@@ -2787,9 +2787,12 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		// budget larger than that; the staging deadline always wins when it
 		// is smaller.
 		listCtx, cancel := context.WithTimeout(stagingCtx, 15*time.Second)
+		listWait := startVirtualResolveWaitLog(stagingCtx, "fetch", "provider_listing", file.ContentID, file.ID, file.FilePath,
+			virtualProbeBudget, virtualProbeBudget)
 		streams, err := h.VirtualPlaybackStreamLister.ListVirtualPlaybackStreams(
 			listCtx, file.FilePath, userID, profileID, file.VirtualOwnerInstallationID,
 		)
+		listWait.finish(err)
 		listDiscovery, listCalls := fetchSnapshot()
 		listDiscovery -= fetchBeforeDur
 		listCalls -= fetchBeforeCalls
@@ -3714,7 +3717,10 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		probeStart := time.Now()
 		forwardVirtualCandidateDeclaredAudio(&syncProbeFile, cand)
 		syncProbeFile.VirtualExpectedRuntimeMinutes = h.virtualExpectedRuntimeMinutes(attemptCtx, file)
+		probeWait := startVirtualResolveWaitLog(probeCtx, "probe", "ffprobe", file.ContentID, file.ID, cand.URI,
+			virtualProbeBudget, virtualStartProbeBudget)
 		probed, probeErr := h.probeVirtualSource(probeCtx, streamURL, &syncProbeFile, cand.RequestHeaders)
+		probeWait.finish(probeErr)
 		trace.probe += time.Since(probeStart)
 		probeCancel()
 		if probeErr != nil || probed == nil {

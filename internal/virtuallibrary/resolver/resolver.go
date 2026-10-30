@@ -1385,10 +1385,41 @@ func (r *Resolver) servePositiveCachedCandidates(cacheKey string, generation uin
 // wait returns the context error so callers keep the bare cancellation they
 // saw before. It does not hold cacheMu across the wait.
 func (r *Resolver) awaitFlight(ctx context.Context, flight *candidateFlight, cacheKey string) ([]StreamCandidate, bool, error) {
+	started := time.Now()
+	r.mu.RLock()
+	waitLogger := r.logger
+	r.mu.RUnlock()
+	if waitLogger != nil {
+		attrs := []any{
+			"component", "virtuallibrary",
+			"wait_kind", "fetch",
+			"wait_on", "provider_fetch_flight",
+			"cache_key", cacheKey,
+		}
+		if deadline, ok := ctx.Deadline(); ok {
+			attrs = append(attrs, "bound_ms", time.Until(deadline).Milliseconds())
+		}
+		waitLogger.InfoContext(ctx, "virtual resolve wait started", attrs...)
+	}
 	select {
 	case <-flight.done:
 	case <-ctx.Done():
 		return nil, false, ctx.Err()
+	}
+	if waitLogger != nil {
+		elapsed := time.Since(started)
+		attrs := []any{
+			"component", "virtuallibrary",
+			"wait_kind", "fetch",
+			"wait_on", "provider_fetch_flight",
+			"cache_key", cacheKey,
+			"waited_ms", elapsed.Milliseconds(),
+		}
+		if elapsed >= backgroundRefreshTimeout {
+			waitLogger.WarnContext(ctx, "virtual resolve wait exceeded threshold", attrs...)
+		} else {
+			waitLogger.DebugContext(ctx, "virtual resolve wait finished", attrs...)
+		}
 	}
 	// The fetch result is published before done closes, so this read is
 	// ordered after the write. A failed flight must surface its error rather
@@ -1515,6 +1546,9 @@ func (r *Resolver) startRefreshLocked(cacheKey string, generation uint64, config
 // ProviderFetchObserver; it does not change behavior.
 func (r *Resolver) fetchProviderCandidates(ctx context.Context, config Config, generation uint64, cacheKey, mediaType, mediaID string, reason FetchReason) (candidates []StreamCandidate, err error) {
 	started := time.Now()
+	r.mu.RLock()
+	fetchLogger := r.logger
+	r.mu.RUnlock()
 	// Report exactly one event per attempt, success or failure, so an observer
 	// counts real provider discovery rather than cache serves. The request id
 	// is read once here, before any early return.
@@ -1524,6 +1558,19 @@ func (r *Resolver) fetchProviderCandidates(ctx context.Context, config Config, g
 		event.Duration = time.Since(started)
 		event.Err = err
 		reportProviderFetch(ctx, event)
+		if fetchLogger != nil && event.Duration >= backgroundRefreshTimeout {
+			attrs := []any{
+				"media_type", mediaType, "media_id", mediaID,
+				"count", event.Count,
+				"duration_ms", event.Duration.Milliseconds(),
+				"cache_key", cacheKey,
+				"reason", string(reason),
+			}
+			if event.RequestID != "" {
+				attrs = append(attrs, "request_id", event.RequestID)
+			}
+			fetchLogger.WarnContext(ctx, "provider candidate fetch exceeded the background refresh budget", attrs...)
+		}
 	}()
 	endpoint, err := streamEndpointWithPolicy(config.ManifestURL, mediaType, mediaID, config.AllowInsecure)
 	if err != nil {
@@ -1539,6 +1586,24 @@ func (r *Resolver) fetchProviderCandidates(ctx context.Context, config Config, g
 	client := r.client
 	if client == nil {
 		client = http.DefaultClient
+	}
+	// The provider round-trip is the silent leg of a listing: the completion
+	// line below is the next thing logged. Announce the fetch once, with the
+	// caller's remaining deadline, so an operator can tell a listing wait from
+	// an ffprobe or an import hold while the start is still running.
+	if fetchLogger != nil {
+		attrs := []any{
+			"media_type", mediaType, "media_id", mediaID,
+			"cache_key", cacheKey,
+			"reason", string(reason),
+		}
+		if deadline, ok := ctx.Deadline(); ok {
+			attrs = append(attrs, "bound_ms", time.Until(deadline).Milliseconds())
+		}
+		if event.RequestID != "" {
+			attrs = append(attrs, "request_id", event.RequestID)
+		}
+		fetchLogger.InfoContext(ctx, "provider candidate fetch started", attrs...)
 	}
 	resp, err := client.Do(req)
 	if err != nil {

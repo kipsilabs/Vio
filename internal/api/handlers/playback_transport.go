@@ -424,7 +424,15 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 				// otherwise spin this loop with no sleep, hammering the
 				// provider with fresh listings. One second per attempt is
 				// negligible against the hold cap and bounds the spin.
-				if !sleepWithContext(resolveStartupCtx, virtualPendingLoopPause) {
+				contentID, fileID := "", 0
+				if file != nil {
+					contentID, fileID = file.ContentID, file.ID
+				}
+				pauseLog := startVirtualResolveWaitLog(resolveStartupCtx, "sleep", "pending_retry_pause", contentID, fileID, canonicalPath,
+					virtualPendingLoopPause, virtualPendingHoldCap)
+				paused := sleepWithContext(resolveStartupCtx, virtualPendingLoopPause)
+				pauseLog.finish(resolveStartupCtx.Err())
+				if !paused {
 					break
 				}
 				continue
@@ -1257,6 +1265,10 @@ func (h *PlaybackHandler) resolveVirtualInputURI(
 			// intentional rotation still rotates on the first successful
 			// relist; only a failed listing is retried.
 			outageTrusted := h.virtualCandidateTrustedForOutageRetry(storedRow)
+			fileID := 0
+			if storedRow != nil {
+				fileID = storedRow.ID
+			}
 			res, err = retryVirtualProviderOutageResolve(ctx, outageTrusted, func(retryCtx context.Context, relist bool) (ResolvedVirtualMedia, error) {
 				if relist {
 					retryCtx = virtuallibrary.WithProviderOutageRelist(retryCtx)
@@ -1264,7 +1276,7 @@ func (h *PlaybackHandler) resolveVirtualInputURI(
 				return h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
 					retryCtx, virtualURI, ownerInstallationID, userID, profileID, forceRefresh || relist, excludedCandidateIDs, preferredCandidateID,
 				)
-			})
+			}, virtualEvidenceLogKeyFileID, fileID, "virtual_uri", logredact.SanitizeURL(virtualURI))
 			// A release AltMount is actively fetching is worth waiting for,
 			// not skipping: hold briefly for the import, then re-list once
 			// (forced, so a flip to completed is picked up) and take whatever
@@ -1274,10 +1286,16 @@ func (h *PlaybackHandler) resolveVirtualInputURI(
 			// A lapsed hold degrades to the pending error, which callers
 			// handle like any unresolvable release — except the startup
 			// loop, which must not indict it (see below).
-			if errors.Is(err, virtuallibrary.ErrProviderPending) && waitVirtualPendingHold(ctx) {
-				res, err = h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
-					ctx, virtualURI, ownerInstallationID, userID, profileID, true, excludedCandidateIDs, preferredCandidateID,
-				)
+			if errors.Is(err, virtuallibrary.ErrProviderPending) {
+				fileID := 0
+				if storedRow != nil {
+					fileID = storedRow.ID
+				}
+				if waitVirtualPendingHold(ctx, virtualURI, fileID) {
+					res, err = h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
+						ctx, virtualURI, ownerInstallationID, userID, profileID, true, excludedCandidateIDs, preferredCandidateID,
+					)
+				}
 			}
 			if err == nil && res.IdentityRematched && storedRow != nil {
 				// The pinned id was absent but the same release re-identified

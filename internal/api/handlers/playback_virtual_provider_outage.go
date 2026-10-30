@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Silo-Server/silo-server/internal/logredact"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary"
@@ -183,17 +184,25 @@ const virtualPendingLoopPause = 1 * time.Second
 // cap and the caller's remaining budget. It reports whether the caller should
 // re-list: false when the pause would consume the room for the retry resolve,
 // in which case the caller degrades to the pending error immediately.
-func waitVirtualPendingHold(ctx context.Context) bool {
+func waitVirtualPendingHold(ctx context.Context, virtualURI string, fileID int) bool {
 	deadline, ok := ctx.Deadline()
-	if !ok {
-		return sleepWithContext(ctx, virtualPendingHoldCap)
+	wait := virtualPendingHoldCap
+	if ok {
+		remaining := time.Until(deadline)
+		wait = min(virtualPendingHoldCap, remaining-virtualPendingHoldReserve)
 	}
-	remaining := time.Until(deadline)
-	wait := min(virtualPendingHoldCap, remaining-virtualPendingHoldReserve)
 	if wait <= 0 {
 		return false
 	}
-	return sleepWithContext(ctx, wait)
+	// The hold is the longest silent leg of a pending-provider start: the
+	// resolver has already listed, so nothing logs again until the import
+	// flips or the hold lapses. Name the release and the hold cap before
+	// sleeping, and warn once when the full cap is consumed.
+	waitLog := startVirtualResolveWaitLog(ctx, "fetch", "provider_import_hold", "", fileID, virtualURI,
+		virtualPendingHoldCap, virtualPendingHoldCap)
+	held := sleepWithContext(ctx, wait)
+	waitLog.finish(ctx.Err())
+	return held
 }
 
 // retryVirtualProviderOutageResolve runs resolve, and while it fails with a
@@ -215,6 +224,7 @@ func retryVirtualProviderOutageResolve(
 	ctx context.Context,
 	trusted bool,
 	resolve func(context.Context, bool) (ResolvedVirtualMedia, error),
+	attrs ...any,
 ) (ResolvedVirtualMedia, error) {
 	resolved, err := resolve(ctx, false)
 	if !trusted {
@@ -228,12 +238,21 @@ func retryVirtualProviderOutageResolve(
 		if errors.Is(err, virtuallibrary.ErrTitleWithoutStreams) {
 			wait = 0
 		}
-		if !sleepWithContext(ctx, wait) {
+		// The pause plus the forced re-list between resolve rounds is otherwise
+		// silent; observe the whole retry cycle once and name the attempt.
+		cycleLog := startVirtualResolveWaitLog(ctx, "fetch", "provider_outage_retry", "", 0, "",
+			wait, virtualProbeBudget, append(attrs, "attempt", attempt+1)...)
+		waited := sleepWithContext(ctx, wait)
+		if !waited {
+			cycleLog.finish(ctx.Err())
+			return resolved, err
+		}
 			return resolved, err
 		}
 		slog.InfoContext(ctx, "virtual provider listing unavailable; retrying the session-bound candidate",
-			"component", "api", "attempt", attempt+1, "retry_in_ms", wait.Milliseconds(), "error", err)
+			"component", "api", "attempt", attempt+1, "retry_in_ms", wait.Milliseconds(), "error", logredact.SanitizeURLError(err))
 		resolved, err = resolve(ctx, true)
+		cycleLog.finish(err)
 	}
 	return resolved, err
 }

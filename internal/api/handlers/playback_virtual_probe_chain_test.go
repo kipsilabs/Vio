@@ -1296,6 +1296,40 @@ func TestScheduleSelectedFileWarmCoalescesLiveWarmUps(t *testing.T) {
 	}
 }
 
+// TestScheduleDefaultFileWarmSharesSelectionAdmissionKey pins the overlap rule:
+// a default warm and an explicit selection for the same row use the same
+// admission key, so the second caller is a no-op instead of starting a second
+// provider listing.
+func TestScheduleDefaultFileWarmSharesSelectionAdmissionKey(t *testing.T) {
+	row := probeChainRow(745, "virtual://movie/probe-chain?result=warm-default", nil)
+	target := &blockedDefaultTarget{open: make(chan struct{}), row: row}
+	var mu sync.Mutex
+	warmCount := 0
+	h := &PlaybackHandler{
+		ServiceContext:     context.Background(),
+		DefaultProbeTarget: target,
+		VirtualReleaseCacheWarmup: VirtualReleaseCacheFillFunc(func(_ context.Context, _ string, _ int, _ func(playback.DownloadProgressPayload)) error {
+			mu.Lock()
+			warmCount++
+			mu.Unlock()
+			return nil
+		}),
+	}
+
+	h.ScheduleSelectedFileWarm(probeChainTestContent, row.ID, catalog.AccessFilter{})
+	probeChainWaitFor(t, 1, target.callCount, "target reads")
+	h.ScheduleDefaultFileWarm(probeChainTestContent, row.ID, catalog.AccessFilter{})
+	probeChainStableWait(t, 1, target.callCount, "target reads after the default warm")
+
+	target.releaseRow()
+	h.warmChainWG.Wait()
+	mu.Lock()
+	defer mu.Unlock()
+	if warmCount != 1 {
+		t.Fatalf("warm-ups = %d, want exactly 1 across both triggers", warmCount)
+	}
+}
+
 // TestScheduleSelectedFileWarmSkipsWhenProbeChainIsLive pins the shared-fetch
 // rule: a live pre-play probe already opens the provider URL, which starts the
 // same fetch, so the warm-up is not scheduled on top of it.
