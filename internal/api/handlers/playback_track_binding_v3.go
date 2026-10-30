@@ -832,41 +832,12 @@ func (h *PlaybackHandler) rekeySubtitleSelectionWithRotationV3(ctx context.Conte
 		}
 	}
 	if rotation {
-		// A recorded candidate rotation must be carried by the strict
-		// release-rotation matcher, never by the generic edition-switch remap:
-		// that remap crosses output muxers and accepts an ambiguous first
-		// survivor, which is exactly how a rotated release's wrong track gets
-		// served. The fast path above already proved a same inventory unchanged.
-		fromIndex, toIndex, exact, matched, attempted, carryErr := h.reconcileRotationSubtitleSelectionV3(ctx, nil, carry, target, req)
-		if carryErr != nil {
-			return decision, carryErr
+		rotationDecision, handled, rotationErr := h.rekeyRotationSubtitleSelectionV3(ctx, req, carry, target)
+		if rotationErr != nil {
+			return decision, rotationErr
 		}
-		if attempted {
-			decision.outcome = subtitleRotationOutcomeV3{
-				Recorded:         true,
-				FromIndex:        fromIndex,
-				ToIndex:          toIndex,
-				Matched:          matched,
-				Exact:            exact,
-				ToFileID:         target.ID,
-				ToCandidateURI:   strings.TrimSpace(target.FilePath),
-				FromCandidateURI: strings.TrimSpace(source.FilePath),
-			}
-			if !matched {
-				slog.InfoContext(ctx, "carried subtitle selection is unavailable after the candidate rotation; clearing it",
-					"component", "playback", "source_file_id", source.ID, "resolved_file_id", target.ID,
-					"carried_index", fromIndex)
-				req.SubtitleTrackID = ""
-				req.SubtitleTrackIndex = nil
-				decision.unavailable = true
-				return decision, nil
-			}
-			if !exact {
-				slog.InfoContext(ctx, "carried subtitle selection matched the rotated release by language and format",
-					"component", "playback", "source_file_id", source.ID, "resolved_file_id", target.ID,
-					"carried_index", fromIndex)
-			}
-			return decision, nil
+		if handled {
+			return rotationDecision, nil
 		}
 	}
 	if _, remapErr := h.remapSubtitleSelectionWithCarryV3(ctx, carry, target, req); remapErr != nil {
@@ -894,6 +865,49 @@ func (h *PlaybackHandler) rekeySubtitleSelectionWithRotationV3(ctx context.Conte
 		return decision, nil
 	}
 	return decision, nil
+}
+
+// rekeyRotationSubtitleSelectionV3 carries a recorded candidate rotation through
+// the strict release-rotation matcher, never the generic edition-switch remap:
+// that remap crosses output muxers and accepts an ambiguous first survivor,
+// which is exactly how a rotated release's wrong track gets served. handled is
+// false when the matcher did not attempt this selection, so the caller falls
+// through to the historical remap.
+func (h *PlaybackHandler) rekeyRotationSubtitleSelectionV3(ctx context.Context, req *playback.StartRequestV3, carry carriedInventorySourceV3, target *models.MediaFile) (subtitleCarryDecisionV3, bool, error) {
+	var decision subtitleCarryDecisionV3
+	source := carry.file
+	fromIndex, toIndex, exact, matched, attempted, err := h.reconcileRotationSubtitleSelectionV3(ctx, nil, carry, target, req)
+	if err != nil {
+		return decision, false, err
+	}
+	if !attempted {
+		return decision, false, nil
+	}
+	decision.outcome = subtitleRotationOutcomeV3{
+		Recorded:         true,
+		FromIndex:        fromIndex,
+		ToIndex:          toIndex,
+		Matched:          matched,
+		Exact:            exact,
+		ToFileID:         target.ID,
+		ToCandidateURI:   strings.TrimSpace(target.FilePath),
+		FromCandidateURI: strings.TrimSpace(source.FilePath),
+	}
+	if !matched {
+		slog.InfoContext(ctx, "carried subtitle selection is unavailable after the candidate rotation; clearing it",
+			"component", "playback", "source_file_id", source.ID, "resolved_file_id", target.ID,
+			"carried_index", fromIndex)
+		req.SubtitleTrackID = ""
+		req.SubtitleTrackIndex = nil
+		decision.unavailable = true
+		return decision, true, nil
+	}
+	if !exact {
+		slog.InfoContext(ctx, "carried subtitle selection matched the rotated release by language and format",
+			"component", "playback", "source_file_id", source.ID, "resolved_file_id", target.ID,
+			"carried_index", fromIndex)
+	}
+	return decision, true, nil
 }
 
 // subtitleRotationOutcomeV3 is the per-request verdict of carrying the viewer's

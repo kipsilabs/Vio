@@ -293,7 +293,7 @@ func SubtitleInventoryDigestV3(items []SubtitleInventoryItemV3) string {
 	for _, item := range items {
 		// Each entry is self-delimiting: the trailing marker separates it from a
 		// following entry, and every field is fixed for a given shape.
-		fmt.Fprintf(digest, "%d\x00%s\x00%s\x00%s\x00%s\x00%t\x00%t\x00%t\x00%s\x00%d\x00%s\x00\x01",
+		_, _ = fmt.Fprintf(digest, "%d\x00%s\x00%s\x00%s\x00%s\x00%t\x00%t\x00%t\x00%s\x00%d\x00%s\x00\x01",
 			item.CombinedIndex, item.Source, item.Codec, item.Language, item.Label,
 			item.Forced, item.Default, item.HearingImpaired, item.Delivery,
 			item.downloadedSubtitleID, item.SyncKey)

@@ -50,15 +50,16 @@ func rotationExhaustedReplanFixture(t *testing.T, pinnedErr, alternateErr error)
 	var providerDown atomic.Bool
 	alternateResolves := &atomic.Int32{}
 	handler.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(func(_ context.Context, path string, _ int, _ string, _ int) (string, error) {
-		if providerDown.Load() {
-			if strings.Contains(path, fmt.Sprintf("alt-%d", rotationExhaustedAlternateID)) {
-				alternateResolves.Add(1)
-				if alternateErr != nil {
-					return "", alternateErr
-				}
-			} else if pinnedErr != nil {
-				return "", pinnedErr
+		if !providerDown.Load() {
+			return "http://127.0.0.1:8080/stream?path=" + path, nil
+		}
+		if strings.Contains(path, fmt.Sprintf("alt-%d", rotationExhaustedAlternateID)) {
+			alternateResolves.Add(1)
+			if alternateErr != nil {
+				return "", alternateErr
 			}
+		} else if pinnedErr != nil {
+			return "", pinnedErr
 		}
 		return "http://127.0.0.1:8080/stream?path=" + path, nil
 	})
