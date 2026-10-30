@@ -114,6 +114,17 @@ describe("buildPublishedSubtitleTracks round-trip against the server", () => {
     expect(published.map((track) => Boolean(track.hearing_impaired))).toEqual([false, false, true]);
   });
 
+  it("carries the container default flag onto the same-language streams", () => {
+    // Two German SRT streams with identical codec and title are distinguishable
+    // only by their ordinal and the default flag the menu badges.
+    const published = buildPublishedSubtitleTracks([
+      { index: 3, language: "de", codec: "srt", title: "German", default: true },
+      { index: 4, language: "de", codec: "srt", title: "German" },
+    ]);
+    expect(published.map((track) => track.index)).toEqual([0, 1]);
+    expect(published.map((track) => Boolean(track.default))).toEqual([true, false]);
+  });
+
   it("keeps two same-basename sidecars distinct when path_key is present", () => {
     // The server keys a sidecar on its full path and now publishes an opaque
     // path_key hash of it. Two sidecars named a.en.srt in different directories

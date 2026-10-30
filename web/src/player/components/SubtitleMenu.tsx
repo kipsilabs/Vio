@@ -15,6 +15,7 @@ import { isTranslatableSource } from "./subtitleTranslateRequest";
 import { PlayerMenuSurface } from "./PlayerMenuSurface";
 import { ProvisionalTrackBadge } from "./ProvisionalTrackBadge";
 import { DiscoveryRetryButton } from "./DiscoveryRetryButton";
+import { TrackBadge } from "./TrackBadge";
 import { useProvisionalInventoryExpiry } from "../hooks/useProvisionalInventoryExpiry";
 import type { SubtitleSync, SubtitleSyncEntry } from "../hooks/useSubtitleSync";
 import {
@@ -378,7 +379,10 @@ export function SubtitleMenu({
                   </span>
                   <span className="flex min-w-0 flex-1 flex-col">
                     <span className="flex w-full items-center justify-between gap-3">
-                      <span className="text-sm">{languageName}</span>
+                      <span className="flex min-w-0 items-center gap-1.5">
+                        <span className="truncate text-sm">{languageName}</span>
+                        {track.default && <TrackBadge variant="outline">Default</TrackBadge>}
+                      </span>
                       <span className="flex shrink-0 items-center gap-1">
                         {formatLabel && (
                           <span className="rounded bg-white/10 px-1.5 py-0.5 text-[10px] tracking-wide text-white/50 uppercase">

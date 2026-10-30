@@ -162,14 +162,32 @@ export function toSubtitleTrackSignature(
   };
 }
 
+/**
+ * Whether two pre-play subtitle selections name the same row.
+ *
+ * The dense combined ordinal (`track_index`) is the row's identity wherever the
+ * inventory published one. Descriptor fields alone cannot separate two streams
+ * in the same language with the same codec and label — the case a release with
+ * two German SRT tracks produces — so comparing only those would light both
+ * rows. Rows the derivation could not place (a duplicate the server collapsed)
+ * keep the descriptor comparison, which is all they have.
+ */
 export function subtitleSelectionEquals(
   left: PrePlaySubtitleSelection | null | undefined,
   right: PrePlaySubtitleSelection | null | undefined,
 ): boolean {
   if (!left || !right) return false;
+  if (left.source !== right.source) return false;
+  if (left.source === "downloaded") {
+    return (
+      (left.downloaded_subtitle_id ?? null) === (right.downloaded_subtitle_id ?? null) &&
+      (left.track_index ?? null) === (right.track_index ?? null)
+    );
+  }
+  if (left.track_index != null || right.track_index != null) {
+    return left.track_index === right.track_index;
+  }
   return (
-    left.source === right.source &&
-    (left.downloaded_subtitle_id ?? null) === (right.downloaded_subtitle_id ?? null) &&
     (left.external_subtitle_path ?? null) === (right.external_subtitle_path ?? null) &&
     (left.language ?? "") === (right.language ?? "") &&
     (left.codec ?? "") === (right.codec ?? "") &&
