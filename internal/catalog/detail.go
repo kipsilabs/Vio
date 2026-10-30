@@ -4842,7 +4842,56 @@ func (s *DetailService) buildPlaybackInfoWith(
 	recap := pick(func(v FileVersion) *Marker { return v.Recap }, firstRecap)
 	preview := pick(func(v FileVersion) *Marker { return v.Preview }, firstPreview)
 
-	return versions, variants, subtitles, intro, credits, recap, preview
+	// Serve verified inventory first without touching the inputs that produced
+	// the variants above: auto-pick, the selected version and every resolved
+	// row still come from the unpartitioned order.
+	return partitionPreparedVersions(versions), variants, subtitles, intro, credits, recap, preview
+}
+
+// versionInventoryPrepared reports whether a version carries probe-verified
+// stream inventory that a thin client can start from: a successful probe
+// stamped the row, it is not durably dead, and (when known) it is not marked
+// unavailable. A rejected wrong-source probe never stamps ProbeUpdatedAt and
+// never sets failed_at, so still-unverified mismatched bytes are already
+// excluded by the probe stamp; the process-local source-mismatch verdict is not
+// part of the durable version list and cannot be carried here.
+func versionInventoryPrepared(v FileVersion) bool {
+	if v.Failed || v.Unreadable || v.ProbedAt == nil || v.ProbedAt.IsZero() {
+		return false
+	}
+	return v.Available == nil || *v.Available
+}
+
+// partitionPreparedVersions stably partitions versions so rows with verified
+// inventory come first. Relative order inside each group is preserved, which
+// keeps the existing provider ranking and listing order intact. It is a pure
+// display-order rule: callers must build playback variants and pick the
+// effective row before applying it.
+func partitionPreparedVersions(versions []FileVersion) []FileVersion {
+	if len(versions) < 2 {
+		return versions
+	}
+	prepared := 0
+	for i := range versions {
+		if versionInventoryPrepared(versions[i]) {
+			prepared++
+		}
+	}
+	if prepared == 0 || prepared == len(versions) {
+		return versions
+	}
+	ordered := make([]FileVersion, len(versions))
+	nextPrepared, nextOther := 0, prepared
+	for _, version := range versions {
+		if versionInventoryPrepared(version) {
+			ordered[nextPrepared] = version
+			nextPrepared++
+		} else {
+			ordered[nextOther] = version
+			nextOther++
+		}
+	}
+	return ordered
 }
 
 func playbackVersionExists(versions []FileVersion, selectedFileID int) bool {

@@ -3,10 +3,63 @@ package jellycompat
 import (
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/config"
 )
+
+// TestCompatLiveVersionsDropFailedBeforePreparedOrder proves the dead-version
+// filter composes with the catalog's prepared-first order: the failed row is
+// dropped wherever it sits, and the verified row remains first among the alive
+// ones. A failed row that carries a probe stamp must not survive the filter.
+func TestCompatLiveVersionsDropFailedBeforePreparedOrder(t *testing.T) {
+	m := newMapper(NewResourceIDCodec(), &config.Config{})
+	probed := time.Now()
+	detail := itemDetailToUpstream(&catalog.ItemDetail{
+		ContentID: "movie-1",
+		Type:      "movie",
+		Versions: []catalog.FileVersion{
+			{FileID: 42, Container: "mkv", Duration: 1200, ProbedAt: &probed},
+			{FileID: 44, Container: "mkv", Duration: 1200},
+			{FileID: 43, Container: "mkv", Duration: 1200, Failed: true, ProbedAt: &probed},
+		},
+	})
+
+	dto := m.itemFromDetailWithFields(detail, false, nil, map[string]bool{"mediasources": true})
+	if len(dto.MediaSources) != 2 {
+		t.Fatalf("MediaSources = %d, want 2 after dropping the failed row", len(dto.MediaSources))
+	}
+	preparedID := m.codec.EncodeIntID(EncodedIDMediaSource, 42)
+	if !mediaSourceIDsEqual(dto.MediaSources[0].ID, preparedID) {
+		t.Fatalf("MediaSources[0].ID = %q, want the prepared row %q", dto.MediaSources[0].ID, preparedID)
+	}
+}
+
+// TestCompatLiveVersionsDropFailedFirstRow proves the filter still removes a
+// failed row that a client would otherwise see first, so prepared ordering can
+// never promote it.
+func TestCompatLiveVersionsDropFailedFirstRow(t *testing.T) {
+	m := newMapper(NewResourceIDCodec(), &config.Config{})
+	probed := time.Now()
+	detail := itemDetailToUpstream(&catalog.ItemDetail{
+		ContentID: "movie-1",
+		Type:      "movie",
+		Versions: []catalog.FileVersion{
+			{FileID: 43, Container: "mkv", Duration: 1200, Failed: true, ProbedAt: &probed},
+			{FileID: 42, Container: "mkv", Duration: 1200, ProbedAt: &probed},
+		},
+	})
+
+	dto := m.itemFromDetailWithFields(detail, false, nil, map[string]bool{"mediasources": true})
+	if len(dto.MediaSources) != 1 {
+		t.Fatalf("MediaSources = %d, want 1 after dropping the failed first row", len(dto.MediaSources))
+	}
+	preparedID := m.codec.EncodeIntID(EncodedIDMediaSource, 42)
+	if !mediaSourceIDsEqual(dto.MediaSources[0].ID, preparedID) {
+		t.Fatalf("MediaSources[0].ID = %q, want the prepared row %q", dto.MediaSources[0].ID, preparedID)
+	}
+}
 
 // TestDetailMediaSourcesExcludeFailedVersions proves a durably failed row is
 // absent from the detail version list, mirroring the native version picker.
