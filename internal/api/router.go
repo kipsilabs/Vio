@@ -2063,6 +2063,12 @@ func newChiRouter(deps Dependencies) chi.Router {
 				}
 				return nil
 			})
+			// Selection warm-up reuses the play-triggered fill above: an
+			// explicit version pick starts the same provider listing, which is
+			// what makes AltMount queue the release, so the first play does not
+			// pay the cold fetch. Nil (no monitor or no virtual library service)
+			// leaves selection warm-ups disabled.
+			playbackHandler.VirtualReleaseCacheWarmup = sh.VirtualReleaseCacheFiller
 			// Install the completion observer last so the waiter registry is
 			// already wired when the first confirmation can arrive.
 			svc.Monitor.SetReleaseConfirmedObserver(sh.HandleVirtualReleaseConfirmed)

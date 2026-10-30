@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -137,6 +138,56 @@ func TestResolveVirtualDownloadMetadata(t *testing.T) {
 	}
 }
 
+// TestResolveVirtualDownloadMetadataStampsPlannerCompleteEvidence pins the
+// shared merge: a probe that omits per-stream bit depth, frame rate and bitrate
+// (common on remote containers) must still persist a row the playback planner
+// accepts, or the next start skips its fast path for metadata the download
+// preparation never wrote.
+func TestResolveVirtualDownloadMetadataStampsPlannerCompleteEvidence(t *testing.T) {
+	relay := remotestream.NewRelay()
+	defer func() { _ = relay.Close(context.Background()) }()
+	file := &models.MediaFile{
+		ID: 7, ContentID: "movie", Container: "virtual", FilePath: "virtual://movie/tt1?result=a",
+		Resolution: "2160p", CodecVideo: "hevc",
+	}
+	var saved models.VirtualFilePersistArgs
+	handler := &PlaybackHandler{
+		RemoteStreamRelay:   relay,
+		AllowPrivateStreams: func(int) bool { return true },
+		VirtualMediaResolver: VirtualMediaResolverFunc(func(context.Context, string, int, int, string) (string, error) {
+			return "http://provider.invalid/source.mkv", nil
+		}),
+		VirtualPlaybackSourceProber: func(_ context.Context, _ string, transient *models.MediaFile) (*models.MediaFile, error) {
+			transient.Container = "mkv"
+			transient.CodecVideo = "hevc"
+			transient.CodecAudio = "eac3"
+			transient.Resolution = "2160p"
+			transient.VideoTracks = []models.VideoTrack{{
+				Codec: "hevc", Width: 3840, Height: 2160,
+				VideoRange: "SDR", VideoRangeType: "SDR",
+			}}
+			return transient, nil
+		},
+		VirtualFileMetadataSaver: func(_ context.Context, args models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error) {
+			saved = args
+			return VirtualFileMetadataUpdateResult{MetadataUpdated: true}, nil
+		},
+	}
+	if _, err := handler.ResolveVirtualDownloadMetadata(context.Background(), file); err != nil {
+		t.Fatal(err)
+	}
+	var tracks []models.VideoTrack
+	if err := json.Unmarshal(saved.VideoTracks, &tracks); err != nil {
+		t.Fatalf("persisted video tracks: %v", err)
+	}
+	stamped := &models.MediaFile{
+		CodecVideo: saved.CodecVideo, Resolution: saved.Resolution,
+		Bitrate: saved.Bitrate, VideoTracks: tracks,
+	}
+	if gaps := playback.VirtualRouteVideoMetadataGapsV3(stamped); gaps != "" {
+		t.Fatalf("persisted probe evidence is planner-incomplete: %s (%+v)", gaps, tracks)
+	}
+}
 func TestResolveVirtualDownloadInputRejectsMissingFile(t *testing.T) {
 	h := &PlaybackHandler{}
 	if _, _, err := h.ResolveVirtualDownloadInput(context.Background(), nil); err == nil {

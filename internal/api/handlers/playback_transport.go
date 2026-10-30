@@ -1127,6 +1127,13 @@ func (h *PlaybackHandler) ResolveVirtualDownloadMetadata(ctx context.Context, fi
 		return nil, errors.New("virtual download source metadata is unavailable")
 	}
 	identity := resolver.NewPersistedIdentityTiers(resolved.ProviderVideoHash, resolved.ProviderGUID, resolved.ProviderReleaseName, resolved.ProviderReleaseSize)
+	// Apply the same declared-metadata merge the playback probe paths use before
+	// stamping. ffprobe legitimately omits per-stream bitrate for some remote
+	// containers and can leave bit depth or frame rate unset, and a raw write
+	// here would stamp the row with metadata the planner rejects as
+	// source_metadata_incomplete — forcing the next start off its fast path even
+	// though the row now looks probed.
+	mergeVirtualCandidateTracks(probed, *virtualPlaybackStreamFromFile(file))
 	if _, committed := h.persistVirtualProbeEvidenceDurable(probeCtx, file, resolved.URI, probed, identity, true); !committed {
 		return nil, errors.New("virtual download source metadata was not committed")
 	}
