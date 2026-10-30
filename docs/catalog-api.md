@@ -14,6 +14,12 @@ version is available, so an absent `available` means available/unknown; `false`
 means the version is currently unavailable. `FileVersion.failed` remains the
 virtual-only "produced no bytes at stream-open" flag.
 
+Detail rows also carry `probed_at`, the instant ffprobe last enumerated the
+version's real stream table; absent means the row still carries declared
+metadata only. A detail row may also carry `source_mismatch` while the API
+process still holds a recent playback probe's wrong-source verdict for that
+row, with the same meaning and lifecycle as the check result below.
+
 On the playback side, the `/api/v2` playback plan projection carries
 `effective_virtual_uri` alongside `virtual_source_revision`, so a client can
 detect a substituted virtual candidate and adopt it in its version menu.

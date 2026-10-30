@@ -398,6 +398,19 @@ func versionCheckSourceMismatchFor(file *models.MediaFile) *versionCheckSourceMi
 	return &versionCheckSourceMismatch{ServedBytes: served, DeclaredBytes: declared}
 }
 
+// VersionSourceMismatch projects the same process-local wrong-source verdict
+// the versions check endpoint reports onto the catalog detail projection. It
+// is the single verdict source for both surfaces: the playback probe damper
+// decides, and this adapter only shapes it. A row with no recent verdict, or a
+// local row, returns nil so the detail field stays absent.
+func VersionSourceMismatch(file *models.MediaFile) *catalog.VersionSourceMismatch {
+	verdict := versionCheckSourceMismatchFor(file)
+	if verdict == nil {
+		return nil
+	}
+	return &catalog.VersionSourceMismatch{ServedBytes: verdict.ServedBytes, DeclaredBytes: verdict.DeclaredBytes}
+}
+
 // versionCheckFailed reports whether a checked row carries a durable failed
 // verdict: either it entered the round already failed, or this round verifiably
 // stamped one. Title-empty and ambiguous outcomes never set it: only an

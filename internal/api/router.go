@@ -1025,6 +1025,11 @@ func newChiRouter(deps Dependencies) chi.Router {
 		detailSvc.SetChapterThumbnailQueuer(deps.ChapterThumbnailQueuer)
 		detailSvc.SetVirtualCandidateScoreSource(virtualCandidateScoreSource(deps.VirtualLibraryService))
 		detailSvc.SetVirtualRankingSource(virtualCandidateRankingSource(deps.VirtualLibraryService))
+		// Per-version source-mismatch rides the same process-local probe
+		// verdict the versions check endpoint reports, so a detail page can
+		// show "served X of declared Y" without a second probe or a second
+		// verdict implementation.
+		detailSvc.SetVersionSourceMismatchSource(handlers.VersionSourceMismatch)
 		if deps.TrickplayReader != nil {
 			detailSvc.SetTrickplayAvailability(deps.TrickplayReader)
 		}
@@ -3528,6 +3533,10 @@ func newChiRouter(deps Dependencies) chi.Router {
 			Manifest: observeNative(deps.StreamTelemetry, http.MethodGet, "/api/v2/playback/transcode/{session_id}/master.m3u8", playbackHandler.HandleGetTranscodeManifest),
 			Segment:  observeNative(deps.StreamTelemetry, http.MethodGet, "/api/v2/playback/transcode/{session_id}/segment/{name}", playbackHandler.HandleGetTranscodeSegment),
 		}
+		// Catalog detail reads warm the virtual versions they surface. The
+		// handler refuses when virtual playback is not wired, so the seam is
+		// safe on every deployment.
+		v2deps.VirtualSelectionWarm = playbackHandler
 		if streamHandler != nil {
 			v2deps.PlaybackMedia.Original = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				observeNative(deps.StreamTelemetry, r.Method, "/api/v2/stream/{session_id}", streamHandler.HandleStream)(w, r)

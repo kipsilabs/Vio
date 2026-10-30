@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/api/handlers"
@@ -31,6 +32,15 @@ type VirtualCandidatesRefreshService interface {
 type VirtualCandidatesDiscoveryService interface {
 	DiscoverVirtualCandidates(ctx context.Context, userID int, profileID, contentID string, filter catalogpkg.AccessFilter, mode handlers.VirtualDiscoveryMode) ([]catalogpkg.FileVersion, error)
 	HasVirtualSource(ctx context.Context, contentID string) (bool, error)
+}
+
+// VirtualSelectionWarmService schedules the pre-play work for one virtual
+// version a detail read surfaced: the inventory probe when the row is
+// unprobed, and the provider-side fetch warm-up. *handlers.PlaybackHandler
+// implements it. Nil leaves detail reads free of side effects.
+type VirtualSelectionWarmService interface {
+	ScheduleSelectedFileProbe(contentID string, fileID int, filter catalogpkg.AccessFilter)
+	ScheduleSelectedFileWarm(contentID string, fileID int, filter catalogpkg.AccessFilter)
 }
 
 const (
@@ -62,6 +72,22 @@ const (
 	// limit. Expired entries are swept first; if the map is still full, it is
 	// cleared, which only costs one extra discovery per item.
 	preplayDiscoveryDetailMemoMaxEntries = 512
+)
+
+const (
+	// maxDetailVirtualWarmVersions caps how many virtual versions one catalog
+	// detail read warms. Two matches the watch-detail prefetch cap and keeps a
+	// many-version title from fanning out provider work on a browse read.
+	maxDetailVirtualWarmVersions = 2
+	// detailVirtualWarmRepeatWindow collapses repeated detail reads for the
+	// same version. The handler's own chain admission already drops a duplicate
+	// live chain; this window also covers the gap after one finishes while the
+	// client is still opening or polling the page.
+	detailVirtualWarmRepeatWindow = 30 * time.Second
+	// detailVirtualWarmMemoMaxEntries bounds the memo so a busy catalog cannot
+	// grow it without limit. Expired entries are swept first; a still-full map
+	// is cleared, costing one extra warm per item.
+	detailVirtualWarmMemoMaxEntries = 512
 )
 
 // preplayDiscoveryMemoKey identifies one viewer's detail read for one item and
@@ -181,6 +207,95 @@ func (reg *Registry) discoverDetailVersions(ctx context.Context, contentID, medi
 		"trigger", trigger, "count", len(listed), "duration_ms", time.Since(started).Milliseconds())
 	reg.rememberPreplayDiscovery(memoKey)
 	return true, true
+}
+
+// warmDetailVirtualVersions starts the pre-play probe/warm chain for the
+// virtual versions a catalog leaf detail read surfaced. Android and other thin
+// clients open the item page through getCatalogItem and pick a version
+// client-side; they never call the versions check or a select endpoint, so
+// this read is the only server-visible signal that a version is about to play.
+//
+// The work is bounded to movies and individual episodes (a series or season
+// page carries no playable row), to maxDetailVirtualWarmVersions per read, and
+// to one schedule per version inside detailVirtualWarmRepeatWindow. Scheduling
+// is non-blocking: ScheduleSelectedFileProbe/Warm only take an admission slot
+// and spawn detached work under their own budgets, and both refuse a duplicate
+// live chain. A failed or durably unavailable row is skipped. This path only
+// warms: it never writes a failure verdict, never stamps failed_at, and never
+// fails the detail request.
+func (reg *Registry) warmDetailVirtualVersions(ctx context.Context, detail *catalogpkg.ItemDetail, filter catalogpkg.AccessFilter) {
+	if reg == nil || detail == nil || reg.deps.VirtualSelectionWarm == nil {
+		return
+	}
+	if detail.Type != themeOwnerMovie && detail.Type != themeOwnerEpisode {
+		return
+	}
+	scheduler := reg.deps.VirtualSelectionWarm
+	warmed := 0
+	for _, version := range detail.Versions {
+		if warmed >= maxDetailVirtualWarmVersions {
+			break
+		}
+		if version.FileID <= 0 || version.Failed || (version.Available != nil && !*version.Available) {
+			continue
+		}
+		if !isVirtualVersion(version) {
+			continue
+		}
+		// The cap counts candidate positions, not admissions, so a repeated
+		// read resolves to the same two rows instead of drifting to the next
+		// pair once the first pair is memoized.
+		warmed++
+		if !reg.rememberDetailVirtualWarm(detail.ContentID, version.FileID) {
+			continue
+		}
+		// An unprobed row needs the inventory probe for its track menus; a
+		// probed row still needs the warm because probe evidence says nothing
+		// about whether the provider has fetched the bytes.
+		if version.ProbedAt == nil {
+			scheduler.ScheduleSelectedFileProbe(detail.ContentID, version.FileID, filter)
+		}
+		scheduler.ScheduleSelectedFileWarm(detail.ContentID, version.FileID, filter)
+	}
+}
+
+// isVirtualVersion reports whether a projected version is provider-backed.
+// The path prefix and the container sentinel are the two markers the catalog
+// row uses; either is enough.
+func isVirtualVersion(version catalogpkg.FileVersion) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(version.FilePath)), "virtual://") ||
+		strings.EqualFold(strings.TrimSpace(version.Container), "virtual")
+}
+
+// rememberDetailVirtualWarm records a scheduled version and reports whether it
+// was new. A repeat inside detailVirtualWarmRepeatWindow returns false so the
+// caller skips scheduling.
+func (reg *Registry) rememberDetailVirtualWarm(contentID string, fileID int) bool {
+	if reg == nil || contentID == "" || fileID <= 0 {
+		return false
+	}
+	key := contentID + "\x00" + strconv.Itoa(fileID)
+	now := time.Now()
+	reg.virtualWarmMu.Lock()
+	defer reg.virtualWarmMu.Unlock()
+	if reg.virtualWarmSeen == nil {
+		reg.virtualWarmSeen = make(map[string]time.Time)
+	}
+	if seen, ok := reg.virtualWarmSeen[key]; ok && now.Sub(seen) < detailVirtualWarmRepeatWindow {
+		return false
+	}
+	if len(reg.virtualWarmSeen) >= detailVirtualWarmMemoMaxEntries {
+		for existing, seen := range reg.virtualWarmSeen {
+			if now.Sub(seen) >= detailVirtualWarmRepeatWindow {
+				delete(reg.virtualWarmSeen, existing)
+			}
+		}
+		if len(reg.virtualWarmSeen) >= detailVirtualWarmMemoMaxEntries {
+			reg.virtualWarmSeen = make(map[string]time.Time)
+		}
+	}
+	reg.virtualWarmSeen[key] = now
+	return true
 }
 
 // VirtualReleaseRequestService requests one stored indexer release on the

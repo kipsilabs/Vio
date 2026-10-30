@@ -108,6 +108,36 @@ func TestVersionCheckReportsSourceMismatchWithoutFailed(t *testing.T) {
 	}
 }
 
+// The catalog detail projection reports the same verdict the check endpoint
+// does. Both read the one playback-probe damper, so the detail page cannot
+// drift into a second source-mismatch implementation.
+func TestVersionSourceMismatchProjectsTheCheckVerdict(t *testing.T) {
+	const (
+		uri           = "virtual://movie/tt-detail-mismatch?result=cand-1"
+		servedBytes   = int64(7_427_636_945)
+		declaredBytes = int64(8_449_999_999)
+	)
+	file := sourceMismatchProbedRow(uri)
+	key := virtualProbeFailureKey(uri, file.VirtualOwnerInstallationID)
+	virtualProbeFailures.clearSizeMismatch(key)
+	t.Cleanup(func() { virtualProbeFailures.clearSizeMismatch(key) })
+	virtualProbeFailures.markSizeMismatch(key, servedBytes, declaredBytes)
+
+	verdict := VersionSourceMismatch(file)
+	if verdict == nil {
+		t.Fatal("projected verdict is nil for a row with a recent mismatch")
+	}
+	if verdict.ServedBytes != servedBytes || verdict.DeclaredBytes != declaredBytes {
+		t.Fatalf("verdict = %+v, want served %d / declared %d", *verdict, servedBytes, declaredBytes)
+	}
+	if check := versionCheckSourceMismatchFor(file); check == nil || check.ServedBytes != verdict.ServedBytes || check.DeclaredBytes != verdict.DeclaredBytes {
+		t.Fatalf("detail verdict %+v and check verdict %+v disagree", *verdict, check)
+	}
+	if got := VersionSourceMismatch(&models.MediaFile{ID: 8, FilePath: "/media/local.mkv"}); got != nil {
+		t.Fatalf("local row projected source_mismatch %+v", *got)
+	}
+}
+
 // A row with no probe verdict keeps the generic unprobed presentation: the
 // liveness answer carries no source_mismatch and no invented sizes.
 func TestVersionCheckLeavesUnprobedRowsGeneric(t *testing.T) {
