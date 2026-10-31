@@ -60,6 +60,9 @@ func virtualProviderListingOutage(err error) bool {
 	if err == nil {
 		return false
 	}
+	if errors.Is(err, virtuallibrary.ErrTitleWithoutStreams) {
+		return true
+	}
 	if errors.Is(err, resolver.ErrProviderUnavailable) {
 		return true
 	}
@@ -219,6 +222,12 @@ func retryVirtualProviderOutageResolve(
 	}
 	for attempt := 0; err != nil && virtualProviderListingOutage(err) && attempt < virtualProviderOutageRetries(err); attempt++ {
 		wait := virtualProviderOutageBackoff[attempt]
+		// The fail-fast sentinel answered without contacting the provider, so
+		// there is no spent round-trip to back off from: retry immediately and
+		// let the forced relist (which bypasses the mark) prove recovery.
+		if errors.Is(err, virtuallibrary.ErrTitleWithoutStreams) {
+			wait = 0
+		}
 		if !sleepWithContext(ctx, wait) {
 			return resolved, err
 		}
