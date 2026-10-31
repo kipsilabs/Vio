@@ -24,9 +24,10 @@ var ErrTitleWithoutStreams = errors.New("virtual title has no provider streams")
 const emptyTitleMarkStreak = 3
 
 // emptyTitleMarkTTL bounds how long a title stays marked after its last empty
-// listing. A title that recovers is re-served on the next resolve (a non-empty
-// listing clears the streak immediately); the TTL only caps how long a stale
-// mark can outlive the evidence.
+// listing. A listing that observes streams again clears the streak immediately,
+// and an explicit forceRefresh bypasses the mark to re-list; the TTL only caps
+// how long a mark can outlive its evidence when nothing else revisits the
+// title.
 var emptyTitleMarkTTL = 5 * time.Minute
 
 // emptyTitleStreak records consecutive empty provider listings for one title.
@@ -71,7 +72,10 @@ func (t *emptyTitleTracker) noteEmptyListing(key string, cacheTTL time.Duration,
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	streak, ok := t.streaks[key]
-	if !ok {
+	// An expired MARK is no evidence for the new listing: start a fresh streak
+	// instead of letting its old count and span re-mark the title from one
+	// observation. An unmarked streak is still accumulating evidence.
+	if !ok || (streak.count >= emptyTitleMarkStreak && (streak.last.IsZero() || now.Sub(streak.last) > emptyTitleMarkTTL)) {
 		streak = &emptyTitleStreak{}
 		t.streaks[key] = streak
 	}
@@ -109,10 +113,13 @@ func (t *emptyTitleTracker) marked(key string, cacheTTL time.Duration, now time.
 	if !ok || streak.count < emptyTitleMarkStreak {
 		return false
 	}
-	if streak.first.IsZero() || streak.last.Sub(streak.first) < required {
+	// Expiry-on-read prunes a mark whose evidence is stale, so the map does not
+	// retain one entry per title forever.
+	if streak.last.IsZero() || now.Sub(streak.last) > emptyTitleMarkTTL {
+		delete(t.streaks, key)
 		return false
 	}
-	return !streak.last.IsZero() && now.Sub(streak.last) <= emptyTitleMarkTTL
+	return !streak.first.IsZero() && streak.last.Sub(streak.first) >= required
 }
 
 // listingCacheTTL returns the provider listing cache TTL that bounds how fast
