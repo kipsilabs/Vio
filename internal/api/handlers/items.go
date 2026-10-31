@@ -128,6 +128,10 @@ type ItemsHandler struct {
 	// VirtualFileByID loads a MediaFile for a version FileID so prefetch can
 	// warm exactly the rows the detail page offers. Nil disables prefetch.
 	virtualFileByID VirtualFileByID
+	// virtualSelectionProber schedules the pre-play probe for an explicitly
+	// selected virtual version whose inventory is still missing. Nil disables
+	// selection probing. Set via SetVirtualSelectionProber.
+	virtualSelectionProber VirtualSelectionProber
 	// virtualPrefetchInflight collapses repeated catalog reads for the same
 	// file+profile before any row load or goroutine: the entry lives only
 	// while the background load runs. Delete is deferred as the goroutine's
@@ -155,6 +159,13 @@ type VirtualFileByID interface {
 	GetByID(ctx context.Context, id int) (*models.MediaFile, error)
 }
 
+// VirtualSelectionProber schedules the pre-play probe chain for one
+// explicitly selected virtual version. *PlaybackHandler.ScheduleSelectedFileProbe
+// implements it; nil disables selection probing.
+type VirtualSelectionProber interface {
+	ScheduleSelectedFileProbe(contentID string, fileID int, filter catalog.AccessFilter)
+}
+
 // SetVirtualPrefetcher wires watch-detail prefetch. Either arg may be nil to
 // keep prefetch disabled.
 func (h *ItemsHandler) SetVirtualPrefetcher(p VirtualPrefetcher, files VirtualFileByID) {
@@ -163,6 +174,15 @@ func (h *ItemsHandler) SetVirtualPrefetcher(p VirtualPrefetcher, files VirtualFi
 	}
 	h.virtualPrefetcher = p
 	h.virtualFileByID = files
+}
+
+// SetVirtualSelectionProber wires probe-on-select for watch-detail reads. Nil
+// keeps the selection probe disabled.
+func (h *ItemsHandler) SetVirtualSelectionProber(p VirtualSelectionProber) {
+	if h == nil {
+		return
+	}
+	h.virtualSelectionProber = p
 }
 
 // NewItemsHandler creates a new ItemsHandler.

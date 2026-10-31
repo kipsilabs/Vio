@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"math"
 	"net/url"
 	"strconv"
 	"strings"
@@ -20,6 +21,29 @@ const (
 	defaultVirtualProbeCacheTTL     = 10 * time.Minute
 	defaultVirtualProbeCacheEntries = 256
 )
+
+// VirtualServedSizeTolerance is the maximum relative difference between the
+// bytes ffprobe read from a virtual candidate and the size its catalog row
+// declares before the served stream is treated as a different release.
+//
+// 0.05 accommodates legitimate variance between what an indexer advertises and
+// what Usenet par2 repair or rounding actually delivers. A different release
+// under the same URL does not land inside this window: the observed production
+// failure served 7,427,636,945 bytes for a row declaring 8,449,999,999 (12%
+// short).
+const VirtualServedSizeTolerance = 0.05
+
+// VirtualServedSizeMismatch reports whether ffprobe's measured container size
+// disagrees with the size the catalog row declares by more than
+// VirtualServedSizeTolerance. Unknown values pass: the check only rejects when
+// both sizes are known and clearly disagree.
+func VirtualServedSizeMismatch(declaredBytes, servedBytes int64) bool {
+	if declaredBytes <= 0 || servedBytes <= 0 {
+		return false
+	}
+	diff := math.Abs(float64(servedBytes) - float64(declaredBytes))
+	return diff > float64(declaredBytes)*VirtualServedSizeTolerance
+}
 
 // VirtualProbeTimeout bounds one playback-time probe. The cache runs the real
 // probe under this timeout and the playback handler uses it as its background
@@ -92,6 +116,15 @@ func (c *VirtualProbeCache) Probe(
 		probed, err := probe(probeCtx, sourceURL, workerSnapshot)
 		if err != nil || probed == nil {
 			return probed, err
+		}
+		if VirtualServedSizeMismatch(inputSnapshot.FileSize, probed.ProbedFormatSize) {
+			// A readable container that is not the release the row declares
+			// must not be cached: the playback path rejects it, and replaying
+			// it for the cache TTL would keep rejecting without ever contacting
+			// the provider again. Returning it uncached lets the row's short
+			// wrong-source backoff reach fresh provider bytes on its next
+			// attempt.
+			return cloneVirtualProbeFile(probed), nil
 		}
 		c.store(key, probed, time.Now())
 		return cloneVirtualProbeFile(probed), nil

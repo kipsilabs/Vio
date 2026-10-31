@@ -175,8 +175,39 @@ func TestCatalogVersionsCheckHTTP(t *testing.T) {
 		if len(resp.Results) != 1 || resp.Results[0].FileID != livePinID || !resp.Results[0].Available {
 			t.Fatalf("unexpected results: %#v", resp.Results)
 		}
+		// The response must describe the confirmed post-clear row: a recovered
+		// version that still reports failed=true remains hidden by every picker.
+		if resp.Results[0].Failed {
+			t.Fatalf("recovered version still reported as failed: %#v", resp.Results[0])
+		}
 		if readFailedAt(livePinID) {
 			t.Fatal("a healthy liveness observation for the same identity must clear the stale stamp")
+		}
+		// The version picker retains the recovered row as selectable: it must
+		// not carry the failed flag or an unavailable signal after the clear.
+		detailSvc := catalog.NewDetailService(
+			catalog.NewItemRepository(pool),
+			catalog.NewEpisodeRepository(pool),
+			catalog.NewSeasonRepository(pool),
+			catalog.NewPersonRepository(pool),
+			repo,
+		)
+		versions, err := detailSvc.GetItemVersions(t.Context(), prefix+"movie", catalog.AccessFilter{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		recovered := false
+		for _, version := range versions {
+			if version.FileID != livePinID {
+				continue
+			}
+			recovered = true
+			if version.Failed || (version.Available != nil && !*version.Available) {
+				t.Fatalf("picker still hides the recovered version: %+v", version)
+			}
+		}
+		if !recovered {
+			t.Fatal("picker dropped the recovered version from the list")
 		}
 	})
 
@@ -400,6 +431,112 @@ func TestCatalogVersionsCheckAccess(t *testing.T) {
 			t.Fatalf("clear calls = %d, want 0 (listing availability is not transport evidence)", clearCalls.Load())
 		}
 	})
+}
+
+// TestCatalogVersionsCheckAccessHidesFailedVerdict proves an unauthorized
+// failed row is indistinguishable from an unknown ID at the response level: a
+// restricted profile must not learn a hidden ID's durable failed_at (or even
+// that it exists) by probing it. Neither request may reach the provider or the
+// health-stamping callbacks.
+func TestCatalogVersionsCheckAccessHidesFailedVerdict(t *testing.T) {
+	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("SILO_TEST_DATABASE_URL is not set")
+	}
+	pool, err := pgxpool.New(t.Context(), dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	exec := func(query string, args ...any) {
+		t.Helper()
+		if _, err := pool.Exec(t.Context(), query, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	prefix := fmt.Sprintf("versions-check-access-failed-%d-", time.Now().UnixNano())
+	var library int
+	if err := pool.QueryRow(t.Context(), `INSERT INTO media_folders (type,name) VALUES ('movies',$1) RETURNING id`, prefix).Scan(&library); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx := context.Background()
+		if _, err := pool.Exec(ctx, `DELETE FROM media_folders WHERE id=$1`, library); err != nil {
+			t.Error(err)
+		}
+		if _, err := pool.Exec(ctx, `DELETE FROM media_items WHERE content_id LIKE $1`, prefix+"%"); err != nil {
+			t.Error(err)
+		}
+	})
+	exec(`INSERT INTO media_items (content_id,type,title,genres,default_metadata_language) VALUES ($1,'movie','Versions Check Hidden Failure','{}','en')`, prefix+"movie")
+	exec(`INSERT INTO media_item_libraries (content_id,media_folder_id) VALUES ($1,$2)`, prefix+"movie", library)
+
+	var failedFileID int
+	if err := pool.QueryRow(t.Context(), `
+		INSERT INTO media_files (content_id,media_folder_id,file_path,file_size,container,virtual_owner_installation_id,failed_at)
+		VALUES ($1,$2,$3,1000,'virtual',7,NOW()) RETURNING id`,
+		prefix+"movie", library, fmt.Sprintf("virtual://movie/tt%d?result=failed", time.Now().UnixNano())).Scan(&failedFileID); err != nil {
+		t.Fatal(err)
+	}
+	const unknownFileID = 999999999
+
+	var resolveCalls, markCalls, clearCalls atomic.Int64
+	repo := scanner.NewFileRepository(pool)
+	itemRepo := catalog.NewItemRepository(pool)
+	h := &CatalogResourceHandler{
+		FileResolver: repo,
+		VirtualResolver: VirtualMediaDetailedResolverFunc(func(context.Context, string, int, int, string, bool, []string, string) (ResolvedVirtualMedia, error) {
+			resolveCalls.Add(1)
+			return ResolvedVirtualMedia{}, errors.New("unauthorized files must never reach the provider")
+		}),
+		MarkVirtualFailed: func(ctx context.Context, fileID int, expectedFilePath string, observedFailedAt *time.Time) error {
+			markCalls.Add(1)
+			return repo.MarkVirtualCandidateFailed(ctx, fileID, expectedFilePath, observedFailedAt)
+		},
+		ClearVirtualFailed: func(ctx context.Context, fileID int, expectedFilePath string, observedFailedAt *time.Time) error {
+			clearCalls.Add(1)
+			return repo.ClearVirtualCandidateFailed(ctx, fileID, expectedFilePath, observedFailedAt)
+		},
+		ItemAccess:    itemRepo,
+		EpisodeLookup: catalog.NewEpisodeRepository(pool),
+		ExtraLookup:   catalog.NewExtraRepository(pool),
+	}
+	router := chi.NewRouter()
+	router.Post("/catalog/versions/check", h.HandleCheckVersions)
+
+	body, err := json.Marshal(map[string][]int{"file_ids": {failedFileID, unknownFileID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := httptest.NewRequest(http.MethodPost, "/catalog/versions/check", strings.NewReader(string(body)))
+	r.Header.Set("Content-Type", "application/json")
+	r = r.WithContext(access.SetScope(r.Context(), access.Scope{AllowedLibraryIDs: []int{}}))
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, r)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	var resp versionCheckResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Results) != 2 {
+		t.Fatalf("results = %#v, want 2", resp.Results)
+	}
+	for _, result := range resp.Results {
+		// Both the denied failed row and the unknown id must serialize to the
+		// same verdict shape: unavailable with no failed field.
+		result.FileID = 0
+		if result != (versionCheckResult{}) {
+			t.Fatalf("denied/unknown result leaked row state: %#v", result)
+		}
+	}
+	if resolveCalls.Load() != 0 {
+		t.Fatalf("resolver invoked %d times for unauthorized IDs, want 0", resolveCalls.Load())
+	}
+	if markCalls.Load() != 0 || clearCalls.Load() != 0 {
+		t.Fatalf("health stamping invoked for unauthorized IDs: mark=%d clear=%d, want 0/0", markCalls.Load(), clearCalls.Load())
+	}
 }
 
 // TestCatalogVersionsCheckInFlightFencing exercises the version-check handler

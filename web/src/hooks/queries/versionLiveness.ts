@@ -3,6 +3,7 @@ import { useMemo } from "react";
 
 import { apiV1 } from "@/api/client";
 import type { VersionLivenessResponse } from "@/api/types";
+import { catalogKeys } from "@/hooks/queries/keys";
 import { isVirtualFileVersion } from "@/pages/ItemDetail/components/versionFormatUtils";
 
 /**
@@ -114,7 +115,7 @@ export function useVersionLiveness(
 
   const queryResults = useQueries({
     queries: chunks.map((fileIds) => ({
-      queryKey: ["catalog", "versions", "check", fileIds],
+      queryKey: [...catalogKeys.versionLiveness, fileIds],
       queryFn: () => fetchVersionLiveness(fileIds),
       enabled: enabled && fileIds.length > 0,
       staleTime: VERSION_LIVENESS_STALE_MS,

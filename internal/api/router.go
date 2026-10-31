@@ -1718,6 +1718,10 @@ func newChiRouter(deps Dependencies) chi.Router {
 		// GetByID); prefetch stays disabled without it.
 		if itemsHandler != nil && deps.FileRepo != nil {
 			itemsHandler.SetVirtualPrefetcher(playbackHandler, deps.FileRepo)
+			// Probe on select: a watch-detail read that names an unprobed
+			// virtual version schedules the shared pre-play chain for that
+			// row, so its track menus are populated before the first play.
+			itemsHandler.SetVirtualSelectionProber(playbackHandler)
 		}
 		if deps.UserStoreProvider != nil {
 			// Device-aware candidate ranking: resolve the caller's persisted
@@ -2431,6 +2435,10 @@ func newChiRouter(deps Dependencies) chi.Router {
 			catalogResourceHandler.MarkVirtualFailed = deps.FileRepo.MarkVirtualCandidateFailed
 			catalogResourceHandler.ClearVirtualFailed = deps.FileRepo.ClearVirtualCandidateFailed
 		}
+		// A fresh failed_at verdict from the liveness check changes the
+		// persisted version list, so the check publishes the same
+		// versions_updated catalog event as the Refresh List executor.
+		catalogResourceHandler.Events = deps.RealtimeHub
 		if playbackHandler != nil {
 			// The liveness check adopts a same-release rematch through the same
 			// saver the playback path uses, so a renumbered provider result id
