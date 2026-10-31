@@ -684,6 +684,10 @@ func (h *PlaybackHandler) forgetProgressSideEffectLock(sessionID string) {
 		return
 	}
 	h.virtualDeliveryCleared.Delete(sessionID)
+	// The session is terminal, so no outstanding subtitle-inventory wait can
+	// still be ended by a delivery. Dropping it keeps a long-lived process from
+	// retaining one record per historical session.
+	h.forgetSubtitleInventoryWait(sessionID)
 	// The session is terminal, so no outstanding audio withdrawal can still be
 	// delivered or complete. Dropping its in-process retry state here keeps a
 	// long-lived process from retaining state for every session it ever served.
@@ -1176,6 +1180,28 @@ func (h *PlaybackHandler) playbackInventoryForSession(ctx context.Context, sessi
 	return h.playbackInventoryForFileV3(ctx, session, record, file, effectiveVirtualURI)
 }
 
+// subtitleInventoryWaitBlockerV3 names the gate holding a session's subtitle
+// inventory when its first unverified read starts the wait. A stamped row waits
+// on fresh evidence for the served generation; a session with an armed probe
+// waits on that enumeration; with no probe armed the enumeration is deferred
+// until the transport resolves, so the wait sits on the relay. It is diagnostic
+// only and never changes what is served.
+func subtitleInventoryWaitBlockerV3(session *playback.Session, file *models.MediaFile) string {
+	if file != nil && file.ProbeUpdatedAt != nil {
+		// The row has probe evidence, but not for the generation this read
+		// describes (a rotated/duplicate row or a refused write): the menu waits
+		// on fresh evidence, not on a first probe.
+		return subtitleWaitBlockerStale
+	}
+	if session != nil && session.VirtualProbeOutcome == playback.VirtualProbeOutcomePending {
+		// A probe lifecycle is armed and enumerating; the rows will arrive.
+		return subtitleWaitBlockerUnprobed
+	}
+	// No probe evidence has landed and none is armed: the enumeration is
+	// deferred until the transport resolves the relay.
+	return subtitleWaitBlockerRelay
+}
+
 // playbackInventoryForFileV3 builds the wire inventory for one session from an
 // already-resolved effective file. It is the shared tail of
 // playbackInventoryForSession and the in-memory serve for a refused probe: the
@@ -1243,6 +1269,16 @@ func (h *PlaybackHandler) playbackInventoryForFileV3(ctx context.Context, sessio
 		// of treating the menu as final. See docs/playback-api.md for the poll
 		// contract; do not busy-poll this endpoint.
 		status = probeOutcomePending
+	}
+	if !inventoryRetryable && status != string(ProbeProvenanceVerified) && status != string(ProbeProvenanceFailed) {
+		// This read publishes a provisional subtitle menu: either the probe is
+		// still enumerating or the row has never been stamped. Record the first
+		// such read as the session's wait start; subsequent polls and replans see
+		// the recorded wait and stay silent, so the lifecycle yields one start
+		// line and one delivery line. A terminal failure is not a wait (it ends
+		// the client's loading state), and a downloaded-extension retry is a
+		// subtitle-store wait, not a probe wait.
+		h.noteSubtitleInventoryWaitStart(ctx, session.ID, file, status, subtitleInventoryWaitBlockerV3(session, file))
 	}
 
 	effectiveFileID := 0
@@ -1646,6 +1682,10 @@ type inventoryPublishSummary struct {
 	FileID           int
 	SessionsNotified int
 	Revision         string
+	// Waits collects the subtitle-inventory waits this fan-out ended, so the
+	// delivery line can report how long each session's menu was provisional and
+	// what blocked it. It is empty for a delivery that resolved no wait.
+	Waits []subtitleInventoryWaitDeliveryV3
 }
 
 // inventoryPublishResult classifies one session-targeted publish attempt for the
@@ -1712,6 +1752,7 @@ func (h *PlaybackHandler) PublishInventoryUpdated(ctx context.Context, fileID in
 		if result == inventoryPublishDelivered {
 			summary.SessionsNotified++
 			summary.Revision = revision
+			h.collectSubtitleInventoryWait(&summary, session.ID)
 		}
 	}
 	return summary
@@ -1762,6 +1803,7 @@ func (h *PlaybackHandler) PublishInventoryUpdatedToSession(ctx context.Context, 
 	if result == inventoryPublishDelivered {
 		summary.SessionsNotified++
 		summary.Revision = revision
+		h.collectSubtitleInventoryWait(&summary, session.ID)
 	}
 	return summary, result
 }

@@ -275,6 +275,20 @@ func startFarSeekHandlerSession(t *testing.T, sessionID, ffmpegPath, outputDir s
 		time.Sleep(5 * time.Millisecond) //nolint:forbidigo // Segment files are the fake encoder's observable output.
 	}
 
+	// The fake encoder writes the segments before the playlist, so segment
+	// existence alone can gate in before stream.m3u8 is published. A request in
+	// that window is recovered as "startup request beyond the window" (or as a
+	// stale produced head, since an unparsed manifest leaves LastProducedAt
+	// zero) and answers 200 from an immediate restart instead of the stalled
+	// head hold this fixture exists to exercise.
+	manifestDeadline := time.Now().Add(5 * time.Second)
+	for !transcodeSession.SegmentProgress(time.Now()).HasManifest {
+		if time.Now().After(manifestDeadline) {
+			t.Fatal("fake transcode never published a parseable manifest")
+		}
+		time.Sleep(5 * time.Millisecond) //nolint:forbidigo // Segment files are the fake encoder's observable output.
+	}
+
 	sessions := playback.NewSessionManager(0, 0)
 	sessions.RegisterReconstructed(&playback.Session{
 		ID:          sessionID,

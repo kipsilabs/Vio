@@ -1232,6 +1232,100 @@ describe("subtitle source changed", () => {
     }
   });
 
+  it("signals the session gone once on a 410 subtitle fetch and stops retrying", async () => {
+    vi.useFakeTimers();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    fetchMock.mockImplementation(() =>
+      Promise.resolve(errorResponse(410, { error: "playback_session_ended" })),
+    );
+    const videoRef = makeVideoRef();
+    const onSessionGone = vi.fn();
+    const { unmount } = renderHook(() =>
+      useSubtitleTracks(
+        videoRef,
+        [srtTrack],
+        1,
+        0,
+        0,
+        { current: 7200 },
+        { current: 0 },
+        undefined,
+        null,
+        0,
+        undefined,
+        undefined,
+        0,
+        0,
+        0,
+        0,
+        0,
+        onSessionGone,
+      ),
+    );
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(onSessionGone).toHaveBeenCalledTimes(1);
+      // The dead session cannot deliver this track. No backoff retries.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(120_000);
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(onSessionGone).toHaveBeenCalledTimes(1);
+    } finally {
+      unmount();
+      error.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("signals the session gone on a 404 that names the playback session", async () => {
+    vi.useFakeTimers();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    fetchMock.mockImplementation(() =>
+      Promise.resolve(errorResponse(404, { error: "playback_session_not_found" })),
+    );
+    const videoRef = makeVideoRef();
+    const onSessionGone = vi.fn();
+    const { unmount } = renderHook(() =>
+      useSubtitleTracks(
+        videoRef,
+        [srtTrack],
+        1,
+        0,
+        0,
+        { current: 7200 },
+        { current: 0 },
+        undefined,
+        null,
+        0,
+        undefined,
+        undefined,
+        0,
+        0,
+        0,
+        0,
+        0,
+        onSessionGone,
+      ),
+    );
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(onSessionGone).toHaveBeenCalledTimes(1);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(120_000);
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      unmount();
+      error.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
   it("does not signal onSourceChanged again when a rebuilt track retries the same source generation", async () => {
     vi.useFakeTimers();
     const error = vi.spyOn(console, "error").mockImplementation(() => {});

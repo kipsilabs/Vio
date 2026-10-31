@@ -1,10 +1,11 @@
 // @vitest-environment jsdom
 
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { createElement } from "react";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { PlayerSubtitleInfo } from "../types";
+import { PROVISIONAL_INVENTORY_TIMEOUT_MS } from "../utils/inventoryProvenance";
 import { SubtitleMenu } from "./SubtitleMenu";
 
 // The appearance panel reads settings through react-query; the menu's own
@@ -208,7 +209,7 @@ describe("SubtitleMenu", () => {
     expect(screen.queryByText("Discovering subtitles…")).toBeNull();
   });
 
-  it("shows discovery banner even when declared tracks are present while provisional", () => {
+  it("gates declared track rows behind the discovery state while provisional", () => {
     render(
       createElement(SubtitleMenu, {
         tracks: [subtitleTrack()],
@@ -223,7 +224,42 @@ describe("SubtitleMenu", () => {
     fireEvent.click(screen.getByRole("button", { name: /(Enable|Disable) captions/ }));
 
     expect(screen.getByText("Discovering subtitles…")).toBeTruthy();
+    // The declared rows are pre-probe placeholders for the effective file, so
+    // they must not sit in the menu as if they were the file's real tracks.
+    expect(screen.queryByText("English")).toBeNull();
+  });
+
+  it("swaps in live rows when the probed inventory arrives", () => {
+    const track = subtitleTrack();
+    const view = render(
+      createElement(SubtitleMenu, {
+        tracks: [track],
+        activeIndex: null,
+        onSelect: () => {},
+        delayMs: 0,
+        onDelayChange: () => {},
+        mediaFileId: 42,
+        provisional: true,
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /(Enable|Disable) captions/ }));
+    expect(screen.queryByText("English")).toBeNull();
+
+    view.rerender(
+      createElement(SubtitleMenu, {
+        tracks: [track],
+        activeIndex: null,
+        onSelect: () => {},
+        delayMs: 0,
+        onDelayChange: () => {},
+        mediaFileId: 42,
+        provisional: false,
+      }),
+    );
+
     expect(screen.getByText("English")).toBeTruthy();
+    expect(screen.queryByText("Discovering subtitles…")).toBeNull();
+    expect(screen.queryByText("Unverified")).toBeNull();
   });
 
   it("shows failure banner even when declared tracks are present", () => {
@@ -312,5 +348,114 @@ describe("SubtitleMenu", () => {
     expect(screen.queryByText("Discovering subtitles…")).toBeNull();
     expect(screen.queryByText("Unverified")).toBeNull();
     expect(screen.getByText("English")).toBeTruthy();
+  });
+});
+
+describe("SubtitleMenu discovery bound", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function renderProvisional(onRetryDiscovery?: () => void) {
+    const view = render(
+      createElement(SubtitleMenu, {
+        tracks: [subtitleTrack()],
+        activeIndex: null,
+        onSelect: () => {},
+        delayMs: 0,
+        onDelayChange: () => {},
+        mediaFileId: 42,
+        provisional: true,
+        onRetryDiscovery,
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /(Enable|Disable) captions/ }));
+    return view;
+  }
+
+  it("replaces the unbounded spinner with an explicit retry when discovery stalls", () => {
+    vi.useFakeTimers();
+    renderProvisional();
+
+    expect(screen.getByText("Discovering subtitles…")).toBeTruthy();
+    act(() => {
+      vi.advanceTimersByTime(PROVISIONAL_INVENTORY_TIMEOUT_MS);
+    });
+
+    expect(screen.queryByText("Discovering subtitles…")).toBeNull();
+    expect(screen.getByText("Subtitles unavailable.")).toBeTruthy();
+    // The stalled rows are still declared metadata, so the menu does not fall
+    // back to offering them.
+    expect(screen.queryByText("English")).toBeNull();
+  });
+
+  it("re-triggers discovery and shows progress again on retry", () => {
+    vi.useFakeTimers();
+    const onRetryDiscovery = vi.fn();
+    renderProvisional(onRetryDiscovery);
+
+    act(() => {
+      vi.advanceTimersByTime(PROVISIONAL_INVENTORY_TIMEOUT_MS);
+    });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Retry" }));
+
+    expect(onRetryDiscovery).toHaveBeenCalledOnce();
+    expect(screen.getByText("Discovering subtitles…")).toBeTruthy();
+    expect(screen.queryByText("Subtitles unavailable.")).toBeNull();
+
+    // The fresh window is itself bounded: a retry that never lands lapses
+    // back to the retry action instead of spinning forever.
+    act(() => {
+      vi.advanceTimersByTime(PROVISIONAL_INVENTORY_TIMEOUT_MS);
+    });
+    expect(screen.getByText("Subtitles unavailable.")).toBeTruthy();
+  });
+
+  it("returns to live rows when the retried inventory lands", () => {
+    vi.useFakeTimers();
+    const props = {
+      tracks: [subtitleTrack()],
+      activeIndex: null,
+      onSelect: () => {},
+      delayMs: 0,
+      onDelayChange: () => {},
+      mediaFileId: 42,
+      provisional: true,
+    };
+    const view = render(createElement(SubtitleMenu, props));
+    fireEvent.click(screen.getByRole("button", { name: /(Enable|Disable) captions/ }));
+    act(() => {
+      vi.advanceTimersByTime(PROVISIONAL_INVENTORY_TIMEOUT_MS);
+    });
+    expect(screen.getByText("Subtitles unavailable.")).toBeTruthy();
+
+    view.rerender(createElement(SubtitleMenu, { ...props, provisional: false }));
+
+    expect(screen.getByText("English")).toBeTruthy();
+    expect(screen.queryByText("Subtitles unavailable.")).toBeNull();
+    expect(screen.queryByText("Discovering subtitles…")).toBeNull();
+  });
+
+  it("offers the same retry beside a terminal discovery failure", () => {
+    vi.useFakeTimers();
+    const onRetryDiscovery = vi.fn();
+    render(
+      createElement(SubtitleMenu, {
+        tracks: [],
+        activeIndex: null,
+        onSelect: () => {},
+        delayMs: 0,
+        onDelayChange: () => {},
+        mediaFileId: 42,
+        provisional: true,
+        failed: true,
+        onRetryDiscovery,
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /(Enable|Disable) captions/ }));
+
+    expect(screen.getByText("Subtitle discovery failed")).toBeTruthy();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Retry" }));
+    expect(onRetryDiscovery).toHaveBeenCalledOnce();
   });
 });

@@ -67,6 +67,23 @@ type carriedInventorySourceV3 struct {
 	subtitleEvidenceErr error
 }
 
+// previousSubtitleEvaluationV3 recovers the predecessor plan's degraded subtitle
+// outcome for the replan track path. When a retry re-sends the identical pick
+// against the identical effective inventory, the planner republishes the
+// subtitles-off outcome instead of re-running (and re-logging) the out-of-range
+// disable the first plan already recorded. A changed pick, a changed inventory,
+// or a rotation makes the evaluation nil or non-matching, so the normal policy
+// runs unchanged.
+func previousSubtitleEvaluationV3(record *playback.AttemptRecordV3) *playback.SubtitleEvaluationV3 {
+	if record == nil {
+		return nil
+	}
+	// The durable normalized request is the request that produced CurrentPlan:
+	// every successful replan writes the seeded start back together with the new
+	// plan, so both halves describe the same selection and inventory.
+	return playback.PreviousSubtitleEvaluationV3(record.NormalizedRequest, record.CurrentPlan)
+}
+
 // subtitleSelectionOrdinalV3 returns the combined subtitle ordinal a request
 // carries, from either the index or the identity.
 func subtitleSelectionOrdinalV3(file *models.MediaFile, request *playback.StartRequestV3) (int, bool) {
@@ -746,14 +763,47 @@ func resolvedRekeyedAudioOrdinalV3(source, target *models.MediaFile, ordinal int
 // file representation: a carried downloaded ordinal is re-checked against the
 // captured rows even when the embedded/external tracks compare equal.
 func (h *PlaybackHandler) constrainRekeyedSubtitleSelectionV3(ctx context.Context, req *playback.StartRequestV3, carry carriedInventorySourceV3, target *models.MediaFile) (unavailable bool, err error) {
+	return h.constrainRekeyedSubtitleSelectionWithRotationV3(ctx, req, carry, target, false)
+}
+
+// subtitleCarryDecisionV3 is the outcome of re-keying a carried subtitle
+// selection onto a target inventory. unavailable reports that the selection was
+// cleared and the caller must degrade. outcome carries the rotation verdict when
+// the strict matcher actually ran; a caller that commits the target can record
+// the carried position (and the fuzzy-carry warning) from it. Recorded stays
+// false for the same-inventory fast path and the historical remap, which do not
+// re-identify the release.
+type subtitleCarryDecisionV3 struct {
+	unavailable bool
+	outcome     subtitleRotationOutcomeV3
+}
+
+// constrainRekeyedSubtitleSelectionWithRotationV3 is the rotation-gated form.
+// When rotation is set, a selection whose inventory differs is carried with the
+// strict release-rotation matcher instead of the generic edition-switch remap;
+// a miss clears both fields and reports unavailable. Non-rotation callers keep
+// the historical remap unchanged.
+func (h *PlaybackHandler) constrainRekeyedSubtitleSelectionWithRotationV3(ctx context.Context, req *playback.StartRequestV3, carry carriedInventorySourceV3, target *models.MediaFile, rotation bool) (unavailable bool, err error) {
+	decision, err := h.rekeySubtitleSelectionWithRotationV3(ctx, req, carry, target, rotation)
+	return decision.unavailable, err
+}
+
+// rekeySubtitleSelectionWithRotationV3 is constrainRekeyedSubtitleSelectionWithRotationV3
+// with the rotation verdict returned. The transport-failure rotation reuses the
+// same carry-or-degrade decision and needs the verdict so the commit that
+// installs the alternate records the carried position and appends the
+// fuzzy-carry warning, exactly as the replan drift carry does.
+func (h *PlaybackHandler) rekeySubtitleSelectionWithRotationV3(ctx context.Context, req *playback.StartRequestV3, carry carriedInventorySourceV3, target *models.MediaFile, rotation bool) (subtitleCarryDecisionV3, error) {
+	var decision subtitleCarryDecisionV3
 	if req == nil {
-		return false, nil
+		return decision, nil
 	}
 	source := carry.file
 	if source == nil {
 		req.SubtitleTrackID = ""
 		req.SubtitleTrackIndex = nil
-		return true, nil
+		decision.unavailable = true
+		return decision, nil
 	}
 	if carry.namesDownloadedSubtitleV3(req) {
 		// A captured inventory cannot place a downloaded ordinal without the
@@ -761,23 +811,33 @@ func (h *PlaybackHandler) constrainRekeyedSubtitleSelectionV3(ctx context.Contex
 		// the same row. Only a current-inventory selection, minted against the
 		// live list that published it, is safe to interpret without one.
 		if carry.subtitleEvidenceErr != nil {
-			return false, carry.subtitleEvidenceErr
+			return decision, carry.subtitleEvidenceErr
 		}
 		if carry.subtitleHistorical && !carry.downloadedKnown {
 			slog.InfoContext(ctx, "re-keyed downloaded subtitle has no captured tail; clearing it",
 				"component", "playback", "source_file_id", source.ID, "resolved_file_id", target.ID)
 			req.SubtitleTrackID = ""
 			req.SubtitleTrackIndex = nil
-			return true, nil
+			decision.unavailable = true
+			return decision, nil
 		}
 	}
 	if sameSubtitleInventoryV3(source, target) {
 		keep, keepErr := h.keepRekeyedSubtitleWithinSameInventoryV3(ctx, req, carry, target)
 		if keepErr != nil {
-			return false, keepErr
+			return decision, keepErr
 		}
 		if keep {
-			return false, nil
+			return decision, nil
+		}
+	}
+	if rotation {
+		rotationDecision, handled, rotationErr := h.rekeyRotationSubtitleSelectionV3(ctx, req, carry, target)
+		if rotationErr != nil {
+			return decision, rotationErr
+		}
+		if handled {
+			return rotationDecision, nil
 		}
 	}
 	if _, remapErr := h.remapSubtitleSelectionWithCarryV3(ctx, carry, target, req); remapErr != nil {
@@ -785,7 +845,7 @@ func (h *PlaybackHandler) constrainRekeyedSubtitleSelectionV3(ctx context.Contex
 			// A failed subtitle-store lookup cannot prove the track is absent;
 			// keeping the old ordinal would reinterpret it against an inventory
 			// we never verified. Surface the dependency failure instead.
-			return false, remapErr
+			return decision, remapErr
 		}
 		// remapSubtitleSelectionV3 deliberately preserves the selection for a
 		// caller that keeps hunting candidates. Here the effective row is
@@ -796,13 +856,236 @@ func (h *PlaybackHandler) constrainRekeyedSubtitleSelectionV3(ctx context.Contex
 			"component", "playback", "source_file_id", source.ID, "resolved_file_id", target.ID)
 		req.SubtitleTrackID = ""
 		req.SubtitleTrackIndex = nil
-		return true, nil
+		decision.unavailable = true
+		return decision, nil
 	}
 	if req.SubtitleTrackID == "" {
 		req.SubtitleTrackIndex = nil
-		return true, nil
+		decision.unavailable = true
+		return decision, nil
 	}
-	return false, nil
+	return decision, nil
+}
+
+// rekeyRotationSubtitleSelectionV3 carries a recorded candidate rotation through
+// the strict release-rotation matcher, never the generic edition-switch remap:
+// that remap crosses output muxers and accepts an ambiguous first survivor,
+// which is exactly how a rotated release's wrong track gets served. handled is
+// false when the matcher did not attempt this selection, so the caller falls
+// through to the historical remap.
+func (h *PlaybackHandler) rekeyRotationSubtitleSelectionV3(ctx context.Context, req *playback.StartRequestV3, carry carriedInventorySourceV3, target *models.MediaFile) (subtitleCarryDecisionV3, bool, error) {
+	var decision subtitleCarryDecisionV3
+	source := carry.file
+	fromIndex, toIndex, exact, matched, attempted, err := h.reconcileRotationSubtitleSelectionV3(ctx, nil, carry, target, req)
+	if err != nil {
+		return decision, false, err
+	}
+	if !attempted {
+		return decision, false, nil
+	}
+	decision.outcome = subtitleRotationOutcomeV3{
+		Recorded:         true,
+		FromIndex:        fromIndex,
+		ToIndex:          toIndex,
+		Matched:          matched,
+		Exact:            exact,
+		ToFileID:         target.ID,
+		ToCandidateURI:   strings.TrimSpace(target.FilePath),
+		FromCandidateURI: strings.TrimSpace(source.FilePath),
+	}
+	if !matched {
+		slog.InfoContext(ctx, "carried subtitle selection is unavailable after the candidate rotation; clearing it",
+			"component", "playback", "source_file_id", source.ID, "resolved_file_id", target.ID,
+			"carried_index", fromIndex)
+		req.SubtitleTrackID = ""
+		req.SubtitleTrackIndex = nil
+		decision.unavailable = true
+		return decision, true, nil
+	}
+	if !exact {
+		slog.InfoContext(ctx, "carried subtitle selection matched the rotated release by language and format",
+			"component", "playback", "source_file_id", source.ID, "resolved_file_id", target.ID,
+			"carried_index", fromIndex)
+	}
+	return decision, true, nil
+}
+
+// subtitleRotationOutcomeV3 is the per-request verdict of carrying the viewer's
+// subtitle selection across a recorded virtual candidate rotation. The replan
+// commits it to the live session through the stream state built later in the
+// same request, so a second rotation re-keys from the carried position and an
+// in-flight subtitle URL can be translated or failed closed.
+type subtitleRotationOutcomeV3 struct {
+	Recorded         bool
+	FromIndex        int
+	ToIndex          int
+	Matched          bool
+	Exact            bool
+	ToFileID         int
+	ToCandidateURI   string
+	FromCandidateURI string
+}
+
+type subtitleRotationOutcomeContextKeyV3 struct{}
+
+func withSubtitleRotationOutcomeV3(ctx context.Context, outcome subtitleRotationOutcomeV3) context.Context {
+	return context.WithValue(ctx, subtitleRotationOutcomeContextKeyV3{}, outcome)
+}
+
+func subtitleRotationOutcomeFromContextV3(ctx context.Context) (subtitleRotationOutcomeV3, bool) {
+	outcome, ok := ctx.Value(subtitleRotationOutcomeContextKeyV3{}).(subtitleRotationOutcomeV3)
+	return outcome, ok && outcome.Recorded
+}
+
+// subtitleCarryGenerationV3 names the evidence generation a carried selection
+// was minted against. The session's retained evidence is authoritative; the
+// carry's file only supplies the row and path when the session predates the
+// provenance fields.
+func subtitleCarryGenerationV3(session *playback.Session, carry carriedInventorySourceV3) playback.SubtitleCarryGenerationV3 {
+	generation := playback.SubtitleCarryGenerationV3{}
+	if session != nil {
+		generation.CandidateURI = strings.TrimSpace(session.VirtualSubtitleEvidenceURI)
+		generation.EvidenceRowID = session.VirtualSubtitleEvidenceFileID
+		generation.SourceRevision = session.VirtualSourceRevision
+	}
+	if carry.file != nil {
+		if generation.CandidateURI == "" {
+			generation.CandidateURI = strings.TrimSpace(carry.file.FilePath)
+		}
+		if generation.EvidenceRowID == 0 {
+			generation.EvidenceRowID = carry.file.ID
+		}
+	}
+	return generation
+}
+
+// subtitleCarryKeyForOrdinalV3 builds the identity of one combined subtitle
+// ordinal against the evidence generation it was minted on. It reports false
+// when the ordinal does not classify against that evidence at all — a captured-
+// empty inventory, a malformed ordinal, or a downloaded ordinal whose tail was
+// never captured. A missing key is never a reason to reinterpret the ordinal
+// against the replacement: the caller must fail closed.
+func subtitleCarryKeyForOrdinalV3(carry carriedInventorySourceV3, ordinal int, generation playback.SubtitleCarryGenerationV3) (playback.SubtitleCarryKeyV3, bool) {
+	key := playback.SubtitleCarryKeyV3{Generation: generation}
+	if carry.file == nil || ordinal < 0 {
+		return key, false
+	}
+	location, ok := classifySubtitleIndexV3(carry.file, ordinal)
+	if !ok {
+		return key, false
+	}
+	switch location.source {
+	case playback.SubtitleSourceExternalV3:
+		if location.offset < 0 || location.offset >= len(carry.file.ExternalSubtitles) {
+			return key, false
+		}
+		sub := carry.file.ExternalSubtitles[location.offset]
+		key.Source = playback.SubtitleSourceExternalV3
+		key.Language = sub.Language
+		key.MuxerClass = playback.SubtitleCarryMuxerClassV3(sub.Format)
+		key.CodecNormalized = playback.SubtitleCarryCodecV3(sub.Format)
+		key.Forced = sub.Forced
+		key.HearingImpaired = sub.HearingImpaired
+		key.Title = playback.SubtitleCarryExternalLabelV3(sub)
+	case playback.SubtitleSourceEmbeddedV3:
+		if location.offset < 0 || location.offset >= len(carry.file.SubtitleTracks) {
+			return key, false
+		}
+		track := carry.file.SubtitleTracks[location.offset]
+		key.Source = playback.SubtitleSourceEmbeddedV3
+		key.Language = track.Language
+		key.MuxerClass = playback.SubtitleCarryMuxerClassV3(track.Codec)
+		key.CodecNormalized = playback.SubtitleCarryCodecV3(track.Codec)
+		key.Forced = track.Forced
+		key.HearingImpaired = track.HearingImpaired
+		key.Title = playback.SubtitleCarryEmbeddedLabelV3(track)
+	case playback.SubtitleSourceDownloadedV3:
+		// A historical downloaded ordinal cannot be placed without the tail
+		// the evidence published: the repository list may have been rewritten
+		// under the same row. Captured-empty evidence is equally unusable.
+		if !carry.downloadedKnown || location.offset < 0 || location.offset >= len(carry.downloaded) {
+			return key, false
+		}
+		item := carry.downloaded[location.offset]
+		key.Source = playback.SubtitleSourceDownloadedV3
+		key.Language = item.Language
+		key.MuxerClass = playback.SubtitleCarryMuxerClassV3(item.Codec)
+		key.CodecNormalized = playback.SubtitleCarryCodecV3(item.Codec)
+		key.Forced = item.Forced
+		key.HearingImpaired = item.HearingImpaired
+		key.Title = item.Label
+		key.DownloadedRowID = downloadedSubtitleCarryIDV3(item)
+	default:
+		return key, false
+	}
+	return key, true
+}
+
+// carrySubtitleSelectionAcrossRotationV3 resolves one carried combined ordinal
+// from the evidence generation it was minted on onto target with the strict
+// rotation matcher. It returns the key it carried (for provenance), the
+// target's published ordinal, whether the match is exact, and whether a unique
+// match exists. A subtitle-store failure is returned, never treated as a miss:
+// an unread downloaded tail cannot prove the track is gone.
+func (h *PlaybackHandler) carrySubtitleSelectionAcrossRotationV3(ctx context.Context, session *playback.Session, carry carriedInventorySourceV3, target *models.MediaFile, ordinal int) (playback.SubtitleCarryKeyV3, int, bool, bool, error) {
+	key, keyed := subtitleCarryKeyForOrdinalV3(carry, ordinal, subtitleCarryGenerationV3(session, carry))
+	if !keyed {
+		return key, 0, false, false, nil
+	}
+	var targetDownloaded []playback.SubtitleInventoryEntryV3
+	if key.Source == playback.SubtitleSourceDownloadedV3 {
+		downloaded, err := h.listDownloadedSubtitlesV3(ctx, target)
+		if err != nil {
+			return key, 0, false, false, err
+		}
+		targetDownloaded = downloaded
+	}
+	published, exact, matched := playback.MatchSubtitleCarryTrackV3(key, target, targetDownloaded)
+	return key, published, exact, matched, nil
+}
+
+// applySubtitleCarryOrdinalV3 writes a carried published ordinal onto the
+// request and keeps the identity in step, so NormalizeAndValidate never sees an
+// id and index naming different tracks.
+func applySubtitleCarryOrdinalV3(request *playback.StartRequestV3, target *models.MediaFile, ordinal int) {
+	if request == nil || target == nil {
+		return
+	}
+	value := ordinal
+	request.SubtitleTrackIndex = &value
+	request.SubtitleTrackID = playback.TrackIDV3(target.ID, "subtitle", ordinal)
+}
+
+// reconcileRotationSubtitleSelectionV3 carries the request's selected subtitle
+// across a recorded candidate rotation. attempted is false when the request
+// names no track (or explicitly asks for subtitles off), so a caller never
+// mistakes "nothing to carry" for a miss. On a miss the request is left
+// untouched for the existing degrade paths; the caller clears it and reports the
+// loss.
+func (h *PlaybackHandler) reconcileRotationSubtitleSelectionV3(ctx context.Context, session *playback.Session, carry carriedInventorySourceV3, target *models.MediaFile, request *playback.StartRequestV3) (fromIndex, toIndex int, exact, matched, attempted bool, err error) {
+	if request == nil || target == nil || carry.file == nil {
+		return 0, 0, false, false, false, nil
+	}
+	if request.SubtitleTrackIndex != nil && *request.SubtitleTrackIndex == playback.SubtitleTrackOffIndexV3 {
+		return 0, 0, false, false, false, nil
+	}
+	ordinal, ok := subtitleSelectionOrdinalV3(carry.file, request)
+	if !ok {
+		return 0, 0, false, false, false, nil
+	}
+	// A selection whose ordinal does not classify against the evidence at all
+	// (captured-empty inventory, or a downloaded ordinal without its captured
+	// tail) has nothing to carry: the caller's existing captured-empty and
+	// fail-closed paths decide its fate. It is not a rotation miss.
+	if _, keyed := subtitleCarryKeyForOrdinalV3(carry, ordinal, subtitleCarryGenerationV3(session, carry)); !keyed {
+		return 0, 0, false, false, false, nil
+	}
+	_, published, exact, matched, err := h.carrySubtitleSelectionAcrossRotationV3(ctx, session, carry, target, ordinal)
+	if err != nil || !matched {
+		return ordinal, 0, false, false, true, err
+	}
+	applySubtitleCarryOrdinalV3(request, target, published)
+	return ordinal, published, exact, true, true, nil
 }
 
 // keepRekeyedSubtitleWithinSameInventoryV3 decides whether a selection whose
@@ -841,6 +1124,15 @@ func (h *PlaybackHandler) keepRekeyedSubtitleWithinSameInventoryV3(ctx context.C
 // remap, so it is re-checked against the captured rows here — unless the caller
 // already reconciled the ordinal, see trackSelectionCurrent.
 func (h *PlaybackHandler) rekeyReplanTrackIdentitiesV3(ctx context.Context, start *playback.StartRequestV3, file *models.MediaFile, session *playback.Session, durable map[int]predecessorPlanInventoryV3, trackSelectionCurrent bool) (audioUnavailable, subtitleUnavailable bool, err error) {
+	return h.rekeyReplanTrackIdentitiesWithRotationV3(ctx, start, file, session, durable, trackSelectionCurrent, false)
+}
+
+// rekeyReplanTrackIdentitiesWithRotationV3 is the rotation-gated form: a
+// selection carried across a recorded candidate rotation is matched with the
+// strict release-rotation matcher. A fresh viewer pick (trackSelectionCurrent)
+// never enters that matcher, because its ordinal was minted against the current
+// menu and must be read through the inventory that published it.
+func (h *PlaybackHandler) rekeyReplanTrackIdentitiesWithRotationV3(ctx context.Context, start *playback.StartRequestV3, file *models.MediaFile, session *playback.Session, durable map[int]predecessorPlanInventoryV3, trackSelectionCurrent, rotation bool) (audioUnavailable, subtitleUnavailable bool, err error) {
 	if h == nil || h.fileResolver == nil || start == nil || file == nil {
 		return false, false, nil
 	}
@@ -925,7 +1217,7 @@ func (h *PlaybackHandler) rekeyReplanTrackIdentitiesV3(ctx context.Context, star
 		// Normalize to the target row first so the edition-switch matcher reads
 		// the carried ordinal regardless of which committed row minted it.
 		start.SubtitleTrackID = playback.TrackIDV3(file.ID, "subtitle", ordinal)
-		subtitleUnavailable, err = h.constrainRekeyedSubtitleSelectionV3(ctx, start, source, file)
+		subtitleUnavailable, err = h.constrainRekeyedSubtitleSelectionWithRotationV3(ctx, start, source, file, rotation && !trackSelectionCurrent)
 		if err != nil {
 			return audioUnavailable, subtitleUnavailable, err
 		}

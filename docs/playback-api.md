@@ -755,10 +755,29 @@ the replacement's inventory by the concrete language it carries (the same
 language-carriage rule a version switch uses); codec and channel layout may
 differ between releases and are not required to match. When no track carries
 that language, the fallback starts on the replacement's default and reports an
-audio-unavailable degradation warning instead of silently resetting. A subtitle
-selection has no cross-release identity matcher yet, so the fallback starts with
-subtitles off and logs the reset; the client keeps the requested subtitle
-identity in its own state and can reselect it from the replacement's inventory.
+audio-unavailable degradation warning instead of silently resetting.
+
+A subtitle selection is carried across a candidate rotation by identity. The
+track source (external sidecar, embedded, or downloaded), the output muxer class
+(WebVTT, ASS, or PGS), the canonical language, the forced flag, and the
+hearing-impaired flag are hard gates; the normalized codec and the displayed
+title only break ties, and two tracks that still cannot be told apart fail
+closed rather than picking one. A downloaded subtitle resolves by its stable
+row id first and then by language and format, never by title. A unique match
+moves the selection to the rotated release's ordinal and is silent when both
+tiebreaks agree; a match that differs on a tiebreak is kept and reported as a
+`subtitle_carry_warning` degradation warning. No match clears the selection,
+starts with subtitles off, reports `subtitle_track_unavailable`, and records the
+rotation's from/to candidates.
+
+The rotation commit records the carried ordinal with the new candidate
+generation. A subtitle URL minted before the rotation is therefore answered on
+the carried ordinal, and a second rotation re-keys from that position. When the
+rotation could not preserve the selection, the old ordinal is terminal: the
+subtitle fetch answers the retryable `409 subtitle_source_changed` with a
+`Retry-After` header instead of resolving the dead candidate or spawning an
+extraction. The client replans and re-selects from the rotated inventory; it
+keeps the requested subtitle identity in its own state meanwhile.
 
 A seek is one server operation. Issue a single media request for the new
 position; sending the same seek twice (or aborting and immediately re-sending an

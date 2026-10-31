@@ -343,6 +343,16 @@ var virtualFailedVerdictMaxAge = 24 * time.Hour
 // selected because its catalog row carries an active failed_at verdict.
 var ErrVirtualCandidateMarkedFailed = errors.New("candidate is marked failed")
 
+// errVirtualRotationExhaustedV3 marks a replan rehydration that already
+// declared candidate rotation and still found no viable provider candidate.
+// The rotation retry is the authoritative signal: it re-lists and substitutes
+// within the release, so its failure means the release has nothing left to
+// serve. A caller that would otherwise walk sibling editions can stop without
+// re-paying the resolve and probe budgets: every virtual sibling resolves
+// through the same provider, and the provider has just answered that it has
+// nothing for this release.
+var errVirtualRotationExhaustedV3 = errors.New("virtual replan candidate rotation exhausted")
+
 // isRehydratedVirtualSourceRotatableV3 reports whether an error from
 // resolving a session-bound candidate indicates that the candidate cannot
 // be served (absent from the provider's current list, or marked failed),
@@ -2221,7 +2231,11 @@ func (h *PlaybackHandler) resolveRehydratedVirtualSourceWithAttemptV3(
 			"component", "api", "session_anchor", pinnedFile.FilePath,
 			"status", "rotation_failed", "old_candidate_id", virtualResultCandidateID(pinnedFile.FilePath),
 			"error", logredact.SanitizeURLError(rotateErr))
-		return rotated, rotateErr
+		// The retry declared rotation, so a failure here is the rotation's own
+		// exhaustion verdict rather than a verdict about one listing token.
+		// Mark it so a replan does not repeat this resolve for every sibling
+		// edition before reaching the same answer.
+		return rotated, fmt.Errorf("%w: %w", errVirtualRotationExhaustedV3, rotateErr)
 	}
 	// Same-release assertion, mirroring the transport anchor refusal. A
 	// rotation that resolves a genuinely different release must not anchor the
@@ -6564,6 +6578,15 @@ func (h *PlaybackHandler) fallbackResolveStaleVirtualSource(
 		if !elig.allowsSibling() && !reconcileCollection {
 			return nil
 		}
+		// A canceled request must stop the walk, not fail every remaining
+		// sibling: each resolve errors instantly on the dead context and the
+		// per-sibling lines below would turn one abandoned client into an
+		// ERROR storm.
+		if ctx.Err() != nil {
+			slog.InfoContext(ctx, "virtual stale fallback: walk abandoned, client gone",
+				"component", "api", "file_id", file.ID)
+			return nil
+		}
 		attempts++
 		if attempts > maxAttempts {
 			break
@@ -6736,11 +6759,21 @@ func (h *PlaybackHandler) fallbackResolveStaleVirtualSource(
 			// try other siblings while the catalog is unhealthy, and treating
 			// the unknown verdict as a dead candidate could substitute one the
 			// verdict system never cleared. Fail the whole fallback closed.
-			slog.ErrorContext(ctx, "virtual stale fallback: refusing to substitute while the candidate verdict is unknown",
+			// A canceled scan is the client going away, not a server fault:
+			// do not page on it.
+			level := slog.LevelError
+			if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+				level = slog.LevelWarn
+			}
+			slog.Log(ctx, level, "virtual stale fallback: refusing to substitute while the candidate verdict is unknown",
 				"component", "api", "candidate", stream.URI, "error", err)
 			return nil
 		}
-		slog.ErrorContext(ctx, "virtual stale fallback: candidate failed", "component", "api", "candidate", stream.URI, "error", err)
+		level := slog.LevelError
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+			level = slog.LevelWarn
+		}
+		slog.Log(ctx, level, "virtual stale fallback: candidate failed", "component", "api", "candidate", stream.URI, "error", err)
 	}
 	return nil
 }
