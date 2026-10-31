@@ -80,7 +80,18 @@ func TestEpisodeAliasIdentityGuardSerializesConcurrentWritesPostgres(t *testing.
 	if err != nil {
 		t.Fatalf("connect second writer: %v", err)
 	}
-	t.Cleanup(func() { _ = connTwo.Close(context.Background()) })
+	// The writer keeps using connTwo after it publishes its outcome: its
+	// deferred rollback flushes on the same PgConn the cleanup would close.
+	// Closing under that in-flight flush trips pgx's write timer ("BUG: slow
+	// write timer already active"), so wait for the goroutine to return first.
+	writerDone := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-writerDone:
+		case <-time.After(5 * time.Second):
+		}
+		_ = connTwo.Close(context.Background())
+	})
 
 	txOne, err := connOne.Begin(ctx)
 	if err != nil {
@@ -98,6 +109,7 @@ func TestEpisodeAliasIdentityGuardSerializesConcurrentWritesPostgres(t *testing.
 	started := make(chan int32, 1)
 	outcome := make(chan insertOutcome, 1)
 	go func() {
+		defer close(writerDone)
 		txTwo, err := connTwo.Begin(ctx)
 		if err != nil {
 			outcome <- insertOutcome{err: fmt.Errorf("begin second writer: %w", err)}

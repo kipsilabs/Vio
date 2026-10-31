@@ -31,7 +31,7 @@ func sourceMismatchProbedRow(filePath string) *models.MediaFile {
 	}
 }
 
-func postVersionCheck(t *testing.T, h *CatalogResourceHandler, ids ...int) versionCheckResponse {
+func postVersionCheckViaRouter(t *testing.T, h *CatalogResourceHandler, ids ...int) versionCheckResponse {
 	t.Helper()
 	router := chi.NewRouter()
 	router.Post("/catalog/versions/check", h.HandleCheckVersions)
@@ -79,7 +79,7 @@ func TestVersionCheckReportsSourceMismatchWithoutFailed(t *testing.T) {
 		},
 	}
 
-	resp := postVersionCheck(t, h, file.ID)
+	resp := postVersionCheckViaRouter(t, h, file.ID)
 	if len(resp.Results) != 1 {
 		t.Fatalf("results = %d, want 1", len(resp.Results))
 	}
@@ -122,7 +122,7 @@ func TestVersionCheckLeavesUnprobedRowsGeneric(t *testing.T) {
 		ItemAccess:   permissiveItemAccess{},
 	}
 
-	resp := postVersionCheck(t, h, file.ID)
+	resp := postVersionCheckViaRouter(t, h, file.ID)
 	if len(resp.Results) != 1 {
 		t.Fatalf("results = %d, want 1", len(resp.Results))
 	}

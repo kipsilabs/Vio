@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Silo-Server/silo-server/internal/virtuallibrary"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary/resolver"
 )
 
@@ -34,6 +35,36 @@ func TestRetryVirtualProviderOutageResolveIsBounded(t *testing.T) {
 	}
 	if got := len(virtualProviderOutageBackoff); got == 0 {
 		t.Fatal("test replaced the backoff with an empty schedule; retry bound is not exercised")
+	}
+}
+
+// TestRetryVirtualProviderOutageResolveSkipsBackoffForMarkedTitle proves the
+// fail-fast sentinel retries without waiting: the resolve never contacted the
+// provider, so there is no round-trip to back off from. The schedule is set to
+// an hour, which would blow the test context if the wait were applied.
+func TestRetryVirtualProviderOutageResolveSkipsBackoffForMarkedTitle(t *testing.T) {
+	restore := virtualProviderOutageBackoff
+	virtualProviderOutageBackoff = []time.Duration{time.Hour, time.Hour}
+	defer func() { virtualProviderOutageBackoff = restore }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	calls := 0
+	resolved, err := retryVirtualProviderOutageResolve(ctx, true, func(context.Context, bool) (ResolvedVirtualMedia, error) {
+		calls++
+		if calls == 1 {
+			return ResolvedVirtualMedia{}, fmt.Errorf("resolve virtual input: %w: title virtual://movie/tt-marked", virtuallibrary.ErrTitleWithoutStreams)
+		}
+		return ResolvedVirtualMedia{URI: "virtual://movie/tt-marked?result=live", URL: "https://provider.test/live.mp4"}, nil
+	})
+	if err != nil {
+		t.Fatalf("retry after the fail-fast sentinel = %v, want recovery", err)
+	}
+	if calls != 2 {
+		t.Fatalf("provider calls = %d, want 2 (initial + one immediate relist)", calls)
+	}
+	if resolved.URI == "" {
+		t.Fatal("retry returned no resolved URI")
 	}
 }
 

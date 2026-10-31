@@ -49,6 +49,37 @@ func TestReconcileAltMountVerdictsStampsFailedReleases(t *testing.T) {
 	}
 }
 
+// Every result= variant of one release must be stamped, not just the first:
+// leaving a sibling unstamped keeps the failed release selectable.
+func TestReconcileAltMountVerdictsStampsEverySiblingRow(t *testing.T) {
+	var stamped []int
+	lookups := 0
+	executor := &VirtualCandidatesRefreshExecutor{
+		ReleaseFailed: func(releaseName string) (bool, bool) {
+			lookups++
+			return strings.EqualFold(releaseName, "bad release"), true
+		},
+		MarkFailed: func(_ context.Context, fileID int, _ string, _ *time.Time) error {
+			stamped = append(stamped, fileID)
+			return nil
+		},
+	}
+	sources := []*models.MediaFile{
+		reconcileTestRow(1, "virtual://x?result=a", "Bad Release"),
+		reconcileTestRow(2, "virtual://x?result=b", "Bad Release"),
+		reconcileTestRow(3, "virtual://x?result=c", "bad release"),
+	}
+	if n := executor.reconcileAltMountVerdicts(context.Background(), "episode-test", "", sources); n != 3 {
+		t.Fatalf("stamped = %d, want 3 sibling rows", n)
+	}
+	if len(stamped) != 3 || stamped[0] != 1 || stamped[1] != 2 || stamped[2] != 3 {
+		t.Fatalf("stamped rows = %v, want [1 2 3]", stamped)
+	}
+	if lookups != 1 {
+		t.Fatalf("AltMount lookups = %d, want 1 per release name", lookups)
+	}
+}
+
 // Unknown, downloading, already-stamped, and nameless rows are never
 // indicted: only an explicit failed verdict from AltMount stamps.
 func TestReconcileAltMountVerdictsLeavesOthersAlone(t *testing.T) {
