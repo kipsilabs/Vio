@@ -5955,7 +5955,7 @@ func (h *PlaybackHandler) virtualProbeEvidenceArgsForRow(ctx context.Context, ca
 	// same release under a new listing token.
 	crossRelease := !virtualProbeEvidenceSharesRowRelease(catalogFile, resolvedPath, candidate)
 
-	if stampProbe && probed != nil && probed.ProbedFormatSize > 0 {
+	if stampProbe && probed != nil && probed.ProbedFormatSize > 0 { //nolint:nestif // upstream virtualProbeEvidenceArgsForRow in playback_virtual.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
 		var declaredSize int64
 		if crossRelease {
 			// For cross-release adoption, validate served bytes against the incoming
