@@ -234,3 +234,35 @@ func TestAudioLayoutsEqualDetectsSameRowRotation(t *testing.T) {
 		t.Fatal("reordered MULTI languages compared unequal")
 	}
 }
+
+// Two releases can agree on language, codec, channels, layout, and container
+// index while ordering a main track and a commentary track differently. Titles
+// are the only identity evidence that exposes the swap, so a carried ordinal
+// must be remapped instead of reusing the position.
+func TestAudioLayoutsEqualDetectsSameLanguageTitleOnlyReorder(t *testing.T) {
+	mainTrack := func(index int) models.AudioTrack {
+		return models.AudioTrack{Index: index, Codec: "aac", Language: "eng", Layout: "stereo", Channels: 2, Title: "Main"}
+	}
+	commentary := func(index int) models.AudioTrack {
+		return models.AudioTrack{Index: index, Codec: "aac", Language: "eng", Layout: "stereo", Channels: 2, Title: "Commentary"}
+	}
+	mainFirst := []models.AudioTrack{mainTrack(0), commentary(1)}
+	commentaryFirst := []models.AudioTrack{commentary(0), mainTrack(1)}
+	if AudioLayoutsEqual(mainFirst, commentaryFirst) {
+		t.Fatal("main/commentary reorder compared equal; the carried ordinal would silently name the other track")
+	}
+
+	// EmbeddedTitle is identity evidence too: providers often leave Title empty
+	// and name the stream only in the container's embedded title.
+	embeddedMain := models.AudioTrack{Index: 0, Codec: "eac3", Language: "eng", Channels: 6, EmbeddedTitle: "English 5.1"}
+	embeddedCommentary := models.AudioTrack{Index: 0, Codec: "eac3", Language: "eng", Channels: 6, EmbeddedTitle: "English Commentary"}
+	if AudioLayoutsEqual([]models.AudioTrack{embeddedMain}, []models.AudioTrack{embeddedCommentary}) {
+		t.Fatal("embedded-title-only difference compared equal")
+	}
+
+	// Case and surrounding whitespace are not identity changes.
+	reformatted := models.AudioTrack{Index: 0, Codec: "AAC", Language: "ENG", Layout: " Stereo ", Channels: 2, Title: " main "}
+	if !AudioLayoutsEqual([]models.AudioTrack{mainTrack(0)}, []models.AudioTrack{reformatted}) {
+		t.Fatal("case/whitespace-only title difference compared unequal")
+	}
+}

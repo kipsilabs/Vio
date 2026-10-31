@@ -298,6 +298,19 @@ func remapAudioSelectionIndex(prev []models.AudioTrack, selectedIndex int, next 
 		return -1
 	}
 	selected := prev[selectedIndex]
+	// A synthesized placeholder carries no identity at all (the virtual rows a
+	// provider declares before its first probe look like {Index: -1,
+	// Default: true}). There is nothing to re-identify, and matching an empty
+	// signature against a real list would tie every track and fail closed with
+	// an invalid selection the client never asked for. Re-resolve the committed
+	// intent as "the default track of the verified list", which is what the
+	// placeholder meant, so the menu keeps the pick the viewer sees.
+	if AudioTrackSignatureFromTrack(selected) == nil {
+		if len(next) == 0 {
+			return -1
+		}
+		return SelectAudioTrack(next, "", nil)
+	}
 	// Absolute stream index is only meaningful in a probed inventory; a
 	// synthesized virtual list carries Index 0 for every track, where matching
 	// on it would collide every track. When the plan-time inventory was probed

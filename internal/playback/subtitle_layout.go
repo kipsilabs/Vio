@@ -92,10 +92,13 @@ func SubtitleLayoutsEqualIncludingExternal(
 
 // AudioLayoutsEqual reports whether two audio inventories are identical on
 // every attribute the selection and extraction path depends on: container
-// index, codec, language/languages, layout, and channel count. A same-row
-// virtual candidate rotation replaces the row's probed tracks without moving
-// the row id, so callers compare this fingerprint instead of id equality to
-// decide whether a carried selection still names the same track.
+// index, codec, language/languages, layout, channel count, and the display and
+// embedded titles. Titles are identity evidence: a release can reorder a main
+// and a commentary track that agree on language, codec, channels and layout, so
+// without them the carried ordinal would silently move to the other stream. A
+// same-row virtual candidate rotation replaces the row's probed tracks without
+// moving the row id, so callers compare this fingerprint instead of id equality
+// to decide whether a carried selection still names the same track.
 func AudioLayoutsEqual(a, b []models.AudioTrack) bool {
 	if len(a) != len(b) {
 		return false
@@ -108,6 +111,8 @@ func AudioLayoutsEqual(a, b []models.AudioTrack) bool {
 			!strings.EqualFold(strings.TrimSpace(at.Layout), strings.TrimSpace(bt.Layout)) ||
 			at.Channels != bt.Channels ||
 			at.Profile != bt.Profile ||
+			!trackStringEqual(at.Title, bt.Title) ||
+			!trackStringEqual(at.EmbeddedTitle, bt.EmbeddedTitle) ||
 			!stringSlicesEqualFold(at.Languages, bt.Languages) {
 			return false
 		}
