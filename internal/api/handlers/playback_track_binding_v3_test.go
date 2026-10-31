@@ -779,7 +779,7 @@ func TestReplanSameRowReprobeUsesPredecessorInventoryWithoutLiveSession(t *testi
 		t.Fatalf("durable inventory = %+v, want the predecessor's English@1 audio", durable[current.ID])
 	}
 	handler := &PlaybackHandler{}
-	source := handler.replanRemapSourceV3(current, nil, durable).file
+	source := handler.replanRemapSourceV3(context.Background(), current, nil, durable).file
 	if sameMediaInventoryV3(source, current) {
 		t.Fatal("remap source reported the re-probed row as unchanged; the stale ordinal would be reused")
 	}
