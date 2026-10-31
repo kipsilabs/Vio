@@ -169,11 +169,12 @@ func TestVirtualProbeCacheDoesNotStoreServedSizeMismatch(t *testing.T) {
 	}
 }
 
-// A short-posted release is the right content even though its served container
-// is smaller than the row declares. The cache keeps that evidence when the
-// measured duration proves identity, so the playback path reuses it instead of
-// re-probing the provider on every start.
-func TestVirtualProbeCacheStoresServedSizeMismatchWhenDurationProvesIdentity(t *testing.T) {
+// A short-posted release can still be the right content, so its bytes stay
+// playable for the current request. A plausible duration does not prove which
+// release was served, though, so the evidence is unverified and must not be
+// cached as the row's inventory: the playback path would then reuse unproven
+// tracks and sizing for the whole TTL.
+func TestVirtualProbeCacheDoesNotStoreUnverifiedSizeMismatch(t *testing.T) {
 	cache := NewVirtualProbeCache(time.Minute, 4)
 	file := &models.MediaFile{
 		ID: 7, FilePath: "virtual://movie/tt7", FileSize: 6_330_000_000,
@@ -184,20 +185,23 @@ func TestVirtualProbeCacheStoresServedSizeMismatchWhenDurationProvesIdentity(t *
 		calls.Add(1)
 		result := *input
 		result.ProbedFormatSize = 5_570_000_000 // 12% short posting
-		result.Duration = 3072                  // 51.2 minutes: identity proven
+		result.Duration = 3072                  // 51.2 minutes: plausible, not proof
 		return &result, nil
 	}
-	if _, err := cache.Probe(context.Background(), "https://provider.example/video.mkv", file, probe); err != nil {
-		t.Fatal(err)
+	for i := 0; i < 2; i++ {
+		probed, err := cache.Probe(context.Background(), "https://provider.example/video.mkv", file, probe)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if probed == nil || probed.ProbedFormatSize != 5_570_000_000 {
+			t.Fatalf("probe %d: unverified evidence must still be returned playable, got %+v", i, probed)
+		}
 	}
-	if _, err := cache.Probe(context.Background(), "https://provider.example/video.mkv", file, probe); err != nil {
-		t.Fatal(err)
+	if calls.Load() != 2 {
+		t.Fatalf("unverified probe calls=%d, want 2: unverified evidence must not be cached", calls.Load())
 	}
-	if calls.Load() != 1 {
-		t.Fatalf("short-posting probe calls=%d, want 1 from the cache", calls.Load())
-	}
-	if cached := cache.Lookup("https://provider.example/video.mkv", file); cached == nil {
-		t.Fatal("duration-proven short posting was not cached")
+	if cached := cache.Lookup("https://provider.example/video.mkv", file); cached != nil {
+		t.Fatal("unverified size mismatch was cached as the row's inventory")
 	}
 }
 
