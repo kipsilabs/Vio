@@ -546,9 +546,12 @@ type transportErrorV3 struct {
 	// seekFailure marks a retryable failure to resolve the seek position itself
 	// (the copy-video anchor probe or its relay lookup) rather than a verdict
 	// about the release. A start must surface it to the client as a retryable
-	// seek error instead of rotating to another version, and a replan must not
-	// tear down the serving transport over it: the bytes may be fine and only
-	// the probe was slow or the relay answered 5xx.
+	// seek error instead of rotating to another version. A seek-failure replan
+	// reaches the same verdict through the replacement path: a failed
+	// replacement rolls back to the plan already serving, so the live transport
+	// is left untouched and the bytes may still be fine — only the probe was
+	// slow or the relay answered 5xx. This flag is read only by the start path;
+	// it never drives replan teardown.
 	seekFailure bool
 }
 
