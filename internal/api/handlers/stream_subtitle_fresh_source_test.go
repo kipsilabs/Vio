@@ -52,7 +52,7 @@ func TestRetryVirtualSubtitleWithFreshSourceReplacesDeadInput(t *testing.T) {
 		InputPath:     dead.URL,
 		TrackIndex:    2,
 		SourceCodec:   "subrip",
-		CacheIdentity: playback.VirtualSubtitleCacheIdentity(file.ID, session.VirtualSourceURI, 2),
+		CacheIdentity: virtualSubtitleCacheIdentity(file, session.VirtualSourceURI, 2),
 	}
 	identity := opts.CacheIdentity
 
@@ -146,7 +146,7 @@ func TestRetryVirtualSubtitleWithFreshSourceResolveFailureKeepsFailedInput(t *te
 		InputPath:     "http://127.0.0.1:1/source/dead/stream",
 		TrackIndex:    0,
 		SourceCodec:   "subrip",
-		CacheIdentity: playback.VirtualSubtitleCacheIdentity(file.ID, session.VirtualSourceURI, 0),
+		CacheIdentity: virtualSubtitleCacheIdentity(file, session.VirtualSourceURI, 0),
 	}
 	input := opts.InputPath
 	released := 0

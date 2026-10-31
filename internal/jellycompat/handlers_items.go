@@ -377,7 +377,9 @@ func (h *ItemsHandler) HandleItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	selectedFileID := 0
 	if fileID, err := h.codec.DecodeIntID(EncodedIDMediaSource, rawID); err == nil {
+		selectedFileID = int(fileID)
 		contentID, err := h.codec.ResolveMediaSourceOwner(r.Context(), fileID)
 		if err != nil {
 			writeItemIDError(w, r, err)
@@ -409,7 +411,10 @@ func (h *ItemsHandler) HandleItem(w http.ResponseWriter, r *http.Request) {
 		writeCompatUpstreamError(w, err)
 		return
 	}
-	dto := h.mapper.itemFromDetail(*detail, favorites[detail.ContentID], progress[detail.ContentID])
+	// Drop durably failed versions for the detail list, but keep the version
+	// the client addressed so its own row is not yanked mid-session.
+	detail.Versions = compatLiveVersions(detail.Versions, selectedFileID)
+	dto := h.mapper.itemFromDetailWithFieldsSelected(*detail, selectedFileID, favorites[detail.ContentID], progress[detail.ContentID], nil)
 	h.populateDetailSubtitles(r.Context(), detail, &dto, savedCompatSubtitleMode(r.Context(), h.storeProvider, session))
 	if strings.EqualFold(detail.Type, "series") {
 		if seasons, seasonErr := h.content.ListSeasons(r.Context(), session, detail.ContentID, nil); seasonErr == nil {

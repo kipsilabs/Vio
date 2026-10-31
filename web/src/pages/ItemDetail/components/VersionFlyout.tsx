@@ -22,6 +22,7 @@ import {
 } from "./versionFormatUtils";
 import { audioScore, resolutionScore } from "./versionRankingUtils";
 import { isVersionUnavailable, useVersionVisibility } from "./versionAvailability";
+import { deriveVersionHealth } from "@/lib/versionHealth";
 
 export { buildQualitySummary };
 
@@ -82,6 +83,7 @@ export default function VersionFlyoutItems({ versions, onPlayVersion }: VersionF
           version.container === "virtual" ||
           Boolean(version.file_path?.toLowerCase().startsWith("virtual://"));
         const unavailable = isVersionUnavailable(version);
+        const health = deriveVersionHealth(version);
 
         return (
           <DropdownMenuItem
@@ -110,12 +112,17 @@ export default function VersionFlyoutItems({ versions, onPlayVersion }: VersionF
                       Virtual
                     </Badge>
                   )}
-                  {unavailable && (
+                  {health && (
                     <Badge
                       variant="outline"
-                      className="shrink-0 border-amber-500/30 bg-amber-500/15 px-1.5 py-0 text-[10px] font-medium text-amber-600 dark:text-amber-300"
+                      title={health.title}
+                      className={
+                        health.tone === "danger"
+                          ? "shrink-0 border-red-500/30 bg-red-500/15 px-1.5 py-0 text-[10px] font-medium text-red-600 dark:text-red-300"
+                          : "shrink-0 border-amber-500/30 bg-amber-500/15 px-1.5 py-0 text-[10px] font-medium text-amber-600 dark:text-amber-300"
+                      }
                     >
-                      Will retry on play
+                      {health.label}
                     </Badge>
                   )}
                 </span>

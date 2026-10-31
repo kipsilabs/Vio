@@ -378,6 +378,11 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 	}
 	failedCandidateIDs := make([]string, 0)
 	for attempt := 0; attempt < maxAttempts; attempt++ {
+		// audioCarry records this attempt's cross-release audio outcome. Only a
+		// degraded fallback that actually becomes the committed transport is
+		// reported on the plan; an attempt that fails and rotates away leaves
+		// its verdict behind with it.
+		audioCarry := fallbackAudioCarryNone
 		targetURI := canonicalPath
 		if attempt > 0 {
 			targetURI = neutralPath
@@ -419,7 +424,15 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 				// otherwise spin this loop with no sleep, hammering the
 				// provider with fresh listings. One second per attempt is
 				// negligible against the hold cap and bounds the spin.
-				if !sleepWithContext(resolveStartupCtx, virtualPendingLoopPause) {
+				contentID, fileID := "", 0
+				if file != nil {
+					contentID, fileID = file.ContentID, file.ID
+				}
+				pauseLog := startVirtualResolveWaitLog(resolveStartupCtx, "sleep", "pending_retry_pause", contentID, fileID, canonicalPath,
+					virtualPendingLoopPause, virtualPendingHoldCap)
+				paused := sleepWithContext(resolveStartupCtx, virtualPendingLoopPause)
+				pauseLog.finish(resolveStartupCtx.Err())
+				if !paused {
 					break
 				}
 				continue
@@ -496,15 +509,14 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 		// replacement is probed synchronously under the remaining startup
 		// budget, and the session is built on the probed facts — source
 		// codecs, audio layout/channels, HDR range — instead of the pinned
-		// release's. Selections reset to the container default (audio and
-		// subtitle -1, no burn-in): the client starts from a valid track on
-		// the replacement rather than an ordinal that means something else
-		// (or nothing) there. The first attempt (the pinned release itself)
-		// keeps the plan's selections untouched. A probe failure does not
-		// fail the fallback: the attempt proceeds on reset-to-default opts
-		// (the pre-#118 behavior) so a slow prober cannot wedge startup.
+		// release's. The audio selection is re-identified on the probed
+		// replacement; a subtitle selection has no cross-release identity
+		// matcher yet, so it is reset to off and the reset is logged. The first
+		// attempt (the pinned release itself) keeps the plan's selections
+		// untouched. A probe failure does not fail the fallback: the attempt
+		// proceeds on declared facts and the replacement's default audio (the
+		// pre-#118 behavior) so a slow prober cannot wedge startup.
 		if attempt > 0 {
-			attemptOpts.AudioTrackIndex = -1
 			attemptOpts.SubtitleTrackIndex = -1
 			attemptOpts.SubtitleBurnIn = false
 			attemptOpts.SourceVideoCodec = ""
@@ -516,11 +528,27 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 			// already fall through to declared metadata, so this stays
 			// best-effort and never fails the fallback.
 			h.fireExpiredVirtualRefresh(startupCtx, file, ownerInstallationID, userID, profileID, resolvedMedia.ExpiresAt)
-			if probedFacts := h.probeVirtualFallbackSource(startupCtx, resolvedMedia, file); probedFacts != nil {
+			probedFacts := h.probeVirtualFallbackSource(startupCtx, resolvedMedia, file)
+			if probedFacts != nil {
 				attemptOpts.SourceVideoCodec = probedFacts.CodecVideo
 				attemptOpts.SourceVideoProfile = virtualFallbackVideoProfile(probedFacts)
 				attemptOpts.SourceVideoBitDepth = virtualFallbackVideoBitDepth(probedFacts)
 				attemptOpts.SourceAudioChannels = virtualFallbackAudioChannels(probedFacts)
+			}
+			// The replacement's inventory is what its ordinals address, so the
+			// pinned release's audio selection is remapped by identity rather
+			// than silently reset to the container default. A selection with no
+			// equivalent on the replacement still degrades, but the reset is
+			// warned (and the plan keeps the requested identity for the client).
+			var remappedAudioIndex int
+			remappedAudioIndex, audioCarry = remapFallbackAudioIndexV3(file, probedFacts, opts.AudioTrackIndex)
+			attemptOpts.AudioTrackIndex = remappedAudioIndex
+			logCrossReleaseAudioCarry(startupCtx, file, probedFacts, opts.AudioTrackIndex, remappedAudioIndex, audioCarry, resolvedMedia.CandidateID)
+			if opts.SubtitleTrackIndex >= 0 {
+				slog.WarnContext(startupCtx, "cross-release virtual fallback reset the subtitle selection to off",
+					"component", "api", "file_id", catalogFileIDOrZero(file),
+					"reset_subtitle_index", opts.SubtitleTrackIndex,
+					"candidate_id", resolvedMedia.CandidateID)
 			}
 		}
 		session, startErr := h.startTranscodeSession(transcodeCtx, attemptOpts)
@@ -540,6 +568,13 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 			_, readyErr := session.WaitForManifestContext(startupCtx, playback.ManifestStartupTimeout)
 			addTransportPhaseDurationV3(ctx, transportPhaseManifestV3, time.Since(manifestStart))
 			if readyErr == nil {
+				// A fallback that could not carry the viewer's audio is now the
+				// committed transport. Record the degradation on the plan so the
+				// client learns it is hearing the replacement's default track
+				// while the plan keeps naming the requested one.
+				if audioCarry == fallbackAudioCarryDegraded {
+					appendCrossReleaseAudioFallbackWarningV3(startupCtx)
+				}
 				winningURI := resolvedMedia.URI
 				if winningURI == "" || winningURI == neutralPath {
 					if resolvedMedia.CandidateID != "" {
@@ -673,6 +708,177 @@ func (h *PlaybackHandler) probeVirtualFallbackSource(ctx context.Context, resolv
 	}
 	mergeVirtualCandidateTracks(probed, probeCand)
 	return probed
+}
+
+// crossReleaseAudioPlanKeyV3 carries the plan a transport start may annotate
+// when a cross-release fallback degrades the viewer's audio selection. The
+// transport has no other handle on the plan: it starts a session and returns
+// before the caller publishes the plan, so the degradation travels beside the
+// start request and is recorded by the transport that actually committed.
+type crossReleaseAudioPlanKeyV3 struct{}
+
+type crossReleaseAudioPlanV3 struct {
+	plan *playback.PlanV3
+}
+
+func withCrossReleaseAudioPlanV3(ctx context.Context, plan *playback.PlanV3) context.Context {
+	if ctx == nil || plan == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, crossReleaseAudioPlanKeyV3{}, &crossReleaseAudioPlanV3{plan: plan})
+}
+
+// appendCrossReleaseAudioFallbackWarningV3 reports a committed fallback that
+// could not carry the requested audio. It is a no-op when no plan is attached
+// (a direct transport test or a non-plan start).
+func appendCrossReleaseAudioFallbackWarningV3(ctx context.Context) {
+	if ctx == nil {
+		return
+	}
+	carrier, ok := ctx.Value(crossReleaseAudioPlanKeyV3{}).(*crossReleaseAudioPlanV3)
+	if !ok || carrier == nil || carrier.plan == nil {
+		return
+	}
+	carrier.plan.DegradationWarnings = append(carrier.plan.DegradationWarnings, playback.AudioTrackUnavailableWarningV3())
+}
+
+// fallbackAudioCarryV3 classifies the outcome of carrying the pinned release's
+// audio selection onto the replacement a cross-release fallback probed. The
+// caller needs the distinction to keep an informational log on a true identity
+// carry and warn when the viewer is about to hear the container default instead
+// of the selected track.
+type fallbackAudioCarryV3 int
+
+const (
+	// fallbackAudioCarryNone means the request had no audio selection to carry.
+	fallbackAudioCarryNone fallbackAudioCarryV3 = iota
+	// fallbackAudioCarryMatched means the selected track family was found on the
+	// replacement and remapped to its ordinal.
+	fallbackAudioCarryMatched
+	// fallbackAudioCarryDegraded means a selection existed but the replacement's
+	// inventory could not honor it, so playback falls back to its default track.
+	fallbackAudioCarryDegraded
+)
+
+// remapFallbackAudioIndexV3 carries the pinned release's audio selection onto the
+// replacement a cross-release fallback probed. It returns -1 (the container
+// default) when there is no selection to carry, and an explicit degraded result
+// when a selection existed but the replacement could not honor it, so the caller
+// can warn instead of logging a successful carry.
+func remapFallbackAudioIndexV3(pinned, probed *models.MediaFile, requestedIndex int) (int, fallbackAudioCarryV3) {
+	if requestedIndex < 0 || pinned == nil || len(pinned.AudioTracks) == 0 {
+		return -1, fallbackAudioCarryNone
+	}
+	// An ordinal outside the pinned inventory names no stream to carry. The
+	// stored plan is already inconsistent; degrade to the replacement default
+	// instead of indexing past the inventory or matching an unrelated track.
+	if requestedIndex >= len(pinned.AudioTracks) {
+		return -1, fallbackAudioCarryDegraded
+	}
+	if probed == nil || len(probed.AudioTracks) == 0 {
+		return -1, fallbackAudioCarryDegraded
+	}
+	index := playback.MatchAudioTrackAcrossVersions(pinned.AudioTracks, probed.AudioTracks, requestedIndex)
+	if index < 0 {
+		return -1, fallbackAudioCarryDegraded
+	}
+	if index < len(probed.AudioTracks) &&
+		fallbackAudioCarryMatchesV3(pinned.AudioTracks[requestedIndex], probed.AudioTracks[index]) {
+		return index, fallbackAudioCarryMatched
+	}
+	// The matcher chose a default/nearest track the selection's languages do not
+	// name. The index is still the right transport choice (playability wins),
+	// but the caller must warn that the viewer hears another stream.
+	return index, fallbackAudioCarryDegraded
+}
+
+const (
+	audioLanguageUndetermined = "und"
+	audioLanguageMulti        = "mul"
+	audioLanguageMultiLong    = "multi"
+	audioLanguageDual         = "dual"
+)
+
+// placeholderAudioLanguageTokensV3 are the values a track carries instead of a
+// concrete language. They name no identity a selection carry can match, so they
+// are skipped when deciding whether a remapped track still names the selection.
+var placeholderAudioLanguageTokensV3 = map[string]bool{
+	"":                        true,
+	audioLanguageUndetermined: true,
+	audioLanguageMulti:        true,
+	audioLanguageMultiLong:    true,
+	audioLanguageDual:         true,
+}
+
+// fallbackAudioCarryMatchesV3 reports whether the replacement track the remap
+// selected still carries a concrete language the selected track named. Codec and
+// channel differences are expected across releases and do not refute identity;
+// a track with no concrete language on either side cannot prove a mismatch, so
+// it is treated as a match rather than warning on a selection that carried no
+// identity evidence to begin with.
+func fallbackAudioCarryMatchesV3(selected, candidate models.AudioTrack) bool {
+	codes := make([]string, 0, len(selected.Languages)+1)
+	codes = append(codes, selected.Language)
+	codes = append(codes, selected.Languages...)
+	concrete := 0
+	for _, code := range codes {
+		if placeholderAudioLanguageTokensV3[strings.ToLower(strings.TrimSpace(code))] {
+			continue
+		}
+		concrete++
+		if playback.TrackCarriesLanguage(candidate, code) {
+			return true
+		}
+	}
+	return concrete == 0
+}
+
+// logCrossReleaseAudioCarry records the outcome of carrying the pinned release's
+// audio selection onto the replacement. A true identity carry is informational;
+// a degradation to the container default warns because the plan keeps the
+// requested identity for the client while the transport plays another stream,
+// and that divergence must be visible to an operator.
+func logCrossReleaseAudioCarry(ctx context.Context, pinned, probed *models.MediaFile, requestedIndex, remappedIndex int, carry fallbackAudioCarryV3, candidateID string) {
+	switch carry {
+	case fallbackAudioCarryMatched:
+		logMatchedCrossReleaseAudioCarry(ctx, pinned, probed, requestedIndex, remappedIndex, candidateID)
+	case fallbackAudioCarryDegraded:
+		probedTracks := 0
+		if probed != nil {
+			probedTracks = len(probed.AudioTracks)
+		}
+		slog.WarnContext(ctx, "cross-release virtual fallback could not carry the audio selection; using its default audio track",
+			"component", "api",
+			"file_id", catalogFileIDOrZero(pinned),
+			"requested_audio_index", requestedIndex,
+			"probed_audio_tracks", probedTracks,
+			"candidate_id", candidateID)
+	}
+}
+
+// logMatchedCrossReleaseAudioCarry records the pinned→replacement audio mapping
+// of a successful cross-release fallback carry. The language/index pair on each
+// side is what an operator needs to tell a correct identity carry from a
+// near-match; a degenerate probed inventory has no languages to name.
+func logMatchedCrossReleaseAudioCarry(ctx context.Context, pinned, probed *models.MediaFile, requestedIndex, remappedIndex int, candidateID string) {
+	if pinned == nil || probed == nil || requestedIndex < 0 || remappedIndex < 0 {
+		return
+	}
+	fromLanguage, toLanguage := "", ""
+	if requestedIndex < len(pinned.AudioTracks) {
+		fromLanguage = strings.TrimSpace(pinned.AudioTracks[requestedIndex].Language)
+	}
+	if remappedIndex < len(probed.AudioTracks) {
+		toLanguage = strings.TrimSpace(probed.AudioTracks[remappedIndex].Language)
+	}
+	slog.InfoContext(ctx, "cross-release virtual fallback carried the audio selection",
+		"component", "api",
+		"file_id", catalogFileIDOrZero(pinned),
+		"from_audio_index", requestedIndex,
+		"from_audio_language", fromLanguage,
+		"to_audio_index", remappedIndex,
+		"to_audio_language", toLanguage,
+		"candidate_id", candidateID)
 }
 
 // fireExpiredVirtualRefresh renews a lapsed virtual candidate's stored URL in
@@ -929,6 +1135,13 @@ func (h *PlaybackHandler) ResolveVirtualDownloadMetadata(ctx context.Context, fi
 		return nil, errors.New("virtual download source metadata is unavailable")
 	}
 	identity := resolver.NewPersistedIdentityTiers(resolved.ProviderVideoHash, resolved.ProviderGUID, resolved.ProviderReleaseName, resolved.ProviderReleaseSize)
+	// Apply the same declared-metadata merge the playback probe paths use before
+	// stamping. ffprobe legitimately omits per-stream bitrate for some remote
+	// containers and can leave bit depth or frame rate unset, and a raw write
+	// here would stamp the row with metadata the planner rejects as
+	// source_metadata_incomplete — forcing the next start off its fast path even
+	// though the row now looks probed.
+	mergeVirtualCandidateTracks(probed, *virtualPlaybackStreamFromFile(file))
 	if _, committed := h.persistVirtualProbeEvidenceDurable(probeCtx, file, resolved.URI, probed, identity, true); !committed {
 		return nil, errors.New("virtual download source metadata was not committed")
 	}
@@ -1052,6 +1265,10 @@ func (h *PlaybackHandler) resolveVirtualInputURI(
 			// intentional rotation still rotates on the first successful
 			// relist; only a failed listing is retried.
 			outageTrusted := h.virtualCandidateTrustedForOutageRetry(storedRow)
+			fileID := 0
+			if storedRow != nil {
+				fileID = storedRow.ID
+			}
 			res, err = retryVirtualProviderOutageResolve(ctx, outageTrusted, func(retryCtx context.Context, relist bool) (ResolvedVirtualMedia, error) {
 				if relist {
 					retryCtx = virtuallibrary.WithProviderOutageRelist(retryCtx)
@@ -1059,7 +1276,7 @@ func (h *PlaybackHandler) resolveVirtualInputURI(
 				return h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
 					retryCtx, virtualURI, ownerInstallationID, userID, profileID, forceRefresh || relist, excludedCandidateIDs, preferredCandidateID,
 				)
-			})
+			}, virtualEvidenceLogKeyFileID, fileID, "virtual_uri", logredact.SanitizeURL(virtualURI))
 			// A release AltMount is actively fetching is worth waiting for,
 			// not skipping: hold briefly for the import, then re-list once
 			// (forced, so a flip to completed is picked up) and take whatever
@@ -1069,10 +1286,16 @@ func (h *PlaybackHandler) resolveVirtualInputURI(
 			// A lapsed hold degrades to the pending error, which callers
 			// handle like any unresolvable release — except the startup
 			// loop, which must not indict it (see below).
-			if errors.Is(err, virtuallibrary.ErrProviderPending) && waitVirtualPendingHold(ctx) {
-				res, err = h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
-					ctx, virtualURI, ownerInstallationID, userID, profileID, true, excludedCandidateIDs, preferredCandidateID,
-				)
+			if errors.Is(err, virtuallibrary.ErrProviderPending) {
+				fileID := 0
+				if storedRow != nil {
+					fileID = storedRow.ID
+				}
+				if waitVirtualPendingHold(ctx, virtualURI, fileID) {
+					res, err = h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
+						ctx, virtualURI, ownerInstallationID, userID, profileID, true, excludedCandidateIDs, preferredCandidateID,
+					)
+				}
 			}
 			if err == nil && res.IdentityRematched && storedRow != nil {
 				// The pinned id was absent but the same release re-identified

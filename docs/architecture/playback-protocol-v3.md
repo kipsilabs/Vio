@@ -252,8 +252,11 @@ language, honoring a MULTi track's full `languages[]` — rather than by raw
 ordinal, which is unstable across encodes. It is additive and optional: absent
 means the server owns audio selection (profile or series preference), exactly as
 before. It is not feature-gated; any v3 client may send it. When the carried
-identity cannot be resolved (the source version is gone, or the identity does
-not parse), the server falls back to its normal preference resolution.
+identity cannot be resolved (the source version is gone, the identity does not
+parse, or the requested version has no track carrying the selection's concrete
+language), the server falls back to its normal preference resolution and reports
+an audio-unavailable degradation warning rather than presenting the default
+track as a successful carry.
 
 **Carrying selections across a restart.** `previous_playback_attempt_id` is the
 optional attempt whose explicit audio and subtitle selections a restart should

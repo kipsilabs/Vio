@@ -55,6 +55,11 @@ type Service struct {
 	// the pool) is unavailable, so callers must nil-check.
 	indexerReleases *IndexerReleaseStore
 
+	// emptyTitles tracks consecutive empty provider listings per title so a
+	// title with nothing to serve fails fast instead of paying a full
+	// alternate walk per start. Nil means untracked (never marked).
+	emptyTitles *emptyTitleTracker
+
 	cfg    Config
 	logger *slog.Logger
 }
@@ -265,7 +270,7 @@ func New(cfg Config, registrar *catalog.VirtualMediaRegistrar, logger *slog.Logg
 	if store := m.ReleaseStore(); store != nil {
 		r.SetReleaseGate(store)
 	}
-	service := &Service{Resolver: r, Monitor: m, registrarAdapter: registrarAdapter, cfg: cfg, logger: logger}
+	service := &Service{Resolver: r, Monitor: m, registrarAdapter: registrarAdapter, cfg: cfg, logger: logger, emptyTitles: newEmptyTitleTracker()}
 	if pool := registrarPool(registrar); pool != nil {
 		service.indexerReleases = NewIndexerReleaseStore(pool)
 	}

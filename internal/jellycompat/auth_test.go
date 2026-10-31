@@ -337,3 +337,16 @@ func (f *fakeAPIKeyUserLoader) GetByID(_ context.Context, id int) (*models.User,
 	}
 	return nil, auth.ErrNotFound
 }
+
+func TestNoteUnknownSessionWarnsOncePerWindow(t *testing.T) {
+	a := &Authenticator{}
+	if !a.noteUnknownSession("abc123...") {
+		t.Fatal("first sighting should warn")
+	}
+	if a.noteUnknownSession("abc123...") {
+		t.Fatal("repeat inside the window should stay quiet")
+	}
+	if !a.noteUnknownSession("other...") {
+		t.Fatal("a different token prefix should warn independently")
+	}
+}

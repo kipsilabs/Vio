@@ -10,10 +10,14 @@ import {
 import { dedupeAudioTracks } from "../utils/trackDedupe";
 import { PlayerMenuSurface } from "./PlayerMenuSurface";
 import { ProvisionalTrackBadge } from "./ProvisionalTrackBadge";
+import { DiscoveryRetryButton } from "./DiscoveryRetryButton";
+import { TrackBadge } from "./TrackBadge";
+import { useProvisionalInventoryExpiry } from "../hooks/useProvisionalInventoryExpiry";
 
 interface AudioTrackMenuProps {
   tracks: PlayerAudioTrack[];
-  activeIndex: number;
+  /** The applied row, or null when no row matched the committed selection. */
+  activeIndex: number | null;
   onSelect: (index: number, currentPosition: number) => void;
   currentPosition: number;
   open?: boolean;
@@ -38,6 +42,11 @@ interface AudioTrackMenuProps {
    * True when track discovery terminally failed or timed out.
    */
   failed?: boolean;
+  /**
+   * Re-runs track discovery. Shown as a retry once the provisional window
+   * lapses or discovery fails, so a stuck menu is actionable.
+   */
+  onRetryDiscovery?: () => void;
 }
 
 /**
@@ -88,6 +97,7 @@ export function AudioTrackMenu({
   provisional = false,
   pending = false,
   failed = false,
+  onRetryDiscovery,
 }: AudioTrackMenuProps) {
   const [uncontrolledOpen, setUncontrolledOpen] = useState(false);
   const rawOpen = controlledOpen ?? uncontrolledOpen;
@@ -164,6 +174,16 @@ export function AudioTrackMenu({
     items[nextIndex]?.focus();
   }, []);
 
+  // A spinner with no bound is an indefinite lie about progress. Once the
+  // provisional window lapses, the menu offers the same retry a terminal
+  // failure does instead of spinning forever.
+  const { expired: discoveryExpired, retry: restartDiscovery } =
+    useProvisionalInventoryExpiry(provisional);
+  const handleRetryDiscovery = useCallback(() => {
+    restartDiscovery();
+    onRetryDiscovery?.();
+  }, [onRetryDiscovery, restartDiscovery]);
+
   if (tracks.length === 0 && !provisional && !pending && !failed && !open) return null;
 
   // Probed inventories can repeat the same stream at several container
@@ -171,6 +191,11 @@ export function AudioTrackMenu({
   // entry keeps its original inventory position so selection still names the
   // track the server has at that slot.
   const dedupedTracks = dedupeAudioTracks(tracks);
+  // Declared or pending rows are placeholders for the effective file, so they
+  // stay out of the menu until probe evidence lands. A terminal failure keeps
+  // the list under its explicit "discovery did not complete" notice instead of
+  // leaving the menu empty.
+  const displayedTracks = provisional && !failed ? [] : dedupedTracks;
 
   return (
     <div ref={menuRef} className="relative" onBlur={handleBlur}>
@@ -206,23 +231,33 @@ export function AudioTrackMenu({
               must never draw "discovery did not complete" above a correct,
               populated list. `provisional` is the menu's own evidence state. */}
           {failed && provisional && dedupedTracks.length === 0 && (
-            <div className="px-3 py-1 text-xs text-amber-300/80">Track discovery failed</div>
-          )}
-          {failed && provisional && dedupedTracks.length > 0 && (
-            <div className="px-3 py-1 text-xs text-white/50">
-              Showing available tracks — discovery did not complete
+            <div className="flex items-center justify-between gap-2 px-3 py-1 text-xs text-amber-300/80">
+              <span>Track discovery failed</span>
+              <DiscoveryRetryButton onRetry={handleRetryDiscovery} />
             </div>
           )}
-          {!failed && provisional && (
+          {failed && provisional && dedupedTracks.length > 0 && (
+            <div className="flex items-center justify-between gap-2 px-3 py-1 text-xs text-white/50">
+              <span>Showing available tracks — discovery did not complete</span>
+              <DiscoveryRetryButton onRetry={handleRetryDiscovery} />
+            </div>
+          )}
+          {!failed && provisional && !discoveryExpired && (
             <div className="flex items-center gap-2 px-3 py-1 text-xs text-white/50">
               <span className="h-3 w-3 animate-spin rounded-full border border-white/20 border-t-white/80" />
               <span>Discovering audio tracks…</span>
             </div>
           )}
+          {!failed && provisional && discoveryExpired && (
+            <div className="flex items-center justify-between gap-2 px-3 py-1 text-xs text-white/50">
+              <span>Audio tracks unavailable.</span>
+              <DiscoveryRetryButton onRetry={handleRetryDiscovery} />
+            </div>
+          )}
           {dedupedTracks.length === 0 && !provisional && (
             <div className="px-3 py-2 text-xs text-white/40">No audio tracks available</div>
           )}
-          {dedupedTracks.map(({ track, index }) => {
+          {displayedTracks.map(({ track, index }) => {
             const descriptor = describeTrack(track, index);
             const isActive = index === activeIndex;
             return (
@@ -263,21 +298,4 @@ export function AudioTrackMenu({
       )}
     </div>
   );
-}
-
-/** Compact pill used to tag tracks with codec/channel/default metadata. The
- *  `outline` variant is used for the DEFAULT marker so it reads as a
- *  qualifier rather than another content facet. */
-function TrackBadge({
-  children,
-  variant = "solid",
-}: {
-  children: React.ReactNode;
-  variant?: "solid" | "outline";
-}) {
-  const base =
-    "inline-flex items-center rounded px-1.5 py-[1px] text-[9.5px] font-semibold tracking-wide whitespace-nowrap uppercase leading-4";
-  const skin =
-    variant === "outline" ? "border border-white/25 text-white/70" : "bg-white/10 text-white/75";
-  return <span className={`${base} ${skin}`}>{children}</span>;
 }

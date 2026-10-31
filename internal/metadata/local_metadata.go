@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"maps"
 	"slices"
+	"strings"
 )
 
 // ErrLocalMetadataUnavailable is returned by a local provider (the built-in
@@ -15,6 +16,63 @@ import (
 // and an initial match waits (see localMetadataTemporarilyUnavailable) rather
 // than commit an identity the sidecar may contradict.
 var ErrLocalMetadataUnavailable = errors.New("local metadata unavailable")
+
+// LocalMetadataPathError names the path a local sidecar read failed on while
+// keeping the message the provider has always produced ("<path>: <cause>").
+// The path is carried so a caller can tell a real local problem from a path
+// that can never hold a sidecar — a virtual provider source has no local files
+// at all, so the same failure there is expected rather than reportable.
+type LocalMetadataPathError struct {
+	Path string
+	Err  error
+}
+
+func (e *LocalMetadataPathError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if e.Path == "" {
+		return e.Err.Error()
+	}
+	return e.Path + ": " + e.Err.Error()
+}
+
+func (e *LocalMetadataPathError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+// LocalMetadataFailurePath returns the path a local-metadata read failure
+// names, if the failure recorded one.
+func LocalMetadataFailurePath(err error) (string, bool) {
+	var pathErr *LocalMetadataPathError
+	if !errors.As(err, &pathErr) || pathErr == nil || pathErr.Path == "" {
+		return "", false
+	}
+	return pathErr.Path, true
+}
+
+// IsVirtualSourcePath reports whether path names a virtual provider source
+// rather than a local file. Those rows are resolved through the provider's
+// relay and never have a filesystem presence, so every local sidecar read for
+// them fails by construction.
+func IsVirtualSourcePath(path string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(path)), "virtual:")
+}
+
+// LocalMetadataUnavailableForVirtual reports whether a refresh failed because
+// a virtual provider source was asked for local metadata it cannot have. It is
+// the expected outcome for those rows and is not worth a warning; the same
+// failure for a local path means a mount or permission problem and does.
+func LocalMetadataUnavailableForVirtual(err error) bool {
+	if err == nil || !errors.Is(err, ErrLocalMetadataUnavailable) {
+		return false
+	}
+	path, ok := LocalMetadataFailurePath(err)
+	return ok && IsVirtualSourcePath(path)
+}
 
 // keepStoredValuesOnLocalReadError reports whether a pass must stop because a
 // local sidecar could not be read. Only passes that replace stored values

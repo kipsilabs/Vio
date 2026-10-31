@@ -1,0 +1,12 @@
+# Version-liveness database contracts for the pull-request gate.
+# This is the liveness/versions-check subset of scripts/ci/db-contracts.txt. The
+# full registry includes unrelated contracts with their own pre-existing
+# failures and is run by the trusted workflow; this list must keep every
+# versions-check contract that this change touches.
+
+# Version liveness: a dead pin is stamped and reported unavailable, a healthy
+# same-identity observation clears the stamp and leaves the recovered row in the
+# picker, ambiguous provider answers leave the stamp alone, and an unauthorized
+# failed row stays indistinguishable from an unknown id.
+./internal/api/handlers TestCatalogVersionsCheckHTTP
+./internal/api/handlers TestCatalogVersionsCheckAccessHidesFailedVerdict

@@ -1211,7 +1211,7 @@ describe("subtitle source changed", () => {
     }
   });
 
-  it("keeps the generic-failure backoff path for a 404", async () => {
+  it("parks the track on a plain 404 instead of backing off", async () => {
     vi.useFakeTimers();
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
     fetchMock.mockImplementation(() => Promise.resolve(errorResponse(404, { error: "missing" })));
@@ -1221,10 +1221,106 @@ describe("subtitle source changed", () => {
         await vi.advanceTimersByTimeAsync(0);
       });
       expect(onSourceChanged).not.toHaveBeenCalled();
+      // The track does not exist for this file: the identical URL can never
+      // start working, so no backoff retry may fire.
       await act(async () => {
-        await vi.advanceTimersByTimeAsync(5000);
+        await vi.advanceTimersByTimeAsync(120_000);
       });
-      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      unmount();
+      error.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("signals the session gone once on a 410 subtitle fetch and stops retrying", async () => {
+    vi.useFakeTimers();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    fetchMock.mockImplementation(() =>
+      Promise.resolve(errorResponse(410, { error: "playback_session_ended" })),
+    );
+    const videoRef = makeVideoRef();
+    const onSessionGone = vi.fn();
+    const { unmount } = renderHook(() =>
+      useSubtitleTracks(
+        videoRef,
+        [srtTrack],
+        1,
+        0,
+        0,
+        { current: 7200 },
+        { current: 0 },
+        undefined,
+        null,
+        0,
+        undefined,
+        undefined,
+        0,
+        0,
+        0,
+        0,
+        0,
+        onSessionGone,
+      ),
+    );
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(onSessionGone).toHaveBeenCalledTimes(1);
+      // The dead session cannot deliver this track. No backoff retries.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(120_000);
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(onSessionGone).toHaveBeenCalledTimes(1);
+    } finally {
+      unmount();
+      error.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("signals the session gone on a 404 that names the playback session", async () => {
+    vi.useFakeTimers();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    fetchMock.mockImplementation(() =>
+      Promise.resolve(errorResponse(404, { error: "playback_session_not_found" })),
+    );
+    const videoRef = makeVideoRef();
+    const onSessionGone = vi.fn();
+    const { unmount } = renderHook(() =>
+      useSubtitleTracks(
+        videoRef,
+        [srtTrack],
+        1,
+        0,
+        0,
+        { current: 7200 },
+        { current: 0 },
+        undefined,
+        null,
+        0,
+        undefined,
+        undefined,
+        0,
+        0,
+        0,
+        0,
+        0,
+        onSessionGone,
+      ),
+    );
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(onSessionGone).toHaveBeenCalledTimes(1);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(120_000);
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
     } finally {
       unmount();
       error.mockRestore();
@@ -1285,6 +1381,171 @@ describe("subtitle source changed", () => {
         await vi.advanceTimersByTimeAsync(0);
       });
       expect(onSourceChanged).toHaveBeenCalledTimes(2);
+    } finally {
+      unmount();
+      error.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("subtitle track missing (404) parking", () => {
+  const missingTrack: PlayerSubtitleInfo = {
+    index: 1,
+    language: "eng",
+    codec: "subrip",
+    label: "English",
+    source: "embedded",
+    url: "/api/v2/stream/session-1/subtitles/1.vtt?file_id=7&embedded_stream_index=0",
+  };
+  const otherTrack: PlayerSubtitleInfo = {
+    index: 2,
+    language: "fra",
+    codec: "subrip",
+    label: "French",
+    source: "embedded",
+    url: "/api/v2/stream/session-1/subtitles/2.vtt?file_id=7&embedded_stream_index=1",
+  };
+
+  function errorResponse(status: number, body?: unknown) {
+    return new Response(body === undefined ? null : JSON.stringify(body), {
+      status,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  function renderParking() {
+    const videoRef = makeVideoRef(1);
+    const states: string[] = [];
+    const hook = renderHook(
+      ({ activeIndex, streamGeneration }: { activeIndex: number; streamGeneration: number }) =>
+        useSubtitleTracks(
+          videoRef,
+          [missingTrack, otherTrack],
+          activeIndex,
+          0,
+          0,
+          { current: 7200 },
+          { current: 0 },
+          undefined,
+          null,
+          streamGeneration,
+          (state) => states.push(state),
+        ),
+      { initialProps: { activeIndex: missingTrack.index, streamGeneration: 0 } },
+    );
+    return { videoRef, states, ...hook };
+  }
+
+  it("stops fetching after the first 404 and stays parked through seeks", async () => {
+    vi.useFakeTimers();
+    fetchMock.mockImplementation(() => Promise.resolve(errorResponse(404, { error: "not_found" })));
+    const { videoRef, states, rerender, unmount } = renderParking();
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      // A missing track renders like one with no cues: no loading chrome and
+      // no "Subtitles couldn't load" retry that could never succeed.
+      expect(states.at(-1)).toBe("idle");
+
+      // Backoff windows, window advances, and seeks are all the same parked
+      // identity: none may re-request it.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(120_000);
+      });
+      act(() => {
+        videoRef.current!.currentTime = 600;
+        videoRef.current!.dispatchEvent(new Event("timeupdate"));
+        videoRef.current!.dispatchEvent(new Event("seeking"));
+        videoRef.current!.dispatchEvent(new Event("seeked"));
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(120_000);
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      // A stream reload rebuilds the fetcher for the same URL: the track is
+      // still missing for this file, so the rebuild stays parked.
+      rerender({ activeIndex: missingTrack.index, streamGeneration: 1 });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      unmount();
+      vi.useRealTimers();
+    }
+  });
+
+  it("unparks a track when the viewer switches away and back", async () => {
+    fetchMock
+      .mockResolvedValueOnce(errorResponse(404, { error: "not_found" }))
+      .mockResolvedValueOnce(vttResponse("WEBVTT\n\n00:00:10.000 --> 00:00:12.000\nbonjour\n\n"))
+      .mockResolvedValueOnce(errorResponse(404, { error: "not_found" }));
+    const { rerender, unmount } = renderParking();
+    try {
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+      rerender({ activeIndex: otherTrack.index, streamGeneration: 0 });
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+      expect(fetchMock.mock.calls[1]![0]).toContain(otherTrack.url);
+      await waitFor(() =>
+        expect(createdTracks.at(-1)!.cues.map((cue) => cue.text)).toEqual(["bonjour"]),
+      );
+
+      // Re-selecting the parked track is a deliberate attempt, not a retry of
+      // the parked window: the switch away cleared the verdict.
+      rerender({ activeIndex: missingTrack.index, streamGeneration: 0 });
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+      expect(String(fetchMock.mock.calls[2]![0])).toContain(missingTrack.url);
+    } finally {
+      unmount();
+    }
+  });
+
+  it("keeps the transient-failure retry for 5xx responses", async () => {
+    vi.useFakeTimers();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    fetchMock.mockImplementation(() =>
+      Promise.resolve(errorResponse(503, { error: "unavailable" })),
+    );
+    const { unmount } = renderParking();
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5000);
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10_000);
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+    } finally {
+      unmount();
+      error.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps the retry for a network error with no response", async () => {
+    vi.useFakeTimers();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    fetchMock.mockRejectedValue(new TypeError("network down"));
+    const { unmount } = renderParking();
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5000);
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
     } finally {
       unmount();
       error.mockRestore();

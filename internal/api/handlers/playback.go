@@ -607,7 +607,21 @@ type PlaybackHandler struct {
 	defaultProbeChains defaultProbeChainAdmission
 	// probeChainWG tracks live pre-play probe chains so tests can wait for
 	// them to settle. Production never waits.
-	probeChainWG            sync.WaitGroup
+	probeChainWG sync.WaitGroup
+	// VirtualReleaseCacheWarmup starts a provider-side fetch for an explicitly
+	// selected virtual release before playback. It is the same fill/listing
+	// call playback start issues (see StreamHandler.VirtualReleaseCacheFiller),
+	// so a selection warms the bytes without inventing a second download path.
+	// Nil disables selection warm-ups while leaving playback fills intact.
+	VirtualReleaseCacheWarmup VirtualReleaseCacheFillFunc
+	// selectedWarmChains admits and deduplicates explicit-selection warm-ups.
+	// Its own instance keeps a warm-up from consuming the probe chain's slots;
+	// the keys are namespaced so a warm and a probe for the same row never
+	// collide. Zero value is ready to use.
+	selectedWarmChains defaultProbeChainAdmission
+	// warmChainWG tracks live selection warm-ups so tests can wait for them to
+	// settle. Production never waits.
+	warmChainWG             sync.WaitGroup
 	VirtualSubtitleSearcher SubtitleSearchTrigger
 	SubtitleSearchInFlight  *sync.Map
 	DeviceCapabilitySource  DeviceCapabilityProfileSource
@@ -840,6 +854,17 @@ type PlaybackHandler struct {
 	// the same reason as the park signal: the dispatcher always re-reads the
 	// map after any wake.
 	deferredPublishDone chan struct{}
+
+	// subtitleWaits records, per session, when a subtitle-inventory wait first
+	// started and which gate was holding it (see noteSubtitleInventoryWaitStart).
+	// It is observability only and never changes what is served: the wait ends at
+	// the first inventory_updated delivery, which logs the start and blocker
+	// fields alongside the existing delivery line. Entries are dropped on
+	// delivery and on session teardown, and an entry older than
+	// subtitleWaitStaleBound is pruned on insert, so the map is bounded by
+	// outstanding waits rather than by every session the process ever served.
+	subtitleWaitsMu sync.Mutex
+	subtitleWaits   map[string]subtitleInventoryWaitV3
 
 	// deferredProbeWatchdogOnce guards the lazy start of the deferred-probe
 	// convergence watchdog (see startDeferredProbeWatchdog). It fails a session

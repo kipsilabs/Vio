@@ -7,6 +7,7 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/cache"
 	evt "github.com/Silo-Server/silo-server/internal/events"
+	"github.com/Silo-Server/silo-server/internal/settingskeys"
 )
 
 // receiveUserSettingsEvent drains one envelope from the subscription, which is
@@ -89,7 +90,14 @@ func TestFailedMutationsPublishNothing(t *testing.T) {
 		"scope=profile", []byte(`{"value":"!!!"}`)); rec.Code != http.StatusBadRequest {
 		t.Fatalf("invalid PUT = %d, want 400", rec.Code)
 	}
-	if rec := routeValues(t, handler, http.MethodDelete, "playback.subtitle_language",
+	// A subtitle preference is the one idempotent clear: it answers 204 for an
+	// absent row, and still publishes nothing because nothing changed.
+	if rec := routeValues(t, handler, http.MethodDelete, settingskeys.PlaybackSubtitleLanguage,
+		"scope=profile", nil); rec.Code != http.StatusNoContent {
+		t.Fatalf("DELETE of an unset subtitle preference = %d, want 204", rec.Code)
+	}
+	// Every other key keeps the 404 that reports an unset aimed at nothing.
+	if rec := routeValues(t, handler, http.MethodDelete, settingskeys.PlaybackIntroSkipMode,
 		"scope=profile", nil); rec.Code != http.StatusNotFound {
 		t.Fatalf("DELETE of nothing = %d, want 404", rec.Code)
 	}

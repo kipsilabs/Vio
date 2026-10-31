@@ -648,6 +648,11 @@ type FileVersion struct {
 	// replaced. Jellyfin PlaybackInfo leaves such versions out. Neither the v1
 	// nor the v2 view carries the flag.
 	Unreadable bool `json:"-"`
+	// ProbedAt is when ffprobe last enumerated the file's real stream table;
+	// nil means the row still carries declared metadata only. Server-side
+	// only: the pre-play probe scheduler uses it to leave a selected row with
+	// fresh inventory alone.
+	ProbedAt *time.Time `json:"-"`
 }
 
 // SetMarkers refreshes the marker projection without rebuilding file metadata.
@@ -4390,22 +4395,10 @@ func sortAudiobookMediaFiles(files []*models.MediaFile) {
 // support were scanned with an empty array; re-deriving it at read time keeps
 // the version flyout complete until the probe-version re-probe catches up.
 func ensureTrackLanguages(tracks []models.AudioTrack) []models.AudioTrack {
-	for i := range tracks {
-		track := &tracks[i]
-		if len(track.Languages) > 0 {
-			continue
-		}
-		if track.Language != "" && track.Language != "und" && track.Language != "mul" {
-			continue
-		}
-		if languages := lang.ParseLanguages(track.EmbeddedTitle); len(languages) > 0 {
-			track.Languages = languages
-			if track.Language == "" || track.Language == "und" || track.Language == "mul" {
-				track.Language = languages[0]
-			}
-		}
-	}
-	return tracks
+	// One implementation shared with the playback start path: the picker marker
+	// and the planner's audio selection must resolve MULTI/DUAL titles from the
+	// same backfilled language view.
+	return playback.BackfillAudioTrackLanguages(tracks)
 }
 
 // virtualMediaContainer is the container sentinel a provider-backed virtual
@@ -4533,20 +4526,38 @@ func probedCollapsesAgainstProbedRelease(f *models.MediaFile, kept []*models.Med
 	if f == nil {
 		return false
 	}
-	size := virtualDeclaredProviderSize(f)
 	for _, k := range kept {
-		if k == nil {
-			continue
+		if VirtualRowsShareRelease(f, k) {
+			return true
 		}
-		if size != virtualDeclaredProviderSize(k) {
-			continue
-		}
-		if virtualProviderIdentityConflicts(f, k) {
-			continue
-		}
-		return true
 	}
 	return false
+}
+
+// VirtualRowsShareRelease reports whether two virtual catalog rows are the same
+// release under the version list's grouping rule: the same provider-neutral
+// release path, an equal declared size, and no conflicting durable provider
+// identity tier. It is the rule that collapses duplicate rows for one release
+// into a single version, exported so a caller holding a release's sibling rows
+// can decide "same release, different row" without inventing a second
+// normalization.
+//
+// A concrete `result=` pick is deliberately not part of the identity test: the
+// neutral path strips it precisely because a provider re-list churns result ids
+// for one release, and different indexers offering the same release each mint
+// their own concrete pick. Local files never share a release by this rule.
+func VirtualRowsShareRelease(a, b *models.MediaFile) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	key := virtualNeutralReleaseKey(a)
+	if key == "" || key != virtualNeutralReleaseKey(b) {
+		return false
+	}
+	if virtualDeclaredProviderSize(a) != virtualDeclaredProviderSize(b) {
+		return false
+	}
+	return !virtualProviderIdentityConflicts(a, b)
 }
 
 // unprobedCollapsesAgainstProbedRelease reports whether an unprobed virtual
@@ -4775,6 +4786,7 @@ func (s *DetailService) buildPlaybackInfoWith(
 				return s.PresignURLsWithExpiry(ctx, paths, "card")
 			}),
 			Unreadable: f.ProbeRejected(),
+			ProbedAt:   f.ProbeUpdatedAt,
 		})
 
 		for _, sub := range f.SubtitleTracks {

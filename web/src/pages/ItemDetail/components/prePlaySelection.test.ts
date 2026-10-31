@@ -5,6 +5,7 @@ import {
   formatAudioTrackSummary,
   formatSubtitlePillSummary,
   inferSubtitleFlagsFromTitle,
+  subtitleSelectionEquals,
 } from "./prePlaySelection";
 import type { DownloadedSubtitle, VersionSubtitleTrack } from "@/api/types";
 
@@ -115,6 +116,38 @@ describe("buildPrePlaySubtitleCandidates track_index", () => {
     expect(byLanguage.get("fr")).toBe(3);
   });
 
+  it("uses the same de-duplicated ordinals as the published inventory", () => {
+    // Two external rows name the same sidecar, so the server's (and the
+    // client's) single published inventory collapses them and no ordinal is
+    // consumed; the later embedded track shifts down. The old position-based
+    // derivation counted both externals and put the embedded track at 2.
+    const duplicateExternals: VersionSubtitleTrack[] = [
+      {
+        index: 1,
+        external: true,
+        language: "en",
+        codec: "srt",
+        file_name: "same.srt",
+        title: "English",
+      },
+      {
+        index: 2,
+        external: true,
+        language: "en",
+        codec: "srt",
+        file_name: "same.srt",
+        title: "English duplicate",
+      },
+      { index: 3, external: false, language: "fr", codec: "subrip" },
+    ];
+    const { all } = buildPrePlaySubtitleCandidates(duplicateExternals, undefined);
+    const byTitle = new Map(all.map((candidate) => [candidate.title, candidate]));
+    const french = all.find((candidate) => candidate.language === "fr");
+    expect(byTitle.get("English")?.selection.track_index).toBe(0);
+    expect(byTitle.get("English duplicate")?.selection.track_index).toBeUndefined();
+    expect(french?.selection.track_index).toBe(1);
+  });
+
   it("never sends the container stream index as subtitle_track_index", () => {
     const { all } = buildPrePlaySubtitleCandidates(tracks, downloaded);
     const byLanguage = new Map(all.map((c) => [c.language, c]));
@@ -144,5 +177,58 @@ describe("buildPrePlaySubtitleCandidates track_index", () => {
     const byLanguage = new Map(all.map((c) => [c.language, c.selection.track_index]));
     expect(byLanguage.get("de")).toBe(0);
     expect(byLanguage.get("en")).toBe(1);
+  });
+});
+
+describe("subtitleSelectionEquals", () => {
+  // A release carries two German SRT streams at container indexes 3 and 4 with
+  // identical codec and title; only the first is the container default. The
+  // dense combined ordinals are 0 and 1, in container order.
+  const germanTracks: VersionSubtitleTrack[] = [
+    { index: 3, language: "de", codec: "srt", title: "German", default: true },
+    { index: 4, language: "de", codec: "srt", title: "German" },
+    { index: 5, language: "en", codec: "srt", title: "English" },
+  ];
+
+  it("separates same-language rows by their published ordinal", () => {
+    const { embedded } = buildPrePlaySubtitleCandidates(germanTracks, undefined);
+    const germanRows = embedded.filter((row) => row.language === "de");
+    expect(germanRows).toHaveLength(2);
+    expect(germanRows.map((row) => row.selection.track_index)).toEqual([0, 1]);
+    expect(germanRows.map((row) => Boolean(row.default))).toEqual([true, false]);
+
+    // Picking the second German row checks that row only.
+    expect(subtitleSelectionEquals(germanRows[1]?.selection, germanRows[1]?.selection)).toBe(true);
+    expect(subtitleSelectionEquals(germanRows[1]?.selection, germanRows[0]?.selection)).toBe(false);
+    expect(subtitleSelectionEquals(germanRows[0]?.selection, germanRows[1]?.selection)).toBe(false);
+  });
+
+  it("still matches rows whose duplicate collapsed and therefore has no ordinal", () => {
+    const { external } = buildPrePlaySubtitleCandidates(
+      [
+        {
+          index: 1,
+          external: true,
+          language: "en",
+          codec: "srt",
+          file_name: "same.srt",
+          title: "English",
+        },
+        {
+          index: 2,
+          external: true,
+          language: "en",
+          codec: "srt",
+          file_name: "same.srt",
+          title: "English duplicate",
+        },
+      ],
+      undefined,
+    );
+    const withoutOrdinal = external.find((row) => row.selection.track_index == null);
+    expect(withoutOrdinal).toBeDefined();
+    expect(subtitleSelectionEquals(withoutOrdinal?.selection, withoutOrdinal?.selection)).toBe(
+      true,
+    );
   });
 });

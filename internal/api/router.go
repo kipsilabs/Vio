@@ -1585,6 +1585,11 @@ func newChiRouter(deps Dependencies) chi.Router {
 						ContentFiles: deps.FileRepo.GetByContentID,
 						EpisodeFiles: deps.FileRepo.GetByEpisodeID,
 						Detail:       itemsHandler,
+						// Catalog detail answers from the persisted list and lets
+						// this discovery finish detached, so the persisted listing
+						// must announce itself: the versions_updated event is what
+						// refreshes an open detail page.
+						Events: deps.RealtimeHub,
 					}
 					// The discovery path schedules the pre-play probe chain
 					// after a successful detached persistence. Both sides stay
@@ -1595,6 +1600,11 @@ func newChiRouter(deps Dependencies) chi.Router {
 					// and the file repository.
 					if detailSvc != nil && deps.FileRepo != nil {
 						virtualCandidatesRefresh.ScheduleDefaultFileProbe = playbackHandler.ScheduleDefaultFileProbe
+						// The same detail discovery resolves the default version
+						// the watch page will play. Warm its provider fetch from
+						// the resolved row, reusing the explicit-selection
+						// warm-up entry point so admission and fill are identical.
+						virtualCandidatesRefresh.ScheduleDefaultFileWarm = playbackHandler.ScheduleDefaultFileWarm
 						playbackHandler.DefaultProbeTarget = handlers.NewVirtualDefaultProbeTarget(detailSvc, deps.FileRepo)
 					}
 					// The indexer-release read/request surface and the async
@@ -1613,6 +1623,8 @@ func newChiRouter(deps Dependencies) chi.Router {
 							Refresh:            virtualCandidatesRefresh,
 							ProviderRefresher:  deps.VirtualLibraryService,
 							ReleaseDownloading: deps.VirtualLibraryService.ReleaseDownloading,
+							ReleaseFailed:      deps.VirtualLibraryService.ReleaseFailed,
+							MarkFailed:         deps.FileRepo.MarkVirtualCandidateFailed,
 							Pruner: &handlers.CandidateDeadPruner{
 								ContentFiles:   deps.FileRepo.GetByContentID,
 								EpisodeFiles:   deps.FileRepo.GetByEpisodeID,
@@ -1716,6 +1728,10 @@ func newChiRouter(deps Dependencies) chi.Router {
 		// GetByID); prefetch stays disabled without it.
 		if itemsHandler != nil && deps.FileRepo != nil {
 			itemsHandler.SetVirtualPrefetcher(playbackHandler, deps.FileRepo)
+			// Probe on select: a watch-detail read that names an unprobed
+			// virtual version schedules the shared pre-play chain for that
+			// row, so its track menus are populated before the first play.
+			itemsHandler.SetVirtualSelectionProber(playbackHandler)
 		}
 		if deps.UserStoreProvider != nil {
 			// Device-aware candidate ranking: resolve the caller's persisted
@@ -2057,6 +2073,12 @@ func newChiRouter(deps Dependencies) chi.Router {
 				}
 				return nil
 			})
+			// Selection warm-up reuses the play-triggered fill above: an
+			// explicit version pick starts the same provider listing, which is
+			// what makes AltMount queue the release, so the first play does not
+			// pay the cold fetch. Nil (no monitor or no virtual library service)
+			// leaves selection warm-ups disabled.
+			playbackHandler.VirtualReleaseCacheWarmup = sh.VirtualReleaseCacheFiller
 			// Install the completion observer last so the waiter registry is
 			// already wired when the first confirmation can arrive.
 			svc.Monitor.SetReleaseConfirmedObserver(sh.HandleVirtualReleaseConfirmed)
@@ -2429,6 +2451,10 @@ func newChiRouter(deps Dependencies) chi.Router {
 			catalogResourceHandler.MarkVirtualFailed = deps.FileRepo.MarkVirtualCandidateFailed
 			catalogResourceHandler.ClearVirtualFailed = deps.FileRepo.ClearVirtualCandidateFailed
 		}
+		// A fresh failed_at verdict from the liveness check changes the
+		// persisted version list, so the check publishes the same
+		// versions_updated catalog event as the Refresh List executor.
+		catalogResourceHandler.Events = deps.RealtimeHub
 		if playbackHandler != nil {
 			// The liveness check adopts a same-release rematch through the same
 			// saver the playback path uses, so a renumbered provider result id

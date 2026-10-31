@@ -16,6 +16,7 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/notifications"
 )
 
 // virtualCandidatesRefreshTimeout bounds one source's provider re-list so a
@@ -163,6 +164,25 @@ type VirtualCandidatesRefreshService struct {
 	// same visible default the discovery response offered.
 	// PlaybackHandler.ScheduleDefaultFileProbe implements this.
 	ScheduleDefaultFileProbe func(contentID string, source *models.MediaFile, streams []VirtualPlaybackStream, filter catalog.AccessFilter)
+	// ScheduleDefaultFileWarm, when non-nil, is called after a detail-page
+	// discovery resolves the item's default version, so the provider-side fetch
+	// for the row a play would use starts before the play press. It is the
+	// explicit-selection warm-up entry point with the resolved default file id:
+	// the same fill, admission key, slots, short damper and no-state-write rule.
+	// It is scheduled only for VirtualDiscoveryDetail without an explicit
+	// selection; a selection read is already owned by the watch-detail select
+	// path, and refresh/listing-only runs warm nothing.
+	// PlaybackHandler.ScheduleDefaultFileWarm implements this.
+	ScheduleDefaultFileWarm func(contentID string, fileID int, filter catalog.AccessFilter)
+	// Events, when non-nil, publishes the versions_updated catalog event after a
+	// detail-page discovery persists a listing. Discovery completes detached
+	// from the request that started it (catalog detail does not wait), so
+	// without this publish an open detail page would keep showing the version
+	// list it happened to read until the client reloaded. The first-playback
+	// sink and the refresh executor publish at the same point for their own
+	// paths; :refresh keeps publishing only from the executor's completion, so
+	// this field never doubles that event.
+	Events *notifications.Hub
 
 	flight      singleflight.Group
 	sourceLocks [64]sync.Mutex
@@ -310,7 +330,37 @@ func (s *VirtualCandidatesRefreshService) listVirtualCandidates(ctx context.Cont
 	if err != nil {
 		return nil, err
 	}
+	// A detail read that resolved the default version should start the same
+	// provider fetch a play would, not wait for the play press. The file id is
+	// the top-sorted row the default-probe target resolves, so the warm uses
+	// the explicit-selection entry point unchanged: same fill, admission key,
+	// slots, damper and no-state-write. An explicit selection is already owned
+	// by the watch-detail select path, so this never schedules a second warm;
+	// listing-only and refresh runs never reach this branch at all.
+	if mode == VirtualDiscoveryDetail && filter.SelectedFileID <= 0 && s.ScheduleDefaultFileWarm != nil {
+		if fileID, ok := defaultVirtualWarmFileID(detail); ok {
+			s.ScheduleDefaultFileWarm(contentID, fileID, filter)
+		}
+	}
 	return detail.Versions, nil
+}
+
+// defaultVirtualWarmFileID returns the top-sorted virtual version a detail read
+// resolved as its default, the same row the default probe chain targets. A
+// local row has no provider fetch to warm, and a detail with no versions has no
+// resolved default, so both report false.
+func defaultVirtualWarmFileID(detail *catalog.WatchDetail) (int, bool) {
+	if detail == nil || len(detail.Versions) == 0 {
+		return 0, false
+	}
+	version := detail.Versions[0]
+	if version.FileID <= 0 {
+		return 0, false
+	}
+	if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(version.FilePath)), virtualPlaybackPrefix) {
+		return 0, false
+	}
+	return version.FileID, true
 }
 
 // RefreshSources force-lists and persists every virtual source of the item
@@ -427,6 +477,15 @@ func (s *VirtualCandidatesRefreshService) listSource(ctx context.Context, source
 	if err := s.Persist(listCtx, source, streams); err != nil {
 		return nil, err
 	}
+	if chainKey != "" {
+		// The persisted version list changed. Announce it from inside the
+		// detached shared work so every client drops its cached list even when
+		// the request that started the discovery has already been answered (and
+		// possibly disconnected). This is the event the waiting watch path used
+		// to make visible by reloading the detail in-request; catalog detail no
+		// longer waits, so it is the only notification that path gets.
+		s.publishVersionsUpdated(ctx, chainKey)
+	}
 	if chainKey != "" && s.ScheduleDefaultFileProbe != nil {
 		// Persistence landed: schedule the pre-play probe chain from here —
 		// inside the detached shared work, not on the request side — so a
@@ -440,6 +499,22 @@ func (s *VirtualCandidatesRefreshService) listSource(ctx context.Context, source
 		s.ScheduleDefaultFileProbe(chainKey, source, copied, filter)
 	}
 	return streams, nil
+}
+
+// publishVersionsUpdated announces a persisted discovery listing through the
+// shared event authority the refresh executor, the liveness check, and the
+// first-playback sink use, so every path emits the same event shape.
+//
+// The publish is detached from the listing context's cancellation but keeps
+// its values, and it is bounded by its own short budget: the listing has
+// already committed, so a caller disconnect must not drop the notification.
+func (s *VirtualCandidatesRefreshService) publishVersionsUpdated(ctx context.Context, contentID string) {
+	if s == nil || s.Events == nil || strings.TrimSpace(contentID) == "" {
+		return
+	}
+	publishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), virtualCandidatePublishBudget)
+	defer cancel()
+	publishVirtualVersionsUpdatedEvent(publishCtx, nil, s.Events.EventsHub(), contentID)
 }
 
 // virtualSources groups the item's virtual media files into one source row per
