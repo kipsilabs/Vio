@@ -83,6 +83,19 @@ absent after a restart, on a node that did not run the probe, and once a later
 probe accepts the served bytes. A row without the field keeps the generic
 unprobed presentation.
 
+Two further node-local in-memory caches affect virtual titles without durable or
+shared state. The empty-title suppression tracker marks a title as currently
+unservable after enough consecutive empty provider listings: a resolve on the
+node holding the mark fails fast with a retryable dependency condition
+(`ErrTitleWithoutStreams`, never a release verdict), while another node, or the
+same node after a restart, re-lists the title normally. The detail warm memo
+coalesces repeated detail reads that would schedule the same version's
+probe/warm chain; it suppresses duplicate scheduling only and never changes the
+response body. Neither has shared admission across nodes: like `source_mismatch`
+they are absent after a restart and on nodes that did not observe the underlying
+reads, and they exist only to bound per-process work, not to record catalog
+state.
+
 ## Multi-audio language support and release metadata
 
 MULTi/DUAL releases — a single audio stream tagged `und`/`mul`/empty whose

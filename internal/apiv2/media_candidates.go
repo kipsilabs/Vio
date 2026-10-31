@@ -291,7 +291,8 @@ func isVirtualVersion(version catalogpkg.FileVersion) bool {
 
 // rememberDetailVirtualWarm records a scheduled version and reports whether it
 // was new. A repeat inside detailVirtualWarmRepeatWindow returns false so the
-// caller skips scheduling.
+// caller skips scheduling. The memo is node-local in-process state with no
+// shared admission; it only suppresses duplicate scheduling.
 func (reg *Registry) rememberDetailVirtualWarm(contentID string, fileID int) bool {
 	if reg == nil || contentID == "" || fileID <= 0 {
 		return false

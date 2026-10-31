@@ -44,7 +44,9 @@ type emptyTitleStreak struct {
 // emptyTitleTracker tracks consecutive empty listings per title so a title
 // whose provider answers keep coming back empty fails fast instead of paying
 // a full alternate walk per start. All methods are safe for concurrent use;
-// a nil receiver is a no-op tracker that never marks.
+// a nil receiver is a no-op tracker that never marks. The tracker is node-local
+// in-process state with no shared admission: another node, or a restart,
+// re-lists the title normally.
 type emptyTitleTracker struct {
 	mu      sync.Mutex
 	streaks map[string]*emptyTitleStreak
