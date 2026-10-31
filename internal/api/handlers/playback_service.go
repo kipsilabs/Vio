@@ -2179,6 +2179,12 @@ func (h *PlaybackHandler) publishInventoryUpdatedToSession(ctx context.Context, 
 		// deferred probe has terminally failed, so the client already holds
 		// exactly this declared inventory. A failed status is new information —
 		// it ends the deferred loading state — so it is pushed.
+		// If the probe itself was verified or failed, but a transient extension
+		// read failure marked the inventory pending, the notification is still
+		// owed: re-park it so the terminal outcome is not dropped as obsolete.
+		if (override != nil && override.ProbeUpdatedAt != nil) || session.VirtualProbeOutcome == probeOutcomeVerified || session.VirtualProbeOutcome == probeOutcomeFailed {
+			return inventory.InventoryRevision, inventoryPublishRetryable
+		}
 		return inventory.InventoryRevision, inventoryPublishObsolete
 	}
 	if inventory.InventoryStatus == string(ProbeProvenanceFailed) &&

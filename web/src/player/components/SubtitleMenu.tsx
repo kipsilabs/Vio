@@ -229,9 +229,12 @@ export function SubtitleMenu({
   }, [open]);
 
   const menuItemsRef = useRef<(HTMLButtonElement | null)[]>([]);
+  const retryButtonRef = useRef<HTMLButtonElement | null>(null);
 
   const handleMenuKeyDown = useCallback((e: React.KeyboardEvent) => {
-    const items = menuItemsRef.current.filter(Boolean) as HTMLButtonElement[];
+    const retryBtn = retryButtonRef.current;
+    const trackButtons = menuItemsRef.current.filter(Boolean) as HTMLButtonElement[];
+    const items = retryBtn ? [retryBtn, ...trackButtons] : trackButtons;
     if (items.length === 0) return;
     const currentIndex = items.indexOf(document.activeElement as HTMLButtonElement);
     let nextIndex: number | null = null;
@@ -323,13 +326,13 @@ export function SubtitleMenu({
             {failed && provisional && sortedTracks.length === 0 && (
               <div className="flex items-center justify-between gap-2 px-3 py-1 text-xs text-amber-300/80">
                 <span>Subtitle discovery failed</span>
-                <DiscoveryRetryButton onRetry={handleRetryDiscovery} />
+                <DiscoveryRetryButton onRetry={handleRetryDiscovery} buttonRef={retryButtonRef} />
               </div>
             )}
             {failed && provisional && sortedTracks.length > 0 && (
               <div className="flex items-center justify-between gap-2 px-3 py-1 text-xs text-white/50">
                 <span>Showing available subtitles — discovery did not complete</span>
-                <DiscoveryRetryButton onRetry={handleRetryDiscovery} />
+                <DiscoveryRetryButton onRetry={handleRetryDiscovery} buttonRef={retryButtonRef} />
               </div>
             )}
             {!failed && provisional && !discoveryExpired && (
@@ -341,7 +344,7 @@ export function SubtitleMenu({
             {!failed && provisional && discoveryExpired && (
               <div className="flex items-center justify-between gap-2 px-3 py-1 text-xs text-white/50">
                 <span>Subtitles unavailable.</span>
-                <DiscoveryRetryButton onRetry={handleRetryDiscovery} />
+                <DiscoveryRetryButton onRetry={handleRetryDiscovery} buttonRef={retryButtonRef} />
               </div>
             )}
             {sortedTracks.length === 0 && !provisional && (

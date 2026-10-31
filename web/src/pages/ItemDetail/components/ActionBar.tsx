@@ -468,13 +468,23 @@ export default function ActionBar({
         : undefined,
     [selectedVersion, selectedWatch],
   );
+  const isVersionProbed = Boolean(selectedWatchVersion?.probed_at || selectedVersion?.probed_at);
   const selectedVersionWithTracks = useMemo(() => {
     if (!selectedVersion) return null;
     if (!selectedWatchVersion) return selectedVersion;
-    // An empty watch-detail list can be an unprobed row, not evidence that the
-    // selected version has no tracks. Keep the catalog lists until the probe
-    // actually supplies a non-empty inventory, so a cold page does not hide its
-    // audio/subtitle menus.
+    // Once probed, the watch-detail lists are authoritative even if empty
+    // (verified empty). Before probing, keep the catalog placeholder lists so
+    // menus have display items, but note they remain provisional.
+    if (isVersionProbed) {
+      return mergePlaybackInventory(
+        {
+          ...selectedVersion,
+          audio_tracks: selectedWatchVersion.audio_tracks ?? [],
+          subtitle_tracks: selectedWatchVersion.subtitle_tracks ?? [],
+        },
+        playerInventory,
+      );
+    }
     return mergePlaybackInventory(
       {
         ...selectedVersion,
@@ -489,26 +499,22 @@ export default function ActionBar({
       },
       playerInventory,
     );
-  }, [playerInventory, selectedVersion, selectedWatchVersion]);
-  // Those catalog lists are the same pre-probe fallback the player overlay
-  // gates: rows the version row carries, not evidence the file has them. Until
-  // the watch detail read (or the player's own mirror) supplies probed rows for
-  // this file, the pre-play menus withhold them and say they are discovering,
-  // so a start cannot carry a pick the file does not have. The verdict is the
-  // overlay's, not a second rule.
+  }, [isVersionProbed, playerInventory, selectedVersion, selectedWatchVersion]);
+  // A row's tracks count as published evidence only when the version has been
+  // probed, or when the player's own inventory mirror has confirmed tracks.
   const audioRowsPublished =
-    (selectedWatchVersion?.audio_tracks?.length ?? 0) > 0 ||
+    (isVersionProbed && selectedWatchVersion !== undefined) ||
     (playerInventory?.audioTracks.length ?? 0) > 0;
   const subtitleRowsPublished =
-    (selectedWatchVersion?.subtitle_tracks?.length ?? 0) > 0 ||
+    (isVersionProbed && selectedWatchVersion !== undefined) ||
     (playerInventory?.subtitleTracks.length ?? 0) > 0;
   const audioInventoryProvisional = isOverlayInventoryProvisional(
-    false,
+    !isVersionProbed && !playerInventory,
     audioRowsPublished,
     selectedVersionWithTracks?.audio_tracks?.length ?? 0,
   );
   const subtitleInventoryProvisional = isOverlayInventoryProvisional(
-    false,
+    !isVersionProbed && !playerInventory,
     subtitleRowsPublished,
     selectedVersionWithTracks?.subtitle_tracks?.length ?? 0,
   );

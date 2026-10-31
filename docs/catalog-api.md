@@ -55,9 +55,13 @@ current computed availability, so a provider outage cannot mass-tag versions.
 
 A result also carries `"failed": true` when the row holds a durable failed
 verdict (confirmed unservable, either from before the check or stamped by it).
-Clients remove failed rows from version pickers instead of offering them;
-rows that are merely `available: false` without `failed` may recover and stay
-listed. Unknown or deleted file IDs are reported as `available: false`.
+Clients remove failed rows from version pickers instead of offering them,
+with two recovery exceptions: the currently active selection stays visible so
+a mid-stream verdict does not yank the playing row, and if every version has
+failed, the list stays visible so the viewer sees the unservable state and can
+trigger a refresh or relink instead of facing an empty menu. Rows that are merely
+`available: false` without `failed` may recover and stay listed behind the
+unavailable toggle. Unknown or deleted file IDs are reported as `available: false`.
 
 A result optionally carries `source_mismatch` while the API process still holds
 a recent playback probe's wrong-source verdict for that row:

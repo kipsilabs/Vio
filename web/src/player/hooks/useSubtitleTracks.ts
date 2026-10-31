@@ -250,7 +250,9 @@ export function useSubtitleTracks(
   // renders. Initial media loading also bumps it because HLS can clear cues
   // fetched before the first media metadata arrives.
   streamGeneration = 0,
-  onLoadState?: (state: "idle" | "loading" | "refreshing" | "ready" | "error") => void,
+  onLoadState?: (
+    state: "idle" | "loading" | "refreshing" | "ready" | "error" | "unavailable",
+  ) => void,
   // Fired when the server answers a window fetch with `subtitle_source_changed`
   // (409): a virtual release rotated under this plan, so every URL for the
   // active track is stale. The caller must refresh the plan's subtitle
@@ -658,13 +660,11 @@ export function useSubtitleTracks(
             // file. Every window of the same track identity would answer the
             // same 404, so park the track instead of backing off forever (a
             // window loop with no cues used to re-ask the identical URL
-            // indefinitely). The overlay then presents the track the way a
-            // track with no cues does: no "loading" or "couldn't load" chrome
-            // and no retry action, because no retry can succeed. The latch is
-            // cleared by the next track, version, or session selection.
+            // indefinitely). Surface "unavailable" so the viewer sees the track
+            // cannot load and can turn it off, without labeling it idle or ready.
             if (!controller.signal.aborted) {
               parkedTrackUrlRef.current = activeUrl;
-              onLoadStateRef.current?.(hasFetched ? "ready" : "idle");
+              onLoadStateRef.current?.("unavailable");
             }
           } else {
             // Other non-ok responses (415, 5xx outside the retryable set) fall

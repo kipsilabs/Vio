@@ -1620,6 +1620,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 							ReleaseDownloading: deps.VirtualLibraryService.ReleaseDownloading,
 							ReleaseFailed:      deps.VirtualLibraryService.ReleaseFailed,
 							MarkFailed:         deps.FileRepo.MarkVirtualCandidateFailed,
+							MarkFailedDetailed: deps.FileRepo.MarkVirtualCandidateFailedDetailed,
 							Pruner: &handlers.CandidateDeadPruner{
 								ContentFiles:   deps.FileRepo.GetByContentID,
 								EpisodeFiles:   deps.FileRepo.GetByEpisodeID,
