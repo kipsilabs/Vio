@@ -328,7 +328,7 @@ func TestReplanRemapSourceUsesPlanTimeEvidence(t *testing.T) {
 	}
 	handler := &PlaybackHandler{}
 
-	source := handler.replanRemapSourceV3(reloadedRow, session, nil).file
+	source := handler.replanRemapSourceV3(context.Background(), reloadedRow, session, nil).file
 	if source.ID != reloadedRow.ID {
 		t.Fatalf("remap source id = %d, want the same catalog row", source.ID)
 	}
@@ -360,10 +360,10 @@ func TestReplanRemapSourceUsesPlanTimeEvidence(t *testing.T) {
 func TestReplanRemapSourceFallsBackToLoadedRow(t *testing.T) {
 	row := &models.MediaFile{ID: 7, AudioTracks: []models.AudioTrack{{Codec: "aac"}}}
 	handler := &PlaybackHandler{}
-	if got := handler.replanRemapSourceV3(row, &playback.Session{}, nil).file; got != row {
+	if got := handler.replanRemapSourceV3(context.Background(), row, &playback.Session{}, nil).file; got != row {
 		t.Fatalf("remap source = %v, want the loaded row", got)
 	}
-	if got := handler.replanRemapSourceV3(row, nil, nil).file; got != row {
+	if got := handler.replanRemapSourceV3(context.Background(), row, nil, nil).file; got != row {
 		t.Fatalf("remap source with nil session = %v, want the loaded row", got)
 	}
 }
@@ -382,7 +382,7 @@ func TestReplanRemapSourceUsesEvidenceAcrossCandidates(t *testing.T) {
 		VirtualAudioTracks:         []models.AudioTrack{{Codec: "aac", Language: "fra"}},
 	}
 	handler := &PlaybackHandler{}
-	source := handler.replanRemapSourceV3(row, session, nil).file
+	source := handler.replanRemapSourceV3(context.Background(), row, session, nil).file
 	if source == row {
 		t.Fatal("a remap must use the plan-time evidence, not the reloaded row")
 	}
@@ -402,7 +402,7 @@ func TestReplanRemapSourceIgnoresEvidenceForLocalFile(t *testing.T) {
 		VirtualAudioTracks:         []models.AudioTrack{{Codec: "aac", Language: "fra"}},
 	}
 	handler := &PlaybackHandler{}
-	if got := handler.replanRemapSourceV3(row, session, nil).file; got != row {
+	if got := handler.replanRemapSourceV3(context.Background(), row, session, nil).file; got != row {
 		t.Fatalf("local file remapped from virtual evidence: %+v", got.AudioTracks)
 	}
 }
@@ -568,7 +568,7 @@ func TestReplanRemapSourceUsesCapturedEmptyEvidence(t *testing.T) {
 	}
 	handler := &PlaybackHandler{}
 
-	source := handler.replanRemapSourceV3(row, session, nil).file
+	source := handler.replanRemapSourceV3(context.Background(), row, session, nil).file
 	if source == row {
 		t.Fatal("captured-empty evidence fell back to the newly populated row")
 	}
@@ -595,7 +595,7 @@ func TestReplanRemapSourceAbsentEvidenceFallsBackToRow(t *testing.T) {
 		VirtualSubtitleEvidenceSet: false,
 	}
 	handler := &PlaybackHandler{}
-	if got := handler.replanRemapSourceV3(row, session, nil).file; got != row {
+	if got := handler.replanRemapSourceV3(context.Background(), row, session, nil).file; got != row {
 		t.Fatalf("absent evidence remap source = %+v, want the loaded row", got)
 	}
 }
@@ -619,7 +619,7 @@ func TestReplanRemapSourcePopulatedEvidenceAgainstNewlyPopulatedRow(t *testing.T
 	}
 	handler := &PlaybackHandler{}
 
-	source := handler.replanRemapSourceV3(row, session, nil).file
+	source := handler.replanRemapSourceV3(context.Background(), row, session, nil).file
 	if source == row {
 		t.Fatal("populated evidence fell back to the newly populated row")
 	}
@@ -668,7 +668,7 @@ func TestReplanRemapSourceAudioAndSubtitleEvidenceIndependent(t *testing.T) {
 		session := baseSession()
 		session.VirtualSubtitleTracks = []models.SubtitleTrack{{Index: 1, Codec: "subrip", Language: "fra"}}
 		row := newRow()
-		source := handler.replanRemapSourceV3(row, session, nil).file
+		source := handler.replanRemapSourceV3(context.Background(), row, session, nil).file
 		if len(source.AudioTracks) != 0 {
 			t.Fatalf("captured-empty audio was repopulated from the row: %+v", source.AudioTracks)
 		}
@@ -692,7 +692,7 @@ func TestReplanRemapSourceAudioAndSubtitleEvidenceIndependent(t *testing.T) {
 		session := baseSession()
 		session.VirtualAudioTracks = []models.AudioTrack{{Codec: "aac", Language: "fra", Channels: 2}}
 		row := newRow()
-		source := handler.replanRemapSourceV3(row, session, nil).file
+		source := handler.replanRemapSourceV3(context.Background(), row, session, nil).file
 		if len(source.AudioTracks) != 1 || source.AudioTracks[0].Language != "fra" {
 			t.Fatalf("captured audio was lost: %+v", source.AudioTracks)
 		}
@@ -730,7 +730,7 @@ func TestCapturedEmptyEvidenceDoesNotInventOldSelection(t *testing.T) {
 		VirtualSubtitleEvidenceURI: "virtual://movie/tt-row?result=candidate-a",
 	}
 	handler := &PlaybackHandler{}
-	source := handler.replanRemapSourceV3(row, session, nil).file
+	source := handler.replanRemapSourceV3(context.Background(), row, session, nil).file
 
 	index := 0
 	request := playback.StartRequestV3{
