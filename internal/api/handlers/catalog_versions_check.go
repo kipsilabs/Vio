@@ -527,8 +527,9 @@ func (h *CatalogResourceHandler) fileAccessible(ctx context.Context, file *model
 // isVirtualProviderListingTemporaryError reports whether a resolution failure
 // is transport-temporary / availability-shaped rather than a verdict about the
 // pinned release: the provider listing could not be produced (request failed,
-// timed out, or answered 5xx), the release is still being fetched, or the
-// trusted persisted candidate was absent from a listing the resolver refused to
+// timed out, or answered 5xx), the title is fail-fast marked as having no
+// provider streams, the release is still being fetched, or the trusted
+// persisted candidate was absent from a listing the resolver refused to
 // substitute from. None of these may indict a pin; the caller reports durable
 // state instead.
 //
@@ -544,6 +545,7 @@ func isVirtualProviderListingTemporaryError(err error) bool {
 		return false
 	}
 	if errors.Is(err, resolver.ErrProviderUnavailable) ||
+		errors.Is(err, virtuallibrary.ErrTitleWithoutStreams) ||
 		errors.Is(err, virtuallibrary.ErrProviderPending) ||
 		errors.Is(err, virtuallibrary.ErrPersistedCandidateTrusted) ||
 		errors.Is(err, context.DeadlineExceeded) ||

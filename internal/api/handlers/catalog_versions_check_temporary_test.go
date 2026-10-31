@@ -70,6 +70,8 @@ func TestVirtualProviderListingTemporaryErrorClassification(t *testing.T) {
 		{"plain request failed", errors.New("virtual stream provider 7 request failed"), true},
 		{"resolver not installed", errors.New("virtual stream resolver is not installed"), true},
 		{"empty listing", errors.New("no streams available from provider"), true},
+		{"fail-fast marked title", fmt.Errorf("resolve virtual input: %w: title virtual://movie/tt-temporary", virtuallibrary.ErrTitleWithoutStreams), true},
+		{"fail-fast marked title bare", virtuallibrary.ErrTitleWithoutStreams, true},
 		{"confirmed dead only", errors.New("virtual stream provider returned no matching candidate"), false},
 		{"no usable stream only", errors.New("virtual transcode provider returned no usable stream"), false},
 	}
@@ -157,6 +159,38 @@ func TestCheckVersionTemporaryFailureNeverStamps(t *testing.T) {
 				t.Fatalf("temporary error %v performed %d durable stamps, want 0", tc.err, marks)
 			}
 		})
+	}
+}
+
+// TestCheckVersionMarkedTitleNeverStamps is the fail-fast sentinel's half of
+// the no-stamp guard. The title is marked without provider streams, so the
+// liveness check reports the pin unavailable without visiting the provider, but
+// that title-wide condition is not evidence about the pin and must never write
+// failed_at.
+func TestCheckVersionMarkedTitleNeverStamps(t *testing.T) {
+	file := virtualVersionRow("A", "hash-marked")
+	var marks int
+	h := &CatalogResourceHandler{
+		FileResolver: versionsCheckTestResolver{file: file},
+		ItemAccess:   permissiveItemAccess{},
+		VirtualResolver: VirtualMediaDetailedResolverFunc(func(context.Context, string, int, int, string, bool, []string, string) (ResolvedVirtualMedia, error) {
+			return ResolvedVirtualMedia{}, fmt.Errorf("resolve virtual input: %w: title virtual://movie/tt-marked", virtuallibrary.ErrTitleWithoutStreams)
+		}),
+		MarkVirtualFailed: func(context.Context, int, string, *time.Time) error {
+			marks++
+			return nil
+		},
+	}
+
+	outcome := h.checkVersion(context.Background(), file.ID)
+	if outcome.stamp {
+		t.Fatalf("fail-fast marked title marked the pin for stamping")
+	}
+	if outcome.available {
+		t.Fatalf("fail-fast marked title reported the pin available")
+	}
+	if marks != 0 {
+		t.Fatalf("fail-fast marked title performed %d durable stamps, want 0", marks)
 	}
 }
 
