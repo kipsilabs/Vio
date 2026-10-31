@@ -5918,10 +5918,6 @@ export function VideoPlayer({
     onEvent: handleRealtimeEvent,
     supportedCommands: VIDEO_PLAYBACK_COMMANDS,
     recoveryRevision: planRevision,
-    // A ticket mint that keeps answering 404 proves this player cannot control
-    // the session. Enter the session-gone state; a fresh start is the only
-    // recovery, so never reconnect or replan the dead id.
-    onSessionGone,
   });
 
   useEffect(() => {
