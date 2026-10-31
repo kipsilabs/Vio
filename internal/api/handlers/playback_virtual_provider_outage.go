@@ -247,8 +247,6 @@ func retryVirtualProviderOutageResolve(
 			cycleLog.finish(ctx.Err())
 			return resolved, err
 		}
-			return resolved, err
-		}
 		slog.InfoContext(ctx, "virtual provider listing unavailable; retrying the session-bound candidate",
 			"component", "api", "attempt", attempt+1, "retry_in_ms", wait.Milliseconds(), "error", logredact.SanitizeURLError(err))
 		resolved, err = resolve(ctx, true)

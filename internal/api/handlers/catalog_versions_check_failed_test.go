@@ -65,7 +65,7 @@ func versionCheckDeadPinResolver() VirtualMediaDetailedResolver {
 	})
 }
 
-func postVersionCheck(t *testing.T, h *CatalogResourceHandler, fileIDs ...int) (*httptest.ResponseRecorder, versionCheckResponse, string) {
+func postVersionCheckFailed(t *testing.T, h *CatalogResourceHandler, fileIDs ...int) (*httptest.ResponseRecorder, versionCheckResponse, string) {
 	t.Helper()
 	body, err := json.Marshal(map[string][]int{"file_ids": fileIDs})
 	if err != nil {
@@ -104,7 +104,7 @@ func TestCatalogVersionsCheckFencedStampDoesNotReportFailure(t *testing.T) {
 		ItemAccess:        versionCheckAccessStub{},
 	}
 
-	rec, resp, rawBody := postVersionCheck(t, h, file.ID)
+	rec, resp, rawBody := postVersionCheckFailed(t, h, file.ID)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
 	}
@@ -151,7 +151,7 @@ func TestCatalogVersionsCheckDeniedRowHidesFailedVerdict(t *testing.T) {
 		ItemAccess: versionCheckAccessStub{err: errors.New("access denied")},
 	}
 
-	rec, resp, rawBody := postVersionCheck(t, h, file.ID)
+	rec, resp, rawBody := postVersionCheckFailed(t, h, file.ID)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
 	}
