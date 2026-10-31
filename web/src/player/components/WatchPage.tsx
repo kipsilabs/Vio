@@ -30,7 +30,10 @@ import {
 } from "../utils/resolveEffectiveVersion";
 import { VideoPlayer } from "./VideoPlayer";
 import { fetchWatchDetail } from "@/hooks/queries/items";
-import { applyVersionAvailability } from "@/hooks/queries/versionLiveness";
+import {
+  applyVersionAvailability,
+  type VersionLivenessVerdict,
+} from "@/hooks/queries/versionLiveness";
 import {
   awaitVirtualCandidatesRefresh,
   cancelVirtualCandidatesRefresh,
@@ -299,7 +302,7 @@ const EMPTY_PLAYBACK_VARIANTS: PlayerPlaybackVariant[] = [];
 // The liveness verdicts are optional so WatchPage can render without the
 // item-page check (watch-party tests, standalone renders). An empty map leaves
 // every row's own metadata flag untouched.
-const EMPTY_VERSION_LIVENESS = new Map<number, boolean>();
+const EMPTY_VERSION_LIVENESS = new Map<number, VersionLivenessVerdict>();
 
 function WatchPagePlayer({
   contentId,
@@ -1406,14 +1409,18 @@ function WatchPagePlayer({
   );
 
   // The server tells us whether a terminal is worth retrying. A retryable
-  // virtual-source refusal gets a Try again action; every other terminal keeps
-  // the plain Go Back dead-end. An adaptation refusal always offers the action:
-  // the server marks it non-retryable because replaying the same plan cannot
-  // work, but a *fresh start* can re-list and re-resolve the source.
+  // virtual-source refusal gets a Try again action, as does a retryable
+  // transcode start failure (e.g. a seek anchor that failed on a transient
+  // relay error — a fresh start re-lists and can succeed where the same
+  // plan could not proceed); every other terminal keeps the plain Go Back
+  // dead-end. An adaptation refusal always offers the action: the server
+  // marks it non-retryable because replaying the same plan cannot work, but
+  // a *fresh start* can re-list and re-resolve the source.
   const canRetryTerminal =
     !session.plan &&
-    (session.errorReason === "virtual_source_unavailable"
-      ? session.errorRetryable
+    (session.errorReason === "virtual_source_unavailable" ||
+    session.errorReason === "transcode_start_failed"
+      ? session.errorRetryable === true
       : isAdaptationUnavailableReason(session.errorReason));
   // A session answered gone cannot be replanned or reconnected. The only
   // recovery is a new start at the position the viewer reached.

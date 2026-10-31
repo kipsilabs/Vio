@@ -43,6 +43,7 @@ function makeVersion(overrides: Partial<FileVersion> = {}): FileVersion {
     duration: overrides.duration ?? 0,
     bitrate: overrides.bitrate ?? 0,
     available: overrides.available,
+    failed: overrides.failed,
   };
 }
 
@@ -205,5 +206,43 @@ describe("useVersionVisibility toggle stability", () => {
     });
 
     expect(result.current.showUnavailable).toBe(false);
+  });
+});
+
+describe("useVersionVisibility failed rows", () => {
+  function visibleIds(versions: FileVersion[], activeFileId?: number | null) {
+    const { result } = renderHook(() => useVersionVisibility(versions, activeFileId));
+    return result.current.visibleVersions.map((v) => v.file_id);
+  }
+
+  function hiddenCount(versions: FileVersion[], activeFileId?: number | null) {
+    const { result } = renderHook(() => useVersionVisibility(versions, activeFileId));
+    return result.current.hiddenUnavailableCount;
+  }
+
+  const live = (id: number): FileVersion => makeVersion({ file_id: id });
+  const dead = (id: number): FileVersion =>
+    makeVersion({ file_id: id, available: false, failed: true });
+  const stale = (id: number): FileVersion => makeVersion({ file_id: id, available: false });
+
+  it("removes failed rows instead of hiding them behind the toggle", () => {
+    expect(visibleIds([live(1), dead(2), live(3)])).toEqual([1, 3]);
+  });
+
+  it("does not count removed rows as hidden", () => {
+    expect(hiddenCount([live(1), dead(2), stale(3)])).toBe(1);
+  });
+
+  it("keeps the active selection visible even when it failed", () => {
+    expect(visibleIds([live(1), dead(2)], 2)).toEqual([1, 2]);
+  });
+
+  it("renders the full list instead of an empty menu when everything failed", () => {
+    expect(visibleIds([dead(1), dead(2)])).toEqual([1, 2]);
+  });
+
+  it("keeps transiently unavailable rows behind the toggle", () => {
+    expect(visibleIds([live(1), stale(2)])).toEqual([1]);
+    expect(hiddenCount([live(1), stale(2)])).toBe(1);
   });
 });

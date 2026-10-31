@@ -390,6 +390,31 @@ describe("WatchPage playback errors", () => {
     expect(screen.getByRole("button", { name: "Go Back" })).toBeInTheDocument();
   });
 
+  it("offers Try again for a retryable transcode start failure such as a failed seek anchor", () => {
+    const retryStart = vi.fn();
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        plan: null,
+        streamUrl: null,
+        sessionId: null,
+        mediaFileId: null,
+        errorTitle: "Playback unavailable",
+        error: "Failed to resolve remux seek position.",
+        errorReason: "transcode_start_failed",
+        errorRetryable: true,
+        retryStart,
+      }),
+    );
+
+    render(createElement(WatchPage, watchPageProps));
+
+    expect(screen.getByText("Failed to resolve remux seek position.")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    expect(retryStart).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("button", { name: "Go Back" })).toBeInTheDocument();
+  });
+
   it("offers Try again for an adaptation refusal the server marked non-retryable", () => {
     const retryStart = vi.fn();
     playbackSessionMock.mockReturnValue(
@@ -947,7 +972,7 @@ describe("WatchPage version list refresh", () => {
       createElement(WatchPage, {
         ...watchPageProps,
         versions: [firstVersion, secondVersion],
-        versionLiveness: new Map([[9, false]]),
+        versionLiveness: new Map([[9, { available: false }]]),
       }),
     );
 
@@ -2781,7 +2806,7 @@ describe("WatchPage realtime reconnect reconcile", () => {
       createElement(WatchPage, {
         ...watchPageProps,
         versions: [{ ...virtualVersion, available: false }],
-        versionLiveness: new Map([[7, false]]),
+        versionLiveness: new Map([[7, { available: false }]]),
       }),
     );
 
@@ -2900,7 +2925,7 @@ describe("WatchPage realtime reconnect reconcile", () => {
       createElement(WatchPage, {
         ...watchPageProps,
         versions: [{ ...firstVersion, resolution: "2160p" }],
-        versionLiveness: new Map([[9, false]]),
+        versionLiveness: new Map([[9, { available: false }]]),
       }),
     );
 

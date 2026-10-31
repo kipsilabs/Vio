@@ -473,7 +473,7 @@ describe("EpisodeContent", () => {
   it("stamps a stale selected version's availability for the action bar", () => {
     const standard = makeFileVersion({ file_id: 1, resolution: "1080p" });
     const stale = makeFileVersion({ file_id: 2, resolution: "2160p" });
-    mocks.useVersionLiveness.mockReturnValue(new Map([[stale.file_id, false]]));
+    mocks.useVersionLiveness.mockReturnValue(new Map([[stale.file_id, { available: false }]]));
 
     render(
       <MemoryRouter initialEntries={["/item/episode-1"]}>

@@ -47,7 +47,11 @@ current computed availability, so a provider outage cannot mass-tag versions.
 }
 ```
 
-Unknown or deleted file IDs are reported as `available: false`.
+A result also carries `"failed": true` when the row holds a durable failed
+verdict (confirmed unservable, either from before the check or stamped by it).
+Clients remove failed rows from version pickers instead of offering them;
+rows that are merely `available: false` without `failed` may recover and stay
+listed. Unknown or deleted file IDs are reported as `available: false`.
 
 ## Multi-audio language support and release metadata
 
