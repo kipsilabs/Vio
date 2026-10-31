@@ -120,15 +120,18 @@ func (c *VirtualProbeCache) Probe(
 		if err != nil || probed == nil {
 			return probed, err
 		}
-		if VirtualServedEvidenceRejected(inputSnapshot.FileSize, probed.ProbedFormatSize, probed.Duration, inputSnapshot.VirtualExpectedRuntimeMinutes) {
-			// A readable container that is not the release the row declares
-			// must not be cached: the playback path rejects it, and replaying
-			// it for the cache TTL would keep rejecting without ever contacting
-			// the provider again. Returning it uncached lets the row's short
-			// wrong-source backoff reach fresh provider bytes on its next
-			// attempt. A size mismatch whose measured duration proves the
-			// content is the right (short-posted) release is not a wrong file,
-			// so it takes the normal cache path below.
+		verdict := ClassifyVirtualServedEvidence(inputSnapshot.FileSize, probed.ProbedFormatSize, probed.Duration, inputSnapshot.VirtualExpectedRuntimeMinutes)
+		if !verdict.EstablishesIdentity() {
+			// A readable container that does not establish the row's release
+			// identity must not be cached. A mismatch is a different release:
+			// the playback path rejects it, and replaying it for the cache TTL
+			// would keep rejecting without ever contacting the provider again,
+			// so returning it uncached lets the row's short wrong-source
+			// backoff reach fresh provider bytes. An unverified size
+			// contradiction (plausible duration, different bytes) still plays
+			// for this request, but caching it would let unproven evidence
+			// stand as the row's inventory for the whole TTL and feed
+			// identity-sensitive decisions. Both stay uncached.
 			return cloneVirtualProbeFile(probed), nil
 		}
 		c.store(key, probed, time.Now())

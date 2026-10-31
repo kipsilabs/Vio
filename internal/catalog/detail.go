@@ -651,8 +651,24 @@ type FileVersion struct {
 	// ProbedAt is when ffprobe last enumerated the file's real stream table;
 	// nil means the row still carries declared metadata only. Server-side
 	// only: the pre-play probe scheduler uses it to leave a selected row with
-	// fresh inventory alone.
+	// fresh inventory alone. The v2 projection exposes the same instant as
+	// probed_at so a client can tell fresh inventory from declared hints.
 	ProbedAt *time.Time `json:"-"`
+	// SourceMismatch is the process-local wrong-source probe verdict for this
+	// row, when the node still holds it. Advisory only: it never changes
+	// Failed or Available and is never persisted. Server-side only; the v2
+	// projection carries it as source_mismatch.
+	SourceMismatch *VersionSourceMismatch `json:"-"`
+}
+
+// VersionSourceMismatch is a recent probe's served-vs-declared byte evidence
+// for a virtual row whose bytes did not match its declared release. It is
+// produced by the playback probe damper and read through the detail service's
+// injected verdict source, so the detail page and the versions check endpoint
+// report one verdict.
+type VersionSourceMismatch struct {
+	ServedBytes   int64 `json:"served_bytes"`
+	DeclaredBytes int64 `json:"declared_bytes"`
 }
 
 // SetMarkers refreshes the marker projection without rebuilding file metadata.
@@ -973,6 +989,10 @@ type DetailService struct {
 	// virtualRankingSource exposes the ranking that produced each virtual
 	// listing. Nil disables the projection; see SetVirtualRankingSource.
 	virtualRankingSource VirtualRankingSource
+	// versionSourceMismatch projects the playback probe's process-local
+	// wrong-source verdict onto each version. Nil disables the projection; see
+	// SetVersionSourceMismatchSource.
+	versionSourceMismatch VersionSourceMismatchSource
 
 	// watchPrepareMu guards watchPrepared, the per-content memo that keeps a
 	// repeated watch-detail fetch of unchanged files from re-running the
@@ -1132,6 +1152,27 @@ func (s *DetailService) SetVirtualCandidateScoreSource(source VirtualCandidateSc
 // is projected.
 func (s *DetailService) SetVirtualRankingSource(source VirtualRankingSource) {
 	s.virtualRankingSource = source
+}
+
+// VersionSourceMismatchSource reads the recent wrong-source probe verdict for
+// one row. The playback probe owns that process-local signal; the detail
+// service only projects it, so this returns nil when the node holds no verdict.
+type VersionSourceMismatchSource func(*models.MediaFile) *VersionSourceMismatch
+
+// SetVersionSourceMismatchSource wires the wrong-source verdict shown per
+// version on the detail response. It is optional; without it no version
+// carries source_mismatch.
+func (s *DetailService) SetVersionSourceMismatchSource(source VersionSourceMismatchSource) {
+	s.versionSourceMismatch = source
+}
+
+// versionSourceMismatchFor projects the injected verdict for one file. A nil
+// source, file, or verdict yields nil so the field stays absent.
+func (s *DetailService) versionSourceMismatchFor(file *models.MediaFile) *VersionSourceMismatch {
+	if s == nil || s.versionSourceMismatch == nil || file == nil {
+		return nil
+	}
+	return s.versionSourceMismatch(file)
 }
 
 // SetRootClaimRepository wires in the root claim repo for series folder path lookups.
@@ -4773,6 +4814,7 @@ func (s *DetailService) buildPlaybackInfoWith(
 			// (missing_since IS NULL). Omitted when available, so an absent
 			// field means available/unknown; false means unavailable.
 			Available:      versionAvailability(f),
+			SourceMismatch: s.versionSourceMismatchFor(f),
 			VideoTracks:    append([]models.VideoTrack(nil), f.VideoTracks...),
 			AudioTracks:    audioTracks,
 			SubtitleTracks: buildVersionSubtitleTracks(f),
@@ -4842,7 +4884,56 @@ func (s *DetailService) buildPlaybackInfoWith(
 	recap := pick(func(v FileVersion) *Marker { return v.Recap }, firstRecap)
 	preview := pick(func(v FileVersion) *Marker { return v.Preview }, firstPreview)
 
-	return versions, variants, subtitles, intro, credits, recap, preview
+	// Serve verified inventory first without touching the inputs that produced
+	// the variants above: auto-pick, the selected version and every resolved
+	// row still come from the unpartitioned order.
+	return partitionPreparedVersions(versions), variants, subtitles, intro, credits, recap, preview
+}
+
+// versionInventoryPrepared reports whether a version carries probe-verified
+// stream inventory that a thin client can start from: a successful probe
+// stamped the row, it is not durably dead, and (when known) it is not marked
+// unavailable. A rejected wrong-source probe never stamps ProbeUpdatedAt and
+// never sets failed_at, so still-unverified mismatched bytes are already
+// excluded by the probe stamp; the process-local source-mismatch verdict is not
+// part of the durable version list and cannot be carried here.
+func versionInventoryPrepared(v FileVersion) bool {
+	if v.Failed || v.Unreadable || v.ProbedAt == nil || v.ProbedAt.IsZero() {
+		return false
+	}
+	return v.Available == nil || *v.Available
+}
+
+// partitionPreparedVersions stably partitions versions so rows with verified
+// inventory come first. Relative order inside each group is preserved, which
+// keeps the existing provider ranking and listing order intact. It is a pure
+// display-order rule: callers must build playback variants and pick the
+// effective row before applying it.
+func partitionPreparedVersions(versions []FileVersion) []FileVersion {
+	if len(versions) < 2 {
+		return versions
+	}
+	prepared := 0
+	for i := range versions {
+		if versionInventoryPrepared(versions[i]) {
+			prepared++
+		}
+	}
+	if prepared == 0 || prepared == len(versions) {
+		return versions
+	}
+	ordered := make([]FileVersion, len(versions))
+	nextPrepared, nextOther := 0, prepared
+	for _, version := range versions {
+		if versionInventoryPrepared(version) {
+			ordered[nextPrepared] = version
+			nextPrepared++
+		} else {
+			ordered[nextOther] = version
+			nextOther++
+		}
+	}
+	return ordered
 }
 
 func playbackVersionExists(versions []FileVersion, selectedFileID int) bool {

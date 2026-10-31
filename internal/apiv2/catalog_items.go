@@ -325,36 +325,59 @@ func itemExtrasOf(extras []catalogpkg.ItemExtraInfo) []ItemExtraInfo {
 
 // FileVersion is one playable file of an item.
 type FileVersion struct {
-	FileID                   ID                                `json:"file_id" example:"120"`
-	FileName                 string                            `json:"file_name,omitempty"`
-	FilePath                 string                            `json:"file_path,omitempty" doc:"Absent for viewers without file-path visibility"`
-	Resolution               string                            `json:"resolution" example:"2160p"`
-	CodecVideo               string                            `json:"codec_video" example:"hevc"`
-	CodecAudio               string                            `json:"codec_audio" example:"truehd"`
-	HDR                      bool                              `json:"hdr"`
-	Container                string                            `json:"container" example:"mkv"`
-	FileSize                 int64                             `json:"file_size" doc:"Bytes"`
-	Duration                 int                               `json:"duration" doc:"Seconds"`
-	Bitrate                  int                               `json:"bitrate" doc:"Kilobits per second"`
-	AddedAt                  Instant                           `json:"added_at"`
-	EditionRaw               string                            `json:"edition_raw,omitempty"`
-	EditionKey               string                            `json:"edition_key,omitempty"`
-	PresentationKind         string                            `json:"presentation_kind,omitempty"`
-	PresentationGroupKey     string                            `json:"presentation_group_key,omitempty"`
-	PresentationPartIndex    int                               `json:"presentation_part_index,omitempty"`
-	PresentationPartTotal    int                               `json:"presentation_part_total,omitempty"`
-	MultiEpisodeStart        int                               `json:"multi_episode_start,omitempty"`
-	MultiEpisodeEnd          int                               `json:"multi_episode_end,omitempty"`
-	EffectiveAudioTrackIndex *int                              `json:"effective_audio_track_index,omitempty"`
-	EffectiveAudioLanguage   string                            `json:"effective_audio_language,omitempty"`
-	VideoTracks              []models.VideoTrack               `json:"video_tracks,omitempty"`
-	AudioTracks              []models.AudioTrack               `json:"audio_tracks,omitempty"`
-	SubtitleTracks           []catalogpkg.VersionSubtitleTrack `json:"subtitle_tracks,omitempty"`
-	Chapters                 []catalogpkg.VersionChapter       `json:"chapters,omitempty"`
-	Intro                    *catalogpkg.Marker                `json:"intro,omitempty"`
-	Credits                  *catalogpkg.Marker                `json:"credits,omitempty"`
-	Recap                    *catalogpkg.Marker                `json:"recap,omitempty"`
-	Preview                  *catalogpkg.Marker                `json:"preview,omitempty"`
+	FileID                   ID      `json:"file_id" example:"120"`
+	FileName                 string  `json:"file_name,omitempty"`
+	FilePath                 string  `json:"file_path,omitempty" doc:"Absent for viewers without file-path visibility"`
+	Resolution               string  `json:"resolution" example:"2160p"`
+	CodecVideo               string  `json:"codec_video" example:"hevc"`
+	CodecAudio               string  `json:"codec_audio" example:"truehd"`
+	HDR                      bool    `json:"hdr"`
+	Container                string  `json:"container" example:"mkv"`
+	FileSize                 int64   `json:"file_size" doc:"Bytes"`
+	Duration                 int     `json:"duration" doc:"Seconds"`
+	Bitrate                  int     `json:"bitrate" doc:"Kilobits per second"`
+	AddedAt                  Instant `json:"added_at"`
+	EditionRaw               string  `json:"edition_raw,omitempty"`
+	EditionKey               string  `json:"edition_key,omitempty"`
+	PresentationKind         string  `json:"presentation_kind,omitempty"`
+	PresentationGroupKey     string  `json:"presentation_group_key,omitempty"`
+	PresentationPartIndex    int     `json:"presentation_part_index,omitempty"`
+	PresentationPartTotal    int     `json:"presentation_part_total,omitempty"`
+	MultiEpisodeStart        int     `json:"multi_episode_start,omitempty"`
+	MultiEpisodeEnd          int     `json:"multi_episode_end,omitempty"`
+	EffectiveAudioTrackIndex *int    `json:"effective_audio_track_index,omitempty"`
+	EffectiveAudioLanguage   string  `json:"effective_audio_language,omitempty"`
+	// Failed is the durable virtual-only "produced no bytes at stream-open"
+	// verdict. Unlike available=false it means the release is confirmed
+	// unservable; menus remove the row instead of offering a retry-able pick.
+	Failed bool `json:"failed,omitempty"`
+	// Available is the durable per-version health signal: a virtual candidate
+	// is unavailable when stamped failed, a local file when marked missing.
+	// Omitted when available, so an absent field means available/unknown.
+	Available *bool `json:"available,omitempty"`
+	// SourceMismatch reports a recent probe that rejected the provider's bytes
+	// as a different release than the row declares. Advisory: it never changes
+	// failed or available, and it is absent once the process drops the verdict.
+	SourceMismatch *VersionSourceMismatch `json:"source_mismatch,omitempty"`
+	// ProbedAt is when ffprobe last enumerated this version's real stream
+	// table. Absent means the row still carries declared metadata only.
+	ProbedAt       *Instant                          `json:"probed_at,omitempty"`
+	VideoTracks    []models.VideoTrack               `json:"video_tracks,omitempty"`
+	AudioTracks    []models.AudioTrack               `json:"audio_tracks,omitempty"`
+	SubtitleTracks []catalogpkg.VersionSubtitleTrack `json:"subtitle_tracks,omitempty"`
+	Chapters       []catalogpkg.VersionChapter       `json:"chapters,omitempty"`
+	Intro          *catalogpkg.Marker                `json:"intro,omitempty"`
+	Credits        *catalogpkg.Marker                `json:"credits,omitempty"`
+	Recap          *catalogpkg.Marker                `json:"recap,omitempty"`
+	Preview        *catalogpkg.Marker                `json:"preview,omitempty"`
+}
+
+// VersionSourceMismatch carries the served-vs-declared byte sizes of a probe
+// that rejected a virtual row's bytes. It is display evidence, not a liveness
+// verdict: the row stays available and never becomes failed on it.
+type VersionSourceMismatch struct {
+	ServedBytes   int64 `json:"served_bytes" example:"7427636945"`
+	DeclaredBytes int64 `json:"declared_bytes" example:"8449999999"`
 }
 
 // FileVersionCollection is an item's versions.
@@ -1261,6 +1284,7 @@ func (reg *Registry) getCatalogItem(ctx context.Context, in *CatalogItemDeviceIn
 		}
 	}
 	out := catalogItemDetailOf(detail, reg.ratingSelection(ctx), virtualSource)
+	reg.warmDetailVirtualVersions(ctx, detail, viewer.Access)
 	out.Collections = NonNil(reg.itemCollections(ctx, detail, viewer.Access))
 	if reg.deps.ThemeSongs != nil && (detail.Type == themeOwnerMovie || detail.Type == themeOwnerSeries || detail.Type == themeOwnerSeason || detail.Type == themeOwnerEpisode) {
 		themes, err := reg.deps.ThemeSongs.Discover(ctx, in.ID, true, viewer.Access)
@@ -1448,9 +1472,30 @@ func fileVersionOf(v catalogpkg.FileVersion) FileVersion {
 		AddedAt: NewInstant(v.AddedAt), EditionRaw: v.EditionRaw, EditionKey: v.EditionKey, PresentationKind: v.PresentationKind,
 		PresentationGroupKey: v.PresentationGroupKey, PresentationPartIndex: v.PresentationPartIndex, PresentationPartTotal: v.PresentationPartTotal,
 		MultiEpisodeStart: v.MultiEpisodeStart, MultiEpisodeEnd: v.MultiEpisodeEnd, EffectiveAudioTrackIndex: v.EffectiveAudioTrackIndex,
-		EffectiveAudioLanguage: v.EffectiveAudioLanguage, VideoTracks: v.VideoTracks, AudioTracks: v.AudioTracks, SubtitleTracks: v.SubtitleTracks,
+		EffectiveAudioLanguage: v.EffectiveAudioLanguage, Failed: v.Failed, Available: v.Available,
+		SourceMismatch: versionSourceMismatchOf(v.SourceMismatch), ProbedAt: probeInstantPtr(v.ProbedAt),
+		VideoTracks: v.VideoTracks, AudioTracks: v.AudioTracks, SubtitleTracks: v.SubtitleTracks,
 		Chapters: v.Chapters, Intro: v.Intro, Credits: v.Credits, Recap: v.Recap, Preview: v.Preview,
 	}
+}
+
+// versionSourceMismatchOf mirrors the catalog's wrong-source verdict onto the
+// v2 wire type. Nil stays nil so the field is absent without a verdict.
+func versionSourceMismatchOf(m *catalogpkg.VersionSourceMismatch) *VersionSourceMismatch {
+	if m == nil {
+		return nil
+	}
+	return &VersionSourceMismatch{ServedBytes: m.ServedBytes, DeclaredBytes: m.DeclaredBytes}
+}
+
+// probeInstantPtr renders a probe stamp, treating a nil or zero time as
+// unprobed. A zero Instant cannot marshal, and a zero stamp means the same
+// thing as no stamp.
+func probeInstantPtr(t *time.Time) *Instant {
+	if t == nil || t.IsZero() {
+		return nil
+	}
+	return instantPtr(t)
 }
 
 func fileVersionsOf(vs []catalogpkg.FileVersion) []FileVersion {

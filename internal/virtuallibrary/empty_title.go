@@ -24,10 +24,15 @@ var ErrTitleWithoutStreams = errors.New("virtual title has no provider streams")
 const emptyTitleMarkStreak = 3
 
 // emptyTitleMarkTTL bounds how long a title stays marked after its last empty
-// listing. A title that recovers is re-served on the next resolve (a non-empty
-// listing clears the streak immediately); the TTL only caps how long a stale
-// mark can outlive the evidence.
+// listing. A listing that observes streams again clears the streak immediately,
+// and an explicit forceRefresh bypasses the mark to re-list; the TTL only caps
+// how long a mark can outlive its evidence when nothing else revisits the
+// title.
 var emptyTitleMarkTTL = 5 * time.Minute
+
+// maxEmptyTitleEntries caps the tracker map so a long-lived server cannot
+// accumulate cold entries indefinitely.
+const maxEmptyTitleEntries = 2048
 
 // emptyTitleStreak records consecutive empty provider listings for one title.
 type emptyTitleStreak struct {
@@ -39,10 +44,20 @@ type emptyTitleStreak struct {
 // emptyTitleTracker tracks consecutive empty listings per title so a title
 // whose provider answers keep coming back empty fails fast instead of paying
 // a full alternate walk per start. All methods are safe for concurrent use;
-// a nil receiver is a no-op tracker that never marks.
+// a nil receiver is a no-op tracker that never marks. The tracker is node-local
+// in-process state with no shared admission: another node, or a restart,
+// re-lists the title normally.
 type emptyTitleTracker struct {
 	mu      sync.Mutex
 	streaks map[string]*emptyTitleStreak
+}
+
+func (t *emptyTitleTracker) sweepExpired(now time.Time) {
+	for k, s := range t.streaks {
+		if s == nil || s.last.IsZero() || now.Sub(s.last) > emptyTitleMarkTTL {
+			delete(t.streaks, k)
+		}
+	}
 }
 
 func newEmptyTitleTracker() *emptyTitleTracker {
@@ -58,6 +73,33 @@ func neutralVirtualPathKey(virtualPath string) string {
 	return virtualPath
 }
 
+func (streak *emptyTitleStreak) expired(now time.Time) bool {
+	return streak.count >= emptyTitleMarkStreak && (streak.last.IsZero() || now.Sub(streak.last) > emptyTitleMarkTTL)
+}
+
+func (t *emptyTitleTracker) ensureCapacity(now time.Time) {
+	if len(t.streaks) < maxEmptyTitleEntries {
+		return
+	}
+	t.sweepExpired(now)
+	if len(t.streaks) < maxEmptyTitleEntries {
+		return
+	}
+	var oldestKey string
+	var oldestTime time.Time
+	for k, s := range t.streaks {
+		if oldestKey == "" || (s != nil && s.last.Before(oldestTime)) {
+			oldestKey = k
+			if s != nil {
+				oldestTime = s.last
+			}
+		}
+	}
+	if oldestKey != "" {
+		delete(t.streaks, oldestKey)
+	}
+}
+
 // noteEmptyListing records one empty provider listing for the title and
 // reports whether the title is now marked without streams.
 func (t *emptyTitleTracker) noteEmptyListing(key string, cacheTTL time.Duration, now time.Time) bool {
@@ -71,7 +113,13 @@ func (t *emptyTitleTracker) noteEmptyListing(key string, cacheTTL time.Duration,
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	streak, ok := t.streaks[key]
-	if !ok {
+	// An expired MARK is no evidence for the new listing: start a fresh streak
+	// instead of letting its old count and span re-mark the title from one
+	// observation. An unmarked streak is still accumulating evidence.
+	if !ok || streak.expired(now) {
+		if !ok {
+			t.ensureCapacity(now)
+		}
 		streak = &emptyTitleStreak{}
 		t.streaks[key] = streak
 	}
@@ -106,13 +154,19 @@ func (t *emptyTitleTracker) marked(key string, cacheTTL time.Duration, now time.
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	streak, ok := t.streaks[key]
-	if !ok || streak.count < emptyTitleMarkStreak {
+	if !ok {
 		return false
 	}
-	if streak.first.IsZero() || streak.last.Sub(streak.first) < required {
+	// Expiry-on-read prunes both completed marks and stale partial streaks
+	// whose evidence has lapsed, so cold titles are not retained indefinitely.
+	if streak == nil || streak.last.IsZero() || now.Sub(streak.last) > emptyTitleMarkTTL {
+		delete(t.streaks, key)
 		return false
 	}
-	return !streak.last.IsZero() && now.Sub(streak.last) <= emptyTitleMarkTTL
+	if streak.count < emptyTitleMarkStreak {
+		return false
+	}
+	return !streak.first.IsZero() && streak.last.Sub(streak.first) >= required
 }
 
 // listingCacheTTL returns the provider listing cache TTL that bounds how fast

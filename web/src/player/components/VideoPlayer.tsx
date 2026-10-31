@@ -5918,10 +5918,6 @@ export function VideoPlayer({
     onEvent: handleRealtimeEvent,
     supportedCommands: VIDEO_PLAYBACK_COMMANDS,
     recoveryRevision: planRevision,
-    // A ticket mint that keeps answering 404 proves this player cannot control
-    // the session. Enter the session-gone state; a fresh start is the only
-    // recovery, so never reconnect or replan the dead id.
-    onSessionGone,
   });
 
   useEffect(() => {
@@ -6334,7 +6330,9 @@ export function VideoPlayer({
       {!isDetached &&
         activeSubtitleIndex !== null &&
         subtitleSyncNotice?.tone !== "progress" &&
-        (subtitleLoadState === "loading" || subtitleLoadState === "error") && (
+        (subtitleLoadState === "loading" ||
+          subtitleLoadState === "error" ||
+          subtitleLoadState === "unavailable") && (
           <div
             role="status"
             className="pointer-events-none absolute inset-x-0 top-20 z-40 flex justify-center"
@@ -6342,6 +6340,17 @@ export function VideoPlayer({
             <span className="flex items-center gap-3 rounded bg-black/75 px-3 py-2 text-sm text-white">
               {subtitleLoadState === "loading" ? (
                 "Loading subtitles…"
+              ) : subtitleLoadState === "unavailable" ? (
+                <>
+                  {"This subtitle is unavailable."}
+                  <button
+                    type="button"
+                    onClick={() => handleSubtitleSelect(null)}
+                    className="pointer-events-auto rounded bg-white/10 px-2 py-0.5 text-sm font-medium text-white transition-colors hover:bg-white/20 focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:outline-none"
+                  >
+                    Turn off
+                  </button>
+                </>
               ) : (
                 <>
                   {"Subtitles couldn't load."}

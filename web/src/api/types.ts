@@ -948,6 +948,8 @@ export interface FileVersion {
    *  this never accompanies `failed`. Populated by versions/check while the
    *  server still holds the short wrong-source verdict. */
   source_mismatch?: VersionSourceMismatch;
+  /** RFC 3339 instant in UTC when the file was probed. */
+  probed_at?: string;
   added_at?: string;
   edition_raw?: string;
   edition_key?: string;

@@ -1620,6 +1620,8 @@ export function usePlaybackSession(
   // without comparing plan identity (which a rotation can move).
   const inventoryRevisionRef = useRef<string | null>(null);
   const inventoryPendingRef = useRef(false);
+  const pollInventoryInflightRef = useRef<Promise<boolean> | null>(null);
+  const teardownAbortRef = useRef<AbortController>(new AbortController());
   // Identity-carrying pushes dropped while a start/switch/replan owns the
   // session. Applying them immediately would mutate the menus under the pending
   // replacement, but discarding them loses the only carrier of the incoming
@@ -1641,12 +1643,15 @@ export function usePlaybackSession(
   // this hook observes. The settle paths call the flusher directly; this is the
   // backstop for the fast pending/declared start.
   useEffect(() => {
+    const controller = new AbortController();
+    teardownAbortRef.current = controller;
     deferredFlushTimerRef.current = window.setInterval(() => {
       if (deferredPushesRef.current.length > 0) {
         flushDeferredPushesRef.current();
       }
     }, 2_000);
     return () => {
+      controller.abort();
       if (deferredFlushTimerRef.current !== null) {
         window.clearInterval(deferredFlushTimerRef.current);
         deferredFlushTimerRef.current = null;
@@ -5023,61 +5028,94 @@ export function usePlaybackSession(
    * replaced session is dropped.
    */
   const pollInventory = useCallback(async (): Promise<boolean> => {
-    const plan = planRef.current;
-    const sessionId = sessionIdRef.current;
-    const url = plan?.inventory_url ?? stateRef.current.inventoryUrl;
-    if (!plan || !sessionId || !url) return false;
-    const revision =
-      inventoryRevisionRef.current ?? plan.inventory_revision ?? stateRef.current.inventoryRevision;
-    const headers: Record<string, string> = { Accept: "application/json" };
-    if (revision) headers["If-None-Match"] = revision;
-    let response: Response;
-    try {
-      response = await playerFetchResponse(config, `${playerV2Origin(config)}${url}`, {
-        headers: { ...headers, Accept: "application/json" },
-        signal: AbortSignal.timeout(10_000),
-      });
-    } catch {
-      return false;
+    if (pollInventoryInflightRef.current) {
+      return pollInventoryInflightRef.current;
     }
-    if (response.status === 304) return false;
-    if (!response.ok) return false;
-    let body: unknown;
+    const run = (async () => {
+      const plan = planRef.current;
+      const sessionId = sessionIdRef.current;
+      const url = plan?.inventory_url ?? stateRef.current.inventoryUrl;
+      if (!plan || !sessionId || !url) return false;
+      const revision =
+        inventoryRevisionRef.current ??
+        plan.inventory_revision ??
+        stateRef.current.inventoryRevision;
+      const headers: Record<string, string> = { Accept: "application/json" };
+      if (revision) headers["If-None-Match"] = revision;
+      const teardownSignal = teardownAbortRef.current.signal;
+      if (teardownSignal.aborted) return false;
+      let response: Response;
+      const timeoutSignal = AbortSignal.timeout(10_000);
+      let signal: AbortSignal;
+      let cleanupAbortListener: (() => void) | undefined;
+      if (typeof AbortSignal.any === "function") {
+        signal = AbortSignal.any([teardownSignal, timeoutSignal]);
+      } else {
+        const fallbackCtrl = new AbortController();
+        const onTeardown = () => fallbackCtrl.abort();
+        const onTimeout = () => fallbackCtrl.abort();
+        teardownSignal.addEventListener("abort", onTeardown);
+        timeoutSignal.addEventListener("abort", onTimeout);
+        cleanupAbortListener = () => {
+          teardownSignal.removeEventListener("abort", onTeardown);
+          timeoutSignal.removeEventListener("abort", onTimeout);
+        };
+        signal = fallbackCtrl.signal;
+      }
+      let body: unknown;
+      try {
+        response = await playerFetchResponse(config, `${playerV2Origin(config)}${url}`, {
+          headers: { ...headers, Accept: "application/json" },
+          signal,
+        });
+        if (response.status === 304 || !response.ok) return false;
+        body = await response.json();
+      } catch {
+        return false;
+      } finally {
+        cleanupAbortListener?.();
+      }
+      if (sessionIdRef.current !== sessionId || planRef.current !== plan) return false;
+      if (typeof body !== "object" || body === null) return false;
+      const record: Record<string, unknown> = body as Record<string, unknown>;
+      const payload = {
+        session_id: sessionId,
+        inventory_revision:
+          typeof record.inventory_revision === "string" ? record.inventory_revision : undefined,
+        inventory_status:
+          typeof record.inventory_status === "string" ? record.inventory_status : undefined,
+        audio_tracks: Array.isArray(record.audio_tracks) ? record.audio_tracks : undefined,
+        subtitle_inventory: Array.isArray(record.subtitle_inventory)
+          ? record.subtitle_inventory
+          : undefined,
+        effective_media_file_id:
+          typeof record.effective_media_file_id === "number"
+            ? record.effective_media_file_id
+            : undefined,
+        effective_virtual_uri:
+          typeof record.effective_virtual_uri === "string"
+            ? record.effective_virtual_uri
+            : undefined,
+        virtual_source_revision:
+          typeof record.virtual_source_revision === "string"
+            ? record.virtual_source_revision
+            : undefined,
+      } satisfies PlaybackInventoryUpdatedPayload;
+      const accepted = applyInventoryUpdate(payload);
+      return (
+        accepted &&
+        !inventoryPendingRef.current &&
+        (payload.inventory_status === "verified" || payload.inventory_status === "failed")
+      );
+    })();
+    pollInventoryInflightRef.current = run;
     try {
-      body = await response.json();
-    } catch {
-      return false;
+      return await run;
+    } finally {
+      if (pollInventoryInflightRef.current === run) {
+        pollInventoryInflightRef.current = null;
+      }
     }
-    if (sessionIdRef.current !== sessionId || planRef.current !== plan) return false;
-    if (typeof body !== "object" || body === null) return false;
-    const record: Record<string, unknown> = body as Record<string, unknown>;
-    const payload = {
-      session_id: sessionId,
-      inventory_revision:
-        typeof record.inventory_revision === "string" ? record.inventory_revision : undefined,
-      inventory_status:
-        typeof record.inventory_status === "string" ? record.inventory_status : undefined,
-      audio_tracks: Array.isArray(record.audio_tracks) ? record.audio_tracks : undefined,
-      subtitle_inventory: Array.isArray(record.subtitle_inventory)
-        ? record.subtitle_inventory
-        : undefined,
-      effective_media_file_id:
-        typeof record.effective_media_file_id === "number"
-          ? record.effective_media_file_id
-          : undefined,
-      effective_virtual_uri:
-        typeof record.effective_virtual_uri === "string" ? record.effective_virtual_uri : undefined,
-      virtual_source_revision:
-        typeof record.virtual_source_revision === "string"
-          ? record.virtual_source_revision
-          : undefined,
-    } satisfies PlaybackInventoryUpdatedPayload;
-    const accepted = applyInventoryUpdate(payload);
-    return (
-      accepted &&
-      !inventoryPendingRef.current &&
-      (payload.inventory_status === "verified" || payload.inventory_status === "failed")
-    );
   }, [applyInventoryUpdate, config]);
 
   const markInventoryExhausted = useCallback(

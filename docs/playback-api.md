@@ -97,12 +97,19 @@ error, an unreadable evidence write, or a saturated worker pool that could not
 admit the probe — and the client must leave the loading state and keep the
 provisional menu it already holds. A failed upgrade never changes the stream or
 the executable audio selection; a viewer who picked an audio track keeps it.
-The pending state is bounded: the server tracks when each deferred probe was
-armed and terminally fails one that has not reached a terminal outcome within
-the convergence bound — the probe's own budget plus a fixed slack for the
-evidence write and the publish handoff. `pending` is therefore never permanent,
-even when a provider ignores cancellation or the probe pool stays saturated; the
-client always receives `verified` or `failed` in the original session.
+The deferred probe's pending state is bounded: the server tracks when each
+deferred probe was armed and terminally fails one that has not reached a
+terminal outcome within the convergence bound — the probe's own budget plus a
+fixed slack for the evidence write and the publish handoff. That bound covers
+the probe lifecycle, not every `pending` the endpoint can report. The probe
+itself therefore always reaches `verified` or `failed`, even when a provider
+ignores cancellation or the probe pool stays saturated. The downloaded-extension
+path above is separate and has no server-side deadline: the extension is
+retried, not probed, so its reported `pending` is bounded only by the client's
+poll and backoff (about 2 seconds, backing off to at most one request every 20
+seconds). While the extension stays unreadable a terminal probe outcome remains
+owed rather than delivered, so the client keeps seeing `pending`; the outcome
+surfaces in the original session as soon as an extension read succeeds.
 When the durable evidence write commits a verified inventory whose order differs
 from the declared one, the server replays the attempt's persisted audio
 selection intent against it (the same default-audio reconciliation the

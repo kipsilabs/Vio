@@ -155,6 +155,56 @@ func TestRekeyReplanTrackChangeCrossRowUsesPublishingInventory(t *testing.T) {
 	}
 }
 
+// A fresh cross-row audio choice is minted against the live menu that published
+// it, not the plan-time inventory. When that publishing row reorders its tracks,
+// the ordinal must be remapped by identity so the selected language wins.
+func TestRekeyReplanTrackChangeCrossRowAudioUsesPublishingInventory(t *testing.T) {
+	const effectiveID, publishedID = 200, 201
+	english := models.AudioTrack{Index: 0, Language: "en", Codec: "aac", Channels: 2, Default: true}
+	japanese := models.AudioTrack{Index: 1, Language: "ja", Codec: "aac", Channels: 2}
+	// The replan validates the session's effective row 200, which lists English
+	// first.
+	effective := &models.MediaFile{
+		ID: effectiveID, ContentID: "movie-1", Container: "virtual", FilePath: "virtual://movie/tt?result=abc",
+		AudioTracks: []models.AudioTrack{english, japanese},
+	}
+	// The live menu published row 201 with the source tracks reordered: Japanese
+	// is now first.
+	published := &models.MediaFile{
+		ID: publishedID, ContentID: "movie-1", Container: "virtual", FilePath: "virtual://movie/tt?result=abc",
+		AudioTracks: []models.AudioTrack{japanese, english},
+	}
+	handler := &PlaybackHandler{
+		fileResolver: mapPlaybackFileResolver{files: map[int]*models.MediaFile{effectiveID: effective, publishedID: published}},
+	}
+	session := &playback.Session{MediaFileID: publishedID, RequestedMediaFileID: 100}
+	durable := map[int]predecessorPlanInventoryV3{
+		publishedID: {audio: []models.AudioTrack{english, japanese}, audioKnown: true},
+	}
+	start := v3HandlerStartRequest()
+	start.FileID = effectiveID
+	// The viewer picked the first track in the live menu, which is Japanese.
+	start.AudioTrackID = playback.TrackIDV3(publishedID, "audio", 0)
+	start.AudioTrackIndex = new(0)
+
+	audioUnavailable, _, err := handler.rekeyReplanTrackIdentitiesV3(context.Background(), &start, effective, session, durable, true)
+	if err != nil {
+		t.Fatalf("rekeyReplanTrackIdentitiesV3: %v", err)
+	}
+	if audioUnavailable {
+		t.Fatalf("fresh cross-row Japanese selection was reported unavailable: id=%q index=%v", start.AudioTrackID, start.AudioTrackIndex)
+	}
+	if want := playback.TrackIDV3(effectiveID, "audio", 1); start.AudioTrackID != want {
+		t.Fatalf("re-keyed audio id = %q, want %q (Japanese on row %d)", start.AudioTrackID, want, effectiveID)
+	}
+	if start.AudioTrackIndex == nil || *start.AudioTrackIndex != 1 {
+		t.Fatalf("re-keyed audio index = %v, want 1 (Japanese on row %d)", start.AudioTrackIndex, effectiveID)
+	}
+	if language := effective.AudioTracks[*start.AudioTrackIndex].Language; language != "ja" {
+		t.Fatalf("re-keyed audio index names language %q, want Japanese", language)
+	}
+}
+
 // Enrichment can re-probe a catalog row in place (same id, different release).
 // A carried audio id that only names that row must be remapped from the
 // evidence generation the selection was minted against, not reused by row-id
@@ -729,7 +779,7 @@ func TestReplanSameRowReprobeUsesPredecessorInventoryWithoutLiveSession(t *testi
 		t.Fatalf("durable inventory = %+v, want the predecessor's English@1 audio", durable[current.ID])
 	}
 	handler := &PlaybackHandler{}
-	source := handler.replanRemapSourceV3(current, nil, durable).file
+	source := handler.replanRemapSourceV3(context.Background(), current, nil, durable).file
 	if sameMediaInventoryV3(source, current) {
 		t.Fatal("remap source reported the re-probed row as unchanged; the stale ordinal would be reused")
 	}

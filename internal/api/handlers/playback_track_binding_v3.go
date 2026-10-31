@@ -1126,17 +1126,17 @@ func (h *PlaybackHandler) keepRekeyedSubtitleWithinSameInventoryV3(ctx context.C
 // row. A same-row subtitle identity that names a downloaded track is the
 // exception: the downloaded tail is invisible to the caller's file-shaped drift
 // remap, so it is re-checked against the captured rows here — unless the caller
-// already reconciled the ordinal, see subtitleSelectionCurrent.
-func (h *PlaybackHandler) rekeyReplanTrackIdentitiesV3(ctx context.Context, start *playback.StartRequestV3, file *models.MediaFile, session *playback.Session, durable map[int]predecessorPlanInventoryV3, subtitleSelectionCurrent bool) (audioUnavailable, subtitleUnavailable bool, err error) {
-	return h.rekeyReplanTrackIdentitiesWithRotationV3(ctx, start, file, session, durable, subtitleSelectionCurrent, false)
+// already reconciled the ordinal, see trackSelectionCurrent.
+func (h *PlaybackHandler) rekeyReplanTrackIdentitiesV3(ctx context.Context, start *playback.StartRequestV3, file *models.MediaFile, session *playback.Session, durable map[int]predecessorPlanInventoryV3, trackSelectionCurrent bool) (audioUnavailable, subtitleUnavailable bool, err error) {
+	return h.rekeyReplanTrackIdentitiesWithRotationV3(ctx, start, file, session, durable, trackSelectionCurrent, false)
 }
 
 // rekeyReplanTrackIdentitiesWithRotationV3 is the rotation-gated form: a
 // selection carried across a recorded candidate rotation is matched with the
-// strict release-rotation matcher. A fresh viewer pick (subtitleSelectionCurrent)
+// strict release-rotation matcher. A fresh viewer pick (trackSelectionCurrent)
 // never enters that matcher, because its ordinal was minted against the current
 // menu and must be read through the inventory that published it.
-func (h *PlaybackHandler) rekeyReplanTrackIdentitiesWithRotationV3(ctx context.Context, start *playback.StartRequestV3, file *models.MediaFile, session *playback.Session, durable map[int]predecessorPlanInventoryV3, subtitleSelectionCurrent, rotation bool) (audioUnavailable, subtitleUnavailable bool, err error) {
+func (h *PlaybackHandler) rekeyReplanTrackIdentitiesWithRotationV3(ctx context.Context, start *playback.StartRequestV3, file *models.MediaFile, session *playback.Session, durable map[int]predecessorPlanInventoryV3, trackSelectionCurrent, rotation bool) (audioUnavailable, subtitleUnavailable bool, err error) {
 	if h == nil || h.fileResolver == nil || start == nil || file == nil {
 		return false, false, nil
 	}
@@ -1161,7 +1161,7 @@ func (h *PlaybackHandler) rekeyReplanTrackIdentitiesWithRotationV3(ctx context.C
 		// remap, which prefers the same durable inventory before this check. The
 		// downloaded subtitle tail is the exception, because the drift remap
 		// compares file-shaped inventories and cannot see it — but only for a
-		// carried ordinal. subtitleSelectionCurrent marks a fresh choice from the
+		// carried ordinal. trackSelectionCurrent marks a fresh choice from the
 		// current menu, or a carried ordinal the drift remap already reconciled
 		// into this row's inventory; either addresses the live list, so reading it
 		// through the predecessor tail would name another downloaded row or clear
@@ -1171,12 +1171,26 @@ func (h *PlaybackHandler) rekeyReplanTrackIdentitiesWithRotationV3(ctx context.C
 			return carriedInventorySourceV3{}, 0, false
 		}
 		if embeddedFileID == file.ID {
-			if kind != subtitleTrackKindV3 || subtitleSelectionCurrent {
+			if kind != subtitleTrackKindV3 || trackSelectionCurrent {
 				return carriedInventorySourceV3{}, 0, false
 			}
 			source := h.rekeySourceFileWithInventoryV3(ctx, embeddedFileID, session, durable)
-			if !source.downloadedKnown || !source.namesDownloadedOrdinalV3(ordinal) {
+			// A historical source may have no captured downloaded tail. That is
+			// absence of proof, not a reason to skip the re-check: a downloaded
+			// ordinal is still recognized positionally, and
+			// constrainRekeyedSubtitleSelectionV3 fails closed for exactly this
+			// case instead of reusing the ordinal as if the tail were unchanged.
+			if !source.namesDownloadedOrdinalV3(ordinal) {
 				return carriedInventorySourceV3{}, 0, false
+			}
+			if !source.downloadedKnown {
+				// The ordinal addresses a downloaded row but no captured tail
+				// proves which row that is today. Mark the evidence historical
+				// so the constraint clears the unprovable selection, or surfaces
+				// a dependency error, instead of leaving the durable ordinal in
+				// place to be reused positionally against whatever the
+				// repository lists now.
+				source.subtitleHistorical = true
 			}
 			return source, ordinal, true
 		}
@@ -1188,13 +1202,13 @@ func (h *PlaybackHandler) rekeyReplanTrackIdentitiesWithRotationV3(ctx context.C
 		if !accepted {
 			return carriedInventorySourceV3{}, 0, false
 		}
-		// A fresh subtitle choice names the row whose live menu published it,
-		// even when that row differs from the one this replan validates against.
-		// Interpret the ordinal against that current inventory, then remap it
-		// onto the target by identity; applying the predecessor inventory here
-		// would read the viewer's new pick as whoever occupied the position in
-		// the captured plan.
-		if kind == subtitleTrackKindV3 && subtitleSelectionCurrent {
+		// A fresh track choice (audio or subtitle) names the row whose live
+		// menu published it, even when that row differs from the one this
+		// replan validates against. Interpret the ordinal against that current
+		// inventory, then remap it onto the target by identity; applying the
+		// predecessor inventory here would read the viewer's new pick as
+		// whoever occupied the position in the captured plan.
+		if trackSelectionCurrent {
 			source = h.currentInventorySourceV3(ctx, embeddedFileID)
 		}
 		return source, ordinal, true
@@ -1216,7 +1230,7 @@ func (h *PlaybackHandler) rekeyReplanTrackIdentitiesWithRotationV3(ctx context.C
 		// Normalize to the target row first so the edition-switch matcher reads
 		// the carried ordinal regardless of which committed row minted it.
 		start.SubtitleTrackID = playback.TrackIDV3(file.ID, "subtitle", ordinal)
-		subtitleUnavailable, err = h.constrainRekeyedSubtitleSelectionWithRotationV3(ctx, start, source, file, rotation && !subtitleSelectionCurrent)
+		subtitleUnavailable, err = h.constrainRekeyedSubtitleSelectionWithRotationV3(ctx, start, source, file, rotation && !trackSelectionCurrent)
 		if err != nil {
 			return audioUnavailable, subtitleUnavailable, err
 		}

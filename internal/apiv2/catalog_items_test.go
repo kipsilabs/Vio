@@ -535,6 +535,139 @@ func TestDetailPreplayDiscovery(t *testing.T) {
 	}
 }
 
+type fakeSelectionWarm struct {
+	probes []int
+	warms  []int
+}
+
+func (f *fakeSelectionWarm) ScheduleSelectedFileProbe(_ string, fileID int, _ catalogpkg.AccessFilter) {
+	f.probes = append(f.probes, fileID)
+}
+
+func (f *fakeSelectionWarm) ScheduleSelectedFileWarm(_ string, fileID int, _ catalogpkg.AccessFilter) {
+	f.warms = append(f.warms, fileID)
+}
+
+// A catalog detail read is the only server-visible signal a thin client sends
+// before it picks a version. It must warm the virtual rows it surfaces: an
+// unprobed row gets the probe and the fetch warm-up, a probed row only the
+// warm-up, the cap holds, local and failed rows are skipped, and a repeated
+// read inside the memo window schedules nothing again.
+func TestCatalogDetailWarmsVirtualVersions(t *testing.T) {
+	deps, base := catalogDeps(t)
+	probedAt := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
+	detail := catalogpkg.ItemDetail{ContentID: "movie:heat-1995", Type: "movie",
+		Versions: []catalogpkg.FileVersion{
+			{FileID: 1, FilePath: "virtual://movie/tt0113277?result=a", AddedAt: fixedTime()},
+			{FileID: 2, FilePath: "virtual://movie/tt0113277?result=b", AddedAt: fixedTime(), ProbedAt: &probedAt},
+			{FileID: 3, FilePath: "virtual://movie/tt0113277?result=c", AddedAt: fixedTime()},
+			{FileID: 4, FilePath: "/media/movie/heat.mkv", AddedAt: fixedTime()},
+			{FileID: 5, FilePath: "virtual://movie/tt0113277?result=dead", AddedAt: fixedTime(), Failed: true},
+		}}
+	fake := &fakePreplayCatalog{fakeCatalog: base, detail: detail}
+	deps.CatalogItems = fake
+	warm := &fakeSelectionWarm{}
+	deps.VirtualSelectionWarm = warm
+	h := newTestHandler(t, deps)
+
+	for range 2 {
+		rec := do(t, h, http.MethodGet, "/api/v2/catalog/items/movie:heat-1995", "", viewerHeaders())
+		if rec.Code != http.StatusOK {
+			t.Fatal(rec.Body.String())
+		}
+	}
+	if want := []int{1}; !reflect.DeepEqual(warm.probes, want) {
+		t.Fatalf("probes = %v, want %v (two-version cap, then deduped)", warm.probes, want)
+	}
+	if want := []int{1, 2}; !reflect.DeepEqual(warm.warms, want) {
+		t.Fatalf("warms = %v, want %v (two-version cap, then deduped)", warm.warms, want)
+	}
+}
+
+// An unwired warm seam leaves the detail read untouched rather than failing it.
+func TestCatalogDetailWarmIsNoOpWhenUnwired(t *testing.T) {
+	deps, base := catalogDeps(t)
+	fake := &fakePreplayCatalog{fakeCatalog: base,
+		detail: catalogpkg.ItemDetail{ContentID: "movie:heat-1995", Type: "movie",
+			Versions: []catalogpkg.FileVersion{{FileID: 1, FilePath: "virtual://movie/tt0113277?result=a", AddedAt: fixedTime()}}}}
+	deps.CatalogItems = fake
+	rec := do(t, newTestHandler(t, deps), http.MethodGet, "/api/v2/catalog/items/movie:heat-1995", "", viewerHeaders())
+	if rec.Code != http.StatusOK {
+		t.Fatal(rec.Body.String())
+	}
+}
+
+// The detail's version rows carry the per-version liveness state the client
+// needs to choose without a second check request: durable failed/available,
+// the process-local source mismatch, the probe stamp, and the audio/subtitle
+// inventory that makes a direct pick possible.
+func TestCatalogDetailVersionsCarryLivenessAndTrackInventory(t *testing.T) {
+	deps, base := catalogDeps(t)
+	probedAt := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
+	unavailable := false
+	zeroIndex := 0
+	detail := catalogpkg.ItemDetail{ContentID: "movie:heat-1995", Type: "movie",
+		Versions: []catalogpkg.FileVersion{
+			{
+				FileID: 42, FilePath: "virtual://movie/tt0113277?result=a", AddedAt: fixedTime(),
+				Failed: true, Available: &unavailable, ProbedAt: &probedAt,
+				SourceMismatch:           &catalogpkg.VersionSourceMismatch{ServedBytes: 7_427_636_945, DeclaredBytes: 8_449_999_999},
+				AudioTracks:              []models.AudioTrack{{Language: "en", Codec: "truehd", Channels: 8}},
+				SubtitleTracks:           []catalogpkg.VersionSubtitleTrack{{Language: "en", Codec: "srt"}},
+				EffectiveAudioTrackIndex: &zeroIndex, EffectiveAudioLanguage: "en",
+			},
+			{FileID: 43, FilePath: "/media/movie/heat.mkv", AddedAt: fixedTime()},
+		}}
+	deps.CatalogItems = &fakePreplayCatalog{fakeCatalog: base, detail: detail}
+
+	rec := do(t, newTestHandler(t, deps), http.MethodGet, "/api/v2/catalog/items/movie:heat-1995", "", viewerHeaders())
+	if rec.Code != http.StatusOK {
+		t.Fatal(rec.Body.String())
+	}
+	var body struct {
+		Versions []struct {
+			FileID         string  `json:"file_id"`
+			Failed         bool    `json:"failed"`
+			Available      *bool   `json:"available"`
+			ProbedAt       *string `json:"probed_at"`
+			SourceMismatch *struct {
+				ServedBytes   int64 `json:"served_bytes"`
+				DeclaredBytes int64 `json:"declared_bytes"`
+			} `json:"source_mismatch"`
+			AudioTracks    []models.AudioTrack               `json:"audio_tracks"`
+			SubtitleTracks []catalogpkg.VersionSubtitleTrack `json:"subtitle_tracks"`
+			EffectiveAudio string                            `json:"effective_audio_language"`
+		} `json:"versions"`
+	}
+	decodeJSON(t, rec.Body, &body)
+	if len(body.Versions) != 2 {
+		t.Fatalf("versions = %+v", body.Versions)
+	}
+	first := body.Versions[0]
+	if first.FileID != "42" || !first.Failed || first.Available == nil || *first.Available {
+		t.Fatalf("virtual version liveness = %+v", first)
+	}
+	if first.ProbedAt == nil || *first.ProbedAt != "2026-03-04T05:06:07.000Z" {
+		t.Fatalf("probed_at = %v", first.ProbedAt)
+	}
+	if first.SourceMismatch == nil || first.SourceMismatch.ServedBytes != 7_427_636_945 || first.SourceMismatch.DeclaredBytes != 8_449_999_999 {
+		t.Fatalf("source_mismatch = %+v", first.SourceMismatch)
+	}
+	if len(first.AudioTracks) != 1 || first.AudioTracks[0].Codec != "truehd" || first.AudioTracks[0].Channels != 8 {
+		t.Fatalf("audio_tracks = %+v", first.AudioTracks)
+	}
+	if len(first.SubtitleTracks) != 1 || first.SubtitleTracks[0].Codec != "srt" {
+		t.Fatalf("subtitle_tracks = %+v", first.SubtitleTracks)
+	}
+	if first.EffectiveAudio != "en" {
+		t.Fatalf("effective_audio_language = %q", first.EffectiveAudio)
+	}
+	second := body.Versions[1]
+	if second.Failed || second.Available != nil || second.ProbedAt != nil || second.SourceMismatch != nil {
+		t.Fatalf("local version must omit virtual-only liveness = %+v", second)
+	}
+}
+
 // Catalog detail must not price the pre-play discovery budget into the answer.
 // It answers from the persisted version list while the listing it started is
 // still in flight, and a second read during that window joins the work instead
