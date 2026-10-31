@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -30,7 +31,26 @@ const (
 	versionCheckPerFileBudget = 1 * time.Second
 	// versionCheckOverallBudget bounds the whole batch.
 	versionCheckOverallBudget = 2 * time.Second
+	// versionCheckWriteBudget bounds one post-verdict write: a stamp, a
+	// recovery clear, the post-write reload, or a rematch adoption. These run
+	// after the request's own deadline has passed, so they must carry their
+	// own bound instead of an unbounded background context.
+	versionCheckWriteBudget = 500 * time.Millisecond
+	// versionCheckPostBudget bounds all post-processing for the batch. It is
+	// one absolute deadline rather than a per-row allowance, so a blocked
+	// database cannot extend the handler proportionally to the batch size.
+	versionCheckPostBudget = 1 * time.Second
 )
+
+// versionCheckDetached returns a context for post-verdict work that must
+// survive client cancellation but must not run unbounded. The row is already
+// committed when the request ends, so dropping the request's cancellation is
+// intended; dropping its deadline is not. A blocked write or reload must fail
+// within this budget and be reported as unconfirmed, never as a durable
+// verdict.
+func versionCheckDetached(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), versionCheckWriteBudget)
+}
 
 type versionCheckRequest struct {
 	FileIDs []int `json:"file_ids"`
@@ -186,6 +206,12 @@ func (h *CatalogResourceHandler) HandleCheckVersions(w http.ResponseWriter, r *h
 	// itself never fails on one file.
 	_ = eg.Wait()
 
+	// All post-processing shares one absolute deadline. A blocked write must
+	// not extend the handler per row, so work that does not fit is logged and
+	// reported unconfirmed rather than assumed to have landed.
+	postCtx, postCancel := context.WithTimeout(context.WithoutCancel(r.Context()), versionCheckPostBudget)
+	defer postCancel()
+
 	// Stamps apply only after the whole batch is judged: one volatile
 	// listing disagreeing with everything must not mass-tag versions.
 	final, toStamp := gateVersionCheckStamps(outcomes)
@@ -200,7 +226,11 @@ func (h *CatalogResourceHandler) HandleCheckVersions(w http.ResponseWriter, r *h
 			// A nil error from the fenced write is not proof it landed (the
 			// repository no-ops on a delivery-grace skip or a rotated row), so
 			// report a new failure only for the confirmed post-write state.
-			stamped = h.stampVirtualCandidateFailed(ctx, outcome.fileID, outcome.file)
+			if postCtx.Err() != nil {
+				slog.WarnContext(postCtx, "version check skipped a failed-version stamp: post-processing budget exhausted", "component", "api", "file_id", outcome.fileID)
+			} else {
+				stamped = h.stampVirtualCandidateFailed(postCtx, outcome.fileID, outcome.file)
+			}
 		}
 		results = append(results, versionCheckResult{
 			FileID:         outcome.fileID,
@@ -297,10 +327,12 @@ func (h *CatalogResourceHandler) checkVersion(ctx context.Context, fileID int) v
 				// Phase-1 write the playback path uses, so the row moves with
 				// the provider's renumbering instead of being rematched on
 				// every listing.
+				adoptCtx, adoptCancel := versionCheckDetached(ctx)
 				adoptRematchedVirtualResolution(
-					context.WithoutCancel(ctx), file, resolved,
+					adoptCtx, file, resolved,
 					h.VirtualFileMetadataSaver, h.VirtualFileSaver,
 				)
+				adoptCancel()
 			}
 			outcome.available = true
 			return outcome
@@ -442,12 +474,18 @@ func (h *CatalogResourceHandler) stampVirtualCandidateFailed(ctx context.Context
 	if h == nil || h.MarkVirtualFailed == nil || file == nil || file.FailedAt != nil {
 		return false
 	}
-	stampCtx := context.WithoutCancel(ctx)
+	stampCtx, cancel := versionCheckDetached(ctx)
+	defer cancel()
 	if err := h.MarkVirtualFailed(stampCtx, fileID, file.FilePath, file.FailedAt); err != nil {
+		slog.WarnContext(ctx, "version check could not stamp a failed version", "component", "api", "file_id", fileID, "error", err)
 		return false
 	}
 	confirmed, err := h.reloadVirtualFileAfterWrite(stampCtx, fileID)
-	if err != nil || confirmed == nil || confirmed.FilePath != file.FilePath || confirmed.FailedAt == nil {
+	if err != nil {
+		slog.WarnContext(ctx, "version check could not confirm a failed-version stamp", "component", "api", "file_id", fileID, "error", err)
+		return false
+	}
+	if confirmed == nil || confirmed.FilePath != file.FilePath || confirmed.FailedAt == nil {
 		return false
 	}
 	h.publishVirtualCandidateFailed(ctx, file)
@@ -478,7 +516,8 @@ func (h *CatalogResourceHandler) publishVirtualCandidateFailed(ctx context.Conte
 	if h == nil || h.Events == nil || file == nil {
 		return
 	}
-	publishCtx := context.WithoutCancel(ctx)
+	publishCtx, cancel := versionCheckDetached(ctx)
+	defer cancel()
 	hub := h.Events.EventsHub()
 	publishVirtualVersionsUpdatedEvent(publishCtx, nil, hub, file.ContentID)
 	if file.EpisodeID != "" && file.EpisodeID != file.ContentID {
@@ -502,12 +541,18 @@ func (h *CatalogResourceHandler) clearVirtualCandidateIfFailed(ctx context.Conte
 	if h == nil || h.ClearVirtualFailed == nil || file == nil || file.FailedAt == nil {
 		return file
 	}
-	clearCtx := context.WithoutCancel(ctx)
+	clearCtx, cancel := versionCheckDetached(ctx)
+	defer cancel()
 	if err := h.ClearVirtualFailed(clearCtx, fileID, file.FilePath, file.FailedAt); err != nil {
+		slog.WarnContext(ctx, "version check could not clear a recovered version", "component", "api", "file_id", fileID, "error", err)
 		return file
 	}
 	confirmed, err := h.reloadVirtualFileAfterWrite(clearCtx, fileID)
-	if err != nil || confirmed == nil || confirmed.FilePath != file.FilePath || confirmed.FailedAt != nil {
+	if err != nil {
+		slog.WarnContext(ctx, "version check could not confirm a version recovery clear", "component", "api", "file_id", fileID, "error", err)
+		return file
+	}
+	if confirmed == nil || confirmed.FilePath != file.FilePath || confirmed.FailedAt != nil {
 		return file
 	}
 	return confirmed
