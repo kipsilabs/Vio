@@ -1,10 +1,11 @@
 // @vitest-environment jsdom
 
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { createElement } from "react";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { PlayerSubtitleInfo } from "../types";
+import { PROVISIONAL_INVENTORY_TIMEOUT_MS } from "../utils/inventoryProvenance";
 import { SubtitleMenu } from "./SubtitleMenu";
 
 // The appearance panel reads settings through react-query; the menu's own
@@ -101,6 +102,147 @@ describe("SubtitleMenu", () => {
     expect(trackRows).toHaveLength(2);
     expect(trackRows[0]?.textContent).not.toContain("✓");
     expect(trackRows[1]?.textContent).toContain("✓");
+  });
+
+  it("distinguishes same-language tracks by badging only the default one", () => {
+    renderMenu([
+      subtitleTrack({
+        index: 3,
+        language: "de",
+        label: "German",
+        track_id: "file:7:subtitle:3",
+        url: "/stream/session-1/subtitles/0.srt?embedded_stream_index=3",
+        default: true,
+      }),
+      subtitleTrack({
+        index: 4,
+        language: "de",
+        label: "German",
+        track_id: "file:7:subtitle:4",
+        url: "/stream/session-1/subtitles/1.srt?embedded_stream_index=4",
+      }),
+      subtitleTrack({
+        index: 5,
+        language: "en",
+        label: "English",
+        track_id: "file:7:subtitle:5",
+        url: "/stream/session-1/subtitles/2.srt?embedded_stream_index=5",
+      }),
+    ]);
+
+    const germanRows = screen.getAllByRole("menuitem", { name: /German/ });
+    expect(germanRows).toHaveLength(2);
+    expect(germanRows[0]?.textContent).toContain("Default");
+    expect(germanRows[1]?.textContent).not.toContain("Default");
+    expect(screen.getAllByText("Default")).toHaveLength(1);
+    // Neither row is checked while playback has no subtitle selected.
+    expect(germanRows[0]?.textContent).not.toContain("✓");
+    expect(germanRows[1]?.textContent).not.toContain("✓");
+  });
+
+  it("checks only the clicked same-language row and selects its track index", () => {
+    const tracks = [
+      subtitleTrack({
+        index: 3,
+        language: "de",
+        label: "German",
+        track_id: "file:7:subtitle:3",
+        url: "/stream/session-1/subtitles/0.srt?embedded_stream_index=3",
+        default: true,
+      }),
+      subtitleTrack({
+        index: 4,
+        language: "de",
+        label: "German",
+        track_id: "file:7:subtitle:4",
+        url: "/stream/session-1/subtitles/1.srt?embedded_stream_index=4",
+      }),
+    ];
+    const { view, onSelect } = renderMenu(tracks, vi.fn(), 3);
+
+    fireEvent.click(screen.getAllByRole("menuitem", { name: /German/ })[1] as HTMLElement);
+    expect(onSelect).toHaveBeenCalledWith(4);
+
+    // The parent applies the pick: row 2 alone shows the checkmark.
+    fireEvent.click(screen.getByRole("button", { name: /(Enable|Disable) captions/ }));
+    view.rerender(
+      createElement(SubtitleMenu, {
+        tracks,
+        activeIndex: 4,
+        onSelect,
+        delayMs: 0,
+        onDelayChange: () => {},
+      }),
+    );
+
+    const germanRows = screen.getAllByRole("menuitem", { name: /German/ });
+    expect(germanRows[0]?.textContent).not.toContain("✓");
+    expect(germanRows[1]?.textContent).toContain("✓");
+  });
+
+  it("switches between same-language rows in both directions", () => {
+    const tracks = [
+      subtitleTrack({
+        index: 3,
+        language: "de",
+        label: "German",
+        track_id: "file:7:subtitle:3",
+        url: "/stream/session-1/subtitles/0.srt?embedded_stream_index=3",
+        default: true,
+      }),
+      subtitleTrack({
+        index: 4,
+        language: "de",
+        label: "German",
+        track_id: "file:7:subtitle:4",
+        url: "/stream/session-1/subtitles/1.srt?embedded_stream_index=4",
+      }),
+    ];
+    const onSelect = vi.fn();
+    const view = render(
+      createElement(SubtitleMenu, {
+        tracks,
+        activeIndex: 4,
+        onSelect,
+        delayMs: 0,
+        onDelayChange: () => {},
+      }),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /(Enable|Disable) captions/ }));
+    fireEvent.click(screen.getAllByRole("menuitem", { name: /German/ })[0] as HTMLElement);
+    expect(onSelect).toHaveBeenLastCalledWith(3);
+
+    view.rerender(
+      createElement(SubtitleMenu, {
+        tracks,
+        activeIndex: 3,
+        onSelect,
+        delayMs: 0,
+        onDelayChange: () => {},
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /(Enable|Disable) captions/ }));
+    let germanRows = screen.getAllByRole("menuitem", { name: /German/ });
+    expect(germanRows[0]?.textContent).toContain("✓");
+    expect(germanRows[1]?.textContent).not.toContain("✓");
+
+    fireEvent.click(germanRows[1] as HTMLElement);
+    expect(onSelect).toHaveBeenLastCalledWith(4);
+
+    view.rerender(
+      createElement(SubtitleMenu, {
+        tracks,
+        activeIndex: 4,
+        onSelect,
+        delayMs: 0,
+        onDelayChange: () => {},
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /(Enable|Disable) captions/ }));
+    germanRows = screen.getAllByRole("menuitem", { name: /German/ });
+    expect(germanRows[0]?.textContent).not.toContain("✓");
+    expect(germanRows[1]?.textContent).toContain("✓");
   });
 
   it("locks the menu shut while the session inventory is switching", () => {
@@ -208,7 +350,7 @@ describe("SubtitleMenu", () => {
     expect(screen.queryByText("Discovering subtitles…")).toBeNull();
   });
 
-  it("shows discovery banner even when declared tracks are present while provisional", () => {
+  it("gates declared track rows behind the discovery state while provisional", () => {
     render(
       createElement(SubtitleMenu, {
         tracks: [subtitleTrack()],
@@ -223,7 +365,42 @@ describe("SubtitleMenu", () => {
     fireEvent.click(screen.getByRole("button", { name: /(Enable|Disable) captions/ }));
 
     expect(screen.getByText("Discovering subtitles…")).toBeTruthy();
+    // The declared rows are pre-probe placeholders for the effective file, so
+    // they must not sit in the menu as if they were the file's real tracks.
+    expect(screen.queryByText("English")).toBeNull();
+  });
+
+  it("swaps in live rows when the probed inventory arrives", () => {
+    const track = subtitleTrack();
+    const view = render(
+      createElement(SubtitleMenu, {
+        tracks: [track],
+        activeIndex: null,
+        onSelect: () => {},
+        delayMs: 0,
+        onDelayChange: () => {},
+        mediaFileId: 42,
+        provisional: true,
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /(Enable|Disable) captions/ }));
+    expect(screen.queryByText("English")).toBeNull();
+
+    view.rerender(
+      createElement(SubtitleMenu, {
+        tracks: [track],
+        activeIndex: null,
+        onSelect: () => {},
+        delayMs: 0,
+        onDelayChange: () => {},
+        mediaFileId: 42,
+        provisional: false,
+      }),
+    );
+
     expect(screen.getByText("English")).toBeTruthy();
+    expect(screen.queryByText("Discovering subtitles…")).toBeNull();
+    expect(screen.queryByText("Unverified")).toBeNull();
   });
 
   it("shows failure banner even when declared tracks are present", () => {
@@ -312,5 +489,114 @@ describe("SubtitleMenu", () => {
     expect(screen.queryByText("Discovering subtitles…")).toBeNull();
     expect(screen.queryByText("Unverified")).toBeNull();
     expect(screen.getByText("English")).toBeTruthy();
+  });
+});
+
+describe("SubtitleMenu discovery bound", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function renderProvisional(onRetryDiscovery?: () => void) {
+    const view = render(
+      createElement(SubtitleMenu, {
+        tracks: [subtitleTrack()],
+        activeIndex: null,
+        onSelect: () => {},
+        delayMs: 0,
+        onDelayChange: () => {},
+        mediaFileId: 42,
+        provisional: true,
+        onRetryDiscovery,
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /(Enable|Disable) captions/ }));
+    return view;
+  }
+
+  it("replaces the unbounded spinner with an explicit retry when discovery stalls", () => {
+    vi.useFakeTimers();
+    renderProvisional();
+
+    expect(screen.getByText("Discovering subtitles…")).toBeTruthy();
+    act(() => {
+      vi.advanceTimersByTime(PROVISIONAL_INVENTORY_TIMEOUT_MS);
+    });
+
+    expect(screen.queryByText("Discovering subtitles…")).toBeNull();
+    expect(screen.getByText("Subtitles unavailable.")).toBeTruthy();
+    // The stalled rows are still declared metadata, so the menu does not fall
+    // back to offering them.
+    expect(screen.queryByText("English")).toBeNull();
+  });
+
+  it("re-triggers discovery and shows progress again on retry", () => {
+    vi.useFakeTimers();
+    const onRetryDiscovery = vi.fn();
+    renderProvisional(onRetryDiscovery);
+
+    act(() => {
+      vi.advanceTimersByTime(PROVISIONAL_INVENTORY_TIMEOUT_MS);
+    });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Retry" }));
+
+    expect(onRetryDiscovery).toHaveBeenCalledOnce();
+    expect(screen.getByText("Discovering subtitles…")).toBeTruthy();
+    expect(screen.queryByText("Subtitles unavailable.")).toBeNull();
+
+    // The fresh window is itself bounded: a retry that never lands lapses
+    // back to the retry action instead of spinning forever.
+    act(() => {
+      vi.advanceTimersByTime(PROVISIONAL_INVENTORY_TIMEOUT_MS);
+    });
+    expect(screen.getByText("Subtitles unavailable.")).toBeTruthy();
+  });
+
+  it("returns to live rows when the retried inventory lands", () => {
+    vi.useFakeTimers();
+    const props = {
+      tracks: [subtitleTrack()],
+      activeIndex: null,
+      onSelect: () => {},
+      delayMs: 0,
+      onDelayChange: () => {},
+      mediaFileId: 42,
+      provisional: true,
+    };
+    const view = render(createElement(SubtitleMenu, props));
+    fireEvent.click(screen.getByRole("button", { name: /(Enable|Disable) captions/ }));
+    act(() => {
+      vi.advanceTimersByTime(PROVISIONAL_INVENTORY_TIMEOUT_MS);
+    });
+    expect(screen.getByText("Subtitles unavailable.")).toBeTruthy();
+
+    view.rerender(createElement(SubtitleMenu, { ...props, provisional: false }));
+
+    expect(screen.getByText("English")).toBeTruthy();
+    expect(screen.queryByText("Subtitles unavailable.")).toBeNull();
+    expect(screen.queryByText("Discovering subtitles…")).toBeNull();
+  });
+
+  it("offers the same retry beside a terminal discovery failure", () => {
+    vi.useFakeTimers();
+    const onRetryDiscovery = vi.fn();
+    render(
+      createElement(SubtitleMenu, {
+        tracks: [],
+        activeIndex: null,
+        onSelect: () => {},
+        delayMs: 0,
+        onDelayChange: () => {},
+        mediaFileId: 42,
+        provisional: true,
+        failed: true,
+        onRetryDiscovery,
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /(Enable|Disable) captions/ }));
+
+    expect(screen.getByText("Subtitle discovery failed")).toBeTruthy();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Retry" }));
+    expect(onRetryDiscovery).toHaveBeenCalledOnce();
   });
 });

@@ -58,6 +58,7 @@ import {
   mergePlaybackInventory,
   usePlaybackInventoryMirror,
 } from "@/player/playbackInventoryMirror";
+import { isOverlayInventoryProvisional } from "@/player/utils/inventoryProvenance";
 import { cn } from "@/lib/utils";
 import AddToCollectionDialog from "@/components/AddToCollectionDialog";
 import { Button } from "@/components/ui/button";
@@ -276,6 +277,12 @@ export interface ActionBarProps {
   hasVirtualSource?: boolean;
   playbackVariants?: PlaybackVariant[];
   selectedVersion?: FileVersion | null;
+  /**
+   * The version the viewer picked is no longer in the refreshed row set. Play
+   * is blocked until they pick again instead of silently starting another
+   * version.
+   */
+  selectedVersionMissing?: boolean;
   onSelectVersion?: (version: FileVersion) => void;
   /** Fired when a version picker popover opens or closes (open=true on open). */
   onVersionPickerOpenChange?: (open: boolean) => void;
@@ -350,6 +357,7 @@ export default function ActionBar({
   hasVirtualSource = false,
   playbackVariants,
   selectedVersion,
+  selectedVersionMissing = false,
   onSelectVersion,
   onVersionPickerOpenChange,
   onDownload,
@@ -443,36 +451,94 @@ export default function ActionBar({
   // the pre-play menus, so the media page offers the same tracks as the player
   // rather than the pre-probe placeholders. The zero stale time is deliberate:
   // this read may follow the probe that populated those lists.
-  const { data: selectedWatch } = useWatchDetail(contentId, selectedVersion?.file_id, undefined, {
-    enabled: !!contentId && !!selectedVersion,
-    staleTime: 0,
-  });
+  const { data: selectedWatch, refetch: refetchSelectedWatch } = useWatchDetail(
+    contentId,
+    selectedVersion?.file_id,
+    undefined,
+    {
+      enabled: !!contentId && !!selectedVersion,
+      staleTime: 0,
+    },
+  );
   const playerInventory = usePlaybackInventoryMirror(selectedVersion?.file_id);
+  const selectedWatchVersion = useMemo(
+    () =>
+      selectedVersion
+        ? selectedWatch?.versions?.find((version) => version.file_id === selectedVersion.file_id)
+        : undefined,
+    [selectedVersion, selectedWatch],
+  );
+  const isWatchProbed = Boolean(selectedWatchVersion?.probed_at);
+  const isCatalogProbed = Boolean(selectedVersion?.probed_at);
   const selectedVersionWithTracks = useMemo(() => {
     if (!selectedVersion) return null;
-    const watchVersion = selectedWatch?.versions?.find(
-      (version) => version.file_id === selectedVersion.file_id,
-    );
-    if (!watchVersion) return selectedVersion;
-    // An empty watch-detail list can be an unprobed row, not evidence that the
-    // selected version has no tracks. Keep the catalog lists until the probe
-    // actually supplies a non-empty inventory, so a cold page does not hide its
-    // audio/subtitle menus.
+    if (!selectedWatchVersion) return selectedVersion;
+    // When the watch detail read is probed, its inventory is authoritative even
+    // if empty (verified empty). When only the catalog version carries probed_at
+    // (watch read hasn't completed or is unprobed), the catalog lists are
+    // authoritative. When neither is probed, keep catalog placeholders as provisional.
+    if (isWatchProbed) {
+      return mergePlaybackInventory(
+        {
+          ...selectedVersion,
+          audio_tracks: selectedWatchVersion.audio_tracks ?? [],
+          subtitle_tracks: selectedWatchVersion.subtitle_tracks ?? [],
+        },
+        playerInventory,
+      );
+    }
+    if (isCatalogProbed) {
+      return mergePlaybackInventory(
+        {
+          ...selectedVersion,
+          audio_tracks: selectedVersion.audio_tracks ?? [],
+          subtitle_tracks: selectedVersion.subtitle_tracks ?? [],
+        },
+        playerInventory,
+      );
+    }
     return mergePlaybackInventory(
       {
         ...selectedVersion,
         audio_tracks:
-          (watchVersion.audio_tracks?.length ?? 0) > 0
-            ? watchVersion.audio_tracks
+          (selectedWatchVersion.audio_tracks?.length ?? 0) > 0
+            ? selectedWatchVersion.audio_tracks
             : selectedVersion.audio_tracks,
         subtitle_tracks:
-          (watchVersion.subtitle_tracks?.length ?? 0) > 0
-            ? watchVersion.subtitle_tracks
+          (selectedWatchVersion.subtitle_tracks?.length ?? 0) > 0
+            ? selectedWatchVersion.subtitle_tracks
             : selectedVersion.subtitle_tracks,
       },
       playerInventory,
     );
-  }, [playerInventory, selectedVersion, selectedWatch]);
+  }, [isCatalogProbed, isWatchProbed, playerInventory, selectedVersion, selectedWatchVersion]);
+  // A row's tracks count as published evidence only when the version has been
+  // probed, or when the player's own inventory mirror has confirmed tracks.
+  const isProbed = isWatchProbed || isCatalogProbed;
+  const audioRowsPublished =
+    (isWatchProbed && selectedWatchVersion !== undefined) ||
+    isCatalogProbed ||
+    (playerInventory?.audioTracks.length ?? 0) > 0;
+  const subtitleRowsPublished =
+    (isWatchProbed && selectedWatchVersion !== undefined) ||
+    isCatalogProbed ||
+    (playerInventory?.subtitleTracks.length ?? 0) > 0;
+  const audioInventoryProvisional = isOverlayInventoryProvisional(
+    !isProbed && !playerInventory,
+    audioRowsPublished,
+    selectedVersionWithTracks?.audio_tracks?.length ?? 0,
+  );
+  const subtitleInventoryProvisional = isOverlayInventoryProvisional(
+    !isProbed && !playerInventory,
+    subtitleRowsPublished,
+    selectedVersionWithTracks?.subtitle_tracks?.length ?? 0,
+  );
+  // The watch detail read is the page's discovery path: the server persists
+  // probed tracks there. Retrying re-reads it for the selected file; Play stays
+  // available throughout, so a slow probe never blocks starting playback.
+  const handleRetryInventory = useCallback(() => {
+    void refetchSelectedWatch();
+  }, [refetchSelectedWatch]);
   const showMarkerEditor = canEditMarkers && !!contentId;
   const hasMultipleVersions = (playbackVariants?.length ?? 0) > 1 || (versions?.length ?? 0) > 1;
   const showPlayChoiceDialog =
@@ -502,6 +568,10 @@ export default function ActionBar({
     () => `${location.pathname}${location.search}`,
     [location.pathname, location.search],
   );
+  // One policy for every start path: a row the liveness check marked
+  // unavailable is re-linked rather than replaying a stale provider pin. Play,
+  // Resume and the overflow "Play from Beginning" must not disagree about it.
+  const forceRelinkForSelectedVersion = selectedVersion?.available === false ? true : undefined;
   const buildPrePlayStartInput = useCallback(
     (base: {
       contentId: string;
@@ -533,6 +603,9 @@ export default function ActionBar({
   );
   const startPlaybackFromHref = useCallback(
     (href: string, restartOverride?: boolean) => {
+      // A vanished explicit selection is a pick-again state, not permission to
+      // start whatever the server chooses.
+      if (selectedVersionMissing) return;
       const parsed = parseWatchHref(href);
       if (!parsed) {
         navigate(href);
@@ -546,11 +619,20 @@ export default function ActionBar({
           libraryId: parsed.libraryId,
           restart: restartOverride ?? parsed.restart,
           returnHref: currentHref,
+          forceRelink: forceRelinkForSelectedVersion,
         }),
         "viewer",
       );
     },
-    [buildPrePlayStartInput, currentHref, navigate, playbackController, selectedVersion?.file_id],
+    [
+      buildPrePlayStartInput,
+      currentHref,
+      forceRelinkForSelectedVersion,
+      navigate,
+      playbackController,
+      selectedVersion?.file_id,
+      selectedVersionMissing,
+    ],
   );
   const handleResumePlayback = () => {
     if (!playHref) return;
@@ -800,7 +882,8 @@ export default function ActionBar({
     items[nextIndex]?.focus({ preventScroll: true });
   };
   // With one version, Play already asks whether to resume or start over.
-  const showRestartInMenu = Boolean(restartHref) && !showPlayChoiceDialog;
+  const showRestartInMenu =
+    Boolean(restartHref) && !showPlayChoiceDialog && !selectedVersionMissing;
   const playbackItems = [
     onShuffle && (
       <DetailOverflowMenuItem key="shuffle" closeMenu={closeOverflowMenu} onAction={onShuffle}>
@@ -1089,17 +1172,26 @@ export default function ActionBar({
           fileId: selectedVersion.file_id,
           restart,
           returnHref: currentHref,
-          forceRelink: selectedVersion.available === false ? true : undefined,
+          forceRelink: forceRelinkForSelectedVersion,
         }),
         "viewer",
       );
     },
-    [buildPrePlayStartInput, contentId, currentHref, playbackController, selectedVersion],
+    [
+      buildPrePlayStartInput,
+      contentId,
+      currentHref,
+      forceRelinkForSelectedVersion,
+      playbackController,
+      selectedVersion,
+    ],
   );
 
   // The subtitle control is available even when the selected file has no
-  // embedded tracks because downloaded subtitles are loaded on demand.
-  const hasStreamControls = Boolean(selectedVersion);
+  // embedded tracks because downloaded subtitles are loaded on demand. A
+  // missing pick still owns this row: it holds the replacement picker.
+  const hasReplacementVersion = selectedVersionMissing && (versions?.length ?? 0) > 0;
+  const hasStreamControls = Boolean(selectedVersion) || hasReplacementVersion;
 
   return (
     <div className="detail-action-bar space-y-2.5" data-compact-mobile={compactMobile || undefined}>
@@ -1109,7 +1201,15 @@ export default function ActionBar({
         {primaryAction ? (
           <PrimaryActionButton action={primaryAction} />
         ) : playHref ? (
-          showPlayChoiceDialog ? (
+          selectedVersionMissing ? (
+            <Button
+              disabled
+              className="h-11 gap-2.5 rounded-full px-8 text-[0.9375rem] font-bold tracking-wide"
+            >
+              <Play className="size-[18px] fill-current" />
+              Version unavailable
+            </Button>
+          ) : showPlayChoiceDialog ? (
             <Button
               onClick={openPlayChoiceDialog}
               className={`${responsivePlayActionClass} relative h-11 cursor-pointer gap-2.5 overflow-hidden rounded-full px-8 text-[0.9375rem] font-bold tracking-wide shadow-md`}
@@ -1380,6 +1480,12 @@ export default function ActionBar({
         )}
       </div>
 
+      {selectedVersionMissing ? (
+        <p role="status" className="text-destructive text-xs">
+          The selected version is no longer available. Pick a version to play.
+        </p>
+      ) : null}
+
       {/* ── Stream info controls (second row) ──────────────── */}
       {/* flex-wrap matters: without it this row's min-content width (two or
           three nowrap trigger buttons) inflates the auto-sized hero column
@@ -1404,13 +1510,15 @@ export default function ActionBar({
             </span>
           )}
           {versions &&
-            (hasMultipleVersions || virtualDetail) &&
-            selectedVersion &&
+            versions.length > 0 &&
+            (hasMultipleVersions || virtualDetail || selectedVersionMissing) &&
+            (selectedVersion || selectedVersionMissing) &&
             onSelectVersion && (
               <VersionDropdown
                 versions={versions}
                 playbackVariants={playbackVariants}
                 selectedVersion={selectedVersionWithTracks}
+                selectionMissing={selectedVersionMissing}
                 onSelectVersion={onSelectVersion}
                 contentId={contentId}
                 onOpenChange={onVersionPickerOpenChange}
@@ -1434,6 +1542,8 @@ export default function ActionBar({
                 version={selectedVersionWithTracks}
                 selectionMode={audioSelectionMode}
                 explicitTrackIndex={explicitAudioTrackIndex}
+                inventoryProvisional={audioInventoryProvisional}
+                onRetryInventory={handleRetryInventory}
                 onSelectTrack={onSelectAudioTrack}
                 onResetSelection={onResetAudioSelection}
               />
@@ -1451,6 +1561,8 @@ export default function ActionBar({
               activeAudioTrackIndex={
                 audioSelectionMode === "explicit" ? explicitAudioTrackIndex : null
               }
+              inventoryProvisional={subtitleInventoryProvisional}
+              onRetryInventory={handleRetryInventory}
               onSelectSubtitle={onSelectSubtitle}
               onSelectSubtitleOff={onSelectSubtitleOff}
               onResetSelection={onResetSubtitleSelection}

@@ -7,6 +7,14 @@ export function isVersionUnavailable(version: FileVersion): boolean {
   return version.available === false;
 }
 
+/** A version the server confirmed dead (durable failed verdict). Unlike a
+ *  merely unavailable row, which may recover and stays behind the "show
+ *  unavailable" toggle, a failed row is removed from the list entirely:
+ *  offering it again would only replay a known-dead release. */
+export function isVersionFailed(version: FileVersion): boolean {
+  return version.failed === true;
+}
+
 export interface VersionVisibility {
   /** Versions to render in the picker. */
   visibleVersions: FileVersion[];
@@ -21,6 +29,11 @@ export interface VersionVisibility {
  * - no unavailable versions → nothing to hide;
  * - every version is unavailable → show everything rather than an empty list;
  * - the active selection is unavailable → it stays visible.
+ * Rows the server confirmed dead (durable failed verdict) are removed
+ * outright instead of hidden: no toggle brings them back. The active
+ * selection is still kept so a mid-playback verdict cannot yank the
+ * playing row, and an all-failed list still renders rather than an
+ * empty menu.
  * When some versions are hidden, the caller renders a "Show N unavailable
  * versions" toggle that flips `showUnavailable`.
  */
@@ -47,19 +60,23 @@ export function useVersionVisibility(
   }
 
   return useMemo(() => {
-    const unavailable = versions.filter(isVersionUnavailable);
-    const allUnavailable = unavailable.length > 0 && unavailable.length === versions.length;
+    const alive = versions.filter(
+      (version) => !isVersionFailed(version) || version.file_id === activeFileId,
+    );
+    const list = alive.length > 0 ? alive : versions;
+    const unavailable = list.filter(isVersionUnavailable);
+    const allUnavailable = unavailable.length > 0 && unavailable.length === list.length;
 
     if (unavailable.length === 0 || allUnavailable || showUnavailable) {
       return {
-        visibleVersions: versions,
+        visibleVersions: list,
         hiddenUnavailableCount: 0,
         showUnavailable,
         setShowUnavailable,
       };
     }
 
-    const visibleVersions = versions.filter(
+    const visibleVersions = list.filter(
       (version) => !isVersionUnavailable(version) || version.file_id === activeFileId,
     );
     const hiddenUnavailableCount = unavailable.filter(

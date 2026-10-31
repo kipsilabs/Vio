@@ -59,6 +59,10 @@ export interface PlayerFileVersion {
    * derived from the client's own playback failures.
    */
   available?: boolean;
+  /** A recent server probe rejected the provider's bytes as a different
+   *  release than this row declares; the release itself is still available.
+   *  Stamped from the same versions/check answer as `available`. */
+  source_mismatch?: { served_bytes: number; declared_bytes: number };
   edition_key?: string;
   release_name?: string;
   /** Provider display label for a virtual candidate; the wire's release-name
@@ -215,6 +219,12 @@ export interface PlayerSubtitleInfo {
   source?: "external" | "embedded" | "downloaded";
   forced?: boolean;
   hearing_impaired?: boolean;
+  /**
+   * The inventory marks this stream as the file's default subtitle. Two
+   * same-language streams can differ only here, so the menu badges it instead
+   * of rendering identical rows.
+   */
+  default?: boolean;
   /** Names the track to the subtitle sync operations; absent when it can't be synced. */
   sync_key?: string;
   url: string;
@@ -307,7 +317,14 @@ export interface ResumeHints {
 export interface PlaybackExitState {
   positionSeconds: number;
   durationSeconds?: number;
+  /** The row that actually served the bytes. */
   lastFileId?: number | null;
+  /**
+   * The row the viewer chose for this playback. Persisted as the resume
+   * selection so a server-side substitution never becomes the new "chosen"
+   * version on the next mount. Falls back to `lastFileId` when absent.
+   */
+  selectedFileId?: number | null;
   lastResolution?: string;
   lastHDR?: boolean;
   lastCodecVideo?: string;
@@ -361,7 +378,14 @@ export interface WatchPageProps {
    * same map to keep the `available: false` / failed badges on the rows it
    * replaces.
    */
-  versionLiveness?: Map<number, boolean>;
+  versionLiveness?: Map<
+    number,
+    {
+      available: boolean;
+      failed?: boolean;
+      sourceMismatch?: { servedBytes: number; declaredBytes: number };
+    }
+  >;
   playbackVariants?: PlayerPlaybackVariant[];
   /**
    * Releases that exist on the indexers but are not downloaded on the provider.
@@ -413,6 +437,13 @@ export interface WatchPageProps {
   seriesContext?: SeriesContext;
   onNavigateEpisode?: (contentId: string, trigger: PlaybackStartTrigger) => void;
   onEnded?: (state?: PlaybackExitState) => void | Promise<void>;
+  /**
+   * Fires when the committed requested version changes during playback (a
+   * version switch or a server-resolved replacement). The host persists the
+   * viewer's request, because completion paths such as post-roll close and
+   * next-episode navigation do not pass through `onEnded`.
+   */
+  onRequestedVersionChange?: (fileId: number | null) => void;
   onExit: (state?: PlaybackExitState) => void | Promise<void>;
   onMinimize?: (state?: PlaybackExitState) => void | Promise<void>;
   resumeHints?: ResumeHints;

@@ -11,11 +11,13 @@ import type {
 } from "../realtime-protocol";
 import type { SubtitleInventoryItemV3 } from "../protocol-v3";
 import { usePlaybackSession } from "../hooks/usePlaybackSession";
+import { isAdaptationUnavailableReason } from "../playback-errors";
 import { usePlayerConfig } from "../context/PlayerConfigContext";
 import {
   hasSelectableSessionSubtitles,
   resolvePlayableSubtitles,
 } from "../utils/playableSubtitles";
+import { isOverlayInventoryProvisional } from "../utils/inventoryProvenance";
 import { patchVersionMarkers, resolveActiveVersionMarkers } from "../utils/watchPageMarkers";
 import { buildPublishedSubtitleTracks } from "../utils/subtitleInventory";
 import {
@@ -28,7 +30,10 @@ import {
 } from "../utils/resolveEffectiveVersion";
 import { VideoPlayer } from "./VideoPlayer";
 import { fetchWatchDetail } from "@/hooks/queries/items";
-import { applyVersionAvailability } from "@/hooks/queries/versionLiveness";
+import {
+  applyVersionAvailability,
+  type VersionLivenessVerdict,
+} from "@/hooks/queries/versionLiveness";
 import {
   awaitVirtualCandidatesRefresh,
   cancelVirtualCandidatesRefresh,
@@ -297,7 +302,7 @@ const EMPTY_PLAYBACK_VARIANTS: PlayerPlaybackVariant[] = [];
 // The liveness verdicts are optional so WatchPage can render without the
 // item-page check (watch-party tests, standalone renders). An empty map leaves
 // every row's own metadata flag untouched.
-const EMPTY_VERSION_LIVENESS = new Map<number, boolean>();
+const EMPTY_VERSION_LIVENESS = new Map<number, VersionLivenessVerdict>();
 
 function WatchPagePlayer({
   contentId,
@@ -333,6 +338,7 @@ function WatchPagePlayer({
   seriesContext,
   onNavigateEpisode,
   onEnded,
+  onRequestedVersionChange,
   onExit,
   onMinimize,
   resumeHints,
@@ -408,6 +414,16 @@ function WatchPagePlayer({
   const sessionRef = useRef(session);
   sessionRef.current = session;
 
+  // A manual retry from a stalled track menu re-arms the bounded discovery
+  // rounds below and makes one immediate inventory read. The menus restart
+  // their own bound, so the retry shows progress instead of failing at once.
+  const [inventoryRetryNonce, setInventoryRetryNonce] = useState(0);
+  const handleRetryInventory = useCallback(() => {
+    sessionRef.current.markInventoryRetrying();
+    setInventoryRetryNonce((current) => current + 1);
+    void sessionRef.current.pollInventory();
+  }, []);
+
   const fallbackHandledRef = useRef<string | null>(null);
   const [pendingFallbackKey, setPendingFallbackKey] = useState<string | null>(null);
   const fallbackRoom = watchTogetherConnection.room;
@@ -473,6 +489,15 @@ function WatchPagePlayer({
     });
   }, [session.initialSubtitleError, session.initialSubtitleErrorTitle, session.playbackAttemptId]);
 
+  const trackSelectionNotice = session.trackSelectionNotice;
+  useEffect(() => {
+    if (!trackSelectionNotice) return;
+    toast.error(trackSelectionNotice.title, {
+      id: `track-selection-${trackSelectionNotice.id}`,
+      description: trackSelectionNotice.message,
+    });
+  }, [trackSelectionNotice]);
+
   const activeVersion = useMemo(() => {
     const resolved = resolveEffectiveVersion(playbackVersions, session);
     if (resolved) return resolved;
@@ -497,6 +522,14 @@ function WatchPagePlayer({
         : (activeVersion?.audio_tracks ?? []),
     [activeVersion, session.planAudioTracks],
   );
+  // The fallback list is catalog metadata, not evidence for the effective file.
+  // Mark it provisional when the plan has no inventory of its own, so the
+  // overlay gates its rows instead of presenting placeholders as final.
+  const audioMenuProvisional = isOverlayInventoryProvisional(
+    session.audioInventoryProvisional,
+    (session.planAudioTracks?.length ?? 0) > 0,
+    audioTracks.length,
+  );
 
   const versionSubtitles = useMemo(() => {
     if (activeVersion?.subtitle_tracks !== undefined) {
@@ -510,9 +543,23 @@ function WatchPagePlayer({
     return subtitles;
   }, [activeVersion, subtitles]);
 
+  // Merge point for the two gated fallbacks above: the audio menu's
+  // `audioTracks` and the subtitle menu's `versionSubtitles`. Both read catalog
+  // metadata only when the plan publishes no inventory, and both must switch
+  // back to plan evidence as soon as it lands — keep their gates aligned.
   const playableSubtitles = useMemo(
     () => resolvePlayableSubtitles(session.subtitleUrls, versionSubtitles),
     [session.subtitleUrls, versionSubtitles],
+  );
+  // `playableSubtitles` knowingly falls back to the catalog rows above when the
+  // plan has not published a selectable inventory yet. Those rows are the
+  // pre-probe placeholders; mark them provisional even if the plan carries no
+  // declared marker, so the overlay waits for probe evidence instead of
+  // treating another release's catalog list as this file's final tracks.
+  const subtitleMenuProvisional = isOverlayInventoryProvisional(
+    session.subtitleInventoryProvisional,
+    hasSelectableSessionSubtitles(session.subtitleUrls),
+    playableSubtitles.length,
   );
 
   const handleSwitchVersion = useCallback(
@@ -655,12 +702,32 @@ function WatchPagePlayer({
       positionSeconds: session.durationSeconds ?? 0,
       durationSeconds: session.durationSeconds ?? undefined,
       lastFileId: session.mediaFileId,
+      selectedFileId: session.plan?.requested_media_file_id ?? fileId ?? session.mediaFileId,
       lastResolution: activePlaybackVersion?.resolution,
       lastHDR: activePlaybackVersion?.hdr,
       lastCodecVideo: activePlaybackVersion?.codec_video,
       lastEditionKey: activePlaybackVersion?.edition_key,
     });
-  }, [activePlaybackVersion, onEnded, session.durationSeconds, session.mediaFileId]);
+  }, [
+    activePlaybackVersion,
+    fileId,
+    onEnded,
+    session.durationSeconds,
+    session.mediaFileId,
+    session.plan?.requested_media_file_id,
+  ]);
+
+  // The committed request row changes when the viewer switches version in the
+  // player. Persist it as soon as the server acknowledges the switch: post-roll
+  // close and next-episode navigation do not wait for `onEnded`, so a viewer
+  // who leaves through those controls would otherwise lose the switch.
+  const committedRequestedFileId = session.plan?.requested_media_file_id ?? null;
+  const lastRequestedFileIdRef = useRef(committedRequestedFileId);
+  useEffect(() => {
+    if (lastRequestedFileIdRef.current === committedRequestedFileId) return;
+    lastRequestedFileIdRef.current = committedRequestedFileId;
+    onRequestedVersionChange?.(committedRequestedFileId);
+  }, [committedRequestedFileId, onRequestedVersionChange]);
 
   const handleSwitchAudio = useCallback(
     (index: number, currentPosition: number) => {
@@ -796,6 +863,7 @@ function WatchPagePlayer({
   }, [
     session.inventoryPending,
     session.inventoryUrl,
+    inventoryRetryNonce,
     session.loading,
     session.mediaFileId,
     session.replacing,
@@ -825,7 +893,11 @@ function WatchPagePlayer({
     // declared metadata, not on whether the plan published any entry: a
     // non-selectable placeholder must not suppress the poll, and a provisional
     // list must keep polling until a verified one clears the badge.
-    const needsSubtitles = playableSubtitles.length === 0 || session.subtitleInventoryProvisional;
+    // Gate on the plan's own inventory, not the rendered menu: an empty plan
+    // now shows the watch-detail evidence as a fallback, and the bounded poll
+    // is still the repair that mints real sidecar URLs and permissions.
+    const needsSubtitles =
+      !hasSelectableSessionSubtitles(session.subtitleUrls) || session.subtitleInventoryProvisional;
     if (!needsAudio && !needsSubtitles) return;
 
     // This poll is a fresh discovery round. If a previous round (the deferred
@@ -1046,6 +1118,7 @@ function WatchPagePlayer({
     applyAudioInventory,
     applyInventoryUpdate,
     contentId,
+    inventoryRetryNonce,
     isVirtualActiveFile,
     libraryId,
     queryClient,
@@ -1336,10 +1409,22 @@ function WatchPagePlayer({
   );
 
   // The server tells us whether a terminal is worth retrying. A retryable
-  // virtual-source refusal gets a Try again action; every other terminal keeps
-  // the plain Go Back dead-end.
+  // virtual-source refusal gets a Try again action, as does a retryable
+  // transcode start failure (e.g. a seek anchor that failed on a transient
+  // relay error — a fresh start re-lists and can succeed where the same
+  // plan could not proceed); every other terminal keeps the plain Go Back
+  // dead-end. An adaptation refusal always offers the action: the server
+  // marks it non-retryable because replaying the same plan cannot work, but
+  // a *fresh start* can re-list and re-resolve the source.
   const canRetryTerminal =
-    !session.plan && session.errorReason === "virtual_source_unavailable" && session.errorRetryable;
+    !session.plan &&
+    (session.errorReason === "virtual_source_unavailable" ||
+    session.errorReason === "transcode_start_failed"
+      ? session.errorRetryable === true
+      : isAdaptationUnavailableReason(session.errorReason));
+  // A session answered gone cannot be replanned or reconnected. The only
+  // recovery is a new start at the position the viewer reached.
+  const canRestartSession = !session.plan && session.connectionStatus === "gone";
   const retryInFlight = session.retrying;
 
   // The plan is the player's contract: without one there is no transport, no
@@ -1363,14 +1448,24 @@ function WatchPagePlayer({
         <div className="surface-panel-subtle flex max-w-md flex-col items-center gap-4 rounded-[1.8rem] px-8 py-8 text-center">
           <div className="space-y-2">
             <p className="text-base font-semibold text-white">
-              {session.errorTitle ?? "Playback unavailable"}
+              {session.errorTitle ?? session.connectionErrorTitle ?? "Playback unavailable"}
             </p>
             <p className="text-sm text-white/60">
-              {session.error ?? "Vio could not start playback."}
+              {session.error ?? session.connectionError ?? "Vio could not start playback."}
             </p>
           </div>
           <div className="flex flex-col items-center gap-2">
-            {canRetryTerminal ? (
+            {canRestartSession ? (
+              <button
+                onClick={() => {
+                  session.restartPlayback();
+                }}
+                type="button"
+                className="rounded-[0.95rem] bg-white px-4 py-2 text-sm font-semibold text-black transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                Restart playback
+              </button>
+            ) : canRetryTerminal ? (
               <button
                 onClick={() => {
                   session.retryStart();
@@ -1556,6 +1651,8 @@ function WatchPagePlayer({
         onConnectionLost={session.recoverConnection}
         onRetryConnection={session.retryConnection}
         onSessionLost={session.reportSessionLost}
+        onSessionGone={session.markSessionGone}
+        onRestartPlayback={session.restartPlayback}
         onExpediteReconnect={session.expediteReconnect}
         connectionStatus={session.connectionStatus}
         connectionErrorTitle={session.connectionErrorTitle}
@@ -1613,10 +1710,11 @@ function WatchPagePlayer({
         audioTracks={audioTracks}
         activeAudioIndex={session.audioTrackIndex}
         onAudioSelect={handleSwitchAudio}
-        audioInventoryProvisional={session.audioInventoryProvisional}
-        subtitleInventoryProvisional={session.subtitleInventoryProvisional}
+        audioInventoryProvisional={audioMenuProvisional}
+        subtitleInventoryProvisional={subtitleMenuProvisional}
         inventoryPending={session.inventoryPending}
         inventoryFailed={session.inventoryFailed}
+        onRetryInventory={handleRetryInventory}
         onSubtitleChanged={handleSubtitleChanged}
         onReturnFromPostRoll={onReturnFromPostRoll}
         watchTogetherRoomId={watchTogetherRoomId}

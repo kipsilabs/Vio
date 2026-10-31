@@ -102,6 +102,7 @@ export function mergePlaybackInventory(
             embedded_title: track.label,
             forced: track.forced,
             hearing_impaired: track.hearing_impaired,
+            default: track.default,
             external: track.source === "external",
           }))
         : version.subtitle_tracks,

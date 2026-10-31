@@ -170,6 +170,19 @@ type MediaFile struct {
 	// override as verified. It is never persisted and never serialized: catalog
 	// rows loaded from storage leave it false.
 	RefusedProbeEvidence bool `json:"-"`
+	// ProbedFormatSize is ffprobe's format.size for the bytes a virtual probe
+	// actually read, in bytes. It is in-memory only and never serialized: the
+	// playback probe path compares it against the row's declared FileSize to
+	// detect a provider serving a different release under the row's URL. Zero
+	// means the probe did not report a size (or the row was never probed).
+	ProbedFormatSize int64 `json:"-"`
+	// VirtualExpectedRuntimeMinutes is the catalog runtime, in minutes, of the
+	// item whose bytes a playback-time probe is validating. It is in-memory
+	// only and never serialized: the playback handler stamps it on the probe
+	// input so the probe cache can accept a short-posted copy of the right
+	// content when its measured duration matches. Zero means no expectation is
+	// known, and a served-size mismatch stays a rejection.
+	VirtualExpectedRuntimeMinutes int `json:"-"`
 	// ProbeVersion is the schema version of the probe-derived columns
 	// (audio/subtitle track shape, track languages). Scans bump it so rows
 	// probed before a probe-shape change are re-probed once instead of being

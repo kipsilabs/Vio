@@ -444,6 +444,14 @@ func convertProbeData(raw *ffprobeOutput) *ProbeData {
 			pd.Bitrate = br / 1000
 		}
 	}
+	// ffprobe reports the byte count of the container it read. Playback keeps
+	// it as evidence of what the provider actually served, separate from the
+	// catalog row's declared file size.
+	if raw.Format.Size != "" {
+		if size, err := strconv.ParseInt(raw.Format.Size, 10, 64); err == nil && size > 0 {
+			pd.FormatSize = size
+		}
+	}
 
 	for _, s := range raw.Streams {
 		switch s.CodecType {

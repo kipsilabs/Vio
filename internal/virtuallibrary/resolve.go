@@ -546,7 +546,16 @@ func (s *Service) ResolveDetailed(
 	if len(allowCandidateSubstitution) > 0 {
 		allowSubstitution = allowCandidateSubstitution[0]
 	}
-	if s == nil || s.Resolver == nil {
+	if s == nil {
+		return ResolvedVirtualStream{}, ErrVirtualLibraryUnavailable
+	}
+	// A forced refresh is an explicit request to re-list, so it must not be
+	// short-circuited by the fail-fast mark: the mark is evidence from an
+	// earlier listing, and this caller has deliberately asked for a new one.
+	if !forceRefresh && s.emptyTitleMarked(virtualPath) {
+		return ResolvedVirtualStream{}, fmt.Errorf("%w: title %s", ErrTitleWithoutStreams, neutralVirtualPathKey(virtualPath))
+	}
+	if s.Resolver == nil {
 		return ResolvedVirtualStream{}, ErrVirtualLibraryUnavailable
 	}
 
@@ -580,8 +589,10 @@ func (s *Service) ResolveDetailed(
 	}
 
 	if len(candidates) == 0 {
+		s.noteEmptyTitleListing(virtualPath)
 		return ResolvedVirtualStream{}, fmt.Errorf("no streams available from provider")
 	}
+	s.noteNonEmptyTitleListing(virtualPath)
 
 	// Rank through the same helper ListStreams uses, so the version list and
 	// the resolver agree on order and on the rejected verdict. Reject is
@@ -964,6 +975,13 @@ func (s *Service) ListStreamsFresh(ctx context.Context, virtualPath string) ([]P
 // playbackStreamsFrom is the shared ranking and formatting step of the two
 // list entry points.
 func (s *Service) playbackStreamsFrom(ctx context.Context, virtualPath string, candidates []stream.StreamCandidate) []PlaybackStream {
+	// A listing that observed streams is recovery evidence: clear the
+	// fail-fast mark here as well as on resolve, so a version list that loads
+	// before the next playback does not leave a stale mark to short-circuit
+	// that playback.
+	if len(candidates) > 0 {
+		s.noteNonEmptyTitleListing(virtualPath)
+	}
 	// Rank here too: the handler's auto-pick walks ListStreams, not
 	// ResolveDetailed, so the profile/custom-format order and the rejected
 	// verdict must be carried on the stream records.

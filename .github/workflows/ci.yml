@@ -465,6 +465,14 @@ jobs:
           SILO_SUBTITLE_STORAGE_TEST_DATABASE_URL="$SILO_TEST_DATABASE_URL" \
             go run ./scripts/ci/dbpins -list scripts/ci/episode-alias-db-contracts.txt
 
+      # Same runner semantics: a missing, skipped, or failing listed test fails
+      # the gate, so no liveness contract can switch itself off when the
+      # database URL is unset.
+      - name: Run the version-check database contracts
+        run: |
+          SILO_SUBTITLE_STORAGE_TEST_DATABASE_URL="$SILO_TEST_DATABASE_URL" \
+            go run ./scripts/ci/dbpins -list scripts/ci/version-check-db-contracts.txt
+
   lint:
     name: Go lint (changed lines)
     runs-on: ubuntu-latest

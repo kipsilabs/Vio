@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -14,6 +15,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/notifications"
+	"github.com/Silo-Server/silo-server/internal/playback"
 )
 
 // The pre-play probe chain must never block its caller, never probe bytes it
@@ -33,6 +35,10 @@ func probeChainRow(fileID int, filePath string, probeUpdatedAt *time.Time) *mode
 		ID: fileID, ContentID: probeChainTestContent, FilePath: filePath,
 		MediaFolderID: 77, VirtualOwnerInstallationID: 5, ProbeSource: "virtual",
 		ProbeUpdatedAt: probeUpdatedAt,
+		// A stored URL carries no expiry here, so the chain's staleness fence
+		// reads the row's own freshness clock. These fixtures describe a
+		// candidate the discovery run just listed.
+		UpdatedAt: time.Now(),
 	}
 	row.ResolvedURL = probeChainProviderURL(row)
 	return row
@@ -760,10 +766,12 @@ func TestScheduleDefaultFileProbeHonorsTheDiscoveryAccessFilter(t *testing.T) {
 	visible := &models.MediaFile{
 		ID: 330, ContentID: probeChainTestContent, FilePath: "virtual://movie/probe-chain?result=visible",
 		MediaFolderID: visibleLibrary, VirtualOwnerInstallationID: 5, ProbeSource: "virtual",
+		UpdatedAt: time.Now(),
 	}
 	hidden := &models.MediaFile{
 		ID: 331, ContentID: probeChainTestContent, FilePath: "virtual://movie/probe-chain?result=hidden",
 		MediaFolderID: hiddenLibrary, VirtualOwnerInstallationID: 5, ProbeSource: "virtual",
+		UpdatedAt: time.Now(),
 	}
 	visible.ResolvedURL = probeChainProviderURL(visible)
 	hidden.ResolvedURL = probeChainProviderURL(hidden)
@@ -845,6 +853,287 @@ func TestVirtualChainProbeURLRefreshesExpiredSelectedCandidate(t *testing.T) {
 	}
 }
 
+// A stored URL whose own expiry has passed must not be probed: the chain
+// resolves a fresh token and records it through the ordinary stored-URL
+// refresh write, so the next chain or play reuses it instead of paying another
+// provider round-trip (or letting the provider fall back to title recovery on
+// the dead token).
+func TestVirtualChainProbeURLResolvesAndPersistsExpiredStoredURL(t *testing.T) {
+	const freshURL = "https://probe.example/fresh-stored"
+	row := probeChainRow(7002, "virtual://movie/probe-chain?result=stored", nil)
+	past := time.Now().Add(-time.Hour)
+	row.ResolvedURL = "https://probe.example/expired-stored"
+	row.ResolvedURLExpiresAt = &past
+	cand := VirtualPlaybackStream{URI: row.FilePath, OwnerInstallationID: row.VirtualOwnerInstallationID}
+
+	newExpiry := time.Now().Add(30 * time.Minute)
+	resolveCalls := 0
+	var saved []models.VirtualFilePersistArgs
+	h := &PlaybackHandler{
+		VirtualMediaDetailedResolver: VirtualMediaDetailedResolverFunc(func(_ context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+			resolveCalls++
+			return ResolvedVirtualMedia{
+				URL: freshURL, URI: row.FilePath, CandidateID: virtualResultCandidateID(row.FilePath),
+				ExpiresAt: newExpiry,
+			}, nil
+		}),
+		VirtualFileMetadataSaver: func(_ context.Context, args models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error) {
+			saved = append(saved, args)
+			return VirtualFileMetadataUpdateResult{MetadataUpdated: true, RowsAffected: 1}, nil
+		},
+	}
+
+	url, _, ok := h.virtualChainProbeURL(context.Background(), row, cand, catalog.AccessFilter{UserID: 1, ProfileID: "profile-1"})
+	if !ok {
+		t.Fatal("an expired stored URL produced no probe URL")
+	}
+	if url != freshURL {
+		t.Fatalf("probe URL = %q, want the fresh resolve %q", url, freshURL)
+	}
+	if resolveCalls != 1 {
+		t.Fatalf("fresh resolver calls = %d, want 1", resolveCalls)
+	}
+	if len(saved) != 1 {
+		t.Fatalf("stored-URL writes = %d, want the fresh token persisted once", len(saved))
+	}
+	if saved[0].FileID != row.ID || saved[0].ExpectedFilePath != row.FilePath {
+		t.Fatalf("persisted row = id %d path %q, want id %d path %q",
+			saved[0].FileID, saved[0].ExpectedFilePath, row.ID, row.FilePath)
+	}
+	if saved[0].ResolvedURL != freshURL {
+		t.Fatalf("persisted URL = %q, want %q", saved[0].ResolvedURL, freshURL)
+	}
+	if saved[0].ResolvedURLExpiresAt == nil || !saved[0].ResolvedURLExpiresAt.Equal(newExpiry) {
+		t.Fatalf("persisted expiry = %v, want %v", saved[0].ResolvedURLExpiresAt, newExpiry)
+	}
+}
+
+// A stored URL that is still inside its own expiry is used as-is: the chain
+// must not spend a provider round-trip refreshing a token nobody doubts.
+func TestVirtualChainProbeURLUsesFreshStoredURLWithoutResolving(t *testing.T) {
+	row := probeChainRow(7003, "virtual://movie/probe-chain?result=fresh", nil)
+	future := time.Now().Add(time.Hour)
+	row.ResolvedURL = "https://probe.example/fresh-stored"
+	row.ResolvedURLExpiresAt = &future
+	cand := VirtualPlaybackStream{URI: row.FilePath, OwnerInstallationID: row.VirtualOwnerInstallationID}
+
+	h := &PlaybackHandler{
+		VirtualMediaDetailedResolver: VirtualMediaDetailedResolverFunc(func(_ context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+			t.Fatal("a fresh stored URL must not trigger a resolve")
+			return ResolvedVirtualMedia{}, nil
+		}),
+	}
+
+	url, _, ok := h.virtualChainProbeURL(context.Background(), row, cand, catalog.AccessFilter{})
+	if !ok {
+		t.Fatal("a fresh stored URL produced no probe URL")
+	}
+	if url != row.ResolvedURL {
+		t.Fatalf("probe URL = %q, want the stored URL %q", url, row.ResolvedURL)
+	}
+}
+
+// The infinite-trust regression: a row that carries no expiry at all is not a
+// row that never expires. An old one must be re-resolved and the new token
+// persisted, exactly like an expired one.
+func TestVirtualChainProbeURLResolvesNilExpiryStoredURLPastAgeBound(t *testing.T) {
+	const freshURL = "https://probe.example/fresh-ageless"
+	row := probeChainRow(7004, "virtual://movie/probe-chain?result=ageless", nil)
+	row.ResolvedURL = "https://probe.example/ancient-stored"
+	row.ResolvedURLExpiresAt = nil
+	row.UpdatedAt = time.Now().Add(-virtualChainStoredURLMaxAge - time.Minute)
+	cand := VirtualPlaybackStream{URI: row.FilePath, OwnerInstallationID: row.VirtualOwnerInstallationID}
+
+	var saved []models.VirtualFilePersistArgs
+	resolveCalls := 0
+	h := &PlaybackHandler{
+		VirtualMediaDetailedResolver: VirtualMediaDetailedResolverFunc(func(_ context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+			resolveCalls++
+			return ResolvedVirtualMedia{URL: freshURL, URI: row.FilePath, CandidateID: virtualResultCandidateID(row.FilePath)}, nil
+		}),
+		VirtualFileMetadataSaver: func(_ context.Context, args models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error) {
+			saved = append(saved, args)
+			return VirtualFileMetadataUpdateResult{MetadataUpdated: true, RowsAffected: 1}, nil
+		},
+	}
+
+	url, _, ok := h.virtualChainProbeURL(context.Background(), row, cand, catalog.AccessFilter{})
+	if !ok {
+		t.Fatal("an over-age nil-expiry stored URL produced no probe URL")
+	}
+	if url != freshURL {
+		t.Fatalf("probe URL = %q, want the fresh resolve %q", url, freshURL)
+	}
+	if resolveCalls != 1 {
+		t.Fatalf("fresh resolver calls = %d, want 1", resolveCalls)
+	}
+	if len(saved) != 1 || saved[0].ResolvedURL != freshURL {
+		t.Fatalf("persisted writes = %d (%v), want the fresh token recorded once", len(saved), saved)
+	}
+}
+
+// Inside the age bound a nil-expiry token is still trusted, so a browse-then-
+// play right after a listing does not pay a second provider listing.
+func TestVirtualChainProbeURLUsesNilExpiryStoredURLInsideAgeBound(t *testing.T) {
+	row := probeChainRow(7005, "virtual://movie/probe-chain?result=ageless-fresh", nil)
+	row.ResolvedURL = "https://probe.example/recent-stored"
+	row.ResolvedURLExpiresAt = nil
+	row.UpdatedAt = time.Now().Add(-virtualChainStoredURLMaxAge / 2)
+	cand := VirtualPlaybackStream{URI: row.FilePath, OwnerInstallationID: row.VirtualOwnerInstallationID}
+
+	h := &PlaybackHandler{
+		VirtualMediaDetailedResolver: VirtualMediaDetailedResolverFunc(func(_ context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+			t.Fatal("a stored URL inside the age bound must not trigger a resolve")
+			return ResolvedVirtualMedia{}, nil
+		}),
+	}
+
+	url, _, ok := h.virtualChainProbeURL(context.Background(), row, cand, catalog.AccessFilter{})
+	if !ok {
+		t.Fatal("a recent nil-expiry stored URL produced no probe URL")
+	}
+	if url != row.ResolvedURL {
+		t.Fatalf("probe URL = %q, want the stored URL %q", url, row.ResolvedURL)
+	}
+}
+
+// A matched listing entry whose own URL has already lapsed is evidence that
+// the token minted from that listing is dead, so the row's nil-expiry stored
+// URL is stale too even though the row itself looks recent.
+func TestVirtualChainProbeURLTreatsExpiredListingAsStoredURLStale(t *testing.T) {
+	const freshURL = "https://probe.example/fresh-listing"
+	row := probeChainRow(7006, "virtual://movie/probe-chain?result=listing", nil)
+	row.ResolvedURL = "https://probe.example/stored-listing"
+	row.ResolvedURLExpiresAt = nil
+	past := time.Now().Add(-time.Minute)
+	cand := VirtualPlaybackStream{
+		URI: row.FilePath, OwnerInstallationID: row.VirtualOwnerInstallationID,
+		ProviderURL: "https://probe.example/expired-listing", ProviderExpiresAt: &past,
+	}
+
+	resolveCalls := 0
+	h := &PlaybackHandler{
+		VirtualMediaDetailedResolver: VirtualMediaDetailedResolverFunc(func(_ context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+			resolveCalls++
+			return ResolvedVirtualMedia{URL: freshURL}, nil
+		}),
+	}
+
+	url, _, ok := h.virtualChainProbeURL(context.Background(), row, cand, catalog.AccessFilter{})
+	if !ok {
+		t.Fatal("an expired listing produced no probe URL")
+	}
+	if url != freshURL {
+		t.Fatalf("probe URL = %q, want the fresh resolve %q", url, freshURL)
+	}
+	if resolveCalls != 1 {
+		t.Fatalf("fresh resolver calls = %d, want 1", resolveCalls)
+	}
+}
+
+// A persisted selected candidate built from the row carries the row's URL, so
+// it obeys the same age bound: a row past the bound must not keep a
+// long-lived token alive through the candidate's ProviderURL.
+func TestVirtualChainProbeURLResolvesPersistedSelectedCandidatePastAgeBound(t *testing.T) {
+	const freshURL = "https://probe.example/fresh-selected-old"
+	row := probeChainRow(7007, "virtual://movie/probe-chain?result=selected-old", nil)
+	row.ResolvedURL = "https://probe.example/ancient-selected"
+	row.ResolvedURLExpiresAt = nil
+	row.UpdatedAt = time.Now().Add(-virtualChainStoredURLMaxAge - time.Hour)
+	cand := virtualPlaybackStreamFromFile(row)
+	if cand == nil {
+		t.Fatal("selected candidate was not built")
+	}
+
+	resolveCalls := 0
+	h := &PlaybackHandler{
+		VirtualMediaDetailedResolver: VirtualMediaDetailedResolverFunc(func(_ context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+			resolveCalls++
+			return ResolvedVirtualMedia{URL: freshURL}, nil
+		}),
+	}
+
+	url, _, ok := h.virtualChainProbeURL(context.Background(), row, *cand, catalog.AccessFilter{})
+	if !ok {
+		t.Fatal("an over-age persisted selected candidate produced no probe URL")
+	}
+	if url != freshURL {
+		t.Fatalf("probe URL = %q, want the fresh resolve %q", url, freshURL)
+	}
+	if resolveCalls != 1 {
+		t.Fatalf("fresh resolver calls = %d, want 1", resolveCalls)
+	}
+}
+
+// TestVirtualChainStoredURLTrusted pins the staleness rule itself at its
+// boundaries, including the nil-expiry cases the production bug lived in.
+func TestVirtualChainStoredURLTrusted(t *testing.T) {
+	now := time.Now()
+	const storedURL = "https://probe.example/stored"
+	future := now.Add(time.Hour)
+	boundary := now.Add(-virtualChainStoredURLMaxAge)
+
+	cases := []struct {
+		name           string
+		row            *models.MediaFile
+		listingExpired bool
+		want           bool
+	}{
+		{name: "nil row", row: nil, want: false},
+		{name: "no stored URL", row: &models.MediaFile{UpdatedAt: now}, want: false},
+		{
+			name: "future expiry",
+			row:  &models.MediaFile{ResolvedURL: storedURL, ResolvedURLExpiresAt: &future, UpdatedAt: now},
+			want: true,
+		},
+		{
+			name: "past expiry",
+			row:  &models.MediaFile{ResolvedURL: storedURL, ResolvedURLExpiresAt: timePtr(now.Add(-time.Second)), UpdatedAt: now},
+			want: false,
+		},
+		{
+			name: "expiry equals now",
+			row:  &models.MediaFile{ResolvedURL: storedURL, ResolvedURLExpiresAt: &now, UpdatedAt: now},
+			want: false,
+		},
+		{
+			name: "nil expiry exactly at the age bound",
+			row:  &models.MediaFile{ResolvedURL: storedURL, UpdatedAt: boundary},
+			want: true,
+		},
+		{
+			name: "nil expiry one nanosecond past the age bound",
+			row:  &models.MediaFile{ResolvedURL: storedURL, UpdatedAt: boundary.Add(-time.Nanosecond)},
+			want: false,
+		},
+		{
+			name: "nil expiry with no row timestamp",
+			row:  &models.MediaFile{ResolvedURL: storedURL},
+			want: false,
+		},
+		{
+			name:           "known-expired listing makes a fresh nil-expiry URL stale",
+			row:            &models.MediaFile{ResolvedURL: storedURL, UpdatedAt: now},
+			listingExpired: true,
+			want:           false,
+		},
+		{
+			name:           "known-expired listing leaves a future expiry expired anyway",
+			row:            &models.MediaFile{ResolvedURL: storedURL, ResolvedURLExpiresAt: timePtr(now.Add(-time.Second)), UpdatedAt: now},
+			listingExpired: true,
+			want:           false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := virtualChainStoredURLTrusted(tc.row, now, tc.listingExpired); got != tc.want {
+				t.Fatalf("virtualChainStoredURLTrusted = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestScheduleDefaultFileProbeSnapshotsAccessFilter pins the filter snapshot:
 // the request that scheduled the chain may reuse or mutate its filter after
 // the hand-off, and the detached read must still see the constraints that
@@ -889,5 +1178,265 @@ func TestDefaultProbeChainAdmissionCancelsLiveChain(t *testing.T) {
 	case <-ctx.Done():
 	case <-time.After(time.Second):
 		t.Fatal("chain context was not canceled")
+	}
+}
+
+// TestScheduleSelectedFileProbeProbesTheSelectedRow pins probe-on-select: an
+// explicit selection schedules the shared chain for the row it names, never the
+// resolved default, and a row that already carries probe evidence schedules no
+// probe at all.
+func TestScheduleSelectedFileProbeProbesTheSelectedRow(t *testing.T) {
+	defaultRow := probeChainRow(740, "virtual://movie/probe-chain?result=default", nil)
+	selectedRow := probeChainRow(741, "virtual://movie/probe-chain?result=selected", nil)
+	reader := &probeChainVersionReader{
+		files: []*models.MediaFile{defaultRow, selectedRow},
+		rows:  map[int]*models.MediaFile{defaultRow.ID: defaultRow, selectedRow.ID: selectedRow},
+	}
+	prober := &recordingProber{}
+	h := &PlaybackHandler{
+		ServiceContext:              context.Background(),
+		DefaultProbeTarget:          NewVirtualDefaultProbeTarget(reader, reader),
+		VirtualPlaybackSourceProber: prober.probe,
+	}
+
+	h.ScheduleSelectedFileProbe(probeChainTestContent, selectedRow.ID, catalog.AccessFilter{AllowedLibraryIDs: []int{77}})
+	h.probeChainWG.Wait()
+
+	if prober.count() != 1 || prober.last() != probeChainProviderURL(selectedRow) {
+		t.Fatalf("probes = %d, last = %q; want exactly the selected row %q", prober.count(), prober.last(), probeChainProviderURL(selectedRow))
+	}
+	if _, reads := reader.snapshot(); len(reads) != 1 || reads[0] != selectedRow.ID {
+		t.Fatalf("file rows read = %v, want only the selected row %d", reads, selectedRow.ID)
+	}
+
+	// Fresh inventory: the same selection must schedule nothing to probe.
+	probedAt := time.Now()
+	selectedRow.ProbeUpdatedAt = &probedAt
+	h.ScheduleSelectedFileProbe(probeChainTestContent, selectedRow.ID, catalog.AccessFilter{AllowedLibraryIDs: []int{77}})
+	h.probeChainWG.Wait()
+	if prober.count() != 1 {
+		t.Fatalf("probes after a selected row with fresh inventory = %d, want no new probe", prober.count())
+	}
+}
+
+// TestScheduleSelectedFileWarmStartsProviderFetchForProbedSelection pins
+// warm-on-select: an explicit selection hands the row's virtual URI to the same
+// fill playback start uses, even when the row already carries probe evidence,
+// and the probe chain stays untouched.
+func TestScheduleSelectedFileWarmStartsProviderFetchForProbedSelection(t *testing.T) {
+	probedAt := time.Now()
+	selectedRow := probeChainRow(742, "virtual://movie/probe-chain?result=warm", &probedAt)
+	reader := &probeChainVersionReader{
+		files: []*models.MediaFile{selectedRow},
+		rows:  map[int]*models.MediaFile{selectedRow.ID: selectedRow},
+	}
+	prober := &recordingProber{}
+	var mu sync.Mutex
+	var warmCalls []recordedWarmCall
+	h := &PlaybackHandler{
+		ServiceContext:              context.Background(),
+		DefaultProbeTarget:          NewVirtualDefaultProbeTarget(reader, reader),
+		VirtualPlaybackSourceProber: prober.probe,
+		VirtualReleaseCacheWarmup: VirtualReleaseCacheFillFunc(func(_ context.Context, virtualURI string, ownerID int, _ func(playback.DownloadProgressPayload)) error {
+			mu.Lock()
+			warmCalls = append(warmCalls, recordedWarmCall{virtualURI: virtualURI, ownerID: ownerID})
+			mu.Unlock()
+			return nil
+		}),
+	}
+
+	h.ScheduleSelectedFileWarm(probeChainTestContent, selectedRow.ID, catalog.AccessFilter{AllowedLibraryIDs: []int{77}})
+	h.warmChainWG.Wait()
+
+	mu.Lock()
+	got := slices.Clone(warmCalls)
+	mu.Unlock()
+	if len(got) != 1 {
+		t.Fatalf("warm-ups = %d, want exactly 1", len(got))
+	}
+	if got[0].virtualURI != selectedRow.FilePath || got[0].ownerID != selectedRow.VirtualOwnerInstallationID {
+		t.Fatalf("warm-up = %+v, want the selected row's URI %q and owner %d",
+			got[0], selectedRow.FilePath, selectedRow.VirtualOwnerInstallationID)
+	}
+	if prober.count() != 0 {
+		t.Fatalf("probes = %d, want none: a probed row warms without re-probing", prober.count())
+	}
+}
+
+// TestScheduleSelectedFileWarmCoalescesLiveWarmUps pins the admission contract:
+// a second explicit selection while the first warm-up is live is dropped rather
+// than spawning a second target read or a second fill.
+func TestScheduleSelectedFileWarmCoalescesLiveWarmUps(t *testing.T) {
+	selectedRow := probeChainRow(743, "virtual://movie/probe-chain?result=warm-live", nil)
+	target := &blockedDefaultTarget{open: make(chan struct{}), row: selectedRow}
+	var mu sync.Mutex
+	warmCount := 0
+	h := &PlaybackHandler{
+		ServiceContext:     context.Background(),
+		DefaultProbeTarget: target,
+		VirtualReleaseCacheWarmup: VirtualReleaseCacheFillFunc(func(_ context.Context, _ string, _ int, _ func(playback.DownloadProgressPayload)) error {
+			mu.Lock()
+			warmCount++
+			mu.Unlock()
+			return nil
+		}),
+	}
+
+	h.ScheduleSelectedFileWarm(probeChainTestContent, selectedRow.ID, catalog.AccessFilter{})
+	probeChainWaitFor(t, 1, target.callCount, "target reads")
+	h.ScheduleSelectedFileWarm(probeChainTestContent, selectedRow.ID, catalog.AccessFilter{})
+	probeChainStableWait(t, 1, target.callCount, "target reads after a duplicate selection")
+
+	target.releaseRow()
+	h.warmChainWG.Wait()
+	mu.Lock()
+	defer mu.Unlock()
+	if warmCount != 1 {
+		t.Fatalf("warm-ups = %d, want exactly 1", warmCount)
+	}
+}
+
+// TestScheduleSelectedFileWarmSkipsWhenProbeChainIsLive pins the shared-fetch
+// rule: a live pre-play probe already opens the provider URL, which starts the
+// same fetch, so the warm-up is not scheduled on top of it.
+func TestScheduleSelectedFileWarmSkipsWhenProbeChainIsLive(t *testing.T) {
+	selectedRow := probeChainRow(744, "virtual://movie/probe-chain?result=warm-probe-live", nil)
+	target := &blockedDefaultTarget{open: make(chan struct{}), row: selectedRow}
+	var mu sync.Mutex
+	warmCount := 0
+	h := &PlaybackHandler{
+		ServiceContext:     context.Background(),
+		DefaultProbeTarget: target,
+		VirtualReleaseCacheWarmup: VirtualReleaseCacheFillFunc(func(_ context.Context, _ string, _ int, _ func(playback.DownloadProgressPayload)) error {
+			mu.Lock()
+			warmCount++
+			mu.Unlock()
+			return nil
+		}),
+	}
+	release, refusal := h.defaultProbeChains.acquire(probeChainTestContent + "\x00" + strconv.Itoa(selectedRow.ID))
+	if refusal != defaultProbeChainRefusalNone {
+		t.Fatalf("probe admission refused: %s", refusal)
+	}
+	defer release()
+
+	h.ScheduleSelectedFileWarm(probeChainTestContent, selectedRow.ID, catalog.AccessFilter{})
+	h.warmChainWG.Wait()
+	probeChainStableWait(t, 0, target.callCount, "target reads with a live probe chain")
+
+	mu.Lock()
+	defer mu.Unlock()
+	if warmCount != 0 {
+		t.Fatalf("warm-ups = %d, want none while the probe chain is live", warmCount)
+	}
+}
+
+type recordedWarmCall struct {
+	virtualURI string
+	ownerID    int
+}
+
+type selectionProbeCall struct {
+	contentID string
+	fileID    int
+	filter    catalog.AccessFilter
+}
+
+// recordingSelectionProber records what the watch-detail trigger hands to the
+// probe and warm schedulers.
+type recordingSelectionProber struct {
+	mu        sync.Mutex
+	calls     []selectionProbeCall
+	warmCalls []selectionProbeCall
+}
+
+func (r *recordingSelectionProber) ScheduleSelectedFileProbe(contentID string, fileID int, filter catalog.AccessFilter) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = append(r.calls, selectionProbeCall{contentID: contentID, fileID: fileID, filter: filter})
+}
+
+func (r *recordingSelectionProber) ScheduleSelectedFileWarm(contentID string, fileID int, filter catalog.AccessFilter) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.warmCalls = append(r.warmCalls, selectionProbeCall{contentID: contentID, fileID: fileID, filter: filter})
+}
+
+func (r *recordingSelectionProber) snapshot() []selectionProbeCall {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Clone(r.calls)
+}
+
+func (r *recordingSelectionProber) warmSnapshot() []selectionProbeCall {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Clone(r.warmCalls)
+}
+
+// TestWatchDetailSelectionSchedulesProbeOnlyForUnprobedVirtualRow pins the
+// trigger rule: only a read that names an explicit, virtual, still-unprobed
+// version schedules a probe. A bare read, a local selection, and a selection
+// with fresh inventory all schedule no probe. Every explicit virtual selection
+// (probed or not) schedules a provider fetch warm-up, because probe evidence
+// does not mean the provider has fetched the bytes.
+func TestWatchDetailSelectionSchedulesProbeOnlyForUnprobedVirtualRow(t *testing.T) {
+	prober := &recordingSelectionProber{}
+	h := &ItemsHandler{virtualSelectionProber: prober}
+	detail := &catalog.WatchDetail{
+		ContentID: "episode-select",
+		Type:      itemTypeEpisode,
+		Versions: []catalog.FileVersion{
+			{FileID: 21, FilePath: "/media/local/episode.mkv"},
+			{FileID: 22, FilePath: "virtual://series/show/s01e01?result=lupins03e01hdr2160pwebh265edith"},
+		},
+	}
+
+	// A bare read carries no selection: nothing is scheduled.
+	h.scheduleSelectedVirtualProbe(detail, catalog.AccessFilter{})
+	if got := prober.snapshot(); len(got) != 0 {
+		t.Fatalf("bare read scheduled %d probes, want none", len(got))
+	}
+	if got := prober.warmSnapshot(); len(got) != 0 {
+		t.Fatalf("bare read scheduled %d warm-ups, want none", len(got))
+	}
+
+	// An explicit selection of the virtual row schedules exactly that row's
+	// probe and its warm-up.
+	h.scheduleSelectedVirtualProbe(detail, catalog.AccessFilter{SelectedFileID: 22})
+	got := prober.snapshot()
+	if len(got) != 1 {
+		t.Fatalf("explicit selection scheduled %d probes, want 1", len(got))
+	}
+	if got[0].contentID != detail.ContentID || got[0].fileID != 22 || got[0].filter.SelectedFileID != 22 {
+		t.Fatalf("scheduled probe = %+v, want content %q file 22 with its selection", got[0], detail.ContentID)
+	}
+	warm := prober.warmSnapshot()
+	if len(warm) != 1 {
+		t.Fatalf("explicit selection scheduled %d warm-ups, want 1", len(warm))
+	}
+	if warm[0].contentID != detail.ContentID || warm[0].fileID != 22 || warm[0].filter.SelectedFileID != 22 {
+		t.Fatalf("scheduled warm-up = %+v, want content %q file 22 with its selection", warm[0], detail.ContentID)
+	}
+
+	// Selecting a local row has no provider bytes to enumerate or fetch.
+	h.scheduleSelectedVirtualProbe(detail, catalog.AccessFilter{SelectedFileID: 21})
+	if got := prober.snapshot(); len(got) != 1 {
+		t.Fatalf("local selection scheduled %d probes, want none", len(got)-1)
+	}
+	if got := prober.warmSnapshot(); len(got) != 1 {
+		t.Fatalf("local selection scheduled %d warm-ups, want none", len(got)-1)
+	}
+
+	// A selected row with fresh inventory needs no probe, but still warms: the
+	// bytes may be cold even though the inventory is known.
+	probedAt := time.Now()
+	detail.Versions[1].ProbedAt = &probedAt
+	h.scheduleSelectedVirtualProbe(detail, catalog.AccessFilter{SelectedFileID: 22})
+	if got := prober.snapshot(); len(got) != 1 {
+		t.Fatalf("fresh selection scheduled %d probes, want none", len(got)-1)
+	}
+	if got := prober.warmSnapshot(); len(got) != 2 {
+		t.Fatalf("fresh selection scheduled %d warm-ups, want a second one", len(got))
 	}
 }

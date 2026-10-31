@@ -181,6 +181,26 @@ type Session struct {
 	// Zero means unknown, and the seek then fails closed rather than borrowing.
 	VirtualSubtitleEvidenceOwnerInstallationID int
 	VirtualSubtitleEvidenceSet                 bool
+	// VirtualSubtitleSelectionIndex is the viewer's committed combined subtitle
+	// ordinal on the current evidence generation (-1 = subtitles off).
+	// SubtitleTrackIndex is a different space (the transport stream operand), so
+	// a candidate rotation must not re-key from it. Set is false when no
+	// selection was ever committed.
+	VirtualSubtitleSelectionIndex int
+	VirtualSubtitleSelectionSet   bool
+	// VirtualSubtitleCarryFromIndex / ToIndex describe the viewer's selection
+	// carried across the most recent virtual candidate rotation: a subtitle URL
+	// minted before the rotation still names FromIndex, and the serve path
+	// rewrites it to ToIndex. A second rotation re-keys from ToIndex, which is
+	// why the commit records the new position rather than the original one.
+	VirtualSubtitleCarryFromIndex int
+	VirtualSubtitleCarryToIndex   int
+	VirtualSubtitleCarrySet       bool
+	// VirtualSubtitleCarryLostIndex records the carried ordinal a rotation could
+	// not preserve. A subtitle fetch still naming it answers the retryable
+	// source-changed answer instead of resolving the dead pin or spawning ffmpeg.
+	VirtualSubtitleCarryLostIndex int
+	VirtualSubtitleCarryLostSet   bool
 	// SelectionOrigin mirrors the attempt's audio selection intent onto the
 	// live session ("auto" when the server resolved an omitted selection,
 	// "explicit" when the viewer named a track). In-memory recovery and
@@ -399,6 +419,16 @@ type SessionStreamState struct {
 	// unknown.
 	VirtualSubtitleEvidenceOwnerInstallationID int
 	VirtualSubtitleEvidenceSet                 bool
+	// VirtualSubtitleSelectionIndex/Set and the VirtualSubtitleCarry* fields
+	// commit the viewer's subtitle position and the most recent rotation carry
+	// with the evidence generation (see Session).
+	VirtualSubtitleSelectionIndex int
+	VirtualSubtitleSelectionSet   bool
+	VirtualSubtitleCarryFromIndex int
+	VirtualSubtitleCarryToIndex   int
+	VirtualSubtitleCarrySet       bool
+	VirtualSubtitleCarryLostIndex int
+	VirtualSubtitleCarryLostSet   bool
 	// SelectionOrigin, PreferredAudioLanguage,
 	// SeriesAudioPreferenceSignature and SelectedAudioSignature mirror the
 	// attempt's audio selection intent (see Session) onto the stream state so
@@ -1638,6 +1668,19 @@ func applySessionStreamStateLocked(s *Session, state SessionStreamState) {
 			}
 		}
 	}
+	// The committed subtitle position and rotation carry travel with the
+	// evidence generation. A full v3 snapshot owns them outright; a legacy
+	// partial update leaves the session's existing values untouched, exactly
+	// like the virtual inventory above.
+	if state.VirtualSourceSet || state.VirtualSourceOwnershipSet {
+		s.VirtualSubtitleSelectionIndex = state.VirtualSubtitleSelectionIndex
+		s.VirtualSubtitleSelectionSet = state.VirtualSubtitleSelectionSet
+		s.VirtualSubtitleCarryFromIndex = state.VirtualSubtitleCarryFromIndex
+		s.VirtualSubtitleCarryToIndex = state.VirtualSubtitleCarryToIndex
+		s.VirtualSubtitleCarrySet = state.VirtualSubtitleCarrySet
+		s.VirtualSubtitleCarryLostIndex = state.VirtualSubtitleCarryLostIndex
+		s.VirtualSubtitleCarryLostSet = state.VirtualSubtitleCarryLostSet
+	}
 	s.SubtitleTrackIndex = state.SubtitleTrackIndex
 	s.SubtitleBurnIn = state.SubtitleBurnIn
 	s.SegmentDuration = state.SegmentDuration
@@ -1712,6 +1755,13 @@ func snapshotSessionStreamStateLocked(s *Session) SessionStreamState {
 		VirtualSubtitleEvidenceFileID:              s.VirtualSubtitleEvidenceFileID,
 		VirtualSubtitleEvidenceOwnerInstallationID: s.VirtualSubtitleEvidenceOwnerInstallationID,
 		VirtualSubtitleEvidenceSet:                 s.VirtualSubtitleEvidenceSet,
+		VirtualSubtitleSelectionIndex:              s.VirtualSubtitleSelectionIndex,
+		VirtualSubtitleSelectionSet:                s.VirtualSubtitleSelectionSet,
+		VirtualSubtitleCarryFromIndex:              s.VirtualSubtitleCarryFromIndex,
+		VirtualSubtitleCarryToIndex:                s.VirtualSubtitleCarryToIndex,
+		VirtualSubtitleCarrySet:                    s.VirtualSubtitleCarrySet,
+		VirtualSubtitleCarryLostIndex:              s.VirtualSubtitleCarryLostIndex,
+		VirtualSubtitleCarryLostSet:                s.VirtualSubtitleCarryLostSet,
 		SelectionOrigin:                            s.SelectionOrigin,
 		SelectionOriginSet:                         true,
 		PreferredAudioLanguage:                     s.PreferredAudioLanguage,
@@ -1804,6 +1854,13 @@ func restoreSessionStreamStateLocked(s *Session, state SessionStreamState) {
 			s.VirtualSubtitleEvidenceOwnerInstallationID = 0
 		}
 	}
+	s.VirtualSubtitleSelectionIndex = state.VirtualSubtitleSelectionIndex
+	s.VirtualSubtitleSelectionSet = state.VirtualSubtitleSelectionSet
+	s.VirtualSubtitleCarryFromIndex = state.VirtualSubtitleCarryFromIndex
+	s.VirtualSubtitleCarryToIndex = state.VirtualSubtitleCarryToIndex
+	s.VirtualSubtitleCarrySet = state.VirtualSubtitleCarrySet
+	s.VirtualSubtitleCarryLostIndex = state.VirtualSubtitleCarryLostIndex
+	s.VirtualSubtitleCarryLostSet = state.VirtualSubtitleCarryLostSet
 	s.SubtitleTrackIndex = state.SubtitleTrackIndex
 	s.SubtitleBurnIn = state.SubtitleBurnIn
 	s.SegmentDuration = state.SegmentDuration
@@ -1849,6 +1906,12 @@ func (m *SessionManager) setVirtualSourceLocked(s *Session, virtualURI string, o
 		// The evidence provenance anchor stays at the old candidate, which is
 		// what makes the mismatch detectable downstream.
 		s.VirtualSourceRevision = ""
+		// A carry pair names ordinals on the evidence generation of the move it
+		// was committed with. A different binding invalidates it; the next plan
+		// commit records a fresh pair, and until then the serve path's evidence
+		// remap handles pre-rotation URLs by identity.
+		s.VirtualSubtitleCarrySet = false
+		s.VirtualSubtitleCarryLostSet = false
 	}
 	// A binding move starts a fresh probe lifecycle: whatever outcome the
 	// previous candidate's deferred probe reached says nothing about this one.

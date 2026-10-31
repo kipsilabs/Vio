@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { isInventoryProvisional } from "./inventoryProvenance";
+import {
+  PROVISIONAL_INVENTORY_TIMEOUT_MS,
+  isInventoryProvisional,
+  isOverlayInventoryProvisional,
+  isProvisionalInventoryExpired,
+} from "./inventoryProvenance";
 
 describe("isInventoryProvisional", () => {
   it("is provisional while the stamp-derived status is declared", () => {
@@ -39,5 +44,55 @@ describe("isInventoryProvisional", () => {
     expect(isInventoryProvisional("verified", "verified", false)).toBe(false);
     expect(isInventoryProvisional("verified", "verified", undefined)).toBe(false);
     expect(isInventoryProvisional("verified", "verified", null)).toBe(false);
+  });
+});
+
+describe("isOverlayInventoryProvisional", () => {
+  it("stays provisional while the plan reports declared or pending inventory", () => {
+    expect(isOverlayInventoryProvisional(true, true, 2)).toBe(true);
+    expect(isOverlayInventoryProvisional(true, false, 0)).toBe(true);
+  });
+
+  it("stays provisional while the rows are catalog fallback, not plan evidence", () => {
+    expect(isOverlayInventoryProvisional(false, false, 2)).toBe(true);
+  });
+
+  it("treats plan-published rows with no provisional marker as final", () => {
+    expect(isOverlayInventoryProvisional(false, true, 2)).toBe(false);
+  });
+
+  it("keeps an empty verified inventory final so the menu can show its empty state", () => {
+    expect(isOverlayInventoryProvisional(false, false, 0)).toBe(false);
+    expect(isOverlayInventoryProvisional(false, true, 0)).toBe(false);
+  });
+});
+
+describe("isProvisionalInventoryExpired", () => {
+  const since = 1_000_000;
+
+  it("keeps the spinner inside the discovery window", () => {
+    expect(isProvisionalInventoryExpired(true, since, since + 1)).toBe(false);
+    expect(
+      isProvisionalInventoryExpired(true, since, since + PROVISIONAL_INVENTORY_TIMEOUT_MS - 1),
+    ).toBe(false);
+  });
+
+  it("offers a retry once the window lapses", () => {
+    expect(
+      isProvisionalInventoryExpired(true, since, since + PROVISIONAL_INVENTORY_TIMEOUT_MS),
+    ).toBe(true);
+    expect(
+      isProvisionalInventoryExpired(true, since, since + PROVISIONAL_INVENTORY_TIMEOUT_MS + 5_000),
+    ).toBe(true);
+  });
+
+  it("never expires a menu that is not provisional", () => {
+    expect(isProvisionalInventoryExpired(false, since, since + 60_000)).toBe(false);
+    expect(isProvisionalInventoryExpired(true, null, since + 60_000)).toBe(false);
+  });
+
+  it("honors a caller's shorter bound", () => {
+    expect(isProvisionalInventoryExpired(true, since, since + 2_000, 2_000)).toBe(true);
+    expect(isProvisionalInventoryExpired(true, since, since + 1_999, 2_000)).toBe(false);
   });
 });

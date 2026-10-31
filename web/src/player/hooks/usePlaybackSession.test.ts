@@ -12,7 +12,7 @@ import {
   VIDEO_CLIENT_FEATURES_V3,
 } from "../playback-session-wire-v3";
 import { PLAN_INVALIDATED_DEFAULT_AUDIO_RECONCILIATION } from "../realtime-protocol";
-import type { PlayerAudioTrack, PlayerFileVersion } from "../types";
+import type { PlayerAudioTrack, PlayerFileVersion, PlayerSubtitleInfo } from "../types";
 import type { SubtitleInventoryItemV3 } from "../protocol-v3";
 import {
   fixtureClientCapabilitiesV3,
@@ -1550,11 +1550,14 @@ describe("usePlaybackSession output capability changes", () => {
       await outputReplanResponse;
     });
 
-    await waitFor(() => expect(replanBodies).toHaveLength(2));
+    // The quality intent was queued behind the output refresh, and the audio
+    // pick is held until that lane frees: it must be re-issued, not dropped.
+    await waitFor(() => expect(replanBodies).toHaveLength(3));
     expect(replanBodies[1]).toMatchObject({
       operation: "quality_change",
       quality_preference: "1080p",
     });
+    expect(replanBodies[2]).toMatchObject({ operation: "track_change" });
     expect(result.current.qualityPreference).toBe("1080p");
     unmount();
   });
@@ -2226,16 +2229,18 @@ describe("usePlaybackSession version switches", () => {
 
     await waitFor(() => expect(result.current.mediaFileId).toBe(99));
     expect(result.current.plan?.plan_id).toBe("plan:switch-2");
-    // The refused seek replays against the settled replacement plan, while the
-    // refused track/quality intents stay dropped.
-    await waitFor(() => expect(replanBodies).toHaveLength(1));
+    // The refused seek replays against the settled replacement plan, and the
+    // held audio pick is re-resolved against it instead of being discarded.
+    // The quality intent is not a track pick and stays dropped.
+    await waitFor(() => expect(replanBodies).toHaveLength(2));
     expect(replanBodies[0]).toMatchObject({ operation: "seek_reanchor", position_seconds: 140 });
+    expect(replanBodies[1]).toMatchObject({ operation: "track_change" });
 
     // Once the switch settles the fence lifts and replans flow again.
     act(() => {
       void result.current.reanchorSeek(150);
     });
-    await waitFor(() => expect(replanBodies).toHaveLength(2));
+    await waitFor(() => expect(replanBodies).toHaveLength(3));
 
     unmount();
   });
@@ -3806,7 +3811,151 @@ describe("usePlaybackSession replans", () => {
     unmount();
   });
 
-  it("drops a queued track change whose plan the in-flight replan replaced", async () => {
+  it("re-issues an audio pick made during a seek reanchor against the new ordinals", async () => {
+    const initialPlan = fixturePlanV3({
+      audio_tracks: [
+        {
+          codec: "eac3",
+          channels: 6,
+          layout: "5.1",
+          language: "eng",
+          default: true,
+          track_id: "file:7:audio:0",
+          selection_index: 0,
+        },
+        {
+          codec: "ac3",
+          channels: 2,
+          layout: "stereo",
+          language: "spa",
+          default: false,
+          track_id: "file:7:audio:1",
+          selection_index: 1,
+        },
+      ],
+    });
+    let resolveSeek: ((response: Response) => void) | undefined;
+    const seekResponse = new Promise<Response>((resolve) => {
+      resolveSeek = resolve;
+    });
+    const replanBodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/playback/start")) {
+          return jsonResponse(
+            {
+              protocol_version: 3,
+              server_features: ["playback_plan_v3"],
+              outcome: "playable",
+              session_id: "session-1",
+              playback_plan: initialPlan,
+            },
+            { status: 201 },
+          );
+        }
+        if (url.endsWith("/playback/session-1/replan")) {
+          replanBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+          if (replanBodies.length === 1) return seekResponse;
+          return jsonResponse({
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3({
+              plan_id: "plan:after-seek-0001",
+              plan_attempt_key: "v3:after-seek-0001",
+              audio_tracks: [
+                {
+                  codec: "ac3",
+                  channels: 2,
+                  layout: "stereo",
+                  language: "spa",
+                  default: true,
+                  track_id: "file:7:audio:0",
+                  selection_index: 0,
+                },
+                {
+                  codec: "eac3",
+                  channels: 6,
+                  layout: "5.1",
+                  language: "eng",
+                  default: false,
+                  track_id: "file:7:audio:1",
+                  selection_index: 1,
+                },
+              ],
+            }),
+          });
+        }
+        if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+        if (init?.method === "DELETE") return new Response(null, { status: 204 });
+        throw new Error(`Unexpected request: ${url}`);
+      }),
+    );
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    act(() => {
+      void result.current.reanchorSeek(400);
+    });
+    await waitFor(() => expect(replanBodies).toHaveLength(1));
+
+    // The viewer picks Spanish while the reanchor is in flight.
+    act(() => result.current.switchAudioTrack(1, 400));
+    expect(replanBodies).toHaveLength(1);
+
+    await act(async () => {
+      resolveSeek?.(
+        jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "playable",
+          session_id: "session-1",
+          playback_plan: fixturePlanV3({
+            plan_id: "plan:after-seek-0001",
+            plan_attempt_key: "v3:after-seek-0001",
+            audio_tracks: [
+              {
+                codec: "ac3",
+                channels: 2,
+                layout: "stereo",
+                language: "spa",
+                default: true,
+                track_id: "file:7:audio:0",
+                selection_index: 0,
+              },
+              {
+                codec: "eac3",
+                channels: 6,
+                layout: "5.1",
+                language: "eng",
+                default: false,
+                track_id: "file:7:audio:1",
+                selection_index: 1,
+              },
+            ],
+          }),
+        }),
+      );
+      await seekResponse;
+    });
+
+    await waitFor(() => expect(replanBodies).toHaveLength(2));
+    expect(replanBodies[1]).toMatchObject({
+      operation: "track_change",
+      selected_tracks: { audio: { id: "file:7:audio:0", index: 0 } },
+    });
+
+    unmount();
+  });
+
+  it("re-issues a queued track change against the replacement plan", async () => {
     const initialPlan = fixturePlanV3();
     const replannedPlan = fixturePlanV3({
       plan_id: "plan:2222222222222222",
@@ -3854,10 +4003,8 @@ describe("usePlaybackSession replans", () => {
     });
     await waitFor(() => expect(replanBodies).toHaveLength(1));
 
-    // The audio ordinal was resolved off the outgoing plan's menu. Once the
-    // in-flight refresh adopts a different plan identity that ordinal no longer
-    // names the same track, so the queued change must be dropped rather than
-    // replayed against the replacement plan.
+    // The pick is re-resolved against the replacement plan's inventory rather
+    // than replayed with the outgoing plan's ordinal or silently dropped.
     act(() => result.current.switchAudioTrack(2, 130));
     expect(replanBodies).toHaveLength(1);
 
@@ -3875,12 +4022,248 @@ describe("usePlaybackSession replans", () => {
     });
 
     await waitFor(() => expect(result.current.plan?.plan_id).toBe("plan:2222222222222222"));
-    expect(replanBodies).toHaveLength(1);
+    await waitFor(() => expect(replanBodies).toHaveLength(2));
+    expect(replanBodies[1]).toMatchObject({ operation: "track_change" });
 
     unmount();
   });
 
-  it("drops a queued plan-bound replan when a rotation moved the effective file", async () => {
+  it("re-resolves a queued subtitle pick when the replacement inventory reuses its ordinal", async () => {
+    const english = fixtureSubtitleInventoryItemV3({
+      track_id: "file:7:subtitle:0",
+      combined_index: 0,
+      source: "external",
+      codec: "srt",
+      language: "eng",
+      label: "English",
+      url: "/stream/session-1/subtitles/0.vtt?file_id=7",
+    });
+    const french = fixtureSubtitleInventoryItemV3({
+      track_id: "file:7:subtitle:1",
+      combined_index: 1,
+      source: "external",
+      codec: "srt",
+      language: "fra",
+      label: "French",
+      url: "/stream/session-1/subtitles/1.vtt?file_id=7",
+    });
+    const initialPlan = fixturePlanV3({
+      subtitle: { mode: "off", inventory: [english, french] },
+    });
+    // The replacement reuses the ordinal-derived ids in the opposite slots:
+    // file:7:subtitle:0 now names French, so trusting the captured id would
+    // replay the click as the wrong language.
+    const replannedPlan = fixturePlanV3({
+      plan_id: "plan:subtitle-swap-01",
+      plan_attempt_key: "v3:subtitle-swap-01",
+      subtitle: {
+        mode: "off",
+        inventory: [
+          { ...french, track_id: "file:7:subtitle:0", combined_index: 0 },
+          { ...english, track_id: "file:7:subtitle:1", combined_index: 1 },
+        ],
+      },
+    });
+    const replanBodies: Array<Record<string, unknown>> = [];
+    let resolveFirstReplan: ((response: Response) => void) | undefined;
+    const firstReplanResponse = new Promise<Response>((resolve) => {
+      resolveFirstReplan = resolve;
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: initialPlan,
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/session-1/replan")) {
+        replanBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        if (replanBodies.length === 1) return firstReplanResponse;
+        return jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "playable",
+          session_id: "session-1",
+          playback_plan: replannedPlan,
+        });
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+    expect(result.current.subtitleUrls.map((track) => track.language)).toEqual(["eng", "fra"]);
+
+    act(() => {
+      void result.current.refreshSubtitles(120);
+    });
+    await waitFor(() => expect(replanBodies).toHaveLength(1));
+
+    // The viewer clicks English while the replacement plan is in flight.
+    act(() => result.current.changeSubtitleTrack(0, 130));
+    expect(replanBodies).toHaveLength(1);
+
+    await act(async () => {
+      resolveFirstReplan?.(
+        jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "playable",
+          session_id: "session-1",
+          playback_plan: replannedPlan,
+        }),
+      );
+      await firstReplanResponse;
+    });
+
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe("plan:subtitle-swap-01"));
+    await waitFor(() => expect(replanBodies).toHaveLength(2));
+    expect(replanBodies[1]).toMatchObject({
+      operation: "track_change",
+      selected_tracks: { subtitle: { id: "file:7:subtitle:1", index: 1 } },
+    });
+
+    unmount();
+  });
+
+  it("keeps the clicked watch-detail fallback subtitle when the deferred inventory reorders its slots", async () => {
+    const english = fixtureSubtitleInventoryItemV3({
+      track_id: "file:7:subtitle:0",
+      combined_index: 0,
+      source: "external",
+      codec: "srt",
+      language: "eng",
+      label: "English",
+      url: "/stream/session-1/subtitles/0.vtt?file_id=7",
+    });
+    const french = fixtureSubtitleInventoryItemV3({
+      track_id: "file:7:subtitle:1",
+      combined_index: 1,
+      source: "external",
+      codec: "srt",
+      language: "fra",
+      label: "French",
+      url: "/stream/session-1/subtitles/1.vtt?file_id=7",
+    });
+    // The probe is deferred, so the session publishes no inventory and the
+    // menu is showing the watch detail's own rows.
+    const initialPlan = fixturePlanV3({
+      subtitle: { mode: "off", inventory: [] },
+    });
+    // The verified inventory arrives with the ordinals swapped: slot 0 is now
+    // French, so the ordinal the click was made at names another language.
+    const replannedPlan = fixturePlanV3({
+      plan_id: "plan:fallback-subtitle-swap-01",
+      plan_attempt_key: "v3:fallback-subtitle-swap-01",
+      subtitle: {
+        mode: "off",
+        inventory: [
+          { ...french, track_id: "file:7:subtitle:0", combined_index: 0 },
+          { ...english, track_id: "file:7:subtitle:1", combined_index: 1 },
+        ],
+      },
+    });
+    const replanBodies: Array<Record<string, unknown>> = [];
+    let resolveFirstReplan: ((response: Response) => void) | undefined;
+    const firstReplanResponse = new Promise<Response>((resolve) => {
+      resolveFirstReplan = resolve;
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: initialPlan,
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/session-1/replan")) {
+        replanBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        if (replanBodies.length === 1) return firstReplanResponse;
+        return jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "playable",
+          session_id: "session-1",
+          playback_plan: replannedPlan,
+        });
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+    expect(result.current.subtitleUrls).toEqual([]);
+
+    act(() => {
+      void result.current.refreshSubtitles(120);
+    });
+    await waitFor(() => expect(replanBodies).toHaveLength(1));
+
+    // The viewer clicks the English row the menu is showing. It has no session
+    // track to look up, so the click has to carry the displayed row itself.
+    const displayedEnglish: PlayerSubtitleInfo = {
+      index: 0,
+      media_file_id: 7,
+      language: "eng",
+      codec: "srt",
+      label: "English",
+      source: "external",
+      url: "",
+    };
+    act(() => result.current.changeSubtitleTrack(0, 130, displayedEnglish));
+    expect(replanBodies).toHaveLength(1);
+
+    await act(async () => {
+      resolveFirstReplan?.(
+        jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "playable",
+          session_id: "session-1",
+          playback_plan: replannedPlan,
+        }),
+      );
+      await firstReplanResponse;
+    });
+
+    await waitFor(() =>
+      expect(result.current.plan?.plan_id).toBe("plan:fallback-subtitle-swap-01"),
+    );
+    await waitFor(() => expect(replanBodies).toHaveLength(2));
+    expect(replanBodies[1]).toMatchObject({
+      operation: "track_change",
+      selected_tracks: { subtitle: { id: "file:7:subtitle:1", index: 1 } },
+    });
+
+    unmount();
+  });
+
+  it("surfaces a queued pick the refreshed plan still cannot reconcile after a rotation", async () => {
     const initialPlan = fixturePlanV3({
       audio_tracks: [
         { codec: "eac3", channels: 6, layout: "5.1", language: "eng", default: true },
@@ -3943,9 +4326,10 @@ describe("usePlaybackSession replans", () => {
     expect(result.current.mediaFileId).toBe(7);
 
     // The in-flight replan is refused without replacing the plan, so on settle
-    // the held rotation folds (the plan was not replaced) while the queued
-    // ordinal, built against the outgoing file, is dropped rather than
-    // replayed against the rotated source.
+    // the held rotation folds (the plan was not replaced). The pick's ordinal
+    // belongs to the outgoing file, so it asks for one plan refresh against the
+    // rotated source; when that is refused too, it surfaces instead of
+    // disappearing with a marker that still points at the old row.
     await act(async () => {
       releaseReplan?.(
         jsonResponse({
@@ -3963,7 +4347,11 @@ describe("usePlaybackSession replans", () => {
     });
 
     await waitFor(() => expect(result.current.mediaFileId).toBe(8));
-    expect(replanBodies).toHaveLength(1);
+    await waitFor(() => expect(replanBodies).toHaveLength(2));
+    expect(replanBodies[1]).toMatchObject({
+      operation: "track_change",
+      selected_tracks: { audio: { id: "", index: 1 } },
+    });
     expect(result.current.plan?.plan_id).toBe("plan:0123456789abcdef");
 
     unmount();
@@ -4095,6 +4483,594 @@ describe("usePlaybackSession replans", () => {
     // The replan only changed the subtitle artifact; the A/V transport bytes
     // are identical, so the player must keep the mounted element.
     expect(result.current.transportRevision).toBe(1);
+
+    unmount();
+  });
+});
+
+describe("usePlaybackSession held track picks", () => {
+  const audioRows = [
+    { codec: "aac", channels: 2, layout: "stereo", language: "eng", default: true },
+    { codec: "ac3", channels: 6, layout: "5.1", language: "spa", default: false },
+  ];
+  const identifiedAudioRows = [
+    { ...audioRows[0]!, track_id: "file:7:audio:0", selection_index: 0 },
+    { ...audioRows[1]!, track_id: "file:7:audio:1", selection_index: 1 },
+  ];
+
+  function playablePlan(plan: ReturnType<typeof fixturePlanV3>, sessionId = "session-1") {
+    return jsonResponse(
+      {
+        protocol_version: 3,
+        server_features: ["playback_plan_v3"],
+        outcome: "playable",
+        session_id: sessionId,
+        playback_plan: plan,
+      },
+      { status: 201 },
+    );
+  }
+
+  function refusedReplan() {
+    return jsonResponse({
+      protocol_version: 3,
+      server_features: ["playback_plan_v3"],
+      outcome: "adaptation_unavailable",
+      session_id: "session-1",
+      terminal: {
+        reason: "video_conversion_unsupported",
+        message: "No executor can transcode this source.",
+        retryable: false,
+      },
+    });
+  }
+
+  it("drops a pick held for the previous request when the viewer opens another title", async () => {
+    const firstPlan = fixturePlanV3({
+      audio_tracks: identifiedAudioRows,
+      selected_tracks: { audio: { id: "file:7:audio:0", index: 0 } },
+    });
+    const secondPlan = fixturePlanV3({
+      plan_id: "plan:secondrequest00001",
+      plan_attempt_key: "v3:secondrequest00001",
+      session_id: "session-2",
+      audio_tracks: identifiedAudioRows,
+      selected_tracks: { audio: { id: "file:8:audio:0", index: 0 } },
+    });
+    let releaseRefresh: ((response: Response) => void) | undefined;
+    const heldRefresh = new Promise<Response>((resolve) => {
+      releaseRefresh = resolve;
+    });
+    const replanUrls: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/playback/start")) {
+          const body = JSON.parse(String(init?.body)) as { file_id: number };
+          return body.file_id === 8
+            ? playablePlan(secondPlan, "session-2")
+            : playablePlan(firstPlan);
+        }
+        if (url.endsWith("/replan")) {
+          replanUrls.push(url);
+          return heldRefresh;
+        }
+        if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+        if (init?.method === "DELETE") return new Response(null, { status: 204 });
+        throw new Error(`Unexpected request: ${url}`);
+      }),
+    );
+
+    const { result, rerender, unmount } = renderHook(
+      ({ requestKey, fileId }: { requestKey: string; fileId: number }) =>
+        usePlaybackSession(requestKey, [], [], fileId, 0, false, "auto"),
+      { wrapper, initialProps: { requestKey: "request-1", fileId: 7 } },
+    );
+    await waitFor(() => expect(result.current.plan?.session_id).toBe("session-1"));
+
+    // A replan owns the lane, so the audio pick is held rather than sent.
+    act(() => void result.current.refreshSubtitles(100));
+    await waitFor(() => expect(replanUrls).toHaveLength(1));
+    act(() => result.current.switchAudioTrack(1, 110));
+
+    // The viewer opens another title before the held replan settles.
+    rerender({ requestKey: "request-2", fileId: 8 });
+    await waitFor(() => expect(result.current.plan?.session_id).toBe("session-2"));
+
+    await act(async () => {
+      releaseRefresh?.(refusedReplan());
+      await heldRefresh;
+    });
+
+    // The pick belonged to request-1's session; replaying it against the new
+    // session would switch a track the viewer never picked for this title.
+    expect(replanUrls.some((url) => url.includes("session-2"))).toBe(false);
+    expect(result.current.trackSelectionNotice).toBeNull();
+    expect(result.current.audioTrackIndex).toBe(0);
+
+    unmount();
+  });
+
+  it("refreshes a provisional plan once before applying a same-source pick", async () => {
+    const declaredPlan = fixturePlanV3({
+      inventory_status: "declared",
+      inventory_provenance: "declared",
+      audio_tracks: identifiedAudioRows,
+      selected_tracks: { audio: { id: "file:7:audio:0", index: 0 } },
+    });
+    const probedFrench = {
+      codec: "aac",
+      channels: 2,
+      layout: "stereo",
+      language: "fra",
+      default: false,
+    };
+    const frenchRow = {
+      ...probedFrench,
+      track_id: "file:7:audio:2",
+      selection_index: 2,
+    };
+    const verifiedPlan = fixturePlanV3({
+      plan_id: "plan:probe000000000001",
+      plan_attempt_key: "v3:probe000000000001",
+      inventory_status: "verified",
+      inventory_provenance: "verified",
+      audio_tracks: [...identifiedAudioRows, frenchRow],
+      selected_tracks: { audio: { id: "file:7:audio:0", index: 0 } },
+    });
+    const appliedPlan = fixturePlanV3({
+      plan_id: "plan:probe000000000002",
+      plan_attempt_key: "v3:probe000000000002",
+      inventory_status: "verified",
+      inventory_provenance: "verified",
+      audio_tracks: [...identifiedAudioRows, frenchRow],
+      selected_tracks: { audio: { id: "file:7:audio:2", index: 2 } },
+    });
+    const replanBodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/playback/start")) return playablePlan(declaredPlan);
+        if (url.endsWith("/playback/session-1/replan")) {
+          replanBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+          return jsonResponse({
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: replanBodies.length === 1 ? verifiedPlan : appliedPlan,
+          });
+        }
+        if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+        if (init?.method === "DELETE") return new Response(null, { status: 204 });
+        throw new Error(`Unexpected request: ${url}`);
+      }),
+    );
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe(declaredPlan.plan_id));
+    // The probe has published catalog rows the declared plan does not name.
+    act(() => result.current.applyAudioInventory([audioRows[0]!, audioRows[1]!, probedFrench], 7));
+    expect(result.current.planAudioTracks).toHaveLength(3);
+
+    act(() => result.current.switchAudioTrack(2, 100));
+
+    await waitFor(() => expect(replanBodies).toHaveLength(2));
+    // The first replan is the bounded refresh: it carries the current
+    // selection, not the clicked row the declared plan cannot name.
+    expect(replanBodies[0]).toMatchObject({
+      operation: "track_change",
+      selected_tracks: { audio: { id: "file:7:audio:0", index: 0 } },
+    });
+    // The verified inventory landed, so the second replan applies the pick.
+    expect(replanBodies[1]).toMatchObject({
+      operation: "track_change",
+      selected_tracks: { audio: { id: "file:7:audio:2", index: 2 } },
+    });
+    expect(result.current.trackSelectionNotice).toBeNull();
+    expect(result.current.audioTrackIndex).toBe(2);
+
+    unmount();
+  });
+
+  it("clears the track notice when the request changes", async () => {
+    const firstPlan = fixturePlanV3({
+      audio_tracks: identifiedAudioRows,
+      selected_tracks: { audio: { id: "file:7:audio:0", index: 0 } },
+    });
+    const secondPlan = fixturePlanV3({
+      plan_id: "plan:secondnotice000001",
+      plan_attempt_key: "v3:secondnotice000001",
+      session_id: "session-2",
+      audio_tracks: identifiedAudioRows,
+      selected_tracks: { audio: { id: "file:8:audio:0", index: 0 } },
+    });
+    let releaseStart: ((response: Response) => void) | undefined;
+    const heldStart = new Promise<Response>((resolve) => {
+      releaseStart = resolve;
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/playback/start")) {
+          const body = JSON.parse(String(init?.body)) as { file_id: number };
+          return body.file_id === 8 ? heldStart : playablePlan(firstPlan);
+        }
+        if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+        if (init?.method === "DELETE") return new Response(null, { status: 204 });
+        throw new Error(`Unexpected request: ${url}`);
+      }),
+    );
+
+    const { result, rerender, unmount } = renderHook(
+      ({ requestKey, fileId }: { requestKey: string; fileId: number }) =>
+        usePlaybackSession(requestKey, [], [], fileId, 0, false, "auto"),
+      { wrapper, initialProps: { requestKey: "request-1", fileId: 7 } },
+    );
+    await waitFor(() => expect(result.current.plan?.session_id).toBe("session-1"));
+
+    act(() => result.current.switchAudioTrack(5, 30));
+    expect(result.current.trackSelectionNotice?.message).toContain("audio track");
+
+    // The notice belongs to the outgoing request; it must clear immediately
+    // rather than waiting for the replacement plan to adopt.
+    rerender({ requestKey: "request-2", fileId: 8 });
+    await waitFor(() => expect(result.current.trackSelectionNotice).toBeNull());
+
+    await act(async () => {
+      releaseStart?.(playablePlan(secondPlan, "session-2"));
+      await heldStart;
+    });
+    await waitFor(() => expect(result.current.plan?.session_id).toBe("session-2"));
+    expect(result.current.trackSelectionNotice).toBeNull();
+
+    unmount();
+  });
+
+  it("clears the track notice when a later track change is adopted", async () => {
+    const firstPlan = fixturePlanV3({
+      audio_tracks: identifiedAudioRows,
+      selected_tracks: { audio: { id: "file:7:audio:0", index: 0 } },
+    });
+    const adoptedPlan = fixturePlanV3({
+      plan_id: "plan:adoptednotice00001",
+      plan_attempt_key: "v3:adoptednotice00001",
+      audio_tracks: identifiedAudioRows,
+      selected_tracks: { audio: { id: "file:7:audio:1", index: 1 } },
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/playback/start")) return playablePlan(firstPlan);
+        if (url.endsWith("/playback/session-1/replan")) {
+          return jsonResponse({
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: adoptedPlan,
+          });
+        }
+        if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+        if (init?.method === "DELETE") return new Response(null, { status: 204 });
+        throw new Error(`Unexpected request: ${url}`);
+      }),
+    );
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan?.session_id).toBe("session-1"));
+
+    act(() => result.current.switchAudioTrack(5, 30));
+    expect(result.current.trackSelectionNotice).not.toBeNull();
+
+    act(() => result.current.switchAudioTrack(1, 40));
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe(adoptedPlan.plan_id));
+    expect(result.current.trackSelectionNotice).toBeNull();
+
+    unmount();
+
+    // A remount starts from a clean session and does not replay the notice.
+    const remounted = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(remounted.result.current.plan?.session_id).toBe("session-1"));
+    expect(remounted.result.current.trackSelectionNotice).toBeNull();
+    remounted.unmount();
+  });
+
+  it("surfaces a queued pick after the one refresh instead of refreshing on a second source move", async () => {
+    const probedFrench = {
+      codec: "aac",
+      channels: 2,
+      layout: "stereo",
+      language: "fra",
+      default: false,
+    };
+    const initialPlan = fixturePlanV3({
+      inventory_status: "verified",
+      inventory_provenance: "verified",
+      audio_tracks: identifiedAudioRows,
+      selected_tracks: { audio: { id: "file:7:audio:0", index: 0 } },
+    });
+    const replanBodies: Array<Record<string, unknown>> = [];
+    const deferreds: Array<{ promise: Promise<Response>; resolve: (response: Response) => void }> =
+      [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/playback/start")) return playablePlan(initialPlan);
+        if (url.endsWith("/playback/session-1/replan")) {
+          replanBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+          let resolve!: (response: Response) => void;
+          const promise = new Promise<Response>((done) => {
+            resolve = done;
+          });
+          deferreds.push({ promise, resolve });
+          return promise;
+        }
+        if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+        if (init?.method === "DELETE") return new Response(null, { status: 204 });
+        throw new Error(`Unexpected request: ${url}`);
+      }),
+    );
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan?.session_id).toBe("session-1"));
+    // The probed menu carries a row the verified plan does not name, so the
+    // click is held rather than resolvable.
+    act(() => result.current.applyAudioInventory([audioRows[0]!, audioRows[1]!, probedFrench], 7));
+
+    act(() => void result.current.refreshSubtitles(100));
+    await waitFor(() => expect(replanBodies).toHaveLength(1));
+
+    act(() => result.current.switchAudioTrack(2, 130));
+    act(() =>
+      result.current.applyCommittedSource(
+        { effectiveMediaFileId: 8, effectiveVirtualUri: null, inventoryStatus: "declared" },
+        [],
+      ),
+    );
+
+    // The refusal does not replace the plan, so the rotation folds and the
+    // held pick asks for its one refresh.
+    await act(async () => {
+      deferreds[0]?.resolve(refusedReplan());
+      await deferreds[0]?.promise;
+    });
+    await waitFor(() => expect(replanBodies).toHaveLength(2));
+    await waitFor(() => expect(result.current.mediaFileId).toBe(8));
+
+    // A second rotation arrives while that refresh is in flight.
+    act(() =>
+      result.current.applyCommittedSource(
+        { effectiveMediaFileId: 9, effectiveVirtualUri: null, inventoryStatus: "declared" },
+        [],
+      ),
+    );
+    await act(async () => {
+      deferreds[1]?.resolve(refusedReplan());
+      await deferreds[1]?.promise;
+    });
+
+    await waitFor(() => expect(result.current.mediaFileId).toBe(9));
+    // The refresh budget is spent: the pick surfaces instead of replanning
+    // against another stale ordinal.
+    await waitFor(() =>
+      expect(result.current.trackSelectionNotice?.message).toContain("audio track"),
+    );
+    expect(replanBodies).toHaveLength(2);
+
+    unmount();
+  });
+
+  it("drops a queued subtitle pick whose inventory has no unambiguous counterpart", async () => {
+    const englishFallback: PlayerSubtitleInfo = {
+      index: 0,
+      media_file_id: 7,
+      track_id: "file:7:subtitle:0",
+      language: "eng",
+      codec: "srt",
+      label: "English",
+      source: "external",
+      url: "",
+    };
+    const twin = (combinedIndex: number) =>
+      fixtureSubtitleInventoryItemV3({
+        track_id: `file:7:subtitle:${combinedIndex}`,
+        combined_index: combinedIndex,
+        source: "external",
+        codec: "srt",
+        language: "eng",
+        label: "English",
+        url: `/stream/session-1/subtitles/${combinedIndex}.vtt?file_id=7`,
+      });
+    const initialPlan = fixturePlanV3({ subtitle: { mode: "off", inventory: [] } });
+    const twinPlan = fixturePlanV3({
+      plan_id: "plan:subtwins0000000001",
+      plan_attempt_key: "v3:subtwins0000000001",
+      subtitle: { mode: "off", inventory: [twin(0), twin(1)] },
+    });
+    const replanBodies: Array<Record<string, unknown>> = [];
+    let releaseReplan: ((response: Response) => void) | undefined;
+    const heldReplan = new Promise<Response>((resolve) => {
+      releaseReplan = resolve;
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/playback/start")) return playablePlan(initialPlan);
+        if (url.endsWith("/playback/session-1/replan")) {
+          replanBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+          if (replanBodies.length === 1) return heldReplan;
+          return jsonResponse({
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: twinPlan,
+          });
+        }
+        if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+        if (init?.method === "DELETE") return new Response(null, { status: 204 });
+        throw new Error(`Unexpected request: ${url}`);
+      }),
+    );
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan?.session_id).toBe("session-1"));
+
+    act(() => void result.current.refreshSubtitles(100));
+    await waitFor(() => expect(replanBodies).toHaveLength(1));
+    // The click is made against the deferred inventory while the replacement
+    // plan is still in flight, so it travels with the clicked fallback row.
+    act(() => result.current.changeSubtitleTrack(0, 130, englishFallback));
+
+    await act(async () => {
+      releaseReplan?.(
+        jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "playable",
+          session_id: "session-1",
+          playback_plan: twinPlan,
+        }),
+      );
+      await heldReplan;
+    });
+
+    // The replacement inventory names two distinct tracks with the same
+    // descriptor, so the captured row cannot be reconciled without guessing.
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe(twinPlan.plan_id));
+    await waitFor(() =>
+      expect(result.current.trackSelectionNotice?.message).toContain("subtitle track"),
+    );
+    expect(replanBodies).toHaveLength(1);
+
+    unmount();
+  });
+
+  it("replays a held pick without a captured row at its exact ordinal", async () => {
+    const initialPlan = fixturePlanV3({
+      audio_tracks: [audioRows[0]!],
+      selected_tracks: { audio: { id: "", index: 0 } },
+    });
+    const replacementPlan = fixturePlanV3({
+      plan_id: "plan:idlessordinal00001",
+      plan_attempt_key: "v3:idlessordinal00001",
+      audio_tracks: audioRows,
+      selected_tracks: { audio: { id: "", index: 0 } },
+    });
+    const replanBodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/playback/start")) return playablePlan(initialPlan);
+        if (url.endsWith("/playback/session-1/replan")) {
+          replanBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+          return jsonResponse({
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: replacementPlan,
+          });
+        }
+        if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+        if (init?.method === "DELETE") return new Response(null, { status: 204 });
+        throw new Error(`Unexpected request: ${url}`);
+      }),
+    );
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan?.session_id).toBe("session-1"));
+
+    act(() => void result.current.refreshSubtitles(100));
+    await waitFor(() => expect(replanBodies).toHaveLength(1));
+    // The menu has one row, so the click at index 1 carries no captured row.
+    act(() => result.current.switchAudioTrack(1, 130));
+
+    await waitFor(() => expect(replanBodies).toHaveLength(2));
+    // An id-less plan has only the ordinal channel; the held click's exact
+    // slot is the fallback instead of a drop.
+    expect(replanBodies[1]).toMatchObject({
+      operation: "track_change",
+      selected_tracks: { audio: { id: "", index: 1 } },
+    });
+    expect(result.current.trackSelectionNotice).toBeNull();
+
+    unmount();
+  });
+
+  it("sends an empty-plan audio pick without spending the refresh budget", async () => {
+    const initialPlan = fixturePlanV3({
+      audio_tracks: [],
+      inventory_status: "declared",
+      inventory_provenance: "declared",
+      tracks_pending: true,
+      selected_tracks: { audio: { id: "", index: 0 } },
+    });
+    const replanBodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/playback/start")) return playablePlan(initialPlan);
+        if (url.endsWith("/playback/session-1/replan")) {
+          replanBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+          return jsonResponse({
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3({ audio_tracks: audioRows }),
+          });
+        }
+        if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+        if (init?.method === "DELETE") return new Response(null, { status: 204 });
+        throw new Error(`Unexpected request: ${url}`);
+      }),
+    );
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan?.session_id).toBe("session-1"));
+    act(() => result.current.applyAudioInventory(audioRows, 7));
+
+    act(() => result.current.switchAudioTrack(1, 90));
+
+    await waitFor(() => expect(replanBodies).toHaveLength(1));
+    // The plan publishes no inventory, so the ordinal is the only channel the
+    // server has; the pick goes straight out rather than refreshing first.
+    expect(replanBodies[0]).toMatchObject({
+      operation: "track_change",
+      selected_tracks: { audio: { id: "", index: 1 } },
+    });
+    expect(result.current.trackSelectionNotice).toBeNull();
 
     unmount();
   });
@@ -5902,6 +6878,100 @@ describe("usePlaybackSession plan audio inventory", () => {
     unmount();
   });
 
+  it("keeps the audio marker on its matched row when an adopted replan reorders its inventory", async () => {
+    const englishTrack = {
+      codec: "eac3",
+      channels: 6,
+      layout: "5.1",
+      language: "eng",
+      default: true,
+      track_id: "file:7:audio:0",
+      selection_index: 0,
+    };
+    const spanishTrack = {
+      codec: "ac3",
+      channels: 2,
+      layout: "stereo",
+      language: "spa",
+      default: false,
+      track_id: "file:7:audio:1",
+      selection_index: 1,
+    };
+    const verifiedAudioTracks = [englishTrack, spanishTrack];
+    // The replan was built before the probe persisted, so it carries the older
+    // declared order and marks itself provisional. The server mints ids from
+    // the file id and published ordinal, so the reordered list re-mints them:
+    // Spanish now occupies slot 0 and English slot 1. Keeping each track's old
+    // id, as this test used to, does not reproduce what the server sends.
+    const reorderedPlanTracks = [
+      { ...spanishTrack, track_id: "file:7:audio:0", selection_index: 0 },
+      { ...englishTrack, track_id: "file:7:audio:1", selection_index: 1 },
+    ];
+    const replanBodies: Array<Record<string, unknown>> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3({
+              inventory_status: "verified",
+              inventory_provenance: "verified",
+              audio_tracks: verifiedAudioTracks,
+              selected_tracks: { audio: { id: "file:7:audio:1", index: 1 } },
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/session-1/replan")) {
+        replanBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        return jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "playable",
+          session_id: "session-1",
+          playback_plan: fixturePlanV3({
+            plan_id: "plan:reordered000000001",
+            plan_attempt_key: "v3:reordered000000001",
+            inventory_status: "declared",
+            inventory_provenance: "declared",
+            tracks_pending: true,
+            audio_tracks: reorderedPlanTracks,
+            selected_tracks: { audio: { id: "file:7:audio:1", index: 1 } },
+          }),
+        });
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+    expect(result.current.planAudioTracks).toEqual(verifiedAudioTracks);
+    expect(result.current.audioTrackIndex).toBe(1);
+
+    // Pick the English row at displayed index 0. The replan answers with the
+    // same track at its own (reordered) ordinal 1.
+    act(() => result.current.switchAudioTrack(0, 120));
+    await waitFor(() => expect(replanBodies).toHaveLength(1));
+
+    // The verified list survives the provisional replan, and the marker must
+    // follow the row naming the committed track (English at displayed 0) rather
+    // than the plan ordinal 1, which now names the Spanish row.
+    expect(result.current.planAudioTracks).toEqual(verifiedAudioTracks);
+    expect(result.current.audioTrackIndex).toBe(0);
+    unmount();
+  });
+
   it("carries the plan's audio identity for a pick from a repaired inventory", async () => {
     const planAudioTracks = [
       {
@@ -5975,15 +7045,17 @@ describe("usePlaybackSession plan audio inventory", () => {
 
     act(() => result.current.applyAudioInventory(repaired, 7));
     expect(result.current.planAudioTracks).toEqual(repaired);
+    // The committed selection (spa) followed the applied row that carries it.
+    expect(result.current.audioTrackIndex).toBe(0);
 
     // The menu's English row is at displayed index 1, but the plan holds it at
-    // ordinal 0. The identity names the picked language; the client ordinal
-    // rides along as the fallback.
+    // ordinal 0. The identity names the picked language and the plan ordinal it
+    // encodes, so the pair is internally consistent for the server.
     act(() => result.current.switchAudioTrack(1, 130));
     await waitFor(() => expect(replanBodies).toHaveLength(1));
     expect(replanBodies[0]).toMatchObject({
       operation: "track_change",
-      selected_tracks: { audio: { id: "file:7:audio:0", index: 1 } },
+      selected_tracks: { audio: { id: "file:7:audio:0", index: 0 } },
     });
 
     // Picking the already-playing track resolves to the same identity and is a
@@ -6922,7 +7994,31 @@ describe("usePlaybackSession plan audio inventory", () => {
   });
 
   it("preserves verified inventory across a stale pending replan and re-clears pending on redelivery", async () => {
+    // The probe verified these rows against the playing source: English at the
+    // first slot, French at the second.
+    const verifiedSubtitles = [
+      fixtureSubtitleInventoryItemV3({
+        track_id: "file:7:subtitle:0",
+        combined_index: 0,
+        language: "eng",
+        label: "English",
+      }),
+      fixtureSubtitleInventoryItemV3({
+        track_id: "file:7:subtitle:1",
+        combined_index: 1,
+        language: "fra",
+        label: "French",
+      }),
+    ];
+    // The replan was built before the probe persisted, so it still publishes
+    // the declared order and re-mints the ordinal-derived ids: French now
+    // occupies slot 0 and English slot 1.
+    const reorderedPlanSubtitles = [
+      { ...verifiedSubtitles[1]!, track_id: "file:7:subtitle:0", combined_index: 0 },
+      { ...verifiedSubtitles[0]!, track_id: "file:7:subtitle:1", combined_index: 1 },
+    ];
     let replanCalled = false;
+    const replanBodies: Array<Record<string, unknown>> = [];
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       if (url.endsWith("/playback/start")) {
@@ -6949,6 +8045,7 @@ describe("usePlaybackSession plan audio inventory", () => {
       }
       if (url.endsWith("/replan")) {
         replanCalled = true;
+        replanBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
         // Server replan returns a plan that still echoes the older provisional/pending inventory
         return jsonResponse({
           protocol_version: 3,
@@ -6966,6 +8063,12 @@ describe("usePlaybackSession plan audio inventory", () => {
             audio_tracks: [
               { codec: "aac", channels: 2, layout: "stereo", language: "eng", default: true },
             ],
+            subtitle: { mode: "render", inventory: reorderedPlanSubtitles },
+            selected_tracks: {
+              audio: { id: "file:7:audio:0", index: 0 },
+              // English, at the ordinal the reordered plan assigned it.
+              subtitle: { id: "file:7:subtitle:1", index: 1 },
+            },
           }),
         });
       }
@@ -6977,12 +8080,7 @@ describe("usePlaybackSession plan audio inventory", () => {
           effective_media_file_id: 7,
           effective_virtual_uri: "virtual://movie/test?result=c1",
           audio_tracks: verifiedAudio,
-          subtitle_inventory: [
-            fixtureSubtitleInventoryItemV3({
-              track_id: "file:7:subtitle:0",
-              language: "deu",
-            }),
-          ],
+          subtitle_inventory: verifiedSubtitles,
         });
       }
       if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
@@ -7010,12 +8108,7 @@ describe("usePlaybackSession plan audio inventory", () => {
         effective_media_file_id: 7,
         effective_virtual_uri: "virtual://movie/test?result=c1",
         audio_tracks: verifiedAudio,
-        subtitle_inventory: [
-          fixtureSubtitleInventoryItemV3({
-            track_id: "file:7:subtitle:0",
-            language: "deu",
-          }),
-        ],
+        subtitle_inventory: verifiedSubtitles,
       });
     });
 
@@ -7033,6 +8126,26 @@ describe("usePlaybackSession plan audio inventory", () => {
     expect(result.current.inventoryPending).toBe(false);
     expect(result.current.audioInventoryProvisional).toBe(false);
     expect(result.current.planAudioTracks).toHaveLength(2);
+    // The menu keeps the verified rows in their verified order, even though the
+    // adopted provisional plan publishes another one.
+    expect(result.current.subtitleUrls.map((track) => track.language)).toEqual(["eng", "fra"]);
+
+    // A manual pick from the preserved rows must name the clicked asset, not
+    // whichever track inherited its ordinal in the adopted plan. Displayed
+    // French still carries `file:7:subtitle:1`, but the plan's French row is
+    // `file:7:subtitle:0`; trusting the equal-looking id would switch language.
+    act(() => result.current.changeSubtitleTrack(1, 130));
+    await waitFor(() => expect(replanBodies).toHaveLength(2));
+    const planFrench = result.current.plan?.subtitle.inventory.find(
+      (item) => item.language === "fra",
+    );
+    expect(planFrench).toMatchObject({ track_id: "file:7:subtitle:0", combined_index: 0 });
+    expect(replanBodies[1]).toMatchObject({
+      operation: "track_change",
+      selected_tracks: {
+        subtitle: { id: planFrench?.track_id, index: planFrench?.combined_index },
+      },
+    });
 
     // Step 3: redelivery of inv:verified-1 terminal update reconciles successfully
     let accepted = false;
@@ -7044,12 +8157,7 @@ describe("usePlaybackSession plan audio inventory", () => {
         effective_media_file_id: 7,
         effective_virtual_uri: "virtual://movie/test?result=c1",
         audio_tracks: verifiedAudio,
-        subtitle_inventory: [
-          fixtureSubtitleInventoryItemV3({
-            track_id: "file:7:subtitle:0",
-            language: "deu",
-          }),
-        ],
+        subtitle_inventory: verifiedSubtitles,
       });
     });
 
@@ -11978,6 +13086,7 @@ describe("usePlaybackSession track change guards", () => {
     act(() => result.current.switchAudioTrack(5, 30));
     expect(replanBodies).toHaveLength(0);
     expect(result.current.replanning).toBe(false);
+    expect(result.current.trackSelectionNotice?.message).toContain("audio track");
 
     // A published ordinal still changes the track.
     act(() => result.current.switchAudioTrack(1, 31));
@@ -12009,6 +13118,7 @@ describe("usePlaybackSession track change guards", () => {
     act(() => result.current.changeSubtitleTrack(4, 30));
     expect(replanBodies).toHaveLength(0);
     expect(result.current.replanning).toBe(false);
+    expect(result.current.trackSelectionNotice?.message).toContain("subtitle track");
 
     // The published ordinal is sent with its identity, not a bare index.
     act(() => result.current.changeSubtitleTrack(0, 31));
@@ -12200,7 +13310,7 @@ describe("usePlaybackSession track change guards", () => {
 
     // The viewer clicked the displayed Japanese slot (0). The revision no
     // longer carries Japanese, and slot 0 now names English: sending the stale
-    // ordinal would silently switch language, so the pick is dropped.
+    // ordinal would silently switch language, so the pick is surfaced.
     act(() => {
       result.current.applyInventoryUpdate({
         session_id: "session-1",
@@ -12218,6 +13328,183 @@ describe("usePlaybackSession track change guards", () => {
 
     expect(replanBodies).toHaveLength(0);
     expect(result.current.replanning).toBe(false);
+    expect(result.current.trackSelectionNotice?.message).toContain("subtitle track");
+
+    unmount();
+  });
+});
+
+describe("usePlaybackSession terminal refusals", () => {
+  it("retires a broken plan and surfaces a retryable error card on adaptation_unavailable", async () => {
+    let starts = 0;
+    let replans = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        starts += 1;
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3(),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/session-1/replan")) {
+        replans += 1;
+        return jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "adaptation_unavailable",
+          terminal: {
+            reason: "adaptation_unavailable",
+            message: "No validated playback route is available for this source and output route.",
+            retryable: false,
+          },
+        });
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    act(() => {
+      result.current.recoverFromFailure({ classification: "decoder_error" }, 30);
+    });
+
+    // The broken transport stays broken: a refusal that names no playable
+    // adaptation leaves nothing to render, so the player must stop showing a
+    // spinner over a plan the server cannot serve.
+    await waitFor(() => expect(result.current.errorTitle).toBe("No playable version found"));
+    expect(result.current.plan).toBeNull();
+    expect(result.current.loading).toBe(false);
+    expect(result.current.errorReason).toBe("adaptation_unavailable");
+    expect(replans).toBe(1);
+
+    // Retry is a fresh start, not a replan against the broken route.
+    act(() => result.current.retryStart());
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+    expect(starts).toBe(2);
+
+    unmount();
+  });
+
+  it("keeps the playing plan when a quality change is refused with adaptation_unavailable", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3(),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/session-1/replan")) {
+        return jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "adaptation_unavailable",
+          terminal: {
+            reason: "adaptation_unavailable",
+            message: "No validated playback route is available for this source and output route.",
+            retryable: false,
+          },
+        });
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    act(() => result.current.changeQuality("720p", 30));
+    await waitFor(() => expect(result.current.errorReason).toBe("adaptation_unavailable"));
+
+    // A refused quality change is not a failed transport: the old stream is
+    // still the viewer's, so only the refusal surfaces (the menu owns the copy).
+    expect(result.current.plan).not.toBeNull();
+    expect(result.current.errorTitle).toBe("No playable version found");
+
+    unmount();
+  });
+
+  it("enters the session-gone state and restarts with a fresh start", async () => {
+    const startBodies: Array<Record<string, unknown>> = [];
+    const replanBodies: Array<Record<string, unknown>> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        startBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        const sessionId = `session-${startBodies.length}`;
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: sessionId,
+            playback_plan: fixturePlanV3({ session_id: sessionId }),
+          },
+          { status: 201 },
+        );
+      }
+      const replanMatch = /\/playback\/([^/]+)\/replan$/.exec(url);
+      if (replanMatch) {
+        replanBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        return jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "playable",
+          session_id: replanMatch[1]!,
+          playback_plan: fixturePlanV3({ session_id: replanMatch[1]! }),
+        });
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan?.session_id).toBe("session-1"));
+    act(() => result.current.updatePlaybackState(120, true));
+
+    // A control-ticket mint (or a stream/subtitle fetch) proved the session is
+    // gone. No replan may be issued against the dead id.
+    act(() => result.current.markSessionGone());
+    expect(result.current.connectionStatus).toBe("gone");
+    expect(result.current.connectionErrorTitle).toBe("Playback session expired");
+
+    act(() => result.current.restartPlayback());
+    await waitFor(() => expect(result.current.plan?.session_id).toBe("session-2"));
+    expect(result.current.connectionStatus).toBe("connected");
+    expect(replanBodies).toHaveLength(0);
+    expect(startBodies).toHaveLength(2);
+    // The restart resumes where the viewer was, not at the request's origin.
+    expect(startBodies[1]).toMatchObject({ start_position: 120 });
 
     unmount();
   });

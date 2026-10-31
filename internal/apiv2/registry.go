@@ -237,6 +237,15 @@ type Registry struct {
 	// evidence. The map is bounded and entries are only a short-lived hint.
 	preplayDiscoveryMu   sync.Mutex
 	preplayDiscoverySeen map[string]time.Time
+
+	// virtualWarmSeen coalesces repeated detail reads that would schedule the
+	// same version's probe/warm chain. The playback handler already refuses a
+	// duplicate live chain; this memo also keeps a burst of reads (the client
+	// opens the page, the player polls inventory) from re-entering admission
+	// after a chain finishes. Entries are a short-lived hint, bounded like the
+	// discovery memo.
+	virtualWarmMu   sync.Mutex
+	virtualWarmSeen map[string]time.Time
 }
 
 // Declared is what the registry recorded for one operation; the runtime

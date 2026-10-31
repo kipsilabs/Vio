@@ -563,7 +563,148 @@ func (h *PlaybackHandler) logInventoryDelivery(summary inventoryPublishSummary, 
 	if originFileID > 0 && originFileID != summary.FileID {
 		attrs = append(attrs, "rotated_from_file_id", originFileID)
 	}
+	// Close the per-session subtitle-inventory wait this delivery ended. The
+	// start line already named the blocker; repeating it here with the elapsed
+	// time makes first-need-to-first-menu measurable without a per-poll or
+	// per-replan line.
+	if len(summary.Waits) > 0 {
+		oldest := summary.Waits[0]
+		for _, wait := range summary.Waits[1:] {
+			if wait.StartedAt.Before(oldest.StartedAt) {
+				oldest = wait
+			}
+		}
+		attrs = append(attrs,
+			"waits_resolved", len(summary.Waits),
+			"wait_started_at", oldest.StartedAt.UTC().Format(time.RFC3339Nano),
+			"wait_ms", time.Since(oldest.StartedAt).Milliseconds(),
+			"wait_blocker", oldest.Blocker,
+		)
+		if len(summary.Waits) == 1 {
+			attrs = append(attrs, "wait_session_id", oldest.SessionID)
+		}
+	}
 	slog.Info("virtual probe evidence inventory delivered", attrs...)
+}
+
+// Subtitle-inventory wait blockers name the first gate that kept a session's
+// subtitle menu provisional. They are diagnostics only: the client contract is
+// unchanged, and the client's own timeout bounds the wait.
+const (
+	// subtitleWaitBlockerRelay: the enumeration is deferred until the transport
+	// has committed, because the probe reads the served bytes through the relay.
+	// The wait is on the relay/transport, not on the provider.
+	subtitleWaitBlockerRelay = "relay"
+	// subtitleWaitBlockerUnprobed: a probe lifecycle is armed and enumerating,
+	// but the effective row still has no probe stamp to serve.
+	subtitleWaitBlockerUnprobed = "unprobed"
+	// subtitleWaitBlockerStale: the row carries probe evidence, but not for the
+	// generation this session serves (a rotated/duplicate row or a refused
+	// write), so the menu waits on fresh evidence rather than a first probe.
+	subtitleWaitBlockerStale = "stale"
+	// subtitleWaitStaleBound bounds how long a wait record may go unresolved.
+	// The probe lifecycle fails or verifies every session within its own
+	// convergence bound, so an older record belongs to a session that ended
+	// without a delivery; pruning it keeps the map bounded.
+	subtitleWaitStaleBound = time.Hour
+)
+
+// subtitleInventoryWaitV3 is one session's subtitle-inventory wait: the first
+// moment the session needed an enumerated subtitle inventory and the gate that
+// was holding it.
+type subtitleInventoryWaitV3 struct {
+	startedAt time.Time
+	fileID    int
+	blocker   string
+}
+
+// subtitleInventoryWaitDeliveryV3 is one wait resolved by a delivery, carried on
+// the publish summary so the delivery line can report the start and blocker.
+type subtitleInventoryWaitDeliveryV3 struct {
+	SessionID string
+	FileID    int
+	StartedAt time.Time
+	Blocker   string
+}
+
+// noteSubtitleInventoryWaitStart records the first time this session needed a
+// verified subtitle inventory while the enumeration was still outstanding. It
+// logs exactly one line per session and keeps later reads silent, so a poll loop
+// or a replan storm cannot multiply it. The delivery line added by
+// logInventoryDelivery carries the matching start and blocker fields.
+func (h *PlaybackHandler) noteSubtitleInventoryWaitStart(ctx context.Context, sessionID string, file *models.MediaFile, inventoryStatus, blocker string) {
+	if h == nil || sessionID == "" {
+		return
+	}
+	now := time.Now()
+	h.subtitleWaitsMu.Lock()
+	if h.subtitleWaits == nil {
+		h.subtitleWaits = make(map[string]subtitleInventoryWaitV3)
+	}
+	if _, exists := h.subtitleWaits[sessionID]; exists {
+		h.subtitleWaitsMu.Unlock()
+		return
+	}
+	for id, wait := range h.subtitleWaits {
+		if now.Sub(wait.startedAt) > subtitleWaitStaleBound {
+			delete(h.subtitleWaits, id)
+		}
+	}
+	fileID := catalogFileIDOrZero(file)
+	h.subtitleWaits[sessionID] = subtitleInventoryWaitV3{startedAt: now, fileID: fileID, blocker: blocker}
+	h.subtitleWaitsMu.Unlock()
+	slog.InfoContext(ctx, "subtitle inventory probe wait started",
+		virtualEvidenceLogKeyComponent, virtualEvidenceLogValueAPI,
+		"session", sessionID,
+		virtualEvidenceLogKeyFileID, fileID,
+		"blocker", blocker,
+		"inventory_status", inventoryStatus,
+		"wait_started_at", now.UTC().Format(time.RFC3339Nano))
+}
+
+// takeSubtitleInventoryWait resolves and removes one session's wait record. It
+// reports false when no wait is outstanding, so a delivery for a session that
+// never waited (a healthy verified read) stays exactly as it was.
+func (h *PlaybackHandler) takeSubtitleInventoryWait(sessionID string) (subtitleInventoryWaitDeliveryV3, bool) {
+	if h == nil || sessionID == "" {
+		return subtitleInventoryWaitDeliveryV3{}, false
+	}
+	h.subtitleWaitsMu.Lock()
+	defer h.subtitleWaitsMu.Unlock()
+	wait, ok := h.subtitleWaits[sessionID]
+	if !ok {
+		return subtitleInventoryWaitDeliveryV3{}, false
+	}
+	delete(h.subtitleWaits, sessionID)
+	return subtitleInventoryWaitDeliveryV3{
+		SessionID: sessionID,
+		FileID:    wait.fileID,
+		StartedAt: wait.startedAt,
+		Blocker:   wait.blocker,
+	}, true
+}
+
+// collectSubtitleInventoryWait folds a delivered session's outstanding wait into
+// the publish summary.
+func (h *PlaybackHandler) collectSubtitleInventoryWait(summary *inventoryPublishSummary, sessionID string) {
+	if summary == nil {
+		return
+	}
+	if wait, ok := h.takeSubtitleInventoryWait(sessionID); ok {
+		summary.Waits = append(summary.Waits, wait)
+	}
+}
+
+// forgetSubtitleInventoryWait drops a session's wait record when the session is
+// torn down, so a process that never delivers evidence for it does not retain
+// the entry indefinitely.
+func (h *PlaybackHandler) forgetSubtitleInventoryWait(sessionID string) {
+	if h == nil || sessionID == "" {
+		return
+	}
+	h.subtitleWaitsMu.Lock()
+	delete(h.subtitleWaits, sessionID)
+	h.subtitleWaitsMu.Unlock()
 }
 
 // runVirtualEvidenceWorker drains accepted work until the buffer is closed by

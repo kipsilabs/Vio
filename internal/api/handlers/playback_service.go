@@ -684,6 +684,10 @@ func (h *PlaybackHandler) forgetProgressSideEffectLock(sessionID string) {
 		return
 	}
 	h.virtualDeliveryCleared.Delete(sessionID)
+	// The session is terminal, so no outstanding subtitle-inventory wait can
+	// still be ended by a delivery. Dropping it keeps a long-lived process from
+	// retaining one record per historical session.
+	h.forgetSubtitleInventoryWait(sessionID)
 	// The session is terminal, so no outstanding audio withdrawal can still be
 	// delivered or complete. Dropping its in-process retry state here keeps a
 	// long-lived process from retaining state for every session it ever served.
@@ -1137,17 +1141,8 @@ func (h *PlaybackHandler) GetPlaybackInventoryV2(ctx context.Context, caller Pla
 		return playback.PlaybackInventoryV3{}, playbackStoreOperationError()
 	}
 	inventory, invErr := h.playbackInventoryForSession(ctx, session, record)
-	if errors.Is(invErr, errPlaybackInventorySubtitlesUnavailable) {
-		return playback.PlaybackInventoryV3{}, playbackStoreOperationError()
-	}
 	return inventory, invErr
 }
-
-// errPlaybackInventorySubtitlesUnavailable marks a live-inventory read that
-// failed because the subtitle inventory dependency was unavailable. The v2 and
-// v1 readers map it to their own established problem shapes; the sentinel keeps
-// the shared resolver from picking one.
-var errPlaybackInventorySubtitlesUnavailable = errors.New("playback inventory subtitle load failed")
 
 // playbackInventoryForSession resolves the live inventory and the effective
 // version identity for an active session. Both the v2 and v3 readers call it so
@@ -1185,6 +1180,28 @@ func (h *PlaybackHandler) playbackInventoryForSession(ctx context.Context, sessi
 	return h.playbackInventoryForFileV3(ctx, session, record, file, effectiveVirtualURI)
 }
 
+// subtitleInventoryWaitBlockerV3 names the gate holding a session's subtitle
+// inventory when its first unverified read starts the wait. A stamped row waits
+// on fresh evidence for the served generation; a session with an armed probe
+// waits on that enumeration; with no probe armed the enumeration is deferred
+// until the transport resolves, so the wait sits on the relay. It is diagnostic
+// only and never changes what is served.
+func subtitleInventoryWaitBlockerV3(session *playback.Session, file *models.MediaFile) string {
+	if file != nil && file.ProbeUpdatedAt != nil {
+		// The row has probe evidence, but not for the generation this read
+		// describes (a rotated/duplicate row or a refused write): the menu waits
+		// on fresh evidence, not on a first probe.
+		return subtitleWaitBlockerStale
+	}
+	if session != nil && session.VirtualProbeOutcome == playback.VirtualProbeOutcomePending {
+		// A probe lifecycle is armed and enumerating; the rows will arrive.
+		return subtitleWaitBlockerUnprobed
+	}
+	// No probe evidence has landed and none is armed: the enumeration is
+	// deferred until the transport resolves the relay.
+	return subtitleWaitBlockerRelay
+}
+
 // playbackInventoryForFileV3 builds the wire inventory for one session from an
 // already-resolved effective file. It is the shared tail of
 // playbackInventoryForSession and the in-memory serve for a refused probe: the
@@ -1204,8 +1221,16 @@ func (h *PlaybackHandler) playbackInventoryForFileV3(ctx context.Context, sessio
 
 	audioTracks := playback.AudioInventoryV3(file)
 	additional, subErr := h.downloadedSubtitleInventoryWithErrorV3(ctx, file)
-	if subErr != nil {
-		return playback.PlaybackInventoryV3{}, errPlaybackInventorySubtitlesUnavailable
+	inventoryRetryable := subErr != nil
+	if inventoryRetryable {
+		// Download/AI subtitle rows are an extension of the base inventory. A
+		// failed read means the base inventory is complete but the extension is
+		// missing, so it must not turn the whole menu into a 503 the client
+		// renders as "no subtitles": serve the embedded and external tracks now
+		// and mark the read retryable so the next poll can pick the extension up.
+		additional = nil
+		slog.WarnContext(ctx, "live inventory: downloaded subtitle rows unavailable; serving the base inventory",
+			"component", "api", "session", session.ID, "file_id", catalogFileIDOrZero(file), "error", subErr)
 	}
 	subtitleInventory := playback.ScopeSubtitleInventoryV3(session.ID, file, playback.BuildSubtitleInventoryV3(file, additional), clientFeatures)
 
@@ -1235,6 +1260,25 @@ func (h *PlaybackHandler) playbackInventoryForFileV3(ctx context.Context, sessio
 		case probeOutcomeFailed:
 			status = string(ProbeProvenanceFailed)
 		}
+	}
+	if inventoryRetryable {
+		// The base inventory is complete but the downloaded extension could not
+		// be read: pending here means "base complete, extension missing", not
+		// "the probe has not landed". Report pending (not failed) so the client
+		// keeps its current menu and retries the extension with backoff instead
+		// of treating the menu as final. See docs/playback-api.md for the poll
+		// contract; do not busy-poll this endpoint.
+		status = probeOutcomePending
+	}
+	if !inventoryRetryable && status != string(ProbeProvenanceVerified) && status != string(ProbeProvenanceFailed) {
+		// This read publishes a provisional subtitle menu: either the probe is
+		// still enumerating or the row has never been stamped. Record the first
+		// such read as the session's wait start; subsequent polls and replans see
+		// the recorded wait and stay silent, so the lifecycle yields one start
+		// line and one delivery line. A terminal failure is not a wait (it ends
+		// the client's loading state), and a downloaded-extension retry is a
+		// subtitle-store wait, not a probe wait.
+		h.noteSubtitleInventoryWaitStart(ctx, session.ID, file, status, subtitleInventoryWaitBlockerV3(session, file))
 	}
 
 	effectiveFileID := 0
@@ -1315,6 +1359,19 @@ func (h *PlaybackHandler) inventoryEffectiveFile(ctx context.Context, file *mode
 		placeholder.SubtitleTracks = nil
 		placeholder.ExternalSubtitles = nil
 		placeholder.ProbeUpdatedAt = nil
+		// No catalog row names the bound candidate, so no row's inventory may
+		// speak for it. The plan-time inventory the session carries describes
+		// that candidate only while its evidence URI still names the live
+		// binding; evidence captured before a binding rotation belongs to the
+		// previous release and is not overlaid under the new identity. This is
+		// a read-only overlay: the catalog and the transport are untouched.
+		evidenceNamesCandidate := session != nil && session.VirtualSubtitleEvidenceSet &&
+			sameVirtualCandidate(session.VirtualSubtitleEvidenceURI, candidateURI)
+		if evidenceNamesCandidate {
+			placeholder.AudioTracks = session.VirtualAudioTracks
+			placeholder.SubtitleTracks = session.VirtualSubtitleTracks
+			placeholder.ExternalSubtitles = session.VirtualExternalSubtitles
+		}
 		base = &placeholder
 		// Name the fail-closed decision so an operator can correlate an empty
 		// menu with the reason it is empty: no catalog row names the bound
@@ -1322,12 +1379,18 @@ func (h *PlaybackHandler) inventoryEffectiveFile(ctx context.Context, file *mode
 		// candidate URI is not logged raw — its query can carry provider
 		// identifiers — so the log carries the provider-neutral path and the
 		// concrete candidate id instead.
-		slog.InfoContext(ctx, "virtual inventory serving fail-closed placeholder: no catalog row names the bound candidate",
+		logFields := []any{
 			"component", "api",
 			"file_id", file.ID,
 			"base_id", placeholder.ID,
 			"candidate_path", virtualPlaybackNeutralKey(candidateURI),
-			"candidate_id", virtualResultCandidateID(candidateURI))
+			"candidate_id", virtualResultCandidateID(candidateURI),
+		}
+		if evidenceNamesCandidate {
+			slog.InfoContext(ctx, "virtual inventory serving session evidence fallback: no catalog row names the bound candidate", logFields...)
+		} else {
+			slog.InfoContext(ctx, "virtual inventory serving fail-closed placeholder: no catalog row names the bound candidate", logFields...)
+		}
 	}
 	return bindSessionVirtualSourceWithTracks(ctx, base, session, h.fileResolver)
 }
@@ -1619,6 +1682,10 @@ type inventoryPublishSummary struct {
 	FileID           int
 	SessionsNotified int
 	Revision         string
+	// Waits collects the subtitle-inventory waits this fan-out ended, so the
+	// delivery line can report how long each session's menu was provisional and
+	// what blocked it. It is empty for a delivery that resolved no wait.
+	Waits []subtitleInventoryWaitDeliveryV3
 }
 
 // inventoryPublishResult classifies one session-targeted publish attempt for the
@@ -1685,6 +1752,7 @@ func (h *PlaybackHandler) PublishInventoryUpdated(ctx context.Context, fileID in
 		if result == inventoryPublishDelivered {
 			summary.SessionsNotified++
 			summary.Revision = revision
+			h.collectSubtitleInventoryWait(&summary, session.ID)
 		}
 	}
 	return summary
@@ -1735,6 +1803,7 @@ func (h *PlaybackHandler) PublishInventoryUpdatedToSession(ctx context.Context, 
 	if result == inventoryPublishDelivered {
 		summary.SessionsNotified++
 		summary.Revision = revision
+		h.collectSubtitleInventoryWait(&summary, session.ID)
 	}
 	return summary, result
 }
@@ -2110,6 +2179,12 @@ func (h *PlaybackHandler) publishInventoryUpdatedToSession(ctx context.Context, 
 		// deferred probe has terminally failed, so the client already holds
 		// exactly this declared inventory. A failed status is new information —
 		// it ends the deferred loading state — so it is pushed.
+		// If the probe itself was verified or failed, but a transient extension
+		// read failure marked the inventory pending, the notification is still
+		// owed: re-park it so the terminal outcome is not dropped as obsolete.
+		if (override != nil && override.ProbeUpdatedAt != nil) || session.VirtualProbeOutcome == probeOutcomeVerified || session.VirtualProbeOutcome == probeOutcomeFailed {
+			return inventory.InventoryRevision, inventoryPublishRetryable
+		}
 		return inventory.InventoryRevision, inventoryPublishObsolete
 	}
 	if inventory.InventoryStatus == string(ProbeProvenanceFailed) &&

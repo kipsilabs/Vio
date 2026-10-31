@@ -484,3 +484,10 @@
 # A partly available season lists canonical metadata-only rows beside the
 # file-backed subset; fileless rows carry no files and alias rows stay hidden.
 ./internal/api/handlers TestSeasonEpisodesMergePartialAvailabilityDB
+
+# Version liveness: a dead pin is stamped and reported unavailable, a healthy
+# same-identity observation clears the stamp and leaves the recovered row in the
+# picker, ambiguous provider answers leave the stamp alone, and an unauthorized
+# failed row stays indistinguishable from an unknown id.
+./internal/api/handlers TestCatalogVersionsCheckHTTP
+./internal/api/handlers TestCatalogVersionsCheckAccessHidesFailedVerdict

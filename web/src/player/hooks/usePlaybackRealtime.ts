@@ -50,15 +50,16 @@ interface UsePlaybackRealtimeResult {
 const reconnectDelays = [500, 1_000, 2_000, 5_000];
 
 /**
- * How many times a mint may answer 404/410 before the control lane stops
- * retrying. The ticket is minted against a per-process, in-memory session map,
- * so a 404 is replica-local: it proves this replica does not hold the session,
- * not that the session ended. A bounded ladder of retries covers a request that
- * lands on the wrong replica or a replica that restarted; after that the lane
- * degrades quietly and leaves the authoritative missing/ended verdict to the
- * durable attempt store behind the progress lane.
+ * How many times a mint may answer 404/410 before the control lane concludes
+ * the playback session is gone. The ticket is minted against a per-process,
+ * in-memory session map, so one 404 is replica-local: it proves this replica
+ * does not hold the session, not that the session ended. A short ladder of
+ * retries still covers a request that lands on the wrong replica. After it, the
+ * player stops minting against the dead id and offers a restart; retrying
+ * forever is what left prod tabs polling an expired session in a `setTimeout`
+ * loop.
  */
-export const SESSION_GONE_MINT_RETRY_LIMIT = 4;
+export const SESSION_GONE_MINT_RETRY_LIMIT = 3;
 
 export function usePlaybackRealtime({
   sessionId,
@@ -113,10 +114,10 @@ export function usePlaybackRealtime({
     let reconnectTimer: number | null = null;
     // A mint answered 404/410. The ticket store is per-process and in-memory, so
     // that answer is replica-local: it proves this replica does not hold the
-    // session, not that playback ended. Retry it a bounded number of times, then
-    // stop quietly — never tear the player down and never report the session
-    // lost. The authoritative missing/ended verdict lives in the durable attempt
-    // store behind the progress lane, which this hook does not read.
+    // session, not that playback ended. Retry it a short, bounded number of
+    // times with backoff; when even that keeps answering gone, degrade this
+    // control lane only. Playback and the stream keep running, and an adopted
+    // plan re-arms the lane through revive() below.
     let sessionGoneMints = 0;
     let degraded = false;
 
@@ -251,10 +252,11 @@ export function usePlaybackRealtime({
             return;
           }
           if (isPlaybackSessionGoneError(error)) {
-            // A 404/410 here is replica-local (see `sessionGoneMints`): it is
-            // not proof the session ended. Retry it a bounded number of times
-            // with backoff, then degrade quietly. Playback keeps running and the
-            // progress lane owns the authoritative missing/ended verdict.
+            // A 404/410 here is replica-local (see `sessionGoneMints`): one
+            // answer is not proof the session ended, and neither is a spent
+            // ladder. Degrade this control lane and keep the stream playing;
+            // reporting the session gone here killed healthy playback whenever
+            // the mint requests kept landing on another replica.
             sessionGoneMints += 1;
             setConnectionState("disconnected");
             if (sessionGoneMints < SESSION_GONE_MINT_RETRY_LIMIT) {

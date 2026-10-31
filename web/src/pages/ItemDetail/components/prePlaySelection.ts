@@ -15,6 +15,7 @@ import { getLanguageName } from "@/player/utils/languageNames";
 import { normalizeSubtitleMode } from "@/player/utils/subtitleMode";
 import { resolveSubtitleAutoSelect } from "@/player/utils/subtitleSort";
 import { getSubtitleFormatLabel } from "@/player/utils/subtitleCodecs";
+import { buildPublishedSubtitleTracks } from "@/player/utils/subtitleInventory";
 import { audioTrackLabel, formatChannels } from "@/lib/mediaFormat";
 import {
   buildVersionSubtitleInventory,
@@ -161,14 +162,32 @@ export function toSubtitleTrackSignature(
   };
 }
 
+/**
+ * Whether two pre-play subtitle selections name the same row.
+ *
+ * The dense combined ordinal (`track_index`) is the row's identity wherever the
+ * inventory published one. Descriptor fields alone cannot separate two streams
+ * in the same language with the same codec and label — the case a release with
+ * two German SRT tracks produces — so comparing only those would light both
+ * rows. Rows the derivation could not place (a duplicate the server collapsed)
+ * keep the descriptor comparison, which is all they have.
+ */
 export function subtitleSelectionEquals(
   left: PrePlaySubtitleSelection | null | undefined,
   right: PrePlaySubtitleSelection | null | undefined,
 ): boolean {
   if (!left || !right) return false;
+  if (left.source !== right.source) return false;
+  if (left.source === "downloaded") {
+    return (
+      (left.downloaded_subtitle_id ?? null) === (right.downloaded_subtitle_id ?? null) &&
+      (left.track_index ?? null) === (right.track_index ?? null)
+    );
+  }
+  if (left.track_index != null || right.track_index != null) {
+    return left.track_index === right.track_index;
+  }
   return (
-    left.source === right.source &&
-    (left.downloaded_subtitle_id ?? null) === (right.downloaded_subtitle_id ?? null) &&
     (left.external_subtitle_path ?? null) === (right.external_subtitle_path ?? null) &&
     (left.language ?? "") === (right.language ?? "") &&
     (left.codec ?? "") === (right.codec ?? "") &&
@@ -185,26 +204,23 @@ export function buildPrePlaySubtitleCandidates(
   const inventory = buildVersionSubtitleInventory(tracks, downloaded);
   const all: PrePlaySubtitleCandidate[] = [];
 
-  // Dense combined ordinals, mirroring the server's BuildSubtitleInventoryV3
-  // order (external → embedded → downloaded): the ordinal is the candidate's
-  // position in that combined list, computed over the UNSORTED catalog order.
-  // Never the container stream index. Keys mirror VersionSubtitleInventoryRow
-  // identity (`source:index`) with the catalog enumeration index as the
-  // no-explicit-index fallback, so lookups always hit.
+  // The same single ordinal derivation the watch route and the player use:
+  // external → embedded → downloaded, de-duplicated and dense. Keys mirror
+  // VersionSubtitleInventoryRow identity (`source:index` / downloaded row id)
+  // with the catalog enumeration index as the no-explicit-index fallback, so
+  // lookups always hit the row the published ordinal was assigned to.
   const trackList = tracks ?? [];
   const denseOrdinalByKey = new Map<string, number>();
-  const externalCount = trackList.filter((track) => track.external).length;
-  let externalOrdinal = 0;
-  let embeddedOrdinal = 0;
-  for (const [catalogIndex, track] of trackList.entries()) {
-    const source = track.external ? "external" : "embedded";
-    const dense = source === "external" ? externalOrdinal++ : externalCount + embeddedOrdinal++;
-    denseOrdinalByKey.set(`${source}:${track.index ?? catalogIndex}`, dense);
-  }
-  let nextOrdinal = trackList.length;
-  for (const subtitle of downloaded ?? []) {
-    denseOrdinalByKey.set(`downloaded:${subtitle.id}`, nextOrdinal);
-    nextOrdinal++;
+  for (const track of buildPublishedSubtitleTracks(trackList, downloaded)) {
+    if (track.source === "downloaded") {
+      if (track.downloadedSubtitleId != null) {
+        denseOrdinalByKey.set(`downloaded:${track.downloadedSubtitleId}`, track.index);
+      }
+      continue;
+    }
+    if (track.containerIndex != null) {
+      denseOrdinalByKey.set(`${track.source}:${track.containerIndex}`, track.index);
+    }
   }
 
   const denseOrdinalFor = (row: VersionSubtitleInventoryRow): number | undefined => {

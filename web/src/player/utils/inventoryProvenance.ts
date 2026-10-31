@@ -36,3 +36,51 @@ export function isInventoryProvisional(
   }
   return status === "declared";
 }
+
+/**
+ * Whether the player overlay's track rows are still placeholders rather than
+ * probe evidence for the effective file.
+ *
+ * `planProvisional` is the plan's own verdict from `isInventoryProvisional`.
+ * When it is false, rows can still be the catalog fallback the menus use before
+ * a plan publishes selectable inventory for the effective source. Those rows
+ * are pre-probe metadata, not evidence the file carries them, so they stay
+ * provisional until the session or plan publishes its own inventory.
+ *
+ * Empty rows are never stale data: they keep the final empty state even when
+ * the plan had to fall back, so the menu can say "No subtitles available"
+ * instead of spinning forever.
+ */
+export function isOverlayInventoryProvisional(
+  planProvisional: boolean,
+  publishedRows: boolean,
+  rowCount: number,
+): boolean {
+  if (planProvisional) return true;
+  return rowCount > 0 && !publishedRows;
+}
+
+/**
+ * How long a provisional menu may spin before it stops implying progress and
+ * offers an explicit retry. A deferred probe usually lands in seconds; a menu
+ * that is still provisional after this long is a stuck discovery the viewer
+ * must be able to act on rather than watch forever.
+ */
+export const PROVISIONAL_INVENTORY_TIMEOUT_MS = 15_000;
+
+/**
+ * Whether a provisional menu has outlived the bound at `now`.
+ *
+ * `provisionalSince` is the moment the current provisional stretch began, or
+ * null when the menu is not provisional. Callers that render a spinner reset
+ * it when the stretch ends or the viewer retries.
+ */
+export function isProvisionalInventoryExpired(
+  provisional: boolean,
+  provisionalSince: number | null,
+  now: number,
+  timeoutMs: number = PROVISIONAL_INVENTORY_TIMEOUT_MS,
+): boolean {
+  if (!provisional || provisionalSince === null) return false;
+  return now - provisionalSince >= timeoutMs;
+}

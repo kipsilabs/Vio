@@ -167,6 +167,19 @@ function describeTerminalCopy(terminal: TerminalV3): { title: string; message: s
 }
 
 /**
+ * Terminal reasons that mean the server found no playable adaptation for this
+ * source on this device. Unlike a refused track or quality pick, there is no
+ * plan left to keep on screen: the route itself could not be built.
+ */
+const ADAPTATION_UNAVAILABLE_REASONS = new Set(["adaptation_exhausted", "adaptation_unavailable"]);
+
+/** True when `reason` is a decision outcome that offers no playable plan. */
+export function isAdaptationUnavailableReason(reason: string | null | undefined): boolean {
+  const normalized = reason?.trim() ?? "";
+  return normalized !== "" && ADAPTATION_UNAVAILABLE_REASONS.has(normalized);
+}
+
+/**
  * True when a transport error means the playback session itself is gone.
  *
  * None of these can be repaired by retrying against the same session id:
@@ -203,6 +216,21 @@ export function isDeadPlaybackSessionError(error: unknown): boolean {
  */
 const SESSION_GONE_PROBLEM_CODES = new Set([
   "not_found",
+  "session_not_found",
+  "playback_session_not_found",
+  "playback_session_ended",
+]);
+
+/**
+ * The problem ids a *session-scoped media route* (a stream or subtitle URL)
+ * uses to say the playback session itself is gone.
+ *
+ * Unlike `SESSION_GONE_PROBLEM_CODES`, a plain `not_found` is deliberately
+ * absent: a subtitle artifact or a source file can be missing while the session
+ * is perfectly alive, and treating that as a dead session would end playback
+ * over one unavailable track.
+ */
+const SESSION_GONE_MEDIA_PROBLEM_CODES = new Set([
   "session_not_found",
   "playback_session_not_found",
   "playback_session_ended",
@@ -247,6 +275,46 @@ export function isPlaybackSessionGoneError(error: unknown): boolean {
   }
   return false;
 }
+
+/**
+ * Whether a session-scoped media response (a stream or subtitle fetch) says the
+ * playback session no longer exists.
+ *
+ * The media routes are session-scoped, so a 410 there is the ended session and
+ * has no other meaning. A 404 is only the session when the problem body names
+ * it: a missing artifact or source file answers 404 too, and retrying those is
+ * still the right behavior.
+ */
+export async function isPlaybackSessionGoneResponse(response: Response): Promise<boolean> {
+  if (response.status !== 404 && response.status !== 410) return false;
+  if (response.status === 410) return true;
+  try {
+    const body = (await response.json()) as {
+      error?: unknown;
+      type?: unknown;
+      title?: unknown;
+      detail?: unknown;
+    };
+    const errorCode = typeof body.error === "string" ? body.error.trim() : "";
+    const typeCode =
+      typeof body.type === "string"
+        ? (body.type.split("?")[0]?.split("/").pop()?.replace(/#.*$/, "") ?? "")
+        : "";
+    return SESSION_GONE_MEDIA_PROBLEM_CODES.has(errorCode || typeCode);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * What the viewer is told when a session-scoped call proves the playback
+ * session no longer exists on the server. Restarting is a fresh start, never a
+ * replan against the dead session.
+ */
+export const PLAYBACK_SESSION_GONE_ERROR: PlaybackPolicyErrorDescription = {
+  title: "Playback session expired",
+  message: "This playback session is no longer active. Start it again to keep watching.",
+};
 
 /**
  * What the viewer is told when a stream that was already playing lost its

@@ -3,8 +3,10 @@ import { describe, expect, it } from "vitest";
 import {
   describePlanTerminal,
   describePlaybackTransportError,
+  isAdaptationUnavailableReason,
   isDeadPlaybackSessionError,
   isPlaybackSessionGoneError,
+  isPlaybackSessionGoneResponse,
 } from "./playback-errors";
 import { PlayerFetchError } from "./player-fetch";
 import { V2ProblemError, V2TransportError } from "@/api/v2/request";
@@ -371,5 +373,58 @@ describe("isPlaybackSessionGoneError", () => {
     );
     expect(isPlaybackSessionGoneError(new Error("404"))).toBe(false);
     expect(isPlaybackSessionGoneError(null)).toBe(false);
+  });
+});
+
+function problemResponse(status: number, body: unknown) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+describe("isAdaptationUnavailableReason", () => {
+  it("names only the outcomes that leave no playable plan", () => {
+    expect(isAdaptationUnavailableReason("adaptation_unavailable")).toBe(true);
+    expect(isAdaptationUnavailableReason("adaptation_exhausted")).toBe(true);
+    expect(isAdaptationUnavailableReason(" subtitle_conversion_unsupported ")).toBe(false);
+    expect(isAdaptationUnavailableReason(null)).toBe(false);
+    expect(isAdaptationUnavailableReason("")).toBe(false);
+  });
+});
+
+describe("isPlaybackSessionGoneResponse", () => {
+  it("treats a 410 on a session media route as the session being gone", async () => {
+    expect(await isPlaybackSessionGoneResponse(problemResponse(410, {}))).toBe(true);
+  });
+
+  it("needs an explicit session code on a 404 so a missing artifact keeps retrying", async () => {
+    expect(
+      await isPlaybackSessionGoneResponse(
+        problemResponse(404, { error: "playback_session_not_found" }),
+      ),
+    ).toBe(true);
+    expect(
+      await isPlaybackSessionGoneResponse(
+        problemResponse(404, {
+          type: "https://siloserver.org/docs/api/v2/problems/session_not_found",
+          status: 404,
+        }),
+      ),
+    ).toBe(true);
+    // A subtitle artifact or source file 404 is not a dead session.
+    expect(await isPlaybackSessionGoneResponse(problemResponse(404, { error: "not_found" }))).toBe(
+      false,
+    );
+    expect(
+      await isPlaybackSessionGoneResponse(problemResponse(404, { error: "source_missing" })),
+    ).toBe(false);
+  });
+
+  it("ignores every other status", async () => {
+    expect(
+      await isPlaybackSessionGoneResponse(problemResponse(503, { error: "unavailable" })),
+    ).toBe(false);
+    expect(await isPlaybackSessionGoneResponse(problemResponse(500, {}))).toBe(false);
   });
 });

@@ -120,8 +120,11 @@ import {
   toPlayerTime,
 } from "../utils/mediaTimeline";
 import {
+  isSameSubtitleTrack,
   pendingServerSubtitleSelection,
+  resolveAppliedSubtitleIndex,
   subtitleArtifactIdentity,
+  subtitleSelectionAcknowledgesPending,
   subtitleTrackIdentityFromInfo,
   subtitleTrackIdentityKey,
   type SubtitleTrackIdentity,
@@ -289,7 +292,11 @@ interface VideoPlayerProps {
   /** `quality_change` replan for a label taken from `plan.available_qualities`. */
   onQualitySelect?: (label: string, currentPosition: number) => void;
   /** `track_change` replan for a subtitle the server has to render. */
-  onSubtitleTrackChange?: (combinedIndex: number | null, currentPosition: number) => void;
+  onSubtitleTrackChange?: (
+    combinedIndex: number | null,
+    currentPosition: number,
+    displayedTrack?: PlayerSubtitleInfo | null,
+  ) => void;
   /** `failure_recovery` replan after the client could not play the plan. */
   onPlanFailure?: (failure: FailureV3, currentPosition: number) => void;
   /**
@@ -306,6 +313,17 @@ interface VideoPlayerProps {
    * lost state directly.
    */
   onSessionLost?: () => void;
+  /**
+   * A session-scoped call proved the playback session no longer exists (a
+   * control-ticket mint, a stream/subtitle fetch, or a replan). The player
+   * stops using the dead session and offers `onRestartPlayback`.
+   */
+  onSessionGone?: () => void;
+  /**
+   * Starts a fresh session at the current position after the old one was
+   * answered gone.
+   */
+  onRestartPlayback?: () => void;
   /**
    * A session-scoped call answered that the session is gone while a reconnect
    * was already running. The reconnect is the recovery, but the server has
@@ -380,6 +398,8 @@ interface VideoPlayerProps {
   inventoryPending?: boolean;
   /** True when track discovery terminally failed or timed out. */
   inventoryFailed?: boolean;
+  /** Re-runs track discovery for a stalled or failed provisional inventory. */
+  onRetryInventory?: () => void;
   onSubtitleChanged?: (index: number | null, inventoryTrack?: SubtitleInventoryItemV3) => void;
   onExit: (state?: PlaybackExitState) => void | Promise<void>;
   onMinimize?: (state?: PlaybackExitState) => void | Promise<void>;
@@ -603,6 +623,8 @@ export function VideoPlayer({
   onConnectionLost,
   onRetryConnection,
   onSessionLost,
+  onSessionGone,
+  onRestartPlayback,
   onExpediteReconnect,
   connectionStatus = "connected",
   connectionErrorTitle = null,
@@ -639,6 +661,7 @@ export function VideoPlayer({
   subtitleInventoryProvisional = false,
   inventoryPending = false,
   inventoryFailed = false,
+  onRetryInventory,
   onSubtitleChanged,
   onExit,
   onMinimize,
@@ -658,6 +681,11 @@ export function VideoPlayer({
 }: VideoPlayerProps) {
   const playerConfig = usePlayerConfig();
   const isDetached = displayMode !== "foreground";
+  // `resolveAppliedAudioIndex` returns -1 when the committed selection has no
+  // row in the applied inventory. Normalize it to "no row" before indexing the
+  // menu list or asking the version for a language; -1 names no track.
+  const appliedAudioIndex =
+    activeAudioIndex != null && activeAudioIndex >= 0 ? activeAudioIndex : null;
 
   // Refs
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -820,6 +848,19 @@ export function VideoPlayer({
       `${plan.effective_media_file_id}|${plan.effective_virtual_uri ?? ""}|${plan.virtual_source_revision ?? ""}`,
   );
   const lastSubtitleIndexRef = useRef<number | null>(null);
+  // The plan whose committed subtitle selection the marker has reconciled to.
+  // A successful replan can re-mint combined ordinals without changing the
+  // asset, so the optimistic index must follow the committed plan.
+  const lastSubtitlePlanIdRef = useRef(plan.plan_id);
+  // The track the viewer picked that the incoming plan has not acknowledged
+  // yet. Reconciliation must not treat that optimistic marker as stale state
+  // from the outgoing plan and pull it back to the committed track.
+  const pendingManualSubtitleIdentityRef = useRef<SubtitleTrackIdentity | null>(null);
+  // The row a freshly adopted plan was reconciled onto. A preserved verified
+  // inventory can carry a different derived id for the same asset, so the
+  // normal identity comparison would ask the server for it again; the settled
+  // row already names what the plan committed.
+  const reconciledSubtitlePlanRef = useRef<{ planId: string; index: number } | null>(null);
   const subtitleSelectionWasManualRef = useRef(false);
   const subtitleSelectionWasManualOffRef = useRef(false);
   const consumedInitialSubtitleErrorKeyRef = useRef<string | null>(null);
@@ -968,6 +1009,18 @@ export function VideoPlayer({
     ];
   }, [subtitleUrls, liveTranslation]);
 
+  // Whether the plan's own inventory offers a row the menu can act on. A
+  // non-empty inventory without a selectable entry is a declared placeholder
+  // for a probe that has not landed; the menu is showing watch-detail fallback
+  // rows then, whose ordinals are menu positions rather than plan ordinals.
+  const planHasSelectableSubtitles = useMemo(
+    () =>
+      plan.subtitle.inventory.some(
+        (track) => (track.url ?? "").trim() !== "" || track.delivery === "burn_in_only",
+      ),
+    [plan.subtitle.inventory],
+  );
+
   // -- Plan-derived transport --
   // The plan names its own protocol and timeline; nothing here is inferred from
   // codec strings or from what the engine reports.
@@ -1074,6 +1127,9 @@ export function VideoPlayer({
    */
   const handleSessionGone = useCallback(() => {
     if (sessionGoneReportedRef.current) return;
+    // A session already answered gone stays gone: its restart action is the
+    // only recovery, and a lost/reconnecting cycle would reuse the dead id.
+    if (connectionStatusRef.current === "gone") return;
     sessionGoneReportedRef.current = true;
     if (reportConnectionLostRef.current()) {
       if (connectionStatusRef.current === "reconnecting") onExpediteReconnectRef.current?.();
@@ -1155,18 +1211,20 @@ export function VideoPlayer({
   // one that was asked for. When the plan resolved a neutral virtual row to a
   // concrete candidate, `effective_virtual_uri` names that candidate by path;
   // matching there is what makes the version menu light the working row.
+  // A list miss is a real miss: falling back to the selected row would light
+  // the viewer's pick as "Playing" while the server serves another candidate,
+  // which is exactly the silent substitution this surface must not show.
   const effectiveVersion = useMemo(
     () =>
       resolveEffectiveVersion(versions, {
         mediaFileId: activeFileId ?? plan.effective_media_file_id,
         effectiveVirtualUri: activeVirtualUri ?? plan.effective_virtual_uri ?? null,
-      }) ?? selectedVersion,
+      }) ?? undefined,
     [
       activeFileId,
       activeVirtualUri,
       plan.effective_media_file_id,
       plan.effective_virtual_uri,
-      selectedVersion,
       versions,
     ],
   );
@@ -1209,6 +1267,16 @@ export function VideoPlayer({
           // server's versions/check answer. Surface it so a version the media
           // page hides as unavailable is not selectable here with no warning.
           unavailable: v.available === false,
+          // A recent probe rejected the bytes the provider served for this
+          // release. The row stays available and selectable; the badge explains
+          // why a play is retrying the link rather than showing the generic
+          // unavailable copy.
+          sourceMismatch: v.source_mismatch
+            ? {
+                servedBytes: v.source_mismatch.served_bytes,
+                declaredBytes: v.source_mismatch.declared_bytes,
+              }
+            : undefined,
         };
       }),
     [versions, virtualRanking, effectiveFileId, plan.requested_media_file_id, pendingSwitchFileId],
@@ -2020,6 +2088,14 @@ export function VideoPlayer({
       positionSeconds,
       durationSeconds,
       lastFileId: effectiveVersion?.file_id ?? activeFileId ?? selectedVersion?.file_id,
+      // The request's row is the viewer's pick; the effective row above is
+      // whatever the server actually served. Persisting the pick keeps a
+      // substitution from becoming the selected version after exit.
+      selectedFileId:
+        plan.requested_media_file_id ??
+        effectiveVersion?.file_id ??
+        activeFileId ??
+        selectedVersion?.file_id,
       lastResolution: selectedVersion?.resolution,
       lastHDR: selectedVersion?.hdr,
       lastCodecVideo: selectedVersion?.codec_video,
@@ -2031,6 +2107,7 @@ export function VideoPlayer({
     duration,
     effectiveVersion,
     elementMediaPosition,
+    plan.requested_media_file_id,
     selectedVersion,
   ]);
 
@@ -2201,20 +2278,35 @@ export function VideoPlayer({
     if (activeSubtitleIndex !== null) {
       subtitleSelectionWasManualOffRef.current = true;
       lastSubtitleIndexRef.current = activeSubtitleIndex;
+      pendingManualSubtitleIdentityRef.current = null;
       setActiveSubtitleIndex(null);
       onSubtitleChanged?.(null);
     } else {
       const restoredIndex = lastSubtitleIndexRef.current;
+      const restoredTrack =
+        restoredIndex !== null
+          ? (effectiveSubtitleTracks.find((track) => track.index === restoredIndex) ?? null)
+          : null;
+      pendingManualSubtitleIdentityRef.current = restoredTrack
+        ? subtitleTrackIdentityFromInfo(restoredTrack)
+        : null;
       subtitleSelectionWasManualOffRef.current = restoredIndex === null;
       setActiveSubtitleIndex(restoredIndex);
       onSubtitleChanged?.(restoredIndex);
     }
-  }, [activeSubtitleIndex, onSubtitleChanged]);
+  }, [activeSubtitleIndex, effectiveSubtitleTracks, onSubtitleChanged]);
 
   const handleSubtitleSelect = useCallback(
     (index: number | null, inventoryTrack?: SubtitleInventoryItemV3) => {
       subtitleSelectionWasManualRef.current = true;
       subtitleSelectionWasManualOffRef.current = index === null;
+      const selectedTrack =
+        index !== null && index !== LIVE_SUBTITLE_INDEX
+          ? (effectiveSubtitleTracks.find((track) => track.index === index) ?? null)
+          : null;
+      pendingManualSubtitleIdentityRef.current = selectedTrack
+        ? subtitleTrackIdentityFromInfo(selectedTrack)
+        : null;
       setActiveSubtitleIndex(index);
       // The in-progress live translation track is synthetic (a sentinel index
       // that exists only in memory); never persist it as the saved preference or
@@ -2222,7 +2314,7 @@ export function VideoPlayer({
       if (index === LIVE_SUBTITLE_INDEX) return;
       onSubtitleChanged?.(index, inventoryTrack);
     },
-    [onSubtitleChanged],
+    [effectiveSubtitleTracks, onSubtitleChanged],
   );
 
   useEffect(() => {
@@ -4089,6 +4181,7 @@ export function VideoPlayer({
     subtitleRefreshRevision,
     engineTransportRevision,
     replayRevision,
+    onSessionGone,
   );
 
   // Group cues by the vertical band their source cue declares (`line`), so a
@@ -4275,9 +4368,110 @@ export function VideoPlayer({
     // the reconnect's start was granted; asking for it now would re-request a
     // track the server may just have refused.
     if (subtitleHandoverPending) return;
+
+    // A plan that just landed can re-mint its combined ordinals, or adoption can
+    // preserve the verified rows while the plan publishes a different order.
+    // On this render the marker still names the outgoing plan's ordinal, so
+    // comparing it with the new inventory would resolve it to another language
+    // and dispatch that request before any reconciliation effect can run.
+    // Reconcile the plan's committed identity onto the displayed rows first.
+    // A marker the viewer moved to a track this plan has not acknowledged is a
+    // new selection, not stale state, so it is allowed straight through.
+    const pendingManualSubtitle = pendingManualSubtitleIdentityRef.current;
+    // The rows the viewer can pick from. Identity comparisons use them to tell
+    // a re-minted ordinal from a sibling track that looks the same.
+    const displayedSubtitleIdentities = effectiveSubtitleTracks.map(subtitleTrackIdentityFromInfo);
+    const planSubtitlesChanged = lastSubtitlePlanIdRef.current !== plan.plan_id;
+    const planAcknowledgesPendingSubtitle =
+      pendingManualSubtitle === null ||
+      subtitleSelectionAcknowledgesPending(
+        planSelectedSubtitleIdentity,
+        pendingManualSubtitle,
+        displayedSubtitleIdentities,
+      );
+    // Acknowledged manual pick, or the plan's own committed selection. With
+    // neither there is nothing to reconcile, and the auto-select path keeps
+    // owning the outbound request.
+    const subtitleIntent = pendingManualSubtitle ?? planSelectedSubtitleIdentity;
+    if (
+      planSubtitlesChanged &&
+      !replanning &&
+      planAcknowledgesPendingSubtitle &&
+      planHasSelectableSubtitles &&
+      subtitleIntent !== null
+    ) {
+      // Resolve the viewer's own asset, not the plan ordinal, so a re-minted
+      // track id cannot hand the marker another row.
+      const reconciledIndex = resolveAppliedSubtitleIndex(
+        displayedSubtitleIdentities,
+        subtitleIntent,
+      );
+      // No unambiguous row: keep holding outbound selection instead of letting
+      // the stale marker resolve against the replacement inventory.
+      if (reconciledIndex === null) return;
+      lastSubtitlePlanIdRef.current = plan.plan_id;
+      pendingManualSubtitleIdentityRef.current = null;
+      subtitleSelectionWasManualOffRef.current = false;
+      reconciledSubtitlePlanRef.current = {
+        planId: plan.plan_id,
+        index: reconciledIndex,
+      };
+      if (reconciledIndex !== activeSubtitleIndex) {
+        setActiveSubtitleIndex(reconciledIndex);
+        lastSubtitleIndexRef.current = reconciledIndex;
+      }
+      return;
+    }
+
+    const settledReconciliation = reconciledSubtitlePlanRef.current;
+    if (
+      settledReconciliation !== null &&
+      settledReconciliation.planId === plan.plan_id &&
+      settledReconciliation.index === activeSubtitleIndex
+    ) {
+      // The marker already sits on the row this plan was reconciled to. A
+      // different derived id does not make it a new pick.
+      requestedSubtitleTrackChangeRef.current = null;
+      return;
+    }
+
+    // A pending manual pick is the viewer's intent, even while the marker still
+    // names the outgoing plan's ordinal. Resolve it against the rows on screen
+    // first so no outbound request can carry whichever track inherited that
+    // ordinal. When the evidence cannot single out a row (two tracks that look
+    // alike), the marker still names the row the viewer clicked as long as that
+    // row is the same asset; otherwise the pick has lost its row and the
+    // request holds instead of guessing.
+    let outboundIdentity = activeSubtitleIdentity;
+    if (pendingManualSubtitle !== null) {
+      const resolvedIndex = resolveAppliedSubtitleIndex(
+        displayedSubtitleIdentities,
+        pendingManualSubtitle,
+      );
+      const markerRow =
+        displayedSubtitleIdentities.find((row) => row.index === pendingManualSubtitle.index) ??
+        null;
+      const pendingIndex =
+        resolvedIndex ??
+        (markerRow !== null && isSameSubtitleTrack(markerRow, pendingManualSubtitle)
+          ? markerRow.index
+          : null);
+      if (pendingIndex === null) return;
+      const pendingRow =
+        effectiveSubtitleTracks.find((track) => track.index === pendingIndex) ?? null;
+      outboundIdentity = pendingRow
+        ? subtitleTrackIdentityFromInfo(pendingRow)
+        : { index: pendingIndex };
+      if (pendingIndex !== activeSubtitleIndex) {
+        setActiveSubtitleIndex(pendingIndex);
+        lastSubtitleIndexRef.current = pendingIndex;
+      }
+    }
+
     const desiredServerIndex = pendingServerSubtitleSelection(
       planSelectedSubtitleIdentity,
-      activeSubtitleIdentity,
+      outboundIdentity,
+      displayedSubtitleIdentities,
     );
     if (desiredServerIndex === undefined) {
       requestedSubtitleTrackChangeRef.current = null;
@@ -4290,9 +4484,9 @@ export function VideoPlayer({
     // plan. A settled plan clears the ref above, so a later user action on the
     // same identity can still request once.
     const requestIdentity =
-      desiredServerIndex === null || activeSubtitleIdentity === null
+      desiredServerIndex === null || outboundIdentity === null
         ? "off"
-        : `track:${subtitleTrackIdentityKey(activeSubtitleIdentity)}`;
+        : `track:${subtitleTrackIdentityKey(outboundIdentity)}`;
     const requestKey = `${subtitleSourceGeneration}:${requestIdentity}`;
     if (requestedSubtitleTrackChangeRef.current === requestKey) return;
     requestedSubtitleTrackChangeRef.current = requestKey;
@@ -4306,14 +4500,23 @@ export function VideoPlayer({
       currentTimeRef.current,
       subtitleFetchAnchorRef.current,
     );
-    onSubtitleTrackChange?.(desiredServerIndex, position);
+    onSubtitleTrackChange?.(
+      desiredServerIndex,
+      position,
+      desiredServerIndex === null
+        ? null
+        : (effectiveSubtitleTracks.find((track) => track.index === desiredServerIndex) ?? null),
+    );
   }, [
     activeSubtitleIdentity,
     activeSubtitleIndex,
     activeSubtitleSourceKey,
+    effectiveSubtitleTracks,
     initialSubtitleError,
     onSubtitleTrackChange,
+    planHasSelectableSubtitles,
     planSelectedSubtitleIdentity,
+    replanning,
     subtitleSourceGeneration,
     plan.plan_id,
     plan.plan_attempt_key,
@@ -4339,13 +4542,117 @@ export function VideoPlayer({
     if (requestedSubtitleTrackChangeRef.current && replanError && !replanning) {
       subtitleSelectionWasManualRef.current = true;
       subtitleSelectionWasManualOffRef.current = false;
-      setActiveSubtitleIndex(plan.selected_tracks.subtitle?.index ?? null);
+      // The refused pick is no longer the viewer's intent. Leaving it pending
+      // would let the outbound effect re-resolve and re-send the rejected track
+      // on the next render, as soon as clearing the request guard below lets it.
+      pendingManualSubtitleIdentityRef.current = null;
+      // Roll back to the accepted asset on the rows the menu actually shows.
+      // The plan ordinal names a row in the plan's own inventory, which
+      // adoption may have reordered under the preserved verified list.
+      const rollbackIndex =
+        resolveAppliedSubtitleIndex(
+          effectiveSubtitleTracks.map(subtitleTrackIdentityFromInfo),
+          planSelectedSubtitleIdentity,
+        ) ??
+        plan.selected_tracks.subtitle?.index ??
+        null;
+      setActiveSubtitleIndex(rollbackIndex);
+      if (rollbackIndex !== null) lastSubtitleIndexRef.current = rollbackIndex;
       requestedSubtitleTrackChangeRef.current = null;
       toast.error(replanErrorTitle ?? "That subtitle track can't be used", {
         description: replanError,
       });
     }
-  }, [plan.selected_tracks.subtitle?.index, replanError, replanErrorTitle, replanning]);
+  }, [
+    effectiveSubtitleTracks,
+    plan.selected_tracks.subtitle?.index,
+    planSelectedSubtitleIdentity,
+    replanError,
+    replanErrorTitle,
+    replanning,
+  ]);
+
+  // A successful replan is authoritative for the marker. The inventory can be
+  // re-minted at new combined ordinals for the same asset, and the optimistic
+  // click index belongs to the outgoing plan. Reconcile the marker to the
+  // committed selection whenever a new plan with the same source lands; a
+  // source change is owned by the identity remap below.
+  const lastSubtitleResyncSourceRef = useRef(
+    `${plan.effective_media_file_id}|${plan.effective_virtual_uri ?? ""}|${plan.virtual_source_revision ?? ""}`,
+  );
+  useEffect(() => {
+    const sourceKey = `${plan.effective_media_file_id}|${plan.effective_virtual_uri ?? ""}|${plan.virtual_source_revision ?? ""}`;
+    if (lastSubtitleResyncSourceRef.current !== sourceKey) {
+      lastSubtitleResyncSourceRef.current = sourceKey;
+      return;
+    }
+    if (lastSubtitlePlanIdRef.current === plan.plan_id) return;
+    if (replanning || subtitleHandoverPending) return;
+    if (activeSubtitleIndex === LIVE_SUBTITLE_INDEX) return;
+    const currentRefusalKey = initialSubtitleError
+      ? `${sessionId}|${plan.plan_attempt_key}|${initialSubtitleError}`
+      : null;
+    if (initialSubtitleError && consumedInitialSubtitleErrorKeyRef.current !== currentRefusalKey) {
+      return;
+    }
+    const nextIndex = plan.selected_tracks.subtitle?.index;
+    // Only a committed track can re-mint an ordinal. A plan with no subtitle
+    // selection is not evidence the viewer wants subtitles off: the failure
+    // rollback above owns refusals, and the auto-select/version-switch effects
+    // own an empty committed selection.
+    if (nextIndex == null || nextIndex < 0) return;
+    // A committed ordinal names a row in the plan's own inventory. When that
+    // inventory has no selectable entry the menu is showing watch-detail
+    // fallback rows, whose indexes are menu positions: stamping the plan value
+    // would mark an unrelated (or placeholder) row.
+    if (!planHasSelectableSubtitles) return;
+    const pendingManualSubtitle = pendingManualSubtitleIdentityRef.current;
+    const displayedSubtitleIdentities = effectiveSubtitleTracks.map(subtitleTrackIdentityFromInfo);
+    if (
+      pendingManualSubtitle !== null &&
+      !subtitleSelectionAcknowledgesPending(
+        planSelectedSubtitleIdentity,
+        pendingManualSubtitle,
+        displayedSubtitleIdentities,
+      )
+    ) {
+      // The viewer's pick is newer than this plan; leave the optimistic marker
+      // for the outbound effect to send instead of pulling it back.
+      lastSubtitlePlanIdRef.current = plan.plan_id;
+      return;
+    }
+    // Resolve the committed asset against the rows actually displayed. The
+    // plan ordinal alone is wrong when adoption preserved a verified inventory
+    // in a different order, and an acknowledged pick's captured id can still
+    // carry the outgoing plan's ordinal.
+    const reconciledIndex = resolveAppliedSubtitleIndex(
+      displayedSubtitleIdentities,
+      pendingManualSubtitle ?? planSelectedSubtitleIdentity,
+    );
+    if (reconciledIndex === null) return;
+    lastSubtitlePlanIdRef.current = plan.plan_id;
+    pendingManualSubtitleIdentityRef.current = null;
+    if (reconciledIndex !== activeSubtitleIndex) {
+      setActiveSubtitleIndex(reconciledIndex);
+      lastSubtitleIndexRef.current = reconciledIndex;
+    }
+    subtitleSelectionWasManualOffRef.current = false;
+  }, [
+    activeSubtitleIndex,
+    effectiveSubtitleTracks,
+    initialSubtitleError,
+    plan.effective_media_file_id,
+    plan.effective_virtual_uri,
+    plan.plan_attempt_key,
+    plan.plan_id,
+    plan.selected_tracks.subtitle?.index,
+    plan.virtual_source_revision,
+    planHasSelectableSubtitles,
+    planSelectedSubtitleIdentity,
+    replanning,
+    sessionId,
+    subtitleHandoverPending,
+  ]);
 
   // When a start or version switch falls back to subtitles-off after a subtitle-bearing
   // start was refused, pin selection Off so manual remapping does not re-request the dropped subtitle.
@@ -4353,6 +4660,9 @@ export function VideoPlayer({
     if (initialSubtitleError) {
       consumedInitialSubtitleErrorKeyRef.current = `${sessionId}|${plan.plan_attempt_key}|${initialSubtitleError}`;
       subtitleRemapRef.current = null;
+      // The refused pick is gone; a pin to Off must not resurrect it as a
+      // pending intent for the next plan.
+      pendingManualSubtitleIdentityRef.current = null;
       subtitleSelectionWasManualRef.current = false;
       subtitleSelectionWasManualOffRef.current = true;
       setActiveSubtitleIndex(null);
@@ -4408,6 +4718,9 @@ export function VideoPlayer({
       return;
     }
     setActiveSubtitleSourceKey(currentSourceKey);
+    // The outgoing inventory's pending pick cannot be acknowledged by the new
+    // source's plan; its carried selection is reconciled from the plan below.
+    pendingManualSubtitleIdentityRef.current = null;
     if (!subtitleSelectionWasManualRef.current) {
       setActiveSubtitleIndex(plan.selected_tracks.subtitle?.index ?? null);
       lastSubtitleIndexRef.current = plan.selected_tracks.subtitle?.index ?? null;
@@ -4564,8 +4877,8 @@ export function VideoPlayer({
 
     const effectiveMode = normalizeSubtitleMode(subtitleMode);
     const audioLang =
-      audioTracks[activeAudioIndex]?.language?.trim() ||
-      resolveVersionAudioLanguage(effectiveVersion, activeAudioIndex);
+      (appliedAudioIndex != null ? audioTracks[appliedAudioIndex]?.language?.trim() : null) ||
+      resolveVersionAudioLanguage(effectiveVersion, appliedAudioIndex);
 
     const match = resolveSubtitleAutoSelect({
       mode: effectiveMode,
@@ -4593,7 +4906,7 @@ export function VideoPlayer({
     showForcedSubtitles,
     profileLanguage,
     audioTracks,
-    activeAudioIndex,
+    appliedAudioIndex,
     effectiveVersion,
     sessionId,
   ]);
@@ -5917,6 +6230,16 @@ export function VideoPlayer({
               </p>
             </div>
             <div className="flex gap-2">
+              {connectionStatus === "gone" && onRestartPlayback && (
+                <button
+                  onClick={onRestartPlayback}
+                  disabled={isLeaving}
+                  type="button"
+                  className="rounded bg-white px-4 py-2 text-sm font-medium text-black hover:bg-white/90"
+                >
+                  Restart playback
+                </button>
+              )}
               {connectionStatus === "lost" && onRetryConnection && (
                 <button
                   onClick={onRetryConnection}
@@ -6007,7 +6330,9 @@ export function VideoPlayer({
       {!isDetached &&
         activeSubtitleIndex !== null &&
         subtitleSyncNotice?.tone !== "progress" &&
-        (subtitleLoadState === "loading" || subtitleLoadState === "error") && (
+        (subtitleLoadState === "loading" ||
+          subtitleLoadState === "error" ||
+          subtitleLoadState === "unavailable") && (
           <div
             role="status"
             className="pointer-events-none absolute inset-x-0 top-20 z-40 flex justify-center"
@@ -6015,6 +6340,17 @@ export function VideoPlayer({
             <span className="flex items-center gap-3 rounded bg-black/75 px-3 py-2 text-sm text-white">
               {subtitleLoadState === "loading" ? (
                 "Loading subtitles…"
+              ) : subtitleLoadState === "unavailable" ? (
+                <>
+                  {"This subtitle is unavailable."}
+                  <button
+                    type="button"
+                    onClick={() => handleSubtitleSelect(null)}
+                    className="pointer-events-auto rounded bg-white/10 px-2 py-0.5 text-sm font-medium text-white transition-colors hover:bg-white/20 focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:outline-none"
+                  >
+                    Turn off
+                  </button>
+                </>
               ) : (
                 <>
                   {"Subtitles couldn't load."}
@@ -6183,12 +6519,13 @@ export function VideoPlayer({
           onSubtitleJobAccepted={handleSubtitleJobAccepted}
           subtitleSync={subtitleSync}
           audioTracks={audioTracks}
-          activeAudioIndex={activeAudioIndex}
+          activeAudioIndex={appliedAudioIndex}
           onAudioSelect={onAudioSelect}
           trackMenusLocked={replacing || replanning}
           audioInventoryProvisional={audioInventoryProvisional}
           inventoryPending={inventoryPending}
           inventoryFailed={inventoryFailed}
+          onRetryInventory={onRetryInventory}
           qualityOptions={qualityOptions}
           activeQualityId={activeQualityId}
           deliveredRecipe={plan.effective_recipe}

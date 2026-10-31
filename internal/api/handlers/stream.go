@@ -2381,6 +2381,13 @@ func (h *StreamHandler) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 	// the session's planned candidate at the same time.
 	file, trackIndex, err = h.resolveSubtitleSourceRequest(r.Context(), file, session, trackIndex, r.URL.Query())
 	if err != nil {
+		if errors.Is(err, errSubtitleSourceChangedAfterRotation) {
+			// The rotation already proved this ordinal cannot be carried. Fail
+			// closed before any source resolve or ffmpeg spawn; the client
+			// replans and re-selects from the rotated inventory.
+			writeSubtitleSourceChanged(w)
+			return
+		}
 		if errors.Is(err, errSubtitleIdentityInvalid) {
 			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		} else {
@@ -2741,10 +2748,31 @@ func (h *StreamHandler) acceptedSubtitleSourceFileID(ctx context.Context, raw st
 	if lookupErr != nil || row == nil {
 		return 0, err
 	}
-	if !isVirtualPlaybackFile(row) || !sameVirtualCandidate(candidateURI, row.FilePath) {
+	if !isVirtualPlaybackFile(row) {
 		return 0, err
 	}
-	return requested, nil
+	// The row the session captured its evidence from is citable even after it
+	// was renumbered, but an evidence row id is not a content fingerprint: an
+	// in-place enrichment re-probe keeps the id while rewriting the path to a
+	// different result. The URL was minted from that row's advertised
+	// inventory, so it is admitted only while the row still names the
+	// session's live bound candidate.
+	namesBoundCandidate := sameVirtualCandidate(candidateURI, row.FilePath)
+	if evidenceID := session.VirtualSubtitleEvidenceFileID; evidenceID > 0 && requested == evidenceID && namesBoundCandidate {
+		return requested, nil
+	}
+	if namesBoundCandidate {
+		return requested, nil
+	}
+	// A legacy session with only an evidence URI still admits a row that names
+	// its evidence candidate, but only while the evidence URI agrees with the
+	// live binding. A stale evidence anchor from a previous release must not
+	// widen the window after the session rotated.
+	evidenceURI := strings.TrimSpace(session.VirtualSubtitleEvidenceURI)
+	if evidenceURI != "" && sameVirtualCandidate(candidateURI, evidenceURI) && sameVirtualCandidate(evidenceURI, row.FilePath) {
+		return requested, nil
+	}
+	return 0, err
 }
 
 // SubtitleFontRequest identifies the session and frozen subtitle inventory
@@ -2802,6 +2830,10 @@ func (h *StreamHandler) SubtitleFonts(ctx context.Context, in SubtitleFontReques
 	}
 	file, trackIndex, err = h.resolveSubtitleSourceRequest(ctx, file, session, trackIndex, in.Query)
 	if err != nil {
+		if errors.Is(err, errSubtitleSourceChangedAfterRotation) {
+			return nil, false, apiError(http.StatusConflict, "subtitle_source_changed",
+				"The selected subtitle track changed on the media source; retry")
+		}
 		if errors.Is(err, errSubtitleIdentityInvalid) {
 			return nil, false, apiError(http.StatusBadRequest, "bad_request", err.Error())
 		}
@@ -3026,6 +3058,10 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 	// virtual candidate so the same release the plan probed is extracted.
 	file, trackIndex, err = h.resolveSubtitleSourceRequest(r.Context(), file, session, trackIndex, r.URL.Query())
 	if err != nil {
+		if errors.Is(err, errSubtitleSourceChangedAfterRotation) {
+			writeSubtitleSourceChanged(w)
+			return
+		}
 		if errors.Is(err, errSubtitleIdentityInvalid) {
 			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		} else {
@@ -4310,6 +4346,10 @@ func writeVirtualAudioSelectionInvalid(w http.ResponseWriter) {
 // retryable 4xx, never a 500 or an ambiguous partial stream.
 func writeSubtitleSourceChanged(w http.ResponseWriter) {
 	clearSubtitleCoverageHeaders(w.Header())
+	// A compliant client waits before replaying the same subtitle request; the
+	// rotation verdict is final for that ordinal, so an immediate retry can only
+	// re-earn it. Clients that ignore the header keep their existing cadence.
+	w.Header().Set("Retry-After", strconv.Itoa(subtitleSourceRetryAfterSeconds))
 	writeError(w, http.StatusConflict, "subtitle_source_changed",
 		"The selected subtitle track changed on the media source; retry")
 }

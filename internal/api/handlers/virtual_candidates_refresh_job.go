@@ -238,6 +238,10 @@ type IndexerReleaseSearcher interface {
 // indexer search whose failure degrades to an altmount-only result, then a
 // cleanup pass that prunes dead candidates the fresh listing no longer offers,
 // and finally a catalog invalidation so every client reloads the version list.
+// Between persist and prune, AltMount's authoritative failed verdicts are
+// stamped onto persisted rows (unknown and downloading releases are left
+// alone): a release the provider itself reports as failed stops being
+// offered without waiting for a playback failure to prove it.
 //
 // The refresh is list-only by design: it never opens a candidate's media URL
 // (no ffprobe, no anchor probe, no range fetch). Touching a ProviderURL can
@@ -262,6 +266,17 @@ type VirtualCandidatesRefreshExecutor struct {
 	// release, for the pending-candidate count. Nil skips the count. An
 	// unconfigured provider (known=false) never marks a release pending.
 	ReleaseDownloading func(releaseName string) (downloading bool, known bool)
+	// ReleaseFailed reports whether AltMount's authoritative snapshot records
+	// a release as failed. Nil means unknown: an empty name or an
+	// unconfigured provider never indicts a row.
+	ReleaseFailed func(releaseName string) (failed bool, known bool)
+	// MarkFailed stamps a durable failed verdict on a row AltMount declares
+	// failed. Nil disables stamping.
+	MarkFailed func(ctx context.Context, fileID int, expectedFilePath string, observedFailedAt *time.Time) error
+	// MarkFailedDetailed stamps a durable failed verdict and reports whether
+	// the write actually committed. When provided, it is preferred so fenced-out
+	// updates or delivery-grace refusals are not counted as stamped.
+	MarkFailedDetailed func(ctx context.Context, fileID int, expectedFilePath string, observedFailedAt *time.Time) (committed bool, err error)
 	// Store persists the indexer-only releases (step c).
 	Store *virtuallibrary.IndexerReleaseStore
 	// Searcher is the on-demand Prowlarr lookup (step b). Nil skips the search.
@@ -271,6 +286,78 @@ type VirtualCandidatesRefreshExecutor struct {
 	Logger *slog.Logger
 
 	searchBudget time.Duration
+}
+
+// reconcileAltMountVerdicts stamps a durable failed verdict on persisted rows
+// AltMount explicitly reports as failed, and only those: unknown releases are
+// left alone (a missing completed entry is not evidence — on-demand fetching
+// may still serve them), downloading releases are pending, and rows that
+// already carry a verdict are skipped. It runs on explicit user refresh after
+// the provider snapshot was forced fresh, so the verdicts reflect current
+// provider state rather than a cached or single-probe view. Stamped rows
+// disappear from version pickers via the existing failed-row removal.
+//
+// The AltMount verdict is keyed by release name, but every row carrying that
+// release needs its own stamp: a release commonly has several result=
+// variants, and stamping only the first leaves its siblings selectable. The
+// per-release lookup result is cached so the verdict is still computed once.
+func (e *VirtualCandidatesRefreshExecutor) reconcileAltMountVerdicts(ctx context.Context, contentID, episodeID string, sources []*models.MediaFile) (stamped int) {
+	if e == nil || e.ReleaseFailed == nil || e.MarkFailed == nil {
+		return 0
+	}
+	verdicts := make(map[string]bool)
+	for _, file := range sources {
+		if file == nil || file.ID <= 0 || file.FailedAt != nil {
+			continue
+		}
+		name := strings.TrimSpace(file.ProviderReleaseName)
+		if name == "" {
+			continue
+		}
+		key := strings.ToLower(name)
+		if _, decided := verdicts[key]; !decided {
+			verdicts[key] = e.altMountReleaseIndicts(name)
+		}
+		if !verdicts[key] {
+			continue
+		}
+		if e.MarkFailedDetailed != nil {
+			committed, err := e.MarkFailedDetailed(ctx, file.ID, file.FilePath, file.FailedAt)
+			if err != nil {
+				e.logger().WarnContext(ctx, "virtual candidates refresh: failed to stamp AltMount-failed release",
+					"component", "api", contentIDKey, contentID, episodeIDKey, episodeID, "file_id", file.ID, "error", err)
+				continue
+			}
+			if committed {
+				stamped++
+			}
+		} else {
+			if err := e.MarkFailed(ctx, file.ID, file.FilePath, file.FailedAt); err != nil {
+				e.logger().WarnContext(ctx, "virtual candidates refresh: failed to stamp AltMount-failed release",
+					"component", "api", contentIDKey, contentID, episodeIDKey, episodeID, "file_id", file.ID, "error", err)
+				continue
+			}
+			stamped++
+		}
+	}
+	if stamped > 0 {
+		e.logger().InfoContext(ctx, "virtual candidates refresh: stamped AltMount-failed releases as unplayable",
+			"component", "api", contentIDKey, contentID, episodeIDKey, episodeID, "candidates", stamped)
+	}
+	return stamped
+}
+
+// altMountReleaseIndicts reports whether AltMount's authoritative snapshot
+// indicts a release name. A release it is still fetching is pending, not
+// failed, and an unconfigured provider is unknown, so both leave it alone.
+func (e *VirtualCandidatesRefreshExecutor) altMountReleaseIndicts(name string) bool {
+	if e.ReleaseDownloading != nil {
+		if downloading, known := e.ReleaseDownloading(name); known && downloading {
+			return false
+		}
+	}
+	failed, known := e.ReleaseFailed(name)
+	return known && failed
 }
 
 // VirtualProviderStateRefresher forces a fresh virtual provider classification
@@ -337,6 +424,18 @@ func (e *VirtualCandidatesRefreshExecutor) Execute(ctx context.Context, req admi
 	}
 	result.IndexerReleases = len(persisted)
 	result.Releases = persisted
+
+	// Reconcile AltMount's authoritative verdicts with the persisted provider
+	// rows: releases AltMount reports as failed get a durable failed_at stamp
+	// so version pickers stop offering them. Unknown and downloading releases
+	// are untouched — only an explicit failed verdict indicts a row.
+	//
+	// Indexer-only releases persisted in step 3 are deliberately excluded.
+	// They are rows in the indexer-release table, not provider candidates: the
+	// failed_at verdict this function writes belongs to a MediaFile/result=
+	// pin, and those rows have neither. Their requestable state is separate,
+	// so an AltMount failure for another provider release does not touch them.
+	e.reconcileAltMountVerdicts(ctx, req.ContentID, req.EpisodeID, sources)
 
 	// Count freshly listed candidates AltMount is still fetching: these are
 	// the releases playback will wait for rather than skip. Best-effort and

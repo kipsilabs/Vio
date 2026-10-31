@@ -8,6 +8,8 @@ import {
   pendingServerSubtitleSelection,
   resolvePlayableSubtitles,
   subtitleArtifactIdentity,
+  subtitleIdentitiesNameSameAsset,
+  subtitleSelectionAcknowledgesPending,
   subtitleTrackIdentityFromInfo,
   subtitleTrackIdentityKey,
   type SubtitleTrackIdentity,
@@ -39,7 +41,7 @@ describe("resolvePlayableSubtitles", () => {
     expect(resolvePlayableSubtitles([sessionTrack], [detailTrack])).toEqual([sessionTrack]);
   });
 
-  it("drops watch-detail subtitle tracks that have no playable url", () => {
+  it("falls back to watch-detail evidence when the plan inventory is empty", () => {
     const detailTrack = makeSubtitle({
       index: 0,
       source: "embedded",
@@ -47,7 +49,16 @@ describe("resolvePlayableSubtitles", () => {
       url: "",
     });
 
-    expect(resolvePlayableSubtitles([], [detailTrack])).toEqual([]);
+    // The plan published no inventory at all; the watch detail is the only
+    // evidence, so the menu lists it and the bounded poll repairs the plan.
+    expect(resolvePlayableSubtitles([], [detailTrack])).toEqual([detailTrack]);
+  });
+
+  it("keeps filtering unplayable fallback rows when the plan published a placeholder", () => {
+    const placeholder = makeSubtitle({ index: 0, url: "" });
+    const detailTrack = makeSubtitle({ index: 1, source: "embedded", url: "" });
+
+    expect(resolvePlayableSubtitles([placeholder], [detailTrack])).toEqual([]);
   });
 
   it("keeps burn-in-only session tracks even though they have no url", () => {
@@ -204,6 +215,165 @@ describe("subtitle track identity", () => {
       streamIndex: 2,
     });
     expect(isSameSubtitleTrack(planSelected, active)).toBe(true);
+  });
+
+  it("keeps the ordinal of a same-language sibling the inventory still lists", () => {
+    const first = identity({
+      index: 0,
+      trackId: "file:7:subtitle:0",
+      language: "eng",
+      codec: "pgs",
+      burnInOnly: true,
+      source: "embedded",
+    });
+    const second = identity({
+      index: 1,
+      trackId: "file:7:subtitle:1",
+      language: "eng",
+      codec: "pgs",
+      burnInOnly: true,
+      source: "embedded",
+    });
+    // Both ids are rows of one inventory, so the ordinal is the asset's and
+    // not the plan's: two burn-in tracks, not one track re-minted.
+    expect(subtitleIdentitiesNameSameAsset(first, second, [first, second])).toBe(false);
+    // Only the ordinal moved across a replacement inventory that no longer
+    // lists the committed ordinal: the descriptor fallback still settles it.
+    expect(subtitleIdentitiesNameSameAsset(first, second, [second])).toBe(true);
+  });
+
+  it("settles a pick the plan acknowledged by re-minting another language slot", () => {
+    const committedFrench = identity({
+      index: 0,
+      trackId: "file:7:subtitle:0",
+      language: "fra",
+      codec: "subrip",
+      source: "embedded",
+    });
+    const pendingFrench = identity({
+      index: 1,
+      trackId: "file:7:subtitle:1",
+      language: "fra",
+      codec: "subrip",
+      source: "embedded",
+    });
+    const shiftedEnglish = identity({
+      index: 1,
+      trackId: "file:7:subtitle:1",
+      language: "eng",
+      codec: "subrip",
+      source: "embedded",
+    });
+    // The inventory's `:1` is English, so the captured French id no longer
+    // names a row of its own: this is the re-mint, not a sibling.
+    expect(
+      subtitleSelectionAcknowledgesPending(committedFrench, pendingFrench, [
+        committedFrench,
+        shiftedEnglish,
+      ]),
+    ).toBe(true);
+  });
+});
+
+describe("subtitleSelectionAcknowledgesPending", () => {
+  function identity(overrides: Partial<SubtitleTrackIdentity> = {}): SubtitleTrackIdentity {
+    return { index: 0, ...overrides };
+  }
+
+  it("acknowledges a manual pick after the plan re-mints its combined ordinal", () => {
+    // Viewer picked French at slot 1; the plan committed the same asset at 0.
+    expect(
+      subtitleSelectionAcknowledgesPending(
+        identity({
+          index: 0,
+          trackId: "file:7:subtitle:0",
+          language: "fra",
+          codec: "subrip",
+          source: "embedded",
+        }),
+        identity({
+          index: 1,
+          trackId: "file:7:subtitle:1",
+          language: "fra",
+          codec: "subrip",
+          source: "embedded",
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  it("does not acknowledge a different-language row that inherited the clicked ordinal", () => {
+    expect(
+      subtitleSelectionAcknowledgesPending(
+        identity({
+          index: 1,
+          trackId: "file:7:subtitle:1",
+          language: "eng",
+          codec: "subrip",
+          source: "embedded",
+        }),
+        identity({
+          index: 1,
+          trackId: "file:7:subtitle:1",
+          language: "fra",
+          codec: "subrip",
+          source: "embedded",
+        }),
+      ),
+    ).toBe(false);
+  });
+
+  it("does not acknowledge a sibling asset in the same id family", () => {
+    expect(
+      subtitleSelectionAcknowledgesPending(
+        identity({
+          index: 0,
+          trackId: "file:7:subtitle:0",
+          language: "eng",
+          codec: "subrip",
+          source: "embedded",
+          streamIndex: 0,
+        }),
+        identity({
+          index: 1,
+          trackId: "file:7:subtitle:1",
+          language: "eng",
+          codec: "subrip",
+          source: "embedded",
+          streamIndex: 1,
+        }),
+      ),
+    ).toBe(false);
+  });
+
+  it("acknowledges a re-minted sidecar by its artifact identity", () => {
+    expect(
+      subtitleSelectionAcknowledgesPending(
+        identity({
+          index: 0,
+          language: "fra",
+          codec: "subrip",
+          source: "external",
+          artifactId: "fr-key",
+        }),
+        identity({
+          index: 2,
+          language: "fra",
+          codec: "subrip",
+          source: "external",
+          artifactId: "fr-key",
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  it("does not acknowledge without a committed plan selection", () => {
+    expect(
+      subtitleSelectionAcknowledgesPending(
+        null,
+        identity({ index: 1, trackId: "file:7:subtitle:1", language: "fra" }),
+      ),
+    ).toBe(false);
   });
 });
 
@@ -365,6 +535,79 @@ describe("pendingServerSubtitleSelection", () => {
         identity({ index: 2, language: "en", codec: "srt", forced: false }),
       ),
     ).toBeUndefined();
+  });
+
+  it("does not settle an equal ordinal-derived id that names another language", () => {
+    // The menu kept verified rows (English at 0, French at 1) while the
+    // replacement plan re-minted the same ids in the other order and selects
+    // English at 1. The clicked French row carries `:1` too; the id alone
+    // would read the pick as already playing and send nothing.
+    const planSelectedEnglish = identity({
+      index: 1,
+      trackId: "file:7:subtitle:1",
+      language: "eng",
+      codec: "subrip",
+      source: "embedded",
+    });
+    const displayedFrench = identity({
+      index: 1,
+      trackId: "file:7:subtitle:1",
+      language: "fra",
+      codec: "subrip",
+      source: "embedded",
+    });
+    expect(isSameSubtitleTrack(planSelectedEnglish, displayedFrench)).toBe(true);
+    expect(pendingServerSubtitleSelection(planSelectedEnglish, displayedFrench)).toBe(1);
+  });
+
+  it("requests the other burn-in track when two same-language rows share every descriptor", () => {
+    // Two embedded bitmap tracks with the same language, codec and flags: the
+    // trailing ordinal is the only difference, and both are real tracks of the
+    // inventory the menu lists.
+    const first = identity({
+      index: 0,
+      trackId: "file:7:subtitle:0",
+      language: "eng",
+      codec: "pgs",
+      burnInOnly: true,
+      source: "embedded",
+    });
+    const second = identity({
+      index: 1,
+      trackId: "file:7:subtitle:1",
+      language: "eng",
+      codec: "pgs",
+      burnInOnly: true,
+      source: "embedded",
+    });
+    const inventory = [first, second];
+    // Picking the second while the plan burns in the first must reach the
+    // server; reading the two ids as one asset would drop the request and keep
+    // the first track burning.
+    expect(pendingServerSubtitleSelection(first, second, inventory)).toBe(1);
+    expect(pendingServerSubtitleSelection(second, first, inventory)).toBe(0);
+  });
+
+  it("settles a burn-in row the inventory re-minted onto another ordinal", () => {
+    const committed = identity({
+      index: 2,
+      trackId: "file:7:subtitle:2",
+      language: "eng",
+      codec: "pgs",
+      burnInOnly: true,
+      source: "embedded",
+    });
+    const reminted = identity({
+      index: 3,
+      trackId: "file:7:subtitle:3",
+      language: "eng",
+      codec: "pgs",
+      burnInOnly: true,
+      source: "embedded",
+    });
+    // The plan's ordinal is gone from the replacement inventory, so the row is
+    // the same asset at a new ordinal and no request is needed.
+    expect(pendingServerSubtitleSelection(committed, reminted, [reminted])).toBeUndefined();
   });
 
   it("offers the selection when the server resolved it to off (caller guard dedupes)", () => {

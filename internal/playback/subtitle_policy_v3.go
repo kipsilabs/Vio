@@ -1,6 +1,8 @@
 package playback
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"slices"
@@ -208,6 +210,125 @@ func subtitleEntryAtCombinedIndexV3(file *models.MediaFile, index int, additiona
 	return SubtitleInventoryEntryV3{}, false
 }
 
+// SubtitleEvaluationKeyV3 names one subtitle evaluation: the selection a request
+// carries and the effective inventory that selection was placed against. A replan
+// that reproduces both is re-evaluating an outcome its predecessor plan already
+// published, so it can reuse that outcome instead of re-running the policy.
+type SubtitleEvaluationKeyV3 struct {
+	// SelectionOrdinal is the combined ordinal the request selected, or -1 when
+	// it selects nothing (subtitles off or no subtitle identity).
+	SelectionOrdinal int
+	// EffectiveFileID is the row whose inventory the ordinal was placed against.
+	// Including it keeps a candidate rotation re-evaluating even when the sibling
+	// publishes an identical list.
+	EffectiveFileID int
+	// InventoryDigest is the canonical digest of that effective inventory,
+	// including the downloaded tail.
+	InventoryDigest string
+}
+
+// SubtitleEvaluationV3 is a predecessor plan's published subtitle outcome for one
+// key. Only the degraded (out-of-range) outcome is carried: it is the one whose
+// warning is logged, so replaying it on an unchanged replan would duplicate a
+// warning the first plan already recorded. A successful selection resolves
+// silently anyway and needs no reuse.
+type SubtitleEvaluationV3 struct {
+	Key      SubtitleEvaluationKeyV3
+	Disabled bool
+}
+
+// PreviousSubtitleEvaluationV3 builds the reuse record of a plan's degraded
+// subtitle outcome for the request that produced it. It returns nil when the plan
+// published a subtitle, selected subtitles off deliberately, or carries no
+// subtitle-unavailable warning: none of those is the out-of-range disable this
+// reuse exists to suppress.
+func PreviousSubtitleEvaluationV3(request StartRequestV3, plan PlanV3) *SubtitleEvaluationV3 {
+	if plan.Subtitle.Mode != SubtitleOffV3 ||
+		!slices.ContainsFunc(plan.DegradationWarnings, func(warning DegradationWarningV3) bool {
+			return warning.Code == DegradationWarningSubtitleTrackUnavailableV3
+		}) {
+		return nil
+	}
+	ordinal := subtitleEvaluationSelectionOrdinalV3(request)
+	if ordinal < 0 {
+		return nil
+	}
+	return &SubtitleEvaluationV3{
+		Key: SubtitleEvaluationKeyV3{
+			SelectionOrdinal: ordinal,
+			EffectiveFileID:  plan.EffectiveMediaFileID,
+			InventoryDigest:  SubtitleInventoryDigestV3(plan.Subtitle.Inventory),
+		},
+		Disabled: true,
+	}
+}
+
+// subtitleEvaluationSelectionOrdinalV3 is the combined ordinal a request
+// selects, normalized from either identity form so an index-only selection and
+// the equivalent track_id compare equal. -1 means no selection.
+func subtitleEvaluationSelectionOrdinalV3(request StartRequestV3) int {
+	if request.SubtitleTrackIndex != nil {
+		if *request.SubtitleTrackIndex < 0 {
+			return -1
+		}
+		return *request.SubtitleTrackIndex
+	}
+	if request.SubtitleTrackID == "" {
+		return -1
+	}
+	_, kind, ordinal, ok := ParseTrackIDV3(request.SubtitleTrackID)
+	if !ok || kind != "subtitle" || ordinal < 0 {
+		return -1
+	}
+	return ordinal
+}
+
+// SubtitleInventoryDigestV3 is a deterministic digest of the selectable subtitle
+// inventory. It covers every field a selection or a carry can key on, plus the
+// downloaded row identity, and deliberately excludes session URLs: those change
+// with the session, not with the inventory, so including them would defeat the
+// comparison.
+func SubtitleInventoryDigestV3(items []SubtitleInventoryItemV3) string {
+	digest := sha256.New()
+	for _, item := range items {
+		// Each entry is self-delimiting: the trailing marker separates it from a
+		// following entry, and every field is fixed for a given shape.
+		_, _ = fmt.Fprintf(digest, "%d\x00%s\x00%s\x00%s\x00%s\x00%t\x00%t\x00%t\x00%s\x00%d\x00%s\x00\x01",
+			item.CombinedIndex, item.Source, item.Codec, item.Language, item.Label,
+			item.Forced, item.Default, item.HearingImpaired, item.Delivery,
+			item.downloadedSubtitleID, item.SyncKey)
+	}
+	return hex.EncodeToString(digest.Sum(nil))
+}
+
+// reusedSubtitleDegradeV3 reports whether the predecessor plan's out-of-range
+// disable already covers this request, and returns the outcome to publish
+// silently if so. It requires the identical selection against an identical
+// effective inventory on the identical effective row: a changed pick, a changed
+// inventory, or a candidate rotation re-evaluates through the normal policy.
+func reusedSubtitleDegradeV3(input PlannerInputV3, file *models.MediaFile, inventory []SubtitleInventoryItemV3) (SubtitlePolicyResultV3, bool) {
+	previous := input.PreviousSubtitleEvaluation
+	if previous == nil || !previous.Disabled || file == nil {
+		return SubtitlePolicyResultV3{}, false
+	}
+	if previous.Key.SelectionOrdinal < 0 ||
+		subtitleEvaluationSelectionOrdinalV3(input.Request) != previous.Key.SelectionOrdinal {
+		return SubtitlePolicyResultV3{}, false
+	}
+	if previous.Key.EffectiveFileID != file.ID ||
+		previous.Key.InventoryDigest != SubtitleInventoryDigestV3(inventory) {
+		return SubtitlePolicyResultV3{}, false
+	}
+	return SubtitlePolicyResultV3{
+		Decision:       SubtitleDecisionV3{Mode: SubtitleOffV3},
+		SelectedIndex:  -1,
+		TransportIndex: -1,
+		Degraded:       true,
+	}, true
+}
+
+// isTextSubtitleV3 reports whether a codec delivers as text the client can
+// render (or the server can convert) without burn-in.
 func isTextSubtitleV3(codec string) bool {
 	switch normalizeCodecV3(codec) {
 	case "srt", "subrip", "vtt", "webvtt", "ass", "ssa", "mov_text", "tx3g",

@@ -139,32 +139,36 @@ it("retries a replica-local mint 404 with backoff instead of treating it as gone
   expect(result.current.connectionState).toBe("disconnected");
 });
 
-it("degrades quietly after the bounded mint 404s and re-arms on a recovery revision", async () => {
+it("degrades the control lane after the bounded mint 404s without reporting the session gone", async () => {
   vi.useFakeTimers();
   mocks.mint.mockRejectedValue(notFoundProblem());
   const { result, rerender } = renderHook(
     ({ revision }: { revision: number }) =>
-      usePlaybackRealtime({ sessionId: "session", onCommand: vi.fn(), recoveryRevision: revision }),
+      usePlaybackRealtime({
+        sessionId: "session",
+        onCommand: vi.fn(),
+        recoveryRevision: revision,
+      }),
     { wrapper, initialProps: { revision: 0 } },
   );
 
-  // Bounded retries, then the lane stops: it never tears the player down and
-  // reports nothing, because a local miss cannot establish that playback ended.
+  // A short backoff ladder, then the lane degrades. A 404 is replica-local, so
+  // it must never claim the session ended or stop the stream.
   await act(async () => {
-    await vi.advanceTimersByTimeAsync(60_000);
+    await vi.advanceTimersByTimeAsync(1_600);
   });
   expect(mocks.mint).toHaveBeenCalledTimes(SESSION_GONE_MINT_RETRY_LIMIT);
   expect(result.current.connectionState).toBe("disconnected");
 
-  // Degraded quietly: no further mint and no reconnect timer left armed.
+  // No further mint and no reconnect timer left armed.
   await act(async () => {
     await vi.advanceTimersByTimeAsync(60_000);
   });
   expect(mocks.mint).toHaveBeenCalledTimes(SESSION_GONE_MINT_RETRY_LIMIT);
   expect(vi.getTimerCount()).toBe(0);
 
-  // An adopted plan (a recovery under the same session id) re-arms the lane; a
-  // second loss degrades it again.
+  // An adopted plan (a recovery under the same session id) re-arms the lane,
+  // and a second loss degrades it again without ending the session.
   rerender({ revision: 1 });
   await act(async () => {
     await vi.advanceTimersByTimeAsync(0);
