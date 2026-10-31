@@ -241,6 +241,15 @@ func (m *mapper) itemFromDetail(item upstreamItemDetail, isFavorite bool, progre
 // parameter — matching Jellyfin's opt-in semantics for People, MediaSources,
 // MediaStreams, and Chapters.
 func (m *mapper) itemFromDetailWithFields(item upstreamItemDetail, isFavorite bool, progress *upstreamProgress, requestedFields map[string]bool) baseItemDTO {
+	return m.itemFromDetailWithFieldsSelected(item, 0, isFavorite, progress, requestedFields)
+}
+
+// itemFromDetailWithFieldsSelected is itemFromDetailWithFields with an explicit
+// active version. selectedFileID is the version the request is built around
+// (the media-source id in the item position, when a client uses one); it is
+// protected from the durable-failed filter so a dead verdict cannot remove the
+// row the client is already on.
+func (m *mapper) itemFromDetailWithFieldsSelected(item upstreamItemDetail, selectedFileID int, isFavorite bool, progress *upstreamProgress, requestedFields map[string]bool) baseItemDTO {
 	allFields := requestedFields == nil
 	wantField := func(name string) bool {
 		return allFields || requestedFields[name]
@@ -287,37 +296,7 @@ func (m *mapper) itemFromDetailWithFields(item upstreamItemDetail, isFavorite bo
 	}, isFavorite, progress, allDetailFields)
 
 	if wantField("people") {
-		dto.People = make([]personDTO, 0, len(item.Cast)+len(item.Crew))
-		for _, cast := range item.Cast {
-			personID, _ := strconv.ParseInt(cast.PersonID, 10, 64)
-			routeID := m.codec.EncodeIntID(EncodedIDPerson, personID)
-			var primaryTag string
-			if cast.PhotoURL != "" {
-				primaryTag = personPrimaryImageTag(m.imageTagSigner, routeID, cast.PhotoPath, cast.PhotoThumbhash)
-			}
-			dto.People = append(dto.People, personDTO{
-				ID:              routeID,
-				Name:            cast.Name,
-				Role:            cast.Character,
-				Type:            "Actor",
-				PrimaryImageTag: primaryTag,
-			})
-		}
-		for _, crew := range item.Crew {
-			personID, _ := strconv.ParseInt(crew.PersonID, 10, 64)
-			routeID := m.codec.EncodeIntID(EncodedIDPerson, personID)
-			var primaryTag string
-			if crew.PhotoURL != "" {
-				primaryTag = personPrimaryImageTag(m.imageTagSigner, routeID, crew.PhotoPath, crew.PhotoThumbhash)
-			}
-			dto.People = append(dto.People, personDTO{
-				ID:              routeID,
-				Name:            crew.Name,
-				Role:            crew.Job,
-				Type:            crew.Job,
-				PrimaryImageTag: primaryTag,
-			})
-		}
+		m.applyDetailPeople(&dto, item)
 	}
 	// Remote provider trailers and local extras counts. The itemFromList base
 	// stamped RemoteTrailers as an empty slice; override with real data here
@@ -348,71 +327,116 @@ func (m *mapper) itemFromDetailWithFields(item upstreamItemDetail, isFavorite bo
 	} else if item.Year > 0 {
 		dto.PremiereDate = syntheticPremiereDate(item.Year)
 	}
-	if isPlayableItemType(item.Type) && len(item.Versions) > 0 {
-		dto.MediaSourceCount = len(item.Versions)
-		firstVersion := item.Versions[0]
-		if firstVersion.Duration > 0 {
-			dto.RunTimeTicks = secondsToTicks(float64(firstVersion.Duration))
-		}
-		dto.DateCreated = formatCompatTime(firstVersion.AddedAt)
-		// CanDownload is load-bearing for Infuse: it refuses Direct Play
-		// (Static=true streaming) of items it believes it cannot download.
-		// The flag is backed by the /Items/{id}/Download route (streams.go).
-		dto.CanDownload = true
-		dto.HasSubtitles = versionsHaveSubtitles(item.Versions)
-		dto.SupportsSync = false
-		dto.Container = strings.ToLower(firstVersion.Container)
-		applyPlayableLocation(&dto, true)
-		dto.Path = compatMediaPath(firstVersion)
-		if len(firstVersion.VideoTracks) > 0 {
-			dto.Width = firstVersion.VideoTracks[0].Width
-			dto.Height = firstVersion.VideoTracks[0].Height
-			dto.IsHD = isHDVideo(firstVersion.VideoTracks[0])
-		}
-		routeItemID := m.codec.EncodeStringID(EncodedIDItem, item.ContentID)
-		// Multi-version detail pages need the version list even when the client
-		// did not spell out Fields=MediaSources. Some Jellyfin clients (Plezy
-		// among them) render versions from the item DTO rather than issuing a
-		// separate PlaybackInfo call, so omitting the field leaves their version
-		// menu empty while single-version clients see no difference.
-		wantMediaSources := wantField("mediasources") || len(item.Versions) > 1
-		wantMediaStreams := wantField("mediastreams")
-		if wantMediaSources {
-			dto.MediaSources = make([]mediaSourceDTO, 0, len(item.Versions))
-		}
-		if wantMediaSources || wantMediaStreams {
-			for _, version := range item.Versions {
-				sourceID := m.codec.EncodeIntID(EncodedIDMediaSource, int64(version.FileID))
-				streams := buildMediaStreams(routeItemID, sourceID, version)
-				if wantMediaStreams {
-					dto.MediaStreams = append(dto.MediaStreams, streams...)
-				}
-				if wantMediaSources {
-					dto.MediaSources = append(dto.MediaSources, detailMediaSourceDTO(sourceID, version, streams))
-				}
-			}
-		}
-		if wantField("chapters") {
-			dto.Chapters = compatChapters(firstVersion.Chapters, firstVersion.AddedAt)
-		}
-		if wantField("trickplay") {
-			dto.Trickplay = m.compatTrickplay(item.Versions)
-		}
-	} else if isPlayableItemType(item.Type) {
-		// Provider-metadata-only (unaired/missing) item: version data is
-		// authoritative here, so override the FileSystem default set by
-		// itemFromList with Jellyfin's Virtual contract.
-		applyPlayableLocation(&dto, false)
-	}
+	versions := compatLiveVersions(item.Versions, selectedFileID)
+	m.applyDetailVersions(&dto, item, versions, wantField)
 	slog.Info("jellycompat item detail mapped",
 		"content_id", item.ContentID,
 		"type", item.Type,
 		"is_folder", dto.IsFolder,
 		"media_type", dto.MediaType,
-		"versions", len(item.Versions),
+		"versions", len(versions),
 		"media_sources", len(dto.MediaSources),
 	)
 	return dto
+}
+
+// applyDetailPeople fills the detail DTO's People list from the item's cast and
+// crew, encoding each person id and seeding their primary image tag.
+func (m *mapper) applyDetailPeople(dto *baseItemDTO, item upstreamItemDetail) {
+	dto.People = make([]personDTO, 0, len(item.Cast)+len(item.Crew))
+	for _, cast := range item.Cast {
+		personID, _ := strconv.ParseInt(cast.PersonID, 10, 64)
+		routeID := m.codec.EncodeIntID(EncodedIDPerson, personID)
+		var primaryTag string
+		if cast.PhotoURL != "" {
+			primaryTag = personPrimaryImageTag(m.imageTagSigner, routeID, cast.PhotoPath, cast.PhotoThumbhash)
+		}
+		dto.People = append(dto.People, personDTO{
+			ID:              routeID,
+			Name:            cast.Name,
+			Role:            cast.Character,
+			Type:            "Actor",
+			PrimaryImageTag: primaryTag,
+		})
+	}
+	for _, crew := range item.Crew {
+		personID, _ := strconv.ParseInt(crew.PersonID, 10, 64)
+		routeID := m.codec.EncodeIntID(EncodedIDPerson, personID)
+		var primaryTag string
+		if crew.PhotoURL != "" {
+			primaryTag = personPrimaryImageTag(m.imageTagSigner, routeID, crew.PhotoPath, crew.PhotoThumbhash)
+		}
+		dto.People = append(dto.People, personDTO{
+			ID:              routeID,
+			Name:            crew.Name,
+			Role:            crew.Job,
+			Type:            crew.Job,
+			PrimaryImageTag: primaryTag,
+		})
+	}
+}
+
+// applyDetailVersions fills the version-derived detail fields. A playable item
+// with no live versions is provider-metadata-only (unaired/missing), so it takes
+// Jellyfin's Virtual contract instead of the FileSystem default from
+// itemFromList.
+func (m *mapper) applyDetailVersions(dto *baseItemDTO, item upstreamItemDetail, versions []catalog.FileVersion, wantField func(string) bool) {
+	if !isPlayableItemType(item.Type) {
+		return
+	}
+	if len(versions) == 0 {
+		applyPlayableLocation(dto, false)
+		return
+	}
+	dto.MediaSourceCount = len(versions)
+	firstVersion := versions[0]
+	if firstVersion.Duration > 0 {
+		dto.RunTimeTicks = secondsToTicks(float64(firstVersion.Duration))
+	}
+	dto.DateCreated = formatCompatTime(firstVersion.AddedAt)
+	// CanDownload is load-bearing for Infuse: it refuses Direct Play
+	// (Static=true streaming) of items it believes it cannot download.
+	// The flag is backed by the /Items/{id}/Download route (streams.go).
+	dto.CanDownload = true
+	dto.HasSubtitles = versionsHaveSubtitles(versions)
+	dto.SupportsSync = false
+	dto.Container = strings.ToLower(firstVersion.Container)
+	applyPlayableLocation(dto, true)
+	dto.Path = compatMediaPath(firstVersion)
+	if len(firstVersion.VideoTracks) > 0 {
+		dto.Width = firstVersion.VideoTracks[0].Width
+		dto.Height = firstVersion.VideoTracks[0].Height
+		dto.IsHD = isHDVideo(firstVersion.VideoTracks[0])
+	}
+	routeItemID := m.codec.EncodeStringID(EncodedIDItem, item.ContentID)
+	// Multi-version detail pages need the version list even when the client did
+	// not spell out Fields=MediaSources. Some Jellyfin clients (Plezy among them)
+	// render versions from the item DTO rather than issuing a separate
+	// PlaybackInfo call, so omitting the field leaves their version menu empty
+	// while single-version clients see no difference.
+	wantMediaSources := wantField("mediasources") || len(versions) > 1
+	wantMediaStreams := wantField("mediastreams")
+	if wantMediaSources {
+		dto.MediaSources = make([]mediaSourceDTO, 0, len(versions))
+	}
+	if wantMediaSources || wantMediaStreams {
+		for _, version := range versions {
+			sourceID := m.codec.EncodeIntID(EncodedIDMediaSource, int64(version.FileID))
+			streams := buildMediaStreams(routeItemID, sourceID, version)
+			if wantMediaStreams {
+				dto.MediaStreams = append(dto.MediaStreams, streams...)
+			}
+			if wantMediaSources {
+				dto.MediaSources = append(dto.MediaSources, detailMediaSourceDTO(sourceID, version, streams))
+			}
+		}
+	}
+	if wantField("chapters") {
+		dto.Chapters = compatChapters(firstVersion.Chapters, firstVersion.AddedAt)
+	}
+	if wantField("trickplay") {
+		dto.Trickplay = m.compatTrickplay(versions)
+	}
 }
 
 func (m *mapper) seasonFromUpstream(season upstreamSeason, seriesID string, isFavorite bool) baseItemDTO {
