@@ -59,7 +59,6 @@ const (
 	subtitleUnavailableReasonV3   = "subtitle_artifact_unavailable"
 	subtitleTrackKindV3           = "subtitle"
 	transcodeStartFailedReasonV3  = "transcode_start_failed"
-	remuxSeekPositionFailedV3     = "Failed to resolve remux seek position."
 	capabilityUnavailableReasonV3 = "transcode_node_capability_unavailable"
 	// copySeekProbeRetryMargin is the slack a replan keeps beyond a second full
 	// copy-video seek-anchor probe before attempting it. Process startup, the
@@ -163,6 +162,10 @@ const (
 	playbackLogValueV3                  = "playback"
 	playbackRemoteOutcomeFailedV3       = "failed"
 	routeCapabilityUnavailableReasonV3  = "route_capability_unavailable"
+	remuxSeekResolveFailedMessageV3     = "Failed to resolve remux seek position."
+	operationLogKeyV3                   = "operation"
+	sessionIDLogKeyV3                   = "session_id"
+	replanOutcomeErrorV3                = "error"
 )
 
 // v3NodeCapabilityRefreshInterval is both how often the background refresher
@@ -546,9 +549,12 @@ type transportErrorV3 struct {
 	// seekFailure marks a retryable failure to resolve the seek position itself
 	// (the copy-video anchor probe or its relay lookup) rather than a verdict
 	// about the release. A start must surface it to the client as a retryable
-	// seek error instead of rotating to another version, and a replan must not
-	// tear down the serving transport over it: the bytes may be fine and only
-	// the probe was slow or the relay answered 5xx.
+	// seek error instead of rotating to another version. A seek-failure replan
+	// reaches the same verdict through the replacement path: a failed
+	// replacement rolls back to the plan already serving, so the live transport
+	// is left untouched and the bytes may still be fine — only the probe was
+	// slow or the relay answered 5xx. This flag is read only by the start path;
+	// it never drives replan teardown.
 	seekFailure bool
 }
 
@@ -3424,107 +3430,38 @@ func virtualStartVersionFallbackEligibleV3(req playback.StartRequestV3) bool {
 		req.FileSelection != playback.FileSelectionExplicitV3
 }
 
-// retainedVirtualStartSourceV3 reuses the candidate binding and probed
-// inventory a still-live session retained for this exact release. A start that
-// re-enters after a transport failure would otherwise re-list the provider and
-// re-probe the candidate before planning the same bytes; when the prior session
-// already holds verified evidence for the requested row, serving that evidence
-// skips the discovery/listing/probe round-trip without changing which release
-// plays. The reuse is deliberately narrow:
-//
-//   - it only fires when the client has not asked for a forced relink or a
-//     specific offered candidate, where a fresh answer is the point;
-//   - the prior session must be the unique client/profile match for this row and
-//     its binding must name a concrete candidate on the same release;
-//   - the evidence must belong to the bound row, and the row must still be
-//     accessible and not marked failed;
-//   - a requested row that already names a complete, probed candidate keeps the
-//     existing fast path, so a healthy start is not diverted.
-//
-// The returned source has no DeferredProbe: the inventory is already proven, and
-// a fresh probe is not a prerequisite for planning a retained generation.
-func (h *PlaybackHandler) retainedVirtualStartSourceV3(
+// retainedVirtualStartBindingV3 finds the live session whose retained evidence
+// may back this start and validates that its binding still names this exact
+// release. It is the guard half of retainedVirtualStartSourceV3: no forced
+// relink, a unique client/profile session for the row, a concrete candidate on
+// the same release, and evidence belonging to the bound row. The caller then
+// resolves that row and builds the planning copy.
+func (h *PlaybackHandler) retainedVirtualStartBindingV3(
 	r *http.Request,
 	userID int,
 	profileID string,
 	requested *models.MediaFile,
 	req playback.StartRequestV3,
-) (resolvedVirtualPlaybackSource, bool) {
-	if !h.retainedVirtualStartAllowedV3(r, requested, req) {
-		return resolvedVirtualPlaybackSource{}, false
-	}
-	previous, candidateURI, ownerID, ok := h.retainedVirtualStartBindingV3(r, userID, profileID, requested)
-	if !ok {
-		return resolvedVirtualPlaybackSource{}, false
-	}
-	effective, err := h.fileResolver.GetByID(r.Context(), previous.MediaFileID)
-	if err != nil || effective == nil || !isVirtualPlaybackFile(effective) {
-		return resolvedVirtualPlaybackSource{}, false
-	}
-	if !catalog.FileAllowedByAccess(effective, requestAccessFilter(r)) {
-		return resolvedVirtualPlaybackSource{}, false
-	}
-	if virtualCandidateVerdictActive(effective.FailedAt, time.Now()) {
-		return resolvedVirtualPlaybackSource{}, false
-	}
-	bound, ok := retainedVirtualBoundFileV3(effective, previous, candidateURI, ownerID)
-	if !ok {
-		return resolvedVirtualPlaybackSource{}, false
-	}
-	resolved := resolvedVirtualPlaybackSource{
-		URI:            candidateURI,
-		OwnerID:        ownerID,
-		File:           bound,
-		ProbeSucceeded: true,
-		Provenance:     ProbeProvenanceVerified,
-		CandidateRank:  -1,
-		CandidateCount: -1,
-	}
-	if effective.ID != requested.ID {
-		resolved.SubstitutedFromFileID = requested.ID
-		resolved.SubstitutionReason = substitutionReasonUnknownV3
-	}
-	slog.InfoContext(r.Context(), "resume start reused retained virtual evidence",
-		"component", "playback",
-		"requested_file_id", requested.ID,
-		"effective_file_id", effective.ID,
-		"candidate_id", virtualResultCandidateID(candidateURI),
-		"subtitle_evidence", true,
-	)
-	return resolved, true
-}
-
-// retainedVirtualStartAllowedV3 reports whether a start may reuse a live
-// session's retained evidence at all. A forced relink, an offered candidate, a
-// row the catalog already indicted, and a row that already names a complete
-// probed candidate (the ordinary repeat-play fast path) all need a fresh answer.
-func (h *PlaybackHandler) retainedVirtualStartAllowedV3(r *http.Request, requested *models.MediaFile, req playback.StartRequestV3) bool {
+) (*playback.Session, string, int, bool) {
 	if h == nil || h.fileResolver == nil || requested == nil || r == nil || !isVirtualPlaybackFile(requested) {
-		return false
+		return nil, "", 0, false
 	}
 	if req.ForceRelink || strings.TrimSpace(req.OfferedVirtualURI) != "" {
-		return false
+		return nil, "", 0, false
 	}
 	allowFailedCandidate := req.FileSelection == playback.FileSelectionExplicitV3 || req.ForceRelink
 	if !allowFailedCandidate && virtualCandidateVerdictActive(requested.FailedAt, time.Now()) {
 		// The catalog already indicted this row. Reusing a live session's older
 		// binding would resurrect a release the provider marked dead.
-		return false
+		return nil, "", 0, false
 	}
 	// A requested row that already names a complete probed candidate is served
 	// by the ordinary repeat-play fast path; leaving it there preserves the
 	// existing revalidation of a healthy row.
-	return virtualResultCandidateID(requested.FilePath) == "" ||
-		requested.ProbeUpdatedAt == nil ||
-		!completeVirtualVideoEvidenceV3(requested) ||
-		!completeVirtualAudioEvidenceV3(requested)
-}
-
-// retainedVirtualStartBindingV3 finds the unique live session for this client,
-// profile and row, then checks that its binding names a candidate on the same
-// release. It returns the session, the bound candidate URI and the owner the
-// planning copy must carry.
-func (h *PlaybackHandler) retainedVirtualStartBindingV3(r *http.Request, userID int, profileID string, requested *models.MediaFile) (*playback.Session, string, int, bool) {
+	if virtualResultCandidateID(requested.FilePath) != "" && requested.ProbeUpdatedAt != nil &&
+		completeVirtualVideoEvidenceV3(requested) && completeVirtualAudioEvidenceV3(requested) {
+		return nil, "", 0, false
+	}
 	if h.sessionMgr == nil {
 		return nil, "", 0, false
 	}
@@ -3567,9 +3504,46 @@ func (h *PlaybackHandler) retainedVirtualStartBindingV3(r *http.Request, userID 
 	return previous, candidateURI, ownerID, true
 }
 
-// retainedVirtualBoundFileV3 builds the planning copy from a retained binding:
-// the session's probed inventory carried onto the candidate the binding names.
-func retainedVirtualBoundFileV3(effective *models.MediaFile, previous *playback.Session, candidateURI string, ownerID int) (*models.MediaFile, bool) {
+// retainedVirtualStartSourceV3 reuses the candidate binding and probed
+// inventory a still-live session retained for this exact release. A start that
+// re-enters after a transport failure would otherwise re-list the provider and
+// re-probe the candidate before planning the same bytes; when the prior session
+// already holds verified evidence for the requested row, serving that evidence
+// skips the discovery/listing/probe round-trip without changing which release
+// plays. The reuse is deliberately narrow:
+//
+//   - it only fires when the client has not asked for a forced relink or a
+//     specific offered candidate, where a fresh answer is the point;
+//   - the prior session must be the unique client/profile match for this row and
+//     its binding must name a concrete candidate on the same release;
+//   - the evidence must belong to the bound row, and the row must still be
+//     accessible and not marked failed;
+//   - a requested row that already names a complete, probed candidate keeps the
+//     existing fast path, so a healthy start is not diverted.
+//
+// The returned source has no DeferredProbe: the inventory is already proven, and
+// a fresh probe is not a prerequisite for planning a retained generation.
+func (h *PlaybackHandler) retainedVirtualStartSourceV3(
+	r *http.Request,
+	userID int,
+	profileID string,
+	requested *models.MediaFile,
+	req playback.StartRequestV3,
+) (resolvedVirtualPlaybackSource, bool) {
+	previous, candidateURI, ownerID, ok := h.retainedVirtualStartBindingV3(r, userID, profileID, requested, req)
+	if !ok {
+		return resolvedVirtualPlaybackSource{}, false
+	}
+	effective, err := h.fileResolver.GetByID(r.Context(), previous.MediaFileID)
+	if err != nil || effective == nil || !isVirtualPlaybackFile(effective) {
+		return resolvedVirtualPlaybackSource{}, false
+	}
+	if !catalog.FileAllowedByAccess(effective, requestAccessFilter(r)) {
+		return resolvedVirtualPlaybackSource{}, false
+	}
+	if virtualCandidateVerdictActive(effective.FailedAt, time.Now()) {
+		return resolvedVirtualPlaybackSource{}, false
+	}
 	bound := *effective
 	bound.FilePath = candidateURI
 	bound.VirtualOwnerInstallationID = ownerID
@@ -3593,9 +3567,29 @@ func retainedVirtualBoundFileV3(effective *models.MediaFile, previous *playback.
 		bound.ProbeUpdatedAt = &stamp
 	}
 	if !completeVirtualVideoEvidenceV3(&bound) || !completeVirtualAudioEvidenceV3(&bound) {
-		return nil, false
+		return resolvedVirtualPlaybackSource{}, false
 	}
-	return &bound, true
+	resolved := resolvedVirtualPlaybackSource{
+		URI:            candidateURI,
+		OwnerID:        ownerID,
+		File:           &bound,
+		ProbeSucceeded: true,
+		Provenance:     ProbeProvenanceVerified,
+		CandidateRank:  -1,
+		CandidateCount: -1,
+	}
+	if effective.ID != requested.ID {
+		resolved.SubstitutedFromFileID = requested.ID
+		resolved.SubstitutionReason = substitutionReasonUnknownV3
+	}
+	slog.InfoContext(r.Context(), "resume start reused retained virtual evidence",
+		"component", "playback",
+		"requested_file_id", requested.ID,
+		"effective_file_id", effective.ID,
+		"candidate_id", virtualResultCandidateID(candidateURI),
+		"subtitle_evidence", true,
+	)
+	return resolved, true
 }
 
 // prepareVirtualAlternateFileV3 resolves an alternate candidate row into the
@@ -4820,7 +4814,7 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 		origin, startSegment := 0.0, 0
 		if requested > 0 {
 			if file == nil || strings.TrimSpace(file.FilePath) == "" {
-				return preparedTimelineV3{}, &transportErrorV3{reason: transcodeStartFailedReasonV3, message: remuxSeekPositionFailedV3, retryable: true, cause: errors.New("copy seek anchor requires a media file path"), seekFailure: true}
+				return preparedTimelineV3{}, &transportErrorV3{reason: transcodeStartFailedReasonV3, message: remuxSeekResolveFailedMessageV3, retryable: true, cause: errors.New("copy seek anchor requires a media file path"), seekFailure: true}
 			}
 			// The whole anchor resolve — pinned-relay lookup and FFmpeg probe —
 			// runs under a cap well inside the replan budget. A relay that is
@@ -4890,7 +4884,7 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 					// release verdict is left as-is so the start's alternate walk
 					// still runs.
 					classified := classifyVirtualAnchorProviderOutage(resolveErr)
-					fallback := &transportErrorV3{reason: transcodeStartFailedReasonV3, message: remuxSeekPositionFailedV3, retryable: true, cause: classified}
+					fallback := &transportErrorV3{reason: transcodeStartFailedReasonV3, message: remuxSeekResolveFailedMessageV3, retryable: true, cause: classified}
 					if anchorCtx.Err() != nil && ctx.Err() == nil {
 						// Our bounded anchor budget elapsed while looking the
 						// candidate up. That is a slow relay, not a release
@@ -5068,7 +5062,7 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 				// rotating the version or a replan tearing down the transport.
 				seekFailure := playback.IsTransientProviderError(err) ||
 					(anchorCtx.Err() != nil && ctx.Err() == nil)
-				return preparedTimelineV3{}, &transportErrorV3{reason: transcodeStartFailedReasonV3, message: remuxSeekPositionFailedV3, retryable: true, cause: err, seekFailure: seekFailure}
+				return preparedTimelineV3{}, &transportErrorV3{reason: transcodeStartFailedReasonV3, message: remuxSeekResolveFailedMessageV3, retryable: true, cause: err, seekFailure: seekFailure}
 			}
 		}
 		configureCopyRemuxTimelineV3(result.Plan, origin)
@@ -8390,15 +8384,6 @@ func markReplanDecisionLoggedV3(ctx context.Context) {
 	}
 }
 
-// Log attribute keys and values for the replan-answered line. They are named
-// so the repeated literals stay out of the changed lines (goconst) and every
-// occurrence cannot drift from the others.
-const (
-	replanLogKeyOperationV3 = "operation"
-	replanLogKeySessionIDV3 = "session_id"
-	replanOutcomeErrorV3    = "error"
-)
-
 // logReplanAnsweredUnchangedV3 emits the one line that accounts for a replan
 // response the decision log did not cover: an idempotent replay of a committed
 // decision, a seek that resolves to the position the plan already serves, or a
@@ -8458,8 +8443,8 @@ func logReplanAnsweredUnchangedV3(ctx context.Context, audit *replanAnswerAuditV
 		"outcome", outcome,
 		"reason", reason,
 		"decision_reason", decisionReason,
-		replanLogKeyOperationV3, string(audit.operation),
-		replanLogKeySessionIDV3, audit.sessionID,
+		operationLogKeyV3, string(audit.operation),
+		sessionIDLogKeyV3, audit.sessionID,
 		"requested_file_id", requestedFileID,
 		"effective_file_id", effectiveFileID,
 		"duration_ms", elapsed.Milliseconds(),
@@ -8488,23 +8473,17 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 		}
 		logReplanAnsweredUnchangedV3(r.Context(), audit, response, err, time.Since(started))
 	}()
-	req, err := h.prepareReplanRequestV3(r, sessionID, body, audit)
+	req, err := parseReplanRequestV3(r, body, audit)
 	if err != nil {
 		return playback.DecisionResponseV3{}, err
 	}
-	releaseSlot, err := h.acquireReplanSlotV3(r.Context())
-	if err != nil {
-		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusServiceUnavailable, "replan_capacity_exhausted", "The server is replanning too many sessions; retry shortly")
+	if err := h.loadReplanAttemptV3(r, sessionID, &req, audit); err != nil {
+		return playback.DecisionResponseV3{}, err
 	}
-	defer releaseSlot()
-	unlockReplan := h.lockReplanV3(sessionID)
-	defer unlockReplan()
-	unlockStore, err := h.PlanStoreV3.AcquireSessionLock(r.Context(), sessionID)
-	if err != nil {
-		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to serialize the replan request")
+	lease, record, replay, cleanup, err := h.beginReplanLeaseV3(r, sessionID, body, &req, audit)
+	if cleanup != nil {
+		defer cleanup()
 	}
-	defer unlockStore()
-	record, lease, replay, err := h.reserveReplanLeaseV3(r, sessionID, body, req, audit)
 	if err != nil {
 		return playback.DecisionResponseV3{}, err
 	}
@@ -8531,20 +8510,6 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 	// fast on a genuinely stuck provider.
 	replanCtx, cancelReplan := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancelReplan()
-	// A viewer who re-armed Auto mid-session states it on the replan, so a
-	// later dead-source recovery rotates even though the session started
-	// explicit. Applying it before execution is what lets executeReplanV3's
-	// autoFallbackForSession read the same intent the client is showing; it is
-	// also written to the durable normalized request so a reconstructed session
-	// keeps the negotiated policy instead of reverting to the start request. A
-	// policy the session cannot adopt refuses the replan rather than continuing
-	// with a stale intent.
-	//
-	// The apply is speculative: executeReplanV3 may still fail, and the live
-	// flag is read mid-execution, so capture the prior policy first and restore
-	// both halves on every failure path below. Only a replacement plan that
-	// actually commits keeps the new policy, which is when live and durable
-	// already agree on it.
 	autoFallbackRollback := h.captureAutoFallbackRollbackV3(sessionID, record)
 	autoFallbackCommitted := false
 	defer func() {
@@ -8565,25 +8530,25 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 		if transport != nil {
 			transport.rollback()
 		}
-		var persisted bool
-		response, persisted, err = h.persistReplanTerminalV3(r, sessionID, req, record, lease, replanErr, autoFallbackRollback)
-		leaseCompleted = persisted
+		var completed bool
+		response, completed, err = h.persistFailedReplanV3(r, sessionID, req, record, lease, autoFallbackRollback, replanErr)
+		leaseCompleted = completed
 		return response, err
 	}
-
-	var committed bool
-	response, committed, err = h.commitReplanApplicationV3(r, sessionID, req, record, lease, response, updated, transport)
-	leaseCompleted = committed
+	var completed, committed bool
+	response, completed, committed, err = h.commitReplanV3(r, sessionID, req, record, lease, response, updated, transport)
+	leaseCompleted = completed
 	autoFallbackCommitted = committed
 	return response, err
 }
 
-// prepareReplanRequestV3 validates a replan body and loads the attempt before
-// the handler queues on the replan capacity bound and per-session locks. Both
-// the preflight and the attempt read are early-outs: the attempt is re-read
-// under the locks and CompleteReplan's compare-and-swap stays the final
-// authority.
-func (h *PlaybackHandler) prepareReplanRequestV3(r *http.Request, sessionID string, body []byte, audit *replanAnswerAuditV3) (playback.ReplanRequestV3, error) {
+// parseReplanRequestV3 authenticates and structurally validates the replan
+// body before any session lookup. Automatic is stripped because it is internal
+// provenance: a client that forges it could suppress preference persistence and
+// impersonate reconciliation. An omitted client_features list temporarily
+// allows the one validation rule that depends on the durable start request; the
+// authoritative merge and second full validation happen after the attempt load.
+func parseReplanRequestV3(r *http.Request, body []byte, audit *replanAnswerAuditV3) (playback.ReplanRequestV3, error) {
 	userID := apimw.GetUserID(r.Context())
 	profileID := apimw.GetProfileID(r.Context())
 	if userID == 0 || profileID == "" {
@@ -8594,18 +8559,7 @@ func (h *PlaybackHandler) prepareReplanRequestV3(r *http.Request, sessionID stri
 		return playback.ReplanRequestV3{}, playbackOperationError(http.StatusBadRequest, "bad_request", "Invalid replan request")
 	}
 	audit.operation = req.EffectiveOperation()
-	// Automatic marks a server-built reconciliation replan. It is internal
-	// provenance: a client that forges it would suppress preference
-	// persistence and impersonate reconciliation, so strip whatever the
-	// client sent and let the server set it only on its own path.
 	stripClientSuppliedAutomatic(&req)
-	// Reject malformed identity/bounds before doing any session lookup. When
-	// client_features is omitted, temporarily allow the only validation rule
-	// that depends on the durable start request; the authoritative merge and a
-	// second full validation happen after the attempt is loaded below.
-	// Validate is structural only — it neither normalizes nor drops a
-	// capability — so this preflight cannot consume the un-negotiated
-	// transformations the single post-merge normalization must later report.
 	preflightReq := req
 	if preflightReq.ClientFeatures == nil {
 		preflightReq.ClientFeatures = []string{playback.FeatureClientVideoTransforms}
@@ -8613,88 +8567,102 @@ func (h *PlaybackHandler) prepareReplanRequestV3(r *http.Request, sessionID stri
 	if err := preflightReq.Validate(); err != nil {
 		return playback.ReplanRequestV3{}, playbackOperationError(http.StatusBadRequest, "bad_request", "Invalid replan request")
 	}
-	// Resolve the cheap attempt/session lookups before queueing for a replan
-	// slot. A reaped in-memory session (or an expired attempt) must surface as
-	// a fast 404 instead of waiting behind the replan capacity bound;
-	// production saw an ~11s queue wait before the session_not_found verdict.
-	// The store read is a single pooled query that releases its connection
-	// immediately and holds none of the replan locks, so it cannot invert the
-	// slot -> per-session mutex -> advisory-lock order below or starve a lock
-	// holder's inner queries.
+	return req, nil
+}
+
+// loadReplanAttemptV3 performs the cheap attempt/session lookups that must
+// answer before queueing for a replan slot: a reaped in-memory session or an
+// expired attempt surfaces as a fast 404 instead of waiting behind the replan
+// capacity bound. The store read is a single pooled query that holds none of
+// the replan locks, so it cannot invert the slot -> per-session mutex ->
+// advisory-lock order; the attempt is re-read under those locks before any
+// lease decision.
+func (h *PlaybackHandler) loadReplanAttemptV3(r *http.Request, sessionID string, req *playback.ReplanRequestV3, audit *replanAnswerAuditV3) error {
 	record, err := h.PlanStoreV3.GetAttempt(r.Context(), sessionID)
 	if err != nil {
-		// A store outage must read as retryable, not as the session being
-		// gone: clients tear playback down on session_not_found.
+		// A store outage must read as retryable, not as the session being gone:
+		// clients tear playback down on session_not_found.
 		if !errors.Is(err, playback.ErrSessionNotFound) {
-			return playback.ReplanRequestV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to load the playback attempt")
+			return playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to load the playback attempt")
 		}
-		return playback.ReplanRequestV3{}, replanSessionNotFoundV3()
+		return replanSessionNotFoundV3()
 	}
 	audit.record = record
+	userID := apimw.GetUserID(r.Context())
+	profileID := apimw.GetProfileID(r.Context())
 	if record.UserID != userID || record.ProfileID != profileID {
-		return playback.ReplanRequestV3{}, playbackOperationError(http.StatusForbidden, "forbidden", "Session belongs to another profile")
+		return playbackOperationError(http.StatusForbidden, "forbidden", "Session belongs to another profile")
 	}
 	if err := requireAttemptAPISurfaceV3(r.Context(), record, nil); err != nil {
-		return playback.ReplanRequestV3{}, err
+		return err
 	}
 	if record.PlaybackAttemptID != req.PlaybackAttemptID {
-		return playback.ReplanRequestV3{}, playbackOperationError(http.StatusConflict, "stale_playback_plan", "The failed plan is no longer current")
+		return playbackOperationError(http.StatusConflict, "stale_playback_plan", "The failed plan is no longer current")
 	}
 	// Replan feature advertisement is optional. An omitted list and an
 	// explicitly empty list both mean "unchanged"; validate transformations
-	// against the durable start-time features in either case, otherwise a valid
-	// replan can be rejected before executeReplanV3 gets the chance to perform
-	// the same merge.
+	// against the durable start-time features in either case.
 	if len(req.ClientFeatures) == 0 {
 		req.ClientFeatures = append([]string(nil), record.NormalizedRequest.ClientFeatures...)
 	}
-
 	// Attempt-sticky features negotiated on the original attempt stay pinned
 	// across every replan of that attempt.
 	req.ClientFeatures = playback.PinAttemptStickyFeaturesV3(req.ClientFeatures, record.NormalizedRequest.ClientFeatures)
 	if err := req.Validate(); err != nil {
-		return playback.ReplanRequestV3{}, playbackOperationError(http.StatusBadRequest, "bad_request", "Invalid replan request")
+		return playbackOperationError(http.StatusBadRequest, "bad_request", "Invalid replan request")
 	}
 	if _, err := h.sessionMgr.GetSession(sessionID); err != nil {
-		return playback.ReplanRequestV3{}, replanSessionNotFoundV3()
+		return replanSessionNotFoundV3()
 	}
-	return req, nil
+	return nil
 }
 
-// reserveReplanLeaseV3 re-reads the attempt under the replan locks and reserves
-// the request's lease. A non-nil replay response means the request repeats a
-// completed replan, which answers with the stored decision instead of
-// executing again.
-func (h *PlaybackHandler) reserveReplanLeaseV3(r *http.Request, sessionID string, body []byte, req playback.ReplanRequestV3, audit *replanAnswerAuditV3) (*playback.AttemptRecordV3, playback.ReplanLeaseV3, *playback.DecisionResponseV3, error) {
-	// Re-read the attempt now that the replan locks are held. The fast 404 in
-	// prepareReplanRequestV3 deliberately reads before queueing on the capacity
-	// bound and the per-session locks, so a duplicate request that waited
+// beginReplanLeaseV3 serializes the replan on the capacity slot, the
+// per-session mutex, and the store advisory lock, re-reads the authoritative
+// attempt, and reserves the durable replan lease. It returns the lock cleanup
+// the caller must defer; a completed lease returns the cached replay response.
+func (h *PlaybackHandler) beginReplanLeaseV3(r *http.Request, sessionID string, body []byte, req *playback.ReplanRequestV3, audit *replanAnswerAuditV3) (playback.ReplanLeaseV3, *playback.AttemptRecordV3, *playback.DecisionResponseV3, func(), error) {
+	releaseSlot, err := h.acquireReplanSlotV3(r.Context())
+	if err != nil {
+		return playback.ReplanLeaseV3{}, nil, nil, nil, playbackOperationError(http.StatusServiceUnavailable, "replan_capacity_exhausted", "The server is replanning too many sessions; retry shortly")
+	}
+	unlockReplan := h.lockReplanV3(sessionID)
+	unlockStore, err := h.PlanStoreV3.AcquireSessionLock(r.Context(), sessionID)
+	if err != nil {
+		unlockReplan()
+		releaseSlot()
+		return playback.ReplanLeaseV3{}, nil, nil, nil, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to serialize the replan request")
+	}
+	cleanup := func() {
+		unlockStore()
+		unlockReplan()
+		releaseSlot()
+	}
+	// Re-read the attempt now that the replan locks are held. The fast 404 above
+	// deliberately reads before queueing, so a duplicate request that waited
 	// behind a completing sibling still holds the pre-lock snapshot here.
-	// Without this read, BeginReplan can return the sibling's
-	// ReplanLeaseCompletedV3 and the stale record makes the handler reject the
-	// replay as stale_playback_plan instead of returning the stored response;
-	// BeginReplan/CompleteReplan would also build on a stale base revision. The
-	// post-lock read is authoritative for both, and CompleteReplan stays the
-	// final compare-and-swap.
+	// Without this read, BeginReplan can return the sibling's completed lease
+	// and the stale record would reject the replay as stale_playback_plan instead
+	// of returning the stored response. CompleteReplan stays the final
+	// compare-and-swap.
 	record, err := h.PlanStoreV3.GetAttempt(r.Context(), sessionID)
 	if err != nil {
 		// Match the fast 404: a session that vanished while this request waited
 		// reads as gone, any other store failure as retryable.
 		if !errors.Is(err, playback.ErrSessionNotFound) {
-			return nil, playback.ReplanLeaseV3{}, nil, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to load the playback attempt")
+			return playback.ReplanLeaseV3{}, nil, nil, cleanup, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to load the playback attempt")
 		}
-		return nil, playback.ReplanLeaseV3{}, nil, replanSessionNotFoundV3()
+		return playback.ReplanLeaseV3{}, nil, nil, cleanup, replanSessionNotFoundV3()
 	}
 	audit.record = record
 	// The durable attempt can outlive the in-memory session: a stop or an idle
 	// reap can land while this request waits on the replan slot and the
-	// per-session locks, between the pre-lock check and here. Re-check now so it
-	// reads as the fast 404; otherwise the request would reserve a replan lease
-	// and persist executeReplanV3's session_expired as a terminal 200, which the
-	// web client does not rebuild from. CompleteReplan stays the final
-	// compare-and-swap.
+	// per-session locks. Re-check now so it reads as the fast 404; otherwise the
+	// request would reserve a replan lease and persist executeReplanV3's
+	// session_expired as a terminal 200, which the web client does not rebuild
+	// from.
 	if _, err := h.sessionMgr.GetSession(sessionID); err != nil {
-		return nil, playback.ReplanLeaseV3{}, nil, replanSessionNotFoundV3()
+		return playback.ReplanLeaseV3{}, nil, nil, cleanup, replanSessionNotFoundV3()
 	}
 	digestBytes := sha256.Sum256(body)
 	digest := hex.EncodeToString(digestBytes[:])
@@ -8707,142 +8675,106 @@ func (h *PlaybackHandler) reserveReplanLeaseV3(r *http.Request, sessionID string
 		time.Now().Add(replanLeaseDurationV3),
 	)
 	if errors.Is(err, playback.ErrIdempotencyKeyReusedV3) {
-		return nil, playback.ReplanLeaseV3{}, nil, playbackOperationError(http.StatusConflict, "idempotency_key_reused", "The replan request ID was reused with different input")
+		return playback.ReplanLeaseV3{}, nil, nil, cleanup, playbackOperationError(http.StatusConflict, "idempotency_key_reused", "The replan request ID was reused with different input")
 	}
 	if errors.Is(err, playback.ErrStaleReplanLeaseV3) {
-		return nil, playback.ReplanLeaseV3{}, nil, playbackOperationError(http.StatusConflict, "stale_playback_plan", "A newer replacement plan is already active")
+		return playback.ReplanLeaseV3{}, nil, nil, cleanup, playbackOperationError(http.StatusConflict, "stale_playback_plan", "A newer replacement plan is already active")
 	}
 	if err != nil {
-		return nil, playback.ReplanLeaseV3{}, nil, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to reserve the replan request")
+		return playback.ReplanLeaseV3{}, nil, nil, cleanup, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to reserve the replan request")
 	}
 	if lease.State == playback.ReplanLeaseInFlightV3 {
-		return nil, playback.ReplanLeaseV3{}, nil, playbackOperationError(http.StatusConflict, "replan_in_progress", "An identical replan is still in progress")
+		return playback.ReplanLeaseV3{}, nil, nil, cleanup, playbackOperationError(http.StatusConflict, "replan_in_progress", "An identical replan is still in progress")
 	}
-	if lease.State != playback.ReplanLeaseCompletedV3 {
-		return record, lease, nil, nil
+	if lease.State == playback.ReplanLeaseCompletedV3 {
+		replay, replayErr := h.completedReplanReplayV3(r, sessionID, *req, record, lease)
+		if replayErr != nil {
+			return playback.ReplanLeaseV3{}, nil, nil, cleanup, replayErr
+		}
+		audit.replayed = true
+		return lease, record, replay, cleanup, nil
 	}
+	return lease, record, nil, cleanup, nil
+}
+
+// completedReplanReplayV3 decodes the cached durable decision for an
+// idempotent replay. The cached response was minted for the surface that first
+// completed it, so a replay through a different surface must not re-emit
+// v2-only contract additions (today delivery_change) on the frozen v1 bridge.
+func (h *PlaybackHandler) completedReplanReplayV3(r *http.Request, sessionID string, req playback.ReplanRequestV3, record *playback.AttemptRecordV3, lease playback.ReplanLeaseV3) (*playback.DecisionResponseV3, error) {
 	if record.CurrentReplanRequestID != req.ReplanRequestID || !completedReplanResponseMatchesAttemptV3(lease.Response, record) {
-		return nil, playback.ReplanLeaseV3{}, nil, playbackOperationError(http.StatusConflict, "stale_playback_plan", "A newer replacement plan is already active")
+		return nil, playbackOperationError(http.StatusConflict, "stale_playback_plan", "A newer replacement plan is already active")
 	}
 	if _, err := h.sessionMgr.GetSession(sessionID); err != nil {
-		return nil, playback.ReplanLeaseV3{}, nil, replanSessionNotFoundV3()
+		return nil, replanSessionNotFoundV3()
 	}
 	var replay playback.DecisionResponseV3
 	if err := json.Unmarshal(lease.Response, &replay); err != nil {
-		return nil, playback.ReplanLeaseV3{}, nil, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to decode the completed replan decision")
+		return nil, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to decode the completed replan decision")
 	}
-	// The cached durable decision was minted for the surface that first
-	// completed it. A replay through a different surface must not re-emit
-	// v2-only contract additions (today delivery_change) on the frozen v1
-	// bridge: clear the marker on a response-local plan copy here, at the same
-	// response boundary the fresh v1 execution uses.
 	if !isNativeAPIV2(r.Context()) && replay.PlaybackPlan != nil {
 		replay.PlaybackPlan.DeliveryChange = nil
 	}
-	audit.replayed = true
-	return record, lease, &replay, nil
+	return &replay, nil
 }
 
-// persistReplanTerminalV3 records the terminal decision executeReplanV3
-// produced and answers it. A session that died mid-execution reads as the fast
-// 404 instead, and an attempt a concurrent stop fenced keeps the replan's own
-// retryable virtual-source terminal. The returned bool reports whether the
-// lease was completed, so the caller's deferred release stays off.
-func (h *PlaybackHandler) persistReplanTerminalV3(
-	r *http.Request,
-	sessionID string,
-	req playback.ReplanRequestV3,
-	record *playback.AttemptRecordV3,
-	lease playback.ReplanLeaseV3,
-	replanErr *transportErrorV3,
-	autoFallbackRollback autoFallbackRollbackV3,
-) (playback.DecisionResponseV3, bool, error) {
-	// The caller's post-lock live-session check is an early-out only: it holds
-	// no lock across BeginReplan or executeReplanV3, so a stop or idle reap can
-	// still land before execution reads the session. Persisting that
-	// session_expired through CompleteReplan would store it as the terminal
-	// decision and answer HTTP 200 — a response the web client does not rebuild
-	// from. Translate it to the same fast 404 and leave the lease to the
-	// deferred non-terminal ReleaseReplan, so no completed 200 terminal for a
-	// dead session is ever persisted. CompleteReplan stays the final
-	// compare-and-swap for every other terminal path.
+// persistFailedReplanV3 turns an execution error into the response the caller
+// answers with. A session_expired terminal is translated to the fast 404 and
+// the lease is left to ReleaseReplan, so no completed 200 terminal for a dead
+// session is ever persisted. Other terminals persist through CompleteReplan,
+// the final compare-and-swap.
+func (h *PlaybackHandler) persistFailedReplanV3(r *http.Request, sessionID string, req playback.ReplanRequestV3, record *playback.AttemptRecordV3, lease playback.ReplanLeaseV3, autoFallbackRollback autoFallbackRollbackV3, replanErr *transportErrorV3) (playback.DecisionResponseV3, bool, error) {
 	if replanErr.reason == "session_expired" {
 		return playback.DecisionResponseV3{}, false, replanSessionNotFoundV3()
 	}
 	response := playback.NewTerminalResponseV3(replanErr.reason, replanErr.message, replanErr.retryable)
-	encoded := marshalReplanDecisionV3(response)
+	encoded, marshalErr := json.Marshal(response)
+	if marshalErr != nil {
+		return playback.DecisionResponseV3{}, false, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to encode the terminal replan decision")
+	}
 	// The failed replan did not adopt the stated policy, so the terminal record
-	// must persist the policy in force before it, not the one this request
-	// tried. Restore the durable half now, before the record is copied into the
-	// terminal decision; the deferred restore covers the live half and
-	// re-applies harmlessly.
+	// must persist the policy in force before it, not the one this request tried.
+	// The deferred restore covers the live half and re-applies harmlessly.
 	autoFallbackRollback.restore()
 	terminalRecord := *record
 	terminalRecord.CurrentReplanRequestID = req.ReplanRequestID
 	if err := h.PlanStoreV3.CompleteReplan(r.Context(), sessionID, req.ReplanRequestID, lease.LeaseToken, record.CurrentReplanRequestID, encoded, terminalRecord); err != nil {
-		// A stop landed on the attempt while this replan ran. A stop verdict
-		// persisted as a 200 terminal is a response the web client does not
-		// rebuild from, so the fast 404 is the right answer for a
-		// session-expired/stop terminal. A provider stall is not a stop
-		// verdict: the replan computed its own retryable virtual-source
-		// terminal, and answering 404 collapses that into "session gone",
-		// forcing every client to tear down and re-resume. Return the terminal
-		// the replan already produced so the retryable virtual-source signal
-		// survives the concurrent stop; the durable attempt is fenced, so
-		// nothing is persisted.
-		if errors.Is(err, playback.ErrAttemptStoppedV3) && virtualSourceStallTerminalV3(replanErr.reason) {
-			return response, false, nil
-		}
-		return playback.DecisionResponseV3{}, false, replanTerminalPersistErrorV3(err, replanErr)
+		return failedReplanPersistResponseV3(replanErr, response, err)
 	}
 	return response, true, nil
 }
 
-// replanTerminalPersistErrorV3 maps a failed terminal CompleteReplan to the
-// client answer: a concurrent stop reads as the fast 404, and route-capacity
-// exhaustion stays retryable rather than collapsing into an internal error.
-func replanTerminalPersistErrorV3(completeErr error, replanErr *transportErrorV3) error {
-	switch {
-	case errors.Is(completeErr, playback.ErrAttemptStoppedV3):
-		return replanSessionNotFoundV3()
-	case errors.Is(completeErr, playback.ErrReplanSupersededV3):
-		return playbackOperationError(http.StatusConflict, "stale_playback_plan", "A newer replacement plan is already active")
-	case isRouteCapacityUnavailableError(replanErr):
-		return playbackOperationError(http.StatusServiceUnavailable, string(noderouting.OutcomeCapacityUnavailable), "The playback route capacity is temporarily unavailable; retry shortly")
-	default:
-		return playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to persist the terminal replan decision")
+// failedReplanPersistResponseV3 maps a failed terminal persist onto the answer
+// the client receives. A provider stall is not a stop verdict, so its retryable
+// virtual-source terminal survives a concurrent stop; every other stop reads as
+// the fast 404 because a stop verdict persisted as a 200 terminal is a response
+// the web client does not rebuild from.
+func failedReplanPersistResponseV3(replanErr *transportErrorV3, response playback.DecisionResponseV3, err error) (playback.DecisionResponseV3, bool, error) {
+	if errors.Is(err, playback.ErrAttemptStoppedV3) {
+		if virtualSourceStallTerminalV3(replanErr.reason) {
+			return response, false, nil
+		}
+		return playback.DecisionResponseV3{}, false, replanSessionNotFoundV3()
 	}
+	if errors.Is(err, playback.ErrReplanSupersededV3) {
+		return playback.DecisionResponseV3{}, false, playbackOperationError(http.StatusConflict, "stale_playback_plan", "A newer replacement plan is already active")
+	}
+	if isRouteCapacityUnavailableError(replanErr) {
+		return playback.DecisionResponseV3{}, false, playbackOperationError(http.StatusServiceUnavailable, string(noderouting.OutcomeCapacityUnavailable), "The playback route capacity is temporarily unavailable; retry shortly")
+	}
+	return playback.DecisionResponseV3{}, false, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to persist the terminal replan decision")
 }
 
-// marshalReplanDecisionV3 encodes a replan decision for the durable store. The
-// decision carries float64 timeline fields, so the encoder can refuse a
-// non-finite value; the caller keeps persisting the empty body it did before
-// this helper existed rather than inventing a different terminal.
-func marshalReplanDecisionV3(response playback.DecisionResponseV3) []byte {
-	encoded, err := json.Marshal(response)
-	if err != nil {
-		return nil
-	}
-	return encoded
-}
-
-// commitReplanApplicationV3 makes a computed replacement durable and installs
-// it on the live transport. The returned bool reports whether the durable plan
-// committed: the caller then keeps the speculative version-fallback policy and
-// skips the deferred lease release, even when the later transport commit fails
-// and aborts the live session.
-func (h *PlaybackHandler) commitReplanApplicationV3(
-	r *http.Request,
-	sessionID string,
-	req playback.ReplanRequestV3,
-	record *playback.AttemptRecordV3,
-	lease playback.ReplanLeaseV3,
-	response playback.DecisionResponseV3,
-	updated playback.AttemptRecordV3,
-	transport *preparedTransportV3,
-) (playback.DecisionResponseV3, bool, error) {
+// commitReplanV3 applies the replacement transport to the live session and
+// persists the durable decision. A failed session restore or CompleteReplan
+// rolls the transport back; once the plan is durable, a later transport commit
+// failure aborts the live session without reverting the durable plan.
+func (h *PlaybackHandler) commitReplanV3(r *http.Request, sessionID string, req playback.ReplanRequestV3, record *playback.AttemptRecordV3, lease playback.ReplanLeaseV3, response playback.DecisionResponseV3, updated playback.AttemptRecordV3, transport *preparedTransportV3) (playback.DecisionResponseV3, bool, bool, error) {
 	updated.CurrentReplanRequestID = req.ReplanRequestID
-	encoded := marshalReplanDecisionV3(response)
+	encoded, marshalErr := json.Marshal(response)
+	if marshalErr != nil {
+		return playback.DecisionResponseV3{}, false, false, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to encode the replacement replan decision")
+	}
 	var rollbackSession func() error
 	if transport != nil && transport.applySession != nil {
 		var err error
@@ -8852,12 +8784,12 @@ func (h *PlaybackHandler) commitReplanApplicationV3(
 			rollbackErr, _ := rollbackFailedReplanV3(transport, nil)
 			if rollbackErr != nil {
 				slog.ErrorContext(r.Context(), "protocol v3 unapplied replacement transport cancellation failed", "session", sessionID, "error", rollbackErr)
-				return playback.DecisionResponseV3{}, false, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to cancel the unapplied replacement transport")
+				return playback.DecisionResponseV3{}, false, false, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to cancel the unapplied replacement transport")
 			}
 			if isRouteCapacityUnavailableError(err) {
-				return playback.DecisionResponseV3{}, false, playbackOperationError(http.StatusServiceUnavailable, string(noderouting.OutcomeCapacityUnavailable), "The playback route capacity is temporarily unavailable; retry shortly")
+				return playback.DecisionResponseV3{}, false, false, playbackOperationError(http.StatusServiceUnavailable, string(noderouting.OutcomeCapacityUnavailable), "The playback route capacity is temporarily unavailable; retry shortly")
 			}
-			return playback.DecisionResponseV3{}, false, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to commit the live replacement session")
+			return playback.DecisionResponseV3{}, false, false, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to commit the live replacement session")
 		}
 	}
 	if err := h.PlanStoreV3.CompleteReplan(r.Context(), sessionID, req.ReplanRequestID, lease.LeaseToken, record.CurrentReplanRequestID, encoded, updated); err != nil {
@@ -8871,33 +8803,32 @@ func (h *PlaybackHandler) commitReplanApplicationV3(
 				slog.ErrorContext(r.Context(), "protocol v3 replacement transport cancellation failed", "session", sessionID, "error", transportRollbackErr)
 			}
 			_ = h.abortPlaybackSessionByID(context.WithoutCancel(r.Context()), sessionID)
-			return playback.DecisionResponseV3{}, false, replanSessionNotFoundV3()
+			return playback.DecisionResponseV3{}, false, false, replanSessionNotFoundV3()
 		}
 		transportRollbackErr, sessionRollbackErr := rollbackFailedReplanV3(transport, rollbackSession)
 		if transportRollbackErr != nil {
 			slog.ErrorContext(r.Context(), "protocol v3 replacement transport cancellation failed", "session", sessionID, "error", transportRollbackErr)
-			return playback.DecisionResponseV3{}, false, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to cancel the replacement transport")
+			return playback.DecisionResponseV3{}, false, false, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to cancel the replacement transport")
 		}
 		if sessionRollbackErr != nil {
 			slog.ErrorContext(r.Context(), "protocol v3 replacement rollback failed", "session", sessionID, "error", sessionRollbackErr)
 			_ = h.stopPlaybackSessionByID(context.WithoutCancel(r.Context()), sessionID, false)
 		}
 		if errors.Is(err, playback.ErrReplanSupersededV3) {
-			return playback.DecisionResponseV3{}, false, playbackOperationError(http.StatusConflict, "stale_playback_plan", "A newer replacement plan is already active")
+			return playback.DecisionResponseV3{}, false, false, playbackOperationError(http.StatusConflict, "stale_playback_plan", "A newer replacement plan is already active")
 		}
 		if isRouteCapacityUnavailableError(err) {
-			return playback.DecisionResponseV3{}, false, playbackOperationError(http.StatusServiceUnavailable, string(noderouting.OutcomeCapacityUnavailable), "The playback route capacity is temporarily unavailable; retry shortly")
+			return playback.DecisionResponseV3{}, false, false, playbackOperationError(http.StatusServiceUnavailable, string(noderouting.OutcomeCapacityUnavailable), "The playback route capacity is temporarily unavailable; retry shortly")
 		}
-		return playback.DecisionResponseV3{}, false, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to commit the replacement plan")
+		return playback.DecisionResponseV3{}, false, false, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to commit the replacement plan")
 	}
 	// The replacement plan is durable, so the speculative policy application is
-	// now the adopted policy: live and durable agree and the deferred rollback
-	// must not undo it. A later transport commit failure aborts the live session
-	// without reverting the durable plan.
+	// now the adopted policy: a later transport commit failure aborts the live
+	// session without reverting the durable plan.
 	if transport != nil {
 		if commitErr := transport.commit(); commitErr != nil {
 			_ = h.abortPlaybackSessionByID(context.WithoutCancel(r.Context()), sessionID)
-			return playback.DecisionResponseV3{}, true, playbackOperationError(http.StatusServiceUnavailable, commitErr.reason, commitErr.message)
+			return playback.DecisionResponseV3{}, true, true, playbackOperationError(http.StatusServiceUnavailable, commitErr.reason, commitErr.message)
 		}
 		h.recordSessionRecipeV3(r.Context(), updated.CurrentPlanID, transport)
 		if transport.afterDurableCommit != nil {
@@ -8905,7 +8836,7 @@ func (h *PlaybackHandler) commitReplanApplicationV3(
 		}
 	}
 	h.raceCopySafetyV3(updated.EffectiveMediaFileID, response.PlaybackPlan)
-	return response, true, nil
+	return response, true, true, nil
 }
 
 // replanSessionNotFoundV3 is the v1 playback_session_not_found body; the v2
