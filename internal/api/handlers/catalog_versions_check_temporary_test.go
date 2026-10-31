@@ -115,23 +115,27 @@ func TestVirtualCandidateDeadErrorExcludesTemporary(t *testing.T) {
 // liveness check: every transport-temporary shape (502, 503, 500, a joined
 // owner-down fallback, a timeout, and a pending release), on an
 // identity-bearing pin that the provider could not list, must leave the row
-// unstamped and report the durable (healthy) signal.
+// unstamped and report the durable (healthy) signal. A fail-fast marked title
+// is the exception: it is a title-wide outage verdict, so it is also never
+// stamped but reports the row unavailable rather than healthy.
 func TestCheckVersionTemporaryFailureNeverStamps(t *testing.T) {
 	temporaryErrors := []struct {
-		name string
-		err  error
+		name      string
+		err       error
+		available bool
 	}{
-		{"502 provider unavailable", fmt.Errorf("%w: streaming provider returned status 502", resolver.ErrProviderUnavailable)},
-		{"503 provider unavailable", fmt.Errorf("%w: streaming provider returned status 503", resolver.ErrProviderUnavailable)},
-		{"500 provider unavailable", fmt.Errorf("%w: streaming provider returned status 500", resolver.ErrProviderUnavailable)},
-		{"failed recently", fmt.Errorf("%w: provider listing failed recently", resolver.ErrProviderUnavailable)},
-		{"joined owner-down with dead text", errors.New("resolve virtual playback: virtual stream provider 7 request failed; virtual stream provider returned no matching candidate")},
-		{"joined status 503 with dead text", errors.New("streaming provider returned status 503: no matching candidate")},
-		{"timeout", context.DeadlineExceeded},
-		{"pending", fmt.Errorf("waiting for import: %w", virtuallibrary.ErrProviderPending)},
-		{"empty listing", errors.New("no streams available from provider")},
-		{"fail-fast marked title", fmt.Errorf("resolve virtual input: %w: title virtual://movie/tt-temporary", virtuallibrary.ErrTitleWithoutStreams)},
-		{"identity-bearing session-bound absent joined with outage", fmt.Errorf("%w: session-bound candidate absent: %w", resolver.ErrProviderUnavailable, virtuallibrary.ErrSessionBoundCandidateAbsent)},
+		{"502 provider unavailable", fmt.Errorf("%w: streaming provider returned status 502", resolver.ErrProviderUnavailable), true},
+		{"503 provider unavailable", fmt.Errorf("%w: streaming provider returned status 503", resolver.ErrProviderUnavailable), true},
+		{"500 provider unavailable", fmt.Errorf("%w: streaming provider returned status 500", resolver.ErrProviderUnavailable), true},
+		{"failed recently", fmt.Errorf("%w: provider listing failed recently", resolver.ErrProviderUnavailable), true},
+		{"joined owner-down with dead text", errors.New("resolve virtual playback: virtual stream provider 7 request failed; virtual stream provider returned no matching candidate"), true},
+		{"joined status 503 with dead text", errors.New("streaming provider returned status 503: no matching candidate"), true},
+		{"timeout", context.DeadlineExceeded, true},
+		{"pending", fmt.Errorf("waiting for import: %w", virtuallibrary.ErrProviderPending), true},
+		{"empty listing", errors.New("no streams available from provider"), true},
+		{"fail-fast marked title", fmt.Errorf("resolve virtual input: %w: title virtual://movie/tt-temporary", virtuallibrary.ErrTitleWithoutStreams), false},
+		{"fail-fast marked title bare", virtuallibrary.ErrTitleWithoutStreams, false},
+		{"identity-bearing session-bound absent joined with outage", fmt.Errorf("%w: session-bound candidate absent: %w", resolver.ErrProviderUnavailable, virtuallibrary.ErrSessionBoundCandidateAbsent), true},
 	}
 	for _, tc := range temporaryErrors {
 		t.Run(tc.name, func(t *testing.T) {
@@ -153,8 +157,8 @@ func TestCheckVersionTemporaryFailureNeverStamps(t *testing.T) {
 			if outcome.stamp {
 				t.Fatalf("temporary error %v marked the pin for stamping", tc.err)
 			}
-			if !outcome.available {
-				t.Fatalf("temporary error %v reported the healthy pin unavailable", tc.err)
+			if outcome.available != tc.available {
+				t.Fatalf("temporary error %v reported available=%v, want %v", tc.err, outcome.available, tc.available)
 			}
 			if marks != 0 {
 				t.Fatalf("temporary error %v performed %d durable stamps, want 0", tc.err, marks)
