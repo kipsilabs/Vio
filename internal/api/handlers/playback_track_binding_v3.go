@@ -1183,6 +1183,15 @@ func (h *PlaybackHandler) rekeyReplanTrackIdentitiesWithRotationV3(ctx context.C
 			if !source.namesDownloadedOrdinalV3(ordinal) {
 				return carriedInventorySourceV3{}, 0, false
 			}
+			if !source.downloadedKnown {
+				// The ordinal addresses a downloaded row but no captured tail
+				// proves which row that is today. Mark the evidence historical
+				// so the constraint clears the unprovable selection, or surfaces
+				// a dependency error, instead of leaving the durable ordinal in
+				// place to be reused positionally against whatever the
+				// repository lists now.
+				source.subtitleHistorical = true
+			}
 			return source, ordinal, true
 		}
 		source := h.rekeySourceFileWithInventoryV3(ctx, embeddedFileID, session, durable)

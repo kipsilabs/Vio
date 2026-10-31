@@ -1958,7 +1958,15 @@ func virtualCandidateFailureGracePredicate(gracePlaceholder int) string {
 // clearing fresh evidence. This mirrors ReplaceVirtualResultPin's
 // `WHERE id=$1 AND file_path=$2` guard.
 func (r *FileRepository) MarkVirtualCandidateFailed(ctx context.Context, fileID int, expectedFilePath string, observedFailedAt *time.Time) error {
-	return r.markVirtualCandidateFailed(ctx, fileID, expectedFilePath, observedFailedAt, true)
+	_, err := r.MarkVirtualCandidateFailedDetailed(ctx, fileID, expectedFilePath, observedFailedAt)
+	return err
+}
+
+// MarkVirtualCandidateFailedDetailed stamps a virtual candidate row as
+// known-bad, returning whether the update actually committed. A nil error
+// from a fenced-out write or a delivery-grace skip returns committed=false.
+func (r *FileRepository) MarkVirtualCandidateFailedDetailed(ctx context.Context, fileID int, expectedFilePath string, observedFailedAt *time.Time) (bool, error) {
+	return r.markVirtualCandidateFailedDetailed(ctx, fileID, expectedFilePath, observedFailedAt, true)
 }
 
 // MarkVirtualCandidateDecodeRejected stamps a virtual candidate row as
@@ -1974,20 +1982,21 @@ func (r *FileRepository) MarkVirtualCandidateFailed(ctx context.Context, fileID 
 // The identity/failed_at fence is identical to MarkVirtualCandidateFailed, so a
 // rotation or a newer stamp is never mis-marked by a stale verdict.
 func (r *FileRepository) MarkVirtualCandidateDecodeRejected(ctx context.Context, fileID int, expectedFilePath string, observedFailedAt *time.Time) error {
-	return r.markVirtualCandidateFailed(ctx, fileID, expectedFilePath, observedFailedAt, false)
+	_, err := r.markVirtualCandidateFailedDetailed(ctx, fileID, expectedFilePath, observedFailedAt, false)
+	return err
 }
 
-// markVirtualCandidateFailed is the shared failed_at stamp. applyGrace selects
+// markVirtualCandidateFailedDetailed is the shared failed_at stamp. applyGrace selects
 // the transport rule: true (MarkVirtualCandidateFailed) skips known-good rows
 // inside VirtualCandidateDeliveryGrace, false (MarkVirtualCandidateDecodeRejected)
 // stamps regardless of delivery evidence. The fence and the placeholder order
 // are identical either way; only the grace clause is conditional.
-func (r *FileRepository) markVirtualCandidateFailed(ctx context.Context, fileID int, expectedFilePath string, observedFailedAt *time.Time, applyGrace bool) error {
+func (r *FileRepository) markVirtualCandidateFailedDetailed(ctx context.Context, fileID int, expectedFilePath string, observedFailedAt *time.Time, applyGrace bool) (bool, error) {
 	if r == nil || r.pool == nil {
-		return errors.New("file repository is not configured")
+		return false, errors.New("file repository is not configured")
 	}
 	if fileID <= 0 {
-		return nil
+		return false, nil
 	}
 	query := `UPDATE media_files SET failed_at = NOW(), updated_at = NOW()
 		WHERE id = $1 AND file_path = $2 AND failed_at IS NOT DISTINCT FROM $3`
@@ -1997,8 +2006,11 @@ func (r *FileRepository) markVirtualCandidateFailed(ctx context.Context, fileID 
 		  AND ` + virtualCandidateFailureGracePredicate(4)
 		args = append(args, VirtualCandidateDeliveryGrace.Seconds())
 	}
-	_, err := r.pool.Exec(ctx, query, args...)
-	return err
+	tag, err := r.pool.Exec(ctx, query, args...)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
 }
 
 // ClearVirtualCandidateFailed clears the failed_at stamp on a virtual candidate

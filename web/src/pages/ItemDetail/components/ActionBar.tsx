@@ -468,13 +468,35 @@ export default function ActionBar({
         : undefined,
     [selectedVersion, selectedWatch],
   );
+  const isWatchProbed = Boolean(selectedWatchVersion?.probed_at);
+  const isCatalogProbed = Boolean(selectedVersion?.probed_at);
   const selectedVersionWithTracks = useMemo(() => {
     if (!selectedVersion) return null;
     if (!selectedWatchVersion) return selectedVersion;
-    // An empty watch-detail list can be an unprobed row, not evidence that the
-    // selected version has no tracks. Keep the catalog lists until the probe
-    // actually supplies a non-empty inventory, so a cold page does not hide its
-    // audio/subtitle menus.
+    // When the watch detail read is probed, its inventory is authoritative even
+    // if empty (verified empty). When only the catalog version carries probed_at
+    // (watch read hasn't completed or is unprobed), the catalog lists are
+    // authoritative. When neither is probed, keep catalog placeholders as provisional.
+    if (isWatchProbed) {
+      return mergePlaybackInventory(
+        {
+          ...selectedVersion,
+          audio_tracks: selectedWatchVersion.audio_tracks ?? [],
+          subtitle_tracks: selectedWatchVersion.subtitle_tracks ?? [],
+        },
+        playerInventory,
+      );
+    }
+    if (isCatalogProbed) {
+      return mergePlaybackInventory(
+        {
+          ...selectedVersion,
+          audio_tracks: selectedVersion.audio_tracks ?? [],
+          subtitle_tracks: selectedVersion.subtitle_tracks ?? [],
+        },
+        playerInventory,
+      );
+    }
     return mergePlaybackInventory(
       {
         ...selectedVersion,
@@ -489,26 +511,25 @@ export default function ActionBar({
       },
       playerInventory,
     );
-  }, [playerInventory, selectedVersion, selectedWatchVersion]);
-  // Those catalog lists are the same pre-probe fallback the player overlay
-  // gates: rows the version row carries, not evidence the file has them. Until
-  // the watch detail read (or the player's own mirror) supplies probed rows for
-  // this file, the pre-play menus withhold them and say they are discovering,
-  // so a start cannot carry a pick the file does not have. The verdict is the
-  // overlay's, not a second rule.
+  }, [isCatalogProbed, isWatchProbed, playerInventory, selectedVersion, selectedWatchVersion]);
+  // A row's tracks count as published evidence only when the version has been
+  // probed, or when the player's own inventory mirror has confirmed tracks.
+  const isProbed = isWatchProbed || isCatalogProbed;
   const audioRowsPublished =
-    (selectedWatchVersion?.audio_tracks?.length ?? 0) > 0 ||
+    (isWatchProbed && selectedWatchVersion !== undefined) ||
+    isCatalogProbed ||
     (playerInventory?.audioTracks.length ?? 0) > 0;
   const subtitleRowsPublished =
-    (selectedWatchVersion?.subtitle_tracks?.length ?? 0) > 0 ||
+    (isWatchProbed && selectedWatchVersion !== undefined) ||
+    isCatalogProbed ||
     (playerInventory?.subtitleTracks.length ?? 0) > 0;
   const audioInventoryProvisional = isOverlayInventoryProvisional(
-    false,
+    !isProbed && !playerInventory,
     audioRowsPublished,
     selectedVersionWithTracks?.audio_tracks?.length ?? 0,
   );
   const subtitleInventoryProvisional = isOverlayInventoryProvisional(
-    false,
+    !isProbed && !playerInventory,
     subtitleRowsPublished,
     selectedVersionWithTracks?.subtitle_tracks?.length ?? 0,
   );

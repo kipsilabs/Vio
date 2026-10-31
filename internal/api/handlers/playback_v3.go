@@ -13479,7 +13479,11 @@ func (h *PlaybackHandler) replanRemapSourceV3(ctx context.Context, effectiveFile
 	}
 	if inventory, ok := durable[effectiveFile.ID]; ok && inventory.anyKnown() {
 		evidence := *effectiveFile
-		carry := carriedInventorySourceV3{file: &evidence}
+		// The captured inventory is historical evidence by definition: the live
+		// row may have been re-probed in place since the plan was made, and a
+		// downloaded ordinal without the captured tail cannot be proven
+		// positionally.
+		carry := carriedInventorySourceV3{file: &evidence, subtitleHistorical: true}
 		if inventory.audioKnown {
 			evidence.AudioTracks = inventory.audio
 		}

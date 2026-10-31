@@ -41,12 +41,6 @@ interface UsePlaybackRealtimeOptions {
    * up after its mint kept answering that the session was gone.
    */
   recoveryRevision?: number;
-  /**
-   * Called once when the bounded mint ladder is exhausted: the session this
-   * player is driving keeps answering that it does not exist, so the caller
-   * enters its session-gone state and offers a fresh start.
-   */
-  onSessionGone?: () => void;
 }
 
 interface UsePlaybackRealtimeResult {
@@ -73,14 +67,12 @@ export function usePlaybackRealtime({
   onEvent,
   supportedCommands,
   recoveryRevision = 0,
-  onSessionGone,
 }: UsePlaybackRealtimeOptions): UsePlaybackRealtimeResult {
   const config = usePlayerConfig();
   const [connectionState, setConnectionState] = useState<ConnectionState>("disconnected");
   const onCommandRef = useRef(onCommand);
   const onEventRef = useRef(onEvent);
   const supportedCommandsRef = useRef(supportedCommands);
-  const onSessionGoneRef = useRef(onSessionGone);
   const seenCommandsRef = useRef<Set<string>>(new Set());
   /**
    * Re-arms a transport loop that degraded, from the recovery effect below. The
@@ -96,10 +88,6 @@ export function usePlaybackRealtime({
   useEffect(() => {
     supportedCommandsRef.current = supportedCommands;
   }, [supportedCommands]);
-
-  useEffect(() => {
-    onSessionGoneRef.current = onSessionGone;
-  }, [onSessionGone]);
 
   useEffect(() => {
     onEventRef.current = onEvent;
@@ -127,11 +115,11 @@ export function usePlaybackRealtime({
     // A mint answered 404/410. The ticket store is per-process and in-memory, so
     // that answer is replica-local: it proves this replica does not hold the
     // session, not that playback ended. Retry it a short, bounded number of
-    // times with backoff; when even that keeps answering gone, report the
-    // session as gone so the player stops using it and offers a fresh start.
+    // times with backoff; when even that keeps answering gone, degrade this
+    // control lane only. Playback and the stream keep running, and an adopted
+    // plan re-arms the lane through revive() below.
     let sessionGoneMints = 0;
     let degraded = false;
-    let sessionGoneReported = false;
 
     let terminated = false;
     const scheduleReconnect = () => {
@@ -265,20 +253,16 @@ export function usePlaybackRealtime({
           }
           if (isPlaybackSessionGoneError(error)) {
             // A 404/410 here is replica-local (see `sessionGoneMints`): one
-            // answer is not proof the session ended. Retry it a short, bounded
-            // ladder with backoff; when the ladder is spent, report the session
-            // gone and stop minting against it. The restart action starts a new
-            // session instead of polling this one forever.
+            // answer is not proof the session ended, and neither is a spent
+            // ladder. Degrade this control lane and keep the stream playing;
+            // reporting the session gone here killed healthy playback whenever
+            // the mint requests kept landing on another replica.
             sessionGoneMints += 1;
             setConnectionState("disconnected");
             if (sessionGoneMints < SESSION_GONE_MINT_RETRY_LIMIT) {
               scheduleReconnect();
             } else {
               degraded = true;
-              if (!sessionGoneReported) {
-                sessionGoneReported = true;
-                onSessionGoneRef.current?.();
-              }
             }
             return;
           }
@@ -299,7 +283,6 @@ export function usePlaybackRealtime({
       if (disposed || terminated || !degraded) return;
       degraded = false;
       sessionGoneMints = 0;
-      sessionGoneReported = false;
       attempt = 0;
       connect();
     };

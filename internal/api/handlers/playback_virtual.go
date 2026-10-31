@@ -3848,7 +3848,8 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			// Size and duration decide identity together: a short posting of the
 			// right content keeps the item's runtime and is accepted, while a
 			// different file fails the duration check independently of size.
-			if scanner.VirtualServedEvidenceRejected(result.File.FileSize, result.File.ProbedFormatSize, result.File.Duration, expectedRuntimeMinutes) {
+			verdict := scanner.ClassifyVirtualServedEvidence(result.File.FileSize, result.File.ProbedFormatSize, result.File.Duration, expectedRuntimeMinutes)
+			if verdict == scanner.VirtualServedEvidenceMismatch {
 				// The probe read a readable container that is not the release
 				// this row declares. Rotate to a sibling instead of persisting
 				// a different release's inventory, but keep the wrong-source
@@ -3872,7 +3873,14 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				}
 				continue
 			}
-			if scanner.VirtualServedSizeMismatch(result.File.FileSize, result.File.ProbedFormatSize) {
+			if !verdict.EstablishesIdentity() {
+				// Size contradicts declared release: keep the stream playable for this
+				// session in memory, but downgrade provenance to Declared so it NEVER
+				// writes authoritative catalog inventory or stamps probe_updated_at.
+				logVirtualProbeSizeMismatchAccepted(r.Context(), file.ID, candidate.URI, result.File.FileSize, result.File.ProbedFormatSize, result.File.Duration, expectedRuntimeMinutes)
+				virtualProbeFailures.clearSizeMismatch(virtualProbeFailureKey(candidate.URI, ownerID))
+				result.Provenance = ProbeProvenanceDeclared
+			} else if scanner.VirtualServedSizeMismatch(result.File.FileSize, result.File.ProbedFormatSize) {
 				logVirtualProbeSizeMismatchAccepted(r.Context(), file.ID, candidate.URI, result.File.FileSize, result.File.ProbedFormatSize, result.File.Duration, expectedRuntimeMinutes)
 				virtualProbeFailures.clearSizeMismatch(virtualProbeFailureKey(candidate.URI, ownerID))
 			}
@@ -3887,10 +3895,11 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 					candidate.URI, result.File.Duration, expectedRuntimeMinutes))
 				continue
 			}
-			// Persist probed audio/subtitle tracks back to the DB so
-			// the watch detail and player UI show track options on
-			// subsequent views without re-probing.
-			h.persistVirtualProbeEvidence(r.Context(), file, result.File.FilePath, result.File, resolvedSourceIdentity(result).tiers(), result.Provenance == ProbeProvenanceVerified, true)
+			// Persist probed audio/subtitle tracks back to the DB only when
+			// evidence establishes release identity and provenance is verified.
+			if verdict.EstablishesIdentity() && result.Provenance == ProbeProvenanceVerified {
+				h.persistVirtualProbeEvidence(r.Context(), file, result.File.FilePath, result.File, resolvedSourceIdentity(result).tiers(), true, true)
+			}
 			// The filtered candidate list is already cached device-neutrally
 			// above (and ranked for this device), so replays skip the provider
 			// round-trip and re-rank for the requesting device. Pin this URI
@@ -4185,7 +4194,8 @@ func (h *PlaybackHandler) matchSameReleaseSiblingProbe(ctx context.Context, anch
 		if err != nil || probed == nil {
 			continue
 		}
-		if scanner.VirtualServedEvidenceRejected(transient.FileSize, probed.ProbedFormatSize, probed.Duration, transient.VirtualExpectedRuntimeMinutes) {
+		verdict := scanner.ClassifyVirtualServedEvidence(transient.FileSize, probed.ProbedFormatSize, probed.Duration, transient.VirtualExpectedRuntimeMinutes)
+		if !verdict.EstablishesIdentity() {
 			virtualProbeFailures.markSizeMismatch(virtualProbeFailureKey(cand.URI, cand.OwnerInstallationID), probed.ProbedFormatSize, transient.FileSize)
 			logVirtualProbeSizeMismatch(ctx, row.ID, cand.URI, transient.FileSize, probed.ProbedFormatSize)
 			// The start path unpins a rejected sibling so a later start does not
@@ -4439,7 +4449,8 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 	// posted short of the indexer's advertised size still carries the item's
 	// runtime, while a different file (a remux of another title, say) fails
 	// the duration check independently of its size.
-	if scanner.VirtualServedEvidenceRejected(probeTransient.FileSize, probed.ProbedFormatSize, probed.Duration, expectedRuntimeMinutes) {
+	verdict := scanner.ClassifyVirtualServedEvidence(probeTransient.FileSize, probed.ProbedFormatSize, probed.Duration, expectedRuntimeMinutes)
+	if verdict == scanner.VirtualServedEvidenceMismatch {
 		// The container was readable but it is not the release the row
 		// declares: the provider is serving a different file under this URL
 		// (a stale cache fill, typically). Do not persist this inventory and do
@@ -4468,6 +4479,13 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 		candidate = sibling.identity
 		probeKey = virtualProbeFailureKey(probeCand.URI, probeCand.OwnerInstallationID)
 		adoptedSibling = sibling
+	} else if !verdict.EstablishesIdentity() {
+		// A size contradiction with plausible duration remains playable for
+		// the live session in memory, but does not establish release identity.
+		// It must NOT be persisted as verified catalog inventory, must NOT
+		// stamp probe_updated_at, and must NOT publish verified inventory.
+		logVirtualProbeSizeMismatchAccepted(bgCtx, anchorFileID, probeCand.URI, probeTransient.FileSize, probed.ProbedFormatSize, probed.Duration, expectedRuntimeMinutes)
+		return probeOutcomeFailed, virtualCommittedProbeInventory{}
 	} else if scanner.VirtualServedSizeMismatch(probeTransient.FileSize, probed.ProbedFormatSize) {
 		// The posting is short of what the indexer advertised but the duration
 		// proves the content: accept the evidence so the row gets its real
@@ -5918,6 +5936,18 @@ func virtualProbeEvidenceSharesRowRelease(row *models.MediaFile, candidateURI st
 // be refused: a cross-release candidate the row cannot adopt (a collection-owned
 // row with no adoption target).
 func (h *PlaybackHandler) virtualProbeEvidenceArgsForRow(ctx context.Context, catalogFile *models.MediaFile, resolvedPath string, probed *models.MediaFile, candidate resolver.PersistedIdentityTiers, stampProbe bool) (models.VirtualFilePersistArgs, bool) {
+	if stampProbe && probed != nil && probed.ProbedFormatSize > 0 && catalogFile != nil && catalogFile.FileSize > 0 {
+		expectedRuntime := catalogFile.VirtualExpectedRuntimeMinutes
+		if expectedRuntime <= 0 {
+			expectedRuntime = h.virtualExpectedRuntimeMinutes(ctx, catalogFile)
+		}
+		verdict := scanner.ClassifyVirtualServedEvidence(catalogFile.FileSize, probed.ProbedFormatSize, probed.Duration, expectedRuntime)
+		if !verdict.EstablishesIdentity() {
+			slog.WarnContext(ctx, "virtual probe evidence refused: served size contradicts declared release",
+				"component", "api", "file_id", catalogFile.ID, "declared_size", catalogFile.FileSize, "probed_size", probed.ProbedFormatSize)
+			return models.VirtualFilePersistArgs{}, false
+		}
+	}
 	snap := snapshotVirtualRow(catalogFile)
 	expectedPath := catalogFile.FilePath
 	adoptPath := ""

@@ -30,6 +30,10 @@ const emptyTitleMarkStreak = 3
 // title.
 var emptyTitleMarkTTL = 5 * time.Minute
 
+// maxEmptyTitleEntries caps the tracker map so a long-lived server cannot
+// accumulate cold entries indefinitely.
+const maxEmptyTitleEntries = 2048
+
 // emptyTitleStreak records consecutive empty provider listings for one title.
 type emptyTitleStreak struct {
 	count int
@@ -44,6 +48,14 @@ type emptyTitleStreak struct {
 type emptyTitleTracker struct {
 	mu      sync.Mutex
 	streaks map[string]*emptyTitleStreak
+}
+
+func (t *emptyTitleTracker) sweepExpired(now time.Time) {
+	for k, s := range t.streaks {
+		if s == nil || s.last.IsZero() || now.Sub(s.last) > emptyTitleMarkTTL {
+			delete(t.streaks, k)
+		}
+	}
 }
 
 func newEmptyTitleTracker() *emptyTitleTracker {
@@ -76,6 +88,24 @@ func (t *emptyTitleTracker) noteEmptyListing(key string, cacheTTL time.Duration,
 	// instead of letting its old count and span re-mark the title from one
 	// observation. An unmarked streak is still accumulating evidence.
 	if !ok || (streak.count >= emptyTitleMarkStreak && (streak.last.IsZero() || now.Sub(streak.last) > emptyTitleMarkTTL)) {
+		if !ok && len(t.streaks) >= maxEmptyTitleEntries {
+			t.sweepExpired(now)
+			if len(t.streaks) >= maxEmptyTitleEntries {
+				var oldestKey string
+				var oldestTime time.Time
+				for k, s := range t.streaks {
+					if oldestKey == "" || (s != nil && s.last.Before(oldestTime)) {
+						oldestKey = k
+						if s != nil {
+							oldestTime = s.last
+						}
+					}
+				}
+				if oldestKey != "" {
+					delete(t.streaks, oldestKey)
+				}
+			}
+		}
 		streak = &emptyTitleStreak{}
 		t.streaks[key] = streak
 	}
@@ -110,13 +140,16 @@ func (t *emptyTitleTracker) marked(key string, cacheTTL time.Duration, now time.
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	streak, ok := t.streaks[key]
-	if !ok || streak.count < emptyTitleMarkStreak {
+	if !ok {
 		return false
 	}
-	// Expiry-on-read prunes a mark whose evidence is stale, so the map does not
-	// retain one entry per title forever.
-	if streak.last.IsZero() || now.Sub(streak.last) > emptyTitleMarkTTL {
+	// Expiry-on-read prunes both completed marks and stale partial streaks
+	// whose evidence has lapsed, so cold titles are not retained indefinitely.
+	if streak == nil || streak.last.IsZero() || now.Sub(streak.last) > emptyTitleMarkTTL {
 		delete(t.streaks, key)
+		return false
+	}
+	if streak.count < emptyTitleMarkStreak {
 		return false
 	}
 	return !streak.first.IsZero() && streak.last.Sub(streak.first) >= required

@@ -104,7 +104,9 @@ function renderTracks(initial: {
   track?: PlayerSubtitleInfo;
   sourceGeneration?: number;
   refreshRevision?: number;
-  onLoadState?: (state: "idle" | "loading" | "refreshing" | "ready" | "error") => void;
+  onLoadState?: (
+    state: "idle" | "loading" | "refreshing" | "ready" | "error" | "unavailable",
+  ) => void;
   onSourceChanged?: () => void;
 }) {
   const videoRef = makeVideoRef(initial.readyState);
@@ -1446,9 +1448,9 @@ describe("subtitle track missing (404) parking", () => {
         await vi.advanceTimersByTimeAsync(0);
       });
       expect(fetchMock).toHaveBeenCalledTimes(1);
-      // A missing track renders like one with no cues: no loading chrome and
-      // no "Subtitles couldn't load" retry that could never succeed.
-      expect(states.at(-1)).toBe("idle");
+      // A missing track reports unavailable so the viewer sees the failure and
+      // can turn it off or switch, without claiming to be ready or idle.
+      expect(states.at(-1)).toBe("unavailable");
 
       // Backoff windows, window advances, and seeks are all the same parked
       // identity: none may re-request it.

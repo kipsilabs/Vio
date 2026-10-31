@@ -273,6 +273,10 @@ type VirtualCandidatesRefreshExecutor struct {
 	// MarkFailed stamps a durable failed verdict on a row AltMount declares
 	// failed. Nil disables stamping.
 	MarkFailed func(ctx context.Context, fileID int, expectedFilePath string, observedFailedAt *time.Time) error
+	// MarkFailedDetailed stamps a durable failed verdict and reports whether
+	// the write actually committed. When provided, it is preferred so fenced-out
+	// updates or delivery-grace refusals are not counted as stamped.
+	MarkFailedDetailed func(ctx context.Context, fileID int, expectedFilePath string, observedFailedAt *time.Time) (committed bool, err error)
 	// Store persists the indexer-only releases (step c).
 	Store *virtuallibrary.IndexerReleaseStore
 	// Searcher is the on-demand Prowlarr lookup (step b). Nil skips the search.
@@ -317,12 +321,24 @@ func (e *VirtualCandidatesRefreshExecutor) reconcileAltMountVerdicts(ctx context
 		if !verdicts[key] {
 			continue
 		}
-		if err := e.MarkFailed(ctx, file.ID, file.FilePath, file.FailedAt); err != nil {
-			e.logger().WarnContext(ctx, "virtual candidates refresh: failed to stamp AltMount-failed release",
-				"component", "api", contentIDKey, contentID, episodeIDKey, episodeID, "file_id", file.ID, "error", err)
-			continue
+		if e.MarkFailedDetailed != nil {
+			committed, err := e.MarkFailedDetailed(ctx, file.ID, file.FilePath, file.FailedAt)
+			if err != nil {
+				e.logger().WarnContext(ctx, "virtual candidates refresh: failed to stamp AltMount-failed release",
+					"component", "api", contentIDKey, contentID, episodeIDKey, episodeID, "file_id", file.ID, "error", err)
+				continue
+			}
+			if committed {
+				stamped++
+			}
+		} else {
+			if err := e.MarkFailed(ctx, file.ID, file.FilePath, file.FailedAt); err != nil {
+				e.logger().WarnContext(ctx, "virtual candidates refresh: failed to stamp AltMount-failed release",
+					"component", "api", contentIDKey, contentID, episodeIDKey, episodeID, "file_id", file.ID, "error", err)
+				continue
+			}
+			stamped++
 		}
-		stamped++
 	}
 	if stamped > 0 {
 		e.logger().InfoContext(ctx, "virtual candidates refresh: stamped AltMount-failed releases as unplayable",
