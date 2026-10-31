@@ -44,6 +44,13 @@ func TestStampStartVirtualCandidateFailedIndictsOnlyConfirmedDead(t *testing.T) 
 		t.Fatalf("empty provider listing stamped a candidate (%d stamps); it must stay unmarked", len(stamps))
 	}
 
+	// The fail-fast sentinel is a dependency condition (the title is marked
+	// without streams), not a verdict about this pin.
+	h.stampStartVirtualCandidateFailed(context.Background(), row, fmt.Errorf("resolve virtual playback: %w: title virtual://movie/movie-indict", virtuallibrary.ErrTitleWithoutStreams))
+	if len(stamps) != 1 {
+		t.Fatalf("fail-fast marked title stamped a candidate (%d stamps); it must stay unmarked", len(stamps))
+	}
+
 	// A row that already carries a verdict is never re-stamped.
 	now := time.Now()
 	row.FailedAt = &now
