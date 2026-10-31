@@ -21,7 +21,7 @@ import (
 // example virtualStartProbeBudget for a start-path probe or
 // virtualPendingHoldCap for the AltMount hold). No new tuning knob is added.
 type virtualResolveWaitLog struct {
-	ctx        context.Context
+	ctx        context.Context //nolint:containedctx // One wait cycle carries the caller's request context to tag its log lines.
 	kind       string
 	on         string
 	contentID  string
@@ -78,7 +78,7 @@ func (w *virtualResolveWaitLog) finish(err error) {
 
 func (w *virtualResolveWaitLog) attrs(extra ...any) []any {
 	attrs := []any{
-		"component", "api",
+		virtualEvidenceLogKeyComponent, virtualEvidenceLogValueAPI,
 		"wait_kind", w.kind,
 		"wait_on", w.on,
 	}

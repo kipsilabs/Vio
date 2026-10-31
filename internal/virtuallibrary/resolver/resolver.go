@@ -53,6 +53,10 @@ var ErrTMDBExternalIDLookupFailed = errors.New("TMDB external-id lookup failed")
 const (
 	virtualPathPrefix = "virtual://"
 
+	// Log attribute keys shared by the wait and fetch traces.
+	logKeyCacheKey = "cache_key"
+	logKeyReason   = "reason"
+
 	maxResponseBytes         = 4 << 20
 	maxCandidateCacheEntries = 256
 	maxCandidateCacheBytes   = 16 << 20
@@ -1394,7 +1398,7 @@ func (r *Resolver) awaitFlight(ctx context.Context, flight *candidateFlight, cac
 			"component", "virtuallibrary",
 			"wait_kind", "fetch",
 			"wait_on", "provider_fetch_flight",
-			"cache_key", cacheKey,
+			logKeyCacheKey, cacheKey,
 		}
 		if deadline, ok := ctx.Deadline(); ok {
 			attrs = append(attrs, "bound_ms", time.Until(deadline).Milliseconds())
@@ -1412,7 +1416,7 @@ func (r *Resolver) awaitFlight(ctx context.Context, flight *candidateFlight, cac
 			"component", "virtuallibrary",
 			"wait_kind", "fetch",
 			"wait_on", "provider_fetch_flight",
-			"cache_key", cacheKey,
+			logKeyCacheKey, cacheKey,
 			"waited_ms", elapsed.Milliseconds(),
 		}
 		if elapsed >= backgroundRefreshTimeout {
@@ -1563,8 +1567,8 @@ func (r *Resolver) fetchProviderCandidates(ctx context.Context, config Config, g
 				"media_type", mediaType, "media_id", mediaID,
 				"count", event.Count,
 				"duration_ms", event.Duration.Milliseconds(),
-				"cache_key", cacheKey,
-				"reason", string(reason),
+				logKeyCacheKey, cacheKey,
+				logKeyReason, string(reason),
 			}
 			if event.RequestID != "" {
 				attrs = append(attrs, "request_id", event.RequestID)
@@ -1594,8 +1598,8 @@ func (r *Resolver) fetchProviderCandidates(ctx context.Context, config Config, g
 	if fetchLogger != nil {
 		attrs := []any{
 			"media_type", mediaType, "media_id", mediaID,
-			"cache_key", cacheKey,
-			"reason", string(reason),
+			logKeyCacheKey, cacheKey,
+			logKeyReason, string(reason),
 		}
 		if deadline, ok := ctx.Deadline(); ok {
 			attrs = append(attrs, "bound_ms", time.Until(deadline).Milliseconds())
@@ -1660,8 +1664,8 @@ func (r *Resolver) fetchProviderCandidates(ctx context.Context, config Config, g
 			"media_type", mediaType, "media_id", mediaID,
 			"count", len(validCandidates),
 			"duration_ms", time.Since(started).Milliseconds(),
-			"cache_key", cacheKey,
-			"reason", string(reason),
+			logKeyCacheKey, cacheKey,
+			logKeyReason, string(reason),
 		}
 		if event.RequestID != "" {
 			attrs = append(attrs, "request_id", event.RequestID)

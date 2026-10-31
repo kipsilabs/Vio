@@ -334,7 +334,7 @@ func (fake *fakePreplayCatalog) waitForDiscoveries(t *testing.T, want int, timeo
 		if time.Now().After(deadline) {
 			t.Fatalf("discoveries = %d after %s, want %d", snap.discoveries, timeout, want)
 		}
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond) //nolint:forbidigo // Polls the fake's recorded discovery count.
 	}
 }
 
@@ -611,14 +611,11 @@ func TestCatalogDetailAnswersWithoutWaitingForPreplayDiscovery(t *testing.T) {
 	// The detached run completes and records its 30 s suppression window, so a
 	// later read in that window neither waits nor re-lists.
 	deadline := time.Now().Add(5 * time.Second)
-	for {
-		if fake.discoveryDoneCount() == 1 {
-			break
-		}
+	for fake.discoveryDoneCount() != 1 {
 		if time.Now().After(deadline) {
 			t.Fatal("detached discovery never completed")
 		}
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond) //nolint:forbidigo // Polls the detached run's completion counter.
 	}
 	// The detached run persisted the fresh candidate, so the next read serves
 	// it from the stored rows without another provider round-trip.

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -2109,7 +2110,7 @@ func VirtualSubtitleCacheIdentity(fileID int, virtualSourceURI string, trackInde
 // artifact for cosmetic changes.
 func SubtitleInventoryToken(tracks []models.SubtitleTrack) string {
 	if len(tracks) == 0 {
-		return "none"
+		return directStreamConditionalNone
 	}
 	var b strings.Builder
 	for _, track := range tracks {
@@ -2127,7 +2128,7 @@ func SubtitleInventoryToken(tracks []models.SubtitleTrack) string {
 		b.WriteByte('|')
 	}
 	sum := sha256.Sum256([]byte(b.String()))
-	return fmt.Sprintf("%x", sum[:8])
+	return hex.EncodeToString(sum[:8])
 }
 
 // LookupFontBundle returns the cached encoded font-bundle JSON for the key, or
