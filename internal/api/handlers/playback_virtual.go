@@ -5956,13 +5956,17 @@ func (h *PlaybackHandler) virtualProbeEvidenceArgsForRow(ctx context.Context, ca
 	crossRelease := !virtualProbeEvidenceSharesRowRelease(catalogFile, resolvedPath, candidate)
 
 	if stampProbe && probed != nil && probed.ProbedFormatSize > 0 {
-		declaredSize := catalogFile.FileSize
+		var declaredSize int64
 		if crossRelease {
+			// For cross-release adoption, validate served bytes against the incoming
+			// candidate's declared release size, never the superseded row's size.
 			if candidate.ReleaseSize > 0 {
 				declaredSize = candidate.ReleaseSize
 			} else if probed.FileSize > 0 {
 				declaredSize = probed.FileSize
 			}
+		} else {
+			declaredSize = catalogFile.FileSize
 		}
 		if declaredSize > 0 {
 			expectedRuntime := catalogFile.VirtualExpectedRuntimeMinutes

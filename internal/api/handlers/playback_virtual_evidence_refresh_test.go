@@ -240,3 +240,40 @@ func TestPersistVirtualProbeEvidenceAdoptsCrossReleaseCandidateWithMatchingCandi
 		t.Fatalf("adoption args = RequireAdopt %v adopt %q, want true/%q", captured.RequireAdopt, captured.AdoptPath, newCandidateURI)
 	}
 }
+
+func TestPersistVirtualProbeEvidenceAdoptsCrossReleaseCandidateWithUnknownCandidateSize(t *testing.T) {
+	row := &models.MediaFile{
+		ID: 7, ContentID: "movie-1", MediaFolderID: 3,
+		FilePath: "virtual://movie/tt7?result=old_release", ProbeSource: "virtual",
+		FileSize:                      6_330_000_000, // Old release was 6.33GB
+		VirtualExpectedRuntimeMinutes: 51,
+	}
+	fresh := *row
+	fresh.UpdatedAt = time.Now()
+	newCandidateURI := "virtual://movie/tt7?result=new_release_no_size"
+	// Candidate carries no declared release size (ReleaseSize = 0)
+	newCandidateTiers := resolver.NewPersistedIdentityTiers("", "", "Movie.New.Release", 0)
+	probed := &models.MediaFile{
+		ID:               7,
+		FilePath:         newCandidateURI,
+		FileSize:         0,
+		ProbedFormatSize: 4_200_000_000, // Differs from old row's 6.33GB
+		Duration:         3072,
+		AudioTracks:      []models.AudioTrack{{Codec: "eac3", Channels: 6, Language: "en"}},
+	}
+	var captured models.VirtualFilePersistArgs
+	h := &PlaybackHandler{
+		fileResolver: evidenceRefreshResolver{file: &fresh},
+		VirtualFileMetadataSaver: func(_ context.Context, args models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error) {
+			captured = args
+			return VirtualFileMetadataUpdateResult{MetadataUpdated: true, RowsAffected: 1}, nil
+		},
+	}
+
+	if _, committed := h.persistVirtualProbeEvidenceDurable(context.Background(), row, newCandidateURI, probed, newCandidateTiers, true); !committed {
+		t.Fatal("cross-release adoption with unknown candidate size must commit without comparing against the old release size")
+	}
+	if !captured.RequireAdopt || captured.AdoptPath != newCandidateURI {
+		t.Fatalf("adoption args = RequireAdopt %v adopt %q, want true/%q", captured.RequireAdopt, captured.AdoptPath, newCandidateURI)
+	}
+}
