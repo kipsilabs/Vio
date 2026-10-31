@@ -512,16 +512,15 @@ export default function ActionBar({
       playerInventory,
     );
   }, [isCatalogProbed, isWatchProbed, playerInventory, selectedVersion, selectedWatchVersion]);
-  // A row's tracks count as published evidence only when the version has been
-  // probed, or when the player's own inventory mirror has confirmed tracks.
-  const isProbed = isWatchProbed || isCatalogProbed;
   const audioRowsPublished =
-    (isWatchProbed && selectedWatchVersion !== undefined) ||
-    isCatalogProbed ||
+    Boolean(selectedWatchVersion?.probed_at) ||
+    Boolean(selectedVersion?.probed_at) ||
+    (selectedWatchVersion?.audio_tracks?.length ?? 0) > 0 ||
     (playerInventory?.audioTracks.length ?? 0) > 0;
   const subtitleRowsPublished =
-    (isWatchProbed && selectedWatchVersion !== undefined) ||
-    isCatalogProbed ||
+    Boolean(selectedWatchVersion?.probed_at) ||
+    Boolean(selectedVersion?.probed_at) ||
+    (selectedWatchVersion?.subtitle_tracks?.length ?? 0) > 0 ||
     (playerInventory?.subtitleTracks.length ?? 0) > 0;
   const audioInventoryProvisional = isOverlayInventoryProvisional(
     false,
