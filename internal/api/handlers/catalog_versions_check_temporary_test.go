@@ -70,6 +70,8 @@ func TestVirtualProviderListingTemporaryErrorClassification(t *testing.T) {
 		{"plain request failed", errors.New("virtual stream provider 7 request failed"), true},
 		{"resolver not installed", errors.New("virtual stream resolver is not installed"), true},
 		{"empty listing", errors.New("no streams available from provider"), true},
+		{"fail-fast marked title", fmt.Errorf("resolve virtual input: %w: title virtual://movie/tt-temporary", virtuallibrary.ErrTitleWithoutStreams), true},
+		{"fail-fast marked title bare", virtuallibrary.ErrTitleWithoutStreams, true},
 		{"confirmed dead only", errors.New("virtual stream provider returned no matching candidate"), false},
 		{"no usable stream only", errors.New("virtual transcode provider returned no usable stream"), false},
 	}
@@ -128,6 +130,7 @@ func TestCheckVersionTemporaryFailureNeverStamps(t *testing.T) {
 		{"timeout", context.DeadlineExceeded},
 		{"pending", fmt.Errorf("waiting for import: %w", virtuallibrary.ErrProviderPending)},
 		{"empty listing", errors.New("no streams available from provider")},
+		{"fail-fast marked title", fmt.Errorf("resolve virtual input: %w: title virtual://movie/tt-temporary", virtuallibrary.ErrTitleWithoutStreams)},
 		{"identity-bearing session-bound absent joined with outage", fmt.Errorf("%w: session-bound candidate absent: %w", resolver.ErrProviderUnavailable, virtuallibrary.ErrSessionBoundCandidateAbsent)},
 	}
 	for _, tc := range temporaryErrors {
