@@ -61,10 +61,11 @@ func rotationExhaustedReplanFixture(t *testing.T, pinnedErr, alternateErr error)
 		return pinnedErr
 	}
 	handler.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(func(_ context.Context, path string, _ int, _ string, _ int) (string, error) {
-		if providerDown.Load() {
-			if err := providerFailure(path); err != nil {
-				return "", err
-			}
+		if !providerDown.Load() {
+			return "http://127.0.0.1:8080/stream?path=" + path, nil
+		}
+		if err := providerFailure(path); err != nil {
+			return "", err
 		}
 		return "http://127.0.0.1:8080/stream?path=" + path, nil
 	})
