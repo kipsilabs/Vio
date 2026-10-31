@@ -6,6 +6,7 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
+	"github.com/Silo-Server/silo-server/internal/subtitles"
 )
 
 // A carried downloaded-subtitle ordinal with no captured tail cannot be proven
@@ -50,8 +51,16 @@ func TestRekeyReplanKeepsDownloadedSubtitleWithCapturedTail(t *testing.T) {
 		Container: "virtual",
 		FilePath:  "virtual://movie/tt?profile=hd&result=abc",
 	}
+	repo := newMockSubtitleRepoForHandler()
+	repo.list = []subtitles.DownloadedSubtitle{{
+		ID:          41,
+		MediaFileID: 200,
+		Format:      subtitles.FormatSRT,
+		Language:    "eng",
+	}}
 	handler := &PlaybackHandler{
 		fileResolver: mapPlaybackFileResolver{files: map[int]*models.MediaFile{200: file}},
+		SubtitleRepo: repo,
 	}
 	start := playback.StartRequestV3{
 		FileID:          200,

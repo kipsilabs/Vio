@@ -5160,17 +5160,9 @@ export function usePlaybackSession(
    * beside an active retry.
    */
   const markInventoryRetrying = useCallback(() => {
-    setState((current) => {
-      const rearmPending = Boolean(current.inventoryUrl);
-      if (rearmPending) {
-        inventoryPendingRef.current = true;
-      }
-      return {
-        ...current,
-        inventoryFailed: false,
-        inventoryPending: rearmPending ? true : current.inventoryPending,
-      };
-    });
+    setState((current) =>
+      current.inventoryFailed ? { ...current, inventoryFailed: false } : current,
+    );
   }, []);
 
   // Mirror the player's authoritative menus for the item page. The page can be

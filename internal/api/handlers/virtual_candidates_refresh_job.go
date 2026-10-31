@@ -321,22 +321,7 @@ func (e *VirtualCandidatesRefreshExecutor) reconcileAltMountVerdicts(ctx context
 		if !verdicts[key] {
 			continue
 		}
-		if e.MarkFailedDetailed != nil {
-			committed, err := e.MarkFailedDetailed(ctx, file.ID, file.FilePath, file.FailedAt)
-			if err != nil {
-				e.logger().WarnContext(ctx, "virtual candidates refresh: failed to stamp AltMount-failed release",
-					"component", "api", contentIDKey, contentID, episodeIDKey, episodeID, "file_id", file.ID, "error", err)
-				continue
-			}
-			if committed {
-				stamped++
-			}
-		} else {
-			if err := e.MarkFailed(ctx, file.ID, file.FilePath, file.FailedAt); err != nil {
-				e.logger().WarnContext(ctx, "virtual candidates refresh: failed to stamp AltMount-failed release",
-					"component", "api", contentIDKey, contentID, episodeIDKey, episodeID, "file_id", file.ID, "error", err)
-				continue
-			}
+		if e.stampAltMountVerdict(ctx, file, contentID, episodeID) {
 			stamped++
 		}
 	}
@@ -345,6 +330,24 @@ func (e *VirtualCandidatesRefreshExecutor) reconcileAltMountVerdicts(ctx context
 			"component", "api", contentIDKey, contentID, episodeIDKey, episodeID, "candidates", stamped)
 	}
 	return stamped
+}
+
+func (e *VirtualCandidatesRefreshExecutor) stampAltMountVerdict(ctx context.Context, file *models.MediaFile, contentID, episodeID string) bool {
+	if e.MarkFailedDetailed != nil {
+		committed, err := e.MarkFailedDetailed(ctx, file.ID, file.FilePath, file.FailedAt)
+		if err != nil {
+			e.logger().WarnContext(ctx, "virtual candidates refresh: failed to stamp AltMount-failed release",
+				"component", "api", contentIDKey, contentID, episodeIDKey, episodeID, "file_id", file.ID, "error", err)
+			return false
+		}
+		return committed
+	}
+	if err := e.MarkFailed(ctx, file.ID, file.FilePath, file.FailedAt); err != nil {
+		e.logger().WarnContext(ctx, "virtual candidates refresh: failed to stamp AltMount-failed release",
+			"component", "api", contentIDKey, contentID, episodeIDKey, episodeID, "file_id", file.ID, "error", err)
+		return false
+	}
+	return true
 }
 
 // altMountReleaseIndicts reports whether AltMount's authoritative snapshot

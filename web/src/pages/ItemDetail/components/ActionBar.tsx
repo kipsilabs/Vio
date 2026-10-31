@@ -524,12 +524,12 @@ export default function ActionBar({
     isCatalogProbed ||
     (playerInventory?.subtitleTracks.length ?? 0) > 0;
   const audioInventoryProvisional = isOverlayInventoryProvisional(
-    !isProbed && !playerInventory,
+    false,
     audioRowsPublished,
     selectedVersionWithTracks?.audio_tracks?.length ?? 0,
   );
   const subtitleInventoryProvisional = isOverlayInventoryProvisional(
-    !isProbed && !playerInventory,
+    false,
     subtitleRowsPublished,
     selectedVersionWithTracks?.subtitle_tracks?.length ?? 0,
   );
