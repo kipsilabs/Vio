@@ -31,6 +31,33 @@ func TestDetailMediaSourcesExcludeFailedVersions(t *testing.T) {
 	}
 }
 
+// TestDetailVersionScalarsUseFirstLiveVersion proves the version-derived scalar
+// fields are read from the first LIVE row after the failed-version filter, not
+// from whatever row happened to be first before it. A stale ticks/container/path
+// from a dead row would describe bytes the client cannot play.
+func TestDetailVersionScalarsUseFirstLiveVersion(t *testing.T) {
+	m := newMapper(NewResourceIDCodec(), &config.Config{})
+	detail := itemDetailToUpstream(&catalog.ItemDetail{
+		ContentID: "movie-1",
+		Type:      "movie",
+		Versions: []catalog.FileVersion{
+			{FileID: 42, Container: "mkv", Duration: 600, FilePath: "/media/dead.mkv", Failed: true},
+			{FileID: 43, Container: "mp4", Duration: 1200, FilePath: "/media/live.mp4"},
+		},
+	})
+
+	dto := m.itemFromDetailWithFields(detail, false, nil, nil)
+	if want := secondsToTicks(1200); dto.RunTimeTicks != want {
+		t.Fatalf("RunTimeTicks = %d, want %d from the live version", dto.RunTimeTicks, want)
+	}
+	if dto.Container != "mp4" {
+		t.Fatalf("Container = %q, want the live version's mp4", dto.Container)
+	}
+	if dto.Path != "/media/live.mp4" {
+		t.Fatalf("Path = %q, want the live version's path", dto.Path)
+	}
+}
+
 // TestDetailMediaSourcesKeepAllFailedList proves an all-failed item still lists
 // its versions rather than returning an empty version menu.
 func TestDetailMediaSourcesKeepAllFailedList(t *testing.T) {
