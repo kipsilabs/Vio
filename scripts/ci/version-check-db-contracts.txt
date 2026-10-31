@@ -7,6 +7,13 @@
 # Version liveness: a dead pin is stamped and reported unavailable, a healthy
 # same-identity observation clears the stamp and leaves the recovered row in the
 # picker, ambiguous provider answers leave the stamp alone, and an unauthorized
-# failed row stays indistinguishable from an unknown id.
+# failed row stays indistinguishable from an unknown id. Access is checked
+# before any resolve or stamp, an in-flight mutation fences the conditional
+# write, a metadata-only check refuses a substituted candidate, and an
+# identity-bearing row is judged by durable identity rather than result id.
 ./internal/api/handlers TestCatalogVersionsCheckHTTP
+./internal/api/handlers TestCatalogVersionsCheckAccess
 ./internal/api/handlers TestCatalogVersionsCheckAccessHidesFailedVerdict
+./internal/api/handlers TestCatalogVersionsCheckInFlightFencing
+./internal/api/handlers TestCatalogVersionsCheckStrictCandidate
+./internal/api/handlers TestCatalogVersionsCheckIdentityVerdicts
