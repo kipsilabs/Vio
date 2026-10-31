@@ -53,14 +53,18 @@ func (h *ItemsHandler) WatchDetail(ctx context.Context, userID int, profileID, c
 	return detail, nil
 }
 
-// scheduleSelectedVirtualProbe schedules the pre-play probe chain when a
-// watch-detail read names one virtual version whose track inventory has not
-// been enumerated yet. Selecting a non-default row previously left its
-// audio/subtitle menus unknown until the row played, because only the
-// discovery path scheduled a probe and it targets the default. The chain
-// re-reads the row under the same access filter and skips a row that is
-// already probed, so a fresh selection schedules nothing; a bare listing or
-// polling read carries no selection and schedules nothing either.
+// scheduleSelectedVirtualProbe schedules the pre-play work for an explicitly
+// selected virtual version: the probe chain when its track inventory has not
+// been enumerated yet, and the provider fetch warm-up in every case.
+//
+// Probe-on-select exists because selecting a non-default row previously left
+// its audio/subtitle menus unknown until the row played. Warm-on-select exists
+// because probe evidence does not mean the provider has fetched the bytes: a
+// cold release (AltMount's NZB download, for example) still blocks the first
+// play even when the row was probed long ago, so the explicit pick starts the
+// same fill a play would. The warm-up is fire-and-forget and re-reads the row
+// under the same access filter, so a bare listing or polling read (no explicit
+// selection) schedules neither.
 func (h *ItemsHandler) scheduleSelectedVirtualProbe(detail *catalog.WatchDetail, filter catalog.AccessFilter) {
 	if h == nil || h.virtualSelectionProber == nil || detail == nil || filter.SelectedFileID <= 0 {
 		return
@@ -73,16 +77,21 @@ func (h *ItemsHandler) scheduleSelectedVirtualProbe(detail *catalog.WatchDetail,
 		if version.FileID != filter.SelectedFileID {
 			continue
 		}
-		// Only a virtual row has provider bytes to enumerate, and only an
-		// unstamped row still needs them. A local row and a probed row both
-		// leave nothing to schedule.
+		// Only a virtual row has provider bytes to enumerate and warm. A local
+		// row leaves both entry points nothing to do.
 		if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(version.FilePath)), virtualPlaybackPrefix) {
 			return
 		}
-		if version.ProbedAt != nil {
-			return
+		// Only an unstamped row still needs the inventory probe; a probed row
+		// skips it but still warms, because the probe says nothing about whether
+		// the provider's copy is fetched. Scheduling the probe first lets a live
+		// chain for an unprobed row cover the warm-up (it opens the same URL and
+		// starts the same fetch), while a refused probe leaves the warm-up to
+		// start the fetch on its own.
+		if version.ProbedAt == nil {
+			h.virtualSelectionProber.ScheduleSelectedFileProbe(detail.ContentID, version.FileID, filter)
 		}
-		h.virtualSelectionProber.ScheduleSelectedFileProbe(detail.ContentID, version.FileID, filter)
+		h.virtualSelectionProber.ScheduleSelectedFileWarm(detail.ContentID, version.FileID, filter)
 		return
 	}
 }

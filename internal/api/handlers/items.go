@@ -159,11 +159,13 @@ type VirtualFileByID interface {
 	GetByID(ctx context.Context, id int) (*models.MediaFile, error)
 }
 
-// VirtualSelectionProber schedules the pre-play probe chain for one
-// explicitly selected virtual version. *PlaybackHandler.ScheduleSelectedFileProbe
-// implements it; nil disables selection probing.
+// VirtualSelectionProber schedules the pre-play work for one explicitly
+// selected virtual version: the probe chain that enumerates its inventory, and
+// the provider-side fetch warm-up that puts its bytes in place before play.
+// *PlaybackHandler implements both entry points; nil disables selection work.
 type VirtualSelectionProber interface {
 	ScheduleSelectedFileProbe(contentID string, fileID int, filter catalog.AccessFilter)
+	ScheduleSelectedFileWarm(contentID string, fileID int, filter catalog.AccessFilter)
 }
 
 // SetVirtualPrefetcher wires watch-detail prefetch. Either arg may be nil to

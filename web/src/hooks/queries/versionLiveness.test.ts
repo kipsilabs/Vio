@@ -37,6 +37,7 @@ function makeVersion(overrides: Partial<FileVersion> = {}): FileVersion {
     file_path: overrides.file_path,
     available: overrides.available,
     failed: overrides.failed,
+    source_mismatch: overrides.source_mismatch,
   };
 }
 
@@ -276,6 +277,66 @@ describe("applyVersionAvailability", () => {
     const versions = [makeVersion({ file_id: 1, available: true })];
 
     expect(applyVersionAvailability(versions, new Map([[1, { available: true }]]))).toBe(versions);
+  });
+});
+
+describe("mergeVersionLiveness source mismatch", () => {
+  it("carries a mismatch verdict from the check result", () => {
+    const versions = [makeVersion({ file_id: 1, container: "virtual" })];
+    const merged = mergeVersionLiveness(versions, {
+      results: [
+        {
+          file_id: 1,
+          available: true,
+          source_mismatch: { served_bytes: 7_000, declared_bytes: 8_000 },
+        },
+      ],
+    });
+    expect(merged.get(1)).toEqual({
+      available: true,
+      failed: undefined,
+      sourceMismatch: { servedBytes: 7_000, declaredBytes: 8_000 },
+    });
+  });
+
+  it("leaves an unprobed row without a mismatch verdict", () => {
+    const versions = [makeVersion({ file_id: 1, container: "virtual" })];
+    const merged = mergeVersionLiveness(versions, {
+      results: [{ file_id: 1, available: true }],
+    });
+    expect(merged.get(1)?.sourceMismatch).toBeUndefined();
+  });
+});
+
+describe("applyVersionAvailability source mismatch", () => {
+  it("stamps the mismatch onto the row without marking it failed", () => {
+    const versions = [makeVersion({ file_id: 1 })];
+    const next = applyVersionAvailability(
+      versions,
+      new Map([
+        [1, { available: true, sourceMismatch: { servedBytes: 7_000, declaredBytes: 8_000 } }],
+      ]),
+    );
+    expect(next[0]?.available).toBe(true);
+    expect(next[0]?.failed).toBeUndefined();
+    expect(next[0]?.source_mismatch).toEqual({ served_bytes: 7_000, declared_bytes: 8_000 });
+  });
+
+  it("clears a stale mismatch when the check reports none", () => {
+    const versions = [
+      makeVersion({
+        file_id: 1,
+        available: true,
+        source_mismatch: { served_bytes: 7_000, declared_bytes: 8_000 },
+      }),
+    ];
+    const next = applyVersionAvailability(versions, new Map([[1, { available: true }]]));
+    expect(next[0]?.source_mismatch).toBeUndefined();
+  });
+
+  it("leaves an unprobed row and its identity untouched", () => {
+    const versions = [makeVersion({ file_id: 1, container: "virtual" })];
+    expect(applyVersionAvailability(versions, new Map())).toBe(versions);
   });
 });
 

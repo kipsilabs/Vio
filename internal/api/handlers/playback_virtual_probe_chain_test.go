@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -14,6 +15,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/notifications"
+	"github.com/Silo-Server/silo-server/internal/playback"
 )
 
 // The pre-play probe chain must never block its caller, never probe bytes it
@@ -1217,6 +1219,123 @@ func TestScheduleSelectedFileProbeProbesTheSelectedRow(t *testing.T) {
 	}
 }
 
+// TestScheduleSelectedFileWarmStartsProviderFetchForProbedSelection pins
+// warm-on-select: an explicit selection hands the row's virtual URI to the same
+// fill playback start uses, even when the row already carries probe evidence,
+// and the probe chain stays untouched.
+func TestScheduleSelectedFileWarmStartsProviderFetchForProbedSelection(t *testing.T) {
+	probedAt := time.Now()
+	selectedRow := probeChainRow(742, "virtual://movie/probe-chain?result=warm", &probedAt)
+	reader := &probeChainVersionReader{
+		files: []*models.MediaFile{selectedRow},
+		rows:  map[int]*models.MediaFile{selectedRow.ID: selectedRow},
+	}
+	prober := &recordingProber{}
+	var mu sync.Mutex
+	var warmCalls []recordedWarmCall
+	h := &PlaybackHandler{
+		ServiceContext:              context.Background(),
+		DefaultProbeTarget:          NewVirtualDefaultProbeTarget(reader, reader),
+		VirtualPlaybackSourceProber: prober.probe,
+		VirtualReleaseCacheWarmup: VirtualReleaseCacheFillFunc(func(_ context.Context, virtualURI string, ownerID int, _ func(playback.DownloadProgressPayload)) error {
+			mu.Lock()
+			warmCalls = append(warmCalls, recordedWarmCall{virtualURI: virtualURI, ownerID: ownerID})
+			mu.Unlock()
+			return nil
+		}),
+	}
+
+	h.ScheduleSelectedFileWarm(probeChainTestContent, selectedRow.ID, catalog.AccessFilter{AllowedLibraryIDs: []int{77}})
+	h.warmChainWG.Wait()
+
+	mu.Lock()
+	got := slices.Clone(warmCalls)
+	mu.Unlock()
+	if len(got) != 1 {
+		t.Fatalf("warm-ups = %d, want exactly 1", len(got))
+	}
+	if got[0].virtualURI != selectedRow.FilePath || got[0].ownerID != selectedRow.VirtualOwnerInstallationID {
+		t.Fatalf("warm-up = %+v, want the selected row's URI %q and owner %d",
+			got[0], selectedRow.FilePath, selectedRow.VirtualOwnerInstallationID)
+	}
+	if prober.count() != 0 {
+		t.Fatalf("probes = %d, want none: a probed row warms without re-probing", prober.count())
+	}
+}
+
+// TestScheduleSelectedFileWarmCoalescesLiveWarmUps pins the admission contract:
+// a second explicit selection while the first warm-up is live is dropped rather
+// than spawning a second target read or a second fill.
+func TestScheduleSelectedFileWarmCoalescesLiveWarmUps(t *testing.T) {
+	selectedRow := probeChainRow(743, "virtual://movie/probe-chain?result=warm-live", nil)
+	target := &blockedDefaultTarget{open: make(chan struct{}), row: selectedRow}
+	var mu sync.Mutex
+	warmCount := 0
+	h := &PlaybackHandler{
+		ServiceContext:     context.Background(),
+		DefaultProbeTarget: target,
+		VirtualReleaseCacheWarmup: VirtualReleaseCacheFillFunc(func(_ context.Context, _ string, _ int, _ func(playback.DownloadProgressPayload)) error {
+			mu.Lock()
+			warmCount++
+			mu.Unlock()
+			return nil
+		}),
+	}
+
+	h.ScheduleSelectedFileWarm(probeChainTestContent, selectedRow.ID, catalog.AccessFilter{})
+	probeChainWaitFor(t, 1, target.callCount, "target reads")
+	h.ScheduleSelectedFileWarm(probeChainTestContent, selectedRow.ID, catalog.AccessFilter{})
+	probeChainStableWait(t, 1, target.callCount, "target reads after a duplicate selection")
+
+	target.releaseRow()
+	h.warmChainWG.Wait()
+	mu.Lock()
+	defer mu.Unlock()
+	if warmCount != 1 {
+		t.Fatalf("warm-ups = %d, want exactly 1", warmCount)
+	}
+}
+
+// TestScheduleSelectedFileWarmSkipsWhenProbeChainIsLive pins the shared-fetch
+// rule: a live pre-play probe already opens the provider URL, which starts the
+// same fetch, so the warm-up is not scheduled on top of it.
+func TestScheduleSelectedFileWarmSkipsWhenProbeChainIsLive(t *testing.T) {
+	selectedRow := probeChainRow(744, "virtual://movie/probe-chain?result=warm-probe-live", nil)
+	target := &blockedDefaultTarget{open: make(chan struct{}), row: selectedRow}
+	var mu sync.Mutex
+	warmCount := 0
+	h := &PlaybackHandler{
+		ServiceContext:     context.Background(),
+		DefaultProbeTarget: target,
+		VirtualReleaseCacheWarmup: VirtualReleaseCacheFillFunc(func(_ context.Context, _ string, _ int, _ func(playback.DownloadProgressPayload)) error {
+			mu.Lock()
+			warmCount++
+			mu.Unlock()
+			return nil
+		}),
+	}
+	release, refusal := h.defaultProbeChains.acquire(probeChainTestContent + "\x00" + strconv.Itoa(selectedRow.ID))
+	if refusal != defaultProbeChainRefusalNone {
+		t.Fatalf("probe admission refused: %s", refusal)
+	}
+	defer release()
+
+	h.ScheduleSelectedFileWarm(probeChainTestContent, selectedRow.ID, catalog.AccessFilter{})
+	h.warmChainWG.Wait()
+	probeChainStableWait(t, 0, target.callCount, "target reads with a live probe chain")
+
+	mu.Lock()
+	defer mu.Unlock()
+	if warmCount != 0 {
+		t.Fatalf("warm-ups = %d, want none while the probe chain is live", warmCount)
+	}
+}
+
+type recordedWarmCall struct {
+	virtualURI string
+	ownerID    int
+}
+
 type selectionProbeCall struct {
 	contentID string
 	fileID    int
@@ -1224,10 +1343,11 @@ type selectionProbeCall struct {
 }
 
 // recordingSelectionProber records what the watch-detail trigger hands to the
-// probe scheduler.
+// probe and warm schedulers.
 type recordingSelectionProber struct {
-	mu    sync.Mutex
-	calls []selectionProbeCall
+	mu        sync.Mutex
+	calls     []selectionProbeCall
+	warmCalls []selectionProbeCall
 }
 
 func (r *recordingSelectionProber) ScheduleSelectedFileProbe(contentID string, fileID int, filter catalog.AccessFilter) {
@@ -1236,16 +1356,30 @@ func (r *recordingSelectionProber) ScheduleSelectedFileProbe(contentID string, f
 	r.calls = append(r.calls, selectionProbeCall{contentID: contentID, fileID: fileID, filter: filter})
 }
 
+func (r *recordingSelectionProber) ScheduleSelectedFileWarm(contentID string, fileID int, filter catalog.AccessFilter) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.warmCalls = append(r.warmCalls, selectionProbeCall{contentID: contentID, fileID: fileID, filter: filter})
+}
+
 func (r *recordingSelectionProber) snapshot() []selectionProbeCall {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return slices.Clone(r.calls)
 }
 
+func (r *recordingSelectionProber) warmSnapshot() []selectionProbeCall {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Clone(r.warmCalls)
+}
+
 // TestWatchDetailSelectionSchedulesProbeOnlyForUnprobedVirtualRow pins the
 // trigger rule: only a read that names an explicit, virtual, still-unprobed
 // version schedules a probe. A bare read, a local selection, and a selection
-// with fresh inventory all schedule nothing.
+// with fresh inventory all schedule no probe. Every explicit virtual selection
+// (probed or not) schedules a provider fetch warm-up, because probe evidence
+// does not mean the provider has fetched the bytes.
 func TestWatchDetailSelectionSchedulesProbeOnlyForUnprobedVirtualRow(t *testing.T) {
 	prober := &recordingSelectionProber{}
 	h := &ItemsHandler{virtualSelectionProber: prober}
@@ -1263,8 +1397,12 @@ func TestWatchDetailSelectionSchedulesProbeOnlyForUnprobedVirtualRow(t *testing.
 	if got := prober.snapshot(); len(got) != 0 {
 		t.Fatalf("bare read scheduled %d probes, want none", len(got))
 	}
+	if got := prober.warmSnapshot(); len(got) != 0 {
+		t.Fatalf("bare read scheduled %d warm-ups, want none", len(got))
+	}
 
-	// An explicit selection of the virtual row schedules exactly that row.
+	// An explicit selection of the virtual row schedules exactly that row's
+	// probe and its warm-up.
 	h.scheduleSelectedVirtualProbe(detail, catalog.AccessFilter{SelectedFileID: 22})
 	got := prober.snapshot()
 	if len(got) != 1 {
@@ -1273,18 +1411,32 @@ func TestWatchDetailSelectionSchedulesProbeOnlyForUnprobedVirtualRow(t *testing.
 	if got[0].contentID != detail.ContentID || got[0].fileID != 22 || got[0].filter.SelectedFileID != 22 {
 		t.Fatalf("scheduled probe = %+v, want content %q file 22 with its selection", got[0], detail.ContentID)
 	}
+	warm := prober.warmSnapshot()
+	if len(warm) != 1 {
+		t.Fatalf("explicit selection scheduled %d warm-ups, want 1", len(warm))
+	}
+	if warm[0].contentID != detail.ContentID || warm[0].fileID != 22 || warm[0].filter.SelectedFileID != 22 {
+		t.Fatalf("scheduled warm-up = %+v, want content %q file 22 with its selection", warm[0], detail.ContentID)
+	}
 
-	// Selecting a local row has no provider bytes to enumerate.
+	// Selecting a local row has no provider bytes to enumerate or fetch.
 	h.scheduleSelectedVirtualProbe(detail, catalog.AccessFilter{SelectedFileID: 21})
 	if got := prober.snapshot(); len(got) != 1 {
 		t.Fatalf("local selection scheduled %d probes, want none", len(got)-1)
 	}
+	if got := prober.warmSnapshot(); len(got) != 1 {
+		t.Fatalf("local selection scheduled %d warm-ups, want none", len(got)-1)
+	}
 
-	// A selected row with fresh inventory needs no probe.
+	// A selected row with fresh inventory needs no probe, but still warms: the
+	// bytes may be cold even though the inventory is known.
 	probedAt := time.Now()
 	detail.Versions[1].ProbedAt = &probedAt
 	h.scheduleSelectedVirtualProbe(detail, catalog.AccessFilter{SelectedFileID: 22})
 	if got := prober.snapshot(); len(got) != 1 {
 		t.Fatalf("fresh selection scheduled %d probes, want none", len(got)-1)
+	}
+	if got := prober.warmSnapshot(); len(got) != 2 {
+		t.Fatalf("fresh selection scheduled %d warm-ups, want a second one", len(got))
 	}
 }

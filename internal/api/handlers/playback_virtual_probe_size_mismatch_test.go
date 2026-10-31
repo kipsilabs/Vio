@@ -44,7 +44,7 @@ func TestBackgroundProbeAcceptsServedSizeMismatchWhenDurationMatches(t *testing.
 	key := virtualProbeFailureKey(uri, 5)
 	virtualProbeFailures.clear(key)
 	virtualProbeFailures.clearSizeMismatch(key)
-	virtualProbeFailures.markSizeMismatch(key) // a previous stale fill armed the wrong-source damper
+	virtualProbeFailures.markSizeMismatch(key, 1, 1) // a previous stale fill armed the wrong-source damper
 	t.Cleanup(func() {
 		virtualProbeFailures.clear(key)
 		virtualProbeFailures.clearSizeMismatch(key)

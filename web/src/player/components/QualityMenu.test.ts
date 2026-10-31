@@ -146,6 +146,26 @@ describe("buildVersionStatusLabels", () => {
       ),
     ).toEqual(["Requested"]);
   });
+
+  it("reports a source mismatch without dropping the available row", () => {
+    expect(
+      buildVersionStatusLabels(
+        makeVersionInfo({
+          sourceMismatch: { servedBytes: 7_000, declaredBytes: 8_000 },
+        }),
+      ),
+    ).toEqual(["Source mismatch — served 6.8 KB of declared 7.8 KB"]);
+  });
+
+  it("does not mark a source mismatch failed", () => {
+    expect(
+      buildVersionStatusLabels(
+        makeVersionInfo({
+          sourceMismatch: { servedBytes: 7_000, declaredBytes: 8_000 },
+        }),
+      ),
+    ).not.toContain("Failed");
+  });
 });
 
 describe("QualityMenu", () => {

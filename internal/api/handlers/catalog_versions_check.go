@@ -45,6 +45,21 @@ type versionCheckResult struct {
 	// confirmed unservable: menus remove the row instead of offering a
 	// retry-able pick.
 	Failed bool `json:"failed,omitempty"`
+	// SourceMismatch reports the byte verdict of a recent probe that rejected
+	// the provider's bytes as a different release than the row declares. It is
+	// additive and transient: it is present only while the process still holds
+	// the short wrong-source marker (no database column). A mismatch never
+	// means the release is dead, so it never travels with failed and never
+	// changes available.
+	SourceMismatch *versionCheckSourceMismatch `json:"source_mismatch,omitempty"`
+}
+
+// versionCheckSourceMismatch carries the served-vs-declared byte sizes of a
+// rejected probe so the version list can render a distinct source-mismatch
+// state instead of the generic unprobed/retry presentation.
+type versionCheckSourceMismatch struct {
+	ServedBytes   int64 `json:"served_bytes"`
+	DeclaredBytes int64 `json:"declared_bytes"`
 }
 
 type versionCheckResponse struct {
@@ -74,6 +89,10 @@ type versionCheckOutcome struct {
 	// and unwired files report without resolving and stay out of the gate
 	// denominator.
 	checked bool
+	// sourceMismatch carries a recent rejected probe's byte verdict for this
+	// row. It is advisory only: it never sets stamp, never changes available,
+	// and never marks the row failed.
+	sourceMismatch *versionCheckSourceMismatch
 }
 
 const (
@@ -183,7 +202,12 @@ func (h *CatalogResourceHandler) HandleCheckVersions(w http.ResponseWriter, r *h
 			// report a new failure only for the confirmed post-write state.
 			stamped = h.stampVirtualCandidateFailed(ctx, outcome.fileID, outcome.file)
 		}
-		results = append(results, versionCheckResult{FileID: outcome.fileID, Available: outcome.available, Failed: versionCheckFailed(outcome, stamped)})
+		results = append(results, versionCheckResult{
+			FileID:         outcome.fileID,
+			Available:      outcome.available,
+			Failed:         versionCheckFailed(outcome, stamped),
+			SourceMismatch: outcome.sourceMismatch,
+		})
 	}
 
 	writeJSON(w, http.StatusOK, versionCheckResponse{Results: results})
@@ -217,6 +241,7 @@ func (h *CatalogResourceHandler) checkVersion(ctx context.Context, fileID int) v
 	}
 	outcome.file = file
 	outcome.durableAlive = file.FailedAt == nil
+	outcome.sourceMismatch = versionCheckSourceMismatchFor(file)
 	if !isVirtualPlaybackFile(file) {
 		outcome.available = file.MissingSince == nil
 		return outcome
@@ -350,6 +375,27 @@ func (h *CatalogResourceHandler) checkVersion(ctx context.Context, fileID int) v
 	outcome.checked = true
 	outcome.available = outcome.durableAlive
 	return outcome
+}
+
+// versionCheckSourceMismatchFor reads the process-wide wrong-source verdict a
+// playback probe recorded for this row. A mismatch is not a liveness verdict:
+// the release is fine, only the bytes the provider served were wrong, so the
+// caller reports it alongside available/failed without touching either. The
+// signal lives only in the in-memory probe damper (keyed exactly like the
+// playback probe cache), so it is intentionally absent after a restart or on a
+// node that did not run the probe; the version list then keeps its generic
+// unprobed presentation instead of inventing a mismatch.
+func versionCheckSourceMismatchFor(file *models.MediaFile) *versionCheckSourceMismatch {
+	if file == nil || !isVirtualPlaybackFile(file) {
+		return nil
+	}
+	served, declared, ok := virtualProbeFailures.sizeMismatchVerdict(
+		virtualProbeFailureKey(file.FilePath, file.VirtualOwnerInstallationID),
+	)
+	if !ok {
+		return nil
+	}
+	return &versionCheckSourceMismatch{ServedBytes: served, DeclaredBytes: declared}
 }
 
 // versionCheckFailed reports whether a checked row carries a durable failed

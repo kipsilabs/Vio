@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/logredact"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary/resolver"
 )
@@ -49,6 +50,13 @@ import (
 // applies its own inner budget on top, so the total cost of a chain is bounded
 // twice: once here, by the chain owner, and once inside the probe.
 var virtualDefaultProbeChainBudget = 90 * time.Second
+
+// virtualSelectionWarmBudget bounds one explicit-selection warm-up. The work is
+// a single forced provider listing — the same call playback start makes in
+// FillVirtualReleaseCache — not the provider-side fetch itself, which the
+// provider continues after the listing returns. Two minutes is generous for a
+// slow provider listing and still bounds a wedged call.
+var virtualSelectionWarmBudget = 2 * time.Minute
 
 // virtualDefaultProbeChainConcurrency bounds how many chains run at once.
 // Two keeps a household-wide discovery burst from saturating the detached
@@ -270,6 +278,20 @@ func (a *defaultProbeChainAdmission) cancelKey(key string) bool {
 	return true
 }
 
+// isLive reports whether a chain for key is currently admitted. It performs no
+// I/O and spawns nothing; callers use it to avoid duplicating work another
+// admitted chain already covers (for example a selection warm-up that would
+// re-open the bytes a live pre-play probe is already touching).
+func (a *defaultProbeChainAdmission) isLive(key string) bool {
+	if a == nil || key == "" {
+		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	_, live := a.active[key]
+	return live
+}
+
 func (a *defaultProbeChainAdmission) release(contentID string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -334,6 +356,120 @@ func (h *PlaybackHandler) ScheduleSelectedFileProbe(contentID string, fileID int
 	}
 	filter.SelectedFileID = fileID
 	h.scheduleFileProbe(contentID, nil, nil, filter, virtualProbeChainTriggerSelection, true)
+}
+
+// ScheduleSelectedFileWarm is the explicit-selection warm-up entry point: it
+// starts the provider-side fetch for the selected row's bytes as soon as the
+// viewer picks that version, instead of waiting for the play press to do it.
+// The row may already be probed — that is the common case and exactly why this
+// is separate from the probe chain: ffprobe evidence says what the bytes are,
+// not that the provider has fetched them, and a cold AltMount release still
+// blocks the first play for the length of the NZB download.
+//
+// It reuses the playback start's own fill call (VirtualReleaseCacheWarmup is the
+// same VirtualReleaseCacheFillFunc the stream handler fills a pinned release
+// with), so there is no second download path. The wired fill already skips a
+// release the provider reports cached or downloaded, and a provider it cannot
+// classify, so an already-cached selection costs nothing. Fire-and-forget and
+// bounded: the caller only reserves an admission slot; the target re-read, the
+// listing, and the goroutine all happen detached under virtualSelectionWarmBudget
+// and the shared detached-work gate.
+//
+// Deduplication matches the probe chain: one live warm-up per (item, selected
+// file), and a live pre-play probe for the same row covers the fetch because
+// opening the provider URL is itself what starts it. Nothing here writes the
+// catalog — no inventory, no probe stamp, no failed_at verdict — it only makes
+// the bytes available earlier, so a failure is a debug line and never a verdict.
+//
+// Metered connections: a watch-detail read carries no server-visible network
+// hint (the client's metered flag exists only on a playback plan request), and
+// the codebase's only Wi-Fi gate, downloads.wifi_only, is a per-profile
+// client-download preference, not a server-side prefetch switch. The default is
+// therefore to warm every explicit selection and let the cached-release check
+// skip the redundant ones. A future toggle belongs with the other
+// virtual_library.* settings next to cache_ttl_minutes and would be read where
+// the fill is wired, not here; no settings key is introduced for it now.
+func (h *PlaybackHandler) ScheduleSelectedFileWarm(contentID string, fileID int, filter catalog.AccessFilter) {
+	if h == nil || contentID == "" || fileID <= 0 {
+		return
+	}
+	if h.VirtualReleaseCacheWarmup == nil || h.DefaultProbeTarget == nil {
+		return
+	}
+	filter.SelectedFileID = fileID
+	// A live probe chain for this exact row is already opening the provider URL,
+	// which starts the same fetch; a second listing would only duplicate it.
+	if h.defaultProbeChains.isLive(contentID + "\x00" + strconv.Itoa(fileID)) {
+		logVirtualSelectionWarmSkip(contentID, "probe_live")
+		return
+	}
+	ctx, cancel := h.virtualDetachedContext(context.Background(), virtualSelectionWarmBudget)
+	release, refusal := h.selectedWarmChains.acquireWithCancel("warm\x00"+contentID+"\x00"+strconv.Itoa(fileID), cancel)
+	if refusal != defaultProbeChainRefusalNone {
+		cancel()
+		logVirtualSelectionWarmSkip(contentID, string(refusal))
+		return
+	}
+	filterSnapshot := virtualProbeAccessFilterSnapshot(filter)
+	h.warmChainWG.Add(1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				slog.ErrorContext(context.WithoutCancel(ctx), "virtual selection warm-up panicked",
+					"component", "api", "content_id", contentID, "stack", string(debug.Stack()))
+			}
+			release()
+			cancel()
+			h.warmChainWG.Done()
+		}()
+		h.runSelectedFileWarm(ctx, contentID, filterSnapshot)
+	}()
+}
+
+// logVirtualSelectionWarmSkip records why an explicit selection did not start a
+// warm-up. Expected skips stay at debug: the play path fills the same release
+// when the time comes, so a skipped warm-up is a latency miss, not a failure.
+func logVirtualSelectionWarmSkip(contentID, reason string) {
+	slog.DebugContext(context.Background(), "virtual selection warm-up skipped",
+		"component", "api",
+		contentIDKey, contentID,
+		virtualEvidenceLogKeyReason, reason,
+		"trigger", virtualProbeChainTriggerSelection)
+}
+
+// runSelectedFileWarm is the body of one admitted warm-up. It re-reads the
+// selected row under the triggering request's access filter (the same
+// authorization the probe chain uses), requires the exact row and a virtual
+// path, then hands the row's virtual URI to the playback fill call. It never
+// writes catalog state and never changes a verdict.
+func (h *PlaybackHandler) runSelectedFileWarm(ctx context.Context, contentID string, filter catalog.AccessFilter) {
+	if err := ctx.Err(); err != nil {
+		return
+	}
+	row, err := h.DefaultProbeTarget.DefaultVirtualProbeTarget(ctx, contentID, filter)
+	if err != nil || row == nil {
+		return
+	}
+	if filter.SelectedFileID > 0 && row.ID != filter.SelectedFileID {
+		return
+	}
+	if !isVirtualPlaybackFile(row) {
+		return
+	}
+	gate := h.detachedGate()
+	if !gate.tryAcquire() {
+		logVirtualSelectionWarmSkip(contentID, virtualProbeChainReasonGateBusy)
+		return
+	}
+	defer gate.release()
+	if err := ctx.Err(); err != nil {
+		return
+	}
+	if err := h.VirtualReleaseCacheWarmup(ctx, row.FilePath, row.VirtualOwnerInstallationID, nil); err != nil {
+		slog.DebugContext(ctx, "virtual selection warm-up could not start the provider fetch",
+			"component", "api", "content_id", contentID, "file_id", row.ID,
+			virtualEvidenceLogKeyError, logredact.SanitizeURLError(err))
+	}
 }
 
 // scheduleFileProbe is the one admission and hand-off path: it validates the

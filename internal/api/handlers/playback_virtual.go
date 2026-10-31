@@ -134,10 +134,18 @@ var virtualBackgroundProbeBudget = scanner.VirtualProbeTimeout
 // virtualProbeFailureMark records the most recent failure for one candidate,
 // the backoff window derived from the number of consecutive failures, and the
 // running failure count that gates unpinning.
+//
+// A wrong-source marker additionally carries the observed byte verdict: the
+// bytes the probe read (servedBytes) and the bytes the catalog row declares
+// (declaredBytes). That lets the version list report the mismatch as a
+// distinct state instead of inferring it from a missing probe. Both stay zero
+// on every other marker kind.
 type virtualProbeFailureMark struct {
-	ttl       time.Duration
-	expiresAt time.Time
-	failures  int
+	ttl           time.Duration
+	expiresAt     time.Time
+	failures      int
+	servedBytes   int64
+	declaredBytes int64
 }
 
 // virtualProbeFailureCache remembers the last failed probe per candidate so a
@@ -232,6 +240,14 @@ func (c *virtualProbeFailureCache) mark(key string) {
 // different backoff posture (the wrong-source damper) use this directly
 // instead of mark.
 func (c *virtualProbeFailureCache) markFor(key string, baseTTL, maxTTL time.Duration) {
+	c.markForBytes(key, baseTTL, maxTTL, 0, 0)
+}
+
+// markForBytes is markFor with the observed served/declared byte verdict
+// attached. Only the wrong-source marker passes non-zero sizes; every other
+// mark leaves them zero so the version list never reads a size verdict from a
+// dead-candidate or partial-enumeration marker.
+func (c *virtualProbeFailureCache) markForBytes(key string, baseTTL, maxTTL time.Duration, servedBytes, declaredBytes int64) {
 	if c == nil || key == "" {
 		return
 	}
@@ -263,7 +279,10 @@ func (c *virtualProbeFailureCache) markFor(key string, baseTTL, maxTTL time.Dura
 			ttl = maxTTL
 		}
 	}
-	c.marks[key] = virtualProbeFailureMark{ttl: ttl, expiresAt: now.Add(ttl), failures: failures}
+	c.marks[key] = virtualProbeFailureMark{
+		ttl: ttl, expiresAt: now.Add(ttl), failures: failures,
+		servedBytes: servedBytes, declaredBytes: declaredBytes,
+	}
 }
 
 // count returns the number of consecutive failures recorded for key, or 0 when
@@ -333,12 +352,42 @@ func virtualProbeSizeMismatchKey(key string) string {
 	return key + "\x00size-mismatch"
 }
 
-// markSizeMismatch arms the short wrong-source damper for a candidate. It uses
-// one fixed window (virtualProbeSizeMismatchTTL) rather than the dead-candidate
-// exponential backoff, so the row is re-probed promptly once the provider serves
-// the release again.
-func (c *virtualProbeFailureCache) markSizeMismatch(key string) {
-	c.markFor(virtualProbeSizeMismatchKey(key), virtualProbeSizeMismatchTTL, virtualProbeSizeMismatchTTL)
+// markSizeMismatch arms the short wrong-source damper for a candidate and
+// records the observed byte verdict. It uses one fixed window
+// (virtualProbeSizeMismatchTTL) rather than the dead-candidate exponential
+// backoff, so the row is re-probed promptly once the provider serves the release
+// again. servedBytes is what the probe actually read; declaredBytes is the size
+// the catalog row advertises. The pair is what the version list reports as a
+// source mismatch while the marker lives.
+func (c *virtualProbeFailureCache) markSizeMismatch(key string, servedBytes, declaredBytes int64) {
+	c.markForBytes(virtualProbeSizeMismatchKey(key), virtualProbeSizeMismatchTTL, virtualProbeSizeMismatchTTL, servedBytes, declaredBytes)
+}
+
+// sizeMismatchVerdict returns the served-vs-declared byte verdict recorded by a
+// live wrong-source marker for a candidate. The marker is the same short damper
+// that backs the row off, so this reports a mismatch only while that recent
+// probe verdict still applies: an accepted probe clears the marker, and an
+// expired one stops reporting. The boolean is false when no live, size-bearing
+// marker exists.
+func (c *virtualProbeFailureCache) sizeMismatchVerdict(key string) (servedBytes, declaredBytes int64, ok bool) {
+	if c == nil || key == "" {
+		return 0, 0, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	markerKey := virtualProbeSizeMismatchKey(key)
+	mark, found := c.marks[markerKey]
+	if !found {
+		return 0, 0, false
+	}
+	if !c.clock().Before(mark.expiresAt) {
+		delete(c.marks, markerKey)
+		return 0, 0, false
+	}
+	if mark.servedBytes <= 0 || mark.declaredBytes <= 0 {
+		return 0, 0, false
+	}
+	return mark.servedBytes, mark.declaredBytes, true
 }
 
 // clearSizeMismatch drops a candidate's wrong-source marker after a probe
@@ -1044,8 +1093,9 @@ func (h *PlaybackHandler) runVirtualPrefetchWorker() {
 // cache and the handler best-result cache, and never touches a candidate's
 // media URL (no resolve, no anchor probe, no range fetch, no ffprobe). Opening
 // a ProviderURL can activate the provider (an AltMount Stremio link starts
-// fetching on first access), so any bytes-touching warm must wait for an
-// explicit Play of one candidate.
+// fetching on first access), so a bytes-touching warm belongs to an explicit
+// version selection (ScheduleSelectedFileWarm) or an explicit Play, never to a
+// browse-driven prefetch.
 func (h *PlaybackHandler) prefetchOne(task virtualPrefetchTask) {
 	gate := h.detachedGate()
 	if !gate.tryAcquire() {
@@ -3805,7 +3855,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				// damper short so this row is retried promptly once the provider
 				// serves it again. The row is never stamped failed here: the
 				// release is not dead.
-				virtualProbeFailures.markSizeMismatch(virtualProbeFailureKey(candidate.URI, ownerID))
+				virtualProbeFailures.markSizeMismatch(virtualProbeFailureKey(candidate.URI, ownerID), result.File.ProbedFormatSize, result.File.FileSize)
 				logVirtualProbeSizeMismatch(r.Context(), file.ID, candidate.URI, result.File.FileSize, result.File.ProbedFormatSize)
 				h.unpinVirtualSticky(stickyKey, candidate.URI)
 				attemptErr = errors.Join(attemptErr, fmt.Errorf("candidate %s served %d bytes for a declared %d-byte release",
@@ -4136,7 +4186,7 @@ func (h *PlaybackHandler) matchSameReleaseSiblingProbe(ctx context.Context, anch
 			continue
 		}
 		if scanner.VirtualServedEvidenceRejected(transient.FileSize, probed.ProbedFormatSize, probed.Duration, transient.VirtualExpectedRuntimeMinutes) {
-			virtualProbeFailures.markSizeMismatch(virtualProbeFailureKey(cand.URI, cand.OwnerInstallationID))
+			virtualProbeFailures.markSizeMismatch(virtualProbeFailureKey(cand.URI, cand.OwnerInstallationID), probed.ProbedFormatSize, transient.FileSize)
 			logVirtualProbeSizeMismatch(ctx, row.ID, cand.URI, transient.FileSize, probed.ProbedFormatSize)
 			// The start path unpins a rejected sibling so a later start does not
 			// retry the same wrong-byte row; the background chain passes no key
@@ -4398,7 +4448,7 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 		// backoff. The probe input's declared size is the comparison basis
 		// because it belongs to the row whose bytes were probed, including a
 		// resolver-substituted candidate's own row.
-		virtualProbeFailures.markSizeMismatch(probeKey)
+		virtualProbeFailures.markSizeMismatch(probeKey, probed.ProbedFormatSize, probeTransient.FileSize)
 		logVirtualProbeSizeMismatch(bgCtx, anchorFileID, probeCand.URI, probeTransient.FileSize, probed.ProbedFormatSize)
 		h.unpinVirtualSticky(stickyKey, probeCand.URI)
 		// The same release is usually offered by several indexers, each its own
@@ -4626,7 +4676,7 @@ func (h *PlaybackHandler) virtualProbeFromCache(
 		// every start until the provider heals. A size mismatch whose duration
 		// proves the content is a short posting, not a wrong file, and is used
 		// normally below.
-		virtualProbeFailures.markSizeMismatch(virtualProbeFailureKey(probeCand.URI, ownerInstallationID))
+		virtualProbeFailures.markSizeMismatch(virtualProbeFailureKey(probeCand.URI, ownerInstallationID), probed.ProbedFormatSize, probeFile.FileSize)
 		logVirtualProbeSizeMismatch(ctx, catalogFile.ID, probeCand.URI, probeFile.FileSize, probed.ProbedFormatSize)
 		return nil
 	}
@@ -6033,7 +6083,7 @@ func (h *PlaybackHandler) probeVirtualCandidateForegroundFallback(
 		return
 	}
 	if scanner.VirtualServedEvidenceRejected(probeTransient.FileSize, probed.ProbedFormatSize, probed.Duration, expectedRuntimeMinutes) {
-		virtualProbeFailures.markSizeMismatch(probeKey)
+		virtualProbeFailures.markSizeMismatch(probeKey, probed.ProbedFormatSize, probeTransient.FileSize)
 		logVirtualProbeSizeMismatch(requestCtx, catalogFile.ID, probeCand.URI, probeTransient.FileSize, probed.ProbedFormatSize)
 		h.unpinVirtualSticky(stickyKey, probeCand.URI)
 		return

@@ -44,6 +44,7 @@ function makeVersion(overrides: Partial<FileVersion> = {}): FileVersion {
     bitrate: overrides.bitrate ?? 0,
     available: overrides.available,
     failed: overrides.failed,
+    source_mismatch: overrides.source_mismatch,
   };
 }
 
@@ -145,6 +146,75 @@ describe("VersionDropdown unavailable versions", () => {
   });
 });
 
+describe("VersionDropdown source mismatch", () => {
+  it("renders the served-vs-declared state instead of the retry badge", () => {
+    const versions = [
+      makeVersion({
+        file_id: 1,
+        resolution: "1080p",
+        available: true,
+        source_mismatch: { served_bytes: 7_427_636_945, declared_bytes: 8_449_999_999 },
+      }),
+      makeVersion({ file_id: 2, resolution: "2160p" }),
+    ];
+    render(
+      <VersionDropdown
+        versions={versions}
+        selectedVersion={versions[0]!}
+        onSelectVersion={vi.fn()}
+      />,
+    );
+
+    const dialog = openVersionDropdown();
+    expect(
+      dialog.getByText("Source mismatch — served 6.9 GB of declared 7.9 GB"),
+    ).toBeInTheDocument();
+    expect(dialog.queryByText("Will retry on play")).not.toBeInTheDocument();
+  });
+
+  it("keeps the generic presentation for a genuinely unprobed row", () => {
+    const versions = [
+      makeVersion({ file_id: 1, resolution: "1080p", available: true }),
+      makeVersion({ file_id: 2, resolution: "2160p" }),
+    ];
+    render(
+      <VersionDropdown
+        versions={versions}
+        selectedVersion={versions[0]!}
+        onSelectVersion={vi.fn()}
+      />,
+    );
+
+    const dialog = openVersionDropdown();
+    expect(dialog.queryByText(/Source mismatch/)).not.toBeInTheDocument();
+    expect(dialog.queryByText("Will retry on play")).not.toBeInTheDocument();
+    expect(dialog.getByRole("button", { name: /1080p/ })).toBeInTheDocument();
+  });
+
+  it("never renders the mismatch as a failed row", () => {
+    const versions = [
+      makeVersion({
+        file_id: 1,
+        resolution: "1080p",
+        available: true,
+        source_mismatch: { served_bytes: 7_000, declared_bytes: 8_000 },
+      }),
+      makeVersion({ file_id: 2, resolution: "2160p" }),
+    ];
+    render(
+      <VersionDropdown
+        versions={versions}
+        selectedVersion={versions[0]!}
+        onSelectVersion={vi.fn()}
+      />,
+    );
+
+    const dialog = openVersionDropdown();
+    expect(dialog.queryByText("Failed")).not.toBeInTheDocument();
+    expect(dialog.getByRole("button", { name: /1080p/ })).toBeInTheDocument();
+  });
+});
+
 describe("VersionFlyoutItems unavailable versions", () => {
   it("hides unavailable versions by default and shows them via the toggle", () => {
     const versions = [
@@ -160,6 +230,24 @@ describe("VersionFlyoutItems unavailable versions", () => {
     expect(unavailableRow).toBeInTheDocument();
     expect(screen.getByText("Will retry on play")).toBeInTheDocument();
     expect(unavailableRow).toHaveClass("opacity-80");
+  });
+
+  it("shows a source mismatch on a row that is still available", () => {
+    const versions = [
+      makeVersion({
+        file_id: 1,
+        resolution: "1080p",
+        available: true,
+        source_mismatch: { served_bytes: 7_427_636_945, declared_bytes: 8_449_999_999 },
+      }),
+    ];
+    render(<VersionFlyoutItems versions={versions} onPlayVersion={vi.fn()} />);
+
+    expect(
+      screen.getByText("Source mismatch — served 6.9 GB of declared 7.9 GB"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Will retry on play")).not.toBeInTheDocument();
+    expect(screen.queryByText("Failed")).not.toBeInTheDocument();
   });
 });
 
