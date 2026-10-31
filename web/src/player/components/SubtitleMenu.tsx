@@ -234,7 +234,9 @@ export function SubtitleMenu({
   const handleMenuKeyDown = useCallback((e: React.KeyboardEvent) => {
     const retryBtn = retryButtonRef.current;
     const trackButtons = menuItemsRef.current.filter(Boolean) as HTMLButtonElement[];
-    const items = retryBtn ? [retryBtn, ...trackButtons] : trackButtons;
+    const items = (
+      retryBtn && !retryBtn.disabled ? [retryBtn, ...trackButtons] : trackButtons
+    ).filter((btn) => !btn.disabled);
     if (items.length === 0) return;
     const currentIndex = items.indexOf(document.activeElement as HTMLButtonElement);
     let nextIndex: number | null = null;

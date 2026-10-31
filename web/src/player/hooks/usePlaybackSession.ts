@@ -1643,13 +1643,15 @@ export function usePlaybackSession(
   // this hook observes. The settle paths call the flusher directly; this is the
   // backstop for the fast pending/declared start.
   useEffect(() => {
+    const controller = new AbortController();
+    teardownAbortRef.current = controller;
     deferredFlushTimerRef.current = window.setInterval(() => {
       if (deferredPushesRef.current.length > 0) {
         flushDeferredPushesRef.current();
       }
     }, 2_000);
     return () => {
-      teardownAbortRef.current.abort();
+      controller.abort();
       if (deferredFlushTimerRef.current !== null) {
         window.clearInterval(deferredFlushTimerRef.current);
         deferredFlushTimerRef.current = null;
@@ -5041,19 +5043,33 @@ export function usePlaybackSession(
       const headers: Record<string, string> = { Accept: "application/json" };
       if (revision) headers["If-None-Match"] = revision;
       let response: Response;
+      const timeoutSignal = AbortSignal.timeout(10_000);
+      let signal: AbortSignal;
+      let cleanupAbortListener: (() => void) | undefined;
+      if (typeof AbortSignal.any === "function") {
+        signal = AbortSignal.any([teardownAbortRef.current.signal, timeoutSignal]);
+      } else {
+        const fallbackCtrl = new AbortController();
+        const onTeardown = () => fallbackCtrl.abort();
+        const onTimeout = () => fallbackCtrl.abort();
+        teardownAbortRef.current.signal.addEventListener("abort", onTeardown);
+        timeoutSignal.addEventListener("abort", onTimeout);
+        cleanupAbortListener = () => {
+          teardownAbortRef.current.signal.removeEventListener("abort", onTeardown);
+          timeoutSignal.removeEventListener("abort", onTimeout);
+        };
+        signal = fallbackCtrl.signal;
+      }
       try {
-        const timeoutSignal = AbortSignal.timeout(10_000);
-        const signal =
-          typeof AbortSignal.any === "function"
-            ? AbortSignal.any([teardownAbortRef.current.signal, timeoutSignal])
-            : timeoutSignal;
         response = await playerFetchResponse(config, `${playerV2Origin(config)}${url}`, {
           headers: { ...headers, Accept: "application/json" },
           signal,
         });
       } catch {
+        cleanupAbortListener?.();
         return false;
       }
+      cleanupAbortListener?.();
       if (response.status === 304) return false;
       if (!response.ok) return false;
       let body: unknown;

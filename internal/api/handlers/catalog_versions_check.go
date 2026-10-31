@@ -43,13 +43,26 @@ const (
 )
 
 // versionCheckDetached returns a context for post-verdict work that must
-// survive client cancellation but must not run unbounded. The row is already
-// committed when the request ends, so dropping the request's cancellation is
-// intended; dropping its deadline is not. A blocked write or reload must fail
-// within this budget and be reported as unconfirmed, never as a durable
-// verdict.
+// survive client cancellation but must not run unbounded. When the parent context
+// carries a deadline (such as versionCheckOverallBudget or versionCheckPostBudget),
+// that absolute deadline is strictly honored so all writes together cannot
+// exceed the budget.
 func versionCheckDetached(ctx context.Context) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.WithoutCancel(ctx), versionCheckWriteBudget)
+	detached := context.WithoutCancel(ctx)
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		timeout := versionCheckWriteBudget
+		if remaining < timeout {
+			timeout = remaining
+		}
+		if timeout <= 0 {
+			cancelledCtx, cancel := context.WithCancel(detached)
+			cancel()
+			return cancelledCtx, cancel
+		}
+		return context.WithTimeout(detached, timeout)
+	}
+	return context.WithTimeout(detached, versionCheckWriteBudget)
 }
 
 type versionCheckRequest struct {

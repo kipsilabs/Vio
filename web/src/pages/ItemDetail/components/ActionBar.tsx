@@ -468,19 +468,31 @@ export default function ActionBar({
         : undefined,
     [selectedVersion, selectedWatch],
   );
-  const isVersionProbed = Boolean(selectedWatchVersion?.probed_at || selectedVersion?.probed_at);
+  const isWatchProbed = Boolean(selectedWatchVersion?.probed_at);
+  const isCatalogProbed = Boolean(selectedVersion?.probed_at);
   const selectedVersionWithTracks = useMemo(() => {
     if (!selectedVersion) return null;
     if (!selectedWatchVersion) return selectedVersion;
-    // Once probed, the watch-detail lists are authoritative even if empty
-    // (verified empty). Before probing, keep the catalog placeholder lists so
-    // menus have display items, but note they remain provisional.
-    if (isVersionProbed) {
+    // When the watch detail read is probed, its inventory is authoritative even
+    // if empty (verified empty). When only the catalog version carries probed_at
+    // (watch read hasn't completed or is unprobed), the catalog lists are
+    // authoritative. When neither is probed, keep catalog placeholders as provisional.
+    if (isWatchProbed) {
       return mergePlaybackInventory(
         {
           ...selectedVersion,
           audio_tracks: selectedWatchVersion.audio_tracks ?? [],
           subtitle_tracks: selectedWatchVersion.subtitle_tracks ?? [],
+        },
+        playerInventory,
+      );
+    }
+    if (isCatalogProbed) {
+      return mergePlaybackInventory(
+        {
+          ...selectedVersion,
+          audio_tracks: selectedVersion.audio_tracks ?? [],
+          subtitle_tracks: selectedVersion.subtitle_tracks ?? [],
         },
         playerInventory,
       );
@@ -499,22 +511,25 @@ export default function ActionBar({
       },
       playerInventory,
     );
-  }, [isVersionProbed, playerInventory, selectedVersion, selectedWatchVersion]);
+  }, [isCatalogProbed, isWatchProbed, playerInventory, selectedVersion, selectedWatchVersion]);
   // A row's tracks count as published evidence only when the version has been
   // probed, or when the player's own inventory mirror has confirmed tracks.
+  const isProbed = isWatchProbed || isCatalogProbed;
   const audioRowsPublished =
-    (isVersionProbed && selectedWatchVersion !== undefined) ||
+    (isWatchProbed && selectedWatchVersion !== undefined) ||
+    isCatalogProbed ||
     (playerInventory?.audioTracks.length ?? 0) > 0;
   const subtitleRowsPublished =
-    (isVersionProbed && selectedWatchVersion !== undefined) ||
+    (isWatchProbed && selectedWatchVersion !== undefined) ||
+    isCatalogProbed ||
     (playerInventory?.subtitleTracks.length ?? 0) > 0;
   const audioInventoryProvisional = isOverlayInventoryProvisional(
-    !isVersionProbed && !playerInventory,
+    !isProbed && !playerInventory,
     audioRowsPublished,
     selectedVersionWithTracks?.audio_tracks?.length ?? 0,
   );
   const subtitleInventoryProvisional = isOverlayInventoryProvisional(
-    !isVersionProbed && !playerInventory,
+    !isProbed && !playerInventory,
     subtitleRowsPublished,
     selectedVersionWithTracks?.subtitle_tracks?.length ?? 0,
   );
