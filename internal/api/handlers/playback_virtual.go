@@ -5956,6 +5956,9 @@ func (h *PlaybackHandler) virtualProbeEvidenceArgsForRow(ctx context.Context, ca
 		}
 		if declaredSize > 0 {
 			expectedRuntime := catalogFile.VirtualExpectedRuntimeMinutes
+			if expectedRuntime <= 0 && probed != nil {
+				expectedRuntime = probed.VirtualExpectedRuntimeMinutes
+			}
 			if expectedRuntime <= 0 {
 				expectedRuntime = h.virtualExpectedRuntimeMinutes(ctx, catalogFile)
 			}
