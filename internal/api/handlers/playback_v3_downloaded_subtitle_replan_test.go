@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -284,5 +285,97 @@ func TestHandleReplanPlaybackV3TrackChangeCrossRowDownloadedInsertion(t *testing
 	if row := selectedDownloadedSubtitleRowV3(t, response.PlaybackPlan); row != effectiveJapaneseRowID {
 		t.Fatalf("cross-row track change selected downloaded row %d, want %d (Japanese); subtitle=%+v inventory=%+v",
 			row, effectiveJapaneseRowID, response.PlaybackPlan.SelectedTracks.Subtitle, response.PlaybackPlan.Subtitle.Inventory)
+	}
+}
+
+// A same-row replan whose carried downloaded ordinal is historical but has no
+// captured tail cannot prove which downloaded row the ordinal names today. The
+// re-key must therefore hand it to the fail-closed constrain step, which clears
+// the selection with a warning, instead of treating an unknown tail as an
+// unchanged one and keeping the ordinal positionally.
+func TestRekeyReplanUnknownDownloadedTailClearsSameRowSelection(t *testing.T) {
+	file := v3HandlerFixtureFile(t)
+	file.SubtitleTracks = []models.SubtitleTrack{{Index: 0, Language: "eng", Codec: "subrip"}}
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), testPlaybackFileResolver{file: file})
+	// The session's evidence names the same row but carries no downloaded tail:
+	// its attempt record is unknown to the plan store.
+	session := &playback.Session{
+		ID:                         "unknown-tail-same-row",
+		MediaFileID:                file.ID,
+		VirtualSubtitleEvidenceSet: true,
+		VirtualSubtitleTracks:      append([]models.SubtitleTrack(nil), file.SubtitleTracks...),
+	}
+	start := v3HandlerStartRequest()
+	start.FileID = file.ID
+	downloadedOrdinal := 1
+	start.SubtitleTrackIndex = &downloadedOrdinal
+	start.SubtitleTrackID = playback.TrackIDV3(file.ID, "subtitle", downloadedOrdinal)
+
+	_, subtitleUnavailable, err := handler.rekeyReplanTrackIdentitiesV3(context.Background(), &start, file, session, nil, false)
+	if err != nil {
+		t.Fatalf("rekeyReplanTrackIdentitiesV3: %v", err)
+	}
+	if !subtitleUnavailable {
+		t.Fatal("unknown downloaded tail was reused instead of reported unavailable")
+	}
+	if start.SubtitleTrackID != "" || start.SubtitleTrackIndex != nil {
+		t.Fatalf("unverifiable downloaded selection was kept: id=%q index=%v", start.SubtitleTrackID, start.SubtitleTrackIndex)
+	}
+}
+
+// The same-id fast path treats a matching file-shaped inventory as proof the
+// carried ordinal still names the same track. The downloaded tail is invisible
+// to that comparison, so a historical carry without the captured tail must not
+// fall through it: an unverified ordinal degrades, it is never silently kept.
+func TestRemapSubtitleSelectionHistoricalUnknownTailDoesNotKeep(t *testing.T) {
+	targets := map[string]*models.MediaFile{
+		"unchanged inventory": {ID: 7, SubtitleTracks: []models.SubtitleTrack{{Index: 0, Language: "eng", Codec: "subrip"}}},
+		"drifted inventory": {ID: 7, SubtitleTracks: []models.SubtitleTrack{
+			{Index: 0, Language: "eng", Codec: "subrip"},
+			{Index: 1, Language: "fra", Codec: "subrip"},
+		}},
+	}
+	for name, target := range targets {
+		t.Run(name, func(t *testing.T) {
+			source := &models.MediaFile{ID: 7, SubtitleTracks: []models.SubtitleTrack{{Index: 0, Language: "eng", Codec: "subrip"}}}
+			downloadedOrdinal := 1
+			request := playback.StartRequestV3{
+				SubtitleTrackIndex: &downloadedOrdinal,
+				SubtitleTrackID:    playback.TrackIDV3(source.ID, "subtitle", downloadedOrdinal),
+			}
+			handler := &PlaybackHandler{}
+			_, err := handler.remapSubtitleSelectionWithCarryV3(context.Background(), carriedInventorySourceV3{
+				file:               source,
+				subtitleHistorical: true,
+			}, target, &request)
+			if !errors.Is(err, errSubtitleUnavailableInTargetV3) {
+				t.Fatalf("remap error = %v, want %v (degrade, not keep)", err, errSubtitleUnavailableInTargetV3)
+			}
+		})
+	}
+}
+
+// A dependency failure while recovering the captured tail must surface as a
+// store error so the caller can refuse the replan as retryable, not reinterpret
+// the ordinal or report the track as permanently gone.
+func TestRemapSubtitleSelectionHistoricalTailErrorSurfaces(t *testing.T) {
+	source := &models.MediaFile{ID: 7, SubtitleTracks: []models.SubtitleTrack{{Index: 0, Language: "eng", Codec: "subrip"}}}
+	target := &models.MediaFile{ID: 7, SubtitleTracks: []models.SubtitleTrack{{Index: 0, Language: "eng", Codec: "subrip"}}}
+	downloadedOrdinal := 1
+	request := playback.StartRequestV3{
+		SubtitleTrackIndex: &downloadedOrdinal,
+		SubtitleTrackID:    playback.TrackIDV3(source.ID, "subtitle", downloadedOrdinal),
+	}
+	handler := &PlaybackHandler{}
+	_, err := handler.remapSubtitleSelectionWithCarryV3(context.Background(), carriedInventorySourceV3{
+		file:                source,
+		subtitleHistorical:  true,
+		subtitleEvidenceErr: wrapSubtitleStoreErrorV3(errors.New("database unavailable")),
+	}, target, &request)
+	if !errors.Is(err, errSubtitleStoreUnavailableV3) {
+		t.Fatalf("remap error = %v, want %v", err, errSubtitleStoreUnavailableV3)
+	}
+	if errors.Is(err, errSubtitleUnavailableInTargetV3) {
+		t.Fatal("store failure was reported as a permanent track miss")
 	}
 }
