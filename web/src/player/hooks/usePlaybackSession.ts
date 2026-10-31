@@ -5042,41 +5042,38 @@ export function usePlaybackSession(
         stateRef.current.inventoryRevision;
       const headers: Record<string, string> = { Accept: "application/json" };
       if (revision) headers["If-None-Match"] = revision;
+      const teardownSignal = teardownAbortRef.current.signal;
+      if (teardownSignal.aborted) return false;
       let response: Response;
       const timeoutSignal = AbortSignal.timeout(10_000);
       let signal: AbortSignal;
       let cleanupAbortListener: (() => void) | undefined;
       if (typeof AbortSignal.any === "function") {
-        signal = AbortSignal.any([teardownAbortRef.current.signal, timeoutSignal]);
+        signal = AbortSignal.any([teardownSignal, timeoutSignal]);
       } else {
         const fallbackCtrl = new AbortController();
         const onTeardown = () => fallbackCtrl.abort();
         const onTimeout = () => fallbackCtrl.abort();
-        teardownAbortRef.current.signal.addEventListener("abort", onTeardown);
+        teardownSignal.addEventListener("abort", onTeardown);
         timeoutSignal.addEventListener("abort", onTimeout);
         cleanupAbortListener = () => {
-          teardownAbortRef.current.signal.removeEventListener("abort", onTeardown);
+          teardownSignal.removeEventListener("abort", onTeardown);
           timeoutSignal.removeEventListener("abort", onTimeout);
         };
         signal = fallbackCtrl.signal;
       }
+      let body: unknown;
       try {
         response = await playerFetchResponse(config, `${playerV2Origin(config)}${url}`, {
           headers: { ...headers, Accept: "application/json" },
           signal,
         });
-      } catch {
-        cleanupAbortListener?.();
-        return false;
-      }
-      cleanupAbortListener?.();
-      if (response.status === 304) return false;
-      if (!response.ok) return false;
-      let body: unknown;
-      try {
+        if (response.status === 304 || !response.ok) return false;
         body = await response.json();
       } catch {
         return false;
+      } finally {
+        cleanupAbortListener?.();
       }
       if (sessionIdRef.current !== sessionId || planRef.current !== plan) return false;
       if (typeof body !== "object" || body === null) return false;
