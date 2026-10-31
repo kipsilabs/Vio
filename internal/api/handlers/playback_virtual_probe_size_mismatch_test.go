@@ -373,8 +373,17 @@ func sizeMismatchFallbackHandler(t *testing.T, file *models.MediaFile, candidate
 	var mu sync.Mutex
 	var probes []int
 	var saved []models.VirtualFilePersistArgs
+	orderedRows := make([]*models.MediaFile, 0, len(candidates))
+	for _, candidate := range candidates {
+		if row := rows[candidate.URI]; row != nil {
+			orderedRows = append(orderedRows, row)
+		}
+	}
 	h := &PlaybackHandler{
 		ServiceContext: context.Background(),
+		FileVersionFetcher: testPlaybackFileVersionFetcher{
+			byContent: map[string][]*models.MediaFile{file.ContentID: orderedRows},
+		},
 		VirtualPlaybackStreamLister: VirtualPlaybackStreamListerFunc(func(context.Context, string, int, string, int) ([]VirtualPlaybackStream, error) {
 			return candidates, nil
 		}),
