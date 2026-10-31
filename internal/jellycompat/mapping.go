@@ -255,7 +255,59 @@ func (m *mapper) itemFromDetailWithFieldsSelected(item upstreamItemDetail, selec
 		return allFields || requestedFields[name]
 	}
 
-	dto := m.itemFromList(upstreamListItem{
+	dto := m.itemFromList(detailListItem(item), isFavorite, progress, allDetailFields)
+
+	if wantField("people") {
+		dto.People = m.peopleDTOs(item.Cast, item.Crew)
+	}
+	// Remote provider trailers and local extras counts. The itemFromList base
+	// stamped RemoteTrailers as an empty slice; override with real data here
+	// on the detail path.
+	dto.RemoteTrailers = remoteTrailerDTOs(item.Videos)
+	localTrailers, specialFeatures := countLocalExtras(item.Extras)
+	dto.LocalTrailerCount = localTrailers
+	dto.SpecialFeatureCount = specialFeatures
+
+	if item.SeriesID != "" {
+		dto.SeriesID = m.codec.EncodeStringID(EncodedIDItem, item.SeriesID)
+	}
+	if item.Type == compatCatalogTypeSeason {
+		dto.ID = m.codec.EncodeStringID(EncodedIDSeason, item.ContentID)
+	}
+	dto.ServerID = m.serverID
+	dto.CanDelete = false
+	dto.OriginalTitle = firstNonEmpty(item.OriginalTitle, item.Title)
+	dto.SortName = firstNonEmpty(item.SortTitle, item.OriginalTitle, item.Title)
+	dto.ForcedSortName = dto.SortName
+	dto.Studios = m.namePairs(item.Studios, EncodedIDStudio)
+	dto.ProductionLocations = append([]string{}, lang.UniqueCountries(item.Countries)...)
+	if item.Tagline != "" {
+		dto.Taglines = []string{item.Tagline}
+	}
+	if item.AirDate != nil {
+		dto.PremiereDate = ensureRFC3339(*item.AirDate)
+	} else if item.Year > 0 {
+		dto.PremiereDate = syntheticPremiereDate(item.Year)
+	}
+	versions := compatLiveVersions(item.Versions, selectedFileID)
+	if isPlayableItemType(item.Type) {
+		m.applyDetailVersions(&dto, item.ContentID, versions, wantField)
+	}
+	slog.Info("jellycompat item detail mapped",
+		"content_id", item.ContentID,
+		"type", item.Type,
+		"is_folder", dto.IsFolder,
+		"media_type", dto.MediaType,
+		"versions", len(versions),
+		"media_sources", len(dto.MediaSources),
+	)
+	return dto
+}
+
+// detailListItem projects the detail payload onto the list shape itemFromList
+// seeds the DTO from, including the cached artwork paths that set image tags.
+func detailListItem(item upstreamItemDetail) upstreamListItem {
+	return upstreamListItem{
 		ContentID:         item.ContentID,
 		Type:              item.Type,
 		Title:             item.Title,
@@ -293,103 +345,52 @@ func (m *mapper) itemFromDetailWithFieldsSelected(item upstreamItemDetail, selec
 		ClearArtPath:       item.ClearArtPath,
 		DiscPath:           item.DiscPath,
 		ExtraBackdropPaths: item.ExtraBackdropPaths,
-	}, isFavorite, progress, allDetailFields)
-
-	if wantField("people") {
-		m.applyDetailPeople(&dto, item)
-	}
-	// Remote provider trailers and local extras counts. The itemFromList base
-	// stamped RemoteTrailers as an empty slice; override with real data here
-	// on the detail path.
-	dto.RemoteTrailers = remoteTrailerDTOs(item.Videos)
-	localTrailers, specialFeatures := countLocalExtras(item.Extras)
-	dto.LocalTrailerCount = localTrailers
-	dto.SpecialFeatureCount = specialFeatures
-
-	if item.SeriesID != "" {
-		dto.SeriesID = m.codec.EncodeStringID(EncodedIDItem, item.SeriesID)
-	}
-	if item.Type == "season" {
-		dto.ID = m.codec.EncodeStringID(EncodedIDSeason, item.ContentID)
-	}
-	dto.ServerID = m.serverID
-	dto.CanDelete = false
-	dto.OriginalTitle = firstNonEmpty(item.OriginalTitle, item.Title)
-	dto.SortName = firstNonEmpty(item.SortTitle, item.OriginalTitle, item.Title)
-	dto.ForcedSortName = dto.SortName
-	dto.Studios = m.namePairs(item.Studios, EncodedIDStudio)
-	dto.ProductionLocations = append([]string{}, lang.UniqueCountries(item.Countries)...)
-	if item.Tagline != "" {
-		dto.Taglines = []string{item.Tagline}
-	}
-	if item.AirDate != nil {
-		dto.PremiereDate = ensureRFC3339(*item.AirDate)
-	} else if item.Year > 0 {
-		dto.PremiereDate = syntheticPremiereDate(item.Year)
-	}
-	versions := compatLiveVersions(item.Versions, selectedFileID)
-	m.applyDetailVersions(&dto, item, versions, wantField)
-	slog.Info("jellycompat item detail mapped",
-		"content_id", item.ContentID,
-		"type", item.Type,
-		"is_folder", dto.IsFolder,
-		"media_type", dto.MediaType,
-		"versions", len(versions),
-		"media_sources", len(dto.MediaSources),
-	)
-	return dto
-}
-
-// applyDetailPeople fills the detail DTO's People list from the item's cast and
-// crew, encoding each person id and seeding their primary image tag.
-func (m *mapper) applyDetailPeople(dto *baseItemDTO, item upstreamItemDetail) {
-	dto.People = make([]personDTO, 0, len(item.Cast)+len(item.Crew))
-	for _, cast := range item.Cast {
-		personID, _ := strconv.ParseInt(cast.PersonID, 10, 64)
-		routeID := m.codec.EncodeIntID(EncodedIDPerson, personID)
-		var primaryTag string
-		if cast.PhotoURL != "" {
-			primaryTag = personPrimaryImageTag(m.imageTagSigner, routeID, cast.PhotoPath, cast.PhotoThumbhash)
-		}
-		dto.People = append(dto.People, personDTO{
-			ID:              routeID,
-			Name:            cast.Name,
-			Role:            cast.Character,
-			Type:            "Actor",
-			PrimaryImageTag: primaryTag,
-		})
-	}
-	for _, crew := range item.Crew {
-		personID, _ := strconv.ParseInt(crew.PersonID, 10, 64)
-		routeID := m.codec.EncodeIntID(EncodedIDPerson, personID)
-		var primaryTag string
-		if crew.PhotoURL != "" {
-			primaryTag = personPrimaryImageTag(m.imageTagSigner, routeID, crew.PhotoPath, crew.PhotoThumbhash)
-		}
-		dto.People = append(dto.People, personDTO{
-			ID:              routeID,
-			Name:            crew.Name,
-			Role:            crew.Job,
-			Type:            crew.Job,
-			PrimaryImageTag: primaryTag,
-		})
 	}
 }
 
-// applyDetailVersions fills the version-derived detail fields. A playable item
-// with no live versions is provider-metadata-only (unaired/missing), so it takes
-// Jellyfin's Virtual contract instead of the FileSystem default from
-// itemFromList.
-func (m *mapper) applyDetailVersions(dto *baseItemDTO, item upstreamItemDetail, versions []catalog.FileVersion, wantField func(string) bool) {
-	if !isPlayableItemType(item.Type) {
-		return
+// peopleDTOs builds the People array from the item's cast and crew.
+func (m *mapper) peopleDTOs(cast []catalog.CastCredit, crew []catalog.CrewCredit) []personDTO {
+	people := make([]personDTO, 0, len(cast)+len(crew))
+	for _, member := range cast {
+		people = append(people, m.personDTO(member.Name, member.PersonID, member.Character, "Actor",
+			member.PhotoURL, member.PhotoPath, member.PhotoThumbhash))
 	}
+	for _, member := range crew {
+		people = append(people, m.personDTO(member.Name, member.PersonID, member.Job, member.Job,
+			member.PhotoURL, member.PhotoPath, member.PhotoThumbhash))
+	}
+	return people
+}
+
+func (m *mapper) personDTO(name, personID, role, kind, photoURL, photoPath, photoThumbhash string) personDTO {
+	parsedID, _ := strconv.ParseInt(personID, 10, 64)
+	routeID := m.codec.EncodeIntID(EncodedIDPerson, parsedID)
+	var primaryTag string
+	if photoURL != "" {
+		primaryTag = personPrimaryImageTag(m.imageTagSigner, routeID, photoPath, photoThumbhash)
+	}
+	return personDTO{
+		ID:              routeID,
+		Name:            name,
+		Role:            role,
+		Type:            kind,
+		PrimaryImageTag: primaryTag,
+	}
+}
+
+// applyDetailVersions fills the version-derived detail fields from the
+// already-filtered version list. An empty list means a provider-metadata-only
+// (unaired/missing) item, where the version data is authoritative.
+func (m *mapper) applyDetailVersions(dto *baseItemDTO, contentID string, versions []catalog.FileVersion, wantField func(string) bool) {
 	if len(versions) == 0 {
+		// Provider-metadata-only (unaired/missing) item: version data is
+		// authoritative here, so override the FileSystem default set by
+		// itemFromList with Jellyfin's Virtual contract.
 		applyPlayableLocation(dto, false)
 		return
 	}
-	dto.MediaSourceCount = len(versions)
 	firstVersion := versions[0]
+	dto.MediaSourceCount = len(versions)
 	if firstVersion.Duration > 0 {
 		dto.RunTimeTicks = secondsToTicks(float64(firstVersion.Duration))
 	}
@@ -408,28 +409,19 @@ func (m *mapper) applyDetailVersions(dto *baseItemDTO, item upstreamItemDetail, 
 		dto.Height = firstVersion.VideoTracks[0].Height
 		dto.IsHD = isHDVideo(firstVersion.VideoTracks[0])
 	}
-	routeItemID := m.codec.EncodeStringID(EncodedIDItem, item.ContentID)
-	// Multi-version detail pages need the version list even when the client did
-	// not spell out Fields=MediaSources. Some Jellyfin clients (Plezy among them)
-	// render versions from the item DTO rather than issuing a separate
-	// PlaybackInfo call, so omitting the field leaves their version menu empty
-	// while single-version clients see no difference.
+	// Multi-version detail pages need the version list even when the client
+	// did not spell out Fields=MediaSources. Some Jellyfin clients (Plezy
+	// among them) render versions from the item DTO rather than issuing a
+	// separate PlaybackInfo call, so omitting the field leaves their version
+	// menu empty while single-version clients see no difference.
 	wantMediaSources := wantField("mediasources") || len(versions) > 1
 	wantMediaStreams := wantField("mediastreams")
-	if wantMediaSources {
-		dto.MediaSources = make([]mediaSourceDTO, 0, len(versions))
+	sources, streams := m.versionMediaParts(contentID, versions, wantMediaSources, wantMediaStreams)
+	if wantMediaStreams {
+		dto.MediaStreams = append(dto.MediaStreams, streams...)
 	}
-	if wantMediaSources || wantMediaStreams {
-		for _, version := range versions {
-			sourceID := m.codec.EncodeIntID(EncodedIDMediaSource, int64(version.FileID))
-			streams := buildMediaStreams(routeItemID, sourceID, version)
-			if wantMediaStreams {
-				dto.MediaStreams = append(dto.MediaStreams, streams...)
-			}
-			if wantMediaSources {
-				dto.MediaSources = append(dto.MediaSources, detailMediaSourceDTO(sourceID, version, streams))
-			}
-		}
+	if wantMediaSources {
+		dto.MediaSources = sources
 	}
 	if wantField("chapters") {
 		dto.Chapters = compatChapters(firstVersion.Chapters, firstVersion.AddedAt)
@@ -437,6 +429,31 @@ func (m *mapper) applyDetailVersions(dto *baseItemDTO, item upstreamItemDetail, 
 	if wantField("trickplay") {
 		dto.Trickplay = m.compatTrickplay(versions)
 	}
+}
+
+// versionMediaParts builds the MediaSources and MediaStreams arrays for the
+// version list, honoring which of the two the client asked for.
+func (m *mapper) versionMediaParts(contentID string, versions []catalog.FileVersion, wantSources, wantStreams bool) ([]mediaSourceDTO, []mediaStreamDTO) {
+	if !wantSources && !wantStreams {
+		return nil, nil
+	}
+	routeItemID := m.codec.EncodeStringID(EncodedIDItem, contentID)
+	var sources []mediaSourceDTO
+	if wantSources {
+		sources = make([]mediaSourceDTO, 0, len(versions))
+	}
+	var streams []mediaStreamDTO
+	for _, version := range versions {
+		sourceID := m.codec.EncodeIntID(EncodedIDMediaSource, int64(version.FileID))
+		versionStreams := buildMediaStreams(routeItemID, sourceID, version)
+		if wantStreams {
+			streams = append(streams, versionStreams...)
+		}
+		if wantSources {
+			sources = append(sources, detailMediaSourceDTO(sourceID, version, versionStreams))
+		}
+	}
+	return sources, streams
 }
 
 func (m *mapper) seasonFromUpstream(season upstreamSeason, seriesID string, isFavorite bool) baseItemDTO {

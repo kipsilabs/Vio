@@ -4368,10 +4368,17 @@ export function VideoPlayer({
     // A marker the viewer moved to a track this plan has not acknowledged is a
     // new selection, not stale state, so it is allowed straight through.
     const pendingManualSubtitle = pendingManualSubtitleIdentityRef.current;
+    // The rows the viewer can pick from. Identity comparisons use them to tell
+    // a re-minted ordinal from a sibling track that looks the same.
+    const displayedSubtitleIdentities = effectiveSubtitleTracks.map(subtitleTrackIdentityFromInfo);
     const planSubtitlesChanged = lastSubtitlePlanIdRef.current !== plan.plan_id;
     const planAcknowledgesPendingSubtitle =
       pendingManualSubtitle === null ||
-      subtitleSelectionAcknowledgesPending(planSelectedSubtitleIdentity, pendingManualSubtitle);
+      subtitleSelectionAcknowledgesPending(
+        planSelectedSubtitleIdentity,
+        pendingManualSubtitle,
+        displayedSubtitleIdentities,
+      );
     // Acknowledged manual pick, or the plan's own committed selection. With
     // neither there is nothing to reconcile, and the auto-select path keeps
     // owning the outbound request.
@@ -4386,7 +4393,7 @@ export function VideoPlayer({
       // Resolve the viewer's own asset, not the plan ordinal, so a re-minted
       // track id cannot hand the marker another row.
       const reconciledIndex = resolveAppliedSubtitleIndex(
-        effectiveSubtitleTracks.map(subtitleTrackIdentityFromInfo),
+        displayedSubtitleIdentities,
         subtitleIntent,
       );
       // No unambiguous row: keep holding outbound selection instead of letting
@@ -4427,10 +4434,13 @@ export function VideoPlayer({
     // request holds instead of guessing.
     let outboundIdentity = activeSubtitleIdentity;
     if (pendingManualSubtitle !== null) {
-      const displayedIdentities = effectiveSubtitleTracks.map(subtitleTrackIdentityFromInfo);
-      const resolvedIndex = resolveAppliedSubtitleIndex(displayedIdentities, pendingManualSubtitle);
+      const resolvedIndex = resolveAppliedSubtitleIndex(
+        displayedSubtitleIdentities,
+        pendingManualSubtitle,
+      );
       const markerRow =
-        displayedIdentities.find((row) => row.index === pendingManualSubtitle.index) ?? null;
+        displayedSubtitleIdentities.find((row) => row.index === pendingManualSubtitle.index) ??
+        null;
       const pendingIndex =
         resolvedIndex ??
         (markerRow !== null && isSameSubtitleTrack(markerRow, pendingManualSubtitle)
@@ -4451,6 +4461,7 @@ export function VideoPlayer({
     const desiredServerIndex = pendingServerSubtitleSelection(
       planSelectedSubtitleIdentity,
       outboundIdentity,
+      displayedSubtitleIdentities,
     );
     if (desiredServerIndex === undefined) {
       requestedSubtitleTrackChangeRef.current = null;
@@ -4586,9 +4597,14 @@ export function VideoPlayer({
     // would mark an unrelated (or placeholder) row.
     if (!planHasSelectableSubtitles) return;
     const pendingManualSubtitle = pendingManualSubtitleIdentityRef.current;
+    const displayedSubtitleIdentities = effectiveSubtitleTracks.map(subtitleTrackIdentityFromInfo);
     if (
       pendingManualSubtitle !== null &&
-      !subtitleSelectionAcknowledgesPending(planSelectedSubtitleIdentity, pendingManualSubtitle)
+      !subtitleSelectionAcknowledgesPending(
+        planSelectedSubtitleIdentity,
+        pendingManualSubtitle,
+        displayedSubtitleIdentities,
+      )
     ) {
       // The viewer's pick is newer than this plan; leave the optimistic marker
       // for the outbound effect to send instead of pulling it back.
@@ -4600,7 +4616,7 @@ export function VideoPlayer({
     // in a different order, and an acknowledged pick's captured id can still
     // carry the outgoing plan's ordinal.
     const reconciledIndex = resolveAppliedSubtitleIndex(
-      effectiveSubtitleTracks.map(subtitleTrackIdentityFromInfo),
+      displayedSubtitleIdentities,
       pendingManualSubtitle ?? planSelectedSubtitleIdentity,
     );
     if (reconciledIndex === null) return;
