@@ -104,6 +104,147 @@ describe("SubtitleMenu", () => {
     expect(trackRows[1]?.textContent).toContain("✓");
   });
 
+  it("distinguishes same-language tracks by badging only the default one", () => {
+    renderMenu([
+      subtitleTrack({
+        index: 3,
+        language: "de",
+        label: "German",
+        track_id: "file:7:subtitle:3",
+        url: "/stream/session-1/subtitles/0.srt?embedded_stream_index=3",
+        default: true,
+      }),
+      subtitleTrack({
+        index: 4,
+        language: "de",
+        label: "German",
+        track_id: "file:7:subtitle:4",
+        url: "/stream/session-1/subtitles/1.srt?embedded_stream_index=4",
+      }),
+      subtitleTrack({
+        index: 5,
+        language: "en",
+        label: "English",
+        track_id: "file:7:subtitle:5",
+        url: "/stream/session-1/subtitles/2.srt?embedded_stream_index=5",
+      }),
+    ]);
+
+    const germanRows = screen.getAllByRole("menuitem", { name: /German/ });
+    expect(germanRows).toHaveLength(2);
+    expect(germanRows[0]?.textContent).toContain("Default");
+    expect(germanRows[1]?.textContent).not.toContain("Default");
+    expect(screen.getAllByText("Default")).toHaveLength(1);
+    // Neither row is checked while playback has no subtitle selected.
+    expect(germanRows[0]?.textContent).not.toContain("✓");
+    expect(germanRows[1]?.textContent).not.toContain("✓");
+  });
+
+  it("checks only the clicked same-language row and selects its track index", () => {
+    const tracks = [
+      subtitleTrack({
+        index: 3,
+        language: "de",
+        label: "German",
+        track_id: "file:7:subtitle:3",
+        url: "/stream/session-1/subtitles/0.srt?embedded_stream_index=3",
+        default: true,
+      }),
+      subtitleTrack({
+        index: 4,
+        language: "de",
+        label: "German",
+        track_id: "file:7:subtitle:4",
+        url: "/stream/session-1/subtitles/1.srt?embedded_stream_index=4",
+      }),
+    ];
+    const { view, onSelect } = renderMenu(tracks, vi.fn(), 3);
+
+    fireEvent.click(screen.getAllByRole("menuitem", { name: /German/ })[1] as HTMLElement);
+    expect(onSelect).toHaveBeenCalledWith(4);
+
+    // The parent applies the pick: row 2 alone shows the checkmark.
+    fireEvent.click(screen.getByRole("button", { name: /(Enable|Disable) captions/ }));
+    view.rerender(
+      createElement(SubtitleMenu, {
+        tracks,
+        activeIndex: 4,
+        onSelect,
+        delayMs: 0,
+        onDelayChange: () => {},
+      }),
+    );
+
+    const germanRows = screen.getAllByRole("menuitem", { name: /German/ });
+    expect(germanRows[0]?.textContent).not.toContain("✓");
+    expect(germanRows[1]?.textContent).toContain("✓");
+  });
+
+  it("switches between same-language rows in both directions", () => {
+    const tracks = [
+      subtitleTrack({
+        index: 3,
+        language: "de",
+        label: "German",
+        track_id: "file:7:subtitle:3",
+        url: "/stream/session-1/subtitles/0.srt?embedded_stream_index=3",
+        default: true,
+      }),
+      subtitleTrack({
+        index: 4,
+        language: "de",
+        label: "German",
+        track_id: "file:7:subtitle:4",
+        url: "/stream/session-1/subtitles/1.srt?embedded_stream_index=4",
+      }),
+    ];
+    const onSelect = vi.fn();
+    const view = render(
+      createElement(SubtitleMenu, {
+        tracks,
+        activeIndex: 4,
+        onSelect,
+        delayMs: 0,
+        onDelayChange: () => {},
+      }),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /(Enable|Disable) captions/ }));
+    fireEvent.click(screen.getAllByRole("menuitem", { name: /German/ })[0] as HTMLElement);
+    expect(onSelect).toHaveBeenLastCalledWith(3);
+
+    view.rerender(
+      createElement(SubtitleMenu, {
+        tracks,
+        activeIndex: 3,
+        onSelect,
+        delayMs: 0,
+        onDelayChange: () => {},
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /(Enable|Disable) captions/ }));
+    let germanRows = screen.getAllByRole("menuitem", { name: /German/ });
+    expect(germanRows[0]?.textContent).toContain("✓");
+    expect(germanRows[1]?.textContent).not.toContain("✓");
+
+    fireEvent.click(germanRows[1] as HTMLElement);
+    expect(onSelect).toHaveBeenLastCalledWith(4);
+
+    view.rerender(
+      createElement(SubtitleMenu, {
+        tracks,
+        activeIndex: 4,
+        onSelect,
+        delayMs: 0,
+        onDelayChange: () => {},
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /(Enable|Disable) captions/ }));
+    germanRows = screen.getAllByRole("menuitem", { name: /German/ });
+    expect(germanRows[0]?.textContent).not.toContain("✓");
+    expect(germanRows[1]?.textContent).toContain("✓");
+  });
+
   it("locks the menu shut while the session inventory is switching", () => {
     const onSelect = vi.fn();
     const props = {

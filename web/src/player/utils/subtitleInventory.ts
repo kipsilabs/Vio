@@ -18,6 +18,8 @@ export interface SubtitleInventoryTrackInput {
   forced?: boolean;
   hearing_impaired?: boolean;
   external?: boolean;
+  /** The file's default subtitle stream, per the probed inventory. */
+  default?: boolean;
 }
 
 /**
@@ -378,6 +380,7 @@ export function buildPublishedSubtitleTracks(
       source: "external",
       forced: track.forced,
       hearing_impaired: track.hearing_impaired,
+      default: track.default,
       url: "",
       containerIndex: track.index ?? list.indexOf(track),
     });
@@ -405,6 +408,7 @@ export function buildPublishedSubtitleTracks(
       source: "embedded",
       forced: track.forced,
       hearing_impaired: track.hearing_impaired,
+      default: track.default,
       url: "",
       containerIndex: track.index ?? list.indexOf(track),
     });
