@@ -31932,6 +31932,7 @@ export interface components {
        */
       added_at: string;
       audio_tracks?: components["schemas"]["WatchAudioTrack"][];
+      available?: boolean;
       /**
        * Format: int64
        * @description Bits per second
@@ -31955,6 +31956,7 @@ export interface components {
       effective_audio_language?: string;
       /** Format: int64 */
       effective_audio_track_index?: number;
+      failed?: boolean;
       /**
        * @description Opaque identifier
        * @example 42
@@ -31990,9 +31992,15 @@ export interface components {
       /** Format: int64 */
       presentation_part_total?: number;
       preview?: components["schemas"]["WatchMarker"];
+      /**
+       * Format: date-time
+       * @description RFC 3339 instant in UTC with millisecond precision
+       */
+      probed_at?: string;
       recap?: components["schemas"]["WatchMarker"];
       /** @example 1080p */
       resolution: string;
+      source_mismatch?: components["schemas"]["VersionSourceMismatch"];
       subtitle_tracks?: components["schemas"]["WatchSubtitleTrack"][];
       /** @description Whether seek-bar previews are published for this file; read them with getWatchTrickplay */
       trickplay_available: boolean;

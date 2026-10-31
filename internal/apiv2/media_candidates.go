@@ -214,6 +214,28 @@ func (reg *Registry) discoverDetailVersions(ctx context.Context, contentID, medi
 // clients open the item page through getCatalogItem and pick a version
 // client-side; they never call the versions check or a select endpoint, so
 // this read is the only server-visible signal that a version is about to play.
+func (reg *Registry) warmDetailVirtualVersions(ctx context.Context, detail *catalogpkg.ItemDetail, filter catalogpkg.AccessFilter) {
+	if detail == nil {
+		return
+	}
+	reg.warmVirtualVersions(ctx, detail.ContentID, detail.Type, detail.Versions, filter)
+}
+
+// warmWatchDetailVirtualVersions starts the same chain for the virtual versions
+// GET /watch/{id} surfaced. Native clients open an episode straight from its
+// watch detail and pick a version client-side without declaring file_id, so the
+// selected-file hook (scheduleSelectedVirtualProbe) has nothing to warm and
+// this read must cover the listed rows instead.
+func (reg *Registry) warmWatchDetailVirtualVersions(ctx context.Context, detail *catalogpkg.WatchDetail, filter catalogpkg.AccessFilter) {
+	if detail == nil {
+		return
+	}
+	reg.warmVirtualVersions(ctx, detail.ContentID, detail.Type, detail.Versions, filter)
+}
+
+// warmVirtualVersions is the shared warm for both detail reads: the catalog
+// leaf read and the watch detail read see the same projected rows and must
+// schedule the same work.
 //
 // The work is bounded to movies and individual episodes (a series or season
 // page carries no playable row), to maxDetailVirtualWarmVersions per read, and
@@ -223,16 +245,16 @@ func (reg *Registry) discoverDetailVersions(ctx context.Context, contentID, medi
 // live chain. A failed or durably unavailable row is skipped. This path only
 // warms: it never writes a failure verdict, never stamps failed_at, and never
 // fails the detail request.
-func (reg *Registry) warmDetailVirtualVersions(ctx context.Context, detail *catalogpkg.ItemDetail, filter catalogpkg.AccessFilter) {
-	if reg == nil || detail == nil || reg.deps.VirtualSelectionWarm == nil {
+func (reg *Registry) warmVirtualVersions(ctx context.Context, contentID, itemType string, versions []catalogpkg.FileVersion, filter catalogpkg.AccessFilter) {
+	if reg == nil || reg.deps.VirtualSelectionWarm == nil {
 		return
 	}
-	if detail.Type != themeOwnerMovie && detail.Type != themeOwnerEpisode {
+	if itemType != themeOwnerMovie && itemType != themeOwnerEpisode {
 		return
 	}
 	scheduler := reg.deps.VirtualSelectionWarm
 	warmed := 0
-	for _, version := range detail.Versions {
+	for _, version := range versions {
 		if warmed >= maxDetailVirtualWarmVersions {
 			break
 		}
@@ -246,16 +268,16 @@ func (reg *Registry) warmDetailVirtualVersions(ctx context.Context, detail *cata
 		// read resolves to the same two rows instead of drifting to the next
 		// pair once the first pair is memoized.
 		warmed++
-		if !reg.rememberDetailVirtualWarm(detail.ContentID, version.FileID) {
+		if !reg.rememberDetailVirtualWarm(contentID, version.FileID) {
 			continue
 		}
 		// An unprobed row needs the inventory probe for its track menus; a
 		// probed row still needs the warm because probe evidence says nothing
 		// about whether the provider has fetched the bytes.
 		if version.ProbedAt == nil {
-			scheduler.ScheduleSelectedFileProbe(detail.ContentID, version.FileID, filter)
+			scheduler.ScheduleSelectedFileProbe(contentID, version.FileID, filter)
 		}
-		scheduler.ScheduleSelectedFileWarm(detail.ContentID, version.FileID, filter)
+		scheduler.ScheduleSelectedFileWarm(contentID, version.FileID, filter)
 	}
 }
 
