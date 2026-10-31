@@ -13479,7 +13479,11 @@ func (h *PlaybackHandler) replanRemapSourceV3(effectiveFile *models.MediaFile, s
 	}
 	if inventory, ok := durable[effectiveFile.ID]; ok && inventory.anyKnown() {
 		evidence := *effectiveFile
-		carry := carriedInventorySourceV3{file: &evidence}
+		// The captured inventory is historical evidence by definition: the live
+		// row may have been re-probed in place since the plan was made, and a
+		// downloaded ordinal without the captured tail cannot be proven
+		// positionally.
+		carry := carriedInventorySourceV3{file: &evidence, subtitleHistorical: true}
 		if inventory.audioKnown {
 			evidence.AudioTracks = inventory.audio
 		}
@@ -13503,7 +13507,11 @@ func (h *PlaybackHandler) replanRemapSourceV3(effectiveFile *models.MediaFile, s
 	evidence.AudioTracks = session.VirtualAudioTracks
 	evidence.SubtitleTracks = session.VirtualSubtitleTracks
 	evidence.ExternalSubtitles = session.VirtualExternalSubtitles
-	return carriedInventorySourceV3{file: &evidence}
+	// The session snapshot describes the file-shaped inventory only. With no
+	// recovered downloaded tail, a downloaded ordinal cannot be proven, so the
+	// carry is historical and the constraint clears it rather than reusing the
+	// position against the live repository list.
+	return carriedInventorySourceV3{file: &evidence, subtitleHistorical: true}
 }
 
 // virtualCandidateRotationRecordedV3 reports whether the session recorded a
