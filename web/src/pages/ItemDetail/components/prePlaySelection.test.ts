@@ -115,6 +115,38 @@ describe("buildPrePlaySubtitleCandidates track_index", () => {
     expect(byLanguage.get("fr")).toBe(3);
   });
 
+  it("uses the same de-duplicated ordinals as the published inventory", () => {
+    // Two external rows name the same sidecar, so the server's (and the
+    // client's) single published inventory collapses them and no ordinal is
+    // consumed; the later embedded track shifts down. The old position-based
+    // derivation counted both externals and put the embedded track at 2.
+    const duplicateExternals: VersionSubtitleTrack[] = [
+      {
+        index: 1,
+        external: true,
+        language: "en",
+        codec: "srt",
+        file_name: "same.srt",
+        title: "English",
+      },
+      {
+        index: 2,
+        external: true,
+        language: "en",
+        codec: "srt",
+        file_name: "same.srt",
+        title: "English duplicate",
+      },
+      { index: 3, external: false, language: "fr", codec: "subrip" },
+    ];
+    const { all } = buildPrePlaySubtitleCandidates(duplicateExternals, undefined);
+    const byTitle = new Map(all.map((candidate) => [candidate.title, candidate]));
+    const french = all.find((candidate) => candidate.language === "fr");
+    expect(byTitle.get("English")?.selection.track_index).toBe(0);
+    expect(byTitle.get("English duplicate")?.selection.track_index).toBeUndefined();
+    expect(french?.selection.track_index).toBe(1);
+  });
+
   it("never sends the container stream index as subtitle_track_index", () => {
     const { all } = buildPrePlaySubtitleCandidates(tracks, downloaded);
     const byLanguage = new Map(all.map((c) => [c.language, c]));

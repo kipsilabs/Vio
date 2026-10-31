@@ -141,6 +141,7 @@ function playbackSession(
     retrying: false,
     initialSubtitleErrorTitle: null,
     initialSubtitleError: null,
+    trackSelectionNotice: null,
     connectionStatus: "connected",
     connectionErrorTitle: null,
     connectionError: null,
@@ -452,6 +453,70 @@ describe("WatchPage playback state", () => {
 
     expect(updatePlaybackState).toHaveBeenCalledWith(321, true);
     expect(onPlaybackStateChange).toHaveBeenCalledWith(state);
+  });
+});
+
+describe("WatchPage exit selection", () => {
+  it("carries the requested file beside the effective one on end", async () => {
+    const onEnded = vi.fn();
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        plan: fixturePlanV3({ requested_media_file_id: 7, effective_media_file_id: 8 }),
+        mediaFileId: 8,
+      }),
+    );
+    render(
+      createElement(WatchPage, {
+        ...watchPageProps,
+        fileId: 7,
+        onEnded,
+      }),
+    );
+    await waitFor(() => expect(videoPlayerMock).toHaveBeenCalled());
+    const props = videoPlayerMock.mock.calls.at(-1)?.[0] as { onEnded?: () => void };
+    act(() => props.onEnded?.());
+
+    expect(onEnded).toHaveBeenCalledWith(
+      expect.objectContaining({
+        lastFileId: 8,
+        selectedFileId: 7,
+      }),
+    );
+  });
+
+  it("reports a committed requested version change to the host", async () => {
+    const onRequestedVersionChange = vi.fn();
+    playbackSessionMock.mockReturnValue(
+      playbackSession({ plan: fixturePlanV3({ requested_media_file_id: 7 }) }),
+    );
+    const { rerender } = render(
+      createElement(WatchPage, {
+        ...watchPageProps,
+        onRequestedVersionChange,
+      }),
+    );
+    await waitFor(() => expect(videoPlayerMock).toHaveBeenCalled());
+    // Mounting on the current row is not a switch.
+    expect(onRequestedVersionChange).not.toHaveBeenCalled();
+
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        plan: fixturePlanV3({
+          plan_id: "plan:version-switch",
+          requested_media_file_id: 8,
+          effective_media_file_id: 8,
+        }),
+        mediaFileId: 8,
+      }),
+    );
+    rerender(
+      createElement(WatchPage, {
+        ...watchPageProps,
+        onRequestedVersionChange,
+      }),
+    );
+
+    await waitFor(() => expect(onRequestedVersionChange).toHaveBeenCalledWith(8));
   });
 });
 

@@ -4,6 +4,7 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import { createElement } from "react";
 import { describe, expect, it, vi } from "vitest";
 import { AudioTrackMenu } from "./AudioTrackMenu";
+import { resolveAppliedAudioIndex } from "../utils/audioTrackMatch";
 
 function renderMenu(tracks: Parameters<typeof AudioTrackMenu>[0]["tracks"]) {
   return render(
@@ -128,6 +129,31 @@ describe("AudioTrackMenu", () => {
     );
     expect(container.firstChild).toBeNull();
     expect(screen.queryByRole("button", { name: "Audio tracks" })).toBeNull();
+  });
+
+  it("shows an empty applied inventory as no selection, not row 0", () => {
+    // The marker is what the session carries when the committed selection has
+    // no row in the applied inventory. It must render no active row while the
+    // menu itself still renders the inventory.
+    const marker = resolveAppliedAudioIndex([], [], null);
+    expect(marker).toBe(-1);
+
+    render(
+      createElement(AudioTrackMenu, {
+        tracks: [{ title: "English", codec: "eac3", channels: 6 }],
+        activeIndex: marker < 0 ? null : marker,
+        onSelect: () => {},
+        currentPosition: 0,
+        open: true,
+        onOpenChange: () => {},
+        hideTrigger: true,
+      }),
+    );
+
+    const entry = screen.getByRole("menuitem");
+    expect(entry).toHaveTextContent("English");
+    expect(entry).not.toHaveClass("text-blue-400");
+    expect(entry).not.toHaveTextContent("\u2713");
   });
 
   it("keeps multiple-track selection behavior unchanged", () => {
