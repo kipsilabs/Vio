@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -13,11 +14,13 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/httpstream"
+	"github.com/Silo-Server/silo-server/internal/models"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -52,6 +55,11 @@ type SubtitleCache struct {
 	// production schedule; tests override it on their own cache instead of
 	// mutating package state.
 	extractRetryDelays []time.Duration
+	// fillWaitTimeout bounds how long a duplicate request waits for an
+	// in-flight fill before answering the retryable "still working" shape.
+	// NewSubtitleCache installs the production bound; tests override it on
+	// their own cache.
+	fillWaitTimeout time.Duration
 
 	mu       sync.Mutex
 	inflight map[string]*SubtitleCacheFill
@@ -141,12 +149,25 @@ const (
 	// bundle after its short client wait long before this fires.
 	subtitleFontBundleExtractTimeout = 5 * time.Minute
 	// subtitleFillWaitRetries bounds how many in-flight fills a single request
-	// waits on before falling back to its own uncached stream. A fill that
-	// fails without committing leaves no entry; the waiter re-attempts the
-	// reservation, so one transient failure still yields a served response.
-	// The cap stops a pathological run of failing fills from wedging a request
-	// indefinitely when its context has no deadline.
+	// waits on before answering retryable. A fill that fails without committing
+	// leaves no entry; the waiter re-attempts the reservation, so one transient
+	// failure still yields a served response. The cap stops a pathological run
+	// of failing fills from wedging a request indefinitely when its context has
+	// no deadline, and the answer there is the retryable shape below rather
+	// than a second extraction stacked on the one already running.
 	subtitleFillWaitRetries = 3
+	// subtitleFillBusyRetryAfter is the Retry-After handed to a request that
+	// joined an in-flight fill and could not get a committed entry from it. It
+	// is shorter than the upstream-failure backoff on purpose: the answer is
+	// "the extraction already running will land soon", not "the provider is
+	// failing".
+	subtitleFillBusyRetryAfter = 2 * time.Second
+	// subtitleFillWaitTimeout bounds how long a duplicate request waits on an
+	// in-flight fill before answering retryable. A local demux finishes well
+	// inside it; a slow provider read that a second request is racing (the
+	// production 16s extract) hands that request the retry shape instead of
+	// holding its connection open and then stacking a second extraction.
+	subtitleFillWaitTimeout = 5 * time.Second
 	// subtitleWarmFailureBaseCooldown is the first backoff after a warm for
 	// one identity fails or is abandoned. Repeated windowed misses on a
 	// source that cannot be warmed (provider error, broken relay,
@@ -294,6 +315,7 @@ func NewSubtitleCache(transcodeDir func() string) *SubtitleCache {
 		transcodeDir:       transcodeDir,
 		maxBytes:           defaultSubtitleCacheMaxBytes,
 		extractRetryDelays: subtitleExtractRetryDelays(),
+		fillWaitTimeout:    subtitleFillWaitTimeout,
 		inflight:           make(map[string]*SubtitleCacheFill),
 		warmGuard:          make(map[string]subtitleWarmGuard),
 		warmSem:            make(chan struct{}, subtitleCacheWarmSlots),
@@ -307,9 +329,11 @@ func NewSubtitleCache(transcodeDir func() string) *SubtitleCache {
 // re-running ffmpeg; SUP retains its progressive window and background-warming
 // behavior in ServeSUPExtract. Only one request fills a complete track; a
 // request that arrives while a fill is in flight waits for it to commit and
-// serves the cached entry (a failed fill falls back to a fresh attempt, then to
-// an uncached stream). Retryable upstream failures are retried a bounded number
-// of times in-request and then put the identity in a short exponential backoff.
+// serves the cached entry (a failed fill is re-attempted, and a run of fills
+// that all settle without committing answers the retryable "still working"
+// shape instead of stacking a second extraction). Retryable upstream failures
+// are retried a bounded number of times in-request and then put the identity in
+// a short exponential backoff.
 //
 // It is ServeExtractWithResult without the serve report. Callers that need to
 // know whether a committed artifact was served — for example to decide whether
@@ -386,7 +410,14 @@ func (c *SubtitleCache) ServeExtractWithResult(w http.ResponseWriter, r *http.Re
 			// A warm (or another request) already holds the fill. Wait for it
 			// to settle instead of running a second full demux, then serve the
 			// entry it committed.
-			if err := waitForSubtitleFill(r.Context(), wait); err != nil {
+			if err := waitForSubtitleFill(r.Context(), wait, c.fillWaitBound()); err != nil {
+				if errors.Is(err, errSubtitleFillWaitTimeout) {
+					// The extraction this request joined is still running. Answer
+					// the retryable "still working" shape instead of holding the
+					// connection open for a multi-second provider read and then
+					// stacking a second extraction on top of it.
+					return result, &SubtitleExtractionRetryError{RetryAfter: subtitleFillBusyRetryAfter}
+				}
 				return result, err
 			}
 			if c.serveCached(w, r, opts, format) {
@@ -394,6 +425,16 @@ func (c *SubtitleCache) ServeExtractWithResult(w http.ResponseWriter, r *http.Re
 				return result, nil
 			}
 			fill, wait = c.beginFillOrWait(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, format)
+		}
+		if fill == nil && wait != nil {
+			// Every fill this request joined settled without committing and
+			// another one is already running for the same identity. Running our
+			// own extract now would stack a second full demux (and a second
+			// provider read) on top of it, which is exactly what a client
+			// retrying a slow track must not cause. Answer with the retryable
+			// "still working, retry" shape the request path already understands
+			// (503 + Retry-After) and let the running fill commit.
+			return result, &SubtitleExtractionRetryError{RetryAfter: subtitleFillBusyRetryAfter}
 		}
 		if fill != nil && c.serveCached(w, r, opts, format) {
 			// A previous owner may have committed between lookup and reservation.
@@ -578,6 +619,15 @@ func (c *SubtitleCache) runExtract(ctx context.Context, opts StreamExtractOpts, 
 	}
 }
 
+// fillWaitBound returns this cache's fill-wait bound, falling back to the
+// production value for a cache built without one.
+func (c *SubtitleCache) fillWaitBound() time.Duration {
+	if c != nil && c.fillWaitTimeout > 0 {
+		return c.fillWaitTimeout
+	}
+	return subtitleFillWaitTimeout
+}
+
 // retryDelays returns this cache's in-request retry schedule, falling back to
 // the production schedule for a disabled (nil) cache.
 func (c *SubtitleCache) retryDelays() []time.Duration {
@@ -641,17 +691,36 @@ func (w *subtitleWindowCapture) Flush() {
 }
 
 // waitForSubtitleFill blocks until the in-flight fill identified by wait
-// settles (its done channel closes on Commit or Discard) or the caller's
-// request context is done. A canceled client returns promptly instead of
-// holding a goroutine until the fill finishes.
-func waitForSubtitleFill(ctx context.Context, wait <-chan struct{}) error {
+// settles (its done channel closes on Commit or Discard), the caller's request
+// context is done, or timeout expires. A canceled client returns promptly
+// instead of holding a goroutine until the fill finishes. A timeout returns
+// errSubtitleFillWaitTimeout so the caller can answer retryable rather than
+// starting a second extraction for the same identity.
+func waitForSubtitleFill(ctx context.Context, wait <-chan struct{}, timeout time.Duration) error {
+	if timeout <= 0 {
+		select {
+		case <-wait:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 	select {
 	case <-wait:
 		return nil
+	case <-timer.C:
+		return errSubtitleFillWaitTimeout
 	case <-ctx.Done():
 		return ctx.Err()
 	}
 }
+
+// errSubtitleFillWaitTimeout marks a duplicate request that waited out its
+// fill-wait bound. It never reaches a client as an error message: the serve
+// paths translate it into SubtitleExtractionRetryError.
+var errSubtitleFillWaitTimeout = errors.New("subtitle fill wait timed out")
 
 func (c *SubtitleCache) serveCached(w http.ResponseWriter, r *http.Request, opts StreamExtractOpts, format string) bool {
 	cached, modTime, ok := c.lookup(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, format)
@@ -1104,13 +1173,22 @@ func (c *SubtitleCache) ServeSUPExtract(w http.ResponseWriter, r *http.Request, 
 	// committed entry can still be served with http.ServeContent.
 	fill, wait := c.beginFillOrWait(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, subtitleFormatSUP)
 	for attempt := 0; wait != nil && attempt < subtitleFillWaitRetries; attempt++ {
-		if err := waitForSubtitleFill(r.Context(), wait); err != nil {
+		if err := waitForSubtitleFill(r.Context(), wait, c.fillWaitBound()); err != nil {
+			if errors.Is(err, errSubtitleFillWaitTimeout) {
+				// Same answer as the text path: the fill this request joined is
+				// still running, so tell the caller to retry rather than stacking
+				// a second full demux on top of it.
+				return &SubtitleExtractionRetryError{RetryAfter: subtitleFillBusyRetryAfter}
+			}
 			return err
 		}
 		if c.serveSUPEntry(w, r, opts) {
 			return nil
 		}
 		fill, wait = c.beginFillOrWait(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, subtitleFormatSUP)
+	}
+	if fill == nil && wait != nil {
+		return &SubtitleExtractionRetryError{RetryAfter: subtitleFillBusyRetryAfter}
 	}
 
 	w.Header().Set("Content-Type", "application/octet-stream")
@@ -1997,19 +2075,60 @@ func fontBundleCacheFileName(identity string, modTime time.Time, size int64) str
 // is bounded by the same generation bucket subtitleCacheSource
 // applies to identity-keyed entries.
 //
+// inventory is the token for the row's probed subtitle layout (see
+// SubtitleInventoryToken). Folding it in is what invalidates the entry when the
+// row's probed inventory changes: a re-probe that establishes a different
+// layout names different streams under the same ordinals, so the artifact
+// extracted against the previous inventory must not be served for the new one.
+// A re-probe that observes the same layout produces the same token and keeps
+// the warm entry.
+//
 // The hash is deliberately ordinal-based: folding in a container track id
 // would change every key and orphan entries committed by earlier releases.
 // Across a drift remap the start-path warm, which keys on the plan ordinal,
 // can therefore miss the post-remap serve identity; the serve-path window warm
 // is the authoritative populator and re-keys to the post-remap ordinal, so an
 // orphaned plan-ordinal entry self-heals on the next window.
-func VirtualSubtitleCacheIdentity(fileID int, virtualSourceURI string, trackIndex int) string {
+func VirtualSubtitleCacheIdentity(fileID int, virtualSourceURI string, trackIndex int, inventory string) string {
 	pinned := ""
 	if parsed, err := url.Parse(strings.TrimSpace(virtualSourceURI)); err == nil {
 		pinned = strings.TrimSpace(parsed.Query().Get("result"))
 	}
-	sum := sha256.Sum256([]byte(fmt.Sprintf("%d|%s|%d", fileID, pinned, trackIndex)))
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%d|%s|%d|%s", fileID, pinned, trackIndex, inventory)))
 	return fmt.Sprintf("%x", sum[:12])
+}
+
+// SubtitleInventoryToken is a stable token for one row's probed subtitle
+// inventory. It feeds VirtualSubtitleCacheIdentity so a layout change re-keys
+// the cache, while an unchanged layout keeps its artifacts across ordinary
+// re-probes.
+//
+// Only fields that identify the stream a given ordinal resolves to are
+// included. Container track ids, titles, and display flags are excluded:
+// remuxes and metadata edits rewrite them without changing which subtitle
+// stream an ordinal names, and folding them in would discard every warm
+// artifact for cosmetic changes.
+func SubtitleInventoryToken(tracks []models.SubtitleTrack) string {
+	if len(tracks) == 0 {
+		return directStreamConditionalNone
+	}
+	var b strings.Builder
+	for _, track := range tracks {
+		b.WriteString(strconv.Itoa(track.Index))
+		b.WriteByte(':')
+		b.WriteString(strings.ToLower(strings.TrimSpace(track.Codec)))
+		b.WriteByte(':')
+		b.WriteString(strings.ToLower(strings.TrimSpace(track.Language)))
+		if track.Forced {
+			b.WriteString(":forced")
+		}
+		if track.HearingImpaired {
+			b.WriteString(":hi")
+		}
+		b.WriteByte('|')
+	}
+	sum := sha256.Sum256([]byte(b.String()))
+	return hex.EncodeToString(sum[:8])
 }
 
 // LookupFontBundle returns the cached encoded font-bundle JSON for the key, or

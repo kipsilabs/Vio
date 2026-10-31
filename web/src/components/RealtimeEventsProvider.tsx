@@ -58,6 +58,7 @@ import { useIsActingAdmin } from "@/hooks/useIsActingAdmin";
 import { usePageActivity } from "@/hooks/usePageActivity";
 import {
   adminKeys,
+  catalogKeys,
   historyImportKeys,
   libraryKeys,
   notInterestedKeys,
@@ -306,6 +307,18 @@ function catalogEventContentID(data: unknown) {
   }
   const value = (data as { content_id?: unknown }).content_id;
   return typeof value === "string" && value ? value : undefined;
+}
+
+/**
+ * A row was stamped failed (or a refresh rewrote the item's versions). Its
+ * liveness verdict is cached for minutes, so the version menus hold the dead
+ * row until the check runs again.
+ */
+function isVersionsUpdatedEvent(message: EventsEventMessage) {
+  if (message.event !== "catalog.item.changed") return false;
+  const data = message.data;
+  if (!data || typeof data !== "object" || !("change" in data)) return false;
+  return (data as { change?: unknown }).change === "versions_updated";
 }
 
 function handleJobSideEffects(
@@ -771,6 +784,13 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
         break;
       case "catalog":
         {
+          // The coalesced sweep below would also invalidate these checks, but
+          // only once its window closes; a stamped row has to leave an open
+          // version menu at once. versions_updated is rare (a stamp or a
+          // refresh), so the checks are re-run directly here.
+          if (isVersionsUpdatedEvent(message)) {
+            void queryClient.invalidateQueries({ queryKey: catalogKeys.versionLiveness });
+          }
           const isItemChange = CATALOG_ITEM_CHANGED_EVENTS.has(message.event);
           catalogInvalidation.schedule({
             itemId: isItemChange ? catalogEventContentID(message.data) : undefined,

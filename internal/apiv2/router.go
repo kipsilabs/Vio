@@ -323,6 +323,10 @@ type Dependencies struct {
 	VirtualCandidatesRefresh   VirtualCandidatesRefreshService
 	VirtualCandidatesDiscovery VirtualCandidatesDiscoveryService
 	PreplayDiscoveryEnabled    func(context.Context) bool
+	// VirtualSelectionWarm schedules probe/warm work for the virtual versions a
+	// catalog detail read surfaces. Nil leaves detail reads side-effect free
+	// (tests construct the registry without it).
+	VirtualSelectionWarm VirtualSelectionWarmService
 	// PreplayDiscoveryBudgetMs reads the configured catalog leaf detail
 	// discovery budget in whole milliseconds
 	// (virtual_library.catalog_discovery_budget_ms). Nil or non-positive

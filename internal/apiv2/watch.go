@@ -75,40 +75,55 @@ type WatchDetail struct {
 
 // WatchFileVersion is one playable file of the item.
 type WatchFileVersion struct {
-	FileID                   ID                   `json:"file_id" example:"42"`
-	FileName                 string               `json:"file_name,omitempty"`
-	FilePath                 string               `json:"file_path,omitempty" doc:"Only for accounts allowed to see paths"`
-	Resolution               string               `json:"resolution" example:"1080p"`
-	CodecVideo               string               `json:"codec_video" example:"h264"`
-	CodecAudio               string               `json:"codec_audio" example:"eac3"`
-	HDR                      bool                 `json:"hdr"`
-	Container                string               `json:"container" example:"mkv"`
-	FileSize                 int64                `json:"file_size" doc:"Bytes"`
-	DurationSeconds          int                  `json:"duration_seconds" example:"10200"`
-	Bitrate                  int                  `json:"bitrate" doc:"Bits per second"`
-	FormatScore              *int                 `json:"format_score,omitempty" doc:"Custom-format score the virtual ranking assigned this candidate; absent when the row is unscored (local files, no ranking)"`
-	MatchedFormats           []string             `json:"matched_formats,omitempty" doc:"Names of the enabled, non-rejecting custom formats the ranking matched on this candidate, best score first, then name; absent when the row is unscored or matched none"`
-	AddedAt                  Instant              `json:"added_at" example:"2026-01-02T03:04:05.000Z"`
-	EditionRaw               string               `json:"edition_raw,omitempty"`
-	EditionKey               string               `json:"edition_key,omitempty"`
-	PresentationKind         string               `json:"presentation_kind,omitempty"`
-	PresentationGroupKey     string               `json:"presentation_group_key,omitempty"`
-	PresentationPartIndex    int                  `json:"presentation_part_index,omitempty"`
-	PresentationPartTotal    int                  `json:"presentation_part_total,omitempty"`
-	MultiEpisodeStart        int                  `json:"multi_episode_start,omitempty"`
-	MultiEpisodeEnd          int                  `json:"multi_episode_end,omitempty"`
-	EffectiveAudioTrackIndex *int                 `json:"effective_audio_track_index,omitempty"`
-	EffectiveAudioLanguage   string               `json:"effective_audio_language,omitempty"`
-	VideoTracks              []WatchVideoTrack    `json:"video_tracks,omitempty"`
-	AudioTracks              []WatchAudioTrack    `json:"audio_tracks,omitempty"`
-	SubtitleTracks           []WatchSubtitleTrack `json:"subtitle_tracks,omitempty"`
-	Chapters                 []WatchChapter       `json:"chapters,omitempty"`
-	Intro                    *WatchMarker         `json:"intro,omitempty"`
-	Credits                  *WatchMarker         `json:"credits,omitempty"`
-	Recap                    *WatchMarker         `json:"recap,omitempty"`
-	Preview                  *WatchMarker         `json:"preview,omitempty"`
-	MarkerSegments           []MarkerOccurrence   `json:"marker_segments" doc:"All effective marker occurrences for this file in source-time order; empty, never null"`
-	TrickplayAvailable       bool                 `json:"trickplay_available" doc:"Whether seek-bar previews are published for this file; read them with getWatchTrickplay"`
+	FileID                   ID       `json:"file_id" example:"42"`
+	FileName                 string   `json:"file_name,omitempty"`
+	FilePath                 string   `json:"file_path,omitempty" doc:"Only for accounts allowed to see paths"`
+	Resolution               string   `json:"resolution" example:"1080p"`
+	CodecVideo               string   `json:"codec_video" example:"h264"`
+	CodecAudio               string   `json:"codec_audio" example:"eac3"`
+	HDR                      bool     `json:"hdr"`
+	Container                string   `json:"container" example:"mkv"`
+	FileSize                 int64    `json:"file_size" doc:"Bytes"`
+	DurationSeconds          int      `json:"duration_seconds" example:"10200"`
+	Bitrate                  int      `json:"bitrate" doc:"Bits per second"`
+	FormatScore              *int     `json:"format_score,omitempty" doc:"Custom-format score the virtual ranking assigned this candidate; absent when the row is unscored (local files, no ranking)"`
+	MatchedFormats           []string `json:"matched_formats,omitempty" doc:"Names of the enabled, non-rejecting custom formats the ranking matched on this candidate, best score first, then name; absent when the row is unscored or matched none"`
+	AddedAt                  Instant  `json:"added_at" example:"2026-01-02T03:04:05.000Z"`
+	EditionRaw               string   `json:"edition_raw,omitempty"`
+	EditionKey               string   `json:"edition_key,omitempty"`
+	PresentationKind         string   `json:"presentation_kind,omitempty"`
+	PresentationGroupKey     string   `json:"presentation_group_key,omitempty"`
+	PresentationPartIndex    int      `json:"presentation_part_index,omitempty"`
+	PresentationPartTotal    int      `json:"presentation_part_total,omitempty"`
+	MultiEpisodeStart        int      `json:"multi_episode_start,omitempty"`
+	MultiEpisodeEnd          int      `json:"multi_episode_end,omitempty"`
+	EffectiveAudioTrackIndex *int     `json:"effective_audio_track_index,omitempty"`
+	EffectiveAudioLanguage   string   `json:"effective_audio_language,omitempty"`
+	// Failed is the durable virtual-only "produced no bytes at stream-open"
+	// verdict. Unlike available=false it means the release is confirmed
+	// unservable; menus remove the row instead of offering a retry-able pick.
+	Failed bool `json:"failed,omitempty"`
+	// Available is the durable per-version health signal: a virtual candidate
+	// is unavailable when stamped failed, a local file when marked missing.
+	// Omitted when available, so an absent field means available/unknown.
+	Available *bool `json:"available,omitempty"`
+	// SourceMismatch reports a recent probe that rejected the provider's bytes
+	// as a different release than the row declares. Advisory: it never changes
+	// failed or available, and it is absent once the process drops the verdict.
+	SourceMismatch *VersionSourceMismatch `json:"source_mismatch,omitempty"`
+	// ProbedAt is when ffprobe last enumerated this version's real stream
+	// table. Absent means the row still carries declared metadata only.
+	ProbedAt           *Instant             `json:"probed_at,omitempty"`
+	VideoTracks        []WatchVideoTrack    `json:"video_tracks,omitempty"`
+	AudioTracks        []WatchAudioTrack    `json:"audio_tracks,omitempty"`
+	SubtitleTracks     []WatchSubtitleTrack `json:"subtitle_tracks,omitempty"`
+	Chapters           []WatchChapter       `json:"chapters,omitempty"`
+	Intro              *WatchMarker         `json:"intro,omitempty"`
+	Credits            *WatchMarker         `json:"credits,omitempty"`
+	Recap              *WatchMarker         `json:"recap,omitempty"`
+	Preview            *WatchMarker         `json:"preview,omitempty"`
+	MarkerSegments     []MarkerOccurrence   `json:"marker_segments" doc:"All effective marker occurrences for this file in source-time order; empty, never null"`
+	TrickplayAvailable bool                 `json:"trickplay_available" doc:"Whether seek-bar previews are published for this file; read them with getWatchTrickplay"`
 }
 
 // WatchVideoTrack is one video stream of a file as the scanner probed it.
@@ -394,6 +409,10 @@ func (reg *Registry) getWatchState(ctx context.Context, in *WatchDetailInput) (*
 			}
 		}
 	}
+	// Native clients never declare a file_id on this read, so the
+	// selected-file hook warmed nothing. Warm the rows the answer lists,
+	// exactly as the catalog leaf detail read does.
+	reg.warmWatchDetailVirtualVersions(ctx, detail, filter)
 	body := watchDetailOf(detail)
 	body.HasVirtualSource = virtualSource
 	body.IndexerReleases = reg.indexerReleasesFor(ctx, string(in.ID))
@@ -556,6 +575,10 @@ func watchVersionOf(v catalogpkg.FileVersion) WatchFileVersion {
 		MultiEpisodeEnd:          v.MultiEpisodeEnd,
 		EffectiveAudioTrackIndex: v.EffectiveAudioTrackIndex,
 		EffectiveAudioLanguage:   v.EffectiveAudioLanguage,
+		Failed:                   v.Failed,
+		Available:                v.Available,
+		SourceMismatch:           versionSourceMismatchOf(v.SourceMismatch),
+		ProbedAt:                 probeInstantPtr(v.ProbedAt),
 		Intro:                    watchMarkerOf(v.Intro),
 		Credits:                  watchMarkerOf(v.Credits),
 		Recap:                    watchMarkerOf(v.Recap),

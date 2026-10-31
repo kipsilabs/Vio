@@ -9,7 +9,9 @@ import (
 	"net/url"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/Silo-Server/silo-server/internal/api/handlers"
 	catalogpkg "github.com/Silo-Server/silo-server/internal/catalog"
@@ -273,6 +275,7 @@ func catalogDeps(t *testing.T) (Dependencies, *fakeCatalog) {
 
 type fakePreplayCatalog struct {
 	*fakeCatalog
+	mu            sync.Mutex
 	detail        catalogpkg.ItemDetail
 	reads         int
 	discoveries   int
@@ -287,6 +290,52 @@ type fakePreplayCatalog struct {
 	// unredacted path), independent of the file paths the response returns:
 	// a viewer's redaction must not gate discovery.
 	hasVirtual bool
+	// discoveryGate, when non-nil, holds a listing open until it is closed and
+	// discoveryStarted receives once that listing is running. They let a test
+	// observe that catalog detail answered while discovery was still in flight.
+	discoveryGate    <-chan struct{}
+	discoveryStarted chan<- struct{}
+	completions      int
+}
+
+// preplaySnapshot copies the fake's mutable observation state. Catalog detail
+// starts discovery on a detached goroutine, so the test must read it under the
+// same lock the fake writes it with.
+type preplaySnapshot struct {
+	reads         int
+	discoveries   int
+	discoveryView handlers.ItemViewer
+	discoveryUser int
+	discoveryID   string
+	discoveryMode handlers.VirtualDiscoveryMode
+	bounded       bool
+}
+
+func (fake *fakePreplayCatalog) snapshot() preplaySnapshot {
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	return preplaySnapshot{
+		reads: fake.reads, discoveries: fake.discoveries,
+		discoveryView: fake.discoveryView, discoveryUser: fake.discoveryUser,
+		discoveryID: fake.discoveryID, discoveryMode: fake.discoveryMode,
+		bounded: fake.bounded,
+	}
+}
+
+// waitForDiscoveries polls until the detached listing for the item has run.
+func (fake *fakePreplayCatalog) waitForDiscoveries(t *testing.T, want int, timeout time.Duration) preplaySnapshot {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		snap := fake.snapshot()
+		if snap.discoveries >= want {
+			return snap
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("discoveries = %d after %s, want %d", snap.discoveries, timeout, want)
+		}
+		time.Sleep(5 * time.Millisecond) //nolint:forbidigo // Polls the fake's recorded discovery count.
+	}
 }
 
 func (fake *fakePreplayCatalog) HasVirtualSource(_ context.Context, _ string) (bool, error) {
@@ -294,6 +343,8 @@ func (fake *fakePreplayCatalog) HasVirtualSource(_ context.Context, _ string) (b
 }
 
 func (fake *fakePreplayCatalog) ItemDetail(_ context.Context, viewer handlers.ItemViewer, _ string) (*catalogpkg.ItemDetail, error) {
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
 	fake.reads++
 	if fake.err != nil {
 		return nil, fake.err
@@ -307,16 +358,44 @@ func (fake *fakePreplayCatalog) ItemDetail(_ context.Context, viewer handlers.It
 }
 
 func (fake *fakePreplayCatalog) DiscoverVirtualCandidates(ctx context.Context, userID int, profileID, contentID string, access catalogpkg.AccessFilter, mode handlers.VirtualDiscoveryMode) ([]catalogpkg.FileVersion, error) {
+	started := fake.discoveryStarted
+	gate := fake.discoveryGate
+	fake.mu.Lock()
 	fake.discoveries++
 	fake.discoveryMode = mode
 	fake.discoveryView = handlers.ItemViewer{ProfileID: profileID, Access: access}
 	fake.discoveryUser, fake.discoveryID = userID, contentID
 	_, fake.bounded = ctx.Deadline()
-	if fake.discoveryErr != nil {
-		return nil, fake.discoveryErr
+	discoveryErr := fake.discoveryErr
+	fake.mu.Unlock()
+	if started != nil {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
 	}
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	if discoveryErr != nil {
+		return nil, discoveryErr
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	fake.completions++
 	fake.detail.Versions = []catalogpkg.FileVersion{{FileID: 121, FilePath: "virtual://movie/tt0113277?result=candidate", Resolution: "2160p", AddedAt: fixedTime()}}
 	return fake.detail.Versions, nil
+}
+
+// discoveryDoneCount reports how many listings returned successfully.
+func (fake *fakePreplayCatalog) discoveryDoneCount() int {
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	return fake.completions
 }
 
 type fakePreplayWatch struct {
@@ -402,7 +481,15 @@ func TestDetailPreplayDiscovery(t *testing.T) {
 						HasVirtualSource *bool `json:"has_virtual_source"`
 					}
 					decodeJSON(t, rec.Body, &body)
-					if len(body.Versions) != 1 || body.Versions[0].FileID != test.wantFileID {
+					wantFileID := test.wantFileID
+					if endpoint == "catalog/items" {
+						// Catalog detail answers from the persisted list: the
+						// listing this read starts is detached, so its result
+						// reaches clients through versions_updated, never this
+						// response.
+						wantFileID = "120"
+					}
+					if len(body.Versions) != 1 || body.Versions[0].FileID != wantFileID {
 						t.Fatalf("versions = %+v", body.Versions)
 					}
 					// The hint is present for eligible virtual leaves (regardless
@@ -418,21 +505,258 @@ func TestDetailPreplayDiscovery(t *testing.T) {
 						t.Fatalf("has_virtual_source = %v, want absent", *body.HasVirtualSource)
 					}
 				}
-				if fake.discoveries != test.wantCalls || fake.reads != test.wantReads {
-					t.Fatalf("discoveries = %d, reads = %d", fake.discoveries, fake.reads)
+				wantReads := test.wantReads
+				if endpoint == "catalog/items" && test.wantCalls > 0 {
+					// No in-request reload: the detached run is what refreshes
+					// an open page.
+					wantReads = 1
 				}
-				if test.wantCalls > 0 && fake.discoveryMode != handlers.VirtualDiscoveryDetail {
-					t.Fatalf("discovery mode = %q, want a detail-page read to prepare", fake.discoveryMode)
+				snap := fake.snapshot()
+				if endpoint == "catalog/items" && test.wantCalls > 0 {
+					// The listing runs detached; wait for it instead of racing
+					// the goroutine.
+					snap = fake.waitForDiscoveries(t, test.wantCalls, 5*time.Second)
 				}
-				if test.wantCalls > 0 && (!fake.bounded || !reflect.DeepEqual(fake.discoveryView, fake.lastViewer) ||
-					fake.discoveryUser != fake.lastViewer.Access.UserID || fake.discoveryID != fake.detail.ContentID) {
-					t.Fatalf("discovery viewer = %+v, detail viewer = %+v, bounded = %v", fake.discoveryView, fake.lastViewer, fake.bounded)
+				if snap.discoveries != test.wantCalls || snap.reads != wantReads {
+					t.Fatalf("discoveries = %d, reads = %d", snap.discoveries, snap.reads)
 				}
-				if test.wantCalls > 0 && fake.discoveryView.Access.SelectedFileID != 120 {
-					t.Fatalf("discovery selected file = %d, want the route's file_id 120", fake.discoveryView.Access.SelectedFileID)
+				if test.wantCalls > 0 && snap.discoveryMode != handlers.VirtualDiscoveryDetail {
+					t.Fatalf("discovery mode = %q, want a detail-page read to prepare", snap.discoveryMode)
+				}
+				if test.wantCalls > 0 && (!snap.bounded || !reflect.DeepEqual(snap.discoveryView, fake.lastViewer) ||
+					snap.discoveryUser != fake.lastViewer.Access.UserID || snap.discoveryID != fake.detail.ContentID) {
+					t.Fatalf("discovery viewer = %+v, detail viewer = %+v, bounded = %v", snap.discoveryView, fake.lastViewer, snap.bounded)
+				}
+				if test.wantCalls > 0 && snap.discoveryView.Access.SelectedFileID != 120 {
+					t.Fatalf("discovery selected file = %d, want the route's file_id 120", snap.discoveryView.Access.SelectedFileID)
 				}
 			})
 		}
+	}
+}
+
+type fakeSelectionWarm struct {
+	probes []int
+	warms  []int
+}
+
+func (f *fakeSelectionWarm) ScheduleSelectedFileProbe(_ string, fileID int, _ catalogpkg.AccessFilter) {
+	f.probes = append(f.probes, fileID)
+}
+
+func (f *fakeSelectionWarm) ScheduleSelectedFileWarm(_ string, fileID int, _ catalogpkg.AccessFilter) {
+	f.warms = append(f.warms, fileID)
+}
+
+// A catalog detail read is the only server-visible signal a thin client sends
+// before it picks a version. It must warm the virtual rows it surfaces: an
+// unprobed row gets the probe and the fetch warm-up, a probed row only the
+// warm-up, the cap holds, local and failed rows are skipped, and a repeated
+// read inside the memo window schedules nothing again.
+func TestCatalogDetailWarmsVirtualVersions(t *testing.T) {
+	deps, base := catalogDeps(t)
+	probedAt := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
+	detail := catalogpkg.ItemDetail{ContentID: "movie:heat-1995", Type: "movie",
+		Versions: []catalogpkg.FileVersion{
+			{FileID: 1, FilePath: "virtual://movie/tt0113277?result=a", AddedAt: fixedTime()},
+			{FileID: 2, FilePath: "virtual://movie/tt0113277?result=b", AddedAt: fixedTime(), ProbedAt: &probedAt},
+			{FileID: 3, FilePath: "virtual://movie/tt0113277?result=c", AddedAt: fixedTime()},
+			{FileID: 4, FilePath: "/media/movie/heat.mkv", AddedAt: fixedTime()},
+			{FileID: 5, FilePath: "virtual://movie/tt0113277?result=dead", AddedAt: fixedTime(), Failed: true},
+		}}
+	fake := &fakePreplayCatalog{fakeCatalog: base, detail: detail}
+	deps.CatalogItems = fake
+	warm := &fakeSelectionWarm{}
+	deps.VirtualSelectionWarm = warm
+	h := newTestHandler(t, deps)
+
+	for range 2 {
+		rec := do(t, h, http.MethodGet, "/api/v2/catalog/items/movie:heat-1995", "", viewerHeaders())
+		if rec.Code != http.StatusOK {
+			t.Fatal(rec.Body.String())
+		}
+	}
+	if want := []int{1}; !reflect.DeepEqual(warm.probes, want) {
+		t.Fatalf("probes = %v, want %v (two-version cap, then deduped)", warm.probes, want)
+	}
+	if want := []int{1, 2}; !reflect.DeepEqual(warm.warms, want) {
+		t.Fatalf("warms = %v, want %v (two-version cap, then deduped)", warm.warms, want)
+	}
+}
+
+// An unwired warm seam leaves the detail read untouched rather than failing it.
+func TestCatalogDetailWarmIsNoOpWhenUnwired(t *testing.T) {
+	deps, base := catalogDeps(t)
+	fake := &fakePreplayCatalog{fakeCatalog: base,
+		detail: catalogpkg.ItemDetail{ContentID: "movie:heat-1995", Type: "movie",
+			Versions: []catalogpkg.FileVersion{{FileID: 1, FilePath: "virtual://movie/tt0113277?result=a", AddedAt: fixedTime()}}}}
+	deps.CatalogItems = fake
+	rec := do(t, newTestHandler(t, deps), http.MethodGet, "/api/v2/catalog/items/movie:heat-1995", "", viewerHeaders())
+	if rec.Code != http.StatusOK {
+		t.Fatal(rec.Body.String())
+	}
+}
+
+// The detail's version rows carry the per-version liveness state the client
+// needs to choose without a second check request: durable failed/available,
+// the process-local source mismatch, the probe stamp, and the audio/subtitle
+// inventory that makes a direct pick possible.
+func TestCatalogDetailVersionsCarryLivenessAndTrackInventory(t *testing.T) {
+	deps, base := catalogDeps(t)
+	probedAt := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
+	unavailable := false
+	zeroIndex := 0
+	detail := catalogpkg.ItemDetail{ContentID: "movie:heat-1995", Type: "movie",
+		Versions: []catalogpkg.FileVersion{
+			{
+				FileID: 42, FilePath: "virtual://movie/tt0113277?result=a", AddedAt: fixedTime(),
+				Failed: true, Available: &unavailable, ProbedAt: &probedAt,
+				SourceMismatch:           &catalogpkg.VersionSourceMismatch{ServedBytes: 7_427_636_945, DeclaredBytes: 8_449_999_999},
+				AudioTracks:              []models.AudioTrack{{Language: "en", Codec: "truehd", Channels: 8}},
+				SubtitleTracks:           []catalogpkg.VersionSubtitleTrack{{Language: "en", Codec: "srt"}},
+				EffectiveAudioTrackIndex: &zeroIndex, EffectiveAudioLanguage: "en",
+			},
+			{FileID: 43, FilePath: "/media/movie/heat.mkv", AddedAt: fixedTime()},
+		}}
+	deps.CatalogItems = &fakePreplayCatalog{fakeCatalog: base, detail: detail}
+
+	rec := do(t, newTestHandler(t, deps), http.MethodGet, "/api/v2/catalog/items/movie:heat-1995", "", viewerHeaders())
+	if rec.Code != http.StatusOK {
+		t.Fatal(rec.Body.String())
+	}
+	var body struct {
+		Versions []struct {
+			FileID         string  `json:"file_id"`
+			Failed         bool    `json:"failed"`
+			Available      *bool   `json:"available"`
+			ProbedAt       *string `json:"probed_at"`
+			SourceMismatch *struct {
+				ServedBytes   int64 `json:"served_bytes"`
+				DeclaredBytes int64 `json:"declared_bytes"`
+			} `json:"source_mismatch"`
+			AudioTracks    []models.AudioTrack               `json:"audio_tracks"`
+			SubtitleTracks []catalogpkg.VersionSubtitleTrack `json:"subtitle_tracks"`
+			EffectiveAudio string                            `json:"effective_audio_language"`
+		} `json:"versions"`
+	}
+	decodeJSON(t, rec.Body, &body)
+	if len(body.Versions) != 2 {
+		t.Fatalf("versions = %+v", body.Versions)
+	}
+	first := body.Versions[0]
+	if first.FileID != "42" || !first.Failed || first.Available == nil || *first.Available {
+		t.Fatalf("virtual version liveness = %+v", first)
+	}
+	if first.ProbedAt == nil || *first.ProbedAt != "2026-03-04T05:06:07.000Z" {
+		t.Fatalf("probed_at = %v", first.ProbedAt)
+	}
+	if first.SourceMismatch == nil || first.SourceMismatch.ServedBytes != 7_427_636_945 || first.SourceMismatch.DeclaredBytes != 8_449_999_999 {
+		t.Fatalf("source_mismatch = %+v", first.SourceMismatch)
+	}
+	if len(first.AudioTracks) != 1 || first.AudioTracks[0].Codec != "truehd" || first.AudioTracks[0].Channels != 8 {
+		t.Fatalf("audio_tracks = %+v", first.AudioTracks)
+	}
+	if len(first.SubtitleTracks) != 1 || first.SubtitleTracks[0].Codec != "srt" {
+		t.Fatalf("subtitle_tracks = %+v", first.SubtitleTracks)
+	}
+	if first.EffectiveAudio != "en" {
+		t.Fatalf("effective_audio_language = %q", first.EffectiveAudio)
+	}
+	second := body.Versions[1]
+	if second.Failed || second.Available != nil || second.ProbedAt != nil || second.SourceMismatch != nil {
+		t.Fatalf("local version must omit virtual-only liveness = %+v", second)
+	}
+}
+
+// Catalog detail must not price the pre-play discovery budget into the answer.
+// It answers from the persisted version list while the listing it started is
+// still in flight, and a second read during that window joins the work instead
+// of starting another provider round-trip. The completion is what publishes
+// versions_updated (covered by the handlers test), so nothing about the fresh
+// list depends on this response waiting.
+func TestCatalogDetailAnswersWithoutWaitingForPreplayDiscovery(t *testing.T) {
+	deps, base := catalogDeps(t)
+	gate := make(chan struct{})
+	started := make(chan struct{}, 4)
+	fake := &fakePreplayCatalog{
+		fakeCatalog: base,
+		detail: catalogpkg.ItemDetail{ContentID: "movie:heat-1995", Type: "movie",
+			Versions: []catalogpkg.FileVersion{{FileID: 120, FilePath: "virtual://movie/tt0113277", AddedAt: fixedTime()}}},
+		hasVirtual:       true,
+		discoveryGate:    gate,
+		discoveryStarted: started,
+	}
+	deps.CatalogItems = fake
+	deps.VirtualCandidatesDiscovery = fake
+	deps.PreplayDiscoveryEnabled = func(context.Context) bool { return true }
+	// The deployment setting that produced the observed 10 s detail reads.
+	deps.PreplayDiscoveryBudgetMs = func(context.Context) int { return 10000 }
+	handler := newTestHandler(t, deps)
+
+	answer := func(wantFileID string) time.Duration {
+		begin := time.Now()
+		rec := do(t, handler, http.MethodGet, "/api/v2/catalog/items/movie:heat-1995?library_id=2&file_id=120", "", viewerHeaders())
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+		}
+		var body struct {
+			Versions []struct {
+				FileID string `json:"file_id"`
+			} `json:"versions"`
+		}
+		decodeJSON(t, rec.Body, &body)
+		if len(body.Versions) != 1 || body.Versions[0].FileID != wantFileID {
+			t.Fatalf("versions = %+v, want %s", body.Versions, wantFileID)
+		}
+		return time.Since(begin)
+	}
+
+	elapsed := answer("120")
+	// Generous compared with the 10 s budget the provider would have consumed,
+	// small enough to fail if the handler waited on the listing at all.
+	if elapsed > 2*time.Second {
+		t.Fatalf("catalog detail took %v while discovery was still in flight", elapsed)
+	}
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("catalog detail did not start the detached discovery")
+	}
+	if snap := fake.snapshot(); snap.discoveries != 1 {
+		t.Fatalf("discoveries = %d after the first read, want 1", snap.discoveries)
+	}
+
+	// A second read during the same listing must answer as well and must not
+	// start a competing provider round-trip.
+	if elapsed := answer("120"); elapsed > 2*time.Second {
+		t.Fatalf("second catalog detail took %v", elapsed)
+	}
+	select {
+	case <-started:
+		t.Fatal("a second detail read started a second discovery while one was running")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if snap := fake.snapshot(); snap.discoveries != 1 {
+		t.Fatalf("discoveries = %d after the second read, want 1", snap.discoveries)
+	}
+
+	close(gate)
+	// The detached run completes and records its 30 s suppression window, so a
+	// later read in that window neither waits nor re-lists.
+	deadline := time.Now().Add(5 * time.Second)
+	for fake.discoveryDoneCount() != 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("detached discovery never completed")
+		}
+		time.Sleep(5 * time.Millisecond) //nolint:forbidigo // Polls the detached run's completion counter.
+	}
+	// The detached run persisted the fresh candidate, so the next read serves
+	// it from the stored rows without another provider round-trip.
+	if elapsed := answer("121"); elapsed > 2*time.Second {
+		t.Fatalf("catalog detail after completion took %v", elapsed)
+	}
+	if snap := fake.snapshot(); snap.discoveries != 1 {
+		t.Fatalf("discoveries = %d after the memo window, want 1", snap.discoveries)
 	}
 }
 

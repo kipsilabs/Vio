@@ -53,6 +53,21 @@ export interface VersionInfo {
   /** The catalog currently reports this version's source as gone. It stays
    *  selectable because a play can force a re-link and retry it. */
   unavailable?: boolean;
+  /** A recent probe read bytes that differ from the declared release. The
+   *  release is alive; only the provider's served bytes were wrong. */
+  sourceMismatch?: { servedBytes: number; declaredBytes: number };
+}
+
+/**
+ * Confirmed-dead rows leave the version list instead of hiding behind the
+ * unavailable treatment: offering them again would only replay a known-dead
+ * release. The current source stays so a mid-playback verdict cannot yank
+ * the playing row, and an all-failed list still renders rather than an
+ * empty menu.
+ */
+export function removeFailedVersions(versions: VersionInfo[]): VersionInfo[] {
+  const alive = versions.filter((version) => !version.failed || version.isCurrentSource);
+  return alive.length > 0 ? alive : versions;
 }
 
 interface QualityMenuProps {
@@ -149,10 +164,12 @@ export function QualityMenu({
   const effectiveCriteria = userCriteria.length > 0 ? userCriteria : serverRanking.criteria;
   const orderedVersions = useMemo(
     () =>
-      sortVersionsByCriteria(
-        versions ?? [],
-        effectiveCriteria,
-        (version) => version.sortable ?? {},
+      removeFailedVersions(
+        sortVersionsByCriteria(
+          versions ?? [],
+          effectiveCriteria,
+          (version) => version.sortable ?? {},
+        ),
       ),
     [versions, effectiveCriteria],
   );
@@ -580,6 +597,12 @@ function versionHealthOf(version: VersionInfo) {
   return deriveVersionHealth({
     failed: version.failed,
     available: version.unavailable === true ? false : undefined,
+    source_mismatch: version.sourceMismatch
+      ? {
+          served_bytes: version.sourceMismatch.servedBytes,
+          declared_bytes: version.sourceMismatch.declaredBytes,
+        }
+      : undefined,
   });
 }
 

@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createWatchRouteRequest, type WatchPlaybackStartInput } from "@/pages/watchRouteHelpers";
 import type { WatchPage } from "@/player/components/WatchPage";
 import { WatchPlaybackHost, WatchPlaybackProvider } from "./WatchPlaybackChrome";
+import { readRequestedFileId } from "./requestedVersion";
 import {
   useWatchPlaybackController,
   type WatchPlaybackControllerValue,
@@ -71,8 +72,19 @@ vi.mock("@/player/components/WatchPage", () => ({
     return <div data-testid="player" />;
   },
 }));
+const postRoll = vi.hoisted(() => ({
+  close: null as null | (() => void),
+  playItem: null as null | ((contentId: string) => void),
+}));
 vi.mock("@/player/components/PlayingNextScreen", () => ({
-  PlayingNextScreen: () => <div data-testid="post-roll" />,
+  PlayingNextScreen: (props: {
+    onClose?: () => void;
+    onPlayItem?: (contentId: string) => void;
+  }) => {
+    postRoll.close = props.onClose ?? null;
+    postRoll.playItem = props.onPlayItem ?? null;
+    return <div data-testid="post-roll" />;
+  },
 }));
 
 const DURATION = 2434;
@@ -115,8 +127,11 @@ async function renderEpisode(input: WatchPlaybackStartInput) {
 
 describe("WatchPlaybackHost end of an episode", () => {
   beforeEach(() => {
+    localStorage.clear();
     mocks.navigate.mockReset();
     mocks.player.props = null;
+    postRoll.close = null;
+    postRoll.playItem = null;
   });
   afterEach(cleanup);
 
@@ -126,6 +141,49 @@ describe("WatchPlaybackHost end of an episode", () => {
     episode.nearEnd();
 
     expect(episode.controller().state.mode).toBe("post-roll");
+  });
+
+  it("remembers a version switched during the episode when it completes into post-roll", async () => {
+    const episode = await renderEpisode({ contentId: "episode-1", libraryId: 1 });
+    // Post-roll opens before the end, then the real `ended` event reports the
+    // switch: row 1 served the bytes, but the viewer asked for row 2.
+    episode.nearEnd();
+    expect(episode.controller().state.mode).toBe("post-roll");
+
+    act(() =>
+      episode.player().onEnded?.({
+        positionSeconds: DURATION,
+        durationSeconds: DURATION,
+        lastFileId: 1,
+        selectedFileId: 2,
+      }),
+    );
+
+    expect(readRequestedFileId("episode-1", "profile-1")).toBe(2);
+  });
+
+  it("remembers a version switched during the episode when post-roll closes before the end", async () => {
+    const episode = await renderEpisode({ contentId: "episode-1", libraryId: 1 });
+    // The version switch is committed before the early post-roll opens; the
+    // viewer then leaves through its Close action and `onEnded` never fires.
+    act(() => episode.player().onRequestedVersionChange?.(2));
+    episode.nearEnd();
+    expect(episode.controller().state.mode).toBe("post-roll");
+
+    act(() => postRoll.close?.());
+
+    expect(readRequestedFileId("episode-1", "profile-1")).toBe(2);
+  });
+
+  it("remembers a version switched during the episode when post-roll advances without ending", async () => {
+    const episode = await renderEpisode({ contentId: "episode-1", libraryId: 1 });
+    act(() => episode.player().onRequestedVersionChange?.(2));
+    episode.nearEnd();
+    expect(episode.controller().state.mode).toBe("post-roll");
+
+    act(() => postRoll.playItem?.("episode-2"));
+
+    expect(readRequestedFileId("episode-1", "profile-1")).toBe(2);
   });
 
   it("keeps a room member in the player and returns it to the room when the room leaves playback", async () => {

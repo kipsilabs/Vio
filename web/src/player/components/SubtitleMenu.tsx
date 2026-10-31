@@ -14,6 +14,9 @@ import { dedupeSubtitleTracks } from "../utils/trackDedupe";
 import { isTranslatableSource } from "./subtitleTranslateRequest";
 import { PlayerMenuSurface } from "./PlayerMenuSurface";
 import { ProvisionalTrackBadge } from "./ProvisionalTrackBadge";
+import { DiscoveryRetryButton } from "./DiscoveryRetryButton";
+import { TrackBadge } from "./TrackBadge";
+import { useProvisionalInventoryExpiry } from "../hooks/useProvisionalInventoryExpiry";
 import type { SubtitleSync, SubtitleSyncEntry } from "../hooks/useSubtitleSync";
 import {
   describeTiming,
@@ -55,6 +58,11 @@ interface SubtitleMenuProps {
   pending?: boolean;
   /** True when track discovery terminally failed or timed out. */
   failed?: boolean;
+  /**
+   * Re-runs track discovery. Shown as a retry once the provisional window
+   * lapses or discovery fails, so a stuck menu is actionable.
+   */
+  onRetryDiscovery?: () => void;
   /** Timing and sync state of the file's syncable tracks (stored and sidecar files). */
   subtitleSync?: SubtitleSync;
 }
@@ -92,6 +100,7 @@ export function SubtitleMenu({
   provisional = false,
   pending = false,
   failed = false,
+  onRetryDiscovery,
   subtitleSync,
 }: SubtitleMenuProps) {
   const [open, setOpen] = useState(false);
@@ -112,6 +121,20 @@ export function SubtitleMenu({
   // indexes; the menu shows one row per distinct descriptor, keeping the first
   // ordinal for selection. Differing forced/hearing-impaired/flag rows stay.
   const sortedTracks = useMemo(() => dedupeSubtitleTracks(sortSubtitlesBySource(tracks)), [tracks]);
+  // Declared or pending rows are placeholders for the effective file, so they
+  // stay out of the menu until probe evidence lands. A terminal failure keeps
+  // the list under its explicit "discovery did not complete" notice instead of
+  // leaving the menu empty.
+  const displayedTracks = provisional && !failed ? [] : sortedTracks;
+  // A spinner with no bound is an indefinite lie about progress. Once the
+  // provisional window lapses, the menu offers the same retry a terminal
+  // failure does instead of spinning forever.
+  const { expired: discoveryExpired, retry: restartDiscovery } =
+    useProvisionalInventoryExpiry(provisional);
+  const handleRetryDiscovery = useCallback(() => {
+    restartDiscovery();
+    onRetryDiscovery?.();
+  }, [onRetryDiscovery, restartDiscovery]);
 
   // Discover whether the server has AI subtitle translation configured, so we
   // only surface the entry point when it can actually do something. This is a
@@ -206,9 +229,14 @@ export function SubtitleMenu({
   }, [open]);
 
   const menuItemsRef = useRef<(HTMLButtonElement | null)[]>([]);
+  const retryButtonRef = useRef<HTMLButtonElement | null>(null);
 
   const handleMenuKeyDown = useCallback((e: React.KeyboardEvent) => {
-    const items = menuItemsRef.current.filter(Boolean) as HTMLButtonElement[];
+    const retryBtn = retryButtonRef.current;
+    const trackButtons = menuItemsRef.current.filter(Boolean) as HTMLButtonElement[];
+    const items = (
+      retryBtn && !retryBtn.disabled ? [retryBtn, ...trackButtons] : trackButtons
+    ).filter((btn) => !btn.disabled);
     if (items.length === 0) return;
     const currentIndex = items.indexOf(document.activeElement as HTMLButtonElement);
     let nextIndex: number | null = null;
@@ -298,23 +326,33 @@ export function SubtitleMenu({
                 must never draw "discovery did not complete" above a correct,
                 populated list. `provisional` is the menu's own evidence state. */}
             {failed && provisional && sortedTracks.length === 0 && (
-              <div className="px-3 py-1 text-xs text-amber-300/80">Subtitle discovery failed</div>
-            )}
-            {failed && provisional && sortedTracks.length > 0 && (
-              <div className="px-3 py-1 text-xs text-white/50">
-                Showing available subtitles — discovery did not complete
+              <div className="flex items-center justify-between gap-2 px-3 py-1 text-xs text-amber-300/80">
+                <span>Subtitle discovery failed</span>
+                <DiscoveryRetryButton onRetry={handleRetryDiscovery} buttonRef={retryButtonRef} />
               </div>
             )}
-            {!failed && provisional && (
+            {failed && provisional && sortedTracks.length > 0 && (
+              <div className="flex items-center justify-between gap-2 px-3 py-1 text-xs text-white/50">
+                <span>Showing available subtitles — discovery did not complete</span>
+                <DiscoveryRetryButton onRetry={handleRetryDiscovery} buttonRef={retryButtonRef} />
+              </div>
+            )}
+            {!failed && provisional && !discoveryExpired && (
               <div className="flex items-center gap-2 px-3 py-1 text-xs text-white/50">
                 <span className="h-3 w-3 animate-spin rounded-full border border-white/20 border-t-white/80" />
                 <span>Discovering subtitles…</span>
               </div>
             )}
+            {!failed && provisional && discoveryExpired && (
+              <div className="flex items-center justify-between gap-2 px-3 py-1 text-xs text-white/50">
+                <span>Subtitles unavailable.</span>
+                <DiscoveryRetryButton onRetry={handleRetryDiscovery} buttonRef={retryButtonRef} />
+              </div>
+            )}
             {sortedTracks.length === 0 && !provisional && (
               <div className="px-3 py-2 text-xs text-white/40">No subtitles available</div>
             )}
-            {sortedTracks.map((track) => {
+            {displayedTracks.map((track) => {
               const isActive = track.index === activeIndex;
               const languageName = getLanguageName(track.language);
               const sourceLabel = SOURCE_LABELS[track.source ?? "embedded"] ?? "Embedded";
@@ -346,7 +384,10 @@ export function SubtitleMenu({
                   </span>
                   <span className="flex min-w-0 flex-1 flex-col">
                     <span className="flex w-full items-center justify-between gap-3">
-                      <span className="text-sm">{languageName}</span>
+                      <span className="flex min-w-0 items-center gap-1.5">
+                        <span className="truncate text-sm">{languageName}</span>
+                        {track.default && <TrackBadge variant="outline">Default</TrackBadge>}
+                      </span>
                       <span className="flex shrink-0 items-center gap-1">
                         {formatLabel && (
                           <span className="rounded bg-white/10 px-1.5 py-0.5 text-[10px] tracking-wide text-white/50 uppercase">

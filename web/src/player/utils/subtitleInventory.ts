@@ -18,6 +18,8 @@ export interface SubtitleInventoryTrackInput {
   forced?: boolean;
   hearing_impaired?: boolean;
   external?: boolean;
+  /** The file's default subtitle stream, per the probed inventory. */
+  default?: boolean;
 }
 
 /**
@@ -41,6 +43,15 @@ export interface DownloadedSubtitleInput {
  */
 export type PublishedSubtitleTrack = PlayerSubtitleInfo & {
   source: "external" | "embedded" | "downloaded";
+  /**
+   * The source row this published track came from (container stream index for
+   * an embedded track, sidecar position for an external one). Exposed so
+   * callers can map a catalog row to the ordinal this single derivation
+   * assigned it without re-implementing the rules.
+   */
+  containerIndex?: number;
+  /** Downloaded subtitle row id, when the source is a downloaded/generated row. */
+  downloadedSubtitleId?: number;
 };
 
 // ---------------------------------------------------------------------------
@@ -369,7 +380,9 @@ export function buildPublishedSubtitleTracks(
       source: "external",
       forced: track.forced,
       hearing_impaired: track.hearing_impaired,
+      default: track.default,
       url: "",
+      containerIndex: track.index ?? list.indexOf(track),
     });
   }
 
@@ -395,7 +408,9 @@ export function buildPublishedSubtitleTracks(
       source: "embedded",
       forced: track.forced,
       hearing_impaired: track.hearing_impaired,
+      default: track.default,
       url: "",
+      containerIndex: track.index ?? list.indexOf(track),
     });
   }
 
@@ -426,6 +441,7 @@ export function buildPublishedSubtitleTracks(
       forced: subtitle.forced,
       hearing_impaired: subtitle.hearing_impaired,
       url: "",
+      downloadedSubtitleId: subtitle.id > 0 ? subtitle.id : undefined,
     });
   }
 

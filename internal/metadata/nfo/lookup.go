@@ -566,7 +566,7 @@ func isAbsent(err error) bool {
 }
 
 func unavailable(path string, err error) error {
-	return fmt.Errorf("%w: %s: %w", metadata.ErrLocalMetadataUnavailable, path, err)
+	return fmt.Errorf("%w: %w", metadata.ErrLocalMetadataUnavailable, &metadata.LocalMetadataPathError{Path: path, Err: err})
 }
 
 // directoryNFONames lists the directory-level NFO names for a content type.

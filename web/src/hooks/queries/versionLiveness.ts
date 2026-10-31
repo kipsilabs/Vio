@@ -3,6 +3,7 @@ import { useMemo } from "react";
 
 import { apiV1 } from "@/api/client";
 import type { VersionLivenessResponse } from "@/api/types";
+import { catalogKeys } from "@/hooks/queries/keys";
 import { isVirtualFileVersion } from "@/pages/ItemDetail/components/versionFormatUtils";
 
 /**
@@ -16,6 +17,31 @@ export interface VersionLivenessCandidate {
   container?: string;
   file_path?: string;
   available?: boolean;
+  /** Durable failed verdict (confirmed unservable). Menus remove rows with
+   * this flag instead of offering them; absent means not failed. */
+  failed?: boolean;
+  /** A recent probe rejected the provider's bytes as a different release than
+   *  this row declares. Advisory only; never implies `failed`. */
+  source_mismatch?: { served_bytes: number; declared_bytes: number };
+}
+
+/** A source-mismatch verdict: bytes served versus bytes declared. */
+export interface VersionSourceMismatchVerdict {
+  servedBytes: number;
+  declaredBytes: number;
+}
+
+/**
+ * A liveness verdict for one file: whether the version is currently
+ * servable, plus whether the server confirmed the row dead (durable failed
+ * verdict). A dead row never recovers without a fresh successful resolve;
+ * an unavailable row without the flag may be transient. A `sourceMismatch`
+ * is neither: the release is alive, only the served bytes were wrong.
+ */
+export interface VersionLivenessVerdict {
+  available: boolean;
+  failed?: boolean;
+  sourceMismatch?: VersionSourceMismatchVerdict;
 }
 
 /** Maximum file_ids per versions/check request. */
@@ -69,20 +95,38 @@ export function chunkVirtualFileIds(versions: VersionLivenessCandidate[]): numbe
 export function mergeVersionLiveness(
   versions: VersionLivenessCandidate[],
   results: VersionLivenessResponse | undefined,
-): Map<number, boolean> {
-  const availability = new Map<number, boolean>();
+): Map<number, VersionLivenessVerdict> {
+  const availability = new Map<number, VersionLivenessVerdict>();
   for (const version of versions) {
     if (version.available === false) {
-      availability.set(version.file_id, false);
+      availability.set(version.file_id, {
+        available: false,
+        failed: version.failed,
+        sourceMismatch: sourceMismatchVerdict(version),
+      });
     }
   }
   for (const result of results?.results ?? []) {
     // The check ran after the item snapshot was fetched, so its result wins
     // for the file_ids it reports — including recovering a version the
     // metadata marked unavailable.
-    availability.set(result.file_id, result.available);
+    availability.set(result.file_id, {
+      available: result.available,
+      failed: result.failed,
+      sourceMismatch: sourceMismatchVerdict(result),
+    });
   }
   return availability;
+}
+
+function sourceMismatchVerdict(row: {
+  source_mismatch?: { served_bytes: number; declared_bytes: number };
+}): VersionSourceMismatchVerdict | undefined {
+  const mismatch = row.source_mismatch;
+  if (!mismatch) {
+    return undefined;
+  }
+  return { servedBytes: mismatch.served_bytes, declaredBytes: mismatch.declared_bytes };
 }
 
 /**
@@ -95,12 +139,12 @@ export function mergeVersionLiveness(
 export function useVersionLiveness(
   versions: VersionLivenessCandidate[],
   enabled: boolean,
-): Map<number, boolean> {
+): Map<number, VersionLivenessVerdict> {
   const chunks = useMemo(() => chunkVirtualFileIds(versions), [versions]);
 
   const queryResults = useQueries({
     queries: chunks.map((fileIds) => ({
-      queryKey: ["catalog", "versions", "check", fileIds],
+      queryKey: [...catalogKeys.versionLiveness, fileIds],
       queryFn: () => fetchVersionLiveness(fileIds),
       enabled: enabled && fileIds.length > 0,
       staleTime: VERSION_LIVENESS_STALE_MS,
@@ -131,16 +175,52 @@ export function useVersionLiveness(
  */
 export function applyVersionAvailability<T extends VersionLivenessCandidate>(
   versions: T[],
-  availability: Map<number, boolean>,
+  availability: Map<number, VersionLivenessVerdict>,
 ): T[] {
   let changed = false;
   const next = versions.map((version) => {
-    const available = availability.get(version.file_id);
-    if (available === undefined || version.available === available) {
+    const verdict = availability.get(version.file_id);
+    if (verdict === undefined) {
+      return version;
+    }
+    // A failed flag is only ever written when there is something to say: an
+    // explicit flag from the check, or clearing a stale one after a
+    // successful resolve. Rows that never carried the field keep their
+    // identity so downstream memoization does not churn.
+    let failed = verdict.failed;
+    if (failed === undefined) {
+      failed = verdict.available && version.failed === true ? false : version.failed;
+    }
+    // The source mismatch is a transient probe verdict, so it is rebuilt from
+    // the check's answer every time: present replaces, absent clears. It never
+    // carries a failed meaning of its own.
+    const sourceMismatch = verdict.sourceMismatch
+      ? {
+          served_bytes: verdict.sourceMismatch.servedBytes,
+          declared_bytes: verdict.sourceMismatch.declaredBytes,
+        }
+      : undefined;
+    if (
+      version.available === verdict.available &&
+      version.failed === failed &&
+      sameSourceMismatch(version.source_mismatch, sourceMismatch)
+    ) {
       return version;
     }
     changed = true;
-    return { ...version, available };
+    return { ...version, available: verdict.available, failed, source_mismatch: sourceMismatch };
   });
   return changed ? next : versions;
+}
+
+function sameSourceMismatch(
+  current: { served_bytes: number; declared_bytes: number } | undefined,
+  next: { served_bytes: number; declared_bytes: number } | undefined,
+): boolean {
+  if (current === undefined || next === undefined) {
+    return current === next;
+  }
+  return (
+    current.served_bytes === next.served_bytes && current.declared_bytes === next.declared_bytes
+  );
 }

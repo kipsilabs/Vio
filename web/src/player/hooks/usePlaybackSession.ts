@@ -8,7 +8,9 @@ import {
   CONNECTION_LOST_ERROR,
   describePlanTerminal,
   describePlaybackTransportError,
+  isAdaptationUnavailableReason,
   isDeadPlaybackSessionError,
+  PLAYBACK_SESSION_GONE_ERROR,
   type PlaybackPolicyErrorDescription,
 } from "../playback-errors";
 import {
@@ -34,8 +36,12 @@ import { playerV2Origin } from "../player-v2";
 import { buildPlayerStreamUrl } from "../stream-url";
 import { randomUUID } from "@/lib/uuid";
 import { matchSubtitleTrackAcrossVersions } from "../utils/subtitleSort";
-import { resolvePlanAudioIdentity } from "../utils/audioTrackMatch";
-import { buildPublishedSubtitleTracks } from "../utils/subtitleInventory";
+import {
+  resolveAppliedAudioIndex,
+  resolveAudioPickIdentity,
+  resolvePlanAudioIdentity,
+} from "../utils/audioTrackMatch";
+import { buildPublishedSubtitleTracks, subtitleLanguageBase } from "../utils/subtitleInventory";
 import { isBitmapCodec } from "../utils/subtitleCodecs";
 import { isInventoryProvisional } from "../utils/inventoryProvenance";
 import { isNeutralVirtualVersion } from "../utils/neutralVirtualVersion";
@@ -222,6 +228,12 @@ interface PlaybackSessionState {
   initialSubtitleErrorTitle: string | null;
   initialSubtitleError: string | null;
   /**
+   * A track pick that could not be reconciled to the current plan and was not
+   * silently discarded. `id` makes repeated identical messages observable to
+   * the toast layer; consumers dismiss it themselves.
+   */
+  trackSelectionNotice: { id: number; title: string; message: string } | null;
+  /**
    * Whether a stream that already played is connected to the server.
    * `reconnecting` while the player retries after a mid-stream drop, `lost`
    * once it gave up; `connectionError` then says why.
@@ -233,9 +245,12 @@ interface PlaybackSessionState {
 
 /**
  * `ended` means the server ended the session for good (an administrator
- * stopped it); the player exits rather than reconnecting.
+ * stopped it); the player exits rather than reconnecting. `gone` means a
+ * session-scoped answer proved the session no longer exists (a reaped or
+ * expired session); the player stops using it and offers a fresh start at the
+ * same position instead.
  */
-export type PlaybackConnectionStatus = "connected" | "reconnecting" | "lost" | "ended";
+export type PlaybackConnectionStatus = "connected" | "reconnecting" | "lost" | "ended" | "gone";
 
 // Mid-stream reconnect backoff: 1s, 2s, 4s, 8s, then every 15s, for about two
 // and a quarter minutes in total before the player gives up and asks the
@@ -409,6 +424,9 @@ function identityMatchesPlan(identity: SourceIdentity, plan: PlanV3): boolean {
     return true;
   }
   // A file-only push cannot be tied to a candidate when the plan names one.
+  // When the plan names none, the file is the only key: an unknown candidate
+  // means the same source. See the companion baseline rule in
+  // `deferredIdentityIsAdmissible`.
   return (
     plan.effective_virtual_uri == null &&
     identity.fileId != null &&
@@ -594,6 +612,8 @@ function deferredIdentityIsAdmissible(
     if (baseline.uri == null) continue;
     // An unknown file on either side is treated as the same file: neither can
     // prove a different source, so a differing concrete URI is a collision.
+    // Companion to the file-only branch in `identityMatchesPlan`: both read an
+    // absent key as the same source, never as proof of a different one.
     const sameFile =
       baseline.fileId == null || identity.fileId == null || baseline.fileId === identity.fileId;
     if (!sameFile) continue;
@@ -665,8 +685,17 @@ export interface UsePlaybackSessionResult extends PlaybackSessionState {
    * conversion. Sidecar tracks are fetched from the plan's inventory and drawn
    * by the client without involving the server. A stale ordinal the plan's
    * inventory does not carry is reconciled by identity/language or ignored.
+   *
+   * `displayedTrack` is the row the viewer clicked when the menu lists
+   * watch-detail fallback rows the session inventory does not carry yet (an
+   * empty inventory while the probe is deferred). Without it a click during an
+   * inventory refresh would be captured with no identity at all.
    */
-  changeSubtitleTrack: (combinedIndex: number | null, currentPosition: number) => void;
+  changeSubtitleTrack: (
+    combinedIndex: number | null,
+    currentPosition: number,
+    displayedTrack?: PlayerSubtitleInfo | null,
+  ) => void;
   /** `quality_change` replan for a label taken from `plan.available_qualities`. */
   changeQuality: (label: string, currentPosition: number) => void;
   /** `failure_recovery` replan after the client could not play the plan. */
@@ -696,6 +725,19 @@ export interface UsePlaybackSessionResult extends PlaybackSessionState {
    * reconnect cannot run (no played stream to reposition).
    */
   reportSessionLost: () => void;
+  /**
+   * Enters the session-gone state: a session-scoped call (a control-ticket
+   * mint, a stream/subtitle fetch, or a replan) proved the playback session no
+   * longer exists. The player stops using the dead session instead of
+   * retrying it, and offers `restartPlayback`.
+   */
+  markSessionGone: () => void;
+  /**
+   * Starts a fresh playback session at the current position after the old one
+   * was answered gone. This is a new start (the server re-plans from scratch),
+   * never a replan against the dead session.
+   */
+  restartPlayback: () => void;
   /**
    * `failure_recovery` replan for a plan the *server* invalidated over the
    * realtime `plan_invalidated` command. Resolves to whether a replacement plan
@@ -858,6 +900,7 @@ function mapSubtitleInventory(
     source: subtitleSourceOf(item.source),
     forced: item.forced,
     hearing_impaired: item.hearing_impaired,
+    default: item.default,
     sync_key: item.sync_key,
     url: item.url ? buildPlayerStreamUrl(config.apiBaseUrl, item.url, token) : "",
     font_bundle_url: item.font_bundle_url
@@ -938,13 +981,116 @@ function resolveAudioTrackChange(
 
   // The pick reconciled to nothing. A plan with stable identities has no
   // counterpart for it, so sending an ordinal would select an unrelated
-  // language: drop it.
+  // language: report it instead of dropping it silently.
   const hasStableIdentities = planTracks.some((track) => (track.track_id ?? "").trim() !== "");
   if (hasStableIdentities) return null;
 
   // A legacy synthesized inventory publishes no identities, so the ordinal is
   // the only selection channel. Keep it while it is a valid plan position.
-  return index < planTracks.length ? { id: "", index } : null;
+  const planIndex = identity.index ?? index;
+  return planIndex < planTracks.length ? { id: "", index: planIndex } : null;
+}
+
+/**
+ * Describes the plan inventory a queued pick was captured against. A subtitle
+ * `track_id` is generated from the file id and published ordinal, so an equal
+ * id only names the same asset while the inventory it was read from is still
+ * the current one.
+ */
+function subtitleInventoryIdentity(inventory: readonly SubtitleInventoryItemV3[]): string {
+  return JSON.stringify(
+    inventory.map((item) => [
+      item.combined_index,
+      item.track_id,
+      item.source,
+      item.codec ?? null,
+      item.language ?? null,
+      item.label ?? null,
+      item.forced,
+      item.hearing_impaired,
+      item.sync_key ?? null,
+    ]),
+  );
+}
+
+/**
+ * A descriptor that names the same subtitle asset after the inventory re-keys.
+ * Language, flags, codec, source, and label are the evidence the menus show the
+ * viewer; unlike the ordinal-derived `track_id` they survive a slot move.
+ */
+function subtitleDescriptorKey(track: {
+  language?: string | null;
+  codec?: string | null;
+  label?: string | null;
+  source?: string | null;
+  forced?: boolean | null;
+  hearing_impaired?: boolean | null;
+}): string {
+  const source = (track.source ?? "").trim().toLowerCase();
+  const knownSource =
+    source === "external" || source === "embedded" || source === "downloaded" ? source : "";
+  return [
+    subtitleLanguageBase(track.language),
+    track.forced ? "forced" : "full",
+    track.hearing_impaired ? "hi" : "plain",
+    (track.codec ?? "").trim().toLowerCase(),
+    knownSource,
+    // The player maps a missing label from the language, so compare the same
+    // fallback instead of an empty label against that synthesized one.
+    (track.label ?? track.language ?? "").trim().toLowerCase(),
+  ].join("|");
+}
+
+/** The captured sidecar row survives a re-key through its stable sync key. */
+function matchSubtitleByAsset(
+  inventory: readonly SubtitleInventoryItemV3[],
+  picked: PlayerSubtitleInfo,
+): SubtitleInventoryItemV3 | null {
+  const syncKey = (picked.sync_key ?? "").trim();
+  if (!syncKey) return null;
+  const matches = inventory.filter((item) => (item.sync_key ?? "").trim() === syncKey);
+  return matches.length === 1 ? (matches[0] ?? null) : null;
+}
+
+function matchSubtitleByDescriptor(
+  inventory: readonly SubtitleInventoryItemV3[],
+  picked: PlayerSubtitleInfo,
+): SubtitleInventoryItemV3 | null {
+  const key = subtitleDescriptorKey(picked);
+  const matches = inventory.filter((item) => subtitleDescriptorKey(item) === key);
+  return matches.length === 1 ? (matches[0] ?? null) : null;
+}
+
+/**
+ * Whether a plan row carrying the clicked row's `track_id` can stand in for it.
+ *
+ * The id embeds the plan's ordinal, so it only names the clicked asset while
+ * the plan publishes the order the menu was read from. Adoption can preserve
+ * verified rows under a provisional plan that publishes another order, which
+ * re-mints every id: the equal id then names a different language. Language,
+ * flags, codec, source, and label are the evidence the menus show, so a row
+ * that disagrees on any of them is a different asset. A label the player
+ * synthesized (from the language, or a slot default) must not veto an
+ * otherwise identical row.
+ */
+function subtitleIdNamesPickedAsset(
+  planRow: SubtitleInventoryItemV3,
+  picked: PlayerSubtitleInfo,
+): boolean {
+  if (subtitleLanguageBase(planRow.language) !== subtitleLanguageBase(picked.language))
+    return false;
+  if ((planRow.codec ?? "").trim().toLowerCase() !== (picked.codec ?? "").trim().toLowerCase()) {
+    return false;
+  }
+  if (Boolean(planRow.forced) !== Boolean(picked.forced)) return false;
+  if (Boolean(planRow.hearing_impaired) !== Boolean(picked.hearing_impaired)) return false;
+  const planSource = (planRow.source ?? "").trim().toLowerCase();
+  const pickedSource = (picked.source ?? "").trim().toLowerCase();
+  if (planSource && pickedSource && planSource !== pickedSource) return false;
+  const planLabel = (planRow.label ?? "").trim().toLowerCase();
+  const pickedLabel = (picked.label ?? "").trim().toLowerCase();
+  if (planLabel && pickedLabel && planLabel !== pickedLabel) return false;
+  return true;
 }
 
 /**
@@ -959,6 +1105,17 @@ function resolveAudioTrackChange(
  * *different* track at that same ordinal. Trusting the ordinal there would
  * switch to a language the viewer never asked for.
  *
+ * `trustPickedTrackId` is false for a queued pick whose captured inventory has
+ * since been replaced. The server derives subtitle ids from the file id and
+ * ordinal, so an equal id in the new inventory can name another language. The
+ * captured row is then matched by its stable sync key or an unambiguous
+ * descriptor instead; when neither names exactly one track the pick is
+ * dropped rather than replayed against the old slot. An immediate pick trusts
+ * its id only while the plan row that carries it still agrees with the clicked
+ * row's descriptor: adoption preserves verified rows under a plan that can
+ * publish another order, and the re-minted ids would otherwise name the track
+ * that inherited the slot.
+ *
  * A pick with a stable identity and no counterpart in the plan is dropped
  * rather than sent. The plan's exact ordinal is used only when there is no
  * stable picked identity to reconcile (the menu publishes no `track_id`s, or
@@ -966,23 +1123,58 @@ function resolveAudioTrackChange(
  *
  * A plan with no published inventory (deferred or legacy) keeps the ordinal:
  * there is no list to validate against, and the server remaps or degrades the
- * provisional pick.
+ * provisional pick. Confirmed server-side: `applySelectedTracksToStartV3`
+ * copies the bare positive ordinal onto the start request, then
+ * `ResolveSubtitlePolicyV3` resolves it against the effective file's own
+ * external, embedded, and downloaded inventory. On a live session, an ordinal
+ * that inventory does not carry (the deferred probe has not landed) degrades
+ * to subtitles-off, never track 0 and never a 400. Audio behaves the same way through
+ * `resolveV3AudioIndex`: a bare `{id: "", index}` is resolved against the
+ * effective file's tracks, and an out-of-range index degrades to its default
+ * track. See docs/playback-api.md#deferred-track-inventory.
  */
 function resolveSubtitleTrackChange(
   plan: PlanV3,
   displayed: readonly PlayerSubtitleInfo[],
   combinedIndex: number,
+  pickedTrack?: PlayerSubtitleInfo | null,
+  trustPickedTrackId = true,
 ): TrackIdentityV3 | null {
   if (!Number.isInteger(combinedIndex) || combinedIndex < 0) return null;
 
   const inventory = plan.subtitle.inventory;
   if (inventory.length === 0) return { id: "", index: combinedIndex };
 
-  const picked = displayed.find((item) => item.index === combinedIndex);
+  const picked =
+    pickedTrack !== undefined
+      ? pickedTrack
+      : displayed.find((item) => item.index === combinedIndex);
   if (picked) {
-    if (picked.track_id) {
+    // An equal `track_id` is only evidence while the plan publishes the same
+    // order the menu was read from. When the row it names has another
+    // language/flags, the click came from an inventory the plan reordered
+    // (adoption preserves verified rows under a provisional plan), so the id
+    // must not be replayed against the slot that inherited it.
+    let idNamesAnotherAsset = false;
+    if (trustPickedTrackId && picked.track_id) {
       const byId = inventory.find((item) => item.track_id === picked.track_id);
-      if (byId) return { id: byId.track_id, index: byId.combined_index };
+      if (byId) {
+        if (subtitleIdNamesPickedAsset(byId, picked)) {
+          return { id: byId.track_id, index: byId.combined_index };
+        }
+        idNamesAnotherAsset = true;
+      }
+    }
+    if (!trustPickedTrackId || idNamesAnotherAsset) {
+      const byAsset = matchSubtitleByAsset(inventory, picked);
+      if (byAsset) return { id: byAsset.track_id, index: byAsset.combined_index };
+      const byDescriptor = matchSubtitleByDescriptor(inventory, picked);
+      if (byDescriptor) {
+        return { id: byDescriptor.track_id, index: byDescriptor.combined_index };
+      }
+      // The inventory moved and the clicked row has no unambiguous
+      // counterpart. Its old slot now names whichever track moved into it.
+      return null;
     }
     const candidates = inventory.map((item) => ({ ...item, index: item.combined_index }));
     const byLanguage = matchSubtitleTrackAcrossVersions(candidates, picked);
@@ -995,8 +1187,64 @@ function resolveSubtitleTrackChange(
 
   // No stable picked identity to reconcile from: the ordinal is the only
   // channel the menu offers, so keep it while the plan publishes that slot.
+  // That reasoning only holds for the inventory the pick was captured against;
+  // once it was replaced, the same slot names whichever track moved into it.
+  if (!trustPickedTrackId) return null;
   const exact = inventory.find((item) => item.combined_index === combinedIndex);
   return exact ? { id: exact.track_id, index: exact.combined_index } : null;
+}
+
+/**
+ * A viewer's track pick captured when it was made, not when it can finally be
+ * sent. A seek reanchor or version switch can adopt a different plan before the
+ * replan lane is free, and the plan-bound identity resolved at click time is
+ * then stale. Carrying the row the viewer actually clicked lets the pick be
+ * re-resolved against the plan that won instead of being dropped.
+ */
+type PendingTrackPick =
+  | {
+      kind: "audio";
+      index: number;
+      positionSeconds: number;
+      track: PlayerAudioTrack | undefined;
+      refreshAttempted: boolean;
+    }
+  | {
+      kind: "subtitle";
+      index: number | null;
+      positionSeconds: number;
+      track: PlayerSubtitleInfo | undefined;
+      /** The inventory the picked row was read from, captured with the pick. */
+      inventoryIdentity: string;
+      refreshAttempted: boolean;
+    };
+
+function trackPickOptions(plan: PlanV3, pick: PendingTrackPick): ReplanOptions | null {
+  if (pick.kind === "audio") {
+    const audio = resolveAudioPickIdentity(plan.audio_tracks ?? [], pick.track, pick.index);
+    if (!audio) return null;
+    return {
+      operation: "track_change",
+      positionSeconds: pick.positionSeconds,
+      audio,
+    };
+  }
+  if (pick.index === null) {
+    return { operation: "track_change", positionSeconds: pick.positionSeconds, subtitle: null };
+  }
+  const subtitle = resolveSubtitleTrackChange(
+    plan,
+    [],
+    pick.index,
+    pick.track,
+    pick.inventoryIdentity === subtitleInventoryIdentity(plan.subtitle.inventory),
+  );
+  if (!subtitle) return null;
+  return {
+    operation: "track_change",
+    positionSeconds: pick.positionSeconds,
+    subtitle,
+  };
 }
 
 // Temporary client-side heuristic for A/V transport equivalence.
@@ -1049,6 +1297,7 @@ function planToSessionState(
   autoFallback: boolean,
   config: PlayerConfig,
 ): PlaybackSessionState {
+  const planAudioTracks = plan.audio_tracks ?? [];
   return {
     plan,
     planRevision,
@@ -1066,9 +1315,17 @@ function planToSessionState(
     inventoryPending: plan.tracks_pending === true,
     inventoryFailed: plan.inventory_status === "failed" || plan.inventory_provenance === "failed",
     initialPosition: plan.timeline.player_start_seconds,
-    audioTrackIndex: plan.selected_tracks.audio?.index ?? 0,
+    // The marker is the applied row, not the raw plan ordinal: the same
+    // resolver the inventory folds use (the plan is both sides here, so it
+    // short-circuits to the committed ordinal). A plan with no committed
+    // selection reports no marker instead of defaulting onto row 0.
+    audioTrackIndex: resolveAppliedAudioIndex(
+      planAudioTracks,
+      planAudioTracks,
+      plan.selected_tracks.audio,
+    ),
     durationSeconds: plan.source.duration_seconds ?? null,
-    planAudioTracks: plan.audio_tracks ?? [],
+    planAudioTracks,
     // tracks_pending is the explicit deferred signal and wins over the
     // stamp/provenance fallback: the server sets it exactly when the plan's
     // inventory is the provisional recipe and a follow-up is promised.
@@ -1102,6 +1359,11 @@ function planToSessionState(
     retrying: false,
     initialSubtitleErrorTitle: null,
     initialSubtitleError: null,
+    // A track notice describes a pick that could not be reconciled against the
+    // plan it was made for. Adopting a plan settles that pick (accepted, or
+    // surfaced once after the bounded refresh), so the notice is one adoption
+    // old at most and never outlives the request that produced it.
+    trackSelectionNotice: null,
     // A plan was just handed out, so the server is reachable.
     connectionStatus: "connected",
     connectionErrorTitle: null,
@@ -1119,6 +1381,21 @@ function planToSessionState(
 function describeDecisionWithoutPlan(decision: DecisionResponseV3): PlaybackSessionErrorState {
   if (decision.terminal) {
     return describePlanTerminal(decision.terminal);
+  }
+  // A server may publish the outcome without a terminal. An outcome that names
+  // no playable adaptation is still a player-facing refusal, and retrying it as
+  // a fresh start is meaningful (the provider may re-list or re-resolve the
+  // source), so it must not fall through to the generic server-busy copy.
+  if (isAdaptationUnavailableReason(decision.outcome)) {
+    return {
+      ...describePlanTerminal({
+        reason: decision.outcome,
+        message: "",
+        retryable: true,
+      }),
+      reason: decision.outcome,
+      retryable: true,
+    };
   }
   return {
     title: "Playback unavailable",
@@ -1250,6 +1527,7 @@ export function usePlaybackSession(
     retrying: false,
     initialSubtitleErrorTitle: null,
     initialSubtitleError: null,
+    trackSelectionNotice: null,
     connectionStatus: "connected",
     connectionErrorTitle: null,
     connectionError: null,
@@ -1266,6 +1544,10 @@ export function usePlaybackSession(
   // the state carrying it renders, so a caller acting on an older render
   // cannot start a reconnect against it.
   const sessionEndedRef = useRef(false);
+  // Set when a session-scoped answer proves the session no longer exists, for
+  // the same reason: a stale render must not replan or reconnect against it.
+  // Cleared by a fresh start (`restartPlayback` or a newly adopted plan).
+  const sessionGoneRef = useRef(false);
   // The live effective source identity, folded through the same commits and
   // rotations as `state` but readable synchronously inside callbacks. Deferring
   // a push still moves where the stream actually is; later decisions (a queued
@@ -1338,6 +1620,8 @@ export function usePlaybackSession(
   // without comparing plan identity (which a rotation can move).
   const inventoryRevisionRef = useRef<string | null>(null);
   const inventoryPendingRef = useRef(false);
+  const pollInventoryInflightRef = useRef<Promise<boolean> | null>(null);
+  const teardownAbortRef = useRef<AbortController>(new AbortController());
   // Identity-carrying pushes dropped while a start/switch/replan owns the
   // session. Applying them immediately would mutate the menus under the pending
   // replacement, but discarding them loses the only carrier of the incoming
@@ -1359,12 +1643,15 @@ export function usePlaybackSession(
   // this hook observes. The settle paths call the flusher directly; this is the
   // backstop for the fast pending/declared start.
   useEffect(() => {
+    const controller = new AbortController();
+    teardownAbortRef.current = controller;
     deferredFlushTimerRef.current = window.setInterval(() => {
       if (deferredPushesRef.current.length > 0) {
         flushDeferredPushesRef.current();
       }
     }, 2_000);
     return () => {
+      controller.abort();
       if (deferredFlushTimerRef.current !== null) {
         window.clearInterval(deferredFlushTimerRef.current);
         deferredFlushTimerRef.current = null;
@@ -1457,6 +1744,14 @@ export function usePlaybackSession(
     // replay a plan-bound op against another release's track ordinals.
     mediaFileId: number | null;
   } | null>(null);
+  // Track picks held while a switch or another replan owns the lane. The pick
+  // carries the row the viewer clicked, so it can be re-resolved against the
+  // plan that eventually wins. Latest pick per kind wins; an audio and a
+  // subtitle pick are independent intents and are replayed in click order.
+  const pendingTrackPicksRef = useRef<PendingTrackPick[]>([]);
+  // Late-bound flusher, like `flushDeferredPushesRef`: the pick dispatcher is
+  // defined after the replan callback it needs.
+  const flushPendingTrackPicksRef = useRef<() => void>(() => {});
   const issueReplanRef = useRef<
     (
       options: ReplanOptions,
@@ -1464,6 +1759,7 @@ export function usePlaybackSession(
       reconnect?: boolean,
     ) => Promise<boolean>
   >(async () => false);
+  const trackSelectionNoticeIdRef = useRef(0);
   // Latest-wins target for a reanchor dropped while a version switch owned the
   // session. The switch completion replays it against the settled plan so a
   // cold-start seek issued mid-switch is not silently lost — but only if the
@@ -1744,6 +2040,9 @@ export function usePlaybackSession(
       planAttemptIdRef.current = randomUUID();
       planRef.current = plan;
       sessionEndedRef.current = false;
+      // A plan for this session proves the server still holds it, so a gone
+      // verdict from an earlier replica miss no longer applies.
+      sessionGoneRef.current = false;
       sessionIdRef.current = sessionId ?? null;
       // The adopted plan is the new live source; a rotation deferred before it
       // landed is superseded by what the plan itself names.
@@ -1832,6 +2131,14 @@ export function usePlaybackSession(
           next.inventoryFailed = false;
           next.planAudioTracks = current.planAudioTracks;
           next.subtitleUrls = current.subtitleUrls;
+          // The preserved list is the applied menu, not the replan's own
+          // (possibly reordered) ordinals: keep the marker on the row that
+          // names the committed track instead of the plan position.
+          next.audioTrackIndex = resolveAppliedAudioIndex(
+            plan.audio_tracks ?? [],
+            current.planAudioTracks,
+            plan.selected_tracks.audio,
+          );
           if (current.inventoryRevision != null) {
             next.inventoryRevision = current.inventoryRevision;
           }
@@ -1949,6 +2256,10 @@ export function usePlaybackSession(
       deferredPushesRef.current = [];
       transitionSourceIdentity(null, null);
       pendingSeekRef.current = null;
+      // A held pick belongs to the session being retired. Replaying it against
+      // whatever plan replaces this one would dispatch a track change the
+      // viewer never made for that session.
+      pendingTrackPicksRef.current = [];
       lastVerifiedIdentityRef.current = null;
       inventoryPendingRef.current = false;
       setState((current) => {
@@ -1981,6 +2292,30 @@ export function usePlaybackSession(
     },
     [stopSession, transitionSourceIdentity],
   );
+
+  /**
+   * Enters the session-gone state after a session-scoped answer proved the
+   * playback session no longer exists (a control-ticket mint, a stream or
+   * subtitle fetch, or a replan). No reconnect and no replan can repair a
+   * session the server does not hold, so the player stops using it and offers
+   * `restartPlayback` instead.
+   */
+  const markSessionGone = useCallback(() => {
+    if (sessionGoneRef.current) return;
+    sessionGoneRef.current = true;
+    endReconnect(false);
+    setState((current) => ({
+      ...current,
+      loading: false,
+      replacing: false,
+      replanning: false,
+      replanningQuality: false,
+      pendingSwitchFileId: null,
+      connectionStatus: "gone",
+      connectionErrorTitle: PLAYBACK_SESSION_GONE_ERROR.title,
+      connectionError: PLAYBACK_SESSION_GONE_ERROR.message,
+    }));
+  }, [endReconnect]);
 
   /**
    * Picks which file to *request*. The server owns adaptation — this only
@@ -2444,6 +2779,14 @@ export function usePlaybackSession(
     transitionSourceIdentity(null, null);
     // A remembered mid-switch seek belongs to the request this effect resets.
     pendingSeekRef.current = null;
+    // So does a track pick held for that request: replaying it against this
+    // request's plan would switch a track the viewer did not pick here.
+    pendingTrackPicksRef.current = [];
+    // The notice belongs to the previous request's plan. Leaving it set makes
+    // the next mount of this hook replay a stale track toast.
+    setState((current) =>
+      current.trackSelectionNotice === null ? current : { ...current, trackSelectionNotice: null },
+    );
     lastVerifiedIdentityRef.current = null;
     // A new request re-derives Auto intent from its own props: without this,
     // the previous request's armed/disarmed state leaks into the new session.
@@ -2490,6 +2833,8 @@ export function usePlaybackSession(
       // instead of adopting it into an abandoned player.
       loadSequenceRef.current += 1;
       pendingSeekRef.current = null;
+      // A held pick dies with the player: nothing will fold its plan.
+      pendingTrackPicksRef.current = [];
       // A viewer who leaves while the player reconnects stops the retries.
       endReconnect(false);
       const sid = sessionIdRef.current;
@@ -2527,6 +2872,9 @@ export function usePlaybackSession(
       const sessionId = sessionIdRef.current;
       const playbackAttemptId = playbackAttemptIdRef.current;
       if (!plan || !sessionId || !playbackAttemptId) return false;
+      // A session answered gone cannot be replanned; every retry earns the same
+      // answer. The restart action starts a new session instead.
+      if (sessionGoneRef.current) return false;
       // A switch is replacing the whole session and about to retire the plan
       // below. A replan built from that outgoing plan would be stamped with the
       // switch's sequence once the switch lands, so it could clobber the
@@ -2691,6 +3039,19 @@ export function usePlaybackSession(
         );
         if (
           !adopted &&
+          isFailureRecovery &&
+          isAdaptationUnavailableReason(decision.terminal?.reason ?? decision.outcome)
+        ) {
+          // The transport already failed and the server can build no route for
+          // it. There is nothing left to render, so retire the broken plan:
+          // keeping it would leave the player spinning over a stream the server
+          // refuses to serve. The refusal itself is the error card's copy, and
+          // its Retry re-issues a fresh start.
+          retireActiveSession(sessionId);
+          return false;
+        }
+        if (
+          !adopted &&
           options.operation === "seek_reanchor" &&
           decision.terminal?.reason?.trim() === SEEK_REANCHOR_EVIDENCE_UNAVAILABLE_REASON
         ) {
@@ -2834,8 +3195,10 @@ export function usePlaybackSession(
         if (deadSession) {
           // Already rebuilt once for this session. Retire the plan it left
           // behind and fall through to surface the copy rather than starting
-          // again in a loop.
+          // again in a loop. The session is gone, so the player offers a fresh
+          // start instead of retrying the dead id.
           retireActiveSession(sessionId);
+          markSessionGone();
         }
         if (retireSessionOnRefusal && !deadSession) {
           console.error("Failed to refresh playback output", err);
@@ -2913,6 +3276,10 @@ export function usePlaybackSession(
         // queued replan was just dispatched this is a no-op (the guard sees it
         // in flight) and that link's own settle path flushes instead.
         flushDeferredPushesRef.current();
+        // A held track pick waited for this plan. Resolve it now; if this was
+        // the one no-op refresh it was allowed, a still-unmatched pick is
+        // surfaced instead of lingering.
+        flushPendingTrackPicksRef.current();
       }
     },
     [
@@ -2924,11 +3291,97 @@ export function usePlaybackSession(
       endAdoption,
       explicitFileSelection,
       loadSession,
+      markSessionGone,
       maxBitrateKbps,
       retireActiveSession,
     ],
   );
   issueReplanRef.current = replan;
+
+  const surfaceTrackPickFailure = useCallback((pick: PendingTrackPick) => {
+    const kind = pick.kind === "audio" ? "audio" : "subtitle";
+    trackSelectionNoticeIdRef.current += 1;
+    setState((current) => ({
+      ...current,
+      trackSelectionNotice: {
+        id: trackSelectionNoticeIdRef.current,
+        title: "Couldn't change track",
+        message: `That ${kind} track isn't available in the current playback plan. Pick another track.`,
+      },
+    }));
+  }, []);
+
+  const holdTrackPick = useCallback((pick: PendingTrackPick) => {
+    // One pick per kind: a second audio click supersedes the first, while an
+    // audio and a subtitle pick are separate intents.
+    pendingTrackPicksRef.current = [
+      ...pendingTrackPicksRef.current.filter((pending) => pending.kind !== pick.kind),
+      pick,
+    ];
+  }, []);
+
+  /**
+   * Re-issues held track picks against the plan that is current now.
+   *
+   * A pick captured before a seek reanchor or a version switch cannot keep the
+   * plan-bound identity resolved at click time: the replacement plan re-mints
+   * ordinals. The row descriptor the viewer clicked is matched against the new
+   * inventory instead. A pick that still cannot be reconciled gets one no-op
+   * plan refresh (a source rotation can leave the menu ahead of the plan), and
+   * then surfaces instead of disappearing.
+   */
+  const flushPendingTrackPicks = useCallback(() => {
+    if (switchingRef.current || replanInFlightRef.current) return;
+    const plan = planRef.current;
+    if (!plan) return;
+    const pick = pendingTrackPicksRef.current[0];
+    if (!pick) return;
+
+    const livePick = { ...pick, positionSeconds: playbackPositionRef.current } as PendingTrackPick;
+    const options = trackPickOptions(plan, livePick);
+    if (options) {
+      pendingTrackPicksRef.current = pendingTrackPicksRef.current.slice(1);
+      void issueReplanRef.current(options);
+      return;
+    }
+    const menuIdentity = menuIdentityRef.current;
+    const sourceMoved =
+      menuIdentity.fileId !== plan.effective_media_file_id ||
+      (menuIdentity.uri != null && menuIdentity.uri !== (plan.effective_virtual_uri ?? null));
+    // A provisional inventory is the same race on a stationary source: the
+    // probe has published menu rows the plan still describes as declared
+    // metadata, and the enumeration it owes is what this pick needs. One
+    // no-op replan re-reads it before the pick surfaces.
+    const provisionalInventory =
+      plan.tracks_pending === true ||
+      isInventoryProvisional(plan.inventory_status, plan.inventory_provenance) ||
+      stateRef.current.audioInventoryProvisional ||
+      stateRef.current.subtitleInventoryProvisional;
+    if (!pick.refreshAttempted && (sourceMoved || provisionalInventory)) {
+      // The menu followed a rotated source (or a probe the plan has not
+      // refreshed yet). One no-op replan re-reads it; a pick that still has no
+      // counterpart then surfaces below instead of looping or vanishing.
+      pendingTrackPicksRef.current = [
+        { ...pick, refreshAttempted: true },
+        ...pendingTrackPicksRef.current.slice(1),
+      ];
+      void issueReplanRef.current({
+        operation: "track_change",
+        positionSeconds: playbackPositionRef.current,
+      });
+      return;
+    }
+    pendingTrackPicksRef.current = pendingTrackPicksRef.current.slice(1);
+    surfaceTrackPickFailure(pick);
+  }, [surfaceTrackPickFailure]);
+  flushPendingTrackPicksRef.current = flushPendingTrackPicks;
+
+  // A replacement plan is the point at which a held pick can be resolved
+  // against the inventory that won. Run after React commits the new plan so
+  // the refs and rendered menu agree.
+  useEffect(() => {
+    flushPendingTrackPicksRef.current();
+  }, [state.planRevision, state.replanning, state.replacing]);
 
   useEffect(() => {
     if (!capabilitiesSettled) return;
@@ -3037,15 +3490,34 @@ export function usePlaybackSession(
       // replaced, whose ordering a probe repair can change. Carry the plan's
       // canonical identity for the picked track — matched by signature, then
       // by language family when the menu no longer shows the plan's own list —
-      // so a raw position cannot name a different language. A pick with no
-      // counterpart in the plan is dropped instead of sent as an ordinal the
-      // server cannot resolve.
+      // so a raw position cannot name a different language.
+      const pick: PendingTrackPick = {
+        kind: "audio",
+        index,
+        positionSeconds: currentPosition,
+        track: stateRef.current.planAudioTracks[index],
+        refreshAttempted: false,
+      };
+      if (switchingRef.current || replanInFlightRef.current) {
+        // A seek reanchor or version switch owns the lane. The plan will be
+        // replaced before this pick can be sent, so hold the row the viewer
+        // clicked and re-resolve it against the plan that wins.
+        holdTrackPick(pick);
+        return;
+      }
       const audio = resolveAudioTrackChange(
         plan.audio_tracks ?? [],
         stateRef.current.planAudioTracks,
         index,
       );
-      if (!audio) return;
+      if (!audio) {
+        // The menu is ahead of the plan (or the plan is ahead of the menu).
+        // Refresh the plan once and retry; if the row still has no counterpart,
+        // surface it instead of dropping the pick.
+        holdTrackPick(pick);
+        flushPendingTrackPicksRef.current();
+        return;
+      }
       const current = plan.selected_tracks.audio;
       // Compare the resolved identity, not the menu position: after a probe
       // repair the already-playing track can sit at a different displayed
@@ -3059,13 +3531,26 @@ export function usePlaybackSession(
         audio,
       });
     },
-    [loadOfferedRelease, replan],
+    [holdTrackPick, loadOfferedRelease, replan],
   );
 
   const changeSubtitleTrack = useCallback(
-    (combinedIndex: number | null, currentPosition: number) => {
+    (
+      combinedIndex: number | null,
+      currentPosition: number,
+      displayedTrack?: PlayerSubtitleInfo | null,
+    ) => {
       const plan = planRef.current;
       if (!plan) return;
+      // The menu can list watch-detail fallback rows before the session
+      // publishes its own inventory. Capture the row the viewer clicked from
+      // the menu when the session list cannot name that slot, so a pick made
+      // during a refresh still carries an identity to reconcile later.
+      const clickedTrack =
+        combinedIndex == null
+          ? undefined
+          : (stateRef.current.subtitleUrls.find((item) => item.index === combinedIndex) ??
+            (displayedTrack?.index === combinedIndex ? displayedTrack : undefined));
       // A pick against a still-deferred inventory names a provisional slot:
       // replan validation runs against the plan's declared list, and the
       // server remaps or degrades there. The follow-up verified inventory
@@ -3075,10 +3560,7 @@ export function usePlaybackSession(
         // picked subtitle identity. Null is an explicit subtitles-off request;
         // passing a `tracks` object with no subtitle index keeps it off instead
         // of falling back to the new plan's initial subtitle.
-        const track =
-          combinedIndex == null
-            ? undefined
-            : stateRef.current.subtitleUrls.find((item) => item.index === combinedIndex);
+        const track = clickedTrack;
         loadOfferedRelease(currentPosition, {
           audioIndex: plan.selected_tracks.audio?.index,
           carriedAudioTrackId: plan.selected_tracks.audio?.id,
@@ -3090,20 +3572,40 @@ export function usePlaybackSession(
       }
       // Null is an explicit subtitles-off request. A concrete ordinal is
       // resolved against the plan first, then reconciled from the menu's stale
-      // slot by identity/language; a slot the plan does not carry is dropped
-      // instead of sending an invalid `track_change`.
+      // slot by identity/language.
+      const pick: PendingTrackPick = {
+        kind: "subtitle",
+        index: combinedIndex,
+        positionSeconds: currentPosition,
+        track: clickedTrack,
+        inventoryIdentity: subtitleInventoryIdentity(plan.subtitle.inventory),
+        refreshAttempted: false,
+      };
+      if (switchingRef.current || replanInFlightRef.current) {
+        holdTrackPick(pick);
+        return;
+      }
       const subtitle =
         combinedIndex == null
           ? null
-          : resolveSubtitleTrackChange(plan, stateRef.current.subtitleUrls, combinedIndex);
-      if (combinedIndex != null && subtitle == null) return;
+          : resolveSubtitleTrackChange(
+              plan,
+              stateRef.current.subtitleUrls,
+              combinedIndex,
+              pick.track,
+            );
+      if (combinedIndex != null && subtitle == null) {
+        holdTrackPick(pick);
+        flushPendingTrackPicksRef.current();
+        return;
+      }
       void replan({
         operation: "track_change",
         positionSeconds: currentPosition,
         subtitle,
       });
     },
-    [loadOfferedRelease, replan],
+    [holdTrackPick, loadOfferedRelease, replan],
   );
 
   const changeQuality = useCallback(
@@ -3291,9 +3793,10 @@ export function usePlaybackSession(
 
   const recoverConnection = useCallback(
     (positionSeconds: number, resume: boolean) => {
-      // Only a stream that exists can lose its connection, and a session an
-      // administrator ended stays ended.
+      // Only a stream that exists can lose its connection, and a session the
+      // server ended or answered gone stays that way.
       if (!planRef.current || !sessionIdRef.current || sessionEndedRef.current) return;
+      if (sessionGoneRef.current) return;
       beginReconnect(positionSeconds, resume, false);
     },
     [beginReconnect],
@@ -3341,6 +3844,56 @@ export function usePlaybackSession(
     reconnect.resume = planAutoPlayRef.current;
     giveUpReconnect(CONNECTION_LOST_ERROR);
   }, [giveUpReconnect]);
+
+  /**
+   * Starts a fresh session at the position the viewer reached after the old
+   * session was answered gone. A new start re-plans server-side from scratch;
+   * a replan against the dead session could only answer the same way again.
+   */
+  const restartPlayback = useCallback(() => {
+    const plan = planRef.current;
+    const played = hasAdoptedPlanRef.current || plan !== null;
+    const position = played ? playbackPositionRef.current : startIntentRef.current.position;
+    const forceStartPosition = played ? true : startIntentRef.current.forceStartPosition;
+    const deadSessionId = sessionIdRef.current;
+    sessionGoneRef.current = false;
+    sessionEndedRef.current = false;
+    endReconnect(false);
+    if (deadSessionId) {
+      // The stop is best effort: a reaped session answers 404, which is exactly
+      // the verdict that brought the viewer here.
+      retireActiveSession(deadSessionId);
+    }
+    setState((current) => ({
+      ...current,
+      loading: true,
+      errorTitle: null,
+      error: null,
+      errorReason: null,
+      errorRetryable: false,
+      connectionStatus: "connected",
+      connectionErrorTitle: null,
+      connectionError: null,
+    }));
+    void loadSession({
+      preferredFileId: plan?.requested_media_file_id ?? stateRef.current.mediaFileId ?? undefined,
+      position,
+      forceStartPosition,
+      allowPreserveExistingSessionOnError: false,
+      replacementErrorMessage: "Failed to restart playback",
+      initialErrorMessage: "Failed to restart playback",
+      carriedAudioTrackId: plan?.selected_tracks.audio?.id ?? null,
+      carriedSubtitleTrackIndex: plan?.selected_tracks.subtitle?.index ?? null,
+      offeredVirtualURI:
+        retryTargetRef.current?.offeredVirtualURI ?? offeredVirtualUriRef.current ?? undefined,
+      // Preserve the viewer's version choice: a restart is not a licence for
+      // the server to substitute another edition behind the dead session.
+      fileSelection: autoFallbackRef.current
+        ? "auto"
+        : (retryTargetRef.current?.fileSelection ?? (explicitFileSelection ? "explicit" : "auto")),
+      intentAt: null,
+    });
+  }, [endReconnect, explicitFileSelection, loadSession, retireActiveSession]);
 
   // Coming back online is the best moment to try again.
   const reconnecting = state.connectionStatus === "reconnecting";
@@ -3528,12 +4081,19 @@ export function usePlaybackSession(
         recordPollApplied({ fileId: nextFileId, uri: nextUri });
       }
       setState((current) => {
+        const plan = planRef.current;
+        const planSelection = plan?.selected_tracks.audio ?? null;
+        const planTracks = plan?.audio_tracks ?? [];
         if (identityChanged) {
           return {
             ...current,
             mediaFileId: nextFileId,
             effectiveVirtualUri: nextUri,
             planAudioTracks: tracks.map((track) => ({ ...track })),
+            // The applied rows are the menu (and the audio menu's marker), not
+            // the plan's ordinals. Map the committed selection onto them by
+            // identity so a re-ordered probe list cannot light another language.
+            audioTrackIndex: resolveAppliedAudioIndex(planTracks, tracks, planSelection),
             // An empty list on a moved identity carries no probe evidence, so
             // the menu stays marked rather than claiming a verified empty
             // inventory.
@@ -3559,6 +4119,7 @@ export function usePlaybackSession(
         return {
           ...current,
           planAudioTracks: tracks.map((track) => ({ ...track })),
+          audioTrackIndex: resolveAppliedAudioIndex(planTracks, tracks, planSelection),
           // Catalog tracks are probe-persisted, so a non-empty fold is the
           // probed evidence the provisional marker was waiting for. It only
           // ends a discovery-failure marker for the audio side: subtitles have
@@ -3637,6 +4198,7 @@ export function usePlaybackSession(
         const replaceInventory =
           identityChanged || richer || (verified && current.audioInventoryProvisional);
         if (!identityChanged && !replaceInventory) return current;
+        const plan = planRef.current;
         return {
           ...current,
           mediaFileId: nextFileId,
@@ -3647,6 +4209,13 @@ export function usePlaybackSession(
           planAudioTracks: replaceInventory
             ? audioTracks.map((track) => ({ ...track }))
             : current.planAudioTracks,
+          audioTrackIndex: replaceInventory
+            ? resolveAppliedAudioIndex(
+                plan?.audio_tracks ?? [],
+                audioTracks,
+                plan?.selected_tracks.audio ?? null,
+              )
+            : current.audioTrackIndex,
           audioInventoryProvisional: provisional,
         };
       });
@@ -4376,6 +4945,10 @@ export function usePlaybackSession(
             // fresh attempt all discard it via the resets above.
             void reanchorSeekRef.current(rememberedSeek.positionSeconds);
           }
+          // A track picked while the switch owned the lane is replayed against
+          // the plan that won. A chained switch has set the guard again and
+          // will flush once it settles.
+          if (!switchingRef.current) flushPendingTrackPicksRef.current();
         }
       })();
     },
@@ -4455,61 +5028,94 @@ export function usePlaybackSession(
    * replaced session is dropped.
    */
   const pollInventory = useCallback(async (): Promise<boolean> => {
-    const plan = planRef.current;
-    const sessionId = sessionIdRef.current;
-    const url = plan?.inventory_url ?? stateRef.current.inventoryUrl;
-    if (!plan || !sessionId || !url) return false;
-    const revision =
-      inventoryRevisionRef.current ?? plan.inventory_revision ?? stateRef.current.inventoryRevision;
-    const headers: Record<string, string> = { Accept: "application/json" };
-    if (revision) headers["If-None-Match"] = revision;
-    let response: Response;
-    try {
-      response = await playerFetchResponse(config, `${playerV2Origin(config)}${url}`, {
-        headers: { ...headers, Accept: "application/json" },
-        signal: AbortSignal.timeout(10_000),
-      });
-    } catch {
-      return false;
+    if (pollInventoryInflightRef.current) {
+      return pollInventoryInflightRef.current;
     }
-    if (response.status === 304) return false;
-    if (!response.ok) return false;
-    let body: unknown;
+    const run = (async () => {
+      const plan = planRef.current;
+      const sessionId = sessionIdRef.current;
+      const url = plan?.inventory_url ?? stateRef.current.inventoryUrl;
+      if (!plan || !sessionId || !url) return false;
+      const revision =
+        inventoryRevisionRef.current ??
+        plan.inventory_revision ??
+        stateRef.current.inventoryRevision;
+      const headers: Record<string, string> = { Accept: "application/json" };
+      if (revision) headers["If-None-Match"] = revision;
+      const teardownSignal = teardownAbortRef.current.signal;
+      if (teardownSignal.aborted) return false;
+      let response: Response;
+      const timeoutSignal = AbortSignal.timeout(10_000);
+      let signal: AbortSignal;
+      let cleanupAbortListener: (() => void) | undefined;
+      if (typeof AbortSignal.any === "function") {
+        signal = AbortSignal.any([teardownSignal, timeoutSignal]);
+      } else {
+        const fallbackCtrl = new AbortController();
+        const onTeardown = () => fallbackCtrl.abort();
+        const onTimeout = () => fallbackCtrl.abort();
+        teardownSignal.addEventListener("abort", onTeardown);
+        timeoutSignal.addEventListener("abort", onTimeout);
+        cleanupAbortListener = () => {
+          teardownSignal.removeEventListener("abort", onTeardown);
+          timeoutSignal.removeEventListener("abort", onTimeout);
+        };
+        signal = fallbackCtrl.signal;
+      }
+      let body: unknown;
+      try {
+        response = await playerFetchResponse(config, `${playerV2Origin(config)}${url}`, {
+          headers: { ...headers, Accept: "application/json" },
+          signal,
+        });
+        if (response.status === 304 || !response.ok) return false;
+        body = await response.json();
+      } catch {
+        return false;
+      } finally {
+        cleanupAbortListener?.();
+      }
+      if (sessionIdRef.current !== sessionId || planRef.current !== plan) return false;
+      if (typeof body !== "object" || body === null) return false;
+      const record: Record<string, unknown> = body as Record<string, unknown>;
+      const payload = {
+        session_id: sessionId,
+        inventory_revision:
+          typeof record.inventory_revision === "string" ? record.inventory_revision : undefined,
+        inventory_status:
+          typeof record.inventory_status === "string" ? record.inventory_status : undefined,
+        audio_tracks: Array.isArray(record.audio_tracks) ? record.audio_tracks : undefined,
+        subtitle_inventory: Array.isArray(record.subtitle_inventory)
+          ? record.subtitle_inventory
+          : undefined,
+        effective_media_file_id:
+          typeof record.effective_media_file_id === "number"
+            ? record.effective_media_file_id
+            : undefined,
+        effective_virtual_uri:
+          typeof record.effective_virtual_uri === "string"
+            ? record.effective_virtual_uri
+            : undefined,
+        virtual_source_revision:
+          typeof record.virtual_source_revision === "string"
+            ? record.virtual_source_revision
+            : undefined,
+      } satisfies PlaybackInventoryUpdatedPayload;
+      const accepted = applyInventoryUpdate(payload);
+      return (
+        accepted &&
+        !inventoryPendingRef.current &&
+        (payload.inventory_status === "verified" || payload.inventory_status === "failed")
+      );
+    })();
+    pollInventoryInflightRef.current = run;
     try {
-      body = await response.json();
-    } catch {
-      return false;
+      return await run;
+    } finally {
+      if (pollInventoryInflightRef.current === run) {
+        pollInventoryInflightRef.current = null;
+      }
     }
-    if (sessionIdRef.current !== sessionId || planRef.current !== plan) return false;
-    if (typeof body !== "object" || body === null) return false;
-    const record: Record<string, unknown> = body as Record<string, unknown>;
-    const payload = {
-      session_id: sessionId,
-      inventory_revision:
-        typeof record.inventory_revision === "string" ? record.inventory_revision : undefined,
-      inventory_status:
-        typeof record.inventory_status === "string" ? record.inventory_status : undefined,
-      audio_tracks: Array.isArray(record.audio_tracks) ? record.audio_tracks : undefined,
-      subtitle_inventory: Array.isArray(record.subtitle_inventory)
-        ? record.subtitle_inventory
-        : undefined,
-      effective_media_file_id:
-        typeof record.effective_media_file_id === "number"
-          ? record.effective_media_file_id
-          : undefined,
-      effective_virtual_uri:
-        typeof record.effective_virtual_uri === "string" ? record.effective_virtual_uri : undefined,
-      virtual_source_revision:
-        typeof record.virtual_source_revision === "string"
-          ? record.virtual_source_revision
-          : undefined,
-    } satisfies PlaybackInventoryUpdatedPayload;
-    const accepted = applyInventoryUpdate(payload);
-    return (
-      accepted &&
-      !inventoryPendingRef.current &&
-      (payload.inventory_status === "verified" || payload.inventory_status === "failed")
-    );
   }, [applyInventoryUpdate, config]);
 
   const markInventoryExhausted = useCallback(
@@ -4587,6 +5193,8 @@ export function usePlaybackSession(
     retryConnection,
     expediteReconnect,
     reportSessionLost,
+    markSessionGone,
+    restartPlayback,
     invalidatePlan,
     reanchorSeek,
     refreshSubtitles,

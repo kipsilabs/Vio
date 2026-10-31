@@ -139,6 +139,21 @@ The refresh is list-only: it never opens a candidate's media URL, so no
 candidate is probed, played, or downloaded by the refresh itself. Verified
 track inventory arrives when the viewer explicitly plays one candidate.
 
+### Detail reads warm the versions they surface
+
+Thin clients open the item page through `GET /api/v2/catalog/items/{id}` and
+pick a version client-side; they never call a select or versions-check
+endpoint. The detail read therefore warms at most two virtual versions it
+surfaces: an unprobed row is scheduled for the pre-play inventory probe, and
+every selected virtual row is scheduled for the provider fetch warm-up. Work
+is coalesced per content id and file id for 30 seconds and the handler refuses
+a duplicate live chain, so a page refresh or inventory poll does not start a
+second probe or fetch. Warming never writes catalog state: it does not stamp
+`probe_updated_at` by itself and never marks a row `failed_at`. The detail
+response carries the row's durable `failed`/`available` state, its `probed_at`
+stamp, and any process-local `source_mismatch` verdict so the client can choose
+from the read alone.
+
 ### Cold-start attribution (list_reason + cache_miss_cause)
 
 Every `resolveVirtualPlaybackSource` emits a `virtual resolve timing` line

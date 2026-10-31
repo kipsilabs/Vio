@@ -8,7 +8,12 @@ import { fixturePlanV3 } from "../protocol-v3.fixtures";
 import { derivePersistedSubtitleMode } from "../utils/subtitleMode";
 import type { UsePlaybackSessionResult } from "../hooks/usePlaybackSession";
 import type { PlaybackSourceCommittedPayload } from "../realtime-protocol";
-import type { PlayerAudioTrack, PlayerFileVersion, WatchPageProps } from "../types";
+import type {
+  PlayerAudioTrack,
+  PlayerFileVersion,
+  PlayerSubtitleInfo,
+  WatchPageProps,
+} from "../types";
 import {
   INVENTORY_REFRESH_DEADLINE_MS,
   INVENTORY_REFRESH_INTERVAL_MS,
@@ -141,6 +146,7 @@ function playbackSession(
     retrying: false,
     initialSubtitleErrorTitle: null,
     initialSubtitleError: null,
+    trackSelectionNotice: null,
     connectionStatus: "connected",
     connectionErrorTitle: null,
     connectionError: null,
@@ -157,6 +163,8 @@ function playbackSession(
     retryConnection: vi.fn(),
     expediteReconnect: vi.fn(),
     reportSessionLost: vi.fn(),
+    markSessionGone: vi.fn(),
+    restartPlayback: vi.fn(),
     invalidatePlan: vi.fn().mockResolvedValue(true),
     reanchorSeek: vi.fn().mockResolvedValue(true),
     refreshSubtitles: vi.fn(),
@@ -382,6 +390,81 @@ describe("WatchPage playback errors", () => {
     expect(screen.getByRole("button", { name: "Go Back" })).toBeInTheDocument();
   });
 
+  it("offers Try again for a retryable transcode start failure such as a failed seek anchor", () => {
+    const retryStart = vi.fn();
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        plan: null,
+        streamUrl: null,
+        sessionId: null,
+        mediaFileId: null,
+        errorTitle: "Playback unavailable",
+        error: "Failed to resolve remux seek position.",
+        errorReason: "transcode_start_failed",
+        errorRetryable: true,
+        retryStart,
+      }),
+    );
+
+    render(createElement(WatchPage, watchPageProps));
+
+    expect(screen.getByText("Failed to resolve remux seek position.")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    expect(retryStart).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("button", { name: "Go Back" })).toBeInTheDocument();
+  });
+
+  it("offers Try again for an adaptation refusal the server marked non-retryable", () => {
+    const retryStart = vi.fn();
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        plan: null,
+        streamUrl: null,
+        sessionId: null,
+        mediaFileId: null,
+        errorTitle: "No playable version found",
+        error: "Vio couldn't find a way to play this file on this device.",
+        errorReason: "adaptation_unavailable",
+        errorRetryable: false,
+        retryStart,
+      }),
+    );
+
+    render(createElement(WatchPage, watchPageProps));
+
+    expect(screen.getByText("No playable version found")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    expect(retryStart).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("button", { name: "Go Back" })).toBeInTheDocument();
+  });
+
+  it("offers Restart playback for a session the server answered gone", () => {
+    const restartPlayback = vi.fn();
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        plan: null,
+        streamUrl: null,
+        sessionId: null,
+        mediaFileId: null,
+        errorTitle: null,
+        error: null,
+        connectionStatus: "gone",
+        connectionErrorTitle: "Playback session expired",
+        connectionError:
+          "This playback session is no longer active. Start it again to keep watching.",
+        restartPlayback,
+      }),
+    );
+
+    render(createElement(WatchPage, watchPageProps));
+
+    expect(screen.getByText("Playback session expired")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Try again" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Restart playback" }));
+    expect(restartPlayback).toHaveBeenCalledTimes(1);
+  });
+
   it("keeps a non-retryable terminal a Go Back-only dead-end", () => {
     playbackSessionMock.mockReturnValue(
       playbackSession({
@@ -452,6 +535,70 @@ describe("WatchPage playback state", () => {
 
     expect(updatePlaybackState).toHaveBeenCalledWith(321, true);
     expect(onPlaybackStateChange).toHaveBeenCalledWith(state);
+  });
+});
+
+describe("WatchPage exit selection", () => {
+  it("carries the requested file beside the effective one on end", async () => {
+    const onEnded = vi.fn();
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        plan: fixturePlanV3({ requested_media_file_id: 7, effective_media_file_id: 8 }),
+        mediaFileId: 8,
+      }),
+    );
+    render(
+      createElement(WatchPage, {
+        ...watchPageProps,
+        fileId: 7,
+        onEnded,
+      }),
+    );
+    await waitFor(() => expect(videoPlayerMock).toHaveBeenCalled());
+    const props = videoPlayerMock.mock.calls.at(-1)?.[0] as { onEnded?: () => void };
+    act(() => props.onEnded?.());
+
+    expect(onEnded).toHaveBeenCalledWith(
+      expect.objectContaining({
+        lastFileId: 8,
+        selectedFileId: 7,
+      }),
+    );
+  });
+
+  it("reports a committed requested version change to the host", async () => {
+    const onRequestedVersionChange = vi.fn();
+    playbackSessionMock.mockReturnValue(
+      playbackSession({ plan: fixturePlanV3({ requested_media_file_id: 7 }) }),
+    );
+    const { rerender } = render(
+      createElement(WatchPage, {
+        ...watchPageProps,
+        onRequestedVersionChange,
+      }),
+    );
+    await waitFor(() => expect(videoPlayerMock).toHaveBeenCalled());
+    // Mounting on the current row is not a switch.
+    expect(onRequestedVersionChange).not.toHaveBeenCalled();
+
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        plan: fixturePlanV3({
+          plan_id: "plan:version-switch",
+          requested_media_file_id: 8,
+          effective_media_file_id: 8,
+        }),
+        mediaFileId: 8,
+      }),
+    );
+    rerender(
+      createElement(WatchPage, {
+        ...watchPageProps,
+        onRequestedVersionChange,
+      }),
+    );
+
+    await waitFor(() => expect(onRequestedVersionChange).toHaveBeenCalledWith(8));
   });
 });
 
@@ -562,6 +709,108 @@ describe("WatchPage audio menu", () => {
       subtitleInventoryProvisional?: boolean;
     };
     expect(props.audioInventoryProvisional).toBe(true);
+    expect(props.subtitleInventoryProvisional).toBe(false);
+  });
+});
+
+describe("WatchPage overlay inventory provenance", () => {
+  const catalogSubtitle: PlayerSubtitleInfo = {
+    index: 4,
+    language: "eng",
+    codec: "subrip",
+    label: "English",
+    source: "embedded",
+    url: "/stream/session-1/subtitles/4.vtt",
+  };
+  const liveSubtitle: PlayerSubtitleInfo = {
+    index: 6,
+    language: "fra",
+    codec: "subrip",
+    label: "French",
+    source: "embedded",
+    url: "/stream/session-1/subtitles/6.vtt",
+  };
+  const catalogAudio = { language: "eng", codec: "aac", channels: 2, default: true };
+  const liveAudio = { language: "fra", codec: "ac3", channels: 6, default: true };
+
+  it("gates catalog subtitle rows until the probe lands, then swaps in the live inventory", () => {
+    playbackSessionMock.mockReturnValue(
+      playbackSession({ subtitleUrls: [], subtitleInventoryProvisional: false }),
+    );
+    const view = render(
+      createElement(WatchPage, { ...watchPageProps, subtitles: [catalogSubtitle] }),
+    );
+
+    let props = videoPlayerMock.mock.calls.at(-1)?.[0] as {
+      subtitleUrls?: PlayerSubtitleInfo[];
+      subtitleInventoryProvisional?: boolean;
+      shouldAutoPlay?: boolean;
+      streamUrl?: string | null;
+    };
+    // The pre-probe catalog rows still reach the player for selection, but the
+    // overlay marks them provisional because they are not probe evidence.
+    expect(props.subtitleUrls).toEqual([catalogSubtitle]);
+    expect(props.subtitleInventoryProvisional).toBe(true);
+    // Only the menu rows wait for the probe; playback starts unblocked.
+    expect(props.shouldAutoPlay).toBe(true);
+    expect(props.streamUrl).toBe("/stream/session-1");
+
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        subtitleUrls: [liveSubtitle],
+        subtitleInventoryProvisional: false,
+      }),
+    );
+    view.rerender(createElement(WatchPage, { ...watchPageProps, subtitles: [catalogSubtitle] }));
+
+    props = videoPlayerMock.mock.calls.at(-1)?.[0] as typeof props;
+    expect(props.subtitleUrls).toEqual([liveSubtitle]);
+    expect(props.subtitleInventoryProvisional).toBe(false);
+  });
+
+  it("gates catalog audio rows until the probe lands, then swaps in the live inventory", () => {
+    const versionWithCatalogAudio: PlayerFileVersion = {
+      ...version,
+      audio_tracks: [catalogAudio],
+    };
+    playbackSessionMock.mockReturnValue(
+      playbackSession({ planAudioTracks: [], audioInventoryProvisional: false }),
+    );
+    const view = render(
+      createElement(WatchPage, { ...watchPageProps, versions: [versionWithCatalogAudio] }),
+    );
+
+    let props = videoPlayerMock.mock.calls.at(-1)?.[0] as {
+      audioTracks?: unknown[];
+      audioInventoryProvisional?: boolean;
+      shouldAutoPlay?: boolean;
+    };
+    expect(props.audioTracks).toEqual([catalogAudio]);
+    expect(props.audioInventoryProvisional).toBe(true);
+    expect(props.shouldAutoPlay).toBe(true);
+
+    playbackSessionMock.mockReturnValue(
+      playbackSession({ planAudioTracks: [liveAudio], audioInventoryProvisional: false }),
+    );
+    view.rerender(
+      createElement(WatchPage, { ...watchPageProps, versions: [versionWithCatalogAudio] }),
+    );
+
+    props = videoPlayerMock.mock.calls.at(-1)?.[0] as typeof props;
+    expect(props.audioTracks).toEqual([liveAudio]);
+    expect(props.audioInventoryProvisional).toBe(false);
+  });
+
+  it("keeps an empty verified inventory final instead of waiting on a probe", () => {
+    playbackSessionMock.mockReturnValue(
+      playbackSession({ subtitleUrls: [], subtitleInventoryProvisional: false }),
+    );
+
+    render(createElement(WatchPage, { ...watchPageProps, subtitles: [] }));
+
+    const props = videoPlayerMock.mock.calls.at(-1)?.[0] as {
+      subtitleInventoryProvisional?: boolean;
+    };
     expect(props.subtitleInventoryProvisional).toBe(false);
   });
 });
@@ -723,7 +972,7 @@ describe("WatchPage version list refresh", () => {
       createElement(WatchPage, {
         ...watchPageProps,
         versions: [firstVersion, secondVersion],
-        versionLiveness: new Map([[9, false]]),
+        versionLiveness: new Map([[9, { available: false }]]),
       }),
     );
 
@@ -2557,7 +2806,7 @@ describe("WatchPage realtime reconnect reconcile", () => {
       createElement(WatchPage, {
         ...watchPageProps,
         versions: [{ ...virtualVersion, available: false }],
-        versionLiveness: new Map([[7, false]]),
+        versionLiveness: new Map([[7, { available: false }]]),
       }),
     );
 
@@ -2676,7 +2925,7 @@ describe("WatchPage realtime reconnect reconcile", () => {
       createElement(WatchPage, {
         ...watchPageProps,
         versions: [{ ...firstVersion, resolution: "2160p" }],
-        versionLiveness: new Map([[9, false]]),
+        versionLiveness: new Map([[9, { available: false }]]),
       }),
     );
 

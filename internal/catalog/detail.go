@@ -648,6 +648,27 @@ type FileVersion struct {
 	// replaced. Jellyfin PlaybackInfo leaves such versions out. Neither the v1
 	// nor the v2 view carries the flag.
 	Unreadable bool `json:"-"`
+	// ProbedAt is when ffprobe last enumerated the file's real stream table;
+	// nil means the row still carries declared metadata only. Server-side
+	// only: the pre-play probe scheduler uses it to leave a selected row with
+	// fresh inventory alone. The v2 projection exposes the same instant as
+	// probed_at so a client can tell fresh inventory from declared hints.
+	ProbedAt *time.Time `json:"-"`
+	// SourceMismatch is the process-local wrong-source probe verdict for this
+	// row, when the node still holds it. Advisory only: it never changes
+	// Failed or Available and is never persisted. Server-side only; the v2
+	// projection carries it as source_mismatch.
+	SourceMismatch *VersionSourceMismatch `json:"-"`
+}
+
+// VersionSourceMismatch is a recent probe's served-vs-declared byte evidence
+// for a virtual row whose bytes did not match its declared release. It is
+// produced by the playback probe damper and read through the detail service's
+// injected verdict source, so the detail page and the versions check endpoint
+// report one verdict.
+type VersionSourceMismatch struct {
+	ServedBytes   int64 `json:"served_bytes"`
+	DeclaredBytes int64 `json:"declared_bytes"`
 }
 
 // SetMarkers refreshes the marker projection without rebuilding file metadata.
@@ -968,6 +989,10 @@ type DetailService struct {
 	// virtualRankingSource exposes the ranking that produced each virtual
 	// listing. Nil disables the projection; see SetVirtualRankingSource.
 	virtualRankingSource VirtualRankingSource
+	// versionSourceMismatch projects the playback probe's process-local
+	// wrong-source verdict onto each version. Nil disables the projection; see
+	// SetVersionSourceMismatchSource.
+	versionSourceMismatch VersionSourceMismatchSource
 
 	// watchPrepareMu guards watchPrepared, the per-content memo that keeps a
 	// repeated watch-detail fetch of unchanged files from re-running the
@@ -1127,6 +1152,27 @@ func (s *DetailService) SetVirtualCandidateScoreSource(source VirtualCandidateSc
 // is projected.
 func (s *DetailService) SetVirtualRankingSource(source VirtualRankingSource) {
 	s.virtualRankingSource = source
+}
+
+// VersionSourceMismatchSource reads the recent wrong-source probe verdict for
+// one row. The playback probe owns that process-local signal; the detail
+// service only projects it, so this returns nil when the node holds no verdict.
+type VersionSourceMismatchSource func(*models.MediaFile) *VersionSourceMismatch
+
+// SetVersionSourceMismatchSource wires the wrong-source verdict shown per
+// version on the detail response. It is optional; without it no version
+// carries source_mismatch.
+func (s *DetailService) SetVersionSourceMismatchSource(source VersionSourceMismatchSource) {
+	s.versionSourceMismatch = source
+}
+
+// versionSourceMismatchFor projects the injected verdict for one file. A nil
+// source, file, or verdict yields nil so the field stays absent.
+func (s *DetailService) versionSourceMismatchFor(file *models.MediaFile) *VersionSourceMismatch {
+	if s == nil || s.versionSourceMismatch == nil || file == nil {
+		return nil
+	}
+	return s.versionSourceMismatch(file)
 }
 
 // SetRootClaimRepository wires in the root claim repo for series folder path lookups.
@@ -4390,22 +4436,10 @@ func sortAudiobookMediaFiles(files []*models.MediaFile) {
 // support were scanned with an empty array; re-deriving it at read time keeps
 // the version flyout complete until the probe-version re-probe catches up.
 func ensureTrackLanguages(tracks []models.AudioTrack) []models.AudioTrack {
-	for i := range tracks {
-		track := &tracks[i]
-		if len(track.Languages) > 0 {
-			continue
-		}
-		if track.Language != "" && track.Language != "und" && track.Language != "mul" {
-			continue
-		}
-		if languages := lang.ParseLanguages(track.EmbeddedTitle); len(languages) > 0 {
-			track.Languages = languages
-			if track.Language == "" || track.Language == "und" || track.Language == "mul" {
-				track.Language = languages[0]
-			}
-		}
-	}
-	return tracks
+	// One implementation shared with the playback start path: the picker marker
+	// and the planner's audio selection must resolve MULTI/DUAL titles from the
+	// same backfilled language view.
+	return playback.BackfillAudioTrackLanguages(tracks)
 }
 
 // virtualMediaContainer is the container sentinel a provider-backed virtual
@@ -4533,20 +4567,38 @@ func probedCollapsesAgainstProbedRelease(f *models.MediaFile, kept []*models.Med
 	if f == nil {
 		return false
 	}
-	size := virtualDeclaredProviderSize(f)
 	for _, k := range kept {
-		if k == nil {
-			continue
+		if VirtualRowsShareRelease(f, k) {
+			return true
 		}
-		if size != virtualDeclaredProviderSize(k) {
-			continue
-		}
-		if virtualProviderIdentityConflicts(f, k) {
-			continue
-		}
-		return true
 	}
 	return false
+}
+
+// VirtualRowsShareRelease reports whether two virtual catalog rows are the same
+// release under the version list's grouping rule: the same provider-neutral
+// release path, an equal declared size, and no conflicting durable provider
+// identity tier. It is the rule that collapses duplicate rows for one release
+// into a single version, exported so a caller holding a release's sibling rows
+// can decide "same release, different row" without inventing a second
+// normalization.
+//
+// A concrete `result=` pick is deliberately not part of the identity test: the
+// neutral path strips it precisely because a provider re-list churns result ids
+// for one release, and different indexers offering the same release each mint
+// their own concrete pick. Local files never share a release by this rule.
+func VirtualRowsShareRelease(a, b *models.MediaFile) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	key := virtualNeutralReleaseKey(a)
+	if key == "" || key != virtualNeutralReleaseKey(b) {
+		return false
+	}
+	if virtualDeclaredProviderSize(a) != virtualDeclaredProviderSize(b) {
+		return false
+	}
+	return !virtualProviderIdentityConflicts(a, b)
 }
 
 // unprobedCollapsesAgainstProbedRelease reports whether an unprobed virtual
@@ -4762,6 +4814,7 @@ func (s *DetailService) buildPlaybackInfoWith(
 			// (missing_since IS NULL). Omitted when available, so an absent
 			// field means available/unknown; false means unavailable.
 			Available:      versionAvailability(f),
+			SourceMismatch: s.versionSourceMismatchFor(f),
 			VideoTracks:    append([]models.VideoTrack(nil), f.VideoTracks...),
 			AudioTracks:    audioTracks,
 			SubtitleTracks: buildVersionSubtitleTracks(f),
@@ -4775,6 +4828,7 @@ func (s *DetailService) buildPlaybackInfoWith(
 				return s.PresignURLsWithExpiry(ctx, paths, "card")
 			}),
 			Unreadable: f.ProbeRejected(),
+			ProbedAt:   f.ProbeUpdatedAt,
 		})
 
 		for _, sub := range f.SubtitleTracks {
@@ -4830,7 +4884,56 @@ func (s *DetailService) buildPlaybackInfoWith(
 	recap := pick(func(v FileVersion) *Marker { return v.Recap }, firstRecap)
 	preview := pick(func(v FileVersion) *Marker { return v.Preview }, firstPreview)
 
-	return versions, variants, subtitles, intro, credits, recap, preview
+	// Serve verified inventory first without touching the inputs that produced
+	// the variants above: auto-pick, the selected version and every resolved
+	// row still come from the unpartitioned order.
+	return partitionPreparedVersions(versions), variants, subtitles, intro, credits, recap, preview
+}
+
+// versionInventoryPrepared reports whether a version carries probe-verified
+// stream inventory that a thin client can start from: a successful probe
+// stamped the row, it is not durably dead, and (when known) it is not marked
+// unavailable. A rejected wrong-source probe never stamps ProbeUpdatedAt and
+// never sets failed_at, so still-unverified mismatched bytes are already
+// excluded by the probe stamp; the process-local source-mismatch verdict is not
+// part of the durable version list and cannot be carried here.
+func versionInventoryPrepared(v FileVersion) bool {
+	if v.Failed || v.Unreadable || v.ProbedAt == nil || v.ProbedAt.IsZero() {
+		return false
+	}
+	return v.Available == nil || *v.Available
+}
+
+// partitionPreparedVersions stably partitions versions so rows with verified
+// inventory come first. Relative order inside each group is preserved, which
+// keeps the existing provider ranking and listing order intact. It is a pure
+// display-order rule: callers must build playback variants and pick the
+// effective row before applying it.
+func partitionPreparedVersions(versions []FileVersion) []FileVersion {
+	if len(versions) < 2 {
+		return versions
+	}
+	prepared := 0
+	for i := range versions {
+		if versionInventoryPrepared(versions[i]) {
+			prepared++
+		}
+	}
+	if prepared == 0 || prepared == len(versions) {
+		return versions
+	}
+	ordered := make([]FileVersion, len(versions))
+	nextPrepared, nextOther := 0, prepared
+	for _, version := range versions {
+		if versionInventoryPrepared(version) {
+			ordered[nextPrepared] = version
+			nextPrepared++
+		} else {
+			ordered[nextOther] = version
+			nextOther++
+		}
+	}
+	return ordered
 }
 
 func playbackVersionExists(versions []FileVersion, selectedFileID int) bool {

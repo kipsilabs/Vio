@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -42,6 +43,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/tonemap"
 	"github.com/Silo-Server/silo-server/internal/transcodenode"
 	"github.com/Silo-Server/silo-server/internal/userstore"
+	"github.com/Silo-Server/silo-server/internal/virtuallibrary/resolver"
 )
 
 const (
@@ -57,6 +59,7 @@ const (
 	subtitleUnavailableReasonV3   = "subtitle_artifact_unavailable"
 	subtitleTrackKindV3           = "subtitle"
 	transcodeStartFailedReasonV3  = "transcode_start_failed"
+	remuxSeekPositionFailedV3     = "Failed to resolve remux seek position."
 	capabilityUnavailableReasonV3 = "transcode_node_capability_unavailable"
 	// copySeekProbeRetryMargin is the slack a replan keeps beyond a second full
 	// copy-video seek-anchor probe before attempting it. Process startup, the
@@ -169,6 +172,16 @@ const (
 // collapses with a planning-triggered lazy refresh through the same per-node
 // singleflight slot (claimCapabilityRefreshLockedV3).
 const v3NodeCapabilityRefreshInterval = v3NodeCapabilityTTL / 4
+
+// copySeekAnchorSeekResolveTimeout bounds one copy-video seek-anchor resolve
+// (the pinned-relay lookup and the FFmpeg keyframe probe) on a start that seeks.
+// A healthy probe costs ~1.8s; anything slower is a stuck upstream and must not
+// consume the 30s replan budget. The cap is a var so tests can shorten it. It
+// only shortens work on a seek start: a caller with no seek position never
+// resolves an anchor. When it elapses the failure is classified as a retryable
+// seek error, not evidence against the release, so the transport is not rotated
+// or torn down over it.
+var copySeekAnchorSeekResolveTimeout = 5 * time.Second
 
 type serverBitrateCapContextKeyV3 struct{}
 
@@ -530,6 +543,16 @@ type transportErrorV3 struct {
 	message   string
 	retryable bool
 	cause     error
+	// seekFailure marks a retryable failure to resolve the seek position itself
+	// (the copy-video anchor probe or its relay lookup) rather than a verdict
+	// about the release. A start must surface it to the client as a retryable
+	// seek error instead of rotating to another version. A seek-failure replan
+	// reaches the same verdict through the replacement path: a failed
+	// replacement rolls back to the plan already serving, so the live transport
+	// is left untouched and the bytes may still be fine — only the probe was
+	// slow or the relay answered 5xx. This flag is read only by the start path;
+	// it never drives replan teardown.
+	seekFailure bool
 }
 
 func subtitleArtifactErrorV3(message string, cause error) *transportErrorV3 {
@@ -2119,6 +2142,21 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	if err := req.ValidateSelectedTrackStructureV3(); err != nil {
 		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusBadRequest, "bad_request", err.Error())
 	}
+	profileID := apimw.GetProfileID(r.Context())
+	if profileID == "" {
+		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusBadRequest, "bad_request", "X-Profile-Id header is required")
+	}
+	if req.ProfileID != profileID {
+		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusBadRequest, "bad_request", "profile_id must match X-Profile-Id")
+	}
+	userID := apimw.GetUserID(r.Context())
+	deviceID := deviceMetadataFromRequest(r).DeviceID
+	// The plan publishes track identities minted against the effective row, but
+	// a restart echoes them alongside the requested file_id. Normalize an echo
+	// onto the requested row before validation; a truly foreign row still falls
+	// through to the stale-identity drop inside NormalizeAndValidate.
+	startTrackRekeys := h.rekeyStartTrackIdentitiesV3(r.Context(), &req, userID, profileID,
+		clientip.FromContext(r.Context()), playbackClientInfoFromRequest(r).UserAgent)
 	dropStaleRequestTrackIdentitiesV3(r.Context(), &req)
 	warnings, err := req.NormalizeAndValidate()
 	if err != nil {
@@ -2133,15 +2171,6 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		req.ClientFeatures = playback.WithoutFeatureV3(req.ClientFeatures, playback.FeatureHLSSubtitleRenditionsV3)
 	}
 	timings.mark("decode_validate")
-	profileID := apimw.GetProfileID(r.Context())
-	if profileID == "" {
-		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusBadRequest, "bad_request", "X-Profile-Id header is required")
-	}
-	if req.ProfileID != profileID {
-		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusBadRequest, "bad_request", "profile_id must match X-Profile-Id")
-	}
-	userID := apimw.GetUserID(r.Context())
-	deviceID := deviceMetadataFromRequest(r).DeviceID
 	requestDigests := newPlaybackStartRequestDigestsV3(body, deviceID)
 	resolutionWasAssumed := false
 	// resolutionProvenance is the virtual resolver's provenance for the source
@@ -2260,8 +2289,16 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		// so the stale-pin recovery may re-pin here while a future session-bound
 		// caller reusing the walk keeps its own binding intent and refuses.
 		var resolveErr error
-		walkSourceReq := r.WithContext(withVirtualSessionBindingV3(r.Context(), false))
-		resolved, resolveErr = h.resolveVirtualStartWithVersionFallback(walkSourceReq, requestedFile, profileID, req, allowFailedCandidate, intOrZeroHandlerV3(req.BandwidthCapKbps))
+		if retained, ok := h.retainedVirtualStartSourceV3(r, userID, profileID, requestedFile, req); ok {
+			// A still-live session already proved this candidate and its
+			// inventory. A start re-entering after a failure serves that
+			// generation instead of paying another discovery/listing/probe
+			// round-trip for the same bytes.
+			resolved = retained
+		} else {
+			walkSourceReq := r.WithContext(withVirtualSessionBindingV3(r.Context(), false))
+			resolved, resolveErr = h.resolveVirtualStartWithVersionFallback(walkSourceReq, requestedFile, profileID, req, allowFailedCandidate, intOrZeroHandlerV3(req.BandwidthCapKbps))
+		}
 		if resolveErr != nil {
 			// A confirmed-dead pinned release is indicted here so a retry does
 			// not re-resolve it; an empty provider listing is not a verdict and
@@ -2320,6 +2357,23 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 			}
 		}
 	}
+	// The re-keyed identities were normalized onto the requested row before
+	// virtual resolution. Re-check their ordinals against the candidate the
+	// resolver actually served: a substitution can reorder its tracks, and an
+	// ordinal kept across that change would silently play another stream.
+	startAudioUnavailable, startSubtitleUnavailable, startConstrainErr := h.constrainRekeyedStartTracksV3(r.Context(), &req, requestedFile, startTrackRekeys)
+	if startConstrainErr != nil {
+		// The subtitle store could not prove whether the selection survived the
+		// candidate change. Reusing the old ordinal would silently play another
+		// track, so surface the dependency failure instead of degrading.
+		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusServiceUnavailable, "subtitle_unavailable", "The selected subtitle track could not be verified; retry shortly.")
+	}
+	if startAudioUnavailable {
+		warnings = append(warnings, playback.AudioTrackUnavailableWarningV3())
+	}
+	if startSubtitleUnavailable {
+		warnings = append(warnings, playback.SubtitleTrackUnavailableWarningV3())
+	}
 	if dropStaleAudioTrackIdentityV3(r.Context(), requestedFile, req.AudioTrackID) {
 		req.AudioTrackID = ""
 		req.AudioTrackIndex = nil
@@ -2350,10 +2404,17 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		// Version switch: the viewer made an explicit audio choice on the previous
 		// version; carry it onto the requested file by track family rather than
 		// letting the server's preference override an explicit choice.
-		if carriedIndex, ok := h.resolveCarriedAudioTrackV3(r.Context(), req.CarriedAudioTrackID, requestedFile); ok {
+		carriedSource := h.carriedAudioSourceV3(r.Context(), &req, requestedFile, userID, profileID,
+			clientip.FromContext(r.Context()), playbackClientInfoFromRequest(r).UserAgent)
+		if carriedIndex, ok := h.resolveCarriedAudioTrackV3(r.Context(), req.CarriedAudioTrackID, requestedFile, carriedSource); ok {
 			audioIndex = carriedIndex
 			req.AudioTrackIndex = &carriedIndex
 			req.AudioTrackID = ""
+		} else {
+			// The viewer made an explicit choice on the previous version and the
+			// requested one has no equivalent. Report the loss instead of letting
+			// the server preference play another stream silently.
+			audioDegraded = true
 		}
 	}
 	if audioDegraded {
@@ -2810,6 +2871,12 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		}
 		deferred.sessionID = sessionID
 		timings.mark("post_commit_probe_scheduled")
+		// The deferred enumeration is where this session first needs a verified
+		// subtitle inventory, and the transport commit is what deferred it. Record
+		// the wait start here (before the probe is armed) so the evidence
+		// delivery line can report how long the menu stayed provisional; the
+		// blocker is the relay the probe waits on, not the provider.
+		h.noteSubtitleInventoryWaitStart(r.Context(), sessionID, deferred.file, probeOutcomePending, subtitleWaitBlockerRelay)
 		h.enqueueDeferredVirtualProbeV3(r.Context(), deferred)
 	}
 	// Split the composite commit measurement into attributable sub-phases: the
@@ -2846,6 +2913,13 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		// release. The reason split already keeps those out of this branch; the
 		// guard makes the audio exclusion explicit so a future caller cannot
 		// fold an audio reason back into the video transport reason.
+		//
+		// A seek-anchor resolve that failed transiently (relay 5xx) or exhausted
+		// its bounded budget is a retryable seek error, not a verdict about the
+		// release. The same-release retry above may still recover it; the
+		// alternate walk below resolves and probes every sibling through the same
+		// failing relay and cannot answer faster, so it is skipped. Surface the
+		// seek error for the client to retry instead of rotating.
 		if statusErr.reason == transcodeStartFailedReasonV3 && !audioOnlyTransportReasonV3(statusErr.reason) && isVirtualPlaybackFile(requestedFile) && req.FileSelection != playback.FileSelectionExplicitV3 {
 			// A single transient provider error (an upstream 5xx or timeout on
 			// the seek-anchor probe or the first bytes) must not change the
@@ -2871,27 +2945,46 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 				enqueueDeferredPostCommitProbe(retriedResponse.SessionID)
 				return retriedResponse, nil
 			}
-			alternateOrder := alternateOrderingForClient(req.Capabilities)
-			// A transient provider (upstream 5xx) failure caps the alternates
-			// tried in this start so the failing upstream is not hammered once
-			// per alternate; a generic transport failure keeps the full list.
-			if alternates, alternateErr := h.virtualTransportAlternatesV3(r.Context(), requestedFile, requestAccessFilter(r), alternateOrder, playback.IsTransientProviderError(statusErr.cause)); alternateErr == nil && len(alternates) > 0 {
-				for alternateRank, altCandidate := range alternates {
-					alternate, alternateProvenance, err := h.prepareVirtualAlternateFileV3(r, altCandidate, profileID)
-					if err != nil || alternate == nil {
-						continue
-					}
-					alternateAudio := remapAudioIndexV3(effectiveFile, alternate, audioIndex)
-					alternateRequest := req
-					_, subtitleErr := h.remapSubtitleSelectionV3(r.Context(), effectiveFile, alternate, &alternateRequest)
-					if errors.Is(subtitleErr, errSubtitleUnavailableInTargetV3) {
-						// The alternate has no equivalent track; degrade rather
-						// than give up on a playable route.
-						alternateRequest.SubtitleTrackIndex = nil
-						alternateRequest.SubtitleTrackID = ""
-						subtitleErr = nil
-					}
-					if subtitleErr == nil {
+			if statusErr.seekFailure {
+				slog.WarnContext(r.Context(), "virtual playback seek anchor failed; answering the retryable seek error without rotating the release",
+					logComponentKey, playbackLogValueV3,
+					"playback_attempt_id", req.PlaybackAttemptID,
+					"requested_file_id", requestedFile.ID,
+					"effective_file_id", effectiveFile.ID,
+					"error", statusErr.cause)
+			}
+			if !statusErr.seekFailure {
+				alternateOrder := alternateOrderingForClient(req.Capabilities)
+				// A transient provider (upstream 5xx) failure caps the alternates
+				// tried in this start so the failing upstream is not hammered once
+				// per alternate; a generic transport failure keeps the full list.
+				if alternates, alternateErr := h.virtualTransportAlternatesV3(r.Context(), requestedFile, requestAccessFilter(r), alternateOrder, playback.IsTransientProviderError(statusErr.cause)); alternateErr == nil && len(alternates) > 0 {
+					for alternateRank, altCandidate := range alternates {
+						alternate, alternateProvenance, err := h.prepareVirtualAlternateFileV3(r, altCandidate, profileID)
+						if err != nil || alternate == nil {
+							continue
+						}
+						alternateAudio := remapAudioIndexV3(effectiveFile, alternate, audioIndex)
+						alternateRequest := req
+						// A transport failure that moves the release is a candidate
+						// rotation: run the same carry-or-degrade decision the replan
+						// drift and stream-state paths use. The generic edition-switch
+						// remap accepts the first language/format survivor and crosses
+						// output muxers, which is how a rotated release's wrong track
+						// gets served. A same-inventory fast path still keeps the exact
+						// ordinal without re-identifying it, and a miss clears the
+						// selection for one fast degrade instead of hunting candidates
+						// with a stale ordinal.
+						carryDecision, subtitleErr := h.rekeySubtitleSelectionWithRotationV3(
+							r.Context(), &alternateRequest, carriedInventorySourceV3{file: effectiveFile}, alternate, true,
+						)
+						if subtitleErr != nil {
+							// The subtitle store could not prove whether the carried
+							// track survived the rotation. Reusing the old ordinal
+							// would play whatever now occupies it, so skip this
+							// candidate rather than guess.
+							continue
+						}
 						alternateResult, _ := h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{
 							Request: alternateRequest, RequestedFile: requestedFile, EffectiveFile: alternate,
 							AudioTrackIndex: alternateAudio, Settings: settings,
@@ -2914,8 +3007,18 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 							// phase line separately, so the walk is
 							// attributable too.
 							alternatePhasesCtx, alternateRecorder := withTransportPhaseTimingsV3(r.Context())
+							// Carry the matcher's verdict into the commit so the new
+							// session records the carried position and reports a
+							// fuzzy carry. A confirmed miss stays out: the alternate
+							// is a fresh commit, not a pre-rotation subtitle URL that
+							// must be failed closed.
+							alternateCtx := alternatePhasesCtx
+							if carryDecision.outcome.Recorded && carryDecision.outcome.Matched &&
+								carryDecision.outcome.ToFileID == alternate.ID {
+								alternateCtx = withSubtitleRotationOutcomeV3(alternatePhasesCtx, carryDecision.outcome)
+							}
 							alternateStartedAt := time.Now()
-							alternateResponse, alternateStatusErr := h.startPlannedPlaybackV3(r.WithContext(alternatePhasesCtx), userID, profileID, alternateRequest, requestDigests, requestedFile, alternate, alternateAudio, alternateDecision, alternateResult, clientInfo, alternateDecision.substitutionReason)
+							alternateResponse, alternateStatusErr := h.startPlannedPlaybackV3(r.WithContext(alternateCtx), userID, profileID, alternateRequest, requestDigests, requestedFile, alternate, alternateAudio, alternateDecision, alternateResult, clientInfo, alternateDecision.substitutionReason)
 							logTransportRetryPhasesV3(r.Context(), req.PlaybackAttemptID, alternateStartedAt, alternateRecorder)
 							if alternateStatusErr == nil {
 								return alternateResponse, nil
@@ -3322,6 +3425,180 @@ func virtualStartVersionFallbackEligibleV3(req playback.StartRequestV3) bool {
 	return req.AllowsAlternateVersions() &&
 		shouldTryAlternateFileV3(req.QualityPreference) &&
 		req.FileSelection != playback.FileSelectionExplicitV3
+}
+
+// retainedVirtualStartSourceV3 reuses the candidate binding and probed
+// inventory a still-live session retained for this exact release. A start that
+// re-enters after a transport failure would otherwise re-list the provider and
+// re-probe the candidate before planning the same bytes; when the prior session
+// already holds verified evidence for the requested row, serving that evidence
+// skips the discovery/listing/probe round-trip without changing which release
+// plays. The reuse is deliberately narrow:
+//
+//   - it only fires when the client has not asked for a forced relink or a
+//     specific offered candidate, where a fresh answer is the point;
+//   - the prior session must be the unique client/profile match for this row and
+//     its binding must name a concrete candidate on the same release;
+//   - the evidence must belong to the bound row, and the row must still be
+//     accessible and not marked failed;
+//   - a requested row that already names a complete, probed candidate keeps the
+//     existing fast path, so a healthy start is not diverted.
+//
+// The returned source has no DeferredProbe: the inventory is already proven, and
+// a fresh probe is not a prerequisite for planning a retained generation.
+func (h *PlaybackHandler) retainedVirtualStartSourceV3(
+	r *http.Request,
+	userID int,
+	profileID string,
+	requested *models.MediaFile,
+	req playback.StartRequestV3,
+) (resolvedVirtualPlaybackSource, bool) {
+	if !h.retainedVirtualStartAllowedV3(r, requested, req) {
+		return resolvedVirtualPlaybackSource{}, false
+	}
+	previous, candidateURI, ownerID, ok := h.retainedVirtualStartBindingV3(r, userID, profileID, requested)
+	if !ok {
+		return resolvedVirtualPlaybackSource{}, false
+	}
+	effective, err := h.fileResolver.GetByID(r.Context(), previous.MediaFileID)
+	if err != nil || effective == nil || !isVirtualPlaybackFile(effective) {
+		return resolvedVirtualPlaybackSource{}, false
+	}
+	if !catalog.FileAllowedByAccess(effective, requestAccessFilter(r)) {
+		return resolvedVirtualPlaybackSource{}, false
+	}
+	if virtualCandidateVerdictActive(effective.FailedAt, time.Now()) {
+		return resolvedVirtualPlaybackSource{}, false
+	}
+	bound, ok := retainedVirtualBoundFileV3(effective, previous, candidateURI, ownerID)
+	if !ok {
+		return resolvedVirtualPlaybackSource{}, false
+	}
+	resolved := resolvedVirtualPlaybackSource{
+		URI:            candidateURI,
+		OwnerID:        ownerID,
+		File:           bound,
+		ProbeSucceeded: true,
+		Provenance:     ProbeProvenanceVerified,
+		CandidateRank:  -1,
+		CandidateCount: -1,
+	}
+	if effective.ID != requested.ID {
+		resolved.SubstitutedFromFileID = requested.ID
+		resolved.SubstitutionReason = substitutionReasonUnknownV3
+	}
+	slog.InfoContext(r.Context(), "resume start reused retained virtual evidence",
+		"component", "playback",
+		"requested_file_id", requested.ID,
+		"effective_file_id", effective.ID,
+		"candidate_id", virtualResultCandidateID(candidateURI),
+		"subtitle_evidence", true,
+	)
+	return resolved, true
+}
+
+// retainedVirtualStartAllowedV3 reports whether a start may reuse a live
+// session's retained evidence at all. A forced relink, an offered candidate, a
+// row the catalog already indicted, and a row that already names a complete
+// probed candidate (the ordinary repeat-play fast path) all need a fresh answer.
+func (h *PlaybackHandler) retainedVirtualStartAllowedV3(r *http.Request, requested *models.MediaFile, req playback.StartRequestV3) bool {
+	if h == nil || h.fileResolver == nil || requested == nil || r == nil || !isVirtualPlaybackFile(requested) {
+		return false
+	}
+	if req.ForceRelink || strings.TrimSpace(req.OfferedVirtualURI) != "" {
+		return false
+	}
+	allowFailedCandidate := req.FileSelection == playback.FileSelectionExplicitV3 || req.ForceRelink
+	if !allowFailedCandidate && virtualCandidateVerdictActive(requested.FailedAt, time.Now()) {
+		// The catalog already indicted this row. Reusing a live session's older
+		// binding would resurrect a release the provider marked dead.
+		return false
+	}
+	// A requested row that already names a complete probed candidate is served
+	// by the ordinary repeat-play fast path; leaving it there preserves the
+	// existing revalidation of a healthy row.
+	return virtualResultCandidateID(requested.FilePath) == "" ||
+		requested.ProbeUpdatedAt == nil ||
+		!completeVirtualVideoEvidenceV3(requested) ||
+		!completeVirtualAudioEvidenceV3(requested)
+}
+
+// retainedVirtualStartBindingV3 finds the unique live session for this client,
+// profile and row, then checks that its binding names a candidate on the same
+// release. It returns the session, the bound candidate URI and the owner the
+// planning copy must carry.
+func (h *PlaybackHandler) retainedVirtualStartBindingV3(r *http.Request, userID int, profileID string, requested *models.MediaFile) (*playback.Session, string, int, bool) {
+	if h.sessionMgr == nil {
+		return nil, "", 0, false
+	}
+	lister, ok := h.sessionMgr.(interface {
+		GetUserSessions(userID int) []*playback.Session
+	})
+	if !ok {
+		return nil, "", 0, false
+	}
+	previous := findCarryCandidateSessionV3(
+		lister.GetUserSessions(userID), profileID, requested.ID,
+		clientip.FromContext(r.Context()), playbackClientInfoFromRequest(r).UserAgent,
+	)
+	if previous == nil || previous.MediaFileID <= 0 || !previous.VirtualSubtitleEvidenceSet {
+		return nil, "", 0, false
+	}
+	candidateURI := strings.TrimSpace(previous.VirtualSourceURI)
+	if virtualResultCandidateID(candidateURI) == "" {
+		return nil, "", 0, false
+	}
+	if virtualPlaybackNeutralKey(candidateURI) != virtualPlaybackNeutralKey(requested.FilePath) {
+		return nil, "", 0, false
+	}
+	if requestedID := virtualResultCandidateID(requested.FilePath); requestedID != "" &&
+		requestedID != virtualResultCandidateID(candidateURI) {
+		return nil, "", 0, false
+	}
+	ownerID := previous.VirtualSourceOwnerInstallationID
+	if ownerID <= 0 {
+		ownerID = requested.VirtualOwnerInstallationID
+	}
+	if ownerID > 0 && requested.VirtualOwnerInstallationID > 0 && ownerID != requested.VirtualOwnerInstallationID {
+		return nil, "", 0, false
+	}
+	// Evidence is bound to the row it was captured from. A moved binding whose
+	// evidence still names an older row cannot prove this candidate's inventory.
+	if evidenceID := previous.VirtualSubtitleEvidenceFileID; evidenceID > 0 && evidenceID != previous.MediaFileID {
+		return nil, "", 0, false
+	}
+	return previous, candidateURI, ownerID, true
+}
+
+// retainedVirtualBoundFileV3 builds the planning copy from a retained binding:
+// the session's probed inventory carried onto the candidate the binding names.
+func retainedVirtualBoundFileV3(effective *models.MediaFile, previous *playback.Session, candidateURI string, ownerID int) (*models.MediaFile, bool) {
+	bound := *effective
+	bound.FilePath = candidateURI
+	bound.VirtualOwnerInstallationID = ownerID
+	bound.AudioTracks = append([]models.AudioTrack(nil), previous.VirtualAudioTracks...)
+	bound.SubtitleTracks = append([]models.SubtitleTrack(nil), previous.VirtualSubtitleTracks...)
+	bound.ExternalSubtitles = append([]models.ExternalSubtitle(nil), previous.VirtualExternalSubtitles...)
+	// A stored provider URL belongs to the candidate the row names. When the
+	// binding moved to a different candidate, serving the row's old URL would
+	// fetch the wrong bytes; let the transport resolve the retained candidate
+	// instead.
+	if virtualResultCandidateID(effective.FilePath) != virtualResultCandidateID(candidateURI) {
+		bound.ResolvedURL = ""
+		bound.ResolvedURLExpiresAt = nil
+		bound.ProviderRequestHeaders = nil
+	}
+	// The retained generation was verified by the session's probe, so it is a
+	// valid evidence generation even when the catalog row's own stamp is absent
+	// (the evidence write may still be queued). Stamp the planning copy only.
+	if bound.ProbeUpdatedAt == nil {
+		stamp := time.Now()
+		bound.ProbeUpdatedAt = &stamp
+	}
+	if !completeVirtualVideoEvidenceV3(&bound) || !completeVirtualAudioEvidenceV3(&bound) {
+		return nil, false
+	}
+	return &bound, true
 }
 
 // prepareVirtualAlternateFileV3 resolves an alternate candidate row into the
@@ -4546,8 +4823,14 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 		origin, startSegment := 0.0, 0
 		if requested > 0 {
 			if file == nil || strings.TrimSpace(file.FilePath) == "" {
-				return preparedTimelineV3{}, &transportErrorV3{reason: transcodeStartFailedReasonV3, message: "Failed to resolve remux seek position.", retryable: true, cause: errors.New("copy seek anchor requires a media file path")}
+				return preparedTimelineV3{}, &transportErrorV3{reason: transcodeStartFailedReasonV3, message: remuxSeekPositionFailedV3, retryable: true, cause: errors.New("copy seek anchor requires a media file path"), seekFailure: true}
 			}
+			// The whole anchor resolve — pinned-relay lookup and FFmpeg probe —
+			// runs under a cap well inside the replan budget. A relay that is
+			// stuck (not merely returning 5xx) must fail the seek quickly instead
+			// of spending the budget the rest of the replan needs.
+			anchorCtx, cancelAnchor := context.WithTimeout(ctx, copySeekAnchorSeekResolveTimeout)
+			defer cancelAnchor()
 			// The stable source identity is the un-resolved file path: for a
 			// virtual file that is the provider-neutral URI, identical across
 			// concurrent starts even though each start pins its own relay URL.
@@ -4598,7 +4881,7 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 				// renumbered its result ids must not terminal a remux seek when a
 				// same-identity candidate is still listed. A different release is
 				// refused rather than silently anchored.
-				if resolveErr := resolveAnchorInput(ctx); resolveErr != nil {
+				if resolveErr := resolveAnchorInput(anchorCtx); resolveErr != nil {
 					// This is the first live provider listing for an already-built
 					// plan: a remux seek start binds the row's probe evidence via
 					// the P0 fast path with no liveness check, by design. A
@@ -4610,15 +4893,21 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 					// release verdict is left as-is so the start's alternate walk
 					// still runs.
 					classified := classifyVirtualAnchorProviderOutage(resolveErr)
-					return preparedTimelineV3{}, transportStartFailureV3(classified,
-						&transportErrorV3{reason: transcodeStartFailedReasonV3, message: "Failed to resolve remux seek position.", retryable: true, cause: classified})
+					fallback := &transportErrorV3{reason: transcodeStartFailedReasonV3, message: remuxSeekPositionFailedV3, retryable: true, cause: classified}
+					if anchorCtx.Err() != nil && ctx.Err() == nil {
+						// Our bounded anchor budget elapsed while looking the
+						// candidate up. That is a slow relay, not a release
+						// verdict, so the start must not rotate over it.
+						fallback.seekFailure = true
+					}
+					return preparedTimelineV3{}, transportStartFailureV3(classified, fallback)
 				}
 				// A stored URL that has already lapsed is renewed before the probe,
 				// bounded to virtualProbeBudget, so the seek does not fail on a
 				// dead token. Best-effort: a failed renewal keeps the existing
 				// registration and lets the probe/retry carry the verdict.
 				if virtualResolvedURLExpired(anchorExpiresAt, time.Now()) {
-					refreshCtx, refreshCancel := context.WithTimeout(ctx, virtualProbeBudget)
+					refreshCtx, refreshCancel := context.WithTimeout(anchorCtx, virtualProbeBudget)
 					if resolveErr := resolveAnchorInput(refreshCtx); resolveErr != nil {
 						slog.WarnContext(ctx, "virtual seek anchor stored-url refresh failed; probing the existing registration",
 							"component", "api",
@@ -4669,7 +4958,7 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 					// this retry before its second probe. A re-resolve that still
 					// yields the same input means no new token is available, so a
 					// second probe would repeat the request that just failed.
-					if resolveErr := resolveAnchorInput(withVirtualRelayFreshRegistration(ctx)); resolveErr != nil {
+					if resolveErr := resolveAnchorInput(withVirtualRelayFreshRegistration(anchorCtx)); resolveErr != nil {
 						slog.WarnContext(ctx, "virtual seek anchor re-resolve failed; skipping retry",
 							"component", "api",
 							"playback_session_id", session.ID,
@@ -4720,8 +5009,8 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 				}
 				lastProbedInput = anchorInput
 				probeStarted := time.Now()
-				origin, startSegment, err = probeAnchor(ctx)
-				if err == nil || ctx.Err() != nil || attempt == 2 {
+				origin, startSegment, err = probeAnchor(anchorCtx)
+				if err == nil || ctx.Err() != nil || anchorCtx.Err() != nil || attempt == 2 {
 					break
 				}
 				fits, remaining := copySeekAnchorRetryFits(ctx)
@@ -4744,7 +5033,7 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 					break
 				}
 				if playback.IsTransientProviderError(err) {
-					if !h.waitCopySeekAnchorBackoff(ctx, remaining) {
+					if !h.waitCopySeekAnchorBackoff(anchorCtx, remaining) {
 						slog.WarnContext(ctx, "copy-video seek anchor retry skipped: no budget for the provider backoff",
 							"component", "api",
 							"playback_session_id", session.ID,
@@ -4776,7 +5065,13 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 					"requested_seek_seconds", requested,
 					"error", err,
 				)
-				return preparedTimelineV3{}, &transportErrorV3{reason: transcodeStartFailedReasonV3, message: "Failed to resolve remux seek position.", retryable: true, cause: err}
+				// A transient relay failure or our own anchor budget expiring is
+				// not evidence against the release. Report it as a retryable seek
+				// error so the client retries the seek instead of the start path
+				// rotating the version or a replan tearing down the transport.
+				seekFailure := playback.IsTransientProviderError(err) ||
+					(anchorCtx.Err() != nil && ctx.Err() == nil)
+				return preparedTimelineV3{}, &transportErrorV3{reason: transcodeStartFailedReasonV3, message: remuxSeekPositionFailedV3, retryable: true, cause: err, seekFailure: seekFailure}
 			}
 		}
 		configureCopyRemuxTimelineV3(result.Plan, origin)
@@ -5850,12 +6145,21 @@ func (h *PlaybackHandler) preferredAudioTrackIndexV3(ctx context.Context, userID
 		slog.ErrorContext(ctx, "protocol v3 start: audio preference store lookup failed", "component", "api", "user_id", userID, "error", err)
 		return 0, "", err
 	}
-	seriesID := h.resolveSeriesID(ctx, file)
+	// The content scope is the parent series for an episode and the content id
+	// for everything else. The catalog picker scopes the same way when it
+	// publishes effective_audio_track_index, so the marker and the plan agree.
+	contentID := strings.TrimSpace(h.resolveSeriesID(ctx, file))
+	if contentID == "" && strings.TrimSpace(file.EpisodeID) == "" {
+		// Movies and other item-level content scope by their own content id,
+		// matching the catalog picker. An episode whose parent series could not
+		// be resolved must not suddenly scope by the episode id.
+		contentID = strings.TrimSpace(file.ContentID)
+	}
 	var seriesPref *playback.AudioTrackPreference
-	if seriesID != "" {
-		stored, prefErr := store.GetAudioPreference(ctx, profileID, seriesID)
+	if contentID != "" {
+		stored, prefErr := store.GetAudioPreference(ctx, profileID, contentID)
 		if prefErr != nil {
-			slog.ErrorContext(ctx, "protocol v3 start: series audio preference lookup failed", "component", "api", "profile_id", profileID, "series_id", seriesID, "error", prefErr)
+			slog.ErrorContext(ctx, "protocol v3 start: content audio preference lookup failed", "component", "api", "profile_id", profileID, "content_id", contentID, "error", prefErr)
 			return 0, "", prefErr
 		}
 		if stored != nil {
@@ -5867,8 +6171,8 @@ func (h *PlaybackHandler) preferredAudioTrackIndexV3(ctx context.Context, userID
 		DeviceID:   deviceID,
 		LibraryIDs: []int{file.MediaFolderID},
 	}
-	if seriesID != "" {
-		rc.SeriesIDs = []string{seriesID}
+	if contentID != "" {
+		rc.SeriesIDs = []string{contentID}
 	}
 	preferredLang, err := resolvedPlaybackAudioLanguage(ctx, store, rc)
 	if err != nil {
@@ -5893,7 +6197,12 @@ func (h *PlaybackHandler) preferredAudioTrackIndexV3(ctx context.Context, userID
 		// settings own the language and its scope precedence.
 		seriesPref.AudioLanguage = preferredLang
 	}
-	return normalizeAudioTrackIndex(file, playback.SelectAudioTrack(file.AudioTracks, preferredLang, seriesPref)), preferredLang, nil
+	// Resolve against the same backfilled language view the catalog picker
+	// publishes, so a MULTI/DUAL title whose language lives only in the embedded
+	// title cannot select one track in the marker and another in the plan.
+	backfilled := *file
+	backfilled.AudioTracks = playback.BackfillAudioTrackLanguages(append([]models.AudioTrack(nil), file.AudioTracks...))
+	return normalizeAudioTrackIndex(file, playback.SelectAudioTrack(backfilled.AudioTracks, preferredLang, seriesPref)), preferredLang, nil
 }
 
 // carrySelectionsFromActiveSessionV3 copies an explicit audio selection and a
@@ -6598,6 +6907,10 @@ func (h *PlaybackHandler) startReadyAutoLocalPlaybackTransportV3(ctx context.Con
 
 // prepareLocalTransportV3 starts a local HLS generation for the selected plan.
 func (h *PlaybackHandler) prepareLocalTransportV3(r *http.Request, session *playback.Session, file *models.MediaFile, result playback.PlannerResultV3, timeline preparedTimelineV3, mode mediaAuthModeV3) (preparedTransportV3, *transportErrorV3) {
+	// A cross-release fallback can only carry the requested audio by identity;
+	// when it cannot, the transport records the degradation on the plan it is
+	// preparing. Attach the plan so the start path can reach it.
+	r = r.WithContext(withCrossReleaseAudioPlanV3(r.Context(), result.Plan))
 	cfg := h.playbackConfig()
 	if err := os.MkdirAll(cfg.TranscodeDir, 0o755); err != nil {
 		return preparedTransportV3{}, &transportErrorV3{reason: "internal_error", message: "Failed to prepare the transcode directory.", cause: err}
@@ -7527,8 +7840,138 @@ func (h *PlaybackHandler) v3SessionStreamState(ctx context.Context, session *pla
 			evidenceSet = session.VirtualSubtitleEvidenceSet
 		}
 		state.VirtualSubtitleEvidenceSet = evidenceSet
+		// The new evidence generation is committed with this write, so the
+		// viewer's subtitle position must be re-keyed onto it in the same
+		// commit. A recorded rotation (the replan drift carry, or a candidate
+		// move this request did not evaluate itself) either commits the carried
+		// ordinal or records the one it could not preserve; a second rotation then
+		// re-keys from the carried position.
+		state.VirtualSubtitleSelectionIndex = result.SubtitleTrackIndex
+		state.VirtualSubtitleSelectionSet = true
+		if outcome, ok := subtitleRotationOutcomeFromContextV3(ctx); ok && outcome.ToFileID == file.ID {
+			if outcome.Matched {
+				if outcome.ToIndex == result.SubtitleTrackIndex {
+					state.VirtualSubtitleCarryFromIndex = outcome.FromIndex
+					state.VirtualSubtitleCarryToIndex = outcome.ToIndex
+					state.VirtualSubtitleCarrySet = true
+					if !outcome.Exact {
+						appendSubtitleCarryWarningV3(result.Plan)
+					}
+				}
+			} else {
+				// A confirmed miss is terminal for that ordinal even when the
+				// planner installed some other subtitle in the same commit; the
+				// pre-rotation URL must not be reinterpreted positionally.
+				state.VirtualSubtitleCarryLostIndex = outcome.FromIndex
+				state.VirtualSubtitleCarryLostSet = true
+			}
+		} else if h.virtualEvidenceMovedV3(session, file, virtualURI) {
+			// The request did not evaluate the carry (for example a rehydrated
+			// replan that resolved a refreshed candidate directly). Re-derive it
+			// from the session's retained evidence at the commit so the new
+			// generation still records the carried position or its loss.
+			h.commitDerivedSubtitleRotationCarryV3(ctx, session, file, &state, result)
+		} else if session.VirtualSubtitleCarryLostSet && result.SubtitleTrackIndex < 0 {
+			// The verdict outlives later non-rotation commits while the viewer
+			// still has subtitles off. A commit that installs a subtitle is a
+			// fresh selection against the current inventory and clears it.
+			state.VirtualSubtitleCarryLostIndex = session.VirtualSubtitleCarryLostIndex
+			state.VirtualSubtitleCarryLostSet = true
+		}
 	}
 	return state
+}
+
+// virtualEvidenceMovedV3 reports whether the session's retained subtitle
+// evidence belongs to a different candidate or layout than the file being
+// committed. It is the rotation signal the stream-state commit needs when no
+// replan drift pass already evaluated the carry.
+func (h *PlaybackHandler) virtualEvidenceMovedV3(session *playback.Session, file *models.MediaFile, virtualURI string) bool {
+	if session == nil || file == nil || !session.VirtualSubtitleEvidenceSet {
+		return false
+	}
+	if evidenceID := session.VirtualSubtitleEvidenceFileID; evidenceID > 0 && evidenceID != file.ID {
+		return true
+	}
+	evidenceURI := strings.TrimSpace(session.VirtualSubtitleEvidenceURI)
+	if evidenceURI != "" && !sameVirtualCandidate(evidenceURI, virtualURI) {
+		return true
+	}
+	return !playback.SubtitleLayoutsEqualIncludingExternal(
+		file.SubtitleTracks, file.ExternalSubtitles, session.VirtualSubtitleTracks, session.VirtualExternalSubtitles)
+}
+
+// commitDerivedSubtitleRotationCarryV3 carries the session's committed subtitle
+// position from the evidence generation it was minted on onto the candidate
+// this commit installs. It writes the same carry/loss state the explicit replan
+// path records, so both entry points leave an in-flight subtitle request with a
+// committed answer.
+func (h *PlaybackHandler) commitDerivedSubtitleRotationCarryV3(ctx context.Context, session *playback.Session, file *models.MediaFile, state *playback.SessionStreamState, result playback.PlannerResultV3) {
+	if session == nil || file == nil || state == nil || !session.VirtualSubtitleSelectionSet || session.VirtualSubtitleSelectionIndex < 0 {
+		return
+	}
+	evidenceID := session.VirtualSubtitleEvidenceFileID
+	if evidenceID <= 0 {
+		evidenceID = file.ID
+	}
+	// Authority is the same as the replan remap source: the durable plan that
+	// minted the ordinal first, the session's retained evidence second, and the
+	// live row only when neither exists.
+	var durable map[int]predecessorPlanInventoryV3
+	if h.PlanStoreV3 != nil {
+		if record, err := h.PlanStoreV3.GetAttempt(ctx, session.ID); err == nil && record != nil {
+			durable = replanDurableInventoryV3(record)
+		}
+	}
+	carry := h.rekeySourceFileWithInventoryV3(ctx, evidenceID, session, durable)
+	if carry.subtitleEvidenceErr != nil {
+		slog.WarnContext(ctx, "cannot commit the carried subtitle position: the evidence tail is unreadable",
+			"component", "playback", "session", session.ID, "file_id", file.ID, "error", carry.subtitleEvidenceErr)
+		return
+	}
+	key, published, exact, matched, err := h.carrySubtitleSelectionAcrossRotationV3(ctx, session, carry, file, session.VirtualSubtitleSelectionIndex)
+	if err != nil {
+		slog.WarnContext(ctx, "cannot commit the carried subtitle position: the downloaded subtitle list is unreadable",
+			"component", "playback", "session", session.ID, "file_id", file.ID, "error", err)
+		return
+	}
+	fromIndex := session.VirtualSubtitleSelectionIndex
+	if matched && published == result.SubtitleTrackIndex {
+		state.VirtualSubtitleCarryFromIndex = fromIndex
+		state.VirtualSubtitleCarryToIndex = published
+		state.VirtualSubtitleCarrySet = true
+		if !exact {
+			appendSubtitleCarryWarningV3(result.Plan)
+		}
+		return
+	}
+	if !matched && result.SubtitleTrackIndex < 0 {
+		state.VirtualSubtitleCarryLostIndex = fromIndex
+		state.VirtualSubtitleCarryLostSet = true
+		slog.InfoContext(ctx, "subtitle selection is unavailable after the candidate rotation",
+			"component", "playback", "event", "subtitle_unavailable_after_rotation",
+			"playback_session_id", session.ID,
+			"from_candidate_id", virtualResultCandidateID(session.VirtualSubtitleEvidenceURI),
+			"to_candidate_id", virtualResultCandidateID(file.FilePath),
+			"carried_index", fromIndex,
+			"carried_muxer_class", key.MuxerClass)
+	}
+}
+
+// appendSubtitleCarryWarningV3 adds the fuzzy-carry degradation warning to a
+// plan at most once. The warning is additive: playback keeps the viewer's
+// subtitle, and the client learns that the rotated release's track differs on a
+// tiebreak rather than being told the selection is gone.
+func appendSubtitleCarryWarningV3(plan *playback.PlanV3) {
+	if plan == nil {
+		return
+	}
+	for _, warning := range plan.DegradationWarnings {
+		if warning.Code == playback.DegradationWarningSubtitleCarryV3 {
+			return
+		}
+	}
+	plan.DegradationWarnings = append(plan.DegradationWarnings, playback.SubtitleCarryWarningV3())
 }
 
 func (h *PlaybackHandler) updateV3SessionState(ctx context.Context, session *playback.Session, file *models.MediaFile, result playback.PlannerResultV3, transport preparedTransportV3, mode mediaAuthModeV3) error {
@@ -7925,84 +8368,132 @@ func (h *PlaybackHandler) HandleReplanPlaybackV3(w http.ResponseWriter, r *http.
 	writeJSON(w, http.StatusOK, response)
 }
 
+// replanAnswerAuditV3 carries the facts the replan entry point needs to account
+// for an answer the decision log did not cover: the operation, the durable
+// attempt, and whether executeReplanV3 emitted the decision line. Every field
+// comes from a read the request already performs, so the answer line costs no
+// extra store round trip.
+type replanAnswerAuditV3 struct {
+	sessionID      string
+	operation      playback.ReplanOperationV3
+	record         *playback.AttemptRecordV3
+	decisionLogged bool
+	replayed       bool
+}
+
+type replanAnswerAuditContextKeyV3 struct{}
+
+func withReplanAnswerAuditV3(ctx context.Context, audit *replanAnswerAuditV3) context.Context {
+	return context.WithValue(ctx, replanAnswerAuditContextKeyV3{}, audit)
+}
+
+func markReplanDecisionLoggedV3(ctx context.Context) {
+	if audit, ok := ctx.Value(replanAnswerAuditContextKeyV3{}).(*replanAnswerAuditV3); ok && audit != nil {
+		audit.decisionLogged = true
+	}
+}
+
+// Log attribute keys and values for the replan-answered line. They are named
+// so the repeated literals stay out of the changed lines (goconst) and every
+// occurrence cannot drift from the others.
+const (
+	replanLogKeyOperationV3 = "operation"
+	replanLogKeySessionIDV3 = "session_id"
+	replanOutcomeErrorV3    = "error"
+)
+
+// logReplanAnsweredUnchangedV3 emits the one line that accounts for a replan
+// response the decision log did not cover: an idempotent replay of a committed
+// decision, a seek that resolves to the position the plan already serves, or a
+// request refused before execution. Production saw 46 of 48 replan calls answer
+// 200 with no line at all, which made a client's seek loop impossible to
+// reconstruct from server logs alone.
+func logReplanAnsweredUnchangedV3(ctx context.Context, audit *replanAnswerAuditV3, response playback.DecisionResponseV3, err error, elapsed time.Duration) {
+	if audit == nil {
+		return
+	}
+	outcome := "no_change"
+	reason := "no_decision"
+	var status int
+	switch {
+	case err != nil:
+		outcome = replanOutcomeErrorV3
+		reason = "internal_error"
+		var operationErr *PlaybackOperationError
+		if errors.As(err, &operationErr) {
+			reason = operationErr.Code
+			status = operationErr.Status
+		}
+	case response.Outcome == playback.OutcomeSeekNoMovementV3:
+		reason = string(playback.OutcomeSeekNoMovementV3)
+	case audit.replayed && response.PlaybackPlan != nil:
+		outcome = "plan"
+		reason = "idempotent_replay"
+	case audit.replayed && response.Terminal != nil:
+		outcome = "terminal"
+		reason = "idempotent_replay"
+	case response.Terminal != nil:
+		// A terminal executeReplanV3 chose but did not route through its
+		// decision line (the candidate-rotation exhaustion path).
+		outcome = "terminal"
+		reason = response.Terminal.Reason
+	case response.PlaybackPlan != nil:
+		outcome = "plan"
+		reason = "no_decision_logged"
+	}
+	decisionReason := ""
+	requestedFileID, effectiveFileID := 0, 0
+	if response.PlaybackPlan != nil {
+		decisionReason = response.PlaybackPlan.DecisionReason
+		requestedFileID = response.PlaybackPlan.RequestedMediaFileID
+		effectiveFileID = response.PlaybackPlan.EffectiveMediaFileID
+	}
+	if audit.record != nil {
+		if requestedFileID <= 0 {
+			requestedFileID = audit.record.RequestedMediaFileID
+		}
+		if effectiveFileID <= 0 {
+			effectiveFileID = audit.record.EffectiveMediaFileID
+		}
+	}
+	attrs := []any{
+		logComponentKey, playbackLogValueV3,
+		"outcome", outcome,
+		"reason", reason,
+		"decision_reason", decisionReason,
+		replanLogKeyOperationV3, string(audit.operation),
+		replanLogKeySessionIDV3, audit.sessionID,
+		"requested_file_id", requestedFileID,
+		"effective_file_id", effectiveFileID,
+		"duration_ms", elapsed.Milliseconds(),
+	}
+	if status != 0 {
+		attrs = append(attrs, "status", status)
+	}
+	slog.InfoContext(ctx, "playback replan answered unchanged", attrs...)
+}
+
 // replanPlaybackApplicationV3 is the replan application shared by the v1
 // handler and the v2 service seam: idempotent on replan_request_id + body
 // digest, serialized per session, and atomic between the durable plan and the
 // live transport. Errors are *PlaybackOperationError.
-func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID string, body []byte) (playback.DecisionResponseV3, error) {
-	userID := apimw.GetUserID(r.Context())
-	profileID := apimw.GetProfileID(r.Context())
-	if userID == 0 || profileID == "" {
-		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusUnauthorized, "unauthorized", "Authentication and profile are required")
-	}
-	var req playback.ReplanRequestV3
-	if err := json.Unmarshal(body, &req); err != nil {
-		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusBadRequest, "bad_request", "Invalid replan request")
-	}
-	// Automatic marks a server-built reconciliation replan. It is internal
-	// provenance: a client that forges it would suppress preference
-	// persistence and impersonate reconciliation, so strip whatever the
-	// client sent and let the server set it only on its own path.
-	stripClientSuppliedAutomatic(&req)
-	// Reject malformed identity/bounds before doing any session lookup. When
-	// client_features is omitted, temporarily allow the only validation rule
-	// that depends on the durable start request; the authoritative merge and a
-	// second full validation happen after the attempt is loaded below.
-	// Validate is structural only — it neither normalizes nor drops a
-	// capability — so this preflight cannot consume the un-negotiated
-	// transformations the single post-merge normalization must later report.
-	preflightReq := req
-	if preflightReq.ClientFeatures == nil {
-		preflightReq.ClientFeatures = []string{playback.FeatureClientVideoTransforms}
-	}
-	if err := preflightReq.Validate(); err != nil {
-		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusBadRequest, "bad_request", "Invalid replan request")
-	}
-	// Resolve the cheap attempt/session lookups before queueing for a replan
-	// slot. A reaped in-memory session (or an expired attempt) must surface as
-	// a fast 404 instead of waiting behind the replan capacity bound;
-	// production saw an ~11s queue wait before the session_not_found verdict.
-	// The store read is a single pooled query that releases its connection
-	// immediately and holds none of the replan locks, so it cannot invert the
-	// slot -> per-session mutex -> advisory-lock order below or starve a lock
-	// holder's inner queries. It is an early-out only: the attempt is re-read
-	// under those locks before any lease decision, and CompleteReplan's
-	// compare-and-swap remains the final authority.
-	record, err := h.PlanStoreV3.GetAttempt(r.Context(), sessionID)
-	if err != nil {
-		// A store outage must read as retryable, not as the session being
-		// gone: clients tear playback down on session_not_found.
-		if !errors.Is(err, playback.ErrSessionNotFound) {
-			return playback.DecisionResponseV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to load the playback attempt")
+//
+// Exactly one decision line is emitted per response: executeReplanV3 logs
+// "playback replan decided" for a route it actually chose, and this entry point
+// logs "playback replan answered unchanged" for everything else.
+func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID string, body []byte) (response playback.DecisionResponseV3, err error) {
+	started := time.Now()
+	audit := &replanAnswerAuditV3{sessionID: sessionID}
+	r = r.WithContext(withReplanAnswerAuditV3(r.Context(), audit))
+	defer func() {
+		if audit.decisionLogged {
+			return
 		}
-		return playback.DecisionResponseV3{}, replanSessionNotFoundV3()
-	}
-	if record.UserID != userID || record.ProfileID != profileID {
-		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusForbidden, "forbidden", "Session belongs to another profile")
-	}
-	if err := requireAttemptAPISurfaceV3(r.Context(), record, nil); err != nil {
+		logReplanAnsweredUnchangedV3(r.Context(), audit, response, err, time.Since(started))
+	}()
+	req, err := h.prepareReplanRequestV3(r, sessionID, body, audit)
+	if err != nil {
 		return playback.DecisionResponseV3{}, err
-	}
-	if record.PlaybackAttemptID != req.PlaybackAttemptID {
-		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusConflict, "stale_playback_plan", "The failed plan is no longer current")
-	}
-	// Replan feature advertisement is optional. An omitted list and an
-	// explicitly empty list both mean "unchanged"; validate transformations
-	// against the durable start-time features in either case, otherwise a valid
-	// replan can be rejected before executeReplanV3 gets the chance to perform
-	// the same merge.
-	if len(req.ClientFeatures) == 0 {
-		req.ClientFeatures = append([]string(nil), record.NormalizedRequest.ClientFeatures...)
-	}
-
-	// Attempt-sticky features negotiated on the original attempt stay pinned
-	// across every replan of that attempt.
-	req.ClientFeatures = playback.PinAttemptStickyFeaturesV3(req.ClientFeatures, record.NormalizedRequest.ClientFeatures)
-	if err := req.Validate(); err != nil {
-		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusBadRequest, "bad_request", "Invalid replan request")
-	}
-	if _, err := h.sessionMgr.GetSession(sessionID); err != nil {
-		return playback.DecisionResponseV3{}, replanSessionNotFoundV3()
 	}
 	releaseSlot, err := h.acquireReplanSlotV3(r.Context())
 	if err != nil {
@@ -8016,76 +8507,12 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to serialize the replan request")
 	}
 	defer unlockStore()
-	// Re-read the attempt now that the replan locks are held. The fast 404 above
-	// deliberately reads before queueing on the capacity bound and the
-	// per-session locks, so a duplicate request that waited behind a completing
-	// sibling still holds the pre-lock snapshot here. Without this read,
-	// BeginReplan can return the sibling's ReplanLeaseCompletedV3 and the stale
-	// record makes the handler reject the replay as stale_playback_plan instead
-	// of returning the stored response; BeginReplan/CompleteReplan would also
-	// build on a stale base revision. The post-lock read is authoritative for
-	// both, and CompleteReplan stays the final compare-and-swap.
-	record, err = h.PlanStoreV3.GetAttempt(r.Context(), sessionID)
+	record, lease, replay, err := h.reserveReplanLeaseV3(r, sessionID, body, req, audit)
 	if err != nil {
-		// Match the fast 404: a session that vanished while this request waited
-		// reads as gone, any other store failure as retryable.
-		if !errors.Is(err, playback.ErrSessionNotFound) {
-			return playback.DecisionResponseV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to load the playback attempt")
-		}
-		return playback.DecisionResponseV3{}, replanSessionNotFoundV3()
+		return playback.DecisionResponseV3{}, err
 	}
-	// The durable attempt can outlive the in-memory session: a stop or an idle
-	// reap can land while this request waits on the replan slot and the
-	// per-session locks, between the pre-lock check and here. Re-check now so it
-	// reads as the fast 404; otherwise the request would reserve a replan lease
-	// and persist executeReplanV3's session_expired as a terminal 200, which the
-	// web client does not rebuild from. CompleteReplan stays the final
-	// compare-and-swap.
-	if _, err := h.sessionMgr.GetSession(sessionID); err != nil {
-		return playback.DecisionResponseV3{}, replanSessionNotFoundV3()
-	}
-	digestBytes := sha256.Sum256(body)
-	digest := hex.EncodeToString(digestBytes[:])
-	lease, err := h.PlanStoreV3.BeginReplan(
-		r.Context(),
-		sessionID,
-		req.ReplanRequestID,
-		digest,
-		record.CurrentReplanRequestID,
-		time.Now().Add(replanLeaseDurationV3),
-	)
-	if errors.Is(err, playback.ErrIdempotencyKeyReusedV3) {
-		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusConflict, "idempotency_key_reused", "The replan request ID was reused with different input")
-	}
-	if errors.Is(err, playback.ErrStaleReplanLeaseV3) {
-		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusConflict, "stale_playback_plan", "A newer replacement plan is already active")
-	}
-	if err != nil {
-		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to reserve the replan request")
-	}
-	if lease.State == playback.ReplanLeaseInFlightV3 {
-		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusConflict, "replan_in_progress", "An identical replan is still in progress")
-	}
-	if lease.State == playback.ReplanLeaseCompletedV3 {
-		if record.CurrentReplanRequestID != req.ReplanRequestID || !completedReplanResponseMatchesAttemptV3(lease.Response, record) {
-			return playback.DecisionResponseV3{}, playbackOperationError(http.StatusConflict, "stale_playback_plan", "A newer replacement plan is already active")
-		}
-		if _, err := h.sessionMgr.GetSession(sessionID); err != nil {
-			return playback.DecisionResponseV3{}, replanSessionNotFoundV3()
-		}
-		var replay playback.DecisionResponseV3
-		if err := json.Unmarshal(lease.Response, &replay); err != nil {
-			return playback.DecisionResponseV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to decode the completed replan decision")
-		}
-		// The cached durable decision was minted for the surface that first
-		// completed it. A replay through a different surface must not re-emit
-		// v2-only contract additions (today delivery_change) on the frozen v1
-		// bridge: clear the marker on a response-local plan copy here, at the
-		// same response boundary the fresh v1 execution uses.
-		if !isNativeAPIV2(r.Context()) && replay.PlaybackPlan != nil {
-			replay.PlaybackPlan.DeliveryChange = nil
-		}
-		return replay, nil
+	if replay != nil {
+		return *replay, nil
 	}
 	leaseCompleted := false
 	defer func() {
@@ -8141,59 +8568,284 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 		if transport != nil {
 			transport.rollback()
 		}
-		// The post-lock live-session check above is an early-out only: it holds
-		// no lock across BeginReplan or executeReplanV3, so a stop or idle reap
-		// can still land before execution reads the session. Persisting that
-		// session_expired through CompleteReplan would store it as the terminal
-		// decision and answer HTTP 200 — a response the web client does not
-		// rebuild from. Translate it to the same fast 404 and leave the lease to
-		// the deferred non-terminal ReleaseReplan, so no completed 200 terminal
-		// for a dead session is ever persisted. CompleteReplan stays the final
-		// compare-and-swap for every other terminal path.
-		if replanErr.reason == "session_expired" {
-			return playback.DecisionResponseV3{}, replanSessionNotFoundV3()
-		}
-		response := playback.NewTerminalResponseV3(replanErr.reason, replanErr.message, replanErr.retryable)
-		encoded, _ := json.Marshal(response)
-		// The failed replan did not adopt the stated policy, so the terminal
-		// record must persist the policy in force before it, not the one this
-		// request tried. Restore the durable half now, before the record is
-		// copied into the terminal decision; the deferred restore covers the
-		// live half and re-applies harmlessly.
-		autoFallbackRollback.restore()
-		terminalRecord := *record
-		terminalRecord.CurrentReplanRequestID = req.ReplanRequestID
-		if err := h.PlanStoreV3.CompleteReplan(r.Context(), sessionID, req.ReplanRequestID, lease.LeaseToken, record.CurrentReplanRequestID, encoded, terminalRecord); err != nil {
-			if errors.Is(err, playback.ErrAttemptStoppedV3) {
-				// A stop landed on the attempt while this replan ran. A stop
-				// verdict persisted as a 200 terminal is a response the web
-				// client does not rebuild from, so the fast 404 is the right
-				// answer for a session-expired/stop terminal. A provider stall
-				// is not a stop verdict: the replan computed its own retryable
-				// virtual-source terminal, and answering 404 collapses that
-				// into "session gone", forcing every client to tear down and
-				// re-resume. Return the terminal the replan already produced so
-				// the retryable virtual-source signal survives the concurrent
-				// stop; the durable attempt is fenced, so nothing is persisted.
-				if virtualSourceStallTerminalV3(replanErr.reason) {
-					return response, nil
-				}
-				return playback.DecisionResponseV3{}, replanSessionNotFoundV3()
-			}
-			if errors.Is(err, playback.ErrReplanSupersededV3) {
-				return playback.DecisionResponseV3{}, playbackOperationError(http.StatusConflict, "stale_playback_plan", "A newer replacement plan is already active")
-			}
-			if isRouteCapacityUnavailableError(replanErr) {
-				return playback.DecisionResponseV3{}, playbackOperationError(http.StatusServiceUnavailable, string(noderouting.OutcomeCapacityUnavailable), "The playback route capacity is temporarily unavailable; retry shortly")
-			}
-			return playback.DecisionResponseV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to persist the terminal replan decision")
-		}
-		leaseCompleted = true
-		return response, nil
+		var persisted bool
+		response, persisted, err = h.persistReplanTerminalV3(r, sessionID, req, record, lease, replanErr, autoFallbackRollback)
+		leaseCompleted = persisted
+		return response, err
 	}
 
+	var committed bool
+	response, committed, err = h.commitReplanApplicationV3(r, sessionID, req, record, lease, response, updated, transport)
+	leaseCompleted = committed
+	autoFallbackCommitted = committed
+	return response, err
+}
+
+// prepareReplanRequestV3 validates a replan body and loads the attempt before
+// the handler queues on the replan capacity bound and per-session locks. Both
+// the preflight and the attempt read are early-outs: the attempt is re-read
+// under the locks and CompleteReplan's compare-and-swap stays the final
+// authority.
+func (h *PlaybackHandler) prepareReplanRequestV3(r *http.Request, sessionID string, body []byte, audit *replanAnswerAuditV3) (playback.ReplanRequestV3, error) {
+	userID := apimw.GetUserID(r.Context())
+	profileID := apimw.GetProfileID(r.Context())
+	if userID == 0 || profileID == "" {
+		return playback.ReplanRequestV3{}, playbackOperationError(http.StatusUnauthorized, "unauthorized", "Authentication and profile are required")
+	}
+	var req playback.ReplanRequestV3
+	if err := json.Unmarshal(body, &req); err != nil {
+		return playback.ReplanRequestV3{}, playbackOperationError(http.StatusBadRequest, "bad_request", "Invalid replan request")
+	}
+	audit.operation = req.EffectiveOperation()
+	// Automatic marks a server-built reconciliation replan. It is internal
+	// provenance: a client that forges it would suppress preference
+	// persistence and impersonate reconciliation, so strip whatever the
+	// client sent and let the server set it only on its own path.
+	stripClientSuppliedAutomatic(&req)
+	// Reject malformed identity/bounds before doing any session lookup. When
+	// client_features is omitted, temporarily allow the only validation rule
+	// that depends on the durable start request; the authoritative merge and a
+	// second full validation happen after the attempt is loaded below.
+	// Validate is structural only — it neither normalizes nor drops a
+	// capability — so this preflight cannot consume the un-negotiated
+	// transformations the single post-merge normalization must later report.
+	preflightReq := req
+	if preflightReq.ClientFeatures == nil {
+		preflightReq.ClientFeatures = []string{playback.FeatureClientVideoTransforms}
+	}
+	if err := preflightReq.Validate(); err != nil {
+		return playback.ReplanRequestV3{}, playbackOperationError(http.StatusBadRequest, "bad_request", "Invalid replan request")
+	}
+	// Resolve the cheap attempt/session lookups before queueing for a replan
+	// slot. A reaped in-memory session (or an expired attempt) must surface as
+	// a fast 404 instead of waiting behind the replan capacity bound;
+	// production saw an ~11s queue wait before the session_not_found verdict.
+	// The store read is a single pooled query that releases its connection
+	// immediately and holds none of the replan locks, so it cannot invert the
+	// slot -> per-session mutex -> advisory-lock order below or starve a lock
+	// holder's inner queries.
+	record, err := h.PlanStoreV3.GetAttempt(r.Context(), sessionID)
+	if err != nil {
+		// A store outage must read as retryable, not as the session being
+		// gone: clients tear playback down on session_not_found.
+		if !errors.Is(err, playback.ErrSessionNotFound) {
+			return playback.ReplanRequestV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to load the playback attempt")
+		}
+		return playback.ReplanRequestV3{}, replanSessionNotFoundV3()
+	}
+	audit.record = record
+	if record.UserID != userID || record.ProfileID != profileID {
+		return playback.ReplanRequestV3{}, playbackOperationError(http.StatusForbidden, "forbidden", "Session belongs to another profile")
+	}
+	if err := requireAttemptAPISurfaceV3(r.Context(), record, nil); err != nil {
+		return playback.ReplanRequestV3{}, err
+	}
+	if record.PlaybackAttemptID != req.PlaybackAttemptID {
+		return playback.ReplanRequestV3{}, playbackOperationError(http.StatusConflict, "stale_playback_plan", "The failed plan is no longer current")
+	}
+	// Replan feature advertisement is optional. An omitted list and an
+	// explicitly empty list both mean "unchanged"; validate transformations
+	// against the durable start-time features in either case, otherwise a valid
+	// replan can be rejected before executeReplanV3 gets the chance to perform
+	// the same merge.
+	if len(req.ClientFeatures) == 0 {
+		req.ClientFeatures = append([]string(nil), record.NormalizedRequest.ClientFeatures...)
+	}
+
+	// Attempt-sticky features negotiated on the original attempt stay pinned
+	// across every replan of that attempt.
+	req.ClientFeatures = playback.PinAttemptStickyFeaturesV3(req.ClientFeatures, record.NormalizedRequest.ClientFeatures)
+	if err := req.Validate(); err != nil {
+		return playback.ReplanRequestV3{}, playbackOperationError(http.StatusBadRequest, "bad_request", "Invalid replan request")
+	}
+	if _, err := h.sessionMgr.GetSession(sessionID); err != nil {
+		return playback.ReplanRequestV3{}, replanSessionNotFoundV3()
+	}
+	return req, nil
+}
+
+// reserveReplanLeaseV3 re-reads the attempt under the replan locks and reserves
+// the request's lease. A non-nil replay response means the request repeats a
+// completed replan, which answers with the stored decision instead of
+// executing again.
+func (h *PlaybackHandler) reserveReplanLeaseV3(r *http.Request, sessionID string, body []byte, req playback.ReplanRequestV3, audit *replanAnswerAuditV3) (*playback.AttemptRecordV3, playback.ReplanLeaseV3, *playback.DecisionResponseV3, error) {
+	// Re-read the attempt now that the replan locks are held. The fast 404 in
+	// prepareReplanRequestV3 deliberately reads before queueing on the capacity
+	// bound and the per-session locks, so a duplicate request that waited
+	// behind a completing sibling still holds the pre-lock snapshot here.
+	// Without this read, BeginReplan can return the sibling's
+	// ReplanLeaseCompletedV3 and the stale record makes the handler reject the
+	// replay as stale_playback_plan instead of returning the stored response;
+	// BeginReplan/CompleteReplan would also build on a stale base revision. The
+	// post-lock read is authoritative for both, and CompleteReplan stays the
+	// final compare-and-swap.
+	record, err := h.PlanStoreV3.GetAttempt(r.Context(), sessionID)
+	if err != nil {
+		// Match the fast 404: a session that vanished while this request waited
+		// reads as gone, any other store failure as retryable.
+		if !errors.Is(err, playback.ErrSessionNotFound) {
+			return nil, playback.ReplanLeaseV3{}, nil, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to load the playback attempt")
+		}
+		return nil, playback.ReplanLeaseV3{}, nil, replanSessionNotFoundV3()
+	}
+	audit.record = record
+	// The durable attempt can outlive the in-memory session: a stop or an idle
+	// reap can land while this request waits on the replan slot and the
+	// per-session locks, between the pre-lock check and here. Re-check now so it
+	// reads as the fast 404; otherwise the request would reserve a replan lease
+	// and persist executeReplanV3's session_expired as a terminal 200, which the
+	// web client does not rebuild from. CompleteReplan stays the final
+	// compare-and-swap.
+	if _, err := h.sessionMgr.GetSession(sessionID); err != nil {
+		return nil, playback.ReplanLeaseV3{}, nil, replanSessionNotFoundV3()
+	}
+	digestBytes := sha256.Sum256(body)
+	digest := hex.EncodeToString(digestBytes[:])
+	lease, err := h.PlanStoreV3.BeginReplan(
+		r.Context(),
+		sessionID,
+		req.ReplanRequestID,
+		digest,
+		record.CurrentReplanRequestID,
+		time.Now().Add(replanLeaseDurationV3),
+	)
+	if errors.Is(err, playback.ErrIdempotencyKeyReusedV3) {
+		return nil, playback.ReplanLeaseV3{}, nil, playbackOperationError(http.StatusConflict, "idempotency_key_reused", "The replan request ID was reused with different input")
+	}
+	if errors.Is(err, playback.ErrStaleReplanLeaseV3) {
+		return nil, playback.ReplanLeaseV3{}, nil, playbackOperationError(http.StatusConflict, "stale_playback_plan", "A newer replacement plan is already active")
+	}
+	if err != nil {
+		return nil, playback.ReplanLeaseV3{}, nil, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to reserve the replan request")
+	}
+	if lease.State == playback.ReplanLeaseInFlightV3 {
+		return nil, playback.ReplanLeaseV3{}, nil, playbackOperationError(http.StatusConflict, "replan_in_progress", "An identical replan is still in progress")
+	}
+	if lease.State != playback.ReplanLeaseCompletedV3 {
+		return record, lease, nil, nil
+	}
+	if record.CurrentReplanRequestID != req.ReplanRequestID || !completedReplanResponseMatchesAttemptV3(lease.Response, record) {
+		return nil, playback.ReplanLeaseV3{}, nil, playbackOperationError(http.StatusConflict, "stale_playback_plan", "A newer replacement plan is already active")
+	}
+	if _, err := h.sessionMgr.GetSession(sessionID); err != nil {
+		return nil, playback.ReplanLeaseV3{}, nil, replanSessionNotFoundV3()
+	}
+	var replay playback.DecisionResponseV3
+	if err := json.Unmarshal(lease.Response, &replay); err != nil {
+		return nil, playback.ReplanLeaseV3{}, nil, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to decode the completed replan decision")
+	}
+	// The cached durable decision was minted for the surface that first
+	// completed it. A replay through a different surface must not re-emit
+	// v2-only contract additions (today delivery_change) on the frozen v1
+	// bridge: clear the marker on a response-local plan copy here, at the same
+	// response boundary the fresh v1 execution uses.
+	if !isNativeAPIV2(r.Context()) && replay.PlaybackPlan != nil {
+		replay.PlaybackPlan.DeliveryChange = nil
+	}
+	audit.replayed = true
+	return record, lease, &replay, nil
+}
+
+// persistReplanTerminalV3 records the terminal decision executeReplanV3
+// produced and answers it. A session that died mid-execution reads as the fast
+// 404 instead, and an attempt a concurrent stop fenced keeps the replan's own
+// retryable virtual-source terminal. The returned bool reports whether the
+// lease was completed, so the caller's deferred release stays off.
+func (h *PlaybackHandler) persistReplanTerminalV3(
+	r *http.Request,
+	sessionID string,
+	req playback.ReplanRequestV3,
+	record *playback.AttemptRecordV3,
+	lease playback.ReplanLeaseV3,
+	replanErr *transportErrorV3,
+	autoFallbackRollback autoFallbackRollbackV3,
+) (playback.DecisionResponseV3, bool, error) {
+	// The caller's post-lock live-session check is an early-out only: it holds
+	// no lock across BeginReplan or executeReplanV3, so a stop or idle reap can
+	// still land before execution reads the session. Persisting that
+	// session_expired through CompleteReplan would store it as the terminal
+	// decision and answer HTTP 200 — a response the web client does not rebuild
+	// from. Translate it to the same fast 404 and leave the lease to the
+	// deferred non-terminal ReleaseReplan, so no completed 200 terminal for a
+	// dead session is ever persisted. CompleteReplan stays the final
+	// compare-and-swap for every other terminal path.
+	if replanErr.reason == "session_expired" {
+		return playback.DecisionResponseV3{}, false, replanSessionNotFoundV3()
+	}
+	response := playback.NewTerminalResponseV3(replanErr.reason, replanErr.message, replanErr.retryable)
+	encoded := marshalReplanDecisionV3(response)
+	// The failed replan did not adopt the stated policy, so the terminal record
+	// must persist the policy in force before it, not the one this request
+	// tried. Restore the durable half now, before the record is copied into the
+	// terminal decision; the deferred restore covers the live half and
+	// re-applies harmlessly.
+	autoFallbackRollback.restore()
+	terminalRecord := *record
+	terminalRecord.CurrentReplanRequestID = req.ReplanRequestID
+	if err := h.PlanStoreV3.CompleteReplan(r.Context(), sessionID, req.ReplanRequestID, lease.LeaseToken, record.CurrentReplanRequestID, encoded, terminalRecord); err != nil {
+		// A stop landed on the attempt while this replan ran. A stop verdict
+		// persisted as a 200 terminal is a response the web client does not
+		// rebuild from, so the fast 404 is the right answer for a
+		// session-expired/stop terminal. A provider stall is not a stop
+		// verdict: the replan computed its own retryable virtual-source
+		// terminal, and answering 404 collapses that into "session gone",
+		// forcing every client to tear down and re-resume. Return the terminal
+		// the replan already produced so the retryable virtual-source signal
+		// survives the concurrent stop; the durable attempt is fenced, so
+		// nothing is persisted.
+		if errors.Is(err, playback.ErrAttemptStoppedV3) && virtualSourceStallTerminalV3(replanErr.reason) {
+			return response, false, nil
+		}
+		return playback.DecisionResponseV3{}, false, replanTerminalPersistErrorV3(err, replanErr)
+	}
+	return response, true, nil
+}
+
+// replanTerminalPersistErrorV3 maps a failed terminal CompleteReplan to the
+// client answer: a concurrent stop reads as the fast 404, and route-capacity
+// exhaustion stays retryable rather than collapsing into an internal error.
+func replanTerminalPersistErrorV3(completeErr error, replanErr *transportErrorV3) error {
+	switch {
+	case errors.Is(completeErr, playback.ErrAttemptStoppedV3):
+		return replanSessionNotFoundV3()
+	case errors.Is(completeErr, playback.ErrReplanSupersededV3):
+		return playbackOperationError(http.StatusConflict, "stale_playback_plan", "A newer replacement plan is already active")
+	case isRouteCapacityUnavailableError(replanErr):
+		return playbackOperationError(http.StatusServiceUnavailable, string(noderouting.OutcomeCapacityUnavailable), "The playback route capacity is temporarily unavailable; retry shortly")
+	default:
+		return playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to persist the terminal replan decision")
+	}
+}
+
+// marshalReplanDecisionV3 encodes a replan decision for the durable store. The
+// decision carries float64 timeline fields, so the encoder can refuse a
+// non-finite value; the caller keeps persisting the empty body it did before
+// this helper existed rather than inventing a different terminal.
+func marshalReplanDecisionV3(response playback.DecisionResponseV3) []byte {
+	encoded, err := json.Marshal(response)
+	if err != nil {
+		return nil
+	}
+	return encoded
+}
+
+// commitReplanApplicationV3 makes a computed replacement durable and installs
+// it on the live transport. The returned bool reports whether the durable plan
+// committed: the caller then keeps the speculative version-fallback policy and
+// skips the deferred lease release, even when the later transport commit fails
+// and aborts the live session.
+func (h *PlaybackHandler) commitReplanApplicationV3(
+	r *http.Request,
+	sessionID string,
+	req playback.ReplanRequestV3,
+	record *playback.AttemptRecordV3,
+	lease playback.ReplanLeaseV3,
+	response playback.DecisionResponseV3,
+	updated playback.AttemptRecordV3,
+	transport *preparedTransportV3,
+) (playback.DecisionResponseV3, bool, error) {
 	updated.CurrentReplanRequestID = req.ReplanRequestID
-	encoded, _ := json.Marshal(response)
+	encoded := marshalReplanDecisionV3(response)
 	var rollbackSession func() error
 	if transport != nil && transport.applySession != nil {
 		var err error
@@ -8203,12 +8855,12 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 			rollbackErr, _ := rollbackFailedReplanV3(transport, nil)
 			if rollbackErr != nil {
 				slog.ErrorContext(r.Context(), "protocol v3 unapplied replacement transport cancellation failed", "session", sessionID, "error", rollbackErr)
-				return playback.DecisionResponseV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to cancel the unapplied replacement transport")
+				return playback.DecisionResponseV3{}, false, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to cancel the unapplied replacement transport")
 			}
 			if isRouteCapacityUnavailableError(err) {
-				return playback.DecisionResponseV3{}, playbackOperationError(http.StatusServiceUnavailable, string(noderouting.OutcomeCapacityUnavailable), "The playback route capacity is temporarily unavailable; retry shortly")
+				return playback.DecisionResponseV3{}, false, playbackOperationError(http.StatusServiceUnavailable, string(noderouting.OutcomeCapacityUnavailable), "The playback route capacity is temporarily unavailable; retry shortly")
 			}
-			return playback.DecisionResponseV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to commit the live replacement session")
+			return playback.DecisionResponseV3{}, false, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to commit the live replacement session")
 		}
 	}
 	if err := h.PlanStoreV3.CompleteReplan(r.Context(), sessionID, req.ReplanRequestID, lease.LeaseToken, record.CurrentReplanRequestID, encoded, updated); err != nil {
@@ -8222,35 +8874,33 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 				slog.ErrorContext(r.Context(), "protocol v3 replacement transport cancellation failed", "session", sessionID, "error", transportRollbackErr)
 			}
 			_ = h.abortPlaybackSessionByID(context.WithoutCancel(r.Context()), sessionID)
-			return playback.DecisionResponseV3{}, replanSessionNotFoundV3()
+			return playback.DecisionResponseV3{}, false, replanSessionNotFoundV3()
 		}
 		transportRollbackErr, sessionRollbackErr := rollbackFailedReplanV3(transport, rollbackSession)
 		if transportRollbackErr != nil {
 			slog.ErrorContext(r.Context(), "protocol v3 replacement transport cancellation failed", "session", sessionID, "error", transportRollbackErr)
-			return playback.DecisionResponseV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to cancel the replacement transport")
+			return playback.DecisionResponseV3{}, false, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to cancel the replacement transport")
 		}
 		if sessionRollbackErr != nil {
 			slog.ErrorContext(r.Context(), "protocol v3 replacement rollback failed", "session", sessionID, "error", sessionRollbackErr)
 			_ = h.stopPlaybackSessionByID(context.WithoutCancel(r.Context()), sessionID, false)
 		}
 		if errors.Is(err, playback.ErrReplanSupersededV3) {
-			return playback.DecisionResponseV3{}, playbackOperationError(http.StatusConflict, "stale_playback_plan", "A newer replacement plan is already active")
+			return playback.DecisionResponseV3{}, false, playbackOperationError(http.StatusConflict, "stale_playback_plan", "A newer replacement plan is already active")
 		}
 		if isRouteCapacityUnavailableError(err) {
-			return playback.DecisionResponseV3{}, playbackOperationError(http.StatusServiceUnavailable, string(noderouting.OutcomeCapacityUnavailable), "The playback route capacity is temporarily unavailable; retry shortly")
+			return playback.DecisionResponseV3{}, false, playbackOperationError(http.StatusServiceUnavailable, string(noderouting.OutcomeCapacityUnavailable), "The playback route capacity is temporarily unavailable; retry shortly")
 		}
-		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to commit the replacement plan")
+		return playback.DecisionResponseV3{}, false, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to commit the replacement plan")
 	}
-	leaseCompleted = true
 	// The replacement plan is durable, so the speculative policy application is
 	// now the adopted policy: live and durable agree and the deferred rollback
 	// must not undo it. A later transport commit failure aborts the live session
 	// without reverting the durable plan.
-	autoFallbackCommitted = true
 	if transport != nil {
 		if commitErr := transport.commit(); commitErr != nil {
 			_ = h.abortPlaybackSessionByID(context.WithoutCancel(r.Context()), sessionID)
-			return playback.DecisionResponseV3{}, playbackOperationError(http.StatusServiceUnavailable, commitErr.reason, commitErr.message)
+			return playback.DecisionResponseV3{}, true, playbackOperationError(http.StatusServiceUnavailable, commitErr.reason, commitErr.message)
 		}
 		h.recordSessionRecipeV3(r.Context(), updated.CurrentPlanID, transport)
 		if transport.afterDurableCommit != nil {
@@ -8258,7 +8908,7 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 		}
 	}
 	h.raceCopySafetyV3(updated.EffectiveMediaFileID, response.PlaybackPlan)
-	return response, nil
+	return response, true, nil
 }
 
 // replanSessionNotFoundV3 is the v1 playback_session_not_found body; the v2
@@ -8416,6 +9066,32 @@ func candidateSubtitleLocalFailureV3(err *candidateErrorV3) bool {
 		return true
 	}
 	return err.Stage == candidateStageSubtitleArtifact
+}
+
+// virtualReplanRotationExhaustedV3 reports whether a failed virtual replan
+// rehydration has already proved that no provider candidate can serve the
+// session's release. The rotation retry marks its own failure, and a
+// provider-wide outage or a candidate walk that produced no usable stream
+// carries the same meaning. A release verdict (an absent pin, a marked-failed
+// candidate) is deliberately not exhaustion: rotation may have found a
+// genuinely different release and refused to substitute it, which leaves the
+// sibling-edition walk as the correct recovery for an auto selection.
+func virtualReplanRotationExhaustedV3(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, errVirtualRotationExhaustedV3) {
+		return true
+	}
+	if errors.Is(err, resolver.ErrProviderUnavailable) {
+		return true
+	}
+	if isVirtualCandidateDeadError(err) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "no streams available from provider") ||
+		strings.Contains(msg, "provider unavailable")
 }
 
 func classifyVirtualReplanExhaustionV3(initialVirtualErr error, candidateErrs []*candidateErrorV3) *transportErrorV3 {
@@ -8623,8 +9299,8 @@ func (h *PlaybackHandler) evaluatePreparedReplanCandidateV3(
 	// the loaded candidate row may have been re-probed in place (same id,
 	// different release), in which case source==target by id but the ordinal
 	// still names the previous release's track.
-	remapSource := h.replanRemapSourceV3(sourceFile, session)
-	if err := remapAudioSelectionV3(remapSource, candidateFile, &candidateStart); err != nil {
+	remapCarry := h.replanRemapSourceV3(r.Context(), sourceFile, session, replanDurableInventoryV3(record))
+	if err := remapAudioSelectionV3(remapCarry.file, candidateFile, &candidateStart); err != nil {
 		return nil, &candidateErrorV3{Stage: candidateStageAudioRemap, Message: fmt.Sprintf("candidate %d audio remap failed", candidateFile.ID), Err: err}
 	}
 	candidateAudioIndex, _, err := resolveV3AudioIndex(candidateFile, candidateStart.AudioTrackID, candidateStart.AudioTrackIndex)
@@ -8640,11 +9316,11 @@ func (h *PlaybackHandler) evaluatePreparedReplanCandidateV3(
 	// non-virtual files, where a stable row id means a stable release;
 	// virtual rows rotate releases under a fixed id, so they keep the
 	// evidence-anchored remap above.
-	subtitleRemapSource := remapSource
+	subtitleRemapCarry := remapCarry
 	if selFileID, selKind, _, selOK := playback.ParseTrackIDV3(candidateStart.SubtitleTrackID); selOK && selKind == subtitleTrackKindV3 && selFileID == candidateFile.ID && !isVirtualPlaybackFile(candidateFile) {
-		subtitleRemapSource = candidateFile
+		subtitleRemapCarry = carriedInventorySourceV3{file: candidateFile}
 	}
-	if _, err := h.remapSubtitleSelectionV3(r.Context(), subtitleRemapSource, candidateFile, &candidateStart); err != nil {
+	if _, err := h.remapSubtitleSelectionWithCarryV3(r.Context(), subtitleRemapCarry, candidateFile, &candidateStart); err != nil {
 		candidateResult = playback.PlannerResultV3{Terminal: &playback.TerminalV3{
 			Reason:    terminalSubtitleUnavailableInVersionV3,
 			Message:   "The selected subtitle track is unavailable in the fallback media version.",
@@ -9066,6 +9742,15 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	start := record.NormalizedRequest
 	operation := req.EffectiveOperation()
 	seekReanchor := operation == playback.ReplanOperationSeekReanchorV3
+	// seekNoMovement marks a frozen seek that resolves to the timeline the plan
+	// and the live session already serve. It suppresses the decision line so the
+	// entry point can answer it as an unchanged replan instead.
+	seekNoMovement := false
+	// seekSubtitleDegraded marks a seek reanchor whose carried subtitle no
+	// longer binds to the effective file. The seek still moves: a requested
+	// position outranks subtitle fidelity, so the replan drops the selection
+	// once and keeps video and audio intact.
+	seekSubtitleDegraded := false
 	seekFailureRecovery := operation == playback.ReplanOperationSeekFailureRecoveryV3
 	seekScopedRecovery := seekReanchor || seekFailureRecovery
 	// A seek reanchor must keep its route; every other replan first finds out
@@ -9726,6 +10411,15 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			reason: "replan_virtual_input_timeout", message: "Virtual stream input resolution was interrupted during replan.", retryable: true, cause: virtualRehydrationErr,
 		}
 	}
+	// The virtual resolver has already walked every provider candidate for this
+	// release (and its stale-source fallback) without a usable source, or the
+	// provider itself is down. The sibling-edition walk below would resolve each
+	// alternate through the same provider, so it can only re-pay the resolve and
+	// probe budgets before reaching this verdict again. Answer with the same
+	// classified terminal now; only the time to reach it changes.
+	if virtualRehydrationFailed && !virtualDecodeRotation && virtualReplanRotationExhaustedV3(virtualRehydrationErr) {
+		return playback.DecisionResponseV3{}, *record, nil, classifyVirtualReplanExhaustionV3(virtualRehydrationErr, nil)
+	}
 
 	var result playback.PlannerResultV3
 	var toneMapCapabilityErr error
@@ -9768,6 +10462,10 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	// drop anything still naming another file. A plan that plays on without
 	// the viewer's subtitle reports it instead of going quiet.
 	detourDroppedSubtitle := false
+	// driftSubtitleUnavailable remembers a selection the active row itself lost
+	// when it was re-probed in place. There is no fallback version holding it,
+	// so the drop is reported unconditionally.
+	driftSubtitleUnavailable := false
 	// reportDetourSubtitleDrop appends the dropped-subtitle warning when
 	// a speculative detour cost the viewer a selection no played version
 	// honors. It runs on the final plan, so a fallback that keeps the
@@ -9882,11 +10580,23 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	} else {
 		effectiveFile = currentEffectiveFile
 		// A replan's carried selection was minted against the plan-time
-		// inventory, which the session still holds as virtual evidence. When
-		// the catalog row was re-probed in place (same id, different release)
-		// the freshly loaded effective file's tracks no longer describe what
-		// the ordinal names, so remap from the evidence rather than the row.
-		remapSource := h.replanRemapSourceV3(currentEffectiveFile, session)
+		// inventory. The plan being replanned is the strongest evidence (the
+		// request names that exact attempt); otherwise a virtual session's
+		// captured evidence stands in. When the catalog row was re-probed in
+		// place (same id, different release) the freshly loaded effective
+		// file's tracks no longer describe what the ordinal names, so remap
+		// from the evidence rather than the row.
+		durableInventory := replanDurableInventoryV3(record)
+		remapCarry := h.replanRemapSourceV3(r.Context(), currentEffectiveFile, session, durableInventory)
+		remapSource := remapCarry.file
+		// A track_change replaces the seeded selection with the viewer's choice
+		// from the current menu, so its ordinals already address the live
+		// inventory. Every other replan carries the plan-time ordinal and relies
+		// on the drift remap below to reconcile it into the effective row's
+		// inventory. Track both so the re-key step applies predecessor inventory
+		// to a carried ordinal exactly once, never to a fresh or already
+		// reconciled one.
+		subtitleSelectionCurrent := trackChange
 		currentEffectiveStart := start
 		if intentChange && !trackChange {
 			// Prefer returning to the requested edition, but a quality/output/track
@@ -9897,55 +10607,193 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			if !isVirtualPlaybackFile(currentEffectiveFile) && requestedEditionResolved && preflightPlaybackFile(r.Context(), requestedFile, h.MissingMarker, h.EventsHub) == nil {
 				effectiveFile = requestedFile
 			}
-			// Track identities only need remapping when the effective inventory
-			// actually changes. Remapping within an unchanged inventory would
-			// degrade an exact selection to a best-match lookup — e.g. moving a
-			// listener from an eng/ac3 commentary track to the identically-shaped
-			// main track on a quality change. A same-row candidate rotation keeps
-			// the id but replaces the tracks, so the guard is the union of an id
-			// change (a real edition switch, which always remaps), an inventory
-			// fingerprint change under a fixed id, and a recorded candidate
-			// rotation (a moved revision) whose tracks happen to compare equal.
-			if currentEffectiveFile.ID != effectiveFile.ID ||
-				!sameMediaInventoryV3(remapSource, effectiveFile) ||
-				virtualCandidateRotationRecordedV3(r.Context(), session, currentEffectiveFile, h.fileResolver) {
-				candidateStart := start
-				remapErr := remapAudioSelectionV3(remapSource, effectiveFile, &candidateStart)
-				if remapErr == nil && (candidateStart.SubtitleTrackIndex != nil || candidateStart.SubtitleTrackID != "") {
-					_, remapErr = h.remapSubtitleSelectionV3(r.Context(), remapSource, effectiveFile, &candidateStart)
+		}
+		// Track identities only need remapping when the effective inventory
+		// actually changes. Remapping within an unchanged inventory would
+		// degrade an exact selection to a best-match lookup — e.g. moving a
+		// listener from an eng/ac3 commentary track to the identically-shaped
+		// main track on a quality change. A same-row candidate rotation keeps
+		// the id but replaces the tracks, so the guard is the union of an id
+		// change (a real edition switch, which always remaps), an inventory
+		// fingerprint change under a fixed id, and a recorded candidate
+		// rotation (a moved revision) whose tracks happen to compare equal.
+		//
+		// The fingerprint and rotation guard run for every replan that keeps
+		// the carried selection, not only an intent change: a seek-only or
+		// recovery replan after an in-place rotation was reusing its ordinal
+		// positionally. A track change is excluded because the client's new
+		// selection was made against the current inventory, not the plan-time
+		// one.
+		// A recorded candidate rotation is the one case where the carried
+		// subtitle ordinal must be re-identified with the strict release matcher
+		// at the commit, not with the generic edition-switch remap below. The
+		// verdict travels with the request so the stream-state commit can record
+		// the new position and answer pre-rotation subtitle URLs.
+		rotationRecorded := !trackChange && virtualCandidateRotationRecordedV3(r.Context(), session, currentEffectiveFile, h.fileResolver)
+		subtitleRotationCarry := subtitleRotationOutcomeV3{}
+		// The carried ordinal was minted against the durable plan inventory when
+		// this replica has it; otherwise the session's retained evidence (with
+		// the downloaded tail recovered from its attempt plan) is the authority.
+		// The live row speaks only when neither exists, which a recorded rotation
+		// never allows.
+		rotationCarryID := currentEffectiveFile.ID
+		if _, durableKnown := durableInventory[rotationCarryID]; !durableKnown && session != nil && session.VirtualSubtitleEvidenceFileID > 0 {
+			rotationCarryID = session.VirtualSubtitleEvidenceFileID
+		}
+		rotationCarry := h.rekeySourceFileWithInventoryV3(r.Context(), rotationCarryID, session, durableInventory)
+		if !trackChange && (intentChange && currentEffectiveFile.ID != effectiveFile.ID ||
+			!sameMediaInventoryV3(remapSource, effectiveFile) ||
+			rotationRecorded) {
+			candidateStart := start
+			remapErr := remapAudioSelectionV3(remapSource, effectiveFile, &candidateStart)
+			subtitleReconciled := false
+			// carrySubtitleSelectionV3 reconciles the carried ordinal against the
+			// candidate this attempt will serve. It returns the outcome so the
+			// commit can record it; a fuzzy match keeps the selection and reports
+			// one warning, a miss is reported through the existing unavailable
+			// sentinel and degrade paths.
+			carrySubtitleSelectionV3 := func(target *models.MediaFile, request *playback.StartRequestV3) (bool, error) {
+				from, to, exact, matched, attempted, carryErr := h.reconcileRotationSubtitleSelectionV3(r.Context(), session, rotationCarry, target, request)
+				if !attempted {
+					// The ordinal does not classify against the evidence (a
+					// captured-empty inventory, or a downloaded ordinal without
+					// its captured tail). Leave it to the historical remap,
+					// whose captured-empty and no-tail rules already fail closed.
+					return false, nil
 				}
-				if remapErr != nil && outputChange {
-					// An output refresh may make the requested edition viable again,
-					// but it must not retire a healthy active alternate merely because
-					// the viewer selected a track unique to that alternate.
-					outputChangeKeptActiveForSubtitle = requestedFile != nil && requestedFile.ID != currentEffectiveFile.ID
-					effectiveFile = currentEffectiveFile
-				} else if errors.Is(remapErr, errSubtitleUnavailableInTargetV3) {
-					// The target edition has no equivalent track. Playability wins:
-					// plan it with subtitles off instead of terminalling. The
-					// cleared selection is scoped to this speculative detour:
-					// start keeps the carried selection (with the remapped
-					// audio) so a failed detour falls back with the viewer's
-					// pick intact instead of losing it to a version that was
-					// never going to play; the detour plan itself degrades the
-					// stale selection gracefully through the subtitle policy.
-					// Remember the drop for the warning below.
+				subtitleRotationCarry = subtitleRotationOutcomeV3{
+					Recorded:         true,
+					FromIndex:        from,
+					ToIndex:          to,
+					Matched:          matched,
+					Exact:            exact,
+					ToFileID:         target.ID,
+					ToCandidateURI:   strings.TrimSpace(target.FilePath),
+					FromCandidateURI: strings.TrimSpace(session.VirtualSubtitleEvidenceURI),
+				}
+				if carryErr != nil {
+					return true, carryErr
+				}
+				if matched {
+					return true, nil
+				}
+				slog.InfoContext(r.Context(), "subtitle selection is unavailable after the candidate rotation",
+					"component", "playback", "event", "subtitle_unavailable_after_rotation",
+					"playback_session_id", session.ID,
+					"from_candidate_id", virtualResultCandidateID(session.VirtualSubtitleEvidenceURI),
+					"to_candidate_id", virtualResultCandidateID(target.FilePath),
+					"carried_index", from)
+				return true, errSubtitleUnavailableInTargetV3
+			}
+			if remapErr == nil && (candidateStart.SubtitleTrackIndex != nil || candidateStart.SubtitleTrackID != "") {
+				// The same-inventory fast path still runs first: when the rotated
+				// release publishes exactly the evidence layout, the carried
+				// ordinal already names the same position and no identity carry
+				// (which could fail closed on an otherwise harmless duplicate) is
+				// needed. Only a genuinely different inventory is re-identified
+				// with the strict rotation matcher.
+				if rotationRecorded && (remapCarry.file == nil || !sameSubtitleInventoryV3(remapCarry.file, effectiveFile)) {
+					attempted, carryErr := carrySubtitleSelectionV3(effectiveFile, &candidateStart)
+					if attempted {
+						remapErr = carryErr
+					} else {
+						_, remapErr = h.remapSubtitleSelectionWithCarryV3(r.Context(), remapCarry, effectiveFile, &candidateStart)
+					}
+					// A successful carry leaves the ordinal addressing the
+					// effective row's current inventory; the re-key step below must
+					// not read it through the plan-time tail a second time.
+					subtitleReconciled = remapErr == nil
+				} else {
+					_, remapErr = h.remapSubtitleSelectionWithCarryV3(r.Context(), remapCarry, effectiveFile, &candidateStart)
+					subtitleReconciled = remapErr == nil
+				}
+			}
+			if remapErr != nil && outputChange {
+				// An output refresh may make the requested edition viable again,
+				// but it must not retire a healthy active alternate merely because
+				// the viewer selected a track unique to that alternate.
+				outputChangeKeptActiveForSubtitle = requestedFile != nil && requestedFile.ID != currentEffectiveFile.ID
+				effectiveFile = currentEffectiveFile
+				// The row being kept is not necessarily the inventory the carried
+				// ordinal was minted against: an in-place re-probe replaces its
+				// tracks under the same id. Re-check the selection against the row
+				// actually kept, or the fallback would play whatever now occupies
+				// the old ordinal.
+				if !trackChange && (!sameMediaInventoryV3(remapSource, effectiveFile) || rotationRecorded) {
+					fallbackStart := start
+					fallbackErr := remapAudioSelectionV3(remapSource, effectiveFile, &fallbackStart)
+					fallbackSubtitleReconciled := false
+					if fallbackErr == nil && (fallbackStart.SubtitleTrackIndex != nil || fallbackStart.SubtitleTrackID != "") {
+						if rotationRecorded && (remapCarry.file == nil || !sameSubtitleInventoryV3(remapCarry.file, effectiveFile)) {
+							if attempted, carryErr := carrySubtitleSelectionV3(effectiveFile, &fallbackStart); attempted {
+								fallbackErr = carryErr
+							} else {
+								_, fallbackErr = h.remapSubtitleSelectionWithCarryV3(r.Context(), remapCarry, effectiveFile, &fallbackStart)
+							}
+						} else {
+							_, fallbackErr = h.remapSubtitleSelectionWithCarryV3(r.Context(), remapCarry, effectiveFile, &fallbackStart)
+						}
+						fallbackSubtitleReconciled = fallbackErr == nil
+					}
+					switch {
+					case fallbackErr == nil:
+						start = fallbackStart
+						subtitleSelectionCurrent = fallbackSubtitleReconciled
+					case errors.Is(fallbackErr, errSubtitleUnavailableInTargetV3):
+						// The kept row lost the selected subtitle in the same
+						// reprobe. Clearing both fields keeps the fallback off
+						// that ordinal and reports the loss below.
+						fallbackStart.SubtitleTrackIndex = nil
+						fallbackStart.SubtitleTrackID = ""
+						start = fallbackStart
+						driftSubtitleUnavailable = true
+					case errors.Is(fallbackErr, errSubtitleStoreUnavailableV3):
+						return playback.DecisionResponseV3{}, *record, nil, subtitleArtifactErrorV3("Downloaded subtitles are temporarily unavailable.", fallbackErr)
+					default:
+						return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: trackUnavailableReasonV3, message: fallbackErr.Error()}
+					}
+				}
+			} else if errors.Is(remapErr, errSubtitleUnavailableInTargetV3) {
+				// The target has no equivalent track. Playability wins: plan it
+				// with subtitles off instead of terminalling.
+				candidateStart.SubtitleTrackIndex = nil
+				candidateStart.SubtitleTrackID = ""
+				if effectiveFile.ID != currentEffectiveFile.ID {
+					// A speculative detour to another edition keeps the carried
+					// selection (with the remapped audio) so a failed detour
+					// falls back with the viewer's pick intact; the detour plan
+					// itself degrades the stale selection through the subtitle
+					// policy and reports the drop below.
 					detourDroppedSubtitle = true
 					candidateStart.SubtitleTrackIndex = start.SubtitleTrackIndex
 					candidateStart.SubtitleTrackID = start.SubtitleTrackID
-					start = candidateStart
-				} else if errors.Is(remapErr, errSubtitleStoreUnavailableV3) {
-					// A failed lookup says nothing about whether the selected track
-					// exists on the target edition, so it is not a track miss. The
-					// playing plan keeps its subtitle; the change can be repeated
-					// once the downloaded subtitles can be read.
-					return playback.DecisionResponseV3{}, *record, nil, subtitleArtifactErrorV3("Downloaded subtitles are temporarily unavailable.", remapErr)
-				} else if remapErr != nil {
-					return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: trackUnavailableReasonV3, message: remapErr.Error()}
 				} else {
-					start = candidateStart
+					// The active row itself was re-probed in place. Its old
+					// ordinal now names whatever track occupies it, and
+					// validation would accept it because the file id still
+					// matches, so the selection must be dropped and reported
+					// instead of restored.
+					driftSubtitleUnavailable = true
 				}
+				start = candidateStart
+			} else if errors.Is(remapErr, errSubtitleStoreUnavailableV3) {
+				// A failed lookup says nothing about whether the selected track
+				// exists on the target edition, so it is not a track miss. The
+				// playing plan keeps its subtitle; the change can be repeated
+				// once the downloaded subtitles can be read.
+				return playback.DecisionResponseV3{}, *record, nil, subtitleArtifactErrorV3("Downloaded subtitles are temporarily unavailable.", remapErr)
+			} else if remapErr != nil {
+				return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: trackUnavailableReasonV3, message: remapErr.Error()}
+			} else {
+				start = candidateStart
+				subtitleSelectionCurrent = subtitleReconciled
 			}
+		}
+		// Only a verdict that belongs to the candidate this replan actually
+		// commits may travel to the stream state; a later fallback that kept a
+		// different row supersedes it and records its own.
+		if subtitleRotationCarry.Recorded && subtitleRotationCarry.ToFileID == effectiveFile.ID {
+			r = r.WithContext(withSubtitleRotationOutcomeV3(r.Context(), subtitleRotationCarry))
 		}
 		start.FileID = effectiveFile.ID
 		if err := preflightPlaybackFile(r.Context(), effectiveFile, h.MissingMarker, h.EventsHub); err != nil {
@@ -9965,9 +10813,47 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				message: "The requested seek position is beyond the end of the selected media source.",
 			}
 		}
+		// The client echoes identities minted by the running plan, which can
+		// name the session's current effective row after a serve association
+		// moved it without rewriting the durable record. Normalize those onto
+		// the row this replan validates against; a foreign row is still dropped.
+		replanAudioUnavailable, replanSubtitleUnavailable, rekeyErr := h.rekeyReplanTrackIdentitiesWithRotationV3(r.Context(), &start, effectiveFile, session, durableInventory, subtitleSelectionCurrent, rotationRecorded && !subtitleRotationCarry.Recorded)
+		if rekeyErr != nil {
+			// A subtitle-store failure cannot prove the carried track is absent.
+			// Keep the playing plan authoritative and let the viewer retry
+			// instead of reinterpreting the old ordinal on unverified evidence.
+			if errors.Is(rekeyErr, errSubtitleStoreUnavailableV3) {
+				if !seekReanchor {
+					return playback.DecisionResponseV3{}, *record, nil, subtitleArtifactErrorV3("Downloaded subtitles are temporarily unavailable.", rekeyErr)
+				}
+				// A seek must not terminal on a subtitle it cannot verify while
+				// the store is down. Drop the carried selection and keep moving
+				// at the requested position; the plan records the loss once.
+				start.SubtitleTrackID = ""
+				start.SubtitleTrackIndex = nil
+				replanSubtitleUnavailable = true
+				slog.InfoContext(r.Context(), "seek reanchor subtitle inventory is temporarily unavailable; continuing with subtitles off",
+					logComponentKey, "playback",
+					"session_id", record.SessionID,
+					"effective_file_id", effectiveFile.ID,
+					"error", logredact.SanitizeURLError(rekeyErr),
+				)
+			} else {
+				return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: trackUnavailableReasonV3, message: rekeyErr.Error()}
+			}
+		}
 		warnings, err := start.NormalizeAndValidate()
 		if err != nil {
 			return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: "invalid_replan", message: err.Error()}
+		}
+		// A re-keyed identity whose ordinal could not be proven against the
+		// effective row's inventory was cleared above; report the degradation
+		// instead of letting it disappear as an omitted selection.
+		if replanAudioUnavailable {
+			warnings = append(warnings, playback.AudioTrackUnavailableWarningV3())
+		}
+		if replanSubtitleUnavailable || driftSubtitleUnavailable {
+			warnings = append(warnings, playback.SubtitleTrackUnavailableWarningV3())
 		}
 		// This is the single normalization of the merged start request. Keep
 		// its degradation warnings, including the drop of a client
@@ -10044,9 +10930,6 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			plannerSettings, plannerSettingsErr = h.plannerSettingsV3Result(r.Context())
 		}
 		if seekReanchor {
-			if err := h.validateFrozenSubtitleIdentityV3(r.Context(), effectiveFile, record.FrozenRecipe); err != nil {
-				return playback.DecisionResponseV3{}, *record, nil, subtitleArtifactErrorV3("The selected subtitle is no longer available at its frozen route.", err)
-			}
 			var frozenErr error
 			result, frozenErr = frozenSeekReanchorResultV3(record, req.PositionSeconds, time.Now())
 			if frozenErr != nil {
@@ -10056,6 +10939,25 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 					retryable: true,
 				}
 			}
+			// A carried subtitle that no longer binds to the effective file is
+			// not a reason to refuse the position: the file was substituted, the
+			// pick went stale, or its artifact moved. Drop the subtitle for this
+			// replan and keep moving with video and audio untouched. Only a
+			// recipe that cannot be replayed at all (the check above) stays
+			// terminal, because the stream itself cannot be reopened.
+			if replanSubtitleUnavailable || driftSubtitleUnavailable {
+				seekSubtitleDegraded = true
+			} else if err := h.validateFrozenSubtitleIdentityV3(r.Context(), effectiveFile, record.FrozenRecipe); err != nil {
+				seekSubtitleDegraded = true
+				slog.InfoContext(r.Context(), "seek reanchor subtitle no longer binds to the effective file; continuing with subtitles off",
+					logComponentKey, "playback",
+					"session_id", record.SessionID,
+					"requested_file_id", record.RequestedMediaFileID,
+					"effective_file_id", effectiveFile.ID,
+					"error", logredact.SanitizeURLError(err),
+				)
+			}
+			seekNoMovement = seekReanchorNoMovementV3(record, session, req.PositionSeconds)
 		} else {
 			additional, inventoryErr := h.listDownloadedSubtitlesV3(r.Context(), effectiveFile)
 			if inventoryErr != nil && (trackChange || qualityChange) && selectsDownloadedSubtitleV3(effectiveFile, start) {
@@ -10066,7 +10968,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				// and the viewer can repeat the change.
 				return playback.DecisionResponseV3{}, *record, nil, subtitleArtifactErrorV3("Downloaded subtitles are temporarily unavailable.", inventoryErr)
 			}
-			result, toneMapCapabilityErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: start, RequestedFile: plannerRequestedFile, EffectiveFile: effectiveFile, ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), AudioTrackIndex: audioIndex, Settings: plannerSettings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: attemptedKeys, AdditionalSubtitles: additional, ForceSoftwareVideoDecode: forceSoftwareDecode, DecodeAttemptDetail: decodeAttemptDetail, StickyDelivery: replanStickyDeliveryV3(operation, record.CurrentPlan.Delivery), InventoryProvenance: string(replanVirtualProvenance)})
+			result, toneMapCapabilityErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: start, RequestedFile: plannerRequestedFile, EffectiveFile: effectiveFile, ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), AudioTrackIndex: audioIndex, Settings: plannerSettings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: attemptedKeys, AdditionalSubtitles: additional, ForceSoftwareVideoDecode: forceSoftwareDecode, DecodeAttemptDetail: decodeAttemptDetail, StickyDelivery: replanStickyDeliveryV3(operation, record.CurrentPlan.Delivery), InventoryProvenance: string(replanVirtualProvenance), PreviousSubtitleEvaluation: previousSubtitleEvaluationV3(record)})
 			clampPlannerTargetResolution(&result, effectiveFile)
 			reportDetourSubtitleDrop()
 		}
@@ -10369,6 +11271,10 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			func() playback.PlannerInputV3 {
 				input := h.plannerInputV3(r.Context(), start, plannerRequestedFile, effectiveFile, audioIndex, attemptedKeys, replanVirtualProvenance)
 				input.LowerVersion = lowerVersionForFileV3(lowerVersion, effectiveFile)
+				// An escalation replans the same selection against the same
+				// inventory, so it reuses the predecessor's degraded subtitle
+				// outcome exactly as the primary plan did.
+				input.PreviousSubtitleEvaluation = previousSubtitleEvaluationV3(record)
 				return input
 			}, result)
 		if escalateErr != nil {
@@ -10395,6 +11301,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			"software_video_decode", forceSoftwareDecode,
 			"decode_failure_count", decodeFailureCount,
 		}, clientInfo.LogAttrs()...)...)
+		markReplanDecisionLoggedV3(r.Context())
 		return playback.NewTerminalResponseFromTerminalV3(result.Terminal), *record, nil, nil
 	}
 	// Surface the warnings from the merged start request's single
@@ -10472,12 +11379,22 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	if result.StickyDeliveryKept {
 		replanLogAttrs = append(replanLogAttrs, "sticky_delivery", result.Plan.Delivery)
 	}
-	slog.InfoContext(r.Context(), "playback replan decided", append(replanLogAttrs, clientInfo.LogAttrs()...)...)
+	if !seekNoMovement {
+		slog.InfoContext(r.Context(), "playback replan decided", append(replanLogAttrs, clientInfo.LogAttrs()...)...)
+		markReplanDecisionLoggedV3(r.Context())
+	}
 	mode = headerAuthenticatedMediaV3(start.ClientFeatures)
 	_, reservationHeld = h.sessionMgr.(replacementReservationCancellerV3)
 	result.Plan.SessionID = session.ID
 	result.Plan.InventoryURL = "/api/v2/playback/" + session.ID + "/inventory"
 	artifactRecipe = record.FrozenRecipe
+	if seekReanchor && seekSubtitleDegraded {
+		// Replay the same route with the subtitle selection cleared. Clearing
+		// the subtitle identity off the frozen recipe too is what stops later
+		// seeks from re-checking a selection this attempt already dropped, so
+		// the warning and its log line are recorded once, not once per seek.
+		artifactRecipe = degradeSeekReanchorSubtitleV3(record.FrozenRecipe, &result)
+	}
 	if !seekReanchor {
 		frozenRecipe, frozenErr := h.freezeExecutableRecipeV3(r.Context(), effectiveFile, result)
 		if frozenErr != nil {
@@ -10496,10 +11413,53 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	// the feature beside WebVTT URLs.
 	artifactFeatures := replanSubtitleFeaturesV3(record, start.ClientFeatures)
 	if err := h.attachSubtitleArtifactV3(r.Context(), session.ID, effectiveFile, result.Plan, result.SubtitleTrackIndex, &artifactRecipe, artifactFeatures); err != nil {
-		return playback.DecisionResponseV3{}, *record, nil, subtitleArtifactErrorV3("Failed to prepare the selected subtitle artifact.", err)
+		if !seekReanchor {
+			return playback.DecisionResponseV3{}, *record, nil, subtitleArtifactErrorV3("Failed to prepare the selected subtitle artifact.", err)
+		}
+		// The subtitle artifact itself is missing, moved, or unreadable. A seek
+		// must still reach the requested position without it; only the
+		// selection is lost, and the plan reports that once.
+		slog.InfoContext(r.Context(), "seek reanchor subtitle artifact is unavailable; continuing with subtitles off",
+			logComponentKey, "playback",
+			"session_id", record.SessionID,
+			"requested_file_id", record.RequestedMediaFileID,
+			"effective_file_id", effectiveFile.ID,
+			"error", logredact.SanitizeURLError(err),
+		)
+		seekSubtitleDegraded = true
+		artifactRecipe = degradeSeekReanchorSubtitleV3(artifactRecipe, &result)
+		if retryErr := h.attachSubtitleArtifactV3(r.Context(), session.ID, effectiveFile, result.Plan, result.SubtitleTrackIndex, &artifactRecipe, artifactFeatures); retryErr != nil {
+			// The menu could not be republished from the current store. The
+			// plan is subtitles-off either way, so serve the position instead
+			// of failing the seek over an advisory inventory.
+			slog.WarnContext(r.Context(), "seek reanchor subtitle inventory could not be republished; continuing with subtitles off",
+				logComponentKey, "playback",
+				"session_id", record.SessionID,
+				"effective_file_id", effectiveFile.ID,
+				"error", logredact.SanitizeURLError(retryErr),
+			)
+		}
+	}
+	if seekSubtitleDegraded {
+		// The durable request must not keep a selection this seek dropped:
+		// later replans seed their carried tracks from it.
+		start.SubtitleTrackID = ""
+		start.SubtitleTrackIndex = nil
 	}
 	if seekReanchor {
-		if err := validateSeekReanchorPlanV3(record, result.Plan); err != nil {
+		// The route-identity guard proves the frozen route did not drift. A
+		// subtitle degrade is this replan's own, deliberate outcome, so compare
+		// against the same subtitles-off baseline on both sides: every other
+		// identity field must still match the running plan exactly.
+		validationRecord := record
+		if seekSubtitleDegraded {
+			baseline := *record
+			baselinePlan := record.CurrentPlan
+			clearPlanSubtitleV3(&baselinePlan)
+			baseline.CurrentPlan = baselinePlan
+			validationRecord = &baseline
+		}
+		if err := validateSeekReanchorPlanV3(validationRecord, result.Plan); err != nil {
 			changedFields := seekReanchorIdentityChangesV3(record, result.Plan)
 			slog.ErrorContext(r.Context(), "protocol v3 seek reanchor changed route identity",
 				"session", record.SessionID,
@@ -10656,13 +11616,22 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		artifactRecipe.PlanID = result.Plan.PlanID
 	}
 	response := playback.DecisionResponseV3{ProtocolVersion: playback.ProtocolV3, ServerFeatures: serverFeaturesForRequestV3(r.Context()), Outcome: playback.OutcomePlayableV3, SessionID: session.ID, PlaybackPlan: result.Plan}
+	if seekNoMovement {
+		// The frozen rebuild is byte-identical to the route already playing:
+		// answer it explicitly so the client does not treat the same timeline as
+		// a fresh seek and snap back to it.
+		response.Outcome = playback.OutcomeSeekNoMovementV3
+	}
 	updated := *record
 	updated.CurrentPlanID = result.Plan.PlanID
 	updated.CurrentPlan = *result.Plan
 	// A seek reanchor that reuses the transport replays the durable recipe
 	// verbatim; a rebuilt seek or newly planned replan binds the frozen
-	// recipe to the final installed plan ID so ValidFor remains true.
-	if !seekReanchor || !transportReused {
+	// recipe to the final installed plan ID so ValidFor remains true. A seek
+	// that dropped its subtitle must rewrite the recipe even when the
+	// transport is reused, or the next seek re-validates the selection this
+	// attempt already dropped and warns again.
+	if !seekReanchor || !transportReused || seekSubtitleDegraded {
 		updated.FrozenRecipe = artifactRecipe
 	}
 	updated.NormalizedRequest = start
@@ -10824,6 +11793,29 @@ func applyTransportToneMapModeV3(result *playback.PlannerResultV3, transport pre
 	}
 }
 
+// seekNoMovementToleranceSecondsV3 is the slack a seek target may differ from
+// the anchored position and still count as "already there". Sub-quarter-second
+// seeks are not visible to a viewer, and the client echoes the plan's own float.
+const seekNoMovementToleranceSecondsV3 = 0.25
+
+// seekReanchorNoMovementV3 reports whether a seek reanchor asks for the
+// position the durable plan and the live session are already serving, so the
+// frozen rebuild would hand back the same timeline and nothing would move.
+//
+// The plan anchor alone cannot answer this: after a viewer has watched past the
+// anchor, a deliberate rewind to that anchor is a real move. Requiring the live
+// position to match too keeps that rewind working while catching a repeated
+// seek to where playback already is.
+func seekReanchorNoMovementV3(record *playback.AttemptRecordV3, session *playback.Session, position float64) bool {
+	if record == nil {
+		return false
+	}
+	if math.Abs(record.CurrentPlan.Timeline.SourceStartSeconds-position) > seekNoMovementToleranceSecondsV3 {
+		return false
+	}
+	return session == nil || math.Abs(session.Position-position) <= seekNoMovementToleranceSecondsV3
+}
+
 func frozenSeekReanchorResultV3(record *playback.AttemptRecordV3, position float64, now time.Time) (playback.PlannerResultV3, error) {
 	if record == nil || !record.FrozenRecipe.ValidFor(record.CurrentPlan) {
 		return playback.PlannerResultV3{}, errors.New("the active playback recipe is unavailable")
@@ -10973,6 +11965,77 @@ func (h *PlaybackHandler) validateFrozenSubtitleIdentityV3(ctx context.Context, 
 		return errors.New("the frozen subtitle identity is unrecognized")
 	}
 	return nil
+}
+
+// subtitleBurnInDecisionReasonV3 marks a plan encoded only because the selected
+// subtitle had to be rendered into the video. A seek that drops that subtitle
+// must not keep advertising the burn-in.
+const subtitleBurnInDecisionReasonV3 = "subtitle_burn_in_required"
+
+// subtitleBurnInWarningCodeV3 is the degradation warning a burn-in plan carries.
+const subtitleBurnInWarningCodeV3 = "subtitle_burn_in"
+
+// clearPlanSubtitleV3 publishes a plan as subtitles-off while keeping the
+// inventory it already carries, so the client menu survives the degrade. It
+// clears every part of the selection together — the decision, the selected
+// track identity, the subtitle claims, and burn-in evidence — because a plan
+// that says "off" next to a selected track or a rendered overlay is exactly the
+// stale pairing clients alias wrong.
+func clearPlanSubtitleV3(plan *playback.PlanV3) {
+	if plan == nil {
+		return
+	}
+	inventory := plan.Subtitle.Inventory
+	plan.Subtitle = playback.SubtitleDecisionV3{Mode: playback.SubtitleOffV3, Inventory: inventory}
+	plan.SelectedTracks.Subtitle = nil
+	plan.Claims.Subtitles = playback.SubtitleClaimsV3{}
+	// Rebuild rather than filter in place: the plan is a shallow copy of the
+	// durable record's plan, so an in-place delete would rewrite the record's
+	// warning slice through the shared backing array.
+	warnings := make([]playback.DegradationWarningV3, 0, len(plan.DegradationWarnings))
+	for _, warning := range plan.DegradationWarnings {
+		if warning.Code != subtitleBurnInWarningCodeV3 {
+			warnings = append(warnings, warning)
+		}
+	}
+	plan.DegradationWarnings = warnings
+	if plan.DecisionReason == subtitleBurnInDecisionReasonV3 {
+		plan.DecisionReason = "subtitle_unavailable"
+	}
+}
+
+// degradeSeekReanchorSubtitleV3 drops a seek reanchor's subtitle from the
+// replayed plan and its frozen recipe. A seek's requested position outranks
+// subtitle fidelity: when the carried selection cannot bind to the effective
+// file (a substituted release, a stale pick, or a missing artifact) the replan
+// continues with video and audio intact and records the existing
+// subtitle-unavailable warning once. The recipe's subtitle identity is cleared
+// with the plan so the same failure is not re-discovered on the next seek.
+func degradeSeekReanchorSubtitleV3(recipe playback.ExecutableRecipeV3, result *playback.PlannerResultV3) playback.ExecutableRecipeV3 {
+	recipe.SubtitleTrackIndex = -1
+	recipe.SubtitleTransportTrackIndex = -1
+	recipe.SubtitleBurnIn = false
+	recipe.SubtitleCodec = ""
+	recipe.SubtitleRendition = false
+	recipe.SubtitleSource = ""
+	recipe.ExternalSubtitlePath = ""
+	recipe.EmbeddedStreamIndex = 0
+	recipe.DownloadedSubtitleID = 0
+	if result == nil {
+		return recipe
+	}
+	result.SubtitleTrackIndex = -1
+	result.SubtitleTransportTrackIndex = -1
+	result.SubtitleBurnIn = false
+	result.SubtitleCodec = ""
+	result.SubtitleRendition = false
+	result.DownloadedSubtitleID = 0
+	if result.Plan == nil {
+		return recipe
+	}
+	clearPlanSubtitleV3(result.Plan)
+	appendStartWarningsV3(result, []playback.DegradationWarningV3{playback.SubtitleTrackUnavailableWarningV3()})
+	return recipe
 }
 
 func validateSeekRecoveryRequestV3(record *playback.AttemptRecordV3, req playback.ReplanRequestV3) error {
@@ -12396,28 +13459,70 @@ func sameMediaInventoryV3(a, b *models.MediaFile) bool {
 }
 
 // replanRemapSourceV3 returns the file whose inventory a carried selection was
-// minted against. For a virtual session the plan-time evidence is the source of
-// truth: the loaded catalog row may have been re-probed in place (same id,
-// different release) after the selection was made, so only the session's
-// captured audio and subtitle inventories describe what the carried ordinal
-// actually names. The evidence is used regardless of which candidate it is
-// anchored to — unlike serving, where a provenance mismatch means the evidence
-// must be discarded, a remap needs exactly the inventory the ordinal was minted
-// against. Presence is decided by the evidence-set flag, not by slice length:
-// a captured-empty inventory is genuine evidence (the old candidate had no such
-// track), and only absent evidence permits falling back to the loaded row.
-func (h *PlaybackHandler) replanRemapSourceV3(effectiveFile *models.MediaFile, session *playback.Session) *models.MediaFile {
-	if effectiveFile == nil || session == nil || !session.VirtualSubtitleEvidenceSet {
-		return effectiveFile
+// minted against. The plan being replanned is the strongest evidence: the
+// request names that exact attempt, and its captured audio and subtitle
+// inventories are what the echoed ordinals were minted against even when no
+// live session survives on this replica. Without durable evidence, a virtual
+// session's plan-time evidence is the fallback for the same reason; either way
+// the loaded catalog row may have been re-probed in place (same id, different
+// release) after the selection was made. Evidence is used regardless of which
+// candidate it is anchored to — unlike serving, where a provenance mismatch
+// means the evidence must be discarded, a remap needs exactly the inventory the
+// ordinal was minted against. Presence is decided by the known flag, not by
+// slice length: a captured-empty inventory is genuine evidence (the old
+// candidate had no such track), and only absent evidence permits falling back
+// to the loaded row. The captured downloaded tail is returned beside the
+// file-shaped evidence because no models.MediaFile can describe it.
+func (h *PlaybackHandler) replanRemapSourceV3(ctx context.Context, effectiveFile *models.MediaFile, session *playback.Session, durable map[int]predecessorPlanInventoryV3) carriedInventorySourceV3 {
+	if effectiveFile == nil {
+		return carriedInventorySourceV3{}
+	}
+	if inventory, ok := durable[effectiveFile.ID]; ok && inventory.anyKnown() {
+		evidence := *effectiveFile
+		// The captured inventory is historical evidence by definition: the live
+		// row may have been re-probed in place since the plan was made, and a
+		// downloaded ordinal without the captured tail cannot be proven
+		// positionally.
+		carry := carriedInventorySourceV3{file: &evidence, subtitleHistorical: true}
+		if inventory.audioKnown {
+			evidence.AudioTracks = inventory.audio
+		}
+		if inventory.subtitleKnown {
+			// The live row is the uncooked source for path/container identity the
+			// wire inventory omits; mismatching tracks keep the plan-derived values
+			// so the fingerprint still reports drift. The downloaded tail has no
+			// file-shaped form and is carried beside the evidence.
+			evidence.ExternalSubtitles, evidence.SubtitleTracks, carry.downloaded = subtitleLayoutFromPlanInventoryV3(inventory.subtitleItems, effectiveFile)
+			carry.downloadedKnown = true
+		}
+		return carry
+	}
+	if session == nil || !session.VirtualSubtitleEvidenceSet {
+		return carriedInventorySourceV3{file: effectiveFile}
 	}
 	if !isVirtualPlaybackFile(effectiveFile) {
-		return effectiveFile
+		return carriedInventorySourceV3{file: effectiveFile}
 	}
 	evidence := *effectiveFile
 	evidence.AudioTracks = session.VirtualAudioTracks
 	evidence.SubtitleTracks = session.VirtualSubtitleTracks
 	evidence.ExternalSubtitles = session.VirtualExternalSubtitles
-	return &evidence
+	carry := carriedInventorySourceV3{file: &evidence, subtitleHistorical: true}
+	// The session evidence arrays describe the file-shaped inventory but cannot
+	// describe the downloaded tail. Without it a carried downloaded ordinal is
+	// indistinguishable from an unchanged one and would be reused positionally
+	// onto whatever row now occupies it. The session's durable attempt plan is
+	// the same captured inventory the evidence was written from, so recover the
+	// tail there. A dependency failure is carried, not swallowed: the remap
+	// surface reports it instead of reusing an ordinal it cannot prove.
+	downloaded, known, tailErr := h.sessionEvidenceDownloadedTailV3(ctx, session, effectiveFile.ID)
+	if tailErr != nil {
+		carry.subtitleEvidenceErr = tailErr
+	} else if known {
+		carry.downloaded = downloaded
+		carry.downloadedKnown = true
+	}
+	return carry
 }
 
 // virtualCandidateRotationRecordedV3 reports whether the session recorded a
@@ -12939,22 +14044,84 @@ func remapAudioSelectionV3(source, target *models.MediaFile, request *playback.S
 	return nil
 }
 
+// carriedAudioSourceV3 loads the inventory the carried audio identity was
+// minted against. The identity is file-bound: its embedded row is the effective
+// row the previous plan selected on, which is the inventory the ordinal names.
+// Evidence is therefore keyed by that source row, not by the target, because a
+// version switch has a different target by definition and keying on it would
+// never find the evidence that makes the carry safe. A predecessor attempt
+// names the evidence durably; otherwise the uniquely matching live session on
+// this replica carries it. Evidence from either source is what lets a same-row
+// id be remapped when enrichment re-probed that row in place (same id, different
+// release) instead of trusting a stale ordinal.
+func (h *PlaybackHandler) carriedAudioSourceV3(ctx context.Context, req *playback.StartRequestV3, target *models.MediaFile, userID int, profileID, clientIP, userAgent string) *models.MediaFile {
+	if req == nil || target == nil {
+		return nil
+	}
+	srcID, kind, _, ok := playback.ParseTrackIDV3(strings.TrimSpace(req.CarriedAudioTrackID))
+	if !ok || kind != "audio" || srcID <= 0 {
+		return nil
+	}
+	if predecessorID := strings.TrimSpace(req.PreviousPlaybackAttemptID); predecessorID != "" && h.PlanStoreV3 != nil {
+		record, err := h.PlanStoreV3.GetAttemptByPlaybackAttemptID(ctx, predecessorID)
+		if err == nil && record != nil && record.UserID == userID && record.ProfileID == profileID &&
+			record.EffectiveMediaFileID == srcID {
+			source := &models.MediaFile{ID: srcID, AudioTracks: audioTracksFromInventoryV3(record.CurrentPlan.AudioTracks)}
+			if len(source.AudioTracks) > 0 {
+				return source
+			}
+		}
+	}
+	lister, ok := h.sessionMgr.(interface {
+		GetUserSessions(userID int) []*playback.Session
+	})
+	if !ok {
+		return nil
+	}
+	previous := findCarryCandidateSessionV3(lister.GetUserSessions(userID), profileID, srcID, clientIP, userAgent)
+	if previous == nil || previous.MediaFileID != srcID {
+		// A session matched only through its requested row carries the effective
+		// candidate's tracks, which are not the inventory srcID names. Leave the
+		// catalog row to resolve it rather than mislabeling another layout.
+		return nil
+	}
+	source := &models.MediaFile{ID: srcID, AudioTracks: h.previousAudioTracksV3(ctx, previous)}
+	if len(source.AudioTracks) == 0 {
+		return nil
+	}
+	return source
+}
+
 // resolveCarriedAudioTrackV3 re-resolves the viewer's audio selection from a
 // previous version onto the requested file. The carried identity is file-bound,
 // so its ordinal is remapped by codec/language family (MatchAudioTrackAcrossVersions),
-// not by raw position, which is unstable across encodes. Falls back (ok=false)
-// to the server's preference when the source version is gone or the identity
-// cannot be parsed; the caller keeps its already-resolved index, so a stale
-// carried selection degrades rather than terminating.
-func (h *PlaybackHandler) resolveCarriedAudioTrackV3(ctx context.Context, carriedID string, target *models.MediaFile) (int, bool) {
+// not by raw position, which is unstable across encodes. A same-row id is only
+// reused directly when the source evidence still describes the target's layout:
+// enrichment can re-probe the row in place, and row-id equality alone would then
+// apply the old ordinal to a different release. A remapped index is only a hit
+// when the matched track still carries a concrete language the selection named.
+// MatchAudioTrackAcrossVersions deliberately falls back to the target's default
+// when no equivalent exists; reporting that as a successful carry would play
+// another language under the viewer's explicit choice with no degradation
+// warning. Falls back (ok=false) to the server's preference when the source
+// version is gone, the identity cannot be parsed, or no equivalent exists; the
+// caller keeps its already-resolved index, so a stale carried selection degrades
+// rather than terminating.
+func (h *PlaybackHandler) resolveCarriedAudioTrackV3(ctx context.Context, carriedID string, target *models.MediaFile, source *models.MediaFile) (int, bool) {
 	srcID, kind, ordinal, ok := playback.ParseTrackIDV3(carriedID)
 	if !ok || kind != "audio" || target == nil {
 		slog.InfoContext(ctx, "carried audio selection is invalid for the effective file; using resolved track",
 			"component", "playback", "carried_track_id", carriedID)
 		return 0, false
 	}
+	if source != nil && source.ID == srcID && len(source.AudioTracks) > 0 {
+		if srcID == target.ID && playback.AudioLayoutsEqual(source.AudioTracks, target.AudioTracks) {
+			return normalizeAudioTrackIndex(target, ordinal), true
+		}
+		return carriedAudioMatchV3(ctx, source.AudioTracks, target, ordinal, srcID)
+	}
 	if srcID == target.ID {
-		// Same file: the ordinal is directly usable (normalize bounds).
+		// No generation evidence: keep the legacy ordinal reuse.
 		return normalizeAudioTrackIndex(target, ordinal), true
 	}
 	if h.fileResolver == nil {
@@ -12962,13 +14129,33 @@ func (h *PlaybackHandler) resolveCarriedAudioTrackV3(ctx context.Context, carrie
 			"component", "playback", "carried_file_id", srcID, "target_file_id", target.ID)
 		return 0, false
 	}
-	source, err := h.fileResolver.GetByID(ctx, srcID)
-	if err != nil || source == nil {
+	sourceRow, err := h.fileResolver.GetByID(ctx, srcID)
+	if err != nil || sourceRow == nil {
 		slog.InfoContext(ctx, "carried audio source version could not be loaded; using resolved track",
 			"component", "playback", "carried_file_id", srcID, "target_file_id", target.ID)
 		return 0, false
 	}
-	return playback.MatchAudioTrackAcrossVersions(source.AudioTracks, target.AudioTracks, ordinal), true
+	return carriedAudioMatchV3(ctx, sourceRow.AudioTracks, target, ordinal, srcID)
+}
+
+// carriedAudioMatchV3 maps a carried ordinal onto target and verifies the result
+// still names the selection's concrete language. An out-of-range ordinal or an
+// unverifiable target inventory is a miss, not a silent default.
+func carriedAudioMatchV3(ctx context.Context, source []models.AudioTrack, target *models.MediaFile, ordinal, srcID int) (int, bool) {
+	if ordinal < 0 || ordinal >= len(source) || target == nil || len(target.AudioTracks) == 0 {
+		slog.InfoContext(ctx, "carried audio selection has no equivalent on the effective file; using resolved track",
+			"component", "playback", "carried_file_id", srcID, "target_file_id", target.ID, "carried_audio_index", ordinal)
+		return 0, false
+	}
+	index := playback.MatchAudioTrackAcrossVersions(source, target.AudioTracks, ordinal)
+	if index < 0 || index >= len(target.AudioTracks) ||
+		!fallbackAudioCarryMatchesV3(source[ordinal], target.AudioTracks[index]) {
+		slog.InfoContext(ctx, "carried audio selection has no equivalent on the effective file; using resolved track",
+			"component", "playback", "carried_file_id", srcID, "target_file_id", target.ID,
+			"carried_audio_index", ordinal, "matched_audio_index", index)
+		return 0, false
+	}
+	return index, true
 }
 
 // errSubtitleUnavailableInTargetV3 reports that the target media file has no
@@ -12980,6 +14167,53 @@ func (h *PlaybackHandler) resolveCarriedAudioTrackV3(ctx context.Context, carrie
 var errSubtitleUnavailableInTargetV3 = errors.New("no equivalent subtitle track in the target file version")
 
 func (h *PlaybackHandler) remapSubtitleSelectionV3(ctx context.Context, source, target *models.MediaFile, request *playback.StartRequestV3) (bool, error) {
+	return h.remapSubtitleSelectionWithCarryV3(ctx, carriedInventorySourceV3{file: source}, target, request)
+}
+
+// downloadedSelectionCarryErrorV3 fails closed for a carried downloaded
+// ordinal the carry cannot place. A dependency failure while recovering the
+// captured tail surfaces as a store error so the caller can refuse the replan
+// as retryable; a historical carry with no tail reports the track unavailable
+// instead of reusing the ordinal positionally against whatever row now occupies
+// it.
+func downloadedSelectionCarryErrorV3(carry carriedInventorySourceV3, request *playback.StartRequestV3) error {
+	if !carry.namesDownloadedSubtitleV3(request) {
+		return nil
+	}
+	if carry.subtitleEvidenceErr != nil {
+		return fmt.Errorf("load downloaded subtitles: %w", carry.subtitleEvidenceErr)
+	}
+	if carry.subtitleHistorical && !carry.downloadedKnown {
+		return errSubtitleUnavailableInTargetV3
+	}
+	return nil
+}
+
+// sameInventorySubtitleSelectionSettledV3 reports whether a selection needs no
+// remap because the source and target are the same row with identical
+// file-shaped subtitle inventories. A carried downloaded ordinal is re-checked
+// against the captured rows first: that tail is invisible to the file-shaped
+// comparison, so a changed tail still needs the remap below.
+func (h *PlaybackHandler) sameInventorySubtitleSelectionSettledV3(ctx context.Context, carry carriedInventorySourceV3, target *models.MediaFile, request *playback.StartRequestV3) (bool, error) {
+	if carry.file == nil || target == nil || carry.file.ID != target.ID || !sameSubtitleInventoryV3(carry.file, target) {
+		return false, nil
+	}
+	if !carry.namesDownloadedSubtitleV3(request) {
+		return true, nil
+	}
+	changed, err := h.downloadedTailChangedV3(ctx, carry, target)
+	if err != nil {
+		return false, fmt.Errorf("load downloaded subtitles: %w", err)
+	}
+	return !changed, nil
+}
+
+// remapSubtitleSelectionWithCarryV3 is remapSubtitleSelectionV3 with the
+// inventory's captured downloaded tail. That segment has no models.MediaFile
+// representation, so a file-shaped source cannot prove an ordinal in it still
+// names the same downloaded row; the carry can.
+func (h *PlaybackHandler) remapSubtitleSelectionWithCarryV3(ctx context.Context, carry carriedInventorySourceV3, target *models.MediaFile, request *playback.StartRequestV3) (bool, error) {
+	source := carry.file
 	if request == nil || source == nil || target == nil {
 		return false, nil
 	}
@@ -12990,13 +14224,26 @@ func (h *PlaybackHandler) remapSubtitleSelectionV3(ctx context.Context, source, 
 	if request.SubtitleTrackIndex != nil && *request.SubtitleTrackIndex == playback.SubtitleTrackOffIndexV3 {
 		return false, nil
 	}
+	// A carried downloaded ordinal is only meaningful with the tail it was
+	// minted against. A historical carry that never recovered one cannot prove
+	// which row the ordinal names today, and a dependency failure while
+	// recovering it says nothing about whether the track exists. Both must fail
+	// closed here, before the same-id fast path can reuse the position.
+	if err := downloadedSelectionCarryErrorV3(carry, request); err != nil {
+		return false, err
+	}
 	// A same-id pairing is only a no-op when the subtitle inventory is
 	// unchanged. A virtual candidate rotation re-probes the catalog row in
 	// place (same id, different release), so a fingerprint match — not id
 	// equality — decides whether the carried ordinal still names the same
 	// track. When the inventory differs, the selection remaps by
-	// language/format/forced/HI exactly like an edition switch.
-	if source.ID == target.ID && sameSubtitleInventoryV3(source, target) {
+	// language/format/forced/HI exactly like an edition switch. The downloaded
+	// tail is not part of that fingerprint, so a carried downloaded ordinal is
+	// re-checked against the captured rows even when the file-shaped
+	// inventories compare equal.
+	if settled, err := h.sameInventorySubtitleSelectionSettledV3(ctx, carry, target, request); err != nil {
+		return false, err
+	} else if settled {
 		return false, nil
 	}
 	// A source with no subtitle inventory has nothing to remap FROM. That is
@@ -13010,7 +14257,12 @@ func (h *PlaybackHandler) remapSubtitleSelectionV3(ctx context.Context, source, 
 	// resolveV3AudioIndex's graceful empty-tracks fallback.
 	if len(source.ExternalSubtitles) == 0 && len(source.SubtitleTracks) == 0 {
 		noDownloaded := h.SubtitleRepo == nil
-		if !noDownloaded {
+		if carry.downloadedKnown {
+			// The captured tail is the authority for an inventory the file
+			// cannot describe; the live list may have changed since it was
+			// published.
+			noDownloaded = len(carry.downloaded) == 0
+		} else if !noDownloaded {
 			downloaded, err := h.SubtitleRepo.ListDownloadedSubtitles(ctx, source.ID)
 			if err != nil {
 				// A failed lookup says nothing about whether the track exists;
@@ -13063,68 +14315,14 @@ func (h *PlaybackHandler) remapSubtitleSelectionV3(ctx context.Context, source, 
 	var wantForced, wantHearingImpaired bool
 	switch sourceLocation.source {
 	case playback.SubtitleSourceExternalV3:
-		wanted := source.ExternalSubtitles[sourceLocation.offset]
-		wantLanguage, wantTitle, wantForced, wantHearingImpaired = wanted.Language, displayedSubtitleTitleV3(wanted.Title, wanted.EmbeddedTitle), wanted.Forced, wanted.HearingImpaired
-		for candidateIndex, candidate := range target.ExternalSubtitles {
-			if !strings.EqualFold(candidate.Language, wanted.Language) || !strings.EqualFold(candidate.Format, wanted.Format) || candidate.Forced != wanted.Forced || candidate.HearingImpaired != wanted.HearingImpaired {
-				continue
-			}
-			if published, mapped := playback.SubtitleInventoryOwnPublishedIndexV3(target, candidateIndex); mapped {
-				targetIndex = published
-				break
-			}
-		}
+		targetIndex, wantLanguage, wantTitle, wantForced, wantHearingImpaired = remapExternalSubtitleIndexV3(source, target, sourceLocation)
 	case playback.SubtitleSourceEmbeddedV3:
-		wanted := source.SubtitleTracks[sourceLocation.offset]
-		wantLanguage, wantTitle, wantForced, wantHearingImpaired = wanted.Language, displayedSubtitleTitleV3(wanted.Title, wanted.EmbeddedTitle), wanted.Forced, wanted.HearingImpaired
-		for candidateIndex, candidate := range target.SubtitleTracks {
-			if !strings.EqualFold(candidate.Language, wanted.Language) || !strings.EqualFold(candidate.Codec, wanted.Codec) || candidate.Forced != wanted.Forced || candidate.HearingImpaired != wanted.HearingImpaired {
-				continue
-			}
-			if published, mapped := playback.SubtitleInventoryOwnPublishedIndexV3(target, len(target.ExternalSubtitles)+candidateIndex); mapped {
-				targetIndex = published
-				break
-			}
-		}
+		targetIndex, wantLanguage, wantTitle, wantForced, wantHearingImpaired = remapEmbeddedSubtitleIndexV3(source, target, sourceLocation)
 	default:
-		if h.SubtitleRepo != nil {
-			sourceDownloaded, sourceErr := h.SubtitleRepo.ListDownloadedSubtitles(ctx, source.ID)
-			targetDownloaded, targetErr := h.SubtitleRepo.ListDownloadedSubtitles(ctx, target.ID)
-			if err := errors.Join(sourceErr, targetErr); err != nil {
-				// A failed lookup says nothing about whether the track exists;
-				// dropping the selection here would store subtitles-off for the
-				// rest of the session over a transient error.
-				return false, fmt.Errorf("load downloaded subtitles: %w", wrapSubtitleStoreErrorV3(err))
-			}
-			downloadedIndex := sourceLocation.offset
-			if downloadedIndex >= 0 && downloadedIndex < len(sourceDownloaded) {
-				wanted := sourceDownloaded[downloadedIndex]
-				base := len(playback.BuildSubtitleInventoryV3(target, nil))
-				// The stable downloaded-subtitle row id (carried in the plan
-				// inventory) is the only reliable identity here. Virtual rows
-				// persist release_name as "" (see ReplaceVirtualCandidates and
-				// upsertVirtualFileVariant), so two same-language/format
-				// downloaded tracks are indistinguishable by ReleaseName and a
-				// first-match scan would collapse them onto one target row.
-				// Resolve the id first, then fall back to the historical
-				// language/format/ReleaseName match for rows that carry no id.
-				if wanted.ID > 0 {
-					for candidateIndex, candidate := range targetDownloaded {
-						if candidate.ID == wanted.ID {
-							targetIndex = base + candidateIndex
-							break
-						}
-					}
-				}
-				if targetIndex < 0 {
-					for candidateIndex, candidate := range targetDownloaded {
-						if strings.EqualFold(candidate.Language, wanted.Language) && strings.EqualFold(string(candidate.Format), string(wanted.Format)) && strings.EqualFold(candidate.ReleaseName, wanted.ReleaseName) {
-							targetIndex = base + candidateIndex
-							break
-						}
-					}
-				}
-			}
+		var remapErr error
+		targetIndex, remapErr = h.remapDownloadedSubtitleIndexV3(ctx, carry, target, sourceLocation.offset)
+		if remapErr != nil {
+			return false, remapErr
 		}
 	}
 	if targetIndex < 0 && wantLanguage != "" {
@@ -13148,6 +14346,155 @@ func (h *PlaybackHandler) remapSubtitleSelectionV3(ctx context.Context, source, 
 	request.SubtitleTrackIndex = &targetIndex
 	request.SubtitleTrackID = playback.TrackIDV3(target.ID, "subtitle", targetIndex)
 	return false, nil
+}
+
+// remapExternalSubtitleIndexV3 returns the target's published ordinal for the
+// external track location names, plus the selection identity the cross-format
+// fallback needs. Language/format/flags can name several physical tracks (two
+// sidecars for one language). Prefer the one whose displayed title the viewer
+// selected; otherwise keep the first identity match as the historical fallback
+// rather than reporting a miss.
+func remapExternalSubtitleIndexV3(source, target *models.MediaFile, location subtitleIndexLocationV3) (targetIndex int, language, title string, forced, hearingImpaired bool) {
+	wanted := source.ExternalSubtitles[location.offset]
+	language = wanted.Language
+	title = displayedSubtitleTitleV3(wanted.Title, wanted.EmbeddedTitle)
+	forced, hearingImpaired = wanted.Forced, wanted.HearingImpaired
+	fallback := -1
+	for candidateIndex, candidate := range target.ExternalSubtitles {
+		if !strings.EqualFold(candidate.Language, wanted.Language) || !strings.EqualFold(candidate.Format, wanted.Format) || candidate.Forced != wanted.Forced || candidate.HearingImpaired != wanted.HearingImpaired {
+			continue
+		}
+		published, mapped := playback.SubtitleInventoryOwnPublishedIndexV3(target, candidateIndex)
+		if !mapped {
+			continue
+		}
+		if subtitleRemapTitleMatchesV3(title, displayedSubtitleTitleV3(candidate.Title, candidate.EmbeddedTitle)) {
+			return published, language, title, forced, hearingImpaired
+		}
+		if fallback < 0 {
+			fallback = published
+		}
+	}
+	return fallback, language, title, forced, hearingImpaired
+}
+
+// remapEmbeddedSubtitleIndexV3 is the embedded counterpart of
+// remapExternalSubtitleIndexV3.
+func remapEmbeddedSubtitleIndexV3(source, target *models.MediaFile, location subtitleIndexLocationV3) (targetIndex int, language, title string, forced, hearingImpaired bool) {
+	wanted := source.SubtitleTracks[location.offset]
+	language = wanted.Language
+	title = displayedSubtitleTitleV3(wanted.Title, wanted.EmbeddedTitle)
+	forced, hearingImpaired = wanted.Forced, wanted.HearingImpaired
+	fallback := -1
+	for candidateIndex, candidate := range target.SubtitleTracks {
+		if !strings.EqualFold(candidate.Language, wanted.Language) || !strings.EqualFold(candidate.Codec, wanted.Codec) || candidate.Forced != wanted.Forced || candidate.HearingImpaired != wanted.HearingImpaired {
+			continue
+		}
+		published, mapped := playback.SubtitleInventoryOwnPublishedIndexV3(target, len(target.ExternalSubtitles)+candidateIndex)
+		if !mapped {
+			continue
+		}
+		if subtitleRemapTitleMatchesV3(title, displayedSubtitleTitleV3(candidate.Title, candidate.EmbeddedTitle)) {
+			return published, language, title, forced, hearingImpaired
+		}
+		if fallback < 0 {
+			fallback = published
+		}
+	}
+	return fallback, language, title, forced, hearingImpaired
+}
+
+// remapDownloadedSubtitleIndexV3 maps a downloaded-subtitle ordinal from the
+// carry source onto target and returns the target's published combined ordinal,
+// or -1 when no equivalent exists. The published position is only a menu
+// ordinal: a row added, removed, or reordered ahead of it moves every ordinal
+// after it without changing the row the viewer picked, so a captured inventory
+// is resolved by its stable subtitle row instead.
+func (h *PlaybackHandler) remapDownloadedSubtitleIndexV3(ctx context.Context, carry carriedInventorySourceV3, target *models.MediaFile, downloadedIndex int) (int, error) {
+	if downloadedIndex < 0 {
+		return -1, nil
+	}
+	if carry.downloadedKnown {
+		return h.capturedDownloadedSubtitleIndexV3(ctx, carry, target, downloadedIndex)
+	}
+	// Evidence that predates the captured tail falls back to the historic match
+	// against the live repository lists of the two rows.
+	return h.remapDownloadedSubtitleFromLiveSourceV3(ctx, carry.file, target, downloadedIndex)
+}
+
+// capturedDownloadedSubtitleIndexV3 resolves a downloaded ordinal against the
+// stable subtitle row id the plan published, not against whatever occupies its
+// old position today.
+func (h *PlaybackHandler) capturedDownloadedSubtitleIndexV3(ctx context.Context, carry carriedInventorySourceV3, target *models.MediaFile, downloadedIndex int) (int, error) {
+	if downloadedIndex >= len(carry.downloaded) {
+		return -1, nil
+	}
+	id := downloadedSubtitleCarryIDV3(carry.downloaded[downloadedIndex])
+	if id <= 0 {
+		// The captured item carries no durable identity (it predates the row id
+		// or its format has no sync key). The live source row is then the only
+		// identity available.
+		return h.remapDownloadedSubtitleFromLiveSourceV3(ctx, carry.file, target, downloadedIndex)
+	}
+	targetDownloaded, err := h.listDownloadedSubtitlesV3(ctx, target)
+	if err != nil {
+		return -1, fmt.Errorf("load downloaded subtitles: %w", err)
+	}
+	base := len(playback.BuildSubtitleInventoryV3(target, nil))
+	for candidateIndex, candidate := range targetDownloaded {
+		if candidate.DownloadedSubtitleID == id {
+			return base + candidateIndex, nil
+		}
+	}
+	// A downloaded row is file-bound, so a version switch never carries the id
+	// itself. Keep the viewer's language and format then — never the old
+	// position, which is what a reordered list rewrites onto another row.
+	wanted := carry.downloaded[downloadedIndex]
+	for candidateIndex, candidate := range targetDownloaded {
+		if strings.EqualFold(candidate.Language, wanted.Language) && strings.EqualFold(candidate.Codec, wanted.Codec) {
+			return base + candidateIndex, nil
+		}
+	}
+	return -1, nil
+}
+
+// remapDownloadedSubtitleFromLiveSourceV3 is the historic downloaded-subtitle
+// identity match against the repository lists of source and target. Virtual
+// rows persist release_name as "" (see ReplaceVirtualCandidates and
+// upsertVirtualFileVariant), so two same-language/format downloaded tracks are
+// indistinguishable by ReleaseName and a first-match scan would collapse them
+// onto one target row; the row id is resolved first, and the
+// language/format/ReleaseName match remains for rows that carry no id.
+func (h *PlaybackHandler) remapDownloadedSubtitleFromLiveSourceV3(ctx context.Context, source, target *models.MediaFile, downloadedIndex int) (int, error) {
+	if h.SubtitleRepo == nil || source == nil || target == nil {
+		return -1, nil
+	}
+	sourceDownloaded, sourceErr := h.SubtitleRepo.ListDownloadedSubtitles(ctx, source.ID)
+	targetDownloaded, targetErr := h.SubtitleRepo.ListDownloadedSubtitles(ctx, target.ID)
+	if err := errors.Join(sourceErr, targetErr); err != nil {
+		// A failed lookup says nothing about whether the track exists;
+		// dropping the selection here would store subtitles-off for the
+		// rest of the session over a transient error.
+		return -1, fmt.Errorf("load downloaded subtitles: %w", wrapSubtitleStoreErrorV3(err))
+	}
+	if downloadedIndex >= len(sourceDownloaded) {
+		return -1, nil
+	}
+	wanted := sourceDownloaded[downloadedIndex]
+	base := len(playback.BuildSubtitleInventoryV3(target, nil))
+	if wanted.ID > 0 {
+		for candidateIndex, candidate := range targetDownloaded {
+			if candidate.ID == wanted.ID {
+				return base + candidateIndex, nil
+			}
+		}
+	}
+	for candidateIndex, candidate := range targetDownloaded {
+		if strings.EqualFold(candidate.Language, wanted.Language) && strings.EqualFold(string(candidate.Format), string(wanted.Format)) && strings.EqualFold(candidate.ReleaseName, wanted.ReleaseName) {
+			return base + candidateIndex, nil
+		}
+	}
+	return -1, nil
 }
 
 // transportFailureClassificationsV3 are the client failure classifications
@@ -13554,6 +14901,18 @@ func displayedSubtitleTitleV3(title, embeddedTitle string) string {
 		return title
 	}
 	return embeddedTitle
+}
+
+// subtitleRemapTitleMatchesV3 is the tiebreak when a language/format/flags
+// match names more than one physical subtitle track. An untitled selection has
+// no title evidence and therefore accepts the first identity match, preserving
+// the historical behavior; a titled selection only prefers the track that
+// carries the same displayed title.
+func subtitleRemapTitleMatchesV3(want, got string) bool {
+	if strings.TrimSpace(want) == "" {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(want), strings.TrimSpace(got))
 }
 
 func subtitleVariantIndexV3(file *models.MediaFile, language, title string, forced, hearingImpaired bool) int {

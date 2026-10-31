@@ -4889,3 +4889,60 @@ func TestNormalizeAndValidateV3ExplicitSubtitleOff(t *testing.T) {
 		t.Fatal("subtitle index -2 was accepted")
 	}
 }
+
+// TestPlanPlaybackV3HDRTerminalNamesTheMissingPiece verifies an
+// hdr_transcode_unsupported terminal carries which tone-map check failed,
+// so the server log and the client message name the actual blocker instead
+// of a generic missing-recipe claim.
+func TestPlanPlaybackV3HDRTerminalNamesTheMissingPiece(t *testing.T) {
+	newHDRFile := func() *models.MediaFile {
+		file := detailedFixtureFileV3()
+		file.VideoTracks[0].ColorPrimaries = "bt2020"
+		file.VideoTracks[0].ColorTransfer = "smpte2084"
+		file.VideoTracks[0].ColorSpace = "bt2020nc"
+		return file
+	}
+	newReq := func() StartRequestV3 {
+		req := validStartRequestV3()
+		req.QualityPreference = "1080p"
+		return req
+	}
+	capabilities := tonemap.Capabilities{{
+		Mode: tonemap.ModeSoftware, Backend: "software", Filter: "tonemapx",
+		SourceKinds: []tonemap.SourceKind{tonemap.SourcePQ},
+	}}
+	withTransform := NewTransformationRegistryV3([]TransformationSpecV3{
+		{Name: TransformationAudioToAACV3, RecipeVersion: TransformationAudioToAACRecipeVersionV3, Available: true},
+		{Name: TransformationVideoToH264V3, RecipeVersion: TransformationVideoToH264RecipeVersionV3, Available: true},
+		{Name: TransformationHDRToSDRToneMapV3, RecipeVersion: TransformationHDRToSDRToneMapRecipeVersionV3, Available: true},
+	})
+	withoutTransform := NewTransformationRegistryV3([]TransformationSpecV3{
+		{Name: TransformationAudioToAACV3, RecipeVersion: TransformationAudioToAACRecipeVersionV3, Available: true},
+		{Name: TransformationVideoToH264V3, RecipeVersion: TransformationVideoToH264RecipeVersionV3, Available: true},
+	})
+	for _, test := range []struct {
+		name     string
+		software bool
+		registry *TransformationRegistryV3
+		want     string
+	}{
+		{name: "policy disabled", registry: withTransform, want: "tone-mapping disabled by policy"},
+		{name: "no validated transform", software: true, registry: withoutTransform, want: "registry lacks validated HDR-to-SDR transform"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			result := PlanPlaybackV3(PlannerInputV3{
+				Request: newReq(), RequestedFile: newHDRFile(), EffectiveFile: newHDRFile(), AudioTrackIndex: 0,
+				Settings:               PlannerSettingsV3{TranscodeEnabled: true, Allow4KTranscode: true, SoftwareToneMapEnabled: test.software},
+				Registry:               withTransform,
+				HLSVideoRegistry:       func() *TransformationRegistryV3 { return test.registry },
+				HLSToneMapCapabilities: func() tonemap.Capabilities { return capabilities },
+			})
+			if result.Terminal == nil || result.Terminal.Reason != TerminalHDRTranscodeUnsupportedV3 {
+				t.Fatalf("result = %s, want %q terminal", ExplainPlannerResultV3(result), TerminalHDRTranscodeUnsupportedV3)
+			}
+			if result.Terminal.Detail != test.want {
+				t.Fatalf("detail = %q, want %q", result.Terminal.Detail, test.want)
+			}
+		})
+	}
+}

@@ -1,9 +1,11 @@
 // @vitest-environment jsdom
 
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { createElement } from "react";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { AudioTrackMenu } from "./AudioTrackMenu";
+import { PROVISIONAL_INVENTORY_TIMEOUT_MS } from "../utils/inventoryProvenance";
+import { resolveAppliedAudioIndex } from "../utils/audioTrackMatch";
 
 function renderMenu(tracks: Parameters<typeof AudioTrackMenu>[0]["tracks"]) {
   return render(
@@ -128,6 +130,31 @@ describe("AudioTrackMenu", () => {
     );
     expect(container.firstChild).toBeNull();
     expect(screen.queryByRole("button", { name: "Audio tracks" })).toBeNull();
+  });
+
+  it("shows an empty applied inventory as no selection, not row 0", () => {
+    // The marker is what the session carries when the committed selection has
+    // no row in the applied inventory. It must render no active row while the
+    // menu itself still renders the inventory.
+    const marker = resolveAppliedAudioIndex([], [], null);
+    expect(marker).toBe(-1);
+
+    render(
+      createElement(AudioTrackMenu, {
+        tracks: [{ title: "English", codec: "eac3", channels: 6 }],
+        activeIndex: marker < 0 ? null : marker,
+        onSelect: () => {},
+        currentPosition: 0,
+        open: true,
+        onOpenChange: () => {},
+        hideTrigger: true,
+      }),
+    );
+
+    const entry = screen.getByRole("menuitem");
+    expect(entry).toHaveTextContent("English");
+    expect(entry).not.toHaveClass("text-blue-400");
+    expect(entry).not.toHaveTextContent("\u2713");
   });
 
   it("keeps multiple-track selection behavior unchanged", () => {
@@ -269,7 +296,7 @@ describe("AudioTrackMenu", () => {
     expect(screen.queryByText("Discovering audio tracks…")).toBeNull();
   });
 
-  it("shows discovery banner even when declared tracks are present while provisional", () => {
+  it("gates declared track rows behind the discovery state while provisional", () => {
     render(
       createElement(AudioTrackMenu, {
         tracks: [{ title: "English", codec: "aac", channels: 2 }],
@@ -284,7 +311,29 @@ describe("AudioTrackMenu", () => {
     );
 
     expect(screen.getByText("Discovering audio tracks…")).toBeTruthy();
+    expect(screen.queryByText("English")).toBeNull();
+  });
+
+  it("swaps in live rows when the probed inventory arrives", () => {
+    const tracks = [{ title: "English", codec: "aac", channels: 2 }];
+    const props = {
+      tracks,
+      activeIndex: 0,
+      onSelect: () => {},
+      currentPosition: 0,
+      open: true,
+      onOpenChange: () => {},
+      hideTrigger: false,
+      provisional: true,
+    };
+    const view = render(createElement(AudioTrackMenu, props));
+    expect(screen.queryByText("English")).toBeNull();
+
+    view.rerender(createElement(AudioTrackMenu, { ...props, provisional: false }));
+
     expect(screen.getByText("English")).toBeTruthy();
+    expect(screen.queryByText("Discovering audio tracks…")).toBeNull();
+    expect(screen.queryByText("Unverified")).toBeNull();
   });
 
   it("shows failure banner even when declared tracks are present", () => {
@@ -403,5 +452,112 @@ describe("AudioTrackMenu", () => {
     );
 
     expect(container.firstChild).toBeNull();
+  });
+});
+
+describe("AudioTrackMenu discovery bound", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function renderProvisional(onRetryDiscovery?: () => void) {
+    return render(
+      createElement(AudioTrackMenu, {
+        tracks: [{ title: "English", codec: "aac", channels: 2 }],
+        activeIndex: 0,
+        onSelect: () => {},
+        currentPosition: 0,
+        open: true,
+        onOpenChange: () => {},
+        hideTrigger: true,
+        provisional: true,
+        onRetryDiscovery,
+      }),
+    );
+  }
+
+  it("replaces the unbounded spinner with an explicit retry when discovery stalls", () => {
+    vi.useFakeTimers();
+    renderProvisional();
+
+    expect(screen.getByText("Discovering audio tracks…")).toBeTruthy();
+    act(() => {
+      vi.advanceTimersByTime(PROVISIONAL_INVENTORY_TIMEOUT_MS);
+    });
+
+    expect(screen.queryByText("Discovering audio tracks…")).toBeNull();
+    expect(screen.getByText("Audio tracks unavailable.")).toBeTruthy();
+    // The stalled rows are still declared metadata, so the menu does not fall
+    // back to offering them.
+    expect(screen.queryByText("English")).toBeNull();
+  });
+
+  it("re-triggers discovery and shows progress again on retry", () => {
+    vi.useFakeTimers();
+    const onRetryDiscovery = vi.fn();
+    renderProvisional(onRetryDiscovery);
+
+    act(() => {
+      vi.advanceTimersByTime(PROVISIONAL_INVENTORY_TIMEOUT_MS);
+    });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Retry" }));
+
+    expect(onRetryDiscovery).toHaveBeenCalledOnce();
+    expect(screen.getByText("Discovering audio tracks…")).toBeTruthy();
+    expect(screen.queryByText("Audio tracks unavailable.")).toBeNull();
+
+    act(() => {
+      vi.advanceTimersByTime(PROVISIONAL_INVENTORY_TIMEOUT_MS);
+    });
+    expect(screen.getByText("Audio tracks unavailable.")).toBeTruthy();
+  });
+
+  it("returns to live rows when the retried inventory lands", () => {
+    vi.useFakeTimers();
+    const tracks = [{ title: "English", codec: "aac", channels: 2 }];
+    const props = {
+      tracks,
+      activeIndex: 0,
+      onSelect: () => {},
+      currentPosition: 0,
+      open: true,
+      onOpenChange: () => {},
+      hideTrigger: true,
+      provisional: true,
+    };
+    const view = render(createElement(AudioTrackMenu, props));
+    act(() => {
+      vi.advanceTimersByTime(PROVISIONAL_INVENTORY_TIMEOUT_MS);
+    });
+    expect(screen.getByText("Audio tracks unavailable.")).toBeTruthy();
+
+    view.rerender(createElement(AudioTrackMenu, { ...props, provisional: false }));
+
+    expect(screen.getByText("English")).toBeTruthy();
+    expect(screen.queryByText("Audio tracks unavailable.")).toBeNull();
+    expect(screen.queryByText("Discovering audio tracks…")).toBeNull();
+  });
+
+  it("offers the same retry beside a terminal discovery failure", () => {
+    vi.useFakeTimers();
+    const onRetryDiscovery = vi.fn();
+    render(
+      createElement(AudioTrackMenu, {
+        tracks: [],
+        activeIndex: 0,
+        onSelect: () => {},
+        currentPosition: 0,
+        open: true,
+        onOpenChange: () => {},
+        hideTrigger: false,
+        provisional: true,
+        failed: true,
+        onRetryDiscovery,
+      }),
+    );
+
+    expect(screen.getByText("Track discovery failed")).toBeTruthy();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Retry" }));
+    expect(onRetryDiscovery).toHaveBeenCalledOnce();
   });
 });

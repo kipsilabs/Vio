@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -510,5 +511,151 @@ func TestWatchVersionMatchedFormatsSerialization(t *testing.T) {
 	}
 	if strings.Contains(string(unscored), "matched_formats") {
 		t.Fatalf("unscored row carried matched_formats: %s", unscored)
+	}
+}
+
+// fakeWatchVirtualDetail answers one episode whose versions carry the liveness
+// mix the warm hook must filter: an unprobed virtual row, a probed virtual row,
+// a third virtual row beyond the cap, a local row, and a durably failed one.
+type fakeWatchVirtualDetail struct {
+	fakeWatch
+	detail catalogpkg.WatchDetail
+}
+
+func (f *fakeWatchVirtualDetail) WatchDetail(_ context.Context, _ int, _ string, _ string, _ catalogpkg.AccessFilter) (*catalogpkg.WatchDetail, error) {
+	detail := f.detail
+	return &detail, nil
+}
+
+// Native clients open an episode through getWatchState without declaring a
+// file_id, so the selected-file hook warms nothing. The watch read must warm
+// the virtual rows it lists, with the same cap and memo as the catalog leaf
+// read: unprobed rows get the probe and the warm-up, probed rows only the
+// warm-up, local and failed rows are skipped, and a repeat read schedules
+// nothing again.
+func TestWatchDetailWarmsVirtualVersions(t *testing.T) {
+	probedAt := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
+	watch := &fakeWatchVirtualDetail{detail: catalogpkg.WatchDetail{
+		ContentID: "episode:severance-s1e1", Type: "episode",
+		Versions: []catalogpkg.FileVersion{
+			{FileID: 1, FilePath: "virtual://series/tvdb/1/1/1?result=a", AddedAt: fixedTime()},
+			{FileID: 2, FilePath: "virtual://series/tvdb/1/1/1?result=b", AddedAt: fixedTime(), ProbedAt: &probedAt},
+			{FileID: 3, FilePath: "virtual://series/tvdb/1/1/1?result=c", AddedAt: fixedTime()},
+			{FileID: 4, FilePath: "/media/tv/severance-s1e1.mkv", AddedAt: fixedTime()},
+			{FileID: 5, FilePath: "virtual://series/tvdb/1/1/1?result=dead", AddedAt: fixedTime(), Failed: true},
+		},
+	}}
+	deps := watchDeps(watch)
+	warm := &fakeSelectionWarm{}
+	deps.VirtualSelectionWarm = warm
+	h := newTestHandler(t, deps)
+
+	for range 2 {
+		rec := do(t, h, http.MethodGet, "/api/v2/watch/episode:severance-s1e1", "", viewerHeaders())
+		if rec.Code != http.StatusOK {
+			t.Fatal(rec.Body.String())
+		}
+	}
+	if want := []int{1}; !reflect.DeepEqual(warm.probes, want) {
+		t.Fatalf("probes = %v, want %v (two-version cap, then deduped)", warm.probes, want)
+	}
+	if want := []int{1, 2}; !reflect.DeepEqual(warm.warms, want) {
+		t.Fatalf("warms = %v, want %v (two-version cap, then deduped)", warm.warms, want)
+	}
+}
+
+// Only a leaf watch target has playable rows to warm.
+func TestWatchDetailWarmSkipsNonLeafItems(t *testing.T) {
+	for _, mediaType := range []string{"series", "season", "ebook", "audiobook"} {
+		t.Run(mediaType, func(t *testing.T) {
+			watch := &fakeWatchVirtualDetail{detail: catalogpkg.WatchDetail{
+				ContentID: "ebook:heat", Type: mediaType,
+				Versions: []catalogpkg.FileVersion{{FileID: 1, FilePath: "virtual://book?result=a", AddedAt: fixedTime()}},
+			}}
+			deps := watchDeps(watch)
+			warm := &fakeSelectionWarm{}
+			deps.VirtualSelectionWarm = warm
+			rec := do(t, newTestHandler(t, deps), http.MethodGet, "/api/v2/watch/ebook:heat", "", viewerHeaders())
+			if rec.Code != http.StatusOK {
+				t.Fatal(rec.Body.String())
+			}
+			if len(warm.probes) != 0 || len(warm.warms) != 0 {
+				t.Fatalf("probes = %v, warms = %v, want none", warm.probes, warm.warms)
+			}
+		})
+	}
+}
+
+// An unwired warm seam leaves the watch read untouched rather than failing it.
+func TestWatchDetailWarmIsNoOpWhenUnwired(t *testing.T) {
+	watch := &fakeWatchVirtualDetail{detail: catalogpkg.WatchDetail{
+		ContentID: "episode:severance-s1e1", Type: "episode",
+		Versions: []catalogpkg.FileVersion{{FileID: 1, FilePath: "virtual://series/tvdb/1/1/1?result=a", AddedAt: fixedTime()}},
+	}}
+	rec := do(t, newTestHandler(t, watchDeps(watch)), http.MethodGet, "/api/v2/watch/episode:severance-s1e1", "", viewerHeaders())
+	if rec.Code != http.StatusOK {
+		t.Fatal(rec.Body.String())
+	}
+}
+
+// The watch version projection carries the same per-version liveness the
+// catalog detail does, so a native client can choose from this read alone.
+func TestWatchDetailProjectsVersionLiveness(t *testing.T) {
+	unavailable := false
+	probedAt := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
+	watch := &fakeWatchVirtualDetail{detail: catalogpkg.WatchDetail{
+		ContentID: "episode:severance-s1e1", Type: "episode",
+		Versions: []catalogpkg.FileVersion{{
+			FileID: 7, FilePath: "virtual://series/tvdb/1/1/1?result=a", AddedAt: fixedTime(),
+			Failed: true, Available: &unavailable,
+			SourceMismatch: &catalogpkg.VersionSourceMismatch{ServedBytes: 7427636945, DeclaredBytes: 8449999999},
+			ProbedAt:       &probedAt,
+		}},
+	}}
+	rec := do(t, newTestHandler(t, watchDeps(watch)), http.MethodGet, "/api/v2/watch/episode:severance-s1e1", "", viewerHeaders())
+	if rec.Code != http.StatusOK {
+		t.Fatal(rec.Body.String())
+	}
+	var body struct {
+		Versions []struct {
+			Failed         bool   `json:"failed"`
+			Available      *bool  `json:"available"`
+			ProbedAt       string `json:"probed_at"`
+			SourceMismatch *struct {
+				ServedBytes   int64 `json:"served_bytes"`
+				DeclaredBytes int64 `json:"declared_bytes"`
+			} `json:"source_mismatch"`
+		} `json:"versions"`
+	}
+	decodeJSON(t, rec.Body, &body)
+	if len(body.Versions) != 1 {
+		t.Fatalf("versions = %+v", body.Versions)
+	}
+	version := body.Versions[0]
+	if !version.Failed {
+		t.Fatal("failed missing on a durably failed row")
+	}
+	if version.Available == nil || *version.Available {
+		t.Fatalf("available = %v, want false", version.Available)
+	}
+	if version.SourceMismatch == nil || version.SourceMismatch.ServedBytes != 7427636945 || version.SourceMismatch.DeclaredBytes != 8449999999 {
+		t.Fatalf("source_mismatch = %+v", version.SourceMismatch)
+	}
+	if version.ProbedAt == "" {
+		t.Fatal("probed_at missing on a probed row")
+	}
+
+	// An available, unprobed row omits the health fields entirely.
+	rec = do(t, newTestHandler(t, watchDeps(&fakeWatchVirtualDetail{detail: catalogpkg.WatchDetail{
+		ContentID: "episode:severance-s1e1", Type: "episode",
+		Versions: []catalogpkg.FileVersion{{FileID: 8, FilePath: "virtual://series/tvdb/1/1/1?result=b", AddedAt: fixedTime()}},
+	}})), http.MethodGet, "/api/v2/watch/episode:severance-s1e1", "", viewerHeaders())
+	if rec.Code != http.StatusOK {
+		t.Fatal(rec.Body.String())
+	}
+	for _, field := range []string{"failed", "available", "source_mismatch", "probed_at"} {
+		if strings.Contains(rec.Body.String(), `"`+field+`"`) {
+			t.Fatalf("healthy unprobed row carried %s: %s", field, rec.Body.String())
+		}
 	}
 }

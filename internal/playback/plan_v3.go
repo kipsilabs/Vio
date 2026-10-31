@@ -137,6 +137,14 @@ type PlannerInputV3 struct {
 	// every existing delivery gate honors it and the caller's map is never
 	// mutated.
 	DeliveryAllowList []string
+	// PreviousSubtitleEvaluation is the predecessor plan's degraded subtitle
+	// outcome for the same selection and effective inventory (see
+	// PreviousSubtitleEvaluationV3). When it matches this plan's request and
+	// inventory, the planner republishes that outcome without re-running the
+	// out-of-range disable, so a replan retry storm cannot re-log a warning the
+	// first plan already recorded. Nil for a fresh start and for any replan that
+	// changes the selection or could change the inventory.
+	PreviousSubtitleEvaluation *SubtitleEvaluationV3
 }
 
 // SourceExecutionMetadataV3 is the immutable source probe snapshot used to
@@ -271,6 +279,28 @@ func (input PlannerInputV3) hlsToneMapCapabilities() tonemap.Capabilities {
 	return input.ToneMapCapabilities
 }
 
+// resolvePlanSubtitlePoliciesV3 resolves the selected subtitle for each delivery
+// class, reusing the predecessor plan's degraded outcome when this plan carries
+// the identical selection against the identical effective inventory. The reuse
+// path skips the out-of-range disable (and its warning) entirely: the first plan
+// already recorded it, and nothing about the choice has changed. A changed pick,
+// a changed inventory, or a candidate rotation falls through to the normal
+// per-delivery resolution, so a real switch still behaves exactly as before.
+//
+// The inventory is passed in because it is also the plan's published inventory;
+// computing it once keeps the reuse comparison and the published entry list from
+// ever disagreeing about what this plan offers.
+func resolvePlanSubtitlePoliciesV3(input PlannerInputV3, file *models.MediaFile, inventory []SubtitleInventoryItemV3) (original, progressive, hls SubtitlePolicyResultV3) {
+	if reused, ok := reusedSubtitleDegradeV3(input, file, inventory); ok {
+		// Every delivery class degrades the same out-of-range selection to
+		// subtitles-off, so one reused outcome answers all three.
+		return reused, reused, reused
+	}
+	return ResolveSubtitlePolicyV3(file, input.Request, input.Settings.TranscodeEnabled, DeliveryClassOriginalHTTPV3, input.AdditionalSubtitles),
+		ResolveSubtitlePolicyV3(file, input.Request, input.Settings.TranscodeEnabled, DeliveryClassProgressiveV3, input.AdditionalSubtitles),
+		ResolveSubtitlePolicyV3(file, input.Request, input.Settings.TranscodeEnabled, DeliveryClassHLSV3, input.AdditionalSubtitles)
+}
+
 // PlanPlaybackV3 chooses a playable protocol-v3 route from source and client facts.
 func PlanPlaybackV3(input PlannerInputV3) (result PlannerResultV3) {
 	result = planPlaybackOnceV3(input)
@@ -372,9 +402,8 @@ func planPlaybackOnceV3(input PlannerInputV3) (result PlannerResultV3) {
 	// validated against the capabilities of the delivery class that would
 	// execute it. A refusal on original_http must not suppress a viable
 	// progressive or HLS subtitle renderer.
-	subtitle := ResolveSubtitlePolicyV3(file, input.Request, input.Settings.TranscodeEnabled, DeliveryClassOriginalHTTPV3, input.AdditionalSubtitles)
-	remuxSubtitle := ResolveSubtitlePolicyV3(file, input.Request, input.Settings.TranscodeEnabled, DeliveryClassProgressiveV3, input.AdditionalSubtitles)
-	hlsSubtitle := ResolveSubtitlePolicyV3(file, input.Request, input.Settings.TranscodeEnabled, DeliveryClassHLSV3, input.AdditionalSubtitles)
+	subtitleInventory := BuildSubtitleInventoryV3(file, input.AdditionalSubtitles)
+	subtitle, remuxSubtitle, hlsSubtitle := resolvePlanSubtitlePoliciesV3(input, file, subtitleInventory)
 	if subtitle.Terminal != nil && remuxSubtitle.Terminal != nil && hlsSubtitle.Terminal != nil {
 		return PlannerResultV3{Terminal: subtitle.Terminal, SubtitleTrackIndex: -1, SubtitleTransportTrackIndex: -1}
 	}
@@ -512,7 +541,7 @@ func planPlaybackOnceV3(input PlannerInputV3) (result PlannerResultV3) {
 		Timeline:               TimelineV3{SourceStartSeconds: floatOrZeroV3(input.Request.StartPosition), PlayerStartSeconds: floatOrZeroV3(input.Request.StartPosition), CanSeekAnywhere: true, SeekRestoration: "player_position"},
 	}
 	base.AvailableQualities = availableQualitiesV3(input, source)
-	base.Subtitle.Inventory = BuildSubtitleInventoryV3(file, input.AdditionalSubtitles)
+	base.Subtitle.Inventory = subtitleInventory
 	// Authoritative per-track audio inventory of the effective source; clients
 	// should prefer it over item metadata, which can be stale after a version
 	// fallback rehydrates a different candidate under the same catalog row.
@@ -1292,6 +1321,29 @@ func planVideoTranscodeUnavailableV3(input PlannerInputV3, subtitle SubtitlePoli
 	return nil
 }
 
+// describeToneMapBlockerV3 names the first check that left the tone-map
+// recipe unavailable, in resolveToneMapRecipeV3 order, so an
+// hdr_transcode_unsupported terminal carries the actual missing piece
+// instead of a generic recipe claim.
+func describeToneMapBlockerV3(recipe resolvedToneMapRecipeV3) string {
+	if recipe.policy == tonemap.PolicyNone {
+		return "tone-mapping disabled by policy"
+	}
+	if recipe.resolution.Kind == "" {
+		return "unresolvable HDR source signal"
+	}
+	if recipe.hlsRegistry == nil {
+		return "no HLS video registry"
+	}
+	if !recipe.hlsRegistry.Available(TransformationHDRToSDRToneMapV3) {
+		return "registry lacks validated HDR-to-SDR transform"
+	}
+	if recipe.mode == "" {
+		return "no preferred tone-map mode for the policy and signal"
+	}
+	return "unknown tone-map blocker"
+}
+
 // resolveTranscodeVideoTargetV3 selects the transcode video codec and registry
 // for an available transcode route. It returns a terminal when the source or
 // toolchain rules the route out before any recipe is built.
@@ -1307,7 +1359,7 @@ func resolveTranscodeVideoTargetV3(input PlannerInputV3, source SourceDescriptor
 			result := terminalPlannerResultV3("subtitle_conversion_unsupported", "The selected subtitle must be burned into the video, but this HDR source cannot be re-encoded.", false)
 			return targetVideoSelectionV3{}, toneMapRecipe, &result
 		}
-		result := terminalPlannerResultV3(TerminalHDRTranscodeUnsupportedV3, "This HDR source requires video encoding, but no validated HDR-preserving or tone-map recipe is installed.", false)
+		result := terminalPlannerResultV3WithDetail(TerminalHDRTranscodeUnsupportedV3, "This HDR source requires video encoding, but no validated HDR-preserving or tone-map recipe is installed.", describeToneMapBlockerV3(toneMapRecipe), false)
 		return targetVideoSelectionV3{}, toneMapRecipe, &result
 	}
 	if is4KSourceV3(input.EffectiveFile, source) && !input.Settings.Allow4KTranscode {

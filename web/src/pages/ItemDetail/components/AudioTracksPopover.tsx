@@ -1,5 +1,5 @@
-import { Check, ChevronDown, Volume2 } from "lucide-react";
-import { memo, type ReactNode } from "react";
+import { Check, ChevronDown, Loader2, Volume2 } from "lucide-react";
+import { memo, useCallback, type ReactNode } from "react";
 
 import type { FileVersion } from "@/api/types";
 import { Badge } from "@/components/ui/badge";
@@ -8,6 +8,7 @@ import { getLanguageName } from "@/player/utils/languageNames";
 import { audioTrackLabel, formatChannels } from "@/lib/mediaFormat";
 import { audioTitle, compactAudioMeta } from "./versionFormatUtils";
 import { formatAudioTrackSummary, resolveAudioTrackSelection } from "./prePlaySelection";
+import { useProvisionalInventoryExpiry } from "@/player/hooks/useProvisionalInventoryExpiry";
 import DetailPopover from "./DetailPopover";
 
 interface AudioTracksPopoverProps {
@@ -16,6 +17,14 @@ interface AudioTracksPopoverProps {
   explicitTrackIndex?: number | null;
   onSelectTrack?: (trackIndex: number) => void;
   onResetSelection?: () => void;
+  /**
+   * True while the version's audio rows are the catalog fallback rather than
+   * probe evidence for the file. The menu withholds those rows and says it is
+   * still discovering instead of offering a pick that may not exist.
+   */
+  inventoryProvisional?: boolean;
+  /** Re-runs inventory discovery; shown once the provisional window lapses. */
+  onRetryInventory?: () => void;
 }
 
 function AudioOptionRow({
@@ -75,8 +84,17 @@ function AudioTracksPopover({
   explicitTrackIndex = null,
   onSelectTrack,
   onResetSelection,
+  inventoryProvisional = false,
+  onRetryInventory,
 }: AudioTracksPopoverProps) {
   const tracks = version?.audio_tracks;
+  const { expired: discoveryExpired, retry: restartDiscovery } =
+    useProvisionalInventoryExpiry(inventoryProvisional);
+  const handleRetryInventory = useCallback(() => {
+    restartDiscovery();
+    onRetryInventory?.();
+  }, [onRetryInventory, restartDiscovery]);
+
   if (!tracks || tracks.length === 0) return null;
 
   const isInteractive = Boolean(onSelectTrack || onResetSelection);
@@ -90,6 +108,7 @@ function AudioTracksPopover({
 
   return (
     <DetailPopover
+      positionKey={`${inventoryProvisional}:${discoveryExpired}:${tracks.length}`}
       contentClassName="w-80 p-1.5"
       trigger={
         <Button
@@ -99,11 +118,15 @@ function AudioTracksPopover({
           <Volume2 className="size-3.5" />
           Audio
           <span className="text-muted-foreground max-w-44 truncate text-[0.6875rem] font-normal sm:max-w-64">
-            {isInteractive
-              ? selectionMode === "auto"
-                ? `Auto: ${autoSummary}`
-                : activeSummary
-              : tracks.length}
+            {inventoryProvisional
+              ? discoveryExpired
+                ? "Unavailable"
+                : "Discovering…"
+              : isInteractive
+                ? selectionMode === "auto"
+                  ? `Auto: ${autoSummary}`
+                  : activeSummary
+                : tracks.length}
           </span>
           <ChevronDown className="text-muted-foreground size-3" />
         </Button>
@@ -114,11 +137,29 @@ function AudioTracksPopover({
           <AudioOptionRow
             active={selectionMode === "auto"}
             title="Auto"
-            description={autoSummary}
+            description={inventoryProvisional ? "Profile defaults" : autoSummary}
             onSelect={onResetSelection}
           />
         )}
-        {tracks.map((track, index) => {
+        {inventoryProvisional && !discoveryExpired && (
+          <div className="text-muted-foreground flex items-center gap-2 px-3 py-2 text-xs">
+            <Loader2 className="size-3 animate-spin" />
+            Discovering audio tracks…
+          </div>
+        )}
+        {inventoryProvisional && discoveryExpired && (
+          <div className="text-muted-foreground flex items-center justify-between gap-2 px-3 py-2 text-xs">
+            <span>Audio tracks unavailable.</span>
+            <button
+              type="button"
+              onClick={handleRetryInventory}
+              className="text-primary shrink-0 rounded px-1.5 py-0.5 font-medium hover:underline focus-visible:ring-2 focus-visible:outline-none"
+            >
+              Retry
+            </button>
+          </div>
+        )}
+        {(inventoryProvisional ? [] : tracks).map((track, index) => {
           const codec = audioTrackLabel(track);
           const channels = formatChannels(track.channels);
           const language = getLanguageName(track.language ?? "");

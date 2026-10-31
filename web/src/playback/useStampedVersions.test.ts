@@ -8,7 +8,7 @@ import { useStampedVersions } from "./useStampedVersions";
 // churn that used to re-fire the player's reconnect reconcile (≈1 Hz
 // refetch of the whole watch payload) on every parent render.
 const ROW = { file_id: 7, file_path: "virtual://movie/x" };
-const LIVENESS = new Map([[7, false]]);
+const LIVENESS = new Map([[7, { available: false }]]);
 
 describe("useStampedVersions", () => {
   it("keeps the stamped identity stable across re-renders with unchanged inputs", () => {
@@ -50,7 +50,7 @@ describe("useStampedVersions", () => {
     );
     const first = result.current;
 
-    rerender({ versions: [ROW], liveness: new Map([[7, true]]) });
+    rerender({ versions: [ROW], liveness: new Map([[7, { available: true }]]) });
     expect(result.current).not.toBe(first);
     expect(result.current[0]).toMatchObject({ file_id: 7, available: true });
   });

@@ -6,9 +6,11 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/api/handlers"
+	"github.com/Silo-Server/silo-server/internal/auth"
 	catalogpkg "github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/models"
 )
@@ -33,22 +35,27 @@ type VirtualCandidatesDiscoveryService interface {
 	HasVirtualSource(ctx context.Context, contentID string) (bool, error)
 }
 
+// VirtualSelectionWarmService schedules the pre-play work for one virtual
+// version a detail read surfaced: the inventory probe when the row is
+// unprobed, and the provider-side fetch warm-up. *handlers.PlaybackHandler
+// implements it. Nil leaves detail reads free of side effects.
+type VirtualSelectionWarmService interface {
+	ScheduleSelectedFileProbe(contentID string, fileID int, filter catalogpkg.AccessFilter)
+	ScheduleSelectedFileWarm(contentID string, fileID int, filter catalogpkg.AccessFilter)
+}
+
 const (
 	// preplayDiscoveryWatchBudget bounds version discovery started from
 	// GET /watch/{id}. The caller is about to play, but the discovery work is
 	// detached and the start path resolves its own candidate; waiting longer
 	// only delays the player's first request.
 	preplayDiscoveryWatchBudget = 2 * time.Second
-	// preplayDiscoveryCatalogBudget bounds the same discovery started from a
-	// catalog leaf detail read: browsing is the hot path (Android opens item
-	// detail before any watch request), so the answer keeps a short budget
-	// while the discovery service keeps working detached from it.
-	//
-	// One second keeps navigation responsive. The discovery work continues
-	// detached after this waiter returns, so a cold provider scrape is not
-	// lost; the detail page reads the already-persisted rows and the chain
-	// publishes the refreshed inventory when it lands. Deployments tune it
-	// with the admin Streaming setting virtual_library.catalog_discovery_budget_ms.
+	// preplayDiscoveryCatalogBudget bounds the detached discovery a catalog
+	// leaf detail read starts. The read never waits for it: it answers from the
+	// persisted version list and the detached run publishes versions_updated
+	// when its listing lands, so this budget only bounds how long that provider
+	// work may run. Deployments tune it with the admin Streaming setting
+	// virtual_library.catalog_discovery_budget_ms.
 	preplayDiscoveryCatalogBudget = 1 * time.Second
 
 	// preplayDiscoveryDetailRepeatWindow is how long a successful detail
@@ -62,6 +69,22 @@ const (
 	// limit. Expired entries are swept first; if the map is still full, it is
 	// cleared, which only costs one extra discovery per item.
 	preplayDiscoveryDetailMemoMaxEntries = 512
+)
+
+const (
+	// maxDetailVirtualWarmVersions caps how many virtual versions one catalog
+	// detail read warms. Two matches the watch-detail prefetch cap and keeps a
+	// many-version title from fanning out provider work on a browse read.
+	maxDetailVirtualWarmVersions = 2
+	// detailVirtualWarmRepeatWindow collapses repeated detail reads for the
+	// same version. The handler's own chain admission already drops a duplicate
+	// live chain; this window also covers the gap after one finishes while the
+	// client is still opening or polling the page.
+	detailVirtualWarmRepeatWindow = 30 * time.Second
+	// detailVirtualWarmMemoMaxEntries bounds the memo so a busy catalog cannot
+	// grow it without limit. Expired entries are swept first; a still-full map
+	// is cleared, costing one extra warm per item.
+	detailVirtualWarmMemoMaxEntries = 512
 )
 
 // preplayDiscoveryMemoKey identifies one viewer's detail read for one item and
@@ -127,14 +150,47 @@ func (reg *Registry) preplayDiscoveryCatalogBudgetFor(ctx context.Context) time.
 	return preplayDiscoveryCatalogBudget
 }
 
-// discoverDetailVersions runs the candidate discovery a detail-page read needs
-// and reports whether it found any. A detail-page read may start the pre-play
-// preparation; a bare listing request may not.
-func (reg *Registry) discoverDetailVersions(ctx context.Context, contentID, mediaType string, filter catalogpkg.AccessFilter, trigger string, budget time.Duration) (discovered, hasVirtualSource bool) {
-	claims := claimsFrom(ctx)
+// beginPreplayDiscovery claims the in-flight marker for one discovery key.
+// False means a listing for that key is already running and this read must not
+// start a second one.
+func (reg *Registry) beginPreplayDiscovery(key string) bool {
+	if reg == nil || key == "" {
+		return false
+	}
+	reg.preplayDiscoveryMu.Lock()
+	defer reg.preplayDiscoveryMu.Unlock()
+	if _, running := reg.preplayDiscoveryRunning[key]; running {
+		return false
+	}
+	if reg.preplayDiscoveryRunning == nil {
+		reg.preplayDiscoveryRunning = make(map[string]struct{})
+	}
+	reg.preplayDiscoveryRunning[key] = struct{}{}
+	return true
+}
+
+func (reg *Registry) endPreplayDiscovery(key string) {
+	if reg == nil || key == "" {
+		return
+	}
+	reg.preplayDiscoveryMu.Lock()
+	defer reg.preplayDiscoveryMu.Unlock()
+	delete(reg.preplayDiscoveryRunning, key)
+}
+
+// detailDiscoveryAdmission is the cheap, local half of a detail read's
+// pre-play discovery. It answers whether a provider listing may start and runs
+// the eligibility read that also feeds the detail response's has_virtual_source
+// hint; it never touches the provider.
+//
+// admitted is true only when the caller may run the listing; key names the
+// coalescing identity for it. The caller decides whether to claim that key as
+// an in-flight run (see startDetailVersionDiscovery).
+func (reg *Registry) detailDiscoveryAdmission(ctx context.Context, contentID, mediaType string, filter catalogpkg.AccessFilter, trigger string) (claims *auth.Claims, hasVirtualSource bool, key string, admitted bool) {
+	claims = claimsFrom(ctx)
 	if claims == nil || (mediaType != themeOwnerMovie && mediaType != themeOwnerEpisode) ||
 		reg.deps.VirtualCandidatesDiscovery == nil {
-		return false, false
+		return nil, false, "", false
 	}
 	// Eligibility reads the stored rows server-side instead of the caller's
 	// (possibly path-redacted) version list, so ordinary viewers reach the
@@ -145,42 +201,231 @@ func (reg *Registry) discoverDetailVersions(ctx context.Context, contentID, medi
 	if err != nil {
 		slog.WarnContext(ctx, "pre-play version discovery skipped", "component", "apiv2", "item_id", contentID,
 			"trigger", trigger, "reason", "eligibility_lookup_failed", "error", err)
-		return false, false
+		return nil, false, "", false
 	}
-	hasVirtualSource = virtual
 	if !virtual {
-		return false, false
+		return nil, false, "", false
 	}
+	hasVirtualSource = true
 	if reg.deps.PreplayDiscoveryEnabled == nil || !reg.deps.PreplayDiscoveryEnabled(ctx) {
-		return false, hasVirtualSource
+		return nil, hasVirtualSource, "", false
 	}
-	memoKey := preplayDiscoveryMemoKey(ctx, contentID, filter)
-	if reg.preplayDiscoveryRecentlyRan(memoKey) {
+	key = preplayDiscoveryMemoKey(ctx, contentID, filter)
+	if reg.preplayDiscoveryRecentlyRan(key) {
 		// The player polls watch detail for inventory while the pre-play probe
 		// is still running. Re-listing on that poll rewrites every candidate and
 		// invalidates the probe write's catalog snapshot; the first read in this
 		// window already did the work.
 		slog.DebugContext(ctx, "pre-play version discovery coalesced", "component", "apiv2", "item_id", contentID,
 			"trigger", trigger, "selected_file_id", filter.SelectedFileID)
-		return false, true
+		return nil, hasVirtualSource, "", false
+	}
+	return claims, hasVirtualSource, key, true
+}
+
+// runDetailDiscovery performs one admitted provider listing for a detail read
+// and records the outcome. ownsFlight marks the detached catalog run, which
+// claimed the key's in-flight marker and must release it (and survive a panic
+// with a log rather than taking the process down); the watch path waits on the
+// discovery service's own coalescing and claims nothing. Either way memoKey is
+// what a successful run records in the repeat window. The caller owns ctx: a
+// bound for the waiting watch-detail path, a detached background context for
+// the catalog path.
+func (reg *Registry) runDetailDiscovery(ctx context.Context, claims *auth.Claims, profileID, contentID string, filter catalogpkg.AccessFilter, trigger, memoKey string, ownsFlight bool) (discovered bool) {
+	if ownsFlight {
+		defer reg.endPreplayDiscovery(memoKey)
+		defer func() {
+			// A panic in a detached listing must not take the process down: the
+			// request that started it has long been answered.
+			if recovered := recover(); recovered != nil {
+				slog.ErrorContext(ctx, "pre-play version discovery panicked",
+					"component", "apiv2", "item_id", contentID, "trigger", trigger, "panic", recovered)
+			}
+		}()
 	}
 	started := time.Now()
-	discoveryCtx, cancel := context.WithTimeout(ctx, budget)
-	defer cancel()
 	slog.InfoContext(ctx, "pre-play version discovery started", "component", "apiv2", "item_id", contentID, "trigger", trigger)
 	listed, listErr := reg.deps.VirtualCandidatesDiscovery.DiscoverVirtualCandidates(
-		discoveryCtx, claims.UserID, profileFrom(ctx), contentID, filter,
+		ctx, claims.UserID, profileID, contentID, filter,
 		handlers.VirtualDiscoveryDetail,
 	)
 	if listErr != nil {
 		slog.WarnContext(ctx, "pre-play version discovery unavailable", "component", "apiv2", "item_id", contentID,
 			"trigger", trigger, "duration_ms", time.Since(started).Milliseconds())
-		return false, true
+		return false
 	}
 	slog.InfoContext(ctx, "pre-play version discovery completed", "component", "apiv2", "item_id", contentID,
 		"trigger", trigger, "count", len(listed), "duration_ms", time.Since(started).Milliseconds())
 	reg.rememberPreplayDiscovery(memoKey)
-	return true, true
+	return true
+}
+
+// startDetailVersionDiscovery starts the candidate discovery a detail-page
+// read needs without making that read wait for it, and reports the
+// has_virtual_source hint. The response is built from the persisted version
+// list; the detached run publishes the existing versions_updated catalog event
+// when its listing lands (see VirtualCandidatesRefreshService.listSource), so
+// an open page still refreshes without pricing the provider round-trip into
+// navigation.
+//
+// Only the catalog leaf detail read uses this. Watch detail still waits its
+// short pre-play budget because the caller is about to start playback, and the
+// start path's own candidate resolution depends on that fresh listing.
+func (reg *Registry) startDetailVersionDiscovery(ctx context.Context, contentID, mediaType string, filter catalogpkg.AccessFilter, trigger string, budget time.Duration) (hasVirtualSource bool) {
+	claims, hasVirtualSource, key, admitted := reg.detailDiscoveryAdmission(ctx, contentID, mediaType, filter, trigger)
+	if !admitted {
+		return hasVirtualSource
+	}
+	if !reg.beginPreplayDiscovery(key) {
+		// A listing an earlier detail read started is still running. The rows it
+		// writes are announced by that run's versions_updated event, so this
+		// read neither waits for nor duplicates the provider work.
+		slog.DebugContext(ctx, "pre-play version discovery already running", "component", "apiv2", "item_id", contentID,
+			"trigger", trigger, "selected_file_id", filter.SelectedFileID)
+		return hasVirtualSource
+	}
+	profileID := profileFrom(ctx)
+	// Detach from the request: the client gets its answer now, and a
+	// disconnect must not cancel the listing. The detached run keeps the
+	// caller's values (its access scope and identity) but not its cancellation.
+	detached := context.WithoutCancel(ctx)
+	go func() {
+		discoveryCtx, cancel := context.WithTimeout(detached, budget)
+		defer cancel()
+		reg.runDetailDiscovery(discoveryCtx, claims, profileID, contentID, filter, trigger, key, true)
+	}()
+	return hasVirtualSource
+}
+
+// discoverDetailVersions runs the candidate discovery a detail-page read needs
+// and waits for it, bounded by budget, and reports whether it found any. Watch
+// detail uses this: the caller is about to play, so it prices a short listing
+// into the answer. Catalog detail uses startDetailVersionDiscovery instead and
+// never waits.
+func (reg *Registry) discoverDetailVersions(ctx context.Context, contentID, mediaType string, filter catalogpkg.AccessFilter, trigger string, budget time.Duration) (discovered, hasVirtualSource bool) {
+	claims, hasVirtualSource, key, admitted := reg.detailDiscoveryAdmission(ctx, contentID, mediaType, filter, trigger)
+	if !admitted {
+		return false, hasVirtualSource
+	}
+	discoveryCtx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	// The watch path deliberately does not claim the in-flight marker: it waits
+	// on the discovery service's own coalescing, so a listing another request
+	// already started is joined rather than skipped. key names the memo entry
+	// the run records on success.
+	return reg.runDetailDiscovery(discoveryCtx, claims, profileFrom(ctx), contentID, filter, trigger, key, false), true
+}
+
+// warmDetailVirtualVersions starts the pre-play probe/warm chain for the
+// virtual versions a catalog leaf detail read surfaced. Android and other thin
+// clients open the item page through getCatalogItem and pick a version
+// client-side; they never call the versions check or a select endpoint, so
+// this read is the only server-visible signal that a version is about to play.
+func (reg *Registry) warmDetailVirtualVersions(ctx context.Context, detail *catalogpkg.ItemDetail, filter catalogpkg.AccessFilter) {
+	if detail == nil {
+		return
+	}
+	reg.warmVirtualVersions(ctx, detail.ContentID, detail.Type, detail.Versions, filter)
+}
+
+// warmWatchDetailVirtualVersions starts the same chain for the virtual versions
+// GET /watch/{id} surfaced. Native clients open an episode straight from its
+// watch detail and pick a version client-side without declaring file_id, so the
+// selected-file hook (scheduleSelectedVirtualProbe) has nothing to warm and
+// this read must cover the listed rows instead.
+func (reg *Registry) warmWatchDetailVirtualVersions(ctx context.Context, detail *catalogpkg.WatchDetail, filter catalogpkg.AccessFilter) {
+	if detail == nil {
+		return
+	}
+	reg.warmVirtualVersions(ctx, detail.ContentID, detail.Type, detail.Versions, filter)
+}
+
+// warmVirtualVersions is the shared warm for both detail reads: the catalog
+// leaf read and the watch detail read see the same projected rows and must
+// schedule the same work.
+//
+// The work is bounded to movies and individual episodes (a series or season
+// page carries no playable row), to maxDetailVirtualWarmVersions per read, and
+// to one schedule per version inside detailVirtualWarmRepeatWindow. Scheduling
+// is non-blocking: ScheduleSelectedFileProbe/Warm only take an admission slot
+// and spawn detached work under their own budgets, and both refuse a duplicate
+// live chain. A failed or durably unavailable row is skipped. This path only
+// warms: it never writes a failure verdict, never stamps failed_at, and never
+// fails the detail request.
+func (reg *Registry) warmVirtualVersions(ctx context.Context, contentID, itemType string, versions []catalogpkg.FileVersion, filter catalogpkg.AccessFilter) {
+	if reg == nil || reg.deps.VirtualSelectionWarm == nil {
+		return
+	}
+	if itemType != themeOwnerMovie && itemType != themeOwnerEpisode {
+		return
+	}
+	scheduler := reg.deps.VirtualSelectionWarm
+	warmed := 0
+	for _, version := range versions {
+		if warmed >= maxDetailVirtualWarmVersions {
+			break
+		}
+		if version.FileID <= 0 || version.Failed || (version.Available != nil && !*version.Available) {
+			continue
+		}
+		if !isVirtualVersion(version) {
+			continue
+		}
+		// The cap counts candidate positions, not admissions, so a repeated
+		// read resolves to the same two rows instead of drifting to the next
+		// pair once the first pair is memoized.
+		warmed++
+		if !reg.rememberDetailVirtualWarm(contentID, version.FileID) {
+			continue
+		}
+		// An unprobed row needs the inventory probe for its track menus; a
+		// probed row still needs the warm because probe evidence says nothing
+		// about whether the provider has fetched the bytes.
+		if version.ProbedAt == nil {
+			scheduler.ScheduleSelectedFileProbe(contentID, version.FileID, filter)
+		}
+		scheduler.ScheduleSelectedFileWarm(contentID, version.FileID, filter)
+	}
+}
+
+// isVirtualVersion reports whether a projected version is provider-backed.
+// The path prefix and the container sentinel are the two markers the catalog
+// row uses; either is enough.
+func isVirtualVersion(version catalogpkg.FileVersion) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(version.FilePath)), "virtual://") ||
+		strings.EqualFold(strings.TrimSpace(version.Container), "virtual")
+}
+
+// rememberDetailVirtualWarm records a scheduled version and reports whether it
+// was new. A repeat inside detailVirtualWarmRepeatWindow returns false so the
+// caller skips scheduling. The memo is node-local in-process state with no
+// shared admission; it only suppresses duplicate scheduling.
+func (reg *Registry) rememberDetailVirtualWarm(contentID string, fileID int) bool {
+	if reg == nil || contentID == "" || fileID <= 0 {
+		return false
+	}
+	key := contentID + "\x00" + strconv.Itoa(fileID)
+	now := time.Now()
+	reg.virtualWarmMu.Lock()
+	defer reg.virtualWarmMu.Unlock()
+	if reg.virtualWarmSeen == nil {
+		reg.virtualWarmSeen = make(map[string]time.Time)
+	}
+	if seen, ok := reg.virtualWarmSeen[key]; ok && now.Sub(seen) < detailVirtualWarmRepeatWindow {
+		return false
+	}
+	if len(reg.virtualWarmSeen) >= detailVirtualWarmMemoMaxEntries {
+		for existing, seen := range reg.virtualWarmSeen {
+			if now.Sub(seen) >= detailVirtualWarmRepeatWindow {
+				delete(reg.virtualWarmSeen, existing)
+			}
+		}
+		if len(reg.virtualWarmSeen) >= detailVirtualWarmMemoMaxEntries {
+			reg.virtualWarmSeen = make(map[string]time.Time)
+		}
+	}
+	reg.virtualWarmSeen[key] = now
+	return true
 }
 
 // VirtualReleaseRequestService requests one stored indexer release on the

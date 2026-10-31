@@ -907,6 +907,16 @@ export interface VirtualRanking {
   criteria?: { attribute: string; direction: "asc" | "desc" }[];
 }
 
+/**
+ * A recent playback probe's byte verdict for a virtual version: the bytes the
+ * provider actually served versus the size the catalog row declares. The
+ * server reports it only while its short wrong-source marker lives.
+ */
+export interface VersionSourceMismatch {
+  served_bytes: number;
+  declared_bytes: number;
+}
+
 export interface FileVersion {
   file_id: number;
   file_name?: string;
@@ -929,6 +939,17 @@ export interface FileVersion {
    *  means the version is currently unavailable (e.g. the provider no longer
    *  serves it). Populated by the catalog versions/check endpoint. */
   available?: boolean;
+  /** True when the server confirmed this row dead (durable failed verdict):
+   *  menus remove the row instead of offering it. Absent means not failed;
+   *  an unavailable row without this flag may recover and stays listed. */
+  failed?: boolean;
+  /** A recent probe rejected the provider's bytes as a different release than
+   *  this row declares. Transient and advisory: the release is not dead, so
+   *  this never accompanies `failed`. Populated by versions/check while the
+   *  server still holds the short wrong-source verdict. */
+  source_mismatch?: VersionSourceMismatch;
+  /** RFC 3339 instant in UTC when the file was probed. */
+  probed_at?: string;
   added_at?: string;
   edition_raw?: string;
   edition_key?: string;
@@ -989,6 +1010,15 @@ export interface WatchIndexerRelease {
 export interface VersionLivenessResult {
   file_id: number;
   available: boolean;
+  /** True when the row carries a durable failed verdict (confirmed
+   * unservable), as opposed to a merely unavailable row that may recover.
+   * Menus remove failed rows instead of offering them. Absent means not
+   * failed. */
+  failed?: boolean;
+  /** A recent probe rejected the provider's bytes as a different release than
+   *  the row declares. Advisory only: it never implies failed, and the release
+   *  stays available. Absent while no recent verdict is held. */
+  source_mismatch?: VersionSourceMismatch;
 }
 
 export interface VersionLivenessResponse {

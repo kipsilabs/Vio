@@ -13,6 +13,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/imagesize"
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/notifications"
 )
 
 // CatalogResourceHandler serves canonical catalog resource read routes.
@@ -49,6 +50,10 @@ type CatalogResourceHandler struct {
 	// and extra files are denied.
 	EpisodeLookup PlaybackEpisodeLookup
 	ExtraLookup   PlaybackExtraLookup
+	// Events publishes the catalog invalidation the liveness check owes a
+	// client when a fresh failed_at verdict removes a row from the version
+	// list. Optional: nil skips the publish.
+	Events *notifications.Hub
 
 	watchlistPromoter WatchlistItemPromoter
 }

@@ -330,6 +330,11 @@ func ProbeVirtualSource(
 	}
 	updated := *file
 	applyProbeData(&updated, probe, "virtual")
+	// Carry what the provider actually served so the playback handler can
+	// compare it with the row's declared size. It is deliberately not written
+	// to FileSize: that column is the release's declared size, not the size of
+	// whichever bytes this probe happened to read.
+	updated.ProbedFormatSize = probe.FormatSize
 	// Technical metadata belongs to this playback attempt, but the source
 	// identity must remain the canonical virtual URI. Persisting or carrying a
 	// provider's signed URL beyond the probe makes restart/resume depend on an

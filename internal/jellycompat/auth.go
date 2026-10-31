@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/logredact"
@@ -45,6 +46,35 @@ type Authenticator struct {
 	// keep their Silo tokens unrefreshed.
 	refresher tokenRefresher
 	now       func() time.Time
+	// unknownSessionWarned tracks the last warn per dead-token prefix so one
+	// client retrying a stale token (socket reconnect bursts hit this path
+	// several times per second) logs once per window instead of per request.
+	unknownSessionWarnedMu sync.Mutex
+	unknownSessionWarned   map[string]time.Time
+}
+
+// unknownSessionWarnWindow bounds repeat warnings for the same dead token.
+// The first sighting stays at warn (a new dead token is signal); a client
+// hammering the same token is noise.
+const unknownSessionWarnWindow = 5 * time.Minute
+
+// noteUnknownSession returns true when a dead-token sighting deserves a warn
+// log (first sighting inside the window), false when it should stay quiet.
+func (a *Authenticator) noteUnknownSession(prefix string) bool {
+	if a == nil {
+		return true
+	}
+	now := time.Now()
+	a.unknownSessionWarnedMu.Lock()
+	defer a.unknownSessionWarnedMu.Unlock()
+	if a.unknownSessionWarned == nil {
+		a.unknownSessionWarned = make(map[string]time.Time)
+	}
+	if last, ok := a.unknownSessionWarned[prefix]; ok && now.Sub(last) < unknownSessionWarnWindow {
+		return false
+	}
+	a.unknownSessionWarned[prefix] = now
+	return true
 }
 
 // NewAuthenticator creates a new compat authenticator.
@@ -119,10 +149,18 @@ func (a *Authenticator) RequireSession(next http.Handler) http.Handler {
 			return
 		}
 		if err != nil {
-			slog.WarnContext(r.Context(), "jellycompat auth: session not found", "component", "jellycompat",
-				"path", r.URL.Path,
-				"token_prefix", safeTokenPrefix(token),
-			)
+			prefix := safeTokenPrefix(token)
+			if a.noteUnknownSession(prefix) {
+				slog.WarnContext(r.Context(), "jellycompat auth: session not found", "component", "jellycompat",
+					"path", r.URL.Path,
+					"token_prefix", prefix,
+				)
+			} else {
+				slog.DebugContext(r.Context(), "jellycompat auth: session still not found", "component", "jellycompat",
+					"path", r.URL.Path,
+					"token_prefix", prefix,
+				)
+			}
 			writeError(w, http.StatusUnauthorized, "Unauthorized", "Invalid or expired authentication token")
 			return
 		}

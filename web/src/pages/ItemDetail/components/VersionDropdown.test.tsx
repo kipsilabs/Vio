@@ -2,7 +2,7 @@
 import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { FileVersion } from "@/api/types";
+import type { FileVersion, PlaybackVariant } from "@/api/types";
 import { REFRESH_VERSIONS_ERROR } from "@/hooks/useVersionListRefresh";
 import { REQUEST_RELEASE_ERROR } from "@/hooks/useIndexerReleases";
 import VersionDropdown from "./VersionDropdown";
@@ -28,15 +28,17 @@ vi.mock("@/hooks/useVersionSortPreference", () => ({
 // still drive the payload.
 const watchDetailMock = vi.hoisted(() => ({
   current: undefined as unknown,
+  lastFileId: undefined as number | undefined,
   lastOptions: undefined as unknown,
 }));
 vi.mock("@/hooks/queries/items", () => ({
   useWatchDetail: (
     _id: string | undefined,
-    _fileId?: number,
+    fileId?: number,
     _libraryId?: number,
     options?: { enabled?: boolean },
   ) => {
+    watchDetailMock.lastFileId = fileId;
     watchDetailMock.lastOptions = options;
     return { data: watchDetailMock.current, isLoading: false };
   },
@@ -58,6 +60,7 @@ beforeEach(() => {
   versionSortMock.apply.mockReset();
   versionSortMock.reset.mockReset();
   watchDetailMock.current = undefined;
+  watchDetailMock.lastFileId = undefined;
   watchDetailMock.lastOptions = undefined;
   capabilityMock.mockReset().mockResolvedValue({
     state: "available",
@@ -408,6 +411,16 @@ describe("VersionDropdown indexer releases", () => {
 });
 
 describe("VersionDropdown score and size", () => {
+  it("reads the selected row's watch detail, the same key the ActionBar uses", () => {
+    openPicker([makeVersion({ file_id: 1 }), makeVersion({ file_id: 2 })], {
+      selectedVersion: makeVersion({ file_id: 2 }),
+      contentId: "movie-1",
+    });
+
+    expect(watchDetailMock.lastFileId).toBe(2);
+    expect(watchDetailMock.lastOptions).toEqual({ enabled: true });
+  });
+
   it("shows the format score badge on scored rows only", () => {
     const dialog = openPicker([
       makeVersion({ file_id: 1, resolution: "2160p", format_score: 850 }),
@@ -433,6 +446,49 @@ describe("VersionDropdown score and size", () => {
     expect(dialog.queryByText(/50 53 GB/)).not.toBeInTheDocument();
     // The release label carries the year once; the row title does not repeat it.
     expect(dialog.getAllByText(/2026/)).toHaveLength(1);
+  });
+});
+
+describe("VersionDropdown missing selection", () => {
+  const theatrical = makeVersion({ file_id: 1, resolution: "1080p", edition_key: "theatrical" });
+  const extended = makeVersion({ file_id: 2, resolution: "2160p", edition_key: "extended" });
+  const playbackVariants: PlaybackVariant[] = [
+    {
+      variant_id: "extended",
+      edition_key: "extended",
+      part_count: 1,
+      parts: [{ part_index: 0, versions: [extended] }],
+    },
+    {
+      variant_id: "theatrical",
+      edition_key: "theatrical",
+      part_count: 1,
+      parts: [{ part_index: 0, versions: [theatrical] }],
+    },
+  ];
+
+  it("lists every edition's survivors without claiming an edition is chosen", () => {
+    render(
+      <VersionDropdown
+        versions={[theatrical, extended]}
+        playbackVariants={playbackVariants}
+        selectedVersion={null}
+        selectionMissing
+        onSelectVersion={vi.fn()}
+      />,
+    );
+
+    // The vanished pick says nothing about which edition is wanted, so no
+    // edition control claims a checkmark.
+    expect(screen.queryByRole("button", { name: /Edition/ })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: /Version/ }));
+    const dialog = within(screen.getByRole("dialog"));
+    // Both editions' survivors stay reachable instead of being filtered to the
+    // first edition's rows.
+    const rows = dialog.getAllByRole("button").map((button) => button.textContent ?? "");
+    expect(rows.some((text) => text.includes("1080p"))).toBe(true);
+    expect(rows.some((text) => text.includes("2160p"))).toBe(true);
   });
 });
 

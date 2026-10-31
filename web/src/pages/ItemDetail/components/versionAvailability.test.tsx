@@ -43,6 +43,8 @@ function makeVersion(overrides: Partial<FileVersion> = {}): FileVersion {
     duration: overrides.duration ?? 0,
     bitrate: overrides.bitrate ?? 0,
     available: overrides.available,
+    failed: overrides.failed,
+    source_mismatch: overrides.source_mismatch,
   };
 }
 
@@ -144,6 +146,75 @@ describe("VersionDropdown unavailable versions", () => {
   });
 });
 
+describe("VersionDropdown source mismatch", () => {
+  it("renders the served-vs-declared state instead of the retry badge", () => {
+    const versions = [
+      makeVersion({
+        file_id: 1,
+        resolution: "1080p",
+        available: true,
+        source_mismatch: { served_bytes: 7_427_636_945, declared_bytes: 8_449_999_999 },
+      }),
+      makeVersion({ file_id: 2, resolution: "2160p" }),
+    ];
+    render(
+      <VersionDropdown
+        versions={versions}
+        selectedVersion={versions[0]!}
+        onSelectVersion={vi.fn()}
+      />,
+    );
+
+    const dialog = openVersionDropdown();
+    expect(
+      dialog.getByText("Source mismatch — served 6.9 GB of declared 7.9 GB"),
+    ).toBeInTheDocument();
+    expect(dialog.queryByText("Will retry on play")).not.toBeInTheDocument();
+  });
+
+  it("keeps the generic presentation for a genuinely unprobed row", () => {
+    const versions = [
+      makeVersion({ file_id: 1, resolution: "1080p", available: true }),
+      makeVersion({ file_id: 2, resolution: "2160p" }),
+    ];
+    render(
+      <VersionDropdown
+        versions={versions}
+        selectedVersion={versions[0]!}
+        onSelectVersion={vi.fn()}
+      />,
+    );
+
+    const dialog = openVersionDropdown();
+    expect(dialog.queryByText(/Source mismatch/)).not.toBeInTheDocument();
+    expect(dialog.queryByText("Will retry on play")).not.toBeInTheDocument();
+    expect(dialog.getByRole("button", { name: /1080p/ })).toBeInTheDocument();
+  });
+
+  it("never renders the mismatch as a failed row", () => {
+    const versions = [
+      makeVersion({
+        file_id: 1,
+        resolution: "1080p",
+        available: true,
+        source_mismatch: { served_bytes: 7_000, declared_bytes: 8_000 },
+      }),
+      makeVersion({ file_id: 2, resolution: "2160p" }),
+    ];
+    render(
+      <VersionDropdown
+        versions={versions}
+        selectedVersion={versions[0]!}
+        onSelectVersion={vi.fn()}
+      />,
+    );
+
+    const dialog = openVersionDropdown();
+    expect(dialog.queryByText("Failed")).not.toBeInTheDocument();
+    expect(dialog.getByRole("button", { name: /1080p/ })).toBeInTheDocument();
+  });
+});
+
 describe("VersionFlyoutItems unavailable versions", () => {
   it("hides unavailable versions by default and shows them via the toggle", () => {
     const versions = [
@@ -159,6 +230,24 @@ describe("VersionFlyoutItems unavailable versions", () => {
     expect(unavailableRow).toBeInTheDocument();
     expect(screen.getByText("Will retry on play")).toBeInTheDocument();
     expect(unavailableRow).toHaveClass("opacity-80");
+  });
+
+  it("shows a source mismatch on a row that is still available", () => {
+    const versions = [
+      makeVersion({
+        file_id: 1,
+        resolution: "1080p",
+        available: true,
+        source_mismatch: { served_bytes: 7_427_636_945, declared_bytes: 8_449_999_999 },
+      }),
+    ];
+    render(<VersionFlyoutItems versions={versions} onPlayVersion={vi.fn()} />);
+
+    expect(
+      screen.getByText("Source mismatch — served 6.9 GB of declared 7.9 GB"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Will retry on play")).not.toBeInTheDocument();
+    expect(screen.queryByText("Failed")).not.toBeInTheDocument();
   });
 });
 
@@ -205,5 +294,43 @@ describe("useVersionVisibility toggle stability", () => {
     });
 
     expect(result.current.showUnavailable).toBe(false);
+  });
+});
+
+describe("useVersionVisibility failed rows", () => {
+  function visibleIds(versions: FileVersion[], activeFileId?: number | null) {
+    const { result } = renderHook(() => useVersionVisibility(versions, activeFileId));
+    return result.current.visibleVersions.map((v) => v.file_id);
+  }
+
+  function hiddenCount(versions: FileVersion[], activeFileId?: number | null) {
+    const { result } = renderHook(() => useVersionVisibility(versions, activeFileId));
+    return result.current.hiddenUnavailableCount;
+  }
+
+  const live = (id: number): FileVersion => makeVersion({ file_id: id });
+  const dead = (id: number): FileVersion =>
+    makeVersion({ file_id: id, available: false, failed: true });
+  const stale = (id: number): FileVersion => makeVersion({ file_id: id, available: false });
+
+  it("removes failed rows instead of hiding them behind the toggle", () => {
+    expect(visibleIds([live(1), dead(2), live(3)])).toEqual([1, 3]);
+  });
+
+  it("does not count removed rows as hidden", () => {
+    expect(hiddenCount([live(1), dead(2), stale(3)])).toBe(1);
+  });
+
+  it("keeps the active selection visible even when it failed", () => {
+    expect(visibleIds([live(1), dead(2)], 2)).toEqual([1, 2]);
+  });
+
+  it("renders the full list instead of an empty menu when everything failed", () => {
+    expect(visibleIds([dead(1), dead(2)])).toEqual([1, 2]);
+  });
+
+  it("keeps transiently unavailable rows behind the toggle", () => {
+    expect(visibleIds([live(1), stale(2)])).toEqual([1]);
+    expect(hiddenCount([live(1), stale(2)])).toBe(1);
   });
 });
