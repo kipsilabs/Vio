@@ -9299,7 +9299,7 @@ func (h *PlaybackHandler) evaluatePreparedReplanCandidateV3(
 	// the loaded candidate row may have been re-probed in place (same id,
 	// different release), in which case source==target by id but the ordinal
 	// still names the previous release's track.
-	remapCarry := h.replanRemapSourceV3(sourceFile, session, replanDurableInventoryV3(record))
+	remapCarry := h.replanRemapSourceV3(r.Context(), sourceFile, session, replanDurableInventoryV3(record))
 	if err := remapAudioSelectionV3(remapCarry.file, candidateFile, &candidateStart); err != nil {
 		return nil, &candidateErrorV3{Stage: candidateStageAudioRemap, Message: fmt.Sprintf("candidate %d audio remap failed", candidateFile.ID), Err: err}
 	}
@@ -10587,7 +10587,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		// file's tracks no longer describe what the ordinal names, so remap
 		// from the evidence rather than the row.
 		durableInventory := replanDurableInventoryV3(record)
-		remapCarry := h.replanRemapSourceV3(currentEffectiveFile, session, durableInventory)
+		remapCarry := h.replanRemapSourceV3(r.Context(), currentEffectiveFile, session, durableInventory)
 		remapSource := remapCarry.file
 		// A track_change replaces the seeded selection with the viewer's choice
 		// from the current menu, so its ordinals already address the live
@@ -13473,7 +13473,7 @@ func sameMediaInventoryV3(a, b *models.MediaFile) bool {
 // candidate had no such track), and only absent evidence permits falling back
 // to the loaded row. The captured downloaded tail is returned beside the
 // file-shaped evidence because no models.MediaFile can describe it.
-func (h *PlaybackHandler) replanRemapSourceV3(effectiveFile *models.MediaFile, session *playback.Session, durable map[int]predecessorPlanInventoryV3) carriedInventorySourceV3 {
+func (h *PlaybackHandler) replanRemapSourceV3(ctx context.Context, effectiveFile *models.MediaFile, session *playback.Session, durable map[int]predecessorPlanInventoryV3) carriedInventorySourceV3 {
 	if effectiveFile == nil {
 		return carriedInventorySourceV3{}
 	}
@@ -13503,7 +13503,22 @@ func (h *PlaybackHandler) replanRemapSourceV3(effectiveFile *models.MediaFile, s
 	evidence.AudioTracks = session.VirtualAudioTracks
 	evidence.SubtitleTracks = session.VirtualSubtitleTracks
 	evidence.ExternalSubtitles = session.VirtualExternalSubtitles
-	return carriedInventorySourceV3{file: &evidence}
+	carry := carriedInventorySourceV3{file: &evidence, subtitleHistorical: true}
+	// The session evidence arrays describe the file-shaped inventory but cannot
+	// describe the downloaded tail. Without it a carried downloaded ordinal is
+	// indistinguishable from an unchanged one and would be reused positionally
+	// onto whatever row now occupies it. The session's durable attempt plan is
+	// the same captured inventory the evidence was written from, so recover the
+	// tail there. A dependency failure is carried, not swallowed: the remap
+	// surface reports it instead of reusing an ordinal it cannot prove.
+	downloaded, known, tailErr := h.sessionEvidenceDownloadedTailV3(ctx, session, effectiveFile.ID)
+	if tailErr != nil {
+		carry.subtitleEvidenceErr = tailErr
+	} else if known {
+		carry.downloaded = downloaded
+		carry.downloadedKnown = true
+	}
+	return carry
 }
 
 // virtualCandidateRotationRecordedV3 reports whether the session recorded a
@@ -14151,6 +14166,44 @@ func (h *PlaybackHandler) remapSubtitleSelectionV3(ctx context.Context, source, 
 	return h.remapSubtitleSelectionWithCarryV3(ctx, carriedInventorySourceV3{file: source}, target, request)
 }
 
+// downloadedSelectionCarryErrorV3 fails closed for a carried downloaded
+// ordinal the carry cannot place. A dependency failure while recovering the
+// captured tail surfaces as a store error so the caller can refuse the replan
+// as retryable; a historical carry with no tail reports the track unavailable
+// instead of reusing the ordinal positionally against whatever row now occupies
+// it.
+func downloadedSelectionCarryErrorV3(carry carriedInventorySourceV3, request *playback.StartRequestV3) error {
+	if !carry.namesDownloadedSubtitleV3(request) {
+		return nil
+	}
+	if carry.subtitleEvidenceErr != nil {
+		return fmt.Errorf("load downloaded subtitles: %w", carry.subtitleEvidenceErr)
+	}
+	if carry.subtitleHistorical && !carry.downloadedKnown {
+		return errSubtitleUnavailableInTargetV3
+	}
+	return nil
+}
+
+// sameInventorySubtitleSelectionSettledV3 reports whether a selection needs no
+// remap because the source and target are the same row with identical
+// file-shaped subtitle inventories. A carried downloaded ordinal is re-checked
+// against the captured rows first: that tail is invisible to the file-shaped
+// comparison, so a changed tail still needs the remap below.
+func (h *PlaybackHandler) sameInventorySubtitleSelectionSettledV3(ctx context.Context, carry carriedInventorySourceV3, target *models.MediaFile, request *playback.StartRequestV3) (bool, error) {
+	if carry.file == nil || target == nil || carry.file.ID != target.ID || !sameSubtitleInventoryV3(carry.file, target) {
+		return false, nil
+	}
+	if !carry.namesDownloadedSubtitleV3(request) {
+		return true, nil
+	}
+	changed, err := h.downloadedTailChangedV3(ctx, carry, target)
+	if err != nil {
+		return false, fmt.Errorf("load downloaded subtitles: %w", err)
+	}
+	return !changed, nil
+}
+
 // remapSubtitleSelectionWithCarryV3 is remapSubtitleSelectionV3 with the
 // inventory's captured downloaded tail. That segment has no models.MediaFile
 // representation, so a file-shaped source cannot prove an ordinal in it still
@@ -14167,6 +14220,14 @@ func (h *PlaybackHandler) remapSubtitleSelectionWithCarryV3(ctx context.Context,
 	if request.SubtitleTrackIndex != nil && *request.SubtitleTrackIndex == playback.SubtitleTrackOffIndexV3 {
 		return false, nil
 	}
+	// A carried downloaded ordinal is only meaningful with the tail it was
+	// minted against. A historical carry that never recovered one cannot prove
+	// which row the ordinal names today, and a dependency failure while
+	// recovering it says nothing about whether the track exists. Both must fail
+	// closed here, before the same-id fast path can reuse the position.
+	if err := downloadedSelectionCarryErrorV3(carry, request); err != nil {
+		return false, err
+	}
 	// A same-id pairing is only a no-op when the subtitle inventory is
 	// unchanged. A virtual candidate rotation re-probes the catalog row in
 	// place (same id, different release), so a fingerprint match — not id
@@ -14176,17 +14237,10 @@ func (h *PlaybackHandler) remapSubtitleSelectionWithCarryV3(ctx context.Context,
 	// tail is not part of that fingerprint, so a carried downloaded ordinal is
 	// re-checked against the captured rows even when the file-shaped
 	// inventories compare equal.
-	if source.ID == target.ID && sameSubtitleInventoryV3(source, target) {
-		if !carry.namesDownloadedSubtitleV3(request) {
-			return false, nil
-		}
-		changed, tailErr := h.downloadedTailChangedV3(ctx, carry, target)
-		if tailErr != nil {
-			return false, fmt.Errorf("load downloaded subtitles: %w", tailErr)
-		}
-		if !changed {
-			return false, nil
-		}
+	if settled, err := h.sameInventorySubtitleSelectionSettledV3(ctx, carry, target, request); err != nil {
+		return false, err
+	} else if settled {
+		return false, nil
 	}
 	// A source with no subtitle inventory has nothing to remap FROM. That is
 	// either a virtual parent row (virtual://movie/ttNNNN with no result= param)

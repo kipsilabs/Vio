@@ -1175,7 +1175,12 @@ func (h *PlaybackHandler) rekeyReplanTrackIdentitiesWithRotationV3(ctx context.C
 				return carriedInventorySourceV3{}, 0, false
 			}
 			source := h.rekeySourceFileWithInventoryV3(ctx, embeddedFileID, session, durable)
-			if !source.downloadedKnown || !source.namesDownloadedOrdinalV3(ordinal) {
+			// A historical source may have no captured downloaded tail. That is
+			// absence of proof, not a reason to skip the re-check: a downloaded
+			// ordinal is still recognized positionally, and
+			// constrainRekeyedSubtitleSelectionV3 fails closed for exactly this
+			// case instead of reusing the ordinal as if the tail were unchanged.
+			if !source.namesDownloadedOrdinalV3(ordinal) {
 				return carriedInventorySourceV3{}, 0, false
 			}
 			return source, ordinal, true
