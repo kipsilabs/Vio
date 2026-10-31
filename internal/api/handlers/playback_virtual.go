@@ -5936,18 +5936,6 @@ func virtualProbeEvidenceSharesRowRelease(row *models.MediaFile, candidateURI st
 // be refused: a cross-release candidate the row cannot adopt (a collection-owned
 // row with no adoption target).
 func (h *PlaybackHandler) virtualProbeEvidenceArgsForRow(ctx context.Context, catalogFile *models.MediaFile, resolvedPath string, probed *models.MediaFile, candidate resolver.PersistedIdentityTiers, stampProbe bool) (models.VirtualFilePersistArgs, bool) {
-	if stampProbe && probed != nil && probed.ProbedFormatSize > 0 && catalogFile != nil && catalogFile.FileSize > 0 {
-		expectedRuntime := catalogFile.VirtualExpectedRuntimeMinutes
-		if expectedRuntime <= 0 {
-			expectedRuntime = h.virtualExpectedRuntimeMinutes(ctx, catalogFile)
-		}
-		verdict := scanner.ClassifyVirtualServedEvidence(catalogFile.FileSize, probed.ProbedFormatSize, probed.Duration, expectedRuntime)
-		if !verdict.EstablishesIdentity() {
-			slog.WarnContext(ctx, "virtual probe evidence refused: served size contradicts declared release",
-				"component", "api", "file_id", catalogFile.ID, "declared_size", catalogFile.FileSize, "probed_size", probed.ProbedFormatSize)
-			return models.VirtualFilePersistArgs{}, false
-		}
-	}
 	snap := snapshotVirtualRow(catalogFile)
 	expectedPath := catalogFile.FilePath
 	adoptPath := ""
@@ -5966,6 +5954,29 @@ func (h *PlaybackHandler) virtualProbeEvidenceArgsForRow(ctx context.Context, ca
 	// or the row's durable identity proves a provider-renumbered candidate is the
 	// same release under a new listing token.
 	crossRelease := !virtualProbeEvidenceSharesRowRelease(catalogFile, resolvedPath, candidate)
+
+	if stampProbe && probed != nil && probed.ProbedFormatSize > 0 {
+		declaredSize := catalogFile.FileSize
+		if crossRelease {
+			if candidate.ReleaseSize > 0 {
+				declaredSize = candidate.ReleaseSize
+			} else if probed.FileSize > 0 {
+				declaredSize = probed.FileSize
+			}
+		}
+		if declaredSize > 0 {
+			expectedRuntime := catalogFile.VirtualExpectedRuntimeMinutes
+			if expectedRuntime <= 0 {
+				expectedRuntime = h.virtualExpectedRuntimeMinutes(ctx, catalogFile)
+			}
+			verdict := scanner.ClassifyVirtualServedEvidence(declaredSize, probed.ProbedFormatSize, probed.Duration, expectedRuntime)
+			if !verdict.EstablishesIdentity() {
+				slog.WarnContext(ctx, "virtual probe evidence refused: served size contradicts declared release",
+					"component", "api", "file_id", catalogFile.ID, "declared_size", declaredSize, "probed_size", probed.ProbedFormatSize)
+				return models.VirtualFilePersistArgs{}, false
+			}
+		}
+	}
 	// Adopt against the session pin: when the row already carries a concrete
 	// ?result= pick and only durable identity ties the resolved churned token to
 	// it, keep the row's concrete path and write the evidence metadata-only
