@@ -74,8 +74,8 @@ func TestRedisClientsTakeDatabaseNumberFromRedisDB(t *testing.T) {
 // Runs without a Redis server: the name Redis receives must carry the database
 // number that the same connection selected.
 func TestRedisEventBusSendsScopedChannelToRedis(t *testing.T) {
-	bare := []string{"SUBSCRIBE vio:admin on database 0", "PUBLISH vio:admin on database 0"}
-	db5 := []string{"SUBSCRIBE vio:admin@db5 on database 5", "PUBLISH vio:admin@db5 on database 5"}
+	bare := []string{"SUBSCRIBE silo:admin on database 0", "PUBLISH silo:admin on database 0"}
+	db5 := []string{"SUBSCRIBE silo:admin@db5 on database 5", "PUBLISH silo:admin@db5 on database 5"}
 	for _, tc := range []struct {
 		name string
 		path string
@@ -83,7 +83,7 @@ func TestRedisEventBusSendsScopedChannelToRedis(t *testing.T) {
 		want []string
 		bare bool
 	}{
-		{"database 3", "/3", "", []string{"SUBSCRIBE vio:admin@db3 on database 3", "PUBLISH vio:admin@db3 on database 3"}, false},
+		{"database 3", "/3", "", []string{"SUBSCRIBE silo:admin@db3 on database 3", "PUBLISH silo:admin@db3 on database 3"}, false},
 		{"database 0", "/0", "", bare, false},
 		{"no database number", "", "", bare, false},
 		{"negative database number", "/-1", "", bare, false},
@@ -131,8 +131,8 @@ func TestCheckEventBusChannels(t *testing.T) {
 	}
 
 	for _, tc := range []struct{ path, want string }{
-		{"/3", "SUBSCRIBE vio:catalog@db3 vio:admin@db3 vio:playback@db3 vio:logs@db3 vio:events@db3"},
-		{"/0", "SUBSCRIBE vio:catalog vio:admin vio:playback vio:logs vio:events"},
+		{"/3", "SUBSCRIBE silo:catalog@db3 silo:admin@db3 silo:playback@db3 silo:transcode-move@db3 silo:logs@db3 silo:events@db3"},
+		{"/0", "SUBSCRIBE silo:catalog silo:admin silo:playback silo:transcode-move silo:logs silo:events"},
 	} {
 		server := startRESPTestServer(t, nil, respTestRedis)
 		if err := check(t, server, tc.path); err != nil {
@@ -147,7 +147,7 @@ func TestCheckEventBusChannels(t *testing.T) {
 		if args[0] != "SUBSCRIBE" {
 			return "", false
 		}
-		return "-NOPERM User silo has no permissions to access the 'vio:catalog' channel\r\n", true
+		return "-NOPERM User silo has no permissions to access the 'silo:catalog' channel\r\n", true
 	})
 	err := check(t, server, "/0")
 	if _, refused := errors.AsType[redis.Error](err); !refused || !strings.Contains(err.Error(), "NOPERM") {
@@ -164,8 +164,8 @@ func TestCheckEventBusChannels(t *testing.T) {
 			"-NOPERM User silo has no permissions to access the '" + args[2] + "' channel\r\n", true
 	})
 	err = check(t, server, "/0")
-	if _, refused := errors.AsType[redis.Error](err); !refused || !strings.Contains(err.Error(), "vio:admin") {
-		t.Errorf("a later channel refused: %v, want the NOPERM reply for vio:admin", err)
+	if _, refused := errors.AsType[redis.Error](err); !refused || !strings.Contains(err.Error(), "silo:admin") {
+		t.Errorf("a later channel refused: %v, want the NOPERM reply for silo:admin", err)
 	}
 }
 

@@ -70,9 +70,7 @@ func TestHandleMasterManifestReplansAfterRemoteSoftwareToneMapFailure(t *testing
 			}
 			// The node accepted the software job but did not confirm its promised
 			// output. The manifest path must stop that job before trying a sibling.
-			// A faithful node echoes the throttle policy it armed; only the
-			// tone-map confirmation is absent.
-			writeJSON(w, http.StatusAccepted, transcodenode.TranscodeStartResponse{ThrottleSeconds: request.ThrottleSeconds})
+			writeJSON(w, http.StatusAccepted, transcodenode.TranscodeStartResponse{ThrottleSeconds: request.ThrottleSeconds, RequireAudioTrack: request.RequireAudioTrack})
 		case r.Method == http.MethodDelete && r.URL.Path == "/transcode/upstream-1":
 			failedNodeCleaned.Store(true)
 			w.WriteHeader(http.StatusNoContent)
@@ -100,11 +98,7 @@ func TestHandleMasterManifestReplansAfterRemoteSoftwareToneMapFailure(t *testing
 				return
 			}
 			fallbackModes.record(request.ToneMapMode)
-			writeJSON(w, http.StatusAccepted, transcodenode.TranscodeStartResponse{
-				HWAccel: request.HWAccel, ToneMapMode: request.ToneMapMode,
-				// A real node echoes the requested policy.
-				ThrottleSeconds: request.ThrottleSeconds,
-			})
+			writeJSON(w, http.StatusAccepted, transcodenode.TranscodeStartResponse{RequireAudioTrack: request.RequireAudioTrack, HWAccel: request.HWAccel, ToneMapMode: request.ToneMapMode, ThrottleSeconds: request.ThrottleSeconds})
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}

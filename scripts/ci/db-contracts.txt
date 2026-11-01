@@ -40,6 +40,15 @@
 ./internal/scanner TestScanIndexesFileWithNonUTF8Name
 ./migrations TestScanRunForeignKeysHaveLeadingIndexesDB
 
+# Movie box sets: grouping by viewer access and the minimum, grouped browse
+# and letters, search, sync bookkeeping, and collection artwork.
+./internal/catalog TestBoxSetGroupsDB
+./internal/catalog TestBoxSetGroupedBrowseDB
+./internal/catalog TestBoxSetSearchAndSyncDB
+./internal/catalog TestBoxSetCollectionsOfDisabledLibraryDB
+./internal/catalog TestMovieBoxSetDB
+./internal/catalog TestBoxSetCollectionArtworkDB
+
 # A watched special does not anchor Next Up for a series with regular seasons.
 ./internal/catalog TestNextUpSkipsSpecialAnchorsPostgres
 
@@ -765,3 +774,7 @@
 # Personal collection list reads remember counts and collages with no source
 # until the membership revision or the viewer's access changes.
 ./internal/catalog TestPersonalCollectionReadsRememberedDB
+
+# The artwork reconcile verify sweep and bulk reset leave bundled app-relative
+# collection posters alone: neither checks them against storage nor clears them.
+./internal/metadata TestArtworkReconcileSkipsBundledPostersDB

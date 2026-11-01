@@ -95,6 +95,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/subtitles/subsource"
 	"github.com/Silo-Server/silo-server/internal/taskmanager"
 	"github.com/Silo-Server/silo-server/internal/taskmanager/repository"
+	"github.com/Silo-Server/silo-server/internal/taskmanager/tasks"
 	"github.com/Silo-Server/silo-server/internal/themedelivery"
 	"github.com/Silo-Server/silo-server/internal/themesongs"
 	"github.com/Silo-Server/silo-server/internal/trickplay"
@@ -909,6 +910,9 @@ func newChiRouter(deps Dependencies) chi.Router {
 		libraryHandler.ScanQueue = deps.LibraryScanQueue
 		libraryHandler.RealtimeMonitor = deps.LibraryMonitor
 		libraryHandler.Trickplay = deps.Trickplay
+		if deps.TaskManager != nil {
+			libraryHandler.BoxSets = boxSetSyncStarter{tasks: deps.TaskManager}
+		}
 		libraryHandler.MovieMatchQueueRepo = deps.MovieMatchQueueRepo
 		libraryHandler.SeriesMatchQueueRepo = deps.SeriesRootMatchQueueRepo
 		libraryHandler.RawMatchBacklogRepo = deps.FileRepo
@@ -1147,6 +1151,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 		catalogHandler = handlers.NewCatalogHandler(catalogResolver, itemsHandler)
 		shuffleService = shuffle.NewService(deps.DB, catalogResolver)
 		catalogHandler.SetWorkSummaryProvider(literaryRepo)
+		catalogHandler.SetBoxSetRepository(catalog.NewBoxSetRepository(deps.DB))
 
 		requestsRepo := mediarequests.NewRepository(deps.DB, deps.SecretCipher)
 		requestSvc := mediarequests.NewService(
@@ -1257,6 +1262,12 @@ func newChiRouter(deps Dependencies) chi.Router {
 			}
 			// Fully qualify webhook URLs when the public base URL is known.
 			autoscanHandler.SetPublicURL(deps.PublicURL)
+			// The v1 and v2 webhook routes share the autoscan_webhook budget,
+			// which only refuses unknown tokens: arr does not retry a refused
+			// delivery, so one with a real token over it is still admitted.
+			if deps.RateLimitMW != nil {
+				deps.RateLimitMW.AdmitOverEndpointBudget("autoscan_webhook", autoscanHandler.KnowsWebhookToken)
+			}
 		}
 
 		if deps.PersonRepo != nil {
@@ -3957,6 +3968,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 	}
 	if catalogHandler != nil {
 		v2deps.CatalogBrowse = catalogHandler
+		v2deps.BoxSets = catalogHandler
 	}
 	if catalogResourceHandler != nil {
 		v2deps.CatalogItems = catalogResourceHandler
@@ -4261,6 +4273,8 @@ func newChiRouter(deps Dependencies) chi.Router {
 		// Vio session; the URL's bearer token authenticates the delivery and
 		// maps it to its Autoscan source. Rate limited per-IP (plus the
 		// "autoscan_webhook" per-endpoint limit) since it is unauthenticated.
+		// The per-endpoint limit only refuses unknown tokens (see
+		// AdmitOverEndpointBudget where the handler is built).
 		if autoscanHandler != nil {
 			if deps.RateLimitMW != nil {
 				r.With(deps.RateLimitMW.AuthEndpointHandler("autoscan_webhook")).
@@ -6371,4 +6385,16 @@ func newDiscordNotificationsHandler(deps Dependencies, tokens *access.ProfileTok
 	h.Stores = deps.UserStoreProvider
 	h.ProfileTokens = tokens
 	return h
+}
+
+// boxSetSyncStarter starts the box set sync task when a library turns box
+// sets on. A run already in progress looks the library up before it ends.
+type boxSetSyncStarter struct {
+	tasks *taskmanager.TaskManager
+}
+
+func (s boxSetSyncStarter) SyncBoxSetsSoon() {
+	if _, err := s.tasks.StartTask(tasks.SyncMovieBoxSetsTaskKey); err != nil {
+		slog.Debug("box set sync not started", "component", "api", "error", err)
+	}
 }
