@@ -117,9 +117,13 @@ type Claims struct {
 	// Reconstruction recipe — the byte-affecting encode parameters, mirroring the
 	// former playback.RecipeCard. Zero for direct/remux tokens, which reconstruct
 	// from identity alone plus the client-supplied position.
-	SourceVideoCodec           string  `json:"svc,omitempty"`
-	SourceVideoProfile         string  `json:"svp,omitempty"`
-	SourceVideoBitDepth        int     `json:"svb,omitempty"`
+	SourceVideoCodec    string `json:"svc,omitempty"`
+	SourceVideoProfile  string `json:"svp,omitempty"`
+	SourceVideoBitDepth int    `json:"svb,omitempty"`
+	// SourceFrameRate and SourceHeight preserve the probed source facts needed
+	// to rebuild frame-accurate GOPs and avoid a no-op scale.
+	SourceFrameRate            float64 `json:"sfr,omitempty"`
+	SourceHeight               int     `json:"sh,omitempty"`
 	SourceAudioChannels        int     `json:"sach,omitempty"`
 	SoftwareVideoDecode        bool    `json:"svd,omitempty"`
 	ToneMapPolicy              string  `json:"tmp,omitempty"`

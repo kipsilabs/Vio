@@ -852,6 +852,8 @@ type StartRequestV3 struct {
 	ProgressPersistence        ProgressPersistenceV3     `json:"progress_persistence,omitempty"`
 	AudioTrackID               string                    `json:"audio_track_id,omitempty"`
 	CarriedAudioTrackID        string                    `json:"carried_audio_track_id,omitempty"`
+	FileSelection              FileSelectionV3           `json:"file_selection,omitempty"`
+	ForceRelink                bool                      `json:"force_relink,omitempty"`
 	OfferedVirtualURI          string                    `json:"offered_virtual_uri,omitempty"`
 	AudioTrackIndex            *int                      `json:"audio_track_index,omitempty"`
 	SubtitleTrackID            string                    `json:"subtitle_track_id,omitempty"`
@@ -1340,6 +1342,8 @@ type PlanV3 struct {
 	DecisionReason         string                 `json:"decision_reason"`
 	RequestedMediaFileID   int                    `json:"requested_media_file_id"`
 	EffectiveMediaFileID   int                    `json:"effective_media_file_id"`
+	DeliveryChange         *DeliveryChangeV3      `json:"delivery_change,omitempty"`
+	TracksPending          bool                   `json:"tracks_pending,omitempty"`
 	Source                 SourceDescriptorV3     `json:"source"`
 	SubtitleFidelityPolicy string                 `json:"subtitle_fidelity_policy"`
 	// ActiveQuality is the AvailableQualities label this plan delivers, or

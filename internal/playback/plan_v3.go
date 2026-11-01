@@ -55,6 +55,9 @@ const (
 type PlannerInputV3 struct {
 	Request                    StartRequestV3
 	PreviousSubtitleEvaluation *SubtitleEvaluationV3
+	// StickyDelivery is the delivery class already serving the session; replans
+	// prefer to retain it when the request remains serviceable.
+	StickyDelivery DeliveryV3
 	// ServerBitrateCapKbps is an administrator-owned, per-attempt ceiling.
 	// Unlike a client's bandwidth preference it must fail closed.
 	ServerBitrateCapKbps int
