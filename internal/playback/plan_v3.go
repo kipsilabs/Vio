@@ -1594,8 +1594,9 @@ func resolveTranscodeVideoTargetV3(input PlannerInputV3, source SourceDescriptor
 	// H.264 is always an allowed output, but it stays within an attested
 	// H.264 decoder: a scaled encode steps down to the tallest class one
 	// takes, and the bitrate stays within that decoder's limit.
+	h264Quality := h264BoundedQualityV3(input.Request, quality, source)
 	hevcQuality := quality
-	quality = h264BoundedQualityV3(input.Request, quality, source)
+	quality = h264Quality
 	if input.Settings.AllowHEVCEncoding && hlsRegistry.Available(TransformationVideoToHEVCV3) {
 		// HEVC output needs no more than the source's bits counted as HEVC,
 		// whether it scales the source or only converts it at its own size,
@@ -1635,7 +1636,7 @@ func resolveTranscodeVideoTargetV3(input PlannerInputV3, source SourceDescriptor
 			return TransformationVideoToHEVCV3
 		}
 		return TransformationVideoToH264V3
-	}()}
+	}(), h264Quality: h264Quality}
 	return selection, quality, toneMapRecipe, nil
 	/*
 		if source.DynamicRange != "" && source.DynamicRange != DynamicRangeSDRV3 {
@@ -1761,7 +1762,7 @@ func downgradeTranscodePlanV3(input PlannerInputV3, subtitle SubtitlePolicyResul
 	// checking exhaustion so recovery can downgrade codecs on the same HLS
 	// delivery without changing source/remux behavior.
 	if targetVideo.codec != TargetVideoCodecH264V3 && planAttemptedV3(*plan, outputContextID, input.AttemptedKeys) {
-		h264Quality := quality
+		h264Quality := targetVideo.h264Quality
 		targetVideo = targetVideoFloorV3
 		targetVideo.h264Quality = h264Quality
 		quality = h264Quality
@@ -1816,9 +1817,9 @@ func planVideoTranscodeV3(input PlannerInputV3, base PlanV3, source SourceDescri
 	// H.264 floor when either fails.
 	if targetVideo.codec == TargetVideoCodecHEVCV3 &&
 		(!input.Settings.AllowHEVCEncoding || !hlsHEVCOutputSupportedV3(input.Request, quality, source)) {
+		quality = targetVideo.h264Quality
 		targetVideo = targetVideoFloorV3
-		quality = ResolveQualityPolicyV3(input.Request, source)
-		quality = h264BoundedQualityV3(input.Request, quality, source)
+		targetVideo.h264Quality = quality
 	}
 	// A forced encode triggered by burn-in, HDR handling, or capability
 	// evidence must not inherit a source-preserving "original quality" bitrate:
