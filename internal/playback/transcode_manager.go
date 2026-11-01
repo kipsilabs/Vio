@@ -504,6 +504,9 @@ func (m *TranscodeManager) restartSegmentLockedWithTarget(
 		target, ok, restartErr = ts.RestartSegment(ctx, segNum())
 		return restartErr
 	})
+	if err != nil {
+		ok = false
+	}
 	return target, ok, err
 }
 
