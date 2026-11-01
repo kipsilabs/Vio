@@ -31,8 +31,11 @@ func TestCreateRequestDefersRoutingFactsAndKeepsClientTitle(t *testing.T) {
 	if req.Title != "spirited away (client copy)" || store.created[0].Facts.Captured() {
 		t.Fatalf("title = %q facts = %+v, want the client's title and uncaptured facts", req.Title, store.created[0].Facts)
 	}
-	facts := store.created[0].Facts
-	if !facts.Captured() || !facts.Anime || !req.IsAnime || facts.OriginalLanguage != "ja" || facts.Year != 2001 ||
+	// Enrichment is deferred past the 201; run the scheduled work explicitly
+	// before asserting the facts it writes back.
+	enrichment.drain()
+	facts := store.requests[req.ID].RoutingFacts
+	if !facts.Captured() || !facts.Anime || !store.requests[req.ID].IsAnime || facts.OriginalLanguage != "ja" || facts.Year != 2001 ||
 		!slices.Equal(facts.GenreIDs, []int{16, 14}) || !slices.Equal(facts.CompanyIDs, []int{10342}) || facts.SeriesStatus != nil {
 		t.Fatalf("facts = %+v, want the TMDB snapshot", facts)
 	}

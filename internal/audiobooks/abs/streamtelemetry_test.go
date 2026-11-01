@@ -71,7 +71,6 @@ func telemetryRegistry(t testing.TB, families ...streamtelemetry.Family) *stream
 // all — behind a real socket. Handler-level tests bypass the middleware under
 // test, which is how this project once shipped a feature that was a no-op for
 // weeks.
-//
 func absTelemetryServer(t testing.TB, registry *streamtelemetry.Registry, deps Dependencies) *absServer {
 	t.Helper()
 	handler := New(deps)
