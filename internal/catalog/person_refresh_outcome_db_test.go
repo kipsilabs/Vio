@@ -7,8 +7,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-
-	"github.com/Silo-Server/silo-server/internal/models"
 )
 
 // seedRefreshPerson inserts a person with an external id and incomplete

@@ -2,10 +2,7 @@ package catalog
 
 import (
 	"context"
-	"errors"
-	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/Silo-Server/silo-server/internal/models"
 )
