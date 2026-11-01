@@ -2892,6 +2892,9 @@ func (s *TranscodeSession) BuildPlaybackManifest(segPrefix, rawQuery string) ([]
 	return s.buildPlaybackManifest(segPrefix, s.generationScopedQuery(rawQuery))
 }
 
+// GenerationQueryParam names the query parameter carrying a generation token.
+const GenerationQueryParam = "sgen"
+
 // generationScopedQuery binds manifest segment URLs to this session generation.
 func (s *TranscodeSession) generationScopedQuery(rawQuery string) string {
 	token := s.GenerationToken()
@@ -3851,6 +3854,34 @@ func (s *TranscodeSession) OpenSegment(name string) (*SegmentLease, error) {
 func servableSegmentName(name string) bool {
 	return filepath.IsLocal(name) && filepath.Base(name) == name && name != "." &&
 		name != subtitleFilterAliasName
+}
+
+// OpenSegmentForGeneration opens a segment only when its generation token still
+// names the generation that produced the opened descriptor. Empty tokens retain
+// compatibility with URLs minted before generation fencing was introduced.
+func (s *TranscodeSession) OpenSegmentForGeneration(name, generationToken string) (*SegmentLease, error) {
+	lease, err := s.OpenSegment(name)
+	if err != nil {
+		return nil, err
+	}
+	if generationToken != "" && lease.GenerationToken != generationToken {
+		_ = lease.Close()
+		return nil, ErrStaleSegmentGeneration
+	}
+	return lease, nil
+}
+
+// FenceSegmentLease applies the generation check after a recovery or wait path
+// that opened a descriptor before the request's token was revalidated.
+func FenceSegmentLease(lease *SegmentLease, generationToken string) (*SegmentLease, error) {
+	if lease == nil || generationToken == "" {
+		return lease, nil
+	}
+	if lease.GenerationToken != generationToken {
+		_ = lease.Close()
+		return nil, ErrStaleSegmentGeneration
+	}
+	return lease, nil
 }
 
 // Close terminates the ffmpeg process and removes the temporary output directory.

@@ -588,7 +588,7 @@ func TestReplanRequestV3ValidationRetainsClientBuildChannelNormalization(t *test
 		t.Fatalf("structural Validate rewrote app_channel = %q, want raw %q", got, rawChannel)
 	}
 
-	merged := start
+	merged := validStartRequestV3()
 	merged.Capabilities = request.Capabilities
 	merged.ClientPlaybackContext = request.ClientPlaybackContext
 	merged.ClientPlaybackContext.Deliveries = CloneDeliveryCapabilitiesV3(request.ClientPlaybackContext.Deliveries)
@@ -5266,7 +5266,7 @@ func TestReplanRequestV3NormalizesUnicodeAppVersionOnMergedStart(t *testing.T) {
 		t.Fatalf("structural Validate rewrote app_version = %q, want raw %q", got, rawVersion)
 	}
 
-	merged := start
+	merged := validStartRequestV3()
 	merged.Capabilities = request.Capabilities
 	merged.ClientPlaybackContext = request.ClientPlaybackContext
 	merged.ClientPlaybackContext.Deliveries = CloneDeliveryCapabilitiesV3(request.ClientPlaybackContext.Deliveries)
