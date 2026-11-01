@@ -2147,8 +2147,8 @@ export function usePlaybackSession(
       // Told before the state update, so the caller hears of the adoption
       // before anything can render the new plan.
       onAdopt?.(planRevisionRef.current);
-      setState((current) => ({
-        ...planToSessionState(
+      setState((current) => {
+        const next = planToSessionState(
           plan,
           sessionId ?? null,
           playbackAttemptIdRef.current ?? "",

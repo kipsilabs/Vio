@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router";
+import { toast } from "sonner";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { v2, V2ProblemError } from "@/api/v2/request";
 import AdminRequests from "./AdminRequests";
@@ -21,37 +22,18 @@ vi.mock("@/api/client", async (importOriginal) => ({
   }),
   isProfileRequestContextCurrent: () => true,
 }));
-vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
-const mockAdminPluginInstallations = vi.fn(() => ({
-  data: [{ id: 1, plugin_id: "router", capabilities: [{ type: "request_router.v1", id: "arr" }] }],
-  isLoading: false,
-}));
-vi.mock("@/hooks/queries/admin/plugins", () => ({
-  useAdminPluginInstallations: () => mockAdminPluginInstallations(),
-}));
+vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn(), info: vi.fn() } }));
 vi.mock("@/hooks/queries/admin/users", () => ({
-  useAdminUsers: () => ({ data: [{ id: 1, username: "member" }], isLoading: false }),
+  useAdminUsers: () => ({
+    data: [
+      { id: 1, username: "member" },
+      { id: 7, username: "sam" },
+    ],
+    isLoading: false,
+  }),
 }));
-const settings = {
-  requests_enabled: true,
-  global_max_requests: 5,
-  global_window_days: 7,
-  global_auto_approval_enabled: false,
-  force_dual_quality: false,
-};
-const conflict = () =>
-  new V2ProblemError(
-    "updateAdminRequestSettings",
-    {
-      type: "https://silo.test/problems/precondition_failed",
-      title: "Changed",
-      status: 412,
-      detail: "Changed",
-      instance: "test",
-    },
-    null,
-    '"newer"',
-  );
+
+const CREATED = "2026-09-01T00:00:00Z";
 function reply(options: unknown, body: unknown, etag = '"initial"') {
   (options as { onResponse?: (r: Response) => void })?.onResponse?.(
     new Response(null, { headers: { ETag: etag } }),
@@ -59,15 +41,81 @@ function reply(options: unknown, body: unknown, etag = '"initial"') {
   return Promise.resolve(body) as never;
 }
 
+type Options = {
+  query?: Record<string, unknown>;
+  path?: Record<string, string>;
+  body?: Record<string, unknown>;
+};
+type Handler = (options: Options) => unknown;
+
+/** Answers each v2 operation from `handlers`; any other operation fails. */
+function serve(handlers: Record<string, Handler>) {
+  vi.mocked(v2).mockImplementation((operation, options) => {
+    const handler = handlers[operation];
+    if (!handler) return Promise.reject(new Error(`unexpected ${operation}`)) as never;
+    return reply(options, handler((options ?? {}) as Options));
+  });
+}
+function calls(operation: string) {
+  return vi
+    .mocked(v2)
+    .mock.calls.filter(([op]) => op === operation)
+    .map(([, options]) => options as Options);
+}
+
+function request(id: string, title: string, fields: Record<string, unknown> = {}) {
+  return {
+    id,
+    provider: "tmdb",
+    media_type: "movie",
+    tmdb_id: Number(id.replace(/\D/g, "")) || 1,
+    title,
+    status: "pending",
+    outcome: "active",
+    state: "pending",
+    requested_by_user_id: "1",
+    is_anime: false,
+    seasons: [],
+    season_progress: [],
+    targets: [],
+    created_at: CREATED,
+    updated_at: CREATED,
+    ...fields,
+  };
+}
+const target = (id: string, fields: Record<string, unknown> = {}) => ({
+  id,
+  request_id: "r",
+  quality: "1080p",
+  is_anime: false,
+  status: "queued",
+  instance_name: "Radarr",
+  route_name: "Everything else",
+  created_at: CREATED,
+  updated_at: CREATED,
+  ...fields,
+});
+const COUNTS = { needs_approval: 1, in_progress: 2, failed: 1, done: 1 };
+const capabilities = () => ({ available: true, guarded_configuration: true });
+const page = (items: unknown[]) => ({ items, page: { has_more: false } });
+
+/** One queue per view, as the server filters it. */
+function queue(byView: Record<string, unknown[]>, counts = COUNTS): Record<string, Handler> {
+  return {
+    "GET /api/v2/admin/requests/capabilities": capabilities,
+    "GET /api/v2/admin/requests/counts": () => counts,
+    "GET /api/v2/admin/requests": ({ query }) => page(byView[String(query?.view)] ?? []),
+  };
+}
+
 function LocationProbe() {
   const location = useLocation();
   return <output data-testid="location">{location.search}</output>;
 }
-function mount(tab: string) {
+function mount(path: string) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: 3 } },
   });
-  const path = tab.startsWith("/") ? tab : `/admin/requests?tab=${tab}`;
   render(
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[path]}>
@@ -89,8 +137,13 @@ function mount(tab: string) {
   );
   return client;
 }
-window.HTMLElement.prototype.scrollIntoView ??= () => {};
-window.HTMLElement.prototype.hasPointerCapture ??= () => false;
+const rowOf = async (title: string) =>
+  (await screen.findByRole("link", { name: title })).closest("li") as HTMLElement;
+const buttonNames = (row: HTMLElement) =>
+  within(row)
+    .getAllByRole("button")
+    .map((button) => button.getAttribute("aria-label") ?? button.textContent)
+    .filter((name) => !name?.startsWith("Details") && name !== "member");
 
 afterEach(() => {
   cleanup();
@@ -339,290 +392,113 @@ describe("request administration", () => {
         return page(
           query?.view === "needs_approval" && !sent ? [request("r1", "Waiting Title")] : [],
         );
-      if (operation === "PUT /api/v2/admin/request-settings") return Promise.reject(conflict());
-      throw new Error(operation);
-    });
-    mount("settings");
-    await screen.findByText("Save Settings");
-    const staleTopInput = screen.getAllByRole("spinbutton")[0]!;
-    fireEvent.change(staleTopInput, { target: { value: "13" } });
-    fireEvent.click(screen.getByText("Save Settings"));
-    await screen.findByRole("alert");
-    cleanup();
-  });
-  it("keeps deletion confirmation open after a stale integration delete", async () => {
-    const row = {
-      id: "integration",
-      name: "Connection",
-      enabled: true,
-      base_url: "https://example.invalid",
-      has_api_key: true,
-      installation_id: "1",
-      capability_id: "arr",
-      plugin_config: {},
-      supported_media_types: [],
-      last_check_at: null,
-      last_check_status: "",
-      last_check_error: "",
-      updated_at: "2026-09-05T00:00:00Z",
-    };
-    vi.mocked(v2).mockImplementation((operation, options) => {
-      if (operation === "GET /api/v2/admin/requests/capabilities")
-        return reply(options, { available: true, guarded_configuration: true });
-      if (operation === "GET /api/v2/admin/request-integrations")
-        return reply(options, { items: [row], page: { has_more: false } });
-      if (operation === "GET /api/v2/admin/request-integrations/{id}") return reply(options, row);
-      if (operation === "DELETE /api/v2/admin/request-integrations/{id}")
-        return Promise.reject(conflict());
-      if (operation === "POST /api/v2/admin/request-integrations/{id}/options")
-        return reply(options, { options: {} });
-      throw new Error(operation);
-    });
-    mount("integrations");
-    fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
-    const staleDialog = await screen.findByRole("dialog");
-    fireEvent.click(within(staleDialog).getByRole("button", { name: "Delete" }));
-    await waitFor(() => expect(within(staleDialog).getByRole("alert")).toBeTruthy());
-    expect(screen.getByRole("dialog")).toBeTruthy();
-    const writes = vi
-      .mocked(v2)
-      .mock.calls.filter(([op]) => op === "DELETE /api/v2/admin/request-integrations/{id}");
-    expect(writes).toHaveLength(1);
-    expect(writes[0]![1]!).toMatchObject({ headers: { "If-Match": '"initial"' } });
-  });
-  it("renders generic integration field errors inline and clears them on edit", async () => {
-    const row = {
-      id: "integration",
-      name: "Connection",
-      enabled: true,
-      base_url: "https://example.invalid",
-      has_api_key: true,
-      installation_id: "1",
-      capability_id: "arr",
-      plugin_config: {},
-      supported_media_types: [],
-      last_check_at: null,
-      last_check_status: "",
-      last_check_error: "",
-      updated_at: "2026-09-05T00:00:00Z",
-    };
-    const errors = [
-      { location: "body.name", code: "invalid", detail: "Connection name is rejected" },
-      { location: "body.api_key_ref", code: "invalid", detail: "Re-enter the credential" },
-      { location: "body.base_url", code: "invalid", detail: "Server URL is rejected" },
-      { location: "body.installation_id", code: "invalid", detail: "Choose another installation" },
-    ];
-    vi.mocked(v2).mockImplementation((operation, options) => {
-      if (operation === "GET /api/v2/admin/requests/capabilities")
-        return reply(options, { available: true, guarded_configuration: true });
-      if (operation === "GET /api/v2/admin/request-integrations")
-        return reply(options, { items: [row], page: { has_more: false } });
-      if (operation === "GET /api/v2/admin/request-integrations/{id}") return reply(options, row);
-      if (operation === "POST /api/v2/admin/request-integrations/{id}/options")
-        return reply(options, { options: {} });
-      if (operation === "PUT /api/v2/admin/request-integrations/{id}")
-        return Promise.reject(
-          new V2ProblemError("updateRequestIntegration", {
-            type: "https://example.invalid/problems/validation_failed",
-            title: "Invalid",
-            status: 422,
-            detail: "Review invalid fields",
-            instance: "test",
-            errors,
-          }),
-        );
-      throw new Error(operation);
-    });
-    mount("integrations");
-    fireEvent.click(await screen.findByRole("button", { name: "Save" }));
-    for (const error of errors) expect(await screen.findByText(error.detail)).toBeTruthy();
-    const name = screen.getByPlaceholderText("Connection name");
-    expect(name.getAttribute("aria-invalid")).toBe("true");
-    expect(name.parentElement?.textContent).toContain("Connection name is rejected");
-    fireEvent.change(name, { target: { value: "Corrected" } });
-    expect(screen.queryByText("Connection name is rejected")).toBeNull();
-    expect(name.getAttribute("aria-invalid")).toBe("false");
-  });
-  it("keeps user override edits and validator until explicit reload after a stale response", async () => {
-    let reads = 0;
-    vi.mocked(v2).mockImplementation((operation, options) => {
-      if (operation === "GET /api/v2/admin/requests/capabilities")
-        return reply(options, { available: true, guarded_configuration: true });
-      if (operation === "GET /api/v2/admin/request-users/{user_id}/limit")
-        return reply(
-          options,
-          {
-            user_id: "1",
-            limit_mode: "custom",
-            max_requests: ++reads === 1 ? 3 : 6,
-            window_days: 7,
-            approval_mode: "inherit",
-          },
-          reads === 1 ? '"initial"' : '"reloaded"',
-        );
-      if (operation === "PUT /api/v2/admin/request-users/{user_id}/limit")
-        return Promise.reject(conflict());
-      throw new Error(operation);
-    });
-    mount("overrides");
-    await screen.findByText("Save Override");
-    const input = screen.getAllByRole("spinbutton")[0]!;
-    fireEvent.change(input, { target: { value: "11" } });
-    fireEvent.click(screen.getByText("Save Override"));
-    await screen.findByRole("alert");
-    expect((input as HTMLInputElement).value).toBe("11");
-    expect(
-      vi
-        .mocked(v2)
-        .mock.calls.filter(([op]) => op === "PUT /api/v2/admin/request-users/{user_id}/limit"),
-    ).toHaveLength(1);
-    const writes = () =>
-      vi
-        .mocked(v2)
-        .mock.calls.filter(([op]) => op === "PUT /api/v2/admin/request-users/{user_id}/limit");
-    expect(writes()[0]![1]).toMatchObject({
-      headers: { "If-Match": '"initial"' },
-      body: { max_requests: 11 },
-    });
-    expect(
-      (screen.getByText("Save Override").closest("button") as HTMLButtonElement).disabled,
-    ).toBe(true);
-    fireEvent.click(screen.getByText("Reload latest version"));
-    await waitFor(() =>
-      expect((screen.getAllByRole("spinbutton")[0] as HTMLInputElement).value).toBe("6"),
-    );
-    fireEvent.click(screen.getByText("Save Override"));
-    await waitFor(() => expect(writes()).toHaveLength(2));
-    expect(writes()[1]![1]).toMatchObject({
-      headers: { "If-Match": '"reloaded"' },
-      body: { max_requests: 6 },
-    });
-  });
-  it("populates virtual://streaming and creates virtual library connection", async () => {
-    mockAdminPluginInstallations.mockReturnValueOnce({
-      data: [],
-      isLoading: false,
-    });
-    vi.mocked(v2).mockImplementation((operation, options) => {
-      if (operation === "GET /api/v2/admin/requests/capabilities")
-        return reply(options, { available: true, guarded_configuration: true });
-      if (operation === "GET /api/v2/admin/request-integrations")
-        return reply(options, { items: [], page: { has_more: false } });
-      if (operation === "POST /api/v2/admin/request-integrations") {
-        return reply(options, {
-          id: "conn-virt",
-          name: "Virtual Library (Core Streaming)",
-          enabled: true,
-          base_url: "virtual://streaming",
-          has_api_key: true,
-          installation_id: "0",
-          capability_id: "virtual-library-requests",
-          plugin_config: {},
-          supported_media_types: [],
-          last_check_at: null,
-          last_check_status: "",
-          last_check_error: "",
-          updated_at: "2026-10-02T00:00:00Z",
-        });
-      }
-      if (operation === "POST /api/v2/admin/request-integrations/{id}/options")
-        return reply(options, { options: {} });
-      throw new Error(operation);
-    });
-    mount("integrations");
-    fireEvent.click(await screen.findByRole("button", { name: "Add connection" }));
-
-    const nameInput = (await screen.findByPlaceholderText("Connection name")) as HTMLInputElement;
-    expect(nameInput.value).toBe("Virtual Library (Core Streaming)");
-    expect((screen.getByPlaceholderText("virtual://streaming") as HTMLInputElement).value).toBe(
-      "virtual://streaming",
-    );
-    expect((screen.getByPlaceholderText("core-managed") as HTMLInputElement).value).toBe(
-      "core-managed",
-    );
-
-    const createBtn = screen.getByRole("button", { name: "Create connection" });
-    fireEvent.click(createBtn);
-    await waitFor(() => {
-      const creates = vi
-        .mocked(v2)
-        .mock.calls.filter(([op]) => op === "POST /api/v2/admin/request-integrations");
-      expect(creates).toHaveLength(1);
-      expect(creates[0]![1]!).toMatchObject({
-        body: {
-          name: "Virtual Library (Core Streaming)",
-          base_url: "virtual://streaming",
-          api_key_ref: "core-managed",
-          installation_id: "0",
-          capability_id: "virtual-library-requests",
+      },
+      "GET /api/v2/admin/requests/{id}/events": () => ({ items: [] }),
+      "POST /api/v2/admin/request-routes/preview": () => ({
+        facts: {
+          anime: false,
+          company_ids: [],
+          genre_ids: [],
+          keyword_ids: [],
+          network_ids: [],
+          origin_countries: [],
         },
-      });
+        rules: [],
+        tiers: [],
+      }),
+      // Another admin sent the one and approved the other a moment ago.
+      "POST /api/v2/admin/requests/{id}/cancel": () => {
+        sent = true;
+        return Promise.reject(new Error("The request changed; reload it."));
+      },
+      "POST /api/v2/admin/requests/{id}/approve": () => {
+        sent = true;
+        return Promise.reject(new Error("The request changed; reload it."));
+      },
     });
-  });
-  it("populates virtual defaults when selecting virtual library plugin from multiple plugins", async () => {
-    vi.mocked(v2).mockImplementation((operation, options) => {
-      if (operation === "GET /api/v2/admin/requests/capabilities")
-        return reply(options, { available: true, guarded_configuration: true });
-      if (operation === "GET /api/v2/admin/request-integrations")
-        return reply(options, { items: [], page: { has_more: false } });
-      if (operation === "POST /api/v2/admin/request-integrations") {
-        return reply(options, {
-          id: "conn-virt-2",
-          name: "Virtual Library (Core Streaming)",
-          enabled: true,
-          base_url: "virtual://streaming",
-          has_api_key: true,
-          installation_id: "0",
-          capability_id: "virtual-library-requests",
-          plugin_config: {},
-          supported_media_types: [],
-          last_check_at: null,
-          last_check_status: "",
-          last_check_error: "",
-          updated_at: "2026-10-02T00:00:00Z",
-        });
-      }
-      if (operation === "POST /api/v2/admin/request-integrations/{id}/options")
-        return reply(options, { options: {} });
-      throw new Error(operation);
-    });
-    mount("integrations");
-    fireEvent.click(await screen.findByRole("button", { name: "Add connection" }));
-
-    expect(screen.getByText("Select a plugin to configure this connection.")).toBeInTheDocument();
-
-    fireEvent.keyDown(screen.getByRole("combobox"), { key: "ArrowDown" });
+    mount("/admin/requests?view=in_progress");
     fireEvent.click(
-      await screen.findByRole("option", {
-        name: "Virtual Library (Core Streaming) (virtual-library-requests)",
+      within(await rowOf("Unsent Title")).getByRole("button", { name: "Details: Unsent Title" }),
+    );
+    let dialog = await screen.findByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel request: Unsent Title" }));
+    const prompt = (await screen.findAllByRole("dialog")).find((d) => d !== dialog)!;
+    fireEvent.click(within(prompt).getByRole("button", { name: "Cancel request" }));
+    // The refused cancel refetched the queue; the dialog shows the sent
+    // request, which can no longer be cancelled.
+    await waitFor(() =>
+      expect(
+        within(dialog).queryByRole("button", { name: "Cancel request: Unsent Title" }),
+      ).not.toBeInTheDocument(),
+    );
+    expect(within(dialog).getByRole("table")).toHaveTextContent("Radarr");
+
+    // A request that left the view closes its dialog.
+    fireEvent.click(within(dialog).getByRole("button", { name: "Close" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    sent = false;
+    fireEvent.mouseDown(screen.getByRole("tab", { name: /^Needs approval/ }));
+    fireEvent.click(
+      within(await rowOf("Waiting Title")).getByRole("button", { name: "Details: Waiting Title" }),
+    );
+    dialog = await screen.findByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Approve: Waiting Title" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    expect(screen.queryByRole("link", { name: "Waiting Title" })).not.toBeInTheDocument();
+  });
+
+  it("loads the next page from the cursor the last one returned", async () => {
+    serve({
+      ...queue({}),
+      "GET /api/v2/admin/requests": ({ query }) =>
+        query?.cursor === "c2"
+          ? page([request("r2", "Second Page Title")])
+          : {
+              items: [request("r1", "First Page Title")],
+              page: { has_more: true, next_cursor: "c2" },
+            },
+    });
+    mount("/admin/requests?view=needs_approval");
+    await rowOf("First Page Title");
+    fireEvent.click(screen.getByRole("button", { name: "Load more" }));
+    expect(await rowOf("Second Page Title")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "First Page Title" })).toBeInTheDocument();
+    expect(calls("GET /api/v2/admin/requests").map((options) => options.query?.cursor)).toEqual([
+      undefined,
+      "c2",
+    ]);
+    expect(screen.queryByRole("button", { name: "Load more" })).not.toBeInTheDocument();
+  });
+
+  it("limits the queue to one account from ?user= and searches as the admin types", async () => {
+    serve(queue({ in_progress: [request("r2", "Approved Title", { status: "approved" })] }));
+    mount("/admin/requests?view=in_progress&user=7");
+    await rowOf("Approved Title");
+    expect(screen.getByText("Requested by sam")).toBeInTheDocument();
+    expect(calls("GET /api/v2/admin/requests")[0]?.query).toMatchObject({
+      view: "in_progress",
+      requested_by_user_id: "7",
+    });
+
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search requests" }), {
+      target: { value: " dune " },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Series" }));
+    await waitFor(() =>
+      expect(calls("GET /api/v2/admin/requests").at(-1)?.query).toMatchObject({
+        q: "dune",
+        media_type: "series",
+        requested_by_user_id: "7",
       }),
     );
 
-    const nameInput = (await screen.findByPlaceholderText("Connection name")) as HTMLInputElement;
-    expect(nameInput.value).toBe("Virtual Library (Core Streaming)");
-    expect((screen.getByPlaceholderText("virtual://streaming") as HTMLInputElement).value).toBe(
-      "virtual://streaming",
+    fireEvent.click(screen.getByRole("button", { name: "Show requests from every account" }));
+    await waitFor(() => expect(screen.getByTestId("location")).not.toHaveTextContent("user="));
+    await waitFor(() =>
+      expect(calls("GET /api/v2/admin/requests").at(-1)?.query).not.toHaveProperty(
+        "requested_by_user_id",
+        "7",
+      ),
     );
-    expect((screen.getByPlaceholderText("core-managed") as HTMLInputElement).value).toBe(
-      "core-managed",
-    );
-
-    const createBtn = screen.getByRole("button", { name: "Create connection" });
-    fireEvent.click(createBtn);
-    await waitFor(() => {
-      const creates = vi
-        .mocked(v2)
-        .mock.calls.filter(([op]) => op === "POST /api/v2/admin/request-integrations");
-      expect(creates).toHaveLength(1);
-      expect(creates[0]![1]!).toMatchObject({
-        body: {
-          name: "Virtual Library (Core Streaming)",
-          base_url: "virtual://streaming",
-          api_key_ref: "core-managed",
-          installation_id: "0",
-          capability_id: "virtual-library-requests",
-        },
-      });
-    });
   });
 });
