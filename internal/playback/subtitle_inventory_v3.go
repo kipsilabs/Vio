@@ -107,8 +107,14 @@ func BuildSubtitleInventoryV3(file *models.MediaFile, additional []SubtitleInven
 		return nil
 	}
 	items := make([]SubtitleInventoryItemV3, 0, len(file.ExternalSubtitles)+len(file.SubtitleTracks)+len(additional))
-	for _, sub := range file.ExternalSubtitles {
-		item := subtitleInventoryItemV3(file.ID, len(items), SubtitleSourceExternalV3, sub.Format,
+	seen := make(map[string]struct{})
+	externalCount := len(file.ExternalSubtitles)
+	base := externalCount + len(file.SubtitleTracks)
+	for index, sub := range file.ExternalSubtitles {
+		if subtitleInventoryDuplicateV3(seen, SubtitleSourceExternalV3, externalSubtitleIdentityV3(sub), sub.Format, sub.Language, sub.Forced, sub.HearingImpaired) {
+			continue
+		}
+		item := subtitleInventoryItemV3(file.ID, len(items), index, SubtitleSourceExternalV3, sub.Format,
 			sub.Language, firstNonEmptySubtitleLabelV3(sub.Title, sub.EmbeddedTitle, fspath.Display(filepath.Base(sub.Path)), sub.Language),
 			sub.Forced, sub.Default, sub.HearingImpaired)
 		if subtitles.SupportsRetime(subtitles.SubtitleFormat(sub.Format)) {

@@ -53,7 +53,8 @@ const (
 )
 
 type PlannerInputV3 struct {
-	Request StartRequestV3
+	Request                    StartRequestV3
+	PreviousSubtitleEvaluation *SubtitleEvaluationV3
 	// ServerBitrateCapKbps is an administrator-owned, per-attempt ceiling.
 	// Unlike a client's bandwidth preference it must fail closed.
 	ServerBitrateCapKbps int

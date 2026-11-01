@@ -2857,7 +2857,7 @@ func (s *TranscodeSession) waitForManifestPolls(ctx context.Context, timeout tim
 		case <-ctx.Done():
 			return nil, polls, ctx.Err()
 		case <-deadline:
-			return nil, s.manifestTimeoutError(timeout)
+			return nil, polls, s.manifestTimeoutError(timeout)
 		case <-time.After(outputPollInterval):
 		}
 	}
@@ -3536,12 +3536,10 @@ func (s *TranscodeSession) SegmentProgress(time.Time) SegmentProgress {
 	manifestPath := filepath.Join(s.outputDir, "stream.m3u8")
 	manifestInfo, statErr := os.Stat(manifestPath)
 	var timeline manifestTimeline
-	var parseOK bool
 	if statErr == nil {
 		if manifest, err := os.ReadFile(manifestPath); err == nil {
 			if parsed, err := parseManifestTimeline(manifest); err == nil {
 				timeline = parsed
-				parseOK = true
 				progress.HasManifest = true
 				progress.ManifestModTime = manifestInfo.ModTime()
 			}
@@ -3564,11 +3562,6 @@ func (s *TranscodeSession) SegmentProgress(time.Time) SegmentProgress {
 		progress.LastProducedAt = info.ModTime()
 		break
 	}
-	if newest == nil {
-		return
-	}
-	progress.ActiveTempAt = newest.ModTime()
-	progress.ActiveTempSize = newest.Size()
 }
 
 // SegmentRecoveryDecision determines whether a missing segment should briefly
