@@ -215,7 +215,6 @@ export default function ItemDetail() {
           item={item as ItemDetail & { type: "movie" }}
           libraryId={libraryId}
           showAdvisoryAge={showAdvisoryAge}
-          onStaleVersion={() => void refetch()}
         />
       );
     case "series":
@@ -232,7 +231,6 @@ export default function ItemDetail() {
       return (
         <EpisodeContent
           item={item as ItemDetail & { type: "episode" }}
-          onStaleVersion={() => void refetch()}
         />
       );
     case "audiobook":
@@ -245,7 +243,6 @@ export default function ItemDetail() {
           item={item as ItemDetail & { type: "ebook" }}
           libraryId={libraryId}
           showAdvisoryAge={showAdvisoryAge}
-          onStaleVersion={() => void refetch()}
         />
       );
     case "manga":
