@@ -458,7 +458,7 @@ func TestVirtualPGSWindowWarmSkipsActivePlayback(t *testing.T) {
 	handler, session, file, virtualURI := newVirtualSubtitleWindowFixture(t, dir,
 		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\nprintf 'PG'\n")
 	session.IsPaused = false
-	identity := playback.VirtualSubtitleCacheIdentity(file.ID, virtualURI, 0)
+	identity := virtualSubtitleCacheIdentity(file, virtualURI, 0)
 
 	handler.warmVirtualSubtitleAfterWindowMiss(file, session, playback.StreamExtractOpts{
 		InputPath:       "unused",

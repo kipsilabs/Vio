@@ -3779,7 +3779,7 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 			planOrdinal := opts.TrackIndex
 			opts.TrackIndex = verdict.trackIndex
 			opts.SourceCodec = verdict.sourceCodec
-			opts.CacheIdentity = playback.VirtualSubtitleCacheIdentity(file.ID, session.VirtualSourceURI, opts.TrackIndex)
+			opts.CacheIdentity = virtualSubtitleCacheIdentity(file, session.VirtualSourceURI, opts.TrackIndex)
 			slog.DebugContext(r.Context(), "virtual subtitle layout probe reused", "component", "api",
 				"file_id", file.ID,
 				"plan_ordinal", planOrdinal,
