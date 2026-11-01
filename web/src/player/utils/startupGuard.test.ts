@@ -2,7 +2,13 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { STARTUP_TIMEOUT_MS, StartupGuard } from "./startupGuard";
+import {
+  MAX_STALE_GENERATION_RECOVERIES,
+  STARTUP_TIMEOUT_MS,
+  StartupGuard,
+  isStaleGenerationError,
+  recoverFromStaleGeneration,
+} from "./startupGuard";
 
 describe("StartupGuard", () => {
   beforeEach(() => {

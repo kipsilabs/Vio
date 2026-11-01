@@ -74,7 +74,12 @@ import {
   ROOM_HELD_SEEK_TIMEOUT_MS,
 } from "../utils/pendingSeek";
 import { resolveVersionAudioLanguage } from "../utils/effectiveAudioLanguage";
-import { StartupGuard } from "../utils/startupGuard";
+import {
+  MAX_STALE_GENERATION_RECOVERIES,
+  StartupGuard,
+  isStaleGenerationError,
+  recoverFromStaleGeneration,
+} from "../utils/startupGuard";
 import { isSafariBrowserV3, resolveHLSEngineV3 } from "../utils/hlsEngine";
 import {
   hlsBufferPolicy,

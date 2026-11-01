@@ -1,3 +1,5 @@
+import type { DecodeErrorCarrier } from "../decode-failure";
+
 // The server keeps a plan's session for at least 90s so the next fallback can
 // still be requested (docs/architecture/playback-protocol-v3.md §2.5).
 export const STARTUP_TIMEOUT_MS = 60_000;
