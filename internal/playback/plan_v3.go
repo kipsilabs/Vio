@@ -1593,11 +1593,9 @@ func resolveTranscodeVideoTargetV3(input PlannerInputV3, source SourceDescriptor
 	targetVideoCodec := transcodeCodecH264
 	// H.264 is always an allowed output, but it stays within an attested
 	// H.264 decoder: a scaled encode steps down to the tallest class one
-	// takes, and the bitrate stays within that decoder's limit. h264Quality
-	// is also kept for the H.264 fallback after a failed HEVC attempt.
-	h264Quality := h264BoundedQualityV3(input.Request, quality, source)
+	// takes, and the bitrate stays within that decoder's limit.
 	hevcQuality := quality
-	quality = h264Quality
+	quality = h264BoundedQualityV3(input.Request, quality, source)
 	if input.Settings.AllowHEVCEncoding && hlsRegistry.Available(TransformationVideoToHEVCV3) {
 		// HEVC output needs no more than the source's bits counted as HEVC,
 		// whether it scales the source or only converts it at its own size,
@@ -1638,7 +1636,6 @@ func resolveTranscodeVideoTargetV3(input PlannerInputV3, source SourceDescriptor
 		}
 		return TransformationVideoToH264V3
 	}()}
-	selection.h264Quality = h264Quality
 	return selection, quality, toneMapRecipe, nil
 	/*
 		if source.DynamicRange != "" && source.DynamicRange != DynamicRangeSDRV3 {
@@ -1756,15 +1753,18 @@ func applyTranscodeToneMapV3(source SourceDescriptorV3, plan *PlanV3, recipe res
 // codec attempt steps down to the H.264 floor, and a failed subtitle rendition
 // falls back to the sidecar. It returns the updated target, whether the
 // rendition survived, and a terminal when every recipe is exhausted.
-func downgradeTranscodePlanV3(input PlannerInputV3, subtitle SubtitlePolicyResultV3, plan *PlanV3, targetVideo targetVideoSelectionV3) (targetVideoSelectionV3, QualityResultV3, bool, *PlannerResultV3) {
-	quality := targetVideo.h264Quality
+func downgradeTranscodePlanV3(input PlannerInputV3, subtitle SubtitlePolicyResultV3, plan *PlanV3, targetVideo targetVideoSelectionV3, currentQuality QualityResultV3) (targetVideoSelectionV3, QualityResultV3, bool, *PlannerResultV3) {
+	quality := currentQuality
 	outputContextID := input.Request.ClientPlaybackContext.Output.OutputContextID
 	// A failed HEVC attempt does not exhaust the H.264 route, and a failed AV1
 	// attempt does not exhaust either fallback. Rebuild the candidate before
 	// checking exhaustion so recovery can downgrade codecs on the same HLS
 	// delivery without changing source/remux behavior.
 	if targetVideo.codec != TargetVideoCodecH264V3 && planAttemptedV3(*plan, outputContextID, input.AttemptedKeys) {
+		h264Quality := quality
 		targetVideo = targetVideoFloorV3
+		targetVideo.h264Quality = h264Quality
+		quality = h264Quality
 		plan.EffectiveRecipe.VideoCodec = targetVideo.codec
 		plan.EffectiveRecipe.VideoSampleEntry = ""
 		plan.EffectiveRecipe.Width = intPointerV3(quality.Width)
@@ -1898,7 +1898,7 @@ func planVideoTranscodeV3(input PlannerInputV3, base PlanV3, source SourceDescri
 		return terminalPlannerResultV3("adaptation_unavailable", "The HLS delivery cannot decode the planned transcode recipe.", false)
 	}
 	finalizePlanIdentityV3(&plan, input.Request.PlaybackAttemptID, input.Request.ClientPlaybackContext.Output.OutputContextID)
-	targetVideo, quality, subtitleRendition, terminal := downgradeTranscodePlanV3(input, subtitle, &plan, targetVideo)
+	targetVideo, quality, subtitleRendition, terminal := downgradeTranscodePlanV3(input, subtitle, &plan, targetVideo, quality)
 	if terminal != nil {
 		return *terminal
 	}
