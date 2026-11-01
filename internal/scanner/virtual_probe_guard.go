@@ -1,6 +1,15 @@
 package scanner
 
-import "math"
+import (
+	"math"
+	"net/url"
+	"strconv"
+	"strings"
+	"sync"
+
+	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/playback"
+)
 
 // VirtualRuntimeTolerance is the maximum fraction a probed duration may deviate
 // from the catalog runtime before the candidate is treated as mislabeled
@@ -90,4 +99,203 @@ func ClassifyVirtualServedEvidence(declaredBytes, servedBytes int64, probedSecon
 // VirtualServedEvidenceVerdict for what it may not be used for.
 func VirtualServedEvidenceRejected(declaredBytes, servedBytes int64, probedSeconds, expectedRuntimeMinutes int) bool {
 	return ClassifyVirtualServedEvidence(declaredBytes, servedBytes, probedSeconds, expectedRuntimeMinutes) == VirtualServedEvidenceMismatch
+}
+
+// VirtualServedSizeSnapshot is the served byte size observed for one pinned
+// candidate after a probe whose measured duration proved the content, despite a
+// served-vs-declared size gap. Providers routinely advertise a rounded release
+// size (an indexer declaration of 2.04 GB for bytes that measure 1.78 GB, ~13%
+// off), so the declared size alone can never clear the 5% evidence gate for
+// that pin.
+//
+// DeclaredBytes is kept so a re-declared release invalidates the snapshot; it is
+// never used to replace the row's declared size. FileSize stays the release's
+// advertised size for the AltMount-completion comparison and every other
+// declared-size decision, so a snapshot can never fake a SourceConfirmed
+// verdict.
+type VirtualServedSizeSnapshot struct {
+	DeclaredBytes  int64
+	ObservedBytes  int64
+	InventoryToken string
+}
+
+// virtualServedSizeSnapshotMaxEntries bounds the snapshot store. Entries are
+// per pinned candidate, so the bound tracks the live candidate set the way the
+// probe-failure damper does; the oldest snapshot is evicted first.
+const virtualServedSizeSnapshotMaxEntries = 512
+
+// virtualServedSizeSnapshotStore is the process-wide snapshot store. It is
+// package-level because the guard has no owner object: probes arrive from the
+// playback handler and from the probe cache, and both must see each other's
+// observations for the same pin.
+type virtualServedSizeSnapshotStore struct {
+	mu       sync.Mutex
+	entries  map[string]virtualServedSizeSnapshotEntry
+	sequence int64
+}
+
+type virtualServedSizeSnapshotEntry struct {
+	snapshot VirtualServedSizeSnapshot
+	sequence int64
+}
+
+var virtualServedSizeSnapshots = &virtualServedSizeSnapshotStore{entries: make(map[string]virtualServedSizeSnapshotEntry)}
+
+// VirtualServedSizePin names the pinned candidate a served-size snapshot
+// belongs to: its provider-neutral virtual path, its owner installation and its
+// concrete ?result= pick. A path with no concrete pick names a release rather
+// than one candidate's bytes, so it has no pin and returns "": an observed size
+// recorded for whatever candidate an auto-pick happened to serve must never
+// become the baseline for a sibling.
+func VirtualServedSizePin(virtualPath string, ownerInstallationID int) string {
+	trimmed := strings.TrimSpace(virtualPath)
+	if trimmed == "" {
+		return ""
+	}
+	neutral := trimmed
+	resultID := ""
+	if parsed, err := url.Parse(trimmed); err == nil && parsed != nil {
+		query := parsed.Query()
+		resultID = strings.TrimSpace(query.Get("result"))
+		if resultID != "" {
+			query.Del("result")
+			parsed.RawQuery = query.Encode()
+			neutral = parsed.String()
+		}
+	}
+	if resultID == "" {
+		return ""
+	}
+	return neutral + "\x00" + strconv.Itoa(ownerInstallationID) + "\x00" + resultID
+}
+
+// VirtualServedSizeSnapshotFor returns the snapshot recorded for pin when it
+// still describes the pin: the release is still declared at the same size and
+// the probed subtitle inventory is unchanged. Either difference invalidates the
+// snapshot, because a layout change means the bytes named by the pin's ordinals
+// are not the bytes the size was observed for.
+func VirtualServedSizeSnapshotFor(pin string, declaredBytes int64, inventoryToken string) (VirtualServedSizeSnapshot, bool) {
+	c := virtualServedSizeSnapshots
+	if c == nil || pin == "" || declaredBytes <= 0 {
+		return VirtualServedSizeSnapshot{}, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.entries[pin]
+	if !ok {
+		return VirtualServedSizeSnapshot{}, false
+	}
+	if entry.snapshot.DeclaredBytes != declaredBytes || entry.snapshot.InventoryToken != inventoryToken || entry.snapshot.ObservedBytes <= 0 {
+		delete(c.entries, pin)
+		return VirtualServedSizeSnapshot{}, false
+	}
+	return entry.snapshot, true
+}
+
+// RecordVirtualServedSizeSnapshotIfProven records the served size observed for
+// pin when, and only when, a size gap had to be excused by a measured duration
+// that proves the content is the item's. It reports whether a snapshot was
+// recorded.
+//
+// It is deliberately the only writer:
+//   - a size within tolerance needs no snapshot, so the declared size stays the
+//     baseline;
+//   - a probe whose duration does not prove identity is unverified or a
+//     mismatch and must never teach the gate to accept those bytes.
+func RecordVirtualServedSizeSnapshotIfProven(pin string, declaredBytes, servedBytes int64, probedSeconds, expectedRuntimeMinutes int, inventoryToken string) bool {
+	c := virtualServedSizeSnapshots
+	if c == nil || pin == "" || declaredBytes <= 0 || servedBytes <= 0 {
+		return false
+	}
+	if !VirtualServedSizeMismatch(declaredBytes, servedBytes) {
+		return false
+	}
+	if !VirtualDurationProvesIdentity(probedSeconds, expectedRuntimeMinutes) {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.entries == nil {
+		c.entries = make(map[string]virtualServedSizeSnapshotEntry)
+	}
+	if _, exists := c.entries[pin]; !exists && len(c.entries) >= virtualServedSizeSnapshotMaxEntries {
+		c.evictOldestLocked()
+	}
+	c.sequence++
+	c.entries[pin] = virtualServedSizeSnapshotEntry{
+		snapshot: VirtualServedSizeSnapshot{
+			DeclaredBytes:  declaredBytes,
+			ObservedBytes:  servedBytes,
+			InventoryToken: inventoryToken,
+		},
+		sequence: c.sequence,
+	}
+	return true
+}
+
+// evictOldestLocked drops the least recently recorded snapshot. Caller holds
+// c.mu.
+func (c *virtualServedSizeSnapshotStore) evictOldestLocked() {
+	victim := ""
+	var oldest int64
+	for pin, entry := range c.entries {
+		if victim == "" || entry.sequence < oldest {
+			victim, oldest = pin, entry.sequence
+		}
+	}
+	if victim != "" {
+		delete(c.entries, victim)
+	}
+}
+
+// ResetVirtualServedSizeSnapshots drops every recorded snapshot. Tests use it to
+// isolate cases that share a pin; production never clears the store.
+func ResetVirtualServedSizeSnapshots() {
+	c := virtualServedSizeSnapshots
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries = make(map[string]virtualServedSizeSnapshotEntry)
+}
+
+// ClassifyVirtualServedEvidenceForPin is ClassifyVirtualServedEvidence with the
+// pin's recorded observed size as the comparison baseline when a snapshot is
+// still valid for it. A pin with no snapshot (or one invalidated by a declared
+// size or subtitle-inventory change) keeps comparing against the declared size,
+// so the gate behaves exactly as before for every unproven pin.
+func ClassifyVirtualServedEvidenceForPin(pin string, declaredBytes, servedBytes int64, probedSeconds, expectedRuntimeMinutes int, inventoryToken string) VirtualServedEvidenceVerdict {
+	baseline := declaredBytes
+	if snapshot, ok := VirtualServedSizeSnapshotFor(pin, declaredBytes, inventoryToken); ok {
+		baseline = snapshot.ObservedBytes
+	}
+	return ClassifyVirtualServedEvidence(baseline, servedBytes, probedSeconds, expectedRuntimeMinutes)
+}
+
+// VirtualServedSizeSubtitleToken is the subtitle inventory token a snapshot is
+// keyed on. It is the same token the subtitle cache uses, so a layout change
+// that invalidates warmed subtitle artifacts invalidates the size snapshot too.
+func VirtualServedSizeSubtitleToken(tracks []models.SubtitleTrack) string {
+	return playback.SubtitleInventoryToken(tracks)
+}
+
+// ClassifyVirtualServedEvidenceForPinWithSnapshot returns the evidence verdict
+// for a probe of pin and records the pin's observed-size snapshot when the only
+// reason the evidence is not admitted is a size gap that a measured duration
+// proves is legitimate. The returned verdict reflects the recorded snapshot, so
+// the caller accepts bytes it has just proven instead of holding the row
+// unverified forever over a rounded provider declaration.
+//
+// A mismatch (no duration proof) is returned unchanged and records nothing: a
+// different release must never teach the gate to accept its bytes.
+func ClassifyVirtualServedEvidenceForPinWithSnapshot(pin string, declaredBytes, servedBytes int64, probedSeconds, expectedRuntimeMinutes int, inventoryToken string) VirtualServedEvidenceVerdict {
+	verdict := ClassifyVirtualServedEvidenceForPin(pin, declaredBytes, servedBytes, probedSeconds, expectedRuntimeMinutes, inventoryToken)
+	if verdict == VirtualServedEvidenceMismatch {
+		return verdict
+	}
+	if !RecordVirtualServedSizeSnapshotIfProven(pin, declaredBytes, servedBytes, probedSeconds, expectedRuntimeMinutes, inventoryToken) {
+		return verdict
+	}
+	return ClassifyVirtualServedEvidenceForPin(pin, declaredBytes, servedBytes, probedSeconds, expectedRuntimeMinutes, inventoryToken)
 }

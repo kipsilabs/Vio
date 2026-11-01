@@ -731,6 +731,25 @@ func virtualProbeFailureKey(candidateURI string, ownerInstallationID int) string
 	return virtualPlaybackNeutralKey(candidateURI) + "\x00" + strconv.Itoa(ownerInstallationID) + "\x00" + candidateID
 }
 
+// classifyVirtualServedEvidenceV3 is the pin-aware probe evidence gate every
+// acceptance point uses. It compares the served bytes against the pin's
+// recorded observed size when one is still valid, and records that observed
+// size when the acceptance leans on a measured duration that proves the content
+// past a rounded provider declaration. The row's declared FileSize is never
+// rewritten: it stays the release's advertised size for the AltMount-completion
+// comparison and every other declared-size decision. A pin with no concrete
+// ?result= candidate (and therefore no stable byte identity) keeps the plain
+// declared-size comparison.
+func classifyVirtualServedEvidenceV3(pin string, declaredBytes int64, probed *models.MediaFile, expectedRuntimeMinutes int) scanner.VirtualServedEvidenceVerdict {
+	if probed == nil {
+		return scanner.ClassifyVirtualServedEvidence(declaredBytes, 0, 0, expectedRuntimeMinutes)
+	}
+	return scanner.ClassifyVirtualServedEvidenceForPinWithSnapshot(
+		pin, declaredBytes, probed.ProbedFormatSize, probed.Duration, expectedRuntimeMinutes,
+		scanner.VirtualServedSizeSubtitleToken(probed.SubtitleTracks),
+	)
+}
+
 // virtualDetachedWorkerCap bounds detached virtual-playback work server-wide
 // per handler. Every goroutine spawned per request or per candidate acquires
 // one of these slots before it starts: background probes, optimistic
@@ -3854,7 +3873,10 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			// Size and duration decide identity together: a short posting of the
 			// right content keeps the item's runtime and is accepted, while a
 			// different file fails the duration check independently of size.
-			if scanner.VirtualServedEvidenceRejected(result.File.FileSize, result.File.ProbedFormatSize, result.File.Duration, expectedRuntimeMinutes) {
+			evidenceVerdict := classifyVirtualServedEvidenceV3(
+				scanner.VirtualServedSizePin(candidate.URI, ownerID), result.File.FileSize, result.File, expectedRuntimeMinutes,
+			)
+			if evidenceVerdict == scanner.VirtualServedEvidenceMismatch {
 				// The probe read a readable container that is not the release
 				// this row declares. Rotate to a sibling instead of persisting
 				// a different release's inventory, but keep the wrong-source
@@ -4188,7 +4210,9 @@ func (h *PlaybackHandler) matchSameReleaseSiblingProbe(ctx context.Context, anch
 		if err != nil || probed == nil {
 			continue
 		}
-		verdict := scanner.ClassifyVirtualServedEvidence(transient.FileSize, probed.ProbedFormatSize, probed.Duration, transient.VirtualExpectedRuntimeMinutes)
+		verdict := classifyVirtualServedEvidenceV3(
+			scanner.VirtualServedSizePin(cand.URI, cand.OwnerInstallationID), transient.FileSize, probed, transient.VirtualExpectedRuntimeMinutes,
+		)
 		if !verdict.EstablishesIdentity() {
 			virtualProbeFailures.markSizeMismatch(virtualProbeFailureKey(cand.URI, cand.OwnerInstallationID), probed.ProbedFormatSize, transient.FileSize)
 			logVirtualProbeSizeMismatch(ctx, row.ID, cand.URI, transient.FileSize, probed.ProbedFormatSize)
@@ -4443,7 +4467,9 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 	// posted short of the indexer's advertised size still carries the item's
 	// runtime, while a different file (a remux of another title, say) fails
 	// the duration check independently of its size.
-	if scanner.VirtualServedEvidenceRejected(probeTransient.FileSize, probed.ProbedFormatSize, probed.Duration, expectedRuntimeMinutes) {
+	if classifyVirtualServedEvidenceV3(
+		scanner.VirtualServedSizePin(probeCand.URI, ownerInstallationID), probeTransient.FileSize, probed, expectedRuntimeMinutes,
+	) == scanner.VirtualServedEvidenceMismatch {
 		// The container was readable but it is not the release the row
 		// declares: the provider is serving a different file under this URL
 		// (a stale cache fill, typically). Do not persist this inventory and do
@@ -4672,7 +4698,9 @@ func (h *PlaybackHandler) virtualProbeFromCache(
 		return nil
 	}
 	expectedRuntimeMinutes := h.virtualExpectedRuntimeMinutes(ctx, catalogFile)
-	if scanner.VirtualServedEvidenceRejected(probeFile.FileSize, probed.ProbedFormatSize, probed.Duration, expectedRuntimeMinutes) {
+	if classifyVirtualServedEvidenceV3(
+		scanner.VirtualServedSizePin(probeCand.URI, ownerInstallationID), probeFile.FileSize, probed, expectedRuntimeMinutes,
+	) == scanner.VirtualServedEvidenceMismatch {
 		// The cached evidence measured a different release's bytes. Replaying
 		// it would persist exactly the inventory the probe persist path
 		// refuses, so the hit is discarded and the row is left unprobed. The
@@ -5962,7 +5990,9 @@ func (h *PlaybackHandler) virtualProbeEvidenceArgsForRow(ctx context.Context, ca
 			if expectedRuntime <= 0 {
 				expectedRuntime = h.virtualExpectedRuntimeMinutes(ctx, catalogFile)
 			}
-			if scanner.VirtualServedEvidenceRejected(declaredSize, probed.ProbedFormatSize, probed.Duration, expectedRuntime) {
+			if classifyVirtualServedEvidenceV3(
+				scanner.VirtualServedSizePin(resolvedPath, catalogFile.VirtualOwnerInstallationID), declaredSize, probed, expectedRuntime,
+			) == scanner.VirtualServedEvidenceMismatch {
 				slog.WarnContext(ctx, "virtual probe evidence refused: served size contradicts declared release",
 					"component", "api", "file_id", catalogFile.ID, "declared_size", declaredSize, "probed_size", probed.ProbedFormatSize)
 				return models.VirtualFilePersistArgs{}, false
@@ -6115,7 +6145,9 @@ func (h *PlaybackHandler) probeVirtualCandidateForegroundFallback(
 			"component", "api", "candidate_uri", probeCand.URI, "error", probeErr)
 		return
 	}
-	if scanner.VirtualServedEvidenceRejected(probeTransient.FileSize, probed.ProbedFormatSize, probed.Duration, expectedRuntimeMinutes) {
+	if classifyVirtualServedEvidenceV3(
+		scanner.VirtualServedSizePin(probeCand.URI, ownerInstallationID), probeTransient.FileSize, probed, expectedRuntimeMinutes,
+	) == scanner.VirtualServedEvidenceMismatch {
 		virtualProbeFailures.markSizeMismatch(probeKey, probed.ProbedFormatSize, probeTransient.FileSize)
 		logVirtualProbeSizeMismatch(requestCtx, catalogFile.ID, probeCand.URI, probeTransient.FileSize, probed.ProbedFormatSize)
 		h.unpinVirtualSticky(stickyKey, probeCand.URI)
