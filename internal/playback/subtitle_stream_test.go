@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"net/http"
 	"net/url"
 	"os"
 	"os/exec"

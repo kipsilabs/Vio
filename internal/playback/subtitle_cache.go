@@ -1508,7 +1508,17 @@ func (c *SubtitleCache) Lookup(inputPath string, trackIndex int) (f *os.File, mo
 	return c.lookup(inputPath, "", trackIndex, subtitleFormatSUP)
 }
 
-func (c *SubtitleCache) lookup(inputPath, cacheIdentity string, trackIndex int, format string) (f *os.File, modTime time.Time, ok bool) {
+func (c *SubtitleCache) lookup(inputPath string, args ...interface{}) (f *os.File, modTime time.Time, ok bool) {
+	var cacheIdentity, format string
+	var trackIndex int
+	if len(args) == 3 {
+		cacheIdentity, _ = args[0].(string)
+		trackIndex, _ = args[1].(int)
+		format, _ = args[2].(string)
+	} else if len(args) == 2 {
+		trackIndex, _ = args[0].(int)
+		format, _ = args[1].(string)
+	}
 	path, modTime, ok := c.cachedFormatEntryPath(inputPath, cacheIdentity, trackIndex, format)
 	if !ok {
 		return nil, time.Time{}, false
@@ -1674,6 +1684,7 @@ func (c *SubtitleCache) cachedFormatEntryPath(inputPath, cacheIdentity string, t
 // it into place atomically, Discard throws it away. Exactly one of Commit or
 // Discard must be called.
 type SubtitleCacheFill struct {
+	mu            sync.Mutex
 	c             *SubtitleCache
 	key           string
 	inputPath     string

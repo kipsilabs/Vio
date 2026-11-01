@@ -14,8 +14,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/Silo-Server/silo-server/internal/models"
 )
 
 func TestServeExtractTextCacheVariants(t *testing.T) {

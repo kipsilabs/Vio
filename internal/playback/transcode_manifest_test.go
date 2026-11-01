@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"

@@ -1,7 +1,6 @@
 package playback
 
 import (
-	"encoding/json"
 	"testing"
 )
 

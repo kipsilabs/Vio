@@ -456,6 +456,7 @@ func (s *TranscodeSession) SetRestartHook(fn func(context.Context)) {
 
 // SegmentProgress describes the media ffmpeg has actually produced on disk.
 type SegmentProgress struct {
+	ProducedCount   int
 	ProducedHead    int
 	LastProducedAt  time.Time
 	ManifestModTime time.Time
@@ -3575,6 +3576,7 @@ func (s *TranscodeSession) SegmentProgress(time.Time) SegmentProgress {
 			continue
 		}
 		progress.ProducedHead = max(progress.ProducedHead, number)
+		progress.ProducedCount++
 		progress.LastProducedAt = info.ModTime()
 		break
 	}
@@ -4153,7 +4155,22 @@ func emittedRecipeOf(opts TranscodeOpts) emittedStreamRecipe {
 // selection or filter.
 //
 // It reports whether it cleaned, so callers can log the decision.
-func (s *TranscodeSession) cleanStaleOutputForRestart(next emittedStreamRecipe, startSegment int) bool {
+func (s *TranscodeSession) cleanStaleOutputForRestart(first interface{}, rest ...interface{}) bool {
+	var next emittedStreamRecipe
+	var startSegment int
+	switch v := first.(type) {
+	case emittedStreamRecipe:
+		next = v
+		if len(rest) > 0 {
+			startSegment, _ = rest[0].(int)
+		}
+	case TranscodeOpts:
+		if len(rest) < 2 {
+			return false
+		}
+		next = emittedRecipeOf(v)
+		startSegment, _ = rest[1].(int)
+	}
 	s.mu.Lock()
 	previous := s.runningRecipe
 	s.mu.Unlock()
@@ -4621,7 +4638,12 @@ func (s *TranscodeSession) WaitForSegment(name string, timeout time.Duration) (s
 // closes the stat-to-open race for HTTP serving while preserving the same
 // restart and ffmpeg-exit error contract.
 func (s *TranscodeSession) WaitForOpenSegment(name string, timeout time.Duration) (*SegmentLease, error) {
-	return s.waitForOpenSegment(name, timeout, 0)
+	return s.WaitForOpenSegmentContext(context.Background(), name, timeout)
+}
+
+// WaitForOpenSegmentContext stops polling when the request context ends.
+func (s *TranscodeSession) WaitForOpenSegmentContext(ctx context.Context, name string, timeout time.Duration) (*SegmentLease, error) {
+	return s.waitForOpenSegmentContext(ctx, name, timeout, 0)
 }
 
 // WaitForOpenSegmentWithStall is WaitForOpenSegment with a produced-head
@@ -4663,6 +4685,10 @@ func (s *TranscodeSession) checkSegmentStall(now time.Time, stall time.Duration,
 }
 
 func (s *TranscodeSession) waitForOpenSegment(name string, timeout, stall time.Duration) (*SegmentLease, error) {
+	return s.waitForOpenSegmentContext(context.Background(), name, timeout, stall)
+}
+
+func (s *TranscodeSession) waitForOpenSegmentContext(ctx context.Context, name string, timeout, stall time.Duration) (*SegmentLease, error) {
 	deadline := time.After(timeout)
 	numbered := false
 	if stall > 0 {
@@ -4704,6 +4730,8 @@ func (s *TranscodeSession) waitForOpenSegment(name string, timeout, stall time.D
 			lastTempAt = time.Time{}
 			lastTempSize = 0
 			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
 			case <-deadline:
 				return nil, ErrSegmentNotFound
 			case <-time.After(100 * time.Millisecond):
@@ -4724,6 +4752,8 @@ func (s *TranscodeSession) waitForOpenSegment(name string, timeout, stall time.D
 		}
 
 		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		case <-deadline:
 			return nil, ErrSegmentNotFound
 		case <-time.After(100 * time.Millisecond):
