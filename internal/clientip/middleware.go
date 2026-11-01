@@ -47,6 +47,11 @@ func Middleware(resolver *Resolver) func(http.Handler) http.Handler {
 	}
 }
 
+// SetContext stores a resolved client IP in a context (primarily for tests and internal callers).
+func SetContext(ctx context.Context, ip string) context.Context {
+	return context.WithValue(ctx, clientIPKey, ip)
+}
+
 // FromContext retrieves the resolved client IP from the request context.
 // Returns empty string if not set.
 func FromContext(ctx context.Context) string {

@@ -17,6 +17,7 @@ import (
 
 type PlannerSettingsV3 struct {
 	TranscodeEnabled  bool
+	HWAccel           string
 	Allow4KTranscode  bool
 	AllowHEVCEncoding bool
 	// PreferLowerVersionTranscode lets a lower-resolution version serve the
@@ -56,8 +57,6 @@ type PlannerInputV3 struct {
 	// ServerBitrateCapKbps is an administrator-owned, per-attempt ceiling.
 	// Unlike a client's bandwidth preference it must fail closed.
 	ServerBitrateCapKbps int
-	DeliveryAllowList    []string
-	InventoryProvenance  string
 	RequestedFile        *models.MediaFile
 	EffectiveFile        *models.MediaFile
 	// LowerVersion names the version that serves lower qualities when the
@@ -1468,6 +1467,7 @@ func describeToneMapBlockerV3(recipe resolvedToneMapRecipeV3) string {
 // for an available transcode route. It returns a terminal when the source or
 // toolchain rules the route out before any recipe is built.
 func resolveTranscodeVideoTargetV3(input PlannerInputV3, source SourceDescriptorV3, subtitle SubtitlePolicyResultV3, subtitleForcedAdaptation bool) (targetVideoSelectionV3, resolvedToneMapRecipeV3, *PlannerResultV3) {
+	quality := ResolveQualityPolicyV3(input.Request, source)
 	var hlsRegistry *TransformationRegistryV3
 	toneMapRecipe := resolvedToneMapRecipeV3{}
 	if source.DynamicRange != "" && source.DynamicRange != DynamicRangeSDRV3 {
