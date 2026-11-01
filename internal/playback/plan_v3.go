@@ -67,6 +67,12 @@ type PlannerInputV3 struct {
 	Settings        PlannerSettingsV3
 	// Registry holds the transformations the local binary can execute.
 	Registry *TransformationRegistryV3
+	// DeliveryAllowList restricts planning to the delivery classes selected by
+	// the session's policy-eligible executor inventory. Nil permits all classes.
+	DeliveryAllowList []string
+	// InventoryProvenance records how the effective virtual-source inventory was
+	// established (for example, declared or verified).
+	InventoryProvenance string
 	// ProgressiveRemuxRegistry, HLSRemuxRegistry, and HLSVideoRegistry report
 	// the transformations executable by policy-eligible routes for each
 	// delivery. They are lazy because building a registry can touch pooled
@@ -1497,9 +1503,11 @@ func resolveTranscodeVideoTargetV3(input PlannerInputV3, source SourceDescriptor
 		// The lower version can still play a quality it serves at its own
 		// size, so a refusal it acts on beats one it does not.
 		if lowerVersionTakesTranscodeV3(input, source, quality) {
-			return terminalPlannerResultV3("no_alternate_version", terminalMessageLowerVersionServesV3, false)
+			result := terminalPlannerResultV3("no_alternate_version", terminalMessageLowerVersionServesV3, false)
+			return targetVideoSelectionV3{}, toneMapRecipe, &result
 		}
-		return terminalPlannerResultV3("conversion_tool_unavailable", "The required validated H.264/AAC conversion toolchain is unavailable.", true)
+		result := terminalPlannerResultV3("conversion_tool_unavailable", "The required validated H.264/AAC conversion toolchain is unavailable.", true)
+		return targetVideoSelectionV3{}, toneMapRecipe, &result
 	}
 	// An automatic encode never spends more than the best menu rung of its
 	// class. A conversion at the source's own size starts from the source's
@@ -1530,7 +1538,8 @@ func resolveTranscodeVideoTargetV3(input PlannerInputV3, source SourceDescriptor
 	if input.ServerBitrateCapKbps > 0 {
 		capBudget := optionalValueV3(input.Request.BandwidthCapKbps) * 95 / 100
 		if capBudget-audioShareKbps(capBudget) < 64 {
-			return terminalPlannerResultV3(TerminalBitratePolicyUnavailableV3, "The server bitrate limit is too low for a playable video stream.", false)
+			result := terminalPlannerResultV3(TerminalBitratePolicyUnavailableV3, "The server bitrate limit is too low for a playable video stream.", false)
+			return targetVideoSelectionV3{}, toneMapRecipe, &result
 		}
 		budget = minPositiveV3(budget, capBudget)
 	}
@@ -1579,54 +1588,66 @@ func resolveTranscodeVideoTargetV3(input PlannerInputV3, source SourceDescriptor
 	// transcodes the lower version instead, and replans this source without
 	// it if that fails.
 	if lowerVersionTakesTranscodeV3(input, source, quality) {
-		return terminalPlannerResultV3("no_alternate_version", terminalMessageLowerVersionServesV3, false)
+		result := terminalPlannerResultV3("no_alternate_version", terminalMessageLowerVersionServesV3, false)
+		return targetVideoSelectionV3{}, toneMapRecipe, &result
 	}
-	if source.DynamicRange != "" && source.DynamicRange != DynamicRangeSDRV3 {
-		base.AvailableQualities = availableQualitiesV3(input, source)
-	}
-	plan := base
-	plan.Delivery = DeliveryTranscodeHLSV3
-	plan.Stream = StreamV3{Protocol: StreamHLSV3, Container: containerHLSV3, MIMEType: "application/vnd.apple.mpegurl", Headers: map[string]string{}, HeaderRefresh: HeaderRefreshNoneV3}
-	plan.EffectiveRecipe.VideoCodec = targetVideoCodec
-	if targetVideoCodec == transcodeCodecHEVC {
-		plan.EffectiveRecipe.VideoSampleEntry = VideoSampleEntryHVC1
-	}
-	plan.EffectiveRecipe.AudioCodec = "aac"
-	plan.EffectiveRecipe.Width = intPointerV3(quality.Width)
-	plan.EffectiveRecipe.Height = intPointerV3(quality.Height)
-	plan.EffectiveRecipe.BitrateKbps = intPointerV3(quality.BitrateKbps)
-	audioLayout := audioLayoutForChannelsV3(targetAudioChannels)
-	plan.EffectiveRecipe.AudioChannels = intPointerV3(targetAudioChannels)
-	plan.EffectiveRecipe.AudioLayout = audioLayout
-	plan.Transformations = append(plan.Transformations,
-		videoTransformationForTargetV3(targetVideoCodec),
-		TransformationV3{Name: TransformationAudioToAACV3, Executor: ExecutorServerV3, RecipeVersion: TransformationAudioToAACRecipeVersionV3, ValidatedClaims: []string{ClaimAudioDecodeV3}},
-	)
-	toneMapPolicy := toneMapRecipe.policy
-	toneMapMode := toneMapRecipe.mode
-	toneMapResolution := toneMapRecipe.resolution
-	toneMapRevision := toneMapRecipe.revision
-	toneMapOK := toneMapRecipe.ok
-	toneMapSourceKind := toneMapResolution.Kind
-	if source.DynamicRange != "" && source.DynamicRange != DynamicRangeSDRV3 {
-		plan.Transformations = append(plan.Transformations, TransformationV3{
-			Name: TransformationHDRToSDRToneMapV3, Executor: ExecutorServerV3,
-			RecipeVersion:   TransformationHDRToSDRToneMapRecipeVersionV3,
-			ValidatedClaims: []string{ClaimHDRMetadataRemovedV3, ClaimSDRBT709OutputV3},
-		})
-		plan.DegradationWarnings = append(plan.DegradationWarnings, DegradationWarningV3{
-			Code: DegradationWarningHDRToneMappedV3, Message: "HDR video is tone-mapped to SDR for this playback route.",
-		})
+	// The caller owns the base plan; this helper only selects the target and
+	// recipe. Plan construction remains in planVideoTranscodeV3 so source and
+	// session state are restored there consistently.
+	return targetVideoSelectionV3{codec: targetVideoCodec, transformation: func() string {
+		if targetVideoCodec == transcodeCodecHEVC {
+			return TransformationVideoToHEVCV3
+		}
+		return TransformationVideoToH264V3
+	}()}, toneMapRecipe, nil
+	/*
+		if source.DynamicRange != "" && source.DynamicRange != DynamicRangeSDRV3 {
+			base.AvailableQualities = availableQualitiesV3(input, source)
+		}
+		plan := base
+		plan.Delivery = DeliveryTranscodeHLSV3
+		plan.Stream = StreamV3{Protocol: StreamHLSV3, Container: containerHLSV3, MIMEType: "application/vnd.apple.mpegurl", Headers: map[string]string{}, HeaderRefresh: HeaderRefreshNoneV3}
+		plan.EffectiveRecipe.VideoCodec = targetVideoCodec
+		if targetVideoCodec == transcodeCodecHEVC {
+			plan.EffectiveRecipe.VideoSampleEntry = VideoSampleEntryHVC1
+		}
+		plan.EffectiveRecipe.AudioCodec = "aac"
+		plan.EffectiveRecipe.Width = intPointerV3(quality.Width)
+		plan.EffectiveRecipe.Height = intPointerV3(quality.Height)
+		plan.EffectiveRecipe.BitrateKbps = intPointerV3(quality.BitrateKbps)
+		audioLayout := audioLayoutForChannelsV3(targetAudioChannels)
+		plan.EffectiveRecipe.AudioChannels = intPointerV3(targetAudioChannels)
+		plan.EffectiveRecipe.AudioLayout = audioLayout
+		plan.Transformations = append(plan.Transformations,
+			videoTransformationForTargetV3(targetVideoCodec),
+			TransformationV3{Name: TransformationAudioToAACV3, Executor: ExecutorServerV3, RecipeVersion: TransformationAudioToAACRecipeVersionV3, ValidatedClaims: []string{ClaimAudioDecodeV3}},
+		)
+		toneMapPolicy := toneMapRecipe.policy
+		toneMapMode := toneMapRecipe.mode
+		toneMapResolution := toneMapRecipe.resolution
+		toneMapRevision := toneMapRecipe.revision
+		toneMapOK := toneMapRecipe.ok
+		toneMapSourceKind := toneMapResolution.Kind
+		if source.DynamicRange != "" && source.DynamicRange != DynamicRangeSDRV3 {
+			plan.Transformations = append(plan.Transformations, TransformationV3{
+				Name: TransformationHDRToSDRToneMapV3, Executor: ExecutorServerV3,
+				RecipeVersion:   TransformationHDRToSDRToneMapRecipeVersionV3,
+				ValidatedClaims: []string{ClaimHDRMetadataRemovedV3, ClaimSDRBT709OutputV3},
+			})
+			plan.DegradationWarnings = append(plan.DegradationWarnings, DegradationWarningV3{
+				Code: DegradationWarningHDRToneMappedV3, Message: "HDR video is tone-mapped to SDR for this playback route.",
+			})
+			return toneMap
+		}
+		// A non-tone-mapped recipe has no execution policy. Keeping PolicyNone
+		// here would turn an ordinary SDR encode into a partial frozen recipe at
+		// the FFmpeg execution boundary.
+		toneMap.policy = ""
+		toneMap.sourceKind = ""
+		toneMap.resolution = tonemap.SourceResolution{}
+		toneMap.revision = tonemap.SourceRevision{}
 		return toneMap
-	}
-	// A non-tone-mapped recipe has no execution policy. Keeping PolicyNone
-	// here would turn an ordinary SDR encode into a partial frozen recipe at
-	// the FFmpeg execution boundary.
-	toneMap.policy = ""
-	toneMap.sourceKind = ""
-	toneMap.resolution = tonemap.SourceResolution{}
-	toneMap.revision = tonemap.SourceRevision{}
-	return toneMap
+	*/
 }
 
 // downgradeTranscodePlanV3 applies the transcode fallback ladder: a failed
