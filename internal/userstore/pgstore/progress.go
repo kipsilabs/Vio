@@ -1458,13 +1458,14 @@ func (s *PostgresUserStore) UpdateProgressHints(ctx context.Context, profileID, 
 		WHERE user_id = $1 AND profile_id = $2 AND media_item_id = $3
 		  AND (last_file_id IS DISTINCT FROM $4 OR last_resolution IS DISTINCT FROM $5 OR last_hdr IS DISTINCT FROM $6
 		       OR last_codec_video IS DISTINCT FROM $7 OR last_edition_key IS DISTINCT FROM $8)`,
-		s.userID, profileID, mediaItemID,
-		hints.FileID, hints.Resolution, hints.HDR, hints.CodecVideo, nilIfEmpty(hints.EditionKey),
-	)
-	if err != nil {
-		return fmt.Errorf("updating progress hints: %w", err)
-	}
-	return nil
+			s.userID, profileID, targetID,
+			hints.FileID, hints.Resolution, hints.HDR, hints.CodecVideo, nilIfEmpty(hints.EditionKey),
+		)
+		if err != nil {
+			return fmt.Errorf("updating progress hints: %w", err)
+		}
+		return nil
+	})
 }
 
 func nilIfEmpty(value string) *string {
