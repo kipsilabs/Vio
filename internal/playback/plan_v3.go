@@ -1808,14 +1808,34 @@ func planVideoTranscodeV3(input PlannerInputV3, base PlanV3, source SourceDescri
 	if targetVideo.codec == TargetVideoCodecHEVCV3 &&
 		(!input.Settings.AllowHEVCEncoding || !hlsHEVCOutputSupportedV3(input.Request, quality, source)) {
 		targetVideo = targetVideoFloorV3
+		quality = ResolveQualityPolicyV3(input.Request, source)
+		if sourceKbps := sourceEquivalentKbps(source, transcodeCodecH264); sourceKbps > 0 {
+			quality.BitrateKbps = sourceKbps
+		}
+		quality = h264BoundedQualityV3(input.Request, quality, source)
 	}
 	// A forced encode triggered by burn-in, HDR handling, or capability
 	// evidence must not inherit a source-preserving "original quality" bitrate:
 	// that yields a source-bitrate encode no hardware encoder can keep up with.
 	// Replace it with the source-class ladder rung.
 	sourcePreservingEncodeForced := quality.PreservesSource
-	if sourcePreservingEncodeForced {
-		quality = forcedEncodeQualityResultV3(source, quality)
+	// Quality policy has already applied the route's source and decoder bounds;
+	// do not replace that bounded result with the generic source-class rung.
+	// forcedEncodeQualityResultV3 restores the source-class ladder rung; retain
+	// the codec-specific bounds selected above when that happens. In
+	// particular, a failed HEVC attempt must replan through the H.264 decoder
+	// bound, rather than carrying the HEVC quality into the fallback recipe.
+	if targetVideo.codec == TargetVideoCodecHEVCV3 {
+		if sourceKbps := sourceEquivalentKbps(source, transcodeCodecHEVC); sourceKbps > 0 {
+			quality.BitrateKbps = min(quality.BitrateKbps, sourceKbps)
+		}
+		for _, decoder := range input.Request.Capabilities.VideoDecode {
+			if strings.EqualFold(decoder.Codec, transcodeCodecHEVC) && decoder.MaxBitrateKbps > 0 {
+				quality.BitrateKbps = min(quality.BitrateKbps, decoder.MaxBitrateKbps)
+			}
+		}
+	} else {
+		quality = h264BoundedQualityV3(input.Request, quality, source)
 	}
 	if source.DynamicRange != "" && source.DynamicRange != DynamicRangeSDRV3 {
 		base.AvailableQualities = availableQualitiesForRouteV3(input, source)
