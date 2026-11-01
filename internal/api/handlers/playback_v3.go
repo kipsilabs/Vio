@@ -8055,13 +8055,16 @@ func (h *PlaybackHandler) warmVirtualFontBundleV3(ctx context.Context, session *
 		return done
 	}
 	ffmpegPath := h.playbackConfig().FFmpegPath
-	cacheKey := fontBundleCacheKey(file, virtualURI, ffmpegPath)
-	if cacheKey.PinnedResult == "" {
-		// Uncacheable without the pinned candidate anchor: the identity would
-		// rotate with the relay URL, so there is nothing stable to warm.
-		close(done)
-		return done
+	// The serve path binds the session's captured subtitle evidence before it
+	// builds the cache key, so the warm must key the same inventory or it
+	// commits under an identity no request will ask for.
+	keyFile := file
+	if session.VirtualSubtitleEvidenceSet {
+		bound := *file
+		bound.SubtitleTracks = session.VirtualSubtitleTracks
+		keyFile = &bound
 	}
+	cacheKey := fontBundleCacheKey(keyFile, ffmpegPath)
 	go func() {
 		defer close(done)
 		resolved, cleanup, err := h.resolveVirtualInputURI(

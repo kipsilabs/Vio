@@ -197,7 +197,7 @@ func TestHandleSubtitleFontsCacheHitClearsFailureThrottleKey(t *testing.T) {
 	if err := os.WriteFile(gatePath, []byte("go"), 0o600); err != nil {
 		t.Fatalf("release gate: %v", err)
 	}
-	key := fontBundleCacheKey(file, "", handler.ffmpegPath())
+	key := fontBundleCacheKey(file, handler.ffmpegPath())
 	if !pollHandlerFontBundle(t, handler.SubtitleCache, key) {
 		t.Fatal("detached extraction never committed to the cache")
 	}

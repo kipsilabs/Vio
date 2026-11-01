@@ -2898,14 +2898,14 @@ func (h *StreamHandler) SubtitleFonts(ctx context.Context, in SubtitleFontReques
 // single-flight extracts while the caller waits up to fontBundleClientWait and
 // then receives pending=true. Virtual inputs are resolved through the relay —
 // a provider-neutral virtual:// URI is not an FFmpeg input, so probing it
-// directly always fails. Virtual keys without a pinned result= are
-// uncacheable and extract uncached within the request. The returned pending
-// flag tells the caller to answer uncacheable/pending rather than definitive.
+// directly always fails. Virtual keys are stable without a pinned result=: the
+// identity follows the probed subtitle layout, so the returned pending flag is
+// the only "not definitive yet" signal the caller needs.
 func (h *StreamHandler) fontBundleForRequest(ctx context.Context, session *playback.Session, file *models.MediaFile, trackIndex int) ([]playback.SubtitleFontBundleItem, bool, error) {
 	failKey := fontExtractFailureKey(file.ID, trackIndex)
 	failAttrs := []any{"file_id", file.ID, "track", trackIndex}
 	virtualFontSource := isVirtualPlaybackFile(file) && session.VirtualSourceURI != ""
-	cacheKey := fontBundleCacheKey(file, session.VirtualSourceURI, h.ffmpegPath())
+	cacheKey := fontBundleCacheKey(file, h.ffmpegPath())
 
 	resolveInput := func(extractCtx context.Context) (string, func(), error) {
 		inputPath := file.FilePath
@@ -2921,7 +2921,7 @@ func (h *StreamHandler) fontBundleForRequest(ctx context.Context, session *playb
 		return inputPath, releaseInput, nil
 	}
 
-	if h.SubtitleCache != nil && !(virtualFontSource && cacheKey.PinnedResult == "") {
+	if h.SubtitleCache != nil {
 		if cached, ok := h.SubtitleCache.LookupFontBundle(cacheKey); ok {
 			h.fontExtractFailures.recovered(failKey)
 			var items []playback.SubtitleFontBundleItem
@@ -3118,14 +3118,7 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 	// must never depend on the resolved relay URL, which rotates per
 	// registration. Shared with the playback pre-warm so the two cannot drift.
 	virtualFontSource := isVirtualPlaybackFile(file) && session.VirtualSourceURI != ""
-	cacheKey := fontBundleCacheKey(file, session.VirtualSourceURI, h.ffmpegPath())
-
-	// Virtual keys without a pinned result= param are intentionally
-	// uncacheable: the identity would be unstable without the candidate
-	// anchor, so we fall through to the uncached extract path below.
-	if virtualFontSource && cacheKey.PinnedResult == "" {
-		slog.DebugContext(r.Context(), "virtual font bundle has no pinned result= param; skipping cache", "component", "api", "file_id", file.ID)
-	}
+	cacheKey := fontBundleCacheKey(file, h.ffmpegPath())
 
 	// A cache hit serves the encoded bundle immediately: no provider round-trip,
 	// no relay registration, no ffmpeg spawn.
@@ -3273,24 +3266,27 @@ var emptyFontBundle = []byte("[]")
 
 // fontBundleCacheKey builds the FontBundleKey for a media file the same way the
 // stream font handler does, and is shared with the playback-time pre-warm so
-// the two can never drift. Virtual rows key on the pinned result candidate
-// because relay URLs rotate per registration; local rows key on the file row's
-// size and mtime so a re-probed or replaced file reads as a miss.
-func fontBundleCacheKey(file *models.MediaFile, virtualSourceURI, ffmpegPath string) playback.FontBundleKey {
-	if file != nil && isVirtualPlaybackFile(file) && virtualSourceURI != "" {
+// the two can never drift. Virtual rows key on the row's probed subtitle
+// inventory because both the pinned result candidate and the resolved relay URL
+// rotate per registration; an unchanged layout therefore reuses the warmed
+// bundle, while a re-probe with a different layout re-keys. Local rows key on
+// the file row's size and mtime so a re-probed or replaced file reads as a miss.
+func fontBundleCacheKey(file *models.MediaFile, ffmpegPath string) playback.FontBundleKey {
+	if file == nil {
+		return playback.FontBundleKey{FFmpegPath: ffmpegPath}
+	}
+	if isVirtualPlaybackFile(file) {
 		return playback.FontBundleKey{
-			FileID:       file.ID,
-			PinnedResult: virtualResultCandidateID(virtualSourceURI),
-			FFmpegPath:   ffmpegPath,
+			FileID:         file.ID,
+			Virtual:        true,
+			InventoryToken: playback.SubtitleInventoryToken(file.SubtitleTracks),
+			FFmpegPath:     ffmpegPath,
 		}
 	}
-	key := playback.FontBundleKey{FFmpegPath: ffmpegPath}
-	if file != nil {
-		key.FileID = file.ID
-		key.Size = file.FileSize
-		if file.FileModifiedAt != nil {
-			key.MtimeUnixNano = file.FileModifiedAt.UnixNano()
-		}
+	key := playback.FontBundleKey{FileID: file.ID, FFmpegPath: ffmpegPath}
+	key.Size = file.FileSize
+	if file.FileModifiedAt != nil {
+		key.MtimeUnixNano = file.FileModifiedAt.UnixNano()
 	}
 	return key
 }

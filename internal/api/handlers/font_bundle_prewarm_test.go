@@ -47,7 +47,7 @@ func TestWarmVirtualFontBundleRunsOncePerFile(t *testing.T) {
 		t.Fatal("virtual font warm did not settle")
 	}
 
-	key := fontBundleCacheKey(file, session.VirtualSourceURI, handler.playbackConfig().FFmpegPath)
+	key := fontBundleCacheKey(file, handler.playbackConfig().FFmpegPath)
 	if _, ok := handler.SubtitleCache.LookupFontBundle(key); !ok {
 		t.Fatal("warm did not commit a font bundle for the file")
 	}
@@ -72,7 +72,7 @@ func TestWarmVirtualFontBundleUsesEffectiveFileURIWhenSessionCopyIsStale(t *test
 	case <-time.After(10 * time.Second):
 		t.Fatal("virtual font warm did not settle")
 	}
-	key := fontBundleCacheKey(file, file.FilePath, handler.playbackConfig().FFmpegPath)
+	key := fontBundleCacheKey(file, handler.playbackConfig().FFmpegPath)
 	if _, ok := handler.SubtitleCache.LookupFontBundle(key); !ok {
 		t.Fatal("warm did not commit a font bundle when the session copy lacked VirtualSourceURI")
 	}
@@ -115,7 +115,10 @@ func TestWarmVirtualFontBundleSkipsNonVirtualFile(t *testing.T) {
 	}
 }
 
-func TestWarmVirtualFontBundleSkipsWithoutPinnedResult(t *testing.T) {
+// An unpinned virtual source is cacheable now that the identity follows the
+// probed subtitle layout instead of the rotating result candidate: there is
+// nothing left for the pin to anchor.
+func TestWarmVirtualFontBundleRunsWithoutPinnedResult(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell script test helper is unix-only")
 	}
@@ -123,10 +126,49 @@ func TestWarmVirtualFontBundleSkipsWithoutPinnedResult(t *testing.T) {
 
 	select {
 	case <-handler.warmVirtualFontBundleV3(context.Background(), session, file):
-	case <-time.After(2 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("warm did not settle for an unpinned virtual source")
 	}
-	if got := countLogLines(t, probeLog); got != 0 {
-		t.Fatalf("ffprobe ran %d times for an unpinned virtual source, want 0", got)
+	key := fontBundleCacheKey(file, handler.playbackConfig().FFmpegPath)
+	if _, ok := handler.SubtitleCache.LookupFontBundle(key); !ok {
+		t.Fatal("warm did not commit a font bundle for an unpinned virtual source")
+	}
+	if got := countLogLines(t, probeLog); got != 1 {
+		t.Fatalf("ffprobe ran %d times for an unpinned virtual source, want 1", got)
+	}
+}
+
+// A candidate rotation that leaves the probed layout intact is the same
+// release: the warm committed under the previous pinned URI must be readable
+// under the new one. A changed layout re-keys, so the previous bytes are not
+// served for the new inventory.
+func TestFontBundleCacheKeyFollowsInventoryAcrossCandidateRotation(t *testing.T) {
+	tracks := assTestTracks()
+	file := &models.MediaFile{ID: 42, FilePath: "virtual://movie/tt1?result=cand-a", SubtitleTracks: tracks}
+	ffmpegPath := "/usr/bin/ffmpeg"
+	base := fontBundleCacheKey(file, ffmpegPath)
+
+	rotated := *file
+	rotated.FilePath = "virtual://movie/tt1?result=cand-b"
+	if got := fontBundleCacheKey(&rotated, ffmpegPath); got != base {
+		t.Fatalf("identical layout re-keyed on candidate rotation: %+v vs %+v", got, base)
+	}
+
+	changed := *file
+	changed.SubtitleTracks = []models.SubtitleTrack{{Index: 4, Codec: "ass"}, {Index: 7, Codec: "subrip"}}
+	if got := fontBundleCacheKey(&changed, ffmpegPath); got == base {
+		t.Fatal("changed probed inventory kept the font-bundle identity")
+	}
+
+	// Captured-empty evidence is still a stable inventory, keyed by file id and
+	// the generation bucket rather than the relay URL.
+	empty := *file
+	empty.SubtitleTracks = nil
+	emptyKey := fontBundleCacheKey(&empty, ffmpegPath)
+	if emptyKey == base {
+		t.Fatal("empty inventory kept the populated-layout identity")
+	}
+	if got := fontBundleCacheKey(&empty, "/opt/ffmpeg"); got == emptyKey {
+		t.Fatal("ffmpeg relocation kept the font-bundle identity")
 	}
 }

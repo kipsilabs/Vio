@@ -2024,29 +2024,34 @@ func subtitleCacheSource(inputPath, cacheIdentity string, now time.Time) (string
 }
 
 // FontBundleKey is a stable identity for font-bundle caching. Virtual rows
-// key on the pinned result id — resolved relay URLs rotate per registration
-// and would defeat the cache (mirror of the DV RPU memo key). Local rows key
-// on the file row's size and mtime so a re-probed or replaced file reads as a
-// miss.
+// key on the row's probed subtitle inventory plus a generation bucket — not on
+// the pinned result candidate or a resolved relay URL, both of which rotate
+// per registration and would strand warmed bundles under keys requests never
+// ask for. An unchanged inventory keeps its bundle across a rotation (the
+// bytes are the same release), while a re-probe that changes the layout
+// re-keys through the inventory token. Local rows key on the file row's size
+// and mtime so a re-probed or replaced file reads as a miss.
 type FontBundleKey struct {
-	FileID        int
-	PinnedResult  string // "" for local files
-	Size          int64
-	MtimeUnixNano int64
-	FFmpegPath    string
+	FileID         int
+	Virtual        bool
+	InventoryToken string // probed subtitle inventory; "" is a stable layout token
+	Size           int64
+	MtimeUnixNano  int64
+	FFmpegPath     string
 }
 
 // source resolves the stable cache identity and invalidation coordinates for
 // the key, mirroring subtitleCacheSource's two modes. Local rows use the file
 // row's mtime/size verbatim (no generation bucket); virtual rows key on the
-// pinned result id plus a generation bucket so a rotated source can
-// never be served past the bucket boundary. ok is false for rows that cannot
-// be keyed reliably (a local row without a usable mtime/size), which callers
-// treat as "do not cache" — the same fallback the DV RPU memo uses.
+// subtitle inventory plus a generation bucket so a rotated source can never
+// be served past the bucket boundary. A virtual row without a probed inventory
+// still keys by file id + bucket. ok is false for rows that cannot be keyed
+// reliably (a local row without a usable mtime/size), which callers treat as
+// "do not cache" — the same fallback the DV RPU memo uses.
 func (k FontBundleKey) source(now time.Time) (identity string, modTime time.Time, size int64, ok bool) {
-	if k.PinnedResult != "" {
+	if k.Virtual {
 		bucket := now.Unix() / int64(subtitleCacheGenerationBucket/time.Second)
-		return fontBundleIdentity(k.FileID, k.PinnedResult, k.FFmpegPath, bucket),
+		return fontBundleIdentity(k.FileID, k.InventoryToken, k.FFmpegPath, bucket),
 			time.Unix(bucket*int64(subtitleCacheGenerationBucket/time.Second), 0), 0, true
 	}
 	if k.MtimeUnixNano == 0 || k.Size <= 0 {
@@ -2056,10 +2061,11 @@ func (k FontBundleKey) source(now time.Time) (identity string, modTime time.Time
 }
 
 // fontBundleIdentity hashes the stable components of a font-bundle cache key.
+// variant carries the virtual row's inventory token (empty for local rows).
 // The ffmpeg path is included so a binary relocation (which can change
 // extraction output) starts a fresh cache.
-func fontBundleIdentity(fileID int, pinnedResult, ffmpegPath string, bucket int64) string {
-	sum := sha256.Sum256([]byte(fmt.Sprintf("%d|%s|%s|%d", fileID, pinnedResult, ffmpegPath, bucket)))
+func fontBundleIdentity(fileID int, variant, ffmpegPath string, bucket int64) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%d|%s|%s|%d", fileID, variant, ffmpegPath, bucket)))
 	return fmt.Sprintf("%x", sum[:12])
 }
 

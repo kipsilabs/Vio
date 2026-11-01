@@ -1028,7 +1028,7 @@ func TestHandleSubtitleFontsKeepsRelayForDetachedFlight(t *testing.T) {
 	if err := os.WriteFile(gate, []byte("go"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	key := fontBundleCacheKey(file, virtualURI, handler.ffmpegPath())
+	key := fontBundleCacheKey(file, handler.ffmpegPath())
 	if !pollHandlerFontBundle(t, handler.SubtitleCache, key) {
 		t.Fatal("detached extraction never committed after the HTTP waiter returned")
 	}
