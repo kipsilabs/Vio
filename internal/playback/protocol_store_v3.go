@@ -143,6 +143,10 @@ type RecoveryStateV3 struct {
 	Exclusions []RecoveryExclusionV3 `json:"exclusions,omitempty"`
 }
 
+func RecoveryExclusionKeyV3(providerSource, candidateID string) string {
+	return providerSource + "\x00" + candidateID
+}
+
 type RecoveryExclusionV3 struct {
 	ProviderSource string    `json:"provider_source,omitempty"`
 	CandidateID    string    `json:"candidate_id"`
@@ -166,10 +170,12 @@ const (
 
 type AudioReconcileEntryV3 struct {
 	Generation    string                   `json:"generation"`
+	SessionID     string                   `json:"session_id,omitempty"`
 	Decision      AudioReconcileDecisionV3 `json:"decision"`
 	AudioIndex    *int                     `json:"audio_index,omitempty"`
 	Request       *ReplanRequestV3         `json:"request,omitempty"`
 	RequestDigest string                   `json:"request_digest,omitempty"`
+	AnnouncedAt   *time.Time               `json:"announced_at,omitempty"`
 }
 
 type AttemptRecordV3 struct {
@@ -213,7 +219,10 @@ type AttemptRecordV3 struct {
 	// shrink it. Entries persist in the audio_reconcile_ledger column; the
 	// memory store keeps them on the record itself. A fresh attempt starts
 	// with the zero value and inherits nothing.
-	AudioReconcileLedger AudioReconcileLedgerV3
+	AudioReconcileLedger     AudioReconcileLedgerV3
+	RecoveryState            RecoveryStateV3
+	RecoveryRevision         int64
+	CurrentTransportRendered bool
 	// StartResponse is the latest durable decision for this attempt. It begins
 	// as the exact start response and advances atomically with each completed
 	// replan so an idempotent start retry never resurrects a superseded plan.

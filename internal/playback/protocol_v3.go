@@ -853,6 +853,8 @@ type StartRequestV3 struct {
 	StartPosition              *float64                  `json:"start_position,omitempty"`
 	ProgressPersistence        ProgressPersistenceV3     `json:"progress_persistence,omitempty"`
 	AudioTrackID               string                    `json:"audio_track_id,omitempty"`
+	CarriedAudioTrackID        string                    `json:"carried_audio_track_id,omitempty"`
+	OfferedVirtualURI          string                    `json:"offered_virtual_uri,omitempty"`
 	AudioTrackIndex            *int                      `json:"audio_track_index,omitempty"`
 	SubtitleTrackID            string                    `json:"subtitle_track_id,omitempty"`
 	SubtitleTrackIndex         *int                      `json:"subtitle_track_index,omitempty"`
