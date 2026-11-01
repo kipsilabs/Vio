@@ -1767,6 +1767,9 @@ func downgradeTranscodePlanV3(input PlannerInputV3, subtitle SubtitlePolicyResul
 		targetVideo = targetVideoFloorV3
 		plan.EffectiveRecipe.VideoCodec = targetVideo.codec
 		plan.EffectiveRecipe.VideoSampleEntry = ""
+		plan.EffectiveRecipe.Width = intPointerV3(quality.Width)
+		plan.EffectiveRecipe.Height = intPointerV3(quality.Height)
+		plan.EffectiveRecipe.BitrateKbps = intPointerV3(quality.BitrateKbps)
 		replaceVideoTransformationV3(plan, targetVideo.codec)
 		if !deliverySupportsPlanV3(input.Request, DeliveryClassHLSV3, *plan) {
 			result := terminalPlannerResultV3("adaptation_unavailable", "The HLS delivery cannot decode the H.264 fallback recipe.", false)
@@ -1813,16 +1816,9 @@ func planVideoTranscodeV3(input PlannerInputV3, base PlanV3, source SourceDescri
 	// H.264 floor when either fails.
 	if targetVideo.codec == TargetVideoCodecHEVCV3 &&
 		(!input.Settings.AllowHEVCEncoding || !hlsHEVCOutputSupportedV3(input.Request, quality, source)) {
-		h264Quality := targetVideo.h264Quality
 		targetVideo = targetVideoFloorV3
-		// The resolver already computed the H.264-specific bounded quality.
-		// Reusing it preserves the fitted dimensions and bitrate when HEVC is
-		// rejected after capability validation.
-		quality = h264Quality
-		if quality.Width == 0 && quality.Height == 0 {
-			quality = ResolveQualityPolicyV3(input.Request, source)
-			quality = h264BoundedQualityV3(input.Request, quality, source)
-		}
+		quality = ResolveQualityPolicyV3(input.Request, source)
+		quality = h264BoundedQualityV3(input.Request, quality, source)
 	}
 	// A forced encode triggered by burn-in, HDR handling, or capability
 	// evidence must not inherit a source-preserving "original quality" bitrate:
