@@ -313,6 +313,10 @@ func CapabilitiesComplete(capabilities Capabilities, hardwareBackend string) boo
 	}
 }
 
+func probeCapabilitiesComplete(capabilities Capabilities, hardwareBackend string) bool {
+	return CapabilitiesComplete(capabilities, hardwareBackend)
+}
+
 func capabilityCoversAllSourceKinds(capabilities Capabilities, mode Mode, backend string) bool {
 	index := slices.IndexFunc(capabilities, func(capability Capability) bool {
 		return capability.Mode == mode && capability.Backend == backend

@@ -42,6 +42,28 @@ type fakeHistoryExec struct {
 	args []any
 }
 
+type fakeHistoryTx struct {
+	execs      []fakeHistoryExec
+	lockTag    pgconn.CommandTag
+	lockTagSet bool
+	committed  bool
+	rolledBack bool
+}
+
+func (tx *fakeHistoryTx) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	tx.execs = append(tx.execs, fakeHistoryExec{sql: sql, args: args})
+	if tx.lockTagSet && strings.Contains(sql, "pg_advisory_xact_lock_shared") {
+		return tx.lockTag, nil
+	}
+	return pgconn.NewCommandTag("UPDATE 1"), nil
+}
+func (tx *fakeHistoryTx) Commit(context.Context) error   { tx.committed = true; return nil }
+func (tx *fakeHistoryTx) Rollback(context.Context) error { tx.rolledBack = true; return nil }
+func (db *fakeHistoryDB) Begin(context.Context) (historyTx, error) {
+	db.tx = &fakeHistoryTx{lockTag: db.lockTag, lockTagSet: db.lockTagSet}
+	return db.tx, nil
+}
+
 func (db *fakeHistoryDB) Query(context.Context, string, ...any) (pgx.Rows, error) {
 	return &fakeHistoryRows{rows: db.rows, pos: -1}, nil
 }
