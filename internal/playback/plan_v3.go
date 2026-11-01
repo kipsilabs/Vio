@@ -279,6 +279,23 @@ func resolvePlanSubtitlePoliciesV3(input PlannerInputV3, file *models.MediaFile,
 
 // PlanPlaybackV3 chooses a playable protocol-v3 route from source and client facts.
 func PlanPlaybackV3(input PlannerInputV3) (result PlannerResultV3) {
+	result = planPlaybackOnceV3(input)
+	if input.StickyDelivery != "" && result.Plan != nil {
+		naturalClass := DeliveryClassV3(result.Plan.Delivery)
+		stickyClass := DeliveryClassV3(input.StickyDelivery)
+		if naturalClass != stickyClass {
+			stickyInput := input
+			stickyInput.DeliveryAllowList = []string{stickyClass}
+			if sticky := planPlaybackOnceV3(stickyInput); sticky.Plan != nil {
+				sticky.StickyDeliveryKept = true
+				return sticky
+			}
+		}
+	}
+	return result
+}
+
+func planPlaybackOnceV3(input PlannerInputV3) (result PlannerResultV3) {
 	// Registered first so it runs last, after any rewrite of the result.
 	defer func() {
 		if result.Plan != nil {
