@@ -106,7 +106,11 @@ func (l *LoginLimiter) janitor() {
 // fresh bucket. PeerFromContext carries the pre-overwrite address for exactly
 // this case; RemoteAddr is only correct when the middleware is absent.
 func clientIP(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	addr := r.RemoteAddr
+	if peer := clientip.PeerFromContext(r.Context()); peer != "" {
+		addr = peer
+	}
+	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		return ratelimit.SourceKey(addr)
 	}
