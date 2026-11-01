@@ -22,9 +22,11 @@ func snapshotSubtitleTracks(codec string) []models.SubtitleTrack {
 
 // A rounded provider declaration is the production shape: the served bytes are
 // ~13% short of the declared size, so the 5% gate can only excuse them when the
-// measured duration proves the content. That acceptance must record the
-// observed size for the pin, because the declared size will never clear the
-// gate on its own.
+// measured duration proves the content. Evidence that leans on the duration must
+// record the observed size for the pin, because the declared size will never
+// clear the gate on its own — but recording is not admission. One serve cannot
+// tell the release from a wrong file of the same runtime, so the recording serve
+// stays unverified and a later serve of the same bytes is what admits the pin.
 func TestVirtualServedSizeSnapshotRecordedOnDurationProvenAcceptance(t *testing.T) {
 	ResetVirtualServedSizeSnapshots()
 	t.Cleanup(ResetVirtualServedSizeSnapshots)
@@ -42,9 +44,11 @@ func TestVirtualServedSizeSnapshotRecordedOnDurationProvenAcceptance(t *testing.
 		t.Fatalf("verdict before acceptance = %v, want unverified", verdict)
 	}
 
+	// The first duration-proven serve records the observation and still does
+	// not establish identity.
 	verdict = ClassifyVirtualServedEvidenceForPinWithSnapshot(pin, snapshotDeclaredBytes, snapshotObservedBytes, snapshotDurationSec, snapshotRuntimeMin, token)
-	if verdict != VirtualServedEvidenceAdmitted {
-		t.Fatalf("verdict after duration-proven acceptance = %v, want admitted", verdict)
+	if verdict != VirtualServedEvidenceUnverified {
+		t.Fatalf("verdict on the recording serve = %v, want unverified (one observation is not identity)", verdict)
 	}
 	snapshot, ok := VirtualServedSizeSnapshotFor(pin, snapshotDeclaredBytes, token)
 	if !ok {
@@ -56,20 +60,30 @@ func TestVirtualServedSizeSnapshotRecordedOnDurationProvenAcceptance(t *testing.
 	if snapshot.DeclaredBytes != snapshotDeclaredBytes {
 		t.Fatalf("snapshot declared = %d, want the provider declaration %d", snapshot.DeclaredBytes, snapshotDeclaredBytes)
 	}
+
+	// A second serve of the recorded bytes confirms the pin, and needs no new
+	// duration proof: the observation already carries it.
+	verdict = ClassifyVirtualServedEvidenceForPinWithSnapshot(pin, snapshotDeclaredBytes, snapshotObservedBytes, 0, 0, token)
+	if verdict != VirtualServedEvidenceAdmitted {
+		t.Fatalf("verdict on the confirming serve = %v, want admitted", verdict)
+	}
 }
 
-// The snapshot is the baseline future comparisons for the same pin use, so a
-// re-probe of the same bytes is admitted instead of being re-probed forever,
-// while a genuinely different size under the pin still has to prove identity by
-// duration.
+// The confirmed observation is the baseline future comparisons for the same pin
+// use, so a re-probe of the same bytes is admitted instead of being re-probed
+// forever, while a genuinely different size under the pin still has to prove
+// identity by duration.
 func TestVirtualServedSizeSnapshotDrivesLaterEvidenceComparisons(t *testing.T) {
 	ResetVirtualServedSizeSnapshots()
 	t.Cleanup(ResetVirtualServedSizeSnapshots)
 
 	pin := VirtualServedSizePin("virtual://movie/tt-snap-later?result=rounded", 7)
 	token := VirtualServedSizeSubtitleToken(snapshotSubtitleTracks("subrip"))
+	if verdict := ClassifyVirtualServedEvidenceForPinWithSnapshot(pin, snapshotDeclaredBytes, snapshotObservedBytes, snapshotDurationSec, snapshotRuntimeMin, token); verdict != VirtualServedEvidenceUnverified {
+		t.Fatalf("recording serve verdict = %v, want unverified", verdict)
+	}
 	if verdict := ClassifyVirtualServedEvidenceForPinWithSnapshot(pin, snapshotDeclaredBytes, snapshotObservedBytes, snapshotDurationSec, snapshotRuntimeMin, token); verdict != VirtualServedEvidenceAdmitted {
-		t.Fatalf("first acceptance verdict = %v, want admitted", verdict)
+		t.Fatalf("confirming serve verdict = %v, want admitted", verdict)
 	}
 
 	// A later probe reads the same release: the baseline is now the observed
@@ -87,6 +101,49 @@ func TestVirtualServedSizeSnapshotDrivesLaterEvidenceComparisons(t *testing.T) {
 	}
 }
 
+// A duration-plausible wrong serve must not become identity by repetition: a
+// second serve with different bytes stays unverified, and the observation the
+// pin was proven to serve is what still confirms it. This is the failure the
+// two-observation rule exists for — one plausible-looking wrong serve (a
+// different release of the same runtime) would otherwise be the pin's baseline
+// forever.
+func TestVirtualServedSizeSnapshotDivergentServeKeepsPinUnverified(t *testing.T) {
+	ResetVirtualServedSizeSnapshots()
+	t.Cleanup(ResetVirtualServedSizeSnapshots)
+
+	pin := VirtualServedSizePin("virtual://movie/tt-snap-divergent?result=wrong", 7)
+	token := VirtualServedSizeSubtitleToken(snapshotSubtitleTracks("subrip"))
+	if verdict := ClassifyVirtualServedEvidenceForPinWithSnapshot(pin, snapshotDeclaredBytes, snapshotObservedBytes, snapshotDurationSec, snapshotRuntimeMin, token); verdict != VirtualServedEvidenceUnverified {
+		t.Fatalf("recording serve verdict = %v, want unverified", verdict)
+	}
+
+	// Different bytes, plausible duration, outside the 5% window on both the
+	// declaration and the recorded observation.
+	divergent := snapshotObservedBytes + 120_000_000
+	if verdict := ClassifyVirtualServedEvidenceForPinWithSnapshot(pin, snapshotDeclaredBytes, divergent, snapshotDurationSec, snapshotRuntimeMin, token); verdict != VirtualServedEvidenceUnverified {
+		t.Fatalf("divergent serve verdict = %v, want unverified (never admitted, never cached)", verdict)
+	}
+	snapshot, ok := VirtualServedSizeSnapshotFor(pin, snapshotDeclaredBytes, token)
+	if !ok {
+		t.Fatal("a divergent serve discarded the pin's recorded observation")
+	}
+	if snapshot.ObservedBytes != snapshotObservedBytes {
+		t.Fatalf("snapshot observed = %d, want the original observation %d", snapshot.ObservedBytes, snapshotObservedBytes)
+	}
+
+	// The bytes the pin was first proven to serve still confirm it after the
+	// divergent serve.
+	if verdict := ClassifyVirtualServedEvidenceForPinWithSnapshot(pin, snapshotDeclaredBytes, snapshotObservedBytes, 0, 0, token); verdict != VirtualServedEvidenceAdmitted {
+		t.Fatalf("confirming serve after divergence verdict = %v, want admitted", verdict)
+	}
+
+	// A divergent serve without a duration proof is a different release, not
+	// merely unverified evidence.
+	if verdict := ClassifyVirtualServedEvidenceForPinWithSnapshot(pin, snapshotDeclaredBytes, divergent, 600, snapshotRuntimeMin, token); verdict != VirtualServedEvidenceMismatch {
+		t.Fatalf("unproven divergent serve verdict = %v, want mismatch", verdict)
+	}
+}
+
 // A subtitle-layout change means the bytes the pin's ordinals address changed,
 // so the observed size recorded for the old layout must stop standing in for the
 // declaration.
@@ -96,8 +153,11 @@ func TestVirtualServedSizeSnapshotInvalidatedOnLayoutChange(t *testing.T) {
 
 	pin := VirtualServedSizePin("virtual://movie/tt-snap-layout?result=rounded", 7)
 	before := VirtualServedSizeSubtitleToken(snapshotSubtitleTracks("subrip"))
-	if verdict := ClassifyVirtualServedEvidenceForPinWithSnapshot(pin, snapshotDeclaredBytes, snapshotObservedBytes, snapshotDurationSec, snapshotRuntimeMin, before); verdict != VirtualServedEvidenceAdmitted {
-		t.Fatalf("acceptance verdict = %v, want admitted", verdict)
+	if verdict := ClassifyVirtualServedEvidenceForPinWithSnapshot(pin, snapshotDeclaredBytes, snapshotObservedBytes, snapshotDurationSec, snapshotRuntimeMin, before); verdict != VirtualServedEvidenceUnverified {
+		t.Fatalf("recording serve verdict = %v, want unverified", verdict)
+	}
+	if _, ok := VirtualServedSizeSnapshotFor(pin, snapshotDeclaredBytes, before); !ok {
+		t.Fatal("the recording serve left no observation")
 	}
 
 	after := VirtualServedSizeSubtitleToken([]models.SubtitleTrack{{Codec: "ass", Language: "eng"}})
@@ -198,9 +258,11 @@ func TestVirtualServedSizePinRequiresConcreteCandidate(t *testing.T) {
 	}
 }
 
-// The probe cache is the recurring 5% comparison: a rounded declaration
-// accepted by duration must cache (so the row is not re-probed on every start),
-// and the cached entry must remain the evidence the row receives.
+// The probe cache is the recurring 5% comparison: a rounded declaration whose
+// duration-proven observation a later probe confirms must cache (so the row is
+// not re-probed on every start), and the cached entry must remain the evidence
+// the row receives. The recording probe itself stays uncached — one observation
+// is not identity — so a pin costs exactly one extra probe, once.
 func TestVirtualProbeCacheCachesDurationProvenRoundedDeclaration(t *testing.T) {
 	ResetVirtualServedSizeSnapshots()
 	t.Cleanup(ResetVirtualServedSizeSnapshots)
@@ -227,20 +289,76 @@ func TestVirtualProbeCacheCachesDurationProvenRoundedDeclaration(t *testing.T) {
 	if first == nil || first.ProbedFormatSize != snapshotObservedBytes {
 		t.Fatalf("first probe = %+v, want the observed bytes", first)
 	}
+	if calls != 1 {
+		t.Fatalf("probe calls = %d, want 1", calls)
+	}
+	// The recording probe must not have cached: its evidence is unverified.
+	if cached := cache.Lookup("https://provider.example/video.mkv?token=two", row); cached != nil {
+		t.Fatalf("an unconfirmed observation was cached: %+v", cached)
+	}
 	second, err := cache.Probe(context.Background(), "https://provider.example/video.mkv?token=two", row, probe)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if second == nil || second.ProbedFormatSize != snapshotObservedBytes {
-		t.Fatalf("second probe = %+v, want the cached observed bytes", second)
+		t.Fatalf("second probe = %+v, want the observed bytes", second)
 	}
-	if calls != 1 {
-		t.Fatalf("probe calls = %d, want 1: a duration-proven rounded declaration must be cached", calls)
+	if calls != 2 {
+		t.Fatalf("probe calls = %d, want 2: the confirming probe must reach the provider", calls)
+	}
+	third, err := cache.Probe(context.Background(), "https://provider.example/video.mkv?token=three", row, probe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third == nil || third.ProbedFormatSize != snapshotObservedBytes {
+		t.Fatalf("third probe = %+v, want the cached observed bytes", third)
+	}
+	if calls != 2 {
+		t.Fatalf("probe calls = %d, want 2: a confirmed observation must cache", calls)
 	}
 
-	// The cached inventory keeps the subtitle layout the snapshot was keyed on,
-	// so warming consumers see the same token.
-	if got, want := playback.SubtitleInventoryToken(second.SubtitleTracks), playback.SubtitleInventoryToken(snapshotSubtitleTracks("subrip")); got != want {
+	// The cached inventory keeps the subtitle layout the observation was keyed
+	// on, so warming consumers see the same token.
+	if got, want := playback.SubtitleInventoryToken(third.SubtitleTracks), playback.SubtitleInventoryToken(snapshotSubtitleTracks("subrip")); got != want {
 		t.Fatalf("cached subtitle token = %q, want %q", got, want)
+	}
+}
+
+// The cache must never make a wrong file authoritative: a second probe that
+// serves different bytes against a recorded observation stays uncached, so the
+// row keeps being probed until the provider serves the bytes the pin was proven
+// on.
+func TestVirtualProbeCacheRejectsDivergentSecondServe(t *testing.T) {
+	ResetVirtualServedSizeSnapshots()
+	t.Cleanup(ResetVirtualServedSizeSnapshots)
+
+	cache := NewVirtualProbeCache(time.Minute, 4)
+	row := &models.MediaFile{
+		ID: 8, FilePath: "virtual://movie/tt-cache-divergent?result=wrong",
+		FileSize:                      snapshotDeclaredBytes,
+		VirtualExpectedRuntimeMinutes: snapshotRuntimeMin,
+	}
+	var calls int
+	served := snapshotObservedBytes
+	probe := func(_ context.Context, _ string, input *models.MediaFile) (*models.MediaFile, error) {
+		calls++
+		result := *input
+		result.ProbedFormatSize = served
+		result.Duration = snapshotDurationSec
+		result.SubtitleTracks = snapshotSubtitleTracks("subrip")
+		return &result, nil
+	}
+	if _, err := cache.Probe(context.Background(), "https://provider.example/video.mkv?token=one", row, probe); err != nil {
+		t.Fatal(err)
+	}
+	served = snapshotObservedBytes + 120_000_000
+	if _, err := cache.Probe(context.Background(), "https://provider.example/video.mkv?token=two", row, probe); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("probe calls = %d, want 2", calls)
+	}
+	if cached := cache.Lookup("https://provider.example/video.mkv?token=two", row); cached != nil {
+		t.Fatalf("a divergent second serve was cached: %+v", cached)
 	}
 }

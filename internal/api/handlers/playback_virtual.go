@@ -733,9 +733,12 @@ func virtualProbeFailureKey(candidateURI string, ownerInstallationID int) string
 
 // classifyVirtualServedEvidenceV3 is the pin-aware probe evidence gate every
 // acceptance point uses. It compares the served bytes against the pin's
-// recorded observed size when one is still valid, and records that observed
-// size when the acceptance leans on a measured duration that proves the content
-// past a rounded provider declaration. The row's declared FileSize is never
+// recorded observed size when one is still valid, and records the pin's first
+// served-size observation when the acceptance leans on a measured duration that
+// proves the content past a rounded provider declaration. Recording is not
+// admission: that first serve stays unverified and only a later serve that
+// matches the recorded size is admitted, so one plausible-looking wrong serve
+// never becomes the pin's identity. The row's declared FileSize is never
 // rewritten: it stays the release's advertised size for the AltMount-completion
 // comparison and every other declared-size decision. A pin with no concrete
 // ?result= candidate (and therefore no stable byte identity) keeps the plain

@@ -60,6 +60,9 @@ const (
 	// prove which release was served. It must not enter the probe cache as
 	// authoritative evidence, be persisted as the row's identity, or feed
 	// identity-sensitive decisions such as version death or candidate bounding.
+	// The first served-size observation a duration-proven probe records is also
+	// unverified: one serve cannot distinguish the release from a wrong file of
+	// the same runtime.
 	VirtualServedEvidenceUnverified
 	// VirtualServedEvidenceMismatch means the served bytes are not the declared
 	// release: the size disagrees and the duration does not prove identity.
@@ -107,6 +110,12 @@ func VirtualServedEvidenceRejected(declaredBytes, servedBytes int64, probedSecon
 // size (an indexer declaration of 2.04 GB for bytes that measure 1.78 GB, ~13%
 // off), so the declared size alone can never clear the 5% evidence gate for
 // that pin.
+//
+// One duration-proven serve is an observation, not identity: a wrong file that
+// happens to carry the item's runtime would look the same. A snapshot therefore
+// only becomes the pin's comparison baseline once a later serve lands on it;
+// see RecordVirtualServedSizeSnapshotIfProven and
+// ClassifyVirtualServedEvidenceForPinWithSnapshot.
 //
 // DeclaredBytes is kept so a re-declared release invalidates the snapshot; it is
 // never used to replace the row's declared size. FileSize stays the release's
@@ -192,16 +201,27 @@ func VirtualServedSizeSnapshotFor(pin string, declaredBytes int64, inventoryToke
 	return entry.snapshot, true
 }
 
-// RecordVirtualServedSizeSnapshotIfProven records the served size observed for
-// pin when, and only when, a size gap had to be excused by a measured duration
-// that proves the content is the item's. It reports whether a snapshot was
-// recorded.
+// RecordVirtualServedSizeSnapshotIfProven records one served-size observation
+// for pin when, and only when, a size gap had to be excused by a measured
+// duration that proves the content is the item's. It reports whether this call
+// recorded the pin's first observation.
+//
+// Recording an observation is not admission. The observation exists so a later
+// serve of the same pin can be compared against it: identical bytes confirm the
+// pin, divergent bytes keep it unverified. See
+// ClassifyVirtualServedEvidenceForPinWithSnapshot for the verdict side.
 //
 // It is deliberately the only writer:
 //   - a size within tolerance needs no snapshot, so the declared size stays the
 //     baseline;
 //   - a probe whose duration does not prove identity is unverified or a
-//     mismatch and must never teach the gate to accept those bytes.
+//     mismatch and must never teach the gate to accept those bytes;
+//   - a pin's existing observation is never overwritten by a divergent serve.
+//     A wrong file that once passed the duration check would otherwise keep
+//     moving the pin's baseline to whatever it serves, which is exactly how one
+//     plausible-looking wrong serve becomes identity. A re-declared release or a
+//     changed subtitle inventory invalidates the observation instead
+//     (VirtualServedSizeSnapshotFor).
 func RecordVirtualServedSizeSnapshotIfProven(pin string, declaredBytes, servedBytes int64, probedSeconds, expectedRuntimeMinutes int, inventoryToken string) bool {
 	c := virtualServedSizeSnapshots
 	if c == nil || pin == "" || declaredBytes <= 0 || servedBytes <= 0 {
@@ -217,6 +237,16 @@ func RecordVirtualServedSizeSnapshotIfProven(pin string, declaredBytes, servedBy
 	defer c.mu.Unlock()
 	if c.entries == nil {
 		c.entries = make(map[string]virtualServedSizeSnapshotEntry)
+	}
+	if existing, ok := c.entries[pin]; ok &&
+		existing.snapshot.DeclaredBytes == declaredBytes &&
+		existing.snapshot.InventoryToken == inventoryToken &&
+		existing.snapshot.ObservedBytes > 0 {
+		// The pin already has an observation for this declaration and layout.
+		// Keep it: a second, divergent serve is not evidence that replaces the
+		// first one, and letting it would turn a duration-plausible wrong file
+		// into the baseline by repetition.
+		return false
 	}
 	if _, exists := c.entries[pin]; !exists && len(c.entries) >= virtualServedSizeSnapshotMaxEntries {
 		c.evictOldestLocked()
@@ -262,9 +292,11 @@ func ResetVirtualServedSizeSnapshots() {
 
 // ClassifyVirtualServedEvidenceForPin is ClassifyVirtualServedEvidence with the
 // pin's recorded observed size as the comparison baseline when a snapshot is
-// still valid for it. A pin with no snapshot (or one invalidated by a declared
-// size or subtitle-inventory change) keeps comparing against the declared size,
-// so the gate behaves exactly as before for every unproven pin.
+// still valid for it. It is the read-only view: it neither records nor confirms
+// an observation, so the returned verdict carries no admission weight by itself.
+// A pin with no snapshot (or one invalidated by a declared size or
+// subtitle-inventory change) keeps comparing against the declared size, so the
+// gate behaves exactly as before for every unproven pin.
 func ClassifyVirtualServedEvidenceForPin(pin string, declaredBytes, servedBytes int64, probedSeconds, expectedRuntimeMinutes int, inventoryToken string) VirtualServedEvidenceVerdict {
 	baseline := declaredBytes
 	if snapshot, ok := VirtualServedSizeSnapshotFor(pin, declaredBytes, inventoryToken); ok {
@@ -281,21 +313,45 @@ func VirtualServedSizeSubtitleToken(tracks []models.SubtitleTrack) string {
 }
 
 // ClassifyVirtualServedEvidenceForPinWithSnapshot returns the evidence verdict
-// for a probe of pin and records the pin's observed-size snapshot when the only
-// reason the evidence is not admitted is a size gap that a measured duration
-// proves is legitimate. The returned verdict reflects the recorded snapshot, so
-// the caller accepts bytes it has just proven instead of holding the row
-// unverified forever over a rounded provider declaration.
+// for a probe of pin and records the pin's first served-size observation when
+// the only reason the evidence is not admitted is a size gap that a measured
+// duration proves is legitimate.
+//
+// A single duration-proven serve is an observation, not identity: a wrong file
+// of the right runtime and a plausible size would produce exactly the same
+// probe. So the serve that records the observation stays Unverified — playable
+// for this request, but not cached, persisted as the row's identity, or used to
+// bound candidates — and only a later serve that lands on the recorded size is
+// Admitted. After that, the observation is the pin's baseline and the cost is
+// one extra probe per pin lifetime.
 //
 // A mismatch (no duration proof) is returned unchanged and records nothing: a
-// different release must never teach the gate to accept its bytes.
+// different release must never teach the gate to accept its bytes. A serve that
+// diverges from an existing observation is Unverified as well and leaves the
+// observation untouched, so a later wrong file cannot displace the bytes the pin
+// was proven to serve.
 func ClassifyVirtualServedEvidenceForPinWithSnapshot(pin string, declaredBytes, servedBytes int64, probedSeconds, expectedRuntimeMinutes int, inventoryToken string) VirtualServedEvidenceVerdict {
-	verdict := ClassifyVirtualServedEvidenceForPin(pin, declaredBytes, servedBytes, probedSeconds, expectedRuntimeMinutes, inventoryToken)
+	snapshot, hasSnapshot := VirtualServedSizeSnapshotFor(pin, declaredBytes, inventoryToken)
+	baseline := declaredBytes
+	if hasSnapshot {
+		baseline = snapshot.ObservedBytes
+	}
+	verdict := ClassifyVirtualServedEvidence(baseline, servedBytes, probedSeconds, expectedRuntimeMinutes)
 	if verdict == VirtualServedEvidenceMismatch {
 		return verdict
 	}
-	if !RecordVirtualServedSizeSnapshotIfProven(pin, declaredBytes, servedBytes, probedSeconds, expectedRuntimeMinutes, inventoryToken) {
+	if hasSnapshot {
+		// A serve inside the observation's tolerance is the second observation
+		// that admits the pin. Anything else stays unverified without moving
+		// the baseline (RecordVirtualServedSizeSnapshotIfProven refuses to
+		// overwrite it).
 		return verdict
 	}
-	return ClassifyVirtualServedEvidenceForPin(pin, declaredBytes, servedBytes, probedSeconds, expectedRuntimeMinutes, inventoryToken)
+	if verdict == VirtualServedEvidenceAdmitted {
+		// The served size clears the declaration on its own; no observation is
+		// needed to excuse a gap, so the pin is admitted without one.
+		return verdict
+	}
+	RecordVirtualServedSizeSnapshotIfProven(pin, declaredBytes, servedBytes, probedSeconds, expectedRuntimeMinutes, inventoryToken)
+	return VirtualServedEvidenceUnverified
 }

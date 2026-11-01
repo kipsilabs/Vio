@@ -269,9 +269,10 @@ func cloneVirtualProbeFile(file *models.MediaFile) *models.MediaFile {
 // classifyVirtualProbeEvidence classifies one cache-run probe against the pin
 // its input names, using the pin's recorded observed served size when one is
 // still valid. A served size that only a duration-proven acceptance can excuse
-// is recorded as the pin's snapshot, so the same evidence is admissible (and
-// cacheable) instead of being re-probed on every start for a provider's rounded
-// declaration.
+// records the pin's first observation and stays unverified, so it is not cached
+// yet; the next probe compares against that observation and, when it matches,
+// is admitted and cached. The pin therefore costs at most one extra probe over
+// its lifetime instead of one on every start.
 func classifyVirtualProbeEvidence(inputSnapshot, probed *models.MediaFile) VirtualServedEvidenceVerdict {
 	if inputSnapshot == nil || probed == nil {
 		return VirtualServedEvidenceMismatch
