@@ -179,6 +179,7 @@ const (
 	// standards-compatible base layer its original_http executor presents.
 	// Unknown or absent ids have no claim, so they fail closed.
 	ClaimClientManagedDVBaseLayerV3Prefix = "client_managed_dv_bl_compat_"
+
 	// ClaimClientDV8BaseLayerFallbackV3 is scoped to the original_http
 	// delivery. The executor decodes a single-layer Dolby Vision Profile 8
 	// stream through an ordinary HEVC decoder and presents its
@@ -194,6 +195,13 @@ const (
 	ClientSurfaceRecoveryV3           = "client_surface_recovery_v1"
 	DeviceQuirkRegistryRevisionV3     = "2026-07-13.1"
 )
+
+func ClientManagedDVBaseLayerClaimV3(id int) string {
+	if id <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s%d_v1", ClaimClientManagedDVBaseLayerV3Prefix, id)
+}
 
 // FeatureHLSVariableSubstitutionV3 is an hls delivery feature: the client
 // resolves EXT-X-DEFINE variables in media playlists, so a playlist the
@@ -1301,9 +1309,16 @@ type BandwidthLimitV3 struct {
 }
 
 type PlanV3 struct {
-	BandwidthLimit  *BandwidthLimitV3 `json:"bandwidth_limit,omitempty"`
-	ProtocolVersion int               `json:"protocol_version"`
-	PlanID          string            `json:"plan_id"`
+	BandwidthLimit        *BandwidthLimitV3      `json:"bandwidth_limit,omitempty"`
+	ProtocolVersion       int                    `json:"protocol_version"`
+	PlanID                string                 `json:"plan_id"`
+	CanonicalPlanID       string                 `json:"canonical_plan_id,omitempty"`
+	EffectiveVirtualURI   string                 `json:"effective_virtual_uri,omitempty"`
+	VirtualSourceRevision string                 `json:"virtual_source_revision,omitempty"`
+	AudioTracks           []AudioInventoryItemV3 `json:"audio_tracks,omitempty"`
+	InventoryRevision     string                 `json:"inventory_revision,omitempty"`
+	InventoryStatus       string                 `json:"inventory_status,omitempty"`
+	InventoryProvenance   string                 `json:"inventory_provenance,omitempty"`
 	// PlanAttemptKey is the server-computed opaque loop-prevention token for
 	// this plan. Clients store the keys of attempted plans and echo them in
 	// attempted_plan_keys on replan; they never compute keys themselves.

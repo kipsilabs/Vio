@@ -56,6 +56,8 @@ type PlannerInputV3 struct {
 	// ServerBitrateCapKbps is an administrator-owned, per-attempt ceiling.
 	// Unlike a client's bandwidth preference it must fail closed.
 	ServerBitrateCapKbps int
+	DeliveryAllowList    []string
+	InventoryProvenance  string
 	RequestedFile        *models.MediaFile
 	EffectiveFile        *models.MediaFile
 	// LowerVersion names the version that serves lower qualities when the

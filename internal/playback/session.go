@@ -219,8 +219,8 @@ type Session struct {
 	RemuxResumeLeadingPictureDrop bool
 	// DeviceID and DevicePlatform are the device the client declared when the
 	// session started (see ClientInfo); empty when it declared none.
-	DeviceID         string
-	DevicePlatform   string
+	DeviceID       string
+	DevicePlatform string
 	// RequireMediaAuthorization distinguishes v3 transports whose session ID is
 	// only a route (media requests must present an authenticated user) from
 	// legacy sessions whose ID doubles as a bearer credential. Secure transports

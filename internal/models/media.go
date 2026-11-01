@@ -539,18 +539,19 @@ type AudioTrack struct {
 	// value. Preserved so the selected track maps to the real stream even when
 	// the track list order differs from the container order (MULTi releases,
 	// virtual sources). -1/0 when unknown (synthesized tracks).
-	Index         int    `json:"index,omitempty"`
-	Title         string `json:"title,omitempty"`
-	EmbeddedTitle string `json:"embedded_title,omitempty"`
-	Language      string `json:"language,omitempty" doc:"Track language from the file: BCP 47 tag, ISO 639-1 where one exists (en, pt-BR); und when the file marks it undetermined. Older scans may carry an ISO 639-2 code or the file's raw tag"`
-	Codec         string `json:"codec,omitempty"`
-	Profile       string `json:"profile,omitempty"`
-	Layout        string `json:"layout,omitempty"`
-	Channels      int    `json:"channels,omitempty"`
-	Bitrate       int    `json:"bitrate,omitempty"`
-	SampleRate    int    `json:"sample_rate,omitempty"`
-	BitDepth      int    `json:"bit_depth,omitempty"`
-	Default       bool   `json:"default"`
+	Index         int      `json:"index,omitempty"`
+	Title         string   `json:"title,omitempty"`
+	EmbeddedTitle string   `json:"embedded_title,omitempty"`
+	Language      string   `json:"language,omitempty" doc:"Track language from the file: BCP 47 tag, ISO 639-1 where one exists (en, pt-BR); und when the file marks it undetermined. Older scans may carry an ISO 639-2 code or the file's raw tag"`
+	Languages     []string `json:"languages,omitempty"`
+	Codec         string   `json:"codec,omitempty"`
+	Profile       string   `json:"profile,omitempty"`
+	Layout        string   `json:"layout,omitempty"`
+	Channels      int      `json:"channels,omitempty"`
+	Bitrate       int      `json:"bitrate,omitempty"`
+	SampleRate    int      `json:"sample_rate,omitempty"`
+	BitDepth      int      `json:"bit_depth,omitempty"`
+	Default       bool     `json:"default"`
 }
 
 // SubtitleTrack represents an embedded subtitle track stored as JSONB.

@@ -1,6 +1,9 @@
 package playback
 
-import "github.com/Silo-Server/silo-server/internal/models"
+import (
+	"github.com/Silo-Server/silo-server/internal/models"
+	"reflect"
+)
 
 // DesiredTracksV3 is the audio and subtitle the viewer asked for during one
 // playback attempt. It survives a version change that had to fall back: a
@@ -65,7 +68,7 @@ func (d DesiredAudioTrackV3) ResolveOn(file *models.MediaFile) int {
 		return 0
 	}
 	if file.ID == d.FileID && d.Index >= 0 && d.Index < len(file.AudioTracks) &&
-		file.AudioTracks[d.Index] == d.Track {
+		reflect.DeepEqual(file.AudioTracks[d.Index], d.Track) {
 		return d.Index
 	}
 	return MatchAudioTrack(file.AudioTracks, d.Track, d.Index)

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
