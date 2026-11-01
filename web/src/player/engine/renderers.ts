@@ -318,12 +318,12 @@ function adopt(
     error: null,
     holder: null,
   };
-  void device.lost.then((info: GPUDeviceLostInfo) => {
+  void device.lost.then((info) => {
     entry.lost = info;
     if (spare === entry) spare = null;
     entry.holder?.deviceLost(info);
   });
-  device.addEventListener("uncapturederror", (event: GPUUncapturedErrorEvent) => {
+  device.addEventListener("uncapturederror", (event) => {
     const message = (event as GPUUncapturedErrorEvent).error.message;
     entry.error ??= message;
     entry.holder?.deviceError(message);
@@ -1055,7 +1055,7 @@ export class WebGPURenderer implements FrameRenderer, DeviceHolder {
       );
     } finally {
       void device.popErrorScope().then(
-        (error: unknown) => {
+        (error) => {
           if (!error) return;
           entry.error ??= error.message;
           if (entry === this.entry) this.deviceError(error.message);

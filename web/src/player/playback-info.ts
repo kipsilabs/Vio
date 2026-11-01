@@ -168,27 +168,29 @@ export function buildPlaybackInfoSections({
 /**
  * Turns the plan's quality ladder into menu entries.
  *
- * The server owns the ladder: this maps its rungs onto the menu's shape and
- * adds nothing. `id` is the rung's own label, which is what a `quality_change`
- * replan sends back. The `auto` entry is prepended locally because it is a
- * *preference*, not a rung — no server rung names it, and picking it hands the
- * choice back to the planner. Original is the server's source-preserving rung
- * and stays a menu entry of its own.
+ * The server owns the ladder: this maps its fixed rungs onto the menu's shape.
+ * `id` is the rung's own label, which is what a `quality_change` replan sends
+ * back. The `auto` entry is prepended locally because it is a *preference*,
+ * not a rung, and it is also how the viewer returns to the source: Auto plays
+ * the original file whenever the device and connection can carry it. Older
+ * servers still list that source as an "original" entry, which is dropped
+ * here.
  */
 export function qualityOptionsFromPlanV3(plan: PlanV3): QualityOption[] {
-  const rungs = plan.available_qualities.map((quality) => ({
-    id: quality.label,
-    label: quality.display_name || qualityRungLabel(quality.label),
-    sublabel: formatQualityBitrate(quality.bitrate_kbps),
-    resolution: quality.height ? `${quality.height}p` : "",
-    bitrateKbps: quality.bitrate_kbps ?? 0,
-    isOriginal: quality.preserves_source,
-  }));
+  const rungs = plan.available_qualities
+    .filter((quality) => quality.label !== QUALITY_ORIGINAL_V3)
+    .map((quality) => ({
+      id: quality.label,
+      label: quality.display_name || quality.label,
+      sublabel: formatQualityBitrate(quality.bitrate_kbps),
+      resolution: quality.height ? `${quality.height}p` : "",
+      bitrateKbps: quality.bitrate_kbps ?? 0,
+    }));
 
-  // A single source-preserving rung is not a choice, so there is no menu to
-  // render — audio-only plans and clients without HLS land here.
-  if (rungs.length <= 1) {
-    return rungs;
+  // Without a fixed rung there is nothing to choose, so there is no menu —
+  // audio-only plans and clients without HLS land here.
+  if (rungs.length === 0) {
+    return [];
   }
 
   return [
@@ -229,18 +231,6 @@ export function plainResolutionLabel(preference: string): string | null {
   return height === 2160 ? "4K" : `${height}p`;
 }
 
-function resolutionHeight(resolution: string): number {
-  const match = resolution
-    .trim()
-    .toLowerCase()
-    .match(/^(\d+)p$/);
-  return match ? Number.parseInt(match[1] ?? "0", 10) : 0;
-}
-
-function qualityRungLabel(label: string): string {
-  return label === QUALITY_ORIGINAL_V3 ? "Original" : label;
-}
-
 /**
  * The next quality rung below what the viewer receives now, for a viewer whose
  * connection cannot keep up. The step is from the lower of the lit rung's
@@ -254,7 +244,7 @@ export function lowerQualityOption(
   deliveredBitrateKbps?: number,
 ): QualityOption | null {
   const rungs = options
-    .filter((option) => option.id !== "auto" && !option.isOriginal && option.bitrateKbps > 0)
+    .filter((option) => option.id !== "auto" && option.bitrateKbps > 0)
     .sort((a, b) => b.bitrateKbps - a.bitrateKbps);
   const activeId = resolveActiveQualityOptionId(options, preference, activeQuality);
   const active = rungs.find((option) => option.id === activeId);
