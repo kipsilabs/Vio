@@ -3747,9 +3747,10 @@ export function VideoPlayer({
     // track the server may just have refused.
     if (subtitleHandoverPending) return;
     const desiredServerIndex = pendingServerSubtitleSelection(
-      plan.selected_tracks.subtitle ?? null,
-      activeSubtitleTrack,
-      effectiveSubtitleTracks,
+      plan.subtitle.mode,
+      plan.selected_tracks.subtitle?.index ?? null,
+      activeSubtitleIndex,
+      activeSubtitleTrack?.burn_in_only === true,
     );
     if (desiredServerIndex === undefined) {
       requestedSubtitleTrackChangeRef.current = null;
