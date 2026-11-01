@@ -12,7 +12,8 @@ import { useVersionListRefresh, REFRESH_VERSIONS_ERROR } from "@/hooks/useVersio
 import { useVersionSortPreference } from "@/hooks/useVersionSortPreference";
 import { sortVersionsByCriteria, type VersionSortable } from "@/lib/qualityRanking";
 import { plainResolutionLabel, resolveActiveQualityOptionId } from "../playback-info";
-import type { QualityOption } from "../types";
+import type { QualityOption, PlayerIndexerRelease } from "../types";
+import { deriveVersionHealth } from "@/hooks/queries/versionLiveness";
 import { PLAYBACK_SPEEDS, formatPlaybackSpeed } from "../utils/playbackSpeed";
 import { PlaybackSpeedTrack } from "./PlaybackSpeedTrack";
 import { PlayerMenuSurface } from "./PlayerMenuSurface";
