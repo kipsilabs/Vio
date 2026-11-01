@@ -725,6 +725,69 @@ func TestFallbackSubstituteProbeGatesOnTheSubstitutesOwnDeclaration(t *testing.T
 		}
 	})
 
+	t.Run("cache hit that diverges from the observation serves without writing", func(t *testing.T) {
+		scanner.ResetVirtualServedSizeSnapshots()
+		t.Cleanup(scanner.ResetVirtualServedSizeSnapshots)
+		h, saved := newFixture(t, 90*60)
+
+		// The probe cache holds bytes measured before an observation was
+		// recorded for this pin. Against the pin's recorded observation those
+		// bytes are unverified, so the cache replay must serve them as an
+		// observation rather than let the caller adopt and stamp them.
+		observed := served
+		cacheHits := 0
+		h.VirtualProbeCacheLookup = func(_ string, probeFile *models.MediaFile) *models.MediaFile {
+			cacheHits++
+			return &models.MediaFile{
+				FilePath: probeFile.FilePath,
+				FileSize: probeFile.FileSize,
+				// These bytes match the substitute's declaration, so the cache
+				// would have admitted them when they were measured.
+				ProbedFormatSize: substituteDeclared,
+				Duration:         90 * 60,
+				VideoTracks:      []models.VideoTrack{{Codec: "hevc", Width: 3840, Height: 2160}},
+				AudioTracks:      []models.AudioTrack{{Codec: "eac3", Channels: 6, Language: "eng"}},
+			}
+		}
+		proberCalls := 0
+		h.VirtualPlaybackSourceProber = func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
+			proberCalls++
+			return f, nil
+		}
+		pin := scanner.VirtualServedSizePin(substituteURI, 5)
+		// The cached inventory carries no subtitle tracks, so its snapshot key
+		// is the empty-inventory token, not a blank string.
+		inventoryToken := scanner.VirtualServedSizeSubtitleToken(nil)
+		if !scanner.RecordVirtualServedSizeSnapshotIfProven(pin, substituteDeclared, observed, 90*60, runtime, inventoryToken) {
+			t.Fatal("failed to record the pin's served-size observation")
+		}
+
+		got := run(t, h)
+		if got == nil {
+			t.Fatal("fallback returned nil, want the cached substitute served")
+		}
+		if cacheHits == 0 {
+			t.Fatal("the probe cache was never consulted")
+		}
+		if proberCalls != 0 {
+			t.Fatalf("synchronous prober calls = %d, want 0: the cache hit must skip the ffprobe", proberCalls)
+		}
+		if !got.EvidenceObservation {
+			t.Fatal("a cached probe that diverges from the observation was served as identity")
+		}
+		if got.Provenance != ProbeProvenanceVerified {
+			t.Fatalf("provenance = %q, want %q (served with the cached inventory)",
+				got.Provenance, ProbeProvenanceVerified)
+		}
+		if got.File == nil || got.File.ProbedFormatSize != substituteDeclared {
+			t.Fatalf("file = %+v, want the cached bytes %d", got.File, substituteDeclared)
+		}
+		h.StopVirtualEvidence()
+		if len(*saved) != 0 {
+			t.Fatalf("the unconfirmed cache replay persisted %+v, want no catalog write", *saved)
+		}
+	})
+
 	t.Run("mismatch is refused", func(t *testing.T) {
 		scanner.ResetVirtualServedSizeSnapshots()
 		t.Cleanup(scanner.ResetVirtualServedSizeSnapshots)

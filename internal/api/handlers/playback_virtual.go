@@ -7566,6 +7566,8 @@ func (h *PlaybackHandler) resolveVirtualCandidateSource(
 	if h.VirtualPlaybackSourceProber == nil && h.VirtualPlaybackSourceProberWithHeaders == nil {
 		return &resolved, nil
 	}
+	expectedRuntimeMinutes := h.virtualExpectedRuntimeMinutes(ctx, file)
+	evidencePin := scanner.VirtualServedSizePin(candidate.URI, ownerID)
 	// Probe-cache-first, same seam the shared resolve uses: a version-switch or
 	// provider-churn candidate that already has a completed probe needs no
 	// second synchronous ffprobe. The cache key strips the provider query, so a
@@ -7575,12 +7577,21 @@ func (h *PlaybackHandler) resolveVirtualCandidateSource(
 		resolved.File = cached
 		resolved.ProbeSucceeded = true
 		resolved.Provenance = ProbeProvenanceVerified
+		// The hit is a completed probe, not necessarily the pin's identity: the
+		// cached bytes can disagree with a served-size observation recorded since
+		// they were measured, and virtualProbeFromCache serves that case without
+		// writing. Classify the served inventory here, exactly as the fresh probe
+		// below and the shared resolve's finalization do, so the caller does not
+		// adopt and stamp bytes that only recorded an observation. A mismatch
+		// never reaches this branch: virtualProbeFromCache discards it.
+		if virtualProbeEvidenceIsObservation(evidencePin, classifyVirtualServedEvidenceV3(evidencePin, candidate.FileSize, cached, expectedRuntimeMinutes)) {
+			resolved.EvidenceObservation = true
+		}
 		if err := h.virtualCandidateVerdictError(ctx, candidate.URI, file, ownerID, allowFailed); err != nil {
 			return nil, err
 		}
 		return &resolved, nil
 	}
-	expectedRuntimeMinutes := h.virtualExpectedRuntimeMinutes(ctx, file)
 	probeCtx, probeCancel := context.WithTimeout(ctx, virtualProbeBudget)
 	forwardVirtualCandidateDeclaredAudio(&probeInput, candidate)
 	probed, probeErr := h.probeVirtualSource(probeCtx, streamURL, &probeInput, candidate.RequestHeaders)
@@ -7598,7 +7609,6 @@ func (h *PlaybackHandler) resolveVirtualCandidateSource(
 	// substitute's own listed size: the stale row's FileSize describes the
 	// release being left, and gating a cross-release substitution against it
 	// would reject nearly every legitimate replacement.
-	evidencePin := scanner.VirtualServedSizePin(candidate.URI, ownerID)
 	evidenceVerdict := classifyVirtualServedEvidenceV3(evidencePin, candidate.FileSize, probed, expectedRuntimeMinutes)
 	if evidenceVerdict == scanner.VirtualServedEvidenceMismatch {
 		// The provider served a readable container that is not the
