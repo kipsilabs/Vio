@@ -12,11 +12,13 @@ var (
 	// ErrPlaybackNotAllowed is the generic policy admission denial: a denial
 	// without a recognized concurrency-limit code (e.g. an admin custom
 	// override, or a failed policy evaluation) must not masquerade as one.
-	ErrPlaybackNotAllowed = errors.New("playback not allowed by policy")
-	ErrFileNotFound       = errors.New("media file not found")
-	ErrTranscodeFailed    = errors.New("transcode process failed")
-	ErrSegmentNotFound    = errors.New("segment not found")
-	ErrManifestNotReady   = errors.New("manifest not ready")
+	ErrPlaybackNotAllowed   = errors.New("playback not allowed by policy")
+	ErrFileNotFound         = errors.New("media file not found")
+	ErrTranscodeFailed      = errors.New("transcode process failed")
+	ErrSegmentNotFound      = errors.New("segment not found")
+	ErrSegmentStalled       = errors.New("segment production stalled")
+	ErrSubtitleWarmCanceled = errors.New("subtitle warm canceled by playback")
+	ErrManifestNotReady     = errors.New("manifest not ready")
 	// ErrManifestQueryTooLong rejects a playlist request whose query is longer
 	// than maxManifestQueryBytes.
 	ErrManifestQueryTooLong = errors.New("playlist request query too long")

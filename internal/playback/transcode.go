@@ -10,7 +10,6 @@ import (
 	"log/slog"
 	"math"
 	"mime"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -3562,6 +3561,35 @@ func (s *TranscodeSession) SegmentProgress(time.Time) SegmentProgress {
 		progress.LastProducedAt = info.ModTime()
 		break
 	}
+	scanActiveTempProgress(s.outputDir, &progress)
+	return progress
+}
+
+func scanActiveTempProgress(outputDir string, progress *SegmentProgress) {
+	if outputDir == "" {
+		return
+	}
+	entries, err := os.ReadDir(outputDir)
+	if err != nil {
+		return
+	}
+	var newest os.FileInfo
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasPrefix(entry.Name(), "seg_") || !strings.HasSuffix(entry.Name(), ".tmp") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil || info.Size() <= 0 {
+			continue
+		}
+		if newest == nil || info.ModTime().After(newest.ModTime()) {
+			newest = info
+		}
+	}
+	if newest != nil {
+		progress.ActiveTempAt = newest.ModTime()
+		progress.ActiveTempSize = newest.Size()
+	}
 }
 
 // SegmentRecoveryDecision determines whether a missing segment should briefly
@@ -4548,13 +4576,48 @@ func (s *TranscodeSession) WaitForSegment(name string, timeout time.Duration) (s
 // closes the stat-to-open race for HTTP serving while preserving the same
 // restart and ffmpeg-exit error contract.
 func (s *TranscodeSession) WaitForOpenSegment(name string, timeout time.Duration) (*SegmentLease, error) {
-	return s.WaitForOpenSegmentContext(context.Background(), name, timeout)
+	return s.waitForOpenSegment(name, timeout, 0)
 }
 
-// WaitForOpenSegmentContext is WaitForOpenSegment that also returns ctx.Err()
-// as soon as ctx ends, so a request the client abandoned stops polling. It
-// does not stop FFmpeg.
-func (s *TranscodeSession) WaitForOpenSegmentContext(ctx context.Context, name string, timeout time.Duration) (*SegmentLease, error) {
+// WaitForOpenSegmentWithStall is WaitForOpenSegment with a produced-head
+// watchdog. A wait may use the full timeout while the encoder keeps advancing
+// the head; if the head does not move for stall, it returns ErrSegmentStalled
+// so the caller can restart the generation instead of treating a slow encode
+// as a dead segment.
+func (s *TranscodeSession) WaitForOpenSegmentWithStall(name string, timeout, stall time.Duration) (*SegmentLease, error) {
+	return s.waitForOpenSegment(name, timeout, stall)
+}
+
+// checkSegmentStall samples produced-head progress at most twice a second and
+// reports ErrSegmentStalled when the head has not moved for stall. It is split
+// from the wait loop so the recovery condition stays readable.
+func (s *TranscodeSession) checkSegmentStall(now time.Time, stall time.Duration, lastCheck *time.Time, lastHead *int, lastHeadAt, lastTempAt *time.Time, lastTempSize *int64) error {
+	if !lastCheck.IsZero() && now.Sub(*lastCheck) < 500*time.Millisecond {
+		return nil
+	}
+	progress := s.SegmentProgress(now)
+	*lastCheck = now
+	if !progress.HasManifest || progress.ProducedHead < progress.StartSegmentNumber {
+		return nil
+	}
+	if progress.ProducedHead != *lastHead {
+		*lastHead = progress.ProducedHead
+		*lastHeadAt = now
+	}
+	// A growing partial segment is encoder progress even though the published
+	// head cannot move until that segment is complete.
+	if progress.ActiveTempAt.After(*lastTempAt) || progress.ActiveTempSize != *lastTempSize {
+		*lastTempAt = progress.ActiveTempAt
+		*lastTempSize = progress.ActiveTempSize
+		*lastHeadAt = now
+	}
+	if !lastHeadAt.IsZero() && now.Sub(*lastHeadAt) >= stall {
+		return ErrSegmentStalled
+	}
+	return nil
+}
+
+func (s *TranscodeSession) waitForOpenSegment(name string, timeout, stall time.Duration) (*SegmentLease, error) {
 	deadline := time.After(timeout)
 	numbered := false
 	if stall > 0 {
@@ -4596,11 +4659,9 @@ func (s *TranscodeSession) WaitForOpenSegmentContext(ctx context.Context, name s
 			lastTempAt = time.Time{}
 			lastTempSize = 0
 			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
 			case <-deadline:
 				return nil, ErrSegmentNotFound
-			case <-time.After(outputPollInterval):
+			case <-time.After(100 * time.Millisecond):
 				continue
 			}
 		}
@@ -4618,11 +4679,9 @@ func (s *TranscodeSession) WaitForOpenSegmentContext(ctx context.Context, name s
 		}
 
 		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
 		case <-deadline:
 			return nil, ErrSegmentNotFound
-		case <-time.After(outputPollInterval):
+		case <-time.After(100 * time.Millisecond):
 		}
 	}
 }
