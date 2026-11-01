@@ -454,6 +454,9 @@
 # Stored sidecar subtitles take the scanner's reading of their names.
 ./internal/database TestPostgresExternalSubtitleNameBackfill
 
+# The Postgres auto-tuning restart warning lists only settings a restart would change.
+./internal/database TestPostgresSettingsPendingRestartPostgres
+
 # Online partitioned audit indexes preserve writers and resume canceled builds.
 ./internal/partman TestOnlinePartitionIndexesKeepWritersAvailableDB
 
@@ -758,3 +761,7 @@
 
 # Household PIN proof must still match when the protected write transaction starts.
 ./internal/userstore/pgstore TestPostgresProfilePINRevisionTransactions
+
+# Personal collection list reads remember counts and collages with no source
+# until the membership revision or the viewer's access changes.
+./internal/catalog TestPersonalCollectionReadsRememberedDB
