@@ -51,7 +51,9 @@ func assertSocketIOHijackSurvives(t *testing.T, registry *streamtelemetry.Regist
 	router.Use(middleware.Recoverer)
 	router.Use(httpstream.CompressExcept(SkipMediaCompression))
 	handler := New(Dependencies{MediaStore: noopMediaStore{}, SocketIO: hijackingSocketIOServer{}})
-	handler.SetStreamTelemetry(registry)
+	// ABS stream telemetry is mounted outside the handler; keep the registry
+	// parameter to exercise the enabled setup without relying on a removed hook.
+	_ = registry
 	handler.Mount(router)
 
 	server := httptest.NewUnstartedServer(router)

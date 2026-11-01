@@ -23,6 +23,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/httpheader"
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/streamtelemetry"
 )
 
 // ---------------------------------------------------------------------------
@@ -351,7 +352,13 @@ type Dependencies struct {
 
 // Handler wires the /abs/api/* and canonical ABS-client paths.
 type Handler struct {
-	deps Dependencies
+	deps      Dependencies
+	telemetry *streamtelemetry.Registry
+}
+
+// SetStreamTelemetry wires local stream observation. Call before Mount.
+func (h *Handler) SetStreamTelemetry(registry *streamtelemetry.Registry) {
+	h.telemetry = registry
 }
 
 // New constructs an ABS Handler. Sensible defaults are applied for optional
@@ -438,8 +445,8 @@ func (h *Handler) mountRoutes(r chi.Router) {
 	// the capability. Mounted at both /public/session and /abs/public/session
 	// for compatibility with clients that pin either prefix.
 	for _, prefix := range []string{"", "/abs"} {
-		r.Get(prefix+"/public/session/{sid}/track/{idx}", h.handlePublicTrack)
-		r.Head(prefix+"/public/session/{sid}/track/{idx}", h.handlePublicTrack)
+		r.Get(prefix+"/public/session/{sid}/track/{idx}", observeABS(h.telemetry, http.MethodGet, prefix+"/public/session/{sid}/track/{idx}", h.handlePublicTrack))
+		r.Head(prefix+"/public/session/{sid}/track/{idx}", observeABS(h.telemetry, http.MethodHead, prefix+"/public/session/{sid}/track/{idx}", h.handlePublicTrack))
 	}
 
 	// Public RSS feed routes — slug is the capability token, no auth.
