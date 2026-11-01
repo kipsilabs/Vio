@@ -1785,7 +1785,6 @@ func planVideoTranscodeV3(input PlannerInputV3, base PlanV3, source SourceDescri
 	if terminal := planVideoTranscodeUnavailableV3(input, subtitle, subtitleForcedAdaptation, compatibleRouteExcluded); terminal != nil {
 		return *terminal
 	}
-	quality := ResolveQualityPolicyV3(input.Request, source)
 	targetVideo, toneMapRecipe, terminal := resolveTranscodeVideoTargetV3(input, source, subtitle, subtitleForcedAdaptation)
 	if terminal != nil {
 		return *terminal
