@@ -102,6 +102,17 @@ function mockFetchResponse(text: string): Response {
   return new Response(text, { status: 200 });
 }
 
+/**
+ * A bounded window response: the server advertises the source-time range it
+ * covers and marks the body as partial. A complete body carries neither header.
+ */
+function mockWindowedResponse(text: string, coverage = "0.000-600.000"): Response {
+  return new Response(text, {
+    status: 200,
+    headers: { "X-Subtitle-Windowed": "true", "X-Subtitle-Coverage": coverage },
+  });
+}
+
 function mockFontBundleResponse(bytes: string): Response {
   return new Response(JSON.stringify({ items: [{ name: "Attached.ttf", data: btoa(bytes) }] }), {
     status: 200,
@@ -966,6 +977,282 @@ describe("useASSSubtitles windowed ASS extraction", () => {
       error.mockRestore();
       vi.useRealTimers();
     }
+  });
+});
+
+describe("useASSSubtitles artifact-aware whole-track upgrade", () => {
+  const windowScript = "[Script Info]\nComment: bounded window";
+  const wholeScript = "[Script Info]\nComment: whole track";
+
+  it("keeps the refresh loop armed when the param-less fallback is windowed", async () => {
+    vi.useFakeTimers();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const requested: string[] = [];
+    vi.mocked(fetch).mockImplementation((input, init) => {
+      const url = String(input);
+      requested.push(url);
+      // Three bounded attempts fail, then the param-less fallback is answered
+      // with the server's implicit 600 s window instead of a whole track.
+      if (requested.length <= 3) return Promise.reject(new Error("extraction failed"));
+      if (url === germanTrack.url) return Promise.resolve(mockWindowedResponse(windowScript));
+      return abortAwareResponse("[Script Info]", init);
+    });
+    const videoRef = makeVideoRef(1);
+    const { unmount } = renderHook(() => useASSSubtitles(videoRef, [germanTrack], 6, false, 0, 0));
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      for (let i = 0; i < 4; i += 1) {
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(5_000);
+        });
+      }
+      expect(requested[3]).toBe(germanTrack.url);
+      expect(constructorOpts).toHaveLength(1);
+      expect(constructorOpts[0]!.subContent).toBe(windowScript);
+
+      // The committed script covers only [0, 600]: leaving it must request a
+      // real window instead of latching on a "whole track" that ends at 600.
+      await act(async () => {
+        videoRef.current!.currentTime = 700;
+        videoRef.current!.dispatchEvent(new Event("timeupdate"));
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(requested).toHaveLength(5);
+      expect(requested[4]).toContain("position=680&duration=120");
+    } finally {
+      unmount();
+      error.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("swaps a complete artifact into the running renderer after the first probe", async () => {
+    vi.useFakeTimers();
+    const requested: string[] = [];
+    vi.mocked(fetch).mockImplementation((input, init) => {
+      const url = String(input);
+      requested.push(url);
+      // The windowed first paint is unchanged; the param-less probe finds the
+      // full-track artifact the warm behind that window committed.
+      if (url === germanTrack.url) return Promise.resolve(mockFetchResponse(wholeScript));
+      return abortAwareResponse(windowScript, init);
+    });
+    const videoRef = makeVideoRef(1);
+    const { unmount } = renderHook(() => useASSSubtitles(videoRef, [germanTrack], 6, false, 0, 0));
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(constructorOpts).toHaveLength(1);
+      expect(constructorOpts[0]!.subContent).toBe(windowScript);
+      expect(requested).toHaveLength(1);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000);
+      });
+      expect(requested).toHaveLength(2);
+      expect(requested[1]).toBe(germanTrack.url);
+      // The script is swapped through the existing setTrack path: the renderer
+      // is neither rebuilt nor destroyed.
+      const instance = instances[0]!;
+      expect(instances).toHaveLength(1);
+      expect(instance.destroy).not.toHaveBeenCalled();
+      expect(instance.renderer.setTrack).toHaveBeenCalledTimes(1);
+      expect(instance.renderer.setTrack).toHaveBeenCalledWith(wholeScript);
+
+      // A seek after the upgrade needs no network at all.
+      await act(async () => {
+        videoRef.current!.currentTime = 3000;
+        videoRef.current!.dispatchEvent(new Event("timeupdate"));
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(requested).toHaveLength(2);
+    } finally {
+      unmount();
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps windowing a non-abutting still-windowed probe answer at the rate limit", async () => {
+    vi.useFakeTimers();
+    const requested: string[] = [];
+    vi.mocked(fetch).mockImplementation((input, init) => {
+      const url = String(input);
+      requested.push(url);
+      // A window nowhere near the loaded [0, 120]: nothing to adopt.
+      if (url === germanTrack.url) {
+        return Promise.resolve(mockWindowedResponse(windowScript, "900.000-1500.000"));
+      }
+      return abortAwareResponse(windowScript, init);
+    });
+    const videoRef = makeVideoRef(1);
+    const { unmount } = renderHook(() => useASSSubtitles(videoRef, [germanTrack], 6, false, 0, 0));
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(requested).toHaveLength(1);
+
+      // First probe after 30 s; it finds no artifact yet.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000);
+      });
+      expect(requested).toHaveLength(2);
+      expect(requested[1]).toBe(germanTrack.url);
+
+      // At most one probe per 60 s: the next one is not due yet.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000);
+      });
+      expect(requested).toHaveLength(2);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000);
+      });
+      expect(requested).toHaveLength(3);
+      expect(requested[2]).toBe(germanTrack.url);
+      // A windowed answer never replaces the loaded script.
+      expect(instances).toHaveLength(1);
+      expect(instances[0]!.renderer.setTrack).not.toHaveBeenCalled();
+    } finally {
+      unmount();
+      vi.useRealTimers();
+    }
+  });
+
+  it("adopts an abutting windowed probe answer as the next window", async () => {
+    vi.useFakeTimers();
+    const requested: string[] = [];
+    vi.mocked(fetch).mockImplementation((input, init) => {
+      const url = String(input);
+      requested.push(url);
+      // The implicit 600 s window starts where the loaded [0, 120] does and
+      // reaches past it, so its body is worth keeping.
+      if (url === germanTrack.url) {
+        return Promise.resolve(mockWindowedResponse(wholeScript, "0.000-600.000"));
+      }
+      return abortAwareResponse(windowScript, init);
+    });
+    const videoRef = makeVideoRef(1);
+    const { unmount } = renderHook(() => useASSSubtitles(videoRef, [germanTrack], 6, false, 0, 0));
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000);
+      });
+      expect(requested).toHaveLength(2);
+      const instance = instances[0]!;
+      expect(instances).toHaveLength(1);
+      expect(instance.renderer.setTrack).toHaveBeenCalledWith(wholeScript);
+
+      // The adopted coverage extends to 600, so playback inside it fetches
+      // nothing.
+      await act(async () => {
+        videoRef.current!.currentTime = 400;
+        videoRef.current!.dispatchEvent(new Event("timeupdate"));
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(requested).toHaveLength(2);
+
+      // The normal 120 s prefetch resumes near the adopted window's end.
+      await act(async () => {
+        videoRef.current!.currentTime = 560;
+        videoRef.current!.dispatchEvent(new Event("timeupdate"));
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(requested).toHaveLength(3);
+      expect(requested[2]).toContain("position=540&duration=120");
+    } finally {
+      unmount();
+      vi.useRealTimers();
+    }
+  });
+
+  it("rebuilds instead of swapping a truncated retimed script", async () => {
+    const state = vi.fn();
+    const requested: string[] = [];
+    vi.mocked(fetch).mockImplementation((input, init) => {
+      const url = String(input);
+      requested.push(url);
+      // The retime fetch is param-less; with no committed artifact the server
+      // answers with a bounded window, which must never become the script.
+      if (url === germanTrack.url) return Promise.resolve(mockWindowedResponse("[Script Info]"));
+      return abortAwareResponse(windowScript, init);
+    });
+    const videoRef = makeVideoRef(1);
+    const { rerender } = renderHook(
+      ({ revision }: { revision: number }) =>
+        useASSSubtitles(
+          videoRef,
+          [germanTrack],
+          6,
+          false,
+          0,
+          0,
+          state,
+          undefined,
+          0,
+          "contain",
+          { x: 0, y: 0 },
+          revision,
+        ),
+      { initialProps: { revision: 0 } },
+    );
+    await waitFor(() => expect(state).toHaveBeenLastCalledWith("ready"));
+    expect(requested).toHaveLength(1);
+
+    await act(async () => {
+      rerender({ revision: 1 });
+    });
+    await waitFor(() => expect(requested).toHaveLength(3));
+    await waitFor(() => expect(state).toHaveBeenLastCalledWith("ready"));
+    // The truncated window was discarded and the windowed pipeline rebuilt
+    // the renderer, so the running script was never replaced by it.
+    expect(requested[1]).toBe(germanTrack.url);
+    expect(requested[2]).toContain("position=0&duration=120");
+    expect(instances).toHaveLength(2);
+    expect(instances[0]!.renderer.setTrack).not.toHaveBeenCalled();
+    expect(constructorOpts[1]!.subContent).toBe(windowScript);
+  });
+
+  it("still swaps a complete retimed script in place", async () => {
+    const state = vi.fn();
+    vi.mocked(fetch).mockImplementation((input, init) => {
+      const url = String(input);
+      if (url === germanTrack.url) return Promise.resolve(mockFetchResponse(wholeScript));
+      return abortAwareResponse(windowScript, init);
+    });
+    const videoRef = makeVideoRef(1);
+    const { rerender } = renderHook(
+      ({ revision }: { revision: number }) =>
+        useASSSubtitles(
+          videoRef,
+          [germanTrack],
+          6,
+          false,
+          0,
+          0,
+          state,
+          undefined,
+          0,
+          "contain",
+          { x: 0, y: 0 },
+          revision,
+        ),
+      { initialProps: { revision: 0 } },
+    );
+    await waitFor(() => expect(state).toHaveBeenLastCalledWith("ready"));
+
+    await act(async () => {
+      rerender({ revision: 1 });
+    });
+    await waitFor(() => expect(instances[0]!.renderer.setTrack).toHaveBeenCalledWith(wholeScript));
+    expect(instances).toHaveLength(1);
+    expect(instances[0]!.destroy).not.toHaveBeenCalled();
   });
 });
 

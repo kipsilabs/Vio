@@ -70,6 +70,50 @@ const ASS_TEXT_MAX_FAILURES = 4;
 // 4-deep terminal budget above, but a source that never recovers still
 // terminates instead of polling forever.
 const ASS_RETRYABLE_TEXT_MAX_FAILURES = 12;
+// The server's implicit window for a param-less subtitle request against a
+// cold large/unknown remote source: 600 s from just behind the session
+// position, flagged with the windowed headers. A param-less fallback that
+// still reports a window is therefore not a whole track and must keep the
+// refresh loop armed, unlike a complete (header-less) body.
+const ASS_FALLBACK_WINDOW_SECONDS = 600;
+// Artifact-aware upgrade: once a window is on screen, a param-less probe can
+// discover that the server has since committed the full-track artifact (the
+// warm it starts behind a windowed serve). The first probe waits this long so
+// first paint and the first prefetch are never contended.
+const ASS_UPGRADE_PROBE_FIRST_DELAY_MS = 30_000;
+// At most one probe per this interval afterwards: each one is a param-less
+// extraction the server may have to serve, so it is not free.
+const ASS_UPGRADE_PROBE_INTERVAL_MS = 60_000;
+// Ceiling for the probe's backoff when the server keeps answering 5xx or an
+// explicitly-retryable status. The working window pipeline is untouched.
+const ASS_UPGRADE_PROBE_MAX_INTERVAL_MS = 5 * 60_000;
+
+/**
+ * Whether an ASS response holds the complete track. Every bounded window
+ * carries `X-Subtitle-Windowed: true`; a whole-track body (local or small
+ * source, committed full-track artifact, or a codec that cannot be sliced)
+ * omits it. The server exposes both markers cross-origin for this check.
+ */
+function isWholeTrackResponse(response: Response): boolean {
+  return !response.headers.get("X-Subtitle-Windowed");
+}
+
+/**
+ * Source-time range advertised by `X-Subtitle-Coverage` (`<start>-<end>`, or
+ * `<start>-*` for an open end), or null when the header is absent or
+ * unparseable. An open end has no finite end, so it is not a range a caller can
+ * treat as a loaded window.
+ */
+function subtitleCoverageRange(response: Response): { start: number; end: number } | null {
+  const coverage = response.headers.get("X-Subtitle-Coverage");
+  if (!coverage) return null;
+  const [startText, endText] = coverage.split("-");
+  const start = Number.parseFloat(startText ?? "");
+  const end = Number.parseFloat(endText ?? "");
+  if (!Number.isFinite(start) || start < 0) return null;
+  if (!Number.isFinite(end) || end <= start) return null;
+  return { start, end };
+}
 
 /** True for statuses the server marks retry-after-backoff rather than failed. */
 function isRetryableSubtitleStatus(status: number): boolean {
@@ -417,6 +461,14 @@ export function useASSSubtitles(
     // and wedge the mount on "Retrying…".
     let retryableTextFailures = 0;
     let busy = false;
+    // One rate-limited param-less probe at a time, only while the loaded
+    // script is a bounded window. A complete answer upgrades the script in
+    // place; a still-windowed one keeps the 120 s pipeline and probes later.
+    let upgradeProbeTimer: ReturnType<typeof setTimeout> | null = null;
+    let upgradeProbeController: AbortController | null = null;
+    let upgradeProbeInFlight = false;
+    let upgradeProbeStopped = false;
+    let upgradeProbeDelayMs = ASS_UPGRADE_PROBE_FIRST_DELAY_MS;
     // Start position of the attempt currently in flight, so a paired
     // seeking/seeked event for the same position does not abort and restart it.
     let attemptStart: number | null = null;
@@ -605,6 +657,15 @@ export function useASSSubtitles(
       let fonts: Uint8Array[];
       let renderedSubContent: string;
       let fallbackFamily: string | undefined;
+      // What the response body actually is, which is not implied by the
+      // request: a param-less fallback against a cold large/remote source is
+      // answered with a bounded window, and a committed artifact answers a
+      // positioned request with the whole track. Read the markers before the
+      // body streams (a box, so the closure's assignment is visible here).
+      const received: { wholeTrack: boolean; coverage: { start: number; end: number } | null } = {
+        wholeTrack: false,
+        coverage: null,
+      };
       try {
         subContent = await fetch(url, { signal }).then(async (response) => {
           if (!response.ok) {
@@ -615,6 +676,8 @@ export function useASSSubtitles(
             }
             throw new SubtitleFetchError(response.status, `HTTP ${response.status}`);
           }
+          received.wholeTrack = isWholeTrackResponse(response);
+          received.coverage = subtitleCoverageRange(response);
           progress();
           if (!response.body) return response.text();
           const reader = response.body.getReader();
@@ -714,12 +777,26 @@ export function useASSSubtitles(
         // Advance to the window this instance renders so the next
         // timeupdate check measures against the loaded track, then clear
         // the failure budgets so a later unrelated error starts fresh.
-        usingWholeTrack = wholeTrack;
-        windowStart = start;
+        // Completeness comes from the response markers, never from the
+        // request: a param-less fallback answered with windowed headers is the
+        // server's implicit 600 s window, not the whole track. Treating it as
+        // whole would set windowEnd to Infinity and silently stop refreshing
+        // while every cue past that window is missing.
+        usingWholeTrack = wholeTrack && received.wholeTrack;
+        const committedStart = wholeTrack ? (received.coverage?.start ?? start) : start;
+        windowStart = committedStart;
+        windowEnd = usingWholeTrack
+          ? Infinity
+          : committedStart +
+            (wholeTrack ? ASS_FALLBACK_WINDOW_SECONDS : ASS_WINDOW_DURATION_SECONDS);
         // This run's commit is the only window a later rebuild of this same
         // track identity may reuse.
-        committedWindowRef.current = { url: activeUrl!, sourceGeneration, replayRevision, start };
-        windowEnd = wholeTrack ? Infinity : start + ASS_WINDOW_DURATION_SECONDS;
+        committedWindowRef.current = {
+          url: activeUrl!,
+          sourceGeneration,
+          replayRevision,
+          start: committedStart,
+        };
         windowFailures = 0;
         textFailures = 0;
         retryableTextFailures = 0;
@@ -729,6 +806,11 @@ export function useASSSubtitles(
           ready: true,
         };
         onLoadStateRef.current?.("ready");
+        // A bounded body still needs the artifact-aware upgrade probe; a
+        // complete body already is the whole track. A fallback that landed on
+        // a window arms the loop here too, so the misclassification costs no
+        // refresh.
+        if (!usingWholeTrack) scheduleUpgradeProbe();
         return true;
       }
       return false;
@@ -750,6 +832,10 @@ export function useASSSubtitles(
     async function attempt(start: number, wholeTrack: boolean, recheckAfterCommit = true) {
       if (cancelled || terminal || busy) return;
       busy = true;
+      // A window attempt owns the pipeline: a probe that landed mid-attempt
+      // could swap the script out from under the commit that is about to
+      // define windowStart/windowEnd.
+      upgradeProbeController?.abort();
       attemptStart = start;
       supersededBySeek = false;
       const attemptController = new AbortController();
@@ -898,6 +984,162 @@ export function useASSSubtitles(
       void attempt(target, false);
     }
 
+    /**
+     * Arms the next artifact-aware probe. Only a bounded window needs one: a
+     * complete body already is the whole track. The first probe is delayed past
+     * first paint and the first prefetch; later ones are rate-limited.
+     */
+    function scheduleUpgradeProbe() {
+      if (cancelled || terminal || usingWholeTrack || upgradeProbeStopped) return;
+      if (upgradeProbeTimer !== null || upgradeProbeInFlight) return;
+      upgradeProbeTimer = setTimeout(() => {
+        upgradeProbeTimer = null;
+        void probeWholeTrackUpgrade();
+      }, upgradeProbeDelayMs);
+    }
+
+    /**
+     * Asks the param-less URL whether the server can now serve the whole track
+     * (the warm behind a windowed serve commits a full-track artifact). A
+     * complete 200 swaps the script into the running renderer through the same
+     * `setTrack` path a retime uses, so seeking needs no further network; a
+     * still-windowed 200 keeps the 120 s pipeline. Nothing here affects the
+     * window durations, leads, stall and failure budgets of that pipeline: the
+     * probe is skipped whenever an attempt owns it, and any probe failure just
+     * backs the probe off.
+     */
+    async function probeWholeTrackUpgrade() {
+      if (cancelled || terminal || usingWholeTrack || upgradeProbeStopped) return;
+      if (!activeUrl) return;
+      // Never race a windowed (or seek-driven) attempt: it owns the commit
+      // that defines windowStart/windowEnd for the loaded script.
+      if (busy || pendingStart !== null || retryTimer !== null) {
+        scheduleUpgradeProbe();
+        return;
+      }
+      const fill = fillRef.current;
+      const instance = jassubRef.current;
+      if (!fill || !instance || fill.instance !== instance) return;
+
+      const controller = new AbortController();
+      upgradeProbeController = controller;
+      upgradeProbeInFlight = true;
+      let timeout: ReturnType<typeof setTimeout> | null = null;
+      const armWatchdog = () => {
+        if (timeout !== null) clearTimeout(timeout);
+        timeout = setTimeout(() => controller.abort(), ASS_STALL_TIMEOUT_MS);
+      };
+      try {
+        armWatchdog();
+        const response = await fetch(activeUrl, { signal: controller.signal });
+        if (cancelled || controller.signal.aborted) return;
+        if (!response.ok) {
+          if (await isSubtitleSourceChanged(response)) {
+            // The plan's URLs are stale; a later probe against this one could
+            // only fail the same way.
+            sourceChangedSignaled = true;
+            upgradeProbeStopped = true;
+            onSourceChangedRef.current?.();
+            return;
+          }
+          if (isDefinitiveSubtitleStatus(response.status)) {
+            // Same terminal policy as a windowed fetch: the server rejected
+            // this URL definitively, so stop rather than keep probing it.
+            terminal = true;
+            return;
+          }
+          // 5xx or an explicitly-retryable status: the loaded window keeps
+          // rendering; keep windowing and probe again on a growing backoff.
+          upgradeProbeDelayMs = Math.min(
+            Math.max(upgradeProbeDelayMs * 2, ASS_UPGRADE_PROBE_INTERVAL_MS),
+            ASS_UPGRADE_PROBE_MAX_INTERVAL_MS,
+          );
+          return;
+        }
+        if (!isWholeTrackResponse(response)) {
+          // Still a bounded window: no committed full-track artifact yet. When
+          // its advertised coverage abuts (or overlaps) the loaded window and
+          // reaches past it, adopt it as the next window instead of throwing
+          // the body away; otherwise drop it and keep the 120 s pipeline.
+          const coverage = subtitleCoverageRange(response);
+          if (
+            coverage === null ||
+            coverage.start > windowEnd + 1 ||
+            coverage.end <= windowEnd + 1
+          ) {
+            void response.body?.cancel().catch(() => {});
+            upgradeProbeDelayMs = ASS_UPGRADE_PROBE_INTERVAL_MS;
+            return;
+          }
+          const text = await response.text();
+          if (cancelled || controller.signal.aborted || jassubRef.current !== instance) return;
+          // Same swap path as the retime: the loaded coverage grows, the
+          // renderer and the video element are untouched.
+          const content = fill.fallbackFamily
+            ? forceASSFontFamily(text, fill.fallbackFamily)
+            : text;
+          fill.baseContent = content;
+          fill.inset = fillInset(content, videoFitRef.current, coverCropRef.current);
+          await instance.renderer.setTrack(applyASSMarginInset(content, fill.inset));
+          if (cancelled || controller.signal.aborted || jassubRef.current !== instance) return;
+          windowStart = coverage.start;
+          windowEnd = coverage.end;
+          windowFailures = 0;
+          textFailures = 0;
+          retryableTextFailures = 0;
+          committedWindowRef.current = {
+            url: activeUrl,
+            sourceGeneration,
+            replayRevision,
+            start: coverage.start,
+          };
+          upgradeProbeDelayMs = ASS_UPGRADE_PROBE_INTERVAL_MS;
+          return;
+        }
+        const text = await response.text();
+        if (cancelled || controller.signal.aborted || jassubRef.current !== instance) return;
+        // The retime swap, not a rebuild: the running renderer's script is
+        // replaced in place, so the current frame and the video element are
+        // untouched.
+        const content = fill.fallbackFamily ? forceASSFontFamily(text, fill.fallbackFamily) : text;
+        fill.baseContent = content;
+        fill.inset = fillInset(content, videoFitRef.current, coverCropRef.current);
+        await instance.renderer.setTrack(applyASSMarginInset(content, fill.inset));
+        if (cancelled || controller.signal.aborted || jassubRef.current !== instance) return;
+        usingWholeTrack = true;
+        windowEnd = Infinity;
+        committedWindowRef.current = {
+          url: activeUrl,
+          sourceGeneration,
+          replayRevision,
+          start: windowStart,
+        };
+        // Nothing left to upgrade.
+        upgradeProbeStopped = true;
+      } catch (err) {
+        if (cancelled) return;
+        if ((err as Error).name !== "AbortError") {
+          console.error(
+            `[useASSSubtitles] Whole-track subtitle probe failed for ${activeUrl}:`,
+            err,
+          );
+        }
+        // A watchdog abort, a network failure, or a failed setTrack leaves the
+        // loaded window rendering, so stay windowed and back the probe off.
+        upgradeProbeDelayMs = Math.min(
+          Math.max(upgradeProbeDelayMs * 2, ASS_UPGRADE_PROBE_INTERVAL_MS),
+          ASS_UPGRADE_PROBE_MAX_INTERVAL_MS,
+        );
+      } finally {
+        if (timeout !== null) clearTimeout(timeout);
+        if (upgradeProbeController === controller) upgradeProbeController = null;
+        upgradeProbeInFlight = false;
+        if (!cancelled && !terminal && !usingWholeTrack && !upgradeProbeStopped) {
+          scheduleUpgradeProbe();
+        }
+      }
+    }
+
     const handleTimeUpdate = () => maybeRefreshWindow(false);
     const handleSeek = () => maybeRefreshWindow(true);
     void attempt(windowStart, false, !resumedAtUnknownPlayhead);
@@ -909,7 +1151,9 @@ export function useASSSubtitles(
       cancelled = true;
       if (retryTimer !== null) clearTimeout(retryTimer);
       if (fontRefreshTimer !== null) clearTimeout(fontRefreshTimer);
+      if (upgradeProbeTimer !== null) clearTimeout(upgradeProbeTimer);
       fontRefreshController?.abort();
+      upgradeProbeController?.abort();
       activeController?.abort();
       stopResizeToStream?.();
       video.removeEventListener("timeupdate", handleTimeUpdate);
@@ -957,6 +1201,14 @@ export function useASSSubtitles(
       try {
         const response = await fetch(activeUrl, { signal: controller.signal });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        if (!isWholeTrackResponse(response)) {
+          // The param-less URL answered with a bounded window (the server has
+          // no committed full-track artifact yet). Swapping it into the
+          // running renderer would truncate the retimed script to that window,
+          // so rebuild through the windowed pipeline instead.
+          setRebuild((n) => n + 1);
+          return;
+        }
         const text = await response.text();
         if (controller.signal.aborted || jassubRef.current !== instance) return;
         const content = fill.fallbackFamily ? forceASSFontFamily(text, fill.fallbackFamily) : text;
