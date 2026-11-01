@@ -12,6 +12,7 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/clientip"
 	"github.com/Silo-Server/silo-server/internal/clientmetadata"
+	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/netaccess"
 	"github.com/Silo-Server/silo-server/internal/streamlocation"
 	"github.com/Silo-Server/silo-server/internal/tonemap"
@@ -216,18 +217,10 @@ type Session struct {
 	// RemuxResumeLeadingPictureDrop freezes the planner's best-effort request
 	// to drop open-GOP leading pictures from a seeked progressive remux.
 	RemuxResumeLeadingPictureDrop bool
-	ClientIP                      string // resolved client IP for the playback session
-	StreamLocation                string // local/remote policy classification fixed at playback negotiation
-	ClientName                    string // reported playback client name, when available
-	ClientVersion                 string // reported playback client version, when available
-	ClientBuild                   string // opaque reported client build identifier, when available
-	ClientChannel                 string // opaque reported client distribution channel, when available
-	ClientUserAgent               string // trimmed request user agent for the playback session
 	// DeviceID and DevicePlatform are the device the client declared when the
 	// session started (see ClientInfo); empty when it declared none.
 	DeviceID         string
 	DevicePlatform   string
-	IsJellyfinCompat bool // immutable origin identity for Jellyfin compatibility sessions
 	// RequireMediaAuthorization distinguishes v3 transports whose session ID is
 	// only a route (media requests must present an authenticated user) from
 	// legacy sessions whose ID doubles as a bearer credential. Secure transports
