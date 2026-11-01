@@ -74,7 +74,6 @@ import {
   ROOM_HELD_SEEK_TIMEOUT_MS,
 } from "../utils/pendingSeek";
 import { resolveVersionAudioLanguage } from "../utils/effectiveAudioLanguage";
-import { resolveEffectiveVersion } from "../utils/resolveEffectiveVersion";
 import {
   MAX_STALE_GENERATION_RECOVERIES,
   StartupGuard,
@@ -109,6 +108,7 @@ import type {
   PlayerSubtitleInfo,
   PlayerSubtitleTrackSignature,
   PlayerTimeRange,
+  QualityOption,
   PlayerMarkerSegment,
   PlayerVirtualRanking,
   PlayerIndexerRelease,
@@ -322,10 +322,6 @@ interface VideoPlayerProps {
   trickplayUpdatedAt?: number;
   /** A preview sheet failed to load; read the previews again. */
   onTrickplayError?: () => void;
-  onSelectAutoVersion?: () => void;
-  autoFallback?: boolean;
-  onRefreshVersions?: () => Promise<void>;
-  onCancelRefresh?: () => void;
   onSwitchVersion?: (
     fileId: number,
     currentPosition: number,
@@ -677,7 +673,7 @@ export function VideoPlayer({
   nativeOriginalSupport,
   shouldAutoPlay = true,
   replanning = false,
-  replanningQuality: _replanningQuality = false,
+  replanningQuality = false,
   replacing = false,
   pendingSwitchFileId = null,
   replanError = null,
@@ -828,11 +824,6 @@ export function VideoPlayer({
     };
   }, []);
   const startupGuardRef = useRef<StartupGuard | null>(null);
-  const hlsStartupGuardRef = startupGuardRef;
-  const planRevisionRef = useRef(planRevision);
-  planRevisionRef.current = planRevision;
-  const bufferPolicyRef = useRef<ReturnType<typeof hlsBufferPolicy> | null>(null);
-  const manifestPollbackRef = useRef<number | undefined>(undefined);
   const mediaRecoveryAttemptsRef = useRef(0);
   const networkRecoveryAttemptsRef = useRef(0);
   const staleGenerationRecoveriesRef = useRef(0);

@@ -7,9 +7,6 @@ import type { PlayerFileVersion, PlayerPlaybackStateChange, WatchPageProps } fro
 import type { PlaybackRealtimeEventEnvelope } from "../realtime-protocol";
 import { usePlaybackSession } from "../hooks/usePlaybackSession";
 import { isAdaptationUnavailableReason } from "../playback-errors";
-import { resolveEffectiveVersion, type EffectiveVersionIdentity } from "../utils/resolveEffectiveVersion";
-import { buildPublishedSubtitleTracks } from "../utils/subtitleInventory";
-import type { PlayerIndexerRelease, PlayerPlaybackVariant } from "../types";
 import { usePlayerConfig } from "../context/PlayerConfigContext";
 import {
   hasSelectableSessionSubtitles,
