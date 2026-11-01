@@ -3970,7 +3970,7 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 	// The windowed request just read the remote source and, by design,
 	// committed nothing. Populate the full-track cache so the next window hits
 	// the small artifact instead of re-demuxing the source.
-	h.warmVirtualSubtitleAfterWindowMiss(file, session, opts, virtualActive, middleware.GetReqID(r.Context()))
+	h.warmVirtualSubtitleAfterWindowMiss(file, track, session, opts, virtualActive, middleware.GetReqID(r.Context()))
 }
 
 // virtualSubtitleCacheIdentity keys the subtitle cache for a virtual row being
@@ -4124,6 +4124,11 @@ func (h *StreamHandler) rememberVirtualSubtitleLayout(planKey string, opts playb
 // remote work and a stuck resolver cannot pin either: concurrent window misses
 // on the same serve identity resolve once and demux once, and the registration
 // is released exactly once when the warm settles.
+//
+// Because that registration is independent of the serve request's, the warm
+// validates it against track and the row's probed inventory before it extracts
+// anything: a rotated release either remaps onto the same-class live track (and
+// re-keys the identity to the effective ordinal) or abandons the warm.
 
 // virtualSubtitleWarmSession returns the freshest session copy the warm gate
 // should read. The session copy on the serve request predates the latest
@@ -4192,10 +4197,15 @@ func (h *StreamHandler) virtualSubtitleWarmCancelReason(session *playback.Sessio
 	return ""
 }
 
-func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(file *models.MediaFile, session *playback.Session, opts playback.StreamExtractOpts, virtualActive bool, requestID string) {
+func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(file *models.MediaFile, track models.SubtitleTrack, session *playback.Session, opts playback.StreamExtractOpts, virtualActive bool, requestID string) {
 	if h == nil || h.SubtitleCache == nil || file == nil || session == nil || !virtualActive {
 		return
 	}
+	// Snapshot the row's probed layout. The warm validates its own relay
+	// registration against this inventory, and the inventory is also the term
+	// SubtitleInventoryToken folds into the cache identity; reading it once
+	// keeps the two in agreement even if the row is refreshed mid-warm.
+	planTracks := file.SubtitleTracks
 	// A full-track warm is a second read of the remote source. Text warms are
 	// worth that read even while the viewer is playing: without one, every
 	// 120 s window on a large virtual source re-demuxes the relay input and the
@@ -4286,12 +4296,58 @@ func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(file *models.MediaFil
 			}
 			cleanup = resolvedCleanup
 			extractOpts.InputPath = resolved.URL
+			// Validate the relay registration this warm resolved on its own.
+			// The serve request validated its registration, but the warm opens
+			// a second one, and the pinned provider result can rotate in
+			// between: resolving a fresh URL and then extracting the plan
+			// ordinal would commit whatever the new release happens to carry
+			// under an identity that still looks valid. One probe per warm
+			// (seconds, once) is the price of never committing unvalidated
+			// bytes, and it is far below the per-window probes the memo removes.
+			proceed, validateErr := h.verifyVirtualSubtitleLayout(warmCtx, track, planTracks, &extractOpts)
+			if !proceed {
+				// The live layout no longer carries a same-class track for this
+				// plan track. Nothing was committed (the fill is discarded on
+				// this path), and this is a deliberate abandonment rather than a
+				// source failure, so it must not arm the warm failure cooldown:
+				// the next windowed miss re-evaluates the layout itself.
+				slog.WarnContext(context.Background(), "virtual subtitle warm abandoned: live layout has no match for the planned track",
+					"component", "api", "file_id", file.ID,
+					"plan_codec", track.Codec, "plan_language", track.Language)
+				return playback.ErrSubtitleWarmCanceled
+			}
+			if validateErr != nil {
+				if warmCtx.Err() != nil {
+					// The abort ticker canceled the probe (seek or session end):
+					// same intentional abandonment as a canceled resolve.
+					return playback.ErrSubtitleWarmCanceled
+				}
+				// The live layout could not be established. Fail closed and let
+				// the cache handle it like any other warm failure, including its
+				// per-identity cooldown, rather than extract an unverified
+				// ordinal.
+				return fmt.Errorf("validate virtual subtitle warm layout: %w", validateErr)
+			}
+			// The probe may have remapped the ordinal onto the live layout.
+			// Extract the mapped stream and keep the extraction's own identity
+			// aligned with it. The fill was reserved before the probe under the
+			// pre-probe identity, so the artifact still commits under the key
+			// the serve lookup computes for this row and ordinal; only the
+			// stream that is demuxed moves.
+			extractOpts.CacheIdentity = virtualSubtitleCacheIdentity(file, session.VirtualSourceURI, extractOpts.TrackIndex)
 			err = playback.StreamExtractSubtitle(warmCtx, extractOpts)
 			if warmCtx.Err() != nil {
 				return playback.ErrSubtitleWarmCanceled
 			}
 			return err
 		}
+		// The serve request may have pinned a committed artifact to skip its own
+		// drift probe. That pin is a claim about one validated serve, and this
+		// warm opens its own registration and validates it above, so it must not
+		// be carried: inheriting it would let a serve-path eviction race fail the
+		// warm and arm the per-identity failure cooldown for bytes the warm never
+		// read.
+		opts.PinnedTextArtifact = nil
 		<-h.SubtitleCache.WarmTrackInBackground(opts, extract, requestID)
 	}()
 }
