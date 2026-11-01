@@ -1347,7 +1347,7 @@ type targetVideoSelectionV3 struct {
 	claim          string
 	// h264Quality preserves the decoder-bounded fallback when an attempted
 	// HEVC rendition is downgraded without re-running codec selection.
-	h264Quality QualityResultV3
+	h264Quality      QualityResultV3
 	audioChannels    int
 	audioBitrateKbps int
 }
