@@ -1231,6 +1231,34 @@ func newTestService(store *fakeStore) *Service {
 	return newTestServiceWithTMDB(store, &fakeTMDBClient{})
 }
 
+// deferredEnrichment collects deferred work so tests can run it deterministically.
+type deferredEnrichment struct {
+	mu   sync.Mutex
+	runs []func()
+}
+
+func (d *deferredEnrichment) schedule(run func()) {
+	d.mu.Lock()
+	d.runs = append(d.runs, run)
+	d.mu.Unlock()
+}
+
+func (d *deferredEnrichment) drain() {
+	d.mu.Lock()
+	runs := d.runs
+	d.runs = nil
+	d.mu.Unlock()
+	for _, run := range runs {
+		run()
+	}
+}
+
+func (d *deferredEnrichment) pending() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return len(d.runs)
+}
+
 func newTestServiceWithTMDB(store *fakeStore, tmdbClient *fakeTMDBClient) *Service {
 	service := NewService(store, tmdbClient, &fakePresence{})
 	service.Now = func() time.Time { return time.Date(2026, 5, 24, 12, 0, 0, 0, time.UTC) }

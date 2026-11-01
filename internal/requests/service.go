@@ -110,13 +110,17 @@ type Service struct {
 	hasDefaultVirtualRouter func() bool
 	catalogChanged          func()
 	cleanupVirtual          func(context.Context, Request) error
-	notifier                FulfillmentNotifier
-	lifecycle               LifecycleNotifier
-	watchlistPref           WatchlistPreference
-	titleObserver           TitleObserver
-	discoverSnapshots       DiscoverSnapshots
-	discoverRefresher       DiscoverListRefresher
-	Now                     func() time.Time
+	// enrichAsync schedules the enrichment CreateRequest defers past the 201.
+	// Production leaves it nil to run the work on a goroutine detached from the
+	// request context; tests replace it to run the step explicitly.
+	enrichAsync       func(func())
+	notifier          FulfillmentNotifier
+	lifecycle         LifecycleNotifier
+	watchlistPref     WatchlistPreference
+	titleObserver     TitleObserver
+	discoverSnapshots DiscoverSnapshots
+	discoverRefresher DiscoverListRefresher
+	Now               func() time.Time
 }
 
 type DiscoverySection struct {
