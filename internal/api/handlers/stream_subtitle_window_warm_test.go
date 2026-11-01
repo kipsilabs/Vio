@@ -473,7 +473,7 @@ func TestVirtualTextWindowWarmKeysOnServeOrdinalAfterRemap(t *testing.T) {
 		SeekSeconds:     600,
 		DurationSeconds: 600,
 		FFmpegPath:      filepath.Join(dir, "ffmpeg"),
-	}, true, "")
+	}, nil, true, "")
 	waitForCommittedTextEntry(t, handler.SubtitleCache, serveIdentity, remappedOrdinal, "subrip")
 
 	planIdentity := virtualSubtitleCacheIdentity(file, virtualURI, 0)
@@ -512,7 +512,7 @@ func TestVirtualSubtitleWarmRemapsOntoLiveLayoutBeforeCommit(t *testing.T) {
 		SeekSeconds:     600,
 		DurationSeconds: 600,
 		FFmpegPath:      filepath.Join(dir, "ffmpeg"),
-	}, true, "")
+	}, nil, true, "")
 
 	const remappedOrdinal = 1
 	planIdentity := virtualSubtitleCacheIdentity(file, virtualURI, 0)
@@ -554,7 +554,7 @@ func TestVirtualSubtitleWarmAbandonsUnmatchedLayoutWithoutCooldown(t *testing.T)
 		DurationSeconds: 600,
 		FFmpegPath:      filepath.Join(dir, "ffmpeg"),
 	}
-	handler.warmVirtualSubtitleAfterWindowMiss(file, file.SubtitleTracks[0], session, opts, true, "")
+	handler.warmVirtualSubtitleAfterWindowMiss(file, file.SubtitleTracks[0], session, opts, nil, true, "")
 	handler.waitForBackgroundSubtitleWarms()
 
 	if _, err := os.Stat(argsLog); !os.IsNotExist(err) {
@@ -567,7 +567,7 @@ func TestVirtualSubtitleWarmAbandonsUnmatchedLayoutWithoutCooldown(t *testing.T)
 	// A matching probe on the next attempt proves the abandonment did not arm
 	// the per-identity failure cooldown.
 	writeSubtitleLayoutProbe(t, dir, models.SubtitleTrack{Index: 0, Codec: "subrip"})
-	handler.warmVirtualSubtitleAfterWindowMiss(file, file.SubtitleTracks[0], session, opts, true, "")
+	handler.warmVirtualSubtitleAfterWindowMiss(file, file.SubtitleTracks[0], session, opts, nil, true, "")
 	waitForCommittedTextEntry(t, handler.SubtitleCache, opts.CacheIdentity, 0, "subrip")
 }
 
@@ -591,7 +591,7 @@ func TestVirtualTextWindowWarmSkipsNonVirtual(t *testing.T) {
 		SeekSeconds:     100,
 		DurationSeconds: 600,
 		FFmpegPath:      filepath.Join(dir, "ffmpeg"),
-	}, false, "")
+	}, nil, false, "")
 
 	if _, err := os.Stat(argsLog); !os.IsNotExist(err) {
 		t.Fatalf("no warm should run for a non-virtual request: %v", err)
@@ -622,7 +622,7 @@ func TestVirtualTextWindowWarmStartsDuringPlayback(t *testing.T) {
 		SeekSeconds:     100,
 		DurationSeconds: 120,
 		FFmpegPath:      filepath.Join(dir, "ffmpeg"),
-	}, true, "")
+	}, nil, true, "")
 
 	waitForCommittedTextEntry(t, handler.SubtitleCache, identity, 0, "subrip")
 }
@@ -648,7 +648,7 @@ func TestVirtualPGSWindowWarmSkipsActivePlayback(t *testing.T) {
 		SeekSeconds:     100,
 		DurationSeconds: 120,
 		FFmpegPath:      filepath.Join(dir, "ffmpeg"),
-	}, true, "")
+	}, nil, true, "")
 
 	if _, err := os.Stat(argsLog); !os.IsNotExist(err) {
 		t.Fatalf("no PGS warm should run while the session is playing: %v", err)
@@ -856,8 +856,8 @@ func TestVirtualTextWindowWarmResolveTimeoutReleasesSlot(t *testing.T) {
 	}
 
 	// Occupy both warm slots with resolvers that block until canceled.
-	handler.warmVirtualSubtitleAfterWindowMiss(file, file.SubtitleTracks[0], session, optsFor(0), true, "")
-	handler.warmVirtualSubtitleAfterWindowMiss(file, file.SubtitleTracks[0], session, optsFor(1), true, "")
+	handler.warmVirtualSubtitleAfterWindowMiss(file, file.SubtitleTracks[0], session, optsFor(0), nil, true, "")
+	handler.warmVirtualSubtitleAfterWindowMiss(file, file.SubtitleTracks[0], session, optsFor(1), nil, true, "")
 	for i := 0; i < 2; i++ {
 		select {
 		case <-entered:
@@ -867,7 +867,7 @@ func TestVirtualTextWindowWarmResolveTimeoutReleasesSlot(t *testing.T) {
 	}
 
 	// With both slots held, a third warm is dropped rather than queued.
-	handler.warmVirtualSubtitleAfterWindowMiss(file, file.SubtitleTracks[0], session, optsFor(2), true, "")
+	handler.warmVirtualSubtitleAfterWindowMiss(file, file.SubtitleTracks[0], session, optsFor(2), nil, true, "")
 	if _, err := os.Stat(argsLog); !os.IsNotExist(err) {
 		t.Fatalf("a warm extracted while both slots were held: %v", err)
 	}
@@ -885,7 +885,7 @@ func TestVirtualTextWindowWarmResolveTimeoutReleasesSlot(t *testing.T) {
 	identity := virtualSubtitleCacheIdentity(file, virtualURI, 2)
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		handler.warmVirtualSubtitleAfterWindowMiss(file, file.SubtitleTracks[0], session, optsFor(2), true, "")
+		handler.warmVirtualSubtitleAfterWindowMiss(file, file.SubtitleTracks[0], session, optsFor(2), nil, true, "")
 		if handler.SubtitleCache.HasCommittedTextEntry("unused", identity, 2, "subrip", "") {
 			return
 		}
@@ -1406,5 +1406,91 @@ func TestImplicitVirtualWindowStart(t *testing.T) {
 	}
 	if got := implicitVirtualWindowStart(&playback.Session{Position: 3600}); got != 3598 {
 		t.Fatalf("resumed session start = %v, want 3598", got)
+	}
+}
+
+// The window serve that starts a detached warm has already established the
+// live layout for this identity and ordinal (a fresh probe or the 120 s memo),
+// so the warm inherits that verdict instead of re-probing. On a slow relay the
+// second ffprobe is exactly what used to time the warm out and keep every
+// window re-demuxing the source, so a probing warm must not be observed here.
+func TestVirtualSubtitleWarmInheritsServeLayoutWithoutReprobe(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+	dir := t.TempDir()
+	argsLog := filepath.Join(dir, "ffmpeg.args")
+	probeLog := filepath.Join(dir, "ffprobe.args")
+	handler, session, file, virtualURI := newVirtualSubtitleWindowFixture(t, dir,
+		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\ncat <<'VTT'\n"+warmSubtitleVTT+"VTT\n")
+	// An inherited verdict must not spawn a probe. This one logs and fails, so a
+	// fallback re-probe both shows up and abandons the warm.
+	writeExecutableScript(t, filepath.Join(dir, "ffprobe"),
+		"#!/bin/sh\nprintf 'probe\\n' >> '"+probeLog+"'\nexit 1\n")
+
+	identity := virtualSubtitleCacheIdentity(file, virtualURI, 0)
+	handler.warmVirtualSubtitleAfterWindowMiss(file, file.SubtitleTracks[0], session, playback.StreamExtractOpts{
+		InputPath:       "unused",
+		CacheIdentity:   identity,
+		TrackIndex:      0,
+		SourceCodec:     "subrip",
+		SeekSeconds:     600,
+		DurationSeconds: 600,
+		FFmpegPath:      filepath.Join(dir, "ffmpeg"),
+	}, &virtualSubtitleLayoutSeed{
+		cacheIdentity: identity,
+		trackIndex:    0,
+		sourceCodec:   "subrip",
+		verifiedAt:    time.Now(),
+	}, true, "")
+
+	waitForCommittedTextEntry(t, handler.SubtitleCache, identity, 0, "subrip")
+	if _, err := os.Stat(probeLog); !os.IsNotExist(err) {
+		t.Fatalf("warm re-probed a layout the serve already validated: %v", err)
+	}
+}
+
+// Inheritance is identity-keyed: a verdict recorded for a different pinned
+// result or inventory must not authorize this warm. It falls back to its own
+// probe and fails closed when the layout cannot be established, committing
+// nothing.
+func TestVirtualSubtitleWarmStaleIdentityStillReprobesAndFailsClosed(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+	dir := t.TempDir()
+	argsLog := filepath.Join(dir, "ffmpeg.args")
+	probeLog := filepath.Join(dir, "ffprobe.args")
+	handler, session, file, virtualURI := newVirtualSubtitleWindowFixture(t, dir,
+		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\ncat <<'VTT'\n"+warmSubtitleVTT+"VTT\n")
+	writeExecutableScript(t, filepath.Join(dir, "ffprobe"),
+		"#!/bin/sh\nprintf 'probe\\n' >> '"+probeLog+"'\nexit 1\n")
+
+	identity := virtualSubtitleCacheIdentity(file, virtualURI, 0)
+	staleIdentity := virtualSubtitleCacheIdentity(file, "virtual://movie/tt-window?result=previous", 0)
+	handler.warmVirtualSubtitleAfterWindowMiss(file, file.SubtitleTracks[0], session, playback.StreamExtractOpts{
+		InputPath:       "unused",
+		CacheIdentity:   identity,
+		TrackIndex:      0,
+		SourceCodec:     "subrip",
+		SeekSeconds:     600,
+		DurationSeconds: 600,
+		FFmpegPath:      filepath.Join(dir, "ffmpeg"),
+	}, &virtualSubtitleLayoutSeed{
+		cacheIdentity: staleIdentity,
+		trackIndex:    0,
+		sourceCodec:   "subrip",
+		verifiedAt:    time.Now(),
+	}, true, "")
+	handler.waitForBackgroundSubtitleWarms()
+
+	if data, err := os.ReadFile(probeLog); err != nil || strings.TrimSpace(string(data)) == "" {
+		t.Fatalf("warm trusted a verdict for a different identity (probe log %q, err %v)", data, err)
+	}
+	if handler.SubtitleCache.HasCommittedTextEntry("unused", identity, 0, "subrip", "") {
+		t.Fatal("warm committed bytes after failing to establish the live layout")
+	}
+	if _, err := os.Stat(argsLog); !os.IsNotExist(err) {
+		t.Fatalf("warm extracted without a validated layout: %v", err)
 	}
 }

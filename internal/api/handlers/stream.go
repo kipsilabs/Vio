@@ -3760,6 +3760,16 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 	// A committed full-track text artifact pins the plan-time release, and a
 	// cached-text input remaps to its sole stream, so the probe is unnecessary
 	// then — skip its multi-second tax and serve the warm.
+	// inheritedLayout is the live-layout verdict this request established for
+	// the exact identity and ordinal it will hand the detached warm. Reusing it
+	// keeps the warm from paying a second multi-second ffprobe on a slow relay
+	// for a verdict this same request already holds: the serve either probed
+	// successfully or read a successful probe from the 120 s memo, and it would
+	// have failed closed otherwise. B1 still holds — the warm never commits
+	// bytes for a layout this request did not validate, and the inherited
+	// verdict is at most virtualSubtitleLayoutCacheTTL old and keyed by the
+	// pinned provider result and inventory token.
+	var inheritedLayout *virtualSubtitleLayoutSeed
 	if virtualActive && driftSuspected {
 		if artifact, ok := h.resolveCommittedTextSubtitleEntry(&opts); ok {
 			// A committed full-track text artifact pins the plan-time release and
@@ -3780,6 +3790,12 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 			opts.TrackIndex = verdict.trackIndex
 			opts.SourceCodec = verdict.sourceCodec
 			opts.CacheIdentity = virtualSubtitleCacheIdentity(file, session.VirtualSourceURI, opts.TrackIndex)
+			inheritedLayout = &virtualSubtitleLayoutSeed{
+				cacheIdentity: opts.CacheIdentity,
+				trackIndex:    opts.TrackIndex,
+				sourceCodec:   opts.SourceCodec,
+				verifiedAt:    verdict.verifiedAt,
+			}
 			slog.DebugContext(r.Context(), "virtual subtitle layout probe reused", "component", "api",
 				"file_id", file.ID,
 				"plan_ordinal", planOrdinal,
@@ -3814,6 +3830,12 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 			// track the effective map so a remapped extraction lands under its
 			// own key.
 			opts.CacheIdentity = virtualSubtitleCacheIdentity(file, session.VirtualSourceURI, opts.TrackIndex)
+			inheritedLayout = &virtualSubtitleLayoutSeed{
+				cacheIdentity: opts.CacheIdentity,
+				trackIndex:    opts.TrackIndex,
+				sourceCodec:   opts.SourceCodec,
+				verifiedAt:    time.Now(),
+			}
 		}
 	}
 
@@ -3851,6 +3873,12 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 			return
 		}
 		opts.CacheIdentity = virtualSubtitleCacheIdentity(file, session.VirtualSourceURI, opts.TrackIndex)
+		inheritedLayout = &virtualSubtitleLayoutSeed{
+			cacheIdentity: opts.CacheIdentity,
+			trackIndex:    opts.TrackIndex,
+			sourceCodec:   opts.SourceCodec,
+			verifiedAt:    time.Now(),
+		}
 		// The pinned artifact is gone, so the committed-entry check that
 		// suppressed the implicit window on the first attempt no longer holds.
 		// Re-evaluate against the now-cold source before retrying.
@@ -3934,6 +3962,12 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 		// under its own key.
 		if virtualActive {
 			opts.CacheIdentity = virtualSubtitleCacheIdentity(file, session.VirtualSourceURI, opts.TrackIndex)
+			inheritedLayout = &virtualSubtitleLayoutSeed{
+				cacheIdentity: opts.CacheIdentity,
+				trackIndex:    opts.TrackIndex,
+				sourceCodec:   opts.SourceCodec,
+				verifiedAt:    time.Now(),
+			}
 		}
 		if retryErr := h.SubtitleCache.ServeExtract(response, r, opts, playback.StreamExtractSubtitle); retryErr != nil {
 			var retryBackoff *playback.SubtitleExtractionRetryError
@@ -3970,7 +4004,7 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 	// The windowed request just read the remote source and, by design,
 	// committed nothing. Populate the full-track cache so the next window hits
 	// the small artifact instead of re-demuxing the source.
-	h.warmVirtualSubtitleAfterWindowMiss(file, track, session, opts, virtualActive, middleware.GetReqID(r.Context()))
+	h.warmVirtualSubtitleAfterWindowMiss(file, track, session, opts, inheritedLayout, virtualActive, middleware.GetReqID(r.Context()))
 }
 
 // virtualSubtitleCacheIdentity keys the subtitle cache for a virtual row being
@@ -4047,6 +4081,21 @@ type virtualSubtitleLayoutVerdict struct {
 	trackIndex  int
 	sourceCodec string
 	verifiedAt  time.Time
+}
+
+// virtualSubtitleLayoutSeed carries a live-layout verdict the serve request
+// established into the detached warm it starts. A warm triggered by a windowed
+// miss normally has to re-probe its own relay registration, but when the serve
+// that triggered it already validated the same identity and ordinal (a fresh
+// probe or the 120 s memo) the warm can inherit that verdict instead of paying
+// a second multi-second ffprobe over a slow remote. The identity is derived
+// from the pinned provider result and inventory token, so a rotated release
+// changes it and the warm falls back to its own probe.
+type virtualSubtitleLayoutSeed struct {
+	cacheIdentity string
+	trackIndex    int
+	sourceCodec   string
+	verifiedAt    time.Time
 }
 
 // virtualSubtitleLayoutKey is the memo key for a plan ordinal. The identity is
@@ -4128,7 +4177,10 @@ func (h *StreamHandler) rememberVirtualSubtitleLayout(planKey string, opts playb
 // Because that registration is independent of the serve request's, the warm
 // validates it against track and the row's probed inventory before it extracts
 // anything: a rotated release either remaps onto the same-class live track (and
-// re-keys the identity to the effective ordinal) or abandons the warm.
+// re-keys the identity to the effective ordinal) or abandons the warm. When the
+// triggering serve already established that verdict for the same identity and
+// ordinal, the warm inherits it (see virtualSubtitleLayoutSeed) instead of
+// re-probing; a mismatched identity falls back to its own probe.
 
 // virtualSubtitleWarmSession returns the freshest session copy the warm gate
 // should read. The session copy on the serve request predates the latest
@@ -4197,7 +4249,7 @@ func (h *StreamHandler) virtualSubtitleWarmCancelReason(session *playback.Sessio
 	return ""
 }
 
-func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(file *models.MediaFile, track models.SubtitleTrack, session *playback.Session, opts playback.StreamExtractOpts, virtualActive bool, requestID string) {
+func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(file *models.MediaFile, track models.SubtitleTrack, session *playback.Session, opts playback.StreamExtractOpts, inherited *virtualSubtitleLayoutSeed, virtualActive bool, requestID string) {
 	if h == nil || h.SubtitleCache == nil || file == nil || session == nil || !virtualActive {
 		return
 	}
@@ -4301,40 +4353,58 @@ func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(file *models.MediaFil
 			// a second one, and the pinned provider result can rotate in
 			// between: resolving a fresh URL and then extracting the plan
 			// ordinal would commit whatever the new release happens to carry
-			// under an identity that still looks valid. One probe per warm
-			// (seconds, once) is the price of never committing unvalidated
-			// bytes, and it is far below the per-window probes the memo removes.
-			proceed, validateErr := h.verifyVirtualSubtitleLayout(warmCtx, track, planTracks, &extractOpts)
-			if !proceed {
-				// The live layout no longer carries a same-class track for this
-				// plan track. Nothing was committed (the fill is discarded on
-				// this path), and this is a deliberate abandonment rather than a
-				// source failure, so it must not arm the warm failure cooldown:
-				// the next windowed miss re-evaluates the layout itself.
-				slog.WarnContext(context.Background(), "virtual subtitle warm abandoned: live layout has no match for the planned track",
+			// under an identity that still looks valid.
+			//
+			// The triggering serve almost always established this exact
+			// verdict itself — it either probed the same pinned result and
+			// inventory token or reused a probe less than
+			// virtualSubtitleLayoutCacheTTL old, and it fails closed otherwise.
+			// Inheriting that verdict skips a second multi-second ffprobe over
+			// a slow relay; B1 still holds because the verdict is keyed by the
+			// same identity (inventory token included) and is at most the memo
+			// TTL old, exactly the trust the serve path already grants it. A
+			// warm started without an inherited verdict, or whose identity no
+			// longer matches, still probes below and fails closed on error.
+			if inherited != nil && inherited.cacheIdentity == extractOpts.CacheIdentity {
+				extractOpts.TrackIndex = inherited.trackIndex
+				extractOpts.SourceCodec = inherited.sourceCodec
+				extractOpts.CacheIdentity = virtualSubtitleCacheIdentity(file, session.VirtualSourceURI, extractOpts.TrackIndex)
+				slog.DebugContext(context.Background(), "virtual subtitle warm inherited serve layout verdict",
 					"component", "api", "file_id", file.ID,
-					"plan_codec", track.Codec, "plan_language", track.Language)
-				return playback.ErrSubtitleWarmCanceled
-			}
-			if validateErr != nil {
-				if warmCtx.Err() != nil {
-					// The abort ticker canceled the probe (seek or session end):
-					// same intentional abandonment as a canceled resolve.
+					"track", extractOpts.TrackIndex, "codec", extractOpts.SourceCodec)
+			} else {
+				proceed, validateErr := h.verifyVirtualSubtitleLayout(warmCtx, track, planTracks, &extractOpts)
+				if !proceed {
+					// The live layout no longer carries a same-class track for this
+					// plan track. Nothing was committed (the fill is discarded on
+					// this path), and this is a deliberate abandonment rather than a
+					// source failure, so it must not arm the warm failure cooldown:
+					// the next windowed miss re-evaluates the layout itself.
+					slog.WarnContext(context.Background(), "virtual subtitle warm abandoned: live layout has no match for the planned track",
+						"component", "api", "file_id", file.ID,
+						"plan_codec", track.Codec, "plan_language", track.Language)
 					return playback.ErrSubtitleWarmCanceled
 				}
-				// The live layout could not be established. Fail closed and let
-				// the cache handle it like any other warm failure, including its
-				// per-identity cooldown, rather than extract an unverified
-				// ordinal.
-				return fmt.Errorf("validate virtual subtitle warm layout: %w", validateErr)
+				if validateErr != nil {
+					if warmCtx.Err() != nil {
+						// The abort ticker canceled the probe (seek or session end):
+						// same intentional abandonment as a canceled resolve.
+						return playback.ErrSubtitleWarmCanceled
+					}
+					// The live layout could not be established. Fail closed and let
+					// the cache handle it like any other warm failure, including its
+					// per-identity cooldown, rather than extract an unverified
+					// ordinal.
+					return fmt.Errorf("validate virtual subtitle warm layout: %w", validateErr)
+				}
+				// The probe may have remapped the ordinal onto the live layout.
+				// Extract the mapped stream and keep the extraction's own identity
+				// aligned with it. The fill was reserved before the probe under the
+				// pre-probe identity, so the artifact still commits under the key
+				// the serve lookup computes for this row and ordinal; only the
+				// stream that is demuxed moves.
+				extractOpts.CacheIdentity = virtualSubtitleCacheIdentity(file, session.VirtualSourceURI, extractOpts.TrackIndex)
 			}
-			// The probe may have remapped the ordinal onto the live layout.
-			// Extract the mapped stream and keep the extraction's own identity
-			// aligned with it. The fill was reserved before the probe under the
-			// pre-probe identity, so the artifact still commits under the key
-			// the serve lookup computes for this row and ordinal; only the
-			// stream that is demuxed moves.
-			extractOpts.CacheIdentity = virtualSubtitleCacheIdentity(file, session.VirtualSourceURI, extractOpts.TrackIndex)
 			err = playback.StreamExtractSubtitle(warmCtx, extractOpts)
 			if warmCtx.Err() != nil {
 				return playback.ErrSubtitleWarmCanceled
