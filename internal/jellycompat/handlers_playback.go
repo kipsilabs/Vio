@@ -27,7 +27,6 @@ import (
 	"github.com/Silo-Server/silo-server/internal/transcodeproxy"
 
 	"github.com/go-chi/chi/v5"
-	"golang.org/x/sync/singleflight"
 
 	"github.com/Silo-Server/silo-server/internal/access"
 	"github.com/Silo-Server/silo-server/internal/catalog"
@@ -402,9 +401,6 @@ type PlaybackHandler struct {
 	// terminal-staging scrobbles; see sendCompatResumeStart, applyCompatReport,
 	// and stageCompatStop.
 	compatScrobbleLocks compatScrobbleLocks
-	// compatMoves single-flights moving a transcode off a node that stopped
-	// answering, so every request that finds the node dead waits on one move.
-	compatMoves singleflight.Group
 }
 
 func (h *PlaybackHandler) serverBitrateCap(ctx context.Context, session *Session) (int, error) {
@@ -1076,29 +1072,6 @@ func (h *PlaybackHandler) resolveCompatHLSRouteOnNodeWithPolicy(
 	excludedShapes map[string]struct{},
 	policy config.PlaybackRoutingPolicy,
 ) (noderouting.Decision, error) {
-	request, err := h.compatHLSResolveRequest(
-		ctx, session, file, source, requiredToneMapMode, requiredTranscodeURL, excludedNodes, excludedShapes, policy,
-	)
-	if err != nil {
-		return noderouting.Decision{}, err
-	}
-	return noderouting.Resolve(noderouting.AdaptSessionPlanner(h.NodePlanner), request)
-}
-
-// compatHLSResolveRequest builds the route request for a Jellyfin-compatible
-// HLS transcode: the workload, the capability filter for the frozen recipe,
-// and the proxy filter for the client's access path.
-func (h *PlaybackHandler) compatHLSResolveRequest(
-	ctx context.Context,
-	session *playback.Session,
-	file *models.MediaFile,
-	source PlaybackMediaSource,
-	requiredToneMapMode tonemap.Mode,
-	requiredTranscodeURL string,
-	excludedNodes map[string]struct{},
-	excludedShapes map[string]struct{},
-	policy config.PlaybackRoutingPolicy,
-) (noderouting.ResolveRequest, error) {
 	videoTranscode := !compatHLSCopiesVideo(source)
 	workload := noderouting.WorkloadRemux
 	delivery := noderouting.DeliveryHLSRemux
@@ -1109,7 +1082,7 @@ func (h *PlaybackHandler) compatHLSResolveRequest(
 	eligible, err := h.compatTranscodeEligibility(ctx, file, videoTranscode,
 		compatHLSRecipeSourceAudioChannels(source), requiredToneMapMode, excludedNodes, policy)
 	if err != nil {
-		return noderouting.ResolveRequest{}, err
+		return noderouting.Decision{}, err
 	}
 	if source.DVStripToHDR10 && !videoTranscode {
 		eligible, excludedShapes = h.compatDVStripRouting(ctx, eligible, excludedShapes, compatHLSRecipeSourceAudioChannels(source))
@@ -1127,7 +1100,7 @@ func (h *PlaybackHandler) compatHLSResolveRequest(
 		}
 		currentTranscodeURL = requiredTranscodeURL
 	}
-	return noderouting.ResolveRequest{
+	return noderouting.Resolve(noderouting.AdaptSessionPlanner(h.NodePlanner), noderouting.ResolveRequest{
 		Request: noderouting.Request{
 			Workload: workload, Delivery: delivery,
 			Policy: policy, ProxyAllowed: h.JWTSecret != "",
@@ -1139,7 +1112,7 @@ func (h *PlaybackHandler) compatHLSResolveRequest(
 		// path; nil on the default path, so every healthy proxy stays eligible.
 		ProxyEligible:    nodepool.ClientReachableVia(netaccess.PathFromContext(ctx), nil),
 		ExcludedShapeIDs: excludedShapes,
-	}, nil
+	})
 }
 
 func (h *PlaybackHandler) releaseCompatSessionReservation(sessionID string) {
@@ -1627,7 +1600,6 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 			compatRecipeTargetVideoMatchesSource(current.Recipe, source) &&
 			current.Recipe.SourceAudioChannels == expectedSourceAudioChannels &&
 			current.Recipe.AudioTrackIndex == expectedAudioTrackIndex &&
-			current.Recipe.RequireAudioTrack == compatRequiresAudioTrack(source) &&
 			playback.ValidateCopyFMP4RecipeCard(*current.Recipe) == nil {
 			// A drained node runs no session, so the runtime recorded on it is
 			// gone; start a fresh one instead of pinning the client to it.
@@ -1765,7 +1737,6 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 		SegmentDuration:        segmentDuration,
 		HWAccel:                h.remoteDispatchHWAccel(transcodeNodeURL),
 		AudioTrackIndex:        compatAudioTrackIndexOrDefault(source),
-		RequireAudioTrack:      compatRequiresAudioTrack(source),
 		SourceAudioChannels:    compatHLSRecipeSourceAudioChannels(source),
 		TotalDuration:          float64(source.Version.Duration),
 		RequireReady:           toneMapRecipe.mode != "",
@@ -1954,10 +1925,6 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 		h.tm.StopRemoteTranscode(upstreamSessionID, transcodeNodeURL)
 		return fmt.Errorf("%w: %w", errRemoteTranscodeStartFailed, err)
 	}
-	if err := transcodenode.ValidateCopyVideoMPEGTSAttestation(reqBody, nodeResponse); err != nil {
-		h.tm.StopRemoteTranscode(upstreamSessionID, transcodeNodeURL)
-		return fmt.Errorf("%w: %w", errRemoteTranscodeStartFailed, err)
-	}
 	if reqBody.ToneMapMode != "" && nodeResponse.ToneMapMode != reqBody.ToneMapMode {
 		h.tm.StopRemoteTranscode(upstreamSessionID, transcodeNodeURL)
 		err := errors.New("remote transcode node did not confirm tone-map mode")
@@ -2026,7 +1993,6 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 		KeyframePlaylist:       reqBody.KeyframePlaylist,
 		SegmentDuration:        reqBody.SegmentDuration,
 		AudioTrackIndex:        reqBody.AudioTrackIndex,
-		RequireAudioTrack:      reqBody.RequireAudioTrack,
 		SourceAudioChannels:    reqBody.SourceAudioChannels,
 		TargetAudioChannels:    reqBody.TargetAudioChannels,
 		TotalDuration:          reqBody.TotalDuration,
@@ -3298,20 +3264,6 @@ func compatAudioTrackIndex(source PlaybackMediaSource) (int, bool) {
 		return 0, false
 	}
 	return audioTrackIndex, true
-}
-
-// compatRequiresAudioTrack reports whether the transcode must fail rather than
-// drop the negotiated audio track when the file lacks it.
-func compatRequiresAudioTrack(source PlaybackMediaSource) bool {
-	return effectiveCompatAudioStreamIndex(source) != nil
-}
-
-// compatAudioRequirementMatches accepts a recipe written before negotiated audio
-// became mandatory, so segment requests across an API upgrade keep their
-// remote executor. A recipe may not demand audio the source no longer offers.
-// Starts compare strictly instead, so a new start replaces a legacy runtime.
-func compatAudioRequirementMatches(requireAudioTrack bool, source PlaybackMediaSource) bool {
-	return !requireAudioTrack || compatRequiresAudioTrack(source)
 }
 
 func compatAudioTrackIndexOrDefault(source PlaybackMediaSource) int {

@@ -153,10 +153,6 @@ type PlaybackMediaSource struct {
 	DefaultSubtitleStreamIndex  *int
 	SelectedSubtitleStreamIndex *int
 	ETag                        string
-	// VirtualSourceURI pins the provider-neutral candidate selected and probed
-	// during PlaybackInfo. The temporary provider URL is resolved just in time.
-	VirtualSourceURI                 string
-	VirtualSourceOwnerInstallationID int
 	// SubtitleDeliveries preserves client delivery capabilities for tracks that
 	// may be enabled later. The scalar fields above retain the selected track's
 	// delivery for sessions read by older binaries during a rolling update.
