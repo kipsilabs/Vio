@@ -788,6 +788,68 @@ func TestFallbackSubstituteProbeGatesOnTheSubstitutesOwnDeclaration(t *testing.T
 		}
 	})
 
+	t.Run("cache hit that records the first observation does not confirm itself", func(t *testing.T) {
+		scanner.ResetVirtualServedSizeSnapshots()
+		t.Cleanup(scanner.ResetVirtualServedSizeSnapshots)
+		h, saved := newFixture(t, 90*60)
+
+		// No snapshot exists yet, so the cache seam's classification records the
+		// pin's first observation and reports the hit as an observation. Gating
+		// the same bytes a second time would compare them against that
+		// just-recorded snapshot, read the recording as a confirming serve, and
+		// persist one unproven serve as the pin's identity.
+		cacheHits := 0
+		h.VirtualProbeCacheLookup = func(_ string, probeFile *models.MediaFile) *models.MediaFile {
+			cacheHits++
+			return &models.MediaFile{
+				FilePath:         probeFile.FilePath,
+				FileSize:         probeFile.FileSize,
+				ProbedFormatSize: served,
+				Duration:         90 * 60,
+				VideoTracks:      []models.VideoTrack{{Codec: "hevc", Width: 3840, Height: 2160}},
+				AudioTracks:      []models.AudioTrack{{Codec: "eac3", Channels: 6, Language: "eng"}},
+			}
+		}
+		proberCalls := 0
+		h.VirtualPlaybackSourceProber = func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
+			proberCalls++
+			return f, nil
+		}
+
+		got := run(t, h)
+		if got == nil {
+			t.Fatal("fallback returned nil, want the cached substitute served")
+		}
+		if cacheHits == 0 {
+			t.Fatal("the probe cache was never consulted")
+		}
+		if proberCalls != 0 {
+			t.Fatalf("synchronous prober calls = %d, want 0: the cache hit must skip the ffprobe", proberCalls)
+		}
+		if !got.EvidenceObservation {
+			t.Fatal("the serve that recorded the pin's first observation was served as identity")
+		}
+		if got.Provenance != ProbeProvenanceVerified {
+			t.Fatalf("provenance = %q, want %q (served with the cached inventory)",
+				got.Provenance, ProbeProvenanceVerified)
+		}
+		if got.File == nil || got.File.ProbedFormatSize != served {
+			t.Fatalf("file = %+v, want the cached bytes %d", got.File, served)
+		}
+		// The one classification that ran is the cache seam's, and it recorded
+		// the observation exactly once: the replayed bytes are the snapshot's
+		// baseline, not a second measurement that agrees with it.
+		pin := scanner.VirtualServedSizePin(substituteURI, 5)
+		observation, ok := scanner.VirtualServedSizeSnapshotFor(pin, substituteDeclared, scanner.VirtualServedSizeSubtitleToken(got.File.SubtitleTracks))
+		if !ok || observation.ObservedBytes != served {
+			t.Fatalf("recorded observation = %+v (present %v), want the served bytes %d", observation, ok, served)
+		}
+		h.StopVirtualEvidence()
+		if len(*saved) != 0 {
+			t.Fatalf("the recording cache replay persisted %+v, want no catalog write", *saved)
+		}
+	})
+
 	t.Run("mismatch is refused", func(t *testing.T) {
 		scanner.ResetVirtualServedSizeSnapshots()
 		t.Cleanup(scanner.ResetVirtualServedSizeSnapshots)

@@ -3744,7 +3744,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		// instead of inheriting the catalog value.
 		syncProbeFile.Duration = 0
 		if !substituted {
-			if cached := h.virtualProbeFromCache(attemptCtx, file, streamURL, syncProbeFile, cand, resolvedIdentity.tiers(), oid); cached != nil {
+			if cached, _ := h.virtualProbeFromCache(attemptCtx, file, streamURL, syncProbeFile, cand, resolvedIdentity.tiers(), oid); cached != nil {
 				trace.probeRan = true
 				if transient.ID > 0 {
 					cached.ID = transient.ID
@@ -4763,6 +4763,13 @@ func catalogFileIDOrZero(file *models.MediaFile) int {
 // The failure damper is cleared on a hit, exactly like the transient-timeout
 // recovery it generalizes.
 //
+// The second return value reports whether that gate classed the hit as the
+// pin's first served-size observation rather than its identity. Callers must
+// rely on it and never re-classify the served bytes themselves: the
+// classification records that observation as a side effect, so a second pass
+// would compare the hit against the snapshot the first pass just wrote, read
+// its own recording as a confirming serve, and admit bytes nothing confirmed.
+//
 // The candidate's declared audio is forwarded onto the lookup input before the
 // cache is consulted. The cache key folds in the completeness gate's
 // expected-audio signal (see virtualProbeCacheKey), and the caller's probe input
@@ -4782,14 +4789,14 @@ func (h *PlaybackHandler) virtualProbeFromCache(
 	probeCand VirtualPlaybackStream,
 	candidate resolver.PersistedIdentityTiers,
 	ownerInstallationID int,
-) *models.MediaFile {
+) (*models.MediaFile, bool) {
 	if h == nil || h.VirtualProbeCacheLookup == nil || catalogFile == nil {
-		return nil
+		return nil, false
 	}
 	forwardVirtualCandidateDeclaredAudio(&probeFile, probeCand)
 	probed := h.VirtualProbeCacheLookup(sourceURL, &probeFile)
 	if probed == nil {
-		return nil
+		return nil, false
 	}
 	expectedRuntimeMinutes := h.virtualExpectedRuntimeMinutes(ctx, catalogFile)
 	evidencePin := scanner.VirtualServedSizePin(probeCand.URI, ownerInstallationID)
@@ -4804,7 +4811,7 @@ func (h *PlaybackHandler) virtualProbeFromCache(
 		// normally below.
 		virtualProbeFailures.markSizeMismatch(virtualProbeFailureKey(probeCand.URI, ownerInstallationID), probed.ProbedFormatSize, probeFile.FileSize)
 		logVirtualProbeSizeMismatch(ctx, catalogFile.ID, probeCand.URI, probeFile.FileSize, probed.ProbedFormatSize)
-		return nil
+		return nil, false
 	}
 	if scanner.VirtualServedSizeMismatch(probeFile.FileSize, probed.ProbedFormatSize) {
 		logVirtualProbeSizeGapV3(ctx, catalogFile.ID, probeCand.URI, probeFile.FileSize, probed.ProbedFormatSize, probed.Duration, expectedRuntimeMinutes,
@@ -4820,13 +4827,14 @@ func (h *PlaybackHandler) virtualProbeFromCache(
 		probed.Duration = probeFile.Duration
 	}
 	mergeVirtualCandidateTracks(probed, probeCand)
-	if !virtualProbeEvidenceIsObservation(evidencePin, evidenceVerdict) {
+	observation := virtualProbeEvidenceIsObservation(evidencePin, evidenceVerdict)
+	if !observation {
 		// An admitted or unpinned hit is identity for this row and gets the
 		// fresh stamp. An observation is not: stamping it would let the next
 		// replay take the repeat-play fast path without the confirmation probe.
 		h.persistVirtualProbeEvidence(ctx, catalogFile, probeCand.URI, probed, candidate, true, false)
 	}
-	return probed
+	return probed, observation
 }
 
 // recoverVirtualProbeFromCache attempts a cache-only probe for a candidate the
@@ -4845,7 +4853,8 @@ func (h *PlaybackHandler) recoverVirtualProbeFromCache(
 	candidate resolver.PersistedIdentityTiers,
 	ownerInstallationID int,
 ) bool {
-	return h.virtualProbeFromCache(ctx, catalogFile, sourceURL, probeFile, probeCand, candidate, ownerInstallationID) != nil
+	probed, _ := h.virtualProbeFromCache(ctx, catalogFile, sourceURL, probeFile, probeCand, candidate, ownerInstallationID)
+	return probed != nil
 }
 
 // revalidateVirtualCandidateBackground resolves the provider URL for a
@@ -7573,20 +7582,21 @@ func (h *PlaybackHandler) resolveVirtualCandidateSource(
 	// second synchronous ffprobe. The cache key strips the provider query, so a
 	// renumbered ?result= or rotated credential still hits the same release's
 	// cached bytes evidence.
-	if cached := h.virtualProbeFromCache(ctx, file, streamURL, probeInput, candidate, resolvedSourceIdentity(&resolved).tiers(), ownerID); cached != nil {
+	if cached, cachedObservation := h.virtualProbeFromCache(ctx, file, streamURL, probeInput, candidate, resolvedSourceIdentity(&resolved).tiers(), ownerID); cached != nil {
 		resolved.File = cached
 		resolved.ProbeSucceeded = true
 		resolved.Provenance = ProbeProvenanceVerified
 		// The hit is a completed probe, not necessarily the pin's identity: the
 		// cached bytes can disagree with a served-size observation recorded since
 		// they were measured, and virtualProbeFromCache serves that case without
-		// writing. Classify the served inventory here, exactly as the fresh probe
-		// below and the shared resolve's finalization do, so the caller does not
-		// adopt and stamp bytes that only recorded an observation. A mismatch
-		// never reaches this branch: virtualProbeFromCache discards it.
-		if virtualProbeEvidenceIsObservation(evidencePin, classifyVirtualServedEvidenceV3(evidencePin, candidate.FileSize, cached, expectedRuntimeMinutes)) {
-			resolved.EvidenceObservation = true
-		}
+		// writing. Take its verdict instead of classifying the bytes again. A
+		// second classification is not a read-only check: it records the pin's
+		// first observation, so the repeat pass would compare the hit against the
+		// snapshot the first pass just wrote, read its own recording as the
+		// confirming serve, and hand the caller bytes to adopt and stamp that
+		// nothing confirmed. A mismatch never reaches this branch:
+		// virtualProbeFromCache discards it.
+		resolved.EvidenceObservation = cachedObservation
 		if err := h.virtualCandidateVerdictError(ctx, candidate.URI, file, ownerID, allowFailed); err != nil {
 			return nil, err
 		}
