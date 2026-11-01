@@ -15,6 +15,7 @@ import type {
   WatchDetail,
 } from "@/api/types";
 import { V2ProblemError, V2TransportError, v2, type V2Result } from "@/api/v2/request";
+import { apiV1 } from "@/api/client";
 import { adminTaskJobFromV2 } from "@/api/v2/adminTasks";
 import { catalogItemDetailFromV2 } from "@/api/v2/catalog";
 import { watchDetailFromV2 } from "@/api/v2/watch";

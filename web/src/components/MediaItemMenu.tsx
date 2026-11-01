@@ -1022,6 +1022,7 @@ function MediaItemMenuEngine({
   const watchlistMutation = useToggleWatchlist(contentId);
   const notInterestedMutation = useToggleNotInterested(contentId);
   const refreshMetadataMutation = useRefreshItemMetadata();
+  const deleteMediaItem = useDeleteMediaItem();
   const dismissHomeItemMutation = useDismissHomeItem();
   const currentHref = `${location.pathname}${location.search}`;
 
@@ -1031,7 +1032,8 @@ function MediaItemMenuEngine({
     watchlistMutation.isPending ||
     notInterestedMutation.isPending ||
     refreshMetadataMutation.isPending ||
-    dismissHomeItemMutation.isPending;
+    dismissHomeItemMutation.isPending ||
+    deleteMediaItem.isPending;
   const watchedPending = watchedMutation.isPending;
   const favoritePending = favoriteMutation.isPending;
   const refreshPending = refreshMetadataMutation.isPending;
