@@ -70,7 +70,45 @@ const (
 	// sfntVersionTrue is the TrueType version tag ffmpeg reports for legacy
 	// Apple fonts.
 	sfntVersionTrue = "true"
+
+	// subtitleFontProbeTimeout bounds the metadata probe that opens the source
+	// and reports attachment stream sizes before any payload is streamed.
+	subtitleFontProbeTimeout = 30 * time.Second
+	// subtitleFontDumpBaseBudget is the floor for the attachment dump. It
+	// covers process startup, the source open, and normal container overhead,
+	// and keeps the historical 30s bound for small/unknown payloads.
+	subtitleFontDumpBaseBudget = 30 * time.Second
+	// subtitleFontDumpBytesPerSecond is the conservative relay throughput the
+	// dump budget is sized against. Production relays run slower than LAN, and
+	// the old flat 30s could not stream a multi-MiB font pack at this rate.
+	subtitleFontDumpBytesPerSecond = 256 << 10 // 256 KiB/s
+	// subtitleFontDumpMaxBudget bounds the scaled dump. It stays under the
+	// detached single-flight's subtitleFontBundleExtractTimeout (5m) so a
+	// pathological pack still yields a real failure instead of outliving the
+	// flight that owns the relay registration.
+	subtitleFontDumpMaxBudget = 4 * time.Minute
 )
+
+// subtitleFontDumpBudget scales the attachment-dump deadline with the payload
+// the probe reported. A small or unknown pack keeps the 30s floor; a multi-MiB
+// pack gets enough time to stream at a conservative relay rate, capped so the
+// extraction always settles inside the detached single-flight budget.
+func subtitleFontDumpBudget(streams []attachmentProbeStream) time.Duration {
+	var total int64
+	for _, stream := range streams {
+		if stream.ExtraDataSize > 0 {
+			total += stream.ExtraDataSize
+		}
+	}
+	budget := subtitleFontDumpBaseBudget
+	if total >= subtitleFontDumpBytesPerSecond {
+		budget += time.Duration(total/subtitleFontDumpBytesPerSecond) * time.Second
+	}
+	if budget > subtitleFontDumpMaxBudget {
+		return subtitleFontDumpMaxBudget
+	}
+	return budget
+}
 
 // SubtitleFontAttachment is a font attached to a media container for ASS/SSA
 // subtitle rendering.
@@ -154,14 +192,14 @@ func ExtractAttachedSubtitleFont(ctx context.Context, inputPath, ffmpegPath stri
 }
 
 func extractAttachedSubtitleFonts(ctx context.Context, inputPath, ffmpegPath string, index *int, maxBytes int64) ([]SubtitleFontAttachment, error) {
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
 	if strings.TrimSpace(inputPath) == "" {
 		return nil, fmt.Errorf("subtitle fonts: input path is required")
 	}
 
 	probePath := ffprobePathFromFFmpeg(ffmpegPath)
-	streams, err := probeFontAttachmentStreams(ctx, inputPath, probePath)
+	probeCtx, cancelProbe := context.WithTimeout(ctx, subtitleFontProbeTimeout)
+	streams, err := probeFontAttachmentStreams(probeCtx, inputPath, probePath)
+	cancelProbe()
 	if err != nil {
 		return nil, err
 	}
@@ -180,6 +218,13 @@ func extractAttachedSubtitleFonts(ctx context.Context, inputPath, ffmpegPath str
 		selectedName = safeAttachmentDisplayName(streams[selected], fmt.Sprintf("attachment-%d%s", selected, fontAttachmentExt(streams[selected])))
 		streams = streams[selected : selected+1]
 	}
+
+	// The probe above reports each attachment's payload size, so the streaming
+	// phase can be budgeted for the bytes it actually has to move. Keep the
+	// caller's deadline (context.WithTimeout inherits an earlier one).
+	dumpCtx, cancelDump := context.WithTimeout(ctx, subtitleFontDumpBudget(streams))
+	defer cancelDump()
+	ctx = dumpCtx
 
 	bin := ffmpegPath
 	if strings.TrimSpace(bin) == "" {

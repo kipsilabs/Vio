@@ -310,6 +310,25 @@ func fontExtractFailureKey(fileID, trackIndex int) string {
 	return strconv.Itoa(fileID) + ":" + strconv.Itoa(trackIndex)
 }
 
+// logFontBundleExtractFailure records an on-demand font extraction failure.
+// The extraction runs detached and often outlives the request that started it:
+// the client receives a pending bundle and polls again, so the request-side
+// error handling never sees the cause. Reporting from the extraction closure
+// keeps a slow-relay dump failure visible at warn (throttled per file+track)
+// instead of leaving only the cache backoff's debug line.
+func (h *StreamHandler) logFontBundleExtractFailure(ctx context.Context, file *models.MediaFile, trackIndex int, err error) {
+	if h == nil || file == nil || err == nil || errors.Is(err, errVirtualFontResolve) {
+		// Provider resolution has its own log path in the callers; logging it
+		// here too would double every relay failure.
+		return
+	}
+	h.fontExtractFailures.failed(ctx, fontExtractFailureKey(file.ID, trackIndex),
+		"file_id", file.ID,
+		"track", trackIndex,
+		"error", err,
+	)
+}
+
 // logSubtitleFontInternalError records the cause behind the font route's
 // internal_error returns. Neither the session-load nor the source-preflight
 // failure used to log anything, so a client that retried a broken font URL
@@ -3206,6 +3225,7 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 
 		fonts, extractErr := playback.ExtractAttachedSubtitleFonts(extractCtx, inputPath, h.ffmpegPath())
 		if extractErr != nil {
+			h.logFontBundleExtractFailure(extractCtx, file, trackIndex, extractErr)
 			return nil, extractErr
 		}
 		return json.Marshal(playback.EncodeSubtitleFontBundle(fonts))

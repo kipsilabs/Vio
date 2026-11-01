@@ -91,6 +91,38 @@ done
 	}
 }
 
+// The dump budget must follow the payload the probe reported: a flat 30s can
+// never stream a multi-MiB font pack from a slow relay, which is why bundles
+// stayed pending forever. Small/unknown packs keep the floor; large ones scale
+// at a conservative rate and stop at the ceiling that fits the detached flight.
+func TestSubtitleFontDumpBudgetScalesWithProbedPayload(t *testing.T) {
+	if got := subtitleFontDumpBudget(nil); got != subtitleFontDumpBaseBudget {
+		t.Fatalf("empty payload budget = %s, want floor %s", got, subtitleFontDumpBaseBudget)
+	}
+	small := []attachmentProbeStream{{ExtraDataSize: 4}, {ExtraDataSize: 0}}
+	if got := subtitleFontDumpBudget(small); got != subtitleFontDumpBaseBudget {
+		t.Fatalf("small payload budget = %s, want floor %s", got, subtitleFontDumpBaseBudget)
+	}
+
+	medium := []attachmentProbeStream{
+		{ExtraDataSize: 4 << 20},
+		{ExtraDataSize: 4 << 20},
+	}
+	wantMedium := subtitleFontDumpBaseBudget +
+		time.Duration(8<<20)*time.Second/subtitleFontDumpBytesPerSecond
+	if got := subtitleFontDumpBudget(medium); got != wantMedium {
+		t.Fatalf("8 MiB payload budget = %s, want %s", got, wantMedium)
+	}
+	if wantMedium <= subtitleFontDumpBaseBudget {
+		t.Fatalf("8 MiB budget %s did not exceed the floor %s", wantMedium, subtitleFontDumpBaseBudget)
+	}
+
+	huge := []attachmentProbeStream{{ExtraDataSize: int64(subtitleFontDumpMaxBudget/time.Second) * int64(subtitleFontDumpBytesPerSecond) * 2}}
+	if got := subtitleFontDumpBudget(huge); got != subtitleFontDumpMaxBudget {
+		t.Fatalf("pathological payload budget = %s, want ceiling %s", got, subtitleFontDumpMaxBudget)
+	}
+}
+
 func containsSeq(argv []string, a, b string) bool {
 	for i := 0; i+1 < len(argv); i++ {
 		if argv[i] == a && argv[i+1] == b {
