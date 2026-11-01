@@ -971,8 +971,12 @@ func validateToneMapOpts(opts TranscodeOpts) error {
 	case tonemap.ModeHardware:
 		switch opts.HWAccel {
 		case transcodeHWQSV:
-			if opts.ToneMapFilter != tonemap.HardwareFilterOpenCL {
-				return fmt.Errorf("unsupported qsv tone-map filter %q", opts.ToneMapFilter)
+			expected := tonemap.HardwareFilterOpenCL
+			// The opt-in VPP tone map is a validated QSV alternative to the
+			// default OpenCL recipe (playback.transcode_vpp_tone_map_enabled).
+			vppOverride := opts.HWAccel == transcodeHWQSV && opts.ToneMapFilter == tonemap.HardwareFilterQSVVPP
+			if opts.ToneMapFilter != expected && !vppOverride {
+				return fmt.Errorf("unsupported %s tone-map filter %q", opts.HWAccel, opts.ToneMapFilter)
 			}
 		case transcodeHWVAAPI:
 			// The probe picks tonemap_opencl on Intel GPUs, whose own VAAPI
@@ -1904,8 +1908,13 @@ func toneMapScaleFilter(opts TranscodeOpts) string {
 	case tonemap.ModeHardware:
 		switch opts.HWAccel {
 		case transcodeHWQSV:
-			height, _ := scaleTargetHeight(opts.TargetResolution)
-			return softwareToneMapUploadFilter(opts) + tonemap.IntelFilter(opts.ToneMapSourceKind, height) + "," + tonemap.QSVInteropFilter() + "," + tonemap.HDRMetadataRemovalFilter()
+			if opts.ToneMapFilter == tonemap.HardwareFilterQSVVPP {
+				return softwareToneMapUploadFilter(opts) + tonemap.QSVVPPToneMapFilter(opts.ToneMapSourceKind) + "," + qsvVPPInputScaleFilter(opts.TargetResolution) + "," + tonemap.HDRMetadataRemovalFilter()
+			}
+			// The OpenCL tone map is unchanged; only its tail moves. The result
+			// maps directly to QSV and scaling runs on the media engine, which
+			// drops the VAAPI scale and one device hop without touching quality.
+			return softwareToneMapUploadFilter(opts) + tonemap.QSVVPPTailFilter(opts.ToneMapSourceKind) + "," + qsvVPPInputScaleFilter(opts.TargetResolution) + "," + tonemap.HDRMetadataRemovalFilter()
 		case transcodeHWVAAPI:
 			if vaapiOpenCLToneMap(opts) {
 				height, _ := scaleTargetHeight(opts.TargetResolution)

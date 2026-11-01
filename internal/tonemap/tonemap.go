@@ -788,6 +788,46 @@ func IntelOpenCLReturnFilter() string {
 	return "hwmap=derive_device=vaapi:mode=write:reverse=1:extra_hw_frames=16,format=vaapi"
 }
 
+// QSVVPPTailFilter is QSVFilter with a shorter device tail: the OpenCL
+// tone-map result is mapped straight to the QSV device instead of detouring
+// back through a VAAPI surface. The subsequent vpp_qsv scale runs on the media
+// engine, so one interop hop and the shader-based VAAPI scale disappear while
+// the tone-map stage itself is byte-for-byte the validated OpenCL recipe.
+func QSVVPPTailFilter(kind SourceKind) string {
+	if IsSDRSource(kind) {
+		return VAAPIFilter(kind) + "," + qsvWriteMapFilter()
+	}
+	return SourceParameters(kind) +
+		",scale_vaapi=format=p010" +
+		",hwmap=derive_device=opencl:mode=read" +
+		"," + openCLToneMapFilter(kind) +
+		"," + qsvWriteMapFilter()
+}
+
+// qsvWriteMapFilter derives the QSV device from the current hardware frames
+// with write access. reverse=1 and extra_hw_frames=16 are required for the
+// mapping to own its output surfaces.
+func qsvWriteMapFilter() string {
+	return "hwmap=derive_device=qsv:mode=write:reverse=1:extra_hw_frames=16,format=qsv"
+}
+
+// QSVVPPToneMapFilter builds the opt-in Intel media-engine HDR-to-SDR
+// conversion: VAAPI-decoded frames are mapped to QSV and converted by
+// vpp_qsv's hardware tonemapper. It replaces the OpenCL chain only when an
+// administrator enables playback.transcode_vpp_tone_map_enabled, because VPP
+// tone mapping is cheaper but not quality-identical to the OpenCL BT.2390
+// recipe. SDR base layers need no luminance mapping and keep the VAAPI color
+// conversion.
+func QSVVPPToneMapFilter(kind SourceKind) string {
+	if IsSDRSource(kind) {
+		return VAAPIFilter(kind) + "," + qsvWriteMapFilter()
+	}
+	return SourceParameters(kind) +
+		",scale_vaapi=format=p010" +
+		",hwmap=derive_device=qsv:mode=read+write,format=qsv" +
+		"," + HardwareFilterQSVVPP + "=tonemap=1:format=nv12:out_color_matrix=bt709:out_color_primaries=bt709:out_color_transfer=bt709:out_range=tv"
+}
+
 // toneMapPeakOption pins the source peak tonemapx and tonemap_opencl map to
 // SDR at 1000 nits (the option counts in tens of nits), so every source
 // converts on the same curve. Left unset, both filters read a Dolby Vision
