@@ -134,8 +134,19 @@ func (f *fallbackInventoryFixture) run(t *testing.T, sessionID string) *playback
 }
 
 func hasAudioUnavailableWarning(plan *playback.PlanV3) bool {
+	return hasDegradationWarningCode(plan, playback.DegradationWarningAudioTrackUnavailableV3)
+}
+
+func hasAudioUnverifiedWarning(plan *playback.PlanV3) bool {
+	return hasDegradationWarningCode(plan, playback.DegradationWarningAudioTrackUnverifiedV3)
+}
+
+func hasDegradationWarningCode(plan *playback.PlanV3, code string) bool {
+	if plan == nil {
+		return false
+	}
 	for _, warning := range plan.DegradationWarnings {
-		if warning.Code == playback.DegradationWarningAudioTrackUnavailableV3 {
+		if warning.Code == code {
 			return true
 		}
 	}
@@ -196,6 +207,12 @@ func TestCrossReleaseFallbackPrefersProbedSiblingOverUnprobedHop(t *testing.T) {
 // When only unprobed candidates remain the walk still tries them, but unknown
 // inventory is not evidence that the viewer's selection is absent: the
 // requested ordinals stay pending instead of being reset to the defaults.
+//
+// A pending audio ordinal is passed into the encode with a `?` map suffix, so an
+// ordinal the replacement does not have produces a session with no audio while
+// the client still shows the track active. The committed fallback must therefore
+// report audio_track_unverified: the plan cannot leave the viewer with silent
+// playback and no signal.
 func TestCrossReleaseFallbackKeepsSelectionsPendingOnUnprobedReplacement(t *testing.T) {
 	f := newFallbackInventoryFixture(t, "fallback-unprobed-pending")
 	f.withSiblings(t, nil)
@@ -225,8 +242,13 @@ func TestCrossReleaseFallbackKeepsSelectionsPendingOnUnprobedReplacement(t *test
 	if f.started[0].SubtitleBurnIn {
 		t.Fatal("burn-in stayed on for an unverified subtitle ordinal")
 	}
+	if !hasAudioUnverifiedWarning(plan) {
+		t.Fatalf("a pending audio ordinal committed without a signal (warnings: %+v)", plan.DegradationWarnings)
+	}
+	// The pending outcome is not the known-mismatch degradation: no default
+	// track is promised, so the unavailable-audio warning would misdescribe it.
 	if hasAudioUnavailableWarning(plan) {
-		t.Fatal("unknown inventory claimed the audio selection was unavailable")
+		t.Fatalf("unknown inventory claimed the default audio track plays (warnings: %+v)", plan.DegradationWarnings)
 	}
 }
 
@@ -257,5 +279,8 @@ func TestCrossReleaseFallbackKnownMismatchStillDegrades(t *testing.T) {
 	}
 	if !hasAudioUnavailableWarning(plan) {
 		t.Fatal("a known audio mismatch did not report the unavailable-audio warning")
+	}
+	if hasAudioUnverifiedWarning(plan) {
+		t.Fatalf("a measured mismatch claimed the audio inventory was unknown (warnings: %+v)", plan.DegradationWarnings)
 	}
 }

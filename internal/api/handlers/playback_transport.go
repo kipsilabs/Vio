@@ -568,7 +568,10 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 			// warned (and the plan keeps the requested identity for the client).
 			// An UNKNOWN replacement keeps the requested ordinal pending: the
 			// index is not evidence of a mismatch, and resetting it would lose a
-			// selection the next probe may prove.
+			// selection the next probe may prove. The pending ordinal is not
+			// proven to exist either — an out-of-range index maps no audio
+			// stream and the HLS session starts silent — so a committed pending
+			// carry is reported on the plan too (audio_track_unverified).
 			var remappedAudioIndex int
 			remappedAudioIndex, audioCarry = fallbackAudioSelectionV3(file, inventory, opts.AudioTrackIndex)
 			attemptOpts.AudioTrackIndex = remappedAudioIndex
@@ -612,13 +615,12 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 			_, readyErr := session.WaitForManifestContext(startupCtx, playback.ManifestStartupTimeout)
 			addTransportPhaseDurationV3(ctx, transportPhaseManifestV3, time.Since(manifestStart))
 			if readyErr == nil {
-				// A fallback that could not carry the viewer's audio is now the
-				// committed transport. Record the degradation on the plan so the
-				// client learns it is hearing the replacement's default track
-				// while the plan keeps naming the requested one.
-				if audioCarry == fallbackAudioCarryDegraded {
-					appendCrossReleaseAudioFallbackWarningV3(startupCtx)
-				}
+				// A fallback whose audio carry could not be proven is now the
+				// committed transport. Record the outcome on the plan so the
+				// client learns that what it hears may not be — or on an
+				// unprobed replacement, may not include — the track the plan
+				// keeps naming.
+				appendCrossReleaseAudioFallbackWarningV3(startupCtx, audioCarry)
 				winningURI := resolvedMedia.URI
 				if winningURI == "" || winningURI == neutralPath {
 					if resolvedMedia.CandidateID != "" {
@@ -772,18 +774,39 @@ func withCrossReleaseAudioPlanV3(ctx context.Context, plan *playback.PlanV3) con
 	return context.WithValue(ctx, crossReleaseAudioPlanKeyV3{}, &crossReleaseAudioPlanV3{plan: plan})
 }
 
-// appendCrossReleaseAudioFallbackWarningV3 reports a committed fallback that
-// could not carry the requested audio. It is a no-op when no plan is attached
-// (a direct transport test or a non-plan start).
-func appendCrossReleaseAudioFallbackWarningV3(ctx context.Context) {
+// appendCrossReleaseAudioFallbackWarningV3 reports on the plan how a committed
+// cross-release fallback left the viewer's audio selection.
+//
+// A degraded carry is documented as audio_track_unavailable: the replacement
+// has measured inventory, the requested track is not on it, and its default
+// plays. A pending carry is reported too, with a distinct code: the replacement
+// was never probed, so the requested ordinal goes into the encode untouched and
+// `-map 0:a:N?` matches nothing when it falls outside the file. That outcome is
+// silent HLS audio absence while the client still shows the track as active, so
+// it cannot be committed without a signal. It is not audio_track_unavailable:
+// that code promises the default track plays, which is exactly what a pending
+// ordinal does not do.
+//
+// It is a no-op when no plan is attached (a direct transport test or a
+// non-plan start) and for the carries that need no report.
+func appendCrossReleaseAudioFallbackWarningV3(ctx context.Context, carry fallbackAudioCarryV3) {
 	if ctx == nil {
+		return
+	}
+	var warning playback.DegradationWarningV3
+	switch carry {
+	case fallbackAudioCarryDegraded:
+		warning = playback.AudioTrackUnavailableWarningV3()
+	case fallbackAudioCarryPending:
+		warning = playback.AudioTrackUnverifiedWarningV3()
+	default:
 		return
 	}
 	carrier, ok := ctx.Value(crossReleaseAudioPlanKeyV3{}).(*crossReleaseAudioPlanV3)
 	if !ok || carrier == nil || carrier.plan == nil {
 		return
 	}
-	carrier.plan.DegradationWarnings = append(carrier.plan.DegradationWarnings, playback.AudioTrackUnavailableWarningV3())
+	carrier.plan.DegradationWarnings = append(carrier.plan.DegradationWarnings, warning)
 }
 
 // fallbackAudioCarryV3 classifies the outcome of carrying the pinned release's
@@ -805,7 +828,11 @@ const (
 	// fallbackAudioCarryPending means the replacement's inventory is unknown, so
 	// the requested ordinal is kept pending instead of being reset or remapped.
 	// Nothing is claimed about what the viewer will hear; a later probe owns the
-	// recovery.
+	// recovery. The ordinal is not proven to name a stream on the replacement
+	// either: the transport maps it with a `?` suffix, so an ordinal past the
+	// replacement's audio streams yields a session with no audio. The caller
+	// must therefore report a committed pending carry on the plan rather than
+	// let it stay silent.
 	fallbackAudioCarryPending
 )
 

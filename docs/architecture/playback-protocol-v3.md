@@ -1815,6 +1815,7 @@ The plan will play, but something the user might notice was given up.
 | `bandwidth_cap_applied` | `bandwidth_cap_kbps` limited the selection |
 | `evidence_insufficient_for_direct` | Evidence tier blocked a direct route |
 | `audio_track_unavailable` | The selected audio track is not on the effective file; its default track plays |
+| `audio_track_unverified` | The effective file's audio inventory could not be measured (a cross-release fallback onto an unprobed replacement). The selected ordinal is passed through unverified: it may name another stream, or none, in which case playback has no audio |
 | `subtitle_track_unavailable` | The selected subtitle has no equivalent on the effective file, or is on it but cannot be shown there; playback continues with subtitles off. `message` says which |
 
 ### 7.3 Terminal reasons

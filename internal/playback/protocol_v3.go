@@ -203,6 +203,12 @@ const (
 	// A carried-over audio selection is not on the effective file, so the plan
 	// plays the file's default audio track instead of refusing to start.
 	DegradationWarningAudioTrackUnavailableV3 = "audio_track_unavailable"
+	// A carried-over audio selection survived a virtual fallback onto a
+	// replacement whose audio inventory could not be probed. The requested
+	// ordinal is passed to the transport unchanged, so the stream may be the
+	// selected one, the container default, or nothing at all. Distinct from
+	// audio_track_unavailable, which asserts the file's default plays.
+	DegradationWarningAudioTrackUnverifiedV3 = "audio_track_unverified"
 	// A carried-over subtitle selection has no equivalent on the effective
 	// file, so the plan starts with subtitles off instead of refusing to start.
 	DegradationWarningSubtitleTrackUnavailableV3 = "subtitle_track_unavailable"
@@ -218,6 +224,16 @@ const (
 // the file's default track.
 func AudioTrackUnavailableWarningV3() DegradationWarningV3 {
 	return DegradationWarningV3{Code: DegradationWarningAudioTrackUnavailableV3, Message: "The selected audio track is not on this file; playing its default instead."}
+}
+
+// AudioTrackUnverifiedWarningV3 reports an audio selection carried onto a
+// replacement whose audio inventory could not be measured. Nothing about the
+// requested ordinal is known: it may name the selected track, may fall outside
+// the replacement's audio streams (leaving the session without audio), or may
+// name an unrelated one. The warning exists because no other signal tells the
+// viewer, and the client still shows the requested track as active.
+func AudioTrackUnverifiedWarningV3() DegradationWarningV3 {
+	return DegradationWarningV3{Code: DegradationWarningAudioTrackUnverifiedV3, Message: "The selected audio track could not be verified on this file; playback may have no audio."}
 }
 
 // SubtitleTrackUnavailableWarningV3 reports a subtitle selection that was
