@@ -1006,6 +1006,32 @@ func (r ReplanRequestV3) EffectiveOperation() ReplanOperationV3 {
 	return r.Operation
 }
 
+type PlaybackInventoryV3 struct {
+	SessionID         string                    `json:"session_id"`
+	InventoryRevision string                    `json:"inventory_revision"`
+	InventoryStatus   string                    `json:"inventory_status"`
+	AudioTracks       []AudioInventoryItemV3    `json:"audio_tracks"`
+	SubtitleInventory []SubtitleInventoryItemV3 `json:"subtitle_inventory"`
+}
+
+type AudioInventoryItemV3 struct {
+	Index          int      `json:"index,omitempty"`
+	Title          string   `json:"title,omitempty"`
+	EmbeddedTitle  string   `json:"embedded_title,omitempty"`
+	Language       string   `json:"language,omitempty"`
+	Languages      []string `json:"languages,omitempty"`
+	Codec          string   `json:"codec,omitempty"`
+	Profile        string   `json:"profile,omitempty"`
+	Layout         string   `json:"layout,omitempty"`
+	Channels       int      `json:"channels,omitempty"`
+	Bitrate        int      `json:"bitrate,omitempty"`
+	SampleRate     int      `json:"sample_rate,omitempty"`
+	BitDepth       int      `json:"bit_depth,omitempty"`
+	Default        bool     `json:"default"`
+	TrackID        string   `json:"track_id"`
+	SelectionIndex int      `json:"selection_index"`
+}
+
 type RouteEventV3 struct {
 	ProtocolVersion       int               `json:"protocol_version"`
 	PlaybackAttemptID     string            `json:"playback_attempt_id"`

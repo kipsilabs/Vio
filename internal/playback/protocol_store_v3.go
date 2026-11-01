@@ -139,6 +139,39 @@ type ProgressStoreV3 interface {
 	ClaimStopFinalization(ctx context.Context, sessionID string, leaseUntil time.Time) (bool, error)
 }
 
+type RecoveryStateV3 struct {
+	Exclusions []RecoveryExclusionV3 `json:"exclusions,omitempty"`
+}
+
+type RecoveryExclusionV3 struct {
+	ProviderSource string    `json:"provider_source,omitempty"`
+	CandidateID    string    `json:"candidate_id"`
+	ReleaseID      string    `json:"release_id,omitempty"`
+	FileID         int       `json:"file_id,omitempty"`
+	ConfirmedAt    time.Time `json:"confirmed_at,omitempty"`
+}
+
+type AudioReconcileLedgerV3 struct {
+	Entries  []AudioReconcileEntryV3 `json:"entries,omitempty"`
+	Revision int64                   `json:"revision,omitempty"`
+}
+
+type AudioReconcileDecisionV3 string
+
+const (
+	AudioReconcileReplanned AudioReconcileDecisionV3 = "replanned"
+	AudioReconcileNoop      AudioReconcileDecisionV3 = "noop"
+	AudioReconcileRefused   AudioReconcileDecisionV3 = "refused"
+)
+
+type AudioReconcileEntryV3 struct {
+	Generation    string                   `json:"generation"`
+	Decision      AudioReconcileDecisionV3 `json:"decision"`
+	AudioIndex    *int                     `json:"audio_index,omitempty"`
+	Request       *ReplanRequestV3         `json:"request,omitempty"`
+	RequestDigest string                   `json:"request_digest,omitempty"`
+}
+
 type AttemptRecordV3 struct {
 	PlaybackAttemptID      string
 	SessionID              string
