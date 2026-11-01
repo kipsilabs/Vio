@@ -8,7 +8,9 @@
 FROM node:24-slim AS jellyfin_web_node
 
 # Stage 1: Build frontend
-FROM node:24-slim AS frontend
+FROM node:22.23.2-slim AS node-base
+
+FROM node-base AS frontend
 RUN corepack enable && corepack prepare pnpm@10.32.1 --activate
 WORKDIR /app/web
 COPY web/package.json web/pnpm-lock.yaml ./
@@ -62,7 +64,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 # trusted-linux-build.yml) so every image picks up Debian security updates; the
 # upgrade covers packages already in the base image between Debian's refreshes
 # of the trixie-slim tag.
-FROM debian:trixie-slim AS runtime
+FROM debian:trixie-20251020-slim
 ARG TARGETARCH
 ARG INTEL_GMMLIB_VERSION=22.10.0
 ARG INTEL_IGC_VERSION=2.34.4

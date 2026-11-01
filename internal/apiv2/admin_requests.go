@@ -150,7 +150,7 @@ type AdminRequestOptionsInput struct {
 	Body struct {
 		Name           string         `json:"name,omitempty"`
 		CapabilityID   string         `json:"capability_id,omitempty"`
-		InstallationID *ID            `json:"installation_id,omitempty" pattern:"^[1-9][0-9]*$"`
+		InstallationID *ID            `json:"installation_id,omitempty" pattern:"^(0|[1-9][0-9]*)$"`
 		BaseURL        *string        `json:"base_url,omitempty" doc:"Service base URL; a host[:port] without a scheme gets http://, and empty clears it; not validated as a URI"`
 		APIKey         string         `json:"api_key_ref,omitempty" writeOnly:"true"`
 		PluginConfig   map[string]any `json:"plugin_config,omitempty"`
