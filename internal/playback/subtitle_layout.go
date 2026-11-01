@@ -215,9 +215,9 @@ func ProbeSubtitleLayout(ctx context.Context, ffprobePathOrFFmpeg, inputURL stri
 func probeSubtitleBin(ffprobePathOrFFmpeg string) string {
 	raw := strings.TrimSpace(ffprobePathOrFFmpeg)
 	if raw == "" {
-		return "ffprobe"
+		return ffprobeBinary
 	}
-	if strings.Contains(strings.ToLower(filepath.Base(raw)), "ffprobe") {
+	if strings.Contains(strings.ToLower(filepath.Base(raw)), ffprobeBinary) {
 		return raw
 	}
 	return ffprobePathFromFFmpeg(raw)
