@@ -13,11 +13,17 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"go.opentelemetry.io/otel/trace"
+
+	"github.com/Silo-Server/silo-server/internal/wsconn"
 )
 
 const wsKeepAlive = "KeepAlive"
 
-var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+// wsMaxClientMessageBytes bounds one client message, on the wire and after
+// decompression.
+const wsMaxClientMessageBytes = 64 * 1024
+
+var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }, EnableCompression: true}
 
 // wsMessage is one socket frame. Jellyfin stamps every outbound message with
 // a fresh MessageId, and jellyfin-sdk-kotlin rejects messages without one.
@@ -143,7 +149,7 @@ func serveCompatSocketWithNotices(w http.ResponseWriter, r *http.Request, valida
 		"device_id", r.URL.Query().Get("deviceId"),
 	)
 	checkCtx := trace.ContextWithSpanContext(r.Context(), trace.SpanContext{})
-	conn.SetReadLimit(64 * 1024)
+	conn.SetReadLimit(wsMaxClientMessageBytes)
 	done := make(chan struct{})
 	defer close(done)
 	messages := make(chan wsMessage, 1)
@@ -152,7 +158,7 @@ func serveCompatSocketWithNotices(w http.ResponseWriter, r *http.Request, valida
 		defer close(readDone)
 		for {
 			var msg wsMessage
-			if err := conn.ReadJSON(&msg); err != nil {
+			if err := wsconn.ReadJSON(conn, &msg, wsMaxClientMessageBytes); err != nil {
 				return
 
 			}

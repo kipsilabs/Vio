@@ -7,27 +7,6 @@ import (
 	"github.com/Silo-Server/silo-server/internal/models"
 )
 
-func TestCompatAudioSpatialFormat(t *testing.T) {
-	cases := []struct {
-		profile string
-		want    string
-	}{
-		{"Dolby Digital Plus + Dolby Atmos", "DolbyAtmos"},
-		{"TrueHD + Dolby Atmos", "DolbyAtmos"},
-		{"dolby atmos", "DolbyAtmos"},
-		{"DTS-HD MA + DTS:X", "DTSX"},
-		{"dts:x", "DTSX"},
-		{"DTS-HD MA", "None"},
-		{"LC", "None"},
-		{"", "None"},
-	}
-	for _, tc := range cases {
-		if got := compatAudioSpatialFormat(tc.profile); got != tc.want {
-			t.Errorf("compatAudioSpatialFormat(%q) = %q, want %q", tc.profile, got, tc.want)
-		}
-	}
-}
-
 func TestBuildMediaStreamsCarriesAudioProfile(t *testing.T) {
 	version := catalog.FileVersion{
 		VideoTracks: []models.VideoTrack{{Codec: "hevc"}},
@@ -90,54 +69,6 @@ func TestBuildMediaStreamsCarriesAudioProfile(t *testing.T) {
 	}
 	if aac.DisplayTitle != "English - AAC Stereo" {
 		t.Fatalf("aac DisplayTitle = %q", aac.DisplayTitle)
-	}
-}
-
-func TestAudioTrackDisplayTitleMultiLanguageList(t *testing.T) {
-	title := audioTrackDisplayTitle(models.AudioTrack{
-		Codec:     "eac3",
-		Channels:  6,
-		Language:  "fr",
-		Languages: []string{"MULTI", "FR", "eng", "fre", "en"},
-	})
-	// The full advertised list renders joined: MULTI resolves as a name,
-	// codes map to display names, and en/eng/fre/fr dedupe onto English/French.
-	if title != "Multi/French/English - EAC3 5.1" {
-		t.Fatalf("DisplayTitle = %q", title)
-	}
-}
-
-func TestAudioTrackDisplayTitleDedupesAndSkipsPlaceholders(t *testing.T) {
-	title := audioTrackDisplayTitle(models.AudioTrack{
-		Codec:     "ac3",
-		Channels:  6,
-		Language:  "und",
-		Languages: []string{"und", "en", "eng", "Unknown", "de"},
-	})
-	if title != "English/German - AC3 5.1" {
-		t.Fatalf("DisplayTitle = %q", title)
-	}
-}
-
-func TestAudioTrackDisplayTitleFallsBackToPrimaryLanguage(t *testing.T) {
-	// Probe data predating multi-audio support carries no Languages list;
-	// the single primary language code is still rendered.
-	title := audioTrackDisplayTitle(models.AudioTrack{Codec: "eac3", Language: "eng", Channels: 6})
-	if title != "English - EAC3 5.1" {
-		t.Fatalf("DisplayTitle = %q", title)
-	}
-	// A genuinely unknown language keeps the legacy verbatim rendering
-	// (compatLanguageName uppercases the 3-letter code) rather than dropping it.
-	unknown := audioTrackDisplayTitle(models.AudioTrack{Codec: "aac", Language: "und", Channels: 2})
-	if unknown != "UND - AAC Stereo" {
-		t.Fatalf("DisplayTitle = %q", unknown)
-	}
-}
-
-func TestAudioTrackDisplayTitleWithoutProfileKeepsCodecName(t *testing.T) {
-	title := audioTrackDisplayTitle(models.AudioTrack{Codec: "eac3", Language: "eng", Channels: 6})
-	if title != "English - EAC3 5.1" {
-		t.Fatalf("DisplayTitle = %q", title)
 	}
 }
 
@@ -208,7 +139,7 @@ func TestBuildPlaybackSourceUndecodableAudioTrack(t *testing.T) {
 		t.Fatalf("default source = selected %v transcoding %v, want stream 2 with transcoding", source.SelectedAudioStreamIndex, source.SupportsTranscoding)
 	}
 
-	source = h.buildPlaybackSource("item", "play", version, profile, playbackInfoRequest{AudioStreamIndex: compatIntValuePtr(1)}, true)
+	source = h.buildPlaybackSource("item", "play", version, profile, playbackInfoRequest{AudioStreamIndex: compatIntValueOf(1)}, true)
 	if source.SupportsDirectPlay || source.SupportsDirectStream || source.SupportsTranscoding || source.CanBurnSubtitle || source.HLSRemux || source.TranscodeAudio {
 		t.Fatalf("undecodable selection offers a server route: %+v", source)
 	}

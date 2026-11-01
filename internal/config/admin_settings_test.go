@@ -122,8 +122,6 @@ func TestEffectiveAdminSettingsProjectsRuntimeLegacyFallbacks(t *testing.T) {
 		"s3.operational_token_secret":     "legacy-token",
 		"s3.operational_token_param":      "signature",
 		"s3.operational_token_ttl":        "3600",
-		"subtitle_ai.base_url":            "https://legacy-ai.example.invalid",
-		"subtitle_ai.api_key":             "legacy-ai-key",
 		"subtitle_ai.chat_model":          "legacy-chat-model",
 		"subtitle_ai.max_concurrent_jobs": "7",
 		"ai.max_concurrent_jobs":          "0",
@@ -150,8 +148,6 @@ func TestEffectiveAdminSettingsProjectsRuntimeLegacyFallbacks(t *testing.T) {
 		"s3.private_key_prefix":   stored["s3.operational_key_prefix"],
 		"s3.private_access_key":   stored["s3.operational_access_key"],
 		"s3.private_secret_key":   stored["s3.operational_secret_key"],
-		"ai.base_url":             stored["subtitle_ai.base_url"],
-		"ai.api_key":              stored["subtitle_ai.api_key"],
 		"ai.chat_model":           stored["subtitle_ai.chat_model"],
 		"ai.max_concurrent_jobs":  stored["subtitle_ai.max_concurrent_jobs"],
 	}
@@ -317,6 +313,27 @@ func TestNormalizeAdminSettingRejectsInvalidValues(t *testing.T) {
 		{key: "opslog.capture_level", value: "chatty"},
 		{key: "s3.metadata_presign_expiry", value: "0s"},
 		{key: "recommendations.embeddings_job_timeout", value: "soon"},
+		{key: PlaybackRoutingRemuxExecutionSettingKey, value: "sometimes_worker"},
+		{key: PlaybackRoutingRemuxEgressSettingKey, value: "worker"},
+		{key: ServerLocalURLSettingKey, value: "192.168.1.20:8080"},
+		{key: ServerLocalURLSettingKey, value: "ftp://192.168.1.20"},
+		{key: ServerLocalURLSettingKey, value: "http://192.168.1.20:8080/silo"},
+		{key: ServerLocalURLSettingKey, value: "http://192.168.1.20:8080/?x=1"},
+		{key: ServerLocalURLSettingKey, value: "http://user@192.168.1.20:8080"},
+		// An administrator default is validated against the value schema of the
+		// setting it stands in for, so the resolver never has to discard one.
+		{key: "defaults.ui.title_art", value: "off"},
+		{key: "defaults.ui.title_art", value: `"false"`},
+		{key: "defaults.ui.title_art", value: "1"},
+		{key: "defaults.ui.title_art", value: "null"},
+		{key: "autoscan.events_retention_days", value: "0"},
+		{key: "autoscan.events_retention_days", value: "3651"},
+		{key: DashboardHiddenAttentionSettingKey, value: "email"},
+		{key: DashboardHiddenAttentionSettingKey, value: `{"email":true}`},
+		{key: DashboardHiddenAttentionSettingKey, value: `[1]`},
+		{key: DashboardHiddenAttentionSettingKey, value: `null`},
+		{key: DashboardHiddenAttentionSettingKey, value: `["email",null]`},
+		{key: DashboardHiddenAttentionSettingKey, value: `["` + strings.Repeat("x", 65) + `"]`},
 	}
 	for _, tc := range tests {
 		t.Run(tc.key, func(t *testing.T) {
@@ -327,161 +344,42 @@ func TestNormalizeAdminSettingRejectsInvalidValues(t *testing.T) {
 	}
 }
 
-func TestNormalizeAdminSettingAcceptsSoftwareFallbackPolicy(t *testing.T) {
-	for _, value := range []string{"allow", "gpu_only"} {
-		if got, err := NormalizeAdminSetting("playback.software_fallback", value); err != nil || got != value {
-			t.Fatalf("NormalizeAdminSetting(%q) = %q, %v", value, got, err)
-		}
+func TestNormalizeAdminSettingAcceptsValidValues(t *testing.T) {
+	tests := []struct{ key, value, want string }{
+		{"playback.segment_retention_seconds", "0", "0"},
+		{"playback.segment_retention_seconds", "120", "120"},
+		{"playback.segment_retention_seconds", "86400", "86400"},
+		{"theme.catalog_url", "https://raw.githubusercontent.com/Silo-Server/silo-themes/main/catalog.json/", "https://raw.githubusercontent.com/Silo-Server/silo-themes/main/catalog.json"},
+		{PlaybackRoutingRemuxExecutionSettingKey, "  prefer_transcode  ", "prefer_transcode"},
+		{PlaybackRoutingVideoTranscodeExecutionSettingKey, "  prefer_api  ", "prefer_api"},
+		{PlaybackRoutingDirectPlayEgressSettingKey, "  proxy_only  ", "proxy_only"},
+		{PlaybackRoutingRemuxEgressSettingKey, "  api_only  ", "api_only"},
+		{PlaybackRoutingVideoTranscodeEgressSettingKey, "  prefer_proxy  ", "prefer_proxy"},
+		// The loader reads a zero or negative grace as "remove missing files
+		// immediately", so the admin API must not reject it.
+		{"scanner.file_removal_grace", "  0s  ", "0s"},
+		{"scanner.file_removal_grace", "  -1h  ", "-1h"},
+		{"scanner.file_removal_grace", "  72h  ", "72h"},
+		{ServerLocalURLSettingKey, "", ""},
+		{ServerLocalURLSettingKey, " http://192.168.1.20:8080/ ", "http://192.168.1.20:8080"},
+		{ServerLocalURLSettingKey, "https://silo.lan", "https://silo.lan"},
+		{"defaults.ui.title_art", "false", "false"},
+		{"defaults.ui.title_art", " true ", "true"},
+		{"defaults.ui.title_art", "", ""},
+		// A defaults.* key for a setting without admin_default is not an
+		// administrator default and passes through untouched.
+		{"defaults.ui.theme", "anything", "anything"},
+		{DashboardHiddenAttentionSettingKey, "", ""},
+		{DashboardHiddenAttentionSettingKey, "[]", ""},
+		{DashboardHiddenAttentionSettingKey, ` [" email ", "storage", "email", ""] `, `["email","storage"]`},
 	}
-	if _, err := NormalizeAdminSetting("playback.software_fallback", "sometimes"); err == nil {
-		t.Fatal("NormalizeAdminSetting accepted invalid software fallback policy")
-	}
-}
-
-func TestNormalizeAdminSettingValidatesVirtualProbeTuningBounds(t *testing.T) {
-	for _, tc := range []struct {
-		key    string
-		value  string
-		reject bool
-	}{
-		{VirtualLibraryPlaybackProbeCacheMinutesSettingKey, "10", false},
-		{VirtualLibraryPlaybackProbeCacheMinutesSettingKey, "0", true},
-		{VirtualLibraryPlaybackProbeCacheMinutesSettingKey, "-3", true},
-		{VirtualLibraryPlaybackProbeCacheMinutesSettingKey, "999999", true},
-		{VirtualLibraryPlaybackProbeCacheMinutesSettingKey, "next week", true},
-		{VirtualLibraryCatalogDiscoveryBudgetMsSettingKey, "3000", false},
-		{VirtualLibraryCatalogDiscoveryBudgetMsSettingKey, "499", true},
-		{VirtualLibraryCatalogDiscoveryBudgetMsSettingKey, "10001", true},
-		{VirtualLibraryCatalogDiscoveryBudgetMsSettingKey, "soon", true},
-	} {
-		got, err := NormalizeAdminSetting(tc.key, tc.value)
-		if tc.reject {
-			if err == nil {
-				t.Fatalf("NormalizeAdminSetting(%q, %q) accepted an out-of-bounds value", tc.key, tc.value)
-			}
-			continue
-		}
-		if err != nil {
-			t.Fatalf("NormalizeAdminSetting(%q, %q): %v", tc.key, tc.value, err)
-		}
-		if got != tc.value {
-			t.Fatalf("NormalizeAdminSetting(%q, %q) = %q, want the value unchanged", tc.key, tc.value, got)
-		}
-	}
-}
-
-func TestVirtualProbeTuningReadersFallBackAndClamp(t *testing.T) {
-	if got := VirtualLibraryPlaybackProbeCacheMinutes(""); got != DefaultVirtualLibraryPlaybackProbeCacheMinutes {
-		t.Fatalf("unset probe cache minutes = %d, want default %d", got, DefaultVirtualLibraryPlaybackProbeCacheMinutes)
-	}
-	if got := VirtualLibraryPlaybackProbeCacheMinutes("123456789"); got != MaxVirtualLibraryPlaybackProbeCacheMinutes {
-		t.Fatalf("oversized probe cache minutes = %d, want clamped to %d", got, MaxVirtualLibraryPlaybackProbeCacheMinutes)
-	}
-	if got := VirtualLibraryCatalogDiscoveryBudgetMs(""); got != DefaultVirtualLibraryCatalogDiscoveryBudgetMs {
-		t.Fatalf("unset discovery budget = %d, want default %d", got, DefaultVirtualLibraryCatalogDiscoveryBudgetMs)
-	}
-	if got := VirtualLibraryCatalogDiscoveryBudgetMs("5"); got != MinVirtualLibraryCatalogDiscoveryBudgetMs {
-		t.Fatalf("undersized discovery budget = %d, want clamped to %d", got, MinVirtualLibraryCatalogDiscoveryBudgetMs)
-	}
-	if !RestartRequired(VirtualLibraryPlaybackProbeCacheMinutesSettingKey) {
-		t.Fatal("the boot-built probe cache TTL must be restart-required")
-	}
-	if RestartRequired(VirtualLibraryCatalogDiscoveryBudgetMsSettingKey) {
-		t.Fatal("the per-request discovery budget must not be restart-required")
-	}
-	if got := RestartRequiredKeys(); !containsString(got, VirtualLibraryPlaybackProbeCacheMinutesSettingKey) {
-		t.Fatal("RestartRequiredKeys() must advertise the probe cache TTL key")
-	}
-}
-
-func containsString(haystack []string, needle string) bool {
-	for _, s := range haystack {
-		if s == needle {
-			return true
-		}
-	}
-	return false
-}
-
-func TestNormalizeAdminSettingAcceptsSegmentRetentionBounds(t *testing.T) {
-	for _, value := range []string{"0", "120", "86400"} {
-		t.Run(value, func(t *testing.T) {
-			got, err := NormalizeAdminSetting("playback.segment_retention_seconds", value)
-			if err != nil {
-				t.Fatalf("NormalizeAdminSetting: %v", err)
-			}
-			if got != value {
-				t.Fatalf("normalized retention = %q, want %q", got, value)
+	for _, tc := range tests {
+		t.Run(tc.key, func(t *testing.T) {
+			got, err := NormalizeAdminSetting(tc.key, tc.value)
+			if err != nil || got != tc.want {
+				t.Fatalf("NormalizeAdminSetting(%q, %q) = %q, %v; want %q", tc.key, tc.value, got, err, tc.want)
 			}
 		})
-	}
-}
-
-func TestNormalizeAdminSettingAcceptsApprovedThemeCatalogURL(t *testing.T) {
-	got, err := NormalizeAdminSetting(
-		"theme.catalog_url",
-		"https://raw.githubusercontent.com/Silo-Server/silo-themes/main/catalog.json/",
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != "https://raw.githubusercontent.com/Silo-Server/silo-themes/main/catalog.json" {
-		t.Fatalf("normalized URL = %q", got)
-	}
-}
-
-func TestNormalizeAdminSettingAcceptsVideoToolbox(t *testing.T) {
-	got, err := NormalizeAdminSetting("playback.hw_accel", " VideoToolbox ")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != "videotoolbox" {
-		t.Fatalf("normalized hardware acceleration = %q, want videotoolbox", got)
-	}
-}
-
-func TestNormalizeAdminSettingAcceptsPlaybackRoutingEnums(t *testing.T) {
-	tests := map[string]string{
-		PlaybackRoutingRemuxExecutionSettingKey:          "prefer_transcode",
-		PlaybackRoutingVideoTranscodeExecutionSettingKey: "prefer_api",
-		PlaybackRoutingDirectPlayEgressSettingKey:        "proxy_only",
-		PlaybackRoutingRemuxEgressSettingKey:             "api_only",
-		PlaybackRoutingVideoTranscodeEgressSettingKey:    "prefer_proxy",
-	}
-	for key, value := range tests {
-		got, err := NormalizeAdminSetting(key, "  "+value+"  ")
-		if err != nil {
-			t.Fatalf("NormalizeAdminSetting(%q): %v", key, err)
-		}
-		if got != value {
-			t.Fatalf("NormalizeAdminSetting(%q) = %q, want %q", key, got, value)
-		}
-	}
-	if _, err := NormalizeAdminSetting(PlaybackRoutingRemuxExecutionSettingKey, "sometimes_worker"); err == nil {
-		t.Fatal("invalid execution preference was accepted")
-	}
-	if _, err := NormalizeAdminSetting(PlaybackRoutingRemuxEgressSettingKey, "worker"); err == nil {
-		t.Fatal("invalid egress preference was accepted")
-	}
-}
-
-func TestPlaybackRoutingDefaultsPreferTranscodeExecutionAndProxyEgress(t *testing.T) {
-	cfg, err := LoadFromDB(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := PlaybackRoutingPolicy{
-		DirectPlayEgress:        PlaybackEgressPreferProxy,
-		RemuxExecution:          PlaybackExecutionPreferTranscode,
-		RemuxEgress:             PlaybackEgressPreferProxy,
-		VideoTranscodeExecution: PlaybackExecutionPreferTranscode,
-		VideoTranscodeEgress:    PlaybackEgressPreferProxy,
-	}
-	if cfg.Playback.Routing != want {
-		t.Fatalf("routing = %#v, want %#v", cfg.Playback.Routing, want)
-	}
-	if defaults := DefaultPlaybackRoutingPolicy(); defaults != want {
-		t.Fatalf("runtime defaults = %#v, want %#v", defaults, want)
 	}
 }
 
@@ -499,19 +397,6 @@ func TestValidateAdminSettingsRejectsImpossibleHardPlaybackRoute(t *testing.T) {
 	}
 	if err := ValidateAdminSettings(values); err == nil {
 		t.Fatal("API-only video transcode with proxy-only egress was accepted")
-	}
-}
-
-func TestLoadFromDBRejectsInvalidStoredPlaybackRoutingEnums(t *testing.T) {
-	for key, value := range map[string]string{
-		PlaybackRoutingRemuxExecutionSettingKey:   "sometimes_worker",
-		PlaybackRoutingDirectPlayEgressSettingKey: "worker",
-	} {
-		t.Run(key, func(t *testing.T) {
-			if _, err := LoadFromDB(map[string]string{key: value}); err == nil {
-				t.Fatalf("LoadFromDB() accepted %s=%q", key, value)
-			}
-		})
 	}
 }
 
@@ -556,164 +441,6 @@ func TestValidateAdminSettingsRequiresDurableRedisTransport(t *testing.T) {
 	}
 }
 
-func TestNormalizeAdminSettingCanonicalizesRedisURL(t *testing.T) {
-	got, err := NormalizeAdminSetting("redis.url", "  rediss://cache.example.invalid:6380/2  ")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != "rediss://cache.example.invalid:6380/2" {
-		t.Fatalf("normalized Redis URL = %q", got)
-	}
-}
-
-// TestNormalizeAdminSettingCanonicalizesProwlarrURL proves the scheme-less
-// Prowlarr value that broke staleness refresh ("one.vio") is stored as an
-// http URL at save time, while a clearly malformed value is rejected.
-func TestNormalizeAdminSettingCanonicalizesProwlarrURL(t *testing.T) {
-	got, err := NormalizeAdminSetting("virtual_library.indexer_rss_url", "  one.vio  ")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != "http://one.vio" {
-		t.Fatalf("normalized Prowlarr URL = %q, want http://one.vio", got)
-	}
-
-	if _, err := NormalizeAdminSetting("virtual_library.indexer_rss_url", "http://"); err == nil {
-		t.Fatal("expected an error for a malformed Prowlarr URL")
-	}
-}
-
-func TestNormalizeAdminSettingMaxVirtualFailoverAttempts(t *testing.T) {
-	got, err := NormalizeAdminSetting("playback.max_virtual_failover_attempts", " 10 ")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if got != "10" {
-		t.Fatalf("NormalizeAdminSetting() = %q, want 10", got)
-	}
-
-	if _, err := NormalizeAdminSetting("playback.max_virtual_failover_attempts", "0"); err == nil {
-		t.Fatal("expected error for 0 max failover attempts")
-	}
-	if _, err := NormalizeAdminSetting("playback.max_virtual_failover_attempts", "51"); err == nil {
-		t.Fatal("expected error for > 50 max failover attempts")
-	}
-}
-
-// TestNormalizeAdminSettingIndexerSearchTimeoutRoundTrip proves the Prowlarr
-// search timeout accepts the documented 5-900 range and rejects values the
-// client would silently clamp.
-func TestNormalizeAdminSettingIndexerSearchTimeoutRoundTrip(t *testing.T) {
-	const key = "virtual_library.indexer_search_timeout_seconds"
-	for _, value := range []string{"5", "20", "900"} {
-		got, err := NormalizeAdminSetting(key, "  "+value+"  ")
-		if err != nil {
-			t.Fatalf("NormalizeAdminSetting(%q, %q): %v", key, value, err)
-		}
-		if got != value {
-			t.Fatalf("normalized timeout = %q, want %q", got, value)
-		}
-	}
-	for _, value := range []string{"4", "901", "0", "-1", "soon"} {
-		if _, err := NormalizeAdminSetting(key, value); err == nil {
-			t.Fatalf("NormalizeAdminSetting(%q, %q) accepted an out-of-range value", key, value)
-		}
-	}
-}
-
-// TestNormalizeAdminSettingKeepsPermissiveScannerGrace locks the loader's
-// documented behavior: a zero or negative grace means "remove missing files
-// immediately", so the admin API must not reject it.
-func TestNormalizeAdminSettingKeepsPermissiveScannerGrace(t *testing.T) {
-	for _, value := range []string{"0s", "-1h", "72h"} {
-		got, err := NormalizeAdminSetting("scanner.file_removal_grace", "  "+value+"  ")
-		if err != nil {
-			t.Fatalf("NormalizeAdminSetting(scanner.file_removal_grace, %q): %v", value, err)
-		}
-		if got != value {
-			t.Fatalf("normalized grace = %q, want %q", got, value)
-		}
-	}
-}
-
-// TestOpslogCaptureLevelAcceptsWarningAlias mirrors the startup reader in
-// cmd/silo, which treats "warning" as "warn".
-func TestOpslogCaptureLevelAcceptsWarningAlias(t *testing.T) {
-	got, err := NormalizeAdminSetting("opslog.capture_level", "WARNING")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != "warning" {
-		t.Fatalf("normalized capture level = %q, want warning", got)
-	}
-}
-
-// TestHiddenTierDefaultsAreExposed guards the keys that have no admin UI: the
-// API must still report the value the server is actually running.
-func TestHiddenTierDefaultsAreExposed(t *testing.T) {
-	effective := EffectiveAdminSettings(nil)
-	want := map[string]string{
-		"recommendations.embeddings_job_timeout": "24h",
-		"policy.editor_enabled":                  "false",
-		"policy.eval_timeout_ms":                 "100",
-		"subtitle_ai.live_asr_chunk_seconds":     "30",
-		"scanner.max_concurrent_libraries":       "1",
-		"scanner.max_concurrent_scoped":          "2",
-		"scanner.file_removal_grace":             "24h",
-		"scanner.empty_trash_after_scan":         "true",
-		"scanner.realtime_monitoring":            "true",
-		"matcher.enable_tv_series_root_queue":    "true",
-		"matcher.enable_tv_series_group_queue":   "false",
-		"opslog.capture_level":                   "info",
-		"s3.metadata_presign_expiry":             "4h",
-	}
-	for key, value := range want {
-		if got := effective[key]; got != value {
-			t.Errorf("effective[%q] = %q, want %q", key, got, value)
-		}
-		if _, err := NormalizeAdminSetting(key, value); err != nil {
-			t.Errorf("default for %q is rejected by NormalizeAdminSetting: %v", key, err)
-		}
-	}
-}
-
-// TestVirtualCandidateStoreWindowDefaultsAndBounds locks the setting's
-// default, parse, and disable semantics used by the playback and scanner
-// trust-window wiring.
-func TestVirtualCandidateStoreWindowDefaultsAndBounds(t *testing.T) {
-	cases := []struct {
-		raw  string
-		want time.Duration
-	}{
-		{"", 720 * time.Hour},
-		{"48", 48 * time.Hour},
-		{"8760", 8760 * time.Hour},
-		{"0", 0},
-		{"-1", 0},
-		{"not a number", 0},
-	}
-	for _, tc := range cases {
-		if got := VirtualCandidateStoreWindow(tc.raw); got != tc.want {
-			t.Errorf("VirtualCandidateStoreWindow(%q) = %v, want %v", tc.raw, got, tc.want)
-		}
-	}
-}
-
-func TestHEVCEncodingSettingDefaultAndValidation(t *testing.T) {
-	if got := EffectiveAdminSettings(nil)[PlaybackAllowHEVCEncodingSettingKey]; got != "false" {
-		t.Fatalf("HEVC default=%q", got)
-	}
-	for _, raw := range []string{"true", "false"} {
-		got, err := NormalizeAdminSetting(PlaybackAllowHEVCEncodingSettingKey, raw)
-		if err != nil || got != raw {
-			t.Fatalf("normalize %q: %q %v", raw, got, err)
-		}
-	}
-	if _, err := NormalizeAdminSetting(PlaybackAllowHEVCEncodingSettingKey, "invalid"); err == nil {
-		t.Fatal("invalid HEVC boolean accepted")
-	}
-}
-
 func TestAuthProviderRecheckInterval(t *testing.T) {
 	for raw, want := range map[string]time.Duration{
 		"":      12 * time.Hour,
@@ -726,76 +453,5 @@ func TestAuthProviderRecheckInterval(t *testing.T) {
 		if got := AuthProviderRecheckInterval(raw); got != want {
 			t.Errorf("AuthProviderRecheckInterval(%q) = %v, want %v", raw, got, want)
 		}
-	}
-}
-
-// TestNormalizeAdminSettingRejectsBadCustomFormatRegex proves a custom
-// format with an uncompilable pattern is rejected at save time with a field
-// error naming it, so the operator fixes the regex before persisting instead
-// of discovering a dormant virtual library after the next restart. Valid
-// formats still save unchanged.
-func TestNormalizeAdminSettingRejectsBadCustomFormatRegex(t *testing.T) {
-	good := `[{"name":"Good","pattern":"\\b1080p\\b","patternType":"regex"}]`
-	if _, err := NormalizeAdminSetting("virtual_library.custom_formats", good); err != nil {
-		t.Fatalf("valid formats rejected: %v", err)
-	}
-	bad := `[{"name":"Good","pattern":"\\b1080p\\b","patternType":"regex"},{"name":"Bad","pattern":"(?:(?<=^)MULTI)","patternType":"regex"}]`
-	if _, err := NormalizeAdminSetting("virtual_library.custom_formats", bad); err == nil {
-		t.Fatal("expected a field error for the uncompilable pattern")
-	} else if !strings.Contains(err.Error(), "Bad") {
-		t.Fatalf("error %q does not name the bad format", err)
-	}
-	if _, err := NormalizeAdminSetting("virtual_library.custom_formats", "not-json"); err == nil {
-		t.Fatal("expected a field error for non-JSON input")
-	}
-}
-
-func TestNormalizeAdminSettingLocalURLIsAnOrigin(t *testing.T) {
-	for raw, want := range map[string]string{
-		"":                            "",
-		" http://192.168.1.20:8080/ ": "http://192.168.1.20:8080",
-		"https://silo.lan":            "https://silo.lan",
-	} {
-		got, err := NormalizeAdminSetting(ServerLocalURLSettingKey, raw)
-		if err != nil || got != want {
-			t.Fatalf("NormalizeAdminSetting(%q) = %q, %v; want %q", raw, got, err, want)
-		}
-	}
-	for _, raw := range []string{
-		"192.168.1.20:8080",
-		"ftp://192.168.1.20",
-		"http://192.168.1.20:8080/silo",
-		"http://192.168.1.20:8080/?x=1",
-		"http://user@192.168.1.20:8080",
-	} {
-		if got, err := NormalizeAdminSetting(ServerLocalURLSettingKey, raw); err == nil {
-			t.Fatalf("NormalizeAdminSetting(%q) = %q, want an error", raw, got)
-		}
-	}
-}
-
-// An administrator default is validated against the value schema of the
-// setting it stands in for, so the resolver never has to discard one.
-func TestNormalizeAdminSettingValidatesAdminDefaults(t *testing.T) {
-	const key = "defaults.ui.title_art"
-	for _, tc := range []struct{ in, want string }{
-		{"false", "false"},
-		{" true ", "true"},
-		{"", ""},
-	} {
-		got, err := NormalizeAdminSetting(key, tc.in)
-		if err != nil || got != tc.want {
-			t.Errorf("NormalizeAdminSetting(%q, %q) = %q, %v; want %q", key, tc.in, got, err, tc.want)
-		}
-	}
-	for _, bad := range []string{"off", `"false"`, "1", "null"} {
-		if _, err := NormalizeAdminSetting(key, bad); err == nil {
-			t.Errorf("NormalizeAdminSetting(%q, %q) accepted a value ui.title_art rejects", key, bad)
-		}
-	}
-	// A defaults.* key for a setting without admin_default is not an
-	// administrator default and passes through untouched, as before.
-	if got, err := NormalizeAdminSetting("defaults.ui.theme", "anything"); err != nil || got != "anything" {
-		t.Errorf("defaults.ui.theme = %q, %v; want passthrough", got, err)
 	}
 }

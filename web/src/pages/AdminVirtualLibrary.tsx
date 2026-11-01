@@ -183,7 +183,7 @@ export default function AdminVirtualLibrary() {
     return items.filter((item) => {
       if (failedOnly && item.failed_count <= 0) return false;
       if (!needle) return true;
-      return item.title.toLowerCase().includes(needle) || item.id.toLowerCase().includes(needle);
+      return item.title.toLowerCase().includes(needle) || String(item.id).toLowerCase().includes(needle);
     });
   }, [items, query, failedOnly]);
 
@@ -328,7 +328,7 @@ export default function AdminVirtualLibrary() {
                         </div>
                       </div>
                     </TableCell>
-                    <TableCell>{pluginLabel(item.installation_id)}</TableCell>
+                    <TableCell>{pluginLabel(String(item.installation_id))}</TableCell>
                     <TableCell>
                       <div className="flex items-center gap-2">
                         <span className="tabular-nums">{item.candidate_count}</span>

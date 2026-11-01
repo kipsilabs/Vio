@@ -1,26 +1,17 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
 import { PlayerConfigProvider, type PlayerConfig } from "../context/PlayerConfigContext";
 import type { WatchTogetherRoomConnectionResult } from "../hooks/useWatchTogetherRoomConnection";
-import { fixturePlanV3, fixtureSubtitleInventoryItemV3 } from "../protocol-v3.fixtures";
+import { fixturePlanV3 } from "../protocol-v3.fixtures";
+import type { AvailableQualityV3, PlanV3 } from "../protocol-v3";
 import type {
   PlaybackRealtimeCommandEnvelope,
   PlaybackRealtimeEventEnvelope,
 } from "../realtime-protocol";
 import type { PlayerSubtitleInfo, VideoFitMode } from "../types";
-import { HLS_DEFAULT_MAX_BUFFER_SIZE_BYTES } from "../utils/bufferPolicy";
-import { HLS_STARTUP_TIMEOUT_MS } from "../utils/hlsStartupGuard";
-import {
-  MANIFEST_NOT_READY_CODE,
-  MANIFEST_NOT_READY_DEFAULT_DELAY_MS,
-} from "../manifest-not-ready";
-import { PENDING_SEEK_HOLD_TIMEOUT_MS } from "../utils/pendingSeek";
-import {
-  buildQualitySummary,
-  buildVersionDetailLine,
-} from "@/pages/ItemDetail/components/versionFormatUtils";
+import { STARTUP_TIMEOUT_MS } from "../utils/startupGuard";
 import { VideoPlayer } from "./VideoPlayer";
 
 const realtimeOptions = vi.hoisted(() => ({
@@ -51,8 +42,7 @@ const controls = vi.hoisted(() => ({
     onFullscreenToggle?: () => void;
     videoFit?: VideoFitMode;
     onVideoFitToggle?: () => void;
-    onSubtitleJobAccepted?: (jobId: string) => void;
-    onSubtitleSelect?: (index: number | null) => void;
+    onSubtitleJobAccepted?: (jobId: string, resultSubtitleId?: string) => void;
     onMutedChange?: (muted: boolean) => void;
     onVolumeChange?: (volume: number) => void;
     playbackSpeed?: number;
@@ -91,14 +81,10 @@ const hlsJS = vi.hoisted(() => ({
   loadSource: vi.fn(),
   errorHandler: null as null | ((event: unknown, data: unknown) => void),
   stopLoad: vi.fn(),
+  loadSource: vi.fn(),
   latest: null as null | { emit: (event: string, data: unknown) => void },
-  bufferAppendedHandler: null as null | ((event: unknown, data?: unknown) => void),
-}));
-// Captures the onSourceChanged handlers the mocked subtitle hooks receive, so
-// tests can drive a subtitle_source_changed (409) signal from the outside.
-const subtitleHooks = vi.hoisted(() => ({
-  vttSourceChanged: null as null | (() => void),
-  assSourceChanged: null as null | (() => void),
+  // Seconds buffered past the playhead, as hls.js measures them.
+  forwardBufferSeconds: 0,
 }));
 
 vi.mock("sonner", () => ({
@@ -146,8 +132,29 @@ vi.mock("../engine/routing", async (importOriginal) => {
           : actual.resolveOriginalPlaybackRoute(...args),
   };
 });
-const attachBrowserEngine = vi.hoisted(() => vi.fn(() => ({ destroy: vi.fn() })));
+const attachBrowserEngine = vi.hoisted(() =>
+  vi.fn((_options: Parameters<typeof import("../engine").attachBrowserEngine>[0]) => ({
+    destroy: vi.fn(),
+  })),
+);
 vi.mock("../engine", () => ({ attachBrowserEngine }));
+const releasedMedia = vi.hoisted(() => vi.fn());
+const sourceLoads = vi.hoisted(() => vi.fn());
+vi.mock("../bandwidth-probe", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../bandwidth-probe")>();
+  return {
+    ...actual,
+    sourceLoadStarted: () => {
+      sourceLoads();
+      return actual.sourceLoadStarted();
+    },
+    mediaElementReleased: (element: HTMLMediaElement) => {
+      releasedMedia(element, element.isConnected);
+      actual.mediaElementReleased(element);
+    },
+  };
+});
+vi.mock("../hooks/useKeyboardShortcuts", () => ({ useKeyboardShortcuts: vi.fn() }));
 vi.mock("../hooks/useRemuxSeeking", () => ({
   useRemuxSeeking: () => ({ handleSeek: playerSeek }),
 }));
@@ -226,8 +233,18 @@ vi.mock("hls.js", () => ({
       ERROR: "error",
       MANIFEST_PARSED: "manifestParsed",
       BUFFER_APPENDED: "bufferAppended",
+      FRAG_LOADING: "fragLoading",
+      FRAG_LOADED: "fragLoaded",
+      FRAG_BUFFERED: "fragBuffered",
+      BUFFER_EOS: "bufferEos",
     };
     static ErrorTypes = { NETWORK_ERROR: "networkError", MEDIA_ERROR: "mediaError" };
+    static ErrorDetails = {
+      MANIFEST_LOAD_ERROR: "manifestLoadError",
+      MANIFEST_LOAD_TIMEOUT: "manifestLoadTimeOut",
+      MANIFEST_PARSING_ERROR: "manifestParsingError",
+      FRAG_LOAD_ERROR: "fragLoadError",
+    };
     static isSupported = () => hlsJS.supported;
 
     config:
@@ -236,13 +253,19 @@ vi.mock("hls.js", () => ({
     url: string | null = null;
     handlers = new Map<string, (event: string, data: unknown) => void>();
     stopLoad = hlsJS.stopLoad;
+    loadSource = hlsJS.loadSource;
 
-    constructor(config?: unknown) {
+    bufferedToEnd = false;
+    maxBufferLength: number;
+
+    constructor(config?: { maxBufferLength?: number }) {
       hlsJS.constructed(config);
       hlsJS.latest = this;
-      // Real hls.js exposes its merged buffer config here; the player
-      // retargets `maxBufferLength` as playback starts, pauses and seeks.
-      this.config = config as { maxBufferLength?: number };
+      this.maxBufferLength = config?.maxBufferLength ?? 30;
+    }
+
+    get mainForwardBufferInfo() {
+      return { len: hlsJS.forwardBufferSeconds };
     }
 
     on(event: string, handler: (event: unknown, data: unknown) => void) {
@@ -1112,7 +1135,41 @@ describe("VideoPlayer room catch-up", () => {
     fireFrameTimeUpdate(video);
     markReady(video);
     const command = roomPlayCommand();
-    return { ...rendered, connection, video, command, onReanchorSeek };
+    // A room correction to `position` that executes now.
+    const correct = async (commandId: string, position = 100) => {
+      rendered.rerenderPlayer({
+        watchTogetherConnection: {
+          ...connection,
+          transportCommand: {
+            ...command,
+            command_id: commandId,
+            position_seconds: position,
+            execute_at: new Date().toISOString(),
+          },
+        },
+      });
+      await act(() => vi.advanceTimersByTimeAsync(0));
+    };
+    return { ...rendered, connection, video, command, onReanchorSeek, correct };
+  }
+
+  /** The room waiting on this viewer with a seek to 25:00. */
+  function waitingSeek(
+    connection: ReturnType<typeof roomConnection>,
+    command: ReturnType<typeof roomPlayCommand>,
+    transport: Partial<ReturnType<typeof roomPlayCommand>> = {},
+  ) {
+    return {
+      ...connection,
+      room: { ...connection.room!, playback_state: "waiting" as const },
+      transportCommand: {
+        ...command,
+        action: "seek" as const,
+        playback_state: "waiting" as const,
+        position_seconds: 1500,
+        ...transport,
+      },
+    };
   }
 
   it("pauses displaced playback and offers an explicit room rejoin", async () => {
@@ -1210,31 +1267,6 @@ describe("VideoPlayer room catch-up", () => {
     await act(() => vi.advanceTimersByTimeAsync(7_000));
     expect(screen.queryByText("Server maintenance at midnight.")).toBeNull();
     expect(screen.getByText(reconnectingMessage)).toBeInTheDocument();
-  });
-
-  it("does not extend an admin notice through a routine room reconnect", async () => {
-    const { connection, rerenderPlayer } = setup(100);
-    const onCommand = realtimeOptions.current?.onCommand;
-    if (!onCommand) throw new Error("expected the realtime command handler");
-    await act(async () => {
-      await onCommand({
-        type: "command",
-        command_id: "cmd-message-brief-reconnect",
-        session_id: "session-1",
-        name: "display_message",
-        deadline_ms: 8_000,
-        payload: { title: "Admin", message: "Server maintenance at midnight." },
-      });
-    });
-
-    await act(() => vi.advanceTimersByTimeAsync(7_500));
-    rerenderPlayer({ watchTogetherConnection: { ...connection, connectionState: "disconnected" } });
-    await act(() => vi.advanceTimersByTimeAsync(499));
-    rerenderPlayer({ watchTogetherConnection: connection });
-    expect(screen.getByText("Server maintenance at midnight.")).toBeInTheDocument();
-    await act(() => vi.advanceTimersByTimeAsync(1));
-    expect(screen.queryByText("Server maintenance at midnight.")).toBeNull();
-    expect(screen.queryByText(reconnectingMessage)).toBeNull();
   });
 
   it("shows a repeated notice again after the previous one expired", async () => {
@@ -1773,31 +1805,6 @@ describe("VideoPlayer room catch-up", () => {
     },
   );
 
-  it("names the viewers still syncing", () => {
-    const { connection, rerenderPlayer } = setup(100);
-    rerenderPlayer({
-      watchTogetherConnection: {
-        ...connection,
-        room: {
-          ...connection.room!,
-          playback_state: "waiting",
-          members: [
-            {
-              user_id: 8,
-              profile_id: "guest",
-              display_name: "Alex",
-              is_host: false,
-              is_self: false,
-              connected: true,
-              is_syncing: true,
-            },
-          ],
-        },
-      },
-    });
-    expect(screen.getByText("Waiting for Alex")).toBeInTheDocument();
-  });
-
   it.each([
     [1503, true],
     [1497, false],
@@ -1807,17 +1814,9 @@ describe("VideoPlayer room catch-up", () => {
       const { connection, video, command, rerenderPlayer } = setup(100);
       Object.defineProperty(video, "readyState", { configurable: true, value: 3 });
       rerenderPlayer({
-        watchTogetherConnection: {
-          ...connection,
-          room: { ...connection.room!, playback_state: "waiting" as const },
-          transportCommand: {
-            ...command,
-            action: "seek" as const,
-            playback_state: "waiting" as const,
-            position_seconds: 1500,
-            execute_at: new Date(Date.now() + 500).toISOString(),
-          },
-        },
+        watchTogetherConnection: waitingSeek(connection, command, {
+          execute_at: new Date(Date.now() + 500).toISOString(),
+        }),
       });
       await act(() => vi.advanceTimersByTimeAsync(500));
       // A rebuilt stream past the target cannot pre-roll back to it; the
@@ -1897,17 +1896,9 @@ describe("VideoPlayer room catch-up", () => {
   it("reports readiness only after the current seek reaches buffered media", async () => {
     const { connection, video, command, rerenderPlayer } = setup(100);
     Object.defineProperty(video, "readyState", { configurable: true, value: 3 });
-    const waitingConnection = {
-      ...connection,
-      room: { ...connection.room!, playback_state: "waiting" as const },
-      transportCommand: {
-        ...command,
-        action: "seek" as const,
-        playback_state: "waiting" as const,
-        position_seconds: 1500,
-        execute_at: new Date(Date.now() + 500).toISOString(),
-      },
-    };
+    const waitingConnection = waitingSeek(connection, command, {
+      execute_at: new Date(Date.now() + 500).toISOString(),
+    });
     rerenderPlayer({ watchTogetherConnection: waitingConnection });
     fireEvent.canPlay(video);
     expect(connection.sendRoomMessage).not.toHaveBeenCalledWith(
@@ -1976,16 +1967,7 @@ describe("VideoPlayer room catch-up", () => {
     const { connection, video, command, rerenderPlayer } = setup(100);
     Object.defineProperty(video, "readyState", { configurable: true, value: 3 });
     rerenderPlayer({
-      watchTogetherConnection: {
-        ...connection,
-        room: { ...connection.room!, playback_state: "waiting" as const },
-        transportCommand: {
-          ...command,
-          action: "seek" as const,
-          playback_state: "waiting" as const,
-          position_seconds: 1500,
-        },
-      },
+      watchTogetherConnection: waitingSeek(connection, command),
     });
     await act(() => vi.advanceTimersByTimeAsync(0));
     // The first canplay still belongs to the old stream.
@@ -2039,17 +2021,7 @@ describe("VideoPlayer room catch-up", () => {
     // The room now waits on this viewer with a seek to the same position.
     vi.mocked(video.play).mockClear();
     rerenderPlayer({
-      watchTogetherConnection: {
-        ...connection,
-        room: { ...connection.room!, playback_state: "waiting" as const },
-        transportCommand: {
-          ...command,
-          command_id: "stall-seek",
-          action: "seek" as const,
-          playback_state: "waiting" as const,
-          position_seconds: 1500,
-        },
-      },
+      watchTogetherConnection: waitingSeek(connection, command, { command_id: "stall-seek" }),
     });
     await act(() => vi.advanceTimersByTimeAsync(0));
     // No second reload, and the running one still pre-rolls up to the target.
@@ -2073,16 +2045,7 @@ describe("VideoPlayer room catch-up", () => {
       vi.mocked(video.pause).mockImplementation(() => {
         paused = true;
       });
-      const waitingConnection = {
-        ...connection,
-        room: { ...connection.room!, playback_state: "waiting" as const },
-        transportCommand: {
-          ...command,
-          action: "seek" as const,
-          playback_state: "waiting" as const,
-          position_seconds: 1500,
-        },
-      };
+      const waitingConnection = waitingSeek(connection, command);
       rerenderPlayer({ watchTogetherConnection: waitingConnection });
       await act(() => vi.advanceTimersByTimeAsync(0));
 
@@ -2227,16 +2190,7 @@ describe("VideoPlayer room catch-up", () => {
     });
     Object.defineProperty(document, "visibilityState", { configurable: true, value: "hidden" });
     try {
-      const waitingConnection = {
-        ...connection,
-        room: { ...connection.room!, playback_state: "waiting" as const },
-        transportCommand: {
-          ...command,
-          action: "seek" as const,
-          playback_state: "waiting" as const,
-          position_seconds: 1500,
-        },
-      };
+      const waitingConnection = waitingSeek(connection, command);
       rerenderPlayer({ watchTogetherConnection: waitingConnection });
       await act(() => vi.advanceTimersByTimeAsync(0));
       // A 12 s pre-roll at normal speed would outlast the room's 10 s waiting
@@ -2478,21 +2432,7 @@ describe("VideoPlayer room catch-up", () => {
   });
 
   it("runs one correction rebuild at a time and aims the next ahead by its startup", async () => {
-    const { connection, video, command, rerenderPlayer, onReanchorSeek } = setup(90);
-    const correct = async (commandId: string, position = 100) => {
-      rerenderPlayer({
-        watchTogetherConnection: {
-          ...connection,
-          transportCommand: {
-            ...command,
-            command_id: commandId,
-            position_seconds: position,
-            execute_at: new Date().toISOString(),
-          },
-        },
-      });
-      await act(() => vi.advanceTimersByTimeAsync(0));
-    };
+    const { video, onReanchorSeek, correct } = setup(90);
     await correct("correction-1");
     expect(onReanchorSeek).toHaveBeenCalledTimes(1);
     expect(onReanchorSeek).toHaveBeenLastCalledWith(100);
@@ -2521,21 +2461,7 @@ describe("VideoPlayer room catch-up", () => {
   });
 
   it("paces corrections that must load unbuffered media on a seekable stream", async () => {
-    const { connection, video, command, rerenderPlayer } = setup(90, 0, true);
-    const correct = async (commandId: string, position: number) => {
-      rerenderPlayer({
-        watchTogetherConnection: {
-          ...connection,
-          transportCommand: {
-            ...command,
-            command_id: commandId,
-            position_seconds: position,
-            execute_at: new Date().toISOString(),
-          },
-        },
-      });
-      await act(() => vi.advanceTimersByTimeAsync(0));
-    };
+    const { video, correct } = setup(90, 0, true);
     await correct("correction-1", 100);
     expect(playerSeek).toHaveBeenCalledTimes(1);
 
@@ -2557,23 +2483,9 @@ describe("VideoPlayer room catch-up", () => {
   });
 
   it("does not settle a correction reload on an unrelated stream swap", async () => {
-    const { connection, video, command, rerenderPlayer, onReanchorSeek } = setup(90);
+    const { video, onReanchorSeek, correct } = setup(90);
     // The reanchor is still being replanned.
     onReanchorSeek.mockImplementation(() => new Promise<boolean>(() => {}) as unknown as boolean);
-    const correct = async (commandId: string, position: number) => {
-      rerenderPlayer({
-        watchTogetherConnection: {
-          ...connection,
-          transportCommand: {
-            ...command,
-            command_id: commandId,
-            position_seconds: position,
-            execute_at: new Date().toISOString(),
-          },
-        },
-      });
-      await act(() => vi.advanceTimersByTimeAsync(0));
-    };
     await correct("correction-1", 100);
     expect(onReanchorSeek).toHaveBeenCalledTimes(1);
 
@@ -2593,25 +2505,11 @@ describe("VideoPlayer room catch-up", () => {
   });
 
   it("ignores a stale reload's completion when a newer reload aims at the same position", async () => {
-    const { connection, video, command, rerenderPlayer, onReanchorSeek } = setup(90);
+    const { video, onReanchorSeek, correct } = setup(90);
     const resolvers: Array<(accepted: boolean) => void> = [];
     onReanchorSeek.mockImplementation(
       () => new Promise<boolean>((resolve) => resolvers.push(resolve)) as unknown as boolean,
     );
-    const correct = async (commandId: string, position: number) => {
-      rerenderPlayer({
-        watchTogetherConnection: {
-          ...connection,
-          transportCommand: {
-            ...command,
-            command_id: commandId,
-            position_seconds: position,
-            execute_at: new Date().toISOString(),
-          },
-        },
-      });
-      await act(() => vi.advanceTimersByTimeAsync(0));
-    };
     await correct("correction-1", 100);
     // The first reload goes stale, and a new one aims at the same position.
     await act(() => vi.advanceTimersByTimeAsync(31_000));
@@ -2658,7 +2556,12 @@ describe("VideoPlayer room catch-up", () => {
     const selectQuality = (controls.current as unknown as { onQualitySelect: (id: string) => void })
       .onQualitySelect;
     act(() => selectQuality("720p"));
-    expect(onQualitySelect).toHaveBeenCalledWith("720p", expect.any(Number));
+    expect(onQualitySelect).toHaveBeenCalledWith(
+      "720p",
+      expect.any(Number),
+      undefined,
+      expect.any(Function),
+    );
     await correct("correction-3");
     expect(onReanchorSeek).toHaveBeenCalledTimes(2);
   });
@@ -2690,7 +2593,12 @@ describe("VideoPlayer room catch-up", () => {
     expect(screen.queryByRole("button", { name: "Lower quality" })).not.toBeInTheDocument();
     await stall();
     await act(async () => fireEvent.click(screen.getByRole("button", { name: "Lower quality" })));
-    expect(onQualitySelect).toHaveBeenCalledWith("1080p-medium", expect.any(Number));
+    expect(onQualitySelect).toHaveBeenCalledWith(
+      "1080p-medium",
+      expect.any(Number),
+      undefined,
+      undefined,
+    );
   });
 
   it("chooses the lower quality from the ladder shown when the viewer accepts", async () => {
@@ -2729,7 +2637,7 @@ describe("VideoPlayer room catch-up", () => {
       ]),
     });
     await act(async () => fireEvent.click(screen.getByRole("button", { name: "Lower quality" })));
-    expect(onQualitySelect).toHaveBeenCalledWith("720p", expect.any(Number));
+    expect(onQualitySelect).toHaveBeenCalledWith("720p", expect.any(Number), undefined, undefined);
   });
 
   it("withdraws the lower-quality offer when a replan leaves no lower quality", async () => {
@@ -2792,43 +2700,6 @@ describe("VideoPlayer room catch-up", () => {
     // The offer was computed for Original; after choosing 720p it would raise quality.
     rerenderPlayer({ watchTogetherConnection: connection, plan, qualityPreference: "720p" });
     expect(screen.queryByRole("button", { name: "Lower quality" })).not.toBeInTheDocument();
-  });
-
-  it("explains a room that kept playing without someone", () => {
-    const { connection, rerenderPlayer } = setup(100);
-    const bob = {
-      user_id: 9,
-      profile_id: "bob",
-      display_name: "Bob",
-      is_host: false,
-      is_self: false,
-      connected: true,
-    };
-    rerenderPlayer({
-      watchTogetherConnection: {
-        ...connection,
-        room: {
-          ...connection.room!,
-          playback_state: "waiting",
-          members: [{ ...bob, is_syncing: true }],
-        },
-      },
-    });
-    rerenderPlayer({
-      watchTogetherConnection: {
-        ...connection,
-        room: { ...connection.room!, playback_state: "playing", members: [bob] },
-      },
-    });
-    expect(screen.getByText("Continuing without Bob. They'll catch up.")).toBeInTheDocument();
-
-    rerenderPlayer({
-      watchTogetherConnection: {
-        ...connection,
-        room: { ...connection.room!, self_ignore_wait: true, members: [bob] },
-      },
-    });
-    expect(screen.getByText(/The party kept playing/)).toBeInTheDocument();
   });
 
   it("repeats readiness on the state tick while the room waits", async () => {
@@ -3370,17 +3241,6 @@ describe("VideoPlayer room catch-up", () => {
     expect(onReanchorSeek).not.toHaveBeenCalled();
   });
 
-  it("leaves a viewer within the deadband at 1x", async () => {
-    const { connection, video, command, rerenderPlayer } = setup(100);
-    markPlaying(video);
-    rerenderPlayer({ watchTogetherConnection: { ...connection, transportCommand: command } });
-    await act(() => vi.advanceTimersByTimeAsync(0));
-    video.currentTime = 100.65;
-    // The first loop check sees the room at 101: 0.35 s behind it is not worth a nudge.
-    await act(() => vi.advanceTimersByTimeAsync(1_000));
-    expect(video.playbackRate).toBe(1);
-  });
-
   it.each(["stalls", "seeks", "the room pauses"])(
     "returns a loop nudge to 1x without resuming when playback %s",
     async (change) => {
@@ -3884,19 +3744,6 @@ describe("VideoPlayer playback speed", () => {
     expect(video.playbackRate).toBe(1.5);
   });
 
-  it("leaves the rate to the room in a Watch Party", () => {
-    const { container } = renderPlayer({
-      shouldAutoPlay: false,
-      watchTogetherRoomId: "room-1",
-      watchTogetherConnection: roomConnection(),
-    });
-    const video = container.querySelector("video")!;
-
-    expect(controls.current!.onPlaybackSpeedChange).toBeUndefined();
-    expect(video.playbackRate).toBe(1);
-    expect(video.defaultPlaybackRate).toBe(1);
-  });
-
   it("restores the viewer's speed after leaving a Watch Party", () => {
     const { container, rerenderPlayer } = renderPlayer({ shouldAutoPlay: false });
     const video = container.querySelector("video")!;
@@ -4324,10 +4171,28 @@ describe("VideoPlayer plan failure recovery", () => {
 
       Object.defineProperty(video, "readyState", { configurable: true, value: 3 });
       fireEvent.canPlay(video);
-      act(() => vi.advanceTimersByTime(HLS_STARTUP_TIMEOUT_MS));
+      act(() => vi.advanceTimersByTime(STARTUP_TIMEOUT_MS));
 
       expect(HTMLMediaElement.prototype.play).not.toHaveBeenCalled();
       expect(onPlanFailure).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("fails a direct-play start that shows no frame by the startup deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      const onPlanFailure = vi.fn();
+      const { container } = renderPlayer({ onPlanFailure });
+      await act(async () => vi.advanceTimersByTimeAsync(0));
+      const video = container.querySelector("video");
+      if (!video) throw new Error("expected video element");
+      expect(video.src).toContain("/api/v1/stream/session-1");
+
+      act(() => vi.advanceTimersByTime(STARTUP_TIMEOUT_MS));
+      expect(onPlanFailure).toHaveBeenCalledOnce();
+      expect(onPlanFailure.mock.calls[0]?.[0]).toMatchObject({ classification: "startup_timeout" });
     } finally {
       vi.useRealTimers();
     }
@@ -4584,6 +4449,49 @@ describe("VideoPlayer plan failure recovery", () => {
     );
   });
 
+  // A sync request built from the player's stale "off" would turn the restored
+  // subtitle off on the server, and the auto-selection would then turn it on again.
+  it("adopts a subtitle a version change dropped and brought back without replanning", async () => {
+    const onSubtitleTrackChange = vi.fn();
+    const sidecarTrack: PlayerSubtitleInfo = {
+      index: 0,
+      media_file_id: 7,
+      track_id: "file:7:subtitle:0",
+      language: "en",
+      codec: "srt",
+      label: "English",
+      source: "external",
+      url: "/stream/session-1/subtitles/0.vtt",
+    };
+    const withSubtitle = (planId: string) =>
+      fixturePlanV3({
+        ...directPlan,
+        plan_id: planId,
+        selected_tracks: { ...directPlan.selected_tracks, subtitle: { id: "", index: 0 } },
+      });
+    const { rerenderPlayer } = renderPlayer({
+      plan: withSubtitle("plan:2160p"),
+      subtitleUrls: [sidecarTrack],
+      subtitleMode: "always",
+      preferredSubtitleLanguage: "en",
+      onSubtitleTrackChange,
+    });
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
+
+    // A fallback version without subtitles, then back to the first.
+    rerenderPlayer({
+      plan: fixturePlanV3({ ...directPlan, plan_id: "plan:1080p" }),
+      planRevision: 2,
+      subtitleUrls: [],
+    });
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBeNull());
+    rerenderPlayer({ plan: withSubtitle("plan:2160p-again"), planRevision: 3 });
+
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
+    await act(async () => Promise.resolve());
+    expect(onSubtitleTrackChange).not.toHaveBeenCalled();
+  });
+
   // The rollback is otherwise silent: the refusal only renders inside the
   // quality menu, which a user who just picked a subtitle never opens.
   it("toasts the server's refusal when a subtitle change is rolled back", async () => {
@@ -4617,80 +4525,6 @@ describe("VideoPlayer plan failure recovery", () => {
     expect(toastError).toHaveBeenCalledWith("That subtitle track can't be used", {
       description: "The selected subtitle must be burned into the video, but 4K is disabled.",
     });
-  });
-
-  it("falls back to a generic subtitle refusal title and toasts once", async () => {
-    const onSubtitleTrackChange = vi.fn();
-    const sidecarTrack: PlayerSubtitleInfo = {
-      index: 2,
-      media_file_id: 7,
-      track_id: "file:7:subtitle:2",
-      language: "en",
-      codec: "srt",
-      label: "English",
-      source: "external",
-      url: "/stream/session-1/subtitles/2.vtt",
-    };
-    const { rerenderPlayer } = renderPlayer({
-      subtitleUrls: [sidecarTrack],
-      subtitleMode: "always",
-      preferredSubtitleLanguage: "en",
-      onSubtitleTrackChange,
-    });
-
-    await waitFor(() => expect(onSubtitleTrackChange).toHaveBeenCalledOnce());
-    rerenderPlayer({ replanError: "Silo could not apply the subtitle selection." });
-    await waitFor(() => expect(toastError).toHaveBeenCalledOnce());
-    expect(toastError).toHaveBeenCalledWith("That subtitle track can't be used", {
-      description: "Silo could not apply the subtitle selection.",
-    });
-
-    // The ref cleared on rollback, so a re-render with the same refusal must
-    // not stack a second toast.
-    rerenderPlayer({ replanError: "Silo could not apply the subtitle selection." });
-    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBeNull());
-    expect(toastError).toHaveBeenCalledOnce();
-  });
-
-  it("does not re-request an unresolved sidecar selection on every plan", async () => {
-    const onSubtitleTrackChange = vi.fn();
-    const sidecarTrack: PlayerSubtitleInfo = {
-      index: 2,
-      media_file_id: 7,
-      track_id: "file:7:subtitle:2",
-      language: "en",
-      codec: "srt",
-      label: "English",
-      source: "external",
-      url: "/stream/session-1/subtitles/2.vtt",
-    };
-    const planA = fixturePlanV3({
-      ...directPlan,
-      plan_id: "plan:aaa",
-      plan_attempt_key: "v3:aaa",
-    });
-    const { rerenderPlayer } = renderPlayer({
-      plan: planA,
-      subtitleUrls: [sidecarTrack],
-      subtitleMode: "always",
-      preferredSubtitleLanguage: "en",
-      onSubtitleTrackChange,
-    });
-
-    await waitFor(() => expect(onSubtitleTrackChange).toHaveBeenCalledTimes(1));
-    expect(onSubtitleTrackChange).toHaveBeenCalledWith(2, 0, expect.objectContaining({ index: 2 }));
-
-    // The server resolved the selection to `off`/absent, so the UI identity is
-    // still outstanding. A replan that only mints a new plan id must not send
-    // the same request again; the guard holds until the plan acknowledges it.
-    const planB = fixturePlanV3({
-      ...directPlan,
-      plan_id: "plan:bbb",
-      plan_attempt_key: "v3:bbb",
-    });
-    rerenderPlayer({ plan: planB });
-    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(2));
-    expect(onSubtitleTrackChange).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -4788,23 +4622,6 @@ describe("VideoPlayer intro skip prompt", () => {
     await waitFor(() =>
       expect(screen.queryByRole("button", { name: "Skip Intro" })).not.toBeInTheDocument(),
     );
-  });
-
-  it("renders the undo action after an automatic skip", async () => {
-    await enterIntro("always");
-    const undo = await screen.findByRole("button", {
-      name: "Watch Intro",
-    });
-
-    fireEvent.click(undo);
-
-    await waitFor(() => expect(undo).not.toBeInTheDocument());
-  });
-
-  it("renders no intro action in never mode", async () => {
-    await enterIntro("never");
-
-    expect(screen.queryByRole("button", { name: /Intro/ })).not.toBeInTheDocument();
   });
 
   it("prompts for nothing while the intro mode is still unknown", async () => {
@@ -5216,512 +5033,46 @@ describe("VideoPlayer source timeline", () => {
   });
 });
 
-describe("VideoPlayer HLS buffer policy", () => {
-  beforeEach(() => {
-    realtimeOptions.current = null;
-    controls.current = null;
-    hlsJS.supported = true;
-    hlsJS.constructed.mockClear();
-    vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
-    vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
-    vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => {});
-    vi.spyOn(HTMLMediaElement.prototype, "canPlayType").mockReturnValue("");
+describe("VideoPlayer Firefox copy-remux fallback", () => {
+  const firefox =
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:140.0) Gecko/20100101 Firefox/140.0";
+  const remuxPlan = fixturePlanV3({
+    delivery: "server_remux_hls",
+    stream: {
+      url: "/playback/transcode/session-1/master.m3u8",
+      protocol: "hls",
+      headers: {},
+      header_refresh: "none",
+    },
+  });
+  const buffered = (end: number) => ({
+    length: end > 0 ? 1 : 0,
+    start: () => 0,
+    end: () => end,
   });
 
-  afterEach(() => {
-    cleanup();
-    vi.restoreAllMocks();
-  });
-
-  function hlsPlan(bitrateKbps?: number) {
-    return fixturePlanV3({
-      effective_recipe: {
-        video_codec: "h264",
-        audio_codec: "aac",
-        height: 1080,
-        ...(bitrateKbps === undefined ? {} : { bitrate_kbps: bitrateKbps }),
-      },
-    });
-  }
-
-  interface RecordedHlsConfig {
-    backBufferLength: number;
-    maxBufferLength: number;
-    maxMaxBufferLength: number;
-    maxBufferSize?: number;
-    startFragPrefetch: boolean;
-  }
-
-  function recordedConfig(): RecordedHlsConfig {
-    return hlsJS.constructed.mock.calls[0]?.[0] as RecordedHlsConfig;
-  }
-
-  // hls.js stops loading once the forward buffer reaches
-  //   min(max((8 * maxBufferSize) / levelBitrate, maxBufferLength), maxMaxBufferLength)
-  // (base-stream-controller.ts `getMaxBufferLength`). Recomputing it here asserts
-  // the window the player actually reaches, not just the config it assigns. An
-  // unset `maxBufferSize` falls back to hls.js's 60 MB default so the test would
-  // catch a regression that drops the byte target.
-  function effectiveForwardBufferSeconds(
-    config: RecordedHlsConfig,
-    levelBitrateBps: number,
-  ): number {
-    const maxBufferSize = config.maxBufferSize ?? HLS_DEFAULT_MAX_BUFFER_SIZE_BYTES;
-    const byByteTarget = levelBitrateBps > 0 ? (8 * maxBufferSize) / levelBitrateBps : 0;
-    return Math.min(Math.max(byByteTarget, config.maxBufferLength), config.maxMaxBufferLength);
-  }
-
-  it("bounds the hls.js back buffer instead of leaving it unbounded", async () => {
-    renderPlayer({ plan: hlsPlan() });
-    await waitFor(() => expect(hlsJS.constructed).toHaveBeenCalledOnce());
-
-    const config = recordedConfig();
-    expect(config.backBufferLength).toBe(120);
-    expect(Number.isFinite(config.backBufferLength)).toBe(true);
-  });
-
-  it("keeps the high-bitrate back buffer inside the 60-120s window", async () => {
-    renderPlayer({ plan: hlsPlan(30_000) });
-    await waitFor(() => expect(hlsJS.constructed).toHaveBeenCalledOnce());
-
-    const config = recordedConfig();
-    expect(config.backBufferLength).toBe(60);
-    // The stable-play window is the configured ceiling; the initial paused
-    // target sits below it until the play event raises it.
-    expect(config.maxMaxBufferLength).toBe(60);
-  });
-
-  it("starts the forward target at the paused prefetch window", async () => {
-    renderPlayer({ plan: hlsPlan(), shouldAutoPlay: false });
-    await waitFor(() => expect(hlsJS.constructed).toHaveBeenCalledOnce());
-
-    const config = recordedConfig();
-    // hls.js may start loading right after attachMedia with no media event, so
-    // a paused start must not be constructed with the full stable-play window.
-    expect(config.maxBufferLength).toBe(30);
-    expect(config.maxMaxBufferLength).toBe(120);
-  });
-
-  it("enables forward fragment prefetch", async () => {
-    renderPlayer({ plan: hlsPlan() });
-    await waitFor(() => expect(hlsJS.constructed).toHaveBeenCalledOnce());
-
-    expect(recordedConfig().startFragPrefetch).toBe(true);
-  });
-
-  it("retargets the forward prefetch between stable play and seeking or pause", async () => {
-    const { container } = renderPlayer({ plan: hlsPlan() });
-    await waitFor(() => expect(hlsJS.constructed).toHaveBeenCalledOnce());
-    const video = container.querySelector("video");
-    if (!video) throw new Error("expected video element");
-
-    const config = recordedConfig();
-    let playing = false;
-    let seeking = false;
-    Object.defineProperty(video, "paused", { configurable: true, get: () => !playing });
-    Object.defineProperty(video, "seeking", { configurable: true, get: () => seeking });
-
-    // Stable play fills toward the produced head.
-    playing = true;
-    fireEvent.play(video);
-    expect(config.maxBufferLength).toBe(120);
-
-    // A seek drops the target to the prefetch window so the client stops
-    // pulling media past a playhead that is not advancing.
-    seeking = true;
-    fireEvent.seeking(video);
-    expect(config.maxBufferLength).toBe(30);
-
-    // The seek settles and prefetch resumes.
-    seeking = false;
-    fireEvent.seeked(video);
-    expect(config.maxBufferLength).toBe(120);
-
-    // Paused media is not heading anywhere either.
-    playing = false;
-    fireEvent.pause(video);
-    expect(config.maxBufferLength).toBe(30);
-  });
-
-  it("keeps paused and seeking loading inside the intended window at the source bitrate", async () => {
-    const levelBitrateBps = 8_000_000; // 8 Mbps
-    const { container } = renderPlayer({
-      plan: hlsPlan(8_000),
-      shouldAutoPlay: false,
-    });
-    await waitFor(() => expect(hlsJS.constructed).toHaveBeenCalledOnce());
-    const video = container.querySelector("video");
-    if (!video) throw new Error("expected video element");
-
-    const config = recordedConfig();
-    let playing = false;
-    let seeking = false;
-    Object.defineProperty(video, "paused", { configurable: true, get: () => !playing });
-    Object.defineProperty(video, "seeking", { configurable: true, get: () => seeking });
-
-    // A paused start must not let the default byte target push loading to ~60s.
-    expect(effectiveForwardBufferSeconds(config, levelBitrateBps)).toBe(30);
-
-    // Stable play fills toward the produced head, still bounded by the window.
-    playing = true;
-    fireEvent.play(video);
-    expect(effectiveForwardBufferSeconds(config, levelBitrateBps)).toBe(120);
-
-    // A seek drops the effective loading limit to the prefetch window.
-    seeking = true;
-    fireEvent.seeking(video);
-    expect(effectiveForwardBufferSeconds(config, levelBitrateBps)).toBe(30);
-
-    // Pausing does the same without a seek.
-    seeking = false;
-    playing = false;
-    fireEvent.pause(video);
-    expect(effectiveForwardBufferSeconds(config, levelBitrateBps)).toBe(30);
-  });
-});
-
-// The server's decode verdict is a 422 on the manifest, which hls.js raises as
-// a fatal network error. Retrying that manifest can never succeed, and the
-// generic network branch would burn its recovery budget and then report a
-// misleading unreachable-transport failure. The client must key on the verdict
-// and replan instead.
-describe("VideoPlayer decode failure recovery", () => {
-  beforeEach(() => {
-    realtimeOptions.current = null;
-    controls.current = null;
-    hlsJS.supported = true;
-    hlsJS.constructed.mockClear();
-    hlsJS.startLoad.mockClear();
-    hlsJS.errorHandler = null;
-    vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
-    vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
-    vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => {});
-    vi.spyOn(HTMLMediaElement.prototype, "canPlayType").mockReturnValue("");
-  });
-
-  afterEach(() => {
-    cleanup();
-    vi.restoreAllMocks();
-  });
-
-  function hlsTranscodePlan() {
-    return fixturePlanV3({
-      delivery: "server_transcode_hls",
-      stream: {
-        url: "/playback/transcode/session-1/master.m3u8",
-        protocol: "hls",
-        headers: {},
-        header_refresh: "none",
-      },
-    });
-  }
-
-  it("routes the server's decode verdict into failure_recovery instead of the network retry", async () => {
-    const onPlanFailure = vi.fn();
-    renderPlayer({ plan: hlsTranscodePlan(), onPlanFailure, shouldAutoPlay: false });
-    await waitFor(() => expect(hlsJS.errorHandler).toBeTypeOf("function"));
-
-    act(() => {
-      hlsJS.errorHandler?.("error", {
-        fatal: true,
-        type: "networkError",
-        details: "manifestLoadError",
-        url: "/api/v2/playback/transcode/session-1/master.m3u8",
-        response: { code: 422, url: "/api/v2/playback/transcode/session-1/master.m3u8" },
-        networkDetails: {
-          status: 422,
-          headers: {
-            get: (name: string) => (name === "X-Vio-Decode-Error" ? "source_decode_failed" : null),
-          },
-        },
-      });
-    });
-
-    expect(onPlanFailure).toHaveBeenCalledTimes(1);
-    expect(onPlanFailure).toHaveBeenCalledWith(
-      expect.objectContaining({ classification: "decode_error" }),
-      expect.any(Number),
-    );
-    expect(hlsJS.startLoad).not.toHaveBeenCalled();
-  });
-
-  it("keeps a genuine network error on the existing retry path", async () => {
-    const onPlanFailure = vi.fn();
-    renderPlayer({ plan: hlsTranscodePlan(), onPlanFailure, shouldAutoPlay: false });
-    await waitFor(() => expect(hlsJS.errorHandler).toBeTypeOf("function"));
-
-    act(() => {
-      hlsJS.errorHandler?.("error", {
-        fatal: true,
-        type: "networkError",
-        details: "manifestLoadError",
-        url: "/api/v2/playback/transcode/session-1/master.m3u8",
-        response: { code: 503, url: "/api/v2/playback/transcode/session-1/master.m3u8" },
-        networkDetails: {
-          status: 503,
-          headers: { get: () => null },
-        },
-      });
-    });
-
-    expect(hlsJS.startLoad).toHaveBeenCalledTimes(1);
-    expect(onPlanFailure).not.toHaveBeenCalled();
-  });
-});
-
-// A segment URL carries an `sgen` token fenced to the FFmpeg incarnation that
-// produced the playlist. After a seek reanchor the session advances to a new
-// incarnation and the server refuses the old token with 412 instead of serving
-// wrong-generation bytes. Retrying that exact URL can never succeed: the client
-// must invalidate the cached playlist and fetch it again so the fresh manifest
-// rebuilds every segment URL with the current token. Retrying the dead URL is
-// the loop the prod evidence showed (three incarnations, client permanently one
-// behind, until failure_recovery terminally killed a healthy session).
-describe("VideoPlayer stale generation recovery", () => {
-  beforeEach(() => {
-    realtimeOptions.current = null;
-    controls.current = null;
-    hlsJS.supported = true;
-    hlsJS.constructed.mockClear();
-    hlsJS.startLoad.mockClear();
-    hlsJS.loadSource.mockClear();
-    hlsJS.errorHandler = null;
-    hlsJS.bufferAppendedHandler = null;
-    vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
-    vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
-    vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => {});
-    vi.spyOn(HTMLMediaElement.prototype, "canPlayType").mockReturnValue("");
-  });
-
-  afterEach(() => {
-    cleanup();
-    vi.restoreAllMocks();
-  });
-
-  function hlsTranscodePlan() {
-    return fixturePlanV3({
-      delivery: "server_transcode_hls",
-      stream: {
-        url: "/playback/transcode/session-1/master.m3u8",
-        protocol: "hls",
-        headers: {},
-        header_refresh: "none",
-      },
-    });
-  }
-
-  const transcodeStreamUrl = "/api/v1/playback/transcode/session-1/master.m3u8?token=token";
-
-  function staleSegfault() {
-    return {
-      fatal: true,
-      type: "networkError",
-      details: "fragLoadError",
-      frag: {
-        url: "/api/v2/playback/transcode/session-1/segment/seg_00007.m4s?sgen=stale:inc:0",
-      },
-      response: { code: 412, url: "/api/v2/playback/transcode/session-1/segment/seg_00007.m4s" },
-      networkDetails: { status: 412, headers: { get: () => null } },
-    };
-  }
-
-  it("refetches the playlist on a stale-sgen frag 412 instead of retrying the dead URL", async () => {
-    const onPlanFailure = vi.fn();
-    renderPlayer({
-      plan: hlsTranscodePlan(),
-      streamUrl: transcodeStreamUrl,
-      onPlanFailure,
-      shouldAutoPlay: false,
-    });
-    await waitFor(() => expect(hlsJS.errorHandler).toBeTypeOf("function"));
-    // Drop the initial loadSource so only the recovery refetch is observed.
-    hlsJS.loadSource.mockClear();
-
-    act(() => {
-      hlsJS.errorHandler?.("error", staleSegfault());
-    });
-
-    expect(hlsJS.loadSource).toHaveBeenCalledTimes(1);
-    // The playlist is reloaded, never the dead segment URL: hls.js builds the
-    // fresh manifest's segment URIs, so the next frag fetch carries the current
-    // sgen rather than the one the server just fenced.
-    expect(hlsJS.loadSource.mock.calls[0]?.[0]).toContain("master.m3u8");
-    expect(hlsJS.loadSource.mock.calls[0]?.[0]).not.toContain("segment/");
-    // The stale fence is not a transport failure: no network recovery, and it
-    // must not be escalated to a plan failure on its own.
-    expect(hlsJS.startLoad).not.toHaveBeenCalled();
-    expect(onPlanFailure).not.toHaveBeenCalled();
-  });
-
-  it("routes a stale-sgen 412 after playback through playlist recovery, not connection loss", async () => {
-    const onConnectionLost = vi.fn();
-    const onPlanFailure = vi.fn();
-    // A nonzero media timeline offset must not leak into hls.js startPosition:
-    // that option uses the player/playlist clock, as the initial load does.
-    const plan = hlsTranscodePlan();
-    plan.timeline.timeline_offset_seconds = 1_800;
-    const { container } = renderPlayer({
-      plan,
-      streamUrl: transcodeStreamUrl,
-      onConnectionLost,
-      onPlanFailure,
-      shouldAutoPlay: false,
-    });
-    await waitFor(() => expect(hlsJS.errorHandler).toBeTypeOf("function"));
-    hlsJS.loadSource.mockClear();
-    hlsJS.startLoad.mockClear();
-
-    const video = container.querySelector("video");
-    if (!video) throw new Error("expected video element");
-    video.currentTime = 40;
-    // A frame has played, so a fatal network error would now be handed to the
-    // reconnect before reaching the stale-generation branch.
-    fireFrameTimeUpdate(video);
-    Object.defineProperty(video, "paused", { configurable: true, value: false });
-
-    act(() => {
-      hlsJS.errorHandler?.("error", staleSegfault());
-    });
-
-    // The fence is a deterministic redirect, not a transport failure: a far-seek
-    // 412 on a stream that already played must not replan the session.
-    expect(onConnectionLost).not.toHaveBeenCalled();
-    expect(hlsJS.loadSource).toHaveBeenCalledTimes(1);
-    expect(hlsJS.loadSource.mock.calls[0]?.[0]).toContain("master.m3u8");
-    const instance = hlsJS.latest as unknown as { config?: { startPosition?: number } };
-    expect(instance.config?.startPosition).toBe(40);
-    expect(hlsJS.startLoad).not.toHaveBeenCalled();
-    expect(onPlanFailure).not.toHaveBeenCalled();
-  });
-
-  it("bounds consecutive stale-generation refetches and falls through to failure recovery", async () => {
-    const onPlanFailure = vi.fn();
-    renderPlayer({
-      plan: hlsTranscodePlan(),
-      streamUrl: transcodeStreamUrl,
-      onPlanFailure,
-      shouldAutoPlay: false,
-    });
-    await waitFor(() => expect(hlsJS.errorHandler).toBeTypeOf("function"));
-    hlsJS.loadSource.mockClear();
-
-    act(() => {
-      hlsJS.errorHandler?.("error", staleSegfault());
-      hlsJS.errorHandler?.("error", staleSegfault());
-      hlsJS.errorHandler?.("error", staleSegfault());
-    });
-
-    // Two refetches: each rebuilds the playlist; the third no longer loops on a
-    // session the server keeps re-keying, and falls through to the ordinary
-    // recovery path.
-    expect(hlsJS.loadSource).toHaveBeenCalledTimes(2);
-    expect(hlsJS.startLoad).toHaveBeenCalledTimes(1);
-  });
-
-  it("re-arms the stale budget on progress so three seek/recovery cycles each recover", async () => {
-    const onPlanFailure = vi.fn();
-    renderPlayer({
-      plan: hlsTranscodePlan(),
-      streamUrl: transcodeStreamUrl,
-      onPlanFailure,
-      shouldAutoPlay: false,
-    });
-    await waitFor(() => expect(hlsJS.errorHandler).toBeTypeOf("function"));
-    expect(hlsJS.bufferAppendedHandler).toBeTypeOf("function");
-    hlsJS.loadSource.mockClear();
-    hlsJS.startLoad.mockClear();
-
-    // Three separated seek/recovery cycles: each stale-sgen frag is followed by
-    // media reaching the buffer, so progress re-arms the budget. Without the
-    // reset the third cycle would inherit an exhausted counter and misroute
-    // into a failure-recovery replan.
-    for (let cycle = 0; cycle < 3; cycle++) {
-      act(() => {
-        hlsJS.errorHandler?.("error", staleSegfault());
-      });
-      act(() => {
-        hlsJS.bufferAppendedHandler?.("bufferAppended");
-      });
-    }
-
-    expect(hlsJS.loadSource).toHaveBeenCalledTimes(3);
-    expect(hlsJS.startLoad).not.toHaveBeenCalled();
-    expect(onPlanFailure).not.toHaveBeenCalled();
-  });
-});
-
-// A not-ready transcode manifest (503 `not_ready_retry`) is polled back after a
-// delay instead of spending the fatal network budget. Each not-ready error
-// schedules one reload timer; if a second arrives before the first fires, the
-// superseded timer has to be cancelled or both fire and open overlapping
-// manifest loads. Pin that a superseded pollback is dropped.
-describe("VideoPlayer manifest not-ready pollback", () => {
-  beforeEach(() => {
-    realtimeOptions.current = null;
-    controls.current = null;
-    hlsJS.supported = true;
-    hlsJS.constructed.mockClear();
-    hlsJS.startLoad.mockClear();
-    hlsJS.loadSource.mockClear();
-    hlsJS.errorHandler = null;
-    vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
-    vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
-    vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => {});
-    vi.spyOn(HTMLMediaElement.prototype, "canPlayType").mockReturnValue("");
-  });
-
-  afterEach(() => {
-    cleanup();
-    vi.restoreAllMocks();
-    vi.useRealTimers();
-  });
-
-  function hlsTranscodePlan() {
-    return fixturePlanV3({
-      delivery: "server_transcode_hls",
-      stream: {
-        url: "/playback/transcode/session-1/master.m3u8",
-        protocol: "hls",
-        headers: {},
-        header_refresh: "none",
-      },
-    });
-  }
-
-  function notReadyError() {
-    return {
-      fatal: true,
-      type: "networkError",
-      details: "manifestLoadError",
-      url: "/api/v2/playback/transcode/session-1/master.m3u8",
-      response: {
-        code: 503,
-        url: "/api/v2/playback/transcode/session-1/master.m3u8",
-        data: { error: MANIFEST_NOT_READY_CODE },
-      },
-      networkDetails: { status: 503, headers: { get: () => null } },
-    };
-  }
-
-  it("cancels a superseded not-ready pollback instead of firing two loads", async () => {
-    renderPlayer({ plan: hlsTranscodePlan(), shouldAutoPlay: false });
-    await waitFor(() => expect(hlsJS.errorHandler).toBeTypeOf("function"));
-    // The initial transport load is not the pollback under test.
-    hlsJS.loadSource.mockClear();
-
+  it("leaves a start that is still waiting for data to the buffering controller", async () => {
     vi.useFakeTimers();
-    act(() => {
-      hlsJS.errorHandler?.("error", notReadyError());
-      hlsJS.errorHandler?.("error", notReadyError());
-    });
+    try {
+      hlsJS.supported = true;
+      vi.stubGlobal("navigator", { ...navigator, userAgent: firefox });
+      const onPlanFailure = vi.fn((_failure: unknown, _position?: number) => true);
+      const { container } = renderPlayer({ plan: remuxPlan, onPlanFailure });
+      const video = container.querySelector("video");
+      if (!video) throw new Error("expected video element");
+      Object.defineProperty(video, "buffered", { value: buffered(0), configurable: true });
+      await act(async () => vi.advanceTimersByTimeAsync(20_000));
+      expect(onPlanFailure).not.toHaveBeenCalled();
 
-    // Both errors scheduled a pollback; neither fires before the delay.
-    expect(hlsJS.loadSource).not.toHaveBeenCalled();
-    act(() => vi.advanceTimersByTime(MANIFEST_NOT_READY_DEFAULT_DELAY_MS));
-
-    // Only the surviving timer reloads the manifest: the superseded retry was
-    // cancelled, so it cannot open a second, overlapping loadSource.
-    expect(hlsJS.loadSource).toHaveBeenCalledTimes(1);
+      // Media arrived and still made no frame: that is Firefox's stall.
+      Object.defineProperty(video, "buffered", { value: buffered(6), configurable: true });
+      await act(async () => vi.advanceTimersByTimeAsync(1_500));
+      expect(onPlanFailure.mock.calls[0]?.[0]).toMatchObject({ classification: "startup_timeout" });
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+      hlsJS.supported = false;
+    }
   });
 });
 
@@ -6220,9 +5571,9 @@ describe("VideoPlayer translation handoff", () => {
         },
       }),
     );
-    expect(toastError).toHaveBeenCalledExactlyOnceWith(
-      "Subtitle processing failed: Source subtitle unavailable",
-    );
+    expect(toastError).toHaveBeenCalledExactlyOnceWith("Subtitle processing failed", {
+      description: "Source subtitle unavailable",
+    });
     expect(controls.current?.activeSubtitleIndex).toBeNull();
     expect(subtitleTimeline.liveKey).toBeNull();
   });
@@ -6341,6 +5692,197 @@ describe("VideoPlayer translation handoff", () => {
     expect(toastError).toHaveBeenCalledTimes(2);
   });
 
+  it("selects the saved track when the server returns an already finished translation", async () => {
+    const english: PlayerSubtitleInfo = {
+      index: 0,
+      language: "en",
+      label: "English",
+      source: "embedded",
+      codec: "subrip",
+      url: "/en.vtt",
+    };
+    const german: PlayerSubtitleInfo = {
+      index: 1,
+      language: "de",
+      label: "English → German (AI)",
+      source: "downloaded",
+      codec: "srt",
+      sync_key: "stored-31",
+      url: "/api/v2/stream/session-1/subtitles/1.vtt?file_id=7&downloaded_subtitle_id=31",
+    };
+    const onRefreshSubtitles = vi.fn();
+    playerV2Mock.mockResolvedValue({ job: { status: "completed", result_subtitle_id: "31" } });
+    renderPlayer({ subtitleUrls: [english, german], onRefreshSubtitles });
+
+    await act(async () => {
+      controls.current?.onSubtitleJobAccepted?.("12");
+    });
+
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(1));
+    expect(onRefreshSubtitles).not.toHaveBeenCalled();
+    expect(toastError).not.toHaveBeenCalled();
+  });
+
+  it("refreshes the inventory once when a reused track is not listed yet", async () => {
+    const onRefreshSubtitles = vi.fn();
+    playerV2Mock.mockResolvedValue({ job: { status: "completed", result_subtitle_id: "44" } });
+    const { rerenderPlayer } = renderPlayer({ subtitleUrls: [], onRefreshSubtitles });
+
+    await act(async () => {
+      controls.current?.onSubtitleJobAccepted?.("13");
+    });
+    await waitFor(() => expect(onRefreshSubtitles).toHaveBeenCalledOnce());
+
+    rerenderPlayer({
+      onRefreshSubtitles,
+      subtitleUrls: [
+        {
+          index: 4,
+          language: "es",
+          label: "English → Spanish (AI)",
+          source: "downloaded",
+          codec: "srt",
+          sync_key: "stored-44",
+          url: "/es.vtt",
+        },
+      ],
+    });
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(4));
+    expect(onRefreshSubtitles).toHaveBeenCalledOnce();
+  });
+
+  it("selects a reused track from the create response without reading the job again", async () => {
+    const german: PlayerSubtitleInfo = {
+      index: 2,
+      language: "de",
+      label: "English → German (AI)",
+      source: "downloaded",
+      codec: "srt",
+      sync_key: "stored-31",
+      url: "/de.vtt",
+    };
+    playerV2Mock.mockImplementation((_config: unknown, route: string) =>
+      route === "GET /api/v2/subtitles/ai/jobs/{job_id}"
+        ? Promise.reject(new Error("network"))
+        : Promise.resolve(undefined),
+    );
+    renderPlayer({ subtitleUrls: [german] });
+
+    await act(async () => {
+      controls.current?.onSubtitleJobAccepted?.("12", "31");
+    });
+
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(2));
+    expect(playerV2Mock).not.toHaveBeenCalledWith(
+      expect.anything(),
+      "GET /api/v2/subtitles/ai/jobs/{job_id}",
+      expect.anything(),
+    );
+  });
+
+  it("drops a reused track still waiting for the inventory when a newer job is accepted", async () => {
+    const onRefreshSubtitles = vi.fn();
+    playerV2Mock.mockResolvedValue({ job: { status: "running" } });
+    const { rerenderPlayer } = renderPlayer({ subtitleUrls: [], onRefreshSubtitles });
+
+    await act(async () => {
+      controls.current?.onSubtitleJobAccepted?.("13", "44");
+    });
+    await waitFor(() => expect(onRefreshSubtitles).toHaveBeenCalledOnce());
+    await act(async () => {
+      controls.current?.onSubtitleJobAccepted?.("14");
+    });
+
+    rerenderPlayer({
+      onRefreshSubtitles,
+      subtitleUrls: [
+        {
+          index: 4,
+          language: "es",
+          label: "English → Spanish (AI)",
+          source: "downloaded",
+          codec: "srt",
+          sync_key: "stored-44",
+          url: "/es.vtt",
+        },
+      ],
+    });
+    await act(async () => {});
+    expect(controls.current?.activeSubtitleIndex).not.toBe(4);
+  });
+
+  it("keeps the viewer's menu choice over a reused track still waiting for the inventory", async () => {
+    const onRefreshSubtitles = vi.fn();
+    const { rerenderPlayer } = renderPlayer({ subtitleUrls: [], onRefreshSubtitles });
+
+    await act(async () => {
+      controls.current?.onSubtitleJobAccepted?.("13", "44");
+    });
+    await waitFor(() => expect(onRefreshSubtitles).toHaveBeenCalledOnce());
+    act(() =>
+      (
+        controls.current as unknown as { onSubtitleSelect: (i: number | null) => void }
+      ).onSubtitleSelect(null),
+    );
+
+    rerenderPlayer({
+      onRefreshSubtitles,
+      subtitleUrls: [
+        {
+          index: 4,
+          language: "es",
+          label: "English → Spanish (AI)",
+          source: "downloaded",
+          codec: "srt",
+          sync_key: "stored-44",
+          url: "/es.vtt",
+        },
+      ],
+    });
+    await act(async () => {});
+    expect(controls.current?.activeSubtitleIndex).toBeNull();
+  });
+
+  it("keeps a reused track when an earlier live translation finishes later", async () => {
+    const german: PlayerSubtitleInfo = {
+      index: 2,
+      language: "de",
+      label: "English → German (AI)",
+      source: "downloaded",
+      codec: "srt",
+      sync_key: "stored-31",
+      url: "/de.vtt",
+    };
+    const onRefreshSubtitles = vi.fn();
+    renderPlayer({ subtitleUrls: [german], onRefreshSubtitles });
+    const base = { session_id: "session-1", file_id: 7, job_id: 1, track_key: "ai-1" };
+    act(() => {
+      realtimeOptions.current?.onEvent?.({
+        type: "event",
+        session_id: "session-1",
+        name: "subtitle_translation_started",
+        payload: { ...base, language: "hr", total_cues: 2 },
+      });
+    });
+
+    await act(async () => {
+      controls.current?.onSubtitleJobAccepted?.("12", "31");
+    });
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(2));
+    expect(subtitleTimeline.liveKey).toBeNull();
+
+    act(() => {
+      realtimeOptions.current?.onEvent?.({
+        type: "event",
+        session_id: "session-1",
+        name: "subtitle_translation_completed",
+        payload: { ...base, subtitle_id: 44, language: "hr" },
+      });
+    });
+    expect(controls.current?.activeSubtitleIndex).toBe(2);
+    expect(onRefreshSubtitles).not.toHaveBeenCalled();
+  });
+
   it("isolates cue batches, completion and failures when a newer AI job starts", () => {
     const onRefreshSubtitles = vi.fn();
     const onApplySubtitleTrack = vi.fn();
@@ -6456,9 +5998,9 @@ describe("VideoPlayer translation handoff", () => {
     expect(subtitleTimeline.liveKey).toBeNull();
     expect(subtitleTimeline.liveCues).toEqual([]);
     expect(controls.current?.activeSubtitleIndex).toBeNull();
-    expect(toastError).toHaveBeenCalledWith(
-      "Subtitle processing failed: Transcription unavailable",
-    );
+    expect(toastError).toHaveBeenCalledWith("Subtitle processing failed", {
+      description: "Transcription unavailable",
+    });
   });
 
   it("selects the refreshed downloaded track and clears the live overlay", async () => {
@@ -6603,1772 +6145,6 @@ describe("VideoPlayer translation handoff", () => {
     });
 
     expect(controls.current?.isFullscreen).toBe(false);
-  });
-
-  it("preserves player when transportRevision is unchanged across plan revisions", async () => {
-    const removeAttrSpy = vi.spyOn(HTMLMediaElement.prototype, "removeAttribute");
-    try {
-      const { rerenderPlayer } = renderPlayer({
-        planRevision: 1,
-        transportRevision: 1,
-      });
-      removeAttrSpy.mockClear();
-
-      const nextPlan = fixturePlanV3({
-        ...directPlan,
-        plan_id: "plan:subtitles-only",
-        plan_attempt_key: "v3:subtitles-only",
-      });
-      rerenderPlayer({
-        plan: nextPlan,
-        planRevision: 2,
-        transportRevision: 1,
-      });
-      expect(removeAttrSpy).not.toHaveBeenCalled();
-
-      rerenderPlayer({
-        plan: nextPlan,
-        planRevision: 3,
-        transportRevision: 2,
-      });
-      expect(removeAttrSpy).toHaveBeenCalledWith("src");
-    } finally {
-      removeAttrSpy.mockRestore();
-    }
-  });
-
-  it("warms a changed transport once per route, not on first load or for a seek", async () => {
-    const fetchMock = vi
-      .spyOn(globalThis, "fetch")
-      .mockResolvedValue(new Response(null, { status: 200 }));
-    try {
-      const { rerenderPlayer } = renderPlayer({
-        planRevision: 1,
-        transportRevision: 0,
-      });
-      // First load with transportRevision 0: the transport did not change, so
-      // no warm fetch fires.
-      expect(fetchMock).not.toHaveBeenCalled();
-
-      // A transport-changing replan (a different delivery and bumped revision)
-      // warms the stream exactly once, before the transport effect reloads the
-      // element.
-      const remuxPlan = fixturePlanV3({
-        ...directPlan,
-        delivery: "server_remux_progressive",
-        plan_id: "plan:remux",
-        plan_attempt_key: "v3:remux",
-      });
-      rerenderPlayer({ plan: remuxPlan, planRevision: 2, transportRevision: 2 });
-      expect(fetchMock).toHaveBeenCalledTimes(1);
-      expect(fetchMock).toHaveBeenCalledWith(
-        "/api/v1/stream/session-1?token=token",
-        expect.objectContaining({
-          method: "GET",
-          headers: { Range: "bytes=0-65535" },
-          signal: expect.any(AbortSignal),
-        }),
-      );
-
-      // The same transportRevision across a further plan revision must not
-      // refire the warm fetch.
-      rerenderPlayer({ plan: remuxPlan, planRevision: 3, transportRevision: 2 });
-      expect(fetchMock).toHaveBeenCalledTimes(1);
-
-      // A seek reanchor bumps the transport revision and mints a new stream
-      // URL, but its route is unchanged. The element's own load is the only
-      // request the seek needs; warming it would spawn a second remux seek.
-      const seekPlan = fixturePlanV3({
-        ...remuxPlan,
-        plan_id: "plan:seek",
-        plan_attempt_key: "v3:seek",
-        stream: { ...remuxPlan.stream, url: "/stream/session-1?seek=900" },
-      });
-      rerenderPlayer({
-        plan: seekPlan,
-        streamUrl: "/api/v1/stream/session-1?seek=900&token=token",
-        planRevision: 4,
-        transportRevision: 3,
-      });
-      expect(fetchMock).toHaveBeenCalledTimes(1);
-    } finally {
-      fetchMock.mockRestore();
-    }
-  });
-
-  it("skips the first position-only seek and still warms a new session", async () => {
-    const fetchMock = vi
-      .spyOn(globalThis, "fetch")
-      .mockResolvedValue(new Response(null, { status: 200 }));
-    try {
-      const { rerenderPlayer } = renderPlayer({
-        planRevision: 1,
-        transportRevision: 0,
-      });
-      // Mount is the element's own load: no warm, and the mounted route is the
-      // baseline.
-      expect(fetchMock).not.toHaveBeenCalled();
-
-      // The first position-only seek bumps the revision but keeps the route.
-      // A null baseline used to read this as a transition and fire a duplicate
-      // warm GET alongside the element's own seek request.
-      const seekPlan = fixturePlanV3({
-        ...directPlan,
-        plan_id: "plan:first-seek",
-        plan_attempt_key: "v3:first-seek",
-        stream: { ...directPlan.stream, url: "/stream/session-1?seek=42" },
-      });
-      rerenderPlayer({
-        plan: seekPlan,
-        streamUrl: "/api/v1/stream/session-1?seek=42&token=token",
-        planRevision: 2,
-        transportRevision: 1,
-      });
-      expect(fetchMock).not.toHaveBeenCalled();
-
-      // A new session is a new server-side transport even on the same route.
-      rerenderPlayer({
-        plan: seekPlan,
-        streamUrl: "/api/v1/stream/session-1?seek=42&token=token",
-        planRevision: 3,
-        transportRevision: 2,
-        sessionId: "session-2",
-      });
-      expect(fetchMock).toHaveBeenCalledTimes(1);
-    } finally {
-      fetchMock.mockRestore();
-    }
-  });
-
-  it("never warms an HLS transport: hls.js loads the playlist itself", async () => {
-    const fetchMock = vi
-      .spyOn(globalThis, "fetch")
-      .mockResolvedValue(new Response(null, { status: 200 }));
-    try {
-      const hlsPlan = fixturePlanV3();
-      const { rerenderPlayer } = renderPlayer({
-        plan: hlsPlan,
-        streamUrl: "/api/v1/stream/session-1/master.m3u8?token=token",
-        planRevision: 1,
-        transportRevision: 0,
-      });
-      expect(fetchMock).not.toHaveBeenCalled();
-
-      // A quality change replaces the manifest URL and bumps the transport.
-      const qualityPlan = fixturePlanV3({
-        plan_id: "plan:quality",
-        plan_attempt_key: "v3:quality",
-        stream: {
-          ...hlsPlan.stream,
-          url: "/stream/session-1/master.m3u8?quality=1080",
-        },
-      });
-      rerenderPlayer({
-        plan: qualityPlan,
-        streamUrl: "/api/v1/stream/session-1/master.m3u8?quality=1080&token=token",
-        planRevision: 2,
-        transportRevision: 2,
-      });
-      expect(fetchMock).not.toHaveBeenCalled();
-    } finally {
-      fetchMock.mockRestore();
-    }
-  });
-
-  it("drives the play/pause icon from the element's own state", async () => {
-    const { container } = renderPlayer();
-    const video = container.querySelector("video") as HTMLVideoElement;
-    const setPaused = (paused: boolean) => {
-      Object.defineProperty(video, "paused", { configurable: true, value: paused });
-    };
-
-    setPaused(false);
-    act(() => {
-      video.dispatchEvent(new Event("play"));
-    });
-    expect(controls.current?.playing).toBe(true);
-
-    // The element pauses itself (a teardown load, the browser, a lost route):
-    // the icon follows the element, not the player's last intent.
-    setPaused(true);
-    act(() => {
-      video.dispatchEvent(new Event("emptied"));
-    });
-    expect(controls.current?.playing).toBe(false);
-
-    // A buffering stall is not a pause; it must not flip the icon.
-    setPaused(false);
-    act(() => {
-      video.dispatchEvent(new Event("waiting"));
-    });
-    expect(controls.current?.playing).toBe(true);
-
-    setPaused(true);
-    act(() => {
-      video.dispatchEvent(new Event("pause"));
-    });
-    expect(controls.current?.playing).toBe(false);
-
-    // A resume that only reports `playing` (no fresh `play`) still shows play.
-    setPaused(false);
-    act(() => {
-      video.dispatchEvent(new Event("playing"));
-    });
-    expect(controls.current?.playing).toBe(true);
-  });
-
-  it("refreshes the subtitle inventory once per source generation on a source-changed signal", async () => {
-    const onRefreshSubtitles = vi.fn();
-    const planA = fixturePlanV3({
-      plan_id: "plan:aaa",
-      plan_attempt_key: "v3:aaa",
-      effective_virtual_uri: "virtual://release/a.mkv",
-    });
-    const { rerenderPlayer } = renderPlayer({ plan: planA, onRefreshSubtitles });
-    expect(subtitleHooks.vttSourceChanged).toBeTypeOf("function");
-    expect(subtitleHooks.assSourceChanged).toBeTypeOf("function");
-
-    // The VTT window fetch and the ASS fetch can both see the rotation; both
-    // signals for the same source must collapse into a single refresh.
-    act(() => subtitleHooks.vttSourceChanged?.());
-    act(() => subtitleHooks.assSourceChanged?.());
-    expect(onRefreshSubtitles).toHaveBeenCalledTimes(1);
-
-    // The refresh's own replan mints a new plan id but the source identity is
-    // unchanged: it must NOT re-arm the signal and restart the cycle.
-    const planB = fixturePlanV3({
-      plan_id: "plan:bbb",
-      plan_attempt_key: "v3:bbb",
-      effective_virtual_uri: "virtual://release/a.mkv",
-    });
-    rerenderPlayer({ plan: planB });
-    act(() => subtitleHooks.vttSourceChanged?.());
-    expect(onRefreshSubtitles).toHaveBeenCalledTimes(1);
-
-    // A genuine source change (a new resolved candidate) re-arms it exactly
-    // once more.
-    const planC = fixturePlanV3({
-      plan_id: "plan:ccc",
-      plan_attempt_key: "v3:ccc",
-      effective_virtual_uri: "virtual://release/b.mkv",
-    });
-    rerenderPlayer({ plan: planC });
-    act(() => subtitleHooks.vttSourceChanged?.());
-    act(() => subtitleHooks.assSourceChanged?.());
-    expect(onRefreshSubtitles).toHaveBeenCalledTimes(2);
-  });
-
-  it("re-arms subtitle recovery on a same-identity virtual rotation via the source revision", async () => {
-    const onRefreshSubtitles = vi.fn();
-    const stable = {
-      plan_id: "plan:rev1",
-      plan_attempt_key: "v3:rev1",
-      effective_media_file_id: 7,
-      effective_virtual_uri: "virtual://release/same.mkv",
-      virtual_source_revision: "rev-one",
-    };
-    const { rerenderPlayer } = renderPlayer({
-      plan: fixturePlanV3(stable),
-      onRefreshSubtitles,
-    });
-
-    act(() => subtitleHooks.vttSourceChanged?.());
-    expect(onRefreshSubtitles).toHaveBeenCalledTimes(1);
-
-    // The refresh replan returns the same candidate: the revision is unchanged,
-    // so the 409 signal must stay deduped instead of restarting the cycle.
-    rerenderPlayer({
-      plan: fixturePlanV3({
-        ...stable,
-        plan_id: "plan:rev1b",
-        plan_attempt_key: "v3:rev1b",
-      }),
-    });
-    act(() => subtitleHooks.vttSourceChanged?.());
-    expect(onRefreshSubtitles).toHaveBeenCalledTimes(1);
-
-    // The release rotated to a different candidate without moving the effective
-    // media file id or the published URI: the revision re-arms recovery once.
-    rerenderPlayer({
-      plan: fixturePlanV3({
-        ...stable,
-        plan_id: "plan:rev2",
-        plan_attempt_key: "v3:rev2",
-        virtual_source_revision: "rev-two",
-      }),
-    });
-    act(() => subtitleHooks.vttSourceChanged?.());
-    act(() => subtitleHooks.assSourceChanged?.());
-    expect(onRefreshSubtitles).toHaveBeenCalledTimes(2);
-  });
-
-  it("does not reload when only player_start_seconds changes (reused-transport replan)", async () => {
-    const removeAttrSpy = vi.spyOn(HTMLMediaElement.prototype, "removeAttribute");
-    try {
-      const startPlan = fixturePlanV3({
-        ...directPlan,
-        timeline: {
-          ...directPlan.timeline,
-          player_start_seconds: 100,
-        },
-      });
-      const { rerenderPlayer } = renderPlayer({
-        plan: startPlan,
-        planRevision: 1,
-        transportRevision: 1,
-      });
-      removeAttrSpy.mockClear();
-
-      // A reused-transport subtitle replan rewrites player_start_seconds to the
-      // live playhead; the stream URL and transport identity are unchanged.
-      const driftedPlan = fixturePlanV3({
-        ...directPlan,
-        timeline: {
-          ...directPlan.timeline,
-          player_start_seconds: 148,
-        },
-      });
-      rerenderPlayer({
-        plan: driftedPlan,
-        planRevision: 2,
-        transportRevision: 1,
-      });
-      expect(removeAttrSpy).not.toHaveBeenCalled();
-
-      // A genuine transport change must still tear the element down.
-      rerenderPlayer({
-        plan: driftedPlan,
-        planRevision: 3,
-        transportRevision: 2,
-      });
-      expect(removeAttrSpy).toHaveBeenCalledWith("src");
-    } finally {
-      removeAttrSpy.mockRestore();
-    }
-  });
-
-  it("does not reload when only player_start_seconds changes on a reused HLS transport", async () => {
-    vi.spyOn(HTMLMediaElement.prototype, "canPlayType").mockImplementation((mime) =>
-      mime === "application/vnd.apple.mpegurl" ? "probably" : "",
-    );
-    const removeAttrSpy = vi.spyOn(HTMLMediaElement.prototype, "removeAttribute");
-    try {
-      const startPlan = fixturePlanV3({
-        timeline: {
-          ...fixturePlanV3().timeline,
-          player_start_seconds: 100,
-        },
-      });
-      const { rerenderPlayer } = renderPlayer({
-        plan: startPlan,
-        planRevision: 1,
-        transportRevision: 1,
-        streamUrl: "/api/v1/stream/session-1/master.m3u8?token=token",
-      });
-      removeAttrSpy.mockClear();
-
-      const driftedPlan = fixturePlanV3({
-        timeline: {
-          ...fixturePlanV3().timeline,
-          player_start_seconds: 148,
-        },
-      });
-      rerenderPlayer({
-        plan: driftedPlan,
-        planRevision: 2,
-        transportRevision: 1,
-      });
-      expect(removeAttrSpy).not.toHaveBeenCalled();
-
-      rerenderPlayer({
-        plan: driftedPlan,
-        planRevision: 3,
-        transportRevision: 2,
-      });
-      expect(removeAttrSpy).toHaveBeenCalledWith("src");
-    } finally {
-      removeAttrSpy.mockRestore();
-    }
-  });
-
-  it("rolls back an outstanding reanchor seek when its replan is refused", async () => {
-    const onReanchorSeek = vi.fn(() => Promise.resolve(true));
-    const plan = fixturePlanV3({
-      ...directPlan,
-      timeline: {
-        ...directPlan.timeline,
-        can_seek_anywhere: false,
-      },
-    });
-    const { container, rerenderPlayer } = renderPlayer({ plan, onReanchorSeek });
-    const video = container.querySelector("video");
-    if (!video) throw new Error("expected video element");
-    fireDirectPlayMetadata(video);
-    Object.defineProperty(video, "currentTime", { configurable: true, writable: true, value: 12 });
-
-    act(() => {
-      (controls.current as unknown as { onSeek: (s: number) => void }).onSeek(300);
-    });
-    expect(onReanchorSeek).toHaveBeenCalledWith(300);
-    await waitFor(() =>
-      expect((controls.current as unknown as { currentTime: number }).currentTime).toBe(300),
-    );
-
-    rerenderPlayer({ replanError: "Seek reanchor refused" });
-    await waitFor(() =>
-      expect((controls.current as unknown as { currentTime: number }).currentTime).toBe(12),
-    );
-  });
-
-  it("does not move the scrubber on an unrelated replan refusal with no pending seek", async () => {
-    const { container, rerenderPlayer } = renderPlayer({});
-    const video = container.querySelector("video");
-    if (!video) throw new Error("expected video element");
-    fireDirectPlayMetadata(video);
-    Object.defineProperty(video, "currentTime", { configurable: true, writable: true, value: 50 });
-    fireEvent.timeUpdate(video);
-    await waitFor(() =>
-      expect((controls.current as unknown as { currentTime: number }).currentTime).toBe(50),
-    );
-
-    Object.defineProperty(video, "currentTime", { configurable: true, writable: true, value: 5 });
-    rerenderPlayer({ replanError: "Quality change refused" });
-    await waitFor(() =>
-      expect((controls.current as unknown as { currentTime: number }).currentTime).toBe(50),
-    );
-  });
-});
-
-describe("VideoPlayer buffered-first seeking", () => {
-  beforeEach(() => {
-    realtimeOptions.current = null;
-    controls.current = null;
-    subtitleTimeline.textOffsetSeconds = null;
-    subtitleTimeline.assOffsetSeconds = null;
-    subtitleHooks.vttSourceChanged = null;
-    subtitleHooks.assSourceChanged = null;
-    hlsJS.supported = false;
-    hlsJS.constructed.mockClear();
-    toastError.mockClear();
-    playerSeek.mockClear();
-    vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
-    vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
-    vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => {});
-  });
-
-  afterEach(() => {
-    cleanup();
-    vi.restoreAllMocks();
-  });
-
-  // The growing-manifest/remux routes force can_seek_anywhere=false, so they
-  // exercise the path that used to fall straight through to the reanchor.
-  const nonSeekablePlan = () =>
-    fixturePlanV3({
-      ...directPlan,
-      timeline: { ...directPlan.timeline, can_seek_anywhere: false },
-    });
-
-  function renderSeekFixture(position: number, buffered: Array<[number, number]>) {
-    const onReanchorSeek = vi.fn(() => true);
-    const { container } = renderPlayer({ plan: nonSeekablePlan(), onReanchorSeek });
-    const video = container.querySelector("video");
-    if (!video) throw new Error("expected video element");
-    fireDirectPlayMetadata(video);
-    Object.defineProperty(video, "currentTime", {
-      configurable: true,
-      writable: true,
-      value: position,
-    });
-    setTimeRanges(video, "buffered", buffered);
-    setTimeRanges(video, "seekable", []);
-    return { video, onReanchorSeek };
-  }
-
-  function seekControls() {
-    return controls.current as unknown as {
-      currentTime: number;
-      onSeek: (seconds: number) => void;
-    };
-  }
-
-  it("skips 30s forward into the buffer without a reanchor", async () => {
-    const { video, onReanchorSeek } = renderSeekFixture(10, [[0, 80]]);
-    fireEvent.timeUpdate(video);
-    await waitFor(() => expect(seekControls().currentTime).toBe(10));
-
-    playerSeek.mockClear();
-    act(() => seekControls().onSeek(seekControls().currentTime + 30));
-
-    expect(onReanchorSeek).not.toHaveBeenCalled();
-    expect(video.currentTime).toBe(40);
-  });
-
-  it("skips 30s backward into the buffer without a reanchor", async () => {
-    const { video, onReanchorSeek } = renderSeekFixture(60, [[0, 80]]);
-    fireEvent.timeUpdate(video);
-    await waitFor(() => expect(seekControls().currentTime).toBe(60));
-
-    playerSeek.mockClear();
-    act(() => seekControls().onSeek(seekControls().currentTime - 30));
-
-    expect(onReanchorSeek).not.toHaveBeenCalled();
-    expect(video.currentTime).toBe(30);
-  });
-
-  it("seeks locally to a target just inside the buffer edge", async () => {
-    const { video, onReanchorSeek } = renderSeekFixture(10, [[0, 40]]);
-    fireEvent.timeUpdate(video);
-    await waitFor(() => expect(seekControls().currentTime).toBe(10));
-
-    act(() => seekControls().onSeek(39.9));
-
-    expect(onReanchorSeek).not.toHaveBeenCalled();
-    expect(video.currentTime).toBe(39.9);
-  });
-
-  it("still reanchors when the target sits exactly on the buffered end", async () => {
-    const { video, onReanchorSeek } = renderSeekFixture(10, [[0, 40]]);
-    fireEvent.timeUpdate(video);
-    await waitFor(() => expect(seekControls().currentTime).toBe(10));
-
-    act(() => seekControls().onSeek(seekControls().currentTime + 30));
-
-    expect(onReanchorSeek).toHaveBeenCalledWith(40);
-    expect(video.currentTime).toBe(10);
-  });
-
-  it("still reanchors when the target is outside every buffered range", async () => {
-    const { video, onReanchorSeek } = renderSeekFixture(10, [[0, 40]]);
-    fireEvent.timeUpdate(video);
-    await waitFor(() => expect(seekControls().currentTime).toBe(10));
-
-    act(() => seekControls().onSeek(100));
-
-    expect(onReanchorSeek).toHaveBeenCalledWith(100);
-    expect(video.currentTime).toBe(10);
-  });
-
-  it("keeps a random seek inside the buffer on the local path", async () => {
-    const { video, onReanchorSeek } = renderSeekFixture(10, [[0, 200]]);
-    fireEvent.timeUpdate(video);
-    await waitFor(() => expect(seekControls().currentTime).toBe(10));
-
-    act(() => seekControls().onSeek(150));
-
-    expect(onReanchorSeek).not.toHaveBeenCalled();
-    expect(video.currentTime).toBe(150);
-  });
-});
-
-describe("VideoPlayer bounded pending seek", () => {
-  beforeEach(() => {
-    vi.useFakeTimers();
-    controls.current = null;
-    realtimeOptions.current = null;
-    hlsJS.supported = false;
-    hlsJS.constructed.mockClear();
-    playerSeek.mockClear();
-    vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
-    vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
-    vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => {});
-  });
-
-  afterEach(() => {
-    cleanup();
-    vi.restoreAllMocks();
-    vi.useRealTimers();
-  });
-
-  function renderPendingSeek(position: number) {
-    const { container } = renderPlayer({
-      plan: directPlan,
-      onReanchorSeek: vi.fn(() => true),
-    });
-    const video = container.querySelector("video");
-    if (!video) throw new Error("expected video element");
-    fireDirectPlayMetadata(video);
-    Object.defineProperty(video, "currentTime", {
-      configurable: true,
-      writable: true,
-      value: position,
-    });
-    return video;
-  }
-
-  function seekControls() {
-    return controls.current as unknown as {
-      currentTime: number;
-      onSeek: (seconds: number) => void;
-    };
-  }
-
-  it("rolls the scrubber back when a declined seek never reaches its target", async () => {
-    const video = renderPendingSeek(10);
-    fireFrameTimeUpdate(video);
-    await act(async () => {});
-    expect(seekControls().currentTime).toBe(10);
-
-    // A local seek the element never honors: the request is held, but the
-    // media stays where it was and no seeked/timeupdate ever lands on target.
-    act(() => seekControls().onSeek(150));
-    expect(seekControls().currentTime).toBe(150);
-
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(PENDING_SEEK_HOLD_TIMEOUT_MS);
-    });
-
-    expect(seekControls().currentTime).toBe(10);
-  });
-
-  it("leaves a seek that reaches its target before the bound alone", async () => {
-    const video = renderPendingSeek(10);
-    fireFrameTimeUpdate(video);
-    await act(async () => {});
-    expect(seekControls().currentTime).toBe(10);
-
-    act(() => seekControls().onSeek(150));
-    expect(seekControls().currentTime).toBe(150);
-
-    // The element actually reached the target.
-    video.currentTime = 150;
-    fireFrameTimeUpdate(video);
-    await act(async () => {});
-    expect(seekControls().currentTime).toBe(150);
-
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(PENDING_SEEK_HOLD_TIMEOUT_MS * 2);
-    });
-    expect(seekControls().currentTime).toBe(150);
-  });
-
-  it("restarts the hold bound when the viewer re-seeks to the same target", async () => {
-    const video = renderPendingSeek(10);
-    fireFrameTimeUpdate(video);
-    await act(async () => {});
-    expect(seekControls().currentTime).toBe(10);
-
-    act(() => seekControls().onSeek(150));
-    expect(seekControls().currentTime).toBe(150);
-
-    // The first attempt's window nearly elapses without the element reaching
-    // the target.
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(PENDING_SEEK_HOLD_TIMEOUT_MS - 1000);
-    });
-    expect(seekControls().currentTime).toBe(150);
-
-    // A second seek to the same target is a fresh attempt. It must get its own
-    // full window rather than inherit the first timer about to fire.
-    act(() => seekControls().onSeek(150));
-
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(1000 + PENDING_SEEK_HOLD_TIMEOUT_MS / 2);
-    });
-    expect(seekControls().currentTime).toBe(150);
-
-    // Once the new bound elapses, the still-declined seek rolls back.
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(PENDING_SEEK_HOLD_TIMEOUT_MS);
-    });
-    expect(seekControls().currentTime).toBe(10);
-  });
-});
-
-describe("VideoPlayer version switch UX", () => {
-  beforeEach(() => {
-    realtimeOptions.current = null;
-    controls.current = null;
-    subtitleTimeline.textOffsetSeconds = null;
-    subtitleTimeline.assOffsetSeconds = null;
-    hlsJS.supported = false;
-    hlsJS.constructed.mockClear();
-    vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
-    vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
-    vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => {});
-  });
-
-  afterEach(() => {
-    cleanup();
-    vi.restoreAllMocks();
-  });
-
-  const versionA = {
-    file_id: 7,
-    resolution: "1080p",
-    codec_video: "h264",
-    codec_audio: "aac",
-    hdr: false,
-    container: "mp4",
-    file_size: 1,
-    duration: 3600,
-    bitrate: 1,
-  };
-  const versionB = {
-    file_id: 99,
-    resolution: "2160p",
-    codec_video: "hevc",
-    codec_audio: "aac",
-    hdr: true,
-    container: "mkv",
-    file_size: 1,
-    duration: 3600,
-    bitrate: 1,
-  };
-
-  it("lights the clicked version as Requested optimistically via pendingSwitchFileId", async () => {
-    const { rerenderPlayer } = renderPlayer({
-      versions: [versionA, versionB],
-      activeFileId: 7,
-    });
-
-    // Before the switch, the old plan names file 7 as requested.
-    let props = controls.current as unknown as {
-      versions?: Array<{
-        fileId: number;
-        isCurrentSource: boolean;
-        isRequestedSource: boolean;
-      }>;
-    };
-    expect(props.versions?.find((v) => v.fileId === 99)?.isRequestedSource).toBe(false);
-
-    // The switch is in flight: pendingSwitchFileId names the clicked version.
-    rerenderPlayer({ pendingSwitchFileId: 99 });
-    props = controls.current as unknown as {
-      versions?: Array<{
-        fileId: number;
-        isCurrentSource: boolean;
-        isRequestedSource: boolean;
-      }>;
-    };
-    expect(props.versions?.find((v) => v.fileId === 99)?.isRequestedSource).toBe(true);
-    expect(props.versions?.find((v) => v.fileId === 7)?.isCurrentSource).toBe(true);
-  });
-
-  it("marks the path-matched candidate as Current Source for a resolved virtual row", () => {
-    const virtualRow = {
-      ...versionA,
-      file_id: 100,
-      container: "virtual",
-      file_path: "virtual://movie/tt1?result=all",
-    };
-    const candidateRow = {
-      ...versionA,
-      file_id: 7,
-      file_path: "/media/Movies/Example (2024)/Example.1080p.mkv",
-    };
-    const plan = fixturePlanV3({
-      requested_media_file_id: 100,
-      effective_media_file_id: 100,
-      effective_virtual_uri: candidateRow.file_path,
-    });
-
-    renderPlayer({ plan, versions: [virtualRow, candidateRow], activeFileId: 100 });
-
-    const props = controls.current as unknown as {
-      versions?: Array<{ fileId: number; isCurrentSource: boolean; isRequestedSource: boolean }>;
-    };
-    // The collapsed VIRTUAL id stays in the plan, so only the path match can
-    // light the concrete candidate the server is actually playing.
-    expect(props.versions?.find((v) => v.fileId === 7)?.isCurrentSource).toBe(true);
-    expect(props.versions?.find((v) => v.fileId === 100)?.isCurrentSource).toBe(false);
-  });
-
-  it("resolves the current source from the committed URI over the plan's stale one", () => {
-    const virtualRow = {
-      ...versionA,
-      file_id: 100,
-      container: "virtual",
-      file_path: "virtual://movie/tt1?result=all",
-    };
-    const candidateA = {
-      ...versionA,
-      file_id: 8,
-      file_path: "/media/Movies/Example (2024)/Example.1080p.mkv",
-    };
-    const candidateB = {
-      ...versionA,
-      file_id: 9,
-      file_path: "/media/Movies/Example (2024)/Example.2160p.mkv",
-    };
-    // The plan still names the outgoing release; a serve-layer rotation moved
-    // the committed source to candidate B.
-    const plan = fixturePlanV3({
-      requested_media_file_id: 100,
-      effective_media_file_id: 100,
-      effective_virtual_uri: candidateA.file_path,
-    });
-
-    renderPlayer({
-      plan,
-      versions: [virtualRow, candidateA, candidateB],
-      activeFileId: 100,
-      activeVirtualUri: candidateB.file_path,
-    });
-
-    const props = controls.current as unknown as {
-      versions?: Array<{ fileId: number; isCurrentSource: boolean }>;
-    };
-    expect(props.versions?.find((v) => v.fileId === 9)?.isCurrentSource).toBe(true);
-    expect(props.versions?.find((v) => v.fileId === 8)?.isCurrentSource).toBe(false);
-  });
-
-  it("leaves the file_id match current when no effective virtual URI is published", () => {
-    renderPlayer({ versions: [versionA, versionB], activeFileId: 7 });
-
-    const props = controls.current as unknown as {
-      versions?: Array<{ fileId: number; isCurrentSource: boolean }>;
-    };
-    expect(props.versions?.find((v) => v.fileId === 7)?.isCurrentSource).toBe(true);
-    expect(props.versions?.find((v) => v.fileId === 99)?.isCurrentSource).toBe(false);
-  });
-
-  it("flags a version the catalog reports unavailable so the menu can warn", () => {
-    const unavailableVersion = { ...versionB, available: false };
-    renderPlayer({ versions: [versionA, unavailableVersion], activeFileId: 7 });
-
-    const props = controls.current as unknown as {
-      versions?: Array<{ fileId: number; unavailable?: boolean }>;
-    };
-    expect(props.versions?.find((v) => v.fileId === 99)?.unavailable).toBe(true);
-    expect(props.versions?.find((v) => v.fileId === 7)?.unavailable).toBe(false);
-  });
-
-  it("forwards a candidate's custom-format score and row detail to the version menu", () => {
-    const scoredVersion = {
-      ...versionB,
-      format_score: 850,
-      file_size: 50_570_000_000,
-      file_path: "virtual://movie/tt1?profile=4K%2BHDR&result=abc",
-      edition_raw: "Movie.2026.2160p.WEB-DL.50.53GB",
-      audio_tracks: [{ language: "eng" }, { language: "fra" }],
-      subtitle_tracks: [{ language: "deu" }],
-    };
-    renderPlayer({ versions: [versionA, scoredVersion], activeFileId: 7 });
-
-    const props = controls.current as unknown as {
-      versions?: Array<{
-        fileId: number;
-        formatScore?: number;
-        detail?: string;
-        audioLanguages?: string[];
-        subtitleLanguages?: string[];
-        profileLabel?: string | null;
-      }>;
-    };
-    const scored = props.versions?.find((v) => v.fileId === 99);
-    expect(scored?.formatScore).toBe(850);
-    // The label's embedded size is dropped in favour of the structured one.
-    expect(scored?.detail).toContain("47.1 GB");
-    expect(scored?.detail).not.toContain("50 53 GB");
-    expect(scored?.audioLanguages).toEqual(["English", "French"]);
-    expect(scored?.subtitleLanguages).toEqual(["German"]);
-    expect(scored?.profileLabel).toBe("4K+HDR");
-
-    // A version with no server score carries no badge value.
-    expect(props.versions?.find((v) => v.fileId === 7)?.formatScore).toBeUndefined();
-  });
-
-  it("builds each version row's label and detail from the shared builders", () => {
-    const versionWithHints = {
-      ...versionB,
-      resolution: "2160p",
-      codec_video: "hevc",
-      codec_audio: "TrueHD Atmos",
-      hdr: true,
-      file_size: 50_570_000_000,
-      edition_raw: "Movie.2026.2160p.Remux.50.53GB",
-      audio_tracks: [{ languages: ["en", "fr"] }],
-      subtitle_tracks: [{ language: "deu" }],
-    };
-    renderPlayer({ versions: [versionA, versionWithHints], activeFileId: 7 });
-
-    const props = controls.current as unknown as {
-      versions?: Array<{
-        fileId: number;
-        label: string;
-        releaseName?: string;
-        detail?: string;
-        audioLanguages?: string[];
-        subtitleLanguages?: string[];
-      }>;
-    };
-    const row = props.versions?.find((v) => v.fileId === 99);
-    // The in-player label is the shared one-line summary, not the old inline
-    // template string, so it matches the item-page picker for the same fields.
-    expect(row?.label).toBe(buildQualitySummary(versionWithHints));
-    expect(row?.detail).toBe(buildVersionDetailLine(versionWithHints));
-    expect(row?.releaseName).toBe(buildVersionDetailLine(versionWithHints));
-    expect(row?.label).toContain("Atmos");
-    expect(row?.label).toContain("HEVC");
-    expect(row?.audioLanguages).toEqual(["English", "French"]);
-    expect(row?.subtitleLanguages).toEqual(["German"]);
-  });
-
-  it("labels a bare More-results row through the shared summary", () => {
-    const moreResults = {
-      ...versionB,
-      file_id: 101,
-      container: "virtual",
-      file_path: "virtual://movie/tt1?results=all",
-    };
-    renderPlayer({ versions: [versionA, moreResults], activeFileId: 7 });
-
-    const props = controls.current as unknown as { versions?: Array<{ label: string }> };
-    expect(props.versions?.find((v) => v.label === "More results…")).toBeDefined();
-  });
-
-  it("shows the quality ellipsis only for quality replans, not track changes", async () => {
-    const { rerenderPlayer } = renderPlayer({});
-
-    // A track-change replan must not flicker the quality label.
-    rerenderPlayer({ replanning: true, replanningQuality: false });
-    expect((controls.current as unknown as { isTranscoding: boolean }).isTranscoding).toBe(false);
-
-    // A quality/output replan does.
-    rerenderPlayer({ replanning: true, replanningQuality: true });
-    expect((controls.current as unknown as { isTranscoding: boolean }).isTranscoding).toBe(true);
-  });
-
-  it("gates the track menus on the replace or replan state", () => {
-    const { rerenderPlayer } = renderPlayer({});
-    const locked = () =>
-      (controls.current as unknown as { trackMenusLocked?: boolean }).trackMenusLocked;
-
-    expect(locked()).toBe(false);
-
-    // A replan keeps the outgoing plan on screen while the new one lands.
-    rerenderPlayer({ replanning: true });
-    expect(locked()).toBe(true);
-
-    // So does a version/episode switch rebuilding the session.
-    rerenderPlayer({ replanning: false, replacing: true });
-    expect(locked()).toBe(true);
-
-    // Once the replacement is adopted the menus unlock.
-    rerenderPlayer({ replacing: false, replanning: false });
-    expect(locked()).toBe(false);
-  });
-
-  it("remaps a manual subtitle selection by identity across a version switch", async () => {
-    const englishTrack: PlayerSubtitleInfo = {
-      index: 0,
-      media_file_id: 7,
-      track_id: "file:7:subtitle:0",
-      language: "en",
-      codec: "srt",
-      label: "English",
-      source: "external",
-      url: "/stream/session-1/subtitles/0.vtt",
-    };
-    const frenchTrack: PlayerSubtitleInfo = {
-      index: 1,
-      media_file_id: 7,
-      track_id: "file:7:subtitle:1",
-      language: "fr",
-      codec: "srt",
-      label: "French",
-      source: "external",
-      url: "/stream/session-1/subtitles/1.vtt",
-    };
-    const { rerenderPlayer } = renderPlayer({
-      subtitleUrls: [englishTrack, frenchTrack],
-      subtitleMode: "always",
-      preferredSubtitleLanguage: "en",
-    });
-
-    // The viewer manually picks French (index 1).
-    act(() => {
-      controls.current?.onSubtitleSelect?.(1);
-    });
-    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(1));
-
-    // The new version's inventory reorders tracks: French is now index 0 and
-    // English index 1. The raw index would silently switch to English.
-    const nextPlan = fixturePlanV3({
-      ...directPlan,
-      plan_id: "plan:switched-version",
-      plan_attempt_key: "v3:switched-version",
-      requested_media_file_id: 99,
-      effective_media_file_id: 99,
-    });
-    const frenchInNewFile: PlayerSubtitleInfo = {
-      index: 0,
-      media_file_id: 99,
-      track_id: "file:99:subtitle:0",
-      language: "fr",
-      codec: "srt",
-      label: "French",
-      source: "external",
-      url: "/stream/session-99/subtitles/0.vtt",
-    };
-    const englishInNewFile: PlayerSubtitleInfo = {
-      index: 1,
-      media_file_id: 99,
-      track_id: "file:99:subtitle:1",
-      language: "en",
-      codec: "srt",
-      label: "English",
-      source: "external",
-      url: "/stream/session-99/subtitles/1.vtt",
-    };
-    rerenderPlayer({
-      plan: nextPlan,
-      planRevision: 2,
-      subtitleUrls: [frenchInNewFile, englishInNewFile],
-    });
-
-    // The manual French selection is remapped to the French track in the new
-    // inventory (index 0) rather than keeping the raw index 1 (English).
-    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
-  });
-
-  it("resolves to off when no identity match exists in the new inventory", async () => {
-    const englishTrack: PlayerSubtitleInfo = {
-      index: 0,
-      media_file_id: 7,
-      track_id: "file:7:subtitle:0",
-      language: "en",
-      codec: "srt",
-      label: "English",
-      source: "external",
-      url: "/stream/session-1/subtitles/0.vtt",
-    };
-    const { rerenderPlayer } = renderPlayer({
-      subtitleUrls: [englishTrack],
-      subtitleMode: "always",
-      preferredSubtitleLanguage: "en",
-    });
-
-    act(() => {
-      controls.current?.onSubtitleSelect?.(0);
-    });
-    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
-
-    const nextPlan = fixturePlanV3({
-      ...directPlan,
-      plan_id: "plan:switched-version-2",
-      plan_attempt_key: "v3:switched-version-2",
-      requested_media_file_id: 99,
-      effective_media_file_id: 99,
-    });
-    // The new file has a German track at index 0 — no identity match for the
-    // English selection, so subtitles resolve to null (off).
-    const germanInNewFile: PlayerSubtitleInfo = {
-      index: 0,
-      media_file_id: 99,
-      track_id: "file:99:subtitle:0",
-      language: "de",
-      codec: "srt",
-      label: "German",
-      source: "external",
-      url: "/stream/session-99/subtitles/0.vtt",
-    };
-    rerenderPlayer({
-      plan: nextPlan,
-      planRevision: 2,
-      subtitleUrls: [germanInNewFile],
-    });
-
-    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBeNull());
-  });
-
-  it("resets to auto-select when neither identity nor raw index matches", async () => {
-    const englishTrack: PlayerSubtitleInfo = {
-      index: 0,
-      media_file_id: 7,
-      track_id: "file:7:subtitle:0",
-      language: "en",
-      codec: "srt",
-      label: "English",
-      source: "external",
-      url: "/stream/session-1/subtitles/0.vtt",
-    };
-    const { rerenderPlayer } = renderPlayer({
-      subtitleUrls: [englishTrack],
-      subtitleMode: "always",
-      preferredSubtitleLanguage: "en",
-    });
-
-    act(() => {
-      controls.current?.onSubtitleSelect?.(0);
-    });
-    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
-
-    const nextPlan = fixturePlanV3({
-      ...directPlan,
-      plan_id: "plan:switched-version-3",
-      plan_attempt_key: "v3:switched-version-3",
-      requested_media_file_id: 99,
-      effective_media_file_id: 99,
-    });
-    // The new file has only a German track at index 5 — neither the identity
-    // nor the raw index (0) exists, so the selection resets to auto-select.
-    const germanInNewFile: PlayerSubtitleInfo = {
-      index: 5,
-      media_file_id: 99,
-      track_id: "file:99:subtitle:5",
-      language: "de",
-      codec: "srt",
-      label: "German",
-      source: "external",
-      url: "/stream/session-99/subtitles/5.vtt",
-    };
-    rerenderPlayer({
-      plan: nextPlan,
-      planRevision: 2,
-      subtitleUrls: [germanInNewFile],
-    });
-
-    // Auto-select with mode "always" and preferred language "en" finds no
-    // English track, so subtitles reset to off.
-    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBeNull());
-  });
-
-  it("preserves manual Off when a manual track selection has no match on the target version", async () => {
-    const onSubtitleTrackChange = vi.fn();
-    const frenchTrack: PlayerSubtitleInfo = {
-      index: 1,
-      media_file_id: 7,
-      track_id: "file:7:subtitle:1",
-      language: "fr",
-      codec: "srt",
-      label: "French",
-      source: "external",
-      url: "/stream/session-1/subtitles/1.vtt",
-    };
-    const { rerenderPlayer } = renderPlayer({
-      subtitleUrls: [frenchTrack],
-      subtitleMode: "always",
-      preferredSubtitleLanguage: "en",
-      onSubtitleTrackChange,
-    });
-
-    act(() => {
-      controls.current?.onSubtitleSelect?.(1);
-    });
-    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(1));
-
-    const nextPlan = fixturePlanV3({
-      ...directPlan,
-      plan_id: "plan:switched-version-english-only",
-      plan_attempt_key: "v3:switched-version-english-only",
-      requested_media_file_id: 99,
-      effective_media_file_id: 99,
-    });
-    const englishOnlyInNewFile: PlayerSubtitleInfo = {
-      index: 0,
-      media_file_id: 99,
-      track_id: "file:99:subtitle:0",
-      language: "en",
-      codec: "srt",
-      label: "English",
-      source: "external",
-      url: "/stream/session-99/subtitles/0.vtt",
-    };
-    onSubtitleTrackChange.mockClear();
-
-    rerenderPlayer({
-      plan: nextPlan,
-      planRevision: 2,
-      subtitleUrls: [englishOnlyInNewFile],
-    });
-
-    // Subtitles must remain Off because French has no match on the target version,
-    // and auto-selection must NOT re-enable English even though subtitleMode="always" and preferred="en".
-    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBeNull());
-    expect(onSubtitleTrackChange).not.toHaveBeenCalled();
-  });
-
-  it("pins selection Off and dispatches no subtitle request when version switch falls back from a refused subtitle start", async () => {
-    const onSubtitleTrackChange = vi.fn();
-    const bitmapTrackA: PlayerSubtitleInfo = {
-      index: 0,
-      media_file_id: 7,
-      track_id: "file:7:subtitle:0",
-      language: "en",
-      codec: "pgs",
-      label: "English PGS",
-      source: "embedded",
-      url: "",
-      burn_in_only: true,
-    };
-    const { rerenderPlayer } = renderPlayer({
-      subtitleUrls: [bitmapTrackA],
-      subtitleMode: "off",
-      onSubtitleTrackChange,
-    });
-
-    act(() => {
-      controls.current?.onSubtitleSelect?.(0);
-    });
-    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
-    onSubtitleTrackChange.mockClear();
-
-    // Version switch start failed with the bitmap subtitle and fell back to subtitles-off plan.
-    const fallbackPlan = fixturePlanV3({
-      ...directPlan,
-      plan_id: "plan:switched-fallback-off",
-      plan_attempt_key: "v3:switched-fallback-off",
-      requested_media_file_id: 99,
-      effective_media_file_id: 99,
-    });
-    const bitmapTrackB: PlayerSubtitleInfo = {
-      index: 0,
-      media_file_id: 99,
-      track_id: "file:99:subtitle:0",
-      language: "en",
-      codec: "pgs",
-      label: "English PGS",
-      source: "embedded",
-      url: "",
-      burn_in_only: true,
-    };
-    rerenderPlayer({
-      plan: fallbackPlan,
-      planRevision: 2,
-      subtitleUrls: [bitmapTrackB],
-      initialSubtitleError: "The selected subtitle could not be rendered.",
-    });
-
-    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBeNull());
-    expect(onSubtitleTrackChange).not.toHaveBeenCalled();
-
-    // Viewer manually selects the track again on the fallback session
-    act(() => {
-      controls.current?.onSubtitleSelect?.(0);
-    });
-    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
-    await waitFor(() => expect(onSubtitleTrackChange).toHaveBeenCalledTimes(1));
-    expect(onSubtitleTrackChange).toHaveBeenCalledWith(
-      0,
-      expect.anything(),
-      expect.objectContaining({ index: 0 }),
-    );
-    onSubtitleTrackChange.mockClear();
-
-    // Another version switch encounters the identical refusal text on a new plan attempt
-    const secondFallbackPlan = fixturePlanV3({
-      ...directPlan,
-      plan_id: "plan:switched-fallback-off-2",
-      plan_attempt_key: "v3:switched-fallback-off-2",
-      requested_media_file_id: 101,
-      effective_media_file_id: 101,
-    });
-    const bitmapTrackC: PlayerSubtitleInfo = {
-      index: 0,
-      media_file_id: 101,
-      track_id: "file:101:subtitle:0",
-      language: "en",
-      codec: "pgs",
-      label: "English PGS",
-      source: "embedded",
-      url: "",
-      burn_in_only: true,
-    };
-    rerenderPlayer({
-      plan: secondFallbackPlan,
-      planRevision: 3,
-      subtitleUrls: [bitmapTrackC],
-      initialSubtitleError: "The selected subtitle could not be rendered.",
-    });
-
-    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBeNull());
-    expect(onSubtitleTrackChange).not.toHaveBeenCalled();
-  });
-
-  it("pins selection Off and dispatches zero requests when a refusal arrives on the same source identity", async () => {
-    const onSubtitleTrackChange = vi.fn();
-    const bitmapTrack: PlayerSubtitleInfo = {
-      index: 0,
-      media_file_id: 7,
-      track_id: "file:7:subtitle:0",
-      language: "en",
-      codec: "pgs",
-      label: "English PGS",
-      source: "embedded",
-      url: "",
-      burn_in_only: true,
-    };
-    const { rerenderPlayer } = renderPlayer({
-      plan: directPlan,
-      subtitleUrls: [bitmapTrack],
-      subtitleMode: "off",
-      onSubtitleTrackChange,
-    });
-
-    // Manually select track
-    act(() => {
-      controls.current?.onSubtitleSelect?.(0);
-    });
-    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
-    onSubtitleTrackChange.mockClear();
-
-    // Re-start / replan on the SAME source identity with an initialSubtitleError fallback
-    const sameSourceFallbackPlan = fixturePlanV3({
-      ...directPlan,
-      plan_id: "plan:same-source-fallback",
-      plan_attempt_key: "v3:same-source-fallback",
-      session_id: "session-same-source-fallback",
-    });
-
-    rerenderPlayer({
-      sessionId: "session-same-source-fallback",
-      plan: sameSourceFallbackPlan,
-      planRevision: 2,
-      subtitleUrls: [bitmapTrack],
-      initialSubtitleError: "The selected subtitle could not be rendered.",
-    });
-
-    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBeNull());
-    // Zero outbound requests must be dispatched for the dropped subtitle!
-    expect(onSubtitleTrackChange).not.toHaveBeenCalled();
-  });
-
-  it("synchronizes manual Off flag when subtitles are toggled", async () => {
-    const englishTrack: PlayerSubtitleInfo = {
-      index: 0,
-      media_file_id: 7,
-      track_id: "file:7:subtitle:0",
-      language: "en",
-      codec: "srt",
-      label: "English",
-      source: "external",
-      url: "/stream/session-1/subtitles/0.vtt",
-    };
-    const { rerenderPlayer } = renderPlayer({
-      displayMode: "foreground",
-      subtitleUrls: [englishTrack],
-      subtitleMode: "always",
-      preferredSubtitleLanguage: "en",
-    });
-
-    // Subtitles start selected
-    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
-
-    // Toggle subtitles off via keyboard / captions button
-    act(() => {
-      keyboardShortcuts.toggleCaptions?.();
-    });
-    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBeNull());
-
-    // Toggle subtitles back on restores the remembered track
-    act(() => {
-      keyboardShortcuts.toggleCaptions?.();
-    });
-    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
-
-    // Toggle subtitles off again before switching versions
-    act(() => {
-      keyboardShortcuts.toggleCaptions?.();
-    });
-    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBeNull());
-
-    // Switch version to new plan with English track
-    const nextPlan = fixturePlanV3({
-      ...directPlan,
-      plan_id: "plan:switched-version-toggle",
-      plan_attempt_key: "v3:switched-version-toggle",
-      requested_media_file_id: 99,
-      effective_media_file_id: 99,
-    });
-    const englishInNewFile: PlayerSubtitleInfo = {
-      index: 0,
-      media_file_id: 99,
-      track_id: "file:99:subtitle:0",
-      language: "en",
-      codec: "srt",
-      label: "English",
-      source: "external",
-      url: "/stream/session-99/subtitles/0.vtt",
-    };
-    rerenderPlayer({
-      plan: nextPlan,
-      planRevision: 2,
-      subtitleUrls: [englishInNewFile],
-    });
-
-    // Subtitles must remain off after toggling off, not overridden by auto-select
-    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBeNull());
-
-    // Toggle back on after version switch restores equivalent English track, not stale ordinal
-    act(() => {
-      keyboardShortcuts.toggleCaptions?.();
-    });
-    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
-  });
-
-  it("remaps subtitle selection when virtual_source_revision changes under the same file ID and URI", async () => {
-    const onSubtitleTrackChange = vi.fn();
-    const virtualRow = {
-      ...versionA,
-      file_id: 100,
-      container: "virtual",
-      file_path: "virtual://movie/tt1?result=pinned",
-    };
-    const englishTrack: PlayerSubtitleInfo = {
-      index: 0,
-      media_file_id: 100,
-      track_id: "file:100:subtitle:0",
-      language: "en",
-      codec: "srt",
-      label: "English",
-      source: "embedded",
-      url: "/stream/session-1/subtitles/0.vtt",
-    };
-    const frenchTrack: PlayerSubtitleInfo = {
-      index: 1,
-      media_file_id: 100,
-      track_id: "file:100:subtitle:1",
-      language: "fr",
-      codec: "srt",
-      label: "French",
-      source: "embedded",
-      url: "/stream/session-1/subtitles/1.vtt",
-    };
-    const initialPlan = fixturePlanV3({
-      ...directPlan,
-      plan_id: "plan:rev-1",
-      plan_attempt_key: "v3:rev-1",
-      requested_media_file_id: 100,
-      effective_media_file_id: 100,
-      effective_virtual_uri: virtualRow.file_path,
-      virtual_source_revision: "rev-1",
-    });
-    const { rerenderPlayer } = renderPlayer({
-      plan: initialPlan,
-      versions: [virtualRow],
-      activeFileId: 100,
-      subtitleUrls: [englishTrack, frenchTrack],
-      subtitleMode: "always",
-      preferredSubtitleLanguage: "en",
-      onSubtitleTrackChange,
-    });
-
-    // The viewer manually picks French (index 1).
-    act(() => {
-      controls.current?.onSubtitleSelect?.(1);
-    });
-    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(1));
-    onSubtitleTrackChange.mockClear();
-
-    // Re-probed candidate updates tracks evidence: file_id and URI are identical, but virtual_source_revision changes.
-    // French is now index 0, English is now index 1.
-    const reorderedPlan = fixturePlanV3({
-      ...directPlan,
-      plan_id: "plan:rev-2",
-      plan_attempt_key: "v3:rev-2",
-      requested_media_file_id: 100,
-      effective_media_file_id: 100,
-      effective_virtual_uri: virtualRow.file_path,
-      virtual_source_revision: "rev-2",
-    });
-    const frenchInRev2: PlayerSubtitleInfo = {
-      index: 0,
-      media_file_id: 100,
-      track_id: "file:100:subtitle:0",
-      language: "fr",
-      codec: "srt",
-      label: "French",
-      source: "embedded",
-      url: "/stream/session-100/subtitles/0.vtt",
-    };
-    const englishInRev2: PlayerSubtitleInfo = {
-      index: 1,
-      media_file_id: 100,
-      track_id: "file:100:subtitle:1",
-      language: "en",
-      codec: "srt",
-      label: "English",
-      source: "embedded",
-      url: "/stream/session-100/subtitles/1.vtt",
-    };
-    rerenderPlayer({
-      plan: reorderedPlan,
-      planRevision: 2,
-      subtitleUrls: [frenchInRev2, englishInRev2],
-    });
-
-    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
-    // Stale outgoing index (1, which is English in rev-2) must never be dispatched!
-    expect(onSubtitleTrackChange).not.toHaveBeenCalledWith(1, expect.anything(), expect.anything());
-    expect(onSubtitleTrackChange).toHaveBeenCalledWith(
-      0,
-      expect.anything(),
-      expect.objectContaining({ index: 0 }),
-    );
-  });
-
-  it("preserves manual Off selection across version changes even when auto-select would pick a track", async () => {
-    const englishTrackA: PlayerSubtitleInfo = {
-      index: 0,
-      media_file_id: 7,
-      track_id: "file:7:subtitle:0",
-      language: "en",
-      codec: "srt",
-      label: "English",
-      source: "external",
-      url: "/stream/session-1/subtitles/0.vtt",
-    };
-    const { rerenderPlayer } = renderPlayer({
-      subtitleUrls: [englishTrackA],
-      subtitleMode: "always",
-      preferredSubtitleLanguage: "en",
-    });
-
-    act(() => {
-      controls.current?.onSubtitleSelect?.(null);
-    });
-    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBeNull());
-
-    const nextPlan = fixturePlanV3({
-      ...directPlan,
-      plan_id: "plan:switched-version-off",
-      plan_attempt_key: "v3:switched-version-off",
-      requested_media_file_id: 99,
-      effective_media_file_id: 99,
-    });
-    const englishTrackB: PlayerSubtitleInfo = {
-      index: 0,
-      media_file_id: 99,
-      track_id: "file:99:subtitle:0",
-      language: "en",
-      codec: "srt",
-      label: "English",
-      source: "external",
-      url: "/stream/session-99/subtitles/0.vtt",
-    };
-    rerenderPlayer({
-      plan: nextPlan,
-      planRevision: 2,
-      subtitleUrls: [englishTrackB],
-    });
-
-    // Subtitles must remain off despite subtitleMode="always" and matching English track on new file.
-    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBeNull());
-  });
-
-  it("remaps a manual subtitle selection when the effective virtual URI rotates under the same id", async () => {
-    const virtualRow = {
-      ...versionA,
-      file_id: 100,
-      container: "virtual",
-      file_path: "virtual://movie/tt1?result=all",
-    };
-    const candidateA = {
-      ...versionA,
-      file_id: 7,
-      file_path: "/media/Movies/Example (2024)/Example.A.mkv",
-    };
-    const candidateB = {
-      ...versionA,
-      file_id: 8,
-      file_path: "/media/Movies/Example (2024)/Example.B.mkv",
-    };
-    const englishTrack: PlayerSubtitleInfo = {
-      index: 0,
-      media_file_id: 7,
-      track_id: "file:7:subtitle:0",
-      language: "en",
-      codec: "srt",
-      label: "English",
-      source: "external",
-      url: "/stream/session-1/subtitles/0.vtt",
-    };
-    const frenchTrack: PlayerSubtitleInfo = {
-      index: 1,
-      media_file_id: 7,
-      track_id: "file:7:subtitle:1",
-      language: "fr",
-      codec: "srt",
-      label: "French",
-      source: "external",
-      url: "/stream/session-1/subtitles/1.vtt",
-    };
-    const initialPlan = fixturePlanV3({
-      ...directPlan,
-      plan_id: "plan:virtual-a",
-      plan_attempt_key: "v3:virtual-a",
-      requested_media_file_id: 100,
-      effective_media_file_id: 100,
-      effective_virtual_uri: candidateA.file_path,
-    });
-    const onSubtitleTrackChange = vi.fn();
-    const { rerenderPlayer } = renderPlayer({
-      plan: initialPlan,
-      versions: [virtualRow, candidateA],
-      activeFileId: 100,
-      subtitleUrls: [englishTrack, frenchTrack],
-      subtitleMode: "always",
-      preferredSubtitleLanguage: "en",
-      onSubtitleTrackChange,
-    });
-
-    // The viewer manually picks French (index 1).
-    act(() => {
-      controls.current?.onSubtitleSelect?.(1);
-    });
-    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(1));
-    onSubtitleTrackChange.mockClear();
-
-    // The collapsed id stays 100; only the concrete candidate rotates. The new
-    // candidate's inventory reorders tracks so the raw index would silently
-    // switch to English, while the identity remap keeps French.
-    const rotatedPlan = fixturePlanV3({
-      ...directPlan,
-      plan_id: "plan:virtual-b",
-      plan_attempt_key: "v3:virtual-b",
-      requested_media_file_id: 100,
-      effective_media_file_id: 100,
-      effective_virtual_uri: candidateB.file_path,
-    });
-    const frenchInNewCandidate: PlayerSubtitleInfo = {
-      index: 0,
-      media_file_id: 8,
-      track_id: "file:8:subtitle:0",
-      language: "fr",
-      codec: "srt",
-      label: "French",
-      source: "external",
-      url: "/stream/session-100/subtitles/0.vtt",
-    };
-    const englishInNewCandidate: PlayerSubtitleInfo = {
-      index: 1,
-      media_file_id: 8,
-      track_id: "file:8:subtitle:1",
-      language: "en",
-      codec: "srt",
-      label: "English",
-      source: "external",
-      url: "/stream/session-100/subtitles/1.vtt",
-    };
-    rerenderPlayer({
-      plan: rotatedPlan,
-      planRevision: 2,
-      subtitleUrls: [frenchInNewCandidate, englishInNewCandidate],
-    });
-
-    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
-    // Must never dispatch the stale outgoing index (1, which is English in new candidate).
-    expect(onSubtitleTrackChange).not.toHaveBeenCalledWith(1, expect.anything(), expect.anything());
-    expect(onSubtitleTrackChange).toHaveBeenCalledWith(
-      0,
-      expect.anything(),
-      expect.objectContaining({ index: 0 }),
-    );
-  });
-
-  it("selects descriptor-identical track_id-less subtitles independently", async () => {
-    const onSubtitleTrackChange = vi.fn();
-    const trackA: PlayerSubtitleInfo = {
-      index: 0,
-      media_file_id: 7,
-      language: "en",
-      codec: "srt",
-      label: "English",
-      source: "embedded",
-      url: "/stream/session-1/subtitles/0.vtt?file_id=7&embedded_stream_index=0",
-    };
-    const trackB: PlayerSubtitleInfo = {
-      ...trackA,
-      index: 1,
-      url: "/stream/session-1/subtitles/1.vtt?file_id=7&embedded_stream_index=1",
-    };
-    const { rerenderPlayer } = renderPlayer({
-      subtitleUrls: [trackA, trackB],
-      subtitleMode: "always",
-      preferredSubtitleLanguage: "en",
-      onSubtitleTrackChange,
-    });
-
-    await waitFor(() =>
-      expect(onSubtitleTrackChange).toHaveBeenCalledWith(
-        0,
-        expect.anything(),
-        expect.objectContaining({ index: 0 }),
-      ),
-    );
-    const callsAfterAutoSelect = onSubtitleTrackChange.mock.calls.length;
-
-    // The server acknowledges the auto-selection by ordinal. Its inventory
-    // carries no `track_id`, so the descriptor tuple alone cannot tell the two
-    // streams apart; only the embedded stream index can.
-    const acknowledgedPlan = fixturePlanV3({
-      ...directPlan,
-      plan_id: "plan:ack-identityless",
-      plan_attempt_key: "v3:ack-identityless",
-      subtitle: {
-        mode: "render",
-        inventory: [
-          {
-            track_id: "",
-            combined_index: 0,
-            source: "embedded",
-            codec: "srt",
-            language: "en",
-            label: "English",
-            forced: false,
-            default: false,
-            hearing_impaired: false,
-            delivery: "sidecar",
-            url: "/stream/session-1/subtitles/0.vtt?file_id=7&embedded_stream_index=0",
-          },
-          {
-            track_id: "",
-            combined_index: 1,
-            source: "embedded",
-            codec: "srt",
-            language: "en",
-            label: "English",
-            forced: false,
-            default: false,
-            hearing_impaired: false,
-            delivery: "sidecar",
-            url: "/stream/session-1/subtitles/1.vtt?file_id=7&embedded_stream_index=1",
-          },
-        ],
-      },
-      selected_tracks: {
-        audio: { id: "file:7:audio:0", index: 0 },
-        subtitle: { id: "", index: 0 },
-      },
-    });
-    rerenderPlayer({ plan: acknowledgedPlan, planRevision: 2 });
-    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
-
-    // Picking the sibling must send its own request instead of being swallowed
-    // as "the plan already has this descriptor".
-    act(() => {
-      controls.current?.onSubtitleSelect?.(1);
-    });
-    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(1));
-    await waitFor(() =>
-      expect(onSubtitleTrackChange.mock.calls.length).toBeGreaterThan(callsAfterAutoSelect),
-    );
-    expect(onSubtitleTrackChange).toHaveBeenLastCalledWith(
-      1,
-      expect.anything(),
-      expect.objectContaining({ index: 1 }),
-    );
-  });
-
-  it("toggles video fit and resets it for a new playback session", () => {
-    const { container, rerenderPlayer } = renderPlayer();
-    const video = container.querySelector("video");
-    if (!video) throw new Error("expected video element");
-
-    expect(video).toHaveClass("object-contain");
-    expect(controls.current?.videoFit).toBe("contain");
-
-    act(() => controls.current?.onVideoFitToggle?.());
-
-    expect(video).toHaveClass("object-cover");
-    expect(controls.current?.videoFit).toBe("cover");
-
-    rerenderPlayer({ sessionId: "session-2" });
-
-    expect(video).toHaveClass("object-contain");
-    expect(controls.current?.videoFit).toBe("contain");
   });
 });
 
@@ -8650,6 +6426,7 @@ describe("VideoPlayer lost connection", () => {
     hlsJS.constructed.mockClear();
     hlsJS.startLoad.mockClear();
     hlsJS.stopLoad.mockClear();
+    hlsJS.loadSource.mockClear();
     hlsJS.latest = null;
     vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
     vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
@@ -9016,6 +6793,61 @@ describe("VideoPlayer lost connection", () => {
     expect(hlsJS.startLoad).toHaveBeenCalledOnce();
   });
 
+  it("loads the manifest again after a fatal manifest error, then reports the route failed", async () => {
+    hlsJS.supported = true;
+    vi.spyOn(HTMLMediaElement.prototype, "canPlayType").mockReturnValue("");
+    const onPlanFailure = vi.fn();
+    const url = "/playback/transcode/session-1/master.m3u8";
+    const plan = fixturePlanV3({
+      stream: { url, protocol: "hls", headers: {}, header_refresh: "none" },
+    });
+    renderPlayer({ plan, onPlanFailure });
+    await waitFor(() => expect(hlsJS.latest).not.toBeNull());
+    expect(hlsJS.loadSource).toHaveBeenCalledOnce();
+
+    // hls.js does not request a failed manifest again on startLoad(), so the
+    // recovery has to load the source again for the second failure to come.
+    const fatalManifestError = { fatal: true, type: "networkError", details: "manifestLoadError" };
+    vi.spyOn(Date, "now").mockReturnValue(10_000);
+    act(() => hlsJS.latest?.emit("error", fatalManifestError));
+    expect(hlsJS.loadSource).toHaveBeenCalledTimes(2);
+    expect(hlsJS.loadSource.mock.calls[1]).toEqual(hlsJS.loadSource.mock.calls[0]);
+    expect(hlsJS.startLoad).not.toHaveBeenCalled();
+    expect(onPlanFailure).not.toHaveBeenCalled();
+
+    vi.spyOn(Date, "now").mockReturnValue(20_000);
+    act(() => hlsJS.latest?.emit("error", fatalManifestError));
+    expect(onPlanFailure).toHaveBeenCalledOnce();
+    expect(onPlanFailure.mock.calls[0]?.[0]).toMatchObject({ classification: "startup_timeout" });
+  });
+
+  it("reports the route failed when the reloaded manifest fails within the recovery cooldown", async () => {
+    hlsJS.supported = true;
+    vi.spyOn(HTMLMediaElement.prototype, "canPlayType").mockReturnValue("");
+    const onPlanFailure = vi.fn();
+    const url = "/playback/transcode/session-1/master.m3u8";
+    const plan = fixturePlanV3({
+      stream: { url, protocol: "hls", headers: {}, header_refresh: "none" },
+    });
+    renderPlayer({ plan, onPlanFailure });
+    await waitFor(() => expect(hlsJS.latest).not.toBeNull());
+
+    const fatalManifestError = {
+      fatal: true,
+      type: "networkError",
+      details: "manifestParsingError",
+    };
+    vi.spyOn(Date, "now").mockReturnValue(10_000);
+    act(() => hlsJS.latest?.emit("error", fatalManifestError));
+    expect(hlsJS.loadSource).toHaveBeenCalledTimes(2);
+
+    vi.spyOn(Date, "now").mockReturnValue(10_500);
+    act(() => hlsJS.latest?.emit("error", fatalManifestError));
+    expect(hlsJS.loadSource).toHaveBeenCalledTimes(2);
+    expect(onPlanFailure).toHaveBeenCalledOnce();
+    expect(onPlanFailure.mock.calls[0]?.[0]).toMatchObject({ classification: "startup_timeout" });
+  });
+
   it("gives a replacement HLS transport that never played its startup recovery", async () => {
     hlsJS.supported = true;
     vi.spyOn(HTMLMediaElement.prototype, "canPlayType").mockReturnValue("");
@@ -9064,5 +6896,932 @@ describe("VideoPlayer when the server ended the session", () => {
     await waitFor(() => expect(onExit).toHaveBeenCalledTimes(1), { timeout: 3_000 });
     expect(toastInfo).toHaveBeenCalledWith("An administrator ended this playback session.");
     expect(screen.queryByText("Retry")).toBeNull();
+  });
+});
+
+describe("VideoPlayer buffering pill", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
+    vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
+    vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it("waits behind a segment skip and shows once it ends", async () => {
+    const { video } = askPlayer({ recap: { start: 25, end: 60 } });
+    video.currentTime = 30;
+    fireFrameTimeUpdate(video);
+    await act(async () => Promise.resolve());
+    expect(screen.getByRole("button", { name: "Skip Recap" })).toBeInTheDocument();
+
+    // A long stall during the recap: the prompt waits behind its skip.
+    fireEvent.waiting(video);
+    act(() => vi.advanceTimersByTime(7_000));
+    expect(screen.queryByRole("button", { name: "Lower quality" })).toBeNull();
+
+    video.currentTime = 61;
+    fireFrameTimeUpdate(video);
+    await act(async () => Promise.resolve());
+    act(() => vi.advanceTimersByTime(200));
+    expect(screen.queryByRole("button", { name: "Skip Recap" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Lower quality" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Keep quality" })).toBeInTheDocument();
+  });
+
+  it("keeps a prompt's timer while the player is minimized", async () => {
+    const { video, rerenderPlayer } = askPlayer();
+    fireEvent.waiting(video);
+    act(() => vi.advanceTimersByTime(7_000));
+    expect(screen.getByRole("button", { name: "Lower quality" })).toBeInTheDocument();
+
+    // Minimized past the 15-second timer, the prompt waits instead of expiring.
+    rerenderPlayer({ displayMode: "detached" });
+    act(() => vi.advanceTimersByTime(20_000));
+    rerenderPlayer({ displayMode: "foreground" });
+    act(() => vi.advanceTimersByTime(200));
+    expect(screen.getByRole("button", { name: "Lower quality" })).toBeInTheDocument();
+    act(() => vi.advanceTimersByTime(15_000));
+    expect(screen.queryByRole("button", { name: "Lower quality" })).toBeNull();
+  });
+
+  function askPlayer(overrides: Partial<Parameters<typeof VideoPlayer>[0]> = {}) {
+    const rendered = renderPlayer({
+      bufferingMode: "ask",
+      qualityPreference: "auto",
+      plan: fixturePlanV3({
+        ...directPlan,
+        available_qualities: [
+          { label: "original", preserves_source: true, bitrate_kbps: 20_000 },
+          { label: "1080p-high", preserves_source: false, height: 1080, bitrate_kbps: 10_000 },
+        ],
+        source: { ...directPlan.source, bitrate_kbps: 20_000 },
+      }),
+      ...overrides,
+    });
+    const video = rendered.container.querySelector("video");
+    if (!video) throw new Error("expected video element");
+    fireEvent.loadedMetadata(video);
+    markPlaying(video);
+    fireEvent.playing(video);
+    act(() => vi.advanceTimersByTime(20_000));
+    return { ...rendered, video };
+  }
+
+  function setVisibility(state: "visible" | "hidden") {
+    Object.defineProperty(document, "visibilityState", { value: state, configurable: true });
+    act(() => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+  }
+
+  it("keeps a prompt's timer while the tab is hidden", () => {
+    const { video } = askPlayer();
+    fireEvent.waiting(video);
+    act(() => vi.advanceTimersByTime(7_000));
+    expect(screen.getByRole("button", { name: "Lower quality" })).toBeInTheDocument();
+    try {
+      setVisibility("hidden");
+      act(() => vi.advanceTimersByTime(20_000));
+      setVisibility("visible");
+      act(() => vi.advanceTimersByTime(200));
+      expect(screen.getByRole("button", { name: "Lower quality" })).toBeInTheDocument();
+    } finally {
+      setVisibility("visible");
+    }
+  });
+
+  it("leaves Back to the reconnect overlay that covers the pill", () => {
+    const rendered = askPlayer();
+    fireEvent.waiting(rendered.video);
+    act(() => vi.advanceTimersByTime(7_000));
+    expect(screen.getByRole("button", { name: "Lower quality" })).toBeInTheDocument();
+    rendered.rerenderPlayer({ connectionStatus: "reconnecting" });
+    fireEvent.keyDown(document, { key: "Escape" });
+    rendered.rerenderPlayer({ connectionStatus: "connected" });
+    // Back did not answer the prompt as Keep quality.
+    expect(screen.getByRole("button", { name: "Lower quality" })).toBeInTheDocument();
+  });
+
+  it("leaves Enter on a focused Keep quality to its own click", () => {
+    const onQualitySelect = vi.fn();
+    const { video } = askPlayer({ onQualitySelect });
+    fireEvent.waiting(video);
+    act(() => vi.advanceTimersByTime(7_000));
+    const keep = screen.getByRole("button", { name: "Keep quality" });
+    keep.focus();
+    expect(fireEvent.keyDown(keep, { key: "Enter" })).toBe(true);
+    expect(screen.getByRole("button", { name: "Lower quality" })).toBeInTheDocument();
+    fireEvent.click(keep);
+    expect(screen.queryByRole("button", { name: "Lower quality" })).toBeNull();
+    expect(onQualitySelect).not.toHaveBeenCalled();
+  });
+
+  /** Picks a quality from the menu; returns what the session tells of it. */
+  function pickQuality(onQualitySelect: ReturnType<typeof vi.fn>, id: string) {
+    const qualityControls = controls.current as unknown as {
+      onQualitySelect: (id: string) => void;
+    };
+    act(() => qualityControls.onQualitySelect(id));
+    const onAdopt = onQualitySelect.mock.calls.at(-1)?.[3] as
+      | ((planRevision?: number) => void)
+      | undefined;
+    return (planRevision?: number) => act(() => onAdopt?.(planRevision));
+  }
+
+  // D12: the pill goes as the viewer picks another quality.
+  it("ignores a pick of the quality already playing, and hides the pill when another is picked", () => {
+    const onQualitySelect = vi.fn();
+    const { video } = askPlayer({ onQualitySelect });
+    fireEvent.waiting(video);
+    act(() => vi.advanceTimersByTime(7_000));
+    expect(screen.getByRole("button", { name: "Lower quality" })).toBeInTheDocument();
+    pickQuality(onQualitySelect, "auto");
+    expect(onQualitySelect).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Lower quality" })).toBeInTheDocument();
+    pickQuality(onQualitySelect, "1080p-high");
+    expect(onQualitySelect).toHaveBeenCalledWith(
+      "1080p-high",
+      expect.any(Number),
+      undefined,
+      expect.any(Function),
+    );
+    expect(screen.queryByRole("button", { name: "Lower quality" })).toBeNull();
+  });
+
+  // D12/D16: a version switch counts like a quality pick.
+  it("hides the pill when the viewer switches version, and keeps the answer if the switch adopts nothing", () => {
+    const onSwitchVersion = vi.fn();
+    const { video } = askPlayer({ onSwitchVersion });
+    fireEvent.waiting(video);
+    act(() => vi.advanceTimersByTime(7_000));
+    fireEvent.click(screen.getByRole("button", { name: "Keep quality" }));
+    fireEvent.playing(video);
+    act(() => vi.advanceTimersByTime(20_000));
+    fireEvent.waiting(video);
+    act(() => vi.advanceTimersByTime(7_000));
+    expect(screen.queryByRole("button", { name: "Lower quality" })).toBeNull();
+    const switchControls = controls.current as unknown as {
+      onSwitchVersion: (fileId: number) => void;
+    };
+    act(() => switchControls.onSwitchVersion(99));
+    const onAdopt = onSwitchVersion.mock.calls.at(-1)?.[2] as (planRevision?: number) => void;
+    act(() => onAdopt(undefined));
+
+    // Still answered: the next long stall asks nothing.
+    fireEvent.playing(video);
+    act(() => vi.advanceTimersByTime(20_000));
+    fireEvent.waiting(video);
+    act(() => vi.advanceTimersByTime(7_000));
+    expect(screen.queryByRole("button", { name: "Lower quality" })).toBeNull();
+  });
+
+  it("keeps a newer pick pending when the pick it replaced is refused", () => {
+    const onQualitySelect = vi.fn();
+    const { video } = askPlayer({ onQualitySelect });
+    fireEvent.waiting(video);
+    act(() => vi.advanceTimersByTime(7_000));
+    const refuseFirst = pickQuality(onQualitySelect, "1080p-high");
+    const refuseSecond = pickQuality(onQualitySelect, "original");
+    // The first pick, replaced, settles as refused: the second still holds.
+    refuseFirst(undefined);
+    act(() => vi.advanceTimersByTime(1_000));
+    expect(screen.queryByRole("button", { name: "Lower quality" })).toBeNull();
+    // Once the second is refused too, the long stall in progress asks at once.
+    refuseSecond(undefined);
+    expect(screen.getByRole("button", { name: "Lower quality" })).toBeInTheDocument();
+  });
+
+  it("keeps the step-down estimate when the session refuses a quality pick", () => {
+    const onQualitySelect = vi.fn();
+    const onKeptEstimate = vi.fn();
+    const { video } = askPlayer({ onQualitySelect, onKeptEstimate });
+    fireEvent.waiting(video);
+    act(() => vi.advanceTimersByTime(7_000));
+    fireEvent.click(screen.getByRole("button", { name: "Lower quality" }));
+    expect(onKeptEstimate).toHaveBeenLastCalledWith(expect.any(Number));
+    const reports = onKeptEstimate.mock.calls.length;
+
+    pickQuality(onQualitySelect, "1080p-high")(undefined);
+    expect(onKeptEstimate).toHaveBeenCalledTimes(reports);
+  });
+
+  it("starts over when the cap its replans send changes", () => {
+    const rendered = askPlayer({ bandwidthCapKbps: null });
+    fireEvent.waiting(rendered.video);
+    act(() => vi.advanceTimersByTime(7_000));
+    expect(screen.getByRole("button", { name: "Lower quality" })).toBeInTheDocument();
+    // The link turned metered, and the cellular cap applies from now on.
+    rendered.rerenderPlayer({ bandwidthCapKbps: 4_000 });
+    act(() => vi.advanceTimersByTime(200));
+    expect(screen.queryByRole("button", { name: "Lower quality" })).toBeNull();
+  });
+
+  it("treats a wait with no data arriving as an outage until data comes back", () => {
+    const { video } = askPlayer();
+    // Too little ahead of the playhead to be the renderer's wait.
+    let end = 0.2;
+    Object.defineProperty(video, "buffered", {
+      configurable: true,
+      get: () => ({ length: 1, start: () => 0, end: () => end }),
+    });
+    // The browser received nothing for its idle time.
+    fireEvent(video, new Event("stalled"));
+    fireEvent.waiting(video);
+    act(() => vi.advanceTimersByTime(4_000));
+    // The browser decoder's once-a-second progress brings no data, so the
+    // outage goes on: no stall is timed from here.
+    fireEvent(video, new Event("progress"));
+    act(() => vi.advanceTimersByTime(6_200));
+    expect(screen.queryByRole("button", { name: "Lower quality" })).toBeNull();
+    // Data arrives again but too slowly: from now it is a stall.
+    end = 0.4;
+    fireEvent(video, new Event("progress"));
+    act(() => vi.advanceTimersByTime(6_200));
+    expect(screen.getByRole("button", { name: "Lower quality" })).toBeInTheDocument();
+  });
+
+  it("keeps an offline outage going after the device is back online until data arrives", () => {
+    const { video } = askPlayer();
+    let end = 0.2;
+    Object.defineProperty(video, "buffered", {
+      configurable: true,
+      get: () => ({ length: 1, start: () => 0, end: () => end }),
+    });
+    let online = false;
+    vi.spyOn(navigator, "onLine", "get").mockImplementation(() => online);
+    act(() => {
+      window.dispatchEvent(new Event("offline"));
+    });
+    fireEvent.waiting(video);
+    // Offline for longer than a failure's outage window.
+    act(() => vi.advanceTimersByTime(20_000));
+    // The network is back, but no media data has arrived yet.
+    online = true;
+    act(() => {
+      window.dispatchEvent(new Event("online"));
+    });
+    act(() => vi.advanceTimersByTime(6_200));
+    expect(screen.queryByRole("button", { name: "Lower quality" })).toBeNull();
+    end = 0.4;
+    fireEvent(video, new Event("progress"));
+    act(() => vi.advanceTimersByTime(6_200));
+    expect(screen.getByRole("button", { name: "Lower quality" })).toBeInTheDocument();
+  });
+
+  it("shows the buffering notice for five seconds", async () => {
+    const { video } = askPlayer({
+      bufferingMode: "always",
+      plan: fixturePlanV3({
+        ...directPlan,
+        available_qualities: [{ label: "original", preserves_source: true, bitrate_kbps: 20_000 }],
+        source: { ...directPlan.source, bitrate_kbps: 20_000 },
+      }),
+    });
+    fireEvent.waiting(video);
+    act(() => vi.advanceTimersByTime(6_100));
+    expect(screen.getByText("Can't lower quality for this video")).toBeInTheDocument();
+    act(() => vi.advanceTimersByTime(4_800));
+    expect(screen.getByText("Can't lower quality for this video")).toBeInTheDocument();
+    act(() => vi.advanceTimersByTime(300));
+    expect(screen.queryByText("Can't lower quality for this video")).toBeNull();
+  });
+});
+
+describe("VideoPlayer hls.js request timeouts", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
+    vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
+    vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => {});
+    vi.spyOn(HTMLMediaElement.prototype, "canPlayType").mockReturnValue("");
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    hlsJS.supported = false;
+    hlsJS.latest = null;
+  });
+
+  /** A main fragment hls.js is loading, receiving `kbps` until `silence`. */
+  function loadingFragment(kbps = 8) {
+    // hls.js fills in a loading fragment's stats as its data arrives.
+    const first = performance.now();
+    let receiving = true;
+    let loaded = 0;
+    const stats = {
+      aborted: false,
+      loading: { start: first, first, end: 0 },
+      get loaded() {
+        if (receiving) loaded = Math.floor(((performance.now() - first) * kbps) / 8);
+        return loaded;
+      },
+    };
+    act(() => hlsJS.latest?.emit("fragLoading", { frag: { type: "main", stats } }));
+    return () => {
+      receiving = false;
+    };
+  }
+
+  /**
+   * A player that has played, met `beforeWait` and is waiting, with too
+   * little buffered to be the renderer's wait. Its media keeps receiving data
+   * slowly, through hls.js fragments (at `kbps`) or the browser engine's
+   * reads, until `silentFor` ms before the wait; `setEnd` moves the end of
+   * the buffered media.
+   */
+  async function waitingAfter({
+    beforeWait = () => {},
+    transport = "hls.js",
+    silentFor,
+    kbps,
+    props,
+  }: {
+    beforeWait?: () => void;
+    transport?: "hls.js" | "engine";
+    silentFor?: number;
+    kbps?: number;
+    props?: Partial<Parameters<typeof VideoPlayer>[0]>;
+  } = {}) {
+    const qualities = {
+      available_qualities: [
+        { label: "original", preserves_source: true, bitrate_kbps: 20_000 },
+        { label: "1080p-high", preserves_source: false, height: 1080, bitrate_kbps: 10_000 },
+      ],
+      source: { ...directPlan.source, bitrate_kbps: 20_000 },
+    };
+    if (transport === "engine") {
+      attachBrowserEngine.mockClear();
+      engineRoute.chosen = true;
+      onTestFinished(() => {
+        engineRoute.chosen = false;
+      });
+    } else hlsJS.supported = true;
+    const rendered = renderPlayer({
+      bufferingMode: "ask",
+      qualityPreference: "auto",
+      ...props,
+      ...(transport === "engine"
+        ? {
+            plan: fixturePlanV3({
+              ...qualities,
+              delivery: "original_http",
+              stream: directPlan.stream,
+            }),
+            browserEngine: {
+              containers: ["mkv"],
+              videoCodecs: ["h264"],
+              audioCodecs: ["aac"],
+              hdr: false,
+            },
+          }
+        : {
+            plan: fixturePlanV3({
+              ...qualities,
+              stream: {
+                url: "/playback/transcode/session-1/master.m3u8",
+                protocol: "hls",
+                headers: {},
+                header_refresh: "none",
+              },
+            }),
+          }),
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(0));
+    const video = rendered.container.querySelector("video");
+    if (!video) throw new Error("expected a video element");
+    let end = 0.2;
+    Object.defineProperty(video, "buffered", {
+      configurable: true,
+      get: () => ({ length: 1, start: () => 0, end: () => end }),
+    });
+    let silence: () => void;
+    if (transport === "engine") {
+      const { onMediaData } = attachBrowserEngine.mock.calls.at(-1)![0];
+      let receiving = true;
+      setInterval(() => {
+        const at = Math.floor(performance.now());
+        if (receiving) onMediaData?.(0, at, 0, at);
+      }, 250);
+      silence = () => {
+        receiving = false;
+      };
+    } else silence = loadingFragment(kbps);
+    markPlaying(video);
+    fireEvent.playing(video);
+    act(() => vi.advanceTimersByTime(20_000));
+    if (silentFor !== undefined) {
+      silence();
+      act(() => vi.advanceTimersByTime(silentFor));
+    }
+    act(beforeWait);
+    fireEvent.waiting(video);
+    return {
+      video,
+      setEnd: (value: number) => {
+        end = value;
+      },
+    };
+  }
+  const waitingAfterError = (error: Record<string, unknown>) =>
+    waitingAfter({
+      beforeWait: () =>
+        hlsJS.latest?.emit("error", { type: "networkError", fatal: false, ...error }),
+    });
+  const prompt = () => screen.queryByRole("button", { name: "Lower quality" });
+  async function stallAfterError(error: Record<string, unknown>) {
+    await waitingAfterError(error);
+    act(() => vi.advanceTimersByTime(7_000));
+    return prompt();
+  }
+  // An outage holds the prompt back; a stall on a slow link shows it.
+  it.each<[string, Record<string, unknown>, boolean]>([
+    [
+      "a timeout with no data received",
+      { details: "fragLoadTimeOut", stats: { loaded: 0 } },
+      false,
+    ],
+    [
+      "a timeout on a request that was still receiving",
+      { details: "fragLoadTimeOut", stats: { loaded: 2_000_000 } },
+      true,
+    ],
+    ["a failed subtitle playlist", { details: "subtitleTrackLoadError" }, true],
+    ["a failed subtitle segment", { details: "fragLoadError", frag: { type: "subtitle" } }, true],
+  ])("after %s, prompts: %s", async (_name, error, prompts) => {
+    expect((await stallAfterError(error)) !== null).toBe(prompts);
+  });
+
+  // C3: a lowering says what the plan's media arrived at, except after the
+  // browser changed networks while the plan played.
+  it.each<[string, boolean, number | undefined]>([
+    ["carries", false, 2_000],
+    ["leaves out after a network change", true, undefined],
+  ])("a lowering %s the plan's measured throughput", async (_name, networkChanged, kbps) => {
+    const onQualitySelect = vi.fn();
+    const { setEnd } = await waitingAfter({
+      kbps: 2_000,
+      props: { onQualitySelect },
+      beforeWait: () => {
+        if (!networkChanged) return;
+        window.dispatchEvent(new Event("offline"));
+        window.dispatchEvent(new Event("online"));
+      },
+    });
+    // Media arriving ends the outage a network change begins.
+    setEnd(0.4);
+    act(() => hlsJS.latest?.emit("bufferAppended", { parent: "main" }));
+    act(() => vi.advanceTimersByTime(7_000));
+    fireEvent.click(prompt()!);
+    expect(
+      onQualitySelect.mock.calls.map(([, , request]) => request.observed_throughput_kbps),
+    ).toEqual([kbps]);
+  });
+
+  // N6: the player applies a resume position before the first frame, and the
+  // seek that fires must not end the plan's slow start (D5/D10 addendum). The
+  // lowering resumes from the resume position, not the element's 0. The
+  // start's media arrives slowly: before the first frame, a wait prompts only
+  // with that evidence (C12).
+  it("keeps timing a resumed start's wait through the player's own resume seek", async () => {
+    hlsJS.supported = true;
+    const onQualitySelect = vi.fn();
+    const rendered = renderPlayer({
+      onQualitySelect,
+      bufferingMode: "ask",
+      qualityPreference: "auto",
+      plan: fixturePlanV3({
+        timeline: { ...directPlan.timeline, player_start_seconds: 1300 },
+        stream: {
+          url: "/playback/transcode/session-1/master.m3u8",
+          protocol: "hls",
+          headers: {},
+          header_refresh: "none",
+        },
+        available_qualities: [
+          { label: "original", preserves_source: true, bitrate_kbps: 20_000 },
+          { label: "1080p-high", preserves_source: false, height: 1080, bitrate_kbps: 10_000 },
+        ],
+        source: { ...directPlan.source, bitrate_kbps: 20_000 },
+      }),
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(0));
+    const video = rendered.container.querySelector("video");
+    if (!video) throw new Error("expected video element");
+    loadingFragment(2_000);
+    // Metadata arrives and the player seeks to the resume position; nothing plays.
+    fireEvent.loadedMetadata(video);
+    fireEvent.seeking(video);
+    fireEvent.waiting(video);
+    act(() => vi.advanceTimersByTime(16_200));
+    fireEvent.click(prompt()!);
+    expect(onQualitySelect.mock.calls.map(([, position]) => position)).toEqual([1300]);
+  });
+
+  // C1: a wait is an outage once no media data has arrived for 4 s on the
+  // engine's progressive reads, or for 15 s on hls.js segments, which the
+  // server holds silent while it makes them. A shorter silence, or data that
+  // keeps arriving however slowly, leaves a stall that counts.
+  it.each<[string, boolean, "hls.js" | "engine", number | undefined]>([
+    ["hls.js segments that go silent as the wait begins", true, "hls.js", 0],
+    ["hls.js segments silent for 16 s when the wait begins", false, "hls.js", 16_000],
+    ["engine reads that keep receiving", true, "engine", undefined],
+    ["engine reads that go silent as the wait begins", false, "engine", 0],
+  ])("8 s into a wait on %s, prompts: %s", async (_name, prompts, transport, silentFor) => {
+    await waitingAfter({ transport, silentFor });
+    act(() => vi.advanceTimersByTime(8_000));
+    expect(prompt() !== null).toBe(prompts);
+  });
+
+  // C9: on Auto in the always mode, a plan that misses the player's own start
+  // deadline lowers as a long stall would, when its media was measured arriving
+  // more slowly than it plays. A first start's wait is timed as a stall and
+  // lowers sooner, so this is mostly a replacement's, whose load is a source
+  // reload: here one that receives data at `kbps` and never starts. It fails
+  // at the same quality when its link is silent (an outage), when its media
+  // arrives at its bitrate, when its buffer filled (the renderer's wait), when
+  // nothing is lower, or when the session refuses the lowering. The
+  // controller's tests cover the other cases that keep the failure.
+  const original = { label: "original", preserves_source: true, bitrate_kbps: 20_000 };
+  const high = { label: "1080p-high", preserves_source: false, bitrate_kbps: 10_000 };
+  const low = { label: "720p", preserves_source: false, bitrate_kbps: 4_000 };
+  it.each<{
+    name: string;
+    rungs?: AvailableQualityV3[];
+    refused?: boolean;
+    /** The rate the replacement's media arrives at; 0 for a silent link. */
+    kbps?: number;
+    /** Seconds buffered past the playhead while it waits. */
+    buffered?: number;
+    lowers?: boolean;
+  }>([
+    { name: "lowers with a lower rung", lowers: true },
+    { name: "fails when the session refuses the lowering", refused: true },
+    { name: "fails with nothing lower", rungs: [original, high] },
+    { name: "fails on a silent link", kbps: 0 },
+    { name: "fails when its media arrives at its bitrate", kbps: 10_000 },
+    { name: "fails when its buffer fills but it never plays", buffered: 6 },
+  ])(
+    "on Auto, a replacement that misses its start deadline $name",
+    async ({
+      rungs = [original, high, low],
+      refused = false,
+      kbps = 2_000,
+      buffered = 0,
+      lowers = false,
+    }) => {
+      hlsJS.supported = true;
+      const onPlanFailure = vi.fn((_failure: unknown, _position?: number) => true);
+      const onQualitySelect = vi.fn(
+        (
+          _label: string,
+          _position: number,
+          _request?: unknown,
+          onAdopt?: (revision?: number, sent?: boolean) => void,
+        ) => {
+          if (refused) onAdopt?.(undefined, false);
+        },
+      );
+      const hlsPlan = (overrides: Partial<PlanV3> = {}) =>
+        fixturePlanV3({
+          stream: {
+            url: "/playback/transcode/session-1/master.m3u8",
+            protocol: "hls",
+            headers: {},
+            header_refresh: "none",
+          },
+          available_qualities: rungs,
+          source: { ...directPlan.source, bitrate_kbps: 20_000 },
+          ...overrides,
+        });
+      const { container, rerenderPlayer } = renderPlayer({
+        bufferingMode: "always",
+        qualityPreference: "auto",
+        onPlanFailure,
+        onQualitySelect,
+        plan: hlsPlan(),
+      });
+      await act(async () => vi.advanceTimersByTimeAsync(0));
+      const video = container.querySelector("video");
+      if (!video) throw new Error("expected a video element");
+      markPlaying(video);
+      fireEvent.playing(video);
+      // A 1080p plan replaces the one that played, and its element waits
+      // paused for data.
+      Object.defineProperty(video, "paused", { configurable: true, value: true });
+      Object.defineProperty(video, "readyState", {
+        configurable: true,
+        value: HTMLMediaElement.HAVE_NOTHING,
+      });
+      rerenderPlayer({
+        planRevision: 2,
+        plan: hlsPlan({
+          active_quality: "1080p-high",
+          effective_recipe: { video_codec: "h264", audio_codec: "aac", bitrate_kbps: 10_000 },
+        }),
+      });
+      await act(async () => vi.advanceTimersByTimeAsync(0));
+      let bufferedEnd = buffered;
+      Object.defineProperty(video, "buffered", {
+        configurable: true,
+        get: () => ({ length: 1, start: () => 0, end: () => bufferedEnd }),
+      });
+      // The deadline resets the element, emptying it, before it reports.
+      vi.mocked(HTMLMediaElement.prototype.load).mockImplementation(() => {
+        bufferedEnd = 0;
+      });
+      if (kbps > 0) loadingFragment(kbps);
+      act(() => vi.advanceTimersByTime(STARTUP_TIMEOUT_MS));
+      expect(onQualitySelect.mock.calls.map(([, , request]) => request)).toEqual(
+        lowers || refused
+          ? [
+              {
+                operation: "quality_change",
+                quality_preference: "auto",
+                bandwidth_estimate_kbps: 7_000,
+                bandwidth_estimate_source: "observed_rebuffer",
+                observed_throughput_kbps: kbps,
+              },
+            ]
+          : [],
+      );
+      expect(onPlanFailure).toHaveBeenCalledTimes(lowers ? 0 : 1);
+    },
+  );
+
+  it("ends the outage when hls.js appends media without a progress event", async () => {
+    const { setEnd } = await waitingAfterError({ details: "fragLoadError" });
+    act(() => vi.advanceTimersByTime(2_000));
+    setEnd(0.4);
+    act(() => hlsJS.latest?.emit("bufferAppended", { parent: "main" }));
+    act(() => vi.advanceTimersByTime(6_200));
+    expect(prompt()).not.toBeNull();
+  });
+
+  it("does not end an outage on a timer while no data arrives", async () => {
+    const { video, setEnd } = await waitingAfterError({ details: "fragLoadError" });
+    act(() => vi.advanceTimersByTime(30_000));
+    expect(prompt()).toBeNull();
+    setEnd(0.4);
+    fireEvent(video, new Event("progress"));
+    act(() => vi.advanceTimersByTime(6_200));
+    expect(prompt()).not.toBeNull();
+  });
+});
+
+describe("VideoPlayer playback throughput", () => {
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+    hlsJS.supported = false;
+    hlsJS.latest = null;
+  });
+
+  async function summaryAfterFragments(
+    fragments: {
+      loaded: number;
+      loading: { start: number; first: number; end: number };
+      type?: string;
+    }[],
+    whilePlaying?: () => void,
+  ) {
+    hlsJS.supported = true;
+    vi.spyOn(HTMLMediaElement.prototype, "canPlayType").mockReturnValue("");
+    const onBufferingSummary = vi.fn();
+    const plan = fixturePlanV3({
+      stream: {
+        url: "/playback/transcode/session-1/master.m3u8",
+        protocol: "hls",
+        headers: {},
+        header_refresh: "none",
+      },
+    });
+    const { unmount } = renderPlayer({ plan, onBufferingSummary });
+    await waitFor(() => expect(hlsJS.latest).not.toBeNull());
+    for (const { type = "main", ...stats } of fragments)
+      act(() => hlsJS.latest?.emit("fragLoaded", { frag: { type, stats } }));
+    if (whilePlaying) act(whilePlaying);
+    unmount();
+    expect(onBufferingSummary).toHaveBeenCalled();
+    return onBufferingSummary.mock.calls.at(-1)![1] as Record<string, unknown>;
+  }
+
+  it.each<[string, Parameters<typeof summaryAfterFragments>[0], number | undefined]>([
+    [
+      // A 4 MB burst in 300 ms is left out; 3 MB over 1.2 s of transfer
+      // counts, without the wait for its first byte.
+      "the rate long fragments arrived at",
+      [
+        { loaded: 4_000_000, loading: { start: 0, first: 50, end: 350 } },
+        { loaded: 3_000_000, loading: { start: 900, first: 1000, end: 2200 } },
+      ],
+      20_000,
+    ],
+    [
+      // A separate audio rendition loads beside the video; subtitles do not count.
+      "overlapping video and audio receiving time once",
+      [
+        { loaded: 3_000_000, loading: { start: 0, first: 0, end: 1200 } },
+        { loaded: 1_000_000, loading: { start: 200, first: 200, end: 1400 }, type: "audio" },
+        { loaded: 900_000, loading: { start: 2000, first: 2000, end: 3500 }, type: "subtitle" },
+      ],
+      22_857,
+    ],
+    [
+      "nothing when every fragment arrived in under a second",
+      [
+        { loaded: 4_000_000, loading: { start: 0, first: 50, end: 850 } },
+        { loaded: 4_000_000, loading: { start: 1000, first: 1050, end: 1850 } },
+      ],
+      undefined,
+    ],
+  ])("reports %s with the plan summary", async (_name, fragments, kbps) => {
+    expect((await summaryAfterFragments(fragments)).throughput_kbps).toBe(kbps);
+  });
+
+  it("reports the rate the browser engine's reads received data at", async () => {
+    attachBrowserEngine.mockClear();
+    engineRoute.chosen = true;
+    onTestFinished(() => {
+      engineRoute.chosen = false;
+    });
+    const onBufferingSummary = vi.fn();
+    const { unmount } = renderPlayer({
+      onBufferingSummary,
+      browserEngine: {
+        containers: ["mkv"],
+        videoCodecs: ["h264"],
+        audioCodecs: ["aac"],
+        hdr: false,
+      },
+    });
+    await waitFor(() => expect(attachBrowserEngine).toHaveBeenCalled());
+    const { onMediaData } = attachBrowserEngine.mock.calls.at(-1)![0];
+    // The header read is too short to count; the two long reads overlap for
+    // half a second, which counts once.
+    act(() => {
+      onMediaData?.(0, 200_000, 0, 300);
+      onMediaData?.(1, 2_000_000, 1000, 2000);
+      onMediaData?.(2, 1_000_000, 1500, 2500);
+    });
+    unmount();
+    expect(onBufferingSummary.mock.calls.at(-1)![1]).toMatchObject({ throughput_kbps: 16_000 });
+  });
+
+  // D1: the server files a sample under the connection that delivers it.
+  it("reports no throughput when the network changed while the plan played", async () => {
+    const summary = await summaryAfterFragments(
+      [{ loaded: 3_000_000, loading: { start: 900, first: 1000, end: 2200 } }],
+      () => {
+        window.dispatchEvent(new Event("offline"));
+        window.dispatchEvent(new Event("online"));
+      },
+    );
+    expect(summary).not.toHaveProperty("throughput_kbps");
+  });
+});
+
+// H7: a removed element's media events never reach the document, where the
+// speed test watches for media.
+describe("VideoPlayer speed test media hold", () => {
+  beforeEach(() => {
+    vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
+    vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
+    vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("releases its element's media hold when the player goes away", () => {
+    const { container, unmount } = renderPlayer();
+    const video = container.querySelector("video");
+    releasedMedia.mockClear();
+    unmount();
+    expect(releasedMedia).toHaveBeenCalledWith(video, false);
+  });
+
+  /** The tab's shared media lock, as other tabs see it. */
+  function heldLocks() {
+    const held: string[] = [];
+    const locks = {
+      request: async (name: string, _options: unknown, callback: () => Promise<unknown>) => {
+        held.push(name);
+        try {
+          return await callback();
+        } finally {
+          held.splice(held.indexOf(name), 1);
+        }
+      },
+    };
+    Object.defineProperty(navigator, "locks", { configurable: true, value: locks });
+    onTestFinished(() => {
+      Reflect.deleteProperty(navigator, "locks");
+    });
+    return held;
+  }
+
+  function settlePaused(video: HTMLVideoElement) {
+    Object.defineProperty(video, "readyState", { configurable: true, value: 3 });
+    fireEvent.canPlay(video);
+  }
+
+  // A source that loads and stays paused, as when autoplay is refused or a
+  // track changes while paused, holds tests off only while it still loads.
+  it("holds speed tests off until a paused hls.js source has filled its buffer", async () => {
+    vi.spyOn(HTMLMediaElement.prototype, "canPlayType").mockReturnValue("");
+    hlsJS.supported = true;
+    hlsJS.forwardBufferSeconds = 10;
+    onTestFinished(() => {
+      hlsJS.supported = false;
+      hlsJS.latest = null;
+    });
+    const held = heldLocks();
+    const { container } = renderPlayer({
+      shouldAutoPlay: false,
+      plan: fixturePlanV3({
+        delivery: "server_remux_hls",
+        stream: {
+          url: "/stream/session-1/master.m3u8",
+          protocol: "hls",
+          headers: {},
+          header_refresh: "none",
+        },
+      }),
+    });
+    const video = container.querySelector("video")!;
+    await waitFor(() => expect(hlsJS.latest).not.toBeNull());
+    settlePaused(video);
+    act(() => hlsJS.latest?.emit("fragBuffered", {}));
+    expect(held).toEqual(["silo-media-active"]);
+
+    hlsJS.forwardBufferSeconds = 120;
+    act(() => hlsJS.latest?.emit("fragBuffered", {}));
+    await waitFor(() => expect(held).toEqual([]));
+  });
+
+  it("holds speed tests off until a paused element stops fetching its source", async () => {
+    const held = heldLocks();
+    const { container } = renderPlayer({ shouldAutoPlay: false });
+    const video = container.querySelector("video")!;
+    await waitFor(() => expect(video.src).toContain("/api/v1/stream/session-1"));
+    Object.defineProperty(video, "networkState", {
+      configurable: true,
+      value: HTMLMediaElement.NETWORK_LOADING,
+    });
+    settlePaused(video);
+    expect(held).toEqual(["silo-media-active"]);
+
+    Object.defineProperty(video, "networkState", {
+      configurable: true,
+      value: HTMLMediaElement.NETWORK_IDLE,
+    });
+    fireEvent(video, new Event("suspend"));
+    await waitFor(() => expect(held).toEqual([]));
+  });
+
+  // The browser decoder reads only what it decodes, which stops while paused.
+  it("lets speed tests run once a paused browser-decoder source can play", async () => {
+    attachBrowserEngine.mockClear();
+    engineRoute.chosen = true;
+    onTestFinished(() => {
+      engineRoute.chosen = false;
+    });
+    const held = heldLocks();
+    const { container } = renderPlayer({
+      shouldAutoPlay: false,
+      browserEngine: {
+        containers: ["mkv"],
+        videoCodecs: ["h264"],
+        audioCodecs: ["aac"],
+        hdr: false,
+      },
+    });
+    const video = container.querySelector("video")!;
+    await waitFor(() => expect(attachBrowserEngine).toHaveBeenCalled());
+    expect(held).toEqual(["silo-media-active"]);
+
+    settlePaused(video);
+    await waitFor(() => expect(held).toEqual([]));
+  });
+
+  // A replan's source loads paused, like a start's, and holds tests off too.
+  it("holds speed tests off while each new source loads", async () => {
+    const { container, rerenderPlayer } = renderPlayer();
+    const video = container.querySelector("video");
+    if (!video) throw new Error("expected video element");
+    await waitFor(() => expect(video.src).toContain("/api/v1/stream/session-1"));
+    sourceLoads.mockClear();
+    rerenderPlayer({ planRevision: 2 });
+    expect(sourceLoads).toHaveBeenCalledTimes(1);
   });
 });

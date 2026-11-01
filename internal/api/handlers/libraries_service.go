@@ -108,6 +108,9 @@ func (h *LibraryHandler) CreateLibrary(ctx context.Context, req LibraryCreateReq
 	if req.TrickplayEnabled && h.ArtworkStore == nil {
 		return LibraryView{}, fieldError("trickplay_enabled", "Seek previews require configured artwork storage")
 	}
+	if err := validateBoxSetSettings(req.Type, &req.BoxSetsEnabled, &req.BoxSetMinMovies); err != nil {
+		return LibraryView{}, err
+	}
 
 	folder, err := h.folderRepo.Create(ctx, catalog.CreateFolderInput{
 		Paths:                    req.Paths,
@@ -119,6 +122,9 @@ func (h *LibraryHandler) CreateLibrary(ctx context.Context, req LibraryCreateReq
 		TrailerKinds:             req.TrailerKinds,
 		RealtimeMonitoring:       req.RealtimeMonitoring,
 		TrickplayEnabled:         req.TrickplayEnabled,
+		BoxSetsEnabled:           req.BoxSetsEnabled,
+		BoxSetMinMovies:          req.BoxSetMinMovies,
+		BoxSetsInSearch:          req.BoxSetsInSearch,
 	})
 	if err != nil {
 		if errors.Is(err, catalog.ErrDuplicatePath) {
@@ -130,6 +136,9 @@ func (h *LibraryHandler) CreateLibrary(ctx context.Context, req LibraryCreateReq
 	h.pokeRealtimeMonitor()
 	if req.TrickplayEnabled {
 		h.reconcileTrickplay()
+	}
+	if folder.BoxSetsEnabled {
+		h.syncBoxSets()
 	}
 
 	// Seed default sections for the new library.
@@ -206,6 +215,14 @@ func (h *LibraryHandler) UpdateLibrary(ctx context.Context, id, userID int, req 
 		return LibraryView{}, apiError(http.StatusInternalServerError, "internal_error", "Failed to fetch library")
 	}
 
+	libraryType := oldFolder.Type
+	if req.Type != nil {
+		libraryType = *req.Type
+	}
+	if err := validateBoxSetUpdate(libraryType, oldFolder.BoxSetsEnabled, &req); err != nil {
+		return LibraryView{}, err
+	}
+
 	err = h.folderRepo.Update(ctx, id, catalog.UpdateFolderInput{
 		Paths:                    req.Paths,
 		Type:                     req.Type,
@@ -218,6 +235,9 @@ func (h *LibraryHandler) UpdateLibrary(ctx context.Context, id, userID int, req 
 		TrailerKinds:             req.TrailerKinds,
 		RealtimeMonitoring:       req.RealtimeMonitoring,
 		TrickplayEnabled:         req.TrickplayEnabled,
+		BoxSetsEnabled:           req.BoxSetsEnabled,
+		BoxSetMinMovies:          req.BoxSetMinMovies,
+		BoxSetsInSearch:          req.BoxSetsInSearch,
 	})
 	if err != nil {
 		if errors.Is(err, catalog.ErrFolderNotFound) {
@@ -239,6 +259,9 @@ func (h *LibraryHandler) UpdateLibrary(ctx context.Context, id, userID int, req 
 	if err != nil {
 		slog.ErrorContext(ctx, "fetching updated library", "component", "api", "error", err)
 		return LibraryView{}, apiError(http.StatusInternalServerError, "internal_error", "Failed to fetch updated library")
+	}
+	if folder.BoxSetsEnabled && (!oldFolder.BoxSetsEnabled || req.Paths != nil || req.Enabled != nil) {
+		h.syncBoxSets()
 	}
 
 	if h.SectionRepo != nil && oldFolder.Name != folder.Name {
@@ -878,9 +901,12 @@ func (h *LibraryHandler) ListUnmatchedItems(ctx context.Context, search string, 
 		)`
 	}
 
-	guards := ` AND ` + catalog.MangaChapterExclusionWhere("mi") + ` AND mi.match_ignored_at IS NULL`
+	// An item in no library has no file left to match.
+	guards := ` AND ` + catalog.MangaChapterExclusionWhere("mi") + ` AND ` + catalog.InSomeLibraryWhere("mi.content_id")
 	if ignored {
-		guards = ` AND ` + catalog.MangaChapterExclusionWhere("mi") + ` AND mi.match_ignored_at IS NOT NULL`
+		guards += ` AND mi.match_ignored_at IS NOT NULL`
+	} else {
+		guards += ` AND mi.match_ignored_at IS NULL`
 	}
 
 	countSQL := `
@@ -1052,7 +1078,7 @@ func (h *LibraryHandler) requeueItemMatchWork(ctx context.Context, contentID str
 			}
 		}
 	}
-	if h.SeriesMatchQueueRepo != nil { //nolint:nestif // upstream requeueItemMatchWork in libraries_service.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
+	if h.SeriesMatchQueueRepo != nil {
 		for _, root := range roots {
 			if err := h.SeriesMatchQueueRepo.EnqueueSeriesRoot(ctx, root.folderID, root.path); err != nil {
 				slog.WarnContext(ctx, "requeueing series match work", "component", "api", "content_id", contentID, "library_id", root.folderID, "error", err)
@@ -1477,20 +1503,38 @@ func normalizeLibraryPaths(paths []string) ([]string, error) {
 		if path == "" {
 			return nil, fieldError("paths", "Library paths must not be blank")
 		}
-		normalized[i] = normalizeLibraryPath(path)
+		normalized[i] = filepath.Clean(path)
 	}
 	return normalized, nil
 }
 
-// normalizeLibraryPath trims whitespace and cleans filesystem paths.
-// Virtual roots (virtual:/...) have no filesystem presence, and
-// filepath.Clean would collapse the scheme's double slash (virtual://x
-// becomes virtual:/x), breaking the prefix checks in rootcheck and the
-// scanner. Leave them untouched beyond trimming.
-func normalizeLibraryPath(path string) string {
-	path = strings.TrimSpace(path)
-	if strings.HasPrefix(strings.ToLower(path), "virtual:") {
-		return path
+// validateBoxSetSettings checks the box set settings of a new library. Box
+// sets group movies, so a library that holds none cannot turn them on.
+func validateBoxSetSettings(libraryType string, enabled *bool, minMovies *int) error {
+	if *enabled && !catalog.LibraryTypeSupportsBoxSets(libraryType) {
+		return fieldError("box_sets_enabled", "Box sets are available for movie and mixed libraries only")
 	}
-	return filepath.Clean(path)
+	if *minMovies != 0 && (*minMovies < catalog.MinBoxSetMinMovies || *minMovies > catalog.MaxBoxSetMinMovies) {
+		return fieldError("box_set_min_movies", fmt.Sprintf("box_set_min_movies must be between %d and %d", catalog.MinBoxSetMinMovies, catalog.MaxBoxSetMinMovies))
+	}
+	return nil
+}
+
+// validateBoxSetUpdate checks a library update's box set settings against the
+// library's resulting type. Changing a library to a type without movies turns
+// its box sets off rather than keeping a setting that no longer applies.
+func validateBoxSetUpdate(libraryType string, wasEnabled bool, req *LibraryUpdateRequest) error {
+	if req.BoxSetMinMovies != nil && (*req.BoxSetMinMovies < catalog.MinBoxSetMinMovies || *req.BoxSetMinMovies > catalog.MaxBoxSetMinMovies) {
+		return fieldError("box_set_min_movies", fmt.Sprintf("box_set_min_movies must be between %d and %d", catalog.MinBoxSetMinMovies, catalog.MaxBoxSetMinMovies))
+	}
+	if catalog.LibraryTypeSupportsBoxSets(libraryType) {
+		return nil
+	}
+	if req.BoxSetsEnabled != nil && *req.BoxSetsEnabled {
+		return fieldError("box_sets_enabled", "Box sets are available for movie and mixed libraries only")
+	}
+	if wasEnabled {
+		req.BoxSetsEnabled = new(false)
+	}
+	return nil
 }

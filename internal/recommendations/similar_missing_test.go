@@ -71,3 +71,15 @@ func TestItemWatchersQueryOnlyIncludesExistingItems(t *testing.T) {
 		"JOIN media_items mi ON mi.content_id = user_watches.media_item_id",
 	)
 }
+
+func assertQueryTermsInOrder(t *testing.T, query string, terms ...string) {
+	t.Helper()
+	pos := 0
+	for _, term := range terms {
+		i := strings.Index(query[pos:], term)
+		if i < 0 {
+			t.Fatalf("query term %q missing or out of order in query:\n%s", term, query)
+		}
+		pos += i + len(term)
+	}
+}

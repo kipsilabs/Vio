@@ -21,7 +21,6 @@ import (
 	chimw "github.com/go-chi/chi/v5/middleware"
 
 	"github.com/Silo-Server/silo-server/internal/nodeauth"
-	"github.com/Silo-Server/silo-server/internal/telemetry"
 
 	"github.com/Silo-Server/silo-server/internal/logredact"
 	"github.com/Silo-Server/silo-server/internal/models"
@@ -1406,7 +1405,7 @@ func (h *PlaybackHandler) startRemotePlaybackTransport(ctx context.Context, node
 	if err := nodeauth.Sign(httpRequest, nodeURL, h.JWTSecret); err != nil {
 		return transcodenode.TranscodeStartResponse{}, 0, err
 	}
-	response, err := telemetry.DoTrustedNode(transcodeproxy.NodeClient(), httpRequest, "transcode_start")
+	response, err := transcodeproxy.DoNode(transcodeproxy.NodeClient(), httpRequest, nodeURL, "transcode_start")
 	if err != nil {
 		// A node that could not be reached is out of selection at once, in
 		// addition to the suppression window: the next attempt and every

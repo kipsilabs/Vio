@@ -38,7 +38,19 @@ Silo." That is nominative, truthful use — it describes where the code came
 from, not who endorses Vio. Vio does not present itself as Silo, as
 official, or as endorsed by Silo Media.
 
-## Forks and redistributions of Vio must pick their own branding
+- **Referring to Silo truthfully** — "compatible with Silo," "a plugin for
+  Silo," "built on Silo," "a fork of Silo." Use the word to refer to *our*
+  project, not to brand *yours*.
+- **Showing the Silo logo or icon in a project that works with Silo** — for
+  example, to list Silo as a server type or on a "Connect to Silo" button. You
+  may include the official, unmodified asset files in your project's source
+  code and builds for this. Do not alter the artwork or use it as your own
+  project's logo or app icon.
+- **Redistributing official, unmodified builds** under the Silo name, with all
+  notices kept intact.
+- **Running, modifying, and self-hosting** Silo for yourself or your
+  organization.
+- **Editorial and educational** use — articles, tutorials, talks, reviews.
 
 You may fork Vio — that is your right under the AGPL. But a
 **distributed** fork must not use the Vio name or logo as its identity.
@@ -50,35 +62,12 @@ many other open-source projects: **open code, protected identity.**
 
 ## Brand assets are not under the AGPL
 
-The Vio logo, wordmark, and icon files are the property of this fork, all
-rights reserved, and are **not** licensed under the AGPL or any other
-open-source license. Any redistribution or fork must **remove or replace**
-them. See the `NOTICE` file in the brand-asset directories. The Silo brand
-assets were already removed from this fork for the same reason.
-
-## Uses that are always fine — no permission needed
-
-- **Referring to Vio or Silo truthfully** — "compatible with Vio," "a fork
-  of Silo," "built on Vio." Use the word to refer to the project, not to
-  brand *yours*.
-- **Running, modifying, and self-hosting** Vio for yourself or your
-  organization.
-- **Editorial and educational** use — articles, tutorials, talks, reviews.
-
-## Uses that require written permission
-
-- Distributing a **modified version under the Vio name**.
-- Using the Vio marks in a **company, product, domain, or app name** in a
-  way that reads as official, or in any way that implies this fork's
-  maintainers operate or endorse your offering.
-- **Merchandise**, or using the Vio logo or wordmark to sell your own
-  product beyond a referential "works with Vio" placement.
-- **Publishing an app to any app store** under the Vio name, logo, or a
-  confusingly similar identity.
-
-Never use the marks to promote piracy or to impersonate the project. For
-questions about the Silo marks (as opposed to Vio's), see Silo's own
-trademark policy in the upstream project.
+The Silo logo, wordmark, and icon files are **© 2026 Silo Media L.L.C., all
+rights reserved**, and are **not** licensed under the AGPL or any other
+open-source license. A fork or modified redistribution of Silo must **remove or
+replace** them. Projects that work with Silo may still include the unmodified
+files to refer to Silo, as described under *Uses that are always fine*. See the
+`NOTICE` file in the brand-asset directories.
 
 ## Official sources
 

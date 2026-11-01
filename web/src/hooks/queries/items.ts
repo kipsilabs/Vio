@@ -1,7 +1,11 @@
-import { getAdminItemImages, applyAdminItemImage } from "@/api/v2/adminImages";
+import {
+  getAdminItemImages,
+  applyAdminItemImage,
+  uploadAdminItemImage,
+  type UploadItemImageType,
+} from "@/api/v2/adminImages";
 import { getAdminItemFiles, splitAdminItem } from "@/api/v2/adminSplit";
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { apiV1 } from "@/api/client";
+import { useQuery, useMutation, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { useRealtimeEvents } from "@/components/realtimeEventsContext";
 import type {
   ApplyItemImageRequest,
@@ -11,6 +15,7 @@ import type {
   WatchDetail,
 } from "@/api/types";
 import { V2ProblemError, V2TransportError, v2, type V2Result } from "@/api/v2/request";
+import { apiV1 } from "@/api/client";
 import { adminTaskJobFromV2 } from "@/api/v2/adminTasks";
 import { catalogItemDetailFromV2 } from "@/api/v2/catalog";
 import { watchDetailFromV2 } from "@/api/v2/watch";
@@ -22,6 +27,7 @@ import {
 } from "@/pages/ItemDetail/watchedState";
 import {
   cancelItemDetailQueries,
+  dropInactiveWatchDetail,
   invalidateMediaSurfaceQueries,
   isTerminalItemDetailNotFound,
   scheduleMediaSurfaceInvalidation,
@@ -318,7 +324,6 @@ export interface UpdateItemMetadataRequest {
   air_time?: string | null;
   air_timezone?: string | null;
   air_date?: string | null;
-  status?: string;
   rating_imdb?: number | null;
   rating_tmdb?: number | null;
   rating_rt_critic?: number | null;
@@ -374,6 +379,9 @@ export function useWatchedStateMutation(item: WatchedMutationItem) {
         ? v2("POST /api/v2/watched/{id}", { path: { id: item.content_id }, keepalive: true })
         : v2("DELETE /api/v2/watched/{id}", { path: { id: item.content_id }, keepalive: true }),
     onMutate: async (nextPlayed: boolean) => {
+      // Marking watched no longer always flips the flag (a rewatch stays
+      // watched), so remember what to restore.
+      const previousPlayed = item.user_data?.played ?? !nextPlayed;
       await cancelItemDetailQueries(queryClient, item.content_id);
       updateCatalogItemDetail(queryClient, item.content_id, (detail) => ({
         ...detail,
@@ -385,16 +393,18 @@ export function useWatchedStateMutation(item: WatchedMutationItem) {
           in_watchlist: detail.user_state?.in_watchlist ?? false,
         },
       }));
+      return { previousPlayed };
     },
     // Revert only this mutation's own field. Restoring a whole snapshot would
     // discard a concurrent favorite/watchlist toggle's optimistic state.
-    onError: (err, nextPlayed) => {
+    onError: (err, nextPlayed, context) => {
+      const previousPlayed = context?.previousPlayed ?? !nextPlayed;
       updateCatalogItemDetail(queryClient, item.content_id, (detail) => ({
         ...detail,
-        user_data: { ...detail.user_data, played: !nextPlayed },
+        user_data: { ...detail.user_data, played: previousPlayed },
         user_state: {
           ...detail.user_state,
-          played: !nextPlayed,
+          played: previousPlayed,
           is_favorite: detail.user_state?.is_favorite ?? false,
           in_watchlist: detail.user_state?.in_watchlist ?? false,
         },
@@ -404,14 +414,20 @@ export function useWatchedStateMutation(item: WatchedMutationItem) {
     onSuccess: (_data, nextPlayed) => {
       toast.success(getWatchedToastMessage(item, nextPlayed));
     },
-    onSettled: () => {
+    onSettled: (_data, error) => {
       // The detail query has to be refreshed: marking watched also zeroes
       // `position_seconds` and moves season/series counts server-side, and the
-      // optimistic patch above only carries `played`.
+      // optimistic patch above only carries `played`. A mark that landed also
+      // clears the resume position, so a closed player must not start from
+      // its cached one while that refresh waits.
+      const knownRelatedIds = error
+        ? undefined
+        : dropInactiveWatchDetail(queryClient, item.content_id);
       scheduleMediaSurfaceInvalidation(queryClient, {
         itemId: item.content_id,
         watchedKeys: getCachedWatchedInvalidationKeys(queryClient, item),
         skipSimilarItems: true,
+        knownRelatedIds,
       });
     },
   });
@@ -611,6 +627,42 @@ export function useItemImages(contentId: string | undefined, enabled = true) {
 
 type ApplyImageItem = Pick<ItemDetail, "content_id" | "type" | "series_id" | "season_number">;
 
+// A validation problem's first field detail says why an image was refused;
+// its summary only says that it was.
+function imageErrorMessage(err: unknown, fallback: string) {
+  if (err instanceof V2ProblemError) return err.problem.errors?.[0]?.detail ?? err.message;
+  return err instanceof Error ? err.message : fallback;
+}
+
+// Refreshes every view that shows the item's artwork, and the series' views
+// for a season or episode.
+async function invalidateAppliedImage(queryClient: QueryClient, item: ApplyImageItem) {
+  await Promise.all([
+    queryClient.invalidateQueries({ queryKey: adminKeys.itemImages(item.content_id) }),
+    queryClient.invalidateQueries({ queryKey: ["items", "detail", item.content_id] }),
+    queryClient.invalidateQueries({
+      queryKey: ["catalog", "items", item.content_id, "detail"],
+    }),
+    queryClient.invalidateQueries({ queryKey: ["items", "watchDetail", item.content_id] }),
+    queryClient.invalidateQueries({ queryKey: catalogKeys.all }),
+    queryClient.invalidateQueries({ queryKey: sectionKeys.all }),
+  ]);
+
+  // Cascade for seasons/episodes to parent series.
+  if ((item.type === "season" || item.type === "episode") && item.series_id) {
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: ["items", "detail", item.series_id] }),
+      queryClient.invalidateQueries({
+        queryKey: ["catalog", "items", item.series_id, "detail"],
+      }),
+      queryClient.invalidateQueries({ queryKey: episodeKeys.seasons(item.series_id) }),
+      queryClient.invalidateQueries({
+        queryKey: ["catalog", "series", item.series_id, "seasons"],
+      }),
+    ]);
+  }
+}
+
 export function useApplyItemImage() {
   const queryClient = useQueryClient();
 
@@ -625,37 +677,34 @@ export function useApplyItemImage() {
     retry: false,
     onSuccess: async (_, { item }) => {
       toast.success("Image applied successfully");
-
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: adminKeys.itemImages(item.content_id) }),
-        queryClient.invalidateQueries({ queryKey: ["items", "detail", item.content_id] }),
-        queryClient.invalidateQueries({
-          queryKey: ["catalog", "items", item.content_id, "detail"],
-        }),
-        queryClient.invalidateQueries({ queryKey: ["items", "watchDetail", item.content_id] }),
-        queryClient.invalidateQueries({
-          queryKey: catalogKeys.all,
-          predicate: (query) => !isTerminalItemDetailNotFound(query),
-        }),
-        queryClient.invalidateQueries({ queryKey: sectionKeys.all }),
-      ]);
-
-      // Cascade for seasons/episodes to parent series.
-      if ((item.type === "season" || item.type === "episode") && item.series_id) {
-        await Promise.all([
-          queryClient.invalidateQueries({ queryKey: ["items", "detail", item.series_id] }),
-          queryClient.invalidateQueries({
-            queryKey: ["catalog", "items", item.series_id, "detail"],
-          }),
-          queryClient.invalidateQueries({ queryKey: episodeKeys.seasons(item.series_id) }),
-          queryClient.invalidateQueries({
-            queryKey: ["catalog", "series", item.series_id, "seasons"],
-          }),
-        ]);
-      }
+      await invalidateAppliedImage(queryClient, item);
     },
     onError: (err) => {
-      toast.error(err instanceof Error ? err.message : "Failed to apply image");
+      toast.error(imageErrorMessage(err, "Failed to apply image"));
+    },
+  });
+}
+
+export function useUploadItemImage() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async ({
+      item,
+      type,
+      file,
+    }: {
+      item: ApplyImageItem;
+      type: UploadItemImageType;
+      file: File;
+    }) => uploadAdminItemImage(item.content_id, type, file),
+    retry: false,
+    onSuccess: async (_, { item }) => {
+      toast.success("Image uploaded");
+      await invalidateAppliedImage(queryClient, item);
+    },
+    onError: (err) => {
+      toast.error(imageErrorMessage(err, "Failed to upload image"));
     },
   });
 }

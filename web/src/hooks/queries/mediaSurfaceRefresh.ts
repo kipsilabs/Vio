@@ -4,6 +4,7 @@ import type {
   ItemDetail,
   SeasonDetailResponse,
   SeasonsResponse,
+  SectionItem,
 } from "@/api/types";
 import { ApiClientError } from "@/api/client";
 import { V2ProblemError } from "@/api/v2/request";
@@ -32,6 +33,10 @@ import { bumpHomeRefreshSignal } from "@/pages/homeSurfaceRefresh";
 
 interface InvalidateMediaSurfaceOptions {
   itemId?: string;
+  // The item's series, when the event names it. Watched and progress events
+  // carry it for episodes and seasons, so the series and its seasons refresh
+  // even when this client has never cached the item (#796).
+  seriesId?: string;
   libraryId?: number;
   watchedKeys?: Array<readonly unknown[]>;
   skipItemDetail?: boolean;
@@ -146,12 +151,18 @@ export function removeItemFromHomeSectionCaches(
       ) {
         return current;
       }
-      const nextItems = current.section.items.filter((item) => item.content_id !== itemId);
+      const kept = (item: SectionItem) => item.content_id !== itemId;
+      const nextItems = current.section.items.filter(kept);
       if (nextItems.length === current.section.items.length) {
         return current;
       }
       return {
         ...current,
+        // A completed row's shown cards lose the removed ones, so none of its
+        // later cards moves up into them (see dropCrossSectionDuplicates).
+        ...(current.shown !== undefined && {
+          shown: current.section.items.slice(0, current.shown).filter(kept).length,
+        }),
         section: {
           ...current.section,
           total_count: Math.max(
@@ -257,7 +268,16 @@ function listedChildIds(data: unknown): string[] {
 // Realtime events and watched marks name only the item itself, so narrowing
 // to that one ID would leave an open season grid, series watched totals or a
 // marked season's episodes stale.
-export function relatedItemIds(queryClient: QueryClient, itemId: string): Set<string> {
+//
+// seriesId is the item's series when the event names it. The series and its
+// cached seasons are related even when nothing cached links the item to them;
+// the series' other episodes are not, since one episode's change doesn't move
+// them.
+export function relatedItemIds(
+  queryClient: QueryClient,
+  itemId: string,
+  seriesId?: string,
+): Set<string> {
   // Index season identities before the links, then walk them, so a
   // series with many cached seasons and episodes costs two cache scans,
   // not one per item.
@@ -355,6 +375,10 @@ export function relatedItemIds(queryClient: QueryClient, itemId: string): Set<st
   };
   walk(parentsOf);
   walk(childrenOf);
+  if (seriesId && seriesId !== itemId) {
+    related.add(seriesId);
+    for (const season of seasonIds.get(seriesId)?.values() ?? []) related.add(season);
+  }
   return related;
 }
 
@@ -442,7 +466,9 @@ export async function invalidateMediaSurfaceQueries(
   // `cancelRefetch: false` — reusing an in-flight request would let a response
   // that predates the mutation satisfy the invalidation and land in the cache
   // as fresh.
-  const relatedIds = options.itemId ? relatedItemIds(queryClient, options.itemId) : undefined;
+  const relatedIds = options.itemId
+    ? relatedItemIds(queryClient, options.itemId, options.seriesId)
+    : undefined;
   options.knownRelatedIds?.forEach((id) => relatedIds?.add(id));
   // A new item nothing in the cache knows about, such as an episode a scan
   // just added, can't be traced to the season or series lists that should now
@@ -618,6 +644,9 @@ export function scheduleMediaSurfaceInvalidation(
           ])
         : undefined,
     watchedKeys: [...(existing?.options.watchedKeys ?? []), ...(options.watchedKeys ?? [])],
+    // A later event without a series (one whose lookup failed, say) mustn't
+    // drop the series an earlier event for the same item named.
+    seriesId: options.seriesId ?? existing?.options.seriesId,
   };
   const now = Date.now();
   const deadline = existing?.deadline ?? now + MEDIA_SURFACE_REFRESH_MAX_WAIT_MS;

@@ -3,12 +3,27 @@ package catalog
 import (
 	"context"
 	"fmt"
+	"os"
 	"slices"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+func newExtraArtworkTestPool(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("SILO_TEST_DATABASE_URL is not set")
+	}
+	pool, err := pgxpool.New(context.Background(), dsn)
+	if err != nil {
+		t.Fatalf("connect test database: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	return pool
+}
 
 // seedSeriesWithNullEpisodeStill seeds a series with a poster, one season with
 // a poster, and one episode whose still_path is NULL. It returns the series ID

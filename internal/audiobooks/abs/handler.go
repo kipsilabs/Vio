@@ -23,6 +23,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/httpheader"
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/streamtelemetry"
 )
 
 // ---------------------------------------------------------------------------
@@ -138,16 +139,16 @@ type Series struct {
 // revocable-token surface (login, refresh, logout, bearerAuth).
 // Real impl: a thin repo over the abs_tokens table added in Stage 2.
 type TokenStore interface {
-	// InsertToken persists a newly minted JTI.
-	InsertToken(ctx context.Context, tok ABSToken) error
+	// IssueTokens persists newly minted tokens for one account only while
+	// the credential they were minted from is still live, and returns
+	// ErrNotFound, storing nothing, once it is not. A sign-out everywhere
+	// that commits after the request checked its credential must not leave
+	// tokens the request stores afterwards.
+	IssueTokens(ctx context.Context, from TokenSource, tokens ...ABSToken) error
 	// GetTokenByJTI looks up a token by its JTI; returns ErrNotFound if absent.
 	GetTokenByJTI(ctx context.Context, jti string) (ABSToken, error)
 	// RevokeTokenByJTI marks a JTI as revoked (sets revoked_at).
 	RevokeTokenByJTI(ctx context.Context, jti string) error
-	// RevokeTokenIfActive atomically marks an unrevoked token as revoked and
-	// returns its previous row. Returns ErrNotFound when the token is absent or
-	// was already revoked.
-	RevokeTokenIfActive(ctx context.Context, jti string) (ABSToken, error)
 	// RevokeTokensForPrincipal revokes every active access/refresh token for a
 	// user profile. Logout uses this to invalidate refresh tokens as well as the
 	// presented access token.
@@ -167,6 +168,19 @@ type ABSToken struct {
 	RevokedAt *time.Time
 }
 
+// TokenSource is the credential a request mints tokens from, which
+// TokenStore.IssueTokens checks is still live.
+type TokenSource struct {
+	// JTI is the token the request presented.
+	JTI string
+	// Rotate revokes JTI as the new tokens are stored, so a refresh token
+	// is exchanged once.
+	Rotate bool
+	// LoginSessionID is the login session a sign-in's credential check
+	// opened.
+	LoginSessionID string
+}
+
 // Principal is who an ABS sign-in authenticated.
 type Principal struct {
 	UserID string
@@ -177,6 +191,10 @@ type Principal struct {
 	// checked. Tokens carry it so a later PIN change ends them (see
 	// ProfileVerifier).
 	PINRevision int64
+	// LoginSessionID is the login session the credential check opened. A
+	// sign-out everywhere revokes it, so the sign-in's tokens are stored
+	// only while it is live.
+	LoginSessionID string
 }
 
 // Sign-in refusals for a profile's PIN. "username#profile" names the profile
@@ -334,7 +352,13 @@ type Dependencies struct {
 
 // Handler wires the /abs/api/* and canonical ABS-client paths.
 type Handler struct {
-	deps Dependencies
+	deps      Dependencies
+	telemetry *streamtelemetry.Registry
+}
+
+// SetStreamTelemetry wires local stream observation. Call before Mount.
+func (h *Handler) SetStreamTelemetry(registry *streamtelemetry.Registry) {
+	h.telemetry = registry
 }
 
 // New constructs an ABS Handler. Sensible defaults are applied for optional
@@ -421,8 +445,8 @@ func (h *Handler) mountRoutes(r chi.Router) {
 	// the capability. Mounted at both /public/session and /abs/public/session
 	// for compatibility with clients that pin either prefix.
 	for _, prefix := range []string{"", "/abs"} {
-		r.Get(prefix+"/public/session/{sid}/track/{idx}", h.handlePublicTrack)
-		r.Head(prefix+"/public/session/{sid}/track/{idx}", h.handlePublicTrack)
+		r.Get(prefix+"/public/session/{sid}/track/{idx}", observeABS(h.telemetry, http.MethodGet, prefix+"/public/session/{sid}/track/{idx}", h.handlePublicTrack))
+		r.Head(prefix+"/public/session/{sid}/track/{idx}", observeABS(h.telemetry, http.MethodHead, prefix+"/public/session/{sid}/track/{idx}", h.handlePublicTrack))
 	}
 
 	// Public RSS feed routes — slug is the capability token, no auth.
@@ -643,6 +667,20 @@ func (h *Handler) accessFilterFromRequest(r *http.Request) (catalog.AccessFilter
 	}
 	filter, err := h.accessFilterForAuth(r.Context(), a)
 	return filter, true, err
+}
+
+// requireAccess resolves the caller's access filter for a handler that reads
+// catalog data. When resolution fails it logs, writes 403, and returns false;
+// the caller must stop before any read or write, because an empty filter means
+// "no restriction" and would widen the response past the profile's scope.
+func (h *Handler) requireAccess(w http.ResponseWriter, r *http.Request, a ctxAuth) (catalog.AccessFilter, bool) {
+	access, err := h.accessFilterForAuth(r.Context(), a)
+	if err != nil {
+		slog.WarnContext(r.Context(), "abs resolve access failed", "component", "audiobooks", "user", a.UserID, "profile", a.ProfileID, "path", r.URL.Path, "err", err)
+		http.Error(w, "resolve access failed", http.StatusForbidden)
+		return catalog.AccessFilter{}, false
+	}
+	return access, true
 }
 
 func emptyAccessFilter() catalog.AccessFilter {

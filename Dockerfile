@@ -18,9 +18,11 @@ COPY web/vendor/foliate-js ./vendor/foliate-js
 RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
     pnpm install --frozen-lockfile
 COPY web/ .
-# The v2 contract fixtures are imported by web tests, which `tsc -b` type-checks
+# The v2 contract fixtures are imported by web tests, which `tsrs -b` type-checks
 # as part of the build; they live outside web/ so copy them explicitly.
 COPY contracts/api/v2/fixtures/ /app/contracts/api/v2/fixtures/
+# Web tests also import the shared design schema vectors under docs/.
+COPY docs/design/schemas/ /app/docs/design/schemas/
 RUN pnpm run build
 
 # Allow CI to inject prebuilt frontend assets via a named `frontend_dist`
@@ -58,7 +60,11 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     -o /vio ./cmd/silo/
 
 # Stage 3: Runtime
-FROM debian:trixie-20260918-slim
+# CI rebuilds this stage without the layer cache (no-cache-filters: runtime in
+# trusted-linux-build.yml) so every image picks up Debian security updates; the
+# upgrade covers packages already in the base image between Debian's refreshes
+# of the trixie-slim tag.
+FROM debian:trixie-20251020-slim
 ARG TARGETARCH
 ARG INTEL_GMMLIB_VERSION=22.10.0
 ARG INTEL_IGC_VERSION=2.34.4
@@ -66,6 +72,7 @@ ARG INTEL_IGC_BUILD=21428
 ARG INTEL_NEO_VERSION=26.18.38308.1
 ARG JELLYFIN_FFMPEG_VERSION=8.1.3-1
 RUN apt-get update && \
+    apt-get upgrade -y && \
     apt-get install -y --no-install-recommends ca-certificates curl gnupg && \
     curl -fsSL https://repo.jellyfin.org/jellyfin_team.gpg.key \
       | gpg --dearmor -o /usr/share/keyrings/jellyfin.gpg && \
@@ -96,7 +103,11 @@ COPY --from=jellyfin_web_node /usr/local/bin/node /usr/local/bin/node
 COPY --from=jellyfin_web_node /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
 RUN ln -sf ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
     ln -sf ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
-COPY --from=build /vio /usr/local/bin/vio
+# Node.js verifies TLS against its own bundled CA list, which Debian's
+# ca-certificates updates do not reach. Use the system store instead, so a CA
+# that Debian removes stops being trusted by npm as well.
+ENV NODE_OPTIONS=--use-openssl-ca
+COPY --from=build /silo /usr/local/bin/silo
 EXPOSE 8080 8096 13378
 # Silo runs database migrations before its HTTP listener starts, and an
 # upgrade on a large library can migrate for many minutes. The start period

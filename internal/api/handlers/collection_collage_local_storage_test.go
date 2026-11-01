@@ -4,9 +4,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"io"
-	"net/http"
-	"net/http/httptest"
+	"image"
+	"image/color"
+	"image/png"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,378 +18,88 @@ import (
 	"github.com/Silo-Server/silo-server/internal/metadata"
 )
 
-// localArtworkPosters models the resolver a local-disk artwork backend wires:
-// every stored poster key comes back as the root-relative signed route the
-// server itself serves, with no scheme or host.
-type localArtworkPosters struct {
-	signer *artworkurl.Signer
-	keys   map[string]string
-}
-
-func (r localArtworkPosters) PresignImageURLs(_ context.Context, paths []string, _, _ string) map[string]string {
-	out := make(map[string]string, len(paths))
-	for _, path := range paths {
-		if key, ok := r.keys[path]; ok {
-			url, _ := r.signer.Sign(key, time.Now())
-			out[path] = url
-		}
-	}
-	return out
-}
-
-// absoluteArtworkPosters models an S3 or public resolver: every stored poster
-// key comes back as an absolute URL the composer fetches over HTTP.
-type absoluteArtworkPosters struct {
-	base string
-	keys map[string]string
-}
-
-func (r absoluteArtworkPosters) PresignImageURLs(_ context.Context, paths []string, _, _ string) map[string]string {
-	out := make(map[string]string, len(paths))
-	for _, path := range paths {
-		if key, ok := r.keys[path]; ok {
-			out[path] = r.base + "/" + key
-		}
-	}
-	return out
-}
-
-func collageSourceKey(prefix, id string) string {
-	return "collection-images/" + id + "/poster/w500." + prefix + ".jpg"
-}
-
-// A collection collage built from local-disk artwork storage must read its
-// source posters straight from that store. The local resolver hands back a
-// root-relative signed route, which no HTTP client can request, so fetching it
-// over HTTP fails with "unsupported protocol scheme".
-func TestComposeCollectionCollageReadsLocalArtworkFromStore(t *testing.T) {
-	ctx := t.Context()
-	posterA, posterB := testCollectionPosterJPEG(t), testCollectionPosterJPEG(t)
-
-	srcA, srcB := "movies/one/poster.jpg", "movies/two/poster.jpg"
-	keyA, keyB := collageSourceKey("aaaa", "one"), collageSourceKey("bbbb", "two")
-
+// localStorageCollageFixture wires collage sources the way local artwork
+// storage serves them: posters resolve to this server's signed, root-relative
+// artwork route, and the store holds the variant each one names.
+func localStorageCollageFixture(t *testing.T, sources []string) (*blobstoretest.Memory, *catalog.DetailService, *artworkurl.Signer) {
+	t.Helper()
 	store := blobstoretest.New()
-	if err := store.Put(ctx, keyA, posterA); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Put(ctx, keyB, posterB); err != nil {
-		t.Fatal(err)
-	}
-
-	signer := artworkurl.NewSigner("collage-local-artwork-test-secret", time.Hour)
-	gen := collectionCollageComposer{
-		prefix: adminCollectionImagePrefix,
-		store:  store,
-		posters: localArtworkPosters{
-			signer: signer,
-			keys:   map[string]string{srcA: keyA, srcB: keyB},
-		},
-		signer:     signer,
-		httpClient: newCollectionImageClient(),
-	}
-
-	const key = "0123456789abcdef"
-	path, thumbhash, err := gen.ComposeCollectionCollage(ctx, "c1", key, []string{srcA, srcB})
-	if err != nil {
-		t.Fatalf("compose from local artwork storage: %v", err)
-	}
-	if path != gen.CollectionCollagePath("c1", key) || thumbhash == "" {
-		t.Fatalf("stored %q with thumbhash %q", path, thumbhash)
-	}
-	for _, objectKey := range []string{
-		"collection-images/c1/collage/original." + key + ".webp",
-		"collection-images/c1/collage/w500." + key + ".webp",
-		"collection-images/c1/collage/w300." + key + ".webp",
-	} {
-		if _, ok := store.Objects[objectKey]; !ok {
-			t.Fatalf("object %s was not stored", objectKey)
-		}
-	}
-}
-
-// The two resolver shapes -- a root-relative local route read from the store,
-// and an absolute S3/public URL fetched over HTTP -- must produce the same
-// composed collage.
-func TestComposeCollectionCollageLocalAndRemoteSourcesAgree(t *testing.T) {
-	ctx := t.Context()
-	posterA, posterB := testCollectionPosterJPEG(t), testCollectionPosterJPEG(t)
-
-	srcA, srcB := "movies/one/poster.jpg", "movies/two/poster.jpg"
-	keyA, keyB := collageSourceKey("aaaa", "one"), collageSourceKey("bbbb", "two")
-
-	localStore := blobstoretest.New()
-	if err := localStore.Put(ctx, keyA, posterA); err != nil {
-		t.Fatal(err)
-	}
-	if err := localStore.Put(ctx, keyB, posterB); err != nil {
-		t.Fatal(err)
-	}
-	localSigner := artworkurl.NewSigner("collage-local-artwork-test-secret", time.Hour)
-	localGen := collectionCollageComposer{
-		prefix: adminCollectionImagePrefix,
-		store:  localStore,
-		posters: localArtworkPosters{
-			signer: localSigner,
-			keys:   map[string]string{srcA: keyA, srcB: keyB},
-		},
-		signer:     localSigner,
-		httpClient: newCollectionImageClient(),
-	}
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/" + keyA:
-			_, _ = w.Write(posterA)
-		case "/" + keyB:
-			_, _ = w.Write(posterB)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	t.Cleanup(server.Close)
-	remoteStore := blobstoretest.New()
-	remoteGen := collectionCollageComposer{
-		prefix: adminCollectionImagePrefix,
-		store:  remoteStore,
-		posters: absoluteArtworkPosters{
-			base: server.URL,
-			keys: map[string]string{srcA: keyA, srcB: keyB},
-		},
-		httpClient: server.Client(),
-	}
-
-	const key = "0123456789abcdef"
-	localPath, localThumb, err := localGen.ComposeCollectionCollage(ctx, "c1", key, []string{srcA, srcB})
-	if err != nil {
-		t.Fatalf("compose from local artwork storage: %v", err)
-	}
-	remotePath, remoteThumb, err := remoteGen.ComposeCollectionCollage(ctx, "c1", key, []string{srcA, srcB})
-	if err != nil {
-		t.Fatalf("compose from absolute artwork URLs: %v", err)
-	}
-	if localPath != remotePath || localThumb != remoteThumb {
-		t.Fatalf("local %q / %q, remote %q / %q; want the same collage", localPath, localThumb, remotePath, remoteThumb)
-	}
-	for _, objectKey := range []string{
-		"collection-images/c1/collage/original." + key + ".webp",
-		"collection-images/c1/collage/w500." + key + ".webp",
-		"collection-images/c1/collage/w300." + key + ".webp",
-	} {
-		localData, ok := localStore.Objects[objectKey]
-		if !ok {
-			t.Fatalf("local compose did not store %s", objectKey)
-		}
-		remoteData, ok := remoteStore.Objects[objectKey]
-		if !ok {
-			t.Fatalf("remote compose did not store %s", objectKey)
-		}
-		if !bytes.Equal(localData, remoteData) {
-			t.Fatalf("object %s differs between local and remote compose", objectKey)
-		}
-	}
-}
-
-// A local route that names a missing store object fails the build with a clean
-// error and stores nothing.
-func TestComposeCollectionCollageMissingLocalArtworkFails(t *testing.T) {
-	ctx := t.Context()
-	signer := artworkurl.NewSigner("collage-local-artwork-test-secret", time.Hour)
-	store := blobstoretest.New()
-
-	src := "movies/missing/poster.jpg"
-	gen := collectionCollageComposer{
-		prefix: adminCollectionImagePrefix,
-		store:  store,
-		posters: localArtworkPosters{
-			signer: signer,
-			keys:   map[string]string{src: collageSourceKey("cccc", "missing")},
-		},
-		signer:     signer,
-		httpClient: newCollectionImageClient(),
-	}
-
-	_, _, err := gen.ComposeCollectionCollage(ctx, "c1", "0123456789abcdef", []string{src})
-	if err == nil {
-		t.Fatal("a collage whose local source is missing was built")
-	}
-	if !errors.Is(err, blobstore.ErrNotFound) {
-		t.Fatalf("compose with a missing local source = %v, want ErrNotFound", err)
-	}
-	if len(store.Objects) != 0 {
-		t.Fatalf("a failed build stored %d objects", len(store.Objects))
-	}
-}
-
-// recordingArtworkRepair records the keys a collage build queues for repair,
-// and how many times it was asked at all, so a negative gate can tell "never
-// called" apart from "called with nothing".
-type recordingArtworkRepair struct {
-	calls int
-	keys  []string
-}
-
-func (r *recordingArtworkRepair) EnqueueArtworkRepair(_ context.Context, keys []string, _ int) (int, error) {
-	r.calls++
-	r.keys = append(r.keys, keys...)
-	return len(keys), nil
-}
-
-// failingArtworkStore is an in-memory store whose Get always fails with a
-// non-ErrNotFound error, modeling a storage outage. Every other method is the
-// in-memory fake's.
-type failingArtworkStore struct {
-	*blobstoretest.Memory
-	err error
-}
-
-func (s *failingArtworkStore) Get(context.Context, string) (io.ReadCloser, blobstore.ObjectInfo, error) {
-	return nil, blobstore.ObjectInfo{}, s.err
-}
-
-// A local source that names a missing revisioned object is queued for
-// regeneration, as the signed artwork route does, so the collage can be
-// rebuilt once the object is back.
-func TestComposeCollectionCollageMissingLocalArtworkQueuesRepair(t *testing.T) {
-	ctx := t.Context()
-	signer := artworkurl.NewSigner("collage-local-artwork-test-secret", time.Hour)
-	repair := &recordingArtworkRepair{}
-
-	src := "movies/missing/poster.jpg"
-	key := collageSourceKey("cccc", "missing")
-	gen := collectionCollageComposer{
-		prefix: adminCollectionImagePrefix,
-		store:  blobstoretest.New(),
-		posters: localArtworkPosters{
-			signer: signer,
-			keys:   map[string]string{src: key},
-		},
-		signer:     signer,
-		repair:     repair,
-		httpClient: newCollectionImageClient(),
-	}
-
-	if _, _, err := gen.ComposeCollectionCollage(ctx, "c1", "0123456789abcdef", []string{src}); !errors.Is(err, blobstore.ErrNotFound) {
-		t.Fatalf("compose with a missing local source = %v, want ErrNotFound", err)
-	}
-	if want := "collection-images/missing/poster/original.cccc.jpg"; len(repair.keys) != 1 || repair.keys[0] != want {
-		t.Fatalf("queued repair keys = %v, want [%s]", repair.keys, want)
-	}
-	if repair.calls != 1 {
-		t.Fatalf("EnqueueArtworkRepair calls = %d, want 1", repair.calls)
-	}
-}
-
-// A local source whose key carries no content revision -- a legacy fixed key --
-// is never queued for repair: the repair path regenerates revisioned objects,
-// so an unrevisioned miss has nothing to enqueue.
-func TestComposeCollectionCollageMissingUnrevisionedSourceSkipsRepair(t *testing.T) {
-	ctx := t.Context()
-	signer := artworkurl.NewSigner("collage-local-artwork-test-secret", time.Hour)
-	repair := &recordingArtworkRepair{}
-
-	src := "movies/missing/poster.jpg"
-	key := "collection-images/missing/poster/original.jpg"
-	gen := collectionCollageComposer{
-		prefix: adminCollectionImagePrefix,
-		store:  blobstoretest.New(),
-		posters: localArtworkPosters{
-			signer: signer,
-			keys:   map[string]string{src: key},
-		},
-		signer:     signer,
-		repair:     repair,
-		httpClient: newCollectionImageClient(),
-	}
-
-	if _, _, err := gen.ComposeCollectionCollage(ctx, "c1", "0123456789abcdef", []string{src}); !errors.Is(err, blobstore.ErrNotFound) {
-		t.Fatalf("compose with a missing unrevisioned source = %v, want ErrNotFound", err)
-	}
-	if repair.calls != 0 {
-		t.Fatalf("EnqueueArtworkRepair calls = %d, want none for an unrevisioned miss", repair.calls)
-	}
-}
-
-// A storage failure that is not a missing object is a fault, not a lost
-// revision: queueing a repair would hide the outage behind regeneration, so the
-// build fails without enqueueing.
-func TestComposeCollectionCollageStorageErrorSkipsRepair(t *testing.T) {
-	ctx := t.Context()
-	signer := artworkurl.NewSigner("collage-local-artwork-test-secret", time.Hour)
-	repair := &recordingArtworkRepair{}
-	storageErr := errors.New("artwork storage unavailable")
-
-	src := "movies/missing/poster.jpg"
-	key := collageSourceKey("cccc", "missing")
-	gen := collectionCollageComposer{
-		prefix: adminCollectionImagePrefix,
-		store:  &failingArtworkStore{Memory: blobstoretest.New(), err: storageErr},
-		posters: localArtworkPosters{
-			signer: signer,
-			keys:   map[string]string{src: key},
-		},
-		signer:     signer,
-		repair:     repair,
-		httpClient: newCollectionImageClient(),
-	}
-
-	if _, _, err := gen.ComposeCollectionCollage(ctx, "c1", "0123456789abcdef", []string{src}); !errors.Is(err, storageErr) {
-		t.Fatalf("compose with a storage failure = %v, want %v", err, storageErr)
-	}
-	if repair.calls != 0 {
-		t.Fatalf("EnqueueArtworkRepair calls = %d, want none for a storage failure", repair.calls)
-	}
-}
-
-// The production local-artwork wiring -- a real filesystem blob store, the
-// artwork signer, and the catalog resolver chain -- composes a collage from
-// sources in that store with no HTTP request.
-func TestComposeCollectionCollageProductionLocalWiring(t *testing.T) {
-	ctx := t.Context()
-	posterA, posterB := testCollectionPosterJPEG(t), testCollectionPosterJPEG(t)
-
-	store, err := blobstore.NewFilesystem(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	signer := artworkurl.NewSigner("collage-local-artwork-test-secret", time.Hour)
+	signer := artworkurl.NewSigner("collage-test-secret", time.Hour)
 	resolver := metadata.NewPluginImageResolver()
-	t.Cleanup(resolver.Close)
 	resolver.SetArtworkResolver(artworkurl.NewServerResolver(signer))
 	detail := &catalog.DetailService{}
 	detail.SetImageResolver(resolver)
 
-	// Cached catalog poster paths, as media_items.poster_path holds them.
-	srcA := "tmdb/movies/550/poster/original.aaaaaaaaaaaaaaaa.webp"
-	srcB := "tmdb/movies/551/poster/original.bbbbbbbbbbbbbbbb.webp"
-
-	// The production resolver names the store key for each source; put the
-	// poster bytes there, as a real local backend would have them.
-	resolved := detail.PresignImageURLs(ctx, []string{srcA, srcB}, "poster", "small")
-	for src, poster := range map[string][]byte{srcA: posterA, srcB: posterB} {
-		key, ok := signer.SignedKey(resolved[src], time.Now())
-		if !ok {
-			t.Fatalf("resolver produced %q for %s, not a signed local route", resolved[src], src)
+	resolved := detail.PresignImageURLs(context.Background(), sources, "poster", "small")
+	for i, source := range sources {
+		url := resolved[source]
+		if !strings.HasPrefix(url, "/api/v2/artwork/") {
+			t.Fatalf("source %q resolved to %q, want the server's artwork route", source, url)
 		}
-		if err := store.Put(ctx, key, poster); err != nil {
+		key, ok := signer.SignedKey(url, time.Now())
+		if !ok {
+			t.Fatalf("resolved URL %q does not verify", url)
+		}
+		poster := image.NewNRGBA(image.Rect(0, 0, 20, 30))
+		for y := range 30 {
+			for x := range 20 {
+				poster.Set(x, y, color.NRGBA{R: uint8(60 * i), G: 120, B: 200, A: 255})
+			}
+		}
+		var buf bytes.Buffer
+		if err := png.Encode(&buf, poster); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Put(context.Background(), key, buf.Bytes()); err != nil {
 			t.Fatal(err)
 		}
 	}
+	return store, detail, signer
+}
 
-	gen := NewPersonalCollectionCollageGenerator(store, detail, signer, nil, nil)
+// Local artwork storage resolves posters to root-relative URLs on this
+// server, which an HTTP client cannot request ("unsupported protocol
+// scheme"), so collages never built there. They are read from the store.
+func TestCollageReadsPostersFromLocalArtworkStorage(t *testing.T) {
+	sources := []string{
+		"local/movies/title-1/0a1b2c3d/poster/original.webp",
+		"local/movies/title-2/1b2c3d4e/poster/original.webp",
+		"local/movies/title-3/2c3d4e5f/poster/original.webp",
+		"local/movies/title-4/3d4e5f60/poster/original.webp",
+	}
+	store, detail, signer := localStorageCollageFixture(t, sources)
+	gen := NewPersonalCollectionCollageGenerator(store, detail, signer, nil)
 	if gen == nil {
 		t.Fatal("no collage generator")
 	}
 
 	const key = "0123456789abcdef"
-	path, thumbhash, err := gen.ComposeCollectionCollage(ctx, "c1", key, []string{srcA, srcB})
+	path, _, err := gen.ComposeCollectionCollage(t.Context(), "c1", key, sources)
 	if err != nil {
-		t.Fatalf("compose with production local wiring: %v", err)
+		t.Fatalf("compose from local artwork storage: %v", err)
 	}
-	if want := gen.CollectionCollagePath("c1", key); path != want || thumbhash == "" {
-		t.Fatalf("stored %q (%q), want %q with a thumbhash", path, thumbhash, want)
+	if path != gen.CollectionCollagePath("c1", key) {
+		t.Fatalf("collage stored at %q, want %q", path, gen.CollectionCollagePath("c1", key))
 	}
-	if _, _, err := store.Get(ctx, path); err != nil {
-		t.Fatalf("composed collage not readable from the store: %v", err)
+	if _, ok := store.Objects[path]; !ok {
+		t.Fatalf("collage %q not in the store", path)
+	}
+
+	// The library collection handler composes with the same reader.
+	h := &LibraryCollectionHandler{ArtworkStore: store, detailSvc: detail, ArtworkSigner: signer, httpClient: newCollectionImageClient()}
+	if _, _, err := h.ComposeCollectionCollage(t.Context(), "c2", key, sources); err != nil {
+		t.Fatalf("library collection compose from local artwork storage: %v", err)
+	}
+}
+
+// A source the store does not hold fails the build, as an unreachable
+// download did, so a later read retries it rather than storing a collage
+// with a gap.
+func TestCollageFromLocalArtworkStorageFailsOnAMissingPoster(t *testing.T) {
+	sources := []string{"local/movies/title-1/0a1b2c3d/poster/original.webp"}
+	_, detail, signer := localStorageCollageFixture(t, sources)
+	gen := NewPersonalCollectionCollageGenerator(blobstoretest.New(), detail, signer, nil)
+	if _, _, err := gen.ComposeCollectionCollage(t.Context(), "c1", "0123456789abcdef", sources); !errors.Is(err, blobstore.ErrNotFound) {
+		t.Fatalf("compose with a poster the store does not hold = %v, want the store's not-found error", err)
 	}
 }

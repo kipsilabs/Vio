@@ -1,8 +1,6 @@
 package chatgpt
 
 import (
-	"crypto/rand"
-	"crypto/rsa"
 	"encoding/base64"
 	"errors"
 	"math/big"
@@ -15,11 +13,8 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 )
 
-func TestLoginActivationReconcilesModelWithoutLosingAcceptedTokens(t *testing.T) { //nolint:funlen,gocyclo // upstream TestLoginActivationReconcilesModelWithoutLosingAcceptedTokens exceeds Vio's 100-line and complexity-30 limits; refactor tracked separately
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		t.Fatal(err)
-	}
+func TestLoginActivationReconcilesModelWithoutLosingAcceptedTokens(t *testing.T) {
+	key := testSigningKey(t)
 	for _, test := range []struct {
 		name, clientID, authMode                               string
 		status                                                 int
@@ -61,12 +56,7 @@ func TestLoginActivationReconcilesModelWithoutLosingAcceptedTokens(t *testing.T)
 				}
 				pending := stored(t, store).Pending
 				claims := identityClaims{RegisteredClaims: jwt.RegisteredClaims{Issuer: issuer, Subject: "user", Audience: jwt.ClaimStrings{test.clientID}, ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour))}, Nonce: pending.Nonce, Email: "user@example.test"}
-				token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
-				token.Header["kid"] = "test-key"
-				signed, err := token.SignedString(key)
-				if err != nil {
-					t.Fatal(err)
-				}
+				signed := signIDToken(t, key, claims)
 				modelsCalls := 0
 				s.http.Transport = transportFunc(func(r *http.Request) (*http.Response, error) {
 					switch r.URL.Path {

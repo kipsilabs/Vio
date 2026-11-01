@@ -488,10 +488,16 @@ func frameMatchesSourceKind(frame preflightFrame, kind SourceKind) bool {
 	// Vio keeps the relaxed compatibility check for other source kinds so
 	// remote and virtual inputs whose decoder omits complete color metadata
 	// can still pass preflight.
-	_, compatible := sourceMetadataCompatibility(kind, SourceMetadata{
+	complete, compatible := sourceMetadataCompatibility(kind, SourceMetadata{
 		ColorRange: frame.ColorRange, ColorPrimaries: frame.ColorPrimaries,
 		ColorTransfer: frame.ColorTransfer, ColorSpace: frame.ColorSpace,
 	})
+	// Full-range PQ conversion preserves the decoded range. An untagged frame
+	// therefore cannot establish which levels the frozen recipe will receive;
+	// accepting it would make the conversion dependent on decoder defaults.
+	if kind == SourcePQFullRange && !complete {
+		return false
+	}
 	return compatible
 }
 
@@ -516,6 +522,7 @@ func sourceConversionPreflightArgs(request SourcePreflightRequest, position floa
 				device = defaultDRIRenderDevice
 			}
 			args = append(args, VAAPIInitDeviceArgs("va", device)...)
+			args = append(args, VAAPIOpenCLInitArgs("va", request.Filter, request.Kind)...)
 			args = append(args, "-filter_hw_device", "va")
 			if !request.SoftwareVideoDecode {
 				args = append(args, "-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi")
@@ -568,21 +575,28 @@ func sourceConversionPreflightFilter(request SourcePreflightRequest) string {
 		}
 		return SourceParameters(request.Kind) + "," + CUDAFilter(request.Kind) + "," + HDRMetadataRemovalFilter()
 	}
-	filter := VAAPIFilter(request.Kind)
-	if request.SoftwareVideoDecode && (request.Backend == BackendQSV || request.Backend == BackendVAAPI) {
-		filter = "format=nv12,hwupload," + filter
-	}
-	if request.Backend == BackendQSV {
-		filter = QSVFilter(request.Kind, 0) + "," + QSVInteropFilter()
-		if request.SoftwareVideoDecode {
-			format := "nv12"
-			if !IsSDRSource(request.Kind) {
-				format = "p010le"
-			}
-			filter = "format=" + format + ",hwupload," + filter
+	if request.Backend == BackendQSV || request.Filter == HardwareFilterOpenCL {
+		filter := IntelFilter(request.Kind, 0)
+		if request.Backend == BackendQSV {
+			filter += "," + QSVInteropFilter()
 		}
+		return intelOpenCLPreflightUpload(request) + filter + "," + HDRMetadataRemovalFilter()
+	}
+	filter := VAAPIFilter(request.Kind)
+	if request.SoftwareVideoDecode {
+		filter = SoftwareUploadFilter(request.Kind) + filter
 	}
 	return filter + "," + HDRMetadataRemovalFilter()
+}
+
+// intelOpenCLPreflightUpload uploads CPU-decoded frames for IntelFilter at the
+// depth playback uploads them: 10-bit for HDR, which the OpenCL tone mapper
+// reads, and 8-bit for SDR bases.
+func intelOpenCLPreflightUpload(request SourcePreflightRequest) string {
+	if !request.SoftwareVideoDecode {
+		return ""
+	}
+	return SoftwareUploadFilter(request.Kind)
 }
 
 // sourcePreflightEncoder returns the encoder paired with the selected mode.

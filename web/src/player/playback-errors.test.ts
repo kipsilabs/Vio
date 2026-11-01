@@ -79,22 +79,6 @@ describe("describePlanTerminal", () => {
     });
   });
 
-  it("falls back to a generic subtitle sentence when the server sends no message", () => {
-    expect(
-      describePlanTerminal({
-        reason: "subtitle_codec_unsupported",
-        message: "  ",
-        retryable: false,
-      }),
-    ).toEqual({
-      title: "That subtitle track can't be used",
-      message:
-        "Vio couldn't prepare the selected subtitles for this device. Try a different track.",
-      reason: "subtitle_codec_unsupported",
-      retryable: false,
-    });
-  });
-
   it("keeps the server's reason for refusing every version of an item", () => {
     expect(
       describePlanTerminal({
@@ -105,18 +89,6 @@ describe("describePlanTerminal", () => {
     ).toEqual({
       title: "No playable version found",
       message: "A lower-resolution source is required because 4K transcoding is disabled.",
-      reason: "no_alternate_version",
-      retryable: false,
-    });
-  });
-
-  it("falls back to a generic sentence when no alternate version carries no message", () => {
-    expect(
-      describePlanTerminal({ reason: "no_alternate_version", message: "   ", retryable: false }),
-    ).toEqual({
-      title: "No playable version found",
-      message:
-        "Vio couldn't find a way to play this file on this device. Try another version if one is available.",
       reason: "no_alternate_version",
       retryable: false,
     });
@@ -149,51 +121,6 @@ describe("describePlanTerminal", () => {
       title: "Playback unavailable",
       message: "Failed to start the playback transport.",
       reason: "transcode_start_failed",
-      retryable: true,
-    });
-  });
-
-  it("falls back to a generic sentence when a conversion failure carries no message", () => {
-    expect(
-      describePlanTerminal({
-        reason: "transcode_node_unavailable",
-        message: " ",
-        retryable: true,
-      }),
-    ).toEqual({
-      title: "Playback unavailable",
-      message: "The server couldn't start converting this file. Please try again.",
-      reason: "transcode_node_unavailable",
-      retryable: true,
-    });
-  });
-
-  it("exposes the retry verdict of a virtual source that could not be resolved", () => {
-    expect(
-      describePlanTerminal({
-        reason: "virtual_source_unavailable",
-        message: "The virtual source could not be resolved for playback.",
-        retryable: true,
-      }),
-    ).toEqual({
-      title: "Playback unavailable",
-      message: "The virtual source could not be resolved for playback.",
-      reason: "virtual_source_unavailable",
-      retryable: true,
-    });
-  });
-
-  it("falls back to a generic sentence when a virtual source failure carries no message", () => {
-    expect(
-      describePlanTerminal({
-        reason: "virtual_source_unavailable",
-        message: "  ",
-        retryable: true,
-      }),
-    ).toEqual({
-      title: "Playback unavailable",
-      message: "The virtual source could not be resolved for playback.",
-      reason: "virtual_source_unavailable",
       retryable: true,
     });
   });

@@ -28,6 +28,8 @@ export interface WatchRouteRequest {
   audioTrackIndex?: number;
   prePlaySubtitleMode?: "auto" | "off" | "explicit";
   prePlaySubtitleSelection?: PrePlaySubtitleSelection | null;
+  /** The viewer chose fileId, so Auto must not swap in another version. */
+  versionPicked?: boolean;
   returnHref?: string;
   requestKey: string;
   /** True when `fileId` was explicitly chosen by the viewer on the media page. */
@@ -49,6 +51,7 @@ export interface WatchPlaybackStartInput {
   audioTrackIndex?: number;
   prePlaySubtitleMode?: "auto" | "off" | "explicit";
   prePlaySubtitleSelection?: PrePlaySubtitleSelection | null;
+  versionPicked?: boolean;
   returnHref?: string;
   explicitFileSelection?: boolean;
   /** When true, the server should force a re-link/re-query of the virtual file
@@ -75,8 +78,7 @@ function buildWatchRouteRequestKey(
   audioTrackIndex: number | undefined,
   prePlaySubtitleMode: "auto" | "off" | "explicit" | undefined,
   prePlaySubtitleSelection: PrePlaySubtitleSelection | null | undefined,
-  explicitFileSelection: boolean | undefined,
-  forceRelink: boolean | undefined,
+  versionPicked: boolean,
 ): string {
   return JSON.stringify([
     contentId,
@@ -89,8 +91,7 @@ function buildWatchRouteRequestKey(
     audioTrackIndex ?? null,
     prePlaySubtitleMode ?? null,
     prePlaySubtitleSelection ?? null,
-    explicitFileSelection ?? null,
-    forceRelink ?? null,
+    versionPicked,
   ]);
 }
 
@@ -105,6 +106,7 @@ export function createWatchRouteRequest({
   audioTrackIndex,
   prePlaySubtitleMode,
   prePlaySubtitleSelection,
+  versionPicked = false,
   returnHref,
   explicitFileSelection,
   forceRelink,
@@ -120,6 +122,7 @@ export function createWatchRouteRequest({
     audioTrackIndex,
     prePlaySubtitleMode,
     prePlaySubtitleSelection,
+    versionPicked,
     returnHref,
     explicitFileSelection,
     forceRelink,
@@ -134,8 +137,7 @@ export function createWatchRouteRequest({
       audioTrackIndex,
       prePlaySubtitleMode,
       prePlaySubtitleSelection,
-      explicitFileSelection,
-      forceRelink,
+      versionPicked,
     ),
   };
 }
@@ -214,7 +216,6 @@ function buildInitialSubtitleTrackIndexes({
   subtitleMode,
   preferredSubtitleLanguage,
   preferredSubtitleTrackSignature,
-  profileLanguage,
   showForcedSubtitles,
 }: {
   item: WatchDetail;
@@ -222,7 +223,6 @@ function buildInitialSubtitleTrackIndexes({
   subtitleMode: SubtitleMode;
   preferredSubtitleLanguage: string | null;
   preferredSubtitleTrackSignature: PlayerSubtitleTrackSignature | null;
-  profileLanguage: string | null;
   showForcedSubtitles: boolean;
 }): {
   start: Record<number, number>;
@@ -252,7 +252,6 @@ function buildInitialSubtitleTrackIndexes({
       preferredLanguage: preferredSubtitleLanguage,
       preferredTrackSignature: preferredSubtitleTrackSignature,
       audioLanguage: resolveVersionAudioLanguage(version, selectedAudioTrackIndex),
-      profileLanguage,
       showForcedSubtitles,
     });
     if (selectedSubtitleTrackIndex === null) {
@@ -314,10 +313,7 @@ export function buildWatchPageProps({
     currentProfile?.subtitle_mode ||
     "off") as SubtitleMode;
   const showForcedSubtitles =
-    request.prePlaySubtitleMode === "off"
-      ? false
-      : (item.effective_show_forced_subtitles ?? currentProfile?.show_forced_subtitles ?? true);
-  const profileLanguage = currentProfile?.language || null;
+    item.effective_show_forced_subtitles ?? currentProfile?.show_forced_subtitles ?? true;
 
   const requestedVersion =
     (request.fileId ? item.versions.find((v) => v.file_id === request.fileId) : undefined) ??
@@ -391,7 +387,6 @@ export function buildWatchPageProps({
     subtitleMode,
     preferredSubtitleLanguage,
     preferredSubtitleTrackSignature: effectivePreferredSubtitleTrackSignature,
-    profileLanguage,
     showForcedSubtitles,
   });
   // A pre-play pick names its row by the dense combined ordinal the popover
@@ -470,6 +465,7 @@ export function buildWatchPageProps({
     title: item.title,
     year: item.year,
     fileId: request.fileId,
+    versionPicked: request.versionPicked,
     libraryId: request.libraryId,
     versions: item.versions,
     playbackVariants: item.playback_variants ?? EMPTY_PLAYBACK_VARIANTS,
@@ -490,7 +486,6 @@ export function buildWatchPageProps({
     preferredSubtitleTrackSignature: effectivePreferredSubtitleTrackSignature,
     subtitleMode,
     showForcedSubtitles,
-    profileLanguage,
     intro,
     introSkipMode,
     credits,

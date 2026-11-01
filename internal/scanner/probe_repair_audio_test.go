@@ -1,6 +1,8 @@
 package scanner
 
 import (
+	"context"
+	"reflect"
 	"testing"
 	"time"
 
@@ -296,68 +298,50 @@ func TestNeedsCriticalProbeRepairScanState_LegacyShortDurationRepairs(t *testing
 	}
 }
 
-// The probe_version gate is the MULTi backfill: rows the September migration
-// created carry version 0 with legacy track shapes, and only a successful
-// probe stamps the current version. An otherwise-complete version-0 file must
-// request repair so the backfill converges; the same file at the current
-// version must stay stable; version-0 virtual files stay exempt because their
-// track shape is provider-declared, never probed.
-func TestNeedsCriticalProbeRepairScanState_ProbeVersionGatesBackfill(t *testing.T) {
-	now := time.Now().UTC()
-	complete := func() *scanStateFile {
-		return &scanStateFile{
-			ProbeSource:    "local",
-			ProbeUpdatedAt: &now,
-			FileSize:       1_200_000_000,
-			Duration:       3600,
-			Container:      "mkv",
-			CodecVideo:     "h264",
-			CodecAudio:     "eac3",
-			Resolution:     "1080p",
-			HasVideoTracks: true,
-			HasAudioTracks: true,
-			HasChapters:    true,
-		}
-	}
-
-	legacy := complete()
-	legacy.ProbeVersion = 0
-	if !needsCriticalProbeRepairScanState(legacy) {
-		t.Fatal("an otherwise-complete version-0 file must request repair for the MULTi backfill")
-	}
-
-	current := complete()
-	current.ProbeVersion = probeVersion
-	if needsCriticalProbeRepairScanState(current) {
-		t.Fatal("an otherwise-complete file at the current probe version must not request repair")
-	}
-
-	virtual := complete()
-	virtual.ProbeVersion = 0
-	virtual.FilePath = "virtual://provider/release"
-	virtual.Container = "virtual"
-	if needsCriticalProbeRepairScanState(virtual) {
-		t.Fatal("a version-0 virtual file must stay exempt from probe repair")
-	}
-}
-
-// A standing probe rejection short-circuits repair before the version gate:
-// an unchanged file ffprobe already rejected must not be reprobed in the
-// background, even at version 0. Changed bytes drop the mark and repair.
-func TestScanStateNeedsProbeRepair_StandingRejectionSkipsVersionGate(t *testing.T) {
-	modifiedAt := time.Now().UTC().Truncate(time.Second)
-	failedAt := modifiedAt
-	rejected := &scanStateFile{
-		ProbeSource:    "local",
-		ProbeFailedAt:  &failedAt,
-		ProbeVersion:   0,
-		FileSize:       1024,
-		FileModifiedAt: &modifiedAt,
-	}
-	if scanStateNeedsProbeRepair(rejected, 1024, modifiedAt, true) {
-		t.Fatal("a standing rejection must skip background repair even at version 0")
-	}
-	if !scanStateNeedsProbeRepair(rejected, 2048, modifiedAt, true) {
-		t.Fatal("changed bytes must drop the rejection and repair")
+// Playback's probe repair rewrites the row from a fresh ffprobe. Chapters the
+// scanner synthesized (one per multipart audiobook file) are not in the
+// container, so a reprobe finding none must not erase them; chapters that did
+// come from the container follow the reprobe.
+func TestPlaybackProbeRepairKeepsChaptersTheProbeCannotReproduce(t *testing.T) {
+	synthesized := []models.MediaChapter{{Index: 2, Title: "part3", StartSeconds: 0, EndSeconds: 600}}
+	embedded := []models.MediaChapter{{Index: 0, Title: "Opening", StartSeconds: 0, EndSeconds: 600, Source: "embedded"}}
+	for _, tc := range []struct {
+		name     string
+		existing []models.MediaChapter
+		want     []models.MediaChapter
+	}{
+		{name: "scanner-synthesized chapters survive", existing: synthesized, want: synthesized},
+		{name: "embedded chapters follow the reprobe", existing: embedded, want: []models.MediaChapter{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			probedAt := time.Date(2026, time.October, 1, 12, 0, 0, 0, time.UTC)
+			row := &models.MediaFile{
+				ID: 7, FilePath: "/library/Author/Book/part3.mp3", BaseType: "audiobook",
+				ProbeSource: "local", ProbeUpdatedAt: &probedAt, Duration: 600,
+				Container: "mp3", CodecAudio: "mp3", Chapters: tc.existing,
+				PresentationKind: audiobookMultipartKind, PresentationPartIndex: 3, PresentationPartTotal: 10,
+			}
+			repo := &probeRepairTestRepository{files: map[int]*models.MediaFile{row.ID: row}}
+			ensurer := &PlaybackProbeEnsurer{
+				fileRepo: repo, ffprobePath: "ffprobe", timeout: time.Second,
+				probeFile: func(context.Context, string, string) (*ProbeData, error) {
+					return &ProbeData{
+						CodecAudio: "mp3", Container: "mp3", Duration: 600,
+						AudioTracks: []AudioTrackInfo{{Codec: "mp3"}},
+						Chapters:    []ChapterInfo{},
+					}, nil
+				},
+			}
+			got, err := ensurer.EnsureProbeOnly(context.Background(), row)
+			if err != nil {
+				t.Fatalf("EnsureProbeOnly: %v", err)
+			}
+			if repo.upserts() != 1 || len(got.AudioTracks) != 1 {
+				t.Fatalf("repair did not run: upserts=%d audio tracks=%d", repo.upserts(), len(got.AudioTracks))
+			}
+			if !reflect.DeepEqual(got.Chapters, tc.want) {
+				t.Fatalf("chapters after repair = %+v, want %+v", got.Chapters, tc.want)
+			}
+		})
 	}
 }

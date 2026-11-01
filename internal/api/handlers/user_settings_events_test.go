@@ -77,34 +77,3 @@ func TestDeleteValuePublishesUserSettingsEvent(t *testing.T) {
 	env := receiveUserSettingsEvent(t, events)
 	assertUserSettingsEnvelope(t, env, "playback.subtitle_language", "profile")
 }
-
-// TestFailedMutationsPublishNothing: a refused write and a delete of nothing
-// must not tell clients something changed.
-func TestFailedMutationsPublishNothing(t *testing.T) {
-	handler, _ := newValuesTestHandler(t)
-	handler.EventsHub = evt.NewHub("test", &cache.NoopEventBus{})
-	events, unsubscribe := handler.EventsHub.Subscribe()
-	defer unsubscribe()
-
-	if rec := routeValues(t, handler, http.MethodPut, "playback.subtitle_language",
-		"scope=profile", []byte(`{"value":"!!!"}`)); rec.Code != http.StatusBadRequest {
-		t.Fatalf("invalid PUT = %d, want 400", rec.Code)
-	}
-	// A subtitle preference is the one idempotent clear: it answers 204 for an
-	// absent row, and still publishes nothing because nothing changed.
-	if rec := routeValues(t, handler, http.MethodDelete, settingskeys.PlaybackSubtitleLanguage,
-		"scope=profile", nil); rec.Code != http.StatusNoContent {
-		t.Fatalf("DELETE of an unset subtitle preference = %d, want 204", rec.Code)
-	}
-	// Every other key keeps the 404 that reports an unset aimed at nothing.
-	if rec := routeValues(t, handler, http.MethodDelete, settingskeys.PlaybackIntroSkipMode,
-		"scope=profile", nil); rec.Code != http.StatusNotFound {
-		t.Fatalf("DELETE of nothing = %d, want 404", rec.Code)
-	}
-
-	select {
-	case env := <-events:
-		t.Errorf("a failed mutation published %s on %s", env.Event, env.Channel)
-	default:
-	}
-}

@@ -9,11 +9,11 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
-	"os"
-	"os/exec"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Silo-Server/silo-server/internal/fspath"
 )
 
 // StreamExtractOpts configures a single streaming subtitle extract.
@@ -148,7 +148,7 @@ func StreamExtractSubtitle(ctx context.Context, opts StreamExtractOpts) error {
 
 	extractCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	cmd := exec.CommandContext(extractCtx, bin, streamExtractArgs(opts)...)
+	cmd := fspath.CommandContext(extractCtx, bin, streamExtractArgs(opts)...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("stdout pipe: %w", err)
@@ -238,7 +238,7 @@ func windowFromCachedSup(opts StreamExtractOpts, firstCue float64) StreamExtract
 // readSupFirstCue returns the time, in seconds, of the first segment in a
 // .sup file.
 func readSupFirstCue(path string) (float64, error) {
-	f, err := os.Open(path) //nolint:gosec // Path is a catalog subtitle file selected by the playback planner.
+	f, err := fspath.Open(path)
 	if err != nil {
 		return 0, err
 	}

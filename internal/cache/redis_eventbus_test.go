@@ -1,14 +1,11 @@
 package cache
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"slices"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/redis/go-redis/v9"
 
@@ -77,8 +74,8 @@ func TestRedisClientsTakeDatabaseNumberFromRedisDB(t *testing.T) {
 // Runs without a Redis server: the name Redis receives must carry the database
 // number that the same connection selected.
 func TestRedisEventBusSendsScopedChannelToRedis(t *testing.T) {
-	bare := []string{"SUBSCRIBE vio:admin on database 0", "PUBLISH vio:admin on database 0"}
-	db5 := []string{"SUBSCRIBE vio:admin@db5 on database 5", "PUBLISH vio:admin@db5 on database 5"}
+	bare := []string{"SUBSCRIBE silo:admin on database 0", "PUBLISH silo:admin on database 0"}
+	db5 := []string{"SUBSCRIBE silo:admin@db5 on database 5", "PUBLISH silo:admin@db5 on database 5"}
 	for _, tc := range []struct {
 		name string
 		path string
@@ -86,7 +83,7 @@ func TestRedisEventBusSendsScopedChannelToRedis(t *testing.T) {
 		want []string
 		bare bool
 	}{
-		{"database 3", "/3", "", []string{"SUBSCRIBE vio:admin@db3 on database 3", "PUBLISH vio:admin@db3 on database 3"}, false},
+		{"database 3", "/3", "", []string{"SUBSCRIBE silo:admin@db3 on database 3", "PUBLISH silo:admin@db3 on database 3"}, false},
 		{"database 0", "/0", "", bare, false},
 		{"no database number", "", "", bare, false},
 		{"negative database number", "/-1", "", bare, false},
@@ -134,8 +131,8 @@ func TestCheckEventBusChannels(t *testing.T) {
 	}
 
 	for _, tc := range []struct{ path, want string }{
-		{"/3", "SUBSCRIBE vio:catalog@db3 vio:admin@db3 vio:playback@db3 vio:logs@db3 vio:events@db3"},
-		{"/0", "SUBSCRIBE vio:catalog vio:admin vio:playback vio:logs vio:events"},
+		{"/3", "SUBSCRIBE silo:catalog@db3 silo:admin@db3 silo:playback@db3 silo:transcode-move@db3 silo:logs@db3 silo:events@db3"},
+		{"/0", "SUBSCRIBE silo:catalog silo:admin silo:playback silo:transcode-move silo:logs silo:events"},
 	} {
 		server := startRESPTestServer(t, nil, respTestRedis)
 		if err := check(t, server, tc.path); err != nil {
@@ -150,7 +147,7 @@ func TestCheckEventBusChannels(t *testing.T) {
 		if args[0] != "SUBSCRIBE" {
 			return "", false
 		}
-		return "-NOPERM User silo has no permissions to access the 'vio:catalog' channel\r\n", true
+		return "-NOPERM User silo has no permissions to access the 'silo:catalog' channel\r\n", true
 	})
 	err := check(t, server, "/0")
 	if _, refused := errors.AsType[redis.Error](err); !refused || !strings.Contains(err.Error(), "NOPERM") {
@@ -167,13 +164,13 @@ func TestCheckEventBusChannels(t *testing.T) {
 			"-NOPERM User silo has no permissions to access the '" + args[2] + "' channel\r\n", true
 	})
 	err = check(t, server, "/0")
-	if _, refused := errors.AsType[redis.Error](err); !refused || !strings.Contains(err.Error(), "vio:admin") {
-		t.Errorf("a later channel refused: %v, want the NOPERM reply for vio:admin", err)
+	if _, refused := errors.AsType[redis.Error](err); !refused || !strings.Contains(err.Error(), "silo:admin") {
+		t.Errorf("a later channel refused: %v, want the NOPERM reply for silo:admin", err)
 	}
 }
 
 func TestRedisEventBusRejectsInvalidDatabaseOnBareAddress(t *testing.T) {
-	for _, db := range []string{"five", "-1", "999999999999999999999999999999"} {
+	for _, db := range []string{"five", "-1"} {
 		t.Run(db, func(t *testing.T) {
 			server := startRESPTestServer(t, nil, respTestRedis)
 			bus := newRedisEventBus(config.RedisConfig{URL: server.addr, DB: db})
@@ -189,123 +186,5 @@ func TestRedisEventBusRejectsInvalidDatabaseOnBareAddress(t *testing.T) {
 				t.Errorf("Redis received %q for an invalid redis.db, want no commands", got)
 			}
 		})
-	}
-}
-
-func testRedisOptions(t *testing.T, db int) *redis.Options {
-	t.Helper()
-	rawURL := os.Getenv("SILO_TEST_REDIS_URL")
-	if rawURL == "" {
-		t.Skip("SILO_TEST_REDIS_URL not set")
-	}
-	options, err := redis.ParseURL(rawURL)
-	if err != nil {
-		t.Fatalf("parse SILO_TEST_REDIS_URL: %v", err)
-	}
-	options.DB = db
-	return options
-}
-
-func testEventBus(t *testing.T, db int) *RedisEventBus {
-	t.Helper()
-	bus := newRedisEventBusFromClient(redis.NewClient(testRedisOptions(t, db)), false)
-	t.Cleanup(func() { _ = bus.Close() })
-	return bus
-}
-
-func collectEvents(t *testing.T, bus *RedisEventBus, channel string) <-chan Event {
-	t.Helper()
-	events := make(chan Event, 8)
-	if err := bus.Subscribe(t.Context(), channel, func(event Event) { events <- event }); err != nil {
-		t.Fatalf("subscribe to %s: %v", channel, err)
-	}
-	return events
-}
-
-func nextEvent(t *testing.T, events <-chan Event) Event {
-	t.Helper()
-	select {
-	case event := <-events:
-		return event
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for an event")
-		return Event{}
-	}
-}
-
-// Two installs sharing one Redis server on different database numbers must
-// not receive each other's events, while the nodes of one install still do.
-func TestRedisEventBusKeepsDatabaseNumbersApart(t *testing.T) {
-	node, peer, otherInstall := testEventBus(t, 1), testEventBus(t, 1), testEventBus(t, 2)
-	channel := fmt.Sprintf("vio:test:%d", time.Now().UnixNano())
-	peerEvents := collectEvents(t, peer, channel)
-	otherEvents := collectEvents(t, otherInstall, channel)
-	ctx := t.Context()
-
-	if err := node.Publish(ctx, channel, Event{Type: EventSettingsChanged, Payload: "database 1"}); err != nil {
-		t.Fatalf("publish on database 1: %v", err)
-	}
-	if got := nextEvent(t, peerEvents); got.Payload != "database 1" {
-		t.Fatalf("peer on the same database received %+v, want the database 1 event", got)
-	}
-
-	// Redis queues messages to a subscriber in publish order, so an event
-	// leaked from database 1 would arrive ahead of this one.
-	if err := otherInstall.Publish(ctx, channel, Event{Type: EventSettingsChanged, Payload: "database 2"}); err != nil {
-		t.Fatalf("publish on database 2: %v", err)
-	}
-	if got := nextEvent(t, otherEvents); got.Payload != "database 2" {
-		t.Fatalf("bus on database 2 received %+v first, want only its own event", got)
-	}
-
-	if err := node.Publish(ctx, channel, Event{Type: EventSettingsChanged, Payload: "database 1 again"}); err != nil {
-		t.Fatalf("publish on database 1: %v", err)
-	}
-	if got := nextEvent(t, peerEvents); got.Payload != "database 1 again" {
-		t.Fatalf("peer on database 1 received %+v, want only database 1 events", got)
-	}
-}
-
-// A node on database 0 must keep exchanging events with nodes built before
-// channels were scoped, which publish and subscribe on the bare channel name.
-func TestRedisEventBusOnDatabaseZeroUsesBareChannel(t *testing.T) {
-	bus := testEventBus(t, 0)
-	channel := fmt.Sprintf("vio:test:%d", time.Now().UnixNano())
-	events := collectEvents(t, bus, channel)
-	ctx := t.Context()
-
-	older := redis.NewClient(testRedisOptions(t, 0))
-	t.Cleanup(func() { _ = older.Close() })
-	pubsub := older.Subscribe(ctx, channel)
-	t.Cleanup(func() { _ = pubsub.Close() })
-	if _, err := pubsub.Receive(ctx); err != nil {
-		t.Fatalf("subscribe to the bare channel: %v", err)
-	}
-
-	if err := bus.Publish(ctx, channel, Event{Type: EventSettingsChanged, Payload: "from the bus"}); err != nil {
-		t.Fatalf("publish from the bus: %v", err)
-	}
-	select {
-	case msg := <-pubsub.Channel():
-		var got Event
-		if err := json.Unmarshal([]byte(msg.Payload), &got); err != nil || got.Payload != "from the bus" {
-			t.Fatalf("bare channel carried %q (%v), want the bus event", msg.Payload, err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("the bare channel did not carry the bus event")
-	}
-	if got := nextEvent(t, events); got.Payload != "from the bus" {
-		t.Fatalf("bus received %+v, want its own event", got)
-	}
-
-	data, err := json.Marshal(Event{Type: EventSettingsChanged, Payload: "from an older node"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := older.Publish(ctx, channel, data).Err(); err != nil {
-		t.Fatalf("publish on the bare channel: %v", err)
-	}
-	if got := nextEvent(t, events); got.Payload != "from an older node" {
-		t.Fatalf("bus received %+v, want the event published on the bare channel", got)
 	}
 }

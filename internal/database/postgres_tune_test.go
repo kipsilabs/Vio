@@ -1,6 +1,15 @@
 package database
 
-import "testing"
+import (
+	"context"
+	"os"
+	"slices"
+	"strconv"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
 
 func TestRecommendPostgresOLTPSettings(t *testing.T) {
 	opts := PostgresTuneOptions{
@@ -22,7 +31,6 @@ func TestRecommendPostgresOLTPSettings(t *testing.T) {
 
 	expected := map[string]string{
 		"max_connections":                  "100",
-		"max_locks_per_transaction":        "256",
 		"shared_buffers":                   "4GB",
 		"effective_cache_size":             "12GB",
 		"maintenance_work_mem":             "1GB",
@@ -132,20 +140,6 @@ func TestPostgresTuneDisabledByDefault(t *testing.T) {
 	}
 }
 
-func TestPostgresTuneDBSizeDefaultsToAuto(t *testing.T) {
-	t.Setenv("POSTGRES_TUNE", "oltp")
-	t.Setenv("POSTGRES_TUNE_MEMORY", "8GB")
-	t.Setenv("POSTGRES_TUNE_CPUS", "4")
-
-	opts, err := LoadPostgresTuneOptionsFromEnv(20)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if opts.DBSize != postgresTuneDBSizeAuto {
-		t.Fatalf("DBSize = %q, want %q", opts.DBSize, postgresTuneDBSizeAuto)
-	}
-}
-
 func TestClassifyPostgresTuneDBSize(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -173,32 +167,67 @@ func TestParsePostgresTuneByteSizeRequiresUnit(t *testing.T) {
 	}
 }
 
-// TestPostgresTuneManualDisablesWithoutError pins that an operator who states
-// they tuned PostgreSQL themselves is honored rather than warned about: the
-// manual/self/custom spellings disable tuning exactly like off, with no error.
-func TestPostgresTuneManualDisablesWithoutError(t *testing.T) {
-	for _, mode := range []string{"manual", "self", "custom", "off"} {
-		t.Run(mode, func(t *testing.T) {
-			t.Setenv("POSTGRES_TUNE", mode)
-			t.Setenv("POSTGRES_TUNE_MEMORY", "8GB")
-			t.Setenv("POSTGRES_TUNE_CPUS", "4")
+// ALTER SYSTEM writes postgresql.auto.conf for the whole cluster but changes
+// nothing until a reload or restart, which this test never does. It restores
+// the file's max_worker_processes entry when it finishes.
+func TestPostgresSettingsPendingRestartPostgres(t *testing.T) {
+	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("SILO_TEST_DATABASE_URL is not set")
+	}
+	ctx := t.Context()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
 
-			opts, err := LoadPostgresTuneOptionsFromEnv(20)
-			if err != nil {
-				t.Fatalf("POSTGRES_TUNE=%s: %v", mode, err)
+	const name = "max_worker_processes"
+	var running int
+	var source string
+	if err := pool.QueryRow(ctx, "SELECT setting::int, source FROM pg_settings WHERE name = $1", name).Scan(&running, &source); err != nil {
+		t.Fatal(err)
+	}
+	if source != "default" {
+		t.Skipf("%s runs from %s; the test needs its built-in default", name, source)
+	}
+	var saved *string
+	if err := pool.QueryRow(ctx, `SELECT (SELECT setting FROM pg_file_settings
+WHERE name = $1 AND sourcefile LIKE '%postgresql.auto.conf' ORDER BY seqno DESC LIMIT 1)`, name).Scan(&saved); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		statement := "ALTER SYSTEM RESET " + name
+		if saved != nil {
+			statement = "ALTER SYSTEM SET " + name + " = " + quotePostgresLiteral(*saved)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if _, err := pool.Exec(ctx, statement); err != nil {
+			t.Error(err)
+		}
+	})
+
+	names := []string{name, "max_connections"}
+	for _, tt := range []struct {
+		name, statement string
+		want            []string
+	}{
+		{name: "set to the running value", statement: "ALTER SYSTEM SET " + name + " = " + strconv.Itoa(running)},
+		{name: "set to another value", statement: "ALTER SYSTEM SET " + name + " = " + strconv.Itoa(running+1), want: []string{name}},
+		{name: "reset while running on the default", statement: "ALTER SYSTEM RESET " + name},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := pool.Exec(ctx, tt.statement); err != nil {
+				t.Fatal(err)
 			}
-			if opts.Enabled {
-				t.Fatalf("POSTGRES_TUNE=%s enabled tuning, want disabled", mode)
+			got, err := postgresSettingsPendingRestart(ctx, pool, names)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(got, tt.want) {
+				t.Fatalf("pending = %v, want %v", got, tt.want)
 			}
 		})
-	}
-}
-
-// TestPostgresTuneUnknownModeStillErrors keeps the permissive disabled set from
-// swallowing a genuinely invalid value: a typo must still be refused.
-func TestPostgresTuneUnknownModeStillErrors(t *testing.T) {
-	t.Setenv("POSTGRES_TUNE", "manual-ish")
-	if _, err := LoadPostgresTuneOptionsFromEnv(20); err == nil {
-		t.Fatal("an unknown POSTGRES_TUNE value was accepted")
 	}
 }

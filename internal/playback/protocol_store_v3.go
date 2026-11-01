@@ -72,6 +72,18 @@ type ProgressReceiptV3 struct {
 	// caller's sample when applied or replayed, the newer stored sample when
 	// stale, nil when nothing has been applied yet.
 	Accepted *ProgressSampleV3
+	// Lifecycle is the pause or resume the applied sample made to the
+	// session's announced lifecycle state, committed with the sample; nil
+	// when the state did not change or the store keeps no lifecycle.
+	Lifecycle *LifecycleChangeV3
+}
+
+// LifecycleChangeV3 is a lifecycle pause transition an accepted progress
+// sample made: its sequence number, commit time and new pause state.
+type LifecycleChangeV3 struct {
+	Seq    int64
+	At     time.Time
+	Paused bool
 }
 
 // StopReceiptV3 is what a stop returns, and what every later stop of the same
@@ -127,6 +139,53 @@ type ProgressStoreV3 interface {
 	ClaimStopFinalization(ctx context.Context, sessionID string, leaseUntil time.Time) (bool, error)
 }
 
+type RecoveryStateV3 struct {
+	Exclusions []RecoveryExclusionV3 `json:"exclusions,omitempty"`
+}
+
+func RecoveryExclusionKeyV3(providerSource, candidateID string) string {
+	return providerSource + "\x00" + candidateID
+}
+
+type RecoveryExclusionV3 struct {
+	ProviderSource string    `json:"provider_source,omitempty"`
+	CandidateID    string    `json:"candidate_id"`
+	ReleaseID      string    `json:"release_id,omitempty"`
+	FileID         int       `json:"file_id,omitempty"`
+	ConfirmedAt    time.Time `json:"confirmed_at,omitempty"`
+}
+
+type AudioReconcileLedgerV3 struct {
+	Entries  []AudioReconcileEntryV3 `json:"entries,omitempty"`
+	Revision int64                   `json:"revision,omitempty"`
+}
+
+type AudioReconcileDecisionV3 string
+
+const (
+	AudioReconcileReplanned AudioReconcileDecisionV3 = "replanned"
+	AudioReconcileNoop      AudioReconcileDecisionV3 = "noop"
+	AudioReconcileRefused   AudioReconcileDecisionV3 = "refused"
+)
+
+type AudioReconcileEntryV3 struct {
+	Generation    string                   `json:"generation"`
+	SessionID     string                   `json:"session_id,omitempty"`
+	Decision      AudioReconcileDecisionV3 `json:"decision"`
+	AudioIndex    *int                     `json:"audio_index,omitempty"`
+	Request       *ReplanRequestV3         `json:"request,omitempty"`
+	RequestDigest string                   `json:"request_digest,omitempty"`
+	AnnouncedAt   *time.Time               `json:"announced_at,omitempty"`
+}
+
+// AudioSelectionV3 is the durable start-time audio selection intent stored in an attempt.
+type AudioSelectionV3 struct {
+	Origin            string                         `json:"origin,omitempty"`
+	PreferredLanguage string                         `json:"preferred_language,omitempty"`
+	SeriesSignature   *userstore.AudioTrackSignature `json:"series_signature,omitempty"`
+	SelectedSignature *userstore.AudioTrackSignature `json:"selected_signature,omitempty"`
+}
+
 type AttemptRecordV3 struct {
 	PlaybackAttemptID      string
 	SessionID              string
@@ -168,7 +227,10 @@ type AttemptRecordV3 struct {
 	// shrink it. Entries persist in the audio_reconcile_ledger column; the
 	// memory store keeps them on the record itself. A fresh attempt starts
 	// with the zero value and inherits nothing.
-	AudioReconcileLedger AudioReconcileLedgerV3
+	AudioReconcileLedger     AudioReconcileLedgerV3
+	RecoveryState            RecoveryStateV3
+	RecoveryRevision         int64
+	CurrentTransportRendered bool
 	// StartResponse is the latest durable decision for this attempt. It begins
 	// as the exact start response and advances atomically with each completed
 	// replan so an idempotent start retry never resurrects a superseded plan.
@@ -192,164 +254,13 @@ type AttemptRecordV3 struct {
 	// A replica reaping a stale local copy compares it with its own activity
 	// clock, since requests can land on other replicas.
 	LastSampleAt time.Time
-	// RecoveryState is the durable attempt-scoped exclusion chain: the provider
-	// candidates this attempt has confirmed as failed, keyed to the release
-	// scope they indict. It is written only by AppendRecoveryExclusions (a
-	// revision-checked union), never by SaveAttempt or CompleteReplan, so a
-	// stale attempt write can never shrink the chain. A fresh attempt starts
-	// with the zero value and inherits nothing.
-	RecoveryState RecoveryStateV3
-	// RecoveryRevision advances with every durable RecoveryState write. It is
-	// the compare-and-set token for concurrent exclusion appends: a caller
-	// reads the revision with the state and a mismatched write is retried
-	// against the freshly read state instead of clobbering it.
-	RecoveryRevision int64
-	// StreamReissues records how many times this attempt reissued a recipe
-	// after mid-stream connectivity loss.
-	StreamReissues int `json:"stream_reissues,omitempty"`
-	// CurrentTransportRendered records whether the active transport generation
-	// has delivered a verified first_frame route event.
-	CurrentTransportRendered bool `json:"current_transport_rendered,omitempty"`
-}
-
-// RecoveryStateV3 is the durable, attempt-scoped recovery memory. The
-// exclusion list records provider candidates that a confirmed verdict indicted
-// so the candidate-selection loop for later replans skips them even when the
-// asynchronous failed_at marker never landed.
-type RecoveryStateV3 struct {
-	// Exclusions is the confirmed chain, in the order verdicts arrived. It is
-	// scoped by provider/source so a candidate id from one release set cannot
-	// suppress an identically named candidate from another.
-	Exclusions []RecoveryExclusionV3 `json:"exclusions,omitempty"`
-}
-
-// AudioSelectionV3 is the JSONB shape of the audio_selection attempt
-// column: the durable start-time audio selection intent. AttemptRecordV3
-// carries the same fields inline for the memory store; Postgres splits them
-// into their own column so CompleteReplan (which rewrites only plan
-// columns) can never clobber them.
-type AudioSelectionV3 struct {
-	Origin            string                         `json:"origin,omitempty"`
-	PreferredLanguage string                         `json:"preferred_language,omitempty"`
-	SeriesSignature   *userstore.AudioTrackSignature `json:"series_signature,omitempty"`
-	SelectedSignature *userstore.AudioTrackSignature `json:"selected_signature,omitempty"`
-}
-
-// AudioReconcileLedgerV3 is the durable, attempt-scoped memory of automatic
-// default-audio reconciliation decisions. One entry per (generation, session)
-// the reconcile path has settled (a committed replan, a byte-equal no-op, a
-// plan invalidation, or a refusal), keyed by that pair so a retried probe
-// write or a second replica replays the same decision instead of minting a
-// second event.
-type AudioReconcileLedgerV3 struct {
-	// Entries is the settled chain, in the order decisions were recorded. It
-	// is scoped by generation: entries for different generations never
-	// suppress each other, and a new probe generation always re-evaluates.
-	Entries []AudioReconcileEntryV3 `json:"entries,omitempty"`
-	// Revision advances with every durable ledger write. It is the
-	// compare-and-set token for concurrent decision records: a writer that
-	// read a stale revision loses with ErrRecoveryRevisionConflictV3 instead
-	// of clobbering a newer decision.
-	Revision int64 `json:"revision,omitempty"`
-}
-
-// AudioReconcileDecisionV3 names the settled outcome recorded for one
-// verified generation.
-type AudioReconcileDecisionV3 string
-
-const (
-	// AudioReconcileReplanned means an automatic track_change replan for the
-	// generation committed (or replayed idempotently) through the replan
-	// lease. The entry's RequestDigest pins the exact replan body: a retry of
-	// the same decision reuses the same bytes, so the lease answers with the
-	// stored response instead of colliding on the request id.
-	AudioReconcileReplanned AudioReconcileDecisionV3 = "replanned"
-	// AudioReconcileNoop means the generation compared byte-equal against
-	// the committed selection: no replan, no session mutation, no push.
-	AudioReconcileNoop AudioReconcileDecisionV3 = "noop"
-	// AudioReconcileRefused means the generation was stale (rotation),
-	// explicit (never overridden), or superseded by a viewer change: the
-	// reconcile path declined and must not retry the generation.
-	AudioReconcileRefused AudioReconcileDecisionV3 = "refused"
-	// AudioReconcileInvalidated means the corrected executable selection was
-	// persisted together with the canonical request, and the active plan was
-	// withdrawn through the realtime plan_invalidated route event instead of
-	// being replaced server-side. Only the client's own replacement replan
-	// commits a new recipe, so the decision and the request it eventually
-	// consumes are one ledger entry: the entry is written before anything is
-	// emitted, and a duplicate probe write or a retried heartbeat replays the
-	// stored decision rather than minting a second event.
-	AudioReconcileInvalidated AudioReconcileDecisionV3 = "invalidated"
-)
-
-// AudioReconcileEntryV3 is one settled reconciliation decision. Generation
-// names the verified inventory it was decided against; Request holds the
-// exact automatic replan body for a replanned decision (nil otherwise) so a
-// retry replays the same bytes; RequestDigest fingerprints those bytes and
-// is the idempotency key the decision is retried under.
-type AudioReconcileEntryV3 struct {
-	Generation string `json:"generation"`
-	// SessionID is the attempt session the decision was recorded under. The
-	// ledger is stored per session row, so this is normally that row's own
-	// session; it is persisted with the entry so a replayed entry can be
-	// validated against the session it was decided for rather than the plan id
-	// that happened to be current when the ledger was read.
-	SessionID  string                   `json:"session_id,omitempty"`
-	Decision   AudioReconcileDecisionV3 `json:"decision"`
-	AudioIndex *int                     `json:"audio_index,omitempty"`
-	// PlanID is the plan the decision was decided against, and the plan an
-	// AudioReconcileInvalidated entry withdraws. Keying a lookup on it would
-	// be wrong: the same generation is re-evaluated against whichever plan is
-	// active then, and the plan id moves as replans commit.
-	PlanID        string           `json:"plan_id,omitempty"`
-	Request       *ReplanRequestV3 `json:"request,omitempty"`
-	RequestDigest string           `json:"request_digest,omitempty"`
-	// Reason is the plan_invalidated reason string this settled decision
-	// implies: "default_audio_reconciliation" for replanned/invalidated
-	// decisions, the empty string otherwise. The replan answering the
-	// withdrawal echoes it back in answers_plan_invalidation, and matching
-	// it against this field is what makes the replan authoritatively a
-	// reconciliation response rather than an identity heuristic.
-	Reason string `json:"reason,omitempty"`
-	// AnnouncedAt records when the realtime hub last accepted this entry's
-	// withdrawal for a client that negotiated both plan_invalidated_v1 and
-	// default_audio_reconcile_response_v1. It is delivery ATTEMPT state and is
-	// deliberately not terminal: a nil value means the withdrawal has never
-	// been delivered, but a set value proves only that the server wrote the
-	// command, not that the client read it, replanned onto it, or stayed
-	// connected to commit. The reconcile loop therefore keys its silence on
-	// completion — the attempt's current plan id moving off this entry's PlanID
-	// — and keeps re-announcing an outstanding correction (with the same
-	// command id, bounded by an in-process attempt ceiling) until that happens.
-	AnnouncedAt *time.Time `json:"announced_at,omitempty"`
-}
-
-// RecoveryExclusionV3 is one confirmed candidate failure. The tuple is scoped
-// so only the release the verdict actually examined is excluded:
-//
-//   - ProviderSource identifies the provider/source namespace (for a virtual
-//     release the provider-neutral URI without the concrete result pick), so
-//     two providers cannot suppress each other's identically numbered results.
-//   - CandidateID is the provider result id that was confirmed bad.
-//   - ReleaseID is the durable release identity (provider GUID/hash) when
-//     known, so a renumbered result still matches the excluded release. Empty
-//     when the release carried no durable identity.
-//   - FileID is the session-bound catalog row id. It narrows the exclusion to
-//     the file identity the attempt was bound to when the catalog row moved.
-type RecoveryExclusionV3 struct {
-	ProviderSource string `json:"provider_source,omitempty"`
-	CandidateID    string `json:"candidate_id"`
-	ReleaseID      string `json:"release_id,omitempty"`
-	FileID         int    `json:"file_id,omitempty"`
-	// ConfirmedAt is diagnostic: when the durable write recorded the verdict.
-	ConfirmedAt time.Time `json:"confirmed_at,omitempty"`
-}
-
-// RecoveryExclusionKeyV3 is the dedup identity of one exclusion: two verdicts
-// for the same provider source and candidate id are the same exclusion even
-// when their release identity or file binding differ.
-func RecoveryExclusionKeyV3(providerSource, candidateID string) string {
-	return strings.TrimSpace(providerSource) + "\x00" + strings.TrimSpace(candidateID)
+	// CreatedAt is when the attempt row was saved, which is when its session
+	// started. SaveAttempt ignores it.
+	CreatedAt time.Time
+	// DesiredTracks is the audio and subtitle the viewer asked for, which
+	// can differ from CurrentPlan's selection after a version change had to
+	// fall back. Nil on rows written before it existed.
+	DesiredTracks *DesiredTracksV3
 }
 
 // AttemptIdentityV3 carries only the ownership columns of an attempt so
@@ -362,6 +273,13 @@ type AttemptIdentityV3 struct {
 }
 
 type RouteEventRecordV3 struct {
+	ConnectionDeviceID string
+	ConnectionKey      string
+	Delivery           string
+	ReceivedAt         time.Time
+	// SampleLifetime is the speed reading lifetime when the event was
+	// received; a plan summary's throughput replaces an older sample.
+	SampleLifetime time.Duration
 	RouteEventV3
 	// EventID is the client-minted identity of one report. Empty for legacy
 	// v1 reports; a v2 report always carries one so a retry after a lost 202
@@ -663,8 +581,8 @@ func (s *MemoryPlanStoreV3) SaveAttempt(_ context.Context, record AttemptRecordV
 		}
 		return ErrPlaybackAttemptExistsV3
 	}
-	record.LastSequence, record.LastSample, record.StoppedAt, record.StopID, record.StreamReissues = 0, nil, nil, "", 0
-	record.CurrentTransportRendered = false
+	record.LastSequence, record.LastSample, record.StoppedAt, record.StopID = 0, nil, nil, ""
+	record.CreatedAt = now
 	s.attempts[record.PlaybackAttemptID] = record
 	return nil
 }

@@ -2,13 +2,11 @@ package transcodenode
 
 import (
 	"context"
-	"net/url"
-	"os"
-	"path"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/Silo-Server/silo-server/internal/fspath"
 	"github.com/Silo-Server/silo-server/internal/themesongs"
 )
 
@@ -61,7 +59,7 @@ func (a *CatalogPathAuthorizer) Allowed(ctx context.Context, path string) (bool,
 	if !active {
 		return false, nil
 	}
-	info, err := os.Stat(path)
+	info, err := fspath.Stat(path)
 	return err == nil && info.Mode().IsRegular(), nil
 }
 

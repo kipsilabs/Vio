@@ -80,6 +80,10 @@ func main() {
 	write(*out, "capability_response.json", goldenCapabilityResponse())
 	write(*out, "error_response.json", goldenErrorResponse())
 	write(*out, "route_event.json", goldenRouteEvent())
+	write(*out, "buffering-start_request.json", goldenBufferingStartRequest())
+	write(*out, "buffering-replan_request.json", goldenBufferingReplanRequest())
+	write(*out, "learned-limit-decision_response.json", goldenLearnedLimitDecisionResponse())
+	write(*out, "plan-summary-route_event.json", goldenPlanSummaryRouteEvent())
 	write(*out, "subtitle_inventory.json", goldenSubtitleInventory())
 	write(*out, "attempt_keys.json", goldenAttemptKeys())
 	write(*out, "conformance_matrix.json", goldenConformanceMatrix())
@@ -1007,7 +1011,7 @@ func conformanceFallbackFile() *models.MediaFile {
 func conformanceRegistry() *playback.TransformationRegistryV3 {
 	return playback.NewTransformationRegistryV3([]playback.TransformationSpecV3{
 		{Name: playback.TransformationAudioToAACV3, RecipeVersion: playback.TransformationAudioToAACRecipeVersionV3, Available: true},
-		{Name: playback.TransformationVideoToH264V3, RecipeVersion: "1", Available: true},
+		{Name: playback.TransformationVideoToH264V3, RecipeVersion: playback.TransformationVideoToH264RecipeVersionV3, Available: true},
 		{Name: playback.TransformationServerDV7HDR10V3, RecipeVersion: playback.TransformationServerDV7HDR10RecipeVersionV3, Available: true},
 	})
 }

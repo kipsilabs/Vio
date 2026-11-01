@@ -1,178 +1,54 @@
-import { useProviderResultEnrichment } from "@/components/streaming/useProviderResultDisplay";
-import {
-  ProviderResultDisplayToggle,
-  ProviderResultText,
-} from "@/components/streaming/ProviderResultDisplay";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Check, RefreshCw, Settings } from "lucide-react";
-import { IndexerReleaseList } from "@/components/streaming/IndexerReleaseList";
-import { QualityRankingSummary } from "@/components/streaming/QualityRankingSummary";
-import { useIndexerReleaseRequests, useVirtualLibraryCapability } from "@/hooks/useIndexerReleases";
-import { useVersionListRefresh, REFRESH_VERSIONS_ERROR } from "@/hooks/useVersionListRefresh";
-import { useVersionSortPreference } from "@/hooks/useVersionSortPreference";
-import { sortVersionsByCriteria, type VersionSortable } from "@/lib/qualityRanking";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { Check, Settings } from "lucide-react";
 import { plainResolutionLabel, resolveActiveQualityOptionId } from "../playback-info";
-import { deriveVersionHealth } from "@/lib/versionHealth";
-import type { EffectiveRecipeV3, SourceDescriptorV3 } from "../protocol-v3";
-import type { PlayerIndexerRelease, QualityOption } from "../types";
+import type { QualityOption } from "../types";
 import { PLAYBACK_SPEEDS, formatPlaybackSpeed } from "../utils/playbackSpeed";
 import { PlaybackSpeedTrack } from "./PlaybackSpeedTrack";
 import { PlayerMenuSurface } from "./PlayerMenuSurface";
-import {
-  formatScoreBadgeLabel,
-  formatScoreTitle,
-  hasFormatScore,
-  serverRankingFromVersions,
-} from "@/pages/ItemDetail/components/versionFormatUtils";
 
 export interface VersionInfo {
   fileId: number;
   label: string;
-  releaseName?: string;
-  providerText?: string;
-  /** Release + structured size + source hint, shared with the item-page picker.
-   *  Preferred over `releaseName` when present so both menus show the same. */
-  detail?: string;
-  /** Display-ready audio language labels ("English/French"). */
-  audioLanguages?: string[];
-  /** Display-ready subtitle language labels ("English"). */
-  subtitleLanguages?: string[];
-  /** Quality-profile label the candidate was ranked under (`?profile=`). */
-  profileLabel?: string | null;
-  /** The `?profile=`/`virtual_ranking` source for the list's ranking. */
-  filePath?: string;
-  virtualRanking?: unknown;
-  /** Payload values the display re-order compares. */
-  sortable?: VersionSortable;
-  /** Custom-format score the server ranked this candidate with. Absent (or
-   *  zero) for local and otherwise unscored rows, which show no badge. */
-  formatScore?: number;
   isCurrentSource: boolean;
   isRequestedSource: boolean;
-  failed?: boolean;
-  /** The catalog currently reports this version's source as gone. It stays
-   *  selectable because a play can force a re-link and retry it. */
-  unavailable?: boolean;
-  /** A recent probe read bytes that differ from the declared release. The
-   *  release is alive; only the provider's served bytes were wrong. */
-  sourceMismatch?: { servedBytes: number; declaredBytes: number };
-}
-
-/**
- * Confirmed-dead rows leave the version list instead of hiding behind the
- * unavailable treatment: offering them again would only replay a known-dead
- * release. The current source stays so a mid-playback verdict cannot yank
- * the playing row, and an all-failed list still renders rather than an
- * empty menu.
- */
-export function removeFailedVersions(versions: VersionInfo[]): VersionInfo[] {
-  const alive = versions.filter((version) => !version.failed || version.isCurrentSource);
-  return alive.length > 0 ? alive : versions;
 }
 
 interface QualityMenuProps {
   options: QualityOption[];
   activeId: string;
-  /** The plan's effective recipe, which shows when a bitrate cap reduced the source. */
-  deliveredRecipe?: EffectiveRecipeV3;
-  /** The source the plan delivers from, for showing Auto when it plays as-is. */
-  source?: Pick<SourceDescriptorV3, "height" | "bitrate_kbps">;
+  /** The plan's `active_quality`: the entry it delivers, lit unless the preference is Auto. */
+  activeQuality?: string;
   isTranscoding: boolean;
   error: string | null;
   onSelect: (id: string) => void;
   versions?: VersionInfo[];
-  /** Releases on the indexers that are not downloaded on the provider yet. */
-  indexerReleases?: PlayerIndexerRelease[];
-  /** The item id, so the menu can request an indexer release. */
+  indexerReleases?: import("../types").PlayerIndexerRelease[];
   contentId?: string;
+  onSelectAutoVersion?: () => void;
+  autoFallback?: boolean;
+  onRefreshVersions?: () => Promise<void>;
+  onCancelRefresh?: () => Promise<void> | void;
   versionLocked?: boolean;
   onSwitchVersion?: (fileId: number) => void;
-  /**
-   * Selects automatic version fallback. When provided, the version list shows
-   * an Auto row that arms fallback (and recovers a dead source). Omitted in
-   * surfaces that cannot toggle it.
-   */
-  onSelectAutoVersion?: () => void;
-  /** Whether automatic version fallback is currently armed. */
-  autoFallback?: boolean;
-  /**
-   * Re-lists the title's video candidates. Resolves once the new list has been
-   * applied upstream; rejecting means the list could not be refreshed and the
-   * rows already on screen stay as they are.
-   */
-  onRefreshVersions?: () => Promise<void>;
-  /**
-   * Cancels the refresh started by `onRefreshVersions` when the row is pressed
-   * again while the job is still running. Omitted when the surface cannot
-   * cancel.
-   */
-  onCancelRefresh?: () => Promise<void> | void;
   /** Omitted while something else owns the rate (a Watch Party room). */
   playbackSpeed?: number;
   onPlaybackSpeedChange?: (rate: number) => void;
 }
 
-export { REFRESH_VERSIONS_ERROR };
-
 export function QualityMenu({
   options,
   activeId,
-  deliveredRecipe,
-  source,
+  activeQuality,
   isTranscoding,
   error,
   onSelect,
   versions,
-  indexerReleases = [],
-  contentId,
   versionLocked,
   onSwitchVersion,
-  onSelectAutoVersion,
-  autoFallback,
-  onRefreshVersions,
-  onCancelRefresh,
   playbackSpeed = 1,
   onPlaybackSpeedChange,
 }: QualityMenuProps) {
   const [open, setOpen] = useState(false);
-  const {
-    refreshing: refreshingVersions,
-    cancelable: cancelableVersions,
-    error: refreshVersionsError,
-    refresh: handleRefreshVersions,
-  } = useVersionListRefresh(onRefreshVersions, onCancelRefresh);
-  // Indexer releases are gated on the server's capability so a server that
-  // cannot request releases shows no indexer UI.
-  const { indexerRequest } = useVirtualLibraryCapability({ enabled: !!contentId });
-  const indexerRequests = useIndexerReleaseRequests(contentId);
-  const visibleIndexerReleases = indexerRequest ? indexerReleases : [];
-  // The viewer's per-profile display order. It only re-orders the list below;
-  // the server's auto-pick is untouched.
-  const enrichProviderResults = useProviderResultEnrichment();
-  const hasProviderText = (versions ?? []).some((version) => version.providerText);
-  const { criteria: userCriteria, apply: applySort, reset: resetSort } = useVersionSortPreference();
-  const serverRanking = useMemo(
-    () =>
-      serverRankingFromVersions(
-        (versions ?? []).map((version) => ({
-          file_path: version.filePath,
-          virtual_ranking: version.virtualRanking,
-        })),
-      ),
-    [versions],
-  );
-  const effectiveCriteria = userCriteria.length > 0 ? userCriteria : serverRanking.criteria;
-  const orderedVersions = useMemo(
-    () =>
-      removeFailedVersions(
-        sortVersionsByCriteria(
-          versions ?? [],
-          effectiveCriteria,
-          (version) => version.sortable ?? {},
-        ),
-      ),
-    [versions, effectiveCriteria],
-  );
   const menuRef = useRef<HTMLDivElement>(null);
 
   const handleSelect = useCallback(
@@ -203,12 +79,6 @@ export function QualityMenu({
   }, [open]);
 
   const menuItemsRef = useRef<(HTMLButtonElement | null)[]>([]);
-
-  // Stable so React does not detach a row's ref (writing `null` into the
-  // roving-focus list) on every re-render.
-  const registerMenuRow = useCallback((index: number, el: HTMLButtonElement | null) => {
-    menuItemsRef.current[index] = el;
-  }, []);
 
   const handleMenuKeyDown = useCallback((e: React.KeyboardEvent) => {
     const items = menuItemsRef.current.filter(Boolean) as HTMLButtonElement[];
@@ -250,33 +120,8 @@ export function QualityMenu({
   if (showSpeed) menuLabel = "Playback settings";
   else if (showQuality) menuLabel = "Quality";
 
-  const resolvedActiveId = resolveActiveQualityOptionId(options, activeId, deliveredRecipe, source);
+  const resolvedActiveId = resolveActiveQualityOptionId(options, activeId, activeQuality);
   const activeOption = options.find((option) => option.id === resolvedActiveId);
-  // Explicit roving-focus slots per group. Mixing a render-time counter with the
-  // refresh rows' commit-time `ref` increments let one overwrite another; naming
-  // each group's start removes the ambiguity. The refresh action is rendered at
-  // both the top and the bottom of the version list, so it owns a slot in each
-  // place. Indexer rows are selectable menu items and get slots between the
-  // version rows and the bottom refresh action so Arrow Up/Down follow visual
-  // order. The speed stops come first in the menu's arrow-key order.
-  const speedRowCount = showSpeed ? PLAYBACK_SPEEDS.length : 0;
-  const versionRowsRendered = Boolean(showVersions);
-  const autoRowRendered = versionRowsRendered && Boolean(onSelectAutoVersion);
-  const indexerRowsRendered = !versionLocked && visibleIndexerReleases.length > 0;
-  // Mirrors the render condition of the Version/Quality header block: the
-  // refresh action lives inside it, so it renders only when this is true.
-  const menuBlockRendered = versionRowsRendered || indexerRowsRendered;
-  const providerToggleRendered = versionRowsRendered && hasProviderText;
-  const topRefreshRowIndex = speedRowCount + (providerToggleRendered ? 1 : 0);
-  const autoRowIndex = topRefreshRowIndex + (onRefreshVersions ? 1 : 0);
-  const versionRowStart = autoRowIndex + (autoRowRendered ? 1 : 0);
-  const indexerRowStart = versionRowStart + (versionRowsRendered ? orderedVersions.length : 0);
-  const bottomRefreshRowIndex =
-    indexerRowStart + (indexerRowsRendered ? visibleIndexerReleases.length : 0);
-  const qualityRowStart = menuBlockRendered
-    ? bottomRefreshRowIndex + (onRefreshVersions ? 1 : 0)
-    : speedRowCount;
-
   let sourceLabel: string | null = null;
   if (showQuality) {
     sourceLabel = isTranscoding
@@ -286,6 +131,8 @@ export function QualityMenu({
   // A speed other than 1x stays on the gear in every layout: inline after the
   // quality label, or on the gear's corner where the label is hidden.
   const changedSpeed = showSpeed && playbackSpeed !== 1 ? formatPlaybackSpeed(playbackSpeed) : null;
+  // The speed stops come first in the menu's arrow-key order.
+  let menuItemIndex = showSpeed ? PLAYBACK_SPEEDS.length : 0;
 
   return (
     <div ref={menuRef} className="relative" onBlur={handleBlur}>
@@ -316,7 +163,7 @@ export function QualityMenu({
       {open && (
         <PlayerMenuSurface
           anchorRef={menuRef}
-          className="absolute right-0 bottom-full z-30 mb-2 max-h-[calc(100dvh-8rem)] max-w-[calc(100vw-2rem)] min-w-[224px] overflow-y-auto rounded-lg bg-black/90 py-1 shadow-lg backdrop-blur"
+          className="absolute right-0 bottom-full z-30 mb-2 max-h-[calc(100dvh-8rem)] min-w-[224px] overflow-y-auto rounded-lg bg-black/90 py-1 shadow-lg backdrop-blur"
           onClose={() => setOpen(false)}
           onKeyDown={handleMenuKeyDown}
         >
@@ -339,203 +186,59 @@ export function QualityMenu({
               below.
             </p>
           )}
-          {/* Version switching (multiple file versions) and indexer releases */}
-          {!versionLocked &&
-            ((versions && versions.length > 1 && onSwitchVersion) ||
-              visibleIndexerReleases.length > 0) && (
-              <>
-                <div className="px-3 py-1 text-xs tracking-wider text-white/40 uppercase">
-                  Version
-                </div>
-                {providerToggleRendered && (
-                  <ProviderResultDisplayToggle
-                    buttonRef={(element) => {
-                      menuItemsRef.current[speedRowCount] = element;
+          {/* Version switching (multiple file versions) */}
+          {showVersions && (
+            <>
+              <div className="px-3 py-1 text-xs tracking-wider text-white/40 uppercase">
+                Version
+              </div>
+              {versions.map((v) => {
+                const idx = menuItemIndex++;
+                const statusLabels = buildVersionStatusLabels(v);
+                return (
+                  <button
+                    key={v.fileId}
+                    ref={(el) => {
+                      menuItemsRef.current[idx] = el;
                     }}
-                  />
-                )}
-                {onRefreshVersions && (
-                  <VersionRefreshRow
-                    rowIndex={topRefreshRowIndex}
-                    registerRow={registerMenuRow}
-                    refreshing={refreshingVersions}
-                    cancelable={cancelableVersions}
-                    error={refreshVersionsError}
-                    onPress={handleRefreshVersions}
-                  />
-                )}
-                {versions && versions.length > 1 && onSwitchVersion && (
-                  <>
-                    {autoRowRendered && (
-                      <button
-                        ref={(el) => {
-                          menuItemsRef.current[autoRowIndex] = el;
-                        }}
-                        role="menuitemradio"
-                        aria-checked={autoFallback === true}
-                        type="button"
-                        className={`flex w-full px-3 py-2 text-left text-sm hover:bg-white/10 focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:outline-none ${
-                          autoFallback ? "text-white" : "text-white/70"
-                        }`}
-                        onClick={() => {
-                          onSelectAutoVersion?.();
-                          setOpen(false);
-                        }}
-                      >
-                        <span className="flex min-w-0 items-center gap-2">
-                          <Check
-                            className={`h-4 w-4 shrink-0 ${autoFallback ? "opacity-100" : "opacity-0"}`}
-                          />
-                          <span className="min-w-0">
-                            <span className="block truncate">Auto</span>
-                            <span className="block truncate text-[11px] text-white/50">
-                              Best playable version; fall back if this one dies
+                    role="menuitem"
+                    type="button"
+                    className={`flex w-full px-3 py-2 text-left text-sm hover:bg-white/10 focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:outline-none ${
+                      v.isCurrentSource ? "text-white" : "text-white/70"
+                    }`}
+                    onClick={() => {
+                      onSwitchVersion(v.fileId);
+                      setOpen(false);
+                    }}
+                  >
+                    <span className="flex min-w-0 items-center gap-2">
+                      <span className="truncate">{v.label}</span>
+                      {statusLabels.length > 0 && (
+                        <span className="flex flex-wrap gap-1">
+                          {statusLabels.map((status) => (
+                            <span
+                              key={status}
+                              className="rounded border border-white/15 bg-white/10 px-1.5 py-0.5 text-[10px] leading-none text-white/70"
+                            >
+                              {status}
                             </span>
-                          </span>
+                          ))}
                         </span>
-                      </button>
-                    )}
-                    <QualityRankingSummary
-                      serverRanking={serverRanking}
-                      userCriteria={userCriteria}
-                      effectiveCriteria={effectiveCriteria}
-                      onApply={applySort}
-                      onReset={resetSort}
-                      tone="dark"
-                      className="px-3 pb-1"
-                    />
-                    {orderedVersions.map((v, versionIndex) => {
-                      const idx = versionRowStart + versionIndex;
-                      const statusLabels = buildVersionStatusLabels(v);
-                      const health = versionHealthOf(v);
-                      const showDetails = !v.providerText || enrichProviderResults;
-                      const hasScore = showDetails && hasFormatScore(v.formatScore);
-                      // One detail derivation for both lists; `detail` carries the
-                      // shared release+size+hint line, and `releaseName` is only a
-                      // fallback for callers that supply no detail at all.
-                      const detailLine = v.providerText ? undefined : v.detail || v.releaseName;
-                      const audioLanguages = showDetails ? (v.audioLanguages ?? []) : [];
-                      const subtitleLanguages = showDetails ? (v.subtitleLanguages ?? []) : [];
-                      const hasBadges =
-                        hasScore ||
-                        statusLabels.length > 0 ||
-                        audioLanguages.length > 0 ||
-                        subtitleLanguages.length > 0;
-                      return (
-                        <button
-                          key={v.fileId}
-                          ref={(el) => {
-                            menuItemsRef.current[idx] = el;
-                          }}
-                          role="menuitem"
-                          type="button"
-                          className={`flex w-full px-3 py-2 text-left text-sm hover:bg-white/10 focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:outline-none ${
-                            v.isCurrentSource ? "text-white" : "text-white/70"
-                          }`}
-                          onClick={() => {
-                            onSwitchVersion(v.fileId);
-                            setOpen(false);
-                          }}
-                        >
-                          <span className="flex min-w-0 items-center gap-2">
-                            <span className="min-w-0">
-                              {v.providerText && <ProviderResultText text={v.providerText} />}
-                              {showDetails && <span className="block truncate">{v.label}</span>}
-                              {detailLine && (
-                                <span className="block truncate text-[11px] text-white/50">
-                                  {detailLine}
-                                </span>
-                              )}
-                            </span>
-                            {hasBadges && (
-                              <span className="flex flex-wrap gap-1">
-                                {hasScore && (
-                                  <span
-                                    className="rounded border border-white/15 bg-white/10 px-1.5 py-0.5 text-[10px] leading-none text-white/60"
-                                    title={formatScoreTitle(v.formatScore!, v.profileLabel)}
-                                  >
-                                    {formatScoreBadgeLabel(v.formatScore!)}
-                                  </span>
-                                )}
-                                {statusLabels.map((status) => (
-                                  <span
-                                    key={status}
-                                    title={
-                                      health && health.label === status ? health.title : undefined
-                                    }
-                                    className={`rounded border border-white/15 px-1.5 py-0.5 text-[10px] leading-none ${
-                                      health && health.label === status && health.tone === "danger"
-                                        ? "border-red-500/30 bg-red-500/20 text-red-400"
-                                        : health &&
-                                            health.label === status &&
-                                            health.tone === "warn"
-                                          ? "border-amber-500/30 bg-amber-500/15 text-amber-400"
-                                          : "bg-white/10 text-white/70"
-                                    }`}
-                                  >
-                                    {status}
-                                  </span>
-                                ))}
-                                {audioLanguages.map((language) => (
-                                  <span
-                                    key={`audio-${language}`}
-                                    className="rounded border border-blue-500/20 bg-blue-500/10 px-1.5 py-0.5 text-[10px] leading-none text-blue-400"
-                                  >
-                                    <span className="mr-0.5 opacity-70">🔊</span>
-                                    {language}
-                                  </span>
-                                ))}
-                                {subtitleLanguages.map((language) => (
-                                  <span
-                                    key={`subtitle-${language}`}
-                                    className="rounded border border-amber-500/20 bg-amber-500/10 px-1.5 py-0.5 text-[10px] leading-none text-amber-400"
-                                  >
-                                    <span className="mr-0.5 opacity-70">CC</span>
-                                    {language}
-                                  </span>
-                                ))}
-                              </span>
-                            )}
-                          </span>
-                        </button>
-                      );
-                    })}
-                  </>
-                )}
-                {/* Releases that exist on the indexers but are not downloaded
-                    on the provider, below the playable versions. Registered in
-                    the menu's roving-focus list so Arrow keys reach them. */}
-                {visibleIndexerReleases.length > 0 && (
-                  <IndexerReleaseList
-                    releases={visibleIndexerReleases}
-                    requests={indexerRequests}
-                    tone="dark"
-                    rowRole="menuitem"
-                    registerRow={registerMenuRow}
-                    rowIndexStart={indexerRowStart}
-                    className="border-t border-white/10 pt-0.5"
-                  />
-                )}
-                {onRefreshVersions && (
-                  <VersionRefreshRow
-                    rowIndex={bottomRefreshRowIndex}
-                    registerRow={registerMenuRow}
-                    refreshing={refreshingVersions}
-                    cancelable={cancelableVersions}
-                    error={refreshVersionsError}
-                    onPress={handleRefreshVersions}
-                  />
-                )}
-              </>
-            )}
+                      )}
+                    </span>
+                  </button>
+                );
+              })}
+            </>
+          )}
           {showQuality && (
             <>
-              {menuBlockRendered && <div className="my-1 border-t border-white/10" />}
+              {showVersions && <div className="my-1 border-t border-white/10" />}
               <div className="px-3 py-1 text-xs tracking-wider text-white/40 uppercase">
                 Quality
               </div>
-              {options.map((opt, optionIndex) => {
-                const idx = qualityRowStart + optionIndex;
+              {options.map((opt) => {
+                const idx = menuItemIndex++;
                 return (
                   <button
                     key={opt.id}
@@ -572,87 +275,16 @@ export function QualityMenu({
 }
 
 export function buildVersionStatusLabels(version: VersionInfo): string[] {
+  if (version.isCurrentSource && version.isRequestedSource) {
+    return ["Playing"];
+  }
+
   const labels: string[] = [];
   if (version.isCurrentSource) {
     labels.push("Playing");
   }
-  if (version.isRequestedSource && !version.isCurrentSource) {
+  if (version.isRequestedSource) {
     labels.push("Requested");
   }
-  // One health badge, chosen by the server: a failed candidate takes precedence
-  // over the liveness verdict. Both come from server-published state only.
-  const health = versionHealthOf(version);
-  if (health) {
-    labels.push(health.label);
-  }
   return labels;
-}
-
-/**
- * Adapts the menu's `VersionInfo` onto the shared health derivation. The menu
- * models the liveness verdict as `unavailable` (the inverse of the server's
- * `available`), so map it back without inventing a second server flag.
- */
-function versionHealthOf(version: VersionInfo) {
-  return deriveVersionHealth({
-    failed: version.failed,
-    available: version.unavailable === true ? false : undefined,
-    source_mismatch: version.sourceMismatch
-      ? {
-          served_bytes: version.sourceMismatch.servedBytes,
-          declared_bytes: version.sourceMismatch.declaredBytes,
-        }
-      : undefined,
-  });
-}
-
-interface VersionRefreshRowProps {
-  rowIndex: number;
-  registerRow: (index: number, el: HTMLButtonElement | null) => void;
-  refreshing: boolean;
-  cancelable: boolean;
-  error: string | null;
-  onPress: () => void;
-}
-
-/**
- * The player menu's "Refresh List" row, rendered both above and below the
- * version list so the control is reachable without scrolling past a long list.
- * Both instances read the same `useVersionListRefresh` state, so one refresh
- * locks and spins both, and each has its own roving-focus slot.
- */
-function VersionRefreshRow({
-  rowIndex,
-  registerRow,
-  refreshing,
-  cancelable,
-  error,
-  onPress,
-}: VersionRefreshRowProps) {
-  return (
-    <button
-      ref={(el) => {
-        registerRow(rowIndex, el);
-      }}
-      role="menuitem"
-      type="button"
-      className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-white/70 hover:bg-white/10 focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-60"
-      disabled={refreshing && !cancelable}
-      aria-busy={refreshing || undefined}
-      onClick={onPress}
-    >
-      {refreshing ? (
-        <span
-          className="h-3.5 w-3.5 shrink-0 animate-spin rounded-full border-2 border-white/30 border-t-white"
-          aria-hidden="true"
-        />
-      ) : (
-        <RefreshCw className="h-3.5 w-3.5 shrink-0 text-white/50" aria-hidden="true" />
-      )}
-      <span className="flex min-w-0 flex-col">
-        <span>{refreshing && cancelable ? "Cancel refresh" : "Refresh List"}</span>
-        {error && <span className="text-[11px] leading-tight text-red-400">{error}</span>}
-      </span>
-    </button>
-  );
 }

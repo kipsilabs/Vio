@@ -75,8 +75,9 @@ func buildPostgresPlayableTargetsQuery(fileSQL, progress, completedSQL string) s
 				CASE WHEN requested.media_type = 'movie' AND EXISTS (
 					SELECT 1 FROM media_files mf WHERE mf.content_id = requested.content_id AND %[1]s
 				) THEN requested.content_id
-				WHEN requested.media_type = 'episode' AND %[5]s
-				THEN requested.content_id END,
+				WHEN requested.media_type = 'episode' AND (EXISTS (
+					SELECT 1 FROM media_files mf WHERE mf.episode_id = requested.content_id AND %[1]s
+				) OR `+SpanningEpisodeFileExistsSQL("requested.content_id", "%[1]s")+`) THEN requested.content_id END,
 				(SELECT episode.content_id
 				 FROM target_scopes scope
 				 JOIN episodes episode ON episode.series_id = scope.series_id

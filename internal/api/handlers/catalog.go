@@ -18,34 +18,11 @@ import (
 	"github.com/Silo-Server/silo-server/internal/sections"
 )
 
-// audiobookGroupsCacheTTL matches the client's React Query staleTime: the
-// grouped author/narrator browse is cached server-side for the same window so
-// the sequential page fetches and a quick refresh reuse one aggregation.
-//
-//nolint:unused // Retained for compatibility with dormant integration paths.
-const audiobookGroupsCacheTTL = 60 * time.Second
-
 type CatalogHandler struct {
 	resolver    *catalog.CatalogResolver
 	itemsH      *ItemsHandler
 	workSummary catalog.WorkSummaryProvider
-
-	//nolint:unused // Retained for compatibility with dormant integration paths.
-	groupsCacheOnce sync.Once
-	//nolint:unused // Retained for compatibility with dormant integration paths.
-	groupsCache *catalog.AudiobookGroupsCache
-}
-
-// audiobookGroups returns the lazily-initialized grouped-browse cache. Built on
-// first use (only the route-mounted singleton handler serves audiobook-groups)
-// so the per-request CatalogHandler instances never spawn a cache sweeper.
-//
-//nolint:unused // Retained for compatibility with dormant integration paths.
-func (h *CatalogHandler) audiobookGroups() *catalog.AudiobookGroupsCache {
-	h.groupsCacheOnce.Do(func() {
-		h.groupsCache = catalog.NewAudiobookGroupsCache(h.itemsH.browseRepo.Pool(), audiobookGroupsCacheTTL)
-	})
-	return h.groupsCache
+	boxSets     *catalog.BoxSetRepository
 }
 
 func NewCatalogHandler(resolver *catalog.CatalogResolver, itemsH *ItemsHandler) *CatalogHandler {
@@ -207,7 +184,7 @@ func (h *CatalogHandler) catalogItemResponses(ctx context.Context, v ItemViewer,
 	responseWG.Add(2)
 	go func() {
 		defer responseWG.Done()
-		imageURLs = h.itemsH.itemListCardImageURLs(ctx, localizedItems, accessFilter.Artwork())
+		imageURLs = h.itemsH.itemListCardImageURLs(ctx, localizedItems, episodeMetadata, accessFilter.Artwork())
 	}()
 	go func() {
 		defer responseWG.Done()
@@ -235,6 +212,9 @@ func (h *CatalogHandler) catalogItemResponses(ctx context.Context, v ItemViewer,
 		resp.PlayContentID = playTargets[playableTargetKeyForItem(item)]
 		if meta, ok := episodeMetadata[item.ContentID]; ok {
 			applyEpisodeBrowseMetadata(&resp, meta)
+			if item.Type == itemTypeEpisode {
+				resp.ParentArtwork = episodeParentArtworkView(meta.ParentArtwork, imageURLs[item.ContentID].parents)
+			}
 		}
 		resp.PosterURL = imageURLs[item.ContentID].posterURL
 		resp.BackdropURL = imageURLs[item.ContentID].backdropURL
