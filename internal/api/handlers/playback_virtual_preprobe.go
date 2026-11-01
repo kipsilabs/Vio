@@ -169,6 +169,12 @@ type virtualCommittedProbeInventory struct {
 	audio        []models.AudioTrack
 	subtitles    []models.SubtitleTrack
 	external     []models.ExternalSubtitle
+	// written reports that this carrier records a catalog write that actually
+	// committed. A carrier can also come from a serve whose evidence was
+	// deliberately not written (see probeInventoryCarrier): its tracks still
+	// belong to the session overlay, but no row changed, so nothing may be
+	// announced as a catalog update.
+	written bool
 }
 
 // committed reports whether the carrier names a real committed catalog row.

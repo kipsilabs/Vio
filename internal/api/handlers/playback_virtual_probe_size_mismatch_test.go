@@ -14,6 +14,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/notifications"
+	"github.com/Silo-Server/silo-server/internal/scanner"
 )
 
 // captureVirtualProbeLogs installs a JSON slog handler for the duration of the
@@ -29,28 +30,89 @@ func captureVirtualProbeLogs(t *testing.T) *bytes.Buffer {
 
 // A release can be posted short of the size the indexer advertised while still
 // being the right content: production served 5.57 GB for a release declared at
-// 6.33 GB, and the provider's own completed download was short too. The measured
-// duration is the identity proof, so the persistence path must accept that
-// evidence, write the inventory, and clear the wrong-source damper — while a
-// warning keeps the posting discrepancy visible.
-func TestBackgroundProbeAcceptsServedSizeMismatchWhenDurationMatches(t *testing.T) {
+// 6.33 GB, and the provider's own completed download was short too. One serve
+// cannot prove which release it was — a wrong file that carries the item's
+// runtime looks the same — so the first duration-proven serve records the pin's
+// observation and writes nothing, and the second serve that lands on those same
+// bytes is admitted, written, and clears the wrong-source damper. A warning
+// keeps the posting discrepancy visible on both.
+func TestBackgroundProbeConfirmsServedSizeMismatchOnSecondServe(t *testing.T) {
 	const (
 		declaredBytes = int64(6_330_000_000)
 		servedBytes   = int64(5_570_000_000) // 12% short: the posting itself is short
 		expectedMins  = 51
 		probedSeconds = 3072 // 51.2 minutes
 	)
+	fx := newServedSizeMismatchFixture(t, declaredBytes, servedBytes, probedSeconds)
+	logs := captureVirtualProbeLogs(t)
+
+	// First serve: the observation. The bytes play for this request, so the
+	// session still gets an inventory, but the row keeps its previous evidence.
+	virtualProbeFailures.markSizeMismatch(fx.key, 1, 1) // a previous stale fill armed the wrong-source damper
+	assertServedSizeMismatchObservation(t, fx, expectedMins, logs)
+
+	// Second serve on the same bytes: the confirmation. Only now is the pin's
+	// identity established, so the inventory and its stamp are written.
+	logs.Reset()
+	outcome, carried := fx.probe(t, expectedMins)
+	if outcome != probeOutcomeVerified {
+		t.Fatalf("outcome = %q, want verified for the confirming serve", outcome)
+	}
+	if !carried.committed() || carried.fileID != fx.file.ID || !carried.written {
+		t.Fatalf("carried inventory = %+v, want the committed row %d", carried, fx.file.ID)
+	}
+	saved := *fx.saved
+	if len(saved) != 1 {
+		t.Fatalf("persisted %d inventories, want exactly one on the confirming serve: %+v", len(saved), saved)
+	}
+	if saved[0].FileID != fx.file.ID {
+		t.Fatalf("inventory persisted on file %d, want %d", saved[0].FileID, fx.file.ID)
+	}
+	if saved[0].Duration != probedSeconds {
+		t.Fatalf("persisted duration = %d, want the measured %d", saved[0].Duration, probedSeconds)
+	}
+	if *fx.failStamped || fx.file.FailedAt != nil {
+		t.Fatal("the confirming serve stamped a failed_at verdict")
+	}
+
+	logged := logs.String()
+	if !strings.Contains(logged, "accepted despite size mismatch") {
+		t.Fatalf("missing the short-posting acceptance warning:\n%s", logged)
+	}
+	if strings.Contains(logged, "rejected: served size mismatch") {
+		t.Fatalf("confirmed short posting was logged as a rejection:\n%s", logged)
+	}
+	for _, attr := range []string{`"file_id":601`, `"served_bytes":5570000000`, `"declared_bytes":6330000000`, `"probed_duration_seconds":3072`, `"expected_runtime_minutes":51`} {
+		if !strings.Contains(logged, attr) {
+			t.Fatalf("acceptance warning is missing %s:\n%s", attr, logged)
+		}
+	}
+}
+
+// servedSizeMismatchFixture is the pinned short-posting case: one candidate
+// whose served bytes are short of the indexer's declaration while the measured
+// duration is plausible for the item's runtime.
+type servedSizeMismatchFixture struct {
+	handler     *PlaybackHandler
+	file        *models.MediaFile
+	cand        VirtualPlaybackStream
+	key         string
+	saved       *[]models.VirtualFilePersistArgs
+	failStamped *bool
+}
+
+func newServedSizeMismatchFixture(t *testing.T, declaredBytes, servedBytes int64, probedSeconds int) *servedSizeMismatchFixture {
+	t.Helper()
 	uri := "virtual://movie/tt-size-mismatch?result=cand-1"
 	key := virtualProbeFailureKey(uri, 5)
 	virtualProbeFailures.clear(key)
 	virtualProbeFailures.clearSizeMismatch(key)
-	virtualProbeFailures.markSizeMismatch(key, 1, 1) // a previous stale fill armed the wrong-source damper
+	scanner.ResetVirtualServedSizeSnapshots()
 	t.Cleanup(func() {
 		virtualProbeFailures.clear(key)
 		virtualProbeFailures.clearSizeMismatch(key)
+		scanner.ResetVirtualServedSizeSnapshots()
 	})
-	logs := captureVirtualProbeLogs(t)
-
 	var saved []models.VirtualFilePersistArgs
 	failStamped := false
 	h := &PlaybackHandler{
@@ -71,57 +133,66 @@ func TestBackgroundProbeAcceptsServedSizeMismatchWhenDurationMatches(t *testing.
 			return nil
 		},
 	}
-	stickyKey := "sticky-size-mismatch"
-	h.pinVirtualSticky(stickyKey, uri)
-	file := &models.MediaFile{
-		ID:                         601,
-		ContentID:                  "movie-tt",
-		FilePath:                   uri,
-		FileSize:                   declaredBytes,
-		VirtualOwnerInstallationID: 5,
+	h.pinVirtualSticky("sticky-size-mismatch", uri)
+	return &servedSizeMismatchFixture{
+		handler: h,
+		file: &models.MediaFile{
+			ID:                         601,
+			ContentID:                  "movie-tt",
+			FilePath:                   uri,
+			FileSize:                   declaredBytes,
+			VirtualOwnerInstallationID: 5,
+		},
+		cand:        VirtualPlaybackStream{ID: "cand-1", URI: uri},
+		key:         key,
+		saved:       &saved,
+		failStamped: &failStamped,
 	}
-	cand := VirtualPlaybackStream{ID: "cand-1", URI: uri}
+}
 
-	outcome, committed := h.probeVirtualSourceAndPersistWith(
-		context.Background(), stickyKey, file, "http://provider.example/stream", *file, cand,
+// probe runs one durable background serve of the fixture's candidate.
+func (f *servedSizeMismatchFixture) probe(t *testing.T, expectedMins int) (string, virtualCommittedProbeInventory) {
+	t.Helper()
+	return f.handler.probeVirtualSourceAndPersistWith(
+		context.Background(), "sticky-size-mismatch", f.file, "http://provider.example/stream", *f.file, f.cand,
 		noCandidateIdentity, expectedMins, 5, true, nil,
 	)
-	if outcome != probeOutcomeVerified {
-		t.Fatalf("outcome = %q, want verified for a short posting whose duration matches", outcome)
-	}
-	if !committed.committed() || committed.fileID != file.ID {
-		t.Fatalf("committed inventory = %+v, want the probed row %d", committed, file.ID)
-	}
-	if len(saved) != 1 {
-		t.Fatalf("persisted %d inventories, want exactly one on the row: %+v", len(saved), saved)
-	}
-	if saved[0].FileID != file.ID {
-		t.Fatalf("inventory persisted on file %d, want %d", saved[0].FileID, file.ID)
-	}
-	if saved[0].Duration != probedSeconds {
-		t.Fatalf("persisted duration = %d, want the measured %d", saved[0].Duration, probedSeconds)
-	}
-	if failStamped || file.FailedAt != nil {
-		t.Fatal("accepted short posting stamped a failed_at verdict")
-	}
-	if virtualProbeFailures.recent(key) {
-		t.Fatal("accepted short posting fed the dead-candidate failure damper")
-	}
-	if virtualProbeFailures.recent(virtualProbeSizeMismatchKey(key)) {
-		t.Fatal("accepted short posting kept the wrong-source damper armed")
-	}
+}
 
+// assertServedSizeMismatchObservation proves the recording serve played the
+// bytes without writing them: an unwritten carrier for the session, no catalog
+// write, no failed stamp, cleared dampers, and an observation log instead of an
+// acceptance.
+func assertServedSizeMismatchObservation(t *testing.T, fx *servedSizeMismatchFixture, expectedMins int, logs *bytes.Buffer) {
+	t.Helper()
+	outcome, carried := fx.probe(t, expectedMins)
+	if outcome != probeOutcomeVerified {
+		t.Fatalf("outcome = %q, want verified so the session leaves loading for a playable short posting", outcome)
+	}
+	if !carried.committed() || carried.fileID != fx.file.ID {
+		t.Fatalf("carried inventory = %+v, want the served row %d", carried, fx.file.ID)
+	}
+	if carried.written {
+		t.Fatal("the recording serve reported a catalog write it did not make")
+	}
+	if saved := *fx.saved; len(saved) != 0 {
+		t.Fatalf("the recording serve persisted %d inventories, want none: %+v", len(saved), saved)
+	}
+	if *fx.failStamped || fx.file.FailedAt != nil {
+		t.Fatal("the recording serve stamped a failed_at verdict")
+	}
+	if virtualProbeFailures.recent(fx.key) {
+		t.Fatal("the recording serve fed the dead-candidate failure damper")
+	}
+	if virtualProbeFailures.recent(virtualProbeSizeMismatchKey(fx.key)) {
+		t.Fatal("the recording serve kept the wrong-source damper armed")
+	}
 	logged := logs.String()
-	if !strings.Contains(logged, "background virtual probe accepted despite size mismatch") {
-		t.Fatalf("missing short-posting acceptance warning:\n%s", logged)
+	if !strings.Contains(logged, "recorded a served-size observation") {
+		t.Fatalf("missing the observation warning:\n%s", logged)
 	}
-	if strings.Contains(logged, "background virtual probe rejected: served size mismatch") {
-		t.Fatalf("accepted short posting was logged as a rejection:\n%s", logged)
-	}
-	for _, attr := range []string{`"file_id":601`, `"served_bytes":5570000000`, `"declared_bytes":6330000000`, `"probed_duration_seconds":3072`, `"expected_runtime_minutes":51`} {
-		if !strings.Contains(logged, attr) {
-			t.Fatalf("acceptance warning is missing %s:\n%s", attr, logged)
-		}
+	if strings.Contains(logged, "accepted despite size mismatch") {
+		t.Fatalf("the recording serve was logged as an acceptance:\n%s", logged)
 	}
 }
 
@@ -478,6 +549,79 @@ func TestResolveVirtualPlaybackMatchingFirstProbeProbesNoSiblings(t *testing.T) 
 	}
 }
 
+// TestResolveVirtualPlaybackObservationServeWritesNothing pins why the
+// two-observation gate has to reach the catalog writes. Serving and persisting
+// the recording serve stamped the row, and the next replay then took the
+// repeat-play fast path on that stamp alone for the stamp's whole freshness
+// window, so the pin was never re-probed and one plausible-looking serve became
+// the pin's identity by persistence. The recording serve now serves, writes
+// nothing and pins nothing; the confirming serve writes the inventory and pins.
+func TestResolveVirtualPlaybackObservationServeWritesNothing(t *testing.T) {
+	const (
+		release  = "Movie.2024.2160p.WEB-DL"
+		declared = int64(6_330_000_000)
+		served   = int64(5_570_000_000)
+		runtime  = 90
+	)
+	uri := "virtual://movie/tt-observation?result=pin-1"
+	file := &models.MediaFile{
+		ID: 620, ContentID: "movie-tt-observation", FilePath: "virtual://movie/tt-observation",
+		Container: "virtual", VirtualOwnerInstallationID: 5, MediaFolderID: 9,
+	}
+	rows := map[string]*models.MediaFile{
+		uri: sizeMismatchFallbackRow(621, uri, release, declared),
+	}
+	candidates := []VirtualPlaybackStream{
+		sizeMismatchFallbackCandidate("pin-1", uri, release, declared),
+	}
+	scanner.ResetVirtualServedSizeSnapshots()
+	t.Cleanup(scanner.ResetVirtualServedSizeSnapshots)
+	h, probes, saved := sizeMismatchFallbackHandler(t, file, candidates, rows, func(*models.MediaFile) (int64, error) {
+		return served, nil
+	})
+	h.ItemLookup = staticRuntimeItemLookup{runtime: runtime}
+	stickyKey := bestResultCacheKey(file.ContentID, virtualPlaybackNeutralKey(file.FilePath), file.VirtualOwnerInstallationID, "")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil)
+	resolved, err := h.resolveVirtualPlaybackSource(req, file, "profile-1", false, nil, "", "", 0, false)
+	if err != nil {
+		t.Fatalf("resolve error: %v", err)
+	}
+	if resolved.URI != uri {
+		t.Fatalf("resolved URI = %q, want the served pin %q", resolved.URI, uri)
+	}
+	h.StopVirtualEvidence()
+	if len(*saved) != 0 {
+		t.Fatalf("the recording serve persisted %+v, want no catalog write", *saved)
+	}
+	if got := h.peekVirtualSticky(stickyKey); got != "" {
+		t.Fatalf("the recording serve pinned %q, want no sticky pin before confirmation", got)
+	}
+	if len(*probes) != 1 {
+		t.Fatalf("probes = %v, want one synchronous probe of the candidate", *probes)
+	}
+
+	// The next start re-probes, lands on the recorded size, and admits the pin.
+	resolved, err = h.resolveVirtualPlaybackSource(
+		httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil), file, "profile-1", false, nil, "", "", 0, false)
+	if err != nil {
+		t.Fatalf("second resolve error: %v", err)
+	}
+	if resolved.URI != uri {
+		t.Fatalf("second resolved URI = %q, want %q", resolved.URI, uri)
+	}
+	h.StopVirtualEvidence()
+	if len(*saved) != 1 || (*saved)[0].FileID != file.ID {
+		t.Fatalf("saved = %+v, want one inventory on the confirming serve", *saved)
+	}
+	if !(*saved)[0].StampProbe {
+		t.Fatal("the confirming serve did not stamp the probe evidence")
+	}
+	if got := h.peekVirtualSticky(stickyKey); got != uri {
+		t.Fatalf("sticky pin = %q, want the confirmed candidate %q", got, uri)
+	}
+}
+
 // TestResolveVirtualPlaybackServedSizeMismatchAdoptsSameReleaseSibling pins the
 // fallback contract: the selected row's probe served a different release, so the
 // same release's second indexer row is probed and adopted, and its verified
@@ -662,14 +806,18 @@ func (s staticRuntimeItemLookup) GetByID(context.Context, string) (*models.Media
 	return &models.MediaItem{Runtime: s.runtime}, nil
 }
 
-// An accepted short posting is ordinary verified evidence: the pre-play probe
-// chain writes its inventory and publishes versions_updated, so an open detail
-// page refreshes exactly as it would for a size-matching release.
-func TestScheduleDefaultFileProbePublishesAfterAcceptedSizeMismatch(t *testing.T) {
+// An accepted short posting is ordinary verified evidence once a second serve
+// confirms it: the pre-play probe chain writes its inventory and publishes
+// versions_updated, so an open detail page refreshes exactly as it would for a
+// size-matching release. The first serve only records the pin's observation, so
+// it writes nothing and there is no catalog change to announce.
+func TestScheduleDefaultFileProbePublishesAfterConfirmedSizeMismatch(t *testing.T) {
 	const (
 		declaredBytes = int64(6_330_000_000)
 		servedBytes   = int64(5_570_000_000)
 	)
+	scanner.ResetVirtualServedSizeSnapshots()
+	t.Cleanup(scanner.ResetVirtualServedSizeSnapshots)
 	row := probeChainRow(740, "virtual://movie/probe-chain?result=short", nil)
 	row.FileSize = declaredBytes
 	reader := &probeChainVersionReader{
@@ -697,10 +845,25 @@ func TestScheduleDefaultFileProbePublishesAfterAcceptedSizeMismatch(t *testing.T
 			return VirtualFileMetadataUpdateResult{MetadataUpdated: true, RowsAffected: 1}, nil
 		},
 	}
-	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), probeChainStreams(row), catalog.AccessFilter{SelectedFileID: row.ID, AllowedLibraryIDs: []int{77}})
+	filter := catalog.AccessFilter{SelectedFileID: row.ID, AllowedLibraryIDs: []int{77}}
+
+	// First serve: the observation. Nothing is written, so no detail page has
+	// anything to refresh and no versions_updated is announced.
+	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), probeChainStreams(row), filter)
+	h.probeChainWG.Wait()
+	if len(saved) != 0 {
+		t.Fatalf("the recording serve persisted %+v, want no write before a confirming serve", saved)
+	}
+	if types := bus.types(); len(types) != 0 {
+		t.Fatalf("the recording serve announced %v, want no catalog change with nothing written", types)
+	}
+
+	// Second serve on the same bytes: the confirming serve writes the inventory
+	// and announces it.
+	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), probeChainStreams(row), filter)
 	h.probeChainWG.Wait()
 	if payload := waitForRecordingEvent(t, bus, 2*time.Second, "catalog.item.changed", "versions_updated", probeChainTestContent); payload == "" {
-		t.Fatal("accepted short posting did not publish versions_updated")
+		t.Fatal("confirmed short posting did not publish versions_updated")
 	}
 	if len(saved) != 1 || saved[0].FileID != row.ID {
 		t.Fatalf("saved = %+v, want one inventory on the short-posting row %d", saved, row.ID)

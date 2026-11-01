@@ -753,11 +753,15 @@ func (h *PlaybackHandler) runFileProbeChain(ctx context.Context, contentID strin
 	// be invalidated after the tracks are actually committed. No session binding
 	// exists here, so the fence is nil and the identity tiers are zero — the same
 	// posture the unstamped-row fast path takes, where the row owns its candidate.
-	outcome, _ := h.probeVirtualSourceAndPersistWith(
+	outcome, carried := h.probeVirtualSourceAndPersistWith(
 		ctx, stickyKey, row, probeURL, probeTransient, *probeCand,
 		resolver.PersistedIdentityTiers{}, expectedRuntimeMinutes, oid, true, nil,
 	)
-	if outcome == probeOutcomeVerified && h.EventsHub != nil {
+	// A verified outcome with an unwritten carrier means the row keeps its
+	// previous evidence: the serve recorded a pin's first served-size
+	// observation, so there is no catalog change for a detail page to refresh
+	// (see virtualProbeEvidenceIsObservation).
+	if outcome == probeOutcomeVerified && carried.written && h.EventsHub != nil {
 		publishCtx, publishCancel := context.WithTimeout(context.WithoutCancel(ctx), virtualCandidatePublishBudget)
 		publishVirtualVersionsUpdatedEvent(publishCtx, nil, h.EventsHub, contentID)
 		publishCancel()
