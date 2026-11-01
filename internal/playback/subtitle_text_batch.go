@@ -192,6 +192,17 @@ func (c *SubtitleCache) WarmTextTracks(inputPath string, tracks []TextSubtitleTr
 		ctx, cancel := context.WithTimeout(context.Background(), subtitleCacheWarmTimeout)
 		defer cancel()
 		start := time.Now()
+		// Detached like every other warm: skip a saturated relay source and
+		// let a later track selection re-attempt it.
+		warmCtx, releaseRelayDemux, demuxErr := acquireRelayDemuxRead(detachedRelayDemux(ctx), inputPath)
+		if demuxErr != nil {
+			discardTextFills(fills)
+			slog.DebugContext(ctx, "subtitle text warm skipped: relay source saturated",
+				"input", inputPath, "tracks", len(fills))
+			return
+		}
+		defer releaseRelayDemux()
+		ctx = warmCtx
 		if err := commitTextFills(ctx, inputPath, fills, batch); err != nil {
 			slog.Log(ctx, slog.LevelWarn, "subtitle text warm failed",
 				subtitleTraceAttrsForRequest(requestID, "", SubtitleTracePhaseWarm, SubtitleTraceBytesUnknown, subtitleTraceOutcome(ctx, err), time.Since(start),

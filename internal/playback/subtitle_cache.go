@@ -544,6 +544,22 @@ func (c *SubtitleCache) ServeExtractWithResult(w http.ResponseWriter, r *http.Re
 		}
 	}
 
+	// This serve is about to become the request path's one heavy relay read.
+	// Admit it per relay source so it does not compete with the same session's
+	// detached warm, font dump, and layout probe for a single slow pipe. The
+	// response is still uncommitted here, so a saturated source answers the
+	// existing retryable shape instead of stacking another demux on it.
+	admittedCtx, releaseRelayDemux, admitErr := acquireRelayDemuxRead(r.Context(), opts.InputPath)
+	if admitErr != nil {
+		if fill != nil {
+			fill.Discard()
+		}
+		slog.DebugContext(r.Context(), "subtitle extract deferred: relay source saturated",
+			"input", opts.InputPath, "track", opts.TrackIndex, "format", format)
+		return result, &SubtitleExtractionRetryError{RetryAfter: subtitleFillBusyRetryAfter}
+	}
+	defer releaseRelayDemux()
+
 	w.Header().Set("Cache-Control", "no-store")
 	counter := &subtitleCountingWriter{w: w}
 	var writer io.Writer = counter
@@ -558,7 +574,7 @@ func (c *SubtitleCache) ServeExtractWithResult(w http.ResponseWriter, r *http.Re
 		writer = capture
 	}
 	opts.Writer = writer
-	err := c.runExtract(r.Context(), opts, extract, counter)
+	err := c.runExtract(admittedCtx, opts, extract, counter)
 	if err != nil {
 		if r.Context().Err() == nil && IsSubtitleUpstreamError(err) {
 			c.noteExtractionFailure(opts, format)
@@ -1191,6 +1207,20 @@ func (c *SubtitleCache) ServeSUPExtract(w http.ResponseWriter, r *http.Request, 
 		return &SubtitleExtractionRetryError{RetryAfter: subtitleFillBusyRetryAfter}
 	}
 
+	// Whole-track PGS is a request-path relay read like a text window: admit it
+	// per relay source before the 200 commits, so a saturated source answers
+	// retryable instead of stacking another full demux on the same pipe.
+	admittedCtx, releaseRelayDemux, admitErr := acquireRelayDemuxRead(r.Context(), opts.InputPath)
+	if admitErr != nil {
+		if fill != nil {
+			fill.Discard()
+		}
+		slog.DebugContext(r.Context(), "subtitle extract deferred: relay source saturated",
+			"input", opts.InputPath, "track", opts.TrackIndex, "format", subtitleFormatSUP)
+		return &SubtitleExtractionRetryError{RetryAfter: subtitleFillBusyRetryAfter}
+	}
+	defer releaseRelayDemux()
+
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
@@ -1204,7 +1234,7 @@ func (c *SubtitleCache) ServeSUPExtract(w http.ResponseWriter, r *http.Request, 
 	}
 
 	opts.Writer = writer
-	err := extract(r.Context(), opts)
+	err := extract(admittedCtx, opts)
 	outcome := subtitleTraceOutcome(r.Context(), err)
 	if fill != nil {
 		if err != nil {
@@ -1351,6 +1381,17 @@ func (c *SubtitleCache) serveWindowedSUP(w http.ResponseWriter, r *http.Request,
 		}
 	}
 
+	// A windowed PGS serve is the request path's relay read: admit it per relay
+	// source before the 200 commits so a saturated source still answers
+	// retryable.
+	admittedCtx, releaseRelayDemux, admitErr := acquireRelayDemuxRead(r.Context(), opts.InputPath)
+	if admitErr != nil {
+		slog.DebugContext(r.Context(), "subtitle extract deferred: relay source saturated",
+			"input", opts.InputPath, "track", opts.TrackIndex, "format", subtitleFormatSUP)
+		return &SubtitleExtractionRetryError{RetryAfter: subtitleFillBusyRetryAfter}
+	}
+	defer releaseRelayDemux()
+
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
@@ -1369,11 +1410,11 @@ func (c *SubtitleCache) serveWindowedSUP(w http.ResponseWriter, r *http.Request,
 	// request. Detach it from the leader's cancellation (bounded by the
 	// timeout) so a leader disconnect does not throw away work that waiters
 	// can still consume from the last-good cache.
-	extractCtx := r.Context()
+	extractCtx := admittedCtx
 	if leader {
 		var cancel context.CancelFunc
 		extractCtx, cancel = context.WithTimeout(
-			context.WithoutCancel(r.Context()),
+			context.WithoutCancel(admittedCtx),
 			subtitleWindowExtractTimeout,
 		)
 		defer cancel()
@@ -1572,6 +1613,20 @@ func (c *SubtitleCache) WarmInBackground(opts StreamExtractOpts, extract SUPExtr
 		start := time.Now()
 		slog.Info("subtitle cache warm started",
 			"input", opts.InputPath, "track", opts.TrackIndex)
+		// A warm is opportunistic: when the relay is already at its demux
+		// ceiling it is dropped rather than queued, and the next windowed miss
+		// re-attempts it. Queueing would make it contend with the window a
+		// client is waiting on, which is exactly the pileup that made warm
+		// demuxes (and their layout probes) time out.
+		warmCtx, releaseRelayDemux, demuxErr := acquireRelayDemuxRead(detachedRelayDemux(ctx), opts.InputPath)
+		if demuxErr != nil {
+			fill.Discard()
+			slog.DebugContext(ctx, "subtitle cache warm skipped: relay source saturated",
+				"input", opts.InputPath, "track", opts.TrackIndex)
+			return
+		}
+		defer releaseRelayDemux()
+		ctx = warmCtx
 		if err := extract(ctx, opts); err != nil {
 			fill.Discard()
 			if errors.Is(err, ErrSubtitleWarmCanceled) {
@@ -1684,6 +1739,18 @@ func (c *SubtitleCache) WarmTrackInBackground(opts StreamExtractOpts, extract SU
 		start := time.Now()
 		slog.Info("subtitle cache warm started",
 			"input", opts.InputPath, "track", opts.TrackIndex, "format", format)
+		// Detached: skip a saturated relay source instead of queueing behind
+		// the request-path reads it exists to protect. The next windowed miss
+		// re-attempts the warm.
+		warmCtx, releaseRelayDemux, demuxErr := acquireRelayDemuxRead(detachedRelayDemux(ctx), opts.InputPath)
+		if demuxErr != nil {
+			fill.Discard()
+			slog.DebugContext(ctx, "subtitle cache warm skipped: relay source saturated",
+				"input", opts.InputPath, "track", opts.TrackIndex, "format", format)
+			return
+		}
+		defer releaseRelayDemux()
+		ctx = warmCtx
 		if err := extract(ctx, opts); err != nil {
 			fill.Discard()
 			if errors.Is(err, ErrSubtitleWarmCanceled) {
@@ -2267,6 +2334,13 @@ func (c *SubtitleCache) startFontBundleFlight(ctx context.Context, key FontBundl
 		defer cancel()
 		data, extractErr := extract(extractCtx)
 		if extractErr != nil {
+			if errors.Is(extractErr, ErrRelayDemuxBusy) {
+				// The relay is already at its demux ceiling. Fonts are optional
+				// to playback, so this attempt is skipped without arming the
+				// failure backoff: a waiter gets the pending (empty bundle)
+				// shape and the next request retries once the pipe frees up.
+				return nil, context.DeadlineExceeded
+			}
 			c.noteFontBundleFailure(flightKey)
 			return nil, extractErr
 		}
@@ -2390,7 +2464,7 @@ func (c *SubtitleCache) WarmFontBundleInBackground(key FontBundleKey, extract fu
 		close(done)
 		return done
 	}
-	resultCh, ok := c.startFontBundleFlight(context.Background(), key, extract)
+	resultCh, ok := c.startFontBundleFlight(detachedRelayDemux(context.Background()), key, extract)
 	if !ok {
 		<-c.warmSem
 		close(done)

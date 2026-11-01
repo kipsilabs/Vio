@@ -168,6 +168,11 @@ func ListAttachedSubtitleFonts(ctx context.Context, inputPath, ffmpegPath string
 	default:
 		return nil, errors.New("subtitle font probes busy")
 	}
+	ctx, releaseRelayDemux, demuxErr := acquireRelayDemuxRead(ctx, inputPath)
+	if demuxErr != nil {
+		return nil, demuxErr
+	}
+	defer releaseRelayDemux()
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	streams, err := probeFontAttachmentStreams(ctx, inputPath, ffprobePathFromFFmpeg(ffmpegPath))
@@ -207,6 +212,18 @@ func extractAttachedSubtitleFonts(ctx context.Context, inputPath, ffmpegPath str
 	if strings.TrimSpace(inputPath) == "" {
 		return nil, fmt.Errorf("subtitle fonts: input path is required")
 	}
+
+	// The probe plus the attachment dump is one of the heaviest subtitle reads
+	// a relay serves (up to 47 network opens). Admit it per relay source with
+	// its caller's class: a font serve waits the short request bound and then
+	// reports busy (the HTTP path answers its pending empty bundle), while a
+	// font warm skips a saturated source and retries on the next trigger. A
+	// local file is never admitted.
+	ctx, releaseRelayDemux, demuxErr := acquireRelayDemuxRead(ctx, inputPath)
+	if demuxErr != nil {
+		return nil, demuxErr
+	}
+	defer releaseRelayDemux()
 
 	probePath := ffprobePathFromFFmpeg(ffmpegPath)
 	probeCtx, cancelProbe := context.WithTimeout(ctx, subtitleFontProbeTimeout)
