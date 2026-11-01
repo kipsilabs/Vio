@@ -122,6 +122,8 @@ type RecipeCard struct {
 	StreamOriginSeconds        float64                `json:"stream_origin_seconds,omitempty"`
 	CopySeekAnchorResolved     bool                   `json:"copy_seek_anchor_resolved,omitempty"`
 	TargetResolution           string                 `json:"target_resolution,omitempty"`
+	SourceFrameRate            float64                `json:"source_frame_rate,omitempty"`
+	SourceHeight               int                    `json:"source_height,omitempty"`
 	TargetCodecVideo           string                 `json:"target_codec_video,omitempty"`
 	TargetCodecAudio           string                 `json:"target_codec_audio,omitempty"`
 	TargetAudioChannels        int                    `json:"target_audio_channels,omitempty"`
@@ -224,10 +226,6 @@ func NewRecipeCard(userID int, profileID string, mediaFileID int, transcodeNodeU
 		playMethod = playMethodCopyFMP4V1
 		copyFMP4RecipeVersion = CopyFMP4RecipeVersion
 	}
-	inputPath := opts.InputPath
-	if canonical := strings.TrimSpace(opts.CanonicalInputPath); canonical != "" {
-		inputPath = canonical
-	}
 	return RecipeCard{
 		SessionID:                  opts.SessionID,
 		UserID:                     userID,
@@ -265,6 +263,8 @@ func NewRecipeCard(userID int, profileID string, mediaFileID int, transcodeNodeU
 		StreamOriginSeconds:        opts.StreamOriginSeconds,
 		CopySeekAnchorResolved:     opts.CopySeekAnchorResolved,
 		TargetResolution:           opts.TargetResolution,
+		SourceFrameRate:            opts.SourceFrameRate,
+		SourceHeight:               opts.SourceHeight,
 		TargetCodecVideo:           opts.TargetCodecVideo,
 		TargetCodecAudio:           opts.TargetCodecAudio,
 		TargetAudioChannels:        opts.TargetAudioChannels,
@@ -453,8 +453,6 @@ func (c RecipeCard) ToClaims() streamtoken.Claims {
 		RoutingEgressNodeID:              c.RoutingEgressNodeID,
 		TargetCodec:                      c.TargetCodecVideo,
 		TargetRes:                        c.TargetResolution,
-		SourceFrameRate:                  c.SourceFrameRate,
-		SourceHeight:                     c.SourceHeight,
 		AudioTrackIndex:                  c.AudioTrackIndex,
 		UserID:                           c.UserID,
 		ProfileID:                        c.ProfileID,

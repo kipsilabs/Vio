@@ -695,6 +695,13 @@ func ServeRemuxWithOptions(w http.ResponseWriter, r *http.Request, filePath, out
 		}()
 	}
 
+	buf := make([]byte, 32*1024)
+	first := make([]byte, 0)
+	if n, readErr := session.Read(buf); n > 0 {
+		first = append(first, buf[:n]...)
+	} else if readErr != nil {
+		return readErr
+	}
 	setStreamHeaders()
 	w.WriteHeader(http.StatusOK)
 	if _, writeErr := w.Write(first); writeErr != nil {

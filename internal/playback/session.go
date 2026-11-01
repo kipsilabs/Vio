@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -294,6 +295,7 @@ type Session struct {
 	PlanCommittedAt            time.Time // when the current plan reached the client; see StartupSessionGrace
 	activeTransportCount       int
 	replacementPlayMethod      PlayMethod
+	ClientCanceled             ClientCancelEvidence
 	streamRevision             uint64
 	// autoFallback and autoFallbackSet record whether this session may fail
 	// over to another media version when its source dies or is unplayable. It
@@ -685,6 +687,8 @@ const (
 	AdmissionReasonTranscodingDisabled      = "transcoding_disabled"
 	AdmissionReasonAudioTranscodingDisabled = "audio_transcoding_disabled"
 )
+
+var ErrAdmissionDeciderTimeout = errors.New("admission decider timeout")
 
 // AdmissionDecider can replace SessionManager's inline limit comparison while
 // keeping session counting in Go.
