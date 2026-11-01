@@ -2888,7 +2888,20 @@ func (s *TranscodeSession) BuildPlaybackManifest(segPrefix, rawQuery string) ([]
 	if err != nil {
 		return nil, err
 	}
-	return s.buildPlaybackManifest(segPrefix, rawQuery)
+	return s.buildPlaybackManifest(segPrefix, s.generationScopedQuery(rawQuery))
+}
+
+// generationScopedQuery binds manifest segment URLs to this session generation.
+func (s *TranscodeSession) generationScopedQuery(rawQuery string) string {
+	token := s.GenerationToken()
+	if token == "" {
+		return rawQuery
+	}
+	encoded := "sgen=" + url.QueryEscape(token)
+	if rawQuery == "" {
+		return encoded
+	}
+	return rawQuery + "&" + encoded
 }
 
 // buildPlaybackManifest is BuildPlaybackManifest for a query manifestQuery
