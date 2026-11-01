@@ -3345,6 +3345,9 @@ func dv7WithELFixtureV3() *models.MediaFile {
 	file := detailedFixtureFileV3()
 	file.VideoTracks[0].DVProfile = 7
 	file.VideoTracks[0].DVBLCompatID = 1
+	file.VideoTracks[0].DVConfigPresent = true
+	file.VideoTracks[0].DVBLCompatIDPresent = true
+	file.VideoTracks[0].DVBLPresent = true
 	file.VideoTracks[0].DVELPresent = true
 	file.VideoTracks[0].DVEnhancementLayer = "unknown"
 	file.VideoTracks[0].VideoRange = "DolbyVision"
@@ -3367,7 +3370,7 @@ func clientManagedDV7RequestV3(hdr, outputHDR, directHDR *HDRCapabilitiesV3, tra
 	direct.VideoCodecs = []string{"hevc"}
 	direct.AudioDecodeCodecs = []string{"aac"}
 	direct.HDRDetails = directHDR
-	direct.ValidatedClaims = append(direct.ValidatedClaims, ClaimClientManagedDynamicRangeV3)
+	direct.ValidatedClaims = append(direct.ValidatedClaims, ClaimClientManagedDynamicRangeV3, ClientManagedDVBaseLayerClaimV3(1))
 	direct.Transformations = transformations
 	request.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3] = direct
 	return request
