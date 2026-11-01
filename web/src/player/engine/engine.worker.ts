@@ -214,7 +214,7 @@ async function open(spec: EngineSourceSpec): Promise<void> {
       requestInit: { headers: spec.headers },
       maxCacheSize: URL_CACHE_BYTES,
       fetchFn: meteredFetch,
-      getRetryDelay: (attempts) => {
+      getRetryDelay: (attempts: number) => {
         // A failed read is the transport failing; the page treats it as an
         // outage rather than a slow link.
         post({ type: "read-failed" });
