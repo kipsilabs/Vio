@@ -140,10 +140,10 @@ func (e *nilPtrError) Error() string { return e.msg }
 func TestHandlerRecordsTypedNilError(t *testing.T) {
 	t.Parallel()
 	entry := logEntry(t, func(logger *slog.Logger) {
-		var err *nilPtrErr
+		var err *nilPtrError
 		logger.ErrorContext(context.Background(), "probe: error", "error", err)
 	})
-	if got := entry.Attrs["error"]; got != "<nil *opslog.nilPtrErr>" {
+	if got := entry.Attrs["error"]; got != "<nil *opslog.nilPtrError>" {
 		t.Fatalf("attrs[error] = %#v, want a nil placeholder", got)
 	}
 }
