@@ -2149,8 +2149,10 @@ describe("useASSSubtitles pending font bundles", () => {
       });
       expect(fontCalls).toBe(3);
 
-      // Third interval is capped at 30 s: still nothing at 40 s, the poll fires
-      // at 50 s, and the attempt budget then stops the loop.
+      // Third interval is capped at 30 s: still nothing at 50 s, the poll fires
+      // at 50 s, and every following poll keeps the 30 s interval. The budget
+      // spans the server's 4-minute dump ceiling (12 attempts reach ~5m20s),
+      // so it only stops after that.
       await act(async () => {
         await vi.advanceTimersByTimeAsync(20_000);
       });
@@ -2159,10 +2161,91 @@ describe("useASSSubtitles pending font bundles", () => {
         await vi.advanceTimersByTimeAsync(10_000);
       });
       expect(fontCalls).toBe(4);
+
+      // Eight more capped intervals (50 s → 290 s) spend attempts 4-11.
       await act(async () => {
-        await vi.advanceTimersByTimeAsync(60_000);
+        await vi.advanceTimersByTimeAsync(240_000);
       });
-      expect(fontCalls).toBe(4);
+      expect(fontCalls).toBe(12);
+
+      // The last attempt fires at 320 s, past the 4-minute dump ceiling.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000);
+      });
+      expect(fontCalls).toBe(13);
+
+      // Budget exhausted: no further poll without a new committed window.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(120_000);
+      });
+      expect(fontCalls).toBe(13);
+    } finally {
+      unmount();
+      vi.useRealTimers();
+    }
+  });
+
+  it("re-arms a pending font refresh after a window advance once the budget is spent", async () => {
+    vi.useFakeTimers();
+    const track = { ...attachedFontTrack, font_bundle_url: "/fonts/pending-rearm" };
+    let fontCalls = 0;
+    vi.mocked(fetch).mockImplementation((input) => {
+      const url = String(input);
+      if (url === track.font_bundle_url) {
+        fontCalls += 1;
+        // Pending through the whole first budget; the poll armed by the next
+        // committed window finds the bundle that landed in the meantime.
+        return Promise.resolve(
+          fontCalls <= 13 ? pendingFontBundleResponse() : mockFontBundleResponse("late-font"),
+        );
+      }
+      // No advertised coverage: the upgrade probe must drop this window and
+      // keep the 120 s pipeline, so the timeupdate below is a real advance.
+      return Promise.resolve(
+        mockWindowedResponse(
+          "[Events]\nDialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,Hello",
+          "",
+        ),
+      );
+    });
+    const videoRef = makeVideoRef(1);
+    const { unmount } = renderHook(() =>
+      useASSSubtitles(videoRef, [track], track.index, false, 0, 0),
+    );
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(fontCalls).toBe(1);
+
+      // Spend the full 12-attempt budget (~5m20s), still pending.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5_000);
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(15_000);
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(300_000);
+      });
+      expect(fontCalls).toBe(13);
+
+      // The client gave up before the server dump finished. Advancing the
+      // window is a natural re-check point: the commit arms exactly one more
+      // poll, which adopts the bundle that has since landed.
+      await act(async () => {
+        videoRef.current!.currentTime = 65;
+        videoRef.current!.dispatchEvent(new Event("timeupdate"));
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(fontCalls).toBe(13);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000);
+      });
+      expect(fontCalls).toBe(14);
+      expect(instances[instances.length - 1]!.renderer.addFonts).toHaveBeenCalledWith([
+        expect.any(Uint8Array),
+      ]);
     } finally {
       unmount();
       vi.useRealTimers();

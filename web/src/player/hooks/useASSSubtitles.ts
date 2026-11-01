@@ -140,7 +140,14 @@ function isDefinitiveSubtitleStatus(status: number): boolean {
 // Bounded background refresh of a font bundle the server reported as pending
 // (empty bundle, extraction still running). It stops as soon as fonts arrive
 // or a definitive font-less bundle is reported, so it can never poll forever.
-const ASS_FONT_REFRESH_MAX_ATTEMPTS = 3;
+//
+// The budget must outlive the server's dump: the dump is payload-scaled from a
+// 30 s floor up to a 4 m ceiling at a conservative relay rate, so a client that
+// stopped after the old three attempts (~50 s) abandoned exactly the slow packs
+// the server had been given room to extract. Twelve capped attempts span about
+// 5.3 minutes; a committed window additionally re-arms one poll (see
+// rearmFontRefreshAfterWindowCommit) so a bundle landing even later is adopted.
+const ASS_FONT_REFRESH_MAX_ATTEMPTS = 12;
 // Backoff between pending-font refresh attempts. The first retry stays fast
 // (the extraction usually lands within seconds); each consecutive pending
 // answer multiplies it so a slow relay is not hammered while the server-side
@@ -595,6 +602,27 @@ export function useASSSubtitles(
       fontRefreshTimer = setTimeout(() => void refreshPendingFonts(), fontRefreshBackoffMs);
     }
 
+    /**
+     * Re-arms the pending-font refresh at every committed window. The server
+     * may still be streaming the bundle when the refresh budget runs out (its
+     * dump ceiling is four minutes), and a window advance is a natural,
+     * bounded re-check point: one extra poll at the capped interval keeps a
+     * landed bundle adoptable without leaving a permanent poll loop. Fonts
+     * remain track-level, so the newly committed window reuses whatever the
+     * adopted state holds.
+     */
+    function rearmFontRefreshAfterWindowCommit() {
+      if (cancelled || !fontBundlePending || !activeFontBundleUrl) return;
+      if (fontRefreshAttempts < ASS_FONT_REFRESH_MAX_ATTEMPTS) {
+        scheduleFontRefresh();
+        return;
+      }
+      // Budget already spent: allow exactly one more poll for this window.
+      fontRefreshAttempts = ASS_FONT_REFRESH_MAX_ATTEMPTS - 1;
+      fontRefreshBackoffMs = ASS_FONT_REFRESH_MAX_BACKOFF_MS;
+      scheduleFontRefresh();
+    }
+
     /** Resolve the per-track font state once, reusing it across windows. */
     async function resolveFontState(signal: AbortSignal, subContent: string) {
       if (fontState) return fontState;
@@ -820,6 +848,10 @@ export function useASSSubtitles(
         // a window arms the loop here too, so the misclassification costs no
         // refresh.
         if (!usingWholeTrack) scheduleUpgradeProbe();
+        // The window is committed: if the track's font bundle was still
+        // pending, give it another chance to land even when the refresh
+        // budget was already spent before this window started.
+        if (fontBundlePending) rearmFontRefreshAfterWindowCommit();
         return true;
       }
       return false;
