@@ -1590,6 +1590,11 @@ func newChiRouter(deps Dependencies) chi.Router {
 						ContentFiles: deps.FileRepo.GetByContentID,
 						EpisodeFiles: deps.FileRepo.GetByEpisodeID,
 						Detail:       itemsHandler,
+						// Catalog detail answers from the persisted list and lets
+						// this discovery finish detached, so the persisted listing
+						// must announce itself: the versions_updated event is what
+						// refreshes an open detail page.
+						Events: deps.RealtimeHub,
 					}
 					// The discovery path schedules the pre-play probe chain
 					// after a successful detached persistence. Both sides stay
@@ -1600,6 +1605,11 @@ func newChiRouter(deps Dependencies) chi.Router {
 					// and the file repository.
 					if detailSvc != nil && deps.FileRepo != nil {
 						virtualCandidatesRefresh.ScheduleDefaultFileProbe = playbackHandler.ScheduleDefaultFileProbe
+						// The same detail discovery resolves the default version
+						// the watch page will play. Warm its provider fetch from
+						// the resolved row, reusing the explicit-selection
+						// warm-up entry point so admission and fill are identical.
+						virtualCandidatesRefresh.ScheduleDefaultFileWarm = playbackHandler.ScheduleDefaultFileWarm
 						playbackHandler.DefaultProbeTarget = handlers.NewVirtualDefaultProbeTarget(detailSvc, deps.FileRepo)
 					}
 					// The indexer-release read/request surface and the async

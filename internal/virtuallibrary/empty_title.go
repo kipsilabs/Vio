@@ -73,6 +73,33 @@ func neutralVirtualPathKey(virtualPath string) string {
 	return virtualPath
 }
 
+func (streak *emptyTitleStreak) expired(now time.Time) bool {
+	return streak.count >= emptyTitleMarkStreak && (streak.last.IsZero() || now.Sub(streak.last) > emptyTitleMarkTTL)
+}
+
+func (t *emptyTitleTracker) ensureCapacity(now time.Time) {
+	if len(t.streaks) < maxEmptyTitleEntries {
+		return
+	}
+	t.sweepExpired(now)
+	if len(t.streaks) < maxEmptyTitleEntries {
+		return
+	}
+	var oldestKey string
+	var oldestTime time.Time
+	for k, s := range t.streaks {
+		if oldestKey == "" || (s != nil && s.last.Before(oldestTime)) {
+			oldestKey = k
+			if s != nil {
+				oldestTime = s.last
+			}
+		}
+	}
+	if oldestKey != "" {
+		delete(t.streaks, oldestKey)
+	}
+}
+
 // noteEmptyListing records one empty provider listing for the title and
 // reports whether the title is now marked without streams.
 func (t *emptyTitleTracker) noteEmptyListing(key string, cacheTTL time.Duration, now time.Time) bool {
@@ -89,24 +116,9 @@ func (t *emptyTitleTracker) noteEmptyListing(key string, cacheTTL time.Duration,
 	// An expired MARK is no evidence for the new listing: start a fresh streak
 	// instead of letting its old count and span re-mark the title from one
 	// observation. An unmarked streak is still accumulating evidence.
-	if !ok || (streak.count >= emptyTitleMarkStreak && (streak.last.IsZero() || now.Sub(streak.last) > emptyTitleMarkTTL)) {
-		if !ok && len(t.streaks) >= maxEmptyTitleEntries {
-			t.sweepExpired(now)
-			if len(t.streaks) >= maxEmptyTitleEntries {
-				var oldestKey string
-				var oldestTime time.Time
-				for k, s := range t.streaks {
-					if oldestKey == "" || (s != nil && s.last.Before(oldestTime)) {
-						oldestKey = k
-						if s != nil {
-							oldestTime = s.last
-						}
-					}
-				}
-				if oldestKey != "" {
-					delete(t.streaks, oldestKey)
-				}
-			}
+	if !ok || streak.expired(now) {
+		if !ok {
+			t.ensureCapacity(now)
 		}
 		streak = &emptyTitleStreak{}
 		t.streaks[key] = streak

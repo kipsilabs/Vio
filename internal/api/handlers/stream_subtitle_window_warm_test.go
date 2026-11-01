@@ -162,7 +162,7 @@ func TestVirtualTextWindowMissWarmsOnceWithServeIdentity(t *testing.T) {
 	if err := os.WriteFile(gate, []byte("go"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	identity := playback.VirtualSubtitleCacheIdentity(file.ID, session.VirtualSourceURI, 0)
+	identity := virtualSubtitleCacheIdentity(file, session.VirtualSourceURI, 0)
 	waitForCommittedTextEntry(t, handler.SubtitleCache, identity, 0, "subrip")
 
 	window, warm := ffmpegLogLines(t, argsLog)
@@ -223,7 +223,7 @@ func TestVirtualTextWindowCommittedEntrySkipsDriftProbe(t *testing.T) {
 	writeExecutableScript(t, filepath.Join(dir, "ffprobe"),
 		"#!/bin/sh\necho probe >> '"+probeLog+"'\nprintf '{\"streams\":[]}'\n")
 
-	identity := playback.VirtualSubtitleCacheIdentity(file.ID, session.VirtualSourceURI, 0)
+	identity := virtualSubtitleCacheIdentity(file, session.VirtualSourceURI, 0)
 	done := handler.SubtitleCache.WarmTrackInBackground(playback.StreamExtractOpts{
 		InputPath:     "unused",
 		CacheIdentity: identity,
@@ -373,7 +373,7 @@ func TestVirtualTextWindowWarmKeysOnServeOrdinalAfterRemap(t *testing.T) {
 	const remappedOrdinal = 1
 	// This is the identity the remapped serve path computes; the warm must
 	// commit under it.
-	serveIdentity := playback.VirtualSubtitleCacheIdentity(file.ID, virtualURI, remappedOrdinal)
+	serveIdentity := virtualSubtitleCacheIdentity(file, virtualURI, remappedOrdinal)
 	handler.warmVirtualSubtitleAfterWindowMiss(file, session, playback.StreamExtractOpts{
 		InputPath:       "unused",
 		CacheIdentity:   serveIdentity,
@@ -385,7 +385,7 @@ func TestVirtualTextWindowWarmKeysOnServeOrdinalAfterRemap(t *testing.T) {
 	}, true, "")
 	waitForCommittedTextEntry(t, handler.SubtitleCache, serveIdentity, remappedOrdinal, "subrip")
 
-	planIdentity := playback.VirtualSubtitleCacheIdentity(file.ID, virtualURI, 0)
+	planIdentity := virtualSubtitleCacheIdentity(file, virtualURI, 0)
 	if handler.SubtitleCache.HasCommittedTextEntry("unused", planIdentity, 0, "subrip", "") {
 		t.Fatal("warm must not commit under the orphaned plan ordinal")
 	}
@@ -401,7 +401,7 @@ func TestVirtualTextWindowWarmSkipsNonVirtual(t *testing.T) {
 	argsLog := filepath.Join(dir, "ffmpeg.args")
 	handler, session, file, virtualURI := newVirtualSubtitleWindowFixture(t, dir,
 		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\n")
-	identity := playback.VirtualSubtitleCacheIdentity(file.ID, virtualURI, 0)
+	identity := virtualSubtitleCacheIdentity(file, virtualURI, 0)
 
 	handler.warmVirtualSubtitleAfterWindowMiss(file, session, playback.StreamExtractOpts{
 		InputPath:       "unused",
@@ -432,7 +432,7 @@ func TestVirtualTextWindowWarmStartsDuringPlayback(t *testing.T) {
 	handler, session, file, virtualURI := newVirtualSubtitleWindowFixture(t, dir,
 		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\ncat <<'VTT'\n"+warmSubtitleVTT+"VTT\n")
 	session.IsPaused = false
-	identity := playback.VirtualSubtitleCacheIdentity(file.ID, virtualURI, 0)
+	identity := virtualSubtitleCacheIdentity(file, virtualURI, 0)
 
 	handler.warmVirtualSubtitleAfterWindowMiss(file, session, playback.StreamExtractOpts{
 		InputPath:       "unused",
@@ -508,7 +508,7 @@ func TestVirtualPGSWholeTrackFetchServesImplicitWindowThenWarms(t *testing.T) {
 	if err := os.WriteFile(gate, []byte("go"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	identity := playback.VirtualSubtitleCacheIdentity(file.ID, virtualURI, 0)
+	identity := virtualSubtitleCacheIdentity(file, virtualURI, 0)
 	waitForCommittedEntry(t, handler.SubtitleCache, identity, 0, "hdmv_pgs_subtitle")
 
 	window, warm := ffmpegLogLines(t, argsLog)
@@ -565,7 +565,7 @@ func TestVirtualPGSWholeTrackFetchServesCommittedWholeTrack(t *testing.T) {
 	file.SubtitleTracks = []models.SubtitleTrack{{Index: 0, Codec: "hdmv_pgs_subtitle"}}
 	session.VirtualSubtitleTracks = file.SubtitleTracks
 
-	identity := playback.VirtualSubtitleCacheIdentity(file.ID, virtualURI, 0)
+	identity := virtualSubtitleCacheIdentity(file, virtualURI, 0)
 	done := handler.SubtitleCache.WarmTrackInBackground(playback.StreamExtractOpts{
 		InputPath:     "unused",
 		CacheIdentity: identity,
@@ -664,7 +664,7 @@ func TestVirtualTextWindowWarmResolveTimeoutReleasesSlot(t *testing.T) {
 	optsFor := func(track int) playback.StreamExtractOpts {
 		return playback.StreamExtractOpts{
 			InputPath:       "unused",
-			CacheIdentity:   playback.VirtualSubtitleCacheIdentity(file.ID, virtualURI, track),
+			CacheIdentity:   virtualSubtitleCacheIdentity(file, virtualURI, track),
 			TrackIndex:      track,
 			SourceCodec:     "subrip",
 			SeekSeconds:     600,
@@ -700,7 +700,7 @@ func TestVirtualTextWindowWarmResolveTimeoutReleasesSlot(t *testing.T) {
 	}
 
 	// A retried warm can now take a slot and commit.
-	identity := playback.VirtualSubtitleCacheIdentity(file.ID, virtualURI, 2)
+	identity := virtualSubtitleCacheIdentity(file, virtualURI, 2)
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		handler.warmVirtualSubtitleAfterWindowMiss(file, session, optsFor(2), true, "")
@@ -906,7 +906,7 @@ func TestVirtualWholeTrackTextFetchServesImplicitWindowThenWarms(t *testing.T) {
 	if err := os.WriteFile(gate, []byte("go"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	identity := playback.VirtualSubtitleCacheIdentity(file.ID, virtualURI, 0)
+	identity := virtualSubtitleCacheIdentity(file, virtualURI, 0)
 	waitForCommittedTextEntry(t, handler.SubtitleCache, identity, 0, "subrip")
 
 	window, warm := ffmpegLogLines(t, argsLog)
@@ -963,7 +963,7 @@ func TestVirtualWholeTrackTextFetchServesCommittedWholeTrack(t *testing.T) {
 	handler, session, file, virtualURI := newVirtualSubtitleWindowFixture(t, dir,
 		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\ncat <<'VTT'\n"+warmSubtitleVTT+"VTT\n")
 
-	identity := playback.VirtualSubtitleCacheIdentity(file.ID, virtualURI, 0)
+	identity := virtualSubtitleCacheIdentity(file, virtualURI, 0)
 	done := handler.SubtitleCache.WarmTrackInBackground(playback.StreamExtractOpts{
 		InputPath:     "unused",
 		CacheIdentity: identity,

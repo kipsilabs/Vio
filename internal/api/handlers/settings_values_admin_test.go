@@ -223,8 +223,14 @@ func TestAdminSetAndDeleteAtExplicitScopeRoundTrip(t *testing.T) {
 	if got, err := env.targetStore.GetSettingValue(ctx, identity); err != nil || got != nil {
 		t.Errorf("value after delete = %+v, %v; want gone", got, err)
 	}
-	if rec := env.do(t, "admin", http.MethodDelete, target, nil); rec.Code != http.StatusNotFound {
-		t.Errorf("second DELETE = %d, want 404", rec.Code)
+	// Clearing a subtitle preference is idempotent: the addressed row is
+	// already gone, which is the state the caller asked for. Every other key
+	// keeps the 404 that reports an unset aimed at nothing.
+	if rec := env.do(t, "admin", http.MethodDelete, target, nil); rec.Code != http.StatusNoContent {
+		t.Errorf("second DELETE = %d, want 204: %s", rec.Code, rec.Body.String())
+	}
+	if got, err := env.targetStore.GetSettingValue(ctx, identity); err != nil || got != nil {
+		t.Errorf("value after repeated delete = %+v, %v; want gone", got, err)
 	}
 }
 

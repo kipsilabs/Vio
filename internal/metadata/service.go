@@ -3978,10 +3978,21 @@ func (s *MetadataService) runOnDemandMetadataRefresh(targetType, contentID strin
 			"content_id", contentID)
 		err := s.refreshTarget(ctx, targetType, contentID, 0, ModeScheduledRefresh, false)
 		if err != nil {
-			slog.Warn("metadata: on-demand stale refresh failed",
-				"target_type", targetType,
-				"content_id", contentID,
-				"error", err)
+			if LocalMetadataUnavailableForVirtual(err) {
+				// A virtual provider source has no local files, so every NFO read
+				// for it fails by construction. That is the expected answer, not
+				// a mount or permission problem worth paging on; the local-file
+				// case below keeps its warning.
+				slog.Debug("metadata: on-demand stale refresh skipped: virtual source has no local metadata",
+					"target_type", targetType,
+					"content_id", contentID,
+					"error", err)
+			} else {
+				slog.Warn("metadata: on-demand stale refresh failed",
+					"target_type", targetType,
+					"content_id", contentID,
+					"error", err)
+			}
 		} else {
 			slog.Info("metadata: completed on-demand stale refresh",
 				"target_type", targetType,

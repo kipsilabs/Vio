@@ -72,6 +72,11 @@ const (
 	virtualProbeChainTriggerSelection = "watch-detail:select"
 )
 
+// virtualSelectionWarmTriggerDefault is the log trigger for a warm-up started
+// by a detail read that resolved the item's default version. The work is the
+// same as an explicit selection's warm-up; only the trigger label differs.
+const virtualSelectionWarmTriggerDefault = "detail:default"
+
 // Reasons a discovered or selected item ends up not probed. They are log
 // values only — nothing branches on them — so an operator can tell a chain
 // that was never admitted (schedule_refused) from one that ran out of budget
@@ -390,6 +395,29 @@ func (h *PlaybackHandler) ScheduleSelectedFileProbe(contentID string, fileID int
 // virtual_library.* settings next to cache_ttl_minutes and would be read where
 // the fill is wired, not here; no settings key is introduced for it now.
 func (h *PlaybackHandler) ScheduleSelectedFileWarm(contentID string, fileID int, filter catalog.AccessFilter) {
+	h.scheduleFileWarm(contentID, fileID, filter, virtualProbeChainTriggerSelection)
+}
+
+// ScheduleDefaultFileWarm warms the default row a detail read resolved. A
+// catalog_detail or watch_detail read lists candidates, persists them, and
+// resolves the top-sorted version; without this warm-up that version's provider
+// fetch waits for the play press even though the read already named it. The
+// caller passes the resolved default file id, so admission, slots, the
+// short damper check, and the no-state-write rule are exactly the explicit
+// selection path's: a live selection warm for the same row already owns the
+// work, and a default warm already running makes a later selection a no-op.
+//
+// It is scheduled only from a detail-page discovery, never from a listing-only
+// request or a refresh job, and never by a browse/list/search row read (those
+// do not run detail discovery at all).
+func (h *PlaybackHandler) ScheduleDefaultFileWarm(contentID string, fileID int, filter catalog.AccessFilter) {
+	h.scheduleFileWarm(contentID, fileID, filter, virtualSelectionWarmTriggerDefault)
+}
+
+// scheduleFileWarm is the one admission and hand-off path for both warm
+// triggers. The trigger is a log attribute only; it never changes the
+// admission key, the fill, or the target.
+func (h *PlaybackHandler) scheduleFileWarm(contentID string, fileID int, filter catalog.AccessFilter, trigger string) {
 	if h == nil || contentID == "" || fileID <= 0 {
 		return
 	}
@@ -400,14 +428,14 @@ func (h *PlaybackHandler) ScheduleSelectedFileWarm(contentID string, fileID int,
 	// A live probe chain for this exact row is already opening the provider URL,
 	// which starts the same fetch; a second listing would only duplicate it.
 	if h.defaultProbeChains.isLive(contentID + "\x00" + strconv.Itoa(fileID)) {
-		logVirtualSelectionWarmSkip(contentID, "probe_live")
+		logVirtualSelectionWarmSkip(contentID, trigger, "probe_live")
 		return
 	}
 	ctx, cancel := h.virtualDetachedContext(context.Background(), virtualSelectionWarmBudget)
 	release, refusal := h.selectedWarmChains.acquireWithCancel("warm\x00"+contentID+"\x00"+strconv.Itoa(fileID), cancel)
 	if refusal != defaultProbeChainRefusalNone {
 		cancel()
-		logVirtualSelectionWarmSkip(contentID, string(refusal))
+		logVirtualSelectionWarmSkip(contentID, trigger, string(refusal))
 		return
 	}
 	filterSnapshot := virtualProbeAccessFilterSnapshot(filter)
@@ -422,19 +450,19 @@ func (h *PlaybackHandler) ScheduleSelectedFileWarm(contentID string, fileID int,
 			cancel()
 			h.warmChainWG.Done()
 		}()
-		h.runSelectedFileWarm(ctx, contentID, filterSnapshot)
+		h.runSelectedFileWarm(ctx, contentID, filterSnapshot, trigger)
 	}()
 }
 
-// logVirtualSelectionWarmSkip records why an explicit selection did not start a
-// warm-up. Expected skips stay at debug: the play path fills the same release
+// logVirtualSelectionWarmSkip records why a selection or default warm-up did
+// not start. Expected skips stay at debug: the play path fills the same release
 // when the time comes, so a skipped warm-up is a latency miss, not a failure.
-func logVirtualSelectionWarmSkip(contentID, reason string) {
+func logVirtualSelectionWarmSkip(contentID, trigger, reason string) {
 	slog.DebugContext(context.Background(), "virtual selection warm-up skipped",
 		"component", "api",
 		contentIDKey, contentID,
 		virtualEvidenceLogKeyReason, reason,
-		"trigger", virtualProbeChainTriggerSelection)
+		"trigger", trigger)
 }
 
 // runSelectedFileWarm is the body of one admitted warm-up. It re-reads the
@@ -442,7 +470,7 @@ func logVirtualSelectionWarmSkip(contentID, reason string) {
 // authorization the probe chain uses), requires the exact row and a virtual
 // path, then hands the row's virtual URI to the playback fill call. It never
 // writes catalog state and never changes a verdict.
-func (h *PlaybackHandler) runSelectedFileWarm(ctx context.Context, contentID string, filter catalog.AccessFilter) {
+func (h *PlaybackHandler) runSelectedFileWarm(ctx context.Context, contentID string, filter catalog.AccessFilter, trigger string) {
 	if err := ctx.Err(); err != nil {
 		return
 	}
@@ -458,7 +486,7 @@ func (h *PlaybackHandler) runSelectedFileWarm(ctx context.Context, contentID str
 	}
 	gate := h.detachedGate()
 	if !gate.tryAcquire() {
-		logVirtualSelectionWarmSkip(contentID, virtualProbeChainReasonGateBusy)
+		logVirtualSelectionWarmSkip(contentID, trigger, virtualProbeChainReasonGateBusy)
 		return
 	}
 	defer gate.release()

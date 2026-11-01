@@ -184,12 +184,12 @@ func TestPersistVirtualProbeEvidenceRefusesUnverifiedSizeMismatch(t *testing.T) 
 	}
 	fresh := *row
 	fresh.UpdatedAt = time.Now()
-	// Probed size contradicts declared size by 12%, though runtime matches 51.2m
+	// Probed size contradicts declared size by 12% and duration does not match (30m vs 51m)
 	probed := &models.MediaFile{
 		ID:               7,
 		FilePath:         row.FilePath,
 		ProbedFormatSize: 5_570_000_000,
-		Duration:         3072,
+		Duration:         1800,
 		AudioTracks:      []models.AudioTrack{{Codec: "eac3", Channels: 6, Language: "en"}},
 	}
 	h := &PlaybackHandler{

@@ -3747,7 +3747,7 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 	// registration is released when the request ends; the cache's own detached
 	// warm is therefore disabled for virtual inputs.
 	if virtualActive {
-		opts.CacheIdentity = playback.VirtualSubtitleCacheIdentity(file.ID, session.VirtualSourceURI, opts.TrackIndex)
+		opts.CacheIdentity = virtualSubtitleCacheIdentity(file, session.VirtualSourceURI, opts.TrackIndex)
 		opts.DisableBackgroundWarm = true
 	}
 
@@ -3813,7 +3813,7 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 			// The probe may have remapped the ordinal; the cache identity must
 			// track the effective map so a remapped extraction lands under its
 			// own key.
-			opts.CacheIdentity = playback.VirtualSubtitleCacheIdentity(file.ID, session.VirtualSourceURI, opts.TrackIndex)
+			opts.CacheIdentity = virtualSubtitleCacheIdentity(file, session.VirtualSourceURI, opts.TrackIndex)
 		}
 	}
 
@@ -3850,7 +3850,7 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 			writeSubtitleSourceUnavailable(w)
 			return
 		}
-		opts.CacheIdentity = playback.VirtualSubtitleCacheIdentity(file.ID, session.VirtualSourceURI, opts.TrackIndex)
+		opts.CacheIdentity = virtualSubtitleCacheIdentity(file, session.VirtualSourceURI, opts.TrackIndex)
 		// The pinned artifact is gone, so the committed-entry check that
 		// suppressed the implicit window on the first attempt no longer holds.
 		// Re-evaluate against the now-cold source before retrying.
@@ -3933,7 +3933,7 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 		// identity must track the effective map so a remapped extraction lands
 		// under its own key.
 		if virtualActive {
-			opts.CacheIdentity = playback.VirtualSubtitleCacheIdentity(file.ID, session.VirtualSourceURI, opts.TrackIndex)
+			opts.CacheIdentity = virtualSubtitleCacheIdentity(file, session.VirtualSourceURI, opts.TrackIndex)
 		}
 		if retryErr := h.SubtitleCache.ServeExtract(response, r, opts, playback.StreamExtractSubtitle); retryErr != nil {
 			var retryBackoff *playback.SubtitleExtractionRetryError
@@ -3971,6 +3971,21 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 	// committed nothing. Populate the full-track cache so the next window hits
 	// the small artifact instead of re-demuxing the source.
 	h.warmVirtualSubtitleAfterWindowMiss(file, session, opts, virtualActive, middleware.GetReqID(r.Context()))
+}
+
+// virtualSubtitleCacheIdentity keys the subtitle cache for a virtual row being
+// served. The row's probed subtitle layout is part of the identity: a re-probe
+// that established a different inventory names different streams under the same
+// ordinals, so artifacts committed against the previous layout must not be
+// served for the new one. An unchanged layout keeps the same key, so ordinary
+// re-probing does not throw away warm artifacts.
+func virtualSubtitleCacheIdentity(file *models.MediaFile, virtualSourceURI string, trackIndex int) string {
+	if file == nil {
+		return ""
+	}
+	return playback.VirtualSubtitleCacheIdentity(
+		file.ID, virtualSourceURI, trackIndex, playback.SubtitleInventoryToken(file.SubtitleTracks),
+	)
 }
 
 // resolveCommittedTextSubtitleEntry resolves the committed full-track text
