@@ -394,6 +394,25 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 				break
 			}
 		}
+		if attempt > 0 {
+			// A cross-release fallback serves different bytes than the plan was
+			// built for, so every hop without measured inventory cannot carry
+			// the viewer's audio/subtitle selection. When the listing still
+			// offers a release whose inventory is probed, bind it now instead of
+			// walking unprobed stubs hop by hop: the probe below then has a
+			// known inventory to carry selections onto, and the healthy release
+			// is reached inside this start rather than after the viewer's picks
+			// have already been wiped. When no probed sibling remains the walk
+			// proceeds normally and the unknown-inventory handling below keeps
+			// the selections pending.
+			if probedSiblingID := h.preferredProbedFallbackCandidate(resolveStartupCtx, file, failedCandidateIDs, preferredID, userID, profileID); probedSiblingID != "" {
+				slog.InfoContext(resolveStartupCtx, "cross-release virtual fallback prefers a probed release over an unprobed hop",
+					"component", "api", "file_id", catalogFileIDOrZero(file),
+					"previous_preference", preferredID, "probed_candidate_id", probedSiblingID,
+					"excluded_candidates", len(failedCandidateIDs))
+				preferredID = probedSiblingID
+			}
+		}
 		// An exclusion is only a substitution verdict when this startup loop
 		// just indicted that candidate (attempt > 0 with a failed id). Declare
 		// it explicitly so the resolver may serve a sibling; a neutral first
@@ -509,15 +528,21 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 		// replacement is probed synchronously under the remaining startup
 		// budget, and the session is built on the probed facts — source
 		// codecs, audio layout/channels, HDR range — instead of the pinned
-		// release's. The audio selection is re-identified on the probed
-		// replacement; a subtitle selection has no cross-release identity
-		// matcher yet, so it is reset to off and the reset is logged. The first
-		// attempt (the pinned release itself) keeps the plan's selections
-		// untouched. A probe failure does not fail the fallback: the attempt
-		// proceeds on declared facts and the replacement's default audio (the
-		// pre-#118 behavior) so a slow prober cannot wedge startup.
+		// release's.
+		//
+		// The replacement's inventory then decides how far a selection can be
+		// carried. When a probe describes it, the audio selection is
+		// re-identified on the replacement and a subtitle selection is reset to
+		// off (there is no cross-release subtitle identity matcher yet). When
+		// the inventory is UNKNOWN — an unprobed row whose live probe failed —
+		// neither selection may be reset: a reset would silently wipe the
+		// viewer's pick for the rest of the session on the chance the bytes do
+		// carry it. The selections stay pending instead, so a probe that lands
+		// later can still recover them. The first attempt (the pinned release
+		// itself) keeps the plan's selections untouched, and a probe failure
+		// never fails the fallback: a slow or missing prober cannot wedge
+		// startup.
 		if attempt > 0 {
-			attemptOpts.SubtitleTrackIndex = -1
 			attemptOpts.SubtitleBurnIn = false
 			attemptOpts.SourceVideoCodec = ""
 			attemptOpts.SourceVideoProfile = ""
@@ -529,26 +554,45 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 			// best-effort and never fails the fallback.
 			h.fireExpiredVirtualRefresh(startupCtx, file, ownerInstallationID, userID, profileID, resolvedMedia.ExpiresAt)
 			probedFacts := h.probeVirtualFallbackSource(startupCtx, resolvedMedia, file)
-			if probedFacts != nil {
-				attemptOpts.SourceVideoCodec = probedFacts.CodecVideo
-				attemptOpts.SourceVideoProfile = virtualFallbackVideoProfile(probedFacts)
-				attemptOpts.SourceVideoBitDepth = virtualFallbackVideoBitDepth(probedFacts)
-				attemptOpts.SourceAudioChannels = virtualFallbackAudioChannels(probedFacts)
+			inventory := h.fallbackInventoryV3(startupCtx, file, resolvedMedia, probedFacts)
+			if inventory.facts != nil {
+				attemptOpts.SourceVideoCodec = inventory.facts.CodecVideo
+				attemptOpts.SourceVideoProfile = virtualFallbackVideoProfile(inventory.facts)
+				attemptOpts.SourceVideoBitDepth = virtualFallbackVideoBitDepth(inventory.facts)
+				attemptOpts.SourceAudioChannels = virtualFallbackAudioChannels(inventory.facts)
 			}
 			// The replacement's inventory is what its ordinals address, so the
 			// pinned release's audio selection is remapped by identity rather
 			// than silently reset to the container default. A selection with no
-			// equivalent on the replacement still degrades, but the reset is
+			// equivalent on a KNOWN replacement still degrades, but the reset is
 			// warned (and the plan keeps the requested identity for the client).
+			// An UNKNOWN replacement keeps the requested ordinal pending: the
+			// index is not evidence of a mismatch, and resetting it would lose a
+			// selection the next probe may prove.
 			var remappedAudioIndex int
-			remappedAudioIndex, audioCarry = remapFallbackAudioIndexV3(file, probedFacts, opts.AudioTrackIndex)
+			remappedAudioIndex, audioCarry = fallbackAudioSelectionV3(file, inventory, opts.AudioTrackIndex)
 			attemptOpts.AudioTrackIndex = remappedAudioIndex
-			logCrossReleaseAudioCarry(startupCtx, file, probedFacts, opts.AudioTrackIndex, remappedAudioIndex, audioCarry, resolvedMedia.CandidateID)
-			if opts.SubtitleTrackIndex >= 0 {
-				slog.WarnContext(startupCtx, "cross-release virtual fallback reset the subtitle selection to off",
-					"component", "api", "file_id", catalogFileIDOrZero(file),
-					"reset_subtitle_index", opts.SubtitleTrackIndex,
-					"candidate_id", resolvedMedia.CandidateID)
+			logCrossReleaseAudioCarry(startupCtx, file, inventory.facts, opts.AudioTrackIndex, remappedAudioIndex, audioCarry, resolvedMedia.CandidateID)
+			if inventory.known {
+				attemptOpts.SubtitleTrackIndex = -1
+				if opts.SubtitleTrackIndex >= 0 {
+					slog.WarnContext(startupCtx, "cross-release virtual fallback reset the subtitle selection to off",
+						"component", "api", "file_id", catalogFileIDOrZero(file),
+						"reset_subtitle_index", opts.SubtitleTrackIndex,
+						"candidate_id", resolvedMedia.CandidateID)
+				}
+			} else {
+				// Unknown inventory is not evidence that the selection is
+				// absent. Keep the ordinal so a probed replacement later in
+				// this session can carry it; burn-in stays off because an
+				// unverifiable [0:s:N] index would hard-fail the encode.
+				attemptOpts.SubtitleTrackIndex = opts.SubtitleTrackIndex
+				if opts.SubtitleTrackIndex >= 0 {
+					slog.InfoContext(startupCtx, "cross-release virtual fallback kept the subtitle selection pending with unknown replacement inventory",
+						"component", "api", "file_id", catalogFileIDOrZero(file),
+						"pending_subtitle_index", opts.SubtitleTrackIndex,
+						"candidate_id", resolvedMedia.CandidateID)
+				}
 			}
 		}
 		session, startErr := h.startTranscodeSession(transcodeCtx, attemptOpts)
@@ -758,7 +802,63 @@ const (
 	// fallbackAudioCarryDegraded means a selection existed but the replacement's
 	// inventory could not honor it, so playback falls back to its default track.
 	fallbackAudioCarryDegraded
+	// fallbackAudioCarryPending means the replacement's inventory is unknown, so
+	// the requested ordinal is kept pending instead of being reset or remapped.
+	// Nothing is claimed about what the viewer will hear; a later probe owns the
+	// recovery.
+	fallbackAudioCarryPending
 )
+
+// fallbackInventoryV3 is what a cross-release fallback knows about the
+// replacement's audio and subtitle inventory.
+//
+// known is the load-bearing field: it says a probe (live or persisted on the
+// candidate's catalog row) described this replacement, so its ordinals are the
+// measured answer. facts carries those measured tracks for identity remapping.
+// An unprobed replacement leaves known false with nil facts — its inventory is
+// UNKNOWN, not empty, and no selection may be reset on it.
+type fallbackInventoryV3 struct {
+	facts *models.MediaFile
+	known bool
+}
+
+// fallbackInventoryV3 resolves what the fallback attempt knows about the
+// replacement it is about to start. The live probe is authoritative; when it
+// failed or was not wired, the candidate's catalog row is consulted and only a
+// row carrying a probe stamp is accepted as measured evidence. Everything else
+// stays unknown, which keeps the viewer's selections pending rather than
+// wiping them.
+func (h *PlaybackHandler) fallbackInventoryV3(ctx context.Context, file *models.MediaFile, resolved ResolvedVirtualMedia, probed *models.MediaFile) fallbackInventoryV3 {
+	if probed != nil {
+		return fallbackInventoryV3{facts: probed, known: true}
+	}
+	if h == nil || file == nil {
+		return fallbackInventoryV3{}
+	}
+	contentID, episodeID := file.ContentID, file.EpisodeID
+	owner := effectiveVirtualOwner(resolved.OwnerID, file.VirtualOwnerInstallationID)
+	row, found, err := h.lookupVirtualCandidateRowDetailed(ctx, resolved.URI, contentID, episodeID, owner)
+	if err != nil || !found || row == nil || row.ProbeUpdatedAt == nil {
+		return fallbackInventoryV3{}
+	}
+	return fallbackInventoryV3{facts: row, known: true}
+}
+
+// fallbackAudioSelectionV3 applies the pinned release's audio selection to the
+// replacement a cross-release fallback is about to start. A known inventory is
+// carried by identity exactly as before (a genuine mismatch still degrades to
+// the replacement's default and the caller warns). An unknown inventory keeps
+// the requested ordinal pending: the index names no evidence either way, so
+// resetting it would discard a selection the next probe may prove correct.
+func fallbackAudioSelectionV3(pinned *models.MediaFile, inventory fallbackInventoryV3, requestedIndex int) (int, fallbackAudioCarryV3) {
+	if requestedIndex < 0 {
+		return -1, fallbackAudioCarryNone
+	}
+	if !inventory.known {
+		return requestedIndex, fallbackAudioCarryPending
+	}
+	return remapFallbackAudioIndexV3(pinned, inventory.facts, requestedIndex)
+}
 
 // remapFallbackAudioIndexV3 carries the pinned release's audio selection onto the
 // replacement a cross-release fallback probed. It returns -1 (the container
@@ -842,6 +942,17 @@ func logCrossReleaseAudioCarry(ctx context.Context, pinned, probed *models.Media
 	switch carry {
 	case fallbackAudioCarryMatched:
 		logMatchedCrossReleaseAudioCarry(ctx, pinned, probed, requestedIndex, remappedIndex, candidateID)
+	case fallbackAudioCarryPending:
+		probedTracks := 0
+		if probed != nil {
+			probedTracks = len(probed.AudioTracks)
+		}
+		slog.InfoContext(ctx, "cross-release virtual fallback kept the audio selection pending with unknown replacement inventory",
+			"component", "api",
+			"file_id", catalogFileIDOrZero(pinned),
+			"pending_audio_index", requestedIndex,
+			"probed_audio_tracks", probedTracks,
+			"candidate_id", candidateID)
 	case fallbackAudioCarryDegraded:
 		probedTracks := 0
 		if probed != nil {
