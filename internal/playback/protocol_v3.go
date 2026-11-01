@@ -1386,6 +1386,12 @@ func (r *StartRequestV3) NormalizeAndValidate() ([]DegradationWarningV3, error) 
 	if r.FileID <= 0 || strings.TrimSpace(r.ProfileID) == "" {
 		return nil, errors.New("file_id and profile_id are required")
 	}
+	if r.FileSelection == "" {
+		r.FileSelection = FileSelectionAutoV3
+	}
+	if r.FileSelection != FileSelectionAutoV3 && r.FileSelection != FileSelectionExplicitV3 {
+		return nil, errors.New("file_selection is invalid")
+	}
 	if !boundedIdentifierV3.MatchString(r.PlaybackAttemptID) {
 		return nil, errors.New("playback_attempt_id is invalid")
 	}
