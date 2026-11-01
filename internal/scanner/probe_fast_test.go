@@ -29,7 +29,7 @@ func TestBuildFastProbeArgs(t *testing.T) {
 		"-show_chapters",
 		"-probesize", fastProbeSizeLimit,
 		"-analyzeduration", fastProbeAnalyzeDuration,
-		"-fflags", "+discardcorrupt+fastseek+nobuffer",
+		fastProbeFFlagsOption, "+discardcorrupt+fastseek+nobuffer",
 		"/media/movie.mkv",
 	} {
 		if !slices.Contains(args, want) {
@@ -41,7 +41,7 @@ func TestBuildFastProbeArgs(t *testing.T) {
 			t.Fatalf("fast probe args %q must not contain %q", args, forbidden)
 		}
 	}
-	if got := args[len(args)-3]; got != "-fflags" {
+	if got := args[len(args)-3]; got != fastProbeFFlagsOption {
 		t.Fatalf("fast probe args order = %q, want the flags before the input path", args)
 	}
 	if got := args[len(args)-2]; got != fastProbeFlags {

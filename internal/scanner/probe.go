@@ -185,6 +185,9 @@ const (
 	fastProbeSizeLimit       = "32"
 	fastProbeAnalyzeDuration = "0"
 	fastProbeFlags           = "+discardcorrupt+fastseek+nobuffer"
+	// fastProbeFFlagsOption names the fflags input option so the flag
+	// stays a single literal across the builder and its tests.
+	fastProbeFFlagsOption = "-fflags"
 )
 
 // buildFastProbeArgs returns the version-candidate preprobe argv. It is split
@@ -198,7 +201,7 @@ func buildFastProbeArgs(filePath string) []string {
 		"-show_chapters",
 		"-probesize", fastProbeSizeLimit,
 		"-analyzeduration", fastProbeAnalyzeDuration,
-		"-fflags", fastProbeFlags,
+		fastProbeFFlagsOption, fastProbeFlags,
 		filePath,
 	}
 }
@@ -220,25 +223,28 @@ func probeFileWithin(ctx context.Context, ffprobePath string, filePath string, l
 	if err != nil {
 		return nil, err
 	}
-	if probe.Duration == 0 {
-		if frameRate, hasVideo := primaryVideoFrameRate(raw.Streams); hasVideo {
-			// A failed or empty packet scan must not discard the codec and
-			// track metadata that already parsed successfully: callers persist
-			// the partial probe, and the repair layer retries rows whose
-			// duration is still unknown.
-			size, _ := strconv.ParseInt(raw.Format.Size, 10, 64)
-			duration, packetErr := probeVideoPacketDuration(ctx, ffprobePath, filePath, frameRate, limits.packetScan(size), limits.waitDelay)
-			if packetErr == nil && duration > 0 {
-				probe.Duration = duration
-			}
-			if errors.Is(packetErr, errProbeTimeout) {
-				slog.WarnContext(ctx, "scanner: ffprobe packet scan timed out; the duration stays unknown until a later probe",
-					"component", "scanner",
-					"path", filePath,
-					"error", packetErr,
-				)
-			}
-		}
+	if probe.Duration != 0 {
+		return probe, nil
+	}
+	frameRate, hasVideo := primaryVideoFrameRate(raw.Streams)
+	if !hasVideo {
+		return probe, nil
+	}
+	// A failed or empty packet scan must not discard the codec and
+	// track metadata that already parsed successfully: callers persist
+	// the partial probe, and the repair layer retries rows whose
+	// duration is still unknown.
+	size, _ := strconv.ParseInt(raw.Format.Size, 10, 64)
+	duration, packetErr := probeVideoPacketDuration(ctx, ffprobePath, filePath, frameRate, limits.packetScan(size), limits.waitDelay)
+	if packetErr == nil && duration > 0 {
+		probe.Duration = duration
+	}
+	if errors.Is(packetErr, errProbeTimeout) {
+		slog.WarnContext(ctx, "scanner: ffprobe packet scan timed out; the duration stays unknown until a later probe",
+			"component", "scanner",
+			"path", filePath,
+			"error", packetErr,
+		)
 	}
 
 	return probe, nil
