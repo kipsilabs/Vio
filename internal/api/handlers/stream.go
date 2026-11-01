@@ -1073,6 +1073,24 @@ func virtualEvidenceMatchesBoundFile(ctx context.Context, bound *models.MediaFil
 	return canonicalCollectionEvidenceMatchesBoundRow(ctx, bound, session, fileResolver, evidenceURI)
 }
 
+// virtualSubtitleOrdinalEvidenceBound reports whether a subtitle request's
+// plan-time ordinal is still trustworthy for the release it serves: the
+// session carries subtitle evidence, that evidence still describes the bound
+// candidate, and the request's own drift check found nothing to probe. It is
+// exactly the condition driftSuspected denies, stated once so the serve and
+// the detached warm it starts agree on what "the serve trusted its evidence"
+// means. A session without evidence, or with evidence that no longer matches,
+// is never evidence-bound.
+func (h *StreamHandler) virtualSubtitleOrdinalEvidenceBound(ctx context.Context, file *models.MediaFile, session *playback.Session) bool {
+	if file == nil || session == nil || !session.VirtualSubtitleEvidenceSet {
+		return false
+	}
+	if !isVirtualPlaybackFile(file) || session.VirtualSourceURI == "" {
+		return false
+	}
+	return virtualEvidenceMatchesBoundFile(ctx, file, session, h.fileResolver)
+}
+
 // virtualEvidenceAnchorsBoundRow is the historical provenance match: the bound
 // row must be the exact row the evidence was captured from and the evidence URI
 // must still name that row's candidate. A known evidence-row identity is
@@ -3823,12 +3841,33 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 	// the exact identity and ordinal it will hand the detached warm. Reusing it
 	// keeps the warm from paying a second multi-second ffprobe on a slow relay
 	// for a verdict this same request already holds: the serve either probed
-	// successfully or read a successful probe from the 120 s memo, and it would
-	// have failed closed otherwise. B1 still holds — the warm never commits
-	// bytes for a layout this request did not validate, and the inherited
-	// verdict is at most virtualSubtitleLayoutCacheTTL old and keyed by the
-	// pinned provider result and inventory token.
+	// successfully, read a successful probe from the 120 s memo, or served an
+	// evidence-bound ordinal it deliberately did not probe, and it would have
+	// failed closed otherwise. B1 still holds — the warm never commits bytes
+	// for a layout this request did not validate, and the inherited verdict is
+	// at most virtualSubtitleLayoutCacheTTL old and keyed by the pinned
+	// provider result and inventory token.
 	var inheritedLayout *virtualSubtitleLayoutSeed
+	if virtualActive && !driftSuspected && h.virtualSubtitleOrdinalEvidenceBound(r.Context(), file, session) {
+		// The serve skipped its own drift probe because the plan-time evidence
+		// still describes this row and ordinal. That decision is the only
+		// validation available for this identity at this moment, and it is
+		// exactly what the warm's own probe would repeat — on a slow relay the
+		// second ffprobe is what times out while the window it validates is
+		// still reading, so the warm never commits and every window re-demuxes
+		// the source. Record it for the warm the way a probe verdict is
+		// recorded: keyed by the same identity (pinned provider result plus
+		// inventory token, so a rotation changes it), and bounded by the same
+		// TTL as the layout memo (resolveWarmExtractLayout enforces it, so the
+		// trust the warm inherits is never older than the memo's).
+		inheritedLayout = &virtualSubtitleLayoutSeed{
+			cacheIdentity:   opts.CacheIdentity,
+			trackIndex:      opts.TrackIndex,
+			sourceCodec:     opts.SourceCodec,
+			verifiedAt:      time.Now(),
+			trustedEvidence: true,
+		}
+	}
 	if virtualActive && driftSuspected {
 		if artifact, ok := h.resolveCommittedTextSubtitleEntry(&opts); ok {
 			// A committed full-track text artifact pins the plan-time release and
@@ -4146,8 +4185,9 @@ type virtualSubtitleLayoutVerdict struct {
 // established into the detached warm it starts. A warm triggered by a windowed
 // miss normally has to re-probe its own relay registration, but when the serve
 // that triggered it already validated the same identity and ordinal (a fresh
-// probe or the 120 s memo) the warm can inherit that verdict instead of paying
-// a second multi-second ffprobe over a slow remote. The identity is derived
+// probe, the 120 s memo, or an evidence-bound ordinal it deliberately served
+// without probing) the warm can inherit that verdict instead of paying a
+// second multi-second ffprobe over a slow remote. The identity is derived
 // from the pinned provider result and inventory token, so a rotated release
 // changes it and the warm falls back to its own probe.
 type virtualSubtitleLayoutSeed struct {
@@ -4155,6 +4195,12 @@ type virtualSubtitleLayoutSeed struct {
 	trackIndex    int
 	sourceCodec   string
 	verifiedAt    time.Time
+	// trustedEvidence marks a seed whose verdict came from the serve trusting
+	// its plan-time evidence without probing, rather than from a probe it ran.
+	// It is informational only: the warm accepts either kind under the same
+	// identity key and TTL bound, but the distinction is what makes a
+	// surprising warm in the logs attributable.
+	trustedEvidence bool
 }
 
 // virtualSubtitleLayoutKey is the memo key for a plan ordinal. The identity is
@@ -4314,21 +4360,27 @@ func (h *StreamHandler) virtualSubtitleWarmCancelReason(session *playback.Sessio
 //
 // The triggering serve almost always established this exact verdict itself —
 // it either probed the same pinned result and inventory token or reused a
-// probe less than virtualSubtitleLayoutCacheTTL old, and it fails closed
-// otherwise. Inheriting that verdict skips a second multi-second ffprobe over
-// a slow relay; B1 still holds because the verdict is keyed by the same
-// identity (inventory token included) and is at most the memo TTL old,
-// exactly the trust the serve path already grants it. A warm started without
-// an inherited verdict, or whose identity no longer matches, still probes
+// probe less than virtualSubtitleLayoutCacheTTL old, or it deliberately served
+// an evidence-bound ordinal without probing — and it fails closed otherwise.
+// Inheriting that verdict skips a second multi-second ffprobe over a slow
+// relay and, more importantly, the multi-second ffprobe that used to time out
+// against the very window that started the warm. B1 still holds because the
+// verdict is keyed by the same identity (inventory token included) and is at
+// most the memo TTL old, exactly the trust the serve path already grants it: a
+// seed that has aged past the TTL, that names a different identity, or that
+// the serve never recorded (an untrusted or remapped ordinal) still probes
 // below and fails closed on error.
 func (h *StreamHandler) resolveWarmExtractLayout(warmCtx context.Context, file *models.MediaFile, session *playback.Session, track models.SubtitleTrack, planTracks []models.SubtitleTrack, inherited *virtualSubtitleLayoutSeed, extractOpts *playback.StreamExtractOpts) error {
-	if inherited != nil && inherited.cacheIdentity == extractOpts.CacheIdentity {
+	if inherited != nil &&
+		inherited.cacheIdentity == extractOpts.CacheIdentity &&
+		time.Since(inherited.verifiedAt) <= virtualSubtitleLayoutCacheTTL {
 		extractOpts.TrackIndex = inherited.trackIndex
 		extractOpts.SourceCodec = inherited.sourceCodec
 		extractOpts.CacheIdentity = virtualSubtitleCacheIdentity(file, session.VirtualSourceURI, extractOpts.TrackIndex)
 		slog.DebugContext(context.Background(), "virtual subtitle warm inherited serve layout verdict",
 			"component", "api", "file_id", file.ID,
-			"track", extractOpts.TrackIndex, "codec", extractOpts.SourceCodec)
+			"track", extractOpts.TrackIndex, "codec", extractOpts.SourceCodec,
+			"trusted_evidence", inherited.trustedEvidence)
 		return nil
 	}
 	proceed, validateErr := h.verifyVirtualSubtitleLayout(warmCtx, track, planTracks, extractOpts)
