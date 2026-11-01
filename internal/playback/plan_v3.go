@@ -1495,7 +1495,7 @@ func describeToneMapBlockerV3(recipe resolvedToneMapRecipeV3) string {
 // resolveTranscodeVideoTargetV3 selects the transcode video codec and registry
 // for an available transcode route. It returns a terminal when the source or
 // toolchain rules the route out before any recipe is built.
-func resolveTranscodeVideoTargetV3(input PlannerInputV3, source SourceDescriptorV3, subtitle SubtitlePolicyResultV3, subtitleForcedAdaptation bool) (targetVideoSelectionV3, resolvedToneMapRecipeV3, *PlannerResultV3) {
+func resolveTranscodeVideoTargetV3(input PlannerInputV3, source SourceDescriptorV3, subtitle SubtitlePolicyResultV3, subtitleForcedAdaptation bool) (targetVideoSelectionV3, QualityResultV3, resolvedToneMapRecipeV3, *PlannerResultV3) {
 	quality := ResolveQualityPolicyV3(input.Request, source)
 	var hlsRegistry *TransformationRegistryV3
 	toneMapRecipe := resolvedToneMapRecipeV3{}
@@ -1506,18 +1506,18 @@ func resolveTranscodeVideoTargetV3(input PlannerInputV3, source SourceDescriptor
 	if source.DynamicRange != "" && source.DynamicRange != DynamicRangeSDRV3 && !toneMapRecipe.ok {
 		if subtitleForcedAdaptation {
 			result := terminalPlannerResultV3("subtitle_conversion_unsupported", "The selected subtitle must be burned into the video, but this HDR source cannot be re-encoded.", false)
-			return targetVideoSelectionV3{}, toneMapRecipe, &result
+			return targetVideoSelectionV3{}, quality, toneMapRecipe, &result
 		}
 		result := terminalPlannerResultV3WithDetail(TerminalHDRTranscodeUnsupportedV3, "This HDR source requires video encoding, but no validated HDR-preserving or tone-map recipe is installed.", describeToneMapBlockerV3(toneMapRecipe), false)
-		return targetVideoSelectionV3{}, toneMapRecipe, &result
+		return targetVideoSelectionV3{}, quality, toneMapRecipe, &result
 	}
 	if is4KSourceV3(input.EffectiveFile, source) && !input.Settings.Allow4KTranscode {
 		if subtitleForcedAdaptation {
 			result := terminalPlannerResultV3("subtitle_conversion_unsupported", "The selected subtitle must be burned into the video, but 4K transcoding is disabled.", false)
-			return targetVideoSelectionV3{}, toneMapRecipe, &result
+			return targetVideoSelectionV3{}, quality, toneMapRecipe, &result
 		}
 		result := terminalPlannerResultV3("no_alternate_version", TerminalMessage4KTranscodeDisabledV3, false)
-		return targetVideoSelectionV3{}, toneMapRecipe, &result
+		return targetVideoSelectionV3{}, quality, toneMapRecipe, &result
 	}
 	if hlsRegistry == nil {
 		hlsRegistry = input.hlsVideoRegistry()
@@ -1527,10 +1527,10 @@ func resolveTranscodeVideoTargetV3(input PlannerInputV3, source SourceDescriptor
 		// size, so a refusal it acts on beats one it does not.
 		if lowerVersionTakesTranscodeV3(input, source, quality) {
 			result := terminalPlannerResultV3("no_alternate_version", terminalMessageLowerVersionServesV3, false)
-			return targetVideoSelectionV3{}, toneMapRecipe, &result
+			return targetVideoSelectionV3{}, quality, toneMapRecipe, &result
 		}
 		result := terminalPlannerResultV3("conversion_tool_unavailable", "The required validated H.264/AAC conversion toolchain is unavailable.", true)
-		return targetVideoSelectionV3{}, toneMapRecipe, &result
+		return targetVideoSelectionV3{}, quality, toneMapRecipe, &result
 	}
 	// An automatic encode never spends more than the best menu rung of its
 	// class. A conversion at the source's own size starts from the source's
@@ -1562,7 +1562,7 @@ func resolveTranscodeVideoTargetV3(input PlannerInputV3, source SourceDescriptor
 		capBudget := optionalValueV3(input.Request.BandwidthCapKbps) * 95 / 100
 		if capBudget-audioShareKbps(capBudget) < 64 {
 			result := terminalPlannerResultV3(TerminalBitratePolicyUnavailableV3, "The server bitrate limit is too low for a playable video stream.", false)
-			return targetVideoSelectionV3{}, toneMapRecipe, &result
+			return targetVideoSelectionV3{}, quality, toneMapRecipe, &result
 		}
 		budget = minPositiveV3(budget, capBudget)
 	}
@@ -1624,7 +1624,7 @@ func resolveTranscodeVideoTargetV3(input PlannerInputV3, source SourceDescriptor
 	// it if that fails.
 	if lowerVersionTakesTranscodeV3(input, source, quality) {
 		result := terminalPlannerResultV3("no_alternate_version", terminalMessageLowerVersionServesV3, false)
-		return targetVideoSelectionV3{}, toneMapRecipe, &result
+		return targetVideoSelectionV3{}, quality, toneMapRecipe, &result
 	}
 	// The caller owns the base plan; this helper only selects the target and
 	// recipe. Plan construction remains in planVideoTranscodeV3 so source and
@@ -1634,7 +1634,7 @@ func resolveTranscodeVideoTargetV3(input PlannerInputV3, source SourceDescriptor
 			return TransformationVideoToHEVCV3
 		}
 		return TransformationVideoToH264V3
-	}()}, toneMapRecipe, nil
+	}()}, quality, toneMapRecipe, nil
 	/*
 		if source.DynamicRange != "" && source.DynamicRange != DynamicRangeSDRV3 {
 			base.AvailableQualities = availableQualitiesV3(input, source)
@@ -1797,7 +1797,7 @@ func planVideoTranscodeV3(input PlannerInputV3, base PlanV3, source SourceDescri
 	if terminal := planVideoTranscodeUnavailableV3(input, subtitle, subtitleForcedAdaptation, compatibleRouteExcluded); terminal != nil {
 		return *terminal
 	}
-	targetVideo, toneMapRecipe, terminal := resolveTranscodeVideoTargetV3(input, source, subtitle, subtitleForcedAdaptation)
+	targetVideo, quality, toneMapRecipe, terminal := resolveTranscodeVideoTargetV3(input, source, subtitle, subtitleForcedAdaptation)
 	if terminal != nil {
 		return *terminal
 	}
@@ -1805,9 +1805,6 @@ func planVideoTranscodeV3(input PlannerInputV3, base PlanV3, source SourceDescri
 	// flat codec lists can describe source copy support without proving the
 	// fMP4 transcode decoder that will receive this recipe. Fall back to the
 	// H.264 floor when either fails.
-	if targetVideo.codec != TargetVideoCodecHEVCV3 {
-		quality = h264BoundedQualityV3(input.Request, quality, source)
-	}
 	if targetVideo.codec == TargetVideoCodecHEVCV3 &&
 		(!input.Settings.AllowHEVCEncoding || !hlsHEVCOutputSupportedV3(input.Request, quality, source)) {
 		targetVideo = targetVideoFloorV3
