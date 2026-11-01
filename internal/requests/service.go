@@ -96,23 +96,27 @@ type SeriesSeasonProvider interface {
 }
 
 type Service struct {
-	store             Store
-	tmdb              TMDBClient
-	animeIndex        AnimeIndex
-	presence          PresenceResolver
-	router            RequestRouterProvider
-	entitlements      EntitlementResolver
-	groupProvider     access.GroupPolicyProvider
-	users             access.UserRepository
-	requesterIdentity RequesterIdentityResolver
-	tvdbResolver      TVDBIDResolver
-	notifier          FulfillmentNotifier
-	lifecycle         LifecycleNotifier
-	watchlistPref     WatchlistPreference
-	titleObserver     TitleObserver
-	discoverSnapshots DiscoverSnapshots
-	discoverRefresher DiscoverListRefresher
-	Now               func() time.Time
+	store                   Store
+	tmdb                    TMDBClient
+	animeIndex              AnimeIndex
+	presence                PresenceResolver
+	router                  RequestRouterProvider
+	entitlements            EntitlementResolver
+	groupProvider           access.GroupPolicyProvider
+	users                   access.UserRepository
+	requesterIdentity       RequesterIdentityResolver
+	tvdbResolver            TVDBIDResolver
+	seriesSeasonProvider    SeriesSeasonProvider
+	hasDefaultVirtualRouter func() bool
+	catalogChanged          func()
+	cleanupVirtual          func(context.Context, Request) error
+	notifier                FulfillmentNotifier
+	lifecycle               LifecycleNotifier
+	watchlistPref           WatchlistPreference
+	titleObserver           TitleObserver
+	discoverSnapshots       DiscoverSnapshots
+	discoverRefresher       DiscoverListRefresher
+	Now                     func() time.Time
 }
 
 type DiscoverySection struct {

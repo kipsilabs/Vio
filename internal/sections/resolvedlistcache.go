@@ -117,6 +117,9 @@ var (
 	resolvedListRefreshMu  sync.Mutex
 	resolvedListRefreshing = make(map[string]struct{})
 	resolvedListGeneration atomic.Uint64
+	resolvedListPurgeEpoch atomic.Uint64
+	purgeReconcileMu       sync.Mutex
+	lastSeenPurgeRevision  atomic.Int64
 	// resolvedListEvictionEpoch advances on every item eviction. A rebuild
 	// records it before loading and installs its result only if no eviction
 	// ran meanwhile, so a load that read an item before an admin edit cannot

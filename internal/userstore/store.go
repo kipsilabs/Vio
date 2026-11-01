@@ -92,6 +92,7 @@ type AuditedProfileDeleter interface { //nolint:iface // implemented by pgstore,
 // UserStore defines the interface for per-user data storage.
 // Both SQLite and Postgres backends implement this interface.
 type UserStore interface {
+	VerifyPIN(ctx context.Context, profileID, pin string) (bool, error)
 	// Profiles
 	CreateProfile(ctx context.Context, p Profile) error
 	GetProfile(ctx context.Context, id string) (*Profile, error)
