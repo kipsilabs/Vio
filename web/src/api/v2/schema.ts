@@ -5961,23 +5961,6 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
-  "/api/v2/admin/virtual-items": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    /** List zero-storage virtual library items with candidate health. */
-    get: operations["listAdminVirtualItems"];
-    put?: never;
-    post?: never;
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
   "/api/v2/api-keys": {
     parameters: {
       query?: never;
@@ -6414,7 +6397,7 @@ export interface paths {
     put?: never;
     /**
      * Redeem the one-time code an OAuth callback issued for the token pair.
-     * @description A code is valid for 60 seconds and redeems once. The login session opens at redemption, so a code that is never redeemed leaves no session. Redeeming a used code again revokes the session its redemption opened. A native code needs the code_verifier of its S256 challenge. A web code takes none and redeems only in the browser the callback answered, which holds the vio_oauth_complete cookie, so a code passed to another browser cannot sign that browser in.
+     * @description A code is valid for 60 seconds and redeems once. The login session opens at redemption, so a code that is never redeemed leaves no session. Redeeming a used code again revokes the session its redemption opened. A native code needs the code_verifier of its S256 challenge. A web code takes none and redeems only in the browser the callback answered, which holds the silo_oauth_complete cookie, so a code passed to another browser cannot sign that browser in.
      */
     post: operations["completeOAuthLogin"];
     delete?: never;
@@ -6683,40 +6666,6 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
-  "/api/v2/capabilities/episode-release": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    /** Whether episode rows and details expose release timing (the v2 Episode release_state member). */
-    get: operations["getEpisodeReleaseCapability"];
-    put?: never;
-    post?: never;
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
-  "/api/v2/capabilities/item-collections": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    /** Whether item detail carries the collections an item belongs to. */
-    get: operations["getItemCollectionsCapability"];
-    put?: never;
-    post?: never;
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
   "/api/v2/capabilities/metadata-ai": {
     parameters: {
       query?: never;
@@ -6811,23 +6760,6 @@ export interface paths {
     };
     /** Whether this server offers the viewer-facing trailer fetch, its cooldown, and the statuses the action answers. */
     get: operations["getTrailersCapability"];
-    put?: never;
-    post?: never;
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
-  "/api/v2/capabilities/virtual-library": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    /** Discover whether indexer search and provider release requests are available. */
-    get: operations["getVirtualLibraryCapabilities"];
     put?: never;
     post?: never;
     delete?: never;
@@ -7996,8 +7928,7 @@ export interface paths {
       path?: never;
       cookie?: never;
     };
-    /** Read one device-managed download, or one of the account's ephemeral downloads. */
-    get: operations["getDownload"];
+    get?: never;
     put?: never;
     post?: never;
     /** Remove a managed download or cancel an ephemeral transfer. */
@@ -9295,74 +9226,6 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
-  "/api/v2/media/{media_id}/virtual-candidates:discover": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    get?: never;
-    put?: never;
-    /** Discover and persist cached provider versions before playback when enabled, without probing or requesting releases. */
-    post: operations["discoverVirtualCandidates"];
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
-  "/api/v2/media/{media_id}/virtual-candidates:refresh": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    get?: never;
-    put?: never;
-    /** Queue an asynchronous provider re-list of a virtual item's version candidates and answer the job to wait on. */
-    post: operations["refreshVirtualCandidates"];
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
-  "/api/v2/media/{media_id}/virtual-candidates:refresh/cancel": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    get?: never;
-    put?: never;
-    /** Cancel the caller's in-flight refresh of a virtual item's version candidates. Cancellation is non-destructive to already-persisted candidates and leaves the automatic re-listing intervals untouched. */
-    post: operations["cancelVirtualCandidatesRefresh"];
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
-  "/api/v2/media/{media_id}/virtual-releases/{release_id}:request": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    get?: never;
-    put?: never;
-    /** Request a release that exists on the indexers on the provider. The stored download URL is used server-side and is never returned. */
-    post: operations["requestVirtualRelease"];
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
   "/api/v2/network-access/capabilities": {
     parameters: {
       query?: never;
@@ -10118,23 +9981,6 @@ export interface paths {
     post?: never;
     /** Stop the session with a client-minted stop id and an optional final sample. Every later stop for the session replays the stored receipt. */
     delete: operations["stopPlayback"];
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
-  "/api/v2/playback/{session_id}/inventory": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    /** Retrieve the live audio and subtitle track inventory for an active playback session without restarting playback. */
-    get: operations["getPlaybackInventory"];
-    put?: never;
-    post?: never;
-    delete?: never;
     options?: never;
     head?: never;
     patch?: never;
@@ -16404,17 +16250,17 @@ export interface components {
        * @description Opaque identifier
        * @example 1
        */
+      silo_profile_id: string;
+      /**
+       * @description Opaque identifier
+       * @example 1
+       */
+      silo_user_id: string;
+      /**
+       * @description Opaque identifier
+       * @example 1
+       */
       source_id: string;
-      /**
-       * @description Opaque identifier
-       * @example 1
-       */
-      vio_profile_id: string;
-      /**
-       * @description Opaque identifier
-       * @example 1
-       */
-      vio_user_id: string;
     };
     AdminHistoryImportMappingCreateInputBody: {
       external_user_id: string;
@@ -16423,29 +16269,29 @@ export interface components {
        * @description Opaque identifier
        * @example 1
        */
+      silo_profile_id: string;
+      /**
+       * @description Opaque identifier
+       * @example 1
+       */
+      silo_user_id: string;
+      /**
+       * @description Opaque identifier
+       * @example 1
+       */
       source_id: string;
-      /**
-       * @description Opaque identifier
-       * @example 1
-       */
-      vio_profile_id: string;
-      /**
-       * @description Opaque identifier
-       * @example 1
-       */
-      vio_user_id: string;
     };
     AdminHistoryImportMappingUpdateInputBody: {
       /**
        * @description Opaque identifier
        * @example 1
        */
-      vio_profile_id?: string;
+      silo_profile_id?: string;
       /**
        * @description Opaque identifier
        * @example 1
        */
-      vio_user_id?: string;
+      silo_user_id?: string;
     };
     AdminHistoryImportPlexLoginInputBody: {
       password: string;
@@ -16627,10 +16473,6 @@ export interface components {
       /** @description An original_url from this item's image list, sent back unchanged; not validated as a URI */
       original_url: string;
       provider_id?: string;
-      /**
-       * @description One of poster, backdrop, logo, still, or titlecard. still and titlecard name the same episode title card and are accepted only for an episode; a movie, series, or season is refused with 400 unsupported_image_type. An episode stores any applied image as its still.
-       * @example poster
-       */
       type: string;
     };
     AdminImagesPage: {
@@ -17396,8 +17238,6 @@ export interface components {
       title: string;
       /** Format: uri */
       url: string;
-      /** @description Keep items matched outside the selected libraries as zero-storage virtual entries. Defaults to on when omitted; send false to disable. */
-      virtual_playback?: boolean;
     };
     AdminMergeInputBody: {
       into: string;
@@ -18390,7 +18230,7 @@ export interface components {
       repository_name: string;
       routes: components["schemas"]["PluginRoute"][];
       /** @enum {string} */
-      source_kind: "silo" | "vio" | "approved_community" | "external";
+      source_kind: "silo" | "approved_community" | "external";
       user_config_schema: components["schemas"]["AdminPluginConfigSchema"][];
       version: string;
     };
@@ -18529,7 +18369,7 @@ export interface components {
       routes: components["schemas"]["PluginRoute"][];
       runtime: components["schemas"]["AdminPluginRuntime"];
       /** @enum {string} */
-      source_kind: "silo" | "vio" | "approved_community" | "external";
+      source_kind: "silo" | "approved_community" | "external";
       task_bindings: components["schemas"]["AdminPluginTaskBinding"][];
       update_policy: string;
       /**
@@ -20416,7 +20256,6 @@ export interface components {
        */
       finished_at?: string;
       id: string;
-      indexer_releases?: components["schemas"]["WatchIndexerRelease"][];
       item_result?: components["schemas"]["AdminTaskJobItemResult"];
       kind: string;
       /**
@@ -20663,8 +20502,6 @@ export interface components {
       dry_run?: boolean;
       featured?: components["schemas"]["AdminTemplateFeatured"];
       library_ids: string[];
-      /** @description Keep items matched outside the selected libraries as zero-storage virtual entries. Defaults to on when omitted; send false to disable. */
-      virtual_playback?: boolean;
     };
     AdminTemplateCollectionEntry: {
       /**
@@ -20771,8 +20608,6 @@ export interface components {
       sync_schedule?: string;
       time_window?: string;
       title: string;
-      /** @description Keep items matched outside the selected libraries as zero-storage virtual entries. Defaults to on when omitted; send false to disable. */
-      virtual_playback?: boolean;
     };
     AdminTMDBListImport: {
       description?: string;
@@ -21681,29 +21516,6 @@ export interface components {
       passthrough: boolean;
       reason?: string;
     };
-    AudioInventoryItemV3: {
-      /** Format: int64 */
-      bit_depth?: number;
-      /** Format: int64 */
-      bitrate?: number;
-      /** Format: int64 */
-      channels?: number;
-      codec?: string;
-      default: boolean;
-      embedded_title?: string;
-      /** Format: int64 */
-      index?: number;
-      language?: string;
-      languages?: string[];
-      layout?: string;
-      profile?: string;
-      /** Format: int64 */
-      sample_rate?: number;
-      /** Format: int64 */
-      selection_index: number;
-      title?: string;
-      track_id: string;
-    };
     AudioPassthroughEntryV3: {
       channel_counts?: number[];
       codec: string;
@@ -21774,7 +21586,6 @@ export interface components {
       embedded_title?: string;
       /** @description Track language from the file: BCP 47 tag, ISO 639-1 where one exists (en, pt-BR); und when the file marks it undetermined. Older scans may carry an ISO 639-2 code or the file's raw tag */
       language?: string;
-      languages?: string[];
       layout?: string;
       profile?: string;
       /** Format: int64 */
@@ -21854,7 +21665,7 @@ export interface components {
       default: boolean;
       /**
        * @description Label for the sign-in button
-       * @example Vio account
+       * @example Silo account
        */
       display_name: string;
       /**
@@ -22383,8 +22194,6 @@ export interface components {
        * @description Presigned, short-lived. Transparent cut-out art. Movies and series only
        */
       clearart_url?: string;
-      /** @description Visible collections containing this item (movies and series); empty, never null */
-      collections: components["schemas"]["ItemCollection"][];
       /**
        * @description Deterministic catalog identifier
        * @example movie:heat-1995
@@ -22430,7 +22239,6 @@ export interface components {
       folder_paths?: string[];
       /** @description Empty, never null */
       genres: string[];
-      has_virtual_source?: boolean;
       imdb_id?: string;
       intro?: components["schemas"]["Marker"];
       is_specials?: boolean;
@@ -22521,11 +22329,6 @@ export interface components {
        * @example 1995-12-15
        */
       release_date?: string;
-      /**
-       * @description Episode release timing derived from air_date: upcoming when the calendar date is after today (UTC), released otherwise; absent when the air date is unknown or the item is not an episode
-       * @enum {string}
-       */
-      release_state?: "upcoming" | "released";
       /**
        * Format: int64
        * @description Minutes
@@ -23887,7 +23690,6 @@ export interface components {
       logo_url?: string;
       /** @description Stored artwork reference (storage key, plugin path, or URL), not a fetchable URL; not validated as a URI */
       poster_url?: string;
-      still_url?: string;
     };
     DecideDeviceLoginInputBody: {
       /**
@@ -23924,14 +23726,6 @@ export interface components {
       transformations: components["schemas"]["TransformationV3"][];
       validated_claims: string[];
       video_codecs: string[];
-    };
-    DeliveryChange: {
-      delivery?: string;
-      delivery_changed?: boolean;
-      play_method?: string;
-      play_method_changed?: boolean;
-      previous_delivery?: string;
-      previous_play_method?: string;
     };
     DeliverySubtitleCapabilitiesV3: {
       ass_styling: boolean;
@@ -24329,7 +24123,7 @@ export interface components {
       slug: string;
       /**
        * Format: int64
-       * @description TMDB identifier (external, not a Vio ID)
+       * @description TMDB identifier (external, not a Silo ID)
        * @example 420
        */
       tmdb_id?: number;
@@ -25235,11 +25029,6 @@ export interface components {
       /** @description The episode's IMDb and TMDB ratings, in the shape a title page's ratings use. Absent when the episode has no rating. */
       ratings?: components["schemas"]["CatalogRating"][];
       /**
-       * @description Release timing derived from air_date: upcoming when the calendar date is after today (UTC), released otherwise; absent when the air date is unknown
-       * @enum {string}
-       */
-      release_state?: "upcoming" | "released";
-      /**
        * Format: int64
        * @description Minutes
        */
@@ -25281,17 +25070,6 @@ export interface components {
       resolution?: string;
       /** @description Present and true when the server could not read the file (empty, corrupt, or truncated). Playback of it falls back to another version of the episode the viewer may play; if no such version is available, playback returns the terminal reason source_unreadable until the file is replaced and a scan reads it successfully. */
       unreadable?: boolean;
-    };
-    EpisodeReleaseCapability: {
-      /** @description Whether the current principal may use the capability */
-      allowed: boolean;
-      /** @description Opaque revision of this document */
-      revision: string;
-      /**
-       * @description Support and configuration state, not health
-       * @enum {string}
-       */
-      state: "available" | "disabled" | "not_configured" | "unsupported";
     };
     EventsCapabilities: {
       /** @description Whether the current principal may use the capability */
@@ -25484,7 +25262,6 @@ export interface components {
        */
       added_at: string;
       audio_tracks?: components["schemas"]["AudioTrack"][];
-      available?: boolean;
       /**
        * Format: int64
        * @description Kilobits per second
@@ -25509,7 +25286,6 @@ export interface components {
       effective_audio_language?: string;
       /** Format: int64 */
       effective_audio_track_index?: number;
-      failed?: boolean;
       /**
        * @description Opaque identifier
        * @example 120
@@ -25536,15 +25312,9 @@ export interface components {
       /** Format: int64 */
       presentation_part_total?: number;
       preview?: components["schemas"]["Marker"];
-      /**
-       * Format: date-time
-       * @description RFC 3339 instant in UTC with millisecond precision
-       */
-      probed_at?: string;
       recap?: components["schemas"]["Marker"];
       /** @example 2160p */
       resolution: string;
-      source_mismatch?: components["schemas"]["VersionSourceMismatch"];
       subtitle_tracks?: components["schemas"]["VersionSubtitleTrack"][];
       video_tracks?: components["schemas"]["VideoTrack"][];
     };
@@ -26262,31 +26032,6 @@ export interface components {
       note: string;
       server_name: string;
       show_tour: boolean;
-    };
-    ItemCollection: {
-      /** @example 01J9Z8C3W4R5T6Y7U8I9O0P1Q2 */
-      id: string;
-      /**
-       * Format: int64
-       * @example 3
-       */
-      item_count: number;
-      poster_thumbhash?: string;
-      /** @description Presigned, short-lived; empty when none */
-      poster_url: string;
-      /** @example Dune Saga */
-      title: string;
-    };
-    ItemCollectionsCapability: {
-      /** @description Whether the current principal may use the capability */
-      allowed: boolean;
-      /** @description Opaque revision of this document */
-      revision: string;
-      /**
-       * @description Support and configuration state, not health
-       * @enum {string}
-       */
-      state: "available" | "disabled" | "not_configured" | "unsupported";
     };
     ItemExtraInfo: {
       content_id: string;
@@ -27519,13 +27264,13 @@ export interface components {
       title: string;
       /**
        * Format: int64
-       * @description TMDB identifier (external, not a Vio ID)
+       * @description TMDB identifier (external, not a Silo ID)
        * @example 949
        */
       tmdb_id: number;
       /**
        * Format: int64
-       * @description TVDB identifier (external, not a Vio ID)
+       * @description TVDB identifier (external, not a Silo ID)
        */
       tvdb_id?: number;
       /**
@@ -27560,12 +27305,6 @@ export interface components {
       /** @description TMDB image path */
       poster_path?: string;
       /**
-       * @description Series only: use TVDB or TMDB season numbering. Omitted: the server prefers TVDB
-       * @example tvdb
-       * @enum {string}
-       */
-      season_source?: "tvdb" | "tmdb";
-      /**
        * @description Series only: the season numbers to request, starting at 1 (a season below 1 is refused). Omitted: every aired season not yet complete in the library
        * @example [
        *       2,
@@ -27577,13 +27316,13 @@ export interface components {
       title: string;
       /**
        * Format: int64
-       * @description TMDB identifier (external, not a Vio ID)
+       * @description TMDB identifier (external, not a Silo ID)
        * @example 949
        */
       tmdb_id: number;
       /**
        * Format: int64
-       * @description TVDB identifier (external, not a Vio ID)
+       * @description TVDB identifier (external, not a Silo ID)
        */
       tvdb_id?: number;
       /**
@@ -28297,7 +28036,6 @@ export interface components {
       notify_continue_watching?: boolean;
       notify_favorites?: boolean;
       notify_next_up?: boolean;
-      notify_ratings?: boolean;
       notify_requests?: boolean;
       notify_watchlist?: boolean;
       /** @enum {string} */
@@ -28334,7 +28072,6 @@ export interface components {
       notify_continue_watching: boolean;
       notify_favorites: boolean;
       notify_next_up: boolean;
-      notify_ratings: boolean;
       notify_requests: boolean;
       notify_watchlist: boolean;
       /** @enum {string} */
@@ -28350,7 +28087,6 @@ export interface components {
       notify_continue_watching?: boolean;
       notify_favorites?: boolean;
       notify_next_up?: boolean;
-      notify_ratings?: boolean;
       notify_requests?: boolean;
       notify_watchlist?: boolean;
       /** Format: uri */
@@ -29222,7 +28958,6 @@ export interface components {
       /** @description The available_qualities label this plan delivers, so a client can mark that menu entry: the label quality_preference named while the menu lists it and the encode keeps its resolution, otherwise the rung whose resolution class and bitrate the encode matches. Absent when the plan delivers no listed entry, such as the source played unchanged or a plain-resolution or auto request whose capped encode falls between two rungs. Present on servers that advertise plan_active_quality_v1. */
       active_quality?: string;
       applied_quirks: components["schemas"]["AppliedQuirkV3"][];
-      audio_tracks?: components["schemas"]["AudioInventoryItemV3"][];
       /** @description Fixed quality rungs a quality_change replan may request, in menu order. The source is not listed: quality_preference auto returns to it. Empty when no rung applies. */
       available_qualities: components["schemas"]["AvailableQualityV3"][];
       bandwidth_limit?: components["schemas"]["PlaybackBandwidthLimit"];
@@ -29230,16 +28965,13 @@ export interface components {
       decision_reason: string;
       degradation_warnings: components["schemas"]["DegradationWarningV3"][];
       delivery: string;
-      delivery_change?: components["schemas"]["DeliveryChange"];
       /**
        * @description Opaque identifier
        * @example 1
        */
       effective_media_file_id: string;
       effective_recipe: components["schemas"]["EffectiveRecipeV3"];
-      effective_virtual_uri?: string;
       expires_at?: string;
-      inventory_url?: string;
       plan_attempt_key: string;
       plan_id: string;
       /** Format: int64 */
@@ -29257,9 +28989,7 @@ export interface components {
       subtitle: components["schemas"]["SubtitleDecisionV3"];
       subtitle_fidelity_policy: string;
       timeline: components["schemas"]["TimelineV3"];
-      tracks_pending?: boolean;
       transformations: components["schemas"]["TransformationV3"][];
-      virtual_source_revision?: string;
     };
     PlaybackPlanSummary: {
       diagnostics: {
@@ -29314,13 +29044,9 @@ export interface components {
       sequence: number;
     };
     PlaybackReplanBody: {
-      /** @description Echoes the reason from the plan_invalidated command this replan answers. Correlates a client that negotiated default_audio_reconcile_response_v1's response with the server's own withdrawal; omitting it on such a replan leaves the viewer's selection in place. Not trust-sensitive: at worst it names a correction the server already decided and announced. */
-      answers_plan_invalidation?: string;
       /** Format: int64 */
       attempt_count: number;
       attempted_plan_keys: string[];
-      /** @description Re-negotiates the session's version-fallback intent. Set true when the viewer re-arms Auto mid-session; omitted leaves the start-time intent unchanged. Never authorizes a healthy mid-play switch. */
-      auto_fallback?: boolean;
       /** Format: int64 */
       bandwidth_cap_kbps?: number;
       /**
@@ -29461,17 +29187,17 @@ export interface components {
       client_ip: string;
       /**
        * @description Display label derived from the client name and version; empty when unknown
-       * @example Vio for Apple TV 1.4
+       * @example Silo for Apple TV 1.4
        */
       client_label: string;
       /**
        * @description Display label with the exact build; empty when unknown
-       * @example Vio for Apple TV 1.4.0 (1400)
+       * @example Silo for Apple TV 1.4.0 (1400)
        */
       client_label_full: string;
       /**
        * @description Empty when unknown
-       * @example Vio for Apple TV
+       * @example Silo for Apple TV
        */
       client_name: string;
       /**
@@ -29820,9 +29546,6 @@ export interface components {
        * @example 1
        */
       file_id: string;
-      /** @enum {string} */
-      file_selection?: "auto" | "explicit";
-      force_relink?: boolean;
       /**
        * @description Opaque identifier
        * @example 1
@@ -29841,8 +29564,6 @@ export interface components {
        */
       observed_throughput_kbps?: number;
       playback_attempt_id: string;
-      /** @description The attempt whose explicit audio and subtitle selections this restart should carry when the request names neither. Omit it for legacy client-identity carry. */
-      previous_playback_attempt_id?: string;
       /**
        * @description Opaque identifier
        * @example 1
@@ -31245,12 +30966,7 @@ export interface components {
        * @example 170
        */
       runtime?: number;
-      /**
-       * @description Series: the metadata provider that supplied the season list: tvdb or tmdb
-       * @example tvdb
-       */
-      season_source?: string;
-      /** @description Series: the regular seasons (specials excluded) from the series metadata provider, with library availability and request coverage; empty for movies */
+      /** @description Series: the regular seasons (specials excluded) with library availability and request coverage; empty for movies */
       seasons: components["schemas"]["RequestMediaSeason"][];
       /**
        * @description TMDB release status
@@ -31262,13 +30978,13 @@ export interface components {
       title: string;
       /**
        * Format: int64
-       * @description TMDB identifier (external, not a Vio ID)
+       * @description TMDB identifier (external, not a Silo ID)
        * @example 949
        */
       tmdb_id: number;
       /**
        * Format: int64
-       * @description TVDB identifier (external, not a Vio ID)
+       * @description TVDB identifier (external, not a Silo ID)
        */
       tvdb_id?: number;
       /** Format: double */
@@ -31342,7 +31058,7 @@ export interface components {
       title: string;
       /**
        * Format: int64
-       * @description TMDB identifier (external, not a Vio ID)
+       * @description TMDB identifier (external, not a Silo ID)
        * @example 949
        */
       tmdb_id: number;
@@ -31369,16 +31085,14 @@ export interface components {
       availability: "missing" | "partial" | "available";
       /**
        * Format: int64
-       * @description Episodes the series metadata provider lists for the season, aired or not
+       * @description Episodes TMDB lists for the season, aired or not
        * @example 10
        */
       episode_count: number;
       /** @example Season 2 */
       name?: string;
-      /** @description TMDB image path, when available */
+      /** @description TMDB image path */
       poster_path?: string;
-      /** @description Absolute artwork URL when the series metadata provider supplies one */
-      poster_url?: string;
       /** @description The title's active request covers this season */
       requested: boolean;
       /**
@@ -33151,7 +32865,6 @@ export interface components {
       item_ids: string[];
     };
     TerminalV3: {
-      detail?: string;
       message: string;
       reason: string;
       retryable: boolean;
@@ -33595,18 +33308,6 @@ export interface components {
       thumbnail_url?: string;
       title: string;
     };
-    VersionSourceMismatch: {
-      /**
-       * Format: int64
-       * @example 8449999999
-       */
-      declared_bytes: number;
-      /**
-       * Format: int64
-       * @example 7427636945
-       */
-      served_bytes: number;
-    };
     VersionSubtitleTrack: {
       codec?: string;
       default: boolean;
@@ -33619,7 +33320,6 @@ export interface components {
       index?: number;
       /** @description Track language from the file: BCP 47 tag, ISO 639-1 where one exists (en, pt-BR); und when the file marks it undetermined. Older scans may carry an ISO 639-2 code or the file's raw tag; an external track's comes from its file name */
       language?: string;
-      path_key?: string;
       resolution?: string;
       title?: string;
     };
@@ -33687,32 +33387,6 @@ export interface components {
       /** Format: int64 */
       width?: number;
     };
-    VirtualLibraryCapabilities: {
-      /** @description Whether the current principal may use the capability */
-      allowed: boolean;
-      discover_before_playback: boolean;
-      indexer_request: boolean;
-      indexer_search: boolean;
-      refresh_prunes_dead_candidates: boolean;
-      /** @description Opaque revision of this document */
-      revision: string;
-      /**
-       * @description Support and configuration state, not health
-       * @enum {string}
-       */
-      state: "available" | "disabled" | "not_configured" | "unsupported";
-      wait_for_imports: boolean;
-    };
-    VirtualReleaseRequest: {
-      message?: string;
-      /**
-       * @description Opaque identifier
-       * @example 1
-       */
-      release_id: string;
-      /** @enum {string} */
-      state: "queued" | "failed";
-    };
     WatchAudioTrack: {
       /** Format: int64 */
       bit_depth?: number;
@@ -33772,9 +33446,6 @@ export interface components {
       effective_version_resolution?: string;
       /** Format: int64 */
       episode_number?: number;
-      has_virtual_source?: boolean;
-      /** @description Releases that exist on the indexers but are not downloaded on the provider; empty, never null */
-      indexer_releases: components["schemas"]["WatchIndexerRelease"][];
       intro?: components["schemas"]["WatchMarker"];
       overview?: string;
       /** @description Logical watch choices, each spanning one or more ordered parts */
@@ -33805,8 +33476,6 @@ export interface components {
       user_data?: components["schemas"]["WatchUserData"];
       /** @description Every playable file of the item; empty, never null */
       versions: components["schemas"]["WatchFileVersion"][];
-      /** @description The ranking that produced the virtual versions' order; absent for local content */
-      virtual_ranking?: components["schemas"]["WatchVirtualRanking"];
       /**
        * Format: int64
        * @example 1995
@@ -33821,7 +33490,6 @@ export interface components {
        */
       added_at: string;
       audio_tracks?: components["schemas"]["WatchAudioTrack"][];
-      available?: boolean;
       /**
        * Format: int64
        * @description Bits per second
@@ -33846,7 +33514,6 @@ export interface components {
       effective_audio_language?: string;
       /** Format: int64 */
       effective_audio_track_index?: number;
-      failed?: boolean;
       /**
        * @description Opaque identifier
        * @example 42
@@ -33860,17 +33527,10 @@ export interface components {
        * @description Bytes
        */
       file_size: number;
-      /**
-       * Format: int64
-       * @description Custom-format score the virtual ranking assigned this candidate; absent when the row is unscored (local files, no ranking)
-       */
-      format_score?: number;
       hdr: boolean;
       intro?: components["schemas"]["WatchMarker"];
       /** @description All effective marker occurrences for this file in source-time order; empty, never null */
       marker_segments: components["schemas"]["MarkerOccurrence"][];
-      /** @description Names of the enabled, non-rejecting custom formats the ranking matched on this candidate, best score first, then name; absent when the row is unscored or matched none */
-      matched_formats?: string[];
       /** Format: int64 */
       multi_episode_end?: number;
       /** Format: int64 */
@@ -33882,51 +33542,13 @@ export interface components {
       /** Format: int64 */
       presentation_part_total?: number;
       preview?: components["schemas"]["WatchMarker"];
-      /**
-       * Format: date-time
-       * @description RFC 3339 instant in UTC with millisecond precision
-       */
-      probed_at?: string;
       recap?: components["schemas"]["WatchMarker"];
       /** @example 1080p */
       resolution: string;
-      source_mismatch?: components["schemas"]["VersionSourceMismatch"];
       subtitle_tracks?: components["schemas"]["WatchSubtitleTrack"][];
       /** @description Whether seek-bar previews are published for this file; read them with getWatchTrickplay */
       trickplay_available: boolean;
       video_tracks?: components["schemas"]["WatchVideoTrack"][];
-    };
-    WatchIndexerRelease: {
-      codec_audio?: string;
-      codec_video?: string;
-      /**
-       * @description Whether the release has been requested on the provider
-       * @enum {string}
-       */
-      download_state: "not_downloaded" | "queued" | "failed";
-      /**
-       * Format: int64
-       * @description Custom-format score the ranking assigned; absent when unscored
-       */
-      format_score?: number;
-      hdr?: boolean;
-      indexer?: string;
-      /** @description usenet or torrent */
-      protocol?: string;
-      /**
-       * Format: date-time
-       * @description When the indexer published the release
-       */
-      published_at?: string;
-      /** @description Opaque server id used to request this release */
-      release_id: string;
-      resolution?: string;
-      /**
-       * Format: int64
-       * @description Bytes
-       */
-      size_bytes?: number;
-      title: string;
     };
     WatchlistCollection: {
       /** @description The page's items; empty, never null */
@@ -34069,8 +33691,6 @@ export interface components {
       /** Format: int64 */
       total_duration_seconds?: number;
       variant_id: string;
-      /** @description The ranking that produced this variant's version order; absent for local content */
-      virtual_ranking?: components["schemas"]["WatchVirtualRanking"];
     };
     WatchPlaybackVariantPart: {
       /**
@@ -34346,19 +33966,6 @@ export interface components {
       /** Format: int64 */
       watched_count: number;
     };
-    WatchSortCriterion: {
-      /**
-       * @description The candidate attribute the key orders
-       * @example score
-       */
-      attribute: string;
-      /**
-       * @description desc for a largest-first numeric key, asc for a best-first ordinal key
-       * @example desc
-       * @enum {string}
-       */
-      direction: "asc" | "desc";
-    };
     WatchSubtitle: {
       codec?: string;
       forced: boolean;
@@ -34399,7 +34006,6 @@ export interface components {
        * @example en
        */
       language?: string;
-      path_key?: string;
       resolution?: string;
       title?: string;
     };
@@ -35250,20 +34856,6 @@ export interface components {
       /** Format: int64 */
       width?: number;
     };
-    WatchVirtualRanking: {
-      /** @description Ordered ranking keys, top-down; empty, never null */
-      criteria: components["schemas"]["WatchSortCriterion"][];
-      /**
-       * @description The quality profile label that produced the ranking; absent for the built-in default order
-       * @example 4K HDR
-       */
-      profile_label?: string;
-      /**
-       * @description profile when a configured profile's selector drove the order, default for the built-in order
-       * @enum {string}
-       */
-      source: "profile" | "default";
-    };
     WebhookConnection: {
       account_discovery_available: boolean;
       /**
@@ -35392,15 +34984,15 @@ export interface components {
        */
       last_seen_at: string;
       /**
+       * @description Opaque identifier
+       * @example 1
+       */
+      silo_profile_id?: string;
+      /**
        * Format: date-time
        * @description RFC 3339 instant in UTC with millisecond precision
        */
       updated_at: string;
-      /**
-       * @description Opaque identifier
-       * @example 1
-       */
-      vio_profile_id?: string;
     };
     WebhookMappingsInputBody: {
       mappings: components["schemas"]["WebhookMappingUpdate"][];
@@ -35413,7 +35005,7 @@ export interface components {
     WebhookMappingUpdate: {
       external_user_id: string;
       external_user_name: string;
-      vio_profile_id: string | null;
+      silo_profile_id: string | null;
     };
     WebhookReceiverCapabilitiesOutputBody: {
       /** @description Whether the current principal may use the capability */
@@ -40627,7 +40219,7 @@ export interface operations {
         cursor?: string;
         limit?: number;
         q?: string;
-        status?: "" | "accepted" | "running" | "completed" | "failed" | "canceled" | "cancelled";
+        status?: "" | "accepted" | "running" | "completed" | "failed" | "cancelled";
       };
       header?: {
         /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
@@ -67310,7 +66902,7 @@ export interface operations {
       /** @description No Content */
       204: {
         headers: {
-          "X-Vio-Restart-Required"?: string;
+          "X-Silo-Restart-Required"?: string;
           [name: string]: unknown;
         };
         content?: never;
@@ -79289,7 +78881,7 @@ export interface operations {
       409: {
         headers: {
           /** @description On a stale refusal, the session's latest applied sequence as a decimal integer; allocate a new command above it. Absent on other conflicts. */
-          "X-Vio-Latest-Sequence"?: string;
+          "X-Silo-Latest-Sequence"?: string;
           [name: string]: unknown;
         };
         content: {
@@ -79448,7 +79040,7 @@ export interface operations {
       409: {
         headers: {
           /** @description On a stale refusal, the session's latest applied sequence as a decimal integer; allocate a new command above it. Absent on other conflicts. */
-          "X-Vio-Latest-Sequence"?: string;
+          "X-Silo-Latest-Sequence"?: string;
           [name: string]: unknown;
         };
         content: {
@@ -79607,7 +79199,7 @@ export interface operations {
       409: {
         headers: {
           /** @description On a stale refusal, the session's latest applied sequence as a decimal integer; allocate a new command above it. Absent on other conflicts. */
-          "X-Vio-Latest-Sequence"?: string;
+          "X-Silo-Latest-Sequence"?: string;
           [name: string]: unknown;
         };
         content: {
@@ -79766,7 +79358,7 @@ export interface operations {
       409: {
         headers: {
           /** @description On a stale refusal, the session's latest applied sequence as a decimal integer; allocate a new command above it. Absent on other conflicts. */
-          "X-Vio-Latest-Sequence"?: string;
+          "X-Silo-Latest-Sequence"?: string;
           [name: string]: unknown;
         };
         content: {
@@ -89267,115 +88859,6 @@ export interface operations {
       };
     };
   };
-  listAdminVirtualItems: {
-    parameters: {
-      query?: {
-        /** @description Maximum virtual items to return; default 100, maximum 500 */
-        limit?: number;
-      };
-      header?: {
-        /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
-        "X-Profile-Id"?: string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path?: never;
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      /** @description OK */
-      200: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["AdminVirtualItemCollection"];
-        };
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
   listPersonalAPIKeys: {
     parameters: {
       query?: {
@@ -92143,7 +91626,7 @@ export interface operations {
       path?: never;
       cookie?: {
         /** @description Completion cookie the callback set in the browser it sent to the web completion page (HttpOnly, path-scoped to this operation, two minutes). The browser sends it by itself; a web code redeemed without it, or with another browser's, is 400 invalid_grant and stays redeemable. Native codes ignore it */
-        vio_oauth_complete?: string;
+        silo_oauth_complete?: string;
       };
     };
     requestBody: {
@@ -93953,270 +93436,6 @@ export interface operations {
       };
     };
   };
-  getEpisodeReleaseCapability: {
-    parameters: {
-      query?: never;
-      header: {
-        /** @description Optional first precondition, evaluated before If-None-Match: a tag that does not match the current representation is 412 precondition_failed. */
-        "If-Match"?: string;
-        "If-None-Match"?: string;
-        /** @description The household profile acting for this request; it must belong to the authenticated account. */
-        "X-Profile-Id": string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path?: never;
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      /** @description OK */
-      200: {
-        headers: {
-          "Cache-Control"?: string;
-          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
-          ETag?: string;
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["EpisodeReleaseCapability"];
-        };
-      };
-      /** @description The representation named by If-None-Match is current; no body. */
-      304: {
-        headers: {
-          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
-          ETag?: string;
-          [name: string]: unknown;
-        };
-        content?: never;
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Precondition Failed */
-      412: {
-        headers: {
-          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
-          ETag?: string;
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  getItemCollectionsCapability: {
-    parameters: {
-      query?: never;
-      header: {
-        /** @description Optional first precondition, evaluated before If-None-Match: a tag that does not match the current representation is 412 precondition_failed. */
-        "If-Match"?: string;
-        "If-None-Match"?: string;
-        /** @description The household profile acting for this request; it must belong to the authenticated account. */
-        "X-Profile-Id": string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path?: never;
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      /** @description OK */
-      200: {
-        headers: {
-          "Cache-Control"?: string;
-          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
-          ETag?: string;
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["ItemCollectionsCapability"];
-        };
-      };
-      /** @description The representation named by If-None-Match is current; no body. */
-      304: {
-        headers: {
-          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
-          ETag?: string;
-          [name: string]: unknown;
-        };
-        content?: never;
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Precondition Failed */
-      412: {
-        headers: {
-          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
-          ETag?: string;
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
   getMetadataAICapability: {
     parameters: {
       query?: never;
@@ -94969,138 +94188,6 @@ export interface operations {
       };
     };
   };
-  getVirtualLibraryCapabilities: {
-    parameters: {
-      query?: never;
-      header?: {
-        /** @description Optional first precondition, evaluated before If-None-Match: a tag that does not match the current representation is 412 precondition_failed. */
-        "If-Match"?: string;
-        "If-None-Match"?: string;
-        /** @description Optional. When present, it must name a profile of the authenticated account. */
-        "X-Profile-Id"?: string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path?: never;
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      /** @description OK */
-      200: {
-        headers: {
-          "Cache-Control"?: string;
-          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
-          ETag?: string;
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["VirtualLibraryCapabilities"];
-        };
-      };
-      /** @description The representation named by If-None-Match is current; no body. */
-      304: {
-        headers: {
-          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
-          ETag?: string;
-          [name: string]: unknown;
-        };
-        content?: never;
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Precondition Failed */
-      412: {
-        headers: {
-          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
-          ETag?: string;
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
   listCatalogItems: {
     parameters: {
       query?: {
@@ -95722,7 +94809,7 @@ export interface operations {
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
         /** @description The stable device identifier used to resolve device-scoped playback preferences; absent resolves the profile's preferences */
-        "X-Vio-Device-Id"?: string;
+        "X-Silo-Device-Id"?: string;
       };
       path: {
         /** @description Content id */
@@ -96779,7 +95866,7 @@ export interface operations {
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
         /** @description The stable device identifier used to resolve device-scoped playback preferences; absent resolves the profile's preferences */
-        "X-Vio-Device-Id"?: string;
+        "X-Silo-Device-Id"?: string;
       };
       path: {
         /** @description Content id */
@@ -102558,7 +101645,7 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        "X-Vio-Device-Id"?: string;
+        "X-Silo-Device-Id"?: string;
       };
       path?: never;
       cookie?: never;
@@ -104385,15 +103472,6 @@ export interface operations {
           "application/problem+json": components["schemas"]["Problem"];
         };
       };
-      /** @description Not Implemented */
-      501: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
       /** @description Service Unavailable */
       503: {
         headers: {
@@ -104544,15 +103622,6 @@ export interface operations {
       };
       /** @description Internal Server Error */
       500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Implemented */
-      501: {
         headers: {
           [name: string]: unknown;
         };
@@ -104769,15 +103838,6 @@ export interface operations {
           "application/problem+json": components["schemas"]["Problem"];
         };
       };
-      /** @description Not Implemented */
-      501: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
       /** @description Service Unavailable */
       503: {
         headers: {
@@ -104936,15 +103996,6 @@ export interface operations {
       };
       /** @description Internal Server Error */
       500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Implemented */
-      501: {
         headers: {
           [name: string]: unknown;
         };
@@ -105311,7 +104362,7 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        "X-Vio-Device-Id"?: string;
+        "X-Silo-Device-Id"?: string;
       };
       path?: never;
       cookie?: never;
@@ -105421,9 +104472,9 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        "X-Vio-Device-Id"?: string;
-        "X-Vio-Device-Name"?: string;
-        "X-Vio-Device-Platform"?: string;
+        "X-Silo-Device-Id"?: string;
+        "X-Silo-Device-Name"?: string;
+        "X-Silo-Device-Platform"?: string;
       };
       path?: never;
       cookie?: never;
@@ -105571,115 +104622,6 @@ export interface operations {
       };
     };
   };
-  getDownload: {
-    parameters: {
-      query?: never;
-      header: {
-        /** @description The household profile acting for this request; it must belong to the authenticated account. */
-        "X-Profile-Id": string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-        "X-Vio-Device-Id"?: string;
-      };
-      path: {
-        id: string;
-      };
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      /** @description OK */
-      200: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["DownloadEntry"];
-        };
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
   deleteDownload: {
     parameters: {
       query?: never;
@@ -105688,7 +104630,7 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        "X-Vio-Device-Id"?: string;
+        "X-Silo-Device-Id"?: string;
       };
       path: {
         id: string;
@@ -105795,7 +104737,7 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        "X-Vio-Device-Id": string;
+        "X-Silo-Device-Id": string;
       };
       path: {
         id: string;
@@ -105944,7 +104886,7 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        "X-Vio-Device-Id": string;
+        "X-Silo-Device-Id": string;
       };
       path: {
         id: string;
@@ -106070,7 +105012,7 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        "X-Vio-Device-Id"?: string;
+        "X-Silo-Device-Id"?: string;
       };
       path: {
         id: string;
@@ -106263,7 +105205,7 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        "X-Vio-Device-Id"?: string;
+        "X-Silo-Device-Id"?: string;
       };
       path: {
         id: string;
@@ -106446,7 +105388,7 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        "X-Vio-Device-Id"?: string;
+        "X-Silo-Device-Id"?: string;
       };
       path: {
         id: string;
@@ -106656,7 +105598,7 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        "X-Vio-Device-Id"?: string;
+        "X-Silo-Device-Id"?: string;
       };
       path: {
         id: string;
@@ -106848,7 +105790,7 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        "X-Vio-Device-Id": string;
+        "X-Silo-Device-Id": string;
       };
       path: {
         id: string;
@@ -107103,7 +106045,7 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        "X-Vio-Device-Id": string;
+        "X-Silo-Device-Id": string;
       };
       path: {
         id: string;
@@ -107245,7 +106187,7 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        "X-Vio-Device-Id": string;
+        "X-Silo-Device-Id": string;
       };
       path: {
         batch_id: string;
@@ -107357,7 +106299,7 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        "X-Vio-Device-Id": string;
+        "X-Silo-Device-Id": string;
       };
       path?: never;
       cookie?: never;
@@ -107465,9 +106407,9 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        "X-Vio-Device-Id": string;
-        "X-Vio-Device-Name"?: string;
-        "X-Vio-Device-Platform"?: string;
+        "X-Silo-Device-Id": string;
+        "X-Silo-Device-Name"?: string;
+        "X-Silo-Device-Platform"?: string;
       };
       path?: never;
       cookie?: never;
@@ -107607,7 +106549,7 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        "X-Vio-Device-Id": string;
+        "X-Silo-Device-Id": string;
       };
       path: {
         id: string;
@@ -107722,7 +106664,7 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        "X-Vio-Device-Id": string;
+        "X-Silo-Device-Id": string;
       };
       path: {
         id: string;
@@ -107853,7 +106795,7 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        "X-Vio-Device-Id": string;
+        "X-Silo-Device-Id": string;
       };
       path: {
         id: string;
@@ -108019,7 +106961,7 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        "X-Vio-Device-Id": string;
+        "X-Silo-Device-Id": string;
       };
       path?: never;
       cookie?: never;
@@ -108758,7 +107700,7 @@ export interface operations {
           "Content-Range"?: string;
           ETag?: string;
           "Last-Modified"?: string;
-          "X-Vio-Ebook-Conversion"?: string;
+          "X-Silo-Ebook-Conversion"?: string;
           [name: string]: unknown;
         };
         content: {
@@ -108784,7 +107726,7 @@ export interface operations {
           "Content-Range"?: string;
           ETag?: string;
           "Last-Modified"?: string;
-          "X-Vio-Ebook-Conversion"?: string;
+          "X-Silo-Ebook-Conversion"?: string;
           [name: string]: unknown;
         };
         content: {
@@ -108810,7 +107752,7 @@ export interface operations {
           "Content-Range"?: string;
           ETag?: string;
           "Last-Modified"?: string;
-          "X-Vio-Ebook-Conversion"?: string;
+          "X-Silo-Ebook-Conversion"?: string;
           [name: string]: unknown;
         };
         content?: never;
@@ -108852,7 +107794,7 @@ export interface operations {
           "Content-Range"?: string;
           ETag?: string;
           "Last-Modified"?: string;
-          "X-Vio-Ebook-Conversion"?: string;
+          "X-Silo-Ebook-Conversion"?: string;
           [name: string]: unknown;
         };
         content?: never;
@@ -108867,7 +107809,7 @@ export interface operations {
           "Content-Range"?: string;
           ETag?: string;
           "Last-Modified"?: string;
-          "X-Vio-Ebook-Conversion"?: string;
+          "X-Silo-Ebook-Conversion"?: string;
           [name: string]: unknown;
         };
         content: {
@@ -108945,7 +107887,7 @@ export interface operations {
           "Content-Range"?: string;
           ETag?: string;
           "Last-Modified"?: string;
-          "X-Vio-Ebook-Conversion"?: string;
+          "X-Silo-Ebook-Conversion"?: string;
           [name: string]: unknown;
         };
         content?: never;
@@ -108960,7 +107902,7 @@ export interface operations {
           "Content-Range"?: string;
           ETag?: string;
           "Last-Modified"?: string;
-          "X-Vio-Ebook-Conversion"?: string;
+          "X-Silo-Ebook-Conversion"?: string;
           [name: string]: unknown;
         };
         content?: never;
@@ -108975,7 +107917,7 @@ export interface operations {
           "Content-Range"?: string;
           ETag?: string;
           "Last-Modified"?: string;
-          "X-Vio-Ebook-Conversion"?: string;
+          "X-Silo-Ebook-Conversion"?: string;
           [name: string]: unknown;
         };
         content?: never;
@@ -109017,7 +107959,7 @@ export interface operations {
           "Content-Range"?: string;
           ETag?: string;
           "Last-Modified"?: string;
-          "X-Vio-Ebook-Conversion"?: string;
+          "X-Silo-Ebook-Conversion"?: string;
           [name: string]: unknown;
         };
         content?: never;
@@ -109032,7 +107974,7 @@ export interface operations {
           "Content-Range"?: string;
           ETag?: string;
           "Last-Modified"?: string;
-          "X-Vio-Ebook-Conversion"?: string;
+          "X-Silo-Ebook-Conversion"?: string;
           [name: string]: unknown;
         };
         content: {
@@ -118195,455 +117137,6 @@ export interface operations {
       };
     };
   };
-  discoverVirtualCandidates: {
-    parameters: {
-      query?: never;
-      header?: {
-        /** @description Optional. When present, it must name a profile of the authenticated account. */
-        "X-Profile-Id"?: string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path: {
-        /** @description A movie or episode whose virtual candidates to re-list */
-        media_id: string;
-      };
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      /** @description No Content */
-      204: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content?: never;
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  refreshVirtualCandidates: {
-    parameters: {
-      query?: never;
-      header?: {
-        /** @description Optional. When present, it must name a profile of the authenticated account. */
-        "X-Profile-Id"?: string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path: {
-        /** @description A movie or episode whose virtual candidates to re-list */
-        media_id: string;
-      };
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      /** @description Accepted */
-      202: {
-        headers: {
-          Location?: string;
-          "Retry-After"?: string;
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["AdminTaskJob"];
-        };
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  cancelVirtualCandidatesRefresh: {
-    parameters: {
-      query?: never;
-      header?: {
-        /** @description Optional. When present, it must name a profile of the authenticated account. */
-        "X-Profile-Id"?: string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path: {
-        /** @description A movie or episode whose virtual candidates to re-list */
-        media_id: string;
-      };
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      /** @description OK */
-      200: {
-        headers: {
-          Location?: string;
-          "Retry-After"?: string;
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["AdminTaskJob"];
-        };
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Conflict */
-      409: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  requestVirtualRelease: {
-    parameters: {
-      query?: never;
-      header?: {
-        /** @description Optional. When present, it must name a profile of the authenticated account. */
-        "X-Profile-Id"?: string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path: {
-        /** @description A movie or episode whose indexer release to request */
-        media_id: string;
-        /** @description The opaque release id read from the watch detail's indexer_releases */
-        release_id: string;
-      };
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      /** @description OK */
-      200: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["VirtualReleaseRequest"];
-        };
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
   getNetworkAccessCapabilities: {
     parameters: {
       query?: never;
@@ -124853,119 +123346,6 @@ export interface operations {
       };
     };
   };
-  getPlaybackInventory: {
-    parameters: {
-      query?: never;
-      header: {
-        /** @description Entity tag of the client's current cached inventory */
-        "If-None-Match"?: string;
-        /** @description The household profile acting for this request; it must belong to the authenticated account. */
-        "X-Profile-Id": string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path: {
-        /** @description Playback session identifier */
-        session_id: string;
-      };
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      /** @description OK */
-      200: {
-        headers: {
-          "Cache-Control"?: string;
-          ETag?: string;
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["PlaybackInventoryV3"];
-        };
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
   updatePlaybackProgress: {
     parameters: {
       query?: never;
@@ -126432,14 +124812,6 @@ export interface operations {
         "X-Silo-Device-Name"?: string;
         /** @description Optional platform recorded on the device registry (first 40 characters) */
         "X-Silo-Device-Platform"?: string;
-        /** @description App name first-party Vio clients send */
-        "X-Vio-Client"?: string;
-        /** @description Opaque build identifier paired with X-Vio-Client */
-        "X-Vio-Client-Build"?: string;
-        /** @description Opaque distribution channel paired with X-Vio-Client */
-        "X-Vio-Client-Channel"?: string;
-        /** @description Marketing version paired with X-Vio-Client */
-        "X-Vio-Client-Version"?: string;
       };
       path?: never;
       cookie?: never;
@@ -131652,10 +130024,7 @@ export interface operations {
   };
   getRequestMediaDetail: {
     parameters: {
-      query?: {
-        /** @description Series only: return TVDB or TMDB season numbering. Omitted: the server prefers TVDB */
-        season_source?: "tvdb" | "tmdb";
-      };
+      query?: never;
       header: {
         /** @description The household profile acting for this request; it must belong to the authenticated account. */
         "X-Profile-Id": string;
@@ -131665,7 +130034,7 @@ export interface operations {
       path: {
         /** @description The media type */
         media_type: "movie" | "series";
-        /** @description TMDB identifier (external, not a Vio ID) */
+        /** @description TMDB identifier (external, not a Silo ID) */
         tmdb_id: number;
       };
       cookie?: never;
@@ -132864,7 +131233,7 @@ export interface operations {
       path: {
         /** @description The media type */
         media_type: "movie" | "series";
-        /** @description TMDB identifier (external, not a Vio ID) */
+        /** @description TMDB identifier (external, not a Silo ID) */
         tmdb_id: number;
       };
       cookie?: never;
@@ -132984,7 +131353,7 @@ export interface operations {
       path: {
         /** @description The media type */
         media_type: "movie" | "series";
-        /** @description TMDB identifier (external, not a Vio ID) */
+        /** @description TMDB identifier (external, not a Silo ID) */
         tmdb_id: number;
       };
       cookie?: never;
@@ -134447,11 +132816,11 @@ export interface operations {
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
         /** @description The client's stable device identifier */
-        "X-Vio-Device-Id": string;
+        "X-Silo-Device-Id": string;
         /** @description Optional display name recorded on the device registry */
-        "X-Vio-Device-Name"?: string;
+        "X-Silo-Device-Name"?: string;
         /** @description Optional platform recorded on the device registry */
-        "X-Vio-Device-Platform"?: string;
+        "X-Silo-Device-Platform"?: string;
       };
       path?: never;
       cookie?: never;
@@ -134590,11 +132959,11 @@ export interface operations {
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
         /** @description The client's stable device identifier */
-        "X-Vio-Device-Id": string;
+        "X-Silo-Device-Id": string;
         /** @description Optional display name recorded on the device registry */
-        "X-Vio-Device-Name"?: string;
+        "X-Silo-Device-Name"?: string;
         /** @description Optional platform recorded on the device registry */
-        "X-Vio-Device-Platform"?: string;
+        "X-Silo-Device-Platform"?: string;
       };
       path?: never;
       cookie?: never;
@@ -135162,11 +133531,11 @@ export interface operations {
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
         /** @description The client's stable device identifier; absent resolves the profile-wide value */
-        "X-Vio-Device-Id"?: string;
+        "X-Silo-Device-Id"?: string;
         /** @description Optional display name recorded on the device registry */
-        "X-Vio-Device-Name"?: string;
+        "X-Silo-Device-Name"?: string;
         /** @description Optional platform recorded on the device registry */
-        "X-Vio-Device-Platform"?: string;
+        "X-Silo-Device-Platform"?: string;
       };
       path?: never;
       cookie?: never;
@@ -135293,13 +133662,13 @@ export interface operations {
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
         /** @description The client family a profile_client value belongs to */
-        "X-Vio-Client-Family"?: "tv" | "mobile" | "tablet" | "desktop" | "web";
+        "X-Silo-Client-Family"?: "tv" | "mobile" | "tablet" | "desktop" | "web";
         /** @description The client's stable device identifier; the profile_device scope stores against it when device_id is absent */
-        "X-Vio-Device-Id"?: string;
+        "X-Silo-Device-Id"?: string;
         /** @description Optional display name recorded on the device registry */
-        "X-Vio-Device-Name"?: string;
+        "X-Silo-Device-Name"?: string;
         /** @description Optional platform recorded on the device registry */
-        "X-Vio-Device-Platform"?: string;
+        "X-Silo-Device-Platform"?: string;
       };
       path?: never;
       cookie?: never;
@@ -135424,13 +133793,13 @@ export interface operations {
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
         /** @description The client family a profile_client value belongs to */
-        "X-Vio-Client-Family"?: "tv" | "mobile" | "tablet" | "desktop" | "web";
+        "X-Silo-Client-Family"?: "tv" | "mobile" | "tablet" | "desktop" | "web";
         /** @description The client's stable device identifier; the profile_device scope stores against it when device_id is absent */
-        "X-Vio-Device-Id"?: string;
+        "X-Silo-Device-Id"?: string;
         /** @description Optional display name recorded on the device registry */
-        "X-Vio-Device-Name"?: string;
+        "X-Silo-Device-Name"?: string;
         /** @description Optional platform recorded on the device registry */
-        "X-Vio-Device-Platform"?: string;
+        "X-Silo-Device-Platform"?: string;
       };
       path: {
         /** @description The setting key, as defined in the settings contract */
@@ -135558,13 +133927,13 @@ export interface operations {
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
         /** @description The client family a profile_client value belongs to */
-        "X-Vio-Client-Family"?: "tv" | "mobile" | "tablet" | "desktop" | "web";
+        "X-Silo-Client-Family"?: "tv" | "mobile" | "tablet" | "desktop" | "web";
         /** @description The client's stable device identifier; the profile_device scope stores against it when device_id is absent */
-        "X-Vio-Device-Id"?: string;
+        "X-Silo-Device-Id"?: string;
         /** @description Optional display name recorded on the device registry */
-        "X-Vio-Device-Name"?: string;
+        "X-Silo-Device-Name"?: string;
         /** @description Optional platform recorded on the device registry */
-        "X-Vio-Device-Platform"?: string;
+        "X-Silo-Device-Platform"?: string;
       };
       path: {
         /** @description The setting key, as defined in the settings contract */
@@ -135723,13 +134092,13 @@ export interface operations {
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
         /** @description The client family a profile_client value belongs to */
-        "X-Vio-Client-Family"?: "tv" | "mobile" | "tablet" | "desktop" | "web";
+        "X-Silo-Client-Family"?: "tv" | "mobile" | "tablet" | "desktop" | "web";
         /** @description The client's stable device identifier; the profile_device scope stores against it when device_id is absent */
-        "X-Vio-Device-Id"?: string;
+        "X-Silo-Device-Id"?: string;
         /** @description Optional display name recorded on the device registry */
-        "X-Vio-Device-Name"?: string;
+        "X-Silo-Device-Name"?: string;
         /** @description Optional platform recorded on the device registry */
-        "X-Vio-Device-Platform"?: string;
+        "X-Silo-Device-Platform"?: string;
       };
       path: {
         /** @description The setting key, as defined in the settings contract */
@@ -135851,11 +134220,11 @@ export interface operations {
         /** @description The client family whose profile_client values take part; optional, and absence skips the profile_client layer */
         "X-Silo-Client-Family"?: "tv" | "mobile" | "tablet" | "desktop" | "web";
         /** @description The client's stable device identifier; its profile_device values take part */
-        "X-Vio-Device-Id"?: string;
+        "X-Silo-Device-Id"?: string;
         /** @description Optional display name recorded on the device registry */
-        "X-Vio-Device-Name"?: string;
+        "X-Silo-Device-Name"?: string;
         /** @description Optional platform recorded on the device registry */
-        "X-Vio-Device-Platform"?: string;
+        "X-Silo-Device-Platform"?: string;
       };
       path?: never;
       cookie?: never;
@@ -135965,11 +134334,11 @@ export interface operations {
         /** @description The client family whose profile_client values take part; optional, and absence skips the profile_client layer */
         "X-Silo-Client-Family"?: "tv" | "mobile" | "tablet" | "desktop" | "web";
         /** @description The client's stable device identifier; its profile_device values take part */
-        "X-Vio-Device-Id"?: string;
+        "X-Silo-Device-Id"?: string;
         /** @description Optional display name recorded on the device registry */
-        "X-Vio-Device-Name"?: string;
+        "X-Silo-Device-Name"?: string;
         /** @description Optional platform recorded on the device registry */
-        "X-Vio-Device-Platform"?: string;
+        "X-Silo-Device-Platform"?: string;
       };
       path?: never;
       cookie?: never;
@@ -137800,7 +136169,6 @@ export interface operations {
       200: {
         headers: {
           "Cache-Control"?: string;
-          "X-Vio-Font-Bundle-Pending"?: string;
           [name: string]: unknown;
         };
         content: {
@@ -146404,7 +144772,7 @@ export interface operations {
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
         /** @description The stable device identifier used to resolve playback preferences */
-        "X-Vio-Device-Id"?: string;
+        "X-Silo-Device-Id"?: string;
       };
       path: {
         /** @description A movie, episode, audiobook or ebook; a series is not directly playable */
@@ -146518,7 +144886,7 @@ export interface operations {
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
         /** @description The stable device identifier used to resolve playback preferences */
-        "X-Vio-Device-Id"?: string;
+        "X-Silo-Device-Id"?: string;
       };
       path: {
         /** @description A movie or episode */

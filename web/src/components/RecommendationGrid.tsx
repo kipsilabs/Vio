@@ -1,9 +1,8 @@
-import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import DefaultArtwork from "@/components/DefaultArtwork";
 import ViewTransitionLink from "@/components/ViewTransitionLink";
 import MediaCarousel from "@/components/MediaCarousel";
 import { useCatalogItemDetail } from "@/hooks/queries/catalogRead";
-import { isTerminalNotFoundError } from "@/hooks/queries/mediaSurfaceRefresh";
 import { useUICustomization } from "@/hooks/useUICustomization";
 import { carouselCardWidthClasses } from "@/lib/uiCustomization";
 import CardPlayOverlay from "@/components/CardPlayOverlay";
@@ -19,27 +18,11 @@ function RecommendationItemCard({ itemId }: { itemId: string }) {
   const { data: item } = useCatalogItemDetail(itemId);
   // Keyed by URL so a re-signed poster is tried again.
   const [failedUrl, setFailedUrl] = useState<string | null>(null);
-  // A 404 is terminal: the recommendation points at an item the catalog no
-  // longer has. Report it so the grid unmounts this card, which lets the
-  // query deactivate instead of polling a dead endpoint forever.
-  const terminal = isTerminalNotFoundError(error);
-
-  useEffect(() => {
-    if (terminal) onTerminalError(itemId);
-  }, [terminal, itemId, onTerminalError]);
-
-  if (terminal) {
-    return null;
-  }
   if (!item) {
-    return (
-      <div className={className}>
-        <div className="bg-surface aspect-[2/3] animate-pulse rounded-lg" />
-      </div>
-    );
+    return <div className="bg-surface aspect-[2/3] animate-pulse rounded-lg" />;
   }
   return (
-    <div className={className ?? "group/card"}>
+    <div className="group/card">
       <div className="group/media relative">
         <ViewTransitionLink
           to={`/item/${encodeURIComponent(itemId)}`}
@@ -113,23 +96,9 @@ export function MoreLikeThisRow<T>({
 }
 
 export default function RecommendationGrid({ items, maxItems = 12 }: RecommendationGridProps) {
-  const [failedItemIds, setFailedItemIds] = useState<Set<string>>(() => new Set());
-  const handleTerminalError = useCallback((itemId: string) => {
-    setFailedItemIds((prev) => {
-      if (prev.has(itemId)) return prev;
-      const next = new Set(prev);
-      next.add(itemId);
-      return next;
-    });
-  }, []);
-
-  // Drop terminally-failed ids before applying the limit so a removed card is
-  // replaced by the next healthy recommendation rather than leaving a gap.
-  const visibleItems = items.filter((si) => !failedItemIds.has(si.content_id));
-
   return (
     <MoreLikeThisRow
-      items={visibleItems}
+      items={items}
       maxItems={maxItems}
       itemKey={(item) => item.content_id}
       renderItem={(item) => <RecommendationItemCard itemId={item.content_id} />}

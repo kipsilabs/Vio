@@ -37,7 +37,6 @@ import MediaInfoDialog from "./components/MediaInfoDialog";
 import SubtitleSearchDialog from "./components/SubtitleSearchDialog";
 import { sortByResolution } from "./components/VersionFlyout";
 import { selectDefaultPlaybackVariantVersion } from "./components/versionRankingUtils";
-import { readRequestedFileId, rememberRequestedFileId } from "@/playback/requestedVersion";
 import { resolveSelectedMediaSummary } from "./components/selectedMediaSummary";
 import { EpisodeCarouselSkeleton } from "./components/SectionSkeletons";
 import {
@@ -51,28 +50,17 @@ import {
   canEditMarkers as canEditMarkersForUser,
 } from "@/lib/permissions";
 import { isEpisodeUnwatched } from "@/lib/episodeSpoilers";
+import { formatDate } from "@/lib/datetime";
 import { formatRuntimeMinutes } from "@/lib/mediaFormat";
 import { useQualityPreference } from "@/hooks/queries/qualityPreference";
-import { applyVersionAvailability, useVersionLiveness } from "@/hooks/queries/versionLiveness";
-import { CalendarClock } from "lucide-react";
-import {
-  formatCalendarDate,
-  isUpcomingEpisode,
-  useEpisodeReleaseCapability,
-} from "@/hooks/queries/episodeRelease";
 import { hasMachineTranslation } from "./components/machineTranslation";
 
-export default function EpisodeContent({
-  item,
-  onStaleVersion,
-}: {
-  item: ItemDetail & { type: "episode" };
-  onStaleVersion?: (fileId: number) => void;
-}) {
+export default function EpisodeContent({ item }: { item: ItemDetail & { type: "episode" } }) {
   const { translating: overviewTranslating, onTranslate: onTranslateOverview } =
     useOnViewTranslation(item);
   const navigate = useNavigate();
   const location = useLocation();
+  useAmbientColor(item.backdrop_thumbhash);
   const { user } = useAuth();
   const isAdmin = useIsActingAdmin();
   const { profile: currentProfile } = useCurrentProfile();
@@ -117,13 +105,11 @@ export default function EpisodeContent({
         userData,
         qualityPreference,
         item.effective_version_edition_key,
-        requestedFileId,
       ),
     [
       qualityPreference,
       item.effective_version_edition_key,
       item.playback_variants,
-      requestedFileId,
       sortedVersions,
       userData,
     ],
@@ -230,18 +216,6 @@ export default function EpisodeContent({
         }
       : null;
   const navigationState = location.state as EpisodeNavigationState | null;
-  // Release timing is presentation only: it never gates playback. A
-  // future-dated episode with a playable file still plays (the server's
-  // release gate remains the sole enforcer), so Play eligibility is
-  // unchanged; upcoming episodes only get a hero badge. The badge itself is
-  // capability-gated so older servers render as before. Unknown dates fail
-  // open (no badge, playable as before).
-  const { data: releaseCapability } = useEpisodeReleaseCapability();
-  const upcoming = isUpcomingEpisode(item, releaseCapability?.available ?? false);
-  const isPlayable =
-    (item.versions?.length ?? 0) > 0 ||
-    (item.playback_variants?.length ?? 0) > 0 ||
-    Boolean(item.play_content_id);
   const primaryAction = resolveLeafPrimaryAction(item, "Play Episode");
   const watchTogether = useDetailWatchTogether({
     item,
@@ -262,7 +236,7 @@ export default function EpisodeContent({
     initialSeasonNumber: item.season_number ?? undefined,
   });
   const restartHref =
-    primaryAction.label === "Resume" && isPlayable
+    primaryAction.label === "Resume" && (item.versions?.length ?? 0) > 0
       ? `/watch/${item.content_id}?restart=1`
       : undefined;
 
@@ -283,29 +257,6 @@ export default function EpisodeContent({
     siblingSeason?.seasonNumber ?? -1,
   );
   const siblingEpisodes = episodesData?.episodes ?? [];
-  // The hero backdrop prefers this episode's own title card: the detail
-  // presigns an episode's still as `poster_url`, and episode rows name the same
-  // artwork `still_url`, consulted last for a series that has a poster but no
-  // backdrop. The series backdrop keeps its place in between, so an episode with
-  // no title card of its own renders as it did before.
-  //
-  // The URL picks the source; the thumbhash is that same source's, even when it
-  // has none. Pairing the two independently could show one image behind another
-  // image's generated thumbnail, so the placeholder would not belong to the
-  // artwork it stands in for.
-  const currentEpisode = siblingEpisodes.find((episode) => episode.content_id === item.content_id);
-  const heroArtwork = item.poster_url
-    ? { url: item.poster_url, thumbhash: item.poster_thumbhash }
-    : item.backdrop_url
-      ? { url: item.backdrop_url, thumbhash: item.backdrop_thumbhash }
-      : currentEpisode?.still_url
-        ? { url: currentEpisode.still_url, thumbhash: currentEpisode.still_thumbhash }
-        : undefined;
-  const heroBackdropUrl = heroArtwork?.url;
-  const heroBackdropThumbhash = heroArtwork?.thumbhash;
-  // The page glow follows the artwork the hero actually shows, the way the ebook
-  // and manga pages key it to their poster.
-  useAmbientColor(heroBackdropThumbhash);
   const seasonLabel =
     navigationState?.parentSeasonLabel ??
     (currentSeason
@@ -345,8 +296,8 @@ export default function EpisodeContent({
           title={title}
           topNav={<PageBack />}
           context={<DetailBreadcrumb segments={breadcrumbSegments} />}
-          backdropUrl={heroBackdropUrl}
-          backdropThumbhash={heroBackdropThumbhash}
+          backdropUrl={item.backdrop_url}
+          backdropThumbhash={item.backdrop_thumbhash}
           hidePoster
           logoUrl={item.logo_url}
           metadata={
@@ -354,14 +305,10 @@ export default function EpisodeContent({
               <MetadataBadges
                 duration={formatRuntimeMinutes(selectedMediaSummary.durationMinutes) || undefined}
               />
-              {upcoming && (
-                <span className="metadata-badge gap-1">
-                  <CalendarClock className="size-3" aria-hidden="true" />
-                  Upcoming{item.air_date && ` · ${formatCalendarDate(item.air_date)}`}
+              {item.air_date && (
+                <span className="metadata-badge">
+                  {formatDate(item.air_date, "medium") || item.air_date}
                 </span>
-              )}
-              {!upcoming && item.air_date && (
-                <span className="metadata-badge">{formatCalendarDate(item.air_date)}</span>
               )}
               <QualityBadges summary={selectedMediaSummary} />
             </div>
@@ -379,10 +326,11 @@ export default function EpisodeContent({
               compactMobile
               item={item}
               contentId={item.content_id}
-              hasVirtualSource={item.has_virtual_source === true}
               canAddToCollection={false}
               watchTogether={watchTogether.menu}
-              playHref={isPlayable ? `/watch/${item.content_id}` : undefined}
+              playHref={
+                item.versions && item.versions.length > 0 ? `/watch/${item.content_id}` : undefined
+              }
               playLabel={primaryAction.label}
               playProgress={primaryAction.progress}
               restartHref={restartHref}
@@ -439,7 +387,7 @@ export default function EpisodeContent({
                   ? () => openMediaInfo()
                   : undefined
               }
-              versions={versionsWithLiveness}
+              versions={item.versions ?? []}
               playbackVariants={item.playback_variants}
               selectedVersion={selectedVersion}
               versionPicked={pickedVersion != null}
@@ -515,12 +463,6 @@ export default function EpisodeContent({
         onOpenChange={setDownloadOpen}
         versions={item.versions ?? []}
         title={title}
-        selectedFileId={selectedVersion?.file_id}
-        onStaleVersion={onStaleVersion}
-        createTarget={{
-          contentId: item.series_id ?? item.content_id,
-          episodeId: item.content_id,
-        }}
       />
       <SubtitleSearchDialog
         open={subtitleSearchOpen}

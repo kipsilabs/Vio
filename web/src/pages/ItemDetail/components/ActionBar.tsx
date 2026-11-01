@@ -42,22 +42,6 @@ import {
   Wrench,
   Zap,
 } from "lucide-react";
-import { useQueryClient } from "@tanstack/react-query";
-import { useDeleteMediaItem } from "@/hooks/queries/items";
-import { usePreplayDiscovery } from "@/hooks/usePreplayDiscovery";
-import { useVersionListRefresh } from "@/hooks/useVersionListRefresh";
-import {
-  awaitVirtualCandidatesRefresh,
-  cancelVirtualCandidatesRefresh,
-} from "@/api/v2/mediaCandidates";
-import { catalogKeys, itemKeys } from "@/hooks/queries/keys";
-import { useRealtimeEvents } from "@/components/realtimeEventsContext";
-import { useWatchDetail } from "@/hooks/queries/items";
-import {
-  mergePlaybackInventory,
-  usePlaybackInventoryMirror,
-} from "@/player/playbackInventoryMirror";
-import { isOverlayInventoryProvisional } from "@/player/utils/inventoryProvenance";
 import { cn } from "@/lib/utils";
 import AddToCollectionDialog from "@/components/AddToCollectionDialog";
 import { Button } from "@/components/ui/button";
@@ -83,7 +67,7 @@ import StarRating from "@/components/StarRating";
 import { MediaActionIcon } from "@/components/mediaActionIcons";
 import { useWatchPlaybackController } from "@/playback/watchPlaybackContext";
 import { parseWatchHref } from "@/pages/watchRouteHelpers";
-import VersionDropdown, { VersionRefreshRow } from "./VersionDropdown";
+import VersionDropdown from "./VersionDropdown";
 import AudioTracksPopover from "./AudioTracksPopover";
 import SubtitlesPopover from "./SubtitlesPopover";
 
@@ -272,15 +256,11 @@ export interface ActionBarProps {
   /** Enables the admin "Seek Previews" action; the server must offer seek previews. */
   canManageTrickplay?: boolean;
   versions?: FileVersion[];
-  /** The item has a virtual source, even when no version is currently playable. */
-  hasVirtualSource?: boolean;
   playbackVariants?: PlaybackVariant[];
   selectedVersion?: FileVersion | null;
   /** The viewer chose selectedVersion rather than playing the default version. */
   versionPicked?: boolean;
   onSelectVersion?: (version: FileVersion) => void;
-  /** Fired when a version picker popover opens or closes (open=true on open). */
-  onVersionPickerOpenChange?: (open: boolean) => void;
   onDownload?: () => void;
   onSearchSubtitles?: () => void;
   /** Opens the season picker to request seasons the library is missing. */
@@ -292,9 +272,6 @@ export interface ActionBarProps {
   qualityPreference?: string | null;
   audioSelectionMode?: "auto" | "explicit";
   explicitAudioTrackIndex?: number | null;
-  /** True when the play target version was explicitly chosen by the viewer;
-   * the server must not silently substitute another version. */
-  explicitFileSelection?: boolean;
   onSelectAudioTrack?: (trackIndex: number) => void;
   onResetAudioSelection?: () => void;
   prePlaySubtitleMode?: "auto" | "off" | "explicit";
@@ -348,12 +325,10 @@ export default function ActionBar({
   canEditMarkers = false,
   canManageTrickplay = false,
   versions,
-  hasVirtualSource = false,
   playbackVariants,
   selectedVersion,
   versionPicked = false,
   onSelectVersion,
-  onVersionPickerOpenChange,
   onDownload,
   onSearchSubtitles,
   onRequestSeasons,
@@ -362,7 +337,6 @@ export default function ActionBar({
   onRatingChange,
   audioSelectionMode = "auto",
   explicitAudioTrackIndex = null,
-  explicitFileSelection = false,
   onSelectAudioTrack,
   onResetAudioSelection,
   prePlaySubtitleMode = "auto",
@@ -401,136 +375,6 @@ export default function ActionBar({
   const [markerEditorOpen, setMarkerEditorOpen] = useState(false);
   const [trickplayOpen, setTrickplayOpen] = useState(false);
   const showTrickplay = isAdmin && canManageTrickplay && !!contentId;
-  const deleteMediaItem = useDeleteMediaItem();
-  const queryClient = useQueryClient();
-  const virtualDetail =
-    hasVirtualSource ||
-    !!versions?.some((version) =>
-      /^virtual:\/\/(?:movie\/[^?]+|series\/[^?]+(?::\d+:\d+|\/\d+\/\d+))(?:\?|$)/.test(
-        version.file_path ?? "",
-      ),
-    );
-  const { discovering, failed: discoveryFailed } = usePreplayDiscovery(contentId, virtualDetail);
-  const { awaitAdminJob } = useRealtimeEvents();
-  // The item-page "Refresh List": start the async re-list job, wait for it to
-  // finish, then re-read the item and the watch detail so both the page's
-  // version list and the picker's indexer rows are replaced from the server's
-  // answer rather than a client-side merge. The refresh control stays locked
-  // for this whole flow; a second press cancels the job and unlocks it.
-  const handleRefreshVersions = useCallback(async () => {
-    if (!contentId) return;
-    await awaitVirtualCandidatesRefresh(contentId, awaitAdminJob);
-    await Promise.all([
-      queryClient.invalidateQueries({
-        queryKey: catalogKeys.itemDetail(contentId).slice(0, 4),
-      }),
-      queryClient.invalidateQueries({
-        queryKey: itemKeys.watchDetail(contentId),
-      }),
-    ]);
-  }, [awaitAdminJob, contentId, queryClient]);
-  const handleCancelRefresh = useCallback(async () => {
-    if (!contentId) return;
-    await cancelVirtualCandidatesRefresh(contentId);
-  }, [contentId]);
-  // A virtual item with no discovered version still needs the indexer search
-  // entry point; the version picker cannot carry it when there are no rows.
-  const standaloneRefresh = useVersionListRefresh(
-    virtualDetail && !selectedVersion ? handleRefreshVersions : undefined,
-    virtualDetail && !selectedVersion ? handleCancelRefresh : undefined,
-  );
-  // The catalog version rows can omit the probed track inventory. Read the
-  // selected file's watch detail and use its current audio/subtitle lists for
-  // the pre-play menus, so the media page offers the same tracks as the player
-  // rather than the pre-probe placeholders. The zero stale time is deliberate:
-  // this read may follow the probe that populated those lists.
-  const { data: selectedWatch, refetch: refetchSelectedWatch } = useWatchDetail(
-    contentId,
-    selectedVersion?.file_id,
-    undefined,
-    {
-      enabled: !!contentId && !!selectedVersion,
-      staleTime: 0,
-    },
-  );
-  const playerInventory = usePlaybackInventoryMirror(selectedVersion?.file_id);
-  const selectedWatchVersion = useMemo(
-    () =>
-      selectedVersion
-        ? selectedWatch?.versions?.find((version) => version.file_id === selectedVersion.file_id)
-        : undefined,
-    [selectedVersion, selectedWatch],
-  );
-  const isWatchProbed = Boolean(selectedWatchVersion?.probed_at);
-  const isCatalogProbed = Boolean(selectedVersion?.probed_at);
-  const selectedVersionWithTracks = useMemo(() => {
-    if (!selectedVersion) return null;
-    if (!selectedWatchVersion) return selectedVersion;
-    // When the watch detail read is probed, its inventory is authoritative even
-    // if empty (verified empty). When only the catalog version carries probed_at
-    // (watch read hasn't completed or is unprobed), the catalog lists are
-    // authoritative. When neither is probed, keep catalog placeholders as provisional.
-    if (isWatchProbed) {
-      return mergePlaybackInventory(
-        {
-          ...selectedVersion,
-          audio_tracks: selectedWatchVersion.audio_tracks ?? [],
-          subtitle_tracks: selectedWatchVersion.subtitle_tracks ?? [],
-        },
-        playerInventory,
-      );
-    }
-    if (isCatalogProbed) {
-      return mergePlaybackInventory(
-        {
-          ...selectedVersion,
-          audio_tracks: selectedVersion.audio_tracks ?? [],
-          subtitle_tracks: selectedVersion.subtitle_tracks ?? [],
-        },
-        playerInventory,
-      );
-    }
-    return mergePlaybackInventory(
-      {
-        ...selectedVersion,
-        audio_tracks:
-          (selectedWatchVersion.audio_tracks?.length ?? 0) > 0
-            ? selectedWatchVersion.audio_tracks
-            : selectedVersion.audio_tracks,
-        subtitle_tracks:
-          (selectedWatchVersion.subtitle_tracks?.length ?? 0) > 0
-            ? selectedWatchVersion.subtitle_tracks
-            : selectedVersion.subtitle_tracks,
-      },
-      playerInventory,
-    );
-  }, [isCatalogProbed, isWatchProbed, playerInventory, selectedVersion, selectedWatchVersion]);
-  const audioRowsPublished =
-    Boolean(selectedWatchVersion?.probed_at) ||
-    Boolean(selectedVersion?.probed_at) ||
-    (selectedWatchVersion?.audio_tracks?.length ?? 0) > 0 ||
-    (playerInventory?.audioTracks.length ?? 0) > 0;
-  const subtitleRowsPublished =
-    Boolean(selectedWatchVersion?.probed_at) ||
-    Boolean(selectedVersion?.probed_at) ||
-    (selectedWatchVersion?.subtitle_tracks?.length ?? 0) > 0 ||
-    (playerInventory?.subtitleTracks.length ?? 0) > 0;
-  const audioInventoryProvisional = isOverlayInventoryProvisional(
-    false,
-    audioRowsPublished,
-    selectedVersionWithTracks?.audio_tracks?.length ?? 0,
-  );
-  const subtitleInventoryProvisional = isOverlayInventoryProvisional(
-    false,
-    subtitleRowsPublished,
-    selectedVersionWithTracks?.subtitle_tracks?.length ?? 0,
-  );
-  // The watch detail read is the page's discovery path: the server persists
-  // probed tracks there. Retrying re-reads it for the selected file; Play stays
-  // available throughout, so a slow probe never blocks starting playback.
-  const handleRetryInventory = useCallback(() => {
-    void refetchSelectedWatch();
-  }, [refetchSelectedWatch]);
   const showMarkerEditor = canEditMarkers && !!contentId;
   const hasMultipleVersions = (playbackVariants?.length ?? 0) > 1 || (versions?.length ?? 0) > 1;
   const showPlayChoiceDialog =
@@ -560,10 +404,6 @@ export default function ActionBar({
     () => `${location.pathname}${location.search}`,
     [location.pathname, location.search],
   );
-  // One policy for every start path: a row the liveness check marked
-  // unavailable is re-linked rather than replaying a stale provider pin. Play,
-  // Resume and the overflow "Play from Beginning" must not disagree about it.
-  const forceRelinkForSelectedVersion = selectedVersion?.available === false ? true : undefined;
   const buildPrePlayStartInput = useCallback(
     (base: {
       contentId: string;
@@ -571,7 +411,6 @@ export default function ActionBar({
       libraryId?: number;
       restart?: boolean;
       returnHref?: string;
-      forceRelink?: boolean;
     }) => ({
       ...base,
       audioTrackIndex:
@@ -595,9 +434,6 @@ export default function ActionBar({
   );
   const startPlaybackFromHref = useCallback(
     (href: string, restartOverride?: boolean) => {
-      // A vanished explicit selection is a pick-again state, not permission to
-      // start whatever the server chooses.
-      if (selectedVersionMissing) return;
       const parsed = parseWatchHref(href);
       if (!parsed) {
         navigate(href);
@@ -611,20 +447,11 @@ export default function ActionBar({
           libraryId: parsed.libraryId,
           restart: restartOverride ?? parsed.restart,
           returnHref: currentHref,
-          forceRelink: forceRelinkForSelectedVersion,
         }),
         "viewer",
       );
     },
-    [
-      buildPrePlayStartInput,
-      currentHref,
-      forceRelinkForSelectedVersion,
-      navigate,
-      playbackController,
-      selectedVersion?.file_id,
-      selectedVersionMissing,
-    ],
+    [buildPrePlayStartInput, currentHref, navigate, playbackController, selectedVersion?.file_id],
   );
   const handleResumePlayback = () => {
     if (!playHref) return;
@@ -874,8 +701,7 @@ export default function ActionBar({
     items[nextIndex]?.focus({ preventScroll: true });
   };
   // With one version, Play already asks whether to resume or start over.
-  const showRestartInMenu =
-    Boolean(restartHref) && !showPlayChoiceDialog && !selectedVersionMissing;
+  const showRestartInMenu = Boolean(restartHref) && !showPlayChoiceDialog;
   const playbackItems = [
     onShuffle && (
       <DetailOverflowMenuItem key="shuffle" closeMenu={closeOverflowMenu} onAction={onShuffle}>
@@ -1081,30 +907,6 @@ export default function ActionBar({
         </DetailOverflowMenuItem>
       ),
     ],
-    [
-      isAdmin && contentId && (
-        <DetailOverflowMenuItem
-          key="delete-item"
-          closeMenu={closeOverflowMenu}
-          className="text-red-500 hover:bg-red-500/10 hover:text-red-400 focus:bg-red-500/10 focus:text-red-400"
-          disabled={deleteMediaItem.isPending}
-          onAction={() => {
-            if (
-              window.confirm("Delete this show/movie? Home and library will update immediately.")
-            ) {
-              deleteMediaItem.mutate(contentId, {
-                onSuccess: () => {
-                  navigate("/");
-                },
-              });
-            }
-          }}
-        >
-          <Trash2 className="size-4 text-red-500" />
-          Delete Show / Movie
-        </DetailOverflowMenuItem>
-      ),
-    ],
   ];
   const manageItems = manageGroups.flat().filter(Boolean);
   // A single management action sits at the end of the menu instead of behind Manage.
@@ -1168,26 +970,16 @@ export default function ActionBar({
           fileId: selectedVersion.file_id,
           restart,
           returnHref: currentHref,
-          forceRelink: forceRelinkForSelectedVersion,
         }),
         "viewer",
       );
     },
-    [
-      buildPrePlayStartInput,
-      contentId,
-      currentHref,
-      forceRelinkForSelectedVersion,
-      playbackController,
-      selectedVersion,
-    ],
+    [buildPrePlayStartInput, contentId, currentHref, playbackController, selectedVersion],
   );
 
   // The subtitle control is available even when the selected file has no
-  // embedded tracks because downloaded subtitles are loaded on demand. A
-  // missing pick still owns this row: it holds the replacement picker.
-  const hasReplacementVersion = selectedVersionMissing && (versions?.length ?? 0) > 0;
-  const hasStreamControls = Boolean(selectedVersion) || hasReplacementVersion;
+  // embedded tracks because downloaded subtitles are loaded on demand.
+  const hasStreamControls = Boolean(selectedVersion);
 
   return (
     <div className="detail-action-bar space-y-2.5" data-compact-mobile={compactMobile || undefined}>
@@ -1197,15 +989,7 @@ export default function ActionBar({
         {primaryAction ? (
           <PrimaryActionButton action={primaryAction} />
         ) : playHref ? (
-          selectedVersionMissing ? (
-            <Button
-              disabled
-              className="h-11 gap-2.5 rounded-full px-8 text-[0.9375rem] font-bold tracking-wide"
-            >
-              <Play className="size-[18px] fill-current" />
-              Version unavailable
-            </Button>
-          ) : showPlayChoiceDialog ? (
+          showPlayChoiceDialog ? (
             <Button
               onClick={openPlayChoiceDialog}
               className={`${responsivePlayActionClass} relative h-11 cursor-pointer gap-2.5 overflow-hidden rounded-full px-8 text-[0.9375rem] font-bold tracking-wide shadow-md`}
@@ -1476,77 +1260,32 @@ export default function ActionBar({
         )}
       </div>
 
-      {selectedVersionMissing ? (
-        <p role="status" className="text-destructive text-xs">
-          The selected version is no longer available. Pick a version to play.
-        </p>
-      ) : null}
-
       {/* ── Stream info controls (second row) ──────────────── */}
       {/* flex-wrap matters: without it this row's min-content width (two or
           three nowrap trigger buttons) inflates the auto-sized hero column
           past narrow viewports, clipping the whole info column. */}
-      {(hasStreamControls ||
-        discovering ||
-        discoveryFailed ||
-        (virtualDetail && !selectedVersion)) && (
+      {hasStreamControls && (
         <div className="detail-stream-actions flex min-w-0 flex-wrap items-center gap-2">
-          {discovering && (
-            <span
-              role="status"
-              className="text-muted-foreground inline-flex items-center gap-2 text-xs"
-            >
-              <Loader2 aria-hidden="true" className="size-3.5 animate-spin" />
-              Finding versions
-            </span>
+          {versions && hasMultipleVersions && selectedVersion && onSelectVersion && (
+            <VersionDropdown
+              versions={versions}
+              playbackVariants={playbackVariants}
+              selectedVersion={selectedVersion}
+              onSelectVersion={onSelectVersion}
+            />
           )}
-          {!discovering && discoveryFailed && (
-            <span role="status" className="text-muted-foreground text-xs">
-              Versions unavailable. Retry with Play.
-            </span>
+          {selectedVersion && (selectedVersion.audio_tracks?.length ?? 0) > 0 && (
+            <AudioTracksPopover
+              version={selectedVersion}
+              selectionMode={audioSelectionMode}
+              explicitTrackIndex={explicitAudioTrackIndex}
+              onSelectTrack={onSelectAudioTrack}
+              onResetSelection={onResetAudioSelection}
+            />
           )}
-          {versions &&
-            versions.length > 0 &&
-            (hasMultipleVersions || virtualDetail || selectedVersionMissing) &&
-            (selectedVersion || selectedVersionMissing) &&
-            onSelectVersion && (
-              <VersionDropdown
-                versions={versions}
-                playbackVariants={playbackVariants}
-                selectedVersion={selectedVersionWithTracks}
-                selectionMissing={selectedVersionMissing}
-                onSelectVersion={onSelectVersion}
-                contentId={contentId}
-                onOpenChange={onVersionPickerOpenChange}
-                onRefreshVersions={contentId ? handleRefreshVersions : undefined}
-                onCancelRefresh={contentId ? handleCancelRefresh : undefined}
-              />
-            )}
-          {virtualDetail && !selectedVersion && contentId && (
-            <div className="w-44 shrink-0">
-              <VersionRefreshRow
-                refreshing={standaloneRefresh.refreshing}
-                cancelable={standaloneRefresh.cancelable}
-                error={standaloneRefresh.error}
-                onPress={standaloneRefresh.refresh}
-              />
-            </div>
-          )}
-          {selectedVersionWithTracks &&
-            (selectedVersionWithTracks.audio_tracks?.length ?? 0) > 0 && (
-              <AudioTracksPopover
-                version={selectedVersionWithTracks}
-                selectionMode={audioSelectionMode}
-                explicitTrackIndex={explicitAudioTrackIndex}
-                inventoryProvisional={audioInventoryProvisional}
-                onRetryInventory={handleRetryInventory}
-                onSelectTrack={onSelectAudioTrack}
-                onResetSelection={onResetAudioSelection}
-              />
-            )}
-          {selectedVersionWithTracks && (
+          {selectedVersion && (
             <SubtitlesPopover
-              version={selectedVersionWithTracks}
+              version={selectedVersion}
               selectionMode={prePlaySubtitleMode}
               explicitSelection={explicitSubtitleSelection}
               preferredSubtitleLanguage={preferredSubtitleLanguage}
@@ -1556,8 +1295,6 @@ export default function ActionBar({
               activeAudioTrackIndex={
                 audioSelectionMode === "explicit" ? explicitAudioTrackIndex : null
               }
-              inventoryProvisional={subtitleInventoryProvisional}
-              onRetryInventory={handleRetryInventory}
               onSelectSubtitle={onSelectSubtitle}
               onSelectSubtitleOff={onSelectSubtitleOff}
               onResetSelection={onResetSubtitleSelection}

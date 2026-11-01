@@ -6,61 +6,17 @@ import { useQueryClient } from "@tanstack/react-query";
 import type { PlayerFileVersion, PlayerPlaybackStateChange, WatchPageProps } from "../types";
 import type { PlaybackRealtimeEventEnvelope } from "../realtime-protocol";
 import { usePlaybackSession } from "../hooks/usePlaybackSession";
-import { isAdaptationUnavailableReason } from "../playback-errors";
 import { usePlayerConfig } from "../context/PlayerConfigContext";
-import {
-  hasSelectableSessionSubtitles,
-  resolvePlayableSubtitles,
-} from "../utils/playableSubtitles";
-import { isOverlayInventoryProvisional } from "../utils/inventoryProvenance";
+import { resolvePlayableSubtitles } from "../utils/playableSubtitles";
 import { patchVersionMarkers, resolveActiveVersionMarkers } from "../utils/watchPageMarkers";
 import { VideoPlayer } from "./VideoPlayer";
 import { fetchWatchDetail } from "@/hooks/queries/items";
-import {
-  applyVersionAvailability,
-  type VersionLivenessVerdict,
-} from "@/hooks/queries/versionLiveness";
-import {
-  awaitVirtualCandidatesRefresh,
-  cancelVirtualCandidatesRefresh,
-} from "@/api/v2/mediaCandidates";
 import { transientTrickplayError, useWatchTrickplay } from "@/hooks/queries/trickplay";
 import { itemKeys } from "@/hooks/queries/keys";
-import { useRealtimeEvents } from "@/components/realtimeEventsContext";
 import { useWatchPlaybackController } from "@/playback/watchPlaybackContext";
 import { useWatchTogetherRoomConnection } from "../hooks/useWatchTogetherRoomConnection";
 import { useTrackChoicePersistence } from "../hooks/useTrackChoicePersistence";
 import { toast } from "sonner";
-
-/**
- * Live inventory refresh. A session that started before the server finished
- * probing a virtual file carries the synthesized inventory the plan had then.
- * These bound how often the client re-reads the catalog to fill the menus in.
- * The poll only ever updates menu data; it never restarts the stream.
- */
-export const INVENTORY_REFRESH_INTERVAL_MS = 20_000;
-export const INVENTORY_REFRESH_MAX_ATTEMPTS = 5;
-// Wall-clock backstop: failed requests do not count toward the attempt cap, so
-// a persistent error loop also needs an absolute deadline to stop at.
-export const INVENTORY_REFRESH_DEADLINE_MS = 5 * 60_000;
-// Early cadence for the first attempts. A virtual file's probe typically
-// persists its inventory within seconds of the optimistic start, so the first
-// reads must not wait a full 20 s interval to see it.
-export const INVENTORY_REFRESH_EARLY_DELAYS_MS: readonly number[] = [2_000, 4_000, 8_000];
-// Must match `useWatchDetail`'s staleTime so the inventory poll, chapter
-// refresh, and realtime marker reconcile share the mounted query's cache
-// instead of each issuing an independent fetch.
-const WATCH_DETAIL_STALE_TIME_MS = 30_000;
-
-/**
- * Delay before the next inventory poll. `attempt` is the number of polls
- * already scheduled, so 0 yields the first early delay. Once the inventory is
- * found the poll is complete and the delay is 0 (no further poll).
- */
-export function inventoryPollDelayMs(attempt: number, found: boolean): number {
-  if (found) return 0;
-  return INVENTORY_REFRESH_EARLY_DELAYS_MS[attempt] ?? INVENTORY_REFRESH_INTERVAL_MS;
-}
 
 function patchChapterThumbnail(
   versions: PlayerFileVersion[],
@@ -99,97 +55,6 @@ function patchChapterThumbnail(
   });
 
   return changed ? nextVersions : versions;
-}
-
-/**
- * Short human label for the catalogue row the plan landed on, used to name the
- * substituted source in the version-swap notice. Returns null when the row
- * carries nothing recognizable, so the notice can fall back to generic copy.
- */
-function buildEffectiveVersionLabel(version: PlayerFileVersion): string | null {
-  const video = version.codec_video ? version.codec_video.toUpperCase() : "";
-  const parts = [version.resolution, video].filter((part) => part.trim().length > 0);
-  if (parts.length === 0) {
-    return null;
-  }
-  return `${parts.join(" ")}${version.hdr ? " HDR" : ""}`;
-}
-
-/**
- * Re-keys the resolved row for the live session file into the version list.
- *
- * A start or an in-player switch can leave the session playing a file the
- * item's version list does not name: the server substituted another version,
- * or the plan resolved a virtual candidate the list carries under a different
- * row. Lookups keyed on `session.mediaFileId` then miss, so `activeVersion`
- * falls through to another release's first row and `isVirtualActiveFile`,
- * `selectedDuration` and `activeChapters` lose the live file's data. Resolve
- * the row for the live file by the plan's published effective source first,
- * otherwise by id, and re-key it under the session's file id, appending when
- * the list carries none.
- *
- * When the list already carries the live file id, the resolved row must be that
- * same file to replace it: a serve-layer rotation can move the effective source
- * without changing the collapsed file id, leaving a row whose URI is stale.
- * A path match that lands on a different catalog row (a virtual collapsed row
- * resolved to a concrete candidate) keeps the live row for provenance — the
- * substitution notice reads its identity — and appends the candidate under its
- * own id when the refreshed list omitted it. The list is returned unchanged when
- * the live row cannot be resolved.
- */
-export function mergeResolvedLiveVersion(
-  versions: PlayerFileVersion[],
-  liveFileId: number | null,
-  identity: EffectiveVersionIdentity,
-  candidates: readonly PlayerFileVersion[],
-): PlayerFileVersion[] {
-  if (liveFileId == null) return versions;
-  const liveIdentity = { ...identity, mediaFileId: liveFileId };
-  // Match the committed source by its published URI across both lists before
-  // falling back to the collapsed id: within a single list the id fallback
-  // would otherwise re-select the stale live row and hide the rotation.
-  const committedUri = identity.effectiveVirtualUri;
-  const resolved =
-    (committedUri
-      ? (versions.find((version) => version.file_path === committedUri) ??
-        candidates.find((version) => version.file_path === committedUri))
-      : undefined) ??
-    resolveEffectiveVersion(versions, liveIdentity) ??
-    resolveEffectiveVersion(candidates, liveIdentity);
-  if (!resolved) return versions;
-  const index = versions.findIndex((version) => version.file_id === liveFileId);
-  if (index === -1) return [...versions, { ...resolved, file_id: liveFileId }];
-  if (resolved.file_id !== liveFileId) {
-    // The committed source is a different catalog row (a virtual collapsed row
-    // resolved to a concrete candidate). Keep the live row for provenance, and
-    // append the candidate under its own id when the refreshed list omitted it.
-    if (versions.some((version) => version.file_id === resolved.file_id)) return versions;
-    return [...versions, resolved];
-  }
-  if (versions[index] === resolved) return versions;
-  const next = versions.slice();
-  next[index] = { ...resolved, file_id: liveFileId };
-  return next;
-}
-
-/**
- * Turns the server's additive `substitution_reason` into the clause the notice
- * leads with. An unknown or absent reason yields null so the caller falls back
- * to the generic substitution copy rather than inventing a cause.
- */
-function substitutionReasonPhrase(reason: string | undefined): string | null {
-  switch (reason) {
-    case "dead_release":
-      return "The selected version is no longer available";
-    case "listing_failed":
-      return "The provider couldn't list the selected version";
-    case "transport_failed":
-      return "The selected version wouldn't start";
-    case "decode_rejected":
-      return "This device can't decode the selected version";
-    default:
-      return null;
-  }
 }
 
 /**
@@ -275,22 +140,6 @@ function WatchPartyPlaybackGate(props: WatchPageProps) {
   );
 }
 
-// Stable empty reference: a fresh `[]` default would give the indexer-release
-// sync effect a new identity on every render and loop it.
-const EMPTY_INDEXER_RELEASES: PlayerIndexerRelease[] = [];
-
-// Stable empty reference for the same reason as `EMPTY_INDEXER_RELEASES`: the
-// array identity reaches the session hook's `selectFileId` and the legacy
-// catalog poll's dependency set, so a fresh `[]` default on every render would
-// restart the poll's attempt budget before it can spend it and clear the
-// terminal failure badge.
-const EMPTY_PLAYBACK_VARIANTS: PlayerPlaybackVariant[] = [];
-
-// The liveness verdicts are optional so WatchPage can render without the
-// item-page check (watch-party tests, standalone renders). An empty map leaves
-// every row's own metadata flag untouched.
-const EMPTY_VERSION_LIVENESS = new Map<number, VersionLivenessVerdict>();
-
 function WatchPagePlayer({
   contentId,
   title,
@@ -300,10 +149,7 @@ function WatchPagePlayer({
   versionPicked = false,
   libraryId,
   versions,
-  versionLiveness = EMPTY_VERSION_LIVENESS,
-  playbackVariants = EMPTY_PLAYBACK_VARIANTS,
-  indexerReleases = EMPTY_INDEXER_RELEASES,
-  virtualRanking,
+  playbackVariants = [],
   subtitles,
   initialPosition,
   forceInitialPosition,
@@ -312,8 +158,6 @@ function WatchPagePlayer({
   explicitAudioTrackIndex,
   initialSubtitleTrackIndexByFileId,
   initialBitmapSubtitleTrackIndexByFileId,
-  explicitFileSelection = false,
-  forceRelink = false,
   preferredSubtitleLanguage,
   preferredSubtitleTrackSignature,
   subtitleMode,
@@ -328,7 +172,6 @@ function WatchPagePlayer({
   seriesContext,
   onNavigateEpisode,
   onEnded,
-  onRequestedVersionChange,
   onExit,
   onMinimize,
   resumeHints,
@@ -347,27 +190,10 @@ function WatchPagePlayer({
   const playbackController = useWatchPlaybackController();
   const chapterRefreshAttemptsRef = useRef<Set<number>>(new Set());
   const handledSelectionRevisionRef = useRef<number | null>(null);
-  const playbackPositionRef = useRef(initialPosition ?? 0);
   const [playbackVersions, setPlaybackVersions] = useState(versions);
-  const [indexerReleaseRows, setIndexerReleaseRows] = useState(indexerReleases);
-  const [versionSwapNoticeDismissed, setVersionSwapNoticeDismissed] = useState(false);
   const [realtimeConnectionState, setRealtimeConnectionState] = useState<
     "disconnected" | "connecting" | "connected"
   >("disconnected");
-  // Only a reconnection needs the player to re-read its watch detail. The
-  // first "connected" is the socket this player just opened, at the same moment
-  // the mounted detail query fetched; reconciling there duplicated that read.
-  // An epoch counts reconnections and the reconcile below consumes it once.
-  const realtimeConnectedOnceRef = useRef(false);
-  const [realtimeReconnectEpoch, setRealtimeReconnectEpoch] = useState(0);
-  useEffect(() => {
-    if (realtimeConnectionState !== "connected") return;
-    if (!realtimeConnectedOnceRef.current) {
-      realtimeConnectedOnceRef.current = true;
-      return;
-    }
-    setRealtimeReconnectEpoch((epoch) => epoch + 1);
-  }, [realtimeConnectionState]);
   const watchTogetherConnection = useWatchTogetherRoomConnection({
     roomId: watchTogetherRoomId,
     roomToken: watchTogetherRoomToken,
@@ -376,10 +202,6 @@ function WatchPagePlayer({
   useEffect(() => {
     setPlaybackVersions(versions);
   }, [versions]);
-
-  useEffect(() => {
-    setIndexerReleaseRows(indexerReleases);
-  }, [indexerReleases]);
 
   const session = usePlaybackSession(
     playbackRequestKey ??
@@ -395,25 +217,10 @@ function WatchPagePlayer({
     explicitAudioTrackIndex,
     initialSubtitleTrackIndexByFileId,
     initialBitmapSubtitleTrackIndexByFileId,
-    explicitFileSelection,
-    forceRelink,
     !watchTogetherRoomId,
     bufferingMode,
     versionPicked,
   );
-
-  const sessionRef = useRef(session);
-  sessionRef.current = session;
-
-  // A manual retry from a stalled track menu re-arms the bounded discovery
-  // rounds below and makes one immediate inventory read. The menus restart
-  // their own bound, so the retry shows progress instead of failing at once.
-  const [inventoryRetryNonce, setInventoryRetryNonce] = useState(0);
-  const handleRetryInventory = useCallback(() => {
-    sessionRef.current.markInventoryRetrying();
-    setInventoryRetryNonce((current) => current + 1);
-    void sessionRef.current.pollInventory();
-  }, []);
 
   const fallbackHandledRef = useRef<string | null>(null);
   const [pendingFallbackKey, setPendingFallbackKey] = useState<string | null>(null);
@@ -480,77 +287,13 @@ function WatchPagePlayer({
     });
   }, [session.initialSubtitleError, session.initialSubtitleErrorTitle, session.playbackAttemptId]);
 
-  const trackSelectionNotice = session.trackSelectionNotice;
-  useEffect(() => {
-    if (!trackSelectionNotice) return;
-    toast.error(trackSelectionNotice.title, {
-      id: `track-selection-${trackSelectionNotice.id}`,
-      description: trackSelectionNotice.message,
-    });
-  }, [trackSelectionNotice]);
-
-  const activeVersion = useMemo(() => {
-    const resolved = resolveEffectiveVersion(playbackVersions, session);
-    if (resolved) return resolved;
-    // When the plan or a committed-source event names a concrete effective
-    // virtual source, a list miss is a real miss: never fall through to an
-    // unrelated release's row for the live session. An older plan with no
-    // effective identity keeps the historical id/first-row fallback.
-    if (session.effectiveVirtualUri) return undefined;
-    return (
-      (fileId ? playbackVersions.find((v) => v.file_id === fileId) : undefined) ??
-      playbackVersions[0]
-    );
-  }, [fileId, playbackVersions, session]);
-
-  // The plan's audio inventory is authoritative for the effective source after
-  // a version fallback; item metadata can be stale. Fall back to the version's
-  // probed tracks only when the plan publishes none (old plans, audiobooks).
   const audioTracks = useMemo(
-    () =>
-      (session.planAudioTracks?.length ?? 0) > 0
-        ? (session.planAudioTracks ?? [])
-        : (activeVersion?.audio_tracks ?? []),
-    [activeVersion, session.planAudioTracks],
+    () => playbackVersions.find((v) => v.file_id === session.mediaFileId)?.audio_tracks ?? [],
+    [playbackVersions, session.mediaFileId],
   );
-  // The fallback list is catalog metadata, not evidence for the effective file.
-  // Mark it provisional when the plan has no inventory of its own, so the
-  // overlay gates its rows instead of presenting placeholders as final.
-  const audioMenuProvisional = isOverlayInventoryProvisional(
-    session.audioInventoryProvisional,
-    (session.planAudioTracks?.length ?? 0) > 0,
-    audioTracks.length,
-  );
-
-  const versionSubtitles = useMemo(() => {
-    if (activeVersion?.subtitle_tracks !== undefined) {
-      if (activeVersion.subtitle_tracks.length === 0) {
-        return [];
-      }
-      // Shared ordinal derivation; see subtitleInventory.ts. Keeps this
-      // fallback's indexes aligned with the plan's published inventory.
-      return buildPublishedSubtitleTracks(activeVersion.subtitle_tracks);
-    }
-    return subtitles;
-  }, [activeVersion, subtitles]);
-
-  // Merge point for the two gated fallbacks above: the audio menu's
-  // `audioTracks` and the subtitle menu's `versionSubtitles`. Both read catalog
-  // metadata only when the plan publishes no inventory, and both must switch
-  // back to plan evidence as soon as it lands — keep their gates aligned.
   const playableSubtitles = useMemo(
-    () => resolvePlayableSubtitles(session.subtitleUrls, versionSubtitles),
-    [session.subtitleUrls, versionSubtitles],
-  );
-  // `playableSubtitles` knowingly falls back to the catalog rows above when the
-  // plan has not published a selectable inventory yet. Those rows are the
-  // pre-probe placeholders; mark them provisional even if the plan carries no
-  // declared marker, so the overlay waits for probe evidence instead of
-  // treating another release's catalog list as this file's final tracks.
-  const subtitleMenuProvisional = isOverlayInventoryProvisional(
-    session.subtitleInventoryProvisional,
-    hasSelectableSessionSubtitles(session.subtitleUrls),
-    playableSubtitles.length,
+    () => resolvePlayableSubtitles(session.subtitleUrls, subtitles),
+    [session.subtitleUrls, subtitles],
   );
 
   const handleSwitchVersion = useCallback(
@@ -559,55 +302,6 @@ function WatchPagePlayer({
     },
     [session],
   );
-
-  const handleSelectAutoVersion = useCallback(() => {
-    session.selectAutoVersion();
-  }, [session]);
-
-  /**
-   * Manually re-lists the title's video candidates for the version menu.
-   *
-   * The re-list is asynchronous: the endpoint accepts the work and returns an
-   * admin job, which is waited on to a terminal state before the server's
-   * answer is read back. The caller's refresh control stays locked for the
-   * whole flow. A rejected refresh throws before any state write, so the rows
-   * already on screen stay put rather than disappearing behind a failed
-   * request. A second press of the locked control cancels the job instead.
-   */
-  const { awaitAdminJob } = useRealtimeEvents();
-  const handleRefreshVersions = useCallback(async () => {
-    await awaitVirtualCandidatesRefresh(contentId, awaitAdminJob);
-    // Re-read the watch detail so the version list and the indexer releases
-    // both come from the server's answer rather than a client-side merge.
-    const detail = await queryClient.fetchQuery({
-      queryKey: itemKeys.watchDetail(contentId, fileId, libraryId),
-      queryFn: () => fetchWatchDetail(contentId, fileId, libraryId),
-      staleTime: 0,
-    });
-    // The refreshed list is the server's, but it carries no liveness verdict —
-    // the parent checks those separately. Re-stamp the parent's verdicts before
-    // the rows replace the list so the menu keeps its `available: false`
-    // warnings rather than dropping them until another projection fires.
-    const stamped = applyVersionAvailability(detail.versions, versionLiveness);
-    // The refreshed list is the server's, but the live session may still be on
-    // a source the re-list did not return (a rotation, or a candidate the
-    // server resolved the collapsed row to). Re-key that committed source into
-    // the fresh list so the version, audio and subtitle menus keep resolving
-    // their active row — and the provenance they display — against it.
-    const live = sessionRef.current;
-    setPlaybackVersions(
-      mergeResolvedLiveVersion(
-        stamped,
-        live.mediaFileId,
-        { mediaFileId: live.mediaFileId, effectiveVirtualUri: live.effectiveVirtualUri },
-        versions,
-      ),
-    );
-    setIndexerReleaseRows(detail.indexer_releases ?? []);
-  }, [awaitAdminJob, contentId, fileId, libraryId, queryClient, versionLiveness, versions]);
-  const handleCancelRefresh = useCallback(async () => {
-    await cancelVirtualCandidatesRefresh(contentId);
-  }, [contentId]);
 
   const activePlaybackVersion = useMemo(
     () => playbackVersions.find((version) => version.file_id === session.mediaFileId),
@@ -667,7 +361,6 @@ function WatchPagePlayer({
       positionSeconds: session.durationSeconds ?? 0,
       durationSeconds: session.durationSeconds ?? undefined,
       lastFileId: session.mediaFileId,
-      selectedFileId: session.plan?.requested_media_file_id ?? fileId ?? session.mediaFileId,
       lastResolution: activePlaybackVersion?.resolution,
       lastHDR: activePlaybackVersion?.hdr,
       lastCodecVideo: activePlaybackVersion?.codec_video,
@@ -693,7 +386,6 @@ function WatchPagePlayer({
   const updatePlaybackState = session.updatePlaybackState;
   const handlePlaybackStateChange = useCallback(
     (state: PlayerPlaybackStateChange) => {
-      playbackPositionRef.current = state.currentTime;
       updatePlaybackState(state.currentTime, state.playing);
       onPlaybackStateChange?.(state);
     },
@@ -768,9 +460,6 @@ function WatchPagePlayer({
     }
     chapterRefreshAttemptsRef.current.add(session.mediaFileId);
 
-    // Force the read past the mounted query's stale window. A fresh cached
-    // payload that still lacks chapters would otherwise be returned without a
-    // network request, spending this file's single repair attempt for nothing.
     void queryClient.fetchQuery({
       queryKey: itemKeys.watchDetail(contentId, fileId, libraryId),
       queryFn: () => fetchWatchDetail(contentId, fileId, libraryId),
@@ -788,23 +477,9 @@ function WatchPagePlayer({
     playbackVersions,
   ]);
 
-  const handledRealtimeReconnectRef = useRef(0);
-  // A reconcile belongs to one content and reconnect generation. Keep the
-  // latest parent inputs in refs so a versions or liveness change landing while
-  // the read is in flight updates what the answer is stamped with instead of
-  // canceling the effect and discarding the reconcile.
-  const versionsRef = useRef(versions);
-  versionsRef.current = versions;
-  const versionLivenessRef = useRef(versionLiveness);
-  versionLivenessRef.current = versionLiveness;
-  const reconcileGeneration = `${contentId}\u0000${fileId ?? ""}\u0000${libraryId ?? ""}\u0000${realtimeReconnectEpoch}`;
-  const reconcileGenerationRef = useRef(reconcileGeneration);
-  reconcileGenerationRef.current = reconcileGeneration;
   useEffect(() => {
     if (
       realtimeConnectionState !== "connected" ||
-      realtimeReconnectEpoch === 0 ||
-      handledRealtimeReconnectRef.current === realtimeReconnectEpoch ||
       !session.sessionId ||
       !session.mediaFileId ||
       session.loading ||
@@ -812,59 +487,32 @@ function WatchPagePlayer({
     ) {
       return;
     }
-    // Claim the reconnect before the request so a versions or liveness identity
-    // change while it is in flight cannot start a second one.
-    handledRealtimeReconnectRef.current = realtimeReconnectEpoch;
 
-    const generation = reconcileGeneration;
-    // Same key as the mounted `useWatchDetail` query, but always read fresh: a
-    // cached payload can predate a server-side inventory change. The fresh rows
-    // carry no liveness, so the verdicts the parent stamped on its own copy are
-    // re-applied below before this list replaces them.
+    const activeFileId = session.mediaFileId;
+    let cancelled = false;
     void queryClient
       .fetchQuery({
-        queryKey: itemKeys.watchDetail(contentId, fileId, libraryId),
-        queryFn: () => fetchWatchDetail(contentId, fileId, libraryId),
+        queryKey: itemKeys.watchDetail(contentId, activeFileId, libraryId),
+        queryFn: () => fetchWatchDetail(contentId, activeFileId, libraryId),
         staleTime: 0,
       })
       .then((detail) => {
-        // Only a newer content target or reconnect generation obsoletes this
-        // answer. Session, versions, and liveness movement while the read was
-        // in flight must not lose the reconcile for the generation that claimed
-        // it.
-        if (reconcileGenerationRef.current !== generation) return;
-
-        // The fresh server rows carry no liveness verdict; re-stamp the
-        // parent's current checked verdicts onto them before replacing the list
-        // so the menu keeps its `available: false` warnings rather than
-        // dropping them until another projection fires.
-        const stamped = applyVersionAvailability(detail.versions, versionLivenessRef.current);
-        // A serve-layer rotation during the disconnect can move the effective
-        // source without changing the collapsed file id. Re-key the committed
-        // live source into the fresh list the same way a manual refresh does,
-        // so `activeVersion` follows the rotation instead of falling through
-        // to the first row.
-        const live = sessionRef.current;
-        setPlaybackVersions(
-          mergeResolvedLiveVersion(
-            stamped,
-            live.mediaFileId,
-            { mediaFileId: live.mediaFileId, effectiveVirtualUri: live.effectiveVirtualUri },
-            versionsRef.current,
-          ),
-        );
+        if (!cancelled) {
+          setPlaybackVersions(detail.versions);
+        }
       })
       .catch(() => {
         // Reconcile again on the next connection; keep the current markers meanwhile.
       });
+
+    return () => {
+      cancelled = true;
+    };
   }, [
     contentId,
-    fileId,
     libraryId,
     queryClient,
     realtimeConnectionState,
-    realtimeReconnectEpoch,
-    reconcileGeneration,
     session.loading,
     session.mediaFileId,
     session.replacing,
@@ -948,25 +596,6 @@ function WatchPagePlayer({
     [session.mediaFileId, session.sessionId],
   );
 
-  // The server tells us whether a terminal is worth retrying. A retryable
-  // virtual-source refusal gets a Try again action, as does a retryable
-  // transcode start failure (e.g. a seek anchor that failed on a transient
-  // relay error — a fresh start re-lists and can succeed where the same
-  // plan could not proceed); every other terminal keeps the plain Go Back
-  // dead-end. An adaptation refusal always offers the action: the server
-  // marks it non-retryable because replaying the same plan cannot work, but
-  // a *fresh start* can re-list and re-resolve the source.
-  const canRetryTerminal =
-    !session.plan &&
-    (session.errorReason === "virtual_source_unavailable" ||
-    session.errorReason === "transcode_start_failed"
-      ? session.errorRetryable === true
-      : isAdaptationUnavailableReason(session.errorReason));
-  // A session answered gone cannot be replanned or reconnected. The only
-  // recovery is a new start at the position the viewer reached.
-  const canRestartSession = !session.plan && session.connectionStatus === "gone";
-  const retryInFlight = session.retrying;
-
   // The plan is the player's contract: without one there is no transport, no
   // timeline and no track inventory to render against.
   if (!session.plan || !session.streamUrl || !session.sessionId) {
@@ -988,149 +617,25 @@ function WatchPagePlayer({
         <div className="surface-panel-subtle flex max-w-md flex-col items-center gap-4 rounded-[1.8rem] px-8 py-8 text-center">
           <div className="space-y-2">
             <p className="text-base font-semibold text-white">
-              {session.errorTitle ?? session.connectionErrorTitle ?? "Playback unavailable"}
+              {session.errorTitle ?? "Playback unavailable"}
             </p>
             <p className="text-sm text-white/60">
-              {session.error ?? session.connectionError ?? "Vio could not start playback."}
+              {session.error ?? "Silo could not start playback."}
             </p>
           </div>
-          <div className="flex flex-col items-center gap-2">
-            {canRestartSession ? (
-              <button
-                onClick={() => {
-                  session.restartPlayback();
-                }}
-                type="button"
-                className="rounded-[0.95rem] bg-white px-4 py-2 text-sm font-semibold text-black transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
-              >
-                Restart playback
-              </button>
-            ) : canRetryTerminal ? (
-              <button
-                onClick={() => {
-                  session.retryStart();
-                }}
-                type="button"
-                disabled={retryInFlight}
-                className="rounded-[0.95rem] bg-white px-4 py-2 text-sm font-semibold text-black transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
-              >
-                Try again
-              </button>
-            ) : null}
-            <button
-              onClick={() => {
-                void onExit();
-              }}
-              type="button"
-              className="rounded-[0.95rem] bg-white/10 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-white/20"
-            >
-              Go Back
-            </button>
-          </div>
+          <button
+            onClick={() => {
+              void onExit();
+            }}
+            type="button"
+            className="rounded-[0.95rem] bg-white/10 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-white/20"
+          >
+            Go Back
+          </button>
         </div>
       </div>
     );
   }
-
-  // A version switch keeps the old stream playing while the replacement plan
-  // is resolved (for virtual versions the server round trip can take seconds).
-  // Surface that with a small non-blocking chip near the controls instead of
-  // replacing the whole page — the viewer keeps watching the old stream.
-  const switchingIndicator = session.replacing ? (
-    <div
-      role="status"
-      aria-label="Switching version"
-      className="pointer-events-none absolute top-[max(4.5rem,calc(env(safe-area-inset-top)+3.5rem))] left-1/2 z-50 -translate-x-1/2"
-    >
-      <div className="flex items-center gap-2 rounded-full border border-white/15 bg-black/70 px-3 py-1.5 text-xs font-medium text-white/80 shadow-lg backdrop-blur">
-        <span className="h-3 w-3 animate-spin rounded-full border-2 border-white/25 border-t-white" />
-        Switching version…
-      </div>
-    </div>
-  ) : null;
-
-  // The server may substitute a different version (e.g. HDR→SDR) when the
-  // requested one is not playable on this device, and a serve-layer rotation can
-  // move the release mid-stream without publishing a new plan. Either way the
-  // client owes the viewer an honest, non-blocking notice saying what is playing
-  // instead of what they asked for.
-  //
-  // The requested row is the plan's requested id (a serve-layer rotation never
-  // moves it). The effective release is the LIVE session identity first — it
-  // moves on a rotation — then the plan's. A virtual requested row defeats the
-  // id comparison: the server collapses `effective_media_file_id` onto the
-  // requested id and publishes the concrete candidate as `effective_virtual_uri`
-  // instead, so the candidate's path is compared against the requested row's
-  // own path. When the requested row carries no path (older responses) the
-  // comparison says nothing, so the notice stays quiet rather than guess.
-  //
-  // The server also publishes the substitution additively
-  // (`substituted_from_file_id` + `substitution_reason`), which is authoritative
-  // when present and lets the notice name the cause without re-deriving it.
-  const plan = session.plan;
-  const requestedFileId = plan?.requested_media_file_id ?? fileId ?? null;
-  const requestedVersion =
-    requestedFileId != null
-      ? playbackVersions.find((v) => v.file_id === requestedFileId)
-      : undefined;
-  // The live session moves the effective id on a rotation; otherwise the plan's
-  // effective id is the authority (the session id can lag, or equal the
-  // collapsed requested row). So the session id wins only once it has actually
-  // moved off the requested row.
-  const planEffectiveFileId = plan?.effective_media_file_id ?? null;
-  const sessionMediaFileId = session.mediaFileId;
-  const effectiveFileId =
-    sessionMediaFileId != null && sessionMediaFileId !== requestedFileId
-      ? sessionMediaFileId
-      : (planEffectiveFileId ?? sessionMediaFileId);
-  const effectiveVirtualUri = session.effectiveVirtualUri ?? plan?.effective_virtual_uri ?? null;
-  const virtualSubstitution =
-    !!effectiveVirtualUri &&
-    requestedVersion?.file_path !== undefined &&
-    requestedVersion.file_path !== effectiveVirtualUri;
-  const versionWasSubstituted =
-    (plan?.substituted_from_file_id != null && plan.substituted_from_file_id !== effectiveFileId) ||
-    (requestedFileId != null && effectiveFileId != null && requestedFileId !== effectiveFileId) ||
-    virtualSubstitution;
-  // Name the row the plan actually landed on when we can resolve it, so the
-  // notice says what is playing instead of only that something changed. The
-  // effective row is resolved through the effective identity, not the
-  // session's requested id, because the effective id is the authority.
-  const effectiveVersionRow = resolveEffectiveVersion(playbackVersions, {
-    // A published virtual URI is the sole identity of the effective candidate;
-    // the collapsed id names the neutral row, so falling back to it would label
-    // the wrong row. Only fall back to the id for ordinary files and older
-    // plans that publish no URI.
-    mediaFileId: effectiveVirtualUri ? null : effectiveFileId,
-    effectiveVirtualUri,
-  });
-  const effectiveVersionLabel = effectiveVersionRow
-    ? buildEffectiveVersionLabel(effectiveVersionRow)
-    : null;
-  const reasonPhrase = substitutionReasonPhrase(plan?.substitution_reason);
-  const substitutionCopy = reasonPhrase
-    ? effectiveVersionLabel
-      ? `${reasonPhrase}, so Vio is playing ${effectiveVersionLabel} instead.`
-      : `${reasonPhrase} — playing a different version.`
-    : effectiveVersionLabel
-      ? `The selected version wasn't available, so Vio is playing ${effectiveVersionLabel} instead.`
-      : "Playing a different version than selected — the requested version isn't playable on this device.";
-  const versionSwapNotice =
-    versionWasSubstituted && !versionSwapNoticeDismissed ? (
-      <div className="absolute top-[max(4.5rem,calc(env(safe-area-inset-top)+3.5rem))] left-1/2 z-50 -translate-x-1/2">
-        <div className="flex items-center gap-2 rounded-full border border-white/15 bg-black/70 px-3 py-1.5 text-xs font-medium text-white/80 shadow-lg backdrop-blur">
-          <span>{substitutionCopy}</span>
-          <button
-            type="button"
-            aria-label="Dismiss version notice"
-            onClick={() => setVersionSwapNoticeDismissed(true)}
-            className="cursor-pointer rounded-full px-1 text-white/60 transition-colors hover:text-white"
-          >
-            ✕
-          </button>
-        </div>
-      </div>
-    ) : null;
 
   // Find the duration of the selected file so the player knows the total
   // length even when the stream is chunked (no Content-Length header).
@@ -1138,7 +643,8 @@ function WatchPagePlayer({
     session.durationSeconds ??
     playbackVersions.find((v) => v.file_id === session.mediaFileId)?.duration ??
     playbackVersions[0]?.duration;
-  const selectedVersion = activeVersion;
+  const selectedVersion =
+    playbackVersions.find((v) => v.file_id === session.mediaFileId) ?? playbackVersions[0];
   const activeChapters =
     (playbackVersions.find((v) => v.file_id === session.mediaFileId) ?? selectedVersion)
       ?.chapters ?? [];
