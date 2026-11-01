@@ -142,9 +142,7 @@ function VersionDropdown({
   // The same cache key the ActionBar reads for the selected row: one watch
   // detail per selection, so the picker's badges and the popovers below it can
   // never disagree about the row's tracks.
-  const { data: watch } = useWatchDetail(contentId, selectedVersion?.file_id, undefined, {
-    enabled: versionOpen && !!contentId,
-  });
+  const { data: watch } = useWatchDetail(contentId, selectedVersion?.file_id, undefined);
   // Indexer releases are read from the same watch detail the picker already
   // loads for the score/ranking. They are gated on the server's capability so a
   // server that cannot request releases shows no indexer UI at all.
