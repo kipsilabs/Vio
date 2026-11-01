@@ -3744,7 +3744,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		// instead of inheriting the catalog value.
 		syncProbeFile.Duration = 0
 		if !substituted {
-			if cached, _ := h.virtualProbeFromCache(attemptCtx, file, streamURL, syncProbeFile, cand, resolvedIdentity.tiers(), oid); cached != nil {
+			if cached, cachedObservation := h.virtualProbeFromCache(attemptCtx, file, streamURL, syncProbeFile, cand, resolvedIdentity.tiers(), oid); cached != nil {
 				trace.probeRan = true
 				if transient.ID > 0 {
 					cached.ID = transient.ID
@@ -3755,8 +3755,15 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				}
 				applyResolvedIdentity(cached, resolvedIdentity)
 				h.maybeTriggerSubtitleSearch(attemptCtx, cached, cand)
+				// The hit is a completed probe, not necessarily the pin's
+				// identity: the cached bytes can disagree with a served-size
+				// observation recorded since they were measured, and
+				// virtualProbeFromCache serves that case without writing. Carry
+				// its verdict on the source so the finalization below can honor
+				// it instead of classifying the same bytes a second time.
 				return withResolvedCandidate(&resolvedVirtualPlaybackSource{
 					URL: streamURL, URI: cand.URI, OwnerID: oid, File: cached, ProbeSucceeded: true, Provenance: ProbeProvenanceVerified,
+					EvidenceObservation: cachedObservation,
 				}, resolvedIdentity, resolvedRematched), nil
 			}
 		}
@@ -3903,9 +3910,21 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			// right content keeps the item's runtime and is accepted, while a
 			// different file fails the duration check independently of size.
 			evidencePin := scanner.VirtualServedSizePin(candidate.URI, ownerID)
-			evidenceVerdict := classifyVirtualServedEvidenceV3(
-				evidencePin, result.File.FileSize, result.File, expectedRuntimeMinutes,
-			)
+			// A cache hit arrives with the verdict its own pass produced (see
+			// virtualProbeFromCache). Classifying is not a read-only check: it
+			// records the pin's first served-size observation, so a second pass
+			// over the same bytes reads back the snapshot this request just
+			// wrote, takes its own recording for the confirming serve, and hands
+			// an unconfirmed serve to the persist and pin below. Honor the
+			// pre-set observation instead. A mismatch never reaches this branch:
+			// the cache seam discards it, so the observation is the only verdict
+			// a hit can carry that the gate must not recompute.
+			evidenceVerdict := scanner.VirtualServedEvidenceUnverified
+			if !result.EvidenceObservation {
+				evidenceVerdict = classifyVirtualServedEvidenceV3(
+					evidencePin, result.File.FileSize, result.File, expectedRuntimeMinutes,
+				)
+			}
 			if evidenceVerdict == scanner.VirtualServedEvidenceMismatch {
 				// The probe read a readable container that is not the release
 				// this row declares. Rotate to a sibling instead of persisting
@@ -3948,12 +3967,13 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			}
 			result.CandidateRank = i
 			result.CandidateCount = len(candidates)
-			if virtualProbeEvidenceIsObservation(evidencePin, evidenceVerdict) {
+			if result.EvidenceObservation || virtualProbeEvidenceIsObservation(evidencePin, evidenceVerdict) {
 				// The bytes play for this request, but they are the pin's first
 				// served-size observation: writing them would stamp the row and
 				// let the next replay skip the probe that confirms it, and
 				// pinning them would bind rotation to bytes no evidence names
-				// yet. Serve, write nothing, leave the pin as it was.
+				// yet. Serve, write nothing, leave the pin as it was. A cached
+				// hit carries the same disposition from its own pass.
 				return *result, nil
 			}
 			h.persistVirtualProbeEvidence(r.Context(), file, result.File.FilePath, result.File, resolvedSourceIdentity(result).tiers(), result.Provenance == ProbeProvenanceVerified, true)

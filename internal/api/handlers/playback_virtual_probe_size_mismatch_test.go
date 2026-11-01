@@ -622,6 +622,123 @@ func TestResolveVirtualPlaybackObservationServeWritesNothing(t *testing.T) {
 	}
 }
 
+// TestResolveVirtualPlaybackCacheFirstObservationWritesNothing pins the
+// cache-first seam of the shared resolve. A probe-cache hit is a completed
+// probe, but the classification deciding what the hit may be used for is not
+// read-only: it records the pin's first served-size observation. Dropping that
+// verdict and classifying the same bytes again in the outer finalization let the
+// request read its own recording as the confirming serve, so the first-ever
+// duration-excused size gap became the pin's identity by persistence. The hit
+// now carries its verdict to the finalization, which serves it and writes
+// nothing; only a later serve landing on the recorded size persists and pins.
+func TestResolveVirtualPlaybackCacheFirstObservationWritesNothing(t *testing.T) {
+	const (
+		release      = "Movie.2024.2160p.WEB-DL"
+		declared     = int64(6_330_000_000)
+		served       = int64(5_570_000_000)
+		runtime      = 90
+		contentID    = "movie-tt-cache-observation"
+		neutralPath  = "virtual://movie/tt-cache-observation"
+		candidateURI = neutralPath + "?result=pin-1"
+	)
+	file := &models.MediaFile{
+		ID: 630, ContentID: contentID, FilePath: neutralPath,
+		Container: "virtual", VirtualOwnerInstallationID: 5, MediaFolderID: 9,
+	}
+	rows := map[string]*models.MediaFile{
+		candidateURI: sizeMismatchFallbackRow(631, candidateURI, release, declared),
+	}
+	candidates := []VirtualPlaybackStream{
+		sizeMismatchFallbackCandidate("pin-1", candidateURI, release, declared),
+	}
+	scanner.ResetVirtualServedSizeSnapshots()
+	t.Cleanup(scanner.ResetVirtualServedSizeSnapshots)
+	h, probes, saved := sizeMismatchFallbackHandler(t, file, candidates, rows, func(*models.MediaFile) (int64, error) {
+		return declared, nil
+	})
+	h.ItemLookup = staticRuntimeItemLookup{runtime: runtime}
+	// The measured bytes are the pin's first duration-proven size observation:
+	// they fall well short of the declaration while the duration proves the
+	// content. This is the release-posted-short case the two-observation gate
+	// exists for, served from a probe completed before any observation existed.
+	cacheHits := 0
+	h.VirtualProbeCacheLookup = func(_ string, probeFile *models.MediaFile) *models.MediaFile {
+		cacheHits++
+		return &models.MediaFile{
+			FilePath:         probeFile.FilePath,
+			FileSize:         probeFile.FileSize,
+			ProbedFormatSize: served,
+			Duration:         runtime * 60,
+			VideoTracks:      []models.VideoTrack{{Codec: "hevc", Width: 3840, Height: 2160}},
+			AudioTracks:      []models.AudioTrack{{Codec: "eac3", Channels: 6, Language: "eng"}},
+		}
+	}
+	stickyKey := bestResultCacheKey(contentID, virtualPlaybackNeutralKey(neutralPath), file.VirtualOwnerInstallationID, "")
+
+	first, err := h.resolveVirtualPlaybackSource(
+		httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil), file, "profile-1", false, nil, "", "", 0, false)
+	if err != nil {
+		t.Fatalf("resolve error: %v", err)
+	}
+	if first.URI != candidateURI {
+		t.Fatalf("resolved URI = %q, want the cached candidate %q", first.URI, candidateURI)
+	}
+	if cacheHits == 0 {
+		t.Fatal("the probe cache was never consulted")
+	}
+	if len(*probes) != 0 {
+		t.Fatalf("probes = %v, want none: the cache hit must skip the ffprobe", *probes)
+	}
+	// The write and pin are what turn one unconfirmed serve into the pin's
+	// identity, so check them first: everything below only explains why.
+	h.StopVirtualEvidence()
+	if len(*saved) != 0 {
+		t.Fatalf("the recording cache replay persisted %+v, want no catalog write", *saved)
+	}
+	if got := h.peekVirtualSticky(stickyKey); got != "" {
+		t.Fatalf("the recording cache replay pinned %q, want no sticky pin before confirmation", got)
+	}
+	if first.Provenance != ProbeProvenanceVerified {
+		t.Fatalf("provenance = %q, want %q (served with the cached inventory)",
+			first.Provenance, ProbeProvenanceVerified)
+	}
+	if !first.EvidenceObservation {
+		t.Fatal("the cache hit that recorded the pin's first observation was served as identity")
+	}
+	if first.File == nil || first.File.ProbedFormatSize != served {
+		t.Fatalf("file = %+v, want the cached bytes %d", first.File, served)
+	}
+
+	// The confirming serve lands on the size the first one recorded, so the pin
+	// is admitted and this request persists and pins it.
+	second, err := h.resolveVirtualPlaybackSource(
+		httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil), file, "profile-1", false, nil, "", "", 0, false)
+	if err != nil {
+		t.Fatalf("second resolve error: %v", err)
+	}
+	if second.URI != candidateURI {
+		t.Fatalf("second resolved URI = %q, want %q", second.URI, candidateURI)
+	}
+	if second.EvidenceObservation {
+		t.Fatal("the confirming serve was still an observation")
+	}
+	h.StopVirtualEvidence()
+	if len(*saved) == 0 {
+		t.Fatal("the confirming serve persisted nothing, want the pin's inventory written")
+	}
+	for _, write := range *saved {
+		if write.FileID != file.ID {
+			t.Fatalf("saved = %+v, want every write on the resolved row %d", *saved, file.ID)
+		}
+		if !write.StampProbe {
+			t.Fatalf("saved = %+v, want the confirming serve to stamp the probe evidence", *saved)
+		}
+	}
+	if got := h.peekVirtualSticky(stickyKey); got != candidateURI {
+		t.Fatalf("sticky pin = %q, want the confirmed candidate %q", got, candidateURI)
+	}
+}
+
 // TestFallbackSubstituteProbeGatesOnTheSubstitutesOwnDeclaration pins the
 // stale-source fallback's evidence gate. The fallback adopts a release other
 // than the stale row, so the declared-size baseline must be that substitute's
@@ -631,7 +748,7 @@ func TestResolveVirtualPlaybackObservationServeWritesNothing(t *testing.T) {
 // two-observation rule instead. A first duration-proven size gap serves without
 // persist/adopt/stamp, the confirming serve adopts it, and a genuine mismatch
 // is refused rather than written.
-func TestFallbackSubstituteProbeGatesOnTheSubstitutesOwnDeclaration(t *testing.T) {
+func TestFallbackSubstituteProbeGatesOnTheSubstitutesOwnDeclaration(t *testing.T) { //nolint:funlen,gocyclo // one fixture drives the five evidence outcomes the gate must distinguish; splitting it duplicates the substitute setup
 	const (
 		staleURI           = "virtual://movie/tt-fallback-gate?result=stale"
 		substituteURI      = "virtual://movie/tt-fallback-gate?result=substitute"
