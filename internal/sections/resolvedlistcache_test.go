@@ -977,8 +977,8 @@ func TestInvalidateAllResolvedListCachesForPurgeDropsEveryRail(t *testing.T) {
 	trending := ResolvedSection{SectionType: SectionTrendingOnServer, ItemLimit: 20}
 	recentKey := resolvedListCacheKey(recent, nil, nil, catalog.AccessFilter{})
 	trendingKey := resolvedListCacheKey(trending, nil, nil, catalog.AccessFilter{})
-	resolvedListSet(recentKey, mediaItems("ghost-recent"), 1, now)
-	resolvedListSet(trendingKey, mediaItems("ghost-trending"), 1, now)
+	resolvedListSet(recentKey, mediaItems("ghost-recent"), 1, now, resolvedListEvictionEpoch.Load())
+	resolvedListSet(trendingKey, mediaItems("ghost-trending"), 1, now, resolvedListEvictionEpoch.Load())
 	InvalidateAllResolvedListCachesForPurge()
 	if _, ok := resolvedListGet(recentKey); ok {
 		t.Fatal("purge invalidation kept recently_added entry")
@@ -994,7 +994,7 @@ func TestPurgeEpochFencesInFlightLoad(t *testing.T) {
 	now := time.Now()
 	sec := ResolvedSection{SectionType: SectionTrendingOnServer, ItemLimit: 20}
 	oldKey := resolvedListCacheKey(sec, nil, nil, catalog.AccessFilter{})
-	resolvedListSet(oldKey, mediaItems("old"), 1, now)
+	resolvedListSet(oldKey, mediaItems("old"), 1, now, resolvedListEvictionEpoch.Load())
 
 	release := make(chan struct{})
 	loaderStarted := make(chan struct{})
@@ -1068,7 +1068,7 @@ func TestDropSupersededMatchesGenerationSegmentExactly(t *testing.T) {
 	// Build keys for specific generations directly: "purge=0|generation=N|…"
 	suffix := "type=" + string(sec.SectionType) + "|config=none|limit=20|library=7|libraries=<nil>"
 	gen10Key := resolvedListPurgeEpochKeyPrefix(0) + resolvedListGenerationKeyPrefix(10) + suffix
-	resolvedListSet(gen10Key, mediaItems("one"), 1, now)
+	resolvedListSet(gen10Key, mediaItems("one"), 1, now, resolvedListEvictionEpoch.Load())
 	resolvedListInvalidationMu.Lock()
 	dropSupersededResolvedListEntries(11)
 	resolvedListInvalidationMu.Unlock()
@@ -1080,7 +1080,7 @@ func TestDropSupersededMatchesGenerationSegmentExactly(t *testing.T) {
 		t.Fatal("stale generation 10 key lingered after sweep")
 	}
 	gen1Key := resolvedListPurgeEpochKeyPrefix(0) + resolvedListGenerationKeyPrefix(1) + suffix
-	resolvedListSet(gen1Key, mediaItems("two"), 1, now)
+	resolvedListSet(gen1Key, mediaItems("two"), 1, now, resolvedListEvictionEpoch.Load())
 	resolvedListInvalidationMu.Lock()
 	dropSupersededResolvedListEntries(2)
 	resolvedListInvalidationMu.Unlock()
