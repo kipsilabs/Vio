@@ -12,7 +12,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Silo-Server/silo-server/internal/auth/passwordhash"
 	"github.com/Silo-Server/silo-server/internal/userstore"
+	"golang.org/x/crypto/bcrypt"
 )
 
 // RunMarkWatchedBatch checks series and season mark-watched behavior on each backend.
@@ -800,8 +802,12 @@ func testProfiles(t *testing.T, newStore func(t *testing.T) userstore.UserStore)
 	}
 
 	// PIN set and verify
-	pin := "1234"
-	if err := store.UpdateProfile(ctx, "prof-1", userstore.UpdateProfileInput{PIN: &pin}); err != nil {
+	pinHash, err := passwordhash.Generate(ctx, []byte("1234"), bcrypt.DefaultCost)
+	if err != nil {
+		t.Fatalf("hash PIN: %v", err)
+	}
+	pin := string(pinHash)
+	if err := store.UpdateProfile(ctx, "prof-1", userstore.UpdateProfileInput{PINHash: &pin}); err != nil {
 		t.Fatalf("UpdateProfile(PIN): %v", err)
 	}
 	ok, err := store.VerifyPIN(ctx, "prof-1", "1234")

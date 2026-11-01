@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/Silo-Server/silo-server/internal/auditmutation"
+	"github.com/Silo-Server/silo-server/internal/auth/passwordhash"
 	"github.com/Silo-Server/silo-server/internal/userstore"
 )
 
@@ -472,6 +473,30 @@ func (s *PostgresUserStore) DeleteProfileAudited(ctx context.Context, id string,
 	}
 
 	return tx.Commit(ctx)
+}
+
+func (s *PostgresUserStore) VerifyPIN(ctx context.Context, profileID, pin string) (bool, error) {
+	var pinHash string
+	err := s.pool.QueryRow(ctx, "SELECT pin_hash FROM user_profiles WHERE user_id = $1 AND id = $2", s.userID, profileID).Scan(&pinHash)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, fmt.Errorf("profile %s not found", profileID)
+	}
+	if err != nil {
+		return false, fmt.Errorf("querying PIN hash for profile %s: %w", profileID, err)
+	}
+	if pinHash == "" {
+		return false, fmt.Errorf("profile %s has no PIN set", profileID)
+	}
+	permit, err := passwordhash.AdmitAhead(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer permit.Release()
+	ok, err := permit.Matches([]byte(pinHash), []byte(pin))
+	if err != nil {
+		return false, fmt.Errorf("comparing PIN for profile %s: %w", profileID, err)
+	}
+	return ok, nil
 }
 
 // deleteProfileSectionOverrides takes a profile's entries out of the account's

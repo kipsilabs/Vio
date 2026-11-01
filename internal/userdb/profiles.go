@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/Silo-Server/silo-server/internal/auth/passwordhash"
 	"github.com/Silo-Server/silo-server/internal/userstore"
 )
 
@@ -15,6 +16,31 @@ type Profile = userstore.Profile
 
 // UpdateProfileInput is an alias for the canonical type in userstore.
 type UpdateProfileInput = userstore.UpdateProfileInput
+
+// VerifyPIN checks a plaintext PIN against the bcrypt hash stored for a profile.
+func VerifyPIN(ctx context.Context, db *sql.DB, profileID, pin string) (bool, error) {
+	var pinHash string
+	err := db.QueryRowContext(ctx, "SELECT pin_hash FROM profiles WHERE id = ?", profileID).Scan(&pinHash)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, fmt.Errorf("profile %s not found", profileID)
+	}
+	if err != nil {
+		return false, fmt.Errorf("querying PIN hash for profile %s: %w", profileID, err)
+	}
+	if pinHash == "" {
+		return false, fmt.Errorf("profile %s has no PIN set", profileID)
+	}
+	permit, err := passwordhash.AdmitAhead(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer permit.Release()
+	ok, err := permit.Matches([]byte(pinHash), []byte(pin))
+	if err != nil {
+		return false, fmt.Errorf("comparing PIN for profile %s: %w", profileID, err)
+	}
+	return ok, nil
+}
 
 // CreateProfile inserts a new profile into the profiles table.
 // The Profile.ID field must be set before calling this function; if empty,

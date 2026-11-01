@@ -54,6 +54,10 @@ func (s *SQLiteUserStore) UpdateProfile(_ context.Context, id string, u userstor
 	return UpdateProfile(s.db, id, u)
 }
 
+func (s *SQLiteUserStore) VerifyPIN(ctx context.Context, profileID, pin string) (bool, error) {
+	return VerifyPIN(ctx, s.db, profileID, pin)
+}
+
 func (s *SQLiteUserStore) DeleteProfile(ctx context.Context, id string) error {
 	return DeleteProfile(ctx, s.db, id)
 }
