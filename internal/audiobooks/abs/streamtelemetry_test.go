@@ -72,13 +72,10 @@ func telemetryRegistry(t testing.TB, families ...streamtelemetry.Family) *stream
 // test, which is how this project once shipped a feature that was a no-op for
 // weeks.
 //
-// NOTE: ABS stream telemetry was removed from the handler (the
-// SetStreamTelemetry hook and per-route observeABS wrapping no longer exist),
-// so the registry argument is accepted for signature compatibility but ignored.
 func absTelemetryServer(t testing.TB, registry *streamtelemetry.Registry, deps Dependencies) *absServer {
 	t.Helper()
 	handler := New(deps)
-	_ = registry
+	handler.SetStreamTelemetry(registry)
 	server := &absServer{registry: registry}
 	router := chi.NewRouter()
 	// Outermost on purpose: it returns only after every inner handler,
