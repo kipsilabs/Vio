@@ -3014,6 +3014,7 @@ func (s *TranscodeSession) BuildSourceAlignedPlaybackManifest(segPrefix, rawQuer
 	if err != nil {
 		return nil, err
 	}
+	rawQuery = s.generationScopedQuery(rawQuery)
 	if s.copyPlan != nil {
 		// A planned playlist starts at the source's beginning and doesn't
 		// depend on FFmpeg's progress or restarts.
