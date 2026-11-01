@@ -1931,7 +1931,32 @@ func planVideoTranscodeV3(input PlannerInputV3, base PlanV3, source SourceDescri
 	if planAttemptedV3(plan, input.Request.ClientPlaybackContext.Output.OutputContextID, input.AttemptedKeys) {
 		return terminalPlannerResultV3("adaptation_exhausted", "All compatible playback recipes have already failed for this output route.", false)
 	}
-	return PlannerResultV3{SubtitleRendition: subtitleRendition, Plan: &plan, PlayMethod: PlayTranscode, TranscodeAudio: true, TargetVideoCodec: targetVideo.codec, TargetAudioCodec: "aac", SourceAudioChannels: stereoDownmixSourceChannelsV3(source.AudioChannels, targetAudioChannels, true), TargetAudioChannels: targetAudioChannels, TargetAudioBitrateKbps: targetAudioBitrateKbps, TargetResolution: quality.Label, TargetBitrateKbps: quality.BitrateKbps, SubtitleTrackIndex: subtitle.SelectedIndex, SubtitleTransportTrackIndex: subtitle.TransportIndex, SubtitleBurnIn: subtitle.RequiresBurn, SubtitleCodec: subtitle.Codec, DownloadedSubtitleID: subtitle.DownloadedSubtitleID, ToneMapPolicy: toneMap.policy, ToneMapMode: toneMap.mode, ToneMapSourceKind: toneMap.sourceKind, ToneMapRecipeVersion: toneMapRecipeVersionV3(toneMap.ok), ToneMapPreflightRequired: toneMap.resolution.PreflightRequired, ToneMapSourceRevision: toneMap.revision}
+	return PlannerResultV3{
+		SubtitleRendition:           subtitleRendition,
+		Plan:                        &plan,
+		PlayMethod:                  PlayTranscode,
+		TranscodeAudio:              true,
+		TargetVideoCodec:            targetVideo.codec,
+		TargetAudioCodec:            "aac",
+		SourceAudioChannels:         stereoDownmixSourceChannelsV3(source.AudioChannels, targetAudioChannels, true),
+		TargetAudioChannels:         targetAudioChannels,
+		TargetAudioBitrateKbps:      targetAudioBitrateKbps,
+		TargetResolution:            quality.Label,
+		TargetBitrateKbps:           quality.BitrateKbps,
+		SourceFrameRate:             source.FrameRate,
+		SourceHeight:                source.Height,
+		SubtitleTrackIndex:          subtitle.SelectedIndex,
+		SubtitleTransportTrackIndex: subtitle.TransportIndex,
+		SubtitleBurnIn:              subtitle.RequiresBurn,
+		SubtitleCodec:               subtitle.Codec,
+		DownloadedSubtitleID:        subtitle.DownloadedSubtitleID,
+		ToneMapPolicy:               toneMap.policy,
+		ToneMapMode:                 toneMap.mode,
+		ToneMapSourceKind:           toneMap.sourceKind,
+		ToneMapRecipeVersion:        toneMapRecipeVersionV3(toneMap.ok),
+		ToneMapPreflightRequired:    toneMap.resolution.PreflightRequired,
+		ToneMapSourceRevision:       toneMap.revision,
+	}
 }
 
 // h264BoundedQualityV3 fits a transcode target to the client's attested
