@@ -2903,10 +2903,13 @@ func (s *TranscodeSession) generationScopedQuery(rawQuery string) string {
 		return rawQuery
 	}
 	encoded := "sgen=" + url.QueryEscape(token)
-	if rawQuery == "" {
-		return encoded
+	values, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return rawQuery + "&" + encoded
 	}
-	return rawQuery + "&" + encoded
+	values.Del(GenerationQueryParam)
+	values.Add(GenerationQueryParam, token)
+	return values.Encode()
 }
 
 // buildPlaybackManifest is BuildPlaybackManifest for a query manifestQuery

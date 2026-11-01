@@ -672,7 +672,7 @@ func ServeRemuxWithOptions(w http.ResponseWriter, r *http.Request, filePath, out
 
 	session, err := startRemuxWithOptions(r.Context(), filePath, outputFormat, seekSeconds, transcodeAudio, audioTrackIndex, dvProfile, mode, ffmpegPath, opts.AudioOnly, opts.SourceAudioChannels, opts.TargetAudioChannels, opts.TargetAudioBitrateKbps, opts.DropResumeLeadingPictures, opts.CopyAudioCodec)
 	if err != nil {
-		writeStartError(w, opts.DeferStartError, "failed to start remux", http.StatusInternalServerError)
+		writeStartError(w, opts.DeferStartError, "failed to start remux", http.StatusBadGateway)
 		return err
 	}
 	defer func() { _ = session.Close() }()
@@ -699,10 +699,38 @@ func ServeRemuxWithOptions(w http.ResponseWriter, r *http.Request, filePath, out
 
 	buf := make([]byte, 32*1024)
 	first := make([]byte, 0)
-	if n, readErr := session.Read(buf); n > 0 {
+	firstTimeout := opts.FirstOutputTimeout
+	if firstTimeout <= 0 {
+		firstTimeout = remuxFirstOutputTimeout
+	}
+	readResult := make(chan struct {
+		n   int
+		err error
+	}, 1)
+	go func() {
+		n, err := session.Read(buf)
+		readResult <- struct {
+			n   int
+			err error
+		}{n, err}
+	}()
+	var n int
+	var readErr error
+	select {
+	case result := <-readResult:
+		n, readErr = result.n, result.err
+	case <-time.After(firstTimeout):
+		session.Abort()
+		err := fmt.Errorf("%w: first output timeout after %s: %w", errRemuxNoOutput, firstTimeout, io.EOF)
+		writeStartError(w, opts.DeferStartError, "failed to remux", http.StatusBadGateway)
+		return err
+	}
+	if n > 0 {
 		first = append(first, buf[:n]...)
 	} else if readErr != nil {
-		return readErr
+		err := fmt.Errorf("%w: %w", errRemuxNoOutput, readErr)
+		writeStartError(w, opts.DeferStartError, "failed to remux", http.StatusBadGateway)
+		return err
 	}
 	setStreamHeaders()
 	w.WriteHeader(http.StatusOK)
