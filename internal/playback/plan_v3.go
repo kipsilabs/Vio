@@ -1631,12 +1631,28 @@ func resolveTranscodeVideoTargetV3(input PlannerInputV3, source SourceDescriptor
 	// The caller owns the base plan; this helper only selects the target and
 	// recipe. Plan construction remains in planVideoTranscodeV3 so source and
 	// session state are restored there consistently.
-	selection := targetVideoSelectionV3{codec: targetVideoCodec, transformation: func() string {
-		if targetVideoCodec == transcodeCodecHEVC {
-			return TransformationVideoToHEVCV3
-		}
-		return TransformationVideoToH264V3
-	}(), h264Quality: h264Quality}
+	selection := targetVideoSelectionV3{
+		codec: targetVideoCodec,
+		transformation: func() string {
+			if targetVideoCodec == transcodeCodecHEVC {
+				return TransformationVideoToHEVCV3
+			}
+			return TransformationVideoToH264V3
+		}(),
+		recipeVersion: func() string {
+			if targetVideoCodec == transcodeCodecHEVC {
+				return TransformationVideoToHEVCRecipeVersionV3
+			}
+			return TransformationVideoToH264RecipeVersionV3
+		}(),
+		claim: func() string {
+			if targetVideoCodec == transcodeCodecHEVC {
+				return ClaimHEVCDecodeV3
+			}
+			return ClaimH264DecodeV3
+		}(),
+		h264Quality: h264Quality,
+	}
 	return selection, quality, toneMapRecipe, nil
 	/*
 		if source.DynamicRange != "" && source.DynamicRange != DynamicRangeSDRV3 {

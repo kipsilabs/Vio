@@ -22,10 +22,6 @@
     "buffering_quality_v1",
     "playback_plan_summary_v1",
     "subrip_sidecar_v1",
-    "live_inventory_refresh_v1",
-    "source_committed_event_v1",
-    "inventory_updated_event_v1",
-    "deferred_track_inventory_v1",
     "marker_thumbnails_v1",
     "hls_subtitle_renditions_v1",
     "plan_active_quality_v1",
@@ -233,6 +229,18 @@
       "audio_layout": "stereo"
     },
     "subtitle_fidelity_policy": "allow_simplified_rendering",
+    "audio_tracks": [
+      {
+        "codec": "aac",
+        "layout": "stereo",
+        "channels": 2,
+        "default": false,
+        "track_id": "file:42:audio:0",
+        "selection_index": 0
+      }
+    ],
+    "inventory_revision": "inv:9a032e462d234d95d38d3b4fef24b046",
+    "inventory_status": "declared",
     "active_quality": "720p-medium"
   }
 }

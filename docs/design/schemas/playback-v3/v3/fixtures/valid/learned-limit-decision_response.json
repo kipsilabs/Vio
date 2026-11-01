@@ -17,6 +17,7 @@
     "authorized_media_origins_v1",
     "software_video_decode_v1",
     "plan_invalidated_v1",
+    "default_audio_reconcile_response_v1",
     "plan_source_duration_v1",
     "buffering_quality_v1",
     "playback_plan_summary_v1",
@@ -206,6 +207,18 @@
       "audio_channels": 2,
       "audio_layout": "stereo"
     },
-    "subtitle_fidelity_policy": "allow_simplified_rendering"
+    "subtitle_fidelity_policy": "allow_simplified_rendering",
+    "audio_tracks": [
+      {
+        "codec": "aac",
+        "layout": "stereo",
+        "channels": 2,
+        "default": false,
+        "track_id": "file:42:audio:0",
+        "selection_index": 0
+      }
+    ],
+    "inventory_revision": "inv:a86e4bf9866c5db45ba238c903fd9c61",
+    "inventory_status": "declared"
   }
 }

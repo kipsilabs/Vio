@@ -949,15 +949,18 @@ type ReplanRequestV3 struct {
 	QualityPreference       string                    `json:"quality_preference"`
 	PositionSeconds         float64                   `json:"position_seconds"`
 	Metered                 bool                      `json:"metered"`
+	AutoFallback            *bool                     `json:"auto_fallback,omitempty"`
 	BandwidthEstimateKbps   *int                      `json:"bandwidth_estimate_kbps,omitempty"`
 	BandwidthEstimateSource string                    `json:"bandwidth_estimate_source,omitempty"`
 	ObservedThroughputKbps  *int                      `json:"observed_throughput_kbps,omitempty"`
 	LearnedLimit            string                    `json:"learned_limit,omitempty"`
 	BandwidthCapKbps        *int                      `json:"bandwidth_cap_kbps,omitempty"`
+	AnswersPlanInvalidation string                    `json:"answers_plan_invalidation,omitempty"`
 	SelectedTracks          SelectedTracksV3          `json:"selected_tracks"`
 	Failure                 FailureV3                 `json:"failure,omitzero"`
 	Capabilities            ClientCodecCapabilitiesV3 `json:"client_capabilities"`
 	ClientPlaybackContext   ClientPlaybackContextV3   `json:"client_playback_context"`
+	Automatic               string                    `json:"automatic,omitempty"`
 }
 
 // ReplanAutomaticV3 is the Automatic marker for server-built reconciliation
@@ -1311,45 +1314,39 @@ type BandwidthLimitV3 struct {
 }
 
 type PlanV3 struct {
-	BandwidthLimit        *BandwidthLimitV3      `json:"bandwidth_limit,omitempty"`
-	ProtocolVersion       int                    `json:"protocol_version"`
-	PlanID                string                 `json:"plan_id"`
-	CanonicalPlanID       string                 `json:"canonical_plan_id,omitempty"`
-	EffectiveVirtualURI   string                 `json:"effective_virtual_uri,omitempty"`
-	VirtualSourceRevision string                 `json:"virtual_source_revision,omitempty"`
-	AudioTracks           []AudioInventoryItemV3 `json:"audio_tracks,omitempty"`
-	InventoryRevision     string                 `json:"inventory_revision,omitempty"`
-	InventoryStatus       string                 `json:"inventory_status,omitempty"`
-	InventoryProvenance   string                 `json:"inventory_provenance,omitempty"`
-	// PlanAttemptKey is the server-computed opaque loop-prevention token for
-	// this plan. Clients store the keys of attempted plans and echo them in
-	// attempted_plan_keys on replan; they never compute keys themselves.
-	PlanAttemptKey         string                 `json:"plan_attempt_key"`
-	SessionID              string                 `json:"session_id,omitempty"`
-	ExpiresAt              string                 `json:"expires_at,omitempty"`
-	Delivery               DeliveryV3             `json:"delivery"`
-	Stream                 StreamV3               `json:"stream"`
-	Timeline               TimelineV3             `json:"timeline"`
-	SelectedTracks         SelectedTracksV3       `json:"selected_tracks"`
-	EffectiveRecipe        EffectiveRecipeV3      `json:"effective_recipe"`
-	Claims                 ValidationClaimsV3     `json:"claims"`
-	Subtitle               SubtitleDecisionV3     `json:"subtitle"`
-	Transformations        []TransformationV3     `json:"transformations"`
-	AppliedQuirks          []AppliedQuirkV3       `json:"applied_quirks"`
-	RuntimeCorrections     []string               `json:"runtime_corrections"`
-	AvailableQualities     []AvailableQualityV3   `json:"available_qualities"`
-	DegradationWarnings    []DegradationWarningV3 `json:"degradation_warnings"`
-	DecisionReason         string                 `json:"decision_reason"`
-	RequestedMediaFileID   int                    `json:"requested_media_file_id"`
-	EffectiveMediaFileID   int                    `json:"effective_media_file_id"`
-	DeliveryChange         *DeliveryChangeV3      `json:"delivery_change,omitempty"`
-	TracksPending          bool                   `json:"tracks_pending,omitempty"`
-	Source                 SourceDescriptorV3     `json:"source"`
-	SubtitleFidelityPolicy string                 `json:"subtitle_fidelity_policy"`
-	// ActiveQuality is the AvailableQualities label this plan delivers, or
-	// empty when it delivers none of them (see activeQualityV3). Published
-	// on /api/v2 only, under FeaturePlanActiveQualityV3.
-	ActiveQuality string `json:"active_quality,omitempty"`
+	BandwidthLimit      *BandwidthLimitV3 `json:"bandwidth_limit,omitempty"`
+	ProtocolVersion     int               `json:"protocol_version"`
+	PlanID              string            `json:"plan_id"`
+	CanonicalPlanID     string            `json:"canonical_plan_id,omitempty"`
+	PlanAttemptKey      string            `json:"plan_attempt_key"`
+	SessionID           string            `json:"session_id,omitempty"`
+	ExpiresAt           string            `json:"expires_at,omitempty"`
+	Delivery            DeliveryV3        `json:"delivery"`
+	Stream              StreamV3          `json:"stream"`
+	Timeline            TimelineV3        `json:"timeline"`
+	SelectedTracks      SelectedTracksV3  `json:"selected_tracks"`
+	EffectiveRecipe     EffectiveRecipeV3 `json:"effective_recipe"`
+	Claims              ValidationClaimsV3 `json:"claims"`
+	Subtitle            SubtitleDecisionV3 `json:"subtitle"`
+	Transformations     []TransformationV3 `json:"transformations"`
+	AppliedQuirks       []AppliedQuirkV3 `json:"applied_quirks"`
+	RuntimeCorrections  []string `json:"runtime_corrections"`
+	AvailableQualities  []AvailableQualityV3 `json:"available_qualities"`
+	DegradationWarnings []DegradationWarningV3 `json:"degradation_warnings"`
+	DecisionReason      string `json:"decision_reason"`
+	RequestedMediaFileID int `json:"requested_media_file_id"`
+	EffectiveMediaFileID int `json:"effective_media_file_id"`
+	DeliveryChange      *DeliveryChangeV3 `json:"delivery_change,omitempty"`
+	TracksPending       bool `json:"tracks_pending,omitempty"`
+	EffectiveVirtualURI string `json:"effective_virtual_uri,omitempty"`
+	VirtualSourceRevision string `json:"virtual_source_revision,omitempty"`
+	Source              SourceDescriptorV3 `json:"source"`
+	SubtitleFidelityPolicy string `json:"subtitle_fidelity_policy"`
+	AudioTracks         []AudioInventoryItemV3 `json:"audio_tracks,omitempty"`
+	InventoryRevision   string `json:"inventory_revision,omitempty"`
+	InventoryStatus     string `json:"inventory_status,omitempty"`
+	InventoryProvenance string `json:"inventory_provenance,omitempty"`
+	ActiveQuality       string `json:"active_quality,omitempty"`
 }
 
 type TerminalV3 struct {
@@ -2135,7 +2132,7 @@ func HasFeatureV3(features []string, wanted string) bool {
 //
 // Stop/start is the explicit boundary for changing any of them.
 func AttemptStickyFeaturesV3() []string {
-	return []string{FeatureHeaderAuthenticatedMediaV3, FeatureAuthorizedMediaOriginsV3, FeatureSoftwareVideoDecodeV3, FeatureSubripSidecarV3, FeatureMarkerThumbnailsV3, FeatureHLSSubtitleRenditionsV3, FeatureHLSRemuxSubtitleRenditionsV3}
+	return []string{FeatureHeaderAuthenticatedMediaV3, FeatureAuthorizedMediaOriginsV3, FeatureSoftwareVideoDecodeV3, FeatureSubripSidecarV3, FeatureDefaultAudioReconcileResponseV3, FeatureMarkerThumbnailsV3, FeatureHLSSubtitleRenditionsV3, FeatureHLSRemuxSubtitleRenditionsV3}
 }
 
 // PinAttemptStickyFeaturesV3 returns requested with every attempt-sticky
