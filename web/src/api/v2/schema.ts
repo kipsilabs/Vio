@@ -12929,6 +12929,29 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
   schemas: {
+    AdminVirtualItem: {
+      id: number;
+      title: string;
+      type: string;
+      library_id: number;
+      library_name: string;
+      installation_id: number;
+      candidate_count: number;
+      failed_count: number;
+      last_delivered_at?: string;
+      last_seen_at?: string;
+      release_names: string[];
+    };
+    AdminVirtualItemCollection: {
+      items: components["schemas"]["AdminVirtualItem"][];
+    };
+    PlaybackInventoryV3: {
+      session_id: string;
+      inventory_revision: string;
+      inventory_status: string;
+      audio_tracks: components["schemas"]["AudioInventoryItemV3"][];
+      subtitle_inventory: components["schemas"]["SubtitleInventoryItemV3"][];
+    };
     Account: {
       /**
        * @description Whether the effective policy permits downloads

@@ -313,7 +313,7 @@
           "authorize_url": {
             "description": "Provider sign-in URL as the sign-in plugin returned it; navigate the same browser there; not validated as a URI",
             "examples": [
-              "https://id.example.test/authorize?client_id=silo\u0026state=..."
+              "https://id.example.test/authorize?client_id=silo&state=..."
             ],
             "type": "string"
           }
@@ -336,7 +336,7 @@
             "type": "string"
           },
           "next": {
-            "description": "Site-relative path the flow returns to with linked=1, or error=oauth_link_failed\u0026reason=\u003creason\u003e; anything that is not a same-origin path becomes /",
+            "description": "Site-relative path the flow returns to with linked=1, or error=oauth_link_failed&reason=<reason>; anything that is not a same-origin path becomes /",
             "examples": [
               "/settings/account"
             ],
@@ -5322,7 +5322,7 @@
             "type": "integer"
           },
           "key": {
-            "description": "The key used in a point's egress_by_source: \"api\" or \"node:\u003cnode_id\u003e\".",
+            "description": "The key used in a point's egress_by_source: \"api\" or \"node:<node_id>\".",
             "type": "string"
           },
           "kind": {
@@ -5334,7 +5334,7 @@
             "type": "string"
           },
           "name": {
-            "description": "Display name. A node deleted since it was sampled is named \"Removed node \u003cid\u003e\".",
+            "description": "Display name. A node deleted since it was sampled is named \"Removed node <id>\".",
             "type": "string"
           },
           "node_id": {
@@ -7118,14 +7118,14 @@
             "type": "string"
           },
           "location": {
-            "description": "Where its prepared file is: server or node:\u003cid\u003e; absent when it has none",
+            "description": "Where its prepared file is: server or node:<id>; absent when it has none",
             "type": "string"
           },
           "location_name": {
             "type": "string"
           },
           "media_type": {
-            "description": "Catalog type of content_id (movie, series, …); empty when unknown",
+            "description": "Catalog type of content_id (movie, series, \u2026); empty when unknown",
             "type": "string"
           },
           "profile_id": {
@@ -8057,7 +8057,7 @@
             "type": "string"
           },
           "location": {
-            "description": "server, node:\u003cid\u003e, or device",
+            "description": "server, node:<id>, or device",
             "type": "string"
           },
           "location_name": {
@@ -8184,7 +8184,7 @@
             "type": "string"
           },
           "location": {
-            "description": "server, or node:\u003cid\u003e",
+            "description": "server, or node:<id>",
             "type": "string"
           },
           "location_name": {
@@ -8330,7 +8330,7 @@
             "type": "integer"
           },
           "key": {
-            "description": "server, or node:\u003cid\u003e",
+            "description": "server, or node:<id>",
             "type": "string"
           },
           "kind": {
@@ -16488,7 +16488,7 @@
             "type": "string"
           },
           "type": {
-            "description": "What happened: created, approved, retried, submit_deferred, available_in_library, status_\u003cstatus\u003e or outcome_\u003coutcome\u003e; clients show unknown types as they are",
+            "description": "What happened: created, approved, retried, submit_deferred, available_in_library, status_<status> or outcome_<outcome>; clients show unknown types as they are",
             "examples": [
               "approved"
             ],
@@ -21918,7 +21918,7 @@
             "type": "string"
           },
           "media_type": {
-            "description": "Catalog type of content_id (movie, series, …); empty when unknown",
+            "description": "Catalog type of content_id (movie, series, \u2026); empty when unknown",
             "type": "string"
           },
           "profile_id": {
@@ -24402,7 +24402,7 @@
             "type": "string"
           },
           "badges": {
-            "description": "Section-specific badges (new, returning, …)",
+            "description": "Section-specific badges (new, returning, \u2026)",
             "items": {
               "type": "string"
             },
@@ -24757,7 +24757,7 @@
             "type": "array"
           },
           "badges": {
-            "description": "Section-specific badges (new, returning, …)",
+            "description": "Section-specific badges (new, returning, \u2026)",
             "items": {
               "type": "string"
             },
@@ -25398,7 +25398,7 @@
             "type": "integer"
           },
           "type": {
-            "description": "premiere, episode, finale, …",
+            "description": "premiere, episode, finale, \u2026",
             "examples": [
               "episode"
             ],
@@ -33059,7 +33059,7 @@
             "type": "string"
           },
           "badges": {
-            "description": "Section-specific badges (new, returning, …)",
+            "description": "Section-specific badges (new, returning, \u2026)",
             "items": {
               "type": "string"
             },
@@ -34798,7 +34798,7 @@
             "type": "string"
           },
           "scan_warning_code": {
-            "description": "Outstanding scan warning (empty_root, dead_root, …); absent when none",
+            "description": "Outstanding scan warning (empty_root, dead_root, \u2026); absent when none",
             "examples": [
               "empty_root"
             ],
@@ -38022,7 +38022,7 @@
         "additionalProperties": false,
         "properties": {
           "hosts": {
-            "description": "Host ids to act on (api, node:\u003cid\u003e); omitted means every host",
+            "description": "Host ids to act on (api, node:<id>); omitted means every host",
             "items": {
               "type": "string"
             },
@@ -38036,7 +38036,7 @@
         "additionalProperties": false,
         "properties": {
           "id": {
-            "description": "api for the API server; node:\u003cid\u003e for a proxy node",
+            "description": "api for the API server; node:<id> for a proxy node",
             "type": "string"
           },
           "name": {
@@ -41501,7 +41501,7 @@
             "type": "string"
           },
           "ticket": {
-            "description": "Opaque single-use credential; offer it as silo.ticket.\u003cticket\u003e after the protocol",
+            "description": "Opaque single-use credential; offer it as silo.ticket.<ticket> after the protocol",
             "type": "string"
           }
         },
@@ -43831,7 +43831,7 @@
             "type": "array"
           },
           "instance": {
-            "description": "urn:silo:request:\u003crequest-id\u003e, matching the X-Request-ID response header",
+            "description": "urn:silo:request:<request-id>, matching the X-Request-ID response header",
             "examples": [
               "urn:silo:request:000000000000000000000003"
             ],
@@ -50868,7 +50868,7 @@
               "format": "int64",
               "type": "integer"
             },
-            "description": "How many signals of each kind (rated, favorited, watched, …) fed the profile; empty, never null",
+            "description": "How many signals of each kind (rated, favorited, watched, \u2026) fed the profile; empty, never null",
             "type": "object"
           },
           "top_genres": {
@@ -54466,7 +54466,7 @@
             "type": "string"
           },
           "badges": {
-            "description": "Section-specific badges (new, returning, …)",
+            "description": "Section-specific badges (new, returning, \u2026)",
             "items": {
               "type": "string"
             },
@@ -54866,7 +54866,7 @@
             "type": "string"
           },
           "badges": {
-            "description": "Section-specific badges (new, returning, …)",
+            "description": "Section-specific badges (new, returning, \u2026)",
             "items": {
               "type": "string"
             },
@@ -56138,6 +56138,110 @@
           "state"
         ],
         "type": "object"
+      },
+      "AdminVirtualItem": {
+        "type": "object",
+        "required": [
+          "id",
+          "title",
+          "type",
+          "library_id",
+          "library_name",
+          "installation_id",
+          "candidate_count",
+          "failed_count",
+          "release_names"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "title": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string"
+          },
+          "library_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "library_name": {
+            "type": "string"
+          },
+          "installation_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "candidate_count": {
+            "type": "integer"
+          },
+          "failed_count": {
+            "type": "integer"
+          },
+          "last_delivered_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "last_seen_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "release_names": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "AdminVirtualItemCollection": {
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminVirtualItem"
+            }
+          }
+        }
+      },
+      "PlaybackInventoryV3": {
+        "type": "object",
+        "required": [
+          "session_id",
+          "inventory_revision",
+          "inventory_status",
+          "audio_tracks",
+          "subtitle_inventory"
+        ],
+        "properties": {
+          "session_id": {
+            "type": "string"
+          },
+          "inventory_revision": {
+            "type": "string"
+          },
+          "inventory_status": {
+            "type": "string"
+          },
+          "audio_tracks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AudioInventoryItemV3"
+            }
+          },
+          "subtitle_inventory": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SubtitleInventoryItemV3"
+            }
+          }
+        }
       }
     },
     "securitySchemes": {
@@ -56761,7 +56865,7 @@
     },
     "/api/v2/account/identities/link-start": {
       "post": {
-        "description": "Consumes a ticket from createAccountIdentityLinkTicket issued to the caller's account, sets the flow's browser-binding cookie on this response and answers the provider URL for the same browser to open. Only the browser that made this request can finish the flow, so a ticket opened by anyone else links nothing. Call it on the public URL's origin (409 otherwise, or when no public URL is configured). The provider is asked for a fresh sign-in. The flow returns to next with linked=1, or error=oauth_link_failed\u0026reason=\u003creason\u003e. An unknown, used, expired or foreign ticket is 404; an API key or impersonation session is 403; a provider that cannot start the flow is 503 provider_unavailable.",
+        "description": "Consumes a ticket from createAccountIdentityLinkTicket issued to the caller's account, sets the flow's browser-binding cookie on this response and answers the provider URL for the same browser to open. Only the browser that made this request can finish the flow, so a ticket opened by anyone else links nothing. Call it on the public URL's origin (409 otherwise, or when no public URL is configured). The provider is asked for a fresh sign-in. The flow returns to next with linked=1, or error=oauth_link_failed&reason=<reason>. An unknown, used, expired or foreign ticket is 404; an API key or impersonation session is 403; a provider that cannot start the flow is 503 provider_unavailable.",
         "operationId": "startAccountIdentityLink",
         "requestBody": {
           "content": {
@@ -78772,12 +78876,12 @@
             }
           },
           {
-            "description": "server, or node:\u003cid\u003e",
+            "description": "server, or node:<id>",
             "in": "path",
             "name": "location",
             "required": true,
             "schema": {
-              "description": "server, or node:\u003cid\u003e",
+              "description": "server, or node:<id>",
               "maxLength": 32,
               "pattern": "^(server|node:[1-9][0-9]*)$",
               "type": "string"
@@ -78928,12 +79032,12 @@
             }
           },
           {
-            "description": "server, or node:\u003cid\u003e",
+            "description": "server, or node:<id>",
             "in": "path",
             "name": "location",
             "required": true,
             "schema": {
-              "description": "server, or node:\u003cid\u003e",
+              "description": "server, or node:<id>",
               "maxLength": 32,
               "pattern": "^(server|node:[1-9][0-9]*)$",
               "type": "string"
@@ -93866,7 +93970,7 @@
             }
           },
           {
-            "description": "Offer silo.admin-logs.v2 followed by silo.ticket.\u003csingle-use-ticket\u003e.",
+            "description": "Offer silo.admin-logs.v2 followed by silo.ticket.<single-use-ticket>.",
             "in": "header",
             "name": "Sec-WebSocket-Protocol",
             "required": true,
@@ -138634,7 +138738,7 @@
     },
     "/api/v2/auth/oauth/{install_id}/callback": {
       "get": {
-        "description": "Accepts only the browser holding the flow's binding cookie. A web sign-in continues to /login/oauth-complete?code=; a failure to /login?error=oauth_failed\u0026reason=\u003creason\u003e (not_permitted, account_required, email_in_use, identity_linked_elsewhere, account_disabled, provider_unavailable, state_invalid, session_expired, already_linked, login_failed). A web linking flow returns to its next path with linked=1 or error=oauth_link_failed\u0026reason=\u003creason\u003e; a native flow to the app redirect, which carries iss (see startNativeOAuthLogin).",
+        "description": "Accepts only the browser holding the flow's binding cookie. A web sign-in continues to /login/oauth-complete?code=; a failure to /login?error=oauth_failed&reason=<reason> (not_permitted, account_required, email_in_use, identity_linked_elsewhere, account_disabled, provider_unavailable, state_invalid, session_expired, already_linked, login_failed). A web linking flow returns to its next path with linked=1 or error=oauth_link_failed&reason=<reason>; a native flow to the app redirect, which carries iss (see startNativeOAuthLogin).",
         "operationId": "finishOAuthCallback",
         "parameters": [
           {
@@ -138715,7 +138819,7 @@
     },
     "/api/v2/auth/oauth/{install_id}/init": {
       "post": {
-        "description": "A browser on another origin than the public URL is sent (303) to startOAuthLogin there, so the flow's browser-binding cookie is set on the origin of the callback. A provider that cannot start the flow, or a missing public URL, sends the browser (302) to /login?error=oauth_failed\u0026reason=provider_unavailable.",
+        "description": "A browser on another origin than the public URL is sent (303) to startOAuthLogin there, so the flow's browser-binding cookie is set on the origin of the callback. A provider that cannot start the flow, or a missing public URL, sends the browser (302) to /login?error=oauth_failed&reason=provider_unavailable.",
         "operationId": "initOAuthLogin",
         "parameters": [
           {
@@ -138843,7 +138947,7 @@
     },
     "/api/v2/auth/oauth/{install_id}/native/start": {
       "get": {
-        "description": "The app opens this start on its saved server base in ASWebAuthenticationSession or a Custom Tab: it appends native_start_path from listAuthProviders to its saved server base URL (an oauth provider without native_start_path offers no native sign-in), adds code_challenge, code_challenge_method=S256 and app_state, and never opens another origin. The server records the start origin, the origin the start arrived on (scheme://host[:port], scheme and host in lower case, default port omitted, IPv6 in brackets, no path or trailing slash), derived from the host a trusted proxy names in X-Forwarded-Host or else the Host header, and the scheme of the connection or the one a trusted proxy names. A start that arrives on another origin than the public URL is accepted only on the origin of a connected network access provider or on a local address: an IP literal in the loopback, private, link-local or 100.64.0.0/10 range, or a single-label, .local, .lan, .localdomain, .home.arpa or .internal host name; any other origin is a plain-text 400. An accepted start is kept on the server and the browser is sent (302) to this start on the public origin with only flow, the kept start's random single-use ID, valid two minutes; the flow sets its binding cookie there and goes to the provider. The flow ends on org.siloserver.silo:/auth/callback with code, state (the app_state), server (getServerIdentity's server_id) and iss, the start origin; a failure carries error=\u003creason\u003e instead of code. Every app redirect of a sign-in or linking flow carries iss, success or failure. The app accepts the redirect only when iss equals the origin of its saved server base, and redeems the code only at that saved base; a server that redirects its start to another server gets that server's own origin as iss, which the app refuses. The Host header is chosen by whoever sends the start, so iss does not stop a hostile server on a local address that sends the app's start here itself; that is why other origins are refused. A start with a valid code_challenge and app_state whose provider cannot start the flow goes straight to the app redirect with error=provider_unavailable (login_failed for a server error); an unknown, used, expired or foreign link_ticket goes there with error=session_expired. An unknown, used, expired or foreign flow is a plain-text 400, as is a flow presented on another origin than the public URL, which leaves the kept start for the public origin. Redeem the code within 60 seconds with completeOAuthLogin and the code_verifier; a linking flow's code carries link=1 and is redeemed with completeAccountIdentityLink instead.",
+        "description": "The app opens this start on its saved server base in ASWebAuthenticationSession or a Custom Tab: it appends native_start_path from listAuthProviders to its saved server base URL (an oauth provider without native_start_path offers no native sign-in), adds code_challenge, code_challenge_method=S256 and app_state, and never opens another origin. The server records the start origin, the origin the start arrived on (scheme://host[:port], scheme and host in lower case, default port omitted, IPv6 in brackets, no path or trailing slash), derived from the host a trusted proxy names in X-Forwarded-Host or else the Host header, and the scheme of the connection or the one a trusted proxy names. A start that arrives on another origin than the public URL is accepted only on the origin of a connected network access provider or on a local address: an IP literal in the loopback, private, link-local or 100.64.0.0/10 range, or a single-label, .local, .lan, .localdomain, .home.arpa or .internal host name; any other origin is a plain-text 400. An accepted start is kept on the server and the browser is sent (302) to this start on the public origin with only flow, the kept start's random single-use ID, valid two minutes; the flow sets its binding cookie there and goes to the provider. The flow ends on org.siloserver.silo:/auth/callback with code, state (the app_state), server (getServerIdentity's server_id) and iss, the start origin; a failure carries error=<reason> instead of code. Every app redirect of a sign-in or linking flow carries iss, success or failure. The app accepts the redirect only when iss equals the origin of its saved server base, and redeems the code only at that saved base; a server that redirects its start to another server gets that server's own origin as iss, which the app refuses. The Host header is chosen by whoever sends the start, so iss does not stop a hostile server on a local address that sends the app's start here itself; that is why other origins are refused. A start with a valid code_challenge and app_state whose provider cannot start the flow goes straight to the app redirect with error=provider_unavailable (login_failed for a server error); an unknown, used, expired or foreign link_ticket goes there with error=session_expired. An unknown, used, expired or foreign flow is a plain-text 400, as is a flow presented on another origin than the public URL, which leaves the kept start for the public origin. Redeem the code within 60 seconds with completeOAuthLogin and the code_verifier; a linking flow's code carries link=1 and is redeemed with completeAccountIdentityLink instead.",
         "operationId": "startNativeOAuthLogin",
         "parameters": [
           {
@@ -138989,7 +139093,7 @@
     },
     "/api/v2/auth/oauth/{install_id}/start": {
       "get": {
-        "description": "Sets an HttpOnly, SameSite=Lax browser-binding cookie scoped to the callback path, then redirects to the provider. A browser on another origin than the public URL is first sent (302) to the same start there. A link_ticket is refused with 400: the web links with startAccountIdentityLink. Malformed parameters are plain-text 400s; a provider that cannot start the flow, or a missing public URL, sends the browser (302) to /login?error=oauth_failed\u0026reason=provider_unavailable (login_failed for a server error), where the login page does not redirect to the provider again.",
+        "description": "Sets an HttpOnly, SameSite=Lax browser-binding cookie scoped to the callback path, then redirects to the provider. A browser on another origin than the public URL is first sent (302) to the same start there. A link_ticket is refused with 400: the web links with startAccountIdentityLink. Malformed parameters are plain-text 400s; a provider that cannot start the flow, or a missing public URL, sends the browser (302) to /login?error=oauth_failed&reason=provider_unavailable (login_failed for a server error), where the login page does not redirect to the provider again.",
         "operationId": "startOAuthLogin",
         "parameters": [
           {
@@ -143458,12 +143562,12 @@
             }
           },
           {
-            "description": "sort=field or -field; one term. Fields: title, year, release_date, added_at, rating, runtime, random, … (see the filters document); absent applies the source's saved or default order",
+            "description": "sort=field or -field; one term. Fields: title, year, release_date, added_at, rating, runtime, random, \u2026 (see the filters document); absent applies the source's saved or default order",
             "explode": false,
             "in": "query",
             "name": "sort",
             "schema": {
-              "description": "sort=field or -field; one term. Fields: title, year, release_date, added_at, rating, runtime, random, … (see the filters document); absent applies the source's saved or default order",
+              "description": "sort=field or -field; one term. Fields: title, year, release_date, added_at, rating, runtime, random, \u2026 (see the filters document); absent applies the source's saved or default order",
               "examples": [
                 "-release_date"
               ],
@@ -168197,7 +168301,7 @@
         "operationId": "connectEventsSocket",
         "parameters": [
           {
-            "description": "Offer silo.events.v2 followed by silo.ticket.\u003csingle-use-ticket\u003e.",
+            "description": "Offer silo.events.v2 followed by silo.ticket.<single-use-ticket>.",
             "in": "header",
             "name": "Sec-WebSocket-Protocol",
             "required": true,
@@ -192063,7 +192167,7 @@
             }
           },
           {
-            "description": "Offer silo.playback-control.v2 followed by silo.ticket.\u003csingle-use-ticket\u003e.",
+            "description": "Offer silo.playback-control.v2 followed by silo.ticket.<single-use-ticket>.",
             "in": "header",
             "name": "Sec-WebSocket-Protocol",
             "required": true,
@@ -201766,12 +201870,12 @@
             }
           },
           {
-            "description": "Discover-mode genre filter, repeated (genres=Crime\u0026genres=Thriller); each must be a known genre",
+            "description": "Discover-mode genre filter, repeated (genres=Crime&genres=Thriller); each must be a known genre",
             "explode": true,
             "in": "query",
             "name": "genres",
             "schema": {
-              "description": "Discover-mode genre filter, repeated (genres=Crime\u0026genres=Thriller); each must be a known genre",
+              "description": "Discover-mode genre filter, repeated (genres=Crime&genres=Thriller); each must be a known genre",
               "examples": [
                 [
                   "Crime"
@@ -201785,12 +201889,12 @@
             }
           },
           {
-            "description": "Catalog identifiers already swiped, repeated (exclude_ids=a\u0026exclude_ids=b)",
+            "description": "Catalog identifiers already swiped, repeated (exclude_ids=a&exclude_ids=b)",
             "explode": true,
             "in": "query",
             "name": "exclude_ids",
             "schema": {
-              "description": "Catalog identifiers already swiped, repeated (exclude_ids=a\u0026exclude_ids=b)",
+              "description": "Catalog identifiers already swiped, repeated (exclude_ids=a&exclude_ids=b)",
               "examples": [
                 [
                   "movie:heat-1995"
@@ -224927,7 +225031,7 @@
             }
           },
           {
-            "description": "Offer silo.room.v2 followed by silo.ticket.\u003csingle-use-ticket\u003e.",
+            "description": "Offer silo.room.v2 followed by silo.ticket.<single-use-ticket>.",
             "in": "header",
             "name": "Sec-WebSocket-Protocol",
             "required": true,
