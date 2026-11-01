@@ -5372,6 +5372,9 @@ func (s *TranscodeSession) ReportSegmentDownloadedForGenerationToken(segNum int,
 func (s *TranscodeSession) GenerationToken() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.opts.SessionID == "" {
+		return ""
+	}
 	if s.segmentIncarnation == "" {
 		s.segmentIncarnation = uuid.NewString()
 	}
