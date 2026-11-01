@@ -15,22 +15,8 @@ interface RecommendationGridProps {
   maxItems?: number;
 }
 
-interface RecommendationItemCardProps {
-  itemId: string;
-  showCaption: boolean;
-  // Sized by the row's wrapper in the default grid; direct card users pass
-  // their own width classes.
-  className?: string;
-  onTerminalError: (itemId: string) => void;
-}
-
-function RecommendationItemCard({
-  itemId,
-  showCaption,
-  className,
-  onTerminalError,
-}: RecommendationItemCardProps) {
-  const { data: item, error } = useCatalogItemDetail(itemId);
+function RecommendationItemCard({ itemId }: { itemId: string }) {
+  const { data: item } = useCatalogItemDetail(itemId);
   // Keyed by URL so a re-signed poster is tried again.
   const [failedUrl, setFailedUrl] = useState<string | null>(null);
   // A 404 is terminal: the recommendation points at an item the catalog no
@@ -83,14 +69,12 @@ function RecommendationItemCard({
           />
         ) : null}
       </div>
-      {showCaption ? (
-        <ViewTransitionLink
-          to={`/item/${encodeURIComponent(itemId)}`}
-          className="mt-1.5 block truncate text-sm font-medium hover:underline"
-        >
-          {item.title}
-        </ViewTransitionLink>
-      ) : null}
+      <ViewTransitionLink
+        to={`/item/${encodeURIComponent(itemId)}`}
+        className="mt-1.5 block truncate text-sm font-medium hover:underline"
+      >
+        {item.title}
+      </ViewTransitionLink>
     </div>
   );
 }
@@ -98,7 +82,7 @@ function RecommendationItemCard({
 interface MoreLikeThisRowProps<T> {
   items: T[];
   itemKey: (item: T) => string;
-  renderItem: (item: T, showCaption: boolean) => ReactNode;
+  renderItem: (item: T) => ReactNode;
   maxItems?: number;
 }
 
@@ -116,13 +100,12 @@ export function MoreLikeThisRow<T>({
   const { cardPresentation } = useUICustomization();
   const itemLimit = Math.max(0, Math.min(maxItems, MAX_MORE_LIKE_THIS_ITEMS));
   const posterWidthClasses = carouselCardWidthClasses(cardPresentation.poster_size);
-  const showCaption = cardPresentation.caption !== "artwork";
 
   return (
     <MediaCarousel title="More Like This" edgePadding={false}>
       {items.slice(0, itemLimit).map((item) => (
         <div key={itemKey(item)} className={posterWidthClasses}>
-          {renderItem(item, showCaption)}
+          {renderItem(item)}
         </div>
       ))}
     </MediaCarousel>
@@ -149,13 +132,7 @@ export default function RecommendationGrid({ items, maxItems = 12 }: Recommendat
       items={visibleItems}
       maxItems={maxItems}
       itemKey={(item) => item.content_id}
-      renderItem={(item, showCaption) => (
-        <RecommendationItemCard
-          itemId={item.content_id}
-          showCaption={showCaption}
-          onTerminalError={handleTerminalError}
-        />
-      )}
+      renderItem={(item) => <RecommendationItemCard itemId={item.content_id} />}
     />
   );
 }

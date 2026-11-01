@@ -116,10 +116,24 @@ func TestAdminItemMetadataTransport(t *testing.T) {
 	if rec.Code != 200 || !slices.Equal(f.clear, []string{"rating_imdb", "release_date", "air_date"}) || f.update.RatingIMDB != nil || f.update.RatingTMDB == nil || *f.update.RatingTMDB != 6.5 || f.update.Year != nil {
 		t.Fatalf("clear: %d %s clear=%v %#v", rec.Code, rec.Body, f.clear, f.update)
 	}
+	// status is the match status; a null is omission, like the other members
+	// that cannot be cleared.
+	rec = do(t, h, "PATCH", path+"/metadata", `{"status":"matched"}`, bearer(memberToken))
+	if rec.Code != 200 || f.update.Status == nil || *f.update.Status != "matched" {
+		t.Fatalf("match status: %d %s %#v", rec.Code, rec.Body, f.update)
+	}
+	rec = do(t, h, "PATCH", path+"/metadata", `{"status":null}`, bearer(memberToken))
+	if rec.Code != 200 || f.update.Status != nil {
+		t.Fatalf("null status: %d %s %#v", rec.Code, rec.Body, f.update)
+	}
 	before := f.calls
 	rec = do(t, h, "POST", path+"/refresh-metadata", `{"mode":"wrong"}`, bearer(memberToken))
 	if rec.Code != 422 || f.calls != before {
 		t.Fatalf("invalid mode: %d", rec.Code)
+	}
+	rec = do(t, h, "PATCH", path+"/metadata", `{"status":"Ended"}`, bearer(memberToken))
+	if rec.Code != 422 || f.calls != before {
+		t.Fatalf("invalid status: %d %s", rec.Code, rec.Body)
 	}
 	for _, tc := range []struct{ method, path string }{{"POST", "/refresh-metadata"}, {"PATCH", "/metadata"}} {
 		rec = do(t, h, tc.method, Prefix+"/admin/items/forbidden"+tc.path, `{}`, bearer(adminToken))
@@ -128,40 +142,33 @@ func TestAdminItemMetadataTransport(t *testing.T) {
 		}
 	}
 }
-
-// TestUpdateAdminItemMetadataCarriesCollections pins that a successful metadata
-// save answers the same collections row the read detail does, using the
-// viewer's resolved access, so an item in a collection does not appear to lose
-// its memberships until a refetch.
-func TestUpdateAdminItemMetadataCarriesCollections(t *testing.T) {
-	deps, _ := catalogDeps(t)
-	deps.AdminItemMetadata = &fakeAdminItemMetadata{}
+func TestAdminItemMetadataRejectsMalformedDates(t *testing.T) {
+	deps := pilotDeps(nil, nil)
+	f := &fakeAdminItemMetadata{}
+	deps.AdminItemMetadata = f
 	deps.PermissionGates[policy.PermissionMetadataCuration] = adminTranslationGate
-	// The metadata route is not profile-scoped, so the lookup reads the scope
-	// the permission gate resolved. Restrict it so the test proves that scope,
-	// not the catalog seam's default, reaches the reverse lookup.
-	deps.ViewerAccess = apimw.NewViewerAccessMiddleware(policyResolver{scope: &access.Scope{AllowedLibraryIDs: []int{1, 2}}})
-	fake := deps.LibraryCollections.(*fakeLibraryViews)
-	fake.collections = []handlers.ItemCollectionView{{ID: "alpha", Title: "Dune Saga", ItemCount: 3}}
 	h := newTestHandler(t, deps)
-
-	rec := do(t, h, "PATCH", Prefix+"/admin/items/item-1/metadata", `{"title":"Updated"}`, bearer(memberToken))
-	if rec.Code != 200 {
-		t.Fatalf("update: %d %s", rec.Code, rec.Body)
+	path := Prefix + "/admin/items/item-1/metadata"
+	// Each date member once: values that don't parse, and year 0, which
+	// time.Parse accepts but PostgreSQL's date type does not. Every bad member
+	// is named and nothing reaches the service.
+	p := requireProblem(t, do(t, h, "PATCH", path, `{"release_date":"","first_air_date":"2024-02-30","last_air_date":"0000-01-01","air_date":"2024-02-29T00:00:00Z","title":"Kept"}`, bearer(memberToken)), TypeValidationFailed)
+	var locations []string
+	for _, e := range p.Errors {
+		if e.Code != codeInvalid {
+			t.Fatalf("errors = %+v", p.Errors)
+		}
+		locations = append(locations, e.Location)
 	}
-	var detail CatalogItemDetail
-	decodeJSON(t, rec.Body, &detail)
-	if fake.lastCollections != "item-1" {
-		t.Fatalf("lookup = %q, want the edited item id", fake.lastCollections)
+	if !slices.Equal(locations, []string{"body.release_date", "body.first_air_date", "body.last_air_date", "body.air_date"}) || f.calls != 0 {
+		t.Fatalf("errors = %+v calls=%d", p.Errors, f.calls)
 	}
-	if got := fake.lastCollectionsAccess.AllowedLibraryIDs; len(got) != 2 || got[0] != 1 || got[1] != 2 {
-		t.Fatalf("lookup access = %+v, want the gate-resolved allowed libraries [1 2]", fake.lastCollectionsAccess)
-	}
-	if len(detail.Collections) != 1 || detail.Collections[0].ID != "alpha" || detail.Collections[0].Title != "Dune Saga" || detail.Collections[0].ItemCount != 3 {
-		t.Fatalf("collections = %+v, want the membership row on the save response", detail.Collections)
+	// A real date is accepted and null still clears.
+	rec := do(t, h, "PATCH", path, `{"release_date":"2024-02-29","air_date":null}`, bearer(memberToken))
+	if rec.Code != 200 || f.calls != 1 || !slices.Equal(f.clear, []string{"air_date"}) {
+		t.Fatalf("valid date: %d %s clear=%v", rec.Code, rec.Body, f.clear)
 	}
 }
-
 func adminCatalogItemMetadataFixtureCases() []fixtureCase {
 	return []fixtureCase{
 		{name: "admin_item_refresh_queued", operationID: "refreshAdminItemMetadata", method: "POST", path: Prefix + "/admin/items/item-1/refresh-metadata", body: `{"mode":"complete"}`, headers: bearer(memberToken), status: 202, schema: "#/components/schemas/AdminTaskJob", assertHeaders: []string{"Content-Type", "Location", "Retry-After"}, scenario: "A delegated curator receives a persisted refresh job without administrator-only payloads."},

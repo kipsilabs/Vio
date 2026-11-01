@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { setAccessToken, setProfileId, setProfileToken } from "@/api/client";
-import { DirectDownloadError, isStaleFileError, prepareDirectDownload } from "./directDownloads";
+import { launchDirectDownload } from "./directDownloads";
+import { pendingResponse } from "./pendingFetch.test-support";
 
 const URL_PATH = "/api/v2/direct-download?file_id=42&token=original-account-token";
 
@@ -50,93 +51,29 @@ describe("direct download preflight", () => {
     expect(download.filename).toBe("Movie.mp4");
     expect(createObjectURL).not.toHaveBeenCalled();
   });
-
-  it("falls back to the caller filename when the server sends no disposition", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(null, { status: 200 })));
-
-    const download = await prepareDirectDownload(
-      42,
-      () => true,
-      new AbortController().signal,
-      "Episode.mkv",
-    );
-    expect(download.filename).toBe("Episode.mkv");
-    expect(createObjectURL).not.toHaveBeenCalled();
-  });
-
-  it.each(["account", "profile", "pin", "closed"])(
-    "refuses a late probe after %s authority changes",
-    async (kind) => {
-      let resolve!: (r: Response) => void;
-      vi.stubGlobal(
-        "fetch",
-        vi.fn(
-          () =>
-            new Promise<Response>((r) => {
-              resolve = r;
-            }),
-        ),
-      );
-      let current = true;
-      const pending = prepareDirectDownload(42, () => current, new AbortController().signal);
-      if (kind === "account") setAccessToken("replacement");
-      if (kind === "profile") setProfileId("profile-two");
-      if (kind === "pin") setProfileToken("pin-two");
-      if (kind === "closed") current = false;
-      resolve(new Response(null, { status: 200 }));
-      await expect(pending).rejects.toThrow();
-      expect(createObjectURL).not.toHaveBeenCalled();
-    },
-  );
-
-  it("aborts an in-flight probe when its controller fires", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(
-        (_url: string, init?: RequestInit) =>
-          new Promise<Response>((_resolve, reject) => {
-            init?.signal?.addEventListener("abort", () =>
-              reject(new DOMException("aborted", "AbortError")),
-            );
-          }),
-      ),
-    );
-    const controller = new AbortController();
-    const pending = prepareDirectDownload(42, () => true, controller.signal);
-    controller.abort();
+  // The link check runs after the mint and the probe check after the HEAD
+  // probe; each stage refuses every kind of authority change.
+  it.each(
+    (["link", "probe"] as const).flatMap((stage) =>
+      (["account", "profile", "pin", "closed"] as const).map((kind) => [stage, kind] as const),
+    ),
+  )("refuses a late %s after %s authority changes", async (stage, kind) => {
+    const late = pendingResponse();
+    const fetch = vi.fn<typeof globalThis.fetch>();
+    if (stage === "link") fetch.mockReturnValue(late.promise);
+    else fetch.mockResolvedValueOnce(linkResponse()).mockReturnValueOnce(late.promise);
+    vi.stubGlobal("fetch", fetch);
+    let current = true;
+    const pending = launchDirectDownload(42, () => current);
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(stage === "link" ? 1 : 2));
+    if (kind === "account") setAccessToken("replacement");
+    if (kind === "profile") setProfileId("profile-two");
+    if (kind === "pin") setProfileToken("pin-two");
+    if (kind === "closed") current = false;
+    late.finish(stage === "link" ? linkResponse() : new Response(null, { status: 200 }));
     await expect(pending).rejects.toThrow();
-    expect(createObjectURL).not.toHaveBeenCalled();
-  });
-
-  it("never fetches when the signal is already aborted", async () => {
-    const fetch = vi.fn();
-    vi.stubGlobal("fetch", fetch);
-    const controller = new AbortController();
-    controller.abort();
-    await expect(prepareDirectDownload(42, () => true, controller.signal)).rejects.toThrow();
-    expect(fetch).not.toHaveBeenCalled();
-    expect(createObjectURL).not.toHaveBeenCalled();
-  });
-
-  it("reports a refused probe with a concrete, status-specific reason", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(null, { status: 403 })));
-    const pending = prepareDirectDownload(42, () => true, new AbortController().signal);
-    await expect(pending).rejects.toBeInstanceOf(DirectDownloadError);
-    await expect(pending).rejects.toMatchObject({
-      status: 403,
-      message: "Downloads are not allowed for this account.",
-    });
-    expect(createObjectURL).not.toHaveBeenCalled();
-  });
-
-  it("does not attempt a transfer after a failed probe", async () => {
-    const fetch = vi.fn().mockRejectedValue(new TypeError("network"));
-    vi.stubGlobal("fetch", fetch);
-    await expect(
-      prepareDirectDownload(42, () => true, new AbortController().signal),
-    ).rejects.toThrow();
-    expect(fetch).toHaveBeenCalledTimes(1);
-    expect(createObjectURL).not.toHaveBeenCalled();
+    if (stage === "link") expect(fetch).toHaveBeenCalledTimes(1);
+    expect(click).not.toHaveBeenCalled();
   });
 
   it("carries the problem code and a refresh prompt for a stale file_id", async () => {

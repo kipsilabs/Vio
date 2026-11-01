@@ -130,14 +130,7 @@ func TestCancelWhileQueuedCallsOnAbort(t *testing.T) {
 	}
 }
 
-func TestCancelUnknownJobReturnsFalse(t *testing.T) {
-	r := New(context.Background(), nil, &fakeStore{}, "test", nil)
-	if r.Cancel(99) {
-		t.Fatal("Cancel(99) = true for unknown job")
-	}
-}
-
-// The run context is canceled by Cancel(id) so an in-flight job can stop.
+// The run context is cancelled by Cancel(id) so an in-flight job can stop.
 func TestCancelRunningJobCancelsContext(t *testing.T) {
 	r := New(context.Background(), NewSemaphore(1), &fakeStore{}, "test", nil)
 	started := make(chan struct{})

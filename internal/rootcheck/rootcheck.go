@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Silo-Server/silo-server/internal/fspath"
 )
 
 // Error codes reported by Probe. They are part of the admin mount-check API
@@ -48,30 +50,14 @@ type Result struct {
 	ErrorMessage string // empty when Reachable
 }
 
-// VirtualRootPrefix is the scheme used by library roots that hold only virtual
-// media populated by plugins. These roots have no filesystem presence and
-// should never be probed as directories or walked by the scanner.
-const VirtualRootPrefix = "virtual://"
-
-// virtualRootPrefixLegacy is the single-slash form (virtual:/x) that older
-// writes produced when filepath.Clean collapsed the scheme's double slash.
-// Accept it for backward compatibility; new writes use VirtualRootPrefix.
-const virtualRootPrefixLegacy = "virtual:/"
-
-// IsVirtualRootPath reports whether path is a virtual library root in either
-// slash form. Case-insensitive; surrounding whitespace is ignored.
-func IsVirtualRootPath(path string) bool {
-	raw := strings.TrimSpace(strings.ToLower(path))
-	return raw == "virtual" || strings.HasPrefix(raw, VirtualRootPrefix) || strings.HasPrefix(raw, virtualRootPrefixLegacy)
-}
-
-// Probe checks that path exists, is a directory, and can be listed.
+// Probe checks that path exists, is a directory, and can be listed. path is
+// fspath-encoded.
 func Probe(path string) Result {
 	if IsVirtualRootPath(path) {
 		return Result{Reachable: true, Empty: true}
 	}
 	res := Result{Reachable: true}
-	info, err := os.Stat(path)
+	info, err := fspath.Stat(path)
 	switch {
 	case err != nil:
 		res.Reachable = false
@@ -80,7 +66,7 @@ func Probe(path string) Result {
 		res.Reachable = false
 		res.ErrorCode, res.ErrorMessage = ErrCodeNotDirectory, "Path is not a directory"
 	default:
-		dir, err := os.Open(path)
+		dir, err := fspath.Open(path)
 		if err == nil {
 			_, err = dir.Readdirnames(1)
 			_ = dir.Close()

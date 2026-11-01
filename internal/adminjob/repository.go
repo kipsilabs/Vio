@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"time"
 
@@ -38,6 +39,16 @@ var (
 	ErrJobNotCancellable                 = errors.New("admin job is not cancellable")
 	ErrStorageTransitionAlreadyCommitted = errors.New("storage transition already committed")
 )
+
+// cancellableJobTypes are the job types RequestCancellation accepts. Every v2
+// job resource that reports such a job as cancelable accepts its cancellation.
+var cancellableJobTypes = []string{JobTypeLibraryRefresh, JobTypeStorageTransition, JobTypeImageCacheCleanup}
+
+// IsCancellableJobType reports whether jobs of this type accept cancellation
+// while queued or running.
+func IsCancellableJobType(jobType string) bool {
+	return slices.Contains(cancellableJobTypes, jobType)
+}
 
 type ActiveJobConflictError struct {
 	Job *models.AdminJob
@@ -995,7 +1006,7 @@ func (r *Repository) RequestCancellation(ctx context.Context, id string) (*model
 	if err != nil {
 		return nil, err
 	}
-	if isCancellableJobType(job.JobType) && job.Status == StatusCancelled {
+	if IsCancellableJobType(job.JobType) && job.Status == StatusCancelled {
 		return job, nil
 	}
 	return nil, ErrJobNotCancellable

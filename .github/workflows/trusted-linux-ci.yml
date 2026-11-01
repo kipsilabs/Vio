@@ -652,7 +652,7 @@ jobs:
       - *libvips-restore
       - *libvips-install
 
-      # The image docker-compose.yml runs: the schema needs pgvector.
+      # The image dev/compose.yml runs: the schema needs pgvector.
       - name: Start Postgres
         run: docker run -d --rm --cidfile "$RUNNER_TEMP/pg" -p 5432:5432 --tmpfs /var/lib/postgresql -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=silo_test pgvector/pgvector:pg18 > "$RUNNER_TEMP/pg.log" 2>&1 &
 
@@ -782,7 +782,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 22
+          node-version: 24
           cache: ${{ runner.environment == 'github-hosted' && 'pnpm' || '' }}
           package-manager-cache: ${{ runner.environment == 'github-hosted' }}
           cache-dependency-path: web/pnpm-lock.yaml
@@ -913,7 +913,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 22
+          node-version: 24
           cache: ${{ runner.environment == 'github-hosted' && 'pnpm' || '' }}
           package-manager-cache: ${{ runner.environment == 'github-hosted' }}
           cache-dependency-path: web/pnpm-lock.yaml

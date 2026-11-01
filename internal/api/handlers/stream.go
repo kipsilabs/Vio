@@ -89,6 +89,10 @@ type StreamHandler struct {
 	// session recipes (same instance), the only reconstruction source for a
 	// session whose URLs carry no stream token. May be nil.
 	SessionRecipeStore sessionRecipeStoreV3
+	// FinishOtherEnd is the PlaybackHandler's finisher for a stop an abort
+	// here took over (same instance). May be nil; the finish hook then
+	// records the stop's history without its provider event.
+	FinishOtherEnd func(ctx context.Context, claim nativeEndClaim, sessionID string)
 	// PlaybackConfig returns the current playback config; read it through
 	// ffmpegPath(). May be nil (tests).
 	PlaybackConfig func() config.PlaybackConfig
@@ -2106,160 +2110,20 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 		// audio/mp4 for it, and a declared-tier client refuses to attach a
 		// source buffer whose advertised type its probe rejected — so the
 		// response has to keep the same promise the plan made.
-		dvProfile := session.DVProfile
-		if dvProfile == 0 {
-			dvProfile = file.PrimaryDVProfile()
-		}
-		serveRemux := func() error {
-			// The remux writes through the raw writer; wrap it to observe how
-			// many bytes actually reached the client. nil return is NOT
-			// delivery evidence (remux.go can return nil when the first
-			// client write fails) — recovery is gated on positive bytes.
-			remuxWriter := httpstream.NewRollingDeadlineWriter(w)
-			err := playback.ServeRemuxWithOptions(remuxWriter, r, inputPath, "mp4", seekSeconds, session.TranscodeAudio, audioStreamOrdinalV3(file, session.AudioTrackIndex), dvProfile, playback.RemuxServeOptions{
-				DVMode:                    session.RemuxDVMode,
-				DropResumeLeadingPictures: session.RemuxResumeLeadingPictureDrop,
-				FFmpegPath:                h.ffmpegPath(),
-				ContentType:               playback.RemuxContentType(file.IsAudioOnly()),
-				AudioOnly:                 file.IsAudioOnly(),
-				SourceAudioChannels:       session.SourceAudioChannels,
-				TargetAudioChannels:       session.TargetAudioChannels,
-				TargetAudioBitrateKbps:    session.TargetAudioBitrateKbps,
-				TimingStart:               requestStart,
-				// The request context (client disconnect) and the session's
-				// transport-stop watch both end the response. Without this a
-				// session stop cannot withdraw a remux the client is still being
-				// fed; the request context alone misses a server-initiated stop
-				// whose client keeps reading.
-				Abort: remuxAbort,
-				// A pre-body start failure must leave the response
-				// uncommitted so the handler can fail over to a sibling
-				// candidate; the v2 writer locks the first >=400 status and
-				// would discard a successful retry.
-				DeferStartError: true,
-			})
-			if err == nil && isVirtualPlaybackFile(file) &&
-				virtualCandidateDeliveryEvidence(http.StatusOK, remuxWriter.BytesWritten()) {
-				// Media bytes actually flowed to the client for the candidate
-				// the session planned — the only evidence that forgives a
-				// transport failure. Fenced on the delivered identity and the
-				// health state observed at transport start.
-				h.clearVirtualCandidateRecovered(r.Context(), file, deliveredPath, virtualObservedFailedAt)
-			}
-			return err
-		}
-		remuxErr := serveRemux()
-		if remuxErr != nil {
-			// The remux only commits 200 after FFmpeg produces media bytes, so
-			// a failure here means the provider release served no output
-			// (corrupted NZB, dead URL). Mark the candidate failed and retry
-			// once with it excluded so the next-ranked release is tried. A
-			// client that disconnected is not a candidate failure: the remux
-			// (and its provider fetch) already aborted on the request context.
-			if !isClientCancellation(r.Context(), remuxErr) && !remuxStoppedServerSide() && isVirtualPlaybackFile(file) && hasVirtualMediaResolver(h) {
-				if releaseInput != nil {
-					releaseInput()
-					releaseInput = nil
-				}
-				// Cache-aware heal first: a cached copy of the pinned release
-				// heals the failure without indicting the release. Only when no
-				// cached copy exists does the existing rotation-to-a-sibling
-				// path run, so a cache-aware heal never silently changes the
-				// release.
-				handled := false
-				if healedResolved, healCleanup, healedOK, _ := h.handoffVirtualSessionToCached(r.Context(), session, file, false); healedOK {
-					if healedURL, parseErr := url.Parse(healedResolved.URL); parseErr == nil && healedURL.Scheme == "http" {
-						healedHost := healedURL.Hostname()
-						if healedHost == "127.0.0.1" || healedHost == "::1" || healedHost == "[::1]" {
-							inputPath = healedResolved.URL
-							deliveredPath = resolvedVirtualCandidatePath(healedResolved)
-							releaseInput = healCleanup
-							remuxErr = serveRemux()
-							// Only a heal that actually delivered is handled;
-							// a cached retry that failed too falls through to
-							// failure marking and sibling rotation.
-							if remuxErr == nil {
-								handled = true
-							} else if healCleanup != nil {
-								healCleanup()
-								releaseInput = nil
-							}
-						} else if healCleanup != nil {
-							healCleanup()
-							releaseInput = nil
-						}
-					} else if healCleanup != nil {
-						healCleanup()
-						releaseInput = nil
-					}
-				}
-				if !handled {
-					// The cached retry above re-ran serveRemux, so re-read the
-					// abort: a stop or a client disconnect that landed during it
-					// ends recovery here instead of indicting a release that was
-					// never given a chance to deliver. Without this the retry
-					// marks the candidate failed and rotates away from a healthy
-					// release, which is what the guard above exists to prevent.
-					if isClientCancellation(r.Context(), remuxErr) || remuxStoppedServerSide() {
-						handled = true
-					}
-				}
-				if !handled {
-					failedID := virtualResultCandidateID(deliveredPath)
-					if failedID != "" {
-						h.markVirtualCandidateFailed(r.Context(), file, failedID)
-					}
-					excluded := []string{failedID}
-					if failedID == "" {
-						excluded = nil
-					}
-					// The remux failed because this serve layer just indicted the
-					// delivered candidate; declare substitution so the resolver may
-					// serve a sibling release. A retry with no indictment keeps
-					// refusing.
-					retried, retryCleanup, retryErr := h.resolveVirtualInputURIExcluding(r.Context(), file, session.UserID, session.ProfileID, true, excluded, failedID != "")
-					if retryErr == nil {
-						// Same pinned-candidate guard direct play has: a retry that
-						// resolved a different release than the session-bound pin
-						// must not silently swap the bytes mid-stream. A failed pin
-						// this serve layer just marked is an intended substitution
-						// (the retry excluded it, so it can only return a sibling),
-						// so the guard applies only when no failed candidate was
-						// identified.
-						expectedCandidateID := ""
-						if parsed, err := url.Parse(file.FilePath); err == nil {
-							expectedCandidateID = parsed.Query().Get("result")
-						}
-						if failedID == "" && expectedCandidateID != "" && retried.CandidateID != "" && retried.CandidateID != expectedCandidateID {
-							if retryCleanup != nil {
-								retryCleanup()
-							}
-							remuxErr = fmt.Errorf("retried candidate %q does not match pinned candidate %q", retried.CandidateID, expectedCandidateID)
-						} else {
-							releaseInput = retryCleanup
-							retryURL, parseErr := url.Parse(retried.URL)
-							if parseErr == nil && retryURL.Scheme == "http" {
-								retryHost := retryURL.Hostname()
-								if retryHost == "127.0.0.1" || retryHost == "::1" || retryHost == "[::1]" {
-									inputPath = retried.URL
-									deliveredPath = resolvedVirtualCandidatePath(retried)
-									remuxErr = serveRemux()
-								}
-							}
-						}
-					}
-				}
-			}
-			if remuxErr != nil {
-				h.handleTransportStartFailure(r.Context(), session, file, remuxErr)
-				// The remux defers pre-body start failures, so with that option set
-				// nothing has committed a status and the v2 writer is still
-				// unlocked; a mid-stream failure returns nil instead. Commit one
-				// coherent error here. A client that disconnected needs no body.
-				if !isClientCancellation(r.Context(), remuxErr) && !remuxStoppedServerSide() {
-					http.Error(w, "failed to start remux", http.StatusBadGateway)
-				}
-			}
+		if err := playback.ServeRemuxWithOptions(w, r, file.FilePath, "mp4", seekSeconds, session.TranscodeAudio, session.AudioTrackIndex, file.PrimaryDVProfile(), playback.RemuxServeOptions{
+			DVMode:                    session.RemuxDVMode,
+			FFmpegPath:                h.ffmpegPath(),
+			DropResumeLeadingPictures: session.RemuxResumeLeadingPictureDrop,
+			ContentType:               playback.RemuxContentType(file.IsAudioOnly()),
+			AudioOnly:                 file.IsAudioOnly(),
+			SourceAudioChannels:       session.SourceAudioChannels,
+			TargetAudioChannels:       session.TargetAudioChannels,
+			TargetAudioBitrateKbps:    session.TargetAudioBitrateKbps,
+			// For a copied track the planned codec is the source's.
+			CopyAudioCodec: session.TargetAudioCodec,
+			Abort:          abort,
+		}); err != nil {
+			h.handleTransportStartFailure(r.Context(), session, file, err)
 		}
 
 	case playback.PlayTranscode:
@@ -2482,7 +2346,7 @@ func (h *StreamHandler) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 
 		// Other formats (MicroDVD .sub) cannot be retimed; ffmpeg converts
 		// them from the file.
-		vttData, err := playback.LoadExternalSubtitleAsVTT(r.Context(), sub.Path, sub.Format, h.ffmpegPath())
+		vttData, err := playback.LoadExternalSubtitleAsVTT(r.Context(), sub, h.ffmpegPath())
 		if err != nil {
 			writeErrorCause(w, http.StatusInternalServerError, "internal_error",
 				"Failed to load external subtitle", err)
@@ -3346,8 +3210,23 @@ func (h *StreamHandler) abortPlaybackSession(ctx context.Context, session *playb
 	if err := h.sessionMgr.StopSession(session.ID); err != nil {
 		return
 	}
+	claim := claimNativeEnd(ctx, h.PlanStoreV3, h.StreamDeny, session.ID, abortStopID(session.ID))
 	h.finalizeSessionAbort(ctx, session, true, "stream_abort")
-	markAttemptStoppedServerSide(ctx, h.PlanStoreV3, h.StreamDeny, session.ID)
+	// An earlier stop that won the row and never finished is finished as
+	// that stop by the playback handler, which has its writers.
+	if claim.owned && !claim.ownEnd(abortStopID(session.ID)) && h.FinishOtherEnd != nil {
+		h.FinishOtherEnd(ctx, claim, session.ID)
+		deleteSessionRecipeV3(ctx, h.SessionRecipeStore, session.ID)
+		return
+	}
+	// The playback handler's finish hook writes the play's history, as it
+	// does for every other end, unless another stop already owns it.
+	if finisher, ok := h.sessionMgr.(detachedFinisher); ok && claim.owned {
+		snapshot := *session
+		claim.applyAccepted(&snapshot)
+		finisher.FinishDetached(playback.WithEndReason(ctx, string(claim.reason(session.ID, PlaybackEndAborted))), snapshot)
+		claim.finish(ctx, session.ID, "")
+	}
 	deleteSessionRecipeV3(ctx, h.SessionRecipeStore, session.ID)
 }
 
@@ -3446,39 +3325,9 @@ func (h *StreamHandler) handleTransportStartFailure(ctx context.Context, session
 	if ctx == nil || session == nil || err == nil {
 		return
 	}
-	// Client cancellation is not a transport failure: the viewer navigated off
-	// (or hls.js gave up) while the upstream fetch was in flight. The request
-	// context propagates into the virtual provider resolve / relay, so the
-	// upstream work is already canceled. Check this before preflight so a
-	// canceled request is never rewritten into a missing-file abort, and
-	// downgrade to debug; a timeout or provider error stays at WARN.
-	if isClientCancellation(ctx, err) {
-		// A transport cancel is evidence about this one request: the viewer
-		// navigated off, or hls.js gave up. Record it scoped to the session's
-		// current route revision and binding generation. It is a diagnostic and
-		// route-fence, never proof the session died, so it cannot fence a live
-		// client's recovery (only a genuine stop does that). The narrow start
-		// hook is deliberate: an HLS fragment cancel is not marked because a
-		// fragment abort is exactly the transient hls.js retry that must stay
-		// recoverable, marking every fragment request would put a liveness read
-		// on the hot segment path, and the route scoping already keeps a cancel
-		// from a predecessor's request off the successor. Best-effort: a
-		// missing session or a manager without the seam changes nothing.
-		if marker, ok := h.sessionMgr.(interface {
-			MarkClientCanceled(sessionID string) error
-		}); ok {
-			_ = marker.MarkClientCanceled(session.ID)
-		}
-		slog.DebugContext(ctx, "stream transport canceled by client",
-			"component", "api",
-			"session", session.ID,
-			"file_id", session.MediaFileID,
-			"reason", "client_canceled",
-			"playback_session_id", session.ID,
-		)
-		return
-	}
-	if preflightErr := preflightPlaybackFile(ctx, file, h.MissingMarker, h.EventsHub); preflightErr != nil {
+	// A request that already ended cannot stat the file; keep the transport's
+	// own error for the log instead of the preflight's context error.
+	if preflightErr := preflightPlaybackFile(ctx, file, h.MissingMarker, h.EventsHub); preflightErr != nil && ctx.Err() == nil {
 		err = preflightErr
 	}
 	if isPlaybackFileMissing(err) || errors.Is(err, os.ErrNotExist) {

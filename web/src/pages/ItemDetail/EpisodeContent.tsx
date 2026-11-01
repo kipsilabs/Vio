@@ -1,9 +1,10 @@
 import { useCallback, useMemo, useState } from "react";
 import { useLocation, useNavigate } from "react-router";
-import type { FileVersion, ItemDetail } from "@/api/types";
+import { leafUserData, type FileVersion, type ItemDetail } from "@/api/types";
 import type { PlayerSubtitleTrackSignature, PrePlaySubtitleSelection } from "@/player/types";
 import { useSeasonDetail, useSeasonEpisodes } from "@/hooks/queries/episodes";
 import { useDeleteSubtitlePreference, useSetSubtitlePreference } from "@/hooks/queries/subtitles";
+import { usePrePlayAudioSelection } from "./usePrePlayAudioSelection";
 import { useAmbientColor } from "@/hooks/useAmbientColor";
 import { useEpisodeSpoilerPrefs } from "@/hooks/useEpisodeSpoilerPrefs";
 import { useAuth } from "@/hooks/useAuth";
@@ -101,18 +102,7 @@ export default function EpisodeContent({
 
   // Version selection state — drives the Play button and inline stream popovers.
   const sortedVersions = useMemo(() => sortByResolution(item.versions ?? []), [item.versions]);
-  const userData =
-    item.user_data && "position_seconds" in item.user_data ? item.user_data : undefined;
-  // The viewer's own pick, remembered on this device. It outlives the server's
-  // `last_file_id`, which names whichever row actually served the bytes after
-  // a substitution. Read on mount, but only once the profile has resolved: the
-  // store is profile-scoped, and a pre-resolution read would alias another
-  // profile's pick. A pick made in place is held in state below.
-  const requestedProfileId = currentProfile?.id ?? null;
-  const requestedFileId = useMemo(
-    () => (requestedProfileId ? readRequestedFileId(item.content_id, requestedProfileId) : null),
-    [item.content_id, requestedProfileId],
-  );
+  const userData = leafUserData(item.user_data);
   const { hideOverviews } = useEpisodeSpoilerPrefs();
   // Keyed by episode so a reveal survives an on-view translation of the same
   // episode but not navigation to the next one.
@@ -139,55 +129,14 @@ export default function EpisodeContent({
     ],
   );
   const [manualSelectedFileId, setManualSelectedFileId] = useState<number | null>(null);
-  // Tracks whether a version picker has been opened; the picker-open path
-  // widens the liveness probe from the default version to the whole list.
-  const [versionPickersOpened, setVersionPickersOpened] = useState(false);
-  const handleVersionPickerOpenChange = useCallback((open: boolean) => {
-    if (open) {
-      setVersionPickersOpened(true);
-    }
-  }, []);
-
-  // Check the default-selected version as soon as the page mounts so it can't
-  // sit as an unavailable row before any liveness result exists. Only that one
-  // version is probed until a picker opens, at which point the full chunked
-  // check takes over (results are cached for 5 minutes, so re-opening does not
-  // re-fetch). The stamped rows are what the ActionBar derives its
-  // force-relink decision from: reading a stale `available` flag would replay
-  // a provider pin the server already knows is gone.
-  const livenessVersions = useMemo(
+  const pickedVersion = useMemo(
     () =>
-      versionPickersOpened ? item.versions : defaultSelectedVersion ? [defaultSelectedVersion] : [],
-    [defaultSelectedVersion, item.versions, versionPickersOpened],
+      manualSelectedFileId != null
+        ? (sortedVersions.find((version) => version.file_id === manualSelectedFileId) ?? null)
+        : null,
+    [manualSelectedFileId, sortedVersions],
   );
-  const versionLiveness = useVersionLiveness(livenessVersions, true);
-  const versionsWithLiveness = useMemo(
-    () => applyVersionAvailability(sortedVersions, versionLiveness),
-    [sortedVersions, versionLiveness],
-  );
-
-  // A chosen row that an enrichment refresh no longer carries is a pick-again
-  // state, not permission to silently show and play another version. The
-  // device's requested row is the viewer's own pick, ahead of the server's
-  // last-file hint.
-  const persistedSelectedFileId =
-    manualSelectedFileId ?? requestedFileId ?? userData?.last_file_id ?? null;
-  const selectedVersionMissing =
-    persistedSelectedFileId != null &&
-    !versionsWithLiveness.some((version) => version.file_id === persistedSelectedFileId);
-  const selectedVersion = useMemo(() => {
-    if (selectedVersionMissing) return null;
-    if (manualSelectedFileId != null) {
-      return (
-        versionsWithLiveness.find((version) => version.file_id === manualSelectedFileId) ?? null
-      );
-    }
-    return defaultSelectedVersion
-      ? (versionsWithLiveness.find(
-          (version) => version.file_id === defaultSelectedVersion.file_id,
-        ) ?? defaultSelectedVersion)
-      : null;
-  }, [defaultSelectedVersion, manualSelectedFileId, selectedVersionMissing, versionsWithLiveness]);
+  const selectedVersion = pickedVersion ?? defaultSelectedVersion;
   const selectedMediaSummary = useMemo(
     () => resolveSelectedMediaSummary(selectedVersion, item.playback_variants, item.runtime ?? 0),
     [item.playback_variants, item.runtime, selectedVersion],
@@ -199,8 +148,8 @@ export default function EpisodeContent({
     },
     [selectedVersion?.file_id],
   );
-  const [audioSelectionMode, setAudioSelectionMode] = useState<"auto" | "explicit">("auto");
-  const [explicitAudioTrackIndex, setExplicitAudioTrackIndex] = useState<number | null>(null);
+  const audioSelection = usePrePlayAudioSelection(item.content_id, item.series_id, selectedVersion);
+  const clearAudioSelection = audioSelection.clear;
   const [subtitleSelectionMode, setSubtitleSelectionMode] = useState<"auto" | "off" | "explicit">(
     "auto",
   );
@@ -212,8 +161,6 @@ export default function EpisodeContent({
   if (prevContentId !== item.content_id) {
     setPrevContentId(item.content_id);
     setManualSelectedFileId(null);
-    setAudioSelectionMode("auto");
-    setExplicitAudioTrackIndex(null);
     setSubtitleSelectionMode("auto");
     setExplicitSubtitleSelection(null);
   }
@@ -221,26 +168,13 @@ export default function EpisodeContent({
   const handleSelectVersion = useCallback(
     (version: FileVersion) => {
       setManualSelectedFileId(version.file_id);
-      // Remember the pick across reloads: the server records the row that
-      // actually plays, which may be a substitute for this one.
-      rememberRequestedFileId(item.content_id, version.file_id, requestedProfileId);
-      setAudioSelectionMode("auto");
-      setExplicitAudioTrackIndex(null);
+      // Track indexes belong to a file, so another version starts from Auto.
+      clearAudioSelection();
       setSubtitleSelectionMode("auto");
       setExplicitSubtitleSelection(null);
     },
-    [item.content_id, requestedProfileId],
+    [clearAudioSelection],
   );
-
-  const handleSelectAudioTrack = useCallback((trackIndex: number) => {
-    setAudioSelectionMode("explicit");
-    setExplicitAudioTrackIndex(trackIndex);
-  }, []);
-
-  const handleResetAudioSelection = useCallback(() => {
-    setAudioSelectionMode("auto");
-    setExplicitAudioTrackIndex(null);
-  }, []);
 
   const handleSelectSubtitle = (selection: PrePlaySubtitleSelection) => {
     setSubtitleSelectionMode("explicit");
@@ -252,7 +186,6 @@ export default function EpisodeContent({
       setSubtitlePreference.mutate({
         prefId: item.series_id,
         selection,
-        showForcedSubtitles: item.effective_show_forced_subtitles,
       });
     }
   };
@@ -275,7 +208,6 @@ export default function EpisodeContent({
       setSubtitlePreference.mutate({
         prefId: item.series_id,
         selection: null,
-        showForcedSubtitles: item.effective_show_forced_subtitles,
       });
     }
   };
@@ -510,9 +442,7 @@ export default function EpisodeContent({
               versions={versionsWithLiveness}
               playbackVariants={item.playback_variants}
               selectedVersion={selectedVersion}
-              selectedVersionMissing={selectedVersionMissing}
-              onVersionPickerOpenChange={handleVersionPickerOpenChange}
-              explicitFileSelection={manualSelectedFileId != null}
+              versionPicked={pickedVersion != null}
               onSelectVersion={handleSelectVersion}
               onDownload={
                 user?.download_allowed && (item.versions ?? []).length > 0
@@ -523,10 +453,10 @@ export default function EpisodeContent({
                 (item.versions?.length ?? 0) > 0 ? () => setSubtitleSearchOpen(true) : undefined
               }
               qualityPreference={qualityPreference}
-              audioSelectionMode={audioSelectionMode}
-              explicitAudioTrackIndex={explicitAudioTrackIndex}
-              onSelectAudioTrack={handleSelectAudioTrack}
-              onResetAudioSelection={handleResetAudioSelection}
+              audioSelectionMode={audioSelection.mode}
+              explicitAudioTrackIndex={audioSelection.explicitIndex}
+              onSelectAudioTrack={audioSelection.select}
+              onResetAudioSelection={audioSelection.reset}
               prePlaySubtitleMode={subtitleSelectionMode}
               explicitSubtitleSelection={explicitSubtitleSelection}
               onSelectSubtitle={handleSelectSubtitle}
@@ -536,7 +466,6 @@ export default function EpisodeContent({
               preferredSubtitleTrackSignature={preferredSubtitleTrackSignature}
               subtitleMode={item.effective_subtitle_mode as "off" | "auto" | "always" | undefined}
               showForcedSubtitles={item.effective_show_forced_subtitles}
-              profileLanguage={currentProfile?.language}
             />
           }
         />

@@ -1,8 +1,11 @@
+import type { BufferingMode, BufferingReplan } from "../buffering-quality";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { usePlayerConfig } from "../context/PlayerConfigContext";
 import { publishPlaybackInventory } from "../playbackInventoryMirror";
 import type { PlayerConfig } from "../context/PlayerConfigContext";
 import { startPlaybackV2 } from "../start-v2";
+import { settleTrackPreferenceWrites } from "../utils/trackPreferenceWrites";
+import { playbackStartEnded } from "../bandwidth-probe";
 import { hasSequencedProgress, stopSequencedSession } from "../session-mutations";
 import {
   CONNECTION_LOST_ERROR,
@@ -28,7 +31,7 @@ import {
   buildClientPlaybackContextV3,
   detectBandwidthEstimateKbpsV3,
 } from "../client-context-v3";
-import { buildRouteEventV3 } from "../route-events-v3";
+import { buildRouteEventV3, type RouteEventInput } from "../route-events-v3";
 import { reportSessionRouteEventV2 } from "../route-events-v2";
 import { replanV2 } from "../lifecycle-v2";
 import { takePlaybackIntent } from "../first-frame";
@@ -660,24 +663,22 @@ export interface UsePlaybackSessionResult extends PlaybackSessionState {
   /** What the media element itself plays from an untouched original. */
   nativeOriginalSupport: NativeOriginalSupport;
   /** Starts a fresh session against another file (edition/version switch). */
-  switchVersion: (fileId: number, currentPosition: number) => void;
   /**
-   * Arms automatic version fallback (the version menu's Auto entry). When the
-   * current source is already terminal, recovers immediately with an auto
-   * re-resolve; otherwise it only arms Auto for a later dead source. A healthy
-   * mid-play source is never switched.
+   * Switches to another version of the title. `onAdopt` gets the adopted
+   * plan's revision before the new plan renders, or no revision when the
+   * switch does not adopt one.
    */
-  selectAutoVersion: () => void;
+  switchVersion: (
+    fileId: number,
+    currentPosition: number,
+    onAdopt?: (planRevision?: number) => void,
+  ) => void;
   /**
-   * Re-issues the start request for the file whose start was refused with a
-   * retryable terminal, forcing a fresh release relist. No-op while a retry is
-   * already in flight or once a plan is playing.
+   * Whether the file playing is one the viewer chose, before Play or with
+   * `switchVersion`. The next part of a multi-part file keeps the choice.
    */
-  retryStart: () => void;
-  /**
-   * `track_change` replan selecting another audio track by combined index. A
-   * pick the plan's inventory cannot name is ignored rather than sent.
-   */
+  versionPinned: () => boolean;
+  /** `track_change` replan selecting another audio track by combined index. */
   switchAudioTrack: (index: number, currentPosition: number) => void;
   /**
    * `track_change` replan selecting (or clearing) the server-side subtitle
@@ -697,7 +698,23 @@ export interface UsePlaybackSessionResult extends PlaybackSessionState {
     displayedTrack?: PlayerSubtitleInfo | null,
   ) => void;
   /** `quality_change` replan for a label taken from `plan.available_qualities`. */
-  changeQuality: (label: string, currentPosition: number) => void;
+  changeQuality: (
+    label: string,
+    currentPosition: number,
+    buffering?: BufferingReplan,
+    /**
+     * Gets the adopted plan's revision before the session's state names that
+     * plan, or no revision when the replan is refused; `sent` is false when it
+     * was refused before it was sent.
+     */
+    onAdopt?: (planRevision?: number, sent?: boolean) => void,
+  ) => void;
+  /**
+   * The step-down estimate of the latest Auto lowering, or undefined. The
+   * session's own later Auto replans repeat it without a source, so the plan
+   * stays lowered; a new start drops it.
+   */
+  setKeptEstimate: (kbps: number | undefined) => void;
   /** `failure_recovery` replan after the client could not play the plan. */
   recoverFromFailure: (failure: FailureV3, currentPosition: number) => void;
   /**
@@ -858,7 +875,11 @@ export interface UsePlaybackSessionResult extends PlaybackSessionState {
     extra?: {
       failureClassification?: string;
       fallbackReason?: string;
+      /** For `plan_summary`: the adoption it summarizes. */
+      adoptionId?: string;
       diagnostics?: Record<string, string | number | boolean | undefined | null>;
+      /** The page is closing; the request must outlive it. */
+      keepalive?: boolean;
     },
   ) => void;
 }
@@ -1413,6 +1434,15 @@ function describePlaybackSessionError(
     return transportError;
   }
 
+  // A request that timed out or could not connect: the browser's own wording
+  // ("signal timed out", "Failed to fetch") means nothing to the viewer.
+  if (isTransientPlayerRequestError(error)) {
+    return {
+      title: "Playback unavailable",
+      message: "Silo couldn't reach the server. Check your connection, then try again.",
+    };
+  }
+
   if (error instanceof Error && error.message.trim().length > 0) {
     return {
       title: "Playback unavailable",
@@ -1461,10 +1491,10 @@ export function usePlaybackSession(
    *  unavailable version. */
   forceRelink = false,
   allowAlternateVersions = true,
-  /** The profile's subtitle mode. `auto`/`always` make a version that owns a
-   *  subtitle inventory preferable to one that does not when the start has no
-   *  explicit file. */
-  subtitleMode?: SubtitleMode | null,
+  /** Effective profile mode, seeded by the host without waiting for settings. */
+  bufferingMode: BufferingMode = "always",
+  /** The viewer chose `fileId`; see `versionPinnedRef`. */
+  versionPicked = false,
 ): UsePlaybackSessionResult {
   const config = usePlayerConfig();
   const probe = useCodecDetection();
@@ -1535,6 +1565,30 @@ export function usePlaybackSession(
 
   const sessionIdRef = useRef<string | null>(null);
   const planRef = useRef<PlanV3 | null>(null);
+  // What a `plan_summary` reports against, by adoption: the plan may have been
+  // replaced, and its session ended, by the time the summary is sent.
+  const summaryIdentitiesRef = useRef(
+    new Map<
+      string,
+      {
+        route: Pick<
+          RouteEventInput,
+          "playbackAttemptId" | "sessionId" | "planId" | "planAttemptId" | "planAttemptKey"
+        >;
+        /** The estimate the plan was requested with. */
+        bandwidthEstimateKbps: number | null | undefined;
+      }
+    >(),
+  );
+  // The adoptions already summarized, so a second report of one is dropped.
+  const summarizedAdoptionsRef = useRef(new Set<string>());
+  // The estimate on the start or replan in flight; requests are serialized,
+  // so the next adoption answers it.
+  const requestedEstimateRef = useRef<number | null | undefined>(undefined);
+  const keptEstimateRef = useRef<number | undefined>(undefined);
+  const setKeptEstimate = useCallback((kbps: number | undefined) => {
+    keptEstimateRef.current = kbps;
+  }, []);
   const planRevisionRef = useRef(0);
   const transportRevisionRef = useRef(0);
   const replayRevisionRef = useRef(0);
@@ -1611,62 +1665,10 @@ export function usePlaybackSession(
   const planAutoPlayRef = useRef(true);
   const planTransportShownRef = useRef(false);
   const switchingRef = useRef(false);
-  // Mirrors state.autoFallback so callbacks can read the armed state without
-  // depending on the rendered value.
-  const autoFallbackRef = useRef(allowAlternateVersions && !explicitFileSelection);
-  // The last live inventory revision folded into the menus. The server stamps
-  // every `inventory_updated` push with its inventory_revision and documents a
-  // duplicate or stale revision as a no-op, so this gates repeat deliveries
-  // without comparing plan identity (which a rotation can move).
-  const inventoryRevisionRef = useRef<string | null>(null);
-  const inventoryPendingRef = useRef(false);
-  const pollInventoryInflightRef = useRef<Promise<boolean> | null>(null);
-  const teardownAbortRef = useRef<AbortController>(new AbortController());
-  // Identity-carrying pushes dropped while a start/switch/replan owns the
-  // session. Applying them immediately would mutate the menus under the pending
-  // replacement, but discarding them loses the only carrier of the incoming
-  // source's virtual identity: the v2 wire omits `effective_virtual_uri`, so the
-  // replacement plan may not name the candidate the push does. They are held in
-  // one arrival-ordered queue and replayed once that operation settles and the
-  // settled plan can vouch for the source. The order matters: a source commit
-  // and an inventory revision for the same source must fold in the order the
-  // server sent them, so a newer source is never overwritten by an older
-  // inventory and vice versa.
-  const deferredPushesRef = useRef<DeferredPush[]>([]);
-  const deferredPushSeqRef = useRef(0);
-  const deferredFlushTimerRef = useRef<number | null>(null);
-  // Late-bound sink: the flusher is defined later in the render, after the
-  // fold callbacks it closes over, so the interval reads it through this ref.
-  const flushDeferredPushesRef = useRef<() => void>(() => {});
-  // A bounded retry cadence so a push dropped while a start/switch/replan owns
-  // the session is still folded in when that operation settles without a signal
-  // this hook observes. The settle paths call the flusher directly; this is the
-  // backstop for the fast pending/declared start.
-  useEffect(() => {
-    const controller = new AbortController();
-    teardownAbortRef.current = controller;
-    deferredFlushTimerRef.current = window.setInterval(() => {
-      if (deferredPushesRef.current.length > 0) {
-        flushDeferredPushesRef.current();
-      }
-    }, 2_000);
-    return () => {
-      controller.abort();
-      if (deferredFlushTimerRef.current !== null) {
-        window.clearInterval(deferredFlushTimerRef.current);
-        deferredFlushTimerRef.current = null;
-      }
-    };
-  }, []);
-  // Latest-wins coalescing for version switches: while a switch is in flight,
-  // a second click records the newest target here instead of being dropped, and
-  // the completion handler starts the switch to it immediately.
-  const pendingSwitchFileIdRef = useRef<number | null>(null);
-  // The live position the viewer was at when they made that second click. The
-  // chained switch starts only after the first one settles, so reusing the
-  // first click's closure position would seek the replacement back to where the
-  // viewer was dozens of seconds earlier.
-  const pendingSwitchPositionRef = useRef<number | null>(null);
+  // Whether the file playing is one the viewer chose, before Play or with a
+  // version switch. Its starts send `allow_alternate_versions: false`, so Auto
+  // under a budget cannot swap in a lower-bitrate sibling.
+  const versionPinnedRef = useRef(false);
   const loadSequenceRef = useRef(0);
   // The start that produced the current terminal, so a retry can re-issue it
   // against the same file with the viewer's original position and selection.
@@ -1733,16 +1735,17 @@ export function usePlaybackSession(
   // decide against, so only it is waited on.
   const adoptionsInFlightRef = useRef(new Map<number, number>());
   const adoptionWaitersRef = useRef<Array<{ loadSequence: number; resolve: () => void }>>([]);
+  /** A Restore's `learned_limit: "clear"` that has not gone out yet. */
+  const clearOwedRef = useRef(false);
   const pendingReplanRef = useRef<{
     options: ReplanOptions;
     loadSequence: number;
     retireSessionOnRefusal: boolean;
     resolve: (adopted: boolean) => void;
     planId: string;
-    // The live effective file the op was built against. A serve-layer rotation
-    // moves it without changing `plan_id`, so the plan-id check alone would
-    // replay a plan-bound op against another release's track ordinals.
-    mediaFileId: number | null;
+    /** The file the queued request's track ordinals index into. */
+    mediaFileId: number;
+    onAdopt?: (planRevision: number) => void;
   } | null>(null);
   // Track picks held while a switch or another replan owns the lane. The pick
   // carries the row the viewer clicked, so it can be re-resolved against the
@@ -1757,6 +1760,7 @@ export function usePlaybackSession(
       options: ReplanOptions,
       retireSessionOnRefusal?: boolean,
       reconnect?: boolean,
+      onAdopt?: (planRevision: number) => void,
     ) => Promise<boolean>
   >(async () => false);
   const trackSelectionNoticeIdRef = useRef(0);
@@ -1948,21 +1952,54 @@ export function usePlaybackSession(
       extra?: {
         failureClassification?: string;
         fallbackReason?: string;
+        /** For `plan_summary`: the adoption it summarizes. */
+        adoptionId?: string;
         diagnostics?: Record<string, string | number | boolean | undefined | null>;
+        /** The page is closing; the request must outlive it. */
+        keepalive?: boolean;
       },
     ) => {
+      const { keepalive, ...fields } = extra ?? {};
       const attemptId = playbackAttemptIdRef.current;
       if (!attemptId) return;
-      const plan = planRef.current;
-      const input = {
-        event,
-        playbackAttemptId: attemptId,
-        ...routeEventPlanIdentityV3(plan, sessionIdRef.current, planAttemptIdRef.current),
-        ...extra,
-      };
-      const sessionId = sessionIdRef.current;
+      let input: RouteEventInput;
+      if (event === "plan_summary") {
+        if (!serverFeaturesRef.current.includes("playback_plan_summary_v1")) return;
+        // Each adoption is summarized once, against its own plan and session.
+        // A plan the page adopted again after the back-forward cache
+        // ("<revision>.<n>") is summarized against the plan it adopted again.
+        const adoptionId = extra?.adoptionId;
+        if (!adoptionId || summarizedAdoptionsRef.current.has(adoptionId)) return;
+        const identity = summaryIdentitiesRef.current.get(adoptionId.split(".")[0]!);
+        if (!identity) return;
+        summarizedAdoptionsRef.current.add(adoptionId);
+        if (summarizedAdoptionsRef.current.size > 100) {
+          const oldest = summarizedAdoptionsRef.current.values().next().value;
+          if (oldest) summarizedAdoptionsRef.current.delete(oldest);
+        }
+        input = {
+          event,
+          ...identity.route,
+          diagnostics: {
+            ...extra.diagnostics,
+            bandwidth_estimate_kbps: identity.bandwidthEstimateKbps,
+          },
+        };
+      } else {
+        input = {
+          event,
+          playbackAttemptId: attemptId,
+          ...routeEventPlanIdentityV3(
+            planRef.current,
+            sessionIdRef.current,
+            planAttemptIdRef.current,
+          ),
+          ...fields,
+        };
+      }
+      const sessionId = input.sessionId;
       if (sessionId && hasSequencedProgress(sessionId)) {
-        void reportSessionRouteEventV2(config, sessionId, buildRouteEventV3(input));
+        void reportSessionRouteEventV2(config, sessionId, buildRouteEventV3(input), { keepalive });
       }
       // A terminal start never produced a session; there is nothing to report it against.
     },
@@ -1977,7 +2014,7 @@ export function usePlaybackSession(
     (
       decision: DecisionResponseV3,
       initialSubtitleFailure?: PlaybackSessionErrorState | null,
-      forceTransportBump?: boolean,
+      onAdopt?: (planRevision: number) => void,
     ): boolean => {
       serverFeaturesRef.current = decision.server_features;
       const plan = decision.playback_plan;
@@ -2079,12 +2116,21 @@ export function usePlaybackSession(
         recoveredDeadSessionRef.current = null;
       }
       planRevisionRef.current += 1;
-      // A failure recovery always prepares a fresh server generation, even when
-      // the replacement plan reuses the same session-scoped URL and transport
-      // shape; the A/V-byte heuristic cannot see that regeneration. Force a
-      // transport revision bump so the player reloads and re-fetches the stream.
-      if (forceTransportBump || !isSameAVTransport(prevPlan, plan)) {
-        transportRevisionRef.current += 1;
+      summaryIdentitiesRef.current.set(String(planRevisionRef.current), {
+        route: {
+          playbackAttemptId: playbackAttemptIdRef.current ?? "",
+          sessionId: sessionId ?? null,
+          planId: plan.plan_id,
+          planAttemptId: planAttemptIdRef.current,
+          planAttemptKey: plan.plan_attempt_key,
+        },
+        bandwidthEstimateKbps: requestedEstimateRef.current,
+      });
+      // An identity outlives its summary, since a plan adopted again after the
+      // back-forward cache reports against it; only the newest are kept.
+      if (summaryIdentitiesRef.current.size > 100) {
+        const oldest = summaryIdentitiesRef.current.keys().next().value;
+        if (oldest) summaryIdentitiesRef.current.delete(oldest);
       }
       hasAdoptedPlanRef.current = true;
       if (
@@ -2098,8 +2144,11 @@ export function usePlaybackSession(
         awaitingInitialPlayerPositionRef.current = plan.timeline.source_start_seconds > 0;
       }
 
-      setState((current) => {
-        const next = planToSessionState(
+      // Told before the state update, so the caller hears of the adoption
+      // before anything can render the new plan.
+      onAdopt?.(planRevisionRef.current);
+      setState((current) => ({
+        ...planToSessionState(
           plan,
           sessionId ?? null,
           playbackAttemptIdRef.current ?? "",
@@ -2190,13 +2239,18 @@ export function usePlaybackSession(
       forceRelink?: boolean,
       audioTrackIndex: number | null | undefined = explicitAudioTrackIndex,
     ): Promise<DecisionResponseV3> => {
-      const body: StartRequestWithForceRelinkV3 = buildStartRequestV3({
+      const bandwidthEstimateKbps = detectBandwidthEstimateKbpsV3();
+      requestedEstimateRef.current = bandwidthEstimateKbps;
+      // An owed Restore's `clear` goes out once, on this start.
+      const clearOwed = clearOwedRef.current;
+      clearOwedRef.current = false;
+      const body = buildStartRequestV3({
         extraClientFeatures: VIDEO_CLIENT_FEATURES_V3,
         fileId: targetFileId,
         profileId: config.getProfileId() ?? "",
         playbackAttemptId,
         qualityPreference: qualityRef.current,
-        allowAlternateVersions,
+        allowAlternateVersions: allowAlternateVersions && !versionPinnedRef.current,
         position,
         forceStartPosition,
         // A carried audio track (version switch) names the file-bound identity
@@ -2210,9 +2264,10 @@ export function usePlaybackSession(
         offeredVirtualURI,
         forceRelink,
         subtitleTrackIndex,
-        subtitleTrackID,
-        bandwidthEstimateKbps: detectBandwidthEstimateKbpsV3(),
+        bandwidthEstimateKbps,
+        bandwidthEstimateSource: bandwidthEstimateKbps === undefined ? undefined : "probe",
         bandwidthCapKbps: maxBitrateKbps,
+        learnedLimit: clearOwed ? "clear" : bufferingMode === "never" ? "ignore" : undefined,
         clientCapabilities,
         clientPlaybackContext,
       });
@@ -2222,6 +2277,9 @@ export function usePlaybackSession(
         body.force_relink = true;
       }
 
+      // The server resolves this start's tracks from the saved series
+      // choices, so a pick or an Auto made just before Play has to land first.
+      await settleTrackPreferenceWrites();
       return await startPlaybackV2(config, body);
       // carriedAudioTrackID is a per-call argument, not render-scope state, so
       // it is intentionally absent from the deps array.
@@ -2233,6 +2291,7 @@ export function usePlaybackSession(
       config,
       explicitAudioTrackIndex,
       maxBitrateKbps,
+      bufferingMode,
     ],
   );
 
@@ -2409,6 +2468,7 @@ export function usePlaybackSession(
       intentAt,
       reconnect = false,
       tracks,
+      onAdopt,
     }: {
       preferredFileId?: number;
       position: number;
@@ -2437,6 +2497,8 @@ export function usePlaybackSession(
       intentAt: number | null;
       /** The start is a reconnect attempt, which must not cancel itself. */
       reconnect?: boolean;
+      /** Told the adopted plan's revision before the new plan renders. */
+      onAdopt?: (planRevision: number) => void;
       /**
        * Track selection to start with instead of the initial request's, so a
        * restarted session keeps what the viewer picked during playback. An
@@ -2673,8 +2735,10 @@ export function usePlaybackSession(
           return { kind: "superseded" };
         }
 
-        const adopted = adoptDecision(decisionToAdopt, initialSubtitleFailure);
+        const adopted = adoptDecision(decisionToAdopt, initialSubtitleFailure, onAdopt);
         if (adopted) {
+          // The kept estimate belonged to the attempt this start replaced.
+          keptEstimateRef.current = undefined;
           // A start opens a new attempt. Its first frame is still to come:
           // whatever the player shows until the new transport loads belongs to
           // the attempt it replaced.
@@ -2761,7 +2825,8 @@ export function usePlaybackSession(
     }
     activeRequestKeyRef.current = requestKey;
     activeCapabilityRequestKeyRef.current = capabilityRequestKey;
-    qualityRef.current = qualityPreference?.trim() || QUALITY_ORIGINAL_V3;
+    versionPinnedRef.current = versionPicked;
+    qualityRef.current = normalizeQualityPreferenceV3(qualityPreference);
     playbackPositionRef.current = initialPosition;
     const intentAt = takePlaybackIntent(requestKey);
     startIntentRef.current = {
@@ -2822,7 +2887,7 @@ export function usePlaybackSession(
     loadSession,
     qualityPreference,
     requestKey,
-    transitionSourceIdentity,
+    versionPicked,
   ]);
 
   // Clean up session on unmount.
@@ -2837,6 +2902,8 @@ export function usePlaybackSession(
       pendingTrackPicksRef.current = [];
       // A viewer who leaves while the player reconnects stops the retries.
       endReconnect(false);
+      // A start this player left still loading no longer holds off speed tests.
+      playbackStartEnded();
       const sid = sessionIdRef.current;
       if (!sid) return;
       // sendBeacon doesn't support DELETE, so the stop uses fetch keepalive.
@@ -2862,6 +2929,7 @@ export function usePlaybackSession(
       options: ReplanOptions,
       retireSessionOnRefusal = false,
       reconnect = false,
+      onAdopt?: (planRevision: number) => void,
     ): Promise<boolean> {
       const plan = planRef.current;
       // Stamp the load sequence with the plan, at the same read. A version
@@ -2871,30 +2939,16 @@ export function usePlaybackSession(
       const loadSequence = loadSequenceRef.current;
       const sessionId = sessionIdRef.current;
       const playbackAttemptId = playbackAttemptIdRef.current;
-      if (!plan || !sessionId || !playbackAttemptId) return false;
-      // A session answered gone cannot be replanned; every retry earns the same
-      // answer. The restart action starts a new session instead.
-      if (sessionGoneRef.current) return false;
-      // A switch is replacing the whole session and about to retire the plan
-      // below. A replan built from that outgoing plan would be stamped with the
-      // switch's sequence once the switch lands, so it could clobber the
-      // replacement instead of being discarded. Refuse until the switch
-      // settles; the switch completion path owns what happens next.
-      if (switchingRef.current) {
-        // A cold-start seek is a viewer intent, not a stale op against the
-        // outgoing plan: remember its live target so the switch completion can
-        // replay it against the replacement once it settles. Scoped to the
-        // current playback generation so a failed or superseded switch never
-        // replays it, and a new session never inherits it.
-        if (options.operation === "seek_reanchor") {
-          pendingSeekRef.current = {
-            positionSeconds: options.positionSeconds ?? 0,
-            playbackAttemptId: playbackAttemptIdRef.current,
-          };
-        }
+      if (!plan || !sessionId || !playbackAttemptId) {
+        // A Restore with no plan to replan, as after a start that adopted
+        // none, owes its `clear` to the next start.
+        if (options.learnedLimit === "clear") clearOwedRef.current = true;
         return false;
       }
       if (replanInFlightRef.current) {
+        // Whatever happens to a Restore here, its `clear` is owed to the next
+        // request that goes out.
+        if (options.learnedLimit === "clear") clearOwedRef.current = true;
         const isPendingFailureRecovery =
           options.operation === "failure_recovery" || options.operation === "seek_failure_recovery";
         const isPendingOutputChange = options.operation === "output_change";
@@ -2940,7 +2994,8 @@ export function usePlaybackSession(
               retireSessionOnRefusal,
               resolve,
               planId: plan.plan_id,
-              mediaFileId: liveSourceIdentityRef.current.fileId,
+              mediaFileId: plan.effective_media_file_id,
+              onAdopt,
             };
           });
         }
@@ -2972,6 +3027,26 @@ export function usePlaybackSession(
         : [];
       const attemptCount = isFailureRecovery ? attemptCountRef.current : 1;
 
+      // A lowering or Restore names its own estimate. The client's other Auto
+      // replans repeat the kept step-down estimate, without a source because
+      // it is not a new observation. The speed-test reading is for starts
+      // only: a replan never sends it, so it cannot raise or hold quality
+      // mid-title.
+      const kept =
+        options.bandwidthEstimateKbps === undefined && qualityRef.current === "auto"
+          ? keptEstimateRef.current
+          : undefined;
+      const bandwidthEstimateKbps =
+        options.bandwidthEstimateKbps !== undefined ? options.bandwidthEstimateKbps : kept;
+      const bandwidthEstimateSource =
+        options.bandwidthEstimateKbps !== undefined ? options.bandwidthEstimateSource : undefined;
+      requestedEstimateRef.current = bandwidthEstimateKbps;
+      // A Restore that could not go at once rides its `clear` on the request
+      // that replaced it.
+      const learnedLimit =
+        options.learnedLimit ??
+        (clearOwedRef.current ? "clear" : bufferingMode === "never" ? "ignore" : undefined);
+      clearOwedRef.current = false;
       const body = buildReplanRequestV3({
         ...options,
         extraClientFeatures: VIDEO_CLIENT_FEATURES_V3,
@@ -2982,13 +3057,10 @@ export function usePlaybackSession(
         qualityPreference: qualityRef.current,
         attemptedPlanKeys,
         attemptCount,
-        // State the viewer's current Auto intent on every replan so the
-        // server's session flag cannot drift from the menu: a viewer who
-        // started on an explicit pick and later re-armed Auto must still
-        // rotate on a dead source.
-        autoFallback: autoFallbackRef.current,
-        bandwidthEstimateKbps: detectBandwidthEstimateKbpsV3(),
+        bandwidthEstimateKbps,
+        bandwidthEstimateSource,
         bandwidthCapKbps: maxBitrateKbps,
+        learnedLimit,
         clientCapabilities,
         clientPlaybackContext,
       });
@@ -3013,7 +3085,7 @@ export function usePlaybackSession(
       }));
 
       try {
-        const decision = await replanV2(config, sessionId, body);
+        const decision = await replanV2(config, sessionId, body, serverFeaturesRef.current);
 
         // A version switch or a fresh start that landed while this was in
         // flight owns the session now; this plan is already superseded.
@@ -3035,7 +3107,7 @@ export function usePlaybackSession(
         const adopted = adoptDecision(
           decision,
           options.operation === "track_change" && options.subtitle !== undefined ? null : undefined,
-          isFailureRecovery,
+          onAdopt,
         );
         if (
           !adopted &&
@@ -3237,31 +3309,34 @@ export function usePlaybackSession(
         const pendingReplan = pendingReplanRef.current;
         pendingReplanRef.current = null;
         if (pendingReplan?.loadSequence === loadSequenceRef.current) {
-          // The queued op was built against the plan its `planId` names and the
-          // live source its `mediaFileId` names. When the in-flight replan has
-          // replaced that plan, an op may only be replayed if it carries no
-          // plan-derived state: a seek target, a quality label and an output
-          // refresh are resolved against the live plan, either by this
-          // re-dispatch or by the server. A track selection bakes in a
-          // plan-derived ordinal, and a failure recovery bakes in the plan to
-          // exclude, so both are dropped once the plan identity they name is
-          // gone. A rotation moves the effective source without changing the
-          // plan id, so the live file id is checked too: the plan-bound ordinal
-          // no longer names the same bytes once the transport rebinds.
-          const planStillCurrent =
-            pendingReplan.planId === planRef.current?.plan_id &&
-            pendingReplan.mediaFileId === liveSourceIdentityRef.current.fileId;
-          const pendingIsPlanBound =
-            pendingReplan.options.operation === "failure_recovery" ||
-            pendingReplan.options.operation === "seek_failure_recovery" ||
+          const recoveryAppliesToCurrentPlan =
+            pendingReplan.options.operation !== "failure_recovery" &&
+            pendingReplan.options.operation !== "seek_failure_recovery"
+              ? true
+              : pendingReplan.planId === planRef.current?.plan_id;
+          // An audio or subtitle pick names its track by its index in the file
+          // it was made on. Once a replan has moved to another file (a quality
+          // change to another version), that index means some other track
+          // there, so the pick is dropped rather than replayed; the saved
+          // series choice still applies from the next start. Subtitles off
+          // (null) names no track and still applies.
+          const namesTrack =
             pendingReplan.options.audio !== undefined ||
-            pendingReplan.options.subtitle !== undefined;
-          if (planStillCurrent || !pendingIsPlanBound) {
+            (pendingReplan.options.subtitle !== undefined &&
+              pendingReplan.options.subtitle !== null);
+          const trackPickAppliesToCurrentFile =
+            !namesTrack || pendingReplan.mediaFileId === planRef.current?.effective_media_file_id;
+          if (recoveryAppliesToCurrentPlan && trackPickAppliesToCurrentFile) {
             // A capability change can queue behind a replan created by an older
             // render. Dispatch through the latest callback so its request carries
             // the current output evidence rather than the closed-over snapshot.
             void issueReplanRef
-              .current(pendingReplan.options, pendingReplan.retireSessionOnRefusal)
+              .current(
+                pendingReplan.options,
+                pendingReplan.retireSessionOnRefusal,
+                false,
+                pendingReplan.onAdopt,
+              )
               .then(pendingReplan.resolve);
           } else {
             pendingReplan.resolve(false);
@@ -3293,6 +3368,7 @@ export function usePlaybackSession(
       loadSession,
       markSessionGone,
       maxBitrateKbps,
+      bufferingMode,
       retireActiveSession,
     ],
   );
@@ -3609,24 +3685,70 @@ export function usePlaybackSession(
   );
 
   const changeQuality = useCallback(
-    (label: string, currentPosition: number) => {
-      const normalized = label.trim() || QUALITY_ORIGINAL_V3;
+    (
+      label: string,
+      currentPosition: number,
+      buffering?: BufferingReplan,
+      onAdopt?: (planRevision?: number, sent?: boolean) => void,
+    ) => {
+      // A lowering waits for nothing: refused while another replan is in
+      // flight, it is not sent, and the controller rearms. A Restore waits
+      // behind it instead (see `replan`), or behind a start in flight.
+      if (
+        buffering &&
+        buffering.learned_limit !== "clear" &&
+        (replanInFlightRef.current || !planRef.current || !sessionIdRef.current)
+      ) {
+        onAdopt?.(undefined, false);
+        return;
+      }
+      const normalized = normalizeQualityPreferenceV3(label);
       const previousPreference = qualityRef.current;
       qualityRef.current = normalized;
       setState((current) => ({ ...current, qualityPreference: normalized }));
-      void replan({ operation: "quality_change", positionSeconds: currentPosition }).then(
-        (adopted) => {
-          if (adopted || qualityRef.current !== normalized) return;
+      // The replan tells onAdopt as it adopts, before the new plan renders; a
+      // refusal is told here.
+      const send = () =>
+        void replan(
+          {
+            operation: "quality_change",
+            positionSeconds: currentPosition,
+            ...(buffering
+              ? {
+                  bandwidthEstimateKbps: buffering.bandwidth_estimate_kbps ?? null,
+                  bandwidthEstimateSource: buffering.bandwidth_estimate_source,
+                  observedThroughputKbps: buffering.observed_throughput_kbps,
+                  learnedLimit: buffering.learned_limit,
+                }
+              : {}),
+          },
+          false,
+          false,
+          onAdopt,
+        ).then((adopted) => {
+          if (adopted) return;
+          onAdopt?.(undefined);
+          if (qualityRef.current !== normalized) return;
           qualityRef.current = previousPreference;
           setState((current) =>
             current.qualityPreference === normalized
               ? { ...current, qualityPreference: previousPreference }
               : current,
           );
-        },
-      );
+        });
+      // A Restore sent during a start would replan the plan that start
+      // replaces, so it goes out against the plan the start leaves.
+      const sendAfterStarts = () => {
+        const settling =
+          buffering?.learned_limit === "clear" && !replanInFlightRef.current
+            ? awaitAdoptionSettled()
+            : null;
+        if (settling) void settling.then(sendAfterStarts);
+        else send();
+      };
+      sendAfterStarts();
     },
-    [replan],
+    [awaitAdoptionSettled, replan],
   );
 
   const recoverFromFailure = useCallback(
@@ -4864,24 +4986,18 @@ export function usePlaybackSession(
   }, []);
 
   const switchVersion = useCallback(
-    (newFileId: number, currentPosition: number) => {
-      if (!allowAlternateVersions) return;
-      if (newFileId === stateRef.current.mediaFileId) return;
-      // The viewer picked a concrete version, so Auto is no longer armed: the
-      // server must not silently move off the chosen release.
-      setAutoFallback(false);
-      if (switchingRef.current) {
-        // A switch is already in flight. Remember the newest target and the
-        // live position it was clicked at; the completion handler starts the
-        // switch to it once the current one settles (latest-wins, mirroring the
-        // replan queue pattern).
-        pendingSwitchFileIdRef.current = newFileId;
-        pendingSwitchPositionRef.current = currentPosition;
-        setState((current) => ({ ...current, pendingSwitchFileId: newFileId }));
+    (newFileId: number, currentPosition: number, onAdopt?: (planRevision?: number) => void) => {
+      if (
+        !allowAlternateVersions ||
+        switchingRef.current ||
+        newFileId === stateRef.current.mediaFileId
+      ) {
+        onAdopt?.(undefined);
         return;
       }
       switchingRef.current = true;
-      setState((current) => ({ ...current, pendingSwitchFileId: newFileId }));
+      versionPinnedRef.current = true;
+      let adopted = false;
       // The viewer picked the version in the player: the new attempt's first
       // frame is timed from here.
       const intentAt = performance.now();
@@ -4911,49 +5027,20 @@ export function usePlaybackSession(
             // must not silently substitute yet another version.
             fileSelection: "explicit",
             intentAt,
+            onAdopt: (revision) => {
+              adopted = true;
+              onAdopt?.(revision);
+            },
           });
         } finally {
           switchingRef.current = false;
-          // A source push that landed while this switch owned the session was
-          // held back; now that the replacement plan has settled, fold it in if
-          // it still names the file that won.
-          flushDeferredPushesRef.current();
-          const rememberedSeek = pendingSeekRef.current;
-          pendingSeekRef.current = null;
-          const latest = pendingSwitchFileIdRef.current;
-          const latestPosition = pendingSwitchPositionRef.current;
-          pendingSwitchFileIdRef.current = null;
-          pendingSwitchPositionRef.current = null;
-          if (latest !== null && latest !== stateRef.current.mediaFileId) {
-            // A chained switch wins: fold the remembered seek into its start
-            // position instead of issuing a replan against the plan that is
-            // about to be replaced.
-            switchVersion(
-              latest,
-              rememberedSeek && rememberedSeek.playbackAttemptId === playbackAttemptIdRef.current
-                ? rememberedSeek.positionSeconds
-                : (latestPosition ?? playbackPositionRef.current),
-            );
-          } else if (
-            rememberedSeek &&
-            rememberedSeek.playbackAttemptId !== null &&
-            rememberedSeek.playbackAttemptId === playbackAttemptIdRef.current &&
-            planRef.current
-          ) {
-            // Only replay when the switch adopted the same playback attempt the
-            // seek was refused in; a chained switch, a failed switch, or a
-            // fresh attempt all discard it via the resets above.
-            void reanchorSeekRef.current(rememberedSeek.positionSeconds);
-          }
-          // A track picked while the switch owned the lane is replayed against
-          // the plan that won. A chained switch has set the guard again and
-          // will flush once it settles.
-          if (!switchingRef.current) flushPendingTrackPicksRef.current();
+          if (!adopted) onAdopt?.(undefined);
         }
       })();
     },
     [allowAlternateVersions, loadSession, setAutoFallback, versions],
   );
+  const versionPinned = useCallback(() => versionPinnedRef.current, []);
 
   /**
    * Re-issues the start that was refused with a retryable terminal.
@@ -5183,11 +5270,11 @@ export function usePlaybackSession(
     browserEngine: browserEngine.capabilities,
     nativeOriginalSupport,
     switchVersion,
-    selectAutoVersion,
-    retryStart,
+    versionPinned,
     switchAudioTrack,
     changeSubtitleTrack,
     changeQuality,
+    setKeptEstimate,
     recoverFromFailure,
     recoverConnection,
     retryConnection,

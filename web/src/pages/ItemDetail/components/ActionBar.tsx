@@ -35,8 +35,7 @@ import {
   RotateCcw,
   Shuffle,
   Tags,
-  Trash2,
-  TimerReset,
+  Eye,
   ThumbsDown,
   UsersRound,
   Hand,
@@ -233,8 +232,8 @@ export interface ActionBarProps {
   playLabel?: string;
   playProgress?: number;
   restartHref?: string;
-  /** Clears the resume position without marking the item watched. */
-  onResetProgress?: () => void;
+  /** Mark Unwatched in the More menu for a partly watched movie or episode. */
+  onMarkUnwatched?: () => void;
   resumePositionSeconds?: number;
   resumeDurationSeconds?: number;
   resumeResolution?: string;
@@ -277,12 +276,8 @@ export interface ActionBarProps {
   hasVirtualSource?: boolean;
   playbackVariants?: PlaybackVariant[];
   selectedVersion?: FileVersion | null;
-  /**
-   * The version the viewer picked is no longer in the refreshed row set. Play
-   * is blocked until they pick again instead of silently starting another
-   * version.
-   */
-  selectedVersionMissing?: boolean;
+  /** The viewer chose selectedVersion rather than playing the default version. */
+  versionPicked?: boolean;
   onSelectVersion?: (version: FileVersion) => void;
   /** Fired when a version picker popover opens or closes (open=true on open). */
   onVersionPickerOpenChange?: (open: boolean) => void;
@@ -311,7 +306,6 @@ export interface ActionBarProps {
   preferredSubtitleTrackSignature?: PlayerSubtitleTrackSignature | null;
   subtitleMode?: SubtitleMode;
   showForcedSubtitles?: boolean;
-  profileLanguage?: string | null;
 }
 
 export default function ActionBar({
@@ -327,7 +321,7 @@ export default function ActionBar({
   playLabel = "Play",
   playProgress,
   restartHref,
-  onResetProgress,
+  onMarkUnwatched,
   resumePositionSeconds,
   resumeDurationSeconds,
   watchedLabel,
@@ -357,7 +351,7 @@ export default function ActionBar({
   hasVirtualSource = false,
   playbackVariants,
   selectedVersion,
-  selectedVersionMissing = false,
+  versionPicked = false,
   onSelectVersion,
   onVersionPickerOpenChange,
   onDownload,
@@ -380,7 +374,6 @@ export default function ActionBar({
   preferredSubtitleTrackSignature,
   subtitleMode,
   showForcedSubtitles,
-  profileLanguage,
 }: ActionBarProps) {
   const navigate = useNavigate();
   const location = useLocation();
@@ -590,14 +583,14 @@ export default function ActionBar({
       prePlaySubtitleMode,
       prePlaySubtitleSelection:
         prePlaySubtitleMode === "explicit" ? explicitSubtitleSelection : null,
-      explicitFileSelection,
+      versionPicked,
     }),
     [
       audioSelectionMode,
       explicitAudioTrackIndex,
       explicitSubtitleSelection,
-      explicitFileSelection,
       prePlaySubtitleMode,
+      versionPicked,
     ],
   );
   const startPlaybackFromHref = useCallback(
@@ -900,10 +893,14 @@ export default function ActionBar({
         Play from Beginning
       </DetailOverflowMenuItem>
     ),
-    onResetProgress && (
-      <DetailOverflowMenuItem key="reset" closeMenu={closeOverflowMenu} onAction={onResetProgress}>
-        <TimerReset className="size-4" />
-        Reset Progress
+    onMarkUnwatched && (
+      <DetailOverflowMenuItem
+        key="markUnwatched"
+        closeMenu={closeOverflowMenu}
+        onAction={onMarkUnwatched}
+      >
+        <Eye className="size-4" />
+        Mark Unwatched
       </DetailOverflowMenuItem>
     ),
   ];
@@ -1556,7 +1553,6 @@ export default function ActionBar({
               preferredSubtitleTrackSignature={preferredSubtitleTrackSignature}
               subtitleMode={subtitleMode}
               showForcedSubtitles={showForcedSubtitles}
-              profileLanguage={profileLanguage}
               activeAudioTrackIndex={
                 audioSelectionMode === "explicit" ? explicitAudioTrackIndex : null
               }

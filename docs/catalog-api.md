@@ -4,131 +4,12 @@
 > 1.0. The frozen alpha `/api/v1` surface answers the same features through the pre-1.0 bridge
 > window and is then retired. See [the native API contract](architecture/api-contract.md).
 
-## Version liveness
+## Recommendation limits
 
-`FileVersion.available` reports the durable per-version health signal on the
-item detail and item-versions responses: a virtual candidate is available when
-it has not been stamped failed (`failed_at` is NULL), a local file when it is
-not marked missing (`missing_since` is NULL). The field is omitted when the
-version is available, so an absent `available` means available/unknown; `false`
-means the version is currently unavailable. `FileVersion.failed` remains the
-virtual-only "produced no bytes at stream-open" flag.
-
-Detail rows also carry `probed_at`, the instant ffprobe last enumerated the
-version's real stream table; absent means the row still carries declared
-metadata only. A detail row may also carry `source_mismatch` while the API
-process still holds a recent playback probe's wrong-source verdict for that
-row, with the same meaning and lifecycle as the check result below.
-
-On the playback side, the `/api/v2` playback plan projection carries
-`effective_virtual_uri` alongside `virtual_source_revision`, so a client can
-detect a substituted virtual candidate and adopt it in its version menu.
-
-`POST /api/v1/catalog/versions/check` batch-tests a set of media file IDs and
-stamps the durable signal. The request is:
-
-```json
-{
-  "file_ids": [123, 456]
-}
-```
-
-At most 40 IDs are accepted per request (413 `too_large` beyond that; 400
-`bad_request` when the body is missing or the list is empty). Each file is
-tested cheaply — virtual rows resolve their pinned `?result=` candidate through
-the provider (no media transfer), local rows are read from `missing_since` with
-no probe — with bounded concurrency and a per-file timeout. A confirmed dead
-pin stamps `failed_at`; a successful resolution clears it. Ambiguous provider
-errors (provider down, timeout) leave the stamp unchanged and report the row's
-current computed availability, so a provider outage cannot mass-tag versions.
-
-**Response** (200 OK):
-
-```json
-{
-  "results": [
-    { "file_id": 123, "available": true },
-    { "file_id": 456, "available": false }
-  ]
-}
-```
-
-A result also carries `"failed": true` when the row holds a durable failed
-verdict (confirmed unservable, either from before the check or stamped by it).
-Clients remove failed rows from version pickers instead of offering them,
-with two recovery exceptions: the currently active selection stays visible so
-a mid-stream verdict does not yank the playing row, and if every version has
-failed, the list stays visible so the viewer sees the unservable state and can
-trigger a refresh or relink instead of facing an empty menu. Rows that are merely
-`available: false` without `failed` may recover and stay listed behind the
-unavailable toggle. Unknown or deleted file IDs are reported as `available: false`.
-
-A result optionally carries `source_mismatch` while the API process still holds
-a recent playback probe's wrong-source verdict for that row:
-
-```json
-{
-  "file_id": 789,
-  "available": true,
-  "source_mismatch": { "served_bytes": 7427636945, "declared_bytes": 8449999999 }
-}
-```
-
-It means a probe read a different release's bytes than the row declares. It is
-advisory, not a liveness verdict: the release remains `available`, is never
-`failed`, and clients should show it as a distinct "source mismatch — served X
-of declared Y" state rather than the generic unavailable/retry copy. The signal
-is process-local and transient (the short wrong-source backoff window); it is
-absent after a restart, on a node that did not run the probe, and once a later
-probe accepts the served bytes. A row without the field keeps the generic
-unprobed presentation.
-
-Two further node-local in-memory caches affect virtual titles without durable or
-shared state. The empty-title suppression tracker marks a title as currently
-unservable after enough consecutive empty provider listings: a resolve on the
-node holding the mark fails fast with a retryable dependency condition
-(`ErrTitleWithoutStreams`, never a release verdict), while another node, or the
-same node after a restart, re-lists the title normally. The detail warm memo
-coalesces repeated detail reads that would schedule the same version's
-probe/warm chain; it suppresses duplicate scheduling only and never changes the
-response body. Neither has shared admission across nodes: like `source_mismatch`
-they are absent after a restart and on nodes that did not observe the underlying
-reads, and they exist only to bound per-process work, not to record catalog
-state.
-
-## Multi-audio language support and release metadata
-
-MULTi/DUAL releases — a single audio stream tagged `und`/`mul`/empty whose
-languages live in the track title (e.g. "English / French / Spanish") — now
-carry real language identity instead of being collapsed to a single code.
-
-- **`FileVersion.audio_tracks[].languages`** — the full advertised language
-  list for a MULTi/DUAL track, parsed from the track title at probe time when
-  the container language tag is absent, undetermined, or multiple. `language`
-  keeps the primary code (the first concrete one when the tag was
-  undetermined). Rows probed before this support are backfilled at read time
-  from the embedded title until the probe-version re-probe catches up.
-- **`FileVersion.audio_tracks[].index`** — the **absolute container stream
-  index** as ffprobe reported it (video is typically stream 0, the first
-  audio stream 1, subtitles interleaved between them). It is NOT the
-  audio-only FFmpeg ordinal used by `0:a:N` map specifiers, and NOT the
-  track's position in the `audio_tracks` array. Track list order can differ
-  from container order on MULTi releases; clients that need to select a
-  track for ffmpeg must convert this index to the audio-only ordinal
-  (the rank of the selected track among tracks ordered by absolute index —
-  see `playback.AudioStreamOrdinal` server-side) rather than sending this
-  value directly.
-- **`FileVersion.release_name`** / **`FileVersion.release_group`** — the file
-  stem (basename without extension) and the trailing group tag on
-  release-style names (`Movie.2023.2160p.AltMount` → group `AltMount`), so
-  clients can show which release a version is. `release_group` is empty when no
-  group tag is present.
-
-`GET /api/v1/catalog/filters` reports the language facets on
-`audio_languages` and `subtitle_languages` (alongside `resolutions`) when
-`include_technical` is true (the default). A MULTi track satisfies the
-audio-language browse filter for any of its `languages[]` codes, not just its
-primary `language`.
+`GET /api/v2/recommendations/because-watched/{item_id}` accepts `limit` from
+1 to 50 (default 20). The v1 bridge route clamps positive limits above 50
+to 50 and keeps its existing default of 50 for missing or invalid values.
+The shared service caps the limit before the engine expands its candidate queries.
 
 ## Section browsing
 
@@ -150,6 +31,23 @@ the row may hold more. Some engines produce fewer items than the cap
 hides them, as the row does. Each page request rebuilds the list, so a row
 whose source moves (trending over a sliding window) can shift between pages. The
 frozen `/api/v1` catalog keeps answering row-backed sections with no items.
+
+A Home or library row is the first page of its section: clients show a few cards
+in the row and open the full list here. To download only the cards a row shows,
+`listHomeSections` and `listLibrarySections` accept `item_limit` (1 to 100),
+which caps every row's item limit for that request. Send it only when
+`getHomeCapabilities` reports `section_item_limit_max`; an older server rejects
+the parameter. `getHomeSectionItems` and `getHomeLayout` (for the rows it
+includes) accept the same `item_limit`; send it only when `getHomeCapabilities`
+reports `row_item_limit_max`. A row they answer with `item_limit` carries
+`has_more: true` when it holds more cards than it answered. See the home section
+of [the native API contract](architecture/api-contract.md) for the details.
+
+This listing is not a continuation of a capped row. Query-backed rows page their
+source here, so a Home row that hides watched items lists them here, and a random
+row is drawn again. A client that shows a capped row reporting `has_more` and
+wants the rest of it in place reads the row again at its own limit
+(`getHomeSectionItems` without `item_limit`) and keeps the cards it already shows.
 
 ## People search
 
@@ -213,6 +111,20 @@ the person without `prefetch` when the user actually opens them.
 `GET /api/v2/catalog/search/capabilities` advertises `person_prefetch: true` when
 the server accepts the parameter. Check it first: `/api/v2` rejects unknown query
 parameters, so an older server answers a prefetch read with `422`.
+
+## Filter values
+
+`GET /api/v2/catalog/filters` (`getCatalogFilters`) lists the facet values of a
+scope. The `technical` lists (resolutions, audio languages, and subtitle
+languages) come from the scope's files, and building them reads every present
+file in the scope. Each node keeps them for five minutes, keyed by the scope's
+full SQL and arguments like the typeahead lists below, so viewers with
+different access never share them. A value that only a newly added or removed
+file brings or takes away can take up to five minutes to appear in or leave
+`technical`. The other lists are read on every request. Pass
+`skip_technical=true` when a screen does not show the technical lists. The
+audio and subtitle language lists of the Jellyfin-compatible `/Items/Filters2`
+share these cached lists.
 
 ## Facet typeahead
 
@@ -494,6 +406,13 @@ header they resolve the profile's preferences alone. Clients that set
 device overrides should send the header so the detail page matches what playback
 picks.
 
+`effective_audio_track_index` does not know the playing device's capabilities.
+A playback start that names no audio track can play another track in the same
+language when the plan for this one converts its audio and the plan for that
+one does not
+(see "Omission is a request" in `docs/architecture/playback-protocol-v3.md`).
+The plan's `selected_tracks` names the track that plays.
+
 ## Episode files
 
 Each episode in `listSeasonEpisodes` and `listCatalogItemEpisodes` lists its
@@ -705,21 +624,42 @@ Each rule is `{field, op, value}`; an operator a field does not list returns `42
 and so does a value of the wrong shape: a span not like `30d` or reaching back before
 PostgreSQL's earliest date (4714 BC), a non-numeric bound,
 a decade that is not a year from 10 on (decade 0 would catch every title with no
-year), a `title` value that is empty or not a string, or a
+year), a `title` or `show_title` value that is empty or not a string, or a
 `latest_episode_added` or `last_air_date` bound that is not a date (`2024-01-31`)
 or an RFC 3339 time.
 
-| Operators                                                              | Fields                                                                                      | Value                                                                                |
-| ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
-| `contains`, `not_contains`, `is`, `is_not`, `begins_with`, `ends_with` | `title`                                                                                     | string, compared ignoring case; `%` and `_` match literally                          |
-| `is`, `is_not`                                                         | `decade`                                                                                    | the decade's first year (`1990` matches 1990 to 1999)                                |
-| `gt`, `gte`, `lt`, `lte`, `between`                                    | `runtime` (minutes), `rating_imdb`, `rating_tmdb`, `rating_rt_critic`, `rating_rt_audience` | number, or `[min, max]` for `between`                                                |
-| `gt`, `lt`, `between`, `in_last`, `not_in_last`                        | `added_at`, `release_date`, `latest_episode_added`, `last_air_date`                         | ISO date, `[from, to]`, or a span such as `30d` (`h`, `d`, `w`, `m` for months, `y`) |
+| Operators | Fields | Value |
+| --- | --- | --- |
+| `contains`, `not_contains`, `is`, `is_not`, `begins_with`, `ends_with` | `title`, `show_title` | string, compared ignoring case; `%` and `_` match literally |
+| `is`, `is_not` | `decade` | the decade's first year (`1990` matches 1990 to 1999) |
+| `gt`, `gte`, `lt`, `lte`, `between` | `runtime` (minutes), `rating_imdb`, `rating_tmdb`, `rating_rt_critic`, `rating_rt_audience` | number, or `[min, max]` for `between` |
+| `gt`, `lt`, `between`, `in_last`, `not_in_last` | `added_at`, `release_date`, `latest_episode_added`, `last_air_date` | ISO date, `[from, to]`, or a span such as `30d` (`h`, `d`, `w`, `m` for months, `y`) |
+
+In the `episode` scope, `title` compares the episode title and `show_title`
+compares its parent show's title. Other item types match neither positive nor
+negative `show_title` rules. Combine `show_title`, `watched`, and `title` rules
+to select watched episodes of a show while excluding particular episode titles.
+`GET /api/v2/catalog/search/capabilities` advertises `show_title_rules: true`
+when the server accepts the field. Clients should offer it only in episode
+rule editors and only while that flag is true. `/api/v1` refuses `show_title`.
 
 `not_in_last` keeps titles whose date falls before the span; a title without the
 date matches neither `in_last` nor `not_in_last`, and a title with no runtime
-matches no `runtime` bound. `latest_episode_added` and `last_air_date` describe a
-show's newest episode, so movies never match them. An episode row never matches
+matches no `runtime` bound. An audiobook's `runtime` uses its longest active
+recording copy across libraries: file durations are summed per library and
+canonical recording root, then rounded to the nearest minute (at least one).
+File changes and removals maintain this value; metadata enrichment and refresh
+preserve it. An admin runtime lock preserves the edited value instead; removing
+the lock restores the file-derived value immediately. Books
+without positive file durations retain their stored runtime. The `runtime` rule,
+sort and item field therefore use the same value. Audiobook group totals and
+Audiobookshelf responses retain their library-scoped duration calculations.
+`latest_episode_added` and `last_air_date` describe a
+show's newest episode with a file in a library, so movies never match them. An
+episode the metadata provider lists but no library has a file for does not count,
+even after its air date. The `last_air_date` sort follows the same rule. A show's
+`last_air_date` response field still reports its newest aired episode, with or
+without a file, so it can be later than the date the rule and sort use. An episode row never matches
 `latest_episode_added`, and in the `episode` scope `last_air_date` is the
 episode's own air date. Rules on `rating_rt_critic` and `rating_rt_audience`
 still apply when an administrator hides that rating source, so a saved collection

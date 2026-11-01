@@ -98,16 +98,246 @@ afterEach(() => {
 });
 
 describe("request administration", () => {
-  it("retains settings and original validator across background refresh and 412, then explicitly reloads", async () => {
-    let reads = 0;
-    vi.mocked(v2).mockImplementation((operation, options) => {
-      if (operation === "GET /api/v2/admin/requests/capabilities")
-        return reply(options, { available: true, guarded_configuration: true });
-      if (operation === "GET /api/v2/admin/request-settings")
-        return reply(
-          options,
-          { ...settings, global_max_requests: ++reads === 1 ? 5 : 9 },
-          reads === 1 ? '"initial"' : '"reloaded"',
+  it.each(["integrations"])(
+    "sends the retired ?tab=%s to the Requests settings page",
+    async (tab) => {
+      serve({ "GET /api/v2/admin/requests/capabilities": capabilities });
+      mount(`/admin/requests?tab=${tab}`);
+      expect(
+        await screen.findByRole("heading", { name: "Request settings page" }),
+      ).toBeInTheDocument();
+    },
+  );
+
+  it("sends the retired ?tab=overrides to the accounts list and says where limits went", async () => {
+    serve({ "GET /api/v2/admin/requests/capabilities": capabilities });
+    mount("/admin/requests?tab=overrides");
+    expect(await screen.findByRole("heading", { name: "Users page" })).toBeInTheDocument();
+    expect(toast.info).toHaveBeenCalledWith(
+      "Request limits moved to each account",
+      expect.objectContaining({ id: "request-overrides-moved" }),
+    );
+    expect(calls("GET /api/v2/admin/request-users/{user_id}/limit")).toHaveLength(0);
+  });
+
+  it("opens on In progress when nothing needs approval, and shows each view's count", async () => {
+    serve(
+      queue(
+        { in_progress: [request("r2", "Approved Title", { status: "approved" })] },
+        { needs_approval: 0, in_progress: 2, failed: 1, done: 3 },
+      ),
+    );
+    mount("/admin/requests");
+    expect(await rowOf("Approved Title")).toBeInTheDocument();
+    expect(screen.getByTestId("location")).toHaveTextContent("view=in_progress");
+    const views = screen.getByRole("tablist", { name: "Request views" });
+    expect(
+      within(views)
+        .getAllByRole("tab")
+        .map((tab) => tab.textContent),
+    ).toEqual(["Needs approval 0", "In progress 2", "Failed 1", "Done 3"]);
+    expect(screen.getByRole("tab", { name: "In progress 2" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(calls("GET /api/v2/admin/requests").map((options) => options.query?.view)).toEqual([
+      "in_progress",
+    ]);
+  });
+
+  it("opens on Needs approval while something waits, and keeps the view a link names", async () => {
+    serve(queue({ needs_approval: [request("r1", "Waiting Title")] }));
+    mount("/admin/requests");
+    expect(await rowOf("Waiting Title")).toBeInTheDocument();
+    expect(screen.getByTestId("location")).toHaveTextContent("view=needs_approval");
+    cleanup();
+
+    serve(queue({ failed: [request("r4", "Broken Title", { outcome: "failed" })] }));
+    mount("/admin/requests?view=failed");
+    expect(await rowOf("Broken Title")).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Failed 1" })).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("offers only the actions the server allows in each view", async () => {
+    serve(
+      queue({
+        needs_approval: [request("r1", "Waiting Title")],
+        in_progress: [
+          request("r2", "Unsent Title", { status: "approved", state: "approved" }),
+          request("r3", "Sent Title", {
+            status: "queued",
+            state: "processing",
+            targets: [target("t3")],
+          }),
+        ],
+        failed: [
+          request("r4", "Broken Title", {
+            status: "approved",
+            outcome: "failed",
+            state: "failed",
+            last_error: "no fulfillment backend configured",
+          }),
+        ],
+        done: [request("r5", "Finished Title", { status: "completed", state: "available" })],
+      }),
+    );
+    mount("/admin/requests?view=needs_approval");
+    expect(buttonNames(await rowOf("Waiting Title"))).toEqual([
+      "Approve: Waiting Title",
+      "Decline: Waiting Title",
+    ]);
+
+    fireEvent.mouseDown(screen.getByRole("tab", { name: /^In progress/ }));
+    expect(buttonNames(await rowOf("Unsent Title"))).toEqual(["Cancel request: Unsent Title"]);
+    expect(buttonNames(await rowOf("Sent Title"))).toEqual([]);
+
+    fireEvent.mouseDown(screen.getByRole("tab", { name: /^Failed/ }));
+    const broken = await rowOf("Broken Title");
+    // An admin retries a failed request or closes it.
+    expect(buttonNames(broken)).toEqual(["Retry: Broken Title", "Cancel request: Broken Title"]);
+    expect(within(broken).getByText("no fulfillment backend configured")).toBeInTheDocument();
+
+    fireEvent.mouseDown(screen.getByRole("tab", { name: /^Done/ }));
+    expect(buttonNames(await rowOf("Finished Title"))).toEqual([]);
+  });
+
+  it("declines with the reason given and refreshes the counts", async () => {
+    const handlers = queue({ needs_approval: [request("r1", "Waiting Title")] });
+    serve({
+      ...handlers,
+      "POST /api/v2/admin/requests/{id}/decline": ({ path }) =>
+        request(path!.id!, "Waiting Title", { outcome: "declined", state: "declined" }),
+    });
+    mount("/admin/requests?view=needs_approval");
+    fireEvent.click(within(await rowOf("Waiting Title")).getByRole("button", { name: /^Decline/ }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(within(dialog).getByLabelText("Reason (optional)"), {
+      target: { value: "  Already in the library  " },
+    });
+    const countsBefore = calls("GET /api/v2/admin/requests/counts").length;
+    fireEvent.click(within(dialog).getByRole("button", { name: "Decline" }));
+    await waitFor(() =>
+      expect(calls("POST /api/v2/admin/requests/{id}/decline")).toEqual([
+        expect.objectContaining({ path: { id: "r1" }, body: { reason: "Already in the library" } }),
+      ]),
+    );
+    await waitFor(() =>
+      expect(calls("GET /api/v2/admin/requests/counts").length).toBeGreaterThan(countsBefore),
+    );
+  });
+
+  it("shows a spinner on the running action until the server answers", async () => {
+    const failed = request("r4", "Broken Title", {
+      status: "approved",
+      outcome: "failed",
+      state: "failed",
+    });
+    let finish: (() => void) | undefined;
+    serve({
+      ...queue({ failed: [failed] }),
+      "POST /api/v2/admin/requests/{id}/retry": ({ path }) =>
+        new Promise((resolve) => {
+          finish = () => resolve(request(path!.id!, "Broken Title", { status: "queued" }));
+        }),
+    });
+    mount("/admin/requests?view=failed");
+    const row = await rowOf("Broken Title");
+    const retry = within(row).getByRole("button", { name: "Retry: Broken Title" });
+    const cancel = within(row).getByRole("button", { name: "Cancel request: Broken Title" });
+    expect(retry).not.toHaveAttribute("aria-busy");
+
+    fireEvent.click(retry);
+    await waitFor(() => expect(retry).toHaveAttribute("aria-busy", "true"));
+    // The row's other actions wait too, without a spinner of their own.
+    expect(retry).toBeDisabled();
+    expect(cancel).toBeDisabled();
+    expect(cancel).not.toHaveAttribute("aria-busy");
+
+    await act(async () => finish!());
+    await waitFor(() => expect(retry).not.toHaveAttribute("aria-busy"));
+    expect(retry).toBeEnabled();
+  });
+
+  it("approves in bulk four at a time and reports the ones that failed", async () => {
+    const rows = Array.from({ length: 6 }, (_, i) => request(`p${i + 1}`, `Title ${i + 1}`));
+    const pending = new Map<string, { resolve: () => void; reject: (err: unknown) => void }>();
+    serve({
+      ...queue({ needs_approval: rows }, { ...COUNTS, needs_approval: 6 }),
+      "POST /api/v2/admin/requests/{id}/approve": ({ path }) =>
+        new Promise((resolve, reject) => {
+          const id = path!.id!;
+          pending.set(id, {
+            resolve: () => resolve(request(id, id, { status: "approved", state: "approved" })),
+            reject,
+          });
+        }),
+    });
+    mount("/admin/requests?view=needs_approval");
+    await rowOf("Title 6");
+    fireEvent.click(screen.getByLabelText("Select all 6 shown"));
+    const countsBefore = calls("GET /api/v2/admin/requests/counts").length;
+    fireEvent.click(screen.getByRole("button", { name: "Approve 6" }));
+
+    await waitFor(() => expect(pending.size).toBe(4));
+    expect(screen.getByText(/Approving 0 of 6/)).toBeInTheDocument();
+    // Row actions wait while the bulk action runs.
+    expect(
+      within(await rowOf("Title 1")).getByRole("button", { name: "Approve: Title 1" }),
+    ).toBeDisabled();
+
+    await act(async () => pending.get("p1")!.resolve());
+    await waitFor(() => expect(pending.size).toBe(5));
+    await act(async () => {
+      pending.get("p2")!.resolve();
+      pending.get("p3")!.reject(
+        new V2ProblemError("adminApproveRequest", {
+          type: "https://silo.test/problems/conflict",
+          title: "Conflict",
+          status: 409,
+          detail: "The request is no longer pending.",
+          instance: "test",
+        }),
+      );
+      pending.get("p4")!.resolve();
+    });
+    await waitFor(() => expect(pending.size).toBe(6));
+    await act(async () => {
+      pending.get("p5")!.resolve();
+      pending.get("p6")!.resolve();
+    });
+
+    const report = await screen.findByRole("alert");
+    expect(report).toHaveTextContent("5 of 6 approved; 1 couldn't be.");
+    expect(report).toHaveTextContent("Title 3: The request is no longer pending.");
+    expect(calls("POST /api/v2/admin/requests/{id}/approve")).toHaveLength(6);
+    await waitFor(() =>
+      expect(calls("GET /api/v2/admin/requests/counts").length).toBeGreaterThan(countsBefore),
+    );
+    // The failed one stays selected, ready to try again.
+    expect(screen.getByRole("checkbox", { name: "Select Title 3" })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "Select Title 1" })).not.toBeChecked();
+  });
+
+  it("shows the refetched request in the open dialog after another admin acted first", async () => {
+    const LATER = "2026-09-02T00:00:00Z";
+    let sent = false;
+    serve({
+      ...queue({}),
+      "GET /api/v2/admin/requests": ({ query }) => {
+        if (query?.view === "in_progress") {
+          return page([
+            sent
+              ? request("r2", "Unsent Title", {
+                  status: "queued",
+                  state: "processing",
+                  targets: [target("t2")],
+                  updated_at: LATER,
+                })
+              : request("r2", "Unsent Title", { status: "approved", state: "approved" }),
+          ]);
+        }
+        return page(
+          query?.view === "needs_approval" && !sent ? [request("r1", "Waiting Title")] : [],
         );
       if (operation === "PUT /api/v2/admin/request-settings") return Promise.reject(conflict());
       throw new Error(operation);

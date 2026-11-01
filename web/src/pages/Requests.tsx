@@ -16,14 +16,7 @@ import {
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import type {
-  MediaRequest,
-  MediaRequestOutcome,
-  MediaRequestStatus,
-  RequestDiscoverySection,
-  RequestMediaResult,
-  RequestSearchMediaType,
-} from "@/api/types";
+import type { MediaRequest, RequestDiscoverySection } from "@/api/types";
 import {
   useCreateMediaRequest,
   useDiscoverGenres,
@@ -368,209 +361,104 @@ export default function Requests() {
   );
 }
 
-function RequestStatusGuide() {
-  return (
-    <section className="px-4 sm:px-6 lg:px-10 xl:px-12" aria-labelledby="request-status-guide">
-      <div className="border-border/60 bg-card/40 rounded-2xl border px-4 py-4 sm:px-5">
-        <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
-          <div className="space-y-1 lg:w-[220px] lg:shrink-0">
-            <h2 id="request-status-guide" className="text-foreground text-sm font-semibold">
-              Status guide
-            </h2>
-            <p className="text-muted-foreground text-[13px] leading-5">
-              Statuses update automatically as Vio checks the library and connected request
-              integrations.
-            </p>
-          </div>
-          <div className="grid min-w-0 flex-1 gap-5 md:grid-cols-2">
-            <StatusGuideGroup title="Request progress">
-              {REQUEST_PROGRESS_GUIDE.map((item) => (
-                <StatusGuideRow
-                  key={item.status}
-                  label={formatRequestStatus(item.status)}
-                  description={item.description}
-                  tone={item.tone}
-                />
-              ))}
-            </StatusGuideGroup>
-            <StatusGuideGroup title="Needs attention">
-              {REQUEST_ISSUE_GUIDE.map((item) => (
-                <StatusGuideRow
-                  key={item.outcome}
-                  label={item.label}
-                  description={item.description}
-                  tone={item.tone}
-                />
-              ))}
-            </StatusGuideGroup>
-          </div>
-        </div>
-      </div>
-    </section>
-  );
-}
+function DiscoverTab() {
+  const discovery = useRequestDiscovery();
+  const watchlist = useWatchlistTitleToggle();
 
-function StatusGuideGroup({ title, children }: { title: string; children: React.ReactNode }) {
-  return (
-    <section className="space-y-2">
-      <h3 className="text-muted-foreground text-xs font-medium">{title}</h3>
-      <dl className="space-y-2">{children}</dl>
-    </section>
-  );
-}
+  if (discovery.isLoading) return <DiscoverRowsSkeleton />;
 
-function StatusGuideRow({
-  label,
-  description,
-  tone,
-}: {
-  label: string;
-  description: string;
-  tone: string;
-}) {
-  return (
-    <div className="grid gap-1 sm:grid-cols-[118px_minmax(0,1fr)] sm:items-start sm:gap-3">
-      <dt>
-        <span
-          className={cn(
-            "inline-flex max-w-full items-center rounded-full px-2 py-0.5 text-[11px] leading-5 font-semibold ring-1",
-            tone,
-          )}
+  if (discovery.isError) {
+    return (
+      <div className={cn(PAGE_GUTTER, "flex flex-col items-center gap-4 py-16 text-center")}>
+        <p className="text-muted-foreground text-sm">
+          TMDB couldn&rsquo;t be reached, so there is nothing to discover right now.
+        </p>
+        <button
+          type="button"
+          onClick={() => void discovery.refetch()}
+          className="text-primary hover:text-primary/80 inline-flex items-center gap-2 text-sm font-medium"
         >
-          {label}
-        </span>
-      </dt>
-      <dd className="text-muted-foreground text-[13px] leading-5">{description}</dd>
+          <RefreshCw className="h-4 w-4" />
+          Retry
+        </button>
+      </div>
+    );
+  }
+
+  // The admin's layout sets the rows and their order; a title row without
+  // titles is not in sections and draws nothing.
+  const sections = new Map((discovery.data?.sections ?? []).map((s) => [s.key, s]));
+  return (
+    <div className="space-y-10">
+      {(discovery.data?.rows ?? []).map((row) => {
+        if (isBrandSourceType(row.type)) {
+          return <BrandRow key={row.key} type={row.type} title={row.title} />;
+        }
+        const section = sections.get(row.key);
+        return section ? (
+          <DiscoverRow key={row.key} section={section} watchlist={watchlist} />
+        ) : null;
+      })}
     </div>
   );
 }
 
-function PageHeader() {
+const BRAND_ROW_SOURCES = {
+  studios: { kind: "studio", useCards: useDiscoverStudios },
+  networks: { kind: "network", useCards: useDiscoverNetworks },
+  genres: { kind: "genre", useCards: useDiscoverGenres },
+} as const;
+
+type BrandSourceType = keyof typeof BRAND_ROW_SOURCES;
+
+function isBrandSourceType(type: string): type is BrandSourceType {
+  return Object.hasOwn(BRAND_ROW_SOURCES, type);
+}
+
+/** A carousel of studios, networks or genres; its list loads only when the layout shows it. */
+function BrandRow({ type, title }: { type: BrandSourceType; title: string }) {
+  const { kind, useCards } = BRAND_ROW_SOURCES[type];
+  const cards = useCards();
   return (
-    <header className="space-y-3">
-      <div className="flex items-center gap-2">
-        <Sparkles className="h-4 w-4 text-amber-300/80" />
-        <span className="text-muted-foreground text-[11px] font-semibold tracking-[0.22em] uppercase">
-          Your wishlist
-        </span>
-      </div>
-      <h1 className="font-display text-foreground text-[clamp(1.8rem,3vw,2.6rem)] leading-[1.05] font-bold tracking-tight text-balance">
-        Find something worth waiting for.
-      </h1>
-      <p className="text-muted-foreground max-w-xl text-sm leading-6">
-        Browse what's trending, search the full TMDB catalog, and watch your requests move from{" "}
-        <span className="text-foreground">pending</span> to{" "}
-        <span className="text-foreground">ready</span>.
-      </p>
-    </header>
+    <BrandCarousel
+      kind={kind}
+      title={title}
+      cards={cards.data}
+      isLoading={cards.isLoading}
+      isError={cards.isError}
+      onRetry={() => void cards.refetch()}
+    />
   );
 }
 
-function SearchBar({
-  mediaType,
-  onMediaTypeChange,
-  searchInput,
-  onSearchInputChange,
-  onSubmit,
-  onClear,
-  isSearching,
-}: {
-  mediaType: RequestSearchMediaType;
-  onMediaTypeChange: (value: RequestSearchMediaType) => void;
-  searchInput: string;
-  onSearchInputChange: (value: string) => void;
-  onSubmit: (event: FormEvent) => void;
-  onClear: () => void;
-  isSearching: boolean;
-}) {
-  return (
-    <form
-      onSubmit={onSubmit}
-      className="border-border/70 bg-card/60 grid items-center gap-2 rounded-2xl border p-2 shadow-[0_1px_0_0_rgba(255,255,255,0.04)_inset,0_20px_50px_-30px_rgba(0,0,0,0.7)] backdrop-blur-sm sm:grid-cols-[150px_minmax(0,1fr)_auto]"
-    >
-      <Select
-        value={mediaType}
-        onValueChange={(value) => onMediaTypeChange(value as RequestSearchMediaType)}
-      >
-        <SelectTrigger className="border-border/60 bg-background/40 h-10 w-full rounded-xl border text-sm">
-          <SelectValue />
-        </SelectTrigger>
-        <SelectContent>
-          <SelectItem value="all">All</SelectItem>
-          <SelectItem value="movie">Movies</SelectItem>
-          <SelectItem value="series">Series</SelectItem>
-        </SelectContent>
-      </Select>
-      <div className="relative">
-        <Search className="text-muted-foreground absolute top-1/2 left-3.5 h-4 w-4 -translate-y-1/2" />
-        <Input
-          value={searchInput}
-          onChange={(event) => onSearchInputChange(event.target.value)}
-          placeholder="Search TMDB by title…"
-          className="border-border/60 bg-background/40 h-10 rounded-xl pr-10 pl-10 text-sm"
-        />
-        {(searchInput || isSearching) && (
-          <button
-            type="button"
-            onClick={onClear}
-            className="text-muted-foreground hover:text-foreground absolute top-1/2 right-2.5 inline-flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded-full transition-colors"
-            aria-label="Clear search"
-          >
-            <X className="h-3.5 w-3.5" />
-          </button>
-        )}
-      </div>
-      <Button
-        type="submit"
-        disabled={searchInput.trim().length < 2}
-        className="h-10 rounded-xl px-5"
-      >
-        Search
-      </Button>
-    </form>
-  );
-}
-
-function DiscoverySectionRow({
+function DiscoverRow({
   section,
-  pendingRequestKey,
-  isSubmitting,
-  onRequest,
   watchlist,
 }: {
   section: RequestDiscoverySection;
-  pendingRequestKey?: string;
-  isSubmitting: boolean;
-  onRequest: (item: RequestMediaResult) => void;
   watchlist: ReturnType<typeof useWatchlistTitleToggle>;
 }) {
   const eyebrow = sectionEyebrow(section.key);
   return (
-    <section className="space-y-1">
-      <div className="px-4 sm:px-6 lg:px-10 xl:px-12">
-        <span className="text-muted-foreground text-[10px] font-semibold tracking-[0.22em] uppercase">
-          {eyebrow}
-        </span>
-      </div>
-      <MediaCarousel
-        title={section.title}
-        viewAllHref={section.total_pages > 1 ? requestDiscoverSectionHref(section.key) : undefined}
-      >
-        {section.results.map((item) => (
-          <RequestPosterCard
-            key={`${item.media_type}-${item.tmdb_id}`}
-            variant="discover"
-            item={item}
-            isSubmitting={
-              isSubmitting && pendingRequestKey === mediaRequestKey(item.media_type, item.tmdb_id)
-            }
-            onRequest={() => onRequest(item)}
-            onToggleWatchlist={watchlist.enabled ? () => watchlist.toggle(item) : undefined}
-            isWatchlistPending={watchlist.isPending(item)}
-          />
-        ))}
-      </MediaCarousel>
-    </section>
+    <MediaCarousel
+      title={section.title}
+      // A row trimmed to its size has more titles even on a one-page source.
+      viewAllHref={
+        section.total_pages > 1 || section.total_results > section.results.length
+          ? requestDiscoverSectionHref(section.key)
+          : undefined
+      }
+    >
+      {section.results.map((item) => (
+        <RequestPosterCard
+          key={`${item.media_type}-${item.tmdb_id}`}
+          variant="discover"
+          item={item}
+          onToggleWatchlist={watchlist.enabled ? () => watchlist.toggle(item) : undefined}
+          isWatchlistPending={watchlist.isPending(item)}
+        />
+      ))}
+    </MediaCarousel>
   );
 }
 

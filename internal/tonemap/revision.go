@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Silo-Server/silo-server/internal/fspath"
 	"github.com/Silo-Server/silo-server/internal/models"
 )
 
@@ -138,11 +139,7 @@ func (r SourceRevision) ValidatePath(path string) error {
 	if r.MediaFileID <= 0 {
 		return ErrSourceRevisionChanged
 	}
-	lower := strings.ToLower(strings.TrimSpace(path))
-	if strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") || strings.HasPrefix(lower, "virtual://") {
-		return nil
-	}
-	info, err := os.Stat(path)
+	info, err := fspath.Stat(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("%w: %w", ErrSourceRevisionChanged, err)
@@ -182,7 +179,7 @@ func computeOpenSubtitlesHash(path string, size int64) (string, error) {
 	if size < 2*openSubtitlesHashBlockSize {
 		return "", fmt.Errorf("file is too small for OpenSubtitles hash")
 	}
-	file, err := os.Open(path)
+	file, err := fspath.Open(path)
 	if err != nil {
 		return "", err
 	}

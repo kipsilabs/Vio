@@ -36,7 +36,6 @@ import type {
 } from "../types";
 import type { PlayerTrickplay } from "../trickplay";
 import type { VersionInfo } from "./QualityMenu";
-import type { EffectiveRecipeV3, SourceDescriptorV3 } from "../protocol-v3";
 import type { PlayerConfig } from "../context/PlayerConfigContext";
 import type { SubtitleSync } from "../hooks/useSubtitleSync";
 import { useCoarsePointer } from "../hooks/useCoarsePointer";
@@ -95,7 +94,7 @@ interface PlayerControlsProps {
   mediaFileId?: number;
   playerConfig?: PlayerConfig;
   onRefreshSubtitles?: () => void;
-  onSubtitleJobAccepted?: (jobId: string) => void;
+  onSubtitleJobAccepted?: (jobId: string, resultSubtitleId?: string) => void;
   sessionId?: string;
   getSubtitleStartPosition?: () => number;
   subtitleSync?: SubtitleSync;
@@ -115,9 +114,8 @@ interface PlayerControlsProps {
   // Quality
   qualityOptions: QualityOption[];
   activeQualityId: string;
-  deliveredRecipe?: EffectiveRecipeV3;
-  /** The source the plan delivers from, for showing Auto when it plays as-is. */
-  playbackSource?: SourceDescriptorV3;
+  /** The plan's `active_quality`, the menu entry it delivers. */
+  activeQuality?: string;
   isTranscoding: boolean;
   qualityError: string | null;
   onQualitySelect: (id: string) => void;
@@ -210,8 +208,7 @@ export function PlayerControls({
   audioInventoryProvisional = false,
   qualityOptions,
   activeQualityId,
-  deliveredRecipe,
-  playbackSource,
+  activeQuality,
   isTranscoding,
   qualityError,
   onQualitySelect,
@@ -422,8 +419,7 @@ export function PlayerControls({
             <QualityMenu
               options={qualityOptions}
               activeId={activeQualityId}
-              deliveredRecipe={deliveredRecipe}
-              source={playbackSource}
+              activeQuality={activeQuality}
               isTranscoding={isTranscoding}
               error={qualityError}
               onSelect={onQualitySelect}
@@ -621,8 +617,7 @@ export function PlayerControls({
               <QualityMenu
                 options={qualityOptions}
                 activeId={activeQualityId}
-                deliveredRecipe={deliveredRecipe}
-                source={playbackSource}
+                activeQuality={activeQuality}
                 isTranscoding={isTranscoding}
                 error={qualityError}
                 onSelect={onQualitySelect}

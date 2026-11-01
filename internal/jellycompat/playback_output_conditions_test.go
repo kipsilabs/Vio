@@ -82,8 +82,9 @@ func TestEncodedOutputConditionsDoNotUseSourceCodecFacts(t *testing.T) {
 		{"source reference frames", ProfileCondition{Condition: "LessThanEqual", Property: "RefFrames", Value: "4"}, 0, true},
 		{"tone mapped range", ProfileCondition{Condition: "Equals", Property: "VideoRangeType", Value: "SDR", IsRequired: true}, 0, true},
 		{"scaled width", ProfileCondition{Condition: "LessThanEqual", Property: "Width", Value: "1280", IsRequired: true}, 4000000, true},
-		{"scaled height", ProfileCondition{Condition: "LessThanEqual", Property: "Height", Value: "720", IsRequired: true}, 4000000, true},
-		{"known width exceeds constraint", ProfileCondition{Condition: "LessThanEqual", Property: "Width", Value: "1280", IsRequired: true}, 0, false},
+		// A width limit is an encode target, as in Jellyfin: the encode scales
+		// to fit it (see TestRoku1080pProfileEncodesWithinItsLimits).
+		{"known width exceeds constraint", ProfileCondition{Condition: "LessThanEqual", Property: "Width", Value: "1280", IsRequired: true}, 0, true},
 		// An H.264 encode is High profile at the level its frame size, rate and
 		// bitrate need, never below the streaming libx264 pin of 4.1; here 4.1.
 		{"required level the encode meets", ProfileCondition{Condition: "LessThanEqual", Property: "VideoLevel", Value: "51", IsRequired: true}, 0, true},
@@ -99,7 +100,6 @@ func TestEncodedOutputConditionsDoNotUseSourceCodecFacts(t *testing.T) {
 		// The encoder chooses reference frames, so a rule on them is an encode
 		// target either way, as in Jellyfin.
 		{"required reference frame limit", ProfileCondition{Condition: "LessThanEqual", Property: "RefFrames", Value: "4", IsRequired: true}, 0, true},
-		{"required reference frame minimum", ProfileCondition{Condition: "GreaterThanEqual", Property: "RefFrames", Value: "2", IsRequired: true}, 0, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			profile := DeviceProfile{

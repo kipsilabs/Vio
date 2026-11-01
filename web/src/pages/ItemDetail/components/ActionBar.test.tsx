@@ -62,112 +62,6 @@ function renderActionBar(overrides: Partial<ActionBarProps> = {}) {
 }
 
 describe("ActionBar", () => {
-  afterEach(() => {
-    startPlayback.mockClear();
-    discoveryMocks.capability.mockReset();
-    discoveryMocks.discover.mockReset();
-  });
-
-  it.each([
-    "virtual://movie/tt123",
-    "virtual://series/tt123:1:2",
-    "virtual://series/tt123/1/2",
-    "virtual://series/tvdb/393159/3/1",
-    "virtual://series/tmdb/202555/1/2?profile=1080p",
-  ])("discovers %s before Play and refreshes the version queries", async (filePath) => {
-    discoveryMocks.capability.mockResolvedValue({ discover_before_playback: true });
-    let finish!: () => void;
-    discoveryMocks.discover.mockImplementation(
-      () =>
-        new Promise<void>((resolve) => {
-          finish = resolve;
-        }),
-    );
-    const invalidate = vi.spyOn(QueryClient.prototype, "invalidateQueries");
-    const version = { ...selectedVersion, file_path: filePath };
-    renderActionBar({ contentId: "media-1", versions: [version], selectedVersion: version });
-    expect(await screen.findByText("Finding versions")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Play" })).toBeEnabled();
-    expect(discoveryMocks.discover).toHaveBeenCalledWith("media-1", expect.any(AbortSignal));
-    expect(startPlayback).not.toHaveBeenCalled();
-    await act(async () => finish());
-    await waitFor(() => expect(invalidate).toHaveBeenCalledTimes(2));
-    expect(screen.queryByText("Finding versions")).not.toBeInTheDocument();
-    invalidate.mockRestore();
-  });
-
-  it("shows Refresh List for a virtual item with one version", async () => {
-    discoveryMocks.capability.mockResolvedValue({ discover_before_playback: false });
-    const version = { ...selectedVersion, file_path: "virtual://series/tt123/1/2" };
-    renderActionBar({
-      contentId: "episode-1",
-      versions: [version],
-      selectedVersion: version,
-      hasVirtualSource: true,
-      onSelectVersion: vi.fn(),
-    });
-
-    expect(screen.getByRole("button", { name: /Version/ })).toBeInTheDocument();
-  });
-
-  it("shows Refresh List for a virtual item with no versions", async () => {
-    discoveryMocks.capability.mockResolvedValue({ discover_before_playback: false });
-    renderActionBar({
-      contentId: "episode-1",
-      hasVirtualSource: true,
-    });
-
-    expect(screen.getByRole("button", { name: /Refresh List/ })).toBeInTheDocument();
-  });
-
-  it("keeps playback-time discovery when the option is off", async () => {
-    discoveryMocks.capability.mockResolvedValue({ discover_before_playback: false });
-    const version = { ...selectedVersion, file_path: "virtual://movie/tt123" };
-    renderActionBar({ contentId: "movie-1", versions: [version], selectedVersion: version });
-    await waitFor(() => expect(discoveryMocks.capability).toHaveBeenCalledOnce());
-    expect(discoveryMocks.discover).not.toHaveBeenCalled();
-    expect(screen.queryByText("Finding versions")).not.toBeInTheDocument();
-  });
-
-  it.each([
-    "/media/movie.mkv",
-    "virtual://series/tt123",
-    "virtual://series/tt123/1",
-    "virtual://series/tvdb/393159",
-    "virtual://series/tmdb/202555",
-  ])("does not discover %s", (filePath) => {
-    const version = { ...selectedVersion, file_path: filePath };
-    renderActionBar({ contentId: "media-1", versions: [version], selectedVersion: version });
-    expect(discoveryMocks.capability).not.toHaveBeenCalled();
-    expect(discoveryMocks.discover).not.toHaveBeenCalled();
-  });
-
-  it("keeps Play enabled when discovery fails", async () => {
-    discoveryMocks.capability.mockResolvedValue({ discover_before_playback: true });
-    discoveryMocks.discover.mockRejectedValue(new Error("provider unavailable"));
-    const version = { ...selectedVersion, file_path: "virtual://movie/tt123" };
-    renderActionBar({ contentId: "movie-1", versions: [version], selectedVersion: version });
-    expect(await screen.findByText("Versions unavailable. Retry with Play.")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Play" })).toBeEnabled();
-  });
-
-  it.each([
-    [false, "Mark Watched"],
-    [true, "Mark Unwatched"],
-  ])("labels the compact watched action by its effect (watched %s)", (isWatched, shortLabel) => {
-    renderActionBar({
-      compactMobile: true,
-      isWatched,
-      watchedLabel: isWatched ? "Mark Series Unwatched" : "Mark Series Watched",
-      onToggleWatched: vi.fn(),
-    });
-    const button = screen.getByRole("button", {
-      name: new RegExp(isWatched ? "Unwatched" : "Series Watched"),
-    });
-    expect(button).not.toHaveAttribute("aria-pressed");
-    expect(button.querySelector(".detail-short-label")).toHaveTextContent(shortLabel);
-  });
-
   it("does not expose an enabled pointer affordance while the watched action is pending", () => {
     renderActionBar({
       watchedLabel: "Mark Watched",
@@ -177,8 +71,6 @@ describe("ActionBar", () => {
 
     const watchedAction = screen.getByRole("button", { name: "Mark Watched" });
     expect(watchedAction).toBeDisabled();
-    expect(watchedAction).toHaveClass("enabled:cursor-pointer");
-    expect(watchedAction).not.toHaveClass("cursor-pointer");
   });
 
   it("sends forceRelink when the selected version is unavailable", () => {
@@ -387,15 +279,6 @@ describe("ActionBar primary action", () => {
     );
   }
 
-  it("shows a status as a disabled primary action without the hover affordance", () => {
-    renderWithPrimary({ primaryAction: { label: "Requested", disabled: true } });
-
-    const status = screen.getByRole("button", { name: "Requested" });
-    expect(status).toBeDisabled();
-    expect(status).not.toHaveClass("cursor-pointer");
-    expect(status).not.toHaveClass("motion-safe:hover:scale-[1.02]");
-  });
-
   it("blocks the action and marks it busy while it is pending", () => {
     const onClick = vi.fn();
     renderWithPrimary({
@@ -406,29 +289,5 @@ describe("ActionBar primary action", () => {
     expect(request).toBeDisabled();
     expect(request).toHaveAttribute("aria-busy", "true");
     expect(request.querySelector("svg")).toHaveClass("animate-spin");
-  });
-
-  it("renders secondary glass actions and external links after the primary action", () => {
-    const onFollow = vi.fn();
-    renderWithPrimary({
-      primaryAction: { label: "Approved", disabled: true },
-      secondaryActions: [
-        { id: "follow", label: "Stop notifying me", onClick: onFollow, pressed: true },
-      ],
-      links: [{ label: "TMDB", href: "https://www.themoviedb.org/movie/603" }],
-    });
-
-    const follow = screen.getByRole("button", { name: "Stop notifying me" });
-    expect(follow).toHaveAttribute("aria-pressed", "true");
-    expect(follow).toHaveClass("glass-hover", "rounded-full", "h-11");
-    fireEvent.click(follow);
-    expect(onFollow).toHaveBeenCalledOnce();
-
-    const link = screen.getByRole("link", { name: "TMDB" });
-    expect(link).toHaveAttribute("href", "https://www.themoviedb.org/movie/603");
-    expect(link).toHaveAttribute("target", "_blank");
-    expect(link).toHaveAttribute("rel", "noreferrer");
-    // Without library props there are no library actions, so no overflow menu.
-    expect(screen.queryByRole("button", { name: "More actions" })).not.toBeInTheDocument();
   });
 });

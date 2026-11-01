@@ -50,11 +50,18 @@ func TestSQLiteProgressSince(t *testing.T) {
 	storetest.RunProgressSince(t, newConformanceStore)
 }
 
-// TestSQLiteDeviceProfiles runs the per-device capability registry
-// conformance tests against the per-user SQLite backend; the Postgres backend
-// runs the same suite in internal/userstore/pgstore.
-func TestSQLiteDeviceProfiles(t *testing.T) {
-	storetest.RunDeviceProfiles(t, newConformanceStore)
+// TestSQLiteProgressHints runs the version hints sync conformance test against
+// the SQLite backend; the Postgres backend runs it in internal/userstore/pgstore.
+func TestSQLiteProgressHints(t *testing.T) {
+	storetest.RunProgressHints(t, newConformanceStore)
+}
+
+// TestSQLiteUnmarkKeepsHistory runs the mark-unwatched conformance test
+// against the SQLite backend; the Postgres backend runs it in
+// internal/userstore/pgstore.
+func TestSQLiteUnmarkKeepsHistory(t *testing.T) {
+	storetest.RunUnmarkKeepsHistory(t, newConformanceStore)
+	storetest.RunPlayFinishedAfterUnmark(t, newConformanceStore)
 }
 
 // TestSQLiteMarkWatchedBatch runs the batch mark-watched conformance test
@@ -130,6 +137,10 @@ func TestSQLiteCollectionSharing(t *testing.T) {
 // in internal/userstore/pgstore.
 func TestSQLiteProfilePINRevision(t *testing.T) {
 	storetest.RunProfilePINRevision(t, newConformanceStore)
+}
+
+func TestSQLiteProfilePINRevisionTransactions(t *testing.T) {
+	storetest.RunProfilePINRevisionTransactions(t, newConformanceStore)
 }
 
 func TestSQLiteDeleteProfileRemovesProfileState(t *testing.T) {

@@ -12,9 +12,7 @@ import { useVersionListRefresh, REFRESH_VERSIONS_ERROR } from "@/hooks/useVersio
 import { useVersionSortPreference } from "@/hooks/useVersionSortPreference";
 import { sortVersionsByCriteria, type VersionSortable } from "@/lib/qualityRanking";
 import { plainResolutionLabel, resolveActiveQualityOptionId } from "../playback-info";
-import { deriveVersionHealth } from "@/lib/versionHealth";
-import type { EffectiveRecipeV3, SourceDescriptorV3 } from "../protocol-v3";
-import type { PlayerIndexerRelease, QualityOption } from "../types";
+import type { QualityOption } from "../types";
 import { PLAYBACK_SPEEDS, formatPlaybackSpeed } from "../utils/playbackSpeed";
 import { PlaybackSpeedTrack } from "./PlaybackSpeedTrack";
 import { PlayerMenuSurface } from "./PlayerMenuSurface";
@@ -73,10 +71,8 @@ export function removeFailedVersions(versions: VersionInfo[]): VersionInfo[] {
 interface QualityMenuProps {
   options: QualityOption[];
   activeId: string;
-  /** The plan's effective recipe, which shows when a bitrate cap reduced the source. */
-  deliveredRecipe?: EffectiveRecipeV3;
-  /** The source the plan delivers from, for showing Auto when it plays as-is. */
-  source?: Pick<SourceDescriptorV3, "height" | "bitrate_kbps">;
+  /** The plan's `active_quality`: the entry it delivers, lit unless the preference is Auto. */
+  activeQuality?: string;
   isTranscoding: boolean;
   error: string | null;
   onSelect: (id: string) => void;
@@ -117,8 +113,7 @@ export { REFRESH_VERSIONS_ERROR };
 export function QualityMenu({
   options,
   activeId,
-  deliveredRecipe,
-  source,
+  activeQuality,
   isTranscoding,
   error,
   onSelect,
@@ -250,7 +245,7 @@ export function QualityMenu({
   if (showSpeed) menuLabel = "Playback settings";
   else if (showQuality) menuLabel = "Quality";
 
-  const resolvedActiveId = resolveActiveQualityOptionId(options, activeId, deliveredRecipe, source);
+  const resolvedActiveId = resolveActiveQualityOptionId(options, activeId, activeQuality);
   const activeOption = options.find((option) => option.id === resolvedActiveId);
   // Explicit roving-focus slots per group. Mixing a render-time counter with the
   // refresh rows' commit-time `ref` increments let one overwrite another; naming

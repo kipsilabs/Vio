@@ -12,6 +12,7 @@ import (
 
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
 	evt "github.com/Silo-Server/silo-server/internal/events"
+	"github.com/Silo-Server/silo-server/internal/fspath"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/scanner"
@@ -20,7 +21,7 @@ import (
 // MissingFileMarker marks media files as missing when playback discovers they
 // no longer exist on disk.
 type MissingFileMarker interface {
-	MarkMissing(ctx context.Context, id int, since time.Time) error
+	MarkMissing(ctx context.Context, id int, filePath string, since time.Time) error
 }
 
 type playbackFilePreflightError struct {
@@ -106,12 +107,7 @@ func preflightPlaybackFile(
 		return &playbackFilePreflightError{notFound: true}
 	}
 
-	lower := strings.ToLower(file.FilePath)
-	if strings.HasPrefix(lower, "aiostreams://") || strings.HasPrefix(lower, "virtual://") || strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") {
-		return nil
-	}
-
-	if _, err := os.Stat(file.FilePath); err != nil {
+	if _, err := fspath.StatContext(ctx, file.FilePath); err != nil {
 		if os.IsNotExist(err) {
 			markPlaybackFileMissing(ctx, file, marker, eventsHub)
 			return &playbackFilePreflightError{notFound: true, err: err}
@@ -154,7 +150,7 @@ func markPlaybackFileMissing(
 	file.MissingSince = &since
 
 	if marker != nil {
-		if err := marker.MarkMissing(ctx, file.ID, since); err != nil {
+		if err := marker.MarkMissing(ctx, file.ID, file.FilePath, since); err != nil {
 			slog.WarnContext(ctx, "failed to mark playback file missing", "component", "api",
 				"file_id", file.ID,
 				"path", file.FilePath,

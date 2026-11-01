@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -154,621 +155,121 @@ func TestServeExtractTextWindowDoesNotPoisonFullTrack(t *testing.T) {
 	}
 }
 
-// A windowed text request against a committed full-track entry must extract
-// from the small cached artifact even when background warms are disabled
-// (virtual relay sources set DisableBackgroundWarm, but an already-populated
-// entry must still be served instead of re-demuxing the multi-GB source).
-// Disabling the warm must also suppress any detached warm.
-func TestServeExtractTextWindowedUsesCachedTrackWithWarmDisabled(t *testing.T) {
-	c, source := newTestCache(t)
-
-	// Populate the full-track VTT entry through the real fill path.
-	full := StreamExtractOpts{InputPath: source, SourceCodec: "subrip", TrackIndex: 0}
-	rec := httptest.NewRecorder()
-	if err := c.ServeExtract(rec, httptest.NewRequest(http.MethodGet, "/subtitle", nil), full, func(_ context.Context, opts StreamExtractOpts) error {
-		_, err := io.WriteString(opts.Writer, "FULL TRACK")
-		return err
-	}); err != nil {
-		t.Fatal(err)
-	}
-	cachedPath := textEntryPath(t, c, source, 0, "vtt")
-	if _, err := os.Stat(cachedPath); err != nil {
-		t.Fatalf("full-track entry not committed: %v", err)
-	}
-
-	var (
-		mu                     sync.Mutex
-		got                    StreamExtractOpts
-		windowCalls, warmCalls int
-	)
-	windowed := StreamExtractOpts{
-		InputPath:             source,
-		SourceCodec:           "subrip",
-		TrackIndex:            0,
-		SeekSeconds:           600,
-		DurationSeconds:       600,
-		DisableBackgroundWarm: true,
-	}
-	rec = httptest.NewRecorder()
-	if err := c.ServeExtract(rec, httptest.NewRequest(http.MethodGet, "/subtitle", nil), windowed, func(_ context.Context, opts StreamExtractOpts) error {
-		mu.Lock()
-		defer mu.Unlock()
-		if opts.SeekSeconds == 0 && opts.DurationSeconds == 0 {
-			warmCalls++
-			return nil
-		}
-		windowCalls++
-		got = opts
-		_, err := io.WriteString(opts.Writer, "WINDOW SLICE")
-		return err
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if windowCalls != 1 || warmCalls != 0 {
-		t.Fatalf("extract calls: window=%d warm=%d, want window=1 warm=0", windowCalls, warmCalls)
-	}
-	if rec.Body.String() != "WINDOW SLICE" {
-		t.Fatalf("windowed body = %q", rec.Body.String())
-	}
-	if got.InputPath != cachedPath {
-		t.Fatalf("windowed extract input = %q, want cached entry %q", got.InputPath, cachedPath)
-	}
-	if got.InputIsExtractedText != "vtt" {
-		t.Fatalf("windowed extract InputIsExtractedText = %q, want %q", got.InputIsExtractedText, "vtt")
-	}
-	if got.SeekSeconds != 600 || got.DurationSeconds != 600 {
-		t.Fatalf("window parameters not preserved: %+v", got)
-	}
-}
-
-// A windowed text miss with background warms enabled must trigger exactly one
-// detached full-track warm no matter how many windowed requests arrive while
-// it runs, and once the warm commits the next windowed request extracts from
-// the cached artifact. Mirrors the SUP warm flow in
-// TestServeSUPExtractWindowedMissWarmsOnce.
-func TestServeExtractTextWindowedMissWarmsOnce(t *testing.T) {
-	c, source := newTestCache(t)
-
-	var (
-		mu          sync.Mutex
-		warmOpts    []StreamExtractOpts
-		windowOpts  []StreamExtractOpts
-		warmRelease = make(chan struct{})
-	)
-	extract := func(_ context.Context, opts StreamExtractOpts) error {
-		if opts.SeekSeconds == 0 && opts.DurationSeconds == 0 && opts.InputIsExtractedText == "" {
-			mu.Lock()
-			warmOpts = append(warmOpts, opts)
-			mu.Unlock()
-			<-warmRelease
-			_, err := opts.Writer.Write([]byte("FULL TRACK"))
-			return err
-		}
-		mu.Lock()
-		windowOpts = append(windowOpts, opts)
-		mu.Unlock()
-		_, err := opts.Writer.Write([]byte("WINDOW SLICE"))
-		return err
-	}
-
-	windowed := StreamExtractOpts{InputPath: source, SourceCodec: "subrip", SeekSeconds: 100, DurationSeconds: 3600}
-	for i := 0; i < 4; i++ {
-		// Distinct windows: an exact repeat would be served from the last-good
-		// window cache instead of exercising the pre-warm path.
-		next := windowed
-		next.SeekSeconds = windowed.SeekSeconds + float64(i)
-		rec := httptest.NewRecorder()
-		if err := c.ServeExtract(rec, httptest.NewRequest(http.MethodGet, "/subtitle", nil), next, extract); err != nil {
-			t.Fatal(err)
-		}
-		if rec.Body.String() != "WINDOW SLICE" {
-			t.Fatalf("windowed body = %q", rec.Body.String())
-		}
-	}
-	close(warmRelease)
-	waitForTextCacheEntry(t, c, source, 0, "vtt")
-
-	mu.Lock()
-	if len(warmOpts) != 1 {
-		t.Fatalf("warm extracts = %d, want exactly 1", len(warmOpts))
-	}
-	warm := warmOpts[0]
-	if warm.InputPath != source || warm.SeekSeconds != 0 || warm.DurationSeconds != 0 || warm.AllowWindow || warm.InputIsExtractedText != "" {
-		t.Fatalf("warm must be a full-track extract of the original file: %+v", warm)
-	}
-	if len(windowOpts) != 4 {
-		t.Fatalf("windowed extracts = %d, want 4", len(windowOpts))
-	}
-	for _, wo := range windowOpts {
-		if wo.InputPath != source || wo.InputIsExtractedText != "" {
-			t.Fatalf("pre-warm windowed extract must read the original file: %+v", wo)
-		}
-	}
-	mu.Unlock()
-
-	// Warm committed → a fresh window reads the cached artifact.
-	postWarm := windowed
-	postWarm.SeekSeconds = 500
-	rec := httptest.NewRecorder()
-	if err := c.ServeExtract(rec, httptest.NewRequest(http.MethodGet, "/subtitle", nil), postWarm, extract); err != nil {
-		t.Fatal(err)
-	}
-	mu.Lock()
-	last := windowOpts[len(windowOpts)-1]
-	mu.Unlock()
-	if last.InputPath != textEntryPath(t, c, source, 0, "vtt") || last.InputIsExtractedText != "vtt" {
-		t.Fatalf("post-warm windowed extract must read the cached artifact: %+v", last)
-	}
-}
-
-// A windowed text miss on a virtual identity with the cache's own warm
-// disabled (the handler owns the warm for request-scoped relay inputs) must
-// still stream the window from the source and must not commit a full-track
-// entry itself.
-func TestServeExtractTextWindowedVirtualMissSkipsCacheWarm(t *testing.T) {
-	c, source := newTestCache(t)
-	windowed := StreamExtractOpts{
-		InputPath:             source,
-		SourceCodec:           "subrip",
-		TrackIndex:            0,
-		SeekSeconds:           600,
-		DurationSeconds:       600,
-		CacheIdentity:         "virtual-result-abc",
-		DisableBackgroundWarm: true,
-	}
-	var (
-		warmCalls, windowCalls int
-		got                    StreamExtractOpts
-	)
-	rec := httptest.NewRecorder()
-	if err := c.ServeExtract(rec, httptest.NewRequest(http.MethodGet, "/subtitle", nil), windowed, func(_ context.Context, opts StreamExtractOpts) error {
-		if opts.SeekSeconds == 0 && opts.DurationSeconds == 0 {
-			warmCalls++
-			return nil
-		}
-		windowCalls++
-		got = opts
-		_, err := io.WriteString(opts.Writer, "WINDOW SLICE")
-		return err
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if windowCalls != 1 || warmCalls != 0 {
-		t.Fatalf("extract calls: window=%d warm=%d, want window=1 warm=0", windowCalls, warmCalls)
-	}
-	if got.InputPath != source || got.InputIsExtractedText != "" {
-		t.Fatalf("windowed extract must read the original source: %+v", got)
-	}
-	if rec.Body.String() != "WINDOW SLICE" {
-		t.Fatalf("windowed body = %q", rec.Body.String())
-	}
-	if c.HasCommittedTextEntry(source, windowed.CacheIdentity, 0, "subrip", "") {
-		t.Fatal("a virtual window miss must not commit a full-track entry")
-	}
-}
-
-// HasCommittedTextEntry derives the cache format from codec/target exactly as
-// ServeExtract does, so the handler's pre-probe check can never disagree with
-// the artifact a windowed serve would read. Bitmap codecs and a nil cache read
-// as false.
-func TestHasCommittedTextEntryFormatAndBitmap(t *testing.T) {
-	c, source := newTestCache(t)
-
-	// Commit a VTT artifact through the real full-track serve path.
-	full := StreamExtractOpts{InputPath: source, SourceCodec: "subrip", TrackIndex: 0}
-	if err := c.ServeExtract(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/subtitle", nil), full, func(_ context.Context, opts StreamExtractOpts) error {
-		_, err := io.WriteString(opts.Writer, "FULL VTT TRACK")
-		return err
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	if !c.HasCommittedTextEntry(source, "", 0, "subrip", "") {
-		t.Fatal("vtt entry must be visible for subrip with the default target")
-	}
-	if !c.HasCommittedTextEntry(source, "", 0, "subrip", "vtt") {
-		t.Fatal("vtt entry must be visible for a forced vtt target")
-	}
-	if !c.HasCommittedTextEntry(source, "", 0, "subrip", ".VTT") {
-		t.Fatal("vtt entry must be visible for a case-insensitive target")
-	}
-	if c.HasCommittedTextEntry(source, "", 0, "ass", "") {
-		t.Fatal("ass must not read the vtt entry")
-	}
-	if c.HasCommittedTextEntry(source, "", 1, "subrip", "") {
-		t.Fatal("a different track ordinal must not read the vtt entry")
-	}
-	if c.HasCommittedTextEntry(source, "", 0, "hdmv_pgs_subtitle", "") {
-		t.Fatal("pgs must never read as a committed text entry")
-	}
-	var nilCache *SubtitleCache
-	if nilCache.HasCommittedTextEntry(source, "", 0, "subrip", "") {
-		t.Fatal("nil cache must read as a miss")
-	}
-}
-
-// HasCommittedEntry generalizes HasCommittedTextEntry to every sidecar class
-// (VTT, ASS, SUP) so the implicit-window gate can leave a committed track whole
-// for text, ASS, and PGS alike.
-func TestHasCommittedEntryAllFormats(t *testing.T) {
-	c, source := newTestCache(t)
-
-	extractText := func(opts StreamExtractOpts, payload string) {
-		t.Helper()
-		if err := c.ServeExtract(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/subtitle", nil), opts, func(_ context.Context, o StreamExtractOpts) error {
-			_, err := io.WriteString(o.Writer, payload)
-			return err
-		}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	extractText(StreamExtractOpts{InputPath: source, SourceCodec: "subrip", TrackIndex: 0}, "FULL VTT")
-	extractText(StreamExtractOpts{InputPath: source, SourceCodec: "ass", TrackIndex: 1}, "[Script Info]\n")
-	if err := c.ServeSUPExtract(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/subtitle.sup", nil),
-		StreamExtractOpts{InputPath: source, SourceCodec: "hdmv_pgs_subtitle", TrackIndex: 2},
-		func(_ context.Context, o StreamExtractOpts) error {
-			_, err := o.Writer.Write([]byte("PG"))
-			return err
-		}); err != nil {
-		t.Fatal(err)
-	}
-
+func TestServeExtractConcurrentViewersShareOneFill(t *testing.T) {
 	for _, tc := range []struct {
-		track int
-		codec string
+		codec, format string
+		failTemp      bool
 	}{
-		{0, "subrip"},
-		{1, "ass"},
-		{2, "hdmv_pgs_subtitle"},
+		{codec: "subrip", format: "vtt"},
+		{codec: "hdmv_pgs_subtitle", format: "sup"},
+		// The temp file fails after the second viewer has the first cues: it
+		// extracts the rest itself without repeating them.
+		{codec: "subrip", format: "vtt", failTemp: true},
 	} {
-		if !c.HasCommittedEntry(source, "", tc.track, tc.codec, "") {
-			t.Fatalf("committed %s track %d not visible", tc.codec, tc.track)
-		}
-	}
-	if c.HasCommittedEntry(source, "", 0, "hdmv_pgs_subtitle", "") {
-		t.Fatal("PGS must not read the VTT entry at the same ordinal")
-	}
-	var nilCache *SubtitleCache
-	if nilCache.HasCommittedEntry(source, "", 0, "subrip", "") {
-		t.Fatal("nil cache must read as a miss")
-	}
-}
+		t.Run(fmt.Sprintf("%s/failTemp=%v", tc.codec, tc.failTemp), func(t *testing.T) {
+			c, source := newTestCache(t)
+			opts := StreamExtractOpts{InputPath: source, SourceCodec: tc.codec}
+			const track = "first cues, rest of the track"
+			secondGotCues := make(chan struct{})
+			var calls atomic.Int32
+			extract := func(ctx context.Context, opts StreamExtractOpts) error {
+				if calls.Add(1) > 1 {
+					_, err := io.WriteString(opts.Writer, track)
+					return err
+				}
+				fill := inflightFill(c)
+				if _, err := io.WriteString(opts.Writer, "first cues, "); err != nil {
+					return err
+				}
+				select {
+				case <-secondGotCues:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+				if tc.failTemp {
+					fill.mu.Lock()
+					_ = fill.tmp.Close()
+					fill.mu.Unlock()
+				}
+				_, err := io.WriteString(opts.Writer, "rest of the track")
+				return err
+			}
+			// The first viewer's client stops reading.
+			stalled := &stalledResponse{ResponseRecorder: httptest.NewRecorder(), wrote: make(chan struct{}), release: make(chan struct{})}
+			firstCtx, leave := context.WithCancel(t.Context())
+			firstDone := make(chan error, 1)
+			go func() {
+				firstDone <- c.ServeExtract(stalled, httptest.NewRequestWithContext(firstCtx, http.MethodGet, "/subtitle", nil), opts, extract)
+			}()
+			defer func() {
+				leave()
+				close(stalled.release)
+				<-firstDone
+			}()
+			// Stall the first viewer before the second can break the temp file.
+			<-stalled.wrote
 
-// HasCommittedTextEntry is identity-keyed for a virtual source: the same
-// generation bucket and identity that a warm commits under is what the serve
-// path queries, so a handler can trust a hit to be the artifact it will read.
-// The cache identity carries the row's probed subtitle layout, so an artifact
-// committed against one inventory is not served under another. An unchanged
-// layout keeps the same identity (the cache survives ordinary re-probing);
-// a changed one re-keys it.
-func TestVirtualSubtitleCacheIdentityTracksProbedInventory(t *testing.T) {
-	const uri = "virtual://movie/tt0113277?result=candidate"
-	first := []models.SubtitleTrack{
-		{Index: 0, Language: "eng", Codec: "subrip"},
-		{Index: 1, Language: "fra", Codec: "ass"},
-	}
-	sameLayoutOtherTitles := []models.SubtitleTrack{
-		{Index: 0, Language: "ENG", Codec: "SubRip", Title: "English SDH"},
-		{Index: 1, Language: "fra", Codec: "ass", ContainerTrackID: "9"},
-	}
-	changedLayout := []models.SubtitleTrack{
-		{Index: 0, Language: "fra", Codec: "ass"},
-		{Index: 1, Language: "eng", Codec: "subrip"},
-	}
-
-	base := VirtualSubtitleCacheIdentity(42, uri, 0, SubtitleInventoryToken(first))
-	if got := VirtualSubtitleCacheIdentity(42, uri, 0, SubtitleInventoryToken(sameLayoutOtherTitles)); got != base {
-		t.Fatalf("identity changed for cosmetic metadata: %s vs %s", got, base)
-	}
-	if got := VirtualSubtitleCacheIdentity(42, uri, 0, SubtitleInventoryToken(changedLayout)); got == base {
-		t.Fatal("a changed probed inventory kept the cache identity")
-	}
-	if got := VirtualSubtitleCacheIdentity(42, uri, 1, SubtitleInventoryToken(first)); got == base {
-		t.Fatal("a different track ordinal kept the cache identity")
-	}
-	if got := VirtualSubtitleCacheIdentity(43, uri, 0, SubtitleInventoryToken(first)); got == base {
-		t.Fatal("a different file id kept the cache identity")
-	}
-}
-
-func TestHasCommittedTextEntryVirtualIdentity(t *testing.T) {
-	c, source := newTestCache(t)
-	const identity = "virtual-result-window-1"
-	fill := c.beginFill(source, identity, 0, subtitleFormatASS)
-	if fill == nil {
-		t.Fatal("failed to reserve identity-keyed fill")
-	}
-	if _, err := fill.Tee(io.Discard).Write([]byte("[Script Info]\n")); err != nil {
-		t.Fatal(err)
-	}
-	if err := fill.Commit(); err != nil {
-		t.Fatal(err)
-	}
-
-	if !c.HasCommittedTextEntry(source, identity, 0, "ass", "") {
-		t.Fatal("committed ass entry must be visible under its virtual identity")
-	}
-	if c.HasCommittedTextEntry(source, "virtual-result-other", 0, "ass", "") {
-		t.Fatal("a different virtual identity must not read the entry")
-	}
-}
-
-// A duplicate request that joins an in-flight fill which outlives its bounded
-// wait must answer retryable instead of holding the connection open and then
-// stacking a second full extract for the same key. This is the production
-// shape: a 16 s remote demux and a client that refetches the same track.
-func TestServeExtractTextBusyFillAnswersRetryableWithoutStacking(t *testing.T) {
-	c, source := newTestCache(t)
-	c.fillWaitTimeout = 30 * time.Millisecond
-	opts := StreamExtractOpts{InputPath: source, SourceCodec: "subrip"}
-
-	held := c.beginFill(source, "", 0, SubtitleFormatVTTV3)
-	if held == nil {
-		t.Fatal("failed to hold the in-flight fill")
-	}
-	defer held.Discard()
-
-	extracted := false
-	err := c.ServeExtract(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/subtitle", nil), opts,
-		func(context.Context, StreamExtractOpts) error {
-			extracted = true
-			return nil
+			second := &signalingResponse{ResponseRecorder: httptest.NewRecorder(), wrote: secondGotCues}
+			if err := c.ServeExtract(second, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/subtitle", nil), opts, extract); err != nil {
+				t.Fatal(err)
+			}
+			if got := second.Body.String(); got != track {
+				t.Fatalf("second viewer body = %q, want %q", got, track)
+			}
+			wantCalls := int32(1)
+			if tc.failTemp {
+				wantCalls = 2
+			}
+			if got := calls.Load(); got != wantCalls {
+				t.Fatalf("extract ran %d times, want %d", got, wantCalls)
+			}
+			f, _, ok := c.lookup(source, 0, tc.format)
+			if ok == tc.failTemp {
+				t.Fatalf("cached=%v with failed temp file=%v", ok, tc.failTemp)
+			}
+			if ok {
+				if got := readAllAndClose(t, f); got != track {
+					t.Fatalf("cached track = %q", got)
+				}
+			}
 		})
-	var retry *SubtitleExtractionRetryError
-	if !errors.As(err, &retry) {
-		t.Fatalf("duplicate extract error = %v, want the retryable busy answer", err)
-	}
-	if retry.RetryAfter != subtitleFillBusyRetryAfter {
-		t.Fatalf("Retry-After = %s, want %s", retry.RetryAfter, subtitleFillBusyRetryAfter)
-	}
-	if extracted {
-		t.Fatal("the duplicate request ran its own extraction while another fill was in flight")
-	}
-	select {
-	case <-held.done:
-		t.Fatal("the duplicate request settled the fill it was waiting on")
-	default:
 	}
 }
 
-// The cached VTT is served without running ffmpeg again: the identity that
-// committed the artifact is the identity the next request resolves.
-func TestServeExtractTextCachedArtifactSkipsExtract(t *testing.T) {
-	c, source := newTestCache(t)
-	opts := StreamExtractOpts{InputPath: source, SourceCodec: "subrip"}
-	const payload = "WEBVTT\n\n00:00.000 --> 00:01.000\ncached\n"
-
-	calls := 0
-	first := httptest.NewRecorder()
-	if err := c.ServeExtract(first, httptest.NewRequest(http.MethodGet, "/subtitle", nil), opts,
-		func(_ context.Context, o StreamExtractOpts) error {
-			calls++
-			_, err := io.WriteString(o.Writer, payload)
-			return err
-		}); err != nil {
-		t.Fatal(err)
+// inflightFill returns the one fill in flight.
+func inflightFill(c *SubtitleCache) *SubtitleCacheFill {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, fill := range c.inflight {
+		return fill
 	}
-
-	second := httptest.NewRecorder()
-	if err := c.ServeExtract(second, httptest.NewRequest(http.MethodGet, "/subtitle", nil), opts,
-		func(context.Context, StreamExtractOpts) error {
-			calls++
-			return errors.New("the cached artifact must be served without a re-extract")
-		}); err != nil {
-		t.Fatal(err)
-	}
-	if calls != 1 {
-		t.Fatalf("extract calls = %d, want 1 (the fill)", calls)
-	}
-	if got := second.Body.String(); got != payload {
-		t.Fatalf("cached body = %q, want %q", got, payload)
-	}
+	return nil
 }
 
-// A fill that misses the cache while another fill for the same key is in flight
-// must wait for that fill and serve its committed bytes — a plan-time warm is
-// not duplicated by the first client fetch. Exactly one extract (the warm)
-// runs.
-func TestServeExtractTextWaitsForInFlightFillAndServesCommitted(t *testing.T) {
-	c, source := newTestCache(t)
-	opts := StreamExtractOpts{InputPath: source, SourceCodec: "subrip"}
-
-	var (
-		mu    sync.Mutex
-		calls int
-	)
-	started, release := make(chan struct{}), make(chan struct{})
-	done := c.WarmTrackInBackground(opts, func(ctx context.Context, o StreamExtractOpts) error {
-		mu.Lock()
-		calls++
-		mu.Unlock()
-		close(started)
-		select {
-		case <-release:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-		_, err := io.WriteString(o.Writer, "WARM TRACK")
-		return err
-	}, "")
-	<-started
-
-	clientDone := make(chan error, 1)
-	rec := httptest.NewRecorder()
-	go func() {
-		clientDone <- c.ServeExtract(rec, httptest.NewRequest(http.MethodGet, "/subtitle", nil), opts, func(_ context.Context, o StreamExtractOpts) error {
-			mu.Lock()
-			calls++
-			mu.Unlock()
-			_, err := io.WriteString(o.Writer, "CLIENT TRACK")
-			return err
-		})
-	}()
-
-	// The client must be waiting on the warm, not running its own demux.
-	select {
-	case err := <-clientDone:
-		t.Fatalf("client returned before the warm committed: %v", err)
-	case <-time.After(50 * time.Millisecond):
-	}
-
-	close(release)
-	if err := <-clientDone; err != nil {
-		t.Fatal(err)
-	}
-	<-done
-
-	if got := rec.Body.String(); got != "WARM TRACK" {
-		t.Fatalf("client body = %q, want the warm's committed bytes", got)
-	}
-	mu.Lock()
-	defer mu.Unlock()
-	if calls != 1 {
-		t.Fatalf("extract ran %d times, want exactly 1 (the warm)", calls)
-	}
+// stalledResponse signals its write, blocks until release is closed, then fails it.
+type stalledResponse struct {
+	*httptest.ResponseRecorder
+	wrote   chan struct{}
+	release chan struct{}
 }
 
-// With no in-flight fill the cold path streams from its own extract unchanged.
-func TestServeExtractTextColdPathStreamsImmediately(t *testing.T) {
-	c, source := newTestCache(t)
-	opts := StreamExtractOpts{InputPath: source, SourceCodec: "subrip"}
-	calls := 0
-	rec := httptest.NewRecorder()
-	if err := c.ServeExtract(rec, httptest.NewRequest(http.MethodGet, "/subtitle", nil), opts, func(_ context.Context, o StreamExtractOpts) error {
-		calls++
-		_, err := io.WriteString(o.Writer, "COLD TRACK")
-		return err
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if calls != 1 {
-		t.Fatalf("cold path extract calls = %d, want 1", calls)
-	}
-	if got := rec.Body.String(); got != "COLD TRACK" {
-		t.Fatalf("cold body = %q", got)
-	}
+func (s *stalledResponse) Write([]byte) (int, error) {
+	close(s.wrote)
+	<-s.release
+	return 0, errors.New("client stopped reading")
 }
 
-// When the fill a request is waiting on fails without committing, the waiter
-// must take over the reservation and extract its own response rather than
-// hanging or dereferencing a nil fill.
-func TestServeExtractTextInFlightFillFailureRetries(t *testing.T) {
-	c, source := newTestCache(t)
-	opts := StreamExtractOpts{InputPath: source, SourceCodec: "subrip"}
-
-	held := c.beginFill(source, "", 0, SubtitleFormatVTTV3)
-	if held == nil {
-		t.Fatal("failed to hold the in-flight fill")
-	}
-
-	clientDone := make(chan error, 1)
-	rec := httptest.NewRecorder()
-	go func() {
-		clientDone <- c.ServeExtract(rec, httptest.NewRequest(http.MethodGet, "/subtitle", nil), opts, func(_ context.Context, o StreamExtractOpts) error {
-			_, err := io.WriteString(o.Writer, "CLIENT TRACK")
-			return err
-		})
-	}()
-
-	select {
-	case err := <-clientDone:
-		t.Fatalf("client returned before the held fill settled: %v", err)
-	case <-time.After(50 * time.Millisecond):
-	}
-
-	// The holder fails: no entry lands, so the waiter re-attempts the fill.
-	held.Discard()
-
-	if err := <-clientDone; err != nil {
-		t.Fatal(err)
-	}
-	if got := rec.Body.String(); got != "CLIENT TRACK" {
-		t.Fatalf("body = %q", got)
-	}
-	f, _, ok := c.lookup(source, "", 0, SubtitleFormatVTTV3)
-	if !ok {
-		t.Fatal("waiter's takeover extract was not committed")
-	}
-	_ = f.Close()
+// signalingResponse closes wrote after its first write.
+type signalingResponse struct {
+	*httptest.ResponseRecorder
+	wrote chan struct{}
+	once  sync.Once
 }
 
-// A canceled waiter returns its context error instead of blocking until the
-// in-flight fill finishes, and must not touch the holder's fill.
-func TestServeExtractTextWaitHonorsContextCancel(t *testing.T) {
-	c, source := newTestCache(t)
-	opts := StreamExtractOpts{InputPath: source, SourceCodec: "subrip"}
-
-	held := c.beginFill(source, "", 0, SubtitleFormatVTTV3)
-	if held == nil {
-		t.Fatal("failed to hold the in-flight fill")
-	}
-	defer held.Discard()
-
-	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Millisecond)
-	defer cancel()
-	extracted := false
-	err := c.ServeExtract(httptest.NewRecorder(), httptest.NewRequestWithContext(ctx, http.MethodGet, "/subtitle", nil), opts, func(context.Context, StreamExtractOpts) error {
-		extracted = true
-		return nil
-	})
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("error = %v, want context deadline", err)
-	}
-	if extracted {
-		t.Fatal("canceled waiter must not extract")
-	}
-}
-
-// The SUP full-track path gets the same treatment: a request arriving while a
-// fill is in flight waits and serves the committed .sup instead of running a
-// duplicate full demux.
-func TestServeSUPExtractWaitsForInFlightFill(t *testing.T) {
-	c, source := newTestCache(t)
-	opts := supExtractOpts(source, 0)
-
-	held := c.beginFill(source, "", 0, subtitleFormatSUP)
-	if held == nil {
-		t.Fatal("failed to hold the in-flight fill")
-	}
-
-	extracted := false
-	clientDone := make(chan error, 1)
-	rec := httptest.NewRecorder()
-	go func() {
-		clientDone <- c.ServeSUPExtract(rec, httptest.NewRequest(http.MethodGet, "/sub.sup", nil), opts, func(_ context.Context, o StreamExtractOpts) error {
-			extracted = true
-			_, err := o.Writer.Write([]byte("CLIENT SUP"))
-			return err
-		})
-	}()
-
-	select {
-	case err := <-clientDone:
-		t.Fatalf("client returned before the fill committed: %v", err)
-	case <-time.After(50 * time.Millisecond):
-	}
-
-	// The holder commits: the waiter must serve these bytes from cache.
-	if _, err := held.Tee(io.Discard).Write([]byte("SUP PAYLOAD")); err != nil {
-		t.Fatal(err)
-	}
-	if err := held.Commit(); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := <-clientDone; err != nil {
-		t.Fatal(err)
-	}
-	if got := rec.Body.String(); got != "SUP PAYLOAD" {
-		t.Fatalf("client body = %q, want the committed .sup", got)
-	}
-	// A committed entry is served with Last-Modified, never a streamed 200.
-	if rec.Header().Get("Last-Modified") == "" {
-		t.Fatal("waited serve must be a cached ServeContent response")
-	}
-	if extracted {
-		t.Fatal("waited request must not run its own extract")
-	}
+func (s *signalingResponse) Write(p []byte) (int, error) {
+	n, err := s.ResponseRecorder.Write(p)
+	s.once.Do(func() { close(s.wrote) })
+	return n, err
 }
 
 func TestServeExtractTextCancelledViewerDoesNotDiscardFill(t *testing.T) {
@@ -798,6 +299,62 @@ func TestServeExtractTextCancelledViewerDoesNotDiscardFill(t *testing.T) {
 		t.Fatal("canceled viewer discarded the active fill")
 	}
 	_ = f.Close()
+}
+
+func TestServeExtractFillOutlivesViewerWhenWarmSlotFree(t *testing.T) {
+	for _, slotsBusy := range []bool{false, true} {
+		t.Run(fmt.Sprintf("slotsBusy=%v", slotsBusy), func(t *testing.T) {
+			c, source := newTestCache(t)
+			if slotsBusy {
+				for range cap(c.warmSem) {
+					c.warmSem <- struct{}{}
+				}
+			}
+			ctx, leave := context.WithCancel(t.Context())
+			var fill *SubtitleCacheFill
+			err := c.ServeExtract(httptest.NewRecorder(), httptest.NewRequestWithContext(ctx, http.MethodGet, "/subtitle", nil),
+				StreamExtractOpts{InputPath: source, SourceCodec: "subrip"}, func(ctx context.Context, opts StreamExtractOpts) error {
+					fill = inflightFill(c)
+					if _, err := io.WriteString(opts.Writer, "first cues, "); err != nil {
+						return err
+					}
+					leave()
+					if slotsBusy {
+						select {
+						case <-ctx.Done():
+							return ctx.Err()
+						case <-time.After(5 * time.Second):
+							t.Error("extract kept running without a warm slot")
+						}
+					}
+					for len(c.warmSem) == 0 {
+						select {
+						case <-ctx.Done():
+							return ctx.Err()
+						case <-time.After(time.Millisecond):
+						}
+					}
+					_, err := io.WriteString(opts.Writer, "rest of the track")
+					return err
+				})
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("error = %v, want the viewer's cancellation", err)
+			}
+			<-fill.done
+			f, _, ok := c.lookup(source, 0, "vtt")
+			if ok == slotsBusy {
+				t.Fatalf("cached=%v with slots busy=%v", ok, slotsBusy)
+			}
+			if ok {
+				if got := readAllAndClose(t, f); got != "first cues, rest of the track" {
+					t.Fatalf("cached track = %q", got)
+				}
+			}
+			if !slotsBusy && len(c.warmSem) != 0 {
+				t.Fatalf("fill kept %d warm slots after finishing", len(c.warmSem))
+			}
+		})
+	}
 }
 
 func TestServeExtractOutlivesServerWriteTimeout(t *testing.T) {
@@ -941,63 +498,6 @@ func readAllAndClose(t *testing.T, f *os.File) string {
 	return string(data)
 }
 
-// textEntryPath computes the committed cache-entry path for source+track in
-// the given text format (e.g. "vtt", "ass").
-func textEntryPath(t *testing.T, c *SubtitleCache, source string, track int, format string) string {
-	t.Helper()
-	src, err := os.Stat(source)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return filepath.Join(c.dir(), subtitleCacheFormatKey(source, track, src.ModTime(), src.Size(), format))
-}
-
-// waitForTextCacheEntry polls until the cache holds a committed entry for
-// source+track in the given text format, like waitForCacheEntry but for
-// non-SUP artifacts.
-func waitForTextCacheEntry(t *testing.T, c *SubtitleCache, source string, track int, format string) {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if f, _, ok := c.lookup(source, "", track, format); ok {
-			_ = f.Close()
-			return
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	t.Fatalf("cache entry for track %d format %q never appeared", track, format)
-}
-
-func TestSubtitleCacheMissThenHit(t *testing.T) {
-	c, source := newTestCache(t)
-
-	if _, _, ok := c.Lookup(source, 0); ok {
-		t.Fatal("expected miss on empty cache")
-	}
-
-	fillEntry(t, c, source, 0, "PGS DATA TRACK 0")
-
-	f, modTime, ok := c.Lookup(source, 0)
-	if !ok {
-		t.Fatal("expected hit after commit")
-	}
-	if got := readAllAndClose(t, f); got != "PGS DATA TRACK 0" {
-		t.Fatalf("cached content = %q", got)
-	}
-	src, err := os.Stat(source)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !modTime.Equal(src.ModTime()) {
-		t.Fatalf("hit modTime = %v, want source mtime %v", modTime, src.ModTime())
-	}
-
-	// A different track ordinal is a distinct entry.
-	if _, _, ok := c.Lookup(source, 1); ok {
-		t.Fatal("expected miss for uncached track ordinal")
-	}
-}
-
 func TestSubtitleCacheTextRoundTripAndFormatIsolation(t *testing.T) {
 	c, source := newTestCache(t)
 	if _, ok := c.LookupText(source, 0, "srt"); ok {
@@ -1014,30 +514,6 @@ func TestSubtitleCacheTextRoundTripAndFormatIsolation(t *testing.T) {
 	}
 	if _, ok := c.LookupText(source, 1, "srt"); ok {
 		t.Fatal("text cache entry must not satisfy another track")
-	}
-}
-
-func TestSubtitleCacheTextInvalidatedBySourceChange(t *testing.T) {
-	c, source := newTestCache(t)
-	if _, err := c.ExtractText(t.Context(), source, 0, "srt", func(context.Context) ([]byte, error) { return []byte("old extract"), nil }); err != nil {
-		t.Fatal(err)
-	}
-
-	newTime := time.Now().Add(2 * time.Hour)
-	if err := os.Chtimes(source, newTime, newTime); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := c.LookupText(source, 0, "srt"); ok {
-		t.Fatal("expected text miss after source mtime changed")
-	}
-	if _, err := c.ExtractText(t.Context(), source, 0, "srt", func(context.Context) ([]byte, error) { return []byte("new extract"), nil }); err != nil {
-		t.Fatal(err)
-	}
-	if got, ok := c.LookupText(source, 0, "srt"); !ok || string(got) != "new extract" {
-		t.Fatalf("refilled SRT lookup = %q, %t", got, ok)
-	}
-	if n := countMatching(t, c, func(name string) bool { return strings.HasSuffix(name, ".srt") }); n != 1 {
-		t.Fatalf("stale text sibling not removed: %d entries", n)
 	}
 }
 

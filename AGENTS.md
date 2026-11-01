@@ -89,9 +89,9 @@ Apple and Google stores, and a server that plays arbitrary remote stream URLs pu
 client suite at risk. This is settled product direction, not a design problem to solve; do not
 write code for it, and say so plainly if asked.
 
-Vio fork exception: this fork does not adopt the upstream non-goals above — see
-[fork-divergence](docs/architecture/fork-divergence.md). Remote/debrid-backed library
-integrations may be explored here; the store risk stands and any shipped integration owns it.
+**Deleting, moving, renaming, or otherwise managing media files will not be accepted** either.
+Silo is a media server, not a media manager: it reads libraries (the shipped Compose file mounts
+them read-only) and leaves file management to other tools.
 
 ## Gotchas
 
@@ -175,7 +175,7 @@ what goes in it.
 
 `make build`, `make dev-backend`, `make dev-frontend`, `make lint`, `make test`, `make migrate-status`
 / `make migrate-up` — read the `Makefile` for the rest. Local services:
-`docker compose up -d postgres redis`.
+`docker compose -f dev/compose.yml up -d postgres redis`.
 
 While iterating, run the focused tests for the packages you touched (`go test ./internal/<pkg>/...`)
 rather than the whole suite; the full gate below is for pre-PR. In tests, wait on observable
@@ -199,32 +199,24 @@ changed-line findings as CI while analyzing only the packages the branch touched
 
 Format Go files as touched with `gofmt`/`goimports`; the frontend follows `web/.prettierrc`.
 
-## Pre-push checklist (first-try green)
+## Tests
 
-Run every item before each push, not just before opening the PR. The two
-most-skipped steps cause the most CI failures.
+A test belongs here only if it would catch a regression that matters and that no other test, type
+check, or lint would catch. Most changes need no new test, and some should delete one. Read
+[Decide what to test](CONTRIBUTING.md#decide-what-to-test) before adding a test. In short:
 
-```sh
-# Go (repo root)
-go build ./...
-gofmt -l internal/ cmd/              # must print nothing
-go vet ./...                         # or at least touched packages
-git diff --check                     # whitespace errors
-# If touched: migrations, settings manifest/keys, apiv2 routes
-make migrate-validate
-make verify-settings-bindings
-```
-
-```sh
-# Web (web/)
-pnpm run lint                        # unused imports kill CI
-pnpm run format:check                # or prettier --write the edited files first
-```
-
-Plus: focused `go test` on touched packages, and after pushing,
-`gh pr checks <n>` to watch the first run. Rebase onto `origin/main`
-right after branching so CI runs against a current target instead of
-surfacing merge drift late.
+- Add or extend a test for security and authority checks, data integrity, public contracts
+  (`/api/v2`, jellycompat, the plugin protocol), failure handling, and logic with real edge cases,
+  and when fixing a bug in one of those.
+- Don't test small changes, UI layout or copy, pass-through wiring, constants and defaults, or
+  frozen `/api/v1` behavior beyond its own authorization checks.
+- Test each behavior once, in the package that owns it. Prefer a new table row to a new test, and a
+  new test to a new file. Delete tests your change makes redundant.
+- Don't write tests that match strings in source, CSS, or docs files, or that only check a fake
+  received the test's own inputs.
+- A new test that needs Postgres goes in `scripts/ci/db-contracts.txt` (or `db-pins.txt` for a
+  query budget) in the same change, or isn't written; CI skips database tests no list or job
+  selects. CI has no Redis, so don't add tests that need one.
 
 ## Development environment
 

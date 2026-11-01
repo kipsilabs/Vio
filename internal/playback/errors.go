@@ -13,22 +13,13 @@ var (
 	// without a recognized concurrency-limit code (e.g. an admin custom
 	// override, or a failed policy evaluation) must not masquerade as one.
 	ErrPlaybackNotAllowed = errors.New("playback not allowed by policy")
-	// ErrAdmissionDeciderTimeout reports the policy engine exceeded its eval
-	// budget, which is not a decision. Playback admission may degrade to the
-	// inline stream/transcode caps; a generic decider error must still deny.
-	ErrAdmissionDeciderTimeout = errors.New("admission decider timed out")
-	ErrFileNotFound            = errors.New("media file not found")
-	ErrTranscodeFailed         = errors.New("transcode process failed")
-	ErrSegmentNotFound         = errors.New("segment not found")
-	// ErrSegmentStalled means the encoder stopped advancing the produced head,
-	// so waiting longer cannot serve the requested segment. It is distinct from
-	// a slow-but-progressing encode: callers restart only on this verdict.
-	ErrSegmentStalled = errors.New("segment production stalled")
-	// ErrSubtitleWarmCanceled reports an intentional abandonment of an
-	// opportunistic subtitle warm, such as playback resuming. It is not a
-	// source failure and must not arm the warm failure cooldown.
-	ErrSubtitleWarmCanceled = errors.New("subtitle warm canceled by playback")
-	ErrManifestNotReady     = errors.New("manifest not ready")
+	ErrFileNotFound       = errors.New("media file not found")
+	ErrTranscodeFailed    = errors.New("transcode process failed")
+	ErrSegmentNotFound    = errors.New("segment not found")
+	ErrManifestNotReady   = errors.New("manifest not ready")
+	// ErrManifestQueryTooLong rejects a playlist request whose query is longer
+	// than maxManifestQueryBytes.
+	ErrManifestQueryTooLong = errors.New("playlist request query too long")
 	// ErrToneMapSourceValidationUnavailable reports that the executor could not
 	// freshly probe the source metadata needed to validate a tone-map recipe.
 	// The failure is transient: callers may retry after the source or probe

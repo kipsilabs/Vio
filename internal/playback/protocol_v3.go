@@ -13,7 +13,15 @@ import (
 )
 
 const (
+	BandwidthEstimateProbeV3            = "probe"
+	BandwidthEstimateObservedRebufferV3 = "observed_rebuffer"
+	LearnedLimitIgnoreV3                = "ignore"
+	LearnedLimitClearV3                 = "clear"
+
 	ProtocolV3                               = 3
+	FeatureBufferingQualityV1                = "buffering_quality_v1"
+	FeatureConnectionSpeedV1                 = "connection_speed_v1"
+	FeaturePlaybackPlanSummaryV1             = "playback_plan_summary_v1"
 	FeaturePlaybackPlanV3                    = "playback_plan_v3"
 	FeatureServerRemoteStreamBitratePolicyV3 = "server_remote_stream_bitrate_policy_v1"
 	FeatureServerLocalStreamBitratePolicyV3  = "server_local_stream_bitrate_policy_v1"
@@ -111,10 +119,36 @@ const (
 	FeatureDeferredTrackInventoryV3 = "deferred_track_inventory_v1"
 	// FeatureHLSSubtitleRenditionsV3 is the client's statement that it plays
 	// a subtitle carried as a WebVTT SUBTITLES rendition of the plan's HLS
-	// stream (subtitle.hls_rendition) instead of a sidecar artifact. Only a
-	// server_transcode_hls plan uses it, for an embedded text track. It
-	// exists only on /api/v2 (see NativeServerFeaturesV3).
+	// stream (subtitle.hls_rendition) instead of a sidecar artifact. A
+	// server_transcode_hls plan uses it for an embedded text track, and a
+	// server_remux_hls plan too when the client also lists
+	// FeatureHLSRemuxSubtitleRenditionsV3. It exists only on /api/v2 (see
+	// NativeServerFeaturesV3).
 	FeatureHLSSubtitleRenditionsV3 = "hls_subtitle_renditions_v1"
+	// FeatureHLSRemuxSubtitleRenditionsV3 extends FeatureHLSSubtitleRenditionsV3,
+	// which it requires, to HLS copy remuxes: an opted-in client receives a
+	// server_remux_hls plan's embedded text track as subtitle.hls_rendition,
+	// on a subtitle playlist that follows the remux's keyframe-cut segments
+	// (a VOD keyframe plan or FFmpeg's EVENT playlist). Without it a remux
+	// keeps its sidecar. It exists only on /api/v2 (see NativeServerFeaturesV3).
+	FeatureHLSRemuxSubtitleRenditionsV3 = "hls_remux_subtitle_renditions_v1"
+	// FeaturePlanActiveQualityV3 tells a client the plan names the
+	// available_qualities entry it delivers in active_quality, so an absent
+	// active_quality means "no entry" rather than "a server that predates
+	// the field". It exists only on /api/v2 (see NativeServerFeaturesV3).
+	FeaturePlanActiveQualityV3 = "plan_active_quality_v1"
+	// FeatureHLSCopyMPEGTSV3 is an hls delivery feature: a client lists it in
+	// deliveries.hls.features to have HLS copy remuxes of H.264 or HEVC video
+	// packaged as MPEG-TS segments instead of fragmented MP4. Players such as
+	// Roku's play the audio of a muxed fMP4 copy silently but play the same
+	// remux in MPEG-TS. The plan records the choice in
+	// effective_recipe.segment_container, which is part of its identity.
+	// Encoded video keeps its packaging. It exists only on /api/v2 (see
+	// NativeServerFeaturesV3).
+	FeatureHLSCopyMPEGTSV3 = "hls_copy_mpegts_v1"
+	// SegmentContainerMPEGTSV3 is effective_recipe.segment_container for an
+	// HLS plan packaged as MPEG-TS because the client asked for it.
+	SegmentContainerMPEGTSV3 = "mpegts"
 	// FailureSubtitleHLSRenditionFailedV3 is the failure_recovery
 	// classification a client sends when the plan's subtitle rendition never
 	// became selectable in its player. The server stops offering renditions
@@ -161,17 +195,20 @@ const (
 	DeviceQuirkRegistryRevisionV3     = "2026-07-13.1"
 )
 
-// ClientManagedDVBaseLayerClaimV3 returns the validated claim a client uses to
-// attest that its original_http executor presents the standards-compatible base
-// layer of a Dolby Vision source with [compatID]. It returns "" for an absent or
-// non-positive id: there is no claim for "unknown", and the caller must fail
-// closed rather than infer one.
-func ClientManagedDVBaseLayerClaimV3(compatID int) string {
-	if compatID <= 0 {
-		return ""
-	}
-	return fmt.Sprintf("%s%d_v1", ClaimClientManagedDVBaseLayerV3Prefix, compatID)
-}
+// FeatureHLSVariableSubstitutionV3 is an hls delivery feature: the client
+// resolves EXT-X-DEFINE variables in media playlists, so a playlist the
+// server rewrites (FFmpeg's real copy playlist, a transcode node's
+// playlist relayed by the API) may carry a credential-sized query once
+// instead of on every segment URI. Long titles otherwise exceed the 4 MiB
+// some players accept. The playlists the server builds itself use the
+// substitution for every client regardless. /api/v2 advertises it in the
+// capabilities features list.
+const FeatureHLSVariableSubstitutionV3 = "hls_variable_substitution_v1"
+
+// FeatureCodecChannelCeilingsV3 tells a client that the server honors a
+// delivery's max_channels_by_codec. /api/v2 advertises it in the capabilities
+// features list.
+const FeatureCodecChannelCeilingsV3 = "codec_channel_ceilings_v1"
 
 // Worker transport features are protocol capabilities rather than media
 // transformations. They let route planning exclude an older worker before a
@@ -181,6 +218,7 @@ const (
 	TransportFeatureProgressiveRemuxRelayV1     = "progressive_remux_relay_v1"
 	// Theme audio markers: a proxy that serves /stream/theme, and a transcode
 	// node that approves theme files as progressive AAC inputs.
+	TransportFeatureBandwidthProbeV1      = "bandwidth_probe_v1"
 	TransportFeatureThemeAudioEgressV1    = "theme_audio_egress_v1"
 	TransportFeatureThemeAudioExecutionV1 = "theme_audio_execution_v1"
 	// A transcode node that executes the multi-track prepared-download layout
@@ -195,7 +233,21 @@ const (
 	// A transcode node that emits and serves an HLS WebVTT subtitle rendition
 	// (TranscodeOpts.SubtitleRendition).
 	TransportFeatureHLSSubtitleRenditionV1 = "hls_subtitle_rendition_v1"
+	// A transcode node that also emits the rendition for an HLS copy remux,
+	// whose subtitle playlist follows the keyframe plan or FFmpeg's EVENT
+	// playlist. Nodes with only hls_subtitle_rendition_v1 refuse it.
+	TransportFeatureHLSRemuxSubtitleRenditionV1 = "hls_remux_subtitle_rendition_v1"
 )
+
+// HLSSubtitleRenditionTransportFeatureV3 is the transport feature a node must
+// advertise to emit the subtitle rendition of a stream whose video target is
+// targetVideoCodec.
+func HLSSubtitleRenditionTransportFeatureV3(targetVideoCodec string) string {
+	if strings.EqualFold(strings.TrimSpace(targetVideoCodec), codecCopyV3) {
+		return TransportFeatureHLSRemuxSubtitleRenditionV1
+	}
+	return TransportFeatureHLSSubtitleRenditionV1
+}
 
 // Degradation warning codes reported by playback plans.
 const (
@@ -283,7 +335,13 @@ func ServerFeaturesV3() []string {
 // advertises and honors only on /api/v2. They postdate the /api/v1 freeze, so
 // the frozen surface neither advertises nor negotiates them.
 func NativeServerFeaturesV3() []string {
-	return append(ServerFeaturesV3(), FeatureSubripSidecarV3, FeatureLiveInventoryV3, FeatureSourceCommittedV3, FeatureInventoryUpdatedV3, FeatureDeferredTrackInventoryV3, FeatureMarkerThumbnailsV3, FeatureHLSSubtitleRenditionsV3)
+	return append(ServerFeaturesV3(), FeatureBufferingQualityV1, FeaturePlaybackPlanSummaryV1, FeatureSubripSidecarV3, FeatureMarkerThumbnailsV3, FeatureHLSSubtitleRenditionsV3, FeaturePlanActiveQualityV3, FeatureHLSRemuxSubtitleRenditionsV3, FeatureHLSCopyMPEGTSV3, FeatureHLSVariableSubstitutionV3, FeatureCodecChannelCeilingsV3)
+}
+
+// HLSVariableSubstitutionV3 reports whether the request's hls delivery
+// listed hls_variable_substitution_v1.
+func HLSVariableSubstitutionV3(request StartRequestV3) bool {
+	return deliverySupportsFeatureV3(request, DeliveryClassHLSV3, FeatureHLSVariableSubstitutionV3)
 }
 
 // WithoutFeatureV3 returns features with every spelling of feature removed.
@@ -721,13 +779,20 @@ type DeliveryCapabilityV3 struct {
 	// player downmixes surround itself omits it. A source track above it is
 	// converted to AAC within the ceiling, on a video-copy remux when the
 	// video can be copied. Zero or less means unset.
-	MaxChannels       *int                           `json:"max_channels,omitempty"`
-	HDRDetails        *HDRCapabilitiesV3             `json:"hdr_details,omitempty"`
-	Subtitles         DeliverySubtitleCapabilitiesV3 `json:"subtitles"`
-	Features          []string                       `json:"features"`
-	AuthHeaderRefresh bool                           `json:"auth_header_refresh"`
-	ValidatedClaims   []string                       `json:"validated_claims"`
-	Transformations   []TransformationV3             `json:"transformations"`
+	MaxChannels *int `json:"max_channels,omitempty"`
+	// MaxChannelsByCodec caps the channel count per audio codec, on top of
+	// MaxChannels: {"aac": 2} from a client that decodes AAC only in stereo
+	// but plays E-AC-3 5.1. A copied track above its codec's ceiling is
+	// converted, and an AAC conversion stays within the "aac" entry. Keys are
+	// codec names as in audio_decode_codecs; a value of zero or less means
+	// unset. Honored when the server advertises codec_channel_ceilings_v1.
+	MaxChannelsByCodec map[string]int                 `json:"max_channels_by_codec,omitempty" maxProperties:"32"`
+	HDRDetails         *HDRCapabilitiesV3             `json:"hdr_details,omitempty"`
+	Subtitles          DeliverySubtitleCapabilitiesV3 `json:"subtitles"`
+	Features           []string                       `json:"features"`
+	AuthHeaderRefresh  bool                           `json:"auth_header_refresh"`
+	ValidatedClaims    []string                       `json:"validated_claims"`
+	Transformations    []TransformationV3             `json:"transformations"`
 }
 
 // ClientPlaybackContextV3 carries the client's execution context. Feature
@@ -775,41 +840,22 @@ type StartRequestV3 struct {
 	QualityPreference         string `json:"quality_preference"`
 	// False pins the source file through start and every replan. Encoding and
 	// delivery can still adapt to the viewer without changing the timeline.
-	AllowAlternateVersions     *bool                 `json:"allow_alternate_versions,omitempty"`
-	SubtitleFidelityPreference SubtitleFidelityV3    `json:"subtitle_fidelity_preference"`
-	StartPosition              *float64              `json:"start_position,omitempty"`
-	ProgressPersistence        ProgressPersistenceV3 `json:"progress_persistence,omitempty"`
-	AudioTrackID               string                `json:"audio_track_id,omitempty"`
-	AudioTrackIndex            *int                  `json:"audio_track_index,omitempty"`
-	// CarriedAudioTrackID is the file-bound audio identity (file:<id>:audio:<ordinal>)
-	// the viewer had selected on a previously playing version. The server re-resolves
-	// it onto the requested file's inventory by track family instead of raw ordinal.
-	// Optional and additive: absent means the server owns audio selection (profile or
-	// series preference), exactly as before.
-	CarriedAudioTrackID string `json:"carried_audio_track_id,omitempty"`
-	SubtitleTrackID     string `json:"subtitle_track_id,omitempty"`
-	SubtitleTrackIndex  *int   `json:"subtitle_track_index,omitempty"`
-	// FileSelection distinguishes an explicit user version pick from an
-	// auto/default selection. Absent means auto, preserving existing client
-	// behavior; an explicit pick pins the requested file and disables the
-	// start-path alternate-file fallback.
-	FileSelection FileSelectionV3 `json:"file_selection,omitempty"`
-	// OfferedVirtualURI binds a start to the concrete candidate a previous
-	// inventory event offered under this row. It is set only when the viewer
-	// picks a track from an offered release; the resolver must serve that
-	// candidate or fail, never substitute another one and apply the offered
-	// track ordinals to it.
-	OfferedVirtualURI string `json:"offered_virtual_uri,omitempty"`
-	// ForceRelink asks the server to fetch a fresh provider listing for an
-	// explicitly re-selected version instead of trusting the cached or pinned
-	// candidate. It is only meaningful alongside an explicit file_selection;
-	// absent means the server keeps its existing listing/cache behavior.
-	ForceRelink           bool                      `json:"force_relink,omitempty"`
-	Metered               bool                      `json:"metered"`
-	BandwidthEstimateKbps *int                      `json:"bandwidth_estimate_kbps,omitempty"`
-	BandwidthCapKbps      *int                      `json:"bandwidth_cap_kbps,omitempty"`
-	Capabilities          ClientCodecCapabilitiesV3 `json:"client_capabilities"`
-	ClientPlaybackContext ClientPlaybackContextV3   `json:"client_playback_context"`
+	AllowAlternateVersions     *bool                     `json:"allow_alternate_versions,omitempty"`
+	SubtitleFidelityPreference SubtitleFidelityV3        `json:"subtitle_fidelity_preference"`
+	StartPosition              *float64                  `json:"start_position,omitempty"`
+	ProgressPersistence        ProgressPersistenceV3     `json:"progress_persistence,omitempty"`
+	AudioTrackID               string                    `json:"audio_track_id,omitempty"`
+	AudioTrackIndex            *int                      `json:"audio_track_index,omitempty"`
+	SubtitleTrackID            string                    `json:"subtitle_track_id,omitempty"`
+	SubtitleTrackIndex         *int                      `json:"subtitle_track_index,omitempty"`
+	Metered                    bool                      `json:"metered"`
+	BandwidthEstimateKbps      *int                      `json:"bandwidth_estimate_kbps,omitempty"`
+	BandwidthEstimateSource    string                    `json:"bandwidth_estimate_source,omitempty"`
+	ObservedThroughputKbps     *int                      `json:"observed_throughput_kbps,omitempty"`
+	LearnedLimit               string                    `json:"learned_limit,omitempty"`
+	BandwidthCapKbps           *int                      `json:"bandwidth_cap_kbps,omitempty"`
+	Capabilities               ClientCodecCapabilitiesV3 `json:"client_capabilities"`
+	ClientPlaybackContext      ClientPlaybackContextV3   `json:"client_playback_context"`
 }
 
 func (r StartRequestV3) AllowsAlternateVersions() bool {
@@ -888,43 +934,20 @@ type ReplanRequestV3 struct {
 	// LocalMutations reports client-applied local plan mutations (for example
 	// a PCM recovery route) so the server can fold them into the attempt key it
 	// computes for the failed plan. Clients never hash anything themselves.
-	LocalMutations    []string `json:"local_mutations,omitempty"`
-	AttemptCount      int      `json:"attempt_count"`
-	QualityPreference string   `json:"quality_preference"`
-	PositionSeconds   float64  `json:"position_seconds"`
-	Metered           bool     `json:"metered"`
-	// AutoFallback re-negotiates the session's version-fallback intent. A
-	// viewer who re-arms Auto mid-session states it here so a later dead-source
-	// recovery rotates even though the session started on an explicit pick.
-	// Omitted leaves the start-time intent unchanged, so clients that predate
-	// the field keep their existing behavior. It never authorizes a healthy
-	// mid-play switch: only a dead or unplayable source advances it.
-	AutoFallback          *bool `json:"auto_fallback,omitempty"`
-	BandwidthEstimateKbps *int  `json:"bandwidth_estimate_kbps,omitempty"`
-	BandwidthCapKbps      *int  `json:"bandwidth_cap_kbps,omitempty"`
-	// AnswersPlanInvalidation carries the `reason` string from the
-	// plan_invalidated command this replan is answering. It is the
-	// authoritative correlation between a withdrawal and its response:
-	// present only on the replan that answers a withdrawn plan, never on
-	// ordinary failure recovery or intent replans. It is NOT trust-sensitive
-	// the way Automatic is: at worst it can make the server apply a
-	// correction the server itself already decided and announced, so the
-	// ingress boundary does not strip it (contrast
-	// stripClientSuppliedAutomatic, which drops a marker the client has no
-	// right to set because forging it would impersonate server
-	// reconciliation).
-	AnswersPlanInvalidation string                    `json:"answers_plan_invalidation,omitempty"`
+	LocalMutations          []string                  `json:"local_mutations,omitempty"`
+	AttemptCount            int                       `json:"attempt_count"`
+	QualityPreference       string                    `json:"quality_preference"`
+	PositionSeconds         float64                   `json:"position_seconds"`
+	Metered                 bool                      `json:"metered"`
+	BandwidthEstimateKbps   *int                      `json:"bandwidth_estimate_kbps,omitempty"`
+	BandwidthEstimateSource string                    `json:"bandwidth_estimate_source,omitempty"`
+	ObservedThroughputKbps  *int                      `json:"observed_throughput_kbps,omitempty"`
+	LearnedLimit            string                    `json:"learned_limit,omitempty"`
+	BandwidthCapKbps        *int                      `json:"bandwidth_cap_kbps,omitempty"`
 	SelectedTracks          SelectedTracksV3          `json:"selected_tracks"`
 	Failure                 FailureV3                 `json:"failure,omitzero"`
 	Capabilities            ClientCodecCapabilitiesV3 `json:"client_capabilities"`
 	ClientPlaybackContext   ClientPlaybackContextV3   `json:"client_playback_context"`
-	// Automatic marks a replan request the server built itself (no client
-	// gesture behind it). It is server-side only: omitempty keeps it off the
-	// client wire in practice, Validate ignores it, and clients never send
-	// it. The replan application uses it to suppress user-preference
-	// persistence for automatic corrections; explicit user track changes
-	// keep persisting. Empty means a client-issued request.
-	Automatic string `json:"automatic,omitempty"`
 }
 
 // ReplanAutomaticV3 is the Automatic marker for server-built reconciliation
@@ -935,6 +958,7 @@ const (
 	RouteEventPlanSelectedV3               = "plan_selected"
 	RouteEventPlanInvalidatedV3            = "plan_invalidated"
 	RouteEventPlanFailedV3                 = "plan_failed"
+	RouteEventPlanSummaryV3                = "plan_summary"
 	RouteEventFirstFrameV3                 = "first_frame"
 	RouteEventTerminalV3                   = "terminal"
 	RouteEventStoppedV3                    = "stopped"
@@ -946,6 +970,7 @@ const (
 )
 
 var routeEventNamesV3 = []string{
+	RouteEventPlanSummaryV3,
 	RouteEventPlanSelectedV3,
 	RouteEventPlanInvalidatedV3,
 	RouteEventPlanFailedV3,
@@ -998,13 +1023,13 @@ type RouteEventV3 struct {
 }
 
 type StreamV3 struct {
-	URL              string              `json:"url"`
+	URL              string              `json:"url" format:"uri-reference"`
 	Protocol         StreamProtocolV3    `json:"protocol"`
 	Container        string              `json:"container,omitempty"`
 	MIMEType         string              `json:"mime_type,omitempty"`
 	Headers          map[string]string   `json:"headers"`
 	HeaderRefresh    HeaderRefreshModeV3 `json:"header_refresh"`
-	HeaderRefreshURL string              `json:"header_refresh_url,omitempty"`
+	HeaderRefreshURL string              `json:"header_refresh_url,omitempty" format:"uri-reference"`
 }
 
 type TimelineV3 struct {
@@ -1019,8 +1044,13 @@ type TimelineV3 struct {
 }
 
 type EffectiveRecipeV3 struct {
-	VideoCodec       string   `json:"video_codec,omitempty"`
-	VideoSampleEntry string   `json:"video_sample_entry,omitempty"`
+	VideoCodec       string `json:"video_codec,omitempty"`
+	VideoSampleEntry string `json:"video_sample_entry,omitempty"`
+	// SegmentContainer is "mpegts" on an HLS copy remux packaged as MPEG-TS
+	// because the client's hls delivery listed hls_copy_mpegts_v1. Such a
+	// plan has no video_sample_entry, which only fragmented MP4 carries.
+	// Absent means the server's default packaging.
+	SegmentContainer string   `json:"segment_container,omitempty"`
 	AudioCodec       string   `json:"audio_codec,omitempty"`
 	Width            *int     `json:"width,omitempty"`
 	Height           *int     `json:"height,omitempty"`
@@ -1110,7 +1140,7 @@ type ValidationClaimsV3 struct {
 }
 
 type SubtitleArtifactV3 struct {
-	URL                 string  `json:"url"`
+	URL                 string  `json:"url" format:"uri-reference"`
 	MIMEType            string  `json:"mime_type"`
 	Format              string  `json:"format"`
 	TimingOriginSeconds float64 `json:"timing_origin_seconds"`
@@ -1199,6 +1229,8 @@ const (
 	QualityRung720pHighV3    = "720p-high"
 	QualityRung720pMediumV3  = "720p-medium"
 	QualityRung720pLowV3     = "720p-low"
+	QualityRung480pLowV3     = "480p-low"
+	QualityRung360pV3        = "360p"
 )
 
 // DeliveryChangeV3 records a mid-session serving-route change on a replan. It
@@ -1236,239 +1268,43 @@ type AvailableQualityV3 struct {
 	PreservesSource bool   `json:"preserves_source"`
 }
 
+type BandwidthLimitV3 struct {
+	Kbps      int    `json:"kbps"`
+	Source    string `json:"source"`
+	ExpiresAt string `json:"expires_at"`
+}
+
 type PlanV3 struct {
-	ProtocolVersion int    `json:"protocol_version"`
-	PlanID          string `json:"plan_id"`
-	// CanonicalPlanID is the unsalted plan ID that identifies the recipe for
-	// this attempt. Replan installations incorporate a unique generation salt
-	// into PlanID for transport identity; CanonicalPlanID stays invariant so
-	// server-side recipe exclusion and PlanAttemptKey are computed consistently.
-	CanonicalPlanID string `json:"canonical_plan_id,omitempty"`
+	BandwidthLimit  *BandwidthLimitV3 `json:"bandwidth_limit,omitempty"`
+	ProtocolVersion int               `json:"protocol_version"`
+	PlanID          string            `json:"plan_id"`
 	// PlanAttemptKey is the server-computed opaque loop-prevention token for
 	// this plan. Clients store the keys of attempted plans and echo them in
 	// attempted_plan_keys on replan; they never compute keys themselves.
-	PlanAttemptKey       string                 `json:"plan_attempt_key"`
-	SessionID            string                 `json:"session_id,omitempty"`
-	ExpiresAt            string                 `json:"expires_at,omitempty"`
-	Delivery             DeliveryV3             `json:"delivery"`
-	Stream               StreamV3               `json:"stream"`
-	Timeline             TimelineV3             `json:"timeline"`
-	SelectedTracks       SelectedTracksV3       `json:"selected_tracks"`
-	EffectiveRecipe      EffectiveRecipeV3      `json:"effective_recipe"`
-	Claims               ValidationClaimsV3     `json:"claims"`
-	Subtitle             SubtitleDecisionV3     `json:"subtitle"`
-	Transformations      []TransformationV3     `json:"transformations"`
-	AppliedQuirks        []AppliedQuirkV3       `json:"applied_quirks"`
-	RuntimeCorrections   []string               `json:"runtime_corrections"`
-	AvailableQualities   []AvailableQualityV3   `json:"available_qualities"`
-	DegradationWarnings  []DegradationWarningV3 `json:"degradation_warnings"`
-	DecisionReason       string                 `json:"decision_reason"`
-	RequestedMediaFileID int                    `json:"requested_media_file_id"`
-	EffectiveMediaFileID int                    `json:"effective_media_file_id"`
-	// SubstitutedFromFileID names the catalog row the client asked for when the
-	// effective release differs from it; it is the requested row id and is
-	// omitted when the effective row is the requested one. It exists so a
-	// client can surface an honest substitution notice without first diffing
-	// the requested/effective ids, and carries SubstitutionReason alongside.
-	// UI-only, like the inventory hints below: it is set after plan identity is
-	// finalized and is deliberately excluded from plan identity hashing.
-	SubstitutedFromFileID int `json:"substituted_from_file_id,omitempty"`
-	// SubstitutionReason is the machine-readable cause of a version
-	// substitution, present only with SubstitutedFromFileID: a dead release, a
-	// provider listing failure, a transport failure, or a decode rejection.
-	// The set is additive; clients treat an unknown value as a generic
-	// substitution rather than failing to render.
-	SubstitutionReason string `json:"substitution_reason,omitempty"`
-	// DeliveryChange, when present, records that this plan changed the serving
-	// route mid-session: the delivery and/or play method differs from the plan
-	// the session was previously serving. A failure-recovery replan may
-	// legitimately move from one delivery to another (for example
-	// server_transcode_hls to server_remux_progressive), and without an explicit
-	// marker the client only sees the new plan body and cannot tell a silent
-	// mid-play route swap from a planned change. It is a UI-only signal, set
-	// after plan identity is finalized and deliberately excluded from plan
-	// identity hashing, like the substitution and inventory hints beside it.
-	DeliveryChange *DeliveryChangeV3 `json:"delivery_change,omitempty"`
-	// EffectiveVirtualURI is the provider-neutral virtual:// candidate URI the
-	// planner selected and probed when it substituted a real candidate for a
-	// neutral catalog row. UI-only: clients use it to keep the version menu in
-	// sync with the version that actually played. It is deliberately excluded
-	// from plan identity hashing, like the inventory fields above.
-	EffectiveVirtualURI string `json:"effective_virtual_uri,omitempty"`
-	// VirtualSourceRevision is an opaque, non-secret revision of the resolved
-	// virtual source media generation. It changes when the planner resolves a
-	// different candidate (a release rotation) and when the track evidence is
-	// repaired under the same candidate, and stays fixed while the same
-	// generation is served, so clients can re-arm source-change recovery on a
-	// rotation even when the published effective_media_file_id and
-	// effective_virtual_uri are unchanged. Its inputs are the provider-neutral
-	// candidate identity (the `?result=` fingerprint) plus the evidence
-	// generation (probe stamp, probe version, canonical track fingerprint) — never a provider
-	// URL, token, or header; the value is a domain-separated SHA-256. Empty
-	// for a non-virtual source. Like EffectiveVirtualURI it is a UI hint and
-	// is deliberately excluded from plan identity hashing.
-	VirtualSourceRevision  string             `json:"virtual_source_revision,omitempty"`
-	Source                 SourceDescriptorV3 `json:"source"`
-	SubtitleFidelityPolicy string             `json:"subtitle_fidelity_policy"`
-	// AudioTracks is the authoritative per-track audio inventory of the
-	// effective source, mirroring the subtitle inventory. Clients should
-	// prefer it over item metadata: after a version fallback the effective
-	// file can differ from the requested catalog row, and only this list
-	// reflects the tracks the plan actually plays. Select a track by echoing an
-	// entry's track_id or selection_index, never by its raw index.
-	AudioTracks []AudioInventoryItemV3 `json:"audio_tracks,omitempty"`
-	// InventoryRevision is an opaque, deterministic revision of the plan's
-	// authoritative audio and subtitle inventories. It advances when the
-	// background probe populates or repairs tracks under a live virtual session.
-	InventoryRevision string `json:"inventory_revision,omitempty"`
-	// InventoryStatus indicates whether the track inventory is "declared"
-	// (placeholder from candidate metadata) or "verified" (probed by ffprobe).
-	InventoryStatus string `json:"inventory_status,omitempty"`
-	// InventoryProvenance qualifies InventoryStatus with the resolver's own
-	// provenance for a virtual source: "verified" (this resolve probed the
-	// served bytes), "declared" (provider metadata only), "pending" (a probe
-	// is deferred), or "failed" (a probe ran and failed, so declared metadata
-	// is served). It is empty for a non-virtual source. InventoryStatus is
-	// inferred from the row's probe stamp alone, which a stale stamp or a
-	// served declared fallback can make look "verified"; this field reports
-	// what the resolve that produced the plan actually did. Like the inventory
-	// fields beside it, it is a UI hint and is deliberately excluded from plan
-	// identity hashing; it never changes selection.
-	InventoryProvenance string `json:"inventory_provenance,omitempty"`
-	// InventoryURL is the relative URL clients can fetch (with ETag/If-None-Match)
-	// to retrieve refreshed audio and subtitle inventories without replanning.
-	InventoryURL string `json:"inventory_url,omitempty"`
-	// TracksPending marks a plan whose audio and subtitle inventory is
-	// deliberately provisional: the first-byte URL was handed back with the
-	// minimal executable recipe (video plus the default audio) and the full
-	// track enumeration is still being probed. It is additive and omitted on a
-	// plan whose inventory is already complete. A client shows its track menu
-	// as loading until the follow-up `inventory_updated` push (or the existing
-	// inventory poll) replaces the provisional list; the value never changes
-	// stream selection or the executable recipe, and it is excluded from plan
-	// identity hashing like the inventory fields beside it.
-	TracksPending bool `json:"tracks_pending,omitempty"`
-}
-
-// PlaybackInventoryV3 is the live audio and subtitle inventory of an active
-// playback session, returned by GET /api/v2/playback/{session_id}/inventory.
-type PlaybackInventoryV3 struct {
-	SessionID         string                    `json:"session_id"`
-	InventoryRevision string                    `json:"inventory_revision"`
-	InventoryStatus   string                    `json:"inventory_status"`
-	AudioTracks       []AudioInventoryItemV3    `json:"audio_tracks"`
-	SubtitleInventory []SubtitleInventoryItemV3 `json:"subtitle_inventory"`
-	// EffectiveMediaFileID is the catalog row the transport is committed to.
-	// It moves when a serve-layer rotation rebinds the session to a sibling
-	// release, so a client polling this endpoint can follow the streamed
-	// version instead of the plan's stale identity. It equals the plan's
-	// effective_media_file_id on an un-rotated session.
-	EffectiveMediaFileID int `json:"effective_media_file_id,omitempty"`
-	// EffectiveVirtualURI is the provider-neutral candidate URI the session is
-	// bound to. Like the plan's effective_virtual_uri it lets a client re-key
-	// its version menu to the release actually being served; unlike the plan it
-	// is read from the live session, so it survives a rotation.
-	EffectiveVirtualURI string `json:"effective_virtual_uri,omitempty"`
-	// VirtualSourceRevision is the opaque media-generation revision the plan
-	// published for the bound candidate. A serve-layer rotation clears it (the
-	// new release is not probed yet), which is itself a signal that the
-	// inventory is declared rather than verified. Empty for a non-virtual
-	// source.
-	VirtualSourceRevision string `json:"virtual_source_revision,omitempty"`
-	// OfferedVirtualURI, when set, names a concrete candidate under the same
-	// neutral key that the row currently offers but the session's transport is
-	// NOT bound to: the pinned candidate vanished from the provider listing and
-	// the transport keeps playing it. The audio and subtitle lists describe that
-	// offered candidate, so a client can show what the row offers now. The bound
-	// candidate is deliberately not repeated: EffectiveVirtualURI stays empty
-	// and EffectiveMediaFileID is the row the session is bound to, so a consumer
-	// can never mistake the offer for the playing identity. It is display-only:
-	// selecting a track from the offered release must go through the explicit
-	// rotation/replan path, and a client that does not know this field falls
-	// back to the playing source's own inventory. Additive; absent on every
-	// ordinary read.
-	OfferedVirtualURI string `json:"offered_virtual_uri,omitempty"`
-}
-
-type inventoryRevisionEnvelope struct {
-	Status      string                    `json:"status"`
-	AudioTracks []AudioInventoryItemV3    `json:"audio_tracks"`
-	Subtitles   []SubtitleInventoryItemV3 `json:"subtitles"`
-	// EffectiveMediaFileID, EffectiveVirtualURI and VirtualSourceRevision name
-	// the effective source. They are omitted for the zero identity, so a plan's
-	// inventory-only revision keeps its historical digest; a live-session
-	// reader supplies them so a rotation to a sibling with an identical track
-	// list still changes the revision (and therefore the ETag).
-	EffectiveMediaFileID  int    `json:"effective_media_file_id,omitempty"`
-	EffectiveVirtualURI   string `json:"effective_virtual_uri,omitempty"`
-	VirtualSourceRevision string `json:"virtual_source_revision,omitempty"`
-}
-
-// InventorySourceIdentityV3 names the effective source an inventory revision
-// describes. The zero value is valid and omits every field from the digest.
-type InventorySourceIdentityV3 struct {
-	EffectiveMediaFileID  int
-	EffectiveVirtualURI   string
-	VirtualSourceRevision string
-}
-
-// ComputeInventoryRevisionV3 returns a deterministic opaque digest of the full
-// audio and subtitle inventories, suitable for ETag generation and inventory
-// caching. It serializes the exact response-visible inventory to canonical JSON
-// before hashing, preventing delimiter collisions and ensuring every field
-// mutation produces a distinct revision. A caller that reads a live session may
-// pass one source identity so the effective version is part of the digest: a
-// rotation to a sibling with an identical inventory then changes the revision
-// instead of returning 304. Callers that only revise a plan's inventory pass no
-// identity and keep the historical digest.
-func ComputeInventoryRevisionV3(status string, audio []AudioInventoryItemV3, subs []SubtitleInventoryItemV3, source ...InventorySourceIdentityV3) string {
-	var identity InventorySourceIdentityV3
-	if len(source) > 0 {
-		identity = source[0]
-	}
-	payload, err := json.Marshal(inventoryRevisionEnvelope{
-		Status:                status,
-		AudioTracks:           audio,
-		Subtitles:             subs,
-		EffectiveMediaFileID:  identity.EffectiveMediaFileID,
-		EffectiveVirtualURI:   identity.EffectiveVirtualURI,
-		VirtualSourceRevision: identity.VirtualSourceRevision,
-	})
-	if err != nil {
-		h := sha256.Sum256([]byte(fmt.Sprintf("%s:%d:%d:%d:%s:%s", status, len(audio), len(subs), identity.EffectiveMediaFileID, identity.EffectiveVirtualURI, identity.VirtualSourceRevision)))
-		return fmt.Sprintf("inv:%x", h[:16])
-	}
-	h := sha256.Sum256(payload)
-	return fmt.Sprintf("inv:%x", h[:16])
-}
-
-// AudioInventoryItemV3 is one selectable audio track of the effective source at
-// its canonical selection ordinal. It mirrors SubtitleInventoryItemV3 so a
-// client selects a track by echoing track_id or selection_index instead of the
-// raw container stream index, which lives in a different domain: index is the
-// absolute ffprobe stream index (video 0, first audio 1, subtitles
-// interleaved), while selection_index is the 0-based inventory position the
-// start/replan request's audio_track_index and audio_track_id must carry.
-type AudioInventoryItemV3 struct {
-	Index         int      `json:"index,omitempty"`
-	Title         string   `json:"title,omitempty"`
-	EmbeddedTitle string   `json:"embedded_title,omitempty"`
-	Language      string   `json:"language,omitempty"`
-	Languages     []string `json:"languages,omitempty"`
-	Codec         string   `json:"codec,omitempty"`
-	Profile       string   `json:"profile,omitempty"`
-	Layout        string   `json:"layout,omitempty"`
-	Channels      int      `json:"channels,omitempty"`
-	Bitrate       int      `json:"bitrate,omitempty"`
-	SampleRate    int      `json:"sample_rate,omitempty"`
-	BitDepth      int      `json:"bit_depth,omitempty"`
-	Default       bool     `json:"default"`
-	// TrackID is the canonical selection identity, file:<id>:audio:<selection_index>.
-	TrackID string `json:"track_id"`
-	// SelectionIndex is this track's 0-based position in the inventory, the
-	// value the selected_tracks.audio identity and the audio_track_index
-	// request field use.
-	SelectionIndex int `json:"selection_index"`
+	PlanAttemptKey         string                 `json:"plan_attempt_key"`
+	SessionID              string                 `json:"session_id,omitempty"`
+	ExpiresAt              string                 `json:"expires_at,omitempty"`
+	Delivery               DeliveryV3             `json:"delivery"`
+	Stream                 StreamV3               `json:"stream"`
+	Timeline               TimelineV3             `json:"timeline"`
+	SelectedTracks         SelectedTracksV3       `json:"selected_tracks"`
+	EffectiveRecipe        EffectiveRecipeV3      `json:"effective_recipe"`
+	Claims                 ValidationClaimsV3     `json:"claims"`
+	Subtitle               SubtitleDecisionV3     `json:"subtitle"`
+	Transformations        []TransformationV3     `json:"transformations"`
+	AppliedQuirks          []AppliedQuirkV3       `json:"applied_quirks"`
+	RuntimeCorrections     []string               `json:"runtime_corrections"`
+	AvailableQualities     []AvailableQualityV3   `json:"available_qualities"`
+	DegradationWarnings    []DegradationWarningV3 `json:"degradation_warnings"`
+	DecisionReason         string                 `json:"decision_reason"`
+	RequestedMediaFileID   int                    `json:"requested_media_file_id"`
+	EffectiveMediaFileID   int                    `json:"effective_media_file_id"`
+	Source                 SourceDescriptorV3     `json:"source"`
+	SubtitleFidelityPolicy string                 `json:"subtitle_fidelity_policy"`
+	// ActiveQuality is the AvailableQualities label this plan delivers, or
+	// empty when it delivers none of them (see activeQualityV3). Published
+	// on /api/v2 only, under FeaturePlanActiveQualityV3.
+	ActiveQuality string `json:"active_quality,omitempty"`
 }
 
 type TerminalV3 struct {
@@ -1526,13 +1362,13 @@ func (r *StartRequestV3) NormalizeAndValidate() ([]DegradationWarningV3, error) 
 	if r.ProgressPersistence == ProgressPersistenceClientV3 && r.StartPosition == nil {
 		return nil, errors.New("start_position is required when progress_persistence is client")
 	}
-	if r.FileSelection == "" {
-		r.FileSelection = FileSelectionAutoV3
-	}
-	if r.FileSelection != FileSelectionAutoV3 && r.FileSelection != FileSelectionExplicitV3 {
-		return nil, errors.New("file_selection is invalid")
+	if err := validateBufferingQualityV3(r.ClientFeatures, r.BandwidthEstimateSource, r.LearnedLimit, r.BandwidthEstimateKbps, r.ObservedThroughputKbps); err != nil {
+		return nil, err
 	}
 	if err := validateOptionalBoundedIntV3(r.BandwidthEstimateKbps, 100, 1_000_000, "bandwidth_estimate_kbps"); err != nil {
+		return nil, err
+	}
+	if err := validateOptionalBoundedIntV3(r.ObservedThroughputKbps, 100, 1_000_000, "observed_throughput_kbps"); err != nil {
 		return nil, err
 	}
 	if err := validateOptionalBoundedIntV3(r.BandwidthCapKbps, 100, 1_000_000, "bandwidth_cap_kbps"); err != nil {
@@ -1636,7 +1472,13 @@ func (r *ReplanRequestV3) Validate() error {
 			return errors.New("invalid local mutation")
 		}
 	}
+	if err := validateBufferingQualityV3(r.ClientFeatures, r.BandwidthEstimateSource, r.LearnedLimit, r.BandwidthEstimateKbps, r.ObservedThroughputKbps); err != nil {
+		return err
+	}
 	if err := validateOptionalBoundedIntV3(r.BandwidthEstimateKbps, 100, 1_000_000, "bandwidth_estimate_kbps"); err != nil {
+		return err
+	}
+	if err := validateOptionalBoundedIntV3(r.ObservedThroughputKbps, 100, 1_000_000, "observed_throughput_kbps"); err != nil {
 		return err
 	}
 	if err := validateOptionalBoundedIntV3(r.BandwidthCapKbps, 100, 1_000_000, "bandwidth_cap_kbps"); err != nil {
@@ -1832,6 +1674,25 @@ func validateCapabilitiesStructureV3(c *ClientCodecCapabilitiesV3, ctx *ClientPl
 		}
 		if err := validateHDRCapabilitiesV3(delivery.HDRDetails); err != nil {
 			return err
+		}
+		if len(delivery.MaxChannelsByCodec) > 32 {
+			return errors.New("delivery capability exceeds supported size")
+		}
+		if len(delivery.MaxChannelsByCodec) > 0 {
+			byCodec := make(map[string]int, len(delivery.MaxChannelsByCodec))
+			for codec, channels := range delivery.MaxChannelsByCodec {
+				codec = normalizeCodecV3(codec)
+				if codec == "" || len(codec) > 64 || channels > 64 {
+					return errors.New("invalid delivery max_channels_by_codec")
+				}
+				// Spellings that name one codec keep the lowest ceiling; a
+				// ceiling beats an unset value (zero or less).
+				if existing, seen := byCodec[codec]; !seen || channels > 0 && (existing <= 0 || channels < existing) {
+					byCodec[codec] = channels
+				}
+			}
+			delivery.MaxChannelsByCodec = byCodec
+			ctx.Deliveries[name] = delivery
 		}
 		for _, values := range [][]string{delivery.Containers, delivery.VideoCodecs, delivery.AudioDecodeCodecs, delivery.AudioPassthroughCodecs, delivery.Features, delivery.ValidatedClaims} {
 			for _, value := range values {
@@ -2217,12 +2078,13 @@ func HasFeatureV3(features []string, wanted string) bool {
 //     seek reanchor must reproduce the frozen plan's artifact exactly.
 //   - hls_subtitle_renditions_v1 decides whether the transcode's stream URL
 //     is a multivariant playlist carrying the subtitle or a media playlist
-//     beside a sidecar. A reused HLS transport keeps the shape it was built
-//     with, so the attempt has to keep the same answer.
+//     beside a sidecar, and hls_remux_subtitle_renditions_v1 the same for a
+//     copy remux. A reused HLS transport keeps the shape it was built with,
+//     so the attempt has to keep the same answer.
 //
 // Stop/start is the explicit boundary for changing any of them.
 func AttemptStickyFeaturesV3() []string {
-	return []string{FeatureHeaderAuthenticatedMediaV3, FeatureAuthorizedMediaOriginsV3, FeatureSoftwareVideoDecodeV3, FeatureSubripSidecarV3, FeatureDefaultAudioReconcileResponseV3, FeatureMarkerThumbnailsV3, FeatureHLSSubtitleRenditionsV3}
+	return []string{FeatureHeaderAuthenticatedMediaV3, FeatureAuthorizedMediaOriginsV3, FeatureSoftwareVideoDecodeV3, FeatureSubripSidecarV3, FeatureMarkerThumbnailsV3, FeatureHLSSubtitleRenditionsV3, FeatureHLSRemuxSubtitleRenditionsV3}
 }
 
 // PinAttemptStickyFeaturesV3 returns requested with every attempt-sticky
@@ -2246,6 +2108,43 @@ func PinAttemptStickyFeaturesV3(requested, negotiated []string) []string {
 		}
 	}
 	return pinned
+}
+
+// PinHLSVariableSubstitutionV3 forces hls_variable_substitution_v1 in
+// requested's hls delivery back to the state the start negotiated. Like the
+// attempt-sticky client features, the playlist form is fixed at start: a
+// reused HLS transport keeps serving the form its session was built with, so
+// a replan must not record or plan a different one. Stop/start is the
+// boundary for changing it.
+//
+// The decision is the feature's presence in the hls delivery's list,
+// whether or not that delivery is currently enabled, because a replan's
+// context replaces the durable request's. A replan that omits the hls
+// delivery keeps the opt-in on a disabled placeholder entry, which plans
+// exactly like an absent one, so a later replan that brings HLS back still
+// gets the form the attempt started with.
+func PinHLSVariableSubstitutionV3(requested *ClientPlaybackContextV3, negotiated StartRequestV3) {
+	pinned := HasFeatureV3(negotiated.ClientPlaybackContext.Deliveries[DeliveryClassHLSV3].Features, FeatureHLSVariableSubstitutionV3)
+	delivery, ok := requested.Deliveries[DeliveryClassHLSV3]
+	if !ok && !pinned {
+		return
+	}
+	if !ok {
+		// The placeholder is persisted, and the schema requires these lists
+		// to be arrays, never null.
+		delivery = DeliveryCapabilityV3{
+			Containers: []string{}, VideoCodecs: []string{}, AudioDecodeCodecs: []string{},
+			AudioPassthroughCodecs: []string{}, ValidatedClaims: []string{}, Transformations: []TransformationV3{},
+		}
+	}
+	delivery.Features = WithoutFeatureV3(delivery.Features, FeatureHLSVariableSubstitutionV3)
+	if pinned {
+		delivery.Features = append(delivery.Features, FeatureHLSVariableSubstitutionV3)
+	}
+	if requested.Deliveries == nil {
+		requested.Deliveries = map[string]DeliveryCapabilityV3{}
+	}
+	requested.Deliveries[DeliveryClassHLSV3] = delivery
 }
 
 func NewTerminalResponseV3(reason, message string, retryable bool) DecisionResponseV3 {
@@ -2275,4 +2174,26 @@ func boundExceedsV3(output, panel int) bool {
 
 func boundExceedsFloatV3(output, panel float64) bool {
 	return panel > 0 && (output == 0 || output > panel)
+}
+
+func validateBufferingQualityV3(features []string, source, limit string, estimate, observed *int) error {
+	if source == "" && limit == "" && observed == nil {
+		return nil
+	}
+	if !HasFeatureV3(features, FeatureBufferingQualityV1) {
+		return errors.New("buffering_quality_v1 is required for buffering quality fields")
+	}
+	if source != "" && source != BandwidthEstimateProbeV3 && source != BandwidthEstimateObservedRebufferV3 {
+		return errors.New("invalid bandwidth_estimate_source")
+	}
+	if source != "" && estimate == nil {
+		return errors.New("bandwidth_estimate_source requires bandwidth_estimate_kbps")
+	}
+	if observed != nil && source != BandwidthEstimateObservedRebufferV3 {
+		return errors.New("observed_throughput_kbps requires bandwidth_estimate_source observed_rebuffer")
+	}
+	if limit != "" && limit != LearnedLimitIgnoreV3 && limit != LearnedLimitClearV3 {
+		return errors.New("invalid learned_limit")
+	}
+	return nil
 }

@@ -4,12 +4,7 @@ import { playerV2Origin } from "../player-v2";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import type { PlayerFileVersion, PlayerPlaybackStateChange, WatchPageProps } from "../types";
-import type { PlayerIndexerRelease, PlayerPlaybackVariant } from "../types";
-import type {
-  PlaybackRealtimeEventEnvelope,
-  PlaybackSourceCommittedPayload,
-} from "../realtime-protocol";
-import type { SubtitleInventoryItemV3 } from "../protocol-v3";
+import type { PlaybackRealtimeEventEnvelope } from "../realtime-protocol";
 import { usePlaybackSession } from "../hooks/usePlaybackSession";
 import { isAdaptationUnavailableReason } from "../playback-errors";
 import { usePlayerConfig } from "../context/PlayerConfigContext";
@@ -19,15 +14,6 @@ import {
 } from "../utils/playableSubtitles";
 import { isOverlayInventoryProvisional } from "../utils/inventoryProvenance";
 import { patchVersionMarkers, resolveActiveVersionMarkers } from "../utils/watchPageMarkers";
-import { buildPublishedSubtitleTracks } from "../utils/subtitleInventory";
-import {
-  buildSubtitleChoiceRequests,
-  sendSubtitleChoiceRequest,
-} from "../utils/subtitleChoicePersistence";
-import {
-  resolveEffectiveVersion,
-  type EffectiveVersionIdentity,
-} from "../utils/resolveEffectiveVersion";
 import { VideoPlayer } from "./VideoPlayer";
 import { fetchWatchDetail } from "@/hooks/queries/items";
 import {
@@ -43,6 +29,7 @@ import { itemKeys } from "@/hooks/queries/keys";
 import { useRealtimeEvents } from "@/components/realtimeEventsContext";
 import { useWatchPlaybackController } from "@/playback/watchPlaybackContext";
 import { useWatchTogetherRoomConnection } from "../hooks/useWatchTogetherRoomConnection";
+import { useTrackChoicePersistence } from "../hooks/useTrackChoicePersistence";
 import { toast } from "sonner";
 
 /**
@@ -310,6 +297,7 @@ function WatchPagePlayer({
   year,
   playbackRequestKey,
   fileId,
+  versionPicked = false,
   libraryId,
   versions,
   versionLiveness = EMPTY_VERSION_LIVENESS,
@@ -330,8 +318,10 @@ function WatchPagePlayer({
   preferredSubtitleTrackSignature,
   subtitleMode,
   showForcedSubtitles,
-  profileLanguage,
   introSkipMode,
+  showMarkerConfidence = false,
+  showMarkerSource = false,
+  bufferingMode = "always",
   autoSkipRecap,
   autoPlayNextPreview,
   canEditMarkers,
@@ -408,7 +398,8 @@ function WatchPagePlayer({
     explicitFileSelection,
     forceRelink,
     !watchTogetherRoomId,
-    subtitleMode,
+    bufferingMode,
+    versionPicked,
   );
 
   const sessionRef = useRef(session);
@@ -563,8 +554,8 @@ function WatchPagePlayer({
   );
 
   const handleSwitchVersion = useCallback(
-    (newFileId: number, currentPosition: number) => {
-      session.switchVersion(newFileId, currentPosition);
+    (newFileId: number, currentPosition: number, onAdopt?: (planRevision?: number) => void) => {
+      session.switchVersion(newFileId, currentPosition, onAdopt);
     },
     [session],
   );
@@ -670,33 +661,7 @@ function WatchPagePlayer({
     refresh();
   }, [refetchTrickplay, session.mediaFileId, trickplayQuery.isError]);
 
-  // Re-key the live session file into the version list whenever it changes.
-  // A start or switch can target a file the current list does not carry, which
-  // leaves `activePlaybackVersion` undefined and makes `activeVersion` (and the
-  // audio menu, duration and chapters that read through it) fall back to
-  // another release's row.
-  useEffect(() => {
-    const liveFileId = session.mediaFileId;
-    if (liveFileId == null) return;
-    setPlaybackVersions((current) =>
-      mergeResolvedLiveVersion(
-        current,
-        liveFileId,
-        { mediaFileId: liveFileId, effectiveVirtualUri: session.effectiveVirtualUri },
-        versions,
-      ),
-    );
-  }, [session.effectiveVirtualUri, session.mediaFileId, versions]);
-
-  // Identity of the current substitution. The dismissal below is scoped to it:
-  // a later rotation to a different effective release re-shows the notice, and
-  // an explicit user switch (which changes the effective identity, and usually
-  // clears the substitution) moves the key too.
-  const substitutionKey = `${session.plan?.requested_media_file_id ?? ""}:${session.mediaFileId ?? ""}:${session.effectiveVirtualUri ?? ""}`;
-  useEffect(() => {
-    setVersionSwapNoticeDismissed(false);
-  }, [substitutionKey]);
-
+  const versionPinned = session.versionPinned;
   const handleEnded = useCallback(() => {
     onEnded?.({
       positionSeconds: session.durationSeconds ?? 0,
@@ -707,33 +672,22 @@ function WatchPagePlayer({
       lastHDR: activePlaybackVersion?.hdr,
       lastCodecVideo: activePlaybackVersion?.codec_video,
       lastEditionKey: activePlaybackVersion?.edition_key,
+      versionPinned: versionPinned(),
     });
-  }, [
-    activePlaybackVersion,
-    fileId,
-    onEnded,
-    session.durationSeconds,
-    session.mediaFileId,
-    session.plan?.requested_media_file_id,
-  ]);
+  }, [activePlaybackVersion, onEnded, session.durationSeconds, session.mediaFileId, versionPinned]);
 
-  // The committed request row changes when the viewer switches version in the
-  // player. Persist it as soon as the server acknowledges the switch: post-roll
-  // close and next-episode navigation do not wait for `onEnded`, so a viewer
-  // who leaves through those controls would otherwise lose the switch.
-  const committedRequestedFileId = session.plan?.requested_media_file_id ?? null;
-  const lastRequestedFileIdRef = useRef(committedRequestedFileId);
-  useEffect(() => {
-    if (lastRequestedFileIdRef.current === committedRequestedFileId) return;
-    lastRequestedFileIdRef.current = committedRequestedFileId;
-    onRequestedVersionChange?.(committedRequestedFileId);
-  }, [committedRequestedFileId, onRequestedVersionChange]);
-
+  const { saveAudioChoice, saveSubtitleChoice } = useTrackChoicePersistence({
+    seriesId: seriesContext?.seriesId ?? contentId,
+    audioTracks,
+    subtitleTracks: playableSubtitles,
+  });
+  // A viewer's audio pick from the player menu: switch now, save for the series.
   const handleSwitchAudio = useCallback(
     (index: number, currentPosition: number) => {
       session.switchAudioTrack(index, currentPosition);
+      saveAudioChoice(index);
     },
-    [session],
+    [saveAudioChoice, session],
   );
 
   const updatePlaybackState = session.updatePlaybackState;
@@ -744,420 +698,6 @@ function WatchPagePlayer({
       onPlaybackStateChange?.(state);
     },
     [onPlaybackStateChange, updatePlaybackState],
-  );
-
-  // Audio is complete once a virtual file has a real multi-track inventory (or
-  // the file is local); subtitles once the plan publishes any inventory.
-  const isVirtualActiveFile = activePlaybackVersion?.container === "virtual";
-
-  const applyAudioInventory = session.applyAudioInventory;
-  const refreshSubtitles = session.refreshSubtitles;
-  const applyInventoryUpdate = session.applyInventoryUpdate;
-
-  /**
-   * Follows the effective version a transport just committed to. The realtime
-   * event is the only signal for a serve-layer rotation, which never publishes
-   * a new plan: adopt the new identity and declared audio inventory, and when
-   * the source actually changed, re-read the subtitle inventory through the
-   * existing refresh path so the subtitle menu follows too.
-   */
-  const applyCommittedSource = session.applyCommittedSource;
-  const handleSourceCommitted = useCallback(
-    (payload: PlaybackSourceCommittedPayload) => {
-      // Compare against the live session identity (which a prior commit event
-      // has already moved), not the plan, so a duplicate delivery is a no-op.
-      const current = sessionRef.current;
-      const identityChanged =
-        (payload.effective_media_file_id != null &&
-          payload.effective_media_file_id !== current.mediaFileId) ||
-        (payload.effective_virtual_uri != null &&
-          payload.effective_virtual_uri !== current.effectiveVirtualUri);
-      applyCommittedSource(
-        {
-          effectiveMediaFileId: payload.effective_media_file_id ?? null,
-          effectiveVirtualUri: payload.effective_virtual_uri ?? null,
-          inventoryStatus: payload.inventory_status ?? null,
-        },
-        payload.audio_tracks ?? [],
-      );
-      // A moved identity needs the subtitle inventory re-read. So does a
-      // verified push against a still-declared subtitle menu: the probe landed
-      // under the same source, and without the replan the menu would keep its
-      // provisional badge and declared list forever.
-      const subtitlesDeclaredBehindVerified =
-        payload.inventory_status === "verified" && current.subtitleInventoryProvisional;
-      if (identityChanged || subtitlesDeclaredBehindVerified) {
-        void refreshSubtitles(playbackPositionRef.current);
-      }
-    },
-    [applyCommittedSource, refreshSubtitles],
-  );
-
-  // Dedicated deferred-inventory polling loop for plans that promised enumeration
-  // on `inventory_url`: polls that endpoint directly with If-None-Match ETag.
-  useEffect(() => {
-    if (
-      !session.sessionId ||
-      !session.mediaFileId ||
-      session.loading ||
-      session.replacing ||
-      !session.inventoryPending ||
-      !session.inventoryUrl
-    ) {
-      return;
-    }
-
-    const sessionId = session.sessionId;
-    const mediaFileId = session.mediaFileId;
-    const inventoryUrl = session.inventoryUrl;
-    let cancelled = false;
-    let completedAttempts = 0;
-    let scheduledAttempts = 0;
-    let timer: number | null = null;
-    const deadline = Date.now() + INVENTORY_REFRESH_DEADLINE_MS;
-
-    const scheduleNextPoll = () => {
-      if (cancelled) return;
-      const current = sessionRef.current;
-      // Mirror the legacy catalog poll's identity guard: a deferred round armed
-      // for one session (or file) must not mark a replacement, and the deferred
-      // round owns a different `inventory_url` when a fresh one re-arms. The live
-      // ref is read here rather than trusted from the closure.
-      if (
-        current.sessionId !== sessionId ||
-        current.mediaFileId !== mediaFileId ||
-        !current.inventoryPending ||
-        current.inventoryUrl !== inventoryUrl
-      ) {
-        return;
-      }
-      if (completedAttempts >= INVENTORY_REFRESH_MAX_ATTEMPTS || Date.now() >= deadline) {
-        // The expected identity lets the shared guard drop a stale timer whose
-        // round was replaced after this callback was armed but before it fired.
-        sessionRef.current.markInventoryExhausted({ sessionId, mediaFileId });
-        return;
-      }
-      const delay = inventoryPollDelayMs(scheduledAttempts, false);
-      if (delay === 0) return;
-      scheduledAttempts += 1;
-      timer = window.setTimeout(() => void poll(), delay);
-    };
-
-    const poll = async () => {
-      let done = false;
-      try {
-        done = await sessionRef.current.pollInventory();
-      } catch {
-        done = false;
-      }
-      if (cancelled) return;
-      completedAttempts += 1;
-      if (!done) scheduleNextPoll();
-    };
-
-    scheduleNextPoll();
-    return () => {
-      cancelled = true;
-      if (timer !== null) window.clearTimeout(timer);
-    };
-  }, [
-    session.inventoryPending,
-    session.inventoryUrl,
-    inventoryRetryNonce,
-    session.loading,
-    session.mediaFileId,
-    session.replacing,
-    session.sessionId,
-  ]);
-
-  // Legacy catalog watch-detail poll for older plans that do not carry inventory_url.
-  useEffect(() => {
-    if (
-      !session.sessionId ||
-      !session.mediaFileId ||
-      session.loading ||
-      session.replacing ||
-      session.inventoryPending
-    ) {
-      return;
-    }
-
-    // A declared (or deferred/failed-probe) inventory is not the source's real
-    // tracks, so keep polling for probe evidence even when the list looks full
-    // or the file is not virtual. The virtual file's single synthesized entry
-    // is the other reason to keep looking.
-    const needsAudio =
-      session.audioInventoryProvisional ||
-      (isVirtualActiveFile && session.planAudioTracks.length <= 1);
-    // Gate on what the menu can actually render, and on whether it is still
-    // declared metadata, not on whether the plan published any entry: a
-    // non-selectable placeholder must not suppress the poll, and a provisional
-    // list must keep polling until a verified one clears the badge.
-    // Gate on the plan's own inventory, not the rendered menu: an empty plan
-    // now shows the watch-detail evidence as a fallback, and the bounded poll
-    // is still the repair that mints real sidecar URLs and permissions.
-    const needsSubtitles =
-      !hasSelectableSessionSubtitles(session.subtitleUrls) || session.subtitleInventoryProvisional;
-    if (!needsAudio && !needsSubtitles) return;
-
-    // This poll is a fresh discovery round. If a previous round (the deferred
-    // `inventory_url` poll, or an earlier legacy round) already spent its budget
-    // and drew the terminal failure, hand the badge to this retry: the menus go
-    // back to "Discovering…" for as long as the catalog fallback is actually
-    // looking, and only its own exhausted budget re-marks the failure. Without
-    // this, the terminal "discovery did not complete" notice would sit beside an
-    // active retry.
-    sessionRef.current.markInventoryRetrying();
-
-    const mediaFileId = session.mediaFileId;
-    const sessionId = session.sessionId;
-    // A serve-layer rotation can move the effective virtual source without
-    // changing the session or the collapsed file id, so the poll must key on
-    // the source identity too. Otherwise a delayed response for source A is
-    // applied as source B's inventory.
-    const effectiveVirtualUri = session.effectiveVirtualUri;
-    let cancelled = false;
-    // Aborts the in-flight catalog read when the poll is torn down — unmount or
-    // a superseding switch that restarts this effect. Without it a slow
-    // response can land after teardown and populate the shared cache with the
-    // outgoing file's inventory.
-    const controller = new AbortController();
-    let completedAttempts = 0;
-    // Counts every scheduled attempt, successful or not, so the early cadence
-    // advances even when requests fail and the completed-attempt cap does not.
-    let scheduledAttempts = 0;
-    let timer: number | null = null;
-    let audioComplete = !needsAudio;
-    let subtitlesComplete = !needsSubtitles;
-    // Absolute wall-clock deadline so an error loop that never completes a
-    // fetch cannot poll past the safety window.
-    const deadline = Date.now() + INVENTORY_REFRESH_DEADLINE_MS;
-
-    const scheduleNextPoll = () => {
-      if (cancelled) return;
-      // Mirror the deferred `inventory_url` poll's identity guard: a timer
-      // armed for one session (or file) must not mark a replacement, and a
-      // deferred round that re-armed while this timer was waiting owns the
-      // inventory now. The live ref is read here rather than trusted from the
-      // closure, so neither a replaced session nor a fresh deferred round is
-      // marked by a stale legacy timer.
-      const current = sessionRef.current;
-      if (
-        current.sessionId !== sessionId ||
-        current.mediaFileId !== mediaFileId ||
-        current.inventoryPending
-      ) {
-        return;
-      }
-      const delay = inventoryPollDelayMs(scheduledAttempts, audioComplete && subtitlesComplete);
-      if (delay === 0) return;
-      // The budget is spent. A catalog read that came back empty is not proof
-      // the probe completed — an unprobed, slow, or failed probe also serves
-      // empty tracks — so the client must not promote the declared inventory to
-      // verified on its own. The badge and the server's declared state stay put
-      // until an authoritative payload carries `inventory_status: "verified"`.
-      if (completedAttempts >= INVENTORY_REFRESH_MAX_ATTEMPTS || Date.now() >= deadline) {
-        // Same contract as the deferred `inventory_url` poll: an exhausted
-        // budget on a still-declared menu is a terminal failure, not an
-        // indefinite "Discovering…". `markInventoryExhausted` only sets the
-        // failure while a menu is still provisional, so a verified list is
-        // never mislabeled. The expected identity lets it drop a stale timer
-        // from a replaced session.
-        sessionRef.current.markInventoryExhausted({ sessionId, mediaFileId });
-        return;
-      }
-      scheduledAttempts += 1;
-      timer = window.setTimeout(() => void poll(), delay);
-    };
-
-    const poll = async () => {
-      // The first attempt must read past the mounted query's stale window: a
-      // payload fetched at page mount would otherwise come back from the cache
-      // without a request, hiding the inventory the probe just persisted.
-      const isFirstAttempt = scheduledAttempts === 1;
-      try {
-        // Key on the *live* session file, not the mount-time request: an
-        // in-player version switch moves `session.mediaFileId` while the
-        // `fileId` prop still names the version the page opened with. A stale
-        // key would keep reading the mount version's inventory (or a cached
-        // payload for it) and never see the newly selected version's probe.
-        const detail = await queryClient.fetchQuery({
-          queryKey: itemKeys.watchDetail(contentId, mediaFileId, libraryId),
-          queryFn: () =>
-            fetchWatchDetail(contentId, mediaFileId, libraryId, { signal: controller.signal }),
-          staleTime: isFirstAttempt ? 0 : WATCH_DETAIL_STALE_TIME_MS,
-        });
-        if (cancelled) return;
-        // Only completed responses count toward the cap; transient fetch
-        // errors are retried without burning the attempt budget.
-        completedAttempts += 1;
-        const current = sessionRef.current;
-        // A version switch or a serve-layer rotation can land while the
-        // request is in flight. If the session no longer targets the
-        // file/session/source we polled for, discard the response silently; the
-        // restarted effect picks up the new target.
-        if (
-          current.mediaFileId !== mediaFileId ||
-          current.sessionId !== sessionId ||
-          current.effectiveVirtualUri !== effectiveVirtualUri
-        ) {
-          return;
-        }
-        // Probe metadata is persisted to the effective candidate row, not the
-        // collapsed virtual row the session id names, so resolve the target the
-        // same way the menus do: effective virtual URI first, collapsed id as
-        // the fallback for ordinary files and older plans.
-        const version = resolveEffectiveVersion(detail.versions, {
-          mediaFileId,
-          effectiveVirtualUri,
-        });
-        if (version) {
-          const nextAudioTracks = version.audio_tracks ?? [];
-          // The menu may replace the plan's inventory when the poll resolved a
-          // different file than the plan names (a virtual candidate vs. the
-          // collapsed row). `applyAudioInventory` owns the replacement, but the
-          // poll decides here whether the attempt found anything: a same-file
-          // list no richer than the plan's keeps the poll running so a later
-          // probe can still expand it.
-          const audioTargetChanged = version.file_id !== current.mediaFileId;
-          // A serve-layer rotation moves the resolved candidate while the
-          // collapsed id stays put, so the version identity has to follow the
-          // same source the inventory does. Only a virtual source carries a
-          // candidate URI; an ordinary version switch moves by id alone and
-          // must leave `effectiveVirtualUri` untouched.
-          const resolvedVirtualUri = isVirtualActiveFile ? version.file_path : undefined;
-          // A changed candidate URI under the same resolved row is an
-          // authoritative identity update even when the catalog list is the
-          // same length; it must not be held to the enrichment guard below.
-          const candidateUriChanged =
-            resolvedVirtualUri !== undefined && resolvedVirtualUri !== current.effectiveVirtualUri;
-          // A declared (provisional) list is upgraded by the catalog's probed
-          // list even when that list is shorter; an already-verified list still
-          // only accepts a strict superset so a poorer row cannot shrink it.
-          if (
-            nextAudioTracks.length > 0 &&
-            (audioTargetChanged ||
-              candidateUriChanged ||
-              current.audioInventoryProvisional ||
-              nextAudioTracks.length > current.planAudioTracks.length)
-          ) {
-            if (resolvedVirtualUri !== undefined) {
-              applyAudioInventory(nextAudioTracks, version.file_id, resolvedVirtualUri);
-            } else {
-              applyAudioInventory(nextAudioTracks, version.file_id);
-            }
-            audioComplete = true;
-          } else if (candidateUriChanged && resolvedVirtualUri !== undefined) {
-            // Same resolved row, unchanged (possibly empty) list, but the
-            // candidate moved. Re-key the identity without pretending the probe
-            // landed, and keep polling for the new source's inventory.
-            applyAudioInventory(nextAudioTracks, version.file_id, resolvedVirtualUri);
-          }
-          const resolvedSubtitleTracks = version.subtitle_tracks ?? [];
-          // The first-play probe persists its tracks to the resolved candidate
-          // row, which a plan that has not learned `effective_virtual_uri` yet
-          // cannot name: the resolved version is then the collapsed row and
-          // carries nothing. Keep the current-row lookup first so a row with its
-          // own probe inventory wins, then fall back to the first row that
-          // actually carries probed tracks. The candidate fallback is scoped
-          // under that lookup, never instead of it.
-          const currentRowSubtitleTracks =
-            detail.versions.find((candidate) => candidate.file_id === mediaFileId)
-              ?.subtitle_tracks ?? [];
-          const nextSubtitleTracks =
-            resolvedSubtitleTracks.length > 0
-              ? resolvedSubtitleTracks
-              : isVirtualActiveFile
-                ? currentRowSubtitleTracks.length > 0
-                  ? currentRowSubtitleTracks
-                  : (detail.versions.find(
-                      (candidate) => (candidate.subtitle_tracks?.length ?? 0) > 0,
-                    )?.subtitle_tracks ?? [])
-                : resolvedSubtitleTracks;
-          const subtitleMenuIncomplete =
-            !hasSelectableSessionSubtitles(current.subtitleUrls) ||
-            current.subtitleInventoryProvisional;
-          if (subtitleMenuIncomplete && nextSubtitleTracks.length > 0) {
-            // The plan's inventory is empty or still declared; a no-op
-            // track_change replan re-reads it (URLs included) without changing
-            // the A/V transport, so the stream keeps playing. Only a plan that
-            // stops reporting a provisional inventory ends the retry budget: a
-            // replan that lands still-declared evidence leaves the poll running
-            // for the probe that clears the badge, and a transient replan
-            // failure does not spend the budget either.
-            const filled = await refreshSubtitles(playbackPositionRef.current);
-            if (cancelled) return;
-            // A failed replan keeps the budget; a successful one ends it only
-            // once the adopted plan is no longer declared.
-            if (filled && !sessionRef.current.subtitleInventoryProvisional) {
-              subtitlesComplete = true;
-            }
-          }
-        }
-      } catch {
-        // Best effort; a later attempt may still succeed.
-      }
-      scheduleNextPoll();
-    };
-
-    scheduleNextPoll();
-
-    return () => {
-      cancelled = true;
-      controller.abort();
-      if (timer !== null) window.clearTimeout(timer);
-    };
-    // The track counts that gate the poll are read once when it starts. They
-    // are deliberately not dependencies: filling the inventory in must not
-    // restart the attempt budget. The provisional flags are different — a
-    // declared push after a verified one re-marks the menu, and the poll has to
-    // come back to clear it again, so a transition restarts (or single-shots)
-    // the poll.
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- restart the poll on the inventory-identity transitions listed below.
-  }, [
-    applyAudioInventory,
-    applyInventoryUpdate,
-    contentId,
-    inventoryRetryNonce,
-    isVirtualActiveFile,
-    libraryId,
-    queryClient,
-    refreshSubtitles,
-    session.audioInventoryProvisional,
-    session.effectiveVirtualUri,
-    session.inventoryPending,
-    session.loading,
-    session.mediaFileId,
-    session.replacing,
-    session.sessionId,
-    session.subtitleInventoryProvisional,
-  ]);
-
-  /**
-   * Persists an in-player subtitle choice for the whole series.
-   *
-   * buildSubtitleChoiceRequests decides what a pick is worth storing and
-   * where; this only issues the requests. They are independent on purpose: a
-   * failed settings write must not cost the user the track they picked, and a
-   * failed track write must not cost them the language, so each is best effort
-   * on its own rather than one composite request that half-applies.
-   */
-  const handleSubtitleChanged = useCallback(
-    (index: number | null, inventoryTrack?: SubtitleInventoryItemV3) => {
-      const requests = buildSubtitleChoiceRequests({
-        seriesId: seriesContext?.seriesId ?? contentId,
-        index,
-        tracks: playableSubtitles,
-        inventoryTrack,
-        showForcedSubtitles,
-      });
-      for (const request of requests) {
-        void sendSubtitleChoiceRequest(config, request).catch(() => {
-          // Best effort.
-        });
-      }
-    },
-    [config, seriesContext, contentId, playableSubtitles, showForcedSubtitles],
   );
 
   useEffect(() => {
@@ -1605,121 +1145,106 @@ function WatchPagePlayer({
   const activeMarkers = resolveActiveVersionMarkers(selectedVersion);
 
   return (
-    <>
-      {switchingIndicator}
-      {versionSwapNotice}
-      <VideoPlayer
-        contentId={contentId}
-        title={title}
-        year={year}
-        streamUrl={session.streamUrl}
-        plan={session.plan}
-        planRevision={session.planRevision}
-        transportRevision={session.transportRevision}
-        replayRevision={session.replayRevision}
-        browserEngine={session.browserEngine}
-        nativeOriginalSupport={session.nativeOriginalSupport}
-        shouldAutoPlay={session.shouldAutoPlay}
-        replanning={session.replanning}
-        replanningQuality={session.replanningQuality}
-        replacing={session.replacing}
-        pendingSwitchFileId={session.pendingSwitchFileId}
-        replanError={fallingBack ? null : session.error}
-        replanErrorTitle={session.errorTitle}
-        initialSubtitleError={session.initialSubtitleError}
-        sessionId={session.sessionId}
-        selectedVersion={selectedVersion}
-        versions={playbackVersions}
-        indexerReleases={indexerReleaseRows}
-        virtualRanking={virtualRanking}
-        activeFileId={session.mediaFileId}
-        activeVirtualUri={session.effectiveVirtualUri}
-        chapters={activeChapters}
-        trickplay={trickplay}
-        trickplayUpdatedAt={trickplayQuery.dataUpdatedAt}
-        onTrickplayError={handleTrickplayError}
-        onSwitchVersion={watchTogetherRoomId ? undefined : handleSwitchVersion}
-        onSelectAutoVersion={watchTogetherRoomId ? undefined : handleSelectAutoVersion}
-        autoFallback={session.autoFallback}
-        onRefreshVersions={handleRefreshVersions}
-        onCancelRefresh={handleCancelRefresh}
-        subtitleUrls={playableSubtitles}
-        initialPosition={session.initialPosition}
-        onQualitySelect={session.changeQuality}
-        onSubtitleTrackChange={session.changeSubtitleTrack}
-        onPlanFailure={session.recoverFromFailure}
-        onConnectionLost={session.recoverConnection}
-        onRetryConnection={session.retryConnection}
-        onSessionLost={session.reportSessionLost}
-        onSessionGone={session.markSessionGone}
-        onRestartPlayback={session.restartPlayback}
-        onExpediteReconnect={session.expediteReconnect}
-        connectionStatus={session.connectionStatus}
-        connectionErrorTitle={session.connectionErrorTitle}
-        connectionError={session.connectionError}
-        onPlanInvalidated={session.invalidatePlan}
-        onReanchorSeek={session.reanchorSeek}
-        onApplySubtitleTrack={session.applySubtitleTrack}
-        preferredSubtitleLanguage={preferredSubtitleLanguage}
-        preferredSubtitleTrackSignature={preferredSubtitleTrackSignature}
-        subtitleMode={session.initialSubtitleError ? "off" : subtitleMode}
-        showForcedSubtitles={session.initialSubtitleError ? false : showForcedSubtitles}
-        profileLanguage={profileLanguage}
-        intro={activeMarkers.intro}
-        introSkipMode={introSkipMode}
-        credits={activeMarkers.credits}
-        recap={activeMarkers.recap}
-        autoSkipRecap={autoSkipRecap}
-        preview={activeMarkers.preview}
-        markerSegments={selectedVersion?.marker_segments}
-        autoPlayNextPreview={autoPlayNextPreview}
-        canEditMarkers={canEditMarkers}
-        onMarkersEdited={(fileId, markers) =>
-          setPlaybackVersions((current) =>
-            patchVersionMarkers(
-              current,
-              fileId,
-              markers.intro,
-              markers.credits,
-              markers.recap,
-              markers.preview,
-            ),
-          )
-        }
-        duration={selectedDuration}
-        // The session's preference, not the caller's: the server normalizes what
-        // was requested and the menu has to light up whatever it settled on.
-        qualityPreference={session.qualityPreference}
-        seriesContext={seriesContext}
-        onNavigateEpisode={onNavigateEpisode}
-        displayMode={displayMode}
-        onPictureInPictureChange={onPictureInPictureChange}
-        autoEnterPictureInPicture={autoEnterPictureInPicture}
-        onPlaybackStateChange={handlePlaybackStateChange}
-        onPlaybackTransportReady={onPlaybackTransportReady}
-        onFirstFrame={session.reportFirstFrame}
-        seekIntervals={seekIntervals}
-        onRealtimeEvent={handleRealtimeEvent}
-        onRealtimeConnectionStateChange={setRealtimeConnectionState}
-        onExit={onExit}
-        onMinimize={onMinimize}
-        onEnded={handleEnded}
-        onRefreshSubtitles={session.refreshSubtitles}
-        onSourceCommitted={handleSourceCommitted}
-        onInventoryUpdated={session.applyInventoryUpdate}
-        audioTracks={audioTracks}
-        activeAudioIndex={session.audioTrackIndex}
-        onAudioSelect={handleSwitchAudio}
-        audioInventoryProvisional={audioMenuProvisional}
-        subtitleInventoryProvisional={subtitleMenuProvisional}
-        inventoryPending={session.inventoryPending}
-        inventoryFailed={session.inventoryFailed}
-        onRetryInventory={handleRetryInventory}
-        onSubtitleChanged={handleSubtitleChanged}
-        onReturnFromPostRoll={onReturnFromPostRoll}
-        watchTogetherRoomId={watchTogetherRoomId}
-        watchTogetherConnection={watchTogetherConnection}
-      />
-    </>
+    <VideoPlayer
+      title={title}
+      year={year}
+      streamUrl={session.streamUrl}
+      plan={session.plan}
+      planRevision={session.planRevision}
+      browserEngine={session.browserEngine}
+      nativeOriginalSupport={session.nativeOriginalSupport}
+      shouldAutoPlay={session.shouldAutoPlay}
+      replanning={session.replanning}
+      replacing={session.replacing}
+      replanError={fallingBack ? null : session.error}
+      replanErrorTitle={session.errorTitle}
+      sessionId={session.sessionId}
+      selectedVersion={selectedVersion}
+      versions={playbackVersions}
+      activeFileId={session.mediaFileId}
+      chapters={activeChapters}
+      trickplay={trickplay}
+      trickplayUpdatedAt={trickplayQuery.dataUpdatedAt}
+      onTrickplayError={handleTrickplayError}
+      onSwitchVersion={watchTogetherRoomId ? undefined : handleSwitchVersion}
+      subtitleUrls={playableSubtitles}
+      initialPosition={session.initialPosition}
+      onQualitySelect={session.changeQuality}
+      onSubtitleTrackChange={session.changeSubtitleTrack}
+      onPlanFailure={session.recoverFromFailure}
+      onConnectionLost={session.recoverConnection}
+      onRetryConnection={session.retryConnection}
+      connectionStatus={session.connectionStatus}
+      connectionErrorTitle={session.connectionErrorTitle}
+      connectionError={session.connectionError}
+      onPlanInvalidated={session.invalidatePlan}
+      onReanchorSeek={session.reanchorSeek}
+      onApplySubtitleTrack={session.applySubtitleTrack}
+      preferredSubtitleLanguage={preferredSubtitleLanguage}
+      preferredSubtitleTrackSignature={preferredSubtitleTrackSignature}
+      subtitleMode={session.initialSubtitleError ? "off" : subtitleMode}
+      showForcedSubtitles={session.initialSubtitleError ? false : showForcedSubtitles}
+      intro={activeMarkers.intro}
+      introSkipMode={introSkipMode}
+      showMarkerConfidence={showMarkerConfidence}
+      showMarkerSource={showMarkerSource}
+      bufferingMode={bufferingMode}
+      bandwidthCapKbps={maxBitrateKbps}
+      bufferingTitleId={contentId}
+      playbackAttemptId={session.playbackAttemptId}
+      onKeptEstimate={session.setKeptEstimate}
+      onBufferingSummary={(plan, summary, pageEnding) =>
+        session.reportEvent("plan_summary", {
+          adoptionId: plan.adoption_id,
+          diagnostics: { ...summary },
+          keepalive: pageEnding,
+        })
+      }
+      credits={activeMarkers.credits}
+      recap={activeMarkers.recap}
+      autoSkipRecap={autoSkipRecap}
+      preview={activeMarkers.preview}
+      markerSegments={selectedVersion?.marker_segments}
+      autoPlayNextPreview={autoPlayNextPreview}
+      canEditMarkers={canEditMarkers}
+      onMarkersEdited={(fileId, markers) =>
+        setPlaybackVersions((current) =>
+          patchVersionMarkers(
+            current,
+            fileId,
+            markers.intro,
+            markers.credits,
+            markers.recap,
+            markers.preview,
+          ),
+        )
+      }
+      duration={selectedDuration}
+      // The session's preference, not the caller's: the server normalizes what
+      // was requested and the menu has to light up whatever it settled on.
+      qualityPreference={session.qualityPreference}
+      seriesContext={seriesContext}
+      onNavigateEpisode={onNavigateEpisode}
+      displayMode={displayMode}
+      onPictureInPictureChange={onPictureInPictureChange}
+      autoEnterPictureInPicture={autoEnterPictureInPicture}
+      onPlaybackStateChange={handlePlaybackStateChange}
+      onPlaybackTransportReady={onPlaybackTransportReady}
+      seekIntervals={seekIntervals}
+      onFirstFrame={session.reportFirstFrame}
+      onRealtimeEvent={handleRealtimeEvent}
+      onRealtimeConnectionStateChange={setRealtimeConnectionState}
+      onExit={onExit}
+      onMinimize={onMinimize}
+      onEnded={handleEnded}
+      onRefreshSubtitles={session.refreshSubtitles}
+      audioTracks={audioTracks}
+      activeAudioIndex={session.audioTrackIndex}
+      onAudioSelect={handleSwitchAudio}
+      onSubtitleChanged={saveSubtitleChoice}
+      onReturnFromPostRoll={onReturnFromPostRoll}
+      watchTogetherRoomId={watchTogetherRoomId}
+      watchTogetherConnection={watchTogetherConnection}
+    />
   );
 }

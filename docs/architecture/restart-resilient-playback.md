@@ -833,9 +833,11 @@ replanned. Now, when the API relays a remote HLS transcode (native protocol,
 API egress) and cannot reach the session's node, it moves the transcode itself:
 
 - **Trigger.** The relay got no HTTP response: the connection could not be
-  opened (refused, unroutable, DNS failure, dial timeout), or any transport
-  error occurred while the pool already lists the node as unhealthy or no
-  longer pools it. A node that answers with an HTTP error is alive; its answer
+  opened (refused, unroutable, DNS failure, dial timeout), the node left the
+  relay waiting and then did not answer a health probe either (a hung node; see
+  [node failure detection](node-failure-detection.md#hung-nodes)), or any
+  transport error occurred while the pool already lists the node as unhealthy
+  or no longer pools it. A node that answers with an HTTP error is alive; its answer
   is relayed and nothing moves. A dial that failed on this host's own resources
   (out of file descriptors or socket buffers, no local address) says nothing
   about the node and does not count.
@@ -843,6 +845,14 @@ API egress) and cannot reach the session's node, it moves the transcode itself:
   (`Planner.MarkTranscodeNodeUnreachable`), so neither new sessions nor other
   moves select it. The next health sweep overwrites the mark with whatever the
   node answers.
+- **Body failure.** If the node hangs after headers, the same liveness watch
+  runs only while a body read is pending. It ends that read after two missed
+  health probes, or one if the node is already remembered as hung. The relay
+  logs the node and playback session and aborts the partial response, so a
+  chunked client does not mistake it for a complete one. It cannot move a
+  response already sent to the client.
+  On the client's next request, the header watch probes the remembered hung
+  node at once; one missed probe triggers the move described here.
 - **Recipe.** The same recipe the restart paths use: the client's `?st` token
   when it names the session's current transport, otherwise the
   `internal/noderecipe` card stored under the transport id for tokenless
@@ -883,8 +893,29 @@ API egress) and cannot reach the session's node, it moves the transcode itself:
   in case it is only unreachable from here; a failed stop is logged as a
   warning, and the node's idle reaper ends a job that still runs. A stored node
   recipe follows the transport to its new node, written after that stop
-  because a node deletes a transport's stored recipe when it stops it; a
-  candidate's rollback stop restores the card for the same reason.
+  because a node deletes a transport's stored recipe when it stops it. A node
+  keeps a card whose `stream_nodes` row id and route URL both differ from its
+  own (`playback.RecipeExecutor.NamesAnotherNode`), reading and deleting in one
+  Redis transaction (`noderecipe.Store.DeleteUnlessMoved`). "Its own" is the
+  identity the node had when it registered the job, since its registration
+  can change while the job runs. A hung node that
+  resumes and runs the stop late, or is force-reloaded while it still holds
+  the job, therefore leaves the new node's card in place. A card it cannot
+  tell apart from its own, such as one without a row id or one written before
+  its URL was edited, is deleted as before, so a stop does not leave its own
+  stopped transport reconstructable. The cost is that a moved transport can
+  still lose its card to such a late stop when its card carries no row id (a
+  session that predates node routing) or when the old node never resolved its
+  registration. A move never lands on the dead node's row,
+  which an operator may have repointed at a replacement process. Nodes built
+  before that check delete whatever card they find, so a candidate's rollback
+  still writes the card back after its stop. A user or admin stop on another
+  API replica does not touch this replica's copy of the session, so these
+  writes also read the session's stream deny marker, uncached, before and
+  after writing. That stop sets the marker before it deletes the card: a write
+  that finds the marker skips, and one that finds it only afterwards deletes
+  the card itself, because the stop's delete already ran. A marker that cannot
+  be read skips a write but never undoes one.
 - **Pacing.** Moves are single-flighted per session
   (`TranscodeManager.RehomeTranscode`), so every request that finds the node
   dead waits on one move, and each remote start holds a `reconstructSem` slot
