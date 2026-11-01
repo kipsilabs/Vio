@@ -178,6 +178,14 @@ type AudioReconcileEntryV3 struct {
 	AnnouncedAt   *time.Time               `json:"announced_at,omitempty"`
 }
 
+// AudioSelectionV3 is the durable start-time audio selection intent stored in an attempt.
+type AudioSelectionV3 struct {
+	Origin            string                         `json:"origin,omitempty"`
+	PreferredLanguage string                         `json:"preferred_language,omitempty"`
+	SeriesSignature   *userstore.AudioTrackSignature `json:"series_signature,omitempty"`
+	SelectedSignature *userstore.AudioTrackSignature `json:"selected_signature,omitempty"`
+}
+
 type AttemptRecordV3 struct {
 	PlaybackAttemptID      string
 	SessionID              string
