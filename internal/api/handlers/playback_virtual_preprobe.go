@@ -1006,16 +1006,21 @@ func (h *PlaybackHandler) runDeferredVirtualProbe(deferred *virtualDeferredProbe
 	// notifications need no drain call here — the dispatcher owns wakeups and
 	// re-checks its map on its own signal and backstop ticker.
 	gate.release()
-	// The durable write committed verified evidence on committed.fileID; run the
-	// shared cold-start default-audio reconciliation against the exact inventory
-	// that write produced — never a reread of the mutable row — with the gate
-	// released so its own catalog/session sweep is not charged to this worker's
-	// slot. It runs BEFORE the overlay is updated so it compares the plan-time
-	// selection against the verified inventory, exactly as the direct and queued
-	// evidence paths do. The probe's binding fence already refuses a superseded
-	// verdict, and the committed carrier is the record of what was written, so an
-	// in-place adoption between the write and this reconcile cannot substitute
-	// another release's tracks into the decision.
+	// A verified outcome carries the exact inventory the session will serve; run
+	// the shared cold-start default-audio reconciliation against that carried
+	// inventory — never a reread of the mutable row — with the gate released so
+	// its own catalog/session sweep is not charged to this worker's slot. The
+	// carrier is either a durable write or a serve whose evidence was
+	// deliberately not written because it only recorded the pin's first
+	// served-size observation (see probeInventoryCarrier); both name the row and
+	// the tracks the session is served, and the reconcile is a session-state
+	// decision rather than a catalog write, so it runs for the carried-but-
+	// unwritten case too. It runs BEFORE the overlay is updated so it compares
+	// the plan-time selection against the verified inventory, exactly as the
+	// direct and queued evidence paths do. The probe's binding fence already
+	// refuses a superseded verdict, and the carrier is the record of what was
+	// verified, so an in-place adoption between the write and this reconcile
+	// cannot substitute another release's tracks into the decision.
 	if outcome == probeOutcomeVerified && committed.committed() {
 		h.reconcileVerifiedDefaultAudioFromCommitted(context.Background(), committed)
 	}

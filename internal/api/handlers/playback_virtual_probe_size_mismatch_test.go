@@ -622,6 +622,149 @@ func TestResolveVirtualPlaybackObservationServeWritesNothing(t *testing.T) {
 	}
 }
 
+// TestFallbackSubstituteProbeGatesOnTheSubstitutesOwnDeclaration pins the
+// stale-source fallback's evidence gate. The fallback adopts a release other
+// than the stale row, so the declared-size baseline must be that substitute's
+// listed size: the stale row's FileSize describes the bytes the session is
+// leaving. Gating against it would admit served bytes that merely match the
+// stale release; gating against the substitute's declaration applies the
+// two-observation rule instead. A first duration-proven size gap serves without
+// persist/adopt/stamp, the confirming serve adopts it, and a genuine mismatch
+// is refused rather than written.
+func TestFallbackSubstituteProbeGatesOnTheSubstitutesOwnDeclaration(t *testing.T) {
+	const (
+		staleURI           = "virtual://movie/tt-fallback-gate?result=stale"
+		substituteURI      = "virtual://movie/tt-fallback-gate?result=substitute"
+		release            = "Movie.2024.2160p.WEB-DL"
+		substituteDeclared = int64(6_330_000_000)
+		served             = int64(5_570_000_000)
+		// The stale row declares exactly the served byte count, so a gate that
+		// wrongly used it as the baseline would admit the substitute at once.
+		staleDeclared = served
+		runtime       = 90
+	)
+	newFixture := func(t *testing.T, probedDuration int) (*PlaybackHandler, *[]models.VirtualFilePersistArgs) {
+		t.Helper()
+		var saved []models.VirtualFilePersistArgs
+		h := &PlaybackHandler{
+			VirtualPlaybackStreamLister: VirtualPlaybackStreamListerFunc(func(context.Context, string, int, string, int) ([]VirtualPlaybackStream, error) {
+				return []VirtualPlaybackStream{{
+					ID: "substitute", URI: substituteURI, FileSize: substituteDeclared,
+					ProviderReleaseName: release, OwnerInstallationID: 5,
+				}}, nil
+			}),
+			VirtualPlaybackResolver: VirtualPlaybackResolverFunc(func(_ context.Context, path string, _ int, _ string, _ int) (string, error) {
+				return "https://93.184.216.34/stream/" + virtualResultCandidateID(path), nil
+			}),
+			VirtualPlaybackSourceProber: func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
+				f.ProbedFormatSize = served
+				f.Duration = probedDuration
+				f.VideoTracks = []models.VideoTrack{{Codec: "hevc", Width: 3840, Height: 2160}}
+				f.AudioTracks = []models.AudioTrack{{Codec: "eac3", Channels: 6, Language: "eng"}}
+				return f, nil
+			},
+			VirtualFileSaver: func(_ context.Context, args models.VirtualFilePersistArgs) (int64, error) {
+				saved = append(saved, args)
+				return 1, nil
+			},
+			ItemLookup: staticRuntimeItemLookup{runtime: runtime},
+		}
+		t.Cleanup(h.StopVirtualEvidence)
+		return h, &saved
+	}
+	staleRow := func() *models.MediaFile {
+		return &models.MediaFile{
+			ID: 700, ContentID: "movie-tt-fallback-gate", FilePath: staleURI,
+			Container: "virtual", VirtualOwnerInstallationID: 5, MediaFolderID: 9,
+			FileSize: staleDeclared,
+		}
+	}
+	run := func(t *testing.T, h *PlaybackHandler) *resolvedVirtualPlaybackSource {
+		t.Helper()
+		return h.fallbackResolveStaleVirtualSource(
+			context.Background(), staleRow(), 1, "profile-1", virtualFallbackEligibility{})
+	}
+
+	t.Run("observation serves without writing", func(t *testing.T) {
+		scanner.ResetVirtualServedSizeSnapshots()
+		t.Cleanup(scanner.ResetVirtualServedSizeSnapshots)
+		h, saved := newFixture(t, 90*60)
+
+		first := run(t, h)
+		if first == nil {
+			t.Fatal("fallback returned nil, want the substitute served")
+		}
+		if !first.EvidenceObservation {
+			t.Fatalf("first serve observation = false, want the pin's first evidence observation")
+		}
+		if first.Provenance != ProbeProvenanceVerified {
+			t.Fatalf("first serve provenance = %q, want %q (served with the probed inventory)",
+				first.Provenance, ProbeProvenanceVerified)
+		}
+		if first.File == nil || first.File.ProbedFormatSize != served {
+			t.Fatalf("first serve file = %+v, want the probed bytes %d", first.File, served)
+		}
+		h.StopVirtualEvidence()
+		if len(*saved) != 0 {
+			t.Fatalf("the recording serve persisted %+v, want no catalog write", *saved)
+		}
+
+		second := run(t, h)
+		if second == nil {
+			t.Fatal("second fallback returned nil, want the confirmed substitute")
+		}
+		if second.EvidenceObservation {
+			t.Fatal("the confirming serve was still an observation")
+		}
+		h.StopVirtualEvidence()
+		if len(*saved) != 1 {
+			t.Fatalf("saved = %+v, want one inventory on the confirming serve", *saved)
+		}
+		if (*saved)[0].AdoptPath != substituteURI || !(*saved)[0].StampProbe {
+			t.Fatalf("saved = %+v, want the substitute adopted and stamped", (*saved)[0])
+		}
+	})
+
+	t.Run("mismatch is refused", func(t *testing.T) {
+		scanner.ResetVirtualServedSizeSnapshots()
+		t.Cleanup(scanner.ResetVirtualServedSizeSnapshots)
+		h, saved := newFixture(t, 10*60) // wrong runtime: the size gap is not excused
+
+		if got := run(t, h); got != nil {
+			t.Fatalf("fallback returned %+v, want nil for a mismatched substitute", got)
+		}
+		h.StopVirtualEvidence()
+		if len(*saved) != 0 {
+			t.Fatalf("the mismatched serve persisted %+v, want no catalog write", *saved)
+		}
+	})
+
+	t.Run("matching declaration still writes", func(t *testing.T) {
+		scanner.ResetVirtualServedSizeSnapshots()
+		t.Cleanup(scanner.ResetVirtualServedSizeSnapshots)
+		h, saved := newFixture(t, 90*60)
+		h.VirtualPlaybackSourceProber = func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
+			f.ProbedFormatSize = substituteDeclared
+			f.Duration = 90 * 60
+			f.VideoTracks = []models.VideoTrack{{Codec: "hevc", Width: 3840, Height: 2160}}
+			f.AudioTracks = []models.AudioTrack{{Codec: "eac3", Channels: 6, Language: "eng"}}
+			return f, nil
+		}
+
+		got := run(t, h)
+		if got == nil {
+			t.Fatal("fallback returned nil, want the matching substitute")
+		}
+		if got.EvidenceObservation {
+			t.Fatal("a size-matching serve was treated as an observation")
+		}
+		h.StopVirtualEvidence()
+		if len(*saved) != 1 || (*saved)[0].AdoptPath != substituteURI {
+			t.Fatalf("saved = %+v, want the substitute adopted", *saved)
+		}
+	})
+}
+
 // TestResolveVirtualPlaybackServedSizeMismatchAdoptsSameReleaseSibling pins the
 // fallback contract: the selected row's probe served a different release, so the
 // same release's second indexer row is probed and adopted, and its verified
