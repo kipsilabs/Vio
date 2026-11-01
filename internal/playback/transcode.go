@@ -4237,7 +4237,11 @@ func (s *TranscodeSession) cleanStaleOutputForRestart(first interface{}, rest ..
 			next = nextRecipe
 		}
 		startSegment, _ := rest[1].(int)
-		if !strings.EqualFold(next.videoCodec, "copy") && previous == next {
+		// Identical emitted recipes can safely reuse retained segments, including
+		// copy-video restarts: absolute numbering keeps them on the same timeline.
+		// Recipe changes must discard the replacement range to avoid wrong-track
+		// or wrong-filter media being served.
+		if previous == next {
 			return false
 		}
 		s.cleanStaleSegments(startSegment)

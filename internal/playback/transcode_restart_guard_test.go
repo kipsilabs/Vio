@@ -56,6 +56,10 @@ func restartRetentionSession(t *testing.T, segments []int, modTime time.Time, la
 			StartSegmentNumber:      0,
 			FFmpegPath:              truePath,
 		},
+		runningRecipe: emittedRecipeOf(TranscodeOpts{
+			OutputDir: dir, TargetCodecVideo: "h264", SegmentDuration: 4,
+			SegmentRetentionSeconds: 20, StartSegmentNumber: 0, FFmpegPath: truePath,
+		}),
 	}, dir
 }
 

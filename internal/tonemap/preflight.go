@@ -488,10 +488,16 @@ func frameMatchesSourceKind(frame preflightFrame, kind SourceKind) bool {
 	// Vio keeps the relaxed compatibility check for other source kinds so
 	// remote and virtual inputs whose decoder omits complete color metadata
 	// can still pass preflight.
-	_, compatible := sourceMetadataCompatibility(kind, SourceMetadata{
+	complete, compatible := sourceMetadataCompatibility(kind, SourceMetadata{
 		ColorRange: frame.ColorRange, ColorPrimaries: frame.ColorPrimaries,
 		ColorTransfer: frame.ColorTransfer, ColorSpace: frame.ColorSpace,
 	})
+	// Full-range PQ conversion preserves the decoded range. An untagged frame
+	// therefore cannot establish which levels the frozen recipe will receive;
+	// accepting it would make the conversion dependent on decoder defaults.
+	if kind == SourcePQFullRange && !complete {
+		return false
+	}
 	return compatible
 }
 
