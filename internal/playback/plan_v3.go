@@ -1834,8 +1834,6 @@ func planVideoTranscodeV3(input PlannerInputV3, base PlanV3, source SourceDescri
 				quality.BitrateKbps = min(quality.BitrateKbps, decoder.MaxBitrateKbps)
 			}
 		}
-	} else {
-		quality = h264BoundedQualityV3(input.Request, quality, source)
 	}
 	if source.DynamicRange != "" && source.DynamicRange != DynamicRangeSDRV3 {
 		base.AvailableQualities = availableQualitiesForRouteV3(input, source)
