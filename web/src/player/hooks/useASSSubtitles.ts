@@ -141,8 +141,13 @@ function isDefinitiveSubtitleStatus(status: number): boolean {
 // (empty bundle, extraction still running). It stops as soon as fonts arrive
 // or a definitive font-less bundle is reported, so it can never poll forever.
 const ASS_FONT_REFRESH_MAX_ATTEMPTS = 3;
-// Backoff between pending-font refresh attempts.
+// Backoff between pending-font refresh attempts. The first retry stays fast
+// (the extraction usually lands within seconds); each consecutive pending
+// answer multiplies it so a slow relay is not hammered while the server-side
+// warm is still streaming the same bundle.
 const ASS_FONT_REFRESH_BACKOFF_MS = 5_000;
+const ASS_FONT_REFRESH_BACKOFF_FACTOR = 3;
+const ASS_FONT_REFRESH_MAX_BACKOFF_MS = 30_000;
 
 /** `url` with the bounded window query the VTT path also uses. */
 function appendSubtitleWindow(url: string, position: number): string {
@@ -486,6 +491,7 @@ export function useASSSubtitles(
     } | null = null;
     let fontBundlePending = false;
     let fontRefreshAttempts = 0;
+    let fontRefreshBackoffMs = ASS_FONT_REFRESH_BACKOFF_MS;
     let fontRefreshTimer: ReturnType<typeof setTimeout> | null = null;
     let fontRefreshController: AbortController | null = null;
 
@@ -561,6 +567,12 @@ export function useASSSubtitles(
           }
           return;
         }
+        // Still extracting: back off so the next poll does not compete with
+        // the server's in-flight warm for relay bandwidth.
+        fontRefreshBackoffMs = Math.min(
+          fontRefreshBackoffMs * ASS_FONT_REFRESH_BACKOFF_FACTOR,
+          ASS_FONT_REFRESH_MAX_BACKOFF_MS,
+        );
       } catch (err) {
         if ((err as Error).name !== "AbortError") {
           console.error(
@@ -572,10 +584,7 @@ export function useASSSubtitles(
         if (fontRefreshController === controller) fontRefreshController = null;
       }
       if (fontBundlePending && fontRefreshAttempts < ASS_FONT_REFRESH_MAX_ATTEMPTS) {
-        fontRefreshTimer = setTimeout(
-          () => void refreshPendingFonts(),
-          ASS_FONT_REFRESH_BACKOFF_MS,
-        );
+        fontRefreshTimer = setTimeout(() => void refreshPendingFonts(), fontRefreshBackoffMs);
       }
     }
 
@@ -583,7 +592,7 @@ export function useASSSubtitles(
       if (cancelled || !fontBundlePending || !activeFontBundleUrl) return;
       if (fontRefreshTimer !== null) return;
       if (fontRefreshAttempts >= ASS_FONT_REFRESH_MAX_ATTEMPTS) return;
-      fontRefreshTimer = setTimeout(() => void refreshPendingFonts(), ASS_FONT_REFRESH_BACKOFF_MS);
+      fontRefreshTimer = setTimeout(() => void refreshPendingFonts(), fontRefreshBackoffMs);
     }
 
     /** Resolve the per-track font state once, reusing it across windows. */
@@ -834,8 +843,9 @@ export function useASSSubtitles(
       busy = true;
       // A window attempt owns the pipeline: a probe that landed mid-attempt
       // could swap the script out from under the commit that is about to
-      // define windowStart/windowEnd.
-      upgradeProbeController?.abort();
+      // define windowStart/windowEnd. Clear the timer too, so the next probe is
+      // armed from the attempt's own commit instead of firing against it.
+      cancelUpgradeProbe();
       attemptStart = start;
       supersededBySeek = false;
       const attemptController = new AbortController();
@@ -974,6 +984,9 @@ export function useASSSubtitles(
             clearTimeout(retryTimer);
             retryTimer = null;
           }
+          // A seek-driven replacement owns the next pipeline; never leave a
+          // whole-track probe scheduled to race it for the same source.
+          cancelUpgradeProbe();
           activeController?.abort();
           pendingStart = target;
         }
@@ -996,6 +1009,19 @@ export function useASSSubtitles(
         upgradeProbeTimer = null;
         void probeWholeTrackUpgrade();
       }, upgradeProbeDelayMs);
+    }
+
+    /**
+     * Drops a scheduled or in-flight whole-track probe. Called whenever an
+     * attempt takes over the pipeline so a probe GET never runs concurrently
+     * with a window (or seek-driven) fetch against the same source.
+     */
+    function cancelUpgradeProbe() {
+      if (upgradeProbeTimer !== null) {
+        clearTimeout(upgradeProbeTimer);
+        upgradeProbeTimer = null;
+      }
+      upgradeProbeController?.abort();
     }
 
     /**

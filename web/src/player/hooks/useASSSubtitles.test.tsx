@@ -1075,6 +1075,63 @@ describe("useASSSubtitles artifact-aware whole-track upgrade", () => {
     }
   });
 
+  it("does not run the upgrade probe while a seek-driven attempt is in flight", async () => {
+    vi.useFakeTimers();
+    const requested: string[] = [];
+    let windowFetches = 0;
+    let seekFetch: ReturnType<typeof deferredResponse> | null = null;
+    vi.mocked(fetch).mockImplementation((input, init) => {
+      const url = String(input);
+      requested.push(url);
+      if (url === germanTrack.url) return Promise.resolve(mockFetchResponse(wholeScript));
+      windowFetches += 1;
+      if (windowFetches === 1) return Promise.resolve(mockWindowedResponse(windowScript));
+      seekFetch = deferredResponse(init);
+      return seekFetch.promise;
+    });
+    const videoRef = makeVideoRef(1);
+    const { unmount } = renderHook(() => useASSSubtitles(videoRef, [germanTrack], 6, false, 0, 0));
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(requested).toHaveLength(1);
+
+      // Schedule the first probe for 30 s, then seek one second before it is
+      // due: the replacement window owns the pipeline and must cancel it.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(29_000);
+      });
+      videoRef.current!.currentTime = 200;
+      videoRef.current!.dispatchEvent(new Event("seeking"));
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(requested).toHaveLength(2);
+      expect(seekFetch).not.toBeNull();
+
+      // Past the original probe deadline: no param-less GET while the seek
+      // window fetch is still in flight.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5_000);
+      });
+      expect(requested.filter((url) => url === germanTrack.url)).toHaveLength(0);
+
+      // Committing the seek window re-arms the probe from its own commit.
+      await act(async () => {
+        seekFetch!.settle(windowScript);
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000);
+      });
+      expect(requested.filter((url) => url === germanTrack.url)).toHaveLength(1);
+    } finally {
+      unmount();
+      vi.useRealTimers();
+    }
+  });
+
   it("keeps windowing a non-abutting still-windowed probe answer at the rate limit", async () => {
     vi.useFakeTimers();
     const requested: string[] = [];
@@ -2048,6 +2105,64 @@ describe("useASSSubtitles pending font bundles", () => {
       });
       expect(fontCalls).toBe(2);
       expect(instances[0]!.renderer.addFonts).toHaveBeenCalledTimes(1);
+    } finally {
+      unmount();
+      vi.useRealTimers();
+    }
+  });
+
+  it("backs off consecutive pending font polls with a cap", async () => {
+    vi.useFakeTimers();
+    const track = { ...attachedFontTrack, font_bundle_url: "/fonts/pending-backoff" };
+    let fontCalls = 0;
+    vi.mocked(fetch).mockImplementation((input) => {
+      const url = String(input);
+      if (url === track.font_bundle_url) {
+        fontCalls += 1;
+        return Promise.resolve(pendingFontBundleResponse());
+      }
+      return Promise.resolve(mockFetchResponse("[Script Info]"));
+    });
+    const videoRef = makeVideoRef();
+    const { unmount } = renderHook(() =>
+      useASSSubtitles(videoRef, [track], track.index, false, 0, 0),
+    );
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      // Initial load, then a fast first retry at 5 s.
+      expect(fontCalls).toBe(1);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5_000);
+      });
+      expect(fontCalls).toBe(2);
+
+      // Consecutive pending answers widen the interval: the next retry is due
+      // 15 s after the previous one, not another 5 s.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5_000);
+      });
+      expect(fontCalls).toBe(2);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10_000);
+      });
+      expect(fontCalls).toBe(3);
+
+      // Third interval is capped at 30 s: still nothing at 40 s, the poll fires
+      // at 50 s, and the attempt budget then stops the loop.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(20_000);
+      });
+      expect(fontCalls).toBe(3);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10_000);
+      });
+      expect(fontCalls).toBe(4);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(60_000);
+      });
+      expect(fontCalls).toBe(4);
     } finally {
       unmount();
       vi.useRealTimers();
