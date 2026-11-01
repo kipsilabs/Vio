@@ -2906,13 +2906,24 @@ func (s *TranscodeSession) generationScopedQuery(rawQuery string) string {
 		return rawQuery
 	}
 	encoded := "sgen=" + url.QueryEscape(token)
-	values, err := url.ParseQuery(rawQuery)
-	if err != nil {
-		return rawQuery + "&" + encoded
+	if rawQuery == "" {
+		return encoded
 	}
-	values.Del(GenerationQueryParam)
-	values.Add(GenerationQueryParam, token)
-	return values.Encode()
+	parts := strings.Split(rawQuery, "&")
+	filtered := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		key, _, _ := strings.Cut(part, "=")
+		if key != GenerationQueryParam {
+			filtered = append(filtered, part)
+		}
+	}
+	if len(filtered) == 0 {
+		return encoded
+	}
+	return strings.Join(filtered, "&") + "&" + encoded
 }
 
 // buildPlaybackManifest is BuildPlaybackManifest for a query manifestQuery
@@ -3560,32 +3571,73 @@ func (s *TranscodeSession) SegmentProgress(time.Time) SegmentProgress {
 	manifestPath := filepath.Join(s.outputDir, "stream.m3u8")
 	manifestInfo, statErr := os.Stat(manifestPath)
 	var timeline manifestTimeline
+	var parseOK bool
 	if statErr == nil {
 		if manifest, err := os.ReadFile(manifestPath); err == nil {
 			if parsed, err := parseManifestTimeline(manifest); err == nil {
 				timeline = parsed
+				parseOK = true
 				progress.HasManifest = true
 				progress.ManifestModTime = manifestInfo.ModTime()
 			}
 		}
 	}
 
-	// FFmpeg numbers segments in order, renames each finished segment into
-	// place (-hls_flags temp_file) before rewriting the playlist to list it,
-	// and lists only its own segments because append_list is not set. The last
-	// listed segment still on disk is therefore both the highest and the most
-	// recently written, so the walk stops there instead of statting every
-	// entry of a playlist that can list 50,000 segments.
-	for i := len(timeline.entries) - 1; i >= 0; i-- {
-		number := timeline.entries[i].number
-		info, err := os.Stat(filepath.Join(s.outputDir, segmentFilename(number, opts)))
-		if err != nil || info.Size() <= 0 {
-			continue
+	if parseOK {
+		for _, entry := range timeline.entries {
+			segmentPath := filepath.Join(s.outputDir, segmentFilename(entry.number, opts))
+			info, err := os.Stat(segmentPath)
+			if err != nil || info.Size() <= 0 {
+				continue
+			}
+			progress.ProducedCount++
+			if entry.number > progress.ProducedHead {
+				progress.ProducedHead = entry.number
+			}
+			if info.ModTime().After(progress.LastProducedAt) {
+				progress.LastProducedAt = info.ModTime()
+			}
+			if progress.GenerationStartedAt.IsZero() || !info.ModTime().Before(progress.GenerationStartedAt) {
+				if entry.number > progress.ProducedHeadCurrentGeneration {
+					progress.ProducedHeadCurrentGeneration = entry.number
+				}
+			}
 		}
-		progress.ProducedHead = max(progress.ProducedHead, number)
-		progress.ProducedCount++
-		progress.LastProducedAt = info.ModTime()
-		break
+	} else if s.outputDir != "" {
+		// Fallback: If the manifest is temporarily unreadable or being rewritten
+		// by FFmpeg, scan the output directory for completed segment files so
+		// ProducedHead does not falsely reset to -1.
+		if entries, err := os.ReadDir(s.outputDir); err == nil {
+			for _, entry := range entries {
+				if entry.IsDir() {
+					continue
+				}
+				segNum, err := ParseSegmentNumber(entry.Name())
+				if err != nil || segNum < opts.StartSegmentNumber {
+					continue
+				}
+				info, err := entry.Info()
+				if err != nil || info.Size() <= 0 {
+					continue
+				}
+				progress.ProducedCount++
+				if segNum > progress.ProducedHead {
+					progress.ProducedHead = segNum
+				}
+				if info.ModTime().After(progress.LastProducedAt) {
+					progress.LastProducedAt = info.ModTime()
+				}
+				if progress.GenerationStartedAt.IsZero() || !info.ModTime().Before(progress.GenerationStartedAt) {
+					if segNum > progress.ProducedHeadCurrentGeneration {
+						progress.ProducedHeadCurrentGeneration = segNum
+					}
+				}
+			}
+			if statErr == nil && progress.ProducedCount > 0 {
+				progress.HasManifest = true
+				progress.ManifestModTime = manifestInfo.ModTime()
+			}
+		}
 	}
 	scanActiveTempProgress(s.outputDir, &progress)
 	return progress
@@ -4163,29 +4215,41 @@ func emittedRecipeOf(opts TranscodeOpts) emittedStreamRecipe {
 //
 // It reports whether it cleaned, so callers can log the decision.
 func (s *TranscodeSession) cleanStaleOutputForRestart(first interface{}, rest ...interface{}) bool {
-	var next emittedStreamRecipe
-	var startSegment int
 	switch v := first.(type) {
-	case emittedStreamRecipe:
-		next = v
-		if len(rest) > 0 {
-			startSegment, _ = rest[0].(int)
-		}
 	case TranscodeOpts:
 		if len(rest) < 2 {
 			return false
 		}
-		next = emittedRecipeOf(v)
-		startSegment, _ = rest[1].(int)
-	}
-	s.mu.Lock()
-	previous := s.runningRecipe
-	s.mu.Unlock()
-	if previous == next {
+		previous := emittedRecipeOf(v)
+		var next emittedStreamRecipe
+		if nextOpts, ok := rest[0].(TranscodeOpts); ok {
+			next = emittedRecipeOf(nextOpts)
+		} else if nextRecipe, ok := rest[0].(emittedStreamRecipe); ok {
+			next = nextRecipe
+		}
+		startSegment, _ := rest[1].(int)
+		if !strings.EqualFold(next.videoCodec, "copy") && previous == next {
+			return false
+		}
+		s.cleanStaleSegments(startSegment)
+		return true
+	case emittedStreamRecipe:
+		next := v
+		var startSegment int
+		if len(rest) > 0 {
+			startSegment, _ = rest[0].(int)
+		}
+		s.mu.Lock()
+		previous := s.runningRecipe
+		s.mu.Unlock()
+		if previous == next {
+			return false
+		}
+		s.cleanStaleSegments(startSegment)
+		return true
+	default:
 		return false
 	}
-	s.cleanStaleSegments(startSegment)
-	return true
 }
 
 // Restart kills the current ffmpeg process and starts a new one seeking to
