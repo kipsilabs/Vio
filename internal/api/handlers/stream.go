@@ -109,9 +109,19 @@ type StreamHandler struct {
 	// (a test with a temp dir, a graceful drain) waits on this to keep the warm
 	// from writing into a directory being torn down.
 	subtitleWarmWG sync.WaitGroup
-	SubtitleRepo   subtitles.Repository // optional; enables S3-sourced subtitles
-	S3Client       subtitles.S3Client   // optional; needed for fetching S3 subtitles
-	S3Bucket       string               // bucket for subtitle storage
+	// virtualSubtitleLayoutMu guards virtualSubtitleLayouts, the short-lived
+	// memo of a drift probe's verdict. Windowed playback requests the same
+	// track every couple of minutes; re-probing the live relay layout on each
+	// one costs seconds before the extraction even starts. The memo is keyed by
+	// the pre-probe (CacheIdentity, plan ordinal) and expires after
+	// virtualSubtitleLayoutCacheTTL. Only successful probes are recorded, so a
+	// probe error or a positive mismatch is re-evaluated on every request. The
+	// zero value (nil map) is usable.
+	virtualSubtitleLayoutMu sync.Mutex
+	virtualSubtitleLayouts  map[string]virtualSubtitleLayoutVerdict
+	SubtitleRepo            subtitles.Repository // optional; enables S3-sourced subtitles
+	S3Client                subtitles.S3Client   // optional; needed for fetching S3 subtitles
+	S3Bucket                string               // bucket for subtitle storage
 	// VirtualMediaResolver resolves virtual:// URIs to a real provider URL.
 	// Required for embedded subtitle extraction from virtual sources.
 	VirtualMediaResolver         VirtualMediaResolver
@@ -3759,7 +3769,26 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 			// re-resolving, so a generation-bucket rollover or eviction cannot
 			// turn the validated artifact into an unvalidated source extract.
 			opts.PinnedTextArtifact = &artifact
+		} else if verdict, ok := h.reuseVirtualSubtitleLayout(&opts, time.Now()); ok {
+			// A successful probe for this identity ran seconds ago. The pinned
+			// provider result cannot rotate without changing the identity, so
+			// reuse the mapping it established instead of paying the ffprobe
+			// tax again on every window. Re-key the cache onto the effective
+			// ordinal exactly as the probe path does, so a warm or serve lands
+			// under the mapped identity.
+			planOrdinal := opts.TrackIndex
+			opts.TrackIndex = verdict.trackIndex
+			opts.SourceCodec = verdict.sourceCodec
+			opts.CacheIdentity = playback.VirtualSubtitleCacheIdentity(file.ID, session.VirtualSourceURI, opts.TrackIndex)
+			slog.DebugContext(r.Context(), "virtual subtitle layout probe reused", "component", "api",
+				"file_id", file.ID,
+				"plan_ordinal", planOrdinal,
+				"track", opts.TrackIndex)
 		} else {
+			// The key is captured before the probe: a drift remap changes
+			// opts.TrackIndex, but later requests still arrive with the plan
+			// ordinal.
+			planLayoutKey := virtualSubtitleLayoutKey(opts.CacheIdentity, opts.TrackIndex)
 			proceed, probeErr := h.verifyVirtualSubtitleLayout(r.Context(), track, file.SubtitleTracks, &opts)
 			if !proceed {
 				writeSubtitleSourceChanged(w)
@@ -3780,6 +3809,7 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 				writeSubtitleSourceUnavailable(w)
 				return
 			}
+			h.rememberVirtualSubtitleLayout(planLayoutKey, opts, time.Now())
 			// The probe may have remapped the ordinal; the cache identity must
 			// track the effective map so a remapped extraction lands under its
 			// own key.
@@ -3967,6 +3997,104 @@ func (h *StreamHandler) resolveCommittedTextSubtitleEntry(opts *playback.StreamE
 // override it to keep the release assertion fast.
 var virtualSubtitleWarmResolveTimeout = 2 * time.Minute
 
+// Seek bounds for the detached warm's one-second abort ticker. A text warm may
+// run during playback, so resuming is no longer a cancel signal; a seek and a
+// session end are. Backward movement is unambiguous, so a small tolerance
+// keeps progress-report jitter and a two-second scrub-back from discarding a
+// warm that is still useful. Forward movement is bounded by twice the elapsed
+// wall clock plus slack, which covers 2x playback and sparse progress samples
+// without letting a real seek hide.
+const (
+	virtualSubtitleWarmSeekBackSlack  = 10.0
+	virtualSubtitleWarmSeekAheadSlack = 30.0
+	virtualSubtitleWarmSeekRate       = 2.0
+)
+
+// virtualSubtitleLayoutCacheTTL bounds how long a successful drift-probe
+// verdict is reused for the same (CacheIdentity, plan ordinal). A windowed
+// player asks for the same track roughly every window, and a re-probe costs
+// seconds before extraction starts. Two minutes covers a burst of adjacent
+// window fetches and a client retry cycle; a release rotation changes the
+// pinned result and therefore the identity, so the TTL only hides residual
+// same-candidate change.
+const virtualSubtitleLayoutCacheTTL = 2 * time.Minute
+
+// virtualSubtitleLayoutCacheMaxEntries caps the probe memo. Live entries are
+// identities probed inside the TTL; a long-lived server would otherwise
+// accumulate one per track ever played. Eviction only costs the next request a
+// probe, so the cap is generous.
+const virtualSubtitleLayoutCacheMaxEntries = 4096
+
+// virtualSubtitleLayoutVerdict is the mapping a successful drift probe
+// established for one (CacheIdentity, plan ordinal): the effective live
+// ordinal and codec, which may be the plan values when the layouts matched.
+type virtualSubtitleLayoutVerdict struct {
+	trackIndex  int
+	sourceCodec string
+	verifiedAt  time.Time
+}
+
+// virtualSubtitleLayoutKey is the memo key for a plan ordinal. The identity is
+// derived from the pinned provider result (not the rotating relay URL), so
+// adjacent windows on one release share it.
+func virtualSubtitleLayoutKey(cacheIdentity string, trackIndex int) string {
+	return cacheIdentity + "\x00" + strconv.Itoa(trackIndex)
+}
+
+// reuseVirtualSubtitleLayout returns the verified mapping for this request's
+// plan ordinal when a successful probe for the same identity ran within
+// virtualSubtitleLayoutCacheTTL. Failures are never recorded, so a probe error
+// or a positive mismatch is re-evaluated on every request.
+func (h *StreamHandler) reuseVirtualSubtitleLayout(opts *playback.StreamExtractOpts, now time.Time) (virtualSubtitleLayoutVerdict, bool) {
+	if h == nil || opts == nil || opts.CacheIdentity == "" {
+		return virtualSubtitleLayoutVerdict{}, false
+	}
+	key := virtualSubtitleLayoutKey(opts.CacheIdentity, opts.TrackIndex)
+	h.virtualSubtitleLayoutMu.Lock()
+	defer h.virtualSubtitleLayoutMu.Unlock()
+	verdict, ok := h.virtualSubtitleLayouts[key]
+	if !ok {
+		return virtualSubtitleLayoutVerdict{}, false
+	}
+	if now.Sub(verdict.verifiedAt) > virtualSubtitleLayoutCacheTTL {
+		delete(h.virtualSubtitleLayouts, key)
+		return virtualSubtitleLayoutVerdict{}, false
+	}
+	return verdict, true
+}
+
+// rememberVirtualSubtitleLayout records the mapping a successful probe
+// established for planKey. planKey is the pre-probe key: a remap changes
+// opts.TrackIndex, but later requests still ask with the plan ordinal.
+func (h *StreamHandler) rememberVirtualSubtitleLayout(planKey string, opts playback.StreamExtractOpts, now time.Time) {
+	if h == nil || planKey == "" {
+		return
+	}
+	h.virtualSubtitleLayoutMu.Lock()
+	defer h.virtualSubtitleLayoutMu.Unlock()
+	if h.virtualSubtitleLayouts == nil {
+		h.virtualSubtitleLayouts = make(map[string]virtualSubtitleLayoutVerdict)
+	}
+	if len(h.virtualSubtitleLayouts) >= virtualSubtitleLayoutCacheMaxEntries {
+		for key, verdict := range h.virtualSubtitleLayouts {
+			if now.Sub(verdict.verifiedAt) > virtualSubtitleLayoutCacheTTL {
+				delete(h.virtualSubtitleLayouts, key)
+			}
+		}
+		if len(h.virtualSubtitleLayouts) >= virtualSubtitleLayoutCacheMaxEntries {
+			// Still full of fresh entries: drop the memo rather than grow it
+			// without bound. A dropped verdict only costs the next request a
+			// probe.
+			clear(h.virtualSubtitleLayouts)
+		}
+	}
+	h.virtualSubtitleLayouts[planKey] = virtualSubtitleLayoutVerdict{
+		trackIndex:  opts.TrackIndex,
+		sourceCodec: opts.SourceCodec,
+		verifiedAt:  now,
+	}
+}
+
 // warmVirtualSubtitleAfterWindowMiss starts a detached full-track warm for a
 // windowed virtual subtitle request (text, ASS/SSA, or PGS) that could not be
 // served from the cache. It is called after the window itself has streamed, so
@@ -3982,39 +4110,94 @@ var virtualSubtitleWarmResolveTimeout = 2 * time.Minute
 // on the same serve identity resolve once and demux once, and the registration
 // is released exactly once when the warm settles.
 
-// virtualSubtitleWarmAllowed reports whether a full-track virtual subtitle
-// warm may run now. The session copy on the serve request predates the latest
+// virtualSubtitleWarmSession returns the freshest session copy the warm gate
+// should read. The session copy on the serve request predates the latest
 // progress sample, so prefer the live session when the handler has a manager.
-// A nil manager keeps the copy's state for minimal handlers/tests.
-func (h *StreamHandler) virtualSubtitleWarmAllowed(session *playback.Session) bool {
+// A nil manager keeps the copy's state for minimal handlers/tests. ok is false
+// when the session is gone.
+func (h *StreamHandler) virtualSubtitleWarmSession(session *playback.Session) (*playback.Session, bool) {
 	if session == nil {
-		return false
+		return nil, false
 	}
-	live := session
-	if h.sessionMgr != nil {
-		current, err := h.sessionMgr.GetSession(session.ID)
-		if err != nil || current == nil {
-			return false
-		}
-		live = current
+	if h.sessionMgr == nil {
+		return session, true
 	}
-	return live.IsPaused
+	current, err := h.sessionMgr.GetSession(session.ID)
+	if err != nil || current == nil {
+		return nil, false
+	}
+	return current, true
+}
+
+// virtualSubtitleWarmAllowed returns the live session when a full-track
+// virtual subtitle warm may run now, or nil when it may not. A paused session
+// warms every sidecar class. A playing session warms text (WebVTT/ASS) only:
+// the warm exists to stop every window from re-demuxing a multi-GB relay
+// source, and a text artifact is a few megabytes. Bitmap (PGS) warms stay
+// paused-only — a full-track .sup is tens of megabytes and is never the next
+// thing playback needs.
+func (h *StreamHandler) virtualSubtitleWarmAllowed(session *playback.Session, sourceCodec string) *playback.Session {
+	live, ok := h.virtualSubtitleWarmSession(session)
+	if !ok {
+		return nil
+	}
+	if live.IsPaused {
+		return live
+	}
+	if playback.NeedsBurnIn(sourceCodec) {
+		return nil
+	}
+	return live
+}
+
+// virtualSubtitleWarmCancelReason reports why a detached warm must stop now,
+// or "" to keep going. Because text warms may run while playing, a pause/resume
+// is no longer a cancel condition: the warm stops when its session ends or the
+// playhead jumps away from the position the warm was started at. A seek makes
+// the window that triggered the warm stale; the next windowed miss starts a
+// fresh warm. The forward bound allows twice-normal playback progress plus
+// slack, so ordinary progress-report lag never kills a warm that is otherwise
+// doing the work the cache needs.
+func (h *StreamHandler) virtualSubtitleWarmCancelReason(session *playback.Session, anchorPosition float64, anchorAt, now time.Time) string {
+	live, ok := h.virtualSubtitleWarmSession(session)
+	if !ok || live == nil {
+		return "session ended"
+	}
+	if live.Position < anchorPosition-virtualSubtitleWarmSeekBackSlack {
+		return "seek backward"
+	}
+	elapsed := now.Sub(anchorAt).Seconds()
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	ahead := anchorPosition + virtualSubtitleWarmSeekRate*elapsed + virtualSubtitleWarmSeekAheadSlack
+	if live.Position > ahead {
+		return "seek forward"
+	}
+	return ""
 }
 
 func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(file *models.MediaFile, session *playback.Session, opts playback.StreamExtractOpts, virtualActive bool, requestID string) {
 	if h == nil || h.SubtitleCache == nil || file == nil || session == nil || !virtualActive {
 		return
 	}
-	// A full-track warm is a second read of the remote source. Running it while
-	// the viewer is playing competes with the transcode and with the next
-	// window/seek; the production trace showed a 53 s warm overlapping playback
-	// and ending just before the video source failed. Window slices already
-	// populate the small result cache, so only warm the full track while the
-	// session is paused. A resumed session keeps the window path.
-	if !h.virtualSubtitleWarmAllowed(session) {
-		slog.DebugContext(context.Background(), "virtual subtitle warm skipped: session is playing",
-			"component", "api", "session", session.ID, "file_id", file.ID)
+	// A full-track warm is a second read of the remote source. Text warms are
+	// worth that read even while the viewer is playing: without one, every
+	// 120 s window on a large virtual source re-demuxes the relay input and the
+	// small artifact never appears, so rendering stops once the client's
+	// lookahead runs out. Bitmap (PGS) warms remain paused-only. The warm stays
+	// single-flighted through WarmTrackInBackground (warmSem + beginFill), so a
+	// burst of windows still demuxes once.
+	live := h.virtualSubtitleWarmAllowed(session, opts.SourceCodec)
+	if live == nil {
+		slog.DebugContext(context.Background(), "virtual subtitle warm skipped: session ended or bitmap track while playing",
+			"component", "api", "session", session.ID, "file_id", file.ID, "codec", opts.SourceCodec)
 		return
+	}
+	if !live.IsPaused {
+		slog.InfoContext(context.Background(), "virtual subtitle warm starting during playback",
+			"component", "api", "session", session.ID, "file_id", file.ID,
+			"codec", opts.SourceCodec, "track", opts.TrackIndex)
 	}
 	if opts.CacheIdentity == "" {
 		return
@@ -4053,6 +4236,8 @@ func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(file *models.MediaFil
 			warmCtx, cancelWarm := context.WithCancel(extractCtx)
 			defer cancelWarm()
 			if h.sessionMgr != nil {
+				anchorPosition := live.Position
+				anchorAt := time.Now()
 				go func() {
 					ticker := time.NewTicker(time.Second)
 					defer ticker.Stop()
@@ -4060,8 +4245,10 @@ func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(file *models.MediaFil
 						select {
 						case <-warmCtx.Done():
 							return
-						case <-ticker.C:
-							if !h.virtualSubtitleWarmAllowed(session) {
+						case now := <-ticker.C:
+							if reason := h.virtualSubtitleWarmCancelReason(session, anchorPosition, anchorAt, now); reason != "" {
+								slog.DebugContext(context.Background(), "virtual subtitle warm canceled",
+									"component", "api", "session", session.ID, "file_id", file.ID, "reason", reason)
 								cancelWarm()
 								return
 							}
@@ -4073,6 +4260,12 @@ func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(file *models.MediaFil
 			defer cancel()
 			resolved, resolvedCleanup, err := h.resolveVirtualInputURI(resolveCtx, file, session.UserID, session.ProfileID, false)
 			if err != nil {
+				if warmCtx.Err() != nil {
+					// The abort ticker canceled an in-flight resolve: an
+					// intentional abandonment, not a source failure, and it must
+					// not arm the failure cooldown.
+					return playback.ErrSubtitleWarmCanceled
+				}
 				logVirtualStreamFailure(resolveCtx, session.ID, file, err)
 				return fmt.Errorf("resolve virtual input for subtitle warm: %w", err)
 			}

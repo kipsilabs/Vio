@@ -261,6 +261,101 @@ func TestVirtualTextWindowCommittedEntrySkipsDriftProbe(t *testing.T) {
 	}
 }
 
+// Adjacent windows on the same pinned release share the drift-probe verdict:
+// the first request probes, the next reuses the mapping instead of paying the
+// ffprobe tax again before it can extract. The warm is made to fail so no
+// committed artifact can short-circuit the test through the other skip path.
+func TestVirtualSubtitleDriftProbeReusedWithinTTL(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+	dir := t.TempDir()
+	probeLog := filepath.Join(dir, "ffprobe.log")
+	script := "#!/bin/sh\n" +
+		"case \"$*\" in\n" +
+		"  *-ss*) cat <<'VTT'\n" + warmSubtitleVTT + "VTT\n    ;;\n" +
+		"  *) exit 1 ;;\n" +
+		"esac\n"
+	handler, session, file, _ := newVirtualSubtitleWindowFixture(t, dir, script)
+	writeExecutableScript(t, filepath.Join(dir, "ffprobe"),
+		"#!/bin/sh\necho probe >> '"+probeLog+"'\n"+
+			"printf '%s' '{\"streams\":[{\"index\":0,\"codec_name\":\"subrip\",\"codec_type\":\"subtitle\",\"tags\":{}}]}'\n")
+
+	serve := func(position int) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet,
+			"/subtitle?position="+strconv.Itoa(position)+"&duration=120", nil)
+		rec := httptest.NewRecorder()
+		handler.streamEmbeddedSubtitle(rec, req, file, 0, session, true, "vtt")
+		return rec
+	}
+	for _, position := range []int{100, 220} {
+		if rec := serve(position); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "WEBVTT") {
+			t.Fatalf("window %d: status=%d body=%q", position, rec.Code, rec.Body.String())
+		}
+	}
+	if got := countLogLines(t, probeLog); got != 1 {
+		t.Fatalf("drift probes = %d, want 1 (the second window reuses the verdict)", got)
+	}
+}
+
+// A verdict older than the TTL is dropped, so a long playback revalidates the
+// live layout instead of trusting a mapping forever.
+func TestVirtualSubtitleLayoutReuseExpires(t *testing.T) {
+	handler := &StreamHandler{}
+	opts := &playback.StreamExtractOpts{CacheIdentity: "identity-a", TrackIndex: 0, SourceCodec: "subrip"}
+	verifiedAt := time.Now()
+	handler.rememberVirtualSubtitleLayout(virtualSubtitleLayoutKey(opts.CacheIdentity, opts.TrackIndex),
+		playback.StreamExtractOpts{CacheIdentity: opts.CacheIdentity, TrackIndex: 2, SourceCodec: "ass"}, verifiedAt)
+
+	verdict, ok := handler.reuseVirtualSubtitleLayout(opts, verifiedAt.Add(virtualSubtitleLayoutCacheTTL-time.Second))
+	if !ok || verdict.trackIndex != 2 || verdict.sourceCodec != "ass" {
+		t.Fatalf("verdict inside TTL = %+v ok=%v, want the remapped ordinal", verdict, ok)
+	}
+	if _, ok := handler.reuseVirtualSubtitleLayout(opts, verifiedAt.Add(virtualSubtitleLayoutCacheTTL+time.Second)); ok {
+		t.Fatal("verdict must expire after the TTL")
+	}
+}
+
+// A text warm survives a resume but still stops when the playhead leaves the
+// position the warm was started at, or when the session ends. The abort itself
+// is ErrSubtitleWarmCanceled, which the cache treats as an intentional
+// abandonment rather than a source failure.
+func TestVirtualSubtitleWarmCancelReason(t *testing.T) {
+	manager := playback.NewSessionManager(0, 0)
+	session, err := manager.StartSession(1, "profile-1", 91, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := &StreamHandler{sessionMgr: manager}
+	anchorAt := time.Now()
+	const anchor = 100.0
+	if err := manager.UpdateProgress(session.ID, anchor, false); err != nil {
+		t.Fatal(err)
+	}
+
+	if reason := handler.virtualSubtitleWarmCancelReason(session, anchor, anchorAt, anchorAt.Add(30*time.Second)); reason != "" {
+		t.Fatalf("normal playback canceled the warm: %q", reason)
+	}
+	if err := manager.UpdateProgress(session.ID, anchor+500, false); err != nil {
+		t.Fatal(err)
+	}
+	if reason := handler.virtualSubtitleWarmCancelReason(session, anchor, anchorAt, anchorAt.Add(2*time.Second)); reason != "seek forward" {
+		t.Fatalf("forward-seek reason = %q", reason)
+	}
+	if err := manager.UpdateProgress(session.ID, anchor-60, false); err != nil {
+		t.Fatal(err)
+	}
+	if reason := handler.virtualSubtitleWarmCancelReason(session, anchor, anchorAt, anchorAt.Add(3*time.Second)); reason != "seek backward" {
+		t.Fatalf("backward-seek reason = %q", reason)
+	}
+	if err := manager.StopSession(session.ID); err != nil {
+		t.Fatal(err)
+	}
+	if reason := handler.virtualSubtitleWarmCancelReason(session, anchor, anchorAt, anchorAt.Add(4*time.Second)); reason != "session ended" {
+		t.Fatalf("session-end reason = %q", reason)
+	}
+}
+
 // The window-miss warm keys on the exact ordinal the serve path hands it, so
 // after a drift remap the post-remap identity is what gets populated and the
 // remapped serve path finds it. The start-path warm still keys on the plan
@@ -323,17 +418,19 @@ func TestVirtualTextWindowWarmSkipsNonVirtual(t *testing.T) {
 	}
 }
 
-// A playing session must not start the second full-source read. The window
-// result cache and the client's next window are enough while playback is
-// active; the full-track warm is reserved for the paused path.
-func TestVirtualTextWindowWarmSkipsActivePlayback(t *testing.T) {
+// A playing session may start one detached text warm. Without it, every
+// window on a large virtual source re-demuxes the relay input and the
+// full-track artifact never appears while the viewer keeps watching, so
+// rendering stops when the client's lookahead runs out. Coalescing through
+// WarmTrackInBackground still keeps it single-flighted.
+func TestVirtualTextWindowWarmStartsDuringPlayback(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell script test helper is unix-only")
 	}
 	dir := t.TempDir()
 	argsLog := filepath.Join(dir, "ffmpeg.args")
 	handler, session, file, virtualURI := newVirtualSubtitleWindowFixture(t, dir,
-		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\n")
+		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\ncat <<'VTT'\n"+warmSubtitleVTT+"VTT\n")
 	session.IsPaused = false
 	identity := playback.VirtualSubtitleCacheIdentity(file.ID, virtualURI, 0)
 
@@ -347,8 +444,34 @@ func TestVirtualTextWindowWarmSkipsActivePlayback(t *testing.T) {
 		FFmpegPath:      filepath.Join(dir, "ffmpeg"),
 	}, true, "")
 
+	waitForCommittedTextEntry(t, handler.SubtitleCache, identity, 0, "subrip")
+}
+
+// The text exception is text-only: a bitmap .sup full track is tens of
+// megabytes and stays paused-only, so a playing session never warms it.
+func TestVirtualPGSWindowWarmSkipsActivePlayback(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+	dir := t.TempDir()
+	argsLog := filepath.Join(dir, "ffmpeg.args")
+	handler, session, file, virtualURI := newVirtualSubtitleWindowFixture(t, dir,
+		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\nprintf 'PG'\n")
+	session.IsPaused = false
+	identity := playback.VirtualSubtitleCacheIdentity(file.ID, virtualURI, 0)
+
+	handler.warmVirtualSubtitleAfterWindowMiss(file, session, playback.StreamExtractOpts{
+		InputPath:       "unused",
+		CacheIdentity:   identity,
+		TrackIndex:      0,
+		SourceCodec:     "hdmv_pgs_subtitle",
+		SeekSeconds:     100,
+		DurationSeconds: 120,
+		FFmpegPath:      filepath.Join(dir, "ffmpeg"),
+	}, true, "")
+
 	if _, err := os.Stat(argsLog); !os.IsNotExist(err) {
-		t.Fatalf("no warm should run while the session is playing: %v", err)
+		t.Fatalf("no PGS warm should run while the session is playing: %v", err)
 	}
 }
 
