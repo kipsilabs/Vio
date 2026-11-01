@@ -2703,6 +2703,9 @@ func (s *TranscodeSession) getManifest(currentGeneration bool) ([]byte, error) {
 		if s.running || s.restarting != nil {
 			return nil, ErrManifestNotReady
 		}
+		if s.cmd == nil && s.waitErr == nil {
+			return data, nil
+		}
 		if s.waitErr != nil {
 			stderr := truncateStderr(s.stderr.String())
 			if stderr != "" {
@@ -5293,6 +5296,9 @@ func (s *TranscodeSession) ReportSegmentDownloadedForGenerationToken(segNum int,
 func (s *TranscodeSession) GenerationToken() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.opts.SessionID == "" {
+		return ""
+	}
 	if s.segmentIncarnation == "" {
 		s.segmentIncarnation = uuid.NewString()
 	}

@@ -86,6 +86,10 @@ func writeManifestFixture(t *testing.T, dir, manifest string, files ...string) {
 	if err := os.WriteFile(filepath.Join(dir, "stream.m3u8"), []byte(manifest), 0o644); err != nil {
 		t.Fatalf("write manifest: %v", err)
 	}
+	if len(files) == 0 {
+		autoFiles, _, _, _, _ := manifestStartupFiles([]byte(manifest), 100)
+		files = autoFiles
+	}
 	for _, name := range files {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o644); err != nil {
 			t.Fatalf("write %s: %v", name, err)
