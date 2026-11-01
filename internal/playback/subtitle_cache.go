@@ -1004,7 +1004,7 @@ func (c *SubtitleCache) ServeSUPExtract(w http.ResponseWriter, r *http.Request, 
 // same source writes the same bytes. A request with no usable fill (caching off,
 // or a text batch that writes its file only at the end) extracts for itself.
 func (c *SubtitleCache) streamFullTrack(ctx context.Context, w io.Writer, opts StreamExtractOpts, format string, extract SUPExtractFunc) error {
-	fill, inflight := c.reserveFill(opts.InputPath, opts.TrackIndex, format, true)
+	fill, inflight := c.reserveFill(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, format, true)
 	switch {
 	case fill != nil:
 		// A fill that committed after the caller's lookup already holds the track.
@@ -1444,7 +1444,7 @@ func (c *SubtitleCache) WarmInBackground(opts StreamExtractOpts, extract SUPExtr
 			"input", opts.InputPath, "track", opts.TrackIndex)
 		return
 	}
-	fill, _ := c.reserveFill(opts.InputPath, opts.TrackIndex, subtitleFormatSUP, true)
+	fill, _ := c.reserveFill(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, subtitleFormatSUP, true)
 	if fill == nil {
 		// Another fill (client-driven or a previous warm) is already in
 		// flight, or the cache is unusable — either way, nothing to do.
@@ -1783,8 +1783,8 @@ func (c *SubtitleCache) cachedFormatEntryPath(inputPath, cacheIdentity string, t
 	if dir == "" {
 		return "", time.Time{}, false
 	}
-	src, err := fspath.Stat(inputPath)
-	if err != nil {
+	identity, modTime, size, ok := subtitleCacheSource(inputPath, cacheIdentity, time.Now())
+	if !ok {
 		return "", time.Time{}, false
 	}
 	path = filepath.Join(dir, subtitleCacheFormatKey(identity, trackIndex, modTime, size, format))
@@ -1855,21 +1855,32 @@ func (c *SubtitleCache) BeginFill(inputPath string, trackIndex int) *SubtitleCac
 	return c.beginFill(inputPath, "", trackIndex, subtitleFormatSUP)
 }
 
-func (c *SubtitleCache) beginFill(inputPath string, trackIndex int, format string) *SubtitleCacheFill {
-	fill, _ := c.reserveFill(inputPath, trackIndex, format, false)
+func (c *SubtitleCache) beginFillOrWait(inputPath, cacheIdentity string, trackIndex int, format string) (*SubtitleCacheFill, <-chan struct{}) {
+	fill, busy := c.reserveFill(inputPath, cacheIdentity, trackIndex, format, true)
+	if fill != nil {
+		return fill, nil
+	}
+	if busy != nil {
+		return nil, busy.done
+	}
+	return nil, nil
+}
+
+func (c *SubtitleCache) beginFill(inputPath, cacheIdentity string, trackIndex int, format string) *SubtitleCacheFill {
+	fill, _ := c.reserveFill(inputPath, cacheIdentity, trackIndex, format, false)
 	return fill
 }
 
 // reserveFill reserves the in-flight slot for a track and creates the fill's
 // temp file. When another fill already holds the slot it returns that fill
 // as inflight instead. Both are nil when caching is unavailable.
-func (c *SubtitleCache) reserveFill(inputPath string, trackIndex int, format string, progressive bool) (fill, inflight *SubtitleCacheFill) {
+func (c *SubtitleCache) reserveFill(inputPath, cacheIdentity string, trackIndex int, format string, progressive bool) (fill, inflight *SubtitleCacheFill) {
 	dir := c.dir()
 	if dir == "" {
 		return nil, nil
 	}
-	src, err := fspath.Stat(inputPath)
-	if err != nil {
+	identity, modTime, size, ok := subtitleCacheSource(inputPath, cacheIdentity, time.Now())
+	if !ok {
 		return nil, nil
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -1878,11 +1889,11 @@ func (c *SubtitleCache) reserveFill(inputPath string, trackIndex int, format str
 	}
 	fill = &SubtitleCacheFill{
 		c:           c,
-		key:         subtitleCacheFormatKey(inputPath, trackIndex, src.ModTime(), src.Size(), format),
+		key:         subtitleCacheFormatKey(identity, trackIndex, modTime, size, format),
 		inputPath:   inputPath,
 		trackIndex:  trackIndex,
-		srcMtime:    src.ModTime(),
-		srcSize:     src.Size(),
+		srcMtime:    modTime,
+		srcSize:     size,
 		progressive: progressive,
 		done:        make(chan struct{}),
 		grew:        make(chan struct{}),
@@ -2010,14 +2021,201 @@ func (f *SubtitleCacheFill) endLocked() {
 // does), so copyAndFlush keeps flushing cues to the client in real time. A
 // temp-file write failure never fails the response — the fill is marked
 // failed and the client keeps streaming.
-func (c *SubtitleCache) release(fill *SubtitleCacheFill) {
-	c.mu.Lock()
-	if c.inflight[fill.key] == fill {
-		close(fill.done)
-		delete(c.inflight, fill.key)
-	}
-	c.mu.Unlock()
+func (f *SubtitleCacheFill) Tee(w io.Writer) io.Writer {
+	flusher, _ := w.(http.Flusher)
+	return &subtitleTeeWriter{w: w, flusher: flusher, fill: f}
 }
 
-// join adds a viewer to a progressive fill that is still running. It
-// reports false when the fill cannot be watched.
+type subtitleTeeWriter struct {
+	w       io.Writer
+	flusher http.Flusher
+	fill    *SubtitleCacheFill
+}
+
+func (t *subtitleTeeWriter) Write(p []byte) (int, error) {
+	t.fill.record(p)
+	return t.w.Write(p)
+}
+
+func (t *subtitleTeeWriter) Flush() {
+	if t.flusher != nil {
+		t.flusher.Flush()
+	}
+}
+
+// record appends p to the temp file and wakes the fill's watchers.
+func (f *SubtitleCacheFill) record(p []byte) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failed || f.ended {
+		return
+	}
+	if _, err := f.tmp.Write(p); err != nil {
+		f.failed = true
+		slog.Warn("subtitle cache tee write failed; continuing uncached",
+			"track", f.trackIndex, "error", err)
+	} else {
+		f.written += int64(len(p))
+	}
+	close(f.grew)
+	f.grew = make(chan struct{})
+}
+
+// Commit publishes the temp file as the cache entry: fsync, atomic rename,
+// stale-sibling cleanup, then size-cap eviction. It refuses to publish (and
+// discards instead) when a tee write failed or when the source file changed
+// while the extract ran — a partial or mismatched entry must never be served.
+func (f *SubtitleCacheFill) Commit() error {
+	f.mu.Lock()
+	failed := f.failed
+	f.mu.Unlock()
+	if failed {
+		f.Discard()
+		return errors.New("subtitle cache fill had write errors; discarded")
+	}
+	if src, err := fspath.Stat(f.inputPath); err != nil ||
+		!src.ModTime().Equal(f.srcMtime) || src.Size() != f.srcSize {
+		f.fail(errSubtitleSourceChanged)
+		return errSubtitleSourceChanged
+	}
+	defer f.c.release(f)
+
+	f.mu.Lock()
+	err := f.publishLocked()
+	f.endLocked()
+	f.mu.Unlock()
+	if err != nil {
+		return err
+	}
+
+	dir := filepath.Dir(f.tmp.Name())
+	f.c.removeStaleSiblings(dir, f.inputPath, f.trackIndex, f.key)
+	f.c.evict(dir)
+	return nil
+}
+
+// publishLocked syncs, closes, and renames the temp file into place.
+func (f *SubtitleCacheFill) publishLocked() error {
+	tmpPath := f.tmp.Name()
+	if err := f.tmp.Sync(); err != nil {
+		f.closeAndRemoveTmp()
+		return fmt.Errorf("sync subtitle cache temp: %w", err)
+	}
+	if err := f.tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("close subtitle cache temp: %w", err)
+	}
+	if err := os.Rename(tmpPath, filepath.Join(filepath.Dir(tmpPath), f.key)); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("publish subtitle cache entry: %w", err)
+	}
+	return nil
+}
+
+// Discard abandons the fill: the temp file is removed and the in-flight slot
+// released. Safe to call after a failed Commit (idempotent enough — the temp
+// file is already gone and re-removal is a no-op).
+func (f *SubtitleCacheFill) Discard() {
+	f.mu.Lock()
+	f.closeAndRemoveTmp()
+	f.endLocked()
+	f.mu.Unlock()
+	f.c.release(f)
+}
+
+func (f *SubtitleCacheFill) closeAndRemoveTmp() {
+	_ = f.tmp.Close()
+	if err := os.Remove(f.tmp.Name()); err != nil && !os.IsNotExist(err) {
+		slog.Warn("subtitle cache temp remove failed", "path", f.tmp.Name(), "error", err)
+	}
+}
+
+// removeStaleSiblings deletes committed entries for the same source+track
+// with a different mtime/size suffix — the source was replaced, so those can
+// never be served again.
+func (c *SubtitleCache) removeStaleSiblings(dir, inputPath string, trackIndex int, keepKey string) {
+	prefix := subtitleCacheKeyPrefix(inputPath, trackIndex)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if name == keepKey || !strings.HasPrefix(name, prefix) || filepath.Ext(name) != filepath.Ext(keepKey) {
+			continue
+		}
+		if err := os.Remove(filepath.Join(dir, name)); err != nil && !os.IsNotExist(err) {
+			slog.Warn("subtitle cache stale entry remove failed", "name", name, "error", err)
+		}
+	}
+}
+
+// evict is the scan-on-write LRU pass: when committed entries exceed the
+// byte budget, the oldest-mtime entries are removed until the total fits.
+// It also sweeps orphaned .part temp files older than stalePartMaxAge
+// (crash leftovers). No background daemon — commits are rare enough that a
+// directory scan per commit is cheap.
+func (c *SubtitleCache) evict(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	type cacheEnt struct {
+		path  string
+		size  int64
+		mtime time.Time
+	}
+	var (
+		ents  []cacheEnt
+		total int64
+	)
+	now := time.Now()
+	for _, e := range entries {
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		path := filepath.Join(dir, e.Name())
+		if strings.Contains(e.Name(), ".part-") {
+			if now.Sub(info.ModTime()) > stalePartMaxAge {
+				_ = os.Remove(path)
+			}
+			continue
+		}
+		if !slices.Contains([]string{SubtitleExtPGSV3, SubtitleExtVTTV3, SubtitleExtASSV3, ".srt", "." + subtitleFormatFontBundle}, filepath.Ext(e.Name())) {
+			continue
+		}
+		ents = append(ents, cacheEnt{path: path, size: info.Size(), mtime: info.ModTime()})
+		total += info.Size()
+	}
+	if total <= c.maxBytes {
+		return
+	}
+	slices.SortFunc(ents, func(a, b cacheEnt) int { return a.mtime.Compare(b.mtime) })
+	for _, e := range ents {
+		if total <= c.maxBytes {
+			break
+		}
+		if err := os.Remove(e.path); err != nil {
+			if !os.IsNotExist(err) {
+				slog.Warn("subtitle cache eviction remove failed", "path", e.path, "error", err)
+			}
+			continue
+		}
+		slog.Info("evicted cached subtitle track (LRU)", "path", e.path, "bytes", e.size)
+		total -= e.size
+	}
+}
+
+func subtitleCacheSource(inputPath, cacheIdentity string, now time.Time) (string, time.Time, int64, bool) {
+	if identity := strings.TrimSpace(cacheIdentity); identity != "" {
+		seconds := int64(subtitleCacheGenerationBucket / time.Second)
+		bucket := now.Unix() / seconds
+		return identity, time.Unix(bucket*seconds, 0), 0, true
+	}
+	src, err := os.Stat(inputPath)
+	if err != nil {
+		return "", time.Time{}, 0, false
+	}
+	return inputPath, src.ModTime(), src.Size(), true
+}
