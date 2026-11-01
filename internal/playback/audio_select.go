@@ -303,7 +303,46 @@ func MatchAudioTrackAcrossVersions(
 	if requestedIndex < 0 || requestedIndex >= len(requestedTracks) {
 		requestedIndex = SelectAudioTrack(requestedTracks, "", nil)
 	}
-	return MatchAudioTrack(effectiveTracks, requestedTracks[requestedIndex], requestedIndex)
+	selected := requestedTracks[requestedIndex]
+	signature := AudioTrackSignatureFromTrack(selected)
+	if idx := findExactAudioTrack(effectiveTracks, signature); idx >= 0 {
+		return idx
+	}
+	for _, code := range crossVersionAudioLanguages(selected) {
+		wanted := selected
+		wanted.Language = code
+		candidate := MatchAudioTrack(effectiveTracks, wanted, requestedIndex)
+		if trackHasLanguage(effectiveTracks[candidate], code) {
+			return candidate
+		}
+	}
+	return MatchAudioTrack(effectiveTracks, selected, requestedIndex)
+}
+
+// crossVersionAudioLanguages returns the concrete languages a track carries,
+// primary code first, then its MULTi language list, deduplicated by canonical
+// tag form. The "und"/"mul" sentinels are placeholders and are skipped.
+func crossVersionAudioLanguages(track models.AudioTrack) []string {
+	codes := make([]string, 0, len(track.Languages)+1)
+	if primary := track.Language; !unknownLanguageMembership(primary) {
+		codes = append(codes, primary)
+	}
+	for _, code := range track.Languages {
+		if unknownLanguageMembership(code) {
+			continue
+		}
+		duplicate := false
+		for _, existing := range codes {
+			if lang.CompatibleTag(existing) == lang.CompatibleTag(code) {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			codes = append(codes, code)
+		}
+	}
+	return codes
 }
 
 // MatchAudioTrack returns the track in tracks closest to wanted, a track the
