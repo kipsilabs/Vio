@@ -1785,6 +1785,7 @@ func planVideoTranscodeV3(input PlannerInputV3, base PlanV3, source SourceDescri
 	if terminal := planVideoTranscodeUnavailableV3(input, subtitle, subtitleForcedAdaptation, compatibleRouteExcluded); terminal != nil {
 		return *terminal
 	}
+	quality := ResolveQualityPolicyV3(input.Request, source)
 	targetVideo, toneMapRecipe, terminal := resolveTranscodeVideoTargetV3(input, source, subtitle, subtitleForcedAdaptation)
 	if terminal != nil {
 		return *terminal
@@ -1793,6 +1794,9 @@ func planVideoTranscodeV3(input PlannerInputV3, base PlanV3, source SourceDescri
 	// flat codec lists can describe source copy support without proving the
 	// fMP4 transcode decoder that will receive this recipe. Fall back to the
 	// H.264 floor when either fails.
+	if targetVideo.codec != TargetVideoCodecHEVCV3 {
+		quality = h264BoundedQualityV3(input.Request, quality, source)
+	}
 	if targetVideo.codec == TargetVideoCodecHEVCV3 &&
 		(!input.Settings.AllowHEVCEncoding || !hlsHEVCOutputSupportedV3(input.Request, quality, source)) {
 		targetVideo = targetVideoFloorV3
