@@ -14,6 +14,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/Silo-Server/silo-server/internal/models"
 )
 
 func TestServeExtractTextCacheVariants(t *testing.T) {
@@ -48,6 +50,40 @@ func TestServeExtractTextCacheVariants(t *testing.T) {
 			t.Fatalf("missing %s variant", format)
 		}
 		_ = f.Close()
+	}
+}
+
+// The cache identity carries the row's probed subtitle layout, so an artifact
+// committed against one inventory is not served under another. An unchanged
+// layout keeps the same identity (the cache survives ordinary re-probing);
+// a changed one re-keys it.
+func TestVirtualSubtitleCacheIdentityTracksProbedInventory(t *testing.T) {
+	const uri = "virtual://movie/tt0113277?result=candidate"
+	first := []models.SubtitleTrack{
+		{Index: 0, Language: "eng", Codec: "subrip"},
+		{Index: 1, Language: "fra", Codec: "ass"},
+	}
+	sameLayoutOtherTitles := []models.SubtitleTrack{
+		{Index: 0, Language: "ENG", Codec: "SubRip", Title: "English SDH"},
+		{Index: 1, Language: "fra", Codec: "ass", ContainerTrackID: "9"},
+	}
+	changedLayout := []models.SubtitleTrack{
+		{Index: 0, Language: "fra", Codec: "ass"},
+		{Index: 1, Language: "eng", Codec: "subrip"},
+	}
+
+	base := VirtualSubtitleCacheIdentity(42, uri, 0, SubtitleInventoryToken(first))
+	if got := VirtualSubtitleCacheIdentity(42, uri, 0, SubtitleInventoryToken(sameLayoutOtherTitles)); got != base {
+		t.Fatalf("identity changed for cosmetic metadata: %s vs %s", got, base)
+	}
+	if got := VirtualSubtitleCacheIdentity(42, uri, 0, SubtitleInventoryToken(changedLayout)); got == base {
+		t.Fatal("a changed probed inventory kept the cache identity")
+	}
+	if got := VirtualSubtitleCacheIdentity(42, uri, 1, SubtitleInventoryToken(first)); got == base {
+		t.Fatal("a different track ordinal kept the cache identity")
+	}
+	if got := VirtualSubtitleCacheIdentity(43, uri, 0, SubtitleInventoryToken(first)); got == base {
+		t.Fatal("a different file id kept the cache identity")
 	}
 }
 
