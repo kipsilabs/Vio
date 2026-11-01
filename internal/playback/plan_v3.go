@@ -1602,8 +1602,20 @@ func resolveTranscodeVideoTargetV3(input PlannerInputV3, source SourceDescriptor
 		if sourceKbps := sourceEquivalentKbps(source, transcodeCodecHEVC); sourceKbps > 0 && hevcQuality.BitrateKbps > 0 {
 			hevcQuality.BitrateKbps = min(hevcQuality.BitrateKbps, sourceKbps)
 		}
+		// The HEVC decoder bound is a bitrate bound on the output, not merely
+		// a class-selection hint. Apply it before validating the candidate.
+		for _, decoder := range input.Request.Capabilities.VideoDecode {
+			if strings.EqualFold(decoder.Codec, transcodeCodecHEVC) && decoder.MaxBitrateKbps > 0 {
+				hevcQuality.BitrateKbps = min(hevcQuality.BitrateKbps, decoder.MaxBitrateKbps)
+			}
+		}
 		if hlsHEVCOutputSupportedV3(input.Request, hevcQuality, source) {
 			targetVideoCodec, quality = transcodeCodecHEVC, hevcQuality
+			for _, decoder := range input.Request.Capabilities.VideoDecode {
+				if strings.EqualFold(decoder.Codec, transcodeCodecHEVC) && decoder.MaxBitrateKbps > 0 {
+					quality.BitrateKbps = min(quality.BitrateKbps, decoder.MaxBitrateKbps)
+				}
+			}
 		}
 	}
 	// Decided on the encode the device takes, which an H.264 decoder can hold
@@ -1900,6 +1912,21 @@ func h264BoundedQualityV3(request StartRequestV3, quality QualityResultV3, sourc
 		}
 		return false
 	}
+	// A decoder's class floor determines whether it can take the rendition,
+	// but its actual bitrate bound still applies to the encode.  Do not leave
+	// the quality at the ladder/cap value when the selected decoder advertises
+	// a lower ceiling.
+	boundBitrate := func(width, height, class int) int {
+		limit := 0
+		for _, decoder := range decoders {
+			if takes(decoder, width, height) &&
+				(decoder.MaxBitrateKbps <= 0 || LadderClassForBitrate(decoder.MaxBitrateKbps, source.FrameRate, transcodeCodecH264) >= class) &&
+				(decoder.MaxBitrateKbps > 0 && (limit == 0 || decoder.MaxBitrateKbps > limit)) {
+				limit = decoder.MaxBitrateKbps
+			}
+		}
+		return limit
+	}
 	outputClass := ladderClassForSize(quality.Width, quality.Height)
 	if quality.PreservesSource {
 		// A source-size conversion keeps the class its height earned on the
@@ -1924,6 +1951,9 @@ func h264BoundedQualityV3(request StartRequestV3, quality QualityResultV3, sourc
 				break
 			}
 		}
+	}
+	if limit := boundBitrate(quality.Width, quality.Height, outputClass); limit > 0 {
+		quality.BitrateKbps = min(quality.BitrateKbps, limit)
 	}
 	return quality
 }
