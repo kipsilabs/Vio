@@ -214,7 +214,7 @@ func TestHandleSubtitleFontsDetachedExtractionFailureWarns(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatalf("detached extraction never recorded its failure\n%s", logs.String())
 		}
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond) //nolint:forbidigo // Polls the cache's failure backoff; the detached flight has no completion channel.
 	}
 
 	output := logs.String()
@@ -264,7 +264,7 @@ func TestSubtitleFontsServiceDetachedExtractionFailureWarns(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatalf("detached extraction never recorded its failure\n%s", logs.String())
 		}
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond) //nolint:forbidigo // Polls the cache's failure backoff; the detached flight has no completion channel.
 	}
 
 	output := logs.String()

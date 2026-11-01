@@ -2911,6 +2911,75 @@ func (h *StreamHandler) SubtitleFonts(ctx context.Context, in SubtitleFontReques
 	return items, pending, nil
 }
 
+// cachedFontBundleForRequest serves one admitted ASS track's attached-font
+// bundle through the subtitle cache: disk hit, failure-backoff pending, or a
+// detached single-flight extraction the caller waits on up to
+// fontBundleClientWait. Extracting it keeps fontBundleForRequest within its
+// nesting budget; behavior is unchanged.
+func (h *StreamHandler) cachedFontBundleForRequest(ctx context.Context, session *playback.Session, file *models.MediaFile, trackIndex int, cacheKey playback.FontBundleKey, failKey string, failAttrs []any, resolveInput func(extractCtx context.Context) (string, func(), error)) ([]playback.SubtitleFontBundleItem, bool, error) {
+	if cached, ok := h.SubtitleCache.LookupFontBundle(cacheKey); ok {
+		h.fontExtractFailures.recovered(failKey)
+		var items []playback.SubtitleFontBundleItem
+		if err := json.Unmarshal(cached, &items); err != nil {
+			return nil, false, err
+		}
+		return items, false, nil
+	}
+	// A recent extraction failure is retried only after its backoff. Fonts
+	// are optional to playback, so the request answers the same pending
+	// empty bundle instead of spawning another provider read or ffmpeg.
+	if retryAfter, cooling := h.SubtitleCache.FontBundleRetryAfter(cacheKey); cooling {
+		slog.DebugContext(ctx, "subtitle font bundle extraction in backoff",
+			"component", "api", "file_id", file.ID, "track", trackIndex,
+			"retry_after", retryAfter)
+		return nil, true, nil
+	}
+	bundle, ready, err := h.SubtitleCache.ExtractFontBundleWithin(ctx, cacheKey, fontBundleClientWait, func(extractCtx context.Context) ([]byte, error) {
+		inputPath, releaseInput, resolveErr := resolveInput(extractCtx)
+		if resolveErr != nil {
+			return nil, resolveErr
+		}
+		defer releaseInput()
+		fonts, extractErr := playback.ExtractAttachedSubtitleFonts(extractCtx, inputPath, h.ffmpegPath())
+		if extractErr != nil {
+			// This closure is the only place that sees a failure which
+			// outlives the request that started it: the caller has already
+			// been handed a pending bundle by the time the detached flight
+			// fails.
+			h.logFontBundleExtractFailure(extractCtx, file, trackIndex, extractErr)
+			return nil, extractErr
+		}
+		return json.Marshal(playback.EncodeSubtitleFontBundle(fonts))
+	})
+	if err != nil {
+		if errors.Is(err, errVirtualFontResolve) {
+			logVirtualStreamFailure(ctx, session.ID, file, err)
+			// Provider resolution is a retryable dependency failure; keep
+			// its 502 rather than inventing an empty bundle for a source
+			// that was never read.
+			return nil, false, err
+		}
+		// The extraction closure already logged this failure through the
+		// shared throttle, so repeating it here would only add a duplicate
+		// line for the same target.
+		//
+		// A legitimate ASS track whose optional font bundle could not be
+		// extracted is not a server error: degrade to the pending empty
+		// bundle so the player uses default fonts and re-fetches after the
+		// cache's failure backoff instead of hammering a 500.
+		return nil, true, nil
+	}
+	if !ready {
+		return nil, true, nil
+	}
+	h.fontExtractFailures.recovered(failKey)
+	var items []playback.SubtitleFontBundleItem
+	if err := json.Unmarshal(bundle, &items); err != nil {
+		return nil, false, err
+	}
+	return items, false, nil
+}
+
 // fontBundleForRequest resolves one already-admitted embedded ASS track's
 // attached-font bundle through the warmed cache shared with the v1 route and
 // the playback pre-warm. A cache hit serves immediately; otherwise a detached
@@ -2941,67 +3010,7 @@ func (h *StreamHandler) fontBundleForRequest(ctx context.Context, session *playb
 	}
 
 	if h.SubtitleCache != nil {
-		if cached, ok := h.SubtitleCache.LookupFontBundle(cacheKey); ok {
-			h.fontExtractFailures.recovered(failKey)
-			var items []playback.SubtitleFontBundleItem
-			if err := json.Unmarshal(cached, &items); err != nil {
-				return nil, false, err
-			}
-			return items, false, nil
-		}
-		// A recent extraction failure is retried only after its backoff. Fonts
-		// are optional to playback, so the request answers the same pending
-		// empty bundle instead of spawning another provider read or ffmpeg.
-		if retryAfter, cooling := h.SubtitleCache.FontBundleRetryAfter(cacheKey); cooling {
-			slog.DebugContext(ctx, "subtitle font bundle extraction in backoff",
-				"component", "api", "file_id", file.ID, "track", trackIndex,
-				"retry_after", retryAfter)
-			return nil, true, nil
-		}
-		bundle, ready, err := h.SubtitleCache.ExtractFontBundleWithin(ctx, cacheKey, fontBundleClientWait, func(extractCtx context.Context) ([]byte, error) {
-			inputPath, releaseInput, resolveErr := resolveInput(extractCtx)
-			if resolveErr != nil {
-				return nil, resolveErr
-			}
-			defer releaseInput()
-			fonts, extractErr := playback.ExtractAttachedSubtitleFonts(extractCtx, inputPath, h.ffmpegPath())
-			if extractErr != nil {
-				// This closure is the only place that sees a failure which
-				// outlives the request that started it: the caller has already
-				// been handed a pending bundle by the time the detached flight
-				// fails.
-				h.logFontBundleExtractFailure(extractCtx, file, trackIndex, extractErr)
-				return nil, extractErr
-			}
-			return json.Marshal(playback.EncodeSubtitleFontBundle(fonts))
-		})
-		if err != nil {
-			if errors.Is(err, errVirtualFontResolve) {
-				logVirtualStreamFailure(ctx, session.ID, file, err)
-				// Provider resolution is a retryable dependency failure; keep
-				// its 502 rather than inventing an empty bundle for a source
-				// that was never read.
-				return nil, false, err
-			}
-			// The extraction closure already logged this failure through the
-			// shared throttle, so repeating it here would only add a duplicate
-			// line for the same target.
-			//
-			// A legitimate ASS track whose optional font bundle could not be
-			// extracted is not a server error: degrade to the pending empty
-			// bundle so the player uses default fonts and re-fetches after the
-			// cache's failure backoff instead of hammering a 500.
-			return nil, true, nil
-		}
-		if !ready {
-			return nil, true, nil
-		}
-		h.fontExtractFailures.recovered(failKey)
-		var items []playback.SubtitleFontBundleItem
-		if err := json.Unmarshal(bundle, &items); err != nil {
-			return nil, false, err
-		}
-		return items, false, nil
+		return h.cachedFontBundleForRequest(ctx, session, file, trackIndex, cacheKey, failKey, failAttrs, resolveInput)
 	}
 
 	// No cache configured, or an uncacheable virtual key: extract uncached
