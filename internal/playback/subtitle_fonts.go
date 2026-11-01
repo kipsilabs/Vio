@@ -82,6 +82,12 @@ const (
 	// dump budget is sized against. Production relays run slower than LAN, and
 	// the old flat 30s could not stream a multi-MiB font pack at this rate.
 	subtitleFontDumpBytesPerSecond = 256 << 10 // 256 KiB/s
+	// subtitleFontDumpUnknownStreamBytes is the conservative per-attachment
+	// payload assumed when the probe reports no extradata sizes at all. A relay
+	// that cannot seek the container sometimes omits them, and falling back to
+	// the 30s floor would keep a multi-font pack timing out exactly like the
+	// known-size case this budget exists to fix.
+	subtitleFontDumpUnknownStreamBytes = 4 << 20 // 4 MiB
 	// subtitleFontDumpMaxBudget bounds the scaled dump. It stays under the
 	// detached single-flight's subtitleFontBundleExtractTimeout (5m) so a
 	// pathological pack still yields a real failure instead of outliving the
@@ -90,15 +96,21 @@ const (
 )
 
 // subtitleFontDumpBudget scales the attachment-dump deadline with the payload
-// the probe reported. A small or unknown pack keeps the 30s floor; a multi-MiB
-// pack gets enough time to stream at a conservative relay rate, capped so the
-// extraction always settles inside the detached single-flight budget.
+// the probe reported. A small pack keeps the 30s floor; a multi-MiB pack gets
+// enough time to stream at a conservative relay rate, capped so the extraction
+// always settles inside the detached single-flight budget.
+//
+// When the probe reports no sizes for any attachment, a count-based estimate
+// drives the same scaling instead of leaving every unknown pack on the floor.
 func subtitleFontDumpBudget(streams []attachmentProbeStream) time.Duration {
 	var total int64
 	for _, stream := range streams {
 		if stream.ExtraDataSize > 0 {
 			total += stream.ExtraDataSize
 		}
+	}
+	if total == 0 && len(streams) > 0 {
+		total = int64(len(streams)) * subtitleFontDumpUnknownStreamBytes
 	}
 	budget := subtitleFontDumpBaseBudget
 	if total >= subtitleFontDumpBytesPerSecond {

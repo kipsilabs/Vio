@@ -2024,34 +2024,46 @@ func subtitleCacheSource(inputPath, cacheIdentity string, now time.Time) (string
 }
 
 // FontBundleKey is a stable identity for font-bundle caching. Virtual rows
-// key on the row's probed subtitle inventory plus a generation bucket — not on
-// the pinned result candidate or a resolved relay URL, both of which rotate
-// per registration and would strand warmed bundles under keys requests never
-// ask for. An unchanged inventory keeps its bundle across a rotation (the
-// bytes are the same release), while a re-probe that changes the layout
-// re-keys through the inventory token. Local rows key on the file row's size
-// and mtime so a re-probed or replaced file reads as a miss.
+// key on the release's durable provider identity, the row's probed subtitle
+// inventory, and a generation bucket — not on the pinned result candidate or a
+// resolved relay URL, both of which rotate per registration and would strand
+// warmed bundles under keys requests never ask for.
+//
+// The inventory alone is not enough: a rotated release (or a re-grabbed file
+// behind the same row) can keep an identical subtitle layout while shipping
+// different attached fonts or an edited script, and the bundle would then be
+// served from the previous release for the rest of the bucket. ReleaseIdentity
+// is the provider's durable identity for the release, the same tiers
+// boundRowSharesRelease compares, so a candidate rotation to different bytes
+// re-keys while an unchanged release keeps its warmed bundle. An identity-empty
+// row still keys by file id + inventory + bucket.
+//
+// Local rows key on the file row's size and mtime so a re-probed or replaced
+// file reads as a miss.
 type FontBundleKey struct {
-	FileID         int
-	Virtual        bool
-	InventoryToken string // probed subtitle inventory; "" is a stable layout token
-	Size           int64
-	MtimeUnixNano  int64
-	FFmpegPath     string
+	FileID          int
+	Virtual         bool
+	ReleaseIdentity string // durable provider identity; "" means unknown
+	InventoryToken  string // probed subtitle inventory; "" is a stable layout token
+	Size            int64
+	MtimeUnixNano   int64
+	FFmpegPath      string
 }
 
 // source resolves the stable cache identity and invalidation coordinates for
 // the key, mirroring subtitleCacheSource's two modes. Local rows use the file
 // row's mtime/size verbatim (no generation bucket); virtual rows key on the
-// subtitle inventory plus a generation bucket so a rotated source can never
-// be served past the bucket boundary. A virtual row without a probed inventory
-// still keys by file id + bucket. ok is false for rows that cannot be keyed
-// reliably (a local row without a usable mtime/size), which callers treat as
-// "do not cache" — the same fallback the DV RPU memo uses.
+// release identity and subtitle inventory plus a generation bucket so a
+// rotated source can never be served past the bucket boundary. A virtual row
+// without either identity still keys by file id + bucket. ok is false for rows
+// that cannot be keyed reliably (a local row without a usable mtime/size),
+// which callers treat as "do not cache" — the same fallback the DV RPU memo
+// uses.
 func (k FontBundleKey) source(now time.Time) (identity string, modTime time.Time, size int64, ok bool) {
 	if k.Virtual {
 		bucket := now.Unix() / int64(subtitleCacheGenerationBucket/time.Second)
-		return fontBundleIdentity(k.FileID, k.InventoryToken, k.FFmpegPath, bucket),
+		variant := k.ReleaseIdentity + "\x1f" + k.InventoryToken
+		return fontBundleIdentity(k.FileID, variant, k.FFmpegPath, bucket),
 			time.Unix(bucket*int64(subtitleCacheGenerationBucket/time.Second), 0), 0, true
 	}
 	if k.MtimeUnixNano == 0 || k.Size <= 0 {
@@ -2061,9 +2073,9 @@ func (k FontBundleKey) source(now time.Time) (identity string, modTime time.Time
 }
 
 // fontBundleIdentity hashes the stable components of a font-bundle cache key.
-// variant carries the virtual row's inventory token (empty for local rows).
-// The ffmpeg path is included so a binary relocation (which can change
-// extraction output) starts a fresh cache.
+// variant carries the virtual row's release identity and inventory token
+// (empty for local rows). The ffmpeg path is included so a binary relocation
+// (which can change extraction output) starts a fresh cache.
 func fontBundleIdentity(fileID int, variant, ffmpegPath string, bucket int64) string {
 	sum := sha256.Sum256([]byte(fmt.Sprintf("%d|%s|%s|%d", fileID, variant, ffmpegPath, bucket)))
 	return fmt.Sprintf("%x", sum[:12])

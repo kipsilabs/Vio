@@ -2966,6 +2966,11 @@ func (h *StreamHandler) fontBundleForRequest(ctx context.Context, session *playb
 			defer releaseInput()
 			fonts, extractErr := playback.ExtractAttachedSubtitleFonts(extractCtx, inputPath, h.ffmpegPath())
 			if extractErr != nil {
+				// This closure is the only place that sees a failure which
+				// outlives the request that started it: the caller has already
+				// been handed a pending bundle by the time the detached flight
+				// fails.
+				h.logFontBundleExtractFailure(extractCtx, file, trackIndex, extractErr)
 				return nil, extractErr
 			}
 			return json.Marshal(playback.EncodeSubtitleFontBundle(fonts))
@@ -2978,7 +2983,10 @@ func (h *StreamHandler) fontBundleForRequest(ctx context.Context, session *playb
 				// that was never read.
 				return nil, false, err
 			}
-			h.fontExtractFailures.failed(ctx, failKey, append(failAttrs, "error", err)...)
+			// The extraction closure already logged this failure through the
+			// shared throttle, so repeating it here would only add a duplicate
+			// line for the same target.
+			//
 			// A legitimate ASS track whose optional font bundle could not be
 			// extracted is not a server error: degrade to the pending empty
 			// bundle so the player uses default fonts and re-fetches after the
@@ -3236,14 +3244,11 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 			writeError(w, http.StatusBadGateway, subtitleSourceUnavailableErrorCode, "Failed to resolve virtual source for the subtitle font bundle")
 			return
 		}
-		h.fontExtractFailures.failed(r.Context(), fontExtractFailureKey(file.ID, trackIndex),
-			"file_id", file.ID,
-			"track", trackIndex,
-			"error", err,
-		)
-		// The track is legitimate; the optional font bundle is not. Answer the
-		// pending empty bundle (and let the cache's backoff gate the next
-		// extraction) instead of a 500.
+		// The extraction closure already logged this failure through the shared
+		// throttle, so repeating it here would only add a duplicate line for the
+		// same target. The track is legitimate; the optional font bundle is not.
+		// Answer the pending empty bundle (and let the cache's backoff gate the
+		// next extraction) instead of a 500.
 		writePendingFontBundleResponse(w)
 		return
 	}
@@ -3286,21 +3291,24 @@ var emptyFontBundle = []byte("[]")
 
 // fontBundleCacheKey builds the FontBundleKey for a media file the same way the
 // stream font handler does, and is shared with the playback-time pre-warm so
-// the two can never drift. Virtual rows key on the row's probed subtitle
-// inventory because both the pinned result candidate and the resolved relay URL
-// rotate per registration; an unchanged layout therefore reuses the warmed
-// bundle, while a re-probe with a different layout re-keys. Local rows key on
-// the file row's size and mtime so a re-probed or replaced file reads as a miss.
+// the two can never drift. Virtual rows key on the release's durable provider
+// identity plus the row's probed subtitle inventory because both the pinned
+// result candidate and the resolved relay URL rotate per registration; an
+// unchanged release and layout therefore reuse the warmed bundle, while a
+// rotation to different bytes re-keys even when the subtitle layout is
+// identical. Local rows key on the file row's size and mtime so a re-probed or
+// replaced file reads as a miss.
 func fontBundleCacheKey(file *models.MediaFile, ffmpegPath string) playback.FontBundleKey {
 	if file == nil {
 		return playback.FontBundleKey{FFmpegPath: ffmpegPath}
 	}
 	if isVirtualPlaybackFile(file) {
 		return playback.FontBundleKey{
-			FileID:         file.ID,
-			Virtual:        true,
-			InventoryToken: playback.SubtitleInventoryToken(file.SubtitleTracks),
-			FFmpegPath:     ffmpegPath,
+			FileID:          file.ID,
+			Virtual:         true,
+			ReleaseIdentity: virtualFontReleaseIdentity(file),
+			InventoryToken:  playback.SubtitleInventoryToken(file.SubtitleTracks),
+			FFmpegPath:      ffmpegPath,
 		}
 	}
 	key := playback.FontBundleKey{FileID: file.ID, FFmpegPath: ffmpegPath}
@@ -3309,6 +3317,32 @@ func fontBundleCacheKey(file *models.MediaFile, ffmpegPath string) playback.Font
 		key.MtimeUnixNano = file.FileModifiedAt.UnixNano()
 	}
 	return key
+}
+
+// virtualFontReleaseIdentity serializes a virtual row's durable provider
+// identity in the same tiers boundRowSharesRelease compares: video hash, source
+// GUID, then normalized release name and size. Fonts belong to the release, not
+// to the subtitle layout: a candidate rotation (or a provider re-grab behind
+// the same row) can keep an identical track list while changing the attached
+// font pack or script, so the warmed bundle must not survive it. Every tier the
+// row carries is folded in, and a row that carries none returns "" so the key
+// keeps its historical file+inventory identity rather than inventing one.
+func virtualFontReleaseIdentity(file *models.MediaFile) string {
+	if file == nil {
+		return ""
+	}
+	tiers := resolver.NewPersistedIdentityTiers(
+		file.ProviderVideoHash, file.ProviderGUID, file.ProviderReleaseName, file.ProviderReleaseSize,
+	)
+	if tiers.VideoHash == "" && tiers.GUID == "" && tiers.ReleaseName == "" && tiers.ReleaseSize <= 0 {
+		return ""
+	}
+	return strings.Join([]string{
+		tiers.VideoHash,
+		tiers.GUID,
+		tiers.ReleaseName,
+		strconv.FormatInt(tiers.ReleaseSize, 10),
+	}, "\x1f")
 }
 
 // writeFontBundleResponse writes an encoded font-bundle payload with the

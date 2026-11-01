@@ -138,6 +138,24 @@ func TestExtractFontBundleKeyStability(t *testing.T) {
 	if _, ok := c.LookupFontBundle(FontBundleKey{FileID: 7, FFmpegPath: "/usr/bin/ffmpeg"}); ok {
 		t.Fatal("virtual inventory-less key collided with an unkeyable local key")
 	}
+
+	// A release rotation can keep the probed layout intact while shipping a
+	// different attached-font pack: the row's durable provider identity is the
+	// font-relevant identity, so changing it must re-key even though the
+	// inventory token did not move. An unchanged identity keeps the entry.
+	releaseKey := virtualKey
+	releaseKey.ReleaseIdentity = "hash-a\x1f\x1fMovie.2024.1080p\x1f8000000000"
+	if _, err := c.ExtractFontBundle(t.Context(), releaseKey, extract); err != nil {
+		t.Fatalf("seed release-keyed virtual entry: %v", err)
+	}
+	if _, ok := c.LookupFontBundle(releaseKey); !ok {
+		t.Fatal("same release identity missed")
+	}
+	rotatedRelease := releaseKey
+	rotatedRelease.ReleaseIdentity = "hash-b\x1f\x1fMovie.2024.1080p\x1f8000000000"
+	if _, ok := c.LookupFontBundle(rotatedRelease); ok {
+		t.Fatal("changed release identity with an identical subtitle layout still hit")
+	}
 }
 
 func TestExtractFontBundleSingleFlight(t *testing.T) {

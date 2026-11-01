@@ -172,3 +172,63 @@ func TestFontBundleCacheKeyFollowsInventoryAcrossCandidateRotation(t *testing.T)
 		t.Fatal("ffmpeg relocation kept the font-bundle identity")
 	}
 }
+
+// A candidate rotation that preserves the subtitle layout but moves the
+// release's durable provider identity must re-key the font bundle: the attached
+// fonts belong to the release, not to the track list, so the previous release's
+// warmed bytes must never be served for the new one. A rotation that only moves
+// the provider result id is the same release and keeps its warm. Local rows are
+// unaffected by provider identity.
+func TestFontBundleCacheKeyReKeysOnReleaseRotationWithIdenticalLayout(t *testing.T) {
+	tracks := assTestTracks()
+	file := &models.MediaFile{
+		ID: 42, FilePath: "virtual://movie/tt1?result=cand-a", SubtitleTracks: tracks,
+		ProviderVideoHash: "hash-a", ProviderReleaseName: "Movie.2024.1080p", ProviderReleaseSize: 8_000_000_000,
+	}
+	ffmpegPath := "/usr/bin/ffmpeg"
+	base := fontBundleCacheKey(file, ffmpegPath)
+
+	// Same release, new result id: identical inventory and identity still hit.
+	rotatedID := *file
+	rotatedID.FilePath = "virtual://movie/tt1?result=cand-b"
+	if got := fontBundleCacheKey(&rotatedID, ffmpegPath); got != base {
+		t.Fatalf("identical release and layout re-keyed on candidate rotation: %+v vs %+v", got, base)
+	}
+
+	// Same layout, different release: the provider identity moved, so the
+	// previous bundle must not be served.
+	rotatedRelease := *file
+	rotatedRelease.ProviderVideoHash = "hash-b"
+	if got := fontBundleCacheKey(&rotatedRelease, ffmpegPath); got == base {
+		t.Fatal("changed provider identity with an identical layout kept the font-bundle identity")
+	}
+
+	// A row with no durable identity keeps the historical file+inventory key:
+	// stable across a result rotation, never equal to an identified release.
+	identityless := *file
+	identityless.ProviderVideoHash = ""
+	identityless.ProviderReleaseName = ""
+	identityless.ProviderReleaseSize = 0
+	identitylessKey := fontBundleCacheKey(&identityless, ffmpegPath)
+	if identitylessKey == base {
+		t.Fatal("identity-less virtual row reused the identified release's key")
+	}
+	identitylessRotated := identityless
+	identitylessRotated.FilePath = "virtual://movie/tt1?result=cand-b"
+	if got := fontBundleCacheKey(&identitylessRotated, ffmpegPath); got != identitylessKey {
+		t.Fatal("identity-less virtual row re-keyed on a result rotation")
+	}
+
+	// Local rows key on the file row only; provider fields are not part of
+	// their identity.
+	mtime := time.Unix(1_700_000_000, 0)
+	local := &models.MediaFile{ID: 7, FilePath: "/media/movie.mkv", FileSize: 1024, FileModifiedAt: &mtime}
+	localKey := fontBundleCacheKey(local, ffmpegPath)
+	withIdentity := *local
+	withIdentity.ProviderVideoHash = "hash-a"
+	withIdentity.ProviderReleaseName = "Movie.2024.1080p"
+	withIdentity.ProviderReleaseSize = 8_000_000_000
+	if got := fontBundleCacheKey(&withIdentity, ffmpegPath); got != localKey {
+		t.Fatalf("local font-bundle key changed with provider identity: %+v vs %+v", got, localKey)
+	}
+}

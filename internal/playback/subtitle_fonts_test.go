@@ -121,6 +121,26 @@ func TestSubtitleFontDumpBudgetScalesWithProbedPayload(t *testing.T) {
 	if got := subtitleFontDumpBudget(huge); got != subtitleFontDumpMaxBudget {
 		t.Fatalf("pathological payload budget = %s, want ceiling %s", got, subtitleFontDumpMaxBudget)
 	}
+
+	// A probe that reports no sizes at all (a relay that cannot seek the
+	// container often omits extradata_size) must not leave a multi-font pack on
+	// the 30 s floor: a count-based estimate drives the same payload scaling.
+	unknown := []attachmentProbeStream{{ExtraDataSize: 0}, {ExtraDataSize: 0}, {ExtraDataSize: 0}}
+	wantUnknown := subtitleFontDumpBaseBudget +
+		time.Duration(3*subtitleFontDumpUnknownStreamBytes)*time.Second/subtitleFontDumpBytesPerSecond
+	if got := subtitleFontDumpBudget(unknown); got != wantUnknown {
+		t.Fatalf("unknown-size payload budget = %s, want %s", got, wantUnknown)
+	}
+	if wantUnknown <= subtitleFontDumpBaseBudget {
+		t.Fatalf("unknown-size budget %s did not exceed the floor %s", wantUnknown, subtitleFontDumpBaseBudget)
+	}
+
+	// Enough unknown attachments reach the ceiling rather than an unbounded or
+	// floor-bound estimate.
+	manyUnknown := make([]attachmentProbeStream, maxSubtitleFontAttachments)
+	if got := subtitleFontDumpBudget(manyUnknown); got != subtitleFontDumpMaxBudget {
+		t.Fatalf("many-unknown payload budget = %s, want ceiling %s", got, subtitleFontDumpMaxBudget)
+	}
 }
 
 func containsSeq(argv []string, a, b string) bool {
