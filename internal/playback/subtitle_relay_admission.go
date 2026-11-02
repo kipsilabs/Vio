@@ -25,27 +25,28 @@ import (
 // subtitle demuxes per relay source so those consumers pace each other
 // instead of starving each other.
 //
-// Admission has two classes:
+// Admission has three classes:
 //
-//   - Request-path reads (a window serve, a font serve) are what a client is
-//     waiting on. They wait a short, bounded time for a slot and, when none
-//     frees up, report ErrRelayDemuxBusy so the caller answers the retryable
-//     shape it already supports (503 + Retry-After, or the pending empty font
-//     bundle). Making a client sit out a 20-70 s demux inside its own fetch
-//     deadline is what turns a slow relay into a failed fetch.
-//   - Detached reads (full-track warms, font warms, layout probes, and the
-//     param-less whole-track upgrade probe) are opportunistic. They never
-//     queue: when their budget is taken they are dropped and retried by the
-//     next trigger (the next windowed miss, warm admission, client probe
-//     cadence, or fetch).
+//   - Request-path reads (a window serve) are what a client is waiting on.
+//     They wait a short, bounded time for a slot and, when none frees up,
+//     report ErrRelayDemuxBusy so the caller answers the retryable shape it
+//     already supports (503 + Retry-After). Making a client sit out a 20-70 s
+//     demux inside its own fetch deadline is what turns a slow relay into a
+//     failed fetch.
+//   - Detached reads (full-track warms, layout probes, and the param-less
+//     whole-track upgrade probe) are opportunistic. They never queue: when
+//     their budget is taken they are dropped and retried by the next trigger
+//     (the next windowed miss, warm admission, client probe cadence, or fetch).
+//   - Font reads (bundle extraction and single-attachment serves) have their
+//     own per-source budget. A request-triggered font serve waits the same
+//     short bound as a request-path read; a detached font warm skips a taken
+//     font budget. Fonts never draw from the request-path pool: a full-pack
+//     attachment dump can hold the pipe for minutes, and letting it occupy a
+//     foreground slot starves the very window extract it exists to support.
 //
-// The two classes draw from separate per-source budgets. Detached work must
-// never consume a request-path slot: a warm or a font dump can hold the pipe
-// for a minute or more, and letting it occupy one of the two foreground slots
-// starves the very window the warm exists to accelerate. Detached work gets its
-// own smaller budget instead, so a foreground read is admitted whenever fewer
-// than relayDemuxSlotsPerSource other foreground reads hold the source,
-// regardless of what background work is doing.
+// The three classes draw from separate per-source budgets, so a foreground read
+// is admitted whenever fewer than relayDemuxSlotsPerSource other foreground
+// reads hold the source, regardless of what background or font work is doing.
 //
 // Local-file reads are not admitted at all: they do not share the relay pipe
 // and are the cheap paths the guard exists to protect.
@@ -66,11 +67,19 @@ const (
 
 	// relayDemuxDetachedSlotsPerSource caps concurrent detached demuxes per
 	// remote source. It is a separate, smaller budget so background work
-	// (full-track warms, font dumps, layout probes, the param-less upgrade
-	// probe) can never occupy a request-path slot. One slot keeps a session's
-	// background reads from stacking on the pipe; a detached read that finds it
-	// taken is skipped and re-kicked by its next trigger.
+	// (full-track warms, layout probes, the param-less upgrade probe) can never
+	// occupy a request-path slot. One slot keeps a session's background reads
+	// from stacking on the pipe; a detached read that finds it taken is skipped
+	// and re-kicked by its next trigger.
 	relayDemuxDetachedSlotsPerSource = 1
+
+	// relayDemuxFontSlotsPerSource caps concurrent font-attachment reads per
+	// remote source. Font dumps are optional to playback and can hold the pipe
+	// for minutes, so they get their own budget instead of borrowing either the
+	// request-path slots a window needs or the detached slot a full-track warm
+	// needs. One slot means a second font fetch answers its existing pending
+	// shape until the dump settles.
+	relayDemuxFontSlotsPerSource = 1
 
 	// relayDemuxRequestWait bounds how long a request-path read waits for a
 	// slot before answering retryable. A read that holds a slot longer than
@@ -88,6 +97,12 @@ const (
 	relayDemuxRequestPath relayDemuxClass = iota
 	// relayDemuxDetached never waits: it skips a saturated source.
 	relayDemuxDetached
+	// relayDemuxFont is a request-triggered font read: it waits the short bound
+	// on the font budget, then reports busy.
+	relayDemuxFont
+	// relayDemuxFontDetached is an opportunistic font read: it never waits and
+	// skips a taken font budget.
+	relayDemuxFontDetached
 )
 
 // relayDemuxClassKey carries the admission class through a context whose
@@ -98,12 +113,13 @@ type relayDemuxClassKey struct{}
 // relayDemuxSlotKey marks a context that already holds a demux slot.
 type relayDemuxSlotKey struct{}
 
-// relayDemuxSourceSlots is the per-source admission budget: request-path reads
-// and detached reads draw from separate pools, so background work cannot hold
-// a foreground slot.
+// relayDemuxSourceSlots is the per-source admission budget: request-path,
+// detached, and font reads draw from separate pools, so background or font work
+// cannot hold a foreground slot.
 type relayDemuxSourceSlots struct {
 	requestPath chan struct{}
 	detached    chan struct{}
+	font        chan struct{}
 }
 
 // relayDemuxGuard bounds concurrent subtitle demuxes per remote source. It is
@@ -111,6 +127,7 @@ type relayDemuxSourceSlots struct {
 type relayDemuxGuard struct {
 	limit         int
 	detachedLimit int
+	fontLimit     int
 	wait          time.Duration
 
 	mu    sync.Mutex
@@ -122,15 +139,23 @@ func newRelayDemuxGuard(limit int, wait time.Duration) *relayDemuxGuard {
 }
 
 func newRelayDemuxGuardWithDetached(limit, detachedLimit int, wait time.Duration) *relayDemuxGuard {
+	return newRelayDemuxGuardWithPools(limit, detachedLimit, relayDemuxFontSlotsPerSource, wait)
+}
+
+func newRelayDemuxGuardWithPools(limit, detachedLimit, fontLimit int, wait time.Duration) *relayDemuxGuard {
 	if limit <= 0 {
 		limit = 1
 	}
 	if detachedLimit <= 0 {
 		detachedLimit = 1
 	}
+	if fontLimit <= 0 {
+		fontLimit = 1
+	}
 	return &relayDemuxGuard{
 		limit:         limit,
 		detachedLimit: detachedLimit,
+		fontLimit:     fontLimit,
 		wait:          wait,
 		slots:         make(map[string]*relayDemuxSourceSlots),
 	}
@@ -165,6 +190,7 @@ func (g *relayDemuxGuard) pools(source string) *relayDemuxSourceSlots {
 		pools = &relayDemuxSourceSlots{
 			requestPath: make(chan struct{}, g.limit),
 			detached:    make(chan struct{}, g.detachedLimit),
+			font:        make(chan struct{}, g.fontLimit),
 		}
 		g.slots[source] = pools
 	}
@@ -180,26 +206,44 @@ func (g *relayDemuxGuard) acquire(ctx context.Context, input string, class relay
 		return func() {}, true
 	}
 	pools := g.pools(source)
-	if class == relayDemuxDetached {
-		// Detached work never waits and never touches the request-path pool:
-		// if its own budget is taken it is skipped and re-kicked later.
+	switch class {
+	case relayDemuxDetached:
+		// Detached work never waits and never touches another budget: if its
+		// own budget is taken it is skipped and re-kicked later.
 		select {
 		case pools.detached <- struct{}{}:
 			return func() { <-pools.detached }, true
 		default:
 			return nil, false
 		}
+	case relayDemuxFontDetached:
+		select {
+		case pools.font <- struct{}{}:
+			return func() { <-pools.font }, true
+		default:
+			return nil, false
+		}
+	case relayDemuxFont:
+		return g.acquireWaiting(ctx, pools.font)
+	default:
+		return g.acquireWaiting(ctx, pools.requestPath)
 	}
+}
+
+// acquireWaiting takes one slot from pool, waiting up to the guard's short
+// bound. It reports false when the pool stays full: the caller answers its
+// existing retryable or pending shape.
+func (g *relayDemuxGuard) acquireWaiting(ctx context.Context, pool chan struct{}) (func(), bool) {
 	select {
-	case pools.requestPath <- struct{}{}:
-		return func() { <-pools.requestPath }, true
+	case pool <- struct{}{}:
+		return func() { <-pool }, true
 	default:
 	}
 	timer := time.NewTimer(g.wait)
 	defer timer.Stop()
 	select {
-	case pools.requestPath <- struct{}{}:
-		return func() { <-pools.requestPath }, true
+	case pool <- struct{}{}:
+		return func() { <-pool }, true
 	case <-timer.C:
 		return nil, false
 	case <-ctx.Done():
@@ -239,6 +283,22 @@ func detachedRelayDemux(ctx context.Context) context.Context {
 		ctx = context.Background()
 	}
 	return context.WithValue(ctx, relayDemuxClassKey{}, relayDemuxDetached)
+}
+
+// fontRelayDemuxContext marks ctx as a font read. A font dump never draws from
+// the request-path or detached pools: request-triggered fonts wait on the font
+// budget, and font warms (which already carry the detached marker) skip a taken
+// font budget. The slot marker is preserved, so a nested read inside an admitted
+// font extraction still takes no second slot.
+func fontRelayDemuxContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	class := relayDemuxFont
+	if relayDemuxClassOf(ctx) == relayDemuxDetached {
+		class = relayDemuxFontDetached
+	}
+	return context.WithValue(ctx, relayDemuxClassKey{}, class)
 }
 
 // relayDemuxAdmissionContext applies an extract's admission class to the

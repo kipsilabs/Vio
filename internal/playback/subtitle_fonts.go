@@ -214,12 +214,14 @@ func extractAttachedSubtitleFonts(ctx context.Context, inputPath, ffmpegPath str
 	}
 
 	// The probe plus the attachment dump is one of the heaviest subtitle reads
-	// a relay serves (up to 47 network opens). Admit it per relay source with
-	// its caller's class: a font serve waits the short request bound and then
+	// a relay serves (up to 47 network opens). Admit it on the font budget, never
+	// on the request-path or detached budgets: a multi-minute font dump must not
+	// hold a slot a window extract needs, nor the slot a full-track warm needs.
+	// A request-triggered font serve waits the short request bound and then
 	// reports busy (the HTTP path answers its pending empty bundle), while a
-	// font warm skips a saturated source and retries on the next trigger. A
+	// font warm skips a saturated font budget and retries on the next trigger. A
 	// local file is never admitted.
-	ctx, releaseRelayDemux, demuxErr := acquireRelayDemuxRead(ctx, inputPath)
+	ctx, releaseRelayDemux, demuxErr := acquireRelayDemuxRead(fontRelayDemuxContext(ctx), inputPath)
 	if demuxErr != nil {
 		return nil, demuxErr
 	}

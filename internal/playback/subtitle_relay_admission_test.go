@@ -274,12 +274,65 @@ func TestWarmTrackInBackgroundSkipsWhenRelaySaturated(t *testing.T) {
 	}
 }
 
-// A font extraction is admitted like any other relay read, and a local font
+// A font extraction draws from the font budget, not the request-path or
+// detached budgets: when both windows and a background warm hold every other
+// slot, the font read still reaches its own probe instead of reporting busy.
+func TestFontExtractionUsesItsOwnRelayBudget(t *testing.T) {
+	swapRelayDemuxGuardForTest(t, newRelayDemuxGuardWithPools(2, 1, 1, 5*time.Millisecond))
+	const remote = "http://relay-font-own-budget.test/source/tok/movie.mkv"
+
+	_, releaseWindow1, err := acquireRelayDemuxRead(context.Background(), remote)
+	if err != nil {
+		t.Fatalf("hold first window slot: %v", err)
+	}
+	defer releaseWindow1()
+	_, releaseWindow2, err := acquireRelayDemuxRead(context.Background(), remote)
+	if err != nil {
+		t.Fatalf("hold second window slot: %v", err)
+	}
+	defer releaseWindow2()
+	releaseDetached := holdDetachedRelaySlot(t, remote)
+	defer releaseDetached()
+
+	_, err = ExtractAttachedSubtitleFonts(context.Background(), remote, filepath.Join(t.TempDir(), "ffmpeg-missing"))
+	if errors.Is(err, ErrRelayDemuxBusy) {
+		t.Fatal("font extraction was denied by the window or detached budget")
+	}
+}
+
+// A font dump holds the pipe for minutes; it must never occupy a slot a
+// concurrent window extract needs. With the font budget taken, both
+// request-path slots are still admitted.
+func TestFontDumpCannotDenyAForegroundWindow(t *testing.T) {
+	swapRelayDemuxGuardForTest(t, newRelayDemuxGuardWithPools(2, 1, 1, 5*time.Millisecond))
+	const remote = "http://relay-font-window.test/source/tok/movie.mkv"
+
+	releaseFont, ok := activeRelayDemuxGuard().acquire(context.Background(), remote, relayDemuxFont)
+	if !ok {
+		t.Fatal("font dump was not admitted to an idle source")
+	}
+	defer releaseFont()
+
+	for slot := 0; slot < relayDemuxSlotsPerSource; slot++ {
+		release, admitted := activeRelayDemuxGuard().acquire(context.Background(), remote, relayDemuxRequestPath)
+		if !admitted {
+			t.Fatalf("window slot %d was denied while a font dump held the font budget", slot)
+		}
+		release()
+	}
+	// A font warm is detached: it skips a taken font budget instead of waiting
+	// on it or borrowing another pool.
+	if _, err := ExtractAttachedSubtitleFonts(detachedRelayDemux(context.Background()), remote, filepath.Join(t.TempDir(), "ffmpeg-missing")); !errors.Is(err, ErrRelayDemuxBusy) {
+		t.Fatalf("detached font read on a taken font budget error = %v, want ErrRelayDemuxBusy", err)
+	}
+}
+
+// A font extraction is admitted on the font budget, and a local font
 // source is not gated at all.
-func TestFontExtractionSkipsWhenRelaySaturated(t *testing.T) {
-	swapRelayDemuxGuardForTest(t, newRelayDemuxGuard(1, 5*time.Millisecond))
+func TestFontExtractionSkipsWhenFontBudgetSaturated(t *testing.T) {
+	swapRelayDemuxGuardForTest(t, newRelayDemuxGuardWithPools(1, 1, 1, 5*time.Millisecond))
 	const remote = "http://relay-fonts-saturated.test/source/tok/movie.mkv"
-	holdDetachedRelaySlot(t, remote)
+	holdFontRelaySlot(t, remote)
 
 	_, err := ExtractAttachedSubtitleFonts(detachedRelayDemux(context.Background()), remote, filepath.Join(t.TempDir(), "ffmpeg-missing"))
 	if !errors.Is(err, ErrRelayDemuxBusy) {
@@ -440,6 +493,22 @@ func holdDetachedRelaySlot(t *testing.T, input string) func() {
 	_, release, err := acquireRelayDemuxRead(detachedRelayDemux(context.Background()), input)
 	if err != nil {
 		t.Fatalf("hold detached relay slot: %v", err)
+	}
+	var released atomic.Bool
+	return func() {
+		if released.CompareAndSwap(false, true) {
+			release()
+		}
+	}
+}
+
+// holdFontRelaySlot occupies the font relay budget for the remainder of the
+// test.
+func holdFontRelaySlot(t *testing.T, input string) func() {
+	t.Helper()
+	_, release, err := acquireRelayDemuxRead(fontRelayDemuxContext(context.Background()), input)
+	if err != nil {
+		t.Fatalf("hold font relay slot: %v", err)
 	}
 	var released atomic.Bool
 	return func() {
