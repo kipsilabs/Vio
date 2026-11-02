@@ -1073,24 +1073,6 @@ func virtualEvidenceMatchesBoundFile(ctx context.Context, bound *models.MediaFil
 	return canonicalCollectionEvidenceMatchesBoundRow(ctx, bound, session, fileResolver, evidenceURI)
 }
 
-// virtualSubtitleOrdinalEvidenceBound reports whether a subtitle request's
-// plan-time ordinal is still trustworthy for the release it serves: the
-// session carries subtitle evidence, that evidence still describes the bound
-// candidate, and the request's own drift check found nothing to probe. It is
-// exactly the condition driftSuspected denies, stated once so the serve and
-// the detached warm it starts agree on what "the serve trusted its evidence"
-// means. A session without evidence, or with evidence that no longer matches,
-// is never evidence-bound.
-func (h *StreamHandler) virtualSubtitleOrdinalEvidenceBound(ctx context.Context, file *models.MediaFile, session *playback.Session) bool {
-	if file == nil || session == nil || !session.VirtualSubtitleEvidenceSet {
-		return false
-	}
-	if !isVirtualPlaybackFile(file) || session.VirtualSourceURI == "" {
-		return false
-	}
-	return virtualEvidenceMatchesBoundFile(ctx, file, session, h.fileResolver)
-}
-
 // virtualEvidenceAnchorsBoundRow is the historical provenance match: the bound
 // row must be the exact row the evidence was captured from and the evidence URI
 // must still name that row's candidate. A known evidence-row identity is
