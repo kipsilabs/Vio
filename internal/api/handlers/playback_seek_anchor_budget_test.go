@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -272,5 +273,105 @@ func TestPrepareTransportTimelineAnchorTimeoutRetriesSamePinWithFreshBudget(t *t
 	}
 	if widened < firstBudget*3/2 {
 		t.Fatalf("resolve budgets = %v, want the retry widened from the first attempt's ~%v budget", resolveBudgets, firstBudget)
+	}
+}
+
+// TestPrepareTransportTimelineRetryReResolveOutageStaysProviderUnavailable
+// proves the retry's own re-resolve failure is surfaced instead of discarded:
+// when the first attempt exhausts its budget and the retry's fresh listing
+// proves a provider outage, the start answers the retryable
+// provider_unavailable rather than attempt 1's stale transcode_start_failed.
+func TestPrepareTransportTimelineRetryReResolveOutageStaysProviderUnavailable(t *testing.T) {
+	previousFloor := copySeekAnchorSeekResolveTimeout
+	copySeekAnchorSeekResolveTimeout = 100 * time.Millisecond
+	defer func() { copySeekAnchorSeekResolveTimeout = previousFloor }()
+
+	const ownerInstallationID = 10
+	clearVirtualProviderLinkLatency(t, "10")
+	handler, file, session, plan := slowLinkAnchorFixture(t, ownerInstallationID)
+
+	var mu sync.Mutex
+	var resolves int
+	handler.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(ctx context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+		mu.Lock()
+		resolves++
+		first := resolves == 1
+		mu.Unlock()
+		if first {
+			// The pinned-relay lookup exhausts the first attempt's budget, so
+			// the anchor retries the same release with a fresh resolve.
+			<-ctx.Done()
+			return ResolvedVirtualMedia{}, ctx.Err()
+		}
+		// The retry's own fresh listing proves the provider is down.
+		return ResolvedVirtualMedia{}, providerEmptyListing()
+	})
+	var probes atomic.Int32
+	handler.copySeekAnchor = func(_ context.Context, _ string, _ string, requested float64, segmentDuration int) (float64, int, error) {
+		probes.Add(1)
+		return requested - 1, computeStartSegment(requested-1, segmentDuration), nil
+	}
+
+	_, transportErr := handler.prepareTransportTimelineV3(context.Background(), session, file, playback.PlannerResultV3{Plan: plan, PlayMethod: playback.PlayRemux})
+	if transportErr == nil {
+		t.Fatal("retry re-resolve outage produced a timeline, want the retryable provider_unavailable")
+	}
+	if transportErr.reason != providerUnavailableReasonV3 || !transportErr.retryable {
+		t.Fatalf("transport error = %#v, want retryable %s instead of the stale attempt-1 cause", transportErr, providerUnavailableReasonV3)
+	}
+	if !errors.Is(transportErr.cause, errVirtualProviderUnavailable) {
+		t.Fatalf("transport cause = %v, want the retry's provider_unavailable classification", transportErr.cause)
+	}
+	if got := probes.Load(); got != 0 {
+		t.Fatalf("anchor probes = %d, want 0: the retry never opened the relay", got)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if resolves < 2 {
+		t.Fatalf("provider resolves = %d, want the timed-out attempt and the retry's own re-resolve", resolves)
+	}
+}
+
+// TestPrepareTransportTimelineDoubleResolveTimeoutStaysSeekError proves a retry
+// whose own re-resolve also exhausts its budget still answers the retryable
+// seek error, not provider_unavailable: our own budget expiring says the link
+// is slow, not that the provider failed. It pins the attempt-2 failure shape
+// the outage fix must not disturb.
+func TestPrepareTransportTimelineDoubleResolveTimeoutStaysSeekError(t *testing.T) {
+	previousFloor := copySeekAnchorSeekResolveTimeout
+	copySeekAnchorSeekResolveTimeout = 40 * time.Millisecond
+	defer func() { copySeekAnchorSeekResolveTimeout = previousFloor }()
+
+	const ownerInstallationID = 11
+	clearVirtualProviderLinkLatency(t, "11")
+	handler, file, session, plan := slowLinkAnchorFixture(t, ownerInstallationID)
+
+	var resolves atomic.Int32
+	handler.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(ctx context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+		resolves.Add(1)
+		<-ctx.Done()
+		return ResolvedVirtualMedia{}, ctx.Err()
+	})
+	var probes atomic.Int32
+	handler.copySeekAnchor = func(_ context.Context, _ string, _ string, requested float64, segmentDuration int) (float64, int, error) {
+		probes.Add(1)
+		return requested - 1, computeStartSegment(requested-1, segmentDuration), nil
+	}
+
+	_, transportErr := handler.prepareTransportTimelineV3(context.Background(), session, file, playback.PlannerResultV3{Plan: plan, PlayMethod: playback.PlayRemux})
+	if transportErr == nil {
+		t.Fatal("double resolve timeout produced a timeline, want the retryable seek error")
+	}
+	if transportErr.reason != transcodeStartFailedReasonV3 || !transportErr.retryable || !transportErr.seekFailure {
+		t.Fatalf("transport error = %#v, want the retryable seek error", transportErr)
+	}
+	if errors.Is(transportErr.cause, errVirtualProviderUnavailable) {
+		t.Fatalf("transport cause = %v, want no provider_unavailable for our own budget expiry", transportErr.cause)
+	}
+	if got := probes.Load(); got != 0 {
+		t.Fatalf("anchor probes = %d, want 0: neither resolve opened the relay", got)
+	}
+	if got := resolves.Load(); got != 2 {
+		t.Fatalf("provider resolves = %d, want exactly 2 (one per attempt)", got)
 	}
 }

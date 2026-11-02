@@ -4994,16 +4994,20 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 						anchorBudgetElapsed = attemptCtx.Err() != nil && ctx.Err() == nil
 						recordVirtualProviderLinkLatency(linkKey, time.Since(attemptStarted), time.Now())
 						if attempt > 1 {
-							// The retry's own re-resolve failed: keep the first
-							// attempt's failure as the surfaced cause, exactly
-							// as before the anchor could retry itself.
+							// The retry's own re-resolve failed: surface this
+							// attempt's failure, exactly as a single resolve
+							// failure would. resolveFailure already carries the
+							// classification resolved above, so a proven
+							// provider outage still answers provider_unavailable
+							// instead of being demoted to a stale
+							// transcode_start_failed verdict from attempt 1.
 							slog.WarnContext(ctx, "virtual seek anchor re-resolve failed; skipping retry",
 								"component", "api",
 								"playback_session_id", session.ID,
 								"requested_seek_seconds", requested,
 								"error", resolveErr,
 							)
-							resolveFailure = nil
+							err = resolveErr
 							break
 						}
 						err = resolveErr
