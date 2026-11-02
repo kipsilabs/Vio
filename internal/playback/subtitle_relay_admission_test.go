@@ -40,18 +40,25 @@ func TestRelayDemuxSourceKeysByRelayHost(t *testing.T) {
 	}
 }
 
-func TestRelayDemuxGuardSkipsDetachedWhenSaturated(t *testing.T) {
+func TestRelayDemuxGuardSkipsDetachedWhenItsBudgetIsTaken(t *testing.T) {
 	guard := newRelayDemuxGuard(1, 5*time.Millisecond)
 	const remote = "http://relay-saturated.test/source/tok/movie.mkv"
 
-	release, ok := guard.acquire(context.Background(), remote, relayDemuxRequestPath)
+	release, ok := guard.acquire(context.Background(), remote, relayDemuxDetached)
 	if !ok {
-		t.Fatal("first request-path read was not admitted to an idle source")
+		t.Fatal("first detached read was not admitted to an idle source")
 	}
 	if _, ok := guard.acquire(context.Background(), remote, relayDemuxDetached); ok {
-		t.Fatal("detached read was admitted to a saturated source")
+		t.Fatal("detached read was admitted while the detached budget was taken")
 	}
-	// A different relay source has its own budget.
+	// Detached work never consumes a request-path slot: a foreground read is
+	// admitted even while the background budget is exhausted.
+	if held, ok := guard.acquire(context.Background(), remote, relayDemuxRequestPath); !ok {
+		t.Fatal("request-path read was blocked by a detached holder")
+	} else {
+		held()
+	}
+	// A different relay source has its own budgets.
 	if _, ok := guard.acquire(context.Background(), "http://other-relay.test/source/tok/movie.mkv", relayDemuxDetached); !ok {
 		t.Fatal("detached read was refused on an unrelated relay source")
 	}
@@ -63,6 +70,34 @@ func TestRelayDemuxGuardSkipsDetachedWhenSaturated(t *testing.T) {
 	// Releasing returns the slot to the pool.
 	if _, ok := guard.acquire(context.Background(), remote, relayDemuxDetached); !ok {
 		t.Fatal("detached read was refused after the slot was released")
+	}
+}
+
+// A foreground window must be admitted while only detached work holds the
+// source, and request-path saturation must still be bounded by its own pool.
+func TestRelayDemuxGuardRequestPathIsNotStarvedByDetachedWork(t *testing.T) {
+	guard := newRelayDemuxGuardWithDetached(2, 1, 20*time.Millisecond)
+	const remote = "http://relay-priority.test/source/tok/movie.mkv"
+
+	releaseDetached, ok := guard.acquire(context.Background(), remote, relayDemuxDetached)
+	if !ok {
+		t.Fatal("detached holder was not admitted")
+	}
+	defer releaseDetached()
+
+	for slot := 0; slot < 2; slot++ {
+		if _, ok := guard.acquire(context.Background(), remote, relayDemuxRequestPath); !ok {
+			t.Fatalf("foreground slot %d was blocked by detached work", slot)
+		}
+	}
+	// The foreground pool is now full; a third request-path read waits its
+	// bound and answers busy without touching the detached holder.
+	start := time.Now()
+	if _, ok := guard.acquire(context.Background(), remote, relayDemuxRequestPath); ok {
+		t.Fatal("request-path read exceeded its own slot budget")
+	}
+	if waited := time.Since(start); waited < 15*time.Millisecond {
+		t.Fatalf("request-path read gave up after %v, want it to wait its short bound", waited)
 	}
 }
 
@@ -190,13 +225,13 @@ func TestServeExtractWindowAnswersRetryableWhenRelaySaturated(t *testing.T) {
 	}
 }
 
-// A detached warm never queues behind a saturated relay: it skips, and the
-// next trigger re-attempts it once the pipe frees up.
+// A detached warm never queues behind a taken detached budget: it skips, and
+// the next trigger re-attempts it once the background budget frees up.
 func TestWarmTrackInBackgroundSkipsWhenRelaySaturated(t *testing.T) {
 	dir := t.TempDir()
 	swapRelayDemuxGuardForTest(t, newRelayDemuxGuard(1, 5*time.Millisecond))
 	const remote = "http://relay-warm-saturated.test/source/tok/movie.mkv"
-	release := holdRelaySlot(t, remote)
+	release := holdDetachedRelaySlot(t, remote)
 
 	cache := NewSubtitleCache(func() string { return dir })
 	var calls atomic.Int32
@@ -244,7 +279,7 @@ func TestWarmTrackInBackgroundSkipsWhenRelaySaturated(t *testing.T) {
 func TestFontExtractionSkipsWhenRelaySaturated(t *testing.T) {
 	swapRelayDemuxGuardForTest(t, newRelayDemuxGuard(1, 5*time.Millisecond))
 	const remote = "http://relay-fonts-saturated.test/source/tok/movie.mkv"
-	holdRelaySlot(t, remote)
+	holdDetachedRelaySlot(t, remote)
 
 	_, err := ExtractAttachedSubtitleFonts(detachedRelayDemux(context.Background()), remote, filepath.Join(t.TempDir(), "ffmpeg-missing"))
 	if !errors.Is(err, ErrRelayDemuxBusy) {
@@ -261,6 +296,127 @@ func TestFontExtractionSkipsWhenRelaySaturated(t *testing.T) {
 	}
 }
 
+// The param-less whole-track probe draws from the detached budget: even with a
+// foreground slot already serving another window, the probe is admitted and a
+// concurrent window still gets its own slot. The probe can never deny a window.
+func TestParamlessProbeExtractNeverDeniesAWindow(t *testing.T) {
+	dir := t.TempDir()
+	swapRelayDemuxGuardForTest(t, newRelayDemuxGuardWithDetached(2, 1, 5*time.Millisecond))
+	const remote = "http://relay-probe-window.test/source/tok/movie.mkv"
+
+	// One foreground slot already serves another client's window.
+	_, releaseWindow, err := acquireRelayDemuxRead(context.Background(), remote)
+	if err != nil {
+		t.Fatalf("hold foreground slot: %v", err)
+	}
+	defer releaseWindow()
+
+	cache := NewSubtitleCache(func() string { return dir })
+	probeStarted := make(chan struct{})
+	releaseProbe := make(chan struct{})
+	var probeCalls, windowCalls atomic.Int32
+	probeExtract := func(_ context.Context, opts StreamExtractOpts) error {
+		probeCalls.Add(1)
+		close(probeStarted)
+		<-releaseProbe
+		_, writeErr := io.WriteString(opts.Writer, "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nprobe\n")
+		return writeErr
+	}
+	probeOpts := StreamExtractOpts{
+		InputPath:          remote,
+		CacheIdentity:      "relay-probe-window",
+		TrackIndex:         0,
+		SourceCodec:        "subrip",
+		DetachedRelayDemux: true,
+	}
+	probeDone := make(chan error, 1)
+	go func() {
+		_, err := cache.ServeExtractWithResult(
+			httptest.NewRecorder(),
+			httptest.NewRequest(http.MethodGet, "/subtitle", nil),
+			probeOpts, probeExtract,
+		)
+		probeDone <- err
+	}()
+	select {
+	case <-probeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("param-less probe never reached its extract while a foreground slot was busy")
+	}
+
+	// The probe is holding the detached budget; a window still gets a slot.
+	windowOpts := StreamExtractOpts{
+		InputPath:       remote,
+		CacheIdentity:   "relay-probe-window",
+		TrackIndex:      0,
+		SourceCodec:     "subrip",
+		SeekSeconds:     600,
+		DurationSeconds: 600,
+		WindowRequested: true,
+	}
+	windowExtract := func(_ context.Context, opts StreamExtractOpts) error {
+		windowCalls.Add(1)
+		_, writeErr := io.WriteString(opts.Writer, "WEBVTT\n\n00:10:00.000 --> 00:10:01.000\nwindow\n")
+		return writeErr
+	}
+	windowRec := httptest.NewRecorder()
+	if _, err := cache.ServeExtractWithResult(
+		windowRec,
+		httptest.NewRequest(http.MethodGet, "/subtitle?position=600&duration=600", nil),
+		windowOpts, windowExtract,
+	); err != nil {
+		t.Fatalf("window serve denied while the probe held the detached budget: %v", err)
+	}
+	if windowCalls.Load() != 1 {
+		t.Fatalf("window extracts = %d, want 1", windowCalls.Load())
+	}
+
+	close(releaseProbe)
+	if err := <-probeDone; err != nil {
+		t.Fatalf("admitted probe serve failed: %v", err)
+	}
+	if probeCalls.Load() != 1 {
+		t.Fatalf("probe extracts = %d, want 1", probeCalls.Load())
+	}
+}
+
+// When the detached budget is taken, the param-less probe is skipped for this
+// round (the client's probe cadence re-issues it) rather than waiting on or
+// occupying a foreground slot.
+func TestParamlessProbeSkipsWhenDetachedBudgetTaken(t *testing.T) {
+	dir := t.TempDir()
+	swapRelayDemuxGuardForTest(t, newRelayDemuxGuardWithDetached(2, 1, 5*time.Millisecond))
+	const remote = "http://relay-probe-skip.test/source/tok/movie.mkv"
+	holdDetachedRelaySlot(t, remote)
+
+	cache := NewSubtitleCache(func() string { return dir })
+	var calls atomic.Int32
+	extract := func(_ context.Context, opts StreamExtractOpts) error {
+		calls.Add(1)
+		_, err := io.WriteString(opts.Writer, "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nprobe\n")
+		return err
+	}
+	opts := StreamExtractOpts{
+		InputPath:          remote,
+		CacheIdentity:      "relay-probe-skip",
+		TrackIndex:         0,
+		SourceCodec:        "subrip",
+		DetachedRelayDemux: true,
+	}
+	rec := httptest.NewRecorder()
+	_, err := cache.ServeExtractWithResult(rec, httptest.NewRequest(http.MethodGet, "/subtitle", nil), opts, extract)
+	var retry *SubtitleExtractionRetryError
+	if !errors.As(err, &retry) {
+		t.Fatalf("probe on a taken detached budget error = %v, want a retryable answer", err)
+	}
+	if calls.Load() != 0 {
+		t.Fatal("probe spawned an extraction while the detached budget was taken")
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("skipped probe wrote %d body bytes", rec.Body.Len())
+	}
+}
+
 // holdRelaySlot occupies a relay-source slot for the remainder of the test and
 // returns a release that is safe to call early.
 func holdRelaySlot(t *testing.T, input string) func() {
@@ -268,6 +424,22 @@ func holdRelaySlot(t *testing.T, input string) func() {
 	_, release, err := acquireRelayDemuxRead(context.Background(), input)
 	if err != nil {
 		t.Fatalf("hold relay slot: %v", err)
+	}
+	var released atomic.Bool
+	return func() {
+		if released.CompareAndSwap(false, true) {
+			release()
+		}
+	}
+}
+
+// holdDetachedRelaySlot occupies the detached relay budget for the remainder of
+// the test.
+func holdDetachedRelaySlot(t *testing.T, input string) func() {
+	t.Helper()
+	_, release, err := acquireRelayDemuxRead(detachedRelayDemux(context.Background()), input)
+	if err != nil {
+		t.Fatalf("hold detached relay slot: %v", err)
 	}
 	var released atomic.Bool
 	return func() {

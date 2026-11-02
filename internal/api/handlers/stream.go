@@ -3815,6 +3815,18 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 	response := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
 	virtualActive := virtualResolved && session != nil && session.VirtualSourceURI != ""
 
+	// A param-less request against a virtual relay source is the client's
+	// whole-track upgrade probe (or a whole-track fallback): it does not name a
+	// window the viewer is waiting on, and its extract only fills the committed
+	// full-track artifact. Draw its relay read from the detached budget so a
+	// 70 s probe demux can never hold a slot a foreground window needs. An
+	// explicit position/duration/windowed request keeps the request-path
+	// budget. This is captured before applyImplicitVirtualWindow synthesizes a
+	// server-side window for the same param-less request.
+	if virtualActive && !windowRequested && seek == 0 && duration == 0 && !allowWindow {
+		opts.DetachedRelayDemux = true
+	}
+
 	// Virtual relay inputs never enter the payload cache under their rotating
 	// URL; key on the pinned source + effective ordinal instead. The identity
 	// is computed before the drift probe so a committed artifact can

@@ -33,10 +33,19 @@ import (
 //     shape it already supports (503 + Retry-After, or the pending empty font
 //     bundle). Making a client sit out a 20-70 s demux inside its own fetch
 //     deadline is what turns a slow relay into a failed fetch.
-//   - Detached reads (full-track warms, font warms, layout probes) are
-//     opportunistic. They never queue: when the source is saturated they are
-//     dropped and retried by the next trigger (the next windowed miss, warm
-//     admission, or client fetch).
+//   - Detached reads (full-track warms, font warms, layout probes, and the
+//     param-less whole-track upgrade probe) are opportunistic. They never
+//     queue: when their budget is taken they are dropped and retried by the
+//     next trigger (the next windowed miss, warm admission, client probe
+//     cadence, or fetch).
+//
+// The two classes draw from separate per-source budgets. Detached work must
+// never consume a request-path slot: a warm or a font dump can hold the pipe
+// for a minute or more, and letting it occupy one of the two foreground slots
+// starves the very window the warm exists to accelerate. Detached work gets its
+// own smaller budget instead, so a foreground read is admitted whenever fewer
+// than relayDemuxSlotsPerSource other foreground reads hold the source,
+// regardless of what background work is doing.
 //
 // Local-file reads are not admitted at all: they do not share the relay pipe
 // and are the cheap paths the guard exists to protect.
@@ -48,13 +57,20 @@ import (
 var ErrRelayDemuxBusy = errors.New("relay demux admission: source saturated")
 
 const (
-	// relayDemuxSlotsPerSource caps concurrent subtitle demuxes per remote
-	// source. Two slots let one client-facing read and one opportunistic read
-	// move at once: a single slot would serialize a household's two
-	// simultaneous subtitle requests, and more than two lets the detached
-	// warm, font dump, and probe compete with the window the client is waiting
-	// on. The video transcode is deliberately outside this budget.
+	// relayDemuxSlotsPerSource caps concurrent request-path subtitle demuxes
+	// per remote source. Two slots let one client-facing read and one second
+	// client-facing read move at once: a single slot would serialize a
+	// household's two simultaneous subtitle requests. The video transcode is
+	// deliberately outside this budget.
 	relayDemuxSlotsPerSource = 2
+
+	// relayDemuxDetachedSlotsPerSource caps concurrent detached demuxes per
+	// remote source. It is a separate, smaller budget so background work
+	// (full-track warms, font dumps, layout probes, the param-less upgrade
+	// probe) can never occupy a request-path slot. One slot keeps a session's
+	// background reads from stacking on the pipe; a detached read that finds it
+	// taken is skipped and re-kicked by its next trigger.
+	relayDemuxDetachedSlotsPerSource = 1
 
 	// relayDemuxRequestWait bounds how long a request-path read waits for a
 	// slot before answering retryable. A read that holds a slot longer than
@@ -82,21 +98,42 @@ type relayDemuxClassKey struct{}
 // relayDemuxSlotKey marks a context that already holds a demux slot.
 type relayDemuxSlotKey struct{}
 
+// relayDemuxSourceSlots is the per-source admission budget: request-path reads
+// and detached reads draw from separate pools, so background work cannot hold
+// a foreground slot.
+type relayDemuxSourceSlots struct {
+	requestPath chan struct{}
+	detached    chan struct{}
+}
+
 // relayDemuxGuard bounds concurrent subtitle demuxes per remote source. It is
 // safe for concurrent use.
 type relayDemuxGuard struct {
-	limit int
-	wait  time.Duration
+	limit         int
+	detachedLimit int
+	wait          time.Duration
 
 	mu    sync.Mutex
-	slots map[string]chan struct{}
+	slots map[string]*relayDemuxSourceSlots
 }
 
 func newRelayDemuxGuard(limit int, wait time.Duration) *relayDemuxGuard {
+	return newRelayDemuxGuardWithDetached(limit, relayDemuxDetachedSlotsPerSource, wait)
+}
+
+func newRelayDemuxGuardWithDetached(limit, detachedLimit int, wait time.Duration) *relayDemuxGuard {
 	if limit <= 0 {
 		limit = 1
 	}
-	return &relayDemuxGuard{limit: limit, wait: wait, slots: make(map[string]chan struct{})}
+	if detachedLimit <= 0 {
+		detachedLimit = 1
+	}
+	return &relayDemuxGuard{
+		limit:         limit,
+		detachedLimit: detachedLimit,
+		wait:          wait,
+		slots:         make(map[string]*relayDemuxSourceSlots),
+	}
 }
 
 // relayDemuxGuardState holds the process-wide guard. A server relays through
@@ -119,17 +156,19 @@ func activeRelayDemuxGuard() *relayDemuxGuard {
 	return relayDemuxGuardState.Load()
 }
 
-// semaphore returns the slot channel for a relay source, creating it on first
-// use.
-func (g *relayDemuxGuard) semaphore(source string) chan struct{} {
+// pools returns the slot pools for a relay source, creating them on first use.
+func (g *relayDemuxGuard) pools(source string) *relayDemuxSourceSlots {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	sem, ok := g.slots[source]
+	pools, ok := g.slots[source]
 	if !ok {
-		sem = make(chan struct{}, g.limit)
-		g.slots[source] = sem
+		pools = &relayDemuxSourceSlots{
+			requestPath: make(chan struct{}, g.limit),
+			detached:    make(chan struct{}, g.detachedLimit),
+		}
+		g.slots[source] = pools
 	}
-	return sem
+	return pools
 }
 
 // acquire takes one slot for input and returns its release. ok is false when
@@ -140,20 +179,27 @@ func (g *relayDemuxGuard) acquire(ctx context.Context, input string, class relay
 	if !remote {
 		return func() {}, true
 	}
-	sem := g.semaphore(source)
-	select {
-	case sem <- struct{}{}:
-		return func() { <-sem }, true
-	default:
-	}
+	pools := g.pools(source)
 	if class == relayDemuxDetached {
-		return nil, false
+		// Detached work never waits and never touches the request-path pool:
+		// if its own budget is taken it is skipped and re-kicked later.
+		select {
+		case pools.detached <- struct{}{}:
+			return func() { <-pools.detached }, true
+		default:
+			return nil, false
+		}
+	}
+	select {
+	case pools.requestPath <- struct{}{}:
+		return func() { <-pools.requestPath }, true
+	default:
 	}
 	timer := time.NewTimer(g.wait)
 	defer timer.Stop()
 	select {
-	case sem <- struct{}{}:
-		return func() { <-sem }, true
+	case pools.requestPath <- struct{}{}:
+		return func() { <-pools.requestPath }, true
 	case <-timer.C:
 		return nil, false
 	case <-ctx.Done():
@@ -186,12 +232,24 @@ func relayDemuxSource(input string) (string, bool) {
 }
 
 // detachedRelayDemux marks ctx as detached admission: opportunistic work that
-// must skip a saturated source instead of queueing behind request-path reads.
+// must skip a taken detached budget instead of queueing behind request-path
+// reads.
 func detachedRelayDemux(ctx context.Context) context.Context {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	return context.WithValue(ctx, relayDemuxClassKey{}, relayDemuxDetached)
+}
+
+// relayDemuxAdmissionContext applies an extract's admission class to the
+// context used for its relay read. A param-less whole-track request is the
+// client's upgrade probe: its extract only fills the committed artifact, so it
+// draws from the detached budget and can never take a slot a window needs.
+func relayDemuxAdmissionContext(ctx context.Context, opts StreamExtractOpts) context.Context {
+	if opts.DetachedRelayDemux {
+		return detachedRelayDemux(ctx)
+	}
+	return ctx
 }
 
 // relayDemuxClassOf reports how ctx was admitted.

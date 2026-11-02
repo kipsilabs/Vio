@@ -1617,3 +1617,75 @@ func TestVirtualTextWindowEvidenceBoundServeWarmsWithoutProbe(t *testing.T) {
 		t.Fatalf("evidence-bound window and warm spawned a probe: %v", err)
 	}
 }
+
+// waitForLogLines waits until argsLog has at least want non-empty lines.
+func waitForLogLines(t *testing.T, argsLog string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if countLogLines(t, argsLog) >= want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("ffmpeg invocations = %d, want at least %d", countLogLines(t, argsLog), want)
+}
+
+// A param-less virtual fetch is the client's upgrade probe. With both
+// foreground demux slots held by explicit windows, the probe must still be
+// admitted from the detached budget instead of answering retryable and leaving
+// the windowed pipeline without a committed artifact.
+func TestParamlessVirtualFetchUsesDetachedDemuxBudget(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+	dir := t.TempDir()
+	argsLog := filepath.Join(dir, "ffmpeg.args")
+	gate := filepath.Join(dir, "gate")
+	handler, session, file, _ := newVirtualSubtitleWindowFixture(t, dir,
+		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\n"+
+			"while [ ! -f '"+gate+"' ]; do sleep 0.01; done\n"+
+			"cat <<'VTT'\n"+warmSubtitleVTT+"VTT\n")
+	file.SubtitleTracks = []models.SubtitleTrack{{Index: 0, Codec: "subrip"}}
+	session.VirtualSubtitleTracks = file.SubtitleTracks
+	// Give the implicit window a position that no explicit window already owns,
+	// so the probe is a distinct extraction rather than a coalesced waiter.
+	session.Position = 3600
+	writeSubtitleLayoutProbe(t, dir, file.SubtitleTracks...)
+	t.Cleanup(func() { _ = os.WriteFile(gate, []byte("go"), 0o644) })
+
+	serve := func(query string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/subtitle"+query, nil)
+		handler.streamEmbeddedSubtitle(rec, req, file, 0, session, false, "vtt")
+		return rec
+	}
+
+	// Two explicit windows hold both foreground slots. Distinct positions keep
+	// them from coalescing onto one in-flight window.
+	windowQueries := []string{"?position=0&duration=600", "?position=1200&duration=600"}
+	windowsDone := make(chan struct{}, len(windowQueries))
+	for _, query := range windowQueries {
+		go func() {
+			_ = serve(query)
+			windowsDone <- struct{}{}
+		}()
+	}
+	waitForLogLines(t, argsLog, 2)
+
+	probeDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() { probeDone <- serve("") }()
+	waitForLogLines(t, argsLog, 3)
+	if err := os.WriteFile(gate, []byte("go"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	<-windowsDone
+	<-windowsDone
+	probe := <-probeDone
+	if probe.Code != http.StatusOK {
+		t.Fatalf("param-less fetch under foreground saturation = %d %q, want 200", probe.Code, probe.Body.String())
+	}
+	if !strings.Contains(probe.Body.String(), "WEBVTT") {
+		t.Fatalf("param-less fetch body = %q", probe.Body.String())
+	}
+}

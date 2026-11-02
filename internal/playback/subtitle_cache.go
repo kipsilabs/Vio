@@ -544,12 +544,13 @@ func (c *SubtitleCache) ServeExtractWithResult(w http.ResponseWriter, r *http.Re
 		}
 	}
 
-	// This serve is about to become the request path's one heavy relay read.
-	// Admit it per relay source so it does not compete with the same session's
-	// detached warm, font dump, and layout probe for a single slow pipe. The
-	// response is still uncommitted here, so a saturated source answers the
-	// existing retryable shape instead of stacking another demux on it.
-	admittedCtx, releaseRelayDemux, admitErr := acquireRelayDemuxRead(r.Context(), opts.InputPath)
+	// This serve is about to become a heavy relay read: the request path's
+	// window extract, or the upgrade probe's detached full-track fill. Admit it
+	// per relay source in its own class so it does not compete with the same
+	// session's other reads for a single slow pipe. The response is still
+	// uncommitted here, so a saturated budget answers the existing retryable
+	// shape instead of stacking another demux on it.
+	admittedCtx, releaseRelayDemux, admitErr := acquireRelayDemuxRead(relayDemuxAdmissionContext(r.Context(), opts), opts.InputPath)
 	if admitErr != nil {
 		if fill != nil {
 			fill.Discard()
@@ -1207,10 +1208,11 @@ func (c *SubtitleCache) ServeSUPExtract(w http.ResponseWriter, r *http.Request, 
 		return &SubtitleExtractionRetryError{RetryAfter: subtitleFillBusyRetryAfter}
 	}
 
-	// Whole-track PGS is a request-path relay read like a text window: admit it
-	// per relay source before the 200 commits, so a saturated source answers
-	// retryable instead of stacking another full demux on the same pipe.
-	admittedCtx, releaseRelayDemux, admitErr := acquireRelayDemuxRead(r.Context(), opts.InputPath)
+	// A whole-track PGS serve is a heavy relay read: the request path's for a
+	// client whole-track fetch, detached for the param-less probe. Admit it in
+	// its class per relay source before the 200 commits, so a taken budget
+	// answers retryable instead of stacking another full demux on the same pipe.
+	admittedCtx, releaseRelayDemux, admitErr := acquireRelayDemuxRead(relayDemuxAdmissionContext(r.Context(), opts), opts.InputPath)
 	if admitErr != nil {
 		if fill != nil {
 			fill.Discard()
@@ -1381,10 +1383,11 @@ func (c *SubtitleCache) serveWindowedSUP(w http.ResponseWriter, r *http.Request,
 		}
 	}
 
-	// A windowed PGS serve is the request path's relay read: admit it per relay
-	// source before the 200 commits so a saturated source still answers
+	// A windowed PGS serve is a heavy relay read in its own admission class
+	// (request path, unless this request is the param-less probe): admit it per
+	// relay source before the 200 commits so a taken budget still answers
 	// retryable.
-	admittedCtx, releaseRelayDemux, admitErr := acquireRelayDemuxRead(r.Context(), opts.InputPath)
+	admittedCtx, releaseRelayDemux, admitErr := acquireRelayDemuxRead(relayDemuxAdmissionContext(r.Context(), opts), opts.InputPath)
 	if admitErr != nil {
 		slog.DebugContext(r.Context(), "subtitle extract deferred: relay source saturated",
 			"input", opts.InputPath, "track", opts.TrackIndex, "format", subtitleFormatSUP)
