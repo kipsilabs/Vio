@@ -1894,11 +1894,18 @@ func (t *virtualResolveTrace) log(ctx context.Context, file *models.MediaFile) {
 // nothing. The snapshot delta lets the enclosing stage (listing or resolution)
 // report its wall time net of discovery, so the fetch stage names the provider
 // cost exactly once instead of hiding it under a probe or resolve label.
-func observeVirtualProviderFetches(ctx context.Context) (context.Context, func() (time.Duration, int)) {
+//
+// Every observed attempt also records its duration against the provider link,
+// which is the measurement the copy-video seek-anchor resolve uses to size its
+// own budget (see copySeekAnchorResolveBudget). It is link-local: one provider
+// owner answering slowly is the pipe this source's anchor will read through,
+// and the sample carries across requests for the lifetime of the window.
+func observeVirtualProviderFetches(ctx context.Context, linkKey string) (context.Context, func() (time.Duration, int)) {
 	var mu sync.Mutex
 	var total time.Duration
 	var calls int
 	ctx = resolver.WithProviderFetchObserver(ctx, func(ev resolver.ProviderFetchEvent) {
+		recordVirtualProviderLinkLatency(linkKey, ev.Duration, time.Now())
 		mu.Lock()
 		total += ev.Duration
 		calls++
@@ -2628,7 +2635,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	// provider listing this cold path initiates, so the enclosing list/resolve
 	// stages can report their wall time net of discovery and a repeat start can
 	// show fetch_calls=0 instead of hiding the cost under a probe label.
-	coldCtx, fetchSnapshot := observeVirtualProviderFetches(coldCtx)
+	coldCtx, fetchSnapshot := observeVirtualProviderFetches(coldCtx, virtualProviderLinkLatencyKey(file))
 	// Candidate selection (listing) must not be able to
 	// consume the resolve/probe attempt's budget. It runs under a staging
 	// deadline that stops at half the cold budget, reserving the other half for
