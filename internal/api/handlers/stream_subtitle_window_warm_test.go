@@ -1409,12 +1409,12 @@ func TestImplicitVirtualWindowStart(t *testing.T) {
 	}
 }
 
-// The window serve that starts a detached warm has already established the
-// live layout for this identity and ordinal (a fresh probe or the 120 s memo),
-// so the warm inherits that verdict instead of re-probing. On a slow relay the
-// second ffprobe is exactly what used to time the warm out and keep every
-// window re-demuxing the source, so a probing warm must not be observed here.
-func TestVirtualSubtitleWarmInheritsServeLayoutWithoutReprobe(t *testing.T) {
+// A warm opens its own relay registration, so a layout verdict the triggering
+// serve established is only an ordinal hint: it never authorizes the bytes the
+// warm reads. Even with a matching, fresh seed the warm must probe its own
+// registration, and a probe that cannot establish the layout fails closed
+// without committing anything.
+func TestVirtualSubtitleWarmProbesOwnRegistrationDespiteInheritedVerdict(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell script test helper is unix-only")
 	}
@@ -1423,8 +1423,6 @@ func TestVirtualSubtitleWarmInheritsServeLayoutWithoutReprobe(t *testing.T) {
 	probeLog := filepath.Join(dir, "ffprobe.args")
 	handler, session, file, virtualURI := newVirtualSubtitleWindowFixture(t, dir,
 		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\ncat <<'VTT'\n"+warmSubtitleVTT+"VTT\n")
-	// An inherited verdict must not spawn a probe. This one logs and fails, so a
-	// fallback re-probe both shows up and abandons the warm.
 	writeExecutableScript(t, filepath.Join(dir, "ffprobe"),
 		"#!/bin/sh\nprintf 'probe\\n' >> '"+probeLog+"'\nexit 1\n")
 
@@ -1443,10 +1441,16 @@ func TestVirtualSubtitleWarmInheritsServeLayoutWithoutReprobe(t *testing.T) {
 		sourceCodec:   "subrip",
 		verifiedAt:    time.Now(),
 	}, true, "")
+	handler.waitForBackgroundSubtitleWarms()
 
-	waitForCommittedTextEntry(t, handler.SubtitleCache, identity, 0, "subrip")
-	if _, err := os.Stat(probeLog); !os.IsNotExist(err) {
-		t.Fatalf("warm re-probed a layout the serve already validated: %v", err)
+	if data, err := os.ReadFile(probeLog); err != nil || strings.TrimSpace(string(data)) == "" {
+		t.Fatalf("warm trusted the serve's verdict instead of probing its own registration (probe log %q, err %v)", data, err)
+	}
+	if handler.SubtitleCache.HasCommittedTextEntry("unused", identity, 0, "subrip", "") {
+		t.Fatal("warm committed bytes after failing to establish its own live layout")
+	}
+	if _, err := os.Stat(argsLog); !os.IsNotExist(err) {
+		t.Fatalf("warm extracted without a validated layout: %v", err)
 	}
 }
 
@@ -1495,53 +1499,11 @@ func TestVirtualSubtitleWarmStaleIdentityStillReprobesAndFailsClosed(t *testing.
 	}
 }
 
-// A serve that trusted its plan-time evidence instead of probing still hands
-// the warm a verdict. The evidence-bound ordinal is the only validation
-// available for this identity at that moment, so the warm must commit without
-// spawning its own ffprobe — on a slow relay that second probe is what times
-// out while the window it exists to validate is still reading.
-func TestVirtualSubtitleWarmInheritsEvidenceTrustWithoutReprobe(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("shell script test helper is unix-only")
-	}
-	dir := t.TempDir()
-	argsLog := filepath.Join(dir, "ffmpeg.args")
-	probeLog := filepath.Join(dir, "ffprobe.args")
-	handler, session, file, virtualURI := newVirtualSubtitleWindowFixture(t, dir,
-		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\ncat <<'VTT'\n"+warmSubtitleVTT+"VTT\n")
-	// An inherited evidence verdict must not spawn a probe. This one logs and
-	// fails, so a fallback re-probe both shows up and abandons the warm.
-	writeExecutableScript(t, filepath.Join(dir, "ffprobe"),
-		"#!/bin/sh\nprintf 'probe\\n' >> '"+probeLog+"'\nexit 1\n")
-
-	identity := virtualSubtitleCacheIdentity(file, virtualURI, 0)
-	handler.warmVirtualSubtitleAfterWindowMiss(file, file.SubtitleTracks[0], session, playback.StreamExtractOpts{
-		InputPath:       "unused",
-		CacheIdentity:   identity,
-		TrackIndex:      0,
-		SourceCodec:     "subrip",
-		SeekSeconds:     600,
-		DurationSeconds: 600,
-		FFmpegPath:      filepath.Join(dir, "ffmpeg"),
-	}, &virtualSubtitleLayoutSeed{
-		cacheIdentity:   identity,
-		trackIndex:      0,
-		sourceCodec:     "subrip",
-		verifiedAt:      time.Now(),
-		trustedEvidence: true,
-	}, true, "")
-
-	waitForCommittedTextEntry(t, handler.SubtitleCache, identity, 0, "subrip")
-	if _, err := os.Stat(probeLog); !os.IsNotExist(err) {
-		t.Fatalf("warm re-probed a layout the serve served on trusted evidence: %v", err)
-	}
-}
-
-// Inherited evidence trust is bounded by the same TTL as the layout memo. A
-// seed older than that is not trust the serve established for this identity
-// any more, so the warm re-probes and fails closed when the layout cannot be
-// established.
-func TestVirtualSubtitleWarmExpiredEvidenceTrustReprobesAndFailsClosed(t *testing.T) {
+// A serve that trusted its plan-time evidence instead of probing has no live
+// layout verdict to lend. If it hands the warm a seed anyway, the warm must
+// still probe its own registration, and a probe that cannot establish the
+// layout fails closed without committing anything.
+func TestVirtualSubtitleWarmProbesOwnRegistrationDespiteEvidenceSeed(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell script test helper is unix-only")
 	}
@@ -1563,16 +1525,59 @@ func TestVirtualSubtitleWarmExpiredEvidenceTrustReprobesAndFailsClosed(t *testin
 		DurationSeconds: 600,
 		FFmpegPath:      filepath.Join(dir, "ffmpeg"),
 	}, &virtualSubtitleLayoutSeed{
-		cacheIdentity:   identity,
-		trackIndex:      0,
-		sourceCodec:     "subrip",
-		verifiedAt:      time.Now().Add(-virtualSubtitleLayoutCacheTTL - time.Second),
-		trustedEvidence: true,
+		cacheIdentity: identity,
+		trackIndex:    0,
+		sourceCodec:   "subrip",
+		verifiedAt:    time.Now(),
 	}, true, "")
 	handler.waitForBackgroundSubtitleWarms()
 
 	if data, err := os.ReadFile(probeLog); err != nil || strings.TrimSpace(string(data)) == "" {
-		t.Fatalf("warm trusted an expired evidence verdict (probe log %q, err %v)", data, err)
+		t.Fatalf("warm trusted an evidence seed instead of probing its own registration (probe log %q, err %v)", data, err)
+	}
+	if handler.SubtitleCache.HasCommittedTextEntry("unused", identity, 0, "subrip", "") {
+		t.Fatal("warm committed bytes after failing to establish its own live layout")
+	}
+	if _, err := os.Stat(argsLog); !os.IsNotExist(err) {
+		t.Fatalf("warm extracted without a validated layout: %v", err)
+	}
+}
+
+// An inherited ordinal hint is bounded by the same TTL as the layout memo. A
+// seed older than that is not a hint the serve established for this identity
+// any more, so the warm ignores it, probes its own registration, and fails
+// closed when the layout cannot be established.
+func TestVirtualSubtitleWarmExpiredHintReprobesAndFailsClosed(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+	dir := t.TempDir()
+	argsLog := filepath.Join(dir, "ffmpeg.args")
+	probeLog := filepath.Join(dir, "ffprobe.args")
+	handler, session, file, virtualURI := newVirtualSubtitleWindowFixture(t, dir,
+		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\ncat <<'VTT'\n"+warmSubtitleVTT+"VTT\n")
+	writeExecutableScript(t, filepath.Join(dir, "ffprobe"),
+		"#!/bin/sh\nprintf 'probe\\n' >> '"+probeLog+"'\nexit 1\n")
+
+	identity := virtualSubtitleCacheIdentity(file, virtualURI, 0)
+	handler.warmVirtualSubtitleAfterWindowMiss(file, file.SubtitleTracks[0], session, playback.StreamExtractOpts{
+		InputPath:       "unused",
+		CacheIdentity:   identity,
+		TrackIndex:      0,
+		SourceCodec:     "subrip",
+		SeekSeconds:     600,
+		DurationSeconds: 600,
+		FFmpegPath:      filepath.Join(dir, "ffmpeg"),
+	}, &virtualSubtitleLayoutSeed{
+		cacheIdentity: identity,
+		trackIndex:    0,
+		sourceCodec:   "subrip",
+		verifiedAt:    time.Now().Add(-virtualSubtitleLayoutCacheTTL - time.Second),
+	}, true, "")
+	handler.waitForBackgroundSubtitleWarms()
+
+	if data, err := os.ReadFile(probeLog); err != nil || strings.TrimSpace(string(data)) == "" {
+		t.Fatalf("warm trusted an expired hint (probe log %q, err %v)", data, err)
 	}
 	if handler.SubtitleCache.HasCommittedTextEntry("unused", identity, 0, "subrip", "") {
 		t.Fatal("warm committed bytes after failing to establish the live layout")
@@ -1583,10 +1588,11 @@ func TestVirtualSubtitleWarmExpiredEvidenceTrustReprobesAndFailsClosed(t *testin
 }
 
 // The production shape of the regression: a windowed request whose ordinal is
-// evidence-bound serves without a drift probe, and the warm it starts inherits
-// that decision. The whole path must produce a committed artifact without a
-// single ffprobe.
-func TestVirtualTextWindowEvidenceBoundServeWarmsWithoutProbe(t *testing.T) {
+// evidence-bound serves without a drift probe. It therefore has no live-layout
+// verdict to hand the warm, which must probe its own registration. Here that
+// probe sees a rotated release whose subtitle class no longer matches, so the
+// warm fails closed and commits nothing while the serve itself still answers.
+func TestVirtualTextWindowEvidenceBoundServeWarmProbesAndFailsClosedOnRotation(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell script test helper is unix-only")
 	}
@@ -1595,14 +1601,18 @@ func TestVirtualTextWindowEvidenceBoundServeWarmsWithoutProbe(t *testing.T) {
 	probeLog := filepath.Join(dir, "ffprobe.args")
 	handler, session, file, virtualURI := newVirtualSubtitleWindowFixture(t, dir,
 		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\ncat <<'VTT'\n"+warmSubtitleVTT+"VTT\n")
+	// A rotated release now exposes only a bitmap track, so the warm's own
+	// probe cannot map the planned text track and must abandon.
 	writeExecutableScript(t, filepath.Join(dir, "ffprobe"),
-		"#!/bin/sh\nprintf 'probe\\n' >> '"+probeLog+"'\nexit 1\n")
+		"#!/bin/sh\nprintf 'probe\\n' >> '"+probeLog+"'\n"+
+			"printf '%s' '{\"streams\":[{\"index\":0,\"codec_name\":\"pgs\",\"codec_type\":\"subtitle\"}]}'\n")
 
 	req := httptest.NewRequest(http.MethodGet, "/subtitle?position=600&duration=600", nil)
 	rec := httptest.NewRecorder()
 	// driftSuspected=false and the session's evidence still describes this
 	// row: exactly the state handleSubtitle derives for an uninterrupted
-	// virtual release. The serve must not probe, and neither must the warm.
+	// virtual release. The serve must not probe; the warm must, because the
+	// serve's evidence is not a verdict on the warm's own registration.
 	session.VirtualSubtitleEvidenceSet = true
 	session.VirtualSubtitleEvidenceFileID = file.ID
 	session.VirtualSubtitleTracks = file.SubtitleTracks
@@ -1610,11 +1620,70 @@ func TestVirtualTextWindowEvidenceBoundServeWarmsWithoutProbe(t *testing.T) {
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "WEBVTT") {
 		t.Fatalf("window serve: status=%d body=%q", rec.Code, rec.Body.String())
 	}
+	handler.waitForBackgroundSubtitleWarms()
+
+	if data, err := os.ReadFile(probeLog); err != nil || strings.TrimSpace(string(data)) == "" {
+		t.Fatalf("warm used the serve's evidence instead of probing its own registration (probe log %q, err %v)", data, err)
+	}
+	identity := virtualSubtitleCacheIdentity(file, virtualURI, 0)
+	if handler.SubtitleCache.HasCommittedTextEntry("unused", identity, 0, "subrip", "") {
+		t.Fatal("warm committed bytes after its own probe found no matching track")
+	}
+	if _, warm := ffmpegLogLines(t, argsLog); warm != 0 {
+		t.Fatalf("warm extracted after its own probe failed closed: %d warm invocations", warm)
+	}
+}
+
+// A fresh inherited seed may steer the warm's own probe toward the ordinal the
+// serve settled on, but the probe still runs and the extraction maps the
+// ordinal the probe establishes. Here the live release rotated the text tracks
+// and the requested language now sits at ordinal 1.
+func TestVirtualSubtitleWarmAppliesInheritedOrdinalHintAfterOwnProbe(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+	dir := t.TempDir()
+	argsLog := filepath.Join(dir, "ffmpeg.args")
+	probeLog := filepath.Join(dir, "ffprobe.args")
+	handler, session, file, virtualURI := newVirtualSubtitleWindowFixture(t, dir,
+		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\ncat <<'VTT'\n"+warmSubtitleVTT+"VTT\n")
+
+	// The plan row has English at ordinal 0 and French at ordinal 1; the live
+	// release rotated them, so the requested English track is now ordinal 1.
+	file.SubtitleTracks = []models.SubtitleTrack{
+		{Index: 0, Codec: "subrip", Language: "eng"},
+		{Index: 1, Codec: "subrip", Language: "fre"},
+	}
+	writeExecutableScript(t, filepath.Join(dir, "ffprobe"),
+		"#!/bin/sh\nprintf 'probe\\n' >> '"+probeLog+"'\n"+
+			"printf '%s' '{\"streams\":[{\"index\":0,\"codec_name\":\"subrip\",\"codec_type\":\"subtitle\",\"tags\":{\"language\":\"fre\"}},{\"index\":1,\"codec_name\":\"subrip\",\"codec_type\":\"subtitle\",\"tags\":{\"language\":\"eng\"}}]}'\n")
 
 	identity := virtualSubtitleCacheIdentity(file, virtualURI, 0)
+	handler.warmVirtualSubtitleAfterWindowMiss(file, file.SubtitleTracks[0], session, playback.StreamExtractOpts{
+		InputPath:       "unused",
+		CacheIdentity:   identity,
+		TrackIndex:      0,
+		SourceCodec:     "subrip",
+		SeekSeconds:     600,
+		DurationSeconds: 600,
+		FFmpegPath:      filepath.Join(dir, "ffmpeg"),
+	}, &virtualSubtitleLayoutSeed{
+		cacheIdentity: identity,
+		trackIndex:    1,
+		sourceCodec:   "subrip",
+		verifiedAt:    time.Now(),
+	}, true, "")
 	waitForCommittedTextEntry(t, handler.SubtitleCache, identity, 0, "subrip")
-	if _, err := os.Stat(probeLog); !os.IsNotExist(err) {
-		t.Fatalf("evidence-bound window and warm spawned a probe: %v", err)
+
+	if data, err := os.ReadFile(probeLog); err != nil || strings.TrimSpace(string(data)) == "" {
+		t.Fatalf("warm skipped its own probe (probe log %q, err %v)", data, err)
+	}
+	args, err := os.ReadFile(argsLog)
+	if err != nil {
+		t.Fatalf("warm never invoked ffmpeg: %v", err)
+	}
+	if !strings.Contains(string(args), "-map 0:s:1") {
+		t.Fatalf("warm did not extract the probed ordinal: args = %q", string(args))
 	}
 }
 
