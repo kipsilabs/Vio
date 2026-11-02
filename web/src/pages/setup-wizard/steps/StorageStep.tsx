@@ -379,7 +379,7 @@ export function StorageStep() {
         />
         <SettingField
           label="Local storage path"
-          hint="/var/lib/silo/artwork"
+          hint="/var/lib/vio/artwork"
           value={form.getValue("artwork.local_path")}
           onChange={(value) => form.setValue("artwork.local_path", value)}
           disabled={locationStatusUnavailable || artworkLocked}

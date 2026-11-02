@@ -948,7 +948,7 @@ export default function StorageSettings() {
           />
           <SettingField
             label="Local storage path"
-            hint="/var/lib/silo/artwork"
+            hint="/var/lib/vio/artwork"
             value={form.getValue("artwork.local_path")}
             onChange={(value) => form.setValue("artwork.local_path", value)}
             disabled={
@@ -1210,7 +1210,7 @@ export default function StorageSettings() {
                     id="storage-transition-local-path"
                     value={transitionLocalPath}
                     onChange={(event) => setTransitionLocalPath(event.target.value)}
-                    placeholder="/var/lib/silo/artwork"
+                    placeholder="/var/lib/vio/artwork"
                   />
                 </div>
               ) : (
