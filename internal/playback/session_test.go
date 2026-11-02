@@ -1797,3 +1797,68 @@ func TestSessionManagerReplacementRollbackRestoresPositionSequence(t *testing.T)
 		t.Fatalf("after rollback = %+v, %v; want replica position 31", current, err)
 	}
 }
+
+// A plan commit freezes the font-bundle key with the subtitle evidence so a
+// background probe that later rewrites the catalog row cannot move every warmed
+// entry out from under its readers. A replan replaces it with the evidence; a
+// non-virtual binding clears it.
+func TestUpdateStreamStateCarriesFrozenVirtualFontBundleKey(t *testing.T) {
+	mgr := playback.NewSessionManager(0, 0)
+	session, err := mgr.StartSession(1, "profile-1", 100, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := playback.FontBundleKey{
+		FileID:          100,
+		Virtual:         true,
+		ReleaseIdentity: "hash-a\x1fguid-a\x1frelease-a\x1f8000000000",
+		InventoryToken:  "inventory-a",
+		FFmpegPath:      "/usr/bin/ffmpeg",
+	}
+	state := playback.SessionStreamState{
+		VirtualSourceSet:              true,
+		VirtualSourceOwnershipSet:     true,
+		VirtualSourceURI:              "virtual://movie/tt1?result=cand-a",
+		VirtualSubtitleEvidenceURI:    "virtual://movie/tt1?result=cand-a",
+		VirtualSubtitleEvidenceFileID: 100,
+		VirtualSubtitleEvidenceSet:    true,
+		VirtualFontBundleKey:          key,
+		VirtualFontBundleKeySet:       true,
+	}
+	if err := mgr.UpdateStreamState(session.ID, state); err != nil {
+		t.Fatalf("UpdateStreamState: %v", err)
+	}
+	got, err := mgr.GetSession(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.VirtualFontBundleKeySet || got.VirtualFontBundleKey != key {
+		t.Fatalf("frozen font-bundle key = %+v (set %v), want %+v", got.VirtualFontBundleKey, got.VirtualFontBundleKeySet, key)
+	}
+
+	// A rotation commit replaces evidence and key together.
+	rotated := key
+	rotated.ReleaseIdentity = "hash-b\x1fguid-b\x1frelease-b\x1f8000000000"
+	state.VirtualSourceURI = "virtual://movie/tt1?result=cand-b"
+	state.VirtualSubtitleEvidenceURI = state.VirtualSourceURI
+	state.VirtualFontBundleKey = rotated
+	if err := mgr.UpdateStreamState(session.ID, state); err != nil {
+		t.Fatalf("UpdateStreamState(rotation): %v", err)
+	}
+	got, _ = mgr.GetSession(session.ID)
+	if got.VirtualFontBundleKey != rotated {
+		t.Fatalf("rotated font-bundle key = %+v, want %+v", got.VirtualFontBundleKey, rotated)
+	}
+
+	// A non-virtual binding (or cleared evidence) drops the frozen identity.
+	if err := mgr.UpdateStreamState(session.ID, playback.SessionStreamState{
+		VirtualSourceSet:          true,
+		VirtualSourceOwnershipSet: true,
+	}); err != nil {
+		t.Fatalf("UpdateStreamState(clear): %v", err)
+	}
+	got, _ = mgr.GetSession(session.ID)
+	if got.VirtualFontBundleKeySet {
+		t.Fatalf("cleared binding kept frozen font-bundle key %+v", got.VirtualFontBundleKey)
+	}
+}

@@ -7840,6 +7840,19 @@ func (h *PlaybackHandler) v3SessionStreamState(ctx context.Context, session *pla
 			evidenceSet = session.VirtualSubtitleEvidenceSet
 		}
 		state.VirtualSubtitleEvidenceSet = evidenceSet
+		// Freeze the font-bundle identity with the plan-time file row. A
+		// background probe persists provider identity and inventory onto the
+		// mutable row after this commit; re-deriving the key at serve time would
+		// move every warmed entry out from under its readers. The warm and both
+		// serve paths reuse this key while it still names the same file row.
+		state.VirtualFontBundleKey = playback.FontBundleKey{
+			FileID:          file.ID,
+			Virtual:         true,
+			ReleaseIdentity: virtualFontReleaseIdentity(file),
+			InventoryToken:  playback.SubtitleInventoryToken(file.SubtitleTracks),
+			FFmpegPath:      h.playbackConfig().FFmpegPath,
+		}
+		state.VirtualFontBundleKeySet = true
 		// The new evidence generation is committed with this write, so the
 		// viewer's subtitle position must be re-keyed onto it in the same
 		// commit. A recorded rotation (the replan drift carry, or a candidate
@@ -8001,8 +8014,18 @@ func (h *PlaybackHandler) scheduleVirtualWarmAfterTransportV3(ctx context.Contex
 		return
 	}
 	warmCtx := context.WithoutCancel(ctx)
+	// The start path's session copy predates the stream-state commit that froze
+	// the font-bundle key, so read the live copy back before the warm derives its
+	// key. Without this the warm would key from the plan-time row and the serve
+	// path from the frozen identity.
+	warmSession := session
+	if h.sessionMgr != nil {
+		if live, err := h.sessionMgr.GetSession(session.ID); err == nil && live != nil {
+			warmSession = live
+		}
+	}
 	go func() {
-		h.warmVirtualFontBundleV3(warmCtx, session, file)
+		h.warmVirtualFontBundleV3(warmCtx, warmSession, file)
 	}()
 }
 
@@ -8065,6 +8088,13 @@ func (h *PlaybackHandler) warmVirtualFontBundleV3(ctx context.Context, session *
 		keyFile = &bound
 	}
 	cacheKey := fontBundleCacheKey(keyFile, ffmpegPath)
+	if session.VirtualFontBundleKeySet {
+		// The plan-time commit froze the identity both this warm and the serve
+		// paths must use. Deriving from keyFile again would re-key the warm when
+		// the background probe has already persisted provider identity onto the
+		// row.
+		cacheKey = session.VirtualFontBundleKey
+	}
 	go func() {
 		defer close(done)
 		resolved, cleanup, err := h.resolveVirtualInputURI(

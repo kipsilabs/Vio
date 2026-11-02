@@ -232,3 +232,75 @@ func TestFontBundleCacheKeyReKeysOnReleaseRotationWithIdenticalLayout(t *testing
 		t.Fatalf("local font-bundle key changed with provider identity: %+v vs %+v", got, localKey)
 	}
 }
+
+// The plan-time font-bundle key is frozen on the session. A background probe
+// that persists a new provider identity and inventory onto the catalog row
+// between the warm and the HTTP request must not re-key either side: the warm
+// stores under the frozen key and the serve path resolves the identical key and
+// hits it.
+func TestVirtualFontBundleWarmAndServeSharePlanTimeKeyAcrossRowMutation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+	handler, session, file, probeLog := newVirtualFontWarmFixture(t, "virtual://movie/tt1?result=cand-1", assTestTracks())
+	ffmpegPath := handler.playbackConfig().FFmpegPath
+
+	// Plan-time release identity and inventory.
+	file.ProviderVideoHash = "hash-plan"
+	file.ProviderGUID = "guid-plan"
+	file.ProviderReleaseName = "Movie.2024.1080p"
+	file.ProviderReleaseSize = 8_000_000_000
+	planKey := fontBundleCacheKey(file, ffmpegPath)
+	session.VirtualSubtitleEvidenceSet = true
+	session.VirtualSubtitleEvidenceURI = session.VirtualSourceURI
+	session.VirtualSubtitleEvidenceFileID = file.ID
+	session.VirtualFontBundleKey = planKey
+	session.VirtualFontBundleKeySet = true
+
+	// The deferred probe persists a different release identity and layout onto
+	// the same row after the plan committed.
+	mutated := *file
+	mutated.ProviderVideoHash = "hash-probe"
+	mutated.ProviderGUID = "guid-probe"
+	mutated.ProviderReleaseName = "Movie.2024.REPACK.1080p"
+	mutated.ProviderReleaseSize = 8_100_000_000
+	mutated.SubtitleTracks = append(assTestTracks(), models.SubtitleTrack{Index: 9, Codec: "subrip"})
+
+	select {
+	case <-handler.warmVirtualFontBundleV3(context.Background(), session, &mutated):
+	case <-time.After(10 * time.Second):
+		t.Fatal("virtual font warm did not settle")
+	}
+	if _, ok := handler.SubtitleCache.LookupFontBundle(planKey); !ok {
+		t.Fatal("warm did not store under the plan-time frozen key")
+	}
+	if _, ok := handler.SubtitleCache.LookupFontBundle(fontBundleCacheKey(&mutated, ffmpegPath)); ok {
+		t.Fatal("warm re-keyed from the mutated catalog row")
+	}
+
+	// The HTTP serve path resolves the same frozen key and serves the warmed
+	// bundle without another extraction.
+	serve := NewStreamHandler(playback.NewSessionManager(0, 0), testPlaybackFileResolver{file: &mutated})
+	serve.PlaybackConfig = handler.PlaybackConfig
+	serve.SubtitleCache = handler.SubtitleCache
+	items, pending, err := serve.fontBundleForRequest(context.Background(), session, &mutated, 0)
+	if err != nil {
+		t.Fatalf("font bundle serve: %v", err)
+	}
+	if pending {
+		t.Fatal("serve reported a pending bundle despite the warmed frozen key")
+	}
+	if len(items) == 0 {
+		t.Fatal("serve returned no fonts from the warmed frozen key")
+	}
+	if got := countLogLines(t, probeLog); got != 1 {
+		t.Fatalf("ffprobe ran %d times, want the single warm extraction", got)
+	}
+
+	// A request for a different row must not borrow the frozen key.
+	otherRow := mutated
+	otherRow.ID = mutated.ID + 1
+	if got := serve.fontBundleKeyForRequest(context.Background(), session, &otherRow); got != fontBundleCacheKey(&otherRow, ffmpegPath) {
+		t.Fatalf("different row resolved frozen key %+v, want live derivation", got)
+	}
+}

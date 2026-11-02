@@ -3011,7 +3011,7 @@ func (h *StreamHandler) fontBundleForRequest(ctx context.Context, session *playb
 	failKey := fontExtractFailureKey(file.ID, trackIndex)
 	failAttrs := []any{"file_id", file.ID, "track", trackIndex}
 	virtualFontSource := isVirtualPlaybackFile(file) && session.VirtualSourceURI != ""
-	cacheKey := fontBundleCacheKey(file, h.ffmpegPath())
+	cacheKey := h.fontBundleKeyForRequest(ctx, session, file)
 
 	resolveInput := func(extractCtx context.Context) (string, func(), error) {
 		inputPath := file.FilePath
@@ -3172,7 +3172,7 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 	// must never depend on the resolved relay URL, which rotates per
 	// registration. Shared with the playback pre-warm so the two cannot drift.
 	virtualFontSource := isVirtualPlaybackFile(file) && session.VirtualSourceURI != ""
-	cacheKey := fontBundleCacheKey(file, h.ffmpegPath())
+	cacheKey := h.fontBundleKeyForRequest(r.Context(), session, file)
 
 	// A cache hit serves the encoded bundle immediately: no provider round-trip,
 	// no relay registration, no ffmpeg spawn.
@@ -3344,6 +3344,26 @@ func fontBundleCacheKey(file *models.MediaFile, ffmpegPath string) playback.Font
 		key.MtimeUnixNano = file.FileModifiedAt.UnixNano()
 	}
 	return key
+}
+
+// fontBundleKeyForRequest resolves the font-bundle key a serve path and the
+// plan-time warm must agree on. A virtual session carries the key frozen when
+// its plan was committed; reusing it keeps the warm readable after a background
+// probe persists provider identity and inventory onto the mutable catalog row.
+// The frozen key is only trusted while it still names the row being served (and,
+// when the session carries evidence, while that evidence still anchors the
+// bound candidate), so a candidate rotation falls back to live derivation
+// instead of serving another release's fonts.
+func (h *StreamHandler) fontBundleKeyForRequest(ctx context.Context, session *playback.Session, file *models.MediaFile) playback.FontBundleKey {
+	if session != nil && session.VirtualFontBundleKeySet && file != nil && isVirtualPlaybackFile(file) {
+		frozen := session.VirtualFontBundleKey
+		if frozen.Virtual && frozen.FileID == file.ID {
+			if !session.VirtualSubtitleEvidenceSet || virtualEvidenceMatchesBoundFile(ctx, file, session, h.fileResolver) {
+				return frozen
+			}
+		}
+	}
+	return fontBundleCacheKey(file, h.ffmpegPath())
 }
 
 // virtualFontReleaseIdentity serializes a virtual row's durable provider

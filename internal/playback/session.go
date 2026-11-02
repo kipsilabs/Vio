@@ -181,6 +181,16 @@ type Session struct {
 	// Zero means unknown, and the seek then fails closed rather than borrowing.
 	VirtualSubtitleEvidenceOwnerInstallationID int
 	VirtualSubtitleEvidenceSet                 bool
+	// VirtualFontBundleKey freezes the font-bundle cache identity captured
+	// with the plan's subtitle evidence. A background probe persists provider
+	// identity and inventory onto the mutable catalog row between plan and
+	// request, so re-deriving the key from that row would store the warmed
+	// bundle under an identity no HTTP request asks for. The warm and both
+	// serve paths reuse this exact key while it still names the same file row;
+	// a session without one (legacy or reconstructed) falls back to live
+	// derivation.
+	VirtualFontBundleKey    FontBundleKey
+	VirtualFontBundleKeySet bool
 	// VirtualSubtitleSelectionIndex is the viewer's committed combined subtitle
 	// ordinal on the current evidence generation (-1 = subtitles off).
 	// SubtitleTrackIndex is a different space (the transport stream operand), so
@@ -419,6 +429,11 @@ type SessionStreamState struct {
 	// unknown.
 	VirtualSubtitleEvidenceOwnerInstallationID int
 	VirtualSubtitleEvidenceSet                 bool
+	// VirtualFontBundleKey/Set travel with the evidence generation so a plan
+	// commit freezes the font-bundle identity the warm and serve paths share
+	// (see Session). A subsequent rotation re-freezes it with the evidence.
+	VirtualFontBundleKey    FontBundleKey
+	VirtualFontBundleKeySet bool
 	// VirtualSubtitleSelectionIndex/Set and the VirtualSubtitleCarry* fields
 	// commit the viewer's subtitle position and the most recent rotation carry
 	// with the evidence generation (see Session).
@@ -1634,6 +1649,8 @@ func applySessionStreamStateLocked(s *Session, state SessionStreamState) {
 			s.VirtualSubtitleEvidenceOwnerInstallationID = state.VirtualSubtitleEvidenceOwnerInstallationID
 			s.VirtualSourceRevision = state.VirtualSourceRevision
 			s.VirtualSubtitleEvidenceSet = true
+			s.VirtualFontBundleKey = state.VirtualFontBundleKey
+			s.VirtualFontBundleKeySet = state.VirtualFontBundleKeySet
 		} else if state.VirtualSourceOwnershipSet {
 			// A full v3 snapshot owns the binding and its evidence outright.
 			// When the new effective file is not virtual (or the caller carries
@@ -1645,6 +1662,8 @@ func applySessionStreamStateLocked(s *Session, state SessionStreamState) {
 			s.VirtualExternalSubtitles = nil
 			s.VirtualSourceRevision = ""
 			s.VirtualSubtitleEvidenceSet = false
+			s.VirtualFontBundleKey = FontBundleKey{}
+			s.VirtualFontBundleKeySet = false
 			if strings.TrimSpace(state.VirtualSourceURI) != "" {
 				// Audio is carried independently of the probe-evidence flag.
 				// Declared audio tracks are a legitimate placeholder (the
@@ -1755,6 +1774,8 @@ func snapshotSessionStreamStateLocked(s *Session) SessionStreamState {
 		VirtualSubtitleEvidenceFileID:              s.VirtualSubtitleEvidenceFileID,
 		VirtualSubtitleEvidenceOwnerInstallationID: s.VirtualSubtitleEvidenceOwnerInstallationID,
 		VirtualSubtitleEvidenceSet:                 s.VirtualSubtitleEvidenceSet,
+		VirtualFontBundleKey:                       s.VirtualFontBundleKey,
+		VirtualFontBundleKeySet:                    s.VirtualFontBundleKeySet,
 		VirtualSubtitleSelectionIndex:              s.VirtualSubtitleSelectionIndex,
 		VirtualSubtitleSelectionSet:                s.VirtualSubtitleSelectionSet,
 		VirtualSubtitleCarryFromIndex:              s.VirtualSubtitleCarryFromIndex,
@@ -1834,10 +1855,14 @@ func restoreSessionStreamStateLocked(s *Session, state SessionStreamState) {
 		s.VirtualSubtitleEvidenceFileID = state.VirtualSubtitleEvidenceFileID
 		s.VirtualSubtitleEvidenceOwnerInstallationID = state.VirtualSubtitleEvidenceOwnerInstallationID
 		s.VirtualSubtitleEvidenceSet = true
+		s.VirtualFontBundleKey = state.VirtualFontBundleKey
+		s.VirtualFontBundleKeySet = state.VirtualFontBundleKeySet
 	} else {
 		s.VirtualSubtitleTracks = nil
 		s.VirtualExternalSubtitles = nil
 		s.VirtualSubtitleEvidenceSet = false
+		s.VirtualFontBundleKey = FontBundleKey{}
+		s.VirtualFontBundleKeySet = false
 		// Mirror applySessionStreamStateLocked: a virtual binding keeps its
 		// plan-time audio inventory and provenance anchor across a rollback
 		// even without a probe stamp, so the serve overlay can still describe
