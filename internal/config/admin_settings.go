@@ -380,7 +380,7 @@ var adminSettingDefaults = map[string]string{
 	"matcher.enable_tv_series_group_queue": "false",
 	"metadata.cache_images":                "true",
 	"artwork.storage_backend":              "auto",
-	"artwork.local_path":                   "/var/lib/silo/artwork",
+	"artwork.local_path":                   DefaultArtworkLocalPath,
 	"markers.mode":                         "both",
 	"markers.lazy_playback":                "true",
 	MarkersDetectionWorkersSettingKey:      "1",
@@ -643,6 +643,14 @@ func EffectiveAdminSettings(stored map[string]string) map[string]string {
 		"ai.max_concurrent_jobs",
 		"subtitle_ai.max_concurrent_jobs",
 	)
+	// An installation that recorded a storage identity keeps the artwork root
+	// it has been serving, even though a new installation defaults to
+	// DefaultArtworkLocalPath. Show the root runtime actually opens so an
+	// untouched form submits the value it was loaded with instead of opening a
+	// transition for a move the operator never made.
+	if strings.TrimSpace(stored["artwork.local_path"]) == "" {
+		effective["artwork.local_path"] = artworkLocalPath(stored)
+	}
 	return effective
 }
 

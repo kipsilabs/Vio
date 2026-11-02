@@ -101,25 +101,66 @@ func TestExtractFontBundleKeyStability(t *testing.T) {
 		t.Fatalf("unkeyable extractor ran %d times, want 2 (never cached)", got)
 	}
 
-	// Virtual keys: same pinned result stays stable, a different pinned result
-	// (rotation to another candidate) misses.
-	virtualKey := FontBundleKey{FileID: 7, PinnedResult: "result-abc", FFmpegPath: "/usr/bin/ffmpeg"}
+	// Virtual keys: the same probed inventory stays stable across rotations to
+	// another result candidate, while a changed layout re-keys. A missing
+	// inventory is still a stable key (file id + generation bucket), never the
+	// relay URL.
+	virtualKey := FontBundleKey{FileID: 7, Virtual: true, InventoryToken: "inv-abc", FFmpegPath: "/usr/bin/ffmpeg"}
 	if _, err := c.ExtractFontBundle(t.Context(), virtualKey, extract); err != nil {
 		t.Fatalf("seed virtual entry: %v", err)
 	}
 	if _, ok := c.LookupFontBundle(virtualKey); !ok {
 		t.Fatal("same virtual key missed")
 	}
-	other := virtualKey
-	other.PinnedResult = "result-def"
-	if _, ok := c.LookupFontBundle(other); ok {
-		t.Fatal("different PinnedResult still hit")
+	changedLayout := virtualKey
+	changedLayout.InventoryToken = "inv-def"
+	if _, ok := c.LookupFontBundle(changedLayout); ok {
+		t.Fatal("changed subtitle inventory still hit")
+	}
+	noInventory := FontBundleKey{FileID: 7, Virtual: true, FFmpegPath: "/usr/bin/ffmpeg"}
+	var noInventoryCalls atomic.Int64
+	noInventoryExtract := func(context.Context) ([]byte, error) {
+		noInventoryCalls.Add(1)
+		return []byte("layout-unknown"), nil
+	}
+	if _, err := c.ExtractFontBundle(t.Context(), noInventory, noInventoryExtract); err != nil {
+		t.Fatalf("seed inventory-less virtual entry: %v", err)
+	}
+	if _, ok := c.LookupFontBundle(noInventory); !ok {
+		t.Fatal("inventory-less virtual key missed; a missing token must still key by file id")
+	}
+	if _, err := c.ExtractFontBundle(t.Context(), noInventory, noInventoryExtract); err != nil {
+		t.Fatal(err)
+	}
+	if got := noInventoryCalls.Load(); got != 1 {
+		t.Fatalf("inventory-less extractor ran %d times, want 1 (stable key)", got)
+	}
+	if _, ok := c.LookupFontBundle(FontBundleKey{FileID: 7, FFmpegPath: "/usr/bin/ffmpeg"}); ok {
+		t.Fatal("virtual inventory-less key collided with an unkeyable local key")
+	}
+
+	// A release rotation can keep the probed layout intact while shipping a
+	// different attached-font pack: the row's durable provider identity is the
+	// font-relevant identity, so changing it must re-key even though the
+	// inventory token did not move. An unchanged identity keeps the entry.
+	releaseKey := virtualKey
+	releaseKey.ReleaseIdentity = "hash-a\x1f\x1fMovie.2024.1080p\x1f8000000000"
+	if _, err := c.ExtractFontBundle(t.Context(), releaseKey, extract); err != nil {
+		t.Fatalf("seed release-keyed virtual entry: %v", err)
+	}
+	if _, ok := c.LookupFontBundle(releaseKey); !ok {
+		t.Fatal("same release identity missed")
+	}
+	rotatedRelease := releaseKey
+	rotatedRelease.ReleaseIdentity = "hash-b\x1f\x1fMovie.2024.1080p\x1f8000000000"
+	if _, ok := c.LookupFontBundle(rotatedRelease); ok {
+		t.Fatal("changed release identity with an identical subtitle layout still hit")
 	}
 }
 
 func TestExtractFontBundleSingleFlight(t *testing.T) {
 	c := newFontCache(t)
-	key := FontBundleKey{FileID: 7, PinnedResult: "result-sf", FFmpegPath: "/usr/bin/ffmpeg"}
+	key := FontBundleKey{FileID: 7, Virtual: true, InventoryToken: "inv-sf", FFmpegPath: "/usr/bin/ffmpeg"}
 
 	const n = 16
 	var calls atomic.Int64
@@ -172,7 +213,7 @@ func TestExtractFontBundleSingleFlight(t *testing.T) {
 
 func TestExtractFontBundleLeaderCancellationDoesNotFailWaiters(t *testing.T) {
 	c := newFontCache(t)
-	key := FontBundleKey{FileID: 9, PinnedResult: "result-cancel", FFmpegPath: "/usr/bin/ffmpeg"}
+	key := FontBundleKey{FileID: 9, Virtual: true, InventoryToken: "inv-cancel", FFmpegPath: "/usr/bin/ffmpeg"}
 
 	started := make(chan struct{})
 	release := make(chan struct{})
@@ -245,7 +286,7 @@ func waitForFontBundle(t *testing.T, c *SubtitleCache, key FontBundleKey) []byte
 // detached extraction must keep running and commit for the next fetch.
 func TestExtractFontBundleWithinReturnsPendingWhileInFlight(t *testing.T) {
 	c := newFontCache(t)
-	key := FontBundleKey{FileID: 7, PinnedResult: "result-inflight", FFmpegPath: "/usr/bin/ffmpeg"}
+	key := FontBundleKey{FileID: 7, Virtual: true, InventoryToken: "inv-inflight", FFmpegPath: "/usr/bin/ffmpeg"}
 
 	release := make(chan struct{})
 	var calls atomic.Int64
@@ -280,7 +321,7 @@ func TestExtractFontBundleWithinReturnsPendingWhileInFlight(t *testing.T) {
 // concurrent requests coalesce onto a single extraction.
 func TestExtractFontBundleWithinCoalescesParallelRequests(t *testing.T) {
 	c := newFontCache(t)
-	key := FontBundleKey{FileID: 7, PinnedResult: "result-stampede", FFmpegPath: "/usr/bin/ffmpeg"}
+	key := FontBundleKey{FileID: 7, Virtual: true, InventoryToken: "inv-stampede", FFmpegPath: "/usr/bin/ffmpeg"}
 
 	release := make(chan struct{})
 	var calls atomic.Int64
@@ -318,7 +359,7 @@ func TestExtractFontBundleWithinCoalescesParallelRequests(t *testing.T) {
 // pending so the client degrades to default fonts.
 func TestExtractFontBundleWithinReportsDefinitiveFailure(t *testing.T) {
 	c := newFontCache(t)
-	key := FontBundleKey{FileID: 7, PinnedResult: "result-fail", FFmpegPath: "/usr/bin/ffmpeg"}
+	key := FontBundleKey{FileID: 7, Virtual: true, InventoryToken: "inv-fail", FFmpegPath: "/usr/bin/ffmpeg"}
 	want := errors.New("malformed container")
 
 	data, ready, err := c.ExtractFontBundleWithin(t.Context(), key, time.Second, func(context.Context) ([]byte, error) {
@@ -334,7 +375,7 @@ func TestExtractFontBundleWithinReportsDefinitiveFailure(t *testing.T) {
 
 func TestExtractFontBundleWithinTreatsTimeoutAsPending(t *testing.T) {
 	c := newFontCache(t)
-	key := FontBundleKey{FileID: 7, PinnedResult: "result-timeout", FFmpegPath: "/usr/bin/ffmpeg"}
+	key := FontBundleKey{FileID: 7, Virtual: true, InventoryToken: "inv-timeout", FFmpegPath: "/usr/bin/ffmpeg"}
 
 	data, ready, err := c.ExtractFontBundleWithin(t.Context(), key, time.Second, func(context.Context) ([]byte, error) {
 		return nil, context.DeadlineExceeded
@@ -352,7 +393,7 @@ func TestExtractFontBundleWithinTreatsTimeoutAsPending(t *testing.T) {
 // registration exactly once after the extraction settles.
 func TestWarmFontBundleInBackgroundFillsCache(t *testing.T) {
 	c := newFontCache(t)
-	key := FontBundleKey{FileID: 7, PinnedResult: "result-warm", FFmpegPath: "/usr/bin/ffmpeg"}
+	key := FontBundleKey{FileID: 7, Virtual: true, InventoryToken: "inv-warm", FFmpegPath: "/usr/bin/ffmpeg"}
 
 	var calls atomic.Int64
 	done := c.WarmFontBundleInBackground(key, func(context.Context) ([]byte, error) {
@@ -374,7 +415,7 @@ func TestWarmFontBundleInBackgroundFillsCache(t *testing.T) {
 
 func TestWarmFontBundleInBackgroundSkipsCached(t *testing.T) {
 	c := newFontCache(t)
-	key := FontBundleKey{FileID: 7, PinnedResult: "result-warm-cached", FFmpegPath: "/usr/bin/ffmpeg"}
+	key := FontBundleKey{FileID: 7, Virtual: true, InventoryToken: "inv-warm-cached", FFmpegPath: "/usr/bin/ffmpeg"}
 	if _, err := c.ExtractFontBundle(t.Context(), key, func(context.Context) ([]byte, error) {
 		return []byte("already"), nil
 	}); err != nil {
@@ -400,7 +441,7 @@ func TestWarmFontBundleInBackgroundSkipsCached(t *testing.T) {
 // racing a request cannot fan out into two ffmpeg runs.
 func TestWarmFontBundleSharesFlightWithExtractWithin(t *testing.T) {
 	c := newFontCache(t)
-	key := FontBundleKey{FileID: 7, PinnedResult: "result-warm-race", FFmpegPath: "/usr/bin/ffmpeg"}
+	key := FontBundleKey{FileID: 7, Virtual: true, InventoryToken: "inv-warm-race", FFmpegPath: "/usr/bin/ffmpeg"}
 
 	release := make(chan struct{})
 	var calls atomic.Int64

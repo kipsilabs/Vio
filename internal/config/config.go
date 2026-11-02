@@ -19,6 +19,50 @@ const ArtworkBackendAuto = "auto"
 
 const artworkBackendAuto = ArtworkBackendAuto
 
+// DefaultArtworkLocalPath is the local artwork root a new installation uses.
+// It matches the directory the image creates (Dockerfile) and the deployment
+// compose file persists, so the volume an operator keeps is the tree the
+// server reads.
+const DefaultArtworkLocalPath = "/var/lib/vio/artwork"
+
+// legacyDefaultArtworkLocalPath was the local artwork root before the default
+// moved under /var/lib/vio. Existing installations keep serving it; see
+// artworkLocalPath.
+const legacyDefaultArtworkLocalPath = "/var/lib/silo/artwork"
+
+// artworkIdentitySettingKey mirrors blobstore.IdentitySettingKey. config must
+// not import internal/blobstore, which would link the S3 client into every
+// settings reader, and this decision needs only the row name.
+// artwork_settings_test.go keeps the two in sync.
+const artworkIdentitySettingKey = "artwork.storage_identity"
+
+// artworkLocalPath resolves artwork.local_path from stored server_settings.
+//
+// The artwork store records its filesystem root as a storage identity on the
+// first write, and startup refuses to open a different root
+// (blobstore.ErrLocationMoved) because catalog rows name keys beneath it. A
+// stored path therefore always wins. With no stored path, any recorded
+// identity keeps the legacy default root, which leaves every existing
+// installation exactly where the previous release served it: a legacy local
+// store keeps its recorded root, and an S3-selected store ignores the local
+// path. Only an installation with no recorded identity, a genuine fresh
+// install, adopts DefaultArtworkLocalPath. An installation whose custom
+// identity survived a deleted local_path row still fails startup with the
+// managed-transition error rather than being guessed at.
+//
+// Existing installations move to the new default only through the managed
+// storage transition in Admin settings, which copies the data and rewrites the
+// identity row; the path itself is never edited directly.
+func artworkLocalPath(stored map[string]string) string {
+	if path := strings.TrimSpace(stored["artwork.local_path"]); path != "" {
+		return path
+	}
+	if strings.TrimSpace(stored[artworkIdentitySettingKey]) != "" {
+		return legacyDefaultArtworkLocalPath
+	}
+	return DefaultArtworkLocalPath
+}
+
 // ServerConfig holds HTTP server settings.
 type ServerConfig struct {
 	Listen    string `yaml:"listen"`
@@ -572,7 +616,7 @@ func setDefaults() *configRaw {
 			MaxConcurrentScoped:    2,
 			RealtimeMonitoring:     true,
 		},
-		Artwork: ArtworkConfig{StorageBackend: artworkBackendAuto, LocalPath: "/var/lib/silo/artwork"},
+		Artwork: ArtworkConfig{StorageBackend: artworkBackendAuto, LocalPath: DefaultArtworkLocalPath},
 		Matcher: MatcherConfig{
 			Workers:                 8,
 			BatchSize:               500,

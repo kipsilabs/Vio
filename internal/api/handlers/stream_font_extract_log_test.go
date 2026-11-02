@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"runtime"
 	"strings"
@@ -173,6 +174,108 @@ func TestHandleSubtitleFontsPendingKeepsFailureThrottleKey(t *testing.T) {
 	}
 }
 
+// TestHandleSubtitleFontsDetachedExtractionFailureWarns pins the diagnostic for
+// the production slow-relay case: the client receives its pending bundle before
+// the dump finishes, so the request never sees the failure. The extraction
+// closure must still warn with file/track/error instead of leaving only the
+// cache backoff's debug line.
+func TestHandleSubtitleFontsDetachedExtractionFailureWarns(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+	restore := setFontBundleClientWait(50 * time.Millisecond)
+	defer restore()
+
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	handler, session, file, _, gatePath := newFontBundleHTTPFixture(t, assTestTracks(), "gate-fail")
+
+	recorder := httptest.NewRecorder()
+	handler.HandleSubtitleFonts(recorder, fontBundleHTTPRequest(session.ID, "0"))
+	if recorder.Code != http.StatusOK || strings.TrimSpace(recorder.Body.String()) != "[]" {
+		t.Fatalf("cold font fetch = %d %q, want 200 pending bundle", recorder.Code, recorder.Body.String())
+	}
+
+	// The request has returned; release the probe so the detached extraction
+	// fails. The cache's failure backoff is the observable signal that the
+	// closure has logged and the flight settled.
+	if err := os.WriteFile(gatePath, []byte("go"), 0o600); err != nil {
+		t.Fatalf("release gate: %v", err)
+	}
+	key := fontBundleCacheKey(file, handler.ffmpegPath())
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, cooling := handler.SubtitleCache.FontBundleRetryAfter(key); cooling {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("detached extraction never recorded its failure\n%s", logs.String())
+		}
+		time.Sleep(5 * time.Millisecond) //nolint:forbidigo // Polls the cache's failure backoff; the detached flight has no completion channel.
+	}
+
+	output := logs.String()
+	if !strings.Contains(output, `"level":"WARN"`) ||
+		!strings.Contains(output, "subtitle font request failed") ||
+		!strings.Contains(output, `"file_id":42`) ||
+		!strings.Contains(output, `"track":0`) {
+		t.Fatalf("detached font extraction failure was not warned with target context\n%s", output)
+	}
+}
+
+// TestSubtitleFontsServiceDetachedExtractionFailureWarns pins the same
+// diagnostic for the v2 shared service: once the caller has a pending answer,
+// only the detached closure can warn with the extraction cause.
+func TestSubtitleFontsServiceDetachedExtractionFailureWarns(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+	restore := setFontBundleClientWait(50 * time.Millisecond)
+	defer restore()
+
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	handler, session, file, _, gatePath := newFontBundleHTTPFixture(t, assTestTracks(), "gate-fail")
+	request := SubtitleFontRequest{SessionID: session.ID, Track: "0", Query: url.Values{"file_id": {"42"}}}
+
+	fonts, pending, err := handler.SubtitleFonts(newAuthorizedPlaybackContext(), request)
+	if err != nil || !pending || len(fonts) != 0 {
+		t.Fatalf("cold v2 font fetch = (fonts=%v pending=%v err=%v), want a pending bundle", fonts, pending, err)
+	}
+
+	// The request has returned; release the probe so the detached extraction
+	// fails. The cache's failure backoff is the observable signal that the
+	// closure has logged and the flight settled.
+	if err := os.WriteFile(gatePath, []byte("go"), 0o600); err != nil {
+		t.Fatalf("release gate: %v", err)
+	}
+	key := fontBundleCacheKey(file, handler.ffmpegPath())
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, cooling := handler.SubtitleCache.FontBundleRetryAfter(key); cooling {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("detached extraction never recorded its failure\n%s", logs.String())
+		}
+		time.Sleep(5 * time.Millisecond) //nolint:forbidigo // Polls the cache's failure backoff; the detached flight has no completion channel.
+	}
+
+	output := logs.String()
+	if !strings.Contains(output, `"level":"WARN"`) ||
+		!strings.Contains(output, "subtitle font request failed") ||
+		!strings.Contains(output, `"file_id":42`) ||
+		!strings.Contains(output, `"track":0`) {
+		t.Fatalf("detached v2 font extraction failure was not warned with target context\n%s", output)
+	}
+}
+
 // TestHandleSubtitleFontsCacheHitClearsFailureThrottleKey pins the recovery
 // path: a detached extraction can commit between requests, so serving its
 // cached bundle must clear the failure key and let a later regression warn.
@@ -197,7 +300,7 @@ func TestHandleSubtitleFontsCacheHitClearsFailureThrottleKey(t *testing.T) {
 	if err := os.WriteFile(gatePath, []byte("go"), 0o600); err != nil {
 		t.Fatalf("release gate: %v", err)
 	}
-	key := fontBundleCacheKey(file, "", handler.ffmpegPath())
+	key := fontBundleCacheKey(file, handler.ffmpegPath())
 	if !pollHandlerFontBundle(t, handler.SubtitleCache, key) {
 		t.Fatal("detached extraction never committed to the cache")
 	}

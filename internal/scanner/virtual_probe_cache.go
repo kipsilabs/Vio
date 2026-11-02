@@ -120,7 +120,7 @@ func (c *VirtualProbeCache) Probe(
 		if err != nil || probed == nil {
 			return probed, err
 		}
-		verdict := ClassifyVirtualServedEvidence(inputSnapshot.FileSize, probed.ProbedFormatSize, probed.Duration, inputSnapshot.VirtualExpectedRuntimeMinutes)
+		verdict := classifyVirtualProbeEvidence(inputSnapshot, probed)
 		if !verdict.EstablishesIdentity() {
 			// A readable container that does not establish the row's release
 			// identity must not be cached. A mismatch is a different release:
@@ -264,4 +264,22 @@ func cloneVirtualProbeFile(file *models.MediaFile) *models.MediaFile {
 	clone.ExternalSubtitles = append([]models.ExternalSubtitle(nil), file.ExternalSubtitles...)
 	clone.Chapters = append([]models.MediaChapter(nil), file.Chapters...)
 	return &clone
+}
+
+// classifyVirtualProbeEvidence classifies one cache-run probe against the pin
+// its input names, using the pin's recorded observed served size when one is
+// still valid. A served size that only a duration-proven acceptance can excuse
+// records the pin's first observation and stays unverified, so it is not cached
+// yet; the next probe compares against that observation and, when it matches,
+// is admitted and cached. The pin therefore costs at most one extra probe over
+// its lifetime instead of one on every start.
+func classifyVirtualProbeEvidence(inputSnapshot, probed *models.MediaFile) VirtualServedEvidenceVerdict {
+	if inputSnapshot == nil || probed == nil {
+		return VirtualServedEvidenceMismatch
+	}
+	pin := VirtualServedSizePin(inputSnapshot.FilePath, inputSnapshot.VirtualOwnerInstallationID)
+	inventoryToken := VirtualServedSizeSubtitleToken(probed.SubtitleTracks)
+	return ClassifyVirtualServedEvidenceForPinWithSnapshot(
+		pin, inputSnapshot.FileSize, probed.ProbedFormatSize, probed.Duration, inputSnapshot.VirtualExpectedRuntimeMinutes, inventoryToken,
+	)
 }

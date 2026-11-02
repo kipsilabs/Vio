@@ -163,6 +163,16 @@ func stringSlicesEqualFold(a, b []string) bool {
 // The probe is bounded to subtitleProbeTimeout; a failure returns an error so
 // the caller can decide whether a spawn can proceed unverified.
 func ProbeSubtitleLayout(ctx context.Context, ffprobePathOrFFmpeg, inputURL string) ([]models.SubtitleTrack, error) {
+	// A layout probe against a relay URL is a remote read like any other
+	// subtitle demux, so it is admitted on the same per-source budget; a
+	// probe that is skipped this way is a "can't validate right now" answer
+	// whose callers already fail closed. A local input is never admitted.
+	ctx, releaseRelayDemux, demuxErr := acquireRelayDemuxRead(ctx, inputURL)
+	if demuxErr != nil {
+		return nil, fmt.Errorf("probe subtitle layout skipped: %w", demuxErr)
+	}
+	defer releaseRelayDemux()
+
 	probeCtx, cancel := context.WithTimeout(ctx, subtitleProbeTimeout)
 	defer cancel()
 
@@ -215,9 +225,9 @@ func ProbeSubtitleLayout(ctx context.Context, ffprobePathOrFFmpeg, inputURL stri
 func probeSubtitleBin(ffprobePathOrFFmpeg string) string {
 	raw := strings.TrimSpace(ffprobePathOrFFmpeg)
 	if raw == "" {
-		return "ffprobe"
+		return ffprobeBinary
 	}
-	if strings.Contains(strings.ToLower(filepath.Base(raw)), "ffprobe") {
+	if strings.Contains(strings.ToLower(filepath.Base(raw)), ffprobeBinary) {
 		return raw
 	}
 	return ffprobePathFromFFmpeg(raw)

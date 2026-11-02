@@ -301,6 +301,60 @@ func virtualProbeEnumerationPartial(probe *ProbeData, expectAudio bool) bool {
 	return false
 }
 
+// virtualFastProbeUsable reports whether a fast preprobe result can stand in
+// for the full metadata probe. The fast argv deliberately reads almost none of
+// the container, so its result is only trusted when it already carries
+// everything the caller's gates consume:
+//
+//   - a non-empty stream table (an empty one previously meant "no tracks",
+//     which is a verdict about the file rather than about the read);
+//   - both format-level identity fields, duration and size, because the playback
+//     handler compares the served bytes against the row's declared release with
+//     them (ClassifyVirtualServedEvidence);
+//   - a complete enumeration, since a video-only read of an item that declared
+//     audio is exactly the partial read ErrVirtualProbePartial exists for.
+//
+// Anything else escalates to the full probe, so the fast path never changes a
+// verdict; a missing duration additionally avoids the packet-scan fallback the
+// full probe would have run.
+func virtualFastProbeUsable(probe *ProbeData, expectAudio bool) bool {
+	if probe == nil {
+		return false
+	}
+	if len(probe.VideoTracks) == 0 && len(probe.AudioTracks) == 0 {
+		return false
+	}
+	if probe.Duration <= 0 || probe.FormatSize <= 0 {
+		return false
+	}
+	return !virtualProbeEnumerationPartial(probe, expectAudio)
+}
+
+// probeVirtualSourceFastFirst runs the version-candidate preprobe argv first
+// and escalates to the full metadata probe when its result cannot support the
+// identity and completeness gates. The fast run is the same code path the full
+// probe used to take from the caller's point of view: a fast error, a missing
+// identity field, an empty stream table, or a partial enumeration falls through
+// to ProbeFile, whose result (including its packet-scan fallback) is returned
+// as before.
+func probeVirtualSourceFastFirst(ctx context.Context, ffprobePath, sourceURL string, file *models.MediaFile) (*ProbeData, error) {
+	fast, fastErr := probeFileFast(ctx, ffprobePath, sourceURL)
+	if fastErr == nil && virtualFastProbeUsable(fast, virtualSourceExpectsAudio(file)) {
+		return fast, nil
+	}
+	if ctx.Err() != nil {
+		// The caller is gone; starting a second probe would only burn a slot
+		// the full probe cannot use. Report what the fast run learned.
+		if fastErr != nil {
+			return nil, fastErr
+		}
+		return fast, nil
+	}
+	slog.DebugContext(ctx, "scanner: virtual fast preprobe escalated to the full metadata probe",
+		"component", "scanner", "file_id", file.ID, "error", fastErr)
+	return ProbeFile(ctx, ffprobePath, sourceURL)
+}
+
 // ProbeVirtualSource probes a virtual (plugin-provided) stream for playback
 // metadata without letting the provider's signed URL replace the canonical
 // virtual URI on the resulting row.
@@ -313,7 +367,7 @@ func ProbeVirtualSource(
 	if file == nil {
 		return nil, nil
 	}
-	probe, err := ProbeFile(ctx, ffprobePath, sourceURL)
+	probe, err := probeVirtualSourceFastFirst(ctx, ffprobePath, sourceURL, file)
 	if err != nil {
 		return file, err
 	}

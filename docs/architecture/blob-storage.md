@@ -108,7 +108,12 @@ changes the location through a managed transition.
 
 `artwork.storage_backend` accepts `auto`, `local`, or `s3`. `auto` selects S3
 when the public bucket is configured and local storage otherwise. The local
-root defaults to `/var/lib/silo/artwork`; containers must persist that directory.
+root defaults to `/var/lib/vio/artwork`, the directory the image creates and the
+deployment compose file persists. An installation that stored artwork before
+this default moved keeps serving its recorded root (normally
+`/var/lib/silo/artwork`); only an install with no recorded storage identity
+adopts the new default, and an existing one moves through the managed storage
+transition.
 Local objects are written `0644` and directories `0755`, including diagnostic
 bundles and job artifacts when they share the root, so the data directory's
 ownership and mount options are what keep them private. Owner-only modes and a

@@ -544,6 +544,23 @@ func (c *SubtitleCache) ServeExtractWithResult(w http.ResponseWriter, r *http.Re
 		}
 	}
 
+	// This serve is about to become a heavy relay read: the request path's
+	// window extract, or the upgrade probe's detached full-track fill. Admit it
+	// per relay source in its own class so it does not compete with the same
+	// session's other reads for a single slow pipe. The response is still
+	// uncommitted here, so a saturated budget answers the existing retryable
+	// shape instead of stacking another demux on it.
+	admittedCtx, releaseRelayDemux, admitErr := acquireRelayDemuxRead(relayDemuxAdmissionContext(r.Context(), opts), opts.InputPath)
+	if admitErr != nil {
+		if fill != nil {
+			fill.Discard()
+		}
+		slog.DebugContext(r.Context(), "subtitle extract deferred: relay source saturated",
+			"input", opts.InputPath, "track", opts.TrackIndex, "format", format)
+		return result, &SubtitleExtractionRetryError{RetryAfter: subtitleFillBusyRetryAfter}
+	}
+	defer releaseRelayDemux()
+
 	w.Header().Set("Cache-Control", "no-store")
 	counter := &subtitleCountingWriter{w: w}
 	var writer io.Writer = counter
@@ -558,7 +575,7 @@ func (c *SubtitleCache) ServeExtractWithResult(w http.ResponseWriter, r *http.Re
 		writer = capture
 	}
 	opts.Writer = writer
-	err := c.runExtract(r.Context(), opts, extract, counter)
+	err := c.runExtract(admittedCtx, opts, extract, counter)
 	if err != nil {
 		if r.Context().Err() == nil && IsSubtitleUpstreamError(err) {
 			c.noteExtractionFailure(opts, format)
@@ -1191,6 +1208,21 @@ func (c *SubtitleCache) ServeSUPExtract(w http.ResponseWriter, r *http.Request, 
 		return &SubtitleExtractionRetryError{RetryAfter: subtitleFillBusyRetryAfter}
 	}
 
+	// A whole-track PGS serve is a heavy relay read: the request path's for a
+	// client whole-track fetch, detached for the param-less probe. Admit it in
+	// its class per relay source before the 200 commits, so a taken budget
+	// answers retryable instead of stacking another full demux on the same pipe.
+	admittedCtx, releaseRelayDemux, admitErr := acquireRelayDemuxRead(relayDemuxAdmissionContext(r.Context(), opts), opts.InputPath)
+	if admitErr != nil {
+		if fill != nil {
+			fill.Discard()
+		}
+		slog.DebugContext(r.Context(), "subtitle extract deferred: relay source saturated",
+			"input", opts.InputPath, "track", opts.TrackIndex, "format", subtitleFormatSUP)
+		return &SubtitleExtractionRetryError{RetryAfter: subtitleFillBusyRetryAfter}
+	}
+	defer releaseRelayDemux()
+
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
@@ -1204,7 +1236,7 @@ func (c *SubtitleCache) ServeSUPExtract(w http.ResponseWriter, r *http.Request, 
 	}
 
 	opts.Writer = writer
-	err := extract(r.Context(), opts)
+	err := extract(admittedCtx, opts)
 	outcome := subtitleTraceOutcome(r.Context(), err)
 	if fill != nil {
 		if err != nil {
@@ -1351,6 +1383,18 @@ func (c *SubtitleCache) serveWindowedSUP(w http.ResponseWriter, r *http.Request,
 		}
 	}
 
+	// A windowed PGS serve is a heavy relay read in its own admission class
+	// (request path, unless this request is the param-less probe): admit it per
+	// relay source before the 200 commits so a taken budget still answers
+	// retryable.
+	admittedCtx, releaseRelayDemux, admitErr := acquireRelayDemuxRead(relayDemuxAdmissionContext(r.Context(), opts), opts.InputPath)
+	if admitErr != nil {
+		slog.DebugContext(r.Context(), "subtitle extract deferred: relay source saturated",
+			"input", opts.InputPath, "track", opts.TrackIndex, "format", subtitleFormatSUP)
+		return &SubtitleExtractionRetryError{RetryAfter: subtitleFillBusyRetryAfter}
+	}
+	defer releaseRelayDemux()
+
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
@@ -1369,11 +1413,11 @@ func (c *SubtitleCache) serveWindowedSUP(w http.ResponseWriter, r *http.Request,
 	// request. Detach it from the leader's cancellation (bounded by the
 	// timeout) so a leader disconnect does not throw away work that waiters
 	// can still consume from the last-good cache.
-	extractCtx := r.Context()
+	extractCtx := admittedCtx
 	if leader {
 		var cancel context.CancelFunc
 		extractCtx, cancel = context.WithTimeout(
-			context.WithoutCancel(r.Context()),
+			context.WithoutCancel(admittedCtx),
 			subtitleWindowExtractTimeout,
 		)
 		defer cancel()
@@ -1572,6 +1616,20 @@ func (c *SubtitleCache) WarmInBackground(opts StreamExtractOpts, extract SUPExtr
 		start := time.Now()
 		slog.Info("subtitle cache warm started",
 			"input", opts.InputPath, "track", opts.TrackIndex)
+		// A warm is opportunistic: when the relay is already at its demux
+		// ceiling it is dropped rather than queued, and the next windowed miss
+		// re-attempts it. Queueing would make it contend with the window a
+		// client is waiting on, which is exactly the pileup that made warm
+		// demuxes (and their layout probes) time out.
+		warmCtx, releaseRelayDemux, demuxErr := acquireRelayDemuxRead(detachedRelayDemux(ctx), opts.InputPath)
+		if demuxErr != nil {
+			fill.Discard()
+			slog.DebugContext(ctx, "subtitle cache warm skipped: relay source saturated",
+				"input", opts.InputPath, "track", opts.TrackIndex)
+			return
+		}
+		defer releaseRelayDemux()
+		ctx = warmCtx
 		if err := extract(ctx, opts); err != nil {
 			fill.Discard()
 			if errors.Is(err, ErrSubtitleWarmCanceled) {
@@ -1684,6 +1742,18 @@ func (c *SubtitleCache) WarmTrackInBackground(opts StreamExtractOpts, extract SU
 		start := time.Now()
 		slog.Info("subtitle cache warm started",
 			"input", opts.InputPath, "track", opts.TrackIndex, "format", format)
+		// Detached: skip a saturated relay source instead of queueing behind
+		// the request-path reads it exists to protect. The next windowed miss
+		// re-attempts the warm.
+		warmCtx, releaseRelayDemux, demuxErr := acquireRelayDemuxRead(detachedRelayDemux(ctx), opts.InputPath)
+		if demuxErr != nil {
+			fill.Discard()
+			slog.DebugContext(ctx, "subtitle cache warm skipped: relay source saturated",
+				"input", opts.InputPath, "track", opts.TrackIndex, "format", format)
+			return
+		}
+		defer releaseRelayDemux()
+		ctx = warmCtx
 		if err := extract(ctx, opts); err != nil {
 			fill.Discard()
 			if errors.Is(err, ErrSubtitleWarmCanceled) {
@@ -2024,29 +2094,46 @@ func subtitleCacheSource(inputPath, cacheIdentity string, now time.Time) (string
 }
 
 // FontBundleKey is a stable identity for font-bundle caching. Virtual rows
-// key on the pinned result id — resolved relay URLs rotate per registration
-// and would defeat the cache (mirror of the DV RPU memo key). Local rows key
-// on the file row's size and mtime so a re-probed or replaced file reads as a
-// miss.
+// key on the release's durable provider identity, the row's probed subtitle
+// inventory, and a generation bucket — not on the pinned result candidate or a
+// resolved relay URL, both of which rotate per registration and would strand
+// warmed bundles under keys requests never ask for.
+//
+// The inventory alone is not enough: a rotated release (or a re-grabbed file
+// behind the same row) can keep an identical subtitle layout while shipping
+// different attached fonts or an edited script, and the bundle would then be
+// served from the previous release for the rest of the bucket. ReleaseIdentity
+// is the provider's durable identity for the release, the same tiers
+// boundRowSharesRelease compares, so a candidate rotation to different bytes
+// re-keys while an unchanged release keeps its warmed bundle. An identity-empty
+// row still keys by file id + inventory + bucket.
+//
+// Local rows key on the file row's size and mtime so a re-probed or replaced
+// file reads as a miss.
 type FontBundleKey struct {
-	FileID        int
-	PinnedResult  string // "" for local files
-	Size          int64
-	MtimeUnixNano int64
-	FFmpegPath    string
+	FileID          int
+	Virtual         bool
+	ReleaseIdentity string // durable provider identity; "" means unknown
+	InventoryToken  string // probed subtitle inventory; "" is a stable layout token
+	Size            int64
+	MtimeUnixNano   int64
+	FFmpegPath      string
 }
 
 // source resolves the stable cache identity and invalidation coordinates for
 // the key, mirroring subtitleCacheSource's two modes. Local rows use the file
 // row's mtime/size verbatim (no generation bucket); virtual rows key on the
-// pinned result id plus a generation bucket so a rotated source can
-// never be served past the bucket boundary. ok is false for rows that cannot
-// be keyed reliably (a local row without a usable mtime/size), which callers
-// treat as "do not cache" — the same fallback the DV RPU memo uses.
+// release identity and subtitle inventory plus a generation bucket so a
+// rotated source can never be served past the bucket boundary. A virtual row
+// without either identity still keys by file id + bucket. ok is false for rows
+// that cannot be keyed reliably (a local row without a usable mtime/size),
+// which callers treat as "do not cache" — the same fallback the DV RPU memo
+// uses.
 func (k FontBundleKey) source(now time.Time) (identity string, modTime time.Time, size int64, ok bool) {
-	if k.PinnedResult != "" {
+	if k.Virtual {
 		bucket := now.Unix() / int64(subtitleCacheGenerationBucket/time.Second)
-		return fontBundleIdentity(k.FileID, k.PinnedResult, k.FFmpegPath, bucket),
+		variant := k.ReleaseIdentity + "\x1f" + k.InventoryToken
+		return fontBundleIdentity(k.FileID, variant, k.FFmpegPath, bucket),
 			time.Unix(bucket*int64(subtitleCacheGenerationBucket/time.Second), 0), 0, true
 	}
 	if k.MtimeUnixNano == 0 || k.Size <= 0 {
@@ -2056,10 +2143,11 @@ func (k FontBundleKey) source(now time.Time) (identity string, modTime time.Time
 }
 
 // fontBundleIdentity hashes the stable components of a font-bundle cache key.
-// The ffmpeg path is included so a binary relocation (which can change
-// extraction output) starts a fresh cache.
-func fontBundleIdentity(fileID int, pinnedResult, ffmpegPath string, bucket int64) string {
-	sum := sha256.Sum256([]byte(fmt.Sprintf("%d|%s|%s|%d", fileID, pinnedResult, ffmpegPath, bucket)))
+// variant carries the virtual row's release identity and inventory token
+// (empty for local rows). The ffmpeg path is included so a binary relocation
+// (which can change extraction output) starts a fresh cache.
+func fontBundleIdentity(fileID int, variant, ffmpegPath string, bucket int64) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%d|%s|%s|%d", fileID, variant, ffmpegPath, bucket)))
 	return fmt.Sprintf("%x", sum[:12])
 }
 
@@ -2249,6 +2337,13 @@ func (c *SubtitleCache) startFontBundleFlight(ctx context.Context, key FontBundl
 		defer cancel()
 		data, extractErr := extract(extractCtx)
 		if extractErr != nil {
+			if errors.Is(extractErr, ErrRelayDemuxBusy) {
+				// The relay is already at its demux ceiling. Fonts are optional
+				// to playback, so this attempt is skipped without arming the
+				// failure backoff: a waiter gets the pending (empty bundle)
+				// shape and the next request retries once the pipe frees up.
+				return nil, context.DeadlineExceeded
+			}
 			c.noteFontBundleFailure(flightKey)
 			return nil, extractErr
 		}
@@ -2372,7 +2467,7 @@ func (c *SubtitleCache) WarmFontBundleInBackground(key FontBundleKey, extract fu
 		close(done)
 		return done
 	}
-	resultCh, ok := c.startFontBundleFlight(context.Background(), key, extract)
+	resultCh, ok := c.startFontBundleFlight(detachedRelayDemux(context.Background()), key, extract)
 	if !ok {
 		<-c.warmSem
 		close(done)

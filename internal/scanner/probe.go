@@ -170,10 +170,97 @@ func ProbeFile(ctx context.Context, ffprobePath string, filePath string) (*Probe
 	return probeFileWithin(ctx, ffprobePath, filePath, defaultProbeLimits)
 }
 
+// Fast version-candidate preprobe limits. A candidate preprobe only needs the
+// stream table and the format-level identity fields; it does not need ffprobe
+// to demux enough of the container to find every stream, which is what makes a
+// probe over a slow provider relay take seconds. -probesize 32 (bytes!) and
+// -analyzeduration 0 stop ffprobe from reading ahead, and
+// +discardcorrupt+fastseek+nobuffer keeps it from buffering or seeking
+// backwards on the relay. Note there is deliberately no -find_stream_info
+// option: it takes no argument, and a written "0" value breaks parsing. Its
+// absence is the fast behavior. A run whose result cannot support the caller's
+// identity or completeness gates escalates to the full probe (see
+// virtualFastProbeUsable), so the reduction never changes a verdict.
+const (
+	fastProbeSizeLimit       = "32"
+	fastProbeAnalyzeDuration = "0"
+	fastProbeFlags           = "+discardcorrupt+fastseek+nobuffer"
+	// fastProbeFFlagsOption names the fflags input option so the flag
+	// stays a single literal across the builder and its tests.
+	fastProbeFFlagsOption = "-fflags"
+)
+
+// buildFastProbeArgs returns the version-candidate preprobe argv. It is split
+// out so tests can assert the fast flags without executing a process.
+func buildFastProbeArgs(filePath string) []string {
+	return []string{
+		"-v", "error",
+		"-print_format", "json",
+		"-show_format",
+		"-show_streams",
+		"-show_chapters",
+		"-probesize", fastProbeSizeLimit,
+		"-analyzeduration", fastProbeAnalyzeDuration,
+		fastProbeFFlagsOption, fastProbeFlags,
+		filePath,
+	}
+}
+
+// probeFileFast runs the version-candidate preprobe argv. Unlike ProbeFile it
+// never falls back to a packet scan: a result that would need one is the
+// caller's signal to escalate to the full probe.
+func probeFileFast(ctx context.Context, ffprobePath string, filePath string) (*ProbeData, error) {
+	return probeFileFastWithin(ctx, ffprobePath, filePath, defaultProbeLimits)
+}
+
+func probeFileFastWithin(ctx context.Context, ffprobePath string, filePath string, limits probeLimits) (*ProbeData, error) {
+	probe, _, err := runProbeArgs(ctx, ffprobePath, filePath, buildFastProbeArgs(filePath), limits)
+	return probe, err
+}
+
 func probeFileWithin(ctx context.Context, ffprobePath string, filePath string, limits probeLimits) (*ProbeData, error) {
+	probe, raw, err := runProbeArgs(ctx, ffprobePath, filePath, buildProbeArgs(filePath), limits)
+	if err != nil {
+		return nil, err
+	}
+	if probe.Duration != 0 {
+		return probe, nil
+	}
+	frameRate, hasVideo := primaryVideoFrameRate(raw.Streams)
+	if !hasVideo {
+		return probe, nil
+	}
+	// A failed or empty packet scan must not discard the codec and
+	// track metadata that already parsed successfully: callers persist
+	// the partial probe, and the repair layer retries rows whose
+	// duration is still unknown.
+	size, _ := strconv.ParseInt(raw.Format.Size, 10, 64)
+	duration, packetErr := probeVideoPacketDuration(ctx, ffprobePath, filePath, frameRate, limits.packetScan(size), limits.waitDelay)
+	if packetErr == nil && duration > 0 {
+		probe.Duration = duration
+	}
+	if errors.Is(packetErr, errProbeTimeout) {
+		slog.WarnContext(ctx, "scanner: ffprobe packet scan timed out; the duration stays unknown until a later probe",
+			"component", "scanner",
+			"path", filePath,
+			"error", packetErr,
+		)
+	}
+
+	return probe, nil
+}
+
+// runProbeArgs runs one ffprobe argv and parses its bounded JSON output. It is
+// the shared body of the metadata probe and the fast candidate preprobe; the
+// packet-scan fallback stays with ProbeFile's caller so a fast run never
+// silently turns into a whole-file read.
+//
+// It returns the parsed output alongside the probe so ProbeFile can still read
+// format.size for the packet-scan deadline without a second execution.
+func runProbeArgs(ctx context.Context, ffprobePath string, filePath string, args []string, limits probeLimits) (*ProbeData, *ffprobeOutput, error) {
 	probeCtx, cancel := context.WithTimeout(ctx, limits.probe)
 	defer cancel()
-	cmd := exec.CommandContext(probeCtx, ffprobePath, buildProbeArgs(filePath)...) //nolint:gosec // ffprobePath is the configured binary and filePath is a catalog media path; no shell is involved.
+	cmd := exec.CommandContext(probeCtx, ffprobePath, args...) //nolint:gosec // ffprobePath is the configured binary and args are built here or in buildProbeArgs; no shell is involved.
 	killProcessGroupOnCancel(cmd)
 	cmd.WaitDelay = limits.waitDelay
 
@@ -190,56 +277,35 @@ func probeFileWithin(ctx context.Context, ffprobePath string, filePath string, l
 		// A producer may receive SIGPIPE after the bounded writer rejects its
 		// output, so the process error can mask the writer's sentinel.
 		if output.overflow || errors.Is(err, errFFprobeOutputTooLarge) {
-			return nil, errFFprobeOutputTooLarge
+			return nil, nil, errFFprobeOutputTooLarge
 		}
 		if probeTimedOut(ctx, probeCtx) {
-			return nil, fmt.Errorf("%w: no result for %s within %s", errProbeTimeout, filePath, limits.probe)
+			return nil, nil, fmt.Errorf("%w: no result for %s within %s", errProbeTimeout, filePath, limits.probe)
 		}
-		return nil, fmt.Errorf("ffprobe failed for %s: %w", filePath, err)
+		return nil, nil, fmt.Errorf("ffprobe failed for %s: %w", filePath, err)
 	}
 	// os/exec may report a successful process exit after its stdout copy
 	// goroutine consumed the Writer error. Keep an explicit overflow bit so a
 	// provider-controlled response can never fall through to JSON parsing.
 	if output.overflow {
-		return nil, errFFprobeOutputTooLarge
+		return nil, nil, errFFprobeOutputTooLarge
 	}
 	processmetrics.Record(processmetrics.Probe, cmd.ProcessState, nil, probeCtx.Err())
 
 	var raw ffprobeOutput
 	if err := json.Unmarshal(output.Bytes(), &raw); err != nil {
-		return nil, fmt.Errorf("ffprobe JSON parse failed for %s: %w", filePath, err)
+		return nil, nil, fmt.Errorf("ffprobe JSON parse failed for %s: %w", filePath, err)
 	}
 	if len(raw.Streams) > maxFFprobeStreams {
-		return nil, fmt.Errorf("ffprobe returned %d streams (maximum %d)", len(raw.Streams), maxFFprobeStreams)
+		return nil, nil, fmt.Errorf("ffprobe returned %d streams (maximum %d)", len(raw.Streams), maxFFprobeStreams)
 	}
 	if len(raw.Chapters) > maxFFprobeChapters {
-		return nil, fmt.Errorf("ffprobe returned %d chapters (maximum %d)", len(raw.Chapters), maxFFprobeChapters)
+		return nil, nil, fmt.Errorf("ffprobe returned %d chapters (maximum %d)", len(raw.Chapters), maxFFprobeChapters)
 	}
 
 	probe := convertProbeData(&raw)
 	applyMatroskaSubtitleTrackIDs(ctx, filePath, probe)
-	if probe.Duration == 0 {
-		if frameRate, hasVideo := primaryVideoFrameRate(raw.Streams); hasVideo {
-			// A failed or empty packet scan must not discard the codec and
-			// track metadata that already parsed successfully: callers persist
-			// the partial probe, and the repair layer retries rows whose
-			// duration is still unknown.
-			size, _ := strconv.ParseInt(raw.Format.Size, 10, 64)
-			duration, packetErr := probeVideoPacketDuration(ctx, ffprobePath, filePath, frameRate, limits.packetScan(size), limits.waitDelay)
-			if packetErr == nil && duration > 0 {
-				probe.Duration = duration
-			}
-			if errors.Is(packetErr, errProbeTimeout) {
-				slog.WarnContext(ctx, "scanner: ffprobe packet scan timed out; the duration stays unknown until a later probe",
-					"component", "scanner",
-					"path", filePath,
-					"error", packetErr,
-				)
-			}
-		}
-	}
-
-	return probe, nil
+	return probe, &raw, nil
 }
 
 // IsProbeRejection reports whether err, returned by ProbeFile for filePath
