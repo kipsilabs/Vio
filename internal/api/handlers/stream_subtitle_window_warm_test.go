@@ -1626,7 +1626,7 @@ func waitForLogLines(t *testing.T, argsLog string, want int) {
 		if countLogLines(t, argsLog) >= want {
 			return
 		}
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond) //nolint:forbidigo // Polls the fake ffmpeg invocation log; the detached extract has no completion channel.
 	}
 	t.Fatalf("ffmpeg invocations = %d, want at least %d", countLogLines(t, argsLog), want)
 }
