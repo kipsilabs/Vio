@@ -24,6 +24,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/userstore"
+	"github.com/Silo-Server/silo-server/internal/virtuallibrary/resolver"
 )
 
 // Playback service seams for the v2 adapter (internal/apiv2/playback.go).
@@ -671,8 +672,8 @@ func (h *PlaybackHandler) scrobblePauseTransitionV2(ctx context.Context, sess *p
 	if loadErr != nil || file == nil {
 		return
 	}
-	targetID := playbackProgressTarget(file)
-	if targetID == "" {
+	targetID, targetErr := h.playbackProgressTarget(ctx, file)
+	if targetErr != nil || targetID == "" {
 		return
 	}
 	event := h.scrobbleEventForSession(ctx, sess, targetID, float64(file.Duration), sess.Position)
@@ -793,7 +794,14 @@ func (h *PlaybackHandler) finalizeStopV2(ctx context.Context, store playback.Pro
 		// The poll context ends on the earlier of the request cancellation and
 		// the finalization deadline, so a store call that blocks does not escape
 		// the detached ceiling just because the request context is still live.
-		pollCtx, cancelPoll := cancelOnEither(finalCtx, ctx)
+		pollCtx, cancelPoll := context.WithCancel(finalCtx)
+		go func() {
+			select {
+			case <-ctx.Done():
+				cancelPoll()
+			case <-pollCtx.Done():
+			}
+		}()
 		defer cancelPoll()
 		for {
 			if replay, _, err := store.StopAttempt(pollCtx, sessionID, receipt.StopID, nil); err == nil {
@@ -1175,14 +1183,11 @@ func (h *PlaybackHandler) playbackInventoryForFileV3(ctx context.Context, sessio
 		VirtualSourceRevision: session.VirtualSourceRevision,
 	})
 	return playback.PlaybackInventoryV3{
-		SessionID:             session.ID,
-		InventoryRevision:     revision,
-		InventoryStatus:       status,
-		AudioTracks:           audioTracks,
-		SubtitleInventory:     subtitleInventory,
-		EffectiveMediaFileID:  effectiveFileID,
-		EffectiveVirtualURI:   effectiveVirtualURI,
-		VirtualSourceRevision: session.VirtualSourceRevision,
+		SessionID:         session.ID,
+		InventoryRevision: revision,
+		InventoryStatus:   status,
+		AudioTracks:       audioTracks,
+		SubtitleInventory: subtitleInventory,
 	}, nil
 }
 
@@ -1288,9 +1293,9 @@ func (h *PlaybackHandler) PublishSourceCommitted(ctx context.Context, sessionID 
 		return
 	}
 	event, err := playback.NewSourceCommittedEvent(sessionID, playback.SourceCommittedPayload{
-		EffectiveMediaFileID:  inventory.EffectiveMediaFileID,
-		EffectiveVirtualURI:   inventory.EffectiveVirtualURI,
-		VirtualSourceRevision: inventory.VirtualSourceRevision,
+		EffectiveMediaFileID:  session.MediaFileID,
+		EffectiveVirtualURI:   session.VirtualSourceURI,
+		VirtualSourceRevision: session.VirtualSourceRevision,
 		InventoryStatus:       inventory.InventoryStatus,
 		AudioTracks:           inventory.AudioTracks,
 	})
@@ -1468,7 +1473,7 @@ func (h *PlaybackHandler) probeRotatedVirtualCandidate(ctx context.Context, sess
 		ctx,
 		bestResultCacheKey(liveFile.ContentID, virtualPlaybackNeutralKey(live.VirtualSourceURI), live.VirtualSourceOwnerInstallationID),
 		liveFile, resolved.URL, probeTransient, probeCand,
-		h.virtualExpectedRuntimeMinutes(ctx, liveFile), live.VirtualSourceOwnerInstallationID,
+		resolver.PersistedIdentityTiers{}, h.virtualExpectedRuntimeMinutes(ctx, liveFile), live.VirtualSourceOwnerInstallationID,
 		generationFence,
 	)
 	return true
