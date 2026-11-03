@@ -24,7 +24,7 @@ func waitForAbandonedBeforeFirstSegment(t *testing.T, handler *PlaybackHandler, 
 		if time.Now().After(deadline) {
 			t.Fatal("the live generation never reached the abandoned-before-first-segment state")
 		}
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond) //nolint:forbidigo // Polls the live generation's abandoned flag; the fake FFmpeg's playlist write has no completion channel.
 	}
 }
 
