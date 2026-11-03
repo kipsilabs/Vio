@@ -95,6 +95,7 @@ type TranscodeStartRequest struct {
 	// receive it.
 	SubtitleRendition       bool                              `json:"subtitle_rendition,omitempty"`
 	SubtitleRenditionTracks []playback.SubtitleRenditionTrack `json:"subtitle_rendition_tracks,omitempty"`
+	SubtitleRenditionSource playback.SubtitleRenditionSource  `json:"subtitle_rendition_source,omitzero"`
 	TotalDuration           float64                           `json:"total_duration"`
 	RequireReady            bool                              `json:"require_ready,omitempty"`
 	// AutoFallbackReady asks the node to wait for the first manifest only when
@@ -2014,6 +2015,7 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		SubtitleCodec:           req.SubtitleCodec,
 		SubtitleRendition:       req.SubtitleRendition,
 		SubtitleRenditionTracks: req.SubtitleRenditionTracks,
+		SubtitleRenditionSource: req.SubtitleRenditionSource,
 		TotalDuration:           req.TotalDuration,
 		FastStart:               true,
 		NodeType:                "transcode",
@@ -2283,6 +2285,13 @@ func (s *Server) reconstructFromToken(r *http.Request, sessionID string, request
 				return (*playback.TranscodeSession)(nil), nil
 			}
 			resolved = *fetched
+		} else if s.recipeStore != nil {
+			// The token is authoritative for byte-affecting choices. The stored
+			// card may only enrich rendition presentation metadata after all
+			// authority and source identity checks match.
+			if fetched, ok := s.recipeStore.Get(r.Context(), sessionID); ok && fetched != nil && renditionMetadataMatches(card, *fetched) {
+				resolved.SubtitleRenditionTracks = mergeRenditionMetadata(card.SubtitleRenditionTracks, fetched.SubtitleRenditionTracks)
+			}
 		}
 		return s.spawnReconstruct(r, sessionID, requestedSegment, resolved)
 	})
@@ -2315,6 +2324,36 @@ func recipeServesTransport(card playback.RecipeCard, transportID string) bool {
 // complete and has to be resolved against the control-plane store.
 func recipeIsComplete(card playback.RecipeCard) bool {
 	return card.SegmentDuration > 0 && card.TargetCodecVideo != ""
+}
+
+// renditionMetadataMatches permits the control-plane recipe to enrich the
+// token's compact rendition records only when it describes the same authorized
+// transport and source. The token remains authoritative for selected defaults.
+func renditionMetadataMatches(token, stored playback.RecipeCard) bool {
+	if token.SessionID != stored.SessionID || token.TranscodeTransportID != stored.TranscodeTransportID ||
+		token.UserID != stored.UserID || token.ProfileID != stored.ProfileID || token.MediaFileID != stored.MediaFileID ||
+		token.InputPath != stored.InputPath || token.SubtitleRenditionSource != stored.SubtitleRenditionSource ||
+		len(token.SubtitleRenditionTracks) != len(stored.SubtitleRenditionTracks) {
+		return false
+	}
+	for i := range token.SubtitleRenditionTracks {
+		if token.SubtitleRenditionTracks[i].TrackNumber != stored.SubtitleRenditionTracks[i].TrackNumber {
+			return false
+		}
+	}
+	return true
+}
+
+func mergeRenditionMetadata(token, stored []playback.SubtitleRenditionTrack) []playback.SubtitleRenditionTrack {
+	if len(token) != len(stored) {
+		return token
+	}
+	merged := make([]playback.SubtitleRenditionTrack, len(token))
+	copy(merged, stored)
+	for i := range merged {
+		merged[i].Default = token[i].Default
+	}
+	return merged
 }
 
 // spawnReconstruct re-spawns ffmpeg for a lost session from its recipe card and
