@@ -108,7 +108,10 @@ type PlannerInputV3 struct {
 	// SubtitleRenditionExecutable reports whether some policy-eligible HLS
 	// video executor can emit an HLS subtitle rendition. Nil means none can.
 	// Lazy for the same reason as the HLS registries.
-	SubtitleRenditionExecutable func() bool
+	SubtitleRenditionExecutable               func() bool
+	OnDemandSubtitleRenditionsExecutable      func() bool
+	RemuxOnDemandSubtitleRenditionsExecutable func() bool
+	CueIndexedSubtitleTracks                  func() *CueIndexedSubtitles
 	// RemuxSubtitleRenditionExecutable is SubtitleRenditionExecutable for an
 	// HLS copy remux, whose executors are chosen under the remux routing
 	// policy and must advertise TransportFeatureHLSRemuxSubtitleRenditionV1.

@@ -308,7 +308,7 @@ func TestResolveSubtitlePolicyV3ResolvesRenumberedPublishedOrdinal(t *testing.T)
 	req.SubtitleTrackIndex = &index
 	req.SubtitleTrackID = TrackIDV3(file.ID, "subtitle", index)
 
-	result := ResolveSubtitlePolicyV3(file, req, true, DeliveryClassOriginalHTTPV3, nil)
+	result := ResolveSubtitlePolicyV3(file, req, true, DeliveryClassOriginalHTTPV3, nil, 0, UnknownSubtitleTrackFactsV3{})
 	if result.Terminal != nil {
 		t.Fatalf("terminal = %#v, want the renumbered selection resolved", result.Terminal)
 	}

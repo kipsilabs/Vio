@@ -22,6 +22,8 @@ import (
 	"github.com/Silo-Server/silo-server/internal/lang"
 )
 
+const maxOnDemandSubtitleRenditions = 64
+
 // On-demand subtitle renditions list every embedded text track of the source
 // as a WebVTT SUBTITLES rendition of its own, in one group, instead of the one
 // selected track the stream's FFmpeg demuxes (subtitle_rendition.go). Each
