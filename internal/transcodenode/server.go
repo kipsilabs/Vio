@@ -51,6 +51,8 @@ type TranscodeStartRequest struct {
 	SourceVideoCodec           string                 `json:"source_video_codec"`
 	SourceVideoProfile         string                 `json:"source_video_profile,omitempty"`
 	SourceVideoBitDepth        int                    `json:"source_video_bit_depth,omitempty"`
+	SourceFrameRate            float64                `json:"source_frame_rate,omitempty"`
+	SourceHeight               int                    `json:"source_height,omitempty"`
 	SourceAudioChannels        int                    `json:"source_audio_channels,omitempty"`
 	AudioRecipeVersion         string                 `json:"audio_recipe_version,omitempty"`
 	CopyFMP4RecipeVersion      string                 `json:"copy_fmp4_recipe_version,omitempty"`
@@ -91,9 +93,10 @@ type TranscodeStartRequest struct {
 	// the playlist's WebVTT subtitle rendition. Only nodes advertising
 	// playback.HLSSubtitleRenditionTransportFeatureV3 for the video target
 	// receive it.
-	SubtitleRendition bool    `json:"subtitle_rendition,omitempty"`
-	TotalDuration     float64 `json:"total_duration"`
-	RequireReady      bool    `json:"require_ready,omitempty"`
+	SubtitleRendition       bool                              `json:"subtitle_rendition,omitempty"`
+	SubtitleRenditionTracks []playback.SubtitleRenditionTrack `json:"subtitle_rendition_tracks,omitempty"`
+	TotalDuration           float64                           `json:"total_duration"`
+	RequireReady            bool                              `json:"require_ready,omitempty"`
 	// AutoFallbackReady asks the node to wait for the first manifest only when
 	// its own hw_accel=auto fallback is enabled for this start, so an early
 	// hardware failure can move to a safer path. The node decides from its
@@ -138,7 +141,8 @@ type TranscodeStartResponse struct {
 	// rendition. Older nodes omit it and are rejected before the plan
 	// promises a rendition their playlist does not carry; nodes that predate
 	// remux renditions omit it for a copy remux.
-	SubtitleRendition bool `json:"subtitle_rendition,omitempty"`
+	SubtitleRendition       bool `json:"subtitle_rendition,omitempty"`
+	SubtitleRenditionTracks int  `json:"subtitle_rendition_tracks,omitempty"`
 	// CopyVideoMPEGTS attests that the executor packages the requested copy
 	// remux as MPEG-TS. Older nodes omit it and are rejected before an fMP4
 	// stream is published under a plan that promises MPEG-TS.
@@ -240,6 +244,9 @@ var ErrSubtitleRenditionAttestationMismatch = errors.New("transcode node subtitl
 // with older nodes, which omit the field.
 func ValidateSubtitleRenditionAttestation(req TranscodeStartRequest, response TranscodeStartResponse) error {
 	if req.SubtitleRendition && !response.SubtitleRendition {
+		return ErrSubtitleRenditionAttestationMismatch
+	}
+	if len(req.SubtitleRenditionTracks) > 0 && response.SubtitleRenditionTracks != len(req.SubtitleRenditionTracks) {
 		return ErrSubtitleRenditionAttestationMismatch
 	}
 	return nil
@@ -1999,18 +2006,19 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		// This node's configured device (or device list — StartTranscode
 		// resolves it to one GPU), matching what reconstruction uses so fresh
 		// and reconstructed sessions balance identically.
-		HWDevice:           cfg.Playback.HWDevice,
-		AudioTrackIndex:    req.AudioTrackIndex,
-		RequireAudioTrack:  req.RequireAudioTrack,
-		SubtitleTrackIndex: req.SubtitleTrackIndex,
-		SubtitleBurnIn:     req.SubtitleBurnIn,
-		SubtitleCodec:      req.SubtitleCodec,
-		SubtitleRendition:  req.SubtitleRendition,
-		TotalDuration:      req.TotalDuration,
-		FastStart:          true,
-		NodeType:           "transcode",
-		ExecutionMode:      "transcode_node",
-		FFmpegLogSink:      s.ffmpegSink,
+		HWDevice:                cfg.Playback.HWDevice,
+		AudioTrackIndex:         req.AudioTrackIndex,
+		RequireAudioTrack:       req.RequireAudioTrack,
+		SubtitleTrackIndex:      req.SubtitleTrackIndex,
+		SubtitleBurnIn:          req.SubtitleBurnIn,
+		SubtitleCodec:           req.SubtitleCodec,
+		SubtitleRendition:       req.SubtitleRendition,
+		SubtitleRenditionTracks: req.SubtitleRenditionTracks,
+		TotalDuration:           req.TotalDuration,
+		FastStart:               true,
+		NodeType:                "transcode",
+		ExecutionMode:           "transcode_node",
+		FFmpegLogSink:           s.ffmpegSink,
 	}
 
 	if opts.HWAccel == "" && cfg.Playback.HWAccel != "" {
@@ -2158,19 +2166,20 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusAccepted)
 	_ = json.NewEncoder(w).Encode(TranscodeStartResponse{
-		SessionID:             req.SessionID,
-		Status:                "started",
-		HWAccel:               effectiveHWAccel,
-		EncoderHWAccel:        encoderHWAccel,
-		ToneMapMode:           session.Opts().ToneMapMode,
-		AudioRecipeVersion:    req.AudioRecipeVersion,
-		RequireAudioTrack:     session.Opts().RequireAudioTrack,
-		CopyFMP4RecipeVersion: req.CopyFMP4RecipeVersion,
-		ThrottleSeconds:       req.ThrottleSeconds,
-		SoftwareVideoDecode:   session.Opts().SoftwareVideoDecode,
-		KeyframePlaylist:      session.Opts().KeyframePlaylist,
-		SubtitleRendition:     session.HasSubtitleRendition(),
-		CopyVideoMPEGTS:       session.Opts().CopyVideoMPEGTS,
+		SessionID:               req.SessionID,
+		Status:                  "started",
+		HWAccel:                 effectiveHWAccel,
+		EncoderHWAccel:          encoderHWAccel,
+		ToneMapMode:             session.Opts().ToneMapMode,
+		AudioRecipeVersion:      req.AudioRecipeVersion,
+		RequireAudioTrack:       session.Opts().RequireAudioTrack,
+		CopyFMP4RecipeVersion:   req.CopyFMP4RecipeVersion,
+		ThrottleSeconds:         req.ThrottleSeconds,
+		SoftwareVideoDecode:     session.Opts().SoftwareVideoDecode,
+		KeyframePlaylist:        session.Opts().KeyframePlaylist,
+		SubtitleRendition:       session.HasSubtitleRendition(),
+		SubtitleRenditionTracks: len(session.Opts().SubtitleRenditionTracks),
+		CopyVideoMPEGTS:         session.Opts().CopyVideoMPEGTS,
 	})
 }
 
@@ -3151,10 +3160,10 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 	}
 	s.attachTelemetrySession(r, sessionID)
 
-	if subtitleSegment, ok := playback.ParseSubtitleSegmentNumber(name); ok {
+	if _, ok := playback.ParseSubtitleSegmentNumber(name); ok {
 		// Subtitle rendition segments never wait out or restart the video
 		// pipeline: they are answered from the cues already on disk.
-		session.ServeSubtitleSegment(w, r, subtitleSegment)
+		session.ServeSubtitleSegment(w, r, name)
 		return
 	}
 	// A generation whose decoder has rejected the source cannot produce a
@@ -3275,7 +3284,7 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 			}
 
 			if errors.Is(err, playback.ErrSegmentNotFound) && decision.RestartOnTimeout {
-				target, ok, restartErr := s.restartSegmentLocked(
+				_, _, restartErr := s.restartSegmentLocked(
 					r.Context(),
 					sessionID,
 					session,
@@ -3328,7 +3337,7 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 						continuationServe = true
 					}
 				} else {
-					target, ok, restartErr := s.restartSegmentLocked(
+					_, _, restartErr := s.restartSegmentLocked(
 						r.Context(),
 						sessionID,
 						session,
