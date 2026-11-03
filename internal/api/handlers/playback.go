@@ -37,6 +37,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/playback/connectionstore"
 	"github.com/Silo-Server/silo-server/internal/remotestream"
+	"github.com/Silo-Server/silo-server/internal/scanner"
 	"github.com/Silo-Server/silo-server/internal/settingscontract"
 	"github.com/Silo-Server/silo-server/internal/settingskeys"
 	"github.com/Silo-Server/silo-server/internal/settingsresolve"
@@ -491,6 +492,7 @@ type PlaybackHandler struct {
 	SessionRecipeStore sessionRecipeStoreV3
 	ItemAccess         PlaybackItemAccessChecker // optional; enables file authorization checks
 	ItemLookup         PlaybackItemLookup
+	VirtualFileLookup  VirtualFileLookup
 	EpisodeLookup      PlaybackEpisodeLookup      // optional; resolves episode files to their series
 	EpisodeAliasLookup PlaybackEpisodeAliasLookup // optional; canonicalizes alias episode identities
 	// virtualSticky remembers the last virtual candidate URI that played
@@ -985,7 +987,7 @@ func NewPlaybackHandler(sessionMgr SessionManagerInterface, opts ...FilePathReso
 		if !h.tm.CloseTranscodeSessionIf(sessionID, dead, nodeURL) {
 			return
 		}
-		if err := h.stopPlaybackSessionByID(ctx, sessionID, ""); err != nil && !errors.Is(err, playback.ErrSessionNotFound) {
+		if err := h.stopPlaybackSessionByID(ctx, sessionID, false); err != nil && !errors.Is(err, playback.ErrSessionNotFound) {
 			slog.ErrorContext(ctx, "failed to stop playback after local transcode exit", "component", "api", "session", sessionID, "error", err, "playback_session_id", sessionID)
 		}
 	}
@@ -2227,7 +2229,7 @@ func (h *PlaybackHandler) finalizeSessionStop(ctx context.Context, session *play
 // passes none.
 func (h *PlaybackHandler) finalizeSessionStopWithResult(ctx context.Context, session *playback.Session, syncNow bool, syncReason string, reason PlaybackEndReason) watchstate.PlaybackStopResult {
 	if h == nil || session == nil || session.ID == "" {
-		return watchstate.PlaybackStopResult{}, nil
+		return watchstate.PlaybackStopResult{}
 	}
 	// Cancel and await the session's start side effects under their own bounded
 	// budget before taking the durable-write budget. The wait can run as long as
