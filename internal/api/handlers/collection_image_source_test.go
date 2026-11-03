@@ -170,7 +170,7 @@ func TestPersonalCollageFetchesLocalArtworkStorage(t *testing.T) {
 
 	detail := &catalog.DetailService{}
 	detail.SetImageResolver(collageSourceResolver{})
-	gen := NewPersonalCollectionCollageGenerator(blobstoretest.NewDirect(server.URL), detail, nil, nil)
+	gen := NewPersonalCollectionCollageGenerator(blobstoretest.NewDirect(server.URL), detail, nil, nil, nil)
 	if gen == nil {
 		t.Fatal("no collage generator")
 	}

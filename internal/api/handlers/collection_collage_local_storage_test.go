@@ -68,7 +68,7 @@ func TestCollageReadsPostersFromLocalArtworkStorage(t *testing.T) {
 		"local/movies/title-4/3d4e5f60/poster/original.webp",
 	}
 	store, detail, signer := localStorageCollageFixture(t, sources)
-	gen := NewPersonalCollectionCollageGenerator(store, detail, signer, nil)
+	gen := NewPersonalCollectionCollageGenerator(store, detail, signer, nil, nil)
 	if gen == nil {
 		t.Fatal("no collage generator")
 	}

@@ -26,6 +26,8 @@ import (
 // Shared artwork helpers used by both the admin library_collections handler
 // and the user collections handler. The S3 prefix differs so the two
 // namespaces don't collide.
+var errCollageArtworkSignerNotConfigured = errors.New("collage artwork signer is not configured")
+
 const (
 	adminCollectionImagePrefix = "collection-images"
 	userCollectionImagePrefix  = "user-collection-images"
@@ -392,6 +394,7 @@ type collectionCollageComposer struct {
 	store      blobstore.Store
 	posters    itemPosterSigner
 	signer     *artworkurl.Signer
+	repair     ArtworkRepairEnqueuer
 	httpClient *http.Client
 }
 
@@ -401,14 +404,14 @@ type collectionCollageComposer struct {
 // personal collections without collages. signer is the artwork URL signer
 // that local storage resolves posters with; nil when storage serves its own
 // URLs. A nil httpClient uses newCollectionImageClient.
-func NewPersonalCollectionCollageGenerator(store blobstore.Store, posters itemPosterSigner, signer *artworkurl.Signer, httpClient *http.Client) catalog.CollageGenerator {
+func NewPersonalCollectionCollageGenerator(store blobstore.Store, posters itemPosterSigner, signer *artworkurl.Signer, repair ArtworkRepairEnqueuer, httpClient *http.Client) catalog.CollageGenerator {
 	if store == nil || posters == nil {
 		return nil
 	}
 	if httpClient == nil {
 		httpClient = newCollectionImageClient()
 	}
-	return collectionCollageComposer{prefix: userCollectionImagePrefix, store: store, posters: posters, signer: signer, httpClient: httpClient}
+	return collectionCollageComposer{prefix: userCollectionImagePrefix, store: store, posters: posters, signer: signer, repair: repair, httpClient: httpClient}
 }
 
 // ComposeCollectionCollage fetches the source posters, composes them and

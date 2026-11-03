@@ -1308,7 +1308,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 		personalMemberCounts = catalog.NewPersonalCollectionMemberCounts(deps.DB)
 	}
 	if deps.DB != nil && detailSvc != nil {
-		if gen := handlers.NewPersonalCollectionCollageGenerator(deps.Blobs.Assets, detailSvc, deps.ArtworkSigner, nil); gen != nil {
+		if gen := handlers.NewPersonalCollectionCollageGenerator(deps.Blobs.Assets, detailSvc, deps.ArtworkSigner, deps.ArtworkRepair, nil); gen != nil {
 			personalCollages = deps.PersonalCollectionCollages
 			if personalCollages == nil {
 				personalCollages = catalog.NewPersonalCollectionCollages(deps.DB, nil)
