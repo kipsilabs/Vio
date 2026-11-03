@@ -76,9 +76,7 @@ const (
 	SessionQuotaEnforce = "enforce"
 )
 
-// SessionQuotaConfig is a token bucket per sign-in session: it holds Burst
-// requests and refills at RequestsPerHour. The per-second and per-minute
-// budgets stop bursts; this one stops a client that stays under them all day.
+// SessionQuotaConfig is a token bucket per sign-in session.
 type SessionQuotaConfig struct {
 	Mode            string
 	RequestsPerHour float64
@@ -97,6 +95,7 @@ func DefaultConfig() Config {
 		IPReqPerSecond: 120,
 		IPReqPerMinute: 6000,
 		IPBurst:        120,
+		Session:        SessionQuotaConfig{Mode: SessionQuotaLog, RequestsPerHour: 10000, Burst: 30000},
 		AuthEndpoints: map[string]AuthEndpointConfig{
 			"login":           {RequestsPerMinute: 20, Burst: 10},
 			"signup":          {RequestsPerMinute: 10, Burst: 6},
@@ -118,17 +117,6 @@ func DefaultConfig() Config {
 			// Public autoscan webhook intake. Generous: arr fires one delivery
 			// per imported file, so season packs are legitimate bursts.
 			"autoscan_webhook": {RequestsPerMinute: 60, Burst: 30},
-			// Session-less Apple push retirement. The 256-bit installation
-			// key is the guard; this is anti-probe hygiene.
-			"apple_push_retire": {RequestsPerMinute: 20, Burst: 10},
-			// Session-less Android push retirement. The 256-bit installation
-			// key is the guard; this is anti-probe hygiene.
-			"android_push_retire": {RequestsPerMinute: 20, Burst: 10},
 		},
-		// Sized from production traffic: the busiest first-party sessions
-		// stayed under 20,000 in an hour and rarely above 10,000, while a
-		// polling integration ran at 30,000 an hour around the clock. Log
-		// until an admin chooses to enforce.
-		Session: SessionQuotaConfig{Mode: SessionQuotaLog, RequestsPerHour: 10000, Burst: 30000},
 	}
 }

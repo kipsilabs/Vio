@@ -122,11 +122,12 @@ func NVENCSoftwareFallbackPixelFormat(sourceVideoBitDepth int) string {
 type SourceKind string
 
 const (
-	SourcePQ        SourceKind = "pq"
-	SourceHLG       SourceKind = DynamicRangeHLG
-	SourceHLGBT709  SourceKind = "hlg_bt709"
-	SourceSDRBT709  SourceKind = "sdr_bt709"
-	SourceSDRBT2020 SourceKind = "sdr_bt2020"
+	SourcePQ          SourceKind = "pq"
+	SourcePQFullRange SourceKind = "pq_full_range"
+	SourceHLG         SourceKind = DynamicRangeHLG
+	SourceHLGBT709    SourceKind = "hlg_bt709"
+	SourceSDRBT709    SourceKind = "sdr_bt709"
+	SourceSDRBT2020   SourceKind = "sdr_bt2020"
 	// SourceDolbyVision is a Dolby Vision base layer that is not a standard
 	// signal on its own: Profile 5's IPTPQc2, or a compatibility id of 0. Only
 	// an executor that applies the stream's RPU reshaping can convert it; read
@@ -530,6 +531,15 @@ func IsSDRSource(kind SourceKind) bool {
 	return kind == SourceSDRBT709 || kind == SourceSDRBT2020
 }
 
+// SoftwareUploadFilter moves CPU-decoded frames onto a hardware device.
+func SoftwareUploadFilter(kind SourceKind) string {
+	format := "p010le"
+	if IsSDRSource(kind) {
+		format = "nv12"
+	}
+	return "format=" + format + ",hwupload,"
+}
+
 // AllSourceKinds returns every base signal supported by capability probes.
 func AllSourceKinds() []SourceKind {
 	return append(StandardSourceKinds(), SourceDolbyVision)
@@ -785,46 +795,6 @@ func QSVOpenCLReturnFilter() string {
 	return "hwmap=derive_device=vaapi:mode=write:reverse=1:extra_hw_frames=16,format=vaapi"
 }
 
-// QSVVPPTailFilter is QSVFilter with a shorter device tail: the OpenCL
-// tone-map result is mapped straight to the QSV device instead of detouring
-// back through a VAAPI surface. The subsequent vpp_qsv scale runs on the media
-// engine, so one interop hop and the shader-based VAAPI scale disappear while
-// the tone-map stage itself is byte-for-byte the validated OpenCL recipe.
-func QSVVPPTailFilter(kind SourceKind) string {
-	if IsSDRSource(kind) {
-		return VAAPIFilter(kind) + "," + qsvWriteMapFilter()
-	}
-	return SourceParameters(kind) +
-		",scale_vaapi=format=p010" +
-		",hwmap=derive_device=opencl:mode=read" +
-		"," + openCLToneMapFilter(kind) +
-		"," + qsvWriteMapFilter()
-}
-
-// qsvWriteMapFilter derives the QSV device from the current hardware frames
-// with write access. reverse=1 and extra_hw_frames=16 are required for the
-// mapping to own its output surfaces.
-func qsvWriteMapFilter() string {
-	return "hwmap=derive_device=qsv:mode=write:reverse=1:extra_hw_frames=16,format=qsv"
-}
-
-// QSVVPPToneMapFilter builds the opt-in Intel media-engine HDR-to-SDR
-// conversion: VAAPI-decoded frames are mapped to QSV and converted by
-// vpp_qsv's hardware tonemapper. It replaces the OpenCL chain only when an
-// administrator enables playback.transcode_vpp_tone_map_enabled, because VPP
-// tone mapping is cheaper but not quality-identical to the OpenCL BT.2390
-// recipe. SDR base layers need no luminance mapping and keep the VAAPI color
-// conversion.
-func QSVVPPToneMapFilter(kind SourceKind) string {
-	if IsSDRSource(kind) {
-		return VAAPIFilter(kind) + "," + qsvWriteMapFilter()
-	}
-	return SourceParameters(kind) +
-		",scale_vaapi=format=p010" +
-		",hwmap=derive_device=qsv:mode=read+write,format=qsv" +
-		"," + HardwareFilterQSVVPP + "=tonemap=1:format=nv12:out_color_matrix=bt709:out_color_primaries=bt709:out_color_transfer=bt709:out_range=tv"
-}
-
 // toneMapPeakOption pins the source peak tonemapx and tonemap_opencl map to
 // SDR at 1000 nits (the option counts in tens of nits), so every source
 // converts on the same curve. Left unset, both filters read a Dolby Vision
@@ -941,4 +911,75 @@ func HDRMetadataRemovalFilter() string {
 		"sidedata=mode=delete:type=DOVI_RPU_BUFFER",
 		"sidedata=mode=delete:type=DOVI_METADATA",
 	}, ",")
+}
+
+func IntelFilter(kind SourceKind, height int) string {
+	if IsSDRSource(kind) {
+		filter := VAAPIFilter(kind)
+		if height > 0 {
+			filter += ",scale_vaapi=w=-2:h=" + strconv.Itoa(height) + ":format=nv12"
+		}
+		return filter
+	}
+	return IntelOpenCLToneMapFilter(kind, height) + "," + IntelOpenCLReturnFilter()
+}
+
+// IntelOpenCLToneMapFilter is the HDR part of IntelFilter that ends with the
+// tone-mapped frame still on the OpenCL device, for graphs that composite onto
+// it there. IntelOpenCLReturnFilter then hands it back to VAAPI.
+
+func VAAPIOpenCLInitArgs(alias, filter string, kind SourceKind) []string {
+	if !OpenCLToneMaps(filter, kind) {
+		return nil
+	}
+	return []string{initHWDeviceFlag, "opencl=ocl@" + alias}
+}
+
+// OpenCLToneMaps reports whether a recipe frozen with filter converts kind on
+// OpenCL. SDR bases convert on VAAPI alone, so they keep working on a host
+// without an OpenCL runtime.
+// IntelFilter builds the Intel HDR-to-SDR conversion graph that QSV and VAAPI
+// on an Intel GPU share, scaled to height (0 keeps the source size). Intel's
+// VAAPI/VPP tone mapper crushes PQ midtones and turns HLG teal and inverted
+// (#2414), so HDR frames take Jellyfin FFmpeg's GPU OpenCL path and return to
+// VAAPI surfaces, which the VAAPI encoder takes directly and QSV takes through
+// QSVInteropFilter. SDR base layers only need color conversion and retain the
+// cheaper VAAPI path.
+//
+// HDR frames are scaled before tone mapping, never after. A VAAPI filter that
+// reads the OpenCL output releases the surface back to the tone mapper's pool
+// without waiting for the GPU, and on Intel Arrow Lake (iHD 26.3, jellyfin-ffmpeg
+// 8.1.3) the scaled frames then came out with blocks of the next frame during
+// motion, although the OpenCL interop should order that access itself. Passing
+// the surface straight to the encoder, which holds it until the encode
+// completes, avoids it.
+func IntelOpenCLToneMapFilter(kind SourceKind, height int) string {
+	size := ""
+	if height > 0 {
+		size = "w=-2:h=" + strconv.Itoa(height) + ":"
+	}
+	return SourceParameters(kind) +
+		",scale_vaapi=" + size + "format=p010" +
+		",hwmap=derive_device=opencl:mode=read" +
+		"," + openCLToneMapFilter(kind)
+}
+
+// IntelOpenCLReturnFilter hands OpenCL frames back to VAAPI: the reverse hwmap
+// makes the filter before it render into VAAPI surfaces, so that filter must
+// allocate its output frames rather than pass its input through. Before a QSV
+// encode only QSVInteropFilter may follow it, and before a VAAPI encode no
+// VAAPI filter may.
+
+func IntelOpenCLReturnFilter() string {
+	return "hwmap=derive_device=vaapi:mode=write:reverse=1:extra_hw_frames=16,format=vaapi"
+}
+
+// toneMapPeakOption pins the source peak tonemapx and tonemap_opencl map to
+// SDR at 1000 nits (the option counts in tens of nits), so every source
+// converts on the same curve. Left unset, both filters read a Dolby Vision
+// frame's peak from its RPU instead, and a title mastered at 4000 nits comes
+// out about a third darker in the midtones.
+
+func OpenCLToneMaps(filter string, kind SourceKind) bool {
+	return filter == HardwareFilterOpenCL && !IsSDRSource(kind)
 }

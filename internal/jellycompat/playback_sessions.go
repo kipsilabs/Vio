@@ -104,8 +104,10 @@ type PlaybackSession struct {
 
 // PlaybackMediaSource stores one negotiated stream source within a compat play session.
 type PlaybackMediaSource struct {
-	ServerBitrateCapKbps int
-	StreamLocation       string // bitrate-policy classification fixed by PlaybackInfo
+	VirtualSourceURI                 string
+	VirtualSourceOwnerInstallationID int
+	ServerBitrateCapKbps             int
+	StreamLocation                   string // bitrate-policy classification fixed by PlaybackInfo
 	// SiloSeekReanchor opts into source-time copy-HLS startup for clients that
 	// renegotiate seeks outside the produced playlist window.
 	SiloSeekReanchor         bool

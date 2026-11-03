@@ -63,8 +63,8 @@ type playbackInfoRequest struct {
 	SiloSeekReanchor                    bool            `json:"SiloSeekReanchor"`
 	UserID                              string          `json:"UserId"`
 	MediaSourceID                       string          `json:"MediaSourceId"`
-	AudioStreamIndex                    compatIntValue  `json:"AudioStreamIndex"`
-	SubtitleStreamIndex                 compatIntValue  `json:"SubtitleStreamIndex"`
+	AudioStreamIndex                    *compatIntValue `json:"AudioStreamIndex"`
+	SubtitleStreamIndex                 *compatIntValue `json:"SubtitleStreamIndex"`
 	MaxStreamingBitrate                 int64           `json:"MaxStreamingBitrate"`
 	MaxAudioChannels                    int             `json:"MaxAudioChannels"`
 	AlwaysBurnInSubtitleWhenTranscoding bool            `json:"AlwaysBurnInSubtitleWhenTranscoding"`
@@ -345,6 +345,7 @@ type PlaybackHandler struct {
 	accessFilter            AccessFilterResolver // the viewer's scope for downloads
 	storeProvider           userstore.UserStoreProvider
 	ScopeResolver           ScopeResolver
+	DeviceProfilePersister  DeviceProfilePersister
 	NodePlanner             nodepool.SessionPlanner
 	JWTSecret               string
 	signalsNotifier         signalsChangedNotifier
@@ -367,13 +368,25 @@ type PlaybackHandler struct {
 	ExternalTimings subtitles.ExternalTimingLookup
 	// PlaySync aligns a subtitle the first time a client is served it, when
 	// it was never synced; nil leaves that to a request.
-	PlaySync               subtitles.PlaySyncer
-	Trickplay              TrickplaySheets       // optional; serves seek-bar preview sheets
-	SettingsRepo           SettingsReader        // optional; reads watched threshold setting
-	SessionSyncer          PlaybackSessionSyncer // optional; enables immediate session sync to shared admin view
-	WatchScrobbler         PlaybackWatchScrobbler
-	StableIdentityResolver watchsync.ScrobbleIdentityResolver
-	terminalFallbackDelay  time.Duration
+	PlaySync                       subtitles.PlaySyncer
+	Trickplay                      TrickplaySheets       // optional; serves seek-bar preview sheets
+	SettingsRepo                   SettingsReader        // optional; reads watched threshold setting
+	SessionSyncer                  PlaybackSessionSyncer // optional; enables immediate session sync to shared admin view
+	WatchScrobbler                 PlaybackWatchScrobbler
+	StableIdentityResolver         watchsync.ScrobbleIdentityResolver
+	VirtualMediaResolver           VirtualMediaResolver
+	VirtualMediaRefreshResolver    VirtualMediaRefreshResolver
+	VirtualMediaDetailedResolver   VirtualMediaDetailedResolver
+	VirtualPlaybackStreamLister    VirtualPlaybackStreamLister
+	VirtualSourceProber            VirtualSourceProber
+	VirtualSourceProberWithHeaders VirtualSourceProberWithHeaders
+	VirtualFileSaver               VirtualFileSaver
+	VirtualFileMetadataSaver       VirtualFileMetadataSaver
+	VirtualCandidateFileLookup     VirtualCandidateFileLookup
+	RemoteStreamRelay              RemoteStreamRelay
+	AllowInsecureVirtual           func(installationID int) bool
+	AllowPrivateStreams            func(installationID int) bool
+	terminalFallbackDelay          time.Duration
 	// RecipeNodeStore hands a remote transcode's reconstruction recipe to the
 	// control-plane recipe store (Redis) so a dedicated transcode node that
 	// restarts can rebuild ffmpeg from it. The node-hop token is server-minted and
@@ -400,7 +413,10 @@ type PlaybackHandler struct {
 	// compatScrobbleLocks orders each upstream session's start, report, and
 	// terminal-staging scrobbles; see sendCompatResumeStart, applyCompatReport,
 	// and stageCompatStop.
-	compatScrobbleLocks compatScrobbleLocks
+	compatScrobbleLocks    compatScrobbleLocks
+	compatBackgroundMu     sync.Mutex
+	compatBackgroundClosed bool
+	compatBackgroundWG     sync.WaitGroup
 }
 
 func (h *PlaybackHandler) serverBitrateCap(ctx context.Context, session *Session) (int, error) {
@@ -1638,6 +1654,42 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 			return fmt.Errorf("bind transcode node: %w", err)
 		}
 	}
+
+	// Virtual sources are durable canonical URIs, but a remote worker cannot
+	// dereference them directly. Resolve them through the relay while retaining
+	// the canonical URI (and provider owner) in the recipe for reconstruction.
+	if isCompatVirtualSource(source) || isCompatVirtualFile(file) {
+		canonicalPath := strings.TrimSpace(source.VirtualSourceURI)
+		if canonicalPath == "" {
+			canonicalPath = strings.TrimSpace(source.Version.FilePath)
+		}
+		if h.tm == nil || h.tm.ResolveInput == nil || canonicalPath == "" {
+			h.tm.StopRemoteTranscode(upstreamSessionID, transcodeNodeURL)
+			return errors.New("unresolved virtual source cannot be dispatched")
+		}
+		userID := 0
+		profileID := ""
+		if h.sessionMgr != nil {
+			if upstream, err := h.sessionMgr.GetSession(upstreamSessionID); err == nil && upstream != nil {
+				userID, profileID = upstream.UserID, upstream.ProfileID
+			}
+		}
+		resolved, cleanup, err := h.tm.ResolveInput(ctx, source.FileID, source.VirtualSourceOwnerInstallationID, userID, profileID, canonicalPath)
+		if err != nil || strings.TrimSpace(resolved) == "" {
+			if cleanup != nil {
+				cleanup()
+			}
+			h.tm.StopRemoteTranscode(upstreamSessionID, transcodeNodeURL)
+			if err != nil {
+				return fmt.Errorf("resolve virtual source for remote transcode: %w", err)
+			}
+			return errors.New("unresolved virtual source cannot be dispatched")
+		}
+		fileCopy := *file
+		fileCopy.FilePath = resolved
+		file = &fileCopy
+		// The recipe builder uses CanonicalInputPath and owner metadata below.
+	}
 	if !compatHLSCopiesVideo(source) && is4KResolution(source.Version.Resolution) && !h.allow4KVideoTranscode(ctx) {
 		return errTranscode4KDisallowed
 	}
@@ -1842,6 +1894,12 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 		err = errors.New("remote transcode node did not confirm tone-map mode")
 		cleanupRequired = true
 	}
+	if err == nil && status == http.StatusAccepted {
+		if attestationErr := transcodenode.ValidateCopyVideoMPEGTSAttestation(reqBody, nodeResponse); attestationErr != nil {
+			err = attestationErr
+			cleanupRequired = true
+		}
+	}
 	initialStatus := status
 	initialErr := err
 	validationErr := initialValidationErr
@@ -1925,10 +1983,6 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 		h.tm.StopRemoteTranscode(upstreamSessionID, transcodeNodeURL)
 		return fmt.Errorf("%w: %w", errRemoteTranscodeStartFailed, err)
 	}
-	if err := transcodenode.ValidateCopyVideoMPEGTSAttestation(reqBody, nodeResponse); err != nil {
-		h.tm.StopRemoteTranscode(upstreamSessionID, transcodeNodeURL)
-		return fmt.Errorf("%w: %w", errRemoteTranscodeStartFailed, err)
-	}
 	if reqBody.ToneMapMode != "" && nodeResponse.ToneMapMode != reqBody.ToneMapMode {
 		h.tm.StopRemoteTranscode(upstreamSessionID, transcodeNodeURL)
 		err := errors.New("remote transcode node did not confirm tone-map mode")
@@ -1975,32 +2029,34 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 	// token of their own, so without a persisted recipe a node or central restart
 	// cannot rebuild ffmpeg and segment serves 404.
 	opts := playback.TranscodeOpts{
-		SessionID:              upstreamSessionID,
-		InputPath:              reqBody.InputPath,
-		SourceVideoCodec:       reqBody.SourceVideoCodec,
-		SourceVideoProfile:     reqBody.SourceVideoProfile,
-		SourceVideoBitDepth:    reqBody.SourceVideoBitDepth,
-		SeekSeconds:            reqBody.SeekSeconds,
-		StreamOriginSeconds:    reqBody.StreamOriginSeconds,
-		CopySeekAnchorResolved: reqBody.CopySeekAnchorResolved,
-		StartSegmentNumber:     reqBody.StartSegmentNumber,
-		TargetCodecVideo:       reqBody.TargetCodecVideo,
-		TargetCodecAudio:       reqBody.TargetCodecAudio,
-		TargetResolution:       reqBody.TargetResolution,
-		SubtitleBurnIn:         reqBody.SubtitleBurnIn,
-		SubtitleTrackIndex:     reqBody.SubtitleTrackIndex,
-		SubtitleCodec:          reqBody.SubtitleCodec,
-		TargetBitrateKbps:      reqBody.TargetBitrateKbps,
-		VideoSampleEntry:       reqBody.VideoSampleEntry,
-		VideoBitstreamFilter:   reqBody.VideoBitstreamFilter,
-		CopyVideoMPEGTS:        reqBody.CopyVideoMPEGTS,
-		KeyframePlaylist:       reqBody.KeyframePlaylist,
-		SegmentDuration:        reqBody.SegmentDuration,
-		AudioTrackIndex:        reqBody.AudioTrackIndex,
-		SourceAudioChannels:    reqBody.SourceAudioChannels,
-		TargetAudioChannels:    reqBody.TargetAudioChannels,
-		TotalDuration:          reqBody.TotalDuration,
-		ThrottleSeconds:        reqBody.ThrottleSeconds,
+		SessionID:                        upstreamSessionID,
+		InputPath:                        reqBody.InputPath,
+		CanonicalInputPath:               strings.TrimSpace(source.VirtualSourceURI),
+		VirtualSourceOwnerInstallationID: source.VirtualSourceOwnerInstallationID,
+		SourceVideoCodec:                 reqBody.SourceVideoCodec,
+		SourceVideoProfile:               reqBody.SourceVideoProfile,
+		SourceVideoBitDepth:              reqBody.SourceVideoBitDepth,
+		SeekSeconds:                      reqBody.SeekSeconds,
+		StreamOriginSeconds:              reqBody.StreamOriginSeconds,
+		CopySeekAnchorResolved:           reqBody.CopySeekAnchorResolved,
+		StartSegmentNumber:               reqBody.StartSegmentNumber,
+		TargetCodecVideo:                 reqBody.TargetCodecVideo,
+		TargetCodecAudio:                 reqBody.TargetCodecAudio,
+		TargetResolution:                 reqBody.TargetResolution,
+		SubtitleBurnIn:                   reqBody.SubtitleBurnIn,
+		SubtitleTrackIndex:               reqBody.SubtitleTrackIndex,
+		SubtitleCodec:                    reqBody.SubtitleCodec,
+		TargetBitrateKbps:                reqBody.TargetBitrateKbps,
+		VideoSampleEntry:                 reqBody.VideoSampleEntry,
+		VideoBitstreamFilter:             reqBody.VideoBitstreamFilter,
+		CopyVideoMPEGTS:                  reqBody.CopyVideoMPEGTS,
+		KeyframePlaylist:                 reqBody.KeyframePlaylist,
+		SegmentDuration:                  reqBody.SegmentDuration,
+		AudioTrackIndex:                  reqBody.AudioTrackIndex,
+		SourceAudioChannels:              reqBody.SourceAudioChannels,
+		TargetAudioChannels:              reqBody.TargetAudioChannels,
+		TotalDuration:                    reqBody.TotalDuration,
+		ThrottleSeconds:                  reqBody.ThrottleSeconds,
 		// Record the decode path the node executed so a reconstruct keeps
 		// it; an older node omits the field.
 		SoftwareVideoDecode: reqBody.SoftwareVideoDecode || nodeResponse.SoftwareVideoDecode,
@@ -2117,6 +2173,13 @@ func (h *PlaybackHandler) persistTranscodeRecipe(
 		}
 	}
 
+	if remoteToLocal {
+		// Fence the replaced remote runtime before publishing the local winner.
+		// The old node recipe was already removed, so no reconstruction can
+		// race this replacement. If the central update fails, the recipe
+		// rollback below leaves the prior remote state available for retry.
+		h.tm.StopRemoteTranscode(upstreamSessionID, previousRecipe.TranscodeNodeURL)
+	}
 	if updateErr := h.playbackStore.Update(playSessionID, func(current *PlaybackSession) error {
 		current.TranscodeStarted = true
 		current.Recipe = recipe
@@ -2151,13 +2214,6 @@ func (h *PlaybackHandler) persistTranscodeRecipe(
 			return errors.Join(updateErr, restoreErr, compatRestoreErr)
 		}
 		return updateErr
-	}
-	if remoteToLocal {
-		// Stop the replaced node job only once the local recipe has committed.
-		// The node fences a stopped transport against reconstruction, so a
-		// rollback that restored the remote recipe could not resume it; leaving
-		// the job running until here keeps that rollback playable.
-		h.tm.StopRemoteTranscode(upstreamSessionID, previousRecipe.TranscodeNodeURL)
 	}
 	return nil
 }
@@ -2278,7 +2334,6 @@ func (h *PlaybackHandler) HandlePlaybackInfo(w http.ResponseWriter, r *http.Requ
 	defer cancelAttachmentProbe()
 
 	allow4KTranscode := h.allow4KVideoTranscode(r.Context())
-	allowHEVCEncoding := h.allowHEVCVideoEncoding(r.Context())
 	toneMapPolicy := tonemap.PolicyNone
 	toneMapPolicyLoaded := false
 	var toneMapCapabilities tonemap.Capabilities
@@ -2306,9 +2361,37 @@ func (h *PlaybackHandler) HandlePlaybackInfo(w http.ResponseWriter, r *http.Requ
 			req.MediaSourceID = pathMediaSourceID
 		}
 	}
+	hadVirtualPrepErr := false
 	unreadableSkipped := false
 	for _, version := range detail.Versions {
-		source := h.buildPlaybackSource(routeItemID, playSessionID, version, profile, req, allow4KTranscode, allowHEVCEncoding)
+		// Failed versions are not playable unless the client explicitly selected
+		// that source (an active session may still be recovering it).
+		if version.Failed && req.MediaSourceID == "" {
+			continue
+		}
+		sourceID := h.codec.EncodeIntID(EncodedIDMediaSource, int64(version.FileID))
+		if req.MediaSourceID != "" && !mediaSourceIDsEqual(sourceID, req.MediaSourceID) {
+			continue
+		}
+		// Virtual sources must be prepared before negotiation so the advertised
+		// source and the later stream request share the canonical URI/owner.
+		prepared := version
+		virtualURI := ""
+		virtualOwnerID := 0
+		if isCompatVirtualPath(version.FilePath) || strings.EqualFold(strings.TrimSpace(version.Container), "virtual") {
+			var prepErr error
+			prepared, virtualURI, virtualOwnerID, prepErr = h.prepareVirtualPlaybackVersion(r.Context(), session, version)
+			if prepErr != nil {
+				hadVirtualPrepErr = true
+				if req.MediaSourceID != "" {
+					writeError(w, http.StatusServiceUnavailable, "PlaybackUnavailable", "Failed to resolve virtual playback source")
+					return
+				}
+				slog.WarnContext(r.Context(), "jellycompat virtual playback version preparation failed", "component", "jellycompat", "file_id", version.FileID, "error", prepErr)
+				continue
+			}
+		}
+		source := h.buildPlaybackSourceWithVirtual(routeItemID, playSessionID, prepared, profile, req, allow4KTranscode, virtualURI, virtualOwnerID)
 		if req.MediaSourceID != "" && !mediaSourceIDsEqual(source.ID, req.MediaSourceID) {
 			continue
 		}
@@ -2452,6 +2535,10 @@ func (h *PlaybackHandler) HandlePlaybackInfo(w http.ResponseWriter, r *http.Requ
 	}
 
 	if len(sourceDTOs) == 0 {
+		if hadVirtualPrepErr {
+			writeError(w, http.StatusServiceUnavailable, "PlaybackUnavailable", "Failed to resolve virtual playback source")
+			return
+		}
 		if unreadableSkipped {
 			// Every version this request could use is unreadable. Answer as
 			// Jellyfin does when nothing can play, so the client says so.
@@ -2498,8 +2585,9 @@ func (h *PlaybackHandler) HandlePlaybackInfo(w http.ResponseWriter, r *http.Requ
 	// Cleaned and clamped like every other client identity, since the stream
 	// request that starts the native session may reuse these values.
 	negotiatedClient := playback.ClientInfo{
-		Name:    firstMediaBrowserAuthorizationValue(r, "Client"),
-		Version: firstMediaBrowserAuthorizationValue(r, "Version"),
+		Name:     firstMediaBrowserAuthorizationValue(r, "Client"),
+		Version:  firstMediaBrowserAuthorizationValue(r, "Version"),
+		DeviceID: clientDeviceID,
 	}.Normalized()
 	h.playbackStore.PutNegotiated(PlaybackSession{
 		ID:                 playSessionID,
@@ -2522,7 +2610,7 @@ func (h *PlaybackHandler) HandlePlaybackInfo(w http.ResponseWriter, r *http.Requ
 		MediaSources:  sourceDTOs,
 	})
 	if played := compatLikelyPlayedSource(sources); played >= 0 && warmSubtitles[played] {
-		h.warmCompatTextSubtitles(sources[played].FileID)
+		h.warmCompatTextSubtitles(sources[played].FileID, "")
 	}
 }
 
@@ -2766,6 +2854,24 @@ func (h *PlaybackHandler) buildPlaybackSource(
 		DefaultSubtitleStreamIndex: subtitleIndex,
 		ETag:                       mediaSourceETag(version),
 	}
+}
+
+// buildPlaybackSourceWithVirtual adds the pinned virtual-source binding to the
+// normal negotiated source. The virtual relay uses the same negotiated mapping;
+// only the source identity is virtualized for later stream resolution.
+func (h *PlaybackHandler) buildPlaybackSourceWithVirtual(
+	routeItemID, playSessionID string,
+	version catalog.FileVersion,
+	profile DeviceProfile,
+	req playbackInfoRequest,
+	allow4KTranscode bool,
+	virtualURI string,
+	virtualOwnerID int,
+) PlaybackMediaSource {
+	source := h.buildPlaybackSource(routeItemID, playSessionID, version, profile, req, allow4KTranscode)
+	source.VirtualSourceURI = virtualURI
+	source.VirtualSourceOwnerInstallationID = virtualOwnerID
+	return source
 }
 
 // compatEncodeTarget returns the video bitrate and TargetResolution an encode
@@ -3851,10 +3957,12 @@ func applyPlaybackQueryOverrides(req *playbackInfoRequest, query url.Values) {
 		req.MediaSourceID = value
 	}
 	if value, ok := parseOptionalInt(firstQueryValue(query, "AudioStreamIndex")); ok {
-		req.AudioStreamIndex = compatIntValueOf(value)
+		v := compatIntValueOf(value)
+		req.AudioStreamIndex = &v
 	}
 	if value, ok := parseOptionalInt(firstQueryValue(query, "SubtitleStreamIndex")); ok {
-		req.SubtitleStreamIndex = compatIntValueOf(value)
+		v := compatIntValueOf(value)
+		req.SubtitleStreamIndex = &v
 	}
 	if value, ok := parseOptionalBool(firstQueryValue(query, "EnableDirectPlay")); ok {
 		req.EnableDirectPlay = &value
@@ -3944,11 +4052,19 @@ func (v *compatIntValue) UnmarshalJSON(data []byte) error {
 
 // get returns the value and whether the request set one.
 func (v *compatIntValue) get() (int, bool) {
+	if v == nil {
+		return 0, false
+	}
 	return v.value, v.set
 }
 
 func compatIntValueOf(value int) compatIntValue {
 	return compatIntValue{value: value, set: true}
+}
+
+func compatIntValuePtr(value int) *compatIntValue {
+	v := compatIntValueOf(value)
+	return &v
 }
 
 func (h *PlaybackHandler) playbackUnavailable(w http.ResponseWriter, err error) {

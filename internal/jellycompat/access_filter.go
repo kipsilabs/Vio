@@ -18,6 +18,10 @@ type ScopeResolver interface {
 	Resolve(ctx context.Context, input access.ResolveInput) (access.Scope, error)
 }
 
+func compatScopeInput(userID int, profileID string) access.ResolveInput {
+	return access.ResolveInput{UserID: userID, ProfileID: profileID, SkipPINVerification: true}
+}
+
 // NewScopeAccessFilter returns an AccessFilterResolver backed by the shared
 // access scope resolver, so account-level library restrictions
 // (users.library_ids), profile library restrictions, user-disabled

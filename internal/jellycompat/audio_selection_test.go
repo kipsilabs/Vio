@@ -161,7 +161,7 @@ func (m *testCompatSessionManager) SetTranscodeNodeURL(sessionID, url string) er
 }
 
 // SetTranscodeStreamDetails records the execution facts supplied by the compatibility handler.
-func (m *testCompatSessionManager) SetTranscodeStreamDetails(sessionID, targetVideoCodec, targetAudioCodec string, transcodeAudio bool, hwAccel string, toneMapMode tonemap.Mode) error {
+func (m *testCompatSessionManager) SetTranscodeStreamDetails(sessionID, targetVideoCodec, targetAudioCodec string, transcodeAudio bool, hwAccel string, toneMapMode tonemap.Mode, targetResolution string, targetBitrateKbps int) error {
 	session, ok := m.sessions[sessionID]
 	if !ok {
 		return playback.ErrSessionNotFound
@@ -171,6 +171,8 @@ func (m *testCompatSessionManager) SetTranscodeStreamDetails(sessionID, targetVi
 	session.TranscodeAudio = transcodeAudio
 	session.TranscodeHWAccel = hwAccel
 	session.ToneMapMode = toneMapMode
+	session.TargetResolution = targetResolution
+	session.TargetBitrateKbps = targetBitrateKbps
 	return nil
 }
 
@@ -261,7 +263,7 @@ func TestPlaybackInfoRequest_AcceptsStringAudioStreamIndex(t *testing.T) {
 	if req.AudioStreamIndex == nil {
 		t.Fatal("expected audio stream index")
 	}
-	if got := int(*req.AudioStreamIndex); got != 1 {
+	if got := req.AudioStreamIndex.value; got != 1 {
 		t.Fatalf("AudioStreamIndex = %d, want 1", got)
 	}
 }

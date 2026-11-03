@@ -67,6 +67,10 @@ func (b *quotaBucket) take(q SessionQuotaConfig, now time.Time) AllowResult {
 	return quotaResult(allowed, b.tokens, q, now)
 }
 
+func roundUpToSecond(t time.Time) time.Time {
+	return t.Truncate(time.Second).Add(time.Second)
+}
+
 func quotaResult(allowed bool, tokens float64, q SessionQuotaConfig, now time.Time) AllowResult {
 	result := AllowResult{
 		Allowed:   allowed,

@@ -598,7 +598,9 @@ func (p DeviceProfile) SupportsVideoCodecForDirectStream(version catalog.FileVer
 }
 
 func (p DeviceProfile) SupportsVideoCodecForDirectStreamForAudioStream(version catalog.FileVersion, audioStreamIndex *int) bool {
-	// Progressive remux writes MP4 even when the original is Matroska.
+	// Progressive remux is advertised as HLS with an MP4 sub-container in
+	// codec profiles. Keep the source version intact for codec matching; the
+	// profile scope, rather than the scanned container, describes the output.
 	version.Container = compatContainerMP4
 	if len(p.DirectPlayProfiles) == 0 {
 		return !p.refusesDirectPlay() && p.codecProfileCompatibility(version, audioStreamIndex).VideoSupported
@@ -608,7 +610,7 @@ func (p DeviceProfile) SupportsVideoCodecForDirectStreamForAudioStream(version c
 			continue
 		}
 		if matchesCSV(profile.VideoCodec, version.CodecVideo) {
-			return p.codecProfileCompatibility(version, audioStreamIndex).VideoSupported
+			return p.codecProfileCompatibilityWithValues(version, audioStreamIndex, buildConditionValues(version, audioStreamIndex), compatContainerMP4, false).VideoSupported
 		}
 	}
 	return false

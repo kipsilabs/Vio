@@ -24,6 +24,8 @@ const minManifestQuerySubstitutionSavings = 64 * 1024
 // manifestQueryVariable carries a playlist's whole request query.
 const manifestQueryVariable = "silo_query"
 
+var ErrManifestQueryTooLong = fmt.Errorf("manifest query too long")
+
 // manifestParamVariablePrefix names the variable that carries a single query
 // parameter value appended after the playlist was built (the relay's "st").
 const manifestParamVariablePrefix = "silo_"
@@ -90,7 +92,7 @@ func manifestVariable(name, value string, minSavingPerURI int) (definition, refe
 // syntheticManifestQuery returns the header line, URI suffix, and minimum HLS
 // version for a playlist the server builds whose segmentCount URIs all end in
 // ?rawQuery.
-func syntheticManifestQuery(segmentCount int, rawQuery string) (definition, suffix string, minVersion int) {
+func syntheticManifestQueryVariables(segmentCount int, rawQuery string) (definition, suffix string, minVersion int) {
 	if rawQuery == "" {
 		return "", "", 0
 	}
