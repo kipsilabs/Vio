@@ -622,6 +622,61 @@ func TestResolveVirtualPlaybackObservationServeWritesNothing(t *testing.T) {
 	}
 }
 
+// TestResolveVirtualPlaybackImplausibleGapNeverAdmits pins the size plausibility
+// cap at the catalog-write seam. The production failure served 17.7 GB for a
+// 3.78 GB declaration (4.7x) and admitted it on a duration match; a second serve
+// of the same bytes then confirmed the pin. Such a gap is not a rounded listing,
+// so the bytes stay playable for the request but no serve may write, stamp, or
+// pin them. The normal rounded band is covered by
+// TestResolveVirtualPlaybackObservationServeWritesNothing above.
+func TestResolveVirtualPlaybackImplausibleGapNeverAdmits(t *testing.T) {
+	const (
+		release  = "Movie.2023.2160p.WEB-DL"
+		declared = int64(3_780_000_000)
+		served   = int64(17_700_000_000) // 4.7x
+		runtime  = 90
+	)
+	uri := "virtual://movie/tt-implausible?result=pin-1"
+	file := &models.MediaFile{
+		ID: 640, ContentID: "movie-tt-implausible", FilePath: "virtual://movie/tt-implausible",
+		Container: "virtual", VirtualOwnerInstallationID: 5, MediaFolderID: 9,
+	}
+	rows := map[string]*models.MediaFile{
+		uri: sizeMismatchFallbackRow(641, uri, release, declared),
+	}
+	candidates := []VirtualPlaybackStream{
+		sizeMismatchFallbackCandidate("pin-1", uri, release, declared),
+	}
+	scanner.ResetVirtualServedSizeSnapshots()
+	t.Cleanup(scanner.ResetVirtualServedSizeSnapshots)
+	h, probes, saved := sizeMismatchFallbackHandler(t, file, candidates, rows, func(*models.MediaFile) (int64, error) {
+		return served, nil
+	})
+	h.ItemLookup = staticRuntimeItemLookup{runtime: runtime}
+	stickyKey := bestResultCacheKey(file.ContentID, virtualPlaybackNeutralKey(file.FilePath), file.VirtualOwnerInstallationID, "")
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		resolved, err := h.resolveVirtualPlaybackSource(
+			httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil), file, "profile-1", false, nil, "", "", 0, false)
+		if err != nil {
+			t.Fatalf("resolve %d error: %v", attempt, err)
+		}
+		if resolved.URI != uri {
+			t.Fatalf("resolve %d URI = %q, want the served pin %q", attempt, resolved.URI, uri)
+		}
+	}
+	h.StopVirtualEvidence()
+	if len(*probes) != 2 {
+		t.Fatalf("probes = %v, want one per start: an implausible serve must never become cache-confirmed", *probes)
+	}
+	if len(*saved) != 0 {
+		t.Fatalf("implausible serves persisted %+v, want no catalog write", *saved)
+	}
+	if got := h.peekVirtualSticky(stickyKey); got != "" {
+		t.Fatalf("implausible serves pinned %q, want no sticky pin", got)
+	}
+}
+
 // TestResolveVirtualPlaybackCacheFirstObservationWritesNothing pins the
 // cache-first seam of the shared resolve. A probe-cache hit is a completed
 // probe, but the classification deciding what the hit may be used for is not

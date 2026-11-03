@@ -760,7 +760,7 @@ func (h *PlaybackHandler) runFileProbeChain(ctx context.Context, contentID strin
 	// A verified outcome with an unwritten carrier means the row keeps its
 	// previous evidence: the serve recorded a pin's first served-size
 	// observation, so there is no catalog change for a detail page to refresh
-	// (see virtualProbeEvidenceIsObservation).
+	// (see virtualProbeEvidenceWithholdsIdentity).
 	if outcome == probeOutcomeVerified && carried.written && h.EventsHub != nil {
 		publishCtx, publishCancel := context.WithTimeout(context.WithoutCancel(ctx), virtualCandidatePublishBudget)
 		publishVirtualVersionsUpdatedEvent(publishCtx, nil, h.EventsHub, contentID)

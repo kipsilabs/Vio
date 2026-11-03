@@ -44,6 +44,31 @@ func VirtualDurationProvesIdentity(probedSeconds, expectedRuntimeMinutes int) bo
 		VirtualRuntimePlausible(probedSeconds, expectedRuntimeMinutes)
 }
 
+// VirtualServedSizePlausibilityRatio is the largest served-vs-declared size
+// ratio a measured duration may excuse. A provider's listing rounds release
+// sizes (the observed production band is 12–19% for a 0.1 GB advertisement), so
+// a duration proof must be allowed to excuse gaps well beyond the 5% evidence
+// tolerance. Rounding cannot explain a multiple, though: the production failure
+// this cap exists for served 17.7 GB for a 3.78 GB declaration (4.7x). Twice the
+// advertised size is far outside any rounding band and far below that failure,
+// so a gap beyond it is implausible on its face: the duration may still keep the
+// bytes playable for the request, but it can never establish release identity.
+const VirtualServedSizePlausibilityRatio = 2.0
+
+// VirtualServedSizeImplausible reports whether the served-vs-declared size gap
+// is too large for a duration proof to excuse as a rounded provider listing.
+// Unknown values pass: the cap only applies when both sizes are known.
+func VirtualServedSizeImplausible(declaredBytes, servedBytes int64) bool {
+	if declaredBytes <= 0 || servedBytes <= 0 {
+		return false
+	}
+	larger, smaller := servedBytes, declaredBytes
+	if declaredBytes > servedBytes {
+		larger, smaller = declaredBytes, servedBytes
+	}
+	return float64(larger) > float64(smaller)*VirtualServedSizePlausibilityRatio
+}
+
 // VirtualServedEvidenceVerdict classifies probed evidence against the release
 // the selected catalog row declares.
 type VirtualServedEvidenceVerdict int
@@ -89,6 +114,9 @@ func ClassifyVirtualServedEvidence(declaredBytes, servedBytes int64, probedSecon
 		return VirtualServedEvidenceAdmitted
 	}
 	if VirtualDurationProvesIdentity(probedSeconds, expectedRuntimeMinutes) {
+		// A gap beyond the plausibility ratio is not a rounded listing, so the
+		// duration keeps the bytes playable but never proves which release was
+		// served. See VirtualServedSizePlausibilityRatio.
 		return VirtualServedEvidenceUnverified
 	}
 	return VirtualServedEvidenceMismatch
@@ -216,6 +244,9 @@ func VirtualServedSizeSnapshotFor(pin string, declaredBytes int64, inventoryToke
 //     baseline;
 //   - a probe whose duration does not prove identity is unverified or a
 //     mismatch and must never teach the gate to accept those bytes;
+//   - a gap beyond VirtualServedSizePlausibilityRatio records nothing even with
+//     a matching duration. A multiple of the advertised size is not a rounded
+//     listing, so there is no byte size a later serve could confirm as identity;
 //   - a pin's existing observation is never overwritten by a divergent serve.
 //     A wrong file that once passed the duration check would otherwise keep
 //     moving the pin's baseline to whatever it serves, which is exactly how one
@@ -228,6 +259,9 @@ func RecordVirtualServedSizeSnapshotIfProven(pin string, declaredBytes, servedBy
 		return false
 	}
 	if !VirtualServedSizeMismatch(declaredBytes, servedBytes) {
+		return false
+	}
+	if VirtualServedSizeImplausible(declaredBytes, servedBytes) {
 		return false
 	}
 	if !VirtualDurationProvesIdentity(probedSeconds, expectedRuntimeMinutes) {
@@ -297,7 +331,14 @@ func ResetVirtualServedSizeSnapshots() {
 // A pin with no snapshot (or one invalidated by a declared size or
 // subtitle-inventory change) keeps comparing against the declared size, so the
 // gate behaves exactly as before for every unproven pin.
+//
+// A gap beyond VirtualServedSizePlausibilityRatio is classified against the
+// declaration before any snapshot is consulted: no observation may confirm
+// bytes that far from the release's advertised size.
 func ClassifyVirtualServedEvidenceForPin(pin string, declaredBytes, servedBytes int64, probedSeconds, expectedRuntimeMinutes int, inventoryToken string) VirtualServedEvidenceVerdict {
+	if VirtualServedSizeImplausible(declaredBytes, servedBytes) {
+		return ClassifyVirtualServedEvidence(declaredBytes, servedBytes, probedSeconds, expectedRuntimeMinutes)
+	}
 	baseline := declaredBytes
 	if snapshot, ok := VirtualServedSizeSnapshotFor(pin, declaredBytes, inventoryToken); ok {
 		baseline = snapshot.ObservedBytes
@@ -329,8 +370,13 @@ func VirtualServedSizeSubtitleToken(tracks []models.SubtitleTrack) string {
 // different release must never teach the gate to accept its bytes. A serve that
 // diverges from an existing observation is Unverified as well and leaves the
 // observation untouched, so a later wrong file cannot displace the bytes the pin
-// was proven to serve.
+// was proven to serve. A gap beyond VirtualServedSizePlausibilityRatio is
+// unverified at most: a duration proof keeps it playable, but no observation or
+// repeat serve can confirm bytes that far from the advertised size.
 func ClassifyVirtualServedEvidenceForPinWithSnapshot(pin string, declaredBytes, servedBytes int64, probedSeconds, expectedRuntimeMinutes int, inventoryToken string) VirtualServedEvidenceVerdict {
+	if VirtualServedSizeImplausible(declaredBytes, servedBytes) {
+		return ClassifyVirtualServedEvidence(declaredBytes, servedBytes, probedSeconds, expectedRuntimeMinutes)
+	}
 	snapshot, hasSnapshot := VirtualServedSizeSnapshotFor(pin, declaredBytes, inventoryToken)
 	baseline := declaredBytes
 	if hasSnapshot {

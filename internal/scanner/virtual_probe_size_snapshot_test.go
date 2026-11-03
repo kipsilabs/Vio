@@ -239,6 +239,87 @@ func TestVirtualServedSizeSnapshotNeverRecordedWithoutDurationProof(t *testing.T
 	}
 }
 
+// A gap far beyond a rounded listing is not excused by a matching duration.
+// Production admitted 17.7 GB served bytes for a 3.78 GB declaration (4.7x) on
+// duration proof alone: two identical serves of such an implausible file then
+// confirmed it, because the recorded observation became the comparison baseline.
+// The plausibility ratio stops the observation from being recorded at all, so no
+// repeat serve can establish identity, while the bytes stay playable (Unverified)
+// for the request that measured them.
+func TestVirtualServedSizeSnapshotRefusesImplausibleGap(t *testing.T) {
+	ResetVirtualServedSizeSnapshots()
+	t.Cleanup(ResetVirtualServedSizeSnapshots)
+
+	const (
+		declared = int64(3_780_000_000)
+		served   = int64(17_700_000_000) // 4.7x the declaration
+		runtime  = 102
+		duration = 6_120
+	)
+	if !VirtualServedSizeImplausible(declared, served) {
+		t.Fatalf("served %d vs declared %d is not classed implausible", served, declared)
+	}
+	pin := VirtualServedSizePin("virtual://movie/tt-snap-implausible?result=oversized", 7)
+	token := VirtualServedSizeSubtitleToken(snapshotSubtitleTracks("subrip"))
+
+	if ok := RecordVirtualServedSizeSnapshotIfProven(pin, declared, served, duration, runtime, token); ok {
+		t.Fatal("a 4.7x gap recorded a served-size observation")
+	}
+	if _, ok := VirtualServedSizeSnapshotFor(pin, declared, token); ok {
+		t.Fatal("a 4.7x gap left a snapshot behind")
+	}
+
+	// Every entry point stays unverified (playable) and never admitted, even on
+	// a second serve of the identical bytes.
+	for i := 0; i < 2; i++ {
+		if verdict := ClassifyVirtualServedEvidenceForPinWithSnapshot(pin, declared, served, duration, runtime, token); verdict != VirtualServedEvidenceUnverified {
+			t.Fatalf("serve %d verdict = %v, want unverified", i+1, verdict)
+		}
+		if verdict := ClassifyVirtualServedEvidenceForPin(pin, declared, served, duration, runtime, token); verdict != VirtualServedEvidenceUnverified {
+			t.Fatalf("read-only serve %d verdict = %v, want unverified", i+1, verdict)
+		}
+	}
+	if _, ok := VirtualServedSizeSnapshotFor(pin, declared, token); ok {
+		t.Fatal("repeated implausible serves recorded a snapshot")
+	}
+
+	// Without a duration proof the same gap is a mismatch, exactly as before.
+	if verdict := ClassifyVirtualServedEvidenceForPinWithSnapshot(pin, declared, served, 0, runtime, token); verdict != VirtualServedEvidenceMismatch {
+		t.Fatalf("unproven implausible serve verdict = %v, want mismatch", verdict)
+	}
+}
+
+// A gap inside the plausibility ratio keeps the existing two-observation rule:
+// the first duration-proven serve records the observation and stays unverified,
+// and a second serve of the same size admits the pin. The boundary is far above
+// the 12–19% rounding band, so ordinary rounded listings are unaffected.
+func TestVirtualServedSizeSnapshotConfirmsWithinPlausibilityRatio(t *testing.T) {
+	ResetVirtualServedSizeSnapshots()
+	t.Cleanup(ResetVirtualServedSizeSnapshots)
+
+	const (
+		declared = int64(4_000_000_000)
+		served   = int64(7_000_000_000) // 1.75x, inside the 2x cap
+		runtime  = 102
+		duration = 6_120
+	)
+	if VirtualServedSizeImplausible(declared, served) {
+		t.Fatalf("served %d vs declared %d must stay inside the plausibility ratio", served, declared)
+	}
+	pin := VirtualServedSizePin("virtual://movie/tt-snap-within-ratio?result=large", 7)
+	token := VirtualServedSizeSubtitleToken(snapshotSubtitleTracks("subrip"))
+
+	if verdict := ClassifyVirtualServedEvidenceForPinWithSnapshot(pin, declared, served, duration, runtime, token); verdict != VirtualServedEvidenceUnverified {
+		t.Fatalf("recording serve verdict = %v, want unverified", verdict)
+	}
+	if _, ok := VirtualServedSizeSnapshotFor(pin, declared, token); !ok {
+		t.Fatal("an in-ratio gap recorded no observation")
+	}
+	if verdict := ClassifyVirtualServedEvidenceForPinWithSnapshot(pin, declared, served, duration, runtime, token); verdict != VirtualServedEvidenceAdmitted {
+		t.Fatalf("confirming serve verdict = %v, want admitted", verdict)
+	}
+}
+
 // A release-level path carries no concrete ?result= candidate, so no observed
 // size can be attributed to one pin's bytes.
 func TestVirtualServedSizePinRequiresConcreteCandidate(t *testing.T) {

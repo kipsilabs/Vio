@@ -752,24 +752,26 @@ func classifyVirtualServedEvidenceV3(pin string, declaredBytes int64, probed *mo
 	)
 }
 
-// virtualProbeEvidenceIsObservation reports whether this verdict is the pin's
-// first served-size observation rather than the pin's identity. An observation
-// is playable for the serve that recorded it but must not be written to the
-// catalog or made sticky: a persisted inventory plus a fresh probe stamp lets
-// the next replay take the repeat-play fast path on that stamp alone, for the
-// stamp's whole freshness window (virtualP0ProbeStalenessBound), without ever
-// re-probing. Writing it would make one unconfirmed serve the pin's identity by
-// persistence instead of by evidence, which is exactly what the two-observation
-// gate exists to prevent. The observation itself stays in memory, so the next
-// serve is compared against it and admits the pin when it lands on the same
-// bytes.
+// virtualProbeEvidenceWithholdsIdentity reports whether this verdict must not be
+// written to the catalog or made sticky. An unverified verdict is playable for
+// the serve that produced it, but it is not the pin's identity: a persisted
+// inventory plus a fresh probe stamp lets the next replay take the repeat-play
+// fast path on that stamp alone, for the stamp's whole freshness window
+// (virtualP0ProbeStalenessBound), without ever re-probing. Writing it would make
+// one unconfirmed serve the pin's identity by persistence instead of by
+// evidence, which is exactly what the two-observation gate exists to prevent.
+// The observation itself stays in memory, so the next serve is compared against
+// it and admits the pin when it lands on the same bytes.
+//
+// This holds for an unpinned candidate too. It cannot become an observation
+// (nothing is recorded without a concrete ?result= pick), but an unverified
+// verdict there means the gap was beyond the plausibility ratio, so there is no
+// identity to persist either.
 //
 // Mismatch never reaches a persist decision: every caller rotates or rejects
-// first. An unpinned candidate has no observation to confirm (nothing is
-// recorded without a concrete ?result= pick), so it keeps the historical
-// persist-and-pin behavior.
-func virtualProbeEvidenceIsObservation(pin string, verdict scanner.VirtualServedEvidenceVerdict) bool {
-	return pin != "" && !verdict.EstablishesIdentity()
+// first. An admitted verdict is written and pinned exactly as before.
+func virtualProbeEvidenceWithholdsIdentity(verdict scanner.VirtualServedEvidenceVerdict) bool {
+	return !verdict.EstablishesIdentity()
 }
 
 // virtualDetachedWorkerCap bounds detached virtual-playback work server-wide
@@ -1612,7 +1614,7 @@ type resolvedVirtualPlaybackSource struct {
 	// pin's first served-size observation. The source is served with the probed
 	// inventory, so its menus are real, but the caller must not persist, adopt,
 	// or stamp it: only a later serve that matches the observation establishes
-	// the pin (see virtualProbeEvidenceIsObservation).
+	// the pin (see virtualProbeEvidenceWithholdsIdentity).
 	EvidenceObservation bool
 }
 
@@ -3957,7 +3959,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			}
 			if scanner.VirtualServedSizeMismatch(result.File.FileSize, result.File.ProbedFormatSize) {
 				logVirtualProbeSizeGapV3(r.Context(), file.ID, candidate.URI, result.File.FileSize, result.File.ProbedFormatSize, result.File.Duration, expectedRuntimeMinutes,
-					virtualProbeEvidenceIsObservation(evidencePin, evidenceVerdict))
+					virtualProbeEvidenceWithholdsIdentity(evidenceVerdict))
 				virtualProbeFailures.clearSizeMismatch(virtualProbeFailureKey(candidate.URI, ownerID))
 			}
 			if !virtualRuntimePlausible(result.File.Duration, expectedRuntimeMinutes) {
@@ -3973,11 +3975,12 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			}
 			result.CandidateRank = i
 			result.CandidateCount = len(candidates)
-			if result.EvidenceObservation || virtualProbeEvidenceIsObservation(evidencePin, evidenceVerdict) {
+			if result.EvidenceObservation || virtualProbeEvidenceWithholdsIdentity(evidenceVerdict) {
 				// The bytes play for this request, but they are the pin's first
-				// served-size observation: writing them would stamp the row and
-				// let the next replay skip the probe that confirms it, and
-				// pinning them would bind rotation to bytes no evidence names
+				// served-size observation (or an implausible gap beyond the
+				// plausibility ratio): writing them would stamp the row and let
+				// the next replay skip the probe that confirms it, and pinning
+				// them would bind rotation to bytes no evidence names
 				// yet. Serve, write nothing, leave the pin as it was. A cached
 				// hit carries the same disposition from its own pass.
 				return *result, nil
@@ -4279,13 +4282,18 @@ func (h *PlaybackHandler) matchSameReleaseSiblingProbe(ctx context.Context, anch
 		verdict := classifyVirtualServedEvidenceV3(siblingPin, transient.FileSize, probed, transient.VirtualExpectedRuntimeMinutes)
 		if !verdict.EstablishesIdentity() {
 			virtualProbeFailures.markSizeMismatch(virtualProbeFailureKey(cand.URI, cand.OwnerInstallationID), probed.ProbedFormatSize, transient.FileSize)
-			if siblingPin != "" && verdict == scanner.VirtualServedEvidenceUnverified {
+			if siblingPin != "" && verdict == scanner.VirtualServedEvidenceUnverified &&
+				!scanner.VirtualServedSizeImplausible(transient.FileSize, probed.ProbedFormatSize) {
 				// The declaration is playable, the bytes are just not confirmed
 				// yet: one observation cannot adopt a sibling either. Logging
 				// this as a size rejection would read as a wrong file. A
 				// genuine mismatch is not an observation and falls through to
-				// the rejection line.
+				// the rejection line, and an implausible gap is reported on its
+				// own line by logVirtualProbeSizeGapV3.
 				logVirtualProbeSiblingObservationPending(ctx, row.ID, cand.URI, transient.FileSize, probed.ProbedFormatSize)
+			} else if scanner.VirtualServedSizeImplausible(transient.FileSize, probed.ProbedFormatSize) {
+				logVirtualProbeSizeGapV3(ctx, row.ID, cand.URI, transient.FileSize, probed.ProbedFormatSize,
+					probed.Duration, transient.VirtualExpectedRuntimeMinutes, true)
 			} else {
 				logVirtualProbeSizeMismatch(ctx, row.ID, cand.URI, transient.FileSize, probed.ProbedFormatSize)
 			}
@@ -4580,7 +4588,7 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 		// inventory. The size disagreement stays logged so a short posting is
 		// still visible to an operator.
 		logVirtualProbeSizeGapV3(bgCtx, anchorFileID, probeCand.URI, probeTransient.FileSize, probed.ProbedFormatSize, probed.Duration, expectedRuntimeMinutes,
-			virtualProbeEvidenceIsObservation(evidencePin, evidenceVerdict))
+			virtualProbeEvidenceWithholdsIdentity(evidenceVerdict))
 	}
 	if !virtualRuntimePlausible(probed.Duration, expectedRuntimeMinutes) {
 		virtualProbeFailures.mark(probeKey)
@@ -4602,11 +4610,11 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 	}
 	mergeVirtualCandidateTracks(probed, probeCand)
 	if durableEvidence {
-		if virtualProbeEvidenceIsObservation(evidencePin, evidenceVerdict) {
+		if virtualProbeEvidenceWithholdsIdentity(evidenceVerdict) {
 			// The probe enumerated the served bytes, but they are the pin's
 			// first served-size observation, not its identity: writing them
 			// would stamp the row and let the next replay skip the probe that
-			// confirms it (see virtualProbeEvidenceIsObservation). The session
+			// confirms it (see virtualProbeEvidenceWithholdsIdentity). The session
 			// still gets the tracks these bytes carry, so its menus are real and
 			// the client leaves loading; the row keeps its previous evidence and
 			// the next start re-probes and compares against the observation.
@@ -4636,7 +4644,7 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 		// recipe keeps the preferred language.
 		return probeOutcomeVerified, committedInv
 	}
-	if !virtualProbeEvidenceIsObservation(evidencePin, evidenceVerdict) {
+	if !virtualProbeEvidenceWithholdsIdentity(evidenceVerdict) {
 		h.persistVirtualProbeEvidence(bgCtx, catalogFile, probeCand.URI, probed, candidate, true, false)
 	}
 	logVirtualSiblingProbeAdopted(bgCtx, anchorFileID, adoptedSibling)
@@ -4745,7 +4753,7 @@ func committedProbeInventoryFromWrite(args models.VirtualFilePersistArgs, resolv
 // without a catalog write. The one caller is a serve that records its pin's
 // first served-size observation: the session menus must show the tracks the
 // bytes actually carry, but the row may not be stamped yet (see
-// virtualProbeEvidenceIsObservation), so there is no committed write to carry.
+// virtualProbeEvidenceWithholdsIdentity), so there is no committed write to carry.
 //
 // The release identity is the row's stored identity, because that is the
 // identity the untouched row keeps, exactly like the metadata-only write the
@@ -4785,7 +4793,7 @@ func catalogFileIDOrZero(file *models.MediaFile) int {
 // the cached evidence skips a redundant ffprobe — the dominant cost of an
 // audio-switch or version-switch replan — and persists it with a fresh stamp so
 // the row stops being probed on every start. A hit the pin-aware gate only
-// observes is served without a write (see virtualProbeEvidenceIsObservation).
+// observes is served without a write (see virtualProbeEvidenceWithholdsIdentity).
 // The failure damper is cleared on a hit, exactly like the transient-timeout
 // recovery it generalizes.
 //
@@ -4841,7 +4849,7 @@ func (h *PlaybackHandler) virtualProbeFromCache(
 	}
 	if scanner.VirtualServedSizeMismatch(probeFile.FileSize, probed.ProbedFormatSize) {
 		logVirtualProbeSizeGapV3(ctx, catalogFile.ID, probeCand.URI, probeFile.FileSize, probed.ProbedFormatSize, probed.Duration, expectedRuntimeMinutes,
-			virtualProbeEvidenceIsObservation(evidencePin, evidenceVerdict))
+			virtualProbeEvidenceWithholdsIdentity(evidenceVerdict))
 	}
 	virtualProbeFailures.clear(virtualProbeFailureKey(probeCand.URI, ownerInstallationID))
 	virtualProbeFailures.clearSizeMismatch(virtualProbeFailureKey(probeCand.URI, ownerInstallationID))
@@ -4853,7 +4861,7 @@ func (h *PlaybackHandler) virtualProbeFromCache(
 		probed.Duration = probeFile.Duration
 	}
 	mergeVirtualCandidateTracks(probed, probeCand)
-	observation := virtualProbeEvidenceIsObservation(evidencePin, evidenceVerdict)
+	observation := virtualProbeEvidenceWithholdsIdentity(evidenceVerdict)
 	if !observation {
 		// An admitted or unpinned hit is identity for this row and gets the
 		// fresh stamp. An observation is not: stamping it would let the next
@@ -6290,7 +6298,7 @@ func (h *PlaybackHandler) probeVirtualCandidateForegroundFallback(
 	}
 	if scanner.VirtualServedSizeMismatch(probeTransient.FileSize, probed.ProbedFormatSize) {
 		logVirtualProbeSizeGapV3(requestCtx, catalogFile.ID, probeCand.URI, probeTransient.FileSize, probed.ProbedFormatSize, probed.Duration, expectedRuntimeMinutes,
-			virtualProbeEvidenceIsObservation(evidencePin, evidenceVerdict))
+			virtualProbeEvidenceWithholdsIdentity(evidenceVerdict))
 	}
 	if !virtualRuntimePlausible(probed.Duration, expectedRuntimeMinutes) {
 		virtualProbeFailures.mark(probeKey)
@@ -6301,10 +6309,10 @@ func (h *PlaybackHandler) probeVirtualCandidateForegroundFallback(
 	}
 	virtualProbeFailures.clear(probeKey)
 	virtualProbeFailures.clearSizeMismatch(probeKey)
-	if virtualProbeEvidenceIsObservation(evidencePin, evidenceVerdict) {
+	if virtualProbeEvidenceWithholdsIdentity(evidenceVerdict) {
 		// The one bounded attempt enumerated playable bytes that are only the
 		// pin's first observation: no stamp, no write, nothing to confirm yet
-		// (see virtualProbeEvidenceIsObservation). The next start probes again
+		// (see virtualProbeEvidenceWithholdsIdentity). The next start probes again
 		// and confirms or diverges.
 		return
 	}
@@ -7658,14 +7666,14 @@ func (h *PlaybackHandler) resolveVirtualCandidateSource(
 	}
 	if scanner.VirtualServedSizeMismatch(candidate.FileSize, probed.ProbedFormatSize) {
 		logVirtualProbeSizeGapV3(ctx, file.ID, candidate.URI, candidate.FileSize, probed.ProbedFormatSize, probed.Duration, expectedRuntimeMinutes,
-			virtualProbeEvidenceIsObservation(evidencePin, evidenceVerdict))
+			virtualProbeEvidenceWithholdsIdentity(evidenceVerdict))
 	}
-	if virtualProbeEvidenceIsObservation(evidencePin, evidenceVerdict) {
+	if virtualProbeEvidenceWithholdsIdentity(evidenceVerdict) {
 		// The bytes play for this request, but they only recorded the pin's
 		// first served-size observation. The caller serves the probed inventory
 		// and writes nothing: persisting, adopting, or stamping it would make
 		// one unconfirmed serve the pin's identity (see
-		// virtualProbeEvidenceIsObservation).
+		// virtualProbeEvidenceWithholdsIdentity).
 		resolved.EvidenceObservation = true
 	}
 	// Adoption fence. The probe can take seconds, during which the serve layer
@@ -8947,8 +8955,16 @@ func logVirtualProbeSizeMismatchAccepted(ctx context.Context, fileID int, candid
 // acceptance: the bytes play and the gap is recorded for the pin, but nothing
 // is written until a later serve confirms it, so the line says so instead of
 // claiming an acceptance the catalog never received.
-func logVirtualProbeSizeGapV3(ctx context.Context, fileID int, candidateURI string, declaredBytes, servedBytes int64, probedSeconds, expectedRuntimeMinutes int, observation bool) {
-	if observation {
+func logVirtualProbeSizeGapV3(ctx context.Context, fileID int, candidateURI string, declaredBytes, servedBytes int64, probedSeconds, expectedRuntimeMinutes int, withholdsIdentity bool) {
+	if scanner.VirtualServedSizeImplausible(declaredBytes, servedBytes) {
+		slog.WarnContext(ctx, "virtual probe served a size beyond the plausibility ratio; the bytes stay playable but can never establish identity",
+			"component", "api", "file_id", fileID, "candidate_uri", candidateURI,
+			"served_bytes", servedBytes, "declared_bytes", declaredBytes,
+			"probed_duration_seconds", probedSeconds,
+			"expected_runtime_minutes", expectedRuntimeMinutes)
+		return
+	}
+	if withholdsIdentity {
 		slog.WarnContext(ctx, "virtual probe recorded a served-size observation; evidence stays unverified until a second serve confirms it",
 			"component", "api", "file_id", fileID, "candidate_uri", candidateURI,
 			"served_bytes", servedBytes, "declared_bytes", declaredBytes,
