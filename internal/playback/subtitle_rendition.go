@@ -79,14 +79,34 @@ func SubtitleRenditionCodecSupported(codec string) bool {
 }
 
 // SubtitleRenditionExecutable reports whether a transcode with these facts can
-// carry a subtitle rendition: an encoded (not copied) video whose playlist is
-// the synthetic fixed-grid VOD playlist the subtitle segments align to.
-func SubtitleRenditionExecutable(targetVideoCodec string, totalDuration float64, segmentDuration int) bool {
-	// A copied video stream cannot provide the fixed-grid segment boundaries
-	// that the cue rendition is aligned to. Keep this gate identical to the
-	// executor's encoded-video requirement.
-	if strings.EqualFold(strings.TrimSpace(targetVideoCodec), "copy") || strings.TrimSpace(targetVideoCodec) == "" {
+// carry a subtitle rendition and a synthetic fixed-grid playlist can be used.
+// A copy-remux is executable when the source video codec is known: the remux
+// path has the same deterministic segment plan as an encoded video. Unknown
+// (including empty) codecs must not activate the rendition, since that recipe
+// cannot safely establish the video output format.
+func SubtitleRenditionExecutable(targetVideoCodec string, args ...any) bool {
+	var sourceVideoCodec string
+	var totalDuration float64
+	var segmentDuration int
+	if len(args) == 3 {
+		sourceVideoCodec, _ = args[0].(string)
+		totalDuration, _ = args[1].(float64)
+		segmentDuration, _ = args[2].(int)
+	} else if len(args) == 2 {
+		totalDuration, _ = args[0].(float64)
+		segmentDuration, _ = args[1].(int)
+	} else {
 		return false
+	}
+	targetVideoCodec = strings.TrimSpace(targetVideoCodec)
+	if targetVideoCodec == "" {
+		return false
+	}
+	if strings.EqualFold(targetVideoCodec, "copy") {
+		sourceVideoCodec = strings.TrimSpace(sourceVideoCodec)
+		if sourceVideoCodec == "" || strings.EqualFold(sourceVideoCodec, "copy") {
+			return false
+		}
 	}
 	if segmentDuration <= 0 {
 		segmentDuration = defaultSegmentDuration
@@ -99,7 +119,7 @@ func SubtitleRenditionExecutable(targetVideoCodec string, totalDuration float64,
 func subtitleRenditionActive(opts TranscodeOpts) bool {
 	return opts.SubtitleRendition && opts.SubtitleTrackIndex >= 0 && !opts.SubtitleBurnIn &&
 		SubtitleRenditionCodecSupported(opts.SubtitleCodec) &&
-		SubtitleRenditionExecutable(opts.TargetCodecVideo, opts.TotalDuration, opts.SegmentDuration)
+		SubtitleRenditionExecutable(opts.TargetCodecVideo, opts.SourceVideoCodec, opts.TotalDuration, opts.SegmentDuration)
 }
 
 func subtitleCueFileName(generation uint64) string {
