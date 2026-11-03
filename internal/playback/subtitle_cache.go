@@ -1169,6 +1169,36 @@ func (c *SubtitleCache) HasCommittedEntry(inputPath, cacheIdentity string, track
 	return ok
 }
 
+// HasWarmingEntry reports whether a full-track fill is already in flight for
+// the source identity + track ordinal in the format this codec/target maps to:
+// the detached warm a windowed miss starts, a request-owned fill, or another
+// waiting request's fill. Like HasCommittedEntry this is a non-binding snapshot
+// for admission decisions; it never reserves or mutates the fill.
+//
+// It distinguishes a client's upgrade probe from a cold whole-track fetch: a
+// probe targets a track whose full-track fill is already warming (the probe
+// exists to discover that commit), whereas a cold fetch has no fill to join.
+// A codec with no sidecar class, an unkeyable source, or a nil cache reads as
+// false.
+func (c *SubtitleCache) HasWarmingEntry(inputPath, cacheIdentity string, trackIndex int, codec, targetFormat string) bool {
+	if c == nil || c.dir() == "" {
+		return false
+	}
+	format := subtitleCacheFormat(codec, targetFormat)
+	if format == "" {
+		return false
+	}
+	identity, modTime, size, ok := subtitleCacheSource(inputPath, cacheIdentity, time.Now())
+	if !ok {
+		return false
+	}
+	key := subtitleCacheFormatKey(identity, trackIndex, modTime, size, format)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_, warming := c.inflight[key]
+	return warming
+}
+
 // warnDemuxBusy reports that this serve shed a client-facing subtitle read
 // because the relay source was saturated. The first shed per interval warns;
 // repeats in the same interval drop to debug, so a client retry loop keeps a

@@ -3817,18 +3817,6 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 	response := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
 	virtualActive := virtualResolved && session != nil && session.VirtualSourceURI != ""
 
-	// A param-less request against a virtual relay source is the client's
-	// whole-track upgrade probe (or a whole-track fallback): it does not name a
-	// window the viewer is waiting on, and its extract only fills the committed
-	// full-track artifact. Draw its relay read from the detached budget so a
-	// 70 s probe demux can never hold a slot a foreground window needs. An
-	// explicit position/duration/windowed request keeps the request-path
-	// budget. This is captured before applyImplicitVirtualWindow synthesizes a
-	// server-side window for the same param-less request.
-	if virtualActive && !windowRequested && seek == 0 && duration == 0 && !allowWindow {
-		opts.DetachedRelayDemux = true
-	}
-
 	// Virtual relay inputs never enter the payload cache under their rotating
 	// URL; key on the pinned source + effective ordinal instead. The identity
 	// is computed before the drift probe so a committed artifact can
@@ -3840,6 +3828,26 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 	if virtualActive {
 		opts.CacheIdentity = virtualSubtitleCacheIdentity(file, session.VirtualSourceURI, opts.TrackIndex)
 		opts.DisableBackgroundWarm = true
+	}
+
+	// A param-less request against a virtual relay source can be either the
+	// web player's whole-track upgrade probe or a native client's one-shot
+	// whole-track fetch; the two are indistinguishable by shape. Only the
+	// probe is a detached read: it targets a track that is already committed
+	// or whose full-track fill is warming (that fill is what it upgrades), so
+	// a shed round costs it nothing and its probe cadence re-issues it. A cold
+	// param-less fetch — the native case, with no windowing contract and no
+	// probe fallback — is a client-facing read and draws from the request-path
+	// budget, where a saturated detached pool cannot shed it. An explicit
+	// position/duration/windowed request keeps the request-path budget too.
+	// This is captured before applyImplicitVirtualWindow synthesizes a
+	// server-side window for the same param-less request.
+	if virtualActive && !windowRequested && seek == 0 && duration == 0 && !allowWindow {
+		opts.DetachedRelayDemux = h.SubtitleCache.HasCommittedEntry(
+			opts.InputPath, opts.CacheIdentity, opts.TrackIndex, opts.SourceCodec, opts.TargetFormat,
+		) || h.SubtitleCache.HasWarmingEntry(
+			opts.InputPath, opts.CacheIdentity, opts.TrackIndex, opts.SourceCodec, opts.TargetFormat,
+		)
 	}
 
 	// Row-vs-evidence drift (flagged in handleSubtitle) means the catalog row

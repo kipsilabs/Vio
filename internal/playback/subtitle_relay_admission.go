@@ -302,9 +302,11 @@ func fontRelayDemuxContext(ctx context.Context) context.Context {
 }
 
 // relayDemuxAdmissionContext applies an extract's admission class to the
-// context used for its relay read. A param-less whole-track request is the
-// client's upgrade probe: its extract only fills the committed artifact, so it
-// draws from the detached budget and can never take a slot a window needs.
+// context used for its relay read. A whole-track upgrade probe against a
+// committed-or-warming track only fills the committed artifact, so it draws
+// from the detached budget and can never take a slot a window needs. A cold
+// param-less whole-track fetch is client-facing and keeps the request-path
+// budget.
 func relayDemuxAdmissionContext(ctx context.Context, opts StreamExtractOpts) context.Context {
 	if opts.DetachedRelayDemux {
 		return detachedRelayDemux(ctx)

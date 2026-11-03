@@ -1687,40 +1687,64 @@ func TestVirtualSubtitleWarmAppliesInheritedOrdinalHintAfterOwnProbe(t *testing.
 	}
 }
 
-// waitForLogLines waits until argsLog has at least want non-empty lines.
-func waitForLogLines(t *testing.T, argsLog string, want int) {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if countLogLines(t, argsLog) >= want {
-			return
-		}
-		time.Sleep(5 * time.Millisecond) //nolint:forbidigo // Polls the fake ffmpeg invocation log; the detached extract has no completion channel.
-	}
-	t.Fatalf("ffmpeg invocations = %d, want at least %d", countLogLines(t, argsLog), want)
-}
-
-// A param-less virtual fetch is the client's upgrade probe. With both
-// foreground demux slots held by explicit windows, the probe must still be
-// admitted from the detached budget instead of answering retryable and leaving
-// the windowed pipeline without a committed artifact.
-func TestParamlessVirtualFetchUsesDetachedDemuxBudget(t *testing.T) {
+// A param-less virtual fetch on a cold track is the native client's one-shot
+// whole-track read, not an upgrade probe: it has no windowing contract and no
+// probe cadence that would re-issue a shed read, so a saturated detached budget
+// must not shed it. Here an unrelated track's detached warm holds the only
+// detached slot while the fetch is served from the request-path pool.
+func TestParamlessVirtualFetchAdmittedWhileDetachedBudgetSaturated(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell script test helper is unix-only")
 	}
 	dir := t.TempDir()
 	argsLog := filepath.Join(dir, "ffmpeg.args")
-	gate := filepath.Join(dir, "gate")
-	handler, session, file, _ := newVirtualSubtitleWindowFixture(t, dir,
-		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\n"+
-			"while [ ! -f '"+gate+"' ]; do sleep 0.01; done\n"+
-			"cat <<'VTT'\n"+warmSubtitleVTT+"VTT\n")
-	file.SubtitleTracks = []models.SubtitleTrack{{Index: 0, Codec: "subrip"}}
-	session.VirtualSubtitleTracks = file.SubtitleTracks
-	// Give the implicit window a position that no explicit window already owns,
-	// so the probe is a distinct extraction rather than a coalesced waiter.
-	session.Position = 3600
-	writeSubtitleLayoutProbe(t, dir, file.SubtitleTracks...)
+	gate := filepath.Join(dir, "warm.gate")
+	handler, session, file, _ := newVirtualSubtitleWindowFixture(t, dir, warmArgsLogScript(argsLog, gate))
+	t.Cleanup(func() { _ = os.WriteFile(gate, []byte("go"), 0o644) })
+
+	serve := func(f *models.MediaFile, s *playback.Session, query string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/subtitle"+query, nil)
+		handler.streamEmbeddedSubtitle(rec, req, f, 0, s, false, "vtt")
+		return rec
+	}
+
+	// A windowed miss starts the fixture track's detached full-track warm and
+	// leaves it blocked on the gate, holding the source's only detached slot.
+	if rec := serve(file, session, "?position=600&duration=600"); rec.Code != http.StatusOK {
+		t.Fatalf("warm-triggering window = %d %q, want 200", rec.Code, rec.Body.String())
+	}
+	waitForWarmInvocation(t, argsLog)
+
+	// Same virtual release and relay source, distinct cache identity (file ID),
+	// so this request has no committed or warming track of its own: it is the
+	// cold param-less shape a native client sends.
+	otherFile := *file
+	otherFile.ID = file.ID + 1
+	otherSession := *session
+	otherSession.MediaFileID = otherFile.ID
+
+	probe := serve(&otherFile, &otherSession, "")
+	if probe.Code != http.StatusOK {
+		t.Fatalf("cold param-less fetch under detached saturation = %d %q, want 200", probe.Code, probe.Body.String())
+	}
+	if !strings.Contains(probe.Body.String(), "WEBVTT") {
+		t.Fatalf("cold param-less fetch body = %q", probe.Body.String())
+	}
+}
+
+// A param-less fetch against a track whose full-track warm is already in
+// flight is the web player's upgrade probe. It stays on the detached budget: a
+// saturated detached source skips this probe round (the probe cadence re-issues
+// it) instead of stacking a second demux beside the warm.
+func TestWarmingParamlessVirtualFetchSkipsDetachedBudget(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+	dir := t.TempDir()
+	argsLog := filepath.Join(dir, "ffmpeg.args")
+	gate := filepath.Join(dir, "warm.gate")
+	handler, session, file, _ := newVirtualSubtitleWindowFixture(t, dir, warmArgsLogScript(argsLog, gate))
 	t.Cleanup(func() { _ = os.WriteFile(gate, []byte("go"), 0o644) })
 
 	serve := func(query string) *httptest.ResponseRecorder {
@@ -1730,31 +1754,19 @@ func TestParamlessVirtualFetchUsesDetachedDemuxBudget(t *testing.T) {
 		return rec
 	}
 
-	// Two explicit windows hold both foreground slots. Distinct positions keep
-	// them from coalescing onto one in-flight window.
-	windowQueries := []string{"?position=0&duration=600", "?position=1200&duration=600"}
-	windowsDone := make(chan struct{}, len(windowQueries))
-	for _, query := range windowQueries {
-		go func() {
-			_ = serve(query)
-			windowsDone <- struct{}{}
-		}()
+	if rec := serve("?position=600&duration=600"); rec.Code != http.StatusOK {
+		t.Fatalf("warm-triggering window = %d %q, want 200", rec.Code, rec.Body.String())
 	}
-	waitForLogLines(t, argsLog, 2)
+	waitForWarmInvocation(t, argsLog)
 
-	probeDone := make(chan *httptest.ResponseRecorder, 1)
-	go func() { probeDone <- serve("") }()
-	waitForLogLines(t, argsLog, 3)
-	if err := os.WriteFile(gate, []byte("go"), 0o644); err != nil {
-		t.Fatal(err)
+	probe := serve("")
+	if probe.Code != http.StatusServiceUnavailable {
+		t.Fatalf("warming param-less probe = %d %q, want 503 retryable", probe.Code, probe.Body.String())
 	}
-	<-windowsDone
-	<-windowsDone
-	probe := <-probeDone
-	if probe.Code != http.StatusOK {
-		t.Fatalf("param-less fetch under foreground saturation = %d %q, want 200", probe.Code, probe.Body.String())
+	if probe.Header().Get("Retry-After") == "" {
+		t.Fatal("skipped probe did not advertise Retry-After")
 	}
-	if !strings.Contains(probe.Body.String(), "WEBVTT") {
-		t.Fatalf("param-less fetch body = %q", probe.Body.String())
+	if window, warm := ffmpegLogLines(t, argsLog); window != 1 || warm != 1 {
+		t.Fatalf("ffmpeg invocations after skipped probe = %d window, %d warm; want 1/1", window, warm)
 	}
 }
