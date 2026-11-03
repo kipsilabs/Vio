@@ -31,6 +31,32 @@ import (
 	"github.com/Silo-Server/silo-server/internal/userstore"
 )
 
+type VirtualCandidateScore struct {
+	ProviderOrder  *int
+	Score          int
+	MatchedFormats []string
+}
+
+type VirtualCandidateScoreSource func(ctx context.Context, contentID string, files []*models.MediaFile) map[int]VirtualCandidateScore
+
+const (
+	VirtualRankingSourceProfile = "profile"
+	VirtualRankingSourceDefault = "default"
+)
+
+type VirtualRankingCriterion struct {
+	Attribute string
+	Direction string
+}
+
+type VirtualRanking struct {
+	ProfileLabel string
+	Source       string
+	Criteria     []VirtualRankingCriterion
+}
+
+type VirtualRankingSource func(ctx context.Context, contentID string, files []*models.MediaFile) map[int]VirtualRanking
+
 // FileVersionFetcher retrieves media files linked to a content ID.
 type FileVersionFetcher interface {
 	GetByContentID(ctx context.Context, contentID string) ([]*models.MediaFile, error)
@@ -543,6 +569,11 @@ type PersonCredit struct {
 
 // FileVersion represents a single file version available for playback.
 type FileVersion struct {
+	Failed                   bool                   `json:"failed,omitempty"`
+	Available                *bool                  `json:"available,omitempty"`
+	FormatScore              *int                   `json:"format_score,omitempty"`
+	MatchedFormats           []string               `json:"matched_formats,omitempty"`
+	ProbedAt                 *time.Time             `json:"-"`
 	FileID                   int                    `json:"file_id"`
 	FileName                 string                 `json:"file_name,omitempty"`
 	FilePath                 string                 `json:"file_path,omitempty"`
@@ -557,6 +588,8 @@ type FileVersion struct {
 	AddedAt                  time.Time              `json:"added_at"`
 	EditionRaw               string                 `json:"edition_raw,omitempty"`
 	EditionKey               string                 `json:"edition_key,omitempty"`
+	ReleaseName              string                 `json:"release_name,omitempty"`
+	ReleaseGroup             string                 `json:"release_group,omitempty"`
 	PresentationKind         string                 `json:"presentation_kind,omitempty"`
 	PresentationGroupKey     string                 `json:"presentation_group_key,omitempty"`
 	PresentationPartIndex    int                    `json:"presentation_part_index,omitempty"`
@@ -587,6 +620,29 @@ type FileVersion struct {
 }
 
 // SetMarkers refreshes the marker projection without rebuilding file metadata.
+func versionInventoryPrepared(v FileVersion) bool {
+	return !v.Failed && v.ProbedAt != nil && !v.ProbedAt.IsZero() && (v.Available == nil || *v.Available)
+}
+
+func partitionPreparedVersions(versions []FileVersion) []FileVersion {
+	if len(versions) < 2 {
+		return versions
+	}
+	prepared := make([]FileVersion, 0, len(versions))
+	other := make([]FileVersion, 0, len(versions))
+	for _, v := range versions {
+		if versionInventoryPrepared(v) {
+			prepared = append(prepared, v)
+		} else {
+			other = append(other, v)
+		}
+	}
+	if len(prepared) == 0 || len(other) == 0 {
+		return versions
+	}
+	return append(prepared, other...)
+}
+
 func (v *FileVersion) SetMarkers(file *models.MediaFile) {
 	v.Intro = markerFromFile(file, markerKindIntro)
 	v.Credits = markerFromFile(file, markerKindCredits)
@@ -668,6 +724,7 @@ type VersionSubtitleTrack struct {
 	HearingImpaired bool   `json:"hearing_impaired"`
 	External        bool   `json:"external"`
 	FileName        string `json:"file_name,omitempty"`
+	PathKey         string `json:"-"`
 	// IndexOnly is models.SubtitleTrack.IndexOnly, for planners that read
 	// this projection.
 	IndexOnly bool `json:"-"`
