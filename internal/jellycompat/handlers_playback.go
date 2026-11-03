@@ -2334,6 +2334,15 @@ func (h *PlaybackHandler) HandlePlaybackInfo(w http.ResponseWriter, r *http.Requ
 	defer cancelAttachmentProbe()
 
 	allow4KTranscode := h.allow4KVideoTranscode(r.Context())
+	allowHEVCEncoding := h.allowHEVCVideoEncoding(r.Context())
+	// Keep failed sources out of an unselected response while there is at least
+	// one viable alternative. If every source has failed, preserve the complete
+	// list so Jellyfin can report the item and its source ids rather than seeing
+	// an indistinguishable empty PlaybackInfo response. An explicit source
+	// selection is handled separately below and always keeps that source.
+	hasLiveVersion := slices.ContainsFunc(detail.Versions, func(version catalog.FileVersion) bool {
+		return !version.Failed
+	})
 	toneMapPolicy := tonemap.PolicyNone
 	toneMapPolicyLoaded := false
 	var toneMapCapabilities tonemap.Capabilities
@@ -2366,7 +2375,7 @@ func (h *PlaybackHandler) HandlePlaybackInfo(w http.ResponseWriter, r *http.Requ
 	for _, version := range detail.Versions {
 		// Failed versions are not playable unless the client explicitly selected
 		// that source (an active session may still be recovering it).
-		if version.Failed && req.MediaSourceID == "" {
+		if version.Failed && req.MediaSourceID == "" && hasLiveVersion {
 			continue
 		}
 		sourceID := h.codec.EncodeIntID(EncodedIDMediaSource, int64(version.FileID))
@@ -2391,7 +2400,7 @@ func (h *PlaybackHandler) HandlePlaybackInfo(w http.ResponseWriter, r *http.Requ
 				continue
 			}
 		}
-		source := h.buildPlaybackSourceWithVirtual(routeItemID, playSessionID, prepared, profile, req, allow4KTranscode, virtualURI, virtualOwnerID)
+		source := h.buildPlaybackSourceWithVirtual(routeItemID, playSessionID, prepared, profile, req, allow4KTranscode, allowHEVCEncoding, virtualURI, virtualOwnerID)
 		if req.MediaSourceID != "" && !mediaSourceIDsEqual(source.ID, req.MediaSourceID) {
 			continue
 		}
@@ -2865,10 +2874,11 @@ func (h *PlaybackHandler) buildPlaybackSourceWithVirtual(
 	profile DeviceProfile,
 	req playbackInfoRequest,
 	allow4KTranscode bool,
+	allowHEVCEncoding bool,
 	virtualURI string,
 	virtualOwnerID int,
 ) PlaybackMediaSource {
-	source := h.buildPlaybackSource(routeItemID, playSessionID, version, profile, req, allow4KTranscode)
+	source := h.buildPlaybackSource(routeItemID, playSessionID, version, profile, req, allow4KTranscode, allowHEVCEncoding)
 	source.VirtualSourceURI = virtualURI
 	source.VirtualSourceOwnerInstallationID = virtualOwnerID
 	return source

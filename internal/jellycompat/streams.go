@@ -3831,7 +3831,7 @@ func (h *PlaybackHandler) createStaticPlaySession(ctx context.Context, session *
 				continue
 			}
 		}
-		source := h.buildPlaybackSourceWithVirtual(routeID, playSessionID, prepared, DeviceProfile{}, playbackInfoRequest{serverBitrateCapKbps: serverBitrateCapKbps, streamLocation: string(streamlocation.FromContext(ctx))}, allow4KTranscode, virtualURI, virtualOwnerID)
+		source := h.buildPlaybackSourceWithVirtual(routeID, playSessionID, prepared, DeviceProfile{}, playbackInfoRequest{serverBitrateCapKbps: serverBitrateCapKbps, streamLocation: string(streamlocation.FromContext(ctx))}, allow4KTranscode, h.allowHEVCVideoEncoding(ctx), virtualURI, virtualOwnerID)
 
 		sources = append(sources, source)
 	}
