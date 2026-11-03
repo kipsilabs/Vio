@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -175,7 +176,7 @@ func TestTransportAbsentPinRotatesWithoutSameReleaseRetry(t *testing.T) {
 		func(_ context.Context, _ string, _ int, _ int, _ string, _ bool, excluded []string, _ string) (ResolvedVirtualMedia, error) {
 			if len(excluded) == 0 {
 				attemptsWithoutExclusions++
-				return ResolvedVirtualMedia{}, fmt.Errorf("pinned candidate absent")
+				return ResolvedVirtualMedia{}, errors.New("pinned candidate absent")
 			}
 			return ResolvedVirtualMedia{
 				URL:         "http://localhost:8080/alternate-live.mp4",
