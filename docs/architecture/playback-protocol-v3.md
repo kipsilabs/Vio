@@ -2130,12 +2130,18 @@ Complete embedded text, ASS/SSA, and PGS extracts are cached by source file
 identity, modification time, size, subtitle ordinal, and output format. Partial
 or failed extracts are never published. Text and ASS cache misses stream while
 extracting; repeated complete requests reuse the finished artifact. A windowed
-miss on a large virtual source starts a detached full-track warm only while the
-playback session is paused, so later paused requests read the small cached
-artifact instead of re-demuxing the source without competing with active
-playback. A failed extraction returns an error response before output begins,
-or aborts an already-started stream so clients can distinguish failure from a
-complete track and retry.
+miss on a large virtual source starts a detached full-track warm while the
+viewer is playing (text and ASS) or paused (bitmap), so later requests read the
+small cached artifact instead of re-demuxing the source. While an ASS warm is
+still filling, the server retains the script prefix it has produced and answers
+a window whose source range that prefix has already passed from memory. The
+prefix is served only once the warm's highest emitted event start has reached
+the requested end, so an event starting inside the window cannot still be
+missing; the body is the same header-plus-overlapping-events shape a windowed
+extract from the committed artifact produces, and the advertised coverage stays
+the requested range. A failed extraction returns an error response before
+output begins, or aborts an already-started stream so clients can distinguish
+failure from a complete track and retry.
 
 ---
 

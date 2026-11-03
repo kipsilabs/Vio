@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -19,9 +20,10 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sync/singleflight"
+
 	"github.com/Silo-Server/silo-server/internal/httpstream"
 	"github.com/Silo-Server/silo-server/internal/models"
-	"golang.org/x/sync/singleflight"
 )
 
 // SubtitleCache stores complete SUP, VTT, and ASS subtitle extracts on disk
@@ -101,6 +103,12 @@ type SubtitleCache struct {
 	// provider on every request.
 	fontFailureMu      sync.Mutex
 	fontFailureRetryAt map[string]time.Time
+
+	// warmTextMu guards warmText, the in-progress full-track ASS warms. A
+	// windowed request whose range a warm has already produced is answered
+	// from this memory copy instead of demuxing the relay source again.
+	warmTextMu sync.Mutex
+	warmText   map[string]*subtitleWarmTextProgress
 
 	// demuxBusyWarnMu guards demuxBusyWarnAt, the interval throttle for the
 	// relay-shed warning. Shedding a client-facing subtitle read answers a
@@ -266,6 +274,11 @@ const (
 	subtitleFontBundleFailureMaxEntries = 512
 )
 
+// errSubtitleFontBundleFlightSkipped reports a font flight dropped because the
+// relay was already at its font-demux ceiling. It is expected backpressure, not
+// a failed extraction, and is reported separately from a timeout.
+var errSubtitleFontBundleFlightSkipped = errors.New("subtitle font bundle extraction skipped: relay demux busy")
+
 // subtitleExtractRetryDelays returns the bounded in-request retry schedule for
 // an extraction that failed on an upstream 5xx before emitting any bytes. Each
 // delay is the pause before the next attempt; the final count is small because
@@ -409,8 +422,12 @@ func (c *SubtitleCache) ServeExtractWithResult(w http.ResponseWriter, r *http.Re
 	// windowed extract may be redirected to a committed artifact below, whose
 	// path/mtime is not the source identity the window is cached under).
 	windowKey := ""
+	warmTextKey := ""
 	if opts.windowIntent() {
 		windowKey, _ = c.windowResultKey(opts, format)
+		if format == subtitleFormatASS {
+			warmTextKey, _ = c.formatEntryKey(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, format)
+		}
 	}
 	windowLeader := false
 	if !opts.windowIntent() {
@@ -510,6 +527,27 @@ func (c *SubtitleCache) ServeExtractWithResult(w http.ResponseWriter, r *http.Re
 				return result, nil
 			}
 		}
+		// An in-progress full-track ASS warm may already have produced this
+		// window's range. Serving it here avoids a second relay demux and
+		// leaves the warm's bandwidth untouched, which is what lets the
+		// first commit land quickly instead of competing with every window.
+		if warmTextKey != "" && !result.ServedCommittedArtifact {
+			if windowed, start, end, openEnded := opts.WindowCoverage(); windowed && !openEnded {
+				if data, ok := c.warmTextWindow(warmTextKey, start, end); ok {
+					if windowKey != "" {
+						c.storeWindowResult(windowKey, opts, data)
+					}
+					w.Header().Set("Cache-Control", "no-store")
+					w.WriteHeader(http.StatusOK)
+					n, writeErr := w.Write(data)
+					if writeErr == nil && n != len(data) {
+						writeErr = io.ErrShortWrite
+					}
+					logWarmTextServe(r, opts, n, start, end)
+					return result, writeErr
+				}
+			}
+		}
 		if !result.ServedCommittedArtifact {
 			// No last-good copy: suppress a provider retry that is known to be
 			// inside its backoff window. An artifact-backed extraction reads a
@@ -593,7 +631,22 @@ func (c *SubtitleCache) ServeExtractWithResult(w http.ResponseWriter, r *http.Re
 		writer = capture
 	}
 	opts.Writer = writer
-	err := c.runExtract(admittedCtx, opts, extract, counter)
+	// A coalesced extraction belongs to the flight, not only to the leader
+	// request. Detach it from the leader's cancellation (bounded by the
+	// timeout) so a leader disconnect does not throw away work that waiters
+	// can still consume from the last-good cache. The window capture already
+	// swallows write failures, so the detached extract keeps producing after
+	// the response writer goes away.
+	extractCtx := admittedCtx
+	if windowLeader {
+		var cancel context.CancelFunc
+		extractCtx, cancel = context.WithTimeout(
+			context.WithoutCancel(admittedCtx),
+			subtitleWindowExtractTimeout,
+		)
+		defer cancel()
+	}
+	err := c.runExtract(extractCtx, opts, extract, counter)
 	if err != nil {
 		if r.Context().Err() == nil && IsSubtitleUpstreamError(err) {
 			c.noteExtractionFailure(opts, format)
@@ -1816,12 +1869,27 @@ func (c *SubtitleCache) WarmTrackInBackground(opts StreamExtractOpts, extract SU
 	opts.AllowWindow = false
 	opts.InputIsExtractedSup = false
 	opts.InputIsExtractedText = ""
-	counter := &subtitleCountingWriter{w: fill.Tee(io.Discard)}
+	warmWriter := fill.Tee(io.Discard)
+	// ASS is line-oriented and small; retain the warm's output as it streams
+	// so windows whose range it has already passed are served from memory
+	// instead of opening another relay read. Registered before the extract
+	// starts so an early window can find it.
+	var warmText *subtitleWarmTextProgress
+	warmTextKey := ""
+	if format == subtitleFormatASS {
+		warmTextKey, _ = c.formatEntryKey(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, format)
+		warmText = c.beginWarmTextProgress(warmTextKey)
+		if warmText != nil {
+			warmWriter = &subtitleWarmTextTap{dst: warmWriter, progress: warmText}
+		}
+	}
+	counter := &subtitleCountingWriter{w: warmWriter}
 	opts.Writer = counter
 
 	go func() {
 		defer close(done)
 		defer func() { <-c.warmSem }()
+		defer c.endWarmTextProgress(warmTextKey, warmText)
 		ctx, cancel := context.WithTimeout(context.Background(), subtitleCacheWarmTimeout)
 		defer cancel()
 
@@ -2428,13 +2496,25 @@ func (c *SubtitleCache) startFontBundleFlight(ctx context.Context, key FontBundl
 				// to playback, so this attempt is skipped without arming the
 				// failure backoff: a waiter gets the pending (empty bundle)
 				// shape and the next request retries once the pipe frees up.
-				return nil, context.DeadlineExceeded
+				return nil, errSubtitleFontBundleFlightSkipped
 			}
 			c.noteFontBundleFailure(flightKey)
 			return nil, extractErr
 		}
 		if storeErr := c.storeFontBundle(key, data); storeErr != nil {
 			slog.WarnContext(ctx, "subtitle font bundle cache store failed", "error", storeErr)
+		}
+		items := fontBundleItemCount(data)
+		if items == 0 {
+			// A completed extraction with no attachments is a definitive empty
+			// bundle, not a failed one: the client should cache it and stop
+			// polling. Say so explicitly so it is distinguishable from the
+			// silent timeout shape below.
+			slog.InfoContext(ctx, "subtitle font bundle stored with no attachments",
+				"file_id", key.FileID, "bytes", len(data))
+		} else {
+			slog.DebugContext(ctx, "subtitle font bundle stored",
+				"file_id", key.FileID, "items", items, "bytes", len(data))
 		}
 		c.noteFontBundleSuccess(flightKey)
 		return data, nil
@@ -2450,13 +2530,33 @@ func (c *SubtitleCache) startFontBundleFlight(ctx context.Context, key FontBundl
 // degrade to the pending empty bundle instead of failing playback.
 func fontBundleFlightOutcome(res singleflight.Result) ([]byte, bool, error) {
 	if res.Err != nil {
-		if errors.Is(res.Err, context.DeadlineExceeded) || errors.Is(res.Err, context.Canceled) {
+		if errors.Is(res.Err, context.DeadlineExceeded) ||
+			errors.Is(res.Err, context.Canceled) ||
+			errors.Is(res.Err, errSubtitleFontBundleFlightSkipped) {
 			return nil, false, nil
 		}
 		return nil, false, res.Err
 	}
 	data, _ := res.Val.([]byte)
 	return data, true, nil
+}
+
+// fontBundleItemCount reports how many attachments an encoded bundle carries.
+// The cache stores the handler's bare JSON array; an unparseable payload still
+// has non-zero bytes, so callers can distinguish it from a definitive empty
+// bundle by size.
+func fontBundleItemCount(data []byte) int {
+	if len(data) == 0 {
+		return 0
+	}
+	var items []json.RawMessage
+	if err := json.Unmarshal(data, &items); err != nil {
+		if len(bytes.TrimSpace(data)) == 0 {
+			return 0
+		}
+		return -1
+	}
+	return len(items)
 }
 
 // ExtractFontBundle returns the encoded font-bundle JSON for the key, reusing
@@ -2566,14 +2666,31 @@ func (c *SubtitleCache) WarmFontBundleInBackground(key FontBundleKey, extract fu
 		defer close(done)
 		defer func() { <-c.warmSem }()
 		start := time.Now()
-		_, _, err := fontBundleFlightOutcome(<-resultCh)
-		if err != nil {
+		elapsed := func() int64 { return time.Since(start).Milliseconds() }
+		res := <-resultCh
+		switch {
+		case errors.Is(res.Err, errSubtitleFontBundleFlightSkipped):
+			// Expected backpressure, not a source failure: the next trigger
+			// retries once the relay's font budget frees up.
+			slog.Debug("font bundle warm skipped: relay demux busy",
+				"file_id", key.FileID, "elapsed_ms", elapsed())
+		case errors.Is(res.Err, context.DeadlineExceeded), errors.Is(res.Err, context.Canceled):
+			// The production failure this reporting exists for: every cold
+			// dump hit its deadline and stored nothing, which the old
+			// "finished" line hid while the client kept polling.
+			slog.Warn("font bundle warm produced no bundle",
+				"file_id", key.FileID, "elapsed_ms", elapsed(),
+				"reason", "extraction deadline exceeded or was canceled")
+		case res.Err != nil:
 			slog.Warn("font bundle warm failed",
-				"file_id", key.FileID, "elapsed_ms", time.Since(start).Milliseconds(), "error", err)
-			return
+				"file_id", key.FileID, "elapsed_ms", elapsed(), "error", res.Err)
+		default:
+			data, _ := res.Val.([]byte)
+			items := fontBundleItemCount(data)
+			slog.Info("font bundle warm finished",
+				"file_id", key.FileID, "elapsed_ms", elapsed(),
+				"items", items, "bytes", len(data))
 		}
-		slog.Info("font bundle warm finished",
-			"file_id", key.FileID, "elapsed_ms", time.Since(start).Milliseconds())
 	}()
 	return done
 }
