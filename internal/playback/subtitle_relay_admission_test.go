@@ -526,7 +526,8 @@ func holdFontRelaySlot(t *testing.T, input string) func() {
 func TestRelayDemuxShedWarnsThrottled(t *testing.T) {
 	swapRelayDemuxGuardForTest(t, newRelayDemuxGuardWithDetached(2, 1, 5*time.Millisecond))
 	const remote = "http://relay-shed-warn.test/source/tok/movie.mkv"
-	defer holdDetachedRelaySlot(t, remote)()
+	releaseDetached := holdDetachedRelaySlot(t, remote)
+	defer releaseDetached()
 
 	dir := t.TempDir()
 	cache := NewSubtitleCache(func() string { return dir })

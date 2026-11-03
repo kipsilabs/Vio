@@ -1226,7 +1226,7 @@ func (c *SubtitleCache) warnDemuxBusy(ctx context.Context, opts StreamExtractOpt
 		c.demuxBusyWarnMu.Unlock()
 	}
 	attrs := []any{
-		"component", "playback",
+		logKeyComponent, logValuePlayback,
 		"input", opts.InputPath,
 		"track", opts.TrackIndex,
 		"format", format,
