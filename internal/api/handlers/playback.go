@@ -987,7 +987,7 @@ func NewPlaybackHandler(sessionMgr SessionManagerInterface, opts ...FilePathReso
 		if !h.tm.CloseTranscodeSessionIf(sessionID, dead, nodeURL) {
 			return
 		}
-		if err := h.stopPlaybackSessionByID(ctx, sessionID, false); err != nil && !errors.Is(err, playback.ErrSessionNotFound) {
+		if err := h.stopPlaybackSessionByID(ctx, sessionID, ""); err != nil && !errors.Is(err, playback.ErrSessionNotFound) {
 			slog.ErrorContext(ctx, "failed to stop playback after local transcode exit", "component", "api", "session", sessionID, "error", err, "playback_session_id", sessionID)
 		}
 	}
@@ -2210,6 +2210,66 @@ func (h *PlaybackHandler) syncSessionsOnPauseChange(ctx context.Context, wasPaus
 	}
 }
 
+// sessionTeardownTimeout bounds a detached session teardown. The local live
+// session is removed first, so the durable half (synced-session row, attempt
+// stop, deny marker, history) must finish even when the request that triggered
+// the teardown is already gone; otherwise a client-canceled stream — a track
+// switch aborts the old transport and replans — can leave the session stranded:
+// gone locally but live on every other replica and in the client's hands.
+const sessionTeardownTimeout = 15 * time.Second
+
+// teardownContext detaches durable session teardown from the request that
+// triggered it. A teardown path reached from a canceled request must still
+// complete its durable writes; the request's logging and tracing values are
+// kept, its cancellation is dropped, and a wedged store is bounded rather than
+// leaking the goroutine.
+//
+// The detached budget never reaches past an enclosing detached budget. The v2
+// stop finalization hands its single end-to-end deadline down through the nested
+// teardown and finalize calls; without the cap every nested teardownContext
+// would reset to a fresh full timeout and the finalization could outlive the
+// lease that fences it against a concurrent replay.
+func teardownContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return detachedWithin(ctx, sessionTeardownTimeout)
+}
+
+// detachedDeadlineKey marks a context whose deadline was established by
+// detachedWithin — an internally-established teardown budget — as distinct from
+// a deadline the caller's request happened to carry. Only a marked, enclosing
+// budget narrows a nested detach.
+type detachedDeadlineKey struct{}
+
+// detachedWithin builds a context that survives cancellation of base (keeping
+// its logging and tracing values) and is bounded by budget. A detach nested
+// inside another detached section is additionally clamped to that section's
+// deadline, so it cannot outlive the single end-to-end budget that fences a v2
+// stop finalization against a concurrent replay.
+//
+// A deadline the caller's request carries is deliberately dropped, even one
+// already in the past: a timeout- or cancel-triggered teardown is exactly the
+// case this exists for, and inheriting an expired request deadline would hand it
+// a context that is canceled the moment it is created, skipping the durable
+// writes. Only an enclosing detached budget (marked here) is inherited.
+func detachedWithin(base context.Context, budget time.Duration) (context.Context, context.CancelFunc) {
+	if base == nil {
+		base = context.Background()
+	}
+	deadline := time.Now().Add(budget)
+	if inherited, ok := base.Deadline(); ok && isDetachedDeadline(base) && inherited.Before(deadline) {
+		deadline = inherited
+	}
+	ctx, cancel := context.WithDeadline(context.WithoutCancel(base), deadline)
+	return context.WithValue(ctx, detachedDeadlineKey{}, deadline), cancel
+}
+
+// isDetachedDeadline reports whether ctx carries a deadline established by an
+// enclosing detachedWithin call. Values survive the wrapper contexts
+// (WithDeadline, WithCancel) that a finalization layers over the detach, so the
+// marker is visible to every nested detach.
+func isDetachedDeadline(ctx context.Context) bool {
+	return ctx != nil && ctx.Value(detachedDeadlineKey{}) != nil
+}
+
 func (h *PlaybackHandler) touchSessionActivity(sessionID string) {
 	if h == nil || sessionID == "" {
 		return
@@ -2260,10 +2320,7 @@ func (h *PlaybackHandler) finalizeSessionStopWithResult(ctx context.Context, ses
 	if syncNow {
 		h.syncSessionsNow(ctx, syncReason)
 	}
-	if historyErr != nil {
-		return stopResult, historyErr
-	}
-	return stopResult, deleteErr
+	return stopResult
 }
 
 func (h *PlaybackHandler) recordStoppedSession(ctx context.Context, session *playback.Session, reason PlaybackEndReason) watchstate.PlaybackStopResult {
@@ -2290,14 +2347,11 @@ func (h *PlaybackHandler) notifyStoppedSession(ctx context.Context, session *pla
 			}
 		}
 	}
-	var deleteErr error
 	if h.AdminStore != nil {
 		if err := h.AdminStore.DeleteSession(ctx, session.ID); err != nil {
 			slog.ErrorContext(ctx, "failed to delete synced session", "component", "api", "session", session.ID, "error", err)
-			deleteErr = fmt.Errorf("delete synced session: %w", err)
 		}
 	}
-	return deleteErr
 }
 
 func (h *PlaybackHandler) cleanupStoppedSessionTransport(ctx context.Context, session *playback.Session) {
@@ -2324,7 +2378,7 @@ func (h *PlaybackHandler) recordStopHistory(ctx context.Context, session *playba
 		h.recordAdminStopHistory(ctx, session, reason)
 		return watchstate.PlaybackStopResult{}
 	}
-	result := h.persistStopAndHistory(ctx, session)
+	result, _ := h.persistStopAndHistory(ctx, session, "")
 	h.recordAdminStopHistory(ctx, session, reason)
 	return result
 }
@@ -2370,7 +2424,10 @@ func (h *PlaybackHandler) scrobbleAbortedSession(ctx context.Context, session *p
 	if err != nil || file == nil {
 		return
 	}
-	targetID := playbackProgressTarget(file)
+	targetID, targetErr := h.playbackProgressTarget(ctx, file)
+	if targetErr != nil {
+		return
+	}
 	if targetID == "" {
 		return
 	}
