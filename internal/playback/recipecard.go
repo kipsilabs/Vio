@@ -392,8 +392,6 @@ func (c RecipeCard) TranscodeOpts(outputDir, ffmpegPath string, logSink FFmpegLo
 		StreamOriginSeconds:              c.StreamOriginSeconds,
 		CopySeekAnchorResolved:           c.CopySeekAnchorResolved,
 		TargetResolution:                 c.TargetResolution,
-		SourceFrameRate:                  c.SourceFrameRate,
-		SourceHeight:                     c.SourceHeight,
 		TargetCodecVideo:                 c.TargetCodecVideo,
 		TargetCodecAudio:                 c.TargetCodecAudio,
 		TargetAudioChannels:              c.TargetAudioChannels,
