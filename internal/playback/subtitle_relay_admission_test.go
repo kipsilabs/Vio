@@ -1,9 +1,11 @@
 package playback
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -515,5 +517,61 @@ func holdFontRelaySlot(t *testing.T, input string) func() {
 		if released.CompareAndSwap(false, true) {
 			release()
 		}
+	}
+}
+
+// A shed client-facing read must be observable at warn level so multi-viewer
+// contention shows up before clients burn their retry budgets, but a client
+// retry loop must not flood the log: one warn per interval, repeats at debug.
+func TestRelayDemuxShedWarnsThrottled(t *testing.T) {
+	swapRelayDemuxGuardForTest(t, newRelayDemuxGuardWithDetached(2, 1, 5*time.Millisecond))
+	const remote = "http://relay-shed-warn.test/source/tok/movie.mkv"
+	defer holdDetachedRelaySlot(t, remote)()
+
+	dir := t.TempDir()
+	cache := NewSubtitleCache(func() string { return dir })
+	now := time.Unix(1700000000, 0)
+	cache.demuxBusyWarnNow = func() time.Time { return now }
+
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	shed := func() {
+		t.Helper()
+		opts := StreamExtractOpts{
+			InputPath:          remote,
+			CacheIdentity:      "relay-shed-warn",
+			TrackIndex:         0,
+			SourceCodec:        "subrip",
+			DetachedRelayDemux: true,
+		}
+		extract := func(context.Context, StreamExtractOpts) error {
+			t.Error("shed read still invoked its extraction")
+			return nil
+		}
+		_, err := cache.ServeExtractWithResult(
+			httptest.NewRecorder(),
+			httptest.NewRequest(http.MethodGet, "/subtitle", nil),
+			opts, extract,
+		)
+		var retry *SubtitleExtractionRetryError
+		if !errors.As(err, &retry) {
+			t.Fatalf("shed read error = %v, want a retryable answer", err)
+		}
+	}
+
+	const warnMsg = "subtitle extract shed: relay source saturated"
+	shed()
+	shed()
+	if got := strings.Count(logs.String(), warnMsg); got != 1 {
+		t.Fatalf("shed warnings inside one interval = %d, want 1 (logs: %s)", got, logs.String())
+	}
+
+	now = now.Add(subtitleDemuxBusyWarnEvery + time.Second)
+	shed()
+	if got := strings.Count(logs.String(), warnMsg); got != 2 {
+		t.Fatalf("shed warnings after the interval = %d, want 2 (logs: %s)", got, logs.String())
 	}
 }

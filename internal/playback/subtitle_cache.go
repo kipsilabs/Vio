@@ -101,6 +101,19 @@ type SubtitleCache struct {
 	// provider on every request.
 	fontFailureMu      sync.Mutex
 	fontFailureRetryAt map[string]time.Time
+
+	// demuxBusyWarnMu guards demuxBusyWarnAt, the interval throttle for the
+	// relay-shed warning. Shedding a client-facing subtitle read answers a
+	// retryable 503; a viewer who keeps retrying can burn a client's retry
+	// budget before anyone notices, so each shed is worth a warning, but a
+	// saturated source sheds every request in a retry loop. One warning per
+	// subtitleDemuxBusyWarnEvery per cache makes the contention visible
+	// without flooding the log. The interval and clock are fields so tests can
+	// drive them without touching package state.
+	demuxBusyWarnMu    sync.Mutex
+	demuxBusyWarnAt    time.Time
+	demuxBusyWarnEvery time.Duration
+	demuxBusyWarnNow   func() time.Time
 }
 
 const (
@@ -138,6 +151,12 @@ const (
 	// warmed artifact across a viewing session while still bounding that
 	// residual risk.
 	subtitleCacheGenerationBucket = 24 * time.Hour
+	// subtitleDemuxBusyWarnEvery bounds how often one cache warns that it shed
+	// a client-facing subtitle read because the relay source was saturated.
+	// The shed itself is expected backpressure; the warning exists so repeated
+	// multi-viewer contention is visible before clients exhaust their retry
+	// budgets, without one log line per retry.
+	subtitleDemuxBusyWarnEvery = time.Minute
 	// subtitleFontBundleExtractTimeout bounds one detached font-bundle
 	// extraction. The extraction runs single-flighted and detached from the
 	// request that triggered it, and its successful result is written through
@@ -555,8 +574,7 @@ func (c *SubtitleCache) ServeExtractWithResult(w http.ResponseWriter, r *http.Re
 		if fill != nil {
 			fill.Discard()
 		}
-		slog.DebugContext(r.Context(), "subtitle extract deferred: relay source saturated",
-			"input", opts.InputPath, "track", opts.TrackIndex, "format", format)
+		c.warnDemuxBusy(r.Context(), opts, format)
 		return result, &SubtitleExtractionRetryError{RetryAfter: subtitleFillBusyRetryAfter}
 	}
 	defer releaseRelayDemux()
@@ -1151,6 +1169,46 @@ func (c *SubtitleCache) HasCommittedEntry(inputPath, cacheIdentity string, track
 	return ok
 }
 
+// warnDemuxBusy reports that this serve shed a client-facing subtitle read
+// because the relay source was saturated. The first shed per interval warns;
+// repeats in the same interval drop to debug, so a client retry loop keeps a
+// diagnostic trail without flooding the log.
+func (c *SubtitleCache) warnDemuxBusy(ctx context.Context, opts StreamExtractOpts, format string) {
+	interval := subtitleDemuxBusyWarnEvery
+	now := time.Now
+	if c != nil {
+		if c.demuxBusyWarnEvery > 0 {
+			interval = c.demuxBusyWarnEvery
+		}
+		if c.demuxBusyWarnNow != nil {
+			now = c.demuxBusyWarnNow
+		}
+	}
+	shouldWarn := true
+	if c != nil {
+		at := now()
+		c.demuxBusyWarnMu.Lock()
+		if !c.demuxBusyWarnAt.IsZero() && at.Sub(c.demuxBusyWarnAt) < interval {
+			shouldWarn = false
+		} else {
+			c.demuxBusyWarnAt = at
+		}
+		c.demuxBusyWarnMu.Unlock()
+	}
+	attrs := []any{
+		"component", "playback",
+		"input", opts.InputPath,
+		"track", opts.TrackIndex,
+		"format", format,
+		"retry_after_seconds", int(subtitleFillBusyRetryAfter.Seconds()),
+	}
+	if !shouldWarn {
+		slog.DebugContext(ctx, "subtitle extract deferred: relay source saturated", attrs...)
+		return
+	}
+	slog.WarnContext(ctx, "subtitle extract shed: relay source saturated", attrs...)
+}
+
 // ServeSUPExtract serves the .sup extract for one source+track described by
 // opts (opts.Writer is ignored; the cache supplies it). Full-track requests
 // (no AllowWindow): a cache hit is served with http.ServeContent (Range
@@ -1217,8 +1275,7 @@ func (c *SubtitleCache) ServeSUPExtract(w http.ResponseWriter, r *http.Request, 
 		if fill != nil {
 			fill.Discard()
 		}
-		slog.DebugContext(r.Context(), "subtitle extract deferred: relay source saturated",
-			"input", opts.InputPath, "track", opts.TrackIndex, "format", subtitleFormatSUP)
+		c.warnDemuxBusy(r.Context(), opts, subtitleFormatSUP)
 		return &SubtitleExtractionRetryError{RetryAfter: subtitleFillBusyRetryAfter}
 	}
 	defer releaseRelayDemux()
@@ -1389,8 +1446,7 @@ func (c *SubtitleCache) serveWindowedSUP(w http.ResponseWriter, r *http.Request,
 	// retryable.
 	admittedCtx, releaseRelayDemux, admitErr := acquireRelayDemuxRead(relayDemuxAdmissionContext(r.Context(), opts), opts.InputPath)
 	if admitErr != nil {
-		slog.DebugContext(r.Context(), "subtitle extract deferred: relay source saturated",
-			"input", opts.InputPath, "track", opts.TrackIndex, "format", subtitleFormatSUP)
+		c.warnDemuxBusy(r.Context(), opts, subtitleFormatSUP)
 		return &SubtitleExtractionRetryError{RetryAfter: subtitleFillBusyRetryAfter}
 	}
 	defer releaseRelayDemux()
