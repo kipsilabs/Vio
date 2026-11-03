@@ -22508,13 +22508,13 @@
       "disposition_rule": "default_ported",
       "disposition_rationale": "No exclusion, removal, or ratified redesign applies; port to v2 in its section PR.",
       "owner": null,
-      "review_state": "proposed",
+      "review_state": "ratified",
       "v2": {
-        "method": null,
-        "path": null,
-        "operation_id": null
+        "method": "POST",
+        "path": "/api/v2/catalog/versions/check",
+        "operation_id": "checkCatalogVersions"
       },
-      "notes": "Conditionally registered: authMiddleware != nil; itemsHandler != nil; catalogResourceHandler != nil. v2 registers the operation unconditionally and reports capability state instead.",
+      "notes": "Section catalog-items (profile_scoped). The v1 body's integer file ids are string IDs in v2; an empty list is 400 bad_request and more than 40 ids is 413 too_large in v1, and both are 422 validation failures in v2. Conditionally registered: authMiddleware != nil; itemsHandler != nil; catalogResourceHandler != nil. v2 registers the operation unconditionally and reports capability state instead.",
       "retry_safety": "natural_idempotent",
       "retry_safety_note": "A batched availability probe: repeating it re-resolves the same files and converges on the current provider verdict; there is no durable side effect to duplicate."
     },

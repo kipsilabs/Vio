@@ -493,6 +493,7 @@ GET /api/v2/catalog/series/{id}/seasons	non-media
 GET /api/v2/catalog/series/{id}/seasons/{num}	non-media
 GET /api/v2/catalog/series/{id}/seasons/{num}/episodes	non-media
 GET /api/v2/catalog/themes/capabilities	non-media
+POST /api/v2/catalog/versions/check	non-media
 GET /api/v2/catalog/works/{work_id}	non-media
 GET /api/v2/collections	non-media
 POST /api/v2/collections	non-media
@@ -1797,6 +1798,7 @@ GET /api/v2/catalog/series/{id}/seasons	non-media
 GET /api/v2/catalog/series/{id}/seasons/{num}	non-media
 GET /api/v2/catalog/series/{id}/seasons/{num}/episodes	non-media
 GET /api/v2/catalog/themes/capabilities	non-media
+POST /api/v2/catalog/versions/check	non-media
 GET /api/v2/catalog/works/{work_id}	non-media
 GET /api/v2/collections	non-media
 POST /api/v2/collections	non-media
