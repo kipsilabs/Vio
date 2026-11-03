@@ -52,6 +52,7 @@ type SubtitleInventoryEntryV3 struct {
 	Forced               bool
 	HearingImpaired      bool
 	DownloadedSubtitleID int `json:"-"`
+	NativeSelectable     bool
 }
 
 // ResolveSubtitlePolicyV3 decides how the selected subtitle is delivered when
@@ -59,7 +60,11 @@ type SubtitleInventoryEntryV3 struct {
 // delivery-specific, so callers must resolve the policy against the delivery
 // class that will actually run the plan rather than assuming the
 // original_http capabilities.
-func ResolveSubtitlePolicyV3(file *models.MediaFile, request StartRequestV3, transcodeAllowed bool, deliveryClass string, additional []SubtitleInventoryEntryV3) SubtitlePolicyResultV3 {
+type SubtitleTrackFactsV3 interface {
+	NativeSelectable(file *models.MediaFile, index int) bool
+}
+
+func ResolveSubtitlePolicyV3(file *models.MediaFile, request StartRequestV3, transcodeAllowed bool, deliveryClass string, additional []SubtitleInventoryEntryV3, audioIndex int, facts SubtitleTrackFactsV3) SubtitlePolicyResultV3 {
 	index := -1
 	if request.SubtitleTrackIndex != nil {
 		index = *request.SubtitleTrackIndex

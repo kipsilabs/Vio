@@ -21,14 +21,15 @@ import (
 // context, channels, log sink). Those are re-wired on reconstruct from the
 // live config and request.
 type RecipeCard struct {
-	SessionID            string    `json:"session_id"`
-	UserID               int       `json:"user_id"`
-	ProfileID            string    `json:"profile_id"`
-	MediaFileID          int       `json:"media_file_id"`
-	TranscodeNodeURL     string    `json:"transcode_node_url,omitempty"`
-	TranscodeTransportID string    `json:"transcode_transport_id,omitempty"`
-	OriginalStartedAt    time.Time `json:"original_started_at,omitempty"`
-	StreamLocation       string    `json:"stream_location,omitempty"`
+	SessionID                        string    `json:"session_id"`
+	UserID                           int       `json:"user_id"`
+	ProfileID                        string    `json:"profile_id"`
+	MediaFileID                      int       `json:"media_file_id"`
+	VirtualSourceOwnerInstallationID int       `json:"virtual_source_owner_installation_id,omitempty"`
+	TranscodeNodeURL                 string    `json:"transcode_node_url,omitempty"`
+	TranscodeTransportID             string    `json:"transcode_transport_id,omitempty"`
+	OriginalStartedAt                time.Time `json:"original_started_at,omitempty"`
+	StreamLocation                   string    `json:"stream_location,omitempty"`
 	// Routing fields freeze the committed media-serving boundary so a token or
 	// stored card cannot lose a proxy-only assignment when it reconstructs a
 	// session on another process. Stable execution and egress identities bind
@@ -122,6 +123,8 @@ type RecipeCard struct {
 	StreamOriginSeconds        float64                `json:"stream_origin_seconds,omitempty"`
 	CopySeekAnchorResolved     bool                   `json:"copy_seek_anchor_resolved,omitempty"`
 	TargetResolution           string                 `json:"target_resolution,omitempty"`
+	SourceFrameRate            float64                `json:"source_frame_rate,omitempty"`
+	SourceHeight               int                    `json:"source_height,omitempty"`
 	TargetCodecVideo           string                 `json:"target_codec_video,omitempty"`
 	TargetCodecAudio           string                 `json:"target_codec_audio,omitempty"`
 	TargetAudioChannels        int                    `json:"target_audio_channels,omitempty"`
