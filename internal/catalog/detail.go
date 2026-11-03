@@ -369,10 +369,11 @@ type ItemDetail struct {
 	Subtitles []SubtitleInfo `json:"subtitles"`
 
 	// Intro/credits/recap/preview markers (from first file that has them).
-	Intro   *Marker `json:"intro,omitempty"`
-	Credits *Marker `json:"credits,omitempty"`
-	Recap   *Marker `json:"recap,omitempty"`
-	Preview *Marker `json:"preview,omitempty"`
+	Intro          *Marker         `json:"intro,omitempty"`
+	Credits        *Marker         `json:"credits,omitempty"`
+	Recap          *Marker         `json:"recap,omitempty"`
+	Preview        *Marker         `json:"preview,omitempty"`
+	VirtualRanking *VirtualRanking `json:"virtual_ranking,omitempty"`
 
 	// Effective subtitle defaults for episode playback derived from
 	// profile, library, and series-level preferences.
@@ -616,8 +617,16 @@ type FileVersion struct {
 	// and nothing usable is recorded for it, so it cannot play until it is
 	// replaced. Jellyfin PlaybackInfo leaves such versions out. Neither the v1
 	// nor the v2 view carries the flag.
-	Unreadable bool `json:"-"`
+	Unreadable     bool                   `json:"-"`
+	SourceMismatch *VersionSourceMismatch `json:"-"`
 }
+
+type VersionSourceMismatch struct {
+	ServedBytes   int64 `json:"served_bytes"`
+	DeclaredBytes int64 `json:"declared_bytes"`
+}
+
+type VersionSourceMismatchSource func(*models.MediaFile) *VersionSourceMismatch
 
 // SetMarkers refreshes the marker projection without rebuilding file metadata.
 func versionInventoryPrepared(v FileVersion) bool {
@@ -688,6 +697,7 @@ type PlaybackVariant struct {
 	PartCount            int                   `json:"part_count"`
 	TotalDuration        int                   `json:"total_duration,omitempty"`
 	DefaultFileID        int                   `json:"default_file_id,omitempty"`
+	VirtualRanking       *VirtualRanking       `json:"virtual_ranking,omitempty"`
 	Parts                []PlaybackVariantPart `json:"parts"`
 }
 
@@ -804,6 +814,7 @@ type WatchDetail struct {
 	HasEffectiveShowForcedSubtitles bool                              `json:"-"`
 	Versions                        []FileVersion                     `json:"versions"`
 	PlaybackVariants                []PlaybackVariant                 `json:"playback_variants,omitempty"`
+	VirtualRanking                  *VirtualRanking                   `json:"virtual_ranking,omitempty"`
 	Subtitles                       []SubtitleInfo                    `json:"subtitles"`
 	Intro                           *Marker                           `json:"intro,omitempty"`
 	Credits                         *Marker                           `json:"credits,omitempty"`
@@ -927,22 +938,25 @@ type DetailService struct {
 	folderRepo     interface {
 		GetByID(ctx context.Context, id int) (*models.MediaFolder, error)
 	}
-	fileFetcher       FileVersionFetcher
-	videoRepo         *VideoRepository
-	ratingSourceRepo  *RatingSourceRepository
-	extraRepo         *ExtraRepository
-	backdropRepo      itemBackdropLister
-	rootClaimRepo     *RootClaimRepository
-	groupClaimRepo    *GroupClaimRepository
-	imageResolver     ImageResolver
-	userStoreProvider userstore.UserStoreProvider
-	workSummary       WorkSummaryProvider
-	workLinker        LiteraryWorkLinker
-	originalLangFn    func(context.Context, string) string
-	probeEnsurer      PlaybackProbeEnsurer
-	copySafetyRacer   CopySafetyRacer
-	chapterThumbs     ChapterThumbnailQueuer
-	trickplay         TrickplayAvailability
+	fileFetcher           FileVersionFetcher
+	videoRepo             *VideoRepository
+	ratingSourceRepo      *RatingSourceRepository
+	extraRepo             *ExtraRepository
+	backdropRepo          itemBackdropLister
+	rootClaimRepo         *RootClaimRepository
+	groupClaimRepo        *GroupClaimRepository
+	imageResolver         ImageResolver
+	userStoreProvider     userstore.UserStoreProvider
+	workSummary           WorkSummaryProvider
+	workLinker            LiteraryWorkLinker
+	originalLangFn        func(context.Context, string) string
+	probeEnsurer          PlaybackProbeEnsurer
+	copySafetyRacer       CopySafetyRacer
+	chapterThumbs         ChapterThumbnailQueuer
+	trickplay             TrickplayAvailability
+	virtualRankingSource  VirtualRankingSource
+	virtualScoreSource    VirtualCandidateScoreSource
+	versionSourceMismatch VersionSourceMismatchSource
 
 	// resolver is built once on first use; see settingsResolver.
 	resolverOnce sync.Once
@@ -971,6 +985,53 @@ func NewDetailService(
 		backdropRepo:     NewItemBackdropRepository(itemRepo.pool),
 		fileFetcher:      fileFetcher,
 	}
+}
+
+func (s *DetailService) attachVirtualCandidateScores(ctx context.Context, contentID string, versions []FileVersion, files []*models.MediaFile) {
+	if s.virtualScoreSource == nil {
+		return
+	}
+	for id, score := range s.virtualScoreSource(ctx, contentID, files) {
+		for i := range versions {
+			if versions[i].FileID == id {
+				versions[i].FormatScore = &score.Score
+				versions[i].MatchedFormats = score.MatchedFormats
+			}
+		}
+	}
+}
+
+func (s *DetailService) SetVirtualRankingSource(source VirtualRankingSource) {
+	s.virtualRankingSource = source
+}
+
+func (s *DetailService) attachVirtualRanking(ctx context.Context, contentID string, detail *WatchDetail, files []*models.MediaFile) {
+	if s.virtualRankingSource == nil || detail == nil {
+		return
+	}
+	rows := s.virtualRankingSource(ctx, contentID, files)
+	for _, f := range files {
+		if r, ok := rows[f.ID]; ok {
+			detail.VirtualRanking = &r
+			for i := range detail.Versions {
+				if detail.Versions[i].FileID == f.ID {
+					break
+				}
+			}
+			return
+		}
+	}
+}
+
+func (s *DetailService) SetVersionSourceMismatchSource(source VersionSourceMismatchSource) {
+	s.versionSourceMismatch = source
+}
+
+func (s *DetailService) versionSourceMismatchFor(file *models.MediaFile) *VersionSourceMismatch {
+	if s == nil || s.versionSourceMismatch == nil || file == nil {
+		return nil
+	}
+	return s.versionSourceMismatch(file)
 }
 
 // SetImageResolver sets the plugin-based image resolver for resolving
