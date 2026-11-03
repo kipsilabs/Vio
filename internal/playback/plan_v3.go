@@ -66,9 +66,10 @@ type PlannerInputV3 struct {
 	// LowerVersion names the version that serves lower qualities when the
 	// requested version is 4K and 4K transcoding is disabled. Nil when the
 	// item has no such version or the caller did not look for one.
-	LowerVersion    *LowerVersionV3
-	AudioTrackIndex int
-	Settings        PlannerSettingsV3
+	LowerVersion       *LowerVersionV3
+	AudioTrackIndex    int
+	SubtitleTrackFacts SubtitleTrackFactsV3
+	Settings           PlannerSettingsV3
 	// Registry holds the transformations the local binary can execute.
 	Registry *TransformationRegistryV3
 	// DeliveryAllowList restricts planning to the delivery classes selected by
@@ -274,9 +275,9 @@ func resolvePlanSubtitlePoliciesV3(input PlannerInputV3, file *models.MediaFile,
 		// subtitles-off, so one reused outcome answers all three.
 		return reused, reused, reused
 	}
-	return ResolveSubtitlePolicyV3(file, input.Request, input.Settings.TranscodeEnabled, DeliveryClassOriginalHTTPV3, input.AdditionalSubtitles),
-		ResolveSubtitlePolicyV3(file, input.Request, input.Settings.TranscodeEnabled, DeliveryClassProgressiveV3, input.AdditionalSubtitles),
-		ResolveSubtitlePolicyV3(file, input.Request, input.Settings.TranscodeEnabled, DeliveryClassHLSV3, input.AdditionalSubtitles)
+	return ResolveSubtitlePolicyV3(file, input.Request, input.Settings.TranscodeEnabled, DeliveryClassOriginalHTTPV3, input.AdditionalSubtitles, input.AudioTrackIndex, input.SubtitleTrackFacts),
+		ResolveSubtitlePolicyV3(file, input.Request, input.Settings.TranscodeEnabled, DeliveryClassProgressiveV3, input.AdditionalSubtitles, input.AudioTrackIndex, input.SubtitleTrackFacts),
+		ResolveSubtitlePolicyV3(file, input.Request, input.Settings.TranscodeEnabled, DeliveryClassHLSV3, input.AdditionalSubtitles, input.AudioTrackIndex, input.SubtitleTrackFacts)
 }
 
 // PlanPlaybackV3 chooses a playable protocol-v3 route from source and client facts.
