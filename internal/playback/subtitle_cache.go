@@ -1144,7 +1144,6 @@ func (c *SubtitleCache) ServeSUPExtract(w http.ResponseWriter, r *http.Request, 
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(http.StatusOK)
 
 	counter := &subtitleCountingWriter{w: w}
 	err := c.streamFullTrack(r.Context(), counter, opts, subtitleFormatSUP, extract)
@@ -1286,7 +1285,6 @@ func (c *SubtitleCache) serveWindowedSUP(w http.ResponseWriter, r *http.Request,
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(http.StatusOK)
 
 	counter := &subtitleCountingWriter{w: w}
 	var writer io.Writer = counter

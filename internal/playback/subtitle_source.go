@@ -136,17 +136,21 @@ const (
 // copy, only when that can't. An extract whose options name no track, or
 // that already has packets, runs as it is.
 func (c *SubtitleCache) sourced(extract SUPExtractFunc) SUPExtractFunc {
-	if c == nil || c.source == nil {
+	if c == nil {
 		return extract
 	}
 	return func(ctx context.Context, opts StreamExtractOpts) error {
 		if opts.Embedded == nil || opts.Packets != nil {
 			return extract(ctx, opts)
 		}
-		// Index-only tracks must never fall through to FFmpeg's source demux,
-		// even when no embedded source has been configured.
+		// Index-only tracks must never fall through to FFmpeg's source demux.
+		// This guard must run before checking the optional source: callers can
+		// still provide an index-only ref when no source implementation is set.
 		if opts.Embedded.IndexOnly && c.source == nil {
 			return ErrSubtitleIndexOnly
+		}
+		if c.source == nil {
+			return extract(ctx, opts)
 		}
 		if _, format := streamExtractOutput(opts.SourceCodec, opts.TargetFormat); format == subtitleMuxerWebVTT {
 			keepalive := newPrefixKeepalive(opts.Writer, webVTTPrefix, keepaliveDelay, keepaliveInterval)
