@@ -1656,6 +1656,7 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 		}
 	}
 
+	var resolvedInputCleanup func()
 	// Virtual sources are durable canonical URIs, but a remote worker cannot
 	// dereference them directly. Resolve them through the relay while retaining
 	// the canonical URI (and provider owner) in the recipe for reconstruction.
@@ -1690,6 +1691,13 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 		fileCopy.FilePath = resolved
 		file = &fileCopy
 		// The recipe builder uses CanonicalInputPath and owner metadata below.
+		// Keep the relay cleanup alive until the remote playback lifecycle owns it.
+		resolvedInputCleanup = cleanup
+		defer func() {
+			if resolvedInputCleanup != nil {
+				resolvedInputCleanup()
+			}
+		}()
 	}
 	if !compatHLSCopiesVideo(source) && is4KResolution(source.Version.Resolution) && !h.allow4KVideoTranscode(ctx) {
 		return errTranscode4KDisallowed
@@ -1883,6 +1891,11 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 			}
 			return transcodenode.TranscodeStartResponse{}, resp.StatusCode, true, err
 		}
+		// Every accepted dispatch, including software retries, must attest the
+		// MPEG-TS packaging it was asked to execute before it is admitted.
+		if attestationErr := transcodenode.ValidateCopyVideoMPEGTSAttestation(request, result); attestationErr != nil {
+			return result, resp.StatusCode, true, attestationErr
+		}
 		return result, resp.StatusCode, false, nil
 	}
 	nodeResponse, status, cleanupRequired, err := dispatch(reqBody)
@@ -2061,6 +2074,7 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 		// Record the decode path the node executed so a reconstruct keeps
 		// it; an older node omits the field.
 		SoftwareVideoDecode: reqBody.SoftwareVideoDecode || nodeResponse.SoftwareVideoDecode,
+		InputCleanup:        resolvedInputCleanup,
 	}
 	toneMapRecipe.apply(&opts)
 	opts.HWAccel = strings.TrimSpace(nodeResponse.HWAccel)
@@ -2075,6 +2089,8 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 		h.tm.StopRemoteTranscode(upstreamSessionID, transcodeNodeURL)
 		return err
 	}
+	// The playback TranscodeSession now owns the relay cleanup.
+	resolvedInputCleanup = nil
 
 	// Publish admin/session execution facts only after the durable recipe
 	// commits. A failed recipe write must not leave the upstream mirror claiming
