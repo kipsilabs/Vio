@@ -88,6 +88,19 @@ type EbookReaderProgressLister interface {
 	ListByContentIDs(ctx context.Context, userID int, profileID string, contentIDs []string) (map[string]EbookReaderProgress, error)
 }
 
+// metadataSeasonCounts returns metadata episode counts by season.
+func (h *ItemsHandler) metadataSeasonCounts(ctx context.Context, seriesID string) (map[int]int, error) {
+	summaries, err := h.episodeRepo.ListMetadataSeasons(ctx, seriesID)
+	if err != nil {
+		return nil, err
+	}
+	counts := make(map[int]int, len(summaries))
+	for _, summary := range summaries {
+		counts[summary.SeasonNumber] = summary.EpisodeCount
+	}
+	return counts, nil
+}
+
 // ItemsHandler handles browse, search, item detail, and series endpoints.
 type ItemsHandler struct {
 	browseRepo               *catalog.BrowseRepository

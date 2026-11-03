@@ -24,6 +24,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/playback/connectionstore"
+	"github.com/Silo-Server/silo-server/internal/userstore"
 )
 
 // Playback service seams for the v2 adapter (internal/apiv2/playback.go).

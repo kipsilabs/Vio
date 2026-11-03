@@ -4208,6 +4208,11 @@ func writeVirtualAudioSelectionInvalid(w http.ResponseWriter) {
 // produced from the live source. Clients already retry through the
 // sliding-window fetcher / replan flow, so the response is deliberately a
 // retryable 4xx, never a 500 or an ambiguous partial stream.
+func writeSubtitleReadsBusy(w http.ResponseWriter) {
+	w.Header().Set("Retry-After", strconv.Itoa(playback.SubtitleReadsRetryAfter))
+	writeError(w, http.StatusServiceUnavailable, "service_unavailable", "The server is busy; try again in a moment")
+}
+
 func writeSubtitleSourceChanged(w http.ResponseWriter) {
 	clearSubtitleCoverageHeaders(w.Header())
 	// A compliant client waits before replaying the same subtitle request; the
