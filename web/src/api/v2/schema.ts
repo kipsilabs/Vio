@@ -7764,6 +7764,23 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/api/v2/devices/push/apple/reset": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /** Clear this account's Apple installation for a device_id so an app that lost its installation key, as after a reinstall, can register again from any generation. */
+    post: operations["resetApplePushInstallation"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   "/api/v2/devices/push/apple/retire": {
     parameters: {
       query?: never;
@@ -13027,7 +13044,7 @@ export interface components {
        */
       password_change_required: boolean;
       /**
-       * @description Effective assignable permissions; empty for a disabled account
+       * @description Assignable permissions the account holds after its access group's mask; empty for a disabled account. An admin lists only explicitly assigned permissions: its role grants every permission only while it acts as administrator (on the primary profile, or with no profile on a household that does not require one), and clients apply that grant from role and profile
        * @example [
        *       "marker_edit"
        *     ]
@@ -18716,7 +18733,7 @@ export interface components {
        */
       restart_count: number;
       /**
-       * @description Process state; starting and backoff occur only for resident plugins, failed also marks a non-resident plugin whose last launch failed
+       * @description Process state; starting and backoff occur only for resident plugins, failed also marks a non-resident plugin whose last launch failed, or whose files can't be restored from its stored archive, on the answering server
        * @enum {string}
        */
       state: "stopped" | "starting" | "running" | "backoff" | "failed";
@@ -21613,6 +21630,8 @@ export interface components {
     ApplePushRegistrationCapability: {
       /** @description Whether the current principal may use the capability */
       allowed: boolean;
+      /** @description resetApplePushInstallation is served: after a push_installation_key_mismatch refusal the app can reset its own installation and register again. */
+      installation_reset_available: boolean;
       /** @description Local ordered storage and current-login validation are configured; not provider delivery or cluster rollout readiness. */
       registration_available: boolean;
       /** @description Opaque revision of this document */
@@ -21651,6 +21670,13 @@ export interface components {
        * @example 3f2a9d5e-6b1c-4c7e-9a0d-2f4b8c1e7a35
        */
       server_id?: string;
+    };
+    ApplePushResetBody: {
+      device_id: string;
+    };
+    ApplePushResetReceipt: {
+      /** @description True when the server cleared the installation's binding and its Apple push registrations. False when there was nothing to clear: no ordered record for this device_id, or one already bound to the sent key, whose generation order still applies. After a cleared or absent record, the next registration with that key binds at any positive generation. */
+      reset: boolean;
     };
     ApplePushRetirementBody: {
       device_id: string;
@@ -22084,7 +22110,7 @@ export interface components {
        * @example America/New_York
        */
       air_timezone?: string;
-      /** @description series_premiere, season_premiere, finale; empty, never null */
+      /** @description series_premiere, season_premiere, finale; on a movie, digital or physical: the home release it is listed on. Empty, never null */
       badges: string[];
       /** @example episode:severance-s02e01 */
       content_id: string;
@@ -22860,7 +22886,7 @@ export interface components {
       air_date: string;
       /** @description Local wall-clock time, HH:MM */
       air_time?: string;
-      /** @description Empty, never null */
+      /** @description The calendar event's badges: series_premiere, season_premiere, finale; on a movie, digital or physical. Empty, never null */
       badges: string[];
       /** Format: int64 */
       episode_number?: number;
@@ -26272,6 +26298,11 @@ export interface components {
     HLSSubtitleRenditionV3: {
       format: string;
       group_id: string;
+      /**
+       * Format: int64
+       * @description 1-based position of the rendition in its SUBTITLES group, set when the group lists every embedded text track (hls_subtitle_renditions_all_v1); equal to the selected inventory row's hls_rendition.index
+       */
+      index?: number;
       mime_type: string;
       name: string;
     };
@@ -28096,6 +28127,8 @@ export interface components {
       codecs: string[];
       container: string;
       font_attachments: boolean;
+      /** @description Renderer limitations of this native route: forced_unlisted, hidden_track_preemption, literal_override_tags. Honored when the server advertises native_embedded_limitations_v1; an entry naming a value the server does not know is not used for native selection. */
+      limitations?: string[];
       track_identity: string;
     };
     NavigationShortcutMutation: {
@@ -33026,22 +33059,46 @@ export interface components {
       source: string;
       title?: string;
     };
+    SubtitleInventoryHLSRenditionV3: {
+      /** @description The rendition's EXT-X-MEDIA GROUP-ID */
+      group_id: string;
+      /**
+       * Format: int64
+       * @description 1-based position of the rendition in its group, in inventory order
+       */
+      index: number;
+      /** @description The rendition's EXT-X-MEDIA NAME, unique in the group */
+      name: string;
+    };
     SubtitleInventoryItemV3: {
       codec?: string;
       /** Format: int64 */
       combined_index: number;
+      /** @description Embedded tracks only: the Matroska TrackNumber or MP4 track ID, omitted when unknown */
+      container_track_id?: string;
       default: boolean;
       delivery: string;
       /** Format: uri-reference */
       font_bundle_url?: string;
       forced: boolean;
       hearing_impaired: boolean;
+      /** @description Embedded text tracks of an HLS plan under hls_subtitle_renditions_all_v1: the track's WebVTT rendition in the stream's SUBTITLES group. The client may select it in its player and report the change with a subtitle_track_changed replan, which keeps the stream; url stays the fallback. */
+      hls_rendition?: components["schemas"]["SubtitleInventoryHLSRenditionV3"];
       label?: string;
       /** @description Subtitle language: BCP 47 tag (en, pt-BR), empty when unknown; older rows may carry a legacy value */
       language?: string;
+      /** @description Embedded tracks only: selecting this track, with the plan's delivery and audio, yields subtitle.embedded. The client may switch to it locally and report the change with a subtitle_track_changed replan, which returns a plan for the same media; url, when the row has one, stays the fallback; a bitmap track delivered only by burn-in has none. */
+      native_selectable?: boolean;
       source: string;
+      /**
+       * Format: int64
+       * @description Embedded tracks only: the absolute probed stream index, the namespace of subtitle.embedded.stream_index and the sidecar URL's embedded_stream_index
+       */
+      stream_index?: number;
       sync_key?: string;
       track_id: string;
+      /** @description No route can show this track: the server has no rendering, conversion, or burn-in route for its format, or doesn't recognize the format at all. Selecting it gets a subtitle_codec_unsupported terminal, so a client should list it as unavailable. */
+      unplayable?: boolean;
       /** Format: uri-reference */
       url?: string;
     };
@@ -103931,6 +103988,145 @@ export interface operations {
       };
     };
   };
+  resetApplePushInstallation: {
+    parameters: {
+      query?: never;
+      header: {
+        /** @description The household profile acting for this request; it must belong to the authenticated account. */
+        "X-Profile-Id": string;
+        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
+        "X-Profile-Token"?: string;
+        /** @description The caller's current installation key, the one its next registration will send. An installation already bound to it is left alone, so a retried reset cannot undo the registration that followed it. */
+        "X-Push-Installation-Key": string;
+      };
+      path?: never;
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["ApplePushResetBody"];
+      };
+    };
+    responses: {
+      /** @description OK */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApplePushResetReceipt"];
+        };
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unauthorized */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Forbidden */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Found */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Acceptable */
+      406: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Request Timeout */
+      408: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Request Entity Too Large */
+      413: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unsupported Media Type */
+      415: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unprocessable Entity */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Too Many Requests */
+      429: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
   retireApplePushInstallation: {
     parameters: {
       query?: never;
@@ -127214,6 +127410,8 @@ export interface operations {
       query?: {
         /** @description Set by the multivariant playlist of a plan with subtitle.hls_rendition: video selects the media playlist, subtitles the WebVTT subtitle playlist. Absent, such a plan's manifest is the multivariant playlist. */
         silo_rendition?: "video" | "subtitles";
+        /** @description Set with silo_rendition=subtitles by the multivariant playlist of a plan with on-demand renditions (hls_subtitle_renditions_all_v1): the container track number whose WebVTT playlist to answer. */
+        silo_track?: string;
         /** @description Signed stream reference the plan URL carries; it reconstructs the session after a restart. Omitted for header-authenticated media. Account and viewer authorization are always required. */
         st?: string;
         /** @description Media-element fallback for the account bearer token when an Authorization header cannot be set. Header-authenticated media requires the Authorization header and the profile selector. */
@@ -127356,7 +127554,7 @@ export interface operations {
         "X-Profile-Token"?: string;
       };
       path: {
-        /** @description Segment name from the media playlist. sub_NNNNN.vtt names a WebVTT subtitle rendition segment, answered from the cues already produced; one the transcode does not reach in time is an empty WebVTT document. */
+        /** @description Segment name from the media playlist. sub_NNNNN.vtt names a WebVTT subtitle rendition segment, answered from the cues already produced; one the transcode does not reach in time is an empty WebVTT document. sub_<track>_NNNNN.vtt names a segment of the on-demand rendition of container track <track> (hls_subtitle_renditions_all_v1), read from the source when it is requested. */
         name: string;
         session_id: string;
       };

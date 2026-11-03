@@ -3,6 +3,7 @@ package playback
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -123,7 +124,7 @@ func TestNewAutoTranscodePipelineEnablesOnlyAutoHardwareTranscodes(t *testing.T)
 			if pipeline.Enabled() {
 				t.Fatal("pipeline must stay disabled")
 			}
-			if got := pipeline.Current(); got.HWAccel != opts.HWAccel || got.InputPath != opts.InputPath || got.SessionID != opts.SessionID {
+			if got := pipeline.Current(); !reflect.DeepEqual(got, opts) {
 				t.Fatalf("disabled Current() = %+v, want request opts unchanged %+v", got, opts)
 			}
 			if pipeline.AdvanceAfterFailure("0") {

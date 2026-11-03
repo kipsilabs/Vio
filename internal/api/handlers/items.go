@@ -2,16 +2,13 @@ package handlers
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
 	"net/http"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -29,7 +26,6 @@ import (
 	"github.com/Silo-Server/silo-server/internal/metadata"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/overlays"
-	"github.com/Silo-Server/silo-server/internal/plugins"
 	"github.com/Silo-Server/silo-server/internal/ratelimit"
 	"github.com/Silo-Server/silo-server/internal/sections"
 	"github.com/Silo-Server/silo-server/internal/userstore"
@@ -117,74 +113,12 @@ type ItemsHandler struct {
 	ebookReadStateStore      EbookReadStateStore
 	EventsHub                *evt.Hub
 	UserRepo                 *auth.UserRepository
-	DeviceProfileReader      plugins.DeviceCapabilityProfileSource
 	AccessGroups             access.GroupPolicyProvider // optional; resolves inherited library access when no scope is in context
 	MarkerPopulation         MarkerPopulationService
 	MarkerFileResolver       FilePathResolver
-	// VirtualPrefetcher warms virtual candidate listings when a watch detail
-	// is viewed, so the later playback start finds a warm BestResultCache.
-	// Nil disables prefetch. Set via SetVirtualPrefetcher.
-	virtualPrefetcher VirtualPrefetcher
-	// VirtualFileByID loads a MediaFile for a version FileID so prefetch can
-	// warm exactly the rows the detail page offers. Nil disables prefetch.
-	virtualFileByID VirtualFileByID
-	// virtualSelectionProber schedules the pre-play probe for an explicitly
-	// selected virtual version whose inventory is still missing. Nil disables
-	// selection probing. Set via SetVirtualSelectionProber.
-	virtualSelectionProber VirtualSelectionProber
-	// virtualPrefetchInflight collapses repeated catalog reads for the same
-	// file+profile before any row load or goroutine: the entry lives only
-	// while the background load runs. Delete is deferred as the goroutine's
-	// first statement, so it runs even on panic unwind; no reaper needed.
-	virtualPrefetchInflight sync.Map // string -> struct{}
-	// virtualPrefetchLoadSem bounds concurrent background row-loads across
-	// distinct keys. Created once via prefetchSemOnce; the local captured in
-	// prefetchVirtualFileIDs is used for both acquire and release so a
-	// concurrent init can never split them across channels.
-	virtualPrefetchLoadSem chan struct{}
-	prefetchSemOnce        sync.Once
-	MarkerImageURLs        interface {
+	MarkerImageURLs          interface {
 		ResolveURLs(context.Context, []string) map[string]catalog.ResolvedImageURL
 	}
-}
-
-// VirtualPrefetcher warms virtual playback listings off the click path.
-// Satisfied by *PlaybackHandler.PrefetchVirtualPlayback.
-type VirtualPrefetcher interface {
-	PrefetchVirtualPlayback(ctx context.Context, files []*models.MediaFile, profileID string)
-}
-
-// VirtualFileByID loads one media file row for prefetch warming.
-type VirtualFileByID interface {
-	GetByID(ctx context.Context, id int) (*models.MediaFile, error)
-}
-
-// VirtualSelectionProber schedules the pre-play work for one explicitly
-// selected virtual version: the probe chain that enumerates its inventory, and
-// the provider-side fetch warm-up that puts its bytes in place before play.
-// *PlaybackHandler implements both entry points; nil disables selection work.
-type VirtualSelectionProber interface {
-	ScheduleSelectedFileProbe(contentID string, fileID int, filter catalog.AccessFilter)
-	ScheduleSelectedFileWarm(contentID string, fileID int, filter catalog.AccessFilter)
-}
-
-// SetVirtualPrefetcher wires watch-detail prefetch. Either arg may be nil to
-// keep prefetch disabled.
-func (h *ItemsHandler) SetVirtualPrefetcher(p VirtualPrefetcher, files VirtualFileByID) {
-	if h == nil {
-		return
-	}
-	h.virtualPrefetcher = p
-	h.virtualFileByID = files
-}
-
-// SetVirtualSelectionProber wires probe-on-select for watch-detail reads. Nil
-// keeps the selection probe disabled.
-func (h *ItemsHandler) SetVirtualSelectionProber(p VirtualSelectionProber) {
-	if h == nil {
-		return
-	}
-	h.virtualSelectionProber = p
 }
 
 // NewItemsHandler creates a new ItemsHandler.
@@ -513,28 +447,22 @@ type episodeFileResponse struct {
 
 // episodeResponse is the shape of an episode in API responses.
 type episodeResponse struct {
-	StillIsEpisodeStill *bool  `json:"-"`
-	ContentID           string `json:"content_id"`
-	SeasonNumber        int    `json:"season_number"`
-	EpisodeNumber       int    `json:"episode_number"`
-	Title               string `json:"title"`
-	Overview            string `json:"overview,omitempty"`
-	AirDate             string `json:"air_date,omitempty"`
-	// ReleaseState is the release timing derived from AirDate by
-	// EpisodeReleaseState: upcoming when the calendar date is after today
-	// (UTC), released otherwise, absent when the air date is unknown. The
-	// v1 shape keeps no copy: the frozen contract is unchanged and v2
-	// carries the field under its own name.
-	ReleaseState   string                  `json:"-"`
-	Runtime        int                     `json:"runtime"`
-	ImdbID         string                  `json:"imdb_id,omitempty"`
-	TmdbID         string                  `json:"tmdb_id,omitempty"`
-	TvdbID         string                  `json:"tvdb_id,omitempty"`
-	StillURL       string                  `json:"still_url,omitempty"`
-	StillThumbhash string                  `json:"still_thumbhash,omitempty"`
-	UserData       *catalog.SeasonUserData `json:"user_data,omitempty"`
-	Files          []episodeFileResponse   `json:"files,omitempty"`
-	OverlaySummary *models.OverlaySummary  `json:"overlay_summary,omitempty"`
+	StillIsEpisodeStill *bool                   `json:"-"`
+	ContentID           string                  `json:"content_id"`
+	SeasonNumber        int                     `json:"season_number"`
+	EpisodeNumber       int                     `json:"episode_number"`
+	Title               string                  `json:"title"`
+	Overview            string                  `json:"overview,omitempty"`
+	AirDate             string                  `json:"air_date,omitempty"`
+	Runtime             int                     `json:"runtime"`
+	ImdbID              string                  `json:"imdb_id,omitempty"`
+	TmdbID              string                  `json:"tmdb_id,omitempty"`
+	TvdbID              string                  `json:"tvdb_id,omitempty"`
+	StillURL            string                  `json:"still_url,omitempty"`
+	StillThumbhash      string                  `json:"still_thumbhash,omitempty"`
+	UserData            *catalog.SeasonUserData `json:"user_data,omitempty"`
+	Files               []episodeFileResponse   `json:"files,omitempty"`
+	OverlaySummary      *models.OverlaySummary  `json:"overlay_summary,omitempty"`
 	// RatingIMDB and RatingTMDB feed the v2 episode's ratings; /api/v1 is
 	// frozen, so they stay off its wire.
 	RatingIMDB *float64 `json:"-"`
@@ -543,24 +471,6 @@ type episodeResponse struct {
 	MachineTranslatedFields []string `json:"-"`
 	// PendingTranslationLanguage reaches the v2 episode row only; v1 is frozen.
 	PendingTranslationLanguage string `json:"-"`
-}
-
-// Episode release states: release timing derived from an episode air date.
-// The values are part of the v2 Episode contract; unknown and malformed
-// dates classify as "" (absent) so unknown metadata fails open for playback.
-// The shared decision lives in catalog.ReleaseStateForAirDate; this is the
-// handlers-package alias so the v1 shell and the v2 renderer name one value.
-const (
-	EpisodeReleaseUpcoming = catalog.EpisodeReleaseUpcoming
-	EpisodeReleaseReleased = catalog.EpisodeReleaseReleased
-)
-
-// EpisodeReleaseState classifies a YYYY-MM-DD air date against today's UTC
-// calendar date. It is the single release-timing decision the episode list,
-// detail, and v2 renderer share: one parse, one boundary, no timezone
-// conversion beyond the stored calendar date.
-func EpisodeReleaseState(airDate string) string {
-	return catalog.ReleaseStateForAirDate(airDate)
 }
 
 type episodeImageFallback struct {
@@ -633,132 +543,8 @@ func (h *ItemsHandler) HandleGetWatchDetail(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	h.prefetchWatchDetailVirtual(r.Context(), detail, requestProfileID(r))
 	writeJSON(w, http.StatusOK, detail)
 }
-
-// prefetchWatchDetailVirtual warms virtual candidate listings for the rows a
-// watch detail offers, off the playback click path. Fire-and-forget:
-// PrefetchVirtualPlayback is already bounded (2 files), deduped, and runs on
-// a detached worker pool, so this never blocks the detail response. Only the
-// first virtual version is warmed; the start path ranks per device from the
-// neutral cache entry.
-func (h *ItemsHandler) prefetchWatchDetailVirtual(ctx context.Context, detail *catalog.WatchDetail, profileID string) {
-	if detail == nil {
-		return
-	}
-	if detail.Type != itemTypeMovie && detail.Type != itemTypeEpisode {
-		return
-	}
-	fileIDs := make([]int, 0, 2)
-	for _, v := range detail.Versions {
-		if v.FileID != 0 {
-			fileIDs = append(fileIDs, v.FileID)
-		}
-		if len(fileIDs) >= 2 {
-			break
-		}
-	}
-	h.prefetchVirtualFileIDs(ctx, fileIDs, profileID)
-}
-
-// prefetchVirtualFileIDs warms virtual candidate listings for raw file rows,
-// shared by watch-detail, item-detail, and episode-list triggers. Dedupes,
-// caps at 2, and runs fully off the response path.
-func (h *ItemsHandler) prefetchVirtualFileIDs(ctx context.Context, fileIDs []int, profileID string) {
-	if h == nil || h.virtualPrefetcher == nil || h.virtualFileByID == nil || profileID == "" {
-		return
-	}
-	seen := make(map[int]bool)
-	unique := make([]int, 0, 2)
-	for _, fid := range fileIDs {
-		if fid != 0 && !seen[fid] {
-			seen[fid] = true
-			unique = append(unique, fid)
-		}
-		if len(unique) >= 2 {
-			break
-		}
-	}
-	if len(unique) == 0 {
-		return
-	}
-	fileIDs = unique
-	// Row loads run off the response path: the detail response must not wait
-	// on database reads for an optional warm. A short timeout bounds the
-	// background load; PrefetchVirtualPlayback itself is already bounded
-	// (2 files), deduped, and detached.
-	//
-	// File-level admission runs BEFORE the goroutine and the row loads: the
-	// content-keyed admission inside PrefetchVirtualPlayback only fires after
-	// rows load, so without this every catalog read would pay DB lookups even
-	// for an already-warming file. Keys live only for the load window.
-	admitKey := virtualPrefetchFileAdmitKey(fileIDs, profileID)
-	if _, loaded := h.virtualPrefetchInflight.LoadOrStore(admitKey, struct{}{}); loaded {
-		observeVirtualPrefetchOutcome(virtualPrefetchFileCollapsed)
-		return
-	}
-	// Shed when saturated: speculative work must never queue without bound.
-	// capVirtualPrefetchLoads mirrors the prefetch worker count so background
-	// loads cannot outrun the workers that consume them.
-	h.prefetchSemOnce.Do(func() {
-		h.virtualPrefetchLoadSem = make(chan struct{}, capVirtualPrefetchLoads)
-	})
-	sem := h.virtualPrefetchLoadSem
-	select {
-	case sem <- struct{}{}:
-	default:
-		h.virtualPrefetchInflight.Delete(admitKey)
-		observeVirtualPrefetchOutcome(virtualPrefetchLoadSaturated)
-		return
-	}
-	prefetcher := h.virtualPrefetcher
-	loader := h.virtualFileByID
-	go func() {
-		defer h.virtualPrefetchInflight.Delete(admitKey)
-		defer func() { <-sem }()
-		// WithoutCancel keeps request values (user ID for PrefetchVirtualPlayback)
-		// while detaching from request cancellation; the timeout still bounds
-		// the background load.
-		loadCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		defer cancel()
-		files := make([]*models.MediaFile, 0, len(fileIDs))
-		for _, fid := range fileIDs {
-			f, err := loader.GetByID(loadCtx, fid)
-			if err != nil || f == nil || !isVirtualPlaybackFile(f) {
-				continue
-			}
-			files = append(files, f)
-		}
-		if len(files) == 0 {
-			return
-		}
-		prefetcher.PrefetchVirtualPlayback(loadCtx, files, profileID)
-	}()
-}
-
-// virtualPrefetchFileAdmitKey collapses repeated catalog reads for the same
-// rows+profile before any row load. Sorted so episode order doesn't multiply
-// keys; capped at the same 2 rows the loader warms.
-func virtualPrefetchFileAdmitKey(fileIDs []int, profileID string) string {
-	sorted := append([]int(nil), fileIDs...)
-	sort.Ints(sorted)
-	var sb strings.Builder
-	sb.WriteString(profileID)
-	sb.WriteByte(0)
-	for i, fid := range sorted {
-		if i > 0 {
-			sb.WriteByte(',')
-		}
-		sb.WriteString(strconv.Itoa(fid))
-	}
-	return sb.String()
-}
-
-// capVirtualPrefetchLoads bounds concurrent background catalog-prefetch row
-// loads. Distinct file-set keys each take one slot; identical repeats collapse
-// on the inflight map before reaching here.
-const capVirtualPrefetchLoads = 4
 
 // trailerRefreshRate bounds how often one user may trigger trailer fetches
 // across all items. The per-item cooldown enforced by the metadata service is
@@ -1479,7 +1265,6 @@ func episodeResponseShell(ep *models.Episode, fallback episodeImageFallback, siz
 
 	if ep.AirDate != nil {
 		resp.AirDate = ep.AirDate.Format("2006-01-02")
-		resp.ReleaseState = EpisodeReleaseState(resp.AirDate)
 	}
 
 	return resp, sizedCardPath(stillPath, artworkkey.ImageStill, size)
@@ -2296,22 +2081,6 @@ func (h *ItemsHandler) parentRollupUserData(ctx context.Context, v ItemViewer, i
 	return catalog.SeasonUserDataFromCounts(parent), true
 }
 
-// metadataSeasonCounts returns each season number's metadata episode count,
-// including seasons with no library-materialized episodes. The seasons list
-// uses it only where the availability rollup has no entry, so a metadata-only
-// season still shows the episode total the provider knows.
-func (h *ItemsHandler) metadataSeasonCounts(ctx context.Context, seriesID string) (map[int]int, error) {
-	summaries, err := h.episodeRepo.ListMetadataSeasons(ctx, seriesID)
-	if err != nil {
-		return nil, err
-	}
-	counts := make(map[int]int, len(summaries))
-	for _, summary := range summaries {
-		counts[summary.SeasonNumber] = summary.EpisodeCount
-	}
-	return counts, nil
-}
-
 // seriesSeasonRollups returns each season number's available episode count
 // and, when the viewer's store is reachable, its aggregate user data. A store
 // with the SQL rollup answers both in one query; otherwise the series'
@@ -2724,41 +2493,13 @@ type watchedLeafTarget struct {
 	DurationSeconds float64
 }
 
-// dedupeWatchedLeafTargets removes duplicate episode targets while retaining
-// the first duration-bearing copy. A partly linked season resolves available
-// episodes explicitly and then expands the parent by season number, so the
-// same episode can appear twice; the mutation is idempotent but the response's
-// AffectedCount is not.
-func dedupeWatchedLeafTargets(targets []watchedLeafTarget) []watchedLeafTarget {
-	if len(targets) < 2 {
-		return targets
-	}
-	indexByID := make(map[string]int, len(targets))
-	deduped := make([]watchedLeafTarget, 0, len(targets))
-	for _, target := range targets {
-		if target.ContentID == "" {
-			continue
-		}
-		if index, ok := indexByID[target.ContentID]; ok {
-			if deduped[index].DurationSeconds == 0 && target.DurationSeconds > 0 {
-				deduped[index].DurationSeconds = target.DurationSeconds
-			}
-			continue
-		}
-		indexByID[target.ContentID] = len(deduped)
-		deduped = append(deduped, target)
-	}
-	return deduped
-}
-
 // watchedTarget is a watched-state target that exists and that the viewer
 // may see, before a season or series is expanded into its episodes.
 type watchedTarget struct {
-	Type      string
-	Item      *models.MediaItem
-	Season    *models.Season
-	Episode   *models.Episode
-	Synthetic bool
+	Type    string
+	Item    *models.MediaItem
+	Season  *models.Season
+	Episode *models.Episode
 }
 
 // seriesID is the series of a season or episode target, named on its
@@ -2805,20 +2546,6 @@ func (h *ItemsHandler) lookupWatchedTarget(ctx context.Context, contentID string
 		case !errors.Is(err, catalog.ErrSeasonNotFound):
 			return watchedTarget{}, err
 		}
-	}
-
-	if seriesID, seasonNumber, ok := parseSyntheticSeasonID(contentID); ok {
-		if h.episodeRepo == nil {
-			return watchedTarget{}, catalog.ErrItemNotFound
-		}
-		if err := h.itemRepo.EnsureAccessible(ctx, seriesID, filter); err != nil {
-			return watchedTarget{}, err
-		}
-		return watchedTarget{
-			Type:      "season",
-			Season:    &models.Season{ContentID: contentID, SeriesID: seriesID, SeasonNumber: seasonNumber},
-			Synthetic: true,
-		}, nil
 	}
 
 	if h.episodeRepo == nil {
@@ -3012,8 +2739,9 @@ func (h *ItemsHandler) requestCanViewFilePaths(r *http.Request) bool {
 	return h.canViewFilePaths(r.Context())
 }
 
-// canViewFilePaths reports whether the caller may see on-disk paths: admins
-// always, other accounts when their stored flag allows it.
+// canViewFilePaths reports whether the caller may see on-disk paths: the
+// acting admin always, any other caller when the account's effective
+// permissions, after the access group's mask, include metadata curation.
 func (h *ItemsHandler) canViewFilePaths(ctx context.Context) bool {
 	claims := apimw.GetClaims(ctx)
 	if claims == nil {
@@ -3021,8 +2749,8 @@ func (h *ItemsHandler) canViewFilePaths(ctx context.Context) bool {
 	}
 	if claims.Role == "admin" {
 		// Only the acting admin sees paths by role. Another profile on the
-		// admin's account needs metadata curation assigned to the account,
-		// the bar the curation gate holds it to.
+		// admin's account falls through: it needs metadata curation assigned
+		// to the account, the bar the curation gate holds it to.
 		actingAdmin, err := apimw.ActingAdmin(ctx)
 		if err != nil {
 			slog.WarnContext(ctx, "checking file path visibility for an admin account", "component", "api", "user_id", claims.UserID, "error", err)
@@ -3031,7 +2759,6 @@ func (h *ItemsHandler) canViewFilePaths(ctx context.Context) bool {
 		if actingAdmin {
 			return true
 		}
-		return h.hasAssignedMetadataCuration(ctx, claims.UserID)
 	}
 	if h == nil || h.UserRepo == nil {
 		return false
@@ -3041,51 +2768,22 @@ func (h *ItemsHandler) canViewFilePaths(ctx context.Context) bool {
 		slog.Log(ctx, ctxerr.LogLevel(ctx, err, slog.LevelWarn), "checking file path visibility permissions", "component", "api", "user_id", claims.UserID, "error", err)
 		return false
 	}
-	return auth.HasEffectivePermission(user, auth.PermissionMetadataCuration)
+	return hasMaskedMetadataCuration(ctx, user, h.AccessGroups)
 }
 
-// HandleDelete handles DELETE /api/v1/admin/items/{id}.
-func (h *ItemsHandler) HandleDelete(w http.ResponseWriter, r *http.Request) {
-	if h.itemRepo == nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", "item repository unavailable")
-		return
-	}
-	contentID := chi.URLParam(r, "id")
-	if contentID == "" {
-		writeError(w, http.StatusBadRequest, "bad_request", "item ID is required")
-		return
-	}
-	images, err := h.itemRepo.Delete(r.Context(), contentID)
-	if err != nil {
-		if errors.Is(err, catalog.ErrItemNotFound) {
-			writeError(w, http.StatusNotFound, "not_found", "item not found")
-			return
-		}
-		slog.ErrorContext(r.Context(), "items: delete media item failed", "component", "api", "content_id", contentID, "error", err)
-		writeError(w, http.StatusInternalServerError, "internal_error", fmt.Sprintf("failed to delete media item: %v", err))
-		return
-	}
-	sections.InvalidateResolvedListCache()
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"success":        true,
-		"content_id":     contentID,
-		"images_cleaned": len(images),
-		"message":        "Media item deleted successfully",
-	})
-}
-
-// hasAssignedMetadataCuration reports whether the account has metadata
-// curation assigned explicitly, not by its admin role. A failed lookup fails
-// closed.
-func (h *ItemsHandler) hasAssignedMetadataCuration(ctx context.Context, userID int) bool {
-	if h == nil || h.UserRepo == nil {
+// hasMaskedMetadataCuration reports whether an enabled account holds
+// metadata_curation after its access group's permission mask, as the metadata
+// curation gate resolves it. A failed group lookup fails closed.
+func hasMaskedMetadataCuration(ctx context.Context, user *models.User, groups access.GroupPolicyProvider) bool {
+	// The group mask can only remove permissions, so an account without the
+	// grant skips the group lookup.
+	if user == nil || !user.Enabled || !slices.Contains(user.Permissions, string(auth.PermissionMetadataCuration)) {
 		return false
 	}
-	user, err := h.UserRepo.GetByID(ctx, userID)
+	effective, err := access.EffectivePolicyForUser(ctx, user, groups)
 	if err != nil {
-		slog.WarnContext(ctx, "checking file path visibility permissions", "component", "api", "user_id", userID, "error", err)
+		slog.WarnContext(ctx, "resolving metadata curation policy", "component", "api", "user_id", user.ID, "error", err)
 		return false
 	}
-	return user != nil && user.Enabled && auth.HasAssignedPermission(user, auth.PermissionMetadataCuration)
+	return slices.Contains(auth.PolicyPermissions(effective), string(auth.PermissionMetadataCuration))
 }

@@ -78,56 +78,6 @@ type ChapterThumbnailQueuer interface {
 	QueuePriorityFileAtPosition(ctx context.Context, fileID int, targetSeconds float64)
 }
 
-// VirtualCandidateScore is the custom-format ranking summary for one virtual
-// candidate file: the summed score the ranking assigned and the names of the
-// enabled, non-rejecting formats that matched it. MatchedFormats is nil for a
-// candidate that matched none. Both fields are absent on the wire for an
-// unscored row.
-type VirtualCandidateScore struct {
-	// ProviderOrder is set only when the provider's order must be preserved.
-	ProviderOrder  *int
-	Score          int
-	MatchedFormats []string
-}
-
-// VirtualCandidateScoreSource returns the custom-format ranking summary the
-// virtual ranking assigned to each candidate file, keyed by media-file ID. The
-// scorer is injected rather than imported because the virtual library service
-// imports catalog, so the dependency cannot point the other way. A nil source,
-// a provider miss, or an unscored candidate leaves the version without a score.
-type VirtualCandidateScoreSource func(ctx context.Context, contentID string, files []*models.MediaFile) map[int]VirtualCandidateScore
-
-// VirtualRanking source values reported on the wire. A profile-scoped selector
-// names the profile that produced the order; the default is the built-in order
-// used when no profile applies.
-const (
-	VirtualRankingSourceProfile = "profile"
-	VirtualRankingSourceDefault = "default"
-)
-
-// VirtualRankingCriterion is one ordered ranking key behind a virtual listing.
-type VirtualRankingCriterion struct {
-	Attribute string
-	Direction string
-}
-
-// VirtualRanking describes the ranking that produced a virtual listing's
-// candidate order: the selected profile label (empty for the built-in default),
-// where the criteria came from, and the ordered keys. It is a read-only
-// projection of the ranking the resolver applied.
-type VirtualRanking struct {
-	ProfileLabel string
-	Source       string
-	Criteria     []VirtualRankingCriterion
-}
-
-// VirtualRankingSource returns the ranking that produced each virtual file's
-// listing, keyed by media-file ID. It is injected for the same reason as
-// VirtualCandidateScoreSource: the virtual library service imports catalog, so
-// the dependency cannot point the other way. A nil source, a local file, or a
-// file outside a virtual listing yields no entry.
-type VirtualRankingSource func(ctx context.Context, contentID string, files []*models.MediaFile) map[int]VirtualRanking
-
 // TrickplayAvailability reports the servable seek-bar previews of files.
 type TrickplayAvailability interface {
 	TrickplayGrids(ctx context.Context, fileIDs []int) (map[int]TrickplayGrid, error)
@@ -348,17 +298,12 @@ type ItemDetail struct {
 	SeasonCount *int `json:"season_count,omitempty"`
 
 	// Season-specific.
-	SeriesID      string  `json:"series_id,omitempty"`
-	SeriesTitle   string  `json:"series_title,omitempty"`
-	SeasonNumber  *int    `json:"season_number,omitempty"`
-	EpisodeNumber *int    `json:"episode_number,omitempty"`
-	EpisodeCount  *int    `json:"episode_count,omitempty"`
-	AirDate       *string `json:"air_date,omitempty"`
-	// ReleaseState carries the episode release timing derived from AirDate
-	// (upcoming when the calendar date is after today UTC, released
-	// otherwise; empty when the air date is unknown). json:"-" because
-	// /api/v1 is frozen: apiv2 emits it under its own name.
-	ReleaseState   string          `json:"-"`
+	SeriesID       string          `json:"series_id,omitempty"`
+	SeriesTitle    string          `json:"series_title,omitempty"`
+	SeasonNumber   *int            `json:"season_number,omitempty"`
+	EpisodeNumber  *int            `json:"episode_number,omitempty"`
+	EpisodeCount   *int            `json:"episode_count,omitempty"`
+	AirDate        *string         `json:"air_date,omitempty"`
 	IsSpecials     bool            `json:"is_specials,omitempty"`
 	SeasonUserData *SeasonUserData `json:"user_data,omitempty"`
 	UserState      *ItemUserState  `json:"user_state,omitempty"`
@@ -598,58 +543,38 @@ type PersonCredit struct {
 
 // FileVersion represents a single file version available for playback.
 type FileVersion struct {
-	providerOrder            *int
-	FileID                   int       `json:"file_id"`
-	FileName                 string    `json:"file_name,omitempty"`
-	FilePath                 string    `json:"file_path,omitempty"`
-	Resolution               string    `json:"resolution"`
-	CodecVideo               string    `json:"codec_video"`
-	CodecAudio               string    `json:"codec_audio"`
-	HDR                      bool      `json:"hdr"`
-	Container                string    `json:"container"`
-	FileSize                 int64     `json:"file_size"`
-	Duration                 int       `json:"duration"`
-	Bitrate                  int       `json:"bitrate"`
-	AddedAt                  time.Time `json:"added_at"`
-	EditionRaw               string    `json:"edition_raw,omitempty"`
-	EditionKey               string    `json:"edition_key,omitempty"`
-	ReleaseName              string    `json:"release_name,omitempty"`
-	ReleaseGroup             string    `json:"release_group,omitempty"`
-	PresentationKind         string    `json:"presentation_kind,omitempty"`
-	PresentationGroupKey     string    `json:"presentation_group_key,omitempty"`
-	PresentationPartIndex    int       `json:"presentation_part_index,omitempty"`
-	PresentationPartTotal    int       `json:"presentation_part_total,omitempty"`
-	MultiEpisodeStart        int       `json:"multi_episode_start,omitempty"`
-	MultiEpisodeEnd          int       `json:"multi_episode_end,omitempty"`
-	EffectiveAudioTrackIndex *int      `json:"effective_audio_track_index,omitempty"`
-	EffectiveAudioLanguage   string    `json:"effective_audio_language,omitempty"`
-	Failed                   bool      `json:"failed,omitempty"`
-	// Available reports the durable per-version health signal: a virtual
-	// candidate is available when it has not been stamped failed (failed_at is
-	// NULL), a local file when it is not marked missing (missing_since is
-	// NULL). Omitted when the version is available, so an absent field means
-	// available/unknown; false means the version is currently unavailable.
-	Available *bool `json:"available,omitempty"`
-	// FormatScore is the custom-format score the virtual ranking assigned to a
-	// virtual candidate under the active quality profile. Absent for local
-	// files and when no ranking ran, so an unscored row shows nothing. It is a
-	// display-only hint and is never used for ordering here.
-	FormatScore *int `json:"format_score,omitempty"`
-	// MatchedFormats names the enabled, non-rejecting custom formats the
-	// virtual ranking matched on this candidate, ordered score-descending then
-	// name-ascending. It accompanies FormatScore and is absent on the same
-	// unscored rows. Display-only: ordering never consults it.
-	MatchedFormats []string               `json:"matched_formats,omitempty"`
-	VideoTracks    []models.VideoTrack    `json:"video_tracks,omitempty"`
-	AudioTracks    []models.AudioTrack    `json:"audio_tracks,omitempty"`
-	SubtitleTracks []VersionSubtitleTrack `json:"subtitle_tracks,omitempty"`
-	Chapters       []VersionChapter       `json:"chapters,omitempty"`
-	Intro          *Marker                `json:"intro,omitempty"`
-	Credits        *Marker                `json:"credits,omitempty"`
-	Recap          *Marker                `json:"recap,omitempty"`
-	Preview        *Marker                `json:"preview,omitempty"`
-	MarkerSegments []models.MarkerSegment `json:"-"`
-	MarkerPreviews []VersionMarkerPreview `json:"-"`
+	FileID                   int                    `json:"file_id"`
+	FileName                 string                 `json:"file_name,omitempty"`
+	FilePath                 string                 `json:"file_path,omitempty"`
+	Resolution               string                 `json:"resolution"`
+	CodecVideo               string                 `json:"codec_video"`
+	CodecAudio               string                 `json:"codec_audio"`
+	HDR                      bool                   `json:"hdr"`
+	Container                string                 `json:"container"`
+	FileSize                 int64                  `json:"file_size"`
+	Duration                 int                    `json:"duration"`
+	Bitrate                  int                    `json:"bitrate"`
+	AddedAt                  time.Time              `json:"added_at"`
+	EditionRaw               string                 `json:"edition_raw,omitempty"`
+	EditionKey               string                 `json:"edition_key,omitempty"`
+	PresentationKind         string                 `json:"presentation_kind,omitempty"`
+	PresentationGroupKey     string                 `json:"presentation_group_key,omitempty"`
+	PresentationPartIndex    int                    `json:"presentation_part_index,omitempty"`
+	PresentationPartTotal    int                    `json:"presentation_part_total,omitempty"`
+	MultiEpisodeStart        int                    `json:"multi_episode_start,omitempty"`
+	MultiEpisodeEnd          int                    `json:"multi_episode_end,omitempty"`
+	EffectiveAudioTrackIndex *int                   `json:"effective_audio_track_index,omitempty"`
+	EffectiveAudioLanguage   string                 `json:"effective_audio_language,omitempty"`
+	VideoTracks              []models.VideoTrack    `json:"video_tracks,omitempty"`
+	AudioTracks              []models.AudioTrack    `json:"audio_tracks,omitempty"`
+	SubtitleTracks           []VersionSubtitleTrack `json:"subtitle_tracks,omitempty"`
+	Chapters                 []VersionChapter       `json:"chapters,omitempty"`
+	Intro                    *Marker                `json:"intro,omitempty"`
+	Credits                  *Marker                `json:"credits,omitempty"`
+	Recap                    *Marker                `json:"recap,omitempty"`
+	Preview                  *Marker                `json:"preview,omitempty"`
+	MarkerSegments           []models.MarkerSegment `json:"-"`
+	MarkerPreviews           []VersionMarkerPreview `json:"-"`
 	// Trickplay is the layout of the file's servable seek-bar previews, nil
 	// when it has none. The v2 watch and Jellyfin views carry it; the frozen
 	// v1 view does not.
@@ -659,27 +584,6 @@ type FileVersion struct {
 	// replaced. Jellyfin PlaybackInfo leaves such versions out. Neither the v1
 	// nor the v2 view carries the flag.
 	Unreadable bool `json:"-"`
-	// ProbedAt is when ffprobe last enumerated the file's real stream table;
-	// nil means the row still carries declared metadata only. Server-side
-	// only: the pre-play probe scheduler uses it to leave a selected row with
-	// fresh inventory alone. The v2 projection exposes the same instant as
-	// probed_at so a client can tell fresh inventory from declared hints.
-	ProbedAt *time.Time `json:"-"`
-	// SourceMismatch is the process-local wrong-source probe verdict for this
-	// row, when the node still holds it. Advisory only: it never changes
-	// Failed or Available and is never persisted. Server-side only; the v2
-	// projection carries it as source_mismatch.
-	SourceMismatch *VersionSourceMismatch `json:"-"`
-}
-
-// VersionSourceMismatch is a recent probe's served-vs-declared byte evidence
-// for a virtual row whose bytes did not match its declared release. It is
-// produced by the playback probe damper and read through the detail service's
-// injected verdict source, so the detail page and the versions check endpoint
-// report one verdict.
-type VersionSourceMismatch struct {
-	ServedBytes   int64 `json:"served_bytes"`
-	DeclaredBytes int64 `json:"declared_bytes"`
 }
 
 // SetMarkers refreshes the marker projection without rebuilding file metadata.
@@ -729,9 +633,6 @@ type PlaybackVariant struct {
 	TotalDuration        int                   `json:"total_duration,omitempty"`
 	DefaultFileID        int                   `json:"default_file_id,omitempty"`
 	Parts                []PlaybackVariantPart `json:"parts"`
-	// VirtualRanking is the ranking that produced this variant's version
-	// order. Absent for local content and when no ranking source is wired.
-	VirtualRanking *VirtualRanking `json:"virtual_ranking,omitempty"`
 }
 
 // PlaybackVariantPart contains the interchangeable versions for one ordered part.
@@ -767,11 +668,9 @@ type VersionSubtitleTrack struct {
 	HearingImpaired bool   `json:"hearing_impaired"`
 	External        bool   `json:"external"`
 	FileName        string `json:"file_name,omitempty"`
-	// PathKey is a stable opaque hash of an external sidecar's full path. It
-	// lets a client distinguish two same-basename sidecars in different
-	// directories without publishing the server filesystem path. Empty for
-	// embedded tracks and for older servers that do not compute it.
-	PathKey string `json:"path_key,omitempty"`
+	// IndexOnly is models.SubtitleTrack.IndexOnly, for planners that read
+	// this projection.
+	IndexOnly bool `json:"-"`
 }
 
 // SubtitleInfo represents a subtitle track available for a media item.
@@ -848,7 +747,6 @@ type WatchDetail struct {
 	HasEffectiveShowForcedSubtitles bool                              `json:"-"`
 	Versions                        []FileVersion                     `json:"versions"`
 	PlaybackVariants                []PlaybackVariant                 `json:"playback_variants,omitempty"`
-	VirtualRanking                  *VirtualRanking                   `json:"virtual_ranking,omitempty"`
 	Subtitles                       []SubtitleInfo                    `json:"subtitles"`
 	Intro                           *Marker                           `json:"intro,omitempty"`
 	Credits                         *Marker                           `json:"credits,omitempty"`
@@ -954,31 +852,6 @@ type versionDefaults struct {
 
 var ErrWatchTargetNotPlayable = errors.New("watch target is not directly playable")
 
-// Episode release states: release timing derived from an episode air date.
-// They mirror the v2 Episode contract values; unknown dates classify as ""
-// (absent) so missing metadata fails open for playback.
-const (
-	EpisodeReleaseUpcoming = "upcoming"
-	EpisodeReleaseReleased = "released"
-)
-
-// ReleaseStateForAirDate classifies a YYYY-MM-DD air date against today's
-// UTC calendar date. It is the single shared release-timing decision behind
-// the episode list shell, the episode detail, and the v2 renderer: one
-// parse, one boundary, no timezone conversion beyond the stored calendar
-// date. Unknown and malformed dates return "" (absent) so missing metadata
-// fails open for playback.
-func ReleaseStateForAirDate(airDate string) string {
-	day, err := time.Parse("2006-01-02", strings.TrimSpace(airDate))
-	if err != nil {
-		return ""
-	}
-	if day.After(time.Now().UTC().Truncate(24 * time.Hour)) {
-		return EpisodeReleaseUpcoming
-	}
-	return EpisodeReleaseReleased
-}
-
 // IsWatchTargetNotPlayable reports whether the error means the client sent a
 // valid content ID that is not directly playable.
 func IsWatchTargetNotPlayable(err error) bool {
@@ -1012,41 +885,7 @@ type DetailService struct {
 	probeEnsurer      PlaybackProbeEnsurer
 	copySafetyRacer   CopySafetyRacer
 	chapterThumbs     ChapterThumbnailQueuer
-	// virtualScoreSource computes the custom-format score per virtual candidate
-	// file. Nil disables scoring; see SetVirtualCandidateScoreSource.
-	virtualScoreSource VirtualCandidateScoreSource
-	// virtualScoreSem bounds the number of virtual score lookups that may run
-	// at once. A scorer that ignores context cancellation can strand its
-	// goroutine indefinitely, so the cap also bounds how many such goroutines
-	// the watch path can accumulate. Lazily created by scoreVirtualCandidates;
-	// see virtualScoreConcurrency.
-	virtualScoreSem     chan struct{}
-	virtualScoreSemOnce sync.Once
-	// virtualRankingSource exposes the ranking that produced each virtual
-	// listing. Nil disables the projection; see SetVirtualRankingSource.
-	virtualRankingSource VirtualRankingSource
-	// versionSourceMismatch projects the playback probe's process-local
-	// wrong-source verdict onto each version. Nil disables the projection; see
-	// SetVersionSourceMismatchSource.
-	versionSourceMismatch VersionSourceMismatchSource
-
-	// watchPrepareMu guards watchPrepared, the per-content memo that keeps a
-	// repeated watch-detail fetch of unchanged files from re-running the
-	// copy-safety preparation and chapter-thumbnail enqueue on every request.
-	watchPrepareMu sync.Mutex
-	watchPrepared  map[string]watchPrepareState
-	// watchRefreshWG tracks the detached watch preparations so tests can wait
-	// for them. Production never waits: see prepareWatchFiles.
-	watchRefreshWG sync.WaitGroup
-	// watchRefreshSem bounds the detached watch preparations that run at once.
-	// Each refresh can wait behind the ensurer's own probe slots for up to
-	// watchPrepareRefreshTimeout; without a cap a burst of distinct watch
-	// targets would accumulate waiting goroutines and queue work. Lazily
-	// created by watchRefreshSemaphore.
-	watchRefreshSem     chan struct{}
-	watchRefreshSemOnce sync.Once
-
-	trickplay TrickplayAvailability
+	trickplay         TrickplayAvailability
 
 	// resolver is built once on first use; see settingsResolver.
 	resolverOnce sync.Once
@@ -1174,41 +1013,6 @@ func (s *DetailService) SetFolderRepository(repo interface {
 	GetByID(ctx context.Context, id int) (*models.MediaFolder, error)
 }) {
 	s.folderRepo = repo
-}
-
-// SetVirtualCandidateScoreSource wires the custom-format scores shown on a
-// watch response's virtual versions. It is optional; without it every version
-// simply carries no score.
-func (s *DetailService) SetVirtualCandidateScoreSource(source VirtualCandidateScoreSource) {
-	s.virtualScoreSource = source
-}
-
-// SetVirtualRankingSource wires the virtual ranking shown on a watch response
-// (item level and per playback variant). It is optional; without it no ranking
-// is projected.
-func (s *DetailService) SetVirtualRankingSource(source VirtualRankingSource) {
-	s.virtualRankingSource = source
-}
-
-// VersionSourceMismatchSource reads the recent wrong-source probe verdict for
-// one row. The playback probe owns that process-local signal; the detail
-// service only projects it, so this returns nil when the node holds no verdict.
-type VersionSourceMismatchSource func(*models.MediaFile) *VersionSourceMismatch
-
-// SetVersionSourceMismatchSource wires the wrong-source verdict shown per
-// version on the detail response. It is optional; without it no version
-// carries source_mismatch.
-func (s *DetailService) SetVersionSourceMismatchSource(source VersionSourceMismatchSource) {
-	s.versionSourceMismatch = source
-}
-
-// versionSourceMismatchFor projects the injected verdict for one file. A nil
-// source, file, or verdict yields nil so the field stays absent.
-func (s *DetailService) versionSourceMismatchFor(file *models.MediaFile) *VersionSourceMismatch {
-	if s == nil || s.versionSourceMismatch == nil || file == nil {
-		return nil
-	}
-	return s.versionSourceMismatch(file)
 }
 
 // SetRootClaimRepository wires in the root claim repo for series folder path lookups.
@@ -1487,7 +1291,10 @@ func (s *DetailService) pendingSeasonTranslationLanguageChecked(ctx context.Cont
 		}
 	}
 	if episodes == nil {
-		episodes, err = s.seasonEpisodesForRead(ctx, season.SeriesID, season.SeasonNumber)
+		if s.episodeRepo == nil {
+			return "", nil
+		}
+		episodes, err = s.episodeRepo.ListBySeasonID(ctx, season.ContentID)
 		if err != nil {
 			return "", err
 		}
@@ -3204,15 +3011,10 @@ func appendAudiobookItemAccessConditions(
 			)`, alias, *argIdx))
 		*args = append(*args, filter.AllowedLibraryIDs)
 		*argIdx = *argIdx + 1
+	} else {
+		*conditions = append(*conditions, InSomeLibraryWhere(alias+".content_id"))
 	}
 	if len(filter.DisabledLibraryIDs) > 0 {
-		if filter.AllowedLibraryIDs == nil {
-			*conditions = append(*conditions, fmt.Sprintf(`
-				EXISTS (
-					SELECT 1 FROM media_item_libraries mil_visible
-					WHERE mil_visible.content_id = %s.content_id
-				)`, alias))
-		}
 		*conditions = append(*conditions, fmt.Sprintf(`
 			NOT EXISTS (
 				SELECT 1 FROM media_item_libraries mil_disabled
@@ -3554,27 +3356,6 @@ func clearSentinel(s string) string {
 	return s
 }
 
-// seasonEpisodesForRead lists a season by its (series_id, season_number)
-// identity. It merges the available episodes with every canonical metadata
-// episode, keyed by content ID, so a partly available season keeps its
-// metadata-only rows visible. Metadata-only rows render without a Play target.
-// The selected slice feeds both detail counts and pending translation
-// detection.
-func (s *DetailService) seasonEpisodesForRead(ctx context.Context, seriesID string, seasonNumber int) ([]*models.Episode, error) {
-	if s.episodeRepo == nil {
-		return nil, nil
-	}
-	available, err := s.episodeRepo.ListBySeason(ctx, seriesID, seasonNumber)
-	if err != nil {
-		return nil, err
-	}
-	metadata, err := s.episodeRepo.ListMetadataBySeason(ctx, seriesID, seasonNumber)
-	if err != nil {
-		return nil, err
-	}
-	return MergeSeasonEpisodesByContentID(available, metadata), nil
-}
-
 func (s *DetailService) buildSeasonDetail(ctx context.Context, season *models.Season, filter AccessFilter) (*ItemDetail, error) {
 	series, err := s.itemRepo.GetByID(ctx, season.SeriesID)
 	if err != nil {
@@ -3583,9 +3364,12 @@ func (s *DetailService) buildSeasonDetail(ctx context.Context, season *models.Se
 	localizationFilter := filter
 	localizationFilter.PresentationOriginalLanguage = series.OriginalLanguage
 
-	episodes, err := s.seasonEpisodesForRead(ctx, season.SeriesID, season.SeasonNumber)
-	if err != nil {
-		return nil, fmt.Errorf("listing season episodes: %w", err)
+	episodes := []*models.Episode{}
+	if s.episodeRepo != nil {
+		episodes, err = s.episodeRepo.ListBySeasonID(ctx, season.ContentID)
+		if err != nil {
+			return nil, fmt.Errorf("listing season episodes: %w", err)
+		}
 	}
 	pendingTranslation := s.pendingSeasonTranslationLanguage(ctx, season, localizationFilter, episodes)
 	localizedSeason, err := s.LocalizeSeasonModel(ctx, season, localizationFilter)
@@ -3766,7 +3550,6 @@ func (s *DetailService) buildEpisodeDetail(ctx context.Context, episode *models.
 	if episode.AirDate != nil {
 		airDate := episode.AirDate.Format("2006-01-02")
 		detail.AirDate = &airDate
-		detail.ReleaseState = ReleaseStateForAirDate(airDate)
 	}
 	if episode.Title == "" {
 		detail.Title = fmt.Sprintf("Episode %d", episode.EpisodeNumber)
@@ -3841,7 +3624,8 @@ func (s *DetailService) GetWatchDetail(ctx context.Context, contentID string, fi
 			return nil, fmt.Errorf("fetching watch file versions: %w", err)
 		}
 		files = FilterMediaFilesByAccess(files, filter)
-		files = s.prepareWatchFiles(ctx, item.ContentID, item.Type, files)
+		files = s.preparePlaybackFiles(ctx, files)
+		s.queueWatchPlaybackFiles(ctx, item.ContentID, item.Type, files)
 		detail := s.newWatchDetail(
 			ctx,
 			item.ContentID,
@@ -3903,7 +3687,8 @@ func (s *DetailService) GetWatchDetail(ctx context.Context, contentID string, fi
 	}
 
 	files = FilterMediaFilesByAccess(files, filter)
-	files = s.prepareWatchFiles(ctx, episode.ContentID, "episode", files)
+	files = s.preparePlaybackFiles(ctx, files)
+	s.queueWatchPlaybackFiles(ctx, episode.ContentID, "episode", files)
 	detail := s.newWatchDetail(
 		ctx,
 		episode.ContentID,
@@ -3978,7 +3763,8 @@ func (s *DetailService) buildExtraWatchDetail(ctx context.Context, contentID str
 		return nil, fmt.Errorf("fetching extra watch files: %w", err)
 	}
 	files = FilterMediaFilesByAccess(files, filter)
-	files = s.prepareWatchFiles(ctx, extra.ContentID, "extra", files)
+	files = s.preparePlaybackFiles(ctx, files)
+	s.queueWatchPlaybackFiles(ctx, extra.ContentID, "extra", files)
 	detail := s.newWatchDetail(
 		ctx,
 		extra.ContentID,
@@ -4029,14 +3815,13 @@ func (s *DetailService) newWatchDetail(
 	filter AccessFilter,
 	audioPreferenceContentID string,
 ) *WatchDetail {
-	var scores map[int]VirtualCandidateScore
-	if s.virtualScoreSource != nil && len(files) > 0 {
-		scores = s.scoreVirtualCandidates(ctx, contentID, files)
-	}
 	versions, playbackVariants, subtitles, intro, credits, recap, preview := s.buildPlaybackInfo(
-		ctx, files, filter, audioPreferenceContentID, scores,
+		ctx,
+		files,
+		filter,
+		audioPreferenceContentID,
 	)
-	detail := &WatchDetail{
+	return &WatchDetail{
 		ContentID:        contentID,
 		Type:             contentType,
 		Title:            title,
@@ -4049,143 +3834,6 @@ func (s *DetailService) newWatchDetail(
 		Recap:            recap,
 		Preview:          preview,
 	}
-	s.attachVirtualRanking(ctx, contentID, detail, files)
-	return detail
-}
-
-// virtualScoreTimeout bounds the virtual candidate score lookup that annotates
-// a watch response. The score is decoration: a cold candidate cache can make
-// the lookup wait on a provider round-trip, which must never hold the watch
-// response open. On timeout the versions are served unscored.
-var virtualScoreTimeout = 1500 * time.Millisecond
-
-// virtualScoreConcurrency bounds how many virtual score lookups run at once.
-// A scorer that ignores context cancellation can strand its goroutine
-// indefinitely, so this cap is also the most leaked goroutines the score path
-// can accumulate. When every slot is held the lookup fails open and the watch
-// response serves unannotated versions rather than waiting.
-const virtualScoreConcurrency = 8
-
-// attachVirtualCandidateScores stamps each virtual candidate version with the
-// custom-format score the virtual ranking assigned it, keyed by media-file ID.
-// Local files and unscored candidates keep a nil score, and a scorer miss or
-// timeout leaves the version unannotated rather than failing the watch response.
-func (s *DetailService) attachVirtualCandidateScores(
-	ctx context.Context,
-	contentID string,
-	versions []FileVersion,
-	files []*models.MediaFile,
-) {
-	if s.virtualScoreSource == nil || len(versions) == 0 {
-		return
-	}
-	applyVirtualCandidateScores(versions, s.scoreVirtualCandidates(ctx, contentID, files))
-}
-
-func applyVirtualCandidateScores(versions []FileVersion, scores map[int]VirtualCandidateScore) {
-	if len(scores) == 0 {
-		return
-	}
-	for i := range versions {
-		if score, ok := scores[versions[i].FileID]; ok {
-			if score.Score != 0 {
-				versions[i].FormatScore = intPtr(score.Score)
-			}
-			versions[i].MatchedFormats = score.MatchedFormats
-			versions[i].providerOrder = score.ProviderOrder
-		}
-	}
-}
-
-// scoreVirtualCandidates runs the score source under a short deadline and
-// fails open. The source runs on its own goroutine so a scorer that ignores
-// context cancellation still cannot block the watch response; the buffered
-// channel lets that goroutine finish without leaking, and a recovered panic
-// yields no scores instead of taking the process down from a background
-// goroutine. A canceled or timed-out lookup also yields no scores, so the
-// caller leaves every version unannotated.
-//
-// A semaphore bounds in-flight scorer calls because a scorer that ignores
-// cancellation never returns and would otherwise strand one goroutine per
-// watch request. A slot is held for the life of the scorer call, not the
-// caller's wait, so a leaked scorer consumes its slot permanently and
-// eventually saturates the semaphore. Once saturated, later lookups find no
-// slot before the deadline and fail open without spawning another goroutine,
-// which bounds the leak. Acquiring a slot shares the response deadline
-// established for the lookup, so a caller never waits past virtualScoreTimeout.
-func (s *DetailService) scoreVirtualCandidates(ctx context.Context, contentID string, files []*models.MediaFile) map[int]VirtualCandidateScore {
-	scoreCtx, cancel := context.WithTimeout(ctx, virtualScoreTimeout)
-	defer cancel()
-
-	s.virtualScoreSemOnce.Do(func() {
-		s.virtualScoreSem = make(chan struct{}, virtualScoreConcurrency)
-	})
-	select {
-	case s.virtualScoreSem <- struct{}{}:
-	case <-scoreCtx.Done():
-		return nil
-	}
-
-	done := make(chan map[int]VirtualCandidateScore, 1)
-	go func() {
-		defer func() { <-s.virtualScoreSem }()
-		defer func() {
-			if recover() != nil {
-				done <- nil
-			}
-		}()
-		done <- s.virtualScoreSource(scoreCtx, contentID, files)
-	}()
-	select {
-	case scores := <-done:
-		return scores
-	case <-scoreCtx.Done():
-		return nil
-	}
-}
-
-// attachVirtualRanking stamps the ranking that produced the item's virtual
-// version order on the detail and on each playback variant, keyed by the
-// versions' media-file IDs. Local content and an unwired source leave both
-// absent, matching the omitempty wire contract.
-func (s *DetailService) attachVirtualRanking(
-	ctx context.Context,
-	contentID string,
-	detail *WatchDetail,
-	files []*models.MediaFile,
-) {
-	if s.virtualRankingSource == nil || detail == nil || len(detail.Versions) == 0 {
-		return
-	}
-	rankings := s.virtualRankingSource(ctx, contentID, files)
-	if len(rankings) == 0 {
-		return
-	}
-	if ranking, ok := virtualRankingForVersions(rankings, detail.Versions); ok {
-		detail.VirtualRanking = ranking
-	}
-	for i := range detail.PlaybackVariants {
-		for p := range detail.PlaybackVariants[i].Parts {
-			ranking, ok := virtualRankingForVersions(rankings, detail.PlaybackVariants[i].Parts[p].Versions)
-			if !ok {
-				continue
-			}
-			detail.PlaybackVariants[i].VirtualRanking = ranking
-			break
-		}
-	}
-}
-
-// virtualRankingForVersions returns the ranking of the first version that has
-// one. Versions of one listing share a ranking, so the first is representative.
-func virtualRankingForVersions(rankings map[int]VirtualRanking, versions []FileVersion) (*VirtualRanking, bool) {
-	for i := range versions {
-		if ranking, ok := rankings[versions[i].FileID]; ok {
-			out := ranking
-			return &out, true
-		}
-	}
-	return nil, false
 }
 
 // effectiveSubtitleDefaults resolves the subtitle preferences that apply to one
@@ -4510,15 +4158,6 @@ func (s *DetailService) effectiveAudioSelectionWith(
 	if file == nil || len(file.AudioTracks) == 0 {
 		return effectiveAudioSelection{}
 	}
-	// Backfill the languages array from embedded track titles before resolving
-	// the effective language: rows probed before MULTI/DUAL languages support
-	// carry an empty array or a "mul"/"und" tag, while the displayed
-	// FileVersion.AudioTracks are backfilled by ensureTrackLanguages. Resolving
-	// against a backfilled copy keeps EffectiveAudioLanguage consistent with
-	// the tracks the client renders without mutating the caller's file.
-	backfilled := *file
-	backfilled.AudioTracks = ensureTrackLanguages(append([]models.AudioTrack(nil), file.AudioTracks...))
-	file = &backfilled
 	if r == nil || !r.valid {
 		index := playback.SelectAudioTrack(file.AudioTracks, "", nil)
 		return effectiveAudioSelection{
@@ -4711,276 +4350,15 @@ func sortAudiobookMediaFiles(files []*models.MediaFile) {
 	})
 }
 
-// ensureTrackLanguages backfills the languages array from a track's embedded
-// title when the track carries no explicit list and its language tag is absent,
-// undetermined, or multiple. Rows probed before the MULTI/DUAL languages
-// support were scanned with an empty array; re-deriving it at read time keeps
-// the version flyout complete until the probe-version re-probe catches up.
-func ensureTrackLanguages(tracks []models.AudioTrack) []models.AudioTrack {
-	// One implementation shared with the playback start path: the picker marker
-	// and the planner's audio selection must resolve MULTI/DUAL titles from the
-	// same backfilled language view.
-	return playback.BackfillAudioTrackLanguages(tracks)
-}
-
-// virtualMediaContainer is the container sentinel a provider-backed virtual
-// row carries. It mirrors models.MediaFile.ResolvedVirtualProvenance, which is
-// the canonical definition of "this row is virtual"; the value is duplicated
-// rather than exported because models is imported here, not the other way
-// round.
-const virtualMediaContainer = "virtual"
-
-// isVirtualMediaFile reports whether a media file row is a zero-storage
-// virtual candidate (provider-backed) rather than a local file. Mirrors the
-// canonical models check (Container == "virtual" or a virtual:// path,
-// case-insensitive): local liveness (missing_since) never applies to virtual
-// rows, and their health signal is the failed_at stamp instead.
-func isVirtualMediaFile(f *models.MediaFile) bool {
-	return f != nil && (f.Container == virtualMediaContainer || strings.HasPrefix(strings.ToLower(f.FilePath), "virtual://"))
-}
-
-// versionAvailability returns the durable per-version health signal as a
-// pointer so the JSON field is omitted when the version is available (absent
-// means available/unknown) and false when it is not: a virtual candidate is
-// unavailable when stamped failed (failed_at set), a local file when marked
-// missing (missing_since set).
-func versionAvailability(f *models.MediaFile) *bool {
-	if f == nil {
-		return nil
-	}
-	available := isVirtualMediaFile(f) && f.FailedAt == nil || !isVirtualMediaFile(f) && f.MissingSince == nil
-	if available {
-		return nil
-	}
-	return boolPtr(false)
-}
-
-// collapseDuplicateVirtualVersionFiles drops duplicate virtual catalog rows so
-// one release lists once. Duplicate rows for a release share a candidate URI
-// (and, for a neutral row, its provider-neutral key) and differ only by the
-// catalog row id, so projecting each row would list the same release twice and
-// let a later serve pick the wrong sibling row.
-//
-// Two rules:
-//   - A probed row collapses a later probed row that shares its provider-neutral
-//     candidate URI (every concrete `result=` pick stripped), its declared size
-//     and a non-conflicting durable provider identity. A provider re-list churns
-//     result ids for one release, so the probe stamp alone must not make a
-//     re-listed duplicate escape the collapse: without the neutral path the same
-//     release lists once per renumbering. A distinct declared size or a
-//     conflicting identity tier stays a genuine version distinction. The order
-//     within the list is preserved otherwise.
-//   - An unprobed virtual row collapses only onto a probed row for the same
-//     neutral release (same content, result= stripped) that is positively the
-//     same release: the unprobed row is a size-unknown placeholder (no stored
-//     or provider-declared size) or shares the probed row's size, and no
-//     durable provider identity tier (video hash, GUID, release name) the two
-//     both carry disagrees. A concrete unprobed alternate release — a distinct
-//     size or a distinct durable identity — is kept, so it stays selectable. A
-//     placeholder with no probed copy is kept too. Unprobed rows also collapse
-//     byte-identically among themselves.
-//
-// The concrete `result=` pick is deliberately not part of the identity test:
-// the neutral key strips it precisely because a provider re-list churns result
-// ids for one release, so a rotated sibling would otherwise never collapse. The
-// neutral path is neutralVirtualMediaPath, the same predicate the catalog's SQL
-// adoption uses, so the Go collapse and the persisted-row matching cannot
-// diverge on what counts as one neutral release.
-//
-// Local files are never collapsed: their on-disk paths are already distinct, and
-// a same-path collision is not the virtual duplicate this addresses.
-func collapseDuplicateVirtualVersionFiles(files []*models.MediaFile) []*models.MediaFile {
-	if len(files) < 2 {
-		return files
-	}
-	probedNeutral := make(map[string][]*models.MediaFile)
-	for _, f := range files {
-		if f == nil || f.ProbeUpdatedAt == nil {
-			continue
-		}
-		if key := virtualNeutralReleaseKey(f); key != "" {
-			probedNeutral[key] = append(probedNeutral[key], f)
-		}
-	}
-	out := make([]*models.MediaFile, 0, len(files))
-	keptProbedByNeutral := make(map[string][]*models.MediaFile)
-	seenExact := make(map[string]struct{})
-	for _, f := range files {
-		if f == nil {
-			continue
-		}
-		if f.ProbeUpdatedAt != nil {
-			key := virtualNeutralReleaseKey(f)
-			if key == "" {
-				out = append(out, f)
-				continue
-			}
-			if probedCollapsesAgainstProbedRelease(f, keptProbedByNeutral[key]) {
-				continue
-			}
-			keptProbedByNeutral[key] = append(keptProbedByNeutral[key], f)
-			out = append(out, f)
-			continue
-		}
-		exact := virtualExactReleaseKey(f)
-		if exact == "" {
-			out = append(out, f)
-			continue
-		}
-		if _, ok := seenExact[exact]; ok {
-			continue
-		}
-		if unprobedCollapsesAgainstProbedRelease(f, probedNeutral[virtualNeutralReleaseKey(f)]) {
-			continue
-		}
-		seenExact[exact] = struct{}{}
-		out = append(out, f)
-	}
-	return out
-}
-
-// probedCollapsesAgainstProbedRelease reports whether a probed virtual row is a
-// renumbering duplicate of an already-kept probed row: same provider-neutral
-// release, same declared size, and no conflicting durable provider identity. A
-// distinct size or a conflicting identity tier is a genuine version and keeps
-// the row.
-func probedCollapsesAgainstProbedRelease(f *models.MediaFile, kept []*models.MediaFile) bool {
-	if f == nil {
-		return false
-	}
-	for _, k := range kept {
-		if VirtualRowsShareRelease(f, k) {
-			return true
-		}
-	}
-	return false
-}
-
-// VirtualRowsShareRelease reports whether two virtual catalog rows are the same
-// release under the version list's grouping rule: the same provider-neutral
-// release path, an equal declared size, and no conflicting durable provider
-// identity tier. It is the rule that collapses duplicate rows for one release
-// into a single version, exported so a caller holding a release's sibling rows
-// can decide "same release, different row" without inventing a second
-// normalization.
-//
-// A concrete `result=` pick is deliberately not part of the identity test: the
-// neutral path strips it precisely because a provider re-list churns result ids
-// for one release, and different indexers offering the same release each mint
-// their own concrete pick. Local files never share a release by this rule.
-func VirtualRowsShareRelease(a, b *models.MediaFile) bool {
-	if a == nil || b == nil {
-		return false
-	}
-	key := virtualNeutralReleaseKey(a)
-	if key == "" || key != virtualNeutralReleaseKey(b) {
-		return false
-	}
-	if virtualDeclaredProviderSize(a) != virtualDeclaredProviderSize(b) {
-		return false
-	}
-	return !virtualProviderIdentityConflicts(a, b)
-}
-
-// unprobedCollapsesAgainstProbedRelease reports whether an unprobed virtual
-// row is positively the same release as one of the probed rows sharing its
-// provider-neutral key. It refuses unless the two rows are a likely placeholder
-// pair (the unprobed row's stored or provider-declared size is unknown, or
-// matches) and carry no conflicting durable provider identity, so a concrete
-// alternate release is never hidden.
-func unprobedCollapsesAgainstProbedRelease(f *models.MediaFile, probed []*models.MediaFile) bool {
-	if f == nil {
-		return false
-	}
-	size := virtualDeclaredProviderSize(f)
-	for _, p := range probed {
-		if p == nil {
-			continue
-		}
-		if size > 0 && size != virtualDeclaredProviderSize(p) {
-			continue
-		}
-		if virtualProviderIdentityConflicts(f, p) {
-			continue
-		}
-		return true
-	}
-	return false
-}
-
-// virtualDeclaredProviderSize returns the size a virtual row advertises for its
-// release, preferring the stored stream size and falling back to the durable
-// provider-declared size tier. Zero means the provider declared no size, which
-// is what marks an unprobed row as a size-unknown placeholder; a row whose size
-// lives only in the behaviorHints/videoSize tier would otherwise look sizeless
-// and collapse across releases it does not match.
-func virtualDeclaredProviderSize(f *models.MediaFile) int64 {
-	if f == nil {
-		return 0
-	}
-	if f.FileSize > 0 {
-		return f.FileSize
-	}
-	return f.ProviderReleaseSize
-}
-
-// virtualProviderIdentityConflicts reports whether two virtual rows carry
-// mutually exclusive durable provider identity. A tier that only one row
-// populates is not a conflict: an unprobed placeholder has no identity to
-// disagree with, while two populated, different tiers are a genuine release
-// swap.
-func virtualProviderIdentityConflicts(a, b *models.MediaFile) bool {
-	if a == nil || b == nil {
-		return true
-	}
-	return providerIdentityTierConflicts(a.ProviderVideoHash, b.ProviderVideoHash) ||
-		providerIdentityTierConflicts(a.ProviderGUID, b.ProviderGUID) ||
-		providerIdentityTierConflicts(a.ProviderReleaseName, b.ProviderReleaseName) ||
-		providerIdentityTierConflicts(a.ReleaseName, b.ReleaseName)
-}
-
-// providerIdentityTierConflicts reports whether two populated identity tiers
-// name different things. An empty side is unknown, never a conflict.
-func providerIdentityTierConflicts(a, b string) bool {
-	a, b = strings.TrimSpace(a), strings.TrimSpace(b)
-	return a != "" && b != "" && a != b
-}
-
-// virtualExactReleaseKey identifies an unprobed virtual row's exact release
-// identity for duplicate collapse: content, size and the concrete candidate
-// URI. Local files return "", so they are never part of the virtual dedup.
-func virtualExactReleaseKey(f *models.MediaFile) string {
-	if f == nil || !isVirtualMediaFile(f) {
-		return ""
-	}
-	return f.ContentID + "\x00" + strconv.FormatInt(f.FileSize, 10) + "\x00" + f.FilePath
-}
-
-// virtualNeutralReleaseKey groups a virtual row by its provider-neutral release:
-// content and the candidate URI with any concrete result= pick stripped. Size is
-// deliberately excluded: an unprobed collection placeholder is stored with size
-// 0 while the probed copy of the same release carries the real size, and the
-// placeholder must still collapse against that probed copy. The neutral path is
-// neutralVirtualMediaPath, the shared predicate the catalog's SQL row adoption
-// also uses, so the Go collapse and the persisted-row matching cannot diverge.
-// Local files return "".
-func virtualNeutralReleaseKey(f *models.MediaFile) string {
-	if f == nil || !isVirtualMediaFile(f) {
-		return ""
-	}
-	return f.ContentID + "\x00" + neutralVirtualMediaPath(f.FilePath)
-}
-
 func (s *DetailService) buildPlaybackInfo(
 	ctx context.Context,
 	files []*models.MediaFile,
 	filter AccessFilter,
 	audioPreferenceContentID string,
-	candidateScores ...map[int]VirtualCandidateScore,
 ) ([]FileVersion, []PlaybackVariant, []SubtitleInfo, *Marker, *Marker, *Marker, *Marker) {
 	// Resolve the request-invariant audio preferences once; a multi-track item
 	// would otherwise re-query the profile/preference rows for every file.
-	return s.buildPlaybackInfoWith(ctx, files, filter, s.newAudioPrefResolver(ctx, filter, audioPreferenceContentID), s.trickplay, candidateScores...)
+	return s.buildPlaybackInfoWith(ctx, files, filter, s.newAudioPrefResolver(ctx, filter, audioPreferenceContentID), s.trickplay)
 }
 
 // buildPlaybackInfoWith is buildPlaybackInfo with a caller-owned audio
@@ -4991,28 +4369,11 @@ func (s *DetailService) buildPlaybackInfoWith(
 	filter AccessFilter,
 	audioResolver *audioPrefResolver,
 	availability TrickplayAvailability,
-	candidateScores ...map[int]VirtualCandidateScore,
 ) ([]FileVersion, []PlaybackVariant, []SubtitleInfo, *Marker, *Marker, *Marker, *Marker) {
 	versions := make([]FileVersion, 0, len(files))
 	subtitleSet := make(map[string]SubtitleInfo)
 	var firstIntro, firstCredits, firstRecap, firstPreview *Marker
 
-	// Collapse byte-identical duplicate catalog rows before projecting versions:
-	// duplicate virtual rows for one release share candidate URIs/neutral keys
-	// and would otherwise list the same release more than once (and let a later
-	// serve pick the wrong sibling). A probed copy is preferred and an unprobed
-	// placeholder is kept only when no probed copy exists.
-	files = collapseDuplicateVirtualVersionFiles(files)
-
-	// Runtime fallbacks are request-invariant too. Every file in one call shares
-	// one item (movies, extras) and, for episode versions, one episode, so a
-	// multi-version item used to pay a fresh GetByID per version when its files
-	// carried no duration. Memoize within the call so each distinct ID costs one
-	// lookup; the zero value also records "looked up, no runtime" so a failed or
-	// empty lookup is not retried per file. Keys are the raw IDs, so a caller
-	// that ever mixes episodes still resolves each one correctly.
-	episodeDuration := make(map[string]int)
-	itemDuration := make(map[string]int)
 	for _, f := range files {
 		if f == nil {
 			continue
@@ -5035,34 +4396,6 @@ func (s *DetailService) buildPlaybackInfoWith(
 			firstPreview = versionPreview
 		}
 
-		fileDuration := f.Duration
-		if fileDuration <= 0 && f.EpisodeID != "" && s.episodeRepo != nil {
-			if cached, ok := episodeDuration[f.EpisodeID]; ok {
-				fileDuration = cached
-			} else {
-				duration := 0
-				if ep, epErr := s.episodeRepo.GetByID(ctx, f.EpisodeID); epErr == nil && ep != nil && ep.Runtime > 0 {
-					duration = ep.Runtime * 60
-				}
-				episodeDuration[f.EpisodeID] = duration
-				fileDuration = duration
-			}
-		}
-		if fileDuration <= 0 && f.ContentID != "" && s.itemRepo != nil {
-			if cached, ok := itemDuration[f.ContentID]; ok {
-				fileDuration = cached
-			} else {
-				duration := 0
-				if item, itemErr := s.itemRepo.GetByID(ctx, f.ContentID); itemErr == nil && item != nil && item.Runtime > 0 {
-					duration = item.Runtime * 60
-				}
-				itemDuration[f.ContentID] = duration
-				fileDuration = duration
-			}
-		}
-
-		audioTracks := ensureTrackLanguages(append([]models.AudioTrack(nil), f.AudioTracks...))
-
 		versions = append(versions, FileVersion{
 			FileID:                   f.ID,
 			FileName:                 fspath.Display(filepath.Base(f.FilePath)),
@@ -5073,13 +4406,11 @@ func (s *DetailService) buildPlaybackInfoWith(
 			HDR:                      f.HDR,
 			Container:                f.Container,
 			FileSize:                 f.FileSize,
-			Duration:                 fileDuration,
+			Duration:                 f.Duration,
 			Bitrate:                  f.Bitrate,
 			AddedAt:                  f.CreatedAt,
 			EditionRaw:               f.EditionRaw,
 			EditionKey:               f.EditionKey,
-			ReleaseName:              f.ReleaseName,
-			ReleaseGroup:             f.ReleaseGroup,
 			PresentationKind:         f.PresentationKind,
 			PresentationGroupKey:     f.PresentationGroupKey,
 			PresentationPartIndex:    f.PresentationPartIndex,
@@ -5088,28 +4419,19 @@ func (s *DetailService) buildPlaybackInfoWith(
 			MultiEpisodeEnd:          f.MultiEpisodeEnd,
 			EffectiveAudioTrackIndex: intPtr(effectiveAudioSelection.Index),
 			EffectiveAudioLanguage:   effectiveAudioSelection.Language,
-			Failed:                   f.FailedAt != nil,
-			// Available is the durable per-version health signal: a virtual
-			// candidate is available when it has not been stamped failed
-			// (failed_at IS NULL), a local file when it is not marked missing
-			// (missing_since IS NULL). Omitted when available, so an absent
-			// field means available/unknown; false means unavailable.
-			Available:      versionAvailability(f),
-			SourceMismatch: s.versionSourceMismatchFor(f),
-			VideoTracks:    append([]models.VideoTrack(nil), f.VideoTracks...),
-			AudioTracks:    audioTracks,
-			SubtitleTracks: buildVersionSubtitleTracks(f),
-			Chapters:       s.buildVersionChapters(ctx, f),
-			Intro:          versionIntro,
-			Credits:        versionCredits,
-			Recap:          versionRecap,
-			Preview:        versionPreview,
-			MarkerSegments: models.EffectiveMarkerSegments(f),
+			VideoTracks:              append([]models.VideoTrack(nil), f.VideoTracks...),
+			AudioTracks:              append([]models.AudioTrack(nil), f.AudioTracks...),
+			SubtitleTracks:           buildVersionSubtitleTracks(f),
+			Chapters:                 s.buildVersionChapters(ctx, f),
+			Intro:                    versionIntro,
+			Credits:                  versionCredits,
+			Recap:                    versionRecap,
+			Preview:                  versionPreview,
+			MarkerSegments:           models.EffectiveMarkerSegments(f),
 			MarkerPreviews: BuildMarkerPreviews(ctx, f, func(ctx context.Context, paths []string) map[string]ResolvedImageURL {
 				return s.PresignURLsWithExpiry(ctx, paths, "card")
 			}),
 			Unreadable: f.ProbeRejected(),
-			ProbedAt:   f.ProbeUpdatedAt,
 		})
 
 		for _, sub := range f.SubtitleTracks {
@@ -5146,10 +4468,6 @@ func (s *DetailService) buildPlaybackInfoWith(
 		subtitles = append(subtitles, sub)
 	}
 
-	if len(candidateScores) > 0 {
-		applyVirtualCandidateScores(versions, candidateScores[0])
-		preserveProviderVersionOrder(versions)
-	}
 	s.markTrickplay(ctx, versions, availability)
 	variants := buildPlaybackVariants(versions, filter.SelectedFileID)
 	selectedVersionExists := playbackVersionExists(versions, filter.SelectedFileID)
@@ -5165,56 +4483,7 @@ func (s *DetailService) buildPlaybackInfoWith(
 	recap := pick(func(v FileVersion) *Marker { return v.Recap }, firstRecap)
 	preview := pick(func(v FileVersion) *Marker { return v.Preview }, firstPreview)
 
-	// Serve verified inventory first without touching the inputs that produced
-	// the variants above: auto-pick, the selected version and every resolved
-	// row still come from the unpartitioned order.
-	return partitionPreparedVersions(versions), variants, subtitles, intro, credits, recap, preview
-}
-
-// versionInventoryPrepared reports whether a version carries probe-verified
-// stream inventory that a thin client can start from: a successful probe
-// stamped the row, it is not durably dead, and (when known) it is not marked
-// unavailable. A rejected wrong-source probe never stamps ProbeUpdatedAt and
-// never sets failed_at, so still-unverified mismatched bytes are already
-// excluded by the probe stamp; the process-local source-mismatch verdict is not
-// part of the durable version list and cannot be carried here.
-func versionInventoryPrepared(v FileVersion) bool {
-	if v.Failed || v.Unreadable || v.ProbedAt == nil || v.ProbedAt.IsZero() {
-		return false
-	}
-	return v.Available == nil || *v.Available
-}
-
-// partitionPreparedVersions stably partitions versions so rows with verified
-// inventory come first. Relative order inside each group is preserved, which
-// keeps the existing provider ranking and listing order intact. It is a pure
-// display-order rule: callers must build playback variants and pick the
-// effective row before applying it.
-func partitionPreparedVersions(versions []FileVersion) []FileVersion {
-	if len(versions) < 2 {
-		return versions
-	}
-	prepared := 0
-	for i := range versions {
-		if versionInventoryPrepared(versions[i]) {
-			prepared++
-		}
-	}
-	if prepared == 0 || prepared == len(versions) {
-		return versions
-	}
-	ordered := make([]FileVersion, len(versions))
-	nextPrepared, nextOther := 0, prepared
-	for _, version := range versions {
-		if versionInventoryPrepared(version) {
-			ordered[nextPrepared] = version
-			nextPrepared++
-		} else {
-			ordered[nextOther] = version
-			nextOther++
-		}
-	}
-	return ordered
+	return versions, variants, subtitles, intro, credits, recap, preview
 }
 
 func playbackVersionExists(versions []FileVersion, selectedFileID int) bool {
@@ -5384,29 +4653,6 @@ func sortFileVersions(versions []FileVersion) {
 		}
 		return a.FileSize > b.FileSize
 	})
-	preserveProviderVersionOrder(versions)
-}
-
-// Reorder only provider rows, leaving local and unlisted versions in their
-// existing slots. Provider preferences must not promote remote files over local files.
-func preserveProviderVersionOrder(versions []FileVersion) {
-	var ranked []FileVersion
-	for _, version := range versions {
-		if version.providerOrder != nil {
-			ranked = append(ranked, version)
-		}
-	}
-	if len(ranked) < 2 {
-		return
-	}
-	sort.SliceStable(ranked, func(i, j int) bool { return *ranked[i].providerOrder < *ranked[j].providerOrder })
-	next := 0
-	for i := range versions {
-		if versions[i].providerOrder != nil {
-			versions[i] = ranked[next]
-			next++
-		}
-	}
 }
 
 func chooseDefaultVariantVersion(versions []FileVersion, selectedFileID int) *FileVersion {
@@ -5517,200 +4763,6 @@ func (s *DetailService) queueWatchPlaybackFiles(
 	s.chapterThumbs.QueueFileIDs(ctx, fileIDs)
 }
 
-// watchPrepareTTL bounds how long a repeated watch-detail fetch trusts the
-// preparation done for the same content. Probe repair is persisted and the
-// copy-safety verdict is memoized, and chapter extraction dedupes in-flight
-// work, so within the TTL the preparation is a replay of work that is already
-// settled. Past the TTL the work is reissued so a file whose probe or
-// thumbnail generation failed still retries without waiting for a restart.
-const watchPrepareTTL = 5 * time.Minute
-
-// watchPreparedMaxEntries bounds the memo so a long-lived process that sees
-// many distinct watch targets cannot accumulate one entry per title forever. It
-// is only a ceiling: expired entries are pruned first, so a busy server sheds
-// stale targets rather than live ones.
-const watchPreparedMaxEntries = 4096
-
-// watchPrepareRefreshTimeout bounds one detached watch preparation. The watch
-// response never waits on this work, so the bound exists only to keep a wedged
-// probe or chapter-thumbnail enqueue from holding its goroutine open forever.
-// It deliberately sits above the ensurer's own probe deadline (10s) and the
-// multi-second remote reads a cold probe performs, so an ordinary slow repair
-// still lands and persists instead of being canceled on every attempt.
-const watchPrepareRefreshTimeout = 30 * time.Second
-
-// watchRefreshConcurrency bounds how many detached watch preparations run at
-// once. Each one blocks on the ensurer's probe slots, so the cap keeps a burst
-// of distinct watch targets from accumulating goroutines and thumbnail queue
-// work faster than the probe pipeline can drain them. A refresh that cannot
-// take a slot drops its memo claim so a later fetch retries.
-const watchRefreshConcurrency = 8
-
-// watchPrepareState records one prepared watch target: the identity of the file
-// set it was prepared against (watchFilesFingerprint) and when.
-type watchPrepareState struct {
-	fingerprint string
-	preparedAt  time.Time
-}
-
-// watchFilesFingerprint identifies a file set by the fields probe repair would
-// change: file IDs and probe_updated_at. If a rescan or repair rewrites any of
-// them the fingerprint changes and the next fetch prepares again; otherwise the
-// previous preparation is still valid.
-func watchFilesFingerprint(files []*models.MediaFile) string {
-	var b strings.Builder
-	for _, file := range files {
-		if file == nil {
-			continue
-		}
-		b.WriteString(strconv.Itoa(file.ID))
-		b.WriteByte(':')
-		if file.ProbeUpdatedAt != nil {
-			b.WriteString(strconv.FormatInt(file.ProbeUpdatedAt.UnixNano(), 10))
-		}
-		b.WriteByte('|')
-	}
-	return b.String()
-}
-
-// prepareWatchFiles prepares a watch target once per unchanged file set, off
-// the request path.
-//
-// Probe repair, the cached copy-safety verdict and the chapter-thumbnail
-// enqueue are all idempotent, but the repair can cost multi-second remote reads
-// on a cold library and the enqueue costs a database read per file in the
-// worker. Both used to run synchronously on every watch/start fetch, so a slow
-// probe sat directly on the playback-start path. The response is now built from
-// the file metadata already on the row, and preparation runs in the background.
-//
-// The first fetch for a target (and any fetch after the probe state changes or
-// the TTL lapses) schedules one refresh; repeated or concurrent fetches of an
-// unchanged file set do not. The memo below is the coherence point: the refresh
-// records the post-repair fingerprint when it lands, so the next fetch reads
-// the repaired rows and recognizes them as already prepared.
-func (s *DetailService) prepareWatchFiles(
-	ctx context.Context,
-	contentID string,
-	contentType string,
-	files []*models.MediaFile,
-) []*models.MediaFile {
-	if s == nil {
-		return files
-	}
-	fingerprint := watchFilesFingerprint(files)
-	now := time.Now()
-
-	s.watchPrepareMu.Lock()
-	previous, seen := s.watchPrepared[contentID]
-	fresh := seen && previous.fingerprint == fingerprint && now.Sub(previous.preparedAt) < watchPrepareTTL
-	if !fresh {
-		// Claim the refresh before launching it so a burst of fetches for the
-		// same target schedules one background preparation, not one each.
-		s.recordWatchPrepareLocked(contentID, watchPrepareState{fingerprint: fingerprint, preparedAt: now}, now)
-	}
-	s.watchPrepareMu.Unlock()
-
-	if !fresh {
-		s.refreshWatchFilesAsync(ctx, contentID, contentType, files)
-	}
-	return files
-}
-
-// refreshWatchFilesAsync runs one watch preparation on a detached goroutine.
-//
-// The request has already been answered from existing row metadata, so the
-// refresh must outlive the request context: a client that disconnects while the
-// watch page loads must not cancel the repair that the next fetch (and the
-// playback start behind it) will read. context.WithoutCancel keeps the request's
-// logging and tracing values while dropping its cancellation, and
-// watchPrepareRefreshTimeout guards against a wedged ensurer.
-//
-// A slot from watchRefreshSemaphore bounds how many refreshes run at once. If
-// none is free the claim is removed and the refresh is skipped, so a burst of
-// distinct targets cannot pile up goroutines waiting behind the probe slots; a
-// later fetch retries.
-func (s *DetailService) refreshWatchFilesAsync(
-	ctx context.Context,
-	contentID string,
-	contentType string,
-	files []*models.MediaFile,
-) {
-	// Copy each row before handing it to the goroutine: the caller builds its
-	// response from these same pointers, and probe repair must not race it.
-	snapshot := make([]*models.MediaFile, 0, len(files))
-	for _, file := range files {
-		if file == nil {
-			continue
-		}
-		clone := *file
-		snapshot = append(snapshot, &clone)
-	}
-	if len(snapshot) == 0 {
-		return
-	}
-
-	base := context.WithoutCancel(ctx)
-	sem := s.watchRefreshSemaphore()
-	select {
-	case sem <- struct{}{}:
-	default:
-		// Saturated: drop the claim so a later fetch retries instead of
-		// queuing another goroutine behind the probe slots.
-		s.watchPrepareMu.Lock()
-		delete(s.watchPrepared, contentID)
-		s.watchPrepareMu.Unlock()
-		return
-	}
-	s.watchRefreshWG.Add(1)
-	go func() {
-		defer s.watchRefreshWG.Done()
-		defer func() { <-sem }()
-		refreshCtx, cancel := context.WithTimeout(base, watchPrepareRefreshTimeout)
-		defer cancel()
-		prepared := s.preparePlaybackFiles(refreshCtx, snapshot)
-		s.queueWatchPlaybackFiles(refreshCtx, contentID, contentType, prepared)
-		// Record the post-repair fingerprint: if probe repair rewrote
-		// probe_updated_at, the next fetch reads the repaired row, and this
-		// marks it as already prepared instead of scheduling another refresh.
-		s.recordWatchPrepare(contentID, watchPrepareState{
-			fingerprint: watchFilesFingerprint(prepared),
-			preparedAt:  time.Now(),
-		})
-	}()
-}
-
-// watchRefreshSemaphore lazily creates the semaphore that bounds detached watch
-// preparations. It is created on first use so a service that never serves a
-// watch detail allocates nothing.
-func (s *DetailService) watchRefreshSemaphore() chan struct{} {
-	s.watchRefreshSemOnce.Do(func() {
-		s.watchRefreshSem = make(chan struct{}, watchRefreshConcurrency)
-	})
-	return s.watchRefreshSem
-}
-
-// recordWatchPrepare stores a prepared state, pruning expired entries when the
-// memo reaches its ceiling.
-func (s *DetailService) recordWatchPrepare(contentID string, state watchPrepareState) {
-	s.watchPrepareMu.Lock()
-	s.recordWatchPrepareLocked(contentID, state, time.Now())
-	s.watchPrepareMu.Unlock()
-}
-
-func (s *DetailService) recordWatchPrepareLocked(contentID string, state watchPrepareState, now time.Time) {
-	if s.watchPrepared == nil {
-		s.watchPrepared = make(map[string]watchPrepareState)
-	}
-	if len(s.watchPrepared) >= watchPreparedMaxEntries {
-		for id, existing := range s.watchPrepared {
-			if now.Sub(existing.preparedAt) >= watchPrepareTTL {
-				delete(s.watchPrepared, id)
-			}
-		}
-	}
-	s.watchPrepared[contentID] = state
-}
-
 func (s *DetailService) buildVersionChapters(ctx context.Context, file *models.MediaFile) []VersionChapter {
 	if file == nil || len(file.Chapters) == 0 {
 		return []VersionChapter{}
@@ -5757,6 +4809,7 @@ func buildVersionSubtitleTracks(file *models.MediaFile) []VersionSubtitleTrack {
 			HearingImpaired: sub.HearingImpaired,
 			External:        sub.External,
 			FileName:        sub.FileName,
+			IndexOnly:       sub.IndexOnly,
 		})
 
 		index := sub.Index

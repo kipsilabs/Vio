@@ -509,7 +509,7 @@ func (s *directUserDataService) UpdateUserData(ctx context.Context, session *Ses
 		}
 		date := time.Now().UTC()
 		if req.LastPlayedDate != nil {
-			date = *req.LastPlayedDate
+			date = time.Time(*req.LastPlayedDate)
 		}
 
 		if req.Played != nil {

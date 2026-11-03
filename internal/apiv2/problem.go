@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -37,6 +36,7 @@ var (
 	TypeProviderAlreadyEnabled  = ProblemType{"provider_already_enabled", http.StatusConflict, "Provider already enabled"}
 	TypeBreakGlassRequired      = ProblemType{"break_glass_required", http.StatusConflict, "Break-glass account required"}
 	TypeLastSignInMethod        = ProblemType{"last_sign_in_method", http.StatusConflict, "Last sign-in method"}
+	TypeProviderUnavailable     = ProblemType{"provider_unavailable", http.StatusServiceUnavailable, "Provider unavailable"}
 	// Directory linking (linkAccountIdentityWithCredentials) refusals.
 	TypeAccountDisabled       = ProblemType{"account_disabled", http.StatusForbidden, "Account disabled"}
 	TypeLocalPasswordRequired = ProblemType{"local_password_required", http.StatusConflict, "Local password required"}
@@ -88,6 +88,7 @@ var (
 	TypeTokenRefreshRequired                          = ProblemType{"token_refresh_required", http.StatusUnauthorized, "Token refresh required"}
 	TypePermissionDenied                              = ProblemType{"permission_denied", http.StatusForbidden, "Permission denied"}
 	TypeProfileVerificationRequired                   = ProblemType{"profile_verification_required", http.StatusForbidden, "Profile verification required"}
+	TypePushInstallationKeyMismatch                   = ProblemType{"push_installation_key_mismatch", http.StatusForbidden, "Push installation key mismatch"}
 	TypePasswordChangeRequired                        = ProblemType{"password_change_required", http.StatusForbidden, "Password change required"}
 	TypeNotFound                                      = ProblemType{"not_found", http.StatusNotFound, "Not found"}
 	TypeMethodNotAllowed                              = ProblemType{"method_not_allowed", http.StatusMethodNotAllowed, "Method not allowed"}
@@ -108,28 +109,13 @@ var (
 	TypeInternalError                                 = ProblemType{"internal_error", http.StatusInternalServerError, "Internal error"}
 	TypeCapabilityUnsupported                         = ProblemType{"capability_unsupported", http.StatusNotImplemented, "Capability unsupported"}
 	TypeDependencyUnavailable                         = ProblemType{"dependency_unavailable", http.StatusServiceUnavailable, "Dependency unavailable"}
-	TypeProviderUnavailable                           = ProblemType{"provider_unavailable", http.StatusServiceUnavailable, "Provider unavailable"} // transient upstream provider outage; retry
 	TypeClientUpgradeRequired                         = ProblemType{"client_upgrade_required", http.StatusGone, "Client upgrade required"}
-	catalog                                           = []ProblemType{TypeRangeNotSatisfiable, TypeDeviceLoginExpired, TypeUnsupportedSource, TypeMalformedRequest, TypeInvalidCursor, TypeAuthenticationRequired, TypeInvalidToken, TypeSessionExpired, TypePermissionDenied, TypeProfileVerificationRequired, TypeNotFound, TypeMethodNotAllowed, TypeNotAcceptable, TypeRequestTimeout, TypeConflict, TypeIdempotencyConflict, TypeJobNotCancelable, TypeCapabilityDisabled, TypeCapabilityNotConfigured, TypePreconditionFailed, TypePayloadTooLarge, TypeUnsupportedMediaType, TypeValidationFailed, TypePreconditionRequired, TypeRateLimited, TypeInternalError, TypeCapabilityUnsupported, TypeDependencyUnavailable, TypeClientUpgradeRequired, TypeSyncResetRequired, TypeSnapshotRequestConflict, TypeProgressSnapshotTooLarge, TypePlaybackInstallationChanged, TypePlaybackSessionEnded, TypePlaybackProgressConflict, TypePasswordChangeRequired, TypeNotPermitted, TypeAccountRequired, TypeLocalLoginDisabled, TypeProviderPasswordExpired, TypeEmailInUse, TypeIdentityLinkedElsewhere, TypeProviderAlreadyEnabled, TypeBreakGlassRequired, TypeLastSignInMethod, TypeProviderUnavailable, TypeInvalidGrant, TypeAccountDisabled, TypeLocalPasswordRequired, TypeAlreadyLinked, TypeTokenRefreshRequired, TypeNetworkIdentityRequired, TypePreparedFileExpired, TypeFileUnavailable, TypeFileAccessDenied, TypeFormatUnavailable}
+	catalog                                           = []ProblemType{TypeRangeNotSatisfiable, TypeDeviceLoginExpired, TypeUnsupportedSource, TypeMalformedRequest, TypeInvalidCursor, TypeAuthenticationRequired, TypeInvalidToken, TypeSessionExpired, TypePermissionDenied, TypeProfileVerificationRequired, TypePushInstallationKeyMismatch, TypeNotFound, TypeMethodNotAllowed, TypeNotAcceptable, TypeRequestTimeout, TypeConflict, TypeIdempotencyConflict, TypeJobNotCancelable, TypeCapabilityDisabled, TypeCapabilityNotConfigured, TypePreconditionFailed, TypePayloadTooLarge, TypeUnsupportedMediaType, TypeValidationFailed, TypePreconditionRequired, TypeRateLimited, TypeInternalError, TypeCapabilityUnsupported, TypeDependencyUnavailable, TypeClientUpgradeRequired, TypeSyncResetRequired, TypeSnapshotRequestConflict, TypeProgressSnapshotTooLarge, TypePlaybackInstallationChanged, TypePlaybackSessionEnded, TypePlaybackProgressConflict, TypePasswordChangeRequired, TypeNotPermitted, TypeAccountRequired, TypeLocalLoginDisabled, TypeProviderPasswordExpired, TypeEmailInUse, TypeIdentityLinkedElsewhere, TypeProviderAlreadyEnabled, TypeBreakGlassRequired, TypeLastSignInMethod, TypeProviderUnavailable, TypeInvalidGrant, TypeAccountDisabled, TypeLocalPasswordRequired, TypeAlreadyLinked, TypeTokenRefreshRequired, TypeNetworkIdentityRequired, TypePreparedFileExpired}
 	defaultTypeByStatus                               = map[int]ProblemType{}
 	problemContentType                                = "application/problem+json"
 	_                               error             = (*Problem)(nil)
 	_                               huma.StatusError  = (*Problem)(nil)
 	_                               huma.HeadersError = (*Problem)(nil)
-)
-
-// Direct-download resolve refusals. file_unavailable is a stale or unknown
-// file_id (refresh the version list); file_access_denied is a file the caller's
-// access filter refuses (keep showing the account's denial); format_unavailable
-// is a version with no downloadable original bytes (a non-original format or a
-// virtual provider placeholder). Declared separately so the main catalog's
-// alignment is not disturbed; their statuses are appended to the catalog below
-// so the status-derived default still resolves to not_found / permission_denied
-// / capability_unsupported.
-var (
-	TypeFileUnavailable   = ProblemType{"file_unavailable", http.StatusNotFound, "File unavailable"}
-	TypeFileAccessDenied  = ProblemType{"file_access_denied", http.StatusForbidden, "File access denied"}
-	TypeFormatUnavailable = ProblemType{"format_unavailable", http.StatusNotImplemented, "Format unavailable"}
 )
 
 func init() {
@@ -173,20 +159,6 @@ type Problem struct {
 	Errors   []ProblemError `json:"errors,omitempty" doc:"Field-level validation details"`
 
 	headers http.Header
-	// cause is the application error an operation swallowed while building a
-	// safe envelope (see serviceProblem). It is never serialized; the observe
-	// middleware logs it under the request ID so a 500 names its underlying
-	// failure instead of only the generic problem code.
-	cause error
-}
-
-// withCause attaches the underlying application error to a problem. It keeps
-// the first cause so a wrapped/annotated problem cannot replace the original.
-func (p *Problem) withCause(err error) *Problem {
-	if p != nil && err != nil && p.cause == nil {
-		p.cause = err
-	}
-	return p
 }
 
 // NewProblem builds an application problem of type t.
@@ -305,13 +277,6 @@ func fromHumaError(requestID string, status int, msg string, errs []error, bodyL
 			Code:     validationCode(detail.Message),
 			Detail:   validationDetail(detail.Message),
 		})
-	}
-	if status == http.StatusUnprocessableEntity && len(p.Errors) > 0 {
-		var codes []string
-		for _, e := range p.Errors {
-			codes = append(codes, e.Code)
-		}
-		slog.Warn("validation_failed", "request_id", requestID, "error_count", len(p.Errors), "codes", codes)
 	}
 	return p
 }
@@ -493,15 +458,6 @@ func installErrorAdapter() {
 		if ctx != nil {
 			requestID = requestIDFrom(ctx.Context())
 			limit = operationBodyLimit(ctx.Operation())
-			// A handler that returned a plain (non-StatusError) error reaches
-			// Huma here, which would otherwise reduce it to the fixed 500
-			// envelope with the cause discarded. Record it so the request log
-			// carries the actual failure under the same request ID.
-			if status >= 500 {
-				for _, err := range errs {
-					noteOperationError(ctx.Context(), err)
-				}
-			}
 		}
 		return fromHumaError(requestID, status, msg, errs, limit)
 	}

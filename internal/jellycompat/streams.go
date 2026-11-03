@@ -1733,10 +1733,20 @@ func writeSubtitleResponse(w http.ResponseWriter, format string, data []byte) {
 	_, _ = w.Write(data)
 }
 
-// extractEmbeddedTextSubtitle serves one embedded text track. A cache miss
-// extracts every text track of the file in the same demux, so switching to
+// extractEmbeddedTextSubtitle serves one embedded text track: from the cache,
+// a kept copy, or the file's index. When only a demux can produce it, the
+// demux extracts every text track of the file at once, so switching to
 // another track later does not read the whole source again.
 func (h *PlaybackHandler) extractEmbeddedTextSubtitle(ctx context.Context, file *models.MediaFile, trackIndex int, format string) ([]byte, error) {
+	// A kept copy of the track, or one read through the file's index, needs
+	// no demux at all.
+	ref := playback.EmbeddedSubtitleRefFor(file, trackIndex)
+	if data, ok, err := h.SubtitleCache.ExtractSourcedText(ctx, file.FilePath, ref, trackIndex, format, h.FFmpegPath); ok || err != nil {
+		return data, err
+	}
+	if ref != nil && ref.IndexOnly {
+		return nil, playback.ErrSubtitleIndexOnly
+	}
 	want := playback.TextSubtitleTrack{Ordinal: trackIndex, Format: format}
 	return h.SubtitleCache.ExtractTextTracks(ctx, file.FilePath, want, compatTextSubtitleTracks(file), h.extractTextSubtitleBatch,
 		func(ctx context.Context) ([]byte, error) {
@@ -1749,11 +1759,15 @@ func (h *PlaybackHandler) extractTextSubtitleBatch(ctx context.Context, inputPat
 }
 
 // compatTextSubtitleTracks lists the text renditions of a file's embedded
-// subtitle streams, indexed by their position among its subtitle streams.
+// subtitle streams, indexed by their position among its subtitle streams. An
+// index-only track is left out: FFmpeg can't demux it, and one stream it
+// can't read fails the batch for every other track.
 func compatTextSubtitleTracks(file *models.MediaFile) []playback.TextSubtitleTrack {
 	codecs := make([]string, len(file.SubtitleTracks))
 	for i, track := range file.SubtitleTracks {
-		codecs[i] = track.Codec
+		if !track.IndexOnly {
+			codecs[i] = track.Codec
+		}
 	}
 	return playback.TextSubtitleTracks(codecs)
 }
@@ -1777,7 +1791,9 @@ func (h *PlaybackHandler) warmCompatTextSubtitles(fileID int) {
 		if err != nil || file == nil {
 			return
 		}
-		h.SubtitleCache.WarmTextTracks(file.FilePath, compatTextSubtitleTracks(file), h.extractTextSubtitleBatch)
+		h.SubtitleCache.WarmEmbeddedTextTracks(file.FilePath, compatTextSubtitleTracks(file), func(ordinal int) *playback.EmbeddedSubtitleRef {
+			return playback.EmbeddedSubtitleRefFor(file, ordinal)
+		}, h.extractTextSubtitleBatch, h.FFmpegPath)
 	}()
 }
 

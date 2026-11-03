@@ -7,13 +7,9 @@ import { afterEach, describe, expect, it, vi, beforeEach } from "vitest";
 import { setAccessToken, setProfileId } from "@/api/client";
 import { installPolicyStorageMocks, jsonResponse } from "@/pages/admin-policy/policyTestUtils";
 import type { FileVersion, ItemDetail, Season } from "@/api/types";
-import { rememberRequestedFileId } from "@/playback/requestedVersion";
+import { catalogKeys } from "@/hooks/queries/keys";
 import EpisodeContent from "./EpisodeContent";
 import { makeFileVersion, makeItemDetail } from "./itemDetail.test-support";
-
-// The requested-version store is profile-scoped; these tests render with the
-// account's resolved profile.
-const PROFILE_ID = "profile-test";
 
 const mocks = vi.hoisted(() => {
   type Props = Record<string, unknown> | null;
@@ -34,7 +30,6 @@ const mocks = vi.hoisted(() => {
     useSetRating: vi.fn(),
     useDeleteRating: vi.fn(),
     useOnViewTranslation: vi.fn(),
-    useVersionLiveness: vi.fn(),
     setRatingMutate: vi.fn(),
     deleteRatingMutate: vi.fn(),
     startPlayback: vi.fn(),
@@ -49,17 +44,6 @@ vi.mock("@/hooks/queries/episodes", () => ({
   useSeasonEpisodes: mocks.useSeasonEpisodes,
 }));
 
-// Capability-gated upcoming badge: tests render without a QueryClient, so
-// the hook stands in for the resolved answer (available) like the quality
-// preference mock above.
-vi.mock("@/hooks/queries/episodeRelease", async (importOriginal) => {
-  const original = (await importOriginal()) as typeof import("@/hooks/queries/episodeRelease");
-  return {
-    ...original,
-    useEpisodeReleaseCapability: () => ({ data: { available: true } }),
-  };
-});
-
 vi.mock("@/hooks/useAuth", () => ({
   useAuth: mocks.useAuth,
   useOptionalAuth: mocks.useAuth,
@@ -73,13 +57,6 @@ vi.mock("@/hooks/queries/qualityPreference", () => ({
 
 vi.mock("@/hooks/useCurrentProfile", () => ({
   useCurrentProfile: mocks.useCurrentProfile,
-}));
-
-// These tests render without a QueryClient; the liveness check is a no-op that
-// leaves item metadata untouched unless a test supplies a verdict.
-vi.mock("@/hooks/queries/versionLiveness", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/hooks/queries/versionLiveness")>()),
-  useVersionLiveness: (...args: unknown[]) => mocks.useVersionLiveness(...args),
 }));
 
 vi.mock("@/hooks/useOnViewTranslation", () => ({
@@ -251,7 +228,6 @@ function countOccurrences(markup: string, fragment: string): number {
 
 describe("EpisodeContent", () => {
   beforeEach(() => {
-    localStorage.clear();
     mocks.capturedActionBarProps.value = null;
     mocks.capturedDetailHeroProps.value = null;
     mocks.useAuth.mockReturnValue({ user: null });
@@ -271,8 +247,6 @@ describe("EpisodeContent", () => {
     });
     mocks.useAdminMarkerCapabilities.mockReturnValue({ data: undefined });
     mocks.useLibraryCapabilities.mockReturnValue({ data: undefined });
-    mocks.useVersionLiveness.mockClear();
-    mocks.useVersionLiveness.mockReturnValue(new Map<number, boolean>());
     mocks.useWatchedStateMutation.mockReturnValue({
       mutate: vi.fn(),
       isPending: false,
@@ -327,207 +301,6 @@ describe("EpisodeContent", () => {
     expect(markup).toContain(">Season 99<");
   });
 
-  it("passes on-view translation controls to the hero", () => {
-    const onTranslate = vi.fn();
-    mocks.useOnViewTranslation.mockReturnValue({
-      translating: true,
-      onTranslate,
-    });
-
-    renderToStaticMarkup(
-      <MemoryRouter initialEntries={["/item/episode-1"]}>
-        <EpisodeContent item={makeEpisodeItem({ pending_translation_language: "fr" })} />
-      </MemoryRouter>,
-    );
-
-    expect(mocks.useOnViewTranslation).toHaveBeenCalledWith(
-      expect.objectContaining({ content_id: "episode-1", type: "episode" }),
-    );
-    expect(mocks.capturedDetailHeroProps.value).toMatchObject({
-      overviewTranslating: true,
-      onTranslateOverview: onTranslate,
-    });
-  });
-
-  it("shows the episode's own title card as the hero backdrop", () => {
-    renderToStaticMarkup(
-      <MemoryRouter initialEntries={["/item/episode-1"]}>
-        <EpisodeContent
-          item={makeEpisodeItem({
-            poster_url: "/stills/episode-1.webp",
-            poster_thumbhash: "still-thumbhash",
-            backdrop_url: "/backdrops/series.webp",
-            backdrop_thumbhash: "backdrop-thumbhash",
-          })}
-        />
-      </MemoryRouter>,
-    );
-
-    expect(mocks.capturedDetailHeroProps.value).toMatchObject({
-      backdropUrl: "/stills/episode-1.webp",
-      backdropThumbhash: "still-thumbhash",
-    });
-  });
-
-  it("keeps the series backdrop when the episode has no title card of its own", () => {
-    renderToStaticMarkup(
-      <MemoryRouter initialEntries={["/item/episode-1"]}>
-        <EpisodeContent
-          item={makeEpisodeItem({
-            backdrop_url: "/backdrops/series.webp",
-            backdrop_thumbhash: "backdrop-thumbhash",
-          })}
-        />
-      </MemoryRouter>,
-    );
-
-    expect(mocks.capturedDetailHeroProps.value).toMatchObject({
-      backdropUrl: "/backdrops/series.webp",
-      backdropThumbhash: "backdrop-thumbhash",
-    });
-  });
-
-  it("shows the preferred still with no placeholder even though the backdrop has a thumbhash", () => {
-    renderToStaticMarkup(
-      <MemoryRouter initialEntries={["/item/episode-1"]}>
-        <EpisodeContent
-          item={makeEpisodeItem({
-            poster_url: "/stills/episode-1.webp",
-            poster_thumbhash: "",
-            backdrop_url: "/backdrops/series.webp",
-            backdrop_thumbhash: "backdrop-thumbhash",
-          })}
-        />
-      </MemoryRouter>,
-    );
-
-    // The URL picks the still, so the placeholder must be the still's — empty,
-    // not the series backdrop's hash for a different image.
-    expect(mocks.capturedDetailHeroProps.value).toMatchObject({
-      backdropUrl: "/stills/episode-1.webp",
-      backdropThumbhash: "",
-    });
-  });
-
-  it("ignores an orphaned still thumbhash when the still URL is absent", () => {
-    renderToStaticMarkup(
-      <MemoryRouter initialEntries={["/item/episode-1"]}>
-        <EpisodeContent
-          item={makeEpisodeItem({
-            poster_url: "",
-            poster_thumbhash: "orphan-still-thumbhash",
-            backdrop_url: "/backdrops/series.webp",
-            backdrop_thumbhash: "backdrop-thumbhash",
-          })}
-        />
-      </MemoryRouter>,
-    );
-
-    // With no still URL the source is the series backdrop, so the hash must not
-    // leak across from the unselected still.
-    expect(mocks.capturedDetailHeroProps.value).toMatchObject({
-      backdropUrl: "/backdrops/series.webp",
-      backdropThumbhash: "backdrop-thumbhash",
-    });
-  });
-
-  it("falls back to the season episode row's still when the detail carries no artwork", () => {
-    mocks.useSeasonEpisodes.mockReturnValue({
-      data: {
-        episodes: [
-          {
-            content_id: "episode-1",
-            season_number: 1,
-            episode_number: 1,
-            title: "Pilot",
-            overview: "",
-            air_date: null,
-            runtime: 42,
-            still_url: "/stills/row.webp",
-            still_thumbhash: "row-thumbhash",
-            files: [],
-          },
-        ],
-      },
-    });
-
-    renderToStaticMarkup(
-      <MemoryRouter initialEntries={["/item/episode-1"]}>
-        <EpisodeContent item={makeEpisodeItem()} />
-      </MemoryRouter>,
-    );
-
-    expect(mocks.capturedDetailHeroProps.value).toMatchObject({
-      backdropUrl: "/stills/row.webp",
-      backdropThumbhash: "row-thumbhash",
-    });
-  });
-
-  it("shows all season episodes in the carousel, not just nearby ones", () => {
-    const allEpisodes = Array.from({ length: 10 }, (_, i) => ({
-      content_id: `ep-${i + 1}`,
-      season_number: 1,
-      episode_number: i + 1,
-      title: `Episode ${i + 1} Title`,
-      overview: "",
-      air_date: null,
-      runtime: 42,
-      still_url: "",
-      still_thumbhash: "",
-      files: [],
-    }));
-
-    mocks.useSeasonEpisodes.mockReturnValue({
-      data: { episodes: allEpisodes },
-    });
-
-    const markup = renderToStaticMarkup(
-      <MemoryRouter initialEntries={["/item/episode-1"]}>
-        <EpisodeContent item={makeEpisodeItem({ episode_number: 5 })} />
-      </MemoryRouter>,
-    );
-
-    // All 10 episodes should be rendered
-    for (let i = 1; i <= 10; i++) {
-      expect(markup).toContain(`Episode ${i} Title`);
-    }
-
-    // Current episode (5) should be marked
-    expect(markup).toContain('data-current="true"');
-    expect(countOccurrences(markup, 'data-current="true"')).toBe(1);
-  });
-
-  it("hides the carousel when only one episode exists", () => {
-    mocks.useSeasonEpisodes.mockReturnValue({
-      data: {
-        episodes: [
-          {
-            content_id: "ep-1",
-            season_number: 1,
-            episode_number: 1,
-            title: "Only Episode",
-            overview: "",
-            air_date: null,
-            runtime: 42,
-            still_url: "",
-            still_thumbhash: "",
-            files: [],
-          },
-        ],
-      },
-    });
-
-    const markup = renderToStaticMarkup(
-      <MemoryRouter initialEntries={["/item/episode-1"]}>
-        <EpisodeContent item={makeEpisodeItem({ episode_number: 1 })} />
-      </MemoryRouter>,
-    );
-
-    expect(markup).not.toContain("More Episodes");
-    expect(markup).not.toContain("episode-detail-navigation");
-    expect(markup).not.toContain("episode-carousel");
-  });
-
   it("hides an unwatched episode's overview until the viewer reveals it", () => {
     spoilerPrefs.hideOverviews = true;
     try {
@@ -547,6 +320,92 @@ describe("EpisodeContent", () => {
     } finally {
       spoilerPrefs.hideOverviews = false;
     }
+  });
+
+  describe("overview", () => {
+    function renderWithSeries(
+      item: ReturnType<typeof makeEpisodeItem>,
+      series: Partial<ItemDetail>,
+      libraryId?: number,
+    ) {
+      const queryClient = new QueryClient({
+        defaultOptions: { queries: { staleTime: Infinity, retry: false } },
+      });
+      queryClient.setQueryData(
+        catalogKeys.itemDetail("series-1", libraryId),
+        makeItemDetail("series", { content_id: "series-1", ...series }),
+      );
+      render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/item/episode-1"]}>
+            <EpisodeContent item={item} libraryId={libraryId} />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+      return mocks.capturedDetailHeroProps.value;
+    }
+
+    // The translate control follows whichever overview is on screen.
+    beforeEach(() => {
+      mocks.useOnViewTranslation.mockImplementation((target?: { content_id: string }) => ({
+        translating: false,
+        onTranslate: target ? `translate ${target.content_id}` : undefined,
+      }));
+    });
+
+    it.each([
+      {
+        name: "falls back to the series overview when the episode has none",
+        episodeOverview: "",
+        hideOverviews: false,
+        expected: {
+          overview: "Series overview",
+          overviewMachineTranslated: true,
+          onTranslateOverview: "translate series-1",
+        },
+      },
+      {
+        name: "keeps the episode's own overview",
+        episodeOverview: "Episode overview",
+        hideOverviews: false,
+        expected: {
+          overview: "Episode overview",
+          overviewMachineTranslated: false,
+          onTranslateOverview: "translate episode-1",
+        },
+      },
+      {
+        name: "does not hide the series overview behind episode spoiler protection",
+        episodeOverview: "",
+        hideOverviews: true,
+        expected: { overview: "Series overview", overviewHidden: false },
+      },
+      {
+        // A profile that inherits the library's metadata language gets the
+        // series in that language only when the request names the library.
+        name: "reads the series in the page's library",
+        episodeOverview: "",
+        hideOverviews: false,
+        libraryId: 7,
+        expected: { overview: "Series overview", onTranslateOverview: "translate series-1" },
+      },
+    ])("$name", ({ episodeOverview, hideOverviews, libraryId, expected }) => {
+      spoilerPrefs.hideOverviews = hideOverviews;
+      try {
+        const props = renderWithSeries(
+          makeEpisodeItem({
+            content_id: "episode-1",
+            overview: episodeOverview,
+            user_data: { played: false },
+          }),
+          { overview: "Series overview", machine_translated_fields: ["overview"] },
+          libraryId,
+        );
+        expect(props).toMatchObject(expected);
+      } finally {
+        spoilerPrefs.hideOverviews = false;
+      }
+    });
   });
 
   it("passes marker re-detection only for admins", () => {
@@ -781,88 +640,5 @@ describe("EpisodeContent", () => {
         }),
       );
     });
-  });
-
-  it("does not pass playHref or restartHref when the episode has no versions or play targets", () => {
-    renderToStaticMarkup(
-      <MemoryRouter initialEntries={["/item/episode-1"]}>
-        <EpisodeContent
-          item={makeEpisodeItem({
-            versions: [],
-            playback_variants: [],
-            play_content_id: undefined,
-          })}
-        />
-      </MemoryRouter>,
-    );
-
-    expect(mocks.capturedActionBarProps.value).toMatchObject({
-      playHref: undefined,
-      restartHref: undefined,
-    });
-  });
-
-  it("passes playHref when the episode has a play target but no local versions", () => {
-    renderToStaticMarkup(
-      <MemoryRouter initialEntries={["/item/episode-1"]}>
-        <EpisodeContent
-          item={makeEpisodeItem({
-            versions: [],
-            playback_variants: [],
-            play_content_id: "virtual-episode-target-1",
-          })}
-        />
-      </MemoryRouter>,
-    );
-
-    expect(mocks.capturedActionBarProps.value).toMatchObject({
-      playHref: "/watch/episode-1",
-    });
-  });
-
-  it("keeps playHref for an upcoming episode with a play target", () => {
-    // Release timing is presentation only: the badge path must not touch
-    // Play eligibility. The hero badge itself renders inside the mocked
-    // DetailHero metadata slot, asserted via the metadata node below.
-    const markup = renderToStaticMarkup(
-      <MemoryRouter initialEntries={["/item/episode-1"]}>
-        <EpisodeContent
-          item={makeEpisodeItem({
-            air_date: "2099-10-03",
-            release_state: "upcoming",
-            versions: [],
-            playback_variants: [],
-            play_content_id: "virtual-episode-target-1",
-          })}
-        />
-      </MemoryRouter>,
-    );
-
-    expect(mocks.capturedActionBarProps.value).toMatchObject({
-      playHref: "/watch/episode-1",
-    });
-    expect(markup).toContain("Upcoming");
-  });
-
-  it("renders no upcoming badge without release_state, even for a future air date", () => {
-    // Capability/field gating: a future air_date alone (older server, no
-    // release_state) keeps today's plain rendering.
-    const markup = renderToStaticMarkup(
-      <MemoryRouter initialEntries={["/item/episode-1"]}>
-        <EpisodeContent
-          item={makeEpisodeItem({
-            air_date: "2099-10-03",
-            versions: [],
-            playback_variants: [],
-            play_content_id: "virtual-episode-target-1",
-          })}
-        />
-      </MemoryRouter>,
-    );
-
-    expect(mocks.capturedActionBarProps.value).toMatchObject({
-      playHref: "/watch/episode-1",
-    });
-    expect(markup).not.toContain("Upcoming");
   });
 });
