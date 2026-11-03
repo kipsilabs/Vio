@@ -163,9 +163,10 @@ type AudioReconcileLedgerV3 struct {
 type AudioReconcileDecisionV3 string
 
 const (
-	AudioReconcileReplanned AudioReconcileDecisionV3 = "replanned"
-	AudioReconcileNoop      AudioReconcileDecisionV3 = "noop"
-	AudioReconcileRefused   AudioReconcileDecisionV3 = "refused"
+	AudioReconcileReplanned   AudioReconcileDecisionV3 = "replanned"
+	AudioReconcileNoop        AudioReconcileDecisionV3 = "noop"
+	AudioReconcileRefused     AudioReconcileDecisionV3 = "refused"
+	AudioReconcileInvalidated AudioReconcileDecisionV3 = "invalidated"
 )
 
 type AudioReconcileEntryV3 struct {
@@ -173,6 +174,8 @@ type AudioReconcileEntryV3 struct {
 	SessionID     string                   `json:"session_id,omitempty"`
 	Decision      AudioReconcileDecisionV3 `json:"decision"`
 	AudioIndex    *int                     `json:"audio_index,omitempty"`
+	PlanID        string                   `json:"plan_id,omitempty"`
+	Reason        string                   `json:"reason,omitempty"`
 	Request       *ReplanRequestV3         `json:"request,omitempty"`
 	RequestDigest string                   `json:"request_digest,omitempty"`
 	AnnouncedAt   *time.Time               `json:"announced_at,omitempty"`
