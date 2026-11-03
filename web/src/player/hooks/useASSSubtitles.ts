@@ -49,6 +49,14 @@ const ASS_WINDOW_LEAD_SECONDS = 20;
 // end. The replacement window restarts `ASS_WINDOW_LEAD_SECONDS` behind the
 // playhead, so it overlaps the outgoing window and the swap drops no cues.
 const ASS_WINDOW_PREFETCH_LEAD_SECONDS = 60;
+// A forward seek whose computed window start is within this many seconds of
+// the attempt already in flight is covered by that request and must not
+// restart it. The paired seeking/seeked events (and a playhead that advances
+// during the same seek) can otherwise shift the start by a second and abort a
+// multi-second extraction that already covers the new position. A backward
+// shift is deliberately excluded: the in-flight window starts after it, so the
+// cues just behind the new playhead would be missing.
+const ASS_WINDOW_REANCHOR_HYSTERESIS_SECONDS = 2;
 // A windowed extraction is seconds of work, not a whole-track 100s: allow this
 // long without a chunk before abandoning the attempt. Covers a cold ffmpeg
 // start plus a slow-but-progressing extraction.
@@ -155,6 +163,12 @@ const ASS_FONT_REFRESH_MAX_ATTEMPTS = 12;
 const ASS_FONT_REFRESH_BACKOFF_MS = 5_000;
 const ASS_FONT_REFRESH_BACKOFF_FACTOR = 3;
 const ASS_FONT_REFRESH_MAX_BACKOFF_MS = 30_000;
+// Bounded window-commit re-arms after the base poll budget is spent. The
+// server's dump ceiling is four minutes, so one window advance is enough to
+// adopt a bundle that landed just after the budget. Never re-arm forever: a
+// source whose extraction keeps timing out would otherwise poll for the life
+// of the track.
+const ASS_FONT_REFRESH_MAX_WINDOW_REARMS = 1;
 
 /** `url` with the bounded window query the VTT path also uses. */
 function appendSubtitleWindow(url: string, position: number): string {
@@ -498,6 +512,7 @@ export function useASSSubtitles(
     } | null = null;
     let fontBundlePending = false;
     let fontRefreshAttempts = 0;
+    let fontRefreshWindowRearms = 0;
     let fontRefreshBackoffMs = ASS_FONT_REFRESH_BACKOFF_MS;
     let fontRefreshTimer: ReturnType<typeof setTimeout> | null = null;
     let fontRefreshController: AbortController | null = null;
@@ -603,20 +618,33 @@ export function useASSSubtitles(
     }
 
     /**
-     * Re-arms the pending-font refresh at every committed window. The server
-     * may still be streaming the bundle when the refresh budget runs out (its
-     * dump ceiling is four minutes), and a window advance is a natural,
-     * bounded re-check point: one extra poll at the capped interval keeps a
-     * landed bundle adoptable without leaving a permanent poll loop. Fonts
-     * remain track-level, so the newly committed window reuses whatever the
-     * adopted state holds.
+     * Re-arms the pending-font refresh after a committed window, a bounded
+     * number of times. The server may still be streaming the bundle when the
+     * refresh budget runs out (its dump ceiling is four minutes), and a window
+     * advance is a natural re-check point: one extra poll at the capped
+     * interval keeps a landed bundle adoptable. After that the bundle is
+     * treated as unavailable for the rest of the mount instead of polling
+     * forever. Fonts remain track-level, so the newly committed window reuses
+     * whatever the adopted state holds.
      */
     function rearmFontRefreshAfterWindowCommit() {
       if (cancelled || !fontBundlePending || !activeFontBundleUrl) return;
+      // Not yet through the base budget: this window is just a normal
+      // scheduling point, not one of the bounded re-arms.
       if (fontRefreshAttempts < ASS_FONT_REFRESH_MAX_ATTEMPTS) {
         scheduleFontRefresh();
         return;
       }
+      if (fontRefreshWindowRearms >= ASS_FONT_REFRESH_MAX_WINDOW_REARMS) {
+        // The base budget and the bounded window re-check both elapsed while
+        // the server still reported an in-flight bundle. Stop treating it as
+        // pending so every later window does not mint another poll against a
+        // source that is not producing fonts; the track keeps its fallback
+        // fonts, and a new mount resolves from scratch.
+        fontBundlePending = false;
+        return;
+      }
+      fontRefreshWindowRearms += 1;
       // Budget already spent: allow exactly one more poll for this window.
       fontRefreshAttempts = ASS_FONT_REFRESH_MAX_ATTEMPTS - 1;
       fontRefreshBackoffMs = ASS_FONT_REFRESH_MAX_BACKOFF_MS;
@@ -1007,8 +1035,17 @@ export function useASSSubtitles(
           // `seeking` and `seeked` both fire for one seek. When the
           // replacement for this position is already pending or already
           // extracting, one event is enough: aborting and restarting the same
-          // target twice would throw away a request that is about to land.
-          if (target === pendingStart || target === attemptStart) return;
+          // target twice would throw away a request that is about to land. The
+          // playhead can move a fraction of a second between the paired events,
+          // so compare inside a small hysteresis rather than for equality.
+          const currentTarget = pendingStart ?? attemptStart;
+          if (
+            currentTarget !== null &&
+            target >= currentTarget &&
+            target - currentTarget <= ASS_WINDOW_REANCHOR_HYSTERESIS_SECONDS
+          ) {
+            return;
+          }
           supersededBySeek = true;
           windowFailures = 0;
           usingWholeTrack = false;

@@ -1132,6 +1132,62 @@ describe("useASSSubtitles artifact-aware whole-track upgrade", () => {
     }
   });
 
+  it("does not re-anchor a near-identical seek while the replacement window is in flight", async () => {
+    vi.useFakeTimers();
+    const requested: string[] = [];
+    let windowFetches = 0;
+    let seekFetch: ReturnType<typeof deferredResponse> | null = null;
+    vi.mocked(fetch).mockImplementation((input, init) => {
+      const url = String(input);
+      requested.push(url);
+      if (url === germanTrack.url) return Promise.resolve(mockFetchResponse(wholeScript));
+      windowFetches += 1;
+      if (windowFetches === 1) return Promise.resolve(mockWindowedResponse(windowScript));
+      seekFetch = deferredResponse(init);
+      return seekFetch.promise;
+    });
+    const videoRef = makeVideoRef(1);
+    const { unmount } = renderHook(() => useASSSubtitles(videoRef, [germanTrack], 6, false, 0, 0));
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(requested).toHaveLength(1);
+
+      // Seek outside the committed [0,120] window: the replacement starts the
+      // usual 20 s behind the playhead and is left pending.
+      videoRef.current!.currentTime = 200;
+      videoRef.current!.dispatchEvent(new Event("seeking"));
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(requested).toHaveLength(2);
+      expect(requested[1]).toContain("position=180&duration=120");
+      expect(seekFetch).not.toBeNull();
+
+      // The playhead moves a fraction of a second during the same gesture, so
+      // the paired seeked event computes 180.6. Restarting the extraction for
+      // a near-identical window would throw away seconds of demux.
+      videoRef.current!.currentTime = 200.6;
+      videoRef.current!.dispatchEvent(new Event("seeked"));
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(requested).toHaveLength(2);
+      expect(seekFetch!.aborted).toBe(false);
+
+      // The retained request still commits and owns the pipeline.
+      await act(async () => {
+        seekFetch!.settle(windowScript);
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(requested).toHaveLength(2);
+    } finally {
+      unmount();
+      vi.useRealTimers();
+    }
+  });
+
   it("keeps windowing a non-abutting still-windowed probe answer at the rate limit", async () => {
     vi.useFakeTimers();
     const requested: string[] = [];
@@ -2246,6 +2302,72 @@ describe("useASSSubtitles pending font bundles", () => {
       expect(instances[instances.length - 1]!.renderer.addFonts).toHaveBeenCalledWith([
         expect.any(Uint8Array),
       ]);
+    } finally {
+      unmount();
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops polling fonts after the bounded window re-arm stays pending", async () => {
+    vi.useFakeTimers();
+    const track = { ...attachedFontTrack, font_bundle_url: "/fonts/pending-rearm-cap" };
+    let fontCalls = 0;
+    vi.mocked(fetch).mockImplementation((input) => {
+      const url = String(input);
+      if (url === track.font_bundle_url) {
+        fontCalls += 1;
+        return Promise.resolve(pendingFontBundleResponse());
+      }
+      return Promise.resolve(
+        mockWindowedResponse(
+          "[Events]\nDialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,Hello",
+          "",
+        ),
+      );
+    });
+    const videoRef = makeVideoRef(1);
+    const { unmount } = renderHook(() =>
+      useASSSubtitles(videoRef, [track], track.index, false, 0, 0),
+    );
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(fontCalls).toBe(1);
+
+      // Spend the base budget, then let the first window advance arm its one
+      // allowed re-check. Both stay pending.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5_000);
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(15_000);
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(300_000);
+      });
+      expect(fontCalls).toBe(13);
+      await act(async () => {
+        videoRef.current!.currentTime = 65;
+        videoRef.current!.dispatchEvent(new Event("timeupdate"));
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000);
+      });
+      expect(fontCalls).toBe(14);
+
+      // The next window advance is past the one allowed re-arm: the client
+      // gives up on the bundle instead of polling for the rest of the track.
+      await act(async () => {
+        videoRef.current!.currentTime = 200;
+        videoRef.current!.dispatchEvent(new Event("timeupdate"));
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(120_000);
+      });
+      expect(fontCalls).toBe(14);
     } finally {
       unmount();
       vi.useRealTimers();
