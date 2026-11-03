@@ -243,6 +243,9 @@ func ResolveSource(source SourceMetadata) SourceResolution {
 	case DynamicRangeHDR10, DynamicRangeHDR10Plus:
 		candidate = SourcePQ
 	case DynamicRangeHLG:
+		if rangeIsFull(normalizeColorValue(source.ColorRange)) {
+			preflight = true
+		}
 		// Cameras also record HLG with BT.709 primaries. Declaring those as
 		// BT.2020 oversaturates the conversion, and their decoded frames fail
 		// the source preflight. SourceHLGBT709 declares a BT.709 matrix too,
@@ -295,6 +298,12 @@ func ResolveSource(source SourceMetadata) SourceResolution {
 	}
 	if candidate == "" {
 		return SourceResolution{}
+	}
+	// Full-range PQ graphs preserve the decoded range and therefore require
+	// explicit frame validation before execution.
+	if candidate == SourcePQ && rangeIsFull(normalizeColorValue(source.ColorRange)) {
+		candidate = SourcePQFullRange
+		preflight = true
 	}
 	complete, compatible := sourceMetadataCompatibility(candidate, source)
 	if !compatible || !complete {
@@ -421,7 +430,7 @@ func colorValueMatchesTransfer(kind SourceKind, value string) bool {
 		return true
 	}
 	switch kind {
-	case SourcePQ:
+	case SourcePQ, SourcePQFullRange:
 		return transferIsPQ(value)
 	case SourceHLG, SourceHLGBT709:
 		return transferIsHLG(value)
@@ -471,6 +480,11 @@ func colorIsBT709(value string) bool {
 // colorIsBT2020 reports whether a normalized color field names BT.2020.
 func colorIsBT2020(value string) bool {
 	return strings.Contains(value, colorBT2020)
+}
+
+// rangeIsFull recognizes FFmpeg's names for full-range video levels.
+func rangeIsFull(value string) bool {
+	return value == "pc" || value == "full" || value == "jpeg"
 }
 
 // rangeIsLimited recognizes FFmpeg's names for limited-range video levels.
@@ -566,6 +580,11 @@ func FilterAppliesDolbyVision(filter string) bool {
 
 // dolbyVisionOption makes RPU application explicit on SourceDolbyVision
 // graphs instead of relying on the filters' default.
+// FilterConvertsFullRange reports whether a probed tone-map filter reads each frame's range.
+func FilterConvertsFullRange(filter string) bool {
+	return filter == SoftwareFilterBT2390 || filter == SoftwareFilterHable
+}
+
 func dolbyVisionOption(kind SourceKind) string {
 	if kind == SourceDolbyVision {
 		return ":apply_dovi=1"
@@ -650,6 +669,9 @@ func (c Capabilities) PreferredMode(policy Policy, kind SourceKind) Mode {
 // BT.2020 signal its RPU reshapes to; the RPU, not these tags, drives the
 // conversion.
 func SourceParameters(kind SourceKind) string {
+	if kind == SourcePQFullRange {
+		return "setparams=color_primaries=" + SourcePrimaries(kind) + ":color_trc=" + SourceTransfer(kind) + ":colorspace=" + SourceMatrix(kind)
+	}
 	return "setparams=range=tv:color_primaries=" + SourcePrimaries(kind) + ":color_trc=" + SourceTransfer(kind) + ":colorspace=" + SourceMatrix(kind)
 }
 

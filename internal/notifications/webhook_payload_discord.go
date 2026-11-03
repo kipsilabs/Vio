@@ -193,7 +193,7 @@ func buildDiscordDigestEntry(row DeliveryRow, test bool) discordDigestEntry {
 			embed.Timestamp = row.CreatedAt.UTC().Format(time.RFC3339)
 		}
 		enforceDiscordTotalLimit(&embed)
-		return embed
+		return discordDigestEntry{embed: embed}
 	}
 
 	// Titles assembled from catalog metadata virtually never approach the

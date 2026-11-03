@@ -404,7 +404,7 @@ func TestSubtitleSpanOriginIsObservedOncePerGeneration(t *testing.T) {
 	results := make(chan float64, 8)
 	for range 8 {
 		go func() {
-			window := session.subtitleSegmentWindow(t.Context(), opts.subtitleCueFile, 12)
+			window := session.subtitleSegmentWindow(t.Context(), opts.subtitleCueFile, 12, renditionSegmentDuration(opts))
 			results <- window.origin + window.offset
 		}()
 	}
@@ -424,7 +424,7 @@ func TestSubtitleSpanOriginBacksOffAfterAFailure(t *testing.T) {
 	session := subtitleOriginTestSession(t, ffmpegPath, 0)
 	opts := session.Opts()
 	for range 3 {
-		if got := session.subtitleSegmentWindow(t.Context(), opts.subtitleCueFile, 3); got.observed || got.offset != 6 {
+		if got := session.subtitleSegmentWindow(t.Context(), opts.subtitleCueFile, 3, renditionSegmentDuration(opts)); got.observed || got.offset != 6 {
 			t.Fatalf("unobserved origin must fall back to the fixed grid: %v", got)
 		}
 	}
@@ -440,7 +440,7 @@ func TestSubtitleSpanOriginDiscardsAnObservationARestartOverlapped(t *testing.T)
 
 	done := make(chan float64, 1)
 	go func() {
-		window := session.subtitleSegmentWindow(t.Context(), opts.subtitleCueFile, 12)
+		window := session.subtitleSegmentWindow(t.Context(), opts.subtitleCueFile, 12, renditionSegmentDuration(opts))
 		done <- window.origin + window.offset
 	}()
 	// Opening the FIFO waits for the fake ffprobe to start.
@@ -478,7 +478,7 @@ func TestSubtitleSpanOriginObservesAnEarlierGenerationItsSuccessorKept(t *testin
 	writeSubtitleRenditionPlaylist(t, session.outputDir, 10, 14)
 	restartSubtitleGeneration(session, opts, 900)
 
-	if got := session.subtitleSegmentWindow(t.Context(), opts.subtitleCueFile, 12); got.origin+got.offset != 21 {
+	if got := session.subtitleSegmentWindow(t.Context(), opts.subtitleCueFile, 12, renditionSegmentDuration(opts)); got.origin+got.offset != 21 {
 		t.Fatalf("earlier generation's window = %+v, want a start at 21", got)
 	}
 	if runs := fakeSubtitleFFprobeRuns(t, fake); runs != 1 {
@@ -523,7 +523,7 @@ func TestRebuiltSessionKeepsAnObservedOrigin(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	observed := session.subtitleSegmentWindow(t.Context(), opts.subtitleCueFile, 52)
+	observed := session.subtitleSegmentWindow(t.Context(), opts.subtitleCueFile, 52, renditionSegmentDuration(opts))
 	if !observed.observed {
 		t.Fatalf("origin not observed: %+v", observed)
 	}
@@ -542,7 +542,7 @@ func TestRebuiltSessionKeepsAnObservedOrigin(t *testing.T) {
 
 	spans, _ := loadSubtitleSpans(opts, nil)
 	rebuilt := &TranscodeSession{outputDir: session.outputDir, opts: opts, running: true, subtitleSpans: spans}
-	got := rebuilt.subtitleSegmentWindow(t.Context(), opts.subtitleCueFile, 80)
+	got := rebuilt.subtitleSegmentWindow(t.Context(), opts.subtitleCueFile, 80, renditionSegmentDuration(opts))
 	if want := (subtitleCueWindow{origin: observed.origin, offset: 60, duration: 2, observed: true, open: true}); got != want {
 		t.Fatalf("rebuilt window = %+v, want %+v", got, want)
 	}

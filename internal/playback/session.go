@@ -294,6 +294,7 @@ type Session struct {
 	StartedAt                  time.Time
 	UpdatedAt                  time.Time
 	LastActivityAt             time.Time
+	PlanCommittedAt            time.Time
 	activeTransportCount       int
 	replacementPlayMethod      PlayMethod
 	streamRevision             uint64
@@ -3500,12 +3501,12 @@ func (m *SessionManager) CleanStale() []*Session {
 // provided grace period. Sessions with an active media transport request are
 // preserved even if they have not emitted a recent heartbeat yet.
 func (m *SessionManager) CleanInactive(activeIdle, pausedIdle time.Duration) []*Session {
-	m.refreshDeliveryActivity(activeIdle, pausedIdle)
-	protected := m.refreshCompatActivity(activeIdle, pausedIdle)
+	m.refreshDeliveryActivity(activeIdle, pausedIdle, 0)
+	protected := m.refreshCompatActivity(activeIdle, pausedIdle, 0)
 	m.mu.Lock()
 
 	now := time.Now()
-	claimed := m.claimCompatExpiryLocked(now, activeIdle, pausedIdle, protected)
+	claimed := m.claimCompatExpiryLocked(now, activeIdle, pausedIdle, 0, protected)
 	var expired []*Session
 	for id, s := range m.sessions {
 		if protected[s] || s.IsJellyfinCompat && claimed != nil && !claimed[id] {

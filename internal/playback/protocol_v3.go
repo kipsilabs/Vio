@@ -972,6 +972,7 @@ const (
 	RouteEventPlanInvalidatedV3            = "plan_invalidated"
 	RouteEventPlanFailedV3                 = "plan_failed"
 	RouteEventFirstFrameV3                 = "first_frame"
+	RouteEventPlanSummaryV3                = "plan_summary"
 	RouteEventTerminalV3                   = "terminal"
 	RouteEventStoppedV3                    = "stopped"
 	RouteEventRuntimeCorrectionAppliedV3   = "runtime_correction_applied"
@@ -986,6 +987,7 @@ var routeEventNamesV3 = []string{
 	RouteEventPlanInvalidatedV3,
 	RouteEventPlanFailedV3,
 	RouteEventFirstFrameV3,
+	RouteEventPlanSummaryV3,
 	RouteEventTerminalV3,
 	RouteEventStoppedV3,
 	RouteEventRuntimeCorrectionAppliedV3,
