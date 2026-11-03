@@ -3623,7 +3623,7 @@ func audioTrackLanguageDisplayName(track models.AudioTrack) string {
 		names = append(names, name)
 	}
 	if len(names) == 0 {
-		return ""
+		return compatLanguageName(track.Language)
 	}
 	return strings.Join(names, "/")
 }

@@ -82,6 +82,12 @@ func SubtitleRenditionCodecSupported(codec string) bool {
 // carry a subtitle rendition: an encoded (not copied) video whose playlist is
 // the synthetic fixed-grid VOD playlist the subtitle segments align to.
 func SubtitleRenditionExecutable(targetVideoCodec string, totalDuration float64, segmentDuration int) bool {
+	// A copied video stream cannot provide the fixed-grid segment boundaries
+	// that the cue rendition is aligned to. Keep this gate identical to the
+	// executor's encoded-video requirement.
+	if strings.EqualFold(strings.TrimSpace(targetVideoCodec), "copy") || strings.TrimSpace(targetVideoCodec) == "" {
+		return false
+	}
 	if segmentDuration <= 0 {
 		segmentDuration = defaultSegmentDuration
 	}
