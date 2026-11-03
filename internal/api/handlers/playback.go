@@ -3704,57 +3704,62 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 						} else if transcodeSession.MatchesGenerationToken(requestedGeneration) {
 							continuationSuccessorToken = requestedGeneration
 						} else {
-							_ = segmentLease.Close(); segmentLease = nil; err = playback.ErrStaleSegmentGeneration
+							_ = segmentLease.Close()
+							segmentLease = nil
+							err = playback.ErrStaleSegmentGeneration
 						}
 					}
-					if err == nil { continuationServe = true }
+					if err == nil {
+						continuationServe = true
+					}
 				} else {
-				target, ok, restartErr := h.tm.RestartSegmentLocked(
-					r.Context(),
-					sessionID,
-					transcodeSession,
-					segNum,
-				)
-				// A restart skipped because the request ended is not a failure.
-				if restartErr != nil && !errors.Is(restartErr, playback.ErrManifestNotReady) && !errors.Is(restartErr, r.Context().Err()) {
-					slog.ErrorContext(r.Context(), "restart transcode at missing segment", "component", "api", "error", restartErr, "segment", segmentName, "session", sessionID, "playback_session_id", sessionID)
-				}
-
-				// Copy-mode with an unresolved seek target (ok=false, no error)
-				// means the manifest can't place this segment yet. Don't restart
-				// at a fabricated position; surface ErrSegmentNotFound so the
-				// client retries while the session keeps producing manifest.
-				// Mirrors the transcode-node guard in
-				// internal/transcodenode/server.go.
-				if !ok && restartErr == nil && transcodeSession.IsCopyVideo() {
-					err = playback.ErrSegmentNotFound
-				}
-
-				if restartErr != nil {
-					err = restartErr
-				} else if ok {
-					slog.InfoContext(r.Context(), "transcode seek restart", "component", "api",
-						"segment", segmentName,
-						"requested_segment", segNum,
-						"produced_head", decision.Progress.ProducedHead,
-						"start_segment_number", decision.Progress.StartSegmentNumber,
-						"reason", decision.Reason,
-						"stalled", segmentStalled,
-						"session", sessionID,
-						"playback_session_id", sessionID,
+					target, ok, restartErr := h.tm.RestartSegmentLocked(
+						r.Context(),
+						sessionID,
+						transcodeSession,
+						segNum,
 					)
-					// Throttler + exit monitor re-arm via the session's
-					// restart hook.
-					segmentLease, err = transcodeSession.WaitForOpenSegmentContext(r.Context(), segmentName, 30*time.Second)
-					if err == nil && strings.EqualFold(transcodeSession.Opts().TargetCodecVideo, "copy") {
-						// Copy-mode seeks can resume as soon as the target segment
-						// exists, but that sometimes leaves the player one segment
-						// away from stalling while FFmpeg catches up. Briefly wait
-						// for a single lookahead fragment when available so the
-						// first resumed playback window is less brittle.
-						nextSegmentName := fmt.Sprintf("seg_%05d%s", segNum+1, filepath.Ext(segmentName))
-						if nextSegment, nextErr := transcodeSession.WaitForOpenSegmentContext(r.Context(), nextSegmentName, 1200*time.Millisecond); nextErr == nil {
-							_ = nextSegment.Close()
+					// A restart skipped because the request ended is not a failure.
+					if restartErr != nil && !errors.Is(restartErr, playback.ErrManifestNotReady) && !errors.Is(restartErr, r.Context().Err()) {
+						slog.ErrorContext(r.Context(), "restart transcode at missing segment", "component", "api", "error", restartErr, "segment", segmentName, "session", sessionID, "playback_session_id", sessionID)
+					}
+
+					// Copy-mode with an unresolved seek target (ok=false, no error)
+					// means the manifest can't place this segment yet. Don't restart
+					// at a fabricated position; surface ErrSegmentNotFound so the
+					// client retries while the session keeps producing manifest.
+					// Mirrors the transcode-node guard in
+					// internal/transcodenode/server.go.
+					if !ok && restartErr == nil && transcodeSession.IsCopyVideo() {
+						err = playback.ErrSegmentNotFound
+					}
+
+					if restartErr != nil {
+						err = restartErr
+					} else if ok {
+						slog.InfoContext(r.Context(), "transcode seek restart", "component", "api",
+							"segment", segmentName,
+							"requested_segment", segNum,
+							"produced_head", decision.Progress.ProducedHead,
+							"start_segment_number", decision.Progress.StartSegmentNumber,
+							"reason", decision.Reason,
+							"stalled", segmentStalled,
+							"session", sessionID,
+							"playback_session_id", sessionID,
+						)
+						// Throttler + exit monitor re-arm via the session's
+						// restart hook.
+						segmentLease, err = transcodeSession.WaitForOpenSegmentContext(r.Context(), segmentName, 30*time.Second)
+						if err == nil && strings.EqualFold(transcodeSession.Opts().TargetCodecVideo, "copy") {
+							// Copy-mode seeks can resume as soon as the target segment
+							// exists, but that sometimes leaves the player one segment
+							// away from stalling while FFmpeg catches up. Briefly wait
+							// for a single lookahead fragment when available so the
+							// first resumed playback window is less brittle.
+							nextSegmentName := fmt.Sprintf("seg_%05d%s", segNum+1, filepath.Ext(segmentName))
+							if nextSegment, nextErr := transcodeSession.WaitForOpenSegmentContext(r.Context(), nextSegmentName, 1200*time.Millisecond); nextErr == nil {
+								_ = nextSegment.Close()
+							}
 						}
 					}
 				}
