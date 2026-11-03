@@ -406,19 +406,20 @@ type VirtualEpisodeFileLookup func(ctx context.Context, episodeID string) (*mode
 type PlaybackHandler struct {
 	Connections *connectionstore.Store
 	// SourceBitrates sets the connection speed test's target; nil sends none.
-	SourceBitrates         SourceBitratePercentiler
-	probeTargets           probeTargetCache
-	sessionMgr             SessionManagerInterface
-	fileResolver           FilePathResolver            // optional; enables stream_url in responses
-	StoreProvider          userstore.UserStoreProvider // optional; enables progress/history persistence
-	DeviceSightings        *DeviceSightings            // optional; registers the device that starts playback
-	WatchScrobbler         PlaybackWatchScrobbler
-	StableIdentityResolver *watchstate.StableIdentityResolver
-	CompletionObserver     watchstate.CompletionObserver // optional; auto-removes watched items from the watchlist
-	signalsNotifier        SignalsChangedNotifier
-	AdminStore             PlaybackAdminStore    // optional; enables admin playback history/live session cleanup
-	SessionSyncer          PlaybackSessionSyncer // optional; enables immediate session sync to shared admin view
-	EventsHub              *evt.Hub
+	SourceBitrates          SourceBitratePercentiler
+	probeTargets            probeTargetCache
+	sessionMgr              SessionManagerInterface
+	fileResolver            FilePathResolver // optional; enables stream_url in responses
+	VirtualPlaybackResolver VirtualPlaybackResolver
+	StoreProvider           userstore.UserStoreProvider // optional; enables progress/history persistence
+	DeviceSightings         *DeviceSightings            // optional; registers the device that starts playback
+	WatchScrobbler          PlaybackWatchScrobbler
+	StableIdentityResolver  *watchstate.StableIdentityResolver
+	CompletionObserver      watchstate.CompletionObserver // optional; auto-removes watched items from the watchlist
+	signalsNotifier         SignalsChangedNotifier
+	AdminStore              PlaybackAdminStore    // optional; enables admin playback history/live session cleanup
+	SessionSyncer           PlaybackSessionSyncer // optional; enables immediate session sync to shared admin view
+	EventsHub               *evt.Hub
 	// LifecycleEncoder and LifecycleViews render and read the session.*
 	// events on the admin sessions channel; without both, no lifecycle
 	// transition is announced.
