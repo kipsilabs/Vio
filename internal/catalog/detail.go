@@ -31,6 +31,22 @@ import (
 	"github.com/Silo-Server/silo-server/internal/userstore"
 )
 
+const (
+	EpisodeReleaseUpcoming = "upcoming"
+	EpisodeReleaseReleased = "released"
+)
+
+func ReleaseStateForAirDate(airDate string) string {
+	day, err := time.Parse("2006-01-02", strings.TrimSpace(airDate))
+	if err != nil {
+		return ""
+	}
+	if day.After(time.Now().UTC().Truncate(24 * time.Hour)) {
+		return EpisodeReleaseUpcoming
+	}
+	return EpisodeReleaseReleased
+}
+
 type VirtualCandidateScore struct {
 	ProviderOrder  *int
 	Score          int
@@ -570,6 +586,7 @@ type PersonCredit struct {
 
 // FileVersion represents a single file version available for playback.
 type FileVersion struct {
+	providerOrder            *int
 	Failed                   bool                   `json:"failed,omitempty"`
 	Available                *bool                  `json:"available,omitempty"`
 	FormatScore              *int                   `json:"format_score,omitempty"`
@@ -927,6 +944,10 @@ func IsWatchTargetNotPlayable(err error) bool {
 }
 
 // DetailService builds full item detail responses with presigned URLs.
+var virtualScoreTimeout = 1500 * time.Millisecond
+
+const virtualScoreConcurrency = 8
+
 type DetailService struct {
 	itemRepo       *ItemRepository
 	episodeRepo    *EpisodeRepository
@@ -956,7 +977,10 @@ type DetailService struct {
 	trickplay             TrickplayAvailability
 	virtualRankingSource  VirtualRankingSource
 	virtualScoreSource    VirtualCandidateScoreSource
+	virtualScoreSem       chan struct{}
+	virtualScoreSemOnce   sync.Once
 	versionSourceMismatch VersionSourceMismatchSource
+	watchRefreshWG        sync.WaitGroup
 
 	// resolver is built once on first use; see settingsResolver.
 	resolverOnce sync.Once
@@ -988,16 +1012,41 @@ func NewDetailService(
 }
 
 func (s *DetailService) attachVirtualCandidateScores(ctx context.Context, contentID string, versions []FileVersion, files []*models.MediaFile) {
-	if s.virtualScoreSource == nil {
+	if s.virtualScoreSource == nil || len(versions) == 0 {
 		return
 	}
-	for id, score := range s.virtualScoreSource(ctx, contentID, files) {
-		for i := range versions {
-			if versions[i].FileID == id {
-				versions[i].FormatScore = &score.Score
-				versions[i].MatchedFormats = score.MatchedFormats
-			}
+	applyVirtualCandidateScores(versions, s.scoreVirtualCandidates(ctx, contentID, files))
+}
+func applyVirtualCandidateScores(versions []FileVersion, scores map[int]VirtualCandidateScore) {
+	for i := range versions {
+		if score, ok := scores[versions[i].FileID]; ok && score.Score != 0 {
+			v := score.Score
+			versions[i].FormatScore = &v
+			versions[i].MatchedFormats = score.MatchedFormats
 		}
+	}
+}
+func (s *DetailService) scoreVirtualCandidates(ctx context.Context, contentID string, files []*models.MediaFile) map[int]VirtualCandidateScore {
+	ctx, cancel := context.WithTimeout(ctx, virtualScoreTimeout)
+	defer cancel()
+	s.virtualScoreSemOnce.Do(func() { s.virtualScoreSem = make(chan struct{}, virtualScoreConcurrency) })
+	select {
+	case s.virtualScoreSem <- struct{}{}:
+	case <-ctx.Done():
+		return nil
+	}
+	done := make(chan map[int]VirtualCandidateScore, 1)
+	go func() {
+		defer func() { <-s.virtualScoreSem }()
+		defer func() { recover() }()
+		done <- s.virtualScoreSource(ctx, contentID, files)
+	}()
+	select {
+	case v := <-done:
+		<-s.virtualScoreSem
+		return v
+	case <-ctx.Done():
+		return nil
 	}
 }
 
@@ -1013,10 +1062,8 @@ func (s *DetailService) attachVirtualRanking(ctx context.Context, contentID stri
 	for _, f := range files {
 		if r, ok := rows[f.ID]; ok {
 			detail.VirtualRanking = &r
-			for i := range detail.Versions {
-				if detail.Versions[i].FileID == f.ID {
-					break
-				}
+			for i := range detail.PlaybackVariants {
+				detail.PlaybackVariants[i].VirtualRanking = &r
 			}
 			return
 		}
