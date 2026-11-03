@@ -373,6 +373,8 @@ type itemListResponse struct {
 	PosterThumbhash   string                      `json:"poster_thumbhash,omitempty"`
 	BackdropURL       string                      `json:"backdrop_url,omitempty"`
 	BackdropThumbhash string                      `json:"backdrop_thumbhash,omitempty"`
+	LogoURL           string                      `json:"-"`
+	ParentArtwork     EpisodeParentArtworkView    `json:"-"`
 	ReleaseDate       *string                     `json:"release_date,omitempty"`
 	LastAirDate       *string                     `json:"last_air_date,omitempty"`
 	AddedAt           *time.Time                  `json:"added_at,omitempty"`
@@ -384,6 +386,8 @@ type itemListResponse struct {
 	WorkID            string                      `json:"work_id,omitempty"`
 	WorkTitle         string                      `json:"work_title,omitempty"`
 	WorkFormats       []catalog.WorkFormatSummary `json:"work_formats,omitempty"`
+	// BoxSet describes a box set card; v2 emits it under its own contract.
+	BoxSet *BoxSetView `json:"-"`
 }
 
 type sortMetricsResponse struct {
@@ -1037,6 +1041,10 @@ func playableTargetInputForItem(item *models.MediaItem) catalog.PlayableTargetIn
 
 func playableTargetKeyForItem(item *models.MediaItem) string {
 	return playableTargetInputForItem(item).Key()
+}
+
+func (h *ItemsHandler) resolvePlayableTargets(ctx context.Context, v ItemViewer, inputs []catalog.PlayableTargetInput, libraryIDs []int, filter catalog.AccessFilter) map[string]string {
+	return h.resolvePlayableTargetInputs(ctx, v, inputs, libraryIDs, filter)
 }
 
 func (h *ItemsHandler) resolvePlayableTargetInputs(ctx context.Context, v ItemViewer, inputs []catalog.PlayableTargetInput, libraryIDs []int, filter catalog.AccessFilter) map[string]string {
@@ -2737,4 +2745,43 @@ func (h *ItemsHandler) HandleDelete(w http.ResponseWriter, r *http.Request) {
 		"images_cleaned": len(images),
 		"message":        "Media item deleted successfully",
 	})
+}
+
+func localizedLogoPaths(ctx context.Context, svc *catalog.DetailService, items []*models.MediaItem, filter catalog.AccessFilter) map[string]string {
+	if svc != nil {
+		if localized, err := svc.LocalizeItemModels(ctx, items, filter); err == nil && len(localized) == len(items) {
+			items = localized
+		}
+	}
+	paths := make(map[string]string, len(items))
+	for _, item := range items {
+		if item != nil && item.LogoPath != "" {
+			paths[item.ContentID] = item.LogoPath
+		}
+	}
+	return paths
+}
+
+func signListingLogos(ctx context.Context, svc *catalog.DetailService, logoPaths map[string]string, size imagesize.Size) map[string]string {
+	urls := make(map[string]string, len(logoPaths))
+	if svc == nil || len(logoPaths) == 0 {
+		return urls
+	}
+	sized := make(map[string]string, len(logoPaths))
+	seen := make(map[string]struct{}, len(logoPaths))
+	for contentID, path := range logoPaths {
+		if path == "" || path == "-" {
+			continue
+		}
+		path = sizedLogoPath(path, size)
+		sized[contentID] = path
+		seen[path] = struct{}{}
+	}
+	resolved := svc.PresignURLsWithExpiry(ctx, slices.Sorted(maps.Keys(seen)), requestVariantHint("featured", size))
+	for contentID, path := range sized {
+		if url := resolved[path].URL; url != "" {
+			urls[contentID] = url
+		}
+	}
+	return urls
 }

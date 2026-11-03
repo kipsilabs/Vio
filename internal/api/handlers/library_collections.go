@@ -336,6 +336,10 @@ type reorderLibraryCollectionGroupsRequest struct {
 	OrderedIDs []string `json:"ordered_ids"`
 }
 
+type ArtworkRepairEnqueuer interface {
+	EnqueueArtworkRepair(context.Context, []string, int) (int, error)
+}
+
 type libraryCollectionsListResponse struct {
 	Collections []libraryCollectionResponse      `json:"collections"`
 	Groups      []libraryCollectionGroupResponse `json:"groups,omitempty"`
@@ -364,6 +368,7 @@ type createLibraryCollectionRequest struct {
 	ManagementSource  string          `json:"management_source"`
 	ManagementKey     string          `json:"management_key"`
 	SyncSchedule      string          `json:"sync_schedule"`
+	V1Rules           bool            `json:"-"`
 }
 
 type updateLibraryCollectionRequest struct {
@@ -388,6 +393,7 @@ type updateLibraryCollectionRequest struct {
 	ManagementSource  *string                `json:"management_source"`
 	ManagementKey     *string                `json:"management_key"`
 	SyncSchedule      *string                `json:"sync_schedule"`
+	V1Rules           bool                   `json:"-"`
 }
 
 type importMDBListRequest struct {
