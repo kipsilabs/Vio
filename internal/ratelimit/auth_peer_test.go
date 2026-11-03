@@ -16,7 +16,11 @@ func newAuthLimitMiddleware(t *testing.T) *Middleware {
 	t.Helper()
 	perKey := NewMemoryLimiter()
 	t.Cleanup(perKey.Close)
-	return NewMiddleware(perKey, NewMemoryLimiter(), nil, true)
+	mw := NewMiddleware(perKey, NewMemoryLimiter(), nil, true)
+	// This helper bypasses Init/Reload, so seed the runtime config explicitly.
+	// Production initialization loads DefaultConfig-backed settings before serving.
+	mw.cfg = DefaultConfig()
+	return mw
 }
 
 // authLimitBackends returns the limiters the auth budgets run on: in-memory
@@ -149,9 +153,9 @@ func TestAuthEndpointHandlerSpendsPeerBudgetOnlyForForwardedClients(t *testing.T
 		},
 		{
 			name:   "direct IPv6 connection",
-			peer:   "[2001:db8::10]:40000",
-			client: "2001:db8::10",
-			want:   []string{"ip:2001:db8::10", "authip:2001:db8::10:login"},
+			peer:   "[2606:4700::10]:40000",
+			client: "2606:4700::10",
+			want:   []string{"ip:2606:4700::/64", "authip:2606:4700::/64:login"},
 		},
 		{
 			name:   "direct connection with an unparsable peer",

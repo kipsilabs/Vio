@@ -78,7 +78,8 @@ type playbackInfoRequest struct {
 }
 
 var compatLanguageNames = map[string]string{
-	"ar": "Arabic", "ara": "Arabic",
+	"multi": "Multi",
+	"ar":    "Arabic", "ara": "Arabic",
 	"bg": "Bulgarian", "bul": "Bulgarian",
 	"bn": "Bengali", "ben": "Bengali",
 	"cs": "Czech", "ces": "Czech", "cze": "Czech",
@@ -3572,7 +3573,7 @@ func compatAudioSpatialFormat(profile string) string {
 }
 
 func audioTrackDisplayTitle(track models.AudioTrack) string {
-	lang := compatLanguageName(track.Language)
+	lang := audioTrackLanguageDisplayName(track)
 	// Jellyfin prefers the ffprobe profile over the codec name in audio display
 	// titles (e.g. "DTS-HD MA", "Dolby Digital Plus + Dolby Atmos"), except the
 	// uninformative AAC "LC" profile.
@@ -3591,6 +3592,40 @@ func audioTrackDisplayTitle(track models.AudioTrack) string {
 		title += " - " + embedded
 	}
 	return title
+}
+
+func audioTrackLanguageDisplayName(track models.AudioTrack) string {
+	if len(track.Languages) == 0 {
+		return compatLanguageName(track.Language)
+	}
+
+	seen := make(map[string]struct{}, len(track.Languages))
+	names := make([]string, 0, len(track.Languages))
+	for _, code := range track.Languages {
+		trimmed := strings.TrimSpace(code)
+		if trimmed == "" {
+			continue
+		}
+		normalized := strings.ToLower(trimmed)
+		// These are probe placeholders, not languages to advertise. Keep the
+		// legacy fallback for a track with no usable list below.
+		if normalized == "und" || normalized == "unknown" || normalized == "undefined" {
+			continue
+		}
+		name := compatLanguageName(trimmed)
+		if name == "Unknown" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	if len(names) == 0 {
+		return ""
+	}
+	return strings.Join(names, "/")
 }
 
 func audioCodecDisplayName(codec string) string {
