@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"path"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -917,17 +918,14 @@ func planPlaybackOnceV3(input PlannerInputV3) (result PlannerResultV3) {
 				applySubtitleDecisionV3(&plan, hlsSubtitle.Decision)
 				plan.Claims.Subtitles = hlsSubtitle.Claims
 				finalizePlanIdentityV3(&plan, input.Request.PlaybackAttemptID, input.Request.ClientPlaybackContext.Output.OutputContextID)
-				subtitleRendition := false
-				if HasFeatureV3(input.Request.ClientFeatures, FeatureHLSRemuxSubtitleRenditionsV3) &&
-					hlsSubtitleRenditionEligibleV3(input, hlsSubtitle, input.RemuxSubtitleRenditionExecutable) {
-					subtitleRendition = applyHLSSubtitleRenditionUnlessAttemptedV3(input, &plan, hlsSubtitle)
-				}
+				renditions := applyHLSSubtitleRenditionsV3(input, &plan, hlsSubtitle, true)
+				subtitleRendition := renditions.carried
 				if deliverySupportsPlanV3(input.Request, DeliveryClassHLSV3, plan) && !planAttemptedV3(plan, input.Request.ClientPlaybackContext.Output.OutputContextID, input.AttemptedKeys) {
 					targetAudio := codecCopyV3
 					if hlsTranscodeAudio {
 						targetAudio = audioCodecAACV3
 					}
-					return PlannerResultV3{SubtitleRendition: subtitleRendition, Plan: &plan, PlayMethod: PlayRemux, TranscodeAudio: hlsTranscodeAudio, TargetVideoCodec: codecCopyV3, TargetAudioCodec: targetAudio, SourceAudioChannels: stereoDownmixSourceChannelsV3(source.AudioChannels, hlsAudioChannels, hlsTranscodeAudio), TargetAudioChannels: hlsAudioChannels, TargetResolution: resolutionLabelV3(source.Height), TargetBitrateKbps: source.BitrateKbps, SubtitleTrackIndex: hlsSubtitle.SelectedIndex, SubtitleTransportTrackIndex: hlsSubtitle.TransportIndex, SubtitleCodec: hlsSubtitle.Codec, DownloadedSubtitleID: hlsSubtitle.DownloadedSubtitleID}
+					return PlannerResultV3{SubtitleRendition: subtitleRendition, SubtitleRenditionTracks: renditions.tracks, SubtitleRenditionSource: renditions.source, Plan: &plan, PlayMethod: PlayRemux, TranscodeAudio: hlsTranscodeAudio, TargetVideoCodec: codecCopyV3, TargetAudioCodec: targetAudio, SourceAudioChannels: stereoDownmixSourceChannelsV3(source.AudioChannels, hlsAudioChannels, hlsTranscodeAudio), TargetAudioChannels: hlsAudioChannels, TargetResolution: resolutionLabelV3(source.Height), TargetBitrateKbps: source.BitrateKbps, SubtitleTrackIndex: hlsSubtitle.SelectedIndex, SubtitleTransportTrackIndex: hlsSubtitle.TransportIndex, SubtitleCodec: hlsSubtitle.Codec, DownloadedSubtitleID: hlsSubtitle.DownloadedSubtitleID}
 				}
 			}
 			if !progressiveFirst {
@@ -1941,6 +1939,11 @@ func planVideoTranscodeV3(input PlannerInputV3, base PlanV3, source SourceDescri
 	}
 	finalizePlanIdentityV3(&plan, input.Request.PlaybackAttemptID, input.Request.ClientPlaybackContext.Output.OutputContextID)
 	targetVideo, quality, subtitleRendition, terminal := downgradeTranscodePlanV3(input, subtitle, &plan, targetVideo, quality)
+	var renditions hlsRenditionsV3
+	if terminal == nil {
+		renditions = applyHLSSubtitleRenditionsV3(input, &plan, subtitle, false)
+		subtitleRendition = renditions.carried
+	}
 	if terminal != nil {
 		return *terminal
 	}
@@ -1949,6 +1952,8 @@ func planVideoTranscodeV3(input PlannerInputV3, base PlanV3, source SourceDescri
 	}
 	return PlannerResultV3{
 		SubtitleRendition:           subtitleRendition,
+		SubtitleRenditionTracks:     renditions.tracks,
+		SubtitleRenditionSource:     renditions.source,
 		Plan:                        &plan,
 		PlayMethod:                  PlayTranscode,
 		TranscodeAudio:              true,
@@ -2154,6 +2159,163 @@ func hlsSubtitleRenditionEligibleV3(input PlannerInputV3, subtitle SubtitlePolic
 		return false
 	}
 	return SubtitleRenditionExecutable(float64(input.EffectiveFile.Duration), DefaultSegmentDuration) && executable()
+}
+
+// hlsRenditionsV3 is the subtitle renditions an HLS plan's stream carries:
+// whether any, and the tracks it reads on demand, from which source version.
+type hlsRenditionsV3 struct {
+	carried bool
+	tracks  []SubtitleRenditionTrack
+	source  SubtitleRenditionSource
+}
+
+// applyHLSSubtitleRenditionsV3 gives a server_transcode_hls or (remux)
+// server_remux_hls plan its subtitle renditions. Every embedded text track
+// the source's index can read becomes an on-demand rendition when the client
+// and an executor support them (hlsOnDemandSubtitleRenditionsV3); otherwise
+// the selected track may become the single pipeline rendition
+// (hlsSubtitleRenditionEligibleV3). Either falls back to the next when its
+// plan has already failed.
+func applyHLSSubtitleRenditionsV3(input PlannerInputV3, plan *PlanV3, subtitle SubtitlePolicyResultV3, remux bool) hlsRenditionsV3 {
+	if renditions, source := hlsOnDemandSubtitleRenditionsV3(input, *plan, subtitle, remux); len(renditions) > 0 {
+		before := *plan
+		tracks := applyHLSOnDemandSubtitleRenditionsV3(plan, renditions)
+		finalizePlanIdentityV3(plan, input.Request.PlaybackAttemptID, input.Request.ClientPlaybackContext.Output.OutputContextID)
+		if !planAttemptedV3(*plan, input.Request.ClientPlaybackContext.Output.OutputContextID, input.AttemptedKeys) {
+			return hlsRenditionsV3{carried: true, tracks: tracks, source: source}
+		}
+		*plan = before
+	}
+	executable := input.SubtitleRenditionExecutable
+	if remux {
+		if !HasFeatureV3(input.Request.ClientFeatures, FeatureHLSRemuxSubtitleRenditionsV3) {
+			return hlsRenditionsV3{}
+		}
+		executable = input.RemuxSubtitleRenditionExecutable
+	}
+	if !hlsSubtitleRenditionEligibleV3(input, subtitle, executable) {
+		return hlsRenditionsV3{}
+	}
+	return hlsRenditionsV3{carried: applyHLSSubtitleRenditionUnlessAttemptedV3(input, plan, subtitle)}
+}
+
+// onDemandRenditionV3 is an inventory row an HLS plan lists as an on-demand
+// rendition: its position in the plan's inventory and the track.
+type onDemandRenditionV3 struct {
+	row   int
+	track SubtitleRenditionTrack
+}
+
+// hlsOnDemandSubtitleRenditionsV3 returns the embedded text tracks an HLS plan
+// lists as on-demand renditions, in inventory order: every one whose codec
+// WebVTT can carry (ASS too, unless the client requires authored fidelity,
+// when it keeps its sidecar) and whose packets the source's index finds. Nil
+// keeps the plan on the single pipeline rendition: the client or every
+// executor lacks on-demand renditions, a burned-in subtitle changes the
+// video, the media outruns the bounded playlist, no track qualifies, or the
+// selected track would be a rendition but its packets can't be found
+// through the index. It also returns the source version the index described.
+func hlsOnDemandSubtitleRenditionsV3(input PlannerInputV3, plan PlanV3, subtitle SubtitlePolicyResultV3, remux bool) ([]onDemandRenditionV3, SubtitleRenditionSource) {
+	features := input.Request.ClientFeatures
+	if !HasFeatureV3(features, FeatureHLSSubtitleRenditionsV3) || !HasFeatureV3(features, FeatureHLSSubtitleRenditionsAllV3) ||
+		remux && !HasFeatureV3(features, FeatureHLSRemuxSubtitleRenditionsV3) {
+		return nil, SubtitleRenditionSource{}
+	}
+	executable := input.OnDemandSubtitleRenditionsExecutable
+	if remux {
+		executable = input.RemuxOnDemandSubtitleRenditionsExecutable
+	}
+	file := input.EffectiveFile
+	if executable == nil || input.CueIndexedSubtitleTracks == nil || file == nil || subtitle.RequiresBurn ||
+		!SubtitleRenditionExecutable(float64(file.Duration), DefaultSegmentDuration) {
+		return nil, SubtitleRenditionSource{}
+	}
+	candidates := onDemandRenditionCandidatesV3(input, plan, subtitle, file)
+	if len(candidates) == 0 || !executable() {
+		return nil, SubtitleRenditionSource{}
+	}
+	indexed := input.CueIndexedSubtitleTracks()
+	if indexed == nil {
+		return nil, SubtitleRenditionSource{}
+	}
+	renditions := candidates[:0]
+	selectedListed := false
+	for _, candidate := range candidates {
+		if indexed.Tracks[candidate.track.TrackNumber] {
+			renditions = append(renditions, candidate)
+			selectedListed = selectedListed || candidate.track.Default
+		}
+	}
+	if len(renditions) == 0 || !selectedListed && selectedTextRenditionV3(subtitle, input.Request) {
+		return nil, SubtitleRenditionSource{}
+	}
+	renditions = firstOnDemandRenditionsV3(renditions, maxOnDemandSubtitleRenditions)
+	labels, languages := make([]string, len(renditions)), make([]string, len(renditions))
+	for i, rendition := range renditions {
+		labels[i], languages[i] = plan.Subtitle.Inventory[rendition.row].Label, rendition.track.Language
+	}
+	for i, name := range SubtitleRenditionNames(labels, languages) {
+		renditions[i].track.Name = name
+	}
+	return renditions, indexed.Source
+}
+
+// firstOnDemandRenditionsV3 keeps the first limit renditions, in inventory
+// order, with the selected one taking the last place when it comes later.
+func firstOnDemandRenditionsV3(renditions []onDemandRenditionV3, limit int) []onDemandRenditionV3 {
+	if len(renditions) <= limit {
+		return renditions
+	}
+	if i := slices.IndexFunc(renditions[limit:], func(r onDemandRenditionV3) bool { return r.track.Default }); i >= 0 {
+		renditions[limit-1] = renditions[limit+i]
+	}
+	return renditions[:limit]
+}
+
+// onDemandRenditionCandidatesV3 returns the plan's embedded inventory rows a
+// WebVTT rendition can carry, with a known container track number, before
+// the index is consulted. A track number repeated by a malformed file names
+// only its first track.
+func onDemandRenditionCandidatesV3(input PlannerInputV3, plan PlanV3, subtitle SubtitlePolicyResultV3, file *models.MediaFile) []onDemandRenditionV3 {
+	preserveASS := input.Request.SubtitleFidelityPreference == SubtitleFidelityPreserveV3
+	var candidates []onDemandRenditionV3
+	seen := map[uint64]bool{}
+	for row, item := range plan.Subtitle.Inventory {
+		ordinal := item.CombinedIndex - len(file.ExternalSubtitles)
+		if item.Source != SubtitleSourceEmbeddedV3 || ordinal < 0 || ordinal >= len(file.SubtitleTracks) {
+			continue
+		}
+		track := file.SubtitleTracks[ordinal]
+		number, err := strconv.ParseUint(track.ContainerTrackID, 10, 64)
+		if err != nil || number == 0 || seen[number] || !SubtitleRenditionCodecSupported(track.Codec) || IsASS(track.Codec) && preserveASS {
+			continue
+		}
+		seen[number] = true
+		candidates = append(candidates, onDemandRenditionV3{row: row, track: SubtitleRenditionTrack{
+			StreamIndex: track.Index, TrackNumber: number, Codec: track.Codec, Language: item.Language, Forced: item.Forced,
+			Default: subtitle.Source == SubtitleSourceEmbeddedV3 && subtitle.SelectedIndex == item.CombinedIndex,
+		}})
+	}
+	return candidates
+}
+
+func selectedTextRenditionV3(s SubtitlePolicyResultV3, r StartRequestV3) bool {
+	return s.Source == SubtitleSourceEmbeddedV3 && s.SelectedIndex >= 0 && s.TransportIndex >= 0 && s.Decision.Embedded == nil && SubtitleRenditionCodecSupported(s.Codec) && (s.Decision.Mode == SubtitleRenderV3 || s.Decision.Mode == SubtitleConvertV3) && (!IsASS(s.Codec) || r.SubtitleFidelityPreference != SubtitleFidelityPreserveV3)
+}
+
+func applyHLSOnDemandSubtitleRenditionsV3(plan *PlanV3, rs []onDemandRenditionV3) []SubtitleRenditionTrack {
+	inv := slices.Clone(plan.Subtitle.Inventory)
+	tracks := make([]SubtitleRenditionTrack, len(rs))
+	for i, r := range rs {
+		tracks[i] = r.track
+		inv[r.row].HLSRendition = &SubtitleInventoryHLSRenditionV3{GroupID: SubtitleRenditionGroupID, Name: r.track.Name, Index: i + 1}
+		if r.track.Default {
+			applyHLSSubtitleRenditionV3(plan)
+			plan.Subtitle.HLSRendition.Name, plan.Subtitle.HLSRendition.Index = r.track.Name, i+1
+		}
+	}
+	plan.Subtitle.Inventory = inv
+	return tracks
 }
 
 // applyHLSSubtitleRenditionUnlessAttemptedV3 gives an HLS plan its subtitle
