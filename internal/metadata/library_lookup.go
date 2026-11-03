@@ -266,7 +266,7 @@ func (s *MetadataService) lookupLibrarySeriesEpisodes(
 			return libraryPartialSeriesResult(result, accumulator, nextSeason, err)
 		}
 		outcome := s.lookupLibrarySeasonEpisodes(ctx, folderID, language, providerIDs, season, opts.PreferredProvider)
-		accumulateEpisodeResults(accumulator, outcome.episodes)
+		accumulateEpisodeResults(accumulator, outcome.episodes, language)
 		failures = append(failures, librarySeasonFailure(season, outcome)...)
 		if err := ctx.Err(); err != nil {
 			return libraryPartialSeriesResult(result, accumulator, nextSeason, err)
@@ -418,7 +418,7 @@ func (s *MetadataService) lookupLibrarySeasons(
 			continue
 		}
 		succeeded++
-		accumulateSeasonResults(accumulator, seasons)
+		accumulateSeasonResults(accumulator, seasons, language)
 	}
 	if succeeded == 0 {
 		if eligible == 0 {
@@ -482,7 +482,7 @@ func (s *MetadataService) lookupLibrarySeasonEpisodes(
 				malformed++
 				continue
 			}
-			accumulateEpisodeResults(accumulator, []EpisodeResult{episode})
+			accumulateEpisodeResults(accumulator, []EpisodeResult{episode}, language)
 		}
 	}
 	if eligible == 0 {

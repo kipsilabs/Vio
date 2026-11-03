@@ -2,6 +2,8 @@ package transcodenode
 
 import (
 	"context"
+	"net/url"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
