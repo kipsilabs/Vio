@@ -3698,3 +3698,10 @@ func (h *LibraryCollectionHandler) HandleMaterializeAdminCollectionItem(w http.R
 		"message":               fmt.Sprintf("Materialized %d virtual files (%d existing) for %s (%s)", res.FilesCreated, res.FilesExisting, res.ContentID, res.MediaType),
 	})
 }
+
+func (h *LibraryCollectionHandler) setListingLogos(ctx context.Context, cards []itemListResponse, items []*models.MediaItem, access catalog.AccessFilter) {
+	urls := signListingLogos(ctx, h.detailSvc, localizedLogoPaths(ctx, h.detailSvc, items, access), access.ImageSizeFor(imagesize.SlotLogo))
+	for i := range cards {
+		cards[i].LogoURL = urls[cards[i].ContentID]
+	}
+}
