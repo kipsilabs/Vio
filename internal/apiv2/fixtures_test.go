@@ -1773,6 +1773,7 @@ func fixtureCases() []fixtureCase {
 	cases = append(cases, notInterestedFixtureCases()...)
 	cases = append(cases, notificationSeriesFixtureCases()...)
 	cases = append(cases, notificationSeriesMuteFixtureCases()...)
+	cases = append(cases, catalogVersionsCheckFixtureCases()...)
 	return append(cases, seasonalThemeFixtureCases()...)
 }
 
@@ -2177,6 +2178,7 @@ func fixtureDeps() Dependencies {
 	deps.WatchProviders = &fakeWatchLifecycle{}
 	catalog := &fakeCatalog{}
 	deps.CatalogAccess, deps.CatalogBrowse, deps.CatalogItems = catalog, catalog, catalog
+	deps.CatalogVersionsCheck = fixtureVersionCheck{}
 	actions := &fakeCatalogActions{enabled: true, trailerView: handlers.TrailerRefreshView{Status: "queued"}}
 	deps.CatalogTrailers, deps.MetadataAI, deps.People, deps.LiteraryWorks = actions, actions, actions, actions
 	deps.ExternalSignIn = &fakeExternalSignIn{}

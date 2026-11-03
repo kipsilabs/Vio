@@ -155,8 +155,8 @@ and `allowed` is `true`; a server without playback wired answers
 `not_configured` with `allowed: false`. `installation_id` is the persisted
 server instance UUID that diagnostics also report. `protocol_versions` is
 `[3]`. `features` is the v3 server feature set plus `sequenced_progress_v1`,
-`fixed_media_file_v1`, `marker_segments_v1`, `trickplay_v1`, and
-`bandwidth_probe_v1`. When the room service and
+`fixed_media_file_v1`, `marker_segments_v1`, `trickplay_v1`,
+`bandwidth_probe_v1`, and `versions_check_v1`. When the room service and
 authenticated room socket are configured, it also includes
 `watch_party_source_fallback_v1` and `watch_party_coordinator_v1`.
 The coordinator capability covers shared room
@@ -164,6 +164,12 @@ membership, command-aware readiness, and ready/buffering/syncing member status.
 `deliveries` lists `original_http`, `server_remux_progressive`,
 `server_remux_hls` and, when transcoding is enabled, `server_transcode_hls`.
 `revision` is a digest of the rest.
+
+The `bandwidth_probe_v1` and `versions_check_v1` entries are additive
+discovery: a client that ignores either keeps its previous behavior. No start,
+replan, or other playback path requires calling the bandwidth probe or the
+catalog versions check, and the capabilities response gains no required member
+when it advertises them.
 
 ## Bandwidth probe
 

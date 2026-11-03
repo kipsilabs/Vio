@@ -69,7 +69,9 @@ type versionCheckRequest struct {
 	FileIDs []int `json:"file_ids"`
 }
 
-type versionCheckResult struct {
+// VersionCheckResult is one file's liveness verdict. It is the shared seam
+// answer behind the v1 route and the v2 checkCatalogVersions operation.
+type VersionCheckResult struct {
 	FileID    int  `json:"file_id"`
 	Available bool `json:"available"`
 	// Failed is true when the row carries a durable failed verdict (either
@@ -84,19 +86,19 @@ type versionCheckResult struct {
 	// the short wrong-source marker (no database column). A mismatch never
 	// means the release is dead, so it never travels with failed and never
 	// changes available.
-	SourceMismatch *versionCheckSourceMismatch `json:"source_mismatch,omitempty"`
+	SourceMismatch *VersionCheckSourceMismatch `json:"source_mismatch,omitempty"`
 }
 
-// versionCheckSourceMismatch carries the served-vs-declared byte sizes of a
+// VersionCheckSourceMismatch carries the served-vs-declared byte sizes of a
 // rejected probe so the version list can render a distinct source-mismatch
 // state instead of the generic unprobed/retry presentation.
-type versionCheckSourceMismatch struct {
+type VersionCheckSourceMismatch struct {
 	ServedBytes   int64 `json:"served_bytes"`
 	DeclaredBytes int64 `json:"declared_bytes"`
 }
 
 type versionCheckResponse struct {
-	Results []versionCheckResult `json:"results"`
+	Results []VersionCheckResult `json:"results"`
 }
 
 // versionCheckOutcome is one file's liveness verdict before stamps are
@@ -125,7 +127,7 @@ type versionCheckOutcome struct {
 	// sourceMismatch carries a recent rejected probe's byte verdict for this
 	// row. It is advisory only: it never sets stamp, never changes available,
 	// and never marks the row failed.
-	sourceMismatch *versionCheckSourceMismatch
+	sourceMismatch *VersionCheckSourceMismatch
 }
 
 const (
@@ -195,14 +197,23 @@ func (h *CatalogResourceHandler) HandleCheckVersions(w http.ResponseWriter, r *h
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), versionCheckOverallBudget)
+	writeJSON(w, http.StatusOK, versionCheckResponse{Results: h.CheckVersions(r.Context(), req.FileIDs)})
+}
+
+// CheckVersions is the liveness probe behind the v1 route and the v2
+// checkCatalogVersions operation. Callers validate the batch (one to
+// maxVersionCheckFiles IDs) before calling; the seam applies the per-file
+// concurrency, timeout and stamping rules and never fails the whole batch on
+// one file.
+func (h *CatalogResourceHandler) CheckVersions(ctx context.Context, fileIDs []int) []VersionCheckResult {
+	ctx, cancel := context.WithTimeout(ctx, versionCheckOverallBudget)
 	defer cancel()
 
-	outcomes := make([]versionCheckOutcome, 0, len(req.FileIDs))
+	outcomes := make([]versionCheckOutcome, 0, len(fileIDs))
 	var mu sync.Mutex
 	eg, egCtx := errgroup.WithContext(ctx)
 	eg.SetLimit(versionCheckConcurrency)
-	for _, id := range req.FileIDs {
+	for _, id := range fileIDs {
 		if id <= 0 {
 			continue
 		}
@@ -222,7 +233,7 @@ func (h *CatalogResourceHandler) HandleCheckVersions(w http.ResponseWriter, r *h
 	// All post-processing shares one absolute deadline. A blocked write must
 	// not extend the handler per row, so work that does not fit is logged and
 	// reported unconfirmed rather than assumed to have landed.
-	postCtx, postCancel := context.WithTimeout(context.WithoutCancel(r.Context()), versionCheckPostBudget)
+	postCtx, postCancel := context.WithTimeout(context.WithoutCancel(ctx), versionCheckPostBudget)
 	defer postCancel()
 
 	// Stamps apply only after the whole batch is judged: one volatile
@@ -232,7 +243,7 @@ func (h *CatalogResourceHandler) HandleCheckVersions(w http.ResponseWriter, r *h
 	for _, id := range toStamp {
 		stampByID[id] = struct{}{}
 	}
-	results := make([]versionCheckResult, 0, len(final))
+	results := make([]VersionCheckResult, 0, len(final))
 	for _, outcome := range final {
 		stamped := false
 		if _, ok := stampByID[outcome.fileID]; ok {
@@ -245,15 +256,14 @@ func (h *CatalogResourceHandler) HandleCheckVersions(w http.ResponseWriter, r *h
 				stamped = h.stampVirtualCandidateFailed(postCtx, outcome.fileID, outcome.file)
 			}
 		}
-		results = append(results, versionCheckResult{
+		results = append(results, VersionCheckResult{
 			FileID:         outcome.fileID,
 			Available:      outcome.available,
 			Failed:         versionCheckFailed(outcome, stamped),
 			SourceMismatch: outcome.sourceMismatch,
 		})
 	}
-
-	writeJSON(w, http.StatusOK, versionCheckResponse{Results: results})
+	return results
 }
 
 // checkVersion tests one media file's liveness and returns whether it is
@@ -430,7 +440,7 @@ func (h *CatalogResourceHandler) checkVersion(ctx context.Context, fileID int) v
 // playback probe cache), so it is intentionally absent after a restart or on a
 // node that did not run the probe; the version list then keeps its generic
 // unprobed presentation instead of inventing a mismatch.
-func versionCheckSourceMismatchFor(file *models.MediaFile) *versionCheckSourceMismatch {
+func versionCheckSourceMismatchFor(file *models.MediaFile) *VersionCheckSourceMismatch {
 	if file == nil || !isVirtualPlaybackFile(file) {
 		return nil
 	}
@@ -440,7 +450,7 @@ func versionCheckSourceMismatchFor(file *models.MediaFile) *versionCheckSourceMi
 	if !ok {
 		return nil
 	}
-	return &versionCheckSourceMismatch{ServedBytes: served, DeclaredBytes: declared}
+	return &VersionCheckSourceMismatch{ServedBytes: served, DeclaredBytes: declared}
 }
 
 // VersionSourceMismatch projects the same process-local wrong-source verdict

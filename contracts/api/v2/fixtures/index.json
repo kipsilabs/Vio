@@ -4394,6 +4394,72 @@
       "body_file": "change_password_profile_verification_required.json"
     },
     {
+      "name": "check_catalog_versions_ok",
+      "operation_id": "checkCatalogVersions",
+      "scenario": "A mixed batch reports the live rows, the durable failed row, and the advisory source-mismatch verdict.",
+      "request": {
+        "method": "POST",
+        "path": "/api/v2/catalog/versions/check",
+        "headers": {
+          "Authorization": "Bearer tok-member",
+          "X-Profile-Id": "p-owner"
+        },
+        "body": "{\"file_ids\":[\"120\",\"121\",\"122\"]}"
+      },
+      "expected_status": 200,
+      "response_headers": {
+        "Cache-Control": "no-store",
+        "Content-Type": "application/json"
+      },
+      "response_media_type": "application/json",
+      "schema": "#/components/schemas/CatalogVersionsCheck",
+      "body_file": "check_catalog_versions_ok.json"
+    },
+    {
+      "name": "check_catalog_versions_profile_verification_required",
+      "operation_id": "checkCatalogVersions",
+      "scenario": "A profile-scoped check for a PIN-locked profile without X-Profile-Token is refused before the body is read.",
+      "request": {
+        "method": "POST",
+        "path": "/api/v2/catalog/versions/check",
+        "headers": {
+          "Authorization": "Bearer tok-member",
+          "X-Profile-Id": "p-locked"
+        },
+        "body": "{\"file_ids\":[\"120\"]}"
+      },
+      "expected_status": 403,
+      "response_headers": {
+        "Cache-Control": "no-store",
+        "Content-Type": "application/problem+json"
+      },
+      "response_media_type": "application/problem+json",
+      "schema": "#/components/schemas/Problem",
+      "body_file": "check_catalog_versions_profile_verification_required.json"
+    },
+    {
+      "name": "check_catalog_versions_too_large",
+      "operation_id": "checkCatalogVersions",
+      "scenario": "More than 40 file identifiers is a validation failure at body.file_ids before any provider work.",
+      "request": {
+        "method": "POST",
+        "path": "/api/v2/catalog/versions/check",
+        "headers": {
+          "Authorization": "Bearer tok-member",
+          "X-Profile-Id": "p-owner"
+        },
+        "body": "{\"file_ids\":[\"1\",\"2\",\"3\",\"4\",\"5\",\"6\",\"7\",\"8\",\"9\",\"10\",\"11\",\"12\",\"13\",\"14\",\"15\",\"16\",\"17\",\"18\",\"19\",\"20\",\"21\",\"22\",\"23\",\"24\",\"25\",\"26\",\"27\",\"28\",\"29\",\"30\",\"31\",\"32\",\"33\",\"34\",\"35\",\"36\",\"37\",\"38\",\"39\",\"40\",\"41\"]}"
+      },
+      "expected_status": 422,
+      "response_headers": {
+        "Cache-Control": "no-store",
+        "Content-Type": "application/problem+json"
+      },
+      "response_media_type": "application/problem+json",
+      "schema": "#/components/schemas/Problem",
+      "body_file": "check_catalog_versions_too_large.json"
+    },
+    {
       "name": "check_library_mount_not_found",
       "operation_id": "checkLibraryMount",
       "scenario": "A library identifier that names no library.",

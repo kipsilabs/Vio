@@ -33,6 +33,23 @@ stamps the durable signal. The request is:
 }
 ```
 
+`POST /api/v2/catalog/versions/check` (`checkCatalogVersions`) is the same
+probe on the stable surface, returning the same verdict shape with the opaque
+string identifiers v2 uses everywhere. The request is:
+
+```json
+{
+  "file_ids": ["123", "456"]
+}
+```
+
+The v2 contract reports an empty list and more than 40 IDs as `422`
+validation failures at `body.file_ids` (the frozen v1 route answers `400` and
+`413` instead). The operation is optional: playback start and replan never
+require a check, and a client that never calls it keeps the behavior it had
+before the operation existed. `getPlaybackCapabilities.features` advertises
+`versions_check_v1` when the server serves it.
+
 At most 40 IDs are accepted per request (413 `too_large` beyond that; 400
 `bad_request` when the body is missing or the list is empty). Each file is
 tested cheaply — virtual rows resolve their pinned `?result=` candidate through

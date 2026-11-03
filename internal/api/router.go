@@ -3923,6 +3923,8 @@ func newChiRouter(deps Dependencies) chi.Router {
 	}
 	if catalogResourceHandler != nil {
 		v2deps.CatalogItems = catalogResourceHandler
+		v2deps.CatalogVersionsCheck = catalogResourceHandler
+		v2deps.CatalogVersionsWarm = catalogResourceHandler
 	}
 	if shuffleService != nil {
 		v2deps.Shuffles = shuffleService

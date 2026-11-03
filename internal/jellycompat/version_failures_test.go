@@ -237,3 +237,22 @@ func TestCompatLiveVersionsKeepsAllFailedList(t *testing.T) {
 		t.Fatalf("all-failed list = %+v, want the single confirmed-dead row returned whole", got)
 	}
 }
+
+// TestCompatLiveVersionsStaysIndependentOfTheV2CheckCapability pins the
+// exclusion-only parity: the Jellyfin surface reads only the durable failed
+// verdict, never a v2 liveness-check request or capability. A row the shared
+// seam stamped is excluded by the same rule whether or not the client ever
+// called checkCatalogVersions or negotiated versions_check_v1.
+func TestCompatLiveVersionsStaysIndependentOfTheV2CheckCapability(t *testing.T) {
+	now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
+	stamped := now.Add(-time.Minute)
+	available, unavailable := true, false
+	versions := []catalog.FileVersion{
+		{FileID: 42, Container: "mkv", Duration: 1200, Failed: true, FailedAt: &stamped, Available: &unavailable},
+		{FileID: 43, Container: "mkv", Duration: 1200, Available: &available},
+	}
+	alive := compatLiveVersionsAt(versions, 0, now)
+	if len(alive) != 1 || alive[0].FileID != 43 {
+		t.Fatalf("live versions = %+v, want only the healthy row", alive)
+	}
+}
