@@ -7080,6 +7080,107 @@ func rotateVirtualSourceToOwnerRow(probed *models.MediaFile, ownerRow *models.Me
 	return &rotated
 }
 
+// virtualCompletedReleaseRetryBudget bounds the one same-release retry a
+// completed, duration-verified pinned release gets before the alternate walk.
+// It matches the detached catalog discovery budget: a provider that just
+// answered slowly enough to time the first resolve out gets room to answer once
+// more, but a dead release cannot hold the start indefinitely.
+const virtualCompletedReleaseRetryBudget = 20 * time.Second
+
+// virtualReleaseCompletedAndVerified reports whether the pinned row is a release
+// the provider already holds and whose measured duration proves the item. Such a
+// release is playable; a transport hiccup on it is a transport problem, not
+// evidence that a different release should be served.
+//
+// Completion comes from the provider's cache-completion signal when it is wired
+// (AltMount's once-per-release confirmation, the same predicate the serve layer
+// uses for cache handoff). Without that signal, a complete probe inventory is
+// the strongest evidence the catalog row carries that the bytes were fetched and
+// read. Duration verification requires a probe stamp: a declaration-only
+// duration is the catalog's runtime, not a measurement, and cannot prove
+// identity.
+func (h *PlaybackHandler) virtualReleaseCompletedAndVerified(ctx context.Context, file *models.MediaFile) bool {
+	if h == nil || file == nil || file.ProbeUpdatedAt == nil {
+		return false
+	}
+	if !completeVirtualVideoEvidenceV3(file) || !completeVirtualAudioEvidenceV3(file) ||
+		!completeVirtualContainerEvidenceV3(file) {
+		return false
+	}
+	expectedMinutes := h.virtualExpectedRuntimeMinutes(ctx, file)
+	if expectedMinutes == 0 {
+		expectedMinutes = file.VirtualExpectedRuntimeMinutes
+	}
+	if !scanner.VirtualDurationProvesIdentity(file.Duration, expectedMinutes) {
+		return false
+	}
+	if h.VirtualReleaseCacheStatus != nil {
+		if cached, known := h.VirtualReleaseCacheStatus(ctx, file.FilePath, effectiveVirtualOwner(0, file.VirtualOwnerInstallationID)); known {
+			return cached
+		}
+	}
+	return true
+}
+
+// virtualCompletedReleaseResolveHiccup reports whether a failed resolve of the
+// pinned release may be retried as the same release. Only transient dependency
+// failures qualify; a release verdict — an absent pin, a marked-failed candidate,
+// an unreadable verdict — is confirmed dead and rotates as before. Pending
+// imports are handled by the caller's own hold and are not retried here.
+func virtualCompletedReleaseResolveHiccup(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, virtuallibrary.ErrProviderPending) ||
+		errors.Is(err, virtuallibrary.ErrSessionBoundCandidateAbsent) ||
+		errors.Is(err, ErrVirtualCandidateMarkedFailed) ||
+		errors.Is(err, errVirtualCandidateVerdictUnknown) {
+		return false
+	}
+	return virtualProviderListingOutage(err) ||
+		errors.Is(err, errVirtualProviderUnavailable) ||
+		errors.Is(err, context.DeadlineExceeded) ||
+		playback.IsTransientProviderError(err)
+}
+
+// retryCompletedPinnedReleaseV3 re-resolves exactly the pinned release once with
+// a fresh relay registration, so a transport hiccup on a completed release gets
+// new bytes before the caller walks to a different release. The retry is forced
+// through a provider re-list (bypassing the negative cache the failure just
+// wrote), and its result is accepted only when it names the same release: a
+// provider renumber re-matches by durable identity, but a ranked sibling is not
+// a retry and is refused. A failure or a different release returns an error and
+// leaves the caller's existing alternate walk in charge.
+func (h *PlaybackHandler) retryCompletedPinnedReleaseV3(
+	ctx context.Context,
+	file *models.MediaFile,
+	ownerInstallationID, userID int,
+	profileID, pinnedURI, preferredCandidateID, pinnedCandidateID string,
+) (ResolvedVirtualMedia, func(), error) {
+	retryCtx, cancel := context.WithTimeout(withVirtualRelayFreshRegistration(ctx), virtualCompletedReleaseRetryBudget)
+	defer cancel()
+	resolved, cleanup, err := h.resolveVirtualInputURI(
+		retryCtx, pinnedURI, ownerInstallationID, userID, profileID, true, nil, preferredCandidateID,
+	)
+	if err != nil {
+		return ResolvedVirtualMedia{}, nil, err
+	}
+	sameRelease := (pinnedCandidateID != "" && resolved.CandidateID == pinnedCandidateID) ||
+		resolved.IdentityRematched || resolvedMatchesPersistedIdentity(resolved, file)
+	if !sameRelease {
+		if cleanup != nil {
+			cleanup()
+		}
+		return ResolvedVirtualMedia{}, nil, fmt.Errorf(
+			"same-release retry resolved candidate %q for pinned candidate %q",
+			resolved.CandidateID, pinnedCandidateID)
+	}
+	slog.InfoContext(ctx, "virtual playback transport hiccup on a completed release; retried the same release with a fresh relay registration",
+		"component", "api", "file_id", catalogFileIDOrZero(file),
+		"candidate_id", pinnedCandidateID, "virtual_uri", pinnedURI)
+	return resolved, cleanup, nil
+}
+
 // fallbackResolveStaleVirtualSource re-lists the provider's current candidates
 // and resolves the first healthy provider-neutral stream. It returns nil when
 // the original URI carried no stale result= pick, or when no substitute

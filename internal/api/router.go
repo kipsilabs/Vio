@@ -2085,6 +2085,10 @@ func newChiRouter(deps Dependencies) chi.Router {
 			// pay the cold fetch. Nil (no monitor or no virtual library service)
 			// leaves selection warm-ups disabled.
 			playbackHandler.VirtualReleaseCacheWarmup = sh.VirtualReleaseCacheFiller
+			// The same completion signal makes a completed, duration-verified
+			// pinned release sticky on the start path: a transient resolve
+			// failure retries that release before the cross-release walk.
+			playbackHandler.VirtualReleaseCacheStatus = sh.VirtualReleaseCacheStatus
 			// Install the completion observer last so the waiter registry is
 			// already wired when the first confirmation can arrive.
 			svc.Monitor.SetReleaseConfirmedObserver(sh.HandleVirtualReleaseConfirmed)

@@ -608,6 +608,12 @@ type PlaybackHandler struct {
 	// probeChainWG tracks live pre-play probe chains so tests can wait for
 	// them to settle. Production never waits.
 	probeChainWG sync.WaitGroup
+	// VirtualReleaseCacheStatus reports whether a pinned release already has a
+	// cached copy on the provider (AltMount's completion signal). A completed,
+	// duration-verified release is sticky: a transport hiccup retries it before
+	// the start walks to a different release. Optional: nil falls back to the
+	// row's own complete probe inventory as completion evidence.
+	VirtualReleaseCacheStatus VirtualReleaseCacheStatusFunc
 	// VirtualReleaseCacheWarmup starts a provider-side fetch for an explicitly
 	// selected virtual release before playback. It is the same fill/listing
 	// call playback start issues (see StreamHandler.VirtualReleaseCacheFiller),

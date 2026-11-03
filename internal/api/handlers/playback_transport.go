@@ -425,6 +425,33 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 			)
 		}()
 		if resolveErr != nil {
+			// A completed, duration-verified pinned release is sticky. The
+			// provider already holds bytes whose measured duration proves the
+			// item, so a transport hiccup is not a reason to change releases and
+			// reset the viewer's audio/subtitle selections. Retry that release
+			// once with a fresh relay registration before the alternate walk
+			// below excludes it. resolveVirtualInputURI's own outage retry may
+			// already have re-listed the release; this retry adds the fresh relay
+			// registration the outage path does not mint, and it is the last
+			// same-release attempt before rotation. A release verdict (absent
+			// pin, marked-failed candidate) is not a hiccup and rotates as before.
+			if attempt == 0 && targetURI == canonicalPath && initialPinnedResultID != "" &&
+				virtualCompletedReleaseResolveHiccup(resolveErr) &&
+				h.virtualReleaseCompletedAndVerified(resolveStartupCtx, file) {
+				retried, retriedCleanup, retriedErr := h.retryCompletedPinnedReleaseV3(
+					resolveStartupCtx, file, ownerInstallationID, userID, profileID,
+					targetURI, preferredID, initialPinnedResultID,
+				)
+				if retriedErr == nil {
+					resolvedMedia, cleanup, resolveErr = retried, retriedCleanup, nil
+				} else {
+					slog.WarnContext(resolveStartupCtx, "virtual playback retry of a completed pinned release failed; walking alternates",
+						"component", "api", "file_id", catalogFileIDOrZero(file),
+						"candidate_id", initialPinnedResultID, "error", retriedErr)
+				}
+			}
+		}
+		if resolveErr != nil {
 			lastErr = resolveErr
 			// A pending release (AltMount actively fetching) is never
 			// indicted: it is neither dead nor ready, so excluding it and
