@@ -9883,6 +9883,32 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	seekSubtitleDegraded := false
 	seekFailureRecovery := operation == playback.ReplanOperationSeekFailureRecoveryV3
 	seekScopedRecovery := seekReanchor || seekFailureRecovery
+	// A failure recovery on a transcode session that answered the playlist and
+	// never served a single segment request is a client that walked away after
+	// fetching the manifest: the encode was live, the bytes were ready, and
+	// nobody ever collected one. Nothing here is evidence against the plan, so
+	// stopping the abandoned session and answering "gone" is the honest reply.
+	// Rotating instead would indict a healthy recipe, spend the adaptation
+	// budget, and persist a failure for a route that never delivered a byte to
+	// the player.
+	if failureRecoveryOperationV3(operation) && h.abandonedBeforeFirstSegmentV3(record.SessionID) {
+		if session, err := h.sessionMgr.GetSession(record.SessionID); err == nil {
+			slog.InfoContext(r.Context(), "playback failure recovery abandoned before the first segment",
+				logComponentKey, playbackLogValueV3,
+				"session_id", record.SessionID,
+				"operation", string(operation),
+				"failure_classification", req.Failure.Classification,
+			)
+			_ = h.abortPlaybackSession(context.WithoutCancel(r.Context()), session)
+		}
+		// Answered as a gone session, which is what it now is: the durable
+		// attempt is stopped, no plan is indicted, and the deferred lease
+		// release leaves no terminal decision behind.
+		return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{
+			reason:  "session_expired",
+			message: "The playback session has ended.",
+		}
+	}
 	// A seek reanchor must keep its route; every other replan first finds out
 	// whether the session's nodes still answer, so neither the plan nor the
 	// route is built on a node that went away.
@@ -14693,6 +14719,17 @@ func failureRecoveryAbandonedDeliveryV3(operation playback.ReplanOperationV3, fa
 func failureRecoveryOperationV3(operation playback.ReplanOperationV3) bool {
 	return operation == playback.ReplanOperationFailureRecoveryV3 ||
 		operation == playback.ReplanOperationSeekFailureRecoveryV3
+}
+
+// abandonedBeforeFirstSegmentV3 reports whether the live transcode session for
+// this attempt served the playlist and never one segment request. See
+// playback.TranscodeSession.AbandonedBeforeFirstSegment: the session carries
+// the evidence, this is only the handler-side lookup. A session with no local
+// transcode handle (direct play, or a route this replica does not own) reports
+// false and keeps the ordinary failure handling.
+func (h *PlaybackHandler) abandonedBeforeFirstSegmentV3(sessionID string) bool {
+	ts := h.tm.GetTranscodeSession(sessionID)
+	return ts != nil && ts.AbandonedBeforeFirstSegment()
 }
 
 // clientCanceledRecoveryWindow bounds how long after an observed transport

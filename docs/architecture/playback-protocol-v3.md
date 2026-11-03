@@ -1669,6 +1669,17 @@ disabled, the terminal is the retryable `routes_exhausted`;
 `transcoding_disabled` stays reserved for a first plan whose source really
 needs an encode.
 
+The server applies one more distinction from its own evidence: whether the
+client ever read from the stream it is indicting. A `failure_recovery` that
+arrives after the server answered this attempt's playlist but before a single
+segment request is a client that stopped reading, not a verdict on the route:
+the player reached the stream, asked for no media, and then reported a failure.
+The server answers it as `playback_session_not_found` and stops the session
+instead of rotating, demoting the delivery, or persisting a failure for a recipe
+that was never exercised. A recovery that arrives before the playlist was served
+is a failure the client met inside the stream and keeps the ordinary ladder, and
+so does every session that already served a segment request.
+
 ### 6.3 `source_committed_event_v1` — the committed version is published at commit
 
 A serve-layer rotation can move a live session to a sibling release without ever

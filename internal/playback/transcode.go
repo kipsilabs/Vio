@@ -267,13 +267,28 @@ const (
 
 // TranscodeSession manages a running ffmpeg HLS transcode process.
 type TranscodeSession struct {
-	cmd                  *exec.Cmd
-	cancel               context.CancelFunc
-	opts                 TranscodeOpts
-	outputDir            string
-	running              bool
-	restarting           *restartFlight
-	waitErr              error
+	cmd        *exec.Cmd
+	cancel     context.CancelFunc
+	opts       TranscodeOpts
+	outputDir  string
+	running    bool
+	restarting *restartFlight
+	waitErr    error
+	// processCanceled records that the last exit came from this session's own
+	// context cancellation (a restart, a switchover teardown, or a stop) rather
+	// than from ffmpeg deciding to die. It is the distinction copy_seek_anchor.go
+	// draws for probe kills: our own kill says nothing about the source, the
+	// recipe, or the client, so it must not be reported as a transcode failure.
+	processCanceled bool
+	// segmentRequested records that at least one segment request reached this
+	// session. A failure recovery on a session that never served a request is a
+	// client that walked away, not evidence against the plan.
+	segmentRequested bool
+	// manifestServed records that this session answered a client-facing
+	// playlist request. With segmentRequested it separates a client that
+	// reached the stream and then stopped reading from one whose failure never
+	// got a playlist at all.
+	manifestServed       bool
 	stderr               *boundedTailBuffer
 	mu                   sync.Mutex
 	done                 chan struct{} // closed when the monitor goroutine finishes
@@ -781,11 +796,16 @@ func (s *TranscodeSession) monitorFFmpeg(ctx context.Context, cmd *exec.Cmd, don
 	releaseHWDevice()
 	processmetrics.Record(processmetrics.Transcode, cmd.ProcessState, waitErr, ctx.Err())
 	s.flushStderr(ctx)
+	// Read the cancellation once, after the reap: a process this session killed
+	// itself surfaces here as a SIGKILL exit, which is indistinguishable from a
+	// crash by err alone. The context is what tells them apart.
+	canceled := ctx.Err() != nil
 	s.mu.Lock()
 	s.running = false
 	s.waitErr = waitErr
+	s.processCanceled = canceled
 	s.mu.Unlock()
-	s.logWaitResult(ctx, waitErr)
+	s.logWaitResult(ctx, waitErr, canceled)
 	close(done)
 }
 
@@ -2620,6 +2640,13 @@ func (s *TranscodeSession) getManifest(currentGeneration bool) ([]byte, error) {
 				if s.restarting != nil {
 					return nil, ErrManifestNotReady
 				}
+				if s.processCanceled {
+					// This generation was stopped by the session itself, so its
+					// playlist will never become ready. Retryable, not a
+					// transcode verdict: the replacement generation may be
+					// producing right now.
+					return nil, ErrManifestNotReady
+				}
 				if s.waitErr != nil {
 					stderr := truncateStderr(s.stderr.String())
 					if stderr != "" {
@@ -2659,6 +2686,11 @@ func (s *TranscodeSession) getManifest(currentGeneration bool) ([]byte, error) {
 	// stalling on its very first segment fetch.
 	if !startupFilesReady(data, s.outputDir, requiredSegments) {
 		if s.running || s.restarting != nil {
+			return nil, ErrManifestNotReady
+		}
+		if s.processCanceled {
+			// Same self-teardown verdict as above: the missing startup media
+			// belongs to a generation nobody is producing any more.
 			return nil, ErrManifestNotReady
 		}
 		if s.waitErr != nil {
@@ -2829,7 +2861,9 @@ func isVirtualInputPath(path string) bool {
 // use the synthetic full VOD manifest only while its segment count is bounded;
 // longer media uses FFmpeg's real sliding playlist.
 func (s *TranscodeSession) BuildPlaybackManifest(segPrefix, rawQuery string) ([]byte, error) {
-	return s.buildPlaybackManifest(segPrefix, s.generationScopedQuery(rawQuery))
+	manifest, err := s.buildPlaybackManifest(segPrefix, s.generationScopedQuery(rawQuery))
+	s.noteManifestServed(err)
+	return manifest, err
 }
 
 // GenerationQueryParam names the query parameter that carries a session's
@@ -2976,10 +3010,19 @@ const SourceTimelineQueryParam = "source_timeline"
 // first produced segment retains its source-time position. Synthetic manifests
 // already cover the full source timeline and need no adjustment.
 func (s *TranscodeSession) BuildSourceAlignedPlaybackManifest(segPrefix, rawQuery string) ([]byte, error) {
+	manifest, err := s.buildSourceAlignedPlaybackManifest(segPrefix, rawQuery)
+	s.noteManifestServed(err)
+	return manifest, err
+}
+
+// buildSourceAlignedPlaybackManifest is BuildSourceAlignedPlaybackManifest
+// without the client-request bookkeeping, so the manifest path records exactly
+// one served playlist per answered request.
+func (s *TranscodeSession) buildSourceAlignedPlaybackManifest(segPrefix, rawQuery string) ([]byte, error) {
 	if s.copyPlan != nil {
 		// A planned playlist starts at the source's beginning and doesn't
 		// depend on FFmpeg's progress or restarts.
-		return s.BuildPlaybackManifest(segPrefix, rawQuery)
+		return s.buildPlaybackManifest(segPrefix, s.generationScopedQuery(rawQuery))
 	}
 	s.mu.Lock()
 	opts, generation, restarting := s.opts, s.segmentGeneration, s.restarting != nil
@@ -3822,6 +3865,11 @@ func (l *SegmentLease) Close() error {
 func (s *TranscodeSession) OpenSegment(name string) (*SegmentLease, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Every serve attempt reaches OpenSegment (directly or through a wait loop),
+	// and only a client request can start one. Record it before any early
+	// return so a request for a generation that is already gone still counts as
+	// the client trying.
+	s.segmentRequested = true
 	if s.restarting != nil {
 		return nil, ErrSegmentNotFound
 	}
@@ -4567,6 +4615,7 @@ func (s *TranscodeSession) WaitForSegment(name string, timeout time.Duration) (s
 		running := s.running
 		restarting := s.restarting != nil
 		waitErr := s.waitErr
+		canceled := s.processCanceled
 		virtualInput := isVirtualInputPath(s.opts.CanonicalInputPath)
 		s.mu.Unlock()
 
@@ -4590,6 +4639,13 @@ func (s *TranscodeSession) WaitForSegment(name string, timeout time.Duration) (s
 		}
 
 		if !running && waitErr != nil {
+			if canceled {
+				// Our own teardown killed this generation. Its bytes are gone
+				// with it, so answer the stale timeline (the client reloads the
+				// manifest) instead of a transcode failure the client would
+				// report as failure_recovery against a recipe that never failed.
+				return "", ErrStaleSegmentGeneration
+			}
 			stderr := ""
 			if s.stderr != nil {
 				stderr = truncateStderr(s.stderr.String())
@@ -4683,6 +4739,7 @@ func (s *TranscodeSession) waitForOpenSegment(name string, timeout, stall time.D
 		running := s.running
 		restarting := s.restarting != nil
 		waitErr := s.waitErr
+		canceled := s.processCanceled
 		virtualInput := isVirtualInputPath(s.opts.CanonicalInputPath)
 		s.mu.Unlock()
 
@@ -4707,6 +4764,10 @@ func (s *TranscodeSession) waitForOpenSegment(name string, timeout, stall time.D
 			}
 		}
 		if !running && waitErr != nil {
+			if canceled {
+				// Same self-teardown verdict as WaitForSegment.
+				return nil, ErrStaleSegmentGeneration
+			}
 			return nil, fmt.Errorf("%w: %w", ErrTranscodeFailed, waitErr)
 		}
 		if !running {
@@ -5361,6 +5422,52 @@ func (s *TranscodeSession) LastRequestedSegment() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.lastRequestedSegment
+}
+
+// AbandonedBeforeFirstSegment reports that this session answered a playlist
+// request and never received a single segment request afterwards. A failure
+// recovery on such a session is a client that reached the stream and then
+// walked away, not evidence about the recipe: the encode had a playlist ready
+// and delivered nothing to a player that asked, so replanning it spends the
+// adaptation budget on a route that never failed.
+//
+// The conditions are deliberately narrow. A session that never served a
+// playlist is a failure the client met before reading anything (a resolve, a
+// seek, a decoder, or a not-ready playlist), and a generation that is dead,
+// mid-restart, no longer servable, or carries a decoder verdict is an ordinary
+// failure; all of those keep the existing handling.
+func (s *TranscodeSession) AbandonedBeforeFirstSegment() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	requested := s.segmentRequested
+	manifestServed := s.manifestServed
+	running := s.running
+	restarting := s.restarting != nil
+	s.mu.Unlock()
+	if requested || !manifestServed || !running || restarting || s.IsDecodeFailed() {
+		return false
+	}
+	// GetManifest is the same readiness a client sees: it succeeds only once
+	// the playlist exists and its startup media is on disk. Failing it (a
+	// playlist still being written) keeps the ordinary failure handling.
+	if _, err := s.GetManifest(); err != nil {
+		return false
+	}
+	return true
+}
+
+// noteManifestServed marks a client-facing playlist request as answered. Only a
+// request the session could serve counts: a not-ready playlist is a failure the
+// client met inside the stream, not a client that abandoned it.
+func (s *TranscodeSession) noteManifestServed(err error) {
+	if s == nil || err != nil {
+		return
+	}
+	s.mu.Lock()
+	s.manifestServed = true
+	s.mu.Unlock()
 }
 
 // StartThrottler creates and starts a throttler for this session.
@@ -6303,9 +6410,21 @@ func (s *TranscodeSession) logFFmpegEvent(ctx context.Context, message, exitErro
 	s.opts.FFmpegLogSink.WriteEvent(ctx, s.opts.SessionID, attrs, message)
 }
 
-func (s *TranscodeSession) logWaitResult(ctx context.Context, waitErr error) {
+func (s *TranscodeSession) logWaitResult(ctx context.Context, waitErr error, canceled bool) {
 	if waitErr == nil {
 		s.logFFmpegEvent(ctx, "ffmpeg process exited", "")
+		return
+	}
+	if canceled {
+		// Teardown of our own generation: a restart, a switchover, or a stop.
+		// The exit status is our kill, not a verdict on the stream, so it stays
+		// out of the error-shaped ffmpeg event log that failure-recovery triage
+		// reads.
+		slog.DebugContext(ctx, "ffmpeg process stopped by session teardown",
+			"component", ffmpegComponent,
+			"playback_session_id", s.opts.SessionID,
+			"exit_error", formatWaitError(waitErr),
+		)
 		return
 	}
 	s.logFFmpegEvent(ctx, "ffmpeg process exit error", formatWaitError(waitErr))
