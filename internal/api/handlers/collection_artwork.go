@@ -190,6 +190,14 @@ func downloadCollectionImageURL(ctx context.Context, client *http.Client, rawURL
 // returns the S3 path of the original variant plus a thumbhash computed from
 // the w300 variant. The content revision gives replacement artwork a new URL
 // (issue #1258).
+func removeCollectionImageVariants(ctx context.Context, store blobstore.Store, prefix, collectionID, imageType string) error {
+	if store == nil {
+		return nil
+	}
+	_, err := store.Delete(ctx, []string{fmt.Sprintf("%s/%s/%s", prefix, collectionID, imageType)})
+	return err
+}
+
 func uploadCollectionImageVariants(
 	ctx context.Context,
 	store blobstore.Store,

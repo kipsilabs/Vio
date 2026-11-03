@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -2255,6 +2257,19 @@ func flattenEpisodeGroups(groups map[int][]*models.Episode) []*models.Episode {
 		flattened = append(flattened, episodes...)
 	}
 	return flattened
+}
+
+// metadataSeasonCounts returns provider-known episode totals by season.
+func (h *ItemsHandler) metadataSeasonCounts(ctx context.Context, seriesID string) (map[int]int, error) {
+	summaries, err := h.episodeRepo.ListMetadataSeasons(ctx, seriesID)
+	if err != nil {
+		return nil, err
+	}
+	counts := make(map[int]int, len(summaries))
+	for _, summary := range summaries {
+		counts[summary.SeasonNumber] = summary.EpisodeCount
+	}
+	return counts, nil
 }
 
 // requestProfileID resolves the active profile for a request, falling back to

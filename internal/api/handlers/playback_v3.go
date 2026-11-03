@@ -91,7 +91,6 @@ const (
 	// trackUnavailableReasonV3 is the transport reason for an audio remap miss:
 	// the candidate's audio inventory did not bind, not its video stream, so the
 	// client may pick another track without swapping the release.
-	trackUnavailableReasonV3 = "track_unavailable"
 	// subtitleDroppedUnavailableCodeV3 is the degradation-warning code for a
 	// successful plan whose selected subtitle was dropped; playback continues on
 	// the same release without it.
@@ -567,6 +566,17 @@ type recipeCardStoreV3 interface {
 	Get(ctx context.Context, key string) (*playback.RecipeCard, bool)
 	Put(ctx context.Context, key string, card playback.RecipeCard) error
 	Delete(ctx context.Context, key string) error
+}
+
+type virtualPlanDecisionV3 struct {
+	preferredAudioLanguage                        string
+	candidateRank, candidateCount                 int
+	substitutionReason, startAudioSelectionOrigin string
+	effectiveVirtualOwner                         int
+}
+type dvRPUMemoKeyV3 struct {
+	fileID              int
+	size, mtimeUnixNano int64
 }
 
 type transportErrorV3 struct {

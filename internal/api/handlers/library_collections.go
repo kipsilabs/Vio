@@ -35,6 +35,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/collections/templates"
 	"github.com/Silo-Server/silo-server/internal/collectionutil"
 	evt "github.com/Silo-Server/silo-server/internal/events"
+	"github.com/Silo-Server/silo-server/internal/imagesize"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/sections"
 	"github.com/Silo-Server/silo-server/internal/usercollections"
@@ -60,6 +61,9 @@ type LibraryCollectionHandler struct {
 	JobRepo               *adminjob.Repository
 	EventsHub             *evt.Hub
 	SortPreferenceCleaner *userstore.CollectionSortPreferenceCleaner
+	PersonalMemberCounts  *catalog.PersonalCollectionMemberCounts
+	CollectionOwners      catalog.PersonalCollectionAccess
+	PersonalCollages      *catalog.PersonalCollectionCollages
 
 	// itemCollectionIndex answers the item→collections reverse lookup behind
 	// the item detail "collections" field. Nil means use repo; tests inject a

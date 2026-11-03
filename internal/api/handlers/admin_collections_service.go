@@ -396,6 +396,10 @@ func (h *LibraryCollectionHandler) PreviewAdminCollection(ctx context.Context, r
 	return resp, nil
 }
 
+func (h *LibraryCollectionHandler) importAdminTrakt(ctx context.Context, req AdminCollectionImportTrakt, artwork adminCollectionArtwork) (AdminCollectionImportResult, error) {
+	return AdminCollectionImportResult{}, apiError(http.StatusGone, "unsupported_source", "new Trakt collections are not supported")
+}
+
 func (h *LibraryCollectionHandler) importAdminMDBList(ctx context.Context, req AdminCollectionImportMDBList, artwork adminCollectionArtwork) (AdminCollectionImportResult, error) {
 	var none AdminCollectionImportResult
 	if !hasLibrarySelection(req.LibraryID, req.LibraryIDs) || strings.TrimSpace(req.Title) == "" || strings.TrimSpace(req.URL) == "" {
