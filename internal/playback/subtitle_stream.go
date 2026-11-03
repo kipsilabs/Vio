@@ -19,7 +19,13 @@ import (
 // StreamExtractOpts configures a single streaming subtitle extract.
 type StreamExtractOpts struct {
 	// InputPath is the path to the source media file.
-	InputPath string
+	InputPath    string
+	Packets      *SubtitlePacketInput
+	Embedded     *EmbeddedSubtitleRef
+	KeepPath     string
+	KeepFormat   string
+	KeepOffset   time.Duration
+	KeepMaxBytes int64
 	// CacheIdentity is a credential-free, stable identity for a transient
 	// remote input. When set, subtitle caching uses a bounded generation
 	// instead of requiring os.Stat on InputPath.

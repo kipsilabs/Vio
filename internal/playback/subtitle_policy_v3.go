@@ -12,6 +12,14 @@ import (
 	"github.com/Silo-Server/silo-server/internal/models"
 )
 
+type SubtitleFactV3 uint8
+
+const (
+	SubtitleFactUnknownV3 SubtitleFactV3 = iota
+	SubtitleFactNoV3
+	SubtitleFactYesV3
+)
+
 type SubtitlePolicyResultV3 struct {
 	Decision             SubtitleDecisionV3
 	Claims               SubtitleClaimsV3

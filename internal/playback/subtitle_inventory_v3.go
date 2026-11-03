@@ -82,7 +82,8 @@ type SubtitleInventoryItemV3 struct {
 	// SyncKey names the track to the subtitle sync operations. Present on
 	// external and downloaded tracks whose timing can be corrected (SRT,
 	// WebVTT, ASS, SSA); stable across sessions and inventory reordering.
-	SyncKey string `json:"sync_key,omitempty"`
+	SyncKey      string                           `json:"sync_key,omitempty"`
+	HLSRendition *SubtitleInventoryHLSRenditionV3 `json:"hls_rendition,omitempty"`
 	// downloadedSubtitleID is deliberately not serialized: clients address the
 	// opaque session URL, while the server uses the row ID to make that URL
 	// stable across inventory reordering and seek reanchors.

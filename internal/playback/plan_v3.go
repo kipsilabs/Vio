@@ -216,7 +216,9 @@ type PlannerResultV3 struct {
 	// SubtitleRendition emits the selected subtitle as the HLS stream's
 	// subtitle rendition (Plan.Subtitle.HLSRendition): a transcode's, or an
 	// HLS copy remux's.
-	SubtitleRendition bool
+	SubtitleRendition       bool
+	SubtitleRenditionTracks []SubtitleRenditionTrack
+	SubtitleRenditionSource SubtitleRenditionSource
 	// DownloadedSubtitleID comes from the same inventory snapshot used for
 	// planning. Freezing must not re-list a mutable ordinal inventory after the
 	// route has already been accepted.
