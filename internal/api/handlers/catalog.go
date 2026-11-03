@@ -14,6 +14,7 @@ import (
 
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
 	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/imagesize"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/sections"
 )
@@ -184,7 +185,7 @@ func (h *CatalogHandler) catalogItemResponses(ctx context.Context, v ItemViewer,
 	responseWG.Add(2)
 	go func() {
 		defer responseWG.Done()
-		imageURLs = h.itemsH.itemListCardImageURLs(ctx, localizedItems, episodeMetadata, accessFilter.Artwork())
+		imageURLs = h.itemsH.itemListCardImageURLs(ctx, localizedItems, accessFilter.Artwork().For(imagesize.SlotPoster))
 	}()
 	go func() {
 		defer responseWG.Done()
@@ -212,13 +213,9 @@ func (h *CatalogHandler) catalogItemResponses(ctx context.Context, v ItemViewer,
 		resp.PlayContentID = playTargets[playableTargetKeyForItem(item)]
 		if meta, ok := episodeMetadata[item.ContentID]; ok {
 			applyEpisodeBrowseMetadata(&resp, meta)
-			if item.Type == itemTypeEpisode {
-				resp.ParentArtwork = episodeParentArtworkView(meta.ParentArtwork, imageURLs[item.ContentID].parents)
-			}
 		}
 		resp.PosterURL = imageURLs[item.ContentID].posterURL
 		resp.BackdropURL = imageURLs[item.ContentID].backdropURL
-		resp.LogoURL = imageURLs[item.ContentID].logoURL
 		resp.SortMetrics = sortMetrics[item.ContentID]
 		items = append(items, resp)
 	}
@@ -229,8 +226,6 @@ func applyEpisodeBrowseMetadata(resp *itemListResponse, meta episodeBrowseMetada
 	if resp == nil {
 		return
 	}
-	resp.PosterIsEpisodeStill = new(meta.StillPath != "" && resp.posterPath == meta.StillPath)
-	resp.BackdropIsEpisodeStill = new(meta.StillPath != "" && resp.backdropPath == meta.StillPath)
 	resp.SeriesID = meta.SeriesID
 	resp.SeriesTitle = meta.SeriesTitle
 	resp.SeasonNumber = meta.SeasonNumber
