@@ -193,11 +193,14 @@ func ResolveSubtitlePolicyV3(file *models.MediaFile, request StartRequestV3, tra
 		}
 	}
 	if transcodeAllowed {
-		if source != "embedded" || file.SubtitleTracks[transportIndex].IndexOnly {
-			return subtitleTerminalV3("subtitle_index_only_burn_in_unsupported", "The selected indexed subtitle cannot be burned in.")
-		}
 		if source != "embedded" {
 			return subtitleTerminalV3("subtitle_burn_in_source_unsupported", "The selected subtitle source cannot be burned in by the installed transport.")
+		}
+		if transportIndex < 0 || transportIndex >= len(file.SubtitleTracks) {
+			return subtitleTerminalV3("subtitle_index_only_burn_in_unsupported", "The selected indexed subtitle cannot be burned in.")
+		}
+		if file.SubtitleTracks[transportIndex].IndexOnly {
+			return subtitleTerminalV3("subtitle_index_only_burn_in_unsupported", "The selected indexed subtitle cannot be burned in.")
 		}
 		return SubtitlePolicyResultV3{
 			Decision:     SubtitleDecisionV3{Mode: SubtitleBurnInV3, TrackID: trackID},
