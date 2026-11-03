@@ -824,7 +824,7 @@ func (h *PlaybackHandler) finalizeStopV2(ctx context.Context, store playback.Pro
 	finalDeadline, _ := finalCtx.Deadline()
 	cleanupCtx, cancelCleanup := context.WithDeadline(finalCtx, finalDeadline.Add(-stopFinalizationReceiptGrace))
 	defer cancelCleanup()
-	historyID, cleanupErr := h.finishStopV2(cleanupCtx, record, sessionID, receipt.Accepted, receipt.HistoryID)
+	historyID, cleanupErr := h.finishStop(cleanupCtx, record, sessionID, receipt.Accepted, receipt.HistoryID, endReasonForStop(sessionID, receipt.StopID))
 	receipt.HistoryID = historyID
 	// A cleanup that did not finish leaves the stop replayable: the receipt is
 	// stored unfinalized so a later replay re-runs the idempotent writers rather
@@ -862,7 +862,7 @@ func (h *PlaybackHandler) finalizeStopV2(ctx context.Context, store playback.Pro
 // second row; every other step is naturally idempotent (progress, deny marker,
 // synced-session delete, proxy grant). The finalization therefore finalizes the
 // receipt only when this returns nil.
-func (h *PlaybackHandler) finishStopV2(ctx context.Context, record *playback.AttemptRecordV3, sessionID string, accepted *playback.ProgressSampleV3, priorHistoryID string) (string, error) {
+func (h *PlaybackHandler) finishStop(ctx context.Context, record *playback.AttemptRecordV3, sessionID string, accepted *playback.ProgressSampleV3, priorHistoryID string, reason PlaybackEndReason) (string, error) {
 	// The sole caller, finalizeStopV2, passes an already-detached, bounded
 	// context, so the deny marker, the final position, and the history writer run
 	// on the finalization budget instead of resetting another.
@@ -883,7 +883,7 @@ func (h *PlaybackHandler) finishStopV2(ctx context.Context, record *playback.Att
 				slog.WarnContext(ctx, "failed to apply final playback position", "component", "api", "session", sessionID, "playback_session_id", sessionID, "error", err)
 			}
 		}
-		result, err := h.stopPlaybackSessionWithResult(ctx, session, true, priorHistoryID)
+		result, err := h.stopPlaybackSessionWithResult(ctx, session, reason)
 		if err == nil {
 			return result.HistoryID, nil
 		}
@@ -898,6 +898,10 @@ func (h *PlaybackHandler) finishStopV2(ctx context.Context, record *playback.Att
 		// the shared rows are cleaned up.
 	}
 	synthesized := h.attemptSessionV2(ctx, record, position, paused)
+	if reason == PlaybackEndAborted || reason == PlaybackEndReplaced {
+		h.recordAdminStopHistory(ctx, synthesized, reason)
+		return priorHistoryID, nil
+	}
 	result, err := h.persistStopAndHistory(ctx, synthesized, priorHistoryID)
 	if err != nil {
 		return "", err
@@ -1920,6 +1924,33 @@ func validatePlaybackSessionID(sessionID string) error {
 
 // expiredStopID is the server-minted stop identity recorded on the attempt
 // row when a session ends without a client stop (expiry, abort).
+// abortStopID is the server-minted stop identity for an abandoned attempt.
+func abortStopID(sessionID string) string {
+	return uuid.NewSHA1(uuid.NameSpaceOID, []byte("silo-abort:"+sessionID)).String()
+}
+
+// adminStopID is the server-minted stop identity for an administrator end.
+func adminStopID(sessionID string) string {
+	return uuid.NewSHA1(uuid.NameSpaceOID, []byte("silo-admin-stop:"+sessionID)).String()
+}
+
+func endReasonForStop(sessionID, stopID string) PlaybackEndReason {
+	switch stopID {
+	case adminStopID(sessionID):
+		return PlaybackEndTerminated
+	case expiredStopID(sessionID):
+		return PlaybackEndExpired
+	case abortStopID(sessionID):
+		return PlaybackEndAborted
+	default:
+		return PlaybackEndStopped
+	}
+}
+
+func serverStopID(sessionID, stopID string) bool {
+	return stopID == adminStopID(sessionID) || stopID == expiredStopID(sessionID) || stopID == abortStopID(sessionID)
+}
+
 func expiredStopID(sessionID string) string {
 	return uuid.NewSHA1(uuid.NameSpaceOID, []byte("silo-expired:"+sessionID)).String()
 }

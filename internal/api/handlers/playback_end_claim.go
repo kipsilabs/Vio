@@ -126,7 +126,7 @@ func (c nativeEndClaim) ownEnd(stopID string) bool {
 // attempt row with that stop's reason and accepted sample: its watch and
 // admin history and its provider event, as the stop's own finalizer would.
 func (h *PlaybackHandler) FinishOtherEnd(ctx context.Context, claim nativeEndClaim, sessionID string) {
-	historyID, err := h.finishStop(ctx, claim.record, sessionID, claim.receipt.Accepted, claim.reason(sessionID, PlaybackEndStopped))
+	historyID, err := h.finishStop(ctx, claim.record, sessionID, claim.receipt.Accepted, claim.receipt.HistoryID, claim.reason(sessionID, PlaybackEndStopped))
 	if err != nil {
 		slog.WarnContext(ctx, "failed to finish an earlier playback stop", "component", "api", "session", sessionID, "playback_session_id", sessionID, "error", err)
 		return
@@ -181,7 +181,7 @@ func (h *PlaybackHandler) endSessionAsAdmin(ctx context.Context, sessionID strin
 	defer h.forgetProgressSideEffectLock(sessionID)
 	switch {
 	case claim.store != nil:
-		historyID, err := h.finishStop(ctx, claim.record, sessionID, claim.receipt.Accepted, claim.reason(sessionID, PlaybackEndTerminated))
+		historyID, err := h.finishStop(ctx, claim.record, sessionID, claim.receipt.Accepted, claim.receipt.HistoryID, claim.reason(sessionID, PlaybackEndTerminated))
 		if err != nil {
 			// The teardown failed before the writers ran: leave the end
 			// unfinalized, so its lease lapses and a retry can finish it.

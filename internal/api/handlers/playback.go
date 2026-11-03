@@ -3713,7 +3713,7 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 						continuationServe = true
 					}
 				} else {
-					target, ok, restartErr := h.tm.RestartSegmentLocked(
+					_, ok, restartErr := h.tm.RestartSegmentLocked(
 						r.Context(),
 						sessionID,
 						transcodeSession,

@@ -171,7 +171,11 @@ func unarbitratedRealtimeStop(result watchstate.PlaybackStopResult) realtimeStop
 func (h *PlaybackHandler) realtimeStopHistory(parent context.Context, session *playback.Session) realtimeStopOutcome {
 	store, ok := h.PlanStoreV3.(playback.ProgressStoreV3)
 	if !ok {
-		return unarbitratedRealtimeStop(h.persistStopAndHistory(parent, session))
+		result, err := h.persistStopAndHistory(parent, session, "")
+		if err != nil {
+			return unarbitratedRealtimeStop(watchstate.PlaybackStopResult{})
+		}
+		return unarbitratedRealtimeStop(result)
 	}
 	ctx, cancel := context.WithTimeout(parent, stopFinalizationLease)
 	defer cancel()
@@ -183,7 +187,11 @@ func (h *PlaybackHandler) realtimeStopHistory(parent context.Context, session *p
 		return unarbitratedRealtimeStop(watchstate.PlaybackStopResult{})
 	}
 	if record == nil {
-		return unarbitratedRealtimeStop(h.persistStopAndHistory(ctx, session)) // Unsequenced bridge play.
+		result, persistErr := h.persistStopAndHistory(ctx, session, "")
+		if persistErr != nil {
+			return unarbitratedRealtimeStop(watchstate.PlaybackStopResult{})
+		}
+		return unarbitratedRealtimeStop(result) // Unsequenced bridge play.
 	}
 	var final *playback.ProgressSampleV3
 	if record.LastSample == nil && session.Position > 0 {
