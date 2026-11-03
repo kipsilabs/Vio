@@ -40,7 +40,7 @@ import (
 type PlaybackCaller struct {
 	UserID                                                int
 	ProfileID, InstallationID                             string
-	DeviceID, DeviceName, Platform                        string
+	DeviceID, ConnectionDeviceID, DeviceName, Platform    string
 	UserAgent, RemoteAddr                                 string
 	ClientName, ClientVersion, ClientBuild, ClientChannel string
 	// DeclaredDevice is the device the client declared in its
@@ -222,6 +222,8 @@ func (h *PlaybackHandler) PlaybackCapabilities(ctx context.Context, userID int, 
 // handler and never carries credentials, a body stream, or a response writer.
 // nativeAPIV2ContextKey marks a request that arrived through /api/v2.
 type nativeAPIV2ContextKey struct{}
+type playbackConnectionDeviceContextKey struct{}
+type playbackDeclaredDeviceContextKey struct{}
 
 // WithNativeAPIV2 marks ctx as serving /api/v2. The playback and stream
 // handlers are shared with the frozen /api/v1 routes, and contract additions
@@ -366,7 +368,10 @@ func withNativeServerFeaturesV3(response playback.DecisionResponseV3) playback.D
 func playbackCallerRequest(ctx context.Context, caller PlaybackCaller) *http.Request {
 	headers := make(http.Header)
 	headers.Set(deviceIDHeader, caller.DeviceID)
+	headers.Set("X-Silo-Device-Id", caller.ConnectionDeviceID)
 	headers.Set(deviceNameHeader, caller.DeviceName)
+	ctx = context.WithValue(ctx, playbackConnectionDeviceContextKey{}, caller.ConnectionDeviceID)
+	ctx = context.WithValue(ctx, playbackDeclaredDeviceContextKey{}, caller.DeclaredDevice)
 	headers.Set(devicePlatformHeader, caller.Platform)
 	headers.Set("User-Agent", caller.UserAgent)
 	headers.Set("X-Vio-Client", caller.ClientName)

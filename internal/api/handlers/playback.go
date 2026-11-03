@@ -3547,7 +3547,7 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 	if isSubtitleSegment {
 		// Subtitle rendition segments never wait out or restart the video
 		// pipeline: they are answered from the cues already on disk.
-		transcodeSession.ServeSubtitleSegment(w, r, subtitleSegment)
+		transcodeSession.ServeSubtitleSegment(w, r, segmentName)
 		return
 	}
 	requestedGeneration := strings.TrimSpace(r.URL.Query().Get(playback.GenerationQueryParam))
@@ -3661,7 +3661,18 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 					"session", sessionID,
 					"playback_session_id", sessionID,
 				)
-				segmentLease, err = transcodeSession.WaitForOpenSegmentContext(r.Context(), segmentName, decision.WaitTimeout)
+				if decision.Reason == "near_produced_head" {
+					segmentLease, err = transcodeSession.WaitForOpenSegmentWithStall(segmentName, decision.WaitTimeout, playback.SegmentStallTimeoutFor(transcodeSession.Opts()))
+				} else {
+					segmentLease, err = transcodeSession.WaitForOpenSegmentContext(r.Context(), segmentName, decision.WaitTimeout)
+				}
+				if errors.Is(err, playback.ErrSegmentStalled) {
+					stalledHead := transcodeSession.SegmentProgress(time.Now()).ProducedHead
+					slog.WarnContext(r.Context(), "transcode segment production stalled", "component", "api", "segment", segmentName, "requested_segment", segNum, "produced_head", stalledHead, "reason", decision.Reason, "session", sessionID, "playback_session_id", sessionID)
+					decision.RestartOnTimeout = true
+					segmentStalled = true
+					err = playback.ErrSegmentNotFound
+				}
 				if err != nil && errors.Is(err, playback.ErrSegmentNotFound) {
 					slog.InfoContext(r.Context(), "transcode segment wait timeout", "component", "api",
 						"segment", segmentName,
@@ -3684,6 +3695,20 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 			// timeline position or return 404 for copy-mode segments outside the
 			// current manifest window.
 			if err != nil && errors.Is(err, playback.ErrSegmentNotFound) && decision.RestartOnTimeout {
+				if (decision.Reason == playback.SegmentRecoveryFarSeekReason || segmentStalled) && !transcodeSession.IsCopyVideo() {
+					h.tm.RestartSegmentAsync(sessionID, transcodeSession, segNum)
+					segmentLease, err = transcodeSession.WaitForRestartContinuationWithin(segmentName, playback.RestartContinuationRemaining(recoveryStarted))
+					if err == nil && requestedGeneration != "" {
+						if _, token, ok := transcodeSession.RestartContinuationSegment(requestedGeneration, segmentName); ok {
+							continuationSuccessorToken = token
+						} else if transcodeSession.MatchesGenerationToken(requestedGeneration) {
+							continuationSuccessorToken = requestedGeneration
+						} else {
+							_ = segmentLease.Close(); segmentLease = nil; err = playback.ErrStaleSegmentGeneration
+						}
+					}
+					if err == nil { continuationServe = true }
+				} else {
 				target, ok, restartErr := h.tm.RestartSegmentLocked(
 					r.Context(),
 					sessionID,
