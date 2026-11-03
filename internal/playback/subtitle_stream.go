@@ -380,8 +380,12 @@ func streamExtractArgs(opts StreamExtractOpts) []string {
 
 	args = append(args, "-f", outFormat, "pipe:1")
 	if opts.KeepPath != "" && !seekApplied {
-		args = append(args, "-map", fmt.Sprintf("0:s:%d", trackIndex), "-c:s", "copy", "-output_ts_offset", strconv.FormatFloat(opts.KeepOffset.Seconds(), 'f', 6, 64), "-flush_packets", "1", "-fs", strconv.FormatInt(opts.demuxCopyLimit(), 10), "-f", opts.KeepFormat, "file:"+opts.KeepPath)
-		args = append(args[:3], append([]string{"-y"}, args[3:]...)...)
+		args = append(args, "-map", fmt.Sprintf("0:s:%d", trackIndex), "-c:s", "copy", "-output_ts_offset", strconv.FormatFloat(opts.KeepOffset.Seconds(), 'f', 6, 64), "-flush_packets", "1", "-fs", strconv.FormatInt(opts.demuxCopyLimit(), 10))
+		if opts.KeepFormat == "mp4" {
+			args = append(args, "-movflags", "+faststart")
+		}
+		args = append(args, "-f", opts.KeepFormat, "file:"+opts.KeepPath)
+		args = append([]string{"-hide_banner", "-nostats", "-loglevel", "error", "-y"}, append(args[4:5], args[5:]...)...)
 	}
 	return args
 }

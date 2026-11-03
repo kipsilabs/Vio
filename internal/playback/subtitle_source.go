@@ -145,14 +145,17 @@ func (c *SubtitleCache) sourced(extract SUPExtractFunc) SUPExtractFunc {
 		// (and its source-timeline semantics) remains the first fallback.
 		// Extracted artifacts are already the single-track input and must not
 		// be routed back through the embedded source either.
-		if opts.Embedded == nil || opts.Packets != nil || opts.windowIntent() || opts.InputIsExtractedSup || opts.InputIsExtractedText != "" {
+		if opts.Embedded == nil || opts.Packets != nil || opts.InputIsExtractedSup || opts.InputIsExtractedText != "" {
 			return extract(ctx, opts)
 		}
 		// Index-only tracks must never fall through to FFmpeg's source demux.
 		// This guard must run before checking the optional source: callers can
 		// still provide an index-only ref when no source implementation is set.
-		if opts.Embedded.IndexOnly && c.source == nil {
+		if opts.Embedded.IndexOnly {
 			return ErrSubtitleIndexOnly
+		}
+		if opts.windowIntent() {
+			return extract(ctx, opts)
 		}
 		if c.source == nil {
 			return extract(ctx, opts)
