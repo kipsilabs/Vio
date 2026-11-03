@@ -23,7 +23,6 @@ import (
 	"github.com/Silo-Server/silo-server/internal/logredact"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
-	"github.com/Silo-Server/silo-server/internal/playback/connectionstore"
 	"github.com/Silo-Server/silo-server/internal/userstore"
 )
 
@@ -39,7 +38,6 @@ import (
 // of one v2 playback request. InstallationID is the value the client read
 // from capabilities; a mutation from a different installation is refused.
 type PlaybackCaller struct {
-	ConnectionDeviceID                                    string
 	UserID                                                int
 	ProfileID, InstallationID                             string
 	DeviceID, DeviceName, Platform                        string
@@ -60,11 +58,6 @@ type PlaybackCapabilitiesView struct {
 	ProtocolVersions                []int
 	Features                        []string
 	Deliveries                      []playback.DeliveryV3
-	// The connection speed test's schedule, with connection_speed_v1. A zero
-	// target means the server has no bitrates to set one from.
-	BandwidthProbeTargetKbps    int
-	BandwidthProbeAutomatic     bool
-	BandwidthProbeMaxAgeSeconds int
 }
 
 const playbackCapabilityStateAvailable = "available"
@@ -210,18 +203,14 @@ func (h *PlaybackHandler) PlaybackCapabilities(ctx context.Context, userID int, 
 		return view, playbackOperationError(http.StatusConflict, "capability_not_configured", "Playback installation identity is not configured")
 	}
 	view.InstallationID = h.InstallationID
-	view.Features = append(playback.NativeServerFeaturesV3(), "sequenced_progress_v1", "fixed_media_file_v1", "marker_segments_v1", "trickplay_v1", "bandwidth_probe_v1", playback.FeatureConnectionSpeedV1)
+	view.Features = append(playback.NativeServerFeaturesV3(), "sequenced_progress_v1", "fixed_media_file_v1", "marker_segments_v1", "trickplay_v1")
 	if h.WatchTogetherAvailable {
 		view.Features = append(view.Features, "watch_party_source_fallback_v1", "watch_party_coordinator_v1")
 	}
 	view.Deliveries = []playback.DeliveryV3{playback.DeliveryOriginalHTTPV3, playback.DeliveryRemuxProgressiveV3, playback.DeliveryRemuxHLSV3}
-	settings := h.playbackConfig()
-	if settings.TranscodeEnabled {
+	if h.playbackConfig().TranscodeEnabled {
 		view.Deliveries = append(view.Deliveries, playback.DeliveryTranscodeHLSV3)
 	}
-	view.BandwidthProbeAutomatic = !settings.AutomaticBandwidthProbeOff
-	view.BandwidthProbeMaxAgeSeconds = int(settings.BandwidthProbeMaxAge() / time.Second)
-	view.BandwidthProbeTargetKbps = h.bandwidthProbeTargetKbps(ctx)
 	capability, _ := json.Marshal(view) // This view contains only JSON-safe scalar values.
 	digest := sha256.Sum256(capability)
 	view.Revision = hex.EncodeToString(digest[:])
@@ -233,12 +222,6 @@ func (h *PlaybackHandler) PlaybackCapabilities(ctx context.Context, userID int, 
 // handler and never carries credentials, a body stream, or a response writer.
 // nativeAPIV2ContextKey marks a request that arrived through /api/v2.
 type nativeAPIV2ContextKey struct{}
-type playbackConnectionDeviceContextKey struct{}
-
-// playbackDeclaredDeviceContextKey carries PlaybackCaller.DeclaredDevice. The
-// request playbackCallerRequest builds maps the v2 X-Device-ID onto the v1
-// device header, so the device a v2 client declared travels beside it.
-type playbackDeclaredDeviceContextKey struct{}
 
 // WithNativeAPIV2 marks ctx as serving /api/v2. The playback and stream
 // handlers are shared with the frozen /api/v1 routes, and contract additions
@@ -382,8 +365,6 @@ func withNativeServerFeaturesV3(response playback.DecisionResponseV3) playback.D
 
 func playbackCallerRequest(ctx context.Context, caller PlaybackCaller) *http.Request {
 	headers := make(http.Header)
-	ctx = context.WithValue(ctx, playbackConnectionDeviceContextKey{}, caller.ConnectionDeviceID)
-	ctx = context.WithValue(ctx, playbackDeclaredDeviceContextKey{}, caller.DeclaredDevice)
 	headers.Set(deviceIDHeader, caller.DeviceID)
 	headers.Set(deviceNameHeader, caller.DeviceName)
 	headers.Set(devicePlatformHeader, caller.Platform)
@@ -450,21 +431,18 @@ func (h *PlaybackHandler) ApplyProgressV2(ctx context.Context, caller PlaybackCa
 		return PlaybackMutationView{}, err
 	}
 	if record.StoppedAt != nil {
-		return PlaybackMutationView{}, h.stoppedAttemptError(ctx, sessionID, record)
+		return PlaybackMutationView{}, playbackSessionNotFoundOperationError()
 	}
 	sample := playback.ProgressSampleV3{Sequence: command.Sequence, Position: command.Position, IsPaused: command.IsPaused}
 	receipt, err := store.ApplyProgress(ctx, sessionID, sample)
 	switch {
 	case errors.Is(err, playback.ErrProgressConflictV3):
 		return PlaybackMutationView{}, playbackOperationError(http.StatusConflict, PlaybackCodeProgressConflict, "The sequence already has different progress")
-	case errors.Is(err, playback.ErrAttemptStoppedV3):
-		return PlaybackMutationView{}, h.stoppedAttemptError(ctx, sessionID, nil)
-	case errors.Is(err, playback.ErrSessionNotFound):
+	case errors.Is(err, playback.ErrAttemptStoppedV3), errors.Is(err, playback.ErrSessionNotFound):
 		return PlaybackMutationView{}, playbackSessionNotFoundOperationError()
 	case err != nil:
 		return PlaybackMutationView{}, playbackStoreOperationError()
 	}
-	h.publishSequencedPause(ctx, sessionID, receipt.Lifecycle)
 	view := PlaybackMutationView{Outcome: receipt.Outcome, Accepted: acceptedProgressV2(receipt.Accepted)}
 	// An applied sample persists. A replayed one (the exact latest sample
 	// again) persists too: the client retried because the first reply was
@@ -473,22 +451,9 @@ func (h *PlaybackHandler) ApplyProgressV2(ctx context.Context, caller PlaybackCa
 	if receipt.Outcome != playback.ProgressAppliedV3 && receipt.Outcome != playback.ProgressReplayedV3 {
 		return view, nil
 	}
-	// The row CAS is the durable truth and stays on the request context. The
-	// ordered side effects (user-store progress, admin session sync, scrobble)
-	// run behind their own bounded budget: a wedged writer used to hold the
-	// progress response for up to a minute while paused, blocking the next
-	// heartbeat (45s/60s holds observed in production). A timed-out writer is
-	// idempotent to replay, and the next sample re-runs it from the row.
-	sideEffectCtx, cancelSideEffects := context.WithTimeout(ctx, progressSideEffectBudget)
-	defer cancelSideEffects()
-	h.persistProgressV2(sideEffectCtx, store, record, sessionID, sample)
+	h.persistProgressV2(ctx, store, record, sessionID, sample)
 	return view, nil
 }
-
-// progressSideEffectBudget bounds how long a progress response waits for its
-// ordered side effects after the row CAS has committed. It is a variable so a
-// test can shorten it.
-var progressSideEffectBudget = 5 * time.Second
 
 // maxProgressWritePassesV2 bounds how many times persistProgressV2 rewrites
 // the side effects after the row moved under it. Each extra pass needs the
@@ -564,30 +529,13 @@ func (h *PlaybackHandler) writeProgressSideEffectsV2(ctx context.Context, record
 	session, err := h.sessionMgr.GetSession(sessionID)
 	if err == nil && session != nil {
 		wasPaused := session.IsPaused
-		var updateErr error
-		if mgr, ok := h.sessionMgr.(interface {
-			UpdateProgressSample(string, playback.ProgressSampleV3) error
-		}); ok {
-			updateErr = mgr.UpdateProgressSample(sessionID, sample)
-		} else {
-			updateErr = h.sessionMgr.UpdateProgress(sessionID, sample.Position, sample.IsPaused)
+		if err := h.sessionMgr.UpdateProgress(sessionID, sample.Position, sample.IsPaused); err != nil && !errors.Is(err, playback.ErrSessionNotFound) {
+			slog.WarnContext(ctx, "failed to update live playback progress", "component", "api", "session", sessionID, "playback_session_id", sessionID, "error", err)
 		}
-		if updateErr != nil && !errors.Is(updateErr, playback.ErrSessionNotFound) {
-			slog.WarnContext(ctx, "failed to update live playback progress", "component", "api", "session", sessionID, "playback_session_id", sessionID, "error", updateErr)
-		}
+		h.syncSessionsOnPauseChange(ctx, wasPaused, sample.IsPaused)
 		if current, getErr := h.sessionMgr.GetSession(sessionID); getErr == nil && current != nil {
-			// A pause/resume transition can only be emitted once: the next
-			// heartbeat sees wasPaused == IsPaused and skips it. Run it before
-			// the admin session sync and the user-store write, which are both
-			// slower and retryable, so a wedged sync can no longer consume the
-			// side-effect budget and silently drop the scrobble. The row CAS is
-			// already durable, so a persistence write skipped after an expired
-			// budget is replayed from the row by the next sample. The admin
-			// session sync is not replayed by that path: it heals only on the
-			// periodic reconcile tick or the next pause/resume transition.
-			h.scrobblePauseTransitionV2(ctx, current, wasPaused)
 			h.persistProgress(ctx, current)
-			h.syncSessionsOnPauseChange(ctx, wasPaused, current.IsPaused)
+			h.scrobblePauseTransitionV2(ctx, current, wasPaused)
 			return
 		}
 	}
@@ -704,10 +652,6 @@ func (h *PlaybackHandler) forgetProgressSideEffectLock(sessionID string) {
 		return
 	}
 	h.virtualDeliveryCleared.Delete(sessionID)
-	// The session is terminal, so no outstanding subtitle-inventory wait can
-	// still be ended by a delivery. Dropping it keeps a long-lived process from
-	// retaining one record per historical session.
-	h.forgetSubtitleInventoryWait(sessionID)
 	// The session is terminal, so no outstanding audio withdrawal can still be
 	// delivered or complete. Dropping its in-process retry state here keeps a
 	// long-lived process from retaining state for every session it ever served.
@@ -722,12 +666,7 @@ func (h *PlaybackHandler) scrobblePauseTransitionV2(ctx context.Context, sess *p
 	if loadErr != nil || file == nil {
 		return
 	}
-	targetID, targetErr := h.playbackProgressTarget(ctx, file)
-	if targetErr != nil {
-		slog.WarnContext(ctx, "failed to resolve canonical episode for pause scrobble", "component", "api",
-			"session", sess.ID, "error", targetErr)
-		return
-	}
+	targetID := playbackProgressTarget(file)
 	if targetID == "" {
 		return
 	}
@@ -755,11 +694,6 @@ func (h *PlaybackHandler) StopPlaybackV2(ctx context.Context, caller PlaybackCal
 	}
 	if id, err := uuid.Parse(command.StopID); err != nil || id == uuid.Nil || id.String() != command.StopID {
 		return PlaybackMutationView{}, playbackOperationError(http.StatusBadRequest, "bad_request", "A canonical stop_id is required")
-	}
-	if serverStopID(sessionID, command.StopID) {
-		// The server's own stop ids say who ended the attempt; a client
-		// stop must not claim one.
-		return PlaybackMutationView{}, playbackOperationError(http.StatusBadRequest, "bad_request", "The stop_id is reserved")
 	}
 	if command.Sequence < 0 || (command.Position == nil) != (command.Sequence == 0) ||
 		(command.Position != nil && (*command.Position < 0 || math.IsNaN(*command.Position) || math.IsInf(*command.Position, 0))) {
@@ -818,23 +752,6 @@ const stopFinalizationBudget = 20 * time.Second
 // stop could be left with no receipt and a later replay would redo the writers.
 const stopFinalizationReceiptGrace = 3 * time.Second
 
-// nativeStopHistoryNamespace derives a v2 stop's watch-history row ID from its
-// durable stop identity, the same way compatPlayHistoryNamespace does for a
-// Jellyfin session.
-var nativeStopHistoryNamespace = uuid.MustParse("6f1b4d2a-9c37-4c58-8a10-7e5b3d9f20c4")
-
-// stopHistoryIDV2 names the watch-history row of a v2 stop. It is derived from
-// the durable stop identity the attempt row already carries rather than minted
-// at write time, so the key exists before the history row is inserted. A crash
-// or receipt-write failure between that insert and RecordStopReceipt leaves the
-// row's HistoryID unset; a later replay derives the same key and AddVisibleHistory
-// reports the row already exists instead of adding a second one for one stop.
-// Deriving per stop, not per session, preserves the native rule that a session
-// resumed under the same id records each stretch separately.
-func stopHistoryIDV2(stopID string) string {
-	return uuid.NewSHA1(nativeStopHistoryNamespace, []byte(stopID)).String()
-}
-
 // finalizeStopV2 claims finalization, runs the stop side effects, and records
 // the finalized receipt. When the claim is lost the stored receipt is returned
 // unchanged. The stop is already committed on the attempt row by the time this
@@ -852,10 +769,8 @@ func stopHistoryIDV2(stopID string) string {
 // so a later replay re-runs the idempotent writers to repair the session rather
 // than treat a half-torn stop as done.
 func (h *PlaybackHandler) finalizeStopV2(ctx context.Context, store playback.ProgressStoreV3, record *playback.AttemptRecordV3, sessionID string, receipt playback.StopReceiptV3) playback.StopReceiptV3 {
-	// The caller's request context no longer bounds the durable side effects, and
-	// neither does its deadline: a request that already timed out is exactly the
-	// case this exists for. The finalization takes its own fresh budget, which a
-	// nested detached teardown below can only narrow further.
+	// The caller's request context no longer bounds the durable side effects,
+	// but its deadline, if any, still narrows this budget.
 	finalCtx, cancelFinal := detachedWithin(ctx, stopFinalizationBudget)
 	defer cancelFinal()
 	claimed, err := store.ClaimStopFinalization(finalCtx, sessionID, time.Now().Add(stopFinalizationLease))
@@ -897,7 +812,28 @@ func (h *PlaybackHandler) finalizeStopV2(ctx context.Context, store playback.Pro
 			}
 		}
 	}
-	receipt.HistoryID = h.finishStopV2(ctx, record, sessionID, receipt.Accepted, endReasonForStop(sessionID, receipt.StopID))
+	// The cleanup runs inside the budget but may not consume the receipt's
+	// reserved slice. finishStopV2's nested teardowns clamp to this deadline, so
+	// a slow cleanup cannot push the receipt past the shared budget and leave the
+	// stop replayable.
+	finalDeadline, _ := finalCtx.Deadline()
+	cleanupCtx, cancelCleanup := context.WithDeadline(finalCtx, finalDeadline.Add(-stopFinalizationReceiptGrace))
+	defer cancelCleanup()
+	historyID, cleanupErr := h.finishStopV2(cleanupCtx, record, sessionID, receipt.Accepted, receipt.HistoryID)
+	receipt.HistoryID = historyID
+	// A cleanup that did not finish leaves the stop replayable: the receipt is
+	// stored unfinalized so a later replay re-runs the idempotent writers rather
+	// than pin a half-torn session as done. Storing it also releases this claim,
+	// so the retry is not blocked for the whole lease.
+	if cleanupErr != nil {
+		slog.WarnContext(finalCtx, "playback stop cleanup incomplete; leaving the stop replayable",
+			"component", "api", "session", sessionID, "playback_session_id", sessionID, "error", cleanupErr)
+		receipt.FinalizingUntil = time.Time{}
+		if err := store.RecordStopReceipt(finalCtx, sessionID, receipt); err != nil {
+			slog.WarnContext(finalCtx, "failed to release playback stop finalization", "component", "api", "session", sessionID, "playback_session_id", sessionID, "error", err)
+		}
+		return receipt
+	}
 	receipt.Finalized = true
 	// The receipt lands on the remaining budget. It is intentionally not given a
 	// fresh detached bound: extending past the shared deadline would let a slow
@@ -913,20 +849,24 @@ func (h *PlaybackHandler) finalizeStopV2(ctx context.Context, store playback.Pro
 // session stop + transcode teardown when this replica holds the session (its
 // finalizer runs the history writer), the history writer directly from a
 // session synthesized from the attempt row otherwise. The deny marker is
-// written in both cases. It returns the watch-history id when one was made.
-// reason is the end reason of the stop that won the row: a replayed stop can
-// finish an administrator's or an expiry's.
-func (h *PlaybackHandler) finishStopV2(ctx context.Context, record *playback.AttemptRecordV3, sessionID string, accepted *playback.ProgressSampleV3, reason PlaybackEndReason) string {
-	historyID, err := h.finishStop(ctx, record, sessionID, accepted, reason)
-	if err != nil {
-		slog.WarnContext(ctx, "failed to stop playback session", "component", "api", "session", sessionID, "playback_session_id", sessionID, "error", err)
+// written in both cases. It returns the watch-history id when one was made and
+// a non-nil error when any durable step did not complete.
+//
+// priorHistoryID is the history row a previous attempt of this same stop already
+// wrote, recorded in the stop receipt. It is reused so a retry cannot add a
+// second row; every other step is naturally idempotent (progress, deny marker,
+// synced-session delete, proxy grant). The finalization therefore finalizes the
+// receipt only when this returns nil.
+func (h *PlaybackHandler) finishStopV2(ctx context.Context, record *playback.AttemptRecordV3, sessionID string, accepted *playback.ProgressSampleV3, priorHistoryID string) (string, error) {
+	// The sole caller, finalizeStopV2, passes an already-detached, bounded
+	// context, so the deny marker, the final position, and the history writer run
+	// on the finalization budget instead of resetting another.
+	if err := ctx.Err(); err != nil {
+		// The budget ended while the claim or an earlier step ran. Starting the
+		// teardown now would run it after the lease another replica may take
+		// over; reject it.
+		return "", err
 	}
-	return historyID
-}
-
-// finishStop is finishStopV2 reporting a failure to stop the live copy here,
-// for callers that answer with it.
-func (h *PlaybackHandler) finishStop(ctx context.Context, record *playback.AttemptRecordV3, sessionID string, accepted *playback.ProgressSampleV3, reason PlaybackEndReason) (string, error) {
 	h.StreamDeny.Deny(ctx, sessionID)
 	position, paused := 0.0, false
 	if accepted != nil {
@@ -938,31 +878,34 @@ func (h *PlaybackHandler) finishStop(ctx context.Context, record *playback.Attem
 				slog.WarnContext(ctx, "failed to apply final playback position", "component", "api", "session", sessionID, "playback_session_id", sessionID, "error", err)
 			}
 		}
-		result, err := h.stopPlaybackSessionWithResult(ctx, session, reason)
+		result, err := h.stopPlaybackSessionWithResult(ctx, session, true, priorHistoryID)
 		if err == nil {
 			return result.HistoryID, nil
 		}
 		if !errors.Is(err, playback.ErrSessionNotFound) {
-			return "", err
+			// The local stop did not finish: its durable writes (the history row
+			// and the synced-session delete) are incomplete. Keep the history id
+			// the writer did produce and leave the stop open for a retry.
+			return result.HistoryID, err
 		}
 		// Lost the race with another stop of the live session; fall through to
 		// the row-synthesized writers so the final sample is still recorded and
 		// the shared rows are cleaned up.
 	}
-	// No copy here to finalize: the copy on another replica, if any, finds
-	// the attempt stopped and is dropped without history, so the admin log
-	// is written from the attempt row and the live row that copy synced.
-	if accepted == nil {
-		position = playback.PositionUnknown
+	synthesized := h.attemptSessionV2(ctx, record, position, paused)
+	result, err := h.persistStopAndHistory(ctx, synthesized, priorHistoryID)
+	if err != nil {
+		return "", err
 	}
-	session := h.attemptSessionV2(ctx, record, position, paused)
-	h.fillDetachedSession(ctx, session, record.CreatedAt)
-	result := h.recordStopHistory(ctx, session, reason)
-	// The copy on another replica is dropped without telling providers, so
-	// the end recorded here does, unless its caller tells them itself.
-	if !leaveProviderNotice(ctx) {
-		h.notifyStoppedSession(ctx, session, result, reason)
+	// The synced-session row lives in a store shared by every replica, so a
+	// replica that does not hold the live session still deletes it. This is the
+	// step a retried stop exists to repair.
+	if h.AdminStore != nil {
+		if err := h.AdminStore.DeleteSession(ctx, sessionID); err != nil {
+			return result.HistoryID, fmt.Errorf("delete synced session: %w", err)
+		}
 	}
+	h.deleteProxyGrantV3(ctx, sessionID)
 	return result.HistoryID, nil
 }
 
@@ -1031,30 +974,17 @@ func (h *PlaybackHandler) ReplanPlaybackV2(ctx context.Context, caller PlaybackC
 	// seek must not launch a replacement transport the deny marker will
 	// refuse to serve. The store's commit predicate refuses stopped rows too.
 	if record, err := h.PlanStoreV3.GetAttempt(ctx, sessionID); err == nil && record != nil && record.StoppedAt != nil {
-		return playback.DecisionResponseV3{}, h.stoppedAttemptError(ctx, sessionID, record)
+		return playback.DecisionResponseV3{}, playbackSessionNotFoundOperationError()
 	}
 	response, err := h.replanPlaybackApplicationV3(playbackCallerSessionRequest(ctx, caller, sessionID), sessionID, body)
-	if err != nil { //nolint:nestif // upstream ReplanPlaybackV2 in playback_service.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
-		// A stop that lands after the check above reaches the replan as a
-		// missing live session or a refused commit, both reported as not
-		// found. Re-read the attempt so an administrator stop still answers
-		// 410 instead of the 404 the player renews from.
-		var opErr *PlaybackOperationError
-		if errors.Is(err, playback.ErrAttemptStoppedV3) || (errors.As(err, &opErr) && opErr.Status == http.StatusNotFound) {
-			if record, getErr := h.PlanStoreV3.GetAttempt(ctx, sessionID); getErr == nil && attemptEndedByAdmin(record) {
-				return playback.DecisionResponseV3{}, playbackSessionEndedByAdminError()
-			}
-		}
-		if errors.Is(err, playback.ErrAttemptStoppedV3) {
-			return playback.DecisionResponseV3{}, playbackSessionNotFoundOperationError()
-		}
+	if errors.Is(err, playback.ErrAttemptStoppedV3) {
+		return playback.DecisionResponseV3{}, playbackSessionNotFoundOperationError()
 	}
 	return withNativeServerFeaturesV3(response), err
 }
 
-// ReportRouteEventV2 is POST /api/v2/playback/route-events. Only the ownership
-// check waits on the store; the event itself is queued, and event_id dedups a
-// retried report.
+// ReportRouteEventV2 is POST /api/v2/playback/route-events. The event is
+// queued and never waits on the store; event_id dedups a retried report.
 func (h *PlaybackHandler) ReportRouteEventV2(ctx context.Context, caller PlaybackCaller, command PlaybackRouteEventCommand) error {
 	if err := h.validatePlaybackCaller(ctx, caller); err != nil {
 		return err
@@ -1088,14 +1018,7 @@ func (h *PlaybackHandler) ReportRouteEventV2(ctx context.Context, caller Playbac
 		return playbackOperationError(http.StatusForbidden, "forbidden", "Route event does not belong to this profile")
 	}
 	event.Diagnostics = sanitizeDiagnosticsV3(event.Diagnostics)
-	record := playback.RouteEventRecordV3{RouteEventV3: event, EventID: command.EventID, UserID: caller.UserID, ProfileID: caller.ProfileID, ClientName: caller.ClientName, ClientVersion: caller.ClientVersion, ClientBuild: caller.ClientBuild, ClientChannel: caller.ClientChannel, ClientModel: event.Diagnostics["device_model"]}
-	if event.Event == playback.RouteEventPlanSummaryV3 {
-		record.ConnectionDeviceID = connectionDeviceV3(caller.ConnectionDeviceID)
-		record.ConnectionKey, _ = connectionstore.Key(ctx, h.JWTSecret)
-		record.ReceivedAt = time.Now().UTC()
-		record.SampleLifetime = h.playbackConfig().BandwidthProbeMaxAge()
-	}
-	h.enqueueRouteEventV3(record)
+	h.enqueueRouteEventV3(playback.RouteEventRecordV3{RouteEventV3: event, EventID: command.EventID, UserID: caller.UserID, ProfileID: caller.ProfileID, ClientName: caller.ClientName, ClientVersion: caller.ClientVersion, ClientBuild: caller.ClientBuild, ClientChannel: caller.ClientChannel, ClientModel: event.Diagnostics["device_model"]})
 	return nil
 }
 
@@ -1136,8 +1059,17 @@ func (h *PlaybackHandler) GetPlaybackInventoryV2(ctx context.Context, caller Pla
 		return playback.PlaybackInventoryV3{}, playbackStoreOperationError()
 	}
 	inventory, invErr := h.playbackInventoryForSession(ctx, session, record)
+	if errors.Is(invErr, errPlaybackInventorySubtitlesUnavailable) {
+		return playback.PlaybackInventoryV3{}, playbackStoreOperationError()
+	}
 	return inventory, invErr
 }
+
+// errPlaybackInventorySubtitlesUnavailable marks a live-inventory read that
+// failed because the subtitle inventory dependency was unavailable. The v2 and
+// v1 readers map it to their own established problem shapes; the sentinel keeps
+// the shared resolver from picking one.
+var errPlaybackInventorySubtitlesUnavailable = errors.New("playback inventory subtitle load failed")
 
 // playbackInventoryForSession resolves the live inventory and the effective
 // version identity for an active session. Both the v2 and v3 readers call it so
@@ -1169,32 +1101,10 @@ func (h *PlaybackHandler) playbackInventoryForSession(ctx context.Context, sessi
 			candidateURI = strings.TrimSpace(file.FilePath)
 		}
 		effectiveVirtualURI = candidateURI
-		file = h.inventoryEffectiveFile(ctx, file, session, record, candidateURI)
+		file = h.inventoryEffectiveFile(ctx, file, session, candidateURI)
 	}
 
 	return h.playbackInventoryForFileV3(ctx, session, record, file, effectiveVirtualURI)
-}
-
-// subtitleInventoryWaitBlockerV3 names the gate holding a session's subtitle
-// inventory when its first unverified read starts the wait. A stamped row waits
-// on fresh evidence for the served generation; a session with an armed probe
-// waits on that enumeration; with no probe armed the enumeration is deferred
-// until the transport resolves, so the wait sits on the relay. It is diagnostic
-// only and never changes what is served.
-func subtitleInventoryWaitBlockerV3(session *playback.Session, file *models.MediaFile) string {
-	if file != nil && file.ProbeUpdatedAt != nil {
-		// The row has probe evidence, but not for the generation this read
-		// describes (a rotated/duplicate row or a refused write): the menu waits
-		// on fresh evidence, not on a first probe.
-		return subtitleWaitBlockerStale
-	}
-	if session != nil && session.VirtualProbeOutcome == playback.VirtualProbeOutcomePending {
-		// A probe lifecycle is armed and enumerating; the rows will arrive.
-		return subtitleWaitBlockerUnprobed
-	}
-	// No probe evidence has landed and none is armed: the enumeration is
-	// deferred until the transport resolves the relay.
-	return subtitleWaitBlockerRelay
 }
 
 // playbackInventoryForFileV3 builds the wire inventory for one session from an
@@ -1216,29 +1126,15 @@ func (h *PlaybackHandler) playbackInventoryForFileV3(ctx context.Context, sessio
 
 	audioTracks := playback.AudioInventoryV3(file)
 	additional, subErr := h.downloadedSubtitleInventoryWithErrorV3(ctx, file)
-	inventoryRetryable := subErr != nil
-	if inventoryRetryable {
-		// Download/AI subtitle rows are an extension of the base inventory. A
-		// failed read means the base inventory is complete but the extension is
-		// missing, so it must not turn the whole menu into a 503 the client
-		// renders as "no subtitles": serve the embedded and external tracks now
-		// and mark the read retryable so the next poll can pick the extension up.
-		additional = nil
-		slog.WarnContext(ctx, "live inventory: downloaded subtitle rows unavailable; serving the base inventory",
-			"component", "api", "session", session.ID, "file_id", catalogFileIDOrZero(file), "error", subErr)
+	if subErr != nil {
+		return playback.PlaybackInventoryV3{}, errPlaybackInventorySubtitlesUnavailable
 	}
 	subtitleInventory := playback.ScopeSubtitleInventoryV3(session.ID, file, playback.BuildSubtitleInventoryV3(file, additional), clientFeatures)
 
 	status := string(ProbeProvenanceDeclared)
-	switch {
-	case file != nil && file.RefusedProbeEvidence:
-		// Refused, unpersisted evidence: measured tracks that no durable write
-		// committed. The override is reported declared no matter what stamp the
-		// base row carried or what outcome a previous probe left on the session,
-		// so a refused override can never be read as verified.
-	case file != nil && file.ProbeUpdatedAt != nil:
+	if file != nil && file.ProbeUpdatedAt != nil {
 		status = string(ProbeProvenanceVerified)
-	default:
+	} else {
 		// No probe stamp on the effective row. A deferred full-track
 		// enumeration may be outstanding, may have committed its evidence
 		// without a stamp, or may have terminally failed; the session carries
@@ -1255,25 +1151,6 @@ func (h *PlaybackHandler) playbackInventoryForFileV3(ctx context.Context, sessio
 		case probeOutcomeFailed:
 			status = string(ProbeProvenanceFailed)
 		}
-	}
-	if inventoryRetryable {
-		// The base inventory is complete but the downloaded extension could not
-		// be read: pending here means "base complete, extension missing", not
-		// "the probe has not landed". Report pending (not failed) so the client
-		// keeps its current menu and retries the extension with backoff instead
-		// of treating the menu as final. See docs/playback-api.md for the poll
-		// contract; do not busy-poll this endpoint.
-		status = probeOutcomePending
-	}
-	if !inventoryRetryable && status != string(ProbeProvenanceVerified) && status != string(ProbeProvenanceFailed) {
-		// This read publishes a provisional subtitle menu: either the probe is
-		// still enumerating or the row has never been stamped. Record the first
-		// such read as the session's wait start; subsequent polls and replans see
-		// the recorded wait and stay silent, so the lifecycle yields one start
-		// line and one delivery line. A terminal failure is not a wait (it ends
-		// the client's loading state), and a downloaded-extension retry is a
-		// subtitle-store wait, not a probe wait.
-		h.noteSubtitleInventoryWaitStart(ctx, session.ID, file, status, subtitleInventoryWaitBlockerV3(session, file))
 	}
 
 	effectiveFileID := 0
@@ -1301,19 +1178,13 @@ func (h *PlaybackHandler) playbackInventoryForFileV3(ctx context.Context, sessio
 }
 
 // inventoryEffectiveFile resolves the catalog row whose inventory describes the
-// release the session is actually bound to. The row the caller already holds
-// wins when it names the bound candidate URI: it is the row the plan committed
-// to and the session's carried evidence is anchored to, whereas an exact-path
-// lookup can return any one of several duplicate catalog rows stored for the
-// same URI, and swapping to such a duplicate would reject the session's own
-// verified evidence by row id. Only when the held row does not name the bound
-// release is the release re-resolved, first from the plan's committed effective
-// row (deterministic) and otherwise from the catalog path lookup. Plan-time
-// evidence is overlaid only when it still matches that bound release. When no
-// row names the bound release and the loaded row is a different one, an
-// identity-only copy with no tracks is returned, so the previous release's
-// inventory is never shown for it.
-func (h *PlaybackHandler) inventoryEffectiveFile(ctx context.Context, file *models.MediaFile, session *playback.Session, record *playback.AttemptRecordV3, candidateURI string) *models.MediaFile {
+// release the session is actually bound to. The bound candidate URI wins: when
+// a row names it, that row speaks for the release (probed evidence if present,
+// its own declared metadata otherwise). Plan-time evidence is overlaid only
+// when it still matches that bound release. When no row names the bound release
+// and the loaded row is a different one, an identity-only copy with no tracks is
+// returned, so the previous release's inventory is never shown for it.
+func (h *PlaybackHandler) inventoryEffectiveFile(ctx context.Context, file *models.MediaFile, session *playback.Session, candidateURI string) *models.MediaFile {
 	if file == nil {
 		return nil
 	}
@@ -1321,85 +1192,23 @@ func (h *PlaybackHandler) inventoryEffectiveFile(ctx context.Context, file *mode
 		return bindSessionVirtualSourceWithTracks(ctx, file, session, h.fileResolver)
 	}
 	base := file
-	if !virtualRowNamesCandidate(file, candidateURI) {
-		// The held row does not name the bound release. The plan's committed
-		// effective row is tried first: it is the row the transport and the
-		// deferred probe committed to, and unlike a path lookup it cannot land
-		// on a duplicate sibling of the same URI.
-		if record != nil && record.EffectiveMediaFileID > 0 && record.EffectiveMediaFileID != file.ID {
-			if planned, err := h.fileResolver.GetByID(ctx, record.EffectiveMediaFileID); err == nil && virtualRowNamesCandidate(planned, candidateURI) {
-				base = planned
-			}
-		}
-		if base == file && h.VirtualFileLookup != nil {
-			if row, err := h.VirtualFileLookup(ctx, candidateURI); err == nil && row != nil && virtualRowNamesCandidate(row, candidateURI) {
-				base = row
-			}
+	if h.VirtualFileLookup != nil {
+		if row, err := h.VirtualFileLookup(ctx, candidateURI); err == nil && row != nil {
+			base = row
 		}
 	}
-	// Late owner-row adoption: a first-ever auto start can pin the session to a
-	// provider-neutral row before the concrete result row exists. When that row
-	// appears later, move the session onto it and re-anchor its evidence so the
-	// verified overlay is served instead of rejected as a different candidate.
-	if adopted, refreshed := reanchorLateVirtualOwnerRow(ctx, h.fileResolver, h.sessionMgr, file, session, candidateURI); adopted != nil && adopted.ID != file.ID {
-		base = adopted
-		session = refreshed
-	}
-	if !virtualRowNamesCandidate(base, candidateURI) {
+	if base == file && strings.TrimSpace(file.FilePath) != candidateURI {
 		// No row names the bound release. Do not serve the loaded row's
 		// inventory under the bound identity.
-		placeholder := *base
+		placeholder := *file
 		placeholder.FilePath = candidateURI
 		placeholder.AudioTracks = nil
 		placeholder.SubtitleTracks = nil
 		placeholder.ExternalSubtitles = nil
 		placeholder.ProbeUpdatedAt = nil
-		// No catalog row names the bound candidate, so no row's inventory may
-		// speak for it. The plan-time inventory the session carries describes
-		// that candidate only while its evidence URI still names the live
-		// binding; evidence captured before a binding rotation belongs to the
-		// previous release and is not overlaid under the new identity. This is
-		// a read-only overlay: the catalog and the transport are untouched.
-		evidenceNamesCandidate := session != nil && session.VirtualSubtitleEvidenceSet &&
-			sameVirtualCandidate(session.VirtualSubtitleEvidenceURI, candidateURI)
-		if evidenceNamesCandidate {
-			placeholder.AudioTracks = session.VirtualAudioTracks
-			placeholder.SubtitleTracks = session.VirtualSubtitleTracks
-			placeholder.ExternalSubtitles = session.VirtualExternalSubtitles
-		}
 		base = &placeholder
-		// Name the fail-closed decision so an operator can correlate an empty
-		// menu with the reason it is empty: no catalog row names the bound
-		// candidate, so no row's inventory may be shown for it. The bound
-		// candidate URI is not logged raw — its query can carry provider
-		// identifiers — so the log carries the provider-neutral path and the
-		// concrete candidate id instead.
-		logFields := []any{
-			"component", "api",
-			"file_id", file.ID,
-			"base_id", placeholder.ID,
-			"candidate_path", virtualPlaybackNeutralKey(candidateURI),
-			"candidate_id", virtualResultCandidateID(candidateURI),
-		}
-		if evidenceNamesCandidate {
-			slog.InfoContext(ctx, "virtual inventory serving session evidence fallback: no catalog row names the bound candidate", logFields...)
-		} else {
-			slog.InfoContext(ctx, "virtual inventory serving fail-closed placeholder: no catalog row names the bound candidate", logFields...)
-		}
 	}
 	return bindSessionVirtualSourceWithTracks(ctx, base, session, h.fileResolver)
-}
-
-// virtualRowNamesCandidate reports whether a catalog row's stored path names the
-// bound candidate URI. Duplicate catalog rows for one release share the same
-// path, so an exact-path lookup can return a different row than the one the plan
-// committed to or the session carries evidence for; caller code uses this to
-// keep the row it already holds instead of swapping in an arbitrary duplicate.
-func virtualRowNamesCandidate(file *models.MediaFile, candidateURI string) bool {
-	if file == nil {
-		return false
-	}
-	return sameVirtualCandidate(file.FilePath, candidateURI)
 }
 
 // PublishSourceCommitted pushes the effective version and its declared
@@ -1445,7 +1254,7 @@ func (h *PlaybackHandler) PublishSourceCommitted(ctx context.Context, sessionID 
 	// no longer names the live effective row is never probed or persisted.
 	if h.fileResolver != nil && session.VirtualSourceURI != "" {
 		if file, loadErr := h.fileResolver.GetByID(ctx, session.MediaFileID); loadErr == nil && file != nil &&
-			virtualCandidateRotationRecordedV3(ctx, session, file, h.fileResolver) {
+			virtualCandidateRotationRecordedV3(session, file) {
 			h.refreshRotatedVirtualCandidateBackground(ctx, session, generation, file)
 		}
 	}
@@ -1650,12 +1459,6 @@ func (h *PlaybackHandler) probeRotatedVirtualCandidate(ctx context.Context, sess
 		ctx,
 		bestResultCacheKey(liveFile.ContentID, virtualPlaybackNeutralKey(live.VirtualSourceURI), live.VirtualSourceOwnerInstallationID),
 		liveFile, resolved.URL, probeTransient, probeCand,
-		virtualProbeIdentity{
-			VideoHash:   resolved.ProviderVideoHash,
-			GUID:        resolved.ProviderGUID,
-			ReleaseName: resolved.ProviderReleaseName,
-			ReleaseSize: resolved.ProviderReleaseSize,
-		}.tiers(),
 		h.virtualExpectedRuntimeMinutes(ctx, liveFile), live.VirtualSourceOwnerInstallationID,
 		generationFence,
 	)
@@ -1677,10 +1480,6 @@ type inventoryPublishSummary struct {
 	FileID           int
 	SessionsNotified int
 	Revision         string
-	// Waits collects the subtitle-inventory waits this fan-out ended, so the
-	// delivery line can report how long each session's menu was provisional and
-	// what blocked it. It is empty for a delivery that resolved no wait.
-	Waits []subtitleInventoryWaitDeliveryV3
 }
 
 // inventoryPublishResult classifies one session-targeted publish attempt for the
@@ -1747,7 +1546,6 @@ func (h *PlaybackHandler) PublishInventoryUpdated(ctx context.Context, fileID in
 		if result == inventoryPublishDelivered {
 			summary.SessionsNotified++
 			summary.Revision = revision
-			h.collectSubtitleInventoryWait(&summary, session.ID)
 		}
 	}
 	return summary
@@ -1798,7 +1596,6 @@ func (h *PlaybackHandler) PublishInventoryUpdatedToSession(ctx context.Context, 
 	if result == inventoryPublishDelivered {
 		summary.SessionsNotified++
 		summary.Revision = revision
-		h.collectSubtitleInventoryWait(&summary, session.ID)
 	}
 	return summary, result
 }
@@ -1851,10 +1648,8 @@ func (h *PlaybackHandler) publishRefusedProbeInventory(ctx context.Context, file
 // effective catalog row when the session is bound to the exact candidate the
 // probe ran against. It returns nil when there is no override to apply, so the
 // caller keeps the committed catalog inventory. The returned file keeps the
-// row's id but drops its probe stamp and carries an explicit
-// RefusedProbeEvidence marker, so the built inventory reports a refused,
-// unpersisted probe as declared and never as verified, regardless of the base
-// row's stamp or a previous session probe outcome.
+// row's id (the catalog is not written), takes the probed tracks, and is stamped
+// so the built inventory reports verified evidence and a fresh revision.
 //
 // probedFileID is the catalog row the probe was captured for. Duplicate rows for
 // one release share candidate URIs, so the URI match alone would paint the
@@ -1889,160 +1684,9 @@ func (h *PlaybackHandler) refusedProbeInventoryFile(ctx context.Context, session
 	override.AudioTracks = probed.AudioTracks
 	override.SubtitleTracks = probed.SubtitleTracks
 	override.ExternalSubtitles = probed.ExternalSubtitles
-	// The probed rows are real measured evidence, but the write to the catalog
-	// was refused, so the session must not report them as verified. Verified
-	// means the row carries committed evidence (a probe stamp) or a durable write
-	// adopted the identity; fabricating a stamp here would label unpersisted
-	// evidence verified. The base row's own stamp described the base row's
-	// tracks, which these replace, so it is dropped rather than carried. The
-	// explicit RefusedProbeEvidence marker is what keeps the status nonverified
-	// even when the base row was already stamped or the session previously
-	// recorded a verified probe outcome.
-	override.ProbeUpdatedAt = nil
-	override.RefusedProbeEvidence = true
+	probedAt := time.Now().UTC()
+	override.ProbeUpdatedAt = &probedAt
 	return &override
-}
-
-// sameRowDifferentCandidate reports whether two virtual URIs name different
-// concrete candidates under the same provider-neutral row key. It is the exact
-// condition for offering a row's current listing to a session whose pinned
-// candidate is a different result of that row.
-func sameRowDifferentCandidate(bound, offered string) bool {
-	bound, offered = strings.TrimSpace(bound), strings.TrimSpace(offered)
-	if bound == "" || offered == "" {
-		return false
-	}
-	if virtualPlaybackNeutralKey(bound) != virtualPlaybackNeutralKey(offered) {
-		return false
-	}
-	return !sameVirtualCandidate(bound, offered)
-}
-
-// publishOfferedReleaseInventory serves the current same-row listing's probed
-// track inventory to every live session still bound to a different candidate
-// under the same neutral key. It is the menu-only answer to a vanished session
-// pin: the provider dropped the pinned ?result= id, the session's transport
-// keeps playing the already-open relay, and every rotation path correctly
-// refuses to swap a different release into the playing row. Nothing then
-// refreshed the menus, so they stayed empty until a stop/resume. The offered
-// candidate's probed tracks are surfaced for display, keyed on the session's
-// own playing identity, so a client never re-keys the transport.
-//
-// The evidence itself was refused a catalog write (the row cannot adopt a
-// different release), and this never writes to the catalog either: it is an
-// in-memory, best-effort push. A session that is not virtual, is not on the
-// same neutral key, is already serving the offered candidate, or has no
-// realtime connection is skipped. It returns how many sessions received the
-// event.
-func (h *PlaybackHandler) publishOfferedReleaseInventory(ctx context.Context, row *models.MediaFile, offeredURI string, probed *models.MediaFile) int {
-	if h == nil || h.RealtimeHub == nil || row == nil || row.ID <= 0 || probed == nil || strings.TrimSpace(offeredURI) == "" {
-		return 0
-	}
-	if len(probed.AudioTracks) == 0 && len(probed.SubtitleTracks) == 0 {
-		// Nothing to show: an empty offered list would only clear a menu the
-		// session may already hold. Leave the menus to the existing paths.
-		return 0
-	}
-	lookup, ok := h.sessionMgr.(mediaFileSessionLookup)
-	if !ok {
-		return 0
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	publishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), inventoryUpdatedPublishBudget)
-	defer cancel()
-	notified := 0
-	for _, session := range lookup.GetSessionsByMediaFileID(row.ID) {
-		if session == nil || session.ID == "" || !session.HasRealtimeConnection {
-			continue
-		}
-		if _, result := h.publishOfferedReleaseInventoryToSession(publishCtx, session, offeredURI, probed); result == inventoryPublishDelivered {
-			notified++
-		}
-	}
-	if notified > 0 {
-		slog.InfoContext(ctx, "virtual offered-release inventory served to live session without a catalog write",
-			"component", "api", "file_id", row.ID, "offered_uri", offeredURI, "sessions_notified", notified)
-	}
-	return notified
-}
-
-// publishOfferedReleaseInventoryToSession delivers one offered-release menu
-// push to a single session. It re-reads the live binding under the same
-// per-session lock the ordinary inventory publisher uses, so a rotation that
-// landed while the caller enumerated sessions is observed and the offered data
-// is dropped rather than delivered against a binding that already moved. The
-// payload carries the session's bound row and leaves effective_virtual_uri
-// empty, so folding it cannot move the transport.
-func (h *PlaybackHandler) publishOfferedReleaseInventoryToSession(ctx context.Context, session *playback.Session, offeredURI string, probed *models.MediaFile) (string, inventoryPublishResult) {
-	release := h.progressSideEffectLock(session.ID)
-	defer release()
-	live, err := h.sessionMgr.GetSession(session.ID)
-	if err != nil || live == nil {
-		return "", inventoryPublishObsolete
-	}
-	if !live.HasRealtimeConnection {
-		return "", inventoryPublishObsolete
-	}
-	if !sameRowDifferentCandidate(live.VirtualSourceURI, offeredURI) {
-		// The session already serves the offered candidate, or moved to
-		// another row entirely: the display data is stale.
-		return "", inventoryPublishObsolete
-	}
-	inventory := h.buildOfferedReleaseInventory(live, offeredURI, probed)
-	event, err := playback.NewInventoryUpdatedEvent(live.ID, inventory)
-	if err != nil {
-		slog.WarnContext(ctx, "failed to encode offered-release realtime event",
-			"component", "playback", "session", live.ID, "error", err)
-		return inventory.InventoryRevision, inventoryPublishRetryable
-	}
-	if err := h.RealtimeHub.Send(live.ID, event); err != nil {
-		if !errors.Is(err, playback.ErrRealtimeConnectionNotFound) {
-			slog.WarnContext(ctx, "failed to deliver offered-release realtime event",
-				"component", "playback", "session", live.ID, "error", err)
-			return inventory.InventoryRevision, inventoryPublishRetryable
-		}
-		return inventory.InventoryRevision, inventoryPublishObsolete
-	}
-	return inventory.InventoryRevision, inventoryPublishDelivered
-}
-
-// buildOfferedReleaseInventory shapes the offered candidate's probed tracks as
-// a display-only live-inventory payload keyed on the session's bound row.
-// effective_virtual_uri is deliberately left empty so no consumer mistakes the
-// offer for the playing identity; the offered candidate travels only as
-// OfferedVirtualURI. The revision is keyed on the offered URI so it is distinct
-// from the playing source's own revision and the client's revision gate folds
-// it exactly once.
-func (h *PlaybackHandler) buildOfferedReleaseInventory(session *playback.Session, offeredURI string, probed *models.MediaFile) playback.PlaybackInventoryV3 {
-	audioTracks := playback.AudioInventoryV3(probed)
-	if audioTracks == nil {
-		audioTracks = []playback.AudioInventoryItemV3{}
-	}
-	subtitleInventory := playback.BuildSubtitleInventoryV3(probed, nil)
-	if subtitleInventory == nil {
-		subtitleInventory = []playback.SubtitleInventoryItemV3{}
-	}
-	status := string(ProbeProvenanceVerified)
-	revision := playback.ComputeInventoryRevisionV3(status, audioTracks, subtitleInventory, playback.InventorySourceIdentityV3{
-		EffectiveMediaFileID:  session.MediaFileID,
-		EffectiveVirtualURI:   offeredURI,
-		VirtualSourceRevision: session.VirtualSourceRevision,
-	})
-	return playback.PlaybackInventoryV3{
-		SessionID:            session.ID,
-		InventoryRevision:    revision,
-		InventoryStatus:      status,
-		AudioTracks:          audioTracks,
-		SubtitleInventory:    subtitleInventory,
-		EffectiveMediaFileID: session.MediaFileID,
-		// The offered release is deliberately not named as the bound candidate:
-		// effective_virtual_uri stays empty so no consumer mistakes the offer
-		// for the playing identity. The bound candidate travels only as the
-		// session's own binding, which a client already holds.
-		OfferedVirtualURI: offeredURI,
-	}
 }
 
 // virtualSourceGenerationReader is the optional session-manager capability the
@@ -2148,15 +1792,11 @@ func (h *PlaybackHandler) publishInventoryUpdatedToSession(ctx context.Context, 
 		}
 	}
 	var inventory playback.PlaybackInventoryV3
-	override := h.refusedProbeInventoryFile(ctx, live, probedFileID, candidateURI, probed)
-	if override != nil {
+	if override := h.refusedProbeInventoryFile(ctx, live, probedFileID, candidateURI, probed); override != nil {
 		// Refused (unwritten) evidence for the exact release this session is
 		// bound to: serve the probed tracks in memory. The catalog row is
 		// untouched, so the effective identity stays the row's own id and the
-		// client's revision gate still sees a new revision. The status is
-		// declared: the override carries an explicit uncommitted marker, so the
-		// live menu receives the measured tracks without claiming they were
-		// persisted as verified.
+		// client's revision gate still sees a new revision.
 		inventory, err = h.playbackInventoryForFileV3(ctx, live, record, override, candidateURI)
 	} else {
 		inventory, err = h.playbackInventoryForSession(ctx, live, record)
@@ -2169,17 +1809,11 @@ func (h *PlaybackHandler) publishInventoryUpdatedToSession(ctx context.Context, 
 		// acking an undelivered terminal status.
 		return "", inventoryPublishRetryable
 	}
-	if override == nil && inventory.InventoryStatus != string(ProbeProvenanceVerified) && inventory.InventoryStatus != string(ProbeProvenanceFailed) {
+	if inventory.InventoryStatus != string(ProbeProvenanceVerified) && inventory.InventoryStatus != string(ProbeProvenanceFailed) {
 		// The probe has not upgraded this session's bound release and no
 		// deferred probe has terminally failed, so the client already holds
 		// exactly this declared inventory. A failed status is new information —
 		// it ends the deferred loading state — so it is pushed.
-		// If the probe itself was verified or failed, but a transient extension
-		// read failure marked the inventory pending, the notification is still
-		// owed: re-park it so the terminal outcome is not dropped as obsolete.
-		if session.VirtualProbeOutcome == probeOutcomeVerified || session.VirtualProbeOutcome == probeOutcomeFailed {
-			return inventory.InventoryRevision, inventoryPublishRetryable
-		}
 		return inventory.InventoryRevision, inventoryPublishObsolete
 	}
 	if inventory.InventoryStatus == string(ProbeProvenanceFailed) &&
@@ -2280,66 +1914,61 @@ func validatePlaybackSessionID(sessionID string) error {
 }
 
 // expiredStopID is the server-minted stop identity recorded on the attempt
-// row when the liveness reaper ends a session.
+// row when a session ends without a client stop (expiry, abort).
 func expiredStopID(sessionID string) string {
 	return uuid.NewSHA1(uuid.NameSpaceOID, []byte("silo-expired:"+sessionID)).String()
 }
 
-// abortStopID is the server-minted stop id of an attempt the server
-// abandoned: its media went missing, or a replacement transport failed.
-func abortStopID(sessionID string) string {
-	return uuid.NewSHA1(uuid.NameSpaceOID, []byte("silo-abort:"+sessionID)).String()
+// markAttemptStoppedServerSide stops the attempt row under the server-minted
+// stop id and writes the deny marker, so a stopped or expired session cannot
+// be replayed from its start attempt or served from a valid token on another
+// replica. Best effort: the local teardown has already happened.
+func (h *PlaybackHandler) markAttemptStoppedServerSide(ctx context.Context, sessionID string) {
+	if h == nil {
+		return
+	}
+	markAttemptStoppedServerSide(ctx, h.PlanStoreV3, h.StreamDeny, sessionID)
+	h.forgetProgressSideEffectLock(sessionID)
 }
 
-// adminStopID is the server-minted stop id of an attempt an administrator
-// ended. Progress and replan for such an attempt answer 410
-// playback_session_ended, so the player exits instead of starting a fresh
-// session the way it recovers from an expiry or a server restart.
-func adminStopID(sessionID string) string {
-	return uuid.NewSHA1(uuid.NameSpaceOID, []byte("silo-admin-stop:"+sessionID)).String()
-}
-
-// endReasonForStop is the end reason a winning stop id records: the
-// server-minted ids name who ended the attempt, and any other id is the
-// client's own stop.
-func endReasonForStop(sessionID, stopID string) PlaybackEndReason {
-	switch stopID {
-	case adminStopID(sessionID):
-		return PlaybackEndTerminated
-	case expiredStopID(sessionID):
-		return PlaybackEndExpired
-	case abortStopID(sessionID):
-		return PlaybackEndAborted
-	default:
-		return PlaybackEndStopped
+func markAttemptStoppedServerSide(ctx context.Context, planStore playback.PlanStoreV3, deny *playback.StreamDeny, sessionID string) {
+	if sessionID == "" {
+		return
+	}
+	// Detached and bounded: a teardown reached from a canceled request (a
+	// client-canceled transport) must still stop the attempt row and write the
+	// deny marker, or the session is stranded half-dead — gone locally but
+	// replayable and still held by the client.
+	ctx, cancel := teardownContext(ctx)
+	defer cancel()
+	deny.Deny(ctx, sessionID)
+	store, ok := planStore.(playback.ProgressStoreV3)
+	if !ok {
+		return
+	}
+	receipt, first, err := store.StopAttempt(ctx, sessionID, expiredStopID(sessionID), nil)
+	if err != nil {
+		if !errors.Is(err, playback.ErrSessionNotFound) {
+			slog.WarnContext(ctx, "failed to stop expired playback attempt", "component", "api", "session", sessionID, "playback_session_id", sessionID, "error", err)
+		}
+		return
+	}
+	if first {
+		// The local teardown already ran; the receipt is complete.
+		receipt.Finalized = true
+		if err := store.RecordStopReceipt(ctx, sessionID, receipt); err != nil {
+			slog.WarnContext(ctx, "failed to record expired playback stop receipt", "component", "api", "session", sessionID, "playback_session_id", sessionID, "error", err)
+		}
 	}
 }
 
-// serverStopID reports whether stopID is one the server mints for an end it
-// makes itself.
-func serverStopID(sessionID, stopID string) bool {
-	return stopID == adminStopID(sessionID) || stopID == expiredStopID(sessionID) || stopID == abortStopID(sessionID)
-}
-
-func attemptEndedByAdmin(record *playback.AttemptRecordV3) bool {
-	return record != nil && record.StoppedAt != nil && record.SessionID != "" && record.StopID == adminStopID(record.SessionID)
-}
-
-func playbackSessionEndedByAdminError() *PlaybackOperationError {
-	return playbackOperationError(http.StatusGone, playbackSessionEndedErrorCode, "An administrator ended this playback session")
-}
-
-// stoppedAttemptError is the answer for a request on an attempt that is no
-// longer live: 410 when an administrator ended it, otherwise the 404 that
-// lets the client start over.
-func (h *PlaybackHandler) stoppedAttemptError(ctx context.Context, sessionID string, record *playback.AttemptRecordV3) *PlaybackOperationError {
-	if record == nil && h != nil && h.PlanStoreV3 != nil {
-		record, _ = h.PlanStoreV3.GetAttempt(ctx, sessionID)
+// attemptLive reports whether the attempt row exists and is not stopped.
+func (h *PlaybackHandler) attemptLive(ctx context.Context, sessionID string) bool {
+	if h == nil || h.PlanStoreV3 == nil || sessionID == "" {
+		return false
 	}
-	if attemptEndedByAdmin(record) {
-		return playbackSessionEndedByAdminError()
-	}
-	return playbackSessionNotFoundOperationError()
+	record, err := h.PlanStoreV3.GetAttempt(ctx, sessionID)
+	return err == nil && record != nil && record.StoppedAt == nil
 }
 
 // attemptStoppedElsewhere reports whether the attempt row is already stopped,
