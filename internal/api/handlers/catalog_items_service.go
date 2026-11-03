@@ -352,7 +352,7 @@ func (h *CatalogHandler) QueryItems(ctx context.Context, v ItemViewer, req Catal
 				item = localized
 			}
 		}
-		items = append(items, h.itemsH.toItemListResponseWithOverlay(ctx, viewer, item, nil, userStates[item.ContentID], accessFilter.Artwork()))
+		items = append(items, h.itemsH.toItemListResponseWithOverlay(ctx, viewer, item, nil, userStates[item.ContentID], accessFilter.ImageSize))
 	}
 	return CatalogQueryView{Total: total, HasMore: req.Offset+req.Limit < total, Items: items}, nil
 }

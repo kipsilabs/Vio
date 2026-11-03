@@ -913,7 +913,7 @@ func (h *ItemsHandler) handleSetWatchedState(w http.ResponseWriter, r *http.Requ
 	if !ok {
 		return
 	}
-	result, err := h.SetWatchedState(r.Context(), userID, profileID, id, played, filter)
+	result, err := h.SetWatchedState(r.Context(), userID, profileID, id, played, played, filter)
 	if err != nil {
 		writeAPIError(w, err)
 		return
@@ -1045,6 +1045,22 @@ func playableTargetKeyForItem(item *models.MediaItem) string {
 
 func (h *ItemsHandler) resolvePlayableTargets(ctx context.Context, v ItemViewer, inputs []catalog.PlayableTargetInput, libraryIDs []int, filter catalog.AccessFilter) map[string]string {
 	return h.resolvePlayableTargetInputs(ctx, v, inputs, libraryIDs, filter)
+}
+
+func (h *ItemsHandler) resolvePlayableTargetDetails(ctx context.Context, v ItemViewer, inputs []catalog.PlayableTargetInput, libraryIDs []int, filter catalog.AccessFilter) map[string]catalog.PlayableTarget {
+	if h == nil || h.playableTargets == nil || len(inputs) == 0 {
+		return map[string]catalog.PlayableTarget{}
+	}
+	store, _, _ := h.viewerUserStore(ctx, v.ProfileID)
+	targets, err := h.playableTargets.ResolveTargets(ctx, catalog.PlayableTargetQuery{
+		UserID: apimw.GetUserID(ctx), ProfileID: v.ProfileID, LibraryIDs: libraryIDs,
+		Access: filter, Items: inputs, ProgressStore: store,
+	})
+	if err != nil {
+		slog.WarnContext(ctx, "resolving playable target details", "component", "api", "error", err)
+		return map[string]catalog.PlayableTarget{}
+	}
+	return targets
 }
 
 func (h *ItemsHandler) resolvePlayableTargetInputs(ctx context.Context, v ItemViewer, inputs []catalog.PlayableTargetInput, libraryIDs []int, filter catalog.AccessFilter) map[string]string {
