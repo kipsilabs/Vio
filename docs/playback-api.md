@@ -278,29 +278,30 @@ When enabled, `GET /api/v2/watch/{id}` also discovers versions after checking
 access for a virtual movie or individual episode. It uses the same cached
 discovery service and re-reads watch detail before answering, so existing
 native clients receive the persisted versions without calling the
-discovery operation themselves. Discovery has a 15-second waiting budget.
-On failure, the original detail is returned; shared provider work may finish
-after that wait and be visible on a later request.
+discovery operation themselves. Discovery has a 5-second waiting budget. A
+provider listing that takes longer than that is abandoned and the original
+detail is returned, so a cold provider never blocks the read beyond the budget;
+shared provider work may finish after that wait and be visible on a later
+request.
 
 When enabled, a leaf catalog detail read — `GET /api/v2/catalog/items/{id}`
-resolving to a virtual movie or individual episode — runs the same discovery
-and re-reads the item detail before answering, under a 3-second waiting
-budget: browsing is the hot path and native clients such as Android read item
-detail alone before play. Shared provider work keeps running detached from
-the request, so a listing that finishes after the budget is visible on a
-later read. Discovery failure, a timeout, or a failed detail re-read returns
-the original detail. Eligibility reads the stored source rows and never the
-response's redacted file paths, so viewers without file-path visibility reach
-the same discovery.
+resolving to a virtual movie or individual episode — starts the same discovery
+detached and answers immediately from the persisted version list: browsing is
+the hot path and native clients such as Android read item detail alone before
+play. Shared provider work keeps running after the response under its own
+budget, so a listing that finishes later is visible on a later read. Discovery
+failure or a timeout changes nothing in the answer. Eligibility reads the
+stored source rows and never the response's redacted file paths, so viewers
+without file-path visibility reach the same discovery.
 
-The catalog wait is tuned with the admin Streaming setting
-`virtual_library.catalog_discovery_budget_ms` (500-10000, default 1000). It
+The detached catalog budget is tuned with the admin Streaming setting
+`virtual_library.catalog_discovery_budget_ms` (500-20000, default 20000). It
 is read on each detail request, so saving it does not require a restart.
-Measured provider scrapes vary from tens of milliseconds to about 2.5s, and
-the built-in default absorbs the wall-clocked overhead the scrape accrues
-before persistence; the watch path keeps a short 2-second wait. Both paths
-continue the provider work detached after the response, so a cold scrape is
-not lost when the response returns first.
+Measured provider scrapes were observed at 17–25 seconds, which is why the
+budget is sized to admit that band; the watch path keeps a shorter 5-second
+wait because its caller is opening the player. Both paths continue the provider
+work detached after the response, so a cold scrape is not lost when the
+response returns first.
 
 Leaf answers carry an additive `has_virtual_source` boolean. It reports
 whether the item holds persisted virtual candidate groups, read from the same

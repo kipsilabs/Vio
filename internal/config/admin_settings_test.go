@@ -350,8 +350,9 @@ func TestNormalizeAdminSettingValidatesVirtualProbeTuningBounds(t *testing.T) {
 		{VirtualLibraryPlaybackProbeCacheMinutesSettingKey, "999999", true},
 		{VirtualLibraryPlaybackProbeCacheMinutesSettingKey, "next week", true},
 		{VirtualLibraryCatalogDiscoveryBudgetMsSettingKey, "3000", false},
+		{VirtualLibraryCatalogDiscoveryBudgetMsSettingKey, "20000", false},
 		{VirtualLibraryCatalogDiscoveryBudgetMsSettingKey, "499", true},
-		{VirtualLibraryCatalogDiscoveryBudgetMsSettingKey, "10001", true},
+		{VirtualLibraryCatalogDiscoveryBudgetMsSettingKey, "20001", true},
 		{VirtualLibraryCatalogDiscoveryBudgetMsSettingKey, "soon", true},
 	} {
 		got, err := NormalizeAdminSetting(tc.key, tc.value)
@@ -382,6 +383,9 @@ func TestVirtualProbeTuningReadersFallBackAndClamp(t *testing.T) {
 	}
 	if got := VirtualLibraryCatalogDiscoveryBudgetMs("5"); got != MinVirtualLibraryCatalogDiscoveryBudgetMs {
 		t.Fatalf("undersized discovery budget = %d, want clamped to %d", got, MinVirtualLibraryCatalogDiscoveryBudgetMs)
+	}
+	if got := VirtualLibraryCatalogDiscoveryBudgetMs("60000"); got != MaxVirtualLibraryCatalogDiscoveryBudgetMs {
+		t.Fatalf("oversized discovery budget = %d, want clamped to %d", got, MaxVirtualLibraryCatalogDiscoveryBudgetMs)
 	}
 	if !RestartRequired(VirtualLibraryPlaybackProbeCacheMinutesSettingKey) {
 		t.Fatal("the boot-built probe cache TTL must be restart-required")
