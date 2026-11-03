@@ -75,6 +75,8 @@ type SubtitleInventoryItemV3 struct {
 	Delivery         string `json:"delivery"`
 	NativeSelectable bool   `json:"native_selectable,omitempty"`
 	Unplayable       bool   `json:"unplayable,omitempty"`
+	StreamIndex      *int   `json:"stream_index,omitempty"`
+	ContainerTrackID string `json:"container_track_id,omitempty"`
 	// URL is the session-scoped sidecar URL, present only on
 	// SubtitleDeliverySidecarV3 tracks and only once a session exists.
 	URL string `json:"url,omitempty" format:"uri-reference"`
@@ -129,9 +131,14 @@ func BuildSubtitleInventoryV3(file *models.MediaFile, additional []SubtitleInven
 		if subtitleInventoryDuplicateV3(seen, SubtitleSourceEmbeddedV3, embeddedSubtitleIdentityV3(track), track.Codec, track.Language, track.Forced, track.HearingImpaired) {
 			continue
 		}
-		items = append(items, subtitleInventoryItemV3(file.ID, len(items), externalCount+index, SubtitleSourceEmbeddedV3, track.Codec,
+		item := subtitleInventoryItemV3(file.ID, len(items), externalCount+index, SubtitleSourceEmbeddedV3, track.Codec,
 			track.Language, firstNonEmptySubtitleLabelV3(track.Title, track.EmbeddedTitle, track.Language),
-			track.Forced, track.Default, track.HearingImpaired))
+			track.Forced, track.Default, track.HearingImpaired)
+		streamIndex := track.Index
+		item.StreamIndex = &streamIndex
+		item.ContainerTrackID = track.ContainerTrackID
+		item.Unplayable = normalizeCodecV3(track.Codec) == "arib_caption" || normalizeCodecV3(track.Codec) == ""
+		items = append(items, item)
 	}
 	for index, entry := range additional {
 		source := entry.Source

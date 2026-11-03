@@ -516,6 +516,16 @@ func planPlaybackOnceV3(input PlannerInputV3) (result PlannerResultV3) {
 		Timeline:               TimelineV3{SourceStartSeconds: floatOrZeroV3(input.Request.StartPosition), PlayerStartSeconds: floatOrZeroV3(input.Request.StartPosition), CanSeekAnywhere: true, SeekRestoration: "player_position"},
 	}
 	base.AvailableQualities = availableQualitiesV3(input, source)
+	for i := range subtitleInventory {
+		if subtitleInventory[i].Source != SubtitleSourceEmbeddedV3 || subtitleInventory[i].Unplayable {
+			continue
+		}
+		if sourceIndex, ok := subtitleInventorySourceIndexV3(file, input.AdditionalSubtitles, subtitleInventory[i].CombinedIndex); ok {
+			ordinal := sourceIndex - len(file.ExternalSubtitles)
+			_, _, native := nativeEmbeddedSubtitleV3(file, input.Request, DeliveryClassOriginalHTTPV3, ordinal, input.AudioTrackIndex, input.SubtitleTrackFacts)
+			subtitleInventory[i].NativeSelectable = native
+		}
+	}
 	base.Subtitle.Inventory = subtitleInventory
 	// Authoritative per-track audio inventory of the effective source; clients
 	// should prefer it over item metadata, which can be stale after a version
@@ -2135,7 +2145,7 @@ func hlsSubtitleRenditionEligibleV3(input PlannerInputV3, subtitle SubtitlePolic
 		executable == nil || input.EffectiveFile == nil {
 		return false
 	}
-	if subtitle.RequiresBurn || subtitle.Source != SubtitleSourceEmbeddedV3 || subtitle.SelectedIndex < 0 || subtitle.TransportIndex < 0 ||
+	if subtitle.RequiresBurn || subtitle.Source != SubtitleSourceEmbeddedV3 || subtitle.SelectedIndex < 0 || subtitle.TransportIndex < 0 || input.EffectiveFile.SubtitleTracks[subtitle.TransportIndex].IndexOnly ||
 		subtitle.Decision.Embedded != nil || !SubtitleRenditionCodecSupported(subtitle.Codec) {
 		return false
 	}

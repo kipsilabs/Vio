@@ -145,7 +145,11 @@ func ResolveSubtitlePolicyV3(file *models.MediaFile, request StartRequestV3, tra
 		// Unknown codecs (arib_caption, ...) have no validated client render
 		// path and no validated burn-in filter; promising a silent burn-in
 		// would produce a plan the transcoder cannot honor.
-		return subtitleTerminalV3("subtitle_codec_unsupported", fmt.Sprintf("Subtitle format %s has no validated rendering or burn-in route.", codec))
+		message := fmt.Sprintf("Subtitle format %s has no validated rendering or burn-in route.", codec)
+		if codec == "" {
+			message = "The subtitle track's format was not recognized, so it has no validated rendering or burn-in route."
+		}
+		return subtitleTerminalV3("subtitle_codec_unsupported", message)
 	}
 	if source == SubtitleSourceEmbeddedV3 && (text || clientBitmap) {
 		if native, nativeCaps, ok := nativeEmbeddedSubtitleV3(file, request, deliveryClass, transportIndex, audioIndex, facts); ok {
@@ -200,7 +204,7 @@ func ResolveSubtitlePolicyV3(file *models.MediaFile, request StartRequestV3, tra
 			return subtitleTerminalV3("subtitle_index_only_burn_in_unsupported", "The selected indexed subtitle cannot be burned in.")
 		}
 		if file.SubtitleTracks[transportIndex].IndexOnly {
-			return subtitleTerminalV3("subtitle_index_only_burn_in_unsupported", "The selected indexed subtitle cannot be burned in.")
+			return subtitleTerminalV3("subtitle_burn_in_source_unsupported", "The selected subtitle source cannot be burned in by the installed transport.")
 		}
 		return SubtitlePolicyResultV3{
 			Decision:     SubtitleDecisionV3{Mode: SubtitleBurnInV3, TrackID: trackID},
