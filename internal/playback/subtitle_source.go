@@ -143,6 +143,11 @@ func (c *SubtitleCache) sourced(extract SUPExtractFunc) SUPExtractFunc {
 		if opts.Embedded == nil || opts.Packets != nil {
 			return extract(ctx, opts)
 		}
+		// Index-only tracks must never fall through to FFmpeg's source demux,
+		// even when no embedded source has been configured.
+		if opts.Embedded.IndexOnly && c.source == nil {
+			return ErrSubtitleIndexOnly
+		}
 		if _, format := streamExtractOutput(opts.SourceCodec, opts.TargetFormat); format == subtitleMuxerWebVTT {
 			keepalive := newPrefixKeepalive(opts.Writer, webVTTPrefix, keepaliveDelay, keepaliveInterval)
 			defer keepalive.stop()
@@ -467,7 +472,9 @@ func (c *SubtitleCache) WarmEmbeddedTextTracks(inputPath string, tracks []TextSu
 			}
 		}
 		if fills := c.beginTextFills(inputPath, demux); len(fills) > 0 && batch != nil {
-			c.WarmTextTracks(inputPath, tracks, batch, "")
+			if err := commitTextFills(ctx, inputPath, fills, batch); err != nil {
+				slog.WarnContext(ctx, "subtitle text warm failed", "component", "playback", "input", inputPath, "error", err)
+			}
 		} else {
 			discardTextFills(fills)
 		}

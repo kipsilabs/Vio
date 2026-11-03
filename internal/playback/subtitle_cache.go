@@ -373,6 +373,10 @@ func (c *SubtitleCache) ServeExtractWithResult(w http.ResponseWriter, r *http.Re
 	// connections still have a bounded write lifetime.
 	w = httpstream.NewRollingDeadlineWriter(w)
 	format := subtitleCacheFormat(opts.SourceCodec, opts.TargetFormat)
+	// Resolve indexed/kept subtitle inputs before invoking the ordinary
+	// extractor. This preserves the source lifecycle (including index-only
+	// refusal and kept-copy fallback) for both full-track and windowed serves.
+	extract = c.sourced(extract)
 	if format == subtitleFormatSUP {
 		return ServeExtractResult{}, c.ServeSUPExtract(w, r, opts, extract)
 	}
