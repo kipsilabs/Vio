@@ -172,7 +172,8 @@ func StreamExtractSubtitle(ctx context.Context, opts StreamExtractOpts) error {
 	cmd.Stderr = stderrBuf
 
 	start := time.Now()
-	if err := cmd.Start(); err != nil {
+	wait, err := startSubtitleCommand(extractCtx, cmd, opts.Packets)
+	if err != nil {
 		return fmt.Errorf("start ffmpeg: %w", err)
 	}
 
@@ -188,13 +189,15 @@ func StreamExtractSubtitle(ctx context.Context, opts StreamExtractOpts) error {
 		cancel()
 	}
 
-	waitErr := cmd.Wait()
+	waitErr, feedErr := wait()
 	var extractErr error
 	switch {
 	case waitErr != nil:
 		extractErr = waitErr
 	case copyErr != nil:
 		extractErr = copyErr
+	case feedErr != nil:
+		extractErr = fmt.Errorf("feed subtitle packets: %w", feedErr)
 	}
 	outcome := subtitleTraceOutcome(ctx, extractErr)
 	level := slog.LevelInfo
@@ -375,10 +378,12 @@ func streamExtractArgs(opts StreamExtractOpts) []string {
 		args = append(args, "-to", strconv.FormatFloat(end, 'f', 3, 64))
 	}
 
-	return append(args,
-		"-f", outFormat,
-		"pipe:1",
-	)
+	args = append(args, "-f", outFormat, "pipe:1")
+	if opts.KeepPath != "" && !seekApplied {
+		args = append(args, "-map", fmt.Sprintf("0:s:%d", trackIndex), "-c:s", "copy", "-output_ts_offset", strconv.FormatFloat(opts.KeepOffset.Seconds(), 'f', 6, 64), "-flush_packets", "1", "-fs", strconv.FormatInt(opts.demuxCopyLimit(), 10), "-f", opts.KeepFormat, "file:"+opts.KeepPath)
+		args = append(args[:3], append([]string{"-y"}, args[3:]...)...)
+	}
+	return args
 }
 
 // windowable reports whether the extract's codec/muxer can be sliced by a

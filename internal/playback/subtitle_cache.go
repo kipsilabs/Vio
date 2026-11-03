@@ -449,6 +449,11 @@ func (c *SubtitleCache) ServeExtractWithResult(w http.ResponseWriter, r *http.Re
 				return ServeExtractResult{}, ErrCommittedTextArtifactGone
 			}
 		}
+		if !result.ServedCommittedArtifact {
+			if served, sourceErr := c.serveWindowFromSource(r.Context(), w, opts, extract); served {
+				return result, sourceErr
+			}
+		}
 		// The exact window cache is keyed on the source identity computed
 		// before the committed-artifact rewrite, so it also covers windows
 		// extracted from that artifact.
@@ -1214,6 +1219,9 @@ func (c *SubtitleCache) serveWindowedSUP(w http.ResponseWriter, r *http.Request,
 	}
 	if served {
 		return nil
+	}
+	if served, sourceErr := c.serveWindowFromSource(r.Context(), w, opts, extract); served {
+		return sourceErr
 	}
 
 	// A committed full-track entry is the best last-good copy, so it is

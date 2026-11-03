@@ -214,6 +214,9 @@ func secondsDuration(s float64) time.Duration {
 // EmbeddedSubtitleSource. It reports false, having written nothing, when
 // the caller should demux the source instead.
 func (c *SubtitleCache) serveWindowFromSource(ctx context.Context, w io.Writer, opts StreamExtractOpts, extract SUPExtractFunc) (bool, error) {
+	if h, ok := w.(interface{ Header() http.Header }); ok {
+		h.Header().Set("Cache-Control", "no-store")
+	}
 	in := c.window(ctx, opts)
 	if in == nil {
 		return false, nil
