@@ -613,6 +613,12 @@ type FileVersion struct {
 	EffectiveAudioTrackIndex *int      `json:"effective_audio_track_index,omitempty"`
 	EffectiveAudioLanguage   string    `json:"effective_audio_language,omitempty"`
 	Failed                   bool      `json:"failed,omitempty"`
+	// FailedAt is when the catalog stamped media_files.failed_at for a virtual
+	// row, nil for a live row or a failed flag without a durable stamp.
+	// Server-side only: the verdict backstop age (FailedVerdictMaxAge) decides
+	// whether it still excludes the row, so each surface applies the same
+	// windowing rather than reading the timeless Failed flag alone.
+	FailedAt *time.Time `json:"-"`
 	// Available reports the durable per-version health signal: a virtual
 	// candidate is available when it has not been stamped failed (failed_at is
 	// NULL), a local file when it is not marked missing (missing_since is
@@ -669,6 +675,25 @@ type FileVersion struct {
 type VersionSourceMismatch struct {
 	ServedBytes   int64 `json:"served_bytes"`
 	DeclaredBytes int64 `json:"declared_bytes"`
+}
+
+// FailedVerdictMaxAge is the backstop age after which a media_files.failed_at
+// verdict stops excluding a candidate. The primary lifecycle is explicit: a
+// verdict is cleared by a real delivery, by an explicit user retry, or by a
+// fresh candidate listing replacing the row. This age exists only so a row that
+// is never listed again cannot stay excluded forever; it is deliberately long
+// so a genuinely dead provider URL is not retried on every start. Every surface
+// that excludes by Failed must apply the same window, or a transient stamp
+// becomes permanent on that surface.
+const FailedVerdictMaxAge = 24 * time.Hour
+
+// FailedVerdictActive reports whether a failed_at stamp still excludes a
+// candidate from selection at now. A nil stamp is never active.
+func FailedVerdictActive(failedAt *time.Time, now time.Time, maxAge time.Duration) bool {
+	if failedAt == nil {
+		return false
+	}
+	return !now.After(failedAt.Add(maxAge))
 }
 
 // SetMarkers refreshes the marker projection without rebuilding file metadata.
@@ -4808,6 +4833,7 @@ func (s *DetailService) buildPlaybackInfoWith(
 			EffectiveAudioTrackIndex: intPtr(effectiveAudioSelection.Index),
 			EffectiveAudioLanguage:   effectiveAudioSelection.Language,
 			Failed:                   f.FailedAt != nil,
+			FailedAt:                 f.FailedAt,
 			// Available is the durable per-version health signal: a virtual
 			// candidate is available when it has not been stamped failed
 			// (failed_at IS NULL), a local file when it is not marked missing

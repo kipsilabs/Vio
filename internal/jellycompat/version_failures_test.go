@@ -202,3 +202,38 @@ func TestPlaybackInfoKeepsAllFailedList(t *testing.T) {
 		t.Fatalf("MediaSources = %d, want the full all-failed list of 2", len(resp.MediaSources))
 	}
 }
+
+// TestCompatLiveVersionsAppliesFailedVerdictWindow proves the Jellyfin filter
+// expires a transient failed_at stamp on the same 24h backstop the native
+// pickers use, while a confirmed-dead stamp inside the window stays hidden.
+func TestCompatLiveVersionsAppliesFailedVerdictWindow(t *testing.T) {
+	now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
+	transient := now.Add(-catalog.FailedVerdictMaxAge - time.Hour)
+	confirmed := now.Add(-time.Hour)
+
+	alive := compatLiveVersionsAt([]catalog.FileVersion{
+		{FileID: 42, Container: "mkv", Duration: 1200},
+		{FileID: 43, Container: "mkv", Duration: 1200, Failed: true, FailedAt: &transient},
+		{FileID: 44, Container: "mkv", Duration: 1200, Failed: true, FailedAt: &confirmed},
+	}, 0, now)
+
+	if len(alive) != 2 {
+		t.Fatalf("live versions = %+v, want the healthy row and the aged-out transient row", alive)
+	}
+	if alive[0].FileID != 42 || alive[1].FileID != 43 {
+		t.Fatalf("live version IDs = %d,%d, want 42,43", alive[0].FileID, alive[1].FileID)
+	}
+}
+
+// TestCompatLiveVersionsKeepsAllFailedList documents the existing fallback: an
+// all-failed list is returned whole rather than rendered empty.
+func TestCompatLiveVersionsKeepsAllFailedList(t *testing.T) {
+	now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
+	confirmed := now.Add(-time.Hour)
+	versions := []catalog.FileVersion{
+		{FileID: 44, Container: "mkv", Duration: 1200, Failed: true, FailedAt: &confirmed},
+	}
+	if got := compatLiveVersionsAt(versions, 0, now); len(got) != 1 || got[0].FileID != 44 {
+		t.Fatalf("all-failed list = %+v, want the single confirmed-dead row returned whole", got)
+	}
+}

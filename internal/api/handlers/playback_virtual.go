@@ -435,8 +435,10 @@ var virtualProbeFailures = &virtualProbeFailureCache{marks: make(map[string]virt
 // (allowFailedCandidate), or by a fresh candidate listing replacing the row.
 // This age exists only so a row that is never listed again cannot stay
 // excluded forever; it is deliberately long so a genuinely dead provider URL
-// is not retried on every start. It is a var so tests can shrink it.
-var virtualFailedVerdictMaxAge = 24 * time.Hour
+// is not retried on every start. It is a var so tests can shrink it; the
+// production value is catalog.FailedVerdictMaxAge so every surface that
+// excludes by failed_at applies the same window.
+var virtualFailedVerdictMaxAge = catalog.FailedVerdictMaxAge
 
 // ErrVirtualCandidateMarkedFailed reports that a virtual candidate cannot be
 // selected because its catalog row carries an active failed_at verdict.
@@ -466,10 +468,7 @@ func isRehydratedVirtualSourceRotatableV3(err error) bool {
 // retry (allowFailedCandidate) is handled by callers and bypasses this check;
 // this helper only answers the passive-eligibility question.
 func virtualCandidateVerdictActive(failedAt *time.Time, now time.Time) bool {
-	if failedAt == nil {
-		return false
-	}
-	return !now.After(failedAt.Add(virtualFailedVerdictMaxAge))
+	return catalog.FailedVerdictActive(failedAt, now, virtualFailedVerdictMaxAge)
 }
 
 // virtualP0ProbeStalenessBound is how old a pinned row's probe evidence may be
