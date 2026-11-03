@@ -24,6 +24,8 @@ import (
 	"github.com/Silo-Server/silo-server/internal/embeddedsub"
 )
 
+const keepFormatMP4 = "mp4"
+
 // fakeEmbeddedSource stands in for keptsub.Store.
 type fakeEmbeddedSource struct {
 	mu          sync.Mutex
@@ -411,7 +413,7 @@ func TestExtractSourcedText(t *testing.T) {
 
 func fillTextEntry(t *testing.T, c *SubtitleCache, source string, ordinal int, format, payload string) {
 	t.Helper()
-	fill := c.beginFill(source, ordinal, format)
+	fill := c.beginFill(source, "", ordinal, format)
 	if fill == nil {
 		t.Fatal("no fill")
 	}
