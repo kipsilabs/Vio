@@ -1220,8 +1220,24 @@ func (c *SubtitleCache) serveWindowedSUP(w http.ResponseWriter, r *http.Request,
 	if served {
 		return nil
 	}
-	if served, sourceErr := c.serveWindowFromSource(r.Context(), w, opts, extract); served {
-		return sourceErr
+	if cachedPath, _, ok := c.cachedEntryPath(opts.InputPath, opts.CacheIdentity, opts.TrackIndex); ok {
+		if opts.DurationSeconds > 0 {
+			// bounded: source first, artifact fallback below
+		} else {
+			opts.InputPath = cachedPath
+			opts.InputIsExtractedSup = true
+		}
+	}
+	// For bounded and uncached open-ended windows, consult the embedded source
+	// before any raw demux. Cached open-ended windows intentionally fall through
+	// to the artifact path above.
+	if opts.DurationSeconds > 0 || (opts.DurationSeconds <= 0 && opts.InputPath == sourceOpts.InputPath) {
+		if served, sourceErr := c.serveWindowFromSource(r.Context(), w, opts, extract); served {
+			if sourceErr == nil && !sourceOpts.DisableBackgroundWarm {
+				c.WarmTrackInBackground(sourceOpts, c.sourced(extract), subtitleTraceRequestID(r.Context()))
+			}
+			return sourceErr
+		}
 	}
 
 	// A committed full-track entry is the best last-good copy, so it is

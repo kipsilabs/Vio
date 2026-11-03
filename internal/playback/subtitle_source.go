@@ -140,7 +140,12 @@ func (c *SubtitleCache) sourced(extract SUPExtractFunc) SUPExtractFunc {
 		return extract
 	}
 	return func(ctx context.Context, opts StreamExtractOpts) error {
-		if opts.Embedded == nil || opts.Packets != nil {
+		// Sourcing is for whole-track extracts only. Windowed requests must
+		// retain the raw window extractor so the caller's source.Window path
+		// (and its source-timeline semantics) remains the first fallback.
+		// Extracted artifacts are already the single-track input and must not
+		// be routed back through the embedded source either.
+		if opts.Embedded == nil || opts.Packets != nil || opts.windowIntent() || opts.InputIsExtractedSup || opts.InputIsExtractedText != "" {
 			return extract(ctx, opts)
 		}
 		// Index-only tracks must never fall through to FFmpeg's source demux.
