@@ -447,7 +447,7 @@ var errNoSourcedTrack = errors.New("embedded subtitle source can't read the trac
 // without blocking.
 func (c *SubtitleCache) WarmEmbeddedTextTracks(inputPath string, tracks []TextSubtitleTrack, ref func(ordinal int) *EmbeddedSubtitleRef, batch TextSubtitleBatchFunc, ffmpegPath string) {
 	if c == nil || c.source == nil || ref == nil {
-		c.WarmTextTracks(inputPath, tracks, batch)
+		c.WarmTextTracks(inputPath, tracks, batch, "")
 		return
 	}
 	select {
@@ -467,7 +467,7 @@ func (c *SubtitleCache) WarmEmbeddedTextTracks(inputPath string, tracks []TextSu
 			}
 		}
 		if fills := c.beginTextFills(inputPath, demux); len(fills) > 0 && batch != nil {
-			c.runTextWarm(inputPath, fills, batch)
+			c.WarmTextTracks(inputPath, tracks, batch, "")
 		} else {
 			discardTextFills(fills)
 		}

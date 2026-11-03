@@ -130,6 +130,15 @@ type StreamExtractOpts struct {
 	Writer io.Writer
 }
 
+const MaxDemuxCopyBytes int64 = 128 << 20
+
+func (opts StreamExtractOpts) demuxCopyLimit() int64 {
+	if opts.KeepMaxBytes > 0 && opts.KeepMaxBytes < MaxDemuxCopyBytes {
+		return opts.KeepMaxBytes
+	}
+	return MaxDemuxCopyBytes
+}
+
 // StreamExtractSubtitle runs ffmpeg to extract a single subtitle track,
 // seeked to SeekSeconds, and pipes its stdout to opts.Writer. The process
 // exits when ffmpeg finishes; the function returns nil on clean exit or
