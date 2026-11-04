@@ -3341,7 +3341,6 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 						"session", sessionID,
 						"playback_session_id", sessionID,
 					)
-					s.restartSegmentAsync(sessionID, session, segNum)
 					// Hold this request through the restart it just scheduled
 					// and serve the segment the restart produces. This is the
 					// same continuation contract as the API segment handler:
