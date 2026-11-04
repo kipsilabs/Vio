@@ -185,7 +185,7 @@ func (h *CatalogHandler) catalogItemResponses(ctx context.Context, v ItemViewer,
 	responseWG.Add(2)
 	go func() {
 		defer responseWG.Done()
-		imageURLs = h.itemsH.itemListCardImageURLs(ctx, localizedItems, accessFilter.Artwork().For(imagesize.SlotPoster))
+		imageURLs = h.itemsH.itemListCardImageURLs(ctx, localizedItems, episodeMetadata, accessFilter.Artwork())
 	}()
 	go func() {
 		defer responseWG.Done()

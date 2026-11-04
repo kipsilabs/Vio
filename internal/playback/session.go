@@ -3261,6 +3261,32 @@ func (m *SessionManager) FinishSession(ctx context.Context, sessionID string) er
 }
 
 // GetSession returns the session with the given ID, or ErrSessionNotFound.
+// EndReasonReplaced is the end reason of a session another one replaced
+// mid-play: a Jellyfin client switched play method.
+const EndReasonReplaced = "replaced"
+
+type endReasonKey struct{}
+type detachedFinishKey struct{}
+
+// WithEndReason tells the finish hooks why the play ended. Without it a
+// finished play ended because its client stopped it.
+func WithEndReason(ctx context.Context, reason string) context.Context {
+	return context.WithValue(ctx, endReasonKey{}, reason)
+}
+
+// EndReasonFromContext is the reason WithEndReason recorded, or "".
+func EndReasonFromContext(ctx context.Context) string {
+	reason, _ := ctx.Value(endReasonKey{}).(string)
+	return reason
+}
+
+// IsDetachedFinish reports whether a finish hook runs for a FinishDetached
+// snapshot rather than a copy this replica held.
+func IsDetachedFinish(ctx context.Context) bool {
+	detached, _ := ctx.Value(detachedFinishKey{}).(bool)
+	return detached
+}
+
 func (m *SessionManager) GetSession(sessionID string) (*Session, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

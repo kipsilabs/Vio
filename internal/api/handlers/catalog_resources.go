@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
@@ -13,13 +14,24 @@ import (
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/imagesize"
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/notifications"
 	"github.com/Silo-Server/silo-server/internal/userstore"
 )
 
 // CatalogResourceHandler serves canonical catalog resource read routes.
 type CatalogResourceHandler struct {
-	items             *ItemsHandler
-	watchlistPromoter WatchlistItemPromoter
+	items                    *ItemsHandler
+	FileResolver             FilePathResolver
+	VirtualResolver          VirtualMediaDetailedResolver
+	MarkVirtualFailed        func(ctx context.Context, fileID int, expectedFilePath string, observedFailedAt *time.Time) error
+	ClearVirtualFailed       func(ctx context.Context, fileID int, expectedFilePath string, observedFailedAt *time.Time) error
+	VirtualFileMetadataSaver VirtualFileMetadataSaver
+	VirtualFileSaver         VirtualFileSaver
+	Events                   *notifications.Hub
+	ItemAccess               PlaybackItemAccessChecker
+	EpisodeLookup            PlaybackEpisodeLookup
+	ExtraLookup              PlaybackExtraLookup
+	watchlistPromoter        WatchlistItemPromoter
 }
 
 // WatchlistItemPromoter moves the profile's watchlist entry for a title the
