@@ -261,7 +261,7 @@ func registerRequestLifecycle(reg *Registry, requests RequestLifecycleService, p
 			return nil, p
 		}
 		if err := requests.RemoveFailed(ctx, viewer, string(in.ID)); err != nil {
-			return nil, requestProblem(err)
+			return nil, requestProblem(ctx, err)
 		}
 		return nil, nil
 	})

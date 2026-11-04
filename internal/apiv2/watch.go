@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/Silo-Server/silo-server/internal/api/handlers"
 	catalogpkg "github.com/Silo-Server/silo-server/internal/catalog"
@@ -64,6 +65,7 @@ type WatchDetail struct {
 	PosterThumbhash                 string                  `json:"poster_thumbhash,omitempty"`
 	BackdropURL                     string                  `json:"backdrop_url,omitempty" format:"uri-reference" doc:"The item's backdrop, an episode's series backdrop, or an extra's parent backdrop, sized by image_size"`
 	BackdropThumbhash               string                  `json:"backdrop_thumbhash,omitempty"`
+	HasVirtualSource                *bool                   `json:"has_virtual_source,omitempty"`
 }
 
 // WatchFileVersion is one playable file of the item.
@@ -100,6 +102,17 @@ type WatchFileVersion struct {
 	Preview                  *WatchMarker         `json:"preview,omitempty"`
 	MarkerSegments           []MarkerOccurrence   `json:"marker_segments" doc:"All effective marker occurrences for this file in source-time order; empty, never null"`
 	TrickplayAvailable       bool                 `json:"trickplay_available" doc:"Whether seek-bar previews are published for this file; read them with getWatchTrickplay"`
+	FormatScore              *int                 `json:"format_score,omitempty"`
+	MatchedFormats           []string             `json:"matched_formats,omitempty"`
+	Failed                   bool                 `json:"failed,omitempty"`
+	Available                *bool                `json:"available,omitempty"`
+	SourceMismatch           *WatchSourceMismatch `json:"source_mismatch,omitempty"`
+	ProbedAt                 *Instant             `json:"probed_at,omitempty"`
+}
+
+type WatchSourceMismatch struct {
+	ServedBytes   int64 `json:"served_bytes"`
+	DeclaredBytes int64 `json:"declared_bytes"`
 }
 
 // WatchVideoTrack is one video stream of a file as the scanner probed it.
@@ -540,6 +553,20 @@ func watchVersionsOf(vs []catalogpkg.FileVersion) []WatchFileVersion {
 	return out
 }
 
+func watchInstantPtr(t *time.Time) *Instant {
+	if t == nil {
+		return nil
+	}
+	i := NewInstant(*t)
+	return &i
+}
+func watchSourceMismatchOf(v *catalogpkg.VersionSourceMismatch) *WatchSourceMismatch {
+	if v == nil {
+		return nil
+	}
+	return &WatchSourceMismatch{ServedBytes: v.ServedBytes, DeclaredBytes: v.DeclaredBytes}
+}
+
 func watchVersionOf(v catalogpkg.FileVersion) WatchFileVersion {
 	out := WatchFileVersion{
 		FileID:                   idOfInt(v.FileID),
@@ -568,8 +595,8 @@ func watchVersionOf(v catalogpkg.FileVersion) WatchFileVersion {
 		EffectiveAudioLanguage:   v.EffectiveAudioLanguage,
 		Failed:                   v.Failed,
 		Available:                v.Available,
-		SourceMismatch:           versionSourceMismatchOf(v.SourceMismatch),
-		ProbedAt:                 probeInstantPtr(v.ProbedAt),
+		SourceMismatch:           watchSourceMismatchOf(v.SourceMismatch),
+		ProbedAt:                 watchInstantPtr(v.ProbedAt),
 		Intro:                    watchMarkerOf(v.Intro),
 		Credits:                  watchMarkerOf(v.Credits),
 		Recap:                    watchMarkerOf(v.Recap),

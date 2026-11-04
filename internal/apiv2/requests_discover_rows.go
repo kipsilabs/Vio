@@ -39,7 +39,7 @@ func (reg *Registry) discoverRow(ctx context.Context, rowID string, page int) (*
 	}
 	section, err := svc.DiscoverRow(ctx, viewer, rowID, page)
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	out := discoverSectionOf(section)
 	reg.markInWatchlist(ctx, watchlistMarksOf(out.Results))
