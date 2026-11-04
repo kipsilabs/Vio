@@ -41,6 +41,13 @@ const (
 	FeatureOutputDisplayEvidenceV3 = "output_display_evidence_v1"
 	FeatureDirectStreamResumeV3    = "direct_stream_resume_v1"
 	FeaturePlanSourceDurationV3    = "plan_source_duration_v1"
+	// FeatureAudioTrackUnverifiedV3 advertises that a plan may carry the
+	// audio_track_unverified degradation warning together with
+	// audio_selection_pending when a cross-release fallback could not verify
+	// the selected audio inventory on the replacement. A client that sees the
+	// feature must render the selected audio pick as pending/unverified while
+	// the flag is set instead of presenting it as the confirmed track.
+	FeatureAudioTrackUnverifiedV3 = "audio_track_unverified_v1"
 	// FeatureSoftwareVideoDecodeV3 lets a strict evidence-tier client opt into
 	// bounded hardware:false video_decode entries. Without the feature, exact
 	// and platform_attested retain their historical hardware-only direct-play
@@ -292,6 +299,12 @@ const (
 	// A carried-over audio selection is not on the effective file, so the plan
 	// plays the file's default audio track instead of refusing to start.
 	DegradationWarningAudioTrackUnavailableV3 = "audio_track_unavailable"
+	// A carried-over audio selection survived a virtual fallback onto a
+	// replacement whose audio inventory could not be probed. The requested
+	// ordinal is passed to the transport unchanged, so the stream may be the
+	// selected one, the container default, or nothing at all. Distinct from
+	// audio_track_unavailable, which asserts the file's default plays.
+	DegradationWarningAudioTrackUnverifiedV3 = "audio_track_unverified"
 	// A carried-over subtitle selection has no equivalent on the effective
 	// file, so the plan starts with subtitles off instead of refusing to start.
 	DegradationWarningSubtitleTrackUnavailableV3 = "subtitle_track_unavailable"
@@ -307,6 +320,16 @@ const (
 // the file's default track.
 func AudioTrackUnavailableWarningV3() DegradationWarningV3 {
 	return DegradationWarningV3{Code: DegradationWarningAudioTrackUnavailableV3, Message: "The selected audio track is not on this file; playing its default instead."}
+}
+
+// AudioTrackUnverifiedWarningV3 reports an audio selection carried onto a
+// replacement whose audio inventory could not be measured. Nothing about the
+// requested ordinal is known: it may name the selected track, may fall outside
+// the replacement's audio streams (leaving the session without audio), or may
+// name an unrelated one. The warning exists because no other signal tells the
+// viewer, and the client still shows the requested track as active.
+func AudioTrackUnverifiedWarningV3() DegradationWarningV3 {
+	return DegradationWarningV3{Code: DegradationWarningAudioTrackUnverifiedV3, Message: "The selected audio track could not be verified on this file; playback may have no audio."}
 }
 
 // SubtitleTrackUnavailableWarningV3 reports a subtitle selection that was
@@ -365,6 +388,11 @@ func ServerFeaturesV3() []string {
 		// absent field, and a client cannot decide whether its own catalog
 		// fallback is still required.
 		FeaturePlanSourceDurationV3,
+		// Advertised so a client can tell an unverified cross-release audio
+		// carry apart from a confirmed selection: the plan carries
+		// audio_selection_pending plus audio_track_unverified, and a client
+		// that negotiated this token renders the pick as pending.
+		FeatureAudioTrackUnverifiedV3,
 	}
 }
 
@@ -372,7 +400,7 @@ func ServerFeaturesV3() []string {
 // advertises and honors only on /api/v2. They postdate the /api/v1 freeze, so
 // the frozen surface neither advertises nor negotiates them.
 func NativeServerFeaturesV3() []string {
-	return append(ServerFeaturesV3(), FeatureBufferingQualityV1, FeaturePlaybackPlanSummaryV1, FeatureSubripSidecarV3, FeatureMarkerThumbnailsV3, FeatureHLSSubtitleRenditionsV3, FeaturePlanActiveQualityV3, FeatureHLSRemuxSubtitleRenditionsV3, FeatureHLSCopyMPEGTSV3, FeatureHLSVariableSubstitutionV3, FeatureCodecChannelCeilingsV3, FeatureNativeEmbeddedLimitationsV3, FeatureHLSSubtitleRenditionsAllV3)
+	return append(ServerFeaturesV3(), FeatureBufferingQualityV1, FeaturePlaybackPlanSummaryV1, FeatureSubripSidecarV3, FeatureLiveInventoryV3, FeatureSourceCommittedV3, FeatureInventoryUpdatedV3, FeatureDeferredTrackInventoryV3, FeatureMarkerThumbnailsV3, FeatureHLSSubtitleRenditionsV3, FeaturePlanActiveQualityV3, FeatureHLSRemuxSubtitleRenditionsV3, FeatureHLSCopyMPEGTSV3, FeatureHLSVariableSubstitutionV3, FeatureCodecChannelCeilingsV3, FeatureNativeEmbeddedLimitationsV3, FeatureHLSSubtitleRenditionsAllV3)
 }
 
 // HLSVariableSubstitutionV3 reports whether the request's hls delivery
