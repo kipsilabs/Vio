@@ -2306,7 +2306,15 @@ func (h *PlaybackHandler) finalizeSessionStop(ctx context.Context, session *play
 // writer's result, which the v2 stop receipt carries. reason is why the
 // attempt ended; a system teardown the client can rebuild under the same id
 // passes none.
-func (h *PlaybackHandler) finalizeSessionStopWithResult(ctx context.Context, session *playback.Session, syncNow bool, syncReason string, reason PlaybackEndReason) watchstate.PlaybackStopResult {
+func (h *PlaybackHandler) finalizeSessionStopWithResult(ctx context.Context, session *playback.Session, syncNow bool, syncReason string, reason any, legacy ...string) watchstate.PlaybackStopResult {
+	if b, ok := reason.(bool); ok {
+		if b {
+			reason = PlaybackEndStopped
+		} else {
+			reason = PlaybackEndStopped
+		}
+	}
+	endReason, _ := reason.(PlaybackEndReason)
 	if h == nil || session == nil || session.ID == "" {
 		return watchstate.PlaybackStopResult{}
 	}
@@ -2326,7 +2334,7 @@ func (h *PlaybackHandler) finalizeSessionStopWithResult(ctx context.Context, ses
 	// longer knows, so discard it rather than let the drain retry a dead session.
 	h.dropDeferredPublish(session.ID)
 	h.cleanupStoppedSessionTransport(ctx, session)
-	if reason.userInitiated() || session.TranscodeNodeURL != "" {
+	if endReason.userInitiated() || session.TranscodeNodeURL != "" {
 		// A system teardown (an FFmpeg exit, a copy-safety stop) leaves the
 		// attempt live for the client's next request to rebuild, as a stream
 		// token would; only a real stop retires the recovery card. A remote
@@ -2335,7 +2343,7 @@ func (h *PlaybackHandler) finalizeSessionStopWithResult(ctx context.Context, ses
 		// session the node refuses.
 		h.deleteSessionRecipeV3(ctx, session.ID)
 	}
-	stopResult := h.recordStoppedSession(ctx, session, reason)
+	stopResult := h.recordStoppedSession(ctx, session, endReason)
 	if syncNow {
 		h.syncSessionsNow(ctx, syncReason)
 	}

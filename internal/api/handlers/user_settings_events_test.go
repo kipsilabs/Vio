@@ -7,7 +7,6 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/cache"
 	evt "github.com/Silo-Server/silo-server/internal/events"
-	"github.com/Silo-Server/silo-server/internal/settingskeys"
 )
 
 // receiveUserSettingsEvent drains one envelope from the subscription, which is
