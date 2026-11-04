@@ -459,6 +459,7 @@ func (p DeviceProfile) supportsVideoTranscodingOutput(version catalog.FileVersio
 // h264StreamingLevel is the level the streaming libx264 encode is pinned to
 // (playback.appendVideoArgs); other encoders pick a level from the stream.
 const h264StreamingLevel = 41
+const compatMinEncodeKbps = 32
 
 // h264EncodeFacts states the profile and level of an H.264 encode of video,
 // whose frame size and rate are already the output's. Every H.264 encode

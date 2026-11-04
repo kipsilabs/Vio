@@ -21,6 +21,9 @@ import (
 	"github.com/Silo-Server/silo-server/internal/userstore"
 )
 
+// PositionUnknown marks a session whose latest playback position was not reported.
+const PositionUnknown = -1
+
 // Transport output facts are independent of the whole-session play method.
 const (
 	OutputContainerFMP4   = "fmp4"

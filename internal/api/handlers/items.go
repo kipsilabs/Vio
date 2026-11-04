@@ -27,6 +27,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/metadata"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/overlays"
+	"github.com/Silo-Server/silo-server/internal/plugins"
 	"github.com/Silo-Server/silo-server/internal/ratelimit"
 	"github.com/Silo-Server/silo-server/internal/sections"
 	"github.com/Silo-Server/silo-server/internal/userstore"
@@ -2862,3 +2863,82 @@ func hasMaskedMetadataCuration(ctx context.Context, user *models.User, groups ac
 	}
 	return slices.Contains(auth.PolicyPermissions(effective), string(auth.PermissionMetadataCuration))
 }
+
+
+type VirtualPrefetcher interface {
+	PrefetchVirtualPlayback(ctx context.Context, files []*models.MediaFile, profileID string)
+}
+
+// VirtualFileByID loads one media file row for prefetch warming.
+type VirtualFileByID interface {
+	GetByID(ctx context.Context, id int) (*models.MediaFile, error)
+}
+
+// SetVirtualPrefetcher wires watch-detail prefetch. Either arg may be nil to
+// keep prefetch disabled.
+func (h *ItemsHandler) SetVirtualPrefetcher(p VirtualPrefetcher, files VirtualFileByID) {
+	if h == nil {
+		return
+	}
+	h.virtualPrefetcher = p
+	h.virtualFileByID = files
+}
+
+
+
+// prefetchWatchDetailVirtual warms virtual candidate listings for the rows a
+// watch detail offers, off the playback click path. Fire-and-forget:
+// PrefetchVirtualPlayback is already bounded (2 files), deduped, and runs on
+// a detached worker pool, so this never blocks the detail response. Only the
+// first virtual version is warmed; the start path ranks per device from the
+// neutral cache entry.
+func (h *ItemsHandler) prefetchWatchDetailVirtual(ctx context.Context, detail *catalog.WatchDetail, profileID string) {
+	if detail == nil {
+		return
+	}
+	if detail.Type != itemTypeMovie && detail.Type != itemTypeEpisode {
+		return
+	}
+	fileIDs := make([]int, 0, 2)
+	for _, v := range detail.Versions {
+		if v.FileID != 0 {
+			fileIDs = append(fileIDs, v.FileID)
+		}
+		if len(fileIDs) >= 2 {
+			break
+		}
+	}
+	h.prefetchVirtualFileIDs(ctx, fileIDs, profileID)
+}
+
+
+
+// HandleDelete handles DELETE /api/v1/admin/items/{id}.
+func (h *ItemsHandler) HandleDelete(w http.ResponseWriter, r *http.Request) {
+	if h.itemRepo == nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "item repository unavailable")
+		return
+	}
+	contentID := chi.URLParam(r, "id")
+	if contentID == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "item ID is required")
+		return
+	}
+	images, err := h.itemRepo.Delete(r.Context(), contentID)
+	if err != nil {
+		if errors.Is(err, catalog.ErrItemNotFound) {
+			writeError(w, http.StatusNotFound, "not_found", "item not found")
+			return
+		}
+		slog.ErrorContext(r.Context(), "items: delete media item failed", "component", "api", "content_id", contentID, "error", err)
+		writeError(w, http.StatusInternalServerError, "internal_error", fmt.Sprintf("failed to delete media item: %v", err))
+		return
+	}
+	sections.InvalidateResolvedListCache()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"success":        true,
+		"content_id":     contentID,
+		"images_cleaned": len(images),
+		"message":        "Media item deleted successfully",
+	})
