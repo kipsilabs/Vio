@@ -18,6 +18,28 @@ import (
 	"github.com/Silo-Server/silo-server/internal/metadata"
 )
 
+// localArtworkPosters models the local artwork resolver: stored poster keys
+// resolve to this server's root-relative signed artwork route.
+type localArtworkPosters struct {
+	signer *artworkurl.Signer
+	keys   map[string]string
+}
+
+func (r localArtworkPosters) PresignImageURLs(_ context.Context, paths []string, _, _ string) map[string]string {
+	out := make(map[string]string, len(paths))
+	for _, path := range paths {
+		if key, ok := r.keys[path]; ok {
+			url, _ := r.signer.Sign(key, time.Now())
+			out[path] = url
+		}
+	}
+	return out
+}
+
+func collageSourceKey(prefix, id string) string {
+	return "collection-images/" + id + "/poster/w500." + prefix + ".jpg"
+}
+
 // localStorageCollageFixture wires collage sources the way local artwork
 // storage serves them: posters resolve to this server's signed, root-relative
 // artwork route, and the store holds the variant each one names.
@@ -98,7 +120,7 @@ func TestCollageReadsPostersFromLocalArtworkStorage(t *testing.T) {
 func TestCollageFromLocalArtworkStorageFailsOnAMissingPoster(t *testing.T) {
 	sources := []string{"local/movies/title-1/0a1b2c3d/poster/original.webp"}
 	_, detail, signer := localStorageCollageFixture(t, sources)
-	gen := NewPersonalCollectionCollageGenerator(blobstoretest.New(), detail, signer, nil)
+	gen := NewPersonalCollectionCollageGenerator(blobstoretest.New(), detail, signer, nil, nil)
 	if _, _, err := gen.ComposeCollectionCollage(t.Context(), "c1", "0123456789abcdef", sources); !errors.Is(err, blobstore.ErrNotFound) {
 		t.Fatalf("compose with a poster the store does not hold = %v, want the store's not-found error", err)
 	}

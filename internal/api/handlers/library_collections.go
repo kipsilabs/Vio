@@ -51,6 +51,7 @@ type LibraryCollectionHandler struct {
 	httpClient            *http.Client
 	ArtworkStore          blobstore.Store
 	ArtworkResolver       artworkurl.Resolver
+	ArtworkSigner         *artworkurl.Signer
 	FrontendFS            fs.FS
 	SectionRepo           *sections.Repository
 	UserCollectionPool    *pgxpool.Pool
@@ -213,7 +214,7 @@ func (h *LibraryCollectionHandler) ComposeCollectionCollage(ctx context.Context,
 		if url == "" {
 			return "", "", fmt.Errorf("collage source %q did not resolve", path)
 		}
-		data, err := h.fetchImageURL(ctx, url)
+		data, err := h.collageComposer().fetchImage(ctx, url)
 		if err != nil {
 			// A transport error names the presigned URL; keep it out of logs.
 			var urlErr *neturl.Error
@@ -247,6 +248,10 @@ func (h *LibraryCollectionHandler) ComposeCollectionCollage(ctx context.Context,
 // CollectionCollagePath implements catalog.CollageGenerator.
 func (h *LibraryCollectionHandler) CollectionCollagePath(collectionID, key string) string {
 	return artworkkey.Original(collectionCollageDir(adminCollectionImagePrefix, collectionID), key, ".webp")
+}
+
+func (h *LibraryCollectionHandler) collageComposer() collectionCollageComposer {
+	return collectionCollageComposer{prefix: adminCollectionImagePrefix, store: h.ArtworkStore, posters: h.detailSvc, signer: h.ArtworkSigner, httpClient: h.httpClient}
 }
 
 // fetchImageURL downloads an image from a resolved URL.
