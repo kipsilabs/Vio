@@ -312,7 +312,12 @@ interface VideoPlayerProps {
     onAdopt?: (planRevision?: number, sent?: boolean) => void,
   ) => void;
   /** `track_change` replan for a subtitle the server has to render. */
-  onSubtitleTrackChange?: (combinedIndex: number | null, currentPosition: number) => void;
+  onSubtitleTrackChange?: (
+    combinedIndex: number | null,
+    currentPosition: number,
+    /** The row the viewer clicked, when the session list cannot name that slot. */
+    displayedTrack?: PlayerSubtitleInfo | null,
+  ) => void;
   /** `failure_recovery` replan after the client could not play the plan. */
   onPlanFailure?: (failure: FailureV3, currentPosition: number) => void;
   /**
@@ -602,6 +607,8 @@ export function VideoPlayer({
   qualityPreference,
   onRefreshSubtitles,
   onApplySubtitleTrack,
+  onSourceCommitted,
+  onInventoryUpdated,
   audioTracks = [],
   activeAudioIndex = 0,
   onAudioSelect,
@@ -2361,6 +2368,26 @@ export function VideoPlayer({
           reportSubtitleFailure(jobId, event.payload.message);
           break;
         }
+        case "source_committed": {
+          // The server committed to an effective version (a fresh start or a
+          // serve-layer rotation). Adopt its identity and declared inventory
+          // now; the inventory poll fills in probe evidence later. A payload
+          // for another session is stale and must not move this session's
+          // menus.
+          if (event.payload.session_id !== sessionId) break;
+          onSourceCommitted?.(event.payload);
+          break;
+        }
+        case "inventory_updated": {
+          // A live inventory revision — the probe landing, or a repaired list
+          // under the same source. Route it into the menus; the hook drops the
+          // push while a replacement switch owns the session, and treats a
+          // declared revision differently from verified probe evidence. A
+          // payload for another session is stale and ignored.
+          if (event.payload.session_id !== sessionId) break;
+          onInventoryUpdated?.(event.payload);
+          break;
+        }
         default:
           onRealtimeEvent?.(event);
       }
@@ -2370,8 +2397,10 @@ export function VideoPlayer({
       getSubtitleStartPosition,
       handleSubtitleSelect,
       onApplySubtitleTrack,
+      onInventoryUpdated,
       onRealtimeEvent,
       onRefreshSubtitles,
+      onSourceCommitted,
       planRevision,
       resumeFromTranslationPause,
       reportSubtitleFailure,
@@ -3986,10 +4015,17 @@ export function VideoPlayer({
       currentTimeRef.current,
       subtitleFetchAnchorRef.current,
     );
-    onSubtitleTrackChange?.(desiredServerIndex, position);
+    onSubtitleTrackChange?.(
+      desiredServerIndex,
+      position,
+      desiredServerIndex === null
+        ? null
+        : (effectiveSubtitleTracks.find((track) => track.index === desiredServerIndex) ?? null),
+    );
   }, [
     activeSubtitleIndex,
     activeSubtitleTrack?.burn_in_only,
+    effectiveSubtitleTracks,
     onSubtitleTrackChange,
     plan.plan_id,
     plan.selected_tracks.subtitle?.index,
