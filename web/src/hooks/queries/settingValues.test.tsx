@@ -9,6 +9,7 @@ import {
   settingsCapabilitiesSupportKey,
   type SettingIdentity,
   useClearSettingValue,
+  useEffectiveSettings,
   useSetSettingValue,
   useSettingValue,
   useSettingsCapabilities,

@@ -80,7 +80,13 @@ vi.mock("sonner", () => ({
 }));
 
 import { V2ProblemError } from "@/api/v2/request";
-import { useRefreshItemMetadata, useUploadItemImage, useWatchedStateMutation } from "./items";
+import {
+  fetchWatchDetail,
+  useRefreshItemMetadata,
+  useUploadItemImage,
+  useWatchDetail,
+  useWatchedStateMutation,
+} from "./items";
 
 type WatchedMutationOptions = {
   mutationFn: (nextPlayed: boolean) => Promise<unknown>;
