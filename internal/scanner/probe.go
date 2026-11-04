@@ -22,6 +22,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/mediaprobe"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/processmetrics"
+	"github.com/Silo-Server/silo-server/internal/procgroup"
 )
 
 const (
@@ -183,12 +184,19 @@ func probeFileWithin(ctx context.Context, ffprobePath string, filePath string, l
 	return probeMediaFile(ctx, ffprobePath, filePath, limits, true)
 }
 
+// toolCommandContext runs an external media tool in its own process group so a
+// deadline or a stop kills the wrapper's children too, decoding an fspath-
+// encoded binary path and arguments for non-UTF-8 file names.
+func toolCommandContext(ctx context.Context, name string, args ...string) *exec.Cmd {
+	return procgroup.CommandContext(ctx, fspath.Decode(name), fspath.DecodeAll(args)...)
+}
+
 func probeMediaFile(ctx context.Context, ffprobePath string, filePath string, limits probeLimits, readFrameSideData bool) (*ProbeData, error) {
 	probeCtx, cancel := context.WithTimeout(ctx, limits.probe)
 	defer cancel()
 	// Errors go to stderr (kept on the *exec.ExitError) so IsProbeRejection
 	// can tell an unreadable source from damaged content; stdout stays JSON.
-	cmd := fspath.CommandContext(probeCtx, ffprobePath,
+	cmd := toolCommandContext(probeCtx, ffprobePath,
 		"-v", "error",
 		"-print_format", "json",
 		"-show_format",
@@ -926,7 +934,7 @@ const frameSideDataFallbackPackets = 24
 func probeVideoFrameSideDataPackets(ctx context.Context, ffprobePath, filePath, streamSpecifier string, packets int) ([]ffprobeSideData, error) {
 	probeCtx, cancel := context.WithTimeout(ctx, frameSideDataProbeTimeout)
 	defer cancel()
-	cmd := fspath.CommandContext(probeCtx, ffprobePath,
+	cmd := toolCommandContext(probeCtx, ffprobePath,
 		"-v", "error",
 		"-read_intervals", "%+#"+strconv.Itoa(packets),
 		"-select_streams", streamSpecifier,
@@ -979,7 +987,7 @@ func probeVideoPacketDuration(
 ) (int, error) {
 	packetCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	cmd := fspath.CommandContext(packetCtx, ffprobePath,
+	cmd := toolCommandContext(packetCtx, ffprobePath,
 		"-v", "error",
 		"-select_streams", "v:0",
 		"-show_entries", "packet=pts_time",

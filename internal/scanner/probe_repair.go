@@ -672,6 +672,11 @@ func (e *PlaybackProbeEnsurer) ensureCriticalProbe(ctx context.Context, file *mo
 		}
 		updated := *current
 		applyProbeData(&updated, probe, "local")
+		if isLocalFilesystemFile(current) {
+			if sidecars, err := newExternalSubtitleDirCache("").Detect(current.FilePath); err == nil {
+				updated.ExternalSubtitles = externalSubtitleModels(sidecars)
+			}
+		}
 		carryCheckedHDR10Plus(current.VideoTracks, updated.VideoTracks)
 		carryUnprobedChapters(current.Chapters, &updated)
 		return e.fileRepo.Upsert(probeCtx, updated)

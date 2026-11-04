@@ -63,7 +63,7 @@ func ExtractAndUploadAudiobookCover(
 	if ffmpegPath == "" || cacher == nil || audioFilePath == "" || contentID == "" {
 		return "", ""
 	}
-	cmd := fspath.CommandContext(ctx, ffmpegPath,
+	cmd := toolCommandContext(ctx, ffmpegPath,
 		"-loglevel", "error",
 		"-i", audioFilePath,
 		"-an", "-map", "0:v?", "-c:v", "mjpeg",

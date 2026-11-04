@@ -5,8 +5,6 @@ import (
 	"context"
 	"fmt"
 	"strings"
-
-	"github.com/Silo-Server/silo-server/internal/fspath"
 )
 
 // copySafetyScanSeconds bounds how much of the stream the multi-PPS scan
@@ -35,7 +33,7 @@ func DetectMultiplePPSH264(ctx context.Context, ffmpegPath, filePath string) (bo
 	}
 	// -bsf:v filter_units=pass_types=8 keeps only PPS NAL units (type 8); the
 	// Annex-B h264 muxer emits them start-code delimited on stdout.
-	cmd := fspath.CommandContext(ctx, ffmpegPath,
+	cmd := toolCommandContext(ctx, ffmpegPath,
 		"-v", "error",
 		"-t", fmt.Sprintf("%d", copySafetyScanSeconds),
 		"-i", filePath,
