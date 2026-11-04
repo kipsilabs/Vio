@@ -26,6 +26,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/mediaprobe"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/processmetrics"
+	"github.com/Silo-Server/silo-server/internal/procgroup"
 	"github.com/Silo-Server/silo-server/internal/tonemap"
 )
 
@@ -770,7 +771,7 @@ func StartTranscode(ctx context.Context, opts TranscodeOpts) (*TranscodeSession,
 	log.Printf("playback: ffmpeg cmd: %s %s", bin, strings.Join(args, " "))
 	s.logFFmpegEvent(ctx, "ffmpeg process starting", "")
 
-	cmd := fspath.CommandContext(ctx, bin, args...)
+	cmd := procgroup.CommandContext(ctx, fspath.Decode(bin), fspath.DecodeAll(args)...)
 	stdinPipe, err := cmd.StdinPipe()
 	if err != nil {
 		cancel()
@@ -4571,7 +4572,7 @@ func (s *TranscodeSession) restart(
 	// As on initial start, the caller bounds synchronous validation; the new
 	// FFmpeg process keeps running after the segment request completes.
 	ctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
-	cmd := fspath.CommandContext(ctx, bin, args...)
+	cmd := procgroup.CommandContext(ctx, fspath.Decode(bin), fspath.DecodeAll(args)...)
 	stdinPipe, err := cmd.StdinPipe()
 	if err != nil {
 		cancel()
