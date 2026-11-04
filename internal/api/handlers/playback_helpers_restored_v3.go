@@ -6,8 +6,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/Silo-Server/silo-server/internal/logredact"
 	"github.com/Silo-Server/silo-server/internal/models"
@@ -82,6 +84,16 @@ func audioTracksFromInventoryV3(items []playback.AudioInventoryItemV3) []models.
 		}
 	}
 	return tracks
+}
+
+type candidateEvaluationV3 struct {
+	start           playback.StartRequestV3
+	file            *models.MediaFile
+	result          playback.PlannerResultV3
+	frozenRecipe    playback.ExecutableRecipeV3
+	transport       preparedTransportV3
+	reservationHeld bool
+	toneMapErr      error
 }
 
 type subtitleTrackIdentityV3 struct {
@@ -583,3 +595,268 @@ func candidateSubtitleLocalFailureV3(err *candidateErrorV3) bool {
 // candidate) is deliberately not exhaustion: rotation may have found a
 // genuinely different release and refused to substitute it, which leaves the
 // sibling-edition walk as the correct recovery for an auto selection.
+
+func (h *PlaybackHandler) evaluateReplanCandidateV3(
+	r *http.Request,
+	session *playback.Session,
+	record *playback.AttemptRecordV3,
+	req playback.ReplanRequestV3,
+	baseStart playback.StartRequestV3,
+	sourceFile *models.MediaFile,
+	candidateAlternate *models.MediaFile,
+	plannerRequestedFile *models.MediaFile,
+	plannerSettings playback.PlannerSettingsV3,
+	plannerSettingsErr error,
+	attemptedKeys []string,
+) (*candidateEvaluationV3, *candidateErrorV3) {
+	if candidateAlternate == nil {
+		return nil, &candidateErrorV3{Stage: candidateStageResolve, Message: "nil candidate alternate"}
+	}
+	candidateFile, candidateProvenance, err := h.prepareVirtualAlternateFileV3(r, candidateAlternate, record.ProfileID)
+	if err != nil || candidateFile == nil {
+		if err == nil {
+			err = errors.New("candidate alternate unavailable")
+		}
+		return nil, &candidateErrorV3{Stage: candidateStageResolve, Message: fmt.Sprintf("candidate %d resolution failed", candidateAlternate.ID), Err: err}
+	}
+	return h.evaluatePreparedReplanCandidateV3(r, session, record, req, baseStart, sourceFile, candidateFile, candidateProvenance, plannerRequestedFile, plannerSettings, plannerSettingsErr, attemptedKeys, false)
+}
+
+func (h *PlaybackHandler) evaluatePreparedReplanCandidateV3(
+	r *http.Request,
+	session *playback.Session,
+	record *playback.AttemptRecordV3,
+	req playback.ReplanRequestV3,
+	baseStart playback.StartRequestV3,
+	sourceFile *models.MediaFile,
+	candidateFile *models.MediaFile,
+	candidateProvenance ProbeProvenance,
+	plannerRequestedFile *models.MediaFile,
+	plannerSettings playback.PlannerSettingsV3,
+	plannerSettingsErr error,
+	attemptedKeys []string,
+	planOnly bool,
+) (*candidateEvaluationV3, *candidateErrorV3) {
+	candidateStart := baseStart
+	// A carried selection was minted against the plan-time inventory. Use the
+	// session's captured evidence as the remap source for a virtual session:
+	// the loaded candidate row may have been re-probed in place (same id,
+	// different release), in which case source==target by id but the ordinal
+	// still names the previous release's track.
+	remapSource := h.replanRemapSourceV3(r.Context(), sourceFile, session, nil).file
+	if err := remapAudioSelectionV3(remapSource, candidateFile, &candidateStart); err != nil {
+		return nil, &candidateErrorV3{Stage: candidateStageAudioRemap, Message: fmt.Sprintf("candidate %d audio remap failed", candidateFile.ID), Err: err}
+	}
+	candidateAudioIndex, _, err := resolveV3AudioIndex(candidateFile, candidateStart.AudioTrackID, candidateStart.AudioTrackIndex)
+	if err != nil {
+		return nil, &candidateErrorV3{Stage: candidateStageAudioRemap, Message: fmt.Sprintf("candidate %d audio track resolve failed", candidateFile.ID), Err: err}
+	}
+	var candidateResult playback.PlannerResultV3
+	var candidateToneMapErr error
+	// A carried selection already naming this candidate was minted against
+	// this file's inventory: remap from the candidate itself rather than
+	// from the nominal source, whose inventory may describe a different
+	// edition (e.g. a speculative detour that failed). Restricted to
+	// non-virtual files, where a stable row id means a stable release;
+	// virtual rows rotate releases under a fixed id, so they keep the
+	// evidence-anchored remap above.
+	subtitleRemapSource := remapSource
+	if subtitleRemapSource == nil { subtitleRemapSource = candidateFile }
+	if selFileID, selKind, _, selOK := playback.ParseTrackIDV3(candidateStart.SubtitleTrackID); selOK && selKind == subtitleTrackKindV3 && selFileID == candidateFile.ID && !isVirtualPlaybackFile(candidateFile) {
+		subtitleRemapSource = candidateFile
+	}
+	if _, err := h.remapSubtitleSelectionV3(r.Context(), subtitleRemapSource, candidateFile, &candidateStart); err != nil {
+		candidateResult = playback.PlannerResultV3{Terminal: &playback.TerminalV3{
+			Reason:    terminalSubtitleUnavailableInVersionV3,
+			Message:   "The selected subtitle track is unavailable in the fallback media version.",
+			Retryable: false,
+		}}
+		return &candidateEvaluationV3{
+			file:       candidateFile,
+			start:      candidateStart,
+			result:     candidateResult,
+			toneMapErr: candidateToneMapErr,
+		}, &candidateErrorV3{Stage: candidateStageSubtitleRemap, TerminalReason: terminalSubtitleUnavailableInVersionV3, Message: fmt.Sprintf("candidate %d subtitle remap failed", candidateFile.ID), Err: err}
+	} else {
+		candidateStart.FileID = candidateFile.ID
+		if _, err := candidateStart.NormalizeAndValidate(); err != nil {
+			return nil, &candidateErrorV3{Stage: candidateStageNormalize, Message: fmt.Sprintf("candidate %d normalize failed", candidateFile.ID), Err: err}
+		}
+		if err := preflightPlaybackFile(r.Context(), candidateFile, h.MissingMarker, h.EventsHub); err != nil {
+			return nil, &candidateErrorV3{Stage: candidateStagePreflight, Message: fmt.Sprintf("candidate %d preflight failed", candidateFile.ID), Err: err}
+		}
+		candidateResult, candidateToneMapErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{
+			Request: candidateStart, RequestedFile: plannerRequestedFile, EffectiveFile: candidateFile,
+			AudioTrackIndex: candidateAudioIndex, Settings: plannerSettings, Registry: h.transformationRegistryV3(r.Context()),
+			DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), candidateFile), Now: time.Now(),
+			AttemptedKeys: attemptedKeys, AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), candidateFile),
+			InventoryProvenance: string(candidateProvenance),
+		})
+	}
+	clampPlannerTargetResolution(&candidateResult, candidateFile)
+	candidateResult = retryIncompleteToneMapPlanningV3(candidateResult, candidateToneMapErr)
+	candidateResult = retryIncompletePlaybackSettingsV3(candidateResult, plannerSettingsErr)
+	if candidateResult.Terminal != nil {
+		return &candidateEvaluationV3{
+			file:       candidateFile,
+			start:      candidateStart,
+			result:     candidateResult,
+			toneMapErr: candidateToneMapErr,
+		}, &candidateErrorV3{Stage: candidateStagePlan, TerminalReason: candidateResult.Terminal.Reason, Message: fmt.Sprintf("candidate %d planner terminal %s: %s", candidateFile.ID, candidateResult.Terminal.Reason, candidateResult.Terminal.Message)}
+	}
+
+	candidateResult.Plan.SessionID = session.ID
+	var candidateReservationHeld bool
+	if checker, ok := h.sessionMgr.(replacementAdmissionCheckerV3); ok {
+		if err := checker.CheckReplacementAllowed(r.Context(), session.ID, candidateResult.PlayMethod, candidateResult.TranscodeAudio); err != nil {
+			return nil, &candidateErrorV3{Stage: candidateStageAdmission, Message: fmt.Sprintf("candidate %d replacement admission denied", candidateFile.ID), Err: err}
+		}
+		_, candidateReservationHeld = h.sessionMgr.(replacementReservationCancellerV3)
+	}
+	cancelCandidateReservation := func() {
+		if candidateReservationHeld {
+			if canceller, ok := h.sessionMgr.(replacementReservationCancellerV3); ok {
+				canceller.CancelReplacementReservation(session.ID)
+			}
+			candidateReservationHeld = false
+		}
+	}
+
+	if checker, ok := h.sessionMgr.(transcodePermissionChecker); ok && (candidateResult.PlayMethod == playback.PlayTranscode || candidateResult.TranscodeAudio) {
+		if err := checker.CheckTranscodingAllowed(r.Context(), session.UserID, candidateResult.PlayMethod == playback.PlayTranscode); err != nil {
+			cancelCandidateReservation()
+			return nil, &candidateErrorV3{Stage: candidateStageTranscodePerm, Message: fmt.Sprintf("candidate %d transcoding disallowed", candidateFile.ID), Err: err}
+		}
+	}
+
+	if planOnly {
+		// A same-release subtitle drop leaves the A/V recipe byte-identical;
+		// the caller reuses the active transport, so preparing a probe one
+		// would only spawn and wait on a second FFmpeg.
+		return &candidateEvaluationV3{
+			file:       candidateFile,
+			start:      candidateStart,
+			result:     candidateResult,
+			toneMapErr: candidateToneMapErr,
+		}, nil
+	}
+	candTransport, transportErr := h.prepareTransportV3(r, session, candidateFile, candidateResult, headerAuthenticatedMediaV3(req.ClientFeatures))
+	if transportErr != nil {
+		cancelCandidateReservation()
+		errMsg := transportErr.message
+		if transportErr.cause != nil {
+			errMsg = fmt.Sprintf("%s (%v)", transportErr.message, logredact.SanitizeURLError(transportErr.cause))
+		}
+		return nil, &candidateErrorV3{Stage: candidateStageTransport, Reason: transportErr.reason, Message: fmt.Sprintf("candidate %d transport preparation failed (%s): %s", candidateFile.ID, transportErr.reason, errMsg), TransportErr: transportErr, Err: transportErr.cause}
+	}
+
+	applyTransportToneMapModeV3(&candidateResult, candTransport)
+	candidateFrozenRecipe, frozenErr := h.freezeExecutableRecipeV3(r.Context(), candidateFile, candidateResult)
+	if frozenErr != nil {
+		candTransport.rollback()
+		cancelCandidateReservation()
+		return nil, &candidateErrorV3{Stage: candidateStageRecipe, Message: fmt.Sprintf("candidate %d freeze recipe failed", candidateFile.ID), Err: frozenErr}
+	}
+
+	candidateResult.Plan.Stream.URL = candTransport.url
+	if err := h.attachSubtitleArtifactV3(r.Context(), session.ID, candidateFile, candidateResult.Plan, candidateResult.SubtitleTrackIndex, &candidateFrozenRecipe, req.ClientFeatures); err != nil {
+		candTransport.rollback()
+		cancelCandidateReservation()
+		return nil, &candidateErrorV3{Stage: candidateStageSubtitleArtifact, Message: fmt.Sprintf("candidate %d attach subtitle artifact failed", candidateFile.ID), Err: err}
+	}
+
+	return &candidateEvaluationV3{
+		start:           candidateStart,
+		file:            candidateFile,
+		result:          candidateResult,
+		frozenRecipe:    candidateFrozenRecipe,
+		transport:       candTransport,
+		reservationHeld: candidateReservationHeld,
+		toneMapErr:      candidateToneMapErr,
+	}, nil
+}
+
+func (h *PlaybackHandler) evaluateSubtitleDegradedCandidateV3(
+	r *http.Request,
+	session *playback.Session,
+	record *playback.AttemptRecordV3,
+	req playback.ReplanRequestV3,
+	baseStart playback.StartRequestV3,
+	sourceFile *models.MediaFile,
+	candidateAlternate *models.MediaFile,
+	plannerRequestedFile *models.MediaFile,
+	plannerSettings playback.PlannerSettingsV3,
+	plannerSettingsErr error,
+	attemptedKeys []string,
+) (*candidateEvaluationV3, *candidateErrorV3) {
+	degradedStart := subtitleDegradedStartV3(baseStart)
+	eval, evalErr := h.evaluateReplanCandidateV3(r, session, record, req, degradedStart, sourceFile, candidateAlternate, plannerRequestedFile, plannerSettings, plannerSettingsErr, attemptedKeys)
+	if eval != nil {
+		annotateSubtitleDroppedV3(&eval.result)
+	}
+	return eval, evalErr
+}
+
+func (h *PlaybackHandler) evaluateSubtitleDegradeInPlaceV3(
+	r *http.Request,
+	session *playback.Session,
+	record *playback.AttemptRecordV3,
+	req playback.ReplanRequestV3,
+	baseStart playback.StartRequestV3,
+	file *models.MediaFile,
+	provenance ProbeProvenance,
+	plannerRequestedFile *models.MediaFile,
+	plannerSettings playback.PlannerSettingsV3,
+	plannerSettingsErr error,
+	attemptedKeys []string,
+) (*candidateEvaluationV3, *candidateErrorV3) {
+	if file == nil {
+		return nil, &candidateErrorV3{Stage: candidateStageResolve, Message: "nil same-release subtitle degrade target"}
+	}
+	degradedStart := subtitleDegradedStartV3(baseStart)
+	eval, evalErr := h.evaluatePreparedReplanCandidateV3(r, session, record, req, degradedStart, file, file, provenance, plannerRequestedFile, plannerSettings, plannerSettingsErr, attemptedKeys, true)
+	if evalErr != nil || eval == nil || eval.result.Terminal != nil || eval.result.Plan == nil {
+		return eval, evalErr
+	}
+	if eval.result.Plan.Delivery == playback.DeliveryRemuxProgressiveV3 {
+		// The same-release plan may be a progressive remux the API cannot run.
+		// Escalate it before adopting it; a failed escalation means this
+		// release cannot play without the subtitle either, so the caller can
+		// try a playable sibling.
+		audioIndex, _, indexErr := resolveV3AudioIndex(file, eval.start.AudioTrackID, eval.start.AudioTrackIndex)
+		if indexErr != nil {
+			return nil, &candidateErrorV3{Stage: candidateStageAudioRemap, Message: "subtitle degrade audio track resolve failed", Err: indexErr}
+		}
+		input := h.plannerInputV3(r.Context(), eval.start, plannerRequestedFile, file, audioIndex, attemptedKeys, provenance)
+		escalated, escalateErr := h.escalateRefusedProgressiveRemuxV3(
+			r.Context(), headerAuthenticatedMediaV3(eval.start.ClientFeatures),
+			func() playback.PlannerInputV3 { return input }, eval.result)
+		if escalateErr != nil {
+			return nil, &candidateErrorV3{Stage: candidateStageTransport, Reason: escalateErr.reason, Message: escalateErr.message, TransportErr: escalateErr, Err: escalateErr.cause}
+		}
+		eval.result = escalated
+	}
+	eval.result.Plan.DegradationWarnings = append(eval.result.Plan.DegradationWarnings, playback.SubtitleNotShownWarningV3())
+	return eval, evalErr
+}
+
+func subtitleDegradedStartV3(baseStart playback.StartRequestV3) playback.StartRequestV3 {
+	degradedStart := baseStart
+	degradedStart.SubtitleTrackIndex = nil
+	degradedStart.SubtitleTrackID = ""
+	return degradedStart
+}
+
+func (h *PlaybackHandler) replanRemapSourceV3(ctx context.Context, effectiveFile *models.MediaFile, session *playback.Session, durable map[int]predecessorPlanInventoryV3) carriedInventorySourceV3 {
+	if effectiveFile == nil {
+		return carriedInventorySourceV3{}
+	}
+	return h.rekeySourceFileWithInventoryV3(ctx, effectiveFile.ID, session, durable)
+}
+
+func sameMediaInventoryV3(a, b *models.MediaFile) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return sameSubtitleInventoryV3(a, b) && playback.AudioLayoutsEqual(a.AudioTracks, b.AudioTracks)
+}
