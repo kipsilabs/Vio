@@ -12,8 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Silo-Server/silo-server/internal/fspath"
-
 	"github.com/Silo-Server/silo-server/internal/procgroup"
 )
 
@@ -179,7 +177,7 @@ func dumpFontAttachments(ctx context.Context, inputPath string, ffmpegPath strin
 
 	}
 	args = append(args, "-i", inputPath, "-map", "0:t?", "-c", "copy", "-f", "null", "-")
-	cmd := fspath.CommandContext(ctx, ffmpegPath, args...)
+	cmd := procgroup.CommandContext(ctx, ffmpegPath, args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, err
@@ -221,7 +219,7 @@ func probeFontAttachmentStreams(ctx context.Context, inputPath string, ffprobePa
 	if strings.TrimSpace(bin) == "" {
 		bin = "ffprobe"
 	}
-	cmd := fspath.CommandContext(ctx, bin,
+	cmd := procgroup.CommandContext(ctx, bin,
 		"-v", "error",
 		"-select_streams", "t",
 		"-show_entries", "stream=index,codec_name,codec_type,extradata_size:stream_tags=filename,mimetype",
