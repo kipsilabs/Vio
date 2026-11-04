@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type { FileVersion } from "@/api/types";
 import { makeFileVersion } from "../itemDetail.test-support";
 import { buildQualitySummary, buildDetailLine, sortByResolution } from "./VersionFlyout";
 import {
@@ -10,6 +11,9 @@ import {
   hasFormatScore,
   subtitleLanguageLabels,
 } from "./versionFormatUtils";
+
+/** The fork tests build versions through makeVersion; the shared helper has the same defaults. */
+const makeVersion = makeFileVersion;
 
 describe("buildQualitySummary", () => {
   it("joins resolution, codec, HDR, and audio", () => {
