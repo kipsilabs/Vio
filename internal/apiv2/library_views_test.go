@@ -12,6 +12,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/adminjob"
 	"github.com/Silo-Server/silo-server/internal/api/handlers"
 	catalogpkg "github.com/Silo-Server/silo-server/internal/catalog"
+	mediacatalog "github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/usercollections"
 )
@@ -121,7 +122,10 @@ func (f *fakeLibraryAdmin) SetLibraryProviders(_ context.Context, id int, levels
 // --- viewer fakes ---
 
 type fakeLibraryViews struct {
-	err error
+	err                   error
+	collections           []handlers.ItemCollectionView
+	lastCollections       string
+	lastCollectionsAccess mediacatalog.AccessFilter
 	// lastViewer is the viewer LibrarySections last saw.
 	lastViewer handlers.SectionViewer
 }
@@ -172,6 +176,15 @@ func (f *fakeLibraryViews) LibraryCollectionsTab(_ context.Context, libraryID, u
 		Groups:    []handlers.LibraryCollectionTabGroupView{{ID: "g1", Name: "Mine", Kind: models.GroupKindUserCollections, SortMode: models.GroupSortNameAsc, Collections: []handlers.LibraryCollectionTabEntryView{{ID: "u1", Title: "Rainy days", ItemCount: 4, CreatorProfileID: &creator}}}},
 		Ungrouped: &handlers.LibraryCollectionTabUngroupedView{SortOrder: 9999, Collections: []handlers.LibraryCollectionTabEntryView{{ID: "c1", Title: "Oscar Winners", ItemCount: 12, Featured: true}}},
 	}, nil
+}
+
+func (f *fakeLibraryViews) ItemCollections(_ context.Context, membership string, access mediacatalog.AccessFilter) ([]handlers.ItemCollectionView, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	f.lastCollections = membership
+	f.lastCollectionsAccess = access
+	return f.collections, nil
 }
 
 func (f *fakeLibraryViews) LibraryUserCollections(_ context.Context, libraryID, userID int, profileID string) ([]usercollections.ServerVisibleCollection, error) {

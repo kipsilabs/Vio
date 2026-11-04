@@ -425,6 +425,7 @@ type CatalogItemDetail struct {
 	Versions                        []FileVersion                        `json:"versions" doc:"Empty, never null"`
 	PlaybackVariants                []PlaybackVariant                    `json:"playback_variants,omitempty"`
 	Videos                          []catalogpkg.ItemVideoInfo           `json:"videos,omitempty" doc:"Trailers and clips"`
+	Collections                     []handlers.ItemCollectionView        `json:"collections" doc:"Collections containing this item; empty, never null"`
 	RatingSources                   []CatalogRatingSource                `json:"rating_sources,omitempty" doc:"Per-source ratings on a 0-100 scale for movies and series; absent when there are none. Only the sources clients show, in the same order as ratings, except for a viewer who curates the item's metadata, who gets every stored source. Title pages render ratings, not this list."`
 	Ratings                         []CatalogRating                      `json:"ratings" doc:"The external ratings a title page shows, in display order: IMDb and TMDB, plus the sources an administrator turned on. Render every entry as its name and display text. Empty, never null"`
 	Extras                          []ItemExtraInfo                      `json:"extras,omitempty"`
@@ -1230,6 +1231,16 @@ func (reg *Registry) getCatalogItem(ctx context.Context, in *CatalogItemDeviceIn
 		return nil, serviceProblem(err)
 	}
 	out := catalogItemDetailOf(detail, reg.ratingSelection(ctx))
+	if svc, ok := reg.deps.LibraryCollections.(ItemCollectionIndex); ok {
+		membership := detail.ContentID
+		if detail.Type == "episode" || detail.Type == "season" {
+			membership = detail.SeriesID
+		}
+		collections, err := svc.ItemCollections(ctx, membership, viewer.Access)
+		if err == nil {
+			out.Collections = NonNil(collections)
+		}
+	}
 	if reg.deps.ThemeSongs != nil && (detail.Type == themeOwnerMovie || detail.Type == themeOwnerSeries || detail.Type == themeOwnerSeason || detail.Type == themeOwnerEpisode) {
 		// The detail authorized the item under the same filter and carries
 		// its owner fields, so the theme lookup repeats neither.
@@ -1470,7 +1481,7 @@ func catalogItemDetailOf(d *catalogpkg.ItemDetail, sel ratingsources.Selection) 
 		ratingSources = shownRatingSources(ratingSources, sel)
 	}
 	out := CatalogItemDetail{
-		CatalogItem: card, PlaySeasonNumber: d.PlaySeasonNumber,
+		CatalogItem: card, PlaySeasonNumber: d.PlaySeasonNumber, Collections: []handlers.ItemCollectionView{},
 		SortTitle: d.SortTitle, OriginalTitle: d.OriginalTitle, Tagline: d.Tagline,
 		ImdbID: d.ImdbID, TmdbID: d.TmdbID, TvdbID: d.TvdbID, Cast: NonNil(d.Cast), Crew: NonNil(d.Crew), Countries: d.Countries, LockedFields: d.LockedFields,
 		BannerURL: d.BannerURL, BannerThumbhash: d.BannerThumbhash, ThumbURL: d.ThumbURL, ThumbThumbhash: d.ThumbThumbhash,
