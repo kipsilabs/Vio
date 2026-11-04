@@ -118,6 +118,8 @@ type PlaybackPlan struct {
 	Source                 PlaybackSource                  `json:"source"`
 	SubtitleFidelityPolicy string                          `json:"subtitle_fidelity_policy"`
 	ActiveQuality          string                          `json:"active_quality,omitempty" doc:"The available_qualities label this plan delivers, so a client can mark that menu entry: the label quality_preference named while the menu lists it and the encode keeps its resolution, otherwise the rung whose resolution class and bitrate the encode matches. Absent when the plan delivers no listed entry, such as the source played unchanged or a plain-resolution or auto request whose capped encode falls between two rungs. Present on servers that advertise plan_active_quality_v1."`
+	InventoryURL           string                          `json:"inventory_url,omitempty" format:"uri-reference"`
+	TracksPending          bool                            `json:"tracks_pending,omitempty"`
 }
 
 // DeliveryChange is the v2 projection of a mid-session serving-route change on
@@ -635,7 +637,7 @@ func playbackDecision(in playback.DecisionResponseV3) PlaybackDecision {
 		p := in.PlaybackPlan
 		stream := p.Stream
 		stream.URL = playbackV2MediaURL(stream.URL)
-		out.PlaybackPlan = &PlaybackPlan{ProtocolVersion: p.ProtocolVersion, PlanID: p.PlanID, PlanAttemptKey: p.PlanAttemptKey, SessionID: p.SessionID, ExpiresAt: p.ExpiresAt, Delivery: p.Delivery, Stream: stream, Timeline: p.Timeline, SelectedTracks: p.SelectedTracks, EffectiveRecipe: p.EffectiveRecipe, BandwidthLimit: playbackBandwidthLimit(p.BandwidthLimit), Claims: p.Claims, Subtitle: playbackV2Subtitle(p.Subtitle), Transformations: p.Transformations, AppliedQuirks: p.AppliedQuirks, RuntimeCorrections: p.RuntimeCorrections, AvailableQualities: playbackQualities(p.AvailableQualities), DegradationWarnings: p.DegradationWarnings, DecisionReason: p.DecisionReason, RequestedMediaFileID: ID(strconv.Itoa(p.RequestedMediaFileID)), EffectiveMediaFileID: ID(strconv.Itoa(p.EffectiveMediaFileID)), Source: playbackSource(p.Source), SubtitleFidelityPolicy: p.SubtitleFidelityPolicy, ActiveQuality: p.ActiveQuality}
+		out.PlaybackPlan = &PlaybackPlan{ProtocolVersion: p.ProtocolVersion, PlanID: p.PlanID, PlanAttemptKey: p.PlanAttemptKey, SessionID: p.SessionID, ExpiresAt: p.ExpiresAt, Delivery: p.Delivery, Stream: stream, Timeline: p.Timeline, SelectedTracks: p.SelectedTracks, EffectiveRecipe: p.EffectiveRecipe, BandwidthLimit: playbackBandwidthLimit(p.BandwidthLimit), Claims: p.Claims, Subtitle: playbackV2Subtitle(p.Subtitle), Transformations: p.Transformations, AppliedQuirks: p.AppliedQuirks, RuntimeCorrections: p.RuntimeCorrections, AvailableQualities: playbackQualities(p.AvailableQualities), DegradationWarnings: p.DegradationWarnings, DecisionReason: p.DecisionReason, RequestedMediaFileID: ID(strconv.Itoa(p.RequestedMediaFileID)), EffectiveMediaFileID: ID(strconv.Itoa(p.EffectiveMediaFileID)), Source: playbackSource(p.Source), SubtitleFidelityPolicy: p.SubtitleFidelityPolicy, ActiveQuality: p.ActiveQuality, InventoryURL: playbackV2InventoryURL(p.InventoryURL), TracksPending: p.TracksPending}
 	}
 	return out
 }
