@@ -2188,6 +2188,7 @@ func (h *PlaybackHandler) recordStartingDevice(ctx context.Context, userID int, 
 // first authorized version of alternateBase that plans replaces it, with the
 // warnings that choice adds.
 func (h *PlaybackHandler) planStartV3(r *http.Request, req playback.StartRequestV3, requestedFile, alternateBase, effectiveFile *models.MediaFile, audioIndex int, settings playback.PlannerSettingsV3, lowerVersion *playback.LowerVersionV3, profileID string) (alternateCandidateV3, []playback.DegradationWarningV3) {
+	resolutionProvenance := ProbeProvenance("")
 	subtitleInventoryByFileID := map[int][]playback.SubtitleInventoryEntryV3{}
 	subtitleInventoryFor := func(file *models.MediaFile) []playback.SubtitleInventoryEntryV3 {
 		if file == nil {
@@ -2207,7 +2208,7 @@ func (h *PlaybackHandler) planStartV3(r *http.Request, req playback.StartRequest
 		ServerBitrateCapKbps: serverBitrateCapV3(r.Context()),
 		AudioTrackIndex:      audioIndex, Settings: settings,
 		Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(),
-		AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), effectiveFile),
+		AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), effectiveFile), InventoryProvenance: string(resolutionProvenance),
 	}
 	result, toneMapCapabilityErr := h.planPlaybackWithCapabilitiesV3(r.Context(), input)
 	var warnings []playback.DegradationWarningV3
@@ -8972,7 +8973,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	// in HandleReplanPlaybackV3), so this mode always equals the one the
 	// attempt started under: a reused transport cannot change the session's
 	// media security contract or the playlist form it serves.
-	mode := withHLSVariableSubstitutionV3(r, headerAuthenticatedMediaV3(start.ClientFeatures), start)
+	mode = withHLSVariableSubstitutionV3(r, headerAuthenticatedMediaV3(start.ClientFeatures), start)
 	if !seekReanchor {
 		// A freshly planned replan can land on the same refused progressive
 		// remux a start would have; escalate it identically. A seek reanchor
@@ -9465,17 +9466,6 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		return playback.DecisionResponseV3{}, *record, nil, classifyVirtualReplanExhaustionV3(virtualRehydrationErr, nil)
 	}
 
-	var result playback.PlannerResultV3
-	var toneMapCapabilityErr error
-	var plannerSettings playback.PlannerSettingsV3
-	var plannerSettingsErr error
-	// audioIndex, attemptedKeys and lowerVersion are function-scoped: the
-	// terminal-driven planning below and the refused-remux escalation at the
-	// end both read them, while the rehydration block in between assigns them.
-	audioIndex := 0
-	attemptedKeys := []string(nil)
-	var lowerVersion *playback.LowerVersionV3
-	var effectiveFile *models.MediaFile
 	var preparedTransport *preparedTransportV3
 	var artifactRecipe playback.ExecutableRecipeV3
 	var mode mediaAuthModeV3
