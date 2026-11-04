@@ -2888,15 +2888,15 @@ func (h *PlaybackHandler) buildPlaybackSource(
 	sourceVideo := compatPrimaryVideoTrack(version)
 	_, aacBitrateKbps := playback.ResolveAACOutputV3(targetAudioChannels, 0)
 	targetVideoCodec := compatTargetVideoCodec
-	targetBitrateKbps, targetResolution := compatEncodeTarget(profile, targetVideoCodec, maxBitrate, aacBitrateKbps, sourceVideo)
-	h264BitrateKbps, h264Resolution := targetBitrateKbps, targetResolution
+	targetBitrateKbps, targetResolution, ceilingKbps := compatEncodeTarget(profile, targetVideoCodec, maxBitrate, aacBitrateKbps, version, sourceVideo)
+	h264BitrateKbps, h264Resolution, h264CeilingKbps := targetBitrateKbps, targetResolution, ceilingKbps
 	canEncodeOutput := profile.supportsTranscodingOutput(version, targetAudioChannels, max(targetBitrateKbps, 0), targetResolution)
 	// HEVC needs server opt-in and an explicit compatible HLS fMP4 profile.
 	if len(allowHEVCEncoding) > 0 && allowHEVCEncoding[0] {
-		hevcBitrateKbps, hevcResolution := compatEncodeTarget(profile, compatVideoCodecHEVC, maxBitrate, aacBitrateKbps, sourceVideo)
+		hevcBitrateKbps, hevcResolution, hevcCeilingKbps := compatEncodeTarget(profile, compatVideoCodecHEVC, maxBitrate, aacBitrateKbps, version, sourceVideo)
 		if profile.supportsHEVCTranscodingOutput(version, targetAudioChannels, max(hevcBitrateKbps, 0), hevcResolution) {
 			targetVideoCodec = compatVideoCodecHEVC
-			targetBitrateKbps, targetResolution = hevcBitrateKbps, hevcResolution
+			targetBitrateKbps, targetResolution, ceilingKbps = hevcBitrateKbps, hevcResolution, hevcCeilingKbps
 			canEncodeOutput = true
 		}
 	}
@@ -2922,6 +2922,8 @@ func (h *PlaybackHandler) buildPlaybackSource(
 		TargetVideoCodec:           targetVideoCodec,
 		h264TargetBitrateKbps:      max(h264BitrateKbps, 0),
 		h264TargetResolution:       h264Resolution,
+		encodeCeilingKbps:          max(ceilingKbps, 0),
+		h264EncodeCeilingKbps:      max(h264CeilingKbps, 0),
 		hlsRemuxInTS:               hlsRemuxInTS,
 		ID:                         sourceID,
 		FileID:                     version.FileID,
@@ -2964,7 +2966,7 @@ func (h *PlaybackHandler) buildPlaybackSourceWithVirtual(
 // capped by the profile's own limits for that codec. The resolution class
 // follows the same video budget, so a limit near a class floor does not earn
 // a class its video bitrate cannot fill.
-func compatEncodeTarget(profile DeviceProfile, videoCodec string, maxBitrate int64, audioBitrateKbps int, sourceVideo models.VideoTrack) (int, string) {
+func compatEncodeTarget(profile DeviceProfile, videoCodec string, maxBitrate int64, audioBitrateKbps int, version catalog.FileVersion, sourceVideo models.VideoTrack) (int, string, int) {
 	maxVideoBitrate, maxHeight, maxWidth := profile.encodeLimits(videoCodec)
 	budget := 0
 	if maxBitrate > 0 {
@@ -2974,7 +2976,14 @@ func compatEncodeTarget(profile DeviceProfile, videoCodec string, maxBitrate int
 		budget = limit
 	}
 	resolution := compatFitResolution(compatTargetResolutionForBitrate(int64(max(budget, 0)), sourceVideo), sourceVideo, maxHeight, maxWidth)
-	return budget, resolution
+	target := budget
+	if source := compatSourceEncodeKbps(version, sourceVideo, videoCodec); source > 0 && target > 0 {
+		target = min(target, source)
+		if target < compatMinEncodeKbps && budget >= compatMinEncodeKbps {
+			target = compatMinEncodeKbps
+		}
+	}
+	return target, resolution, budget
 }
 
 // supportedHLSRemuxAudioStreamIndexes freezes the copy-safe switch targets. A
@@ -3129,7 +3138,7 @@ func compatTranscodeReasons(source PlaybackMediaSource) []string {
 		return []string{container, "AudioCodecNotSupported"}
 	case source.SubtitleBurnIn:
 		return []string{"SubtitleCodecNotSupported"}
-	case source.TargetBitrateKbps > 0 && source.Version.Bitrate > source.TargetBitrateKbps:
+	case source.encodeCeilingKbps > 0 && source.Version.Bitrate > source.encodeCeilingKbps:
 		return []string{"VideoBitrateNotSupported"}
 	case source.TargetResolution != "":
 		return []string{"VideoResolutionNotSupported"}

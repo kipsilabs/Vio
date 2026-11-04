@@ -303,6 +303,10 @@ func (m *mapper) itemFromDetailWithFieldsSelected(item upstreamItemDetail, selec
 		"versions", len(versions),
 		"media_sources", len(dto.MediaSources),
 	)
+	// The detail mapping fills every list field from allDetailFields; a
+	// request that named Fields keeps only the empty lists it asked for, as
+	// Jellyfin does on the detail path too.
+	dropUnrequestedEmptyLists(&dto, wantField)
 	return dto
 }
 
@@ -387,8 +391,15 @@ func (m *mapper) applyDetailVersions(dto *baseItemDTO, contentID string, version
 	if len(versions) == 0 {
 		// Provider-metadata-only (unaired/missing) item: version data is
 		// authoritative here, so override the FileSystem default set by
-		// itemFromList with Jellyfin's Virtual contract.
+		// itemFromList with Jellyfin's Virtual contract. A requested list
+		// still answers [] rather than an absent field.
 		applyPlayableLocation(dto, false)
+		if wantField("mediasources") {
+			dto.MediaSources = []mediaSourceDTO{}
+		}
+		if wantField("mediastreams") {
+			dto.MediaStreams = []mediaStreamDTO{}
+		}
 		return
 	}
 	firstVersion := versions[0]

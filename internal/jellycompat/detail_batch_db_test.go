@@ -153,9 +153,12 @@ func newDetailBatchFixture(tb testing.TB) *detailBatchFixture {
 	idsPath := "/Users/" + session.PseudoUserID.String() + "/Items?Ids=" + url.QueryEscape(strings.Join(ids, ",")) + "&Fields=MediaSources,People"
 	f.requests = []detailBatchRequest{
 		{
-			name:         "next up with media sources",
-			path:         "/Shows/NextUp?UserId=" + session.PseudoUserID.String() + "&Fields=MediaSources,People&Limit=20",
-			budget:       45,
+			name: "next up with media sources",
+			path: "/Shows/NextUp?UserId=" + session.PseudoUserID.String() + "&Fields=MediaSources,People&Limit=20",
+			// 48, not 45: the batched path also issues the three per-request
+			// MediaSources/MediaStreams population statements the merge restored
+			// (one per returned series), which the per-item path pays per item.
+			budget:       48,
 			wantContains: []string{"Episode 2 of series 0", "Episode 2 of series 3"},
 		},
 		{
