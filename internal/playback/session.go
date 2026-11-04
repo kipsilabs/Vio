@@ -517,6 +517,7 @@ type SessionReplacementRollback struct {
 	previousPositionSequence     int64
 	restoreProgress              bool
 	previousReplacementMethod    PlayMethod
+	previousPlanCommittedAt      time.Time
 }
 
 // ErrSessionReplacementSuperseded means a replacement rollback would overwrite
@@ -1094,6 +1095,7 @@ func (m *SessionManager) RegisterReconstructed(s *Session) *Session {
 	}
 	s.UpdatedAt = now
 	s.LastActivityAt = now
+	s.PlanCommittedAt = now
 	m.sessions[s.ID] = s
 	return s
 }
@@ -1150,6 +1152,7 @@ func (m *SessionManager) RegisterReconstructedWithLimits(ctx context.Context, s 
 	}
 	s.UpdatedAt = now
 	s.LastActivityAt = now
+	s.PlanCommittedAt = now
 	m.sessions[s.ID] = s
 	return s, nil
 }
@@ -2781,6 +2784,7 @@ func (m *SessionManager) applyReplacementLocked(
 		previousEffectiveMediaFileID: s.MediaFileID,
 		previousStreamState:          snapshotSessionStreamStateLocked(s),
 		previousReplacementMethod:    s.replacementPlayMethod,
+		previousPlanCommittedAt:      s.PlanCommittedAt,
 	}
 	if replacement.PositionSeconds != nil {
 		rollback.previousPosition = s.Position
@@ -2807,6 +2811,9 @@ func (m *SessionManager) applyReplacementLocked(
 	s.streamRevision++
 	rollback.appliedRevision = s.streamRevision
 	m.touchSessionLocked(s)
+	// A committed fallback plan restarts the startup window: the client is
+	// still waiting out its startup timeout for this plan.
+	s.PlanCommittedAt = s.LastActivityAt
 	return rollback, nil
 }
 
@@ -2837,6 +2844,9 @@ func (m *SessionManager) RollbackReplacement(sessionID string, rollback SessionR
 		s.positionSequence = rollback.previousPositionSequence
 	}
 	s.replacementPlayMethod = rollback.previousReplacementMethod
+	// A rolled-back replan handed the client no plan, so it must not restart
+	// the startup window.
+	s.PlanCommittedAt = rollback.previousPlanCommittedAt
 	s.streamRevision++
 	m.touchSessionLocked(s)
 	return nil
