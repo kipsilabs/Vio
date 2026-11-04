@@ -1251,15 +1251,6 @@ func TestPlanPlaybackV3KeepsRemuxSidecarWithoutHLSSubtitleRendition(t *testing.T
 	}
 }
 
-// copyRemuxRenditionOpts is a copy remux of a source whose embedded SubRip
-// track 3 is carried as the rendition.
-func copyRemuxRenditionOpts(dir string, mpegts bool) TranscodeOpts {
-	opts := subtitleRenditionTestOpts(dir)
-	opts.TargetCodecVideo, opts.SourceVideoCodec, opts.CopyVideoMPEGTS = "copy", transcodeCodecHEVC, mpegts
-	opts.TotalDuration = 12.5
-	return opts
-}
-
 // writeCopyRemuxPlaylist writes the playlist FFmpeg's HLS muxer keeps for a
 // copy generation that started at segment first, with the given keyframe-cut
 // durations, and the segment files it lists.

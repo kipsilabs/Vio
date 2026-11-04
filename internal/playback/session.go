@@ -685,6 +685,10 @@ const (
 	// observed playback activity before it stops counting toward limits.
 	DefaultActiveSessionGrace = 45 * time.Second
 
+	// StartupSessionGrace keeps a newly committed playback plan alive while the
+	// client waits for its startup timeout before requesting a fallback.
+	StartupSessionGrace = 90 * time.Second
+
 	// remoteTransportIdleGrace is the floor on the idle windows for a session
 	// whose media is served by another node. See remoteTransportGrace: it must
 	// outlast a heartbeat gap on an otherwise healthy proxy stream, while still
