@@ -8503,7 +8503,102 @@ func (h *PlaybackHandler) replanInputV3(r *http.Request, p replanPlanningV3, sta
 }
 
 // executeReplanV3 prepares an atomic replacement for a failed playback route.
+func (h *PlaybackHandler) previousAudioTracksV3(ctx context.Context, previous *playback.Session) []models.AudioTrack {
+	if previous == nil {
+		return nil
+	}
+	if len(previous.VirtualAudioTracks) > 0 {
+		return previous.VirtualAudioTracks
+	}
+	if h.fileResolver == nil || previous.MediaFileID <= 0 {
+		return nil
+	}
+	prior, err := h.fileResolver.GetByID(ctx, previous.MediaFileID)
+	if err != nil || prior == nil {
+		return nil
+	}
+	return prior.AudioTracks
+}
+
+func (h *PlaybackHandler) evaluateAudioDegradeInPlaceV3(
+	r *http.Request,
+	session *playback.Session,
+	record *playback.AttemptRecordV3,
+	req playback.ReplanRequestV3,
+	baseStart playback.StartRequestV3,
+	file *models.MediaFile,
+	provenance ProbeProvenance,
+	plannerRequestedFile *models.MediaFile,
+	plannerSettings playback.PlannerSettingsV3,
+	plannerSettingsErr error,
+	attemptedKeys []string,
+) (*candidateEvaluationV3, *candidateErrorV3, bool) {
+	if file == nil {
+		return nil, &candidateErrorV3{Stage: candidateStageResolve, Message: "nil same-release audio degrade target"}, false
+	}
+	if req.SelectedTracks.Audio != nil {
+		return nil, &candidateErrorV3{Stage: candidateStageAudioRemap, Message: "explicit audio selection is not auto-substituted"}, false
+	}
+	current := 0
+	if baseStart.AudioTrackIndex != nil {
+		current = *baseStart.AudioTrackIndex
+	}
+	for _, index := range inPlaceAudioCandidateOrderV3(baseStart, file, current) {
+		degradedStart := audioDegradedStartV3(baseStart, file, index)
+		eval, evalErr := h.evaluatePreparedReplanCandidateV3(r, session, record, req, degradedStart, file, file, provenance, plannerRequestedFile, plannerSettings, plannerSettingsErr, attemptedKeys, false)
+		if evalErr == nil && eval != nil && eval.result.Terminal == nil {
+			annotateAudioTrackSubstitutedV3(&eval.result, index)
+			return eval, nil, true
+		}
+	}
+	return nil, &candidateErrorV3{Stage: candidateStageAudioRemap, Message: "no alternative audio track is playable on this release"}, false
+}
+
+func audioDegradedStartV3(baseStart playback.StartRequestV3, file *models.MediaFile, index int) playback.StartRequestV3 {
+	degradedStart := baseStart
+	indexCopy := index
+	degradedStart.AudioTrackIndex = &indexCopy
+	if file != nil {
+		degradedStart.AudioTrackID = playback.TrackIDV3(file.ID, "audio", index)
+	}
+	return degradedStart
+}
+
+func inPlaceAudioCandidateOrderV3(req playback.StartRequestV3, file *models.MediaFile, current int) []int {
+	if file == nil || len(file.AudioTracks) < 2 {
+		return nil
+	}
+	playable := playback.AudioTrackPlayableFuncV3(req)
+	order := make([]int, 0, len(file.AudioTracks))
+	for index := range file.AudioTracks {
+		if index != current && playable(file.AudioTracks[index]) {
+			order = append(order, index)
+		}
+	}
+	for index := range file.AudioTracks {
+		if index != current && !playable(file.AudioTracks[index]) {
+			order = append(order, index)
+		}
+	}
+	if len(order) > maxInPlaceAudioCandidatesV3 {
+		order = order[:maxInPlaceAudioCandidatesV3]
+	}
+	return order
+}
+
+func annotateAudioTrackSubstitutedV3(result *playback.PlannerResultV3, index int) {
+	if result == nil || result.Terminal != nil || result.Plan == nil {
+		return
+	}
+	result.Plan.DegradationWarnings = append(result.Plan.DegradationWarnings, playback.DegradationWarningV3{
+		Code:    "audio_track_substituted",
+		Message: fmt.Sprintf("The selected audio track could not be played on this release; audio track %d in the same file is used instead.", index),
+	})
+}
+
 func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.AttemptRecordV3, req playback.ReplanRequestV3) (playback.DecisionResponseV3, playback.AttemptRecordV3, *preparedTransportV3, *transportErrorV3) {
+	afterCtx, afterCancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
+	defer afterCancel()
 	r = r.WithContext(withPlaybackRoutingPolicySnapshotV3(r.Context(), h.playbackRoutingPolicyV3()))
 	r = r.WithContext(withServerBitrateCapV3(r.Context(), record.ServerBitrateCapKbps))
 	reservationHeld := false
