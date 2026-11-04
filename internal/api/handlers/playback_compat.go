@@ -39,8 +39,14 @@ func subtitleInventoryWaitBlockerV3(session *playback.Session, file *models.Medi
 	if session == nil || file == nil {
 		return subtitleWaitBlockerRelay
 	}
+	// An unprobed row is only an enumeration gate once the session has an
+	// armed deferred probe. Before that, the relay is the authority holding
+	// inventory back; do not infer a probe from the effective row alone.
 	if file.ProbeUpdatedAt == nil {
-		return subtitleWaitBlockerUnprobed
+		if session.VirtualProbeOutcome == playback.VirtualProbeOutcomePending {
+			return subtitleWaitBlockerUnprobed
+		}
+		return subtitleWaitBlockerRelay
 	}
 	return subtitleWaitBlockerStale
 }

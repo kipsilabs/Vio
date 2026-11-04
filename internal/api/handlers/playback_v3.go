@@ -8039,12 +8039,15 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 	}
 	defer unlockStore()
 	audit := &replanAnswerAuditV3{sessionID: sessionID}
-	record, lease, _, err := h.reserveReplanLeaseV3(r, sessionID, body, req, audit)
+	record, lease, replay, err := h.reserveReplanLeaseV3(r, sessionID, body, req, audit)
 	if err != nil {
 		return playback.DecisionResponseV3{}, err
 	}
 	if record.PlaybackAttemptID != req.PlaybackAttemptID {
 		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusConflict, "stale_playback_plan", "The failed plan is no longer current")
+	}
+	if replay != nil {
+		return *replay, nil
 	}
 	// Replan feature advertisement is optional. Validate transformations against
 	// the durable start-time features when the client omits the unchanged list;
@@ -8071,42 +8074,6 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 	}
 	if _, err := h.sessionMgr.GetSession(sessionID); err != nil {
 		return playback.DecisionResponseV3{}, replanSessionNotFoundV3()
-	}
-	digestBytes := sha256.Sum256(body)
-
-	digest := hex.EncodeToString(digestBytes[:])
-	lease, err = h.PlanStoreV3.BeginReplan(
-		r.Context(),
-		sessionID,
-		req.ReplanRequestID,
-		digest,
-		record.CurrentReplanRequestID,
-		time.Now().Add(replanLeaseDurationV3),
-	)
-	if errors.Is(err, playback.ErrIdempotencyKeyReusedV3) {
-		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusConflict, "idempotency_key_reused", "The replan request ID was reused with different input")
-	}
-	if errors.Is(err, playback.ErrStaleReplanLeaseV3) {
-		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusConflict, "stale_playback_plan", "A newer replacement plan is already active")
-	}
-	if err != nil {
-		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to reserve the replan request")
-	}
-	if lease.State == playback.ReplanLeaseInFlightV3 {
-		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusConflict, "replan_in_progress", "An identical replan is still in progress")
-	}
-	if lease.State == playback.ReplanLeaseCompletedV3 {
-		if record.CurrentReplanRequestID != req.ReplanRequestID || !completedReplanResponseMatchesAttemptV3(lease.Response, record) {
-			return playback.DecisionResponseV3{}, playbackOperationError(http.StatusConflict, "stale_playback_plan", "A newer replacement plan is already active")
-		}
-		if _, err := h.sessionMgr.GetSession(sessionID); err != nil {
-			return playback.DecisionResponseV3{}, replanSessionNotFoundV3()
-		}
-		var replay playback.DecisionResponseV3
-		if err := json.Unmarshal(lease.Response, &replay); err != nil {
-			return playback.DecisionResponseV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to decode the completed replan decision")
-		}
-		return replay, nil
 	}
 	leaseCompleted := false
 	defer func() {
@@ -8951,7 +8918,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			r = r.WithContext(withUnreachableRouteNodesV3(r.Context(), unreachableNodes))
 		}
 	}
-	trackChange := operation == playback.ReplanOperationTrackChangeV3
+	trackChange := operation == playback.ReplanOperationTrackChangeV3 || req.Failure.Classification == "subtitle_track_changed" || req.Failure.Classification == "audio_track_changed"
 	qualityChange := operation == playback.ReplanOperationQualityChangeV3
 	outputChange := operation == playback.ReplanOperationOutputChangeV3
 	// A failure recovery that abandoned a delivery for a transport reason
