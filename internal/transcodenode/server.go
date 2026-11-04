@@ -3105,6 +3105,10 @@ func (s *Server) handleManifest(w http.ResponseWriter, r *http.Request) {
 	} else {
 		manifest, err = session.BuildPlaybackManifest("segment/", r.URL.RawQuery)
 	}
+	if err == nil && manifest == nil {
+		http.NotFound(w, r)
+		return
+	}
 	if errors.Is(err, playback.ErrManifestQueryTooLong) {
 		http.Error(w, "playlist request query too long", http.StatusBadRequest)
 		return

@@ -139,8 +139,12 @@ func (s *TranscodeSession) subtitleSegmentPlacementKnown(span subtitleCueSpan, s
 }
 
 func subtitleRenditionActive(opts TranscodeOpts) bool {
+	// On-demand recipes carry their selected track metadata directly; an older
+	// planner may not have populated SubtitleCodec yet. The executor still has
+	// enough information to publish the rendition in that case.
+	codecOK := len(opts.SubtitleRenditionTracks) > 0 || SubtitleRenditionCodecSupported(opts.SubtitleCodec)
 	return opts.SubtitleRendition && (opts.SubtitleTrackIndex >= 0 || len(opts.SubtitleRenditionTracks) > 0) && !opts.SubtitleBurnIn &&
-		SubtitleRenditionCodecSupported(opts.SubtitleCodec) &&
+		codecOK &&
 		(SubtitleRenditionExecutable(opts.TargetCodecVideo, opts.SourceVideoCodec, opts.TotalDuration, opts.SegmentDuration) ||
 			(strings.EqualFold(opts.TargetCodecVideo, "copy") && opts.CopyVideoMPEGTS))
 }
@@ -473,7 +477,9 @@ func (s *TranscodeSession) readOutputFile(name string) ([]byte, error) {
 func (s *TranscodeSession) ServeSubtitleSegment(w http.ResponseWriter, r *http.Request, name string) {
 	var body []byte
 	var err error
-	if track, segNum, ok := parseSubtitleTrackSegment(name); ok {
+	segNum := 0
+	if track, n, ok := parseSubtitleTrackSegment(name); ok {
+		segNum = n
 		body, err = s.subtitleTrackSegmentVTT(r.Context(), track, segNum)
 	} else {
 		segNum, ok := ParseSubtitleSegmentNumber(name)
@@ -481,9 +487,23 @@ func (s *TranscodeSession) ServeSubtitleSegment(w http.ResponseWriter, r *http.R
 			http.NotFound(w, r)
 			return
 		}
+		if subtitleRenditionsOnDemand(s.Opts()) {
+			http.NotFound(w, r)
+			return
+		}
 		body, err = s.SubtitleSegmentVTT(r.Context(), segNum)
 	}
 	if err != nil && r.Context().Err() != nil {
+		return
+	}
+	if errors.Is(err, ErrSubtitleRenditionNotFound) {
+		// A generated playlist can advertise the complete timeline before a
+		// cue file reaches disk. Keep the route usable with an empty segment.
+		body = subtitleSegmentDocument(s.Opts(), segNum, subtitleCueWindow{}, nil)
+		err = nil
+	}
+	if errors.Is(err, ErrSegmentNotFound) {
+		http.NotFound(w, r)
 		return
 	}
 	if err != nil {
@@ -671,7 +691,11 @@ func (s *TranscodeSession) generateCopySubtitlePlaylist(segPrefix, rawQuery stri
 	out.WriteString("#EXTM3U\n")
 	fmt.Fprintf(&out, "#EXT-X-VERSION:%d\n", version)
 	out.WriteString(queryDefinition)
-	out.WriteString("#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n")
+	playlistType := "VOD"
+	if strings.EqualFold(s.Opts().TargetCodecVideo, "copy") {
+		playlistType = "EVENT"
+	}
+	fmt.Fprintf(&out, "#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:%s\n", playlistType)
 	for i, d := range s.copyPlan.durations {
 		fmt.Fprintf(&out, "#EXTINF:%.6f,\n%s\n", d, segPrefix+subtitleSegmentPrefix+fmt.Sprintf("%05d", i)+subtitleSegmentExt+suffix)
 	}
@@ -694,6 +718,10 @@ func (s *TranscodeSession) buildSubtitleRenditionPlaylist(segPrefix, rawQuery st
 	case subtitleRenditionVideo:
 		return s.GenerateFullManifest(segPrefix, query)
 	case subtitleRenditionSubtitles:
+		track := subtitleTrackQuery(query)
+		if (track == "" && len(s.Opts().SubtitleRenditionTracks) > 1) || (track != "" && !s.hasSubtitleTrack(track)) {
+			return nil
+		}
 		if s.copyPlan != nil {
 			return s.generateCopySubtitlePlaylist(segPrefix, query)
 		}
@@ -703,7 +731,11 @@ func (s *TranscodeSession) buildSubtitleRenditionPlaylist(segPrefix, rawQuery st
 				return (&TranscodeSession{opts: s.Opts(), copyPlan: &copySegmentPlan{durations: durations}}).generateCopySubtitlePlaylist(segPrefix, query)
 			}
 		}
-		return s.generateSyntheticPlaylist(segPrefix, query, subtitleSegmentPrefix, subtitleSegmentExt, false)
+		playlist := s.generateSyntheticPlaylist(segPrefix, query, subtitleSegmentPrefix, subtitleSegmentExt, false)
+		if track := subtitleTrackQuery(query); track != "" {
+			playlist = bytes.ReplaceAll(playlist, []byte(segPrefix+subtitleSegmentPrefix), []byte(segPrefix+subtitleSegmentPrefix+track+"_"))
+		}
+		return playlist
 	default:
 		return subtitleRenditionMultivariantPlaylist(s.Opts(), query)
 	}
@@ -805,6 +837,28 @@ func validCopyHLSVideoRange(opts TranscodeOpts) bool {
 
 // splitSubtitleRenditionQuery removes SubtitleRenditionQueryParam from a raw
 // query, keeping every other parameter byte-for-byte.
+func (s *TranscodeSession) hasSubtitleTrack(value string) bool {
+	n, err := strconv.ParseUint(value, 10, 64)
+	if err != nil {
+		return false
+	}
+	for _, track := range s.Opts().SubtitleRenditionTracks {
+		if track.TrackNumber == n {
+			return true
+		}
+	}
+	return false
+}
+
+func subtitleTrackQuery(rawQuery string) string {
+	for part := range strings.SplitSeq(rawQuery, "&") {
+		if key, value, _ := strings.Cut(part, "="); key == SubtitleRenditionTrackQueryParam && value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
 func splitSubtitleRenditionQuery(rawQuery string) (rendition, rest string) {
 	if rawQuery == "" {
 		return "", ""
