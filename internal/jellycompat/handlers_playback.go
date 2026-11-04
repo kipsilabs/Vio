@@ -384,25 +384,13 @@ type PlaybackHandler struct {
 	ExternalTimings subtitles.ExternalTimingLookup
 	// PlaySync aligns a subtitle the first time a client is served it, when
 	// it was never synced; nil leaves that to a request.
-	PlaySync                       subtitles.PlaySyncer
-	Trickplay                      TrickplaySheets       // optional; serves seek-bar preview sheets
-	SettingsRepo                   SettingsReader        // optional; reads watched threshold setting
-	SessionSyncer                  PlaybackSessionSyncer // optional; enables immediate session sync to shared admin view
-	WatchScrobbler                 PlaybackWatchScrobbler
-	StableIdentityResolver         watchsync.ScrobbleIdentityResolver
-	VirtualMediaResolver           VirtualMediaResolver
-	VirtualMediaRefreshResolver    VirtualMediaRefreshResolver
-	VirtualMediaDetailedResolver   VirtualMediaDetailedResolver
-	VirtualPlaybackStreamLister    VirtualPlaybackStreamLister
-	VirtualSourceProber            VirtualSourceProber
-	VirtualSourceProberWithHeaders VirtualSourceProberWithHeaders
-	VirtualFileSaver               VirtualFileSaver
-	VirtualFileMetadataSaver       VirtualFileMetadataSaver
-	VirtualCandidateFileLookup     VirtualCandidateFileLookup
-	RemoteStreamRelay              RemoteStreamRelay
-	AllowInsecureVirtual           func(installationID int) bool
-	AllowPrivateStreams            func(installationID int) bool
-	terminalFallbackDelay          time.Duration
+	PlaySync               subtitles.PlaySyncer
+	Trickplay              TrickplaySheets       // optional; serves seek-bar preview sheets
+	SettingsRepo           SettingsReader        // optional; reads watched threshold setting
+	SessionSyncer          PlaybackSessionSyncer // optional; enables immediate session sync to shared admin view
+	WatchScrobbler         PlaybackWatchScrobbler
+	StableIdentityResolver watchsync.ScrobbleIdentityResolver
+	terminalFallbackDelay  time.Duration
 	// RecipeNodeStore hands a remote transcode's reconstruction recipe to the
 	// control-plane recipe store (Redis) so a dedicated transcode node that
 	// restarts can rebuild ffmpeg from it. The node-hop token is server-minted and

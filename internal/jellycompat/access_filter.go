@@ -60,12 +60,6 @@ func NewScopeAccessFilter(resolver ScopeResolver) AccessFilterResolver {
 	}
 }
 
-// compatScopeInput is the resolve input of a compat viewer: the session's
-// account and profile, with the PIN already checked at login.
-func compatScopeInput(userID int, profileID string) access.ResolveInput {
-	return access.ResolveInput{UserID: userID, ProfileID: profileID, SkipPINVerification: true}
-}
-
 type requestScopeKey struct{}
 
 // requestScope holds the access scope of the viewer a compat request

@@ -172,13 +172,6 @@ func compatAudioOrdinal(source PlaybackMediaSource) (int, bool) {
 	return playback.AudioStreamOrdinal(source.Version.AudioTracks, trackIndex), true
 }
 
-func compatAudioOrdinalOrDefault(source PlaybackMediaSource) int {
-	if ordinal, ok := compatAudioOrdinal(source); ok {
-		return ordinal
-	}
-	return 0
-}
-
 type compatAudioV2RouteContextKey struct{}
 type compatRemuxV1RouteContextKey struct{}
 type compatRemuxTSV1RouteContextKey struct{}
@@ -2183,8 +2176,6 @@ const (
 	compatTargetAudioProfile   = "lc"
 	compatCopyCodec            = "copy"
 	compatContainerTS          = "ts"
-	compatStreamProtocolHTTP   = "http"
-	compatStreamProtocolHLS    = "hls"
 	compatAudioCodecAC3        = "ac3"
 	compatAudioCodecEAC3       = "eac3"
 	compatAudioCodecFLAC       = "flac"
