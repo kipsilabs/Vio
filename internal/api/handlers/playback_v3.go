@@ -2188,13 +2188,6 @@ func (h *PlaybackHandler) recordStartingDevice(ctx context.Context, userID int, 
 // first authorized version of alternateBase that plans replaces it, with the
 // warnings that choice adds.
 func (h *PlaybackHandler) planStartV3(r *http.Request, req playback.StartRequestV3, requestedFile, alternateBase, effectiveFile *models.MediaFile, audioIndex int, settings playback.PlannerSettingsV3, lowerVersion *playback.LowerVersionV3, profileID string) (alternateCandidateV3, []playback.DegradationWarningV3) {
-	resolutionProvenance := ProbeProvenance("")
-	enqueueDeferredPostCommitProbe := func(sessionID string) {
-		if deferredProbe != nil {
-			deferredProbe.sessionID = sessionID
-			h.enqueueDeferredVirtualProbeV3(r.Context(), deferredProbe)
-		}
-	}
 	subtitleInventoryByFileID := map[int][]playback.SubtitleInventoryEntryV3{}
 	subtitleInventoryFor := func(file *models.MediaFile) []playback.SubtitleInventoryEntryV3 {
 		if file == nil {
@@ -2452,6 +2445,13 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	resolutionProvenance := ProbeProvenance("")
 	virtualDecision := virtualPlanDecisionV3{candidateCount: -1}
 	var deferredProbe *virtualDeferredProbeV3
+	enqueueDeferredPostCommitProbe := func(sessionID string) {
+		if deferredProbe == nil {
+			return
+		}
+		deferredProbe.sessionID = sessionID
+		h.enqueueDeferredVirtualProbeV3(r.Context(), deferredProbe)
+	}
 	subtitleInventoryByFileID := map[int][]playback.SubtitleInventoryEntryV3{}
 	subtitleInventoryFor := func(file *models.MediaFile) []playback.SubtitleInventoryEntryV3 {
 		if file == nil {
@@ -2852,13 +2852,6 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 			return playback.DecisionResponseV3{}, playbackPersistenceOperationError(persistErr)
 		}
 		return persistedResponse, nil
-	}
-	enqueueDeferredPostCommitProbe := func(sessionID string) {
-		if deferredProbe == nil {
-			return
-		}
-		deferredProbe.sessionID = sessionID
-		h.enqueueDeferredVirtualProbeV3(r.Context(), deferredProbe)
 	}
 	// The transport has committed and the first-byte URL is on the response.
 	// The fresh-start resolve deferred its full audio/subtitle enumeration, so
@@ -3520,7 +3513,7 @@ func (h *PlaybackHandler) rotateRejectedVirtualCandidateStartV3(
 		if planResult.Terminal != nil || planResult.Plan == nil {
 			return playback.DecisionResponseV3{}, false
 		}
-		response, statusErr := h.startPlannedPlaybackV3(r, userID, profileID, req, requestDigests, catalogFile, &resolvedFile, audioIndex, virtualPlanDecisionV3{candidateRank: resolved.CandidateRank, candidateCount: resolved.CandidateCount, substitutionReason: substitutionReasonDecodeRejectedV3, startAudioSelectionOrigin: virtualPlanSelectionOriginForRequestV3(req)}, planResult, clientInfo, substitutionReasonDecodeRejectedV3)
+		response, statusErr := h.startPlannedPlaybackV3(r, userID, profileID, req, requestDigests, catalogFile, &resolvedFile, audioIndex, startIntentV3{audioIndex: audioIndex}, planResult, clientInfo)
 		if statusErr == nil {
 			// The start committed a replacement candidate after excluding the
 			// rejected ones. Persist the chain on the new attempt so a later
@@ -3603,13 +3596,17 @@ type playbackStartRequestDigestsV3 struct {
 // promises. The web player, for one, reports the literal "web" there; taking it
 // unconditionally would write "web" into the one field that is contractually
 // semver, on every browser session.
+func playbackClientInfoFromRequest(r *http.Request) playback.ClientInfo {
+	return playback.ClientInfoFromRequest(r).Normalized()
+}
+
 func playbackClientInfoForStartV3(r *http.Request, clientContext playback.ClientPlaybackContextV3) playback.ClientInfo {
 	info := playback.ClientInfoFromRequest(r)
 	device := DeviceMetadataFromHeaders(r.Header)
 	if isNativeAPIV2(r.Context()) {
 		device, _ = r.Context().Value(playbackDeclaredDeviceContextKey{}).(DeviceMetadata)
 	}
-	info.DeviceID, info.DevicePlatform = device.DeviceID, device.DevicePlatform
+	info.DeviceID = device.DeviceID
 	if info.Name == "" {
 		return info.Normalized()
 	}
@@ -3701,6 +3698,36 @@ func annotateSubtitleDroppedV3(result *playback.PlannerResultV3) {
 
 var errOfferedCandidateUnavailable = errors.New("offered candidate unavailable")
 
+func selectedAudioTrackLogFieldsV3(result playback.PlannerResultV3, audioIndex int) (string, string, int) {
+	if result.Plan == nil {
+		return "", "", -1
+	}
+	if audioIndex >= 0 && audioIndex < len(result.Plan.AudioTracks) {
+		t := result.Plan.AudioTracks[audioIndex]
+		return t.Language, t.Codec, audioIndex
+	}
+	return "", "", -1
+}
+
+func virtualPlanDecisionAttrsV3(result playback.PlannerResultV3, audioIndex int, decision virtualPlanDecisionV3) []any {
+	if result.Plan == nil || result.Plan.EffectiveVirtualURI == "" {
+		return nil
+	}
+	language, codec, ordinal := selectedAudioTrackLogFieldsV3(result, audioIndex)
+	attrs := []any{"candidate_uri", result.Plan.EffectiveVirtualURI, "candidate_count", decision.candidateCount, "preferred_audio_language", decision.preferredAudioLanguage, "audio_track_language", language, "audio_track_codec", codec, "audio_track_index", ordinal}
+	if decision.candidateCount > 0 {
+		attrs = append(attrs, "candidate_rank", decision.candidateRank)
+	}
+	return attrs
+}
+
+func localTransportReadinessErrorV3(opts playback.TranscodeOpts, running bool, cause error) *transportErrorV3 {
+	if running && opts.SubtitleBurnIn && opts.SubtitleTrackIndex >= 0 {
+		return &transportErrorV3{reason: subtitleUnavailableReasonV3, message: "The selected subtitle could not be prepared in time on this release; retry, or start with subtitles off.", retryable: true, cause: cause}
+	}
+	return manifestStartupTransportErrorV3(running, cause)
+}
+
 // startPlannedPlaybackV3 creates a session and transport for an accepted plan.
 func (h *PlaybackHandler) startPlannedPlaybackV3(r *http.Request, userID int, profileID string, req playback.StartRequestV3, requestDigests playbackStartRequestDigestsV3, requestedFile, effectiveFile *models.MediaFile, audioIndex int, intent startIntentV3, result playback.PlannerResultV3, clientInfo playback.ClientInfo) (playback.DecisionResponseV3, *transportErrorV3) {
 	if result.Plan == nil {
@@ -3751,7 +3778,11 @@ func (h *PlaybackHandler) startPlannedPlaybackV3(r *http.Request, userID int, pr
 	// finalized inside the planner, so they never change the plan hash. The web
 	// player still compares the live effective identity against the requested
 	// one at render time, so a serve-layer rotation is covered too.
-	publishSubstitutionFieldsV3(result.Plan, requestedFile.ID, effectiveFile.ID, substitutionReasonV3)
+	substitutionReason := substitutionReasonUnknownV3
+	if requestedFile.ID == effectiveFile.ID {
+		substitutionReason = ""
+	}
+	publishSubstitutionFieldsV3(result.Plan, requestedFile.ID, effectiveFile.ID, substitutionReason)
 	// One line per final plan decision so route selection is reconstructible
 	// from server logs.
 	planDecisionAttrs := []any{
@@ -3775,7 +3806,7 @@ func (h *PlaybackHandler) startPlannedPlaybackV3(r *http.Request, userID int, pr
 	// considered list, the audio track the plan will play, and the resolved
 	// playback.audio_language that steered it. Without these a cold playback
 	// that ignored the configured language was unattributable.
-	planDecisionAttrs = append(planDecisionAttrs, virtualPlanDecisionAttrsV3(result, audioIndex, virtualDecision)...)
+	planDecisionAttrs = append(planDecisionAttrs, virtualPlanDecisionAttrsV3(result, audioIndex, virtualPlanDecisionV3{candidateCount: -1})...)
 	slog.InfoContext(r.Context(), "playback plan decided", append(planDecisionAttrs, clientInfo.LogAttrs()...)...)
 	applyTransportToneMapModeV3(&result, transport)
 	frozenRecipe, frozenErr := h.freezeExecutableRecipeV3(r.Context(), effectiveFile, result)
@@ -3793,7 +3824,7 @@ func (h *PlaybackHandler) startPlannedPlaybackV3(r *http.Request, userID int, pr
 	response := playback.DecisionResponseV3{ProtocolVersion: playback.ProtocolV3, ServerFeatures: serverFeaturesForRequestV3(r.Context()), Outcome: playback.OutcomePlayableV3, SessionID: session.ID, PlaybackPlan: result.Plan}
 	record := playback.AttemptRecordV3{PlaybackAttemptID: req.PlaybackAttemptID, SessionID: session.ID, UserID: userID, ProfileID: profileID, RequestedMediaFileID: requestedFile.ID, EffectiveMediaFileID: effectiveFile.ID, CurrentPlanID: result.Plan.PlanID, CurrentPlan: *result.Plan, FrozenRecipe: frozenRecipe, NormalizedRequest: req, ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), StartResponse: response, RequestDigest: requestDigests.current, ExpiresAt: time.Now().Add(playback.MaxTokenTTL), DesiredTracks: h.startDesiredTracksV3(r.Context(), requestedFile, intent, effectiveFile, result.Plan, frozenRecipe)}
 	if err := h.updateV3SessionState(r.Context(), session, effectiveFile, result, transport, mode); err != nil {
-		recordTransportPhaseV3(r.Context(), transportPhasePersistV3, persistStart)
+		recordTransportPhaseV3(r.Context(), transportPhasePersistV3, time.Now())
 		transport.rollback()
 		abort()
 		return playback.DecisionResponseV3{}, &transportErrorV3{reason: "internal_error", message: "Failed to commit the live playback session.", cause: err}
@@ -3806,12 +3837,12 @@ func (h *PlaybackHandler) startPlannedPlaybackV3(r *http.Request, userID int, pr
 		return playback.DecisionResponseV3{}, &transportErrorV3{reason: "internal_error", message: "Failed to commit the live playback session.", cause: err}
 	}
 	if err := h.PlanStoreV3.SaveAttempt(r.Context(), record); err != nil {
-		recordTransportPhaseV3(r.Context(), transportPhasePersistV3, persistStart)
+		recordTransportPhaseV3(r.Context(), transportPhasePersistV3, time.Now())
 		transport.rollback()
 		abort()
 		return h.replayDuplicateStartV3(r.Context(), userID, profileID, req, requestDigests, err)
 	}
-	recordTransportPhaseV3(r.Context(), transportPhasePersistV3, persistStart)
+	recordTransportPhaseV3(r.Context(), transportPhasePersistV3, time.Now())
 	if commitErr := transport.commit(); commitErr != nil {
 		abort()
 		return playback.DecisionResponseV3{}, commitErr
@@ -4088,7 +4119,6 @@ func (h *PlaybackHandler) prepareTransportWithPolicyAndExclusionsV3(
 	// rather than the generic route exhaustion, so the client gets a clear
 	// audio outcome. A single non-audio failure makes the exhaustion a route
 	// failure.
-	audioOnlyFailure := true
 	loopStartedAt := time.Now()
 	for attempts := 0; attempts < 32; attempts++ {
 		if time.Since(loopStartedAt) >= maxHLSRouteAttemptLoopV3 {
@@ -4124,7 +4154,6 @@ func (h *PlaybackHandler) prepareTransportWithPolicyAndExclusionsV3(
 
 		if decision.Shape.Execution == noderouting.ExecutionAPI {
 			if capabilityErr := h.validateLocalTransportCapabilitiesV3(r.Context(), result); capabilityErr != nil {
-				audioOnlyFailure = false
 				lastErr = combineTransportErrorsV3(lastErr, capabilityErr)
 				excludedShapes[decision.Shape.ID] = struct{}{}
 				continue
@@ -4149,7 +4178,6 @@ func (h *PlaybackHandler) prepareTransportWithPolicyAndExclusionsV3(
 				return preparedTransportV3{}, transportErr
 			}
 			if !audioOnlyTransportReasonV3(transportErr.reason) {
-				audioOnlyFailure = false
 			}
 			lastErr = combineTransportErrorsV3(lastErr, transportErr)
 			excludedShapes[decision.Shape.ID] = struct{}{}
@@ -4218,9 +4246,6 @@ func (h *PlaybackHandler) prepareTransportWithPolicyAndExclusionsV3(
 			excludedShapes[decision.Shape.ID] = struct{}{}
 		} else {
 			excludedNodes[nodeURL] = struct{}{}
-		}
-		if !audioOnlyTransportReasonV3(transportErr.reason) {
-			audioOnlyFailure = false
 		}
 		lastErr = combineTransportErrorsV3(lastErr, transportErr)
 	}
@@ -4501,7 +4526,7 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 		origin, startSegment := 0.0, 0
 		if requested > 0 {
 			if file == nil || strings.TrimSpace(file.FilePath) == "" {
-				return preparedTimelineV3{}, &transportErrorV3{reason: transcodeStartFailedReasonV3, message: remuxSeekPositionFailedV3, retryable: true, cause: errors.New("copy seek anchor requires a media file path"), seekFailure: true}
+				return preparedTimelineV3{}, &transportErrorV3{reason: transcodeStartFailedReasonV3, message: "failed to resolve remux seek position", retryable: true, cause: errors.New("copy seek anchor requires a media file path"), seekFailure: true}
 			}
 			// The whole anchor resolve — pinned-relay lookup and FFmpeg probe —
 			// runs under a cap well inside the replan budget. A relay that is
@@ -4571,7 +4596,7 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 					// release verdict is left as-is so the start's alternate walk
 					// still runs.
 					classified := classifyVirtualAnchorProviderOutage(resolveErr)
-					fallback := &transportErrorV3{reason: transcodeStartFailedReasonV3, message: remuxSeekPositionFailedV3, retryable: true, cause: classified}
+					fallback := &transportErrorV3{reason: transcodeStartFailedReasonV3, message: "failed to resolve remux seek position", retryable: true, cause: classified}
 					if anchorCtx.Err() != nil && ctx.Err() == nil {
 						// Our bounded anchor budget elapsed while looking the
 						// candidate up. That is a slow relay, not a release
@@ -4749,7 +4774,7 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 				// rotating the version or a replan tearing down the transport.
 				seekFailure := playback.IsTransientProviderError(err) ||
 					(anchorCtx.Err() != nil && ctx.Err() == nil)
-				return preparedTimelineV3{}, &transportErrorV3{reason: transcodeStartFailedReasonV3, message: remuxSeekPositionFailedV3, retryable: true, cause: err, seekFailure: seekFailure}
+				return preparedTimelineV3{}, &transportErrorV3{reason: transcodeStartFailedReasonV3, message: "failed to resolve remux seek position", retryable: true, cause: err, seekFailure: seekFailure}
 			}
 		}
 		configureCopyRemuxTimelineV3(result.Plan, origin)
@@ -5831,6 +5856,7 @@ func (h *PlaybackHandler) preferredAudioTrackIndexV3(ctx context.Context, userID
 		return 0, false, err
 	}
 	seriesID := h.playbackPreferenceKey(ctx, file)
+	contentID := seriesID
 	var seriesPref *playback.AudioTrackPreference
 	if contentID != "" {
 		stored, prefErr := store.GetAudioPreference(ctx, profileID, contentID)
@@ -6207,7 +6233,6 @@ func (h *PlaybackHandler) prepareLocalTransportV3(r *http.Request, session *play
 	// every path that spawns FFmpeg into one output directory, so measuring it
 	// apart from spawn and readiness shows a start queued behind another writer
 	// instead of an unexplained delay.
-	queueStart := time.Now()
 	unlock := h.tm.LockSessionLifecycle(session.ID)
 	opts := playback.TranscodeOpts{InputPath: file.FilePath, OutputDir: outputDir, OutputSubdir: outputSubdir, SessionID: session.ID, SourceVideoCodec: sourceMetadata.VideoCodec, SourceVideoProfile: sourceProfile, SourceVideoBitDepth: sourceBitDepth, SourceAudioChannels: result.SourceAudioChannels, SoftwareVideoDecode: sourceMetadata.SoftwareVideoDecode, ToneMapPolicy: result.ToneMapPolicy, ToneMapMode: result.ToneMapMode, ToneMapSourceKind: result.ToneMapSourceKind, ToneMapRecipeVersion: result.ToneMapRecipeVersion, ToneMapPreflightRequired: result.ToneMapPreflightRequired, ToneMapSourceRevision: result.ToneMapSourceRevision, VideoBitstreamFilter: videoBitstreamFilterForPlanV3(result.Plan), VideoSampleEntry: videoSampleEntryForPlanV3(result.Plan), VideoRange: copyHLSVideoRangeV3(file, result, videoCodec), SeekSeconds: timeline.seekSeconds, StreamOriginSeconds: timeline.streamOriginSeconds, CopySeekAnchorResolved: timeline.copySeekAnchorResolved, StartSegmentNumber: timeline.startSegmentNumber, TargetResolution: result.TargetResolution, TargetCodecVideo: videoCodec, TargetCodecAudio: result.TargetAudioCodec, TargetAudioChannels: result.TargetAudioChannels, TargetAudioBitrateKbps: result.TargetAudioBitrateKbps, TargetBitrateKbps: result.TargetBitrateKbps, SegmentDuration: playback.DefaultSegmentDuration, KeyframePlaylist: cfg.KeyframePlaylist && videoCodec == "copy", SegmentRetentionSeconds: cfg.SegmentRetentionSeconds, FFmpegPath: cfg.FFmpegPath, HWAccel: cfg.HWAccel, HWDevice: cfg.HWDevice, AudioTrackIndex: plannedAudioTrackIndexV3(result, session.AudioTrackIndex), SubtitleTrackIndex: result.SubtitleTransportTrackIndex, SubtitleBurnIn: result.SubtitleBurnIn, SubtitleCodec: result.SubtitleCodec, SubtitleRendition: result.SubtitleRendition, TotalDuration: sourceMetadata.DurationSeconds, FastStart: true, NodeType: playbackNodeIntegratedV3, ExecutionMode: playbackNodeIntegratedV3, FFmpegLogSink: h.FFmpegLogSink}
 	opts.CopyVideoMPEGTS = playback.PlanCopiesVideoAsMPEGTSV3(*result.Plan)
@@ -6560,6 +6585,7 @@ func (h *PlaybackHandler) prepareRemoteTransportV3(r *http.Request, session *pla
 		req.ToneMapDVBLPresent = sourceMetadata.ToneMapDVBLPresent
 		req.ToneMapDVRPUPresent = sourceMetadata.ToneMapDVRPUPresent
 	}
+	cleanupOnFailure := func() {}
 	remoteStartAt := time.Now()
 	nodeResp, status, err := h.startRemotePlaybackTransport(r.Context(), node.URL, req)
 	recordTransportPhaseV3(r.Context(), "transport_remote_ready", remoteStartAt)
@@ -6645,7 +6671,6 @@ func (h *PlaybackHandler) prepareRemoteTransportV3(r *http.Request, session *pla
 	card.RoutingEgress = string(noderouting.EgressAPI)
 	// The node never sees the token, so the API relaying its playlist reads
 	// the negotiated playlist form from the token's claims.
-	card.HLSVariableSubstitution = mode.hlsVariableSubstitution
 	if nodePlan.ProxyNode != nil {
 		card.RoutingEgress = string(noderouting.EgressProxy)
 		card.RoutingEgressNodeID = nodePlan.ProxyNode.ID
@@ -7014,7 +7039,7 @@ func (h *PlaybackHandler) v3SessionStreamState(ctx context.Context, session *pla
 		}
 		state.VirtualSourceURI = virtualURI
 		state.VirtualSourceOwnerInstallationID = owner
-		state.VirtualSourceRevision = planVirtualSourceRevisionV3(result)
+		state.VirtualSourceRevision = ""
 		state.VirtualSubtitleTracks = file.SubtitleTracks
 		state.VirtualExternalSubtitles = file.ExternalSubtitles
 		state.VirtualAudioTracks = file.AudioTracks
