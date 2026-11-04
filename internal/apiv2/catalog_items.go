@@ -1230,17 +1230,26 @@ func (reg *Registry) getCatalogItem(ctx context.Context, in *CatalogItemDeviceIn
 	if err != nil {
 		return nil, serviceProblem(err)
 	}
-	out := catalogItemDetailOf(detail, reg.ratingSelection(ctx))
-	if svc, ok := reg.deps.LibraryCollections.(ItemCollectionIndex); ok {
-		membership := detail.ContentID
-		if detail.Type == "episode" || detail.Type == "season" {
-			membership = detail.SeriesID
-		}
-		collections, err := svc.ItemCollections(ctx, membership, viewer.Access)
-		if err == nil {
-			out.Collections = NonNil(collections)
+	// A leaf detail (movie or individual episode, never a series, season or
+	// list) may start the item's provider version discovery, but the answer
+	// never waits for it: the response is built from the already-persisted
+	// version list and the detached run publishes the existing versions_updated
+	// catalog event when its listing lands, so an open detail page still
+	// refreshes. A slow provider therefore costs a client nothing.
+	//
+	// The eligibility read also feeds the detail's has_virtual_source hint,
+	// which exists independently of whether discovery is enabled.
+	var virtualSource *bool
+	if detail != nil {
+		if reg.startDetailVersionDiscovery(ctx, detail.ContentID, detail.Type, viewer.Access, "catalog_detail", reg.preplayDiscoveryCatalogBudgetFor(ctx)) {
+			source := true
+			virtualSource = &source
 		}
 	}
+	out := catalogItemDetailOf(detail, reg.ratingSelection(ctx))
+	out.HasVirtualSource = virtualSource
+	reg.warmDetailVirtualVersions(ctx, detail, viewer.Access)
+	out.Collections = NonNil(reg.itemCollections(ctx, detail, viewer.Access))
 	if reg.deps.ThemeSongs != nil && (detail.Type == themeOwnerMovie || detail.Type == themeOwnerSeries || detail.Type == themeOwnerSeason || detail.Type == themeOwnerEpisode) {
 		// The detail authorized the item under the same filter and carries
 		// its owner fields, so the theme lookup repeats neither.
@@ -1255,6 +1264,40 @@ func (reg *Registry) getCatalogItem(ctx context.Context, in *CatalogItemDeviceIn
 		}
 	}
 	return &CatalogItemDetailOutput{Body: out}, nil
+}
+
+// itemCollections answers the item's collections for the detail page. It is
+// best-effort: when the index service is not wired, or the lookup fails, the
+// result is nil and the detail page still succeeds with an empty row,
+// following the theme lookup's non-fatal contract.
+//
+// The membership key is an item's own content id for a movie or series; an
+// episode or season contributes its parent series id, because a membership row
+// names the series rather than an episode. Any other type, and a title whose
+// series id is empty, answers empty.
+func (reg *Registry) itemCollections(ctx context.Context, detail *catalogpkg.ItemDetail, access catalogpkg.AccessFilter) []handlers.ItemCollectionView {
+	index, ok := reg.deps.LibraryCollections.(ItemCollectionIndex)
+	if !ok || index == nil || detail == nil {
+		return nil
+	}
+	var membership string
+	switch detail.Type {
+	case themeOwnerMovie, themeOwnerSeries:
+		membership = detail.ContentID
+	case themeOwnerEpisode, themeOwnerSeason:
+		membership = detail.SeriesID
+	default:
+		return nil
+	}
+	if membership == "" {
+		return nil
+	}
+	views, err := index.ItemCollections(ctx, membership, access)
+	if err != nil {
+		slog.WarnContext(ctx, "catalog item collections lookup failed", "component", "apiv2", "item_id", detail.ContentID, "error", err)
+		return nil
+	}
+	return views
 }
 
 // themeItemOf is the theme owner a movie, series, season, or episode detail
