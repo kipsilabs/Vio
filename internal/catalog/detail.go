@@ -4465,6 +4465,55 @@ func (s *DetailService) effectiveAudioSelectionWith(
 	}
 }
 
+// VirtualRowsShareRelease reports whether two virtual catalog rows represent the
+// same release for version grouping. Unknown identity on one side is not a conflict;
+// populated, differing identity tiers are kept separate.
+func VirtualRowsShareRelease(a, b *models.MediaFile) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	key := virtualNeutralReleaseKey(a)
+	if key == "" || key != virtualNeutralReleaseKey(b) {
+		return false
+	}
+	if virtualDeclaredProviderSize(a) != virtualDeclaredProviderSize(b) {
+		return false
+	}
+	return !virtualProviderIdentityConflicts(a, b)
+}
+
+func virtualNeutralReleaseKey(f *models.MediaFile) string {
+	if f == nil || !(strings.HasPrefix(f.FilePath, "virtual://") || strings.EqualFold(f.Container, "virtual")) {
+		return ""
+	}
+	return f.ContentID + "\x00" + neutralVirtualMediaPath(f.FilePath)
+}
+
+func virtualDeclaredProviderSize(f *models.MediaFile) int64 {
+	if f == nil {
+		return 0
+	}
+	if f.FileSize > 0 {
+		return f.FileSize
+	}
+	return f.ProviderReleaseSize
+}
+
+func virtualProviderIdentityConflicts(a, b *models.MediaFile) bool {
+	if a == nil || b == nil {
+		return true
+	}
+	return providerIdentityTierConflicts(a.ProviderVideoHash, b.ProviderVideoHash) ||
+		providerIdentityTierConflicts(a.ProviderGUID, b.ProviderGUID) ||
+		providerIdentityTierConflicts(a.ProviderReleaseName, b.ProviderReleaseName) ||
+		providerIdentityTierConflicts(a.ReleaseName, b.ReleaseName)
+}
+
+func providerIdentityTierConflicts(a, b string) bool {
+	a, b = strings.TrimSpace(a), strings.TrimSpace(b)
+	return a != "" && b != "" && a != b
+}
+
 func (s *DetailService) effectiveAudioTrackIndex(
 	ctx context.Context,
 	filter AccessFilter,
