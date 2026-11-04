@@ -567,6 +567,10 @@ func RecipeCardFromClaims(c *streamtoken.Claims) RecipeCard {
 		method = PlayRemux
 	case streamtoken.PlayMethodCopyFMP4Transcode:
 		method = playMethodCopyFMP4V1
+	case streamtoken.PlayMethodSubtitleRenditionsTranscode:
+		method = PlayTranscode
+	case streamtoken.PlayMethodSubtitleRenditionsCopyFMP4:
+		method = playMethodCopyFMP4V1
 	}
 	if method == "" {
 		method = PlayTranscode
