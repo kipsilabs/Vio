@@ -741,14 +741,34 @@ func (h *PlaybackHandler) retryCompletedPinnedReleaseOnHiccup(
 		!h.virtualReleaseCompletedAndVerified(ctx, file) {
 		return ResolvedVirtualMedia{}, nil, false
 	}
+	retryBudget, allowed := virtualPinRetryBudget(ctx)
+	if !allowed {
+		// The start phase has already spent its budget on the catalog resolve.
+		// A same-release retry would only consume the remainder and still be
+		// cut off, so fall through to the bounded alternate walk instead.
+		slog.WarnContext(ctx, "virtual playback start budget exhausted; skipping the completed-release retry",
+			"component", "api", "signal", "start_budget_exhausted",
+			"file_id", catalogFileIDOrZero(file),
+			"candidate_id", pinnedCandidateID,
+			"remaining_ms", retryBudget.Milliseconds())
+		return ResolvedVirtualMedia{}, nil, false
+	}
 	retried, retriedCleanup, retriedErr := h.retryCompletedPinnedReleaseV3(
 		ctx, file, ownerInstallationID, userID, profileID,
-		targetURI, preferredCandidateID, pinnedCandidateID,
+		targetURI, preferredCandidateID, pinnedCandidateID, retryBudget,
 	)
 	if retriedErr != nil {
-		slog.WarnContext(ctx, "virtual playback retry of a completed pinned release failed; walking alternates",
-			"component", "api", "file_id", catalogFileIDOrZero(file),
-			"candidate_id", pinnedCandidateID, "error", retriedErr)
+		if errors.Is(retriedErr, context.DeadlineExceeded) && ctx.Err() == context.DeadlineExceeded {
+			slog.WarnContext(ctx, "virtual playback start budget exhausted during the completed-release retry",
+				"component", "api", "signal", "start_budget_exhausted",
+				"file_id", catalogFileIDOrZero(file),
+				"candidate_id", pinnedCandidateID,
+				"error", retriedErr)
+		} else {
+			slog.WarnContext(ctx, "virtual playback retry of a completed pinned release failed; walking alternates",
+				"component", "api", "file_id", catalogFileIDOrZero(file),
+				"candidate_id", pinnedCandidateID, "error", retriedErr)
+		}
 		return ResolvedVirtualMedia{}, nil, false
 	}
 	return retried, retriedCleanup, true

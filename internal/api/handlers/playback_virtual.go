@@ -7156,8 +7156,12 @@ func (h *PlaybackHandler) retryCompletedPinnedReleaseV3(
 	file *models.MediaFile,
 	ownerInstallationID, userID int,
 	profileID, pinnedURI, preferredCandidateID, pinnedCandidateID string,
+	budget time.Duration,
 ) (ResolvedVirtualMedia, func(), error) {
-	retryCtx, cancel := context.WithTimeout(withVirtualRelayFreshRegistration(ctx), virtualCompletedReleaseRetryBudget)
+	if budget <= 0 || budget > virtualCompletedReleaseRetryBudget {
+		budget = virtualCompletedReleaseRetryBudget
+	}
+	retryCtx, cancel := context.WithTimeout(withVirtualRelayFreshRegistration(ctx), budget)
 	defer cancel()
 	resolved, cleanup, err := h.resolveVirtualInputURI(
 		retryCtx, pinnedURI, ownerInstallationID, userID, profileID, true, nil, preferredCandidateID,

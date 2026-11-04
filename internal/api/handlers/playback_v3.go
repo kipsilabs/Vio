@@ -2264,6 +2264,14 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	// therefore out of scope here, not silently missing; adding one means
 	// teaching its session model the split first.
 	if isVirtualPlaybackFile(requestedFile) {
+		// One deadline owns the whole user-visible start: the candidate
+		// resolve, transport startup, and the completed-release pin retry all
+		// derive from it. The detached catalog discovery may already be
+		// holding the provider, so a start that paid that wait must not then
+		// hand the pin retry a fresh 20 s and stack both onto one click.
+		startPhaseCtx, startPhaseCancel := withVirtualStartPhaseDeadline(r.Context(), virtualStartPhaseBudget)
+		defer startPhaseCancel()
+		r = r.WithContext(startPhaseCtx)
 		requestedCatalogFileID := requestedFile.ID
 		// A detail-page read may have scheduled a detached probe for this row.
 		// The start path is about to resolve and probe the same provider bytes;
@@ -2302,6 +2310,15 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 			resolved, resolveErr = h.resolveVirtualStartWithVersionFallback(walkSourceReq, requestedFile, profileID, req, allowFailedCandidate, intOrZeroHandlerV3(req.BandwidthCapKbps))
 		}
 		if resolveErr != nil {
+			if r.Context().Err() == context.DeadlineExceeded {
+				// The shared start phase ran out during catalog/provider
+				// work. Keep it distinct from a release verdict: the release
+				// was not indicted, the start simply hit its end-to-end
+				// bound.
+				slog.WarnContext(r.Context(), "virtual playback start budget exhausted during candidate resolve",
+					"component", "api", "signal", "start_budget_exhausted",
+					"file_id", requestedFile.ID, "error", resolveErr)
+			}
 			// A confirmed-dead pinned release is indicted here so a retry does
 			// not re-resolve it; an empty provider listing is not a verdict and
 			// is left unmarked.
