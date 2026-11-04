@@ -94,6 +94,9 @@ func (h *RealtimeHub) Register(sessionID string, conn RealtimeConnection) *Realt
 		if reconnected && h.onNewConnection != nil {
 			h.onNewConnection(sessionID)
 		}
+		if observer := h.laneObserver; observer != nil {
+			observer(sessionID, true)
+		}
 		return &RealtimeRegistration{sessionID: sessionID, lane: lane, generation: 1}
 	}
 	h.mu.Unlock()
@@ -125,6 +128,9 @@ func (h *RealtimeHub) Register(sessionID string, conn RealtimeConnection) *Realt
 		// an undeliverable command (audio withdrawal, download telemetry) can
 		// rearm here: a reconnecting client is a fresh delivery candidate.
 		h.onNewConnection(sessionID)
+	}
+	if observer := h.laneObserver; observer != nil {
+		observer(sessionID, true)
 	}
 	return reg
 }
