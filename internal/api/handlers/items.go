@@ -2730,6 +2730,19 @@ func (h *ItemsHandler) lookupWatchedTarget(ctx context.Context, contentID string
 		}
 	}
 
+	if seriesID, seasonNumber, ok := parseSyntheticSeasonID(contentID); ok {
+		if h.episodeRepo == nil {
+			return watchedTarget{}, catalog.ErrItemNotFound
+		}
+		if err := h.itemRepo.EnsureAccessible(ctx, seriesID, filter); err != nil {
+			return watchedTarget{}, err
+		}
+		return watchedTarget{
+			Type:   "season",
+			Season: &models.Season{ContentID: contentID, SeriesID: seriesID, SeasonNumber: seasonNumber},
+		}, nil
+	}
+
 	if h.episodeRepo == nil {
 		return watchedTarget{}, catalog.ErrItemNotFound
 	}
@@ -2796,7 +2809,7 @@ func (h *ItemsHandler) resolveWatchedTargets(ctx context.Context, contentID stri
 		if !played {
 			return "season", seriesID, nil, nil
 		}
-		episodes, err := h.episodeRepo.ListBySeasonID(ctx, target.Season.ContentID)
+		episodes, err := h.seasonEpisodesForRead(ctx, target.Season.SeriesID, target.Season.SeasonNumber)
 		if err != nil {
 			return "", "", nil, err
 		}

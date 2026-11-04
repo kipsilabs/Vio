@@ -218,7 +218,7 @@ func (h *CatalogResourceHandler) syntheticSeasonDetail(ctx context.Context, v It
 		return nil, err
 	}
 
-	episodes, err := h.items.episodeRepo.ListBySeason(ctx, seriesID, seasonNum)
+	episodes, err := h.items.seasonEpisodesForRead(ctx, seriesID, seasonNum)
 	if err != nil {
 		return nil, fmt.Errorf("listing season episodes: %w", err)
 	}
@@ -272,6 +272,31 @@ func parseSyntheticSeasonID(contentID string) (string, int, bool) {
 
 // enrichItemDetail adds the viewer's state to detail. curates is
 // canViewFilePaths for the request; paths are stripped without it.
+// enrichSeasonDetailUserData folds the same season read the season page uses,
+// so a metadata-only or partly linked season reports progress over the listed
+// episode set instead of only the row-linked one.
+func (h *CatalogResourceHandler) enrichSeasonDetailUserData(ctx context.Context, v ItemViewer, detail *catalog.ItemDetail) {
+	if h.items.episodeRepo == nil || detail.SeriesID == "" || detail.SeasonNumber == nil {
+		return
+	}
+	episodes, err := h.items.seasonEpisodesForRead(ctx, detail.SeriesID, *detail.SeasonNumber)
+	if err != nil || len(episodes) == 0 {
+		if userData, ok := h.items.parentRollupUserData(ctx, v, "season", detail.ContentID); ok && userData != nil {
+			detail.SeasonUserData = userData
+		}
+		return
+	}
+	var userData *catalog.SeasonUserData
+	rolledUp := false
+	if episodesAllLinkedToSeason(episodes, detail.ContentID) {
+		userData, rolledUp = h.items.parentRollupUserData(ctx, v, "season", detail.ContentID)
+	}
+	if !rolledUp || userData == nil {
+		userData = h.items.getAggregateUserData(ctx, v, episodes)
+	}
+	detail.SeasonUserData = userData
+}
+
 func (h *CatalogResourceHandler) enrichItemDetail(ctx context.Context, v ItemViewer, detail *catalog.ItemDetail, curates bool) {
 	if detail == nil {
 		return
@@ -291,13 +316,7 @@ func (h *CatalogResourceHandler) enrichItemDetail(ctx context.Context, v ItemVie
 	state, batched := h.batchedViewerState(ctx, v, detail)
 	switch detail.Type {
 	case "season":
-		if h.items.episodeRepo != nil {
-			if userData, ok := h.items.parentRollupUserData(ctx, v, detail.Type, detail.ContentID); ok {
-				detail.SeasonUserData = userData
-			} else if episodes, err := h.items.episodeRepo.ListBySeasonID(ctx, detail.ContentID); err == nil {
-				detail.SeasonUserData = h.items.getAggregateUserData(ctx, v, episodes)
-			}
-		}
+		h.enrichSeasonDetailUserData(ctx, v, detail)
 	case "series":
 		if h.items.episodeRepo != nil {
 			if userData, ok := h.items.parentRollupUserData(ctx, v, detail.Type, detail.ContentID); ok {
