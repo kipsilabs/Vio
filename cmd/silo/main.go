@@ -1459,6 +1459,10 @@ func main() {
 	registerShutdownWork := func(done <-chan struct{}) {
 		shutdownWork = append(shutdownWork, done)
 	}
+	var shutdownSteps []shutdownStep
+	registerShutdownFunc := func(name string, run func()) {
+		shutdownSteps = append(shutdownSteps, shutdownStep{name: name, run: run})
+	}
 	normalizedBootstrapRedisURL, bootstrapRedisURLErr := config.NormalizeRedisURL(bc.RedisURL)
 	redisBootstrapAvailable := normalizedBootstrapRedisURL != "" && bootstrapRedisURLErr == nil
 
@@ -1479,6 +1483,7 @@ func main() {
 		RedisBootstrapAvailable:      redisBootstrapAvailable,
 		AppContext:                   appCtx,
 		RegisterShutdownWork:         registerShutdownWork,
+		RegisterShutdownFunc:         registerShutdownFunc,
 		StreamTelemetry:              streamTelemetryRegistry,
 		StreamTelemetryViewCache:     streamTelemetryViewCache,
 		DB:                           pool,
@@ -4264,6 +4269,7 @@ func main() {
 	}
 
 	// 1. Stop accepting new requests.
+	runShutdownSteps(30*time.Second, shutdownSteps)
 	if shutdownErr := srv.Shutdown(shutdownCtx); shutdownErr != nil {
 		slog.Error("HTTP shutdown error", "error", shutdownErr)
 	}
@@ -4319,6 +4325,50 @@ func main() {
 	_ = adminJobRunner
 
 	slog.Info("server stopped")
+}
+
+// shutdownStep is an explicit application-shutdown step registered through
+// api.Dependencies.RegisterShutdownFunc. Steps are idempotent and safe to call
+// during shutdown; main invokes each one directly under its own deadline.
+type shutdownStep struct {
+	name string
+	run  func()
+}
+
+// runShutdownSteps invokes each explicit application-shutdown step in
+// registration order, waiting at most timeout for each. A step that overruns is
+// abandoned and logged; later steps still run, so one stuck step cannot starve
+// the rest of the shutdown sequence.
+func runShutdownSteps(timeout time.Duration, steps []shutdownStep) {
+	for _, step := range steps {
+		if err := awaitShutdownFunc(timeout, step.run); err != nil {
+			slog.Error("shutdown step did not finish before deadline; abandoning in-memory work",
+				"step", step.name, "timeout", timeout, "error", err)
+		}
+	}
+}
+
+// awaitShutdownFunc runs one explicit shutdown step and waits at most timeout
+// for it to return. A step that overruns keeps running, but shutdown stops
+// waiting and reports context.DeadlineExceeded so a stuck step cannot hang the
+// process. nil is a no-op.
+func awaitShutdownFunc(timeout time.Duration, run func()) error {
+	if run == nil {
+		return nil
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		run()
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return nil
+	case <-timer.C:
+		return context.DeadlineExceeded
+	}
 }
 
 // waitForShutdownWork waits for registered cleanup tasks within the process's

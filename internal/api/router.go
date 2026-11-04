@@ -48,6 +48,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/httpstream"
 	"github.com/Silo-Server/silo-server/internal/intromarkers"
 	"github.com/Silo-Server/silo-server/internal/invitations"
+	"github.com/Silo-Server/silo-server/internal/keptsub"
 	"github.com/Silo-Server/silo-server/internal/libraryingest"
 	"github.com/Silo-Server/silo-server/internal/literaryworks"
 	"github.com/Silo-Server/silo-server/internal/logstream"
@@ -312,10 +313,12 @@ type Dependencies struct {
 	EventsHub                 *evt.Hub
 	ScanRegistry              *evt.ScanRegistry
 	LibraryScanQueue          *scanqueue.Service
-	LibraryMonitor            interface{ Poke() }            // real-time library monitor, reconciled after library mutations (nil when this node runs none)
-	Trickplay                 interface{ ReconcileSoon() }   // seek preview service, reconciled after a library's trickplay setting changes (nil when not configured)
-	TrickplayReader           *trickplay.Reader              // published seek previews for players (nil when not configured)
-	TrickplayAdmin            *trickplay.Admin               // seek preview status and regeneration for administrators (nil when not configured)
+	LibraryMonitor            interface{ Poke() }          // real-time library monitor, reconciled after library mutations (nil when this node runs none)
+	Trickplay                 interface{ ReconcileSoon() } // seek preview service, reconciled after a library's trickplay setting changes (nil when not configured)
+	TrickplayReader           *trickplay.Reader            // published seek previews for players (nil when not configured)
+	TrickplayAdmin            *trickplay.Admin             // seek preview status and regeneration for administrators (nil when not configured)
+	KeptSubtitles             *keptsub.Store
+	SubtitlePrefetch          *keptsub.Prefetcher
 	LibraryMonitoring         apiv2.LibraryMonitoringService // real-time monitoring status for the v2 admin read (may be nil)
 	ActivityLogWriter         activitylog.Writer
 	ActivityLogRepo           *activitylog.Repo
@@ -2347,6 +2350,10 @@ func newChiRouter(deps Dependencies) chi.Router {
 		}
 		if subtitleRepo != nil {
 			playbackHandler.SubtitleRepo = subtitleRepo
+		}
+		if deps.KeptSubtitles != nil {
+			playbackHandler.SubtitleTrackFacts = deps.KeptSubtitles
+			playbackHandler.SubtitlePrefetch = deps.SubtitlePrefetch
 		}
 		if subtitleManager != nil && itemRepo != nil {
 			playbackHandler.VirtualSubtitleSearcher = func(
