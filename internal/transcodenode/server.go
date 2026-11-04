@@ -3139,10 +3139,10 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 	}
 	s.attachTelemetrySession(r, sessionID)
 
-	if subtitleSegment, ok := playback.ParseSubtitleSegmentNumber(name); ok {
+	if _, ok := playback.ParseSubtitleSegmentNumber(name); ok {
 		// Subtitle rendition segments never wait out or restart the video
 		// pipeline: they are answered from the cues already on disk.
-		session.ServeSubtitleSegment(w, r, subtitleSegment)
+		session.ServeSubtitleSegment(w, r, name)
 		return
 	}
 	// A generation whose decoder has rejected the source cannot produce a
