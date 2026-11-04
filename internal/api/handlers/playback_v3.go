@@ -7790,7 +7790,7 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 	digestBytes := sha256.Sum256(body)
 
 	digest := hex.EncodeToString(digestBytes[:])
-	lease, err := h.PlanStoreV3.BeginReplan(
+	lease, err = h.PlanStoreV3.BeginReplan(
 		r.Context(),
 		sessionID,
 		req.ReplanRequestID,
@@ -7998,6 +7998,7 @@ func (h *PlaybackHandler) reserveReplanLeaseV3(r *http.Request, sessionID string
 		return nil, playback.ReplanLeaseV3{}, nil, replanSessionNotFoundV3()
 	}
 	audit.record = record
+	var lease playback.ReplanLeaseV3
 	// The durable attempt can outlive the in-memory session: a stop or an idle
 	// reap can land while this request waits on the replan slot and the
 	// per-session locks, between the pre-lock check and here. Re-check now so it
