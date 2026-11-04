@@ -1044,11 +1044,16 @@ func (s *DetailService) attachVirtualCandidateScores(ctx context.Context, conten
 }
 func applyVirtualCandidateScores(versions []FileVersion, scores map[int]VirtualCandidateScore) {
 	for i := range versions {
-		if score, ok := scores[versions[i].FileID]; ok && score.Score != 0 {
+		score, ok := scores[versions[i].FileID]
+		if !ok {
+			continue
+		}
+		if score.Score != 0 {
 			v := score.Score
 			versions[i].FormatScore = &v
-			versions[i].MatchedFormats = score.MatchedFormats
 		}
+		versions[i].MatchedFormats = score.MatchedFormats
+		versions[i].providerOrder = score.ProviderOrder
 	}
 }
 func (s *DetailService) scoreVirtualCandidates(ctx context.Context, contentID string, files []*models.MediaFile) map[int]VirtualCandidateScore {
@@ -1094,19 +1099,39 @@ func (s *DetailService) SetVirtualCandidateScoreSource(source VirtualCandidateSc
 }
 
 func (s *DetailService) attachVirtualRanking(ctx context.Context, contentID string, detail *WatchDetail, files []*models.MediaFile) {
-	if s.virtualRankingSource == nil || detail == nil {
+	if s.virtualRankingSource == nil || detail == nil || len(detail.Versions) == 0 {
 		return
 	}
-	rows := s.virtualRankingSource(ctx, contentID, files)
-	for _, f := range files {
-		if r, ok := rows[f.ID]; ok {
-			detail.VirtualRanking = &r
-			for i := range detail.PlaybackVariants {
-				detail.PlaybackVariants[i].VirtualRanking = &r
+	rankings := s.virtualRankingSource(ctx, contentID, files)
+	if len(rankings) == 0 {
+		return
+	}
+	if ranking, ok := virtualRankingForVersions(rankings, detail.Versions); ok {
+		detail.VirtualRanking = ranking
+	}
+	for i := range detail.PlaybackVariants {
+		for p := range detail.PlaybackVariants[i].Parts {
+			ranking, ok := virtualRankingForVersions(rankings, detail.PlaybackVariants[i].Parts[p].Versions)
+			if !ok {
+				continue
 			}
-			return
+			detail.PlaybackVariants[i].VirtualRanking = ranking
+			break
 		}
 	}
+}
+
+// virtualRankingForVersions returns the first listed version whose file the
+// ranking covers, so an unranked head row does not suppress a later row's
+// listing ranking.
+func virtualRankingForVersions(rankings map[int]VirtualRanking, versions []FileVersion) (*VirtualRanking, bool) {
+	for i := range versions {
+		if ranking, ok := rankings[versions[i].FileID]; ok {
+			out := ranking
+			return &out, true
+		}
+	}
+	return nil, false
 }
 
 func (s *DetailService) SetVersionSourceMismatchSource(source VersionSourceMismatchSource) {
@@ -4091,13 +4116,18 @@ func (s *DetailService) newWatchDetail(
 	filter AccessFilter,
 	audioPreferenceContentID string,
 ) *WatchDetail {
+	var scores map[int]VirtualCandidateScore
+	if s.virtualScoreSource != nil && len(files) > 0 {
+		scores = s.scoreVirtualCandidates(ctx, contentID, files)
+	}
 	versions, playbackVariants, subtitles, intro, credits, recap, preview := s.buildPlaybackInfo(
 		ctx,
 		files,
 		filter,
 		audioPreferenceContentID,
+		scores,
 	)
-	return &WatchDetail{
+	detail := &WatchDetail{
 		ContentID:        contentID,
 		Type:             contentType,
 		Title:            title,
@@ -4110,6 +4140,8 @@ func (s *DetailService) newWatchDetail(
 		Recap:            recap,
 		Preview:          preview,
 	}
+	s.attachVirtualRanking(ctx, contentID, detail, files)
+	return detail
 }
 
 // effectiveSubtitleDefaults resolves the subtitle preferences that apply to one
@@ -4856,10 +4888,11 @@ func (s *DetailService) buildPlaybackInfo(
 	files []*models.MediaFile,
 	filter AccessFilter,
 	audioPreferenceContentID string,
+	candidateScores ...map[int]VirtualCandidateScore,
 ) ([]FileVersion, []PlaybackVariant, []SubtitleInfo, *Marker, *Marker, *Marker, *Marker) {
 	// Resolve the request-invariant audio preferences once; a multi-track item
 	// would otherwise re-query the profile/preference rows for every file.
-	return s.buildPlaybackInfoWith(ctx, files, filter, s.newAudioPrefResolver(ctx, filter, audioPreferenceContentID), s.trickplay, true)
+	return s.buildPlaybackInfoWith(ctx, files, filter, s.newAudioPrefResolver(ctx, filter, audioPreferenceContentID), s.trickplay, true, candidateScores...)
 }
 
 // buildPlaybackInfoWith is buildPlaybackInfo with a caller-owned audio
@@ -4873,6 +4906,7 @@ func (s *DetailService) buildPlaybackInfoWith(
 	audioResolver *audioPrefResolver,
 	availability TrickplayAvailability,
 	markerPreviews bool,
+	candidateScores ...map[int]VirtualCandidateScore,
 ) ([]FileVersion, []PlaybackVariant, []SubtitleInfo, *Marker, *Marker, *Marker, *Marker) {
 	versions := make([]FileVersion, 0, len(files))
 	subtitleSet := make(map[string]SubtitleInfo)
@@ -5029,6 +5063,11 @@ func (s *DetailService) buildPlaybackInfoWith(
 	subtitles := make([]SubtitleInfo, 0, len(subtitleSet))
 	for _, sub := range subtitleSet {
 		subtitles = append(subtitles, sub)
+	}
+
+	if len(candidateScores) > 0 {
+		applyVirtualCandidateScores(versions, candidateScores[0])
+		preserveProviderVersionOrder(versions)
 	}
 
 	s.markTrickplay(ctx, versions, availability)
@@ -5216,6 +5255,30 @@ func sortFileVersions(versions []FileVersion) {
 		}
 		return a.FileSize > b.FileSize
 	})
+	preserveProviderVersionOrder(versions)
+}
+
+// preserveProviderVersionOrder reorders only provider rows, leaving local and
+// unlisted versions in their existing slots. Provider preferences must not
+// promote remote files over local files.
+func preserveProviderVersionOrder(versions []FileVersion) {
+	var ranked []FileVersion
+	for _, version := range versions {
+		if version.providerOrder != nil {
+			ranked = append(ranked, version)
+		}
+	}
+	if len(ranked) < 2 {
+		return
+	}
+	sort.SliceStable(ranked, func(i, j int) bool { return *ranked[i].providerOrder < *ranked[j].providerOrder })
+	next := 0
+	for i := range versions {
+		if versions[i].providerOrder != nil {
+			versions[i] = ranked[next]
+			next++
+		}
+	}
 }
 
 func chooseDefaultVariantVersion(versions []FileVersion, selectedFileID int) *FileVersion {

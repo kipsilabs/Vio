@@ -40,7 +40,16 @@ var ServedEpisodeFilesSQL = `
 	UNION
 	SELECT covered.content_id, mf.id
 	FROM episodes covered` + spannedEpisodeJoinSQL + `
-	WHERE covered.content_id = ANY($1::text[])`
+	WHERE covered.content_id = ANY($1::text[])
+	UNION
+	-- A file kept on an alias row still serves the canonical episode the
+	-- catalog displays; the alias exists only to carry a second layout.
+	SELECT ea.canonical_episode_id, mf.id
+	FROM episode_aliases ea
+	JOIN media_files mf ON mf.episode_id = ea.alias_episode_id
+	WHERE ea.canonical_episode_id = ANY($1::text[])
+	  AND ea.alias_episode_id IS NOT NULL
+	  AND mf.missing_since IS NULL`
 
 // NoServingEpisodeFileSQL holds for a membership el whose episode has no
 // present file in its folder, linked or spanning it.

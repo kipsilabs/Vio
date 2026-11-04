@@ -1233,11 +1233,19 @@ func collectRawImageDirs(ctx context.Context, q rowQuerier, contentIDs []string)
 	defer imgRows.Close()
 	dirSet := make(map[string]struct{})
 	for imgRows.Next() {
-		var p1, p2, p3 string
+		// still_path (episodes, extras) and some item slots are nullable; a
+		// NULL is no path, so scan it as such instead of failing the union.
+		var p1, p2, p3 *string
 		if err := imgRows.Scan(&p1, &p2, &p3); err != nil {
 			return nil, fmt.Errorf("scanning image path: %w", err)
 		}
-		for _, p := range []string{p1, p2, p3} {
+		values := []string{}
+		for _, p := range []*string{p1, p2, p3} {
+			if p != nil {
+				values = append(values, *p)
+			}
+		}
+		for _, p := range values {
 			if p != "" && !strings.Contains(p, "://") {
 				if dir := imageDeletePrefix(p); dir != "" {
 					dirSet[dir] = struct{}{}

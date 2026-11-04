@@ -999,6 +999,10 @@ func (r *LibraryCollectionRepository) AcceptPreparedItems(ctx context.Context, s
 // collection, so the item triggers leave the collection revision alone. The
 // statement count does not grow with the list size.
 func (r *LibraryCollectionRepository) ReplaceItems(ctx context.Context, collectionID string, items []LibraryCollectionItemInput) error {
+	collectionSourceKey := "collection:" + collectionID
+	if len([]byte(collectionSourceKey)) > 128 {
+		return fmt.Errorf("collection ID is too long for virtual source ownership")
+	}
 	// Dedupe by media_item_id. Different source entries can resolve to the
 	// same library item (e.g. an IMDb and a TMDB entry pointing at the same
 	// local content_id, or one item present in several of the collection's
@@ -1075,6 +1079,158 @@ func (r *LibraryCollectionRepository) ReplaceItems(ctx context.Context, collecti
 	`, collectionID, ids, positions, ranks)
 	if err != nil {
 		return fmt.Errorf("inserting collection items: %w", err)
+	}
+
+	if err := captureCollectionVirtualItems(ctx, tx, collectionSourceKey); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO affected_collection_virtual_items(content_id)
+		SELECT media_item_id FROM library_collection_items WHERE collection_id=$1
+		ON CONFLICT DO NOTHING`, collectionID); err != nil {
+		return fmt.Errorf("capturing current collection virtual items: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM virtual_media_source_claims
+		WHERE source_key=$1`, collectionSourceKey); err != nil {
+		return fmt.Errorf("clearing previous collection virtual claims: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO virtual_media_source_claims(
+			plugin_installation_id,source_key,content_id,media_folder_id,
+			owns_item_metadata,last_seen_at,updated_at
+		)
+		SELECT DISTINCT
+			file_claim.plugin_installation_id,$1,file_claim.content_id,file_claim.media_folder_id,
+			false,
+			NOW(),NOW()
+		FROM (
+			SELECT plugin_installation_id, content_id, media_folder_id, file_path
+			FROM previous_collection_virtual_files
+			UNION
+			-- Legacy adoption: files carrying an unscoped legacy claim are
+			-- adopted explicitly by identity.
+			SELECT legacy_claim.plugin_installation_id, legacy_claim.content_id,
+			       legacy_claim.media_folder_id, legacy_claim.file_path
+			FROM virtual_media_file_source_claims legacy_claim
+			WHERE legacy_claim.source_key = 'collection'
+			UNION
+			-- Claimless adoption: virtual_collection files with no ownership
+			-- claims at all (legacy materialization output) are adopted for
+			-- accepted members in target folders. Files claimed by any other
+			-- owner are never adopted here. Core-owned files (owner 0) adopt
+			-- like plugin-owned ones; local files (NULL owner) never do.
+			SELECT mf.virtual_owner_installation_id, mf.content_id,
+			       mf.media_folder_id, mf.file_path
+			FROM media_files mf
+			WHERE mf.probe_source = 'virtual_collection'
+			  AND mf.virtual_owner_installation_id >= 0
+			  AND NOT EXISTS (
+			      SELECT 1 FROM virtual_media_file_source_claims existing_claim
+			      WHERE existing_claim.plugin_installation_id = mf.virtual_owner_installation_id
+			        AND existing_claim.content_id = mf.content_id
+			        AND existing_claim.media_folder_id = mf.media_folder_id
+			        AND existing_claim.file_path = mf.file_path
+			  )
+		) file_claim
+		JOIN library_collection_items lci
+		  ON lci.collection_id=$2 AND lci.media_item_id=file_claim.content_id
+		JOIN library_collection_libraries lcl
+		  ON lcl.collection_id=$2 AND lcl.library_id=file_claim.media_folder_id
+		WHERE file_claim.plugin_installation_id>=0
+		ON CONFLICT(plugin_installation_id,source_key,content_id,media_folder_id)
+		DO UPDATE SET
+			owns_item_metadata=EXCLUDED.owns_item_metadata,
+			last_seen_at=EXCLUDED.last_seen_at,
+			staged_until=NULL,
+			updated_at=NOW()`, collectionSourceKey, collectionID); err != nil {
+		return fmt.Errorf("claiming collection virtual sources: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO virtual_media_file_source_claims(
+			plugin_installation_id,source_key,content_id,media_folder_id,
+			file_path,last_seen_at,updated_at
+		)
+		SELECT
+			file_claim.plugin_installation_id,$1,file_claim.content_id,file_claim.media_folder_id,
+			file_claim.file_path,NOW(),NOW()
+		FROM (
+			SELECT plugin_installation_id, content_id, media_folder_id, file_path
+			FROM previous_collection_virtual_files
+			UNION
+			-- Legacy adoption: see the source-claim rebuild above.
+			SELECT legacy_claim.plugin_installation_id, legacy_claim.content_id,
+			       legacy_claim.media_folder_id, legacy_claim.file_path
+			FROM virtual_media_file_source_claims legacy_claim
+			WHERE legacy_claim.source_key = 'collection'
+			UNION
+			-- Claimless adoption: see the source-claim rebuild above.
+			SELECT mf.virtual_owner_installation_id, mf.content_id,
+			       mf.media_folder_id, mf.file_path
+			FROM media_files mf
+			WHERE mf.probe_source = 'virtual_collection'
+			  AND mf.virtual_owner_installation_id >= 0
+			  AND NOT EXISTS (
+			      SELECT 1 FROM virtual_media_file_source_claims existing_claim
+			      WHERE existing_claim.plugin_installation_id = mf.virtual_owner_installation_id
+			        AND existing_claim.content_id = mf.content_id
+			        AND existing_claim.media_folder_id = mf.media_folder_id
+			        AND existing_claim.file_path = mf.file_path
+			  )
+		) file_claim
+		JOIN library_collection_items lci
+		  ON lci.collection_id=$2 AND lci.media_item_id=file_claim.content_id
+		JOIN library_collection_libraries lcl
+		  ON lcl.collection_id=$2 AND lcl.library_id=file_claim.media_folder_id
+		WHERE file_claim.plugin_installation_id>=0
+		ON CONFLICT(plugin_installation_id,source_key,content_id,media_folder_id,file_path)
+		DO UPDATE SET last_seen_at=EXCLUDED.last_seen_at,staged_until=NULL,updated_at=NOW()`,
+		collectionSourceKey, collectionID); err != nil {
+		return fmt.Errorf("claiming collection virtual files: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE media_files mf
+		SET missing_since = NULL
+		FROM virtual_media_file_source_claims file_claim
+		JOIN library_collection_items lci ON lci.collection_id = $1 AND lci.media_item_id = file_claim.content_id
+		JOIN library_collection_libraries lcl ON lcl.collection_id = $1 AND lcl.library_id = file_claim.media_folder_id
+		WHERE file_claim.source_key = $2
+		  AND file_claim.plugin_installation_id = mf.virtual_owner_installation_id
+		  AND file_claim.content_id = mf.content_id
+		  AND file_claim.media_folder_id = mf.media_folder_id
+		  AND file_claim.file_path = mf.file_path
+		  AND mf.probe_source = 'virtual_collection'`, collectionID, collectionSourceKey); err != nil {
+		return fmt.Errorf("activating collection virtual files: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO media_item_libraries(content_id, media_folder_id, first_seen_at)
+		SELECT DISTINCT file_claim.content_id, file_claim.media_folder_id, NOW()
+		FROM virtual_media_file_source_claims file_claim
+		JOIN library_collection_items lci ON lci.collection_id = $1 AND lci.media_item_id = file_claim.content_id
+		JOIN library_collection_libraries lcl ON lcl.collection_id = $1 AND lcl.library_id = file_claim.media_folder_id
+		WHERE file_claim.source_key = $2
+		ON CONFLICT DO NOTHING`, collectionID, collectionSourceKey); err != nil {
+		return fmt.Errorf("linking collection virtual items to libraries: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO episode_libraries(episode_id, media_folder_id)
+		SELECT DISTINCT mf.episode_id, file_claim.media_folder_id
+		FROM virtual_media_file_source_claims file_claim
+		JOIN media_files mf ON mf.content_id = file_claim.content_id
+		                   AND mf.media_folder_id = file_claim.media_folder_id
+		                   AND mf.file_path = file_claim.file_path
+		JOIN library_collection_items lci ON lci.collection_id = $1 AND lci.media_item_id = file_claim.content_id
+		JOIN library_collection_libraries lcl ON lcl.collection_id = $1 AND lcl.library_id = file_claim.media_folder_id
+		WHERE file_claim.source_key = $2
+		  AND mf.episode_id IS NOT NULL
+		ON CONFLICT DO NOTHING`, collectionID, collectionSourceKey); err != nil {
+		return fmt.Errorf("linking collection virtual episodes to libraries: %w", err)
+	}
+	if err := reconcileAffectedVirtualMetadataOwnership(ctx, tx); err != nil {
+		return err
+	}
+	if err := cleanupUnclaimedCollectionVirtualMedia(ctx, tx); err != nil {
+		return err
 	}
 
 	if deleted.RowsAffected()+updated.RowsAffected()+inserted.RowsAffected() > 0 {

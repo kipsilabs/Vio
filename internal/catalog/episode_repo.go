@@ -1597,7 +1597,7 @@ func (r *EpisodeRepository) ListUpcoming(ctx context.Context, since time.Time, s
 // and filters.LibraryID narrows it to one library. A zero filters.Limit only
 // counts.
 func (r *EpisodeRepository) BrowseEpisodes(ctx context.Context, seriesID, seasonID string, seasonNumber *int, startItemID string, filters BrowseFilters, access AccessFilter, includeTotal bool) ([]*models.Episode, int, error) {
-	conditions := []string{}
+	conditions := []string{episodeAliasExclusionPredicateFor("e")}
 	args := []any{}
 	index := 1
 	if seriesID != "" {
@@ -1605,12 +1605,15 @@ func (r *EpisodeRepository) BrowseEpisodes(ctx context.Context, seriesID, season
 		args = append(args, seriesID)
 		index++
 	}
+	// Membership may live on an alias row while the canonical episode has
+	// none; the catalog displays the canonical row.
+	memberIDs := "el.episode_id = e.content_id OR el.episode_id IN (SELECT ea.alias_episode_id FROM episode_aliases ea WHERE ea.canonical_episode_id = e.content_id)"
 	if filters.LibraryID > 0 {
-		conditions = append(conditions, fmt.Sprintf("EXISTS (SELECT 1 FROM episode_libraries el WHERE el.episode_id=e.content_id AND el.media_folder_id=$%d)", index))
+		conditions = append(conditions, fmt.Sprintf("EXISTS (SELECT 1 FROM episode_libraries el WHERE (%s) AND el.media_folder_id=$%d)", memberIDs, index))
 		args = append(args, filters.LibraryID)
 		index++
 	} else {
-		conditions = append(conditions, "EXISTS (SELECT 1 FROM episode_libraries el WHERE el.episode_id=e.content_id)")
+		conditions = append(conditions, fmt.Sprintf("EXISTS (SELECT 1 FROM episode_libraries el WHERE %s)", memberIDs))
 	}
 	appendLibraryAccessConditions("s.content_id", access, &conditions, &args, &index)
 	applyAccessFilter("s", access, &conditions, &args, &index)

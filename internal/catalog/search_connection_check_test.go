@@ -68,7 +68,7 @@ func TestMeilisearchConnectionCheckRedirectPolicy(t *testing.T) {
 				switch req.URL.Path {
 				case "/base/indexes":
 					body = `{"results":[],"total":0}`
-				case "/base/indexes/silo_media_items_rebuild_check/search":
+				case "/base/indexes/" + DefaultMeilisearchIndex + "_rebuild_check/search":
 					body = `{"code":"index_not_found"}`
 					status = http.StatusNotFound
 					if tc.searchStatus != 0 {

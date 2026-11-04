@@ -62,9 +62,7 @@ func (r *PlayableTargetResolver) resolvePostgresTargets(ctx context.Context, arg
 				CASE WHEN requested.media_type = 'movie' AND EXISTS (
 					SELECT 1 FROM media_files mf WHERE mf.content_id = requested.content_id AND %[1]s
 				) THEN requested.content_id
-				WHEN requested.media_type = 'episode' AND (EXISTS (
-					SELECT 1 FROM media_files mf WHERE mf.episode_id = requested.content_id AND %[1]s
-				) OR `+SpanningEpisodeFileExistsSQL("requested.content_id", "%[1]s")+`) THEN requested.content_id END,
+				WHEN requested.media_type = 'episode' AND `+canonicalEpisodeFileExistsSQL("requested.content_id", "%[1]s")+` THEN requested.content_id END,
 				(SELECT episode.content_id
 				 FROM target_scopes scope
 				 JOIN episodes episode ON episode.series_id = scope.series_id
@@ -187,6 +185,8 @@ func buildPostgresPlayableTargetsQuery(fileSQL, progress, completedSQL string) s
 // episode index applies it and a season card reads only its own season. With
 // the OR, each season card of a long-running series read the whole series.
 func firstPlayableEpisodeSQL(fileSQL, progressSQL string) string {
+	episodeFileSQL := canonicalEpisodeFileExistsSQL("episode.content_id", fileSQL)
+	excludeAliases := episodeAliasExclusionPredicateFor("episode")
 	first := func(seasonSQL string) string {
 		return fmt.Sprintf(`(SELECT winner.content_id
 			FROM target_scopes scope
@@ -197,14 +197,15 @@ func firstPlayableEpisodeSQL(fileSQL, progressSQL string) string {
 				  AND episode.season_number BETWEEN COALESCE(scope.season_number, -2147483648)
 				    AND COALESCE(scope.season_number, 2147483647)
 				  AND %s
-				  AND EXISTS (SELECT 1 FROM media_files mf WHERE mf.episode_id = episode.content_id AND %s)
+				  AND %s
+				  AND %s
 				  %s
 				ORDER BY episode.season_number, episode.episode_number, episode.content_id
 				LIMIT 1
 			) winner
 			WHERE scope.ord = requested.ord
 			ORDER BY winner.season_number, winner.episode_number, winner.content_id
-			LIMIT 1)`, seasonSQL, fileSQL, progressSQL)
+			LIMIT 1)`, excludeAliases, seasonSQL, episodeFileSQL, progressSQL)
 	}
 	return "COALESCE(" + first("episode.season_number IS DISTINCT FROM 0") + ", " + first("episode.season_number = 0") + ")"
 }
