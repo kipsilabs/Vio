@@ -3,6 +3,7 @@ package playback
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -122,26 +123,28 @@ type RecipeCard struct {
 	// SourceFrameRate and SourceHeight keep a rebuilt encode's GOP aligned with
 	// the real source cadence and let the filter chain detect a no-op scale.
 	// Zero is the historical 30 fps / unknown-height behavior.
-	SourceFrameRate        float64 `json:"source_frame_rate,omitempty"`
-	SourceHeight           int     `json:"source_height,omitempty"`
-	TargetCodecVideo       string  `json:"target_codec_video,omitempty"`
-	TargetCodecAudio       string  `json:"target_codec_audio,omitempty"`
-	TargetAudioChannels    int     `json:"target_audio_channels,omitempty"`
-	TargetAudioBitrateKbps int     `json:"target_audio_bitrate_kbps,omitempty"`
-	SegmentDuration        int     `json:"segment_duration"`
-	StartSegmentNumber     int     `json:"start_segment_number"`
-	HWAccel                string  `json:"hw_accel,omitempty"`
-	EncoderHWAccel         string  `json:"encoder_hw_accel,omitempty"`
-	HWDevice               string  `json:"hw_device,omitempty"`
-	SubtitleTrackIndex     int     `json:"subtitle_track_index"`
-	SubtitleBurnIn         bool    `json:"subtitle_burn_in,omitempty"`
-	SubtitleCodec          string  `json:"subtitle_codec,omitempty"`
-	SubtitleRendition      bool    `json:"subtitle_rendition,omitempty"`
-	AudioTrackIndex        int     `json:"audio_track_index"`
-	TargetBitrateKbps      int     `json:"target_bitrate_kbps,omitempty"`
-	TotalDuration          float64 `json:"total_duration"`
-	FastStart              bool    `json:"fast_start,omitempty"`
-	ThrottleSeconds        int     `json:"throttle_seconds,omitempty"`
+	SourceFrameRate         float64                  `json:"source_frame_rate,omitempty"`
+	SourceHeight            int                      `json:"source_height,omitempty"`
+	TargetCodecVideo        string                   `json:"target_codec_video,omitempty"`
+	TargetCodecAudio        string                   `json:"target_codec_audio,omitempty"`
+	TargetAudioChannels     int                      `json:"target_audio_channels,omitempty"`
+	TargetAudioBitrateKbps  int                      `json:"target_audio_bitrate_kbps,omitempty"`
+	SegmentDuration         int                      `json:"segment_duration"`
+	StartSegmentNumber      int                      `json:"start_segment_number"`
+	HWAccel                 string                   `json:"hw_accel,omitempty"`
+	EncoderHWAccel          string                   `json:"encoder_hw_accel,omitempty"`
+	HWDevice                string                   `json:"hw_device,omitempty"`
+	SubtitleTrackIndex      int                      `json:"subtitle_track_index"`
+	SubtitleBurnIn          bool                     `json:"subtitle_burn_in,omitempty"`
+	SubtitleCodec           string                   `json:"subtitle_codec,omitempty"`
+	SubtitleRendition       bool                     `json:"subtitle_rendition,omitempty"`
+	SubtitleRenditionTracks []SubtitleRenditionTrack `json:"subtitle_rendition_tracks,omitempty"`
+	SubtitleRenditionSource SubtitleRenditionSource  `json:"subtitle_rendition_source,omitzero"`
+	AudioTrackIndex         int                      `json:"audio_track_index"`
+	TargetBitrateKbps       int                      `json:"target_bitrate_kbps,omitempty"`
+	TotalDuration           float64                  `json:"total_duration"`
+	FastStart               bool                     `json:"fast_start,omitempty"`
+	ThrottleSeconds         int                      `json:"throttle_seconds,omitempty"`
 }
 
 const playMethodCopyFMP4V1 PlayMethod = streamtoken.PlayMethodCopyFMP4Transcode
@@ -277,6 +280,8 @@ func NewRecipeCard(userID int, profileID string, mediaFileID int, transcodeNodeU
 		SubtitleBurnIn:                   opts.SubtitleBurnIn,
 		SubtitleCodec:                    opts.SubtitleCodec,
 		SubtitleRendition:                opts.SubtitleRendition,
+		SubtitleRenditionTracks:          slices.Clone(opts.SubtitleRenditionTracks),
+		SubtitleRenditionSource:          opts.SubtitleRenditionSource,
 		AudioTrackIndex:                  opts.AudioTrackIndex,
 		TargetBitrateKbps:                opts.TargetBitrateKbps,
 		TotalDuration:                    opts.TotalDuration,
@@ -386,6 +391,8 @@ func (c RecipeCard) TranscodeOpts(outputDir, ffmpegPath string, logSink FFmpegLo
 		SubtitleBurnIn:                   c.SubtitleBurnIn,
 		SubtitleCodec:                    c.SubtitleCodec,
 		SubtitleRendition:                c.SubtitleRendition,
+		SubtitleRenditionTracks:          slices.Clone(c.SubtitleRenditionTracks),
+		SubtitleRenditionSource:          c.SubtitleRenditionSource,
 		AudioTrackIndex:                  c.AudioTrackIndex,
 		TargetBitrateKbps:                c.TargetBitrateKbps,
 		TotalDuration:                    c.TotalDuration,
@@ -410,6 +417,35 @@ const MaxTokenTTL = 24 * time.Hour
 // environment-specific knobs (HWAccel/HWDevice) are intentionally NOT carried —
 // they are re-resolved from live config on reconstruct, so an operator's config
 // change applies to reconstructed sessions too.
+func subtitleRenditionTrackNumbers(tracks []SubtitleRenditionTrack) []uint64 {
+	if len(tracks) == 0 {
+		return nil
+	}
+	out := make([]uint64, len(tracks))
+	for i, t := range tracks {
+		out[i] = t.TrackNumber
+	}
+	return out
+}
+func subtitleRenditionDefaultTrack(tracks []SubtitleRenditionTrack) uint64 {
+	for _, t := range tracks {
+		if t.Default {
+			return t.TrackNumber
+		}
+	}
+	return 0
+}
+func subtitleRenditionTracksFromClaims(c *streamtoken.Claims) []SubtitleRenditionTrack {
+	if len(c.SubtitleRenditionTracks) == 0 {
+		return nil
+	}
+	out := make([]SubtitleRenditionTrack, len(c.SubtitleRenditionTracks))
+	for i, n := range c.SubtitleRenditionTracks {
+		out[i] = SubtitleRenditionTrack{StreamIndex: -1, TrackNumber: n, Default: n == c.SubtitleRenditionDefault}
+	}
+	return out
+}
+
 func (c RecipeCard) ToClaims() streamtoken.Claims {
 	playMethod := string(c.PlayMethod)
 	sourceAudioChannels := 0
@@ -590,6 +626,8 @@ func RecipeCardFromClaims(c *streamtoken.Claims) RecipeCard {
 		SubtitleBurnIn:                   c.SubtitleBurnIn,
 		SubtitleCodec:                    c.SubtitleCodec,
 		SubtitleRendition:                c.SubtitleRendition,
+		SubtitleRenditionTracks:          subtitleRenditionTracksFromClaims(c),
+		SubtitleRenditionSource:          SubtitleRenditionSource{Size: c.SubtitleRenditionSourceSize, ModTimeUnixNano: c.SubtitleRenditionSourceModTime},
 		AudioTrackIndex:                  c.AudioTrackIndex,
 		TargetBitrateKbps:                c.TargetBitrateKbps,
 		TotalDuration:                    c.TotalDuration,
