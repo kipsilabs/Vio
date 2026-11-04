@@ -1247,7 +1247,7 @@ func serviceProblem(err error) *Problem {
 	if errors.Is(err, passwordhash.ErrBusy) {
 		return passwordHashBusyProblem()
 	}
-	return NewProblem(TypeInternalError, "An unexpected error occurred.")
+	return NewProblem(TypeInternalError, "An unexpected error occurred.").withCause(err)
 }
 
 // passwordHashBusyProblem answers a password or PIN the server was too busy

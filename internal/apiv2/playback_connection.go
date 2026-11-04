@@ -59,7 +59,10 @@ type PlaybackConnectionResetOutput struct{ Status int }
 func registerPlaybackConnection(reg *Registry) {
 	registerPlaybackProbeResults(reg)
 	op := func(method, path, id string) Operation {
-		result := Operation{Operation: humaOp(method, Prefix+"/playback/connection"+path, id, playbackTag, "Read or reset the calling device's learned connection limit."), Class: ClassProfileScoped, ServiceBacked: true, RetrySafety: RetrySafetyNonRetryable}
+		// The implementation keys the reading on the account and device
+		// (playback_connection.go in handlers), never on a household profile,
+		// so this is an account-level operation.
+		result := Operation{Operation: humaOp(method, Prefix+"/playback/connection"+path, id, playbackTag, "Read or reset the calling device's learned connection limit."), Class: ClassAuthenticated, ServiceBacked: true, RetrySafety: RetrySafetyNonRetryable}
 		if method == http.MethodGet {
 			result.RetrySafety = ""
 		}
