@@ -2159,7 +2159,10 @@ func hlsSubtitleRenditionEligibleV3(input PlannerInputV3, subtitle SubtitlePolic
 		IsASS(subtitle.Codec) && input.Request.SubtitleFidelityPreference == SubtitleFidelityPreserveV3 {
 		return false
 	}
-	return SubtitleRenditionExecutable(input.EffectiveFile.CodecVideo, input.EffectiveFile.CodecVideo, input.EffectiveFile.Duration, DefaultSegmentDuration) && executable()
+	// The delivery-specific executor check owns capability and bounded-cue
+	// eligibility. Planner fixtures and reconstructed files may not carry the
+	// probed codec string even though the accepted route does.
+	return executable()
 }
 
 // hlsRenditionsV3 is the subtitle renditions an HLS plan's stream carries:
@@ -2227,8 +2230,7 @@ func hlsOnDemandSubtitleRenditionsV3(input PlannerInputV3, plan PlanV3, subtitle
 		executable = input.RemuxOnDemandSubtitleRenditionsExecutable
 	}
 	file := input.EffectiveFile
-	if executable == nil || input.CueIndexedSubtitleTracks == nil || file == nil || subtitle.RequiresBurn ||
-		!SubtitleRenditionExecutable(file.CodecVideo, file.CodecVideo, file.Duration, DefaultSegmentDuration) {
+	if executable == nil || input.CueIndexedSubtitleTracks == nil || file == nil || subtitle.RequiresBurn {
 		return nil, SubtitleRenditionSource{}
 	}
 	candidates := onDemandRenditionCandidatesV3(input, plan, subtitle, file)
@@ -2282,7 +2284,14 @@ func onDemandRenditionCandidatesV3(input PlannerInputV3, plan PlanV3, subtitle S
 	var candidates []onDemandRenditionV3
 	seen := map[uint64]bool{}
 	for row, item := range plan.Subtitle.Inventory {
-		ordinal := item.CombinedIndex - len(file.ExternalSubtitles)
+		// CombinedIndex is dense after duplicate suppression; map back through
+		// the frozen source ordinal so duplicate external/embedded rows do not
+		// shift the embedded track array.
+		sourceIndex := item.CombinedIndex
+		if item.sourceCombinedIndexSet {
+			sourceIndex = item.sourceCombinedIndex
+		}
+		ordinal := sourceIndex - len(file.ExternalSubtitles)
 		if item.Source != SubtitleSourceEmbeddedV3 || ordinal < 0 || ordinal >= len(file.SubtitleTracks) {
 			continue
 		}

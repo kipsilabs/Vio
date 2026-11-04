@@ -1,6 +1,10 @@
 package playback
 
-import "github.com/Silo-Server/silo-server/internal/tonemap"
+import (
+	"slices"
+
+	"github.com/Silo-Server/silo-server/internal/tonemap"
+)
 
 // ExecutableRecipeV3 is the frozen operational half of a protocol-v3 plan.
 // PlanV3 describes the client-visible route identity; these fields are the
@@ -60,8 +64,10 @@ type ExecutableRecipeV3 struct {
 	// SubtitleRendition emits the selected subtitle as the transcode's HLS
 	// subtitle rendition. It needs version 4 so a binary that predates it
 	// rejects the recipe instead of reopening the transport without one.
-	SubtitleRendition bool `json:"subtitle_rendition,omitempty"`
-	CopyVideoMPEGTS   bool `json:"copy_video_mpegts,omitempty"`
+	SubtitleRendition       bool                     `json:"subtitle_rendition,omitempty"`
+	SubtitleRenditionTracks []SubtitleRenditionTrack `json:"subtitle_rendition_tracks,omitempty"`
+	SubtitleRenditionSource SubtitleRenditionSource  `json:"subtitle_rendition_source,omitzero"`
+	CopyVideoMPEGTS         bool                     `json:"copy_video_mpegts,omitempty"`
 }
 
 const (
@@ -118,6 +124,8 @@ func FreezeExecutableRecipeV3(result PlannerResultV3) ExecutableRecipeV3 {
 		SubtitleCodec:                 result.SubtitleCodec,
 		DownloadedSubtitleID:          result.DownloadedSubtitleID,
 		SubtitleRendition:             result.SubtitleRendition,
+		SubtitleRenditionTracks:       slices.Clone(result.SubtitleRenditionTracks),
+		SubtitleRenditionSource:       result.SubtitleRenditionSource,
 		CopyVideoMPEGTS:               result.Plan != nil && result.Plan.EffectiveRecipe.SegmentContainer == SegmentContainerMPEGTSV3,
 	}
 	if recipe.hasVersion2Fields() {
@@ -153,7 +161,7 @@ func (r ExecutableRecipeV3) hasVersion3Fields() bool {
 }
 
 func (r ExecutableRecipeV3) hasVersion4Fields() bool {
-	return r.SubtitleRendition
+	return r.SubtitleRendition || len(r.SubtitleRenditionTracks) > 0 || !r.SubtitleRenditionSource.IsZero()
 }
 
 // Valid reports whether an executable recipe is complete and internally consistent.
@@ -229,6 +237,8 @@ func (r ExecutableRecipeV3) PlannerResult(plan *PlanV3) PlannerResultV3 {
 		SubtitleBurnIn:              r.SubtitleBurnIn,
 		SubtitleCodec:               r.SubtitleCodec,
 		SubtitleRendition:           r.SubtitleRendition,
+		SubtitleRenditionTracks:     slices.Clone(r.SubtitleRenditionTracks),
+		SubtitleRenditionSource:     r.SubtitleRenditionSource,
 		DownloadedSubtitleID:        r.DownloadedSubtitleID,
 	}
 }

@@ -475,8 +475,8 @@ func (s *TranscodeSession) ServeSubtitleSegment(w http.ResponseWriter, r *http.R
 	if track, segNum, ok := parseSubtitleTrackSegment(name); ok {
 		body, err = s.subtitleTrackSegmentVTT(r.Context(), track, segNum)
 	} else {
-		segNum, parseErr := ParseSubtitleSegmentNumber(name)
-		if parseErr != nil {
+		segNum, ok := ParseSubtitleSegmentNumber(name)
+		if !ok {
 			http.NotFound(w, r)
 			return
 		}
