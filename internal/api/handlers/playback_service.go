@@ -1494,6 +1494,7 @@ type inventoryPublishSummary struct {
 	FileID           int
 	SessionsNotified int
 	Revision         string
+	Waits            []subtitleInventoryWaitDeliveryV3
 }
 
 // inventoryPublishResult classifies one session-targeted publish attempt for the
