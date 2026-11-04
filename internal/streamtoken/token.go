@@ -10,6 +10,10 @@ import (
 )
 
 const (
+	// PlayMethodBandwidthProbe identifies a token used only for a bounded
+	// connection-speed measurement. It must not be accepted as a media
+	// playback token by older routes.
+	PlayMethodBandwidthProbe = "bandwidth_probe_v1"
 	// PlayMethodDownload identifies a token minted only after the API has
 	// authorized a file download. Proxy download routes reject playback tokens.
 	PlayMethodDownload = "download"
@@ -28,6 +32,11 @@ const (
 	// PlayMethodCopyFMP4Transcode makes the versioned copy-video timestamp and
 	// bitstream recipe fail closed on readers predating that recipe.
 	PlayMethodCopyFMP4Transcode = "transcode_copy_fmp4_v1"
+	// PlayMethodSubtitleRenditionsTranscode and PlayMethodSubtitleRenditionsCopyFMP4
+	// mark tokens that carry on-demand subtitle rendition metadata. Older readers
+	// must reject them rather than rebuilding an incomplete playlist.
+	PlayMethodSubtitleRenditionsTranscode = "transcode_subtitle_renditions_v1"
+	PlayMethodSubtitleRenditionsCopyFMP4  = "transcode_copy_fmp4_subtitle_renditions_v1"
 	// PlayMethodThemeDirect and PlayMethodThemeAAC authorize a detail-page
 	// theme song: its original bytes, or its progressive AAC conversion. They
 	// are not playback sessions, and workers that predate them reject them, so
@@ -149,14 +158,20 @@ type Claims struct {
 	SubtitleCodec              string  `json:"sbc,omitempty"`
 	// SubtitleRendition emits the selected text track as the HLS WebVTT
 	// subtitle rendition of the transcode's own playlist.
-	SubtitleRendition      bool    `json:"srn,omitempty"`
-	TargetBitrateKbps      int     `json:"tbr,omitempty"`
-	TotalDuration          float64 `json:"dur,omitempty"`
-	FastStart              bool    `json:"fs,omitempty"`
-	ThrottleSeconds        int     `json:"ths,omitempty"`
-	TargetCodecAudio       string  `json:"tca,omitempty"`
-	TargetAudioChannels    int     `json:"tac,omitempty"`
-	TargetAudioBitrateKbps int     `json:"tabr,omitempty"`
+	SubtitleRendition bool `json:"srn,omitempty"`
+	// SubtitleRenditionTracks and source facts freeze the on-demand rendition
+	// inventory and the media version it was generated from.
+	SubtitleRenditionTracks        []uint64 `json:"srt,omitempty"`
+	SubtitleRenditionDefault       uint64   `json:"srd,omitempty"`
+	SubtitleRenditionSourceSize    int64    `json:"srs,omitempty"`
+	SubtitleRenditionSourceModTime int64    `json:"srm,omitempty"`
+	TargetBitrateKbps              int      `json:"tbr,omitempty"`
+	TotalDuration                  float64  `json:"dur,omitempty"`
+	FastStart                      bool     `json:"fs,omitempty"`
+	ThrottleSeconds                int      `json:"ths,omitempty"`
+	TargetCodecAudio               string   `json:"tca,omitempty"`
+	TargetAudioChannels            int      `json:"tac,omitempty"`
+	TargetAudioBitrateKbps         int      `json:"tabr,omitempty"`
 
 	// Recipe staleness hint, bumped on each re-mint after a recipe mutation
 	// (audio/quality/seek switch). An optional client-side hint only.
