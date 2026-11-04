@@ -22,6 +22,8 @@ import (
 	"github.com/Silo-Server/silo-server/internal/lang"
 )
 
+const executableRecipeVersionRenditionTracksV3 = 3
+
 const maxOnDemandSubtitleRenditions = 64
 
 // On-demand subtitle renditions list every embedded text track of the source

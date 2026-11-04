@@ -144,6 +144,10 @@ func subtitleRenditionActive(opts TranscodeOpts) bool {
 		SubtitleRenditionExecutable(opts.TargetCodecVideo, opts.SourceVideoCodec, opts.TotalDuration, opts.SegmentDuration)
 }
 
+const subtitleVideoStartReads = 3
+
+func subtitleVideoStartFileName(cue string) string { return cue + ".video-start" }
+
 func subtitleCueFileName(generation uint64) string {
 	return fmt.Sprintf("subtitles_%d.vtt", generation)
 }
@@ -192,7 +196,8 @@ type subtitleCueSpan struct {
 	origin      float64
 	originKnown bool
 	// originFailedAt is when the last observation of origin failed.
-	originFailedAt time.Time
+	originFailedAt   time.Time
+	videoStartMisses int
 }
 
 // startSubtitleSpanLocked records the generation that was just spawned.
@@ -463,8 +468,13 @@ func (s *TranscodeSession) readOutputFile(name string) ([]byte, error) {
 	return root.ReadFile(name)
 }
 
-// ServeSubtitleSegment writes subtitle segment segNum.
-func (s *TranscodeSession) ServeSubtitleSegment(w http.ResponseWriter, r *http.Request, segNum int) {
+// ServeSubtitleSegment writes the named subtitle segment.
+func (s *TranscodeSession) ServeSubtitleSegment(w http.ResponseWriter, r *http.Request, name string) {
+	segNum, err := ParseSegmentNumber(name)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
 	body, err := s.SubtitleSegmentVTT(r.Context(), segNum)
 	if err != nil && r.Context().Err() != nil {
 		return
