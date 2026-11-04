@@ -787,6 +787,41 @@ func (m *SessionManager) AddLifecycleHooks(h LifecycleHooks) {
 	m.lifecycleHooks = append(m.lifecycleHooks, h)
 }
 
+// AnnounceStart tells lifecycle hooks that a frontend started this session.
+// The session is copied under the read lock so hooks observe a race-free snapshot.
+func (m *SessionManager) AnnounceStart(ctx context.Context, sessionID, frontend string) {
+	m.mu.RLock()
+	s, ok := m.sessions[sessionID]
+	var started Session
+	if ok {
+		started = *s
+	}
+	hooks := append([]LifecycleHooks(nil), m.lifecycleHooks...)
+	m.mu.RUnlock()
+	if !ok {
+		return
+	}
+	for _, hook := range hooks {
+		if hook.Started != nil {
+			hook.Started(ctx, &started, frontend)
+		}
+	}
+}
+
+// ReportPause tells lifecycle hooks about a pause or resume reported without a
+// progress sequence. It intentionally does not alter session state; callers
+// that own authoritative progress use SetPaused or UpdateProgress.
+func (m *SessionManager) ReportPause(ctx context.Context, sessionID string, paused bool) {
+	m.mu.RLock()
+	hooks := append([]LifecycleHooks(nil), m.lifecycleHooks...)
+	m.mu.RUnlock()
+	for _, hook := range hooks {
+		if hook.PauseReported != nil {
+			hook.PauseReported(ctx, sessionID, paused)
+		}
+	}
+}
+
 // AddFinishHook registers a callback that runs after FinishSession removes a
 // session. The hook executes outside the manager lock.
 func (m *SessionManager) AddFinishHook(fn func(context.Context, *Session)) {
@@ -3289,6 +3324,18 @@ func (m *SessionManager) FinishSession(ctx context.Context, sessionID string) er
 		hook(ctx, &finished)
 	}
 	return nil
+}
+
+// FinishDetached runs finish hooks for a snapshot this replica does not hold.
+// It leaves live sessions untouched and marks the context for hook enrichment.
+func (m *SessionManager) FinishDetached(ctx context.Context, s Session) {
+	m.mu.RLock()
+	hooks := append([]func(context.Context, *Session){}, m.finishHooks...)
+	m.mu.RUnlock()
+	ctx = context.WithValue(ctx, detachedFinishKey{}, true)
+	for _, hook := range hooks {
+		hook(ctx, &s)
+	}
 }
 
 // GetSession returns the session with the given ID, or ErrSessionNotFound.
