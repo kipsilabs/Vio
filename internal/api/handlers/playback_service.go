@@ -59,6 +59,9 @@ type PlaybackCapabilitiesView struct {
 	ProtocolVersions                []int
 	Features                        []string
 	Deliveries                      []playback.DeliveryV3
+	BandwidthProbeTargetKbps        int
+	BandwidthProbeAutomatic         bool
+	BandwidthProbeMaxAgeSeconds     int
 }
 
 const playbackCapabilityStateAvailable = "available"
