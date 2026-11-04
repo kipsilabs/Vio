@@ -75,6 +75,8 @@ type TranscodeStartRequest struct {
 	CopySeekAnchorResolved     bool                   `json:"copy_seek_anchor_resolved,omitempty"`
 	StartSegmentNumber         int                    `json:"start_segment_number"`
 	TargetResolution           string                 `json:"target_resolution"`
+	SourceFrameRate            float64                `json:"source_frame_rate,omitempty"`
+	SourceHeight               int                    `json:"source_height,omitempty"`
 	TargetCodecVideo           string                 `json:"target_codec_video"`
 	TargetCodecAudio           string                 `json:"target_codec_audio"`
 	TargetAudioChannels        int                    `json:"target_audio_channels,omitempty"`
@@ -134,7 +136,6 @@ type TranscodeStartResponse struct {
 	// serve FFmpeg's growing playlist under a recipe that records the planned
 	// one.
 	KeyframePlaylist bool `json:"keyframe_playlist,omitempty"`
-	CopyVideoMPEGTS  bool `json:"copy_video_mpegts,omitempty"`
 	// SubtitleRendition attests that the executor emits the requested subtitle
 	// rendition. Older nodes omit it and are rejected before the plan
 	// promises a rendition their playlist does not carry; nodes that predate
@@ -214,20 +215,6 @@ func ValidateCopyFMP4RecipeAttestation(req TranscodeStartRequest, response Trans
 func ValidateKeyframePlaylistAttestation(req TranscodeStartRequest, response TranscodeStartResponse) error {
 	if req.KeyframePlaylist && !response.KeyframePlaylist {
 		return ErrKeyframePlaylistAttestationMismatch
-	}
-	return nil
-}
-
-// ErrCopyVideoMPEGTSAttestationMismatch reports an executor that ignored
-// requested MPEG-TS copy packaging.
-var ErrCopyVideoMPEGTSAttestationMismatch = errors.New("transcode node mpeg-ts copy attestation mismatch")
-
-// ValidateCopyVideoMPEGTSAttestation rejects an executor that silently
-// packaged a requested MPEG-TS copy remux as fMP4. Requests without it stay
-// compatible with older nodes, which omit the field.
-func ValidateCopyVideoMPEGTSAttestation(req TranscodeStartRequest, response TranscodeStartResponse) error {
-	if req.CopyVideoMPEGTS && !response.CopyVideoMPEGTS {
-		return ErrCopyVideoMPEGTSAttestationMismatch
 	}
 	return nil
 }
@@ -2172,12 +2159,11 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		KeyframePlaylist:      session.Opts().KeyframePlaylist,
 		CopyVideoMPEGTS:       session.Opts().CopyVideoMPEGTS,
 		SubtitleRendition:     session.HasSubtitleRendition(),
-		CopyVideoMPEGTS:       session.Opts().CopyVideoMPEGTS,
 	})
 }
 
 func softwareFallbackAllowed(value string) bool {
-	return playback.SoftwareFallbackAllowed(value)
+	return !strings.EqualFold(strings.TrimSpace(value), "gpu_only")
 }
 
 func (s *Server) requireApprovedInputPath(w http.ResponseWriter, r *http.Request, path string) bool {
@@ -3277,7 +3263,7 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 			}
 
 			if errors.Is(err, playback.ErrSegmentNotFound) && decision.RestartOnTimeout {
-				target, ok, restartErr := s.restartSegmentLocked(
+				_, ok, restartErr := s.restartSegmentLocked(
 					r.Context(),
 					sessionID,
 					session,
@@ -3330,7 +3316,7 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 						continuationServe = true
 					}
 				} else {
-					target, ok, restartErr := s.restartSegmentLocked(
+					_, _, restartErr := s.restartSegmentLocked(
 						r.Context(),
 						sessionID,
 						session,
