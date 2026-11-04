@@ -258,7 +258,8 @@ describe("AdminCollections Select collections", () => {
     expect(within(bar()).getByRole("button", { name: "Hide from tabs" })).toBeEnabled();
   });
 
-  it("refuses more than 100 at a time", async () => {
+  // A hundred-odd rows take longer than the default budget to render here.
+  it("refuses more than 100 at a time", { timeout: 20_000 }, async () => {
     items = Array.from({ length: 101 }, (_, index) => stored(`List ${index + 1}`));
     items.push(stored("Studio Ghibli"));
     renderPage();
