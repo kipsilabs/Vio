@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/Silo-Server/silo-server/internal/envutil"
 	"log/slog"
 	"os"
 	"path/filepath"
