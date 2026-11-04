@@ -144,7 +144,7 @@ func registerAdminCatalogImages(reg *Registry) {
 		for provider := range result.ProviderErrors {
 			failures[provider] = "Image provider failed"
 		}
-		return &AdminImagesOutput{Body: AdminImagesPage{Items: rows, Page: PageInfo{NextCursor: next, HasMore: next != ""}, Current: CurrentImages{PosterURL: result.Current.PosterURL, BackdropURL: result.Current.BackdropURL, LogoURL: result.Current.LogoURL}, ProviderErrors: failures}}, nil
+		return &AdminImagesOutput{Body: AdminImagesPage{Items: rows, Page: PageInfo{NextCursor: next, HasMore: next != ""}, Current: CurrentImages{PosterURL: result.Current.PosterURL, BackdropURL: result.Current.BackdropURL, LogoURL: result.Current.LogoURL, StillURL: result.Current.StillURL}, ProviderErrors: failures}}, nil
 	})
 	write := Operation{Operation: humaOp("POST", Prefix+"/admin/items/{id}/images/apply", "applyAdminItemImage", "admin-catalog", "Cache immutable artwork then publish the existing item selection synchronously."), Class: ClassActingAdmin, ServiceBacked: true, DemoRestricted: true, RetrySafety: RetrySafetyNonRetryable}
 	Register(reg, write, func(ctx context.Context, in *AdminImageApplyInput) (*AdminImageApplyOutput, error) {
@@ -205,4 +205,5 @@ type CurrentImages struct {
 	PosterURL   string `json:"poster_url,omitempty" doc:"Stored artwork reference (storage key, plugin path, or URL), not a fetchable URL; not validated as a URI"`
 	BackdropURL string `json:"backdrop_url,omitempty" doc:"Stored artwork reference (storage key, plugin path, or URL), not a fetchable URL; not validated as a URI"`
 	LogoURL     string `json:"logo_url,omitempty" doc:"Stored artwork reference (storage key, plugin path, or URL), not a fetchable URL; not validated as a URI"`
+	StillURL    string `json:"still_url,omitempty" doc:"Stored episode title-card reference; absent when the item has no title card"`
 }

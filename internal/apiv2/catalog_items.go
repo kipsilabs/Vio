@@ -444,6 +444,7 @@ type CatalogItemDetail struct {
 	Audiobook                       *catalogpkg.AudiobookDetailExtension `json:"audiobook,omitempty"`
 	Ebook                           *catalogpkg.EbookDetailExtension     `json:"ebook,omitempty"`
 	Manga                           *catalogpkg.MangaDetailExtension     `json:"manga,omitempty"`
+	HasVirtualSource                *bool                                `json:"has_virtual_source,omitempty"`
 }
 
 // CatalogRatingSource is one source's rating of an item.

@@ -18,6 +18,7 @@ import (
 type fakeAdminImages struct {
 	calls      int
 	rows       []handlers.AdminImageEntryView
+	current    handlers.AdminCurrentImagesView
 	request    handlers.AdminItemImageRequest
 	uploadType string
 	upload     []byte
