@@ -350,10 +350,13 @@ type ItemDetail struct {
 	// SeasonID is an episode's stored season, empty when its season is
 	// synthetic. Not part of any JSON contract; apiv2 finds the themes an
 	// episode inherits with it.
-	SeasonID       string          `json:"-"`
-	EpisodeNumber  *int            `json:"episode_number,omitempty"`
-	EpisodeCount   *int            `json:"episode_count,omitempty"`
-	AirDate        *string         `json:"air_date,omitempty"`
+	SeasonID      string  `json:"-"`
+	EpisodeNumber *int    `json:"episode_number,omitempty"`
+	EpisodeCount  *int    `json:"episode_count,omitempty"`
+	AirDate       *string `json:"air_date,omitempty"`
+	// ReleaseState is derived from AirDate for episode details. It remains out
+	// of the frozen v1 JSON shape; apiv2 projects it explicitly.
+	ReleaseState   string          `json:"-"`
 	IsSpecials     bool            `json:"is_specials,omitempty"`
 	SeasonUserData *SeasonUserData `json:"user_data,omitempty"`
 	UserState      *ItemUserState  `json:"user_state,omitempty"`

@@ -12,7 +12,7 @@ import (
 // resolve, the still's ThumbHash is still served and must stay protected.
 func TestV2EpisodeDetailPosterStaysAStillWithoutURL(t *testing.T) {
 	detail := &catalogpkg.ItemDetail{ContentID: "episode:1", Type: "episode", Title: "Pilot", PosterThumbhash: "still-hash"}
-	out := catalogItemDetailOf(detail, ratingsources.Selection{}, nil)
+	out := catalogItemDetailOf(detail, ratingsources.Selection{})
 	if out.PosterIsEpisodeStill == nil || !*out.PosterIsEpisodeStill {
 		t.Fatalf("poster_is_episode_still = %v with the still's ThumbHash served", out.PosterIsEpisodeStill)
 	}
