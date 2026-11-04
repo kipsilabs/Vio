@@ -2186,8 +2186,7 @@ func (h *PlaybackHandler) recordStartingDevice(ctx context.Context, userID int, 
 // reason another version can avoid and the request allows other versions, the
 // first authorized version of alternateBase that plans replaces it, with the
 // warnings that choice adds.
-func (h *PlaybackHandler) planStartV3(r *http.Request, req playback.StartRequestV3, requestedFile, alternateBase, effectiveFile *models.MediaFile, audioIndex int, settings playback.PlannerSettingsV3, lowerVersion *playback.LowerVersionV3, profileID string) (alternateCandidateV3, []playback.DegradationWarningV3) {
-	resolutionProvenance := ProbeProvenance("")
+func (h *PlaybackHandler) planStartV3(r *http.Request, req playback.StartRequestV3, requestedFile, alternateBase, effectiveFile *models.MediaFile, audioIndex int, settings playback.PlannerSettingsV3, lowerVersion *playback.LowerVersionV3, profileID string, resolutionProvenance ProbeProvenance) (alternateCandidateV3, []playback.DegradationWarningV3) {
 	subtitleInventoryByFileID := map[int][]playback.SubtitleInventoryEntryV3{}
 	subtitleInventoryFor := func(file *models.MediaFile) []playback.SubtitleInventoryEntryV3 {
 		if file == nil {
@@ -2783,7 +2782,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		audioIndex = h.playableStartAudioV3(r.Context(), req, requestedFile, effectiveFile, remapAudioIndexV3(requestedFile, effectiveFile, preferredAudio), settings)
 	}
 	lowerVersion := h.lowerVersionV3(r.Context(), req, alternateBase, settings, requestAccessFilter(r))
-	planned, fallbackWarnings := h.planStartV3(r, req, requestedFile, alternateBase, effectiveFile, audioIndex, settings, lowerVersion, profileID)
+	planned, fallbackWarnings := h.planStartV3(r, req, requestedFile, alternateBase, effectiveFile, audioIndex, settings, lowerVersion, profileID, resolutionProvenance)
 	req, effectiveFile, audioIndex = planned.request, planned.file, planned.audioIndex
 	warnings = append(warnings, fallbackWarnings...)
 	timings.mark("planning")
@@ -2848,13 +2847,25 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		// nothing.
 		readingErr := h.applyConnectionReading(r, &unlimitedReq)
 		unlimitedFile, unlimitedReq, unlimitedAudioIndex = h.lowerBufferedVersion(r, unlimitedReq, unlimitedFile, unlimitedAudioIndex, settings)
-		unlimited, _ := h.planStartV3(r, unlimitedReq, requestedFile, alternateBase, unlimitedFile, unlimitedAudioIndex, settings, lowerVersion, profileID)
+		unlimited, _ := h.planStartV3(r, unlimitedReq, requestedFile, alternateBase, unlimitedFile, unlimitedAudioIndex, settings, lowerVersion, profileID, resolutionProvenance)
 		if readingErr != nil || unlimited.result.Plan == nil || deliveredKbpsV3(result.Plan) >= deliveredKbpsV3(unlimited.result.Plan) {
 			result.Plan.BandwidthLimit = nil
 		}
 		timings.mark("unlimited_planning")
 	}
 	appendStartWarningsV3(&result, warnings)
+	// The fresh-start resolve deferred its full audio/subtitle enumeration and
+	// handed back the probe to run once the transport has committed. Mark the
+	// plan provisional now, before the transport commit and before the attempt
+	// record is written, so an idempotent replay of this attempt republishes the
+	// same provisional truth instead of appearing fully probed. tracks_pending
+	// is part of the deferred_track_inventory_v1 lifecycle, so it is only
+	// advertised to a surface/client that negotiated it: the frozen /api/v1
+	// contract and a v2 client that did not advertise the feature keep the
+	// byte-for-byte response they had before.
+	if deferredProbe != nil && result.Plan != nil && h.deferTrackInventoryNegotiatedV3(r, req) {
+		result.Plan.TracksPending = true
+	}
 	phasesCtx, phaseTimings := withTransportPhaseTimingsV3(r.Context())
 	response, statusErr := h.startPlannedPlaybackV3(r.WithContext(phasesCtx), userID, profileID, req, requestDigests, requestedFile, effectiveFile, audioIndex, intent, result, clientInfo)
 	timings.mark("session_transport_commit")
@@ -9496,6 +9507,14 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			reason:  "invalid_seek_position",
 			message: "The requested seek position is beyond the end of the selected media source.",
 		}
+	}
+	// A stop or idle reap can land after the caller's early-out and while the
+	// replan reads the catalog (the source load is the slow step). Re-check the
+	// live session before validating the rebuilt start: a session that died
+	// mid-execution must answer the fast 404, not persist a terminal for a
+	// session nobody owns any more.
+	if _, liveErr := h.sessionMgr.GetSession(record.SessionID); liveErr != nil {
+		return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: "session_expired", message: "The playback session is no longer live.", cause: liveErr}
 	}
 	if _, err := start.NormalizeAndValidate(); err != nil {
 		return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: "invalid_replan", message: err.Error()}
