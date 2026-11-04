@@ -10,6 +10,8 @@ import (
 	"testing"
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
+
+	"github.com/Silo-Server/silo-server/internal/httpheader"
 )
 
 type profileTestRouteClient struct {
@@ -87,8 +89,8 @@ func TestHTTPProxyUsesLaunchProfileWithoutRequestHeader(t *testing.T) {
 	if themes.profileID != "profile-1" || identities.profileID != "profile-1" {
 		t.Fatalf("lookup profiles = theme %q identity %q", themes.profileID, identities.profileID)
 	}
-	if client.request == nil || client.request.Headers["X-Silo-Theme"] != "dark" ||
-		client.request.Headers["X-Silo-Profile-Name"] != "Living Room" ||
+	if client.request == nil || client.request.Headers[httpheader.PluginTheme] != "dark" ||
+		client.request.Headers[httpheader.PluginProfileName] != "Living Room" ||
 		client.request.Headers["X-Silo-Profile-Id"] != "profile-1" {
 		t.Fatalf("forwarded request = %#v", client.request)
 	}
