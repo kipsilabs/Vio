@@ -27,6 +27,7 @@ type PlannerSettingsV3 struct {
 	PreferLowerVersionTranscode bool
 	HardwareToneMapEnabled      bool
 	SoftwareToneMapEnabled      bool
+	VPPToneMapEnabled           bool
 	// ViewerTranscodeDisabled reflects the viewer's account policy. Session
 	// admission enforces it; the planner only uses it to stop advertising
 	// quality rungs the viewer cannot start.
@@ -2158,7 +2159,7 @@ func hlsSubtitleRenditionEligibleV3(input PlannerInputV3, subtitle SubtitlePolic
 		IsASS(subtitle.Codec) && input.Request.SubtitleFidelityPreference == SubtitleFidelityPreserveV3 {
 		return false
 	}
-	return SubtitleRenditionExecutable(float64(input.EffectiveFile.Duration), DefaultSegmentDuration) && executable()
+	return SubtitleRenditionExecutable(input.EffectiveFile.CodecVideo, float64(input.EffectiveFile.Duration), DefaultSegmentDuration) && executable()
 }
 
 // hlsRenditionsV3 is the subtitle renditions an HLS plan's stream carries:

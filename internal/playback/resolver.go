@@ -277,9 +277,8 @@ func videoCopyUnsafeFile(file *models.MediaFile) bool {
 	if track.VideoCopyUnsafe || (track.MultiplePPS != nil && *track.MultiplePPS) {
 		return true
 	}
-	// Scanner verdicts are persisted on media_files as well as on the selected
-	// track. Honour a current persisted unsafe verdict so a fresh planner (or a
-	// different replica) cannot re-admit a route after the scan completed.
-	unsafe, known := file.PersistedVideoCopyVerdict()
-	return known && unsafe
+	if verdict, ok := file.PersistedVideoCopyVerdict(); ok {
+		return verdict
+	}
+	return false
 }

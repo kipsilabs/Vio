@@ -1029,8 +1029,8 @@ const (
 	RouteEventPlanSelectedV3               = "plan_selected"
 	RouteEventPlanInvalidatedV3            = "plan_invalidated"
 	RouteEventPlanFailedV3                 = "plan_failed"
-	RouteEventPlanSummaryV3                = "plan_summary"
 	RouteEventFirstFrameV3                 = "first_frame"
+	RouteEventPlanSummaryV3                = "plan_summary"
 	RouteEventTerminalV3                   = "terminal"
 	RouteEventStoppedV3                    = "stopped"
 	RouteEventRuntimeCorrectionAppliedV3   = "runtime_correction_applied"
@@ -1041,11 +1041,11 @@ const (
 )
 
 var routeEventNamesV3 = []string{
-	RouteEventPlanSummaryV3,
 	RouteEventPlanSelectedV3,
 	RouteEventPlanInvalidatedV3,
 	RouteEventPlanFailedV3,
 	RouteEventFirstFrameV3,
+	RouteEventPlanSummaryV3,
 	RouteEventTerminalV3,
 	RouteEventStoppedV3,
 	RouteEventRuntimeCorrectionAppliedV3,
@@ -1078,11 +1078,15 @@ func (r ReplanRequestV3) EffectiveOperation() ReplanOperationV3 {
 }
 
 type PlaybackInventoryV3 struct {
-	SessionID         string                    `json:"session_id"`
-	InventoryRevision string                    `json:"inventory_revision"`
-	InventoryStatus   string                    `json:"inventory_status"`
-	AudioTracks       []AudioInventoryItemV3    `json:"audio_tracks"`
-	SubtitleInventory []SubtitleInventoryItemV3 `json:"subtitle_inventory"`
+	SessionID             string                    `json:"session_id"`
+	InventoryRevision     string                    `json:"inventory_revision"`
+	InventoryStatus       string                    `json:"inventory_status"`
+	AudioTracks           []AudioInventoryItemV3    `json:"audio_tracks"`
+	SubtitleInventory     []SubtitleInventoryItemV3 `json:"subtitle_inventory"`
+	EffectiveMediaFileID  int                       `json:"effective_media_file_id,omitempty"`
+	EffectiveVirtualURI   string                    `json:"effective_virtual_uri,omitempty"`
+	VirtualSourceRevision string                    `json:"virtual_source_revision,omitempty"`
+	OfferedVirtualURI     string                    `json:"offered_virtual_uri,omitempty"`
 }
 
 type AudioInventoryItemV3 struct {
@@ -1162,6 +1166,11 @@ type EffectiveRecipeV3 struct {
 	// participates in plan identity so the software retry is a distinct
 	// attempt from the hardware plan it replaces.
 	SoftwareVideoDecode bool `json:"software_video_decode,omitempty"`
+}
+
+// PlanCopiesVideoAsMPEGTSV3 reports whether the plan uses MPEG-TS copy packaging.
+func PlanCopiesVideoAsMPEGTSV3(plan PlanV3) bool {
+	return plan.EffectiveRecipe.SegmentContainer == SegmentContainerMPEGTSV3
 }
 
 type SourceDescriptorV3 struct {
@@ -1406,6 +1415,9 @@ type PlanV3 struct {
 	DecisionReason         string                 `json:"decision_reason"`
 	RequestedMediaFileID   int                    `json:"requested_media_file_id"`
 	EffectiveMediaFileID   int                    `json:"effective_media_file_id"`
+	SubstitutedFromFileID  int                    `json:"substituted_from_file_id,omitempty"`
+	SubstitutionReason     string                 `json:"substitution_reason,omitempty"`
+	InventoryURL           string                 `json:"inventory_url,omitempty" format:"uri-reference"`
 	DeliveryChange         *DeliveryChangeV3      `json:"delivery_change,omitempty"`
 	TracksPending          bool                   `json:"tracks_pending,omitempty"`
 	EffectiveVirtualURI    string                 `json:"effective_virtual_uri,omitempty"`

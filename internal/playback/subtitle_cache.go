@@ -1147,6 +1147,24 @@ func (c *SubtitleCache) ServeSUPExtract(w http.ResponseWriter, r *http.Request, 
 		return &SubtitleExtractionRetryError{RetryAfter: retryAfter}
 	}
 
+	// Reserve before committing response headers. If another request owns the
+	// fill, wait here so a committed result can use ServeContent (and retain
+	// range/Last-Modified semantics) rather than becoming a streamed 200.
+	if c != nil {
+		reserved, inflight := c.reserveFill(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, subtitleFormatSUP, true)
+		if reserved != nil {
+			reserved.Discard()
+		}
+		if inflight != nil {
+			if err := waitForSubtitleFill(r.Context(), inflight.done, c.fillWaitBound()); err != nil {
+				return err
+			}
+			if c.serveSUPEntry(w, r, opts) {
+				return nil
+			}
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Cache-Control", "no-store")
 
@@ -2619,8 +2637,10 @@ func (c *SubtitleCache) streamFullTrack(ctx context.Context, w io.Writer, opts S
 		if served, err := c.copyCachedFrom(w, opts, format, 0); served {
 			return err
 		}
-		opts.Writer = w
-		return extract(ctx, opts)
+		// The leader may have failed without publishing an entry. Re-enter
+		// reservation so this waiter takes ownership and its bytes are cached;
+		// a direct uncached extract here would lose the takeover fill.
+		return c.streamFullTrack(ctx, w, opts, format, extract)
 	default:
 		opts.Writer = w
 		return extract(ctx, opts)

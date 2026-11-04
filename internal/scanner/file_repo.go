@@ -5545,7 +5545,75 @@ func (r *servedEpisodeRows) Scan(dest ...any) error {
 // ListByEpisodeIDs returns media files grouped by episode ID for the given
 // episode IDs, excluding files that are marked missing. A multi-episode file
 // is listed under every requested episode it spans.
+//
+// A canonical episode row can be fileless when episode_aliases points at a
+// duplicate layout row that owns the files. For a requested episode, the files
+// of its alias rows are returned under the requested canonical key after the
+// direct files. Returned MediaFile.EpisodeID stays the stored alias ID; only
+// the result map key is canonical. Keeping both sets is deliberate: the
+// playability query can admit a canonical episode through either a direct file
+// or an alias file, so the file listing must offer the same candidate.
+// Direct files come first, then alias files, each in file ID order, so the
+// canonical episode's own files lead regardless of the alias rows' IDs.
 func (r *FileRepository) ListByEpisodeIDs(ctx context.Context, episodeIDs []string) (map[string][]*models.MediaFile, error) {
+	direct, err := r.listFilesByEpisodeIDs(ctx, episodeIDs)
+	if err != nil {
+		return nil, err
+	}
+	if len(episodeIDs) == 0 {
+		return direct, nil
+	}
+
+	seen := make(map[string]struct{}, len(episodeIDs))
+	canonicalIDs := make([]string, 0, len(episodeIDs))
+	for _, episodeID := range episodeIDs {
+		if _, ok := seen[episodeID]; ok {
+			continue
+		}
+		seen[episodeID] = struct{}{}
+		canonicalIDs = append(canonicalIDs, episodeID)
+	}
+
+	fallback, err := r.listAliasFilesByCanonicalEpisodeIDs(ctx, canonicalIDs)
+	if err != nil {
+		return nil, err
+	}
+	for canonicalID, files := range fallback {
+		direct[canonicalID] = mergeEpisodeFiles(direct[canonicalID], files)
+	}
+	return direct, nil
+}
+
+// mergeEpisodeFiles lists the canonical episode's own files before the files
+// of its alias rows, preserving the ID order each query returned. Both input
+// slices are already ordered by file ID, so the result is deterministic without
+// re-sorting across the two sets. A file that appears in both is kept once, at
+// its direct position.
+func mergeEpisodeFiles(direct, alias []*models.MediaFile) []*models.MediaFile {
+	if len(alias) == 0 {
+		return direct
+	}
+	seen := make(map[int]struct{}, len(direct)+len(alias))
+	merged := make([]*models.MediaFile, 0, len(direct)+len(alias))
+	for _, files := range [][]*models.MediaFile{direct, alias} {
+		for _, file := range files {
+			if file == nil {
+				continue
+			}
+			if _, ok := seen[file.ID]; ok {
+				continue
+			}
+			seen[file.ID] = struct{}{}
+			merged = append(merged, file)
+		}
+	}
+	return merged
+}
+
+// listFilesByEpisodeIDs is the direct media_files lookup behind
+// ListByEpisodeIDs. It groups by the served episode ID, so a multi-episode
+// file is listed under every requested episode it spans.
+func (r *FileRepository) listFilesByEpisodeIDs(ctx context.Context, episodeIDs []string) (map[string][]*models.MediaFile, error) {
 	grouped := make(map[string][]*models.MediaFile, len(episodeIDs))
 	if len(episodeIDs) == 0 {
 		return grouped, nil

@@ -492,9 +492,11 @@ func frameMatchesSourceKind(frame preflightFrame, kind SourceKind) bool {
 		ColorRange: frame.ColorRange, ColorPrimaries: frame.ColorPrimaries,
 		ColorTransfer: frame.ColorTransfer, ColorSpace: frame.ColorSpace,
 	})
+	if kind == SourcePQ && !rangeIsLimited(normalizeColorValue(frame.ColorRange)) {
+		return false
+	}
 	// Full-range PQ conversion preserves the decoded range. An untagged frame
-	// therefore cannot establish which levels the frozen recipe will receive;
-	// accepting it would make the conversion dependent on decoder defaults.
+	// therefore cannot establish which levels the frozen recipe will receive.
 	if kind == SourcePQFullRange && !complete {
 		return false
 	}

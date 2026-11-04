@@ -2678,7 +2678,7 @@ func (s *TranscodeSession) getManifest(currentGeneration bool) ([]byte, error) {
 	if currentGeneration {
 		inherited = s.inheritedManifest
 	}
-	data, err := readManifestFile(manifestPath, inherited)
+	data, _, err := readManifestFile(manifestPath, inherited)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			if !s.running {
@@ -2765,20 +2765,21 @@ func statManifest(outputDir string) os.FileInfo {
 // open file: FFmpeg replaces the playlist by rename, so a separate Stat by path
 // could describe a newer file than the bytes returned and let an inherited
 // playlist pass as current.
-func readManifestFile(path string, inherited os.FileInfo) ([]byte, error) {
+func readManifestFile(path string, inherited os.FileInfo) ([]byte, os.FileInfo, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer func() { _ = f.Close() }()
 	info, err := f.Stat()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if inherited != nil && sameManifestFile(info, inherited) {
-		return nil, os.ErrNotExist
+		return nil, info, os.ErrNotExist
 	}
-	return io.ReadAll(f)
+	data, err := io.ReadAll(f)
+	return data, info, err
 }
 
 // sameManifestFile reports whether current is still the inherited playlist.
@@ -2953,7 +2954,7 @@ func (s *TranscodeSession) generationScopedQuery(rawQuery string) string {
 // has already accepted.
 func (s *TranscodeSession) buildPlaybackManifest(segPrefix, rawQuery string) ([]byte, error) {
 	if s.HasSubtitleRendition() {
-		return s.buildSubtitleRenditionPlaylist(segPrefix, rawQuery)
+		return s.buildSubtitleRenditionPlaylist(segPrefix, rawQuery), nil
 	}
 	return s.buildVideoPlaylist(segPrefix, rawQuery)
 }
@@ -6535,3 +6536,21 @@ func formatWaitError(err error) string {
 	}
 	return err.Error()
 }
+func syntheticManifestQuery(segmentCount int, rawQuery string) (definition, suffix string, minVersion int) {
+	if rawQuery == "" {
+		return "", "", 0
+	}
+	legacySuffix := "?" + rawQuery
+	variableSuffix := "?{$" + manifestQueryVariable + "}"
+	savingsPerSegment := len(legacySuffix) - len(variableSuffix)
+	if savingsPerSegment <= 0 || int64(segmentCount)*int64(savingsPerSegment) < minManifestQuerySubstitutionSavings || strings.ContainsAny(rawQuery, "\"\r\n") {
+		return "", legacySuffix, 0
+	}
+	definition = fmt.Sprintf("#EXT-X-DEFINE:NAME=\"%s\",VALUE=\"%s\"\n", manifestQueryVariable, rawQuery)
+	return definition, variableSuffix, 8
+}
+
+// GetSegment returns the file path of a named segment if it exists.
+
+// SegmentLease binds an opened segment descriptor to the FFmpeg generation it
+// came from. Keeping the descriptor open makes it a filesystem-backed lease: a

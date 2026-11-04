@@ -22,6 +22,8 @@ var (
 	// ErrManifestQueryTooLong rejects a playlist request whose query is longer
 	// than maxManifestQueryBytes.
 	ErrManifestQueryTooLong = errors.New("playlist request query too long")
+	// ErrAdmissionDeciderTimeout reports that the optional policy hook exceeded its deadline.
+	ErrAdmissionDeciderTimeout = errors.New("admission decider timed out")
 	// ErrToneMapSourceValidationUnavailable reports that the executor could not
 	// freshly probe the source metadata needed to validate a tone-map recipe.
 	// The failure is transient: callers may retry after the source or probe

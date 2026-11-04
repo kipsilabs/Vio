@@ -3630,7 +3630,11 @@ export function VideoPlayer({
     liveTranslation?.trackKey ?? null,
     subtitleStreamGeneration,
     setTextSubtitleState,
+    undefined,
+    undefined,
+    0,
     activeSubtitleCueRevision,
+    engineTransportRevision,
   );
 
   // -- ASS/SSA subtitle rendering via JASSUB (client-side libass) --
@@ -3642,6 +3646,8 @@ export function VideoPlayer({
     timelineOffsetSeconds,
     subtitleDelayMs,
     setASSSubtitleState,
+    undefined,
+    0,
     videoFit,
     coverCrop,
     activeSubtitleCueRevision,
@@ -3747,9 +3753,10 @@ export function VideoPlayer({
     // track the server may just have refused.
     if (subtitleHandoverPending) return;
     const desiredServerIndex = pendingServerSubtitleSelection(
-      plan.selected_tracks.subtitle ?? null,
-      activeSubtitleTrack,
-      effectiveSubtitleTracks,
+      plan.subtitle.mode,
+      plan.selected_tracks.subtitle?.index ?? null,
+      activeSubtitleIndex,
+      activeSubtitleTrack?.burn_in_only === true,
     );
     if (desiredServerIndex === undefined) {
       requestedSubtitleTrackChangeRef.current = null;
@@ -5456,7 +5463,7 @@ export function VideoPlayer({
               className="inline-block rounded px-3 py-1 text-center leading-snug"
               style={{ ...scaledCueStyle, whiteSpace: "pre-line" }}
             >
-              {text}
+              {text.text}
             </span>
           ))}
         </div>

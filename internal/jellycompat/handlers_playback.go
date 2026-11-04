@@ -1,7 +1,6 @@
 package jellycompat
 
 import (
-	"cmp"
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
@@ -28,7 +27,6 @@ import (
 	"github.com/Silo-Server/silo-server/internal/transcodeproxy"
 
 	"github.com/go-chi/chi/v5"
-	"golang.org/x/sync/singleflight"
 
 	"github.com/Silo-Server/silo-server/internal/access"
 	"github.com/Silo-Server/silo-server/internal/catalog"
@@ -65,8 +63,8 @@ type playbackInfoRequest struct {
 	SiloSeekReanchor                    bool            `json:"SiloSeekReanchor"`
 	UserID                              string          `json:"UserId"`
 	MediaSourceID                       string          `json:"MediaSourceId"`
-	AudioStreamIndex                    compatIntValue  `json:"AudioStreamIndex"`
-	SubtitleStreamIndex                 compatIntValue  `json:"SubtitleStreamIndex"`
+	AudioStreamIndex                    *compatIntValue `json:"AudioStreamIndex"`
+	SubtitleStreamIndex                 *compatIntValue `json:"SubtitleStreamIndex"`
 	MaxStreamingBitrate                 int64           `json:"MaxStreamingBitrate"`
 	MaxAudioChannels                    int             `json:"MaxAudioChannels"`
 	AlwaysBurnInSubtitleWhenTranscoding bool            `json:"AlwaysBurnInSubtitleWhenTranscoding"`
@@ -80,7 +78,8 @@ type playbackInfoRequest struct {
 }
 
 var compatLanguageNames = map[string]string{
-	"ar": "Arabic", "ara": "Arabic",
+	"multi": "Multi",
+	"ar":    "Arabic", "ara": "Arabic",
 	"bg": "Bulgarian", "bul": "Bulgarian",
 	"bn": "Bengali", "ben": "Bengali",
 	"cs": "Czech", "ces": "Czech", "cze": "Czech",
@@ -347,6 +346,7 @@ type PlaybackHandler struct {
 	accessFilter            AccessFilterResolver // the viewer's scope for downloads
 	storeProvider           userstore.UserStoreProvider
 	ScopeResolver           ScopeResolver
+	DeviceProfilePersister  DeviceProfilePersister
 	NodePlanner             nodepool.SessionPlanner
 	JWTSecret               string
 	signalsNotifier         signalsChangedNotifier
@@ -369,13 +369,25 @@ type PlaybackHandler struct {
 	ExternalTimings subtitles.ExternalTimingLookup
 	// PlaySync aligns a subtitle the first time a client is served it, when
 	// it was never synced; nil leaves that to a request.
-	PlaySync               subtitles.PlaySyncer
-	Trickplay              TrickplaySheets       // optional; serves seek-bar preview sheets
-	SettingsRepo           SettingsReader        // optional; reads watched threshold setting
-	SessionSyncer          PlaybackSessionSyncer // optional; enables immediate session sync to shared admin view
-	WatchScrobbler         PlaybackWatchScrobbler
-	StableIdentityResolver watchsync.ScrobbleIdentityResolver
-	terminalFallbackDelay  time.Duration
+	PlaySync                       subtitles.PlaySyncer
+	Trickplay                      TrickplaySheets       // optional; serves seek-bar preview sheets
+	SettingsRepo                   SettingsReader        // optional; reads watched threshold setting
+	SessionSyncer                  PlaybackSessionSyncer // optional; enables immediate session sync to shared admin view
+	WatchScrobbler                 PlaybackWatchScrobbler
+	StableIdentityResolver         watchsync.ScrobbleIdentityResolver
+	VirtualMediaResolver           VirtualMediaResolver
+	VirtualMediaRefreshResolver    VirtualMediaRefreshResolver
+	VirtualMediaDetailedResolver   VirtualMediaDetailedResolver
+	VirtualPlaybackStreamLister    VirtualPlaybackStreamLister
+	VirtualSourceProber            VirtualSourceProber
+	VirtualSourceProberWithHeaders VirtualSourceProberWithHeaders
+	VirtualFileSaver               VirtualFileSaver
+	VirtualFileMetadataSaver       VirtualFileMetadataSaver
+	VirtualCandidateFileLookup     VirtualCandidateFileLookup
+	RemoteStreamRelay              RemoteStreamRelay
+	AllowInsecureVirtual           func(installationID int) bool
+	AllowPrivateStreams            func(installationID int) bool
+	terminalFallbackDelay          time.Duration
 	// RecipeNodeStore hands a remote transcode's reconstruction recipe to the
 	// control-plane recipe store (Redis) so a dedicated transcode node that
 	// restarts can rebuild ffmpeg from it. The node-hop token is server-minted and
@@ -402,10 +414,10 @@ type PlaybackHandler struct {
 	// compatScrobbleLocks orders each upstream session's start, report, and
 	// terminal-staging scrobbles; see sendCompatResumeStart, applyCompatReport,
 	// and stageCompatStop.
-	compatScrobbleLocks compatScrobbleLocks
-	// compatMoves single-flights moving a transcode off a node that stopped
-	// answering, so every request that finds the node dead waits on one move.
-	compatMoves singleflight.Group
+	compatScrobbleLocks    compatScrobbleLocks
+	compatBackgroundMu     sync.Mutex
+	compatBackgroundClosed bool
+	compatBackgroundWG     sync.WaitGroup
 }
 
 func (h *PlaybackHandler) serverBitrateCap(ctx context.Context, session *Session) (int, error) {
@@ -1077,29 +1089,6 @@ func (h *PlaybackHandler) resolveCompatHLSRouteOnNodeWithPolicy(
 	excludedShapes map[string]struct{},
 	policy config.PlaybackRoutingPolicy,
 ) (noderouting.Decision, error) {
-	request, err := h.compatHLSResolveRequest(
-		ctx, session, file, source, requiredToneMapMode, requiredTranscodeURL, excludedNodes, excludedShapes, policy,
-	)
-	if err != nil {
-		return noderouting.Decision{}, err
-	}
-	return noderouting.Resolve(noderouting.AdaptSessionPlanner(h.NodePlanner), request)
-}
-
-// compatHLSResolveRequest builds the route request for a Jellyfin-compatible
-// HLS transcode: the workload, the capability filter for the frozen recipe,
-// and the proxy filter for the client's access path.
-func (h *PlaybackHandler) compatHLSResolveRequest(
-	ctx context.Context,
-	session *playback.Session,
-	file *models.MediaFile,
-	source PlaybackMediaSource,
-	requiredToneMapMode tonemap.Mode,
-	requiredTranscodeURL string,
-	excludedNodes map[string]struct{},
-	excludedShapes map[string]struct{},
-	policy config.PlaybackRoutingPolicy,
-) (noderouting.ResolveRequest, error) {
 	videoTranscode := !compatHLSCopiesVideo(source)
 	workload := noderouting.WorkloadRemux
 	delivery := noderouting.DeliveryHLSRemux
@@ -1110,7 +1099,7 @@ func (h *PlaybackHandler) compatHLSResolveRequest(
 	eligible, err := h.compatTranscodeEligibility(ctx, file, videoTranscode,
 		compatHLSRecipeSourceAudioChannels(source), requiredToneMapMode, excludedNodes, policy)
 	if err != nil {
-		return noderouting.ResolveRequest{}, err
+		return noderouting.Decision{}, err
 	}
 	if source.DVStripToHDR10 && !videoTranscode {
 		eligible, excludedShapes = h.compatDVStripRouting(ctx, eligible, excludedShapes, compatHLSRecipeSourceAudioChannels(source))
@@ -1128,7 +1117,7 @@ func (h *PlaybackHandler) compatHLSResolveRequest(
 		}
 		currentTranscodeURL = requiredTranscodeURL
 	}
-	return noderouting.ResolveRequest{
+	return noderouting.Resolve(noderouting.AdaptSessionPlanner(h.NodePlanner), noderouting.ResolveRequest{
 		Request: noderouting.Request{
 			Workload: workload, Delivery: delivery,
 			Policy: policy, ProxyAllowed: h.JWTSecret != "",
@@ -1140,7 +1129,7 @@ func (h *PlaybackHandler) compatHLSResolveRequest(
 		// path; nil on the default path, so every healthy proxy stays eligible.
 		ProxyEligible:    nodepool.ClientReachableVia(netaccess.PathFromContext(ctx), nil),
 		ExcludedShapeIDs: excludedShapes,
-	}, nil
+	})
 }
 
 func (h *PlaybackHandler) releaseCompatSessionReservation(sessionID string) {
@@ -1628,7 +1617,6 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 			compatRecipeTargetVideoMatchesSource(current.Recipe, source) &&
 			current.Recipe.SourceAudioChannels == expectedSourceAudioChannels &&
 			current.Recipe.AudioTrackIndex == expectedAudioTrackIndex &&
-			current.Recipe.RequireAudioTrack == compatRequiresAudioTrack(source) &&
 			playback.ValidateCopyFMP4RecipeCard(*current.Recipe) == nil {
 			// A drained node runs no session, so the runtime recorded on it is
 			// gone; start a fresh one instead of pinning the client to it.
@@ -1666,6 +1654,50 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 		if err := h.sessionMgr.SetTranscodeNodeURL(upstreamSessionID, transcodeNodeURL); err != nil {
 			return fmt.Errorf("bind transcode node: %w", err)
 		}
+	}
+
+	var resolvedInputCleanup func()
+	// Virtual sources are durable canonical URIs, but a remote worker cannot
+	// dereference them directly. Resolve them through the relay while retaining
+	// the canonical URI (and provider owner) in the recipe for reconstruction.
+	if isCompatVirtualSource(source) || isCompatVirtualFile(file) {
+		canonicalPath := strings.TrimSpace(source.VirtualSourceURI)
+		if canonicalPath == "" {
+			canonicalPath = strings.TrimSpace(source.Version.FilePath)
+		}
+		if h.tm == nil || h.tm.ResolveInput == nil || canonicalPath == "" {
+			h.tm.StopRemoteTranscode(upstreamSessionID, transcodeNodeURL)
+			return errors.New("unresolved virtual source cannot be dispatched")
+		}
+		userID := 0
+		profileID := ""
+		if h.sessionMgr != nil {
+			if upstream, err := h.sessionMgr.GetSession(upstreamSessionID); err == nil && upstream != nil {
+				userID, profileID = upstream.UserID, upstream.ProfileID
+			}
+		}
+		resolved, cleanup, err := h.tm.ResolveInput(ctx, source.FileID, source.VirtualSourceOwnerInstallationID, userID, profileID, canonicalPath)
+		if err != nil || strings.TrimSpace(resolved) == "" {
+			if cleanup != nil {
+				cleanup()
+			}
+			h.tm.StopRemoteTranscode(upstreamSessionID, transcodeNodeURL)
+			if err != nil {
+				return fmt.Errorf("resolve virtual source for remote transcode: %w", err)
+			}
+			return errors.New("unresolved virtual source cannot be dispatched")
+		}
+		fileCopy := *file
+		fileCopy.FilePath = resolved
+		file = &fileCopy
+		// The recipe builder uses CanonicalInputPath and owner metadata below.
+		// Keep the relay cleanup alive until the remote playback lifecycle owns it.
+		resolvedInputCleanup = cleanup
+		defer func() {
+			if resolvedInputCleanup != nil {
+				resolvedInputCleanup()
+			}
+		}()
 	}
 	if !compatHLSCopiesVideo(source) && is4KResolution(source.Version.Resolution) && !h.allow4KVideoTranscode(ctx) {
 		return errTranscode4KDisallowed
@@ -1766,7 +1798,6 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 		SegmentDuration:        segmentDuration,
 		HWAccel:                h.remoteDispatchHWAccel(transcodeNodeURL),
 		AudioTrackIndex:        compatAudioTrackIndexOrDefault(source),
-		RequireAudioTrack:      compatRequiresAudioTrack(source),
 		SourceAudioChannels:    compatHLSRecipeSourceAudioChannels(source),
 		TotalDuration:          float64(source.Version.Duration),
 		RequireReady:           toneMapRecipe.mode != "",
@@ -1860,6 +1891,11 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 			}
 			return transcodenode.TranscodeStartResponse{}, resp.StatusCode, true, err
 		}
+		// Every accepted dispatch, including software retries, must attest the
+		// MPEG-TS packaging it was asked to execute before it is admitted.
+		if attestationErr := transcodenode.ValidateCopyVideoMPEGTSAttestation(request, result); attestationErr != nil {
+			return result, resp.StatusCode, true, attestationErr
+		}
 		return result, resp.StatusCode, false, nil
 	}
 	nodeResponse, status, cleanupRequired, err := dispatch(reqBody)
@@ -1871,6 +1907,12 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 	if err == nil && status == http.StatusAccepted && reqBody.ToneMapMode != "" && nodeResponse.ToneMapMode != reqBody.ToneMapMode {
 		err = errors.New("remote transcode node did not confirm tone-map mode")
 		cleanupRequired = true
+	}
+	if err == nil && status == http.StatusAccepted {
+		if attestationErr := transcodenode.ValidateCopyVideoMPEGTSAttestation(reqBody, nodeResponse); attestationErr != nil {
+			err = attestationErr
+			cleanupRequired = true
+		}
 	}
 	initialStatus := status
 	initialErr := err
@@ -1955,10 +1997,6 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 		h.tm.StopRemoteTranscode(upstreamSessionID, transcodeNodeURL)
 		return fmt.Errorf("%w: %w", errRemoteTranscodeStartFailed, err)
 	}
-	if err := transcodenode.ValidateCopyVideoMPEGTSAttestation(reqBody, nodeResponse); err != nil {
-		h.tm.StopRemoteTranscode(upstreamSessionID, transcodeNodeURL)
-		return fmt.Errorf("%w: %w", errRemoteTranscodeStartFailed, err)
-	}
 	if reqBody.ToneMapMode != "" && nodeResponse.ToneMapMode != reqBody.ToneMapMode {
 		h.tm.StopRemoteTranscode(upstreamSessionID, transcodeNodeURL)
 		err := errors.New("remote transcode node did not confirm tone-map mode")
@@ -2005,36 +2043,38 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 	// token of their own, so without a persisted recipe a node or central restart
 	// cannot rebuild ffmpeg and segment serves 404.
 	opts := playback.TranscodeOpts{
-		SessionID:              upstreamSessionID,
-		InputPath:              reqBody.InputPath,
-		SourceVideoCodec:       reqBody.SourceVideoCodec,
-		SourceVideoProfile:     reqBody.SourceVideoProfile,
-		SourceVideoBitDepth:    reqBody.SourceVideoBitDepth,
-		SeekSeconds:            reqBody.SeekSeconds,
-		StreamOriginSeconds:    reqBody.StreamOriginSeconds,
-		CopySeekAnchorResolved: reqBody.CopySeekAnchorResolved,
-		StartSegmentNumber:     reqBody.StartSegmentNumber,
-		TargetCodecVideo:       reqBody.TargetCodecVideo,
-		TargetCodecAudio:       reqBody.TargetCodecAudio,
-		TargetResolution:       reqBody.TargetResolution,
-		SubtitleBurnIn:         reqBody.SubtitleBurnIn,
-		SubtitleTrackIndex:     reqBody.SubtitleTrackIndex,
-		SubtitleCodec:          reqBody.SubtitleCodec,
-		TargetBitrateKbps:      reqBody.TargetBitrateKbps,
-		VideoSampleEntry:       reqBody.VideoSampleEntry,
-		VideoBitstreamFilter:   reqBody.VideoBitstreamFilter,
-		CopyVideoMPEGTS:        reqBody.CopyVideoMPEGTS,
-		KeyframePlaylist:       reqBody.KeyframePlaylist,
-		SegmentDuration:        reqBody.SegmentDuration,
-		AudioTrackIndex:        reqBody.AudioTrackIndex,
-		RequireAudioTrack:      reqBody.RequireAudioTrack,
-		SourceAudioChannels:    reqBody.SourceAudioChannels,
-		TargetAudioChannels:    reqBody.TargetAudioChannels,
-		TotalDuration:          reqBody.TotalDuration,
-		ThrottleSeconds:        reqBody.ThrottleSeconds,
+		SessionID:                        upstreamSessionID,
+		InputPath:                        reqBody.InputPath,
+		CanonicalInputPath:               strings.TrimSpace(source.VirtualSourceURI),
+		VirtualSourceOwnerInstallationID: source.VirtualSourceOwnerInstallationID,
+		SourceVideoCodec:                 reqBody.SourceVideoCodec,
+		SourceVideoProfile:               reqBody.SourceVideoProfile,
+		SourceVideoBitDepth:              reqBody.SourceVideoBitDepth,
+		SeekSeconds:                      reqBody.SeekSeconds,
+		StreamOriginSeconds:              reqBody.StreamOriginSeconds,
+		CopySeekAnchorResolved:           reqBody.CopySeekAnchorResolved,
+		StartSegmentNumber:               reqBody.StartSegmentNumber,
+		TargetCodecVideo:                 reqBody.TargetCodecVideo,
+		TargetCodecAudio:                 reqBody.TargetCodecAudio,
+		TargetResolution:                 reqBody.TargetResolution,
+		SubtitleBurnIn:                   reqBody.SubtitleBurnIn,
+		SubtitleTrackIndex:               reqBody.SubtitleTrackIndex,
+		SubtitleCodec:                    reqBody.SubtitleCodec,
+		TargetBitrateKbps:                reqBody.TargetBitrateKbps,
+		VideoSampleEntry:                 reqBody.VideoSampleEntry,
+		VideoBitstreamFilter:             reqBody.VideoBitstreamFilter,
+		CopyVideoMPEGTS:                  reqBody.CopyVideoMPEGTS,
+		KeyframePlaylist:                 reqBody.KeyframePlaylist,
+		SegmentDuration:                  reqBody.SegmentDuration,
+		AudioTrackIndex:                  reqBody.AudioTrackIndex,
+		SourceAudioChannels:              reqBody.SourceAudioChannels,
+		TargetAudioChannels:              reqBody.TargetAudioChannels,
+		TotalDuration:                    reqBody.TotalDuration,
+		ThrottleSeconds:                  reqBody.ThrottleSeconds,
 		// Record the decode path the node executed so a reconstruct keeps
 		// it; an older node omits the field.
 		SoftwareVideoDecode: reqBody.SoftwareVideoDecode || nodeResponse.SoftwareVideoDecode,
+		InputCleanup:        resolvedInputCleanup,
 	}
 	toneMapRecipe.apply(&opts)
 	opts.HWAccel = strings.TrimSpace(nodeResponse.HWAccel)
@@ -2049,6 +2089,8 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 		h.tm.StopRemoteTranscode(upstreamSessionID, transcodeNodeURL)
 		return err
 	}
+	// The playback TranscodeSession now owns the relay cleanup.
+	resolvedInputCleanup = nil
 
 	// Publish admin/session execution facts only after the durable recipe
 	// commits. A failed recipe write must not leave the upstream mirror claiming
@@ -2148,6 +2190,13 @@ func (h *PlaybackHandler) persistTranscodeRecipe(
 		}
 	}
 
+	if remoteToLocal {
+		// Fence the replaced remote runtime before publishing the local winner.
+		// The old node recipe was already removed, so no reconstruction can
+		// race this replacement. If the central update fails, the recipe
+		// rollback below leaves the prior remote state available for retry.
+		h.tm.StopRemoteTranscode(upstreamSessionID, previousRecipe.TranscodeNodeURL)
+	}
 	if updateErr := h.playbackStore.Update(playSessionID, func(current *PlaybackSession) error {
 		current.TranscodeStarted = true
 		current.Recipe = recipe
@@ -2182,13 +2231,6 @@ func (h *PlaybackHandler) persistTranscodeRecipe(
 			return errors.Join(updateErr, restoreErr, compatRestoreErr)
 		}
 		return updateErr
-	}
-	if remoteToLocal {
-		// Stop the replaced node job only once the local recipe has committed.
-		// The node fences a stopped transport against reconstruction, so a
-		// rollback that restored the remote recipe could not resume it; leaving
-		// the job running until here keeps that rollback playable.
-		h.tm.StopRemoteTranscode(upstreamSessionID, previousRecipe.TranscodeNodeURL)
 	}
 	return nil
 }
@@ -2310,6 +2352,14 @@ func (h *PlaybackHandler) HandlePlaybackInfo(w http.ResponseWriter, r *http.Requ
 
 	allow4KTranscode := h.allow4KVideoTranscode(r.Context())
 	allowHEVCEncoding := h.allowHEVCVideoEncoding(r.Context())
+	// Keep failed sources out of an unselected response while there is at least
+	// one viable alternative. If every source has failed, preserve the complete
+	// list so Jellyfin can report the item and its source ids rather than seeing
+	// an indistinguishable empty PlaybackInfo response. An explicit source
+	// selection is handled separately below and always keeps that source.
+	hasLiveVersion := slices.ContainsFunc(detail.Versions, func(version catalog.FileVersion) bool {
+		return !version.Failed
+	})
 	toneMapPolicy := tonemap.PolicyNone
 	toneMapPolicyLoaded := false
 	var toneMapCapabilities tonemap.Capabilities
@@ -2337,9 +2387,37 @@ func (h *PlaybackHandler) HandlePlaybackInfo(w http.ResponseWriter, r *http.Requ
 			req.MediaSourceID = pathMediaSourceID
 		}
 	}
+	hadVirtualPrepErr := false
 	unreadableSkipped := false
 	for _, version := range detail.Versions {
-		source := h.buildPlaybackSource(routeItemID, playSessionID, version, profile, req, allow4KTranscode, allowHEVCEncoding)
+		// Failed versions are not playable unless the client explicitly selected
+		// that source (an active session may still be recovering it).
+		if version.Failed && req.MediaSourceID == "" && hasLiveVersion {
+			continue
+		}
+		sourceID := h.codec.EncodeIntID(EncodedIDMediaSource, int64(version.FileID))
+		if req.MediaSourceID != "" && !mediaSourceIDsEqual(sourceID, req.MediaSourceID) {
+			continue
+		}
+		// Virtual sources must be prepared before negotiation so the advertised
+		// source and the later stream request share the canonical URI/owner.
+		prepared := version
+		virtualURI := ""
+		virtualOwnerID := 0
+		if isCompatVirtualPath(version.FilePath) || strings.EqualFold(strings.TrimSpace(version.Container), "virtual") {
+			var prepErr error
+			prepared, virtualURI, virtualOwnerID, prepErr = h.prepareVirtualPlaybackVersion(r.Context(), session, version)
+			if prepErr != nil {
+				hadVirtualPrepErr = true
+				if req.MediaSourceID != "" {
+					writeError(w, http.StatusServiceUnavailable, "PlaybackUnavailable", "Failed to resolve virtual playback source")
+					return
+				}
+				slog.WarnContext(r.Context(), "jellycompat virtual playback version preparation failed", "component", "jellycompat", "file_id", version.FileID, "error", prepErr)
+				continue
+			}
+		}
+		source := h.buildPlaybackSourceWithVirtual(routeItemID, playSessionID, prepared, profile, req, allow4KTranscode, allowHEVCEncoding, virtualURI, virtualOwnerID)
 		if req.MediaSourceID != "" && !mediaSourceIDsEqual(source.ID, req.MediaSourceID) {
 			continue
 		}
@@ -2429,7 +2507,6 @@ func (h *PlaybackHandler) HandlePlaybackInfo(w http.ResponseWriter, r *http.Requ
 			// The HEVC target followed HEVC's limits; H.264 has its own.
 			source.TargetVideoCodec = compatTargetVideoCodec
 			source.TargetBitrateKbps, source.TargetResolution = source.h264TargetBitrateKbps, source.h264TargetResolution
-			source.encodeCeilingKbps = source.h264EncodeCeilingKbps
 			source.SupportsTranscoding = profile.supportsTranscodingOutput(version, source.TargetAudioChannels, source.TargetBitrateKbps, source.TargetResolution)
 		}
 		source.SiloSeekReanchor = req.SiloSeekReanchor && compatHLSCopiesVideo(source) && source.SupportsTranscoding
@@ -2484,6 +2561,10 @@ func (h *PlaybackHandler) HandlePlaybackInfo(w http.ResponseWriter, r *http.Requ
 	}
 
 	if len(sourceDTOs) == 0 {
+		if hadVirtualPrepErr {
+			writeError(w, http.StatusServiceUnavailable, "PlaybackUnavailable", "Failed to resolve virtual playback source")
+			return
+		}
 		if unreadableSkipped {
 			// Every version this request could use is unreadable. Answer as
 			// Jellyfin does when nothing can play, so the client says so.
@@ -2530,8 +2611,9 @@ func (h *PlaybackHandler) HandlePlaybackInfo(w http.ResponseWriter, r *http.Requ
 	// Cleaned and clamped like every other client identity, since the stream
 	// request that starts the native session may reuse these values.
 	negotiatedClient := playback.ClientInfo{
-		Name:    firstMediaBrowserAuthorizationValue(r, "Client"),
-		Version: firstMediaBrowserAuthorizationValue(r, "Version"),
+		Name:     firstMediaBrowserAuthorizationValue(r, "Client"),
+		Version:  firstMediaBrowserAuthorizationValue(r, "Version"),
+		DeviceID: clientDeviceID,
 	}.Normalized()
 	h.playbackStore.PutNegotiated(PlaybackSession{
 		ID:                 playSessionID,
@@ -2554,7 +2636,7 @@ func (h *PlaybackHandler) HandlePlaybackInfo(w http.ResponseWriter, r *http.Requ
 		MediaSources:  sourceDTOs,
 	})
 	if played := compatLikelyPlayedSource(sources); played >= 0 && warmSubtitles[played] {
-		h.warmCompatTextSubtitles(sources[played].FileID)
+		h.warmCompatTextSubtitles(sources[played].FileID, "")
 	}
 }
 
@@ -2743,21 +2825,20 @@ func (h *PlaybackHandler) buildPlaybackSource(
 	}
 	// Copy and audio-transcode remuxes must match the fMP4 output profile;
 	// full video encodes independently match the MPEG-TS output profile.
-	// An encode targets the source's rate, under the client's ceiling less
-	// audio and mux overhead and the profile's own bitrate and frame size
-	// limits for that codec.
+	// An encode targets the client's ceiling, less audio and mux overhead,
+	// and the profile's own bitrate and frame size limits for that codec.
 	sourceVideo := compatPrimaryVideoTrack(version)
 	_, aacBitrateKbps := playback.ResolveAACOutputV3(targetAudioChannels, 0)
 	targetVideoCodec := compatTargetVideoCodec
-	targetBitrateKbps, targetResolution, ceilingKbps := compatEncodeTarget(profile, targetVideoCodec, maxBitrate, aacBitrateKbps, version, sourceVideo)
-	h264BitrateKbps, h264Resolution, h264CeilingKbps := targetBitrateKbps, targetResolution, ceilingKbps
+	targetBitrateKbps, targetResolution := compatEncodeTarget(profile, targetVideoCodec, maxBitrate, aacBitrateKbps, sourceVideo)
+	h264BitrateKbps, h264Resolution := targetBitrateKbps, targetResolution
 	canEncodeOutput := profile.supportsTranscodingOutput(version, targetAudioChannels, max(targetBitrateKbps, 0), targetResolution)
 	// HEVC needs server opt-in and an explicit compatible HLS fMP4 profile.
 	if len(allowHEVCEncoding) > 0 && allowHEVCEncoding[0] {
-		hevcBitrateKbps, hevcResolution, hevcCeilingKbps := compatEncodeTarget(profile, compatVideoCodecHEVC, maxBitrate, aacBitrateKbps, version, sourceVideo)
+		hevcBitrateKbps, hevcResolution := compatEncodeTarget(profile, compatVideoCodecHEVC, maxBitrate, aacBitrateKbps, sourceVideo)
 		if profile.supportsHEVCTranscodingOutput(version, targetAudioChannels, max(hevcBitrateKbps, 0), hevcResolution) {
 			targetVideoCodec = compatVideoCodecHEVC
-			targetBitrateKbps, targetResolution, ceilingKbps = hevcBitrateKbps, hevcResolution, hevcCeilingKbps
+			targetBitrateKbps, targetResolution = hevcBitrateKbps, hevcResolution
 			canEncodeOutput = true
 		}
 	}
@@ -2770,21 +2851,19 @@ func (h *PlaybackHandler) buildPlaybackSource(
 		supportsTranscoding = false
 	}
 
-	if maxBitrate > 0 && targetBitrateKbps < compatMinEncodeKbps {
+	if maxBitrate > 0 && targetBitrateKbps < 64 {
 		supportsTranscoding = false
 	}
 	return PlaybackMediaSource{
 		ServerBitrateCapKbps:       req.serverBitrateCapKbps,
 		StreamLocation:             req.streamLocation,
-		CanBurnSubtitle:            enableTranscoding && (maxBitrate <= 0 || targetBitrateKbps >= compatMinEncodeKbps) && (allow4KTranscode || !is4KResolution(version.Resolution)) && canEncodeOutput,
+		CanBurnSubtitle:            enableTranscoding && (maxBitrate <= 0 || targetBitrateKbps >= 64) && (allow4KTranscode || !is4KResolution(version.Resolution)) && canEncodeOutput,
 		TargetBitrateKbps:          max(targetBitrateKbps, 0),
 		TargetResolution:           targetResolution,
 		TargetAudioChannels:        targetAudioChannels,
 		TargetVideoCodec:           targetVideoCodec,
 		h264TargetBitrateKbps:      max(h264BitrateKbps, 0),
 		h264TargetResolution:       h264Resolution,
-		encodeCeilingKbps:          max(ceilingKbps, 0),
-		h264EncodeCeilingKbps:      max(h264CeilingKbps, 0),
 		hlsRemuxInTS:               hlsRemuxInTS,
 		ID:                         sourceID,
 		FileID:                     version.FileID,
@@ -2803,18 +2882,31 @@ func (h *PlaybackHandler) buildPlaybackSource(
 	}
 }
 
-// compatMinEncodeKbps is the lowest video bitrate an encode can target.
-const compatMinEncodeKbps = 64
+// buildPlaybackSourceWithVirtual adds the pinned virtual-source binding to the
+// normal negotiated source. The virtual relay uses the same negotiated mapping;
+// only the source identity is virtualized for later stream resolution.
+func (h *PlaybackHandler) buildPlaybackSourceWithVirtual(
+	routeItemID, playSessionID string,
+	version catalog.FileVersion,
+	profile DeviceProfile,
+	req playbackInfoRequest,
+	allow4KTranscode bool,
+	allowHEVCEncoding bool,
+	virtualURI string,
+	virtualOwnerID int,
+) PlaybackMediaSource {
+	source := h.buildPlaybackSource(routeItemID, playSessionID, version, profile, req, allow4KTranscode, allowHEVCEncoding)
+	source.VirtualSourceURI = virtualURI
+	source.VirtualSourceOwnerInstallationID = virtualOwnerID
+	return source
+}
 
 // compatEncodeTarget returns the video bitrate and TargetResolution an encode
-// to videoCodec aims for, and the ceiling they were fit to: the client's limit
-// less audio and mux overhead, capped by the profile's own limits for that
-// codec. The resolution class follows that ceiling, so a limit near a class
-// floor does not earn a class its video bitrate cannot fill, and the source's
-// rate never lowers the class. The bitrate stops at what the source can use
-// (compatSourceEncodeKbps), since a re-encode cannot add what the source does
-// not have.
-func compatEncodeTarget(profile DeviceProfile, videoCodec string, maxBitrate int64, audioBitrateKbps int, version catalog.FileVersion, sourceVideo models.VideoTrack) (int, string, int) {
+// to videoCodec aims for: the client's ceiling less audio and mux overhead,
+// capped by the profile's own limits for that codec. The resolution class
+// follows the same video budget, so a limit near a class floor does not earn
+// a class its video bitrate cannot fill.
+func compatEncodeTarget(profile DeviceProfile, videoCodec string, maxBitrate int64, audioBitrateKbps int, sourceVideo models.VideoTrack) (int, string) {
 	maxVideoBitrate, maxHeight, maxWidth := profile.encodeLimits(videoCodec)
 	budget := 0
 	if maxBitrate > 0 {
@@ -2824,28 +2916,7 @@ func compatEncodeTarget(profile DeviceProfile, videoCodec string, maxBitrate int
 		budget = limit
 	}
 	resolution := compatFitResolution(compatTargetResolutionForBitrate(int64(max(budget, 0)), sourceVideo), sourceVideo, maxHeight, maxWidth)
-	target := budget
-	if source := compatSourceEncodeKbps(version, sourceVideo, videoCodec); source > 0 && target > 0 {
-		target = min(target, source)
-		if target < compatMinEncodeKbps && budget >= compatMinEncodeKbps {
-			target = compatMinEncodeKbps
-		}
-	}
-	return target, resolution, budget
-}
-
-// compatSourceEncodeKbps is the rate an encode of the source to videoCodec
-// needs for the same quality, or 0 when the source's rate is unknown. A track
-// rate above the file's is impossible and one far below it is suspect, so
-// either falls back to the file's rate: a target that is too high costs only
-// bandwidth, while a bogus low one ruins the picture.
-func compatSourceEncodeKbps(version catalog.FileVersion, sourceVideo models.VideoTrack, videoCodec string) int {
-	fileKbps := playback.SourceVideoKbps(version.Bitrate, 0)
-	videoKbps := playback.SourceVideoKbps(version.Bitrate, sourceVideo.Bitrate)
-	if fileKbps > 0 && (videoKbps > fileKbps || videoKbps < fileKbps/4) {
-		videoKbps = fileKbps
-	}
-	return playback.EncodeEquivalentKbps(videoKbps, cmp.Or(sourceVideo.Codec, version.CodecVideo), videoCodec)
+	return budget, resolution
 }
 
 // supportedHLSRemuxAudioStreamIndexes freezes the copy-safe switch targets. A
@@ -3000,7 +3071,7 @@ func compatTranscodeReasons(source PlaybackMediaSource) []string {
 		return []string{container, "AudioCodecNotSupported"}
 	case source.SubtitleBurnIn:
 		return []string{"SubtitleCodecNotSupported"}
-	case source.encodeCeilingKbps > 0 && source.Version.Bitrate > source.encodeCeilingKbps:
+	case source.TargetBitrateKbps > 0 && source.Version.Bitrate > source.TargetBitrateKbps:
 		return []string{"VideoBitrateNotSupported"}
 	case source.TargetResolution != "":
 		return []string{"VideoResolutionNotSupported"}
@@ -3332,20 +3403,6 @@ func compatAudioTrackIndex(source PlaybackMediaSource) (int, bool) {
 	return audioTrackIndex, true
 }
 
-// compatRequiresAudioTrack reports whether the transcode must fail rather than
-// drop the negotiated audio track when the file lacks it.
-func compatRequiresAudioTrack(source PlaybackMediaSource) bool {
-	return effectiveCompatAudioStreamIndex(source) != nil
-}
-
-// compatAudioRequirementMatches accepts a recipe written before negotiated audio
-// became mandatory, so segment requests across an API upgrade keep their
-// remote executor. A recipe may not demand audio the source no longer offers.
-// Starts compare strictly instead, so a new start replaces a legacy runtime.
-func compatAudioRequirementMatches(requireAudioTrack bool, source PlaybackMediaSource) bool {
-	return !requireAudioTrack || compatRequiresAudioTrack(source)
-}
-
 func compatAudioTrackIndexOrDefault(source PlaybackMediaSource) int {
 	if audioTrackIndex, ok := compatAudioTrackIndex(source); ok {
 		return audioTrackIndex
@@ -3532,7 +3589,7 @@ func compatAudioSpatialFormat(profile string) string {
 }
 
 func audioTrackDisplayTitle(track models.AudioTrack) string {
-	lang := compatLanguageName(track.Language)
+	lang := audioTrackLanguageDisplayName(track)
 	// Jellyfin prefers the ffprobe profile over the codec name in audio display
 	// titles (e.g. "DTS-HD MA", "Dolby Digital Plus + Dolby Atmos"), except the
 	// uninformative AAC "LC" profile.
@@ -3551,6 +3608,40 @@ func audioTrackDisplayTitle(track models.AudioTrack) string {
 		title += " - " + embedded
 	}
 	return title
+}
+
+func audioTrackLanguageDisplayName(track models.AudioTrack) string {
+	if len(track.Languages) == 0 {
+		return compatLanguageName(track.Language)
+	}
+
+	seen := make(map[string]struct{}, len(track.Languages))
+	names := make([]string, 0, len(track.Languages))
+	for _, code := range track.Languages {
+		trimmed := strings.TrimSpace(code)
+		if trimmed == "" {
+			continue
+		}
+		normalized := strings.ToLower(trimmed)
+		// These are probe placeholders, not languages to advertise. Keep the
+		// legacy fallback for a track with no usable list below.
+		if normalized == "und" || normalized == "unknown" || normalized == "undefined" {
+			continue
+		}
+		name := compatLanguageName(trimmed)
+		if name == "Unknown" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	if len(names) == 0 {
+		return compatLanguageName(track.Language)
+	}
+	return strings.Join(names, "/")
 }
 
 func audioCodecDisplayName(codec string) string {
@@ -3927,10 +4018,12 @@ func applyPlaybackQueryOverrides(req *playbackInfoRequest, query url.Values) {
 		req.MediaSourceID = value
 	}
 	if value, ok := parseOptionalInt(firstQueryValue(query, "AudioStreamIndex")); ok {
-		req.AudioStreamIndex = compatIntValueOf(value)
+		v := compatIntValueOf(value)
+		req.AudioStreamIndex = &v
 	}
 	if value, ok := parseOptionalInt(firstQueryValue(query, "SubtitleStreamIndex")); ok {
-		req.SubtitleStreamIndex = compatIntValueOf(value)
+		v := compatIntValueOf(value)
+		req.SubtitleStreamIndex = &v
 	}
 	if value, ok := parseOptionalBool(firstQueryValue(query, "EnableDirectPlay")); ok {
 		req.EnableDirectPlay = &value
@@ -4020,11 +4113,19 @@ func (v *compatIntValue) UnmarshalJSON(data []byte) error {
 
 // get returns the value and whether the request set one.
 func (v *compatIntValue) get() (int, bool) {
+	if v == nil {
+		return 0, false
+	}
 	return v.value, v.set
 }
 
 func compatIntValueOf(value int) compatIntValue {
 	return compatIntValue{value: value, set: true}
+}
+
+func compatIntValuePtr(value int) *compatIntValue {
+	v := compatIntValueOf(value)
+	return &v
 }
 
 func (h *PlaybackHandler) playbackUnavailable(w http.ResponseWriter, err error) {
@@ -4059,12 +4160,6 @@ func applyCompatSubtitleDelivery(source *PlaybackMediaSource, profile DeviceProf
 			embed = embed || strings.EqualFold(sub.Method, "Embed")
 			external = external || strings.EqualFold(sub.Method, "External")
 		}
-		// FFmpeg can't demux an index-only track, so neither can a stream
-		// that carries it embedded, and it can't be burned in: only the
-		// server's external delivery, which reads the index, shows it.
-		if track.IndexOnly {
-			embed = false
-		}
 		text := !playback.NeedsBurnIn(track.Codec)
 		var delivery PlaybackSubtitleDelivery
 		if format, ok := profile.ExternalSubtitleFormat(track.Codec); ok && text {
@@ -4086,7 +4181,7 @@ func applyCompatSubtitleDelivery(source *PlaybackMediaSource, profile DeviceProf
 		}
 		if !text || !external || alwaysBurn {
 			source.SupportsDirectStream = false
-			source.SupportsTranscoding = source.CanBurnSubtitle && !track.External && !track.IndexOnly
+			source.SupportsTranscoding = source.CanBurnSubtitle && !track.External
 			// A burn-in is a full encode. TranscodeAudio also marks a video-copy
 			// remux (compatHLSCopiesVideo), so it is cleared with HLSRemux.
 			source.HLSRemux = false
