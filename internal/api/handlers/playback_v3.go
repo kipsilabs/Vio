@@ -2211,6 +2211,25 @@ func (h *PlaybackHandler) planStartV3(r *http.Request, req playback.StartRequest
 	}
 	result, toneMapCapabilityErr := h.planPlaybackWithCapabilitiesV3(r.Context(), input)
 	var warnings []playback.DegradationWarningV3
+	// Audio adaptation is release-local: when the selected track cannot be
+	// converted, try another track in this file before considering (or
+	// reporting) a sibling release. If no same-release track can play, keep
+	// the planner's adaptation_unavailable terminal intact.
+	if audioOnlyTerminalV3(result.Terminal) {
+		degradedReq, degradedIndex, degradedResult, degradedToneMapErr, ok := h.degradeStartAudioInPlaceV3(
+			r, req, requestedFile, effectiveFile, audioIndex, settings, ProbeProvenance(""),
+		)
+		if ok {
+			req = degradedReq
+			audioIndex = degradedIndex
+			result = degradedResult
+			toneMapCapabilityErr = degradedToneMapErr
+			if result.Plan != nil {
+				warnings = append(warnings, result.Plan.DegradationWarnings...)
+				result.Plan.DegradationWarnings = nil
+			}
+		}
+	}
 	if req.AllowsAlternateVersions() && terminalAllowsAlternateFileV3(result.Terminal) { //nolint:nestif // existing alternate-version fallback; only its quality condition changed
 		accessFilter := requestAccessFilter(r)
 		alternateOrder := alternateOrderingForClient(req.Capabilities)
