@@ -3940,6 +3940,50 @@ func firstMediaSource(session *PlaybackSession) *PlaybackMediaSource {
 	return &source
 }
 
+// playedMediaSource identifies the source represented by a Jellyfin report.
+// Prefer the report's source id, then the file selected by the native playback
+// session (which survives reports that omit MediaSourceId), and leave fallback
+// selection to callers when neither is available.
+func playedMediaSource(session *PlaybackSession, mediaSourceID string) *PlaybackMediaSource {
+	if source := findMediaSource(session, mediaSourceID); source != nil {
+		return source
+	}
+	if session == nil || session.UpstreamMediaFileID == 0 {
+		return nil
+	}
+	return mediaSourceByFileID(session, session.UpstreamMediaFileID)
+}
+
+// mediaSourceByFileID returns a copy so callers cannot mutate the durable play
+// session while resolving a scrobble or progress report.
+func mediaSourceByFileID(session *PlaybackSession, fileID int) *PlaybackMediaSource {
+	if session == nil || fileID == 0 {
+		return nil
+	}
+	for _, source := range session.MediaSources {
+		if source.FileID == fileID {
+			copy := source
+			return &copy
+		}
+	}
+	return nil
+}
+
+func playedSourceDuration(session *PlaybackSession, mediaSourceID string) float64 {
+	if source := playedMediaSource(session, mediaSourceID); source != nil {
+		return float64(source.Version.Duration)
+	}
+	if session == nil {
+		return 0
+	}
+	for _, source := range session.MediaSources {
+		if source.Version.Duration > 0 {
+			return float64(source.Version.Duration)
+		}
+	}
+	return 0
+}
+
 func findMediaSource(session *PlaybackSession, mediaSourceID string) *PlaybackMediaSource {
 	if session == nil {
 		return nil
