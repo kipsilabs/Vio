@@ -383,7 +383,7 @@ func (m *mapper) personDTO(name, personID, role, kind, photoURL, photoPath, phot
 // applyDetailVersions fills the version-derived detail fields from the
 // already-filtered version list. An empty list means a provider-metadata-only
 // (unaired/missing) item, where the version data is authoritative.
-func (m *mapper) applyDetailVersions(dto *baseItemDTO, _ string, versions []catalog.FileVersion, wantField func(string) bool) {
+func (m *mapper) applyDetailVersions(dto *baseItemDTO, contentID string, versions []catalog.FileVersion, wantField func(string) bool) {
 	if len(versions) == 0 {
 		// Provider-metadata-only (unaired/missing) item: version data is
 		// authoritative here, so override the FileSystem default set by
@@ -391,11 +391,71 @@ func (m *mapper) applyDetailVersions(dto *baseItemDTO, _ string, versions []cata
 		applyPlayableLocation(dto, false)
 		return
 	}
-	// A requested MediaSources on a playable item without a present version
-	// is [], as in Jellyfin; series and seasons have no media sources.
-	if wantField("mediasources") && dto.MediaSources == nil {
-		dto.MediaSources = []mediaSourceDTO{}
+	firstVersion := versions[0]
+	dto.MediaSourceCount = len(versions)
+	if firstVersion.Duration > 0 {
+		dto.RunTimeTicks = secondsToTicks(float64(firstVersion.Duration))
 	}
+	dto.DateCreated = formatCompatTime(firstVersion.AddedAt)
+	// CanDownload is load-bearing for Infuse: it refuses Direct Play
+	// (Static=true streaming) of items it believes it cannot download.
+	// The flag is backed by the /Items/{id}/Download route (streams.go).
+	dto.CanDownload = true
+	dto.HasSubtitles = versionsHaveSubtitles(versions)
+	dto.SupportsSync = false
+	dto.Container = strings.ToLower(firstVersion.Container)
+	applyPlayableLocation(dto, true)
+	dto.Path = compatMediaPath(firstVersion)
+	if len(firstVersion.VideoTracks) > 0 {
+		dto.Width = firstVersion.VideoTracks[0].Width
+		dto.Height = firstVersion.VideoTracks[0].Height
+		dto.IsHD = isHDVideo(firstVersion.VideoTracks[0])
+	}
+	// Multi-version detail pages need the version list even when the client
+	// did not spell out Fields=MediaSources. Some Jellyfin clients (Plezy
+	// among them) render versions from the item DTO rather than issuing a
+	// separate PlaybackInfo call, so omitting the field leaves their version
+	// menu empty while single-version clients see no difference.
+	wantMediaSources := wantField("mediasources") || len(versions) > 1
+	wantMediaStreams := wantField("mediastreams")
+	sources, streams := m.versionMediaParts(contentID, versions, wantMediaSources, wantMediaStreams)
+	if wantMediaStreams {
+		dto.MediaStreams = append(dto.MediaStreams, streams...)
+	}
+	if wantMediaSources {
+		dto.MediaSources = sources
+	}
+	if wantField("chapters") {
+		dto.Chapters = compatChapters(firstVersion.Chapters, firstVersion.AddedAt)
+	}
+	if wantField("trickplay") {
+		dto.Trickplay = m.compatTrickplay(versions)
+	}
+}
+
+// versionMediaParts builds the MediaSources and MediaStreams arrays for the
+// version list, honoring which of the two the client asked for.
+func (m *mapper) versionMediaParts(contentID string, versions []catalog.FileVersion, wantSources, wantStreams bool) ([]mediaSourceDTO, []mediaStreamDTO) {
+	if !wantSources && !wantStreams {
+		return nil, nil
+	}
+	routeItemID := m.codec.EncodeStringID(EncodedIDItem, contentID)
+	var sources []mediaSourceDTO
+	if wantSources {
+		sources = make([]mediaSourceDTO, 0, len(versions))
+	}
+	var streams []mediaStreamDTO
+	for _, version := range versions {
+		sourceID := m.codec.EncodeIntID(EncodedIDMediaSource, int64(version.FileID))
+		versionStreams := buildMediaStreams(routeItemID, sourceID, version)
+		if wantStreams {
+			streams = append(streams, versionStreams...)
+		}
+		if wantSources {
+			sources = append(sources, detailMediaSourceDTO(sourceID, version, versionStreams))
+		}
+	}
+	return sources, streams
 }
 
 // dropUnrequestedEmptyLists leaves an empty list field out of a list
