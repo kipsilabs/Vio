@@ -2282,8 +2282,16 @@ func (h *PlaybackHandler) touchSessionActivity(sessionID string) {
 	}
 }
 
-func (h *PlaybackHandler) finalizeSessionStop(ctx context.Context, session *playback.Session, syncNow bool, syncReason string, reason PlaybackEndReason) {
-	h.finalizeSessionStopWithResult(ctx, session, syncNow, syncReason, reason)
+func (h *PlaybackHandler) finalizeSessionStop(ctx context.Context, session *playback.Session, syncNow bool, syncReason string, reason any) {
+	if userInitiated, ok := reason.(bool); ok {
+		if userInitiated {
+			reason = PlaybackEndStopped
+		} else {
+			reason = PlaybackEndStopped
+		}
+	}
+	endReason, _ := reason.(PlaybackEndReason)
+	h.finalizeSessionStopWithResult(ctx, session, syncNow, syncReason, endReason)
 }
 
 // finalizeSessionStopWithResult is finalizeSessionStop reporting the history

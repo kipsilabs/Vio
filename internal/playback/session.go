@@ -539,9 +539,10 @@ type ClientInfo struct {
 	// Channel is the client's opaque distribution channel ("release", "beta",
 	// "sideload", "dev", …). Stored verbatim — deliberately not validated
 	// against an enum so a new channel needs no server change.
-	Channel   string
-	UserAgent string
-	IsCompat  bool
+	Channel        string
+	UserAgent      string
+	DevicePlatform string
+	IsCompat       bool
 }
 
 // Normalized returns the identity with every field trimmed and clamped to the
