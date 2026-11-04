@@ -275,6 +275,8 @@ type Session struct {
 
 	Position float64
 	IsPaused bool
+	// Watch records measured playback and pause time from progress samples.
+	Watch WatchTime
 	// ClientCanceled records the last transport cancel observed for this
 	// session, scoped to the route revision and binding generation it happened
 	// on. It is liveness evidence for one request, not a session verdict: the
@@ -1366,6 +1368,7 @@ func (m *SessionManager) updateProgress(sessionID string, position float64, isPa
 	}
 
 	s.Position = position
+	s.Watch.Observe(position, isPaused, time.Now())
 	s.positionSequence = max(s.positionSequence, sequence)
 	if sequence < 0 || sequence > s.confirmedPauseSequence {
 		s.IsPaused = isPaused
@@ -1394,11 +1397,16 @@ func (m *SessionManager) SetPaused(sessionID string, paused bool, acceptedSequen
 		return false, ErrSessionNotFound
 	}
 	s.confirmedPauseSequence = max(s.confirmedPauseSequence, acceptedSequence)
+	wasPaused := s.IsPaused
+	if paused && !wasPaused {
+		s.Watch.Pause(time.Now())
+	}
 	moved := false
 	if latest != nil && latest.Sequence > s.positionSequence {
 		s.positionSequence = latest.Sequence
 		moved = s.Position != latest.Position
 		s.Position = latest.Position
+		s.Watch.Observe(latest.Position, wasPaused, time.Now())
 	}
 	if s.IsPaused == paused {
 		if moved {

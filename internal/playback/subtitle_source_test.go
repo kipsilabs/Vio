@@ -578,6 +578,17 @@ func TestPrefixKeepalive(t *testing.T) {
 	}
 }
 
+// inflightFill returns the active cache fill. Tests use the production fill
+// type so they observe the same progressive written-byte lifecycle as callers.
+func inflightFill(c *SubtitleCache) *SubtitleCacheFill {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, fill := range c.inflight {
+		return fill
+	}
+	return nil
+}
+
 // waitForCondition polls cond, then runs then once it holds.
 func waitForCondition(t *testing.T, cond func() bool, then func()) {
 	t.Helper()
