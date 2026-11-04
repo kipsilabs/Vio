@@ -719,6 +719,10 @@ func (s *TranscodeSession) buildSubtitleRenditionPlaylist(segPrefix, rawQuery st
 		return s.GenerateFullManifest(segPrefix, query)
 	case subtitleRenditionSubtitles:
 		track := subtitleTrackQuery(query)
+		query = subtitleTrackQueryRemoved(query)
+		if track == "" && len(s.Opts().SubtitleRenditionTracks) > 1 {
+			return nil
+		}
 		if (track == "" && len(s.Opts().SubtitleRenditionTracks) > 1) || (track != "" && !s.hasSubtitleTrack(track)) {
 			return nil
 		}
@@ -732,7 +736,7 @@ func (s *TranscodeSession) buildSubtitleRenditionPlaylist(segPrefix, rawQuery st
 			}
 		}
 		playlist := s.generateSyntheticPlaylist(segPrefix, query, subtitleSegmentPrefix, subtitleSegmentExt, false)
-		if track := subtitleTrackQuery(query); track != "" {
+		if track != "" {
 			playlist = bytes.ReplaceAll(playlist, []byte(segPrefix+subtitleSegmentPrefix), []byte(segPrefix+subtitleSegmentPrefix+track+"_"))
 		}
 		return playlist
@@ -783,9 +787,27 @@ func subtitleRenditionMultivariantPlaylist(opts TranscodeOpts, query string) []b
 	for i, track := range tracks {
 		names[i], fallbacks[i] = track.Name, track.Language
 	}
-	names = SubtitleRenditionNames(names, fallbacks)
+	// Preserve authoritative labels from recipe cards. Synthesize names only
+	// when a track is unlabeled or labels collide.
+	seen := make(map[string]struct{}, len(names))
+	needNames := false
+	for _, name := range names {
+		key := strings.ToLower(name)
+		if key == "" {
+			needNames = true
+			break
+		}
+		if _, ok := seen[key]; ok {
+			needNames = true
+			break
+		}
+		seen[key] = struct{}{}
+	}
+	if needNames {
+		names = SubtitleRenditionNames(names, fallbacks)
+	}
 	for i, track := range tracks {
-		name := names[i]
+		name := hlsQuotedStringValue(names[i])
 		language := track.Language
 		if language == "" {
 			language = "und"
@@ -805,7 +827,7 @@ func subtitleRenditionMultivariantPlaylist(opts TranscodeOpts, query string) []b
 			languageAttr = fmt.Sprintf(",LANGUAGE=%q", language)
 		}
 		fmt.Fprintf(&buf, "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=%q,NAME=%q%s,DEFAULT=%s,AUTOSELECT=YES,FORCED=%s,URI=%q\n",
-			SubtitleRenditionGroupID, name, languageAttr, map[bool]string{true: "YES", false: "NO"}[track.Default || (i == 0 && !anyDefaultTrack(tracks))], map[bool]string{true: "YES", false: "NO"}[track.Forced], trackURI)
+			SubtitleRenditionGroupID, name, languageAttr, map[bool]string{true: "YES", false: "NO"}[track.Default], map[bool]string{true: "YES", false: "NO"}[track.Forced], trackURI)
 	}
 	fmt.Fprintf(&buf, "#EXT-X-STREAM-INF:BANDWIDTH=%d,SUBTITLES=%q\n", (videoKbps+audioKbps)*1000, SubtitleRenditionGroupID)
 	buf.WriteString(uri(subtitleRenditionVideo) + "\n")
@@ -858,6 +880,17 @@ func (s *TranscodeSession) hasSubtitleTrack(value string) bool {
 		}
 	}
 	return false
+}
+
+func subtitleTrackQueryRemoved(rawQuery string) string {
+	parts := strings.FieldsFunc(rawQuery, func(r rune) bool { return r == '&' })
+	kept := parts[:0]
+	for _, part := range parts {
+		if key, _, _ := strings.Cut(part, "="); key != SubtitleRenditionTrackQueryParam {
+			kept = append(kept, part)
+		}
+	}
+	return strings.Join(kept, "&")
 }
 
 func subtitleTrackQuery(rawQuery string) string {
