@@ -896,6 +896,10 @@ func (h *AdminHandler) HandleCreateUser(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if req.AccessGroupID != nil {
+		if req.Role == roleAdmin {
+			writeError(w, http.StatusUnprocessableEntity, "unprocessable_entity", "Admin accounts cannot belong to an access group")
+			return
+		}
 		if h.AccessGroups == nil {
 			writeError(w, http.StatusInternalServerError, "internal_error", "Access groups are not configured")
 			return
