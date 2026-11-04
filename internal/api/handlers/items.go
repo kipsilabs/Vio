@@ -123,7 +123,10 @@ type ItemsHandler struct {
 	AccessGroups             access.GroupPolicyProvider // optional; resolves inherited library access when no scope is in context
 	MarkerPopulation         MarkerPopulationService
 	MarkerFileResolver       FilePathResolver
-	MarkerImageURLs          interface {
+	// virtualSelectionProber schedules the pre-play probe for an explicitly
+	// selected virtual version whose inventory is still missing.
+	virtualSelectionProber VirtualSelectionProber
+	MarkerImageURLs        interface {
 		ResolveURLs(context.Context, []string) map[string]catalog.ResolvedImageURL
 	}
 }
@@ -2536,6 +2539,19 @@ func (h *ItemsHandler) ensurePresentationLibraryAccess(ctx context.Context, cont
 type watchedLeafTarget struct {
 	ContentID       string
 	DurationSeconds float64
+}
+
+func dedupeWatchedLeafTargets(targets []watchedLeafTarget) []watchedLeafTarget {
+	seen := make(map[string]struct{}, len(targets))
+	out := make([]watchedLeafTarget, 0, len(targets))
+	for _, target := range targets {
+		if _, ok := seen[target.ContentID]; ok {
+			continue
+		}
+		seen[target.ContentID] = struct{}{}
+		out = append(out, target)
+	}
+	return out
 }
 
 // watchedTarget is a watched-state target that exists and that the viewer
