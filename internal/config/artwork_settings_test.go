@@ -44,9 +44,10 @@ func TestArtworkLocalPathDefaultsToVioRootForFreshInstall(t *testing.T) {
 
 // TestArtworkLocalPathPreservesRecordedStorageIdentity covers the upgrade
 // hazard: moving the default root would make blobstore.Open refuse the store
-// an installation already recorded. Only an install with no identity row may
-// adopt the new default; an existing one keeps the legacy root until a managed
-// storage transition moves it.
+// an installation already recorded. A recorded local identity names its exact
+// root, so that recorded path wins over the new default; only an install with
+// no identity row may adopt the new default. An existing one moves through a
+// managed storage transition.
 func TestArtworkLocalPathPreservesRecordedStorageIdentity(t *testing.T) {
 	if artworkIdentitySettingKey != blobstore.IdentitySettingKey {
 		t.Fatalf("config key %q does not match blobstore.IdentitySettingKey %q", artworkIdentitySettingKey, blobstore.IdentitySettingKey)
@@ -63,7 +64,7 @@ func TestArtworkLocalPathPreservesRecordedStorageIdentity(t *testing.T) {
 			want:   DefaultArtworkLocalPath,
 		},
 		{
-			name: "legacy local identity keeps its root",
+			name: "legacy local identity keeps its recorded root",
 			stored: map[string]string{
 				"artwork.local_path":      "",
 				artworkIdentitySettingKey: legacyIdentity,
@@ -71,17 +72,24 @@ func TestArtworkLocalPathPreservesRecordedStorageIdentity(t *testing.T) {
 			want: legacyDefaultArtworkLocalPath,
 		},
 		{
+			name: "a fresh install that recorded the new default keeps it",
+			stored: map[string]string{
+				artworkIdentitySettingKey: blobstore.BackendLocal + "|" + DefaultArtworkLocalPath,
+			},
+			want: DefaultArtworkLocalPath,
+		},
+		{
 			name:   "s3 identity keeps the legacy local default unused by s3",
 			stored: map[string]string{artworkIdentitySettingKey: "s3|https://s3.example|artwork|"},
 			want:   legacyDefaultArtworkLocalPath,
 		},
 		{
-			name:   "custom identity is never guessed at",
+			name:   "custom local identity keeps its recorded root",
 			stored: map[string]string{artworkIdentitySettingKey: "local|/srv/artwork"},
-			want:   legacyDefaultArtworkLocalPath,
+			want:   "/srv/artwork",
 		},
 		{
-			name: "explicit path wins over the default",
+			name: "explicit path wins over the recorded identity",
 			stored: map[string]string{
 				"artwork.local_path":      "/srv/artwork",
 				artworkIdentitySettingKey: legacyIdentity,
