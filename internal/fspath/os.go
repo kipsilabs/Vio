@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 )
 
 // The functions below are the os, path/filepath, and os/exec calls Silo makes
@@ -23,8 +24,53 @@ func OpenFile(name string, flag int, perm os.FileMode) (*os.File, error) {
 // Stat is os.Stat for an encoded path. The returned FileInfo reports the
 // encoded base name.
 func Stat(name string) (os.FileInfo, error) {
-	info, err := os.Stat(Decode(name))
+	info, err := osStat(Decode(name))
 	return encodedInfo(info), err
+}
+
+// osStat is os.Stat; tests swap it to simulate a stat that never returns.
+var osStat = os.Stat
+
+type statCall struct {
+	done chan struct{}
+	info os.FileInfo
+	err  error
+}
+
+var (
+	statCallsMu sync.Mutex
+	statCalls   = map[string]*statCall{}
+)
+
+// StatContext returns when ctx is canceled even if the underlying stat is
+// blocked. Calls for the same path share the in-flight system call.
+func StatContext(ctx context.Context, name string) (os.FileInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	statCallsMu.Lock()
+	call, ok := statCalls[name]
+	if !ok {
+		call = &statCall{done: make(chan struct{})}
+		statCalls[name] = call
+		go func() {
+			call.info, call.err = Stat(name)
+			statCallsMu.Lock()
+			delete(statCalls, name)
+			statCallsMu.Unlock()
+			close(call.done)
+		}()
+	}
+	statCallsMu.Unlock()
+	select {
+	case <-call.done:
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return call.info, call.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 // Lstat is os.Lstat for an encoded path. The returned FileInfo reports the
