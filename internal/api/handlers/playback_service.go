@@ -706,6 +706,12 @@ func (h *PlaybackHandler) StopPlaybackV2(ctx context.Context, caller PlaybackCal
 	if id, err := uuid.Parse(command.StopID); err != nil || id == uuid.Nil || id.String() != command.StopID {
 		return PlaybackMutationView{}, playbackOperationError(http.StatusBadRequest, "bad_request", "A canonical stop_id is required")
 	}
+	// These identities are reserved for server-owned lifecycle transitions.
+	// Reject them before touching the attempt so a client cannot impersonate an
+	// administrator, expiry, or abort finalization.
+	if serverStopID(sessionID, command.StopID) {
+		return PlaybackMutationView{}, playbackOperationError(http.StatusBadRequest, "bad_request", "A client stop_id is required")
+	}
 	if command.Sequence < 0 || (command.Position == nil) != (command.Sequence == 0) ||
 		(command.Position != nil && (*command.Position < 0 || math.IsNaN(*command.Position) || math.IsInf(*command.Position, 0))) {
 		return PlaybackMutationView{}, playbackOperationError(http.StatusBadRequest, "bad_request", "Invalid stop identity or final sample")
@@ -919,6 +925,10 @@ func (h *PlaybackHandler) finishStop(ctx context.Context, record *playback.Attem
 	if err != nil {
 		return "", err
 	}
+	// No local session means the normal lifecycle finalizer did not get a
+	// chance to write the durable admin log. Do it from the attempt-derived
+	// session, preserving the attempt's start time and accepted final sample.
+	h.recordAdminStopHistory(ctx, synthesized, reason)
 	// The synced-session row lives in a store shared by every replica, so a
 	// replica that does not hold the live session still deletes it. This is the
 	// step a retried stop exists to repair.
@@ -1148,9 +1158,12 @@ func (h *PlaybackHandler) playbackInventoryForFileV3(ctx context.Context, sessio
 
 	audioTracks := playback.AudioInventoryV3(file)
 	additional, subErr := h.downloadedSubtitleInventoryWithErrorV3(ctx, file)
-	if subErr != nil {
-		return playback.PlaybackInventoryV3{}, errPlaybackInventorySubtitlesUnavailable
-	}
+	// Downloaded subtitles are an optional extension of the file inventory. If
+	// their store is unavailable, retain the catalog-backed tracks and mark the
+	// response pending so clients can retry the extension without losing the
+	// effective source identity or turning an otherwise valid inventory into a
+	// 503.
+	extensionPending := subErr != nil
 	subtitleInventory := playback.ScopeSubtitleInventoryV3(session.ID, file, playback.BuildSubtitleInventoryV3(file, additional), clientFeatures)
 
 	status := string(ProbeProvenanceDeclared)
@@ -1173,6 +1186,9 @@ func (h *PlaybackHandler) playbackInventoryForFileV3(ctx context.Context, sessio
 		case probeOutcomeFailed:
 			status = string(ProbeProvenanceFailed)
 		}
+	}
+	if extensionPending {
+		status = probeOutcomePending
 	}
 
 	effectiveFileID := 0
