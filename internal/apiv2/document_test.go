@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -582,19 +583,19 @@ func TestImpliedStatusesForConcurrency(t *testing.T) {
 		}
 		return false
 	}
-	plain := ImpliedStatuses(ClassPublic, false, false, false, true, false, false, false)
+	plain := ImpliedStatuses(ClassPublic, false, false, false, true, false, false, false, false)
 	if has(plain, http.StatusPreconditionFailed) || has(plain, http.StatusPreconditionRequired) || has(plain, http.StatusNotModified) {
 		t.Fatalf("plain operation implies concurrency statuses: %v", plain)
 	}
-	guarded := ImpliedStatuses(ClassPublic, false, false, true, true, true, false, false)
+	guarded := ImpliedStatuses(ClassPublic, false, false, true, true, true, false, false, false)
 	if !has(guarded, http.StatusPreconditionFailed) || !has(guarded, http.StatusPreconditionRequired) || has(guarded, http.StatusNotModified) {
 		t.Fatalf("guarded = %v", guarded)
 	}
-	conditional := ImpliedStatuses(ClassPublic, false, false, false, true, false, true, false)
+	conditional := ImpliedStatuses(ClassPublic, false, false, false, true, false, true, false, false)
 	if !has(conditional, http.StatusNotModified) || !has(conditional, http.StatusPreconditionFailed) || has(conditional, http.StatusPreconditionRequired) {
 		t.Fatalf("conditional = %v", conditional)
 	}
-	createOnly := ImpliedStatuses(ClassPublic, false, false, true, true, false, false, true)
+	createOnly := ImpliedStatuses(ClassPublic, false, false, true, true, false, false, true, false)
 	if !has(createOnly, http.StatusPreconditionFailed) || has(createOnly, http.StatusPreconditionRequired) || has(createOnly, http.StatusNotModified) {
 		t.Fatalf("createOnly = %v", createOnly)
 	}

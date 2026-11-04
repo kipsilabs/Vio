@@ -30,12 +30,12 @@ func ratedDetail() *catalogpkg.ItemDetail {
 // on every member of the detail, so a client that reads rating_rt_critic or
 // rating_sources directly still follows the administrator's choice.
 func TestCatalogItemDetailHidesSourcesAnAdministratorHasNotTurnedOn(t *testing.T) {
-	out := catalogItemDetailOf(ratedDetail(), ratingsources.Selection{}, nil)
+	out := catalogItemDetailOf(ratedDetail(), ratingsources.Selection{})
 	if out.RatingIMDB == nil || out.RatingRTCritic != nil || out.RatingRTAudience != nil || out.RatingSources != nil {
 		t.Fatalf("imdb=%v rt=%v audience=%v sources=%+v; want IMDb and TMDB only", out.RatingIMDB, out.RatingRTCritic, out.RatingRTAudience, out.RatingSources)
 	}
 
-	out = catalogItemDetailOf(ratedDetail(), ratingsources.NewSelection("metacritic").WithDeclared(mdblistSources), nil)
+	out = catalogItemDetailOf(ratedDetail(), ratingsources.NewSelection("metacritic").WithDeclared(mdblistSources))
 	if len(out.RatingSources) != 1 || out.RatingSources[0].Source != "metacritic" || out.RatingRTCritic != nil {
 		t.Fatalf("with Metacritic on: rt=%v sources=%+v; want the Metacritic row only", out.RatingRTCritic, out.RatingSources)
 	}
@@ -45,7 +45,7 @@ func TestCatalogItemDetailHidesSourcesAnAdministratorHasNotTurnedOn(t *testing.T
 func TestCatalogItemDetailKeepsStoredRatingsForCurators(t *testing.T) {
 	d := ratedDetail()
 	d.ViewerCurates = true
-	out := catalogItemDetailOf(d, ratingsources.Selection{}, nil)
+	out := catalogItemDetailOf(d, ratingsources.Selection{})
 	if out.RatingRTCritic == nil || out.RatingRTAudience == nil || len(out.RatingSources) != 1 {
 		t.Fatalf("rt=%v audience=%v sources=%+v; want every stored rating", out.RatingRTCritic, out.RatingRTAudience, out.RatingSources)
 	}
