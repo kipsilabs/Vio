@@ -704,6 +704,7 @@ func registerCatalogItems(reg *Registry) {
 		"The episodes of one season of a series by number.")), reg.listSeasonEpisodes)
 	registerCatalogActions(reg)
 	registerRatingsCapability(reg)
+	registerItemCollectionsCapability(reg)
 }
 
 // --- helpers ---
