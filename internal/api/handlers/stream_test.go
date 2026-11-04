@@ -810,7 +810,7 @@ func TestEmbeddedSubtitleExtractionFailures(t *testing.T) {
 			}
 			file := &models.MediaFile{ID: 42, FilePath: "/synthetic/media.mkv", SubtitleTracks: []models.SubtitleTrack{{Codec: codec, Index: 2}}}
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				handler.streamEmbeddedSubtitle(w, r, file, 0, format...)
+				handler.streamEmbeddedSubtitle(w, r, file, 0, nil, false, format...)
 			}))
 			defer server.Close()
 			response, err := server.Client().Get(server.URL)
