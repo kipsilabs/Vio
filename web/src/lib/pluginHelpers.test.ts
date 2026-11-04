@@ -5,6 +5,7 @@ import type { PluginInstallation } from "@/api/types";
 import { capabilityListLabel, catalogJobs } from "./pluginCapabilities";
 import { parsePluginMarkdown } from "./pluginMarkdown";
 import {
+  CATALOG_GROUPS,
   installationTier,
   pendingUpdateVersion,
   pluginPagePath,

@@ -12,6 +12,8 @@ import {
   detectHLSSupport,
   type WebCapabilityProbe,
 } from "./client-context-v3";
+import { ENGINE_DV_BL_COMPAT_IDS, engineTransferForPlan } from "./engine/routing";
+import { fixturePlanV3 } from "./protocol-v3.fixtures";
 import { readMeasuredBandwidthKbps } from "./bandwidth-probe";
 
 afterEach(() => {

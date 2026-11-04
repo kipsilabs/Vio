@@ -41,6 +41,7 @@ export function pendingUpdateVersion(installation: PluginInstallation): string |
 /** The plugin's tier, shown on every plugin (1.0 plugin-management AC4). */
 export function sourceLabel(tier: string): string {
   switch (tier) {
+    case "vio":
     case "silo":
       return "Silo maintained";
     case "approved_community":
@@ -58,6 +59,7 @@ export function sourceLabel(tier: string): string {
  */
 export function tierNotice(tier: string): string | null {
   switch (tier) {
+    case "vio":
     case "silo":
       return null;
     case "approved_community":
