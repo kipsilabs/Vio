@@ -2162,7 +2162,8 @@ func hlsSubtitleRenditionEligibleV3(input PlannerInputV3, subtitle SubtitlePolic
 	// The delivery-specific executor check owns capability and bounded-cue
 	// eligibility. Planner fixtures and reconstructed files may not carry the
 	// probed codec string even though the accepted route does.
-	return executable()
+	duration := float64(input.EffectiveFile.Duration)
+	return duration > 0 && CanGenerateSyntheticManifest(duration, DefaultSegmentDuration) && executable()
 }
 
 // hlsRenditionsV3 is the subtitle renditions an HLS plan's stream carries:

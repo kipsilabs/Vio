@@ -176,7 +176,13 @@ func (r ExecutableRecipeV3) Valid() bool {
 		(r.Version == executableRecipeVersionCopyMPEGTSV3 && !r.CopyVideoMPEGTS) {
 		return false
 	}
-	if r.SubtitleRendition && (r.PlayMethod != PlayTranscode || r.SubtitleBurnIn || r.SubtitleTransportTrackIndex < 0 && len(r.SubtitleRenditionTracks) == 0) {
+	hlsRemux := r.PlayMethod == PlayRemux && r.TargetVideoCodec == codecCopyV3
+	if r.CopyVideoMPEGTS && (r.PlayMethod != PlayRemux || r.TargetVideoCodec != codecCopyV3) {
+		return false
+	}
+	// A copy remux carries its rendition inside the remuxed HLS stream, so a
+	// remux recipe is a valid host for one; a progressive remux is not.
+	if r.SubtitleRendition && ((r.PlayMethod != PlayTranscode && !hlsRemux) || r.SubtitleBurnIn || r.SubtitleTransportTrackIndex < 0 && len(r.SubtitleRenditionTracks) == 0) {
 		return false
 	}
 	hasToneMapField := r.ToneMapPolicy != "" || r.ToneMapMode != "" || r.ToneMapSourceKind != "" || r.ToneMapRecipeVersion != "" || r.ToneMapPreflightRequired || !r.ToneMapSourceRevision.IsZero()
