@@ -588,6 +588,9 @@ type transportErrorV3 struct {
 	// definitely cannot run the recipe, so nothing was attempted there.
 	// combineTransportErrorsV3 lets an attempted route's verdict win over it.
 	executorIneligible bool
+	// seekFailure marks failures resolving the seek anchor, allowing callers to
+	// retry the same release instead of rotating to an alternate candidate.
+	seekFailure bool
 }
 
 func subtitleArtifactErrorV3(message string, cause error) *transportErrorV3 {
@@ -2770,7 +2773,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 								alternateCtx = withSubtitleRotationOutcomeV3(alternatePhasesCtx, carryDecision.outcome)
 							}
 							alternateStartedAt := time.Now()
-							alternateResponse, alternateStatusErr := h.startPlannedPlaybackV3(r.WithContext(alternateCtx), userID, profileID, alternateRequest, requestDigests, requestedFile, alternate, alternateAudio, alternateDecision, alternateResult, clientInfo, alternateDecision.substitutionReason)
+							alternateResponse, alternateStatusErr := h.startPlannedPlaybackV3(r.WithContext(alternateCtx), userID, profileID, alternateRequest, requestDigests, requestedFile, alternate, alternateAudio, alternateDecision, alternateResult, clientInfo)
 							logTransportRetryPhasesV3(r.Context(), req.PlaybackAttemptID, alternateStartedAt, alternateRecorder)
 							if alternateStatusErr == nil {
 								return alternateResponse, nil
