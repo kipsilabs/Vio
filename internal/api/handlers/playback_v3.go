@@ -8718,6 +8718,8 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	// (such as browser_engine_unsupported_source), decode errors, and delivery
 	// demotions are not connectivity losses and must continue through route retirement.
 	currentTransportRendered := record.CurrentTransportRendered
+	streamReissued := false
+	subtitleDegraded, audioDegraded, subtitleNotShown := false, false, false
 	progressReissue := operation == playback.ReplanOperationFailureRecoveryV3 &&
 		!intentChange &&
 		!proxyOriginRecovery &&
@@ -8725,9 +8727,9 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		!virtualDecodeRotation &&
 		connectivityFailureClassificationV3(req.Failure.Classification) &&
 		currentTransportRendered &&
-		record.StreamReissues < 1
+		!streamReissued
 	if progressReissue {
-		record.StreamReissues++
+		streamReissued = true
 	}
 	requestedFallbackID := record.EffectiveMediaFileID
 	effectiveFallbackID := record.RequestedMediaFileID
