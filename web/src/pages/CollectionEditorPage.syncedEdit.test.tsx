@@ -369,7 +369,7 @@ describe("server Synced list editor", () => {
     expect(await setMaxTitles("10000")).toHaveValue(10000);
     await save(ADMIN_PATCH);
     expect(patches(ADMIN_PATCH)[0]).toMatchObject({
-      source_config: { mode: "mdblist_json", limit: 100000 },
+      source_config: { mode: "mdblist_json", limit: 10000 },
     });
   });
 

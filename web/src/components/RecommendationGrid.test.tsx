@@ -1,6 +1,7 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { MemoryRouter } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { v2Problem } from "@/api/v2/problems.test-support";
 import RecommendationGrid from "./RecommendationGrid";
 
 const mocks = vi.hoisted(() => ({

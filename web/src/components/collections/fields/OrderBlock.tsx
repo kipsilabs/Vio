@@ -12,6 +12,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { useShownRatingSources } from "@/hooks/queries/ratingsCapability";
+import { COLLECTION_MAX_ITEMS } from "@/lib/collectionTemplates";
 import { COLLECTION_SOURCE_ORDER } from "@/lib/collectionSortConfig";
 import {
   MANUAL_ORDER_LINE,
@@ -233,6 +234,7 @@ function MaxTitlesInput({
         key={limit ?? ""}
         type="number"
         min={1}
+        max={COLLECTION_MAX_ITEMS}
         step={1}
         aria-label="Max titles"
         placeholder={placeholder}
@@ -271,7 +273,8 @@ function SyncedOrder({
   const directions = directionLabels(field);
 
   function commitLimit(input: HTMLInputElement) {
-    const next = parsedLimit(input.value, limit);
+    const typed = parsedLimit(input.value, limit);
+    const next = typed === undefined ? undefined : Math.min(typed, COLLECTION_MAX_ITEMS);
     input.value = next === undefined ? "" : String(next);
     if (next !== limit) onLimitChange(next);
   }
