@@ -3127,6 +3127,10 @@ func (s *Server) handleManifest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "playlist request query too long", http.StatusBadRequest)
 		return
 	}
+	if errors.Is(err, playback.ErrSubtitleRenditionNotFound) {
+		http.NotFound(w, r)
+		return
+	}
 	if err != nil {
 		slog.ErrorContext(r.Context(), "get manifest", "component", "transcodenode", "error", err, "session", sessionID, "playback_session_id", sessionID)
 		http.Error(w, "manifest not ready", http.StatusServiceUnavailable)
