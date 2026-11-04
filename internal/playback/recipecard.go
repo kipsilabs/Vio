@@ -461,6 +461,12 @@ func (c RecipeCard) ToClaims() streamtoken.Claims {
 		case PlayRemux:
 			playMethod = streamtoken.PlayMethodAudioDownmixRemux
 		}
+	} else if len(c.SubtitleRenditionTracks) > 0 {
+		if c.PlayMethod == playMethodCopyFMP4V1 {
+			playMethod = streamtoken.PlayMethodSubtitleRenditionsCopyFMP4
+		} else if c.PlayMethod == PlayTranscode {
+			playMethod = streamtoken.PlayMethodSubtitleRenditionsTranscode
+		}
 	} else if c.PlayMethod == PlayTranscode && c.ToneMapMode != "" {
 		// Older binaries do not understand the frozen tone-map claims. Give
 		// them a method they reject instead of silently reconstructing SDR
@@ -501,42 +507,46 @@ func (c RecipeCard) ToClaims() streamtoken.Claims {
 			}
 			return c.OriginalStartedAt.UnixNano()
 		}(),
-		SourceVideoCodec:           c.SourceVideoCodec,
-		SourceVideoProfile:         c.SourceVideoProfile,
-		SourceVideoBitDepth:        c.SourceVideoBitDepth,
-		SourceAudioChannels:        sourceAudioChannels,
-		SoftwareVideoDecode:        c.SoftwareVideoDecode,
-		ToneMapPolicy:              string(c.ToneMapPolicy),
-		ToneMapMode:                string(c.ToneMapMode),
-		ToneMapSourceKind:          string(c.ToneMapSourceKind),
-		ToneMapRecipeVersion:       c.ToneMapRecipeVersion,
-		CopyFMP4RecipeVersion:      c.CopyFMP4RecipeVersion,
-		ToneMapPreflightRequired:   c.ToneMapPreflightRequired,
-		ToneMapSourceRevision:      c.ToneMapSourceRevision.Encode(),
-		ToneMapDVConfigPresent:     c.ToneMapDVConfigPresent,
-		ToneMapDVBLCompatIDPresent: c.ToneMapDVBLCompatIDPresent,
-		ToneMapDVBLPresent:         c.ToneMapDVBLPresent,
-		ToneMapDVRPUPresent:        c.ToneMapDVRPUPresent,
-		VideoBitstreamFilter:       c.VideoBitstreamFilter,
-		VideoSampleEntry:           c.VideoSampleEntry,
-		CopyVideoMPEGTS:            c.CopyVideoMPEGTS,
-		KeyframePlaylist:           c.KeyframePlaylist,
-		SeekSeconds:                c.SeekSeconds,
-		StreamOriginSeconds:        c.StreamOriginSeconds,
-		CopySeekAnchorResolved:     c.CopySeekAnchorResolved,
-		SegmentDuration:            c.SegmentDuration,
-		StartSegmentNumber:         c.StartSegmentNumber,
-		SubtitleTrackIndex:         c.SubtitleTrackIndex,
-		SubtitleBurnIn:             c.SubtitleBurnIn,
-		SubtitleCodec:              c.SubtitleCodec,
-		SubtitleRendition:          c.SubtitleRendition,
-		TargetBitrateKbps:          c.TargetBitrateKbps,
-		TotalDuration:              c.TotalDuration,
-		FastStart:                  c.FastStart,
-		ThrottleSeconds:            c.ThrottleSeconds,
-		TargetCodecAudio:           c.TargetCodecAudio,
-		TargetAudioChannels:        targetAudioChannels,
-		TargetAudioBitrateKbps:     c.TargetAudioBitrateKbps,
+		SourceVideoCodec:               c.SourceVideoCodec,
+		SourceVideoProfile:             c.SourceVideoProfile,
+		SourceVideoBitDepth:            c.SourceVideoBitDepth,
+		SourceAudioChannels:            sourceAudioChannels,
+		SoftwareVideoDecode:            c.SoftwareVideoDecode,
+		ToneMapPolicy:                  string(c.ToneMapPolicy),
+		ToneMapMode:                    string(c.ToneMapMode),
+		ToneMapSourceKind:              string(c.ToneMapSourceKind),
+		ToneMapRecipeVersion:           c.ToneMapRecipeVersion,
+		CopyFMP4RecipeVersion:          c.CopyFMP4RecipeVersion,
+		ToneMapPreflightRequired:       c.ToneMapPreflightRequired,
+		ToneMapSourceRevision:          c.ToneMapSourceRevision.Encode(),
+		ToneMapDVConfigPresent:         c.ToneMapDVConfigPresent,
+		ToneMapDVBLCompatIDPresent:     c.ToneMapDVBLCompatIDPresent,
+		ToneMapDVBLPresent:             c.ToneMapDVBLPresent,
+		ToneMapDVRPUPresent:            c.ToneMapDVRPUPresent,
+		VideoBitstreamFilter:           c.VideoBitstreamFilter,
+		VideoSampleEntry:               c.VideoSampleEntry,
+		CopyVideoMPEGTS:                c.CopyVideoMPEGTS,
+		KeyframePlaylist:               c.KeyframePlaylist,
+		SeekSeconds:                    c.SeekSeconds,
+		StreamOriginSeconds:            c.StreamOriginSeconds,
+		CopySeekAnchorResolved:         c.CopySeekAnchorResolved,
+		SegmentDuration:                c.SegmentDuration,
+		StartSegmentNumber:             c.StartSegmentNumber,
+		SubtitleTrackIndex:             c.SubtitleTrackIndex,
+		SubtitleBurnIn:                 c.SubtitleBurnIn,
+		SubtitleCodec:                  c.SubtitleCodec,
+		SubtitleRendition:              c.SubtitleRendition,
+		SubtitleRenditionTracks:        subtitleRenditionTrackNumbers(c.SubtitleRenditionTracks),
+		SubtitleRenditionDefault:       subtitleRenditionDefaultTrack(c.SubtitleRenditionTracks),
+		SubtitleRenditionSourceSize:    c.SubtitleRenditionSource.Size,
+		SubtitleRenditionSourceModTime: c.SubtitleRenditionSource.ModTimeUnixNano,
+		TargetBitrateKbps:              c.TargetBitrateKbps,
+		TotalDuration:                  c.TotalDuration,
+		FastStart:                      c.FastStart,
+		ThrottleSeconds:                c.ThrottleSeconds,
+		TargetCodecAudio:               c.TargetCodecAudio,
+		TargetAudioChannels:            targetAudioChannels,
+		TargetAudioBitrateKbps:         c.TargetAudioBitrateKbps,
 	}
 }
 
