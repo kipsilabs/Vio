@@ -184,6 +184,7 @@ type subtitleCueSpan struct {
 	file      string
 	start     int
 	startTime float64
+	startTime float64
 	durations []float64
 	final     bool
 	muxShift  float64
