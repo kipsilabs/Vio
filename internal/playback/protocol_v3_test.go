@@ -61,6 +61,7 @@ func TestServerFeaturesV3ReturnsIndependentSlices(t *testing.T) {
 		FeatureDefaultAudioReconcileResponseV3:   {},
 		FeaturePlanSourceDurationV3:              {},
 		FeatureOutputDisplayEvidenceV3:           {},
+		FeatureAudioTrackUnverifiedV3:            {},
 	}
 	for feature := range expected {
 		if !HasFeatureV3(first, feature) {
