@@ -3137,6 +3137,8 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 			requestedSegment = n
 		} else if n, ok := playback.ParseSubtitleSegmentNumber(name); ok {
 			requestedSegment = n
+		} else if _, n, ok := playback.ParseSubtitleTrackSegment(name); ok {
+			requestedSegment = n
 		}
 		var reconstructErr error
 		session, reconstructErr = s.reconstructFromToken(r, sessionID, requestedSegment)
@@ -3158,7 +3160,7 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 	}
 	s.attachTelemetrySession(r, sessionID)
 
-	if _, ok := playback.ParseSubtitleSegmentNumber(name); ok {
+	if _, ok := playback.ParseSubtitleSegmentNumber(name); ok || func() bool { _, _, ok := playback.ParseSubtitleTrackSegment(name); return ok }() {
 		// Subtitle rendition segments never wait out or restart the video
 		// pipeline: they are answered from the cues already on disk.
 		session.ServeSubtitleSegment(w, r, name)

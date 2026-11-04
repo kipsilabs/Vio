@@ -232,6 +232,11 @@ func subtitleTrackSegmentPrefix(number uint64) string {
 
 // parseSubtitleTrackSegment parses an on-demand rendition segment name,
 // sub_<track>_<segment>.vtt.
+// ParseSubtitleTrackSegment parses an on-demand rendition segment name.
+func ParseSubtitleTrackSegment(name string) (number uint64, segNum int, ok bool) {
+	return parseSubtitleTrackSegment(name)
+}
+
 func parseSubtitleTrackSegment(name string) (number uint64, segNum int, ok bool) {
 	rest, ok := strings.CutPrefix(name, subtitleSegmentPrefix)
 	if !ok {

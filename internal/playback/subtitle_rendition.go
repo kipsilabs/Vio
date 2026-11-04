@@ -470,12 +470,18 @@ func (s *TranscodeSession) readOutputFile(name string) ([]byte, error) {
 
 // ServeSubtitleSegment writes the named subtitle segment.
 func (s *TranscodeSession) ServeSubtitleSegment(w http.ResponseWriter, r *http.Request, name string) {
-	segNum, err := ParseSegmentNumber(name)
-	if err != nil {
-		http.NotFound(w, r)
-		return
+	var body []byte
+	var err error
+	if track, segNum, ok := parseSubtitleTrackSegment(name); ok {
+		body, err = s.subtitleTrackSegmentVTT(r.Context(), track, segNum)
+	} else {
+		segNum, parseErr := ParseSubtitleSegmentNumber(name)
+		if parseErr != nil {
+			http.NotFound(w, r)
+			return
+		}
+		body, err = s.SubtitleSegmentVTT(r.Context(), segNum)
 	}
-	body, err := s.SubtitleSegmentVTT(r.Context(), segNum)
 	if err != nil && r.Context().Err() != nil {
 		return
 	}
