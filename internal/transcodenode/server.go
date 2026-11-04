@@ -2279,7 +2279,18 @@ func (s *Server) reconstructFromToken(r *http.Request, sessionID string, request
 			if fetched, ok := s.recipeStore.Get(r.Context(), sessionID); ok && fetched != nil &&
 				fetched.SubtitleRenditionSource == resolved.SubtitleRenditionSource &&
 				fetched.UserID == resolved.UserID && len(fetched.SubtitleRenditionTracks) == len(resolved.SubtitleRenditionTracks) {
-				resolved.SubtitleRenditionTracks = slices.Clone(fetched.SubtitleRenditionTracks)
+				// Claims are authoritative for rendition identity and playback
+				// semantics (order, track number, forced/default flags). The stored
+				// card may add descriptive fields, but must not rewrite those
+				// authority-bearing values during reconstruction.
+				tracks := slices.Clone(resolved.SubtitleRenditionTracks)
+				for i := range tracks {
+					tracks[i].StreamIndex = fetched.SubtitleRenditionTracks[i].StreamIndex
+					tracks[i].Codec = fetched.SubtitleRenditionTracks[i].Codec
+					tracks[i].Name = fetched.SubtitleRenditionTracks[i].Name
+					tracks[i].Language = fetched.SubtitleRenditionTracks[i].Language
+				}
+				resolved.SubtitleRenditionTracks = tracks
 			}
 		}
 		return s.spawnReconstruct(r, sessionID, requestedSegment, resolved)
