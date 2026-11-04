@@ -2187,7 +2187,28 @@ func (h *PlaybackHandler) recordStartingDevice(ctx context.Context, userID int, 
 // reason another version can avoid and the request allows other versions, the
 // first authorized version of alternateBase that plans replaces it, with the
 // warnings that choice adds.
-func (h *PlaybackHandler) planStartV3(r *http.Request, req playback.StartRequestV3, requestedFile, alternateBase, effectiveFile *models.MediaFile, audioIndex int, settings playback.PlannerSettingsV3, lowerVersion *playback.LowerVersionV3) (alternateCandidateV3, []playback.DegradationWarningV3) {
+func (h *PlaybackHandler) planStartV3(r *http.Request, req playback.StartRequestV3, requestedFile, alternateBase, effectiveFile *models.MediaFile, audioIndex int, settings playback.PlannerSettingsV3, lowerVersion *playback.LowerVersionV3, profileID string) (alternateCandidateV3, []playback.DegradationWarningV3) {
+	resolutionProvenance := ProbeProvenance("")
+	enqueueDeferredPostCommitProbe := func(sessionID string) {
+		if deferredProbe != nil {
+			deferredProbe.sessionID = sessionID
+			h.enqueueDeferredVirtualProbeV3(r.Context(), deferredProbe)
+		}
+	}
+	subtitleInventoryByFileID := map[int][]playback.SubtitleInventoryEntryV3{}
+	subtitleInventoryFor := func(file *models.MediaFile) []playback.SubtitleInventoryEntryV3 {
+		if file == nil {
+			return nil
+		}
+		if inventory, ok := subtitleInventoryByFileID[file.ID]; ok {
+			return inventory
+		}
+		inventory := h.downloadedSubtitleInventoryV3(r.Context(), file)
+		if file.ID != 0 {
+			subtitleInventoryByFileID[file.ID] = inventory
+		}
+		return inventory
+	}
 	input := playback.PlannerInputV3{
 		Request: req, RequestedFile: requestedFile, EffectiveFile: effectiveFile, LowerVersion: lowerVersionForFileV3(lowerVersion, effectiveFile),
 		ServerBitrateCapKbps: serverBitrateCapV3(r.Context()),
@@ -2427,6 +2448,24 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusBadRequest, "bad_request", "profile_id must match X-Profile-Id")
 	}
 	userID := apimw.GetUserID(r.Context())
+	catalogRequestedFile := (*models.MediaFile)(nil)
+	resolutionProvenance := ProbeProvenance("")
+	virtualDecision := virtualPlanDecisionV3{candidateCount: -1}
+	var deferredProbe *virtualDeferredProbeV3
+	subtitleInventoryByFileID := map[int][]playback.SubtitleInventoryEntryV3{}
+	subtitleInventoryFor := func(file *models.MediaFile) []playback.SubtitleInventoryEntryV3 {
+		if file == nil {
+			return nil
+		}
+		if v, ok := subtitleInventoryByFileID[file.ID]; ok {
+			return v
+		}
+		v := h.downloadedSubtitleInventoryV3(r.Context(), file)
+		if file.ID != 0 {
+			subtitleInventoryByFileID[file.ID] = v
+		}
+		return v
+	}
 	deviceID := deviceMetadataFromRequest(r).DeviceID
 	requestDigests := newPlaybackStartRequestDigestsV3(body, deviceID)
 	if existing, lookupErr := h.PlanStoreV3.GetAttemptByPlaybackAttemptID(r.Context(), req.PlaybackAttemptID); lookupErr == nil {
@@ -2568,7 +2607,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		audioIndex = h.playableStartAudioV3(r.Context(), req, requestedFile, effectiveFile, remapAudioIndexV3(requestedFile, effectiveFile, preferredAudio), settings)
 	}
 	lowerVersion := h.lowerVersionV3(r.Context(), req, alternateBase, settings, requestAccessFilter(r))
-	planned, fallbackWarnings := h.planStartV3(r, req, requestedFile, alternateBase, effectiveFile, audioIndex, settings, lowerVersion)
+	planned, fallbackWarnings := h.planStartV3(r, req, requestedFile, alternateBase, effectiveFile, audioIndex, settings, lowerVersion, profileID)
 	req, effectiveFile, audioIndex = planned.request, planned.file, planned.audioIndex
 	warnings = append(warnings, fallbackWarnings...)
 	timings.mark("planning")
@@ -2633,14 +2672,15 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		// nothing.
 		readingErr := h.applyConnectionReading(r, &unlimitedReq)
 		unlimitedFile, unlimitedReq, unlimitedAudioIndex = h.lowerBufferedVersion(r, unlimitedReq, unlimitedFile, unlimitedAudioIndex, settings)
-		unlimited, _ := h.planStartV3(r, unlimitedReq, requestedFile, alternateBase, unlimitedFile, unlimitedAudioIndex, settings, lowerVersion)
+		unlimited, _ := h.planStartV3(r, unlimitedReq, requestedFile, alternateBase, unlimitedFile, unlimitedAudioIndex, settings, lowerVersion, profileID)
 		if readingErr != nil || unlimited.result.Plan == nil || deliveredKbpsV3(result.Plan) >= deliveredKbpsV3(unlimited.result.Plan) {
 			result.Plan.BandwidthLimit = nil
 		}
 		timings.mark("unlimited_planning")
 	}
 	appendStartWarningsV3(&result, warnings)
-	response, statusErr := h.startPlannedPlaybackV3(r, userID, profileID, req, requestDigests, requestedFile, effectiveFile, audioIndex, intent, result, clientInfo)
+	phasesCtx, phaseTimings := withTransportPhaseTimingsV3(r.Context())
+	response, statusErr := h.startPlannedPlaybackV3(r.WithContext(phasesCtx), userID, profileID, req, requestDigests, requestedFile, effectiveFile, audioIndex, intent, result, clientInfo)
 	timings.mark("session_transport_commit")
 	timings.observeTransportPhasesV3(phaseTimings)
 	if statusErr != nil {
@@ -2691,7 +2731,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 				// without disturbing the first attempt's composite line.
 				retryPhasesCtx, retryRecorder := withTransportPhaseTimingsV3(retryCtx)
 				retryStartedAt := time.Now()
-				retryResponse, retryStatusErr := h.startPlannedPlaybackV3(r.WithContext(retryPhasesCtx), userID, profileID, req, requestDigests, requestedFile, effectiveFile, audioIndex, virtualDecision, result, clientInfo)
+				retryResponse, retryStatusErr := h.startPlannedPlaybackV3(r.WithContext(retryPhasesCtx), userID, profileID, req, requestDigests, requestedFile, effectiveFile, audioIndex, intent, result, clientInfo)
 				logTransportRetryPhasesV3(r.Context(), req.PlaybackAttemptID, retryStartedAt, retryRecorder)
 				return retryResponse, retryStatusErr
 			}); retried {
@@ -2773,7 +2813,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 								alternateCtx = withSubtitleRotationOutcomeV3(alternatePhasesCtx, carryDecision.outcome)
 							}
 							alternateStartedAt := time.Now()
-							alternateResponse, alternateStatusErr := h.startPlannedPlaybackV3(r.WithContext(alternateCtx), userID, profileID, alternateRequest, requestDigests, requestedFile, alternate, alternateAudio, alternateDecision, alternateResult, clientInfo)
+							alternateResponse, alternateStatusErr := h.startPlannedPlaybackV3(r.WithContext(alternateCtx), userID, profileID, alternateRequest, requestDigests, requestedFile, alternate, alternateAudio, startIntentV3{audioIndex: alternateAudio}, alternateResult, clientInfo)
 							logTransportRetryPhasesV3(r.Context(), req.PlaybackAttemptID, alternateStartedAt, alternateRecorder)
 							if alternateStatusErr == nil {
 								return alternateResponse, nil
@@ -2812,6 +2852,13 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 			return playback.DecisionResponseV3{}, playbackPersistenceOperationError(persistErr)
 		}
 		return persistedResponse, nil
+	}
+	enqueueDeferredPostCommitProbe := func(sessionID string) {
+		if deferredProbe == nil {
+			return
+		}
+		deferredProbe.sessionID = sessionID
+		h.enqueueDeferredVirtualProbeV3(r.Context(), deferredProbe)
 	}
 	// The transport has committed and the first-byte URL is on the response.
 	// The fresh-start resolve deferred its full audio/subtitle enumeration, so
@@ -3643,6 +3690,16 @@ func appendStartWarningsV3(result *playback.PlannerResultV3, warnings []playback
 		result.Plan.DegradationWarnings = append(result.Plan.DegradationWarnings, warning)
 	}
 }
+
+// annotateSubtitleDroppedV3 records a successful subtitle degradation.
+func annotateSubtitleDroppedV3(result *playback.PlannerResultV3) {
+	if result == nil || result.Terminal != nil || result.Plan == nil {
+		return
+	}
+	result.Plan.DegradationWarnings = append(result.Plan.DegradationWarnings, playback.DegradationWarningV3{Code: subtitleDroppedUnavailableCodeV3, Message: "The selected subtitle is unavailable on this release; playback continues without it on the same release."})
+}
+
+var errOfferedCandidateUnavailable = errors.New("offered candidate unavailable")
 
 // startPlannedPlaybackV3 creates a session and transport for an accepted plan.
 func (h *PlaybackHandler) startPlannedPlaybackV3(r *http.Request, userID int, profileID string, req playback.StartRequestV3, requestDigests playbackStartRequestDigestsV3, requestedFile, effectiveFile *models.MediaFile, audioIndex int, intent startIntentV3, result playback.PlannerResultV3, clientInfo playback.ClientInfo) (playback.DecisionResponseV3, *transportErrorV3) {
