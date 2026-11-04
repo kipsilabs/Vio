@@ -78,6 +78,7 @@ type Session struct {
 	DVProfilePin     DVPinV3
 	ClientIP         string // resolved client IP for the playback session
 	DeviceID         string // client installation identifier, when available
+	DevicePlatform   string // client platform declaration, when available
 	StreamLocation   string // local/remote policy classification fixed at playback negotiation
 	ClientName       string // reported playback client name, when available
 	ClientVersion    string // reported playback client version, when available
@@ -614,6 +615,11 @@ func ClientInfoFromContext(ctx context.Context) ClientInfo {
 }
 
 // SessionManager tracks active playback sessions and enforces stream limits.
+type LifecycleHooks struct {
+	Started       func(context.Context, *Session, string)
+	PauseReported func(context.Context, string, bool)
+}
+
 type SessionManager struct {
 	sessions             map[string]*Session
 	mu                   sync.RWMutex
@@ -625,6 +631,7 @@ type SessionManager struct {
 	pausedGrace          time.Duration
 	expireHooks          []func(*Session)
 	finishHooks          []func(context.Context, *Session)
+	lifecycleHooks       []LifecycleHooks
 	compatActivityReader SessionActivityReader
 	compatExpiryClaimer  SessionExpiryClaimer
 	// deliveryActivityReader reports media that another node served for a
@@ -769,6 +776,12 @@ func (m *SessionManager) AddExpirationHook(fn func(*Session)) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.expireHooks = append(m.expireHooks, fn)
+}
+
+func (m *SessionManager) AddLifecycleHooks(h LifecycleHooks) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.lifecycleHooks = append(m.lifecycleHooks, h)
 }
 
 // AddFinishHook registers a callback that runs after FinishSession removes a

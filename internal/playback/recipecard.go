@@ -22,6 +22,7 @@ import (
 // live config and request.
 type RecipeCard struct {
 	DeviceID                         string    `json:"device_id,omitempty"`
+	DevicePlatform                   string    `json:"device_platform,omitempty"`
 	SessionID                        string    `json:"session_id"`
 	UserID                           int       `json:"user_id"`
 	ProfileID                        string    `json:"profile_id"`
@@ -128,6 +129,7 @@ type RecipeCard struct {
 	SourceHeight            int                      `json:"source_height,omitempty"`
 	TargetCodecVideo        string                   `json:"target_codec_video,omitempty"`
 	TargetCodecAudio        string                   `json:"target_codec_audio,omitempty"`
+	CopyAudioCodec          string                   `json:"copy_audio_codec,omitempty"`
 	TargetAudioChannels     int                      `json:"target_audio_channels,omitempty"`
 	TargetAudioBitrateKbps  int                      `json:"target_audio_bitrate_kbps,omitempty"`
 	SegmentDuration         int                      `json:"segment_duration"`
