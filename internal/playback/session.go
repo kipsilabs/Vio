@@ -3338,10 +3338,13 @@ func (m *SessionManager) FinishDetached(ctx context.Context, s Session) {
 	}
 }
 
-// GetSession returns the session with the given ID, or ErrSessionNotFound.
+// PlaybackEndReason describes why a playback session ended.
+// The empty value means no explicit reason was supplied.
+type PlaybackEndReason string
+
 // EndReasonReplaced is the end reason of a session another one replaced
 // mid-play: a Jellyfin client switched play method.
-const EndReasonReplaced = "replaced"
+const EndReasonReplaced PlaybackEndReason = "replaced"
 
 type endReasonKey struct{}
 type detachedFinishKey struct{}
