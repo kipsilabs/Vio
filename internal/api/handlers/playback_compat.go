@@ -1,38 +1,23 @@
 package handlers
 
 import (
-	"context"
-	"github.com/Silo-Server/silo-server/internal/models"
-	"github.com/Silo-Server/silo-server/internal/playback"
 	"net/http"
 	"time"
+
+	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/playback"
 )
 
+// audioStreamOrdinalV3 translates a selected audio track's array position in
+// file.AudioTracks to the audio-only stream ordinal ffmpeg's `0:a:N` expects.
+// It delegates to the shared playback.AudioStreamOrdinal so v3 and jellycompat
+// convert through one implementation; see that function for the two index
+// domains and the synthesized-track fallback.
 func audioStreamOrdinalV3(file *models.MediaFile, selected int) int {
-	if file == nil || selected < 0 || selected >= len(file.AudioTracks) {
-		return -1
-	}
-	tracks := file.AudioTracks
-	known := false
-	for _, t := range tracks {
-		if t.Index > 0 {
-			known = true
-			break
-		}
-	}
-	if !known {
+	if file == nil {
 		return selected
 	}
-	ordinal := 0
-	for i, t := range tracks {
-		if i == selected {
-			return ordinal
-		}
-		if t.Index > 0 {
-			ordinal++
-		}
-	}
-	return -1
+	return playback.AudioStreamOrdinal(file.AudioTracks, selected)
 }
 
 func subtitleInventoryWaitBlockerV3(session *playback.Session, file *models.MediaFile) string {
@@ -49,21 +34,6 @@ func subtitleInventoryWaitBlockerV3(session *playback.Session, file *models.Medi
 		return subtitleWaitBlockerRelay
 	}
 	return subtitleWaitBlockerStale
-}
-
-func (h *PlaybackHandler) carrySubtitleFromPlanV3(ctx context.Context, req *playback.StartRequestV3, plan playback.PlanV3, file *models.MediaFile) bool {
-	if req == nil || file == nil || plan.SelectedTracks.Subtitle == nil {
-		return false
-	}
-	item := plan.SelectedTracks.Subtitle
-	if item.Index != nil {
-		inv := playback.BuildSubtitleInventoryV3(file, nil)
-		if *item.Index >= 0 && *item.Index < len(inv) && inv[*item.Index].Source == playback.SubtitleSourceEmbeddedV3 {
-			req.SubtitleTrackIndex = item.Index
-			return false
-		}
-	}
-	return true
 }
 
 func (h *PlaybackHandler) degradeStartSubtitleInPlaceV3(r *http.Request, req playback.StartRequestV3, requested, effective *models.MediaFile, audio int, settings playback.PlannerSettingsV3, provenance ProbeProvenance) (playback.StartRequestV3, playback.PlannerResultV3, error, bool) {

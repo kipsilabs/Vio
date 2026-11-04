@@ -4176,7 +4176,18 @@ func applyProbeData(mf *models.MediaFile, probe *ProbeData, probeSource string) 
 	mf.Container = probe.Container
 	mf.Duration = probe.Duration
 	mf.Bitrate = probe.Bitrate
+	if mf.Bitrate <= 0 && mf.Duration > 0 && mf.FileSize > 0 {
+		// ffprobe legitimately omits format.bit_rate for some containers. Size
+		// over duration is a conservative upper bound (it counts every stream
+		// plus container overhead) and satisfies the playback planner's
+		// completeness gate; without it such rows fail planning forever while
+		// looking healthy to NeedsCriticalProbeRepair. The walk always knows
+		// FileSize before this runs, so every reprobe of a flagged row
+		// converges instead of looping.
+		mf.Bitrate = int(impliedBitrateBps(mf.FileSize, float64(mf.Duration)) / 1000)
+	}
 	mf.ProbeSource = probeSource
+	mf.ProbeVersion = probeVersion
 
 	now := time.Now().UTC()
 	mf.ProbeUpdatedAt = &now
@@ -4223,9 +4234,11 @@ func applyProbeData(mf *models.MediaFile, probe *ProbeData, probeSource string) 
 	audioTracks := make([]models.AudioTrack, len(probe.AudioTracks))
 	for i, at := range probe.AudioTracks {
 		audioTracks[i] = models.AudioTrack{
+			Index:         at.Index,
 			Title:         at.Title,
 			EmbeddedTitle: at.EmbeddedTitle,
 			Language:      at.Language,
+			Languages:     append([]string(nil), at.Languages...),
 			Codec:         at.Codec,
 			Profile:       at.Profile,
 			Layout:        at.Layout,

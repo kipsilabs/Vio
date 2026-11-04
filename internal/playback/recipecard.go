@@ -597,6 +597,7 @@ func (c RecipeCard) ToClaims() streamtoken.Claims {
 		FastStart:                      c.FastStart,
 		ThrottleSeconds:                c.ThrottleSeconds,
 		TargetCodecAudio:               c.TargetCodecAudio,
+		CopyAudioCodec:                 c.CopyAudioCodec,
 		TargetAudioChannels:            targetAudioChannels,
 		TargetAudioBitrateKbps:         c.TargetAudioBitrateKbps,
 	}
@@ -685,6 +686,7 @@ func RecipeCardFromClaims(c *streamtoken.Claims) RecipeCard {
 		SourceHeight:                     c.SourceHeight,
 		TargetCodecVideo:                 c.TargetCodec,
 		TargetCodecAudio:                 c.TargetCodecAudio,
+		CopyAudioCodec:                   c.CopyAudioCodec,
 		TargetAudioChannels:              c.TargetAudioChannels,
 		TargetAudioBitrateKbps:           c.TargetAudioBitrateKbps,
 		SegmentDuration:                  c.SegmentDuration,
