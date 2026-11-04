@@ -1321,6 +1321,20 @@ func videoToolboxProbeCacheKey(execPath string) string {
 	return strconv.FormatUint(hwProbeGeneration(), 10) + "\x00" + execPath + "\x00" + ffmpegIdentityKey(execPath)
 }
 
+// SoftwareFallbackGPUOnly is the playback.software_fallback policy value that
+// forbids the server from starting any automated CPU-decode fallback. It lives
+// in the playback domain so every surface that can silently choose software
+// decode compares against the same spelling.
+const SoftwareFallbackGPUOnly = "gpu_only"
+
+// SoftwareFallbackAllowed reports whether a playback.software_fallback policy
+// value permits an automated software-decode fallback. The empty string is the
+// default "allow", matching config loading, so a zero-value TranscodeOpts or
+// PlaybackConfig never disables fallback by accident.
+func SoftwareFallbackAllowed(value string) bool {
+	return !strings.EqualFold(strings.TrimSpace(value), SoftwareFallbackGPUOnly)
+}
+
 // StartupRetryHWAccel returns the acceleration for the single retry after a
 // transcode dies before producing its first segment. VideoToolbox has no
 // alternate render device to move to, so an ordinary encode retries on the
