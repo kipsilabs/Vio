@@ -20,6 +20,12 @@ export interface KeptReading {
    * it is for the connection the server saw.
    */
   network?: string;
+  /**
+   * Playback could not sustain `kbps` on this connection. An observed limit
+   * lowers what a later start or replan plans for; it is not a measurement of
+   * its own.
+   */
+  observed?: boolean;
 }
 
 /**
@@ -60,7 +66,8 @@ function parseStored(raw: string | null | undefined): StoredEntry | undefined {
         typeof reading?.kbps === "number" &&
         typeof reading.measuredAt === "number" &&
         typeof reading.maxAgeMs === "number" &&
-        (reading.network === undefined || typeof reading.network === "string"),
+        (reading.network === undefined || typeof reading.network === "string") &&
+        (reading.observed === undefined || typeof reading.observed === "boolean"),
     );
     return { readings, writtenAt: parsed.writtenAt };
   } catch {
@@ -123,11 +130,41 @@ export function forgetServerReadings(): void {
 
 /** The highest current reading in kbps, for a playback start to send. */
 export function readMeasuredBandwidthKbps(now = Date.now()): number | undefined {
-  return bestKeptKbps(
-    readStored()?.readings ?? [],
+  const readings = readStored()?.readings ?? [];
+  const measured = bestKeptKbps(
+    readings.filter((reading) => !reading.observed),
     now,
     (reading) => reading.network !== undefined || serverReadingConfirmed,
   );
+  const observed = bestKeptKbps(
+    readings.filter((reading) => reading.observed),
+    now,
+  );
+  if (observed === undefined) return measured;
+  // A limit playback observed lowers what the next plan may assume.
+  return measured === undefined ? observed : Math.min(measured, observed);
+}
+
+/** How long a limit playback observed steers later starts and replans. */
+const OBSERVED_LIMIT_MAX_AGE_MS = 30 * 60 * 1000;
+
+/**
+ * Records that playback could not sustain `kbps`. The kept limit only ever
+ * moves down this way, so later starts and replans plan for the slower link
+ * instead of the optimistic probe.
+ */
+export function recordObservedBandwidthLimitKbps(kbps: number, now = Date.now()): void {
+  if (!withinProbeBounds(kbps)) return;
+  const readings = readStored()?.readings ?? [];
+  const previous = bestKeptKbps(
+    readings.filter((reading) => reading.observed),
+    now,
+  );
+  const limit = previous === undefined ? kbps : Math.min(kbps, previous);
+  writeStored([
+    ...readings.filter((reading) => !reading.observed),
+    { kbps: limit, measuredAt: now, maxAgeMs: OBSERVED_LIMIT_MAX_AGE_MS, observed: true },
+  ]);
 }
 
 /**

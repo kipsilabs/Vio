@@ -31,7 +31,11 @@ import type { ProbeMode, ProbeResult } from "./probe-meter";
  * are kept (bandwidth-readings.ts) so playback starts can read them at once.
  */
 
-export { forgetBandwidthEstimate, readMeasuredBandwidthKbps } from "./bandwidth-readings";
+export {
+  forgetBandwidthEstimate,
+  readMeasuredBandwidthKbps,
+  recordObservedBandwidthLimitKbps,
+} from "./bandwidth-readings";
 export { ProbeRateLimited } from "./bandwidth-measure";
 export { networkInformation } from "./network-information";
 
