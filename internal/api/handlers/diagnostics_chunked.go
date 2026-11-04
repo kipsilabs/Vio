@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -109,6 +110,10 @@ type diagnosticsChunkOwner struct {
 }
 
 func newDiagnosticsChunkSessions(spoolDir string) *diagnosticsChunkSessions {
+	// Test and development callers commonly provide an already-created temp
+	// directory (whose default mode is 0755). Upload roots must be private so
+	// the manager's ownership check can safely protect spooled session data.
+	_ = os.Chmod(spoolDir, 0o700)
 	sessions := &diagnosticsChunkSessions{
 		manager: uploads.NewManager(uploads.ManagerOptions{
 			RootDir:      spoolDir,
