@@ -150,6 +150,12 @@ func downloadCollectionImageURL(ctx context.Context, client *http.Client, rawURL
 	if parsed.Hostname() == "" {
 		return nil, invalidCollectionImage("The image source URL is not valid.", nil)
 	}
+	if err := netguard.CheckURL(ctx, parsed.String(), netguard.PrivateAccess(ctx)); err != nil {
+		if errors.Is(err, netguard.ErrPrivateDestination) || errors.Is(err, netguard.ErrBlockedDestination) {
+			return nil, errCollectionImageSourceNotAllowed
+		}
+		return nil, err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
 	if err != nil {
 		return nil, fmt.Errorf("building request: %w", err)
@@ -485,15 +491,16 @@ func (c collectionCollageComposer) CollectionCollagePath(collectionID, key strin
 // artworkurl.FetchContext tells those apart, and netguard refuses blocked
 // addresses either way.
 func (c collectionCollageComposer) fetchImage(ctx context.Context, imageURL string) ([]byte, error) {
-	if c.store != nil && c.signer != nil {
-		if key, ok := c.signer.SignedKey(imageURL, time.Now()); ok {
-			body, _, err := c.store.Get(ctx, key)
-			if err != nil {
-				return nil, fmt.Errorf("reading stored poster: %w", err)
-			}
-			defer func() { _ = body.Close() }()
-			return io.ReadAll(io.LimitReader(body, collectionImageMaxBytes))
+	if isRootRelativeURL(imageURL) {
+		key, ok := c.storedArtworkKey(imageURL, time.Now())
+		if !ok {
+			return nil, c.localSourceError(imageURL)
 		}
+		data, err := c.readStoredImage(ctx, key)
+		if err != nil {
+			return nil, fmt.Errorf("reading stored poster: %w", err)
+		}
+		return data, nil
 	}
 	if c.httpClient == nil {
 		return nil, errors.New("collage downloads have no HTTP client")
