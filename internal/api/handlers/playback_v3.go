@@ -8519,6 +8519,47 @@ func (h *PlaybackHandler) previousAudioTracksV3(ctx context.Context, previous *p
 	return prior.AudioTracks
 }
 
+// degradeStartAudioInPlaceV3 re-plans a fresh start's effective file with a
+// different audio track when the selected one cannot be adapted. It is the
+// audio counterpart of degradeStartSubtitleInPlaceV3: an audio problem must be
+// resolved on the release already mounted, never by rotating the video
+// candidate. The effective file is planned verbatim, so a virtual release is
+// never re-resolved or substituted. An explicit audio pick is left untouched: a
+// viewer's track choice surfaces its failure instead of being silently
+// overridden. It reports false when no alternative track yields a playable plan.
+func (h *PlaybackHandler) degradeStartAudioInPlaceV3(
+	r *http.Request,
+	req playback.StartRequestV3,
+	requestedFile, effectiveFile *models.MediaFile,
+	currentAudioIndex int,
+	settings playback.PlannerSettingsV3,
+	provenance ProbeProvenance,
+) (playback.StartRequestV3, int, playback.PlannerResultV3, error, bool) {
+	if req.AudioTrackID != "" || req.AudioTrackIndex != nil {
+		return req, currentAudioIndex, playback.PlannerResultV3{}, nil, false
+	}
+	for _, index := range inPlaceAudioCandidateOrderV3(req, effectiveFile, currentAudioIndex) {
+		degradedReq := audioDegradedStartV3(req, effectiveFile, index)
+		degradedResult, degradedToneMapErr := h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{
+			Request: degradedReq, RequestedFile: requestedFile, EffectiveFile: effectiveFile,
+			AudioTrackIndex: index, Settings: settings,
+			Registry:            h.transformationRegistryV3(r.Context()),
+			DVRPUStrippable:     h.lazyDVRPUStrippableV3(r.Context(), effectiveFile),
+			Now:                 time.Now(),
+			AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), effectiveFile),
+			// The degraded plan serves the same release with another audio
+			// track, so it keeps the selected source's provenance.
+			InventoryProvenance: string(provenance),
+		})
+		clampPlannerTargetResolution(&degradedResult, effectiveFile)
+		if degradedResult.Terminal == nil {
+			annotateAudioTrackSubstitutedV3(&degradedResult, index)
+			return degradedReq, index, degradedResult, degradedToneMapErr, true
+		}
+	}
+	return req, currentAudioIndex, playback.PlannerResultV3{}, nil, false
+}
+
 func (h *PlaybackHandler) evaluateAudioDegradeInPlaceV3(
 	r *http.Request,
 	session *playback.Session,
