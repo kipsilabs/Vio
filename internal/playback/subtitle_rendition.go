@@ -139,7 +139,7 @@ func (s *TranscodeSession) subtitleSegmentPlacementKnown(span subtitleCueSpan, s
 }
 
 func subtitleRenditionActive(opts TranscodeOpts) bool {
-	return opts.SubtitleRendition && opts.SubtitleTrackIndex >= 0 && !opts.SubtitleBurnIn &&
+	return opts.SubtitleRendition && (opts.SubtitleTrackIndex >= 0 || len(opts.SubtitleRenditionTracks) > 0) && !opts.SubtitleBurnIn &&
 		SubtitleRenditionCodecSupported(opts.SubtitleCodec) &&
 		SubtitleRenditionExecutable(opts.TargetCodecVideo, opts.SourceVideoCodec, opts.TotalDuration, opts.SegmentDuration)
 }

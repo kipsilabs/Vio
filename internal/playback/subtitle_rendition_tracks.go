@@ -315,7 +315,7 @@ func hlsLanguage(language string) string {
 // serves: 0 without them, or when its recipe can't carry a rendition at all.
 func (s *TranscodeSession) SubtitleRenditionTrackCount() int {
 	opts := s.Opts()
-	if !subtitleRenditionActive(opts) {
+	if !opts.SubtitleRendition || len(opts.SubtitleRenditionTracks) == 0 {
 		return 0
 	}
 	return len(opts.SubtitleRenditionTracks)
