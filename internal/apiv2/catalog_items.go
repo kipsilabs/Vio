@@ -19,6 +19,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/imagesize"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/ratingsources"
+	"github.com/Silo-Server/silo-server/internal/themesongs"
 )
 
 // Section catalog-items: the profile-scoped catalog browse, facet documents,
@@ -46,7 +47,7 @@ type CatalogBrowseInput struct {
 	YearMax       int      `query:"year_max" minimum:"0" example:"1999"`
 	ContentRating []string `query:"content_rating,explode" doc:"Repeat the key for several ratings" example:"R"`
 	Sort          string   `query:"sort" doc:"sort=field or -field; one term. Fields: title, year, release_date, added_at, rating, runtime, random, … (see the filters document); absent applies the source's saved or default order" example:"-release_date"`
-	Group         string   `query:"group" enum:"work,box_set" doc:"group=work collapses editions of one book into one card. group=box_set, on a source=query browse of one library with box sets on and no search text, collapses the movies of each TMDB collection into one box_set card; elsewhere it returns the ordinary list"`
+	Group         string   `query:"group" enum:"work" doc:"group=work collapses editions of one book into one card"`
 	SkipTotal     bool     `query:"skip_total" doc:"true skips the exact count; the total is then an estimate"`
 	ArtworkQuery
 	LimitParam
@@ -114,7 +115,7 @@ type CatalogQuery struct {
 	Q            string              `json:"q,omitempty"`
 	NamePrefix   string              `json:"name_prefix,omitempty" doc:"Alphabetical jump: only titles whose sort title (or title, when none is set) starts here"`
 	Type         string              `json:"type,omitempty" doc:"Media scope, as the listCatalogItems type parameter"`
-	Group        string              `json:"group,omitempty" enum:"work,box_set" doc:"As the listCatalogItems group parameter"`
+	Group        string              `json:"group,omitempty" enum:"work"`
 	SkipTotal    bool                `json:"skip_total,omitzero"`
 	QueryLimit   int                 `json:"query_limit,omitzero" minimum:"0"`
 	Cursor       string              `json:"cursor,omitempty"`
@@ -146,7 +147,7 @@ type CatalogItemInput struct {
 // playback choice (effective_audio_*, effective_subtitle_*), which the
 // caller's device-scoped preferences decide.
 type CatalogItemDeviceInput struct {
-	DeviceID string `header:"X-Vio-Device-Id" maxLength:"128" doc:"The stable device identifier used to resolve device-scoped playback preferences; absent resolves the profile's preferences" example:"tv-1"`
+	DeviceID string `header:"X-Silo-Device-Id" maxLength:"128" doc:"The stable device identifier used to resolve device-scoped playback preferences; absent resolves the profile's preferences" example:"tv-1"`
 	CatalogItemInput
 }
 
@@ -443,30 +444,6 @@ type CatalogItemDetail struct {
 	Audiobook                       *catalogpkg.AudiobookDetailExtension `json:"audiobook,omitempty"`
 	Ebook                           *catalogpkg.EbookDetailExtension     `json:"ebook,omitempty"`
 	Manga                           *catalogpkg.MangaDetailExtension     `json:"manga,omitempty"`
-	// HasVirtualSource renders only when the item carries persisted virtual
-	// candidate groups (provider-hosted versions); the value is always true.
-	// The read comes from the same stored rows discovery uses and is
-	// independent of whether discovery is enabled, so a persisted
-	// redacted-path viewer still learns whether the item's source rows live
-	// on the provider; it does not promise additional playable versions
-	// beyond what the versions fields already list. Absent when the item is
-	// not a movie or episode, holds no virtual candidates, or the lookup
-	// failed.
-	HasVirtualSource *bool `json:"has_virtual_source,omitempty"`
-	// Collections are the visible collections this item belongs to: the
-	// title page's "Collections" row, each linking to the collection's view.
-	// Present on every v2 item detail, as an empty array when the item is in
-	// none.
-	Collections []ItemCollection `json:"collections" doc:"Visible collections containing this item (movies and series); empty, never null"`
-}
-
-// ItemCollection is one collection a title page lists under Collections.
-type ItemCollection struct {
-	ID              string `json:"id" example:"01J9Z8C3W4R5T6Y7U8I9O0P1Q2"`
-	Title           string `json:"title" example:"Dune Saga"`
-	PosterURL       string `json:"poster_url" doc:"Presigned, short-lived; empty when none"`
-	PosterThumbhash string `json:"poster_thumbhash,omitempty"`
-	ItemCount       int    `json:"item_count" example:"3"`
 }
 
 // CatalogRatingSource is one source's rating of an item.
@@ -700,7 +677,6 @@ func registerCatalogItems(reg *Registry) {
 		"The episodes of one season of a series by number.")), reg.listSeasonEpisodes)
 	registerCatalogActions(reg)
 	registerRatingsCapability(reg)
-	registerItemCollectionsCapability(reg)
 }
 
 // --- helpers ---
@@ -753,7 +729,7 @@ func (reg *Registry) itemViewerOnDevice(ctx context.Context, deviceID string, ar
 	}
 	filter, err := reg.deps.CatalogAccess.ContextAccessFilter(ctx, opts)
 	if err != nil {
-		return handlers.ItemViewer{}, NewProblem(TypeInternalError, "An unexpected error occurred.").withCause(err)
+		return handlers.ItemViewer{}, NewProblem(TypeInternalError, "An unexpected error occurred.")
 	}
 	filter.ImageSize = art.Size
 	filter.ImageWidths = art.Widths
@@ -820,7 +796,7 @@ func catalogProblem(err error, location string) *Problem {
 		}
 	}
 	if errors.Is(err, context.Canceled) {
-		return NewProblem(TypeInternalError, "The request was canceled.").withCause(err)
+		return NewProblem(TypeInternalError, "The request was canceled.")
 	}
 	return serviceProblem(err)
 }
@@ -1056,7 +1032,6 @@ func (reg *Registry) listCatalogItems(ctx context.Context, cursors *Cursors, in 
 	req.After = pos.After
 	req.ResolvedSort = pos.Sort
 	req.Limit = in.Limit
-	req.GroupBoxSets = in.Group == groupBoxSet
 	view, err := svc.Browse(ctx, viewer, req, in.Group == "work")
 	if err != nil {
 		return nil, catalogProblem(err, "query.source")
@@ -1251,28 +1226,11 @@ func (reg *Registry) getCatalogItem(ctx context.Context, in *CatalogItemDeviceIn
 	if err != nil {
 		return nil, serviceProblem(err)
 	}
-	// A leaf detail (movie or individual episode, never a series, season or
-	// list) may start the item's provider version discovery, but the answer
-	// never waits for it: the response is built from the already-persisted
-	// version list and the detached run publishes the existing versions_updated
-	// catalog event when its listing lands, so an open detail page still
-	// refreshes. A slow provider therefore costs a client nothing — before
-	// this, a 10 s discovery budget made a 10 s detail read.
-	//
-	// The eligibility read also feeds the detail's has_virtual_source hint,
-	// which exists independently of whether discovery is enabled.
-	var virtualSource *bool
-	if detail != nil {
-		if reg.startDetailVersionDiscovery(ctx, detail.ContentID, detail.Type, viewer.Access, "catalog_detail", reg.preplayDiscoveryCatalogBudgetFor(ctx)) {
-			source := true
-			virtualSource = &source
-		}
-	}
-	out := catalogItemDetailOf(detail, reg.ratingSelection(ctx), virtualSource)
-	reg.warmDetailVirtualVersions(ctx, detail, viewer.Access)
-	out.Collections = NonNil(reg.itemCollections(ctx, detail, viewer.Access))
+	out := catalogItemDetailOf(detail, reg.ratingSelection(ctx))
 	if reg.deps.ThemeSongs != nil && (detail.Type == themeOwnerMovie || detail.Type == themeOwnerSeries || detail.Type == themeOwnerSeason || detail.Type == themeOwnerEpisode) {
-		themes, err := reg.deps.ThemeSongs.Discover(ctx, in.ID, true, viewer.Access)
+		// The detail authorized the item under the same filter and carries
+		// its owner fields, so the theme lookup repeats neither.
+		themes, err := reg.deps.ThemeSongs.Discover(ctx, themeItemOf(detail), true, viewer.Access)
 		if err != nil {
 			slog.Log(ctx, ctxerr.LogLevel(ctx, err, slog.LevelWarn), "catalog theme lookup failed", "component", "apiv2", "item_id", in.ID, "error", err)
 			return &CatalogItemDetailOutput{Body: out}, nil
@@ -1285,42 +1243,17 @@ func (reg *Registry) getCatalogItem(ctx context.Context, in *CatalogItemDeviceIn
 	return &CatalogItemDetailOutput{Body: out}, nil
 }
 
-// itemCollections answers the item's collections for the detail page. It is
-// best-effort: when the index service is not wired, or the lookup fails, the
-// result is nil and the detail page still succeeds with an empty row,
-// following the theme lookup's non-fatal contract.
-//
-// The membership key is an item's own content id for a movie or series; an
-// episode or season contributes its parent series id, because a membership row
-// names the series rather than an episode. Any other type, and a title whose
-// series id is empty, answers empty.
-func (reg *Registry) itemCollections(ctx context.Context, detail *catalogpkg.ItemDetail, access catalogpkg.AccessFilter) []ItemCollection {
-	index, ok := reg.deps.LibraryCollections.(ItemCollectionIndex)
-	if !ok || index == nil || detail == nil {
-		return nil
+// themeItemOf is the theme owner a movie, series, season, or episode detail
+// describes. A movie or series is its own series.
+func themeItemOf(d *catalogpkg.ItemDetail) themesongs.Item {
+	item := themesongs.Item{ID: d.ContentID, Type: d.Type, SeriesID: d.SeriesID, SeasonID: d.SeasonID}
+	if d.Type == themeOwnerMovie || d.Type == themeOwnerSeries {
+		item.SeriesID = d.ContentID
 	}
-	var membership string
-	switch detail.Type {
-	case themeOwnerMovie, themeOwnerSeries:
-		membership = detail.ContentID
-	case themeOwnerEpisode, themeOwnerSeason:
-		membership = detail.SeriesID
-	default:
-		return nil
+	if d.SeasonNumber != nil {
+		item.SeasonNumber = *d.SeasonNumber
 	}
-	if membership == "" {
-		return nil
-	}
-	views, err := index.ItemCollections(ctx, membership, access)
-	if err != nil {
-		slog.WarnContext(ctx, "catalog item collections lookup failed", "component", "apiv2", "item_id", detail.ContentID, "error", err)
-		return nil
-	}
-	out := make([]ItemCollection, 0, len(views))
-	for _, c := range views {
-		out = append(out, ItemCollection{ID: c.ID, Title: c.Title, PosterURL: c.PosterURL, PosterThumbhash: c.PosterThumbhash, ItemCount: c.ItemCount})
-	}
-	return out
+	return item
 }
 
 func (reg *Registry) listCatalogItemVersions(ctx context.Context, in *CatalogItemDeviceInput) (*FileVersionCollectionOutput, error) {
@@ -1457,30 +1390,9 @@ func fileVersionOf(v catalogpkg.FileVersion) FileVersion {
 		AddedAt: NewInstant(v.AddedAt), EditionRaw: v.EditionRaw, EditionKey: v.EditionKey, PresentationKind: v.PresentationKind,
 		PresentationGroupKey: v.PresentationGroupKey, PresentationPartIndex: v.PresentationPartIndex, PresentationPartTotal: v.PresentationPartTotal,
 		MultiEpisodeStart: v.MultiEpisodeStart, MultiEpisodeEnd: v.MultiEpisodeEnd, EffectiveAudioTrackIndex: v.EffectiveAudioTrackIndex,
-		EffectiveAudioLanguage: v.EffectiveAudioLanguage, Failed: v.Failed, Available: v.Available,
-		SourceMismatch: versionSourceMismatchOf(v.SourceMismatch), ProbedAt: probeInstantPtr(v.ProbedAt),
-		VideoTracks: v.VideoTracks, AudioTracks: v.AudioTracks, SubtitleTracks: v.SubtitleTracks,
+		EffectiveAudioLanguage: v.EffectiveAudioLanguage, VideoTracks: v.VideoTracks, AudioTracks: v.AudioTracks, SubtitleTracks: v.SubtitleTracks,
 		Chapters: v.Chapters, Intro: v.Intro, Credits: v.Credits, Recap: v.Recap, Preview: v.Preview,
 	}
-}
-
-// versionSourceMismatchOf mirrors the catalog's wrong-source verdict onto the
-// v2 wire type. Nil stays nil so the field is absent without a verdict.
-func versionSourceMismatchOf(m *catalogpkg.VersionSourceMismatch) *VersionSourceMismatch {
-	if m == nil {
-		return nil
-	}
-	return &VersionSourceMismatch{ServedBytes: m.ServedBytes, DeclaredBytes: m.DeclaredBytes}
-}
-
-// probeInstantPtr renders a probe stamp, treating a nil or zero time as
-// unprobed. A zero Instant cannot marshal, and a zero stamp means the same
-// thing as no stamp.
-func probeInstantPtr(t *time.Time) *Instant {
-	if t == nil || t.IsZero() {
-		return nil
-	}
-	return instantPtr(t)
 }
 
 func fileVersionsOf(vs []catalogpkg.FileVersion) []FileVersion {
@@ -1546,9 +1458,8 @@ func catalogItemCardOf(d *catalogpkg.ItemDetail) CatalogItem {
 // from the same detail, so a detail never disagrees with its own card. A
 // viewer who curates the item's metadata gets every stored rating, for the
 // metadata editor; everyone else gets only the ratings sel shows, as on
-// cards. virtualSource, when non-nil, renders the has_virtual_source hint
-// read before discovery; nil leaves it absent.
-func catalogItemDetailOf(d *catalogpkg.ItemDetail, sel ratingsources.Selection, virtualSource *bool) CatalogItemDetail {
+// cards.
+func catalogItemDetailOf(d *catalogpkg.ItemDetail, sel ratingsources.Selection) CatalogItemDetail {
 	card := catalogItemCardOf(d)
 	ratingSources := d.RatingSources
 	if !d.ViewerCurates {
@@ -1567,9 +1478,8 @@ func catalogItemDetailOf(d *catalogpkg.ItemDetail, sel ratingsources.Selection, 
 		FolderPaths: d.FolderPaths, Subtitles: NonNil(d.Subtitles), Intro: d.Intro, Credits: d.Credits, Recap: d.Recap, Preview: d.Preview,
 		EffectiveVersionResolution: d.EffectiveVersionResolution,
 		EffectiveVersionHDR:        d.EffectiveVersionHDR, EffectiveVersionCodecVideo: d.EffectiveVersionCodecVideo, EffectiveVersionEditionKey: d.EffectiveVersionEditionKey,
-		Audiobook: d.Audiobook, Ebook: d.Ebook, Manga: d.Manga, Collections: []ItemCollection{},
+		Audiobook: d.Audiobook, Ebook: d.Ebook, Manga: d.Manga,
 	}
-	out.HasVirtualSource = virtualSource
 	if d.EffectiveSubtitleTrackSignature != nil {
 		out.EffectiveSubtitleTrackSignature = watchSignatureOf(*d.EffectiveSubtitleTrackSignature)
 	}
@@ -1599,7 +1509,7 @@ func episodesOf(views []handlers.EpisodeView) []Episode {
 	out := make([]Episode, 0, len(views))
 	for _, e := range views {
 		ep := Episode{ContentID: e.ContentID, SeasonNumber: e.SeasonNumber, EpisodeNumber: e.EpisodeNumber, Title: e.Title, Overview: e.Overview,
-			AirDate: datePtr(e.AirDate), ReleaseState: handlers.EpisodeReleaseState(e.AirDate), Runtime: e.Runtime, ImdbID: e.ImdbID, TmdbID: e.TmdbID, TvdbID: e.TvdbID, StillIsEpisodeStill: e.StillIsEpisodeStill, StillURL: e.StillURL, StillThumbhash: e.StillThumbhash,
+			AirDate: datePtr(e.AirDate), Runtime: e.Runtime, ImdbID: e.ImdbID, TmdbID: e.TmdbID, TvdbID: e.TvdbID, StillIsEpisodeStill: e.StillIsEpisodeStill, StillURL: e.StillURL, StillThumbhash: e.StillThumbhash,
 			Ratings:  builtRatingsOf(ratingsources.Item{IMDB: e.RatingIMDB, TMDB: e.RatingTMDB}, ratingsources.Selection{}),
 			UserData: watchRollupOf(e.UserData), OverlaySummary: catalogOverlayOf(e.OverlaySummary), MachineTranslatedFields: e.MachineTranslatedFields, PendingTranslationLanguage: e.PendingTranslationLanguage}
 		for _, f := range e.Files {

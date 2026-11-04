@@ -1,3 +1,6 @@
+// Keep default listeners on TCP to reduce CVE-2026-98432 exposure on Linux.
+//go:debug multipathtcp=0
+
 package main
 
 import (
@@ -77,6 +80,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/imagecache"
 	"github.com/Silo-Server/silo-server/internal/intromarkers"
 	"github.com/Silo-Server/silo-server/internal/jellycompat"
+	"github.com/Silo-Server/silo-server/internal/keptsub"
 	"github.com/Silo-Server/silo-server/internal/lantls"
 	"github.com/Silo-Server/silo-server/internal/libraryingest"
 	"github.com/Silo-Server/silo-server/internal/librarymonitor"
@@ -92,6 +96,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/metadata/tmdb"
 	"github.com/Silo-Server/silo-server/internal/netaccess"
 	"github.com/Silo-Server/silo-server/internal/netadmin"
+	"github.com/Silo-Server/silo-server/internal/overlays"
 
 	// Built-in metadata providers self-register into the metadata package's
 	// builtin registry on import; buildProviders resolves their seeded chain
@@ -114,7 +119,6 @@ import (
 	"github.com/Silo-Server/silo-server/internal/proxy"
 	"github.com/Silo-Server/silo-server/internal/ratelimit"
 	"github.com/Silo-Server/silo-server/internal/recommendations"
-	"github.com/Silo-Server/silo-server/internal/remotestream"
 	mediarequests "github.com/Silo-Server/silo-server/internal/requests"
 	"github.com/Silo-Server/silo-server/internal/requests/discoverrows"
 	"github.com/Silo-Server/silo-server/internal/s3client"
@@ -135,7 +139,6 @@ import (
 	"github.com/Silo-Server/silo-server/internal/tcpcongestion"
 	"github.com/Silo-Server/silo-server/internal/telemetry"
 	"github.com/Silo-Server/silo-server/internal/themesongs"
-	"github.com/Silo-Server/silo-server/internal/tonemap"
 	"github.com/Silo-Server/silo-server/internal/transcodenode"
 	"github.com/Silo-Server/silo-server/internal/trickplay"
 	"github.com/Silo-Server/silo-server/internal/tuning"
@@ -143,7 +146,6 @@ import (
 	"github.com/Silo-Server/silo-server/internal/userdb"
 	"github.com/Silo-Server/silo-server/internal/userstore"
 	"github.com/Silo-Server/silo-server/internal/userstore/pgstore"
-	virtuallibrary "github.com/Silo-Server/silo-server/internal/virtuallibrary"
 	"github.com/Silo-Server/silo-server/internal/watchlist"
 	"github.com/Silo-Server/silo-server/internal/watchstate"
 	"github.com/Silo-Server/silo-server/internal/watchsync"
@@ -489,6 +491,23 @@ func configureActivityLogging(pool *pgxpool.Pool, logStreamHub *logstream.Hub) (
 	return buffer, startLogDrain(func(ctx context.Context) { consumer.Run(ctx, buffer.Chan()) })
 }
 
+// keptSubtitleStore is where embedded subtitle tracks read whole are kept.
+// They come from users' media, so never a store whose objects are delivered
+// outside the server's own authorization: the operational store, which is a
+// private bucket or the local root that holds operational blobs, or, with
+// neither, the assets bucket only while its reads are presigned. A public or
+// token-delivered assets bucket gets nil, and nothing is kept: tracks are
+// read through their index or demuxed instead.
+func keptSubtitleStore(stores blobstore.Stores, assetsS3 *s3client.Client) blobstore.Store {
+	if stores.Operational != nil {
+		return stores.Operational
+	}
+	if stores.Assets != nil && assetsS3 != nil && !assetsS3.UsesExternalAuth() {
+		return stores.Assets
+	}
+	return nil
+}
+
 // configureOperationalLogging installs the slog default that captures records
 // into this node's in-memory operational log queue. stop flushes what is
 // queued.
@@ -780,9 +799,9 @@ func main() {
 		return
 	}
 
-	if len(os.Args) > 1 && os.Args[1] == "episode-aliases" {
-		if err := runEpisodeAliasCommand(context.Background(), os.Args[2:], os.Stdout); err != nil {
-			log.Fatalf("episode-aliases: %v", err)
+	if len(os.Args) > 1 && os.Args[1] == "postgres-tune-conf" {
+		if err := runPostgresTuneConfCommand(os.Args[2:], os.Stdout); err != nil {
+			log.Fatalf("postgres-tune-conf: %v", err)
 		}
 		return
 	}
@@ -1089,7 +1108,6 @@ func main() {
 	defer stopDebugOnCancel()
 	var streamTelemetryRegistry *streamtelemetry.Registry
 	var streamTelemetryViewCache *streamtelemetry.ViewCache
-	defer appCancel()
 	restartReqCh := make(chan struct{}, 1)
 	var restartRequested atomic.Bool
 	if mode == "integrated" || mode == "api" {
@@ -1182,6 +1200,8 @@ func main() {
 			slog.Error("redis is required for this mode", "mode", mode, "error", err)
 			os.Exit(1)
 		}
+		streamTelemetryRegistry = newStreamTelemetryRegistry(appCtx, nodeID, redisClient)
+		streamTelemetryRegistry.Start(appCtx)
 
 		// Resolved before the watcher starts: NODE_URL is this process's
 		// stream_nodes identity, and the watcher needs it on its very first
@@ -1209,14 +1229,19 @@ func main() {
 			os.Exit(1)
 		}
 
-		streamTelemetryRegistry = newStreamTelemetryRegistry(appCtx, nodeID, redisClient)
-		streamTelemetryRegistry.Start(appCtx)
 		tracker := nodesessions.NewTracker(redisClient, nodeURL, nodeName, mode)
 		tracker.StartRefresh(appCtx)
 		defer func() {
 			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cleanupCancel()
 			tracker.Cleanup(cleanupCtx)
+		}()
+		defer func() {
+			telemetryCtx, telemetryCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer telemetryCancel()
+			if stopErr := streamTelemetryRegistry.Stop(telemetryCtx); stopErr != nil {
+				slog.Error("stream telemetry shutdown error", "error", stopErr)
+			}
 		}()
 
 		var handler http.Handler
@@ -1402,6 +1427,19 @@ func main() {
 		ratelimit.NewOutboundLimiter(tmdbRedisClient, "outbound:tmdb", tmdb.RequestsPerSecond))
 	defer tmdbClient.Close()
 
+	// The playback control relay bounds each lane ownership read and write
+	// at one second; this client's sockets give up at that deadline.
+	var playbackControlRedisClient *redis.Client
+	if apiRedisClient != nil {
+		controlClient, controlErr := cache.NewDeadlineRedisClientForRole(cfg.Redis, "api")
+		if controlErr != nil {
+			slog.Warn("redis client init failed; administrator playback commands reach only sessions on this replica", "error", controlErr)
+		} else if controlClient != nil {
+			defer func() { _ = cache.CloseRedisClient(controlClient) }()
+			playbackControlRedisClient = controlClient
+		}
+	}
+
 	if mode == "" || mode == "integrated" || mode == "api" {
 		streamTelemetryRegistry = newStreamTelemetryRegistry(appCtx, nodeID, apiRedisClient)
 		streamTelemetryRegistry.Start(appCtx)
@@ -1420,15 +1458,6 @@ func main() {
 	var shutdownWork []<-chan struct{}
 	registerShutdownWork := func(done <-chan struct{}) {
 		shutdownWork = append(shutdownWork, done)
-	}
-	// shutdownSteps are explicit, bounded application-shutdown steps wired by
-	// the API layer (for example the probe-evidence drain). Unlike shutdownWork,
-	// whose tasks are triggered by app-context cancellation, main invokes each
-	// step directly during the graceful-shutdown sequence and waits for it under
-	// its own deadline.
-	var shutdownSteps []shutdownStep
-	registerShutdownFunc := func(name string, run func()) {
-		shutdownSteps = append(shutdownSteps, shutdownStep{name: name, run: run})
 	}
 	normalizedBootstrapRedisURL, bootstrapRedisURLErr := config.NormalizeRedisURL(bc.RedisURL)
 	redisBootstrapAvailable := normalizedBootstrapRedisURL != "" && bootstrapRedisURLErr == nil
@@ -1450,13 +1479,13 @@ func main() {
 		RedisBootstrapAvailable:      redisBootstrapAvailable,
 		AppContext:                   appCtx,
 		RegisterShutdownWork:         registerShutdownWork,
-		RegisterShutdownFunc:         registerShutdownFunc,
 		StreamTelemetry:              streamTelemetryRegistry,
 		StreamTelemetryViewCache:     streamTelemetryViewCache,
 		DB:                           pool,
 		SecretCipher:                 dataCipher,
 		EventBus:                     eventBus,
 		RedisClient:                  apiRedisClient,
+		PlaybackControlRedisClient:   playbackControlRedisClient,
 		TMDB:                         tmdbClient,
 		DownloadBandwidthRedis:       downloadBandwidthRedis,
 		LogStreamHub:                 logStreamHub,
@@ -1774,9 +1803,6 @@ func main() {
 	var pluginRuntimeConfigStore *plugins.RuntimeConfigStore
 	var refreshMarkerProviders func(context.Context) error
 	var pluginHTTPProxy *plugins.HTTPProxy
-	var virtualRegistrar *catalog.VirtualMediaRegistrar
-	var vlSvc *virtuallibrary.Service
-	vlActive := false
 	pluginAutoUpdateDone := make(chan struct{})
 	var pluginAutoUpdater *plugins.AutoUpdateService
 	// Network access providers: ingress tokens issued per plugin start and the
@@ -1792,7 +1818,6 @@ func main() {
 		}
 		repositoryStore := plugins.NewRepositoryStore(deps.DB)
 		installationStore := plugins.NewInstallationStore(deps.DB)
-		virtualRegistrar = catalog.NewVirtualMediaRegistrar(deps.DB)
 		runtimeConfigStore := plugins.NewRuntimeConfigStore(deps.DB, deps.SecretCipher)
 		// This process is the api host: its resident plugins keep their
 		// per-instance state (overlay node keys) under the "api" scope.
@@ -2162,15 +2187,11 @@ func main() {
 		}
 		if deps.Blobs.Assets != nil {
 			imageResolver.SetArtworkResolver(deps.ArtworkResolver)
-			// Every backend reads the publication manifest, because a key the
-			// catalog holds can name a rung its revision predates: after a
-			// ladder change, existing artwork lacks the new widest rung until
-			// the ladder backfill regenerates it. Only external delivery (a
-			// public or token-authenticated read endpoint in front of S3) can
-			// also lag behind a write, so only it runs the verifier.
-			imageResolver.SetArtworkAvailabilityReader(metadata.NewArtworkDeliveryStore(
-				deps.DB, deps.ArtworkDelivery.Scope, deps.ArtworkDelivery.External,
-			))
+			// The publication manifest answers for a key the catalog holds
+			// that names a rung its revision predates: after a ladder change,
+			// existing artwork lacks the new widest rung until the ladder
+			// backfill regenerates it.
+			imageResolver.SetArtworkAvailabilityReader(metadata.NewArtworkPublicationStore(deps.DB))
 		}
 		deps.ImageResolver = imageResolver
 		deps.PluginImageResolver = imageResolver
@@ -2537,7 +2558,7 @@ func main() {
 			userStoreProvider = pgstore.NewPostgresProvider(deps.DB)
 			slog.Info("user store initialized", "backend", "postgres")
 		}
-		defer func() { _ = userStoreProvider.Close() }()
+		defer userStoreProvider.Close()
 	}
 
 	var policySystem *policy.System
@@ -2990,20 +3011,12 @@ func main() {
 	})
 	// The config watcher covers the Redis-less poll/RequestReload path, so
 	// admin UI edits apply without a restart on single-node deployments too.
-	configWatcher.OnChange(func(old, updated *config.Config) {
-		if old != nil && old.ClientIP.TrustedProxies == updated.ClientIP.TrustedProxies {
-			return
+	configWatcher.OnChange(func(_, _ *config.Config) {
+		// Re-read under the same resolver reload lock as direct/event callbacks.
+		// The watcher snapshot may predate a committed administrator write.
+		if loadErr := ipResolver.ReloadTrustedCIDRs(context.Background(), settingsRepo); loadErr != nil {
+			slog.WarnContext(context.Background(), "clientip config reload failed", "component", "app", "error", loadErr)
 		}
-		raw := updated.ClientIP.TrustedProxies
-		if raw == "" {
-			raw = clientip.DefaultTrustedProxies
-		}
-		cidrs, parseErr := clientip.ParseCIDRs(raw)
-		if parseErr != nil {
-			slog.WarnContext(context.Background(), "clientip config reload failed", "component", "app", "error", parseErr)
-			return
-		}
-		ipResolver.UpdateTrustedCIDRs(cidrs)
 	})
 
 	// Step 6b: Create rate limiter.
@@ -3172,6 +3185,11 @@ func main() {
 			userCollectionScheduler = usercollections.NewScheduler(deps.DB, userSync, slog.Default())
 			deps.UserCollectionSync = userSync
 			deps.UserCollectionScheduler = userCollectionScheduler
+			deps.MDBListClient = mdblist.NewClient(cfg.MDBListAPIKey, nil)
+			mdblistForReload := deps.MDBListClient
+			configWatcher.OnChange(func(_, updated *config.Config) {
+				mdblistForReload.SetAPIKey(updated.MDBListAPIKey)
+			})
 		}
 	}
 
@@ -3272,9 +3290,15 @@ func main() {
 			taskMgr.Register(tasks.NewCleanupArtworkRevisionsTask(
 				metadata.NewArtworkRevisionGarbageCollector(deps.DB, deps.Blobs.Assets),
 			))
-			mediaImages := []blobgc.Namespace{chapterthumbs.BlobNamespace(), trickplay.BlobNamespace()}
-			// Replaced chapter images are queued by key; the sweep lists by file.
-			collected := append([]blobgc.Namespace{chapterthumbs.ImageBlobNamespace()}, mediaImages...)
+			// Kept subtitle tracks live in their own store (keptSubtitleStore).
+			keptFiles, keptStreams := keptsub.FileBlobNamespace(), keptsub.StreamBlobNamespace()
+			if kept := keptSubtitleStore(deps.Blobs, deps.S3Public); kept != nil {
+				keptFiles.Store, keptStreams.Store = kept, kept
+			}
+			mediaImages := []blobgc.Namespace{chapterthumbs.BlobNamespace(), trickplay.BlobNamespace(), keptFiles}
+			// Replaced chapter images and kept subtitle tracks are queued by key;
+			// the sweep lists by file.
+			collected := append([]blobgc.Namespace{chapterthumbs.ImageBlobNamespace(), keptStreams}, mediaImages...)
 			if collector := blobgc.NewCollector(deps.DB, deps.Blobs.Assets, collected...); collector != nil {
 				taskMgr.Register(tasks.NewCleanupRemovedMediaImagesTask(collector))
 			}
@@ -3283,10 +3307,17 @@ func main() {
 			}
 			trickplayExtractor := trickplay.NewNodeExtractor(trickplay.NewLocalExtractor(settingsRepo), deps.NodePlanner, settingsRepo)
 			if trickplayService := trickplay.NewService(deps.DB, deps.Blobs.Assets, settingsRepo, trickplayExtractor, deps.NodeID); trickplayService != nil {
+				trickplayReader := trickplay.NewReader(deps.DB, deps.Blobs.Assets, trickplayURLResolver(&deps))
+				if checker, ok := deps.Blobs.Assets.(trickplay.DeliveryChecker); ok && deps.ArtworkDelivery.External {
+					// Sheets confirmed fetchable through the external endpoint
+					// are read from it; the rest use the signed server route.
+					trickplayService.SetExternalDelivery(deps.ArtworkDelivery.Scope, checker)
+					trickplayReader.SetExternalDelivery(deps.ArtworkDelivery.Scope, deps.ArtworkResolver)
+				}
 				trickplayService.Start(appCtx)
 				taskMgr.Register(tasks.NewQueueSeekPreviewsTask(trickplayService))
 				deps.Trickplay = trickplayService
-				deps.TrickplayReader = trickplay.NewReader(deps.DB, deps.Blobs.Assets, trickplayURLResolver(&deps))
+				deps.TrickplayReader = trickplayReader
 				deps.TrickplayAdmin = trickplay.NewAdmin(deps.DB, deps.Blobs.Assets, trickplayService.Kick)
 			}
 		}
@@ -3432,10 +3463,6 @@ func main() {
 		if refreshWorker != nil && metadataService != nil {
 			taskMgr.Register(tasks.NewRefreshMetadataTask(refreshWorker, metadataService))
 		}
-		if itemRepo != nil {
-			taskMgr.Register(tasks.NewReconcileVirtualEpisodesTask(itemRepo))
-			taskMgr.Register(tasks.NewCleanupLegacyCollectionClaimsTask(itemRepo))
-		}
 		if metadataService != nil {
 			taskMgr.Register(tasks.NewBulkMetadataEnrichmentTask(metadataService, pool))
 		}
@@ -3477,12 +3504,6 @@ func main() {
 		}
 		if deps.Blobs.Assets != nil {
 			identity := deps.Blobs.Assets.Identity()
-			if deps.ArtworkDelivery.External {
-				taskMgr.Register(tasks.NewVerifyArtworkDeliveryTask(
-					metadata.NewArtworkDeliveryStore(deps.DB, deps.ArtworkDelivery.Scope, true),
-					deps.Blobs.Assets,
-				))
-			}
 			var brandingReconciler tasks.BrandingAssetReconciler
 			if brandingSvc != nil {
 				brandingReconciler = brandingSvc
@@ -3546,12 +3567,8 @@ func main() {
 		requestReconcileSvc.SetRequesterIdentityResolver(plugins.RequesterIdentityFromLookup(plugins.NewPgUserIdentityLookup(deps.DB)))
 		if metadataService != nil {
 			requestReconcileSvc.SetTVDBIDResolver(metadataService)
-			if source, ok := any(metadataService).(api.SeriesTVDBSeasonSource); ok {
-				requestReconcileSvc.SetSeriesSeasonProvider(api.NewSeriesSeasonProvider(source))
-			}
 		}
-		api.AttachRequestRouter(requestReconcileSvc, pluginService, vlSvc)
-		requestReconcileSvc.SetCatalogChangeNotifier(sections.InvalidateResolvedListCache)
+		api.AttachRequestRouter(requestReconcileSvc, pluginService)
 		requestReconcileSvc.SetGroupPolicyProvider(accessGroupStore)
 		if userStoreProvider != nil {
 			userRepo := auth.NewUserRepository(deps.DB)
@@ -3709,6 +3726,8 @@ func main() {
 			SessionSyncer:  deps.SessionSyncer,
 		}
 		absH := audiobooksService.BuildABSHandler(absHDeps)
+		// Must precede Mount: Mount is what registers the observed handlers.
+		absH.SetStreamTelemetry(streamTelemetryRegistry)
 		deps.ABSHandler = absH
 	}
 	_ = audiobooksService
@@ -3758,6 +3777,13 @@ func main() {
 	// API and the frontend handler.
 	deps.BrandingService = brandingSvc
 	server.Branding = brandingSvc
+	// Card overlay images share the assets store with branding; without one the
+	// library lists nothing new and uploads report storage as unconfigured.
+	var overlayImageStore overlays.ImageStore
+	if deps.Blobs.Assets != nil {
+		overlayImageStore = deps.Blobs.Assets
+	}
+	deps.OverlayImages = overlays.NewImageLibrary(deps.DB, overlayImageStore)
 	var transitionPrivate blobstore.Store
 	if deps.S3Private != nil {
 		transitionPrivate = deps.Blobs.Operational
@@ -3779,12 +3805,29 @@ func main() {
 		}
 	}
 
-	// The router builds the asynchronous virtual candidates refresh executor
-	// from services it composes; main owns the admin job runner (started after
-	// the router), so the executor is handed back here for installation.
-	var virtualRefreshExecutor adminjob.VirtualCandidatesRefreshExecutor
-	deps.OnVirtualRefreshExecutor = func(executor adminjob.VirtualCandidatesRefreshExecutor) {
-		virtualRefreshExecutor = executor
+	if kept := keptSubtitleStore(deps.Blobs, deps.S3Public); deps.DB != nil && kept != nil {
+		// Embedded subtitle tracks read whole are kept in a private store and
+		// copied under the transcode directory, beside the subtitle cache.
+		deps.KeptSubtitles = keptsub.NewStore(keptsub.NewPgRepo(deps.DB), kept, keptsub.Options{
+			FFmpegPath: func() string { return deps.CurrentConfig().Playback.FFmpegPath },
+			MirrorDir: func() string {
+				if dir := deps.CurrentConfig().Playback.TranscodeDir; dir != "" {
+					return filepath.Join(dir, "subtitle-cache", "kept")
+				}
+				return ""
+			},
+		})
+		var nextEpisode keptsub.NextFileFunc
+		if deps.FileRepo != nil {
+			nextEpisode = keptsub.NextEpisodeFile(catalog.NewEpisodeRepository(deps.DB), deps.FileRepo)
+		}
+		deps.SubtitlePrefetch = keptsub.NewPrefetcher(deps.KeptSubtitles, nextEpisode)
+		deps.SubtitlePrefetch.Start(appCtx)
+		// The HLS streams this server runs read their on-demand subtitle
+		// renditions from kept tracks too.
+		if deps.KeptSubtitles != nil {
+			playback.SetRenditionKeptTracks(deps.KeptSubtitles)
+		}
 	}
 
 	router := api.NewRouter(deps)
@@ -3842,8 +3885,6 @@ func main() {
 			)
 			collectionHandler.ArtworkStore = deps.Blobs.Assets
 			collectionHandler.ArtworkResolver = deps.ArtworkResolver
-			collectionHandler.ArtworkSigner = deps.ArtworkSigner
-			collectionHandler.ArtworkRepair = deps.ArtworkRepair
 			collectionHandler.FrontendFS = deps.FrontendFS
 			collectionHandler.SectionRepo = sectionRepo
 			collectionHandler.FolderRepo = deps.FolderRepo
@@ -3874,40 +3915,11 @@ func main() {
 			templateBundleApplyExecutor,
 			deps.RealtimeHub,
 		)
-		adminJobRunner.SetVirtualRefreshExecutor(virtualRefreshExecutor)
 		adminJobRunner.SetCancelRegistry(adminJobCancelRegistry)
 		adminJobRunner.SetStorageTransitionExecutor(storageTransitionSvc)
 		adminJobRunner.SetStorageTransitionCommitted(deps.RequestServerRestart)
-		// The identity backfill is a one-shot resumable pass over legacy
-		// virtual rows. It is only meaningful when the core virtual library is
-		// active, and it owns the same admin-job runner as every other
-		// background pass.
-		var virtualIdentityBackfill *handlers.VirtualIdentityBackfillExecutor
-		if deps.VirtualLibraryService != nil && deps.FileRepo != nil {
-			virtualIdentityBackfill = &handlers.VirtualIdentityBackfillExecutor{
-				Lister: deps.VirtualLibraryService.ListStreams,
-				Store:  deps.FileRepo,
-				Jobs:   adminjob.NewRepository(deps.DB),
-				Logger: slog.Default(),
-			}
-			adminJobRunner.SetVirtualIdentityBackfillExecutor(virtualIdentityBackfill)
-		}
 		adminJobRunner.Start()
 		defer adminJobRunner.Stop()
-
-		// Queue the one-shot backfill after the runner is live. A job that has
-		// already finished (completed or canceled) is the one-shot gate; rows
-		// it could not match stay legacy and are not re-listed on every
-		// restart. A server with no admin account has no job owner and is
-		// skipped.
-		if virtualIdentityBackfill != nil {
-			var ownerUserID int
-			if err := deps.DB.QueryRow(appCtx, `SELECT COALESCE((SELECT id FROM users WHERE role = 'admin' AND enabled IS TRUE ORDER BY id ASC LIMIT 1), 0)`).Scan(&ownerUserID); err != nil {
-				slog.Warn("virtual identity backfill: resolve job owner failed", "error", err)
-			} else if err := virtualIdentityBackfill.EnsureBackfillJob(appCtx, ownerUserID); err != nil {
-				slog.Warn("virtual identity backfill: queue failed", "error", err)
-			}
-		}
 
 		// Start recommendation worker if enabled (reuse worker created above).
 		if recWorker != nil {
@@ -3925,13 +3937,6 @@ func main() {
 		}
 
 		slog.Info("background workers started")
-	}
-
-	// Proxy nodes never run ffmpeg locally, so there is nothing to validate.
-	// Everywhere else the inventory runs detached: a cold multi-device walk
-	// can take minutes and must never delay serving traffic.
-	if mode != "proxy" {
-		go logToneMapStartupSummary(cfg)
 	}
 
 	// Step 10: Create and start the HTTP server.
@@ -3975,128 +3980,6 @@ func main() {
 			// The native limiter itself, so budgets, reloads, and counters
 			// are shared with the native API. Nil when rate limiting is off.
 			RateLimit: deps.RateLimitMW,
-		}
-		if vlActive && vlSvc != nil {
-			virtualRelay := remotestream.NewRelay()
-			compatDeps.RemoteStreamRelay = virtualRelay
-			go func() {
-				<-appCtx.Done()
-				closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
-				if err := virtualRelay.Close(closeCtx); err != nil {
-					slog.Warn("close jellycompat virtual stream relay", "error", err)
-				}
-			}()
-
-			// Virtual playback resolves exclusively through the core virtual
-			// library: the virtual-library plugin is retired, so every virtual
-			// URI — including rows left over from plugin ownership — resolves
-			// by path through core.
-			compatDeps.VirtualMediaResolver = jellycompat.VirtualMediaResolverFunc(func(ctx context.Context, path string, ownerInstallationID, userID int, profileID string) (string, error) {
-				return vlSvc.Resolve(ctx, path)
-			})
-			compatDeps.VirtualMediaRefreshResolver = jellycompat.VirtualMediaRefreshResolverFunc(func(ctx context.Context, path string, ownerInstallationID, userID int, profileID string) (string, error) {
-				return vlSvc.Refresh(ctx, path)
-			})
-			compatDeps.VirtualMediaDetailedResolver = jellycompat.VirtualMediaDetailedResolverFunc(func(ctx context.Context, path string, ownerInstallationID int, userID int, profileID string, forceRefresh bool, excludedCandidateIDs []string, preferredCandidateID string) (jellycompat.ResolvedVirtualMedia, error) {
-				// Jellyfin-compat only excludes a candidate for a dead-provider
-				// failover, so an exclusion is an explicit rotation request.
-				res, err := vlSvc.ResolveDetailed(ctx, path, forceRefresh, excludedCandidateIDs, preferredCandidateID, len(excludedCandidateIDs) > 0)
-				if err != nil {
-					return jellycompat.ResolvedVirtualMedia{}, err
-				}
-				return jellycompat.ResolvedVirtualMedia{
-					URL:                 res.URL,
-					URI:                 res.URI,
-					CandidateID:         res.CandidateID,
-					RequestHeaders:      res.RequestHeaders,
-					ExpiresAt:           res.ExpiresAt,
-					ProviderVideoHash:   res.ProviderVideoHash,
-					ProviderGUID:        res.ProviderGUID,
-					ProviderReleaseName: res.ProviderReleaseName,
-					ProviderReleaseSize: res.ProviderReleaseSize,
-				}, nil
-			})
-			compatDeps.VirtualPlaybackStreamLister = jellycompat.VirtualPlaybackStreamListerFunc(func(ctx context.Context, path string, userID int, profileID string, ownerInstallationID int) ([]jellycompat.VirtualPlaybackStream, error) {
-				streams, err := vlSvc.ListStreams(ctx, path)
-				if err != nil {
-					return nil, err
-				}
-				out := make([]jellycompat.VirtualPlaybackStream, 0, len(streams))
-				for _, stream := range streams {
-					out = append(out, jellycompat.VirtualPlaybackStream{
-						URI:                 stream.URI,
-						Label:               stream.Label,
-						Resolution:          stream.Resolution,
-						CodecVideo:          stream.CodecVideo,
-						CodecAudio:          stream.CodecAudio,
-						HDR:                 stream.HDR,
-						Container:           stream.Container,
-						FileSize:            stream.FileSize,
-						Bitrate:             stream.Bitrate,
-						AudioLanguages:      stream.AudioLanguages,
-						SubtitleLanguages:   stream.SubtitleLanguages,
-						OwnerInstallationID: stream.OwnerInstallationID,
-					})
-				}
-				return out, nil
-			})
-			compatDeps.AllowInsecureVirtual = func(installationID int) bool {
-				// HTTP-manifest posture for virtual traffic comes solely from
-				// the core virtual_library.allow_insecure_http opt-in:
-				// resolution is core-only, so per-installation plugin config
-				// no longer applies.
-				return plugins.CoreVirtualInsecureAllowed(context.Background())
-			}
-			compatDeps.AllowPrivateStreams = func(installationID int) bool {
-				// Private stream destination posture comes solely from the
-				// core virtual_library.allow_private_streams opt-in.
-				return plugins.CoreVirtualPrivateStreamsAllowed(context.Background())
-			}
-			ffprobePath := scanner.FFprobePathFromFFmpeg(cfg.Playback.FFmpegPath)
-			virtualProbeCache := scanner.NewVirtualProbeCache(10*time.Minute, 256)
-			compatVirtualSourceProberWithHeaders := func(ctx context.Context, sourceURL string, file *models.MediaFile, headers map[string]string) (*models.MediaFile, error) {
-				return virtualProbeCache.Probe(ctx, sourceURL, file, func(probeCtx context.Context, probeURL string, probeFile *models.MediaFile) (*models.MediaFile, error) {
-					var relayURL string
-					var cleanup func()
-					var err error
-					insecure := plugins.CoreVirtualPrivateStreamsAllowed(probeCtx)
-					if insecure {
-						relayURL, cleanup, err = virtualRelay.RegisterInsecureWithHeaders(probeCtx, probeURL, headers)
-					} else {
-						relayURL, cleanup, err = virtualRelay.RegisterWithHeaders(probeCtx, probeURL, headers)
-					}
-					if err != nil {
-						return probeFile, err
-					}
-					defer cleanup()
-					return scanner.ProbeVirtualSource(probeCtx, ffprobePath, cfg.Playback.FFmpegPath, relayURL, probeFile, func(dvCtx context.Context, input string) bool {
-						return playback.DVRPUStrippable(dvCtx, cfg.Playback.FFmpegPath, input)
-					})
-				})
-			}
-			compatDeps.VirtualSourceProberWithHeaders = compatVirtualSourceProberWithHeaders
-			compatDeps.VirtualSourceProber = func(ctx context.Context, sourceURL string, file *models.MediaFile) (*models.MediaFile, error) {
-				return compatVirtualSourceProberWithHeaders(ctx, sourceURL, file, nil)
-			}
-			compatAdoptionRefusalStore := scanner.NewFileRepository(deps.DB)
-			compatDeps.VirtualFileSaver = func(ctx context.Context, args models.VirtualFilePersistArgs) (int64, error) {
-				if deps.DB == nil {
-					return 0, nil
-				}
-				return handlers.ExecVirtualFileMetadataUpdateWithRefusals(ctx, deps.DB, args, compatAdoptionRefusalStore)
-			}
-			compatDeps.VirtualFileMetadataSaver = func(ctx context.Context, args models.VirtualFilePersistArgs) (jellycompat.VirtualFileMetadataUpdateResult, error) {
-				if deps.DB == nil {
-					return jellycompat.VirtualFileMetadataUpdateResult{}, nil
-				}
-				result, err := handlers.ExecVirtualFileMetadataUpdateResultWithRefusals(ctx, deps.DB, args, compatAdoptionRefusalStore)
-				return jellycompat.VirtualFileMetadataUpdateResult{
-					RowsAffected:    result.RowsAffected,
-					MetadataUpdated: result.MetadataUpdated,
-					IdentityAdopted: result.IdentityAdopted,
-				}, err
-			}
 		}
 
 		// Wire direct dependencies when DB is available.
@@ -4163,6 +4046,9 @@ func main() {
 			if blobs := blobstore.NewByteStore(deps.Blobs.Assets); blobs != nil {
 				compatDeps.SubtitleBlobs = blobs
 			}
+			if deps.KeptSubtitles != nil {
+				compatDeps.KeptSubtitles = deps.KeptSubtitles
+			}
 			if deps.TrickplayReader != nil {
 				compatDeps.Trickplay = deps.TrickplayReader
 			}
@@ -4170,13 +4056,6 @@ func main() {
 
 			if deps.FileRepo != nil {
 				compatDeps.FileResolver = deps.FileRepo
-				compatDeps.VirtualCandidateFileLookup = func(ctx context.Context, path, contentID, episodeID string, ownerInstallationID int) (*models.MediaFile, error) {
-					file, err := deps.FileRepo.GetVirtualCandidateByNeutralPath(ctx, path, contentID, episodeID, ownerInstallationID)
-					if err != nil && errors.Is(err, scanner.ErrFileNotFound) {
-						return nil, jellycompat.ErrVirtualCandidateNotFound
-					}
-					return file, err
-				}
 				compatDeps.MediaSourceOwners = deps.FileRepo
 			}
 			compatDeps.Downloads = compatDownloads
@@ -4278,7 +4157,7 @@ func main() {
 
 	// Run non-critical startup work in the background so it doesn't delay the
 	// HTTP listener from accepting connections. Steps run sequentially and stop
-	// early if the app context is canceled (shutdown).
+	// early if the app context is cancelled (shutdown).
 	if len(backgroundInit) > 0 {
 		go func() {
 			start := time.Now()
@@ -4398,15 +4277,6 @@ func main() {
 			slog.Error("abs compat shutdown error", "error", shutdownErr)
 		}
 	}
-	// 1b. Run explicit shutdown steps that own a bounded drain. The probe
-	// evidence queue is accepted in memory, so application shutdown calls its
-	// stop method here and waits for it, rather than relying only on the
-	// handler's detached lifecycle watcher. The handler drains within its own
-	// 5 s grace; this outer bound leaves it headroom to finish and then abandons
-	// (with a warning) instead of hanging. Anything abandoned at this point is
-	// in-memory evidence and is lost on exit; the next playback start re-probes
-	// and re-admits it.
-	runShutdownSteps(virtualEvidenceShutdownTimeout, shutdownSteps)
 	if err := runShutdownWorkWithTimeout(30*time.Second, func(cleanupCtx context.Context) error {
 		return waitForShutdownWork(cleanupCtx, shutdownWork)
 	}); err != nil {
@@ -4449,56 +4319,6 @@ func main() {
 	_ = adminJobRunner
 
 	slog.Info("server stopped")
-}
-
-// virtualEvidenceShutdownTimeout bounds the explicit application-shutdown wait
-// for the probe-evidence drain. The handler's own drain grace is 5 s, so this
-// leaves room for the worker await plus the drain to complete; a step that
-// overruns is abandoned rather than allowed to hang process shutdown.
-const virtualEvidenceShutdownTimeout = 10 * time.Second
-
-// shutdownStep is an explicit application-shutdown step registered through
-// api.Dependencies.RegisterShutdownFunc. Steps are idempotent and safe to call
-// during shutdown; main invokes each one directly under its own deadline.
-type shutdownStep struct {
-	name string
-	run  func()
-}
-
-// runShutdownSteps invokes each explicit application-shutdown step in
-// registration order, waiting at most timeout for each. A step that overruns is
-// abandoned and logged; later steps still run, so one stuck step cannot starve
-// the rest of the shutdown sequence.
-func runShutdownSteps(timeout time.Duration, steps []shutdownStep) {
-	for _, step := range steps {
-		if err := awaitShutdownFunc(timeout, step.run); err != nil {
-			slog.Error("shutdown step did not finish before deadline; abandoning in-memory work",
-				"step", step.name, "timeout", timeout, "error", err)
-		}
-	}
-}
-
-// awaitShutdownFunc runs one explicit shutdown step and waits at most timeout
-// for it to return. A step that overruns keeps running, but shutdown stops
-// waiting and reports context.DeadlineExceeded so a stuck step cannot hang the
-// process. nil is a no-op.
-func awaitShutdownFunc(timeout time.Duration, run func()) error {
-	if run == nil {
-		return nil
-	}
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		run()
-	}()
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	select {
-	case <-done:
-		return nil
-	case <-timer.C:
-		return context.DeadlineExceeded
-	}
 }
 
 // waitForShutdownWork waits for registered cleanup tasks within the process's
@@ -4622,7 +4442,8 @@ func newS3ClientIfConfigured(cfg s3client.BucketConfig) *s3client.Client {
 func trickplayURLResolver(deps *api.Dependencies) artworkurl.Resolver {
 	if deps.ArtworkDelivery.External {
 		// An external read endpoint can lag behind the S3 write that published
-		// the manifest. The signed server route reads the storage API directly.
+		// the manifest. Until the service confirms the endpoint serves a
+		// revision, the signed server route reads the storage API directly.
 		return artworkurl.NewServerResolver(deps.ArtworkSigner)
 	}
 	return deps.ArtworkResolver

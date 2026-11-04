@@ -529,6 +529,20 @@ and the watchlist alone. A change publishes `user_state.changed` with
 clients can update. The frozen v1 surface has no mark and does not show it. See
 [recommendations.md](architecture/recommendations.md#rows).
 
+## Episodes left on a series card
+
+On a series or season card the profile has not finished, v2 `user_state` adds
+`watched_count` (episodes the profile watched) and `unplayed_count` (available
+episodes it has not). Both are absent on a finished series or season, on movies
+and episodes, and when the user store has no episode rollup; the frozen v1 card
+never carries them. "Available" and "watched" follow `played`: an episode counts
+while it belongs to a library, and is watched when its visible progress or a
+visible completed history row says so. Clients draw the episodes-left mark in a
+card's top-right status corner from the pair (see
+[card-overlays.md](architecture/card-overlays.md)). `played` still comes from the
+completion query; the counts come from one batched rollup per kind for just the
+unfinished series and seasons on the page.
+
 ## Watchlist titles outside the library
 
 The watchlist can also hold movies and series the library doesn't have, keyed by
@@ -708,11 +722,20 @@ servers ignore an unrecognized `type`, which searches every media type, and
 reject it as a people `media_scope`. A client that hides books must check the
 flag and send `video` when it is absent.
 
-`GET /api/v2/catalog/search/capabilities` reports the selected provider and, for
+`GET /api/v2/catalog/search/capabilities` reports the provider selected by the
+responding server's current ranking-availability checks and, for
 Meilisearch, `result_window_limit`, `session_ttl_seconds`, and
-`max_sessions_per_account`. Catalog query bodies default to 50 results per page. Search
-responses also expose the applicable window limit and fixed session expiry in
-`search_diagnostics`.
+`max_sessions_per_account`. While Meilisearch is configured but its index is
+unbuilt, unreachable, or on an incompatible schema, searches fall back to
+PostgreSQL and the read reports `provider: postgres` without the Meilisearch
+limits. These provider and limit fields are an explicit exception to the usual
+configuration-only capability contract: changes in availability affect the
+document's `revision` and `ETag`, and replicas can return different answers.
+This is a snapshot, not a dependency-health guarantee; a failed PostgreSQL
+index-state read can also select fallback even though searches cannot succeed.
+Clients use each search response's `search_diagnostics` for its actual provider,
+applicable window limit, and fixed session expiry. A later search can choose a
+different provider. Catalog query bodies default to 50 results per page.
 
 PostgreSQL search retains the complete relevance tuple or requested SQL sort
 rather than a numeric page. It selects the FTS or bounded fuzzy retrieval family
@@ -841,36 +864,25 @@ The letter index sorts the whole result to number it, so its cost grows with
 the result like an exact count; it has the same 10-second deadline as a window
 seek. It covers the query source only and takes no search text or
 `name_prefix`. `getCatalogSearchCapabilities` reports `letter_index: true` when
-the operation is available. With `group: "box_set"` it counts a box set browse
-(see Movie box sets) the way `queryCatalogItems` pages it.
+the operation is available.
 
 ## Movie box sets
 
-A movie or mixed library can browse the movies TMDB lists in one collection (a
-franchise such as Harry Potter) as one box set. An administrator turns it on
+A movie or mixed library can gather the movies TMDB lists in one collection (a
+franchise such as Harry Potter) into one box set. An administrator turns it on
 with the library's `box_sets_enabled`; `box_set_min_movies` (2 to 10, default
 2) is the fewest of a collection's movies the library must hold, and
 `box_sets_in_search` (default true) lists the library's box sets in search.
 `getCatalogSearchCapabilities` reports `box_sets: true` to viewers when the
 server supports them (`getLibraryCapabilities` reports the same to
-administrators), and `listUserLibraries` reports each viewer library's `box_sets_enabled`
-so a client knows which libraries to browse with `group=box_set`.
+administrators), and `listUserLibraries` reports each viewer library's
+`box_sets_enabled`.
 
-`listCatalogItems` and `queryCatalogItems` with `group=box_set`, on a
-`source=query` browse of one library with box sets on and no search text,
-return a box set card in place of the collection's movies once the viewer can
-see at least `box_set_min_movies` of them there. The card has `type:
-"box_set"`, `content_id: "box_set:<tmdb collection id>"`, the collection's
-title, overview, and artwork, and a `box_set` object with its `id`,
-`library_id`, `movie_count`, `played_count`, `first_year`, and `last_year`.
-The card stands at its first movie in the requested order and carries that
-movie's `sort_metrics`; totals, cursors, and `seek` count the grouped list.
-`name_prefix` matches that first movie, so a box set is listed under one
-letter, the one the letter index files it under.
-Any other request with `group=box_set` returns the ordinary list. Send the
-same `group` to `queryCatalogLetters` so the letter index counts the grouped
-list. A collection's artwork is cached like item artwork when the server
-caches metadata images; until then its URLs point at TMDB.
+Box sets appear in search, on their own page, and as a row on a movie's page.
+Library browse never groups them: `listCatalogItems`, `queryCatalogItems`, and
+`queryCatalogLetters` list each movie on its own. A collection's artwork is
+cached like item artwork when the server caches metadata images; until then
+its URLs point at TMDB.
 
 `GET /api/v2/catalog/box-sets/{id}?library_id=` (`getCatalogBoxSet`) answers a
 box set with its movies in that library that the viewer can see, in collection

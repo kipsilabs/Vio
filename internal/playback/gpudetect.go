@@ -47,6 +47,7 @@ var (
 	defaultDRIDir              = "/dev/dri"
 	defaultNVIDIAControlDevice = "/dev/nvidiactl"
 	defaultNVIDIADeviceGlob    = "/dev/nvidia[0-9]*"
+	defaultDXGDevice           = "/dev/dxg"
 	sysClassDRMDir             = "/sys/class/drm"
 	procBootIDPath             = "/proc/sys/kernel/random/boot_id"
 	currentGOOS                = runtime.GOOS
@@ -1320,20 +1321,6 @@ func videoToolboxProbeCacheKey(execPath string) string {
 	return strconv.FormatUint(hwProbeGeneration(), 10) + "\x00" + execPath + "\x00" + ffmpegIdentityKey(execPath)
 }
 
-// SoftwareFallbackGPUOnly is the playback.software_fallback policy value that
-// forbids the server from starting any automated CPU-decode fallback. It lives
-// in the playback domain so every surface that can silently choose software
-// decode compares against the same spelling.
-const SoftwareFallbackGPUOnly = "gpu_only"
-
-// SoftwareFallbackAllowed reports whether a playback.software_fallback policy
-// value permits an automated software-decode fallback. The empty string is the
-// default "allow", matching config loading, so a zero-value TranscodeOpts or
-// PlaybackConfig never disables fallback by accident.
-func SoftwareFallbackAllowed(value string) bool {
-	return !strings.EqualFold(strings.TrimSpace(value), SoftwareFallbackGPUOnly)
-}
-
 // StartupRetryHWAccel returns the acceleration for the single retry after a
 // transcode dies before producing its first segment. VideoToolbox has no
 // alternate render device to move to, so an ordinary encode retries on the
@@ -1341,10 +1328,6 @@ func SoftwareFallbackAllowed(value string) bool {
 // shortcut because its mode and filter would no longer describe the executor;
 // the owner must replan it as a complete software recipe instead. Every other
 // accel keeps its configured value and moves render devices via AvoidHWDevice.
-//
-// A caller under playback.software_fallback=gpu_only must not take the retry
-// when it returns HWAccelNone: that path is a CPU decode+encode fallback. The
-// callers gate on SoftwareFallbackAllowed for exactly this case.
 func StartupRetryHWAccel(opts TranscodeOpts) string {
 	if opts.ToneMapMode != tonemap.ModeHardware &&
 		ResolveHWAccelWithFFmpeg(opts.HWAccel, opts.FFmpegPath, opts.HWDevice) == transcodeHWVideoToolbox {
@@ -1576,7 +1559,7 @@ func listRenderDevices(driDir string) []string {
 	var accessible []string
 	for _, dev := range matches {
 		if f, err := os.Open(dev); err == nil {
-			_ = f.Close()
+			f.Close()
 			accessible = append(accessible, dev)
 		}
 	}
@@ -1609,8 +1592,8 @@ func isNVIDIADevice(renderDevPath string) bool {
 }
 
 func hasNVIDIADevice() bool {
-	if file, err := os.Open(defaultNVIDIAControlDevice); err == nil {
-		_ = file.Close()
+	// WSL exposes GPUs through dxg; the FFmpeg probe still verifies NVENC.
+	if deviceOpenable(defaultNVIDIAControlDevice) || deviceOpenable(defaultDXGDevice) {
 		return true
 	}
 	matches, err := filepath.Glob(defaultNVIDIADeviceGlob)
@@ -1618,8 +1601,7 @@ func hasNVIDIADevice() bool {
 		return false
 	}
 	for _, dev := range matches {
-		if file, err := os.Open(dev); err == nil {
-			_ = file.Close()
+		if deviceOpenable(dev) {
 			return true
 		}
 	}

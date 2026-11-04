@@ -5,64 +5,31 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
-	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5"
 
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/imagesize"
 	"github.com/Silo-Server/silo-server/internal/models"
-	"github.com/Silo-Server/silo-server/internal/notifications"
+	"github.com/Silo-Server/silo-server/internal/userstore"
 )
 
 // CatalogResourceHandler serves canonical catalog resource read routes.
 type CatalogResourceHandler struct {
-	items *ItemsHandler
-	// FileResolver looks up a media file row by ID for the batched version
-	// liveness check. Optional: without it the check reports every file as
-	// unavailable.
-	FileResolver FilePathResolver
-	// VirtualResolver resolves a virtual candidate's pinned result through the
-	// provider for the liveness check. Optional: without it virtual rows are
-	// reported from their durable failed_at stamp only and never re-stamped.
-	VirtualResolver VirtualMediaDetailedResolver
-	// MarkVirtualFailed stamps a virtual candidate row as known-bad after a
-	// confirmed dead pin. Optional: without it the check never stamps.
-	MarkVirtualFailed func(ctx context.Context, fileID int, expectedFilePath string, observedFailedAt *time.Time) error
-	// ClearVirtualFailed clears a virtual candidate's failed stamp after a
-	// successful resolution. Optional: without it the check never clears.
-	ClearVirtualFailed func(ctx context.Context, fileID int, expectedFilePath string, observedFailedAt *time.Time) error
-	// VirtualFileMetadataSaver and VirtualFileSaver adopt a same-release
-	// candidate the resolver re-identified under a new provider result id, via
-	// the same CAS-fenced Phase-1 write the playback path uses. Optional:
-	// without them the check still treats a rematch as live and leaves the
-	// adoption to the next playback resolve.
-	VirtualFileMetadataSaver VirtualFileMetadataSaver
-	VirtualFileSaver         VirtualFileSaver
-	// ItemAccess authorizes a file's parent item for the requesting profile
-	// before the liveness check resolves or stamps anything. Optional: without
-	// it every file is reported unavailable, indistinguishable from unknown.
-	ItemAccess PlaybackItemAccessChecker
-	// EpisodeLookup and ExtraLookup resolve the parent of episode and extra
-	// files so they authorize through their series/item, mirroring the
-	// playback handler's loadAuthorizedFile. Optional: without them episode
-	// and extra files are denied.
-	EpisodeLookup PlaybackEpisodeLookup
-	ExtraLookup   PlaybackExtraLookup
-	// Events publishes the catalog invalidation the liveness check owes a
-	// client when a fresh failed_at verdict removes a row from the version
-	// list. Optional: nil skips the publish.
-	Events *notifications.Hub
-
+	items             *ItemsHandler
 	watchlistPromoter WatchlistItemPromoter
 }
 
 // WatchlistItemPromoter moves the profile's watchlist entry for a title the
 // library did not have onto the library watchlist once the item carries the
 // title's IDs. *watchlist.Titles implements it; a failure is its to log.
+// QueuePromotable queues, on a batch sent to the catalog database, whether
+// the profile has any entry PromoteWatchlistItem could move.
 type WatchlistItemPromoter interface {
 	PromoteWatchlistItem(ctx context.Context, access catalog.AccessFilter, contentID string)
+	QueuePromotable(b *pgx.Batch, access catalog.AccessFilter, promotable *bool)
 }
 
 // SetWatchlistPromoter makes item detail promote the viewer's matching
@@ -91,27 +58,7 @@ func (h *CatalogResourceHandler) HandleGetItemDetail(w http.ResponseWriter, r *h
 		writeAPIError(w, err)
 		return
 	}
-	h.prefetchItemDetailVirtual(r.Context(), view, requestProfileID(r))
 	writeJSON(w, http.StatusOK, view)
-}
-
-// prefetchItemDetailVirtual warms virtual listings for a movie/episode detail
-// view. Series details carry no versions and are skipped; per-episode warming
-// happens on the season-episodes read instead.
-func (h *CatalogResourceHandler) prefetchItemDetailVirtual(ctx context.Context, view *catalog.ItemDetail, profileID string) {
-	if h == nil || h.items == nil || view == nil {
-		return
-	}
-	fileIDs := make([]int, 0, 2)
-	for _, v := range view.Versions {
-		if v.FileID != 0 {
-			fileIDs = append(fileIDs, v.FileID)
-		}
-		if len(fileIDs) >= 2 {
-			break
-		}
-	}
-	h.items.prefetchVirtualFileIDs(ctx, fileIDs, profileID)
 }
 
 func (h *CatalogResourceHandler) HandleGetItemVersions(w http.ResponseWriter, r *http.Request) {
@@ -167,7 +114,6 @@ func (h *CatalogResourceHandler) HandleGetItemEpisodes(w http.ResponseWriter, r 
 		writeAPIError(w, err)
 		return
 	}
-	h.prefetchEpisodeViewsVirtual(r.Context(), view, requestProfileID(r))
 	writeJSON(w, http.StatusOK, episodesListResponse{Episodes: view})
 }
 
@@ -241,28 +187,7 @@ func (h *CatalogResourceHandler) HandleGetEpisodes(w http.ResponseWriter, r *htt
 		writeAPIError(w, err)
 		return
 	}
-	h.prefetchEpisodeViewsVirtual(r.Context(), view, requestProfileID(r))
 	writeJSON(w, http.StatusOK, episodesListResponse{Episodes: view})
-}
-
-// prefetchEpisodeViewsVirtual warms the first episode's files only: it is the
-// likely next play (autoplay/next-up order), and warming a whole season would
-// fan out provider listings per episode. Bounded to 2 file rows like the
-// other triggers.
-func (h *CatalogResourceHandler) prefetchEpisodeViewsVirtual(ctx context.Context, views []EpisodeView, profileID string) {
-	if h == nil || h.items == nil || len(views) == 0 {
-		return
-	}
-	fileIDs := make([]int, 0, 2)
-	for _, f := range views[0].Files {
-		if f.FileID != 0 {
-			fileIDs = append(fileIDs, f.FileID)
-		}
-		if len(fileIDs) >= 2 {
-			break
-		}
-	}
-	h.items.prefetchVirtualFileIDs(ctx, fileIDs, profileID)
 }
 
 func (h *CatalogResourceHandler) syntheticSeasonDetail(ctx context.Context, v ItemViewer, seasonID string) (*catalog.ItemDetail, error) {
@@ -281,7 +206,7 @@ func (h *CatalogResourceHandler) syntheticSeasonDetail(ctx context.Context, v It
 		return nil, err
 	}
 
-	episodes, err := h.items.seasonEpisodesForRead(ctx, seriesID, seasonNum)
+	episodes, err := h.items.episodeRepo.ListBySeason(ctx, seriesID, seasonNum)
 	if err != nil {
 		return nil, fmt.Errorf("listing season episodes: %w", err)
 	}
@@ -333,34 +258,9 @@ func parseSyntheticSeasonID(contentID string) (string, int, bool) {
 	return catalog.ParseSyntheticSeasonID(contentID)
 }
 
-// enrichSeasonDetailUserData folds the same episode set the season page and
-// season list show. The season-row rollup is only safe when every listed
-// episode is linked to that row; otherwise its counts miss unlinked episodes.
-// A metadata-only season has no availability rollup entry, so it must fold its
-// metadata episodes rather than overwrite the detail's state with nil.
-func (h *CatalogResourceHandler) enrichSeasonDetailUserData(ctx context.Context, v ItemViewer, detail *catalog.ItemDetail) {
-	if h.items.episodeRepo == nil || detail.SeriesID == "" || detail.SeasonNumber == nil {
-		return
-	}
-	episodes, err := h.items.seasonEpisodesForRead(ctx, detail.SeriesID, *detail.SeasonNumber)
-	if err != nil || len(episodes) == 0 {
-		if userData, ok := h.items.parentRollupUserData(ctx, v, "season", detail.ContentID); ok && userData != nil {
-			detail.SeasonUserData = userData
-		}
-		return
-	}
-	var userData *catalog.SeasonUserData
-	rolledUp := false
-	if episodesAllLinkedToSeason(episodes, detail.ContentID) {
-		userData, rolledUp = h.items.parentRollupUserData(ctx, v, "season", detail.ContentID)
-	}
-	if !rolledUp || userData == nil {
-		userData = h.items.getAggregateUserData(ctx, v, episodes)
-	}
-	detail.SeasonUserData = userData
-}
-
-func (h *CatalogResourceHandler) enrichItemDetail(ctx context.Context, v ItemViewer, detail *catalog.ItemDetail) {
+// enrichItemDetail adds the viewer's state to detail. curates is
+// canViewFilePaths for the request; paths are stripped without it.
+func (h *CatalogResourceHandler) enrichItemDetail(ctx context.Context, v ItemViewer, detail *catalog.ItemDetail, curates bool) {
 	if detail == nil {
 		return
 	}
@@ -371,14 +271,21 @@ func (h *CatalogResourceHandler) enrichItemDetail(ctx context.Context, v ItemVie
 			SeriesID:     detail.SeriesID,
 			SeasonNumber: detail.SeasonNumber,
 		}
-		target := h.items.resolvePlayableTargetDetails(ctx, v, []catalog.PlayableTargetInput{input}, nil, v.Access)[input.Key()]
+		target := h.items.resolvePlayableTargets(ctx, v, []catalog.PlayableTargetInput{input}, nil, v.Access)[input.Key()]
 		detail.PlayContentID = target.ContentID
 		detail.PlaySeasonNumber = target.SeasonNumber
 	}
 
+	state, batched := h.batchedViewerState(ctx, v, detail)
 	switch detail.Type {
 	case "season":
-		h.enrichSeasonDetailUserData(ctx, v, detail)
+		if h.items.episodeRepo != nil {
+			if userData, ok := h.items.parentRollupUserData(ctx, v, detail.Type, detail.ContentID); ok {
+				detail.SeasonUserData = userData
+			} else if episodes, err := h.items.episodeRepo.ListBySeasonID(ctx, detail.ContentID); err == nil {
+				detail.SeasonUserData = h.items.getAggregateUserData(ctx, v, episodes)
+			}
+		}
 	case "series":
 		if h.items.episodeRepo != nil {
 			if userData, ok := h.items.parentRollupUserData(ctx, v, detail.Type, detail.ContentID); ok {
@@ -388,11 +295,15 @@ func (h *CatalogResourceHandler) enrichItemDetail(ctx context.Context, v ItemVie
 			}
 		}
 	case "movie", "episode", "audiobook", "ebook":
-		detail.SeasonUserData = h.items.getLeafUserData(ctx, v, detail.ContentID, detail.Type)
+		if batched && detail.Type != itemTypeEbook {
+			detail.SeasonUserData = state.leaf
+		} else {
+			detail.SeasonUserData = h.items.getLeafUserData(ctx, v, detail.ContentID, detail.Type)
+		}
 		applyEffectiveEditionPreference(detail.SeasonUserData, &detail.EffectiveVersionEditionKey)
 	}
 
-	detail.ViewerCurates = h.items.canViewFilePaths(ctx)
+	detail.ViewerCurates = curates
 	if !detail.ViewerCurates {
 		for i := range detail.Versions {
 			detail.Versions[i].FilePath = ""
@@ -400,7 +311,102 @@ func (h *CatalogResourceHandler) enrichItemDetail(ctx context.Context, v ItemVie
 		detail.FolderPaths = nil
 	}
 
+	if batched {
+		state.applyTo(detail)
+		return
+	}
 	h.enrichViewerState(ctx, v, detail)
+}
+
+// detailViewerState is the viewer's own state for one item detail, as
+// batchedViewerState reads it.
+type detailViewerState struct {
+	// read is false when the batch failed; the detail then shows no viewer
+	// state, as it shows none when a one-at-a-time read fails.
+	read      bool
+	leaf      *catalog.SeasonUserData
+	userState catalog.ItemUserState
+	rating    *int
+}
+
+// applyTo sets the detail's user state and rating. Played comes from the
+// detail's user data, which the caller has already set.
+func (s detailViewerState) applyTo(detail *catalog.ItemDetail) {
+	if !s.read {
+		return
+	}
+	userState := s.userState
+	userState.Played = detail.SeasonUserData != nil && detail.SeasonUserData.Played
+	detail.UserState = &userState
+	if s.rating != nil {
+		detail.UserRating = s.rating
+	}
+}
+
+// batchedViewerState reads in one round trip what enrichItemDetail and
+// enrichViewerState otherwise read one query at a time: a leaf item's
+// progress (and a movie's version choice), the favorite, watchlist and
+// not-interested marks, the rating, and whether the profile has a watchlist
+// title entry that promotion could move onto the library watchlist. It
+// needs a store whose state lives beside the catalog; batched is false
+// otherwise, and the caller reads one at a time.
+func (h *CatalogResourceHandler) batchedViewerState(ctx context.Context, v ItemViewer, detail *catalog.ItemDetail) (state detailViewerState, batched bool) {
+	store, profileID, ok := h.items.viewerUserStore(ctx, v.ProfileID)
+	if !ok || h.items.browseRepo == nil || h.items.browseRepo.Pool() == nil {
+		return state, false
+	}
+	leaf := detail.Type == itemTypeMovie || detail.Type == itemTypeEpisode || detail.Type == itemTypeAudiobook
+	var batch pgx.Batch
+	var viewer userstore.ItemViewerState
+	if !userstore.QueueItemViewerState(store, &batch, userstore.ItemViewerStateQuery{
+		ProfileID:     profileID,
+		MediaItemID:   detail.ContentID,
+		Progress:      leaf,
+		VersionChoice: detail.Type == itemTypeMovie,
+		Marks:         true,
+	}, &viewer) {
+		return state, false
+	}
+	userID := apimw.GetUserID(ctx)
+	var rating *catalog.UserRating
+	if h.items.ratingsRepo != nil {
+		catalog.QueueUserRating(&batch, userID, profileID, detail.ContentID, &rating)
+	}
+	promoteAccess := v.Access
+	promoteAccess.UserID, promoteAccess.ProfileID = userID, profileID
+	var promotable bool
+	if h.watchlistPromoter != nil && (detail.Type == itemTypeMovie || detail.Type == itemTypeSeries) {
+		h.watchlistPromoter.QueuePromotable(&batch, promoteAccess, &promotable)
+	}
+	if err := h.items.browseRepo.Pool().SendBatch(ctx, &batch).Close(); err != nil {
+		return state, true
+	}
+	if promotable {
+		// The batch read the watchlist before promotion could add the item.
+		h.watchlistPromoter.PromoteWatchlistItem(ctx, promoteAccess, detail.ContentID)
+		inWatchlist, err := store.InWatchlist(ctx, profileID, detail.ContentID)
+		if err != nil {
+			return state, true
+		}
+		viewer.InWatchlist = inWatchlist
+	}
+
+	state.read = true
+	if leaf {
+		state.leaf = leafUserDataFromProgress(viewer.Progress)
+		if detail.Type == itemTypeMovie {
+			state.leaf = applyVersionChoice(state.leaf, viewer.VersionChoice)
+		}
+	}
+	state.userState = catalog.ItemUserState{
+		IsFavorite:    viewer.IsFavorite,
+		InWatchlist:   viewer.InWatchlist,
+		NotInterested: viewer.NotInterested,
+	}
+	if rating != nil {
+		state.rating = &rating.Rating
+	}
+	return state, true
 }
 
 func (h *CatalogResourceHandler) enrichViewerState(ctx context.Context, v ItemViewer, detail *catalog.ItemDetail) {

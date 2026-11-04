@@ -85,31 +85,22 @@ func (p *interestTrackingProvider) ForUser(ctx context.Context, userID int) (use
 	// send callers down a fast path that can only fail.
 	registry, hasDevices := store.(userstore.DeviceRegistry)
 	rollup, hasRollup := store.(userstore.SeriesEpisodeRollupStore)
-	profiles, hasProfiles := store.(userstore.DeviceProfileRegistry)
 	completion, hasCompletion := store.(userstore.EpisodeParentCompletionStore)
 	var wrapped userstore.UserStore = tracked
 	switch {
 	case hasDevices && hasRollup && hasCompletion:
-		inner := &interestTrackingStoreWithDevicesAndRollup{
-			interestTrackingStore: tracked, DeviceRegistry: registry, SeriesEpisodeRollupStore: rollup,
-		}
-		if hasProfiles {
-			inner.DeviceProfileRegistry = profiles
-		}
 		wrapped = &interestTrackingStoreWithDevicesRollupAndCompletion{
-			interestTrackingStoreWithDevicesAndRollup: inner,
-			EpisodeParentCompletionStore:              completion,
+			interestTrackingStoreWithDevicesAndRollup: &interestTrackingStoreWithDevicesAndRollup{
+				interestTrackingStore: tracked, DeviceRegistry: registry, SeriesEpisodeRollupStore: rollup,
+			},
+			EpisodeParentCompletionStore: completion,
 		}
 	case hasDevices && hasCompletion:
-		inner := &interestTrackingStoreWithDevices{
-			interestTrackingStore: tracked, DeviceRegistry: registry,
-		}
-		if hasProfiles {
-			inner.DeviceProfileRegistry = profiles
-		}
 		wrapped = &interestTrackingStoreWithDevicesAndCompletion{
-			interestTrackingStoreWithDevices: inner,
-			EpisodeParentCompletionStore:     completion,
+			interestTrackingStoreWithDevices: &interestTrackingStoreWithDevices{
+				interestTrackingStore: tracked, DeviceRegistry: registry,
+			},
+			EpisodeParentCompletionStore: completion,
 		}
 	case hasRollup && hasCompletion:
 		wrapped = &interestTrackingStoreWithRollupAndCompletion{
@@ -123,28 +114,15 @@ func (p *interestTrackingProvider) ForUser(ctx context.Context, userID int) (use
 			interestTrackingStore: tracked, EpisodeParentCompletionStore: completion,
 		}
 	case hasDevices && hasRollup:
-		res := &interestTrackingStoreWithDevicesAndRollup{
+		wrapped = &interestTrackingStoreWithDevicesAndRollup{
 			interestTrackingStore:    tracked,
 			DeviceRegistry:           registry,
 			SeriesEpisodeRollupStore: rollup,
 		}
-		if hasProfiles {
-			res.DeviceProfileRegistry = profiles
-		}
-		wrapped = res
 	case hasDevices:
-		res := &interestTrackingStoreWithDevices{
+		wrapped = &interestTrackingStoreWithDevices{
 			interestTrackingStore: tracked,
 			DeviceRegistry:        registry,
-		}
-		if hasProfiles {
-			res.DeviceProfileRegistry = profiles
-		}
-		wrapped = res
-	case hasProfiles:
-		wrapped = &interestTrackingStoreWithProfiles{
-			interestTrackingStore: tracked,
-			DeviceProfileRegistry: profiles,
 		}
 	case hasRollup:
 		wrapped = &interestTrackingStoreWithRollup{
@@ -186,12 +164,6 @@ func (s *interestTrackingStore) SaveOnboardingProgress(ctx context.Context, stat
 type interestTrackingStoreWithDevices struct {
 	*interestTrackingStore
 	userstore.DeviceRegistry
-	userstore.DeviceProfileRegistry
-}
-
-type interestTrackingStoreWithProfiles struct {
-	*interestTrackingStore
-	userstore.DeviceProfileRegistry
 }
 
 // interestTrackingStoreWithRollup adds the series-rollup capability only when
@@ -210,7 +182,6 @@ type interestTrackingStoreWithRollup struct {
 type interestTrackingStoreWithDevicesAndRollup struct {
 	*interestTrackingStore
 	userstore.DeviceRegistry
-	userstore.DeviceProfileRegistry
 	userstore.SeriesEpisodeRollupStore
 }
 
@@ -240,8 +211,6 @@ var _ userstore.SettingValueCompareAndSetter = (*interestTrackingStore)(nil)
 var _ userstore.SettingMutationTransactioner = (*interestTrackingStore)(nil)
 var _ userstore.SettingValueCompareAndSetter = (*interestTrackingStoreWithDevices)(nil)
 var _ userstore.SettingMutationTransactioner = (*interestTrackingStoreWithDevices)(nil)
-var _ userstore.SettingValueCompareAndSetter = (*interestTrackingStoreWithProfiles)(nil)
-var _ userstore.SettingMutationTransactioner = (*interestTrackingStoreWithProfiles)(nil)
 
 // Optional store capabilities must survive the decorator. Embedding the
 // UserStore interface promotes only that interface's methods, so each of these
@@ -252,12 +221,13 @@ var _ userstore.SettingMutationTransactioner = (*interestTrackingStoreWithProfil
 // on the backing store, so they live on the wrapper types above rather than
 // being forwarded unconditionally.
 var _ userstore.WatchedBatchWriter = (*interestTrackingStore)(nil)
+var _ userstore.ItemViewerStateQueuer = (*interestTrackingStore)(nil)
 var _ userstore.VisibleHistoryAdder = (*interestTrackingStore)(nil)
 var _ userstore.HistoryVisibilityStore = (*interestTrackingStore)(nil)
-var _ userstore.NextUpStateStore = (*interestTrackingStore)(nil)
 var _ userstore.WatchedBatchWriter = (*interestTrackingStoreWithDevices)(nil)
 var _ userstore.VisibleHistoryAdder = (*interestTrackingStoreWithDevices)(nil)
 var _ userstore.HistoryVisibilityStore = (*interestTrackingStoreWithDevices)(nil)
+var _ userstore.ItemUserFlagStore = (*interestTrackingStore)(nil)
 var _ userstore.SeriesEpisodeRollupStore = (*interestTrackingStoreWithRollup)(nil)
 var _ userstore.SeriesEpisodeRollupStore = (*interestTrackingStoreWithDevicesAndRollup)(nil)
 var _ userstore.DeviceRegistry = (*interestTrackingStoreWithDevicesAndRollup)(nil)
@@ -668,26 +638,14 @@ func (s *interestTrackingStore) VisibleHistoryTimestamps(ctx context.Context, pr
 	return visibility.VisibleHistoryTimestamps(ctx, profileID, mediaItemIDs, at)
 }
 
-// ListNextUpStatePage forwards the Next Up state page walk. The catalog's Next
-// Up repository type-asserts NextUpStateStore and treats a store without the
-// capability as a hard error, so a missing forward breaks Next Up sections in
-// production rather than degrading to a fallback.
-func (s *interestTrackingStore) ListNextUpStatePage(ctx context.Context, profileID string, cursor *userstore.NextUpStateCursor, limit int) (userstore.NextUpStatePage, error) {
-	state, ok := s.UserStore.(userstore.NextUpStateStore)
+// ItemUserFlags forwards the one-statement list and played read, reporting
+// false when the backing store has none so callers make the per-table reads.
+func (s *interestTrackingStore) ItemUserFlags(ctx context.Context, profileID string, mediaItemIDs, playedIDs []string) (map[string]userstore.ItemUserFlags, bool, error) {
+	reader, ok := s.UserStore.(userstore.ItemUserFlagStore)
 	if !ok {
-		return userstore.NextUpStatePage{}, errors.New("wrapped user store does not implement userstore.NextUpStateStore")
+		return nil, false, nil
 	}
-	return state.ListNextUpStatePage(ctx, profileID, cursor, limit)
-}
-
-// ListNextUpStateForItems forwards the by-item Next Up state read; see
-// ListNextUpStatePage.
-func (s *interestTrackingStore) ListNextUpStateForItems(ctx context.Context, profileID string, mediaItemIDs []string) ([]userstore.NextUpStateEntry, error) {
-	state, ok := s.UserStore.(userstore.NextUpStateStore)
-	if !ok {
-		return nil, errors.New("wrapped user store does not implement userstore.NextUpStateStore")
-	}
-	return state.ListNextUpStateForItems(ctx, profileID, mediaItemIDs)
+	return reader.ItemUserFlags(ctx, profileID, mediaItemIDs, playedIDs)
 }
 
 func (s *interestTrackingStore) DeleteHistoryBySource(ctx context.Context, profileID string, mediaItemIDs []string, source userstore.WatchHistorySource) error {
@@ -792,6 +750,13 @@ func preserveDeviceSettings(wrapped, inner userstore.UserStore) userstore.UserSt
 func (p *interestTrackingProvider) SupportsAtomicSectionProfileReset(pool *pgxpool.Pool) bool {
 	provider, ok := p.inner.(userstore.SectionProfileResetProvider)
 	return ok && provider.SupportsAtomicSectionProfileReset(pool)
+}
+
+// The decorator hooks writes only, so reading the shared tables directly
+// misses nothing it does.
+func (p *interestTrackingProvider) StoresAccountsIn(pool *pgxpool.Pool) bool {
+	provider, ok := p.inner.(interface{ StoresAccountsIn(*pgxpool.Pool) bool })
+	return ok && provider.StoresAccountsIn(pool)
 }
 
 func (s *interestTrackingStore) ListAdminSettingValuesPage(ctx context.Context, after userstore.SettingIdentity, limit int) ([]userstore.SettingValue, bool, error) {

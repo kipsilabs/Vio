@@ -52,7 +52,7 @@ func (h *UserDataHandler) HandleGetUserData(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	detail, err := h.detailOrSyntheticSeason(r.Context(), session, contentID)
+	detail, err := h.content.GetItemDetail(r.Context(), session, contentID, nil)
 	if err != nil {
 		writeCompatUpstreamError(w, err)
 		return
@@ -69,7 +69,7 @@ func (h *UserDataHandler) HandleGetUserData(w http.ResponseWriter, r *http.Reque
 	progress := progressMap[detail.ContentID]
 
 	if strings.EqualFold(detail.Type, "series") || strings.EqualFold(detail.Type, "season") {
-		targets, err := h.resolvePlayedTargets(r, session, chi.URLParam(r, "itemId"))
+		targets, _, err := h.resolvePlayedTargetsWithParent(r, session, chi.URLParam(r, "itemId"))
 		if err != nil {
 			writeCompatUpstreamError(w, err)
 			return
@@ -209,11 +209,15 @@ func (h *UserDataHandler) handlePlayedMutation(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	targets, err := h.resolveMarkTargets(r, session, chi.URLParam(r, "itemId"), played)
+	targets, parent, err := h.resolveMarkTargets(r, session, chi.URLParam(r, "itemId"), played)
 	if err != nil {
 		writeCompatUpstreamError(w, err)
 		return
 	}
+	// A movie or episode mark clears a rewatch's resume position, as Jellyfin
+	// does and as the native mark does; a series or season mark leaves its
+	// episodes' rewatch positions alone, as the native mark does (#3257).
+	recordRewatch := parent.kind == ""
 
 	if !validateOptionalUser(w, r, session) {
 		return
@@ -225,15 +229,15 @@ func (h *UserDataHandler) handlePlayedMutation(w http.ResponseWriter, r *http.Re
 			return
 		}
 		writer, ok := h.userData.(interface {
-			MarkPlayedBatchAt(context.Context, *Session, []string, time.Time) error
+			MarkPlayedBatchAt(context.Context, *Session, []string, time.Time, bool) error
 		})
 		if !ok {
 			writeError(w, 501, "NotImplemented", "Dated watch state unavailable")
 			return
 		}
-		err = writer.MarkPlayedBatchAt(r.Context(), session, targets, date)
+		err = writer.MarkPlayedBatchAt(r.Context(), session, targets, date, recordRewatch)
 	} else if played {
-		err = h.userData.MarkPlayedBatch(r.Context(), session, targets)
+		err = h.userData.MarkPlayedBatch(r.Context(), session, targets, recordRewatch)
 	} else {
 		err = h.userData.MarkUnplayedBatch(r.Context(), session, targets)
 	}
@@ -292,58 +296,39 @@ func (d *clientDate) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-func (h *UserDataHandler) resolvePlayedTargets(r *http.Request, session *Session, rawItemID string) ([]string, error) {
-	targets, _, err := h.resolvePlayedTargetsWithParent(r, session, rawItemID)
-	return targets, err
-}
-
-// resolveMarkTargets resolves the leaf items a played or unplayed mark writes.
-func (h *UserDataHandler) resolveMarkTargets(r *http.Request, session *Session, rawItemID string, played bool) ([]string, error) {
+// resolveMarkTargets resolves the leaf items a played or unplayed mark writes,
+// and the series or season it expanded, if any.
+func (h *UserDataHandler) resolveMarkTargets(r *http.Request, session *Session, rawItemID string, played bool) ([]string, playedParent, error) {
 	if played {
-		return h.resolvePlayedTargets(r, session, rawItemID)
+		return h.resolvePlayedTargetsWithParent(r, session, rawItemID)
 	}
 	return h.resolveUnplayedTargets(r, session, rawItemID)
 }
 
-// resolveUnplayedTargets is resolvePlayedTargets for an unplayed mark. A series
-// or season also clears its watched episodes that no longer have a library
-// file, which the episode listings leave out; otherwise their completed
-// progress keeps the series in Next Up.
-func (h *UserDataHandler) resolveUnplayedTargets(r *http.Request, session *Session, rawItemID string) ([]string, error) {
+// resolveUnplayedTargets is resolvePlayedTargetsWithParent for an unplayed
+// mark. A series or season also clears its watched episodes that no longer
+// have a library file, which the episode listings leave out; otherwise their
+// completed progress keeps the series in Next Up.
+func (h *UserDataHandler) resolveUnplayedTargets(r *http.Request, session *Session, rawItemID string) ([]string, playedParent, error) {
 	targets, parent, err := h.resolvePlayedTargetsWithParent(r, session, rawItemID)
 	if err != nil || parent.kind == "" {
-		return targets, err
+		return targets, parent, err
 	}
-	var extra []string
-	seasonHandled := false
-	if parent.kind == watchstate.ParentSeason && parent.seriesID != "" && parent.seasonNumber != nil {
-		seasonResolver, ok := h.userData.(interface {
-			ParentUnplayedTargetsForSeason(context.Context, *Session, string, string, int) ([]string, bool, error)
-		})
-		if ok {
-			extra, seasonHandled, err = seasonResolver.ParentUnplayedTargetsForSeason(r.Context(), session, parent.id, parent.seriesID, *parent.seasonNumber)
-			if err != nil {
-				return nil, err
-			}
-		}
+	resolver, ok := h.userData.(interface {
+		ParentUnplayedTargets(context.Context, *Session, string, string) ([]string, error)
+	})
+	if !ok {
+		return targets, parent, nil
 	}
-	if !seasonHandled {
-		resolver, ok := h.userData.(interface {
-			ParentUnplayedTargets(context.Context, *Session, string, string) ([]string, error)
-		})
-		if !ok {
-			return targets, nil
-		}
-		extra, err = resolver.ParentUnplayedTargets(r.Context(), session, parent.kind, parent.id)
-		if err != nil {
-			return nil, err
-		}
+	extra, err := resolver.ParentUnplayedTargets(r.Context(), session, parent.kind, parent.id)
+	if err != nil {
+		return nil, parent, err
 	}
 	seen := make(map[string]struct{}, len(targets))
 	for _, target := range targets {
 		seen[target] = struct{}{}
 	}
-	return appendUniqueContentIDs(targets, seen, extra...), nil
+	return appendUniqueContentIDs(targets, seen, extra...), parent, nil
 }
 
 // playedTargetNotFound answers a played mark on an unknown item.
@@ -353,16 +338,12 @@ const playedTargetNotFound = "Item not found"
 // empty for a movie or episode.
 type playedParent struct {
 	kind, id string
-	// seriesID and seasonNumber identify a season by durable catalog
-	// coordinates. A season row can be synthetic or partly linked, so the
-	// mutable season id alone cannot reach every watched file-less episode.
-	seriesID     string
-	seasonNumber *int
 }
 
 func (h *UserDataHandler) resolvePlayedTargetsWithParent(r *http.Request, session *Session, rawItemID string) ([]string, playedParent, error) {
 	if seasonID, err := h.codec.DecodeStringID(EncodedIDSeason, rawItemID); err == nil {
-		return h.resolveSeasonTargets(r, session, seasonID)
+		targets, err := h.resolvePlayedTargetsForSeason(r, session, seasonID)
+		return targets, playedParent{kind: watchstate.ParentSeason, id: seasonID}, err
 	}
 
 	contentID, _, err := decodeItemOrMediaSourceID(r.Context(), h.codec, rawItemID)
@@ -385,12 +366,8 @@ func (h *UserDataHandler) resolvePlayedTargetsForItem(r *http.Request, session *
 	case "movie", "episode":
 		return []string{detail.ContentID}, playedParent{}, nil
 	case "season":
-		parent := playedParent{
-			kind: watchstate.ParentSeason, id: detail.ContentID,
-			seriesID: detail.SeriesID, seasonNumber: detail.SeasonNumber,
-		}
-		targets, err := h.resolvePlayedTargetsForSeason(r, session, detail.ContentID, parent)
-		return targets, parent, err
+		targets, err := h.resolvePlayedTargetsForSeason(r, session, detail.ContentID)
+		return targets, playedParent{kind: watchstate.ParentSeason, id: detail.ContentID}, err
 	case "series":
 		seasons, err := h.content.ListSeasons(r.Context(), session, detail.ContentID, nil)
 		if err != nil {
@@ -411,75 +388,7 @@ func (h *UserDataHandler) resolvePlayedTargetsForItem(r *http.Request, session *
 	}
 }
 
-// resolveSeasonTargets resolves the played targets of a season route id and the
-// durable (series_id, season_number) coordinates that identify it. A stored
-// season resolves through GetItemDetail; a synthetic season has no row there,
-// so its id carries the coordinates instead.
-func (h *UserDataHandler) resolveSeasonTargets(r *http.Request, session *Session, seasonID string) ([]string, playedParent, error) {
-	parent := seasonParentCoordinates(r.Context(), h.content, session, seasonID)
-	targets, err := h.resolvePlayedTargetsForSeason(r, session, seasonID, parent)
-	return targets, parent, err
-}
-
-// seasonParentCoordinates names a season by its durable coordinates. The
-// catalog detail answers a stored row; when it cannot, a synthetic season id
-// already carries the same coordinates.
-func seasonParentCoordinates(ctx context.Context, content ContentService, session *Session, seasonID string) playedParent {
-	parent := playedParent{kind: watchstate.ParentSeason, id: seasonID}
-	if detail, err := content.GetItemDetail(ctx, session, seasonID, nil); err == nil && detail != nil {
-		parent.seriesID, parent.seasonNumber = detail.SeriesID, detail.SeasonNumber
-	}
-	if parent.seriesID == "" || parent.seasonNumber == nil {
-		if seriesID, seasonNumber, ok := catalog.ParseSyntheticSeasonID(seasonID); ok {
-			parent.seriesID, parent.seasonNumber = seriesID, &seasonNumber
-		}
-	}
-	return parent
-}
-
-// detailOrSyntheticSeason resolves an item detail, falling back to a synthetic
-// season detail when contentID names a season derived from episode groups that
-// has no catalog row. Without the fallback a user-data response for such a
-// season answers not-found after a successful played-state write.
-func (h *UserDataHandler) detailOrSyntheticSeason(ctx context.Context, session *Session, contentID string) (*upstreamItemDetail, error) {
-	detail, err := h.content.GetItemDetail(ctx, session, contentID, nil)
-	if err == nil {
-		return detail, nil
-	}
-	seriesID, seasonNumber, ok := catalog.ParseSyntheticSeasonID(contentID)
-	if !ok {
-		return nil, err
-	}
-	season, seasonErr := h.content.GetSeason(ctx, session, seriesID, seasonNumber, nil)
-	if seasonErr != nil || season == nil {
-		return nil, err
-	}
-	return &upstreamItemDetail{
-		ContentID:       contentID,
-		Type:            "season",
-		Title:           season.Title,
-		Overview:        season.Overview,
-		SeriesID:        seriesID,
-		SeasonNumber:    &seasonNumber,
-		EpisodeCount:    &season.EpisodeCount,
-		PosterURL:       season.PosterURL,
-		PosterPath:      season.PosterPath,
-		PosterThumbhash: season.PosterThumbhash,
-		UpdatedAt:       season.UpdatedAt,
-	}, nil
-}
-
-func (h *UserDataHandler) resolvePlayedTargetsForSeason(r *http.Request, session *Session, contentID string, parent playedParent) ([]string, error) {
-	// The episode listing is keyed by (series, season number) rather than by
-	// the season row. That is the only key a synthetic season has, and it also
-	// reaches episodes unlinked from a stored season row.
-	if parent.seriesID != "" && parent.seasonNumber != nil {
-		episodes, err := h.content.ListEpisodes(r.Context(), session, parent.seriesID, *parent.seasonNumber, nil)
-		if err != nil {
-			return nil, err
-		}
-		return episodeContentIDs(episodes), nil
-	}
+func (h *UserDataHandler) resolvePlayedTargetsForSeason(r *http.Request, session *Session, contentID string) ([]string, error) {
 	episodes, err := h.content.ListEpisodesBySeasonID(r.Context(), session, contentID, nil)
 	if err != nil {
 		return nil, err
@@ -549,7 +458,7 @@ func (h *UserDataHandler) HandleUpdateUserData(w http.ResponseWriter, r *http.Re
 		writeItemIDError(w, r, err)
 		return
 	}
-	detail, err := h.detailOrSyntheticSeason(r.Context(), session, contentID)
+	detail, err := h.content.GetItemDetail(r.Context(), session, contentID, nil)
 	if err != nil {
 		writeCompatUpstreamError(w, err)
 		return
@@ -564,7 +473,7 @@ func (h *UserDataHandler) HandleUpdateUserData(w http.ResponseWriter, r *http.Re
 			req.Played = new(*req.PlayCount > 0)
 		}
 		if req.Played != nil {
-			targets, err := h.resolveMarkTargets(r, session, chi.URLParam(r, "itemId"), *req.Played)
+			targets, _, err := h.resolveMarkTargets(r, session, chi.URLParam(r, "itemId"), *req.Played)
 			if err != nil {
 				writeCompatUpstreamError(w, err)
 				return
@@ -585,7 +494,7 @@ func (h *UserDataHandler) HandleUpdateUserData(w http.ResponseWriter, r *http.Re
 				return
 			}
 			if *req.Played {
-				err = h.userData.MarkPlayedBatch(r.Context(), session, targets)
+				err = h.userData.MarkPlayedBatch(r.Context(), session, targets, false)
 			} else {
 				err = h.userData.MarkUnplayedBatch(r.Context(), session, targets)
 			}

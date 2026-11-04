@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/url"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -13,11 +12,11 @@ import (
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/database/readtx"
 	"github.com/Silo-Server/silo-server/internal/markers"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/pathscope"
 	"github.com/Silo-Server/silo-server/internal/scanbatch"
-	"github.com/Silo-Server/silo-server/internal/virtuallibrary/stream"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -38,10 +37,6 @@ var (
 // FileRepository provides CRUD operations for the media_files table.
 type FileRepository struct {
 	pool *pgxpool.Pool
-	// virtualCandidateStoreWindow reports the configured candidate store
-	// window. Zero (or nil) keeps the pre-window sweep behavior. Wired lazily
-	// from the settings store so an admin change applies without a restart.
-	virtualCandidateStoreWindow func() time.Duration
 }
 
 type fileQueryer interface {
@@ -64,18 +59,6 @@ func NewFileRepository(pool *pgxpool.Pool) *FileRepository {
 	return &FileRepository{pool: pool}
 }
 
-// SetVirtualCandidateStoreWindow wires the candidate store window reader used
-// by ReplaceVirtualCandidates to retain a listed candidate inside the window.
-// It returns the receiver so callers can chain it onto a freshly built
-// repository; a nil callback restores the pre-window sweep behavior.
-func (r *FileRepository) SetVirtualCandidateStoreWindow(window func() time.Duration) *FileRepository {
-	if r == nil {
-		return r
-	}
-	r.virtualCandidateStoreWindow = window
-	return r
-}
-
 // fileColumns is the list of columns returned by all SELECT queries.
 const fileColumns = `id, content_id, episode_id, extra_id, season_number, episode_number,
 	media_folder_id, canonical_root_path, observed_root_path, content_group_key, group_key_version,
@@ -90,16 +73,11 @@ const fileColumns = `id, content_id, episode_id, extra_id, season_number, episod
 	recap_markers_source, recap_markers_provider, recap_markers_confidence, recap_markers_algorithm, recap_markers_detected_at,
 	preview_markers_source, preview_markers_provider, preview_markers_confidence, preview_markers_algorithm, preview_markers_detected_at,
 	edition_raw, edition_key, edition_confidence, edition_source,
-	release_name, release_group,
 	presentation_kind, presentation_group_key, presentation_part_index, presentation_part_total,
 	multi_episode_start, multi_episode_end,
 	multiple_pps, multiple_pps_scan_size, multiple_pps_scan_mtime,
-	probe_source, probe_updated_at, probe_failed_at, probe_version, match_attempted_at, missing_since, failed_at,
-	first_seen_scan_run_id, created_at, updated_at,
-	virtual_owner_installation_id, last_delivered_at,
-	resolved_url, resolved_url_expires_at,
-	provider_video_hash, provider_guid, provider_release_name, provider_release_size,
-	provider_request_headers`
+	probe_source, probe_updated_at, probe_failed_at, match_attempted_at, missing_since,
+	first_seen_scan_run_id, created_at, updated_at`
 
 const overlayFileColumns = `content_id, episode_id, media_folder_id, file_path,
 	codec_video, codec_audio, resolution, audio_channels, hdr, container,
@@ -109,6 +87,12 @@ const overlayFileColumns = `content_id, episode_id, media_folder_id, file_path,
 const mfOverlayFileColumns = `mf.content_id, mf.episode_id, mf.media_folder_id, mf.file_path,
 	mf.codec_video, mf.codec_audio, mf.resolution, mf.audio_channels, mf.hdr, mf.container,
 	mf.video_tracks, mf.audio_tracks, mf.subtitle_tracks, mf.external_subtitles, mf.edition_key`
+
+// mfEpisodeListFileColumns adds what a season's episode list shows for each
+// version beyond its overlay badges: the file ID, the size, and the probe
+// timestamps MediaFile.ProbeRejected reads.
+const mfEpisodeListFileColumns = mfOverlayFileColumns + `,
+	mf.id, mf.file_size, mf.probe_updated_at, mf.probe_failed_at`
 
 // mfFileColumns qualifies every column with the "mf" alias for use in JOIN queries
 // where unqualified "id" would be ambiguous.
@@ -125,16 +109,11 @@ const mfFileColumns = `mf.id, mf.content_id, mf.episode_id, mf.extra_id, mf.seas
 	mf.recap_markers_source, mf.recap_markers_provider, mf.recap_markers_confidence, mf.recap_markers_algorithm, mf.recap_markers_detected_at,
 	mf.preview_markers_source, mf.preview_markers_provider, mf.preview_markers_confidence, mf.preview_markers_algorithm, mf.preview_markers_detected_at,
 	mf.edition_raw, mf.edition_key, mf.edition_confidence, mf.edition_source,
-	mf.release_name, mf.release_group,
 	mf.presentation_kind, mf.presentation_group_key, mf.presentation_part_index, mf.presentation_part_total,
 	mf.multi_episode_start, mf.multi_episode_end,
 	mf.multiple_pps, mf.multiple_pps_scan_size, mf.multiple_pps_scan_mtime,
-	mf.probe_source, mf.probe_updated_at, mf.probe_failed_at, mf.probe_version, mf.match_attempted_at, mf.missing_since, mf.failed_at,
-	mf.first_seen_scan_run_id, mf.created_at, mf.updated_at,
-	mf.virtual_owner_installation_id, mf.last_delivered_at,
-	mf.resolved_url, mf.resolved_url_expires_at,
-	mf.provider_video_hash, mf.provider_guid, mf.provider_release_name, mf.provider_release_size,
-	mf.provider_request_headers`
+	mf.probe_source, mf.probe_updated_at, mf.probe_failed_at, mf.match_attempted_at, mf.missing_since,
+	mf.first_seen_scan_run_id, mf.created_at, mf.updated_at`
 
 // scanMediaFile scans a single row into a *models.MediaFile.
 func scanMediaFile(row pgx.Row) (*models.MediaFile, error) {
@@ -150,14 +129,12 @@ func scanMediaFile(row pgx.Row) (*models.MediaFile, error) {
 	var fileModifiedAt *time.Time
 	var fileHash *string
 	var codecVideo, codecAudio, resolution, container, probeSource *string
-	var probeVersion int
 	var markersSource, introMarkersSource, introMarkersProvider, introMarkersAlgorithm *string
 	var creditsMarkersSource, creditsMarkersProvider, creditsMarkersAlgorithm *string
 	var recapMarkersSource, recapMarkersProvider, recapMarkersAlgorithm *string
 	var previewMarkersSource, previewMarkersProvider, previewMarkersAlgorithm *string
 	var chapterThumbnailLastError *string
 	var editionRaw, editionKey, editionSource *string
-	var releaseName, releaseGroup *string
 	var audioChannels *int
 	var hdr *bool
 	var duration, bitrate *int
@@ -173,13 +150,6 @@ func scanMediaFile(row pgx.Row) (*models.MediaFile, error) {
 	var firstSeenScanRunID *string
 	var chapterThumbnailRetryAfter *time.Time
 	var videoTracksJSON, audioTracksJSON, subtitleTracksJSON, externalSubtitlesJSON, chaptersJSON []byte
-	var virtualOwnerInstallationID *int
-	var lastDeliveredAt *time.Time
-	var resolvedURL *string
-	var resolvedURLExpiresAt *time.Time
-	var providerVideoHash, providerGUID, providerReleaseName *string
-	var providerReleaseSize *int64
-	var providerRequestHeaders []byte
 
 	err := row.Scan(
 		&f.ID,
@@ -254,8 +224,6 @@ func scanMediaFile(row pgx.Row) (*models.MediaFile, error) {
 		&editionKey,
 		&editionConfidence,
 		&editionSource,
-		&releaseName,
-		&releaseGroup,
 		&presentationKind,
 		&presentationGroupKey,
 		&presentationPartIndex,
@@ -268,22 +236,11 @@ func scanMediaFile(row pgx.Row) (*models.MediaFile, error) {
 		&probeSource,
 		&f.ProbeUpdatedAt,
 		&f.ProbeFailedAt,
-		&probeVersion,
 		&f.MatchAttemptedAt,
 		&f.MissingSince,
-		&f.FailedAt,
 		&firstSeenScanRunID,
 		&f.CreatedAt,
 		&f.UpdatedAt,
-		&virtualOwnerInstallationID,
-		&lastDeliveredAt,
-		&resolvedURL,
-		&resolvedURLExpiresAt,
-		&providerVideoHash,
-		&providerGUID,
-		&providerReleaseName,
-		&providerReleaseSize,
-		&providerRequestHeaders,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -307,36 +264,6 @@ func scanMediaFile(row pgx.Row) (*models.MediaFile, error) {
 	}
 	if episodeNumber != nil {
 		f.EpisodeNumber = *episodeNumber
-	}
-	if virtualOwnerInstallationID != nil {
-		f.VirtualOwnerInstallationID = *virtualOwnerInstallationID
-		f.VirtualOwnerInstallationSet = true
-	}
-	if lastDeliveredAt != nil {
-		f.LastDeliveredAt = lastDeliveredAt
-	}
-	if resolvedURL != nil {
-		f.ResolvedURL = *resolvedURL
-	}
-	if resolvedURLExpiresAt != nil {
-		f.ResolvedURLExpiresAt = resolvedURLExpiresAt
-	}
-	if providerVideoHash != nil {
-		f.ProviderVideoHash = *providerVideoHash
-	}
-	if providerGUID != nil {
-		f.ProviderGUID = *providerGUID
-	}
-	if providerReleaseName != nil {
-		f.ProviderReleaseName = *providerReleaseName
-	}
-	if providerReleaseSize != nil {
-		f.ProviderReleaseSize = *providerReleaseSize
-	}
-	if len(providerRequestHeaders) > 0 {
-		if err := json.Unmarshal(providerRequestHeaders, &f.ProviderRequestHeaders); err != nil {
-			return nil, fmt.Errorf("unmarshaling provider_request_headers: %w", err)
-		}
 	}
 	if canonicalRootPath != nil {
 		f.CanonicalRootPath = *canonicalRootPath
@@ -407,7 +334,6 @@ func scanMediaFile(row pgx.Row) (*models.MediaFile, error) {
 	if probeSource != nil {
 		f.ProbeSource = *probeSource
 	}
-	f.ProbeVersion = probeVersion
 	if editionRaw != nil {
 		f.EditionRaw = *editionRaw
 	}
@@ -417,12 +343,6 @@ func scanMediaFile(row pgx.Row) (*models.MediaFile, error) {
 	f.EditionConfidence = editionConfidence
 	if editionSource != nil {
 		f.EditionSource = *editionSource
-	}
-	if releaseName != nil {
-		f.ReleaseName = *releaseName
-	}
-	if releaseGroup != nil {
-		f.ReleaseGroup = *releaseGroup
 	}
 	if presentationKind != nil {
 		f.PresentationKind = *presentationKind
@@ -530,14 +450,12 @@ func scanMediaFiles(rows pgx.Rows) ([]*models.MediaFile, error) {
 		var fileModifiedAt *time.Time
 		var fileHash *string
 		var codecVideo, codecAudio, resolution, container, probeSource *string
-		var probeVersion int
 		var markersSource, introMarkersSource, introMarkersProvider, introMarkersAlgorithm *string
 		var creditsMarkersSource, creditsMarkersProvider, creditsMarkersAlgorithm *string
 		var recapMarkersSource, recapMarkersProvider, recapMarkersAlgorithm *string
 		var previewMarkersSource, previewMarkersProvider, previewMarkersAlgorithm *string
 		var chapterThumbnailLastError *string
 		var editionRaw, editionKey, editionSource *string
-		var releaseName, releaseGroup *string
 		var audioChannels *int
 		var hdr *bool
 		var duration, bitrate *int
@@ -553,13 +471,6 @@ func scanMediaFiles(rows pgx.Rows) ([]*models.MediaFile, error) {
 		var firstSeenScanRunID *string
 		var chapterThumbnailRetryAfter *time.Time
 		var videoTracksJSON, audioTracksJSON, subtitleTracksJSON, externalSubtitlesJSON, chaptersJSON []byte
-		var virtualOwnerInstallationID *int
-		var lastDeliveredAt *time.Time
-		var resolvedURL *string
-		var resolvedURLExpiresAt *time.Time
-		var providerVideoHash, providerGUID, providerReleaseName *string
-		var providerReleaseSize *int64
-		var providerRequestHeaders []byte
 
 		err := rows.Scan(
 			&f.ID,
@@ -634,8 +545,6 @@ func scanMediaFiles(rows pgx.Rows) ([]*models.MediaFile, error) {
 			&editionKey,
 			&editionConfidence,
 			&editionSource,
-			&releaseName,
-			&releaseGroup,
 			&presentationKind,
 			&presentationGroupKey,
 			&presentationPartIndex,
@@ -648,22 +557,11 @@ func scanMediaFiles(rows pgx.Rows) ([]*models.MediaFile, error) {
 			&probeSource,
 			&f.ProbeUpdatedAt,
 			&f.ProbeFailedAt,
-			&probeVersion,
 			&f.MatchAttemptedAt,
 			&f.MissingSince,
-			&f.FailedAt,
 			&firstSeenScanRunID,
 			&f.CreatedAt,
 			&f.UpdatedAt,
-			&virtualOwnerInstallationID,
-			&lastDeliveredAt,
-			&resolvedURL,
-			&resolvedURLExpiresAt,
-			&providerVideoHash,
-			&providerGUID,
-			&providerReleaseName,
-			&providerReleaseSize,
-			&providerRequestHeaders,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scanning media file row: %w", err)
@@ -753,7 +651,6 @@ func scanMediaFiles(rows pgx.Rows) ([]*models.MediaFile, error) {
 		if probeSource != nil {
 			f.ProbeSource = *probeSource
 		}
-		f.ProbeVersion = probeVersion
 		if editionRaw != nil {
 			f.EditionRaw = *editionRaw
 		}
@@ -763,12 +660,6 @@ func scanMediaFiles(rows pgx.Rows) ([]*models.MediaFile, error) {
 		f.EditionConfidence = editionConfidence
 		if editionSource != nil {
 			f.EditionSource = *editionSource
-		}
-		if releaseName != nil {
-			f.ReleaseName = *releaseName
-		}
-		if releaseGroup != nil {
-			f.ReleaseGroup = *releaseGroup
 		}
 		if presentationKind != nil {
 			f.PresentationKind = *presentationKind
@@ -790,36 +681,6 @@ func scanMediaFiles(rows pgx.Rows) ([]*models.MediaFile, error) {
 		}
 		if multiEpisodeEnd != nil {
 			f.MultiEpisodeEnd = *multiEpisodeEnd
-		}
-		if virtualOwnerInstallationID != nil {
-			f.VirtualOwnerInstallationID = *virtualOwnerInstallationID
-			f.VirtualOwnerInstallationSet = true
-		}
-		if lastDeliveredAt != nil {
-			f.LastDeliveredAt = lastDeliveredAt
-		}
-		if resolvedURL != nil {
-			f.ResolvedURL = *resolvedURL
-		}
-		if resolvedURLExpiresAt != nil {
-			f.ResolvedURLExpiresAt = resolvedURLExpiresAt
-		}
-		if providerVideoHash != nil {
-			f.ProviderVideoHash = *providerVideoHash
-		}
-		if providerGUID != nil {
-			f.ProviderGUID = *providerGUID
-		}
-		if providerReleaseName != nil {
-			f.ProviderReleaseName = *providerReleaseName
-		}
-		if providerReleaseSize != nil {
-			f.ProviderReleaseSize = *providerReleaseSize
-		}
-		if len(providerRequestHeaders) > 0 {
-			if err := json.Unmarshal(providerRequestHeaders, &f.ProviderRequestHeaders); err != nil {
-				return nil, fmt.Errorf("unmarshaling provider_request_headers: %w", err)
-			}
 		}
 		f.MarkersSource = markersSource
 		f.MarkersConfidence = markersConfidence
@@ -896,6 +757,19 @@ func scanMediaFiles(rows pgx.Rows) ([]*models.MediaFile, error) {
 }
 
 func scanOverlayMediaFiles(rows pgx.Rows) ([]*models.MediaFile, error) {
+	return scanOverlayMediaFilesWith(rows, nil)
+}
+
+// scanEpisodeListMediaFiles scans rows selected with mfEpisodeListFileColumns.
+func scanEpisodeListMediaFiles(rows pgx.Rows) ([]*models.MediaFile, error) {
+	return scanOverlayMediaFilesWith(rows, func(f *models.MediaFile) []any {
+		return []any{&f.ID, &f.FileSize, &f.ProbeUpdatedAt, &f.ProbeFailedAt}
+	})
+}
+
+// scanOverlayMediaFilesWith scans the overlay columns followed by the
+// destinations extra returns for each file, if any.
+func scanOverlayMediaFilesWith(rows pgx.Rows, extra func(*models.MediaFile) []any) ([]*models.MediaFile, error) {
 	var files []*models.MediaFile
 	for rows.Next() {
 		var f models.MediaFile
@@ -904,7 +778,7 @@ func scanOverlayMediaFiles(rows pgx.Rows) ([]*models.MediaFile, error) {
 		var hdr *bool
 		var videoTracksJSON, audioTracksJSON, subtitleTracksJSON, externalSubtitlesJSON []byte
 
-		if err := rows.Scan(
+		dest := []any{
 			&contentID,
 			&episodeID,
 			&f.MediaFolderID,
@@ -920,7 +794,11 @@ func scanOverlayMediaFiles(rows pgx.Rows) ([]*models.MediaFile, error) {
 			&subtitleTracksJSON,
 			&externalSubtitlesJSON,
 			&editionKey,
-		); err != nil {
+		}
+		if extra != nil {
+			dest = append(dest, extra(&f)...)
+		}
+		if err := rows.Scan(dest...); err != nil {
 			return nil, fmt.Errorf("scanning overlay media file: %w", err)
 		}
 
@@ -990,38 +868,6 @@ func serializeJSONB(v any) ([]byte, error) {
 
 // Upsert inserts or updates a media file by file_path (ON CONFLICT DO UPDATE).
 // Returns the resulting row.
-// SaveCopySafetyVerdict persists the multi-PPS bitstream scan result so the
-// first play after a restart does not re-read the opening seconds of remote
-// media. Validity is re-checked against the file's size on load.
-func (r *FileRepository) SaveCopySafetyVerdict(ctx context.Context, id int, multi bool, size int64) error {
-	_, err := r.pool.Exec(ctx, `
-		UPDATE media_files
-		SET copy_safety_multi=$2, copy_safety_checked_size=$3, copy_safety_checked_at=NOW()
-		WHERE id=$1`, id, multi, size)
-	return err
-}
-
-// LoadCopySafetyVerdict returns the persisted multi-PPS verdict for id when a
-// scan was recorded for the same file size.
-func (r *FileRepository) LoadCopySafetyVerdict(ctx context.Context, id int, size int64) (multi bool, ok bool, err error) {
-	var (
-		multiVal *bool
-		sizeVal  *int64
-	)
-	err = r.pool.QueryRow(ctx, `
-		SELECT copy_safety_multi, copy_safety_checked_size
-		FROM media_files
-		WHERE id=$1 AND copy_safety_multi IS NOT NULL
-		  AND copy_safety_checked_size=$2`, id, size).Scan(&multiVal, &sizeVal)
-	if err != nil {
-		return false, false, err
-	}
-	if multiVal == nil || sizeVal == nil || *sizeVal != size {
-		return false, false, nil
-	}
-	return *multiVal, true, nil
-}
-
 func (r *FileRepository) Upsert(ctx context.Context, mf models.MediaFile) (*models.MediaFile, error) {
 	return r.upsertWithQueryer(ctx, r.pool, mf)
 }
@@ -1158,11 +1004,9 @@ func (r *FileRepository) upsertWithQueryer(ctx context.Context, queryer fileQuer
 		duration, bitrate, video_tracks, audio_tracks, subtitle_tracks, external_subtitles, chapters,
 		intro_start, intro_end, credits_start, credits_end, markers_source, markers_confidence,
 		edition_raw, edition_key, edition_confidence, edition_source,
-		release_name, release_group,
 		presentation_kind, presentation_group_key, presentation_part_index, presentation_part_total,
 		multi_episode_start, multi_episode_end,
-		probe_source, probe_updated_at, probe_failed_at, probe_version, missing_since,
-		first_seen_scan_run_id, virtual_owner_installation_id
+		probe_source, probe_updated_at, missing_since, first_seen_scan_run_id, probe_failed_at
 	) VALUES (
 		$1, $2, $3, $4, $5,
 		$6, $7, $8, $9, $10,
@@ -1171,12 +1015,12 @@ func (r *FileRepository) upsertWithQueryer(ctx context.Context, queryer fileQuer
 		$20, $21, $22, $23, $24, $25,
 		$26, $27, $28, $29, $30, $31, $32,
 		$33, $34, $35, $36, $37, $38,
-		$39, $40, $41, $42, $43, $44,
-		$45, $46, $47, $48,
-		$49, $50,
-		$51, $52, $53, $54, $55, $56, $57
+		$39, $40, $41, $42,
+		$43, $44, $45, $46,
+		$47, $48,
+		$49, $50, $51, $52, $53
 	)
-	ON CONFLICT (file_path) WHERE virtual_owner_installation_id IS NULL DO UPDATE SET
+	ON CONFLICT (file_path) DO UPDATE SET
 		content_id = CASE
 			WHEN EXCLUDED.extra_id IS NOT NULL THEN NULL
 			ELSE COALESCE(EXCLUDED.content_id, media_files.content_id)
@@ -1224,8 +1068,6 @@ func (r *FileRepository) upsertWithQueryer(ctx context.Context, queryer fileQuer
 		edition_key = EXCLUDED.edition_key,
 		edition_confidence = EXCLUDED.edition_confidence,
 		edition_source = EXCLUDED.edition_source,
-		release_name = EXCLUDED.release_name,
-		release_group = EXCLUDED.release_group,
 		presentation_kind = EXCLUDED.presentation_kind,
 		presentation_group_key = EXCLUDED.presentation_group_key,
 		presentation_part_index = EXCLUDED.presentation_part_index,
@@ -1234,7 +1076,6 @@ func (r *FileRepository) upsertWithQueryer(ctx context.Context, queryer fileQuer
 		multi_episode_end = EXCLUDED.multi_episode_end,
 		probe_source = EXCLUDED.probe_source,
 		probe_updated_at = EXCLUDED.probe_updated_at,
-		probe_version = EXCLUDED.probe_version,
 		-- A successful probe clears the rejection and a new rejection
 		-- replaces it. A write that carries neither (the probe was skipped,
 		-- timed out, or could not read the file) keeps the stored rejection
@@ -1297,8 +1138,6 @@ func (r *FileRepository) upsertWithQueryer(ctx context.Context, queryer fileQuer
 		mf.EditionKey,
 		mf.EditionConfidence,
 		mf.EditionSource,
-		mf.ReleaseName,
-		mf.ReleaseGroup,
 		mf.PresentationKind,
 		mf.PresentationGroupKey,
 		nilIfZero(mf.PresentationPartIndex),
@@ -1307,1303 +1146,15 @@ func (r *FileRepository) upsertWithQueryer(ctx context.Context, queryer fileQuer
 		nilIfZero(mf.MultiEpisodeEnd),
 		probeSource,
 		mf.ProbeUpdatedAt,
-		mf.ProbeFailedAt,
-		mf.ProbeVersion,
 		mf.MissingSince,
 		nilIfEmpty(scanbatch.RunID(ctx)),
-		virtualOwnerInstallationValue(mf),
+		mf.ProbeFailedAt,
 	)
 	if _, ok := queryer.(*fileUpsertCapture); ok {
 		return nil, nil
 	}
 
 	return scanMediaFile(row)
-}
-
-func virtualOwnerInstallationValue(mf models.MediaFile) any {
-	if mf.VirtualOwnerInstallationSet || mf.VirtualOwnerInstallationID > 0 {
-		return mf.VirtualOwnerInstallationID
-	}
-	return nil
-}
-
-// VirtualCandidate is provider-neutral technical metadata for one ephemeral
-// stream choice. URI must remain a canonical virtual:// handle; provider URLs
-// are resolved only when playback opens the selected file.
-type VirtualCandidate struct {
-	OwnerInstallationID int
-	URI                 string
-	Label               string
-	Resolution          string
-	CodecVideo          string
-	CodecAudio          string
-	HDR                 string
-	FileSize            int64
-	Bitrate             int
-	AudioLanguages      []string
-	SubtitleLanguages   []string
-	AudioChannels       string
-	HasAtmos            bool
-	Is10Bit             bool
-	IsMultiAudio        bool
-	VisualTags          []string
-	// ResolvedURL is the candidate's provider stream URL, persisted so a later
-	// phase can reuse it. It is purely additive to URI. ResolvedURLExpiresAt
-	// is the URL's parsed expiry (nil when unparseable).
-	ResolvedURL          string
-	ResolvedURLExpiresAt *time.Time
-	// ProviderVideoHash, ProviderGUID, ProviderReleaseName and
-	// ProviderReleaseSize are the candidate's durable identity, in the same
-	// tier order as the resolver's dedup key. ProviderReleaseName is always
-	// derived when the candidate has any usable name, so every row is
-	// re-matchable by at least name+size.
-	ProviderVideoHash   string
-	ProviderGUID        string
-	ProviderReleaseName string
-	ProviderReleaseSize int64
-	// ProviderRequestHeaders is the relay-forwardable header set (Referer,
-	// Origin, User-Agent) the provider URL needs. It is stored with
-	// ResolvedURL and preserved on omission, exactly like the URL.
-	ProviderRequestHeaders map[string]string
-}
-
-// ReplaceVirtualCandidates atomically replaces the just-in-time candidates
-// for one canonical source, episode, profile, and plugin owner. Provider result
-// IDs can change between requests; replacement prevents stale rows from
-// accumulating forever while retaining other profiles and installations.
-func (r *FileRepository) ReplaceVirtualCandidates(ctx context.Context, source *models.MediaFile, candidates []VirtualCandidate) error {
-	if r == nil || r.pool == nil {
-		return errors.New("file repository is not configured")
-	}
-	if source == nil || source.ContentID == "" {
-		return errors.New("virtual candidate source is required")
-	}
-	if len(candidates) == 0 {
-		// An empty listing is a provider hiccup, not a statement that the title
-		// lost every release. It must not rewrite, sweep, or otherwise touch the
-		// persisted candidate state: a provider that intermittently returns a
-		// zero-count answer would otherwise erase a healthy version list. The
-		// provider failure is surfaced by the caller, and the next non-empty
-		// listing replaces the rows as usual.
-		return nil
-	}
-	if source.VirtualOwnerInstallationID <= 0 {
-		for _, candidate := range candidates {
-			if candidate.OwnerInstallationID > 0 {
-				source.VirtualOwnerInstallationID = candidate.OwnerInstallationID
-				break
-			}
-		}
-		if source.VirtualOwnerInstallationID <= 0 && source.ContentID != "" {
-			_ = r.pool.QueryRow(ctx, `SELECT COALESCE(virtual_owner_installation_id, 0) FROM media_items WHERE content_id = $1`, source.ContentID).Scan(&source.VirtualOwnerInstallationID)
-		}
-		if source.VirtualOwnerInstallationID <= 0 {
-			_ = r.pool.QueryRow(ctx, `SELECT id FROM plugin_installations WHERE enabled = true ORDER BY id ASC LIMIT 1`).Scan(&source.VirtualOwnerInstallationID)
-		}
-	}
-	if len(candidates) > 50 {
-		candidates = candidates[:50]
-	}
-	group, ok := virtualCandidateGroup(source.FilePath)
-	if !ok {
-		return errors.New("virtual candidate source URI is invalid")
-	}
-	tx, err := r.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("begin virtual candidate replacement: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
-	keep := make(map[int]struct{}, len(candidates))
-	owners := map[int]struct{}{source.VirtualOwnerInstallationID: {}}
-	for _, candidate := range candidates {
-		ownerInstallationID := candidate.OwnerInstallationID
-		if ownerInstallationID <= 0 {
-			ownerInstallationID = source.VirtualOwnerInstallationID
-		}
-		owners[ownerInstallationID] = struct{}{}
-		candidateGroup, candidateOK := virtualCandidateGroup(candidate.URI)
-		if !candidateOK || candidateGroup != group || !virtualCandidateSelection(candidate.URI) {
-			return fmt.Errorf("virtual candidate URI is outside its source group")
-		}
-		fileSize := candidate.FileSize
-		if fileSize < 0 {
-			fileSize = 0
-		}
-		audioTracks, err := json.Marshal(syntheticAudioTracks(candidate))
-		if err != nil {
-			return fmt.Errorf("marshal virtual candidate audio tracks: %w", err)
-		}
-		subtitleTracks, err := json.Marshal(languageSubtitleTracks(candidate.SubtitleLanguages))
-		if err != nil {
-			return fmt.Errorf("marshal virtual candidate subtitle tracks: %w", err)
-		}
-		videoTracks, err := json.Marshal(syntheticVideoTracks(candidate))
-		if err != nil {
-			return fmt.Errorf("marshal virtual candidate video tracks: %w", err)
-		}
-		audioChannels := virtualChannelsCount(candidate.AudioChannels)
-		bitrate := candidate.Bitrate
-		if bitrate < 0 {
-			bitrate = 0
-		}
-		// The expiry belongs to the URL it was parsed from. A candidate with
-		// no URL must not carry an orphan expiry into the row; the update
-		// below clears the stored expiry whenever a new URL replaces the old
-		// one, so the pair always describes the same URL.
-		var resolvedURLExpiresAt *time.Time
-		if strings.TrimSpace(candidate.ResolvedURL) != "" {
-			resolvedURLExpiresAt = candidate.ResolvedURLExpiresAt
-		}
-		// Request headers travel with the URL they authenticate. serializeJSONB
-		// returns nil for an empty map, so a header-less candidate stores NULL
-		// and the re-list preserves any previously stored set.
-		providerRequestHeadersJSON, err := serializeJSONB(candidate.ProviderRequestHeaders)
-		if err != nil {
-			return fmt.Errorf("marshal virtual candidate request headers: %w", err)
-		}
-		var id int
-		err = tx.QueryRow(ctx, `
-			-- The provider display label is display-only metadata: it lives in
-			-- edition_raw (the version flyout's fallback). Virtual files have no
-			-- filename to parse a release name from, so release_name and
-			-- release_group stay empty (the column default) on both insert and
-			-- conflict update, matching upsertVirtualFileVariant and the cleanup
-			-- migration 20260908140000_cleanup_virtual_release_metadata.sql.
-			INSERT INTO media_files (
-				content_id, episode_id, media_folder_id, file_path, file_size,
-				resolution, codec_video, codec_audio, audio_channels, hdr, container, bitrate,
-				edition_raw, release_name, release_group, audio_tracks, subtitle_tracks, video_tracks, probe_source,
-				probe_updated_at, virtual_owner_installation_id,
-				resolved_url, resolved_url_expires_at,
-				provider_video_hash, provider_guid, provider_release_name, provider_release_size,
-				provider_request_headers
-			) VALUES (
-				$1, NULLIF($2,''), $3, $4, $5,
-				NULLIF($6,''), NULLIF($7,''), NULLIF($8,''), NULLIF($9,0), $10, 'virtual',
-				NULLIF($11,0), $12, '', '', $13, $14, $15, 'virtual', NULL, $16,
-				NULLIF($17,''), $18,
-				NULLIF($19,''), NULLIF($20,''), NULLIF($21,''), NULLIF($22::bigint,0),
-				$23
-			)
-			ON CONFLICT (file_path, virtual_owner_installation_id, media_folder_id)
-				WHERE virtual_owner_installation_id IS NOT NULL
-			DO UPDATE SET
-				content_id=EXCLUDED.content_id,
-				episode_id=EXCLUDED.episode_id,
-				media_folder_id=EXCLUDED.media_folder_id,
-				file_size=EXCLUDED.file_size,
-				resolution = CASE
-					WHEN media_files.probe_updated_at IS NOT NULL THEN media_files.resolution
-					ELSE EXCLUDED.resolution
-				END,
-				codec_video = CASE
-					WHEN media_files.probe_updated_at IS NOT NULL THEN media_files.codec_video
-					ELSE EXCLUDED.codec_video
-				END,
-				codec_audio = CASE
-					WHEN media_files.probe_updated_at IS NOT NULL THEN media_files.codec_audio
-					ELSE EXCLUDED.codec_audio
-				END,
-				audio_channels = CASE
-					WHEN media_files.probe_updated_at IS NOT NULL THEN media_files.audio_channels
-					ELSE EXCLUDED.audio_channels
-				END,
-				hdr = CASE
-					WHEN media_files.probe_updated_at IS NOT NULL THEN media_files.hdr
-					ELSE EXCLUDED.hdr
-				END,
-				container = CASE
-					WHEN media_files.probe_updated_at IS NOT NULL THEN media_files.container
-					ELSE 'virtual'
-				END,
-				bitrate = CASE
-					WHEN media_files.probe_updated_at IS NOT NULL THEN media_files.bitrate
-					ELSE EXCLUDED.bitrate
-				END,
-				edition_raw=EXCLUDED.edition_raw,
-				release_name='',
-				release_group='',
-				audio_tracks = CASE
-					WHEN media_files.probe_updated_at IS NOT NULL THEN media_files.audio_tracks
-					ELSE EXCLUDED.audio_tracks
-				END,
-				subtitle_tracks = CASE
-					WHEN media_files.probe_updated_at IS NOT NULL THEN media_files.subtitle_tracks
-					ELSE EXCLUDED.subtitle_tracks
-				END,
-				video_tracks = CASE
-					WHEN media_files.probe_updated_at IS NOT NULL THEN media_files.video_tracks
-					ELSE EXCLUDED.video_tracks
-				END,
-				probe_source='virtual',
-				-- A re-list that no longer reports a provider URL must not
-				-- erase the last resolved one; only a newer successful
-				-- resolution overwrites it, and its expiry is replaced with it
-				-- so the pair always describes the same URL.
-				resolved_url = CASE
-					WHEN EXCLUDED.resolved_url IS NOT NULL THEN EXCLUDED.resolved_url
-					ELSE media_files.resolved_url
-				END,
-				resolved_url_expires_at = CASE
-					WHEN EXCLUDED.resolved_url IS NOT NULL THEN EXCLUDED.resolved_url_expires_at
-					ELSE media_files.resolved_url_expires_at
-				END,
-				-- Durable identity is preserved when a re-list omits a tier:
-				-- a release that once carried a hash keeps it until a newer
-				-- listing supplies a replacement.
-				provider_video_hash=COALESCE(EXCLUDED.provider_video_hash, media_files.provider_video_hash),
-				provider_guid=COALESCE(EXCLUDED.provider_guid, media_files.provider_guid),
-				provider_release_name=COALESCE(EXCLUDED.provider_release_name, media_files.provider_release_name),
-				provider_release_size=COALESCE(EXCLUDED.provider_release_size, media_files.provider_release_size),
-				-- Request headers belong to the stored URL. A re-list that
-				-- refreshes the URL replaces the complete header set, including
-				-- clearing it when the new URL carries none: a header-less URL
-				-- must not inherit the previous URL's credentials. A re-list
-				-- that omits the URL preserves the stored set so a
-				-- header-authenticated URL is not orphaned.
-				provider_request_headers = CASE
-					WHEN EXCLUDED.resolved_url IS NOT NULL THEN EXCLUDED.provider_request_headers
-					ELSE COALESCE(EXCLUDED.provider_request_headers, media_files.provider_request_headers)
-				END,
-				-- Registration is not a probe: preserve any existing real probe
-				-- timestamp (NULL stays NULL) so the probe repair gate can fill
-				-- real track inventory later.
-				probe_updated_at = CASE WHEN media_files.probe_updated_at IS NULL THEN NULL ELSE media_files.probe_updated_at END,
-				missing_since=NULL,
-				-- A re-list is not a recovery. The provider still offering the
-				-- release says nothing about the bytes that failed to arrive or
-				-- failed to decode, so the persisted verdict survives the
-				-- listing. Clearing is the job of MarkVirtualCandidateRecovered
-				-- (real delivery), ClearVirtualCandidateFailed (a liveness
-				-- success), or an explicit user retry/forced relink. A genuinely
-				-- new row is inserted without a failed_at and is unaffected.
-				updated_at=NOW()
-			RETURNING id`,
-			source.ContentID, source.EpisodeID, source.MediaFolderID, candidate.URI,
-			fileSize, candidate.Resolution, candidate.CodecVideo,
-			candidate.CodecAudio, audioChannels, candidate.HDR != "", bitrate,
-			candidate.Label, audioTracks, subtitleTracks, videoTracks,
-			ownerInstallationID,
-			candidate.ResolvedURL, resolvedURLExpiresAt,
-			candidate.ProviderVideoHash, candidate.ProviderGUID,
-			candidate.ProviderReleaseName, candidate.ProviderReleaseSize,
-			providerRequestHeadersJSON,
-		).Scan(&id)
-		if err != nil {
-			return fmt.Errorf("upsert virtual candidate: %w", err)
-		}
-		keep[id] = struct{}{}
-	}
-
-	ownerIDs := make([]int64, 0, len(owners))
-	for ownerID := range owners {
-		ownerIDs = append(ownerIDs, int64(ownerID))
-	}
-	rows, err := tx.Query(ctx, `
-		SELECT id, file_path
-		FROM media_files
-		WHERE content_id=$1
-		  AND COALESCE(episode_id,'')=$2
-		  AND media_folder_id=$3
-		  AND virtual_owner_installation_id=ANY($4::bigint[])
-		  AND (container='virtual' OR file_path LIKE 'virtual://%')`,
-		source.ContentID, source.EpisodeID, source.MediaFolderID, ownerIDs)
-	if err != nil {
-		return fmt.Errorf("list existing virtual candidates: %w", err)
-	}
-	var stale []int
-	for rows.Next() {
-		var id int
-		var path string
-		if err := rows.Scan(&id, &path); err != nil {
-			rows.Close()
-			return fmt.Errorf("scan existing virtual candidate: %w", err)
-		}
-		existingGroup, valid := virtualCandidateGroup(path)
-		if !valid || existingGroup != group || !virtualCandidateSelection(path) {
-			continue
-		}
-		if _, exists := keep[id]; !exists {
-			stale = append(stale, id)
-		}
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return fmt.Errorf("iterate existing virtual candidates: %w", err)
-	}
-	rows.Close()
-	if len(stale) > 0 && len(keep) > 0 {
-		// Candidate store window. A positive window keeps a listed candidate
-		// row around even after the provider's re-list drops it, so a replay of
-		// the viewer's saved pick still finds the persisted URL instead of
-		// being refused or rotated to a sibling. The window is measured from
-		// updated_at (refreshed on every re-list upsert and on a stored-URL
-		// refresh), and zero disables it, restoring the sweep below unchanged.
-		windowSeconds := 0.0
-		if r.virtualCandidateStoreWindow != nil {
-			if window := r.virtualCandidateStoreWindow(); window > 0 {
-				windowSeconds = window.Seconds()
-			}
-		}
-		// Retention: candidate identity is a provider result id that can churn
-		// between listings, but a version a user actually played is recorded as
-		// user_watch_progress.last_file_id. Keep stale rows that are still
-		// someone's last-played file so a known-working version does not vanish
-		// from the version list when the provider re-lists with new result ids.
-		// A retained row keeps its failed_at. A failed retained row stays out
-		// of the auto-pick (a re-list no longer clears the verdict), and the
-		// resolver drops SourceFailed candidates before the version-list sink,
-		// so a failed release is neither re-persisted nor offered for manual
-		// retry through the version list. Only a real delivery
-		// (MarkVirtualCandidateRecovered) or a liveness success
-		// (ClearVirtualCandidateFailed) clears the verdict; the next listing
-		// then re-adds the release if the provider still offers it.
-		//
-		// A row that actually delivered media bytes (last_delivered_at set) is
-		// retained on the same principle even if no progress row points at it:
-		// "once worked" is stronger evidence than "recently listed". These
-		// retained rows have no cleanup path here; a future retention TTL may
-		// prune them (not implemented).
-		if _, err := tx.Exec(ctx, `
-			DELETE FROM media_files
-			WHERE id = ANY($1::bigint[])
-			  AND `+virtualCandidateRetentionSQL("$2"), stale, windowSeconds); err != nil {
-			return fmt.Errorf("delete stale virtual candidates: %w", err)
-		}
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit virtual candidate replacement: %w", err)
-	}
-	return nil
-}
-
-// virtualCandidateRetentionSQL returns the SQL predicate that protects a stale
-// or dead virtual-candidate row from deletion. windowArg names the placeholder
-// carrying the candidate store window in seconds. The re-list sweep in
-// ReplaceVirtualCandidates and the dead-candidate prune in
-// PruneDeadVirtualCandidates share it, so the two retention rules can never
-// drift apart. The predicate assumes the row under test is media_files.id.
-//
-// A row is retained when any of these hold:
-//   - it delivered media bytes (last_delivered_at not null): "once worked" is
-//     stronger evidence than "recently listed";
-//   - it is still inside the candidate store window (a positive window keeps a
-//     listed candidate trusted for replay even after a re-list drops it);
-//   - it is some user's last-played file (user_watch_progress.last_file_id);
-//   - a live playback attempt's effective_media_file_id points at it (the
-//     FK is ON DELETE CASCADE, so deleting the row would destroy live session
-//     state; the FK's key-share lock serializes this against a new insert);
-//   - an open ABS-compatible session references it (ON DELETE SET NULL, so
-//     deleting the row would silently strip a live session's file identity).
-func virtualCandidateRetentionSQL(windowArg string) string {
-	return `last_delivered_at IS NULL
-			  -- Keep a candidate inside the candidate store window: it is still
-			  -- trusted for replay even though this listing dropped it. Zero
-			  -- seconds disables the clause (updated_at is never in the future).
-			  AND updated_at < NOW() - make_interval(secs => ` + windowArg + `)
-			  AND NOT EXISTS (
-				SELECT 1 FROM user_watch_progress p
-				WHERE p.last_file_id = media_files.id
-			  )
-			  -- Never delete a row a live playback attempt points at. The
-			  -- attempt's effective_media_file_id has an ON DELETE CASCADE
-			  -- foreign key, so deleting the row would destroy the attempt and
-			  -- session state out from under an active stream. The sweep runs on
-			  -- every version-list fetch, so without this guard a long session is
-			  -- unprotected for most of its life (last_delivered_at is only
-			  -- written after a direct stream finishes). The FK's key-share lock
-			  -- serializes this against a concurrent attempt insert, so the
-			  -- check cannot race a new attempt. The live window matches the
-			  -- planstore's retention: an expired attempt is already cleanup.
-			  AND NOT EXISTS (
-				SELECT 1 FROM playback_v3_attempts a
-				WHERE a.expires_at > NOW()
-				  AND a.effective_media_file_id = media_files.id
-			  )
-			  -- The same protection for the ABS-compatible session table: an
-			  -- open session references its media file with ON DELETE SET NULL,
-			  -- so deleting the row silently strips a live session's file
-			  -- identity.
-			  AND NOT EXISTS (
-				SELECT 1 FROM abs_playback_sessions s
-				WHERE s.media_file_id = media_files.id
-				  AND s.closed_at IS NULL
-			  )`
-}
-
-// virtualCandidateWindowSeconds returns the configured candidate store window
-// in seconds, or zero when the window is disabled (nil reader or non-positive
-// value). The retention predicate treats zero as "no window protection".
-func (r *FileRepository) virtualCandidateWindowSeconds() float64 {
-	if r == nil || r.virtualCandidateStoreWindow == nil {
-		return 0
-	}
-	if window := r.virtualCandidateStoreWindow(); window > 0 {
-		return window.Seconds()
-	}
-	return 0
-}
-
-// PruneDeadAbsentVirtualCandidates deletes the named virtual candidate rows
-// unless the candidate retention rule protects them. ids are candidate rows the
-// refresh has already proven both absent from the fresh listing and dead (a
-// failed_at verdict or an AltMount failed verdict); this method re-applies the
-// same retention predicate the re-list sweep uses, so a last-played, delivered,
-// in-window, or live-session row is never deleted even when dead and absent.
-// Passing the caller's evidence rather than re-deriving it keeps the "when in
-// doubt, keep" rule in one place: a missed prune is a cosmetic leftover, a
-// wrong prune is data loss.
-//
-// Rows that are not virtual candidates (the provider-neutral source row, a
-// local file) are ignored. It returns the number of rows actually deleted.
-func (r *FileRepository) PruneDeadAbsentVirtualCandidates(ctx context.Context, ids []int) (int, error) {
-	if r == nil || r.pool == nil {
-		return 0, errors.New("file repository is not configured")
-	}
-	if len(ids) == 0 {
-		return 0, nil
-	}
-	tag, err := r.pool.Exec(ctx, `
-		DELETE FROM media_files
-		WHERE id = ANY($1::bigint[])
-		  AND (container = 'virtual' OR file_path LIKE 'virtual://%')
-		  AND `+virtualCandidateRetentionSQL("$2"), ids, r.virtualCandidateWindowSeconds())
-	if err != nil {
-		return 0, fmt.Errorf("prune dead virtual candidates: %w", err)
-	}
-	return int(tag.RowsAffected()), nil
-}
-
-func virtualCandidateGroup(raw string) (string, bool) {
-	parsed, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil || parsed.Scheme != "virtual" || parsed.Host == "" {
-		return "", false
-	}
-	query := parsed.Query()
-	query.Del("result")
-	parsed.RawQuery = query.Encode()
-	parsed.Fragment = ""
-	return parsed.String(), true
-}
-
-// ListVirtualCandidatesNeedingRefresh returns the virtual candidate rows whose
-// signed stored URL is approaching expiry and still inside the candidate store
-// window, oldest expiry first. It feeds the bounded background refresh pass.
-//
-// Selection is deliberately narrow:
-//   - only rows that carry a signaled expiry (resolved_url_expires_at) are
-//     eligible: a NULL expiry is the durable unsigned-provider case and must
-//     never be re-fetched;
-//   - already-expired rows are excluded (the pass only pre-warms a live URL);
-//   - rows are confined to the trust window (updated_at inside it), so a row
-//     the server no longer trusts is never touched;
-//   - a zero window or lead matches nothing, so the pass is inert when the
-//     window is disabled.
-//
-// limit caps one pass; the caller also bounds its own batch.
-//
-// Cooldown ordering note: the refresher holds its per-row failure cooldown in
-// memory (it is deliberately not durable — a restart clears it and the next
-// pass retries), so this query cannot exclude cooling-down rows itself. The
-// caller filters them after the cap. When every row in the batch is cooling
-// down the pass cheaply skips them; rows beyond the cap wait for the next
-// pass. The per-row cooldown (an hour) is shorter than the pass's lead window
-// (two hours), so a skipped row becomes eligible again before its URL lapses.
-func (r *FileRepository) ListVirtualCandidatesNeedingRefresh(ctx context.Context, window, lead time.Duration, limit int) ([]*models.MediaFile, error) {
-	if r == nil || r.pool == nil {
-		return nil, errors.New("file repository is not configured")
-	}
-	if window <= 0 || lead <= 0 || limit <= 0 {
-		return nil, nil
-	}
-	rows, err := r.pool.Query(ctx, `
-		SELECT `+fileColumns+`
-		FROM media_files
-		WHERE (container = 'virtual' OR file_path LIKE 'virtual://%')
-		  AND resolved_url IS NOT NULL
-		  AND resolved_url_expires_at IS NOT NULL
-		  AND resolved_url_expires_at > NOW()
-		  AND resolved_url_expires_at <= NOW() + make_interval(secs => $1)
-		  AND updated_at >= NOW() - make_interval(secs => $2)
-		ORDER BY resolved_url_expires_at ASC
-		LIMIT $3`,
-		lead.Seconds(), window.Seconds(), limit)
-	if err != nil {
-		return nil, fmt.Errorf("list virtual candidates needing refresh: %w", err)
-	}
-	defer rows.Close()
-	return scanMediaFiles(rows)
-}
-
-// VirtualProviderIdentity is one virtual candidate's durable provider identity,
-// in the same tier order the resolver's dedup key uses. It is the payload the
-// identity backfill writes onto a legacy row.
-type VirtualProviderIdentity struct {
-	VideoHash   string
-	GUID        string
-	ReleaseName string
-	ReleaseSize int64
-}
-
-// ListVirtualIdentityBackfillRows returns one page of virtual candidate rows
-// that never carried provider identity: both provider_video_hash and
-// provider_guid are NULL or empty. Rows are ordered by id and keyset-paginated
-// on afterID so a resumed backfill picks up where it stopped.
-//
-// A row that already carries a hash or a GUID is never returned, so the page
-// shrinks as the backfill fills rows in and a resumed pass never reworks a row
-// that already has identity. A non-virtual row is likewise never returned.
-func (r *FileRepository) ListVirtualIdentityBackfillRows(ctx context.Context, afterID, limit int) ([]*models.MediaFile, error) {
-	if r == nil || r.pool == nil {
-		return nil, errors.New("file repository is not configured")
-	}
-	if limit <= 0 {
-		return nil, nil
-	}
-	rows, err := r.pool.Query(ctx, `
-		SELECT `+fileColumns+`
-		FROM media_files
-		WHERE (container = 'virtual' OR file_path LIKE 'virtual://%')
-		  AND virtual_owner_installation_id IS NOT NULL
-		  AND (provider_video_hash IS NULL OR provider_video_hash = '')
-		  AND (provider_guid IS NULL OR provider_guid = '')
-		  AND id > $1
-		ORDER BY id ASC
-		LIMIT $2`,
-		afterID, limit)
-	if err != nil {
-		return nil, fmt.Errorf("list virtual identity backfill rows: %w", err)
-	}
-	defer rows.Close()
-	return scanMediaFiles(rows)
-}
-
-// CountVirtualIdentityBackfillRows counts the virtual rows still missing
-// provider identity. It is the backfill's progress total and its one-shot gate:
-// zero means there is nothing left to backfill.
-func (r *FileRepository) CountVirtualIdentityBackfillRows(ctx context.Context) (int, error) {
-	if r == nil || r.pool == nil {
-		return 0, errors.New("file repository is not configured")
-	}
-	var count int
-	if err := r.pool.QueryRow(ctx, `
-		SELECT COUNT(*)
-		FROM media_files
-		WHERE (container = 'virtual' OR file_path LIKE 'virtual://%')
-		  AND virtual_owner_installation_id IS NOT NULL
-		  AND (provider_video_hash IS NULL OR provider_video_hash = '')
-		  AND (provider_guid IS NULL OR provider_guid = '')`).Scan(&count); err != nil {
-		return 0, fmt.Errorf("count virtual identity backfill rows: %w", err)
-	}
-	return count, nil
-}
-
-// FillVirtualProviderIdentity writes a confidently matched candidate's durable
-// identity onto a legacy virtual row, filling only the tiers the row is
-// missing. An existing tier is never overwritten: the write is fenced to rows
-// that carry neither a hash nor a GUID, and each column keeps its stored value
-// via COALESCE. An identity with no usable tier is a no-op, so the caller can
-// never blank an existing value or invent identity from nothing.
-//
-// expectedFilePath is the listing identity the matcher inspected; a row that
-// rotated underneath performs no write, mirroring the other virtual-candidate
-// CAS writes. It reports whether a row was actually updated.
-func (r *FileRepository) FillVirtualProviderIdentity(ctx context.Context, fileID int, expectedFilePath string, identity VirtualProviderIdentity) (bool, error) {
-	if r == nil || r.pool == nil {
-		return false, errors.New("file repository is not configured")
-	}
-	if fileID <= 0 || expectedFilePath == "" {
-		return false, nil
-	}
-	tag, err := r.pool.Exec(ctx, `
-		UPDATE media_files
-		SET provider_video_hash = COALESCE(provider_video_hash, NULLIF($2, '')),
-		    provider_guid = COALESCE(provider_guid, NULLIF($3, '')),
-		    provider_release_name = COALESCE(provider_release_name, NULLIF($4, '')),
-		    provider_release_size = COALESCE(provider_release_size, NULLIF($5::bigint, 0))
-		WHERE id = $1
-		  AND file_path = $6
-		  AND (provider_video_hash IS NULL OR provider_video_hash = '')
-		  AND (provider_guid IS NULL OR provider_guid = '')
-		  AND (NULLIF($2, '') IS NOT NULL
-		       OR NULLIF($3, '') IS NOT NULL
-		       OR NULLIF($4, '') IS NOT NULL)`,
-		fileID, identity.VideoHash, identity.GUID, identity.ReleaseName, identity.ReleaseSize, expectedFilePath)
-	if err != nil {
-		return false, fmt.Errorf("fill virtual provider identity: %w", err)
-	}
-	return tag.RowsAffected() > 0, nil
-}
-
-// VirtualCandidateDeliveryGrace is how long after a virtual candidate's last
-// successful delivery a later failure is forgiven (failed_at is not stamped).
-// A release that played recently should not be branded dead because the
-// provider flapped today: within the window the row stays selectable and the
-// auto-pick keeps preferring it for a re-verify. After the window, an absence
-// of fresh delivery evidence means a failure stamps normally. The same window
-// guards the transport no-bytes marker.
-const VirtualCandidateDeliveryGrace = 7 * 24 * time.Hour
-
-// virtualCandidateFailureGracePredicate is the SQL predicate the transport
-// failed_at stamp applies: known-good rows inside the delivery grace are
-// skipped, while rows that never delivered (or whose last delivery is stale)
-// stamp as before. gracePlaceholder is the 1-based index of the query
-// placeholder that carries the grace in seconds, so the one rule can be embedded
-// in statements whose placeholders differ. The decode-rejection stamp
-// deliberately omits this clause: bytes that cannot be decoded are unplayable
-// regardless of delivery evidence. The transport no-bytes marker in NewRouter
-// delegates here (MarkVirtualCandidateFailed), so this predicate is the single
-// definition of the rule.
-func virtualCandidateFailureGracePredicate(gracePlaceholder int) string {
-	return fmt.Sprintf(`(last_delivered_at IS NULL OR last_delivered_at < NOW() - make_interval(secs => $%d))`, gracePlaceholder)
-}
-
-// MarkVirtualCandidateFailed stamps a virtual candidate row as known-bad after
-// a transport produced no bytes (corrupted NZB, dead provider URL). The
-// auto-pick skips failed candidates. The verdict survives a provider re-list
-// (ReplaceVirtualCandidates no longer clears it): only real delivery
-// (MarkVirtualCandidateRecovered), a liveness success
-// (ClearVirtualCandidateFailed), or an explicit user retry clears it.
-//
-// A known-good row (last_delivered_at set) inside VirtualCandidateDeliveryGrace
-// is not stamped: the failure is treated as a transient flap and the candidate
-// stays eligible for the next auto-pick. This is the "prefer a release that
-// once delivered" rule, paired with the retention guard in
-// ReplaceVirtualCandidates that never deletes known-good rows.
-//
-// The write is fenced on the candidate identity the caller actually inspected:
-// expectedFilePath must still be the row's file_path and observedFailedAt must
-// still be the row's failed_at. A concurrent candidate rotation (the row's
-// file_path now points at a replacement candidate) or a newer failure stamp
-// therefore makes the write a no-op instead of mis-marking the replacement or
-// clearing fresh evidence. This mirrors ReplaceVirtualResultPin's
-// `WHERE id=$1 AND file_path=$2` guard.
-func (r *FileRepository) MarkVirtualCandidateFailed(ctx context.Context, fileID int, expectedFilePath string, observedFailedAt *time.Time) error {
-	_, err := r.MarkVirtualCandidateFailedDetailed(ctx, fileID, expectedFilePath, observedFailedAt)
-	return err
-}
-
-// MarkVirtualCandidateFailedDetailed stamps a virtual candidate row as
-// known-bad, returning whether the update actually committed. A nil error
-// from a fenced-out write or a delivery-grace skip returns committed=false.
-func (r *FileRepository) MarkVirtualCandidateFailedDetailed(ctx context.Context, fileID int, expectedFilePath string, observedFailedAt *time.Time) (bool, error) {
-	return r.markVirtualCandidateFailedDetailed(ctx, fileID, expectedFilePath, observedFailedAt, true)
-}
-
-// MarkVirtualCandidateDecodeRejected stamps a virtual candidate row as
-// known-bad after a decoder rejected the source, bypassing the delivery grace
-// that MarkVirtualCandidateFailed applies. A decode verdict is a statement
-// about the bytes themselves — they are unplayable by the executor that just
-// tried — so a candidate that delivered recently is still branded dead and the
-// auto-pick rotates instead of re-selecting the same undecodable release
-// forever. Transport failures keep the grace behavior: a provider flap is
-// forgiven for a candidate that demonstrably delivered; an undecodable release
-// is not.
-//
-// The identity/failed_at fence is identical to MarkVirtualCandidateFailed, so a
-// rotation or a newer stamp is never mis-marked by a stale verdict.
-func (r *FileRepository) MarkVirtualCandidateDecodeRejected(ctx context.Context, fileID int, expectedFilePath string, observedFailedAt *time.Time) error {
-	_, err := r.markVirtualCandidateFailedDetailed(ctx, fileID, expectedFilePath, observedFailedAt, false)
-	return err
-}
-
-// markVirtualCandidateFailedDetailed is the shared failed_at stamp. applyGrace selects
-// the transport rule: true (MarkVirtualCandidateFailed) skips known-good rows
-// inside VirtualCandidateDeliveryGrace, false (MarkVirtualCandidateDecodeRejected)
-// stamps regardless of delivery evidence. The fence and the placeholder order
-// are identical either way; only the grace clause is conditional.
-func (r *FileRepository) markVirtualCandidateFailedDetailed(ctx context.Context, fileID int, expectedFilePath string, observedFailedAt *time.Time, applyGrace bool) (bool, error) {
-	if r == nil || r.pool == nil {
-		return false, errors.New("file repository is not configured")
-	}
-	if fileID <= 0 {
-		return false, nil
-	}
-	query := `UPDATE media_files SET failed_at = NOW(), updated_at = NOW()
-		WHERE id = $1 AND file_path = $2 AND failed_at IS NOT DISTINCT FROM $3`
-	args := []any{fileID, expectedFilePath, observedFailedAt}
-	if applyGrace {
-		query += `
-		  AND ` + virtualCandidateFailureGracePredicate(4)
-		args = append(args, VirtualCandidateDeliveryGrace.Seconds())
-	}
-	tag, err := r.pool.Exec(ctx, query, args...)
-	if err != nil {
-		return false, err
-	}
-	return tag.RowsAffected() > 0, nil
-}
-
-// ClearVirtualCandidateFailed clears the failed_at stamp on a virtual candidate
-// row after a liveness check resolved its pinned result successfully, so the
-// auto-pick considers it again. No-op when the row is not virtual or has
-// vanished.
-//
-// Like MarkVirtualCandidateFailed, the write is fenced on the candidate
-// identity the check inspected: expectedFilePath must still be the row's
-// file_path and observedFailedAt must still be the row's failed_at, so a
-// concurrent rotation or a newer failure stamp is never cleared by a stale
-// success.
-func (r *FileRepository) ClearVirtualCandidateFailed(ctx context.Context, fileID int, expectedFilePath string, observedFailedAt *time.Time) error {
-	if r == nil || r.pool == nil {
-		return errors.New("file repository is not configured")
-	}
-	if fileID <= 0 {
-		return nil
-	}
-	_, err := r.pool.Exec(ctx, `UPDATE media_files SET failed_at = NULL, updated_at = NOW() WHERE id = $1 AND file_path = $2 AND failed_at IS NOT DISTINCT FROM $3 AND (container = 'virtual' OR file_path LIKE 'virtual://%')`, fileID, expectedFilePath, observedFailedAt)
-	return err
-}
-
-// MarkVirtualCandidateRecovered records durable delivery evidence for a
-// virtual candidate: it clears the failed_at stamp and sets last_delivered_at
-// after that candidate actually delivered media bytes to a client. This is the
-// transport-delivery counterpart to ClearVirtualCandidateFailed: the caller
-// passes the candidate identity the transport served (the row's file_path AT
-// DELIVERY TIME, which a session retains even after the row rotates) and the
-// failure timestamp observed when the transport started, so the write only
-// lands when the row still describes the delivered candidate in the observed
-// health state. A rotated row (now describing candidate B) or a newer failure
-// stamp on candidate A is never cleared or re-stamped by a late delivery of A.
-//
-// The two column writes are deliberately one UPDATE: delivery evidence and the
-// failed_at clear happen atomically, so a reader never sees a cleared stamp
-// without the corresponding delivery timestamp (or vice versa).
-func (r *FileRepository) MarkVirtualCandidateRecovered(ctx context.Context, fileID int, deliveredFilePath string, observedFailedAt *time.Time) error {
-	if r == nil || r.pool == nil {
-		return errors.New("file repository is not configured")
-	}
-	if fileID <= 0 || strings.TrimSpace(deliveredFilePath) == "" {
-		return nil
-	}
-	_, err := r.pool.Exec(ctx, `UPDATE media_files SET failed_at = NULL, last_delivered_at = NOW(), updated_at = NOW() WHERE id = $1 AND file_path = $2 AND failed_at IS NOT DISTINCT FROM $3 AND (container = 'virtual' OR file_path LIKE 'virtual://%')`, fileID, deliveredFilePath, observedFailedAt)
-	return err
-}
-
-// recordVirtualAdoptionRefusalSQL atomically increments the consecutive-refusal
-// count for one (file, pinned path). The CASE restarts the count when the
-// previous mark has expired, so a refusal stream separated by more than the TTL
-// does not accumulate; the ON CONFLICT upsert makes the increment safe under
-// concurrent replicas.
-const recordVirtualAdoptionRefusalSQL = `
-	INSERT INTO virtual_adoption_refusals (file_id, expected_path, refusal_count, expires_at)
-	VALUES ($1, $2, 1, now() + ($3 * interval '1 second'))
-	ON CONFLICT (file_id, expected_path) DO UPDATE
-	SET refusal_count = CASE
-	        WHEN virtual_adoption_refusals.expires_at > now()
-	        THEN virtual_adoption_refusals.refusal_count + 1
-	        ELSE 1
-	    END,
-	    expires_at = now() + ($3 * interval '1 second')
-	RETURNING refusal_count
-`
-
-// sweepVirtualAdoptionRefusalsSQL deletes a bounded batch of expired marks so
-// the table cannot retain refusal state past its window. It is best-effort and
-// intentionally bounded: the sweep runs alongside the rare refusal write, not as
-// a table-wide scan.
-const sweepVirtualAdoptionRefusalsSQL = `
-	DELETE FROM virtual_adoption_refusals
-	WHERE ctid IN (
-	    SELECT ctid FROM virtual_adoption_refusals
-	    WHERE expires_at <= now()
-	    LIMIT $1
-	)
-`
-
-// virtualAdoptionRefusalSweepBatch caps how many expired marks one refusal write
-// reclaims.
-const virtualAdoptionRefusalSweepBatch = 512
-
-// RecordVirtualAdoptionRefusal atomically increments the durable
-// consecutive-refusal count for one virtual row and pinned path and returns the
-// new count. It is the cross-replica trigger that reaches the bounded-refusal
-// decision: a restarted process or a different replica continues the same count
-// instead of restarting at zero, so the durable terminal decision is reached
-// regardless of which replica served the earlier refusals. An entry older than
-// ttl is treated as absent and restarts at one, so a provider that recovers is
-// not permanently treated as stale.
-//
-// It returns the current database error unchanged; callers must treat a store
-// error as a recoverable infrastructure failure, never as a refusal.
-func (r *FileRepository) RecordVirtualAdoptionRefusal(ctx context.Context, fileID int, expectedPath string, ttl time.Duration) (int, error) {
-	if r == nil || r.pool == nil {
-		return 0, errors.New("file repository is not configured")
-	}
-	if fileID <= 0 || strings.TrimSpace(expectedPath) == "" || ttl <= 0 {
-		return 0, nil
-	}
-	var count int
-	if err := r.pool.QueryRow(ctx, recordVirtualAdoptionRefusalSQL, fileID, expectedPath, ttl.Seconds()).Scan(&count); err != nil {
-		return 0, err
-	}
-	// Bounded, best-effort reclamation of expired marks; a failure here changes
-	// nothing about the count just recorded.
-	_, _ = r.pool.Exec(ctx, sweepVirtualAdoptionRefusalsSQL, virtualAdoptionRefusalSweepBatch)
-	return count, nil
-}
-
-// ClearVirtualAdoptionRefusal drops the durable refusal mark for one row and
-// pinned path after a write landed, so the bound resets on success. A missing
-// row is not an error.
-func (r *FileRepository) ClearVirtualAdoptionRefusal(ctx context.Context, fileID int, expectedPath string) error {
-	if r == nil || r.pool == nil {
-		return errors.New("file repository is not configured")
-	}
-	if fileID <= 0 || strings.TrimSpace(expectedPath) == "" {
-		return nil
-	}
-	_, err := r.pool.Exec(ctx, `DELETE FROM virtual_adoption_refusals WHERE file_id = $1 AND expected_path = $2`, fileID, expectedPath)
-	return err
-}
-
-// CountVirtualAdoptionRefusal returns the live durable consecutive-refusal count
-// for one row and pinned path, or zero when no live mark exists. It never
-// increments, so a caller can decide whether the bound was reached without
-// itself advancing the count.
-func (r *FileRepository) CountVirtualAdoptionRefusal(ctx context.Context, fileID int, expectedPath string) (int, error) {
-	if r == nil || r.pool == nil {
-		return 0, errors.New("file repository is not configured")
-	}
-	if fileID <= 0 || strings.TrimSpace(expectedPath) == "" {
-		return 0, nil
-	}
-	var count int
-	err := r.pool.QueryRow(ctx, `SELECT refusal_count FROM virtual_adoption_refusals WHERE file_id = $1 AND expected_path = $2 AND expires_at > now()`, fileID, expectedPath).Scan(&count)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return 0, nil
-	}
-	if err != nil {
-		return 0, err
-	}
-	return count, nil
-}
-
-// RecordVirtualAdoptionRefusalTx is RecordVirtualAdoptionRefusal bound to the
-// caller's transaction, so the increment commits atomically with the evidence
-// write or terminal decision it belongs to. The atomic upsert and TTL semantics
-// are identical to the pool variant; the expired-row sweep is deliberately not
-// run here (it would acquire a second pooled connection while the transaction is
-// open). The caller runs SweepVirtualAdoptionRefusals best-effort after commit.
-func (r *FileRepository) RecordVirtualAdoptionRefusalTx(ctx context.Context, tx pgx.Tx, fileID int, expectedPath string, ttl time.Duration) (int, error) {
-	if r == nil || tx == nil {
-		return 0, errors.New("file repository is not configured")
-	}
-	if fileID <= 0 || strings.TrimSpace(expectedPath) == "" || ttl <= 0 {
-		return 0, nil
-	}
-	var count int
-	if err := tx.QueryRow(ctx, recordVirtualAdoptionRefusalSQL, fileID, expectedPath, ttl.Seconds()).Scan(&count); err != nil {
-		return 0, err
-	}
-	return count, nil
-}
-
-// lockVirtualAdoptionRowSQL takes the media_files row lock the locked refusal
-// recorder serializes on. It is the same lock the transactional evidence saver
-// takes first, so every replica reconciles one row in the same order
-// (media_files before virtual_adoption_refusals) and cannot deadlock.
-const lockVirtualAdoptionRowSQL = `SELECT id FROM media_files WHERE id = $1 FOR UPDATE`
-
-// RecordVirtualAdoptionRefusalLocked records one consecutive refusal for a
-// virtual row and pinned path under the media_files row lock, so a refusal
-// increment taken outside the evidence transaction (the same-release sibling
-// rotation trigger) serializes on the same row-first order as the evidence write
-// and its clear. It reports the live count read under that lock, so a bound
-// decision cannot rest on a count a concurrent evidence write or clear has
-// already invalidated. A missing row is a no-op: there is nothing to count
-// against, and a refusal row for a vanished file would only fail its foreign
-// key. The expired-row sweep runs best-effort after commit.
-func (r *FileRepository) RecordVirtualAdoptionRefusalLocked(ctx context.Context, fileID int, expectedPath string, ttl time.Duration) (int, error) {
-	if r == nil || r.pool == nil {
-		return 0, errors.New("file repository is not configured")
-	}
-	if fileID <= 0 || strings.TrimSpace(expectedPath) == "" || ttl <= 0 {
-		return 0, nil
-	}
-	tx, err := r.pool.Begin(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("begin adoption refusal transaction: %w", err)
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback(context.Background())
-		}
-	}()
-
-	var lockedID int
-	lockErr := tx.QueryRow(ctx, lockVirtualAdoptionRowSQL, fileID).Scan(&lockedID)
-	if errors.Is(lockErr, pgx.ErrNoRows) {
-		return 0, nil
-	}
-	if lockErr != nil {
-		return 0, fmt.Errorf("lock virtual row for adoption refusal: %w", lockErr)
-	}
-
-	count, err := r.RecordVirtualAdoptionRefusalTx(ctx, tx, fileID, expectedPath, ttl)
-	if err != nil {
-		return 0, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return 0, fmt.Errorf("commit adoption refusal transaction: %w", err)
-	}
-	committed = true
-	_, _ = r.pool.Exec(ctx, sweepVirtualAdoptionRefusalsSQL, virtualAdoptionRefusalSweepBatch)
-	return count, nil
-}
-
-// ClearVirtualAdoptionRefusalTx is ClearVirtualAdoptionRefusal bound to the
-// caller's transaction, so a successful evidence write and the exact-pin clear
-// commit together. A cancel or database interruption can therefore never leave a
-// cleared write behind a still-live threshold, or a live threshold behind a
-// committed write.
-func (r *FileRepository) ClearVirtualAdoptionRefusalTx(ctx context.Context, tx pgx.Tx, fileID int, expectedPath string) error {
-	if r == nil || tx == nil {
-		return errors.New("file repository is not configured")
-	}
-	if fileID <= 0 || strings.TrimSpace(expectedPath) == "" {
-		return nil
-	}
-	_, err := tx.Exec(ctx, `DELETE FROM virtual_adoption_refusals WHERE file_id = $1 AND expected_path = $2`, fileID, expectedPath)
-	return err
-}
-
-// SweepVirtualAdoptionRefusals runs the bounded, best-effort reclamation of
-// expired refusal marks. The transactional record path hands the sweep to the
-// caller's post-commit step so the sweep never holds a second connection inside
-// the transaction; a failure changes nothing about any recorded count.
-func (r *FileRepository) SweepVirtualAdoptionRefusals(ctx context.Context) error {
-	if r == nil || r.pool == nil {
-		return errors.New("file repository is not configured")
-	}
-	_, err := r.pool.Exec(ctx, sweepVirtualAdoptionRefusalsSQL, virtualAdoptionRefusalSweepBatch)
-	return err
-}
-
-// virtualAdoptionTerminalRefusalSQL stamps the durable terminal refusal for a
-// row whose pinned adoption the bounded decision has exhausted. It is fenced on
-// the candidate identity AND the evidence revision the decision observed: the
-// row is only stamped while it still describes the exact candidate and still
-// carries the updated_at/probe_updated_at the decision was taken from. A newer
-// evidence write that advanced the row therefore wins over a stale terminal
-// instead of being condemned by it. The transport delivery grace is applied like
-// MarkVirtualCandidateFailed, so a release that recently delivered is not
-// terminally fenced by refusals alone.
-var virtualAdoptionTerminalRefusalSQL = `
-	UPDATE media_files SET failed_at = NOW(), updated_at = NOW()
-	WHERE id = $1
-	  AND file_path = $2
-	  AND failed_at IS NOT DISTINCT FROM $3
-	  AND updated_at = $4
-	  AND probe_updated_at IS NOT DISTINCT FROM $5
-	  AND (container = 'virtual' OR file_path LIKE 'virtual://%')
-	  AND ` + virtualCandidateFailureGracePredicate(6) + `
-	RETURNING id
-`
-
-// markVirtualAdoptionTerminalRefusal is the shared terminal stamp behind the
-// pool and transaction entry points. q is the pool or the caller's transaction;
-// it reports whether a marker was installed. A stale revision (a newer evidence
-// write committed since the decision) makes the stamp a no-op rather than a
-// stale terminal.
-func (r *FileRepository) markVirtualAdoptionTerminalRefusal(ctx context.Context, q fileQueryer, fileID int, expectedFilePath string, observedFailedAt *time.Time, observedUpdatedAt time.Time, observedProbeUpdatedAt *time.Time) (bool, error) {
-	if r == nil || q == nil {
-		return false, errors.New("file repository is not configured")
-	}
-	if fileID <= 0 || strings.TrimSpace(expectedFilePath) == "" {
-		return false, nil
-	}
-	var id int
-	err := q.QueryRow(ctx, virtualAdoptionTerminalRefusalSQL,
-		fileID, expectedFilePath, observedFailedAt, observedUpdatedAt, observedProbeUpdatedAt,
-		VirtualCandidateDeliveryGrace.Seconds()).Scan(&id)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
-// MarkVirtualAdoptionTerminalRefusal installs the revision-fenced terminal
-// refusal outside a transaction. It is the non-transactional fast path a caller
-// uses when it can pre-empt the write (the args builder); the authoritative
-// decision runs inside the evidence transaction.
-func (r *FileRepository) MarkVirtualAdoptionTerminalRefusal(ctx context.Context, fileID int, expectedFilePath string, observedFailedAt *time.Time, observedUpdatedAt time.Time, observedProbeUpdatedAt *time.Time) (bool, error) {
-	return r.markVirtualAdoptionTerminalRefusal(ctx, r.pool, fileID, expectedFilePath, observedFailedAt, observedUpdatedAt, observedProbeUpdatedAt)
-}
-
-// MarkVirtualAdoptionTerminalRefusalTx is MarkVirtualAdoptionTerminalRefusal
-// bound to the caller's transaction, so the terminal verdict commits with the
-// refusal count that reached the bound and is serialized on the same row lock as
-// the evidence write.
-func (r *FileRepository) MarkVirtualAdoptionTerminalRefusalTx(ctx context.Context, tx pgx.Tx, fileID int, expectedFilePath string, observedFailedAt *time.Time, observedUpdatedAt time.Time, observedProbeUpdatedAt *time.Time) (bool, error) {
-	return r.markVirtualAdoptionTerminalRefusal(ctx, tx, fileID, expectedFilePath, observedFailedAt, observedUpdatedAt, observedProbeUpdatedAt)
-}
-
-func virtualCandidateSelection(raw string) bool {
-	parsed, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil {
-		return false
-	}
-	return strings.TrimSpace(parsed.Query().Get("result")) != ""
-}
-
-const (
-	virtualResolution2160p = "2160p"
-	videoRangeHDR          = "HDR"
-)
-
-func virtualResolutionDimensions(resolution string) (int, int) {
-	switch strings.ToLower(strings.TrimSpace(resolution)) {
-	case "4320p", "8k":
-		return 7680, 4320
-	case virtualResolution2160p, "4k", "uhd":
-		return 3840, 2160
-	case "1080p", "1080i":
-		return 1920, 1080
-	case "720p":
-		return 1280, 720
-	case "480p", "sd":
-		return 720, 480
-	default:
-		return 0, 0
-	}
-}
-
-func virtualChannelsCount(ch string) int {
-	ch = strings.TrimSpace(ch)
-	switch {
-	case strings.HasPrefix(ch, "7.1"):
-		return 8
-	case strings.HasPrefix(ch, "5.1"):
-		return 6
-	case strings.HasPrefix(ch, "2.0") || ch == "2":
-		return 2
-	case strings.HasPrefix(ch, "1.0") || ch == "1":
-		return 1
-	default:
-		return 0
-	}
-}
-
-func extractDeclaredDVProfile(label string) int {
-	lower := strings.ToLower(label)
-	// "dv"/"dovi" followed by digit: "dv8" -> 8, "dovi7" -> 7. A trailing
-	// digit boundary prevents "dv80" from matching profile 8.
-	for _, p := range []struct {
-		prefix  string
-		profile int
-	}{
-		{"dv8", 8},
-		{"dv7", 7},
-		{"dv5", 5},
-		{"dovi8", 8},
-		{"dovi7", 7},
-		{"dovi5", 5},
-	} {
-		if idx := strings.Index(lower, p.prefix); idx >= 0 {
-			next := lower[idx+len(p.prefix):]
-			if next == "" || next[0] < '0' || next[0] > '9' {
-				return p.profile
-			}
-		}
-	}
-	// "profile 8"/"profile.8" with a digit boundary: "profile 80" must not
-	// match profile 8 (a "." separator like "Profile.8.HDR10" is fine).
-	for _, p := range []struct {
-		prefix  string
-		profile int
-	}{
-		{"profile 8", 8},
-		{"profile.8", 8},
-		{"profile 7", 7},
-		{"profile.7", 7},
-		{"profile 5", 5},
-		{"profile.5", 5},
-	} {
-		if idx := strings.Index(lower, p.prefix); idx >= 0 {
-			next := lower[idx+len(p.prefix):]
-			if next == "" || !isASCIIDigitVirtual(next[0]) {
-				return p.profile
-			}
-		}
-	}
-	return 0
-}
-
-func isASCIIDigitVirtual(b byte) bool { return b >= '0' && b <= '9' }
-
-func syntheticVideoTracks(candidate VirtualCandidate) []models.VideoTrack {
-	if candidate.Resolution == "" && candidate.CodecVideo == "" && candidate.HDR == "" && len(candidate.VisualTags) == 0 {
-		return []models.VideoTrack{}
-	}
-
-	videoCodec := strings.TrimSpace(candidate.CodecVideo)
-	width, height := virtualResolutionDimensions(candidate.Resolution)
-	bitDepth := 0
-	if candidate.Is10Bit {
-		bitDepth = 10
-	}
-
-	hasDV := false
-	hasHDR10Plus := false
-	hasHDR10 := false
-	hasHLG := false
-	hasGenericHDR := false
-
-	for _, tag := range candidate.VisualTags {
-		switch strings.ToLower(tag) {
-		case "dv":
-			hasDV = true
-		case "hdr10+":
-			hasHDR10Plus = true
-		case "hdr10":
-			hasHDR10 = true
-		case "hlg":
-			hasHLG = true
-		case "hdr":
-			hasGenericHDR = true
-		}
-	}
-	if !hasDV && strings.EqualFold(candidate.HDR, "dv") {
-		hasDV = true
-	}
-	if !hasHDR10Plus && strings.EqualFold(candidate.HDR, "hdr10+") {
-		hasHDR10Plus = true
-	}
-	if !hasHDR10 && strings.EqualFold(candidate.HDR, "hdr10") {
-		hasHDR10 = true
-	}
-	if !hasHLG && strings.EqualFold(candidate.HDR, "hlg") {
-		hasHLG = true
-	}
-	if !hasGenericHDR && strings.EqualFold(candidate.HDR, "hdr") {
-		hasGenericHDR = true
-	}
-
-	videoRange := "SDR"
-	videoRangeType := "SDR"
-	dvProfile := 0
-	dolbyVision := ""
-
-	if hasDV {
-		videoRange = "DolbyVision"
-		dolbyVision = "Dolby Vision"
-		dvProfile = extractDeclaredDVProfile(candidate.Label)
-		if hasHDR10Plus {
-			videoRangeType = "DOVIWithHDR10Plus"
-		} else if hasHDR10 {
-			videoRangeType = "DOVIWithHDR10"
-		} else if hasHLG {
-			videoRangeType = "DOVIWithHLG"
-		} else {
-			videoRangeType = "DOVI"
-		}
-	} else if hasHDR10Plus {
-		videoRange = videoRangeHDR
-		videoRangeType = "HDR10Plus"
-	} else if hasHDR10 {
-		videoRange = videoRangeHDR
-		videoRangeType = "HDR10"
-	} else if hasHLG {
-		videoRange = videoRangeHDR
-		videoRangeType = "HLG"
-	} else if hasGenericHDR {
-		videoRange = videoRangeHDR
-		videoRangeType = videoRangeHDR
-	}
-
-	bitrate := candidate.Bitrate
-	if bitrate <= 0 {
-		bitrate = 0
-	}
-	frameRate := ""
-
-	vt := models.VideoTrack{
-		Codec:          videoCodec,
-		Width:          width,
-		Height:         height,
-		BitDepth:       bitDepth,
-		FrameRate:      frameRate,
-		Bitrate:        bitrate,
-		VideoRange:     videoRange,
-		VideoRangeType: videoRangeType,
-		DVProfile:      dvProfile,
-		DolbyVision:    dolbyVision,
-		HDR10Plus:      hasHDR10Plus,
-	}
-	return []models.VideoTrack{vt}
-}
-
-func syntheticAudioTracks(candidate VirtualCandidate) []models.AudioTrack {
-	codec := strings.TrimSpace(candidate.CodecAudio)
-	channels := virtualChannelsCount(candidate.AudioChannels)
-
-	languages := candidate.AudioLanguages
-	if len(languages) == 0 {
-		if codec != "" || candidate.Resolution != "" {
-			t := models.AudioTrack{
-				Index:    -1,
-				Codec:    codec,
-				Channels: channels,
-				Default:  true,
-			}
-			if candidate.HasAtmos {
-				t.Title = "Dolby Atmos"
-			}
-			return []models.AudioTrack{t}
-		}
-		return []models.AudioTrack{}
-	}
-
-	result := make([]models.AudioTrack, 0, len(languages))
-	for i, lang := range languages {
-		lang = strings.TrimSpace(lang)
-		if lang == "" {
-			continue
-		}
-		t := models.AudioTrack{
-			Index:    -1,
-			Language: lang,
-			Codec:    codec,
-			Channels: channels,
-			Default:  i == 0,
-		}
-		if candidate.IsMultiAudio {
-			t.Languages = languages
-		}
-		if candidate.HasAtmos {
-			t.Title = "Dolby Atmos"
-		}
-		result = append(result, t)
-	}
-	return result
-}
-
-func languageAudioTracks(languages []string) []models.AudioTrack {
-	result := make([]models.AudioTrack, 0, len(languages))
-	for _, language := range languages {
-		if language = strings.TrimSpace(language); language != "" {
-			result = append(result, models.AudioTrack{Language: language})
-		}
-	}
-	return result
-}
-
-func languageSubtitleTracks(languages []string) []models.SubtitleTrack {
-	// Collapse language aliases onto one entry per base language so a re-list
-	// cannot persist two placeholder rows for the same language (for example
-	// "EN-US" and "ENG" from a release name).
-	deduped := stream.DedupeLanguageAliases(languages)
-	result := make([]models.SubtitleTrack, 0, len(deduped))
-	for _, language := range deduped {
-		result = append(result, models.SubtitleTrack{Language: language})
-	}
-	return result
 }
 
 // identityColumnDefaults normalizes the identity/grouping zero values the way
@@ -2719,8 +1270,6 @@ func identityArgs(key any, mf models.MediaFile, externalSubtitlesJSON []byte) []
 		mf.EditionKey,
 		mf.EditionConfidence,
 		mf.EditionSource,
-		mf.ReleaseName,
-		mf.ReleaseGroup,
 		mf.PresentationKind,
 		mf.PresentationGroupKey,
 		nilIfZero(mf.PresentationPartIndex),
@@ -2909,6 +1458,61 @@ func (r *FileRepository) MarkProbeFailed(ctx context.Context, fileID int, probed
 		normalizedMtime,
 	); err != nil {
 		return fmt.Errorf("recording probe failure: %w", err)
+	}
+	return nil
+}
+
+// UpdateMultiplePPS records the H.264 multi-PPS copy-safety verdict together
+// with the size and mtime it was computed from, so a later read can tell
+// whether the file has been rewritten since. A nil scanMtime records a verdict
+// for a row that has no file mtime; reading it back validates on size alone.
+//
+// It deliberately does not go through Upsert: that path also clears
+// match_suppressed_at and missing_since, which a copy-safety scan has no
+// business touching.
+//
+// The write is conditional on the row still holding the generation that was
+// scanned. A scan reads the opening seconds of a file over storage that can be
+// slow, so an old-generation scan finishing late would otherwise stamp its
+// verdict — and its stale size and mtime — over the replacement generation's,
+// re-validating a verdict for bytes that are gone and condemning (or clearing
+// the condemnation of) a file nobody scanned. A superseded write reports
+// ErrStaleCopySafetyScan rather than succeeding silently, because the caller
+// must also refrain from notifying live sessions on the strength of it.
+//
+// Both sides of the mtime predicate are normalized to microseconds, exactly as
+// MediaFile.PersistedVideoCopyVerdict normalizes them when it reads the verdict
+// back: Postgres stores timestamptz at microsecond resolution while a
+// filesystem mtime carries nanoseconds, so comparing the raw values would make
+// every write for a row whose mtime came from a stat call fail.
+func (r *FileRepository) UpdateMultiplePPS(ctx context.Context, fileID int, multiplePPS bool, scanSize int64, scanMtime *time.Time) error {
+	var normalizedMtime *time.Time
+	if scanMtime != nil {
+		normalized := models.NormalizeFileModifiedAt(*scanMtime)
+		normalizedMtime = &normalized
+	}
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE media_files
+		SET multiple_pps = $2,
+		    multiple_pps_scan_size = $3,
+		    multiple_pps_scan_mtime = $4,
+		    updated_at = NOW()
+		WHERE id = $1
+		  AND file_size = $3
+		  AND date_trunc('microseconds', file_modified_at) IS NOT DISTINCT FROM $4::timestamptz`,
+		fileID,
+		multiplePPS,
+		scanSize,
+		normalizedMtime,
+	)
+	if err != nil {
+		return fmt.Errorf("updating multiple pps verdict: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		// The row is gone, or it no longer carries the size and mtime that were
+		// scanned. Both mean the same thing to every caller: this verdict does
+		// not describe the file as it stands.
+		return ErrStaleCopySafetyScan
 	}
 	return nil
 }
@@ -3263,7 +1867,7 @@ func (r *FileRepository) upsertAndClearMarkers(ctx context.Context, fileID int, 
 	if err != nil {
 		return false, fmt.Errorf("begin marker mutation transaction: %w", err)
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
+	defer tx.Rollback(ctx)
 
 	state, err := loadMarkerMutationState(ctx, tx, fileID)
 	if err != nil {
@@ -3840,313 +2444,6 @@ func (r *FileRepository) GetByID(ctx context.Context, id int) (*models.MediaFile
 	return scanMediaFile(r.pool.QueryRow(ctx, query, id))
 }
 
-// stripVirtualResultParam returns the virtual URI with the pinned ?result=
-// selection removed, preserving the scheme/host/path and every other query
-// parameter. The result parameter is removed wherever it appears in the query
-// string (leading, trailing, or between other parameters). A URI whose only
-// query parameter was result collapses to the bare path with no trailing '?'.
-// The input is returned unchanged when it carries no result parameter or
-// cannot be parsed.
-func stripVirtualResultParam(raw string) string {
-	parsed, err := url.Parse(raw)
-	if err != nil {
-		return raw
-	}
-	q := parsed.Query()
-	if strings.TrimSpace(q.Get("result")) == "" {
-		return raw
-	}
-	q.Del("result")
-	parsed.RawQuery = q.Encode()
-	return parsed.String()
-}
-
-// virtualPinDB is the narrow database surface the virtual pin writes need.
-// *pgxpool.Pool implements it; tests substitute a scripted fake so the
-// collision paths can be exercised without a live Postgres.
-type virtualPinDB interface {
-	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
-	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
-}
-
-// virtualCandidateEvidenceResetSQL clears the probe, delivery and resolved-URL
-// evidence a candidate produced and reports the live owner of the target path.
-// It deliberately does not touch file_path: a row that lost a path-ownership
-// race keeps its dead pin but must not keep a stored URL or evidence that
-// describe the candidate that failed.
-//
-// The owner lookup and the clear are one statement so no repair can commit
-// between them: a repair that rotates this row and writes fresh evidence makes
-// the revision fence (file_path and updated_at observed before the failed CAS)
-// match no row, and the update count stays zero. The caller must treat that as
-// a concurrent modification, never as a clean success, so the new evidence is
-// never erased. The owner predicate is: the exact target path, the same
-// virtual owner installation and media folder, the same content and episode,
-// a different row id, and no missing_since stamp.
-//
-// Placeholders: $1 losing row id, $2 target path, $3 observed file_path,
-// $4 observed updated_at.
-const virtualCandidateEvidenceResetSQL = `
-	WITH owner AS (
-		SELECT owner.id, owner.file_path
-		FROM media_files current
-		JOIN media_files owner
-		  ON owner.file_path = $2
-		 AND owner.virtual_owner_installation_id IS NOT DISTINCT FROM current.virtual_owner_installation_id
-		 AND owner.media_folder_id IS NOT DISTINCT FROM current.media_folder_id
-		 AND owner.content_id = current.content_id
-		 AND owner.episode_id IS NOT DISTINCT FROM current.episode_id
-		 AND owner.id <> current.id
-		 AND owner.missing_since IS NULL
-		WHERE current.id = $1
-		LIMIT 1
-	),
-	cleared AS (
-		UPDATE media_files
-		SET probe_updated_at = NULL,
-			probe_source = NULL,
-			last_delivered_at = NULL,
-			resolution = NULL,
-			codec_video = NULL,
-			codec_audio = NULL,
-			audio_channels = NULL,
-			container = 'virtual',
-			hdr = false,
-			bitrate = NULL,
-			video_tracks = '[]'::jsonb,
-			audio_tracks = '[]'::jsonb,
-			subtitle_tracks = '[]'::jsonb,
-			resolved_url = NULL,
-			resolved_url_expires_at = NULL,
-			-- Advance the revision so a stale evidence writer that snapshotted the
-			-- pre-reset row cannot CAS its dead evidence back in after the clear.
-			updated_at = GREATEST(clock_timestamp(), updated_at + interval '1 microsecond')
-		WHERE id = $1
-		  AND file_path = $3
-		  AND updated_at = $4
-		  AND EXISTS (SELECT 1 FROM owner)
-		RETURNING id
-	)
-	SELECT owner.id, owner.file_path, (SELECT count(*) FROM cleared)::int
-	FROM owner`
-
-// virtualPinUpdate reports where a pin replacement landed. Replaced is true
-// when the requested target is represented in the catalog: either this row
-// took the path, or a sibling owner row already held it. Owner is set to that
-// sibling when the target path was already owned.
-type virtualPinUpdate struct {
-	Replaced bool
-	Owner    *models.MediaFile
-}
-
-func isUniqueViolation(err error) bool {
-	var pgErr *pgconn.PgError
-	return errors.As(err, &pgErr) && pgErr.Code == "23505"
-}
-
-// errVirtualPinRevisionSuperseded reports that a collision cleanup matched no
-// row because the losing row was rotated after the failed CAS. A newer repair
-// owns the row now, so its path and evidence must be left alone.
-var errVirtualPinRevisionSuperseded = errors.New("virtual pin row changed after the failed update")
-
-// virtualPinRevision is the losing row's state as observed before a pin CAS.
-// The collision fallback fences its evidence reset on this revision: only the
-// row that lost the CAS may be cleared, and only while it still holds the
-// state the caller observed.
-type virtualPinRevision struct {
-	filePath  string
-	updatedAt time.Time
-}
-
-// readVirtualPinRevision snapshots the row a pin write is about to CAS. It must
-// run before the write: a read after a 23505 could observe a newer repair that
-// another session already committed, and clearing against that revision would
-// erase the healthy evidence the repair just wrote.
-func readVirtualPinRevision(ctx context.Context, db virtualPinDB, fileID int) (virtualPinRevision, bool, error) {
-	var rev virtualPinRevision
-	err := db.QueryRow(ctx, `
-		SELECT file_path, updated_at FROM media_files WHERE id = $1`, fileID).
-		Scan(&rev.filePath, &rev.updatedAt)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return virtualPinRevision{}, false, nil
-	}
-	if err != nil {
-		return virtualPinRevision{}, false, fmt.Errorf("read virtual pin revision: %w", err)
-	}
-	return rev, true, nil
-}
-
-// adoptVirtualPinOwner handles a target path that a sibling already owns. The
-// winning candidate is already pinned on that row, so the replacement must not
-// be attempted again (the unique index would reject it forever). This row's
-// candidate evidence is cleared by id without rewriting file_path: its stored
-// URL and probe facts described the candidate that just failed, and keeping
-// them would let the durable-resume fast path serve those dead bytes.
-//
-// The clear is revision-fenced to observed, the state read before the CAS that
-// lost. A concurrent repair that rotated this row and committed fresh evidence
-// makes the fence miss; that is reported as errVirtualPinRevisionSuperseded
-// instead of success so the repair survives.
-func adoptVirtualPinOwner(ctx context.Context, db virtualPinDB, fileID int, targetPath string, observed virtualPinRevision) (*models.MediaFile, error) {
-	var ownerID int
-	var ownerPath string
-	var cleared int
-	err := db.QueryRow(ctx, virtualCandidateEvidenceResetSQL,
-		fileID, targetPath, observed.filePath, observed.updatedAt).
-		Scan(&ownerID, &ownerPath, &cleared)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, fmt.Errorf("resolve path owner for %q: no live owner row", targetPath)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("clear stale candidate evidence for %q: %w", targetPath, err)
-	}
-	if cleared == 0 {
-		return nil, fmt.Errorf("%w: %q no longer matches the observed path %q at %s",
-			errVirtualPinRevisionSuperseded, targetPath, observed.filePath, observed.updatedAt.Format(time.RFC3339Nano))
-	}
-	return &models.MediaFile{ID: ownerID, FilePath: ownerPath}, nil
-}
-
-// unpinVirtualResult strips the pinned ?result= selection from a virtual
-// file's path, preserving every other query parameter. It is a no-op when the
-// row vanished, no longer matches expectedPath (CAS), or carries no result
-// parameter. expectedPath "" skips the CAS check.
-//
-// The path is read and then CAS'd in one statement rather than held under a
-// row lock: a concurrent rotation makes the CAS match no row, which is already
-// the intended no-op. Avoiding a transaction also lets a 23505 be explained by
-// an owner lookup instead of aborting the transaction that produced it.
-//
-// A 23505 here means the neutral no-pin path is also owned by a sibling row
-// (a provider re-list materialized it concurrently). The unpinned state already
-// exists on that owner, so this row's dead candidate evidence is cleared by id
-// and the operation reports success instead of leaving a stale pin behind. The
-// clear is fenced on the path and updated_at observed before the failed CAS; a
-// concurrent repair of this row is reported as an error and left untouched.
-func (r *FileRepository) unpinVirtualResult(ctx context.Context, fileID int, expectedPath string) error {
-	return unpinVirtualResultWithDB(ctx, r.pool, fileID, expectedPath)
-}
-
-func unpinVirtualResultWithDB(ctx context.Context, db virtualPinDB, fileID int, expectedPath string) error {
-	observed, found, err := readVirtualPinRevision(ctx, db, fileID)
-	if err != nil {
-		return err
-	}
-	if !found {
-		return nil
-	}
-	currentPath := observed.filePath
-	if expectedPath != "" && currentPath != expectedPath {
-		return nil
-	}
-	neutralPath := stripVirtualResultParam(currentPath)
-	if neutralPath == currentPath {
-		return nil
-	}
-	_, err = db.Exec(ctx, `
-		UPDATE media_files
-		SET file_path = $1
-		WHERE id = $2 AND file_path = $3`, neutralPath, fileID, currentPath)
-	if err != nil {
-		if isUniqueViolation(err) {
-			if _, adoptErr := adoptVirtualPinOwner(ctx, db, fileID, neutralPath, observed); adoptErr != nil {
-				return fmt.Errorf("update path: %w (adopt path owner: %w)", err, adoptErr)
-			}
-			return nil
-		}
-		return fmt.Errorf("update path: %w", err)
-	}
-	return nil
-}
-
-// ClearVirtualResultPin strips the pinned ?result= selection from a virtual
-// file's path so the next playback re-lists live provider candidates instead
-// of resolving a cached link that just failed (expired or 5xx-ing debrid
-// links otherwise brick the title: the pin survives every failover). No-op
-// when the row has no pin or vanished concurrently.
-func (r *FileRepository) ClearVirtualResultPin(ctx context.Context, fileID int) error {
-	if err := r.unpinVirtualResult(ctx, fileID, ""); err != nil {
-		return fmt.Errorf("clear virtual result pin for file %d: %w", fileID, err)
-	}
-	return nil
-}
-
-// ReplaceVirtualResultPin conditionally updates a virtual file's path if it still
-// matches expectedPath. This prevents concurrent playback sessions or stale attempts
-// from clobbering a newer or already-updated file path.
-//
-// Collision semantics: the unique index media_files_virtual_file_owner_key
-// (file_path, virtual_owner_installation_id, media_folder_id) means a replacement
-// path can only be written to this row if no sibling row already owns that tuple.
-// A unique violation (SQLSTATE 23505) therefore means the winning candidate is a
-// separate live row that a concurrent scan/refresh already re-listed. Repointing
-// this row would duplicate it and an unpin can collide the same way when the
-// neutral path is owned too, so the existing owner row is adopted: the target is
-// already pinned there, this row's stale evidence is cleared by id without
-// rewriting file_path, and the update reports success. The clear is fenced on the
-// losing row's path and updated_at observed before the CAS; if another session
-// repaired this row after the collision, the update reports an error and leaves
-// the newer path and evidence in place. A collision with no resolvable owner is
-// a genuine failure and is returned as an error.
-func (r *FileRepository) ReplaceVirtualResultPin(ctx context.Context, fileID int, expectedPath, replacementPath string) (bool, error) {
-	res, err := replaceVirtualResultPinWithDB(ctx, r.pool, fileID, expectedPath, replacementPath)
-	if err != nil {
-		return false, fmt.Errorf("replace virtual result pin for file %d: %w", fileID, err)
-	}
-	return res.Replaced, nil
-}
-
-func replaceVirtualResultPinWithDB(ctx context.Context, db virtualPinDB, fileID int, expectedPath, replacementPath string) (virtualPinUpdate, error) {
-	observed, found, err := readVirtualPinRevision(ctx, db, fileID)
-	if err != nil {
-		return virtualPinUpdate{}, err
-	}
-	if !found {
-		return virtualPinUpdate{}, nil
-	}
-	tag, err := db.Exec(ctx, `
-		UPDATE media_files
-		SET file_path = $1,
-			-- The replacement is a different provider candidate. Probe and
-			-- delivery evidence belongs to the candidate that produced it, so
-			-- clear it: otherwise the replacement looks probed and recently
-			-- delivered (optimistic-start eligibility) without either.
-			probe_updated_at = NULL,
-			probe_source = NULL,
-			last_delivered_at = NULL,
-			resolution = NULL,
-			codec_video = NULL,
-			codec_audio = NULL,
-			audio_channels = NULL,
-			container = 'virtual',
-			hdr = false,
-			bitrate = NULL,
-			video_tracks = '[]'::jsonb,
-			audio_tracks = '[]'::jsonb,
-			subtitle_tracks = '[]'::jsonb,
-			-- The stored URL and its expiry describe the old candidate's bytes.
-			-- Clearing them with the rest of the evidence means no URL survives
-			-- pointing at a path this row no longer describes, and the
-			-- durable-resume fast path cannot fire for the replacement until it
-			-- has been resolved and probed itself.
-			resolved_url = NULL,
-			resolved_url_expires_at = NULL
-		WHERE id = $2 AND file_path = $3`, replacementPath, fileID, expectedPath)
-	if err != nil {
-		if isUniqueViolation(err) {
-			owner, adoptErr := adoptVirtualPinOwner(ctx, db, fileID, replacementPath, observed)
-			if adoptErr != nil {
-				return virtualPinUpdate{}, fmt.Errorf("replacement path is owned: %w (after %w)", adoptErr, err)
-			}
-			// The losing path remains on this row, but no dead URL or probe
-			// evidence survives. The live candidate is represented by owner.
-			return virtualPinUpdate{Replaced: true, Owner: owner}, nil
-		}
-		return virtualPinUpdate{}, err
-	}
-	return virtualPinUpdate{Replaced: tag.RowsAffected() > 0}, nil
-}
-
 // PlayableContentID returns the catalog item a media file plays as: its
 // episode, otherwise its content item, otherwise its local extra. It returns
 // ErrFileNotFound when no file has the id, and "" for an unlinked file.
@@ -4189,63 +2486,6 @@ func (r *FileRepository) GetByIDs(ctx context.Context, ids []int) ([]*models.Med
 func (r *FileRepository) GetByPath(ctx context.Context, path string) (*models.MediaFile, error) {
 	query := `SELECT ` + fileColumns + ` FROM media_files WHERE file_path = $1`
 	return scanMediaFile(r.pool.QueryRow(ctx, query, path))
-}
-
-// virtualNeutralLikePrefix builds a left-anchored LIKE pattern covering every
-// stored path for a neutral virtual key. The neutral key's query string is
-// dropped: a provider candidate URI may carry result= in any parameter
-// position, so only the scheme/host/path is guaranteed to prefix it. The
-// prefix is escaped with the backslash escape character declared by the caller
-// so a literal %, _ or \ in the path cannot widen the match.
-func virtualNeutralLikePrefix(neutralPath string) string {
-	base := neutralPath
-	if i := strings.IndexByte(base, '?'); i >= 0 {
-		base = base[:i]
-	}
-	var b strings.Builder
-	b.Grow(len(base) + 1)
-	for i := 0; i < len(base); i++ {
-		switch c := base[i]; c {
-		case '\\', '%', '_':
-			b.WriteByte('\\')
-			b.WriteByte(c)
-		default:
-			b.WriteByte(c)
-		}
-	}
-	b.WriteByte('%')
-	return b.String()
-}
-
-// GetVirtualCandidateByNeutralPath retrieves a virtual candidate while ignoring
-// the provider's rotating result selection. The stored path is matched with a
-// left-anchored LIKE so the lookup is sargable; the exact neutral key is then
-// confirmed in Go because a bare neutral key is also a prefix of sibling URIs
-// (for example a longer content id under the same scheme/host/path).
-func (r *FileRepository) GetVirtualCandidateByNeutralPath(ctx context.Context, neutralPath, contentID, episodeID string, ownerInstallationID int) (*models.MediaFile, error) {
-	query := `SELECT ` + fileColumns + `
-		FROM media_files
-		WHERE virtual_owner_installation_id = $1
-		  AND content_id = $2
-		  AND COALESCE(episode_id, '') = COALESCE($3, '')
-		  AND file_path LIKE $4 ESCAPE '\'
-		  AND missing_since IS NULL
-		ORDER BY id`
-	rows, err := r.pool.Query(ctx, query, ownerInstallationID, contentID, episodeID, virtualNeutralLikePrefix(neutralPath))
-	if err != nil {
-		return nil, fmt.Errorf("querying virtual candidate by neutral path: %w", err)
-	}
-	defer rows.Close()
-	files, err := scanMediaFiles(rows)
-	if err != nil {
-		return nil, err
-	}
-	for _, file := range files {
-		if stripVirtualResultParam(file.FilePath) == neutralPath {
-			return file, nil
-		}
-	}
-	return nil, ErrFileNotFound
 }
 
 // IsActivePath reports whether path is the exact logical path of a media file
@@ -4476,7 +2716,7 @@ func (r *FileRepository) MarkMatchAttempted(ctx context.Context, fileID int) err
 	return err
 }
 
-// IsMatchSuppressed reports whether a raw unmatched file has been canceled
+// IsMatchSuppressed reports whether a raw unmatched file has been cancelled
 // from background matching.
 func (r *FileRepository) IsMatchSuppressed(ctx context.Context, fileID int) (bool, error) {
 	var suppressed bool
@@ -5002,16 +3242,11 @@ func (r *FileRepository) MarkMissing(ctx context.Context, id int, filePath strin
 // Returns the number of rows deleted.
 func (r *FileRepository) DeleteMissingByFolder(ctx context.Context, folderID int, gracePeriod time.Duration, protectedRoots []string) (int, error) {
 	cutoff := time.Now().UTC().Add(-gracePeriod)
-	// Virtual plugin-backed files are not present on the local filesystem by
-	// design. They must never be treated as missing physical files by scanner
-	// cleanup, otherwise a scan/restart disables playback for every virtual item.
 	query := `WITH deleted AS (
 		DELETE FROM media_files mf
 		WHERE mf.media_folder_id = $1
 		  AND mf.missing_since IS NOT NULL
 		  AND mf.missing_since < $2
-		  AND (mf.container IS NULL OR mf.container <> 'virtual')
-		  AND mf.file_path NOT LIKE 'virtual://%'
 		  AND NOT EXISTS (
 			SELECT 1 FROM media_items mi
 			WHERE mi.content_id = mf.content_id
@@ -5039,7 +3274,7 @@ func (r *FileRepository) DeleteMissingByFolder(ctx context.Context, folderID int
 //
 // This is the proactive counterpart to ListRootsWithOnlyMissingFiles. That
 // query requires a root to have NO live rows left, which means it can only
-// recognize a lost mount after a scan has already marked its files missing —
+// recognise a lost mount after a scan has already marked its files missing —
 // i.e. after the damage is done. For deciding whether to mark in the first
 // place, the question is simply "does the catalog believe anything lives
 // here", because an empty-but-reachable directory that still owns cataloged
@@ -5159,7 +3394,7 @@ func (r *FileRepository) DeleteByIDs(ctx context.Context, ids []int) (int, error
 // longer covered by any configured root.
 func (r *FileRepository) ListIDsOutsideRoots(ctx context.Context, folderID int, roots []string) ([]int, error) {
 	if len(roots) == 0 {
-		rows, err := r.pool.Query(ctx, `SELECT id FROM media_files WHERE media_folder_id = $1 AND (container IS NULL OR container <> 'virtual') AND file_path NOT LIKE 'virtual://%'`, folderID)
+		rows, err := r.pool.Query(ctx, `SELECT id FROM media_files WHERE media_folder_id = $1`, folderID)
 		if err != nil {
 			return nil, fmt.Errorf("querying file ids outside roots: %w", err)
 		}
@@ -5184,7 +3419,7 @@ func (r *FileRepository) ListIDsOutsideRoots(ctx context.Context, folderID int, 
 	coveredClauses, coveredArgs := rootCoverageClauses(roots, 2)
 	args = append(args, coveredArgs...)
 
-	query := `SELECT id FROM media_files WHERE media_folder_id = $1 AND (container IS NULL OR container <> 'virtual') AND file_path NOT LIKE 'virtual://%' AND NOT (` + strings.Join(coveredClauses, " OR ") + `)`
+	query := `SELECT id FROM media_files WHERE media_folder_id = $1 AND NOT (` + strings.Join(coveredClauses, " OR ") + `)`
 	rows, err := r.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("querying file ids outside roots: %w", err)
@@ -5282,7 +3517,7 @@ func (r *FileRepository) ListByObservedRootPath(ctx context.Context, folderID in
 func (r *FileRepository) GetByContentID(ctx context.Context, contentID string) ([]*models.MediaFile, error) {
 	query := `SELECT ` + fileColumns + ` FROM media_files
 		WHERE content_id = $1 AND missing_since IS NULL
-		ORDER BY (container = 'virtual') ASC, id ASC`
+		ORDER BY id ASC`
 	rows, err := r.pool.Query(ctx, query, contentID)
 	if err != nil {
 		return nil, fmt.Errorf("querying files by content_id: %w", err)
@@ -5545,205 +3780,61 @@ func (r *servedEpisodeRows) Scan(dest ...any) error {
 // ListByEpisodeIDs returns media files grouped by episode ID for the given
 // episode IDs, excluding files that are marked missing. A multi-episode file
 // is listed under every requested episode it spans.
-//
-// A canonical episode row can be fileless when episode_aliases points at a
-// duplicate layout row that owns the files. For a requested episode, the files
-// of its alias rows are returned under the requested canonical key after the
-// direct files. Returned MediaFile.EpisodeID stays the stored alias ID; only
-// the result map key is canonical. Keeping both sets is deliberate: the
-// playability query can admit a canonical episode through either a direct file
-// or an alias file, so the file listing must offer the same candidate.
-// Direct files come first, then alias files, each in file ID order, so the
-// canonical episode's own files lead regardless of the alias rows' IDs.
 func (r *FileRepository) ListByEpisodeIDs(ctx context.Context, episodeIDs []string) (map[string][]*models.MediaFile, error) {
-	direct, err := r.listFilesByEpisodeIDs(ctx, episodeIDs)
-	if err != nil {
-		return nil, err
-	}
-	if len(episodeIDs) == 0 {
-		return direct, nil
-	}
-
-	seen := make(map[string]struct{}, len(episodeIDs))
-	canonicalIDs := make([]string, 0, len(episodeIDs))
-	for _, episodeID := range episodeIDs {
-		if _, ok := seen[episodeID]; ok {
-			continue
-		}
-		seen[episodeID] = struct{}{}
-		canonicalIDs = append(canonicalIDs, episodeID)
-	}
-
-	fallback, err := r.listAliasFilesByCanonicalEpisodeIDs(ctx, canonicalIDs)
-	if err != nil {
-		return nil, err
-	}
-	for canonicalID, files := range fallback {
-		direct[canonicalID] = mergeEpisodeFiles(direct[canonicalID], files)
-	}
-	return direct, nil
-}
-
-// mergeEpisodeFiles lists the canonical episode's own files before the files
-// of its alias rows, preserving the ID order each query returned. Both input
-// slices are already ordered by file ID, so the result is deterministic without
-// re-sorting across the two sets. A file that appears in both is kept once, at
-// its direct position.
-func mergeEpisodeFiles(direct, alias []*models.MediaFile) []*models.MediaFile {
-	if len(alias) == 0 {
-		return direct
-	}
-	seen := make(map[int]struct{}, len(direct)+len(alias))
-	merged := make([]*models.MediaFile, 0, len(direct)+len(alias))
-	for _, files := range [][]*models.MediaFile{direct, alias} {
-		for _, file := range files {
-			if file == nil {
-				continue
-			}
-			if _, ok := seen[file.ID]; ok {
-				continue
-			}
-			seen[file.ID] = struct{}{}
-			merged = append(merged, file)
-		}
-	}
-	return merged
-}
-
-// listFilesByEpisodeIDs is the direct media_files lookup behind
-// ListByEpisodeIDs. It groups by the served episode ID, so a multi-episode
-// file is listed under every requested episode it spans.
-func (r *FileRepository) listFilesByEpisodeIDs(ctx context.Context, episodeIDs []string) (map[string][]*models.MediaFile, error) {
-	grouped := make(map[string][]*models.MediaFile, len(episodeIDs))
-	if len(episodeIDs) == 0 {
-		return grouped, nil
-	}
-
-	query := `SELECT served.episode_id, ` + mfFileColumns + `
-		FROM (` + catalog.ServedEpisodeFilesSQL + `) served(episode_id, file_id)
-		JOIN media_files mf ON mf.id = served.file_id
-		ORDER BY served.episode_id ASC, mf.id ASC`
-	rows, err := r.pool.Query(ctx, query, episodeIDs)
-	if err != nil {
-		return nil, fmt.Errorf("querying files by episode_ids: %w", err)
-	}
-	defer rows.Close()
-
-	served := &servedEpisodeRows{Rows: rows}
-	files, err := scanMediaFiles(served)
-	if err != nil {
-		return nil, err
-	}
-	for i, file := range files {
-		grouped[served.episodeIDs[i]] = append(grouped[served.episodeIDs[i]], file)
-	}
-	return grouped, nil
-}
-
-func (r *FileRepository) listFilesByEpisodeIDs(ctx context.Context, episodeIDs []string) (map[string][]*models.MediaFile, error) {
-	return r.ListByEpisodeIDs(ctx, episodeIDs)
-}
-
-func mergeEpisodeFiles(direct, alias []*models.MediaFile) []*models.MediaFile {
-	if len(alias) == 0 {
-		return direct
-	}
-	out := make([]*models.MediaFile, 0, len(direct)+len(alias))
-	seen := make(map[int]struct{}, len(direct)+len(alias))
-	for _, files := range [][]*models.MediaFile{direct, alias} {
-		for _, file := range files {
-			if file == nil {
-				continue
-			}
-			if _, ok := seen[file.ID]; ok {
-				continue
-			}
-			seen[file.ID] = struct{}{}
-			out = append(out, file)
-		}
-	}
-	return out
-}
-
-// listAliasFilesByCanonicalEpisodeIDs resolves canonical episode IDs to the
-// files owned by their alias rows. It returns alias files independently of
-// direct files, ordered by file ID. ListByEpisodeIDs appends them after the
-// canonical episode's direct files.
-func (r *FileRepository) listAliasFilesByCanonicalEpisodeIDs(ctx context.Context, canonicalEpisodeIDs []string) (map[string][]*models.MediaFile, error) {
-	grouped := make(map[string][]*models.MediaFile, len(canonicalEpisodeIDs))
-	mappingRows, err := r.pool.Query(ctx, `
-		SELECT canonical_episode_id, alias_episode_id
-		FROM episode_aliases
-		WHERE canonical_episode_id = ANY($1)
-		  AND alias_episode_id IS NOT NULL
-		ORDER BY canonical_episode_id ASC, alias_episode_id ASC`, canonicalEpisodeIDs)
-	if err != nil {
-		return nil, fmt.Errorf("querying episode aliases: %w", err)
-	}
-	aliasToCanonical := make(map[string]string)
-	aliasIDs := make([]string, 0, len(canonicalEpisodeIDs))
-	for mappingRows.Next() {
-		var canonicalID, aliasID string
-		if err := mappingRows.Scan(&canonicalID, &aliasID); err != nil {
-			mappingRows.Close()
-			return nil, fmt.Errorf("scanning episode alias: %w", err)
-		}
-		if _, ok := aliasToCanonical[aliasID]; ok {
-			continue
-		}
-		aliasToCanonical[aliasID] = canonicalID
-		aliasIDs = append(aliasIDs, aliasID)
-	}
-	if err := mappingRows.Err(); err != nil {
-		mappingRows.Close()
-		return nil, fmt.Errorf("iterating episode aliases: %w", err)
-	}
-	mappingRows.Close()
-	if len(aliasIDs) == 0 {
-		return grouped, nil
-	}
-
-	filesByAlias, err := r.listFilesByEpisodeIDs(ctx, aliasIDs)
-	if err != nil {
-		return nil, err
-	}
-	for aliasID, files := range filesByAlias {
-		canonicalID := aliasToCanonical[aliasID]
-		if canonicalID == "" {
-			continue
-		}
-		grouped[canonicalID] = append(grouped[canonicalID], files...)
-	}
-	for canonicalID := range grouped {
-		sort.Slice(grouped[canonicalID], func(i, j int) bool {
-			return grouped[canonicalID][i].ID < grouped[canonicalID][j].ID
-		})
-	}
-	return grouped, nil
+	return r.listServedEpisodeFiles(ctx, episodeIDs, mfFileColumns, scanMediaFiles, "files")
 }
 
 // ListOverlayFilesByEpisodeIDs returns a lightweight media-file projection for
 // building overlay summaries, grouped by episode ID.
 func (r *FileRepository) ListOverlayFilesByEpisodeIDs(ctx context.Context, episodeIDs []string) (map[string][]*models.MediaFile, error) {
+	return r.listServedEpisodeFiles(ctx, episodeIDs, mfOverlayFileColumns, scanOverlayMediaFiles, "overlay files")
+}
+
+// ListEpisodeListFilesByEpisodeIDs returns the media-file projection a
+// season's episode list renders (mfEpisodeListFileColumns), grouped by
+// episode ID.
+func (r *FileRepository) ListEpisodeListFilesByEpisodeIDs(ctx context.Context, episodeIDs []string) (map[string][]*models.MediaFile, error) {
+	return r.listServedEpisodeFiles(ctx, episodeIDs, mfEpisodeListFileColumns, scanEpisodeListMediaFiles, "episode list files")
+}
+
+// listServedEpisodeFiles selects columns for the files served under the given
+// episodes and groups them by episode ID, in episode then file ID order. Files
+// marked missing are left out, and a multi-episode file is listed under every
+// requested episode it spans.
+func (r *FileRepository) listServedEpisodeFiles(
+	ctx context.Context,
+	episodeIDs []string,
+	columns string,
+	scan func(pgx.Rows) ([]*models.MediaFile, error),
+	what string,
+) (map[string][]*models.MediaFile, error) {
 	grouped := make(map[string][]*models.MediaFile, len(episodeIDs))
 	if len(episodeIDs) == 0 {
 		return grouped, nil
 	}
 
-	query := `SELECT served.episode_id, ` + mfOverlayFileColumns + `
+	query := `SELECT served.episode_id, ` + columns + `
 		FROM (` + catalog.ServedEpisodeFilesSQL + `) served(episode_id, file_id)
 		JOIN media_files mf ON mf.id = served.file_id
 		ORDER BY served.episode_id ASC, mf.id ASC`
-	rows, err := r.pool.Query(ctx, query, episodeIDs)
-	if err != nil {
-		return nil, fmt.Errorf("querying overlay files by episode_ids: %w", err)
+	// Each connection keeps one generic plan. Planning takes about 1 ms,
+	// several times what a short season takes to read. PostgreSQL would plan
+	// again for every list shorter than ten, because the generic plan is
+	// priced for ten episodes; longer lists already run on it. Both branches
+	// look up each requested episode by index whatever the list's length.
+	var served *servedEpisodeRows
+	var files []*models.MediaFile
+	var scanErr error
+	err := readtx.Query(ctx, r.pool, query, []any{episodeIDs}, func(rows pgx.Rows) error {
+		served = &servedEpisodeRows{Rows: rows}
+		files, scanErr = scan(served)
+		return scanErr
+	}, readtx.GenericPlan)
+	if scanErr != nil {
+		return nil, scanErr
 	}
-	defer rows.Close()
-
-	served := &servedEpisodeRows{Rows: rows}
-	files, err := scanOverlayMediaFiles(served)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("querying %s by episode_ids: %w", what, err)
 	}
 	for i, file := range files {
 		grouped[served.episodeIDs[i]] = append(grouped[served.episodeIDs[i]], file)
@@ -6208,47 +4299,12 @@ func (r *FileRepository) ListBySeriesUnlinked(ctx context.Context, seriesContent
 // GetByEpisodeID returns all media files serving the given episode ID: linked
 // to it, or a multi-episode file spanning it.
 func (r *FileRepository) GetByEpisodeID(ctx context.Context, episodeID string) ([]*models.MediaFile, error) {
-	files, err := r.listFilesByEpisodeID(ctx, episodeID)
-	if err != nil {
-		return nil, err
-	}
-	aliasFiles, err := r.listAliasFilesByCanonicalEpisodeID(ctx, episodeID)
-	if err != nil {
-		return nil, err
-	}
-	return mergeEpisodeFiles(files, aliasFiles), nil
-}
-
-// listFilesByEpisodeID is the direct media_files lookup behind
-// GetByEpisodeID.
-func (r *FileRepository) listFilesByEpisodeID(ctx context.Context, episodeID string) ([]*models.MediaFile, error) {
 	query := `SELECT ` + fileColumns + ` FROM media_files
 		WHERE id IN (SELECT served.file_id FROM (` + catalog.ServedEpisodeFilesSQL + `) served(episode_id, file_id))
 		ORDER BY id ASC`
 	rows, err := r.pool.Query(ctx, query, []string{episodeID})
 	if err != nil {
 		return nil, fmt.Errorf("querying files by episode_id: %w", err)
-	}
-	defer rows.Close()
-
-	return scanMediaFiles(rows)
-}
-
-// listAliasFilesByCanonicalEpisodeID returns the present files owned by the
-// alias rows of one canonical episode, ordered by file ID.
-func (r *FileRepository) listAliasFilesByCanonicalEpisodeID(ctx context.Context, canonicalEpisodeID string) ([]*models.MediaFile, error) {
-	query := `SELECT ` + fileColumns + ` FROM media_files
-		WHERE episode_id IN (
-			SELECT alias_episode_id
-			FROM episode_aliases
-			WHERE canonical_episode_id = $1
-			  AND alias_episode_id IS NOT NULL
-		)
-		  AND missing_since IS NULL
-		ORDER BY id ASC`
-	rows, err := r.pool.Query(ctx, query, canonicalEpisodeID)
-	if err != nil {
-		return nil, fmt.Errorf("querying alias files by canonical episode_id: %w", err)
 	}
 	defer rows.Close()
 
@@ -6465,59 +4521,4 @@ func pathPrefixLike(pathPrefix string) string {
 // rows that live at or under that root; see pathscope.CoverageClauses.
 func rootCoverageClauses(roots []string, firstArg int) ([]string, []any) {
 	return pathscope.CoverageClauses("file_path", roots, firstArg)
-}
-
-// UpdateMultiplePPS records the H.264 multi-PPS copy-safety verdict together
-// with the size and mtime it was computed from, so a later read can tell
-// whether the file has been rewritten since. A nil scanMtime records a verdict
-// for a row that has no file mtime; reading it back validates on size alone.
-//
-// It deliberately does not go through Upsert: that path also clears
-// match_suppressed_at and missing_since, which a copy-safety scan has no
-// business touching.
-//
-// The write is conditional on the row still holding the generation that was
-// scanned. A scan reads the opening seconds of a file over storage that can be
-// slow, so an old-generation scan finishing late would otherwise stamp its
-// verdict — and its stale size and mtime — over the replacement generation's,
-// re-validating a verdict for bytes that are gone and condemning (or clearing
-// the condemnation of) a file nobody scanned. A superseded write reports
-// ErrStaleCopySafetyScan rather than succeeding silently, because the caller
-// must also refrain from notifying live sessions on the strength of it.
-//
-// Both sides of the mtime predicate are normalized to microseconds, exactly as
-// MediaFile.PersistedVideoCopyVerdict normalizes them when it reads the verdict
-// back: Postgres stores timestamptz at microsecond resolution while a
-// filesystem mtime carries nanoseconds, so comparing the raw values would make
-// every write for a row whose mtime came from a stat call fail.
-func (r *FileRepository) UpdateMultiplePPS(ctx context.Context, fileID int, multiplePPS bool, scanSize int64, scanMtime *time.Time) error {
-	var normalizedMtime *time.Time
-	if scanMtime != nil {
-		normalized := models.NormalizeFileModifiedAt(*scanMtime)
-		normalizedMtime = &normalized
-	}
-	tag, err := r.pool.Exec(ctx, `
-		UPDATE media_files
-		SET multiple_pps = $2,
-		    multiple_pps_scan_size = $3,
-		    multiple_pps_scan_mtime = $4,
-		    updated_at = NOW()
-		WHERE id = $1
-		  AND file_size = $3
-		  AND date_trunc('microseconds', file_modified_at) IS NOT DISTINCT FROM $4::timestamptz`,
-		fileID,
-		multiplePPS,
-		scanSize,
-		normalizedMtime,
-	)
-	if err != nil {
-		return fmt.Errorf("updating multiple pps verdict: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		// The row is gone, or it no longer carries the size and mtime that were
-		// scanned. Both mean the same thing to every caller: this verdict does
-		// not describe the file as it stands.
-		return ErrStaleCopySafetyScan
-	}
-	return nil
 }
