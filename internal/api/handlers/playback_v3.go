@@ -2188,6 +2188,7 @@ func (h *PlaybackHandler) recordStartingDevice(ctx context.Context, userID int, 
 // first authorized version of alternateBase that plans replaces it, with the
 // warnings that choice adds.
 func (h *PlaybackHandler) planStartV3(r *http.Request, req playback.StartRequestV3, requestedFile, alternateBase, effectiveFile *models.MediaFile, audioIndex int, settings playback.PlannerSettingsV3, lowerVersion *playback.LowerVersionV3, profileID string) (alternateCandidateV3, []playback.DegradationWarningV3) {
+	resolutionProvenance := ProbeProvenance("")
 	subtitleInventoryByFileID := map[int][]playback.SubtitleInventoryEntryV3{}
 	subtitleInventoryFor := func(file *models.MediaFile) []playback.SubtitleInventoryEntryV3 {
 		if file == nil {
@@ -7752,7 +7753,8 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to serialize the replan request")
 	}
 	defer unlockStore()
-	record, lease, replay, err := h.reserveReplanLeaseV3(r, sessionID, body, req, audit)
+	audit := &replanAnswerAuditV3{sessionID: sessionID}
+	record, lease, _, err := h.reserveReplanLeaseV3(r, sessionID, body, req, audit)
 	if err != nil {
 		return playback.DecisionResponseV3{}, err
 	}
@@ -7786,6 +7788,7 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 		return playback.DecisionResponseV3{}, replanSessionNotFoundV3()
 	}
 	digestBytes := sha256.Sum256(body)
+
 	digest := hex.EncodeToString(digestBytes[:])
 	lease, err := h.PlanStoreV3.BeginReplan(
 		r.Context(),
@@ -8007,7 +8010,7 @@ func (h *PlaybackHandler) reserveReplanLeaseV3(r *http.Request, sessionID string
 	}
 	digestBytes := sha256.Sum256(body)
 	digest := hex.EncodeToString(digestBytes[:])
-	lease, err := h.PlanStoreV3.BeginReplan(
+	lease, err = h.PlanStoreV3.BeginReplan(
 		r.Context(),
 		sessionID,
 		req.ReplanRequestID,
@@ -8351,7 +8354,7 @@ func (h *PlaybackHandler) planReplanV3(r *http.Request, p replanPlanningV3, star
 		result, toneMapCapabilityErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: start, RequestedFile: p.plannerRequestedFile, EffectiveFile: effectiveFile, LowerVersion: lowerVersionForFileV3(p.lowerVersion, effectiveFile), ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), AudioTrackIndex: audioIndex, Settings: p.settings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: p.attemptedKeys, AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), effectiveFile)})
 	}
 	planned := replanPassV3{alternateCandidateV3: alternateCandidateV3{file: effectiveFile, request: start, audioIndex: audioIndex, result: result, toneMapErr: toneMapCapabilityErr}, audioDegraded: audioDegraded}
-	if start.AllowsAlternateVersions() && terminalAllowsAlternateFileV3(result.Terminal) && replanAllowsAlternateFileV3(p.operation) {
+	if start.AllowsAlternateVersions() && terminalAllowsAlternateFileV3(result.Terminal) && replanAllowsAlternateFileV3(p.operation, start.QualityPreference) {
 		planned.alternateCandidateV3, planned.subtitleDegraded, planned.subtitleNotShown = h.planReplanAlternateV3(r, p, planned.alternateCandidateV3)
 	}
 	return planned, nil
