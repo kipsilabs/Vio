@@ -133,6 +133,10 @@ func (h *UserCollectionImportHandler) HandleImportTMDB(w http.ResponseWriter, r 
 	writeJSON(w, http.StatusCreated, resp)
 }
 
+func traktImportRetired() error {
+	return apiError(http.StatusGone, "unsupported_source", "new Trakt collections are not supported")
+}
+
 // HandleImportTrakt answers the frozen v1 profile Trakt import route. Silo no
 // longer supports Trakt, so every well-formed request is refused.
 func (h *UserCollectionImportHandler) HandleImportTrakt(w http.ResponseWriter, r *http.Request) {

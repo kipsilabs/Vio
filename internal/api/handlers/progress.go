@@ -47,12 +47,13 @@ type ProgressEpisodeLookup interface {
 
 // ProgressHandler handles watch progress and sync endpoints.
 type ProgressHandler struct {
-	storeProvider   userstore.UserStoreProvider
-	LibraryLookup   ProgressLibraryLookup
-	EpisodeLookup   ProgressEpisodeLookup
-	SettingsRepo    PlaybackSettingsReader
-	EventsHub       *evt.Hub
-	signalsNotifier SignalsChangedNotifier
+	storeProvider      userstore.UserStoreProvider
+	LibraryLookup      ProgressLibraryLookup
+	EpisodeLookup      ProgressEpisodeLookup
+	EpisodeAliasLookup watchstate.EpisodeAliasLookup
+	SettingsRepo       PlaybackSettingsReader
+	EventsHub          *evt.Hub
+	signalsNotifier    SignalsChangedNotifier
 }
 
 // NewProgressHandler creates a new ProgressHandler.
