@@ -790,12 +790,22 @@ func subtitleRenditionMultivariantPlaylist(opts TranscodeOpts, query string) []b
 		if language == "" {
 			language = "und"
 		}
-		trackURI := uri(subtitleRenditionSubtitles)
+		trackURI := "master.m3u8?" + SubtitleRenditionQueryParam + "=" + subtitleRenditionSubtitles
 		if len(tracks) > 1 {
 			trackURI += "&silo_track=" + strconv.FormatUint(track.TrackNumber, 10)
 		}
-		fmt.Fprintf(&buf, "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=%q,NAME=%q,LANGUAGE=%q,DEFAULT=%s,AUTOSELECT=YES,FORCED=%s,URI=%q\n",
-			SubtitleRenditionGroupID, name, language, map[bool]string{true: "YES", false: "NO"}[track.Default || (i == 0 && !anyDefaultTrack(tracks))], map[bool]string{true: "YES", false: "NO"}[track.Forced], trackURI)
+		if query != "" {
+			trackURI += "&" + query
+		}
+		languageAttr := ""
+		if language != "" && language != "und" {
+			if language == "eng" {
+				language = "en"
+			}
+			languageAttr = fmt.Sprintf(",LANGUAGE=%q", language)
+		}
+		fmt.Fprintf(&buf, "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=%q,NAME=%q%s,DEFAULT=%s,AUTOSELECT=YES,FORCED=%s,URI=%q\n",
+			SubtitleRenditionGroupID, name, languageAttr, map[bool]string{true: "YES", false: "NO"}[track.Default || (i == 0 && !anyDefaultTrack(tracks))], map[bool]string{true: "YES", false: "NO"}[track.Forced], trackURI)
 	}
 	fmt.Fprintf(&buf, "#EXT-X-STREAM-INF:BANDWIDTH=%d,SUBTITLES=%q\n", (videoKbps+audioKbps)*1000, SubtitleRenditionGroupID)
 	buf.WriteString(uri(subtitleRenditionVideo) + "\n")

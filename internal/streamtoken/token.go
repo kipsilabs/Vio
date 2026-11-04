@@ -164,6 +164,9 @@ type Claims struct {
 	// SubtitleRenditionTracks and source facts freeze the on-demand rendition
 	// inventory and the media version it was generated from.
 	SubtitleRenditionTracks        []uint64 `json:"srt,omitempty"`
+	SubtitleRenditionNames         []string `json:"srnms,omitempty"`
+	SubtitleRenditionLanguages     []string `json:"srl,omitempty"`
+	SubtitleRenditionForced        []bool   `json:"srf,omitempty"`
 	SubtitleRenditionDefault       uint64   `json:"srd,omitempty"`
 	SubtitleRenditionSourceSize    int64    `json:"srs,omitempty"`
 	SubtitleRenditionSourceModTime int64    `json:"srm,omitempty"`

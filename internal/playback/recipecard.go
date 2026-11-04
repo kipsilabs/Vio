@@ -433,6 +433,36 @@ func subtitleRenditionTrackNumbers(tracks []SubtitleRenditionTrack) []uint64 {
 	}
 	return out
 }
+func subtitleRenditionNames(tracks []SubtitleRenditionTrack) []string {
+	if len(tracks) == 0 {
+		return nil
+	}
+	out := make([]string, len(tracks))
+	for i, t := range tracks {
+		out[i] = t.Name
+	}
+	return out
+}
+func subtitleRenditionLanguages(tracks []SubtitleRenditionTrack) []string {
+	if len(tracks) == 0 {
+		return nil
+	}
+	out := make([]string, len(tracks))
+	for i, t := range tracks {
+		out[i] = t.Language
+	}
+	return out
+}
+func subtitleRenditionForced(tracks []SubtitleRenditionTrack) []bool {
+	if len(tracks) == 0 {
+		return nil
+	}
+	out := make([]bool, len(tracks))
+	for i, t := range tracks {
+		out[i] = t.Forced
+	}
+	return out
+}
 func subtitleRenditionDefaultTrack(tracks []SubtitleRenditionTrack) uint64 {
 	for _, t := range tracks {
 		if t.Default {
@@ -448,6 +478,15 @@ func subtitleRenditionTracksFromClaims(c *streamtoken.Claims) []SubtitleRenditio
 	out := make([]SubtitleRenditionTrack, len(c.SubtitleRenditionTracks))
 	for i, n := range c.SubtitleRenditionTracks {
 		out[i] = SubtitleRenditionTrack{StreamIndex: -1, TrackNumber: n, Default: n == c.SubtitleRenditionDefault}
+		if i < len(c.SubtitleRenditionNames) {
+			out[i].Name = c.SubtitleRenditionNames[i]
+		}
+		if i < len(c.SubtitleRenditionLanguages) {
+			out[i].Language = c.SubtitleRenditionLanguages[i]
+		}
+		if i < len(c.SubtitleRenditionForced) {
+			out[i].Forced = c.SubtitleRenditionForced[i]
+		}
 	}
 	return out
 }
@@ -545,6 +584,9 @@ func (c RecipeCard) ToClaims() streamtoken.Claims {
 		SubtitleCodec:                  c.SubtitleCodec,
 		SubtitleRendition:              c.SubtitleRendition,
 		SubtitleRenditionTracks:        subtitleRenditionTrackNumbers(c.SubtitleRenditionTracks),
+		SubtitleRenditionNames:         subtitleRenditionNames(c.SubtitleRenditionTracks),
+		SubtitleRenditionLanguages:     subtitleRenditionLanguages(c.SubtitleRenditionTracks),
+		SubtitleRenditionForced:        subtitleRenditionForced(c.SubtitleRenditionTracks),
 		SubtitleRenditionDefault:       subtitleRenditionDefaultTrack(c.SubtitleRenditionTracks),
 		SubtitleRenditionSourceSize:    c.SubtitleRenditionSource.Size,
 		SubtitleRenditionSourceModTime: c.SubtitleRenditionSource.ModTimeUnixNano,
