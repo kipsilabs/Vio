@@ -1474,3 +1474,35 @@ func TestWatchDetailSelectionSchedulesProbeOnlyForUnprobedVirtualRow(t *testing.
 		t.Fatalf("fresh selection scheduled %d warm-ups, want a second one", len(got))
 	}
 }
+
+// TestPreprobeSelectedFileDeclinesWithoutAProbeTarget: the synchronous mode
+// never invents work. A nil handler, an unknown row, or an unwired target
+// reports declined so the caller answers declared metadata.
+func TestPreprobeSelectedFileDeclinesWithoutAProbeTarget(t *testing.T) {
+	var nilHandler *PlaybackHandler
+	if got := nilHandler.PreprobeSelectedFile(t.Context(), "movie:1", 5, catalog.AccessFilter{}); got != VirtualPreprobeDeclined {
+		t.Fatalf("nil handler preprobe = %q, want declined", got)
+	}
+	h := &PlaybackHandler{}
+	if got := h.PreprobeSelectedFile(t.Context(), "", 5, catalog.AccessFilter{}); got != VirtualPreprobeDeclined {
+		t.Fatalf("empty content preprobe = %q, want declined", got)
+	}
+	if got := h.PreprobeSelectedFile(t.Context(), "movie:1", 5, catalog.AccessFilter{}); got != VirtualPreprobeDeclined {
+		t.Fatalf("unwired target preprobe = %q, want declined", got)
+	}
+}
+
+// TestPreprobeSelectedFileReportsPendingWhenAChainIsLive: admission is shared
+// with the detached chains, so a row another chain is already enumerating
+// reports pending instead of opening a second probe on the same bytes.
+func TestPreprobeSelectedFileReportsPendingWhenAChainIsLive(t *testing.T) {
+	h := &PlaybackHandler{}
+	release, refusal := h.defaultProbeChains.acquire("movie:1\x005")
+	if refusal != defaultProbeChainRefusalNone {
+		t.Fatalf("admission refused: %s", refusal)
+	}
+	defer release()
+	if got := h.PreprobeSelectedFile(t.Context(), "movie:1", 5, catalog.AccessFilter{}); got != VirtualPreprobePending {
+		t.Fatalf("preprobe with a live chain = %q, want pending", got)
+	}
+}

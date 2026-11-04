@@ -4394,6 +4394,28 @@
       "body_file": "change_password_profile_verification_required.json"
     },
     {
+      "name": "check_catalog_versions_inventory",
+      "operation_id": "checkCatalogVersions",
+      "scenario": "The single-file inventory mode answers the enumerated tracks with their provenance beside the liveness verdict.",
+      "request": {
+        "method": "POST",
+        "path": "/api/v2/catalog/versions/check",
+        "headers": {
+          "Authorization": "Bearer tok-member",
+          "X-Profile-Id": "p-owner"
+        },
+        "body": "{\"file_ids\":[\"124\"],\"preprobe\":true}"
+      },
+      "expected_status": 200,
+      "response_headers": {
+        "Cache-Control": "no-store",
+        "Content-Type": "application/json"
+      },
+      "response_media_type": "application/json",
+      "schema": "#/components/schemas/CatalogVersionsCheck",
+      "body_file": "check_catalog_versions_inventory.json"
+    },
+    {
       "name": "check_catalog_versions_ok",
       "operation_id": "checkCatalogVersions",
       "scenario": "A mixed batch reports the live rows, the durable failed row, and the advisory source-mismatch verdict.",

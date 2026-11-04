@@ -1738,6 +1738,10 @@ func newChiRouter(deps Dependencies) chi.Router {
 			// virtual version schedules the shared pre-play chain for that
 			// row, so its track menus are populated before the first play.
 			itemsHandler.SetVirtualSelectionProber(playbackHandler)
+			// The versions check's single-file inventory mode runs that same
+			// probe inline under its own short request bound, so a client that
+			// asked for the tracks gets them without a second round trip.
+			itemsHandler.SetVirtualSelectionPreprober(playbackHandler)
 		}
 		if deps.UserStoreProvider != nil {
 			// Device-aware candidate ranking: resolve the caller's persisted

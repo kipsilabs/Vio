@@ -8,9 +8,11 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Silo-Server/silo-server/internal/api/handlers"
 	catalogpkg "github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/models"
 )
 
 // fakeVersionCheck records the IDs the v2 adapter forwarded to the shared
@@ -68,6 +70,127 @@ func TestCheckCatalogVersionsWiresTheSharedSeam(t *testing.T) {
 	}
 	if body.Results[2].SourceMismatch == nil || body.Results[2].SourceMismatch.ServedBytes != 7_427_636_945 || body.Results[2].SourceMismatch.DeclaredBytes != 8_449_999_999 {
 		t.Fatalf("source mismatch = %+v", body.Results[2].SourceMismatch)
+	}
+}
+
+// fakeInventoryVersionCheck adds the single-file inventory mode to the liveness
+// fake and records which method the adapter chose.
+type fakeInventoryVersionCheck struct {
+	fakeVersionCheck
+	inventoryIDs   []int
+	inventoryCalls int
+}
+
+func (f *fakeInventoryVersionCheck) CheckVersionsWithInventory(_ context.Context, fileIDs []int) []handlers.VersionCheckResult {
+	f.inventoryCalls++
+	f.inventoryIDs = append([]int(nil), fileIDs...)
+	return f.results
+}
+
+// TestCheckCatalogVersionsInventoryMode pins the additive mode: preprobe reaches
+// the inventory seam, the flat wire fields carry what it reported, and the
+// batched path never touches it.
+func TestCheckCatalogVersionsInventoryMode(t *testing.T) {
+	deps, _ := catalogDeps(t)
+	probedAt := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	seam := &fakeInventoryVersionCheck{fakeVersionCheck: fakeVersionCheck{results: []handlers.VersionCheckResult{{
+		FileID:    42,
+		Available: true,
+		Inventory: &handlers.VersionCheckInventory{
+			Provenance:     handlers.VersionInventoryVerified,
+			ProbedAt:       &probedAt,
+			VideoTracks:    []models.VideoTrack{{Codec: "hevc", Width: 3840, Height: 2160}},
+			AudioTracks:    []models.AudioTrack{{Index: 1, Codec: "truehd", Language: "eng", Channels: 8}},
+			SubtitleTracks: []catalogpkg.VersionSubtitleTrack{{Index: 2, Language: "eng", Codec: "subrip"}},
+		},
+	}}}}
+	deps.CatalogVersionsCheck = seam
+	h := newTestHandler(t, deps)
+
+	rec := do(t, h, http.MethodPost, Prefix+"/catalog/versions/check", `{"file_ids":["42"],"preprobe":true}`, viewerHeaders())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if seam.inventoryCalls != 1 || fmt.Sprint(seam.inventoryIDs) != "[42]" {
+		t.Fatalf("inventory seam calls = %d ids %v, want the single requested id", seam.inventoryCalls, seam.inventoryIDs)
+	}
+	var body struct {
+		Results []struct {
+			FileID              string `json:"file_id"`
+			InventoryProvenance string `json:"inventory_provenance"`
+			ProbedAt            string `json:"probed_at"`
+			VideoTracks         []struct {
+				Codec string `json:"codec"`
+			} `json:"video_tracks"`
+			AudioTracks []struct {
+				Codec string `json:"codec"`
+			} `json:"audio_tracks"`
+			SubtitleTracks []struct {
+				Codec string `json:"codec"`
+			} `json:"subtitle_tracks"`
+		} `json:"results"`
+	}
+	decodeJSON(t, rec.Body, &body)
+	if len(body.Results) != 1 {
+		t.Fatalf("results = %+v", body.Results)
+	}
+	result := body.Results[0]
+	if result.FileID != "42" || result.InventoryProvenance != handlers.VersionInventoryVerified {
+		t.Fatalf("inventory result = %+v", result)
+	}
+	if result.ProbedAt != "2026-01-02T03:04:05.000Z" {
+		t.Fatalf("probed_at = %q", result.ProbedAt)
+	}
+	if len(result.VideoTracks) != 1 || result.VideoTracks[0].Codec != "hevc" ||
+		len(result.AudioTracks) != 1 || result.AudioTracks[0].Codec != "truehd" ||
+		len(result.SubtitleTracks) != 1 || result.SubtitleTracks[0].Codec != "subrip" {
+		t.Fatalf("inventory tracks = %+v", result)
+	}
+}
+
+// TestCheckCatalogVersionsInventoryModeRejectsABatch: the mode's wait is per
+// file, so more than one identifier is a validation failure before any probe.
+func TestCheckCatalogVersionsInventoryModeRejectsABatch(t *testing.T) {
+	deps, _ := catalogDeps(t)
+	seam := &fakeInventoryVersionCheck{}
+	deps.CatalogVersionsCheck = seam
+	h := newTestHandler(t, deps)
+
+	rec := do(t, h, http.MethodPost, Prefix+"/catalog/versions/check", `{"file_ids":["42","43"],"preprobe":true}`, viewerHeaders())
+	requireProblem(t, rec, TypeValidationFailed)
+	if seam.inventoryCalls != 0 || seam.ids != nil {
+		t.Fatalf("batch reached the seam: inventory=%d ids=%v", seam.inventoryCalls, seam.ids)
+	}
+}
+
+// TestCheckCatalogVersionsInventoryModeUnwired: a seam without the inventory
+// method answers dependency_unavailable instead of answering without inventory.
+func TestCheckCatalogVersionsInventoryModeUnwired(t *testing.T) {
+	deps, _ := catalogDeps(t)
+	deps.CatalogVersionsCheck = &fakeVersionCheck{}
+	h := newTestHandler(t, deps)
+
+	rec := do(t, h, http.MethodPost, Prefix+"/catalog/versions/check", `{"file_ids":["42"],"preprobe":true}`, viewerHeaders())
+	requireProblem(t, rec, TypeDependencyUnavailable)
+}
+
+// TestCheckCatalogVersionsBatchedPathSkipsInventory: without preprobe the
+// adapter keeps the liveness call and never reaches the inventory seam.
+func TestCheckCatalogVersionsBatchedPathSkipsInventory(t *testing.T) {
+	deps, _ := catalogDeps(t)
+	seam := &fakeInventoryVersionCheck{fakeVersionCheck: fakeVersionCheck{results: []handlers.VersionCheckResult{{FileID: 42, Available: true}}}}
+	deps.CatalogVersionsCheck = seam
+	h := newTestHandler(t, deps)
+
+	rec := do(t, h, http.MethodPost, Prefix+"/catalog/versions/check", `{"file_ids":["42"]}`, viewerHeaders())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if seam.inventoryCalls != 0 {
+		t.Fatalf("batched path reached the inventory seam %d times", seam.inventoryCalls)
+	}
+	if strings.Contains(rec.Body.String(), "inventory_provenance") {
+		t.Fatalf("batched answer carried inventory: %s", rec.Body.String())
 	}
 }
 
@@ -135,6 +258,25 @@ func (fixtureVersionCheck) CheckVersions(_ context.Context, fileIDs []int) []han
 	return results
 }
 
+// CheckVersionsWithInventory is the deterministic single-file inventory seam
+// the committed fixture records: file 124 answers enumerated tracks, so the
+// fixture pins the inventory wire shape.
+func (fixtureVersionCheck) CheckVersionsWithInventory(ctx context.Context, fileIDs []int) []handlers.VersionCheckResult {
+	results := fixtureVersionCheck{}.CheckVersions(ctx, fileIDs)
+	if len(results) != 1 {
+		return results
+	}
+	probedAt := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	results[0].Inventory = &handlers.VersionCheckInventory{
+		Provenance:     handlers.VersionInventoryVerified,
+		ProbedAt:       &probedAt,
+		VideoTracks:    []models.VideoTrack{{Codec: "hevc", Width: 3840, Height: 2160}},
+		AudioTracks:    []models.AudioTrack{{Index: 1, Codec: "truehd", Language: "eng", Channels: 8}},
+		SubtitleTracks: []catalogpkg.VersionSubtitleTrack{{Index: 2, Language: "eng", Codec: "subrip"}},
+	}
+	return results
+}
+
 // catalogVersionsCheckFixtureCases documents the v2 liveness check: a mixed
 // verdict list, the too-large validation boundary, and the profile gate.
 func catalogVersionsCheckFixtureCases() []fixtureCase {
@@ -155,6 +297,12 @@ func catalogVersionsCheckFixtureCases() []fixtureCase {
 			body:    `{"file_ids":[` + strings.Join(tooLarge, ",") + `]}`,
 			headers: viewerHeaders(),
 			status:  http.StatusUnprocessableEntity, assertHeaders: []string{"Content-Type", "Cache-Control"}, schema: "#/components/schemas/Problem"},
+		{name: "check_catalog_versions_inventory", operationID: opCheckCatalogVersions,
+			scenario: "The single-file inventory mode answers the enumerated tracks with their provenance beside the liveness verdict.",
+			method:   http.MethodPost, path: Prefix + "/catalog/versions/check",
+			body:    `{"file_ids":["124"],"preprobe":true}`,
+			headers: viewerHeaders(),
+			status:  http.StatusOK, assertHeaders: []string{"Content-Type", "Cache-Control"}, schema: "#/components/schemas/CatalogVersionsCheck"},
 		{name: "check_catalog_versions_profile_verification_required", operationID: opCheckCatalogVersions,
 			scenario: "A profile-scoped check for a PIN-locked profile without X-Profile-Token is refused before the body is read.",
 			method:   http.MethodPost, path: Prefix + "/catalog/versions/check",

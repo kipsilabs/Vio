@@ -100,6 +100,63 @@ absent after a restart, on a node that did not run the probe, and once a later
 probe accepts the served bytes. A row without the field keeps the generic
 unprobed presentation.
 
+### Single-file inventory mode
+
+A version row carries provider-declared track lists until something enumerates
+its bytes, and selecting a version only schedules that enumeration in the
+background. `checkCatalogVersions` can answer both in one round trip: with
+`"preprobe": true` and exactly one file identifier, the server runs the same
+inventory probe a version selection schedules, waits for it under a 5 s bound,
+and returns the row's tracks with the liveness verdict.
+
+```json
+{
+  "file_ids": ["123"],
+  "preprobe": true
+}
+```
+
+```json
+{
+  "results": [
+    {
+      "file_id": "123",
+      "available": true,
+      "inventory_provenance": "verified",
+      "probed_at": "2026-01-02T03:04:05.000Z",
+      "video_tracks": [{ "codec": "hevc", "width": 3840, "height": 2160 }],
+      "audio_tracks": [{ "index": 1, "codec": "truehd", "language": "eng", "channels": 8 }],
+      "subtitle_tracks": [{ "index": 2, "language": "eng", "codec": "subrip" }]
+    }
+  ]
+}
+```
+
+`inventory_provenance` says how much of that inventory is evidence:
+
+- `verified`: a probe enumerated the row and its stamp is on it, so
+  `probed_at` and the tracks are real container metadata.
+- `pending`: the probe ran (or is still running for another read of the same
+  row) but no committed evidence reached the row yet, so the tracks are still
+  the declared placeholders. A later probe — the detail read's warm-up or a
+  playback start — is what stamps the row and publishes `versions_updated`.
+- `declared`: nothing enumerated the row. The tracks are registration metadata.
+
+Notes for clients:
+
+- The mode is additive and never fails the read: an inaccessible or unknown ID
+  answers exactly like the liveness check, a timeout answers declared or
+  pending metadata with the row's current tracks, and a seam the server does
+  not serve answers `503 dependency_unavailable` instead of answering without
+  inventory.
+- `preprobe` requires exactly one identifier (`422` validation failure at
+  `body.file_ids` otherwise): the wait is per file, so a batch would multiply it.
+- `inventory_provenance`, `probed_at`, and the three track lists are absent from
+  every other request, so the batched answer is unchanged. The frozen v1 route
+  is liveness-only and ignores `preprobe`.
+- Playback still schedules its own probe; this mode is a read optimization, not
+  a prerequisite. Never gate a start or a plan on it.
+
 Two further node-local in-memory caches affect virtual titles without durable or
 shared state. The empty-title suppression tracker marks a title as currently
 unservable after enough consecutive empty provider listings: a resolve on the

@@ -21485,6 +21485,8 @@ export interface components {
       subtitle_languages: string[];
     };
     CatalogVersionCheckResult: {
+      /** @description The row's audio tracks; present only in the single-file inventory mode */
+      audio_tracks?: components["schemas"]["AudioTrack"][];
       available: boolean;
       failed?: boolean;
       /**
@@ -21492,7 +21494,21 @@ export interface components {
        * @example 1
        */
       file_id: string;
+      /**
+       * @description How much of the returned inventory is evidence: verified (probe-enumerated and stamped), pending (a probe ran for this read without committed evidence), or declared (registration metadata only)
+       * @enum {string}
+       */
+      inventory_provenance?: "declared" | "pending" | "verified";
+      /**
+       * Format: date-time
+       * @description When a probe last enumerated this row's stream table; absent means declared metadata only
+       */
+      probed_at?: string;
       source_mismatch?: components["schemas"]["VersionSourceMismatch"];
+      /** @description The row's embedded and external subtitle tracks; present only in the single-file inventory mode */
+      subtitle_tracks?: components["schemas"]["VersionSubtitleTrack"][];
+      /** @description The row's video tracks; present only in the single-file inventory mode */
+      video_tracks?: components["schemas"]["VideoTrack"][];
     };
     CatalogVersionsCheck: {
       /** @description One result per requested file identifier; empty, never null */
@@ -21507,6 +21523,8 @@ export interface components {
        *     ]
        */
       file_ids: string[];
+      /** @description Ask for the single file's track inventory, enumerated synchronously under a short bound; requires exactly one file identifier */
+      preprobe?: boolean;
     };
     CatalogWorkFormat: {
       /** @example audiobook:dune */

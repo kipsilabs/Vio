@@ -5486,6 +5486,17 @@ func (s *DetailService) buildVersionChapters(ctx context.Context, file *models.M
 	return chapters
 }
 
+// VersionSubtitleTracks projects a row's embedded and external subtitle tracks
+// into the version wire shape. It is the projection a version row carries, so a
+// caller that reports inventory outside a version list can answer with the same
+// shape instead of a second one.
+func VersionSubtitleTracks(file *models.MediaFile) []VersionSubtitleTrack {
+	if file == nil {
+		return nil
+	}
+	return buildVersionSubtitleTracks(file)
+}
+
 func buildVersionSubtitleTracks(file *models.MediaFile) []VersionSubtitleTrack {
 	tracks := make([]VersionSubtitleTrack, 0, len(file.SubtitleTracks)+len(file.ExternalSubtitles))
 	nextExternalIndex := len(file.VideoTracks) + len(file.AudioTracks)

@@ -23744,6 +23744,13 @@
       "CatalogVersionCheckResult": {
         "additionalProperties": false,
         "properties": {
+          "audio_tracks": {
+            "description": "The row's audio tracks; present only in the single-file inventory mode",
+            "items": {
+              "$ref": "#/components/schemas/AudioTrack"
+            },
+            "type": "array"
+          },
           "available": {
             "type": "boolean"
           },
@@ -23758,8 +23765,38 @@
             "minLength": 1,
             "type": "string"
           },
+          "inventory_provenance": {
+            "description": "How much of the returned inventory is evidence: verified (probe-enumerated and stamped), pending (a probe ran for this read without committed evidence), or declared (registration metadata only)",
+            "enum": [
+              "declared",
+              "pending",
+              "verified"
+            ],
+            "type": "string"
+          },
+          "probed_at": {
+            "description": "When a probe last enumerated this row's stream table; absent means declared metadata only",
+            "format": "date-time",
+            "pattern": "^(?:[1-9][0-9]{3}|0[1-9][0-9]{2}|00[1-9][0-9]|000[2-9])-",
+            "patternDescription": "a non-zero RFC 3339 instant",
+            "type": "string"
+          },
           "source_mismatch": {
             "$ref": "#/components/schemas/VersionSourceMismatch"
+          },
+          "subtitle_tracks": {
+            "description": "The row's embedded and external subtitle tracks; present only in the single-file inventory mode",
+            "items": {
+              "$ref": "#/components/schemas/VersionSubtitleTrack"
+            },
+            "type": "array"
+          },
+          "video_tracks": {
+            "description": "The row's video tracks; present only in the single-file inventory mode",
+            "items": {
+              "$ref": "#/components/schemas/VideoTrack"
+            },
+            "type": "array"
           }
         },
         "required": [
@@ -23806,6 +23843,10 @@
             "maxItems": 40,
             "minItems": 1,
             "type": "array"
+          },
+          "preprobe": {
+            "description": "Ask for the single file's track inventory, enumerated synchronously under a short bound; requires exactly one file identifier",
+            "type": "boolean"
           }
         },
         "required": [
