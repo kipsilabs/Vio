@@ -208,6 +208,14 @@ func ExtractAttachedSubtitleFont(ctx context.Context, inputPath, ffmpegPath stri
 	return &fonts[0], nil
 }
 
+// ErrSubtitleFontSubsetUnavailable reports that script-driven subsetting could
+// not rescue an oversized font pack: the script or its references were
+// unusable (or the subset still exceeded the ceiling), and the bounded
+// whole-pack dump that follows also failed. A client then falls back to system
+// fonts; the handler marks that response so it is not mistaken for an ordinary
+// empty bundle (a file with no attachments) or for a still-running extraction.
+var ErrSubtitleFontSubsetUnavailable = errors.New("subtitle font subsetting unavailable")
+
 func extractAttachedSubtitleFonts(ctx context.Context, inputPath, ffmpegPath string, index *int, maxBytes int64) ([]SubtitleFontAttachment, error) {
 	if strings.TrimSpace(inputPath) == "" {
 		return nil, fmt.Errorf("subtitle fonts: input path is required")
@@ -265,10 +273,15 @@ func extractAttachedSubtitleFonts(ctx context.Context, inputPath, ffmpegPath str
 	// Only a whole-bundle request that is already past the ceiling needs the
 	// scripts. Smaller packs keep the historical bytes and cost: no extra
 	// probe, no family parsing, all attachments returned.
+	subsetAttempted := false
 	if index == nil && attachmentPayloadExceeds(streams, maxBytes) {
+		subsetAttempted = true
 		fonts, done, subsetErr := extractReferencedFontSubset(ctx, inputPath, bin, probePath, streams, maxBytes)
 		if subsetErr != nil {
-			return nil, subsetErr
+			// Subsetting is the only path this pack has to a bundle. Any
+			// failure here leaves the client on system fonts, so mark it
+			// distinctly from a transient whole-pack extraction error.
+			return nil, fmt.Errorf("%w: %w", ErrSubtitleFontSubsetUnavailable, subsetErr)
 		}
 		if done {
 			return fonts, nil
@@ -279,6 +292,12 @@ func extractAttachedSubtitleFonts(ctx context.Context, inputPath, ffmpegPath str
 	}
 
 	fonts, err := dumpFontAttachments(ctx, inputPath, bin, streams, maxBytes)
+	if err != nil && subsetAttempted {
+		// Subsetting was the only way this pack could fit and it did not
+		// produce a subset. The client will use system fonts, so mark the
+		// failure distinctly from a transient extraction error.
+		return nil, fmt.Errorf("%w: %w", ErrSubtitleFontSubsetUnavailable, err)
+	}
 	if selectedName != "" && len(fonts) > 0 {
 		fonts[0].Name = selectedName
 	}

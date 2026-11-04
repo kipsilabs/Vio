@@ -283,12 +283,15 @@ func TestVirtualFontBundleWarmAndServeSharePlanTimeKeyAcrossRowMutation(t *testi
 	serve := NewStreamHandler(playback.NewSessionManager(0, 0), testPlaybackFileResolver{file: &mutated})
 	serve.PlaybackConfig = handler.PlaybackConfig
 	serve.SubtitleCache = handler.SubtitleCache
-	items, pending, err := serve.fontBundleForRequest(context.Background(), session, &mutated, 0)
+	items, pending, fallback, err := serve.fontBundleForRequest(context.Background(), session, &mutated, 0)
 	if err != nil {
 		t.Fatalf("font bundle serve: %v", err)
 	}
 	if pending {
 		t.Fatal("serve reported a pending bundle despite the warmed frozen key")
+	}
+	if fallback != "" {
+		t.Fatalf("serve reported a font fallback %q for a warmed bundle", fallback)
 	}
 	if len(items) == 0 {
 		t.Fatal("serve returned no fonts from the warmed frozen key")

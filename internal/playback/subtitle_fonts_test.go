@@ -517,6 +517,8 @@ done
 	maxBytes := int64(len(fontA) - 1)
 	if _, err := extractAttachedSubtitleFonts(context.Background(), "input.mkv", ffmpeg, nil, maxBytes); err == nil || !strings.Contains(err.Error(), "exceeds") {
 		t.Fatalf("subset past the ceiling: %v, want a size failure", err)
+	} else if !errors.Is(err, ErrSubtitleFontSubsetUnavailable) {
+		t.Fatalf("subset failure = %v, want ErrSubtitleFontSubsetUnavailable so the client sees a system-font fallback", err)
 	}
 }
 

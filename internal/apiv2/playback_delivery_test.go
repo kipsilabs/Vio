@@ -473,6 +473,44 @@ func TestPlaybackDecisionV2ProjectsSubtitleURLsWithoutMutatingSource(t *testing.
 	}
 }
 
+func TestPlaybackSubtitleFontsV2CarriesSystemFontFallbackMarker(t *testing.T) {
+	deps, _ := catalogDeps(t)
+	deps.PlaybackMedia = &PlaybackMediaHandlers{
+		SubtitleFonts: fakeSubtitleFontFallbackService{
+			fakeSubtitleFontService: func(context.Context, handlers.SubtitleFontRequest) ([]playback.SubtitleFontBundleItem, bool, error) {
+				return nil, true, nil
+			},
+			fallback: playback.SubtitleFontFallbackSubsetUnavailable,
+		},
+	}
+	h := newTestHandler(t, deps)
+	resp := do(t, h, http.MethodGet, Prefix+"/stream/"+deliveryTestSession+"/subtitles/1/fonts?file_id=42&st=opaque", "", viewerHeaders())
+	if resp.Code != http.StatusOK {
+		t.Fatalf("fonts status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+	if got := resp.Header().Get("X-Vio-Font-Bundle-Fallback"); got != playback.SubtitleFontFallbackSubsetUnavailable {
+		t.Fatalf("fallback header = %q, want %q", got, playback.SubtitleFontFallbackSubsetUnavailable)
+	}
+	if got := resp.Header().Get("X-Vio-Font-Bundle-Pending"); got != "true" {
+		t.Fatalf("pending header = %q, want true", got)
+	}
+	if got := resp.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("cache-control = %q, want no-store", got)
+	}
+}
+
+// fakeSubtitleFontFallbackService implements the optional detailed extension
+// while keeping the historical two-result fake usable for other tests.
+type fakeSubtitleFontFallbackService struct {
+	fakeSubtitleFontService
+	fallback string
+}
+
+func (f fakeSubtitleFontFallbackService) SubtitleFontsWithFallback(ctx context.Context, in handlers.SubtitleFontRequest) ([]playback.SubtitleFontBundleItem, bool, string, error) {
+	items, pending, err := f.fakeSubtitleFontService(ctx, in)
+	return items, pending, f.fallback, err
+}
+
 func TestPlaybackDecisionV2EmptySubtitleInventoryIsArray(t *testing.T) {
 	for _, tc := range []struct {
 		name      string

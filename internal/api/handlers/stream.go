@@ -2817,18 +2817,29 @@ type SubtitleFontRequest struct {
 // transports use this operation so reconstruction, deny markers and source-file
 // admission stay identical without invoking another transport's HTTP handler.
 func (h *StreamHandler) SubtitleFonts(ctx context.Context, in SubtitleFontRequest) ([]playback.SubtitleFontBundleItem, bool, error) {
+	items, pending, _, err := h.SubtitleFontsWithFallback(ctx, in)
+	return items, pending, err
+}
+
+// SubtitleFontsWithFallback is SubtitleFonts plus the explicit system-font
+// fallback reason. When subsetting an oversized font pack was the only path to
+// a bundle and failed, fallback names playback.SubtitleFontFallbackSubsetUnavailable;
+// it is empty for a definitive bundle, an empty file, or a transient in-flight
+// extraction. Transports put it on the response so a client can tell a real
+// system-font fallback from an ordinary empty bundle.
+func (h *StreamHandler) SubtitleFontsWithFallback(ctx context.Context, in SubtitleFontRequest) ([]playback.SubtitleFontBundleItem, bool, string, error) {
 	userID := apimw.GetUserID(ctx)
 	if userID == 0 {
-		return nil, false, apiError(http.StatusUnauthorized, "unauthorized", "Authentication required")
+		return nil, false, "", apiError(http.StatusUnauthorized, "unauthorized", "Authentication required")
 	}
 	if in.SessionID == "" {
-		return nil, false, apiError(http.StatusBadRequest, "bad_request", "Session ID is required")
+		return nil, false, "", apiError(http.StatusBadRequest, "bad_request", "Session ID is required")
 	}
 	if lc := activitylog.GetPlaybackLogContext(ctx); lc != nil {
 		lc.PlaybackSessionID = in.SessionID
 	}
 	if h.StreamDeny.Denied(ctx, in.SessionID) {
-		return nil, false, apiError(http.StatusGone, playbackSessionEndedErrorCode, "Playback session has ended")
+		return nil, false, "", apiError(http.StatusGone, playbackSessionEndedErrorCode, "Playback session has ended")
 	}
 	session, claims, err := h.loadSidecarSession(ctx, in.Query.Get(streamTokenParam), in.SessionID, userID)
 	if err != nil {
@@ -2840,33 +2851,33 @@ func (h *StreamHandler) SubtitleFonts(ctx context.Context, in SubtitleFontReques
 			}
 			h.logSubtitleFontInternalError(ctx, in, 0, -1, "session_load", cause)
 		}
-		return nil, false, err
+		return nil, false, "", err
 	}
 	attachPlaybackSession(ctx, session, claims)
 
 	fileID, err := h.acceptedSubtitleSourceFileID(ctx, in.Query.Get("file_id"), session)
 	if err != nil {
-		return nil, false, apiError(http.StatusBadRequest, "bad_request", err.Error())
+		return nil, false, "", apiError(http.StatusBadRequest, "bad_request", err.Error())
 	}
 	file, err := h.fileResolver.GetByID(ctx, fileID)
 	if err != nil || file == nil {
-		return nil, false, apiError(http.StatusNotFound, "not_found", "Media file not found")
+		return nil, false, "", apiError(http.StatusNotFound, "not_found", "Media file not found")
 	}
 
 	trackIndex, _, err := playback.ParseSubtitleTrackParam(in.Track)
 	if err != nil {
-		return nil, false, apiError(http.StatusBadRequest, "bad_request", "Invalid subtitle track index")
+		return nil, false, "", apiError(http.StatusBadRequest, "bad_request", "Invalid subtitle track index")
 	}
 	file, trackIndex, err = h.resolveSubtitleSourceRequest(ctx, file, session, trackIndex, in.Query)
 	if err != nil {
 		if errors.Is(err, errSubtitleSourceChangedAfterRotation) {
-			return nil, false, apiError(http.StatusConflict, "subtitle_source_changed",
+			return nil, false, "", apiError(http.StatusConflict, "subtitle_source_changed",
 				"The selected subtitle track changed on the media source; retry")
 		}
 		if errors.Is(err, errSubtitleIdentityInvalid) {
-			return nil, false, apiError(http.StatusBadRequest, "bad_request", err.Error())
+			return nil, false, "", apiError(http.StatusBadRequest, "bad_request", err.Error())
 		}
-		return nil, false, apiError(http.StatusNotFound, "not_found", err.Error())
+		return nil, false, "", apiError(http.StatusNotFound, "not_found", err.Error())
 	}
 	// Source admission comes first: a missing local file must answer 404 and
 	// end the session regardless of the codec, and only a genuinely
@@ -2876,13 +2887,13 @@ func (h *StreamHandler) SubtitleFonts(ctx context.Context, in SubtitleFontReques
 	if err := preflightPlaybackFile(ctx, file, h.MissingMarker, h.EventsHub); err != nil {
 		if isPlaybackFileMissing(err) {
 			h.abortPlaybackSession(ctx, session)
-			return nil, false, apiError(http.StatusNotFound, "not_found", "Source media file is missing")
+			return nil, false, "", apiError(http.StatusNotFound, "not_found", "Source media file is missing")
 		}
 		h.logSubtitleFontInternalError(ctx, in, file.ID, trackIndex, "source_preflight", err)
 		// A legitimate ASS track whose source cannot be read right now is a
 		// retryable dependency failure, not a server defect. Fonts are
 		// optional, so never turn a transient source-access failure into a 500.
-		return nil, false, apiError(http.StatusServiceUnavailable, subtitleSourceUnavailableErrorCode, "Failed to access source media file")
+		return nil, false, "", apiError(http.StatusServiceUnavailable, subtitleSourceUnavailableErrorCode, "Failed to access source media file")
 	}
 	// Validate the requested ordinal and codec before extraction. A non-ASS
 	// ordinal or one outside the embedded range is a client error no retry
@@ -2890,25 +2901,25 @@ func (h *StreamHandler) SubtitleFonts(ctx context.Context, in SubtitleFontReques
 	// extraction.
 	embeddedIndex := trackIndex - len(file.ExternalSubtitles)
 	if embeddedIndex < 0 || embeddedIndex >= len(file.SubtitleTracks) {
-		return nil, false, apiError(http.StatusNotFound, "not_found", "Embedded subtitle track not found")
+		return nil, false, "", apiError(http.StatusNotFound, "not_found", "Embedded subtitle track not found")
 	}
 	if !playback.IsASS(file.SubtitleTracks[embeddedIndex].Codec) {
-		return nil, false, apiError(http.StatusBadRequest, "bad_request", "Subtitle font bundles are only available for ASS/SSA tracks")
+		return nil, false, "", apiError(http.StatusBadRequest, "bad_request", "Subtitle font bundles are only available for ASS/SSA tracks")
 	}
 
 	// Virtual rows resolve through the relay inside the shared core: a
 	// provider-neutral virtual:// URI is not an FFmpeg input, so probing it
 	// directly always fails with a 500 the client then retries in a storm.
-	items, pending, err := h.fontBundleForRequest(ctx, session, file, trackIndex)
+	items, pending, fallback, err := h.fontBundleForRequest(ctx, session, file, trackIndex)
 	if err != nil {
 		if errors.Is(err, errVirtualFontResolve) {
 			logVirtualStreamFailure(ctx, session.ID, file, err)
-			return nil, false, apiError(http.StatusBadGateway, subtitleSourceUnavailableErrorCode, "Failed to resolve virtual source for the subtitle font bundle")
+			return nil, false, "", apiError(http.StatusBadGateway, subtitleSourceUnavailableErrorCode, "Failed to resolve virtual source for the subtitle font bundle")
 		}
 		// Throttle logging already happened in the shared core.
-		return nil, false, apiError(http.StatusInternalServerError, "font_extract_failed", "Failed to extract subtitle fonts")
+		return nil, false, "", apiError(http.StatusInternalServerError, "font_extract_failed", "Failed to extract subtitle fonts")
 	}
-	return items, pending, nil
+	return items, pending, fallback, nil
 }
 
 // cachedFontBundleForRequest serves one admitted ASS track's attached-font
@@ -2916,14 +2927,14 @@ func (h *StreamHandler) SubtitleFonts(ctx context.Context, in SubtitleFontReques
 // detached single-flight extraction the caller waits on up to
 // fontBundleClientWait. Extracting it keeps fontBundleForRequest within its
 // nesting budget; behavior is unchanged.
-func (h *StreamHandler) cachedFontBundleForRequest(ctx context.Context, session *playback.Session, file *models.MediaFile, trackIndex int, cacheKey playback.FontBundleKey, failKey string, failAttrs []any, resolveInput func(extractCtx context.Context) (string, func(), error)) ([]playback.SubtitleFontBundleItem, bool, error) {
+func (h *StreamHandler) cachedFontBundleForRequest(ctx context.Context, session *playback.Session, file *models.MediaFile, trackIndex int, cacheKey playback.FontBundleKey, failKey string, failAttrs []any, resolveInput func(extractCtx context.Context) (string, func(), error)) ([]playback.SubtitleFontBundleItem, bool, string, error) {
 	if cached, ok := h.SubtitleCache.LookupFontBundle(cacheKey); ok {
 		h.fontExtractFailures.recovered(failKey)
 		var items []playback.SubtitleFontBundleItem
 		if err := json.Unmarshal(cached, &items); err != nil {
-			return nil, false, err
+			return nil, false, "", err
 		}
-		return items, false, nil
+		return items, false, "", nil
 	}
 	// A recent extraction failure is retried only after its backoff. Fonts
 	// are optional to playback, so the request answers the same pending
@@ -2932,7 +2943,7 @@ func (h *StreamHandler) cachedFontBundleForRequest(ctx context.Context, session 
 		slog.DebugContext(ctx, "subtitle font bundle extraction in backoff",
 			"component", "api", "file_id", file.ID, "track", trackIndex,
 			"retry_after", retryAfter)
-		return nil, true, nil
+		return nil, true, h.SubtitleCache.FontBundleFallback(cacheKey), nil
 	}
 	bundle, ready, err := h.SubtitleCache.ExtractFontBundleWithin(ctx, cacheKey, fontBundleClientWait, func(extractCtx context.Context) ([]byte, error) {
 		inputPath, releaseInput, resolveErr := resolveInput(extractCtx)
@@ -2957,7 +2968,7 @@ func (h *StreamHandler) cachedFontBundleForRequest(ctx context.Context, session 
 			// Provider resolution is a retryable dependency failure; keep
 			// its 502 rather than inventing an empty bundle for a source
 			// that was never read.
-			return nil, false, err
+			return nil, false, "", err
 		}
 		// The extraction closure already logged this failure through the
 		// shared throttle, so repeating it here would only add a duplicate
@@ -2967,29 +2978,35 @@ func (h *StreamHandler) cachedFontBundleForRequest(ctx context.Context, session 
 		// extracted is not a server error: degrade to the pending empty
 		// bundle so the player uses default fonts and re-fetches after the
 		// cache's failure backoff instead of hammering a 500.
-		return nil, true, nil
+		fallback := ""
+		if errors.Is(err, playback.ErrSubtitleFontSubsetUnavailable) {
+			fallback = playback.SubtitleFontFallbackSubsetUnavailable
+		}
+		return nil, true, fallback, nil
 	}
 	if !ready {
-		return nil, true, nil
+		return nil, true, h.SubtitleCache.FontBundleFallback(cacheKey), nil
 	}
 	h.fontExtractFailures.recovered(failKey)
 	var items []playback.SubtitleFontBundleItem
 	if err := json.Unmarshal(bundle, &items); err != nil {
-		return nil, false, err
+		return nil, false, "", err
 	}
-	return items, false, nil
+	return items, false, "", nil
 }
 
 // fontBundleForRequest resolves one already-admitted embedded ASS track's
 // attached-font bundle through the warmed cache shared with the v1 route and
-// the playback pre-warm. A cache hit serves immediately; otherwise a detached
+// the playback pre-warm. The third result is an explicit system-font fallback
+// reason when subsetting was the only path to a bundle and failed; empty
+// otherwise. A cache hit serves immediately; otherwise a detached
 // single-flight extracts while the caller waits up to fontBundleClientWait and
 // then receives pending=true. Virtual inputs are resolved through the relay —
 // a provider-neutral virtual:// URI is not an FFmpeg input, so probing it
 // directly always fails. Virtual keys are stable without a pinned result=: the
 // identity follows the probed subtitle layout, so the returned pending flag is
 // the only "not definitive yet" signal the caller needs.
-func (h *StreamHandler) fontBundleForRequest(ctx context.Context, session *playback.Session, file *models.MediaFile, trackIndex int) ([]playback.SubtitleFontBundleItem, bool, error) {
+func (h *StreamHandler) fontBundleForRequest(ctx context.Context, session *playback.Session, file *models.MediaFile, trackIndex int) ([]playback.SubtitleFontBundleItem, bool, string, error) {
 	failKey := fontExtractFailureKey(file.ID, trackIndex)
 	failAttrs := []any{"file_id", file.ID, "track", trackIndex}
 	virtualFontSource := isVirtualPlaybackFile(file) && session.VirtualSourceURI != ""
@@ -3019,19 +3036,23 @@ func (h *StreamHandler) fontBundleForRequest(ctx context.Context, session *playb
 	if err != nil {
 		if errors.Is(err, errVirtualFontResolve) {
 			logVirtualStreamFailure(ctx, session.ID, file, err)
-			return nil, false, err
+			return nil, false, "", err
 		}
 		h.fontExtractFailures.failed(ctx, failKey, append(failAttrs, "error", err)...)
-		return nil, true, nil
+		return nil, true, "", nil
 	}
 	defer releaseInput()
 	fonts, err := playback.ExtractAttachedSubtitleFonts(ctx, inputPath, h.ffmpegPath())
 	if err != nil {
 		h.fontExtractFailures.failed(ctx, failKey, append(failAttrs, "error", err)...)
-		return nil, true, nil
+		fallback := ""
+		if errors.Is(err, playback.ErrSubtitleFontSubsetUnavailable) {
+			fallback = playback.SubtitleFontFallbackSubsetUnavailable
+		}
+		return nil, true, fallback, nil
 	}
 	h.fontExtractFailures.recovered(failKey)
-	return playback.EncodeSubtitleFontBundle(fonts), false, nil
+	return playback.EncodeSubtitleFontBundle(fonts), false, "", nil
 }
 
 // HandleSubtitleFonts preserves the bridge API's array response and serves
@@ -3174,7 +3195,7 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 			slog.DebugContext(r.Context(), "subtitle font bundle extraction in backoff",
 				"component", "api", "file_id", file.ID, "track", trackIndex,
 				"retry_after", retryAfter)
-			writePendingFontBundleResponse(w)
+			writePendingFontBundleResponse(w, h.SubtitleCache.FontBundleFallback(cacheKey))
 			return
 		}
 	}
@@ -3205,8 +3226,13 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 			)
 			// Fonts are optional to playback; a failed extraction degrades to
 			// the pending empty bundle rather than a 500 that a retrying client
-			// re-issues.
-			writePendingFontBundleResponse(w)
+			// re-issues. A subsetting failure is permanent, so mark the bundle
+			// as an explicit system-font fallback.
+			fallback := ""
+			if errors.Is(extractErr, playback.ErrSubtitleFontSubsetUnavailable) {
+				fallback = playback.SubtitleFontFallbackSubsetUnavailable
+			}
+			writePendingFontBundleResponse(w, fallback)
 			return
 		}
 		h.fontExtractFailures.recovered(fontExtractFailureKey(file.ID, trackIndex))
@@ -3258,7 +3284,11 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 		// same target. The track is legitimate; the optional font bundle is not.
 		// Answer the pending empty bundle (and let the cache's backoff gate the
 		// next extraction) instead of a 500.
-		writePendingFontBundleResponse(w)
+		fallback := ""
+		if errors.Is(err, playback.ErrSubtitleFontSubsetUnavailable) {
+			fallback = playback.SubtitleFontFallbackSubsetUnavailable
+		}
+		writePendingFontBundleResponse(w, fallback)
 		return
 	}
 	if !ready {
@@ -3271,7 +3301,7 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 		// served, so a slow retry that fails still logs at debug.
 		slog.DebugContext(r.Context(), "subtitle font bundle extraction in flight; serving pending bundle",
 			"component", "api", "file_id", file.ID, "track", trackIndex)
-		writePendingFontBundleResponse(w)
+		writePendingFontBundleResponse(w, h.SubtitleCache.FontBundleFallback(cacheKey))
 		return
 	}
 	// Recovery is confirmed by the completed bundle; only now clear the
@@ -3390,15 +3420,27 @@ func writeFontBundleResponse(w http.ResponseWriter, bundle []byte) {
 // font-less result and instead re-fetches for the completed bundle.
 const fontBundlePendingHeader = "X-Vio-Font-Bundle-Pending"
 
+// fontBundleFallbackHeader marks a font-bundle response that fell back to
+// system fonts because script-driven subsetting could not produce a bundle
+// within the ceiling. Unlike the pending marker, this is the server's answer
+// for this source: the client should not present a missing-font state as a
+// still-loading bundle. Its value is the machine-readable fallback reason.
+const fontBundleFallbackHeader = "X-Vio-Font-Bundle-Fallback"
+
 // writePendingFontBundleResponse writes a valid empty bundle for an extraction
 // that is still running. Unlike a definitive font-less file, it is marked
 // pending and uncacheable, so a client cannot retain the empty state for ten
-// minutes while the real bundle is being produced.
-func writePendingFontBundleResponse(w http.ResponseWriter) {
+// minutes while the real bundle is being produced. fallback, when non-empty,
+// additionally names a system-font fallback reason (see
+// fontBundleFallbackHeader).
+func writePendingFontBundleResponse(w http.ResponseWriter, fallback string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set(fontBundlePendingHeader, "true")
+	if fallback != "" {
+		w.Header().Set(fontBundleFallbackHeader, fallback)
+	}
 	_, _ = w.Write(emptyFontBundle)
 }
 

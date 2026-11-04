@@ -59,6 +59,13 @@ type SubtitleFontService interface {
 	SubtitleFonts(context.Context, apihandlers.SubtitleFontRequest) ([]playback.SubtitleFontBundleItem, bool, error)
 }
 
+// SubtitleFontFallbackService is the optional extension of SubtitleFontService
+// that reports an explicit system-font fallback reason. A transport checks for
+// it by assertion so older fakes keep the two-result contract.
+type SubtitleFontFallbackService interface {
+	SubtitleFontsWithFallback(context.Context, apihandlers.SubtitleFontRequest) ([]playback.SubtitleFontBundleItem, bool, string, error)
+}
+
 type PlaybackSubtitleFont struct {
 	Name string `json:"name" doc:"Attachment file name as authored in the container"`
 	Data string `json:"data" doc:"Base64-encoded font bytes"`
@@ -86,7 +93,12 @@ type PlaybackSubtitleFontsOutput struct {
 	// result. Empty on definitive answers. The header name matches the bridge
 	// API's pending marker so one client constant covers both surfaces.
 	FontBundlePending string `header:"X-Vio-Font-Bundle-Pending"`
-	Body              Collection[PlaybackSubtitleFont]
+	// FontBundleFallback names an explicit system-font fallback: subsetting an
+	// oversized font pack was the only path to a bundle and failed. Empty on
+	// an ordinary empty bundle and on a still-running extraction. The header
+	// name matches the bridge API's fallback marker.
+	FontBundleFallback string `header:"X-Vio-Font-Bundle-Fallback"`
+	Body               Collection[PlaybackSubtitleFont]
 }
 
 func registerPlaybackDelivery(reg *Registry) {
@@ -186,9 +198,16 @@ func registerPlaybackDelivery(reg *Registry) {
 		if reg.deps.PlaybackMedia == nil || reg.deps.PlaybackMedia.SubtitleFonts == nil {
 			return nil, NewProblem(TypeDependencyUnavailable, "Playback delivery is not configured.")
 		}
-		items, pending, err := reg.deps.PlaybackMedia.SubtitleFonts.SubtitleFonts(ctx, apihandlers.SubtitleFontRequest{
-			SessionID: string(in.SessionID), Track: in.Track, Query: in.query,
-		})
+		items, pending, fallback, err := func() ([]playback.SubtitleFontBundleItem, bool, string, error) {
+			request := apihandlers.SubtitleFontRequest{
+				SessionID: string(in.SessionID), Track: in.Track, Query: in.query,
+			}
+			if detailed, ok := reg.deps.PlaybackMedia.SubtitleFonts.(SubtitleFontFallbackService); ok {
+				return detailed.SubtitleFontsWithFallback(ctx, request)
+			}
+			items, pending, err := reg.deps.PlaybackMedia.SubtitleFonts.SubtitleFonts(ctx, request)
+			return items, pending, "", err
+		}()
 		if err != nil {
 			return nil, playbackSubtitleFontProblem(err)
 		}
@@ -204,6 +223,7 @@ func registerPlaybackDelivery(reg *Registry) {
 			// bundle instead of retaining the empty state.
 			out.CacheControl = "no-store"
 			out.FontBundlePending = "true"
+			out.FontBundleFallback = fallback
 		} else {
 			// Definitive answer (fonts or a genuinely font-less file):
 			// cacheable, so the client stops after one fetch instead of

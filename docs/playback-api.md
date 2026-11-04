@@ -740,6 +740,17 @@ reanchor, and is excluded from plan identity.
 | Subtitle sidecar | GET/HEAD `/api/v2/stream/{session_id}/subtitles/{track}` |
 | Subtitle fonts | GET `/api/v2/stream/{session_id}/subtitles/{track}/fonts`, JSON `{items: [{name, data}]}` |
 
+A font bundle that is still being extracted answers an empty collection with
+`Cache-Control: no-store` and `X-Vio-Font-Bundle-Pending: true`; the client
+falls back to default fonts and re-fetches. When the complete attached pack is
+past the 48 MiB ceiling and script-driven subsetting cannot produce a bundle
+(the script is unreadable, more than eight tracks, more than 8 MiB of decoded
+script, or no referenced attachment matched), the response also carries
+`X-Vio-Font-Bundle-Fallback: subset_unavailable`. That marker means the server
+has answered for this source and the client is on system fonts; it is not a
+still-running extraction. A definitive empty bundle for a file with no
+attachments keeps the cacheable response and carries neither marker.
+
 These reuse the shared byte-delivery handlers behind the v2 listener, as the raw
 playback registry allows. The plan's URLs
 carry the signed stream reference `st`; a media element that cannot set headers

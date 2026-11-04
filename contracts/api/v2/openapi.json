@@ -204892,6 +204892,11 @@
                   "type": "string"
                 }
               },
+              "X-Vio-Font-Bundle-Fallback": {
+                "schema": {
+                  "type": "string"
+                }
+              },
               "X-Vio-Font-Bundle-Pending": {
                 "schema": {
                   "type": "string"

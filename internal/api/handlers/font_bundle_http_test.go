@@ -22,6 +22,26 @@ const fontProbeJSON = `cat <<'JSON'
 JSON
 `
 
+func TestPendingFontBundleResponseCarriesFallbackMarker(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	writePendingFontBundleResponse(recorder, playback.SubtitleFontFallbackSubsetUnavailable)
+	if got := recorder.Header().Get(fontBundleFallbackHeader); got != playback.SubtitleFontFallbackSubsetUnavailable {
+		t.Fatalf("fallback header = %q, want %q", got, playback.SubtitleFontFallbackSubsetUnavailable)
+	}
+	if got := recorder.Header().Get(fontBundlePendingHeader); got != "true" {
+		t.Fatalf("pending header = %q, want true", got)
+	}
+	if body := strings.TrimSpace(recorder.Body.String()); body != "[]" {
+		t.Fatalf("fallback body = %q, want an empty bundle", body)
+	}
+
+	ordinary := httptest.NewRecorder()
+	writePendingFontBundleResponse(ordinary, "")
+	if got := ordinary.Header().Get(fontBundleFallbackHeader); got != "" {
+		t.Fatalf("ordinary pending bundle carried fallback %q", got)
+	}
+}
+
 func writeExecutableScript(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(content), 0o755); err != nil {

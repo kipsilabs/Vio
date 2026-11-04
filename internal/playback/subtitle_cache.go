@@ -100,9 +100,13 @@ type SubtitleCache struct {
 	// fontFailureMu guards fontFailureRetryAt, the per-font-bundle extraction
 	// backoff. A failed font extraction is optional to playback, so callers
 	// degrade to an empty pending bundle instead of retrying a flapping
-	// provider on every request.
-	fontFailureMu      sync.Mutex
-	fontFailureRetryAt map[string]time.Time
+	// provider on every request. fontFailureFallback records the failures that
+	// are permanent for this key (subsetting exhausted the only paths to a
+	// bundle), so responses keep an explicit system-font fallback marker while
+	// the backoff lasts.
+	fontFailureMu       sync.Mutex
+	fontFailureRetryAt  map[string]time.Time
+	fontFailureFallback map[string]string
 
 	// warmTextMu guards warmText, the in-progress full-track ASS warms. A
 	// windowed request whose range a warm has already produced is answered
@@ -278,6 +282,13 @@ const (
 // relay was already at its font-demux ceiling. It is expected backpressure, not
 // a failed extraction, and is reported separately from a timeout.
 var errSubtitleFontBundleFlightSkipped = errors.New("subtitle font bundle extraction skipped: relay demux busy")
+
+// SubtitleFontFallbackSubsetUnavailable is the response marker a font-bundle
+// failure carries when the client must use system fonts: the complete pack is
+// past the ceiling and script-driven subsetting could not produce one (an
+// unreadable script, too many tracks, too many decoded bytes, or no referenced
+// attachment matched). It is not a transient pending state.
+const SubtitleFontFallbackSubsetUnavailable = "subset_unavailable"
 
 // subtitleExtractRetryDelays returns the bounded in-request retry schedule for
 // an extraction that failed on an upstream 5xx before emitting any bytes. Each
@@ -2424,12 +2435,13 @@ func (c *SubtitleCache) FontBundleRetryAfter(key FontBundleKey) (time.Duration, 
 	}
 	if !now.Before(retryAt) {
 		delete(c.fontFailureRetryAt, flightKey)
+		delete(c.fontFailureFallback, flightKey)
 		return 0, false
 	}
 	return retryAt.Sub(now), true
 }
 
-func (c *SubtitleCache) noteFontBundleFailure(flightKey string) {
+func (c *SubtitleCache) noteFontBundleFailure(flightKey string, extractErr error) {
 	if c == nil || flightKey == "" {
 		return
 	}
@@ -2438,11 +2450,18 @@ func (c *SubtitleCache) noteFontBundleFailure(flightKey string) {
 	if c.fontFailureRetryAt == nil {
 		c.fontFailureRetryAt = make(map[string]time.Time)
 	}
+	if errors.Is(extractErr, ErrSubtitleFontSubsetUnavailable) {
+		if c.fontFailureFallback == nil {
+			c.fontFailureFallback = make(map[string]string)
+		}
+		c.fontFailureFallback[flightKey] = SubtitleFontFallbackSubsetUnavailable
+	}
 	if len(c.fontFailureRetryAt) >= subtitleFontBundleFailureMaxEntries {
 		now := time.Now()
 		for key, retryAt := range c.fontFailureRetryAt {
 			if !now.Before(retryAt) {
 				delete(c.fontFailureRetryAt, key)
+				delete(c.fontFailureFallback, key)
 			}
 		}
 		if len(c.fontFailureRetryAt) >= subtitleFontBundleFailureMaxEntries {
@@ -2456,9 +2475,36 @@ func (c *SubtitleCache) noteFontBundleFailure(flightKey string) {
 				}
 			}
 			delete(c.fontFailureRetryAt, victim)
+			delete(c.fontFailureFallback, victim)
 		}
 	}
 	c.fontFailureRetryAt[flightKey] = time.Now().Add(subtitleFontBundleFailureCooldown)
+}
+
+// FontBundleFallback reports the permanent fallback reason recorded for a key's
+// last font-bundle extraction, or "" when the failure was transient or absent.
+// It is meaningful only while the failure backoff is active; an expired entry
+// is cleared like FontBundleRetryAfter does.
+func (c *SubtitleCache) FontBundleFallback(key FontBundleKey) string {
+	if c == nil {
+		return ""
+	}
+	flightKey, ok := c.fontBundleFlightKey(key, time.Now())
+	if !ok {
+		return ""
+	}
+	c.fontFailureMu.Lock()
+	defer c.fontFailureMu.Unlock()
+	reason := c.fontFailureFallback[flightKey]
+	if reason == "" {
+		return ""
+	}
+	retryAt, cooling := c.fontFailureRetryAt[flightKey]
+	if !cooling || !time.Now().Before(retryAt) {
+		delete(c.fontFailureFallback, flightKey)
+		return ""
+	}
+	return reason
 }
 
 func (c *SubtitleCache) noteFontBundleSuccess(flightKey string) {
@@ -2467,6 +2513,7 @@ func (c *SubtitleCache) noteFontBundleSuccess(flightKey string) {
 	}
 	c.fontFailureMu.Lock()
 	delete(c.fontFailureRetryAt, flightKey)
+	delete(c.fontFailureFallback, flightKey)
 	c.fontFailureMu.Unlock()
 }
 
@@ -2498,7 +2545,7 @@ func (c *SubtitleCache) startFontBundleFlight(ctx context.Context, key FontBundl
 				// shape and the next request retries once the pipe frees up.
 				return nil, errSubtitleFontBundleFlightSkipped
 			}
-			c.noteFontBundleFailure(flightKey)
+			c.noteFontBundleFailure(flightKey, extractErr)
 			return nil, extractErr
 		}
 		if storeErr := c.storeFontBundle(key, data); storeErr != nil {
