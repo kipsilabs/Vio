@@ -18,10 +18,11 @@ type RealtimeConnection interface {
 }
 
 type sessionLane struct {
-	conn       RealtimeConnection
-	mu         sync.Mutex
-	closed     bool
-	generation uint64
+	conn        RealtimeConnection
+	mu          sync.Mutex
+	closed      bool
+	generation  uint64
+	connectedAt time.Time
 }
 
 // RealtimeRegistration is an opaque ownership token for a realtime connection.
@@ -37,6 +38,7 @@ type RealtimeHub struct {
 	connections          map[string]*sessionLane
 	onInitialRegister    func()
 	onRegisterLaneLookup func(sessionID string, lane *sessionLane)
+	laneObserver         func(sessionID string, connected bool)
 	// onNewConnection fires when a session that had a live lane gets a new one:
 	// either a registration takes over the existing lane, or a client
 	// reconnects after Unregister deleted it. It never fires for a session's
@@ -71,7 +73,7 @@ func (h *RealtimeHub) Register(sessionID string, conn RealtimeConnection) *Realt
 	h.mu.Lock()
 	lane := h.connections[sessionID]
 	if lane == nil {
-		lane = &sessionLane{conn: conn, generation: 1}
+		lane = &sessionLane{conn: conn, generation: 1, connectedAt: time.Now()}
 		h.connections[sessionID] = lane
 		// Whether this is the session's first connection or a reconnect after a
 		// disconnect cannot be told apart from the lane map alone: Unregister
@@ -109,6 +111,7 @@ func (h *RealtimeHub) Register(sessionID string, conn RealtimeConnection) *Realt
 	}
 	lane.conn = conn
 	lane.closed = false
+	lane.connectedAt = time.Now()
 	lane.generation++
 	reg := &RealtimeRegistration{
 		sessionID:  sessionID,
@@ -167,6 +170,63 @@ func (h *RealtimeHub) SetOnNewConnection(hook func(sessionID string)) {
 	h.onNewConnection = hook
 }
 
+// SetLaneObserver installs a callback for lane connect/disconnect transitions.
+func (h *RealtimeHub) SetLaneObserver(observer func(string, bool)) {
+	if h != nil {
+		h.mu.Lock()
+		h.laneObserver = observer
+		h.mu.Unlock()
+	}
+}
+func (h *RealtimeHub) HasLane(id string) bool {
+	if h == nil || id == "" {
+		return false
+	}
+	h.mu.RLock()
+	l := h.connections[id]
+	h.mu.RUnlock()
+	if l == nil {
+		return false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return !l.closed && l.conn != nil
+}
+func (h *RealtimeHub) LaneConnectedAt(id string) (time.Time, bool) {
+	if h == nil || id == "" {
+		return time.Time{}, false
+	}
+	h.mu.RLock()
+	l := h.connections[id]
+	h.mu.RUnlock()
+	if l == nil {
+		return time.Time{}, false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed || l.conn == nil {
+		return time.Time{}, false
+	}
+	return l.connectedAt, true
+}
+func (h *RealtimeHub) LaneSessionIDs() []string {
+	if h == nil {
+		return nil
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	ids := make([]string, 0, len(h.connections))
+	for id, l := range h.connections {
+		l.mu.Lock()
+		live := !l.closed && l.conn != nil
+		l.mu.Unlock()
+		if live {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
 // Unregister removes the active realtime connection for the given registration
 // token only if it still matches the currently registered connection.
 func (h *RealtimeHub) Unregister(reg *RealtimeRegistration) bool {
@@ -204,6 +264,9 @@ func (h *RealtimeHub) Unregister(reg *RealtimeRegistration) bool {
 	h.sweepRecentReleasesLocked(now)
 	h.mu.Unlock()
 	lane.mu.Unlock()
+	if observer := h.laneObserver; observer != nil {
+		observer(reg.sessionID, false)
+	}
 
 	return true
 }

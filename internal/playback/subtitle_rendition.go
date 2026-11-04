@@ -723,6 +723,23 @@ func subtitleRenditionMultivariantPlaylist(opts TranscodeOpts, query string) []b
 	return buf.Bytes()
 }
 
+// CopyHLSVideoRange reports the HDR range implied by copied-stream metadata.
+func CopyHLSVideoRange(transfer, filter, sampleEntry string) string {
+	if filter == DV7ToHDR10BitstreamFilter {
+		return HLSVideoRangePQ
+	}
+	if sampleEntry == VideoSampleEntryDVH1 && transfer == "unknown" {
+		return HLSVideoRangePQ
+	}
+	if transfer == "smpte2084" {
+		return HLSVideoRangePQ
+	}
+	if transfer == "arib-std-b67" {
+		return HLSVideoRangeHLG
+	}
+	return ""
+}
+
 // validCopyHLSVideoRange admits only a range CopyHLSVideoRange produces.
 const (
 	HLSVideoRangePQ  = "PQ"
