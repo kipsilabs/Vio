@@ -459,7 +459,6 @@ type VideoTrack struct {
 	DVProvenanceCurrent *bool  `json:"-"`
 	DVBLPresent         bool   `json:"dv_bl_present,omitempty"`
 	DVRPUPresent        bool   `json:"dv_rpu_present,omitempty"`
-	DVRPUStrippable     *bool  `json:"dv_rpu_strippable,omitempty"`
 	DVELPresent         bool   `json:"dv_el_present,omitempty"`
 	DVEnhancementLayer  string `json:"dv_enhancement_layer,omitempty"` // none, mel, fel, unknown
 	HDR10Plus           bool   `json:"hdr10_plus,omitempty"`
