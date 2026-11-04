@@ -558,7 +558,7 @@ func TestEveryEndRecordsTheAdminLog(t *testing.T) {
 		name: "method switch",
 		end: func(r finishHistoryReplica, held *playback.Session) {
 			_ = r.mgr.StopSession(held.ID)
-			r.mgr.FinishDetached(playback.WithEndReason(context.Background(), playback.EndReasonReplaced), *held)
+			r.mgr.FinishDetached(playback.WithEndReason(context.Background(), string(playback.EndReasonReplaced)), *held)
 		},
 		wantReason: PlaybackEndReplaced,
 	}, {
@@ -602,7 +602,7 @@ func TestEveryEndRecordsTheAdminLog(t *testing.T) {
 	store := newPlaybackTestStore(t)
 	admin := &liveRowAdminStore{}
 	replica := newFinishHistoryReplica(store, admin, finishHistoryFile())
-	replica.mgr.FinishDetached(playback.WithEndReason(context.Background(), playback.EndReasonReplaced), compatFinishSession())
+	replica.mgr.FinishDetached(playback.WithEndReason(context.Background(), string(playback.EndReasonReplaced)), compatFinishSession())
 	if len(admin.history) != 0 {
 		t.Fatalf("admin history = %+v, want none for a copy without progress", admin.history)
 	}

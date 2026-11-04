@@ -464,6 +464,8 @@ func (h *PlaybackHandler) ApplyProgressV2(ctx context.Context, caller PlaybackCa
 	return view, nil
 }
 
+var progressSideEffectBudget = 5 * time.Second
+
 // maxProgressWritePassesV2 bounds how many times persistProgressV2 rewrites
 // the side effects after the row moved under it. Each extra pass needs the
 // row to have advanced while the previous write ran, so one is the norm.

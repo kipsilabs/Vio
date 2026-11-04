@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	"github.com/Silo-Server/silo-server/internal/watchsync"
 )
 
 // blockingSessionSyncer models the admin-session sync that held progress
@@ -93,4 +95,14 @@ func TestApplyProgressV2PauseScrobbleSurvivesSlowSessionSync(t *testing.T) {
 	if scrobbler.pauseContextErr != nil {
 		t.Fatalf("pause scrobble ran on an expired context: %v", scrobbler.pauseContextErr)
 	}
+}
+
+type contextCheckingPauseScrobbler struct {
+	recordingPlaybackWatchScrobbler
+	pauseContextErr error
+}
+
+func (s *contextCheckingPauseScrobbler) ScrobblePause(ctx context.Context, event watchsync.ScrobbleEvent) error {
+	s.pauseContextErr = ctx.Err()
+	return s.recordingPlaybackWatchScrobbler.ScrobblePause(ctx, event)
 }
