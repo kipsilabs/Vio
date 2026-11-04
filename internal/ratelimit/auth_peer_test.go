@@ -5,12 +5,29 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"slices"
 	"testing"
 
 	"github.com/Silo-Server/silo-server/internal/clientip"
 	"github.com/Silo-Server/silo-server/internal/netaccess"
+	"github.com/redis/go-redis/v9"
 )
+
+func testAttemptRedisClient(t *testing.T) *redis.Client {
+	t.Helper()
+	raw := os.Getenv("SILO_TEST_REDIS_URL")
+	if raw == "" {
+		t.Skip("SILO_TEST_REDIS_URL required for the Redis attempt limiter test")
+	}
+	opts, err := redis.ParseURL(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := redis.NewClient(opts)
+	t.Cleanup(func() { _ = client.Close() })
+	return client
+}
 
 func newAuthLimitMiddleware(t *testing.T) *Middleware {
 	t.Helper()

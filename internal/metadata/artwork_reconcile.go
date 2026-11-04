@@ -80,10 +80,6 @@ type ArtworkObjectChecker interface {
 	Stat(context.Context, string) (blobstore.ObjectInfo, error)
 }
 
-// uploadedImageSourcePrefix marks artwork an admin uploaded. Its bytes exist
-// only in artwork storage, so it cannot be downloaded from its source.
-const uploadedImageSourcePrefix = "upload://"
-
 // nonProviderImageSchemesSQL mirrors isNonProviderImageScheme for use inside
 // SQL predicates: source paths with these schemes cannot be re-downloaded.
 const nonProviderImageSchemesSQL = `ARRAY['s3://%', 'file://%', 'nfo+%', 'local://%', 'upload://%', 'generated://%']`
