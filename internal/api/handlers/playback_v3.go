@@ -8718,7 +8718,8 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	// demotions are not connectivity losses and must continue through route retirement.
 	currentTransportRendered := record.CurrentTransportRendered
 	streamReissued := false
-	subtitleDegraded, audioDegraded, subtitleNotShown := false, false, false
+	subtitleDegraded, subtitleNotShown := false, false
+	audioDegraded := false
 	progressReissue := operation == playback.ReplanOperationFailureRecoveryV3 &&
 		!intentChange &&
 		!proxyOriginRecovery &&
@@ -8870,7 +8871,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	// A recovery whose node stopped answering failed on the node, not on its
 	// recipe: keep the failed plan eligible so the replacement can run the same
 	// recipe on another node instead of stepping down or running out of plans.
-	nodeRecovery := !userIntentOperation && len(unreachableNodes) > 0
+	nodeRecovery = !userIntentOperation && len(unreachableNodes) > 0
 	currentKey := playback.PlanAttemptKeyV3(record.CurrentPlan, record.NormalizedRequest.ClientPlaybackContext.Output.OutputContextID, req.LocalMutations)
 	attemptedKeys := []string(nil)
 	if !intentChange && !seekReanchor && !userIntentOperation {
