@@ -995,7 +995,7 @@ func (h *ItemsHandler) writeCatalogBrowseResponse(w http.ResponseWriter, r *http
 	episodeMetadata := h.listEpisodeBrowseMetadata(r.Context(), result.Items)
 	items := make([]itemListResponse, 0, len(result.Items))
 	for _, item := range result.Items {
-		resp := h.toItemListResponseWithOverlay(r.Context(), viewer, item, overlaySummaries[item.ContentID], userStates[item.ContentID], filter.ImageSize)
+		resp := h.toItemListResponseWithOverlay(r.Context(), viewer, item, overlaySummaries[item.ContentID], userStates[item.ContentID], filter.Artwork())
 		// The resolver validated the item's own hint against this profile, so
 		// its answer replaces the unvalidated one carried by the item.
 		resp.PlayContentID = playTargets[playableTargetKeyForItem(item)]
@@ -1156,20 +1156,21 @@ func (h *ItemsHandler) writeCatalogFiltersResponse(w http.ResponseWriter, r *htt
 
 // toItemListResponse converts a MediaItem to an itemListResponse with presigned
 // URLs at the size the caller's request asked for.
-func (h *ItemsHandler) toItemListResponse(ctx context.Context, v ItemViewer, item *models.MediaItem, size imagesize.Size) itemListResponse {
-	return h.toItemListResponseWithOverlay(ctx, v, item, nil, nil, size)
+func (h *ItemsHandler) toItemListResponse(ctx context.Context, v ItemViewer, item *models.MediaItem, artwork imagesize.Request) itemListResponse {
+	return h.toItemListResponseWithOverlay(ctx, v, item, nil, nil, artwork)
 }
 
-func (h *ItemsHandler) toItemListResponseWithOverlay(ctx context.Context, v ItemViewer, item *models.MediaItem, overlaySummary *models.OverlaySummary, userState *itemUserStateResponse, size imagesize.Size) itemListResponse {
+func (h *ItemsHandler) toItemListResponseWithOverlay(ctx context.Context, v ItemViewer, item *models.MediaItem, overlaySummary *models.OverlaySummary, userState *itemUserStateResponse, artwork imagesize.Request) itemListResponse {
 	if h.detailSvc != nil {
 		if localized, err := h.detailSvc.LocalizeItemModel(ctx, item, v.Access); err == nil && localized != nil {
 			item = localized
 		}
 	}
 	resp := itemListResponseShell(item, overlaySummary, userState)
-	hint := requestVariantHint("card", size)
-	resp.PosterURL = h.presignURLCtx(ctx, sizedCardPath(item.PosterPath, artworkkey.ImagePoster, size), hint)
-	resp.BackdropURL = h.presignURLCtx(ctx, sizedCardBackdropPath(item.BackdropPath, size), hint)
+	posterSize := artwork.For(imagesize.SlotPoster)
+	backdropSize := artwork.For(imagesize.SlotBackdrop)
+	resp.PosterURL = h.presignURLCtx(ctx, sizedCardPath(item.PosterPath, artworkkey.ImagePoster, posterSize), requestVariantHint("card", posterSize))
+	resp.BackdropURL = h.presignURLCtx(ctx, sizedCardBackdropPath(item.BackdropPath, backdropSize), requestVariantHint("card", backdropSize))
 	return resp
 }
 
@@ -2726,25 +2727,40 @@ func (h *ItemsHandler) requestCanViewFilePaths(r *http.Request) bool {
 	return h.canViewFilePaths(r.Context())
 }
 
-// canViewFilePaths reports whether the caller may see on-disk paths: admins
-// always, other accounts when their stored flag allows it.
+// hasMaskedMetadataCuration reports whether metadata curation remains in the
+// user's effective policy. Group lookup failures deny access.
+func hasMaskedMetadataCuration(ctx context.Context, user *models.User, groups access.GroupPolicyProvider) bool {
+	if user == nil || !user.Enabled {
+		return false
+	}
+	effective, err := access.EffectivePolicyForUser(ctx, user, groups)
+	if err != nil {
+		return false
+	}
+	return slices.Contains(effective.Permissions, string(auth.PermissionMetadataCuration))
+}
+
+// canViewFilePaths reports whether the caller may see on-disk paths. Acting
+// admins bypass the assigned permission only through the verified acting-admin
+// decision; secondary profiles must retain an assigned, effective grant.
 func (h *ItemsHandler) canViewFilePaths(ctx context.Context) bool {
 	claims := apimw.GetClaims(ctx)
-	if claims == nil {
+	if claims == nil || h == nil || h.UserRepo == nil {
 		return false
 	}
-	if claims.Role == "admin" {
+	actingAdmin, err := apimw.ActingAdmin(ctx)
+	if err != nil {
+		return false
+	}
+	if actingAdmin {
 		return true
-	}
-	if h == nil || h.UserRepo == nil {
-		return false
 	}
 	user, err := h.UserRepo.GetByID(ctx, claims.UserID)
 	if err != nil {
 		slog.WarnContext(ctx, "checking file path visibility permissions", "component", "api", "user_id", claims.UserID, "error", err)
 		return false
 	}
-	return auth.HasEffectivePermission(user, auth.PermissionMetadataCuration)
+	return hasMaskedMetadataCuration(ctx, user, h.AccessGroups)
 }
 
 // HandleDelete handles DELETE /api/v1/admin/items/{id}.

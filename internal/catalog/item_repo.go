@@ -4093,6 +4093,12 @@ func (r *ItemRepository) GetByID(ctx context.Context, contentID string) (*models
 	return scanItem(r.pool.QueryRow(ctx, query, contentID))
 }
 
+// GetByIDTx retrieves a media item using the supplied transaction.
+func (r *ItemRepository) GetByIDTx(ctx context.Context, tx pgx.Tx, contentID string) (*models.MediaItem, error) {
+	query := `SELECT ` + itemColumns + ` FROM media_items WHERE content_id = $1`
+	return scanItem(tx.QueryRow(ctx, query, contentID))
+}
+
 // GetByIDs retrieves multiple media items by their content IDs.
 // Items not found are silently omitted from the result.
 func (r *ItemRepository) GetByIDs(ctx context.Context, contentIDs []string) ([]*models.MediaItem, error) {

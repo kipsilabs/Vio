@@ -193,7 +193,9 @@ func buildDiscordDigestEntry(row DeliveryRow, test bool) discordDigestEntry {
 			embed.Timestamp = row.CreatedAt.UTC().Format(time.RFC3339)
 		}
 		enforceDiscordTotalLimit(&embed)
-		return discordDigestEntry{embed: embed}
+		// Keep the rating text as the digest teaser so aggregate message
+		// fitting can shorten it without losing the rating-specific payload.
+		return discordDigestEntry{embed: embed, teaser: embed.Description}
 	}
 
 	// Titles assembled from catalog metadata virtually never approach the

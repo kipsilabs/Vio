@@ -3,6 +3,7 @@ package jellycompat
 import (
 	"crypto/sha1"
 	"encoding/hex"
+	"log/slog"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -382,7 +383,7 @@ func (m *mapper) personDTO(name, personID, role, kind, photoURL, photoPath, phot
 // applyDetailVersions fills the version-derived detail fields from the
 // already-filtered version list. An empty list means a provider-metadata-only
 // (unaired/missing) item, where the version data is authoritative.
-func (m *mapper) applyDetailVersions(dto *baseItemDTO, contentID string, versions []catalog.FileVersion, wantField func(string) bool) {
+func (m *mapper) applyDetailVersions(dto *baseItemDTO, _ string, versions []catalog.FileVersion, wantField func(string) bool) {
 	if len(versions) == 0 {
 		// Provider-metadata-only (unaired/missing) item: version data is
 		// authoritative here, so override the FileSystem default set by
@@ -392,13 +393,9 @@ func (m *mapper) applyDetailVersions(dto *baseItemDTO, contentID string, version
 	}
 	// A requested MediaSources on a playable item without a present version
 	// is [], as in Jellyfin; series and seasons have no media sources.
-	if wantField("mediasources") && isPlayableItemType(item.Type) && dto.MediaSources == nil {
+	if wantField("mediasources") && dto.MediaSources == nil {
 		dto.MediaSources = []mediaSourceDTO{}
 	}
-	if !allFields {
-		dropUnrequestedEmptyLists(&dto, wantField)
-	}
-	return dto
 }
 
 // dropUnrequestedEmptyLists leaves an empty list field out of a list

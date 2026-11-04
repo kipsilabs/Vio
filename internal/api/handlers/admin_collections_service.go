@@ -29,6 +29,7 @@ type AdminCollectionPreviewRequest = previewCollectionRequest
 type AdminCollectionImportMDBList = importMDBListRequest
 type AdminCollectionImportTMDB = importTMDBRequest
 type AdminCollectionImportTMDBList = importTMDBListRequest
+type AdminCollectionImportTrakt = importTraktRequest
 type AdminCollectionImportResult = importCollectionResponse
 type AdminCollectionTemplateApply = applyTemplateBundleRequest
 type AdminCollectionTemplateResult = applyTemplateBundleResponse

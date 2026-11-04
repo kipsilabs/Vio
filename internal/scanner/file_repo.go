@@ -5640,6 +5640,31 @@ func (r *FileRepository) listFilesByEpisodeIDs(ctx context.Context, episodeIDs [
 	return grouped, nil
 }
 
+func (r *FileRepository) listFilesByEpisodeIDs(ctx context.Context, episodeIDs []string) (map[string][]*models.MediaFile, error) {
+	return r.ListByEpisodeIDs(ctx, episodeIDs)
+}
+
+func mergeEpisodeFiles(direct, alias []*models.MediaFile) []*models.MediaFile {
+	if len(alias) == 0 {
+		return direct
+	}
+	out := make([]*models.MediaFile, 0, len(direct)+len(alias))
+	seen := make(map[int]struct{}, len(direct)+len(alias))
+	for _, files := range [][]*models.MediaFile{direct, alias} {
+		for _, file := range files {
+			if file == nil {
+				continue
+			}
+			if _, ok := seen[file.ID]; ok {
+				continue
+			}
+			seen[file.ID] = struct{}{}
+			out = append(out, file)
+		}
+	}
+	return out
+}
+
 // listAliasFilesByCanonicalEpisodeIDs resolves canonical episode IDs to the
 // files owned by their alias rows. It returns alias files independently of
 // direct files, ordered by file ID. ListByEpisodeIDs appends them after the

@@ -335,27 +335,42 @@ type PlaybackWatchStopConfirmer interface {
 
 // PlaybackHandler serves Jellyfin playback negotiation endpoints.
 type PlaybackHandler struct {
-	cfg                     *config.Config
-	content                 ContentService
-	codec                   *ResourceIDCodec
-	deviceProfiles          *DeviceProfileStore
-	playbackStore           CompatPlaybackStore
-	sessionMgr              SessionManagerInterface
-	fileResolver            FilePathResolver
-	downloads               DownloadServer       // nil refuses /Items/{id}/Download
-	accessFilter            AccessFilterResolver // the viewer's scope for downloads
-	storeProvider           userstore.UserStoreProvider
-	ScopeResolver           ScopeResolver
-	DeviceProfilePersister  DeviceProfilePersister
-	NodePlanner             nodepool.SessionPlanner
-	JWTSecret               string
-	signalsNotifier         signalsChangedNotifier
-	FFmpegPath              string
-	HWAccel                 string
-	TranscodeDir            string
-	SubtitleCache           *playback.SubtitleCache
-	SegmentRetentionSeconds func() int
-	PlaybackConfig          func() config.PlaybackConfig
+	cfg                            *config.Config
+	content                        ContentService
+	codec                          *ResourceIDCodec
+	deviceProfiles                 *DeviceProfileStore
+	DeviceProfilePersister         DeviceProfilePersister
+	VirtualMediaResolver           VirtualMediaResolver
+	VirtualMediaRefreshResolver    VirtualMediaRefreshResolver
+	VirtualMediaDetailedResolver   VirtualMediaDetailedResolver
+	VirtualPlaybackStreamLister    VirtualPlaybackStreamLister
+	VirtualSourceProber            VirtualSourceProber
+	VirtualSourceProberWithHeaders VirtualSourceProberWithHeaders
+	VirtualFileSaver               VirtualFileSaver
+	VirtualFileMetadataSaver       VirtualFileMetadataSaver
+	VirtualCandidateFileLookup     VirtualCandidateFileLookup
+	RemoteStreamRelay              RemoteStreamRelay
+	AllowInsecureVirtual           func(int) bool
+	AllowPrivateStreams            func(int) bool
+	compatBackgroundMu             sync.Mutex
+	compatBackgroundClosed         bool
+	compatBackgroundWG             sync.WaitGroup
+	playbackStore                  CompatPlaybackStore
+	sessionMgr                     SessionManagerInterface
+	fileResolver                   FilePathResolver
+	downloads                      DownloadServer       // nil refuses /Items/{id}/Download
+	accessFilter                   AccessFilterResolver // the viewer's scope for downloads
+	storeProvider                  userstore.UserStoreProvider
+	ScopeResolver                  ScopeResolver
+	NodePlanner                    nodepool.SessionPlanner
+	JWTSecret                      string
+	signalsNotifier                signalsChangedNotifier
+	FFmpegPath                     string
+	HWAccel                        string
+	TranscodeDir                   string
+	SubtitleCache                  *playback.SubtitleCache
+	SegmentRetentionSeconds        func() int
+	PlaybackConfig                 func() config.PlaybackConfig
 	// tm is the shared transcode-session lifecycle (live map, reconstruct) — the
 	// same type the native handler uses, so jellycompat gets the reconstruct cap
 	// and node-affinity rule for free. The reconstruction recipe is carried in the

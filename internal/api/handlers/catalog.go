@@ -686,7 +686,7 @@ func (h *CatalogHandler) HandleLegacySearch(w http.ResponseWriter, r *http.Reque
 	userStates := h.itemsH.listItemUserStates(r.Context(), viewerFromRequest(r, accessFilter), items)
 	resp := make([]itemListResponse, 0, len(items))
 	for _, item := range items {
-		resp = append(resp, h.itemsH.toItemListResponseWithOverlay(r.Context(), viewerFromRequest(r, accessFilter), item, nil, userStates[item.ContentID], accessFilter.ImageSize))
+		resp = append(resp, h.itemsH.toItemListResponseWithOverlay(r.Context(), viewerFromRequest(r, accessFilter), item, nil, userStates[item.ContentID], accessFilter.Artwork()))
 	}
 
 	writeJSON(w, http.StatusOK, browseResponse{
