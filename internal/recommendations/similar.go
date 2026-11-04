@@ -35,6 +35,19 @@ func (e *Engine) SimilarItemsWithReasons(ctx context.Context, userID int, profil
 
 // rankSimilar ranks the items similar to itemID and returns them with the
 // source metadata the connection reasons compare against.
+func dropMissingItems(items []ScoredItem, existing map[string]struct{}) []ScoredItem {
+	if len(items) == 0 {
+		return items
+	}
+	filtered := make([]ScoredItem, 0, len(items))
+	for _, item := range items {
+		if _, ok := existing[item.MediaItemID]; ok {
+			filtered = append(filtered, item)
+		}
+	}
+	return filtered
+}
+
 func (e *Engine) rankSimilar(ctx context.Context, userID int, profileID, itemID string, limit int, filter catalog.AccessFilter) ([]ScoredItem, *ItemMetadata, error) {
 	marks, err := e.signalReader().NotInterestedMarks(ctx, userID, profileID)
 	if err != nil {
@@ -98,7 +111,23 @@ func (e *Engine) rankSimilar(ctx context.Context, userID int, profileID, itemID 
 		blended = excludeScoredItems(blended, marked)
 	}
 
-	// 5. Validation pipeline, after reading the details of the co-watch
+	// 5. Resolve candidates against the catalog before validation and MMR.
+	// Co-watch rows can outlive their media item, so existence must be checked
+	// after blending. This is deliberately an existence-only filter: access
+	// filtering already happened while fetching candidates and co-watch rows.
+	if len(blended) > 0 {
+		ids := make([]string, len(blended))
+		for i, item := range blended {
+			ids[i] = item.MediaItemID
+		}
+		existing, err := e.repo.ExistingItemIDs(ctx, ids)
+		if err != nil {
+			return nil, nil, fmt.Errorf("filter missing similar items: %w", err)
+		}
+		blended = dropMissingItems(blended, existing)
+	}
+
+	// 6. Validation pipeline, after reading the details of the co-watch
 	// neighbors the embedding search did not return.
 	var cowatchOnly []string
 	for _, item := range blended {
