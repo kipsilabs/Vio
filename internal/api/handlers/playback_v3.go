@@ -8586,6 +8586,8 @@ func inPlaceAudioCandidateOrderV3(req playback.StartRequestV3, file *models.Medi
 	return order
 }
 
+const maxInPlaceAudioCandidatesV3 = 4
+
 func annotateAudioTrackSubstitutedV3(result *playback.PlannerResultV3, index int) {
 	if result == nil || result.Terminal != nil || result.Plan == nil {
 		return
@@ -9062,6 +9064,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		audioDegraded, subtitleNotShown = planned.audioDegraded, planned.subtitleNotShown
 		subtitleDegraded = subtitleDegraded || planned.subtitleDegraded
 	}
+	mode := withHLSVariableSubstitutionV3(r, headerAuthenticatedMediaV3(start.ClientFeatures), start)
 	result = retryIncompleteToneMapPlanningV3(result, toneMapCapabilityErr)
 	result = retryIncompletePlaybackSettingsV3(result, plannerSettingsErr)
 	// Media authentication and the hls playlist form are attempt-sticky (pinned
