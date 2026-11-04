@@ -2279,6 +2279,20 @@ func (s *Server) reconstructFromToken(r *http.Request, sessionID string, request
 			if fetched, ok := s.recipeStore.Get(r.Context(), sessionID); ok && fetched != nil &&
 				fetched.SubtitleRenditionSource == resolved.SubtitleRenditionSource &&
 				fetched.UserID == resolved.UserID && len(fetched.SubtitleRenditionTracks) == len(resolved.SubtitleRenditionTracks) {
+				// Track numbers identify the source rendition. Do not hydrate from a
+				// stale recipe when the token and stored card refer to different
+				// tracks: even fields that look descriptive (stream index, codec) can
+				// then point at a different stream and must remain token-authoritative.
+				matchingTracks := true
+				for i := range resolved.SubtitleRenditionTracks {
+					if fetched.SubtitleRenditionTracks[i].TrackNumber != resolved.SubtitleRenditionTracks[i].TrackNumber {
+						matchingTracks = false
+						break
+					}
+				}
+				if !matchingTracks {
+					return s.spawnReconstruct(r, sessionID, requestedSegment, resolved)
+				}
 				// Claims are authoritative for rendition identity and playback
 				// semantics (order, track number, forced/default flags). The stored
 				// card may add descriptive fields, but must not rewrite those
