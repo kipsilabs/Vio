@@ -5,11 +5,15 @@ package handlers
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 
+	"github.com/Silo-Server/silo-server/internal/logredact"
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/noderouting"
 	"github.com/Silo-Server/silo-server/internal/playback"
+	"github.com/Silo-Server/silo-server/internal/virtuallibrary/resolver"
 )
 
 func findCarryCandidateSessionV3(sessions []*playback.Session, profileID string, fileID int, clientIP, userAgent string) *playback.Session {
@@ -297,3 +301,285 @@ func fillVirtualVideoTrackFromDescriptorV3(t *models.VideoTrack, source playback
 	t.Bitrate = source.BitrateKbps
 	t.ColorRange = source.ColorRange
 }
+func virtualReplanRotationExhaustedV3(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, errVirtualRotationExhaustedV3) {
+		return true
+	}
+	if errors.Is(err, resolver.ErrProviderUnavailable) {
+		return true
+	}
+	if isVirtualCandidateDeadError(err) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "no streams available from provider") ||
+		strings.Contains(msg, "provider unavailable")
+}
+
+func classifyVirtualReplanExhaustionV3(initialVirtualErr error, candidateErrs []*candidateErrorV3) *transportErrorV3 {
+	var joinedErr error
+	if initialVirtualErr != nil {
+		joinedErr = initialVirtualErr
+	}
+	var highestCandidate *candidateErrorV3
+	highestPriority := -1
+	for _, ce := range candidateErrs {
+		if ce != nil {
+			if ce.Err != nil {
+				joinedErr = errors.Join(joinedErr, ce.Err)
+			} else if ce.Message != "" {
+				joinedErr = errors.Join(joinedErr, errors.New(ce.Message))
+			}
+			p := candidateStagePriority(ce.Stage)
+			if p > highestPriority {
+				highestPriority = p
+				highestCandidate = ce
+			}
+		}
+	}
+
+	if errors.Is(initialVirtualErr, context.DeadlineExceeded) && (highestCandidate == nil || highestCandidate.Stage == candidateStageResolve) {
+		return &transportErrorV3{
+			reason:    "replan_virtual_input_timeout",
+			message:   "Virtual stream input resolution timed out during replan.",
+			retryable: true,
+			cause:     joinedErr,
+		}
+	}
+	for _, ce := range candidateErrs {
+		if ce != nil && ce.Stage == candidateStageResolve && errors.Is(ce.Err, context.DeadlineExceeded) {
+			if highestCandidate == nil || highestCandidate.Stage == candidateStageResolve {
+				return &transportErrorV3{
+					reason:    "replan_virtual_input_timeout",
+					message:   "Virtual stream input resolution timed out during replan.",
+					retryable: true,
+					cause:     joinedErr,
+				}
+			}
+		}
+	}
+
+	// Route-capacity exhaustion is an honest, retryable verdict: the selected
+	// workload has no route capacity right now, not a broken plan. Surface it
+	// even when another candidate failed at a higher-priority stage first (for
+	// example a canceled virtual re-resolve), because the client's correct
+	// response is to retry. Without this the final reason can be a masking
+	// transport error and the replan handler answers 500 internal_error
+	// instead of a retryable 503, which stranded the HLS fallback in the field.
+	for _, ce := range candidateErrs {
+		if ce != nil && ce.TransportErr != nil &&
+			ce.TransportErr.reason == string(noderouting.OutcomeCapacityUnavailable) {
+			return &transportErrorV3{
+				reason:    string(noderouting.OutcomeCapacityUnavailable),
+				message:   "The playback route capacity is temporarily unavailable; retry shortly",
+				retryable: true,
+				cause:     joinedErr,
+			}
+		}
+	}
+
+	// A limit-provider blip is not a capacity limit. Replacement admission
+	// fails open on it, but if it still surfaces (for example through a later
+	// transcode-permission lookup) classify it as the transient dependency
+	// failure it is instead of reporting capacity_unavailable or
+	// transcoding_disabled.
+	if highestCandidate != nil &&
+		(highestCandidate.Stage == candidateStageAdmission || highestCandidate.Stage == candidateStageTranscodePerm) &&
+		errors.Is(highestCandidate.Err, playback.ErrLimitProviderUnavailable) {
+		return &transportErrorV3{
+			reason:    "limit_provider_unavailable",
+			message:   "Playback limits could not be checked. Please retry.",
+			retryable: true,
+			cause:     joinedErr,
+		}
+	}
+
+	if highestCandidate != nil {
+		if highestCandidate.TransportErr != nil {
+			cloned := *highestCandidate.TransportErr
+			cloned.cause = joinedErr
+			return &cloned
+		}
+		switch highestCandidate.Stage {
+		case candidateStageTransport:
+			reason := highestCandidate.Reason
+			if reason == "" {
+				reason = transcodeStartFailedReasonV3
+			}
+			return &transportErrorV3{
+				reason:    reason,
+				message:   "Playback transport failed for all alternate media versions.",
+				retryable: true,
+				cause:     joinedErr,
+			}
+		case candidateStageSubtitleArtifact:
+			return subtitleArtifactErrorV3("Failed to prepare the selected subtitle artifact.", joinedErr)
+		case candidateStageSubtitleRemap:
+			// A subtitle remap miss is a subtitle-local outcome. Reporting it
+			// as virtual_source_unavailable would let the generic candidate
+			// machinery treat a track that every compatible version lacks as
+			// a failed media source. Name the subtitle instead so the client
+			// can drop or re-pick it without a release swap.
+			return subtitleArtifactErrorV3("The selected subtitle is unavailable in every compatible media version.", joinedErr)
+		case candidateStageAudioRemap:
+			// An audio remap miss is an audio-local outcome. The candidate's
+			// audio inventory is what failed to bind, not its video stream.
+			// Reporting virtual_source_unavailable would let the generic
+			// candidate machinery indict the release for a track the file
+			// lacks or the client sent malformed. Name the audio so the client
+			// can pick another track without a release swap.
+			return &transportErrorV3{
+				reason:    trackUnavailableReasonV3,
+				message:   "The selected audio track is unavailable in every compatible media version.",
+				retryable: false,
+				cause:     joinedErr,
+			}
+		case candidateStageTranscodePerm:
+			return &transportErrorV3{
+				reason:    "transcoding_disabled",
+				message:   "The required server adaptation is disabled for this user.",
+				retryable: false,
+				cause:     joinedErr,
+			}
+		case candidateStageAdmission:
+			return &transportErrorV3{
+				reason:    "capacity_unavailable",
+				message:   "No playback capacity is available for alternate versions.",
+				retryable: true,
+				cause:     joinedErr,
+			}
+		}
+	}
+
+	return &transportErrorV3{
+		reason:    "virtual_source_unavailable",
+		message:   "The virtual source could not be refreshed for playback.",
+		retryable: true,
+		cause:     joinedErr,
+	}
+}
+
+func sameCandidateFailureDescriptorCarryV3(operation playback.ReplanOperationV3, session *playback.Session, record *playback.AttemptRecordV3, pinnedRowProvenance bool, resolved resolvedVirtualPlaybackSource, decodeRotation bool) bool {
+	if !failureRecoveryOperationV3(operation) || session == nil || record == nil || resolved.File == nil {
+		return false
+	}
+	if decodeRotation || !pinnedRowProvenance {
+		return false
+	}
+	planURI := strings.TrimSpace(record.CurrentPlan.EffectiveVirtualURI)
+	resolvedURI := strings.TrimSpace(resolved.URI)
+	if planURI == "" || resolvedURI == "" {
+		return false
+	}
+	// The running plan must still name the session's pin, and the resolver must
+	// have returned that same candidate. Session provenance proves the retained
+	// evidence describes the pinned row; it does not by itself prove the plan's
+	// descriptor is for the same bytes, so both candidate checks are required.
+	if !sameVirtualCandidate(session.VirtualSourceURI, planURI) ||
+		!sameVirtualCandidate(resolvedURI, planURI) {
+		return false
+	}
+	// An installation change is a different provider binding even when the
+	// provider-neutral path is unchanged.
+	return resolved.OwnerID > 0 && resolved.OwnerID == session.VirtualSourceOwnerInstallationID
+}
+
+// virtualCodecAgreesV3 reports whether every video-codec spelling the row
+// already declares agrees with the descriptor's codec under the planner's
+// normalization. An absent declaration is a gap and agrees by construction.
+type candidateFailureStage string
+
+const (
+	candidateStageResolve          candidateFailureStage = "resolve"
+	candidateStageAudioRemap       candidateFailureStage = "audio_remap"
+	candidateStageSubtitleRemap    candidateFailureStage = "subtitle_remap"
+	candidateStagePreflight        candidateFailureStage = "preflight"
+	candidateStageNormalize        candidateFailureStage = "normalize"
+	candidateStagePlan             candidateFailureStage = "plan"
+	candidateStageAdmission        candidateFailureStage = "admission"
+	candidateStageTranscodePerm    candidateFailureStage = "transcode_permission"
+	candidateStageTransport        candidateFailureStage = "transport"
+	candidateStageRecipe           candidateFailureStage = "recipe"
+	candidateStageSubtitleArtifact candidateFailureStage = "subtitle_artifact"
+)
+
+type candidateErrorV3 struct {
+	Stage          candidateFailureStage
+	Reason         string
+	Message        string
+	TerminalReason string
+	TransportErr   *transportErrorV3
+	Err            error
+}
+
+func candidateStagePriority(s candidateFailureStage) int {
+	switch s {
+	case candidateStageSubtitleArtifact:
+		return 10
+	case candidateStageRecipe:
+		return 9
+	case candidateStageTransport:
+		return 8
+	case candidateStageTranscodePerm:
+		return 7
+	case candidateStageAdmission:
+		return 6
+	case candidateStagePlan:
+		return 5
+	case candidateStageNormalize:
+		return 4
+	case candidateStagePreflight:
+		return 3
+	case candidateStageAudioRemap, candidateStageSubtitleRemap:
+		return 2
+	case candidateStageResolve:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func (e *candidateErrorV3) Error() string {
+	if e == nil {
+		return ""
+	}
+	if e.Err != nil {
+		return fmt.Sprintf("[%s] %s: %v", e.Stage, e.Message, logredact.SanitizeURLError(e.Err))
+	}
+	return fmt.Sprintf("[%s] %s", e.Stage, e.Message)
+}
+
+func (e *candidateErrorV3) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+// candidateSubtitleLocalFailureV3 reports whether a candidate was rejected for
+// a subtitle reason rather than a video/transport one. Such a candidate is held
+// as the subtitle-degrade target: dropping the subtitle and playing its video
+// changes the release less than skipping it for a sibling that also cannot
+// honor the selection. A video/transport rejection is deliberately excluded so
+// the genuine failover paths are untouched.
+func candidateSubtitleLocalFailureV3(err *candidateErrorV3) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, errSubtitleUnavailableInTargetV3) {
+		return true
+	}
+	return err.Stage == candidateStageSubtitleArtifact
+}
+
+// virtualReplanRotationExhaustedV3 reports whether a failed virtual replan
+// rehydration has already proved that no provider candidate can serve the
+// session's release. The rotation retry marks its own failure, and a
+// provider-wide outage or a candidate walk that produced no usable stream
+// carries the same meaning. A release verdict (an absent pin, a marked-failed
+// candidate) is deliberately not exhaustion: rotation may have found a
+// genuinely different release and refused to substitute it, which leaves the
+// sibling-edition walk as the correct recovery for an auto selection.
