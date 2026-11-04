@@ -94,7 +94,7 @@ func TestInventoryEffectiveFileLogsFailClosedPlaceholder(t *testing.T) {
 	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
 	file := &models.MediaFile{ID: 900, FilePath: "virtual://movie/tt-placeholder?result=other", Container: "virtual"}
 
-	got := handler.inventoryEffectiveFile(context.Background(), file, &playback.Session{}, nil, "virtual://movie/tt-placeholder?result=bound")
+	got := handler.inventoryEffectiveFile(context.Background(), file, &playback.Session{}, "virtual://movie/tt-placeholder?result=bound")
 	if got == nil {
 		t.Fatal("inventoryEffectiveFile returned nil")
 	}

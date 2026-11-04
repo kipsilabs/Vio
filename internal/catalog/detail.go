@@ -1065,6 +1065,13 @@ func (s *DetailService) SetVirtualRankingSource(source VirtualRankingSource) {
 	s.virtualRankingSource = source
 }
 
+// SetVirtualCandidateScoreSource wires the custom-format scores shown on a
+// watch response's virtual versions. It is optional; without it every version
+// simply carries no score.
+func (s *DetailService) SetVirtualCandidateScoreSource(source VirtualCandidateScoreSource) {
+	s.virtualScoreSource = source
+}
+
 func (s *DetailService) attachVirtualRanking(ctx context.Context, contentID string, detail *WatchDetail, files []*models.MediaFile) {
 	if s.virtualRankingSource == nil || detail == nil {
 		return

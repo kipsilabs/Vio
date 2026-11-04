@@ -27,7 +27,7 @@ func TestInventoryEffectiveFileFallsBackToSessionEvidence(t *testing.T) {
 		VirtualSubtitleTracks:      subtitles,
 	}
 
-	got := handler.inventoryEffectiveFile(context.Background(), file, session, nil, candidateURI)
+	got := handler.inventoryEffectiveFile(context.Background(), file, session, candidateURI)
 	if got == nil {
 		t.Fatal("inventoryEffectiveFile returned nil")
 	}
@@ -55,7 +55,7 @@ func TestInventoryEffectiveFileRejectsMismatchedSessionEvidence(t *testing.T) {
 		VirtualSubtitleTracks:      []models.SubtitleTrack{{Index: 0, Language: "en", Codec: "subrip"}},
 	}
 
-	got := handler.inventoryEffectiveFile(context.Background(), file, session, nil, candidateURI)
+	got := handler.inventoryEffectiveFile(context.Background(), file, session, candidateURI)
 	if got == nil {
 		t.Fatal("inventoryEffectiveFile returned nil")
 	}
