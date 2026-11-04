@@ -2802,6 +2802,12 @@ func withNegotiatedClientInfo(ctx context.Context, playSession *PlaybackSession)
 // didn't yet name the client from PlaybackInfo, still takes the name.
 func fillReconstructedClientInfo(card *playback.RecipeCard, info playback.ClientInfo) {
 	card.IsJellyfinCompat = info.IsCompat
+	if card.DeviceID == "" {
+		card.DeviceID = info.DeviceID
+	}
+	if card.DevicePlatform == "" {
+		card.DevicePlatform = info.DevicePlatform
+	}
 	if card.ClientName == "" && card.ClientUserAgent == "" {
 		card.ClientName, card.ClientVersion, card.ClientUserAgent = info.Name, info.Version, info.UserAgent
 	} else if card.ClientName == "" && info.Name != "" {

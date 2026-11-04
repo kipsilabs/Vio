@@ -1,5 +1,8 @@
 package jellycompat
 
 func compatAudioOrdinalOrDefault(source PlaybackMediaSource) int {
-	return source.SubtitleTrackIndex
+	if ordinal, ok := compatAudioOrdinal(source); ok {
+		return ordinal
+	}
+	return 0
 }
