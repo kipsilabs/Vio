@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 
 
 import { PlayerConfigProvider, type PlayerConfig } from "../context/PlayerConfigContext";
 import type { WatchTogetherRoomConnectionResult } from "../hooks/useWatchTogetherRoomConnection";
-import { fixturePlanV3 } from "../protocol-v3.fixtures";
+import { fixturePlanV3, fixtureSubtitleInventoryItemV3 } from "../protocol-v3.fixtures";
 import type { AvailableQualityV3, PlanV3 } from "../protocol-v3";
 import type {
   PlaybackRealtimeCommandEnvelope,
@@ -81,10 +81,16 @@ const hlsJS = vi.hoisted(() => ({
   loadSource: vi.fn(),
   errorHandler: null as null | ((event: unknown, data: unknown) => void),
   stopLoad: vi.fn(),
-  loadSource: vi.fn(),
   latest: null as null | { emit: (event: string, data: unknown) => void },
+  bufferAppendedHandler: null as null | ((event: unknown, data?: unknown) => void),
   // Seconds buffered past the playhead, as hls.js measures them.
   forwardBufferSeconds: 0,
+}));
+// Captures the onSourceChanged handlers the mocked subtitle hooks receive, so
+// tests can drive a subtitle_source_changed (409) signal from the outside.
+const subtitleHooks = vi.hoisted(() => ({
+  vttSourceChanged: null as null | (() => void),
+  assSourceChanged: null as null | (() => void),
 }));
 
 vi.mock("sonner", () => ({
@@ -253,7 +259,6 @@ vi.mock("hls.js", () => ({
     url: string | null = null;
     handlers = new Map<string, (event: string, data: unknown) => void>();
     stopLoad = hlsJS.stopLoad;
-    loadSource = hlsJS.loadSource;
 
     bufferedToEnd = false;
     maxBufferLength: number;
@@ -982,31 +987,6 @@ function setMediaError(video: HTMLVideoElement, message: string) {
   Object.defineProperty(video, "error", {
     configurable: true,
     value: { code: 3, message },
-  });
-}
-
-/**
- * Marks an original file's clock origin known, as a real load does before its
- * first `timeupdate`. Until `loadedmetadata` fires the player keeps the
- * scrubber at the session's start position instead of an event's media time.
- */
-function fireDirectPlayMetadata(video: HTMLVideoElement) {
-  fireEvent.loadedMetadata(video);
-}
-
-/** Installs a fake `TimeRanges` list so tests can drive buffer/seek checks. */
-function setTimeRanges(
-  video: HTMLVideoElement,
-  property: "buffered" | "seekable",
-  ranges: Array<[number, number]>,
-) {
-  Object.defineProperty(video, property, {
-    configurable: true,
-    value: {
-      length: ranges.length,
-      start: (index: number) => ranges[index]?.[0] ?? 0,
-      end: (index: number) => ranges[index]?.[1] ?? 0,
-    } as TimeRanges,
   });
 }
 
