@@ -1297,6 +1297,8 @@ func (r *FileRepository) upsertWithQueryer(ctx context.Context, queryer fileQuer
 		mf.EditionKey,
 		mf.EditionConfidence,
 		mf.EditionSource,
+		mf.ReleaseName,
+		mf.ReleaseGroup,
 		mf.PresentationKind,
 		mf.PresentationGroupKey,
 		nilIfZero(mf.PresentationPartIndex),

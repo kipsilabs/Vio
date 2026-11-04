@@ -118,7 +118,7 @@ func TestProxyFollowsStoreBackedTranscodeOffDeadNode(t *testing.T) {
 		if r.URL.Path != "/transcode/upstream-1/segment/seg_00019.ts" {
 			t.Errorf("new node path = %q", r.URL.Path)
 		}
-		if r.Header.Get("X-Silo-Stream-Token") != "token" {
+		if r.Header.Get("X-Vio-Stream-Token") != "token" {
 			t.Error("new node did not receive the forwarded stream token")
 		}
 		_, _ = w.Write([]byte("segment from the new node"))
