@@ -34,6 +34,7 @@ import { useIntroSkipPrompt } from "../hooks/useIntroSkipPrompt";
 import { useRemuxSeeking } from "../hooks/useRemuxSeeking";
 import { useSubtitleTracks } from "../hooks/useSubtitleTracks";
 import { useASSSubtitles } from "../hooks/useASSSubtitles";
+import { useSubtitleFontPrefetch } from "../hooks/useSubtitleFontPrefetch";
 import { usePGSSubtitles } from "../hooks/usePGSSubtitles";
 import type { EngineCapabilities } from "../engine/capabilities";
 import { resolveOriginalPlaybackRoute, type NativeOriginalSupport } from "../engine/routing";
@@ -77,6 +78,7 @@ import { StartupGuard } from "../utils/startupGuard";
 import { isSafariBrowserV3, resolveHLSEngineV3 } from "../utils/hlsEngine";
 import { isFirefoxUserAgent } from "../utils/browser";
 import { normalizeSubtitleMode } from "../utils/subtitleMode";
+import { buildWarmTransportRouteKey } from "../utils/warmTransport";
 import {
   markerOccurrenceAtTime,
   resolveAutoplayMarker,
@@ -533,10 +535,13 @@ export function VideoPlayer({
   streamUrl,
   plan,
   planRevision,
+  transportRevision,
+  replayRevision = 0,
   browserEngine = null,
   nativeOriginalSupport,
   shouldAutoPlay = true,
   replanning = false,
+  replanningQuality = false,
   replacing = false,
   pendingSwitchFileId = null,
   replanError = null,
@@ -600,6 +605,11 @@ export function VideoPlayer({
   audioTracks = [],
   activeAudioIndex = 0,
   onAudioSelect,
+  audioInventoryProvisional = false,
+  subtitleInventoryProvisional = false,
+  inventoryPending = false,
+  inventoryFailed = false,
+  onRetryInventory,
   onSubtitleChanged,
   onExit,
   onMinimize,
@@ -632,6 +642,7 @@ export function VideoPlayer({
   const [engineTransportRevision, setEngineTransportRevision] = useState(0);
   const fullscreenRootRef = usePlayerFullscreenRoot();
   const isMountedRef = useRef(true);
+  const effectiveTransportRevision = transportRevision ?? planRevision;
   const hlsRef = useRef<HlsType | null>(null);
   // The plan's media requests, where its transport can see their bytes:
   // hls.js fragments and the browser engine's reads. The media element's own
@@ -2632,6 +2643,74 @@ export function VideoPlayer({
   const plannedBitrateKbps = plan.effective_recipe.bitrate_kbps ?? 0;
   const plannedDynamicRange = plan.effective_recipe.dynamic_range;
 
+  // Warm the new progressive transport as soon as a transport-changing plan
+  // adopts, before the transport-init effect below tears down the element.
+  // A copy remux's first bytes cost a cold ffmpeg start (1-3s); firing the
+  // request now means the element's own load hits a warm remux.
+  //
+  // The warm is one extra connection to the transport, so it is limited to
+  // changes that need a server-side start: the same route at a new position
+  // (every seek reanchor) opens its own connection from the element a moment
+  // later, and a warm there spawns a second, identical remux seek. HLS needs
+  // none at all: hls.js fetches the playlist itself right after the transport
+  // is built, and the transcode has already been started by the plan.
+  // A new session is a new server-side transport even on the same route.
+  const warmRouteKey = useMemo(
+    () => `${sessionId}:${buildWarmTransportRouteKey(plan)}`,
+    [plan, sessionId],
+  );
+  // Seed the baseline with the route this player mounted on. The element's own
+  // load starts that first transport, so a position-only seek (new revision,
+  // same route) must compare equal here instead of looking like a transition.
+  const warmTransportRouteKeyRef = useRef<string | null>(warmRouteKey);
+  const transportRevisionRef = useRef<number | null>(null);
+  useEffect(() => {
+    const url = effectiveStreamUrl;
+    if (!url || !isPlayerReady || isHlsStream) return;
+    if (!transportRevision || effectiveTransportRevision === transportRevisionRef.current) return; // unchanged transport
+    if (warmTransportRouteKeyRef.current === warmRouteKey) return; // same route, new position only
+    transportRevisionRef.current = effectiveTransportRevision;
+    warmTransportRouteKeyRef.current = warmRouteKey;
+    const controller = new AbortController();
+    // Ask only for a small prefix and cancel after the first chunk. A plain
+    // GET here downloads the whole remux (tens of megabytes per transport
+    // change) in parallel with the element that is about to play it, which
+    // wastes bandwidth and causes stalls. The first bytes are enough to start
+    // the server-side remux; the element's own load then shares that work.
+    const timer = setTimeout(() => controller.abort(), 2000);
+    void fetch(url, {
+      signal: controller.signal,
+      method: "GET",
+      headers: { Range: "bytes=0-65535" },
+    })
+      .then(async (response) => {
+        if (response.body) {
+          const reader = response.body.getReader();
+          try {
+            await reader.read();
+          } catch {
+            // Abort or a closed body: nothing left to warm.
+          }
+          await reader.cancel().catch(() => {});
+        }
+        controller.abort();
+      })
+      .catch(() => {})
+      .finally(() => clearTimeout(timer));
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [
+    effectiveStreamUrl,
+    effectiveTransportRevision,
+    isHlsStream,
+    isPlayerReady,
+    sessionId,
+    transportRevision,
+    warmRouteKey,
+  ]);
+
   // Read by the transport effect, which reruns on planRevision rather than on
   // every input the original-file route depends on.
   const originalRouteInputRef = useRef({ plan, browserEngine, nativeOriginalSupport, audioTracks });
@@ -3756,6 +3835,7 @@ export function VideoPlayer({
     0,
     activeSubtitleCueRevision,
     engineTransportRevision,
+    replayRevision,
   );
 
   // -- ASS/SSA subtitle rendering via JASSUB (client-side libass) --
@@ -3773,7 +3853,15 @@ export function VideoPlayer({
     coverCrop,
     activeSubtitleCueRevision,
     engineTransportRevision,
+    replayRevision,
   );
+  // Prefetch ASS font bundles at plan adoption so a later track selection hits
+  // the in-memory font cache instead of a cold server extraction. Purely a
+  // warm-up: errors are swallowed and never affect playback. Mirrors the
+  // useASSSubtitles gating — the hook itself no-ops without font inventory —
+  // and is scoped to the effective release so a list spanning versions never
+  // warms a font bundle the active renderer cannot reach.
+  useSubtitleFontPrefetch(subtitleUrls, effectiveFileId);
 
   // -- PGS rendering (client-side Blu-ray bitmaps) --
   // The server sends embedded PGS as a `.sup` sidecar because the web player
@@ -3795,6 +3883,7 @@ export function VideoPlayer({
     videoFit,
     bottomInsetPx: subtitleHudInsetPx,
     onLoadState: setPGSSubtitleState,
+    replayRevision,
   });
   const subtitleLoadState = isASSActive
     ? assSubtitleState
@@ -5670,6 +5759,7 @@ export function VideoPlayer({
           onSubtitleSelect={handleMenuSubtitleSelect}
           subtitleDelayMs={subtitleDelayMs}
           onSubtitleDelayChange={setSubtitleDelayMs}
+          subtitleInventoryProvisional={subtitleInventoryProvisional}
           mediaFileId={activeFileId ?? undefined}
           playerConfig={playerConfig}
           onRefreshSubtitles={
@@ -5682,12 +5772,17 @@ export function VideoPlayer({
           audioTracks={audioTracks}
           activeAudioIndex={activeAudioIndex}
           onAudioSelect={onAudioSelect}
+          trackMenusLocked={replacing || replanning}
+          audioInventoryProvisional={audioInventoryProvisional}
+          inventoryPending={inventoryPending}
+          inventoryFailed={inventoryFailed}
+          onRetryInventory={onRetryInventory}
           qualityOptions={qualityOptions}
           activeQualityId={activeQualityId}
           activeQuality={plan.active_quality}
           deliveredRecipe={plan.effective_recipe}
           playbackSource={plan.source}
-          isTranscoding={replanning}
+          isTranscoding={replanningQuality}
           qualityError={replanError}
           onQualitySelect={(id) => {
             // Picking the quality already playing changes nothing. Any pill
