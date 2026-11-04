@@ -450,6 +450,8 @@ export interface WatchPageProps {
   initialBitmapSubtitleTrackIndexByFileId?: Record<number, number>;
   preferredSubtitleLanguage?: string | null;
   preferredSubtitleTrackSignature?: PlayerSubtitleTrackSignature | null;
+  /** The viewer's profile subtitle language, used to rank auto-selection. */
+  profileLanguage?: string | null;
   subtitleMode?: SubtitleMode;
   showForcedSubtitles?: boolean;
   intro: PlayerMarkerRange | null;

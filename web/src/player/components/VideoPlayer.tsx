@@ -60,8 +60,10 @@ import { preconnectToStreamOrigin } from "../stream-url";
 import { WatchTogetherPanel } from "./WatchTogetherPanel";
 import { readPlanInvalidatedPayload, VIDEO_PLAYBACK_COMMANDS } from "../realtime-protocol";
 import type {
+  PlaybackInventoryUpdatedPayload,
   PlaybackRealtimeCommandEnvelope,
   PlaybackRealtimeEventEnvelope,
+  PlaybackSourceCommittedPayload,
 } from "../realtime-protocol";
 import {
   remainingRoomHeldSeek,
@@ -88,7 +90,9 @@ import type {
   PlayerAudioTrack,
   PlayerChapter,
   PlayerFileVersion,
+  PlayerIndexerRelease,
   PlayerSubtitleInfo,
+  PlayerVirtualRanking,
   PlayerSubtitleTrackSignature,
   PlayerTimeRange,
   PlayerMarkerSegment,
@@ -234,6 +238,37 @@ interface VideoPlayerProps {
   replanning?: boolean;
   /** True while a fresh start replaces the session, such as a version switch. */
   replacing?: boolean;
+  /**
+   * Fork-side transport contract. The merged WatchPage publishes these from
+   * the live session; the player wiring for the fork features that read them
+   * lands with the player restore, so the interface accepts them here in the
+   * meantime.
+   */
+  contentId?: string;
+  transportRevision?: number;
+  replayRevision?: number;
+  replanningQuality?: boolean;
+  pendingSwitchFileId?: number | null;
+  initialSubtitleError?: string | null;
+  activeVirtualUri?: string | null;
+  indexerReleases?: PlayerIndexerRelease[];
+  virtualRanking?: PlayerVirtualRanking;
+  autoFallback?: boolean;
+  onSelectAutoVersion?: () => void;
+  onRefreshVersions?: () => Promise<void>;
+  onCancelRefresh?: () => Promise<void> | void;
+  onSessionLost?: () => void;
+  onSessionGone?: () => void;
+  onRestartPlayback?: () => void;
+  onExpediteReconnect?: () => void;
+  profileLanguage?: string | null;
+  audioInventoryProvisional?: boolean;
+  subtitleInventoryProvisional?: boolean;
+  inventoryPending?: boolean;
+  inventoryFailed?: boolean;
+  onRetryInventory?: () => void;
+  onSourceCommitted?: (payload: PlaybackSourceCommittedPayload) => void;
+  onInventoryUpdated?: (payload: PlaybackInventoryUpdatedPayload) => void;
   /** Server-described replan error, if the last replan was refused. */
   replanError?: string | null;
   /** Title for the replan error, used when surfacing the refusal as a toast. */
