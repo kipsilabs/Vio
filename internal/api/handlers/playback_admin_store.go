@@ -31,7 +31,7 @@ const (
 	PlaybackEndAborted PlaybackEndReason = "aborted"
 	// PlaybackEndReplaced: a Jellyfin client switched play method, and the
 	// play continues under a new session.
-	PlaybackEndReplaced PlaybackEndReason = playback.EndReasonReplaced
+	PlaybackEndReplaced PlaybackEndReason = PlaybackEndReason(playback.EndReasonReplaced)
 )
 
 // PlaybackEndReasons lists every reason in its published order.
