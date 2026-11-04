@@ -12712,8 +12712,8 @@ func (h *PlaybackHandler) plannerSettingsV3Result(ctx context.Context) (settings
 	viewerTranscodeDisabled := h.viewerTranscodeDisabledV3(ctx)
 	defer func() { settings.ViewerTranscodeDisabled = <-viewerTranscodeDisabled }()
 	if h.SettingsRepo != nil {
-		var values [5]string
-		var errs [5]error
+		var values [6]string
+		var errs [6]error
 		keys := [...]string{
 			config.Allow4KTranscodeSettingKey,
 			config.PlaybackTranscodeHardwareToneMapSettingKey,
@@ -12747,13 +12747,17 @@ func (h *PlaybackHandler) plannerSettingsV3Result(ctx context.Context) (settings
 			return settings, fmt.Errorf("load HEVC encoding setting: %w", errs[4])
 		}
 		if errs[4] != nil {
-			return settings, fmt.Errorf("load lower-version transcode setting: %w", errs[4])
+			return settings, fmt.Errorf("load HEVC encoding setting: %w", errs[4])
+		}
+		if errs[5] != nil {
+			return settings, fmt.Errorf("load lower-version transcode setting: %w", errs[5])
 		}
 		settings.Allow4KTranscode = config.AdminSettingEnabled(keys[0], values[0])
 		settings.HardwareToneMapEnabled = config.AdminSettingEnabled(keys[1], values[1])
 		settings.SoftwareToneMapEnabled = config.AdminSettingEnabled(keys[2], values[2])
-		settings.AllowHEVCEncoding = config.AdminSettingEnabled(keys[3], values[3])
-		settings.PreferLowerVersionTranscode = config.AdminSettingEnabled(keys[4], values[4])
+		settings.VPPToneMapEnabled = config.AdminSettingEnabled(keys[3], values[3])
+		settings.AllowHEVCEncoding = config.AdminSettingEnabled(keys[4], values[4])
+		settings.PreferLowerVersionTranscode = config.AdminSettingEnabled(keys[5], values[5])
 	}
 	return settings, nil
 }
