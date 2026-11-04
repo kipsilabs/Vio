@@ -102,13 +102,13 @@ the document is always the full one:
                "neutral_playback_v3_contract_v1", "embedded_subtitles_v1", "layout_aware_passthrough", "playback_route_diagnostics",
                "device_quirks_v1", "seek_reanchor_v1", "output_change_v1", "output_display_evidence_v1", "direct_stream_resume_v1",
                "header_authenticated_media_v1", "authorized_media_origins_v1", "software_video_decode_v1",
-               "plan_invalidated_v1", "plan_source_duration_v1"],
+               "plan_invalidated_v1", "default_audio_reconcile_response_v1", "plan_source_duration_v1", "audio_track_unverified_v1"],
   "deliveries": ["original_http", "server_remux_progressive", "server_remux_hls", "server_transcode_hls"],
   "transformations": [{"name": "audio_to_aac", "executor": "server", "recipe_version": "2", "validated_claims": ["audio_decode"]}]
 }
 ```
 
-The seventeen feature strings above are the full set this server version advertises on `/api/v1`. `/api/v2` advertises them plus `subrip_sidecar_v1`, `marker_thumbnails_v1`, `hls_subtitle_renditions_v1`, and `source_committed_event_v1`:
+The nineteen feature strings above are the full set this server version advertises on `/api/v1`. `/api/v2` advertises them plus `subrip_sidecar_v1`, `marker_thumbnails_v1`, `hls_subtitle_renditions_v1`, and `source_committed_event_v1`:
 
 | Feature | What it promises |
 | --- | --- |
@@ -126,7 +126,9 @@ The seventeen feature strings above are the full set this server version adverti
 | `authorized_media_origins_v1` | Meaningful only with the token above: the client also honors credential-free absolute media URLs on server-designated proxy origins, which restores distributed egress for a header-authenticated attempt (§4.1) |
 | `software_video_decode_v1` | Exact/platform-attested clients may qualify bounded `video_decode[]` entries with `hardware: false` for direct/original delivery; without the opt-in those evidence tiers remain hardware-only (§3) |
 | `plan_invalidated_v1` | The client can be told mid-session that the plan it is playing was withdrawn, over the realtime `plan_invalidated` command, and replans off it. A session that did not negotiate it is stopped instead (§6.1) |
+| `default_audio_reconcile_response_v1` | A client can answer the `default_audio_reconciliation` withdrawal through the dedicated `answers_plan_invalidation` correlation instead of ordinary failure recovery |
 | `plan_source_duration_v1` | `source.duration_seconds` is populated when known, so its absence means *unknown* rather than *unsupported* (§5) |
+| `audio_track_unverified_v1` | A plan may carry `audio_selection_pending` alongside the `audio_track_unverified` degradation warning; a client that sees the flag renders the audio pick as pending, not confirmed (§7.2) |
 | `subrip_sidecar_v1` | `/api/v2` only. An opted-in client that parses SubRip itself receives external and downloaded SRT tracks as the original `.srt` file instead of the WebVTT conversion (§8) |
 | `hls_subtitle_renditions_v1` | `/api/v2` only. An opted-in client receives a `server_transcode_hls` plan's embedded text subtitle as a WebVTT `SUBTITLES` rendition of the plan's HLS stream (`subtitle.hls_rendition`) instead of a sidecar artifact (§8) |
 | `source_committed_event_v1` | `/api/v2` only. The server pushes the realtime `source_committed` event the moment a transport commits to an effective version, including a serve-layer rotation, so the client re-keys its version menu and adopts the declared inventory before the probe lands (§6.2) |
@@ -1826,8 +1828,21 @@ The plan will play, but something the user might notice was given up.
 | `bandwidth_cap_applied` | `bandwidth_cap_kbps` limited the selection |
 | `evidence_insufficient_for_direct` | Evidence tier blocked a direct route |
 | `audio_track_unavailable` | The selected audio track is not on the effective file; its default track plays |
-| `audio_track_unverified` | The effective file's audio inventory could not be measured (a cross-release fallback onto an unprobed replacement). The selected ordinal is passed through unverified: it may name another stream, or none, in which case playback has no audio |
+| `audio_track_unverified` | The effective file's audio inventory could not be measured (a cross-release fallback onto an unprobed replacement). The selected ordinal is passed through unverified: it may name another stream, or none, in which case playback has no audio. The plan also sets `audio_selection_pending: true`, so a client that ignores degradation warnings still sees the selection is unconfirmed |
 | `subtitle_track_unavailable` | The selected subtitle has no equivalent on the effective file, or is on it but cannot be shown there; playback continues with subtitles off. `message` says which |
+
+`playback_plan.audio_selection_pending` makes the unverified-audio state
+explicit outside the warning list. It is set only when a cross-release fallback
+committed the request's audio ordinal onto a replacement whose inventory was
+never probed, and it is omitted otherwise (including a measured mismatch, which
+plays a known track and reports `audio_track_unavailable`). Like the other
+inventory hints it is set after plan identity is finalized and is excluded from
+`plan_id` and `plan_attempt_key`. A client that negotiated
+`audio_track_unverified_v1` must render the audio pick as pending/unverified
+while the flag is set instead of presenting the requested track as confirmed;
+the flag never changes stream selection. The Jellyfin-compatibility surface has
+no degradation channel and never takes this cross-release fallback, so it is
+unaffected.
 
 ### 7.3 Terminal reasons
 

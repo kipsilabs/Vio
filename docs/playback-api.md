@@ -769,7 +769,18 @@ the replacement's inventory by the concrete language it carries (the same
 language-carriage rule a version switch uses); codec and channel layout may
 differ between releases and are not required to match. When no track carries
 that language, the fallback starts on the replacement's default and reports an
-audio-unavailable degradation warning instead of silently resetting.
+audio-unavailable degradation warning instead of silently resetting. When the
+replacement's inventory could not be measured at all, the requested ordinal is
+passed through unverified: the plan reports `audio_track_unverified` and sets
+`audio_selection_pending: true`, because the ordinal may name another stream or
+no stream. A client must render that audio pick as pending/unverified rather
+than confirmed while the flag is set, and must not treat it as a known
+degradation to the file's default (`audio_track_unavailable`). A client that
+negotiated `audio_track_unverified_v1` can rely on the flag; older v2 clients
+still see the warning and are otherwise unchanged. The marker is outside plan
+identity and never changes stream selection. Jellyfin-protocol clients are
+unaffected: that surface has no degradation channel and never takes this
+cross-release fallback.
 
 A subtitle selection is carried across a candidate rotation by identity. The
 track source (external sidecar, embedded, or downloaded), the output muxer class

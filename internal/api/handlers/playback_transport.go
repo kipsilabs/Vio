@@ -852,6 +852,27 @@ func appendCrossReleaseAudioFallbackWarningV3(ctx context.Context, carry fallbac
 		return
 	}
 	carrier.plan.DegradationWarnings = append(carrier.plan.DegradationWarnings, warning)
+	if carry != fallbackAudioCarryPending {
+		return
+	}
+	// A client that ignores degradation warnings would otherwise show the
+	// requested track as active while the session may have no audio. The plan
+	// flag makes the pending state explicit on a surface outside the warning
+	// list, and this is the moment the transport is actually serving it.
+	carrier.plan.AudioSelectionPending = true
+	slog.WarnContext(ctx, "serving playback with a pending unverified audio selection",
+		"component", "api", "signal", playback.DegradationWarningAudioTrackUnverifiedV3,
+		"plan_id", carrier.plan.PlanID,
+		"selected_audio_track_id", selectedAudioTrackIDV3(carrier.plan))
+}
+
+// selectedAudioTrackIDV3 names the plan's requested audio identity for a log,
+// without dereferencing a nil selection.
+func selectedAudioTrackIDV3(plan *playback.PlanV3) string {
+	if plan == nil || plan.SelectedTracks.Audio == nil {
+		return ""
+	}
+	return plan.SelectedTracks.Audio.ID
 }
 
 // fallbackAudioCarryV3 classifies the outcome of carrying the pinned release's

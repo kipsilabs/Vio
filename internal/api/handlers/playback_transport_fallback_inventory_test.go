@@ -202,6 +202,9 @@ func TestCrossReleaseFallbackPrefersProbedSiblingOverUnprobedHop(t *testing.T) {
 	if hasAudioUnavailableWarning(plan) {
 		t.Fatal("a carried audio selection reported the unavailable-audio warning")
 	}
+	if plan.AudioSelectionPending {
+		t.Fatal("a verified carry marked the plan's audio pick pending")
+	}
 }
 
 // When only unprobed candidates remain the walk still tries them, but unknown
@@ -245,6 +248,9 @@ func TestCrossReleaseFallbackKeepsSelectionsPendingOnUnprobedReplacement(t *test
 	if !hasAudioUnverifiedWarning(plan) {
 		t.Fatalf("a pending audio ordinal committed without a signal (warnings: %+v)", plan.DegradationWarnings)
 	}
+	if !plan.AudioSelectionPending {
+		t.Fatal("a pending audio selection committed without marking the plan's audio pick pending")
+	}
 	// The pending outcome is not the known-mismatch degradation: no default
 	// track is promised, so the unavailable-audio warning would misdescribe it.
 	if hasAudioUnavailableWarning(plan) {
@@ -282,5 +288,8 @@ func TestCrossReleaseFallbackKnownMismatchStillDegrades(t *testing.T) {
 	}
 	if hasAudioUnverifiedWarning(plan) {
 		t.Fatalf("a measured mismatch claimed the audio inventory was unknown (warnings: %+v)", plan.DegradationWarnings)
+	}
+	if plan.AudioSelectionPending {
+		t.Fatal("a measured mismatch marked the audio pick pending")
 	}
 }

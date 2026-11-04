@@ -39103,6 +39103,9 @@
             },
             "type": "array"
           },
+          "audio_selection_pending": {
+            "type": "boolean"
+          },
           "audio_tracks": {
             "items": {
               "$ref": "#/components/schemas/AudioInventoryItemV3"

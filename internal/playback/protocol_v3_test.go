@@ -58,6 +58,7 @@ func TestServerFeaturesV3ReturnsIndependentSlices(t *testing.T) {
 		FeatureDefaultAudioReconcileResponseV3:   {},
 		FeaturePlanSourceDurationV3:              {},
 		FeatureOutputDisplayEvidenceV3:           {},
+		FeatureAudioTrackUnverifiedV3:            {},
 	}
 	for feature := range expected {
 		if !HasFeatureV3(first, feature) {
@@ -4716,6 +4717,7 @@ func TestServerFeaturesV3ReturnsCompleteIndependentSlices(t *testing.T) {
 		FeatureDefaultAudioReconcileResponseV3:   {},
 		FeaturePlanSourceDurationV3:              {},
 		FeatureOutputDisplayEvidenceV3:           {},
+		FeatureAudioTrackUnverifiedV3:            {},
 	}
 	if len(first) != len(expected) {
 		t.Fatalf("server features = %v, want %d entries", first, len(expected))

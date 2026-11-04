@@ -131,6 +131,14 @@ type PlaybackPlan struct {
 	// follow-up inventory_updated push (or a poll of InventoryURL) lands. It
 	// never changes stream selection.
 	TracksPending bool `json:"tracks_pending,omitempty"`
+	// AudioSelectionPending marks a plan whose selected audio track is
+	// unverified: a cross-release fallback committed the request's ordinal onto
+	// a replacement whose audio inventory could not be measured. It mirrors
+	// PlanV3.AudioSelectionPending so a v2 client can render the selection as
+	// pending instead of confirmed; the plan also carries the
+	// audio_track_unverified degradation warning. It never changes stream
+	// selection.
+	AudioSelectionPending bool `json:"audio_selection_pending,omitempty"`
 	// InventoryURL is the relative URL a client fetches (with ETag /
 	// If-None-Match) to retrieve the refreshed audio and subtitle inventories
 	// without replanning. It mirrors PlanV3.InventoryURL so a deferred v2 client
@@ -634,7 +642,7 @@ func playbackDecision(in playback.DecisionResponseV3) PlaybackDecision {
 		p := in.PlaybackPlan
 		stream := p.Stream
 		stream.URL = playbackV2MediaURL(stream.URL)
-		out.PlaybackPlan = &PlaybackPlan{ProtocolVersion: p.ProtocolVersion, PlanID: p.PlanID, PlanAttemptKey: p.PlanAttemptKey, SessionID: p.SessionID, ExpiresAt: p.ExpiresAt, Delivery: p.Delivery, Stream: stream, Timeline: p.Timeline, SelectedTracks: p.SelectedTracks, EffectiveRecipe: p.EffectiveRecipe, Claims: p.Claims, Subtitle: playbackV2Subtitle(p.Subtitle), AudioTracks: p.AudioTracks, Transformations: p.Transformations, AppliedQuirks: p.AppliedQuirks, RuntimeCorrections: p.RuntimeCorrections, AvailableQualities: playbackQualities(p.AvailableQualities), DegradationWarnings: p.DegradationWarnings, DecisionReason: p.DecisionReason, RequestedMediaFileID: ID(strconv.Itoa(p.RequestedMediaFileID)), EffectiveMediaFileID: ID(strconv.Itoa(p.EffectiveMediaFileID)), EffectiveVirtualURI: p.EffectiveVirtualURI, DeliveryChange: playbackV2DeliveryChange(p.DeliveryChange), VirtualSourceRevision: p.VirtualSourceRevision, TracksPending: p.TracksPending, InventoryURL: playbackV2InventoryURL(p.InventoryURL), Source: playbackSource(p.Source), SubtitleFidelityPolicy: p.SubtitleFidelityPolicy}
+		out.PlaybackPlan = &PlaybackPlan{ProtocolVersion: p.ProtocolVersion, PlanID: p.PlanID, PlanAttemptKey: p.PlanAttemptKey, SessionID: p.SessionID, ExpiresAt: p.ExpiresAt, Delivery: p.Delivery, Stream: stream, Timeline: p.Timeline, SelectedTracks: p.SelectedTracks, EffectiveRecipe: p.EffectiveRecipe, Claims: p.Claims, Subtitle: playbackV2Subtitle(p.Subtitle), AudioTracks: p.AudioTracks, Transformations: p.Transformations, AppliedQuirks: p.AppliedQuirks, RuntimeCorrections: p.RuntimeCorrections, AvailableQualities: playbackQualities(p.AvailableQualities), DegradationWarnings: p.DegradationWarnings, DecisionReason: p.DecisionReason, RequestedMediaFileID: ID(strconv.Itoa(p.RequestedMediaFileID)), EffectiveMediaFileID: ID(strconv.Itoa(p.EffectiveMediaFileID)), EffectiveVirtualURI: p.EffectiveVirtualURI, DeliveryChange: playbackV2DeliveryChange(p.DeliveryChange), VirtualSourceRevision: p.VirtualSourceRevision, TracksPending: p.TracksPending, AudioSelectionPending: p.AudioSelectionPending, InventoryURL: playbackV2InventoryURL(p.InventoryURL), Source: playbackSource(p.Source), SubtitleFidelityPolicy: p.SubtitleFidelityPolicy}
 	}
 	return out
 }

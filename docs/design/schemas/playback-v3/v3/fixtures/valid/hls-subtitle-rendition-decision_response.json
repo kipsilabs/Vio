@@ -19,6 +19,7 @@
     "plan_invalidated_v1",
     "default_audio_reconcile_response_v1",
     "plan_source_duration_v1",
+    "audio_track_unverified_v1",
     "subrip_sidecar_v1",
     "live_inventory_refresh_v1",
     "source_committed_event_v1",

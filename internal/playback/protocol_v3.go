@@ -35,6 +35,13 @@ const (
 	FeatureOutputDisplayEvidenceV3 = "output_display_evidence_v1"
 	FeatureDirectStreamResumeV3    = "direct_stream_resume_v1"
 	FeaturePlanSourceDurationV3    = "plan_source_duration_v1"
+	// FeatureAudioTrackUnverifiedV3 advertises that a plan may carry the
+	// audio_track_unverified degradation warning together with
+	// audio_selection_pending when a cross-release fallback could not verify
+	// the selected audio inventory on the replacement. A client that sees the
+	// feature must render the selected audio pick as pending/unverified while
+	// the flag is set instead of presenting it as the confirmed track.
+	FeatureAudioTrackUnverifiedV3 = "audio_track_unverified_v1"
 	// FeatureSoftwareVideoDecodeV3 lets a strict evidence-tier client opt into
 	// bounded hardware:false video_decode entries. Without the feature, exact
 	// and platform_attested retain their historical hardware-only direct-play
@@ -292,6 +299,11 @@ func ServerFeaturesV3() []string {
 		// absent field, and a client cannot decide whether its own catalog
 		// fallback is still required.
 		FeaturePlanSourceDurationV3,
+		// Advertised so a client can tell an unverified cross-release audio
+		// carry apart from a confirmed selection: the plan carries
+		// audio_selection_pending plus audio_track_unverified, and a client
+		// that negotiated this token renders the pick as pending.
+		FeatureAudioTrackUnverifiedV3,
 	}
 }
 
@@ -1364,6 +1376,17 @@ type PlanV3 struct {
 	// stream selection or the executable recipe, and it is excluded from plan
 	// identity hashing like the inventory fields beside it.
 	TracksPending bool `json:"tracks_pending,omitempty"`
+	// AudioSelectionPending marks a committed cross-release fallback whose
+	// selected audio ordinal could not be verified on the replacement: the
+	// replacement's inventory was never probed, so the request's ordinal was
+	// passed to the transport unchanged. It may name the selected track,
+	// another stream, or no stream at all. It is additive, UI-only, and set
+	// after plan identity is finalized (like the inventory hints beside it),
+	// so it is excluded from plan identity hashing; the plan also carries the
+	// audio_track_unverified degradation warning. A client must render the
+	// audio pick as pending/unverified rather than confirmed while this is
+	// true, even if it ignores degradation warnings.
+	AudioSelectionPending bool `json:"audio_selection_pending,omitempty"`
 }
 
 // PlaybackInventoryV3 is the live audio and subtitle inventory of an active

@@ -27531,6 +27531,7 @@ export interface components {
     };
     PlaybackPlan: {
       applied_quirks: components["schemas"]["AppliedQuirkV3"][];
+      audio_selection_pending?: boolean;
       audio_tracks?: components["schemas"]["AudioInventoryItemV3"][];
       /** @description Fixed quality rungs a quality_change replan may request, in menu order. The source is not listed: quality_preference auto returns to it. Empty when no rung applies. */
       available_qualities: components["schemas"]["AvailableQualityV3"][];
