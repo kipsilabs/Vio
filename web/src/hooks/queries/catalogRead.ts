@@ -34,10 +34,17 @@ export async function fetchCatalogItemDetail(
   id: string,
   libraryId?: number,
   options?: ReadOptions,
+  fileId?: number,
 ): Promise<ItemDetail> {
   const detail = await v2("GET /api/v2/catalog/items/{id}", {
     path: { id },
-    query: libraryQuery(libraryId),
+    query: {
+      ...libraryQuery(libraryId),
+      // The version the viewer picked. The server applies it to the effective
+      // playback answer and schedules that row's inventory probe, so a pick is
+      // known before the picker (and the player) read the row again.
+      ...(fileId != null ? { file_id: String(fileId) } : {}),
+    },
     signal: signalOf(options),
   });
   return catalogItemDetailFromV2(detail);
@@ -120,16 +127,27 @@ export async function fetchCatalogSeasonEpisodes(
   return { episodes: episodes.items.map(episodeFromV2) };
 }
 
-export function useCatalogItemDetail(id: string | undefined, libraryId?: number) {
+export function useCatalogItemDetail(id: string | undefined, libraryId?: number, fileId?: number) {
   return useQuery({
-    queryKey: catalogKeys.itemDetail(id!, libraryId),
-    queryFn: ({ signal }) => fetchCatalogItemDetail(id!, libraryId, { signal }),
+    queryKey: catalogKeys.itemDetail(id!, libraryId, fileId),
+    // Passing the id only when one is selected keeps the argument list of every
+    // existing call exactly as it was.
+    queryFn: ({ signal }) =>
+      fileId != null
+        ? fetchCatalogItemDetail(id!, libraryId, { signal }, fileId)
+        : fetchCatalogItemDetail(id!, libraryId, { signal }),
     enabled: !!id,
     // Detail pages are remounted on navigation (e.g. detail -> player -> back).
     // A short freshness window reuses the cached payload instead of refetching
     // identical data, while mutations still invalidate immediately and a
     // server-side change is picked up within half a minute.
     staleTime: 30_000,
+    // A new selection of the same item refetches under a new key and keeps the
+    // previous payload meanwhile, so picking a version never flashes the page
+    // skeleton. A different item must not inherit that placeholder: showing the
+    // previous title while the new one loads would be a wrong page.
+    placeholderData: (previous, previousQuery) =>
+      previousQuery?.queryKey[2] === id ? previous : undefined,
   });
 }
 

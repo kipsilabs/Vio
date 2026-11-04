@@ -126,7 +126,7 @@ describe("ItemDetail", () => {
 
     renderToStaticMarkup(<ItemDetail />);
 
-    expect(mocks.useCatalogItemDetail).toHaveBeenCalledWith("movie-123", undefined);
+    expect(mocks.useCatalogItemDetail).toHaveBeenCalledWith("movie-123", undefined, undefined);
   });
 
   it("keeps the lightweight shell mounted until the sidebar transition finishes", () => {

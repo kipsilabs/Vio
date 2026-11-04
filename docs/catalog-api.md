@@ -511,6 +511,21 @@ header they resolve the profile's preferences alone. Clients that set
 device overrides should send the header so the detail page matches what playback
 picks.
 
+## Selected-version reads
+
+`getCatalogItem` accepts the optional `file_id` query parameter, the version the
+viewer picked. It applies the same selection the watch detail applies: the
+effective playback answer is resolved for that row, `playback_variants` names it
+as the default, and the server schedules that row's inventory probe and provider
+warm-up exactly as an explicit selection on a watch-detail read does. Without it
+the read answers the server's own default and schedules nothing for a row the
+page did not name, so a client that never passes it keeps the behavior it had.
+
+Sending it on every pick is what makes the probe start when the viewer chooses a
+version rather than when the picker or the player next reads the row. A caller
+that wants the enumerated tracks in the same answer can additionally use the
+[versions check's single-file inventory mode](#single-file-inventory-mode).
+
 ## Episode files
 
 Each episode in `listSeasonEpisodes` and `listCatalogItemEpisodes` lists its

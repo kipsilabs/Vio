@@ -1427,7 +1427,7 @@ func TestWatchDetailSelectionSchedulesProbeOnlyForUnprobedVirtualRow(t *testing.
 	}
 
 	// A bare read carries no selection: nothing is scheduled.
-	h.scheduleSelectedVirtualProbe(detail, catalog.AccessFilter{})
+	h.scheduleSelectedVirtualProbe(detail.ContentID, detail.Type, detail.Versions, catalog.AccessFilter{})
 	if got := prober.snapshot(); len(got) != 0 {
 		t.Fatalf("bare read scheduled %d probes, want none", len(got))
 	}
@@ -1437,7 +1437,7 @@ func TestWatchDetailSelectionSchedulesProbeOnlyForUnprobedVirtualRow(t *testing.
 
 	// An explicit selection of the virtual row schedules exactly that row's
 	// probe and its warm-up.
-	h.scheduleSelectedVirtualProbe(detail, catalog.AccessFilter{SelectedFileID: 22})
+	h.scheduleSelectedVirtualProbe(detail.ContentID, detail.Type, detail.Versions, catalog.AccessFilter{SelectedFileID: 22})
 	got := prober.snapshot()
 	if len(got) != 1 {
 		t.Fatalf("explicit selection scheduled %d probes, want 1", len(got))
@@ -1454,7 +1454,7 @@ func TestWatchDetailSelectionSchedulesProbeOnlyForUnprobedVirtualRow(t *testing.
 	}
 
 	// Selecting a local row has no provider bytes to enumerate or fetch.
-	h.scheduleSelectedVirtualProbe(detail, catalog.AccessFilter{SelectedFileID: 21})
+	h.scheduleSelectedVirtualProbe(detail.ContentID, detail.Type, detail.Versions, catalog.AccessFilter{SelectedFileID: 21})
 	if got := prober.snapshot(); len(got) != 1 {
 		t.Fatalf("local selection scheduled %d probes, want none", len(got)-1)
 	}
@@ -1466,7 +1466,7 @@ func TestWatchDetailSelectionSchedulesProbeOnlyForUnprobedVirtualRow(t *testing.
 	// bytes may be cold even though the inventory is known.
 	probedAt := time.Now()
 	detail.Versions[1].ProbedAt = &probedAt
-	h.scheduleSelectedVirtualProbe(detail, catalog.AccessFilter{SelectedFileID: 22})
+	h.scheduleSelectedVirtualProbe(detail.ContentID, detail.Type, detail.Versions, catalog.AccessFilter{SelectedFileID: 22})
 	if got := prober.snapshot(); len(got) != 1 {
 		t.Fatalf("fresh selection scheduled %d probes, want none", len(got)-1)
 	}

@@ -156,6 +156,78 @@ describe("catalog item reads on the v2 contract", () => {
     expect(requestedUrl(fetchMock)).toBe("/api/v2/catalog/items/ebook%201%2Fisbn%3A978");
   });
 
+  it("sends the selected file id only when one is given", async () => {
+    const fetchMock = stubFetch(getCatalogItemOk);
+
+    await fetchCatalogItemDetail("movie:heat-1995", 12, undefined, 120);
+
+    expect(requestedUrl(fetchMock)).toBe(
+      "/api/v2/catalog/items/movie%3Aheat-1995?library_id=12&file_id=120",
+    );
+
+    fetchMock.mockClear();
+    await fetchCatalogItemDetail("movie:heat-1995", 12);
+
+    expect(requestedUrl(fetchMock)).toBe("/api/v2/catalog/items/movie%3Aheat-1995?library_id=12");
+  });
+
+  it("re-reads the detail under a new selection", async () => {
+    const fetchMock = stubFetch(getCatalogItemOk);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { rerender } = renderHook(
+      ({ fileId }: { fileId: number | undefined }) =>
+        useCatalogItemDetail("movie:heat-1995", 12, fileId),
+      { wrapper, initialProps: { fileId: undefined as number | undefined } },
+    );
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(requestedUrl(fetchMock)).toBe("/api/v2/catalog/items/movie%3Aheat-1995?library_id=12");
+
+    rerender({ fileId: 120 });
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    expect(requestedUrl(fetchMock, 1)).toBe(
+      "/api/v2/catalog/items/movie%3Aheat-1995?library_id=12&file_id=120",
+    );
+    queryClient.clear();
+  });
+
+  it("does not reuse another item's payload while a new item loads", async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    let releaseSecond: (() => void) | undefined;
+    let call = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(async () => {
+        call += 1;
+        if (call === 1) {
+          return jsonResponse(getCatalogItemOk);
+        }
+        return new Promise<Response>((resolve) => {
+          releaseSecond = () => resolve(jsonResponse(getCatalogItemOk));
+        });
+      }),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result, rerender } = renderHook(
+      ({ id }: { id: string }) => useCatalogItemDetail(id, 12),
+      { wrapper, initialProps: { id: "movie:heat-1995" } },
+    );
+
+    await waitFor(() => expect(result.current.data?.content_id).toBe("movie:heat-1995"));
+
+    rerender({ id: "movie:other" });
+
+    // The previous item's payload is a placeholder only for its own item.
+    expect(result.current.data).toBeUndefined();
+    expect(result.current.isLoading).toBe(true);
+    releaseSecond?.();
+    queryClient.clear();
+  });
+
   it("unwraps the versions collection and returns numeric file ids", async () => {
     const fetchMock = stubFetch(listCatalogItemVersionsOk);
 

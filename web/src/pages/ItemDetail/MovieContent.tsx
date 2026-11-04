@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useLocation, useNavigate } from "react-router";
 import type { FileVersion, ItemDetail } from "@/api/types";
 import type { PlayerSubtitleTrackSignature, PrePlaySubtitleSelection } from "@/player/types";
@@ -53,10 +53,18 @@ export default function MovieContent({
   item,
   showAdvisoryAge,
   onStaleVersion,
+  onSelectedFileIdChange,
 }: {
   item: ItemDetail & { type: "movie" };
   showAdvisoryAge?: boolean;
   onStaleVersion?: (fileId: number) => void;
+  /**
+   * Reports the viewer's explicit version pick (the in-place choice or the
+   * remembered one on this device) so the page's detail read can carry it. The
+   * server-derived default is not reported: it would only duplicate the read
+   * the page already made.
+   */
+  onSelectedFileIdChange?: (fileId: number | null) => void;
 }) {
   const { translating: overviewTranslating, onTranslate: onTranslateOverview } =
     useOnViewTranslation(item);
@@ -183,6 +191,14 @@ export default function MovieContent({
         ) ?? defaultSelectedVersion)
       : null;
   }, [defaultSelectedVersion, manualSelectedFileId, selectedVersionMissing, versionsWithLiveness]);
+  // A pick-again row (one the refresh dropped) must not keep naming itself to
+  // the detail read; only a row the catalog still carries is a selection.
+  const explicitSelectedFileId = selectedVersionMissing
+    ? null
+    : (manualSelectedFileId ?? requestedFileId ?? null);
+  useEffect(() => {
+    onSelectedFileIdChange?.(explicitSelectedFileId);
+  }, [explicitSelectedFileId, onSelectedFileIdChange]);
   const selectedMediaSummary = useMemo(
     () => resolveSelectedMediaSummary(selectedVersion, item.playback_variants, item.runtime ?? 0),
     [item.playback_variants, item.runtime, selectedVersion],
