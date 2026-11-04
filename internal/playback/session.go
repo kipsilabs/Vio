@@ -1368,6 +1368,10 @@ func (m *SessionManager) updateProgress(sessionID string, position float64, isPa
 	}
 
 	s.Position = position
+	if sequence >= 0 && sequence <= s.positionSequence {
+		m.touchSessionLocked(s)
+		return nil
+	}
 	s.Watch.Observe(position, isPaused, time.Now())
 	s.positionSequence = max(s.positionSequence, sequence)
 	if sequence < 0 || sequence > s.confirmedPauseSequence {
@@ -3599,6 +3603,11 @@ func (m *SessionManager) sessionIsInactiveLocked(s *Session, now time.Time, acti
 	}
 
 	lastActivity := s.LastActivityAt
+	// A committed plan gets its own startup grace: clients may take longer than
+	// the ordinary activity window to attach and emit their first sample.
+	if !s.PlanCommittedAt.IsZero() && s.PlanCommittedAt.Add(StartupSessionGrace).After(now) {
+		return false
+	}
 	if lastActivity.IsZero() {
 		lastActivity = s.UpdatedAt
 	}

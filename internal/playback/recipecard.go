@@ -114,6 +114,7 @@ type RecipeCard struct {
 	ToneMapDVRPUPresent        bool                   `json:"tone_map_dv_rpu_present,omitempty"`
 	VideoBitstreamFilter       string                 `json:"video_bitstream_filter,omitempty"`
 	VideoSampleEntry           string                 `json:"video_sample_entry,omitempty"`
+	VideoRange                 string                 `json:"video_range,omitempty"`
 	CopyVideoMPEGTS            bool                   `json:"copy_video_mpegts,omitempty"`
 	KeyframePlaylist           bool                   `json:"keyframe_playlist,omitempty"`
 	SeekSeconds                float64                `json:"seek_seconds"`
@@ -141,6 +142,7 @@ type RecipeCard struct {
 	SubtitleRenditionTracks []SubtitleRenditionTrack `json:"subtitle_rendition_tracks,omitempty"`
 	SubtitleRenditionSource SubtitleRenditionSource  `json:"subtitle_rendition_source,omitzero"`
 	AudioTrackIndex         int                      `json:"audio_track_index"`
+	RequireAudioTrack       bool                     `json:"require_audio_track,omitempty"`
 	TargetBitrateKbps       int                      `json:"target_bitrate_kbps,omitempty"`
 	TotalDuration           float64                  `json:"total_duration"`
 	FastStart               bool                     `json:"fast_start,omitempty"`
@@ -259,6 +261,7 @@ func NewRecipeCard(userID int, profileID string, mediaFileID int, transcodeNodeU
 		ToneMapDVRPUPresent:              opts.ToneMapDVRPUPresent,
 		VideoBitstreamFilter:             opts.VideoBitstreamFilter,
 		VideoSampleEntry:                 opts.VideoSampleEntry,
+		VideoRange:                       opts.VideoRange,
 		CopyVideoMPEGTS:                  opts.CopyVideoMPEGTS,
 		KeyframePlaylist:                 opts.KeyframePlaylist,
 		SeekSeconds:                      opts.SeekSeconds,
@@ -283,6 +286,7 @@ func NewRecipeCard(userID int, profileID string, mediaFileID int, transcodeNodeU
 		SubtitleRenditionTracks:          slices.Clone(opts.SubtitleRenditionTracks),
 		SubtitleRenditionSource:          opts.SubtitleRenditionSource,
 		AudioTrackIndex:                  opts.AudioTrackIndex,
+		RequireAudioTrack:                opts.RequireAudioTrack,
 		TargetBitrateKbps:                opts.TargetBitrateKbps,
 		TotalDuration:                    opts.TotalDuration,
 		FastStart:                        opts.FastStart,
@@ -369,6 +373,7 @@ func (c RecipeCard) TranscodeOpts(outputDir, ffmpegPath string, logSink FFmpegLo
 		ToneMapDVRPUPresent:              c.ToneMapDVRPUPresent,
 		VideoBitstreamFilter:             c.VideoBitstreamFilter,
 		VideoSampleEntry:                 c.VideoSampleEntry,
+		VideoRange:                       c.VideoRange,
 		CopyVideoMPEGTS:                  c.CopyVideoMPEGTS,
 		KeyframePlaylist:                 c.KeyframePlaylist,
 		SeekSeconds:                      c.SeekSeconds,
@@ -394,6 +399,7 @@ func (c RecipeCard) TranscodeOpts(outputDir, ffmpegPath string, logSink FFmpegLo
 		SubtitleRenditionTracks:          slices.Clone(c.SubtitleRenditionTracks),
 		SubtitleRenditionSource:          c.SubtitleRenditionSource,
 		AudioTrackIndex:                  c.AudioTrackIndex,
+		RequireAudioTrack:                c.RequireAudioTrack,
 		TargetBitrateKbps:                c.TargetBitrateKbps,
 		TotalDuration:                    c.TotalDuration,
 		FastStart:                        c.FastStart,
@@ -494,6 +500,7 @@ func (c RecipeCard) ToClaims() streamtoken.Claims {
 		RoutingEgress:                    c.RoutingEgress,
 		RoutingEgressNodeID:              c.RoutingEgressNodeID,
 		TargetCodec:                      c.TargetCodecVideo,
+		RequireAudioTrack:                c.RequireAudioTrack,
 		TargetRes:                        c.TargetResolution,
 		SourceFrameRate:                  c.SourceFrameRate,
 		SourceHeight:                     c.SourceHeight,
@@ -525,6 +532,7 @@ func (c RecipeCard) ToClaims() streamtoken.Claims {
 		ToneMapDVRPUPresent:            c.ToneMapDVRPUPresent,
 		VideoBitstreamFilter:           c.VideoBitstreamFilter,
 		VideoSampleEntry:               c.VideoSampleEntry,
+		VideoRange:                     c.VideoRange,
 		CopyVideoMPEGTS:                c.CopyVideoMPEGTS,
 		KeyframePlaylist:               c.KeyframePlaylist,
 		SeekSeconds:                    c.SeekSeconds,
@@ -622,6 +630,7 @@ func RecipeCardFromClaims(c *streamtoken.Claims) RecipeCard {
 		ToneMapDVRPUPresent:              c.ToneMapDVRPUPresent,
 		VideoBitstreamFilter:             c.VideoBitstreamFilter,
 		VideoSampleEntry:                 c.VideoSampleEntry,
+		VideoRange:                       c.VideoRange,
 		CopyVideoMPEGTS:                  c.CopyVideoMPEGTS,
 		KeyframePlaylist:                 c.KeyframePlaylist,
 		SeekSeconds:                      c.SeekSeconds,
@@ -643,6 +652,7 @@ func RecipeCardFromClaims(c *streamtoken.Claims) RecipeCard {
 		SubtitleRenditionTracks:          subtitleRenditionTracksFromClaims(c),
 		SubtitleRenditionSource:          SubtitleRenditionSource{Size: c.SubtitleRenditionSourceSize, ModTimeUnixNano: c.SubtitleRenditionSourceModTime},
 		AudioTrackIndex:                  c.AudioTrackIndex,
+		RequireAudioTrack:                c.RequireAudioTrack,
 		TargetBitrateKbps:                c.TargetBitrateKbps,
 		TotalDuration:                    c.TotalDuration,
 		FastStart:                        c.FastStart,
