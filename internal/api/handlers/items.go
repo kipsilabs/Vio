@@ -2,11 +2,13 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
 	"net/http"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -121,6 +123,12 @@ type ItemsHandler struct {
 	ebookReadStateStore      EbookReadStateStore
 	EventsHub                *evt.Hub
 	UserRepo                 *auth.UserRepository
+	DeviceProfileReader      plugins.DeviceCapabilityProfileSource
+	virtualPrefetcher        VirtualPrefetcher
+	virtualFileByID          VirtualFileByID
+	virtualPrefetchInflight  sync.Map
+	virtualPrefetchLoadSem   chan struct{}
+	prefetchSemOnce          sync.Once
 	AccessGroups             access.GroupPolicyProvider // optional; resolves inherited library access when no scope is in context
 	MarkerPopulation         MarkerPopulationService
 	MarkerFileResolver       FilePathResolver
@@ -563,6 +571,102 @@ func (h *ItemsHandler) HandleGetWatchDetail(w http.ResponseWriter, r *http.Reque
 
 	writeJSON(w, http.StatusOK, detail)
 }
+
+// prefetchVirtualFileIDs warms virtual candidate listings for raw file rows,
+// shared by watch-detail, item-detail, and episode-list triggers. Dedupes,
+// caps at 2, and runs fully off the response path.
+func (h *ItemsHandler) prefetchVirtualFileIDs(ctx context.Context, fileIDs []int, profileID string) {
+	if h == nil || h.virtualPrefetcher == nil || h.virtualFileByID == nil || profileID == "" {
+		return
+	}
+	seen := make(map[int]bool)
+	unique := make([]int, 0, 2)
+	for _, fid := range fileIDs {
+		if fid != 0 && !seen[fid] {
+			seen[fid] = true
+			unique = append(unique, fid)
+		}
+		if len(unique) >= 2 {
+			break
+		}
+	}
+	if len(unique) == 0 {
+		return
+	}
+	fileIDs = unique
+	// Row loads run off the response path: the detail response must not wait
+	// on database reads for an optional warm. A short timeout bounds the
+	// background load; PrefetchVirtualPlayback itself is already bounded
+	// (2 files), deduped, and detached.
+	//
+	// File-level admission runs BEFORE the goroutine and the row loads: the
+	// content-keyed admission inside PrefetchVirtualPlayback only fires after
+	// rows load, so without this every catalog read would pay DB lookups even
+	// for an already-warming file. Keys live only for the load window.
+	admitKey := virtualPrefetchFileAdmitKey(fileIDs, profileID)
+	if _, loaded := h.virtualPrefetchInflight.LoadOrStore(admitKey, struct{}{}); loaded {
+		return
+	}
+	// Shed when saturated: speculative work must never queue without bound.
+	// capVirtualPrefetchLoads mirrors the prefetch worker count so background
+	// loads cannot outrun the workers that consume them.
+	h.prefetchSemOnce.Do(func() {
+		h.virtualPrefetchLoadSem = make(chan struct{}, capVirtualPrefetchLoads)
+	})
+	sem := h.virtualPrefetchLoadSem
+	select {
+	case sem <- struct{}{}:
+	default:
+		h.virtualPrefetchInflight.Delete(admitKey)
+		return
+	}
+	prefetcher := h.virtualPrefetcher
+	loader := h.virtualFileByID
+	go func() {
+		defer h.virtualPrefetchInflight.Delete(admitKey)
+		defer func() { <-sem }()
+		// WithoutCancel keeps request values (user ID for PrefetchVirtualPlayback)
+		// while detaching from request cancellation; the timeout still bounds
+		// the background load.
+		loadCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		files := make([]*models.MediaFile, 0, len(fileIDs))
+		for _, fid := range fileIDs {
+			f, err := loader.GetByID(loadCtx, fid)
+			if err != nil || f == nil || !isVirtualPlaybackFile(f) {
+				continue
+			}
+			files = append(files, f)
+		}
+		if len(files) == 0 {
+			return
+		}
+		prefetcher.PrefetchVirtualPlayback(loadCtx, files, profileID)
+	}()
+}
+
+// virtualPrefetchFileAdmitKey collapses repeated catalog reads for the same
+// rows+profile before any row load. Sorted so episode order doesn't multiply
+// keys; capped at the same 2 rows the loader warms.
+func virtualPrefetchFileAdmitKey(fileIDs []int, profileID string) string {
+	sorted := append([]int(nil), fileIDs...)
+	sort.Ints(sorted)
+	var sb strings.Builder
+	sb.WriteString(profileID)
+	sb.WriteByte(0)
+	for i, fid := range sorted {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteString(strconv.Itoa(fid))
+	}
+	return sb.String()
+}
+
+// capVirtualPrefetchLoads bounds concurrent background catalog-prefetch row
+// loads. Distinct file-set keys each take one slot; identical repeats collapse
+// on the inflight map before reaching here.
+const capVirtualPrefetchLoads = 4
 
 // trailerRefreshRate bounds how often one user may trigger trailer fetches
 // across all items. The per-item cooldown enforced by the metadata service is
@@ -2864,7 +2968,6 @@ func hasMaskedMetadataCuration(ctx context.Context, user *models.User, groups ac
 	return slices.Contains(auth.PolicyPermissions(effective), string(auth.PermissionMetadataCuration))
 }
 
-
 type VirtualPrefetcher interface {
 	PrefetchVirtualPlayback(ctx context.Context, files []*models.MediaFile, profileID string)
 }
@@ -2883,8 +2986,6 @@ func (h *ItemsHandler) SetVirtualPrefetcher(p VirtualPrefetcher, files VirtualFi
 	h.virtualPrefetcher = p
 	h.virtualFileByID = files
 }
-
-
 
 // prefetchWatchDetailVirtual warms virtual candidate listings for the rows a
 // watch detail offers, off the playback click path. Fire-and-forget:
@@ -2910,8 +3011,6 @@ func (h *ItemsHandler) prefetchWatchDetailVirtual(ctx context.Context, detail *c
 	}
 	h.prefetchVirtualFileIDs(ctx, fileIDs, profileID)
 }
-
-
 
 // HandleDelete handles DELETE /api/v1/admin/items/{id}.
 func (h *ItemsHandler) HandleDelete(w http.ResponseWriter, r *http.Request) {
@@ -2942,3 +3041,4 @@ func (h *ItemsHandler) HandleDelete(w http.ResponseWriter, r *http.Request) {
 		"images_cleaned": len(images),
 		"message":        "Media item deleted successfully",
 	})
+}

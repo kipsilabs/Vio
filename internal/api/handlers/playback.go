@@ -411,6 +411,8 @@ type PlaybackHandler struct {
 	VirtualPlaybackStreamLister VirtualPlaybackStreamLister
 	VirtualPlaybackStreamSink   VirtualPlaybackStreamSink
 	VirtualCandidateFileLookup  VirtualCandidateFileLookup
+	VirtualEpisodeFileLookup    VirtualEpisodeFileLookup
+	VirtualContentFileLookup    VirtualContentFileLookup
 	StoreProvider               userstore.UserStoreProvider // optional; enables progress/history persistence
 	DeviceSightings             *DeviceSightings            // optional; registers the device that starts playback
 	WatchScrobbler              PlaybackWatchScrobbler
