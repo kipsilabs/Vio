@@ -661,7 +661,9 @@ func (h *PlaybackHandler) evaluatePreparedReplanCandidateV3(
 	// virtual rows rotate releases under a fixed id, so they keep the
 	// evidence-anchored remap above.
 	subtitleRemapSource := remapSource
-	if subtitleRemapSource == nil { subtitleRemapSource = candidateFile }
+	if subtitleRemapSource == nil {
+		subtitleRemapSource = candidateFile
+	}
 	if selFileID, selKind, _, selOK := playback.ParseTrackIDV3(candidateStart.SubtitleTrackID); selOK && selKind == subtitleTrackKindV3 && selFileID == candidateFile.ID && !isVirtualPlaybackFile(candidateFile) {
 		subtitleRemapSource = candidateFile
 	}

@@ -1505,7 +1505,6 @@ func NewStreamHandler(sessionMgr SessionManagerInterface, fileResolver FilePathR
 // For remux: starts an ffmpeg remux and streams the output.
 // For transcode: returns 400 (transcode uses manifest/segment endpoints).
 func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
-	requestStart := time.Now()
 	userID := apimw.GetUserID(r.Context())
 	if userID == 0 {
 		writeError(w, http.StatusUnauthorized, "unauthorized", "Authentication required")
@@ -2099,7 +2098,6 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 		// a provider release that served nothing — retiring a healthy release
 		// because of a stop the operator asked for. Record that the transport was
 		// stopped so the branch can tell the two apart.
-		remuxStoppedServerSide := remuxStoppedServerSide(r.Context(), remuxAbort)
 		seekSeconds := 0.0
 		if seekStr := r.URL.Query().Get("seek"); seekStr != "" {
 			if s, err := strconv.ParseFloat(seekStr, 64); err == nil && s >= 0 {
@@ -2121,7 +2119,7 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 			TargetAudioBitrateKbps:    session.TargetAudioBitrateKbps,
 			// For a copied track the planned codec is the source's.
 			CopyAudioCodec: session.TargetAudioCodec,
-			Abort:          abort,
+			Abort:          remuxAbort,
 		}); err != nil {
 			h.handleTransportStartFailure(r.Context(), session, file, err)
 		}
