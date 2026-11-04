@@ -2159,7 +2159,7 @@ func hlsSubtitleRenditionEligibleV3(input PlannerInputV3, subtitle SubtitlePolic
 		IsASS(subtitle.Codec) && input.Request.SubtitleFidelityPreference == SubtitleFidelityPreserveV3 {
 		return false
 	}
-	return SubtitleRenditionExecutable(input.EffectiveFile.CodecVideo, float64(input.EffectiveFile.Duration), DefaultSegmentDuration) && executable()
+	return SubtitleRenditionExecutable(input.EffectiveFile.CodecVideo, input.EffectiveFile.CodecVideo, input.EffectiveFile.Duration, DefaultSegmentDuration) && executable()
 }
 
 // hlsRenditionsV3 is the subtitle renditions an HLS plan's stream carries:
@@ -2228,7 +2228,7 @@ func hlsOnDemandSubtitleRenditionsV3(input PlannerInputV3, plan PlanV3, subtitle
 	}
 	file := input.EffectiveFile
 	if executable == nil || input.CueIndexedSubtitleTracks == nil || file == nil || subtitle.RequiresBurn ||
-		!SubtitleRenditionExecutable(float64(file.Duration), DefaultSegmentDuration) {
+		!SubtitleRenditionExecutable(file.CodecVideo, file.CodecVideo, file.Duration, DefaultSegmentDuration) {
 		return nil, SubtitleRenditionSource{}
 	}
 	candidates := onDemandRenditionCandidatesV3(input, plan, subtitle, file)

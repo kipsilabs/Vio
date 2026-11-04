@@ -49,10 +49,11 @@ const (
 	SubtitleRenditionGroupID = "subs"
 	// SubtitleRenditionName is the rendition's NAME. The plan's inventory
 	// already describes the track; the playlist only has to be valid.
-	SubtitleRenditionName   = "Subtitles"
-	subtitleSegmentPrefix   = "sub_"
-	subtitleSegmentExt      = ".vtt"
-	subtitleCuePollInterval = 100 * time.Millisecond
+	SubtitleRenditionName      = "Subtitles"
+	subtitleSegmentPrefix      = "sub_"
+	subtitleSegmentExt         = ".vtt"
+	subtitleCuePollInterval    = 100 * time.Millisecond
+	maxSubtitleCuePollInterval = time.Second
 	// subtitleOriginProbeTimeout bounds one observation of a generation's
 	// origin; it reads a single local segment.
 	subtitleOriginProbeTimeout = 5 * time.Second
@@ -116,6 +117,27 @@ func SubtitleRenditionExecutable(targetVideoCodec string, args ...any) bool {
 
 // subtitleRenditionActive is the single gate shared by the ffmpeg output, the
 // playlists, and segment serving, so they cannot disagree about a recipe.
+func subtitleRenditionsOnDemand(opts TranscodeOpts) bool {
+	return len(opts.SubtitleRenditionTracks) > 0
+}
+
+func (s *TranscodeSession) subtitleSegmentPlacementKnown(span subtitleCueSpan, segNum int) (subtitleCueWindow, bool) {
+	opts := s.Opts()
+	d := renditionSegmentDuration(opts)
+	i := segNum - span.start
+	w := subtitleCueWindow{offset: float64(i * d), duration: float64(d)}
+	if i >= 0 && i < len(span.durations) {
+		w.offset = 0
+		for _, x := range span.durations[:i] {
+			w.offset += x
+		}
+		w.duration = span.durations[i]
+		w.open = span.final && i == len(span.durations)-1
+		return w, true
+	}
+	return w, !strings.EqualFold(opts.TargetCodecVideo, "copy")
+}
+
 func subtitleRenditionActive(opts TranscodeOpts) bool {
 	return opts.SubtitleRendition && opts.SubtitleTrackIndex >= 0 && !opts.SubtitleBurnIn &&
 		SubtitleRenditionCodecSupported(opts.SubtitleCodec) &&
@@ -155,8 +177,12 @@ func appendSubtitleRenditionOutputArgs(args []string, opts TranscodeOpts) []stri
 // demuxed past. A seek restart starts a new span; older spans stay readable so
 // a backward seek into output an earlier generation produced keeps its cues.
 type subtitleCueSpan struct {
-	file  string
-	start int
+	file      string
+	start     int
+	startTime float64
+	durations []float64
+	final     bool
+	muxShift  float64
 	// end is the last segment the generation finished, or -1 while it is the
 	// live generation, whose progress is read from its own playlist.
 	end int
@@ -319,18 +345,24 @@ func (s *TranscodeSession) SubtitleSegmentVTT(ctx context.Context, segNum int) (
 // timestamps; without one, origin is zero and the window is the fixed grid,
 // which is right for the common source whose clock starts at zero.
 type subtitleCueWindow struct {
-	origin, offset float64
-	observed       bool
+	origin, offset, duration float64
+	observed, open           bool
+	restartGrid              bool
+	grid90k                  int64
 }
 
 // subtitleSegmentWindow returns the window of segment segNum of the
 // generation that wrote cue file.
-func (s *TranscodeSession) subtitleSegmentWindow(ctx context.Context, file string, segNum int, segDur int) subtitleCueWindow {
+func (s *TranscodeSession) subtitleSegmentWindow(ctx context.Context, file string, segNum int, segDur ...int) subtitleCueWindow {
+	segmentDuration := renditionSegmentDuration(s.Opts())
+	if len(segDur) > 0 && segDur[0] > 0 {
+		segmentDuration = segDur[0]
+	}
 	start, origin, ok := s.subtitleSpanOrigin(ctx, file, segNum)
 	if !ok {
-		return subtitleCueWindow{offset: float64(segNum * segDur)}
+		return subtitleCueWindow{offset: float64(segNum * segmentDuration), duration: float64(segmentDuration)}
 	}
-	return subtitleCueWindow{origin: origin, offset: float64((segNum - start) * segDur), observed: true}
+	return subtitleCueWindow{origin: origin, offset: float64((segNum - start) * segmentDuration), duration: float64(segmentDuration), observed: true}
 }
 
 // subtitleSpanOrigin returns the start segment and observed origin of the span

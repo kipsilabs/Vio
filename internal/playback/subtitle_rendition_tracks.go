@@ -504,7 +504,7 @@ func readOnDemandCues(ctx context.Context, opts TranscodeOpts, number uint64, se
 	}
 	// A copy remux's cues are on the source's clock less its start time
 	// (-start_at_zero), an encode's on the source's own (-copyts).
-	copyClock := copyMuxShiftsVideo(opts)
+	copyClock := strings.EqualFold(opts.TargetCodecVideo, "copy")
 	tsEpoch := window.observed && HLSOutputContainer(opts) == OutputContainerMPEGTS
 	kept, ref := keptRenditionWindowSource(opts, number)
 	var startTime time.Duration
