@@ -1760,7 +1760,7 @@ func (h *PlaybackHandler) HandleSubtitleStream(w http.ResponseWriter, r *http.Re
 				h.deliverSubtitle(w, r, requestedFormat, data, segmentPTSOffset)
 				return
 			}
-			data, subErr := playback.LoadExternalSubtitleAsVTT(r.Context(), sub.Path, sub.Format, h.FFmpegPath)
+			data, subErr := playback.LoadExternalSubtitleAsVTT(r.Context(), sub, h.FFmpegPath)
 			if subErr != nil {
 				writeError(w, http.StatusInternalServerError, "ServerError", "Failed to load subtitle")
 				return

@@ -469,6 +469,15 @@ const h264StreamingLevel = 41
 // at the source's H.264-equivalent rate. It is never below the 4.1 the
 // streaming libx264 encode is pinned to, so a rule checks the higher of the
 // two.
+func compatSourceEncodeKbps(version catalog.FileVersion, sourceVideo models.VideoTrack, videoCodec string) int {
+	fileKbps := playback.SourceVideoKbps(version.Bitrate, 0)
+	videoKbps := playback.SourceVideoKbps(version.Bitrate, sourceVideo.Bitrate)
+	if fileKbps > 0 && (videoKbps > fileKbps || videoKbps < fileKbps/4) {
+		videoKbps = fileKbps
+	}
+	return playback.EncodeEquivalentKbps(videoKbps, sourceVideo.Codec, videoCodec)
+}
+
 func h264EncodeFacts(video models.VideoTrack, videoBitrateKbps int, source catalog.FileVersion) (profile string, level int) {
 	kbps := videoBitrateKbps
 	if kbps <= 0 {
