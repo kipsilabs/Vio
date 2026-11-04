@@ -2955,7 +2955,11 @@ func (s *TranscodeSession) generationScopedQuery(rawQuery string) string {
 // has already accepted.
 func (s *TranscodeSession) buildPlaybackManifest(segPrefix, rawQuery string) ([]byte, error) {
 	if s.HasSubtitleRendition() {
-		return s.buildSubtitleRenditionPlaylist(segPrefix, rawQuery), nil
+		playlist := s.buildSubtitleRenditionPlaylist(segPrefix, rawQuery)
+		if playlist == nil {
+			return nil, ErrSubtitleRenditionNotFound
+		}
+		return playlist, nil
 	}
 	return s.buildVideoPlaylist(segPrefix, rawQuery)
 }

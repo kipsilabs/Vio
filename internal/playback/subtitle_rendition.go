@@ -318,6 +318,9 @@ func (s *TranscodeSession) subtitleSegmentSource(segNum int) (file string, ready
 // brief unless the live generation is about to reach the segment, when it is
 // as long as the matching video segment's.
 func (s *TranscodeSession) SubtitleSegmentVTT(ctx context.Context, segNum int) ([]byte, error) {
+	if subtitleRenditionsOnDemand(s.Opts()) {
+		return nil, ErrSegmentNotFound
+	}
 	opts := s.Opts()
 	started := time.Now()
 	deadline := started.Add(segmentWaitTimeout(opts.SegmentDuration))
@@ -680,7 +683,7 @@ func ParseSubtitleSegmentNumber(name string) (int, bool) {
 	return segNum, true
 }
 
-func (s *TranscodeSession) generateCopySubtitlePlaylist(segPrefix, rawQuery string) []byte {
+func (s *TranscodeSession) generateCopySubtitlePlaylist(segPrefix, rawQuery, track string) []byte {
 	queryCount := len(s.copyPlan.durations)
 	if s.opts.TotalDuration > 0 {
 		queryCount = syntheticSegmentCount(s.opts.TotalDuration, s.opts.SegmentDuration)
@@ -697,7 +700,11 @@ func (s *TranscodeSession) generateCopySubtitlePlaylist(segPrefix, rawQuery stri
 	}
 	fmt.Fprintf(&out, "#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:%s\n", playlistType)
 	for i, d := range s.copyPlan.durations {
-		fmt.Fprintf(&out, "#EXTINF:%.6f,\n%s\n", d, segPrefix+subtitleSegmentPrefix+fmt.Sprintf("%05d", i)+subtitleSegmentExt+suffix)
+		name := subtitleSegmentPrefix + fmt.Sprintf("%05d", i) + subtitleSegmentExt
+		if track != "" {
+			name = subtitleSegmentPrefix + track + "_" + fmt.Sprintf("%05d", i) + subtitleSegmentExt
+		}
+		fmt.Fprintf(&out, "#EXTINF:%.6f,\n%s\n", d, segPrefix+name+suffix)
 	}
 	out.WriteString("#EXT-X-ENDLIST\n")
 	return out.Bytes()
@@ -727,12 +734,12 @@ func (s *TranscodeSession) buildSubtitleRenditionPlaylist(segPrefix, rawQuery st
 			return nil
 		}
 		if s.copyPlan != nil {
-			return s.generateCopySubtitlePlaylist(segPrefix, query)
+			return s.generateCopySubtitlePlaylist(segPrefix, query, track)
 		}
 		if strings.EqualFold(s.Opts().TargetCodecVideo, "copy") {
 			if head, ok := s.liveProducedHead(); ok {
 				durations := slices.Repeat([]float64{float64(max(1, s.Opts().SegmentDuration))}, head+1)
-				return (&TranscodeSession{opts: s.Opts(), copyPlan: &copySegmentPlan{durations: durations}}).generateCopySubtitlePlaylist(segPrefix, query)
+				return (&TranscodeSession{opts: s.Opts(), copyPlan: &copySegmentPlan{durations: durations}}).generateCopySubtitlePlaylist(segPrefix, query, track)
 			}
 		}
 		playlist := s.generateSyntheticPlaylist(segPrefix, query, subtitleSegmentPrefix, subtitleSegmentExt, false)
@@ -740,8 +747,10 @@ func (s *TranscodeSession) buildSubtitleRenditionPlaylist(segPrefix, rawQuery st
 			playlist = bytes.ReplaceAll(playlist, []byte(segPrefix+subtitleSegmentPrefix), []byte(segPrefix+subtitleSegmentPrefix+track+"_"))
 		}
 		return playlist
-	default:
+	case "":
 		return subtitleRenditionMultivariantPlaylist(s.Opts(), query)
+	default:
+		return nil
 	}
 }
 
