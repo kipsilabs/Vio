@@ -1038,25 +1038,32 @@ func applyVirtualCandidateScores(versions []FileVersion, scores map[int]VirtualC
 	}
 }
 func (s *DetailService) scoreVirtualCandidates(ctx context.Context, contentID string, files []*models.MediaFile) map[int]VirtualCandidateScore {
-	ctx, cancel := context.WithTimeout(ctx, virtualScoreTimeout)
+	scoreCtx, cancel := context.WithTimeout(ctx, virtualScoreTimeout)
 	defer cancel()
-	s.virtualScoreSemOnce.Do(func() { s.virtualScoreSem = make(chan struct{}, virtualScoreConcurrency) })
+
+	s.virtualScoreSemOnce.Do(func() {
+		s.virtualScoreSem = make(chan struct{}, virtualScoreConcurrency)
+	})
 	select {
 	case s.virtualScoreSem <- struct{}{}:
-	case <-ctx.Done():
+	case <-scoreCtx.Done():
 		return nil
 	}
+
 	done := make(chan map[int]VirtualCandidateScore, 1)
 	go func() {
 		defer func() { <-s.virtualScoreSem }()
-		defer func() { recover() }()
-		done <- s.virtualScoreSource(ctx, contentID, files)
+		defer func() {
+			if recover() != nil {
+				done <- nil
+			}
+		}()
+		done <- s.virtualScoreSource(scoreCtx, contentID, files)
 	}()
 	select {
-	case v := <-done:
-		<-s.virtualScoreSem
-		return v
-	case <-ctx.Done():
+	case scores := <-done:
+		return scores
+	case <-scoreCtx.Done():
 		return nil
 	}
 }

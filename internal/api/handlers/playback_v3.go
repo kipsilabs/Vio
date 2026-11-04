@@ -2525,7 +2525,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	if err != nil {
 		return playback.DecisionResponseV3{}, playbackFileOperationError(err)
 	}
-	requestedFile = h.ensurePlaybackProbe(r.Context(), requestedFile)
+	requestedFile = h.ensurePlaybackProbeStart(r.Context(), requestedFile)
 	timings.mark("file_load_probe")
 	audioIndex, audioDegraded, err := resolveV3AudioIndex(requestedFile, req.AudioTrackID, req.AudioTrackIndex)
 	if err != nil {
@@ -2589,7 +2589,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 				// A fixed-file attempt cannot resume into a different part.
 				req.StartPosition = new(float64(0))
 			} else if target != nil {
-				effectiveFile = h.ensurePlaybackProbe(r.Context(), target)
+				effectiveFile = h.ensurePlaybackProbeStart(r.Context(), target)
 				audioIndex = remapAudioIndexV3(requestedFile, effectiveFile, audioIndex)
 				if err := preflightPlaybackFile(r.Context(), effectiveFile, h.MissingMarker, h.EventsHub); err != nil {
 					return playback.DecisionResponseV3{}, playbackPreflightOperationError(err)
