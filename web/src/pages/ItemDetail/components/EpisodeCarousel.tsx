@@ -16,7 +16,6 @@ import { useEpisodeSpoilerPrefs } from "@/hooks/useEpisodeSpoilerPrefs";
 import { useOverlayPrefs } from "@/hooks/useOverlayPrefs";
 import { isUpcomingEpisode, useEpisodeReleaseCapability } from "@/hooks/queries/episodeRelease";
 import type { CardQuickActionMode } from "@/lib/cardQuickActions";
-import type { ScrollPreservingState } from "@/hooks/useScrollRestoration";
 import EpisodeCardCaption from "./EpisodeCardCaption";
 
 interface EpisodeCarouselProps {
@@ -40,12 +39,6 @@ export default function EpisodeCarousel({
   const { data: releaseCapability } = useEpisodeReleaseCapability();
   const releaseSupported = releaseCapability?.available ?? false;
   const { hideImages, hideOverviews } = useEpisodeSpoilerPrefs();
-  // Moving between siblings keeps the viewer where they scrolled to: the page
-  // keeps its layout, and the carousel re-centres on the new episode.
-  const linkState: EpisodeNavigationState & ScrollPreservingState = {
-    ...episodeLinkState,
-    preserveScroll: true,
-  };
   const { emblaApi, emblaRef, canScrollPrev, canScrollNext, scrollPrev, scrollNext } =
     useCarouselEmbla({
       options: {
@@ -80,7 +73,7 @@ export default function EpisodeCarousel({
                 key={ep.content_id}
                 ep={ep}
                 isCurrent={ep.episode_number === currentEpisodeNumber}
-                episodeLinkState={linkState}
+                episodeLinkState={episodeLinkState}
                 quickActionMode={quickActionMode}
                 upcoming={isUpcomingEpisode(ep, releaseSupported)}
                 hideImageIfUnwatched={hideImages}

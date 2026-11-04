@@ -27,6 +27,7 @@ import { useOnViewTranslation } from "@/hooks/useOnViewTranslation";
 import MetadataBadges from "./components/MetadataBadges";
 import TrailersSection from "./components/TrailersSection";
 import ExtrasSection from "./components/ExtrasSection";
+import CollectionsSection from "./components/CollectionsSection";
 import QualityBadges from "./components/QualityBadges";
 import ScoreRow from "./components/ScoreRow";
 import HeroCrewLine from "./components/HeroCrewLine";
@@ -35,6 +36,7 @@ import MediaInfoDialog from "./components/MediaInfoDialog";
 import SubtitleSearchDialog from "./components/SubtitleSearchDialog";
 import { sortByResolution } from "./components/VersionFlyout";
 import { selectDefaultPlaybackVariantVersion } from "./components/versionRankingUtils";
+import { readRequestedFileId, rememberRequestedFileId } from "@/playback/requestedVersion";
 import { resolveSelectedMediaSummary } from "./components/selectedMediaSummary";
 import { RecommendationGridSkeleton } from "./components/SectionSkeletons";
 import { resolveLeafPrimaryAction } from "./itemDetailLayout";
@@ -50,9 +52,11 @@ import { hasMachineTranslation } from "./components/machineTranslation";
 export default function MovieContent({
   item,
   showAdvisoryAge,
+  onStaleVersion,
 }: {
   item: ItemDetail & { type: "movie" };
   showAdvisoryAge?: boolean;
+  onStaleVersion?: (fileId: number) => void;
 }) {
   const { translating: overviewTranslating, onTranslate: onTranslateOverview } =
     useOnViewTranslation(item);
@@ -94,6 +98,14 @@ export default function MovieContent({
   const [mediaInfoOpen, setMediaInfoOpen] = useState(false);
   const crewGroups = useMemo(() => buildCrewGroups(item.crew ?? [], "Director"), [item.crew]);
   const [mediaInfoFileId, setMediaInfoFileId] = useState<number | null>(null);
+  // Tracks whether a version picker has been opened; the picker-open path
+  // widens the liveness probe from the default version to the whole list.
+  const [versionPickersOpened, setVersionPickersOpened] = useState(false);
+  const handleVersionPickerOpenChange = useCallback((open: boolean) => {
+    if (open) {
+      setVersionPickersOpened(true);
+    }
+  }, []);
 
   // Version selection state — drives the Play button and inline stream popovers.
   const sortedVersions = useMemo(() => sortByResolution(item.versions), [item.versions]);
@@ -117,11 +129,13 @@ export default function MovieContent({
         userData,
         qualityPreference,
         item.effective_version_edition_key,
+        requestedFileId,
       ),
     [
       qualityPreference,
       item.effective_version_edition_key,
       item.playback_variants,
+      requestedFileId,
       sortedVersions,
       userData,
     ],
@@ -252,6 +266,10 @@ export default function MovieContent({
     deleteSubtitlePreference.mutate(item.content_id);
   };
 
+  const isPlayable =
+    (item.versions?.length ?? 0) > 0 ||
+    (item.playback_variants?.length ?? 0) > 0 ||
+    Boolean(item.play_content_id);
   const primaryAction = resolveLeafPrimaryAction(item, "Play");
   const watchTogether = useDetailWatchTogether({
     item,
@@ -267,7 +285,7 @@ export default function MovieContent({
         : null,
   });
   const restartHref =
-    primaryAction.label === "Resume" && item.versions.length > 0
+    primaryAction.label === "Resume" && isPlayable
       ? `/watch/${item.content_id}?restart=1`
       : undefined;
   const { data: similarData, isLoading: similarLoading } = useSimilarItems(item.content_id);
@@ -336,7 +354,7 @@ export default function MovieContent({
               item={item}
               contentId={item.content_id}
               watchTogether={watchTogether.menu}
-              playHref={item.versions.length > 0 ? `/watch/${item.content_id}` : undefined}
+              playHref={isPlayable ? `/watch/${item.content_id}` : undefined}
               playLabel={primaryAction.label}
               playProgress={primaryAction.progress}
               restartHref={restartHref}
@@ -388,11 +406,14 @@ export default function MovieContent({
               onShowMediaInfo={
                 canCurateMetadata && item.versions.length > 0 ? () => openMediaInfo() : undefined
               }
-              versions={item.versions}
+              versions={versionsWithLiveness}
+              hasVirtualSource={item.has_virtual_source === true}
               playbackVariants={item.playback_variants}
               selectedVersion={selectedVersion}
               selectedVersionMissing={selectedVersionMissing}
               onSelectVersion={handleSelectVersion}
+              onVersionPickerOpenChange={handleVersionPickerOpenChange}
+              explicitFileSelection={manualSelectedFileId != null}
               onDownload={
                 user?.download_allowed && item.versions.length > 0
                   ? () => setDownloadOpen(true)
@@ -447,6 +468,9 @@ export default function MovieContent({
             onOpenChange={setDownloadOpen}
             versions={item.versions}
             title={title}
+            selectedFileId={selectedVersion?.file_id}
+            onStaleVersion={onStaleVersion}
+            createTarget={{ contentId: item.content_id }}
           />
           <SubtitleSearchDialog
             open={subtitleSearchOpen}
@@ -485,6 +509,8 @@ export default function MovieContent({
           <CastCarousel cast={item.cast ?? []} crewGroups={crewGroups} limit={12} prefetchPeople />
         </DetailSection>
       )}
+
+      <CollectionsSection collections={item.collections} />
 
       {/* More Like This */}
       {similarLoading ? (

@@ -2,7 +2,6 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { EpisodeListItem } from "@/api/types";
 import EpisodeCarousel from "./EpisodeCarousel";
 
 vi.mock("@/lib/thumbhash", () => ({ decodeThumbhash: () => "data:image/png;base64,fixture" }));
@@ -41,40 +40,40 @@ vi.mock("@/hooks/useCarouselEmbla", () => ({
   }),
 }));
 
-function episode(number: number, overrides: Partial<EpisodeListItem> = {}): EpisodeListItem {
+// Capability gating: the carousel stands in for the resolved answer
+// (available) so the badge path is exercised without a QueryClient.
+vi.mock("@/hooks/queries/episodeRelease", async (importOriginal) => {
+  const original = (await importOriginal()) as typeof import("@/hooks/queries/episodeRelease");
   return {
-    content_id: `ep-${number}`,
-    season_number: 1,
-    episode_number: number,
-    title: "",
-    overview: "",
-    air_date: null,
-    runtime: 42,
-    still_url: "",
-    still_thumbhash: "",
-    files: [],
-    ...overrides,
+    ...original,
+    useEpisodeReleaseCapability: () => ({ data: { available: true } }),
   };
-}
-
-const carousel = (currentEpisodeNumber: number, episodes: EpisodeListItem[]) => (
-  <MemoryRouter>
-    <EpisodeCarousel currentEpisodeNumber={currentEpisodeNumber} episodes={episodes} />
-  </MemoryRouter>
-);
+});
 
 it("captions each card like the series grid and hides unwatched descriptions on request", () => {
   spoilerPrefs.hideOverviews = true;
-  const card = (id: string, number: number, played: boolean) =>
-    episode(number, {
-      content_id: id,
-      title: `Chapter ${number}`,
-      overview: `Overview ${number}`,
-      runtime: 52,
-      user_data: { played },
-    });
+  const card = (id: string, number: number, played: boolean) => ({
+    content_id: id,
+    season_number: 1,
+    episode_number: number,
+    title: `Chapter ${number}`,
+    overview: `Overview ${number}`,
+    air_date: null,
+    runtime: 52,
+    still_url: "",
+    still_thumbhash: "",
+    files: [],
+    user_data: { played },
+  });
   try {
-    render(carousel(1, [card("ep-1", 1, true), card("ep-2", 2, false)]));
+    render(
+      <MemoryRouter>
+        <EpisodeCarousel
+          currentEpisodeNumber={1}
+          episodes={[card("ep-1", 1, true), card("ep-2", 2, false)]}
+        />
+      </MemoryRouter>,
+    );
     expect(screen.getByText("S01E01 · Chapter 1")).toBeInTheDocument();
     expect(screen.getAllByText("52m")).toHaveLength(2);
     expect(screen.getByText("Overview 1")).toBeInTheDocument();
@@ -86,21 +85,54 @@ it("captions each card like the series grid and hides unwatched descriptions on 
 
 it("suppresses a protected still placeholder until the image loads", () => {
   spoilerPrefs.hideImages = true;
-  const protectedStill = () => [
-    episode(1, {
-      content_id: "ep-protected",
-      title: "Protected",
-      still_url: "https://example.invalid/still.jpg",
-      still_thumbhash: "fixture",
-      still_is_episode_still: true,
-    }),
-  ];
-  const { container, rerender } = render(carousel(0, protectedStill()));
+  const { container, rerender } = render(
+    <MemoryRouter>
+      <EpisodeCarousel
+        currentEpisodeNumber={0}
+        episodes={[
+          {
+            content_id: "ep-protected",
+            season_number: 1,
+            episode_number: 1,
+            title: "Protected",
+            overview: "",
+            air_date: null,
+            runtime: 42,
+            still_url: "https://example.invalid/still.jpg",
+            still_thumbhash: "fixture",
+            files: [],
+            still_is_episode_still: true,
+          },
+        ]}
+      />
+    </MemoryRouter>,
+  );
   const image = container.querySelector("img")!;
   expect(image.parentElement!.style.backgroundImage).toBe("");
   expect(image.className).toContain("blur");
   spoilerPrefs.hideImages = false;
-  rerender(carousel(0, protectedStill()));
+  rerender(
+    <MemoryRouter>
+      <EpisodeCarousel
+        currentEpisodeNumber={0}
+        episodes={[
+          {
+            content_id: "ep-protected",
+            season_number: 1,
+            episode_number: 1,
+            title: "Protected",
+            overview: "",
+            air_date: null,
+            runtime: 42,
+            still_url: "https://example.invalid/still.jpg",
+            still_thumbhash: "fixture",
+            files: [],
+            still_is_episode_still: true,
+          },
+        ]}
+      />
+    </MemoryRouter>,
+  );
   expect(container.querySelector("img")!.parentElement!.style.backgroundImage).toContain(
     "data:image/png",
   );
@@ -117,7 +149,27 @@ describe("EpisodeCarousel", () => {
     // passes would start cache work for the whole season. Intent is a dwell.
     vi.useFakeTimers();
     try {
-      render(carousel(2, [episode(1, { title: "Pilot" })]));
+      render(
+        <MemoryRouter>
+          <EpisodeCarousel
+            currentEpisodeNumber={2}
+            episodes={[
+              {
+                content_id: "ep-1",
+                season_number: 1,
+                episode_number: 1,
+                title: "Pilot",
+                overview: "",
+                air_date: null,
+                runtime: 42,
+                still_url: "",
+                still_thumbhash: "",
+                files: [],
+              },
+            ]}
+          />
+        </MemoryRouter>,
+      );
 
       const card = screen.getAllByRole("link", { name: /Pilot/ })[0]!.closest("div.group\\/card")!;
 
@@ -137,21 +189,61 @@ describe("EpisodeCarousel", () => {
 
   it("enables unwatched shortcuts without losing partial-progress restart eligibility", () => {
     renderToStaticMarkup(
-      carousel(2, [
-        episode(1, { title: "Pilot" }),
-        episode(2, {
-          title: "Next",
-          runtime: 43,
-          user_data: { played: false, position_seconds: 120, duration_seconds: 1800 },
-        }),
-        episode(3, {
-          title: "Rewatch",
-          runtime: 44,
-          // Watched before and partly rewatched: no progress bar, but a
-          // resume position Mark Unwatched can clear.
-          user_data: { played: true, position_seconds: 300, duration_seconds: 1800 },
-        }),
-      ]),
+      <MemoryRouter>
+        <EpisodeCarousel
+          currentEpisodeNumber={2}
+          episodes={[
+            {
+              content_id: "ep-1",
+              season_number: 1,
+              episode_number: 1,
+              title: "Pilot",
+              overview: "",
+              air_date: null,
+              runtime: 42,
+              still_url: "",
+              still_thumbhash: "",
+              files: [],
+            },
+            {
+              content_id: "ep-2",
+              season_number: 1,
+              episode_number: 2,
+              title: "Next",
+              overview: "",
+              air_date: null,
+              runtime: 43,
+              still_url: "",
+              still_thumbhash: "",
+              files: [],
+              user_data: {
+                played: false,
+                position_seconds: 120,
+                duration_seconds: 1800,
+              },
+            },
+            {
+              content_id: "ep-3",
+              season_number: 1,
+              episode_number: 3,
+              title: "Rewatch",
+              overview: "",
+              air_date: null,
+              runtime: 44,
+              still_url: "",
+              still_thumbhash: "",
+              files: [],
+              // Watched before and partly rewatched: no progress bar, but a
+              // resume position Reset Progress can clear.
+              user_data: {
+                played: true,
+                position_seconds: 300,
+                duration_seconds: 1800,
+              },
+            },
+          ]}
+        />
+      </MemoryRouter>,
     );
 
     expect(capturedMenuProps[0]).toMatchObject({
