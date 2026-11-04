@@ -449,24 +449,37 @@ type episodeFileResponse struct {
 	Unreadable bool `json:"-"`
 }
 
+const (
+	EpisodeReleaseUpcoming = catalog.EpisodeReleaseUpcoming
+	EpisodeReleaseReleased = catalog.EpisodeReleaseReleased
+)
+
+// EpisodeReleaseState classifies a YYYY-MM-DD air date using the shared catalog
+// release classifier. Unknown or malformed dates are intentionally absent.
+func EpisodeReleaseState(airDate string) string {
+	return catalog.ReleaseStateForAirDate(airDate)
+}
+
 // episodeResponse is the shape of an episode in API responses.
 type episodeResponse struct {
-	StillIsEpisodeStill *bool                   `json:"-"`
-	ContentID           string                  `json:"content_id"`
-	SeasonNumber        int                     `json:"season_number"`
-	EpisodeNumber       int                     `json:"episode_number"`
-	Title               string                  `json:"title"`
-	Overview            string                  `json:"overview,omitempty"`
-	AirDate             string                  `json:"air_date,omitempty"`
-	Runtime             int                     `json:"runtime"`
-	ImdbID              string                  `json:"imdb_id,omitempty"`
-	TmdbID              string                  `json:"tmdb_id,omitempty"`
-	TvdbID              string                  `json:"tvdb_id,omitempty"`
-	StillURL            string                  `json:"still_url,omitempty"`
-	StillThumbhash      string                  `json:"still_thumbhash,omitempty"`
-	UserData            *catalog.SeasonUserData `json:"user_data,omitempty"`
-	Files               []episodeFileResponse   `json:"files,omitempty"`
-	OverlaySummary      *models.OverlaySummary  `json:"overlay_summary,omitempty"`
+	StillIsEpisodeStill *bool `json:"-"`
+	// ReleaseState is consumed by the v2 renderer; the frozen v1 wire omits it.
+	ReleaseState   string                  `json:"-"`
+	ContentID      string                  `json:"content_id"`
+	SeasonNumber   int                     `json:"season_number"`
+	EpisodeNumber  int                     `json:"episode_number"`
+	Title          string                  `json:"title"`
+	Overview       string                  `json:"overview,omitempty"`
+	AirDate        string                  `json:"air_date,omitempty"`
+	Runtime        int                     `json:"runtime"`
+	ImdbID         string                  `json:"imdb_id,omitempty"`
+	TmdbID         string                  `json:"tmdb_id,omitempty"`
+	TvdbID         string                  `json:"tvdb_id,omitempty"`
+	StillURL       string                  `json:"still_url,omitempty"`
+	StillThumbhash string                  `json:"still_thumbhash,omitempty"`
+	UserData       *catalog.SeasonUserData `json:"user_data,omitempty"`
+	Files          []episodeFileResponse   `json:"files,omitempty"`
+	OverlaySummary *models.OverlaySummary  `json:"overlay_summary,omitempty"`
 	// RatingIMDB and RatingTMDB feed the v2 episode's ratings; /api/v1 is
 	// frozen, so they stay off its wire.
 	RatingIMDB *float64 `json:"-"`
@@ -1269,6 +1282,7 @@ func episodeResponseShell(ep *models.Episode, fallback episodeImageFallback, siz
 
 	if ep.AirDate != nil {
 		resp.AirDate = ep.AirDate.Format("2006-01-02")
+		resp.ReleaseState = EpisodeReleaseState(resp.AirDate)
 	}
 
 	return resp, sizedCardPath(stillPath, artworkkey.ImageStill, size)
