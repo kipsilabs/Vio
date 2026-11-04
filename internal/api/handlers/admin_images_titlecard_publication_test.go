@@ -29,6 +29,10 @@ func (f *titlecardPublicationImages) FetchSeasonImages(context.Context, map[stri
 	return nil, nil, nil
 }
 
+func (f *titlecardPublicationImages) ApplyUploadedItemImage(context.Context, metadata.ApplyUploadedItemImageRequest) (*metadata.ApplyUploadedItemImageResult, error) {
+	return nil, fmt.Errorf("uploaded image not supported by this test service")
+}
+
 func (f *titlecardPublicationImages) ApplyItemImage(context.Context, metadata.ApplyItemImageRequest) (*metadata.ApplyItemImageResult, error) {
 	f.calls++
 	return &metadata.ApplyItemImageResult{StoredPath: f.stored, Thumbhash: f.hash, Revision: "rev"}, nil

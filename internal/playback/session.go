@@ -3075,6 +3075,21 @@ func (m *SessionManager) SetProgressPersistenceDisabled(sessionID string, disabl
 
 // TouchActivity refreshes the session's activity timestamp without changing
 // any other playback state.
+// MarkPlanCommitted records that startup planning completed, allowing normal lifecycle accounting.
+func (m *SessionManager) MarkPlanCommitted(sessionID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		return ErrSessionNotFound
+	}
+	now := time.Now()
+	s.PlanCommittedAt = now
+	s.LastActivityAt = now
+	s.UpdatedAt = now
+	return nil
+}
+
 func (m *SessionManager) TouchActivity(sessionID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
