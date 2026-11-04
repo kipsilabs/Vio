@@ -412,6 +412,8 @@ type PlaybackHandler struct {
 	fileResolver                FilePathResolver // optional; enables stream_url in responses
 	VirtualPlaybackResolver     VirtualPlaybackResolver
 	VirtualPlaybackStreamLister VirtualPlaybackStreamLister
+	VirtualPlaybackStreamSink   VirtualPlaybackStreamSink
+	VirtualCandidateFileLookup  VirtualCandidateFileLookup
 	StoreProvider               userstore.UserStoreProvider // optional; enables progress/history persistence
 	DeviceSightings             *DeviceSightings            // optional; registers the device that starts playback
 	WatchScrobbler              PlaybackWatchScrobbler

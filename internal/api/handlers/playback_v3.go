@@ -9566,7 +9566,6 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 
 	var preparedTransport *preparedTransportV3
 	var artifactRecipe playback.ExecutableRecipeV3
-	var mode mediaAuthModeV3
 	// replanCapabilityWarnings holds the degradation warnings produced by the
 	// one normalization of the merged start request, so they can be surfaced on
 	// whichever plan this replan ultimately returns.
@@ -13654,6 +13653,17 @@ func frozenV1DecisionV3(response playback.DecisionResponseV3) playback.DecisionR
 	})
 	response.PlaybackPlan = &plan
 	return response
+}
+
+func startReplayResponseBelongsToAttemptV3(response playback.DecisionResponseV3, record *playback.AttemptRecordV3) bool {
+	if record == nil || record.SessionID == "" || response.SessionID != record.SessionID {
+		return false
+	}
+	return response.PlaybackPlan == nil || response.PlaybackPlan.SessionID == record.SessionID
+}
+
+func foreignAttemptSessionDecisionV3() playback.DecisionResponseV3 {
+	return playback.NewTerminalResponseV3("session_expired", "The playback plan for this attempt does not belong to its session.", true)
 }
 
 func normalizeDecisionResponseV3(response playback.DecisionResponseV3) playback.DecisionResponseV3 {
