@@ -76,11 +76,18 @@ func TestSubtitleWarmTextProgressFiltersAndCovers(t *testing.T) {
 }
 
 func TestSubtitleWarmTextProgressDisablesOnMalformedEvent(t *testing.T) {
+	before := subtitleWarmTextDisables.Load()
 	p := newSubtitleWarmTextProgress()
 	p.observe([]byte(warmTextASSHeader))
 	p.observe([]byte(subtitleASSEventDialogue + " 0,not-a-time,0:02:10.00,Default,,0,0,0,,Broken\n"))
 	if _, ok := p.render(0, 120); ok {
 		t.Fatal("progress served a window after a malformed event")
+	}
+	// The disable is signalled once per warm: another malformed chunk must not
+	// count or log the same fallback again.
+	p.observe([]byte(subtitleASSEventDialogue + " 0,also-not-a-time,0:02:10.00,Default,,0,0,0,,Broken\n"))
+	if got := subtitleWarmTextDisables.Load() - before; got != 1 {
+		t.Fatalf("disable signal count = %d, want exactly one per warm", got)
 	}
 }
 

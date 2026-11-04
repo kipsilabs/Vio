@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // In-progress full-track ASS warm progress.
@@ -48,6 +49,18 @@ const (
 	subtitleASSEventDialogue = "Dialogue:" //nolint:misspell // ASS/SSA event keyword
 	subtitleASSEventComment  = "Comment:"
 )
+
+// subtitleWarmTextDisabledSignal is the operator-facing signal emitted when a
+// warm's in-memory ASS prefix disables itself. The layer is fail-closed: a
+// later window uses the existing extract path. Counting it lets production
+// measure how often sources are malformed, unordered, or larger than the
+// retained bounds rather than guessing from missing cache hits.
+const subtitleWarmTextDisabledSignal = "warm_prefix_disabled_unordered"
+
+// subtitleWarmTextDisables counts warm-prefix layers disabled for any reason.
+// Disabling is once per warm, so the counter is also the number of warms that
+// fell back to the extract path.
+var subtitleWarmTextDisables atomic.Int64
 
 // subtitleWarmTextEvent is one retained event line with the source time range
 // parsed from it.
@@ -123,12 +136,12 @@ func (p *subtitleWarmTextProgress) observe(chunk []byte) {
 		return
 	}
 	if p.retainedBytes+len(p.partialLine)+len(chunk) > subtitleWarmTextMaxBytes {
-		p.disableLocked()
+		p.disableLocked("bundle_byte_budget")
 		return
 	}
 	p.partialLine = append(p.partialLine, chunk...)
 	if len(p.partialLine) > subtitleWarmTextMaxLineBytes && bytes.IndexByte(p.partialLine, '\n') < 0 {
-		p.disableLocked()
+		p.disableLocked("line_byte_budget")
 		return
 	}
 	for {
@@ -169,11 +182,11 @@ func (p *subtitleWarmTextProgress) consumeLineLocked(line string) bool {
 		strings.HasPrefix(lower, strings.ToLower(subtitleASSEventComment)):
 		start, end, ok := p.parseEventTimesLocked(trimmed)
 		if !ok {
-			p.disableLocked()
+			p.disableLocked("malformed_event")
 			return false
 		}
 		if len(p.events) >= subtitleWarmTextMaxEvents {
-			p.disableLocked()
+			p.disableLocked("event_budget")
 			return false
 		}
 		p.events = append(p.events, subtitleWarmTextEvent{line: line, start: start, end: end})
@@ -245,12 +258,27 @@ func (p *subtitleWarmTextProgress) parseEventTimesLocked(line string) (start, en
 	return start, end, true
 }
 
-func (p *subtitleWarmTextProgress) disableLocked() {
+func (p *subtitleWarmTextProgress) disableLocked(reason string) {
+	if p.disabled {
+		return
+	}
 	p.disabled = true
+	events, retainedBytes, watermark := len(p.events), p.retainedBytes, p.watermark
 	p.header.Reset()
 	p.events = nil
 	p.partialLine = nil
 	p.retainedBytes = 0
+	subtitleWarmTextDisables.Add(1)
+	// Once per warm: the disabled guard above makes every later observe a
+	// no-op, so a malformed source cannot flood the log with one line per
+	// chunk. Serving never changes; this is the only signal that the
+	// in-memory prefix fell back to the extract path.
+	slog.Warn("subtitle warm text prefix layer disabled; serving windows from the extract path",
+		"signal", subtitleWarmTextDisabledSignal,
+		"reason", reason,
+		"retained_events", events,
+		"retained_bytes", retainedBytes,
+		"watermark_seconds", watermark)
 }
 
 // render returns a self-contained ASS window for [start,end] when the warm has
