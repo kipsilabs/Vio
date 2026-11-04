@@ -1,6 +1,8 @@
 package handlers
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -3304,6 +3306,23 @@ func writeTranscodeManifestResponse(w http.ResponseWriter, r *http.Request, mani
 	// which drops the Content-Length below (Cloudflare does).
 	w.Header().Set("Cache-Control", "no-store, no-transform, max-age=0")
 	w.Header().Set("Pragma", "no-cache")
+	// Advertise the encoding negotiation even when this particular request did
+	// not ask for gzip, so a cache never serves one variant under the other's key.
+	w.Header().Set("Vary", "Accept-Encoding")
+	if r != nil && acceptsGzipEncoding(r.Header.Get("Accept-Encoding")) {
+		var buf bytes.Buffer
+		gz := gzip.NewWriter(&buf)
+		if _, err := gz.Write(manifest); err == nil {
+			if err := gz.Close(); err == nil {
+				w.Header().Set("Content-Encoding", "gzip")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write(buf.Bytes())
+				return
+			}
+		}
+		// Compression failed mid-stream with nothing written yet; fall through
+		// and serve the identical identity body rather than a broken response.
+	}
 	// The playlist is complete in memory, so state its length. Without it a
 	// playlist past net/http's small write buffer goes out chunked, and a
 	// player that opens HLS sources with a ranged byte reader (AetherEngine
