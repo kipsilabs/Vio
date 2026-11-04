@@ -104,6 +104,7 @@ type PlaybackPlan struct {
 	Stream                 playback.StreamV3               `json:"stream"`
 	Timeline               playback.TimelineV3             `json:"timeline"`
 	SelectedTracks         playback.SelectedTracksV3       `json:"selected_tracks"`
+	AudioTracks            []playback.AudioInventoryItemV3 `json:"audio_tracks,omitempty"`
 	EffectiveRecipe        playback.EffectiveRecipeV3      `json:"effective_recipe"`
 	Claims                 playback.ValidationClaimsV3     `json:"claims"`
 	Subtitle               playback.SubtitleDecisionV3     `json:"subtitle"`
@@ -640,7 +641,7 @@ func playbackDecision(in playback.DecisionResponseV3) PlaybackDecision {
 		p := in.PlaybackPlan
 		stream := p.Stream
 		stream.URL = playbackV2MediaURL(stream.URL)
-		out.PlaybackPlan = &PlaybackPlan{ProtocolVersion: p.ProtocolVersion, PlanID: p.PlanID, PlanAttemptKey: p.PlanAttemptKey, SessionID: p.SessionID, ExpiresAt: p.ExpiresAt, Delivery: p.Delivery, Stream: stream, Timeline: p.Timeline, SelectedTracks: p.SelectedTracks, EffectiveRecipe: p.EffectiveRecipe, BandwidthLimit: playbackBandwidthLimit(p.BandwidthLimit), Claims: p.Claims, Subtitle: playbackV2Subtitle(p.Subtitle), Transformations: p.Transformations, AppliedQuirks: p.AppliedQuirks, RuntimeCorrections: p.RuntimeCorrections, AvailableQualities: playbackQualities(p.AvailableQualities), DegradationWarnings: p.DegradationWarnings, DecisionReason: p.DecisionReason, RequestedMediaFileID: ID(strconv.Itoa(p.RequestedMediaFileID)), EffectiveMediaFileID: ID(strconv.Itoa(p.EffectiveMediaFileID)), Source: playbackSource(p.Source), SubtitleFidelityPolicy: p.SubtitleFidelityPolicy, ActiveQuality: p.ActiveQuality, InventoryURL: playbackV2InventoryURL(p.InventoryURL), TracksPending: p.TracksPending, DeliveryChange: playbackV2DeliveryChange(p.DeliveryChange), VirtualSourceRevision: p.VirtualSourceRevision, EffectiveVirtualURI: p.EffectiveVirtualURI}
+		out.PlaybackPlan = &PlaybackPlan{ProtocolVersion: p.ProtocolVersion, PlanID: p.PlanID, PlanAttemptKey: p.PlanAttemptKey, SessionID: p.SessionID, ExpiresAt: p.ExpiresAt, Delivery: p.Delivery, Stream: stream, Timeline: p.Timeline, SelectedTracks: p.SelectedTracks, AudioTracks: p.AudioTracks, EffectiveRecipe: p.EffectiveRecipe, BandwidthLimit: playbackBandwidthLimit(p.BandwidthLimit), Claims: p.Claims, Subtitle: playbackV2Subtitle(p.Subtitle), Transformations: p.Transformations, AppliedQuirks: p.AppliedQuirks, RuntimeCorrections: p.RuntimeCorrections, AvailableQualities: playbackQualities(p.AvailableQualities), DegradationWarnings: p.DegradationWarnings, DecisionReason: p.DecisionReason, RequestedMediaFileID: ID(strconv.Itoa(p.RequestedMediaFileID)), EffectiveMediaFileID: ID(strconv.Itoa(p.EffectiveMediaFileID)), Source: playbackSource(p.Source), SubtitleFidelityPolicy: p.SubtitleFidelityPolicy, ActiveQuality: p.ActiveQuality, InventoryURL: playbackV2InventoryURL(p.InventoryURL), TracksPending: p.TracksPending, DeliveryChange: playbackV2DeliveryChange(p.DeliveryChange), VirtualSourceRevision: p.VirtualSourceRevision, EffectiveVirtualURI: p.EffectiveVirtualURI}
 	}
 	return out
 }

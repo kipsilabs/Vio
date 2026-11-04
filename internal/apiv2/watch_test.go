@@ -152,7 +152,7 @@ func (f *fakeWatchFilters) WatchDetail(_ context.Context, userID int, profileID,
 	return nil, &handlers.APIError{Status: http.StatusNotFound, Code: "not_found", Message: "Watch target not found"}
 }
 
-func (f *fakeWatchFilters) SetWatchedState(_ context.Context, userID int, profileID, contentID string, played bool, _ catalogpkg.AccessFilter) (handlers.WatchedStateView, error) {
+func (f *fakeWatchFilters) SetWatchedState(_ context.Context, userID int, profileID, contentID string, played, recordRewatch bool, _ catalogpkg.AccessFilter) (handlers.WatchedStateView, error) {
 	return handlers.WatchedStateView{}, &handlers.APIError{Status: http.StatusNotFound, Code: "not_found", Message: "Item not found"}
 }
 
