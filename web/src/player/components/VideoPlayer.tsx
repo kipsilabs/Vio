@@ -52,6 +52,7 @@ import { useNextEpisode } from "../hooks/useNextEpisode";
 import { MARKER_KINDS, useMarkerEditor } from "../hooks/useMarkerEditor";
 import { useWatchTogetherPlaybackSync } from "../hooks/useWatchTogetherPlaybackSync";
 import type { WatchTogetherRoomConnectionResult } from "../hooks/useWatchTogetherRoomConnection";
+import { providerResultText } from "@/components/streaming/useProviderResultDisplay";
 import { getPersistedVolume, persistVolume } from "./VolumeControl";
 import { playerV2 } from "../player-v2";
 import { usePlayerConfig } from "../context/PlayerConfigContext";
@@ -71,6 +72,7 @@ import {
   ROOM_HELD_SEEK_TIMEOUT_MS,
 } from "../utils/pendingSeek";
 import { resolveVersionAudioLanguage } from "../utils/effectiveAudioLanguage";
+import { resolveEffectiveVersion } from "../utils/resolveEffectiveVersion";
 import { StartupGuard } from "../utils/startupGuard";
 import { isSafariBrowserV3, resolveHLSEngineV3 } from "../utils/hlsEngine";
 import { isFirefoxUserAgent } from "../utils/browser";
@@ -147,6 +149,15 @@ import {
   stopWatchTogetherPlayback,
   setWatchTogetherGuestControl,
 } from "@/lib/watchTogetherActions";
+import { versionSortableFromFile } from "@/lib/qualityRanking";
+import {
+  audioLanguageLabels,
+  buildQualitySummary,
+  buildReleasePresentation,
+  buildVersionDetailLine,
+  profileLabelFromFilePath,
+  subtitleLanguageLabels,
+} from "@/pages/ItemDetail/components/versionFormatUtils";
 import { toast } from "sonner";
 import { MediaDataMeter } from "../media-data-meter";
 import { mediaElementReleased, sourceLoadStarted } from "../bandwidth-probe";
@@ -516,6 +527,7 @@ function readStringPayload(
 }
 
 export function VideoPlayer({
+  contentId,
   title,
   year,
   streamUrl,
@@ -526,17 +538,25 @@ export function VideoPlayer({
   shouldAutoPlay = true,
   replanning = false,
   replacing = false,
+  pendingSwitchFileId = null,
   replanError = null,
   replanErrorTitle = null,
   sessionId,
   selectedVersion,
   versions = [],
+  indexerReleases = [],
+  virtualRanking,
   activeFileId,
+  activeVirtualUri,
   chapters = [],
   trickplay = null,
   trickplayUpdatedAt,
   onTrickplayError,
   onSwitchVersion,
+  onSelectAutoVersion,
+  autoFallback,
+  onRefreshVersions,
+  onCancelRefresh,
   subtitleUrls,
   initialPosition,
   onQualitySelect,
@@ -1093,10 +1113,76 @@ export function VideoPlayer({
   const qualityOptions = useMemo(() => qualityOptionsFromPlanV3(plan), [plan]);
 
   // The file the server actually planned against, which is not necessarily the
-  // one that was asked for — a fallback to an alternate version shows up here.
+  // one that was asked for. When the plan resolved a neutral virtual row to a
+  // concrete candidate, `effective_virtual_uri` names that candidate by path;
+  // matching there is what makes the version menu light the working row.
+  // A list miss is a real miss: falling back to the selected row would light
+  // the viewer's pick as "Playing" while the server serves another candidate,
+  // which is exactly the silent substitution this surface must not show.
   const effectiveVersion = useMemo(
-    () => versions.find((v) => v.file_id === plan.effective_media_file_id) ?? selectedVersion,
-    [plan.effective_media_file_id, selectedVersion, versions],
+    () =>
+      resolveEffectiveVersion(versions, {
+        mediaFileId: activeFileId ?? plan.effective_media_file_id,
+        effectiveVirtualUri: activeVirtualUri ?? plan.effective_virtual_uri ?? null,
+      }),
+    [
+      activeFileId,
+      activeVirtualUri,
+      plan.effective_media_file_id,
+      plan.effective_virtual_uri,
+      versions,
+    ],
+  );
+  const effectiveFileId = effectiveVersion?.file_id ?? plan.effective_media_file_id;
+
+  // Resolve source status for the version menu. A row is "Playing" when it is
+  // the effective source and "Requested" while the viewer's pick is still
+  // pending, or when the plan names it as requested but it has not become
+  // effective yet.
+  const versionStatus = useMemo(
+    () =>
+      versions.map((v) => ({
+        fileId: v.file_id,
+        providerText: providerResultText(v),
+        // Scored release candidates lead with the Radarr-style release line;
+        // everything else keeps the shared one-line quality summary, identical
+        // to the item-page picker's for the same version fields.
+        label: buildReleasePresentation(v) || buildQualitySummary(v),
+        releaseName: buildVersionDetailLine(v),
+        // Same release + structured size + source hint the item-page picker
+        // shows, so the two version menus stay equal in information.
+        detail: buildVersionDetailLine(v),
+        audioLanguages: audioLanguageLabels(v.audio_tracks),
+        subtitleLanguages: subtitleLanguageLabels(v.subtitle_tracks),
+        profileLabel: profileLabelFromFilePath(v.file_path),
+        filePath: v.file_path,
+        // The server publishes the ranking on the watch detail, not per file.
+        // Prefer the detail-level block and keep reading any per-version block
+        // for forward compatibility.
+        virtualRanking: virtualRanking ?? (v as { virtual_ranking?: unknown }).virtual_ranking,
+        sortable: versionSortableFromFile(v),
+        formatScore: v.format_score,
+        isCurrentSource: v.file_id === effectiveFileId,
+        isRequestedSource:
+          (v.file_id === pendingSwitchFileId && v.file_id !== effectiveFileId) ||
+          (v.file_id === plan.requested_media_file_id && v.file_id !== effectiveFileId),
+        failed: v.failed,
+        // The catalog's liveness flag, stamped onto the row from the server's
+        // versions/check answer. Surface it so a version the media page hides
+        // as unavailable is not selectable here with no warning.
+        unavailable: v.available === false,
+        // A recent probe rejected the bytes the provider served for this
+        // release. The row stays available and selectable; the badge explains
+        // why a play is retrying the link rather than showing the generic
+        // unavailable copy.
+        sourceMismatch: v.source_mismatch
+          ? {
+              servedBytes: v.source_mismatch.served_bytes,
+              declaredBytes: v.source_mismatch.declared_bytes,
+            }
+          : undefined,
+      })),
+    [versions, virtualRanking, effectiveFileId, plan.requested_media_file_id, pendingSwitchFileId],
   );
 
   // Any stream restart (transcode restart on seek, quality/audio switch,
@@ -5599,6 +5685,8 @@ export function VideoPlayer({
           qualityOptions={qualityOptions}
           activeQualityId={activeQualityId}
           activeQuality={plan.active_quality}
+          deliveredRecipe={plan.effective_recipe}
+          playbackSource={plan.source}
           isTranscoding={replanning}
           qualityError={replanError}
           onQualitySelect={(id) => {
@@ -5610,18 +5698,10 @@ export function VideoPlayer({
             sendBufferingPick((onAdopt) => handleQualitySelect(id, onAdopt));
           }}
           versionLocked={!!watchTogetherRoomId}
-          versions={
-            versions.length > 1
-              ? versions.map((v) => ({
-                  fileId: v.file_id,
-                  label: `${v.resolution} ${v.codec_video.toUpperCase()}${v.hdr ? " HDR" : ""}`,
-                  // The server names the file it actually planned against; a
-                  // fallback to an alternate version shows up here.
-                  isCurrentSource: v.file_id === plan.effective_media_file_id,
-                  isRequestedSource: v.file_id === plan.requested_media_file_id,
-                }))
-              : undefined
-          }
+          // Keep the version block reachable when only indexer releases exist.
+          versions={versions.length > 1 || indexerReleases.length > 0 ? versionStatus : undefined}
+          indexerReleases={indexerReleases}
+          contentId={contentId}
           onSwitchVersion={
             onSwitchVersion && !watchTogetherRoomId
               ? (fileId) => {
@@ -5633,6 +5713,10 @@ export function VideoPlayer({
                 }
               : undefined
           }
+          onSelectAutoVersion={watchTogetherRoomId ? undefined : onSelectAutoVersion}
+          autoFallback={autoFallback}
+          onRefreshVersions={onRefreshVersions}
+          onCancelRefresh={onCancelRefresh}
           playbackSpeed={playbackSpeed}
           onPlaybackSpeedChange={roomPlaybackActive ? undefined : setPlaybackSpeed}
           onTogglePiP={browserEngineActive ? undefined : handleTogglePiP}

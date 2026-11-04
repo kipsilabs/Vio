@@ -266,16 +266,6 @@ describe("QualityMenu version format score", () => {
         makeVersionInfo({ fileId: 2, label: "2160p HEVC" }),
       ],
     });
-    render(
-      createElement(QualityMenu, {
-        options: qualityOptionsFromPlanV3(plan),
-        activeId: "1080p-medium",
-        activeQuality: "1080p-medium",
-        isTranscoding: false,
-        error: null,
-        onSelect: select,
-      }),
-    );
 
     expect(screen.getByText("★ 850")).toBeInTheDocument();
   });

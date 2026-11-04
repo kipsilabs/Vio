@@ -36,6 +36,7 @@ import type {
 } from "../types";
 import type { PlayerTrickplay } from "../trickplay";
 import type { VersionInfo } from "./QualityMenu";
+import type { EffectiveRecipeV3, SourceDescriptorV3 } from "../protocol-v3";
 import type { PlayerConfig } from "../context/PlayerConfigContext";
 import type { SubtitleSync } from "../hooks/useSubtitleSync";
 import { useCoarsePointer } from "../hooks/useCoarsePointer";
@@ -116,6 +117,9 @@ interface PlayerControlsProps {
   activeQualityId: string;
   /** The plan's `active_quality`, the menu entry it delivers. */
   activeQuality?: string;
+  /** Fallback inputs for servers that do not publish `active_quality`. */
+  deliveredRecipe?: EffectiveRecipeV3;
+  playbackSource?: Pick<SourceDescriptorV3, "height" | "bitrate_kbps">;
   isTranscoding: boolean;
   qualityError: string | null;
   onQualitySelect: (id: string) => void;
@@ -209,6 +213,8 @@ export function PlayerControls({
   qualityOptions,
   activeQualityId,
   activeQuality,
+  deliveredRecipe,
+  playbackSource,
   isTranscoding,
   qualityError,
   onQualitySelect,
@@ -420,6 +426,8 @@ export function PlayerControls({
               options={qualityOptions}
               activeId={activeQualityId}
               activeQuality={activeQuality}
+              deliveredRecipe={deliveredRecipe}
+              source={playbackSource}
               isTranscoding={isTranscoding}
               error={qualityError}
               onSelect={onQualitySelect}
@@ -618,6 +626,8 @@ export function PlayerControls({
                 options={qualityOptions}
                 activeId={activeQualityId}
                 activeQuality={activeQuality}
+                deliveredRecipe={deliveredRecipe}
+                source={playbackSource}
                 isTranscoding={isTranscoding}
                 error={qualityError}
                 onSelect={onQualitySelect}

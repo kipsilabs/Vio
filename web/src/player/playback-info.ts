@@ -10,7 +10,7 @@ import {
   mentionsAtmos,
 } from "@/lib/mediaFormat";
 import { videoRangeLabel } from "@/lib/videoRange";
-import type { DeliveryV3, PlanV3 } from "./protocol-v3";
+import type { DeliveryV3, EffectiveRecipeV3, PlanV3, SourceDescriptorV3 } from "./protocol-v3";
 import {
   QUALITY_ORIGINAL_V3,
   normalizeQualityPreferenceV3,
@@ -206,19 +206,120 @@ export function qualityOptionsFromPlanV3(plan: PlanV3): QualityOption[] {
 }
 
 /**
- * The menu entry the current plan delivers. An auto preference, including the
- * legacy source labels, lights Auto. Any other preference lights the entry the
- * server names as the plan's `active_quality`, or none when the plan delivers
- * no entry on this menu, so Auto stays selectable.
+ * The menu entry the current plan delivers. An auto preference lights Auto.
+ * Any other preference lights the entry the server names as the plan's
+ * `active_quality`, or none when the plan delivers no entry on this menu, so
+ * Auto stays selectable.
+ *
+ * `active_quality` is authoritative and is the only path a current server
+ * takes. `delivered` and `source` are a fallback for older bridge servers that
+ * do not publish `active_quality` yet: see `inferActiveQualityOptionId`.
  */
 export function resolveActiveQualityOptionId(
   options: QualityOption[],
   preference: string,
   activeQuality?: string,
+  delivered?: EffectiveRecipeV3,
+  source?: Pick<SourceDescriptorV3, "height" | "bitrate_kbps">,
 ): string | null {
   if (options.length === 0) return null;
   if (normalizeQualityPreferenceV3(preference) === "auto") return "auto";
-  return options.find((option) => option.id === activeQuality)?.id ?? null;
+  // Primary path: the server names the delivered rung.
+  if (activeQuality) {
+    return options.find((option) => option.id === activeQuality)?.id ?? null;
+  }
+  // Fallback path: an older server does not publish `active_quality`. Infer
+  // the lit rung from the delivered recipe and the source it came from. This
+  // never runs when the server names a rung, so there is one source of truth.
+  return inferActiveQualityOptionId(options, preference, delivered, source);
+}
+
+// The server's bitrate ladder classes (bitrateLadder), smallest first.
+const LADDER_CLASS_BOXES = [
+  { width: 854, height: 480 },
+  { width: 960, height: 540 },
+  { width: 1280, height: 720 },
+  { width: 1920, height: 1080 },
+  { width: 3840, height: 2160 },
+] as const;
+
+/**
+ * The ladder class an encoded frame belongs to: the smallest class box that
+ * holds it, as the server's ladderClassForSize decides. A 1280x688 encode is
+ * 720p and a 1920x800 scope encode is 1080p.
+ */
+function ladderClassHeight(width?: number, height?: number): number | null {
+  if (!isPositive(height)) return null;
+  const box = LADDER_CLASS_BOXES.find(
+    (candidate) => height <= candidate.height && (!isPositive(width) || width <= candidate.width),
+  );
+  // A frame larger than every box is in the largest class.
+  return box?.height ?? 2160;
+}
+
+/**
+ * The menu rung that encodes at a ladder class's Medium bitrate. The 540p
+ * class, which a low bitrate cap can choose, has no menu rung.
+ */
+function classMediumRungId(classHeight: number): string | null {
+  switch (classHeight) {
+    case 480:
+      return "480p";
+    case 540:
+      return null;
+    default:
+      return `${classHeight}p-medium`;
+  }
+}
+
+/**
+ * FALLBACK-ONLY recipe inference for plans from servers that do not publish
+ * `active_quality`. A plain 2160p/1080p/720p preference uses the ladder's
+ * Medium bitrate; when that resolution cap is at or above the source, no rung
+ * is lit because the source plays as-is (Auto is the source-preserving choice
+ * on current servers). A reduced delivered bitrate or frame reveals a cap that
+ * forced a lower class.
+ */
+function inferActiveQualityOptionId(
+  options: QualityOption[],
+  preference: string,
+  delivered?: EffectiveRecipeV3,
+  source?: Pick<SourceDescriptorV3, "height" | "bitrate_kbps">,
+): string | null {
+  // No evidence to infer from: the caller has no recipe for this plan, so leave
+  // the menu unlit exactly as a plan without a named entry does today.
+  if (!delivered && !source) return null;
+
+  // A sole rung is effective regardless of the saved preference. Keep the
+  // preference unchanged so it applies again when more qualities are available.
+  if (options.length === 1) return options[0]!.id;
+
+  const normalized = normalizeQualityPreferenceV3(preference).toLowerCase();
+  const exact = options.find((option) => option.id.toLowerCase() === normalized);
+  if (exact) return exact.id;
+
+  const aliasHeight = qualityPreferenceHeight(normalized);
+  if (aliasHeight === null) return null;
+
+  const sourceHeight = source?.height;
+  const sourceKbps = source?.bitrate_kbps;
+  const deliveredKbps = delivered?.bitrate_kbps;
+  const deliveredHeight = delivered?.height;
+  // A smaller delivered frame shows a reduction even when the source bitrate
+  // is unknown.
+  const capped =
+    (isPositive(deliveredKbps) && isPositive(sourceKbps) && deliveredKbps < sourceKbps) ||
+    (isPositive(deliveredHeight) && isPositive(sourceHeight) && deliveredHeight < sourceHeight);
+  // No Original row on this menu (upstream retires it): a source inside the cap
+  // plays as-is, so no rung is lit.
+  if (!capped && isPositive(sourceHeight) && sourceHeight <= aliasHeight) return null;
+
+  // Otherwise the planner encodes at the Medium bitrate of a ladder class: the
+  // preferred one, or a lower one a bitrate cap chose. The delivered frame
+  // names the class; without it, assume the preferred one.
+  const classHeight = ladderClassHeight(delivered?.width, delivered?.height) ?? aliasHeight;
+  const rungId = classMediumRungId(classHeight);
+  return options.find((option) => option.id === rungId)?.id ?? null;
 }
 
 /**
