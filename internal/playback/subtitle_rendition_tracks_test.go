@@ -296,7 +296,11 @@ func TestRecipeCardCarriesOnDemandSubtitleRenditions(t *testing.T) {
 		t.Fatalf("method from the token = %q", fromClaims.PlayMethod)
 	}
 	rebuilt := fromClaims.TranscodeOpts(opts.OutputDir, "", nil)
-	want := []SubtitleRenditionTrack{{StreamIndex: -1, TrackNumber: 3}, {StreamIndex: -1, TrackNumber: 4, Default: true}, {StreamIndex: -1, TrackNumber: 7}}
+	want := []SubtitleRenditionTrack{
+		{StreamIndex: -1, TrackNumber: 3, Name: "English", Language: "eng"},
+		{StreamIndex: -1, TrackNumber: 4, Name: "English (Forced)", Language: "en", Forced: true, Default: true},
+		{StreamIndex: -1, TrackNumber: 7, Name: "Track \"7\""},
+	}
 	if !slices.Equal(rebuilt.SubtitleRenditionTracks, want) || !subtitleRenditionsOnDemand(rebuilt) || rebuilt.SubtitleRenditionSource != testRenditionSource {
 		t.Fatalf("renditions from the token = %+v %+v", rebuilt.SubtitleRenditionTracks, rebuilt.SubtitleRenditionSource)
 	}
@@ -310,7 +314,9 @@ func TestRecipeCardCarriesOnDemandSubtitleRenditions(t *testing.T) {
 	}
 	// A session rebuilt from the token names its renditions by number.
 	master := string(subtitleRenditionMultivariantPlaylist(rebuilt, ""))
-	if !strings.Contains(master, `NAME="Track 4",DEFAULT=YES`) || !strings.Contains(master, "silo_rendition=subtitles&silo_track=7") {
+	if !strings.Contains(master, `NAME="English (Forced)",LANGUAGE="en",DEFAULT=YES`) ||
+		!strings.Contains(master, `FORCED=YES,URI="master.m3u8?silo_rendition=subtitles&silo_track=4"`) ||
+		!strings.Contains(master, "silo_rendition=subtitles&silo_track=7") {
 		t.Fatalf("rebuilt multivariant playlist:\n%s", master)
 	}
 }
