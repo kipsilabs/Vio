@@ -141,7 +141,8 @@ func (s *TranscodeSession) subtitleSegmentPlacementKnown(span subtitleCueSpan, s
 func subtitleRenditionActive(opts TranscodeOpts) bool {
 	return opts.SubtitleRendition && (opts.SubtitleTrackIndex >= 0 || len(opts.SubtitleRenditionTracks) > 0) && !opts.SubtitleBurnIn &&
 		SubtitleRenditionCodecSupported(opts.SubtitleCodec) &&
-		SubtitleRenditionExecutable(opts.TargetCodecVideo, opts.SourceVideoCodec, opts.TotalDuration, opts.SegmentDuration)
+		(SubtitleRenditionExecutable(opts.TargetCodecVideo, opts.SourceVideoCodec, opts.TotalDuration, opts.SegmentDuration) ||
+			(strings.EqualFold(opts.TargetCodecVideo, "copy") && opts.CopyVideoMPEGTS))
 }
 
 const subtitleVideoStartReads = 3
@@ -183,7 +184,6 @@ func appendSubtitleRenditionOutputArgs(args []string, opts TranscodeOpts) []stri
 type subtitleCueSpan struct {
 	file      string
 	start     int
-	startTime float64
 	startTime float64
 	durations []float64
 	final     bool
@@ -333,7 +333,7 @@ func (s *TranscodeSession) SubtitleSegmentVTT(ctx context.Context, segNum int) (
 			}
 		}
 		if !waitable || !time.Now().Before(deadline) {
-			return subtitleSegmentDocument(opts, segNum, subtitleCueWindow{}, nil), nil
+			return nil, ErrSubtitleRenditionNotFound
 		}
 		timer := time.NewTimer(subtitleCuePollInterval)
 		select {
@@ -709,6 +709,15 @@ func (s *TranscodeSession) buildSubtitleRenditionPlaylist(segPrefix, rawQuery st
 	}
 }
 
+func anyDefaultTrack(tracks []SubtitleRenditionTrack) bool {
+	for _, track := range tracks {
+		if track.Default {
+			return true
+		}
+	}
+	return false
+}
+
 // subtitleRenditionMultivariantPlaylist lists the transcode as one variant
 // whose SUBTITLES group holds the selected track. Both URIs are master.m3u8
 // relative to itself, so the playlist works behind every relay path.
@@ -733,8 +742,29 @@ func subtitleRenditionMultivariantPlaylist(opts TranscodeOpts, query string) []b
 	buf.WriteString("#EXTM3U\n")
 	buf.WriteString("#EXT-X-VERSION:3\n")
 	buf.WriteString("#EXT-X-INDEPENDENT-SEGMENTS\n")
-	fmt.Fprintf(&buf, "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=%q,NAME=%q,DEFAULT=YES,AUTOSELECT=YES,FORCED=NO,URI=%q\n",
-		SubtitleRenditionGroupID, SubtitleRenditionName, uri(subtitleRenditionSubtitles))
+	tracks := opts.SubtitleRenditionTracks
+	if len(tracks) == 0 {
+		tracks = []SubtitleRenditionTrack{{Default: true}}
+	}
+	names := make([]string, len(tracks))
+	fallbacks := make([]string, len(tracks))
+	for i, track := range tracks {
+		names[i], fallbacks[i] = track.Name, track.Language
+	}
+	names = SubtitleRenditionNames(names, fallbacks)
+	for i, track := range tracks {
+		name := names[i]
+		language := track.Language
+		if language == "" {
+			language = "und"
+		}
+		trackURI := uri(subtitleRenditionSubtitles)
+		if len(tracks) > 1 {
+			trackURI += "&silo_track=" + strconv.FormatUint(track.TrackNumber, 10)
+		}
+		fmt.Fprintf(&buf, "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=%q,NAME=%q,LANGUAGE=%q,DEFAULT=%s,AUTOSELECT=YES,FORCED=%s,URI=%q\n",
+			SubtitleRenditionGroupID, name, language, map[bool]string{true: "YES", false: "NO"}[track.Default || (i == 0 && !anyDefaultTrack(tracks))], map[bool]string{true: "YES", false: "NO"}[track.Forced], trackURI)
+	}
 	fmt.Fprintf(&buf, "#EXT-X-STREAM-INF:BANDWIDTH=%d,SUBTITLES=%q\n", (videoKbps+audioKbps)*1000, SubtitleRenditionGroupID)
 	buf.WriteString(uri(subtitleRenditionVideo) + "\n")
 	return buf.Bytes()
