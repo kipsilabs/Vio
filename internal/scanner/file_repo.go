@@ -59,6 +59,69 @@ func NewFileRepository(pool *pgxpool.Pool) *FileRepository {
 	return &FileRepository{pool: pool}
 }
 
+// VirtualCandidateDeliveryGrace is the period during which a transport
+// failure is forgiven for a candidate that has delivered successfully.
+const VirtualCandidateDeliveryGrace = 7 * 24 * time.Hour
+
+// MarkVirtualCandidateFailed records a fenced transport failure for a virtual
+// candidate. The identity and health state observed by the caller are both
+// part of the fence, so a late result cannot overwrite a newer candidate or
+// verdict. Recently delivered candidates are given a grace period.
+func (r *FileRepository) MarkVirtualCandidateFailed(ctx context.Context, fileID int, expectedFilePath string, observedFailedAt *time.Time) error {
+	_, err := r.MarkVirtualCandidateFailedDetailed(ctx, fileID, expectedFilePath, observedFailedAt)
+	return err
+}
+
+func (r *FileRepository) MarkVirtualCandidateFailedDetailed(ctx context.Context, fileID int, expectedFilePath string, observedFailedAt *time.Time) (bool, error) {
+	return r.markVirtualCandidateFailedDetailed(ctx, fileID, expectedFilePath, observedFailedAt, true)
+}
+
+func (r *FileRepository) MarkVirtualCandidateDecodeRejected(ctx context.Context, fileID int, expectedFilePath string, observedFailedAt *time.Time) error {
+	_, err := r.markVirtualCandidateFailedDetailed(ctx, fileID, expectedFilePath, observedFailedAt, false)
+	return err
+}
+
+func (r *FileRepository) markVirtualCandidateFailedDetailed(ctx context.Context, fileID int, expectedFilePath string, observedFailedAt *time.Time, applyGrace bool) (bool, error) {
+	query := `UPDATE media_files SET failed_at = NOW(), updated_at = NOW()
+		WHERE id = $1 AND file_path = $2 AND failed_at IS NOT DISTINCT FROM $3
+		  AND (container = 'virtual' OR file_path LIKE 'virtual://%')`
+	args := []any{fileID, expectedFilePath, observedFailedAt}
+	if applyGrace {
+		query += ` AND (last_delivered_at IS NULL OR last_delivered_at < NOW() - ($4 * INTERVAL '1 second'))`
+		args = append(args, VirtualCandidateDeliveryGrace.Seconds())
+	}
+	result, err := r.pool.Exec(ctx, query, args...)
+	if err != nil {
+		return false, fmt.Errorf("mark virtual candidate failed: %w", err)
+	}
+	return result.RowsAffected() != 0, nil
+}
+
+// ClearVirtualCandidateFailed clears a fenced failure stamp on a virtual
+// candidate. A local file, vanished row, or superseded observation is a no-op.
+func (r *FileRepository) ClearVirtualCandidateFailed(ctx context.Context, fileID int, expectedFilePath string, observedFailedAt *time.Time) error {
+	_, err := r.pool.Exec(ctx, `UPDATE media_files SET failed_at = NULL, updated_at = NOW()
+		WHERE id = $1 AND file_path = $2 AND failed_at IS NOT DISTINCT FROM $3
+		  AND (container = 'virtual' OR file_path LIKE 'virtual://%')`, fileID, expectedFilePath, observedFailedAt)
+	if err != nil {
+		return fmt.Errorf("clear virtual candidate failed: %w", err)
+	}
+	return nil
+}
+
+// MarkVirtualCandidateRecovered records delivery evidence and clears the
+// failure atomically, fenced to the candidate and health state delivered.
+func (r *FileRepository) MarkVirtualCandidateRecovered(ctx context.Context, fileID int, deliveredFilePath string, observedFailedAt *time.Time) error {
+	_, err := r.pool.Exec(ctx, `UPDATE media_files
+		SET failed_at = NULL, last_delivered_at = NOW(), updated_at = NOW()
+		WHERE id = $1 AND file_path = $2 AND failed_at IS NOT DISTINCT FROM $3
+		  AND (container = 'virtual' OR file_path LIKE 'virtual://%')`, fileID, deliveredFilePath, observedFailedAt)
+	if err != nil {
+		return fmt.Errorf("mark virtual candidate recovered: %w", err)
+	}
+	return nil
+}
+
 // fileColumns is the list of columns returned by all SELECT queries.
 const fileColumns = `id, content_id, episode_id, extra_id, season_number, episode_number,
 	media_folder_id, canonical_root_path, observed_root_path, content_group_key, group_key_version,
