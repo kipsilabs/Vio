@@ -176,7 +176,7 @@ func (r ExecutableRecipeV3) Valid() bool {
 		(r.Version == executableRecipeVersionCopyMPEGTSV3 && !r.CopyVideoMPEGTS) {
 		return false
 	}
-	if r.SubtitleRendition && (r.PlayMethod != PlayTranscode || r.SubtitleBurnIn || r.SubtitleTransportTrackIndex < 0) {
+	if r.SubtitleRendition && (r.PlayMethod != PlayTranscode || r.SubtitleBurnIn || r.SubtitleTransportTrackIndex < 0 && len(r.SubtitleRenditionTracks) == 0) {
 		return false
 	}
 	hasToneMapField := r.ToneMapPolicy != "" || r.ToneMapMode != "" || r.ToneMapSourceKind != "" || r.ToneMapRecipeVersion != "" || r.ToneMapPreflightRequired || !r.ToneMapSourceRevision.IsZero()

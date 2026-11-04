@@ -22,7 +22,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/lang"
 )
 
-const executableRecipeVersionRenditionTracksV3 = 3
+const executableRecipeVersionRenditionTracksV3 = executableRecipeVersionSubtitleRenditionV3
 
 const maxOnDemandSubtitleRenditions = 64
 
