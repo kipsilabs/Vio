@@ -24,6 +24,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/config"
 	evt "github.com/Silo-Server/silo-server/internal/events"
 	"github.com/Silo-Server/silo-server/internal/httpstream"
+	"github.com/Silo-Server/silo-server/internal/keptsub"
 	"github.com/Silo-Server/silo-server/internal/logredact"
 	"github.com/Silo-Server/silo-server/internal/markers"
 	"github.com/Silo-Server/silo-server/internal/models"
@@ -429,8 +430,15 @@ type PlaybackHandler struct {
 	LifecycleViews   PlaybackLifecycleViews
 	// LiveRowJSON renders a session as the live row a sync would store for
 	// it (worker.SessionSyncRowJSON), for a start announced before a sync.
-	LiveRowJSON     func(*playback.Session) (json.RawMessage, error)
-	MissingMarker   MissingFileMarker
+	LiveRowJSON        func(*playback.Session) (json.RawMessage, error)
+	MissingMarker      MissingFileMarker
+	SubtitleTrackFacts interface {
+		SubtitleTrackFacts(context.Context, *models.MediaFile) playback.SubtitleTrackFactsV3
+	}
+	SubtitlePrefetch interface {
+		SessionStarted(keptsub.PrefetchRequest)
+		SessionEnded(string)
+	}
 	NodePlanner     nodepool.SessionPlanner   // optional; enables proxy/transcode node selection
 	JWTSecret       string                    // needed for signing stream tokens
 	StreamTelemetry *streamtelemetry.Registry // local observation-only telemetry

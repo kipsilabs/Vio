@@ -1669,7 +1669,7 @@ func (snapshot *hlsPlanningSnapshotV3) remuxSubtitleRenditionExecutable() bool {
 // can emit a subtitle rendition: this server, or a pooled transcode node
 // advertising the transport feature for it. Node selection then admits only
 // capable nodes for a plan that carries one (transcodeEligibilityV3).
-func (h *PlaybackHandler) hlsSubtitleRenditionExecutableV3(ctx context.Context, proxyAllowed bool, playMethod playback.PlayMethod) bool {
+func (h *PlaybackHandler) hlsSubtitleRenditionExecutableV3(ctx context.Context, proxyAllowed bool, playMethod playback.PlayMethod, legacy ...bool) bool {
 	workload, feature := noderouting.WorkloadVideoTranscode, playback.TransportFeatureHLSSubtitleRenditionV1
 	if playMethod == playback.PlayRemux {
 		workload, feature = noderouting.WorkloadRemux, playback.TransportFeatureHLSRemuxSubtitleRenditionV1
@@ -11665,6 +11665,10 @@ func sameStringMultisetV3(left, right []string) bool {
 // those are the point of the replan and are delivered by the independently
 // addressed sidecar artifact. Every field that can change FFmpeg's audio/video
 // output remains part of the comparison.
+func sidecarOnlyHLSReplanV3(record *playback.AttemptRecordV3, candidate *playback.PlanV3, candidateRecipe playback.ExecutableRecipeV3, outputContextID string) (playback.ExecutableRecipeV3, bool) {
+	return sidecarOnlyReuseReplanV3(record, candidate, candidateRecipe, outputContextID)
+}
+
 func sidecarOnlyReuseReplanV3(record *playback.AttemptRecordV3, candidate *playback.PlanV3, candidateRecipe playback.ExecutableRecipeV3, outputContextID string) (playback.ExecutableRecipeV3, bool) {
 	if record == nil || candidate == nil || record.CurrentPlan.Stream.URL == "" ||
 		!record.FrozenRecipe.ValidFor(record.CurrentPlan) || !candidateRecipe.ValidFor(*candidate) ||
