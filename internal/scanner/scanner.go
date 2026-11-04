@@ -420,6 +420,12 @@ func cleanScopedAudiobookScanRoot(path string) (string, error) {
 	return clean, nil
 }
 
+// probeVersion is the current shape version of probe-derived columns. It is
+// written on every probe; rows probed under an older shape (e.g. audio tracks
+// without a languages array) fail needsCriticalProbeRepairScanState and are
+// re-probed once.
+const probeVersion = 1
+
 // walkMode tells walkLogicalTree which file extensions to surface and
 // which library-specific filename heuristics (sample/extra skipping)
 // to apply.
@@ -3642,6 +3648,9 @@ func needsCriticalProbeRepairScanState(file *scanStateFile) bool {
 		return true
 	}
 	if file.DVProvenanceCurrent != nil && !*file.DVProvenanceCurrent {
+		return true
+	}
+	if file.ProbeVersion < probeVersion {
 		return true
 	}
 	if strings.TrimSpace(file.ProbeSource) == "" || file.ProbeUpdatedAt == nil {
