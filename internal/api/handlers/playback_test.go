@@ -318,6 +318,7 @@ func (failingSessionManager) UpdateAudioTrack(string, int, playback.PlayMethod) 
 func (failingSessionManager) UpdateStreamState(string, playback.SessionStreamState) error {
 	return nil
 }
+func (failingSessionManager) MarkPlanCommitted(string) error { return nil }
 
 func (failingSessionManager) TouchActivity(string) error { return nil }
 
