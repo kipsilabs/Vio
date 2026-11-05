@@ -276,6 +276,17 @@ func fromHumaError(requestID string, status int, msg string, errs []error, bodyL
 	t := humaStatusType(status, msg)
 	p := NewProblem(t, humaDetail(t, msg, bodyLimit))
 	p.Instance = requestInstance(requestID)
+	// Huma converts handler errors into its status error before the response
+	// transformer sees them. Preserve the original error as an out-of-band
+	// cause so request observation can still log it; never serialize it.
+	if status >= http.StatusInternalServerError {
+		for _, err := range errs {
+			if err != nil {
+				p.withCause(err)
+				break
+			}
+		}
+	}
 	if status != http.StatusUnprocessableEntity && status != http.StatusBadRequest {
 		// Only validation-shaped failures carry field details; a 406 or 413
 		// has nothing field-level to say and Huma's message would leak.
@@ -488,6 +499,12 @@ func installErrorAdapter() {
 		if ctx != nil {
 			requestID = requestIDFrom(ctx.Context())
 			limit = operationBodyLimit(ctx.Operation())
+		}
+		for _, err := range errs {
+			if err != nil {
+				noteOperationError(ctx.Context(), err)
+				break
+			}
 		}
 		return fromHumaError(requestID, status, msg, errs, limit)
 	}

@@ -141,8 +141,14 @@ func noteOperationError(ctx context.Context, err error) {
 	if err == nil {
 		return
 	}
-	if o := observationFrom(ctx); o != nil && o.operationError == nil {
-		o.operationError = err
+	if o := observationFrom(ctx); o != nil {
+		if p, ok := o.operationError.(*Problem); ok && p.cause != nil {
+			o.operationError = p.cause
+			return
+		}
+		if o.operationError == nil {
+			o.operationError = err
+		}
 	}
 }
 
