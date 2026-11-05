@@ -6068,11 +6068,13 @@ type TMDBDiscoverAdapter struct {
 
 type tmdbDiscoverAdapter = TMDBDiscoverAdapter
 
-// NewTMDBDiscoverAdapter creates a TMDBDiscoverAdapter from an API key.
+// NewTMDBDiscoverAdapter adapts client to catalog.TMDBDiscoverFetcher and
+// catalog.TMDBDigitalReleaseChecker. Callers pass the process-wide TMDB client
+// so discover syncs and release gating share its caches and rate budget.
 // Exported so main.go can wire it before background tasks start.
-func NewTMDBDiscoverAdapter(apiKey string) *TMDBDiscoverAdapter {
+func NewTMDBDiscoverAdapter(client *tmdb.Client) *TMDBDiscoverAdapter {
 	return &TMDBDiscoverAdapter{
-		client: tmdb.NewClient(apiKey, 40),
+		client: client,
 	}
 }
 

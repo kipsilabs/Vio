@@ -119,6 +119,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/proxy"
 	"github.com/Silo-Server/silo-server/internal/ratelimit"
 	"github.com/Silo-Server/silo-server/internal/recommendations"
+	"github.com/Silo-Server/silo-server/internal/remotestream"
 	mediarequests "github.com/Silo-Server/silo-server/internal/requests"
 	"github.com/Silo-Server/silo-server/internal/requests/discoverrows"
 	"github.com/Silo-Server/silo-server/internal/s3client"
@@ -146,6 +147,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/userdb"
 	"github.com/Silo-Server/silo-server/internal/userstore"
 	"github.com/Silo-Server/silo-server/internal/userstore/pgstore"
+	virtuallibrary "github.com/Silo-Server/silo-server/internal/virtuallibrary"
 	"github.com/Silo-Server/silo-server/internal/watchlist"
 	"github.com/Silo-Server/silo-server/internal/watchstate"
 	"github.com/Silo-Server/silo-server/internal/watchsync"
@@ -1808,6 +1810,9 @@ func main() {
 	var pluginRuntimeConfigStore *plugins.RuntimeConfigStore
 	var refreshMarkerProviders func(context.Context) error
 	var pluginHTTPProxy *plugins.HTTPProxy
+	var virtualRegistrar *catalog.VirtualMediaRegistrar
+	var vlSvc *virtuallibrary.Service
+	vlActive := false
 	pluginAutoUpdateDone := make(chan struct{})
 	var pluginAutoUpdater *plugins.AutoUpdateService
 	// Network access providers: ingress tokens issued per plugin start and the
@@ -1823,6 +1828,7 @@ func main() {
 		}
 		repositoryStore := plugins.NewRepositoryStore(deps.DB)
 		installationStore := plugins.NewInstallationStore(deps.DB)
+		virtualRegistrar = catalog.NewVirtualMediaRegistrar(deps.DB)
 		runtimeConfigStore := plugins.NewRuntimeConfigStore(deps.DB, deps.SecretCipher)
 		// This process is the api host: its resident plugins keep their
 		// per-instance state (overlay node keys) under the "api" scope.
@@ -3152,8 +3158,140 @@ func main() {
 		libraryItemRepo := catalog.NewLibraryItemRepository(deps.DB)
 		collectionService := catalog.NewLibraryCollectionService(collectionRepo, collItemRepo, libraryItemRepo, nil)
 		collectionService.TMDBCollections = api.NewTMDBCollectionFetcher(tmdbClient)
+		discoverAdapter := api.NewTMDBDiscoverAdapter(tmdbClient)
 		deps.CollectionService = collectionService
 		collectionSyncScheduler = catalog.NewCollectionSyncScheduler(collectionRepo, collectionService, slog.Default())
+
+		if virtualRegistrar != nil {
+			virtualRegistrar.TMDBDigitalReleases = discoverAdapter
+			virtualRegistrar.EpisodeReleaseDates = discoverAdapter
+		}
+		// Virtual library core service. Boot order:
+		// migrate -> validate -> activate. Migration never overwrites
+		// existing core settings; failure keeps the core service
+		// unavailable (explicit, no silent fallback).
+		vlActive = false
+		var vlCfg virtuallibrary.Config
+		vlSvc, vlCfg = virtualLibraryStartup{
+			Settings: settingsRepo,
+			Installations: virtuallibrary.InstallationListerFunc(func(ctx context.Context, pluginID string) ([]*virtuallibrary.PluginInstallation, error) {
+				if pluginInstallationStore == nil {
+					return nil, nil
+				}
+				rows, err := pluginInstallationStore.ListByPluginID(ctx, pluginID)
+				if err != nil {
+					return nil, err
+				}
+				out := make([]*virtuallibrary.PluginInstallation, 0, len(rows))
+				for _, r := range rows {
+					if r == nil {
+						continue
+					}
+					out = append(out, &virtuallibrary.PluginInstallation{ID: r.ID, PluginID: r.PluginID, Enabled: r.Enabled})
+				}
+				return out, nil
+			}),
+			Configs: virtuallibrary.PluginConfigReaderFunc(func(ctx context.Context, installationID int, key string) (map[string]any, error) {
+				if pluginRuntimeConfigStore == nil {
+					return nil, nil
+				}
+				rows, err := pluginRuntimeConfigStore.ListGlobalConfigs(ctx, installationID)
+				if err != nil {
+					return nil, err
+				}
+				for _, r := range rows {
+					if r != nil && r.Key == key {
+						return r.Value, nil
+					}
+				}
+				return nil, nil
+			}),
+			Registrar:   virtualRegistrar,
+			Metadata:    metadataService,
+			Collections: collectionService,
+			Deps:        &deps,
+		}.start(ctx)
+		if vlSvc != nil {
+			vlActive = true
+			go func(svc *virtuallibrary.Service) {
+				probeCtx, cancel := context.WithTimeout(appCtx, 5*time.Second)
+				defer cancel()
+				if err := svc.CheckRemote(probeCtx); err != nil {
+					slog.Warn("virtual library provider initial remote probe failed (will retry on playback)", "error", err)
+				} else {
+					slog.Info("virtual library provider remote manifest verified")
+				}
+			}(vlSvc)
+
+			// Monitor timer: Run is bounded work (see monitor/doc.go); the
+			// caller drives repetition with a per-pass deadline. Refresh
+			// interval from settings; shutdown via appCtx.
+			vlMonitor := vlSvc.Monitor
+			vlInterval := time.Duration(vlCfg.ScheduleRefreshMinutes) * time.Minute
+			if vlInterval <= 0 {
+				vlInterval = 6 * time.Hour
+			}
+			vlDone := make(chan struct{})
+			registerShutdownWork(vlDone)
+			go func() {
+				defer close(vlDone)
+				// drainMonitorPasses runs bounded passes back-to-back until a
+				// pass completes a full cycle (or makes no progress). Each pass
+				// persists its cursor, so a large library drains in one tick
+				// instead of waiting a whole refresh interval between passes.
+				// A pass that exhausts its deadline is normal: it returns a
+				// successful response with budget_exhausted set.
+				drainMonitorPasses := func() {
+					for {
+						if appCtx.Err() != nil {
+							return
+						}
+						passCtx, cancel := context.WithTimeout(appCtx, 2*time.Minute)
+						resp, runErr := vlMonitor.Run(passCtx, &virtuallibrary.RunTask{TaskKey: "monitor-media"})
+						cancel()
+						if runErr != nil {
+							slog.Warn("virtual library monitor pass failed", "error", runErr)
+							return
+						}
+						if resp == nil {
+							return
+						}
+						budgetExhausted, _ := resp.Output["budget_exhausted"].(bool)
+						processed, _ := resp.Output["processed"].(int)
+						if !budgetExhausted || processed == 0 {
+							// Full cycle done, or a pass too short to make any
+							// progress: stop draining to avoid a hot loop and
+							// let the next tick try again.
+							return
+						}
+					}
+				}
+				// Initial run after brief delay (10s) so server finishes startup first
+				select {
+				case <-appCtx.Done():
+					return
+				case <-time.After(10 * time.Second):
+					drainMonitorPasses()
+				}
+
+				ticker := time.NewTicker(vlInterval)
+				defer ticker.Stop()
+				var running atomic.Bool
+				for {
+					select {
+					case <-appCtx.Done():
+						return
+					case <-ticker.C:
+						if !running.CompareAndSwap(false, true) {
+							slog.Warn("virtual library monitor pass skipped: prior pass still running")
+							continue
+						}
+						drainMonitorPasses()
+						running.Store(false)
+					}
+				}
+			}()
+		}
 
 		// The trending refresher reuses the section repo (to find used source/
 		// window combos beyond the calendar's fixed feed), a snapshot repo, an
@@ -3468,6 +3606,10 @@ func main() {
 		if refreshWorker != nil && metadataService != nil {
 			taskMgr.Register(tasks.NewRefreshMetadataTask(refreshWorker, metadataService))
 		}
+		if itemRepo != nil {
+			taskMgr.Register(tasks.NewReconcileVirtualEpisodesTask(itemRepo))
+			taskMgr.Register(tasks.NewCleanupLegacyCollectionClaimsTask(itemRepo))
+		}
 		if metadataService != nil {
 			taskMgr.Register(tasks.NewBulkMetadataEnrichmentTask(metadataService, pool))
 		}
@@ -3573,7 +3715,7 @@ func main() {
 		if metadataService != nil {
 			requestReconcileSvc.SetTVDBIDResolver(metadataService)
 		}
-		api.AttachRequestRouter(requestReconcileSvc, pluginService)
+		api.AttachRequestRouter(requestReconcileSvc, pluginService, vlSvc)
 		requestReconcileSvc.SetGroupPolicyProvider(accessGroupStore)
 		if userStoreProvider != nil {
 			userRepo := auth.NewUserRepository(deps.DB)
@@ -3835,6 +3977,14 @@ func main() {
 		}
 	}
 
+	// The router builds the asynchronous virtual candidates refresh executor
+	// from services it composes; main owns the admin job runner (started after
+	// the router), so the executor is handed back here for installation.
+	var virtualRefreshExecutor adminjob.VirtualCandidatesRefreshExecutor
+	deps.OnVirtualRefreshExecutor = func(executor adminjob.VirtualCandidatesRefreshExecutor) {
+		virtualRefreshExecutor = executor
+	}
+
 	router := api.NewRouter(deps)
 
 	// Step 8: Build the handler the primary port serves — the API router and
@@ -3920,11 +4070,40 @@ func main() {
 			templateBundleApplyExecutor,
 			deps.RealtimeHub,
 		)
+		adminJobRunner.SetVirtualRefreshExecutor(virtualRefreshExecutor)
 		adminJobRunner.SetCancelRegistry(adminJobCancelRegistry)
 		adminJobRunner.SetStorageTransitionExecutor(storageTransitionSvc)
 		adminJobRunner.SetStorageTransitionCommitted(deps.RequestServerRestart)
+		// The identity backfill is a one-shot resumable pass over legacy
+		// virtual rows. It is only meaningful when the core virtual library is
+		// active, and it owns the same admin-job runner as every other
+		// background pass.
+		var virtualIdentityBackfill *handlers.VirtualIdentityBackfillExecutor
+		if deps.VirtualLibraryService != nil && deps.FileRepo != nil {
+			virtualIdentityBackfill = &handlers.VirtualIdentityBackfillExecutor{
+				Lister: deps.VirtualLibraryService.ListStreams,
+				Store:  deps.FileRepo,
+				Jobs:   adminjob.NewRepository(deps.DB),
+				Logger: slog.Default(),
+			}
+			adminJobRunner.SetVirtualIdentityBackfillExecutor(virtualIdentityBackfill)
+		}
 		adminJobRunner.Start()
 		defer adminJobRunner.Stop()
+
+		// Queue the one-shot backfill after the runner is live. A job that has
+		// already finished (completed or canceled) is the one-shot gate; rows
+		// it could not match stay legacy and are not re-listed on every
+		// restart. A server with no admin account has no job owner and is
+		// skipped.
+		if virtualIdentityBackfill != nil {
+			var ownerUserID int
+			if err := deps.DB.QueryRow(appCtx, `SELECT COALESCE((SELECT id FROM users WHERE role = 'admin' AND enabled IS TRUE ORDER BY id ASC LIMIT 1), 0)`).Scan(&ownerUserID); err != nil {
+				slog.Warn("virtual identity backfill: resolve job owner failed", "error", err)
+			} else if err := virtualIdentityBackfill.EnsureBackfillJob(appCtx, ownerUserID); err != nil {
+				slog.Warn("virtual identity backfill: queue failed", "error", err)
+			}
+		}
 
 		// Start recommendation worker if enabled (reuse worker created above).
 		if recWorker != nil {
@@ -3985,6 +4164,128 @@ func main() {
 			// The native limiter itself, so budgets, reloads, and counters
 			// are shared with the native API. Nil when rate limiting is off.
 			RateLimit: deps.RateLimitMW,
+		}
+		if vlActive && vlSvc != nil {
+			virtualRelay := remotestream.NewRelay()
+			compatDeps.RemoteStreamRelay = virtualRelay
+			go func() {
+				<-appCtx.Done()
+				closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if err := virtualRelay.Close(closeCtx); err != nil {
+					slog.Warn("close jellycompat virtual stream relay", "error", err)
+				}
+			}()
+
+			// Virtual playback resolves exclusively through the core virtual
+			// library: the virtual-library plugin is retired, so every virtual
+			// URI — including rows left over from plugin ownership — resolves
+			// by path through core.
+			compatDeps.VirtualMediaResolver = jellycompat.VirtualMediaResolverFunc(func(ctx context.Context, path string, ownerInstallationID, userID int, profileID string) (string, error) {
+				return vlSvc.Resolve(ctx, path)
+			})
+			compatDeps.VirtualMediaRefreshResolver = jellycompat.VirtualMediaRefreshResolverFunc(func(ctx context.Context, path string, ownerInstallationID, userID int, profileID string) (string, error) {
+				return vlSvc.Refresh(ctx, path)
+			})
+			compatDeps.VirtualMediaDetailedResolver = jellycompat.VirtualMediaDetailedResolverFunc(func(ctx context.Context, path string, ownerInstallationID int, userID int, profileID string, forceRefresh bool, excludedCandidateIDs []string, preferredCandidateID string) (jellycompat.ResolvedVirtualMedia, error) {
+				// Jellyfin-compat only excludes a candidate for a dead-provider
+				// failover, so an exclusion is an explicit rotation request.
+				res, err := vlSvc.ResolveDetailed(ctx, path, forceRefresh, excludedCandidateIDs, preferredCandidateID, len(excludedCandidateIDs) > 0)
+				if err != nil {
+					return jellycompat.ResolvedVirtualMedia{}, err
+				}
+				return jellycompat.ResolvedVirtualMedia{
+					URL:                 res.URL,
+					URI:                 res.URI,
+					CandidateID:         res.CandidateID,
+					RequestHeaders:      res.RequestHeaders,
+					ExpiresAt:           res.ExpiresAt,
+					ProviderVideoHash:   res.ProviderVideoHash,
+					ProviderGUID:        res.ProviderGUID,
+					ProviderReleaseName: res.ProviderReleaseName,
+					ProviderReleaseSize: res.ProviderReleaseSize,
+				}, nil
+			})
+			compatDeps.VirtualPlaybackStreamLister = jellycompat.VirtualPlaybackStreamListerFunc(func(ctx context.Context, path string, userID int, profileID string, ownerInstallationID int) ([]jellycompat.VirtualPlaybackStream, error) {
+				streams, err := vlSvc.ListStreams(ctx, path)
+				if err != nil {
+					return nil, err
+				}
+				out := make([]jellycompat.VirtualPlaybackStream, 0, len(streams))
+				for _, stream := range streams {
+					out = append(out, jellycompat.VirtualPlaybackStream{
+						URI:                 stream.URI,
+						Label:               stream.Label,
+						Resolution:          stream.Resolution,
+						CodecVideo:          stream.CodecVideo,
+						CodecAudio:          stream.CodecAudio,
+						HDR:                 stream.HDR,
+						Container:           stream.Container,
+						FileSize:            stream.FileSize,
+						Bitrate:             stream.Bitrate,
+						AudioLanguages:      stream.AudioLanguages,
+						SubtitleLanguages:   stream.SubtitleLanguages,
+						OwnerInstallationID: stream.OwnerInstallationID,
+					})
+				}
+				return out, nil
+			})
+			compatDeps.AllowInsecureVirtual = func(installationID int) bool {
+				// HTTP-manifest posture for virtual traffic comes solely from
+				// the core virtual_library.allow_insecure_http opt-in:
+				// resolution is core-only, so per-installation plugin config
+				// no longer applies.
+				return plugins.CoreVirtualInsecureAllowed(context.Background())
+			}
+			compatDeps.AllowPrivateStreams = func(installationID int) bool {
+				// Private stream destination posture comes solely from the
+				// core virtual_library.allow_private_streams opt-in.
+				return plugins.CoreVirtualPrivateStreamsAllowed(context.Background())
+			}
+			ffprobePath := scanner.FFprobePathFromFFmpeg(cfg.Playback.FFmpegPath)
+			virtualProbeCache := scanner.NewVirtualProbeCache(10*time.Minute, 256)
+			compatVirtualSourceProberWithHeaders := func(ctx context.Context, sourceURL string, file *models.MediaFile, headers map[string]string) (*models.MediaFile, error) {
+				return virtualProbeCache.Probe(ctx, sourceURL, file, func(probeCtx context.Context, probeURL string, probeFile *models.MediaFile) (*models.MediaFile, error) {
+					var relayURL string
+					var cleanup func()
+					var err error
+					insecure := plugins.CoreVirtualPrivateStreamsAllowed(probeCtx)
+					if insecure {
+						relayURL, cleanup, err = virtualRelay.RegisterInsecureWithHeaders(probeCtx, probeURL, headers)
+					} else {
+						relayURL, cleanup, err = virtualRelay.RegisterWithHeaders(probeCtx, probeURL, headers)
+					}
+					if err != nil {
+						return probeFile, err
+					}
+					defer cleanup()
+					return scanner.ProbeVirtualSource(probeCtx, ffprobePath, cfg.Playback.FFmpegPath, relayURL, probeFile, func(dvCtx context.Context, input string) bool {
+						return playback.DVRPUStrippable(dvCtx, cfg.Playback.FFmpegPath, input)
+					})
+				})
+			}
+			compatDeps.VirtualSourceProberWithHeaders = compatVirtualSourceProberWithHeaders
+			compatDeps.VirtualSourceProber = func(ctx context.Context, sourceURL string, file *models.MediaFile) (*models.MediaFile, error) {
+				return compatVirtualSourceProberWithHeaders(ctx, sourceURL, file, nil)
+			}
+			compatAdoptionRefusalStore := scanner.NewFileRepository(deps.DB)
+			compatDeps.VirtualFileSaver = func(ctx context.Context, args models.VirtualFilePersistArgs) (int64, error) {
+				if deps.DB == nil {
+					return 0, nil
+				}
+				return handlers.ExecVirtualFileMetadataUpdateWithRefusals(ctx, deps.DB, args, compatAdoptionRefusalStore)
+			}
+			compatDeps.VirtualFileMetadataSaver = func(ctx context.Context, args models.VirtualFilePersistArgs) (jellycompat.VirtualFileMetadataUpdateResult, error) {
+				if deps.DB == nil {
+					return jellycompat.VirtualFileMetadataUpdateResult{}, nil
+				}
+				result, err := handlers.ExecVirtualFileMetadataUpdateResultWithRefusals(ctx, deps.DB, args, compatAdoptionRefusalStore)
+				return jellycompat.VirtualFileMetadataUpdateResult{
+					RowsAffected:    result.RowsAffected,
+					MetadataUpdated: result.MetadataUpdated,
+					IdentityAdopted: result.IdentityAdopted,
+				}, err
+			}
 		}
 
 		// Wire direct dependencies when DB is available.
@@ -4061,6 +4362,13 @@ func main() {
 
 			if deps.FileRepo != nil {
 				compatDeps.FileResolver = deps.FileRepo
+				compatDeps.VirtualCandidateFileLookup = func(ctx context.Context, path, contentID, episodeID string, ownerInstallationID int) (*models.MediaFile, error) {
+					file, err := deps.FileRepo.GetVirtualCandidateByNeutralPath(ctx, path, contentID, episodeID, ownerInstallationID)
+					if err != nil && errors.Is(err, scanner.ErrFileNotFound) {
+						return nil, jellycompat.ErrVirtualCandidateNotFound
+					}
+					return file, err
+				}
 				compatDeps.MediaSourceOwners = deps.FileRepo
 			}
 			compatDeps.Downloads = compatDownloads
