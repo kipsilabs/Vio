@@ -103,6 +103,8 @@ type Service struct {
 	tvdbResolver            TVDBIDResolver
 	seriesSeasonProvider    SeriesSeasonProvider
 	hasDefaultVirtualRouter func() bool
+	catalogChanged          func()
+	cleanupVirtual          func(context.Context, Request) error
 	// enrichAsync schedules deferred enrichment; tests replace it to control execution.
 	enrichAsync       func(func())
 	notifier          FulfillmentNotifier
@@ -169,6 +171,14 @@ func isVirtualIntegration(installationID *int, capabilityID string) bool {
 func (s *Service) SetRouterProvider(p RequestRouterProvider) { s.router = p }
 
 func (s *Service) SetDefaultVirtualRouter(enabled func() bool) { s.hasDefaultVirtualRouter = enabled }
+
+// SetCatalogChangeNotifier installs the cache/event hook used when a request router may register media during fulfillment.
+func (s *Service) SetCatalogChangeNotifier(notify func()) { s.catalogChanged = notify }
+
+// SetVirtualMediaCleanup installs the cleanup hook used when a pending virtual request is canceled.
+func (s *Service) SetVirtualMediaCleanup(cleanup func(context.Context, Request) error) {
+	s.cleanupVirtual = cleanup
+}
 
 func (s *Service) SetEntitlementResolver(r EntitlementResolver) { s.entitlements = r }
 
@@ -650,6 +660,15 @@ func (s *Service) Search(ctx context.Context, viewer Viewer, query string, media
 // request-state signals used by search and discovery. Recommendations carry
 // their own per-item state so the detail page can render them as request cards.
 func (s *Service) GetDetail(ctx context.Context, viewer Viewer, mediaType MediaType, tmdbID int) (*MediaDetail, error) {
+	return s.getDetail(ctx, viewer, mediaType, tmdbID, "")
+}
+
+// GetDetailWithSeasonSource selects the season numbering source explicitly.
+func (s *Service) GetDetailWithSeasonSource(ctx context.Context, viewer Viewer, mediaType MediaType, tmdbID int, seasonSource string) (*MediaDetail, error) {
+	return s.getDetail(ctx, viewer, mediaType, tmdbID, seasonSource)
+}
+
+func (s *Service) getDetail(ctx context.Context, viewer Viewer, mediaType MediaType, tmdbID int, preferredSeasonSource string) (*MediaDetail, error) {
 	if s == nil || s.store == nil || s.tmdb == nil {
 		return nil, fmt.Errorf("request service is not configured")
 	}
@@ -722,7 +741,7 @@ func (s *Service) GetDetail(ctx context.Context, viewer Viewer, mediaType MediaT
 	available := primaryMatch.Available
 	var seasons []RequestSeason
 	if mediaType == MediaTypeSeries {
-		seasonList, _, fromTVDB, seasonListAvailable, err := s.seriesSeasonSource(ctx, raw, 0, "")
+		seasonList, _, fromTVDB, seasonListAvailable, err := s.seriesSeasonSource(ctx, raw, 0, preferredSeasonSource)
 		if err != nil {
 			return nil, err
 		}
@@ -1114,7 +1133,7 @@ func (s *Service) attachLibraryContent(ctx context.Context, reqs ...*Request) er
 			}
 			for _, req := range requestsByKey[requestKey{mediaType: mediaType, tmdbID: tmdbID}] {
 				req.LibraryContentID = match.ContentID
-				if req.MediaType == MediaTypeSeries && len(req.Seasons) > 0 {
+				if req.MediaType == MediaTypeSeries && len(req.Seasons) > 0 && requestSeasonCountsCompatible(req.SeasonSource, match) {
 					seasonRequests[match.ContentID] = append(seasonRequests[match.ContentID], req)
 				}
 			}
@@ -1251,6 +1270,11 @@ func (s *Service) cancel(ctx context.Context, viewer Viewer, id, reason string, 
 	withdrawn, err := s.store.SetOutcome(ctx, req.ID, guard, OutcomeCancelled, viewer, reason)
 	if err != nil {
 		return nil, err
+	}
+	if s.cleanupVirtual != nil {
+		if err := s.cleanupVirtual(ctx, *withdrawn); err != nil {
+			slog.WarnContext(ctx, "requests: canceled virtual media cleanup failed", "request_id", req.ID, "error", err)
+		}
 	}
 	return withdrawn, nil
 }
@@ -2405,6 +2429,9 @@ func (s *Service) submitClaimed(ctx context.Context, req Request, actor Viewer, 
 	if err != nil {
 		return nil, err
 	}
+	if s.catalogChanged != nil {
+		s.catalogChanged()
+	}
 	if len(targets) == 0 {
 		if msg == "" {
 			msg = "fulfillment backend created no targets"
@@ -2509,6 +2536,9 @@ func (s *Service) submitRouted(ctx context.Context, req Request, actor Viewer, f
 			failures[q] = msg
 		}
 		targets = append(targets, tier...)
+	}
+	if s.catalogChanged != nil {
+		s.catalogChanged()
 	}
 	return s.recordTargets(ctx, req, actor, plan, targets, connKind, decisions, failures)
 }
@@ -2961,7 +2991,7 @@ func (s *Service) presentRequests(ctx context.Context, reqs []*Request) (map[str
 				continue
 			}
 			out[req.ID] = false
-			if match.Available && match.ContentID != "" {
+			if match.Available && match.ContentID != "" && requestSeasonCountsCompatible(req.SeasonSource, match) {
 				seasonRequests[match.ContentID] = append(seasonRequests[match.ContentID], req)
 			}
 		}
