@@ -2719,6 +2719,12 @@ func sourceClassLadderRungV3(classHeight int) (ladderRungV3, bool) {
 // lower HDR rung performs the executor capability lookup during the replan;
 // building the menu itself never probes local or pooled executors.
 func availableQualitiesForRouteV3(input PlannerInputV3, source SourceDescriptorV3) []AvailableQualityV3 {
+	if lowerVersionServesQualitiesV3(input) {
+		// An HDR source playing through a lower version still describes that
+		// version's menu, including the plain resolution entry that plays it
+		// unchanged; the HDR-specific list belongs to the source route.
+		return lowerVersionQualitiesV3(input)
+	}
 	qualities := []AvailableQualityV3{{
 		Label:           QualityOriginalV3,
 		Height:          source.Height,
