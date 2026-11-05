@@ -42,7 +42,11 @@ const (
 // errCollectionImageSourceNotAllowed is the one answer for an image URL on
 // the server's own network or in a blocked range. Every refused address gets
 // it unchanged, so the answer says nothing about what listens there.
-var errCollectionImageSourceNotAllowed = errors.New("the image URL must be a public internet address")
+var errCollectionImageSourceNotAllowed = &APIError{
+	Status:  http.StatusBadRequest,
+	Code:    "bad_request",
+	Message: "the image URL must be a public internet address",
+}
 
 // newCollectionImageClient returns the client collection artwork downloads
 // use. Its netguard transport checks every address it dials, redirect hops

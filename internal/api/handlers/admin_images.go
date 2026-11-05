@@ -445,6 +445,13 @@ func (h *AdminImageHandler) applyItemImage(ctx context.Context, contentID string
 		return AdminItemImageResult{}, apiError(http.StatusBadRequest, "unsupported_image_type",
 			fmt.Sprintf("%s items do not accept %s images", resolved.contentType, metadata.ImageTypeToString(imageType)))
 	}
+	// The apply ruling narrows a season to its poster: a season's backdrop is
+	// owned by the provider sync (the series carries the user-facing backdrop),
+	// so selecting one here would be stored where no client reads it.
+	if resolved.contentType == "season" && imageType != metadata.ImagePoster {
+		return AdminItemImageResult{}, apiError(http.StatusBadRequest, "unsupported_image_type",
+			"season items accept poster images only")
+	}
 	var result *metadata.ApplyItemImageResult
 	switch {
 	case allowLocal && metadata.IsLocalImageSource(req.OriginalURL):

@@ -1503,6 +1503,13 @@ func normalizeLibraryPaths(paths []string) ([]string, error) {
 		if path == "" {
 			return nil, fieldError("paths", "Library paths must not be blank")
 		}
+		// filepath.Clean collapses "//" in a scheme, but virtual roots are
+		// opaque provider URIs: the scanner and rootcheck match on the
+		// "virtual://" prefix, so trimming is the only normalization allowed.
+		if strings.HasPrefix(strings.ToLower(path), "virtual://") {
+			normalized[i] = path
+			continue
+		}
 		normalized[i] = filepath.Clean(path)
 	}
 	return normalized, nil
