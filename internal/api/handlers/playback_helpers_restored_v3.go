@@ -716,6 +716,7 @@ func (h *PlaybackHandler) evaluateReplanCandidateV3(
 	plannerSettings playback.PlannerSettingsV3,
 	plannerSettingsErr error,
 	attemptedKeys []string,
+	lowerVersion *playback.LowerVersionV3,
 ) (*candidateEvaluationV3, *candidateV3Error) {
 	if candidateAlternate == nil {
 		return nil, &candidateV3Error{Stage: candidateStageResolve, Message: "nil candidate alternate"}
@@ -727,7 +728,7 @@ func (h *PlaybackHandler) evaluateReplanCandidateV3(
 		}
 		return nil, &candidateV3Error{Stage: candidateStageResolve, Message: fmt.Sprintf("candidate %d resolution failed", candidateAlternate.ID), Err: err}
 	}
-	return h.evaluatePreparedReplanCandidateV3(r, session, record, req, baseStart, sourceFile, candidateFile, candidateProvenance, plannerRequestedFile, plannerSettings, plannerSettingsErr, attemptedKeys, false)
+	return h.evaluatePreparedReplanCandidateV3(r, session, record, req, baseStart, sourceFile, candidateFile, candidateProvenance, plannerRequestedFile, plannerSettings, plannerSettingsErr, attemptedKeys, false, lowerVersion)
 }
 
 func (h *PlaybackHandler) evaluatePreparedReplanCandidateV3( //nolint:funlen // evaluatePreparedReplanCandidateV3 exceeds Vio's 100-line limit; refactor tracked separately
@@ -744,6 +745,7 @@ func (h *PlaybackHandler) evaluatePreparedReplanCandidateV3( //nolint:funlen // 
 	plannerSettingsErr error,
 	attemptedKeys []string,
 	planOnly bool,
+	lowerVersion *playback.LowerVersionV3,
 ) (*candidateEvaluationV3, *candidateV3Error) {
 	candidateStart := baseStart
 	// A carried selection was minted against the plan-time inventory. Use the
@@ -797,6 +799,7 @@ func (h *PlaybackHandler) evaluatePreparedReplanCandidateV3( //nolint:funlen // 
 		}
 		candidateResult, candidateToneMapErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{
 			Request: candidateStart, RequestedFile: plannerRequestedFile, EffectiveFile: candidateFile,
+			LowerVersion:    lowerVersionForFileV3(lowerVersion, candidateFile),
 			AudioTrackIndex: candidateAudioIndex, Settings: plannerSettings, Registry: h.transformationRegistryV3(r.Context()),
 			DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), candidateFile), Now: time.Now(),
 			AttemptedKeys: attemptedKeys, AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), candidateFile),
@@ -898,9 +901,10 @@ func (h *PlaybackHandler) evaluateSubtitleDegradedCandidateV3(
 	plannerSettings playback.PlannerSettingsV3,
 	plannerSettingsErr error,
 	attemptedKeys []string,
+	lowerVersion *playback.LowerVersionV3,
 ) (*candidateEvaluationV3, *candidateV3Error) {
 	degradedStart := subtitleDegradedStartV3(baseStart)
-	eval, evalErr := h.evaluateReplanCandidateV3(r, session, record, req, degradedStart, sourceFile, candidateAlternate, plannerRequestedFile, plannerSettings, plannerSettingsErr, attemptedKeys)
+	eval, evalErr := h.evaluateReplanCandidateV3(r, session, record, req, degradedStart, sourceFile, candidateAlternate, plannerRequestedFile, plannerSettings, plannerSettingsErr, attemptedKeys, lowerVersion)
 	if eval != nil {
 		annotateSubtitleDroppedV3(&eval.result)
 	}
@@ -924,7 +928,7 @@ func (h *PlaybackHandler) evaluateSubtitleDegradeInPlaceV3(
 		return nil, &candidateV3Error{Stage: candidateStageResolve, Message: "nil same-release subtitle degrade target"}
 	}
 	degradedStart := subtitleDegradedStartV3(baseStart)
-	eval, evalErr := h.evaluatePreparedReplanCandidateV3(r, session, record, req, degradedStart, file, file, provenance, plannerRequestedFile, plannerSettings, plannerSettingsErr, attemptedKeys, true)
+	eval, evalErr := h.evaluatePreparedReplanCandidateV3(r, session, record, req, degradedStart, file, file, provenance, plannerRequestedFile, plannerSettings, plannerSettingsErr, attemptedKeys, true, nil)
 	if evalErr != nil || eval == nil || eval.result.Terminal != nil || eval.result.Plan == nil {
 		return eval, evalErr
 	}
@@ -961,7 +965,25 @@ func (h *PlaybackHandler) replanRemapSourceV3(ctx context.Context, effectiveFile
 	if effectiveFile == nil {
 		return carriedInventorySourceV3{}
 	}
-	return h.rekeySourceFileWithInventoryV3(ctx, effectiveFile.ID, session, durable)
+	// Remapping needs the inventory the carried ordinal was minted against,
+	// not the inventory serving would accept. Captured evidence is that
+	// inventory even when it names a different candidate or the session has no
+	// live row id; anchor the re-key on the effective row so its evidence path
+	// is used instead of the reloaded row's current tracks.
+	rekeySession := session
+	if session != nil && session.VirtualSubtitleEvidenceSet && isVirtualPlaybackFile(effectiveFile) {
+		copied := *session
+		copied.MediaFileID = effectiveFile.ID
+		copied.VirtualSubtitleEvidenceFileID = effectiveFile.ID
+		rekeySession = &copied
+	}
+	carry := h.rekeySourceFileWithInventoryV3(ctx, effectiveFile.ID, rekeySession, durable)
+	if carry.file == nil {
+		// No evidence and no catalog row to load: the loaded row is still the
+		// only description available.
+		carry.file = effectiveFile
+	}
+	return carry
 }
 
 func sameMediaInventoryV3(a, b *models.MediaFile) bool {
