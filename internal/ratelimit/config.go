@@ -7,7 +7,12 @@ import (
 	"strconv"
 )
 
-const globalRequestsPerSecondSetting = "ratelimit.global.requests_per_second"
+const (
+	globalRequestsPerSecondSetting = "ratelimit.global.requests_per_second"
+	sessionModeSetting             = "ratelimit.session.mode"
+	sessionRequestsPerHourSetting  = "ratelimit.session.requests_per_hour"
+	sessionBurstSetting            = "ratelimit.session.burst"
+)
 
 // SettingsStore is the interface for reading/writing server_settings.
 // Satisfied by *catalog.ServerSettingsRepo.
@@ -54,6 +59,11 @@ func ConfigFromSettings(all map[string]string) Config {
 	cfg.IPReqPerSecond = parseRate(all, "ratelimit.ip.requests_per_second", defaults.IPReqPerSecond, MaxRequestsPerWindow)
 	cfg.IPReqPerMinute = parseRate(all, "ratelimit.ip.requests_per_minute", defaults.IPReqPerMinute, MaxRequestsPerWindow)
 	cfg.IPBurst = parseInt(all, "ratelimit.ip.burst", defaults.IPBurst)
+	cfg.Session = SessionQuotaConfig{
+		Mode:            parseSessionMode(all, defaults.Session.Mode),
+		RequestsPerHour: parseRate(all, sessionRequestsPerHourSetting, defaults.Session.RequestsPerHour, MaxRequestsPerWindow),
+		Burst:           parseInt(all, sessionBurstSetting, defaults.Session.Burst),
+	}
 
 	cfg.AuthEndpoints = make(map[string]AuthEndpointConfig)
 	for name, ep := range defaults.AuthEndpoints {
@@ -86,6 +96,9 @@ func SeedDefaults(ctx context.Context, store SettingsStore) error {
 		"ratelimit.ip.requests_per_second":                   "120",
 		"ratelimit.ip.requests_per_minute":                   "6000",
 		"ratelimit.ip.burst":                                 "120",
+		sessionModeSetting:                                   SessionQuotaLog,
+		sessionRequestsPerHourSetting:                        "10000",
+		sessionBurstSetting:                                  "30000",
 		"ratelimit.auth.login.requests_per_minute":           "20",
 		"ratelimit.auth.login.burst":                         "10",
 		"ratelimit.auth.signup.requests_per_minute":          "10",
@@ -142,6 +155,9 @@ func ConfigSettings(cfg Config) map[string]string {
 		pairs[prefix+"requests_per_minute"] = strconv.FormatFloat(ep.RequestsPerMinute, 'f', -1, 64)
 		pairs[prefix+"burst"] = strconv.Itoa(ep.Burst)
 	}
+	pairs[sessionModeSetting] = cfg.Session.Mode
+	pairs[sessionRequestsPerHourSetting] = strconv.FormatFloat(cfg.Session.RequestsPerHour, 'f', -1, 64)
+	pairs[sessionBurstSetting] = strconv.Itoa(cfg.Session.Burst)
 	return pairs
 }
 
@@ -183,6 +199,21 @@ func parseRate(m map[string]string, key string, def, maxValue float64) float64 {
 		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 && f <= maxValue {
 			return f
 		}
+	}
+	return def
+}
+
+func ValidSessionQuotaMode(mode string) bool {
+	switch mode {
+	case SessionQuotaOff, SessionQuotaLog, SessionQuotaEnforce:
+		return true
+	}
+	return false
+}
+
+func parseSessionMode(m map[string]string, def string) string {
+	if v := m[sessionModeSetting]; ValidSessionQuotaMode(v) {
+		return v
 	}
 	return def
 }

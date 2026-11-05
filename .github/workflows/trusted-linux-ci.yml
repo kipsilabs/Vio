@@ -142,6 +142,8 @@ jobs:
           fi
       - name: Check workflows and shell
         run: make verify-actionlint verify-shellcheck
+      - name: Test image packaging scripts
+        run: sh scripts/tests/intel-qsv-runtime.sh
       - name: Check action SHA pins
         shell: bash
         run: |
@@ -652,7 +654,7 @@ jobs:
       - *libvips-restore
       - *libvips-install
 
-      # The image docker-compose.yml runs: the schema needs pgvector.
+      # The image dev/compose.yml runs: the schema needs pgvector.
       - name: Start Postgres
         run: docker run -d --rm --cidfile "$RUNNER_TEMP/pg" -p 5432:5432 --tmpfs /var/lib/postgresql -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=silo_test pgvector/pgvector:pg18 > "$RUNNER_TEMP/pg.log" 2>&1 &
 
@@ -675,6 +677,79 @@ jobs:
 
       - name: Migrate the test database
         run: DATABASE_URL="$SILO_TEST_DATABASE_URL" go run ./scripts/ci/migrate/ --migrate-only
+
+      # The backup tests in db-contracts.txt run pg_dump and pg_restore, which
+      # must be at least the server's major version, and the hosted runner's
+      # client is older than the pg18 server above. The backup package picks
+      # the newest major under /usr/lib/postgresql, so the older client can
+      # stay on PATH. apt reads only the Ubuntu sources and PGDG, whose key is
+      # checked against its published fingerprint and trusted for that source
+      # alone. The packages are cached per runner image, as libvips's are.
+      - name: Read the PostgreSQL client cache key
+        if: runner.environment == 'github-hosted'
+        id: pg-client-cache-key
+        shell: bash
+        run: echo "key=postgresql-client-18-${ImageOS:?}-${ImageVersion:?}-${RUNNER_ARCH}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the PostgreSQL client packages
+        if: runner.environment == 'github-hosted'
+        id: pg-client-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/pg-client-debs/*.deb
+          key: ${{ steps.pg-client-cache-key.outputs.key }}
+
+      - name: Install the PostgreSQL 18 client
+        shell: bash
+        run: |
+          pg_dump=/usr/lib/postgresql/18/bin/pg_dump
+          if "$pg_dump" --version 2>/dev/null; then
+            exit 0
+          fi
+          test -f /etc/apt/sources.list.d/ubuntu.sources
+          apt_options=(
+            -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources
+            -o Dir::Etc::sourceparts=/etc/apt/pgdg.sources.d
+          )
+          if [ "$RUNNER_ENVIRONMENT" = github-hosted ]; then
+            mkdir -p "$RUNNER_TEMP/pg-client-debs"
+            apt_options+=(-o "Dir::Cache::archives=$RUNNER_TEMP/pg-client-debs")
+            debs=("$RUNNER_TEMP"/pg-client-debs/*.deb)
+            if [ -e "${debs[0]}" ]; then
+              echo "apt-get install cached"
+              if sudo apt-get "${apt_options[@]}" install -y --no-install-recommends --no-download "${debs[@]}"; then
+                "$pg_dump" --version
+                exit 0
+              fi
+            fi
+          fi
+          key="$RUNNER_TEMP/pgdg.asc"
+          curl -fsSL --retry 3 -o "$key" https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          # apt trusts every key in the file, so it must hold exactly one
+          # primary key, PGDG's. A key's fpr record follows its pub or sub
+          # record; only the pub ones are primary keys.
+          fingerprints="$(gpg --show-keys --with-colons "$key" | awk -F: '$1 == "pub" { primary = 1 } $1 == "fpr" { if (primary) print $10; primary = 0 }')"
+          if [ "$fingerprints" != B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8 ]; then
+            echo "::error::The PGDG key file holds primary keys '${fingerprints//$'\n'/ }', not only the published one"
+            exit 1
+          fi
+          sudo install -D -m 0644 "$key" /etc/apt/keyrings/pgdg.asc
+          codename="$(. /etc/os-release && echo "$VERSION_CODENAME")"
+          printf '%s\n' 'Types: deb' 'URIs: https://apt.postgresql.org/pub/repos/apt' \
+            "Suites: ${codename}-pgdg" 'Components: main' 'Signed-By: /etc/apt/keyrings/pgdg.asc' \
+            | sudo install -D -m 0644 /dev/stdin /etc/apt/pgdg.sources.d/pgdg.sources
+          echo "apt-get update"
+          sudo apt-get "${apt_options[@]}" update
+          echo "apt-get install"
+          sudo apt-get "${apt_options[@]}" install -y --no-install-recommends postgresql-client-18
+          "$pg_dump" --version
+
+      - name: Save the PostgreSQL client packages
+        if: runner.environment == 'github-hosted' && github.event_name != 'pull_request' && steps.pg-client-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/pg-client-debs/*.deb
+          key: ${{ steps.pg-client-cache.outputs.cache-primary-key }}
 
       - name: Run the query-budget pins
         run: make test-db-pins
@@ -782,7 +857,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 22
+          node-version: 24
           cache: ${{ runner.environment == 'github-hosted' && 'pnpm' || '' }}
           package-manager-cache: ${{ runner.environment == 'github-hosted' }}
           cache-dependency-path: web/pnpm-lock.yaml
@@ -842,36 +917,12 @@ jobs:
       #   run: pnpm exec knip
       # Not measured; needs a prototype defining entrypoints and public consumers.
 
-      - name: Restore the TypeScript cache
-        if: matrix.part == 'build' && runner.environment == 'github-hosted' && github.event_name == 'pull_request'
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ runner.temp }}/silo-tsc
-          key: tsc-${{ runner.os }}-${{ github.sha }}
-          restore-keys: tsc-${{ runner.os }}-
-
-      - name: Restore and save the TypeScript cache
-        if: matrix.part == 'build' && runner.environment == 'github-hosted' && github.event_name != 'pull_request'
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ runner.temp }}/silo-tsc
-          key: tsc-${{ runner.os }}-${{ github.sha }}
-          restore-keys: tsc-${{ runner.os }}-
-
       - name: Typecheck and build
         if: matrix.part == 'build'
         run: |
-          cache_dir="$RUNNER_TEMP/silo-tsc"
-          mkdir -p "$cache_dir"
-          # -p --incremental reuses content checks after checkout resets mtimes; tsc -b rechecks.
-          pnpm exec tsc -p tsconfig.app.json --incremental --tsBuildInfoFile "$cache_dir/app.tsbuildinfo" &
-          app_pid=$!
-          pnpm exec tsc -p tsconfig.node.json --incremental --tsBuildInfoFile "$cache_dir/node.tsbuildinfo" &
-          node_pid=$!
           failed=0
+          pnpm exec tsrs -b || { echo "::error::Typecheck failed"; failed=1; }
           pnpm exec vite build || { echo "::error::Vite build failed"; failed=1; }
-          wait "$app_pid" || { echo "::error::App typecheck failed"; failed=1; }
-          wait "$node_pid" || { echo "::error::Node typecheck failed"; failed=1; }
           exit "$failed"
 
       # Reports the launch bundle size, and fails when the React vendor chunk
@@ -937,7 +988,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 22
+          node-version: 24
           cache: ${{ runner.environment == 'github-hosted' && 'pnpm' || '' }}
           package-manager-cache: ${{ runner.environment == 'github-hosted' }}
           cache-dependency-path: web/pnpm-lock.yaml

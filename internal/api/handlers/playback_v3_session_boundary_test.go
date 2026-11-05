@@ -120,7 +120,7 @@ func TestStartPlaybackV3ConcurrentReplayRejectsForeignPlanSession(t *testing.T) 
 	// A stored terminal publishes no plan, so it replays unchanged rather than
 	// being turned into the foreign-session refusal.
 	terminalRecord := original
-	terminalRecord.StartResponse = playback.NewTerminalResponseV3("source_unavailable", "The provider listed no streams for this title.", true)
+	terminalRecord.StartResponse = playback.NewTerminalResponseV3(sourceUnavailableReason, "The provider listed no streams for this title.", true)
 	memoryStore.ReplaceAttempt(context.Background(), terminalRecord)
 	terminal := start()
 	if terminal.Code != http.StatusCreated {
@@ -130,7 +130,7 @@ func TestStartPlaybackV3ConcurrentReplayRejectsForeignPlanSession(t *testing.T) 
 	if err := json.Unmarshal(terminal.Body.Bytes(), &terminalResponse); err != nil {
 		t.Fatal(err)
 	}
-	if terminalResponse.Terminal == nil || terminalResponse.Terminal.Reason != "source_unavailable" {
+	if terminalResponse.Terminal == nil || terminalResponse.Terminal.Reason != sourceUnavailableReason {
 		t.Fatalf("terminal collision replay = %#v, want the stored terminal replay", terminalResponse)
 	}
 }
@@ -162,7 +162,7 @@ func TestStartPlaybackV3TerminalSaveCollisionRejectsForeignPlanSession(t *testin
 		},
 	}
 	handler := seedTerminalSaveCollisionStore(t, record)
-	terminal := playback.NewTerminalResponseV3("source_unavailable", "The provider listed no streams for this title.", true)
+	terminal := playback.NewTerminalResponseV3(sourceUnavailableReason, "The provider listed no streams for this title.", true)
 	response, err := handler.persistTerminalStartDecisionV3(
 		newAuthorizedPlaybackContext(), 1, "profile-1", startRequest,
 		playbackStartRequestDigestsV3{current: "digest-terminal-collision"}, 42, 42, terminal,
@@ -279,7 +279,7 @@ func TestCompletedReplanResponseMatchesAttemptV3RequiresSessionOwnership(t *test
 		return encoded
 	}
 	terminal := func(sessionID string) playback.DecisionResponseV3 {
-		response := playback.NewTerminalResponseV3("source_unavailable", "The provider listed no streams for this title.", true)
+		response := playback.NewTerminalResponseV3(sourceUnavailableReason, "The provider listed no streams for this title.", true)
 		response.SessionID = sessionID
 		return response
 	}

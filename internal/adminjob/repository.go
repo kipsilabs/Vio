@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"time"
 
@@ -38,6 +39,16 @@ var (
 	ErrJobNotCancellable                 = errors.New("admin job is not cancellable")
 	ErrStorageTransitionAlreadyCommitted = errors.New("storage transition already committed")
 )
+
+// cancellableJobTypes are the job types RequestCancellation accepts. Every v2
+// job resource that reports such a job as cancelable accepts its cancellation.
+var cancellableJobTypes = []string{JobTypeLibraryRefresh, JobTypeStorageTransition, JobTypeVirtualCandidatesRefresh, JobTypeVirtualIdentityBackfill, JobTypeImageCacheCleanup}
+
+// IsCancellableJobType reports whether jobs of this type accept cancellation
+// while queued or running.
+func IsCancellableJobType(jobType string) bool {
+	return slices.Contains(cancellableJobTypes, jobType)
+}
 
 type ActiveJobConflictError struct {
 	Job *models.AdminJob
@@ -963,21 +974,6 @@ func (r *Repository) withClaim(job *models.AdminJob) *Repository {
 	return &Repository{pool: r.pool, claim: new(job.ClaimGeneration)}
 }
 
-// cancellableJobTypes are the managed background job kinds the cancellation
-// command accepts. Each has a runner path that observes CancelRequested and a
-// durable terminal transition, so setting the intent is enough for a queued job
-// and a running one alike.
-var cancellableJobTypes = []string{JobTypeLibraryRefresh, JobTypeStorageTransition, JobTypeVirtualCandidatesRefresh, JobTypeVirtualIdentityBackfill, JobTypeImageCacheCleanup}
-
-func isCancellableJobType(jobType string) bool {
-	for _, candidate := range cancellableJobTypes {
-		if jobType == candidate {
-			return true
-		}
-	}
-	return false
-}
-
 // RequestCancellation durably coalesces intent. A queued job is still claimed by
 // the ordinary runner, which acknowledges cancellation without executing it.
 func (r *Repository) RequestCancellation(ctx context.Context, id string) (*models.AdminJob, error) {
@@ -995,7 +991,7 @@ func (r *Repository) RequestCancellation(ctx context.Context, id string) (*model
 	if err != nil {
 		return nil, err
 	}
-	if isCancellableJobType(job.JobType) && job.Status == StatusCancelled {
+	if IsCancellableJobType(job.JobType) && job.Status == StatusCancelled {
 		return job, nil
 	}
 	return nil, ErrJobNotCancellable

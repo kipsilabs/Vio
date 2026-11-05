@@ -124,6 +124,121 @@ func (a nextUpAnchor) newerThan(b nextUpAnchor) bool {
 	return a.ContentID > b.ContentID
 }
 
+// nextUpMaxEpisodeNumber sorts before every real episode, so a successor
+// lookup anchored there starts at the series' first regular episode.
+const nextUpMaxEpisodeNumber = 2147483647
+
+// nextUpSpecialAnchor moves a special anchor onto the series' regular seasons.
+// Season 0 sorts before season 1 and specials carry no airing position, so a
+// watched special would otherwise offer only the next special. The anchor moves
+// to the profile's most recent completed regular episode, or, when it has
+// finished none, to just before the first regular season. A series of specials
+// alone keeps stepping through them.
+//
+// effective is the anchor to look up the successor after. moved reports that
+// the anchor left the special. anchoredAt is the regular completion it stands
+// on, zero when the profile has finished no regular episode. seriesInProgress
+// and specialInProgress are the newest in-progress timestamps of each kind.
+type nextUpSpecialAnchor struct {
+	effective         nextUpAnchor
+	moved             bool
+	anchoredAt        time.Time
+	seriesInProgress  time.Time
+	specialInProgress time.Time
+}
+
+func adjustNextUpSpecialAnchor(
+	candidate nextUpAnchor,
+	seriesEpisodes map[string]nextUpEpisode,
+	entries []userstore.NextUpStateEntry,
+) nextUpSpecialAnchor {
+	adjustment := nextUpSpecialAnchor{effective: candidate}
+	hasRegularSeason := false
+	for _, episode := range seriesEpisodes {
+		if episode.SeasonNumber > 0 {
+			hasRegularSeason = true
+			break
+		}
+	}
+	if candidate.SeasonNumber != 0 || !hasRegularSeason {
+		return adjustment
+	}
+
+	adjustment.moved = true
+	var best nextUpEpisode
+	var bestAt time.Time
+	haveBest := false
+	for _, entry := range entries {
+		episode, ok := seriesEpisodes[entry.MediaItemID]
+		if !ok {
+			continue
+		}
+		switch {
+		case entry.Completed && episode.SeasonNumber > 0:
+			if !haveBest || entry.UpdatedAt.After(bestAt) ||
+				(entry.UpdatedAt.Equal(bestAt) && episodeAfter(episode, best)) {
+				best, bestAt, haveBest = episode, entry.UpdatedAt, true
+			}
+		case !entry.Completed && entry.Position > 0 && episode.SeasonNumber > 0:
+			if entry.UpdatedAt.After(adjustment.seriesInProgress) {
+				adjustment.seriesInProgress = entry.UpdatedAt
+			}
+		case !entry.Completed && entry.Position > 0:
+			if entry.UpdatedAt.After(adjustment.specialInProgress) {
+				adjustment.specialInProgress = entry.UpdatedAt
+			}
+		}
+	}
+
+	if haveBest {
+		adjustment.anchoredAt = bestAt
+		adjustment.effective = nextUpAnchor{nextUpEpisode: best, UpdatedAt: bestAt}
+		return adjustment
+	}
+	adjustment.effective = nextUpAnchor{
+		nextUpEpisode: nextUpEpisode{
+			SeriesID:      candidate.SeriesID,
+			SeriesTitle:   candidate.SeriesTitle,
+			SeasonNumber:  0,
+			EpisodeNumber: nextUpMaxEpisodeNumber,
+		},
+		UpdatedAt: candidate.UpdatedAt,
+	}
+	return adjustment
+}
+
+// episodeAfter orders two episodes by airing position, then content id.
+func episodeAfter(a, b nextUpEpisode) bool {
+	if a.SeasonNumber != b.SeasonNumber {
+		return a.SeasonNumber > b.SeasonNumber
+	}
+	if a.EpisodeNumber != b.EpisodeNumber {
+		return a.EpisodeNumber > b.EpisodeNumber
+	}
+	return a.ContentID > b.ContentID
+}
+
+// nextUpInProgressGate reports whether in-progress activity should keep the
+// candidate out of the completed-next list when resumable rows are disabled.
+// A moved anchor measures regular in-progress activity against the regular
+// completion it stands on, so an episode watched before that completion no
+// longer holds the series back; an unfinished special always does.
+func (adjustment nextUpSpecialAnchor) inProgressBlocks(candidate nextUpAnchor) bool {
+	if !adjustment.moved {
+		return false
+	}
+	if !adjustment.specialInProgress.IsZero() && adjustment.specialInProgress.After(candidate.UpdatedAt) {
+		return true
+	}
+	if adjustment.seriesInProgress.IsZero() {
+		return false
+	}
+	if adjustment.anchoredAt.IsZero() {
+		return true
+	}
+	return adjustment.seriesInProgress.After(adjustment.anchoredAt)
+}
+
 // ListNextUp returns the next unwatched episode per series for the given user.
 //
 // The profile's progress lives only behind the user store, never in the
@@ -180,6 +295,33 @@ func (r *NextUpRepository) ListNextUp(ctx context.Context, q NextUpQuery) ([]Nex
 		return nil, err
 	}
 
+	for i := range results {
+		if results[i].ActivityAt.IsZero() {
+			results[i].ActivityAt = results[i].CompletedAt
+		}
+	}
+	if q.RankByRelease {
+		// Only the ranked candidates are lifted by release time; a series
+		// finished behind them keeps its completion-time place, so every limit
+		// reads a prefix of one order. The ranked set never depends on the
+		// limit, so paging by raising it sees no row twice.
+		ranked := results
+		if len(ranked) > nextUpRankedCandidates {
+			ranked = ranked[:nextUpRankedCandidates]
+		}
+		if err := r.applyNextUpReleaseActivity(ctx, q, ranked); err != nil {
+			return nil, err
+		}
+		sortNextUpByActivity(ranked)
+	}
+
+	// The completed-next rows are the ones the limit bounds. Trim them before
+	// the resumable branch adds its rows: an in-progress series fills a slot
+	// the completed walk left empty, it does not evict a completed row.
+	if q.SeriesID == "" && len(results) > limit {
+		results = results[:limit]
+	}
+
 	if q.EnableResumable {
 		resumable, rErr := r.listResumableEpisodes(ctx, q, store, stateStore, anchors)
 		if rErr != nil {
@@ -199,24 +341,12 @@ func (r *NextUpRepository) ListNextUp(ctx context.Context, q NextUpQuery) ([]Nex
 		}
 		for _, res := range resumable {
 			if !seen[res.SeriesID] {
+				if res.ActivityAt.IsZero() {
+					res.ActivityAt = res.CompletedAt
+				}
 				results = append(results, res)
 			}
 		}
-	}
-
-	for i := range results {
-		if results[i].ActivityAt.IsZero() {
-			results[i].ActivityAt = results[i].CompletedAt
-		}
-	}
-	if q.RankByRelease {
-		if err := r.applyNextUpReleaseActivity(ctx, q, results); err != nil {
-			return nil, err
-		}
-		sortNextUpByActivity(results)
-	}
-	if q.SeriesID == "" && len(results) > limit {
-		results = results[:limit]
 	}
 
 	return results, nil
@@ -514,11 +644,39 @@ func (r *NextUpRepository) listNextUpForSeries(
 		return nil, anchors, nil
 	}
 	anchors[anchor.SeriesID] = anchor
-	if !q.EnableResumable && haveInProgress && inProgressMax.After(anchor.UpdatedAt) {
+	effectiveAnchor := anchor
+	gated := haveInProgress && inProgressMax.After(anchor.UpdatedAt)
+	if anchor.SeasonNumber == 0 {
+		// A watched special continues the regular seasons from the profile's
+		// most recent regular completion, so the successor comes from the
+		// moved anchor and the in-progress gate measures regular episodes
+		// against that completion instead.
+		seriesEpisodes, metaErr := r.nextUpSeriesEpisodeMeta(ctx, []string{anchor.SeriesID})
+		if metaErr != nil {
+			return nil, nil, metaErr
+		}
+		episodeIDs := make([]string, 0, len(seriesEpisodes))
+		for id := range seriesEpisodes {
+			episodeIDs = append(episodeIDs, id)
+		}
+		entries, stateErr := stateStore.ListNextUpStateForItems(ctx, q.ProfileID, episodeIDs)
+		if stateErr != nil {
+			return nil, nil, stateErr
+		}
+		for _, entry := range entries {
+			stateIDs[entry.MediaItemID] = struct{}{}
+		}
+		adjustment := adjustNextUpSpecialAnchor(anchor, seriesEpisodes, entries)
+		if adjustment.moved {
+			effectiveAnchor = adjustment.effective
+			gated = adjustment.inProgressBlocks(anchor)
+		}
+	}
+	if !q.EnableResumable && gated {
 		return nil, anchors, nil
 	}
 
-	successors, err := r.lookupNextUpSuccessors(ctx, []nextUpAnchor{anchor}, stateIDs)
+	successors, err := r.lookupNextUpSuccessors(ctx, []nextUpAnchor{effectiveAnchor}, stateIDs)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -540,9 +698,9 @@ const nextUpResolveBatchSize = 32
 // timestamp. It is cached across page iterations, so a candidate is resolved at
 // most once per ListNextUp call.
 type nextUpCandidateResolution struct {
-	successor     nextUpEpisode
-	hasSuccessor  bool
-	inProgressMax time.Time
+	successor        nextUpEpisode
+	hasSuccessor     bool
+	inProgressBlocks bool
 }
 
 // nextUpResolver resolves candidate series against exact item-scoped state.
@@ -601,7 +759,7 @@ func (res *nextUpResolver) resolve(ctx context.Context, anchors map[string]nextU
 			// When resumable items are disabled, a series with in-progress
 			// activity newer than its newest completion is mid-watch; surfacing
 			// the episode after the completion would skip past the position.
-			if !res.q.EnableResumable && !resolution.inProgressMax.IsZero() && resolution.inProgressMax.After(candidate.UpdatedAt) {
+			if !res.q.EnableResumable && resolution.inProgressBlocks {
 				continue
 			}
 			if !resolution.hasSuccessor {
@@ -617,45 +775,116 @@ func (res *nextUpResolver) resolve(ctx context.Context, anchors map[string]nextU
 // catalog query and one store query, then resolves their successors in one
 // more catalog query.
 func (res *nextUpResolver) resolveBatch(ctx context.Context, candidates []nextUpAnchor) error {
-	episodeToSeries, err := res.repo.nextUpPostAnchorEpisodes(ctx, candidates)
-	if err != nil {
-		return err
-	}
-	episodeIDs := make([]string, 0, len(episodeToSeries))
-	for episodeID := range episodeToSeries {
-		episodeIDs = append(episodeIDs, episodeID)
-	}
-
-	entries, err := res.stateStore.ListNextUpStateForItems(ctx, res.q.ProfileID, episodeIDs)
-	if err != nil {
-		return err
-	}
-
-	stateIDs := make(map[string]struct{}, len(entries))
-	inProgressMax := make(map[string]time.Time)
-	for _, entry := range entries {
-		seriesID, ok := episodeToSeries[entry.MediaItemID]
-		if !ok {
+	var regular, special []nextUpAnchor
+	for _, candidate := range candidates {
+		if candidate.SeasonNumber == 0 {
+			special = append(special, candidate)
 			continue
 		}
-		stateIDs[entry.MediaItemID] = struct{}{}
-		if !entry.Completed && entry.Position > 0 {
-			if current, ok := inProgressMax[seriesID]; !ok || entry.UpdatedAt.After(current) {
-				inProgressMax[seriesID] = entry.UpdatedAt
+		regular = append(regular, candidate)
+	}
+
+	effective := make([]nextUpAnchor, 0, len(candidates))
+	stateIDs := make(map[string]struct{})
+	inProgressBlocks := make(map[string]bool, len(candidates))
+
+	if len(regular) > 0 { //nolint:nestif // resolveBatch exceeds Vio's nestif complexity-4 limit; refactor tracked separately
+		episodeToSeries, err := res.repo.nextUpPostAnchorEpisodes(ctx, regular)
+		if err != nil {
+			return err
+		}
+		episodeIDs := make([]string, 0, len(episodeToSeries))
+		for episodeID := range episodeToSeries {
+			episodeIDs = append(episodeIDs, episodeID)
+		}
+
+		entries, err := res.stateStore.ListNextUpStateForItems(ctx, res.q.ProfileID, episodeIDs)
+		if err != nil {
+			return err
+		}
+
+		inProgressMax := make(map[string]time.Time)
+		for _, entry := range entries {
+			seriesID, ok := episodeToSeries[entry.MediaItemID]
+			if !ok {
+				continue
+			}
+			stateIDs[entry.MediaItemID] = struct{}{}
+			if !entry.Completed && entry.Position > 0 {
+				if current, ok := inProgressMax[seriesID]; !ok || entry.UpdatedAt.After(current) {
+					inProgressMax[seriesID] = entry.UpdatedAt
+				}
+			}
+		}
+		for _, candidate := range regular {
+			effective = append(effective, candidate)
+			if at, ok := inProgressMax[candidate.SeriesID]; ok && at.After(candidate.UpdatedAt) {
+				inProgressBlocks[candidate.SeriesID] = true
 			}
 		}
 	}
 
-	successors, err := res.repo.lookupNextUpSuccessors(ctx, candidates, stateIDs)
+	if len(special) > 0 { //nolint:nestif // resolveBatch exceeds Vio's nestif complexity-4 limit; refactor tracked separately
+		seriesIDs := make([]string, len(special))
+		for i, candidate := range special {
+			seriesIDs[i] = candidate.SeriesID
+		}
+		seriesEpisodes, err := res.repo.nextUpSeriesEpisodeMeta(ctx, seriesIDs)
+		if err != nil {
+			return err
+		}
+		episodeIDs := make([]string, 0, len(seriesEpisodes))
+		for episodeID := range seriesEpisodes {
+			episodeIDs = append(episodeIDs, episodeID)
+		}
+		entries, err := res.stateStore.ListNextUpStateForItems(ctx, res.q.ProfileID, episodeIDs)
+		if err != nil {
+			return err
+		}
+
+		bySeries := make(map[string][]userstore.NextUpStateEntry, len(special))
+		for _, entry := range entries {
+			episode, ok := seriesEpisodes[entry.MediaItemID]
+			if !ok {
+				continue
+			}
+			stateIDs[entry.MediaItemID] = struct{}{}
+			bySeries[episode.SeriesID] = append(bySeries[episode.SeriesID], entry)
+		}
+		episodesBySeries := make(map[string]map[string]nextUpEpisode, len(special))
+		for id, episode := range seriesEpisodes {
+			episodes, ok := episodesBySeries[episode.SeriesID]
+			if !ok {
+				episodes = make(map[string]nextUpEpisode)
+				episodesBySeries[episode.SeriesID] = episodes
+			}
+			episodes[id] = episode
+		}
+		for _, candidate := range special {
+			adjustment := adjustNextUpSpecialAnchor(candidate, episodesBySeries[candidate.SeriesID], bySeries[candidate.SeriesID])
+			effective = append(effective, adjustment.effective)
+			if adjustment.moved {
+				inProgressBlocks[candidate.SeriesID] = adjustment.inProgressBlocks(candidate)
+				continue
+			}
+			// A series of specials alone gates like any other anchor: an
+			// unfinished episode newer than the anchor holds it back.
+			for _, entry := range bySeries[candidate.SeriesID] {
+				if !entry.Completed && entry.Position > 0 && entry.UpdatedAt.After(candidate.UpdatedAt) {
+					inProgressBlocks[candidate.SeriesID] = true
+					break
+				}
+			}
+		}
+	}
+
+	successors, err := res.repo.lookupNextUpSuccessors(ctx, effective, stateIDs)
 	if err != nil {
 		return err
 	}
 
 	for _, candidate := range candidates {
-		resolution := nextUpCandidateResolution{}
-		if at, ok := inProgressMax[candidate.SeriesID]; ok {
-			resolution.inProgressMax = at
-		}
+		resolution := nextUpCandidateResolution{inProgressBlocks: inProgressBlocks[candidate.SeriesID]}
 		if successor, ok := successors[candidate.SeriesID]; ok {
 			resolution.successor = successor
 			resolution.hasSuccessor = true
@@ -837,6 +1066,46 @@ func (r *NextUpRepository) nextUpSeriesEpisodes(ctx context.Context, seriesIDs [
 		return nil, fmt.Errorf("iterating next-up series episodes: %w", err)
 	}
 	return episodeToSeries, nil
+}
+
+// nextUpSeriesEpisodeMetaQuery resolves every episode of the given series with
+// its catalog metadata. A special anchor needs the whole series' state to find
+// the profile's most recent regular completion.
+var nextUpSeriesEpisodeMetaQuery = `
+	SELECT e.content_id, e.series_id, e.season_number, e.episode_number, si.title
+	FROM episodes e
+	JOIN media_items si ON si.content_id = e.series_id
+	WHERE e.series_id = ANY($1::text[])
+	  AND ` + episodeAliasExclusionPredicateFor("e")
+
+// nextUpSeriesEpisodeMeta returns episode content id -> metadata for every
+// episode of the given series.
+func (r *NextUpRepository) nextUpSeriesEpisodeMeta(ctx context.Context, seriesIDs []string) (map[string]nextUpEpisode, error) {
+	episodes := make(map[string]nextUpEpisode)
+	if len(seriesIDs) == 0 {
+		return episodes, nil
+	}
+
+	rows, err := r.pool.Query(ctx, nextUpSeriesEpisodeMetaQuery, seriesIDs)
+	if err != nil {
+		return nil, fmt.Errorf("resolving next-up series episodes: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var episode nextUpEpisode
+		if err := rows.Scan(
+			&episode.ContentID, &episode.SeriesID, &episode.SeasonNumber,
+			&episode.EpisodeNumber, &episode.SeriesTitle,
+		); err != nil {
+			return nil, fmt.Errorf("scanning next-up series episode: %w", err)
+		}
+		episodes[episode.ContentID] = episode
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating next-up series episodes: %w", err)
+	}
+	return episodes, nil
 }
 
 // nextUpSuccessorQuery resolves, for every candidate anchor, the first canonical

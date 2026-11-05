@@ -119,6 +119,20 @@ func TestAudioTrackDisplayTitleDedupesAndSkipsPlaceholders(t *testing.T) {
 	}
 }
 
+func TestAudioTrackDisplayTitlePlaceholderLanguagesFallBackToPrimaryLanguage(t *testing.T) {
+	// A populated Languages list may still contain only probe placeholders. Keep
+	// the legacy primary-language fallback instead of returning an empty label.
+	title := audioTrackDisplayTitle(models.AudioTrack{
+		Codec:     "aac",
+		Language:  "eng",
+		Channels:  2,
+		Languages: []string{"und", "unknown", "undefined", " ", "Unknown"},
+	})
+	if title != "English - AAC Stereo" {
+		t.Fatalf("DisplayTitle = %q", title)
+	}
+}
+
 func TestAudioTrackDisplayTitleFallsBackToPrimaryLanguage(t *testing.T) {
 	// Probe data predating multi-audio support carries no Languages list;
 	// the single primary language code is still rendered.

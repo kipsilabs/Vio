@@ -107,7 +107,7 @@ func TestCarryValidatedVirtualVideoEvidenceV3FillsEmptyTrackIncludingCopySafety(
 	if track.Codec != "hevc" || track.Profile != "main10" || track.Level != 153 ||
 		track.BitDepth != 10 || track.Width != 3840 || track.Height != 2160 ||
 		track.Bitrate != 15_000 || track.ColorRange != "tv" || !track.HDR10Plus ||
-		track.VideoRangeType != "DOVI" {
+		track.VideoRangeType != videoRangeDOVI {
 		t.Fatalf("reconstructed track = %+v, want the descriptor's planner fields", track)
 	}
 	if math.Abs(virtualFrameRateV3(track.FrameRate)-descriptor.FrameRate) > 1e-6 {
@@ -148,7 +148,7 @@ func TestCarryValidatedVirtualVideoEvidenceV3FillsExistingPartialTrack(t *testin
 	if track.Profile != "main10" || track.Level != 153 || track.BitDepth != 10 ||
 		track.Width != 3840 || track.Height != 2160 || track.Bitrate != 15_000 ||
 		track.ColorRange != "tv" || !track.HDR10Plus ||
-		track.VideoRangeType != "DOVI" {
+		track.VideoRangeType != videoRangeDOVI {
 		t.Fatalf("partial track = %+v, want the same planner fields as the empty-track fill", track)
 	}
 	if !track.VideoCopyUnsafe {
@@ -179,7 +179,7 @@ func TestCarryValidatedVirtualVideoEvidenceV3DoesNotInventDVWithoutProfile(t *te
 		track.DVConfigPresent || track.DVBLCompatIDPresent || track.DVBLPresent {
 		t.Fatalf("carry invented DV classification from a profileless descriptor: %+v", track)
 	}
-	if track.VideoRangeType != "DOVI" {
+	if track.VideoRangeType != videoRangeDOVI {
 		t.Fatalf("video range type = %q, want the descriptor's dynamic range", track.VideoRangeType)
 	}
 }
@@ -371,7 +371,7 @@ func TestCarryValidatedVirtualVideoEvidenceV3DynamicRangeRoundTrip(t *testing.T)
 	// A profileless DV source carries only the "DOVI" range label: no profile
 	// and no base-layer provenance, the shape whose dynamic range was lost.
 	profilelessDVRow := func() *models.MediaFile {
-		return rangeRow("DOVI")
+		return rangeRow(videoRangeDOVI)
 	}
 	// A profiled DV source carries the config record, and the compatibility id
 	// may be an explicit zero.
@@ -395,11 +395,11 @@ func TestCarryValidatedVirtualVideoEvidenceV3DynamicRangeRoundTrip(t *testing.T)
 		// to HDR10 would still round-trip against its own misclassification.
 		wantDynamicRange string
 	}{
-		{name: "sdr", row: rangeRow("SDR")},
-		{name: "hdr10", row: rangeRow("HDR10")},
+		{name: "sdr", row: rangeRow(videoRangeSDR)},
+		{name: "hdr10", row: rangeRow(videoRangeHDR10)},
 		{name: "hdr10_plus", row: hdr10PlusRow()},
 		{name: "hdr10_plus_label_only", row: hdr10PlusLabelOnlyRow(), wantDynamicRange: playback.DynamicRangeHDR10PlusV3},
-		{name: "hlg", row: rangeRow("HLG")},
+		{name: "hlg", row: rangeRow(videoRangeHLG)},
 		{name: "unknown_hdr", row: unknownHDRRow()},
 		{name: "dv_profileless", row: profilelessDVRow()},
 		{name: "dv_compat_one", row: dvRow(1)},

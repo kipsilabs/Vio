@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Silo-Server/silo-server/internal/fspath"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/subtitles"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary/stream"
@@ -16,6 +17,9 @@ const (
 	SubtitleSourceExternalV3   = "external"
 	SubtitleSourceEmbeddedV3   = "embedded"
 	SubtitleSourceDownloadedV3 = "downloaded"
+	// subtitleCodecAribCaption is the ARIB caption codec, which has no
+	// validated client render path.
+	subtitleCodecAribCaption = "arib_caption"
 )
 
 // Sidecar file extensions the stream handler serves a subtitle track as. The
@@ -64,24 +68,29 @@ type SubtitleInventoryItemV3 struct {
 	CombinedIndex int    `json:"combined_index"`
 	Source        string `json:"source"`
 	Codec         string `json:"codec,omitempty"`
-	Language      string `json:"language,omitempty"`
+	Language      string `json:"language,omitempty" doc:"Subtitle language: BCP 47 tag (en, pt-BR), empty when unknown; older rows may carry a legacy value"`
 	Label         string `json:"label,omitempty"`
 	Forced        bool   `json:"forced"`
 	// Default marks the track the source container flags as its default
 	// selection. Only embedded and external tracks can carry it.
-	Default         bool   `json:"default"`
-	HearingImpaired bool   `json:"hearing_impaired"`
-	Delivery        string `json:"delivery"`
+	Default          bool   `json:"default"`
+	HearingImpaired  bool   `json:"hearing_impaired"`
+	Delivery         string `json:"delivery"`
+	NativeSelectable bool   `json:"native_selectable,omitempty"`
+	Unplayable       bool   `json:"unplayable,omitempty"`
+	StreamIndex      *int   `json:"stream_index,omitempty"`
+	ContainerTrackID string `json:"container_track_id,omitempty"`
 	// URL is the session-scoped sidecar URL, present only on
 	// SubtitleDeliverySidecarV3 tracks and only once a session exists.
-	URL string `json:"url,omitempty"`
+	URL string `json:"url,omitempty" format:"uri-reference"`
 	// FontBundleURL is the attachment bundle needed to render an embedded
 	// ASS/SSA track with its authored typesetting.
-	FontBundleURL string `json:"font_bundle_url,omitempty"`
+	FontBundleURL string `json:"font_bundle_url,omitempty" format:"uri-reference"`
 	// SyncKey names the track to the subtitle sync operations. Present on
 	// external and downloaded tracks whose timing can be corrected (SRT,
 	// WebVTT, ASS, SSA); stable across sessions and inventory reordering.
-	SyncKey string `json:"sync_key,omitempty"`
+	SyncKey      string                           `json:"sync_key,omitempty"`
+	HLSRendition *SubtitleInventoryHLSRenditionV3 `json:"hls_rendition,omitempty"`
 	// downloadedSubtitleID is deliberately not serialized: clients address the
 	// opaque session URL, while the server uses the row ID to make that URL
 	// stable across inventory reordering and seek reanchors.
@@ -105,17 +114,16 @@ func BuildSubtitleInventoryV3(file *models.MediaFile, additional []SubtitleInven
 	if file == nil {
 		return nil
 	}
+	items := make([]SubtitleInventoryItemV3, 0, len(file.ExternalSubtitles)+len(file.SubtitleTracks)+len(additional))
+	seen := make(map[string]struct{})
 	externalCount := len(file.ExternalSubtitles)
 	base := externalCount + len(file.SubtitleTracks)
-	items := make([]SubtitleInventoryItemV3, 0, base+len(additional))
-	seen := make(map[string]struct{}, base+len(additional))
-
 	for index, sub := range file.ExternalSubtitles {
 		if subtitleInventoryDuplicateV3(seen, SubtitleSourceExternalV3, externalSubtitleIdentityV3(sub), sub.Format, sub.Language, sub.Forced, sub.HearingImpaired) {
 			continue
 		}
 		item := subtitleInventoryItemV3(file.ID, len(items), index, SubtitleSourceExternalV3, sub.Format,
-			sub.Language, firstNonEmptySubtitleLabelV3(sub.Title, sub.EmbeddedTitle, filepath.Base(sub.Path), sub.Language),
+			sub.Language, firstNonEmptySubtitleLabelV3(sub.Title, sub.EmbeddedTitle, fspath.Display(filepath.Base(sub.Path)), sub.Language),
 			sub.Forced, sub.Default, sub.HearingImpaired)
 		if subtitles.SupportsRetime(subtitles.SubtitleFormat(sub.Format)) {
 			item.SyncKey = subtitles.ExternalSyncKey(sub.Path)
@@ -126,9 +134,14 @@ func BuildSubtitleInventoryV3(file *models.MediaFile, additional []SubtitleInven
 		if subtitleInventoryDuplicateV3(seen, SubtitleSourceEmbeddedV3, embeddedSubtitleIdentityV3(track), track.Codec, track.Language, track.Forced, track.HearingImpaired) {
 			continue
 		}
-		items = append(items, subtitleInventoryItemV3(file.ID, len(items), externalCount+index, SubtitleSourceEmbeddedV3, track.Codec,
+		item := subtitleInventoryItemV3(file.ID, len(items), externalCount+index, SubtitleSourceEmbeddedV3, track.Codec,
 			track.Language, firstNonEmptySubtitleLabelV3(track.Title, track.EmbeddedTitle, track.Language),
-			track.Forced, track.Default, track.HearingImpaired))
+			track.Forced, track.Default, track.HearingImpaired)
+		streamIndex := track.Index
+		item.StreamIndex = &streamIndex
+		item.ContainerTrackID = track.ContainerTrackID
+		item.Unplayable = normalizeCodecV3(track.Codec) == subtitleCodecAribCaption || normalizeCodecV3(track.Codec) == ""
+		items = append(items, item)
 	}
 	for index, entry := range additional {
 		source := entry.Source

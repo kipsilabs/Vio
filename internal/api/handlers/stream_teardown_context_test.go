@@ -66,6 +66,12 @@ func canceledPlaybackContext() context.Context {
 	return ctx
 }
 
+func expiredDeadlinePlaybackContext() context.Context {
+	ctx, cancel := context.WithDeadline(newAuthorizedPlaybackContext(), time.Now().Add(-time.Second))
+	cancel()
+	return ctx
+}
+
 // A client that cancels its remux stream mid-teardown (a track switch aborts
 // the old transport) must not strand the teardown: the synced-session delete
 // has to run to completion under a detached context, not fail with
@@ -85,77 +91,6 @@ func TestStreamAbortTeardownCompletesUnderCanceledContext(t *testing.T) {
 
 	if !adminStore.deleted[session.ID] {
 		t.Fatalf("durable session delete did not complete under a canceled context (calls=%d)", adminStore.deleteCalls)
-	}
-	if _, err := manager.GetSession(session.ID); !errors.Is(err, playback.ErrSessionNotFound) {
-		t.Fatalf("session still live after abort: err=%v", err)
-	}
-}
-
-// expiredDeadlinePlaybackContext is a request whose deadline has already passed:
-// the timeout case, where the request is done but the teardown it triggered must
-// still run. The context records a past deadline; detachedWithin must ignore it.
-func expiredDeadlinePlaybackContext() context.Context {
-	ctx, cancel := context.WithDeadline(newAuthorizedPlaybackContext(), time.Now().Add(-time.Second))
-	cancel()
-	return ctx
-}
-
-// detachedWithin must not inherit an already-expired request deadline: doing so
-// would hand a timeout-triggered teardown a context that is canceled at birth.
-// It takes a fresh budget instead. Only an enclosing detached budget narrows it.
-func TestDetachedWithinIgnoresExpiredRequestDeadline(t *testing.T) {
-	ctx, cancel := detachedWithin(expiredDeadlinePlaybackContext(), time.Minute)
-	defer cancel()
-	if err := ctx.Err(); err != nil {
-		t.Fatalf("detached context was already done: %v", err)
-	}
-	deadline, ok := ctx.Deadline()
-	if !ok || !deadline.After(time.Now()) {
-		t.Fatalf("deadline = %v, ok = %v, want a fresh future budget", deadline, ok)
-	}
-}
-
-// A detach nested inside another detached budget is clamped to it, so a v2 stop
-// finalization's nested teardowns cannot reset a fresh full timeout and outlive
-// the lease that fences the finalization.
-func TestDetachedWithinClampsToEnclosingDetachedBudget(t *testing.T) {
-	outer, cancelOuter := detachedWithin(context.Background(), 50*time.Millisecond)
-	defer cancelOuter()
-	outerDeadline, ok := outer.Deadline()
-	if !ok {
-		t.Fatal("outer detached context has no deadline")
-	}
-
-	inner, cancelInner := detachedWithin(outer, time.Hour)
-	defer cancelInner()
-	innerDeadline, ok := inner.Deadline()
-	if !ok {
-		t.Fatal("inner detached context has no deadline")
-	}
-	if !innerDeadline.Equal(outerDeadline) {
-		t.Fatalf("nested deadline = %v, want the enclosing %v", innerDeadline, outerDeadline)
-	}
-}
-
-// An already-expired request deadline is the common timeout case, not just the
-// canceled case above. The teardown it triggers must still complete its durable
-// writes on a fresh budget; otherwise the synced-session delete runs on an
-// already-canceled context and the session is stranded.
-func TestStreamAbortTeardownCompletesUnderExpiredRequestDeadline(t *testing.T) {
-	manager := playback.NewSessionManager(0, 0)
-	file := &models.MediaFile{ID: 4030317, FilePath: "/media/movie.mkv", FileSize: 1}
-	session, err := manager.StartSession(1, "profile-1", file.ID, playback.PlayDirect, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	adminStore := &cancelSensitiveAdminStore{}
-	h := NewStreamHandler(manager, testPlaybackFileResolver{file: file})
-	h.AdminStore = adminStore
-
-	h.abortPlaybackSession(expiredDeadlinePlaybackContext(), session)
-
-	if !adminStore.deleted[session.ID] {
-		t.Fatalf("durable session delete did not complete under an expired deadline (calls=%d)", adminStore.deleteCalls)
 	}
 	if _, err := manager.GetSession(session.ID); !errors.Is(err, playback.ErrSessionNotFound) {
 		t.Fatalf("session still live after abort: err=%v", err)
@@ -714,10 +649,8 @@ func TestStopFinalizationFailedCleanupStaysReplayable(t *testing.T) {
 // preparation may hold. That wait is bounded by the finalization's own budget,
 // not by the request that triggered it: an already-expired request deadline must
 // not become the teardown's deadline, or a timeout-triggered stop would skip its
-// durable writes entirely. A finalizer blocked past its lease is a different
-// problem, and the budget stays below the lease so it cannot start teardown after
-// another replica took the stop over. Here the holder outlasts the budget, so the
-// wait ends on the budget and nothing is torn down or finalized.
+// durable writes. The holder outlasts the lease, so the wait ends on the budget
+// and nothing is torn down or finalized.
 func TestStopFinalizationLifecycleWaitBoundedByBudgetNotRequestDeadline(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		f := newPlaybackServiceFixture(t)
@@ -830,77 +763,6 @@ func TestStopReplayPollingIsBoundedByFinalizationDeadline(t *testing.T) {
 		}
 		if _, err := f.manager.GetSession(f.session.ID); err != nil {
 			t.Fatalf("a replay that lost the claim must not tear the session down: %v", err)
-		}
-	})
-}
-
-// failFinalizedReceiptOnce drops the first finalized receipt write, standing in
-// for a crash between the watch-history insert and RecordStopReceipt. The durable
-// attempt row keeps the stop id, so the replay must derive the same history row
-// rather than mint a second one.
-type failFinalizedReceiptOnce struct {
-	*playback.MemoryPlanStoreV3
-	mu     sync.Mutex
-	failed bool
-}
-
-func (s *failFinalizedReceiptOnce) RecordStopReceipt(ctx context.Context, sessionID string, receipt playback.StopReceiptV3) error {
-	s.mu.Lock()
-	fail := receipt.Finalized && !s.failed
-	if fail {
-		s.failed = true
-	}
-	s.mu.Unlock()
-	if fail {
-		return errors.New("simulated crash before the receipt write")
-	}
-	return s.MemoryPlanStoreV3.RecordStopReceipt(ctx, sessionID, receipt)
-}
-
-// A crash between the watch-history insert and the receipt write must not let a
-// replay mint a second history row for one stop. The history key is derived from
-// the durable stop id before the insert, so the replay derives the same row and
-// AddVisibleHistory reports it already exists instead of duplicating the play.
-func TestStopReplayAfterLostReceiptReusesHistoryRow(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		f := newPlaybackServiceFixture(t)
-		userStore := newPlaybackTestStore(t)
-		f.handler.StoreProvider = testUserStoreProvider{store: userStore}
-		store := &failFinalizedReceiptOnce{MemoryPlanStoreV3: f.handler.PlanStoreV3.(*playback.MemoryPlanStoreV3)}
-		f.handler.PlanStoreV3 = store
-
-		final := 120.0
-		first, err := f.handler.StopPlaybackV2(f.ctx, f.caller, f.session.ID, PlaybackStopCommand{StopID: uuid.NewString(), Sequence: 1, Position: &final})
-		if err != nil || first.Outcome != PlaybackOutcomeStopped {
-			t.Fatalf("first stop = %+v, %v", first, err)
-		}
-		if first.HistoryID == "" {
-			t.Fatal("first stop recorded no history id")
-		}
-		history, err := userStore.ListHistory(context.Background(), "profile-1", 10, 0)
-		if err != nil {
-			t.Fatalf("ListHistory: %v", err)
-		}
-		if len(history) != 1 {
-			t.Fatalf("history after the lost receipt = %d rows, want 1", len(history))
-		}
-
-		// A crash left the finalization claim behind; past its lease a replay may
-		// reclaim it and must reuse the same history row.
-		time.Sleep(stopFinalizationLease + time.Second)
-		second, err := f.handler.StopPlaybackV2(f.ctx, f.caller, f.session.ID, PlaybackStopCommand{StopID: uuid.NewString()})
-		if err != nil || second.Outcome != PlaybackOutcomeReplayed {
-			t.Fatalf("replayed stop = %+v, %v", second, err)
-		}
-		if second.HistoryID != first.HistoryID {
-			t.Fatalf("replay history id = %q, want %q: the stop re-minted the history row", second.HistoryID, first.HistoryID)
-		}
-		history, err = userStore.ListHistory(context.Background(), "profile-1", 10, 0)
-		if err != nil {
-			t.Fatalf("ListHistory: %v", err)
-		}
-		if len(history) != 1 {
-			t.Fatalf("history after replay = %d rows, want 1: a replay duplicated the stop", len(history))
 		}
 	})
 }

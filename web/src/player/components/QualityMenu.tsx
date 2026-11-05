@@ -73,9 +73,14 @@ export function removeFailedVersions(versions: VersionInfo[]): VersionInfo[] {
 interface QualityMenuProps {
   options: QualityOption[];
   activeId: string;
-  /** The plan's effective recipe, which shows when a bitrate cap reduced the source. */
+  /** The plan's `active_quality`: the entry it delivers, lit unless the preference is Auto. */
+  activeQuality?: string;
+  /**
+   * The plan's effective recipe and source. They are fallback inputs for older
+   * servers that do not publish `active_quality`; a current server's named
+   * entry always wins.
+   */
   deliveredRecipe?: EffectiveRecipeV3;
-  /** The source the plan delivers from, for showing Auto when it plays as-is. */
   source?: Pick<SourceDescriptorV3, "height" | "bitrate_kbps">;
   isTranscoding: boolean;
   error: string | null;
@@ -117,6 +122,7 @@ export { REFRESH_VERSIONS_ERROR };
 export function QualityMenu({
   options,
   activeId,
+  activeQuality,
   deliveredRecipe,
   source,
   isTranscoding,
@@ -250,7 +256,13 @@ export function QualityMenu({
   if (showSpeed) menuLabel = "Playback settings";
   else if (showQuality) menuLabel = "Quality";
 
-  const resolvedActiveId = resolveActiveQualityOptionId(options, activeId, deliveredRecipe, source);
+  const resolvedActiveId = resolveActiveQualityOptionId(
+    options,
+    activeId,
+    activeQuality,
+    deliveredRecipe,
+    source,
+  );
   const activeOption = options.find((option) => option.id === resolvedActiveId);
   // Explicit roving-focus slots per group. Mixing a render-time counter with the
   // refresh rows' commit-time `ref` increments let one overwrite another; naming

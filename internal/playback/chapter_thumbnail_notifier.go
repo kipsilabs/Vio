@@ -15,15 +15,11 @@ import (
 
 const defaultChapterThumbnailEventTTL = 15 * time.Minute
 
-type chapterThumbnailSessionLookup interface {
-	GetSessionsByMediaFileID(fileID int) []*Session
-}
-
 type ChapterThumbnailURLResolver func(context.Context, string, time.Duration) (string, error)
 
 // ChapterThumbnailNotifier publishes live chapter thumbnail updates to active playback sessions.
 type ChapterThumbnailNotifier struct {
-	sessions chapterThumbnailSessionLookup
+	sessions sessionLookup
 	hub      *RealtimeHub
 	presign  ChapterThumbnailURLResolver
 	ttl      time.Duration
@@ -35,7 +31,7 @@ type ChapterThumbnailNotifier struct {
 
 // NewChapterThumbnailNotifier creates a notifier that targets active sessions for a file.
 func NewChapterThumbnailNotifier(
-	sessions chapterThumbnailSessionLookup,
+	sessions sessionLookup,
 	hub *RealtimeHub,
 	presign ChapterThumbnailURLResolver,
 	ttl time.Duration,

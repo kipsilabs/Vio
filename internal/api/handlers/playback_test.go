@@ -318,6 +318,7 @@ func (failingSessionManager) UpdateAudioTrack(string, int, playback.PlayMethod) 
 func (failingSessionManager) UpdateStreamState(string, playback.SessionStreamState) error {
 	return nil
 }
+func (failingSessionManager) MarkPlanCommitted(string) error { return nil }
 
 func (failingSessionManager) TouchActivity(string) error { return nil }
 
@@ -362,10 +363,9 @@ func newPlaybackTestStore(t *testing.T) userstore.UserStore {
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
-	// SQLite's :memory: database is per connection. Pin the pool to one
-	// connection so InitSchema and every later query see the same database;
-	// otherwise a request under load can open a second connection and fail
-	// with "no such table: audio_preferences".
+	// An in-memory SQLite database belongs to one connection. A second pooled
+	// connection opens a fresh, schema-less database, so any concurrent or
+	// interleaved query would see missing tables; pin the pool to one.
 	db.SetMaxOpenConns(1)
 	t.Cleanup(func() {
 		_ = db.Close()
@@ -612,18 +612,21 @@ func writePlaybackTestFFmpegSleep(t *testing.T, sleepSeconds string) string {
 	// Discovery and one-frame smoke commands finish immediately. Only a
 	// transport stays alive; exec keeps it one process so cancellation closes
 	// its pipes without waiting for an orphaned shell child.
+	// A generation may append a second output after the playlist (a copy
+	// remux's first-video-packet framecrc), so find the playlist anywhere in
+	// the arguments instead of assuming it is last.
 	script := "#!/bin/sh\n" +
-		"last=\"\"\n" +
-		"for arg in \"$@\"; do last=\"$arg\"; done\n" +
+		"playlist=\"\"\n" +
+		"for arg in \"$@\"; do case \"$arg\" in *.m3u8) playlist=\"$arg\" ;; esac; done\n" +
 		"case \" $* \" in *\" -bsfs \"*|*\" -encoders \"*|*\" -f null - \"*) exit 0 ;; esac\n" +
-		"case \"$last\" in\n" +
-		"  *.m3u8) out=\"$(dirname \"$last\")\"; mkdir -p \"$out\"; " +
+		"case \"$playlist\" in\n" +
+		"  *.m3u8) out=\"$(dirname \"$playlist\")\"; mkdir -p \"$out\"; " +
 		"printf x > \"$out/init.mp4\"; printf x > \"$out/seg_0.m4s\"; " +
 		"printf x > \"$out/seg_1.m4s\"; printf x > \"$out/seg_2.m4s\"; " +
 		"printf '#EXTM3U\\n#EXT-X-VERSION:7\\n#EXT-X-TARGETDURATION:2\\n" +
 		"#EXT-X-MEDIA-SEQUENCE:0\\n#EXT-X-MAP:URI=\"init.mp4\"\\n" +
 		"#EXTINF:2.0,\\nseg_0.m4s\\n#EXTINF:2.0,\\nseg_1.m4s\\n" +
-		"#EXTINF:2.0,\\nseg_2.m4s\\n' > \"$last\" ;;\n" +
+		"#EXTINF:2.0,\\nseg_2.m4s\\n' > \"$playlist\" ;;\n" +
 		"esac\n" +
 		"exec sleep " + sleepSeconds + "\n"
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
@@ -744,7 +747,7 @@ type recordingMissingMarker struct {
 	ids []int
 }
 
-func (m *recordingMissingMarker) MarkMissing(_ context.Context, id int, _ time.Time) error {
+func (m *recordingMissingMarker) MarkMissing(_ context.Context, id int, _ string, _ time.Time) error {
 	m.ids = append(m.ids, id)
 	return nil
 }

@@ -95,7 +95,7 @@ interface PlayerControlsProps {
   mediaFileId?: number;
   playerConfig?: PlayerConfig;
   onRefreshSubtitles?: () => void;
-  onSubtitleJobAccepted?: (jobId: string) => void;
+  onSubtitleJobAccepted?: (jobId: string, resultSubtitleId?: string) => void;
   sessionId?: string;
   getSubtitleStartPosition?: () => number;
   subtitleSync?: SubtitleSync;
@@ -115,9 +115,11 @@ interface PlayerControlsProps {
   // Quality
   qualityOptions: QualityOption[];
   activeQualityId: string;
+  /** The plan's `active_quality`, the menu entry it delivers. */
+  activeQuality?: string;
+  /** Fallback inputs for servers that do not publish `active_quality`. */
   deliveredRecipe?: EffectiveRecipeV3;
-  /** The source the plan delivers from, for showing Auto when it plays as-is. */
-  playbackSource?: SourceDescriptorV3;
+  playbackSource?: Pick<SourceDescriptorV3, "height" | "bitrate_kbps">;
   isTranscoding: boolean;
   qualityError: string | null;
   onQualitySelect: (id: string) => void;
@@ -210,6 +212,7 @@ export function PlayerControls({
   audioInventoryProvisional = false,
   qualityOptions,
   activeQualityId,
+  activeQuality,
   deliveredRecipe,
   playbackSource,
   isTranscoding,
@@ -422,6 +425,7 @@ export function PlayerControls({
             <QualityMenu
               options={qualityOptions}
               activeId={activeQualityId}
+              activeQuality={activeQuality}
               deliveredRecipe={deliveredRecipe}
               source={playbackSource}
               isTranscoding={isTranscoding}
@@ -621,6 +625,7 @@ export function PlayerControls({
               <QualityMenu
                 options={qualityOptions}
                 activeId={activeQualityId}
+                activeQuality={activeQuality}
                 deliveredRecipe={deliveredRecipe}
                 source={playbackSource}
                 isTranscoding={isTranscoding}

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"os/exec"
 	"strings"
 )
 
@@ -34,7 +33,7 @@ func DetectMultiplePPSH264(ctx context.Context, ffmpegPath, filePath string) (bo
 	}
 	// -bsf:v filter_units=pass_types=8 keeps only PPS NAL units (type 8); the
 	// Annex-B h264 muxer emits them start-code delimited on stdout.
-	cmd := exec.CommandContext(ctx, ffmpegPath,
+	cmd := toolCommandContext(ctx, ffmpegPath,
 		"-v", "error",
 		"-t", fmt.Sprintf("%d", copySafetyScanSeconds),
 		"-i", filePath,

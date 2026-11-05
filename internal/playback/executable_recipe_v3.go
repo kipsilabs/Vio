@@ -1,6 +1,10 @@
 package playback
 
-import "github.com/Silo-Server/silo-server/internal/tonemap"
+import (
+	"slices"
+
+	"github.com/Silo-Server/silo-server/internal/tonemap"
+)
 
 // ExecutableRecipeV3 is the frozen operational half of a protocol-v3 plan.
 // PlanV3 describes the client-visible route identity; these fields are the
@@ -60,7 +64,10 @@ type ExecutableRecipeV3 struct {
 	// SubtitleRendition emits the selected subtitle as the transcode's HLS
 	// subtitle rendition. It needs version 4 so a binary that predates it
 	// rejects the recipe instead of reopening the transport without one.
-	SubtitleRendition bool `json:"subtitle_rendition,omitempty"`
+	SubtitleRendition       bool                     `json:"subtitle_rendition,omitempty"`
+	SubtitleRenditionTracks []SubtitleRenditionTrack `json:"subtitle_rendition_tracks,omitempty"`
+	SubtitleRenditionSource SubtitleRenditionSource  `json:"subtitle_rendition_source,omitzero"`
+	CopyVideoMPEGTS         bool                     `json:"copy_video_mpegts,omitempty"`
 }
 
 const (
@@ -68,6 +75,7 @@ const (
 	executableRecipeVersionV3                  = 2
 	executableRecipeVersionSourceAudioV3       = 3
 	executableRecipeVersionSubtitleRenditionV3 = 4
+	executableRecipeVersionCopyMPEGTSV3        = 5
 )
 
 // FreezeExecutableRecipeV3 captures the byte-affecting facts from a planner result.
@@ -116,6 +124,9 @@ func FreezeExecutableRecipeV3(result PlannerResultV3) ExecutableRecipeV3 {
 		SubtitleCodec:                 result.SubtitleCodec,
 		DownloadedSubtitleID:          result.DownloadedSubtitleID,
 		SubtitleRendition:             result.SubtitleRendition,
+		SubtitleRenditionTracks:       slices.Clone(result.SubtitleRenditionTracks),
+		SubtitleRenditionSource:       result.SubtitleRenditionSource,
+		CopyVideoMPEGTS:               result.Plan != nil && result.Plan.EffectiveRecipe.SegmentContainer == SegmentContainerMPEGTSV3,
 	}
 	if recipe.hasVersion2Fields() {
 		recipe.Version = executableRecipeVersionV3
@@ -125,6 +136,9 @@ func FreezeExecutableRecipeV3(result PlannerResultV3) ExecutableRecipeV3 {
 	}
 	if recipe.hasVersion4Fields() {
 		recipe.Version = executableRecipeVersionSubtitleRenditionV3
+	}
+	if recipe.CopyVideoMPEGTS {
+		recipe.Version = executableRecipeVersionCopyMPEGTSV3
 	}
 	return recipe
 }
@@ -147,20 +161,28 @@ func (r ExecutableRecipeV3) hasVersion3Fields() bool {
 }
 
 func (r ExecutableRecipeV3) hasVersion4Fields() bool {
-	return r.SubtitleRendition
+	return r.SubtitleRendition || len(r.SubtitleRenditionTracks) > 0 || !r.SubtitleRenditionSource.IsZero()
 }
 
 // Valid reports whether an executable recipe is complete and internally consistent.
 func (r ExecutableRecipeV3) Valid() bool {
-	if r.Version < executableRecipeVersionLegacyV3 || r.Version > executableRecipeVersionSubtitleRenditionV3 || r.PlanID == "" || r.SourceAudioChannels < 0 {
+	if r.Version < executableRecipeVersionLegacyV3 || r.Version > executableRecipeVersionCopyMPEGTSV3 || r.PlanID == "" || r.SourceAudioChannels < 0 {
 		return false
 	}
 	if (r.Version == executableRecipeVersionLegacyV3 && r.hasVersion2Fields()) ||
 		(r.Version < executableRecipeVersionSourceAudioV3 && r.hasVersion3Fields()) ||
-		(r.Version < executableRecipeVersionSubtitleRenditionV3 && r.hasVersion4Fields()) {
+		(r.Version < executableRecipeVersionSubtitleRenditionV3 && r.hasVersion4Fields()) ||
+		(r.Version < executableRecipeVersionCopyMPEGTSV3 && r.CopyVideoMPEGTS) ||
+		(r.Version == executableRecipeVersionCopyMPEGTSV3 && !r.CopyVideoMPEGTS) {
 		return false
 	}
-	if r.SubtitleRendition && (r.PlayMethod != PlayTranscode || r.SubtitleBurnIn || r.SubtitleTransportTrackIndex < 0) {
+	hlsRemux := r.PlayMethod == PlayRemux && r.TargetVideoCodec == codecCopyV3
+	if r.CopyVideoMPEGTS && (r.PlayMethod != PlayRemux || r.TargetVideoCodec != codecCopyV3) {
+		return false
+	}
+	// A copy remux carries its rendition inside the remuxed HLS stream, so a
+	// remux recipe is a valid host for one; a progressive remux is not.
+	if r.SubtitleRendition && ((r.PlayMethod != PlayTranscode && !hlsRemux) || r.SubtitleBurnIn || r.SubtitleTransportTrackIndex < 0 && len(r.SubtitleRenditionTracks) == 0) {
 		return false
 	}
 	hasToneMapField := r.ToneMapPolicy != "" || r.ToneMapMode != "" || r.ToneMapSourceKind != "" || r.ToneMapRecipeVersion != "" || r.ToneMapPreflightRequired || !r.ToneMapSourceRevision.IsZero()
@@ -177,7 +199,7 @@ func (r ExecutableRecipeV3) Valid() bool {
 }
 
 func (r ExecutableRecipeV3) ValidFor(plan PlanV3) bool {
-	return r.Valid() && r.PlanID == plan.PlanID
+	return r.Valid() && r.PlanID == plan.PlanID && r.CopyVideoMPEGTS == (plan.EffectiveRecipe.SegmentContainer == SegmentContainerMPEGTSV3)
 }
 
 // PlannerResult restores a planner result from the frozen executable recipe.
@@ -221,6 +243,8 @@ func (r ExecutableRecipeV3) PlannerResult(plan *PlanV3) PlannerResultV3 {
 		SubtitleBurnIn:              r.SubtitleBurnIn,
 		SubtitleCodec:               r.SubtitleCodec,
 		SubtitleRendition:           r.SubtitleRendition,
+		SubtitleRenditionTracks:     slices.Clone(r.SubtitleRenditionTracks),
+		SubtitleRenditionSource:     r.SubtitleRenditionSource,
 		DownloadedSubtitleID:        r.DownloadedSubtitleID,
 	}
 }

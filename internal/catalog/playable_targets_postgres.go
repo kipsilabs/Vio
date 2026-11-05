@@ -20,9 +20,75 @@ func (r *PlayableTargetResolver) resolvePostgresTargets(ctx context.Context, arg
 		-- Keep the unique-key lookup when profile statistics lag a bulk import.
 		OFFSET 0
 	)`, progress)
-	query := buildPostgresPlayableTargetsQuery(fileSQL, progress, completedSQL)
+	query := fmt.Sprintf(`
+		WITH requested AS (
+			SELECT content_id, media_type, series_id, season_number, preferred_content_id, ord
+			FROM unnest($1::text[], $2::text[], $3::text[], $4::integer[], $5::text[]) WITH ORDINALITY
+			  AS requested(content_id, media_type, series_id, season_number, preferred_content_id, ord)
+		), target_scopes AS (
+			SELECT ord, content_id AS series_id, NULL::integer AS season_number
+			FROM requested WHERE media_type = 'series'
+			UNION ALL
+			SELECT ord, series_id, season_number
+			FROM requested WHERE media_type = 'season' AND series_id <> '' AND season_number >= 0
+			UNION ALL
+			SELECT requested.ord, season.series_id, season.season_number
+			FROM requested
+			JOIN seasons season ON requested.media_type = 'season' AND season.content_id = requested.content_id
+			WHERE NOT (requested.series_id <> '' AND requested.season_number >= 0
+				AND requested.series_id = season.series_id AND requested.season_number = season.season_number)
+		), resumable AS MATERIALIZED (
+			-- Every card's newest resumable episode, chosen once per statement.
+			-- The progress relation's truncated updated_at keeps an index from
+			-- supplying this order, so a per-card subquery re-read all of the
+			-- profile's resumable rows for each card. MATERIALIZED keeps the
+			-- single reference below from inlining it back into every card;
+			-- it runs only when a card without a valid anchor first reads it.
+			SELECT DISTINCT ON (scope.ord) scope.ord, episode.content_id
+			FROM target_scopes scope
+			JOIN episodes episode ON episode.series_id = scope.series_id
+			  AND (scope.season_number IS NULL OR episode.season_number = scope.season_number)
+			JOIN %[2]s progress ON progress.media_item_id = episode.content_id
+			WHERE progress.position_seconds > 0 AND NOT progress.completed
+			  AND EXISTS (SELECT 1 FROM media_files mf WHERE mf.episode_id = episode.content_id AND %[1]s)
+			ORDER BY scope.ord, progress.updated_at DESC,
+			  CASE WHEN episode.season_number = 0 THEN 1 ELSE 0 END,
+			  episode.season_number, episode.episode_number, episode.content_id
+		)
+		SELECT requested.ord, target.play_content_id, target_episode.season_number
+		FROM requested
+		CROSS JOIN LATERAL (
+			SELECT COALESCE(
+				CASE WHEN requested.media_type = 'movie' AND EXISTS (
+					SELECT 1 FROM media_files mf WHERE mf.content_id = requested.content_id AND %[1]s
+				) THEN requested.content_id
+				WHEN requested.media_type = 'episode' AND `+canonicalEpisodeFileExistsSQL("requested.content_id", "%[1]s")+` THEN requested.content_id END,
+				(SELECT episode.content_id
+				 FROM target_scopes scope
+				 JOIN episodes episode ON episode.series_id = scope.series_id
+				   AND (scope.season_number IS NULL OR episode.season_number = scope.season_number)
+				 WHERE scope.ord = requested.ord AND episode.content_id = requested.preferred_content_id
+				   AND EXISTS (SELECT 1 FROM media_files mf WHERE mf.episode_id = episode.content_id AND %[1]s)
+				 LIMIT 1),
+				(SELECT resumable.content_id FROM resumable WHERE resumable.ord = requested.ord),
+				%[3]s,
+				%[4]s
+			) AS play_content_id
+			-- Prevent the outer null filter from inlining and evaluating all
+			-- winner subqueries a second time for the SELECT projection.
+			OFFSET 0
+		) target
+		-- One primary-key probe per winner, not per candidate.
+		LEFT JOIN episodes target_episode ON target_episode.content_id = target.play_content_id
+		WHERE target.play_content_id IS NOT NULL
+	`, fileSQL, progress, firstPlayableEpisodeSQL(fileSQL, completedSQL), firstPlayableEpisodeSQL(fileSQL, ""))
 
 	result := make(map[string]PlayableTarget, len(keysByOrd))
+	// queryPlayableTargets keeps one generic plan per connection. Planning
+	// this statement takes 4-7 ms, several times what a show page's single
+	// card takes to run. Its generic plan does the same work as a custom one
+	// whatever the card count or history: it reads the profile's resumable
+	// rows once and checks each episode's completion by key.
 	err := r.queryPlayableTargets(ctx, query, args, func(rows pgx.Rows) error {
 		var ord int64
 		var contentID string
@@ -115,6 +181,9 @@ func buildPostgresPlayableTargetsQuery(fileSQL, progress, completedSQL string) s
 // picking each scope's first match preserves the legacy union's global order.
 // Separating regular seasons and specials lets the episode series index supply
 // the order, so ordinary unseen cards stop after their first available match.
+// The season is a range bound rather than "IS NULL OR equal" so that the
+// episode index applies it and a season card reads only its own season. With
+// the OR, each season card of a long-running series read the whole series.
 func firstPlayableEpisodeSQL(fileSQL, progressSQL string) string {
 	episodeFileSQL := canonicalEpisodeFileExistsSQL("episode.content_id", fileSQL)
 	excludeAliases := episodeAliasExclusionPredicateFor("episode")
@@ -125,8 +194,9 @@ func firstPlayableEpisodeSQL(fileSQL, progressSQL string) string {
 				SELECT episode.content_id, episode.season_number, episode.episode_number
 				FROM episodes episode
 				WHERE episode.series_id = scope.series_id
-				  AND (scope.season_number IS NULL OR episode.season_number = scope.season_number)
-				  AND `+excludeAliases+`
+				  AND episode.season_number BETWEEN COALESCE(scope.season_number, -2147483648)
+				    AND COALESCE(scope.season_number, 2147483647)
+				  AND %s
 				  AND %s
 				  AND %s
 				  %s
@@ -135,7 +205,7 @@ func firstPlayableEpisodeSQL(fileSQL, progressSQL string) string {
 			) winner
 			WHERE scope.ord = requested.ord
 			ORDER BY winner.season_number, winner.episode_number, winner.content_id
-			LIMIT 1)`, seasonSQL, episodeFileSQL, progressSQL)
+			LIMIT 1)`, excludeAliases, seasonSQL, episodeFileSQL, progressSQL)
 	}
 	return "COALESCE(" + first("episode.season_number IS DISTINCT FROM 0") + ", " + first("episode.season_number = 0") + ")"
 }

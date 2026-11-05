@@ -21,10 +21,12 @@ import (
 // upstream bound.
 const nextUpAnchorMaxSeries = 96
 
-type nextUpTestStoreProvider struct{}
+// nextUpTestStoreProvider reads user state from the same PostgreSQL test
+// database as the catalog, as the postgres_state backend does in production.
+type nextUpTestStoreProvider struct{ pool *pgxpool.Pool }
 
-func (nextUpTestStoreProvider) ForUser(context.Context, int) (userstore.UserStore, error) {
-	return nil, nil
+func (p nextUpTestStoreProvider) ForUser(ctx context.Context, userID int) (userstore.UserStore, error) {
+	return pgstore.NewPostgresProvider(p.pool).ForUser(ctx, userID)
 }
 
 func (nextUpTestStoreProvider) Close() error { return nil }
@@ -1096,7 +1098,7 @@ func TestNextUpRepository_ReleasedEpisodeMovesCaughtUpSeriesForward(t *testing.T
 		episodes[0]: weeklyDone, episodes[2]: bingeDone, episodes[4]: rerunDone,
 	})
 
-	repo := NewNextUpRepository(pool, nextUpTestStoreProvider{})
+	repo := NewNextUpRepository(pool, nextUpTestStoreProvider{pool: pool})
 	results, err := repo.ListNextUp(ctx, NextUpQuery{UserID: userID, ProfileID: profileID, RankByRelease: true, Limit: 20})
 	if err != nil {
 		t.Fatalf("ListNextUp: %v", err)
@@ -1176,7 +1178,7 @@ func TestNextUpRepository_EarliestAvailabilityDecidesRelease(t *testing.T) {
 		episodes[2]: now.Add(-200 * 24 * time.Hour),
 	})
 
-	repo := NewNextUpRepository(pool, nextUpTestStoreProvider{})
+	repo := NewNextUpRepository(pool, nextUpTestStoreProvider{pool: pool})
 	results, err := repo.ListNextUp(ctx, NextUpQuery{UserID: userID, ProfileID: profileID, RankByRelease: true, Limit: 20})
 	if err != nil {
 		t.Fatalf("ListNextUp: %v", err)
@@ -1228,7 +1230,7 @@ func TestNextUpRepository_ReleaseOutsideScopeKeepsCompletionOrder(t *testing.T) 
 		episodes[2]: now.Add(-10 * 24 * time.Hour),
 	})
 
-	repo := NewNextUpRepository(pool, nextUpTestStoreProvider{})
+	repo := NewNextUpRepository(pool, nextUpTestStoreProvider{pool: pool})
 	base := NextUpQuery{UserID: userID, ProfileID: profileID, RankByRelease: true, Limit: 20}
 	results, err := repo.ListNextUp(ctx, base)
 	if err != nil {
@@ -1304,7 +1306,7 @@ func TestNextUpRepository_SmallerLimitReadsPrefixOfLargerLimit(t *testing.T) {
 		episodes[4]: now.Add(-400 * 24 * time.Hour),
 	})
 
-	repo := NewNextUpRepository(pool, nextUpTestStoreProvider{})
+	repo := NewNextUpRepository(pool, nextUpTestStoreProvider{pool: pool})
 	all, err := repo.ListNextUp(ctx, NextUpQuery{UserID: userID, ProfileID: profileID, RankByRelease: true, Limit: 3})
 	if err != nil {
 		t.Fatalf("ListNextUp limit 3: %v", err)
@@ -1357,7 +1359,7 @@ func TestNextUpRepository_PagesPastRankedCandidatesKeepOneOrder(t *testing.T) {
 	oldest := fmt.Sprintf("%s-s%d", prefix, total)
 	seedNextUpAvailability(t, ctx, pool, folderID, oldest+"-e2", oldest, 2, now.Add(-time.Minute), true)
 
-	repo := NewNextUpRepository(pool, nextUpTestStoreProvider{})
+	repo := NewNextUpRepository(pool, nextUpTestStoreProvider{pool: pool})
 	all, err := repo.ListNextUp(ctx, NextUpQuery{UserID: userID, ProfileID: profileID, RankByRelease: true, Limit: total + 23})
 	if err != nil {
 		t.Fatalf("ListNextUp all: %v", err)

@@ -274,5 +274,11 @@ func videoCopyUnsafeFile(file *models.MediaFile) bool {
 		return false
 	}
 	track := file.VideoTracks[0]
-	return track.VideoCopyUnsafe || (track.MultiplePPS != nil && *track.MultiplePPS)
+	if track.VideoCopyUnsafe || (track.MultiplePPS != nil && *track.MultiplePPS) {
+		return true
+	}
+	if verdict, ok := file.PersistedVideoCopyVerdict(); ok {
+		return verdict
+	}
+	return false
 }

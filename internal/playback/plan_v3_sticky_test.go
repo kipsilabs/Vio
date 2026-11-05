@@ -17,7 +17,7 @@ func stickyDeliveryFixtureV3() (*models.MediaFile, StartRequestV3) {
 	file.VideoTracks[0].BitDepth = 10
 	file.VideoTracks[0].VideoRange = "HDR10"
 	file.VideoTracks[0].VideoRangeType = "HDR10"
-	file.VideoTracks[0].ColorTransfer = "smpte2084"
+	file.VideoTracks[0].ColorTransfer = colorTransferPQ
 	file.VideoTracks[0].ColorPrimaries = "bt2020"
 	req := validStartRequestV3()
 	req.Capabilities.CodecsVideo = []string{"hevc", "h264"}

@@ -23,7 +23,7 @@ func TestVirtualMediaRegistrationDoesNotStampProbe(t *testing.T) {
 	if _, err := pool.Exec(ctx, `INSERT INTO media_folders(id,name,type,enabled) VALUES(999,'TestVirtualProbe','movies',true)`); err != nil {
 		t.Fatalf("seed virtual media folder: %v", err)
 	}
-	reg := NewVirtualMediaRegistrar(pool)
+	reg := newReleasedVirtualMediaRegistrar(pool)
 
 	movie := VirtualMedia{
 		LibraryID:      "999",
@@ -100,7 +100,7 @@ func TestVirtualMediaVariantRegistrationDoesNotStampProbe(t *testing.T) {
 	if _, err := pool.Exec(ctx, `INSERT INTO media_folders(id,name,type,enabled) VALUES(999,'TestVirtualProbe','movies',true)`); err != nil {
 		t.Fatalf("seed virtual media folder: %v", err)
 	}
-	reg := NewVirtualMediaRegistrar(pool)
+	reg := newReleasedVirtualMediaRegistrar(pool)
 
 	uri := "virtual://movie/tt70000002?profile=1080p&result=hash-one"
 	in := VirtualMedia{
@@ -213,7 +213,7 @@ func TestVirtualMediaRegistrationClearsProbeOnAdoptedRow(t *testing.T) {
 	if _, err := pool.Exec(ctx, `INSERT INTO media_folders(id,name,type,enabled) VALUES(999,'TestVirtualProbe','movies',true)`); err != nil {
 		t.Fatalf("seed virtual media folder: %v", err)
 	}
-	reg := NewVirtualMediaRegistrar(pool)
+	reg := newReleasedVirtualMediaRegistrar(pool)
 
 	movie := VirtualMedia{
 		LibraryID:      "999",
@@ -253,7 +253,7 @@ func TestVirtualMediaRegistrationClearsProbeOnConflictRow(t *testing.T) {
 	if _, err := pool.Exec(ctx, `INSERT INTO media_folders(id,name,type,enabled) VALUES(999,'TestVirtualProbe','movies',true)`); err != nil {
 		t.Fatalf("seed virtual media folder: %v", err)
 	}
-	reg := NewVirtualMediaRegistrar(pool)
+	reg := newReleasedVirtualMediaRegistrar(pool)
 
 	movie := VirtualMedia{
 		LibraryID:      "999",
@@ -291,7 +291,7 @@ func TestVirtualMediaVariantRegistrationClearsProbeOnAdoptedRow(t *testing.T) {
 	if _, err := pool.Exec(ctx, `INSERT INTO media_folders(id,name,type,enabled) VALUES(999,'TestVirtualProbe','movies',true)`); err != nil {
 		t.Fatalf("seed virtual media folder: %v", err)
 	}
-	reg := NewVirtualMediaRegistrar(pool)
+	reg := newReleasedVirtualMediaRegistrar(pool)
 
 	in := VirtualMedia{
 		LibraryID:      "999",
@@ -331,7 +331,7 @@ func TestVirtualMediaVariantRegistrationClearsProbeOnConflictRow(t *testing.T) {
 	if _, err := pool.Exec(ctx, `INSERT INTO media_folders(id,name,type,enabled) VALUES(999,'TestVirtualProbe','movies',true)`); err != nil {
 		t.Fatalf("seed virtual media folder: %v", err)
 	}
-	reg := NewVirtualMediaRegistrar(pool)
+	reg := newReleasedVirtualMediaRegistrar(pool)
 
 	in := VirtualMedia{
 		LibraryID:      "999",

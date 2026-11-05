@@ -150,19 +150,13 @@ type VirtualProbeVersionLister interface {
 	GetItemVersions(ctx context.Context, contentID string, filter catalog.AccessFilter) ([]catalog.FileVersion, error)
 }
 
-// VirtualProbeFileReader resolves a version's media file row.
-// *scanner.FileRepository implements it.
-type VirtualProbeFileReader interface {
-	GetByID(ctx context.Context, id int) (*models.MediaFile, error)
-}
-
 // NewVirtualDefaultProbeTarget builds the production default-probe target from
 // the catalog detail service and the file repository. It resolves the default
 // under the access filter of the discovery request that scheduled the chain
 // (see VirtualDefaultProbeTarget), so versions the viewer cannot see are never
 // read and never probed. A nil reader disables the target, and with it the
 // chain.
-func NewVirtualDefaultProbeTarget(versions VirtualProbeVersionLister, files VirtualProbeFileReader) VirtualDefaultProbeTarget {
+func NewVirtualDefaultProbeTarget(versions VirtualProbeVersionLister, files FilePathResolver) VirtualDefaultProbeTarget {
 	if versions == nil || files == nil {
 		return nil
 	}

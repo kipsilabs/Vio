@@ -181,7 +181,7 @@ func TestMergeVirtualCandidateTracksRepairsStaleSDRRange(t *testing.T) {
 		Resolution: "2160p",
 		CodecVideo: "hevc",
 		VideoTracks: []models.VideoTrack{{
-			VideoRange: "SDR",
+			VideoRange: videoRangeSDR,
 		}},
 	}
 
@@ -190,7 +190,7 @@ func TestMergeVirtualCandidateTracksRepairsStaleSDRRange(t *testing.T) {
 	if got := probed.VideoTracks[0].VideoRange; got != "HDR" {
 		t.Fatalf("video range = %q, want HDR", got)
 	}
-	if got := probed.VideoTracks[0].VideoRangeType; got != "HDR10" {
+	if got := probed.VideoTracks[0].VideoRangeType; got != videoRangeHDR10 {
 		t.Fatalf("video range type = %q, want HDR10", got)
 	}
 }
@@ -207,7 +207,7 @@ func TestMergeVirtualCandidateTracksKeepsObservedSDRRange(t *testing.T) {
 		VideoTracks: []models.VideoTrack{{
 			Codec: "h264", Profile: "High", Level: 41,
 			Width: 1920, Height: 1080, BitDepth: 8,
-			VideoRange: "SDR", VideoRangeType: "SDR",
+			VideoRange: videoRangeSDR, VideoRangeType: videoRangeSDR,
 		}},
 		AudioTracks: []models.AudioTrack{{Codec: "aac", Channels: 2, Language: "eng"}},
 	}
@@ -218,7 +218,7 @@ func TestMergeVirtualCandidateTracksKeepsObservedSDRRange(t *testing.T) {
 	})
 
 	vt := probed.VideoTracks[0]
-	if vt.VideoRange != "SDR" || vt.VideoRangeType != "SDR" {
+	if vt.VideoRange != videoRangeSDR || vt.VideoRangeType != videoRangeSDR {
 		t.Fatalf("observed range overwritten: %#v", vt)
 	}
 	if vt.Codec != "h264" || vt.Profile != "High" || vt.BitDepth != 8 {
@@ -246,7 +246,7 @@ func TestMergeVirtualCandidateTracksKeepsLaterObservedSDRRange(t *testing.T) {
 			{
 				Codec: "h264", Profile: "High", Level: 41,
 				Width: 1920, Height: 1080, BitDepth: 8,
-				VideoRange: "SDR", VideoRangeType: "SDR",
+				VideoRange: videoRangeSDR, VideoRangeType: videoRangeSDR,
 			},
 		},
 	}
@@ -257,7 +257,7 @@ func TestMergeVirtualCandidateTracksKeepsLaterObservedSDRRange(t *testing.T) {
 	})
 
 	vt := probed.VideoTracks[1]
-	if vt.VideoRange != "SDR" || vt.VideoRangeType != "SDR" {
+	if vt.VideoRange != videoRangeSDR || vt.VideoRangeType != videoRangeSDR {
 		t.Fatalf("later observed range repainted: %#v", vt)
 	}
 	if vt.BitDepth != 8 || vt.DVProfile != 0 || vt.DolbyVision != "" {
@@ -306,7 +306,7 @@ func TestMergeVirtualCandidateTracksCorroboratedHDRTypeFillsUnknownDepth(t *test
 		CodecVideo: "hevc",
 		VideoTracks: []models.VideoTrack{{
 			Codec: "hevc", Width: 3840, Height: 2160, FrameRate: "24",
-			VideoRangeType: "HDR10",
+			VideoRangeType: videoRangeHDR10,
 		}},
 	}
 
@@ -318,7 +318,7 @@ func TestMergeVirtualCandidateTracksCorroboratedHDRTypeFillsUnknownDepth(t *test
 	if vt.BitDepth != 10 {
 		t.Fatalf("corroborated HDR10 track depth = %d, want 10", vt.BitDepth)
 	}
-	if vt.VideoRangeType != "HDR10" {
+	if vt.VideoRangeType != videoRangeHDR10 {
 		t.Fatalf("range type changed: %#v", vt)
 	}
 	if !completeVirtualVideoEvidenceV3(probed) {
@@ -337,7 +337,7 @@ func TestMergeVirtualCandidateTracksCorroboratedHDRTypeWithoutReleaseLabel(t *te
 		CodecVideo: "hevc",
 		VideoTracks: []models.VideoTrack{{
 			Codec: "hevc", Width: 1920, Height: 1080, FrameRate: "24",
-			VideoRangeType: "HDR10",
+			VideoRangeType: videoRangeHDR10,
 		}},
 	}
 
@@ -359,7 +359,7 @@ func TestMergeVirtualCandidateTracksKeepsObserved8BitDepth(t *testing.T) {
 		CodecVideo: "h264",
 		VideoTracks: []models.VideoTrack{{
 			Codec: "h264", Width: 1920, Height: 1080, FrameRate: "24",
-			BitDepth: 8, VideoRangeType: "HDR10",
+			BitDepth: 8, VideoRangeType: videoRangeHDR10,
 		}},
 	}
 
@@ -381,7 +381,7 @@ func TestMergeVirtualCandidateTracksKeepsObservedRangeType(t *testing.T) {
 		CodecVideo: "h264",
 		VideoTracks: []models.VideoTrack{{
 			Codec: "h264", Width: 1920, Height: 1080,
-			VideoRangeType: "HLG",
+			VideoRangeType: videoRangeHLG,
 		}},
 	}
 
@@ -391,7 +391,7 @@ func TestMergeVirtualCandidateTracksKeepsObservedRangeType(t *testing.T) {
 	})
 
 	vt := probed.VideoTracks[0]
-	if vt.VideoRangeType != "HLG" {
+	if vt.VideoRangeType != videoRangeHLG {
 		t.Fatalf("observed range type overwritten: %#v", vt)
 	}
 	if vt.VideoRange == "DolbyVision" || vt.DVProfile != 0 {
@@ -410,7 +410,7 @@ func TestMergeVirtualCandidateTracksAllObservedKeepsHDRFlagFalse(t *testing.T) {
 		VideoTracks: []models.VideoTrack{{
 			Codec: "h264", Profile: "High", Level: 41,
 			Width: 1920, Height: 1080, BitDepth: 8,
-			VideoRange: "SDR", VideoRangeType: "SDR",
+			VideoRange: videoRangeSDR, VideoRangeType: videoRangeSDR,
 		}},
 	}
 
@@ -443,7 +443,7 @@ func TestMergeVirtualCandidateTracksBareSDRGainsHDRCoherently(t *testing.T) {
 	})
 
 	vt := probed.VideoTracks[0]
-	if vt.VideoRange != "HDR" || vt.VideoRangeType != "HDR10" {
+	if vt.VideoRange != "HDR" || vt.VideoRangeType != videoRangeHDR10 {
 		t.Fatalf("bare track not repainted: %#v", vt)
 	}
 	if vt.BitDepth != 10 {
@@ -471,7 +471,7 @@ func TestMergeVirtualCandidateTracksBareEmptyGainsDVCoherently(t *testing.T) {
 	})
 
 	vt := probed.VideoTracks[0]
-	if vt.VideoRange != "DolbyVision" || vt.VideoRangeType != "DOVI" {
+	if vt.VideoRange != "DolbyVision" || vt.VideoRangeType != videoRangeDOVI {
 		t.Fatalf("bare track not repainted to DV: %#v", vt)
 	}
 	if vt.BitDepth != 10 || vt.DVProfile != 8 || vt.DolbyVision == "" {
@@ -500,7 +500,7 @@ func TestMergeVirtualCandidateTracksLowercaseSDRRepaintsCoherently(t *testing.T)
 	})
 
 	vt := probed.VideoTracks[0]
-	if vt.VideoRange != "DolbyVision" || vt.VideoRangeType != "DOVI" {
+	if vt.VideoRange != "DolbyVision" || vt.VideoRangeType != videoRangeDOVI {
 		t.Fatalf("lowercase sdr not repainted: %#v", vt)
 	}
 	if vt.DVProfile != 8 || vt.DolbyVision == "" || vt.BitDepth != 10 {
@@ -526,7 +526,7 @@ func TestMergeVirtualCandidateTracksWhitespaceRangeRepaintsCoherently(t *testing
 	})
 
 	vt := probed.VideoTracks[0]
-	if vt.VideoRange != "DolbyVision" || vt.VideoRangeType != "DOVI" {
+	if vt.VideoRange != "DolbyVision" || vt.VideoRangeType != videoRangeDOVI {
 		t.Fatalf("whitespace range not repainted: %#v", vt)
 	}
 	if vt.DVProfile != 8 || vt.DolbyVision == "" || vt.BitDepth != 10 {
@@ -695,7 +695,7 @@ func TestVirtualDVMetadataRobustProfileExtraction(t *testing.T) {
 		{raw: "Dolby Vision 2160p", wantDV: true, wantProfile: 0},
 		{raw: "DV 1080p", wantDV: true, wantProfile: 0},
 		{raw: "Dolby Vision 10bit", wantDV: true, wantProfile: 0},
-		{raw: "HDR10", wantDV: false, wantProfile: 0},
+		{raw: videoRangeHDR10, wantDV: false, wantProfile: 0},
 		{raw: "DVD", wantDV: false, wantProfile: 0},
 	}
 	for _, tc := range cases {

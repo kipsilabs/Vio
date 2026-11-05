@@ -101,16 +101,16 @@ Existing library data is preserved when upgrading.
 
 ## Quick start
 
-Requires Docker Compose 2.24 or newer. The default stack runs Vio Server,
-PostgreSQL with pgvector, and Redis.
+Requires Docker Compose 2.24 or newer. The default Compose file runs the
+omnibus image: Silo with a bundled PostgreSQL (with pgvector) and Redis, plus
+Meilisearch when you turn it on.
 
 ```sh
 git clone https://github.com/kipsilabs/Vio.git
 cd Vio
 cp .env.example .env
 chmod 600 .env
-printf '\nPOSTGRES_PASSWORD=%s\nSECRET_KEY=%s\n' \
-  "$(openssl rand -hex 24)" "$(openssl rand -base64 48)" >> .env
+key="$(openssl rand -base64 48)" && printf '\nSECRET_KEY=%s\n' "$key" >> .env
 ```
 
 Set `MEDIA_ROOT` in `.env` to the absolute path of your media, then:
@@ -121,21 +121,32 @@ docker compose up -d
 
 Open <http://localhost:8090> and complete onboarding.
 
-The published developmental image is `ghcr.io/kipsilabs/vio:dev` (override with
-`VIO_IMAGE` to pin a tag or use `:latest` for releases). Server data lives under `/opt/vio` by default;
-set `VIO_DATA_ROOT` in `.env` to relocate it. When running from source, the
-server binary is `./vio`.
+Hardware transcoding (VA-API or NVIDIA) and access for proxy or transcode
+nodes on other hosts are commented out in `docker-compose.yml`; uncomment the
+lines you need.
 
-The [Docker deployment guide](docs/wiki/deployment/docker.md) covers the
-`SECRET_KEY` backup requirement, storage paths, GPU acceleration, Meilisearch,
-external PostgreSQL and Redis, distributed roles, PostgreSQL tuning, backups,
-and updates. Migrating from Silo? Use the
-[Vio migration guide](docs/silo-to-vio-migration.md).
+### Updating an install from before the omnibus image
+
+An install that runs Silo, PostgreSQL, and Redis in separate containers keeps
+that layout when its `.env` sets `COMPOSE_FILE=docker-compose.advanced.yml`; set
+it before updating. `docker-compose.yml` is an example of a new install and
+does not look for an earlier one: started on that data folder, it replaces
+the old `silo` container and comes up on a new, empty database with setup
+open, while the earlier PostgreSQL and Redis keep running with their data
+untouched. Moving into the single container is a separate step. The separate GPU and node Compose files are gone, so a `COMPOSE_FILE`
+that names one fails until it names only the deployment file you use, with
+the matching lines in it uncommented. See [Moving from the multi-container
+stack](docs/architecture/omnibus-image.md#moving-from-the-multi-container-stack).
+
+The [user manual](https://siloserver.org/docs) covers the rest, starting with
+[installation](https://siloserver.org/docs/install): backing up `SECRET_KEY`,
+storage, GPU acceleration, Meilisearch, external PostgreSQL and Redis,
+transcode nodes, PostgreSQL tuning, backups, and updates.
 
 ## Builds and releases
 
 Until the first release, default-branch images carry an ordered `build-N` tag
-and a short commit SHA alongside `latest`. Build numbers order published images;
+and the full commit SHA alongside `latest`. Build numbers order published images;
 they are not release versions. [Release versioning](docs/release-versioning.md)
 defines each tag and the SemVer contract.
 
@@ -170,9 +181,10 @@ an issue useful.
 
 ## License and trademarks
 
-Vio's source code is licensed under the
-**GNU Affero General Public License v3.0 or later** (`AGPL-3.0-or-later`). See
-[LICENSE](LICENSE).
+Silo's source code is licensed under the
+**GNU Affero General Public License v3.0 or later** (`AGPL-3.0-or-later`), with
+an additional permission to combine it with platform SDKs such as the Windows
+App SDK. See [LICENSE](LICENSE) and [PLATFORM-EXCEPTION.md](PLATFORM-EXCEPTION.md).
 
 Vio is based on Silo (© Silo Media L.L.C., AGPL-3.0-or-later). Silo is a trademark of Silo Media L.L.C.; Vio is an unofficial fork, not affiliated with or endorsed by Silo Media.
 

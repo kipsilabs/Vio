@@ -366,10 +366,10 @@ func TestResolveQualityPolicyV3AutoUsesTheLadderUnderACap(t *testing.T) {
 		{"7 Mbps reaches 1080p", uhd, 7_000, 1920, 1080, "1080p", 6_000},
 		{"10 Mbps encodes 1080p at the class bitrate", uhd, 10_000, 1920, 1080, "1080p", 6_000},
 		{"4 Mbps is 720p", uhd, 4_000, 1280, 720, "720p", 2_000},
-		{"2 Mbps is 540p", uhd, 2_000, 960, 540, "540p", 1_800},
+		{"2 Mbps is 720p", uhd, 2_000, 1280, 720, "720p", 2_000},
 		{"1 Mbps is 480p", uhd, 1_000, 854, 480, "480p", 1_000},
 		{"scope keeps its shape", scope, 10_000, 1920, 800, "800p", 6_000},
-		{"60 fps drops a class", uhd60, 7_000, 1280, 720, "720p", 2_000},
+		{"60 fps keeps 1080p", uhd60, 7_000, 1920, 1080, "1080p", 6_000},
 		{"a source over the cap is re-encoded at its own size", SourceDescriptorV3{Width: 1920, Height: 1080, BitrateKbps: 8_000, FrameRate: 24}, 7_000, 1920, 1080, "1080p", 6_000},
 		{"a cropped source over the cap keeps its size and class", SourceDescriptorV3{Width: 1920, Height: 800, BitrateKbps: 8_000, FrameRate: 24}, 7_000, 1920, 800, "800p", 6_000},
 		{"a 4:3 source over the cap keeps its size", SourceDescriptorV3{Width: 1280, Height: 960, BitrateKbps: 8_000, FrameRate: 24}, 7_000, 1280, 960, "960p", 6_000},
@@ -415,16 +415,16 @@ func TestResolveQualityPolicyV3AutoUsesTheLadderForAnEstimate(t *testing.T) {
 		wantBitrate int
 	}{
 		{"7 Mbps reaches 1080p within its budget", uhd, 7_000, 1920, 1080, "1080p", 5_600},
-		{"10 Mbps encodes 1080p at the class bitrate", uhd, 10_000, 1920, 1080, "1080p", 6_000},
-		{"4 Mbps is 720p", uhd, 4_000, 1280, 720, "720p", 2_000},
+		{"10 Mbps encodes 1080p at the class bitrate", uhd, 10_000, 1920, 1080, "1080p", 8_000},
+		{"4 Mbps is 720p", uhd, 4_000, 1280, 720, "720p", 3_200},
 		{"2 Mbps is 540p", uhd, 2_000, 960, 540, "540p", 1_600},
 		{"1 Mbps is 480p", uhd, 1_000, 854, 480, "480p", 800},
-		{"scope keeps its shape", scope, 10_000, 1920, 800, "800p", 6_000},
-		{"60 fps drops a class", uhd60, 7_000, 1280, 720, "720p", 2_000},
+		{"scope keeps its shape", scope, 10_000, 1920, 800, "800p", 8_000},
+		{"60 fps drops a class", uhd60, 7_000, 1280, 720, "720p", 4_000},
 		{"a source over the budget is re-encoded at its own size", SourceDescriptorV3{Width: 1920, Height: 1080, BitrateKbps: 8_000, FrameRate: 24}, 7_000, 1920, 1080, "1080p", 5_600},
 		{"a cropped source over the budget keeps its size and class", SourceDescriptorV3{Width: 1920, Height: 800, BitrateKbps: 8_000, FrameRate: 24}, 7_000, 1920, 800, "800p", 5_600},
 		{"a 4:3 source over the budget keeps its size", SourceDescriptorV3{Width: 1280, Height: 960, BitrateKbps: 8_000, FrameRate: 24}, 7_000, 1280, 960, "960p", 5_600},
-		{"a 720p source over the budget keeps the 720p bitrate", SourceDescriptorV3{Width: 1280, Height: 720, BitrateKbps: 8_000, FrameRate: 24}, 7_000, 1280, 720, "720p", 2_000},
+		{"a 720p source over the budget keeps the 720p bitrate", SourceDescriptorV3{Width: 1280, Height: 720, BitrateKbps: 8_000, FrameRate: 24}, 7_000, 1280, 720, "720p", 4_000},
 		{"an odd source frame is re-encoded at an even size", SourceDescriptorV3{Width: 1920, Height: 1079, BitrateKbps: 8_000, FrameRate: 24}, 7_000, 1918, 1078, "1078p", 5_600},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -510,20 +510,22 @@ func TestLadderClassForSize(t *testing.T) {
 	}
 }
 
-func TestH264EquivalentKbps(t *testing.T) {
+func TestEncodeEquivalentKbps(t *testing.T) {
 	for _, tc := range []struct {
-		name     string
-		srcKbps  int
-		srcCodec string
-		want     int
+		name        string
+		srcKbps     int
+		srcCodec    string
+		targetCodec string
+		want        int
 	}{
-		{"an H.264 source keeps its rate", 12000, "h264", 12000},
-		{"an HEVC source counts at its H.264-equivalent rate", 12000, "hevc", 20000},
-		{"an unknown source rate", 0, "h264", 0},
+		{"an H.264 source keeps its rate", 12000, "h264", transcodeCodecH264, 12000},
+		{"an HEVC source counts at its H.264-equivalent rate", 12000, "hevc", transcodeCodecH264, 20000},
+		{"an H.264 source needs less as HEVC", 20000, "h264", transcodeCodecHEVC, 12000},
+		{"an unknown source rate", 0, "h264", transcodeCodecH264, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := H264EquivalentKbps(tc.srcKbps, tc.srcCodec); got != tc.want {
-				t.Errorf("H264EquivalentKbps(%d, %q) = %d, want %d", tc.srcKbps, tc.srcCodec, got, tc.want)
+			if got := EncodeEquivalentKbps(tc.srcKbps, tc.srcCodec, tc.targetCodec); got != tc.want {
+				t.Errorf("EncodeEquivalentKbps(%d, %q, %q) = %d, want %d", tc.srcKbps, tc.srcCodec, tc.targetCodec, got, tc.want)
 			}
 		})
 	}

@@ -44,7 +44,7 @@ func TestTranscodeManifestResponseGzipsIdenticalBody(t *testing.T) {
 	if got := rec.Header().Get("Content-Type"); got != "application/vnd.apple.mpegurl" {
 		t.Fatalf("Content-Type = %q", got)
 	}
-	if got := rec.Header().Get("Cache-Control"); got != "no-store, max-age=0" {
+	if got := rec.Header().Get("Cache-Control"); got != "no-store, no-transform, max-age=0" {
 		t.Fatalf("Cache-Control = %q, want the no-store semantics preserved", got)
 	}
 	if got := rec.Header().Get("Pragma"); got != "no-cache" {

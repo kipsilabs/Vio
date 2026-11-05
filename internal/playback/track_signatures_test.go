@@ -404,7 +404,7 @@ func TestClientAudioSignatureMatchesTrackUnknownTrackLanguageIsNeutral(t *testin
 		},
 		{
 			name:  "undetermined language with populated codec and channels",
-			track: models.AudioTrack{Language: "und", Codec: "aac", Channels: 2},
+			track: models.AudioTrack{Language: langUndetermined, Codec: "aac", Channels: 2},
 			sig:   &userstore.AudioTrackSignature{Language: "en", Codec: "aac", Channels: 2},
 		},
 		{
@@ -427,7 +427,7 @@ func TestClientAudioSignatureMatchesTrackUnknownTrackLanguageIsNeutral(t *testin
 		},
 		{
 			name:  "sentinel primary with only sentinel members states nothing",
-			track: models.AudioTrack{Language: "mul", Languages: []string{"und"}, Codec: "aac", Channels: 2},
+			track: models.AudioTrack{Language: "mul", Languages: []string{langUndetermined}, Codec: "aac", Channels: 2},
 			sig:   &userstore.AudioTrackSignature{Language: "en", Codec: "aac", Channels: 2},
 		},
 	}
@@ -547,7 +547,7 @@ func TestClientAudioSignatureMatchesTrackRegionalRuleMatrix(t *testing.T) {
 		{
 			name:  "sentinel stated language is neutral on the MULTi field",
 			track: track("en"),
-			sig:   &userstore.AudioTrackSignature{Codec: "aac", Channels: 2, Languages: []string{"und"}},
+			sig:   &userstore.AudioTrackSignature{Codec: "aac", Channels: 2, Languages: []string{langUndetermined}},
 			want:  true,
 		},
 		// The original regression: a partial snapshot is not refuted by a

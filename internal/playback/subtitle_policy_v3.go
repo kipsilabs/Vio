@@ -9,8 +9,26 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Silo-Server/silo-server/internal/lang"
 	"github.com/Silo-Server/silo-server/internal/models"
 )
+
+type SubtitleFactV3 uint8
+
+const (
+	SubtitleFactUnknownV3 SubtitleFactV3 = iota
+	SubtitleFactNoV3
+	SubtitleFactYesV3
+)
+
+type SubtitleTrackFactsV3 interface {
+	OverrideTags(file *models.MediaFile, track models.SubtitleTrack) SubtitleFactV3
+}
+type UnknownSubtitleTrackFactsV3 struct{}
+
+func (UnknownSubtitleTrackFactsV3) OverrideTags(*models.MediaFile, models.SubtitleTrack) SubtitleFactV3 {
+	return SubtitleFactUnknownV3
+}
 
 type SubtitlePolicyResultV3 struct {
 	Decision             SubtitleDecisionV3
@@ -44,6 +62,7 @@ type SubtitleInventoryEntryV3 struct {
 	Forced               bool
 	HearingImpaired      bool
 	DownloadedSubtitleID int `json:"-"`
+	NativeSelectable     bool
 }
 
 // ResolveSubtitlePolicyV3 decides how the selected subtitle is delivered when
@@ -51,7 +70,23 @@ type SubtitleInventoryEntryV3 struct {
 // delivery-specific, so callers must resolve the policy against the delivery
 // class that will actually run the plan rather than assuming the
 // original_http capabilities.
-func ResolveSubtitlePolicyV3(file *models.MediaFile, request StartRequestV3, transcodeAllowed bool, deliveryClass string, additional []SubtitleInventoryEntryV3) SubtitlePolicyResultV3 {
+func SameTrackLanguageV3(a, b string) bool {
+	pa, pb := lang.PrimaryLanguage(a), lang.PrimaryLanguage(b)
+	if pa != "" || pb != "" {
+		return pa != "" && pa == pb
+	}
+	a, b = strings.TrimSpace(a), strings.TrimSpace(b)
+	return a != "" && strings.EqualFold(a, b)
+}
+
+func playedAudioIndexV3(file *models.MediaFile, index int) int {
+	if file == nil || index < 0 || index >= len(file.AudioTracks) {
+		return -1
+	}
+	return index
+}
+
+func ResolveSubtitlePolicyV3(file *models.MediaFile, request StartRequestV3, transcodeAllowed bool, deliveryClass string, additional []SubtitleInventoryEntryV3, audioIndex int, facts SubtitleTrackFactsV3) SubtitlePolicyResultV3 { //nolint:funlen,gocyclo // ResolveSubtitlePolicyV3 exceeds Vio's 100-line and complexity-30 limits; refactor tracked separately
 	index := -1
 	if request.SubtitleTrackIndex != nil {
 		index = *request.SubtitleTrackIndex
@@ -110,10 +145,14 @@ func ResolveSubtitlePolicyV3(file *models.MediaFile, request StartRequestV3, tra
 		// Unknown codecs (arib_caption, ...) have no validated client render
 		// path and no validated burn-in filter; promising a silent burn-in
 		// would produce a plan the transcoder cannot honor.
-		return subtitleTerminalV3("subtitle_codec_unsupported", fmt.Sprintf("Subtitle format %s has no validated rendering or burn-in route.", codec))
+		message := fmt.Sprintf("Subtitle format %s has no validated rendering or burn-in route.", codec)
+		if codec == "" {
+			message = "The subtitle track's format was not recognized, so it has no validated rendering or burn-in route."
+		}
+		return subtitleTerminalV3("subtitle_codec_unsupported", message)
 	}
 	if source == SubtitleSourceEmbeddedV3 && (text || clientBitmap) {
-		if native, nativeCaps, ok := nativeEmbeddedSubtitleV3(file, request, deliveryClass, transportIndex); ok {
+		if native, nativeCaps, ok := nativeEmbeddedSubtitleV3(file, request, deliveryClass, transportIndex, audioIndex, facts); ok {
 			return SubtitlePolicyResultV3{
 				Decision:      SubtitleDecisionV3{Mode: SubtitleRenderV3, TrackID: trackID, Embedded: native},
 				Claims:        SubtitleClaimsV3{ASSStylingPreserved: !ass || nativeCaps.ASSStyling, Reason: "client_embedded_subtitle_supported"},
@@ -159,6 +198,12 @@ func ResolveSubtitlePolicyV3(file *models.MediaFile, request StartRequestV3, tra
 	}
 	if transcodeAllowed {
 		if source != "embedded" {
+			return subtitleTerminalV3("subtitle_burn_in_source_unsupported", "The selected subtitle source cannot be burned in by the installed transport.")
+		}
+		if transportIndex < 0 || transportIndex >= len(file.SubtitleTracks) {
+			return subtitleTerminalV3("subtitle_index_only_burn_in_unsupported", "The selected indexed subtitle cannot be burned in.")
+		}
+		if file.SubtitleTracks[transportIndex].IndexOnly {
 			return subtitleTerminalV3("subtitle_burn_in_source_unsupported", "The selected subtitle source cannot be burned in by the installed transport.")
 		}
 		return SubtitlePolicyResultV3{
@@ -351,11 +396,49 @@ func isClientRenderableBitmapSubtitleV3(codec string) bool {
 	return NeedsBurnIn(codec)
 }
 
+func nativeEmbeddedLimitationsAllowV3(limitations []string, file *models.MediaFile, track models.SubtitleTrack, audioIndex int, facts SubtitleTrackFactsV3) bool {
+	for _, limitation := range limitations {
+		switch strings.ToLower(strings.TrimSpace(limitation)) {
+		case NativeEmbeddedLimitationForcedUnlistedV3:
+			if track.Forced {
+				return false
+			}
+		case NativeEmbeddedLimitationHiddenTrackPreemptionV3:
+			if hiddenSubtitleTrackPreemptsV3(file, audioIndex) {
+				return false
+			}
+		case NativeEmbeddedLimitationLiteralOverrideTagsV3:
+			if facts != nil && facts.OverrideTags(file, track) == SubtitleFactYesV3 {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func hiddenSubtitleTrackPreemptsV3(file *models.MediaFile, audioIndex int) bool {
+	language := ""
+	if i := playedAudioIndexV3(file, audioIndex); i >= 0 {
+		language = file.AudioTracks[i].Language
+	}
+	for _, track := range file.SubtitleTracks {
+		if track.Default && isClientRenderableBitmapSubtitleV3(track.Codec) {
+			return true
+		}
+		if track.Forced && SameTrackLanguageV3(track.Language, language) {
+			return true
+		}
+	}
+	return false
+}
+
 func subtitleTerminalV3(reason, message string) SubtitlePolicyResultV3 {
 	return SubtitlePolicyResultV3{Decision: SubtitleDecisionV3{Mode: SubtitleOffV3}, SelectedIndex: -1, TransportIndex: -1, Terminal: &TerminalV3{Reason: reason, Message: message}}
 }
 
-func nativeEmbeddedSubtitleV3(file *models.MediaFile, request StartRequestV3, deliveryClass string, ordinal int) (*EmbeddedSubtitleV3, NativeEmbeddedSubtitleCapabilityV3, bool) {
+func nativeEmbeddedSubtitleV3(file *models.MediaFile, request StartRequestV3, deliveryClass string, ordinal, audioIndex int, facts SubtitleTrackFactsV3) (*EmbeddedSubtitleV3, NativeEmbeddedSubtitleCapabilityV3, bool) {
 	var none NativeEmbeddedSubtitleCapabilityV3
 	if deliveryClass != DeliveryClassOriginalHTTPV3 || !HasFeatureV3(request.ClientFeatures, FeatureEmbeddedSubtitlesV3) || ordinal < 0 || ordinal >= len(file.SubtitleTracks) {
 		return nil, none, false
@@ -365,7 +448,7 @@ func nativeEmbeddedSubtitleV3(file *models.MediaFile, request StartRequestV3, de
 		return nil, none, false
 	}
 	track := file.SubtitleTracks[ordinal]
-	if track.Index < 0 {
+	if track.IndexOnly || track.Index < 0 {
 		return nil, none, false
 	}
 	// Reject ambiguous source metadata instead of selecting a different stream.
@@ -384,6 +467,9 @@ func nativeEmbeddedSubtitleV3(file *models.MediaFile, request StartRequestV3, de
 			continue
 		}
 		if IsASS(track.Codec) && request.SubtitleFidelityPreference == SubtitleFidelityPreserveV3 && (!capability.ASSStyling || !capability.FontAttachments) {
+			continue
+		}
+		if !nativeEmbeddedLimitationsAllowV3(capability.Limitations, file, track, playedAudioIndexV3(file, audioIndex), facts) {
 			continue
 		}
 		switch capability.TrackIdentity {

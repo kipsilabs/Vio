@@ -384,7 +384,7 @@ func TestReplanVirtualSourceStallSurvivesConcurrentStop(t *testing.T) {
 	}
 	cases := []stallCase{
 		{
-			name:   "virtual_source_unavailable",
+			name:   virtualSourceUnavailableReasonV3,
 			reason: virtualSourceUnavailableReasonV3,
 			request: func(fx *pinnedTrackChangeFixture) playback.ReplanRequestV3 {
 				return fx.trackChangeRequest(1, "pinned-stall-concurrent-stop-0001")
@@ -394,7 +394,7 @@ func TestReplanVirtualSourceStallSurvivesConcurrentStop(t *testing.T) {
 			},
 		},
 		{
-			name:   "replan_virtual_input_timeout",
+			name:   replanVirtualInputTimeoutReasonV3,
 			reason: replanVirtualInputTimeoutReasonV3,
 			request: func(fx *pinnedTrackChangeFixture) playback.ReplanRequestV3 {
 				return fx.failureRecoveryRequest("pinned-stall-input-timeout-0001")

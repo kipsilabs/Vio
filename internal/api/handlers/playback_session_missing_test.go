@@ -28,64 +28,6 @@ func TestPlaybackSessionMissingResponsesUseStableErrorCode(t *testing.T) {
 		wantStatus int // defaults to 404 with the stable error code
 	}{
 		{
-			name: "progress",
-			// Progress for a session that no longer exists is a benign no-op:
-			// version switches delete the old session while a 10s progress tick
-			// is in flight, and answering 404 would just flood the console.
-			wantStatus: http.StatusNoContent,
-			request: func() *http.Request {
-				return playbackTestRequest(
-					http.MethodPost,
-					"/api/v1/playback/"+missingSessionID+"/progress",
-					[]byte(`{"position":12,"is_paused":false}`),
-					map[string]string{"session_id": missingSessionID},
-				)
-			},
-			handle: playbackHandler.HandleUpdateProgress,
-		},
-		{
-			name: "stop",
-			request: func() *http.Request {
-				return playbackTestRequest(
-					http.MethodDelete,
-					"/api/v1/playback/"+missingSessionID,
-					nil,
-					map[string]string{"session_id": missingSessionID},
-				)
-			},
-			handle: playbackHandler.HandleStopPlayback,
-		},
-		{
-			name: "replan",
-			request: func() *http.Request {
-				return playbackTestRequest(
-					http.MethodPost,
-					"/api/v1/playback/"+missingSessionID+"/replan",
-					// A fully valid replan body: the point of this case is the
-					// missing session, so nothing earlier may reject it.
-					[]byte(`{"protocol_version":3,"playback_attempt_id":"attempt-00000001",`+
-						`"replan_request_id":"replan-00000001","failed_plan_id":"plan:00000000000000",`+
-						`"plan_attempt_id":"plan-attempt-1","plan_attempt_key":"v3:0000000000000001",`+
-						`"attempt_count":1,"failure":{"classification":"decoder_error"},`+
-						`"client_capabilities":{"video_evidence":"exact","audio_evidence":"exact"}}`),
-					map[string]string{"session_id": missingSessionID},
-				)
-			},
-			handle: playbackHandler.HandleReplanPlaybackV3,
-		},
-		{
-			name: "websocket",
-			request: func() *http.Request {
-				return playbackTestRequest(
-					http.MethodGet,
-					"/api/v1/playback/sessions/"+missingSessionID+"/control/ws",
-					nil,
-					map[string]string{"session_id": missingSessionID},
-				)
-			},
-			handle: playbackHandler.HandleSessionWebSocket,
-		},
-		{
 			name: "stream",
 			request: func() *http.Request {
 				return playbackTestRequest(

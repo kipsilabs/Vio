@@ -69,6 +69,14 @@
       "effective_audio_language": "en"
     }
   ],
+  "collections": [
+    {
+      "id": "oscar-winners",
+      "title": "Oscar Winners",
+      "poster_url": "https://cdn.example.invalid/oscar-winners.jpg",
+      "item_count": 12
+    }
+  ],
   "rating_sources": [
     {
       "source": "imdb",
@@ -84,13 +92,5 @@
       "display": "8.3"
     }
   ],
-  "subtitles": [],
-  "collections": [
-    {
-      "id": "oscar-winners",
-      "title": "Oscar Winners",
-      "poster_url": "https://cdn.example.invalid/oscar-winners.jpg",
-      "item_count": 12
-    }
-  ]
+  "subtitles": []
 }

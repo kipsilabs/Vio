@@ -277,6 +277,8 @@ export interface ActionBarProps {
   hasVirtualSource?: boolean;
   playbackVariants?: PlaybackVariant[];
   selectedVersion?: FileVersion | null;
+  /** The viewer chose selectedVersion rather than playing the default version. */
+  versionPicked?: boolean;
   /**
    * The version the viewer picked is no longer in the refreshed row set. Play
    * is blocked until they pick again instead of silently starting another
@@ -311,7 +313,6 @@ export interface ActionBarProps {
   preferredSubtitleTrackSignature?: PlayerSubtitleTrackSignature | null;
   subtitleMode?: SubtitleMode;
   showForcedSubtitles?: boolean;
-  profileLanguage?: string | null;
 }
 
 export default function ActionBar({
@@ -357,6 +358,7 @@ export default function ActionBar({
   hasVirtualSource = false,
   playbackVariants,
   selectedVersion,
+  versionPicked = false,
   selectedVersionMissing = false,
   onSelectVersion,
   onVersionPickerOpenChange,
@@ -380,7 +382,6 @@ export default function ActionBar({
   preferredSubtitleTrackSignature,
   subtitleMode,
   showForcedSubtitles,
-  profileLanguage,
 }: ActionBarProps) {
   const navigate = useNavigate();
   const location = useLocation();
@@ -591,6 +592,7 @@ export default function ActionBar({
       prePlaySubtitleSelection:
         prePlaySubtitleMode === "explicit" ? explicitSubtitleSelection : null,
       explicitFileSelection,
+      versionPicked,
     }),
     [
       audioSelectionMode,
@@ -598,6 +600,7 @@ export default function ActionBar({
       explicitSubtitleSelection,
       explicitFileSelection,
       prePlaySubtitleMode,
+      versionPicked,
     ],
   );
   const startPlaybackFromHref = useCallback(
@@ -1556,7 +1559,6 @@ export default function ActionBar({
               preferredSubtitleTrackSignature={preferredSubtitleTrackSignature}
               subtitleMode={subtitleMode}
               showForcedSubtitles={showForcedSubtitles}
-              profileLanguage={profileLanguage}
               activeAudioTrackIndex={
                 audioSelectionMode === "explicit" ? explicitAudioTrackIndex : null
               }

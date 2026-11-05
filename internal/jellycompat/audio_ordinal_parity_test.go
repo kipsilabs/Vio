@@ -106,8 +106,10 @@ func TestEnsureTranscodeSession_MultiAudioUsesContainerOrdinal(t *testing.T) {
 	if len(args) == 0 {
 		t.Fatalf("ffmpeg args were not recorded to %s", argsPath)
 	}
-	if !strings.Contains(string(args), "-map\n0:a:0?\n") {
-		t.Fatalf("ffmpeg args missing -map 0:a:0? for the English track: %s", string(args))
+	// The negotiated pick is mandatory, so the map carries no optional marker:
+	// a source missing it must fail rather than stream video without audio.
+	if !strings.Contains(string(args), "-map\n0:a:0\n") {
+		t.Fatalf("ffmpeg args missing -map 0:a:0 for the English track: %s", string(args))
 	}
 }
 

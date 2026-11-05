@@ -1,13 +1,19 @@
 package streamtoken
 
 import (
+	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 )
 
 const (
+	// PlayMethodBandwidthProbe identifies a token used only for a bounded
+	// connection-speed measurement. It must not be accepted as a media
+	// playback token by older routes.
+	PlayMethodBandwidthProbe = "bandwidth_probe_v1"
 	// PlayMethodDownload identifies a token minted only after the API has
 	// authorized a file download. Proxy download routes reject playback tokens.
 	PlayMethodDownload = "download"
@@ -26,6 +32,11 @@ const (
 	// PlayMethodCopyFMP4Transcode makes the versioned copy-video timestamp and
 	// bitstream recipe fail closed on readers predating that recipe.
 	PlayMethodCopyFMP4Transcode = "transcode_copy_fmp4_v1"
+	// PlayMethodSubtitleRenditionsTranscode and PlayMethodSubtitleRenditionsCopyFMP4
+	// mark tokens that carry on-demand subtitle rendition metadata. Older readers
+	// must reject them rather than rebuilding an incomplete playlist.
+	PlayMethodSubtitleRenditionsTranscode = "transcode_subtitle_renditions_v1"
+	PlayMethodSubtitleRenditionsCopyFMP4  = "transcode_copy_fmp4_subtitle_renditions_v1"
 	// PlayMethodThemeDirect and PlayMethodThemeAAC authorize a detail-page
 	// theme song: its original bytes, or its progressive AAC conversion. They
 	// are not playback sessions, and workers that predate them reject them, so
@@ -64,12 +75,15 @@ type Claims struct {
 	// SourceFrameRate and SourceHeight let a token-carried reconstruction keep
 	// the frame-accurate GOP and detect a no-op scale. Zero decodes to the
 	// historical 30 fps / unknown-height behavior.
-	SourceFrameRate float64 `json:"sfr,omitempty"`
-	SourceHeight    int     `json:"sh,omitempty"`
-	AudioCodec      string  `json:"ac,omitempty"`
-	AudioChannels   int     `json:"ach,omitempty"`
-	AudioTrackIndex int     `json:"ati,omitempty"`
-	AudioOnly       bool    `json:"ao,omitempty"`
+	SourceFrameRate         float64 `json:"sfr,omitempty"`
+	SourceHeight            int     `json:"sh,omitempty"`
+	AudioCodec              string  `json:"ac,omitempty"`
+	CopyAudioCodec          string  `json:"cac,omitempty"`
+	HLSVariableSubstitution bool    `json:"hlsvs,omitempty"`
+	AudioChannels           int     `json:"ach,omitempty"`
+	AudioTrackIndex         int     `json:"ati,omitempty"`
+	RequireAudioTrack       bool    `json:"rat,omitempty"`
+	AudioOnly               bool    `json:"ao,omitempty"`
 	// DVProfile is the file's Dolby Vision profile (0 = none); remux nodes
 	// use it to strip dangling profile 7 RPUs. Absent in older tokens, which
 	// decodes as 0 (no strip — the pre-existing behavior).
@@ -133,6 +147,7 @@ type Claims struct {
 	ToneMapDVRPUPresent        bool    `json:"tmdr,omitempty"`
 	VideoBitstreamFilter       string  `json:"vbsf,omitempty"`
 	VideoSampleEntry           string  `json:"vse,omitempty"`
+	VideoRange                 string  `json:"vr,omitempty"`
 	CopyVideoMPEGTS            bool    `json:"cvts,omitempty"`
 	KeyframePlaylist           bool    `json:"kfp,omitempty"`
 	OutputSubdir               string  `json:"osd,omitempty"`
@@ -146,14 +161,23 @@ type Claims struct {
 	SubtitleCodec              string  `json:"sbc,omitempty"`
 	// SubtitleRendition emits the selected text track as the HLS WebVTT
 	// subtitle rendition of the transcode's own playlist.
-	SubtitleRendition      bool    `json:"srn,omitempty"`
-	TargetBitrateKbps      int     `json:"tbr,omitempty"`
-	TotalDuration          float64 `json:"dur,omitempty"`
-	FastStart              bool    `json:"fs,omitempty"`
-	ThrottleSeconds        int     `json:"ths,omitempty"`
-	TargetCodecAudio       string  `json:"tca,omitempty"`
-	TargetAudioChannels    int     `json:"tac,omitempty"`
-	TargetAudioBitrateKbps int     `json:"tabr,omitempty"`
+	SubtitleRendition bool `json:"srn,omitempty"`
+	// SubtitleRenditionTracks and source facts freeze the on-demand rendition
+	// inventory and the media version it was generated from.
+	SubtitleRenditionTracks        []uint64 `json:"srt,omitempty"`
+	SubtitleRenditionNames         []string `json:"srnms,omitempty"`
+	SubtitleRenditionLanguages     []string `json:"srl,omitempty"`
+	SubtitleRenditionForced        []bool   `json:"srf,omitempty"`
+	SubtitleRenditionDefault       uint64   `json:"srd,omitempty"`
+	SubtitleRenditionSourceSize    int64    `json:"srs,omitempty"`
+	SubtitleRenditionSourceModTime int64    `json:"srm,omitempty"`
+	TargetBitrateKbps              int      `json:"tbr,omitempty"`
+	TotalDuration                  float64  `json:"dur,omitempty"`
+	FastStart                      bool     `json:"fs,omitempty"`
+	ThrottleSeconds                int      `json:"ths,omitempty"`
+	TargetCodecAudio               string   `json:"tca,omitempty"`
+	TargetAudioChannels            int      `json:"tac,omitempty"`
+	TargetAudioBitrateKbps         int      `json:"tabr,omitempty"`
 
 	// Recipe staleness hint, bumped on each re-mint after a recipe mutation
 	// (audio/quality/seek switch). An optional client-side hint only.
@@ -186,8 +210,16 @@ func (c *Claims) StartedAt() (time.Time, StartedAtSource) {
 	return time.Time{}, StartedAtSourceNone
 }
 
+// ErrNoSecret reports that no signing secret is configured. An empty HMAC key
+// is one anyone can sign with, so Sign and Verify refuse it rather than mint
+// or accept tokens that grant arbitrary media paths.
+var ErrNoSecret = errors.New("stream token: signing secret is not configured")
+
 // Sign creates a signed JWT string from the given claims.
 func Sign(c Claims, secret string, ttl time.Duration) (string, error) {
+	if strings.TrimSpace(secret) == "" {
+		return "", ErrNoSecret
+	}
 	now := time.Now()
 	c.RegisteredClaims = jwt.RegisteredClaims{
 		ExpiresAt: jwt.NewNumericDate(now.Add(ttl)),
@@ -199,6 +231,9 @@ func Sign(c Claims, secret string, ttl time.Duration) (string, error) {
 
 // Verify parses and validates a stream token JWT string.
 func Verify(tokenString, secret string) (*Claims, error) {
+	if strings.TrimSpace(secret) == "" {
+		return nil, ErrNoSecret
+	}
 	token, err := jwt.ParseWithClaims(tokenString, &Claims{}, func(token *jwt.Token) (any, error) {
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])

@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Silo-Server/silo-server/internal/database/readtx"
 	"github.com/Silo-Server/silo-server/internal/userstore"
 )
 
@@ -52,29 +53,6 @@ func scanWatchHistoryEntry(scanner interface {
 		_ = json.Unmarshal([]byte(identityJSON), &entry.Identity)
 	}
 	return &entry, nil
-}
-
-// withWatchStateSeries runs fn in one transaction that holds the shared
-// episode-series lock for every target before fn resolves a canonical id, and
-// commits only after fn succeeds. Watch-state writers must use it (or take the
-// same lock in a caller transaction) so reconciliation cannot repair a series
-// in the middle of a resolve-then-write sequence.
-func (s *PostgresUserStore) withWatchStateSeries(ctx context.Context, mediaItemIDs []string, fn func(pgx.Tx) error) error {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("begin watch-state write: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	if err := lockWatchStateSeries(ctx, tx, mediaItemIDs); err != nil {
-		return err
-	}
-	if err := fn(tx); err != nil {
-		return err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit watch-state write: %w", err)
-	}
-	return nil
 }
 
 func (s *PostgresUserStore) UpdateProgress(ctx context.Context, profileID, mediaItemID string, position, duration float64, thresholds userstore.ProgressThresholds) error {
@@ -320,174 +298,6 @@ func (s *PostgresUserStore) ListProgressSince(ctx context.Context, profileID, cu
 	return results, strconv.FormatInt(next, 10), nil
 }
 
-// ListNextUpStatePage reads one Next Up state page for a profile within this
-// store's account, newest first. See userstore.NextUpStateStore for the full
-// contract.
-//
-// The page predicate `completed = TRUE OR position_seconds > 0` spans the two
-// existing partial indexes rather than a single one, so a naive OR would make
-// the planner scan the whole profile and sort. Instead each disjoint half is
-// read through its own index-bounded, keyset-bounded branch and the branches
-// are merged:
-//   - completed rows ride idx_uwp_profile_completed_cursor
-//     (user_id, profile_id, updated_at DESC, media_item_id DESC) WHERE completed
-//     = TRUE, so the (updated_at, media_item_id) comparison is one ordered seek;
-//   - in-progress rows ride idx_uwp_profile_in_progress
-//     (user_id, profile_id, updated_at DESC) WHERE completed = FALSE.
-//
-// The halves are disjoint (completed TRUE vs FALSE) so the union needs no
-// distinct. Each branch reads limit+1 rows, the merge reads limit+1, and the
-// shared exhaustion rule still holds: a result of at most limit rows means both
-// branches were fully drained. The hidden-history NOT EXISTS probe rides the
-// user_history_hidden_items (user_id, profile_id, media_item_id) primary key.
-func (s *PostgresUserStore) ListNextUpStatePage(ctx context.Context, profileID string, cursor *userstore.NextUpStateCursor, limit int) (userstore.NextUpStatePage, error) {
-	if limit <= 0 {
-		return userstore.NextUpStatePage{}, userstore.ErrNextUpStateInvalidLimit
-	}
-	if err := ctx.Err(); err != nil {
-		return userstore.NextUpStatePage{}, err
-	}
-
-	args := []any{s.userID, profileID}
-	keyset := ""
-	if cursor != nil {
-		keyset = `
-		  AND (uwp.updated_at, uwp.media_item_id) < ($3, $4)`
-		args = append(args, cursor.UpdatedAt.UTC(), cursor.MediaItemID)
-	}
-	// The same limit placeholder is shared by both branches and the outer merge.
-	limitPlaceholder := "$" + strconv.Itoa(len(args)+1)
-	args = append(args, limit+1)
-
-	query := `
-		SELECT merged.media_item_id, merged.completed, merged.position_seconds, merged.updated_at
-		FROM (
-			(SELECT uwp.media_item_id, uwp.completed, uwp.position_seconds, uwp.updated_at
-			 FROM user_watch_progress uwp
-			 WHERE uwp.user_id = $1
-			   AND uwp.profile_id = $2
-			   AND uwp.completed = TRUE
-			   AND NOT EXISTS (
-				SELECT 1
-				FROM user_history_hidden_items hhi
-				WHERE hhi.user_id = uwp.user_id
-				  AND hhi.profile_id = uwp.profile_id
-				  AND hhi.media_item_id = uwp.media_item_id
-				  AND hhi.hidden_before >= uwp.updated_at
-			   )` + keyset + `
-			 ORDER BY uwp.updated_at DESC, uwp.media_item_id DESC
-			 LIMIT ` + limitPlaceholder + `)
-			UNION ALL
-			(SELECT uwp.media_item_id, uwp.completed, uwp.position_seconds, uwp.updated_at
-			 FROM user_watch_progress uwp
-			 WHERE uwp.user_id = $1
-			   AND uwp.profile_id = $2
-			   AND uwp.completed = FALSE
-			   AND uwp.position_seconds > 0
-			   AND NOT EXISTS (
-				SELECT 1
-				FROM user_history_hidden_items hhi
-				WHERE hhi.user_id = uwp.user_id
-				  AND hhi.profile_id = uwp.profile_id
-				  AND hhi.media_item_id = uwp.media_item_id
-				  AND hhi.hidden_before >= uwp.updated_at
-			   )` + keyset + `
-			 ORDER BY uwp.updated_at DESC, uwp.media_item_id DESC
-			 LIMIT ` + limitPlaceholder + `)
-		) merged
-		ORDER BY merged.updated_at DESC, merged.media_item_id DESC
-		LIMIT ` + limitPlaceholder
-
-	rows, err := s.pool.Query(ctx, query, args...)
-	if err != nil {
-		return userstore.NextUpStatePage{}, fmt.Errorf("listing next up state page: %w", err)
-	}
-	defer rows.Close()
-
-	entries := make([]userstore.NextUpStateEntry, 0, limit+1)
-	for rows.Next() {
-		var entry userstore.NextUpStateEntry
-		var updatedAt time.Time
-		if err := rows.Scan(&entry.MediaItemID, &entry.Completed, &entry.Position, &updatedAt); err != nil {
-			return userstore.NextUpStatePage{}, fmt.Errorf("scanning next up state row: %w", err)
-		}
-		entry.UpdatedAt = updatedAt.UTC()
-		entries = append(entries, entry)
-	}
-	if err := rows.Err(); err != nil {
-		return userstore.NextUpStatePage{}, fmt.Errorf("iterating next up state rows: %w", err)
-	}
-	// A cancellation that lands after the last row was scanned must surface as
-	// the context error, never as a short page the caller would treat as
-	// authoritative.
-	if err := ctx.Err(); err != nil {
-		return userstore.NextUpStatePage{}, err
-	}
-
-	return userstore.NextUpStatePageFromEntries(entries, limit), nil
-}
-
-// ListNextUpStateForItems returns the exact Next Up state rows for the given
-// media item ids, scoped to this store's account and the profile. See
-// userstore.NextUpStateStore for the full contract.
-//
-// Unlike ListNextUpStatePage there is no keyset and no sort: the caller already
-// chose the items, and order is unspecified. Empty input short-circuits before
-// touching the pool.
-//
-// Indexes: user_watch_progress_pkey (user_id, profile_id, media_item_id) serves
-// the id equality list, and the user_history_hidden_items_pkey
-// (user_id, profile_id, media_item_id) serves the hidden NOT EXISTS probe.
-func (s *PostgresUserStore) ListNextUpStateForItems(ctx context.Context, profileID string, mediaItemIDs []string) ([]userstore.NextUpStateEntry, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if len(mediaItemIDs) == 0 {
-		return nil, nil
-	}
-
-	rows, err := s.pool.Query(ctx, `
-		SELECT uwp.media_item_id, uwp.completed, uwp.position_seconds, uwp.updated_at
-		FROM user_watch_progress uwp
-		WHERE uwp.user_id = $1
-		  AND uwp.profile_id = $2
-		  AND uwp.media_item_id = ANY($3::text[])
-		  AND (uwp.completed = TRUE OR uwp.position_seconds > 0)
-		  AND NOT EXISTS (
-			SELECT 1
-			FROM user_history_hidden_items hhi
-			WHERE hhi.user_id = uwp.user_id
-			  AND hhi.profile_id = uwp.profile_id
-			  AND hhi.media_item_id = uwp.media_item_id
-			  AND hhi.hidden_before >= uwp.updated_at
-		  )`, s.userID, profileID, mediaItemIDs)
-	if err != nil {
-		return nil, fmt.Errorf("listing next up state for items: %w", err)
-	}
-	defer rows.Close()
-
-	entries := make([]userstore.NextUpStateEntry, 0, len(mediaItemIDs))
-	for rows.Next() {
-		var entry userstore.NextUpStateEntry
-		var updatedAt time.Time
-		if err := rows.Scan(&entry.MediaItemID, &entry.Completed, &entry.Position, &updatedAt); err != nil {
-			return nil, fmt.Errorf("scanning next up state item row: %w", err)
-		}
-		entry.UpdatedAt = updatedAt.UTC()
-		entries = append(entries, entry)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterating next up state item rows: %w", err)
-	}
-	// A cancellation that lands after the last row was scanned must surface as
-	// the context error, never as a short result the caller would treat as exact.
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-
-	return entries, nil
-}
-
 func (s *PostgresUserStore) MarkWatched(ctx context.Context, profileID, mediaItemID string, duration float64) error {
 	if duration < 0 {
 		duration = 0
@@ -660,6 +470,7 @@ func (s *PostgresUserStore) markWatchedBatchTx(ctx context.Context, tx pgx.Tx, p
 	mediaItemIDs := make([]string, 0, len(targets))
 	durations := make([]float64, 0, len(targets))
 	eventDates := make([]*time.Time, 0, len(targets))
+	rewatchIDs := make([]string, 0)
 	explicitDates := false
 	seen := make(map[string]struct{}, len(targets))
 	for _, target := range targets {
@@ -667,19 +478,22 @@ func (s *PostgresUserStore) markWatchedBatchTx(ctx context.Context, tx pgx.Tx, p
 		if mediaItemID == "" {
 			continue
 		}
-		canonicalID := canonicalByID[mediaItemID]
-		if _, ok := seen[canonicalID]; ok {
+		mediaItemID = canonicalByID[mediaItemID]
+		if _, ok := seen[mediaItemID]; ok {
 			continue
 		}
-		seen[canonicalID] = struct{}{}
+		seen[mediaItemID] = struct{}{}
 		duration := target.DurationSeconds
 		if duration < 0 {
 			duration = 0
 		}
-		mediaItemIDs = append(mediaItemIDs, canonicalID)
+		mediaItemIDs = append(mediaItemIDs, mediaItemID)
 		durations = append(durations, duration)
 		eventDates = append(eventDates, target.EventAt)
 		explicitDates = explicitDates || target.EventAt != nil
+		if target.RecordRewatch {
+			rewatchIDs = append(rewatchIDs, mediaItemID)
+		}
 	}
 	if len(mediaItemIDs) == 0 {
 		return nil, nil
@@ -776,13 +590,15 @@ func (s *PostgresUserStore) markWatchedBatchTx(ctx context.Context, tx pgx.Tx, p
 			completed = TRUE,
 			updated_at = EXCLUDED.updated_at,
 			event_at = EXCLUDED.event_at
- WHERE NOT user_watch_progress.completed OR EXISTS (
+ WHERE NOT user_watch_progress.completed
+  OR (user_watch_progress.position_seconds > 0 AND user_watch_progress.media_item_id = ANY($7::text[]))
+  OR EXISTS (
   SELECT 1 FROM user_history_hidden_items hhi
   WHERE hhi.user_id = user_watch_progress.user_id AND hhi.profile_id = user_watch_progress.profile_id
   AND hhi.media_item_id = user_watch_progress.media_item_id AND user_watch_progress.updated_at <= hhi.hidden_before
  )
  RETURNING media_item_id`,
-		s.userID, profileID, mediaItemIDs, durations, now, eventDates,
+		s.userID, profileID, mediaItemIDs, durations, now, eventDates, rewatchIDs,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("marking watched batch: %w", err)
@@ -872,6 +688,10 @@ func (s *PostgresUserStore) markWatchedBatchTx(ctx context.Context, tx pgx.Tx, p
 // in mediaItemIDs in a single statement. Used by the jellycompat series
 // mark-played path so a 200-episode mark collapses to one INSERT.
 func (s *PostgresUserStore) MarkProgressBatch(ctx context.Context, profileID string, mediaItemIDs []string, updatedAt time.Time) error {
+	mediaItemIDs = compactMediaItemIDs(mediaItemIDs)
+	if len(mediaItemIDs) == 0 {
+		return nil
+	}
 	if updatedAt.IsZero() {
 		updatedAt = time.Now().UTC()
 	}
@@ -922,12 +742,21 @@ func (s *PostgresUserStore) MarkProgressBatch(ctx context.Context, profileID str
 
 // ClearProgressBatch resets every (user, profile, media_item_id) row to
 // `completed = FALSE, position_seconds = 0` in a single UPDATE. Rows that
-// don't exist are silently skipped. (Mark-unplayed flows currently go through
-// RemoveHistoryItems; this remains on the interface for bulk resets.)
+// don't exist are silently skipped. (Mark-unplayed flows go through
+// ClearWatchedState; this remains on the interface for bulk resets.)
 func (s *PostgresUserStore) ClearProgressBatch(ctx context.Context, profileID string, mediaItemIDs []string, updatedAt time.Time) error {
+	mediaItemIDs = compactMediaItemIDs(mediaItemIDs)
+	if len(mediaItemIDs) == 0 {
+		return nil
+	}
 	if updatedAt.IsZero() {
 		updatedAt = time.Now().UTC()
 	}
+	// Clear partially-watched rows (completed = FALSE with position_seconds > 0)
+	// in addition to fully-completed ones — the prior ClearProgress path
+	// DELETE-d the row unconditionally, so any non-default state must be
+	// cleared. Skip rows already in the target state (completed = FALSE AND
+	// position_seconds = 0) to avoid pointless writes.
 	return s.withWatchStateSeries(ctx, mediaItemIDs, func(tx pgx.Tx) error {
 		canonicalIDs, err := canonicalWatchStateIDs(ctx, tx, mediaItemIDs)
 		if err != nil {
@@ -936,11 +765,6 @@ func (s *PostgresUserStore) ClearProgressBatch(ctx context.Context, profileID st
 		if len(canonicalIDs) == 0 {
 			return nil
 		}
-		// Clear partially-watched rows (completed = FALSE with position_seconds > 0)
-		// in addition to fully-completed ones — the prior ClearProgress path
-		// DELETE-d the row unconditionally, so any non-default state must be
-		// cleared. Skip rows already in the target state (completed = FALSE AND
-		// position_seconds = 0) to avoid pointless writes.
 		_, err = tx.Exec(ctx, `
 		UPDATE user_watch_progress
 		SET completed = FALSE, position_seconds = 0, updated_at = $4
@@ -957,7 +781,16 @@ func (s *PostgresUserStore) ClearProgressBatch(ctx context.Context, profileID st
 }
 
 func (s *PostgresUserStore) GetProgress(ctx context.Context, profileID, mediaItemID string) (*userstore.WatchProgress, error) {
-	row := s.pool.QueryRow(ctx, `
+	wp, err := scanProgressRow(s.pool.QueryRow(ctx, progressSQL, s.userID, profileID, mediaItemID))
+	if err != nil {
+		return nil, fmt.Errorf("getting progress: %w", err)
+	}
+	return wp, nil
+}
+
+// progressSQL reads one item's visible progress row: $1 user, $2 profile,
+// $3 media item.
+const progressSQL = `
 		SELECT profile_id, media_item_id, position_seconds, duration_seconds, completed, updated_at,
 		       last_file_id, last_resolution, last_hdr, last_codec_video, last_edition_key
 		FROM user_watch_progress
@@ -969,17 +802,15 @@ func (s *PostgresUserStore) GetProgress(ctx context.Context, profileID, mediaIte
 			  AND hhi.profile_id = user_watch_progress.profile_id
 			  AND hhi.media_item_id = user_watch_progress.media_item_id
 			  AND user_watch_progress.updated_at <= hhi.hidden_before
-		  )`,
-		s.userID, profileID, mediaItemID,
-	)
+		  )`
+
+// scanProgressRow reads the row progressSQL selects, nil when there is none.
+func scanProgressRow(row pgx.Row) (*userstore.WatchProgress, error) {
 	wp, err := scanWatchProgress(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
-	if err != nil {
-		return nil, fmt.Errorf("getting progress: %w", err)
-	}
-	return wp, nil
+	return wp, err
 }
 
 // progressListSelect is the projection, profile scope, and hidden-item
@@ -1315,11 +1146,9 @@ var _ userstore.SeriesEpisodeRollupStore = (*PostgresUserStore)(nil)
 // every requested series (a 50-series page of an episode-heavy library
 // expanded to 32k episode rows and ~65 sequential queries, ~17s measured).
 //
-// Semantics mirror the canonical episode path:
-//   - alias layout rows (episode_aliases.alias_episode_id) are excluded;
-//   - a canonical episode counts when it is available through an
-//     episode_libraries row or through a present file owned by one of its alias
-//     rows;
+// Semantics mirror the chunked path exactly:
+//   - episodes count when they are available (episode_libraries row — the same
+//     predicate as catalog's episode listings);
 //   - a progress row is visible unless hidden via user_history_hidden_items
 //     (updated_at <= hidden_before), matching ListProgressByMediaItems;
 //   - watched = visible completed progress OR a visible completed history row
@@ -1334,6 +1163,11 @@ func (s *PostgresUserStore) SeriesEpisodeWatchCounts(ctx context.Context, profil
 	if len(seriesIDs) == 0 {
 		return map[string]userstore.SeriesWatchCounts{}, nil
 	}
+	if len(seriesIDs) == 1 {
+		return queryOneSeriesWatchCounts[string](ctx, s, `SELECT e.series_id,`+oneSeriesWatchCountsSQL+`
+		  AND e.series_id = $3
+		GROUP BY e.series_id`, profileID, seriesIDs[0])
+	}
 	return queryEpisodeWatchCounts[string](ctx, s, `SELECT e.series_id,`+episodeWatchCountsSQL+`
 		  AND e.series_id = ANY($3::text[])
 		GROUP BY e.series_id`, profileID, seriesIDs)
@@ -1343,7 +1177,7 @@ func (s *PostgresUserStore) SeriesEpisodeWatchCounts(ctx context.Context, profil
 // by episode season number like catalog's ListBySeriesGroupedBySeason. The
 // season list reads each season's episode count from it as well.
 func (s *PostgresUserStore) SeriesSeasonWatchCounts(ctx context.Context, profileID, seriesID string) (map[int]userstore.SeriesWatchCounts, error) {
-	return queryEpisodeWatchCounts[int](ctx, s, `SELECT e.season_number,`+episodeWatchCountsSQL+`
+	return queryOneSeriesWatchCounts[int](ctx, s, `SELECT e.season_number,`+oneSeriesWatchCountsSQL+`
 		  AND e.series_id = $3
 		GROUP BY e.season_number`, profileID, seriesID)
 }
@@ -1362,14 +1196,19 @@ func (s *PostgresUserStore) SeasonEpisodeWatchCounts(ctx context.Context, profil
 // episodeWatchCountsSQL is the rollup shared by the series and season
 // variants. Each selects its grouping column first, then appends its $3
 // parent filter and GROUP BY.
-//
-// The counted set is the canonical episode set: a row named by
-// episode_aliases.alias_episode_id is excluded, and a canonical episode is
-// available when it has an episode_libraries row or a present file owned by
-// one of its alias rows. That matches the catalog's canonical episode lists
-// while keeping file-backed canonical rows countable before their own
-// media_files row exists.
-const episodeWatchCountsSQL = `
+var episodeWatchCountsSQL = fmt.Sprintf(episodeWatchCountsTemplate, "")
+
+// oneSeriesWatchCountsSQL is episodeWatchCountsSQL for one series. OFFSET 0
+// keeps its completed-history check a key lookup per episode, so the work
+// follows the series' episode count whatever the profile's history. Without
+// it a plan can hash the profile's whole history instead, and a generic plan
+// prices that hash for the average profile: for a profile with 53k history
+// rows it took about 100 ms where the lookups take under 1 ms. Pages of
+// several series keep the planner's choice, since hashing a short history
+// beats a lookup for each of their many episodes.
+var oneSeriesWatchCountsSQL = fmt.Sprintf(episodeWatchCountsTemplate, "OFFSET 0")
+
+const episodeWatchCountsTemplate = `
 		       COUNT(*)::int,
 		       COUNT(*) FILTER (WHERE ws.watched)::int,
 		       COUNT(*) FILTER (WHERE NOT ws.watched AND ws.resumable)::int
@@ -1392,6 +1231,7 @@ const episodeWatchCountsSQL = `
 		                  WHERE hh.user_id = h.user_id AND hh.profile_id = h.profile_id
 		                    AND hh.media_item_id = h.media_item_id AND h.watched_at <= hh.hidden_before
 		              )
+		              %s
 		        ) AS watched,
 		        COALESCE(p.position_seconds, 0) > 0 AS resumable
 		) ws
@@ -1421,20 +1261,47 @@ func queryEpisodeWatchCounts[K comparable](ctx context.Context, s *PostgresUserS
 	defer rows.Close()
 
 	result := make(map[K]userstore.SeriesWatchCounts)
-	for rows.Next() {
-		var key K
-		var counts userstore.SeriesWatchCounts
-		if err := rows.Scan(&key, &counts.TotalEpisodes, &counts.WatchedCount, &counts.InProgressCount); err != nil {
-			return nil, fmt.Errorf("scanning episode watch counts: %w", err)
-		}
-		result[key] = counts
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterating episode watch counts: %w", err)
+	if err := scanEpisodeWatchCounts(rows, result); err != nil {
+		return nil, err
 	}
 	return result, nil
 }
 
+// queryOneSeriesWatchCounts runs a oneSeriesWatchCountsSQL rollup on the
+// connection's generic plan. Planning it takes 1-2 ms, more than running it
+// for most series, and PostgreSQL would plan it again on every call because
+// the generic plan is priced for an average series.
+func queryOneSeriesWatchCounts[K comparable](ctx context.Context, s *PostgresUserStore, query, profileID, seriesID string) (map[K]userstore.SeriesWatchCounts, error) {
+	result := make(map[K]userstore.SeriesWatchCounts)
+	err := readtx.Query(ctx, s.pool, query, []any{s.userID, profileID, seriesID}, func(rows pgx.Rows) error {
+		return scanEpisodeWatchCounts(rows, result)
+	}, readtx.GenericPlan)
+	if err != nil {
+		return nil, fmt.Errorf("aggregating episode watch counts: %w", err)
+	}
+	return result, nil
+}
+
+func scanEpisodeWatchCounts[K comparable](rows pgx.Rows, result map[K]userstore.SeriesWatchCounts) error {
+	for rows.Next() {
+		var key K
+		var counts userstore.SeriesWatchCounts
+		if err := rows.Scan(&key, &counts.TotalEpisodes, &counts.WatchedCount, &counts.InProgressCount); err != nil {
+			return fmt.Errorf("scanning episode watch counts: %w", err)
+		}
+		result[key] = counts
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterating episode watch counts: %w", err)
+	}
+	return nil
+}
+
+// UpdateProgressHints writes the version hints of an existing progress row.
+// Heartbeats and stops repeat the hints of the file being played, so the
+// update matches only when a hint changed: the stamp trigger restamps
+// synced_seq on every update, which would resend an unchanged row to every
+// offline-sync device.
 func (s *PostgresUserStore) UpdateProgressHints(ctx context.Context, profileID, mediaItemID string, hints userstore.VersionHints) error {
 	return s.withWatchStateSeries(ctx, []string{mediaItemID}, func(tx pgx.Tx) error {
 		targetID, err := canonicalWatchStateID(ctx, tx, mediaItemID)
@@ -1444,7 +1311,9 @@ func (s *PostgresUserStore) UpdateProgressHints(ctx context.Context, profileID, 
 		_, err = tx.Exec(ctx, `
 		UPDATE user_watch_progress
 		SET last_file_id = $4, last_resolution = $5, last_hdr = $6, last_codec_video = $7, last_edition_key = $8
-		WHERE user_id = $1 AND profile_id = $2 AND media_item_id = $3`,
+		WHERE user_id = $1 AND profile_id = $2 AND media_item_id = $3
+		  AND (last_file_id IS DISTINCT FROM $4 OR last_resolution IS DISTINCT FROM $5 OR last_hdr IS DISTINCT FROM $6
+		       OR last_codec_video IS DISTINCT FROM $7 OR last_edition_key IS DISTINCT FROM $8)`,
 			s.userID, profileID, targetID,
 			hints.FileID, hints.Resolution, hints.HDR, hints.CodecVideo, nilIfEmpty(hints.EditionKey),
 		)
@@ -1522,10 +1391,6 @@ func (s *PostgresUserStore) AddVisibleHistory(ctx context.Context, entry usersto
 	return written, nil
 }
 
-// addVisibleHistory inserts one history row inside tx. It takes the shared
-// episode-series lock itself, so every caller (the exported method and the
-// Jellyfin compatibility transaction) resolves and writes under the same lock
-// reconciliation uses.
 func (s *PostgresUserStore) addVisibleHistory(ctx context.Context, tx pgx.Tx, entry userstore.WatchHistoryEntry) (userstore.WatchHistoryEntry, error) {
 	if entry.ID == "" {
 		entry.ID = generateUUID()
@@ -1565,7 +1430,16 @@ func (s *PostgresUserStore) addVisibleHistory(ctx context.Context, tx pgx.Tx, en
 		INSERT INTO user_watch_history (id, user_id, profile_id, media_item_id, watched_at, duration_seconds, completed, source, watch_identity)
 		SELECT $1, $2, $3, $4, watched_at, $6, $7, $8, $9
 		FROM visible
-		ON CONFLICT (user_id, id) DO UPDATE SET completed = TRUE
+		ON CONFLICT (user_id, id) DO UPDATE SET completed = TRUE,
+			-- A play a mark unwatched kept takes the new watch's time, so the
+			-- completion counts as watched.
+			watched_at = CASE WHEN EXISTS (
+				SELECT 1 FROM user_history_hidden_items hhi
+				WHERE hhi.user_id = user_watch_history.user_id
+				  AND hhi.profile_id = user_watch_history.profile_id
+				  AND hhi.media_item_id = user_watch_history.media_item_id
+				  AND user_watch_history.watched_at <= hhi.hidden_before
+			) THEN EXCLUDED.watched_at ELSE user_watch_history.watched_at END
 		WHERE NOT user_watch_history.completed AND EXCLUDED.completed
 		RETURNING watched_at`,
 		entry.ID, s.userID, entry.ProfileID, targetID, entry.WatchedAt,
@@ -1576,7 +1450,6 @@ func (s *PostgresUserStore) addVisibleHistory(ctx context.Context, tx pgx.Tx, en
 		}
 		return entry, fmt.Errorf("adding visible history entry: %w", err)
 	}
-	entry.MediaItemID = targetID
 	entry.WatchedAt = timeToString(watchedAt)
 	return entry, nil
 }
@@ -1606,11 +1479,6 @@ func (s *PostgresUserStore) AddHistoryIfMissing(ctx context.Context, entry users
 	defer func() { _ = tx.Rollback(ctx) }()
 	// Shared with RemoveHistoryItems. The next statement gets a fresh READ
 	// COMMITTED snapshot after any concurrent import or hide has committed.
-	if err := lockImportedHistory(ctx, tx, s.userID, entry.ProfileID); err != nil {
-		return false, err
-	}
-	// Keep the same lock order as RemoveHistoryItems: the profile import lock
-	// first, then the episode series shared lock.
 	if err := lockWatchStateSeries(ctx, tx, []string{entry.MediaItemID}); err != nil {
 		return false, err
 	}
@@ -1618,11 +1486,15 @@ func (s *PostgresUserStore) AddHistoryIfMissing(ctx context.Context, entry users
 	if err != nil {
 		return false, err
 	}
+	if err := LockHistoryCutoff(ctx, tx, s.userID, entry.ProfileID); err != nil {
+		return false, err
+	}
 	// The watermark is compared at full precision ($5), so an import later in
 	// the same second as a removal is kept. It is stored at the whole second
 	// ($10), as imports always were, unless that second is at or before the
 	// watermark; then it keeps its precise time to stay visible. Any row in the
-	// same second counts as the same play, whichever precision it was kept at.
+	// same second counts as the same play, whichever precision it was kept at,
+	// except a play an unmark kept in history at or before the watermark.
 	tag, err := tx.Exec(ctx, `
         WITH visible AS (
             SELECT CASE
@@ -1638,9 +1510,14 @@ func (s *PostgresUserStore) AddHistoryIfMissing(ctx context.Context, entry users
         SELECT $1, $2, $3, $4, visible.watched_at, $6, $7, $8, $9
         FROM visible
         WHERE NOT EXISTS (
-            SELECT 1 FROM user_watch_history
-            WHERE user_id = $2 AND profile_id = $3 AND media_item_id = $4
-              AND watched_at >= $10::timestamptz AND watched_at < $10::timestamptz + interval '1 second'
+            SELECT 1 FROM user_watch_history h
+            WHERE h.user_id = $2 AND h.profile_id = $3 AND h.media_item_id = $4
+              AND h.watched_at >= $10::timestamptz AND h.watched_at < $10::timestamptz + interval '1 second'
+              AND NOT EXISTS (
+                SELECT 1 FROM user_history_hidden_items hhi
+                WHERE hhi.user_id = h.user_id AND hhi.profile_id = h.profile_id
+                  AND hhi.media_item_id = h.media_item_id AND h.watched_at <= hhi.hidden_before
+              )
         )`,
 		entry.ID, s.userID, entry.ProfileID, targetID, watchedAt, entry.DurationSeconds, entry.Completed, entry.Source, string(identityJSON),
 		watchedAt.Truncate(time.Second))
@@ -1653,9 +1530,12 @@ func (s *PostgresUserStore) AddHistoryIfMissing(ctx context.Context, entry users
 	return tag.RowsAffected() > 0, nil
 }
 
-// A profile-scoped database lock serializes imported-history deduplication and
-// hiding across API nodes. Hash collisions only serialize unrelated profiles.
-func lockImportedHistory(ctx context.Context, tx pgx.Tx, userID int, profileID string) error {
+// LockHistoryCutoff serializes a profile's history imports, resets, and
+// cutoff-aware progress writes across API nodes. Read the cutoff in a separate
+// statement after acquiring this lock under READ COMMITTED, so a concurrent
+// reset's committed cutoff is visible. Hash collisions only serialize unrelated
+// profiles.
+func LockHistoryCutoff(ctx context.Context, tx pgx.Tx, userID int, profileID string) error {
 	_, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1::integer, hashtext('imported-history:' || $2))`, userID, profileID)
 	if err != nil {
 		return fmt.Errorf("lock imported history: %w", err)
@@ -1663,6 +1543,9 @@ func lockImportedHistory(ctx context.Context, tx pgx.Tx, userID int, profileID s
 	return nil
 }
 
+// historyListSelect lists plays from the history-listing cutoff, so a mark
+// unwatched leaves them listed. A NULL removed_before predates the column and
+// reads as hidden_before.
 const historyListSelect = `
 		SELECT h.id, h.profile_id, h.media_item_id, h.watched_at, h.duration_seconds, h.completed, h.source, h.watch_identity::text
 		FROM user_watch_history h
@@ -1673,7 +1556,7 @@ const historyListSelect = `
 			WHERE hhi.user_id = h.user_id
 			  AND hhi.profile_id = h.profile_id
 			  AND hhi.media_item_id = h.media_item_id
-			  AND h.watched_at <= hhi.hidden_before
+			  AND h.watched_at <= COALESCE(hhi.removed_before, hhi.hidden_before)
 		  )`
 
 func (s *PostgresUserStore) ListHistory(ctx context.Context, profileID string, limit, offset int) ([]userstore.WatchHistoryEntry, error) {
@@ -1875,43 +1758,108 @@ func (s *PostgresUserStore) RemoveHistoryItems(
 	mediaItemIDs []string,
 	removedAt time.Time,
 ) error {
-	mediaItemIDs = compactMediaItemIDs(mediaItemIDs)
-	if len(mediaItemIDs) == 0 {
+	if len(compactMediaItemIDs(mediaItemIDs)) == 0 {
 		return nil
 	}
-	if removedAt.IsZero() {
-		removedAt = time.Now().UTC()
-	}
+	return s.inHistoryCutoffTx(ctx, "remove history items", func(tx pgx.Tx) error {
+		if err := lockWatchStateSeries(ctx, tx, mediaItemIDs); err != nil {
+			return err
+		}
+		canonicalIDs, err := canonicalWatchStateIDs(ctx, tx, mediaItemIDs)
+		if err != nil {
+			return err
+		}
+		return s.removeHistoryItems(ctx, tx, profileID, canonicalIDs, removedAt)
+	})
+}
 
+// ClearWatchedState marks the items unwatched without touching their history.
+func (s *PostgresUserStore) ClearWatchedState(
+	ctx context.Context,
+	profileID string,
+	mediaItemIDs []string,
+	clearedAt time.Time,
+) error {
+	if len(compactMediaItemIDs(mediaItemIDs)) == 0 {
+		return nil
+	}
+	return s.inHistoryCutoffTx(ctx, "clear watched state", func(tx pgx.Tx) error {
+		if err := lockWatchStateSeries(ctx, tx, mediaItemIDs); err != nil {
+			return err
+		}
+		canonicalIDs, err := canonicalWatchStateIDs(ctx, tx, mediaItemIDs)
+		if err != nil {
+			return err
+		}
+		return s.clearWatchedState(ctx, tx, profileID, canonicalIDs, clearedAt)
+	})
+}
+
+func (s *PostgresUserStore) inHistoryCutoffTx(ctx context.Context, op string, fn func(pgx.Tx) error) error {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
-		return fmt.Errorf("begin remove history items: %w", err)
+		return fmt.Errorf("begin %s: %w", op, err)
 	}
 	defer tx.Rollback(ctx)
-	if err := lockImportedHistory(ctx, tx, s.userID, profileID); err != nil {
+	if err := fn(tx); err != nil {
 		return err
 	}
-
-	if err := s.removeHistoryItems(ctx, tx, profileID, mediaItemIDs, removedAt); err != nil {
-		return err
-	}
-
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit remove history items: %w", err)
+		return fmt.Errorf("commit %s: %w", op, err)
 	}
 	return nil
 }
 
+// removeHistoryItems raises both cutoffs, then deletes the plays at or before
+// the listing cutoff and the progress rows.
 func (s *PostgresUserStore) removeHistoryItems(ctx context.Context, tx pgx.Tx, profileID string, mediaItemIDs []string, removedAt time.Time) error {
-	if err := lockWatchStateSeries(ctx, tx, mediaItemIDs); err != nil {
-		return err
-	}
-	mediaItemIDs, err := canonicalWatchStateIDs(ctx, tx, mediaItemIDs)
-	if err != nil {
-		return err
-	}
+	mediaItemIDs = compactMediaItemIDs(mediaItemIDs)
 	if len(mediaItemIDs) == 0 {
 		return nil
+	}
+	if err := s.raiseHistoryCutoffs(ctx, tx, profileID, mediaItemIDs, removedAt, true); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM user_watch_history h
+		USING user_history_hidden_items hhi
+		WHERE h.user_id = $1
+		  AND h.profile_id = $2
+		  AND h.media_item_id = ANY($3::text[])
+		  AND hhi.user_id = h.user_id
+		  AND hhi.profile_id = h.profile_id
+		  AND hhi.media_item_id = h.media_item_id
+		  AND h.watched_at <= hhi.removed_before
+	`, s.userID, profileID, mediaItemIDs); err != nil {
+		return fmt.Errorf("deleting removed history rows: %w", err)
+	}
+	return s.deleteClearedProgress(ctx, tx, profileID, mediaItemIDs)
+}
+
+// clearWatchedState raises the watched-state cutoff and deletes the progress
+// rows. The plays stay listed in history; at or before the cutoff they no
+// longer count as watched, and an import of one is skipped.
+func (s *PostgresUserStore) clearWatchedState(ctx context.Context, tx pgx.Tx, profileID string, mediaItemIDs []string, clearedAt time.Time) error {
+	mediaItemIDs = compactMediaItemIDs(mediaItemIDs)
+	if len(mediaItemIDs) == 0 {
+		return nil
+	}
+	if err := s.raiseHistoryCutoffs(ctx, tx, profileID, mediaItemIDs, clearedAt, false); err != nil {
+		return err
+	}
+	return s.deleteClearedProgress(ctx, tx, profileID, mediaItemIDs)
+}
+
+// raiseHistoryCutoffs moves hidden_before to at, or past the newest play when
+// one is dated later, under the imported-history lock. A removal moves
+// removed_before with it. An unmark keeps the listing cutoff: a legacy NULL
+// becomes the old hidden_before it stood for, and a new row stores -infinity.
+func (s *PostgresUserStore) raiseHistoryCutoffs(ctx context.Context, tx pgx.Tx, profileID string, mediaItemIDs []string, at time.Time, removal bool) error {
+	if at.IsZero() {
+		at = time.Now().UTC()
+	}
+	if err := LockHistoryCutoff(ctx, tx, s.userID, profileID); err != nil {
+		return err
 	}
 	if _, err := tx.Exec(ctx, `
 		WITH target(media_item_id) AS (
@@ -1928,30 +1876,23 @@ func (s *PostgresUserStore) removeHistoryItems(ctx context.Context, tx pgx.Tx, p
 			 AND h.media_item_id = t.media_item_id
 			GROUP BY t.media_item_id
 		)
-		INSERT INTO user_history_hidden_items (user_id, profile_id, media_item_id, hidden_before, updated_at)
-		SELECT $1, $2, media_item_id, hidden_before, $4
+		INSERT INTO user_history_hidden_items (user_id, profile_id, media_item_id, hidden_before, removed_before, updated_at)
+		SELECT $1, $2, media_item_id, hidden_before,
+			CASE WHEN $5::boolean THEN hidden_before ELSE '-infinity'::timestamptz END, $4
 		FROM watermark
 		ON CONFLICT (user_id, profile_id, media_item_id) DO UPDATE SET
 			hidden_before = GREATEST(user_history_hidden_items.hidden_before, EXCLUDED.hidden_before),
+			removed_before = GREATEST(
+				COALESCE(user_history_hidden_items.removed_before, user_history_hidden_items.hidden_before),
+				EXCLUDED.removed_before),
 			updated_at = EXCLUDED.updated_at
-	`, s.userID, profileID, mediaItemIDs, removedAt.UTC()); err != nil {
+	`, s.userID, profileID, mediaItemIDs, at.UTC(), removal); err != nil {
 		return fmt.Errorf("upserting hidden history items: %w", err)
 	}
+	return nil
+}
 
-	if _, err := tx.Exec(ctx, `
-		DELETE FROM user_watch_history h
-		USING user_history_hidden_items hhi
-		WHERE h.user_id = $1
-		  AND h.profile_id = $2
-		  AND h.media_item_id = ANY($3::text[])
-		  AND hhi.user_id = h.user_id
-		  AND hhi.profile_id = h.profile_id
-		  AND hhi.media_item_id = h.media_item_id
-		  AND h.watched_at <= hhi.hidden_before
-	`, s.userID, profileID, mediaItemIDs); err != nil {
-		return fmt.Errorf("deleting removed history rows: %w", err)
-	}
-
+func (s *PostgresUserStore) deleteClearedProgress(ctx context.Context, tx pgx.Tx, profileID string, mediaItemIDs []string) error {
 	if _, err := tx.Exec(ctx, `
 		DELETE FROM user_watch_progress
 		WHERE user_id = $1
@@ -1960,11 +1901,14 @@ func (s *PostgresUserStore) removeHistoryItems(ctx context.Context, tx pgx.Tx, p
 	`, s.userID, profileID, mediaItemIDs); err != nil {
 		return fmt.Errorf("deleting removed progress rows: %w", err)
 	}
-
 	return nil
 }
 
 func (s *PostgresUserStore) DeleteHistoryBySource(ctx context.Context, profileID string, mediaItemIDs []string, source userstore.WatchHistorySource) error {
+	mediaItemIDs = compactMediaItemIDs(mediaItemIDs)
+	if len(mediaItemIDs) == 0 {
+		return nil
+	}
 	return s.withWatchStateSeries(ctx, mediaItemIDs, func(tx pgx.Tx) error {
 		canonicalIDs, err := canonicalWatchStateIDs(ctx, tx, mediaItemIDs)
 		if err != nil {
