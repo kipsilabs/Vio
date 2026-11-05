@@ -114,7 +114,7 @@ RUN ln -sf ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
 # that Debian removes stops being trusted by npm as well.
 ENV NODE_OPTIONS=--use-openssl-ca
 LABEL io.silo.intel-qsv-runtime="${INTEL_QSV_RUNTIME}"
-COPY --from=build /silo /usr/local/bin/silo
+COPY --from=build /vio /usr/local/bin/vio
 EXPOSE 8080 8096 13378
 # Silo runs database migrations before its HTTP listener starts, and an
 # upgrade on a large library can migrate for many minutes. The start period
