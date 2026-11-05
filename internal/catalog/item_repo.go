@@ -3397,9 +3397,9 @@ func (r *ItemRepository) ReconcileReleasedCollectionVirtualEpisodes(ctx context.
 			              verified_episode_release_at(ep.series_id,ep.season_number,ep.episode_number,ep.air_date::timestamp AT TIME ZONE 'UTC') <= statement_timestamp()
 			          )
 			          ELSE (
-			              -- No override history: possession alone proves
-			              -- release. A bare air_date never authorizes
-			              -- materialization without verified evidence.
+			              -- No active override: local possession, then the
+			              -- provider/air-date evidence (the documented fallback
+			              -- order). A null date has no evidence and stays blocked.
 			              ep.metadata_source='local'
 			              OR EXISTS(
 			                  SELECT 1 FROM media_files proven
@@ -3407,6 +3407,7 @@ func (r *ItemRepository) ReconcileReleasedCollectionVirtualEpisodes(ctx context.
 			                    AND proven.container<>'virtual'
 			                    AND proven.file_path NOT LIKE 'virtual://%'
 			              )
+			              OR verified_episode_release_at(ep.series_id,ep.season_number,ep.episode_number,ep.air_date::timestamp AT TIME ZONE 'UTC') <= statement_timestamp()
 			          )
 			      END
 			  )
@@ -3475,12 +3476,11 @@ func (r *ItemRepository) ReconcileReleasedCollectionVirtualEpisodes(ctx context.
 			                  verified_episode_release_at(ep.series_id,ep.season_number,ep.episode_number,ep.air_date::timestamp AT TIME ZONE 'UTC') > statement_timestamp()
 			              )
 			              ELSE (
-			                  -- No override history: an existing virtual
-			                  -- file is stale only when the episode is
-			                  -- neither locally proven nor physically
-			                  -- possessed. Bare air_date transitions do
-			                  -- not drive staleness without verified
-			                  -- evidence.
+			                  -- No active override: an existing virtual file is
+			                  -- stale when the episode is neither locally proven
+			                  -- nor physically possessed and its provider date is
+			                  -- still in the future. An unknown date keeps the
+			                  -- file rather than withdrawing on absence.
 			                  COALESCE(ep.metadata_source,'')<>'local'
 			                  AND NOT EXISTS(
 			                      SELECT 1 FROM media_files proven
@@ -3488,6 +3488,7 @@ func (r *ItemRepository) ReconcileReleasedCollectionVirtualEpisodes(ctx context.
 			                        AND proven.container<>'virtual'
 			                        AND proven.file_path NOT LIKE 'virtual://%'
 			                  )
+			                  AND verified_episode_release_at(ep.series_id,ep.season_number,ep.episode_number,ep.air_date::timestamp AT TIME ZONE 'UTC') > statement_timestamp()
 			              )
 			          END
 			      )
@@ -3810,14 +3811,14 @@ func materializeVirtualPlaybackEpisodesDetailedTx(ctx context.Context, tx pgx.Tx
 		return 0, 0, 0, nil
 	}
 
-	// The expected set covers ALL evaluated candidates (the truncated
-	// batch), not just the released subset. Candidates beyond the release
-	// gate still own virtual files/claims from prior passes; excluding
-	// them here would let cleanup delete files for episodes 501+ that
-	// simply were not released in this pass.
-	expectedPaths := make([]string, 0, len(bases)*len(candidates))
-	expectedOwners := make([]int64, 0, len(bases)*len(candidates))
-	expectedFolders := make([]int, 0, len(bases)*len(candidates))
+	// The expected set is the released subset: an episode whose release gate
+	// closed (a future override) must lose the virtual file and claims a prior
+	// pass created, or a delayed release keeps advertising a placeholder the
+	// provider cannot serve yet. The batch bound only limits how many episodes
+	// this pass evaluates, not which of them may exist.
+	expectedPaths := make([]string, 0, len(bases)*len(episodes))
+	expectedOwners := make([]int64, 0, len(bases)*len(episodes))
+	expectedFolders := make([]int, 0, len(bases)*len(episodes))
 
 	type episodeFileKey struct {
 		path     string
@@ -3829,7 +3830,7 @@ func materializeVirtualPlaybackEpisodesDetailedTx(ctx context.Context, tx pgx.Tx
 	for _, base := range bases {
 		parsed, _ := url.Parse(base.filePath)
 		identifier := strings.TrimPrefix(parsed.EscapedPath(), "/")
-		for _, candidate := range candidates {
+		for _, candidate := range episodes {
 			episodeURI := &url.URL{
 				Scheme:   "virtual",
 				Host:     "series",
