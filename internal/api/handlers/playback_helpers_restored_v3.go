@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -275,44 +276,151 @@ func virtualCandidateRotationRecordedV3(ctx context.Context, session *playback.S
 
 var errFrozenSeekEvidenceUnavailable = errors.New("the frozen seek candidate's own evidence is unavailable")
 
-func virtualCodecAgreesV3(file *models.MediaFile, codec string) bool {
-	if file == nil {
+func virtualCodecAgreesV3(file *models.MediaFile, sourceCodec string) bool {
+	if file == nil || strings.TrimSpace(sourceCodec) == "" {
 		return false
 	}
-	want := strings.TrimSpace(codec)
-	if want == "" {
+	if declared := strings.TrimSpace(file.CodecVideo); declared != "" &&
+		!playback.CodecsAgreeV3(declared, sourceCodec) {
 		return false
 	}
-	if strings.EqualFold(file.CodecVideo, want) {
-		return true
-	}
-	for _, t := range file.VideoTracks {
-		if strings.EqualFold(t.Codec, want) {
-			return true
+	if len(file.VideoTracks) > 0 {
+		if declared := strings.TrimSpace(file.VideoTracks[0].Codec); declared != "" &&
+			!playback.CodecsAgreeV3(declared, sourceCodec) {
+			return false
 		}
 	}
-	return false
+	return true
 }
 
+// virtualVideoTrackFromDescriptorV3 reconstructs the primary video track the
+// running plan validated from its source descriptor. It builds an empty track
+// and fills it through fillVirtualVideoTrackFromDescriptorV3, so the
+// reconstruction and the in-place top-up of a partial row cover exactly the
+// same field set: the fields the planner reads for route selection (codec,
+// profile, level, bit depth, dimensions, frame rate, bitrate, color range, and
+// the dynamic-range classification via the range-type text, with the DV profile
+// carried explicitly) plus the aggregated copy-safety verdict. The session's DV
+// pin is applied after the carry and re-overwrites the profile for a pinned
+// row, so the two never disagree.
 func virtualVideoTrackFromDescriptorV3(source playback.SourceDescriptorV3) models.VideoTrack {
-	t := models.VideoTrack{}
-	fillVirtualVideoTrackFromDescriptorV3(&t, source)
-	return t
+	var track models.VideoTrack
+	fillVirtualVideoTrackFromDescriptorV3(&track, source)
+	return track
 }
 
-func fillVirtualVideoTrackFromDescriptorV3(t *models.VideoTrack, source playback.SourceDescriptorV3) {
-	if t == nil {
+// virtualVideoRangeTypeFromDescriptorV3 maps a normalized descriptor grade back
+// to the probe's range-type token, the spelling the planner's classifier reads.
+// Unknown HDR (and any unrecognized grade) stays unclassifiable; the file-level
+// HDR flag carries that grade.
+func virtualVideoRangeTypeFromDescriptorV3(source playback.SourceDescriptorV3) string {
+	switch source.DynamicRange {
+	case playback.DynamicRangeDolbyVisionV3:
+		return "DOVI"
+	case playback.DynamicRangeHDR10PlusV3:
+		return "HDR10Plus"
+	case playback.DynamicRangeHLGV3:
+		return "HLG"
+	case playback.DynamicRangeHDR10V3:
+		return "HDR10"
+	case playback.DynamicRangeSDRV3:
+		return "SDR"
+	default:
+		return ""
+	}
+}
+
+// fillVirtualVideoTrackFromDescriptorV3 top-fills every gap in track from the
+// descriptor the running plan validated. It is the single field list shared by
+// the empty-track reconstruction and the existing-track top-up: a field the
+// planner reads is either filled from the descriptor here or deliberately
+// absent, never filled by one caller but not the other.
+//
+// A field that already carries a row value is left as-is; the carry only tops
+// up the unprobed metadata a fresh listing row dropped and never overwrites
+// evidence the row already has. The one deliberate exception is VideoCopyUnsafe,
+// an aggregated runtime verdict that must propagate whenever the running plan
+// proved it: reading it false would let a route the plan already disqualified as
+// copy-unsafe look copy-safe.
+func fillVirtualVideoTrackFromDescriptorV3(track *models.VideoTrack, source playback.SourceDescriptorV3) {
+	if track == nil {
 		return
 	}
-	t.Codec = source.VideoCodec
-	t.Profile = source.VideoProfile
-	t.Level = source.VideoLevel
-	t.BitDepth = source.BitDepth
-	t.Width = source.Width
-	t.Height = source.Height
-	t.Bitrate = source.BitrateKbps
-	t.ColorRange = source.ColorRange
+	if track.Codec == "" {
+		track.Codec = source.VideoCodec
+	}
+	if track.Profile == "" {
+		track.Profile = source.VideoProfile
+	}
+	if track.Level == 0 {
+		track.Level = source.VideoLevel
+	}
+	if track.BitDepth == 0 {
+		track.BitDepth = source.BitDepth
+	}
+	if track.Width == 0 {
+		track.Width = source.Width
+	}
+	if track.Height == 0 {
+		track.Height = source.Height
+	}
+	if virtualFrameRateV3(track.FrameRate) <= 0 {
+		track.FrameRate = strconv.FormatFloat(source.FrameRate, 'f', -1, 64)
+	}
+	if track.Bitrate == 0 {
+		// VideoTrack.Bitrate is the probe's kbps figure (scanner/probe.go
+		// stores ffprobe bit_rate/1000), the same unit as
+		// SourceDescriptorV3.BitrateKbps, so the assignment is unit-preserving.
+		track.Bitrate = source.BitrateKbps
+	}
+	if strings.TrimSpace(track.ColorRange) == "" {
+		track.ColorRange = source.ColorRange
+	}
+	if !track.HDR10Plus {
+		track.HDR10Plus = source.HDR10Plus
+	}
+	if strings.TrimSpace(track.VideoRangeType) == "" {
+		track.VideoRangeType = virtualVideoRangeTypeFromDescriptorV3(source)
+	}
+	// A DV base-layer provenance without a profile is not a DV classification
+	// the route resolver can trust, so the whole DV block is gated on the
+	// descriptor naming a profile — the same fail-closed posture the previous
+	// reconstruction used. Within that, each sub-field is a gap fill.
+	if source.DVProfile > 0 {
+		if track.DVProfile == 0 {
+			track.DVProfile = source.DVProfile
+		}
+		if track.DVLevel == 0 {
+			track.DVLevel = source.DVLevel
+		}
+		if track.DVBLCompatID == 0 && !track.DVBLCompatIDPresent {
+			// Zero is a meaningful compatibility id — tonemap deliberately
+			// returns no safe base for it — so a row that already knows it is
+			// zero keeps it. Only a missing field may be filled: matching codecs
+			// alone does not establish that the row's profile and compatibility
+			// agree with the descriptor's.
+			track.DVBLCompatID = source.DVBLCompatID
+		}
+		// The descriptor carries a single aggregated base-layer provenance
+		// flag. Reproduce it only when it was proven; an unproven profile keeps
+		// the three presence booleans false so the route resolution fails
+		// closed instead of inventing a compatible base layer.
+		if source.DVBaseLayerProven {
+			track.DVConfigPresent = true
+			track.DVBLCompatIDPresent = true
+			track.DVBLPresent = true
+		}
+	}
+	if strings.TrimSpace(track.DVEnhancementLayer) == "" {
+		if layer := strings.TrimSpace(string(source.DVEnhancementLayer)); layer != "" {
+			track.DVEnhancementLayer = layer
+		}
+	}
+	if source.VideoCopyUnsafe {
+		track.VideoCopyUnsafe = true
+	}
 }
+
 func virtualReplanRotationExhaustedV3(err error) bool {
 	if err == nil {
 		return false

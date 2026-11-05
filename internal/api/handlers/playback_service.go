@@ -25,6 +25,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/userstore"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary/resolver"
+	"github.com/Silo-Server/silo-server/internal/watchstate"
 )
 
 // Playback service seams for the v2 adapter (internal/apiv2/playback.go).
@@ -110,6 +111,22 @@ func playbackPersistenceOperationError(err error) error {
 }
 func playbackSessionNotFoundOperationError() *PlaybackOperationError {
 	return playbackOperationError(http.StatusNotFound, "session_not_found", "Playback session not found")
+}
+
+// playbackSessionEndedOperationError is the 410 answer for an attempt an
+// administrator ended: the player exits instead of renewing a session the
+// account is no longer allowed to play.
+func playbackSessionEndedOperationError() *PlaybackOperationError {
+	return playbackOperationError(http.StatusGone, playbackSessionEndedErrorCode, "Playback session has ended")
+}
+
+// stoppedAttemptOperationErrorV3 distinguishes an administrator end (410) from
+// an expiry or an abandoned attempt (404, which the player renews from).
+func stoppedAttemptOperationErrorV3(sessionID string, record *playback.AttemptRecordV3) *PlaybackOperationError {
+	if record != nil && record.StopID == adminStopID(sessionID) {
+		return playbackSessionEndedOperationError()
+	}
+	return playbackSessionNotFoundOperationError()
 }
 func playbackStoreOperationError() *PlaybackOperationError {
 	return playbackOperationError(http.StatusServiceUnavailable, "unavailable", "Playback state is temporarily unavailable")
@@ -440,7 +457,7 @@ func (h *PlaybackHandler) ApplyProgressV2(ctx context.Context, caller PlaybackCa
 		return PlaybackMutationView{}, err
 	}
 	if record.StoppedAt != nil {
-		return PlaybackMutationView{}, playbackSessionNotFoundOperationError()
+		return PlaybackMutationView{}, stoppedAttemptOperationErrorV3(sessionID, record)
 	}
 	sample := playback.ProgressSampleV3{Sequence: command.Sequence, Position: command.Position, IsPaused: command.IsPaused}
 	receipt, err := store.ApplyProgress(ctx, sessionID, sample)
@@ -936,6 +953,7 @@ func (h *PlaybackHandler) finishStop(ctx context.Context, record *playback.Attem
 	synthesized := h.attemptSessionV2(ctx, record, position, paused)
 	if reason == PlaybackEndAborted || reason == PlaybackEndReplaced {
 		h.recordAdminStopHistory(ctx, synthesized, reason)
+		h.notifyStoppedSession(ctx, synthesized, watchstate.PlaybackStopResult{HistoryID: priorHistoryID}, reason)
 		return priorHistoryID, nil
 	}
 	result, err := h.persistStopAndHistory(ctx, synthesized, priorHistoryID)
@@ -946,6 +964,9 @@ func (h *PlaybackHandler) finishStop(ctx context.Context, record *playback.Attem
 	// chance to write the durable admin log. Do it from the attempt-derived
 	// session, preserving the attempt's start time and accepted final sample.
 	h.recordAdminStopHistory(ctx, synthesized, reason)
+	// This replica holds no live copy, so no lifecycle finalizer told providers.
+	// A deferred notice leaves the event to this caller.
+	h.notifyStoppedSession(ctx, synthesized, result, reason)
 	// The synced-session row lives in a store shared by every replica, so a
 	// replica that does not hold the live session still deletes it. This is the
 	// step a retried stop exists to repair.
@@ -1024,7 +1045,7 @@ func (h *PlaybackHandler) ReplanPlaybackV2(ctx context.Context, caller PlaybackC
 	// seek must not launch a replacement transport the deny marker will
 	// refuse to serve. The store's commit predicate refuses stopped rows too.
 	if record, err := h.PlanStoreV3.GetAttempt(ctx, sessionID); err == nil && record != nil && record.StoppedAt != nil {
-		return playback.DecisionResponseV3{}, playbackSessionNotFoundOperationError()
+		return playback.DecisionResponseV3{}, stoppedAttemptOperationErrorV3(sessionID, record)
 	}
 	response, err := h.replanPlaybackApplicationV3(playbackCallerSessionRequest(ctx, caller, sessionID), sessionID, body)
 	if errors.Is(err, playback.ErrAttemptStoppedV3) {
@@ -1185,7 +1206,11 @@ func (h *PlaybackHandler) playbackInventoryForFileV3(ctx context.Context, sessio
 	subtitleInventory := playback.ScopeSubtitleInventoryV3(session.ID, file, playback.BuildSubtitleInventoryV3(file, additional), clientFeatures)
 
 	status := string(ProbeProvenanceDeclared)
-	if file != nil && file.ProbeUpdatedAt != nil {
+	if file != nil && file.RefusedProbeEvidence {
+		// Refused in-memory evidence is never a verified inventory: the catalog
+		// write that would make it durable did not happen.
+		status = string(ProbeProvenanceDeclared)
+	} else if file != nil && file.ProbeUpdatedAt != nil {
 		status = string(ProbeProvenanceVerified)
 	} else {
 		// No probe stamp on the effective row. A deferred full-track
@@ -1336,7 +1361,7 @@ func (h *PlaybackHandler) PublishSourceCommitted(ctx context.Context, sessionID 
 	}
 	event, err := playback.NewSourceCommittedEvent(sessionID, playback.SourceCommittedPayload{
 		EffectiveMediaFileID:  session.MediaFileID,
-		EffectiveVirtualURI:   session.VirtualSourceURI,
+		EffectiveVirtualURI:   h.sourceCommittedVirtualURIV3(ctx, session),
 		VirtualSourceRevision: session.VirtualSourceRevision,
 		InventoryStatus:       inventory.InventoryStatus,
 		AudioTracks:           inventory.AudioTracks,
@@ -1350,6 +1375,27 @@ func (h *PlaybackHandler) PublishSourceCommitted(ctx context.Context, sessionID 
 		slog.WarnContext(ctx, "failed to deliver source committed realtime event",
 			"component", "playback", "session", sessionID, "error", err)
 	}
+}
+
+// sourceCommittedVirtualURIV3 names the virtual candidate the committed session
+// serves. The live binding is authoritative once it exists; a session that was
+// started directly (or restored without a binding) still names its effective
+// row, whose path is the candidate the client must correlate against.
+func (h *PlaybackHandler) sourceCommittedVirtualURIV3(ctx context.Context, session *playback.Session) string {
+	if session == nil {
+		return ""
+	}
+	if uri := strings.TrimSpace(session.VirtualSourceURI); uri != "" {
+		return uri
+	}
+	if h.fileResolver == nil || session.MediaFileID <= 0 {
+		return ""
+	}
+	file, err := h.fileResolver.GetByID(ctx, session.MediaFileID)
+	if err != nil || file == nil || !isVirtualPlaybackFile(file) {
+		return ""
+	}
+	return strings.TrimSpace(file.FilePath)
 }
 
 // mediaFileSessionLookup enumerates the live playback sessions associated with
@@ -1603,6 +1649,7 @@ func (h *PlaybackHandler) PublishInventoryUpdated(ctx context.Context, fileID in
 		if result == inventoryPublishDelivered {
 			summary.SessionsNotified++
 			summary.Revision = revision
+			h.collectSubtitleInventoryWait(&summary, session.ID)
 		}
 	}
 	return summary
@@ -1653,6 +1700,7 @@ func (h *PlaybackHandler) PublishInventoryUpdatedToSession(ctx context.Context, 
 	if result == inventoryPublishDelivered {
 		summary.SessionsNotified++
 		summary.Revision = revision
+		h.collectSubtitleInventoryWait(&summary, session.ID)
 	}
 	return summary, result
 }
@@ -1741,8 +1789,12 @@ func (h *PlaybackHandler) refusedProbeInventoryFile(ctx context.Context, session
 	override.AudioTracks = probed.AudioTracks
 	override.SubtitleTracks = probed.SubtitleTracks
 	override.ExternalSubtitles = probed.ExternalSubtitles
-	probedAt := time.Now().UTC()
-	override.ProbeUpdatedAt = &probedAt
+	// The evidence was refused by the catalog guard: it is served for this live
+	// session only and is not committed. Drop any stamp the base row carried
+	// (it described the replaced tracks, not these) and mark the override so the
+	// inventory reports declared, never verified.
+	override.ProbeUpdatedAt = nil
+	override.RefusedProbeEvidence = true
 	return &override
 }
 

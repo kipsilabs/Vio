@@ -2297,7 +2297,10 @@ func (h *PlaybackHandler) finalizeSessionStop(ctx context.Context, session *play
 		if userInitiated {
 			reason = PlaybackEndStopped
 		} else {
-			reason = PlaybackEndStopped
+			// A system teardown the client can rebuild under the same attempt is
+			// not a user-visible end: leave the reason unset so providers get a
+			// pause scrobble instead of a stop.
+			reason = PlaybackEndReason("")
 		}
 	}
 	endReason, _ := reason.(PlaybackEndReason)
@@ -2313,7 +2316,9 @@ func (h *PlaybackHandler) finalizeSessionStopWithResult(ctx context.Context, ses
 		if b {
 			reason = PlaybackEndStopped
 		} else {
-			reason = PlaybackEndStopped
+			// See finalizeSessionStop: a recoverable system teardown keeps no
+			// user-visible end reason.
+			reason = PlaybackEndReason("")
 		}
 	}
 	endReason, _ := reason.(PlaybackEndReason)
@@ -2364,7 +2369,10 @@ func (h *PlaybackHandler) recordStoppedSession(ctx context.Context, session *pla
 // finds the play after an expiry and sends that play's own stop, so its
 // expiry stays a plain pause.
 func (h *PlaybackHandler) notifyStoppedSession(ctx context.Context, session *playback.Session, stopResult watchstate.PlaybackStopResult, reason PlaybackEndReason) {
-	if h.WatchScrobbler != nil {
+	// A realtime stop's confirmed finalizer can defer the provider event to the
+	// caller that owns the confirmed snapshot; honor that here so the finalizer
+	// does not send it twice.
+	if h.WatchScrobbler != nil && !leaveProviderNotice(ctx) {
 		if event, ok := h.scrobbleEventForStoppedSession(ctx, session, stopResult); ok && (reason.userInitiated() || stopResult.Completed) {
 			if err := h.WatchScrobbler.ScrobbleStop(ctx, event); err != nil {
 				slog.WarnContext(ctx, "failed to queue watch provider stop scrobble", "component", "api", "session", session.ID, "error", err)
