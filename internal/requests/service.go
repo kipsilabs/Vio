@@ -50,6 +50,17 @@ const externalIDHydrationConcurrency = 4
 
 const certificationHydrationConcurrency = 8
 
+const (
+	VirtualLibraryRequestsCapability = "virtual-library-requests"
+	VirtualLibraryBaseURL            = "virtual://streaming"
+	VirtualLibraryAPIKey             = "core-managed"
+)
+
+// SeriesSeasonProvider reads a series' season list from TVDB.
+type SeriesSeasonProvider interface {
+	FetchSeriesTVDBSeasons(ctx context.Context, tvdbID int, language string) ([]SeriesSeason, error)
+}
+
 type EntitlementResolver interface {
 	// MaxPlaybackQuality returns the requester's effective playback-quality
 	// ceiling (already combining account- and profile-level caps). Empty string
@@ -80,23 +91,24 @@ type TVDBIDResolver interface {
 }
 
 type Service struct {
-	store             Store
-	tmdb              TMDBClient
-	animeIndex        AnimeIndex
-	presence          PresenceResolver
-	router            RequestRouterProvider
-	entitlements      EntitlementResolver
-	groupProvider     access.GroupPolicyProvider
-	users             access.UserRepository
-	requesterIdentity RequesterIdentityResolver
-	tvdbResolver      TVDBIDResolver
-	notifier          FulfillmentNotifier
-	lifecycle         LifecycleNotifier
-	watchlistPref     WatchlistPreference
-	titleObserver     TitleObserver
-	discoverSnapshots DiscoverSnapshots
-	discoverRefresher DiscoverListRefresher
-	Now               func() time.Time
+	store                Store
+	tmdb                 TMDBClient
+	animeIndex           AnimeIndex
+	presence             PresenceResolver
+	router               RequestRouterProvider
+	entitlements         EntitlementResolver
+	groupProvider        access.GroupPolicyProvider
+	users                access.UserRepository
+	requesterIdentity    RequesterIdentityResolver
+	tvdbResolver         TVDBIDResolver
+	seriesSeasonProvider SeriesSeasonProvider
+	notifier             FulfillmentNotifier
+	lifecycle            LifecycleNotifier
+	watchlistPref        WatchlistPreference
+	titleObserver        TitleObserver
+	discoverSnapshots    DiscoverSnapshots
+	discoverRefresher    DiscoverListRefresher
+	Now                  func() time.Time
 }
 
 type DiscoverySection struct {
@@ -124,6 +136,10 @@ func NewService(store Store, tmdbClient TMDBClient, presence PresenceResolver) *
 	}
 }
 
+func isVirtualIntegration(installationID *int, capabilityID string) bool {
+	return capabilityID == VirtualLibraryRequestsCapability || (installationID != nil && *installationID <= 0)
+}
+
 func (s *Service) SetRouterProvider(p RequestRouterProvider) { s.router = p }
 
 func (s *Service) SetEntitlementResolver(r EntitlementResolver) { s.entitlements = r }
@@ -141,6 +157,8 @@ func (s *Service) SetRequesterIdentityResolver(r RequesterIdentityResolver) {
 // SetTVDBIDResolver wires the metadata-provider fallback used when TMDB has no
 // TVDB ID for a requested series.
 func (s *Service) SetTVDBIDResolver(r TVDBIDResolver) { s.tvdbResolver = r }
+
+func (s *Service) SetSeriesSeasonProvider(p SeriesSeasonProvider) { s.seriesSeasonProvider = p }
 
 // populateRequesterIdentity fills req.RequesterEmail/Username from the resolver.
 // Nil resolver or any error leaves them empty (the plugin then behaves as admin).
