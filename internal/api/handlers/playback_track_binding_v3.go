@@ -514,7 +514,18 @@ func (h *PlaybackHandler) currentInventorySourceV3(ctx context.Context, fileID i
 	if err != nil || row == nil {
 		return carriedInventorySourceV3{}
 	}
-	return carriedInventorySourceV3{file: row}
+	carry := carriedInventorySourceV3{file: row}
+	// The live downloaded tail orders the ordinals this row's menu published;
+	// without it a fresh selection past the embedded layout cannot be placed.
+	if h.SubtitleRepo != nil {
+		if entries, listErr := h.listDownloadedSubtitlesV3(ctx, row); listErr == nil {
+			items := playback.BuildSubtitleInventoryV3(row, entries)
+			_, _, downloaded := subtitleLayoutFromPlanInventoryV3(items, row)
+			carry.downloaded = downloaded
+			carry.downloadedKnown = true
+		}
+	}
+	return carry
 }
 
 // rekeySourceFileWithInventoryV3 loads the inventory a track identity's ordinal

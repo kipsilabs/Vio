@@ -38,8 +38,8 @@
     {
       "id": "api",
       "entrypoint": "internal/api.NewRouter",
-      "description": "Main Silo API listener: the /api/v1 namespace and the routes mounted beside it.",
-      "route_count": 704
+      "description": "Main Vio API listener: the /api/v1 namespace and the routes mounted beside it.",
+      "route_count": 717
     },
     {
       "id": "api_v2",
@@ -61,8 +61,8 @@
     }
   ],
   "totals": {
-    "routes": 889,
-    "conditional_routes": 692,
+    "routes": 902,
+    "conditional_routes": 705,
     "streaming_routes": 45,
     "websocket_routes": 4
   },

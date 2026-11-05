@@ -8,8 +8,6 @@
   "cast": [],
   "crew": [],
   "versions": [],
-  "ratings": [],
-  "subtitles": [],
   "collections": [
     {
       "id": "oscar-winners",
@@ -17,5 +15,7 @@
       "poster_url": "https://cdn.example.invalid/oscar-winners.jpg",
       "item_count": 12
     }
-  ]
+  ],
+  "ratings": [],
+  "subtitles": []
 }

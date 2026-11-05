@@ -1676,6 +1676,7 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 			compatRecipeTargetVideoMatchesSource(current.Recipe, source) &&
 			current.Recipe.SourceAudioChannels == expectedSourceAudioChannels &&
 			current.Recipe.AudioTrackIndex == expectedAudioTrackIndex &&
+			current.Recipe.RequireAudioTrack == compatRequiresAudioTrack(source) &&
 			playback.ValidateCopyFMP4RecipeCard(*current.Recipe) == nil {
 			// A drained node runs no session, so the runtime recorded on it is
 			// gone; start a fresh one instead of pinning the client to it.
@@ -1857,6 +1858,7 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 		SegmentDuration:        segmentDuration,
 		HWAccel:                h.remoteDispatchHWAccel(transcodeNodeURL),
 		AudioTrackIndex:        compatAudioTrackIndexOrDefault(source),
+		RequireAudioTrack:      compatRequiresAudioTrack(source),
 		SourceAudioChannels:    compatHLSRecipeSourceAudioChannels(source),
 		TotalDuration:          float64(source.Version.Duration),
 		RequireReady:           toneMapRecipe.mode != "",
@@ -2126,6 +2128,7 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 		KeyframePlaylist:                 reqBody.KeyframePlaylist,
 		SegmentDuration:                  reqBody.SegmentDuration,
 		AudioTrackIndex:                  reqBody.AudioTrackIndex,
+		RequireAudioTrack:                reqBody.RequireAudioTrack,
 		SourceAudioChannels:              reqBody.SourceAudioChannels,
 		TargetAudioChannels:              reqBody.TargetAudioChannels,
 		TotalDuration:                    reqBody.TotalDuration,
@@ -2249,13 +2252,6 @@ func (h *PlaybackHandler) persistTranscodeRecipe(
 		}
 	}
 
-	if remoteToLocal {
-		// Fence the replaced remote runtime before publishing the local winner.
-		// The old node recipe was already removed, so no reconstruction can
-		// race this replacement. If the central update fails, the recipe
-		// rollback below leaves the prior remote state available for retry.
-		h.tm.StopRemoteTranscode(upstreamSessionID, previousRecipe.TranscodeNodeURL)
-	}
 	if updateErr := h.playbackStore.Update(playSessionID, func(current *PlaybackSession) error {
 		current.TranscodeStarted = true
 		current.Recipe = recipe
@@ -2290,6 +2286,13 @@ func (h *PlaybackHandler) persistTranscodeRecipe(
 			return errors.Join(updateErr, restoreErr, compatRestoreErr)
 		}
 		return updateErr
+	}
+	if remoteToLocal {
+		// Stop the replaced node job only once the local recipe has committed.
+		// The node fences a stopped transport against reconstruction, so a
+		// rollback that restored the remote recipe could not resume it; leaving
+		// the job running until here keeps that rollback playable.
+		h.tm.StopRemoteTranscode(upstreamSessionID, previousRecipe.TranscodeNodeURL)
 	}
 	return nil
 }
@@ -3470,6 +3473,20 @@ func compatAudioTrackIndex(source PlaybackMediaSource) (int, bool) {
 	return audioTrackIndex, true
 }
 
+// compatRequiresAudioTrack reports whether the transcode must fail rather than
+// drop the negotiated audio track when the file lacks it.
+func compatRequiresAudioTrack(source PlaybackMediaSource) bool {
+	return effectiveCompatAudioStreamIndex(source) != nil
+}
+
+// compatAudioRequirementMatches accepts a recipe written before negotiated audio
+// became mandatory, so segment requests across an API upgrade keep their
+// remote executor. A recipe may not demand audio the source no longer offers.
+// Starts compare strictly instead, so a new start replaces a legacy runtime.
+func compatAudioRequirementMatches(requireAudioTrack bool, source PlaybackMediaSource) bool {
+	return !requireAudioTrack || compatRequiresAudioTrack(source)
+}
+
 func compatAudioTrackIndexOrDefault(source PlaybackMediaSource) int {
 	if audioTrackIndex, ok := compatAudioTrackIndex(source); ok {
 		return audioTrackIndex
@@ -4227,6 +4244,12 @@ func applyCompatSubtitleDelivery(source *PlaybackMediaSource, profile DeviceProf
 			embed = embed || strings.EqualFold(sub.Method, "Embed")
 			external = external || strings.EqualFold(sub.Method, "External")
 		}
+		// FFmpeg can't demux an index-only track, so neither can a stream
+		// that carries it embedded, and it can't be burned in: only the
+		// server's external delivery, which reads the index, shows it.
+		if track.IndexOnly {
+			embed = false
+		}
 		text := !playback.NeedsBurnIn(track.Codec)
 		var delivery PlaybackSubtitleDelivery
 		if format, ok := profile.ExternalSubtitleFormat(track.Codec); ok && text {
@@ -4248,7 +4271,7 @@ func applyCompatSubtitleDelivery(source *PlaybackMediaSource, profile DeviceProf
 		}
 		if !text || !external || alwaysBurn {
 			source.SupportsDirectStream = false
-			source.SupportsTranscoding = source.CanBurnSubtitle && !track.External
+			source.SupportsTranscoding = source.CanBurnSubtitle && !track.External && !track.IndexOnly
 			// A burn-in is a full encode. TranscodeAudio also marks a video-copy
 			// remux (compatHLSCopiesVideo), so it is cleared with HLSRemux.
 			source.HLSRemux = false

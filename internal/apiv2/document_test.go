@@ -404,6 +404,21 @@ func TestGeneratedDocumentStatuses(t *testing.T) {
 	profileToken["getAdminPlaybackSummary"] = true
 	profileToken["getThemeSongsCapability"] = true
 	profileToken["createThemeSongPlayback"] = true
+	// Fork surfaces whose registration carries the profile header.
+	for _, id := range []string{
+		"checkAdminAIProvider", "createAdminAIProvider", "deleteAdminAIProvider",
+		"deleteAdminOverlayImage", "getAdminCatalogCapabilities", "getAdminDashboardAPIClientEndpoints",
+		"getAdminDashboardAPIClients", "getAdminPlaybackHistoryCapabilities", "getCatalogBoxSet",
+		"getCatalogItemBoxSet", "getDiscoverRow", "getFavoriteMembership", "getPersonalListCapability",
+		"getRequestDiscoverLayout", "getWatchlistMembership", "listAdminAIProviderModels",
+		"listAdminAIProviders", "listAdminCatalogItems", "listAdminNodeSummaries",
+		"listRequestWatchProviders", "previewRequestDiscoverRow", "removeFailedRequest",
+		"reportPlaybackBandwidthProbe", "resetAdminDeviceLearnedLimit", "resetApplePushInstallation",
+		"resetRequestDiscoverLayout", "searchCatalogBoxSets", "updateAdminAIProvider",
+		"updateRequestDiscoverLayout", "uploadAdminItemImage", "uploadAdminOverlayImage",
+	} {
+		profileToken[id] = true
+	}
 	for _, id := range []string{
 		"cancelLibraryMetadataTranslation", "clearResumePosition", "completeAdminChatGPTLogin", "disconnectAdminChatGPTAccount",
 		"drainAdminNode", "getAdminAICapabilities", "getAdminChatGPTConnection", "getAdminJob",

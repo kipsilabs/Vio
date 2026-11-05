@@ -57,3 +57,9 @@ func virtualFrameRateV3(s string) float64 {
 	}
 	return 0
 }
+
+// withCueIndexReadsV3 starts the index reads of one start or replan, so every
+// planning pass shares one deadline and one answer per file.
+func withCueIndexReadsV3(ctx context.Context) context.Context {
+	return context.WithValue(ctx, cueIndexReadsKeyV3{}, newCueIndexReadsV3())
+}

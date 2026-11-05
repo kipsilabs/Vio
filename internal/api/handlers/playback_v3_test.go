@@ -3128,8 +3128,11 @@ func TestStartPlaybackV3HLSCopyMPEGTSOnV2Only(t *testing.T) {
 	if err != nil || reanchored.PlaybackPlan == nil || reanchored.PlaybackPlan.PlanID != frozen.PlanID {
 		t.Fatalf("reanchored = %#v, terminal = %#v, err = %v", reanchored.PlaybackPlan, reanchored.Terminal, err)
 	}
-	if ts := handler.tm.GetTranscodeSession(v2.SessionID); ts == nil || !ts.Opts().CopyVideoMPEGTS || ts.Opts().SeekSeconds == 0 {
-		t.Fatal("the seek reanchor did not reopen the MPEG-TS transport")
+	// A seek inside the active window keeps the running generation (the
+	// segment layer restarts FFmpeg in place), so the transport need not reopen;
+	// what must survive is the MPEG-TS packaging the start negotiated.
+	if ts := handler.tm.GetTranscodeSession(v2.SessionID); ts == nil || !ts.Opts().CopyVideoMPEGTS {
+		t.Fatal("the seek reanchor lost the MPEG-TS packaging")
 	}
 
 	request.PlaybackAttemptID = "attempt-handler-0002"

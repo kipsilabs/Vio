@@ -141,6 +141,11 @@ func (r *LibraryCollectionRepository) TouchCollectionItem(ctx context.Context, c
 	return nil
 }
 
+// libraryCollectionScopedItemCount is the listing count: members without a
+// library membership row keep their catalog grace window and are not counted.
+const libraryCollectionScopedItemCount = `COALESCE(COUNT(DISTINCT lci.media_item_id) FILTER (WHERE EXISTS (
+	         SELECT 1 FROM media_item_libraries in_library WHERE in_library.content_id = lci.media_item_id)), 0)`
+
 const libraryCollectionColumns = `lc.id, lc.library_id, lc.slug, lc.title, lc.description,
 	lc.collection_type, lc.visibility, COALESCE(scope_lcl.sort_order, lc.sort_order), scope_lcl.group_id, lc.featured, lc.poster_url,
 	lc.backdrop_url, lc.poster_thumbhash, lc.backdrop_thumbhash, lc.poster_auto_generated, lc.poster_from_template,
@@ -453,6 +458,11 @@ func (r *LibraryCollectionRepository) ListAll(ctx context.Context, libraryID *in
 // collections derive their members at read time and store no rows, so they are
 // not reported.
 func (r *LibraryCollectionRepository) ListContainingItem(ctx context.Context, mediaItemID string) ([]*models.LibraryCollection, error) {
+	// The reverse lookup answers "how many items are in this set", not what a
+	// listing page would show: a member in its post-scan grace window still
+	// counts here, so the count is every membership row.
+	columns := strings.Replace(libraryCollectionColumns, libraryCollectionScopedItemCount,
+		`COALESCE(COUNT(DISTINCT lci.media_item_id), 0)`, 1)
 	query := fmt.Sprintf(`
 		SELECT %s
 		FROM library_collections lc
@@ -467,7 +477,7 @@ func (r *LibraryCollectionRepository) ListContainingItem(ctx context.Context, me
 		  )
 		GROUP BY lc.id, scope_lcl.group_id, scope_lcl.sort_order
 		ORDER BY lower(lc.title) ASC, lc.title ASC, lc.id ASC
-	`, libraryCollectionColumns, libraryCollectionScopeFallbackJoin)
+	`, columns, libraryCollectionScopeFallbackJoin)
 
 	rows, err := r.pool.Query(ctx, query, mediaItemID)
 	if err != nil {

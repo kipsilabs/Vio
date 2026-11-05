@@ -40,7 +40,24 @@ func (h *PlaybackHandler) degradeStartSubtitleInPlaceV3(r *http.Request, req pla
 	degraded := req
 	degraded.SubtitleTrackIndex = nil
 	degraded.SubtitleTrackID = ""
-	result, err := h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: degraded, RequestedFile: requested, EffectiveFile: effective, AudioTrackIndex: audio, Settings: settings, Now: time.Now(), InventoryProvenance: string(provenance), AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), effective)})
+	input := playback.PlannerInputV3{
+		Request: degraded, RequestedFile: requested, EffectiveFile: effective,
+		AudioTrackIndex: audio, Settings: settings,
+		Registry:            h.transformationRegistryV3(r.Context()),
+		DVRPUStrippable:     h.lazyDVRPUStrippableV3(r.Context(), effective),
+		Now:                 time.Now(),
+		InventoryProvenance: string(provenance),
+		AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), effective),
+	}
+	result, err := h.planPlaybackWithCapabilitiesV3(r.Context(), input)
+	// A refused progressive remux is no proof the release cannot play: escalate
+	// it to HLS before the result can replace a sibling that already plays.
+	if escalated, escalateErr := h.escalateRefusedProgressiveRemuxV3(r.Context(), headerAuthenticatedMediaV3(req.ClientFeatures), func() playback.PlannerInputV3 { return input }, result); escalateErr != nil {
+		return req, result, escalateErr, false
+	} else {
+		result = escalated
+	}
+	clampPlannerTargetResolution(&result, effective)
 	if result.Terminal != nil {
 		return req, result, err, false
 	}

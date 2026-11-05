@@ -2356,7 +2356,13 @@ func (r *ItemRepository) ensureVirtualCollectionItemMaterializedTx(ctx context.C
 	if err := lockReleaseContentTx(ctx, tx, item.ContentID, false); err != nil {
 		return nil, err
 	}
-	if err := validateReleaseSnapshotTx(ctx, tx, opts.releaseSnapshot); err != nil {
+	snapshot := opts.releaseSnapshot
+	if opts.accepting {
+		// Acceptance executes the decision made when the member was prepared;
+		// an override first recorded afterwards does not invalidate it.
+		snapshot = recordedReleaseOverrides(snapshot)
+	}
+	if err := validateReleaseSnapshotTx(ctx, tx, snapshot); err != nil {
 		return nil, err
 	}
 
@@ -2486,7 +2492,10 @@ func (r *ItemRepository) ensureVirtualCollectionItemMaterializedTx(ctx context.C
 	// identities must arrive prepared (override evaluation done). New items
 	// with no stored aliases are exempt.
 	if mediaType == "movie" {
-		movieIDs, err := releaseIdentitiesForContent(ctx, tx, "movie", item.ContentID, "movie", item.TmdbID, item.TvdbID, item.ImdbID, 0, 0)
+		// The rows locked above are authoritative: a prepared item can carry
+		// aliases enrichment has since removed, and those must not retain
+		// authority at acceptance.
+		movieIDs, err := releaseIdentitiesForContent(ctx, tx, "movie", item.ContentID, "movie", rowTmdbID, "", rowImdbID, 0, 0)
 		if err != nil {
 			return nil, err
 		}
@@ -2500,15 +2509,25 @@ func (r *ItemRepository) ensureVirtualCollectionItemMaterializedTx(ctx context.C
 			if len(opts.releaseSnapshot) > 0 && !releaseIdentitySetsEqual(snapshotIdentities(opts.releaseSnapshot), movieIDs) {
 				return nil, fmt.Errorf("%w: release alias set changed after preparation", ErrReleaseOverrideConflict)
 			}
-			fresh, err := captureReleaseOverridesTx(ctx, tx, movieIDs)
-			if err != nil {
-				return nil, err
-			}
-			if err := validateReleaseSnapshotTx(ctx, tx, fresh); err != nil {
-				return nil, err
-			}
-			if allowed, active := decideReleaseOverrides(time.Now().UTC(), fresh); active && !allowed {
-				return nil, fmt.Errorf("%w: verified release override blocks materialization", ErrProviderUnavailable)
+			if opts.accepting {
+				// Collection acceptance executes the decision made when its
+				// members were prepared. A concurrent override write may land
+				// after that snapshot, but it must not retroactively cancel
+				// the acceptance; a changed alias set still conflicts above.
+				if allowed, active := decideReleaseOverrides(time.Now().UTC(), opts.releaseSnapshot); active && !allowed {
+					return nil, fmt.Errorf("%w: verified release override blocks materialization", ErrProviderUnavailable)
+				}
+			} else {
+				fresh, err := captureReleaseOverridesTx(ctx, tx, movieIDs)
+				if err != nil {
+					return nil, err
+				}
+				if err := validateReleaseSnapshotTx(ctx, tx, fresh); err != nil {
+					return nil, err
+				}
+				if allowed, active := decideReleaseOverrides(time.Now().UTC(), fresh); active && !allowed {
+					return nil, fmt.Errorf("%w: verified release override blocks materialization", ErrProviderUnavailable)
+				}
 			}
 		}
 	}

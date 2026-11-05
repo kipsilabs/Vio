@@ -286,6 +286,20 @@ func releaseIdentitiesCovered(superset, subset []ReleaseIdentity) bool {
 	return true
 }
 
+// recordedReleaseOverrides keeps only the entries a snapshot actually saw an
+// override for. A never-recorded identity may gain one after preparation;
+// collection acceptance still executes the pre-override decision, so it
+// validates only the revisions it relied on.
+func recordedReleaseOverrides(entries []ReleaseOverride) []ReleaseOverride {
+	recorded := make([]ReleaseOverride, 0, len(entries))
+	for _, entry := range entries {
+		if entry.Revision != 0 {
+			recorded = append(recorded, entry)
+		}
+	}
+	return recorded
+}
+
 // snapshotIdentities extracts the identity set covered by captured entries.
 func snapshotIdentities(entries []ReleaseOverride) []ReleaseIdentity {
 	ids := make([]ReleaseIdentity, 0, len(entries))

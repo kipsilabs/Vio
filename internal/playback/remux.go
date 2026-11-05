@@ -645,11 +645,16 @@ func ServeRemuxWithOptions(w http.ResponseWriter, r *http.Request, filePath, out
 	w = streamWriter
 	// Check file exists before starting ffmpeg to return a proper 404.
 	// Headers must be written before streaming begins, so we can't detect
-	// ffmpeg errors after WriteHeader(200) has been sent.
-	if _, err := fspath.Stat(filePath); err != nil {
-		if os.IsNotExist(err) {
-			http.Error(w, "file not found", http.StatusNotFound)
-			return err
+	// ffmpeg errors after WriteHeader(200) has been sent. Remote inputs
+	// (resolved provider URLs and the loopback relay) are opened by FFmpeg
+	// directly; os.Stat on an HTTP URL would incorrectly return ENOENT and
+	// break every virtual remux.
+	if !isRemoteRemuxInput(filePath) {
+		if _, err := fspath.Stat(filePath); err != nil {
+			if os.IsNotExist(err) {
+				http.Error(w, "file not found", http.StatusNotFound)
+				return err
+			}
 		}
 	}
 

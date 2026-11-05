@@ -52,7 +52,7 @@ func (h *UserDataHandler) HandleGetUserData(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	detail, err := h.content.GetItemDetail(r.Context(), session, contentID, nil)
+	detail, err := h.detailOrSyntheticSeason(r.Context(), session, contentID)
 	if err != nil {
 		writeCompatUpstreamError(w, err)
 		return
@@ -314,15 +314,30 @@ func (h *UserDataHandler) resolveUnplayedTargets(r *http.Request, session *Sessi
 	if err != nil || parent.kind == "" {
 		return targets, parent, err
 	}
-	resolver, ok := h.userData.(interface {
-		ParentUnplayedTargets(context.Context, *Session, string, string) ([]string, error)
-	})
-	if !ok {
-		return targets, parent, nil
+	var extra []string
+	seasonHandled := false
+	if parent.kind == watchstate.ParentSeason && parent.seriesID != "" && parent.seasonNumber != nil {
+		seasonResolver, ok := h.userData.(interface {
+			ParentUnplayedTargetsForSeason(context.Context, *Session, string, string, int) ([]string, bool, error)
+		})
+		if ok {
+			extra, seasonHandled, err = seasonResolver.ParentUnplayedTargetsForSeason(r.Context(), session, parent.id, parent.seriesID, *parent.seasonNumber)
+			if err != nil {
+				return nil, parent, err
+			}
+		}
 	}
-	extra, err := resolver.ParentUnplayedTargets(r.Context(), session, parent.kind, parent.id)
-	if err != nil {
-		return nil, parent, err
+	if !seasonHandled {
+		resolver, ok := h.userData.(interface {
+			ParentUnplayedTargets(context.Context, *Session, string, string) ([]string, error)
+		})
+		if !ok {
+			return targets, parent, nil
+		}
+		extra, err = resolver.ParentUnplayedTargets(r.Context(), session, parent.kind, parent.id)
+		if err != nil {
+			return nil, parent, err
+		}
 	}
 	seen := make(map[string]struct{}, len(targets))
 	for _, target := range targets {
@@ -337,13 +352,14 @@ const playedTargetNotFound = "Item not found"
 // playedParent names the series or season a played mark expanded; kind is
 // empty for a movie or episode.
 type playedParent struct {
-	kind, id string
+	kind, id     string
+	seriesID     string
+	seasonNumber *int
 }
 
 func (h *UserDataHandler) resolvePlayedTargetsWithParent(r *http.Request, session *Session, rawItemID string) ([]string, playedParent, error) {
 	if seasonID, err := h.codec.DecodeStringID(EncodedIDSeason, rawItemID); err == nil {
-		targets, err := h.resolvePlayedTargetsForSeason(r, session, seasonID)
-		return targets, playedParent{kind: watchstate.ParentSeason, id: seasonID}, err
+		return h.resolveSeasonTargets(r, session, seasonID)
 	}
 
 	contentID, _, err := decodeItemOrMediaSourceID(r.Context(), h.codec, rawItemID)
@@ -366,8 +382,12 @@ func (h *UserDataHandler) resolvePlayedTargetsForItem(r *http.Request, session *
 	case "movie", "episode":
 		return []string{detail.ContentID}, playedParent{}, nil
 	case "season":
-		targets, err := h.resolvePlayedTargetsForSeason(r, session, detail.ContentID)
-		return targets, playedParent{kind: watchstate.ParentSeason, id: detail.ContentID}, err
+		parent := playedParent{
+			kind: watchstate.ParentSeason, id: detail.ContentID,
+			seriesID: detail.SeriesID, seasonNumber: detail.SeasonNumber,
+		}
+		targets, err := h.resolvePlayedTargetsForSeason(r, session, detail.ContentID, parent)
+		return targets, parent, err
 	case "series":
 		seasons, err := h.content.ListSeasons(r.Context(), session, detail.ContentID, nil)
 		if err != nil {
@@ -388,7 +408,61 @@ func (h *UserDataHandler) resolvePlayedTargetsForItem(r *http.Request, session *
 	}
 }
 
-func (h *UserDataHandler) resolvePlayedTargetsForSeason(r *http.Request, session *Session, contentID string) ([]string, error) {
+func (h *UserDataHandler) resolveSeasonTargets(r *http.Request, session *Session, seasonID string) ([]string, playedParent, error) {
+	parent := seasonParentCoordinates(r.Context(), h.content, session, seasonID)
+	targets, err := h.resolvePlayedTargetsForSeason(r, session, seasonID, parent)
+	return targets, parent, err
+}
+
+func seasonParentCoordinates(ctx context.Context, content ContentService, session *Session, seasonID string) playedParent {
+	parent := playedParent{kind: watchstate.ParentSeason, id: seasonID}
+	if detail, err := content.GetItemDetail(ctx, session, seasonID, nil); err == nil && detail != nil {
+		parent.seriesID, parent.seasonNumber = detail.SeriesID, detail.SeasonNumber
+	}
+	if parent.seriesID == "" || parent.seasonNumber == nil {
+		if seriesID, seasonNumber, ok := catalog.ParseSyntheticSeasonID(seasonID); ok {
+			parent.seriesID, parent.seasonNumber = seriesID, &seasonNumber
+		}
+	}
+	return parent
+}
+
+func (h *UserDataHandler) detailOrSyntheticSeason(ctx context.Context, session *Session, contentID string) (*upstreamItemDetail, error) {
+	detail, err := h.content.GetItemDetail(ctx, session, contentID, nil)
+	if err == nil {
+		return detail, nil
+	}
+	seriesID, seasonNumber, ok := catalog.ParseSyntheticSeasonID(contentID)
+	if !ok {
+		return nil, err
+	}
+	season, seasonErr := h.content.GetSeason(ctx, session, seriesID, seasonNumber, nil)
+	if seasonErr != nil || season == nil {
+		return nil, err
+	}
+	return &upstreamItemDetail{
+		ContentID:       contentID,
+		Type:            "season",
+		Title:           season.Title,
+		Overview:        season.Overview,
+		SeriesID:        seriesID,
+		SeasonNumber:    &seasonNumber,
+		EpisodeCount:    &season.EpisodeCount,
+		PosterURL:       season.PosterURL,
+		PosterPath:      season.PosterPath,
+		PosterThumbhash: season.PosterThumbhash,
+		UpdatedAt:       season.UpdatedAt,
+	}, nil
+}
+
+func (h *UserDataHandler) resolvePlayedTargetsForSeason(r *http.Request, session *Session, contentID string, parent playedParent) ([]string, error) {
+	if parent.seriesID != "" && parent.seasonNumber != nil {
+		episodes, err := h.content.ListEpisodes(r.Context(), session, parent.seriesID, *parent.seasonNumber, nil)
+		if err != nil {
+			return nil, err
+		}
+		return episodeContentIDs(episodes), nil
+	}
 	episodes, err := h.content.ListEpisodesBySeasonID(r.Context(), session, contentID, nil)
 	if err != nil {
 		return nil, err
@@ -458,7 +532,7 @@ func (h *UserDataHandler) HandleUpdateUserData(w http.ResponseWriter, r *http.Re
 		writeItemIDError(w, r, err)
 		return
 	}
-	detail, err := h.content.GetItemDetail(r.Context(), session, contentID, nil)
+	detail, err := h.detailOrSyntheticSeason(r.Context(), session, contentID)
 	if err != nil {
 		writeCompatUpstreamError(w, err)
 		return
