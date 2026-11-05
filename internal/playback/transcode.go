@@ -74,7 +74,6 @@ type TranscodeOpts struct {
 	// mechanism. A copy target never invokes it. Runtime-only: no-op when nil.
 	OnSourceRejected func(ctx context.Context, mediaFileID int, canonicalPath string) error
 	OutputDir        string // e.g., /tmp/silo-transcode/{session_id}/
-	AudioOnly        bool
 	// subtitleFilterInputPath is a parser-safe local alias used only by the
 	// libass subtitles filter. FFmpeg still opens InputPath as the media input.
 	subtitleFilterInputPath string
