@@ -691,11 +691,21 @@ func (s *Service) GetDetail(ctx context.Context, viewer Viewer, mediaType MediaT
 	available := primaryMatch.Available
 	var seasons []RequestSeason
 	if mediaType == MediaTypeSeries {
+		seasonList, _, fromTVDB, seasonListAvailable, err := s.seriesSeasonSource(ctx, raw, 0, "")
+		if err != nil {
+			return nil, err
+		}
 		counts, err := s.seasonCounts(ctx, primaryMatch)
 		if err != nil {
 			return nil, err
 		}
-		seasons = requestSeasons(raw, counts, primaryRequests[raw.ID])
+		if !seasonCountsCompatible(fromTVDB, primaryMatch) {
+			counts = nil
+		}
+		if !seasonListAvailable {
+			seasonList = nil
+		}
+		seasons = requestSeasons(seasonList, counts, primaryRequests[raw.ID])
 		if active := primaryRequests[raw.ID]; active != nil && len(active.Seasons) > 0 && counts != nil {
 			// Attach the season progress the request lists attach, so the
 			// state can read partially available or available.
@@ -704,7 +714,7 @@ func (s *Service) GetDetail(ctx context.Context, viewer Viewer, mediaType MediaT
 			withProgress.SeasonProgress = seasonProgress(active.Seasons, counts)
 			primaryRequests[raw.ID] = &withProgress
 		}
-		if available && seriesHasOpenSeason(raw, counts) {
+		if available && seriesHasOpenSeason(seasonList, counts) {
 			more, err := s.moreSeasonsRequestable(ctx)
 			if err != nil {
 				return nil, err
@@ -854,11 +864,27 @@ func (s *Service) CreateRequest(ctx context.Context, viewer Viewer, input Create
 	if normalized.MediaType == MediaTypeSeries && !normalized.WholeSeries {
 		// A series partly in the library can still be requested for the
 		// seasons it is missing.
-		seasons, err := s.resolveRequestedSeasons(ctx, normalized.Seasons, detail, match)
+		tvdbID := 0
+		if normalized.TVDBID != nil {
+			tvdbID = *normalized.TVDBID
+		}
+		seasonList, _, fromTVDB, seasonListAvailable, err := s.seriesSeasonSource(ctx, detail, tvdbID, normalized.SeasonSource)
+		if err != nil {
+			return nil, err
+		}
+		joinCounts := seasonCountsCompatible(fromTVDB, match)
+		seasons, err := s.resolveRequestedSeasons(ctx, normalized.Seasons, seasonList, seasonListAvailable, match, joinCounts)
 		if err != nil {
 			return nil, err
 		}
 		normalized.Seasons = seasons
+		if normalized.SeasonSource == "" && seasonListAvailable {
+			if fromTVDB {
+				normalized.SeasonSource = SeasonSourceTVDB
+			} else {
+				normalized.SeasonSource = SeasonSourceTMDB
+			}
+		}
 	}
 
 	policy, err := s.EffectivePolicy(ctx, viewer.UserID)
