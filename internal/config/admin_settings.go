@@ -40,6 +40,11 @@ const ChapterThumbnailSoftwareToneMapSettingKey = "playback.chapter_thumbnail_so
 const (
 	PlaybackTranscodeHardwareToneMapSettingKey = "playback.transcode_hardware_tone_map_enabled"
 	PlaybackTranscodeSoftwareToneMapSettingKey = "playback.transcode_software_tone_map_enabled"
+	// PlaybackTranscodeVPPToneMapSettingKey selects Intel's media-engine (VPP)
+	// HDR-to-SDR converter for QSV transcodes instead of the default OpenCL
+	// recipe. It is opt-in because VPP tone mapping is cheaper but not
+	// quality-identical.
+	PlaybackTranscodeVPPToneMapSettingKey = "playback.transcode_vpp_tone_map_enabled"
 )
 
 // SetupCompletedSettingKey records that the first-run setup wizard reached its
@@ -65,6 +70,59 @@ const (
 // the files stored in that library. Off, the default, keeps every accessible
 // version of an item visible no matter which library it was opened from.
 const CatalogScopeVersionsToLibrarySettingKey = "catalog.scope_versions_to_library"
+
+// VirtualLibraryPlaybackProbeCacheMinutesSettingKey sizes the playback-time
+// virtual-source ffprobe evidence cache: how long a completed remote probe's
+// verdict stays reusable before the next playback or pre-play probe pays a
+// fresh enumeration. It is not the provider listing cache
+// (virtual_library.cache_ttl_minutes). Restart-required: the cache is built
+// once per server boot.
+const (
+	VirtualLibraryPlaybackProbeCacheMinutesSettingKey = "virtual_library.playback_probe_cache_minutes"
+	// DefaultVirtualLibraryPlaybackProbeCacheMinutes matches the previous
+	// hardwired scanner.NewVirtualProbeCache TTL, so unaffected deployments
+	// keep probing behavior identical after upgrade.
+	DefaultVirtualLibraryPlaybackProbeCacheMinutes = 10
+	MinVirtualLibraryPlaybackProbeCacheMinutes     = 1
+	MaxVirtualLibraryPlaybackProbeCacheMinutes     = 10080
+)
+
+// VirtualLibraryCatalogDiscoveryBudgetMsSettingKey bounds how long one
+// catalog leaf detail read (v2 item detail; the browse path Android opens
+// first) waits for pre-play virtual version discovery before answering with
+// whatever is already persisted. Discovery keeps running detached either way;
+// this only prices the wait in the response. The pre-play probe chain carries
+// its own separate budget and never inherits this number.
+const (
+	VirtualLibraryCatalogDiscoveryBudgetMsSettingKey = "virtual_library.catalog_discovery_budget_ms"
+	DefaultVirtualLibraryCatalogDiscoveryBudgetMs    = 1000
+	MinVirtualLibraryCatalogDiscoveryBudgetMs        = 500
+	MaxVirtualLibraryCatalogDiscoveryBudgetMs        = 10000
+)
+
+// VirtualLibraryPlaybackProbeCacheMinutes reads a stored
+// VirtualLibraryPlaybackProbeCacheMinutesSettingKey value. An unset or invalid
+// value is the default; any other integer is brought within bounds.
+func VirtualLibraryPlaybackProbeCacheMinutes(raw string) int {
+	value, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil {
+		return DefaultVirtualLibraryPlaybackProbeCacheMinutes
+	}
+	return min(max(value, MinVirtualLibraryPlaybackProbeCacheMinutes), MaxVirtualLibraryPlaybackProbeCacheMinutes)
+}
+
+// VirtualLibraryCatalogDiscoveryBudgetMs reads a stored
+// VirtualLibraryCatalogDiscoveryBudgetMsSettingKey value as whole
+// milliseconds. Writer validation rejects out-of-range values; the reader
+// still defaults and clamps defensively so an unvalidated stored value
+// cannot stretch the wait.
+func VirtualLibraryCatalogDiscoveryBudgetMs(raw string) int {
+	value, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil {
+		return DefaultVirtualLibraryCatalogDiscoveryBudgetMs
+	}
+	return min(max(value, MinVirtualLibraryCatalogDiscoveryBudgetMs), MaxVirtualLibraryCatalogDiscoveryBudgetMs)
+}
 
 // AccessUnratedContentSettingKey decides what a profile with a content-rating
 // ceiling sees for a title with no rating: an empty rating, or an explicit
@@ -452,6 +510,7 @@ var adminSettingDefaults = map[string]string{
 	ChapterThumbnailSoftwareToneMapSettingKey:        "true",
 	PlaybackTranscodeHardwareToneMapSettingKey:       "true",
 	PlaybackTranscodeSoftwareToneMapSettingKey:       "true",
+	PlaybackTranscodeVPPToneMapSettingKey:            "false",
 	CatalogScopeVersionsToLibrarySettingKey:          "false",
 	AccessUnratedContentSettingKey:                   AccessUnratedContentHide,
 	CatalogExtraRatingSourcesSettingKey:              "",
@@ -730,7 +789,8 @@ func NormalizeAdminSetting(key, raw string) (string, error) {
 	case "metadata.cache_images", "playback.transcode_enabled", PlaybackAllowHEVCEncodingSettingKey, PlaybackPreferLowerVersionTranscodeSettingKey,
 		PlaybackKeyframePlaylistSettingKey, PlaybackBandwidthProbeAutomaticSettingKey,
 		ChapterThumbnailSoftwareToneMapSettingKey, PlaybackTranscodeHardwareToneMapSettingKey,
-		PlaybackTranscodeSoftwareToneMapSettingKey, CatalogScopeVersionsToLibrarySettingKey,
+		PlaybackTranscodeSoftwareToneMapSettingKey, PlaybackTranscodeVPPToneMapSettingKey,
+		CatalogScopeVersionsToLibrarySettingKey,
 		Allow4KTranscodeSettingKey, playback.TranscodeThrottleEnabledSettingKey, "audiobookshelf_compat.enabled",
 		"jellyfin_compat.enabled", "jellyfin_compat.web_enabled", "recommendations.enabled",
 		"subtitle_ai.enabled", "subtitle_ai.transcribe_enabled", "metadata_ai.enabled", "subtitles.auto_sync",
@@ -1399,6 +1459,23 @@ func normalizeAdminInt(key, value string, minValue, maxValue int) (string, error
 		return "", fmt.Errorf("%s must be an integer between %d and %d", key, minValue, maxValue)
 	}
 	return strconv.Itoa(parsed), nil
+}
+
+// VirtualCandidateStoreWindow parses the virtual_library.candidate_store_hours
+// setting into the duration the playback and scanner layers trust a persisted
+// virtual candidate for. An empty value uses the setting's default (a newly
+// added key has no stored row yet); a non-positive or unparseable value returns
+// zero, which disables the window and keeps the pre-window behavior.
+func VirtualCandidateStoreWindow(raw string) time.Duration {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		raw = adminSettingDefaults["virtual_library.candidate_store_hours"]
+	}
+	hours, err := strconv.Atoi(raw)
+	if err != nil || hours <= 0 {
+		return 0
+	}
+	return time.Duration(hours) * time.Hour
 }
 
 func normalizeAdminInt64(key, value string, minValue, maxValue int64) (string, error) {
