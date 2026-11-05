@@ -452,7 +452,10 @@ type TranscodeSession struct {
 // NewTranscodeSessionForTest exposes only the output directory needed by tests
 // in other packages that exercise the mounted transcode-node media routes.
 func NewTranscodeSessionForTest(outputDir string) *TranscodeSession {
-	return &TranscodeSession{outputDir: outputDir}
+	// Give the fixture a session identity so its generation token is real: the
+	// segment-generation tests fence on `sgen`, and a tokenless session can
+	// never match one.
+	return &TranscodeSession{outputDir: outputDir, opts: TranscodeOpts{SessionID: "test-transcode-session"}}
 }
 
 // SetRestartHook registers a callback fired after every successful Restart.
@@ -2862,9 +2865,6 @@ func (s *TranscodeSession) waitForManifestPolls(ctx context.Context, timeout tim
 		if err == nil {
 			return manifest, polls, nil
 		}
-		if err != nil && !errors.Is(err, ErrManifestNotReady) {
-			return nil, polls, err
-		}
 
 		// A revoked generation surfaces its decode verdict here instead of
 		// the deadline's generic startup timeout — but only for virtual
@@ -2875,11 +2875,22 @@ func (s *TranscodeSession) waitForManifestPolls(ctx context.Context, timeout tim
 		// The production SPS/PPS incident decayed through this exact wait.
 		// The check runs every 100ms tick alongside the manifest stat, so a
 		// verdict surfaces within one tick without any notification channel.
+		//
+		// The verdict outranks every other wait outcome, including the
+		// process teardown that confirmation itself starts: reaping the
+		// rejected generation makes getManifest report the killed process
+		// ("transcode process failed: signal: killed") on the next poll. If
+		// that generic error were returned first, the caller would rotate the
+		// transport silently instead of surfacing ErrSourceDecodeRejected to
+		// the candidate-rotation loop.
 		s.mu.Lock()
 		virtualInput := isVirtualInputPath(s.opts.CanonicalInputPath)
 		s.mu.Unlock()
 		if virtualInput && s.IsSourceRejected() {
 			return nil, polls, ErrSourceDecodeRejected
+		}
+		if !errors.Is(err, ErrManifestNotReady) {
+			return nil, polls, err
 		}
 
 		select {
