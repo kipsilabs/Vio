@@ -2899,6 +2899,9 @@ func dv7WithELFixtureV3() *models.MediaFile {
 	file := detailedFixtureFileV3()
 	file.VideoTracks[0].DVProfile = 7
 	file.VideoTracks[0].DVBLCompatID = 1
+	file.VideoTracks[0].DVConfigPresent = true
+	file.VideoTracks[0].DVBLCompatIDPresent = true
+	file.VideoTracks[0].DVBLPresent = true
 	file.VideoTracks[0].DVELPresent = true
 	file.VideoTracks[0].DVEnhancementLayer = "unknown"
 	file.VideoTracks[0].VideoRange = "DolbyVision"
