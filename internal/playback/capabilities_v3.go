@@ -1,6 +1,7 @@
 package playback
 
 import (
+	"slices"
 	"strconv"
 	"strings"
 	"unicode"
@@ -168,7 +169,7 @@ func videoEligibleV3(source SourceDescriptorV3, request StartRequestV3) (bool, b
 				if len(capability.Profiles) > 0 && !videoProfileSupportedV3(source.VideoCodec, source.VideoProfile, capability.Profiles) {
 					continue
 				}
-				if len(capability.Levels) > 0 && (source.VideoLevel <= 0 || !containsAtLeastV3(capability.Levels, source.VideoLevel)) {
+				if len(capability.Levels) > 0 && (source.VideoLevel <= 0 || !(containsAtLeastV3(capability.Levels, source.VideoLevel) || (request.Capabilities.VideoEvidence == EvidenceExactV3 && capability.Hardware && hevcLevelFitsDecoderV3(source, slices.Max(capability.Levels))))) {
 					continue
 				}
 			}
@@ -211,6 +212,92 @@ func decoderEnvelopeFitsV3(source SourceDescriptorV3, capability VideoDecodeCapa
 		}
 	}
 	return true
+}
+
+// hevcLevelLimitV3 holds H.265 level limits for one level_idc: maxLumaPs
+// (Table A.8; levels sharing it also share the decoded picture buffer,
+// slice-segment and tile limits), and maxLumaSr and maxBRKbps (Table A.9,
+// Main tier, since Android reports levels without a tier).
+type hevcLevelLimitV3 struct {
+	maxLumaPs int
+	maxLumaSr int
+	maxBRKbps int
+}
+
+var hevcLevelLimitsV3 = map[int]hevcLevelLimitV3{
+	30:  {36_864, 552_960, 128},
+	60:  {122_880, 3_686_400, 1_500},
+	63:  {245_760, 7_372_800, 3_000},
+	90:  {552_960, 16_588_800, 6_000},
+	93:  {983_040, 33_177_600, 10_000},
+	120: {2_228_224, 66_846_720, 12_000},
+	123: {2_228_224, 133_693_440, 20_000},
+	150: {8_912_896, 267_386_880, 25_000},
+	153: {8_912_896, 534_773_760, 40_000},
+	156: {8_912_896, 1_069_547_520, 60_000},
+	180: {35_651_584, 1_069_547_520, 60_000},
+	183: {35_651_584, 2_139_095_040, 120_000},
+	186: {35_651_584, 4_278_190_080, 240_000},
+}
+
+// hevcLevelFitsDecoderV3 reports whether an HEVC source tagged above a
+// decoder's highest level stays within that level's decoding work. Encoders
+// pick the level from the declared buffer and peak bitrate as well as picture
+// size and rate, so a 4K24 encode with a high VBV ceiling is tagged 5.2
+// though a 5.1 decoder handles its pictures. The tag must share the decoder
+// level's picture-size family, and the source's sample rate and average
+// bitrate must fit the decoder's level. Peaks and per-picture slice counts
+// are not in the metadata, which is why the bitrate bound is Main tier's.
+// The stored frame rate is an average too, so a variable-rate stream could
+// hide faster stretches: the sample rate is checked at no less than
+// maxTradedFrameRateV3.
+func hevcLevelFitsDecoderV3(source SourceDescriptorV3, decoderLevel int) bool {
+	sourceLimit, sourceKnown := hevcLevelLimitsV3[source.VideoLevel]
+	decoderLimit, decoderKnown := hevcLevelLimitsV3[decoderLevel]
+	if !strings.EqualFold(source.VideoCodec, transcodeCodecHEVC) || !sourceKnown || !decoderKnown ||
+		sourceLimit.maxLumaPs != decoderLimit.maxLumaPs {
+		return false
+	}
+	lumaPs := source.Width * source.Height
+	frameRate := max(source.FrameRate, maxTradedFrameRateV3)
+	return lumaPs > 0 && lumaPs <= decoderLimit.maxLumaPs &&
+		float64(lumaPs)*frameRate <= float64(decoderLimit.maxLumaSr) &&
+		source.BitrateKbps > 0 && source.BitrateKbps <= decoderLimit.maxBRKbps
+}
+
+// maxTradedFrameRateV3 is the highest source frame rate a copy route admits
+// by trading an exact decoder's rate against its size. It covers the 50 and
+// 60 fps sources the trade is for without assuming a frame-rate range the
+// decoder never reported.
+const maxTradedFrameRateV3 = 60
+
+// decoderTakesFrameRateV3 reports whether a decoder takes a frame rate at its
+// largest size; an unknown rate or limit always passes.
+func decoderTakesFrameRateV3(decoder VideoDecodeCapabilityV3, frameRate float64) bool {
+	return decoder.MaxFrameRate <= 0 || frameRate <= decoder.MaxFrameRate+0.01
+}
+
+// decoderTakesFrameV3 reports whether a decoder takes width x height video at
+// frameRate. The maximum width and height always bind. With rateAtMaxSize the
+// reported rate holds at the decoder's largest size (Android derives it
+// there), so a smaller frame may run faster within the same macroblock rate,
+// counted in 16x16 macroblocks as Android's performance points are: a 4K30
+// decoder takes 1080p60 but not 1080p120, and a 1080p30 one takes 720p60 but
+// not 1080p60. Otherwise, or without both sizes, the rate is absolute.
+func decoderTakesFrameV3(decoder VideoDecodeCapabilityV3, width, height int, frameRate float64, rateAtMaxSize bool) bool {
+	if (decoder.MaxWidth > 0 && width > decoder.MaxWidth) || (decoder.MaxHeight > 0 && height > decoder.MaxHeight) {
+		return false
+	}
+	if decoderTakesFrameRateV3(decoder, frameRate) {
+		return true
+	}
+	return rateAtMaxSize && decoder.MaxWidth > 0 && decoder.MaxHeight > 0 && width > 0 && height > 0 &&
+		float64(macroblocksV3(width, height))*frameRate <= float64(macroblocksV3(decoder.MaxWidth, decoder.MaxHeight))*(decoder.MaxFrameRate+0.01)
+}
+
+// macroblocksV3 counts the 16x16 macroblocks that cover a frame.
+func macroblocksV3(width, height int) int {
+	return ((width + 15) / 16) * ((height + 15) / 16)
 }
 
 // videoProfileSupportedV3 compares a source profile with the profiles an exact
