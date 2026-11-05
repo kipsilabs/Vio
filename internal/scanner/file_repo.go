@@ -5620,7 +5620,9 @@ func (r *FileRepository) listFilesByEpisodeIDs(ctx context.Context, episodeIDs [
 	query := `SELECT served.episode_id, ` + mfFileColumns + `
 		FROM (` + catalog.ServedEpisodeFilesSQL + `) served(episode_id, file_id)
 		JOIN media_files mf ON mf.id = served.file_id
-		ORDER BY served.episode_id ASC, mf.id ASC`
+		ORDER BY served.episode_id ASC,
+		         CASE WHEN mf.episode_id = served.episode_id THEN 0 ELSE 1 END ASC,
+		         mf.id ASC`
 	rows, err := r.pool.Query(ctx, query, episodeIDs)
 	if err != nil {
 		return nil, fmt.Errorf("querying files by episode_ids: %w", err)
@@ -6201,7 +6203,7 @@ func (r *FileRepository) GetByEpisodeID(ctx context.Context, episodeID string) (
 func (r *FileRepository) listFilesByEpisodeID(ctx context.Context, episodeID string) ([]*models.MediaFile, error) {
 	query := `SELECT ` + fileColumns + ` FROM media_files
 		WHERE id IN (SELECT served.file_id FROM (` + catalog.ServedEpisodeFilesSQL + `) served(episode_id, file_id))
-		ORDER BY id ASC`
+		ORDER BY CASE WHEN episode_id = ANY($1::text[]) THEN 0 ELSE 1 END ASC, id ASC`
 	rows, err := r.pool.Query(ctx, query, []string{episodeID})
 	if err != nil {
 		return nil, fmt.Errorf("querying files by episode_id: %w", err)
