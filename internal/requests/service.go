@@ -500,7 +500,10 @@ func (s *Service) resolveRouterConnections(ctx context.Context, fc *fulfillConte
 			readErr = err
 			continue
 		}
-		if missing {
+		if isVirtualIntegration(in.InstallationID, in.CapabilityID) {
+			in.APIKeyRef = VirtualLibraryAPIKey
+		}
+		if missing && !isVirtualIntegration(in.InstallationID, in.CapabilityID) {
 			slog.WarnContext(ctx, "requests: skipping router connection with no api key", "component", "requests", "connection_id", in.ID)
 			continue
 		}
@@ -1516,7 +1519,7 @@ func (s *Service) UpdateIntegration(ctx context.Context, viewer Viewer, in Integ
 // so the API layer can render them inline.
 func (s *Service) validateViaPlugin(ctx context.Context, in Integration) error {
 	if isVirtualIntegration(in.InstallationID, in.CapabilityID) {
-		if s.hasDefaultVirtualRouter != nil && !s.hasActiveDefaultVirtualRouter() {
+		if strings.TrimSpace(in.BaseURL) != "" && !s.hasActiveDefaultVirtualRouter() {
 			return &ValidationError{FormError: "virtual library routing is not active"}
 		}
 		in.BaseURL = VirtualLibraryBaseURL
@@ -2277,7 +2280,7 @@ func (s *Service) submitApprovedRequest(ctx context.Context, req Request, actor 
 		}
 		fc = built
 	}
-	if s.router == nil || !routerConfiguredFor(fc, req.MediaType) {
+	if s.router == nil || (!routerConfiguredFor(fc, req.MediaType) && !s.hasActiveDefaultVirtualRouter()) {
 		// No router serves this media type: the request stays approved and
 		// the reconcile pass completes it when the title reaches the library.
 		return &req, nil
@@ -2366,6 +2369,10 @@ func (s *Service) submitClaimed(ctx context.Context, req Request, actor Viewer, 
 	conns, installationID, capabilityID, err := s.resolveRouterConnections(ctx, fc, req.MediaType)
 	if err != nil {
 		return nil, err
+	}
+	if len(conns) == 0 && s.hasActiveDefaultVirtualRouter() {
+		conns = []ResolvedRouterConnection{{ID: "virtual", BaseURL: VirtualLibraryBaseURL, APIKey: VirtualLibraryAPIKey}}
+		installationID, capabilityID = 0, VirtualLibraryRequestsCapability
 	}
 	if len(conns) == 0 {
 		// A connection is configured for the media type (routerConfiguredFor)
