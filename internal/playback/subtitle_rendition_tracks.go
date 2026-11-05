@@ -19,8 +19,11 @@ import (
 	"unicode/utf8"
 
 	"github.com/Silo-Server/silo-server/internal/embeddedsub"
-	"github.com/Silo-Server/silo-server/internal/lang"
 )
+
+const executableRecipeVersionRenditionTracksV3 = executableRecipeVersionSubtitleRenditionV3
+
+const maxOnDemandSubtitleRenditions = 64
 
 // On-demand subtitle renditions list every embedded text track of the source
 // as a WebVTT SUBTITLES rendition of its own, in one group, instead of the one
@@ -228,6 +231,11 @@ func subtitleTrackSegmentPrefix(number uint64) string {
 
 // parseSubtitleTrackSegment parses an on-demand rendition segment name,
 // sub_<track>_<segment>.vtt.
+// ParseSubtitleTrackSegment parses an on-demand rendition segment name.
+func ParseSubtitleTrackSegment(name string) (number uint64, segNum int, ok bool) {
+	return parseSubtitleTrackSegment(name)
+}
+
 func parseSubtitleTrackSegment(name string) (number uint64, segNum int, ok bool) {
 	rest, ok := strings.CutPrefix(name, subtitleSegmentPrefix)
 	if !ok {
@@ -256,62 +264,11 @@ func allDigits(s string) bool {
 	return s != "" && strings.Trim(s, "0123456789") == ""
 }
 
-// parseSubtitleRenditionTrack reads an on-demand track number from a
-// SubtitleRenditionTrackQueryParam value.
-func parseSubtitleRenditionTrack(value string) (uint64, bool) {
-	if !allDigits(value) {
-		return 0, false
-	}
-	number, err := strconv.ParseUint(value, 10, 64)
-	return number, err == nil && number > 0
-}
-
-// subtitleRenditionsPlaylist is the multivariant playlist of a stream with
-// on-demand renditions: one EXT-X-MEDIA per track, in the recipe's order,
-// DEFAULT=YES only on the selected one.
-func subtitleRenditionsPlaylist(opts TranscodeOpts, uri func(rendition string) string) []byte {
-	var buf bytes.Buffer
-	for _, track := range opts.SubtitleRenditionTracks {
-		def := "NO"
-		if track.Default {
-			def = "YES"
-		}
-		forced := "NO"
-		if track.Forced {
-			forced = "YES"
-		}
-		name := hlsQuotedStringValue(track.Name)
-		if name == "" {
-			// A session rebuilt from a stream token knows its tracks only
-			// by number.
-			name = "Track " + strconv.FormatUint(track.TrackNumber, 10)
-		}
-		fmt.Fprintf(&buf, "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=%q,NAME=\"%s\"", SubtitleRenditionGroupID, name)
-		if language := hlsLanguage(track.Language); language != "" {
-			fmt.Fprintf(&buf, ",LANGUAGE=\"%s\"", language)
-		}
-		fmt.Fprintf(&buf, ",DEFAULT=%s,AUTOSELECT=YES,FORCED=%s,URI=%q\n", def, forced,
-			uri(subtitleRenditionSubtitles+"&"+SubtitleRenditionTrackQueryParam+"="+strconv.FormatUint(track.TrackNumber, 10)))
-	}
-	return buf.Bytes()
-}
-
-// hlsLanguage is a rendition's LANGUAGE: the track's language as a canonical
-// BCP 47 tag ("eng" becomes "en"), as HLS asks, or "" when it is unknown or
-// isn't one.
-func hlsLanguage(language string) string {
-	tag := lang.CanonicalTag(language)
-	if strings.EqualFold(tag, "und") {
-		return ""
-	}
-	return tag
-}
-
 // SubtitleRenditionTrackCount is how many on-demand renditions the session
 // serves: 0 without them, or when its recipe can't carry a rendition at all.
 func (s *TranscodeSession) SubtitleRenditionTrackCount() int {
 	opts := s.Opts()
-	if !subtitleRenditionActive(opts) {
+	if !opts.SubtitleRendition || len(opts.SubtitleRenditionTracks) == 0 {
 		return 0
 	}
 	return len(opts.SubtitleRenditionTracks)
@@ -502,7 +459,7 @@ func readOnDemandCues(ctx context.Context, opts TranscodeOpts, number uint64, se
 	}
 	// A copy remux's cues are on the source's clock less its start time
 	// (-start_at_zero), an encode's on the source's own (-copyts).
-	copyClock := copyMuxShiftsVideo(opts)
+	copyClock := strings.EqualFold(opts.TargetCodecVideo, "copy")
 	tsEpoch := window.observed && HLSOutputContainer(opts) == OutputContainerMPEGTS
 	kept, ref := keptRenditionWindowSource(opts, number)
 	var startTime time.Duration
