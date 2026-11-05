@@ -38,6 +38,14 @@ import (
 	"github.com/Silo-Server/silo-server/internal/userstore"
 )
 
+type ArtworkRepairEnqueuer interface {
+	EnqueueArtworkRepair(context.Context, []string, int) (int, error)
+}
+
+type itemCollectionIndex interface {
+	ListContainingItem(context.Context, string) ([]*models.LibraryCollection, error)
+}
+
 type LibraryCollectionHandler struct {
 	repo                  *catalog.LibraryCollectionRepository
 	service               *catalog.LibraryCollectionService
@@ -71,6 +79,8 @@ type LibraryCollectionHandler struct {
 	// hand-picked and imported personal collections opted into a library
 	// tab and remembers the counts between reads; nil counts on every read.
 	PersonalMemberCounts *catalog.PersonalCollectionMemberCounts
+	itemCollectionIndex  itemCollectionIndex
+	ArtworkRepair        ArtworkRepairEnqueuer
 }
 
 var errLibraryCollectionInUse = catalog.ErrLibraryCollectionInUse
@@ -199,7 +209,7 @@ func (h *LibraryCollectionHandler) CollectionCollagePath(collectionID, key strin
 }
 
 func (h *LibraryCollectionHandler) collageComposer() collectionCollageComposer {
-	return collectionCollageComposer{prefix: adminCollectionImagePrefix, store: h.ArtworkStore, posters: h.detailSvc, signer: h.ArtworkSigner, httpClient: h.httpClient}
+	return collectionCollageComposer{prefix: adminCollectionImagePrefix, store: h.ArtworkStore, posters: h.detailSvc, signer: h.ArtworkSigner, repair: h.ArtworkRepair, httpClient: h.httpClient}
 }
 
 type libraryCollectionResponse struct {
@@ -446,6 +456,19 @@ type importTMDBDiscoverRequest struct {
 	ManagementSource   string                     `json:"management_source,omitempty"`
 	ManagementKey      string                     `json:"management_key,omitempty"`
 	PosterFromTemplate bool                       `json:"-"`
+}
+
+type importTraktRequest struct {
+	SortConfig  json.RawMessage `json:"sort_config,omitempty"`
+	LibraryID   int             `json:"library_id"`
+	LibraryIDs  []int           `json:"library_ids"`
+	Title       string          `json:"title"`
+	Description string          `json:"description"`
+	Preset      string          `json:"preset"`
+	MediaType   string          `json:"media_type"`
+	ProfileID   string          `json:"profile_id,omitempty"`
+	ListURL     string          `json:"list_url,omitempty"`
+	Limit       *int            `json:"limit,omitempty"`
 }
 
 // importTMDBDiscoverSpecBody mirrors templates.TMDBDiscoverSpec without the
