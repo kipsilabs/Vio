@@ -125,6 +125,9 @@ var (
 	TypeCapabilityUnsupported                         = ProblemType{"capability_unsupported", http.StatusNotImplemented, "Capability unsupported"}
 	TypeDependencyUnavailable                         = ProblemType{"dependency_unavailable", http.StatusServiceUnavailable, "Dependency unavailable"}
 	TypeClientUpgradeRequired                         = ProblemType{"client_upgrade_required", http.StatusGone, "Client upgrade required"}
+	TypeFileUnavailable                               = ProblemType{"file_unavailable", http.StatusNotFound, "File unavailable"}
+	TypeFileAccessDenied                              = ProblemType{"file_access_denied", http.StatusForbidden, "File access denied"}
+	TypeFormatUnavailable                             = ProblemType{"format_unavailable", http.StatusNotAcceptable, "Format unavailable"}
 	catalog                                           = []ProblemType{TypeRangeNotSatisfiable, TypeDeviceLoginExpired, TypeUnsupportedSource, TypeMalformedRequest, TypeInvalidCursor, TypeAuthenticationRequired, TypeInvalidToken, TypeSessionExpired, TypePermissionDenied, TypeProfileVerificationRequired, TypePushInstallationKeyMismatch, TypeNotFound, TypeMethodNotAllowed, TypeNotAcceptable, TypeRequestTimeout, TypeConflict, TypeIdempotencyConflict, TypeJobNotCancelable, TypeCapabilityDisabled, TypeCapabilityNotConfigured, TypePreconditionFailed, TypePayloadTooLarge, TypeUnsupportedMediaType, TypeValidationFailed, TypePreconditionRequired, TypeRateLimited, TypeInternalError, TypeCapabilityUnsupported, TypeDependencyUnavailable, TypeClientUpgradeRequired, TypeSyncResetRequired, TypeSnapshotRequestConflict, TypeProgressSnapshotTooLarge, TypePlaybackInstallationChanged, TypePlaybackSessionEnded, TypePlaybackProgressConflict, TypePasswordChangeRequired, TypeNotPermitted, TypeAccountRequired, TypeLocalLoginDisabled, TypeProviderPasswordExpired, TypeEmailInUse, TypeIdentityLinkedElsewhere, TypeProviderAlreadyEnabled, TypeBreakGlassRequired, TypeLastSignInMethod, TypeProviderUnavailable, TypeInvalidGrant, TypeAccountDisabled, TypeLocalPasswordRequired, TypeAlreadyLinked, TypeTokenRefreshRequired, TypeNetworkIdentityRequired, TypePreparedFileExpired, TypeDeviceBindingMismatch, TypeRestoreSetChanged, TypeBackupUnauthenticated, TypeUploadLimitReached}
 	defaultTypeByStatus                               = map[int]ProblemType{}
 	problemContentType                                = "application/problem+json"
@@ -174,11 +177,19 @@ type Problem struct {
 	Errors   []ProblemError `json:"errors,omitempty" doc:"Field-level validation details"`
 
 	headers http.Header
+	cause   error
 }
 
 // NewProblem builds an application problem of type t.
 func NewProblem(t ProblemType, detail string) *Problem {
 	return &Problem{Type: t.URI(), Title: t.Title, Status: t.Status, Detail: detail}
+}
+
+func (p *Problem) withCause(err error) *Problem {
+	if p != nil && err != nil && p.cause == nil {
+		p.cause = err
+	}
+	return p
 }
 
 // WithErrors attaches validation details.

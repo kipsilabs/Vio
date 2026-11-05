@@ -347,6 +347,7 @@ type importMDBListRequest struct {
 	Description       string          `json:"description"`
 	URL               string          `json:"url"`
 	Limit             *int            `json:"limit,omitempty"`
+	VirtualPlayback   *bool           `json:"virtual_playback,omitempty"`
 	Featured          bool            `json:"featured"`
 	SortOrder         int             `json:"sort_order,omitempty"`
 	PosterURL         string          `json:"poster_url"`
@@ -372,6 +373,7 @@ type importTMDBRequest struct {
 	TimeWindow         string          `json:"time_window"`
 	MediaType          string          `json:"media_type"`
 	Limit              *int            `json:"limit,omitempty"`
+	VirtualPlayback    *bool           `json:"virtual_playback,omitempty"`
 	Featured           bool            `json:"featured"`
 	SortOrder          int             `json:"sort_order,omitempty"`
 	PosterURL          string          `json:"poster_url"`
