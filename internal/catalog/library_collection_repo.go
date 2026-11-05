@@ -2283,3 +2283,78 @@ func int32SliceToInts(values []int32) []int {
 	}
 	return result
 }
+
+func UpdateLibraryCollectionColumnsInTx(ctx context.Context, tx pgx.Tx, input UpdateLibraryCollectionInput) error {
+	if input.LibraryIDs != nil || input.SetGroupID != nil || input.ExpectedRevision != nil {
+		return errors.New("updating a collection's scope or group needs Update")
+	}
+	sets, args, argIdx := libraryCollectionColumnSets(input)
+	if len(sets) == 0 {
+		return nil
+	}
+	if err := lockLibraryCollectionParent(ctx, tx, input.ID); err != nil {
+		return err
+	}
+	query := fmt.Sprintf("UPDATE library_collections SET %s, updated_at = NOW() WHERE id = $%d", strings.Join(sets, ", "), argIdx)
+	tag, err := tx.Exec(ctx, query, append(args, input.ID)...)
+	if err != nil {
+		return fmt.Errorf("updating library collection: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrLibraryCollectionNotFound
+	}
+	return nil
+}
+
+//nolint:funlen,gocyclo // the scope and group writes of one transaction; its column assignments moved to libraryCollectionColumnSets
+func AddMissingItemsInTx(ctx context.Context, tx pgx.Tx, collectionID string, mediaItemIDs []string) ([]string, error) {
+	if len(mediaItemIDs) == 0 {
+		return nil, nil
+	}
+	if err := lockLibraryCollectionParent(ctx, tx, collectionID); err != nil {
+		return nil, err
+	}
+	rows, err := tx.Query(ctx, `
+		WITH wanted AS (
+			SELECT id, ord FROM unnest($2::text[]) WITH ORDINALITY AS w(id, ord)
+		), base AS (
+			SELECT COALESCE(MAX(position), -1) AS last FROM library_collection_items WHERE collection_id = $1
+		)
+		INSERT INTO library_collection_items (collection_id, media_item_id, position, source_rank)
+		SELECT $1, w.id, base.last + row_number() OVER (ORDER BY w.ord), 0
+		FROM wanted w CROSS JOIN base
+		JOIN media_items m ON m.content_id = w.id
+		WHERE NOT EXISTS (SELECT 1 FROM library_collection_items i WHERE i.collection_id = $1 AND i.media_item_id = w.id)
+		ON CONFLICT (collection_id, media_item_id) DO NOTHING
+		RETURNING media_item_id`, collectionID, mediaItemIDs)
+	if err != nil {
+		return nil, fmt.Errorf("adding collection items: %w", err)
+	}
+	defer rows.Close()
+	var added []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		added = append(added, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("adding collection items: %w", err)
+	}
+	if len(added) > 0 {
+		if _, err := tx.Exec(ctx, "UPDATE library_collections SET updated_at = NOW() WHERE id = $1", collectionID); err != nil {
+			return nil, fmt.Errorf("touching library collection: %w", err)
+		}
+	}
+	return added, nil
+}
+
+// GroupUngroupedMembershipInTx puts a collection's membership in one library
+// into groupID, at the end of that group's order, only while the membership
+// is ungrouped, in the caller's transaction. It reports whether it changed
+// anything; a membership an admin grouped is left alone. It takes the
+// collection-editing locks in their order: the collection parent, then the
+// library's order revision, then the membership row. MoveAndReorder takes
+// the library's parents before anything else, so it waits on the parent
+// here instead of holding the membership row this needs.
