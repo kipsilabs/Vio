@@ -3687,6 +3687,7 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 		DurationSeconds: duration,
 		AllowWindow:     allowWindow,
 		WindowRequested: windowRequested,
+		Embedded:        playback.EmbeddedSubtitleRefFor(file, embeddedIndex),
 		FFmpegPath:      h.ffmpegPath(),
 	}
 	// Virtual sources are provider-neutral URIs, not FFmpeg inputs. Resolve
@@ -3852,6 +3853,18 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 				panic(http.ErrAbortHandler)
 			}
 			writeSubtitleSourceUnavailableRetry(w, extractionRetry.RetryAfter)
+			return
+		}
+		if errors.Is(extractErr, playback.ErrSubtitleReadsBusy) {
+			// The node admits no more whole-track reads. Answer before any byte
+			// with the standard busy status and Retry-After, like the download
+			// asset path, instead of blaming the extraction.
+			clearSubtitleCoverageHeaders(w.Header())
+			if response.Status() == 0 {
+				writeSubtitleReadsBusy(w)
+			} else {
+				panic(http.ErrAbortHandler)
+			}
 			return
 		}
 		playback.LogSubtitleStreamError(r.Context(), extractErr, file.ID, embeddedIndex)
