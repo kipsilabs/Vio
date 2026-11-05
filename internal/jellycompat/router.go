@@ -180,8 +180,12 @@ func NewRouter(deps Dependencies) chi.Router {
 	// reaping of a >24h idle dir is bounded and safe.
 	playback.StartPeriodicOrphanCleanup(deps.AppContext, "jellycompat", playbackHandler.TranscodeDir, playbackHandler.CleanupOrphanedTranscodes, playback.OrphanCleanupInterval)
 	cleanupDone := playbackHandler.tm.StartShutdownCleanup(deps.AppContext)
+	virtualCleanupDone := playbackHandler.StartCompatBackgroundShutdownCleanup(deps.AppContext)
 	if deps.RegisterShutdownWork != nil {
+		// Register transcode cleanup first so shutdown preserves the existing
+		// manager ordering, then retain virtual evidence cleanup separately.
 		deps.RegisterShutdownWork(cleanupDone)
+		deps.RegisterShutdownWork(virtualCleanupDone)
 	}
 	if deps.RecWorker != nil {
 		playbackHandler.signalsNotifier = deps.RecWorker
