@@ -110,7 +110,7 @@ func NewClient(cfg BucketConfig) *Client {
 
 	role := telemetry.Role(cfg.Role)
 	s3Client := s3.New(s3.Options{
-		APIOptions:   []func(*middleware.Stack) error{observeS3(role), markThrottled},
+		APIOptions:   []func(*middleware.Stack) error{observeS3(role), markThrottled, boundListResponses},
 		HTTPClient:   observedHTTPClient{inner: sharedHTTPClient(), role: role},
 		Region:       region,
 		BaseEndpoint: aws.String(cfg.Endpoint),
@@ -126,7 +126,7 @@ func NewClient(cfg BucketConfig) *Client {
 	// URL signing is local work, so it must not appear as a storage call.
 	presignClient := s3.NewPresignClient(s3Client, s3.WithPresignClientFromClientOptions(func(o *s3.Options) {
 		o.APIOptions = append(o.APIOptions, func(stack *middleware.Stack) error {
-			_, _ = stack.Initialize.Remove("VioObserve")
+			_, _ = stack.Initialize.Remove("SiloObserve")
 			return nil
 		})
 	}))
@@ -193,7 +193,7 @@ func (c *Client) GetObject(ctx context.Context, bucket, key string) ([]byte, err
 		}
 		return nil, fmt.Errorf("s3 GetObject %s/%s: %w", bucket, key, err)
 	}
-	defer func() { _ = out.Body.Close() }()
+	defer out.Body.Close()
 
 	data, err := io.ReadAll(out.Body)
 	if err != nil {
@@ -257,6 +257,60 @@ func (c *Client) PutObject(ctx context.Context, bucket, key string, data []byte)
 	return nil
 }
 
+// ErrObjectExists reports a conditional create that found an object at its
+// key. Nothing was written.
+var ErrObjectExists = errors.New("s3: object already exists")
+
+// ErrConditionalWriteUnsupported reports a backend that refused the
+// If-None-Match header of a conditional create.
+var ErrConditionalWriteUnsupported = errors.New("s3: conditional writes are not supported by this backend")
+
+// PutObjectIfAbsent uploads data only when no object exists at key, with
+// If-None-Match: *, so a concurrent writer is never overwritten. It returns
+// ErrObjectExists when one does (412, or 409 for a conflicting concurrent
+// conditional write), and ErrConditionalWriteUnsupported when the backend
+// rejects the header (501, or a 400 naming it).
+func (c *Client) PutObjectIfAbsent(ctx context.Context, bucket, key string, data []byte) error {
+	if err := c.mutations.Acquire(ctx, 1); err != nil {
+		return err
+	}
+	defer c.mutations.Release(1)
+	input := &s3.PutObjectInput{
+		Bucket:      aws.String(bucket),
+		Key:         aws.String(c.prefixedKey(key)),
+		Body:        newBytesReadSeeker(data),
+		IfNoneMatch: aws.String("*"),
+		Metadata:    map[string]string{"silo-sha256": objectSHA256(data)},
+	}
+	if ct := contentTypeFromKey(key); ct != "" {
+		input.ContentType = aws.String(ct)
+	}
+	_, err := c.s3Client.PutObject(ctx, input)
+	switch {
+	case err == nil:
+		return nil
+	case httpStatusCode(err) == http.StatusPreconditionFailed, httpStatusCode(err) == http.StatusConflict:
+		return ErrObjectExists
+	case httpStatusCode(err) == http.StatusNotImplemented, conditionalHeaderRejected(err):
+		return ErrConditionalWriteUnsupported
+	}
+	return fmt.Errorf("s3 PutObject if absent %s/%s: %w", bucket, key, err)
+}
+
+// conditionalHeaderRejected recognizes a 400 that names the If-None-Match
+// header or reports it as not implemented, as some S3-compatible backends
+// answer instead of 501.
+func conditionalHeaderRejected(err error) bool {
+	if httpStatusCode(err) != http.StatusBadRequest {
+		return false
+	}
+	if apiErr, ok := errors.AsType[smithy.APIError](err); ok &&
+		(apiErr.ErrorCode() == "NotImplemented" || strings.Contains(apiErr.ErrorMessage(), "If-None-Match")) {
+		return true
+	}
+	return strings.Contains(err.Error(), "If-None-Match")
+}
+
 // PutObjectStream uploads a streaming body to the given key. When contentType is
 // empty, it falls back to the same extension-based inference used by PutObject.
 // The body length is untrusted until streamed, so the upload goes through the
@@ -264,6 +318,18 @@ func (c *Client) PutObject(ctx context.Context, bucket, key string, data []byte)
 // known Content-Length, which backends like Cloudflare R2 require (a plain
 // PutObject with an unsized stream is rejected with 411 MissingContentLength).
 func (c *Client) PutObjectStream(ctx context.Context, bucket, key string, r io.Reader, contentType string) error {
+	return c.PutObjectStreamParts(ctx, bucket, key, r, contentType, streamUploadPartSize)
+}
+
+// MaxUploadParts is the most parts one multipart upload may have.
+const MaxUploadParts = 10_000
+
+// PutObjectStreamParts is PutObjectStream with partSize-byte parts, for
+// objects that may be larger than 10,000 default parts: the multipart upload
+// holds one part in memory at a time, and an object can be at most
+// MaxUploadParts parts. A partSize below the default uses the default.
+func (c *Client) PutObjectStreamParts(ctx context.Context, bucket, key string, r io.Reader, contentType string, partSize int64) error {
+	partSize = max(partSize, streamUploadPartSize)
 	if err := c.mutations.Acquire(ctx, 1); err != nil {
 		return err
 	}
@@ -281,11 +347,11 @@ func (c *Client) PutObjectStream(ctx context.Context, bucket, key string, r io.R
 		input.ContentType = aws.String(ct)
 	}
 
-	uploader := manager.NewUploader(c.s3Client, func(u *manager.Uploader) { //nolint:staticcheck // AWS deprecates manager for transfermanager; migrating the upload path is tracked separately.
-		u.PartSize = streamUploadPartSize
+	uploader := manager.NewUploader(c.s3Client, func(u *manager.Uploader) {
+		u.PartSize = partSize
 		u.Concurrency = 1
 	})
-	if _, err := uploader.Upload(ctx, input); err != nil { //nolint:staticcheck // Same manager uploader deprecation as NewUploader above.
+	if _, err := uploader.Upload(ctx, input); err != nil {
 		return fmt.Errorf("s3 PutObject stream %s/%s: %w", bucket, key, err)
 	}
 
@@ -320,7 +386,7 @@ func (c *Client) UploadFile(ctx context.Context, bucket, key, path, contentType 
 	if err != nil {
 		return 0, fmt.Errorf("opening upload file %s: %w", path, err)
 	}
-	defer func() { _ = file.Close() }()
+	defer file.Close()
 
 	info, err := file.Stat()
 	if err != nil {
@@ -696,9 +762,8 @@ func (c *Client) DeletePrefix(ctx context.Context, bucket, prefix string) (int, 
 
 // DeleteObjects deletes the given keys in batches of up to 1000 (the S3 API
 // limit). Returns the total number of successfully deleted objects. Missing
-// keys count as deleted. Batch request failures and a canceled context return
-// an error alongside the count; per-key failures are logged and left out of
-// the count so cleanup remains best-effort.
+// keys count as deleted; any other failure is returned as an error alongside
+// the count, and a canceled context stops the deletion with its error.
 func (c *Client) DeleteObjects(ctx context.Context, bucket string, keys []string) (int, error) {
 	if err := c.mutations.Acquire(ctx, 1); err != nil {
 		return 0, err
@@ -710,6 +775,14 @@ func (c *Client) DeleteObjects(ctx context.Context, bucket string, keys []string
 func (c *Client) deleteObjects(ctx context.Context, bucket string, keys []string) (int, error) {
 	const batchSize = 1000
 	deleted := 0
+	failed := 0
+	var firstErr error
+	recordFailure := func(err error) {
+		failed++
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
 
 	for i := 0; i < len(keys); i += batchSize {
 		if err := ctx.Err(); err != nil {
@@ -755,6 +828,7 @@ func (c *Client) deleteObjects(ctx context.Context, bucket string, keys []string
 						return deleted, ctxErr
 					}
 					slog.WarnContext(ctx, "s3 DeleteObjects fallback: failed to delete", "component", "s3client", "key", key, "code", s3ErrorCode(delErr))
+					recordFailure(fmt.Errorf("s3 DeleteObjects %s/%s: %s", bucket, key, s3ErrorCode(delErr)))
 					continue
 				}
 				deleted++
@@ -783,15 +857,32 @@ func (c *Client) deleteObjects(ctx context.Context, bucket string, keys []string
 				code := safeErrorCode(aws.ToString(e.Code))
 				slog.WarnContext(ctx, "s3 DeleteObjects: partial failure", "component", "s3client",
 					"key", key, "code", code)
-				// The backend's free-form message is omitted from the log: it may
-				// echo credentials or signed URLs. Per-key failures are best-effort
-				// accounting, so the caller gets the deleted count and no error.
+				// The backend's free-form message is omitted from both the log
+				// and the returned error: it may echo credentials or signed URLs.
+				recordFailure(fmt.Errorf("s3 DeleteObjects %s/%s: %s", bucket, key, code))
 			}
 		}
 	}
 
+	if failed > 0 {
+		return deleted, fmt.Errorf("s3 DeleteObjects %s: %d of %d objects not deleted: %w", bucket, failed, len(keys), firstErr)
+	}
 	return deleted, nil
 }
+
+// ErrorCode returns the backend's error code for err, such as "AccessDenied"
+// or "NoSuchBucket", or "" when err carries none (a network failure). The
+// backend's free-form message is never returned.
+func ErrorCode(err error) string {
+	if apiErr, ok := errors.AsType[smithy.APIError](err); ok {
+		return safeErrorCode(apiErr.ErrorCode())
+	}
+	return ""
+}
+
+// HTTPStatus returns the HTTP status of the response behind err, or 0 when
+// no response arrived.
+func HTTPStatus(err error) int { return httpStatusCode(err) }
 
 // s3ErrorCode returns the backend error code for err without its free-form
 // message, which may echo credentials or signed URLs.
@@ -872,7 +963,24 @@ func (c *Client) ListObjects(ctx context.Context, bucket, prefix string) ([]stri
 	return keys, nil
 }
 
-// ListObjectInfos lists objects with the given prefix and returns summary metadata.
+// ErrListingTooLarge reports a full listing that passed maxListEntries or
+// maxListPages. Callers that need every key of a larger prefix page through it
+// with ListObjectInfosAfter or ListObjectInfosPage.
+var ErrListingTooLarge = errors.New("s3 listing exceeds the full-listing limit")
+
+// Full-listing ceilings. Real callers list one item's images, one backup
+// upload's parts (a terabyte at the 1 MiB minimum part size), catalog seeds, or
+// diagnostic reports, all well under a million keys. The ceilings stop an endpoint that keeps returning truncated pages with
+// fresh continuation tokens from growing the result, or the request count,
+// without bound. Variables so tests can lower them.
+var (
+	maxListEntries = 1_000_000
+	maxListPages   = 10_000
+)
+
+// ListObjectInfos lists objects with the given prefix and returns summary
+// metadata. It returns ErrListingTooLarge past maxListEntries entries or
+// maxListPages pages.
 func (c *Client) ListObjectInfos(ctx context.Context, bucket, prefix string) ([]ObjectInfo, error) {
 	var objects []ObjectInfo
 	prefixedPrefix := c.prefixedKey(prefix)
@@ -882,7 +990,10 @@ func (c *Client) ListObjectInfos(ctx context.Context, bucket, prefix string) ([]
 		Prefix: aws.String(prefixedPrefix),
 	})
 
-	for paginator.HasMorePages() {
+	for pages := 0; paginator.HasMorePages(); pages++ {
+		if pages == maxListPages || len(objects) >= maxListEntries {
+			return nil, fmt.Errorf("s3 ListObjectsV2 %s prefix=%s: %w (%d pages, %d entries)", bucket, prefix, ErrListingTooLarge, pages, len(objects))
+		}
 		page, err := paginator.NextPage(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("s3 ListObjectsV2 %s prefix=%s: %w", bucket, prefix, err)

@@ -9,6 +9,7 @@ import (
 	"net/mail"
 	"net/url"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -18,7 +19,6 @@ import (
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/settingscontract"
-	"github.com/Silo-Server/silo-server/internal/virtuallibrary/quality"
 	redisv9 "github.com/redis/go-redis/v9"
 	"github.com/robfig/cron/v3"
 )
@@ -40,11 +40,6 @@ const ChapterThumbnailSoftwareToneMapSettingKey = "playback.chapter_thumbnail_so
 const (
 	PlaybackTranscodeHardwareToneMapSettingKey = "playback.transcode_hardware_tone_map_enabled"
 	PlaybackTranscodeSoftwareToneMapSettingKey = "playback.transcode_software_tone_map_enabled"
-	// PlaybackTranscodeVPPToneMapSettingKey selects Intel's media-engine (VPP)
-	// HDR-to-SDR converter for QSV transcodes instead of the default OpenCL
-	// recipe. It is opt-in because VPP tone mapping is cheaper but not
-	// quality-identical.
-	PlaybackTranscodeVPPToneMapSettingKey = "playback.transcode_vpp_tone_map_enabled"
 )
 
 // SetupCompletedSettingKey records that the first-run setup wizard reached its
@@ -70,59 +65,6 @@ const (
 // the files stored in that library. Off, the default, keeps every accessible
 // version of an item visible no matter which library it was opened from.
 const CatalogScopeVersionsToLibrarySettingKey = "catalog.scope_versions_to_library"
-
-// VirtualLibraryPlaybackProbeCacheMinutesSettingKey sizes the playback-time
-// virtual-source ffprobe evidence cache: how long a completed remote probe's
-// verdict stays reusable before the next playback or pre-play probe pays a
-// fresh enumeration. It is not the provider listing cache
-// (virtual_library.cache_ttl_minutes). Restart-required: the cache is built
-// once per server boot.
-const (
-	VirtualLibraryPlaybackProbeCacheMinutesSettingKey = "virtual_library.playback_probe_cache_minutes"
-	// DefaultVirtualLibraryPlaybackProbeCacheMinutes matches the previous
-	// hardwired scanner.NewVirtualProbeCache TTL, so unaffected deployments
-	// keep probing behavior identical after upgrade.
-	DefaultVirtualLibraryPlaybackProbeCacheMinutes = 10
-	MinVirtualLibraryPlaybackProbeCacheMinutes     = 1
-	MaxVirtualLibraryPlaybackProbeCacheMinutes     = 10080
-)
-
-// VirtualLibraryCatalogDiscoveryBudgetMsSettingKey bounds how long one
-// catalog leaf detail read (v2 item detail; the browse path Android opens
-// first) waits for pre-play virtual version discovery before answering with
-// whatever is already persisted. Discovery keeps running detached either way;
-// this only prices the wait in the response. The pre-play probe chain carries
-// its own separate budget and never inherits this number.
-const (
-	VirtualLibraryCatalogDiscoveryBudgetMsSettingKey = "virtual_library.catalog_discovery_budget_ms"
-	DefaultVirtualLibraryCatalogDiscoveryBudgetMs    = 1000
-	MinVirtualLibraryCatalogDiscoveryBudgetMs        = 500
-	MaxVirtualLibraryCatalogDiscoveryBudgetMs        = 10000
-)
-
-// VirtualLibraryPlaybackProbeCacheMinutes reads a stored
-// VirtualLibraryPlaybackProbeCacheMinutesSettingKey value. An unset or invalid
-// value is the default; any other integer is brought within bounds.
-func VirtualLibraryPlaybackProbeCacheMinutes(raw string) int {
-	value, err := strconv.Atoi(strings.TrimSpace(raw))
-	if err != nil {
-		return DefaultVirtualLibraryPlaybackProbeCacheMinutes
-	}
-	return min(max(value, MinVirtualLibraryPlaybackProbeCacheMinutes), MaxVirtualLibraryPlaybackProbeCacheMinutes)
-}
-
-// VirtualLibraryCatalogDiscoveryBudgetMs reads a stored
-// VirtualLibraryCatalogDiscoveryBudgetMsSettingKey value as whole
-// milliseconds. Writer validation rejects out-of-range values; the reader
-// still defaults and clamps defensively so an unvalidated stored value
-// cannot stretch the wait.
-func VirtualLibraryCatalogDiscoveryBudgetMs(raw string) int {
-	value, err := strconv.Atoi(strings.TrimSpace(raw))
-	if err != nil {
-		return DefaultVirtualLibraryCatalogDiscoveryBudgetMs
-	}
-	return min(max(value, MinVirtualLibraryCatalogDiscoveryBudgetMs), MaxVirtualLibraryCatalogDiscoveryBudgetMs)
-}
 
 // AccessUnratedContentSettingKey decides what a profile with a content-rating
 // ceiling sees for a title with no rating: an empty rating, or an explicit
@@ -280,6 +222,63 @@ const MarkersDetectionWorkersSettingKey = "markers.detection_workers"
 // takes effect on restart.
 const ServerLANDiscoverySettingKey = "server.lan_discovery"
 
+// Backup settings (docs/architecture/backups.md). internal/backup reads them
+// live at each run, so none needs a restart.
+const (
+	// BackupEnabledSettingKey turns the nightly backup on. "Back up now" works
+	// either way.
+	BackupEnabledSettingKey = "backup.enabled"
+	// BackupTimeSettingKey is the server-local HH:MM the nightly backup starts.
+	BackupTimeSettingKey = "backup.time"
+	// BackupKeepSettingKey is how many nightly and manual backups rotation
+	// keeps, from MinBackupKeep to MaxBackupKeep.
+	BackupKeepSettingKey = "backup.keep"
+	// BackupIncludeIntroFingerprintsSettingKey keeps intro fingerprint data in
+	// the dump. Without it, intro detection analyzes a season again when its
+	// next episode arrives.
+	BackupIncludeIntroFingerprintsSettingKey = "backup.include_intro_fingerprints"
+	// BackupIncludeSubtitlesSettingKey copies downloaded subtitles into the
+	// backup's blobs.
+	BackupIncludeSubtitlesSettingKey = "backup.include_subtitles"
+	// BackupDestinationSettingKey names where backups are written:
+	// BackupDestinationDefault, the operational blob store, or
+	// BackupDestinationS3, the dedicated bucket the backup.s3.* keys name.
+	BackupDestinationSettingKey = "backup.destination"
+	BackupDestinationDefault    = "default"
+	BackupDestinationS3         = "s3"
+	// The dedicated backup bucket. The secret key is encrypted at rest.
+	BackupS3EndpointSettingKey  = "backup.s3.endpoint"
+	BackupS3RegionSettingKey    = "backup.s3.region"
+	BackupS3PathStyleSettingKey = "backup.s3.path_style"
+	BackupS3BucketSettingKey    = "backup.s3.bucket"
+	BackupS3KeyPrefixSettingKey = "backup.s3.key_prefix"
+	BackupS3AccessKeySettingKey = "backup.s3.access_key"
+	BackupS3SecretKeySettingKey = "backup.s3.secret_key"
+	// BackupS3KeyAcknowledgedSettingKey is the SECRET_KEY check value the
+	// admin confirmed keeping a copy of. S3 backups run only while it equals
+	// this server's; only the acknowledge-key endpoint writes it.
+	BackupS3KeyAcknowledgedSettingKey = "backup.s3.key_acknowledged"
+	MinBackupKeep                     = 1
+	MaxBackupKeep                     = 60
+	DefaultBackupTime                 = "04:00"
+	DefaultBackupKeep                 = 7
+)
+
+// ParseBackupTime reads a backup.time value, "H:MM" or "HH:MM" on a 24-hour
+// clock.
+func ParseBackupTime(value string) (hour, minute int, ok bool) {
+	h, m, found := strings.Cut(strings.TrimSpace(value), ":")
+	if !found || len(h) < 1 || len(h) > 2 || len(m) != 2 {
+		return 0, 0, false
+	}
+	hour, errH := strconv.Atoi(h)
+	minute, errM := strconv.Atoi(m)
+	if errH != nil || errM != nil || hour < 0 || hour > 23 || minute < 0 || minute > 59 {
+		return 0, 0, false
+	}
+	return hour, minute, true
+}
+
 // ServerLocalURLSettingKey is the API server's address on the local network,
 // for a deployment whose LAN advertisement cannot reach the network or names
 // the wrong port (Docker bridge networking). Signed-in clients read it from the
@@ -378,7 +377,7 @@ var adminSettingDefaults = map[string]string{
 	"server.log_level":          "info",
 	"server.log_quiet":          "",
 	"server.public_url":         "",
-	"branding.server_name":      "Vio",
+	"branding.server_name":      "Silo",
 	"branding.login_subtitle":   "Sign in with an existing account.",
 	"clientip.trusted_proxies":  "10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8, ::1/128",
 	"theme.catalog_url":         DefaultThemeCatalogURL,
@@ -426,35 +425,6 @@ var adminSettingDefaults = map[string]string{
 	// migration stored true on servers set up before the wizard saved it.
 	"markers.share_by_default": "",
 
-	"virtual_library.enabled":                         "true",
-	"virtual_library.discover_before_playback":        "false",
-	"virtual_library.manifest_url":                    "",
-	"virtual_library.movie_library_id":                "1",
-	"virtual_library.series_library_id":               "2",
-	"virtual_library.tmdb_api_key":                    "",
-	"virtual_library.allow_insecure_http":             "false",
-	"virtual_library.allow_private_streams":           "false",
-	"virtual_library.cache_ttl_minutes":               "10",
-	VirtualLibraryPlaybackProbeCacheMinutesSettingKey: strconv.Itoa(DefaultVirtualLibraryPlaybackProbeCacheMinutes),
-	VirtualLibraryCatalogDiscoveryBudgetMsSettingKey:  strconv.Itoa(DefaultVirtualLibraryCatalogDiscoveryBudgetMs),
-	"virtual_library.candidate_store_hours":           "720",
-	"virtual_library.schedule_refresh_minutes":        "360",
-	"virtual_library.monitor_file":                    ".vio-virtual-library-monitored.json",
-	"virtual_library.enable_quality_profiles":         "false",
-	"virtual_library.quality_preset":                  "custom",
-	"virtual_library.custom_format_preset":            "custom",
-	"virtual_library.single_stream_with_failover":     "true",
-	"virtual_library.fallback_to_any_stream":          "false",
-	"virtual_library.quality_profiles":                "",
-	"virtual_library.custom_formats":                  "",
-	"virtual_library.indexer_rss_url":                 "",
-	"virtual_library.indexer_api_key":                 "",
-	"virtual_library.indexer_rss_check_minutes":       "15",
-	"virtual_library.indexer_search_timeout_seconds":  "20",
-	"virtual_library.altmount_url":                    "",
-	"virtual_library.altmount_api_key":                "",
-	"virtual_library.altmount_check_minutes":          "15",
-
 	// Background person metadata lookups per API node per minute.
 	MetadataPersonRefreshPerMinuteSettingKey: "120",
 	MetadataFallbackLanguageSettingKey:       "en",
@@ -463,7 +433,6 @@ var adminSettingDefaults = map[string]string{
 	playbackTranscodeDirSettingKey:                   DefaultTranscodeDir,
 	playbackSegmentRetentionSettingKey:               "600",
 	"playback.hw_accel":                              "auto",
-	"playback.software_fallback":                     "allow",
 	"playback.transcode_enabled":                     "true",
 	PlaybackAllowHEVCEncodingSettingKey:              "false",
 	PlaybackPreferLowerVersionTranscodeSettingKey:    "true",
@@ -483,13 +452,11 @@ var adminSettingDefaults = map[string]string{
 	ChapterThumbnailSoftwareToneMapSettingKey:        "true",
 	PlaybackTranscodeHardwareToneMapSettingKey:       "true",
 	PlaybackTranscodeSoftwareToneMapSettingKey:       "true",
-	PlaybackTranscodeVPPToneMapSettingKey:            "false",
 	CatalogScopeVersionsToLibrarySettingKey:          "false",
 	AccessUnratedContentSettingKey:                   AccessUnratedContentHide,
 	CatalogExtraRatingSourcesSettingKey:              "",
 	"playback.watched_threshold":                     "90",
 	"playback.min_resume_threshold":                  "5",
-	"playback.max_virtual_failover_attempts":         "5",
 	Allow4KTranscodeSettingKey:                       "true",
 	playback.TranscodeThrottleEnabledSettingKey:      strconv.FormatBool(playback.DefaultTranscodeThrottleEnabled),
 	playback.TranscodeThrottleSecondsSettingKey:      strconv.Itoa(playback.DefaultTranscodeThrottleSeconds),
@@ -498,7 +465,7 @@ var adminSettingDefaults = map[string]string{
 	"jellyfin_compat.enabled":                 "true",
 	"jellyfin_compat.public_url":              "http://127.0.0.1:8096",
 	"jellyfin_compat.emulated_server_version": DefaultJellyfinCompatEmulatedServerVersion,
-	"jellyfin_compat.server_name":             "Vio",
+	"jellyfin_compat.server_name":             "Silo",
 	"jellyfin_compat.web_enabled":             "true",
 	"jellyfin_compat.web_version":             DefaultJellyfinWebVersion,
 	"jellyfin_compat.web_install_dir":         DefaultJellyfinWebInstallDir,
@@ -556,7 +523,7 @@ var adminSettingDefaults = map[string]string{
 	"email.enabled":       "false",
 	"email.smtp_port":     "587",
 	"email.smtp_security": "starttls",
-	"email.from_name":     "Vio",
+	"email.from_name":     "Silo",
 
 	"notifications.release_events_enabled":                     "true",
 	"notifications.fanout_enabled":                             "true",
@@ -608,7 +575,7 @@ var adminSettingDefaults = map[string]string{
 	"password_reset.self_service_enabled": "false",
 
 	"catalog.search.provider":                             "postgres",
-	"catalog.search.meilisearch.index":                    "vio_media_items",
+	"catalog.search.meilisearch.index":                    "silo_media_items",
 	"catalog.search.meilisearch.timeout_ms":               "800",
 	"catalog.search.meilisearch.matching_strategy":        "last",
 	"catalog.search.meilisearch.sync_batch_size":          "500",
@@ -616,13 +583,26 @@ var adminSettingDefaults = map[string]string{
 	"catalog.search.meilisearch.rebuild_task_queue_depth": "4",
 	"catalog.search.meilisearch.semantic_enabled":         "false",
 	"catalog.search.meilisearch.semantic_ratio":           "0.5",
-	"catalog.search.meilisearch.embedder":                 "vio_recommendations",
+	"catalog.search.meilisearch.embedder":                 "silo_recommendations",
 	"catalog.search.meilisearch.binary_quantized":         "false",
 
 	PlaybackKeyframePlaylistSettingKey: "false",
 
 	PlaybackBandwidthProbeAutomaticSettingKey:  "true",
 	PlaybackBandwidthProbeMaxAgeDaysSettingKey: strconv.Itoa(DefaultBandwidthProbeMaxAgeDays),
+
+	BackupEnabledSettingKey:                  "true",
+	BackupTimeSettingKey:                     DefaultBackupTime,
+	BackupKeepSettingKey:                     strconv.Itoa(DefaultBackupKeep),
+	BackupIncludeIntroFingerprintsSettingKey: "false",
+	BackupIncludeSubtitlesSettingKey:         "true",
+	BackupDestinationSettingKey:              BackupDestinationDefault,
+	BackupS3EndpointSettingKey:               "",
+	BackupS3RegionSettingKey:                 "",
+	BackupS3PathStyleSettingKey:              "false",
+	BackupS3BucketSettingKey:                 "",
+	BackupS3KeyPrefixSettingKey:              "",
+	BackupS3AccessKeySettingKey:              "",
 }
 
 var legacyAdminSettingFallbacks = []struct {
@@ -649,6 +629,17 @@ var legacyAdminSettingFallbacks = []struct {
 	{"s3.private_access_key", "s3.operational_access_key"},
 	{"s3.private_secret_key", "s3.operational_secret_key"},
 	{"ai.chat_model", "subtitle_ai.chat_model"},
+}
+
+// AdminSettingDefaultKeys lists every key with an admin default, sorted. The
+// backup restore table must classify each one.
+func AdminSettingDefaultKeys() []string {
+	keys := make([]string, 0, len(adminSettingDefaults))
+	for key := range adminSettingDefaults {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // EffectiveAdminSettings overlays persisted values onto the runtime defaults
@@ -739,8 +730,7 @@ func NormalizeAdminSetting(key, raw string) (string, error) {
 	case "metadata.cache_images", "playback.transcode_enabled", PlaybackAllowHEVCEncodingSettingKey, PlaybackPreferLowerVersionTranscodeSettingKey,
 		PlaybackKeyframePlaylistSettingKey, PlaybackBandwidthProbeAutomaticSettingKey,
 		ChapterThumbnailSoftwareToneMapSettingKey, PlaybackTranscodeHardwareToneMapSettingKey,
-		PlaybackTranscodeSoftwareToneMapSettingKey, PlaybackTranscodeVPPToneMapSettingKey,
-		CatalogScopeVersionsToLibrarySettingKey,
+		PlaybackTranscodeSoftwareToneMapSettingKey, CatalogScopeVersionsToLibrarySettingKey,
 		Allow4KTranscodeSettingKey, playback.TranscodeThrottleEnabledSettingKey, "audiobookshelf_compat.enabled",
 		"jellyfin_compat.enabled", "jellyfin_compat.web_enabled", "recommendations.enabled",
 		"subtitle_ai.enabled", "subtitle_ai.transcribe_enabled", "metadata_ai.enabled", "subtitles.auto_sync",
@@ -758,13 +748,25 @@ func NormalizeAdminSetting(key, raw string) (string, error) {
 		"notifications.apple_push_delivery_enabled", "notifications.android_push_delivery_enabled",
 		"catalog.search.meilisearch.semantic_enabled", "catalog.search.meilisearch.binary_quantized",
 		"s3.public_path_style", "s3.private_path_style", "s3.user_db_path_style",
-		"virtual_library.enabled", "virtual_library.discover_before_playback", "virtual_library.allow_insecure_http",
-		"virtual_library.allow_private_streams",
-		"virtual_library.enable_quality_profiles",
-		"virtual_library.single_stream_with_failover",
-		"virtual_library.fallback_to_any_stream",
-		AuthLocalPasswordLoginSettingKey, AuthEmailAutoMatchSettingKey, ServerLANDiscoverySettingKey:
+		AuthLocalPasswordLoginSettingKey, AuthEmailAutoMatchSettingKey, ServerLANDiscoverySettingKey,
+		BackupEnabledSettingKey, BackupIncludeIntroFingerprintsSettingKey, BackupIncludeSubtitlesSettingKey,
+		BackupS3PathStyleSettingKey:
 		return normalizeAdminBool(key, value)
+
+	case BackupTimeSettingKey:
+		hour, minute, ok := ParseBackupTime(value)
+		if !ok {
+			return "", fmt.Errorf("%s must be a 24-hour time such as 04:00", key)
+		}
+		return fmt.Sprintf("%02d:%02d", hour, minute), nil
+	case BackupKeepSettingKey:
+		return normalizeAdminInt(key, value, MinBackupKeep, MaxBackupKeep)
+	case BackupDestinationSettingKey:
+		return normalizeAdminEnum(key, value, BackupDestinationDefault, BackupDestinationS3)
+	case BackupS3EndpointSettingKey:
+		return normalizeAdminURL(key, value)
+	case BackupS3KeyPrefixSettingKey:
+		return strings.Trim(value, "/"), nil
 
 	case AuthProviderRecheckIntervalSettingKey:
 		parsed, err := parseDuration(value)
@@ -827,65 +829,6 @@ func NormalizeAdminSetting(key, raw string) (string, error) {
 		return normalizeAdminInt(key, value, 1, 100)
 	case "playback.min_resume_threshold":
 		return normalizeAdminInt(key, value, 1, 99)
-	case "playback.max_virtual_failover_attempts":
-		return normalizeAdminInt(key, value, 1, 50)
-	case "virtual_library.movie_library_id", "virtual_library.series_library_id":
-		return normalizeAdminInt(key, value, 1, 1000000)
-	case "virtual_library.cache_ttl_minutes", "virtual_library.indexer_rss_check_minutes", "virtual_library.altmount_check_minutes":
-		return normalizeAdminInt(key, value, 1, 10080)
-	case VirtualLibraryPlaybackProbeCacheMinutesSettingKey:
-		return normalizeAdminInt(key, value, MinVirtualLibraryPlaybackProbeCacheMinutes, MaxVirtualLibraryPlaybackProbeCacheMinutes)
-	case VirtualLibraryCatalogDiscoveryBudgetMsSettingKey:
-		return normalizeAdminInt(key, value, MinVirtualLibraryCatalogDiscoveryBudgetMs, MaxVirtualLibraryCatalogDiscoveryBudgetMs)
-	case "virtual_library.indexer_search_timeout_seconds":
-		return normalizeAdminInt(key, value, 5, 900)
-	case "virtual_library.candidate_store_hours":
-		// 0 disables the trust window and keeps the pre-window behavior.
-		return normalizeAdminInt(key, value, 0, 8760)
-	case "virtual_library.schedule_refresh_minutes":
-		return normalizeAdminInt(key, value, 30, 10080)
-	case "virtual_library.manifest_url", "virtual_library.tmdb_api_key",
-		"virtual_library.monitor_file",
-		"virtual_library.indexer_api_key", "virtual_library.altmount_url",
-		"virtual_library.altmount_api_key":
-		if len(value) > 4096 {
-			return "", fmt.Errorf("%s exceeds 4096 bytes", key)
-		}
-		return value, nil
-	case "virtual_library.indexer_rss_url":
-		return normalizeProwlarrBaseURL(value)
-	case "virtual_library.quality_preset", "virtual_library.custom_format_preset":
-		if value == "" {
-			return "custom", nil
-		}
-		if len(value) > 64 {
-			return "", fmt.Errorf("%s exceeds 64 bytes", key)
-		}
-		return value, nil
-	case "virtual_library.quality_profiles":
-		if len(value) > 65536 {
-			return "", fmt.Errorf("%s exceeds 65536 bytes", key)
-		}
-		return value, nil
-	case "virtual_library.custom_formats":
-		if len(value) > 65536 {
-			return "", fmt.Errorf("%s exceeds 65536 bytes", key)
-		}
-		// Reject uncompilable patterns at save time with a field error, so
-		// the operator fixes the regex before persisting it instead of
-		// discovering a dormant virtual library after the next restart.
-		// Boot activation stays lenient (skips bad formats) for rows
-		// written by other means; Validate here is deliberately strict.
-		if strings.TrimSpace(value) != "" {
-			var formats []quality.CustomFormat
-			if err := json.Unmarshal([]byte(value), &formats); err != nil {
-				return "", fmt.Errorf("%s is not valid JSON: %w", key, err)
-			}
-			if err := (&quality.QualityConfig{CustomFormats: formats}).Validate(); err != nil {
-				return "", fmt.Errorf("%s invalid: %w", key, err)
-			}
-		}
-		return value, nil
 	case playback.TranscodeThrottleSecondsSettingKey:
 		return normalizeAdminInt(key, value, 60, 86400)
 	case playbackSegmentRetentionSettingKey:
@@ -992,8 +935,6 @@ func NormalizeAdminSetting(key, raw string) (string, error) {
 		return normalizeAdminEnum(key, value, "postgres", "sqlite")
 	case "playback.hw_accel":
 		return normalizeAdminEnum(key, value, "auto", "qsv", "vaapi", "nvenc", "videotoolbox", "none")
-	case "playback.software_fallback":
-		return normalizeAdminEnum(key, value, "allow", "gpu_only")
 	case PlaybackRoutingRemuxExecutionSettingKey, PlaybackRoutingVideoTranscodeExecutionSettingKey:
 		return normalizeAdminEnum(key, value,
 			string(PlaybackExecutionPreferWorker), string(PlaybackExecutionPreferTranscode),
@@ -1245,31 +1186,6 @@ func NormalizeRedisURL(raw string) (string, error) {
 	return value, nil
 }
 
-// normalizeProwlarrBaseURL canonicalizes virtual_library.indexer_rss_url. A
-// scheme-less value like "one.vio" is prepended with http:// so it becomes a
-// usable base URL instead of a value that fails every staleness refresh with
-// "expected the server base URL with a scheme". The runtime Prowlarr client
-// applies the stricter path/query shape check (see prowlarr.NormalizeBaseURL)
-// and leaves Prowlarr unconfigured, with a warning, when a value is still
-// unusable; this only guarantees a scheme and a host at save time.
-func normalizeProwlarrBaseURL(value string) (string, error) {
-	if value == "" {
-		return "", nil
-	}
-	if len(value) > 4096 {
-		return "", fmt.Errorf("virtual_library.indexer_rss_url exceeds 4096 bytes")
-	}
-	if !strings.Contains(value, "://") {
-		value = "http://" + value
-	}
-	value = strings.TrimRight(value, "/")
-	parsed, err := url.Parse(value)
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return "", fmt.Errorf("virtual_library.indexer_rss_url must be a valid http(s) base URL, for example http://prowlarr:9696")
-	}
-	return value, nil
-}
-
 // RedisDBSettingKey is the setting that replaces the database number in
 // redis.url.
 const RedisDBSettingKey = "redis.db"
@@ -1483,23 +1399,6 @@ func normalizeAdminInt(key, value string, minValue, maxValue int) (string, error
 		return "", fmt.Errorf("%s must be an integer between %d and %d", key, minValue, maxValue)
 	}
 	return strconv.Itoa(parsed), nil
-}
-
-// VirtualCandidateStoreWindow parses the virtual_library.candidate_store_hours
-// setting into the duration the playback and scanner layers trust a persisted
-// virtual candidate for. An empty value uses the setting's default (a newly
-// added key has no stored row yet); a non-positive or unparseable value returns
-// zero, which disables the window and keeps the pre-window behavior.
-func VirtualCandidateStoreWindow(raw string) time.Duration {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		raw = adminSettingDefaults["virtual_library.candidate_store_hours"]
-	}
-	hours, err := strconv.Atoi(raw)
-	if err != nil || hours <= 0 {
-		return 0
-	}
-	return time.Duration(hours) * time.Hour
 }
 
 func normalizeAdminInt64(key, value string, minValue, maxValue int64) (string, error) {

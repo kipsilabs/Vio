@@ -3069,6 +3069,7 @@ export interface ClientDiagnosticManifest {
     platform: DiagnosticPlatform;
     os_version: string;
     profile_id?: string;
+    occurrence_count?: number;
     [key: string]: unknown;
   };
   destination: {
@@ -3085,7 +3086,7 @@ export interface ClientDiagnosticManifest {
     stack_excerpt?: string;
     thread?: string;
     foreground?: boolean;
-    source: "ueh" | "exit_info" | "metrickit" | "exit_sentinel";
+    source: "ueh" | "exit_info" | "metrickit" | "exit_sentinel" | "watchdog";
     provenance: "pre_failure" | "post_restart" | "metric_reporting_period";
     occurred_at: string;
     [key: string]: unknown;
@@ -3684,6 +3685,10 @@ export interface LibraryMetadataMatchFailureDetail {
     outcome: string;
     candidate_count: number;
     threshold: number;
+    /** The rule behind a candidate_rejected outcome, such as "lone_candidate". */
+    rejection?: string;
+    /** The score that rule required, when the rule is a score bar. */
+    required_score?: number;
     top_candidates?: Array<{
       title: string;
       matched_title?: string;
@@ -4787,6 +4792,8 @@ export interface PageSectionConfig {
   item_limit: number;
   config: Record<string, unknown>;
   enabled: boolean;
+  /** The hero banner is kept off the apps. Absent from a server that predates it. */
+  web_only?: boolean;
   created_at: string;
   updated_at: string;
 }

@@ -6,13 +6,12 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"os"
+	"slices"
 	"strings"
 	"time"
 
-	"github.com/Silo-Server/silo-server/internal/envutil"
-
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/pressly/goose/v3"
 	"github.com/pressly/goose/v3/lock"
 )
@@ -22,16 +21,12 @@ const (
 	gooseVersionTable            = "public.goose_db_version"
 
 	// migrationTimeoutEnv configures how long a migration run may take.
-	// Vio renamed the knob to VIO_MIGRATE_TIMEOUT; SILO_MIGRATE_TIMEOUT is
-	// still honored as a fallback.
-	migrationTimeoutEnv       = "VIO_MIGRATE_TIMEOUT"
-	migrationTimeoutEnvLegacy = "SILO_MIGRATE_TIMEOUT"
-	defaultMigrationTimeout   = 20 * time.Minute
+	migrationTimeoutEnv     = "SILO_MIGRATE_TIMEOUT"
+	defaultMigrationTimeout = 20 * time.Minute
 )
 
 // MigrationTimeout returns the deadline budget for a migration run. It is
-// configurable via VIO_MIGRATE_TIMEOUT (a Go duration such as "60m"), with
-// SILO_MIGRATE_TIMEOUT honored as a legacy fallback. A value
+// configurable via SILO_MIGRATE_TIMEOUT (a Go duration such as "60m"). A value
 // of 0 or negative disables the deadline entirely — appropriate for a one-off
 // heavy data migration (e.g. a full-table COLLATE rewrite + value remap) that
 // legitimately runs longer than any fixed cap and must not be abandoned
@@ -39,7 +34,7 @@ const (
 // AccessExclusive locks while the next boot retries. Unset or unparseable falls
 // back to defaultMigrationTimeout, preserving prior behavior.
 func MigrationTimeout() time.Duration {
-	raw := strings.TrimSpace(envutil.GetenvFirst(migrationTimeoutEnv, migrationTimeoutEnvLegacy))
+	raw := strings.TrimSpace(os.Getenv(migrationTimeoutEnv))
 	if raw == "" {
 		return defaultMigrationTimeout
 	}
@@ -71,7 +66,7 @@ func RunMigrations(ctx context.Context, pool *pgxpool.Pool, fsys fs.FS, dir stri
 	if err != nil {
 		return err
 	}
-	defer func() { _ = provider.Close() }()
+	defer provider.Close()
 
 	if err := applyMigrationsLogged(ctx, provider, slog.Default(), migrationHeartbeatInterval); err != nil {
 		return err
@@ -150,7 +145,7 @@ func MigrationStatuses(ctx context.Context, pool *pgxpool.Pool, fsys fs.FS, dir 
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = provider.Close() }()
+	defer provider.Close()
 
 	gooseStatuses, err := provider.Status(ctx)
 	if err != nil {
@@ -176,26 +171,21 @@ func MigrationStatuses(ctx context.Context, pool *pgxpool.Pool, fsys fs.FS, dir 
 }
 
 func newMigrationProvider(pool *pgxpool.Pool, fsys fs.FS, dir string) (*goose.Provider, error) {
-	migrationFS, err := migrationSubFS(fsys, dir)
+	p, err := openMigrationProvider(pool, fsys, dir, goMigrations())
 	if err != nil {
 		return nil, err
 	}
+	return p.Provider, nil
+}
 
-	sqlDB := stdlib.OpenDBFromPool(pool)
-
-	locker, err := lock.NewPostgresSessionLocker(lock.WithLockID(schemaMigrationsLockID))
-	if err != nil {
-		_ = sqlDB.Close()
-		return nil, fmt.Errorf("creating goose migration lock: %w", err)
-	}
-
+func newGooseProvider(sqlDB *sql.DB, migrationFS fs.FS, locker lock.SessionLocker, goMigs []*goose.Migration) (*goose.Provider, error) {
 	provider, err := goose.NewProvider(
 		goose.DialectPostgres,
 		sqlDB,
 		migrationFS,
 		goose.WithTableName(gooseVersionTable),
 		goose.WithAllowOutofOrder(true),
-		goose.WithSessionLocker(&legacyBootstrapLocker{delegate: locker}),
+		goose.WithSessionLocker(locker),
 		// These are Go rather than SQL because their conversion rules live
 		// in Go packages shared with other write paths: the settings backfill
 		// validates every value against the contract and re-encodes it as
@@ -206,20 +196,52 @@ func newMigrationProvider(pool *pgxpool.Pool, fsys fs.FS, dir string) (*goose.Pr
 		// expressed in SQL without duplicating those rules. The invalid index rebuild and the
 		// push attempt key scope decide per index whether to drop and build it
 		// concurrently, which SQL cannot do outside a transaction.
-		goose.WithGoMigrations(
-			settingsBackfillMigration(),
-			displayPrefsMoveMigration(),
-			subtitleLanguageBackfillMigration(),
-			invalidIndexRebuildMigration(),
-			pushAttemptKeyScopeMigration(),
-			externalSubtitleNameBackfillMigration(),
-		),
+		goose.WithGoMigrations(goMigs...),
 	)
 	if err != nil {
-		_ = sqlDB.Close()
 		return nil, fmt.Errorf("creating goose migration provider: %w", err)
 	}
 	return provider, nil
+}
+
+func goMigrations() []*goose.Migration {
+	return []*goose.Migration{
+		settingsBackfillMigration(),
+		displayPrefsMoveMigration(),
+		subtitleLanguageBackfillMigration(),
+		invalidIndexRebuildMigration(),
+		pushAttemptKeyScopeMigration(),
+		externalSubtitleNameBackfillMigration(),
+	}
+}
+
+// MigrationVersions lists every migration version this binary carries, SQL
+// and Go, in ascending order. A restore refuses a backup whose schema is
+// newer than the last of them, or that has applied a version not among them:
+// migrations run out of order, so a database can hold a version older than
+// the newest one here that this binary does not carry.
+func MigrationVersions(fsys fs.FS, dir string) ([]int64, error) {
+	migrationFS, err := migrationSubFS(fsys, dir)
+	if err != nil {
+		return nil, err
+	}
+	names, err := fs.Glob(migrationFS, "*.sql")
+	if err != nil {
+		return nil, err
+	}
+	versions := make([]int64, 0, len(names)+len(goMigrations()))
+	for _, name := range names {
+		version, err := goose.NumericComponent(name)
+		if err != nil {
+			return nil, fmt.Errorf("migration %s: %w", name, err)
+		}
+		versions = append(versions, version)
+	}
+	for _, m := range goMigrations() {
+		versions = append(versions, m.Version)
+	}
+	slices.Sort(versions)
+	return slices.Compact(versions), nil
 }
 
 func migrationSubFS(fsys fs.FS, dir string) (fs.FS, error) {
@@ -339,7 +361,7 @@ func verifyLegacyVersions(ctx context.Context, conn *sql.Conn) error {
 	if err != nil {
 		return fmt.Errorf("verifying legacy schema_versions rows: %w", err)
 	}
-	defer func() { _ = rows.Close() }()
+	defer rows.Close()
 
 	var missing []int
 	for rows.Next() {

@@ -3,8 +3,11 @@ import { createElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
 import { PlayerConfigProvider, type PlayerConfig } from "../context/PlayerConfigContext";
+import { PlayerFullscreenRootContext } from "../context/PlayerFullscreenContext";
+import { INTRO_PROMPT_SECONDS } from "../hooks/useIntroSkipPrompt";
+import { useKeyboardShortcuts } from "../hooks/useKeyboardShortcuts";
 import type { WatchTogetherRoomConnectionResult } from "../hooks/useWatchTogetherRoomConnection";
-import { fixturePlanV3, fixtureSubtitleInventoryItemV3 } from "../protocol-v3.fixtures";
+import { fixturePlanV3 } from "../protocol-v3.fixtures";
 import type { AvailableQualityV3, PlanV3 } from "../protocol-v3";
 import type {
   PlaybackRealtimeCommandEnvelope,
@@ -20,21 +23,13 @@ const realtimeOptions = vi.hoisted(() => ({
     onCommand: (command: PlaybackRealtimeCommandEnvelope) => Promise<void> | void;
   },
 }));
-// Captures the progress sampler's gone-session callback: the authoritative lane
-// the player funnels through its one recovery. The control lane no longer
-// reports session loss (a control-ticket 404 is replica-local).
-const progressOptions = vi.hoisted(() => ({
-  current: null as null | { onSessionLost?: () => void },
-}));
 const controls = vi.hoisted(() => ({
   current: null as null | {
     currentTime: number;
     duration: number;
-    playing?: boolean;
     onSeek: (seconds: number) => void;
     activeSubtitleIndex: number | null;
     subtitleTracks: PlayerSubtitleInfo[];
-    onSubtitleSelect?: (index: number | null) => void;
     visible: boolean;
     onSkip?: { back: () => void; forward: () => void };
     skipSeconds?: { back: number; forward: number };
@@ -61,17 +56,7 @@ const subtitleTimeline = vi.hoisted(() => ({
   streamGeneration: 0,
   cueRevision: 0,
   assCueRevision: 0,
-  refreshRevision: 0,
   setLoadState: null as null | ((state: string) => void),
-  setASSLoadState: null as null | ((state: string) => void),
-  assActive: false,
-  activeCues: [] as Array<{
-    text: string;
-    align?: "left" | "center" | "right";
-    line?: "top" | "middle" | "bottom";
-    position?: number;
-    size?: number;
-  }>,
 }));
 const toastError = vi.hoisted(() => vi.fn());
 const toastInfo = vi.hoisted(() => vi.fn());
@@ -79,19 +64,11 @@ const hlsJS = vi.hoisted(() => ({
   supported: false,
   constructed: vi.fn(),
   startLoad: vi.fn(),
-  loadSource: vi.fn(),
-  errorHandler: null as null | ((event: unknown, data: unknown) => void),
   stopLoad: vi.fn(),
+  loadSource: vi.fn(),
   latest: null as null | { emit: (event: string, data: unknown) => void },
-  bufferAppendedHandler: null as null | ((event: unknown, data?: unknown) => void),
   // Seconds buffered past the playhead, as hls.js measures them.
   forwardBufferSeconds: 0,
-}));
-// Captures the onSourceChanged handlers the mocked subtitle hooks receive, so
-// tests can drive a subtitle_source_changed (409) signal from the outside.
-const subtitleHooks = vi.hoisted(() => ({
-  vttSourceChanged: null as null | (() => void),
-  assSourceChanged: null as null | (() => void),
 }));
 
 vi.mock("sonner", () => ({
@@ -105,20 +82,7 @@ vi.mock("../hooks/usePlaybackRealtime", () => ({
   }),
 }));
 vi.mock("../hooks/useWatchProgress", () => ({
-  useWatchProgress: (...args: unknown[]) => {
-    progressOptions.current = { onSessionLost: args[3] as (() => void) | undefined };
-    return vi.fn().mockResolvedValue(undefined);
-  },
-}));
-const keyboardShortcuts = vi.hoisted(() => ({
-  toggleCaptions: null as (() => void) | null,
-  toggleMuted: null as (() => void) | null,
-}));
-vi.mock("../hooks/useKeyboardShortcuts", () => ({
-  useKeyboardShortcuts: (...args: unknown[]) => {
-    keyboardShortcuts.toggleCaptions = (args[4] as () => void) ?? null;
-    keyboardShortcuts.toggleMuted = (args[5] as () => void) ?? null;
-  },
+  useWatchProgress: () => vi.fn().mockResolvedValue(undefined),
 }));
 // Opted into per test: plans whose original the browser engine plays.
 const engineRoute = vi.hoisted(() => ({ chosen: false, refused: false }));
@@ -161,6 +125,7 @@ vi.mock("../bandwidth-probe", async (importOriginal) => {
     },
   };
 });
+vi.mock("../hooks/useKeyboardShortcuts", () => ({ useKeyboardShortcuts: vi.fn() }));
 vi.mock("../hooks/useRemuxSeeking", () => ({
   useRemuxSeeking: () => ({ handleSeek: playerSeek }),
 }));
@@ -171,51 +136,15 @@ vi.mock("../hooks/useSubtitleTracks", () => ({
     subtitleTimeline.liveKey = args[8] as string | null;
     subtitleTimeline.streamGeneration = args[9] as number;
     subtitleTimeline.setLoadState = args[10] as (state: string) => void;
-    subtitleHooks.vttSourceChanged = (args[11] as (() => void) | undefined) ?? null;
-    subtitleTimeline.cueRevision = args[13] as number;
-    subtitleTimeline.refreshRevision = args[14] as number;
-    return subtitleTimeline.activeCues;
+    subtitleTimeline.cueRevision = args[11] as number;
+    return [];
   },
 }));
 vi.mock("../hooks/useASSSubtitles", () => ({
   useASSSubtitles: (...args: unknown[]) => {
     subtitleTimeline.assOffsetSeconds = args[4] as number;
-    subtitleTimeline.setASSLoadState = args[6] as (state: string) => void;
-    subtitleHooks.assSourceChanged = (args[7] as (() => void) | undefined) ?? null;
-    subtitleTimeline.assCueRevision = args[11] as number;
-    return { isActive: subtitleTimeline.assActive };
-  },
-}));
-const pgsHook = vi.hoisted(() => ({
-  options: null as null | {
-    activeSubtitleIndex: number | null;
-    enabled: boolean;
-    subtitleUrls: PlayerSubtitleInfo[];
-    sourceGeneration?: number;
-    cueRevision?: number;
-    transportRevision?: number;
-    replayRevision?: number;
-    refreshRevision?: number;
-    onSourceChanged?: () => void;
-  },
-}));
-vi.mock("../hooks/usePGSSubtitles", () => ({
-  usePGSSubtitles: (options: {
-    activeSubtitleIndex: number | null;
-    enabled: boolean;
-    subtitleUrls: PlayerSubtitleInfo[];
-    sourceGeneration?: number;
-    cueRevision?: number;
-    transportRevision?: number;
-    replayRevision?: number;
-    refreshRevision?: number;
-    onSourceChanged?: () => void;
-  }) => {
-    pgsHook.options = options;
-    const selected = options.subtitleUrls.find(
-      (track) => track.index === options.activeSubtitleIndex,
-    );
-    return { isActive: options.enabled && selected?.codec === "pgs" };
+    subtitleTimeline.assCueRevision = args[9] as number;
+    return { isActive: false };
   },
 }));
 // The delay is the profile's saved offset; plain state stands in for the query.
@@ -253,12 +182,10 @@ vi.mock("hls.js", () => ({
     };
     static isSupported = () => hlsJS.supported;
 
-    config:
-      | { maxBufferLength?: number; startPosition?: number; maxBufferSize?: number }
-      | undefined;
-    url: string | null = null;
     handlers = new Map<string, (event: string, data: unknown) => void>();
+    startLoad = hlsJS.startLoad;
     stopLoad = hlsJS.stopLoad;
+    loadSource = hlsJS.loadSource;
 
     bufferedToEnd = false;
     maxBufferLength: number;
@@ -273,38 +200,26 @@ vi.mock("hls.js", () => ({
       return { len: hlsJS.forwardBufferSeconds };
     }
 
-    on(event: string, handler: (event: unknown, data: unknown) => void) {
+    on(event: string, handler: (event: string, data: unknown) => void) {
       this.handlers.set(event, handler);
-      if (event === "error") hlsJS.errorHandler = handler;
-      if (event === "bufferAppended") hlsJS.bufferAppendedHandler = handler;
-    }
-    loadSource(url: string) {
-      this.url = url;
-      hlsJS.loadSource(url);
     }
     emit(event: string, data: unknown) {
       this.handlers.get(event)?.(event, data);
     }
     attachMedia() {}
-    startLoad() {
-      hlsJS.startLoad();
-    }
     destroy() {}
   },
 }));
 vi.mock("./PlayerControls", () => ({
-  SKIP_BUTTON_SECONDS: 30,
-  SKIP_BACK_SECONDS: 30,
+  SKIP_BACK_SECONDS: 10,
   SKIP_FORWARD_SECONDS: 30,
   PlayerControls: vi.fn(
     (props: {
       currentTime: number;
       duration: number;
-      playing?: boolean;
       onSeek: (seconds: number) => void;
       activeSubtitleIndex: number | null;
       subtitleTracks: PlayerSubtitleInfo[];
-      onSubtitleSelect?: (index: number | null) => void;
       visible: boolean;
       onSurfaceTap?: (event: React.MouseEvent<HTMLElement>) => void;
       isFullscreen?: boolean;
@@ -369,588 +284,6 @@ function renderPlayer(overrides: Partial<Parameters<typeof VideoPlayer>[0]> = {}
     },
   };
 }
-
-const renderModePGS: PlayerSubtitleInfo = {
-  index: 0,
-  media_file_id: 7,
-  track_id: "file:7:subtitle:0",
-  language: "en",
-  codec: "pgs",
-  label: "English PGS",
-  source: "embedded",
-  url: "/api/v2/stream/session/subtitles/0.sup?file_id=7",
-  burn_in_only: false,
-};
-
-describe("PGS render mode", () => {
-  it("shows the bitmap canvas for a sidecar PGS track", async () => {
-    const onRefreshSubtitles = vi.fn();
-    const { container, unmount } = renderPlayer({
-      subtitleUrls: [renderModePGS],
-      subtitleMode: "off",
-      onRefreshSubtitles,
-    });
-
-    act(() => {
-      controls.current?.onSubtitleSelect?.(0);
-    });
-    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
-
-    const canvas = container.querySelector("canvas");
-    expect(canvas).not.toBeNull();
-    expect(canvas!.style.display).not.toBe("none");
-    expect(pgsHook.options).toMatchObject({
-      activeSubtitleIndex: 0,
-      enabled: true,
-      sourceGeneration: 0,
-      cueRevision: 0,
-      transportRevision: 0,
-      replayRevision: 0,
-      refreshRevision: 0,
-      onSourceChanged: expect.any(Function),
-    });
-    act(() => pgsHook.options?.onSourceChanged?.());
-    expect(onRefreshSubtitles).toHaveBeenCalledTimes(1);
-
-    unmount();
-  });
-
-  it("keeps the canvas hidden when the plan burns PGS in", async () => {
-    const burnInPlan = fixturePlanV3({
-      ...directPlan,
-      subtitle: { mode: "burn_in", inventory: [] },
-    });
-    const { container, unmount } = renderPlayer({
-      plan: burnInPlan,
-      subtitleUrls: [renderModePGS],
-      subtitleMode: "off",
-    });
-
-    act(() => {
-      controls.current?.onSubtitleSelect?.(0);
-    });
-    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
-
-    const canvas = container.querySelector("canvas");
-    expect(canvas).not.toBeNull();
-    expect(canvas!.style.display).toBe("none");
-    expect(pgsHook.options?.enabled).toBe(false);
-
-    unmount();
-  });
-});
-
-describe("subtitle marker reconciliation", () => {
-  it("follows a successful replan that re-mints the combined ordinal", async () => {
-    const french = fixtureSubtitleInventoryItemV3({
-      track_id: "file:7:subtitle:1",
-      combined_index: 1,
-      language: "fra",
-      label: "French",
-    });
-    const english = fixtureSubtitleInventoryItemV3({
-      track_id: "file:7:subtitle:0",
-      combined_index: 0,
-      language: "eng",
-      label: "English",
-    });
-    const basePlan = fixturePlanV3({
-      ...directPlan,
-      subtitle: { mode: "render", track_id: english.track_id, inventory: [english, french] },
-      selected_tracks: {
-        audio: { id: "file:7:audio:0", index: 0 },
-        subtitle: { id: english.track_id, index: 0 },
-      },
-    });
-    const toPlayerTrack = (
-      item: ReturnType<typeof fixtureSubtitleInventoryItemV3>,
-    ): PlayerSubtitleInfo => ({
-      index: item.combined_index,
-      media_file_id: 7,
-      track_id: item.track_id,
-      language: item.language ?? "",
-      codec: item.codec,
-      label: item.label ?? "",
-      source: "embedded",
-      url: item.url ?? "",
-    });
-
-    const onSubtitleTrackChange = vi.fn();
-    const { rerenderPlayer } = renderPlayer({
-      plan: basePlan,
-      subtitleUrls: [toPlayerTrack(english), toPlayerTrack(french)],
-      subtitleMode: "always",
-      preferredSubtitleLanguage: "eng",
-      onSubtitleTrackChange,
-    });
-    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
-
-    // The same English asset comes back at a new ordinal (1); the optimistic
-    // marker still names the outgoing plan's 0, which now means French.
-    const shiftedEnglish = { ...english, combined_index: 1, track_id: "file:7:subtitle:1" };
-    const shiftedFrench = { ...french, combined_index: 0, track_id: "file:7:subtitle:0" };
-    rerenderPlayer({
-      plan: fixturePlanV3({
-        ...directPlan,
-        plan_id: "plan:subtitle-remint",
-        plan_attempt_key: "v3:subtitle-remint",
-        subtitle: {
-          mode: "render",
-          track_id: shiftedEnglish.track_id,
-          inventory: [shiftedFrench, shiftedEnglish],
-        },
-        selected_tracks: {
-          audio: { id: "file:7:audio:0", index: 0 },
-          subtitle: { id: shiftedEnglish.track_id, index: 1 },
-        },
-      }),
-      subtitleUrls: [toPlayerTrack(shiftedFrench), toPlayerTrack(shiftedEnglish)],
-      subtitleMode: "always",
-    });
-
-    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(1));
-    // The first render of the replacement plan still had the outgoing ordinal
-    // (0), which now names French. Reconciliation must not dispatch that row
-    // before moving the marker onto the committed English asset.
-    expect(onSubtitleTrackChange).not.toHaveBeenCalled();
-
-    // A later render of the settled plan must not fall back to the outgoing
-    // ordinal either.
-    rerenderPlayer({
-      plan: fixturePlanV3({
-        ...directPlan,
-        plan_id: "plan:subtitle-remint",
-        plan_attempt_key: "v3:subtitle-remint",
-        subtitle: {
-          mode: "render",
-          track_id: shiftedEnglish.track_id,
-          inventory: [shiftedFrench, shiftedEnglish],
-        },
-        selected_tracks: {
-          audio: { id: "file:7:audio:0", index: 0 },
-          subtitle: { id: shiftedEnglish.track_id, index: 1 },
-        },
-      }),
-      subtitleUrls: [toPlayerTrack(shiftedFrench), toPlayerTrack(shiftedEnglish)],
-      subtitleMode: "always",
-    });
-    await act(async () => {});
-    expect(controls.current?.activeSubtitleIndex).toBe(1);
-    expect(onSubtitleTrackChange).not.toHaveBeenCalled();
-  });
-
-  it("keeps the committed subtitle when adoption preserves verified rows in another order", async () => {
-    const english = fixtureSubtitleInventoryItemV3({
-      track_id: "file:7:subtitle:0",
-      combined_index: 0,
-      language: "eng",
-      label: "English",
-    });
-    const french = fixtureSubtitleInventoryItemV3({
-      track_id: "file:7:subtitle:1",
-      combined_index: 1,
-      language: "fra",
-      label: "French",
-    });
-    const toPlayerTrack = (
-      item: ReturnType<typeof fixtureSubtitleInventoryItemV3>,
-    ): PlayerSubtitleInfo => ({
-      index: item.combined_index,
-      media_file_id: 7,
-      track_id: item.track_id,
-      language: item.language ?? "",
-      codec: item.codec,
-      label: item.label ?? "",
-      source: "embedded",
-      url: item.url ?? "",
-    });
-    const basePlan = fixturePlanV3({
-      ...directPlan,
-      subtitle: { mode: "render", track_id: english.track_id, inventory: [english, french] },
-      selected_tracks: {
-        audio: { id: "file:7:audio:0", index: 0 },
-        subtitle: { id: english.track_id, index: 0 },
-      },
-    });
-    const onSubtitleTrackChange = vi.fn();
-    const { rerenderPlayer } = renderPlayer({
-      plan: basePlan,
-      subtitleUrls: [toPlayerTrack(english), toPlayerTrack(french)],
-      subtitleMode: "always",
-      preferredSubtitleLanguage: "eng",
-      onSubtitleTrackChange,
-    });
-    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
-
-    // Adoption keeps the verified rows (English at 0) while the incoming
-    // provisional plan publishes them reordered and selects English at 1. The
-    // marker must follow the preserved row, not the plan's ordinal.
-    const shiftedEnglish = { ...english, combined_index: 1, track_id: "file:7:subtitle:1" };
-    const shiftedFrench = { ...french, combined_index: 0, track_id: "file:7:subtitle:0" };
-    rerenderPlayer({
-      plan: fixturePlanV3({
-        ...directPlan,
-        plan_id: "plan:subtitle-preserved-adoption",
-        plan_attempt_key: "v3:subtitle-preserved-adoption",
-        subtitle: {
-          mode: "render",
-          track_id: shiftedEnglish.track_id,
-          inventory: [shiftedFrench, shiftedEnglish],
-        },
-        selected_tracks: {
-          audio: { id: "file:7:audio:0", index: 0 },
-          subtitle: { id: shiftedEnglish.track_id, index: 1 },
-        },
-      }),
-      subtitleUrls: [toPlayerTrack(english), toPlayerTrack(french)],
-      subtitleMode: "always",
-    });
-
-    await act(async () => {});
-    expect(controls.current?.activeSubtitleIndex).toBe(0);
-    expect(onSubtitleTrackChange).not.toHaveBeenCalled();
-
-    // Re-render the settled plan; the preserved row is still the committed
-    // asset even though its ordinal and derived id differ from the plan's.
-    rerenderPlayer({
-      plan: fixturePlanV3({
-        ...directPlan,
-        plan_id: "plan:subtitle-preserved-adoption",
-        plan_attempt_key: "v3:subtitle-preserved-adoption",
-        subtitle: {
-          mode: "render",
-          track_id: shiftedEnglish.track_id,
-          inventory: [shiftedFrench, shiftedEnglish],
-        },
-        selected_tracks: {
-          audio: { id: "file:7:audio:0", index: 0 },
-          subtitle: { id: shiftedEnglish.track_id, index: 1 },
-        },
-      }),
-      subtitleUrls: [toPlayerTrack(english), toPlayerTrack(french)],
-      subtitleMode: "always",
-    });
-    await act(async () => {});
-    expect(controls.current?.activeSubtitleIndex).toBe(0);
-    expect(onSubtitleTrackChange).not.toHaveBeenCalled();
-
-    // A manual pick on the preserved rows must still reach the session. The
-    // displayed French row carries `file:7:subtitle:1`, which is the id the
-    // plan assigned to English; comparing ids alone would read the click as
-    // already playing and send nothing while the marker moved to French. The
-    // request carries the clicked row, so the session resolver names the
-    // plan's French row (`file:7:subtitle:0`).
-    act(() => controls.current?.onSubtitleSelect?.(1));
-    await waitFor(() =>
-      expect(onSubtitleTrackChange).toHaveBeenCalledWith(
-        1,
-        expect.anything(),
-        expect.objectContaining({ language: "fra" }),
-      ),
-    );
-    expect(controls.current?.activeSubtitleIndex).toBe(1);
-  });
-
-  it("keeps a manual pick when its acknowledging plan re-mints the ordinal", async () => {
-    const english = fixtureSubtitleInventoryItemV3({
-      track_id: "file:7:subtitle:0",
-      combined_index: 0,
-      language: "eng",
-      label: "English",
-    });
-    const french = fixtureSubtitleInventoryItemV3({
-      track_id: "file:7:subtitle:1",
-      combined_index: 1,
-      language: "fra",
-      label: "French",
-    });
-    const toPlayerTrack = (
-      item: ReturnType<typeof fixtureSubtitleInventoryItemV3>,
-    ): PlayerSubtitleInfo => ({
-      index: item.combined_index,
-      media_file_id: 7,
-      track_id: item.track_id,
-      language: item.language ?? "",
-      codec: item.codec,
-      label: item.label ?? "",
-      source: "embedded",
-      url: item.url ?? "",
-    });
-    const basePlan = fixturePlanV3({
-      ...directPlan,
-      subtitle: { mode: "render", track_id: english.track_id, inventory: [english, french] },
-      selected_tracks: {
-        audio: { id: "file:7:audio:0", index: 0 },
-        subtitle: { id: english.track_id, index: 0 },
-      },
-    });
-    const onSubtitleTrackChange = vi.fn();
-    const { rerenderPlayer } = renderPlayer({
-      plan: basePlan,
-      subtitleUrls: [toPlayerTrack(english), toPlayerTrack(french)],
-      subtitleMode: "always",
-      preferredSubtitleLanguage: "eng",
-      onSubtitleTrackChange,
-    });
-    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
-    onSubtitleTrackChange.mockClear();
-
-    // The viewer manually picks French at slot 1; the request names that row.
-    act(() => controls.current?.onSubtitleSelect?.(1));
-    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(1));
-    expect(onSubtitleTrackChange).toHaveBeenLastCalledWith(
-      1,
-      expect.anything(),
-      expect.objectContaining({ language: "fra" }),
-    );
-    onSubtitleTrackChange.mockClear();
-
-    // The acknowledging plan re-mints the inventory: French moves to slot 0 and
-    // English to slot 1, so the captured French id (`:1`) differs from the
-    // committed one (`:0`) even though it names the same asset. The clicked
-    // ordinal now means English, which must never be requested.
-    const shiftedFrench = { ...french, combined_index: 0, track_id: "file:7:subtitle:0" };
-    const shiftedEnglish = { ...english, combined_index: 1, track_id: "file:7:subtitle:1" };
-    rerenderPlayer({
-      plan: fixturePlanV3({
-        ...directPlan,
-        plan_id: "plan:subtitle-manual-remint",
-        plan_attempt_key: "v3:subtitle-manual-remint",
-        subtitle: {
-          mode: "render",
-          track_id: shiftedFrench.track_id,
-          inventory: [shiftedFrench, shiftedEnglish],
-        },
-        selected_tracks: {
-          audio: { id: "file:7:audio:0", index: 0 },
-          subtitle: { id: shiftedFrench.track_id, index: 0 },
-        },
-      }),
-      subtitleUrls: [toPlayerTrack(shiftedFrench), toPlayerTrack(shiftedEnglish)],
-      subtitleMode: "always",
-    });
-
-    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
-    expect(onSubtitleTrackChange).not.toHaveBeenCalledWith(1, expect.anything(), expect.anything());
-    // The acknowledged pick also is not re-sent at its new ordinal.
-    expect(onSubtitleTrackChange).not.toHaveBeenCalled();
-  });
-
-  it("does not stamp a placeholder plan ordinal onto watch-detail fallback rows", async () => {
-    const english: PlayerSubtitleInfo = {
-      index: 0,
-      media_file_id: 7,
-      language: "eng",
-      codec: "srt",
-      label: "English",
-      source: "external",
-      url: "/api/v2/stream/session/subtitles/en.vtt?file_id=7",
-    };
-    const french: PlayerSubtitleInfo = {
-      ...english,
-      index: 1,
-      language: "fra",
-      label: "French",
-      url: "/api/v2/stream/session/subtitles/fr.vtt?file_id=7",
-    };
-    // A published-but-unselectable entry: the probe has not landed, so the
-    // plan's inventory is a declared placeholder with no sidecar to fetch.
-    const placeholder = fixtureSubtitleInventoryItemV3({
-      track_id: "file:7:subtitle:9",
-      combined_index: 9,
-      language: "eng",
-      label: "English",
-      delivery: "sidecar",
-      url: "",
-    });
-    const deferredPlan = fixturePlanV3({
-      ...directPlan,
-      subtitle: { mode: "off", inventory: [] },
-    });
-    const placeholderPlan = fixturePlanV3({
-      ...directPlan,
-      plan_id: "plan:subtitle-placeholder",
-      plan_attempt_key: "v3:subtitle-placeholder",
-      subtitle: { mode: "render", track_id: placeholder.track_id, inventory: [placeholder] },
-      selected_tracks: {
-        audio: { id: "file:7:audio:0", index: 0 },
-        subtitle: { id: placeholder.track_id, index: 9 },
-      },
-    });
-    const { rerenderPlayer } = renderPlayer({
-      plan: deferredPlan,
-      subtitleUrls: [english, french],
-      subtitleMode: "off",
-    });
-
-    // The viewer picks a watch-detail fallback row while the plan inventory is
-    // still deferred; the marker is manual from here on.
-    act(() => controls.current?.onSubtitleSelect?.(0));
-    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
-
-    rerenderPlayer({
-      plan: placeholderPlan,
-      subtitleUrls: [english, french],
-      subtitleMode: "off",
-    });
-    await act(async () => {});
-
-    // Ordinal 9 names no fallback row, and the plan has no selectable entry to
-    // re-mint: the marker must stay on the viewer's row.
-    expect(controls.current?.activeSubtitleIndex).toBe(0);
-  });
-
-  it("forwards the watch-detail fallback row a queued subtitle pick was made from", async () => {
-    const onSubtitleTrackChange = vi.fn();
-    // The plan's probe is deferred, so its inventory is empty and the menu is
-    // showing the watch detail's own rows, which carry no session identity.
-    const englishFallback: PlayerSubtitleInfo = {
-      index: 0,
-      media_file_id: 7,
-      language: "eng",
-      codec: "srt",
-      label: "English",
-      source: "external",
-      url: "",
-    };
-    const frenchFallback: PlayerSubtitleInfo = {
-      ...englishFallback,
-      index: 1,
-      language: "fra",
-      label: "French",
-    };
-    renderPlayer({
-      plan: fixturePlanV3({
-        ...directPlan,
-        plan_id: "plan:deferred-subtitles",
-        plan_attempt_key: "v3:deferred-subtitles",
-        subtitle: { mode: "off", inventory: [] },
-      }),
-      subtitleUrls: [englishFallback, frenchFallback],
-      subtitleMode: "off",
-      onSubtitleTrackChange,
-    });
-
-    act(() => {
-      controls.current?.onSubtitleSelect?.(1);
-    });
-
-    // The row itself travels with the request so the session can reconcile it
-    // against the inventory that replaces this one.
-    await waitFor(() =>
-      expect(onSubtitleTrackChange).toHaveBeenCalledWith(1, expect.any(Number), frenchFallback),
-    );
-  });
-
-  it("requests the clicked row when two fallback rows look identical", async () => {
-    const onSubtitleTrackChange = vi.fn();
-    // Neither row carries an id, a URL or a stream index, so the descriptor
-    // cannot tell them apart; the marker still names the row that was clicked.
-    const englishFallback: PlayerSubtitleInfo = {
-      index: 0,
-      media_file_id: 7,
-      language: "eng",
-      codec: "srt",
-      label: "English",
-      source: "embedded",
-      url: "",
-    };
-    const secondEnglishFallback = { ...englishFallback, index: 1 };
-    renderPlayer({
-      plan: fixturePlanV3({
-        ...directPlan,
-        plan_id: "plan:deferred-identical-subtitles",
-        plan_attempt_key: "v3:deferred-identical-subtitles",
-        subtitle: { mode: "off", inventory: [] },
-      }),
-      subtitleUrls: [englishFallback, secondEnglishFallback],
-      subtitleMode: "off",
-      onSubtitleTrackChange,
-    });
-
-    act(() => {
-      controls.current?.onSubtitleSelect?.(1);
-    });
-
-    await waitFor(() =>
-      expect(onSubtitleTrackChange).toHaveBeenCalledWith(
-        1,
-        expect.any(Number),
-        secondEnglishFallback,
-      ),
-    );
-  });
-
-  it("requests the second burn-in track when two same-language rows look identical", async () => {
-    const onSubtitleTrackChange = vi.fn();
-    // A release with two embedded English bitmap subtitles: same language, same
-    // codec, same flags, no URL (they only exist as burned-in video). Only the
-    // trailing ordinal of the track id tells them apart.
-    const firstBurnIn = fixtureSubtitleInventoryItemV3({
-      track_id: "file:7:subtitle:0",
-      combined_index: 0,
-      language: "eng",
-      codec: "hdmv_pgs_subtitle",
-      label: "English",
-      delivery: "burn_in_only",
-      url: "",
-    });
-    const secondBurnIn = {
-      ...firstBurnIn,
-      track_id: "file:7:subtitle:1",
-      combined_index: 1,
-    };
-    const toPlayerTrack = (item: typeof firstBurnIn): PlayerSubtitleInfo => ({
-      index: item.combined_index,
-      media_file_id: 7,
-      track_id: item.track_id,
-      burn_in_only: item.delivery === "burn_in_only",
-      language: item.language ?? "",
-      codec: item.codec,
-      label: item.label ?? "",
-      source: "embedded",
-      url: "",
-    });
-    renderPlayer({
-      plan: fixturePlanV3({
-        ...directPlan,
-        plan_id: "plan:two-burn-in-tracks",
-        plan_attempt_key: "v3:two-burn-in-tracks",
-        subtitle: {
-          mode: "burn_in",
-          track_id: firstBurnIn.track_id,
-          inventory: [firstBurnIn, secondBurnIn],
-        },
-        selected_tracks: {
-          audio: { id: "file:7:audio:0", index: 0 },
-          subtitle: { id: firstBurnIn.track_id, index: 0 },
-        },
-      }),
-      subtitleUrls: [toPlayerTrack(firstBurnIn), toPlayerTrack(secondBurnIn)],
-      subtitleMode: "always",
-      preferredSubtitleLanguage: "eng",
-      onSubtitleTrackChange,
-    });
-
-    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
-    expect(onSubtitleTrackChange).not.toHaveBeenCalled();
-
-    act(() => {
-      controls.current?.onSubtitleSelect?.(1);
-    });
-
-    // The plan still burns in the first track until the server replans, so the
-    // pick of the sibling has to be sent even though every descriptor matches.
-    await waitFor(() =>
-      expect(onSubtitleTrackChange).toHaveBeenCalledWith(
-        1,
-        expect.any(Number),
-        expect.objectContaining({ track_id: "file:7:subtitle:1", burn_in_only: true }),
-      ),
-    );
-    expect(controls.current?.activeSubtitleIndex).toBe(1);
-  });
-});
 
 function planInvalidatedCommand(
   payload: Record<string, unknown> = {
@@ -1153,6 +486,71 @@ describe("VideoPlayer room catch-up", () => {
     };
   }
 
+  it("shows the sync panel while a seek reloads the transport for a waiting room", async () => {
+    const { connection, command, video, rerenderPlayer } = setup(100);
+    // The replanned transport has no media yet.
+    Object.defineProperty(video, "readyState", {
+      configurable: true,
+      value: HTMLMediaElement.HAVE_NOTHING,
+    });
+    rerenderPlayer({ watchTogetherConnection: waitingSeek(connection, command), planRevision: 2 });
+    expect(screen.queryByRole("status", { name: "Loading video" })).not.toBeInTheDocument();
+    expect(screen.getByRole("status", { name: "Syncing playback" })).toBeInTheDocument();
+  });
+
+  it("leaves a held room seek to the room while a native HLS transport reloads", async () => {
+    vi.spyOn(HTMLMediaElement.prototype, "canPlayType").mockImplementation((mime) =>
+      mime === "application/vnd.apple.mpegurl" ? "probably" : "",
+    );
+    const connection = roomConnection();
+    const host = {
+      ...connection,
+      room: { ...connection.room!, self_can_manage_room: true, self_can_control_transport: true },
+    };
+    const plan = fixturePlanV3({
+      delivery: "server_remux_hls",
+      stream: {
+        url: "/playback/transcode/session-1/master.m3u8",
+        protocol: "hls",
+        headers: {},
+        header_refresh: "none",
+      },
+      timeline: {
+        source_start_seconds: 0,
+        player_start_seconds: 100,
+        stream_origin_seconds: 0,
+        timeline_offset_seconds: 0,
+        can_seek_anywhere: true,
+        seek_restoration: "player_position",
+      },
+    });
+    const { container, rerenderPlayer } = renderPlayer({
+      plan,
+      shouldAutoPlay: false,
+      watchTogetherRoomId: "room-1",
+      watchTogetherConnection: host,
+    });
+    const video = container.querySelector("video")!;
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    fireEvent.loadedMetadata(video);
+    fireFrameTimeUpdate(video);
+    markReady(video);
+
+    // A quality change reloads the transport, and the host seeks the room
+    // before the new transport's metadata arrives.
+    rerenderPlayer({ planRevision: 2, streamUrl: "/api/v1/stream/session-1?revision=2" });
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(video.src).toContain("revision=2");
+    act(() => {
+      controls.current!.onSeek(300);
+    });
+    expect(controls.current!.currentTime).toBe(300);
+    fireEvent.loadedMetadata(video);
+
+    // The element waits for the room's seek command.
+    expect(video.currentTime).toBe(100);
+  });
+
   it("pauses displaced playback and offers an explicit room rejoin", async () => {
     const { connection, video, rerenderPlayer } = setup(100);
     vi.mocked(video.pause).mockClear();
@@ -1290,6 +688,26 @@ describe("VideoPlayer room catch-up", () => {
     expect(onExit).toHaveBeenCalledWith(expect.objectContaining({ destinationHref: "/rooms" }));
     expect(connection.closeRoom).not.toHaveBeenCalled();
     expect(connection.rejoinRoom).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { at: "at the end of the item", position: 3598, notice: "Playback finished." },
+    { at: "mid-item", position: 1200, notice: "The host stopped playback." },
+  ])("says why the room returned to the lobby $at", async ({ position, notice }) => {
+    const { connection, rerenderPlayer } = setup(position);
+    const onExit = vi.fn();
+    rerenderPlayer({
+      onExit,
+      watchTogetherConnection: {
+        ...connection,
+        room: { ...connection.room!, phase: "lobby", playback_state: "idle" },
+      },
+    });
+    expect(screen.getByText(notice)).toBeInTheDocument();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(onExit).toHaveBeenCalledTimes(1);
   });
 
   it.each(["canplay", "retry", "pending play"])(
@@ -2091,11 +1509,11 @@ describe("VideoPlayer room catch-up", () => {
 
       // The mute shortcut flips the viewer's choice rather than the element's
       // temporary pre-roll mute, which it could only ever turn off.
-      const toggleMuted = keyboardShortcuts.toggleMuted;
-      act(() => toggleMuted?.());
+      const toggleMuted = vi.mocked(useKeyboardShortcuts).mock.lastCall![5];
+      act(() => toggleMuted());
       expect(localStorage.getItem("player-muted")).toBe("true");
       expect(video.muted).toBe(true);
-      act(() => keyboardShortcuts.toggleMuted?.());
+      act(() => vi.mocked(useKeyboardShortcuts).mock.lastCall![5]());
       expect(localStorage.getItem("player-muted")).toBe("false");
       expect(video.muted).toBe(true);
 
@@ -2452,15 +1870,14 @@ describe("VideoPlayer room catch-up", () => {
     await correct("correction-2", 110);
     expect(playerSeek).toHaveBeenCalledTimes(1);
 
-    // Buffered media is reached at once, whatever the budget: the
-    // buffer-first seek applies it locally without a remux seek call.
+    // Buffered media is reached at once, whatever the budget.
     Object.defineProperty(video, "buffered", {
       configurable: true,
       value: { length: 1, start: () => 0, end: () => 200 } as unknown as TimeRanges,
     });
     await correct("correction-3", 120);
-    expect(playerSeek).toHaveBeenCalledTimes(1);
-    expect(video.currentTime).toBe(120);
+    expect(playerSeek).toHaveBeenCalledTimes(2);
+    expect(playerSeek).toHaveBeenLastCalledWith(120);
   });
 
   it("does not settle a correction reload on an unrelated stream swap", async () => {
@@ -3750,8 +3167,6 @@ describe("VideoPlayer plan failure recovery", () => {
     controls.current = null;
     subtitleTimeline.textOffsetSeconds = null;
     subtitleTimeline.assOffsetSeconds = null;
-    subtitleHooks.vttSourceChanged = null;
-    subtitleHooks.assSourceChanged = null;
     hlsJS.supported = false;
     hlsJS.constructed.mockClear();
     toastError.mockClear();
@@ -4207,50 +3622,6 @@ describe("VideoPlayer plan failure recovery", () => {
     expect(screen.queryByText("Unrelated replan error.")).not.toBeInTheDocument();
   });
 
-  it("recovers a virtual remux whose transport answers 409 audio_selection_invalid", async () => {
-    // The transport answers the progressive remux request with 409
-    // audio_selection_invalid, which a media element cannot surface as a body:
-    // the load fails with a source-not-supported MediaError. The server-side
-    // code and body assertion lives in the Go handler test
-    // (TestDeferredProbeOverlayRemovedOrAmbiguousCommittedAudioFailsClosed →
-    // assertStreamAudioSelectionRejected); the client contract exercised here is
-    // that the load failure routes into plan recovery (a fresh failure_recovery
-    // replan), not a dead-end error or a reconnect, so the client re-selects on
-    // the re-probed inventory.
-    const onPlanFailure = vi.fn();
-    const onConnectionLost = vi.fn();
-    const virtualRemuxPlan = fixturePlanV3({
-      delivery: "server_remux_progressive",
-      stream: {
-        url: "/stream/session-1",
-        protocol: "http_progressive",
-        headers: {},
-        header_refresh: "none",
-      },
-    });
-    const { container } = renderPlayer({ plan: virtualRemuxPlan, onPlanFailure, onConnectionLost });
-    const video = container.querySelector("video");
-    if (!video) throw new Error("expected video element");
-
-    Object.defineProperty(video, "error", {
-      configurable: true,
-      value: { code: 4, message: "The selected audio track is no longer available" },
-    });
-    fireEvent.error(video);
-
-    expect(onPlanFailure).toHaveBeenCalledOnce();
-    expect(onPlanFailure.mock.calls[0]?.[0]).toMatchObject({
-      classification: "decoder_error",
-      message: "The selected audio track is no longer available",
-    });
-    // A rejected audio selection is a route failure, not a dropped connection:
-    // the reconnect path must not swallow it.
-    expect(onConnectionLost).not.toHaveBeenCalled();
-    // Recovery is taken instead of a dead-end error surface.
-    await act(async () => Promise.resolve());
-    expect(screen.queryByText(/Playback error:/)).not.toBeInTheDocument();
-  });
-
   it("re-arms the plan failure guard after a transient recovery request failure", async () => {
     const onPlanFailure = vi.fn();
     const { container, rerenderPlayer } = renderPlayer({ onPlanFailure });
@@ -4327,7 +3698,7 @@ describe("VideoPlayer plan failure recovery", () => {
     });
 
     await waitFor(() => expect(onSubtitleTrackChange).toHaveBeenCalledOnce());
-    expect(onSubtitleTrackChange).toHaveBeenCalledWith(2, 0, expect.objectContaining({ index: 2 }));
+    expect(onSubtitleTrackChange).toHaveBeenCalledWith(2, 0);
 
     rerenderPlayer({ replanError: "Silo could not apply the subtitle selection." });
 
@@ -4344,90 +3715,7 @@ describe("VideoPlayer plan failure recovery", () => {
 
     await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(2));
     expect(onSubtitleTrackChange).toHaveBeenCalledTimes(2);
-    expect(onSubtitleTrackChange).toHaveBeenLastCalledWith(
-      2,
-      0,
-      expect.objectContaining({ index: 2 }),
-    );
-  });
-
-  it("rolls a refused manual subtitle pick back to the accepted track without retrying", async () => {
-    const english = fixtureSubtitleInventoryItemV3({
-      track_id: "file:7:subtitle:0",
-      combined_index: 0,
-      language: "eng",
-      label: "English",
-    });
-    const french = fixtureSubtitleInventoryItemV3({
-      track_id: "file:7:subtitle:1",
-      combined_index: 1,
-      language: "fra",
-      label: "French",
-    });
-    const toPlayerTrack = (
-      item: ReturnType<typeof fixtureSubtitleInventoryItemV3>,
-    ): PlayerSubtitleInfo => ({
-      index: item.combined_index,
-      media_file_id: 7,
-      track_id: item.track_id,
-      language: item.language ?? "",
-      codec: item.codec,
-      label: item.label ?? "",
-      source: item.source === "external" || item.source === "downloaded" ? item.source : "embedded",
-      url: item.url ?? "",
-    });
-    const onSubtitleTrackChange = vi.fn();
-    const acceptedPlan = fixturePlanV3({
-      ...directPlan,
-      subtitle: { mode: "render", track_id: english.track_id, inventory: [english, french] },
-      selected_tracks: {
-        audio: { id: "file:7:audio:0", index: 0 },
-        subtitle: { id: english.track_id, index: 0 },
-      },
-    });
-    const { rerenderPlayer } = renderPlayer({
-      plan: acceptedPlan,
-      subtitleUrls: [toPlayerTrack(english), toPlayerTrack(french)],
-      subtitleMode: "always",
-      preferredSubtitleLanguage: "eng",
-      onSubtitleTrackChange,
-    });
-    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
-    expect(onSubtitleTrackChange).not.toHaveBeenCalled();
-
-    // The viewer picks French, and the server refuses that track without a
-    // replacement plan. The accepted English row must stay committed and the
-    // rejected pick must not be replayed by the outbound effect.
-    act(() => controls.current?.onSubtitleSelect?.(1));
-    await waitFor(() => expect(onSubtitleTrackChange).toHaveBeenCalledOnce());
-    expect(onSubtitleTrackChange).toHaveBeenLastCalledWith(
-      1,
-      expect.anything(),
-      expect.objectContaining({ index: 1 }),
-    );
-
-    rerenderPlayer({ replanError: "Silo could not apply the subtitle selection." });
-    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
-    expect(onSubtitleTrackChange).toHaveBeenCalledOnce();
-
-    // Extra renders of the same refusal must not arm the rejected pick again.
-    rerenderPlayer({ replanError: "Silo could not apply the subtitle selection." });
-    await act(async () => {});
-    expect(controls.current?.activeSubtitleIndex).toBe(0);
-    expect(onSubtitleTrackChange).toHaveBeenCalledOnce();
-
-    rerenderPlayer({ replanError: null });
-    await act(async () => {});
-    expect(onSubtitleTrackChange).toHaveBeenCalledOnce();
-
-    // Only a new user action retries the track.
-    act(() => controls.current?.onSubtitleSelect?.(1));
-    await waitFor(() => expect(onSubtitleTrackChange).toHaveBeenCalledTimes(2));
-    expect(onSubtitleTrackChange).toHaveBeenLastCalledWith(
-      1,
-      expect.anything(),
-      expect.objectContaining({ index: 1 }),
-    );
+    expect(onSubtitleTrackChange).toHaveBeenLastCalledWith(2, 0);
   });
 
   // A sync request built from the player's stale "off" would turn the restored
@@ -4553,17 +3841,44 @@ describe("VideoPlayer first frame", () => {
 
     // Switching transports empties the element with load(), which resets the
     // position and queues a timeupdate while no source has data. It is not the
-    // new transport's first frame, and the loading overlay stays up for it.
+    // new transport's first frame, and the spinner stays up for it.
     rerenderPlayer({ planRevision: 2 });
     fireEvent.timeUpdate(video);
     fireEvent.seeked(video);
     expect(onFirstFrame).toHaveBeenCalledTimes(1);
-    expect(screen.getByRole("status", { name: "Loading video" })).toBeInTheDocument();
+    expect(screen.getByRole("status", { name: "Buffering" })).toBeInTheDocument();
 
     fireEvent.playing(video);
     expect(onFirstFrame).toHaveBeenCalledTimes(2);
     fireFrameTimeUpdate(video);
     expect(onFirstFrame).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps the controls uncovered while a replan reloads a session that has played", async () => {
+    const { container, rerenderPlayer } = renderPlayer();
+    const video = container.querySelector("video");
+    if (!video) throw new Error("expected video element");
+    await waitFor(() => expect(video.src).toContain("/api/v1/stream/session-1"));
+    expect(screen.getByRole("status", { name: "Loading video" })).toBeInTheDocument();
+    fireEvent.playing(video);
+    expect(screen.queryByRole("status", { name: "Loading video" })).not.toBeInTheDocument();
+
+    // A seek outside the buffer replans the same session. Its new transport
+    // shows the buffering spinner over the controls, not the startup cover.
+    rerenderPlayer({ planRevision: 2 });
+    expect(screen.queryByRole("status", { name: "Loading video" })).not.toBeInTheDocument();
+    expect(screen.getByRole("status", { name: "Buffering" })).toBeInTheDocument();
+    fireEvent.playing(video);
+    expect(screen.queryByRole("status", { name: "Buffering" })).not.toBeInTheDocument();
+
+    // A new session, such as the next episode, starts behind the cover again.
+    rerenderPlayer({
+      sessionId: "session-2",
+      streamUrl: "/api/v1/stream/session-2",
+      planRevision: 3,
+    });
+    await waitFor(() => expect(video.src).toContain("/api/v1/stream/session-2"));
+    expect(screen.getByRole("status", { name: "Loading video" })).toBeInTheDocument();
   });
 });
 
@@ -4636,6 +3951,65 @@ describe("VideoPlayer intro skip prompt", () => {
     expect(prompt).toBeInTheDocument();
   });
 
+  // The offer that returns with the controls after the timer ran out must not
+  // take Space or Escape from the rest of the player, only answer them when
+  // the viewer focused it.
+  it("brings a timed-out ask back without claiming unfocused keys", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      const rendered = await enterIntro("ask");
+      const video = rendered.container.querySelector("video");
+      if (!video) throw new Error("expected video element");
+      fireEvent.play(video);
+      expect(screen.getByRole("button", { name: "Skip Intro" })).toBeInTheDocument();
+
+      act(() => vi.advanceTimersByTime(INTRO_PROMPT_SECONDS * 1_000));
+      fireEvent.mouseMove(rendered.container.firstElementChild ?? rendered.container);
+      const offer = screen.getByRole("button", { name: "Skip Intro" });
+
+      expect(fireEvent.keyDown(document.body, { key: "Escape" })).toBe(true);
+      expect(offer).toBeInTheDocument();
+      fireEvent.keyDown(document.body, { key: " " });
+      expect(offer).toBeInTheDocument();
+      expect(video.currentTime).toBe(12);
+
+      offer.focus();
+      expect(fireEvent.keyDown(offer, { key: " " })).toBe(false);
+      await act(async () => Promise.resolve());
+      expect(offer).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // The timed pill takes focus for keyboard viewers. When it runs out with the
+  // controls up, the offer that replaces it must not inherit that focus, or
+  // the next Space skips the intro instead of pausing.
+  it("does not hand the expired pill's focus to the returning offer", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      const rendered = await enterIntro("ask");
+      const video = rendered.container.querySelector("video");
+      if (!video) throw new Error("expected video element");
+      fireEvent.play(video);
+      screen.getByRole("button", { name: "Skip Intro" }).focus();
+
+      fireEvent.mouseMove(rendered.container.firstElementChild ?? rendered.container);
+      act(() => vi.advanceTimersByTime(INTRO_PROMPT_SECONDS * 1_000));
+      fireEvent.mouseMove(rendered.container.firstElementChild ?? rendered.container);
+      const offer = screen.getByRole("button", { name: "Skip Intro" });
+      expect(offer).not.toHaveFocus();
+
+      const focused = document.activeElement ?? document.body;
+      fireEvent.keyDown(focused, { key: " " });
+      await act(async () => Promise.resolve());
+      expect(video.currentTime).toBe(12);
+      expect(offer).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("acts on Select while the pill itself is focused", async () => {
     await enterIntro("ask");
     const prompt = await screen.findByRole("button", { name: "Skip Intro" });
@@ -4697,6 +4071,43 @@ describe("VideoPlayer source timeline", () => {
     expect(video.currentTime).toBe(7);
     expect(subtitleTimeline.textOffsetSeconds).toBe(0);
     expect(subtitleTimeline.assOffsetSeconds).toBe(0);
+  });
+
+  it("keeps a seek made while a native HLS transport reloads", async () => {
+    const plan = fixturePlanV3({
+      delivery: "server_remux_hls",
+      stream: {
+        url: "/playback/transcode/session-1/master.m3u8",
+        protocol: "hls",
+        headers: {},
+        header_refresh: "none",
+      },
+      timeline: {
+        source_start_seconds: 42,
+        player_start_seconds: 7,
+        stream_origin_seconds: 35,
+        timeline_offset_seconds: 0,
+        can_seek_anywhere: true,
+        seek_restoration: "player_position",
+      },
+    });
+    const { container, rerenderPlayer } = renderPlayer({ plan, initialPosition: 42 });
+    const video = container.querySelector("video");
+    if (!video) throw new Error("expected video element");
+    await waitFor(() => expect(video.src).toContain("/api/v1/stream/session-1"));
+    fireEvent.loadedMetadata(video);
+    fireEvent.playing(video);
+
+    // A quality change replans the session; the controls stay usable while the
+    // new transport loads, and the viewer seeks before its metadata arrives.
+    rerenderPlayer({ plan, planRevision: 2, streamUrl: "/api/v1/stream/session-1?revision=2" });
+    await waitFor(() => expect(video.src).toContain("revision=2"));
+    act(() => {
+      controls.current!.onSeek(300);
+    });
+    fireEvent.loadedMetadata(video);
+
+    expect(video.currentTime).toBe(300);
   });
 
   // Chrome keeps a Matroska file's container start time on its clock, so a
@@ -5395,116 +4806,6 @@ describe("VideoPlayer subtitle sync", () => {
   });
 });
 
-describe("VideoPlayer subtitle overlay", () => {
-  const track: PlayerSubtitleInfo = {
-    index: 0,
-    language: "en",
-    label: "English",
-    source: "external",
-    codec: "vtt",
-    sync_key: "external-" + "a".repeat(64),
-    url: "/api/v1/stream/session-1/subtitles/0.vtt?file_id=7",
-  };
-
-  const selectTrack = async () => {
-    await act(async () => {
-      (
-        controls.current as unknown as { onSubtitleSelect: (index: number) => void }
-      ).onSubtitleSelect(0);
-    });
-  };
-
-  const cueGroup = (text: string): HTMLElement => {
-    const group = screen.getByText(text).parentElement;
-    if (!group) throw new Error(`No group rendered for cue "${text}"`);
-    return group;
-  };
-
-  beforeEach(() => {
-    realtimeOptions.current = null;
-    controls.current = null;
-    subtitleTimeline.activeCues = [];
-    subtitleTimeline.assActive = false;
-    subtitleTimeline.refreshRevision = 0;
-    playerV2Mock.mockReset().mockResolvedValue({});
-    vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
-    vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
-    vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => {});
-  });
-
-  afterEach(() => {
-    subtitleTimeline.activeCues = [];
-    subtitleTimeline.assActive = false;
-    cleanup();
-    vi.restoreAllMocks();
-  });
-
-  it("places top, middle and bottom cues in their own groups", () => {
-    subtitleTimeline.activeCues = [
-      { text: "Top caption", line: "top" },
-      { text: "Middle caption", line: "middle" },
-      { text: "Bottom caption", line: "bottom" },
-      // No line: the viewer's position setting (bottom in this suite) decides.
-      { text: "Setting caption" },
-    ];
-    renderPlayer();
-
-    expect(cueGroup("Top caption")).toHaveAttribute("data-subtitle-group", "top");
-    expect(cueGroup("Top caption").style.top).toBe("10%");
-    expect(cueGroup("Middle caption")).toHaveAttribute("data-subtitle-group", "middle");
-    expect(cueGroup("Middle caption")).toHaveClass("top-1/2", "-translate-y-1/2");
-    expect(cueGroup("Bottom caption")).toHaveAttribute("data-subtitle-group", "bottom");
-    expect(cueGroup("Setting caption")).toBe(cueGroup("Bottom caption"));
-    expect(cueGroup("Bottom caption").style.transform).toContain("translateY(");
-    expect(cueGroup("Bottom caption").style.top).toBe("");
-  });
-
-  it("aligns each cue by its source alignment", () => {
-    subtitleTimeline.activeCues = [
-      { text: "Left caption", line: "bottom", align: "left" },
-      { text: "Right caption", line: "bottom", align: "right" },
-      { text: "Centered caption", line: "bottom" },
-    ];
-    renderPlayer();
-
-    expect(screen.getByText("Left caption")).toHaveClass("self-start", "text-left");
-    expect(screen.getByText("Right caption")).toHaveClass("self-end", "text-right");
-    expect(screen.getByText("Centered caption")).toHaveClass("self-center", "text-center");
-  });
-
-  it("bounds a positioned cue by its size and stays inside the player", () => {
-    subtitleTimeline.activeCues = [
-      { text: "Positioned caption", line: "bottom", align: "left", position: 10, size: 40 },
-    ];
-    renderPlayer();
-
-    const cue = screen.getByText("Positioned caption");
-    expect(cue).toHaveStyle({ maxWidth: "40%", left: "10%" });
-  });
-
-  it("offers a retry for a text subtitle failure that rebuilds the track", async () => {
-    renderPlayer({ subtitleUrls: [track] });
-    await selectTrack();
-    act(() => subtitleTimeline.setLoadState?.("error"));
-
-    expect(screen.getByText("Subtitles couldn't load.")).toBeInTheDocument();
-    expect(subtitleTimeline.refreshRevision).toBe(0);
-
-    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
-    expect(subtitleTimeline.refreshRevision).toBe(1);
-  });
-
-  it("shows an ASS subtitle failure without a retry action", async () => {
-    subtitleTimeline.assActive = true;
-    renderPlayer({ subtitleUrls: [track] });
-    await selectTrack();
-    act(() => subtitleTimeline.setASSLoadState?.("error"));
-
-    expect(screen.getByText("Subtitles couldn't load.")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
-  });
-});
-
 describe("VideoPlayer translation handoff", () => {
   beforeEach(() => {
     toastError.mockClear();
@@ -5557,82 +4858,6 @@ describe("VideoPlayer translation handoff", () => {
     });
     expect(controls.current?.activeSubtitleIndex).toBeNull();
     expect(subtitleTimeline.liveKey).toBeNull();
-  });
-
-  it("routes a source committed event to the parent", () => {
-    const onSourceCommitted = vi.fn();
-    renderPlayer({ onSourceCommitted });
-    const payload = {
-      session_id: "session-1",
-      effective_media_file_id: 8,
-      effective_virtual_uri: "virtual://movie/x?result=B",
-      inventory_status: "declared",
-      audio_tracks: [{ language: "deu", codec: "eac3", default: true }],
-    };
-    act(() =>
-      realtimeOptions.current?.onEvent?.({
-        type: "event",
-        session_id: "session-1",
-        name: "source_committed",
-        payload,
-      }),
-    );
-    expect(onSourceCommitted).toHaveBeenCalledExactlyOnceWith(payload);
-  });
-
-  it("ignores a source committed event for another session", () => {
-    const onSourceCommitted = vi.fn();
-    renderPlayer({ onSourceCommitted });
-    act(() =>
-      realtimeOptions.current?.onEvent?.({
-        type: "event",
-        session_id: "other-session",
-        name: "source_committed",
-        payload: {
-          session_id: "other-session",
-          effective_media_file_id: 8,
-          effective_virtual_uri: "virtual://movie/x?result=B",
-          audio_tracks: [],
-        },
-      }),
-    );
-    expect(onSourceCommitted).not.toHaveBeenCalled();
-  });
-
-  it("routes a live inventory update to the parent", () => {
-    const onInventoryUpdated = vi.fn();
-    renderPlayer({ onInventoryUpdated });
-    const payload = {
-      session_id: "session-1",
-      inventory_revision: "inv:abc",
-      inventory_status: "verified",
-      effective_media_file_id: 8,
-      audio_tracks: [{ language: "deu", codec: "eac3", default: true }],
-      subtitle_inventory: [],
-    };
-    act(() =>
-      realtimeOptions.current?.onEvent?.({
-        type: "event",
-        session_id: "session-1",
-        name: "inventory_updated",
-        payload,
-      }),
-    );
-    expect(onInventoryUpdated).toHaveBeenCalledExactlyOnceWith(payload);
-  });
-
-  it("ignores a live inventory update for another session", () => {
-    const onInventoryUpdated = vi.fn();
-    renderPlayer({ onInventoryUpdated });
-    act(() =>
-      realtimeOptions.current?.onEvent?.({
-        type: "event",
-        session_id: "other-session",
-        name: "inventory_updated",
-        payload: { session_id: "other-session", inventory_status: "verified" },
-      }),
-    );
-    expect(onInventoryUpdated).not.toHaveBeenCalled();
   });
 
   it("reconciles a failure before the acceptance response and ignores stale job and session failures", async () => {
@@ -6055,11 +5280,7 @@ describe("VideoPlayer translation handoff", () => {
     });
 
     await waitFor(() => expect(onSubtitleChanged).toHaveBeenCalledWith(4, undefined));
-    expect(onSubtitleTrackChange).toHaveBeenCalledWith(
-      4,
-      expect.any(Number),
-      expect.objectContaining({ index: 4 }),
-    );
+    expect(onSubtitleTrackChange).toHaveBeenCalledWith(4, expect.any(Number));
     expect(controls.current?.activeSubtitleIndex).toBe(4);
     expect(controls.current?.subtitleTracks).toEqual([downloadedTrack]);
   });
@@ -6105,6 +5326,50 @@ describe("VideoPlayer translation handoff", () => {
       expect(webkitExitFullscreen).toHaveBeenCalledOnce();
     },
   );
+
+  it("makes the host's fullscreen root fullscreen instead of its own container", () => {
+    const root = document.createElement("div");
+    const requestRootFullscreen = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(root, "requestFullscreen", {
+      value: requestRootFullscreen,
+      configurable: true,
+    });
+    const { container } = render(createElement(VideoPlayer, playerProps()), {
+      wrapper: ({ children }) =>
+        wrapper({
+          children: createElement(PlayerFullscreenRootContext.Provider, {
+            value: { current: root },
+            children,
+          }),
+        }),
+    });
+    const playerContainer = container.querySelector(".player-container") as HTMLElement;
+    const requestContainerFullscreen = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(playerContainer, "requestFullscreen", {
+      value: requestContainerFullscreen,
+      configurable: true,
+    });
+
+    act(() => {
+      controls.current?.onFullscreenToggle?.();
+    });
+
+    expect(requestRootFullscreen).toHaveBeenCalledOnce();
+    expect(requestContainerFullscreen).not.toHaveBeenCalled();
+  });
+
+  it("starts in fullscreen when mounted inside a fullscreen host", () => {
+    Object.defineProperty(document, "fullscreenElement", {
+      value: document.body,
+      configurable: true,
+    });
+    try {
+      renderPlayer();
+      expect(controls.current?.isFullscreen).toBe(true);
+    } finally {
+      delete (document as { fullscreenElement?: Element | null }).fullscreenElement;
+    }
+  });
 
   it("tracks WebKit fullscreen events on the video element", async () => {
     const { container } = renderPlayer();
@@ -6401,7 +5666,6 @@ describe("VideoPlayer progressive remux after a long pause", () => {
 describe("VideoPlayer lost connection", () => {
   beforeEach(() => {
     realtimeOptions.current = null;
-    progressOptions.current = null;
     controls.current = null;
     hlsJS.supported = false;
     hlsJS.constructed.mockClear();
@@ -6444,132 +5708,6 @@ describe("VideoPlayer lost connection", () => {
     expect(onConnectionLost).toHaveBeenCalledExactlyOnceWith(1_200, true);
     expect(onPlanFailure).not.toHaveBeenCalled();
     expect(screen.queryByText("Go Back")).not.toBeInTheDocument();
-  });
-
-  it("routes a gone session on a stream that played through its one recovery", () => {
-    const onConnectionLost = vi.fn();
-    const onSessionLost = vi.fn();
-    const { container } = renderPlayer({ onConnectionLost, onSessionLost });
-    const video = container.querySelector("video");
-    if (!video) throw new Error("expected video element");
-    fireFrameTimeUpdate(video);
-    Object.defineProperty(video, "paused", { configurable: true, value: false });
-
-    // The progress sampler is the authoritative lane; a control-ticket 404 is
-    // replica-local and never reaches the player, so only this one reports.
-    act(() => {
-      progressOptions.current?.onSessionLost?.();
-    });
-
-    expect(onConnectionLost).toHaveBeenCalledExactlyOnceWith(0, true);
-    expect(onSessionLost).not.toHaveBeenCalled();
-  });
-
-  it("reports a gone session once when nothing played and the sampler answers twice", () => {
-    const onConnectionLost = vi.fn();
-    const onSessionLost = vi.fn();
-    renderPlayer({ onConnectionLost, onSessionLost });
-
-    // No frame has played, so the reconnect has no position to restart from and
-    // the player goes straight to the lost state — once, not twice.
-    act(() => {
-      progressOptions.current?.onSessionLost?.();
-      progressOptions.current?.onSessionLost?.();
-    });
-
-    expect(onSessionLost).toHaveBeenCalledOnce();
-    expect(onConnectionLost).not.toHaveBeenCalled();
-  });
-
-  it("reports a later gone session after a recovery landed", () => {
-    const onConnectionLost = vi.fn();
-    const onSessionLost = vi.fn();
-    const { container, rerenderPlayer } = renderPlayer({ onConnectionLost, onSessionLost });
-    const video = container.querySelector("video");
-    if (!video) throw new Error("expected video element");
-    fireFrameTimeUpdate(video);
-    Object.defineProperty(video, "paused", { configurable: true, value: false });
-
-    act(() => progressOptions.current?.onSessionLost?.());
-    expect(onConnectionLost).toHaveBeenCalledOnce();
-
-    // The reconnect runs, then a fresh transport reconnects: the report re-arms
-    // so a later drop is not swallowed by the first one.
-    rerenderPlayer({ connectionStatus: "reconnecting" });
-    act(() => progressOptions.current?.onSessionLost?.());
-    expect(onConnectionLost).toHaveBeenCalledOnce();
-
-    rerenderPlayer({ connectionStatus: "connected" });
-    act(() => progressOptions.current?.onSessionLost?.());
-    expect(onConnectionLost).toHaveBeenCalledTimes(2);
-    expect(onSessionLost).not.toHaveBeenCalled();
-  });
-
-  it("re-arms the gone report when the session id changes", () => {
-    const onConnectionLost = vi.fn();
-    const onSessionLost = vi.fn();
-    const { rerenderPlayer } = renderPlayer({ onConnectionLost, onSessionLost });
-
-    // Nothing played, so the first gone report goes straight to the lost state.
-    act(() => progressOptions.current?.onSessionLost?.());
-    expect(onSessionLost).toHaveBeenCalledOnce();
-
-    // A new session id is a different session: its disappearance must report
-    // even though the connection status prop never left "connected".
-    rerenderPlayer({ sessionId: "session-2" });
-    act(() => progressOptions.current?.onSessionLost?.());
-
-    expect(onSessionLost).toHaveBeenCalledTimes(2);
-  });
-
-  it("re-arms the gone report after a recovery that keeps the session id", () => {
-    const onConnectionLost = vi.fn();
-    const onSessionLost = vi.fn();
-    const { container, rerenderPlayer } = renderPlayer({ onConnectionLost, onSessionLost });
-    const video = container.querySelector("video");
-    if (!video) throw new Error("expected video element");
-    fireFrameTimeUpdate(video);
-    Object.defineProperty(video, "paused", { configurable: true, value: false });
-
-    act(() => progressOptions.current?.onSessionLost?.());
-    expect(onConnectionLost).toHaveBeenCalledOnce();
-
-    // Recovery adopts a new plan without changing the session id and without
-    // leaving the "connected" status. The dedupe must re-arm on the revision so
-    // a second loss is reported rather than swallowed for the rest of the
-    // session.
-    rerenderPlayer({ planRevision: 2 });
-    // The replacement transport plays a frame again.
-    fireFrameTimeUpdate(video);
-    act(() => progressOptions.current?.onSessionLost?.());
-    expect(onConnectionLost).toHaveBeenCalledTimes(2);
-    expect(onSessionLost).not.toHaveBeenCalled();
-  });
-
-  it("expedites a reconnect already in flight when the session is gone", () => {
-    const onConnectionLost = vi.fn();
-    const onExpediteReconnect = vi.fn();
-    const onSessionLost = vi.fn();
-    const { container, rerenderPlayer } = renderPlayer({
-      onConnectionLost,
-      onExpediteReconnect,
-      onSessionLost,
-    });
-    const video = container.querySelector("video");
-    if (!video) throw new Error("expected video element");
-    fireFrameTimeUpdate(video);
-    Object.defineProperty(video, "paused", { configurable: true, value: false });
-
-    // A network drop already started the reconnect; no session-gone report has
-    // run yet, so the latch is still armed.
-    rerenderPlayer({ connectionStatus: "reconnecting" });
-    act(() => progressOptions.current?.onSessionLost?.());
-
-    // The reconnect is the recovery, so it is not restarted, but a dead session
-    // must not make the viewer wait out the backoff.
-    expect(onConnectionLost).not.toHaveBeenCalled();
-    expect(onExpediteReconnect).toHaveBeenCalledOnce();
-    expect(onSessionLost).not.toHaveBeenCalled();
   });
 
   it("sends a replacement transport's network error before its first frame to route recovery", () => {
@@ -6666,24 +5804,6 @@ describe("VideoPlayer lost connection", () => {
     expect(screen.getByRole("button", { name: "Go Back" })).toBeInTheDocument();
   });
 
-  it("offers Restart playback for a session answered gone", () => {
-    const onRestartPlayback = vi.fn();
-    renderPlayer({
-      onRestartPlayback,
-      connectionStatus: "gone",
-      connectionErrorTitle: "Playback session expired",
-      connectionError:
-        "This playback session is no longer active. Start it again to keep watching.",
-    });
-
-    expect(screen.getByRole("alert")).toHaveTextContent("Playback session expired");
-    // A dead session is never reconnected or replanned in place.
-    expect(screen.queryByText("Try again")).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Restart playback" }));
-    expect(onRestartPlayback).toHaveBeenCalledOnce();
-    expect(screen.getByRole("button", { name: "Go Back" })).toBeInTheDocument();
-  });
-
   it("keeps subtitles off when a reconnect had to start a new session", async () => {
     const onSubtitleTrackChange = vi.fn();
     const sidecarTrack: PlayerSubtitleInfo = {
@@ -6715,7 +5835,7 @@ describe("VideoPlayer lost connection", () => {
         controls.current as unknown as { onSubtitleSelect: (i: number | null) => void }
       ).onSubtitleSelect(null),
     );
-    await waitFor(() => expect(onSubtitleTrackChange).toHaveBeenCalledWith(null, 0, null));
+    await waitFor(() => expect(onSubtitleTrackChange).toHaveBeenCalledWith(null, 0));
     rerenderPlayer({ plan: directPlan, planRevision: 2 });
 
     // The server restarts: the reconnect starts session-2 with no subtitle.
@@ -6734,10 +5854,7 @@ describe("VideoPlayer lost connection", () => {
     await act(async () => Promise.resolve());
 
     expect(controls.current?.activeSubtitleIndex).toBeNull();
-    // The turn-off must be the last word: an adopt echo for the initial
-    // selection may precede it now that inventory resolves in stages, but no
-    // later call may re-enable a track after the reconnect.
-    expect(onSubtitleTrackChange).toHaveBeenLastCalledWith(null, 0, null);
+    expect(onSubtitleTrackChange).toHaveBeenCalledOnce();
   });
 
   it("hands a fatal hls.js network error on a stream that played to the reconnect", async () => {

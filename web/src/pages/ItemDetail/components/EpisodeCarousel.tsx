@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { CalendarClock, Play, ChevronLeft, ChevronRight } from "lucide-react";
+import { Play, ChevronLeft, ChevronRight } from "lucide-react";
 import type { EpisodeListItem } from "@/api/types";
 import { WatchedCheckIndicator } from "@/components/CardWatchedBadge";
 import { toEpisodeUserState } from "@/components/episodeUserState";
@@ -8,37 +8,44 @@ import { decodeThumbhash } from "@/lib/thumbhash";
 import { cn } from "@/lib/utils";
 import MediaItemMenu from "@/components/MediaItemMenu";
 import ViewTransitionLink from "@/components/ViewTransitionLink";
-import type { EpisodeNavigationState } from "../itemDetailLayout";
+import { episodeLinkLibraryId, type EpisodeNavigationState } from "../itemDetailLayout";
 import { useCarouselEmbla } from "@/hooks/useCarouselEmbla";
 import { usePrefetchCatalogItemDetail } from "@/hooks/queries/catalogRead";
 import { useDwellPrefetch } from "@/hooks/useDwellPrefetch";
 import { useEpisodeSpoilerPrefs } from "@/hooks/useEpisodeSpoilerPrefs";
 import { useOverlayPrefs } from "@/hooks/useOverlayPrefs";
-import { isUpcomingEpisode, useEpisodeReleaseCapability } from "@/hooks/queries/episodeRelease";
 import type { CardQuickActionMode } from "@/lib/cardQuickActions";
+import type { ScrollPreservingState } from "@/hooks/useScrollRestoration";
+import { buildItemHref } from "@/lib/mediaNavigation";
 import EpisodeCardCaption from "./EpisodeCardCaption";
 
 interface EpisodeCarouselProps {
   episodes: EpisodeListItem[];
   currentEpisodeNumber: number;
   episodeLinkState?: EpisodeNavigationState;
+  /** The page's library scope, kept on each episode link. */
+  libraryId?: number;
 }
 
 export default function EpisodeCarousel({
   episodes,
   currentEpisodeNumber,
   episodeLinkState,
+  libraryId,
 }: EpisodeCarouselProps) {
   const currentEpisodeIndex = episodes.findIndex(
     (episode) => episode.episode_number === currentEpisodeNumber,
   );
-  const prefetchEpisodeDetail = usePrefetchCatalogItemDetail();
+  const prefetchScopedEpisode = usePrefetchCatalogItemDetail(libraryId);
+  const prefetchEpisode = usePrefetchCatalogItemDetail();
   const { quickActionMode } = useOverlayPrefs();
-  // Capability-gated upcoming treatment: older servers without release_state
-  // keep today's plain carousel rendering.
-  const { data: releaseCapability } = useEpisodeReleaseCapability();
-  const releaseSupported = releaseCapability?.available ?? false;
   const { hideImages, hideOverviews } = useEpisodeSpoilerPrefs();
+  // Moving between siblings keeps the viewer where they scrolled to: the page
+  // keeps its layout, and the carousel re-centres on the new episode.
+  const linkState: EpisodeNavigationState & ScrollPreservingState = {
+    ...episodeLinkState,
+    preserveScroll: true,
+  };
   const { emblaApi, emblaRef, canScrollPrev, canScrollNext, scrollPrev, scrollNext } =
     useCarouselEmbla({
       options: {
@@ -73,12 +80,16 @@ export default function EpisodeCarousel({
                 key={ep.content_id}
                 ep={ep}
                 isCurrent={ep.episode_number === currentEpisodeNumber}
-                episodeLinkState={episodeLinkState}
+                episodeLinkState={linkState}
+                libraryId={libraryId}
                 quickActionMode={quickActionMode}
-                upcoming={isUpcomingEpisode(ep, releaseSupported)}
                 hideImageIfUnwatched={hideImages}
                 hideOverviewIfUnwatched={hideOverviews}
-                onPrefetch={() => prefetchEpisodeDetail(ep.content_id)}
+                onPrefetch={() =>
+                  (episodeLinkLibraryId(ep, libraryId) === undefined
+                    ? prefetchEpisode
+                    : prefetchScopedEpisode)(ep.content_id)
+                }
               />
             ))}
           </ul>
@@ -103,8 +114,8 @@ function EpisodeCarouselCard({
   ep,
   isCurrent,
   episodeLinkState,
+  libraryId,
   quickActionMode,
-  upcoming,
   hideImageIfUnwatched,
   hideOverviewIfUnwatched,
   onPrefetch,
@@ -112,8 +123,8 @@ function EpisodeCarouselCard({
   ep: EpisodeListItem;
   isCurrent: boolean;
   episodeLinkState?: EpisodeNavigationState;
+  libraryId?: number;
   quickActionMode: CardQuickActionMode;
-  upcoming: boolean;
   hideImageIfUnwatched: boolean;
   hideOverviewIfUnwatched: boolean;
   onPrefetch: () => void;
@@ -122,6 +133,10 @@ function EpisodeCarouselCard({
   const prefetchHandlers = useDwellPrefetch(onPrefetch);
   const thumbhashUrl = ep.still_thumbhash ? decodeThumbhash(ep.still_thumbhash) : "";
   const episodeTitle = ep.title || `Episode ${ep.episode_number}`;
+  const episodeHref = buildItemHref({
+    contentId: ep.content_id,
+    libraryId: episodeLinkLibraryId(ep, libraryId),
+  });
   const hideImage =
     hideImageIfUnwatched &&
     isEpisodeStill(ep.still_is_episode_still) &&
@@ -148,7 +163,7 @@ function EpisodeCarouselCard({
       >
         <div className="relative">
           <ViewTransitionLink
-            to={`/item/${ep.content_id}`}
+            to={episodeHref}
             state={episodeLinkState}
             aria-current={isCurrent ? "page" : undefined}
             className="block"
@@ -170,33 +185,13 @@ function EpisodeCarouselCard({
                 <img
                   src={ep.still_url}
                   alt={episodeTitle}
-                  className={cn(
-                    "h-full w-full object-cover",
-                    upcoming && "opacity-45 saturate-50",
-                    hideImage && SPOILER_IMAGE_CLASS,
-                  )}
+                  className={cn("h-full w-full object-cover", hideImage && SPOILER_IMAGE_CLASS)}
                   loading="lazy"
                   decoding="async"
                 />
-              ) : upcoming ? (
-                <div className="bg-accent/30 flex h-full w-full items-center justify-center">
-                  <CalendarClock
-                    size={28}
-                    className="text-muted-foreground/50"
-                    aria-label="Upcoming"
-                  />
-                </div>
               ) : (
                 <div className="bg-accent/30 flex h-full w-full items-center justify-center">
                   <Play size={28} className="text-muted-foreground/30" />
-                </div>
-              )}
-              {upcoming && ep.still_url && (
-                <div className="absolute inset-0 flex items-center justify-center bg-black/35">
-                  <span className="metadata-badge gap-1">
-                    <CalendarClock className="size-3" aria-hidden="true" />
-                    Upcoming
-                  </span>
                 </div>
               )}
               {isCurrent && (
@@ -233,7 +228,7 @@ function EpisodeCarouselCard({
           />
         </div>
         <ViewTransitionLink
-          to={`/item/${ep.content_id}`}
+          to={episodeHref}
           state={episodeLinkState}
           aria-current={isCurrent ? "page" : undefined}
           className="block"
@@ -243,7 +238,6 @@ function EpisodeCarouselCard({
             hideOverview={hideOverviewIfUnwatched && isEpisodeUnwatched(ep.user_data)}
             isCurrent={isCurrent}
             badges={ep.user_data?.played && <WatchedCheckIndicator />}
-            notice={upcoming ? "Upcoming" : undefined}
           />
         </ViewTransitionLink>
       </div>

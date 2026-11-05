@@ -55,6 +55,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/audiobooks/podcastfeed"
 	"github.com/Silo-Server/silo-server/internal/auth"
 	"github.com/Silo-Server/silo-server/internal/autoscan"
+	"github.com/Silo-Server/silo-server/internal/backup"
 	"github.com/Silo-Server/silo-server/internal/blobgc"
 	"github.com/Silo-Server/silo-server/internal/blobstore"
 	"github.com/Silo-Server/silo-server/internal/boxsets"
@@ -808,6 +809,20 @@ func main() {
 		return
 	}
 
+	if len(os.Args) > 1 && os.Args[1] == "backup" {
+		if err := runBackupMain(os.Args[2:], os.Stdout, os.Stderr); err != nil {
+			log.Fatalf("backup: %v", err)
+		}
+		return
+	}
+
+	if len(os.Args) > 1 && os.Args[1] == "secret" {
+		if err := runSecretCommand(os.Args[2:], os.Stdin, os.Stdout); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+
 	envFile := flag.String("env", ".env", "path to .env bootstrap file")
 	migrateOnly := flag.Bool("migrate-only", false, "apply database migrations and exit")
 	migrateStatus := flag.Bool("migrate-status", false, "show database migration status and exit")
@@ -896,11 +911,17 @@ func main() {
 		return
 	}
 
+	// Every server that migrates runs the same sequence: wait for any other
+	// server's, back up the database when migrations are pending, then
+	// migrate (database.MigrateAtStartup, docs/architecture/backups.md).
+	migrationWait := database.MigrationWait()
+	startupMigrations := database.StartupOptions{
+		Wait:          migrationWait,
+		BeforeMigrate: beforeMigrateBackup(bc, pool, dataCipher, migrationWait),
+	}
+
 	if *migrateOnly {
-		migCtx, migCancel := database.MigrationContext(ctx)
-		migErr := database.MigrateOnly(migCtx, pool, migrations.FS, "sql")
-		migCancel()
-		if migErr != nil {
+		if migErr := database.MigrateAtStartup(ctx, pool, migrations.FS, "sql", startupMigrations); migErr != nil {
 			log.Fatalf("failed to run migrations: %v", migErr)
 		}
 		slog.Info("database migrations applied")
@@ -915,13 +936,9 @@ func main() {
 	// ciphertext; secondary nodes read whatever the primary encrypted.
 	isPrimaryNode := bc.Mode == "integrated" || bc.Mode == "api" || bc.Mode == ""
 	if isPrimaryNode {
-		migCtx, migCancel := database.MigrationContext(ctx)
-		migErr := database.MigrateOnly(migCtx, pool, migrations.FS, "sql")
-		if migErr != nil {
-			migCancel()
+		if migErr := database.MigrateAtStartup(ctx, pool, migrations.FS, "sql", startupMigrations); migErr != nil {
 			log.Fatalf("failed to run migrations: %v", migErr)
 		}
-		migCancel()
 		slog.Info("database migrations applied")
 	}
 
@@ -1721,6 +1738,12 @@ func main() {
 	// Runs after configureS3Clients: an S3 backend takes both buckets from deps.
 	if err := configureBlobStorage(appCtx, mode, cfg, &deps, settingsRepo); err != nil {
 		log.Fatalf("configure blob storage: %v", err)
+	}
+	if needsWorkers && deps.DB != nil {
+		deps.Backups = newBackupService(pool, bc, settingsRepo, &deps)
+	}
+	if deps.DB != nil {
+		deps.ProfileTransfer = newProfileTransfer(pool, settingsRepo, cfg)
 	}
 	if storageAdmission != nil {
 		// While a failed admission session is replaced, no blob write may land:
@@ -3802,9 +3825,17 @@ func main() {
 			}
 		}
 
+		if deps.Backups != nil {
+			taskMgr.Register(backup.NewTask(deps.Backups))
+			deps.Backups.SetTaskStarter(taskMgr)
+		}
+
 		taskMgr.Start(appCtx)
 		defer taskMgr.Stop()
 		deps.TaskManager = taskMgr
+		if deps.Backups != nil {
+			syncBackupSchedule(appCtx, deps.Backups, taskMgr, eventBus, configWatcher)
+		}
 		slog.Info("task manager started")
 	}
 
@@ -4072,6 +4103,9 @@ func main() {
 		adminJobRunner.SetVirtualRefreshExecutor(virtualRefreshExecutor)
 		adminJobRunner.SetCancelRegistry(adminJobCancelRegistry)
 		adminJobRunner.SetStorageTransitionExecutor(storageTransitionSvc)
+		if deps.Backups != nil {
+			adminJobRunner.SetBackupRestoreExecutor(backupRestoreExecutor{svc: deps.Backups})
+		}
 		adminJobRunner.SetStorageTransitionCommitted(deps.RequestServerRestart)
 		// The identity backfill is a one-shot resumable pass over legacy
 		// virtual rows. It is only meaningful when the core virtual library is
@@ -4153,6 +4187,7 @@ func main() {
 			RecWorker:            recWorker,
 			FrontendFS:           deps.FrontendFS,
 			ArtworkStore:         deps.Blobs.Assets,
+			AvatarStore:          handlers.NewProfileAvatarStore(deps.Blobs),
 			// Hand remote-transcode recipes to the shared recipe store so a dedicated
 			// transcode node that restarts can rebuild a jellycompat session.
 			RecipeNodeStore:  noderecipe.NewStore(apiRedisClient, 0),

@@ -1,9 +1,8 @@
-import { useEffect, useMemo, useState } from "react";
+import { useState } from "react";
 import { useNavigate } from "react-router";
 import type { ItemDetail } from "@/api/types";
 import { useStartShuffle } from "@/hooks/queries/shuffles";
 import { useItemEpisodes } from "@/hooks/queries/episodes";
-import { prefetchVirtualPlayback } from "@/hooks/queries/catalogRead";
 import { useRefreshItemMetadata } from "@/hooks/queries/items";
 import { useAmbientColor } from "@/hooks/useAmbientColor";
 import { useAuth } from "@/hooks/useAuth";
@@ -23,8 +22,10 @@ import DetailBreadcrumb from "./components/DetailBreadcrumb";
 import SeasonEpisodeGrid from "./components/SeasonEpisodeGrid";
 import type { EpisodeNavigationState } from "./itemDetailLayout";
 import { canCurateMetadata as canCurateMetadataForUser } from "@/lib/permissions";
+import { buildItemHref } from "@/lib/mediaNavigation";
 import { hasMachineTranslation } from "./components/machineTranslation";
 import EpisodesTranslationAction from "./components/EpisodesTranslationAction";
+import { useEpisodePlaybackList } from "./useEpisodePlaybackList";
 
 function seasonLabel(seasonNumber: number, title?: string) {
   if (title) return title;
@@ -32,7 +33,14 @@ function seasonLabel(seasonNumber: number, title?: string) {
   return `Season ${seasonNumber}`;
 }
 
-export default function SeasonContent({ item }: { item: ItemDetail & { type: "season" } }) {
+export default function SeasonContent({
+  item,
+  libraryId,
+}: {
+  item: ItemDetail & { type: "season" };
+  /** The page's ?libraryId= scope; series and episode links keep it. */
+  libraryId?: number;
+}) {
   const { translating: overviewTranslating, onTranslate: onTranslateOverview } =
     useOnViewTranslation(item);
   const navigate = useNavigate();
@@ -49,21 +57,9 @@ export default function SeasonContent({ item }: { item: ItemDetail & { type: "se
     data: episodesData,
     isLoading: episodesLoading,
     error: episodesError,
-  } = useItemEpisodes(item.content_id);
+  } = useItemEpisodes(item.content_id, libraryId);
 
-  const episodes = useMemo(() => episodesData?.episodes ?? [], [episodesData]);
-  useEffect(() => {
-    const fileIDs = episodes
-      .filter((episode) => !episode.user_data?.played)
-      .slice(0, 2)
-      .map((episode) => {
-        const files = episode.files ?? [];
-        const candidate = files.find((file) => file.container !== "virtual");
-        return candidate?.file_id ?? files[0]?.file_id;
-      })
-      .filter((fileID): fileID is number => fileID !== undefined);
-    if (fileIDs.length > 0) void prefetchVirtualPlayback(fileIDs);
-  }, [episodes]);
+  const episodes = episodesData?.episodes ?? [];
   // The season's pending language also covers its episodes. While an episode
   // is the thing missing, or the season has no overview of its own, the
   // translation status and action sit with the episode list; otherwise the
@@ -75,9 +71,23 @@ export default function SeasonContent({ item }: { item: ItemDetail & { type: "se
   const label = item.is_specials ? "Specials" : seasonLabel(seasonNumber, item.title);
   const seriesTitle = item.series_title ?? "Series";
   const seriesId = item.series_id;
-  const playableEpisodes = episodes.filter((episode) => (episode.files?.length ?? 0) > 0);
-  const firstUnwatched =
-    playableEpisodes.find((episode) => !episode.user_data?.played) ?? playableEpisodes[0];
+  const seriesHref = seriesId ? buildItemHref({ contentId: seriesId, libraryId }) : "/";
+  const firstEpisode = episodes[0];
+  const { episodes: playbackEpisodes, pending: unscopedPending } = useEpisodePlaybackList(
+    item.content_id,
+    libraryId,
+    episodes,
+  );
+  const playableEpisodes = playbackEpisodes.filter((episode) => (episode.files?.length ?? 0) > 0);
+  // Until the unscoped list arrives (or if it fails), an episode with no file
+  // here may still play from another library, so the season's episode count
+  // stands in.
+  const canShuffle = playableEpisodes.length > 1 || (unscopedPending && episodes.length > 1);
+  // The scoped list can't name the first unwatched playable episode, so Watch
+  // Party gets no target (its sheet asks for one) until the unscoped list does.
+  const firstUnwatched = unscopedPending
+    ? undefined
+    : (playableEpisodes.find((episode) => !episode.user_data?.played) ?? playableEpisodes[0]);
   const watchTogether = useDetailWatchTogether({
     item,
     target: firstUnwatched
@@ -93,7 +103,7 @@ export default function SeasonContent({ item }: { item: ItemDetail & { type: "se
     initialSeasonNumber: item.season_number ?? undefined,
   });
   const episodeLinkState: EpisodeNavigationState = {
-    parentSeasonHref: `/item/${item.content_id}`,
+    parentSeasonHref: buildItemHref({ contentId: item.content_id, libraryId }),
     parentSeasonLabel: label,
   };
 
@@ -102,10 +112,7 @@ export default function SeasonContent({ item }: { item: ItemDetail & { type: "se
 
   const breadcrumb = (
     <DetailBreadcrumb
-      segments={[
-        { label: seriesTitle, href: seriesId ? `/item/${seriesId}` : "/" },
-        { label: seasonIndicator },
-      ]}
+      segments={[{ label: seriesTitle, href: seriesHref }, { label: seasonIndicator }]}
     />
   );
 
@@ -115,7 +122,7 @@ export default function SeasonContent({ item }: { item: ItemDetail & { type: "se
     return (
       <div className="px-4 py-6 sm:px-6 sm:py-10 lg:px-12">
         <ViewTransitionLink
-          to={seriesId ? `/item/${seriesId}` : "/"}
+          to={seriesHref}
           up
           className="text-muted-foreground hover:text-foreground text-sm"
         >
@@ -160,9 +167,7 @@ export default function SeasonContent({ item }: { item: ItemDetail & { type: "se
               contentId={item.content_id}
               canAddToCollection={false}
               watchTogether={watchTogether.menu}
-              playHref={
-                playableEpisodes[0] ? `/watch/${playableEpisodes[0].content_id}` : undefined
-              }
+              playHref={firstEpisode ? `/watch/${firstEpisode.content_id}` : undefined}
               playLabel="Play First Episode"
               onRefresh={
                 canCurateMetadata
@@ -171,7 +176,9 @@ export default function SeasonContent({ item }: { item: ItemDetail & { type: "se
                         item,
                         mode,
                         onReplaced: (contentID) =>
-                          navigate(`/item/${contentID}`, { replace: true }),
+                          navigate(buildItemHref({ contentId: contentID, libraryId }), {
+                            replace: true,
+                          }),
                       })
                   : undefined
               }
@@ -180,9 +187,7 @@ export default function SeasonContent({ item }: { item: ItemDetail & { type: "se
               canCurateMetadata={canCurateMetadata}
               onEditMetadata={canCurateMetadata ? () => setEditOpen(true) : undefined}
               onShuffle={
-                playableEpisodes.length > 1
-                  ? () => startShuffle({ kind: "season", id: item.content_id })
-                  : undefined
+                canShuffle ? () => startShuffle({ kind: "season", id: item.content_id }) : undefined
               }
             />
           }
@@ -211,8 +216,10 @@ export default function SeasonContent({ item }: { item: ItemDetail & { type: "se
 
             <SeasonEpisodeGrid
               episodes={episodes}
+              playbackEpisodes={playbackEpisodes}
               isLoading={episodesLoading}
               episodeLinkState={episodeLinkState}
+              libraryId={libraryId}
             />
           </section>
         </div>

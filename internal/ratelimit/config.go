@@ -77,14 +77,9 @@ func ConfigFromSettings(all map[string]string) Config {
 	return cfg
 }
 
-// SeedDefaults writes default rate limit settings if they don't exist yet.
-func SeedDefaults(ctx context.Context, store SettingsStore) error {
-	all, err := store.GetAll(ctx)
-	if err != nil {
-		return fmt.Errorf("seed rate limit defaults: %w", err)
-	}
-
-	defaults := map[string]string{
+// DefaultSettings are the rate limit settings SeedDefaults writes, by key.
+func DefaultSettings() map[string]string {
+	return map[string]string{
 		"ratelimit.enabled":                                  "true",
 		globalRequestsPerSecondSetting:                       "1000",
 		"ratelimit.tier.standard.requests_per_second":        "20",
@@ -114,6 +109,15 @@ func SeedDefaults(ctx context.Context, store SettingsStore) error {
 		"ratelimit.auth.device_poll.requests_per_minute":     "120",
 		"ratelimit.auth.device_poll.burst":                   "30",
 	}
+}
+
+// SeedDefaults writes default rate limit settings if they don't exist yet.
+func SeedDefaults(ctx context.Context, store SettingsStore) error {
+	all, err := store.GetAll(ctx)
+	if err != nil {
+		return fmt.Errorf("seed rate limit defaults: %w", err)
+	}
+	defaults := DefaultSettings()
 
 	// Sort keys for deterministic seeding order
 	keys := make([]string, 0, len(defaults))

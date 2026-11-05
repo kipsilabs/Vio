@@ -14,6 +14,8 @@ import (
 	"unicode/utf8"
 
 	"golang.org/x/sync/errgroup"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/Silo-Server/silo-server/internal/access"
 	"github.com/Silo-Server/silo-server/internal/idgen"
@@ -48,14 +50,6 @@ const externalIDHydrationConcurrency = 4
 
 const certificationHydrationConcurrency = 8
 
-// VirtualLibraryRequestsCapability is the request_router.v1 capability sub-id
-// served by the core virtual library (installation 0), not by a plugin.
-const (
-	VirtualLibraryRequestsCapability = "virtual-library-requests"
-	VirtualLibraryBaseURL            = "virtual://streaming"
-	VirtualLibraryAPIKey             = "core-managed"
-)
-
 type EntitlementResolver interface {
 	// MaxPlaybackQuality returns the requester's effective playback-quality
 	// ceiling (already combining account- and profile-level caps). Empty string
@@ -85,35 +79,17 @@ type TVDBIDResolver interface {
 	ResolveSeriesTVDBID(ctx context.Context, tmdbID int, imdbID string) (int, error)
 }
 
-// SeriesSeasonProvider reads a series' season list from TVDB. The request paths
-// prefer it over TMDB, whose grouping collapses long anime into few seasons.
-//
-// The result type is local because requests cannot import internal/metadata:
-// metadata imports internal/notifications, which imports requests. The API
-// layer adapts the metadata service to this interface.
-type SeriesSeasonProvider interface {
-	FetchSeriesTVDBSeasons(ctx context.Context, tvdbID int, language string) ([]SeriesSeason, error)
-}
-
 type Service struct {
-	store                   Store
-	tmdb                    TMDBClient
-	animeIndex              AnimeIndex
-	presence                PresenceResolver
-	router                  RequestRouterProvider
-	entitlements            EntitlementResolver
-	groupProvider           access.GroupPolicyProvider
-	users                   access.UserRepository
-	requesterIdentity       RequesterIdentityResolver
-	tvdbResolver            TVDBIDResolver
-	seriesSeasonProvider    SeriesSeasonProvider
-	hasDefaultVirtualRouter func() bool
-	catalogChanged          func()
-	cleanupVirtual          func(context.Context, Request) error
-	// enrichAsync schedules the enrichment CreateRequest defers past the 201.
-	// Production leaves it nil to run the work on a goroutine detached from the
-	// request context; tests replace it to run the step explicitly.
-	enrichAsync       func(func())
+	store             Store
+	tmdb              TMDBClient
+	animeIndex        AnimeIndex
+	presence          PresenceResolver
+	router            RequestRouterProvider
+	entitlements      EntitlementResolver
+	groupProvider     access.GroupPolicyProvider
+	users             access.UserRepository
+	requesterIdentity RequesterIdentityResolver
+	tvdbResolver      TVDBIDResolver
 	notifier          FulfillmentNotifier
 	lifecycle         LifecycleNotifier
 	watchlistPref     WatchlistPreference
@@ -150,18 +126,6 @@ func NewService(store Store, tmdbClient TMDBClient, presence PresenceResolver) *
 
 func (s *Service) SetRouterProvider(p RequestRouterProvider) { s.router = p }
 
-func (s *Service) SetDefaultVirtualRouter(enabled func() bool) { s.hasDefaultVirtualRouter = enabled }
-
-// SetCatalogChangeNotifier installs the cache/event hook used when a request
-// router may have registered media directly in the catalog during Fulfill.
-func (s *Service) SetCatalogChangeNotifier(notify func()) { s.catalogChanged = notify }
-
-// SetVirtualMediaCleanup installs the host catalog cleanup hook used when a
-// pending request is canceled. The hook must preserve physical files.
-func (s *Service) SetVirtualMediaCleanup(cleanup func(context.Context, Request) error) {
-	s.cleanupVirtual = cleanup
-}
-
 func (s *Service) SetEntitlementResolver(r EntitlementResolver) { s.entitlements = r }
 
 func (s *Service) SetGroupPolicyProvider(p access.GroupPolicyProvider) { s.groupProvider = p }
@@ -177,10 +141,6 @@ func (s *Service) SetRequesterIdentityResolver(r RequesterIdentityResolver) {
 // SetTVDBIDResolver wires the metadata-provider fallback used when TMDB has no
 // TVDB ID for a requested series.
 func (s *Service) SetTVDBIDResolver(r TVDBIDResolver) { s.tvdbResolver = r }
-
-// SetSeriesSeasonProvider wires the TVDB season source used in preference to
-// TMDB's season list for series requests.
-func (s *Service) SetSeriesSeasonProvider(p SeriesSeasonProvider) { s.seriesSeasonProvider = p }
 
 // populateRequesterIdentity fills req.RequesterEmail/Username from the resolver.
 // Nil resolver or any error leaves them empty (the plugin then behaves as admin).
@@ -488,45 +448,22 @@ func (s *Service) resolveRouterConnections(ctx context.Context, fc *fulfillConte
 		if chosen && (*in.InstallationID != installationID || in.CapabilityID != capabilityID) {
 			continue
 		}
-		// in.APIKeyRef was decrypted by the repo on read; empty means unconfigured.
-		apiKey := strings.TrimSpace(in.APIKeyRef)
-		baseURL := in.BaseURL
-		if isVirtualIntegration(in.InstallationID, in.CapabilityID) { //nolint:nestif // upstream resolveRouterConnections in service.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
-			// The core virtual library has no plugin credentials to declare;
-			// it always carries the core-managed placeholders.
-			if apiKey == "" {
-				apiKey = VirtualLibraryAPIKey
-			}
-			if strings.TrimSpace(baseURL) == "" {
-				baseURL = VirtualLibraryBaseURL
-			}
-		} else {
-			missing, err := s.missingAPIKey(ctx, fc, in)
-			if err != nil {
-				slog.WarnContext(ctx, "requests: skipping router connection whose plugin's api key declaration cannot be read", "component", "requests", "connection_id", in.ID, "err", err)
-				readErr = err
-				continue
-			}
-			if missing {
-				slog.WarnContext(ctx, "requests: skipping router connection with no api key", "component", "requests", "connection_id", in.ID)
-				continue
-			}
+		missing, err := s.missingAPIKey(ctx, fc, in)
+		if err != nil {
+			slog.WarnContext(ctx, "requests: skipping router connection whose plugin's api key declaration cannot be read", "component", "requests", "connection_id", in.ID, "err", err)
+			readErr = err
+			continue
+		}
+		if missing {
+			slog.WarnContext(ctx, "requests: skipping router connection with no api key", "component", "requests", "connection_id", in.ID)
+			continue
 		}
 		// Lock on the first SUCCESSFULLY resolved connection so a skipped
 		// bad-key connection never pins the installation/capability.
 		if !chosen {
 			installationID, capabilityID, chosen = *in.InstallationID, in.CapabilityID, true
 		}
-		conns = append(conns, ResolvedRouterConnection{ID: in.ID, BaseURL: baseURL, APIKey: apiKey, Config: in.PluginConfig})
-	}
-	if len(conns) == 0 && s.hasActiveDefaultVirtualRouter() {
-		conns = []ResolvedRouterConnection{{
-			ID:      "core-virtual-library",
-			BaseURL: VirtualLibraryBaseURL,
-			APIKey:  VirtualLibraryAPIKey,
-			Config:  map[string]any{},
-		}}
-		return conns, 0, VirtualLibraryRequestsCapability, nil
+		conns = append(conns, ResolvedRouterConnection{ID: in.ID, BaseURL: in.BaseURL, APIKey: strings.TrimSpace(in.APIKeyRef), Config: in.PluginConfig})
 	}
 	if len(conns) == 0 && readErr != nil {
 		return nil, 0, "", readErr
@@ -543,11 +480,6 @@ func (s *Service) resolveRouterConnections(ctx context.Context, fc *fulfillConte
 // missing and the error is returned.
 func (s *Service) missingAPIKey(ctx context.Context, fc *fulfillContext, in Integration) (bool, error) {
 	if strings.TrimSpace(in.APIKeyRef) != "" {
-		return false, nil
-	}
-	if isVirtualIntegration(in.InstallationID, in.CapabilityID) {
-		// The core virtual library has no plugin to declare a key requirement
-		// and always runs with its core-managed placeholder credentials.
 		return false, nil
 	}
 	if in.InstallationID == nil || in.CapabilityID == "" {
@@ -619,12 +551,6 @@ func routerConfiguredFor(fc *fulfillContext, mediaType MediaType) bool {
 	return false
 }
 
-// hasActiveDefaultVirtualRouter reports whether the implicit core virtual
-// router serves requests even with no integration row configured.
-func (s *Service) hasActiveDefaultVirtualRouter() bool {
-	return s.hasDefaultVirtualRouter != nil && s.hasDefaultVirtualRouter()
-}
-
 // skippedRouterConnection reports whether resolveRouterConnections leaves out
 // a connection that would otherwise serve the media type, because it has no
 // API key and its plugin needs one.
@@ -675,16 +601,6 @@ func (s *Service) Search(ctx context.Context, viewer Viewer, query string, media
 // request-state signals used by search and discovery. Recommendations carry
 // their own per-item state so the detail page can render them as request cards.
 func (s *Service) GetDetail(ctx context.Context, viewer Viewer, mediaType MediaType, tmdbID int) (*MediaDetail, error) {
-	return s.getDetail(ctx, viewer, mediaType, tmdbID, "")
-}
-
-// GetDetailWithSeasonSource is GetDetail with an explicit series season
-// numbering source. An empty source keeps the default TVDB-preferred path.
-func (s *Service) GetDetailWithSeasonSource(ctx context.Context, viewer Viewer, mediaType MediaType, tmdbID int, seasonSource string) (*MediaDetail, error) {
-	return s.getDetail(ctx, viewer, mediaType, tmdbID, seasonSource)
-}
-
-func (s *Service) getDetail(ctx context.Context, viewer Viewer, mediaType MediaType, tmdbID int, preferredSeasonSource string) (*MediaDetail, error) {
 	if s == nil || s.store == nil || s.tmdb == nil {
 		return nil, fmt.Errorf("request service is not configured")
 	}
@@ -716,9 +632,22 @@ func (s *Service) getDetail(ctx context.Context, viewer Viewer, mediaType MediaT
 	// country's cert, and a foreign "PG"/"G" is the same string as the US
 	// rating, so it would pass the US ladder. ErrNotFound rather than
 	// ErrForbidden: a restricted profile shouldn't learn the title exists.
-	ceiling, err := s.detailRatingCeiling(ctx, viewer, mediaType, tmdbID)
+	ceiling, err := s.viewerContentCeiling(ctx, viewer)
 	if err != nil {
 		return nil, err
+	}
+	if ceiling != "" {
+		client, ok := s.tmdb.(TMDBCertificationClient)
+		if !ok {
+			return nil, fmt.Errorf("requests: tmdb client cannot resolve certifications")
+		}
+		cert, err := client.GetCertification(ctx, tmdbMediaType(mediaType), tmdbID)
+		if err != nil {
+			return nil, err
+		}
+		if !access.RatingAllowed(cert, ceiling) {
+			return nil, ErrNotFound
+		}
 	}
 
 	policy, err := s.EffectivePolicy(ctx, viewer.UserID)
@@ -742,15 +671,27 @@ func (s *Service) getDetail(ctx context.Context, viewer Viewer, mediaType MediaT
 	// A series counts as available only when every aired season is complete;
 	// until then its missing seasons can be requested.
 	available := primaryMatch.Available
-	var (
-		seasons        []RequestSeason
-		resolvedTVDBID int
-		fromTVDB       bool
-	)
+	var seasons []RequestSeason
 	if mediaType == MediaTypeSeries {
-		seasons, resolvedTVDBID, fromTVDB, available, err = s.seriesDetailSeasons(ctx, raw, primaryMatch, primaryRequests, preferredSeasonSource)
+		counts, err := s.seasonCounts(ctx, primaryMatch)
 		if err != nil {
 			return nil, err
+		}
+		seasons = requestSeasons(raw, counts, primaryRequests[raw.ID])
+		if active := primaryRequests[raw.ID]; active != nil && len(active.Seasons) > 0 && counts != nil {
+			// Attach the season progress the request lists attach, so the
+			// state can read partially available or available.
+			withProgress := *active
+			withProgress.LibraryContentID = primaryMatch.ContentID
+			withProgress.SeasonProgress = seasonProgress(active.Seasons, counts)
+			primaryRequests[raw.ID] = &withProgress
+		}
+		if available && seriesHasOpenSeason(raw, counts) {
+			more, err := s.moreSeasonsRequestable(ctx)
+			if err != nil {
+				return nil, err
+			}
+			available = !more
 		}
 	}
 	primaryState := requestStateFor(viewer, policy, available, primaryRequests[raw.ID])
@@ -759,98 +700,6 @@ func (s *Service) getDetail(ctx context.Context, viewer Viewer, mediaType MediaT
 		return nil, err
 	}
 
-	detail := mediaDetailOf(raw, mediaType, primaryMatch, primaryState, seasons, resolvedTVDBID, fromTVDB)
-
-	if len(raw.Recommendations) > 0 {
-		recPage := &tmdb.MediaPage{Results: raw.Recommendations}
-		enriched, err := s.enrichPageWithCeiling(ctx, viewer, recPage, ceiling)
-		if err != nil {
-			return nil, err
-		}
-		detail.Recommendations = enriched.Results
-	}
-
-	return detail, nil
-}
-
-// detailRatingCeiling enforces the viewer's content ceiling for a detail read
-// and returns the ceiling for the recommendation enrichment that follows.
-func (s *Service) detailRatingCeiling(ctx context.Context, viewer Viewer, mediaType MediaType, tmdbID int) (string, error) {
-	ceiling, err := s.viewerContentCeiling(ctx, viewer)
-	if err != nil {
-		return "", err
-	}
-	if ceiling == "" {
-		return "", nil
-	}
-	client, ok := s.tmdb.(TMDBCertificationClient)
-	if !ok {
-		return "", errors.New("requests: tmdb client cannot resolve certifications")
-	}
-	cert, err := client.GetCertification(ctx, tmdbMediaType(mediaType), tmdbID)
-	if err != nil {
-		return "", err
-	}
-	if !access.RatingAllowed(cert, ceiling) {
-		return "", ErrNotFound
-	}
-	return ceiling, nil
-}
-
-// seriesDetailSeasons builds the season list and availability signals for a
-// series detail read, including the active request's season progress.
-func (s *Service) seriesDetailSeasons(
-	ctx context.Context,
-	raw *tmdb.MediaDetail,
-	match PresenceMatch,
-	active map[int]*Request,
-	preferredSeasonSource string,
-) ([]RequestSeason, int, bool, bool, error) {
-	seasonSource, resolvedTVDBID, fromTVDB, _, err := s.seriesSeasonSource(ctx, raw, raw.TVDBID, preferredSeasonSource)
-	if err != nil {
-		return nil, 0, false, match.Available, err
-	}
-	counts, err := s.seasonCounts(ctx, match)
-	if err != nil {
-		return nil, 0, false, match.Available, err
-	}
-	if !seasonCountsCompatible(fromTVDB, match) {
-		// The catalog and the request list use different season numbering.
-		// Integer season joins would mark the wrong seasons available.
-		counts = nil
-	}
-	activeRequest := active[raw.ID]
-	seasons := requestSeasons(seasonSource, counts, activeRequest)
-	if activeRequest != nil && len(activeRequest.Seasons) > 0 && counts != nil {
-		// Attach the season progress the request lists attach, so the state
-		// can read partially available or available.
-		withProgress := *activeRequest
-		withProgress.LibraryContentID = match.ContentID
-		withProgress.SeasonProgress = seasonProgress(activeRequest.Seasons, counts)
-		active[raw.ID] = &withProgress
-	}
-	available := match.Available
-	if available && seriesHasOpenSeason(seasonSource, counts) {
-		more, err := s.moreSeasonsRequestable(ctx)
-		if err != nil {
-			return nil, 0, false, available, err
-		}
-		available = !more
-	}
-	return seasons, resolvedTVDBID, fromTVDB, available, nil
-}
-
-// mediaDetailOf turns a TMDB detail response into the request detail payload,
-// including the source-specific season totals and TVDB identifier.
-func mediaDetailOf(
-	raw *tmdb.MediaDetail,
-	mediaType MediaType,
-	match PresenceMatch,
-	state RequestState,
-	seasons []RequestSeason,
-	resolvedTVDBID int,
-	fromTVDB bool,
-) *MediaDetail {
 	detail := &MediaDetail{
 		MediaType:           mediaType,
 		TMDBID:              raw.ID,
@@ -878,34 +727,12 @@ func mediaDetailOf(
 		Networks:            raw.Networks,
 		Director:            raw.Director,
 		Creators:            raw.Creators,
-		Availability:        availabilityValue(match.Available),
-		LibraryContentID:    match.ContentID,
-		Request:             state,
+		Availability:        availabilityValue(primaryMatch.Available),
+		LibraryContentID:    primaryMatch.ContentID,
+		Request:             primaryState,
 		Seasons:             seasons,
 	}
-	if fromTVDB {
-		seasonsCount, episodesCount := 0, 0
-		for _, season := range seasons {
-			if season.Number <= 0 {
-				continue
-			}
-			seasonsCount++
-			episodesCount += season.EpisodeCount
-		}
-		detail.NumberOfSeasons, detail.NumberOfEpisodes = seasonsCount, episodesCount
-	}
-	if mediaType == MediaTypeSeries {
-		switch {
-		case fromTVDB:
-			detail.SeasonSource = SeasonSourceTVDB
-		case len(seasons) > 0:
-			detail.SeasonSource = SeasonSourceTMDB
-		}
-	}
-	if resolvedTVDBID > 0 {
-		tvdb := resolvedTVDBID
-		detail.TVDBID = &tvdb
-	} else if raw.TVDBID > 0 {
+	if raw.TVDBID > 0 {
 		tvdb := raw.TVDBID
 		detail.TVDBID = &tvdb
 	}
@@ -920,7 +747,17 @@ func mediaDetailOf(
 			})
 		}
 	}
-	return detail
+
+	if len(raw.Recommendations) > 0 {
+		recPage := &tmdb.MediaPage{Results: raw.Recommendations}
+		enriched, err := s.enrichPageWithCeiling(ctx, viewer, recPage, ceiling)
+		if err != nil {
+			return nil, err
+		}
+		detail.Recommendations = enriched.Results
+	}
+
+	return detail, nil
 }
 
 func (s *Service) CreateRequest(ctx context.Context, viewer Viewer, input CreateRequestInput) (*Request, error) {
@@ -940,21 +777,27 @@ func (s *Service) CreateRequest(ctx context.Context, viewer Viewer, input Create
 	if err != nil {
 		return nil, err
 	}
-	normalized.SeasonSource = requestSeasonSource(normalized.SeasonSource)
 	if err := s.ensureCreateAllowedByCeiling(ctx, viewer, normalized); err != nil {
 		return nil, err
 	}
-	// The cheap local refusals run before any external call, so a bulk client
-	// retrying a title after a client-side timeout gets its 409 in
-	// milliseconds instead of after TMDB/TVDB round trips. The duplicate check
-	// runs before the TMDB read the next block may make.
+	tvdbLookupFailed := s.enrichExternalIDs(ctx, &normalized)
+
 	matches, err := s.lookupPresence(ctx, normalized.MediaType, []PresenceCandidate{createPresenceCandidate(normalized)})
 	if err != nil {
 		return nil, err
 	}
 	match := matches[normalized.TMDBID]
-	if err := s.refuseUnavailable(ctx, normalized, match); err != nil {
-		return nil, err
+	if match.Available {
+		if normalized.MediaType == MediaTypeMovie || normalized.WholeSeries {
+			return nil, ErrAlreadyAvailable
+		}
+		more, err := s.moreSeasonsRequestable(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if !more {
+			return nil, ErrAlreadyAvailable
+		}
 	}
 
 	active, err := s.store.ListActiveByTMDB(ctx, normalized.MediaType, []int{normalized.TMDBID})
@@ -965,70 +808,39 @@ func (s *Service) CreateRequest(ctx context.Context, viewer Viewer, input Create
 		return nil, ErrAlreadyRequested
 	}
 
-	// A series request cannot defer its TMDB read: its seasons are checked and
-	// defaulted from the title's season list, and the TVDB cross-reference TMDB
-	// supplies (directly or through a metadata provider) is what the router
-	// plugin needs. Both belong in the response and in a synchronous refusal.
-	// A v1 create also keeps the read: WholeSeries marks v1, whose frozen
-	// response must carry the server's title exactly as before. Only a v2
-	// movie defers the read past the 201: its display fields come from the
-	// client, and its routing facts and external IDs are backfilled by the
-	// enrichment step below.
-	enrichNow := normalized.MediaType == MediaTypeSeries || normalized.WholeSeries
-	var (
-		facts            RoutingFacts
-		tvdbLookupFailed bool
-	)
-	if enrichNow {
-		tvdbLookupFailed = s.enrichExternalIDs(ctx, &normalized)
-		// The TMDB lookup may have supplied the TVDB/IMDb IDs a series is
-		// matched in the library by. Re-check with them, so a series already
-		// present under its TVDB ID is refused rather than requested again.
-		if !match.Available {
-			hydrated, err := s.lookupPresence(ctx, normalized.MediaType, []PresenceCandidate{createPresenceCandidate(normalized)})
-			if err != nil {
-				return nil, err
-			}
-			if hm := hydrated[normalized.TMDBID]; hm.Available {
-				match = hm
-				if err := s.refuseUnavailable(ctx, normalized, match); err != nil {
-					return nil, err
-				}
-			}
+	// One TMDB detail read, after the cheap refusals, serves routing and the
+	// stored title: the server's copy of the title and year wins over the
+	// client's.
+	detail := s.requestDetail(ctx, normalized.MediaType, normalized.TMDBID)
+	if detail != nil {
+		if title := strings.TrimSpace(detail.Title); title != "" {
+			normalized.Title = title
 		}
-		detail := s.requestDetail(ctx, normalized.MediaType, normalized.TMDBID)
-		normalized = applyRequestDetail(normalized, detail)
-		facts = s.routingFacts(ctx, detail)
-		if normalized.MediaType == MediaTypeSeries {
-			// A series partly in the library can still be requested for the
-			// seasons it is missing. Prefer TVDB's season list, which keeps a
-			// long anime's seasons apart where TMDB groups them. Resolve and
-			// freeze the actual source even for a whole-series request so
-			// fulfillment does not later pick a different provider chain.
-			tvdbID := 0
-			if detail != nil {
-				tvdbID = detail.TVDBID
-			}
-			if tvdbID == 0 && normalized.TVDBID != nil {
-				tvdbID = *normalized.TVDBID
-			}
-			seasonSource, _, fromTVDB, sourceAvailable, sourceErr := s.seriesSeasonSource(ctx, detail, tvdbID, normalized.SeasonSource)
-			if sourceErr != nil {
-				return nil, sourceErr
-			}
-			if fromTVDB {
-				normalized.SeasonSource = SeasonSourceTVDB
-			} else if sourceAvailable {
-				normalized.SeasonSource = SeasonSourceTMDB
-			}
-			if !normalized.WholeSeries {
-				seasons, err := s.resolveRequestedSeasons(ctx, normalized.Seasons, seasonSource, sourceAvailable, match, seasonCountsCompatible(fromTVDB, match))
-				if err != nil {
-					return nil, err
-				}
-				normalized.Seasons = seasons
-			}
+		if detail.Year > 0 {
+			year := detail.Year
+			normalized.Year = &year
 		}
+		// A caller without the display fields (a watchlist add keeps only
+		// its own snapshot) gets TMDB's; one that sent them keeps its own.
+		if normalized.Overview == "" {
+			normalized.Overview = strings.TrimSpace(detail.Overview)
+		}
+		if normalized.PosterPath == "" {
+			normalized.PosterPath = strings.TrimSpace(detail.PosterPath)
+		}
+		if normalized.BackdropPath == "" {
+			normalized.BackdropPath = strings.TrimSpace(detail.BackdropPath)
+		}
+	}
+	facts := s.routingFacts(ctx, detail)
+	if normalized.MediaType == MediaTypeSeries && !normalized.WholeSeries {
+		// A series partly in the library can still be requested for the
+		// seasons it is missing.
+		seasons, err := s.resolveRequestedSeasons(ctx, normalized.Seasons, detail, match)
+		if err != nil {
+			return nil, err
+		}
+		normalized.Seasons = seasons
 	}
 
 	policy, err := s.EffectivePolicy(ctx, viewer.UserID)
@@ -1088,65 +900,11 @@ func (s *Service) CreateRequest(ctx context.Context, viewer Viewer, input Create
 		// Auto-approval is a real approval transition; channels subscribed to
 		// approvals see it alongside the submission.
 		s.notifyApproval(ctx, *req, ApprovalOriginPolicy)
-		// Only a request enriched before the insert has its external IDs
-		// resolved; a deferred one lets the submission path resolve them, and
-		// records the lookup outcome the same way.
-		req.externalIDsResolved = enrichNow
+		req.externalIDsResolved = true
 		req.tvdbLookupFailed = tvdbLookupFailed
-		req = s.submitAfterCommit(ctx, *req, viewer)
-	}
-	if !enrichNow {
-		s.scheduleEnrichment(ctx, req.ID)
+		return s.withLibraryContent(ctx, s.submitAfterCommit(ctx, *req, viewer)), nil
 	}
 	return s.withLibraryContent(ctx, req), nil
-}
-
-// refuseUnavailable applies the library-availability rule to a presence match:
-// a movie or a whole-series request is refused once the title is in the
-// library, and a series request only when no further season is requestable.
-// A match that is not available (or a series with seasons left) passes.
-func (s *Service) refuseUnavailable(ctx context.Context, input CreateRequestInput, match PresenceMatch) error {
-	if !match.Available {
-		return nil
-	}
-	if input.MediaType == MediaTypeMovie || input.WholeSeries {
-		return ErrAlreadyAvailable
-	}
-	more, err := s.moreSeasonsRequestable(ctx)
-	if err != nil {
-		return err
-	}
-	if !more {
-		return ErrAlreadyAvailable
-	}
-	return nil
-}
-
-// applyRequestDetail folds a TMDB detail into a create input: the server's
-// title and year replace the client's, and the display fields the caller
-// omitted are filled from TMDB. A nil detail (TMDB unreachable) changes
-// nothing.
-func applyRequestDetail(input CreateRequestInput, detail *tmdb.MediaDetail) CreateRequestInput {
-	if detail == nil {
-		return input
-	}
-	if title := strings.TrimSpace(detail.Title); title != "" {
-		input.Title = title
-	}
-	if detail.Year > 0 {
-		year := detail.Year
-		input.Year = &year
-	}
-	if input.Overview == "" {
-		input.Overview = strings.TrimSpace(detail.Overview)
-	}
-	if input.PosterPath == "" {
-		input.PosterPath = strings.TrimSpace(detail.PosterPath)
-	}
-	if input.BackdropPath == "" {
-		input.BackdropPath = strings.TrimSpace(detail.BackdropPath)
-	}
-	return input
 }
 
 func (s *Service) ListMine(ctx context.Context, viewer Viewer, filter ListFilter) ([]*Request, error) {
@@ -1290,8 +1048,7 @@ func (s *Service) attachLibraryContent(ctx context.Context, reqs ...*Request) er
 			}
 			for _, req := range requestsByKey[requestKey{mediaType: mediaType, tmdbID: tmdbID}] {
 				req.LibraryContentID = match.ContentID
-				if req.MediaType == MediaTypeSeries && len(req.Seasons) > 0 &&
-					requestSeasonCountsCompatible(req.SeasonSource, match) {
+				if req.MediaType == MediaTypeSeries && len(req.Seasons) > 0 {
 					seasonRequests[match.ContentID] = append(seasonRequests[match.ContentID], req)
 				}
 			}
@@ -1428,11 +1185,6 @@ func (s *Service) cancel(ctx context.Context, viewer Viewer, id, reason string, 
 	withdrawn, err := s.store.SetOutcome(ctx, req.ID, guard, OutcomeCancelled, viewer, reason)
 	if err != nil {
 		return nil, err
-	}
-	if s.cleanupVirtual != nil {
-		if err := s.cleanupVirtual(ctx, *withdrawn); err != nil {
-			slog.WarnContext(ctx, "requests: canceled virtual media cleanup failed", "component", "requests", "request_id", req.ID, "error", err)
-		}
 	}
 	return withdrawn, nil
 }
@@ -1664,14 +1416,6 @@ func (s *Service) CreateIntegration(ctx context.Context, viewer Viewer, in Integ
 		return nil, err
 	}
 	in.ID = id
-	if isVirtualIntegration(in.InstallationID, in.CapabilityID) {
-		if strings.TrimSpace(in.BaseURL) == "" {
-			in.BaseURL = VirtualLibraryBaseURL
-		}
-		if strings.TrimSpace(in.APIKeyRef) == "" {
-			in.APIKeyRef = VirtualLibraryAPIKey
-		}
-	}
 	if err := validateInstance(&in); err != nil {
 		return nil, err
 	}
@@ -1688,14 +1432,6 @@ func (s *Service) UpdateIntegration(ctx context.Context, viewer Viewer, in Integ
 	if strings.TrimSpace(in.ID) == "" {
 		return nil, fmt.Errorf("%w: integration id required", ErrInvalidInput)
 	}
-	if isVirtualIntegration(in.InstallationID, in.CapabilityID) {
-		if strings.TrimSpace(in.BaseURL) == "" {
-			in.BaseURL = VirtualLibraryBaseURL
-		}
-		if strings.TrimSpace(in.APIKeyRef) == "" {
-			in.APIKeyRef = VirtualLibraryAPIKey
-		}
-	}
 	if err := validateInstance(&in); err != nil {
 		return nil, err
 	}
@@ -1708,37 +1444,12 @@ func (s *Service) UpdateIntegration(ctx context.Context, viewer Viewer, in Integ
 	return s.store.SaveIntegrationWithDefaults(ctx, in, false)
 }
 
-// isVirtualRouterTarget mirrors compositeRequestRouter.isVirtual: installation 0
-// is the core virtual library, and the virtual-library-requests capability
-// sub-id is only ever served by it, never by a plugin.
-func isVirtualRouterTarget(installationID int, capabilityID string) bool {
-	return installationID <= 0 || capabilityID == VirtualLibraryRequestsCapability
-}
-
-func isVirtualIntegration(installationID *int, capabilityID string) bool {
-	return capabilityID == VirtualLibraryRequestsCapability || (installationID != nil && *installationID <= 0)
-}
-
-func (s *Service) virtualRouterAvailable() bool {
-	return s != nil && s.hasDefaultVirtualRouter != nil && s.hasDefaultVirtualRouter()
-}
-
 // validateViaPlugin asks the bound request_router plugin to validate the
 // connection config on save. Field/form errors are surfaced as *ValidationError
 // so the API layer can render them inline.
 func (s *Service) validateViaPlugin(ctx context.Context, in Integration) error {
 	if s.router == nil || in.InstallationID == nil {
 		return nil
-	}
-	if isVirtualRouterTarget(*in.InstallationID, in.CapabilityID) {
-		// The core virtual router has no plugin behind it: when the virtual
-		// library is dormant there is nothing to validate against, so reject
-		// the save as a client error instead of letting the plugin resolver
-		// fail with an opaque internal error.
-		if s.virtualRouterAvailable() {
-			return nil
-		}
-		return &ValidationError{FormError: "The virtual library is not configured on this server."}
 	}
 	// On UPDATE the client omits api_key_ref ("leave blank to keep saved key"),
 	// so we would otherwise validate against an empty credential. Mirror
@@ -1751,14 +1462,6 @@ func (s *Service) validateViaPlugin(ctx context.Context, in Integration) error {
 		stored, err := s.store.GetIntegration(ctx, in.ID)
 		if err != nil && !errors.Is(err, ErrNotFound) {
 			return err
-		}
-		if stored != nil {
-			sameInstallation := stored.InstallationID != nil && in.InstallationID != nil && *stored.InstallationID == *in.InstallationID
-			if !sameInstallation {
-				// Credentials and plugin config belong to the selected plugin. Never
-				// carry them across when an integration is rebound to another install.
-				stored = nil
-			}
 		}
 		if stored != nil {
 			// Don't pair a stored API key with a caller-changed base URL: require the
@@ -1890,23 +1593,45 @@ func (s *Service) LoadIntegrationOptions(ctx context.Context, viewer Viewer, int
 	if missing {
 		return nil, probeValidation(&ValidationError{FieldErrors: map[string]string{fieldAPIKey: integrationKeyMissing}})
 	}
-	apiKey := strings.TrimSpace(integration.APIKeyRef)
-	if apiKey == "" && isVirtualIntegration(integration.InstallationID, integration.CapabilityID) {
-		apiKey = VirtualLibraryAPIKey
-	}
 	if s.router == nil || integration.InstallationID == nil {
 		return nil, fmt.Errorf("no fulfillment backend configured")
 	}
-	baseURL := integration.BaseURL
-	if strings.TrimSpace(baseURL) == "" && isVirtualIntegration(integration.InstallationID, integration.CapabilityID) {
-		baseURL = VirtualLibraryBaseURL
+	conn := ResolvedRouterConnection{ID: integration.ID, BaseURL: integration.BaseURL, APIKey: strings.TrimSpace(integration.APIKeyRef), Config: integration.PluginConfig}
+	if integration.TestConnection {
+		if err := s.testIntegrationConnection(ctx, integration, conn); err != nil {
+			return nil, err
+		}
 	}
-	conn := ResolvedRouterConnection{ID: integration.ID, BaseURL: baseURL, APIKey: apiKey, Config: integration.PluginConfig}
 	options, err := s.router.ListConfigOptions(ctx, *integration.InstallationID, integration.CapabilityID, conn)
 	if err != nil {
 		return nil, classifyIntegrationError(err, integration.CapabilityID)
 	}
 	return options, nil
+}
+
+// testIntegrationConnection asks the router whether it can reach and sign in
+// to the server, since a router may answer an empty option list for a server
+// it cannot reach. The test is sent without the plugin config: the options
+// probe runs while that config is being edited, and a stale choice in it (a
+// server the router no longer lists) must not stop the options that replace
+// it from loading; save-time validation checks the config. A router that does
+// not implement the test is judged by its options. A failed test is
+// classified like a failed options load.
+func (s *Service) testIntegrationConnection(ctx context.Context, integration Integration, conn ResolvedRouterConnection) error {
+	conn.Config = nil
+	ok, message, err := s.router.TestConnection(ctx, *integration.InstallationID, integration.CapabilityID, conn)
+	switch {
+	case status.Code(err) == codes.Unimplemented:
+		return nil
+	case err != nil:
+		return classifyIntegrationError(err, integration.CapabilityID)
+	case !ok:
+		if strings.TrimSpace(message) == "" {
+			message = "connection test failed"
+		}
+		return classifyIntegrationError(errors.New(message), integration.CapabilityID)
+	}
+	return nil
 }
 
 func (s *Service) EffectivePolicy(ctx context.Context, userID int) (EffectivePolicy, error) {
@@ -1944,26 +1669,17 @@ func withPolicyCache(ctx context.Context) context.Context {
 	return context.WithValue(ctx, policyCacheKey{}, &policyCache{byUser: map[int]EffectivePolicy{}})
 }
 
-func (s *Service) resolvePolicy(ctx context.Context, userID int) (EffectivePolicy, error) {
-	settings, err := s.store.GetSettings(ctx)
-	if err != nil {
-		return EffectivePolicy{}, err
-	}
-	limit, err := s.store.GetUserLimit(ctx, userID)
-	if err != nil {
-		return EffectivePolicy{}, err
-	}
-	viewerAccess, err := s.viewerRequestAccess(ctx, userID)
-	if err != nil {
-		return EffectivePolicy{}, err
-	}
-
+// LayeredPolicy is the request policy an account gets, without its usage:
+// the server's settings, then its access group's limits, then its own, a
+// layer set to inherit deferring to the next; allowed is the account's
+// requests switch. Every reader of an account's request authority uses it.
+func LayeredPolicy(settings Settings, allowed bool, group *GroupLimit, limit *UserLimit) EffectivePolicy {
 	policy := EffectivePolicy{
 		RequestsEnabled: settings.RequestsEnabled,
 		MaxRequests:     settings.GlobalMaxRequests,
 		WindowDays:      settings.GlobalWindowDays,
 		AutoApprove:     settings.GlobalAutoApprovalEnabled,
-		Blocked:         !viewerAccess.allowed,
+		Blocked:         !allowed,
 	}
 	if policy.WindowDays <= 0 {
 		policy.WindowDays = 7
@@ -1973,7 +1689,7 @@ func (s *Service) resolvePolicy(ctx context.Context, userID int) (EffectivePolic
 	limitMode, maxRequests, windowDays := LimitModeInherit, (*int)(nil), (*int)(nil)
 	approval := ApprovalModeInherit
 	layers := []*UserLimit{}
-	if g := viewerAccess.group; g != nil {
+	if g := group; g != nil {
 		layers = append(layers, &UserLimit{LimitMode: g.LimitMode, MaxRequests: g.MaxRequests, WindowDays: g.WindowDays, ApprovalMode: g.ApprovalMode})
 	}
 	if limit != nil {
@@ -2009,6 +1725,28 @@ func (s *Service) resolvePolicy(ctx context.Context, userID int) (EffectivePolic
 		policy.AutoApprove = true
 	}
 
+	return policy
+}
+
+func (s *Service) resolvePolicy(ctx context.Context, userID int) (EffectivePolicy, error) {
+	settings, err := s.store.GetSettings(ctx)
+	if err != nil {
+		return EffectivePolicy{}, err
+	}
+	limit, err := s.store.GetUserLimit(ctx, userID)
+	if err != nil {
+		return EffectivePolicy{}, err
+	}
+	viewerAccess, err := s.viewerRequestAccess(ctx, userID)
+	if err != nil {
+		return EffectivePolicy{}, err
+	}
+
+	var group *GroupLimit
+	if viewerAccess.group != nil {
+		group = viewerAccess.group
+	}
+	policy := LayeredPolicy(settings, viewerAccess.allowed, group, limit)
 	policy.WindowStart = s.now().AddDate(0, 0, -policy.WindowDays)
 	if !policy.Unlimited {
 		used, err := s.store.CountUserRequestsSince(ctx, userID, policy.WindowStart)
@@ -2287,96 +2025,6 @@ func (s *Service) enrichExternalIDs(ctx context.Context, input *CreateRequestInp
 	return tmdbFailed && input.MediaType == MediaTypeSeries && input.TVDBID == nil
 }
 
-// enrichmentTimeout bounds the deferred enrichment's external calls after the
-// request context is gone.
-const enrichmentTimeout = 2 * time.Minute
-
-// scheduleEnrichment runs a request's deferred TMDB enrichment after the 201.
-// It is best effort and detached from the request context: the durable request
-// row is the source of truth, so if the process dies mid-enrichment the
-// submission path backfills the routing facts (ensureRoutingFacts) and the
-// series path resolves the TVDB cross-reference again (ensureSeriesTVDBID).
-func (s *Service) scheduleEnrichment(ctx context.Context, id string) {
-	if id == "" {
-		return
-	}
-	base := context.WithoutCancel(ctx)
-	run := func() {
-		enrichCtx, cancel := context.WithTimeout(base, enrichmentTimeout)
-		defer cancel()
-		s.enrichRequest(enrichCtx, id)
-	}
-	if s.enrichAsync != nil {
-		s.enrichAsync(run)
-		return
-	}
-	go func() {
-		defer func() {
-			if recovered := recover(); recovered != nil {
-				slog.ErrorContext(base, "requests: deferred enrichment panicked", "component", "requests", "request_id", id, "panic", recovered)
-			}
-		}()
-		run()
-	}()
-}
-
-// enrichRequest is the deferred half of CreateRequest: it reads the title's
-// external IDs and routing facts from TMDB and writes them back to the row the
-// create already committed. A failure leaves the row as the create left it —
-// the facts uncaptured and the IDs unfilled — rather than storing an empty
-// snapshot that would read as captured, so submission and routing retry
-// through their backfill paths and the failure is not silently swallowed.
-func (s *Service) enrichRequest(ctx context.Context, id string) {
-	req, err := s.store.GetRequest(ctx, id)
-	if err != nil {
-		slog.WarnContext(ctx, "requests: deferred enrichment could not read the request", "component", "requests", "request_id", id, "err", err)
-		return
-	}
-	if req == nil || req.Outcome != OutcomeActive {
-		return
-	}
-	if req.RoutingFacts.Captured() && req.IMDbID != "" {
-		return
-	}
-	if req.IMDbID == "" {
-		input := CreateRequestInput{MediaType: req.MediaType, TMDBID: req.TMDBID, TVDBID: req.TVDBID}
-		if failed := s.enrichExternalIDs(ctx, &input); failed {
-			slog.WarnContext(ctx, "requests: deferred external-ID enrichment found no TVDB id for the series", "component", "requests", "request_id", id)
-		}
-		if strings.TrimSpace(input.IMDbID) != "" {
-			if _, err := s.store.SetExternalIDs(ctx, id, 0, input.IMDbID); err != nil {
-				slog.WarnContext(ctx, "requests: deferred enrichment could not store external ids", "component", "requests", "request_id", id, "err", err)
-			}
-		}
-	}
-	if req.RoutingFacts.Captured() {
-		return
-	}
-	detail := s.requestDetail(ctx, req.MediaType, req.TMDBID)
-	if detail == nil {
-		// TMDB unreachable: leave the facts uncaptured so submission/routing
-		// reads them again rather than routing on a title with no facts.
-		slog.WarnContext(ctx, "requests: deferred enrichment could not read the title from TMDB; routing will retry", "component", "requests", "request_id", id)
-		return
-	}
-	if req.Year == nil || req.Overview == "" || req.PosterPath == "" || req.BackdropPath == "" {
-		if _, err := s.store.FillRequestDisplay(ctx, id, detailYear(detail), detail.Overview, detail.PosterPath, detail.BackdropPath); err != nil {
-			slog.WarnContext(ctx, "requests: deferred enrichment could not fill the request display fields", "component", "requests", "request_id", id, "err", err)
-		}
-	}
-	if _, err := s.store.SetRoutingFacts(ctx, id, s.routingFacts(ctx, detail)); err != nil {
-		slog.WarnContext(ctx, "requests: deferred enrichment could not store routing facts", "component", "requests", "request_id", id, "err", err)
-	}
-}
-
-func detailYear(detail *tmdb.MediaDetail) *int {
-	if detail == nil || detail.Year <= 0 {
-		return nil
-	}
-	year := detail.Year
-	return &year
-}
-
 // ensureSeriesTVDBID looks up a series request's missing TVDB ID again right
 // before submission (approve, Retry, reconcile), so an ID added on TMDB or TVDB
 // since the request was created is used, and records it on the request.
@@ -2497,7 +2145,7 @@ func (s *Service) submitApprovedRequest(ctx context.Context, req Request, actor 
 		}
 		fc = built
 	}
-	if s.router == nil || (!routerConfiguredFor(fc, req.MediaType) && !s.hasActiveDefaultVirtualRouter()) {
+	if s.router == nil || !routerConfiguredFor(fc, req.MediaType) {
 		// No router serves this media type: the request stays approved and
 		// the reconcile pass completes it when the title reaches the library.
 		return &req, nil
@@ -2618,12 +2266,6 @@ func (s *Service) submitClaimed(ctx context.Context, req Request, actor Viewer, 
 	if err != nil {
 		return nil, err
 	}
-	// Fulfill is allowed to create virtual catalog rows before returning. Flush
-	// shared home-section membership now so Recently Added reflects the change
-	// on the user's next request instead of serving its five-minute warm entry.
-	if s.catalogChanged != nil {
-		s.catalogChanged()
-	}
 	if len(targets) == 0 {
 		if msg == "" {
 			msg = "fulfillment backend created no targets"
@@ -2728,11 +2370,6 @@ func (s *Service) submitRouted(ctx context.Context, req Request, actor Viewer, f
 			failures[q] = msg
 		}
 		targets = append(targets, tier...)
-	}
-	// As on the unrouted path: Fulfill may have registered virtual catalog
-	// rows, so flush shared home-section membership before recording.
-	if s.catalogChanged != nil {
-		s.catalogChanged()
 	}
 	return s.recordTargets(ctx, req, actor, plan, targets, connKind, decisions, failures)
 }
@@ -3185,8 +2822,7 @@ func (s *Service) presentRequests(ctx context.Context, reqs []*Request) (map[str
 				continue
 			}
 			out[req.ID] = false
-			if match.Available && match.ContentID != "" &&
-				requestSeasonCountsCompatible(req.SeasonSource, match) {
+			if match.Available && match.ContentID != "" {
 				seasonRequests[match.ContentID] = append(seasonRequests[match.ContentID], req)
 			}
 		}
@@ -3526,7 +3162,7 @@ func (s *Service) retireStalledTargets(ctx context.Context, req Request, live []
 	var updated *Request
 	retired := false
 	for _, t := range live {
-		if t.Status != StatusQueued || t.UpdatedAt.After(cutoff) || strings.EqualFold(strings.TrimSpace(t.ExternalStatus), "monitored") {
+		if t.Status != StatusQueued || t.UpdatedAt.After(cutoff) {
 			continue
 		}
 		next, err := s.store.UpdateTargetStatus(ctx, t.ID, StatusCompleted, "", ExternalStatusPresenceConfirmed, "", Viewer{})

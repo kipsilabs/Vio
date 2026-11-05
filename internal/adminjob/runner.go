@@ -5,10 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
-	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,8 +26,6 @@ type ArtifactStore interface {
 	DeleteObject(ctx context.Context, bucket, key string) error
 }
 
-const remoteCatalogImportTimeout = 10 * time.Minute
-
 const (
 	// imageCacheCleanupMaxStalledClaims bounds how long a cleanup keeps
 	// yielding without deleting anything, e.g. while storage writes are
@@ -42,7 +37,7 @@ const (
 )
 
 // Maximum wall-clock time a single admin job execution may run before its
-// context is canceled. This is the safety net that prevents a hung
+// context is cancelled. This is the safety net that prevents a hung
 // operation (e.g. an unreachable S3 endpoint) from blocking the job queue
 // indefinitely, while still giving large jobs a budget that matches their
 // actual scope.
@@ -68,8 +63,7 @@ type Runner struct {
 	templateBundleApply        templateBundleApplyExecutor
 	storageTransition          storageTransitionExecutor
 	storageTransitionCommitted func(context.Context) error
-	virtualRefresh             VirtualCandidatesRefreshExecutor
-	virtualIdentityBackfill    VirtualIdentityBackfillExecutor
+	backupRestore              backupRestoreExecutor
 	realtimeHub                *notifications.Hub
 	imageCacheCleanupSlice     time.Duration
 	pollInterval               time.Duration
@@ -232,8 +226,7 @@ func (r *Runner) runNext() {
 		JobTypeDeleteLibrary,
 		JobTypeTemplateBundleApply,
 		JobTypeStorageTransition,
-		JobTypeVirtualCandidatesRefresh,
-		JobTypeVirtualIdentityBackfill,
+		JobTypeBackupRestore,
 	})
 	cancel()
 	if err != nil {
@@ -263,10 +256,8 @@ func (r *Runner) runNext() {
 		itemRefresh: r.itemRefresh, libraryRefresh: r.libraryRefresh, libraryDelete: r.libraryDelete,
 		imageCacheCleanup: r.imageCacheCleanup, imageCacheCleanupSlice: r.imageCacheCleanupSlice,
 		templateBundleApply: r.templateBundleApply, storageTransition: r.storageTransition,
-		storageTransitionCommitted: r.storageTransitionCommitted,
-		virtualRefresh:             r.virtualRefresh,
-		virtualIdentityBackfill:    r.virtualIdentityBackfill,
-		realtimeHub:                r.realtimeHub, heartbeatInterval: r.heartbeatInterval, retention: r.retention, cancelRegistry: r.cancelRegistry,
+		storageTransitionCommitted: r.storageTransitionCommitted, backupRestore: r.backupRestore,
+		realtimeHub: r.realtimeHub, heartbeatInterval: r.heartbeatInterval, retention: r.retention, cancelRegistry: r.cancelRegistry,
 		storageRestart: r.storageRestart, stop: r.stop,
 	}
 	if job.JobType == JobTypeStorageTransition && r.storageRestartPending() {
@@ -279,6 +270,9 @@ func (r *Runner) runNext() {
 		message := "Library metadata refresh canceled"
 		if job.JobType == JobTypeImageCacheCleanup {
 			message = QueuedImageCacheCleanupCanceledMessage(job.ProgressCurrent, job.ProgressTotal)
+		}
+		if job.JobType == JobTypeBackupRestore {
+			message = "Restore canceled"
 		}
 		if job.JobType == JobTypeStorageTransition {
 			message = "Storage transition canceled; verified copy checkpoints retained"
@@ -324,10 +318,8 @@ func (r *Runner) runNext() {
 		r.executeImageCacheCleanup(job)
 	case JobTypeStorageTransition:
 		r.executeStorageTransition(job)
-	case JobTypeVirtualCandidatesRefresh:
-		r.executeVirtualCandidatesRefresh(job)
-	case JobTypeVirtualIdentityBackfill:
-		r.executeVirtualIdentityBackfill(job)
+	case JobTypeBackupRestore:
+		r.executeBackupRestore(job)
 	default:
 		r.failJob(job.ID, 0, 0, "Admin job failed", "unsupported admin job type")
 	}
@@ -874,7 +866,7 @@ func (r *Runner) executeLibraryRefresh(job *models.AdminJob) {
 	})
 	if err != nil {
 		if errors.Is(ctx.Err(), context.Canceled) {
-			r.cancelJob(job.ID, current, total, "Library metadata refresh canceled")
+			r.cancelJob(job.ID, current, total, "Library metadata refresh cancelled")
 			return
 		}
 		msg := err.Error()
@@ -1008,7 +1000,7 @@ func (r *Runner) executeCatalogExport(job *models.AdminJob) {
 		return
 	}
 	tempPath := tempFile.Name()
-	defer func() { _ = os.Remove(tempPath) }()
+	defer os.Remove(tempPath)
 
 	var (
 		lastProgressUpdate time.Time
@@ -1111,7 +1103,7 @@ func (r *Runner) executeCatalogImport(job *models.AdminJob) {
 			r.publishJobByID(ctx, notifications.TypeJobProgress, job.ID)
 		}
 		var err error
-		data, err = downloadRemoteCatalogSeed(ctx, req.RemoteURL)
+		data, err = catalogseed.DownloadRemoteBundle(ctx, req.RemoteURL)
 		if err != nil {
 			r.failJob(job.ID, 0, 0, "Catalog import failed", err.Error())
 			return
@@ -1177,44 +1169,6 @@ func (r *Runner) executeCatalogImport(job *models.AdminJob) {
 		return
 	}
 	r.publishJobByID(completeCtx, notifications.TypeJobCompleted, job.ID)
-}
-
-func downloadRemoteCatalogSeed(ctx context.Context, remoteURL string) ([]byte, error) {
-	parsed, err := url.Parse(remoteURL)
-	if err != nil {
-		return nil, fmt.Errorf("invalid remote URL: %w", err)
-	}
-	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return nil, fmt.Errorf("invalid remote URL scheme")
-	}
-	if !strings.HasSuffix(strings.ToLower(parsed.Path), ".json.gz") {
-		return nil, fmt.Errorf("remote URL must point to a .json.gz file")
-	}
-
-	reqCtx, cancel := context.WithTimeout(ctx, remoteCatalogImportTimeout)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, remoteURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("building remote import request: %w", err)
-	}
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("downloading remote catalog seed: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("downloading remote catalog seed: unexpected status %d", resp.StatusCode)
-	}
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("reading remote catalog seed: %w", err)
-	}
-
-	return data, nil
 }
 
 func (r *Runner) executeItemRefresh(job *models.AdminJob) {
@@ -1288,201 +1242,6 @@ func (r *Runner) executeItemRefresh(job *models.AdminJob) {
 		ProgressTotal:   progressTotal,
 	}); err != nil {
 		slog.Warn("admin jobs: failed to complete item refresh", "job_id", job.ID, "error", err)
-		return
-	}
-	r.publishJobByID(ctx, notifications.TypeJobCompleted, job.ID)
-}
-
-// executeVirtualCandidatesRefresh runs the asynchronous "Refresh List"
-// pipeline. Unlike the item refresh, a provider or indexer hiccup is not fatal:
-// the executor owns the degradation (altmount-only results survive an indexer
-// search failure), so any error it returns is a genuine pipeline failure.
-func (r *Runner) executeVirtualCandidatesRefresh(job *models.AdminJob) {
-	if r.virtualRefresh == nil {
-		r.failJob(job.ID, 0, 0, "Virtual candidates refresh failed", "virtual candidates refresh executor is not configured")
-		return
-	}
-
-	var req VirtualCandidatesRefreshRequest
-	if len(job.RequestPayload) > 0 {
-		if err := json.Unmarshal(job.RequestPayload, &req); err != nil {
-			r.failJob(job.ID, 0, 0, "Virtual candidates refresh failed", fmt.Sprintf("invalid virtual candidates refresh payload: %v", err))
-			return
-		}
-	}
-
-	ctx, cancel := context.WithTimeout(r.executionContext(), virtualCandidatesRefreshTimeout)
-	defer cancel()
-
-	// A running refresh is cancellable from the API: the registry bridges the
-	// command to this context, and the polling goroutine covers a cancellation
-	// that arrives through the durable row on another node.
-	go func() {
-		ticker := time.NewTicker(r.heartbeatInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				current, err := r.repo.GetByID(ctx, job.ID)
-				if err == nil && (current.CancelRequested || current.ClaimGeneration != job.ClaimGeneration) {
-					cancel()
-					return
-				}
-			}
-		}
-	}()
-	unregisterCancel := r.cancelRegistry.Register(job.ID, cancel)
-	defer unregisterCancel()
-
-	heartbeatStop := make(chan struct{})
-	go r.heartbeatLoop(ctx, job.ID, heartbeatStop)
-	defer close(heartbeatStop)
-
-	progress := func(current, total int, message string) {
-		if err := r.repo.UpdateProgress(ctx, job.ID, current, total, message); err != nil {
-			slog.Warn("admin jobs: failed to update virtual candidates refresh progress", "job_id", job.ID, "error", err)
-			return
-		}
-		r.publishJobByID(ctx, notifications.TypeJobProgress, job.ID)
-	}
-
-	result, err := r.virtualRefresh.Execute(ctx, req, progress)
-	if err != nil {
-		if errors.Is(ctx.Err(), context.Canceled) {
-			r.cancelJob(job.ID, 0, 0, "Virtual candidates refresh canceled")
-			return
-		}
-		msg := err.Error()
-		if ctx.Err() != nil {
-			msg = fmt.Sprintf("timed out after %s: %s", virtualCandidatesRefreshTimeout, msg)
-		}
-		r.failJob(job.ID, 0, 0, "Virtual candidates refresh failed", msg)
-		return
-	}
-
-	if err := r.repo.Complete(ctx, job.ID, CompleteJobInput{
-		ResultPayload:   result,
-		Message:         "Virtual candidates refreshed",
-		ProgressCurrent: 1,
-		ProgressTotal:   1,
-		ExpiresAt:       time.Now().UTC().Add(r.retention),
-	}); err != nil {
-		slog.Warn("admin jobs: failed to complete virtual candidates refresh", "job_id", job.ID, "error", err)
-		return
-	}
-	r.publishJobByID(ctx, notifications.TypeJobCompleted, job.ID)
-}
-
-// executeVirtualIdentityBackfill runs the one-shot resumable identity backfill.
-// The executor loops over pages of legacy rows and owns its degradation: a
-// provider that cannot be reached for one candidate group is counted and
-// skipped, but the page it belongs to is left incomplete. A pass with any
-// failed group is failed rather than completed, so the one-shot token is not
-// consumed and the durable cursor in the result payload lets a later run
-// resume after the last fully-processed page and retry the rest. The durable
-// cursor is persisted with every progress tick as well, so a requeued claim
-// resumes instead of restarting.
-func (r *Runner) executeVirtualIdentityBackfill(job *models.AdminJob) {
-	if r.virtualIdentityBackfill == nil {
-		r.failJob(job.ID, 0, 0, "Virtual identity backfill failed", "virtual identity backfill executor is not configured")
-		return
-	}
-
-	var req VirtualIdentityBackfillRequest
-	if len(job.RequestPayload) > 0 {
-		if err := json.Unmarshal(job.RequestPayload, &req); err != nil {
-			r.failJob(job.ID, 0, 0, "Virtual identity backfill failed", fmt.Sprintf("invalid virtual identity backfill payload: %v", err))
-			return
-		}
-	}
-	// The resume cursor is whatever the last claim persisted. A fresh job
-	// carries no result payload and starts at zero.
-	var resume VirtualIdentityBackfillResume
-	if len(job.ResultPayload) > 0 {
-		if err := json.Unmarshal(job.ResultPayload, &resume); err != nil {
-			slog.Warn("admin jobs: ignoring unreadable virtual identity backfill cursor", "job_id", job.ID, "error", err)
-		}
-	}
-
-	ctx, cancel := context.WithTimeout(r.executionContext(), virtualIdentityBackfillTimeout)
-	defer cancel()
-
-	go func() {
-		ticker := time.NewTicker(r.heartbeatInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				current, err := r.repo.GetByID(ctx, job.ID)
-				if err == nil && (current.CancelRequested || current.ClaimGeneration != job.ClaimGeneration) {
-					cancel()
-					return
-				}
-			}
-		}
-	}()
-	unregisterCancel := r.cancelRegistry.Register(job.ID, cancel)
-	defer unregisterCancel()
-
-	heartbeatStop := make(chan struct{})
-	go r.heartbeatLoop(ctx, job.ID, heartbeatStop)
-	defer close(heartbeatStop)
-
-	progress := func(current, total, cursor int, message string) {
-		// Persist the cursor with the progress so a stale recovery resumes here.
-		if err := r.repo.UpdateProgressResult(ctx, job.ID, current, total, message, VirtualIdentityBackfillResume{Cursor: cursor}); err != nil {
-			slog.Warn("admin jobs: failed to update virtual identity backfill progress", "job_id", job.ID, "error", err)
-			return
-		}
-		r.publishJobByID(ctx, notifications.TypeJobProgress, job.ID)
-	}
-
-	result, err := r.virtualIdentityBackfill.Execute(ctx, req, resume, progress)
-	if err != nil {
-		if errors.Is(ctx.Err(), context.Canceled) {
-			r.cancelJob(job.ID, 0, 0, "Virtual identity backfill canceled")
-			return
-		}
-		msg := err.Error()
-		if ctx.Err() != nil {
-			msg = fmt.Sprintf("timed out after %s: %s", virtualIdentityBackfillTimeout, msg)
-		}
-		r.failJob(job.ID, 0, 0, "Virtual identity backfill failed", msg)
-		return
-	}
-
-	progressCurrent := 0
-	progressTotal := 0
-	if result != nil {
-		progressCurrent = result.RowsScanned
-		progressTotal = result.RowsTotal
-	}
-
-	// A provider group that could not be re-listed leaves rows unconsidered.
-	// Completing would consume the one-shot token and orphan them, so fail the
-	// job instead and keep the retriable watermark in the result payload. A
-	// failed job is not "finished", so the next boot requeues it and resumes
-	// after the last fully-processed page.
-	if result != nil && result.GroupsFailed > 0 {
-		r.failJobWithResult(job.ID, progressCurrent, progressTotal,
-			"Virtual identity backfill incomplete",
-			fmt.Sprintf("%d provider group(s) could not be re-listed; the backfill will retry", result.GroupsFailed),
-			result)
-		return
-	}
-
-	if err := r.repo.Complete(ctx, job.ID, CompleteJobInput{
-		ResultPayload:   result,
-		Message:         "Virtual identity backfill completed",
-		ProgressCurrent: progressCurrent,
-		ProgressTotal:   progressTotal,
-		ExpiresAt:       time.Now().UTC().Add(r.retention),
-	}); err != nil {
-		slog.Warn("admin jobs: failed to complete virtual identity backfill", "job_id", job.ID, "error", err)
 		return
 	}
 	r.publishJobByID(ctx, notifications.TypeJobCompleted, job.ID)
@@ -1615,7 +1374,7 @@ func (r *Runner) cancelJob(id string, current, total int, message string) {
 	}
 	job, err := r.repo.Cancel(ctx, id, message, time.Now().UTC().Add(r.retention))
 	if err != nil {
-		slog.Warn("admin jobs: failed to mark job canceled", "job_id", id, "error", err)
+		slog.Warn("admin jobs: failed to mark job cancelled", "job_id", id, "error", err)
 		return
 	}
 	if r.observation != nil {

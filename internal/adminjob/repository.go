@@ -26,11 +26,7 @@ const (
 	StatusRunning   = "running"
 	StatusCompleted = "completed"
 	StatusFailed    = "failed"
-	// StatusCancelled is the durable status value. It matches the
-	// admin_jobs_status_check constraint (migration 178) and the literals the
-	// cancel-on-completion paths write in Complete and Fail; a different
-	// spelling would violate the constraint and lose the cancellation.
-	StatusCancelled = "cancelled" //nolint:misspell // Persisted DB enum value (migration 178).
+	StatusCancelled = "cancelled"
 )
 
 var (
@@ -42,7 +38,7 @@ var (
 
 // cancellableJobTypes are the job types RequestCancellation accepts. Every v2
 // job resource that reports such a job as cancelable accepts its cancellation.
-var cancellableJobTypes = []string{JobTypeLibraryRefresh, JobTypeStorageTransition, JobTypeVirtualCandidatesRefresh, JobTypeVirtualIdentityBackfill, JobTypeImageCacheCleanup}
+var cancellableJobTypes = []string{JobTypeLibraryRefresh, JobTypeStorageTransition, JobTypeImageCacheCleanup, JobTypeBackupRestore}
 
 // IsCancellableJobType reports whether jobs of this type accept cancellation
 // while queued or running.
@@ -256,64 +252,6 @@ func (r *Repository) GetByID(ctx context.Context, id string) (*models.AdminJob, 
 	))
 }
 
-// CreateVirtualCandidatesRefresh persists one Refresh List job for a title.
-// A unique index (job_type, request_payload->>'content_id') enforces one active
-// job per title; a duplicate returns ActiveJobConflictError carrying the
-// already-active job so the caller can answer it like a coalesced command.
-func (r *Repository) CreateVirtualCandidatesRefresh(ctx context.Context, createdByUserID int, req VirtualCandidatesRefreshRequest, message string) (*models.AdminJob, error) {
-	payload, err := marshalPayload(req)
-	if err != nil {
-		return nil, fmt.Errorf("marshaling virtual candidates refresh payload: %w", err)
-	}
-
-	id, err := idgen.NextID()
-	if err != nil {
-		return nil, fmt.Errorf("generate job id: %w", err)
-	}
-	job, err := scanAdminJob(r.pool.QueryRow(ctx, `
-		INSERT INTO admin_jobs (
-			id, job_type, status, created_by_user_id, request_payload, message
-		) VALUES ($1, $2, $3, $4, $5, $6)
-		RETURNING `+adminJobColumns,
-		id,
-		JobTypeVirtualCandidatesRefresh,
-		StatusQueued,
-		createdByUserID,
-		payload,
-		message,
-	))
-	if err == nil {
-		return job, nil
-	}
-
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
-		activeJob, lookupErr := r.GetActiveVirtualRefreshByContentID(ctx, req.ContentID)
-		if lookupErr != nil && !errors.Is(lookupErr, ErrJobNotFound) {
-			return nil, lookupErr
-		}
-		return nil, &ActiveJobConflictError{Job: activeJob}
-	}
-
-	return nil, fmt.Errorf("creating virtual candidates refresh job: %w", err)
-}
-
-func (r *Repository) GetActiveVirtualRefreshByContentID(ctx context.Context, contentID string) (*models.AdminJob, error) {
-	return scanAdminJob(r.pool.QueryRow(ctx, `
-		SELECT `+adminJobColumns+`
-		FROM admin_jobs
-		WHERE job_type = $1
-		  AND status IN ($2, $3)
-		  AND request_payload->>'content_id' = $4
-		ORDER BY requested_at ASC
-		LIMIT 1`,
-		JobTypeVirtualCandidatesRefresh,
-		StatusQueued,
-		StatusRunning,
-		contentID,
-	))
-}
-
 func (r *Repository) GetActiveByType(ctx context.Context, jobType string) (*models.AdminJob, error) {
 	return scanAdminJob(r.pool.QueryRow(ctx, `
 		SELECT `+adminJobColumns+`
@@ -323,24 +261,6 @@ func (r *Repository) GetActiveByType(ctx context.Context, jobType string) (*mode
 		LIMIT 1`,
 		jobType, StatusQueued, StatusRunning,
 	))
-}
-
-// HasFinishedJobOfType reports whether a job of this kind has reached a
-// terminal state the operator did not ask to retry: completed, or canceled.
-// It is the one-shot gate for work that must not be re-queued on every process
-// start, such as the virtual identity backfill. A failed job is deliberately
-// not "finished": the next boot re-queues it and the durable cursor resumes.
-func (r *Repository) HasFinishedJobOfType(ctx context.Context, jobType string) (bool, error) {
-	var exists bool
-	if err := r.pool.QueryRow(ctx, `
-		SELECT EXISTS(
-			SELECT 1 FROM admin_jobs WHERE job_type = $1 AND status IN ($2, $3)
-		)`,
-		jobType, StatusCompleted, StatusCancelled,
-	).Scan(&exists); err != nil {
-		return false, fmt.Errorf("check finished admin job of type: %w", err)
-	}
-	return exists, nil
 }
 
 func (r *Repository) GetActiveLibraryRefreshByLibraryID(ctx context.Context, libraryID int) (*models.AdminJob, error) {
@@ -550,11 +470,15 @@ func (r *Repository) HoldStorageTransitionForRestart(ctx context.Context, id str
 	return nil
 }
 
+// TouchHeartbeat records that the job's worker is alive. The heartbeat
+// only moves forward, at the time the row is written: an update that waited
+// on the row behind a fenced restore item (RunFenced) must not write its
+// statement's start over the time that item committed.
 func (r *Repository) TouchHeartbeat(ctx context.Context, id string) error {
 	tag, err := r.pool.Exec(ctx, `
 		UPDATE admin_jobs
-		SET heartbeat_at = NOW(),
-			updated_at = NOW()
+		SET heartbeat_at = GREATEST(heartbeat_at, clock_timestamp()),
+			updated_at = clock_timestamp()
 		WHERE id = $1 AND status = 'running' AND ($2::bigint IS NULL OR claim_generation = $2)`,
 		id, r.claim,
 	)
@@ -573,7 +497,11 @@ func (r *Repository) Complete(ctx context.Context, id string, input CompleteJobI
 		return fmt.Errorf("marshaling admin job result payload: %w", err)
 	}
 
-	tag, err := r.pool.Exec(ctx, `
+	// A restore's item outcome rows go in the statement that records its
+	// final report, so a crash before it keeps them for the report.
+	var finished int
+	err = r.pool.QueryRow(ctx, `
+		WITH done AS (
 		UPDATE admin_jobs
 		SET status = CASE WHEN cancel_requested THEN 'cancelled' ELSE $2 END,
 			result_payload = CASE WHEN cancel_requested AND $12 = '' THEN '{}'::jsonb ELSE $3 END,
@@ -588,7 +516,12 @@ func (r *Repository) Complete(ctx context.Context, id string, input CompleteJobI
 			heartbeat_at = NOW(),
 			expires_at = GREATEST($10, NOW() + INTERVAL '24 hours'),
 			updated_at = NOW()
-		WHERE id = $1 AND status = 'running' AND ($11::bigint IS NULL OR claim_generation = $11)`,
+		WHERE id = $1 AND status = 'running' AND ($11::bigint IS NULL OR claim_generation = $11)
+		RETURNING id
+		), removed AS (
+			DELETE FROM backup_restore_items i USING done WHERE i.run_id = done.id
+		)
+		SELECT count(*) FROM done`,
 		id,
 		StatusCompleted,
 		resultPayload,
@@ -601,11 +534,11 @@ func (r *Repository) Complete(ctx context.Context, id string, input CompleteJobI
 		input.ExpiresAt,
 		r.claim,
 		input.CanceledMessage,
-	)
+	).Scan(&finished)
 	if err != nil {
 		return fmt.Errorf("completing admin job: %w", err)
 	}
-	if tag.RowsAffected() == 0 {
+	if finished == 0 {
 		return ErrJobNotFound
 	}
 	return nil
@@ -673,7 +606,9 @@ func (r *Repository) Fail(ctx context.Context, id string, input FailJobInput) er
 			return fmt.Errorf("marshaling failed admin job result payload: %w", err)
 		}
 	}
-	tag, err := r.pool.Exec(ctx, `
+	var finished int
+	err := r.pool.QueryRow(ctx, `
+		WITH done AS (
 		UPDATE admin_jobs
 		SET status = CASE WHEN cancel_requested THEN 'cancelled' ELSE $2 END,
 			message = $3,
@@ -685,7 +620,12 @@ func (r *Repository) Fail(ctx context.Context, id string, input FailJobInput) er
 			heartbeat_at = NOW(),
 			expires_at = GREATEST($8, NOW() + INTERVAL '24 hours'),
 			updated_at = NOW()
-		WHERE id = $1 AND status = 'running' AND ($9::bigint IS NULL OR claim_generation = $9)`,
+		WHERE id = $1 AND status = 'running' AND ($9::bigint IS NULL OR claim_generation = $9)
+		RETURNING id
+		), removed AS (
+			DELETE FROM backup_restore_items i USING done WHERE i.run_id = done.id
+		)
+		SELECT count(*) FROM done`,
 		id,
 		StatusFailed,
 		input.Message,
@@ -695,11 +635,11 @@ func (r *Repository) Fail(ctx context.Context, id string, input FailJobInput) er
 		input.ProgressTotal,
 		input.ExpiresAt,
 		r.claim,
-	)
+	).Scan(&finished)
 	if err != nil {
 		return fmt.Errorf("failing admin job: %w", err)
 	}
-	if tag.RowsAffected() == 0 {
+	if finished == 0 {
 		return ErrJobNotFound
 	}
 	return nil
@@ -707,7 +647,7 @@ func (r *Repository) Fail(ctx context.Context, id string, input FailJobInput) er
 
 func (r *Repository) Cancel(ctx context.Context, id, message string, expiresAt time.Time) (*models.AdminJob, error) {
 	if message == "" {
-		message = "Admin job canceled"
+		message = "Admin job cancelled"
 	}
 	job, err := scanAdminJob(r.pool.QueryRow(ctx, `
 		UPDATE admin_jobs
@@ -754,6 +694,7 @@ func (r *Repository) CancelWithResult(ctx context.Context, id string, current, t
 		return nil, fmt.Errorf("marshaling admin job result payload: %w", err)
 	}
 	return scanAdminJob(r.pool.QueryRow(ctx, `
+		WITH done AS (
 		UPDATE admin_jobs
 		SET status = $2,
 			message = $3,
@@ -768,7 +709,11 @@ func (r *Repository) CancelWithResult(ctx context.Context, id string, current, t
 		WHERE id = $1
 		  AND status = $8
 		  AND ($9::bigint IS NULL OR claim_generation = $9)
-		RETURNING `+adminJobColumns,
+		RETURNING `+adminJobColumns+`
+		), removed AS (
+			DELETE FROM backup_restore_items i USING done WHERE i.run_id = done.id
+		)
+		SELECT `+adminJobColumns+` FROM done`,
 		id, StatusCancelled, message, current, total, payload, expiresAt, StatusRunning, r.claim,
 	))
 }
@@ -783,7 +728,7 @@ func (r *Repository) CancelState(ctx context.Context, id string) (cancelRequeste
 
 func (r *Repository) CancelQueued(ctx context.Context, id, message string, expiresAt time.Time) (*models.AdminJob, error) {
 	if message == "" {
-		message = "Admin job canceled"
+		message = "Admin job cancelled"
 	}
 	job, err := scanAdminJob(r.pool.QueryRow(ctx, `
 		UPDATE admin_jobs
@@ -858,7 +803,42 @@ func (r *Repository) Yield(ctx context.Context, id string, current, total int, m
 	return nil
 }
 
+// RequeueStaleRunning requeues running jobs whose worker stopped
+// heartbeating, except backup restores: a restore is never run twice by
+// recovery. It is marked failed as interrupted instead, keeping the report of
+// what committed; running the same restore again is safe. A restore item's
+// fenced transaction holds the job row locked, so this update waits for it
+// and then sees a fresh heartbeat.
 func (r *Repository) RequeueStaleRunning(ctx context.Context, before time.Time) (int, error) {
+	// The report keeps every outcome the restore committed: until the run
+	// ends they are backup_restore_items rows, which this collects into its
+	// result and removes.
+	var interrupted int64
+	err := r.pool.QueryRow(ctx, `
+		WITH stale AS (
+			UPDATE admin_jobs
+			SET status = $2,
+				message = 'Restore interrupted: the server running it stopped',
+				error_message = $4,
+				result_payload = CASE WHEN EXISTS (SELECT 1 FROM backup_restore_items i WHERE i.run_id = admin_jobs.id)
+					THEN jsonb_set(coalesce(result_payload, '{}'::jsonb), '{items}',
+						(SELECT jsonb_agg(i.item ORDER BY i.seq) FROM backup_restore_items i WHERE i.run_id = admin_jobs.id))
+					ELSE result_payload END,
+				completed_at = NOW(),
+				expires_at = NOW() + INTERVAL '7 days',
+				updated_at = NOW()
+			WHERE status = $1 AND job_type = $5
+			  AND COALESCE(heartbeat_at, started_at, requested_at) < $3
+			RETURNING id
+		), removed AS (
+			DELETE FROM backup_restore_items i USING stale WHERE i.run_id = stale.id
+		)
+		SELECT count(*) FROM stale`,
+		StatusRunning, StatusFailed, before, BackupRestoreInterrupted, JobTypeBackupRestore,
+	).Scan(&interrupted)
+	if err != nil {
+		return 0, fmt.Errorf("failing interrupted restores: %w", err)
+	}
 	tag, err := r.pool.Exec(ctx, `
 		UPDATE admin_jobs
 		SET status = $2,
@@ -871,57 +851,14 @@ func (r *Repository) RequeueStaleRunning(ctx context.Context, before time.Time) 
 			completed_at = NULL,
 			heartbeat_at = NULL,
 			updated_at = NOW()
-		WHERE status = $1
+		WHERE status = $1 AND job_type <> $4
 		  AND COALESCE(heartbeat_at, started_at, requested_at) < $3`,
-		StatusRunning, StatusQueued, before,
+		StatusRunning, StatusQueued, before, JobTypeBackupRestore,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("requeueing stale admin jobs: %w", err)
 	}
-	return int(tag.RowsAffected()), nil
-}
-
-// RequeueLatestFailedOfType resets the newest failed job of a kind to queued so
-// a boot retry resumes it, preserving its result payload. The identity backfill
-// persists a retriable watermark there; without this the boot gate would queue
-// a fresh job that restarts from zero and re-lists every unmatched row. It
-// clears the terminal retention deadline so the expired-job cleanup cannot
-// sweep the retry before it runs, and leaves an already-active job alone. It
-// reports whether a job was requeued.
-//
-// The outer `status = $3` re-checks the locked row's status: the subquery and
-// the NOT EXISTS guard are uncorrelated subplans the executor evaluates once,
-// before it takes the row lock, and does not re-run on the EvalPlanQual
-// recheck. Without the direct predicate a claim that commits while the requeue
-// waits for the lock would let it flip the now-running job back to queued.
-func (r *Repository) RequeueLatestFailedOfType(ctx context.Context, jobType string) (bool, error) {
-	tag, err := r.pool.Exec(ctx, `
-		UPDATE admin_jobs
-		SET status = $2,
-			message = 'Requeued after a partial run',
-			error_message = '',
-			started_at = NULL,
-			completed_at = NULL,
-			heartbeat_at = NULL,
-			expires_at = NULL,
-			updated_at = NOW()
-		WHERE id = (
-			SELECT id FROM admin_jobs
-			WHERE job_type = $1 AND status = $3
-			ORDER BY requested_at DESC, id DESC
-			LIMIT 1
-		)
-		  AND status = $3
-		  AND NOT EXISTS (
-			SELECT 1 FROM admin_jobs
-			WHERE job_type = $1 AND status IN ($2, $4)
-		)`,
-		jobType, StatusQueued, StatusFailed, StatusRunning,
-	)
-	if err != nil {
-		return false, fmt.Errorf("requeueing latest failed admin job of type: %w", err)
-	}
-	return tag.RowsAffected() > 0, nil
+	return int(tag.RowsAffected() + interrupted), nil
 }
 
 func (r *Repository) ListExpired(ctx context.Context, now time.Time, limit int) ([]*models.AdminJob, error) {
