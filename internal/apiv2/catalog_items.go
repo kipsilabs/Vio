@@ -147,7 +147,7 @@ type CatalogItemInput struct {
 // playback choice (effective_audio_*, effective_subtitle_*), which the
 // caller's device-scoped preferences decide.
 type CatalogItemDeviceInput struct {
-	DeviceID string `header:"X-Silo-Device-Id" maxLength:"128" doc:"The stable device identifier used to resolve device-scoped playback preferences; absent resolves the profile's preferences" example:"tv-1"`
+	DeviceID string `header:"X-Vio-Device-Id" maxLength:"128" doc:"The stable device identifier used to resolve device-scoped playback preferences; absent resolves the profile's preferences" example:"tv-1"`
 	CatalogItemInput
 }
 

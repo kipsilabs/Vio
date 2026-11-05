@@ -42520,6 +42520,10 @@
             "maxItems": 16,
             "type": "array"
           },
+          "auto_fallback": {
+            "description": "Re-negotiates the session's version-fallback intent. Set true when the viewer re-arms Auto mid-session; omitted leaves the start-time intent unchanged. Never authorizes a healthy mid-play switch.",
+            "type": "boolean"
+          },
           "bandwidth_cap_kbps": {
             "format": "int64",
             "type": "integer"
@@ -146221,7 +146225,7 @@
           {
             "description": "The stable device identifier used to resolve device-scoped playback preferences; absent resolves the profile's preferences",
             "in": "header",
-            "name": "X-Silo-Device-Id",
+            "name": "X-Vio-Device-Id",
             "schema": {
               "description": "The stable device identifier used to resolve device-scoped playback preferences; absent resolves the profile's preferences",
               "examples": [
@@ -148516,7 +148520,7 @@
           {
             "description": "The stable device identifier used to resolve device-scoped playback preferences; absent resolves the profile's preferences",
             "in": "header",
-            "name": "X-Silo-Device-Id",
+            "name": "X-Vio-Device-Id",
             "schema": {
               "description": "The stable device identifier used to resolve device-scoped playback preferences; absent resolves the profile's preferences",
               "examples": [
@@ -210660,7 +210664,7 @@
           {
             "description": "The client family whose profile_client values take part; optional, and absence skips the profile_client layer",
             "in": "header",
-            "name": "X-Silo-Client-Family",
+            "name": "X-Vio-Client-Family",
             "schema": {
               "description": "The client family whose profile_client values take part; optional, and absence skips the profile_client layer",
               "enum": [
@@ -210679,7 +210683,7 @@
           {
             "description": "The client's stable device identifier; its profile_device values take part",
             "in": "header",
-            "name": "X-Silo-Device-Id",
+            "name": "X-Vio-Device-Id",
             "schema": {
               "description": "The client's stable device identifier; its profile_device values take part",
               "examples": [
@@ -210692,7 +210696,7 @@
           {
             "description": "Optional display name recorded on the device registry",
             "in": "header",
-            "name": "X-Silo-Device-Name",
+            "name": "X-Vio-Device-Name",
             "schema": {
               "description": "Optional display name recorded on the device registry",
               "examples": [
@@ -210705,7 +210709,7 @@
           {
             "description": "Optional platform recorded on the device registry",
             "in": "header",
-            "name": "X-Silo-Device-Platform",
+            "name": "X-Vio-Device-Platform",
             "schema": {
               "description": "Optional platform recorded on the device registry",
               "examples": [
@@ -210859,7 +210863,7 @@
           {
             "description": "The client family whose profile_client values take part; optional, and absence skips the profile_client layer",
             "in": "header",
-            "name": "X-Silo-Client-Family",
+            "name": "X-Vio-Client-Family",
             "schema": {
               "description": "The client family whose profile_client values take part; optional, and absence skips the profile_client layer",
               "enum": [
@@ -210878,7 +210882,7 @@
           {
             "description": "The client's stable device identifier; its profile_device values take part",
             "in": "header",
-            "name": "X-Silo-Device-Id",
+            "name": "X-Vio-Device-Id",
             "schema": {
               "description": "The client's stable device identifier; its profile_device values take part",
               "examples": [
@@ -210891,7 +210895,7 @@
           {
             "description": "Optional display name recorded on the device registry",
             "in": "header",
-            "name": "X-Silo-Device-Name",
+            "name": "X-Vio-Device-Name",
             "schema": {
               "description": "Optional display name recorded on the device registry",
               "examples": [
@@ -210904,7 +210908,7 @@
           {
             "description": "Optional platform recorded on the device registry",
             "in": "header",
-            "name": "X-Silo-Device-Platform",
+            "name": "X-Vio-Device-Platform",
             "schema": {
               "description": "Optional platform recorded on the device registry",
               "examples": [

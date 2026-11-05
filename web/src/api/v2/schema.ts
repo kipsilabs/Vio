@@ -29744,6 +29744,8 @@ export interface components {
       /** Format: int64 */
       attempt_count: number;
       attempted_plan_keys: string[];
+      /** @description Re-negotiates the session's version-fallback intent. Set true when the viewer re-arms Auto mid-session; omitted leaves the start-time intent unchanged. Never authorizes a healthy mid-play switch. */
+      auto_fallback?: boolean;
       /** Format: int64 */
       bandwidth_cap_kbps?: number;
       /**
@@ -96665,7 +96667,7 @@ export interface operations {
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
         /** @description The stable device identifier used to resolve device-scoped playback preferences; absent resolves the profile's preferences */
-        "X-Silo-Device-Id"?: string;
+        "X-Vio-Device-Id"?: string;
       };
       path: {
         /** @description Content id */
@@ -97846,7 +97848,7 @@ export interface operations {
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
         /** @description The stable device identifier used to resolve device-scoped playback preferences; absent resolves the profile's preferences */
-        "X-Silo-Device-Id"?: string;
+        "X-Vio-Device-Id"?: string;
       };
       path: {
         /** @description Content id */
@@ -137283,13 +137285,13 @@ export interface operations {
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
         /** @description The client family whose profile_client values take part; optional, and absence skips the profile_client layer */
-        "X-Silo-Client-Family"?: "tv" | "mobile" | "tablet" | "desktop" | "web";
+        "X-Vio-Client-Family"?: "tv" | "mobile" | "tablet" | "desktop" | "web";
         /** @description The client's stable device identifier; its profile_device values take part */
-        "X-Silo-Device-Id"?: string;
+        "X-Vio-Device-Id"?: string;
         /** @description Optional display name recorded on the device registry */
-        "X-Silo-Device-Name"?: string;
+        "X-Vio-Device-Name"?: string;
         /** @description Optional platform recorded on the device registry */
-        "X-Silo-Device-Platform"?: string;
+        "X-Vio-Device-Platform"?: string;
       };
       path?: never;
       cookie?: never;
@@ -137397,13 +137399,13 @@ export interface operations {
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
         /** @description The client family whose profile_client values take part; optional, and absence skips the profile_client layer */
-        "X-Silo-Client-Family"?: "tv" | "mobile" | "tablet" | "desktop" | "web";
+        "X-Vio-Client-Family"?: "tv" | "mobile" | "tablet" | "desktop" | "web";
         /** @description The client's stable device identifier; its profile_device values take part */
-        "X-Silo-Device-Id"?: string;
+        "X-Vio-Device-Id"?: string;
         /** @description Optional display name recorded on the device registry */
-        "X-Silo-Device-Name"?: string;
+        "X-Vio-Device-Name"?: string;
         /** @description Optional platform recorded on the device registry */
-        "X-Silo-Device-Platform"?: string;
+        "X-Vio-Device-Platform"?: string;
       };
       path?: never;
       cookie?: never;
