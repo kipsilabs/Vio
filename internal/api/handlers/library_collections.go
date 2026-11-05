@@ -8,6 +8,7 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
+	neturl "net/url"
 	"runtime/debug"
 	"slices"
 	"sort"
@@ -26,9 +27,11 @@ import (
 	"github.com/Silo-Server/silo-server/internal/access"
 	"github.com/Silo-Server/silo-server/internal/adminjob"
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
+	"github.com/Silo-Server/silo-server/internal/artworkkey"
 	"github.com/Silo-Server/silo-server/internal/artworkurl"
 	"github.com/Silo-Server/silo-server/internal/blobstore"
 	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/collage"
 	"github.com/Silo-Server/silo-server/internal/collections/templates"
 	"github.com/Silo-Server/silo-server/internal/collectionutil"
 	evt "github.com/Silo-Server/silo-server/internal/events"
@@ -40,21 +43,15 @@ import (
 )
 
 type LibraryCollectionHandler struct {
-	repo            *catalog.LibraryCollectionRepository
-	service         *catalog.LibraryCollectionService
-	itemRepo        *catalog.ItemRepository
-	Executor        *catalog.QueryExecutor
-	detailSvc       *catalog.DetailService
-	httpClient      *http.Client
-	ArtworkStore    blobstore.Store
-	ArtworkResolver artworkurl.Resolver
-	// ArtworkSigner maps a local-storage signed route back to its store key,
-	// so a collage reads its sources from the store instead of requesting the
-	// server's own route.
-	ArtworkSigner *artworkurl.Signer
-	// ArtworkRepair queues regeneration of a collage source missing from local
-	// storage; nil skips that.
-	ArtworkRepair         ArtworkRepairEnqueuer
+	repo                  *catalog.LibraryCollectionRepository
+	service               *catalog.LibraryCollectionService
+	itemRepo              *catalog.ItemRepository
+	Executor              *catalog.QueryExecutor
+	detailSvc             *catalog.DetailService
+	httpClient            *http.Client
+	ArtworkStore          blobstore.Store
+	ArtworkResolver       artworkurl.Resolver
+	ArtworkSigner         *artworkurl.Signer
 	FrontendFS            fs.FS
 	SectionRepo           *sections.Repository
 	UserCollectionPool    *pgxpool.Pool
@@ -65,12 +62,9 @@ type LibraryCollectionHandler struct {
 	JobRepo               *adminjob.Repository
 	EventsHub             *evt.Hub
 	SortPreferenceCleaner *userstore.CollectionSortPreferenceCleaner
-	// CollectionOwners resolves the owner's access for another profile's
-	// shared collection opted into the library tab.
-	CollectionOwners catalog.PersonalCollectionAccess
-	// PersonalCollages serves the collages of the personal collections opted
-	// into a library tab; nil when artwork storage is not configured.
-	PersonalCollages *catalog.PersonalCollectionCollages
+	PersonalMemberCounts  *catalog.PersonalCollectionMemberCounts
+	CollectionOwners      catalog.PersonalCollectionAccess
+	PersonalCollages      *catalog.PersonalCollectionCollages
 
 	// itemCollectionIndex answers the item→collections reverse lookup behind
 	// the item detail "collections" field. Nil means use repo; tests inject a
@@ -118,7 +112,7 @@ func NewLibraryCollectionHandler(
 	httpClient *http.Client,
 ) *LibraryCollectionHandler {
 	if httpClient == nil {
-		httpClient = newCollectionImageClient()
+		httpClient = http.DefaultClient
 	}
 
 	return &LibraryCollectionHandler{
@@ -199,19 +193,77 @@ func (h *LibraryCollectionHandler) storeBundledTemplatePoster(
 	return true, storedPath, thumbhash, nil
 }
 
-// ComposeCollectionCollage implements catalog.CollageGenerator for server
-// collections; see collectionCollageComposer.
+// ComposeCollectionCollage implements catalog.CollageGenerator. It fetches the
+// source posters, composes them, and stores the result in the collection's
+// collage directory with key as its revision, so every node that builds the
+// same collage writes the same objects.
 func (h *LibraryCollectionHandler) ComposeCollectionCollage(ctx context.Context, collectionID, key string, sources []string) (string, string, error) {
-	return h.collageComposer().ComposeCollectionCollage(ctx, collectionID, key, sources)
+	if len(sources) == 0 {
+		return "", "", collage.ErrNotEnoughImages
+	}
+
+	slog.InfoContext(ctx, "collage: generating poster", "component", "api", "collection_id", collectionID, "item_poster_count", len(sources))
+
+	// Resolve poster paths to fetchable URLs. The collage is stored under the
+	// key of all its sources, so a source that doesn't resolve or download
+	// fails the build rather than being left out. A later read retries it.
+	resolved := h.detailSvc.PresignImageURLs(ctx, sources, "poster", "small")
+	imageData := make([][]byte, 0, len(sources))
+	for _, path := range sources {
+		url := resolved[path]
+		if url == "" {
+			return "", "", fmt.Errorf("collage source %q did not resolve", path)
+		}
+		data, err := h.collageComposer().fetchImage(ctx, url)
+		if err != nil {
+			// A transport error names the presigned URL; keep it out of logs.
+			var urlErr *neturl.Error
+			if errors.As(err, &urlErr) {
+				err = urlErr.Err
+			}
+			return "", "", fmt.Errorf("fetching collage source %q: %w", path, err)
+		}
+		imageData = append(imageData, data)
+	}
+
+	// Compose the collage.
+	composited, err := collage.ComposePoster(imageData)
+	if err != nil {
+		return "", "", err
+	}
+
+	// Process through the standard image pipeline (generates WebP variants + thumbhash).
+	s3Path, thumbhash, err := putCollectionImageVariants(ctx, h.ArtworkStore, collectionCollageDir(adminCollectionImagePrefix, collectionID), key, collectionPosterWidths, composited)
+	if err != nil {
+		return "", "", fmt.Errorf("processing collage image: %w", err)
+	}
+	if want := h.CollectionCollagePath(collectionID, key); s3Path != want {
+		return "", "", fmt.Errorf("collage stored at %q, want %q", s3Path, want)
+	}
+
+	slog.InfoContext(ctx, "collage: poster generated successfully", "component", "api", "collection_id", collectionID, "s3_path", s3Path)
+	return s3Path, thumbhash, nil
 }
 
 // CollectionCollagePath implements catalog.CollageGenerator.
 func (h *LibraryCollectionHandler) CollectionCollagePath(collectionID, key string) string {
-	return h.collageComposer().CollectionCollagePath(collectionID, key)
+	return artworkkey.Original(collectionCollageDir(adminCollectionImagePrefix, collectionID), key, ".webp")
 }
 
 func (h *LibraryCollectionHandler) collageComposer() collectionCollageComposer {
-	return collectionCollageComposer{prefix: adminCollectionImagePrefix, store: h.ArtworkStore, posters: h.detailSvc, signer: h.ArtworkSigner, repair: h.ArtworkRepair, httpClient: h.httpClient}
+	return collectionCollageComposer{prefix: adminCollectionImagePrefix, store: h.ArtworkStore, posters: h.detailSvc, signer: h.ArtworkSigner, httpClient: h.httpClient}
+}
+
+// viewerCollectionCounts returns viewer-specific counts, preserving absent counts on errors.
+func (h *LibraryCollectionHandler) viewerCollectionCounts(ctx context.Context, collections []*models.LibraryCollection, access catalog.AccessFilter) map[string]catalog.ViewerCollectionCount {
+	if h.repo == nil {
+		return nil
+	}
+	counts, err := h.repo.ViewerCollectionCounts(ctx, collections, access)
+	if err != nil {
+		slog.WarnContext(ctx, "counting server collections for the viewer failed", "component", "collections", "error", err)
+	}
+	return counts
 }
 
 type libraryCollectionResponse struct {
@@ -245,8 +297,7 @@ type libraryCollectionResponse struct {
 	ItemCount         int             `json:"item_count"`
 	CreatedAt         string          `json:"created_at"`
 	UpdatedAt         string          `json:"updated_at"`
-	// PosterIsCollage reports that PosterURL is the viewer's collage of the
-	// collection's members (withViewerPosters). Only /api/v2 carries it.
+	// PosterIsCollage reports viewer-specific collage state without changing the frozen v1 wire shape.
 	PosterIsCollage bool `json:"-"`
 }
 
@@ -287,6 +338,10 @@ type reorderLibraryCollectionGroupsRequest struct {
 	OrderedIDs []string `json:"ordered_ids"`
 }
 
+type ArtworkRepairEnqueuer interface {
+	EnqueueArtworkRepair(context.Context, []string, int) (int, error)
+}
+
 type libraryCollectionsListResponse struct {
 	Collections []libraryCollectionResponse      `json:"collections"`
 	Groups      []libraryCollectionGroupResponse `json:"groups,omitempty"`
@@ -315,8 +370,7 @@ type createLibraryCollectionRequest struct {
 	ManagementSource  string          `json:"management_source"`
 	ManagementKey     string          `json:"management_key"`
 	SyncSchedule      string          `json:"sync_schedule"`
-	// V1Rules: see PersonalCollectionPreviewRequest.
-	V1Rules bool `json:"-"`
+	V1Rules           bool            `json:"-"`
 }
 
 type updateLibraryCollectionRequest struct {
@@ -341,8 +395,7 @@ type updateLibraryCollectionRequest struct {
 	ManagementSource  *string                `json:"management_source"`
 	ManagementKey     *string                `json:"management_key"`
 	SyncSchedule      *string                `json:"sync_schedule"`
-	// V1Rules: see PersonalCollectionPreviewRequest.
-	V1Rules bool `json:"-"`
+	V1Rules           bool                   `json:"-"`
 }
 
 type importMDBListRequest struct {
@@ -483,6 +536,30 @@ type importTMDBDiscoverSpecBody struct {
 	WithRuntimeGte   int      `json:"with_runtime_gte,omitempty"`
 	WithRuntimeLte   int      `json:"with_runtime_lte,omitempty"`
 	OriginalLanguage string   `json:"original_language,omitempty"`
+}
+
+type importTraktRequest struct {
+	SortConfig  json.RawMessage `json:"sort_config,omitempty"`
+	LibraryID   int             `json:"library_id"`
+	LibraryIDs  []int           `json:"library_ids"`
+	Title       string          `json:"title"`
+	Description string          `json:"description"`
+	Preset      string          `json:"preset"`
+	MediaType   string          `json:"media_type"`
+	ProfileID   string          `json:"profile_id,omitempty"`
+	// ListURL selects a user-authored Trakt list
+	// (https://trakt.tv/users/{user}/lists/{slug}) instead of a preset.
+	ListURL           string `json:"list_url,omitempty"`
+	Limit             *int   `json:"limit,omitempty"`
+	VirtualPlayback   *bool  `json:"virtual_playback,omitempty"`
+	Featured          bool   `json:"featured"`
+	PosterURL         string `json:"poster_url"`
+	PosterSourceURL   string `json:"poster_source_url"`
+	BackdropSourceURL string `json:"backdrop_source_url"`
+	SyncSchedule      string `json:"sync_schedule"`
+	ManagementMode    string `json:"management_mode,omitempty"`
+	ManagementSource  string `json:"management_source,omitempty"`
+	ManagementKey     string `json:"management_key,omitempty"`
 }
 
 type importCollectionResponse struct {
@@ -725,7 +802,7 @@ func templateEligibleForLibrary(tmpl templates.Template, library *models.MediaFo
 		return tmpl.MediaKind == templates.MediaTV || tmpl.MediaKind == templates.MediaMixed
 	case "audiobook", "audiobooks":
 		// Audiobook libraries only accept audiobook-targeted templates.
-		// Today the catalog has none (built-ins are TMDB/MDBList
+		// Today the catalog has none (built-ins are TMDB/Trakt/MDBList
 		// movie/TV imports), so this evaluates to an empty gallery —
 		// the correct UX. Previously this fell through to default:true
 		// and offered admins broken movie/TV templates.
@@ -752,21 +829,14 @@ type libraryTabCollection struct {
 	ItemCount        int     `json:"item_count"`
 	Featured         bool    `json:"featured,omitempty"`
 	CreatorProfileID *string `json:"creator_profile_id,omitempty"`
-	// PosterIsCollage reports that PosterURL is the viewer's collage. The
-	// frozen /api/v1 shape does not carry it.
-	PosterIsCollage bool `json:"-"`
+	PosterIsCollage  bool    `json:"-"`
 }
 
-// libraryTabCardOf is the card of a server collection whose poster is already
-// the viewer's (withViewerPosters).
+// libraryTabCardOf is the card of a server collection whose poster is already viewer-specific.
 func (h *LibraryCollectionHandler) libraryTabCardOf(ctx context.Context, c *models.LibraryCollection) libraryTabCollection {
 	return libraryTabCollection{
-		ID:              c.ID,
-		Title:           c.Title,
-		PosterURL:       h.presignGPURLCtx(ctx, c.PosterURL),
-		PosterThumbhash: c.PosterThumbhash,
-		ItemCount:       c.ItemCount,
-		Featured:        c.Featured,
+		ID: c.ID, Title: c.Title, PosterURL: h.presignGPURLCtx(ctx, c.PosterURL),
+		PosterThumbhash: c.PosterThumbhash, ItemCount: c.ItemCount, Featured: c.Featured,
 		PosterIsCollage: c.PosterAutoGenerated && c.PosterURL != "",
 	}
 }
@@ -792,9 +862,10 @@ type libraryTabResponse struct {
 	Ungrouped   *libraryTabUngrouped        `json:"ungrouped,omitempty"`
 }
 
-// HandleListLibraryUserCollections serves LibraryUserCollections: the
-// personal collections on the library's Collections tab that the viewer can
-// see, never another login's.
+// HandleListLibraryUserCollections returns the viewer's own personal
+// collections that they've opted into their library Collections tab and whose
+// library scope matches the requested library. Personal collections are
+// private to their owner; this endpoint never reveals other users' rows.
 func (h *LibraryCollectionHandler) HandleListLibraryUserCollections(w http.ResponseWriter, r *http.Request) {
 	libraryID, ok := parsePathLibraryID(w, r)
 	if !ok {
@@ -942,7 +1013,6 @@ func (h *LibraryCollectionHandler) HandleCreateAdminCollection(w http.ResponseWr
 		writeError(w, http.StatusBadRequest, "bad_request", "Invalid request body")
 		return
 	}
-	req.V1Rules = true
 	resp, err := h.createAdminCollection(r.Context(), req, func(id, p, b string) error { return h.processArtworkInputs(r, id, p, b) })
 	if err != nil {
 		writeAPIError(w, err)
@@ -963,7 +1033,6 @@ func (h *LibraryCollectionHandler) HandleUpdateAdminCollection(w http.ResponseWr
 		writeError(w, http.StatusBadRequest, "bad_request", "Invalid request body")
 		return
 	}
-	req.V1Rules = true
 	resp, err := h.updateAdminCollection(r.Context(), collectionID, req, func(id, p, b string) error { return h.processArtworkInputs(r, id, p, b) })
 	if err != nil {
 		writeAPIError(w, err)
@@ -983,7 +1052,6 @@ func (h *LibraryCollectionHandler) HandlePreviewAdminCollection(w http.ResponseW
 		writeError(w, http.StatusBadRequest, "bad_request", "Invalid request body")
 		return
 	}
-	req.V1Rules = true
 
 	resp, err := h.PreviewAdminCollection(r.Context(), req)
 	if err != nil {
@@ -1104,7 +1172,7 @@ func (h *LibraryCollectionHandler) requireManualCollection(w http.ResponseWriter
 }
 
 // HandleReorderAdminCollectionItems handles PUT /admin/collections/{id}/items/order.
-// Manual collections only — synced types (mdblist/tmdb) and smart
+// Manual collections only — synced types (mdblist/tmdb/trakt) and smart
 // collections reject the call.
 func (h *LibraryCollectionHandler) HandleReorderAdminCollectionItems(w http.ResponseWriter, r *http.Request) {
 	collectionID, ok := h.requireManualCollection(w, r)
@@ -1552,7 +1620,7 @@ func (h *LibraryCollectionHandler) applyTemplateBundle(
 			}
 			entry.CollectionID = collection.ID
 			rememberTemplateBundleExistingCollection(remainingByLibrarySlug, library.ID, collection)
-			if !tmpl.NeedsSetup() {
+			if templateBundleTemplateCanInitialSync(tmpl) {
 				pendingSyncs = append(pendingSyncs, pendingTemplateBundleSync{
 					CollectionID: collection.ID,
 					SyncSchedule: collection.SyncSchedule,
@@ -1674,6 +1742,13 @@ func (h *LibraryCollectionHandler) ensureTemplatePoster(
 
 func shouldQueueTemplateBundleSyncs(bundle templates.Bundle, pendingCount int) bool {
 	return bundle.ID == "all_defaults" || pendingCount > templateBundleInlineSyncLimit
+}
+
+func templateBundleTemplateCanInitialSync(tmpl templates.Template) bool {
+	if tmpl.Source == templates.SourceTMDBCollection {
+		return tmpl.TMDBCollection != nil && tmpl.TMDBCollection.CollectionID > 0
+	}
+	return true
 }
 
 func templateBundleCreatedEntries(pending []pendingTemplateBundleSync) []templateBundleApplyEntry {
@@ -2576,20 +2651,18 @@ func (h *LibraryCollectionHandler) HandleImportTMDBCollection(w http.ResponseWri
 	writeJSON(w, http.StatusCreated, resp)
 }
 
-// HandleImportTraktCollection answers the frozen v1 admin Trakt import route.
-// Silo no longer supports Trakt, so every well-formed request is refused.
 func (h *LibraryCollectionHandler) HandleImportTraktCollection(w http.ResponseWriter, r *http.Request) {
-	var req struct{}
+	var req importTraktRequest
 	if err := decodeJSONOrMultipart(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", "Invalid request body")
 		return
 	}
-	writeAPIError(w, traktImportRetired())
-}
-
-// traktImportRetired is the error the frozen v1 Trakt import routes return.
-func traktImportRetired() error {
-	return apiError(http.StatusGone, "unsupported_source", "new Trakt collections are not supported")
+	resp, err := h.importAdminTrakt(r.Context(), req, func(id, p, b string) error { return h.processArtworkInputs(r, id, p, b) })
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, resp)
 }
 
 // loadOrderedCollectionItems answers a manual collection's stored items in
@@ -2751,15 +2824,6 @@ func (h *LibraryCollectionHandler) itemListResponseOf(ctx context.Context, item 
 	resp.PosterURL = h.presignURLCtx(ctx, cardThumbnailPath(item.PosterPath), "card")
 	resp.BackdropURL = h.presignURLCtx(ctx, cardThumbnailPath(item.BackdropPath), "card")
 	return resp
-}
-
-// setListingLogos fills in the logo of each card on a v2 collection page,
-// signed in one batch. items are the cards' media items in any order.
-func (h *LibraryCollectionHandler) setListingLogos(ctx context.Context, cards []itemListResponse, items []*models.MediaItem, access catalog.AccessFilter) {
-	urls := signListingLogos(ctx, h.detailSvc, localizedLogoPaths(ctx, h.detailSvc, items, access), access.ImageSizeFor(imagesize.SlotLogo))
-	for i := range cards {
-		cards[i].LogoURL = urls[cards[i].ContentID]
-	}
 }
 
 func (h *LibraryCollectionHandler) presignURL(r *http.Request, path string, variant string) string {
@@ -3124,7 +3188,7 @@ type tmdbDiscoverConfigBody struct {
 //
 // The discover sub-object exists so additional discover-only fields don't
 // pollute the top-level libraryCollectionSourceConfig struct used for the
-// existing tmdb_preset / mdblist_json modes.
+// existing tmdb_preset / trakt_preset / mdblist_json modes.
 func buildTMDBDiscoverSourceConfig(mediaType string, spec importTMDBDiscoverSpecBody, limit *int, virtualPlayback bool) (json.RawMessage, error) {
 	payload := struct {
 		Mode            string                 `json:"mode"`
@@ -3205,10 +3269,6 @@ func (h *LibraryCollectionHandler) processCollectionImage(
 	return uploadCollectionImageVariants(ctx, h.ArtworkStore, adminCollectionImagePrefix, collectionID, imageType, fileData)
 }
 
-func (h *LibraryCollectionHandler) deleteCollectionImages(ctx context.Context, collectionID, imageType string) error {
-	return removeCollectionImageVariants(ctx, h.ArtworkStore, adminCollectionImagePrefix, collectionID, imageType)
-}
-
 // adminCollectionImagePath returns the stored path of one admin collection
 // image.
 func (h *LibraryCollectionHandler) adminCollectionImagePath(ctx context.Context, collectionID, imageType string) (string, error) {
@@ -3254,7 +3314,7 @@ func (h *LibraryCollectionHandler) processArtworkInputs(r *http.Request, collect
 			if sourceByType[imageType] == "" {
 				continue
 			}
-			fileData, err = downloadCollectionImageURL(adminCollectionImageContext(r.Context()), h.httpClient, sourceByType[imageType])
+			fileData, err = downloadCollectionImageURL(r.Context(), h.httpClient, sourceByType[imageType])
 			if err != nil {
 				return fmt.Errorf("%s source: %w", imageType, err)
 			}
@@ -3450,7 +3510,7 @@ func (h *LibraryCollectionHandler) SubscribePurgeInvalidations(ctx context.Conte
 // Typical causes:
 //
 //   - the owning provider installation was disabled or removed at the time
-//     the original TMDB sync ran, so the per-row check rejected
+//     the original TMDB/Trakt sync ran, so the per-row check rejected
 //     "virtual playback item requires an owning provider installation";
 //   - a prior purge reset the media_files row without re-creating it.
 //
@@ -3568,4 +3628,11 @@ func (h *LibraryCollectionHandler) HandleMaterializeAdminCollectionItem(w http.R
 		"episodes_materialized": res.EpisodesMaterialized,
 		"message":               fmt.Sprintf("Materialized %d virtual files (%d existing) for %s (%s)", res.FilesCreated, res.FilesExisting, res.ContentID, res.MediaType),
 	})
+}
+
+func (h *LibraryCollectionHandler) setListingLogos(ctx context.Context, cards []itemListResponse, items []*models.MediaItem, access catalog.AccessFilter) {
+	urls := signListingLogos(ctx, h.detailSvc, localizedLogoPaths(ctx, h.detailSvc, items, access), access.ImageSizeFor(imagesize.SlotLogo))
+	for i := range cards {
+		cards[i].LogoURL = urls[cards[i].ContentID]
+	}
 }

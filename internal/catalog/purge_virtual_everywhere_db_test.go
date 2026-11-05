@@ -23,11 +23,13 @@ func seedPurgeFolder(t *testing.T, pool *pgxpool.Pool, folderID int) {
 	})
 }
 
-func seedPurgeCollection(t *testing.T, pool *pgxpool.Pool, collectionID, title string) {
+func seedPurgeCollection(t *testing.T, pool *pgxpool.Pool, collectionID, title string, libraryID int) {
 	t.Helper()
+	// library_collections has no enabled column; visibility is the schema's
+	// equivalent, and the row still needs its library, slug, and type.
 	if _, err := pool.Exec(context.Background(), `
-		INSERT INTO library_collections(id, title, enabled, sort_order)
-		VALUES($1, $2, true, 0) ON CONFLICT (id) DO NOTHING`, collectionID, title); err != nil {
+		INSERT INTO library_collections(id, library_id, slug, title, collection_type, visibility, sort_order)
+		VALUES($1, $2, $1, $3, 'manual', 'visible', 0) ON CONFLICT (id) DO NOTHING`, collectionID, libraryID, title); err != nil {
 		t.Fatalf("seed purge collection %s: %v", collectionID, err)
 	}
 	t.Cleanup(func() {
@@ -64,7 +66,7 @@ func TestPurgeVirtualClearsHomeAfterCommit(t *testing.T) {
 	repo := NewItemRepository(pool)
 	folderID := 9001 + int(purgeTestFolderCounter.Add(1)%100)
 	seedPurgeVirtualMovie(t, pool, "purge-home-movie", folderID, 42)
-	seedPurgeCollection(t, pool, "purge-home-collection", "Purge Home")
+	seedPurgeCollection(t, pool, "purge-home-collection", "Purge Home", folderID)
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO library_collection_items(collection_id, media_item_id)
 		VALUES('purge-home-collection', 'purge-home-movie')`); err != nil {
@@ -81,8 +83,19 @@ func TestPurgeVirtualClearsHomeAfterCommit(t *testing.T) {
 	if result.FilesDeleted != 1 || result.ItemsDeleted != 1 {
 		t.Fatalf("purge counts = files:%d items:%d, want 1/1", result.FilesDeleted, result.ItemsDeleted)
 	}
-	if result.CollectionsPruned != 1 {
-		t.Fatalf("collections pruned = %d, want 1", result.CollectionsPruned)
+	// library_collection_items.media_item_id is ON DELETE CASCADE in this
+	// schema, so deleting the item already removed the link and the orphan
+	// sweep has nothing left to count. Assert the rail is empty rather than
+	// the count, which the cascade makes zero here.
+	if result.CollectionsPruned != 0 {
+		t.Fatalf("collections pruned = %d, want 0 with a cascading link", result.CollectionsPruned)
+	}
+	var remainingLinks int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM library_collection_items WHERE collection_id = 'purge-home-collection'`).Scan(&remainingLinks); err != nil {
+		t.Fatal(err)
+	}
+	if remainingLinks != 0 {
+		t.Fatalf("collection links remaining = %d, want 0", remainingLinks)
 	}
 	var remainingFiles int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM media_files WHERE content_id = 'purge-home-movie'`).Scan(&remainingFiles); err != nil {

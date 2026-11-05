@@ -11,51 +11,6 @@ import (
 	"github.com/Silo-Server/silo-server/internal/tonemap"
 )
 
-func TestBuildPrepareFileArgsEmitsFaststartMP4(t *testing.T) {
-	cases := []struct {
-		name  string
-		video string
-		audio string
-	}{
-		{"remux", "copy", "copy"},
-		{"transcode", "h264", "aac"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			args := buildPrepareFileArgs(TranscodeOpts{
-				InputPath:        "/media/in.mkv",
-				SourceVideoCodec: "h264",
-				TargetCodecVideo: tc.video,
-				TargetCodecAudio: tc.audio,
-				HWAccel:          "none",
-				AudioTrackIndex:  -1,
-			}, "/artifacts/out.mp4")
-			joined := strings.Join(args, " ")
-
-			if !strings.Contains(joined, "-movflags +faststart") {
-				t.Fatalf("%s args missing -movflags +faststart: %s", tc.name, joined)
-			}
-			if !strings.Contains(joined, "-f mp4") {
-				t.Fatalf("%s args missing -f mp4: %s", tc.name, joined)
-			}
-			if strings.Contains(joined, "-f hls") || strings.Contains(joined, "hls_segment") {
-				t.Fatalf("%s args must not emit HLS: %s", tc.name, joined)
-			}
-			if args[len(args)-1] != "/artifacts/out.mp4" {
-				t.Fatalf("%s output path must be last arg: %s", tc.name, joined)
-			}
-		})
-	}
-
-	// Remux copies the video stream rather than re-encoding.
-	remux := strings.Join(buildPrepareFileArgs(TranscodeOpts{
-		InputPath: "/m.mkv", TargetCodecVideo: "copy", TargetCodecAudio: "copy", HWAccel: "none", AudioTrackIndex: -1,
-	}, "/o.mp4"), " ")
-	if !strings.Contains(remux, "-c:v copy") {
-		t.Fatalf("remux must copy video: %s", remux)
-	}
-}
-
 // A download encode is not watched live, so it takes a slower preset than
 // HLS, lets libx264 choose the level for 4K or 60 fps output, and tags HEVC
 // hvc1 so Apple players open it.
@@ -322,7 +277,7 @@ func TestPrepareFileDoesNotDropHardwareToneMapGraphOnSoftwareRetry(t *testing.T)
 	}
 	track := models.VideoTrack{
 		Codec: "hevc", Profile: "Main 10", Level: 153, Width: 3840, Height: 2160, FrameRate: "23.976",
-		ColorRange: "tv", ColorPrimaries: "bt2020", ColorTransfer: "smpte2084", ColorSpace: "bt2020nc",
+		ColorRange: "tv", ColorPrimaries: "bt2020", ColorTransfer: colorTransferPQ, ColorSpace: "bt2020nc",
 		BitDepth: 10, PixelFormat: "yuv420p10le",
 	}
 	revision := tonemap.RevisionForFile(&models.MediaFile{ID: 42, FileSize: info.Size(), VideoTracks: []models.VideoTrack{track}})

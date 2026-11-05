@@ -268,7 +268,7 @@ func listRemoteWebVersions(ctx context.Context, sourceURL string) ([]string, err
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("User-Agent", "vio-jellyfin-web-installer")
+	req.Header.Set("User-Agent", "silo-jellyfin-web-installer")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -520,10 +520,6 @@ func installWebComponentLocked(ctx context.Context, opts WebComponentInstallOpti
 	if now == nil {
 		now = time.Now
 	}
-	run := opts.RunCommand
-	if run == nil {
-		run = runWebInstallCommand
-	}
 	reportProgress := func(phase WebComponentOperationPhase, progressPercent int, message string) {
 		notifyWebOperationProgress(
 			opts.OnProgress,
@@ -543,6 +539,13 @@ func installWebComponentLocked(ctx context.Context, opts WebComponentInstallOpti
 		return webComponentStatus(root, ManagedWebInstallPath(root), version, sourceURL), err
 	}
 	defer func() { _ = os.RemoveAll(tmpRoot) }()
+	run := opts.RunCommand
+	if run == nil {
+		// npm caches under HOME by default, and HOME is / when the container
+		// runs silo directly as a uid with no passwd entry. A cache in the
+		// workspace is writable either way and goes away with it.
+		run = webInstallCommandRunner(filepath.Join(tmpRoot, "npm-cache"))
+	}
 	if err := os.WriteFile(filepath.Join(tmpRoot, webTempMarker), []byte("silo jellyfin web install workspace\n"), 0o644); err != nil {
 		writeWebInstallError(root, err)
 		return webComponentStatus(root, ManagedWebInstallPath(root), version, sourceURL), err
@@ -846,7 +849,7 @@ func validateWebComponentDirectory(path string) (WebComponentMetadata, error) {
 		return WebComponentMetadata{}, fmt.Errorf("invalid Jellyfin Web metadata version %q", metadata.Version)
 	}
 	if strings.TrimSpace(metadata.License) == "" {
-		return WebComponentMetadata{}, errors.New("Jellyfin Web metadata license is missing") //nolint:staticcheck // Jellyfin Web is a proper product name.
+		return WebComponentMetadata{}, errors.New("metadata license is missing for Jellyfin Web")
 	}
 	if _, err := normalizeWebSourceURL(metadata.SourceURL); err != nil {
 		return WebComponentMetadata{}, err
@@ -1026,7 +1029,7 @@ func ensureWebInstallerPrerequisites() error {
 		}
 	}
 	if len(missing) > 0 {
-		return fmt.Errorf("%w: install %s on the Vio host or container", ErrWebInstallerUnavailable, strings.Join(missing, ", "))
+		return fmt.Errorf("%w: install %s on the Silo host or container", ErrWebInstallerUnavailable, strings.Join(missing, ", "))
 	}
 	return nil
 }
@@ -1484,20 +1487,24 @@ func commandOutput(ctx context.Context, dir, name string, args ...string) (strin
 	return string(out), nil
 }
 
-func runWebInstallCommand(ctx context.Context, dir string, argv []string, stdin string) error {
-	if len(argv) == 0 {
-		return fmt.Errorf("empty command")
+// webInstallCommandRunner runs install commands with npm's cache in cacheDir.
+func webInstallCommandRunner(cacheDir string) func(context.Context, string, []string, string) error {
+	return func(ctx context.Context, dir string, argv []string, stdin string) error {
+		if len(argv) == 0 {
+			return errors.New("empty command")
+		}
+		cmd := exec.CommandContext(ctx, argv[0], argv[1:]...) //nolint:gosec // G204: argv is the installer's own git and npm commands
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(), "npm_config_cache="+cacheDir)
+		if stdin != "" {
+			cmd.Stdin = strings.NewReader(stdin)
+		}
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("%s: %s", strings.Join(argv, " "), strings.TrimSpace(string(out)))
+		}
+		return nil
 	}
-	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
-	cmd.Dir = dir
-	if stdin != "" {
-		cmd.Stdin = strings.NewReader(stdin)
-	}
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("%s: %s", strings.Join(argv, " "), strings.TrimSpace(string(out)))
-	}
-	return nil
 }
 
 func copyDir(src, dst string) error {
@@ -1670,7 +1677,7 @@ Modified: %t
 Patches: %s
 Checksum: %s
 
-This component is separate from Vio's AGPL-licensed server code. It is installed only
+This component is separate from Silo's AGPL-licensed server code. It is installed only
 when an administrator explicitly requests Jellyfin-compatible web UI assets.
 `, metadata.SourceURL, metadata.Tag, metadata.CommitSHA, metadata.License, metadata.BuildCommand, metadata.Modified, strings.Join(metadata.Patches, ", "), metadata.Checksum)
 	return os.WriteFile(filepath.Join(dir, webSourceFile), []byte(body), 0o644)

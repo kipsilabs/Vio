@@ -123,7 +123,7 @@ func TestParentUnplayedClearsWatchedEpisodesWithoutFile(t *testing.T) {
 				watchState:    watchstate.NewService(provider),
 				episodes:      stubEpisodePartitioner{withFile: []string{"on-disk"}, fileless: []string{"deleted", "metadata-only"}},
 			}
-			if err := service.watchState.RecordJellycompatMarkPlayedBatch(t.Context(), 1, "profile-1", []string{"on-disk", "deleted"}, time.Now().UTC().Add(-time.Hour)); err != nil {
+			if err := service.watchState.RecordJellycompatMarkPlayedBatch(t.Context(), 1, "profile-1", []string{"on-disk", "deleted"}, time.Now().UTC().Add(-time.Hour), false); err != nil {
 				t.Fatal(err)
 			}
 			codec := NewResourceIDCodec()
@@ -192,7 +192,7 @@ func TestParentUnplayedUsesSeriesSeasonIdentity(t *testing.T) {
 		watchState:    watchstate.NewService(provider),
 		episodes:      partitioner,
 	}
-	if err := service.watchState.RecordJellycompatMarkPlayedBatch(t.Context(), 1, "profile-1", []string{"on-disk", "deleted"}, time.Now().UTC().Add(-time.Hour)); err != nil {
+	if err := service.watchState.RecordJellycompatMarkPlayedBatch(t.Context(), 1, "profile-1", []string{"on-disk", "deleted"}, time.Now().UTC().Add(-time.Hour), false); err != nil {
 		t.Fatal(err)
 	}
 	codec := NewResourceIDCodec()
@@ -242,7 +242,7 @@ func TestParentUnplayedSyntheticSeasonWithoutRow(t *testing.T) {
 		watchState:    watchstate.NewService(provider),
 		episodes:      partitioner,
 	}
-	if err := service.watchState.RecordJellycompatMarkPlayedBatch(t.Context(), 1, "profile-1", []string{"on-disk", "deleted"}, time.Now().UTC().Add(-time.Hour)); err != nil {
+	if err := service.watchState.RecordJellycompatMarkPlayedBatch(t.Context(), 1, "profile-1", []string{"on-disk", "deleted"}, time.Now().UTC().Add(-time.Hour), false); err != nil {
 		t.Fatal(err)
 	}
 	codec := NewResourceIDCodec()

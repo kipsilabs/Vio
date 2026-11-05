@@ -53,6 +53,12 @@ type overlayFileProvider interface {
 	ListOverlayFilesByEpisodeIDs(ctx context.Context, episodeIDs []string) (map[string][]*models.MediaFile, error)
 }
 
+// episodeListFileProvider loads only the file fields a season's episode list
+// renders: access, version rows, the unreadable flag, and overlay badges.
+type episodeListFileProvider interface {
+	ListEpisodeListFilesByEpisodeIDs(ctx context.Context, episodeIDs []string) (map[string][]*models.MediaFile, error)
+}
+
 type MetadataRefreshRequester interface {
 	RequestStaleMetadataRefresh(ctx context.Context, targetType, contentID string) error
 }
@@ -118,19 +124,13 @@ type ItemsHandler struct {
 	EventsHub                *evt.Hub
 	UserRepo                 *auth.UserRepository
 	DeviceProfileReader      plugins.DeviceCapabilityProfileSource
+	virtualPrefetcher        VirtualPrefetcher
+	virtualFileByID          FilePathResolver
 	AccessGroups             access.GroupPolicyProvider // optional; resolves inherited library access when no scope is in context
 	MarkerPopulation         MarkerPopulationService
 	MarkerFileResolver       FilePathResolver
-	// VirtualPrefetcher warms virtual candidate listings when a watch detail
-	// is viewed, so the later playback start finds a warm BestResultCache.
-	// Nil disables prefetch. Set via SetVirtualPrefetcher.
-	virtualPrefetcher VirtualPrefetcher
-	// VirtualFileByID loads a MediaFile for a version FileID so prefetch can
-	// warm exactly the rows the detail page offers. Nil disables prefetch.
-	virtualFileByID VirtualFileByID
 	// virtualSelectionProber schedules the pre-play probe for an explicitly
-	// selected virtual version whose inventory is still missing. Nil disables
-	// selection probing. Set via SetVirtualSelectionProber.
+	// selected virtual version whose inventory is still missing.
 	virtualSelectionProber VirtualSelectionProber
 	// virtualSelectionPreprober runs that same probe inline for a caller that
 	// waits on its tracks (the single-file versions check). Nil disables the
@@ -163,15 +163,6 @@ type VirtualFileByID interface {
 	GetByID(ctx context.Context, id int) (*models.MediaFile, error)
 }
 
-// VirtualSelectionProber schedules the pre-play work for one explicitly
-// selected virtual version: the probe chain that enumerates its inventory, and
-// the provider-side fetch warm-up that puts its bytes in place before play.
-// *PlaybackHandler implements both entry points; nil disables selection work.
-type VirtualSelectionProber interface {
-	ScheduleSelectedFileProbe(contentID string, fileID int, filter catalog.AccessFilter)
-	ScheduleSelectedFileWarm(contentID string, fileID int, filter catalog.AccessFilter)
-}
-
 // SetVirtualPrefetcher wires watch-detail prefetch. Either arg may be nil to
 // keep prefetch disabled.
 func (h *ItemsHandler) SetVirtualPrefetcher(p VirtualPrefetcher, files VirtualFileByID) {
@@ -180,15 +171,6 @@ func (h *ItemsHandler) SetVirtualPrefetcher(p VirtualPrefetcher, files VirtualFi
 	}
 	h.virtualPrefetcher = p
 	h.virtualFileByID = files
-}
-
-// SetVirtualSelectionProber wires probe-on-select for watch-detail reads. Nil
-// keeps the selection probe disabled.
-func (h *ItemsHandler) SetVirtualSelectionProber(p VirtualSelectionProber) {
-	if h == nil {
-		return
-	}
-	h.virtualSelectionProber = p
 }
 
 // VirtualSelectionPreprober runs one selected virtual row's inventory probe
@@ -357,12 +339,8 @@ func (h *ItemsHandler) maybeRequestStaleDetailMetadataRefresh(ctx context.Contex
 			h.maybeRequestStaleSeasonMetadataRefresh(ctx, detail.ContentID, episodes)
 		}
 	case "series":
-		if h.itemRepo == nil {
-			return
-		}
-		item, err := h.itemRepo.GetByID(ctx, detail.ContentID)
-		if err == nil && item != nil && item.EpisodeMetadataIncomplete {
-			h.requestStaleMetadataRefresh(ctx, "item", item.ContentID)
+		if detail.EpisodeMetadataIncomplete {
+			h.requestStaleMetadataRefresh(ctx, "item", detail.ContentID)
 		}
 	}
 }
@@ -454,6 +432,9 @@ type itemListResponse struct {
 	WorkID                 string                      `json:"work_id,omitempty"`
 	WorkTitle              string                      `json:"work_title,omitempty"`
 	WorkFormats            []catalog.WorkFormatSummary `json:"work_formats,omitempty"`
+
+	// ParentArtwork reaches the v2 card only; v1 is frozen.
+	ParentArtwork EpisodeParentArtworkView `json:"-"`
 }
 
 type sortMetricsResponse struct {
@@ -473,6 +454,7 @@ type itemListImageURLs struct {
 	posterURL   string
 	backdropURL string
 	logoURL     string
+	parents     episodeParentImageURLs
 }
 
 // browseResponse is the paginated response for the /items endpoint.
@@ -537,21 +519,28 @@ type episodeFileResponse struct {
 	Unreadable bool `json:"-"`
 }
 
+const (
+	EpisodeReleaseUpcoming = catalog.EpisodeReleaseUpcoming
+	EpisodeReleaseReleased = catalog.EpisodeReleaseReleased
+)
+
+// EpisodeReleaseState classifies a YYYY-MM-DD air date using the shared catalog
+// release classifier. Unknown or malformed dates are intentionally absent.
+func EpisodeReleaseState(airDate string) string {
+	return catalog.ReleaseStateForAirDate(airDate)
+}
+
 // episodeResponse is the shape of an episode in API responses.
 type episodeResponse struct {
-	StillIsEpisodeStill *bool  `json:"-"`
-	ContentID           string `json:"content_id"`
-	SeasonNumber        int    `json:"season_number"`
-	EpisodeNumber       int    `json:"episode_number"`
-	Title               string `json:"title"`
-	Overview            string `json:"overview,omitempty"`
-	AirDate             string `json:"air_date,omitempty"`
-	// ReleaseState is the release timing derived from AirDate by
-	// EpisodeReleaseState: upcoming when the calendar date is after today
-	// (UTC), released otherwise, absent when the air date is unknown. The
-	// v1 shape keeps no copy: the frozen contract is unchanged and v2
-	// carries the field under its own name.
+	StillIsEpisodeStill *bool `json:"-"`
+	// ReleaseState is consumed by the v2 renderer; the frozen v1 wire omits it.
 	ReleaseState   string                  `json:"-"`
+	ContentID      string                  `json:"content_id"`
+	SeasonNumber   int                     `json:"season_number"`
+	EpisodeNumber  int                     `json:"episode_number"`
+	Title          string                  `json:"title"`
+	Overview       string                  `json:"overview,omitempty"`
+	AirDate        string                  `json:"air_date,omitempty"`
 	Runtime        int                     `json:"runtime"`
 	ImdbID         string                  `json:"imdb_id,omitempty"`
 	TmdbID         string                  `json:"tmdb_id,omitempty"`
@@ -569,24 +558,6 @@ type episodeResponse struct {
 	MachineTranslatedFields []string `json:"-"`
 	// PendingTranslationLanguage reaches the v2 episode row only; v1 is frozen.
 	PendingTranslationLanguage string `json:"-"`
-}
-
-// Episode release states: release timing derived from an episode air date.
-// The values are part of the v2 Episode contract; unknown and malformed
-// dates classify as "" (absent) so unknown metadata fails open for playback.
-// The shared decision lives in catalog.ReleaseStateForAirDate; this is the
-// handlers-package alias so the v1 shell and the v2 renderer name one value.
-const (
-	EpisodeReleaseUpcoming = catalog.EpisodeReleaseUpcoming
-	EpisodeReleaseReleased = catalog.EpisodeReleaseReleased
-)
-
-// EpisodeReleaseState classifies a YYYY-MM-DD air date against today's UTC
-// calendar date. It is the single release-timing decision the episode list,
-// detail, and v2 renderer share: one parse, one boundary, no timezone
-// conversion beyond the stored calendar date.
-func EpisodeReleaseState(airDate string) string {
-	return catalog.ReleaseStateForAirDate(airDate)
 }
 
 type episodeImageFallback struct {
@@ -659,33 +630,7 @@ func (h *ItemsHandler) HandleGetWatchDetail(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	h.prefetchWatchDetailVirtual(r.Context(), detail, requestProfileID(r))
 	writeJSON(w, http.StatusOK, detail)
-}
-
-// prefetchWatchDetailVirtual warms virtual candidate listings for the rows a
-// watch detail offers, off the playback click path. Fire-and-forget:
-// PrefetchVirtualPlayback is already bounded (2 files), deduped, and runs on
-// a detached worker pool, so this never blocks the detail response. Only the
-// first virtual version is warmed; the start path ranks per device from the
-// neutral cache entry.
-func (h *ItemsHandler) prefetchWatchDetailVirtual(ctx context.Context, detail *catalog.WatchDetail, profileID string) {
-	if detail == nil {
-		return
-	}
-	if detail.Type != itemTypeMovie && detail.Type != itemTypeEpisode {
-		return
-	}
-	fileIDs := make([]int, 0, 2)
-	for _, v := range detail.Versions {
-		if v.FileID != 0 {
-			fileIDs = append(fileIDs, v.FileID)
-		}
-		if len(fileIDs) >= 2 {
-			break
-		}
-	}
-	h.prefetchVirtualFileIDs(ctx, fileIDs, profileID)
 }
 
 // prefetchVirtualFileIDs warms virtual candidate listings for raw file rows,
@@ -721,7 +666,6 @@ func (h *ItemsHandler) prefetchVirtualFileIDs(ctx context.Context, fileIDs []int
 	// for an already-warming file. Keys live only for the load window.
 	admitKey := virtualPrefetchFileAdmitKey(fileIDs, profileID)
 	if _, loaded := h.virtualPrefetchInflight.LoadOrStore(admitKey, struct{}{}); loaded {
-		observeVirtualPrefetchOutcome(virtualPrefetchFileCollapsed)
 		return
 	}
 	// Shed when saturated: speculative work must never queue without bound.
@@ -735,7 +679,6 @@ func (h *ItemsHandler) prefetchVirtualFileIDs(ctx context.Context, fileIDs []int
 	case sem <- struct{}{}:
 	default:
 		h.virtualPrefetchInflight.Delete(admitKey)
-		observeVirtualPrefetchOutcome(virtualPrefetchLoadSaturated)
 		return
 	}
 	prefetcher := h.virtualPrefetcher
@@ -997,7 +940,8 @@ func (h *ItemsHandler) handleSetWatchedState(w http.ResponseWriter, r *http.Requ
 	if !ok {
 		return
 	}
-	result, err := h.SetWatchedState(r.Context(), userID, profileID, id, played, filter)
+	// The frozen v1 mark leaves a rewatch in progress alone.
+	result, err := h.SetWatchedState(r.Context(), userID, profileID, id, played, false, filter)
 	if err != nil {
 		writeAPIError(w, err)
 		return
@@ -1243,33 +1187,35 @@ func (h *ItemsHandler) toItemListResponseWithOverlay(ctx context.Context, v Item
 
 func itemListResponseShell(item *models.MediaItem, overlaySummary *models.OverlaySummary, userState *itemUserStateResponse) itemListResponse {
 	resp := itemListResponse{
-		posterPath:        item.PosterPath,
-		backdropPath:      item.BackdropPath,
-		ContentID:         item.ContentID,
-		PlayContentID:     item.PlayContentID,
-		Type:              item.Type,
-		Title:             item.Title,
-		Year:              item.Year,
-		Runtime:           item.Runtime,
-		Genres:            item.Genres,
-		Keywords:          item.Keywords,
-		Studios:           item.Studios,
-		Networks:          item.Networks,
-		ContentRating:     item.ContentRating,
-		AdvisoryAge:       item.AdvisoryAge,
-		AdvisorySource:    item.AdvisorySource,
-		Status:            item.Status,
-		ShowStatus:        item.ShowStatus,
-		RatingIMDB:        item.RatingIMDB,
-		RatingTMDB:        item.RatingTMDB,
-		RatingRTCritic:    item.RatingRTCritic,
-		RatingRTAudience:  item.RatingRTAudience,
-		OriginalLanguage:  item.OriginalLanguage,
-		Overview:          item.Overview,
-		PosterThumbhash:   item.PosterThumbhash,
-		BackdropThumbhash: item.BackdropThumbhash,
-		OverlaySummary:    overlaySummary,
-		UserState:         userState,
+		posterPath:             item.PosterPath,
+		backdropPath:           item.BackdropPath,
+		ContentID:              item.ContentID,
+		PlayContentID:          item.PlayContentID,
+		Type:                   item.Type,
+		Title:                  item.Title,
+		Year:                   item.Year,
+		Runtime:                item.Runtime,
+		Genres:                 item.Genres,
+		Keywords:               item.Keywords,
+		Studios:                item.Studios,
+		Networks:               item.Networks,
+		ContentRating:          item.ContentRating,
+		AdvisoryAge:            item.AdvisoryAge,
+		AdvisorySource:         item.AdvisorySource,
+		Status:                 item.Status,
+		ShowStatus:             item.ShowStatus,
+		RatingIMDB:             item.RatingIMDB,
+		RatingTMDB:             item.RatingTMDB,
+		RatingRTCritic:         item.RatingRTCritic,
+		RatingRTAudience:       item.RatingRTAudience,
+		OriginalLanguage:       item.OriginalLanguage,
+		Overview:               item.Overview,
+		PosterThumbhash:        item.PosterThumbhash,
+		BackdropThumbhash:      item.BackdropThumbhash,
+		OverlaySummary:         overlaySummary,
+		UserState:              userState,
+		PosterIsEpisodeStill:   item.PosterIsEpisodeStill,
+		BackdropIsEpisodeStill: item.BackdropIsEpisodeStill,
 	}
 
 	resp.AddedAt = item.AddedAt
@@ -1298,16 +1244,21 @@ func (h *ItemsHandler) localizeItemListModels(ctx context.Context, items []*mode
 	return localized
 }
 
-func (h *ItemsHandler) itemListCardImageURLs(ctx context.Context, items []*models.MediaItem, art imagesize.Request) map[string]itemListImageURLs {
+// episodeMetadata supplies episode cards' parent artwork, which signs at the
+// card's poster and backdrop sizes in the same batch.
+func (h *ItemsHandler) itemListCardImageURLs(ctx context.Context, items []*models.MediaItem, episodeMetadata map[string]episodeBrowseMetadata, art imagesize.Request) map[string]itemListImageURLs {
 	urls := make(map[string]itemListImageURLs, len(items))
 	if h == nil || h.detailSvc == nil || len(items) == 0 {
 		return urls
 	}
 
 	type pendingImages struct {
-		contentID    string
-		posterPath   string
-		backdropPath string
+		contentID          string
+		posterPath         string
+		backdropPath       string
+		seriesPosterPath   string
+		seriesBackdropPath string
+		seasonPosterPath   string
 	}
 
 	pending := make([]pendingImages, 0, len(items))
@@ -1325,9 +1276,17 @@ func (h *ItemsHandler) itemListCardImageURLs(ctx context.Context, items []*model
 			posterPath:   sizedCardPath(item.PosterPath, artworkkey.ImagePoster, posterSize),
 			backdropPath: sizedCardBackdropPath(item.BackdropPath, backdropSize),
 		}
+		if p := episodeMetadata[item.ContentID].ParentArtwork; p != nil && item.Type == "episode" {
+			images.seriesPosterPath = sizedCardPath(p.SeriesPosterPath, artworkkey.ImagePoster, posterSize)
+			images.seriesBackdropPath = sizedCardBackdropPath(p.SeriesBackdropPath, backdropSize)
+			images.seasonPosterPath = sizedCardPath(p.SeasonPosterPath, artworkkey.ImagePoster, posterSize)
+		}
 		pending = append(pending, images)
 		batch.Add(images.posterPath, posterHint)
 		batch.Add(images.backdropPath, backdropHint)
+		batch.Add(images.seriesPosterPath, posterHint)
+		batch.Add(images.seriesBackdropPath, backdropHint)
+		batch.Add(images.seasonPosterPath, posterHint)
 		logoPaths[item.ContentID] = item.LogoPath
 	}
 
@@ -1338,6 +1297,11 @@ func (h *ItemsHandler) itemListCardImageURLs(ctx context.Context, items []*model
 			posterURL:   resolved.Get(images.posterPath, posterHint).URL,
 			backdropURL: resolved.Get(images.backdropPath, backdropHint).URL,
 			logoURL:     logoURLs[images.contentID],
+			parents: episodeParentImageURLs{
+				seriesPosterURL:   resolved.Get(images.seriesPosterPath, posterHint).URL,
+				seriesBackdropURL: resolved.Get(images.seriesBackdropPath, backdropHint).URL,
+				seasonPosterURL:   resolved.Get(images.seasonPosterPath, posterHint).URL,
+			},
 		}
 	}
 	return urls
@@ -1399,6 +1363,7 @@ type episodeBrowseMetadata struct {
 	SeriesTitle   string
 	SeasonNumber  *int
 	EpisodeNumber *int
+	ParentArtwork *models.EpisodeParentArtwork
 }
 
 func (h *ItemsHandler) listEpisodeBrowseMetadata(
@@ -1420,49 +1385,21 @@ func (h *ItemsHandler) listEpisodeBrowseMetadata(
 		return map[string]episodeBrowseMetadata{}
 	}
 
-	episodes, err := h.episodeRepo.GetByIDs(ctx, episodeIDs)
-	if err != nil || len(episodes) == 0 {
+	contexts, err := h.episodeRepo.ListCardContexts(ctx, episodeIDs)
+	if err != nil || len(contexts) == 0 {
 		return map[string]episodeBrowseMetadata{}
 	}
 
-	seriesIDs := make([]string, 0, len(episodes))
-	seenSeriesIDs := make(map[string]struct{}, len(episodes))
-	for _, episode := range episodes {
-		if episode == nil || strings.TrimSpace(episode.SeriesID) == "" {
-			continue
-		}
-		if _, ok := seenSeriesIDs[episode.SeriesID]; ok {
-			continue
-		}
-		seenSeriesIDs[episode.SeriesID] = struct{}{}
-		seriesIDs = append(seriesIDs, episode.SeriesID)
-	}
-
-	seriesTitles := make(map[string]string, len(seriesIDs))
-	if len(seriesIDs) > 0 {
-		if seriesItems, err := h.itemRepo.GetByIDs(ctx, seriesIDs); err == nil {
-			for _, seriesItem := range seriesItems {
-				if seriesItem == nil {
-					continue
-				}
-				seriesTitles[seriesItem.ContentID] = seriesItem.Title
-			}
-		}
-	}
-
-	result := make(map[string]episodeBrowseMetadata, len(episodes))
-	for _, episode := range episodes {
-		if episode == nil {
-			continue
-		}
-		seasonNumber := episode.SeasonNumber
-		episodeNumber := episode.EpisodeNumber
-		result[episode.ContentID] = episodeBrowseMetadata{
-			StillPath:     episode.StillPath,
-			SeriesID:      episode.SeriesID,
-			SeriesTitle:   seriesTitles[episode.SeriesID],
-			SeasonNumber:  &seasonNumber,
-			EpisodeNumber: &episodeNumber,
+	result := make(map[string]episodeBrowseMetadata, len(contexts))
+	for contentID, c := range contexts {
+		parent := c.ParentArtwork
+		result[contentID] = episodeBrowseMetadata{
+			StillPath:     c.StillPath,
+			SeriesID:      c.SeriesID,
+			SeriesTitle:   c.SeriesTitle,
+			SeasonNumber:  &c.SeasonNumber,
+			EpisodeNumber: &c.EpisodeNumber,
+			ParentArtwork: &parent,
 		}
 	}
 	return result
@@ -1522,17 +1459,11 @@ func episodeResponseShell(ep *models.Episode, fallback episodeImageFallback, siz
 // buildEpisodeResponses converts episodes to API responses using batched
 // lookups — localization, media files, watch progress, and image presigning
 // each resolve in one round-trip for the whole list instead of per episode.
+// Localization rewrites only text fields, so the lookups keyed by episode and
+// series ID run alongside it.
 func (h *ItemsHandler) buildEpisodeResponses(ctx context.Context, v ItemViewer, episodes []*models.Episode) []episodeResponse {
 	filter := v.Access
 	size := filter.ImageSizeFor(imagesize.SlotStill)
-
-	if h.detailSvc != nil {
-		if localized, err := h.detailSvc.LocalizeEpisodeModels(ctx, episodes, filter); err == nil && len(localized) == len(episodes) {
-			episodes = localized
-		}
-	}
-
-	fallbacks := h.episodeImageFallbacks(ctx, episodes)
 
 	episodeIDs := make([]string, 0, len(episodes))
 	for _, ep := range episodes {
@@ -1540,8 +1471,29 @@ func (h *ItemsHandler) buildEpisodeResponses(ctx context.Context, v ItemViewer, 
 			episodeIDs = append(episodeIDs, ep.ContentID)
 		}
 	}
-	filesByEpisode := h.listEpisodeFiles(ctx, episodeIDs)
-	userData := h.listLeafUserData(ctx, v, episodeIDs)
+
+	var (
+		localized      []*models.Episode
+		localizedOK    bool
+		fallbacks      map[string]episodeImageFallback
+		filesByEpisode map[string][]*models.MediaFile
+		userData       map[string]*catalog.SeasonUserData
+		wg             sync.WaitGroup
+	)
+	if h.detailSvc != nil {
+		wg.Go(func() {
+			var err error
+			localized, err = h.detailSvc.LocalizeEpisodeModels(ctx, episodes, filter)
+			localizedOK = err == nil && len(localized) == len(episodes)
+		})
+	}
+	wg.Go(func() { fallbacks = h.episodeImageFallbacks(ctx, episodes) })
+	wg.Go(func() { filesByEpisode = h.listEpisodeListFiles(ctx, episodeIDs) })
+	wg.Go(func() { userData = h.listLeafUserData(ctx, v, episodeIDs) })
+	wg.Wait()
+	if localizedOK {
+		episodes = localized
+	}
 
 	resp := make([]episodeResponse, 0, len(episodes))
 	stillPaths := make([]string, 0, len(episodes))
@@ -1590,6 +1542,20 @@ func (h *ItemsHandler) listEpisodeFiles(ctx context.Context, episodeIDs []string
 	return files
 }
 
+// listEpisodeListFiles fetches the file fields the episode list renders,
+// falling back to full rows when the repository lacks that projection.
+func (h *ItemsHandler) listEpisodeListFiles(ctx context.Context, episodeIDs []string) map[string][]*models.MediaFile {
+	provider, ok := h.fileRepo.(episodeListFileProvider)
+	if !ok || len(episodeIDs) == 0 {
+		return h.listEpisodeFiles(ctx, episodeIDs)
+	}
+	files, err := provider.ListEpisodeListFilesByEpisodeIDs(ctx, episodeIDs)
+	if err != nil {
+		return nil
+	}
+	return files
+}
+
 func episodeFileResponses(files []*models.MediaFile, filter catalog.AccessFilter) []episodeFileResponse {
 	var resp []episodeFileResponse
 	for _, f := range files {
@@ -1610,6 +1576,9 @@ func episodeFileResponses(files []*models.MediaFile, filter catalog.AccessFilter
 	return resp
 }
 
+// episodeImageFallbacks loads the series artwork that stands in for a missing
+// episode still. episodeResponseShell reads it only for episodes without a
+// still of their own, so only their series are loaded.
 func (h *ItemsHandler) episodeImageFallbacks(ctx context.Context, episodes []*models.Episode) map[string]episodeImageFallback {
 	if h.itemRepo == nil || len(episodes) == 0 {
 		return map[string]episodeImageFallback{}
@@ -1617,7 +1586,7 @@ func (h *ItemsHandler) episodeImageFallbacks(ctx context.Context, episodes []*mo
 	seriesIDs := make([]string, 0, 1)
 	seen := make(map[string]struct{})
 	for _, ep := range episodes {
-		if ep == nil || strings.TrimSpace(ep.SeriesID) == "" {
+		if ep == nil || strings.TrimSpace(ep.SeriesID) == "" || strings.TrimSpace(ep.StillPath) != "" {
 			continue
 		}
 		if _, ok := seen[ep.SeriesID]; ok {
@@ -2147,7 +2116,46 @@ func (h *ItemsHandler) leafUserData(ctx context.Context, userID int, profileID, 
 	if err != nil {
 		return nil
 	}
-	return leafUserDataFromProgress(progress)
+	userData := leafUserDataFromProgress(progress)
+	if itemType == itemTypeMovie {
+		// A failed read keeps the progress row's hints, which is what the
+		// detail page showed before the version choice was stored apart.
+		if choice, err := store.GetSeriesPlaybackPreference(ctx, profileID, contentID); err == nil {
+			userData = applyVersionChoice(userData, choice)
+		}
+	}
+	return userData
+}
+
+// applyVersionChoice reports the version a movie was last started on, from the
+// row playback start keeps under the movie's content ID. That row exists even
+// when the play was too short to leave progress, so a picked version is not
+// forgotten. It wins over the progress row's hints whenever it names a file:
+// marking watched or clearing the resume point moves the progress timestamp
+// without a new version being played. A Jellyfin-protocol play records no
+// choice, so its file shows only for a movie never started natively.
+func applyVersionChoice(userData *catalog.SeasonUserData, choice *userstore.SeriesPlaybackPreference) *catalog.SeasonUserData {
+	if choice == nil || choice.FileID == 0 {
+		return userData
+	}
+	if userData == nil {
+		userData = &catalog.SeasonUserData{}
+	}
+	fileID := choice.FileID
+	userData.LastFileID = &fileID
+	userData.LastResolution = stringPtrOrNil(choice.Resolution)
+	hdr := choice.HDR
+	userData.LastHDR = &hdr
+	userData.LastCodecVideo = stringPtrOrNil(choice.CodecVideo)
+	userData.LastEditionKey = stringPtrOrNil(choice.EditionKey)
+	return userData
+}
+
+func stringPtrOrNil(v string) *string {
+	if v == "" {
+		return nil
+	}
+	return &v
 }
 
 // listLeafUserData batch-fetches watch progress for the given content IDs in a
@@ -2291,10 +2299,6 @@ func (h *ItemsHandler) parentRollupUserData(ctx context.Context, v ItemViewer, i
 	return catalog.SeasonUserDataFromCounts(parent), true
 }
 
-// metadataSeasonCounts returns each season number's metadata episode count,
-// including seasons with no library-materialized episodes. The seasons list
-// uses it only where the availability rollup has no entry, so a metadata-only
-// season still shows the episode total the provider knows.
 func (h *ItemsHandler) metadataSeasonCounts(ctx context.Context, seriesID string) (map[int]int, error) {
 	summaries, err := h.episodeRepo.ListMetadataSeasons(ctx, seriesID)
 	if err != nil {
@@ -2719,46 +2723,44 @@ type watchedLeafTarget struct {
 	DurationSeconds float64
 }
 
-// dedupeWatchedLeafTargets removes duplicate episode targets while retaining
-// the first duration-bearing copy. A partly linked season resolves available
-// episodes explicitly and then expands the parent by season number, so the
-// same episode can appear twice; the mutation is idempotent but the response's
-// AffectedCount is not.
 func dedupeWatchedLeafTargets(targets []watchedLeafTarget) []watchedLeafTarget {
-	if len(targets) < 2 {
-		return targets
-	}
-	indexByID := make(map[string]int, len(targets))
-	deduped := make([]watchedLeafTarget, 0, len(targets))
+	seen := make(map[string]struct{}, len(targets))
+	out := make([]watchedLeafTarget, 0, len(targets))
 	for _, target := range targets {
-		if target.ContentID == "" {
+		if _, ok := seen[target.ContentID]; ok {
 			continue
 		}
-		if index, ok := indexByID[target.ContentID]; ok {
-			if deduped[index].DurationSeconds == 0 && target.DurationSeconds > 0 {
-				deduped[index].DurationSeconds = target.DurationSeconds
-			}
-			continue
-		}
-		indexByID[target.ContentID] = len(deduped)
-		deduped = append(deduped, target)
+		seen[target.ContentID] = struct{}{}
+		out = append(out, target)
 	}
-	return deduped
+	return out
 }
 
 // watchedTarget is a watched-state target that exists and that the viewer
 // may see, before a season or series is expanded into its episodes.
 type watchedTarget struct {
-	Type      string
-	Item      *models.MediaItem
-	Season    *models.Season
-	Episode   *models.Episode
-	Synthetic bool
+	Type    string
+	Item    *models.MediaItem
+	Season  *models.Season
+	Episode *models.Episode
 }
 
-// lookupWatchedTarget finds a movie, ebook, series, season or episode and
-// checks the viewer's access without loading a season's or series' episodes.
-// Any other item type is not found.
+// seriesID is the series of a season or episode target, named on its
+// user-state events so a client that hasn't cached the item can refresh the
+// series (#796); other targets have none.
+func (t watchedTarget) seriesID() string {
+	switch {
+	case t.Season != nil:
+		return t.Season.SeriesID
+	case t.Episode != nil:
+		return t.Episode.SeriesID
+	}
+	return ""
+}
+
+// lookupWatchedTarget finds a movie, audiobook, ebook, series, season or
+// episode and checks the viewer's access without loading a season's or
+// series' episodes. Any other item type is not found.
 func (h *ItemsHandler) lookupWatchedTarget(ctx context.Context, contentID string, filter catalog.AccessFilter) (watchedTarget, error) {
 	item, err := h.itemRepo.GetByID(ctx, contentID)
 	switch {
@@ -2767,7 +2769,7 @@ func (h *ItemsHandler) lookupWatchedTarget(ctx context.Context, contentID string
 			return watchedTarget{}, err
 		}
 		switch item.Type {
-		case itemTypeMovie, itemTypeEbook, "series":
+		case itemTypeMovie, itemTypeAudiobook, itemTypeEbook, "series":
 			return watchedTarget{Type: item.Type, Item: item}, nil
 		default:
 			return watchedTarget{}, catalog.ErrItemNotFound
@@ -2797,9 +2799,8 @@ func (h *ItemsHandler) lookupWatchedTarget(ctx context.Context, contentID string
 			return watchedTarget{}, err
 		}
 		return watchedTarget{
-			Type:      "season",
-			Season:    &models.Season{ContentID: contentID, SeriesID: seriesID, SeasonNumber: seasonNumber},
-			Synthetic: true,
+			Type:   "season",
+			Season: &models.Season{ContentID: contentID, SeriesID: seriesID, SeasonNumber: seasonNumber},
 		}, nil
 	}
 
@@ -2820,56 +2821,62 @@ func (h *ItemsHandler) lookupWatchedTarget(ctx context.Context, contentID string
 // resolveWatchedTargets checks access to contentID and resolves the leaf
 // targets a watched mark writes. Unwatching a series or season returns no
 // targets: the caller expands it with watchstate.ParentUnwatchTargets, which
-// also reaches watched episodes that no longer have a file.
-func (h *ItemsHandler) resolveWatchedTargets(ctx context.Context, contentID string, played bool, filter catalog.AccessFilter) (string, []watchedLeafTarget, error) {
+// also reaches watched episodes that no longer have a file. It also returns
+// the target's series (watchedTarget.seriesID), for the user-state event.
+func (h *ItemsHandler) resolveWatchedTargets(ctx context.Context, contentID string, played bool, filter catalog.AccessFilter) (string, string, []watchedLeafTarget, error) {
 	target, err := h.lookupWatchedTarget(ctx, contentID, filter)
 	if err != nil {
-		return "", nil, err
+		return "", "", nil, err
 	}
+	seriesID := target.seriesID()
 	switch target.Type {
 	case itemTypeMovie:
-		return itemTypeMovie, []watchedLeafTarget{{
+		return itemTypeMovie, seriesID, []watchedLeafTarget{{
 			ContentID:       target.Item.ContentID,
 			DurationSeconds: h.contentDurationSeconds(ctx, target.Item.ContentID, "", target.Item.Runtime),
+		}}, nil
+	case itemTypeAudiobook:
+		var duration float64
+		if played {
+			duration, err = h.audiobookDurationSeconds(ctx, target.Item.ContentID, target.Item.Runtime, filter)
+			if err != nil {
+				return "", "", nil, err
+			}
+		}
+		return itemTypeAudiobook, seriesID, []watchedLeafTarget{{
+			ContentID:       target.Item.ContentID,
+			DurationSeconds: duration,
 		}}, nil
 	case itemTypeEbook:
 		// Ebooks have no playback duration; read state is keyed off
 		// ebook_reader_progress, so the leaf target only carries the ID.
-		return itemTypeEbook, []watchedLeafTarget{{ContentID: target.Item.ContentID}}, nil
+		return itemTypeEbook, seriesID, []watchedLeafTarget{{ContentID: target.Item.ContentID}}, nil
 	case "series":
 		if h.episodeRepo == nil {
-			return "", nil, catalog.ErrItemNotFound
+			return "", "", nil, catalog.ErrItemNotFound
 		}
 		if !played {
-			return "series", nil, nil
+			return "series", seriesID, nil, nil
 		}
 		episodes, err := h.episodeRepo.ListBySeries(ctx, target.Item.ContentID)
 		if err != nil {
-			return "", nil, err
+			return "", "", nil, err
 		}
-		return "series", h.episodeTargets(ctx, episodes), nil
+		return "series", seriesID, h.episodeTargets(ctx, episodes), nil
 	case "season":
 		if h.episodeRepo == nil {
-			return "", nil, catalog.ErrItemNotFound
+			return "", "", nil, catalog.ErrItemNotFound
+		}
+		if !played {
+			return "season", seriesID, nil, nil
 		}
 		episodes, err := h.seasonEpisodesForRead(ctx, target.Season.SeriesID, target.Season.SeasonNumber)
 		if err != nil {
-			return "", nil, err
+			return "", "", nil, err
 		}
-		if len(episodes) == 0 {
-			return "", nil, catalog.ErrItemNotFound
-		}
-		if !played {
-			// ParentUnwatchTargetsForSeason now partitions by
-			// (series_id, season_number) and applies the watched-fileless
-			// filter. Returning the displayed episodes here would append those
-			// unfiltered metadata rows to that set and hide never-watched
-			// episodes from future history.
-			return "season", nil, nil
-		}
-		return "season", h.episodeTargets(ctx, episodes), nil
+		return "season", seriesID, h.episodeTargets(ctx, episodes), nil
 	default:
-		return itemTypeEpisode, []watchedLeafTarget{{
+		return itemTypeEpisode, seriesID, []watchedLeafTarget{{
 			ContentID:       target.Episode.ContentID,
 			DurationSeconds: h.contentDurationSeconds(ctx, "", target.Episode.ContentID, target.Episode.Runtime),
 		}}, nil
@@ -2891,7 +2898,7 @@ func (h *ItemsHandler) episodeTargets(ctx context.Context, episodes []*models.Ep
 	for _, episode := range episodes {
 		targets = append(targets, watchedLeafTarget{
 			ContentID:       episode.ContentID,
-			DurationSeconds: mediaFileDurationSeconds(filesByEpisode[episode.ContentID], episode.Runtime),
+			DurationSeconds: mediaFileDurationSeconds(filesByEpisode[episode.ContentID], episode.ContentID, episode.Runtime),
 		})
 	}
 	return targets
@@ -2899,10 +2906,12 @@ func (h *ItemsHandler) episodeTargets(ctx context.Context, episodes []*models.Ep
 
 // mediaFileDurationSeconds picks a playable duration from an item's files,
 // falling back to the catalog runtime. Mirrors contentDurationSeconds's
-// preference order so the batched and single-item paths agree.
-func mediaFileDurationSeconds(files []*models.MediaFile, fallbackRuntimeMinutes int) float64 {
+// preference order so the batched and single-item paths agree. For an
+// episode, a multi-episode file linked to an earlier episode of its range
+// lasts the whole range, so only files linked to the episode itself count.
+func mediaFileDurationSeconds(files []*models.MediaFile, episodeID string, fallbackRuntimeMinutes int) float64 {
 	for _, file := range files {
-		if file != nil && file.Duration > 0 {
+		if file != nil && file.Duration > 0 && (episodeID == "" || file.EpisodeID == episodeID) {
 			return float64(file.Duration)
 		}
 	}
@@ -2910,6 +2919,44 @@ func mediaFileDurationSeconds(files []*models.MediaFile, fallbackRuntimeMinutes 
 		return float64(fallbackRuntimeMinutes * 60)
 	}
 	return 0
+}
+
+// audiobookDurationSeconds is a book's whole length: an audiobook is often
+// split into several files, so its length is the sum of its present files,
+// not the first file's. The scanner can attach several copies of one recording
+// (another folder, format or library) to the same book; each copy is one
+// recording root, and the book counts the longest accessible copy. The catalog runtime is
+// only a fallback for a book whose files report no duration.
+func (h *ItemsHandler) audiobookDurationSeconds(ctx context.Context, contentID string, fallbackRuntimeMinutes int, filter catalog.AccessFilter) (float64, error) {
+	var files []*models.MediaFile
+	if h.fileRepo != nil {
+		var err error
+		if files, err = h.fileRepo.GetByContentID(ctx, contentID); err != nil {
+			return 0, err
+		}
+	}
+	files = catalog.FilterMediaFilesByAccess(files, filter)
+	type copyRoot struct {
+		folderID int
+		root     string
+	}
+	byCopy := map[copyRoot]int{}
+	longest := 0
+	for _, file := range files {
+		if file == nil || file.Duration <= 0 {
+			continue
+		}
+		key := copyRoot{file.MediaFolderID, file.CanonicalRootPath}
+		byCopy[key] += file.Duration
+		longest = max(longest, byCopy[key])
+	}
+	if longest > 0 {
+		return float64(longest), nil
+	}
+	if fallbackRuntimeMinutes > 0 {
+		return float64(fallbackRuntimeMinutes * 60), nil
+	}
+	return 0, nil
 }
 
 func (h *ItemsHandler) contentDurationSeconds(ctx context.Context, contentID, episodeID string, fallbackRuntimeMinutes int) float64 {
@@ -2934,7 +2981,7 @@ func (h *ItemsHandler) contentDurationSeconds(ctx context.Context, contentID, ep
 	if err != nil {
 		files = nil
 	}
-	return mediaFileDurationSeconds(files, fallbackRuntimeMinutes)
+	return mediaFileDurationSeconds(files, episodeID, fallbackRuntimeMinutes)
 }
 
 // isNotFound checks if an error is a "not found" sentinel.
@@ -2948,8 +2995,9 @@ func (h *ItemsHandler) requestCanViewFilePaths(r *http.Request) bool {
 	return h.canViewFilePaths(r.Context())
 }
 
-// canViewFilePaths reports whether the caller may see on-disk paths: admins
-// always, other accounts when their stored flag allows it.
+// canViewFilePaths reports whether the caller may see on-disk paths: the
+// acting admin always, any other caller when the account's effective
+// permissions, after the access group's mask, include metadata curation.
 func (h *ItemsHandler) canViewFilePaths(ctx context.Context) bool {
 	claims := apimw.GetClaims(ctx)
 	if claims == nil {
@@ -2957,8 +3005,8 @@ func (h *ItemsHandler) canViewFilePaths(ctx context.Context) bool {
 	}
 	if claims.Role == "admin" {
 		// Only the acting admin sees paths by role. Another profile on the
-		// admin's account needs metadata curation assigned to the account,
-		// the bar the curation gate holds it to.
+		// admin's account falls through: it needs metadata curation assigned
+		// to the account, the bar the curation gate holds it to.
 		actingAdmin, err := apimw.ActingAdmin(ctx)
 		if err != nil {
 			slog.WarnContext(ctx, "checking file path visibility for an admin account", "component", "api", "user_id", claims.UserID, "error", err)
@@ -2967,7 +3015,6 @@ func (h *ItemsHandler) canViewFilePaths(ctx context.Context) bool {
 		if actingAdmin {
 			return true
 		}
-		return h.hasAssignedMetadataCuration(ctx, claims.UserID)
 	}
 	if h == nil || h.UserRepo == nil {
 		return false
@@ -2977,7 +3024,49 @@ func (h *ItemsHandler) canViewFilePaths(ctx context.Context) bool {
 		slog.Log(ctx, ctxerr.LogLevel(ctx, err, slog.LevelWarn), "checking file path visibility permissions", "component", "api", "user_id", claims.UserID, "error", err)
 		return false
 	}
-	return auth.HasEffectivePermission(user, auth.PermissionMetadataCuration)
+	return hasMaskedMetadataCuration(ctx, user, h.AccessGroups)
+}
+
+// hasMaskedMetadataCuration reports whether an enabled account holds
+// metadata_curation after its access group's permission mask, as the metadata
+// curation gate resolves it. A failed group lookup fails closed.
+func hasMaskedMetadataCuration(ctx context.Context, user *models.User, groups access.GroupPolicyProvider) bool {
+	// The group mask can only remove permissions, so an account without the
+	// grant skips the group lookup.
+	if user == nil || !user.Enabled || !slices.Contains(user.Permissions, string(auth.PermissionMetadataCuration)) {
+		return false
+	}
+	effective, err := access.EffectivePolicyForUser(ctx, user, groups)
+	if err != nil {
+		slog.WarnContext(ctx, "resolving metadata curation policy", "component", "api", "user_id", user.ID, "error", err)
+		return false
+	}
+	return slices.Contains(auth.PolicyPermissions(effective), string(auth.PermissionMetadataCuration))
+}
+
+// prefetchWatchDetailVirtual warms virtual candidate listings for the rows a
+// watch detail offers, off the playback click path. Fire-and-forget:
+// PrefetchVirtualPlayback is already bounded (2 files), deduped, and runs on
+// a detached worker pool, so this never blocks the detail response. Only the
+// first virtual version is warmed; the start path ranks per device from the
+// neutral cache entry.
+func (h *ItemsHandler) prefetchWatchDetailVirtual(ctx context.Context, detail *catalog.WatchDetail, profileID string) {
+	if detail == nil {
+		return
+	}
+	if detail.Type != itemTypeMovie && detail.Type != itemTypeEpisode {
+		return
+	}
+	fileIDs := make([]int, 0, 2)
+	for _, v := range detail.Versions {
+		if v.FileID != 0 {
+			fileIDs = append(fileIDs, v.FileID)
+		}
+		if len(fileIDs) >= 2 {
+			break
+		}
+	}
+	h.prefetchVirtualFileIDs(ctx, fileIDs, profileID)
 }
 
 // HandleDelete handles DELETE /api/v1/admin/items/{id}.
@@ -3009,19 +3098,4 @@ func (h *ItemsHandler) HandleDelete(w http.ResponseWriter, r *http.Request) {
 		"images_cleaned": len(images),
 		"message":        "Media item deleted successfully",
 	})
-}
-
-// hasAssignedMetadataCuration reports whether the account has metadata
-// curation assigned explicitly, not by its admin role. A failed lookup fails
-// closed.
-func (h *ItemsHandler) hasAssignedMetadataCuration(ctx context.Context, userID int) bool {
-	if h == nil || h.UserRepo == nil {
-		return false
-	}
-	user, err := h.UserRepo.GetByID(ctx, userID)
-	if err != nil {
-		slog.WarnContext(ctx, "checking file path visibility permissions", "component", "api", "user_id", userID, "error", err)
-		return false
-	}
-	return user != nil && user.Enabled && auth.HasAssignedPermission(user, auth.PermissionMetadataCuration)
 }

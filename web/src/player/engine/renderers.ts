@@ -318,12 +318,12 @@ function adopt(
     error: null,
     holder: null,
   };
-  void device.lost.then((info) => {
+  void device.lost.then((info: GPUDeviceLostInfo) => {
     entry.lost = info;
     if (spare === entry) spare = null;
     entry.holder?.deviceLost(info);
   });
-  device.addEventListener("uncapturederror", (event) => {
+  device.addEventListener("uncapturederror", (event: GPUUncapturedErrorEvent) => {
     const message = (event as GPUUncapturedErrorEvent).error.message;
     entry.error ??= message;
     entry.holder?.deviceError(message);

@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -27,6 +28,10 @@ func (f *titlecardPublicationImages) FetchItemImages(context.Context, map[string
 
 func (f *titlecardPublicationImages) FetchSeasonImages(context.Context, map[string]string, string, int, int) ([]metadata.RemoteImage, map[string]string, error) {
 	return nil, nil, nil
+}
+
+func (f *titlecardPublicationImages) ApplyUploadedItemImage(context.Context, metadata.ApplyUploadedItemImageRequest) (*metadata.ApplyUploadedItemImageResult, error) {
+	return nil, errors.New("uploaded image not supported by this test service")
 }
 
 func (f *titlecardPublicationImages) ApplyItemImage(context.Context, metadata.ApplyItemImageRequest) (*metadata.ApplyItemImageResult, error) {

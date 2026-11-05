@@ -3,6 +3,7 @@ package playback
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -20,6 +21,8 @@ import (
 // context, channels, log sink). Those are re-wired on reconstruct from the
 // live config and request.
 type RecipeCard struct {
+	DeviceID                         string    `json:"device_id,omitempty"`
+	DevicePlatform                   string    `json:"device_platform,omitempty"`
 	SessionID                        string    `json:"session_id"`
 	UserID                           int       `json:"user_id"`
 	ProfileID                        string    `json:"profile_id"`
@@ -112,6 +115,7 @@ type RecipeCard struct {
 	ToneMapDVRPUPresent        bool                   `json:"tone_map_dv_rpu_present,omitempty"`
 	VideoBitstreamFilter       string                 `json:"video_bitstream_filter,omitempty"`
 	VideoSampleEntry           string                 `json:"video_sample_entry,omitempty"`
+	VideoRange                 string                 `json:"video_range,omitempty"`
 	CopyVideoMPEGTS            bool                   `json:"copy_video_mpegts,omitempty"`
 	KeyframePlaylist           bool                   `json:"keyframe_playlist,omitempty"`
 	SeekSeconds                float64                `json:"seek_seconds"`
@@ -121,26 +125,30 @@ type RecipeCard struct {
 	// SourceFrameRate and SourceHeight keep a rebuilt encode's GOP aligned with
 	// the real source cadence and let the filter chain detect a no-op scale.
 	// Zero is the historical 30 fps / unknown-height behavior.
-	SourceFrameRate        float64 `json:"source_frame_rate,omitempty"`
-	SourceHeight           int     `json:"source_height,omitempty"`
-	TargetCodecVideo       string  `json:"target_codec_video,omitempty"`
-	TargetCodecAudio       string  `json:"target_codec_audio,omitempty"`
-	TargetAudioChannels    int     `json:"target_audio_channels,omitempty"`
-	TargetAudioBitrateKbps int     `json:"target_audio_bitrate_kbps,omitempty"`
-	SegmentDuration        int     `json:"segment_duration"`
-	StartSegmentNumber     int     `json:"start_segment_number"`
-	HWAccel                string  `json:"hw_accel,omitempty"`
-	EncoderHWAccel         string  `json:"encoder_hw_accel,omitempty"`
-	HWDevice               string  `json:"hw_device,omitempty"`
-	SubtitleTrackIndex     int     `json:"subtitle_track_index"`
-	SubtitleBurnIn         bool    `json:"subtitle_burn_in,omitempty"`
-	SubtitleCodec          string  `json:"subtitle_codec,omitempty"`
-	SubtitleRendition      bool    `json:"subtitle_rendition,omitempty"`
-	AudioTrackIndex        int     `json:"audio_track_index"`
-	TargetBitrateKbps      int     `json:"target_bitrate_kbps,omitempty"`
-	TotalDuration          float64 `json:"total_duration"`
-	FastStart              bool    `json:"fast_start,omitempty"`
-	ThrottleSeconds        int     `json:"throttle_seconds,omitempty"`
+	SourceFrameRate         float64                  `json:"source_frame_rate,omitempty"`
+	SourceHeight            int                      `json:"source_height,omitempty"`
+	TargetCodecVideo        string                   `json:"target_codec_video,omitempty"`
+	TargetCodecAudio        string                   `json:"target_codec_audio,omitempty"`
+	CopyAudioCodec          string                   `json:"copy_audio_codec,omitempty"`
+	TargetAudioChannels     int                      `json:"target_audio_channels,omitempty"`
+	TargetAudioBitrateKbps  int                      `json:"target_audio_bitrate_kbps,omitempty"`
+	SegmentDuration         int                      `json:"segment_duration"`
+	StartSegmentNumber      int                      `json:"start_segment_number"`
+	HWAccel                 string                   `json:"hw_accel,omitempty"`
+	EncoderHWAccel          string                   `json:"encoder_hw_accel,omitempty"`
+	HWDevice                string                   `json:"hw_device,omitempty"`
+	SubtitleTrackIndex      int                      `json:"subtitle_track_index"`
+	SubtitleBurnIn          bool                     `json:"subtitle_burn_in,omitempty"`
+	SubtitleCodec           string                   `json:"subtitle_codec,omitempty"`
+	SubtitleRendition       bool                     `json:"subtitle_rendition,omitempty"`
+	SubtitleRenditionTracks []SubtitleRenditionTrack `json:"subtitle_rendition_tracks,omitempty"`
+	SubtitleRenditionSource SubtitleRenditionSource  `json:"subtitle_rendition_source,omitzero"`
+	AudioTrackIndex         int                      `json:"audio_track_index"`
+	RequireAudioTrack       bool                     `json:"require_audio_track,omitempty"`
+	TargetBitrateKbps       int                      `json:"target_bitrate_kbps,omitempty"`
+	TotalDuration           float64                  `json:"total_duration"`
+	FastStart               bool                     `json:"fast_start,omitempty"`
+	ThrottleSeconds         int                      `json:"throttle_seconds,omitempty"`
 }
 
 const playMethodCopyFMP4V1 PlayMethod = streamtoken.PlayMethodCopyFMP4Transcode
@@ -161,6 +169,33 @@ func (c RecipeCard) EffectiveEncoderHWAccel() string {
 // so binaries predating it reject the card instead of reconstructing old bytes.
 func (c RecipeCard) IsTranscodeRecipe() bool {
 	return c.PlayMethod == "" || c.PlayMethod == PlayTranscode || c.PlayMethod == playMethodCopyFMP4V1
+}
+
+// RecipeExecutor identifies a transcode node by its stream_nodes row id and
+// the route URL stored on that row. Either is zero while the node has not
+// resolved its row.
+type RecipeExecutor struct {
+	NodeID  int
+	NodeURL string
+}
+
+// NamesAnotherNode reports whether card was issued for a different node to
+// run, so that e must not delete it. The API moves a transport to another node
+// under the same transport id, so a stop the old node runs late can find the
+// new node's card stored there. Only a card whose row id and node URL both
+// differ from e's counts: when either side lacks one, or either matches, the
+// card is treated as e's and deleted as it always was, because keeping a card
+// a stop should remove leaves the stopped transport reconstructable. A node
+// whose row or URL changed while it ran a transport therefore still deletes
+// that transport's card.
+func (e RecipeExecutor) NamesAnotherNode(card RecipeCard) bool {
+	nodeURL, cardURL := normalizeExecutorURL(e.NodeURL), normalizeExecutorURL(card.TranscodeNodeURL)
+	return e.NodeID > 0 && card.RoutingExecutionNodeID > 0 && card.RoutingExecutionNodeID != e.NodeID &&
+		nodeURL != "" && cardURL != "" && cardURL != nodeURL
+}
+
+func normalizeExecutorURL(nodeURL string) string {
+	return strings.TrimRight(strings.TrimSpace(nodeURL), "/")
 }
 
 // ValidateCopyFMP4RecipeCard rejects an old copy card under the current
@@ -228,6 +263,7 @@ func NewRecipeCard(userID int, profileID string, mediaFileID int, transcodeNodeU
 		ToneMapDVRPUPresent:              opts.ToneMapDVRPUPresent,
 		VideoBitstreamFilter:             opts.VideoBitstreamFilter,
 		VideoSampleEntry:                 opts.VideoSampleEntry,
+		VideoRange:                       opts.VideoRange,
 		CopyVideoMPEGTS:                  opts.CopyVideoMPEGTS,
 		KeyframePlaylist:                 opts.KeyframePlaylist,
 		SeekSeconds:                      opts.SeekSeconds,
@@ -249,7 +285,10 @@ func NewRecipeCard(userID int, profileID string, mediaFileID int, transcodeNodeU
 		SubtitleBurnIn:                   opts.SubtitleBurnIn,
 		SubtitleCodec:                    opts.SubtitleCodec,
 		SubtitleRendition:                opts.SubtitleRendition,
+		SubtitleRenditionTracks:          slices.Clone(opts.SubtitleRenditionTracks),
+		SubtitleRenditionSource:          opts.SubtitleRenditionSource,
 		AudioTrackIndex:                  opts.AudioTrackIndex,
+		RequireAudioTrack:                opts.RequireAudioTrack,
 		TargetBitrateKbps:                opts.TargetBitrateKbps,
 		TotalDuration:                    opts.TotalDuration,
 		FastStart:                        opts.FastStart,
@@ -336,6 +375,7 @@ func (c RecipeCard) TranscodeOpts(outputDir, ffmpegPath string, logSink FFmpegLo
 		ToneMapDVRPUPresent:              c.ToneMapDVRPUPresent,
 		VideoBitstreamFilter:             c.VideoBitstreamFilter,
 		VideoSampleEntry:                 c.VideoSampleEntry,
+		VideoRange:                       c.VideoRange,
 		CopyVideoMPEGTS:                  c.CopyVideoMPEGTS,
 		KeyframePlaylist:                 c.KeyframePlaylist,
 		SeekSeconds:                      c.SeekSeconds,
@@ -358,7 +398,10 @@ func (c RecipeCard) TranscodeOpts(outputDir, ffmpegPath string, logSink FFmpegLo
 		SubtitleBurnIn:                   c.SubtitleBurnIn,
 		SubtitleCodec:                    c.SubtitleCodec,
 		SubtitleRendition:                c.SubtitleRendition,
+		SubtitleRenditionTracks:          slices.Clone(c.SubtitleRenditionTracks),
+		SubtitleRenditionSource:          c.SubtitleRenditionSource,
 		AudioTrackIndex:                  c.AudioTrackIndex,
+		RequireAudioTrack:                c.RequireAudioTrack,
 		TargetBitrateKbps:                c.TargetBitrateKbps,
 		TotalDuration:                    c.TotalDuration,
 		FastStart:                        c.FastStart,
@@ -382,6 +425,74 @@ const MaxTokenTTL = 24 * time.Hour
 // environment-specific knobs (HWAccel/HWDevice) are intentionally NOT carried —
 // they are re-resolved from live config on reconstruct, so an operator's config
 // change applies to reconstructed sessions too.
+func subtitleRenditionTrackNumbers(tracks []SubtitleRenditionTrack) []uint64 {
+	if len(tracks) == 0 {
+		return nil
+	}
+	out := make([]uint64, len(tracks))
+	for i, t := range tracks {
+		out[i] = t.TrackNumber
+	}
+	return out
+}
+func subtitleRenditionNames(tracks []SubtitleRenditionTrack) []string {
+	if len(tracks) == 0 {
+		return nil
+	}
+	out := make([]string, len(tracks))
+	for i, t := range tracks {
+		out[i] = t.Name
+	}
+	return out
+}
+func subtitleRenditionLanguages(tracks []SubtitleRenditionTrack) []string {
+	if len(tracks) == 0 {
+		return nil
+	}
+	out := make([]string, len(tracks))
+	for i, t := range tracks {
+		out[i] = t.Language
+	}
+	return out
+}
+func subtitleRenditionForced(tracks []SubtitleRenditionTrack) []bool {
+	if len(tracks) == 0 {
+		return nil
+	}
+	out := make([]bool, len(tracks))
+	for i, t := range tracks {
+		out[i] = t.Forced
+	}
+	return out
+}
+func subtitleRenditionDefaultTrack(tracks []SubtitleRenditionTrack) uint64 {
+	for _, t := range tracks {
+		if t.Default {
+			return t.TrackNumber
+		}
+	}
+	return 0
+}
+func subtitleRenditionTracksFromClaims(c *streamtoken.Claims) []SubtitleRenditionTrack {
+	if len(c.SubtitleRenditionTracks) == 0 {
+		return nil
+	}
+	out := make([]SubtitleRenditionTrack, len(c.SubtitleRenditionTracks))
+	for i, n := range c.SubtitleRenditionTracks {
+		out[i] = SubtitleRenditionTrack{StreamIndex: -1, TrackNumber: n, Default: n == c.SubtitleRenditionDefault}
+		if i < len(c.SubtitleRenditionNames) {
+			out[i].Name = c.SubtitleRenditionNames[i]
+		}
+		if i < len(c.SubtitleRenditionLanguages) {
+			out[i].Language = c.SubtitleRenditionLanguages[i]
+		}
+		if i < len(c.SubtitleRenditionForced) {
+			out[i].Forced = c.SubtitleRenditionForced[i]
+		}
+	}
+	return out
+}
+
 func (c RecipeCard) ToClaims() streamtoken.Claims {
 	playMethod := string(c.PlayMethod)
 	sourceAudioChannels := 0
@@ -396,6 +507,13 @@ func (c RecipeCard) ToClaims() streamtoken.Claims {
 			playMethod = streamtoken.PlayMethodAudioDownmixTranscode
 		case PlayRemux:
 			playMethod = streamtoken.PlayMethodAudioDownmixRemux
+		}
+	} else if len(c.SubtitleRenditionTracks) > 0 {
+		switch c.PlayMethod {
+		case playMethodCopyFMP4V1:
+			playMethod = streamtoken.PlayMethodSubtitleRenditionsCopyFMP4
+		case PlayTranscode:
+			playMethod = streamtoken.PlayMethodSubtitleRenditionsTranscode
 		}
 	} else if c.PlayMethod == PlayTranscode && c.ToneMapMode != "" {
 		// Older binaries do not understand the frozen tone-map claims. Give
@@ -424,6 +542,7 @@ func (c RecipeCard) ToClaims() streamtoken.Claims {
 		RoutingEgress:                    c.RoutingEgress,
 		RoutingEgressNodeID:              c.RoutingEgressNodeID,
 		TargetCodec:                      c.TargetCodecVideo,
+		RequireAudioTrack:                c.RequireAudioTrack,
 		TargetRes:                        c.TargetResolution,
 		SourceFrameRate:                  c.SourceFrameRate,
 		SourceHeight:                     c.SourceHeight,
@@ -437,42 +556,51 @@ func (c RecipeCard) ToClaims() streamtoken.Claims {
 			}
 			return c.OriginalStartedAt.UnixNano()
 		}(),
-		SourceVideoCodec:           c.SourceVideoCodec,
-		SourceVideoProfile:         c.SourceVideoProfile,
-		SourceVideoBitDepth:        c.SourceVideoBitDepth,
-		SourceAudioChannels:        sourceAudioChannels,
-		SoftwareVideoDecode:        c.SoftwareVideoDecode,
-		ToneMapPolicy:              string(c.ToneMapPolicy),
-		ToneMapMode:                string(c.ToneMapMode),
-		ToneMapSourceKind:          string(c.ToneMapSourceKind),
-		ToneMapRecipeVersion:       c.ToneMapRecipeVersion,
-		CopyFMP4RecipeVersion:      c.CopyFMP4RecipeVersion,
-		ToneMapPreflightRequired:   c.ToneMapPreflightRequired,
-		ToneMapSourceRevision:      c.ToneMapSourceRevision.Encode(),
-		ToneMapDVConfigPresent:     c.ToneMapDVConfigPresent,
-		ToneMapDVBLCompatIDPresent: c.ToneMapDVBLCompatIDPresent,
-		ToneMapDVBLPresent:         c.ToneMapDVBLPresent,
-		ToneMapDVRPUPresent:        c.ToneMapDVRPUPresent,
-		VideoBitstreamFilter:       c.VideoBitstreamFilter,
-		VideoSampleEntry:           c.VideoSampleEntry,
-		CopyVideoMPEGTS:            c.CopyVideoMPEGTS,
-		KeyframePlaylist:           c.KeyframePlaylist,
-		SeekSeconds:                c.SeekSeconds,
-		StreamOriginSeconds:        c.StreamOriginSeconds,
-		CopySeekAnchorResolved:     c.CopySeekAnchorResolved,
-		SegmentDuration:            c.SegmentDuration,
-		StartSegmentNumber:         c.StartSegmentNumber,
-		SubtitleTrackIndex:         c.SubtitleTrackIndex,
-		SubtitleBurnIn:             c.SubtitleBurnIn,
-		SubtitleCodec:              c.SubtitleCodec,
-		SubtitleRendition:          c.SubtitleRendition,
-		TargetBitrateKbps:          c.TargetBitrateKbps,
-		TotalDuration:              c.TotalDuration,
-		FastStart:                  c.FastStart,
-		ThrottleSeconds:            c.ThrottleSeconds,
-		TargetCodecAudio:           c.TargetCodecAudio,
-		TargetAudioChannels:        targetAudioChannels,
-		TargetAudioBitrateKbps:     c.TargetAudioBitrateKbps,
+		SourceVideoCodec:               c.SourceVideoCodec,
+		SourceVideoProfile:             c.SourceVideoProfile,
+		SourceVideoBitDepth:            c.SourceVideoBitDepth,
+		SourceAudioChannels:            sourceAudioChannels,
+		SoftwareVideoDecode:            c.SoftwareVideoDecode,
+		ToneMapPolicy:                  string(c.ToneMapPolicy),
+		ToneMapMode:                    string(c.ToneMapMode),
+		ToneMapSourceKind:              string(c.ToneMapSourceKind),
+		ToneMapRecipeVersion:           c.ToneMapRecipeVersion,
+		CopyFMP4RecipeVersion:          c.CopyFMP4RecipeVersion,
+		ToneMapPreflightRequired:       c.ToneMapPreflightRequired,
+		ToneMapSourceRevision:          c.ToneMapSourceRevision.Encode(),
+		ToneMapDVConfigPresent:         c.ToneMapDVConfigPresent,
+		ToneMapDVBLCompatIDPresent:     c.ToneMapDVBLCompatIDPresent,
+		ToneMapDVBLPresent:             c.ToneMapDVBLPresent,
+		ToneMapDVRPUPresent:            c.ToneMapDVRPUPresent,
+		VideoBitstreamFilter:           c.VideoBitstreamFilter,
+		VideoSampleEntry:               c.VideoSampleEntry,
+		VideoRange:                     c.VideoRange,
+		CopyVideoMPEGTS:                c.CopyVideoMPEGTS,
+		KeyframePlaylist:               c.KeyframePlaylist,
+		SeekSeconds:                    c.SeekSeconds,
+		StreamOriginSeconds:            c.StreamOriginSeconds,
+		CopySeekAnchorResolved:         c.CopySeekAnchorResolved,
+		SegmentDuration:                c.SegmentDuration,
+		StartSegmentNumber:             c.StartSegmentNumber,
+		SubtitleTrackIndex:             c.SubtitleTrackIndex,
+		SubtitleBurnIn:                 c.SubtitleBurnIn,
+		SubtitleCodec:                  c.SubtitleCodec,
+		SubtitleRendition:              c.SubtitleRendition,
+		SubtitleRenditionTracks:        subtitleRenditionTrackNumbers(c.SubtitleRenditionTracks),
+		SubtitleRenditionNames:         subtitleRenditionNames(c.SubtitleRenditionTracks),
+		SubtitleRenditionLanguages:     subtitleRenditionLanguages(c.SubtitleRenditionTracks),
+		SubtitleRenditionForced:        subtitleRenditionForced(c.SubtitleRenditionTracks),
+		SubtitleRenditionDefault:       subtitleRenditionDefaultTrack(c.SubtitleRenditionTracks),
+		SubtitleRenditionSourceSize:    c.SubtitleRenditionSource.Size,
+		SubtitleRenditionSourceModTime: c.SubtitleRenditionSource.ModTimeUnixNano,
+		TargetBitrateKbps:              c.TargetBitrateKbps,
+		TotalDuration:                  c.TotalDuration,
+		FastStart:                      c.FastStart,
+		ThrottleSeconds:                c.ThrottleSeconds,
+		TargetCodecAudio:               c.TargetCodecAudio,
+		CopyAudioCodec:                 c.CopyAudioCodec,
+		TargetAudioChannels:            targetAudioChannels,
+		TargetAudioBitrateKbps:         c.TargetAudioBitrateKbps,
 	}
 }
 
@@ -492,6 +620,10 @@ func RecipeCardFromClaims(c *streamtoken.Claims) RecipeCard {
 	case streamtoken.PlayMethodAudioDownmixRemux:
 		method = PlayRemux
 	case streamtoken.PlayMethodCopyFMP4Transcode:
+		method = playMethodCopyFMP4V1
+	case streamtoken.PlayMethodSubtitleRenditionsTranscode:
+		method = PlayTranscode
+	case streamtoken.PlayMethodSubtitleRenditionsCopyFMP4:
 		method = playMethodCopyFMP4V1
 	}
 	if method == "" {
@@ -544,6 +676,7 @@ func RecipeCardFromClaims(c *streamtoken.Claims) RecipeCard {
 		ToneMapDVRPUPresent:              c.ToneMapDVRPUPresent,
 		VideoBitstreamFilter:             c.VideoBitstreamFilter,
 		VideoSampleEntry:                 c.VideoSampleEntry,
+		VideoRange:                       c.VideoRange,
 		CopyVideoMPEGTS:                  c.CopyVideoMPEGTS,
 		KeyframePlaylist:                 c.KeyframePlaylist,
 		SeekSeconds:                      c.SeekSeconds,
@@ -554,6 +687,7 @@ func RecipeCardFromClaims(c *streamtoken.Claims) RecipeCard {
 		SourceHeight:                     c.SourceHeight,
 		TargetCodecVideo:                 c.TargetCodec,
 		TargetCodecAudio:                 c.TargetCodecAudio,
+		CopyAudioCodec:                   c.CopyAudioCodec,
 		TargetAudioChannels:              c.TargetAudioChannels,
 		TargetAudioBitrateKbps:           c.TargetAudioBitrateKbps,
 		SegmentDuration:                  c.SegmentDuration,
@@ -562,7 +696,10 @@ func RecipeCardFromClaims(c *streamtoken.Claims) RecipeCard {
 		SubtitleBurnIn:                   c.SubtitleBurnIn,
 		SubtitleCodec:                    c.SubtitleCodec,
 		SubtitleRendition:                c.SubtitleRendition,
+		SubtitleRenditionTracks:          subtitleRenditionTracksFromClaims(c),
+		SubtitleRenditionSource:          SubtitleRenditionSource{Size: c.SubtitleRenditionSourceSize, ModTimeUnixNano: c.SubtitleRenditionSourceModTime},
 		AudioTrackIndex:                  c.AudioTrackIndex,
+		RequireAudioTrack:                c.RequireAudioTrack,
 		TargetBitrateKbps:                c.TargetBitrateKbps,
 		TotalDuration:                    c.TotalDuration,
 		FastStart:                        c.FastStart,

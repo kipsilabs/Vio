@@ -119,7 +119,7 @@ func (s *MetadataService) discoverLibraryItemImages(
 	}
 
 	target := *item
-	applyBestImages(&target, filtered, MergeReplaceUnlocked, language)
+	applyBestImages(&target, filtered, MergeReplaceUnlocked, language, "en")
 	applyLibraryImageSourcePaths(&target)
 
 	item.PosterPath = target.PosterPath

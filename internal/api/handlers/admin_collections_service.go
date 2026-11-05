@@ -29,6 +29,7 @@ type AdminCollectionPreviewRequest = previewCollectionRequest
 type AdminCollectionImportMDBList = importMDBListRequest
 type AdminCollectionImportTMDB = importTMDBRequest
 type AdminCollectionImportTMDBList = importTMDBListRequest
+type AdminCollectionImportTrakt = importTraktRequest
 type AdminCollectionImportResult = importCollectionResponse
 type AdminCollectionTemplateApply = applyTemplateBundleRequest
 type AdminCollectionTemplateResult = applyTemplateBundleResponse
@@ -396,6 +397,10 @@ func (h *LibraryCollectionHandler) PreviewAdminCollection(ctx context.Context, r
 	return resp, nil
 }
 
+func (h *LibraryCollectionHandler) importAdminTrakt(ctx context.Context, req AdminCollectionImportTrakt, artwork adminCollectionArtwork) (AdminCollectionImportResult, error) {
+	return AdminCollectionImportResult{}, apiError(http.StatusGone, "unsupported_source", "new Trakt collections are not supported")
+}
+
 func (h *LibraryCollectionHandler) importAdminMDBList(ctx context.Context, req AdminCollectionImportMDBList, artwork adminCollectionArtwork) (AdminCollectionImportResult, error) {
 	var none AdminCollectionImportResult
 	if !hasLibrarySelection(req.LibraryID, req.LibraryIDs) || strings.TrimSpace(req.Title) == "" || strings.TrimSpace(req.URL) == "" {
@@ -638,11 +643,13 @@ func (h *LibraryCollectionHandler) DeleteAdminCollectionArtwork(ctx context.Cont
 	if kind != collectionImagePoster && kind != adminCollectionBackdrop {
 		return apiError(400, "bad_request", "Artwork kind must be poster or backdrop")
 	}
-	if _, err := h.repo.GetByID(ctx, id); err != nil {
+	collection, err := h.repo.GetByID(ctx, id)
+	if err != nil {
 		return err
 	}
-	if err := h.deleteCollectionImages(ctx, id, kind); err != nil {
-		return err
+	oldPath := collection.PosterURL
+	if kind == adminCollectionBackdrop {
+		oldPath = collection.BackdropURL
 	}
 	input := catalog.UpdateLibraryCollectionInput{ID: id}
 	if kind == collectionImagePoster {
@@ -657,6 +664,7 @@ func (h *LibraryCollectionHandler) DeleteAdminCollectionArtwork(ctx context.Cont
 	if err := h.repo.Update(ctx, input); err != nil {
 		return err
 	}
+	h.cleanUpReplacedCollectionImage(ctx, id, kind, oldPath)
 	if kind == collectionImagePoster && h.service != nil {
 		h.service.MaybeGenerateCollage(ctx, id)
 	}

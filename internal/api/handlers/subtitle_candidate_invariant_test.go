@@ -154,7 +154,7 @@ func playbackFontRequest(sessionID, track string) *http.Request {
 // not be classified as a failed media source, which is what would feed the
 // candidate-failure machinery and rotate the release.
 func TestSubtitleRemapExhaustionIsSubtitleLocal(t *testing.T) {
-	errs := []*candidateErrorV3{{
+	errs := []*candidateV3Error{{
 		Stage:   candidateStageSubtitleRemap,
 		Message: "candidate 84 subtitle remap failed",
 		Err:     errSubtitleUnavailableInTargetV3,
@@ -166,11 +166,11 @@ func TestSubtitleRemapExhaustionIsSubtitleLocal(t *testing.T) {
 	if got.reason != subtitleUnavailableReasonV3 {
 		t.Fatalf("subtitle remap exhaustion reason = %q, want %q", got.reason, subtitleUnavailableReasonV3)
 	}
-	if got.reason == "virtual_source_unavailable" {
+	if got.reason == virtualSourceUnavailableReasonV3 {
 		t.Fatal("a subtitle remap miss was classified as a virtual source failure")
 	}
 
-	artifactErrs := []*candidateErrorV3{{
+	artifactErrs := []*candidateV3Error{{
 		Stage:   candidateStageSubtitleArtifact,
 		Message: "candidate 84 attach subtitle artifact failed",
 		Err:     errors.New("subtitle store unavailable"),
@@ -179,13 +179,13 @@ func TestSubtitleRemapExhaustionIsSubtitleLocal(t *testing.T) {
 		t.Fatalf("subtitle artifact exhaustion reason = %q, want %q", got.reason, subtitleUnavailableReasonV3)
 	}
 
-	if !candidateSubtitleLocalFailureV3(&candidateErrorV3{Stage: candidateStageSubtitleRemap, Err: errSubtitleUnavailableInTargetV3}) {
+	if !candidateSubtitleLocalFailureV3(&candidateV3Error{Stage: candidateStageSubtitleRemap, Err: errSubtitleUnavailableInTargetV3}) {
 		t.Fatal("a subtitle remap miss was not recognized as subtitle-local")
 	}
-	if !candidateSubtitleLocalFailureV3(&candidateErrorV3{Stage: candidateStageSubtitleArtifact, Err: errors.New("store")}) {
+	if !candidateSubtitleLocalFailureV3(&candidateV3Error{Stage: candidateStageSubtitleArtifact, Err: errors.New("store")}) {
 		t.Fatal("a subtitle artifact failure was not recognized as subtitle-local")
 	}
-	if candidateSubtitleLocalFailureV3(&candidateErrorV3{Stage: candidateStageTransport, Err: errors.New("no bytes")}) {
+	if candidateSubtitleLocalFailureV3(&candidateV3Error{Stage: candidateStageTransport, Err: errors.New("no bytes")}) {
 		t.Fatal("a transport failure was misclassified as subtitle-local")
 	}
 }

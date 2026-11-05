@@ -200,7 +200,7 @@ func TestCatalogItemDetailOfCarriesEpisodeReleaseState(t *testing.T) {
 		AirDate: &air, ReleaseState: upcoming,
 		Cast: []catalogpkg.CastCredit{}, Crew: []catalogpkg.CrewCredit{},
 		Genres: []string{}, Versions: []catalogpkg.FileVersion{}, Subtitles: []catalogpkg.SubtitleInfo{},
-	}, ratingsources.Selection{}, nil)
+	}, ratingsources.Selection{})
 	if out.ReleaseState != "upcoming" {
 		t.Fatalf("episode detail release_state = %q, want upcoming", out.ReleaseState)
 	}
@@ -212,7 +212,7 @@ func TestCatalogItemDetailOfCarriesEpisodeReleaseState(t *testing.T) {
 		ContentID: "movie:heat-1995", Type: "movie", Title: "Heat",
 		Cast: []catalogpkg.CastCredit{}, Crew: []catalogpkg.CrewCredit{},
 		Genres: []string{}, Versions: []catalogpkg.FileVersion{}, Subtitles: []catalogpkg.SubtitleInfo{},
-	}, ratingsources.Selection{}, nil)
+	}, ratingsources.Selection{})
 	if movie.ReleaseState != "" {
 		t.Fatalf("movie detail release_state = %q, want absent", movie.ReleaseState)
 	}
@@ -279,8 +279,9 @@ func TestMetadataAICapabilityAndTranslate(t *testing.T) {
 	if job.ID != "42" || job.TargetLanguage != "de" || job.Status != "pending" || fake.lastLang != "de" || fake.lastUser != 1 || fake.lastFilter.UserID != 1 {
 		t.Fatalf("job = %+v fake = %+v", job, fake)
 	}
+	// Empty fails both minLength and the language tag pattern, at the member.
 	p := requireProblem(t, do(t, h, http.MethodPost, "/api/v2/catalog/items/movie:heat-1995/translate-description", `{"target_language":""}`, viewerHeaders()), TypeValidationFailed)
-	if len(p.Errors) != 1 || p.Errors[0].Location != "body.target_language" {
+	if len(p.Errors) == 0 || slices.ContainsFunc(p.Errors, func(e ProblemError) bool { return e.Location != "body.target_language" }) {
 		t.Fatalf("errors = %+v", p.Errors)
 	}
 	requireProblem(t, do(t, h, http.MethodPost, "/api/v2/catalog/items/movie:heat-1995/translate-description", `{"target_language":"de","force":true}`, viewerHeaders()), TypeValidationFailed)

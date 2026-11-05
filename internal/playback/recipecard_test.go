@@ -346,7 +346,7 @@ func TestSetTranscodeStreamDetails(t *testing.T) {
 	m := NewSessionManager(0, 0)
 	m.RegisterReconstructed(&Session{ID: "sess-1", UserID: 7, PlayMethod: PlayTranscode})
 
-	if err := m.SetTranscodeStreamDetails("sess-1", "copy", "aac", true, "qsv", tonemap.ModeHardware); err != nil {
+	if err := m.SetTranscodeStreamDetails("sess-1", "copy", "aac", true, "qsv", tonemap.ModeHardware, "1080p", 8000); err != nil {
 		t.Fatalf("SetTranscodeStreamDetails: %v", err)
 	}
 	s, err := m.GetSession("sess-1")
@@ -356,7 +356,7 @@ func TestSetTranscodeStreamDetails(t *testing.T) {
 	if s.TargetVideoCodec != "copy" || s.TargetAudioCodec != "aac" || !s.TranscodeAudio || s.TranscodeHWAccel != "qsv" || s.ToneMapMode != tonemap.ModeHardware {
 		t.Fatalf("details not recorded: %+v", s)
 	}
-	if err := m.SetTranscodeStreamDetails("missing", "h264", "aac", true, "none", tonemap.ModeSoftware); err == nil {
+	if err := m.SetTranscodeStreamDetails("missing", "h264", "aac", true, "none", tonemap.ModeSoftware, "720p", 4000); err == nil {
 		t.Fatal("expected ErrSessionNotFound for unknown session")
 	}
 }

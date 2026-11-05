@@ -54,7 +54,8 @@
         "Language": "spa",
         "Label": "Spanish (downloaded)",
         "Forced": false,
-        "HearingImpaired": false
+        "HearingImpaired": false,
+        "NativeSelectable": false
       }
     ]
   },
@@ -84,6 +85,7 @@
       "default": false,
       "hearing_impaired": false,
       "delivery": "sidecar",
+      "stream_index": 0,
       "url": "/stream/11111111-1111-4111-8111-111111111111/subtitles/1.ass?file_id=42\u0026embedded_stream_index=0",
       "font_bundle_url": "/stream/11111111-1111-4111-8111-111111111111/subtitles/1/fonts?file_id=42\u0026embedded_stream_index=0"
     },
@@ -98,6 +100,7 @@
       "default": false,
       "hearing_impaired": false,
       "delivery": "sidecar",
+      "stream_index": 1,
       "url": "/stream/11111111-1111-4111-8111-111111111111/subtitles/2.sup?file_id=42\u0026embedded_stream_index=1"
     },
     {
@@ -110,7 +113,8 @@
       "forced": false,
       "default": false,
       "hearing_impaired": false,
-      "delivery": "burn_in_only"
+      "delivery": "burn_in_only",
+      "stream_index": 2
     },
     {
       "track_id": "file:42:subtitle:4",

@@ -237,7 +237,7 @@ func TestResolveVirtualStartWithVersionFallbackReturnsHonestEmptyListing(t *test
 		t.Fatal("expected the empty-listing resolve to fail")
 	}
 	terminal := virtualStartUnresolvedTerminalV3(err).Terminal
-	if terminal == nil || terminal.Reason != "virtual_source_unavailable" || !strings.Contains(terminal.Message, "no streams") {
+	if terminal == nil || terminal.Reason != virtualSourceUnavailableReasonV3 || !strings.Contains(terminal.Message, "no streams") {
 		t.Fatalf("terminal = %#v, want the honest empty-listing cause", terminal)
 	}
 	if !terminal.Retryable {
@@ -256,11 +256,11 @@ func TestVirtualStartUnresolvedTerminalHonestCause(t *testing.T) {
 		t.Fatalf("edge failure terminal = %#v, want retryable %s", edge.Terminal, providerUnavailableReasonV3)
 	}
 	empty := virtualStartUnresolvedTerminalV3(errors.New("no streams available from provider"))
-	if empty.Terminal == nil || empty.Terminal.Reason != "virtual_source_unavailable" || !strings.Contains(empty.Terminal.Message, "no streams") {
+	if empty.Terminal == nil || empty.Terminal.Reason != virtualSourceUnavailableReasonV3 || !strings.Contains(empty.Terminal.Message, "no streams") {
 		t.Fatalf("empty listing terminal = %#v, want the empty-listing message", empty.Terminal)
 	}
 	dead := virtualStartUnresolvedTerminalV3(errors.New("virtual stream provider returned no matching candidate"))
-	if dead.Terminal == nil || dead.Terminal.Reason != "virtual_source_unavailable" || strings.Contains(dead.Terminal.Message, "no streams") {
+	if dead.Terminal == nil || dead.Terminal.Reason != virtualSourceUnavailableReasonV3 || strings.Contains(dead.Terminal.Message, "no streams") {
 		t.Fatalf("other terminal = %#v, want the generic resolve message", dead.Terminal)
 	}
 }

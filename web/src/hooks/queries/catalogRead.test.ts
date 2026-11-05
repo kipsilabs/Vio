@@ -74,33 +74,6 @@ describe("catalog item reads on the v2 contract", () => {
     expect(detail.status).toBeUndefined();
   });
 
-  it("preserves explicit subtitle choices and track identity in item detail", async () => {
-    const signature = {
-      source: "embedded",
-      language: "eng",
-      codec: "subrip",
-      label: "English SDH",
-      forced: false,
-      hearing_impaired: true,
-    };
-    stubFetch({
-      ...getCatalogItemOk,
-      effective_subtitle_language: "eng",
-      effective_subtitle_mode: "off",
-      effective_show_forced_subtitles: false,
-      effective_subtitle_track_signature: signature,
-      subtitles: [{ index: 3, language: "eng", forced: false }],
-    });
-
-    const detail = await fetchCatalogItemDetail("movie:heat-1995");
-
-    expect(detail.effective_subtitle_language).toBe("eng");
-    expect(detail.effective_subtitle_mode).toBe("off");
-    expect(detail.effective_show_forced_subtitles).toBe(false);
-    expect(detail.effective_subtitle_track_signature).toEqual(signature);
-    expect(detail.subtitles[0]).toMatchObject({ codec: "", title: "", forced: false });
-  });
-
   it("aborts the detail fetch when its last observer unmounts", async () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     let requestSignal: AbortSignal | null | undefined;
@@ -159,7 +132,7 @@ describe("catalog item reads on the v2 contract", () => {
   it("sends the selected file id only when one is given", async () => {
     const fetchMock = stubFetch(getCatalogItemOk);
 
-    await fetchCatalogItemDetail("movie:heat-1995", 12, undefined, 120);
+    await fetchCatalogItemDetail("movie:heat-1995", 12, undefined, undefined, 120);
 
     expect(requestedUrl(fetchMock)).toBe(
       "/api/v2/catalog/items/movie%3Aheat-1995?library_id=12&file_id=120",

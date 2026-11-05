@@ -21,6 +21,9 @@ import (
 	"github.com/Silo-Server/silo-server/internal/userstore"
 )
 
+// PositionUnknown marks a session whose latest playback position was not reported.
+const PositionUnknown = -1
+
 // Transport output facts are independent of the whole-session play method.
 const (
 	OutputContainerFMP4   = "fmp4"
@@ -77,6 +80,8 @@ type Session struct {
 	// means no pin.
 	DVProfilePin     DVPinV3
 	ClientIP         string // resolved client IP for the playback session
+	DeviceID         string // client installation identifier, when available
+	DevicePlatform   string // client platform declaration, when available
 	StreamLocation   string // local/remote policy classification fixed at playback negotiation
 	ClientName       string // reported playback client name, when available
 	ClientVersion    string // reported playback client version, when available
@@ -284,6 +289,8 @@ type Session struct {
 
 	Position float64
 	IsPaused bool
+	// Watch records measured playback and pause time from progress samples.
+	Watch WatchTime
 	// ClientCanceled records the last transport cancel observed for this
 	// session, scoped to the route revision and binding generation it happened
 	// on. It is liveness evidence for one request, not a session verdict: the
@@ -303,6 +310,7 @@ type Session struct {
 	StartedAt                  time.Time
 	UpdatedAt                  time.Time
 	LastActivityAt             time.Time
+	PlanCommittedAt            time.Time
 	activeTransportCount       int
 	replacementPlayMethod      PlayMethod
 	streamRevision             uint64
@@ -524,6 +532,7 @@ type SessionReplacementRollback struct {
 	previousPositionSequence     int64
 	restoreProgress              bool
 	previousReplacementMethod    PlayMethod
+	previousPlanCommittedAt      time.Time
 }
 
 // ErrSessionReplacementSuperseded means a replacement rollback would overwrite
@@ -536,8 +545,9 @@ type clientInfoContextKey struct{}
 // ClientInfo carries best-effort client metadata from request handling into
 // the playback session manager.
 type ClientInfo struct {
-	Name    string
-	Version string
+	Name     string
+	Version  string
+	DeviceID string
 	// Build is the client's opaque per-platform build identifier (Android
 	// versionCode, Apple CFBundleVersion, …). The server never parses or
 	// compares it; it exists so an admin can name the exact build.
@@ -545,9 +555,10 @@ type ClientInfo struct {
 	// Channel is the client's opaque distribution channel ("release", "beta",
 	// "sideload", "dev", …). Stored verbatim — deliberately not validated
 	// against an enum so a new channel needs no server change.
-	Channel   string
-	UserAgent string
-	IsCompat  bool
+	Channel        string
+	UserAgent      string
+	DevicePlatform string
+	IsCompat       bool
 }
 
 // Normalized returns the identity with every field trimmed and clamped to the
@@ -624,6 +635,11 @@ func ClientInfoFromContext(ctx context.Context) ClientInfo {
 }
 
 // SessionManager tracks active playback sessions and enforces stream limits.
+type LifecycleHooks struct {
+	Started       func(context.Context, *Session, string)
+	PauseReported func(context.Context, string, bool)
+}
+
 type SessionManager struct {
 	sessions             map[string]*Session
 	mu                   sync.RWMutex
@@ -635,6 +651,7 @@ type SessionManager struct {
 	pausedGrace          time.Duration
 	expireHooks          []func(*Session)
 	finishHooks          []func(context.Context, *Session)
+	lifecycleHooks       []LifecycleHooks
 	compatActivityReader SessionActivityReader
 	compatExpiryClaimer  SessionExpiryClaimer
 	// deliveryActivityReader reports media that another node served for a
@@ -696,6 +713,10 @@ const (
 	// DefaultActiveSessionGrace is how long an unpaused session may go without
 	// observed playback activity before it stops counting toward limits.
 	DefaultActiveSessionGrace = 45 * time.Second
+
+	// StartupSessionGrace keeps a newly committed playback plan alive while the
+	// client waits for its startup timeout before requesting a fallback.
+	StartupSessionGrace = 90 * time.Second
 
 	// remoteTransportIdleGrace is the floor on the idle windows for a session
 	// whose media is served by another node. See remoteTransportGrace: it must
@@ -775,6 +796,47 @@ func (m *SessionManager) AddExpirationHook(fn func(*Session)) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.expireHooks = append(m.expireHooks, fn)
+}
+
+func (m *SessionManager) AddLifecycleHooks(h LifecycleHooks) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.lifecycleHooks = append(m.lifecycleHooks, h)
+}
+
+// AnnounceStart tells lifecycle hooks that a frontend started this session.
+// The session is copied under the read lock so hooks observe a race-free snapshot.
+func (m *SessionManager) AnnounceStart(ctx context.Context, sessionID, frontend string) {
+	m.mu.RLock()
+	s, ok := m.sessions[sessionID]
+	var started Session
+	if ok {
+		started = *s
+	}
+	hooks := append([]LifecycleHooks(nil), m.lifecycleHooks...)
+	m.mu.RUnlock()
+	if !ok {
+		return
+	}
+	for _, hook := range hooks {
+		if hook.Started != nil {
+			hook.Started(ctx, &started, frontend)
+		}
+	}
+}
+
+// ReportPause tells lifecycle hooks about a pause or resume reported without a
+// progress sequence. It intentionally does not alter session state; callers
+// that own authoritative progress use SetPaused or UpdateProgress.
+func (m *SessionManager) ReportPause(ctx context.Context, sessionID string, paused bool) {
+	m.mu.RLock()
+	hooks := append([]LifecycleHooks(nil), m.lifecycleHooks...)
+	m.mu.RUnlock()
+	for _, hook := range hooks {
+		if hook.PauseReported != nil {
+			hook.PauseReported(ctx, sessionID, paused)
+		}
+	}
 }
 
 // AddFinishHook registers a callback that runs after FinishSession removes a
@@ -993,6 +1055,7 @@ func newSession(
 		IsPaused:               false,
 		ClientName:             clientInfo.Name,
 		ClientVersion:          clientInfo.Version,
+		DeviceID:               clientInfo.DeviceID,
 		ClientBuild:            clientInfo.Build,
 		ClientChannel:          clientInfo.Channel,
 		ClientUserAgent:        clientInfo.UserAgent,
@@ -1047,6 +1110,7 @@ func (m *SessionManager) RegisterReconstructed(s *Session) *Session {
 	}
 	s.UpdatedAt = now
 	s.LastActivityAt = now
+	s.PlanCommittedAt = now
 	m.sessions[s.ID] = s
 	return s
 }
@@ -1103,6 +1167,7 @@ func (m *SessionManager) RegisterReconstructedWithLimits(ctx context.Context, s 
 	}
 	s.UpdatedAt = now
 	s.LastActivityAt = now
+	s.PlanCommittedAt = now
 	m.sessions[s.ID] = s
 	return s, nil
 }
@@ -1373,6 +1438,11 @@ func (m *SessionManager) updateProgress(sessionID string, position float64, isPa
 	}
 
 	s.Position = position
+	if sequence >= 0 && sequence <= s.positionSequence {
+		m.touchSessionLocked(s)
+		return nil
+	}
+	s.Watch.Observe(position, isPaused, time.Now())
 	s.positionSequence = max(s.positionSequence, sequence)
 	if sequence < 0 || sequence > s.confirmedPauseSequence {
 		s.IsPaused = isPaused
@@ -1401,11 +1471,16 @@ func (m *SessionManager) SetPaused(sessionID string, paused bool, acceptedSequen
 		return false, ErrSessionNotFound
 	}
 	s.confirmedPauseSequence = max(s.confirmedPauseSequence, acceptedSequence)
+	wasPaused := s.IsPaused
+	if paused && !wasPaused {
+		s.Watch.Pause(time.Now())
+	}
 	moved := false
 	if latest != nil && latest.Sequence > s.positionSequence {
 		s.positionSequence = latest.Sequence
 		moved = s.Position != latest.Position
 		s.Position = latest.Position
+		s.Watch.Observe(latest.Position, wasPaused, time.Now())
 	}
 	if s.IsPaused == paused {
 		if moved {
@@ -2734,6 +2809,7 @@ func (m *SessionManager) applyReplacementLocked(
 		previousEffectiveMediaFileID: s.MediaFileID,
 		previousStreamState:          snapshotSessionStreamStateLocked(s),
 		previousReplacementMethod:    s.replacementPlayMethod,
+		previousPlanCommittedAt:      s.PlanCommittedAt,
 	}
 	if replacement.PositionSeconds != nil {
 		rollback.previousPosition = s.Position
@@ -2760,6 +2836,9 @@ func (m *SessionManager) applyReplacementLocked(
 	s.streamRevision++
 	rollback.appliedRevision = s.streamRevision
 	m.touchSessionLocked(s)
+	// A committed fallback plan restarts the startup window: the client is
+	// still waiting out its startup timeout for this plan.
+	s.PlanCommittedAt = s.LastActivityAt
 	return rollback, nil
 }
 
@@ -2790,17 +2869,24 @@ func (m *SessionManager) RollbackReplacement(sessionID string, rollback SessionR
 		s.positionSequence = rollback.previousPositionSequence
 	}
 	s.replacementPlayMethod = rollback.previousReplacementMethod
+	// A rolled-back replan handed the client no plan, so it must not restart
+	// the startup window.
+	s.PlanCommittedAt = rollback.previousPlanCommittedAt
 	s.streamRevision++
 	m.touchSessionLocked(s)
 	return nil
 }
+
+var _ interface {
+	SetTranscodeStreamDetails(string, string, string, bool, string, tonemap.Mode, string, int) error
+} = (*SessionManager)(nil)
 
 // SetTranscodeStreamDetails records the actual encode decisions of a running
 // transcode on the session — video copy vs re-encode, and whether audio is
 // re-encoded — together with the confirmed hardware and tone-map executors —
 // so session sync and the admin activity views describe what ffmpeg is doing
 // rather than relying on requested transport defaults.
-func (m *SessionManager) SetTranscodeStreamDetails(sessionID, targetVideoCodec, targetAudioCodec string, transcodeAudio bool, hwAccel string, toneMapMode tonemap.Mode) error {
+func (m *SessionManager) SetTranscodeStreamDetails(sessionID, targetVideoCodec, targetAudioCodec string, transcodeAudio bool, hwAccel string, toneMapMode tonemap.Mode, targetResolution string, targetBitrateKbps int) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -2814,6 +2900,8 @@ func (m *SessionManager) SetTranscodeStreamDetails(sessionID, targetVideoCodec, 
 	s.TranscodeAudio = transcodeAudio
 	s.TranscodeHWAccel = hwAccel
 	s.ToneMapMode = toneMapMode
+	s.TargetResolution = targetResolution
+	s.TargetBitrateKbps = targetBitrateKbps
 	m.touchSessionLocked(s)
 	return nil
 }
@@ -3061,6 +3149,21 @@ func (m *SessionManager) SetProgressPersistenceDisabled(sessionID string, disabl
 
 // TouchActivity refreshes the session's activity timestamp without changing
 // any other playback state.
+// MarkPlanCommitted records that startup planning completed, allowing normal lifecycle accounting.
+func (m *SessionManager) MarkPlanCommitted(sessionID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		return ErrSessionNotFound
+	}
+	now := time.Now()
+	s.PlanCommittedAt = now
+	s.LastActivityAt = now
+	s.UpdatedAt = now
+	return nil
+}
+
 func (m *SessionManager) TouchActivity(sessionID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -3259,7 +3362,48 @@ func (m *SessionManager) FinishSession(ctx context.Context, sessionID string) er
 	return nil
 }
 
-// GetSession returns the session with the given ID, or ErrSessionNotFound.
+// FinishDetached runs finish hooks for a snapshot this replica does not hold.
+// It leaves live sessions untouched and marks the context for hook enrichment.
+func (m *SessionManager) FinishDetached(ctx context.Context, s Session) {
+	m.mu.RLock()
+	hooks := append([]func(context.Context, *Session){}, m.finishHooks...)
+	m.mu.RUnlock()
+	ctx = context.WithValue(ctx, detachedFinishKey{}, true)
+	for _, hook := range hooks {
+		hook(ctx, &s)
+	}
+}
+
+// PlaybackEndReason describes why a playback session ended.
+// The empty value means no explicit reason was supplied.
+type PlaybackEndReason string
+
+// EndReasonReplaced is the end reason of a session another one replaced
+// mid-play: a Jellyfin client switched play method.
+const EndReasonReplaced PlaybackEndReason = "replaced"
+
+type endReasonKey struct{}
+type detachedFinishKey struct{}
+
+// WithEndReason tells the finish hooks why the play ended. Without it a
+// finished play ended because its client stopped it.
+func WithEndReason(ctx context.Context, reason string) context.Context {
+	return context.WithValue(ctx, endReasonKey{}, reason)
+}
+
+// EndReasonFromContext is the reason WithEndReason recorded, or "".
+func EndReasonFromContext(ctx context.Context) string {
+	reason, _ := ctx.Value(endReasonKey{}).(string)
+	return reason
+}
+
+// IsDetachedFinish reports whether a finish hook runs for a FinishDetached
+// snapshot rather than a copy this replica held.
+func IsDetachedFinish(ctx context.Context) bool {
+	detached, _ := ctx.Value(detachedFinishKey{}).(bool)
+	return detached
+}
+
 func (m *SessionManager) GetSession(sessionID string) (*Session, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -3516,12 +3660,12 @@ func (m *SessionManager) CleanStale() []*Session {
 // provided grace period. Sessions with an active media transport request are
 // preserved even if they have not emitted a recent heartbeat yet.
 func (m *SessionManager) CleanInactive(activeIdle, pausedIdle time.Duration) []*Session {
-	m.refreshDeliveryActivity(activeIdle, pausedIdle)
-	protected := m.refreshCompatActivity(activeIdle, pausedIdle)
+	m.refreshDeliveryActivity(activeIdle, pausedIdle, 0)
+	protected := m.refreshCompatActivity(activeIdle, pausedIdle, 0)
 	m.mu.Lock()
 
 	now := time.Now()
-	claimed := m.claimCompatExpiryLocked(now, activeIdle, pausedIdle, protected)
+	claimed := m.claimCompatExpiryLocked(now, activeIdle, pausedIdle, 0, protected)
 	var expired []*Session
 	for id, s := range m.sessions {
 		if protected[s] || s.IsJellyfinCompat && claimed != nil && !claimed[id] {
@@ -3602,6 +3746,11 @@ func (m *SessionManager) sessionIsInactiveLocked(s *Session, now time.Time, acti
 	}
 
 	lastActivity := s.LastActivityAt
+	// A committed plan gets its own startup grace: clients may take longer than
+	// the ordinary activity window to attach and emit their first sample.
+	if !s.PlanCommittedAt.IsZero() && s.PlanCommittedAt.Add(StartupSessionGrace).After(now) {
+		return false
+	}
 	if lastActivity.IsZero() {
 		lastActivity = s.UpdatedAt
 	}

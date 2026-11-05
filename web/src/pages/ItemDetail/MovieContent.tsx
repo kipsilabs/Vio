@@ -260,7 +260,6 @@ export default function MovieContent({
     setSubtitlePreference.mutate({
       prefId: item.content_id,
       selection,
-      showForcedSubtitles: item.effective_show_forced_subtitles,
     });
   };
 
@@ -270,7 +269,6 @@ export default function MovieContent({
     setSubtitlePreference.mutate({
       prefId: item.content_id,
       selection: null,
-      showForcedSubtitles: item.effective_show_forced_subtitles,
     });
   };
 
@@ -452,7 +450,6 @@ export default function MovieContent({
               preferredSubtitleTrackSignature={preferredSubtitleTrackSignature}
               subtitleMode={item.effective_subtitle_mode as "off" | "auto" | "always" | undefined}
               showForcedSubtitles={item.effective_show_forced_subtitles}
-              profileLanguage={currentProfile?.language}
             />
           }
         />

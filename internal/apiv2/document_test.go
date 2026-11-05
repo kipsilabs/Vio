@@ -61,6 +61,36 @@ func TestProfileHeaderRequiredMatchesGateChain(t *testing.T) {
 	}
 }
 
+// TestBucketLimitedPublicOperationsDocument429: a public operation whose gate
+// chain runs the per-endpoint limiter documents the 429 it answers. Every
+// gated class implies 429 already.
+func TestBucketLimitedPublicOperationsDocument429(t *testing.T) {
+	api := huma.NewAPI(humaConfig(), noopAdapter{})
+	registerAll(&Registry{api: api})
+	deps := Dependencies{BucketRateLimit: func(string) func(http.Handler) http.Handler {
+		return func(next http.Handler) http.Handler { return next }
+	}}
+	limited := 0
+	for path, item := range api.OpenAPI().Paths {
+		for _, op := range []*huma.Operation{item.Get, item.Head, item.Post, item.Put, item.Patch, item.Delete} {
+			if op == nil || op.Metadata[metaClass] != ClassPublic {
+				continue
+			}
+			bucket, _ := op.Metadata[metaRateLimitBucket].(string)
+			if chain, _ := gateChain(deps, ClassPublic, "", false, false, false, bucket); len(chain) == 0 {
+				continue
+			}
+			limited++
+			if _, ok := op.Responses[strconv.Itoa(http.StatusTooManyRequests)]; !ok {
+				t.Errorf("%s %s runs the %q limiter but does not document 429", op.Method, path, bucket)
+			}
+		}
+	}
+	if limited == 0 {
+		t.Fatal("no public operation runs a bucket limiter")
+	}
+}
+
 // The generator has no runtime dependencies. Cache immutable JSON while each
 // consumer receives its own bytes and decoded schema objects.
 var generatedOpenAPI = sync.OnceValues(func() (string, error) {
@@ -374,6 +404,21 @@ func TestGeneratedDocumentStatuses(t *testing.T) {
 	profileToken["getAdminPlaybackSummary"] = true
 	profileToken["getThemeSongsCapability"] = true
 	profileToken["createThemeSongPlayback"] = true
+	// Fork surfaces whose registration carries the profile header.
+	for _, id := range []string{
+		"checkAdminAIProvider", "createAdminAIProvider", "deleteAdminAIProvider",
+		"deleteAdminOverlayImage", "getAdminCatalogCapabilities", "getAdminDashboardAPIClientEndpoints",
+		"getAdminDashboardAPIClients", "getAdminPlaybackHistoryCapabilities", "getCatalogBoxSet",
+		"getCatalogItemBoxSet", "getDiscoverRow", "getFavoriteMembership", "getPersonalListCapability",
+		"getRequestDiscoverLayout", "getWatchlistMembership", "listAdminAIProviderModels",
+		"listAdminAIProviders", "listAdminCatalogItems", "listAdminNodeSummaries",
+		"listRequestWatchProviders", "previewRequestDiscoverRow", "removeFailedRequest",
+		"reportPlaybackBandwidthProbe", "resetAdminDeviceLearnedLimit", "resetApplePushInstallation",
+		"resetRequestDiscoverLayout", "searchCatalogBoxSets", "updateAdminAIProvider",
+		"updateRequestDiscoverLayout", "uploadAdminItemImage", "uploadAdminOverlayImage",
+	} {
+		profileToken[id] = true
+	}
 	for _, id := range []string{
 		"cancelLibraryMetadataTranslation", "clearResumePosition", "completeAdminChatGPTLogin", "disconnectAdminChatGPTAccount",
 		"drainAdminNode", "getAdminAICapabilities", "getAdminChatGPTConnection", "getAdminJob",
@@ -553,19 +598,19 @@ func TestImpliedStatusesForConcurrency(t *testing.T) {
 		}
 		return false
 	}
-	plain := ImpliedStatuses(ClassPublic, false, false, false, true, false, false, false)
+	plain := ImpliedStatuses(ClassPublic, false, false, false, true, false, false, false, false)
 	if has(plain, http.StatusPreconditionFailed) || has(plain, http.StatusPreconditionRequired) || has(plain, http.StatusNotModified) {
 		t.Fatalf("plain operation implies concurrency statuses: %v", plain)
 	}
-	guarded := ImpliedStatuses(ClassPublic, false, false, true, true, true, false, false)
+	guarded := ImpliedStatuses(ClassPublic, false, false, true, true, true, false, false, false)
 	if !has(guarded, http.StatusPreconditionFailed) || !has(guarded, http.StatusPreconditionRequired) || has(guarded, http.StatusNotModified) {
 		t.Fatalf("guarded = %v", guarded)
 	}
-	conditional := ImpliedStatuses(ClassPublic, false, false, false, true, false, true, false)
+	conditional := ImpliedStatuses(ClassPublic, false, false, false, true, false, true, false, false)
 	if !has(conditional, http.StatusNotModified) || !has(conditional, http.StatusPreconditionFailed) || has(conditional, http.StatusPreconditionRequired) {
 		t.Fatalf("conditional = %v", conditional)
 	}
-	createOnly := ImpliedStatuses(ClassPublic, false, false, true, true, false, false, true)
+	createOnly := ImpliedStatuses(ClassPublic, false, false, true, true, false, false, true, false)
 	if !has(createOnly, http.StatusPreconditionFailed) || has(createOnly, http.StatusPreconditionRequired) || has(createOnly, http.StatusNotModified) {
 		t.Fatalf("createOnly = %v", createOnly)
 	}

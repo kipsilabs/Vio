@@ -12,7 +12,8 @@
           "dv_bl_compat_id_present": false,
           "width": 3840,
           "height": 2160,
-          "interlaced": false
+          "interlaced": false,
+          "hdr10_plus": false
         }
       ],
       "audio_tracks": [

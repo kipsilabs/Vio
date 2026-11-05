@@ -532,6 +532,20 @@ func TestTheatricalGatePrefetchWithoutCheckerIsNoop(t *testing.T) {
 	gate.prefetch(context.Background(), []int{1, 2, 3})
 }
 
+func TestTheatricalReleaseGateWithoutCheckerRefusesHomeReleaseEvidence(t *testing.T) {
+	gate := newTheatricalReleaseGate(nil)
+	released, err := gate.lookupProvider(context.Background(), 123)
+	if released {
+		t.Fatal("a gate without a checker must not report a movie as released")
+	}
+	if !errors.Is(err, ErrProviderUnavailable) {
+		t.Fatalf("lookup error = %v, want ErrProviderUnavailable", err)
+	}
+	if !strings.Contains(err.Error(), "movie home release evidence unavailable") {
+		t.Fatalf("lookup error = %q, want explicit missing-evidence reason", err)
+	}
+}
+
 func TestTheatricalGateMemoConcurrentPrefetchAndLookup(t *testing.T) {
 	checker := &recordingReleaseChecker{released: map[int]bool{500: true, 501: false, 502: true}}
 	gate := newTheatricalReleaseGate(checker)

@@ -27,7 +27,7 @@ func readyRetainedSession(t *testing.T, dir string) *TranscodeSession {
 		t.Fatal(err)
 	}
 	session := NewTranscodeSessionForTest(dir)
-	session.opts = TranscodeOpts{FastStart: true, HWAccel: transcodeHWQSV}
+	session.opts = TranscodeOpts{SessionID: "s1", FastStart: true, HWAccel: transcodeHWQSV}
 	return session
 }
 

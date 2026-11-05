@@ -104,8 +104,10 @@ type PlaybackSession struct {
 
 // PlaybackMediaSource stores one negotiated stream source within a compat play session.
 type PlaybackMediaSource struct {
-	ServerBitrateCapKbps int
-	StreamLocation       string // bitrate-policy classification fixed by PlaybackInfo
+	VirtualSourceURI                 string
+	VirtualSourceOwnerInstallationID int
+	ServerBitrateCapKbps             int
+	StreamLocation                   string // bitrate-policy classification fixed by PlaybackInfo
 	// SiloSeekReanchor opts into source-time copy-HLS startup for clients that
 	// renegotiate seeks outside the produced playlist window.
 	SiloSeekReanchor         bool
@@ -153,14 +155,26 @@ type PlaybackMediaSource struct {
 	DefaultSubtitleStreamIndex  *int
 	SelectedSubtitleStreamIndex *int
 	ETag                        string
-	// VirtualSourceURI pins the provider-neutral candidate selected and probed
-	// during PlaybackInfo. The temporary provider URL is resolved just in time.
-	VirtualSourceURI                 string
-	VirtualSourceOwnerInstallationID int
 	// SubtitleDeliveries preserves client delivery capabilities for tracks that
 	// may be enabled later. The scalar fields above retain the selected track's
 	// delivery for sessions read by older binaries during a rolling update.
 	SubtitleDeliveries map[int]PlaybackSubtitleDelivery
+
+	// h264TargetBitrateKbps and h264TargetResolution are the H.264 encode
+	// target, which PlaybackInfo restores when it falls back from an HEVC
+	// encode no executor can run. They are only read while PlaybackInfo
+	// builds the source, so they are not stored.
+	h264TargetBitrateKbps int
+	h264TargetResolution  string
+	// encodeCeilingKbps and h264EncodeCeilingKbps are the limits those targets
+	// were fit to, which the targets themselves fall below for a low-bitrate
+	// source. They are not stored either.
+	encodeCeilingKbps     int
+	h264EncodeCeilingKbps int
+
+	// hlsRemuxInTS marks a copy the client accepts only as MPEG-TS. PlaybackInfo
+	// reads it once the route is final, so it is not stored.
+	hlsRemuxInTS bool
 
 	// preservedJSON carries fields written by a newer binary through this
 	// binary's durable read-modify-write cycle. See playback_sessions_json.go.

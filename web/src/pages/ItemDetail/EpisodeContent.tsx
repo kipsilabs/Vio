@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useLocation, useNavigate } from "react-router";
-import type { FileVersion, ItemDetail } from "@/api/types";
+import { leafUserData, type FileVersion, type ItemDetail } from "@/api/types";
 import type { PlayerSubtitleTrackSignature, PrePlaySubtitleSelection } from "@/player/types";
 import { useSeasonDetail, useSeasonEpisodes } from "@/hooks/queries/episodes";
+import { useCatalogItemDetail } from "@/hooks/queries/catalogRead";
 import { useDeleteSubtitlePreference, useSetSubtitlePreference } from "@/hooks/queries/subtitles";
+import { usePrePlayAudioSelection } from "./usePrePlayAudioSelection";
 import { useAmbientColor } from "@/hooks/useAmbientColor";
 import { useEpisodeSpoilerPrefs } from "@/hooks/useEpisodeSpoilerPrefs";
 import { useAuth } from "@/hooks/useAuth";
@@ -63,10 +65,13 @@ import { hasMachineTranslation } from "./components/machineTranslation";
 
 export default function EpisodeContent({
   item,
+  libraryId,
   onStaleVersion,
   onSelectedFileIdChange,
 }: {
   item: ItemDetail & { type: "episode" };
+  /** The page's ?libraryId= scope; the series overview fallback resolves its language in it. */
+  libraryId?: number;
   onStaleVersion?: (fileId: number) => void;
   /**
    * Reports the viewer's explicit version pick (the in-place choice or the
@@ -76,8 +81,6 @@ export default function EpisodeContent({
    */
   onSelectedFileIdChange?: (fileId: number | null) => void;
 }) {
-  const { translating: overviewTranslating, onTranslate: onTranslateOverview } =
-    useOnViewTranslation(item);
   const navigate = useNavigate();
   const location = useLocation();
   const { user } = useAuth();
@@ -109,8 +112,7 @@ export default function EpisodeContent({
 
   // Version selection state — drives the Play button and inline stream popovers.
   const sortedVersions = useMemo(() => sortByResolution(item.versions ?? []), [item.versions]);
-  const userData =
-    item.user_data && "position_seconds" in item.user_data ? item.user_data : undefined;
+  const userData = leafUserData(item.user_data);
   // The viewer's own pick, remembered on this device. It outlives the server's
   // `last_file_id`, which names whichever row actually served the bytes after
   // a substitution. Read on mount, but only once the profile has resolved: the
@@ -125,8 +127,23 @@ export default function EpisodeContent({
   // Keyed by episode so a reveal survives an on-view translation of the same
   // episode but not navigation to the next one.
   const [revealedOverviewId, setRevealedOverviewId] = useState<string | null>(null);
+  // An episode without a description shows its series' overview, in the
+  // language the series page shows in this library, and on-view translation
+  // follows it. It reveals nothing about the episode, so spoiler protection leaves it
+  // visible.
+  const hasOwnOverview = !!item.overview?.trim();
+  const { data: series } = useCatalogItemDetail(
+    hasOwnOverview ? undefined : item.series_id,
+    libraryId,
+  );
+  const overviewSource = hasOwnOverview ? item : series;
+  const { translating: overviewTranslating, onTranslate: onTranslateOverview } =
+    useOnViewTranslation(overviewSource);
   const overviewHidden =
-    hideOverviews && isEpisodeUnwatched(item.user_data) && revealedOverviewId !== item.content_id;
+    hasOwnOverview &&
+    hideOverviews &&
+    isEpisodeUnwatched(item.user_data) &&
+    revealedOverviewId !== item.content_id;
   const defaultSelectedVersion = useMemo(
     () =>
       selectDefaultPlaybackVariantVersion(
@@ -215,8 +232,8 @@ export default function EpisodeContent({
     },
     [selectedVersion?.file_id],
   );
-  const [audioSelectionMode, setAudioSelectionMode] = useState<"auto" | "explicit">("auto");
-  const [explicitAudioTrackIndex, setExplicitAudioTrackIndex] = useState<number | null>(null);
+  const audioSelection = usePrePlayAudioSelection(item.content_id, item.series_id, selectedVersion);
+  const clearAudioSelection = audioSelection.clear;
   const [subtitleSelectionMode, setSubtitleSelectionMode] = useState<"auto" | "off" | "explicit">(
     "auto",
   );
@@ -228,8 +245,6 @@ export default function EpisodeContent({
   if (prevContentId !== item.content_id) {
     setPrevContentId(item.content_id);
     setManualSelectedFileId(null);
-    setAudioSelectionMode("auto");
-    setExplicitAudioTrackIndex(null);
     setSubtitleSelectionMode("auto");
     setExplicitSubtitleSelection(null);
   }
@@ -240,23 +255,13 @@ export default function EpisodeContent({
       // Remember the pick across reloads: the server records the row that
       // actually plays, which may be a substitute for this one.
       rememberRequestedFileId(item.content_id, version.file_id, requestedProfileId);
-      setAudioSelectionMode("auto");
-      setExplicitAudioTrackIndex(null);
+      // Track indexes belong to a file, so another version starts from Auto.
+      clearAudioSelection();
       setSubtitleSelectionMode("auto");
       setExplicitSubtitleSelection(null);
     },
-    [item.content_id, requestedProfileId],
+    [item.content_id, requestedProfileId, clearAudioSelection],
   );
-
-  const handleSelectAudioTrack = useCallback((trackIndex: number) => {
-    setAudioSelectionMode("explicit");
-    setExplicitAudioTrackIndex(trackIndex);
-  }, []);
-
-  const handleResetAudioSelection = useCallback(() => {
-    setAudioSelectionMode("auto");
-    setExplicitAudioTrackIndex(null);
-  }, []);
 
   const handleSelectSubtitle = (selection: PrePlaySubtitleSelection) => {
     setSubtitleSelectionMode("explicit");
@@ -268,7 +273,6 @@ export default function EpisodeContent({
       setSubtitlePreference.mutate({
         prefId: item.series_id,
         selection,
-        showForcedSubtitles: item.effective_show_forced_subtitles,
       });
     }
   };
@@ -291,7 +295,6 @@ export default function EpisodeContent({
       setSubtitlePreference.mutate({
         prefId: item.series_id,
         selection: null,
-        showForcedSubtitles: item.effective_show_forced_subtitles,
       });
     }
   };
@@ -451,10 +454,12 @@ export default function EpisodeContent({
             </div>
           }
           scoreRow={<ScoreRow ratings={item.ratings} />}
-          overview={item.overview}
+          overview={overviewSource?.overview}
           overviewTranslating={overviewTranslating}
           onTranslateOverview={onTranslateOverview}
-          overviewMachineTranslated={hasMachineTranslation(item.machine_translated_fields)}
+          overviewMachineTranslated={hasMachineTranslation(
+            overviewSource?.machine_translated_fields,
+          )}
           overviewHidden={overviewHidden}
           onRevealOverview={() => setRevealedOverviewId(item.content_id)}
           crewLine={<HeroCrewLine crew={item.crew ?? []} />}
@@ -539,10 +544,10 @@ export default function EpisodeContent({
                 (item.versions?.length ?? 0) > 0 ? () => setSubtitleSearchOpen(true) : undefined
               }
               qualityPreference={qualityPreference}
-              audioSelectionMode={audioSelectionMode}
-              explicitAudioTrackIndex={explicitAudioTrackIndex}
-              onSelectAudioTrack={handleSelectAudioTrack}
-              onResetAudioSelection={handleResetAudioSelection}
+              audioSelectionMode={audioSelection.mode}
+              explicitAudioTrackIndex={audioSelection.explicitIndex}
+              onSelectAudioTrack={audioSelection.select}
+              onResetAudioSelection={audioSelection.reset}
               prePlaySubtitleMode={subtitleSelectionMode}
               explicitSubtitleSelection={explicitSubtitleSelection}
               onSelectSubtitle={handleSelectSubtitle}
@@ -552,7 +557,6 @@ export default function EpisodeContent({
               preferredSubtitleTrackSignature={preferredSubtitleTrackSignature}
               subtitleMode={item.effective_subtitle_mode as "off" | "auto" | "always" | undefined}
               showForcedSubtitles={item.effective_show_forced_subtitles}
-              profileLanguage={currentProfile?.language}
             />
           }
         />

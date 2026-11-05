@@ -55,7 +55,7 @@ func TestAudioOnlyTransportReasonsAreAudioLocal(t *testing.T) {
 // be classified as a failed media source, which is what would feed the
 // candidate-failure machinery and indict the release.
 func TestClassifyVirtualReplanExhaustionAudioRemapIsNotReleaseFailure(t *testing.T) {
-	errs := []*candidateErrorV3{{
+	errs := []*candidateV3Error{{
 		Stage:   candidateStageAudioRemap,
 		Message: "candidate 84 audio remap failed",
 		Err:     errors.New("selected audio track identity is invalid"),
@@ -67,7 +67,7 @@ func TestClassifyVirtualReplanExhaustionAudioRemapIsNotReleaseFailure(t *testing
 	if got.reason != "track_unavailable" {
 		t.Fatalf("audio remap exhaustion reason = %q, want track_unavailable", got.reason)
 	}
-	if got.reason == "virtual_source_unavailable" {
+	if got.reason == virtualSourceUnavailableReasonV3 {
 		t.Fatal("an audio remap miss was classified as a virtual source failure")
 	}
 }

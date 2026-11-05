@@ -89,6 +89,10 @@ type StreamHandler struct {
 	// session recipes (same instance), the only reconstruction source for a
 	// session whose URLs carry no stream token. May be nil.
 	SessionRecipeStore sessionRecipeStoreV3
+	// FinishOtherEnd is the PlaybackHandler's finisher for a stop an abort
+	// here took over (same instance). May be nil; the finish hook then
+	// records the stop's history without its provider event.
+	FinishOtherEnd func(ctx context.Context, claim nativeEndClaim, sessionID string)
 	// PlaybackConfig returns the current playback config; read it through
 	// ffmpegPath(). May be nil (tests).
 	PlaybackConfig func() config.PlaybackConfig
@@ -1530,7 +1534,6 @@ func NewStreamHandler(sessionMgr SessionManagerInterface, fileResolver FilePathR
 // For remux: starts an ffmpeg remux and streams the output.
 // For transcode: returns 400 (transcode uses manifest/segment endpoints).
 func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
-	requestStart := time.Now()
 	userID := apimw.GetUserID(r.Context())
 	if userID == 0 {
 		writeError(w, http.StatusUnauthorized, "unauthorized", "Authentication required")
@@ -2124,7 +2127,6 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 		// a provider release that served nothing — retiring a healthy release
 		// because of a stop the operator asked for. Record that the transport was
 		// stopped so the branch can tell the two apart.
-		remuxStoppedServerSide := remuxStoppedServerSide(r.Context(), remuxAbort)
 		seekSeconds := 0.0
 		if seekStr := r.URL.Query().Get("seek"); seekStr != "" {
 			if s, err := strconv.ParseFloat(seekStr, 64); err == nil && s >= 0 {
@@ -2135,32 +2137,25 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 		// audio/mp4 for it, and a declared-tier client refuses to attach a
 		// source buffer whose advertised type its probe rejected — so the
 		// response has to keep the same promise the plan made.
-		dvProfile := session.DVProfile
-		if dvProfile == 0 {
-			dvProfile = file.PrimaryDVProfile()
-		}
+		stoppedServerSide := remuxStoppedServerSide(r.Context(), remuxAbort)
 		serveRemux := func() error {
 			// The remux writes through the raw writer; wrap it to observe how
 			// many bytes actually reached the client. nil return is NOT
 			// delivery evidence (remux.go can return nil when the first
 			// client write fails) — recovery is gated on positive bytes.
 			remuxWriter := httpstream.NewRollingDeadlineWriter(w)
-			err := playback.ServeRemuxWithOptions(remuxWriter, r, inputPath, "mp4", seekSeconds, session.TranscodeAudio, audioStreamOrdinalV3(file, session.AudioTrackIndex), dvProfile, playback.RemuxServeOptions{
+			err := playback.ServeRemuxWithOptions(remuxWriter, r, file.FilePath, "mp4", seekSeconds, session.TranscodeAudio, session.AudioTrackIndex, file.PrimaryDVProfile(), playback.RemuxServeOptions{
 				DVMode:                    session.RemuxDVMode,
-				DropResumeLeadingPictures: session.RemuxResumeLeadingPictureDrop,
 				FFmpegPath:                h.ffmpegPath(),
+				DropResumeLeadingPictures: session.RemuxResumeLeadingPictureDrop,
 				ContentType:               playback.RemuxContentType(file.IsAudioOnly()),
 				AudioOnly:                 file.IsAudioOnly(),
 				SourceAudioChannels:       session.SourceAudioChannels,
 				TargetAudioChannels:       session.TargetAudioChannels,
 				TargetAudioBitrateKbps:    session.TargetAudioBitrateKbps,
-				TimingStart:               requestStart,
-				// The request context (client disconnect) and the session's
-				// transport-stop watch both end the response. Without this a
-				// session stop cannot withdraw a remux the client is still being
-				// fed; the request context alone misses a server-initiated stop
-				// whose client keeps reading.
-				Abort: remuxAbort,
+				// For a copied track the planned codec is the source's.
+				CopyAudioCodec: session.TargetAudioCodec,
+				Abort:          remuxAbort,
 				// A pre-body start failure must leave the response
 				// uncommitted so the handler can fail over to a sibling
 				// candidate; the v2 writer locks the first >=400 status and
@@ -2185,7 +2180,7 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 			// once with it excluded so the next-ranked release is tried. A
 			// client that disconnected is not a candidate failure: the remux
 			// (and its provider fetch) already aborted on the request context.
-			if !isClientCancellation(r.Context(), remuxErr) && !remuxStoppedServerSide() && isVirtualPlaybackFile(file) && hasVirtualMediaResolver(h) {
+			if !isClientCancellation(r.Context(), remuxErr) && !stoppedServerSide() && isVirtualPlaybackFile(file) && hasVirtualMediaResolver(h) {
 				if releaseInput != nil {
 					releaseInput()
 					releaseInput = nil
@@ -2229,7 +2224,7 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 					// never given a chance to deliver. Without this the retry
 					// marks the candidate failed and rotates away from a healthy
 					// release, which is what the guard above exists to prevent.
-					if isClientCancellation(r.Context(), remuxErr) || remuxStoppedServerSide() {
+					if isClientCancellation(r.Context(), remuxErr) || stoppedServerSide() {
 						handled = true
 					}
 				}
@@ -2285,7 +2280,7 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 				// nothing has committed a status and the v2 writer is still
 				// unlocked; a mid-stream failure returns nil instead. Commit one
 				// coherent error here. A client that disconnected needs no body.
-				if !isClientCancellation(r.Context(), remuxErr) && !remuxStoppedServerSide() {
+				if !isClientCancellation(r.Context(), remuxErr) && !stoppedServerSide() {
 					http.Error(w, "failed to start remux", http.StatusBadGateway)
 				}
 			}
@@ -2511,7 +2506,7 @@ func (h *StreamHandler) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 
 		// Other formats (MicroDVD .sub) cannot be retimed; ffmpeg converts
 		// them from the file.
-		vttData, err := playback.LoadExternalSubtitleAsVTT(r.Context(), sub.Path, sub.Format, h.ffmpegPath())
+		vttData, err := playback.LoadExternalSubtitleAsVTT(r.Context(), sub, h.ffmpegPath())
 		if err != nil {
 			writeErrorCause(w, http.StatusInternalServerError, "internal_error",
 				"Failed to load external subtitle", err)
@@ -3474,11 +3469,32 @@ func (h *StreamHandler) abortPlaybackSession(ctx context.Context, session *playb
 	if h == nil || session == nil || session.ID == "" {
 		return
 	}
+	// Teardown reached from a canceled request (a client-canceled transport or
+	// a track switch aborting the old stream) must still stop the durable
+	// attempt and remove the synced session. Run the durable half detached and
+	// bounded instead of inheriting the dead request context.
+	ctx, cancel := teardownContext(ctx)
+	defer cancel()
 	if err := h.sessionMgr.StopSession(session.ID); err != nil {
 		return
 	}
+	claim := claimNativeEnd(ctx, h.PlanStoreV3, h.StreamDeny, session.ID, abortStopID(session.ID))
 	h.finalizeSessionAbort(ctx, session, true, "stream_abort")
-	markAttemptStoppedServerSide(ctx, h.PlanStoreV3, h.StreamDeny, session.ID)
+	// An earlier stop that won the row and never finished is finished as
+	// that stop by the playback handler, which has its writers.
+	if claim.owned && !claim.ownEnd(abortStopID(session.ID)) && h.FinishOtherEnd != nil {
+		h.FinishOtherEnd(ctx, claim, session.ID)
+		deleteSessionRecipeV3(ctx, h.SessionRecipeStore, session.ID)
+		return
+	}
+	// The playback handler's finish hook writes the play's history, as it
+	// does for every other end, unless another stop already owns it.
+	if finisher, ok := h.sessionMgr.(detachedFinisher); ok && claim.owned {
+		snapshot := *session
+		claim.applyAccepted(&snapshot)
+		finisher.FinishDetached(playback.WithEndReason(ctx, string(claim.reason(session.ID, PlaybackEndAborted))), snapshot)
+		claim.finish(ctx, session.ID, "")
+	}
 	deleteSessionRecipeV3(ctx, h.SessionRecipeStore, session.ID)
 }
 
@@ -3584,22 +3600,6 @@ func (h *StreamHandler) handleTransportStartFailure(ctx context.Context, session
 	// canceled request is never rewritten into a missing-file abort, and
 	// downgrade to debug; a timeout or provider error stays at WARN.
 	if isClientCancellation(ctx, err) {
-		// A transport cancel is evidence about this one request: the viewer
-		// navigated off, or hls.js gave up. Record it scoped to the session's
-		// current route revision and binding generation. It is a diagnostic and
-		// route-fence, never proof the session died, so it cannot fence a live
-		// client's recovery (only a genuine stop does that). The narrow start
-		// hook is deliberate: an HLS fragment cancel is not marked because a
-		// fragment abort is exactly the transient hls.js retry that must stay
-		// recoverable, marking every fragment request would put a liveness read
-		// on the hot segment path, and the route scoping already keeps a cancel
-		// from a predecessor's request off the successor. Best-effort: a
-		// missing session or a manager without the seam changes nothing.
-		if marker, ok := h.sessionMgr.(interface {
-			MarkClientCanceled(sessionID string) error
-		}); ok {
-			_ = marker.MarkClientCanceled(session.ID)
-		}
 		slog.DebugContext(ctx, "stream transport canceled by client",
 			"component", "api",
 			"session", session.ID,
@@ -3609,7 +3609,9 @@ func (h *StreamHandler) handleTransportStartFailure(ctx context.Context, session
 		)
 		return
 	}
-	if preflightErr := preflightPlaybackFile(ctx, file, h.MissingMarker, h.EventsHub); preflightErr != nil {
+	// A request that already ended cannot stat the file; keep the transport's
+	// own error for the log instead of the preflight's context error.
+	if preflightErr := preflightPlaybackFile(ctx, file, h.MissingMarker, h.EventsHub); preflightErr != nil && ctx.Err() == nil {
 		err = preflightErr
 	}
 	if isPlaybackFileMissing(err) || errors.Is(err, os.ErrNotExist) {
@@ -3816,6 +3818,7 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 		DurationSeconds: duration,
 		AllowWindow:     allowWindow,
 		WindowRequested: windowRequested,
+		Embedded:        playback.EmbeddedSubtitleRefFor(file, embeddedIndex),
 		FFmpegPath:      h.ffmpegPath(),
 	}
 	// Virtual sources are provider-neutral URIs, not FFmpeg inputs. Resolve
@@ -3851,8 +3854,6 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 		}
 		opts.TargetFormat = "vtt"
 	}
-
-	w.Header().Set("Access-Control-Allow-Origin", "*")
 
 	// Only complete successful extracts enter the cache; explicit windows
 	// remain streamed. Keep failures distinguishable from a clean subtitle EOF.
@@ -4049,6 +4050,18 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 				panic(http.ErrAbortHandler)
 			}
 			writeSubtitleSourceUnavailableRetry(w, extractionRetry.RetryAfter)
+			return
+		}
+		if errors.Is(extractErr, playback.ErrSubtitleReadsBusy) {
+			// The node admits no more whole-track reads. Answer before any byte
+			// with the standard busy status and Retry-After, like the download
+			// asset path, instead of blaming the extraction.
+			clearSubtitleCoverageHeaders(w.Header())
+			if response.Status() == 0 {
+				writeSubtitleReadsBusy(w)
+			} else {
+				panic(http.ErrAbortHandler)
+			}
 			return
 		}
 		playback.LogSubtitleStreamError(r.Context(), extractErr, file.ID, embeddedIndex)
@@ -4837,6 +4850,11 @@ func writeVirtualAudioSelectionInvalid(w http.ResponseWriter) {
 // produced from the live source. Clients already retry through the
 // sliding-window fetcher / replan flow, so the response is deliberately a
 // retryable 4xx, never a 500 or an ambiguous partial stream.
+func writeSubtitleReadsBusy(w http.ResponseWriter) {
+	w.Header().Set("Retry-After", strconv.Itoa(playback.SubtitleReadsRetryAfter))
+	writeError(w, http.StatusServiceUnavailable, "service_unavailable", "The server is busy; try again in a moment")
+}
+
 func writeSubtitleSourceChanged(w http.ResponseWriter) {
 	clearSubtitleCoverageHeaders(w.Header())
 	// A compliant client waits before replaying the same subtitle request; the

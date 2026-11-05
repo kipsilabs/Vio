@@ -562,7 +562,7 @@ func TestVirtualTranscodeCrossReleaseFallbackProbesReplacement(t *testing.T) {
 		}),
 		VirtualPlaybackSourceProber: func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
 			f.CodecVideo = "hevc"
-			f.VideoTracks = []models.VideoTrack{{Codec: "hevc", Profile: "main 10", Width: 3840, Height: 2160, BitDepth: 10, VideoRange: "HDR", VideoRangeType: "HDR10"}}
+			f.VideoTracks = []models.VideoTrack{{Codec: "hevc", Profile: "main 10", Width: 3840, Height: 2160, BitDepth: 10, VideoRange: "HDR", VideoRangeType: videoRangeHDR10}}
 			f.AudioTracks = []models.AudioTrack{{Codec: "eac3", Channels: 6, Language: "eng"}}
 			f.CodecAudio = "eac3"
 			return f, nil

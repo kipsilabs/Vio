@@ -124,6 +124,22 @@ function describeTerminalCopy(terminal: TerminalV3): { title: string; message: s
         message:
           "There's no capacity to convert this file right now. Please try again in a moment.",
       };
+    // The server has room here: this account has used its allowance. The
+    // server writes these for viewers, so every client shows the same advice.
+    case "stream_limit_reached":
+      return {
+        title: "Streaming limit reached",
+        message:
+          terminal.message?.trim() ||
+          "Stop anything else playing or paused on your account, then try again.",
+      };
+    case "transcode_limit_reached":
+      return {
+        title: "Video conversion limit reached",
+        message:
+          terminal.message?.trim() ||
+          "Stop anything else playing or paused on your account, then try again.",
+      };
     case "session_expired":
       return {
         title: "Playback session expired",

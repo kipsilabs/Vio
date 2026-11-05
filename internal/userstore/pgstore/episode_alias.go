@@ -37,6 +37,26 @@ type watchStateQuerier interface {
 // are already canonical. Aliases are only defined between episodes that share
 // one series, so the submitted id's own episodes row names the series that
 // owns any mapping it can match.
+// withWatchStateSeries runs fn in one transaction that holds the shared
+// episode-series lock for every target before fn resolves a canonical id.
+func (s *PostgresUserStore) withWatchStateSeries(ctx context.Context, mediaItemIDs []string, fn func(pgx.Tx) error) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin watch-state write: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := lockWatchStateSeries(ctx, tx, mediaItemIDs); err != nil {
+		return err
+	}
+	if err := fn(tx); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit watch-state write: %w", err)
+	}
+	return nil
+}
+
 func lockWatchStateSeries(ctx context.Context, tx pgx.Tx, mediaItemIDs []string) error {
 	mediaItemIDs = compactMediaItemIDs(mediaItemIDs)
 	if len(mediaItemIDs) == 0 {

@@ -1292,6 +1292,7 @@ var itemColumnNames = []string{
 	"matched_at", "last_refreshed", "refresh_failures",
 	"episode_metadata_incomplete", "episode_metadata_last_checked_at", "locked_fields", "status", "created_at", "updated_at",
 	advisoryAgeColumn, advisorySourceColumn,
+	"digital_release_date::text", "physical_release_date::text",
 }
 
 // nullableStringItemColumns are media_items columns that may hold NULL but
@@ -1430,6 +1431,8 @@ func scanItem(row pgx.Row) (*models.MediaItem, error) {
 		&item.UpdatedAt,
 		&item.AdvisoryAge,
 		&item.AdvisorySource,
+		&item.DigitalReleaseDate,
+		&item.PhysicalReleaseDate,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -1508,6 +1511,8 @@ func listItemScanDests(item *models.MediaItem) []any {
 		&item.UpdatedAt,
 		&item.AdvisoryAge,
 		&item.AdvisorySource,
+		&item.DigitalReleaseDate,
+		&item.PhysicalReleaseDate,
 	}
 }
 
@@ -1695,6 +1700,26 @@ func (r *ItemRepository) upsert(ctx context.Context, execer itemExecer, item *mo
 	return err
 }
 
+// itemArtworkAssignments keeps an item's artwork slots that an admin pick
+// locked after the writer read the item; see lockedArtworkAssignments.
+var itemArtworkAssignments = func() string {
+	locked := imagesLockedSQL("media_items.locked_fields")
+	slots := [][]string{
+		{"poster_path", "poster_source_path", "poster_thumbhash"},
+		{"backdrop_path", "backdrop_source_path", "backdrop_thumbhash"},
+		{"logo_path", "logo_source_path"},
+		{"banner_path", "banner_source_path", "banner_thumbhash"},
+		{"thumb_path", "thumb_source_path", "thumb_thumbhash"},
+		{"clearart_path", "clearart_source_path"},
+		{"disc_path", "disc_source_path"},
+	}
+	assignments := make([]string, len(slots))
+	for i, slot := range slots {
+		assignments[i] = lockedArtworkAssignments("media_items", locked, slot...)
+	}
+	return strings.Join(assignments, ",\n\t\t\t")
+}()
+
 // writeItem inserts item and, when update is set, overwrites every mutable
 // field of an existing row. It reports whether a row was written. An update
 // that leaves the item matched also clears match_ignored_at, since an
@@ -1722,7 +1747,8 @@ func (r *ItemRepository) writeItem(ctx context.Context, execer itemExecer, item 
 			content_rating_age,
 			advisory_age, advisory_source,
 			banner_path, banner_source_path, banner_thumbhash, thumb_path, thumb_source_path, thumb_thumbhash,
-			clearart_path, clearart_source_path, disc_path, disc_source_path
+			clearart_path, clearart_source_path, disc_path, disc_source_path,
+			digital_release_date, physical_release_date
 		) VALUES (
 			$1, $2, $3, $4, $5, $6, $7, $8,
 			$9, $10, $11, $12,
@@ -1737,7 +1763,8 @@ func (r *ItemRepository) writeItem(ctx context.Context, execer itemExecer, item 
 			$48,
 			$49, $50,
 			$51, $52, $53, $54, $55, $56,
-			$57, $58, $59, $60
+			$57, $58, $59, $60,
+			$61, $62
 		)`
 	conflict := `
 		ON CONFLICT (content_id) DO NOTHING`
@@ -1752,24 +1779,20 @@ func (r *ItemRepository) writeItem(ctx context.Context, execer itemExecer, item 
 			year = EXCLUDED.year,
 			genres = EXCLUDED.genres,
 			content_rating = EXCLUDED.content_rating,
-			runtime = EXCLUDED.runtime,
+			-- Audiobook runtime is maintained from active files. Preserve the
+			-- current value even when a metadata request read an older one.
+			runtime = CASE WHEN media_items.type = 'audiobook'
+				THEN media_items.runtime ELSE EXCLUDED.runtime END,
 			overview = EXCLUDED.overview,
 			tagline = EXCLUDED.tagline,
 			rating_imdb = EXCLUDED.rating_imdb,
 			rating_tmdb = EXCLUDED.rating_tmdb,
 			rating_rt_critic = EXCLUDED.rating_rt_critic,
 			rating_rt_audience = EXCLUDED.rating_rt_audience,
-			imdb_id = COALESCE(NULLIF(EXCLUDED.imdb_id, ''), media_items.imdb_id),
-			tmdb_id = COALESCE(NULLIF(EXCLUDED.tmdb_id, ''), media_items.tmdb_id),
-			tvdb_id = COALESCE(NULLIF(EXCLUDED.tvdb_id, ''), media_items.tvdb_id),
-			poster_path = EXCLUDED.poster_path,
-			poster_source_path = EXCLUDED.poster_source_path,
-			poster_thumbhash = EXCLUDED.poster_thumbhash,
-			backdrop_path = EXCLUDED.backdrop_path,
-			backdrop_source_path = EXCLUDED.backdrop_source_path,
-			backdrop_thumbhash = EXCLUDED.backdrop_thumbhash,
-			logo_path = EXCLUDED.logo_path,
-			logo_source_path = EXCLUDED.logo_source_path,
+			imdb_id = EXCLUDED.imdb_id,
+			tmdb_id = EXCLUDED.tmdb_id,
+			tvdb_id = EXCLUDED.tvdb_id,
+			` + itemArtworkAssignments + `,
 			metadata_s3_path = EXCLUDED.metadata_s3_path,
 			metadata_etag = EXCLUDED.metadata_etag,
 			season_count = EXCLUDED.season_count,
@@ -1779,6 +1802,8 @@ func (r *ItemRepository) writeItem(ctx context.Context, execer itemExecer, item 
 			keywords = EXCLUDED.keywords,
 			original_language = EXCLUDED.original_language,
 			release_date = EXCLUDED.release_date,
+			digital_release_date = EXCLUDED.digital_release_date,
+			physical_release_date = EXCLUDED.physical_release_date,
 			first_air_date = EXCLUDED.first_air_date,
 			last_air_date = EXCLUDED.last_air_date,
 			air_time = EXCLUDED.air_time,
@@ -1794,16 +1819,6 @@ func (r *ItemRepository) writeItem(ctx context.Context, execer itemExecer, item 
 			content_rating_age = EXCLUDED.content_rating_age,
 			advisory_age = EXCLUDED.advisory_age,
 			advisory_source = EXCLUDED.advisory_source,
-			banner_path = EXCLUDED.banner_path,
-			banner_source_path = EXCLUDED.banner_source_path,
-			banner_thumbhash = EXCLUDED.banner_thumbhash,
-			thumb_path = EXCLUDED.thumb_path,
-			thumb_source_path = EXCLUDED.thumb_source_path,
-			thumb_thumbhash = EXCLUDED.thumb_thumbhash,
-			clearart_path = EXCLUDED.clearart_path,
-			clearart_source_path = EXCLUDED.clearart_source_path,
-			disc_path = EXCLUDED.disc_path,
-			disc_source_path = EXCLUDED.disc_source_path,
 			updated_at = NOW()`
 	}
 
@@ -1873,6 +1888,8 @@ func (r *ItemRepository) writeItem(ctx context.Context, execer itemExecer, item 
 		item.ClearArtSourcePath,
 		item.DiscPath,
 		item.DiscSourcePath,
+		item.DigitalReleaseDate,
+		item.PhysicalReleaseDate,
 	)
 	if err != nil {
 		return false, fmt.Errorf("writing media item: %w", err)
@@ -2339,7 +2356,13 @@ func (r *ItemRepository) ensureVirtualCollectionItemMaterializedTx(ctx context.C
 	if err := lockReleaseContentTx(ctx, tx, item.ContentID, false); err != nil {
 		return nil, err
 	}
-	if err := validateReleaseSnapshotTx(ctx, tx, opts.releaseSnapshot); err != nil {
+	snapshot := opts.releaseSnapshot
+	if opts.accepting {
+		// Acceptance executes the decision made when the member was prepared;
+		// an override first recorded afterwards does not invalidate it.
+		snapshot = recordedReleaseOverrides(snapshot)
+	}
+	if err := validateReleaseSnapshotTx(ctx, tx, snapshot); err != nil {
 		return nil, err
 	}
 
@@ -2469,7 +2492,10 @@ func (r *ItemRepository) ensureVirtualCollectionItemMaterializedTx(ctx context.C
 	// identities must arrive prepared (override evaluation done). New items
 	// with no stored aliases are exempt.
 	if mediaType == "movie" {
-		movieIDs, err := releaseIdentitiesForContent(ctx, tx, "movie", item.ContentID, "movie", item.TmdbID, item.TvdbID, item.ImdbID, 0, 0)
+		// The rows locked above are authoritative: a prepared item can carry
+		// aliases enrichment has since removed, and those must not retain
+		// authority at acceptance.
+		movieIDs, err := releaseIdentitiesForContent(ctx, tx, "movie", item.ContentID, "movie", rowTmdbID, "", rowImdbID, 0, 0)
 		if err != nil {
 			return nil, err
 		}
@@ -2483,15 +2509,25 @@ func (r *ItemRepository) ensureVirtualCollectionItemMaterializedTx(ctx context.C
 			if len(opts.releaseSnapshot) > 0 && !releaseIdentitySetsEqual(snapshotIdentities(opts.releaseSnapshot), movieIDs) {
 				return nil, fmt.Errorf("%w: release alias set changed after preparation", ErrReleaseOverrideConflict)
 			}
-			fresh, err := captureReleaseOverridesTx(ctx, tx, movieIDs)
-			if err != nil {
-				return nil, err
-			}
-			if err := validateReleaseSnapshotTx(ctx, tx, fresh); err != nil {
-				return nil, err
-			}
-			if allowed, active := decideReleaseOverrides(time.Now().UTC(), fresh); active && !allowed {
-				return nil, fmt.Errorf("%w: verified release override blocks materialization", ErrProviderUnavailable)
+			if opts.accepting {
+				// Collection acceptance executes the decision made when its
+				// members were prepared. A concurrent override write may land
+				// after that snapshot, but it must not retroactively cancel
+				// the acceptance; a changed alias set still conflicts above.
+				if allowed, active := decideReleaseOverrides(time.Now().UTC(), opts.releaseSnapshot); active && !allowed {
+					return nil, fmt.Errorf("%w: verified release override blocks materialization", ErrProviderUnavailable)
+				}
+			} else {
+				fresh, err := captureReleaseOverridesTx(ctx, tx, movieIDs)
+				if err != nil {
+					return nil, err
+				}
+				if err := validateReleaseSnapshotTx(ctx, tx, fresh); err != nil {
+					return nil, err
+				}
+				if allowed, active := decideReleaseOverrides(time.Now().UTC(), fresh); active && !allowed {
+					return nil, fmt.Errorf("%w: verified release override blocks materialization", ErrProviderUnavailable)
+				}
 			}
 		}
 	}
@@ -3380,9 +3416,9 @@ func (r *ItemRepository) ReconcileReleasedCollectionVirtualEpisodes(ctx context.
 			              verified_episode_release_at(ep.series_id,ep.season_number,ep.episode_number,ep.air_date::timestamp AT TIME ZONE 'UTC') <= statement_timestamp()
 			          )
 			          ELSE (
-			              -- No override history: possession alone proves
-			              -- release. A bare air_date never authorizes
-			              -- materialization without verified evidence.
+			              -- No active override: local possession, then the
+			              -- provider/air-date evidence (the documented fallback
+			              -- order). A null date has no evidence and stays blocked.
 			              ep.metadata_source='local'
 			              OR EXISTS(
 			                  SELECT 1 FROM media_files proven
@@ -3390,6 +3426,7 @@ func (r *ItemRepository) ReconcileReleasedCollectionVirtualEpisodes(ctx context.
 			                    AND proven.container<>'virtual'
 			                    AND proven.file_path NOT LIKE 'virtual://%'
 			              )
+			              OR verified_episode_release_at(ep.series_id,ep.season_number,ep.episode_number,ep.air_date::timestamp AT TIME ZONE 'UTC') <= statement_timestamp()
 			          )
 			      END
 			  )
@@ -3458,12 +3495,11 @@ func (r *ItemRepository) ReconcileReleasedCollectionVirtualEpisodes(ctx context.
 			                  verified_episode_release_at(ep.series_id,ep.season_number,ep.episode_number,ep.air_date::timestamp AT TIME ZONE 'UTC') > statement_timestamp()
 			              )
 			              ELSE (
-			                  -- No override history: an existing virtual
-			                  -- file is stale only when the episode is
-			                  -- neither locally proven nor physically
-			                  -- possessed. Bare air_date transitions do
-			                  -- not drive staleness without verified
-			                  -- evidence.
+			                  -- No active override: an existing virtual file is
+			                  -- stale when the episode is neither locally proven
+			                  -- nor physically possessed and its provider date is
+			                  -- still in the future. An unknown date keeps the
+			                  -- file rather than withdrawing on absence.
 			                  COALESCE(ep.metadata_source,'')<>'local'
 			                  AND NOT EXISTS(
 			                      SELECT 1 FROM media_files proven
@@ -3471,6 +3507,7 @@ func (r *ItemRepository) ReconcileReleasedCollectionVirtualEpisodes(ctx context.
 			                        AND proven.container<>'virtual'
 			                        AND proven.file_path NOT LIKE 'virtual://%'
 			                  )
+			                  AND verified_episode_release_at(ep.series_id,ep.season_number,ep.episode_number,ep.air_date::timestamp AT TIME ZONE 'UTC') > statement_timestamp()
 			              )
 			          END
 			      )
@@ -3793,14 +3830,14 @@ func materializeVirtualPlaybackEpisodesDetailedTx(ctx context.Context, tx pgx.Tx
 		return 0, 0, 0, nil
 	}
 
-	// The expected set covers ALL evaluated candidates (the truncated
-	// batch), not just the released subset. Candidates beyond the release
-	// gate still own virtual files/claims from prior passes; excluding
-	// them here would let cleanup delete files for episodes 501+ that
-	// simply were not released in this pass.
-	expectedPaths := make([]string, 0, len(bases)*len(candidates))
-	expectedOwners := make([]int64, 0, len(bases)*len(candidates))
-	expectedFolders := make([]int, 0, len(bases)*len(candidates))
+	// The expected set is the released subset: an episode whose release gate
+	// closed (a future override) must lose the virtual file and claims a prior
+	// pass created, or a delayed release keeps advertising a placeholder the
+	// provider cannot serve yet. The batch bound only limits how many episodes
+	// this pass evaluates, not which of them may exist.
+	expectedPaths := make([]string, 0, len(bases)*len(episodes))
+	expectedOwners := make([]int64, 0, len(bases)*len(episodes))
+	expectedFolders := make([]int, 0, len(bases)*len(episodes))
 
 	type episodeFileKey struct {
 		path     string
@@ -3812,7 +3849,7 @@ func materializeVirtualPlaybackEpisodesDetailedTx(ctx context.Context, tx pgx.Tx
 	for _, base := range bases {
 		parsed, _ := url.Parse(base.filePath)
 		identifier := strings.TrimPrefix(parsed.EscapedPath(), "/")
-		for _, candidate := range candidates {
+		for _, candidate := range episodes {
 			episodeURI := &url.URL{
 				Scheme:   "virtual",
 				Host:     "series",
@@ -4076,6 +4113,12 @@ func (r *ItemRepository) GetByID(ctx context.Context, contentID string) (*models
 	return scanItem(r.pool.QueryRow(ctx, query, contentID))
 }
 
+// GetByIDTx retrieves a media item using the supplied transaction.
+func (r *ItemRepository) GetByIDTx(ctx context.Context, tx pgx.Tx, contentID string) (*models.MediaItem, error) {
+	query := `SELECT ` + itemColumns + ` FROM media_items WHERE content_id = $1`
+	return scanItem(tx.QueryRow(ctx, query, contentID))
+}
+
 // GetByIDs retrieves multiple media items by their content IDs.
 // Items not found are silently omitted from the result.
 func (r *ItemRepository) GetByIDs(ctx context.Context, contentIDs []string) ([]*models.MediaItem, error) {
@@ -4124,13 +4167,24 @@ func (r *ItemRepository) GetStatusByIDs(ctx context.Context, ids []string) (map[
 // (libraryAccessConditions), the same semantics EnsureAccessible and
 // EnsureAccessibleIDs enforce.
 func (r *ItemRepository) GetByIDsWithAccess(ctx context.Context, contentIDs []string, access AccessFilter) ([]*models.MediaItem, error) {
+	return r.getByIDsWithAccess(ctx, contentIDs, access, itemAccessConditions)
+}
+
+// GetListedByIDsWithAccess is GetByIDsWithAccess for a listing built from
+// stored IDs, such as a collection's member page: it also leaves out items in
+// no library, as listedItemAccessConditions does.
+func (r *ItemRepository) GetListedByIDsWithAccess(ctx context.Context, contentIDs []string, access AccessFilter) ([]*models.MediaItem, error) {
+	return r.getByIDsWithAccess(ctx, contentIDs, access, listedItemAccessConditions)
+}
+
+func (r *ItemRepository) getByIDsWithAccess(ctx context.Context, contentIDs []string, access AccessFilter, conditions itemConditions) ([]*models.MediaItem, error) {
 	if len(contentIDs) == 0 {
 		return []*models.MediaItem{}, nil
 	}
 	if access.AllowedLibraryIDs != nil && len(access.AllowedLibraryIDs) == 0 {
 		return []*models.MediaItem{}, nil
 	}
-	sql, args := r.buildGetByIDsWithAccessSQL(contentIDs, access)
+	sql, args := r.buildGetByIDsWithAccessSQL(contentIDs, access, conditions)
 	rows, err := r.pool.Query(ctx, sql, args...)
 	if err != nil {
 		return nil, fmt.Errorf("fetching media items by IDs with access: %w", err)
@@ -4139,14 +4193,17 @@ func (r *ItemRepository) GetByIDsWithAccess(ctx context.Context, contentIDs []st
 	return scanItems(rows)
 }
 
-func (r *ItemRepository) buildGetByIDsWithAccessSQL(contentIDs []string, access AccessFilter) (string, []any) {
+// itemConditions renders access predicates over media_items mi.
+type itemConditions func(access AccessFilter, args *[]any, argIdx *int) []string
+
+func (r *ItemRepository) buildGetByIDsWithAccessSQL(contentIDs []string, access AccessFilter, conditions itemConditions) (string, []any) {
 	sql := `SELECT ` + itemColumns + `
             FROM media_items mi
             WHERE mi.content_id = ANY($1)`
 	args := []any{contentIDs}
 	argIdx := 2
 
-	for _, c := range itemAccessConditions(access, &args, &argIdx) {
+	for _, c := range conditions(access, &args, &argIdx) {
 		sql += "\n            AND " + c
 	}
 
@@ -4161,6 +4218,18 @@ func itemAccessConditions(access AccessFilter, args *[]any, argIdx *int) []strin
 	var conditions []string
 	appendLibraryAccessConditions("mi.content_id", access, &conditions, args, argIdx)
 	applyAccessFilter("mi", AccessFilter{MaturityLimits: access.MaturityLimits, ExcludedMediaTypes: access.ExcludedMediaTypes}, &conditions, args, argIdx)
+	return conditions
+}
+
+// listedItemAccessConditions is itemAccessConditions for listings and their
+// counts: with no library restriction it still requires the item to be in a
+// library, so an item held only by the scanner's file removal grace is left
+// out (see InSomeLibraryWhere).
+func listedItemAccessConditions(access AccessFilter, args *[]any, argIdx *int) []string {
+	conditions := itemAccessConditions(access, args, argIdx)
+	if access.AllowedLibraryIDs == nil && len(access.DisabledLibraryIDs) == 0 {
+		conditions = append(conditions, InSomeLibraryWhere("mi.content_id"))
+	}
 	return conditions
 }
 
@@ -4200,7 +4269,7 @@ func buildCountVisiblePersonalCollectionMembersSQL(userID int, collectionIDs []s
             WHERE upci.user_id = $1 AND upci.collection_id = ANY($2) AND upci.sub_item_id = ''`
 	args := []any{userID, collectionIDs}
 	argIdx := 3
-	for _, c := range itemAccessConditions(access, &args, &argIdx) {
+	for _, c := range listedItemAccessConditions(access, &args, &argIdx) {
 		sql += "\n            AND " + c
 	}
 	// The catalog view never lists manga chapters as items.
@@ -5550,10 +5619,10 @@ func appendSearchScopeFilters(itemTypes []string, filter AccessFilter, condition
 	// passing and a disabled library must not slip through. The old JOIN +
 	// NOT(mil.media_folder_id = ANY(...)) form let the passing membership row
 	// satisfy the deny check (audit 2026-05-01 §3.3), so both the FTS search and
-	// the fuzzy fallback that share this helper used it. appendLibraryAccessConditions
-	// emits independent EXISTS/NOT EXISTS subqueries keyed on mi.content_id and
-	// needs no JOIN.
-	appendLibraryAccessConditions("mi.content_id", filter, conditions, args, argIdx)
+	// the fuzzy fallback that share this helper used it. The helper emits
+	// independent EXISTS/NOT EXISTS subqueries keyed on mi.content_id and needs
+	// no JOIN, and as a listing it leaves out an item in no library.
+	appendListedLibraryAccessConditions("mi.content_id", filter, conditions, args, argIdx)
 
 	applyAccessFilter("mi", AccessFilter{MaturityLimits: filter.MaturityLimits, ExcludedMediaTypes: filter.ExcludedMediaTypes}, conditions, args, argIdx)
 
@@ -6148,6 +6217,13 @@ func (r *ItemRepository) UpdateMetadataTx(ctx context.Context, tx pgx.Tx, conten
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrItemNotFound
+	}
+	if upd.Runtime != nil || upd.LockedFields != nil {
+		// Removing the runtime lock restores the file-derived value even
+		// when an unchanged audiobook will be skipped by the next scan.
+		if _, err := tx.Exec(ctx, `SELECT refresh_audiobook_runtime(ARRAY[$1]::text[])`, contentID); err != nil {
+			return fmt.Errorf("refreshing audiobook runtime: %w", err)
+		}
 	}
 	// The UPDATE above locked the item row before its rating sources, the
 	// order every rating source writer follows (see lockRatingSourceItem).

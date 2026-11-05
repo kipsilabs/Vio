@@ -11,6 +11,7 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/config"
+	"github.com/Silo-Server/silo-server/internal/fspath"
 	"github.com/Silo-Server/silo-server/internal/lang"
 	"github.com/Silo-Server/silo-server/internal/models"
 )
@@ -189,6 +190,7 @@ func (m *mapper) itemFromList(item upstreamListItem, isFavorite bool, progress *
 		dto.Studios = m.namePairs(item.Studios, EncodedIDStudio)
 	}
 	if allFields || fields["taglines"] {
+		dto.Taglines = []string{}
 		if item.Tagline != "" {
 			dto.Taglines = []string{item.Tagline}
 		}
@@ -301,6 +303,10 @@ func (m *mapper) itemFromDetailWithFieldsSelected(item upstreamItemDetail, selec
 		"versions", len(versions),
 		"media_sources", len(dto.MediaSources),
 	)
+	// The detail mapping fills every list field from allDetailFields; a
+	// request that named Fields keeps only the empty lists it asked for, as
+	// Jellyfin does on the detail path too.
+	dropUnrequestedEmptyLists(&dto, wantField)
 	return dto
 }
 
@@ -385,8 +391,15 @@ func (m *mapper) applyDetailVersions(dto *baseItemDTO, contentID string, version
 	if len(versions) == 0 {
 		// Provider-metadata-only (unaired/missing) item: version data is
 		// authoritative here, so override the FileSystem default set by
-		// itemFromList with Jellyfin's Virtual contract.
+		// itemFromList with Jellyfin's Virtual contract. A requested list
+		// still answers [] rather than an absent field.
 		applyPlayableLocation(dto, false)
+		if wantField("mediasources") {
+			dto.MediaSources = []mediaSourceDTO{}
+		}
+		if wantField("mediastreams") {
+			dto.MediaStreams = []mediaStreamDTO{}
+		}
 		return
 	}
 	firstVersion := versions[0]
@@ -454,6 +467,57 @@ func (m *mapper) versionMediaParts(contentID string, versions []catalog.FileVers
 		}
 	}
 	return sources, streams
+}
+
+// dropUnrequestedEmptyLists leaves an empty list field out of a list
+// response unless Fields asked for it. The detail mapping fills every list
+// field, and an empty one would otherwise be sent as [], which Jellyfin sends
+// only for requested fields. Non-empty values are left as they were.
+func dropUnrequestedEmptyLists(dto *baseItemDTO, wantField func(string) bool) {
+	if !wantField("genres") {
+		dto.Genres = nilIfEmpty(dto.Genres)
+		dto.GenreItems = nilIfEmpty(dto.GenreItems)
+	}
+	if !wantField("studios") {
+		dto.Studios = nilIfEmpty(dto.Studios)
+	}
+	if !wantField("tags") {
+		dto.Tags = nilIfEmpty(dto.Tags)
+	}
+	if !wantField("taglines") {
+		dto.Taglines = nilIfEmpty(dto.Taglines)
+	}
+	if !wantField("productionlocations") {
+		dto.ProductionLocations = nilIfEmpty(dto.ProductionLocations)
+	}
+	if !wantField("externalurls") {
+		dto.ExternalURLs = nilIfEmpty(dto.ExternalURLs)
+	}
+	if !wantField("remotetrailers") {
+		dto.RemoteTrailers = nilIfEmpty(dto.RemoteTrailers)
+	}
+	if !wantField("settings") {
+		dto.LockedFields = nilIfEmpty(dto.LockedFields)
+	}
+	if !wantField("people") {
+		dto.People = nilIfEmpty(dto.People)
+	}
+	if !wantField("chapters") {
+		dto.Chapters = nilIfEmpty(dto.Chapters)
+	}
+	if !wantField("mediasources") {
+		dto.MediaSources = nilIfEmpty(dto.MediaSources)
+	}
+	if !wantField("mediastreams") {
+		dto.MediaStreams = nilIfEmpty(dto.MediaStreams)
+	}
+}
+
+func nilIfEmpty[T any](values []T) []T {
+	if len(values) == 0 {
+		return nil
+	}
+	return values
 }
 
 func (m *mapper) seasonFromUpstream(season upstreamSeason, seriesID string, isFavorite bool) baseItemDTO {
@@ -969,7 +1033,7 @@ func detailMediaSourceDTO(sourceID string, version catalog.FileVersion, streams 
 		Formats:                             []string{strings.ToLower(version.Container)},
 		RequiredHTTPHeaders:                 map[string]string{},
 		MediaAttachments:                    []map[string]any{},
-		TranscodingSubProtocol:              "hls",
+		TranscodingSubProtocol:              compatStreamProtocolHTTP,
 		Bitrate:                             version.Bitrate * 1000,
 		DefaultAudioStreamIndex:             defaultAudioStreamIndex(version),
 		DefaultSubtitleStreamIndex:          defaultSubtitleStreamIndex(version),
@@ -980,7 +1044,7 @@ func detailMediaSourceDTO(sourceID string, version catalog.FileVersion, streams 
 func mediaSourceName(version catalog.FileVersion) string {
 	name := strings.TrimSpace(version.FileName)
 	if name == "" {
-		name = filepath.Base(version.FilePath)
+		name = fspath.Display(filepath.Base(version.FilePath))
 	}
 	if name == "" {
 		return ""

@@ -9,17 +9,23 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
-	"os"
-	"os/exec"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Silo-Server/silo-server/internal/fspath"
 )
 
 // StreamExtractOpts configures a single streaming subtitle extract.
 type StreamExtractOpts struct {
 	// InputPath is the path to the source media file.
-	InputPath string
+	InputPath    string
+	Packets      *SubtitlePacketInput
+	Embedded     *EmbeddedSubtitleRef
+	KeepPath     string
+	KeepFormat   string
+	KeepOffset   time.Duration
+	KeepMaxBytes int64
 	// CacheIdentity is a credential-free, stable identity for a transient
 	// remote input. When set, subtitle caching uses a bounded generation
 	// instead of requiring os.Stat on InputPath.
@@ -136,6 +142,15 @@ type StreamExtractOpts struct {
 	Writer io.Writer
 }
 
+const MaxDemuxCopyBytes int64 = 128 << 20
+
+func (opts StreamExtractOpts) demuxCopyLimit() int64 {
+	if opts.KeepMaxBytes > 0 && opts.KeepMaxBytes < MaxDemuxCopyBytes {
+		return opts.KeepMaxBytes
+	}
+	return MaxDemuxCopyBytes
+}
+
 // StreamExtractSubtitle runs ffmpeg to extract a single subtitle track,
 // seeked to SeekSeconds, and pipes its stdout to opts.Writer. The process
 // exits when ffmpeg finishes; the function returns nil on clean exit or
@@ -160,7 +175,7 @@ func StreamExtractSubtitle(ctx context.Context, opts StreamExtractOpts) error {
 
 	extractCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	cmd := exec.CommandContext(extractCtx, bin, streamExtractArgs(opts)...)
+	cmd := fspath.CommandContext(extractCtx, bin, streamExtractArgs(opts)...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("stdout pipe: %w", err)
@@ -169,7 +184,8 @@ func StreamExtractSubtitle(ctx context.Context, opts StreamExtractOpts) error {
 	cmd.Stderr = stderrBuf
 
 	start := time.Now()
-	if err := cmd.Start(); err != nil {
+	wait, err := startSubtitleCommand(extractCtx, cmd, opts.Packets)
+	if err != nil {
 		return fmt.Errorf("start ffmpeg: %w", err)
 	}
 
@@ -185,13 +201,15 @@ func StreamExtractSubtitle(ctx context.Context, opts StreamExtractOpts) error {
 		cancel()
 	}
 
-	waitErr := cmd.Wait()
+	waitErr, feedErr := wait()
 	var extractErr error
 	switch {
 	case waitErr != nil:
 		extractErr = waitErr
 	case copyErr != nil:
 		extractErr = copyErr
+	case feedErr != nil:
+		extractErr = fmt.Errorf("feed subtitle packets: %w", feedErr)
 	}
 	outcome := subtitleTraceOutcome(ctx, extractErr)
 	level := slog.LevelInfo
@@ -250,7 +268,7 @@ func windowFromCachedSup(opts StreamExtractOpts, firstCue float64) StreamExtract
 // readSupFirstCue returns the time, in seconds, of the first segment in a
 // .sup file.
 func readSupFirstCue(path string) (float64, error) {
-	f, err := os.Open(path) //nolint:gosec // Path is a catalog subtitle file selected by the playback planner.
+	f, err := fspath.Open(path)
 	if err != nil {
 		return 0, err
 	}
@@ -372,10 +390,16 @@ func streamExtractArgs(opts StreamExtractOpts) []string {
 		args = append(args, "-to", strconv.FormatFloat(end, 'f', 3, 64))
 	}
 
-	return append(args,
-		"-f", outFormat,
-		"pipe:1",
-	)
+	args = append(args, "-f", outFormat, "pipe:1")
+	if opts.KeepPath != "" && !seekApplied {
+		args = append(args, "-map", fmt.Sprintf("0:s:%d", trackIndex), "-c:s", "copy", "-output_ts_offset", strconv.FormatFloat(opts.KeepOffset.Seconds(), 'f', 6, 64), "-flush_packets", "1", "-fs", strconv.FormatInt(opts.demuxCopyLimit(), 10))
+		if opts.KeepFormat == "mp4" { //nolint:goconst // Container token shared with capability fixtures; names stay inline
+			args = append(args, "-movflags", "+faststart")
+		}
+		args = append(args, "-f", opts.KeepFormat, "file:"+opts.KeepPath)
+		args = append([]string{"-hide_banner", "-nostats", "-loglevel", "error", "-y"}, append(args[4:5], args[5:]...)...)
+	}
+	return args
 }
 
 // windowable reports whether the extract's codec/muxer can be sliced by a

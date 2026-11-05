@@ -21,6 +21,7 @@ import (
 	"golang.org/x/sync/singleflight"
 
 	"github.com/Silo-Server/silo-server/internal/nodemetrics"
+	"github.com/Silo-Server/silo-server/internal/procgroup"
 	"github.com/Silo-Server/silo-server/internal/tonemap"
 )
 
@@ -46,6 +47,7 @@ var (
 	defaultDRIDir              = "/dev/dri"
 	defaultNVIDIAControlDevice = "/dev/nvidiactl"
 	defaultNVIDIADeviceGlob    = "/dev/nvidia[0-9]*"
+	defaultDXGDevice           = "/dev/dxg"
 	sysClassDRMDir             = "/sys/class/drm"
 	procBootIDPath             = "/proc/sys/kernel/random/boot_id"
 	currentGOOS                = runtime.GOOS
@@ -1340,10 +1342,6 @@ func SoftwareFallbackAllowed(value string) bool {
 // shortcut because its mode and filter would no longer describe the executor;
 // the owner must replan it as a complete software recipe instead. Every other
 // accel keeps its configured value and moves render devices via AvoidHWDevice.
-//
-// A caller under playback.software_fallback=gpu_only must not take the retry
-// when it returns HWAccelNone: that path is a CPU decode+encode fallback. The
-// callers gate on SoftwareFallbackAllowed for exactly this case.
 func StartupRetryHWAccel(opts TranscodeOpts) string {
 	if opts.ToneMapMode != tonemap.ModeHardware &&
 		ResolveHWAccelWithFFmpeg(opts.HWAccel, opts.FFmpegPath, opts.HWDevice) == transcodeHWVideoToolbox {
@@ -1539,7 +1537,7 @@ func runFFmpegProbe(ctx context.Context, timeout time.Duration, ffmpegPath strin
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	return exec.CommandContext(ctx, ffmpegPath, args...).CombinedOutput()
+	return procgroup.CommandContext(ctx, ffmpegPath, args...).CombinedOutput()
 }
 
 func ffmpegOutputHasToken(output []byte, token string) bool {
@@ -1608,8 +1606,8 @@ func isNVIDIADevice(renderDevPath string) bool {
 }
 
 func hasNVIDIADevice() bool {
-	if file, err := os.Open(defaultNVIDIAControlDevice); err == nil {
-		_ = file.Close()
+	// WSL exposes GPUs through dxg; the FFmpeg probe still verifies NVENC.
+	if deviceOpenable(defaultNVIDIAControlDevice) || deviceOpenable(defaultDXGDevice) {
 		return true
 	}
 	matches, err := filepath.Glob(defaultNVIDIADeviceGlob)
@@ -1617,8 +1615,7 @@ func hasNVIDIADevice() bool {
 		return false
 	}
 	for _, dev := range matches {
-		if file, err := os.Open(dev); err == nil {
-			_ = file.Close()
+		if deviceOpenable(dev) {
 			return true
 		}
 	}

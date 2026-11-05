@@ -64,6 +64,23 @@ type Config struct {
 	IPBurst        int
 	// Auth endpoint per-IP limits
 	AuthEndpoints map[string]AuthEndpointConfig
+	// Session is the hourly quota each sign-in session gets.
+	Session SessionQuotaConfig
+}
+
+// Session quota modes. Off counts nothing; log counts and logs sessions over
+// the quota but serves them; enforce refuses them with 429.
+const (
+	SessionQuotaOff     = "off"
+	SessionQuotaLog     = "log"
+	SessionQuotaEnforce = "enforce"
+)
+
+// SessionQuotaConfig is a token bucket per sign-in session.
+type SessionQuotaConfig struct {
+	Mode            string
+	RequestsPerHour float64
+	Burst           int
 }
 
 // DefaultConfig returns the default rate limit configuration.
@@ -78,6 +95,7 @@ func DefaultConfig() Config {
 		IPReqPerSecond: 120,
 		IPReqPerMinute: 6000,
 		IPBurst:        120,
+		Session:        SessionQuotaConfig{Mode: SessionQuotaLog, RequestsPerHour: 10000, Burst: 30000},
 		AuthEndpoints: map[string]AuthEndpointConfig{
 			"login":           {RequestsPerMinute: 20, Burst: 10},
 			"signup":          {RequestsPerMinute: 10, Burst: 6},

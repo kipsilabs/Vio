@@ -153,7 +153,7 @@ func TestStampStartVirtualCandidateFailedBareAbsentStillStamps(t *testing.T) {
 // otherwise win the highest-priority tie. Without the capacity scan the replan
 // surfaced a masking reason and could not map to the honest 503.
 func TestClassifyVirtualReplanExhaustionPrefersRouteCapacity(t *testing.T) {
-	errs := []*candidateErrorV3{
+	errs := []*candidateV3Error{
 		{Stage: candidateStageTransport, TransportErr: &transportErrorV3{reason: transcodeStartFailedReasonV3, retryable: true}},
 		{Stage: candidateStageTransport, TransportErr: &transportErrorV3{reason: string(noderouting.OutcomeCapacityUnavailable), message: "no route", retryable: true}},
 	}

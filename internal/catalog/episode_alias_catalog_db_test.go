@@ -59,6 +59,9 @@ func TestEpisodeAliasExcludedFromCanonicalCatalogDB(t *testing.T) { //nolint:fun
 		args []any
 	}{
 		{`INSERT INTO media_items (content_id, type, title) VALUES ($1, 'series', 'Alias Fixture')`, []any{seriesID}},
+		// Listings require the item to be in a library; the fixture's folder is
+		// that membership.
+		{`INSERT INTO media_item_libraries (content_id, media_folder_id) VALUES ($1, $2)`, []any{seriesID, folderID}},
 		{`INSERT INTO seasons (content_id, series_id, season_number) VALUES ($1, $2, 1), ($3, $2, 2)`, []any{seasonOneID, seriesID, seasonTwoID}},
 		// Both rows share the air date. The canonical row is a named-season
 		// episode; the alias row is the absolute-layout duplicate.

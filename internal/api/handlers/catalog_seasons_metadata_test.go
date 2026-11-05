@@ -443,7 +443,7 @@ func TestSeriesSeasonsKeepsMetadataOnlySeasons(t *testing.T) {
 	// season reads expose, not only the season-row-linked subset.
 	items.watchState = watchstate.NewService(provider)
 	authFilter := catalog.AccessFilter{UserID: userID, ProfileID: profileID}
-	if _, err := items.SetWatchedState(authCtx, userID, profileID, seasonID(2), true, authFilter); err != nil {
+	if _, err := items.SetWatchedState(authCtx, userID, profileID, seasonID(2), true, false, authFilter); err != nil {
 		t.Fatalf("mark partly linked season watched: %v", err)
 	}
 	marked, err := h.ItemDetail(authCtx, authViewer, seasonID(2))
@@ -453,7 +453,7 @@ func TestSeriesSeasonsKeepsMetadataOnlySeasons(t *testing.T) {
 	if marked.SeasonUserData == nil || marked.SeasonUserData.WatchedCount != 4 || !marked.SeasonUserData.Played {
 		t.Fatalf("partly linked season watched state = %+v, want all 4 episodes watched", marked.SeasonUserData)
 	}
-	unwatchView, err := items.SetWatchedState(authCtx, userID, profileID, seasonID(2), false, authFilter)
+	unwatchView, err := items.SetWatchedState(authCtx, userID, profileID, seasonID(2), false, false, authFilter)
 	if err != nil {
 		t.Fatalf("mark partly linked season unwatched: %v", err)
 	}
@@ -478,7 +478,7 @@ func TestSeriesSeasonsKeepsMetadataOnlySeasons(t *testing.T) {
 		{"synthetic metadata-only season", syntheticPrefix + "-S02", 2},
 	} {
 		t.Run(tc.name+" mutation", func(t *testing.T) {
-			if _, err := items.SetWatchedState(authCtx, userID, profileID, tc.id, true, authFilter); err != nil {
+			if _, err := items.SetWatchedState(authCtx, userID, profileID, tc.id, true, false, authFilter); err != nil {
 				t.Fatalf("mark synthetic season watched: %v", err)
 			}
 			marked, err := h.ItemDetail(authCtx, authViewer, tc.id)
@@ -488,7 +488,7 @@ func TestSeriesSeasonsKeepsMetadataOnlySeasons(t *testing.T) {
 			if marked.SeasonUserData == nil || marked.SeasonUserData.WatchedCount != tc.want || !marked.SeasonUserData.Played {
 				t.Fatalf("synthetic season watched state = %+v, want %d episodes watched", marked.SeasonUserData, tc.want)
 			}
-			if _, err := items.SetWatchedState(authCtx, userID, profileID, tc.id, false, authFilter); err != nil {
+			if _, err := items.SetWatchedState(authCtx, userID, profileID, tc.id, false, false, authFilter); err != nil {
 				t.Fatalf("mark synthetic season unwatched: %v", err)
 			}
 			unmarked, err := h.ItemDetail(authCtx, authViewer, tc.id)

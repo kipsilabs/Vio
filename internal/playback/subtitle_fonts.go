@@ -9,13 +9,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
 	"unicode"
+
+	"github.com/Silo-Server/silo-server/internal/procgroup"
 )
 
 const (
@@ -375,7 +376,7 @@ func dumpFontAttachments(ctx context.Context, inputPath string, ffmpegPath strin
 
 	}
 	args = append(args, "-i", inputPath, "-map", "0:t?", "-c", "copy", "-f", "null", "-")
-	cmd := exec.CommandContext(ctx, ffmpegPath, args...)
+	cmd := procgroup.CommandContext(ctx, ffmpegPath, args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, err
@@ -385,7 +386,7 @@ func dumpFontAttachments(ctx context.Context, inputPath string, ffmpegPath strin
 	}
 	data, readErr := io.ReadAll(io.LimitReader(stdout, expected+1))
 	if readErr != nil || int64(len(data)) > expected {
-		_ = cmd.Process.Kill()
+		_ = procgroup.Kill(cmd)
 		_ = cmd.Wait()
 		return nil, errors.New("subtitle fonts: attachment data exceeds probed size or could not be read")
 	}
@@ -564,7 +565,7 @@ func probeASSScript(ctx context.Context, ffprobePath, inputPath string, track as
 // The child's stderr is discarded; a probe that fails, times out, or exceeds the
 // encoded bound is reported as unusable so callers fall back instead of guessing.
 func captureFFprobe(ctx context.Context, ffprobePath string, args ...string) ([]byte, bool) {
-	cmd := exec.CommandContext(ctx, ffprobePath, args...) //nolint:gosec // ffprobePath is operator configuration, never request input.
+	cmd := procgroup.CommandContext(ctx, ffprobePath, args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, false
@@ -764,7 +765,7 @@ func dumpFontAttachmentsSubset(ctx context.Context, inputPath string, ffmpegPath
 		args = append(args, fmt.Sprintf("-dump_attachment:%d", stream.Index), "pipe:1")
 	}
 	args = append(args, "-i", inputPath, "-map", "0:t?", "-c", "copy", "-f", "null", "-")
-	cmd := exec.CommandContext(ctx, ffmpegPath, args...)
+	cmd := procgroup.CommandContext(ctx, ffmpegPath, args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, err
@@ -1070,7 +1071,7 @@ func probeFontAttachmentStreams(ctx context.Context, inputPath string, ffprobePa
 	if strings.TrimSpace(bin) == "" {
 		bin = ffprobeBinary
 	}
-	cmd := exec.CommandContext(ctx, bin,
+	cmd := procgroup.CommandContext(ctx, bin,
 		"-v", "error",
 		"-select_streams", "t",
 		"-show_entries", "stream=index,codec_name,codec_type,extradata_size:stream_tags=filename,mimetype",
@@ -1087,7 +1088,7 @@ func probeFontAttachmentStreams(ctx context.Context, inputPath string, ffprobePa
 	const maxProbeBytes = 1 << 20
 	out, readErr := io.ReadAll(io.LimitReader(stdout, maxProbeBytes+1))
 	if readErr != nil || len(out) > maxProbeBytes {
-		_ = cmd.Process.Kill()
+		_ = procgroup.Kill(cmd)
 		_ = cmd.Wait()
 		return nil, errors.New("subtitle fonts: attachment metadata exceeds probe limit or could not be read")
 	}

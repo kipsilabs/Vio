@@ -36,6 +36,8 @@ type fencedStore struct {
 	fenced atomic.Bool
 }
 
+func (s *fencedStore) unwrapStore() Store { return s.Store }
+
 func (s *fencedStore) Put(ctx context.Context, key string, data []byte) error {
 	if err := s.mutations.Acquire(ctx, 1); err != nil {
 		return err
