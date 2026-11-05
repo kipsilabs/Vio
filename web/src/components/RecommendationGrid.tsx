@@ -116,7 +116,9 @@ export function MoreLikeThisRow<T>({
   const { cardPresentation } = useUICustomization();
   const itemLimit = Math.max(0, Math.min(maxItems, MAX_MORE_LIKE_THIS_ITEMS));
   const posterWidthClasses = carouselCardWidthClasses(cardPresentation.poster_size);
-  const showCaption = cardPresentation.caption !== "artwork";
+  // Card captions are always on: the caption preference was retired, and every
+  // card shows its title and details.
+  const showCaption = true;
 
   return (
     <MediaCarousel title="More Like This" edgePadding={false}>

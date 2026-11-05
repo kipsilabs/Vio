@@ -213,7 +213,6 @@ export default function ItemDetail() {
       return (
         <MovieContent
           item={item as ItemDetail & { type: "movie" }}
-          libraryId={libraryId}
           showAdvisoryAge={showAdvisoryAge}
         />
       );

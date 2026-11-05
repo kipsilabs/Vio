@@ -1055,7 +1055,7 @@ export class WebGPURenderer implements FrameRenderer, DeviceHolder {
       );
     } finally {
       void device.popErrorScope().then(
-        (error: unknown) => {
+        (error) => {
           if (!error) return;
           entry.error ??= error.message;
           if (entry === this.entry) this.deviceError(error.message);
