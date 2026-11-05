@@ -91,24 +91,27 @@ type TVDBIDResolver interface {
 }
 
 type Service struct {
-	store                Store
-	tmdb                 TMDBClient
-	animeIndex           AnimeIndex
-	presence             PresenceResolver
-	router               RequestRouterProvider
-	entitlements         EntitlementResolver
-	groupProvider        access.GroupPolicyProvider
-	users                access.UserRepository
-	requesterIdentity    RequesterIdentityResolver
-	tvdbResolver         TVDBIDResolver
-	seriesSeasonProvider SeriesSeasonProvider
-	notifier             FulfillmentNotifier
-	lifecycle            LifecycleNotifier
-	watchlistPref        WatchlistPreference
-	titleObserver        TitleObserver
-	discoverSnapshots    DiscoverSnapshots
-	discoverRefresher    DiscoverListRefresher
-	Now                  func() time.Time
+	store                   Store
+	tmdb                    TMDBClient
+	animeIndex              AnimeIndex
+	presence                PresenceResolver
+	router                  RequestRouterProvider
+	entitlements            EntitlementResolver
+	groupProvider           access.GroupPolicyProvider
+	users                   access.UserRepository
+	requesterIdentity       RequesterIdentityResolver
+	tvdbResolver            TVDBIDResolver
+	seriesSeasonProvider    SeriesSeasonProvider
+	hasDefaultVirtualRouter func() bool
+	// enrichAsync schedules deferred enrichment; tests replace it to control execution.
+	enrichAsync       func(func())
+	notifier          FulfillmentNotifier
+	lifecycle         LifecycleNotifier
+	watchlistPref     WatchlistPreference
+	titleObserver     TitleObserver
+	discoverSnapshots DiscoverSnapshots
+	discoverRefresher DiscoverListRefresher
+	Now               func() time.Time
 }
 
 type DiscoverySection struct {
@@ -136,11 +139,36 @@ func NewService(store Store, tmdbClient TMDBClient, presence PresenceResolver) *
 	}
 }
 
+func (s *Service) hasActiveDefaultVirtualRouter() bool {
+	return s.hasDefaultVirtualRouter != nil && s.hasDefaultVirtualRouter()
+}
+
+const enrichmentTimeout = 2 * time.Minute
+
+func (s *Service) scheduleEnrichment(ctx context.Context, id string) {
+	if id == "" {
+		return
+	}
+	base := context.WithoutCancel(ctx)
+	run := func() {
+		enrichCtx, cancel := context.WithTimeout(base, enrichmentTimeout)
+		defer cancel()
+		s.enrichRequest(enrichCtx, id)
+	}
+	if s.enrichAsync != nil {
+		s.enrichAsync(run)
+		return
+	}
+	go run()
+}
+
 func isVirtualIntegration(installationID *int, capabilityID string) bool {
 	return capabilityID == VirtualLibraryRequestsCapability || (installationID != nil && *installationID <= 0)
 }
 
 func (s *Service) SetRouterProvider(p RequestRouterProvider) { s.router = p }
+
+func (s *Service) SetDefaultVirtualRouter(enabled func() bool) { s.hasDefaultVirtualRouter = enabled }
 
 func (s *Service) SetEntitlementResolver(r EntitlementResolver) { s.entitlements = r }
 

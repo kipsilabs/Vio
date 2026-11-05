@@ -755,7 +755,7 @@ func TestSelectedVTTDeliverySurvivesPersistence(t *testing.T) {
 			if index == 5 {
 				return
 			}
-			dto := (&PlaybackHandler{}).mediaSourceDTO("item", "play", "token", recovered)
+			dto := (&PlaybackHandler{}).mediaSourceDTO("item", "play", recovered)
 			found := false
 			for _, stream := range dto.MediaStreams {
 				if stream.Type != "Subtitle" {
