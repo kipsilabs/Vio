@@ -74,9 +74,11 @@ type TranscodeOpts struct {
 	// mechanism. A copy target never invokes it. Runtime-only: no-op when nil.
 	OnSourceRejected func(ctx context.Context, mediaFileID int, canonicalPath string) error
 	OutputDir        string // e.g., /tmp/silo-transcode/{session_id}/
+	AudioOnly        bool
 	// subtitleFilterInputPath is a parser-safe local alias used only by the
 	// libass subtitles filter. FFmpeg still opens InputPath as the media input.
 	subtitleFilterInputPath string
+	subtitleFilterFontsDir  string
 	// OutputSubdir is the signed, root-relative reconstruction directory. Empty
 	// retains the legacy flat {session_id} layout.
 	OutputSubdir         string
@@ -237,6 +239,10 @@ type TranscodeOpts struct {
 // configuration and RPUs. A single-track Profile 7 stream also interleaves its
 // enhancement layer as NAL unit type 63 in the same video stream, which stream
 // mapping cannot separate, so filter_units removes those units.
+const DV7ToDV81BitstreamFilter = "filter_units=remove_types=63"
+
+const DV7ToDV81BitstreamFilter = "filter_units=remove_types=63"
+
 const DV7ToHDR10BitstreamFilter = "dovi_rpu=strip=1,filter_units=remove_types=63"
 
 // CopyFMP4RecipeVersion identifies the byte-affecting copy-video HLS recipe.
@@ -2596,6 +2602,17 @@ const subtitleFilterAliasName = "subtitle-source.media"
 // by the filtergraph parser even after it was escaped for the subtitles filter.
 // A stable alias in the session directory keeps the media input unchanged and
 // is retained for seek restarts with the rest of TranscodeOpts.
+func textSubtitleFilter(opts TranscodeOpts) string {
+	p := opts.InputPath
+	if opts.subtitleFilterInputPath != "" {
+		p = opts.subtitleFilterInputPath
+	}
+	if opts.subtitleFilterFontsDir != "" {
+		return fmt.Sprintf("subtitles=filename='%s':fontsdir='%s'", escapeFilterPath(p), escapeFilterPath(opts.subtitleFilterFontsDir))
+	}
+	return fmt.Sprintf("subtitles=filename='%s':si=%d", escapeFilterPath(p), opts.SubtitleTrackIndex)
+}
+
 func prepareSubtitleFilterInput(opts *TranscodeOpts) error {
 	if !opts.SubtitleBurnIn || opts.SubtitleTrackIndex < 0 || NeedsBurnIn(opts.SubtitleCodec) {
 		return nil
