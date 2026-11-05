@@ -155,6 +155,9 @@ func ConfigSettings(cfg Config) map[string]string {
 		pairs[prefix+"requests_per_minute"] = strconv.FormatFloat(ep.RequestsPerMinute, 'f', -1, 64)
 		pairs[prefix+"burst"] = strconv.Itoa(ep.Burst)
 	}
+	pairs[sessionModeSetting] = cfg.Session.Mode
+	pairs[sessionRequestsPerHourSetting] = strconv.FormatFloat(cfg.Session.RequestsPerHour, 'f', -1, 64)
+	pairs[sessionBurstSetting] = strconv.Itoa(cfg.Session.Burst)
 	return pairs
 }
 
