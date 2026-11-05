@@ -677,6 +677,9 @@ func normalizeBitrateKbpsV3(value int) int {
 }
 
 func dimensionsFromResolutionV3(value string) (int, int) {
+	if w, h, ok := parseWxHResolution(value); ok {
+		return w, h
+	}
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case "4320p", "8k":
 		return 7680, 4320
@@ -773,4 +776,56 @@ func tighterBoundFloatV3(a, b float64) float64 {
 	default:
 		return a
 	}
+}
+
+func deliveryManagesOriginalDynamicRangeV3(delivery DeliveryCapabilityV3, source SourceDescriptorV3) bool {
+	if source.DynamicRange == DynamicRangeDolbyVisionV3 {
+		return deliveryManagedDVBaseLayerV3(delivery, source)
+	}
+	return containsFoldV3(delivery.ValidatedClaims, ClaimClientManagedDynamicRangeV3)
+}
+
+func deliveryManagedDVBaseLayerV3(delivery DeliveryCapabilityV3, source SourceDescriptorV3) bool {
+	if !source.DVBaseLayerProven || (source.DVProfile != 7 && source.DVProfile != 8) {
+		return false
+	}
+	claim := ClientManagedDVBaseLayerClaimV3(source.DVBLCompatID)
+	return claim != "" && containsFoldV3(delivery.ValidatedClaims, claim)
+}
+
+func parseWxHResolution(value string) (int, int, bool) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	left, right, ok := strings.Cut(value, "x")
+	if !ok {
+		return 0, 0, false
+	}
+	w, err1 := strconv.Atoi(left)
+	h, err2 := strconv.Atoi(right)
+	if err1 != nil || err2 != nil || w <= 0 || h <= 0 || w > 32768 || h > 32768 || right != strconv.Itoa(h) {
+		return 0, 0, false
+	}
+	return w, h, true
+}
+
+func routeVideoMetadataGapsDetailV3(source SourceDescriptorV3) string {
+	var missing []string
+	if source.VideoCodec == "" {
+		missing = append(missing, "video codec")
+	}
+	if source.BitDepth <= 0 {
+		missing = append(missing, "bit depth")
+	}
+	if source.Width <= 0 || source.Height <= 0 {
+		missing = append(missing, "resolution")
+	}
+	if source.FrameRate <= 0 {
+		missing = append(missing, "frame rate")
+	}
+	if source.BitrateKbps <= 0 {
+		missing = append(missing, "bitrate")
+	}
+	if len(missing) == 0 {
+		return ""
+	}
+	return "missing: " + strings.Join(missing, ", ")
 }
