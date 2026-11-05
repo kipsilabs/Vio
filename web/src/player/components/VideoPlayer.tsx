@@ -574,6 +574,10 @@ export function VideoPlayer({
   onPlanFailure,
   onConnectionLost,
   onRetryConnection,
+  onSessionLost,
+  onSessionGone,
+  onRestartPlayback,
+  onExpediteReconnect,
   connectionStatus = "connected",
   connectionErrorTitle = null,
   connectionError = null,
@@ -1044,6 +1048,55 @@ export function VideoPlayer({
   // never tears the transport down.
   const reportConnectionLostRef = useRef(reportConnectionLost);
   reportConnectionLostRef.current = reportConnectionLost;
+
+  const onSessionLostRef = useRef(onSessionLost);
+  onSessionLostRef.current = onSessionLost;
+  const onExpediteReconnectRef = useRef(onExpediteReconnect);
+  onExpediteReconnectRef.current = onExpediteReconnect;
+
+  /**
+   * The progress sampler reports a session's disappearance and can answer that
+   * the session is gone in the same tick as a previous report. React batches
+   * the reconnect state change, so `connectionStatusRef` cannot separate them on
+   * its own: report a given session's disappearance once. A recovery re-arms it
+   * — a fresh `connected` status, or a newly adopted plan under the same session
+   * id (`planRevision`), since either proves the session is alive again and can
+   * drop later. A new session id re-arms it unconditionally: it is a different
+   * session whose disappearance must be reported even when the status never left
+   * `connected`.
+   */
+  const sessionGoneReportedRef = useRef(false);
+  useEffect(() => {
+    sessionGoneReportedRef.current = false;
+  }, [planRevision, sessionId]);
+  useEffect(() => {
+    if (connectionStatus === "connected") sessionGoneReportedRef.current = false;
+  }, [connectionStatus]);
+
+  /**
+   * A session-scoped call — the progress sampler's 404 — answered that the
+   * session no longer exists. Route it through the one recovery the player has
+   * — the reconnect restarts at the same position — and fall through to the
+   * lost state when nothing has played to reposition.
+   *
+   * A reconnect may already be running from an earlier network drop. The
+   * server has now confirmed the session it is rebuilding is gone, so run its
+   * next attempt immediately instead of waiting out the backoff: the attempt
+   * that follows replaces the dead session with a fresh start.
+   */
+  const handleSessionGone = useCallback(() => {
+    if (sessionGoneReportedRef.current) return;
+    // A session already answered gone stays gone: its restart action is the
+    // only recovery, and a lost/reconnecting cycle would reuse the dead id.
+    if (connectionStatusRef.current === "gone") return;
+    sessionGoneReportedRef.current = true;
+    if (reportConnectionLostRef.current()) {
+      if (connectionStatusRef.current === "reconnecting") onExpediteReconnectRef.current?.();
+      return;
+    }
+    onSessionLostRef.current?.();
+  }, []);
+
   // A start that missed the player's own deadline goes to the buffering
   // controller, which lowers when Auto lowers on its own and otherwise calls
   // back to fail the plan. Set once the controller's hook has run below.
@@ -1219,6 +1272,33 @@ export function VideoPlayer({
     video.addEventListener("loadedmetadata", handleLoadedMetadata);
     return () => video.removeEventListener("loadedmetadata", handleLoadedMetadata);
   }, [isPlayerReady, planRevision]);
+
+  // The effective subtitle source identity. A virtual release that rotates to
+  // a new concrete candidate changes this; a plan that only re-mints subtitle
+  // URLs or re-orders the inventory does not. The revision is part of the
+  // identity because the effective media file id is the requested catalog row
+  // and does not move on a rotation, and the v2 wire does not carry the virtual
+  // URI. The 409 source-change signal is deduped per generation (below and in
+  // the two subtitle hooks) so the refresh -> replan -> refetch cycle cannot
+  // restart on a new plan id.
+  const [subtitleSourceGeneration, setSubtitleSourceGeneration] = useState(0);
+  const lastSubtitleSourceIdentityRef = useRef<string | null>(null);
+  useEffect(() => {
+    const identity = `${sessionId}|${plan.effective_media_file_id}|${plan.effective_virtual_uri ?? ""}|${plan.virtual_source_revision ?? ""}`;
+    if (lastSubtitleSourceIdentityRef.current === null) {
+      lastSubtitleSourceIdentityRef.current = identity;
+      return;
+    }
+    if (lastSubtitleSourceIdentityRef.current !== identity) {
+      lastSubtitleSourceIdentityRef.current = identity;
+      setSubtitleSourceGeneration((generation) => generation + 1);
+    }
+  }, [
+    sessionId,
+    plan.effective_media_file_id,
+    plan.effective_virtual_uri,
+    plan.virtual_source_revision,
+  ]);
 
   const isFirefoxBrowser =
     typeof navigator !== "undefined" && isFirefoxUserAgent(navigator.userAgent);
@@ -1918,6 +1998,8 @@ export function VideoPlayer({
     sessionId,
     videoRef,
     timelineOffsetRef,
+    handleSessionGone,
+    planRevision,
     markSessionEnded,
   );
 
@@ -2410,6 +2492,29 @@ export function VideoPlayer({
       subtitleUrls,
     ],
   );
+
+  // Set between a source-changed signal and the replan that answers it. The
+  // text-track hook must retry the window only once the re-minted URLs land:
+  // retrying when the 409 is signaled would re-fetch the stale URL. The
+  // planRevision effect below turns that landing into refreshRevision.
+  const subtitleSourceChangedGenerationRef = useRef<number | null>(null);
+  const subtitleRefreshPendingRef = useRef(false);
+  const [subtitleRefreshRevision, setSubtitleRefreshRevision] = useState(0);
+  useEffect(() => {
+    if (!subtitleRefreshPendingRef.current) return;
+    subtitleRefreshPendingRef.current = false;
+    setSubtitleRefreshRevision((revision) => revision + 1);
+  }, [planRevision]);
+  // The text and ASS/PGS hooks call this when the server answers a subtitle
+  // fetch with `subtitle_source_changed` (409). Nobody else answers it, so
+  // without this the fetcher would park on a URL that can never succeed.
+  const handleSubtitleSourceChanged = useCallback(() => {
+    if (subtitleSourceChangedGenerationRef.current === subtitleSourceGeneration) return;
+    subtitleSourceChangedGenerationRef.current = subtitleSourceGeneration;
+    if (!onRefreshSubtitles) return;
+    subtitleRefreshPendingRef.current = true;
+    onRefreshSubtitles(getSubtitleStartPosition());
+  }, [getSubtitleStartPosition, onRefreshSubtitles, subtitleSourceGeneration]);
 
   // Resume as soon as the first translated cues arrive. Playhead-first
   // translation means the cues covering the current position are delivered
@@ -3859,12 +3964,13 @@ export function VideoPlayer({
     liveTranslation?.trackKey ?? null,
     subtitleStreamGeneration,
     setTextSubtitleState,
-    undefined,
-    undefined,
-    0,
+    handleSubtitleSourceChanged,
+    subtitleSourceGeneration,
     activeSubtitleCueRevision,
+    subtitleRefreshRevision,
     engineTransportRevision,
     replayRevision,
+    onSessionGone,
   );
 
   // -- ASS/SSA subtitle rendering via JASSUB (client-side libass) --
@@ -3876,8 +3982,8 @@ export function VideoPlayer({
     timelineOffsetSeconds,
     subtitleDelayMs,
     setASSSubtitleState,
-    undefined,
-    0,
+    handleSubtitleSourceChanged,
+    subtitleSourceGeneration,
     videoFit,
     coverCrop,
     activeSubtitleCueRevision,
@@ -3912,7 +4018,12 @@ export function VideoPlayer({
     videoFit,
     bottomInsetPx: subtitleHudInsetPx,
     onLoadState: setPGSSubtitleState,
+    onSourceChanged: handleSubtitleSourceChanged,
+    sourceGeneration: subtitleSourceGeneration,
+    cueRevision: activeSubtitleCueRevision,
+    transportRevision: engineTransportRevision,
     replayRevision,
+    refreshRevision: subtitleRefreshRevision,
   });
   const subtitleLoadState = isASSActive
     ? assSubtitleState
@@ -5583,6 +5694,16 @@ export function VideoPlayer({
               </p>
             </div>
             <div className="flex gap-2">
+              {connectionStatus === "gone" && onRestartPlayback && (
+                <button
+                  onClick={onRestartPlayback}
+                  disabled={isLeaving}
+                  type="button"
+                  className="rounded bg-white px-4 py-2 text-sm font-medium text-black hover:bg-white/90"
+                >
+                  Restart playback
+                </button>
+              )}
               {connectionStatus === "lost" && onRetryConnection && (
                 <button
                   onClick={onRetryConnection}
