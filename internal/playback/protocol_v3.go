@@ -1715,6 +1715,9 @@ func (r *ReplanRequestV3) Validate() error {
 	if err := validateCapabilitiesStructureV3(&r.Capabilities, &r.ClientPlaybackContext, r.ClientFeatures); err != nil {
 		return err
 	}
+	r.ClientPlaybackContext.AppVersion = normalizeClientMetadataValue(r.ClientPlaybackContext.AppVersion, 64)
+	r.ClientPlaybackContext.AppBuild = normalizeClientMetadataValue(r.ClientPlaybackContext.AppBuild, 64)
+	r.ClientPlaybackContext.AppChannel = normalizeClientMetadataValue(r.ClientPlaybackContext.AppChannel, 32)
 	return nil
 }
 
