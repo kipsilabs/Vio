@@ -3205,6 +3205,12 @@ func (h *StreamHandler) abortPlaybackSession(ctx context.Context, session *playb
 	if h == nil || session == nil || session.ID == "" {
 		return
 	}
+	// Teardown reached from a canceled request (a client-canceled transport or
+	// a track switch aborting the old stream) must still stop the durable
+	// attempt and remove the synced session. Run the durable half detached and
+	// bounded instead of inheriting the dead request context.
+	ctx, cancel := teardownContext(ctx)
+	defer cancel()
 	if err := h.sessionMgr.StopSession(session.ID); err != nil {
 		return
 	}
@@ -3321,6 +3327,22 @@ func watchProgressiveRemuxAbort(ctx context.Context, sessionMgr SessionManagerIn
 
 func (h *StreamHandler) handleTransportStartFailure(ctx context.Context, session *playback.Session, file *models.MediaFile, err error) {
 	if ctx == nil || session == nil || err == nil {
+		return
+	}
+	// Client cancellation is not a transport failure: the viewer navigated off
+	// (or hls.js gave up) while the upstream fetch was in flight. The request
+	// context propagates into the virtual provider resolve / relay, so the
+	// upstream work is already canceled. Check this before preflight so a
+	// canceled request is never rewritten into a missing-file abort, and
+	// downgrade to debug; a timeout or provider error stays at WARN.
+	if isClientCancellation(ctx, err) {
+		slog.DebugContext(ctx, "stream transport canceled by client",
+			"component", "api",
+			"session", session.ID,
+			"file_id", session.MediaFileID,
+			"reason", "client_canceled",
+			"playback_session_id", session.ID,
+		)
 		return
 	}
 	// A request that already ended cannot stat the file; keep the transport's

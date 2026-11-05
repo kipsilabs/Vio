@@ -2304,14 +2304,14 @@ func (h *PlaybackHandler) finalizeSessionStop(ctx context.Context, session *play
 		}
 	}
 	endReason, _ := reason.(PlaybackEndReason)
-	h.finalizeSessionStopWithResult(ctx, session, syncNow, syncReason, endReason)
+	_, _ = h.finalizeSessionStopWithResult(ctx, session, syncNow, syncReason, endReason)
 }
 
 // finalizeSessionStopWithResult is finalizeSessionStop reporting the history
 // writer's result, which the v2 stop receipt carries. reason is why the
 // attempt ended; a system teardown the client can rebuild under the same id
 // passes none.
-func (h *PlaybackHandler) finalizeSessionStopWithResult(ctx context.Context, session *playback.Session, syncNow bool, syncReason string, reason any, legacy ...string) watchstate.PlaybackStopResult {
+func (h *PlaybackHandler) finalizeSessionStopWithResult(ctx context.Context, session *playback.Session, syncNow bool, syncReason string, reason any, legacy ...string) (watchstate.PlaybackStopResult, error) {
 	if b, ok := reason.(bool); ok {
 		if b {
 			reason = PlaybackEndStopped
@@ -2323,7 +2323,7 @@ func (h *PlaybackHandler) finalizeSessionStopWithResult(ctx context.Context, ses
 	}
 	endReason, _ := reason.(PlaybackEndReason)
 	if h == nil || session == nil || session.ID == "" {
-		return watchstate.PlaybackStopResult{}
+		return watchstate.PlaybackStopResult{}, nil
 	}
 	// Cancel and await the session's start side effects under their own bounded
 	// budget before taking the durable-write budget. The wait can run as long as
@@ -2350,17 +2350,17 @@ func (h *PlaybackHandler) finalizeSessionStopWithResult(ctx context.Context, ses
 		// session the node refuses.
 		h.deleteSessionRecipeV3(ctx, session.ID)
 	}
-	stopResult := h.recordStoppedSession(ctx, session, endReason)
+	stopResult, stopErr := h.recordStoppedSession(ctx, session, endReason)
 	if syncNow {
 		h.syncSessionsNow(ctx, syncReason)
 	}
-	return stopResult
+	return stopResult, stopErr
 }
 
-func (h *PlaybackHandler) recordStoppedSession(ctx context.Context, session *playback.Session, reason PlaybackEndReason) watchstate.PlaybackStopResult {
-	stopResult := h.recordStopHistory(ctx, session, reason)
-	h.notifyStoppedSession(ctx, session, stopResult, reason)
-	return stopResult
+func (h *PlaybackHandler) recordStoppedSession(ctx context.Context, session *playback.Session, reason PlaybackEndReason) (watchstate.PlaybackStopResult, error) {
+	stopResult, historyErr := h.recordStopHistory(ctx, session, reason)
+	notifyErr := h.notifyStoppedSession(ctx, session, stopResult, reason)
+	return stopResult, errors.Join(historyErr, notifyErr)
 }
 
 // notifyStoppedSession tells watch providers and the live admin view that the
@@ -2368,7 +2368,7 @@ func (h *PlaybackHandler) recordStoppedSession(ctx context.Context, session *pla
 // for a Jellyfin play's upstream session: its client's Stopped report still
 // finds the play after an expiry and sends that play's own stop, so its
 // expiry stays a plain pause.
-func (h *PlaybackHandler) notifyStoppedSession(ctx context.Context, session *playback.Session, stopResult watchstate.PlaybackStopResult, reason PlaybackEndReason) {
+func (h *PlaybackHandler) notifyStoppedSession(ctx context.Context, session *playback.Session, stopResult watchstate.PlaybackStopResult, reason PlaybackEndReason) error {
 	// A realtime stop's confirmed finalizer can defer the provider event to the
 	// caller that owns the confirmed snapshot; honor that here so the finalizer
 	// does not send it twice.
@@ -2384,11 +2384,14 @@ func (h *PlaybackHandler) notifyStoppedSession(ctx context.Context, session *pla
 			}
 		}
 	}
+	var deleteErr error
 	if h.AdminStore != nil {
 		if err := h.AdminStore.DeleteSession(ctx, session.ID); err != nil {
 			slog.ErrorContext(ctx, "failed to delete synced session", "component", "api", "session", session.ID, "error", err)
+			deleteErr = fmt.Errorf("delete synced session: %w", err)
 		}
 	}
+	return deleteErr
 }
 
 func (h *PlaybackHandler) cleanupStoppedSessionTransport(ctx context.Context, session *playback.Session) {
@@ -2407,17 +2410,17 @@ func (h *PlaybackHandler) cleanupStoppedSessionTransport(ctx context.Context, se
 // An aborted or replaced play goes to the admin log only: an abort never
 // wrote watch history, and a replaced play continues under the session that
 // replaced it.
-func (h *PlaybackHandler) recordStopHistory(ctx context.Context, session *playback.Session, reason PlaybackEndReason) watchstate.PlaybackStopResult {
+func (h *PlaybackHandler) recordStopHistory(ctx context.Context, session *playback.Session, reason PlaybackEndReason) (watchstate.PlaybackStopResult, error) {
 	if compatCopyWithoutProgress(session) {
-		return watchstate.PlaybackStopResult{}
+		return watchstate.PlaybackStopResult{}, nil
 	}
 	if reason == PlaybackEndAborted || reason == PlaybackEndReplaced {
 		h.recordAdminStopHistory(ctx, session, reason)
-		return watchstate.PlaybackStopResult{}
+		return watchstate.PlaybackStopResult{}, nil
 	}
-	result, _ := h.persistStopAndHistory(ctx, session, "")
+	result, err := h.persistStopAndHistory(ctx, session, "")
 	h.recordAdminStopHistory(ctx, session, reason)
-	return result
+	return result, err
 }
 
 func (h *PlaybackHandler) recordAdminStopHistory(ctx context.Context, session *playback.Session, reason PlaybackEndReason) {
@@ -2493,7 +2496,7 @@ func (h *PlaybackHandler) finalizeSessionAbort(ctx context.Context, session *pla
 		// An abort writes no watch history, but the play happened: the admin
 		// log records it as aborted, unless it is a Jellyfin copy that never
 		// saw it.
-		h.recordStopHistory(ctx, session, claim.reason(session.ID, PlaybackEndAborted))
+		_, _ = h.recordStopHistory(ctx, session, claim.reason(session.ID, PlaybackEndAborted))
 	}
 
 	if h.AdminStore != nil {
@@ -2592,7 +2595,7 @@ func (h *PlaybackHandler) expireSessionCopy(ctx context.Context, session *playba
 		return
 	}
 	claim.applyAccepted(session)
-	result := h.finalizeSessionStopWithResult(ctx, session, false, "", PlaybackEndExpired)
+	result, _ := h.finalizeSessionStopWithResult(ctx, session, false, "", PlaybackEndExpired)
 	claim.finish(ctx, session.ID, result.HistoryID)
 }
 
@@ -2643,7 +2646,7 @@ func (h *PlaybackHandler) handleFinishedSession(ctx context.Context, session *pl
 			return // nothing left that says whose play it was
 		}
 	}
-	h.recordStopHistory(ctx, session, reason)
+	_, _ = h.recordStopHistory(ctx, session, reason)
 }
 
 // detachedFinisher runs the session manager's finish hooks for a play this

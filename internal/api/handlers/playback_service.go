@@ -963,7 +963,9 @@ func (h *PlaybackHandler) finishStop(ctx context.Context, record *playback.Attem
 	synthesized := h.attemptSessionV2(ctx, record, position, paused)
 	if reason == PlaybackEndAborted || reason == PlaybackEndReplaced {
 		h.recordAdminStopHistory(ctx, synthesized, reason)
-		h.notifyStoppedSession(ctx, synthesized, watchstate.PlaybackStopResult{HistoryID: priorHistoryID}, reason)
+		if err := h.notifyStoppedSession(ctx, synthesized, watchstate.PlaybackStopResult{HistoryID: priorHistoryID}, reason); err != nil {
+			return priorHistoryID, err
+		}
 		return priorHistoryID, nil
 	}
 	result, err := h.persistStopAndHistory(ctx, synthesized, priorHistoryID)
@@ -976,7 +978,9 @@ func (h *PlaybackHandler) finishStop(ctx context.Context, record *playback.Attem
 	h.recordAdminStopHistory(ctx, synthesized, reason)
 	// This replica holds no live copy, so no lifecycle finalizer told providers.
 	// A deferred notice leaves the event to this caller.
-	h.notifyStoppedSession(ctx, synthesized, result, reason)
+	if err := h.notifyStoppedSession(ctx, synthesized, result, reason); err != nil {
+		return result.HistoryID, err
+	}
 	// The synced-session row lives in a store shared by every replica, so a
 	// replica that does not hold the live session still deletes it. This is the
 	// step a retried stop exists to repair.

@@ -66,6 +66,12 @@ func canceledPlaybackContext() context.Context {
 	return ctx
 }
 
+func expiredDeadlinePlaybackContext() context.Context {
+	ctx, cancel := context.WithDeadline(newAuthorizedPlaybackContext(), time.Now().Add(-time.Second))
+	cancel()
+	return ctx
+}
+
 // A client that cancels its remux stream mid-teardown (a track switch aborts
 // the old transport) must not strand the teardown: the synced-session delete
 // has to run to completion under a detached context, not fail with
@@ -399,7 +405,7 @@ func TestStopTeardownDurableWritesSurviveSlowStartEffect(t *testing.T) {
 		}
 		h.v3StartEffectsPending = map[string]*playbackStartSideEffectsStateV3{session.ID: state}
 
-		h.finalizeSessionStopWithResult(context.Background(), session, false, "", true, "")
+		_, _ = h.finalizeSessionStopWithResult(context.Background(), session, false, "", true, "")
 
 		if !adminStore.deleted[session.ID] {
 			t.Fatalf("durable session delete did not run after a slow start effect (calls=%d)", adminStore.deleteCalls)
@@ -640,11 +646,12 @@ func TestStopFinalizationFailedCleanupStaysReplayable(t *testing.T) {
 }
 
 // The stop finalization waits for the per-session lifecycle lock a replacement
-// preparation may hold. That wait is bounded by the finalization deadline: a
-// finalizer blocked past its lease could otherwise start teardown after another
-// replica took the stop over. Here the holder outlasts the deadline, so the
-// expired teardown is rejected and nothing is torn down or finalized.
-func TestStopFinalizationLifecycleWaitBoundedByDeadline(t *testing.T) {
+// preparation may hold. That wait is bounded by the finalization's own budget,
+// not by the request that triggered it: an already-expired request deadline must
+// not become the teardown's deadline, or a timeout-triggered stop would skip its
+// durable writes. The holder outlasts the lease, so the wait ends on the budget
+// and nothing is torn down or finalized.
+func TestStopFinalizationLifecycleWaitBoundedByBudgetNotRequestDeadline(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		f := newPlaybackServiceFixture(t)
 		store := &leaseObservingStore{MemoryPlanStoreV3: f.handler.PlanStoreV3.(*playback.MemoryPlanStoreV3)}
@@ -652,26 +659,31 @@ func TestStopFinalizationLifecycleWaitBoundedByDeadline(t *testing.T) {
 		admin := &cancelSensitiveAdminStore{}
 		f.handler.AdminStore = admin
 
-		// The replacement holds the lifecycle lock for longer than the stop's
-		// finalization deadline.
+		// The replacement holds the lifecycle lock past the finalization budget.
 		unlock := f.handler.tm.LockSessionLifecycle(f.session.ID)
 		holderDone := make(chan struct{})
 		go func() {
-			time.Sleep(6 * time.Second) //nolint:forbidigo // holds the lifecycle lock past the stop deadline; the delay is the scenario under test
+			time.Sleep(25 * time.Second)
 			unlock()
 			close(holderDone)
 		}()
 
-		reqCtx, cancel := context.WithTimeout(f.ctx, 5*time.Second)
-		defer cancel()
+		// The request is already past its deadline: the teardown must take its
+		// own budget rather than inherit the expired one.
 		start := time.Now()
-		view, err := f.handler.StopPlaybackV2(reqCtx, f.caller, f.session.ID, PlaybackStopCommand{StopID: uuid.NewString()})
+		view, err := f.handler.StopPlaybackV2(expiredDeadlinePlaybackContext(), f.caller, f.session.ID, PlaybackStopCommand{StopID: uuid.NewString()})
 		elapsed := time.Since(start)
 		if err != nil || view.Outcome != PlaybackOutcomeStopped {
 			t.Fatalf("stop = %+v, %v", view, err)
 		}
-		if elapsed >= 5*time.Second {
-			t.Fatalf("stop waited %v for the lifecycle lock, past its finalization deadline", elapsed)
+		if elapsed < 10*time.Second {
+			t.Fatalf("stop waited only %v for the lifecycle lock, so it inherited the expired request deadline", elapsed)
+		}
+		if elapsed > stopFinalizationBudget {
+			t.Fatalf("stop waited %v for the lifecycle lock, past the %v finalization budget", elapsed, stopFinalizationBudget)
+		}
+		if elapsed >= stopFinalizationLease {
+			t.Fatalf("stop ran %v, not inside the %v lease", elapsed, stopFinalizationLease)
 		}
 		if _, err := f.manager.GetSession(f.session.ID); err != nil {
 			t.Fatalf("an expired teardown ran once the lock was free: %v", err)

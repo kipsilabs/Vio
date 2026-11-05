@@ -58,7 +58,7 @@ func (h *PlaybackHandler) stopPlaybackSessionWithResult(ctx context.Context, ses
 	if err != nil {
 		return watchstate.PlaybackStopResult{}, err
 	}
-	return h.finalizeSessionStopWithResult(ctx, current, true, "stop", reason), nil
+	return h.finalizeSessionStopWithResult(ctx, current, true, "stop", reason)
 }
 
 // endPlaybackSessionAuthority ends the live session and revokes its streams
@@ -143,7 +143,9 @@ func (h *PlaybackHandler) recordRealtimeStoppedSession(ctx context.Context, sess
 		h.recordAdminStopHistory(ctx, session, outcome.reason)
 	}
 	if outcome.notify {
-		h.notifyStoppedSession(ctx, session, outcome.result, outcome.reason)
+		// Best effort: the writer has already logged a failed synced-session
+		// delete, and the client's own stop retry repairs it.
+		_ = h.notifyStoppedSession(ctx, session, outcome.result, outcome.reason)
 	}
 }
 
