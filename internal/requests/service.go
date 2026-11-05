@@ -2097,6 +2097,63 @@ func (s *Service) enrichExternalIDs(ctx context.Context, input *CreateRequestInp
 	return tmdbFailed && input.MediaType == MediaTypeSeries && input.TVDBID == nil
 }
 
+// enrichRequest is the deferred half of CreateRequest: it reads the title's
+// external IDs and routing facts from TMDB and writes them back to the row the
+// create already committed. A failure leaves the row as the create left it —
+// the facts uncaptured and the IDs unfilled — rather than storing an empty
+// snapshot that would read as captured, so submission and routing retry
+// through their backfill paths and the failure is not silently swallowed.
+func (s *Service) enrichRequest(ctx context.Context, id string) {
+	req, err := s.store.GetRequest(ctx, id)
+	if err != nil {
+		slog.WarnContext(ctx, "requests: deferred enrichment could not read the request", "component", "requests", "request_id", id, "err", err)
+		return
+	}
+	if req == nil || req.Outcome != OutcomeActive {
+		return
+	}
+	if req.RoutingFacts.Captured() && req.IMDbID != "" {
+		return
+	}
+	if req.IMDbID == "" {
+		input := CreateRequestInput{MediaType: req.MediaType, TMDBID: req.TMDBID, TVDBID: req.TVDBID}
+		if failed := s.enrichExternalIDs(ctx, &input); failed {
+			slog.WarnContext(ctx, "requests: deferred external-ID enrichment found no TVDB id for the series", "component", "requests", "request_id", id)
+		}
+		if strings.TrimSpace(input.IMDbID) != "" {
+			if _, err := s.store.SetExternalIDs(ctx, id, 0, input.IMDbID); err != nil {
+				slog.WarnContext(ctx, "requests: deferred enrichment could not store external ids", "component", "requests", "request_id", id, "err", err)
+			}
+		}
+	}
+	if req.RoutingFacts.Captured() {
+		return
+	}
+	detail := s.requestDetail(ctx, req.MediaType, req.TMDBID)
+	if detail == nil {
+		// TMDB unreachable: leave the facts uncaptured so submission/routing
+		// reads them again rather than routing on a title with no facts.
+		slog.WarnContext(ctx, "requests: deferred enrichment could not read the title from TMDB; routing will retry", "component", "requests", "request_id", id)
+		return
+	}
+	if req.Year == nil || req.Overview == "" || req.PosterPath == "" || req.BackdropPath == "" {
+		if _, err := s.store.FillRequestDisplay(ctx, id, detailYear(detail), detail.Overview, detail.PosterPath, detail.BackdropPath); err != nil {
+			slog.WarnContext(ctx, "requests: deferred enrichment could not fill the request display fields", "component", "requests", "request_id", id, "err", err)
+		}
+	}
+	if _, err := s.store.SetRoutingFacts(ctx, id, s.routingFacts(ctx, detail)); err != nil {
+		slog.WarnContext(ctx, "requests: deferred enrichment could not store routing facts", "component", "requests", "request_id", id, "err", err)
+	}
+}
+
+func detailYear(detail *tmdb.MediaDetail) *int {
+	if detail == nil || detail.Year <= 0 {
+		return nil
+	}
+	year := detail.Year
+	return &year
+}
+
 // ensureSeriesTVDBID looks up a series request's missing TVDB ID again right
 // before submission (approve, Retry, reconcile), so an ID added on TMDB or TVDB
 // since the request was created is used, and records it on the request.
