@@ -1,3 +1,11 @@
 {
-  "approvals": []
+  "approvals": [
+    {
+      "operation_id": "createWebhookConnection",
+      "change_id": "request-property-type-changed",
+      "fingerprint": "9365f95439d7d598ec9fe50b99d6a17e028b85baf06af9d6351c9bf6698e6643",
+      "reason": "A webhook connection's base_url is always a URI, and the schema now validates the format the server already requires.",
+      "approved_in": "#418"
+    }
+  ]
 }
