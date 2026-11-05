@@ -6,6 +6,7 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/api"
 	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/metadata/tmdb"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary"
 )
 
@@ -79,4 +80,17 @@ func (s virtualLibraryStartup) start(ctx context.Context) (*virtuallibrary.Servi
 		s.Deps.VirtualLibraryVariants = svc.VirtualVariants()
 	}
 	return svc, cfg
+}
+
+// wireCollectionTMDB installs the shared TMDB client's collection, discover,
+// and digital-release adapters on the collection service. Both discover paths
+// use one adapter so collection sync and theatrical release gating spend the
+// same client (and its cache and rate budget) instead of constructing a second
+// TMDB client.
+func wireCollectionTMDB(collectionService *catalog.LibraryCollectionService, client *tmdb.Client) *api.TMDBDiscoverAdapter {
+	discover := api.NewTMDBDiscoverAdapter(client)
+	collectionService.TMDBCollections = api.NewTMDBCollectionFetcher(client)
+	collectionService.TMDBDiscovers = discover
+	collectionService.TMDBDigitalReleases = discover
+	return discover
 }

@@ -3157,8 +3157,7 @@ func main() {
 		collItemRepo := catalog.NewItemRepository(deps.DB)
 		libraryItemRepo := catalog.NewLibraryItemRepository(deps.DB)
 		collectionService := catalog.NewLibraryCollectionService(collectionRepo, collItemRepo, libraryItemRepo, nil)
-		collectionService.TMDBCollections = api.NewTMDBCollectionFetcher(tmdbClient)
-		discoverAdapter := api.NewTMDBDiscoverAdapter(tmdbClient)
+		discoverAdapter := wireCollectionTMDB(collectionService, tmdbClient)
 		deps.CollectionService = collectionService
 		collectionSyncScheduler = catalog.NewCollectionSyncScheduler(collectionRepo, collectionService, slog.Default())
 
