@@ -290,6 +290,8 @@ func TestTranscribeMissingSegmentsFieldFailsFast(t *testing.T) {
 
 	cfg := chatConfig(srv.URL)
 	cfg.ASRModel = "whisper-test"
+	// Transcription has its own endpoint; it does not fall back to the chat URL.
+	cfg.ASRBaseURL = cfg.BaseURL
 	_, err := NewClient(cfg).Transcribe(context.Background(), TranscribeRequest{Filename: "c.wav", Audio: []byte("x")})
 	if err == nil || !strings.Contains(err.Error(), "verbose_json") {
 		t.Fatalf("err = %v, want verbose_json complaint", err)
