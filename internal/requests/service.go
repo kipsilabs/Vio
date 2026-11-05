@@ -836,7 +836,12 @@ func (s *Service) CreateRequest(ctx context.Context, viewer Viewer, input Create
 	if err := s.ensureCreateAllowedByCeiling(ctx, viewer, normalized); err != nil {
 		return nil, err
 	}
-	tvdbLookupFailed := s.enrichExternalIDs(ctx, &normalized)
+	// External metadata enrichment is deferred for movies until after the row is
+	// committed. Series creation still needs metadata for season validation.
+	var tvdbLookupFailed bool
+	if normalized.MediaType == MediaTypeSeries {
+		tvdbLookupFailed = s.enrichExternalIDs(ctx, &normalized)
+	}
 
 	matches, err := s.lookupPresence(ctx, normalized.MediaType, []PresenceCandidate{createPresenceCandidate(normalized)})
 	if err != nil {
@@ -864,31 +869,14 @@ func (s *Service) CreateRequest(ctx context.Context, viewer Viewer, input Create
 		return nil, ErrAlreadyRequested
 	}
 
-	// One TMDB detail read, after the cheap refusals, serves routing and the
-	// stored title: the server's copy of the title and year wins over the
-	// client's.
-	detail := s.requestDetail(ctx, normalized.MediaType, normalized.TMDBID)
-	if detail != nil {
-		if title := strings.TrimSpace(detail.Title); title != "" {
-			normalized.Title = title
-		}
-		if detail.Year > 0 {
-			year := detail.Year
-			normalized.Year = &year
-		}
-		// A caller without the display fields (a watchlist add keeps only
-		// its own snapshot) gets TMDB's; one that sent them keeps its own.
-		if normalized.Overview == "" {
-			normalized.Overview = strings.TrimSpace(detail.Overview)
-		}
-		if normalized.PosterPath == "" {
-			normalized.PosterPath = strings.TrimSpace(detail.PosterPath)
-		}
-		if normalized.BackdropPath == "" {
-			normalized.BackdropPath = strings.TrimSpace(detail.BackdropPath)
-		}
+	// Metadata reads are deferred until after the request is committed. Keep the
+	// client's display snapshot exactly as submitted for the 201 response.
+	var detail *tmdb.MediaDetail
+	facts := RoutingFacts{}
+	if normalized.MediaType == MediaTypeSeries {
+		detail = s.requestDetail(ctx, normalized.MediaType, normalized.TMDBID)
+		facts = s.routingFacts(ctx, detail)
 	}
-	facts := s.routingFacts(ctx, detail)
 	if normalized.MediaType == MediaTypeSeries && !normalized.WholeSeries {
 		// A series partly in the library can still be requested for the
 		// seasons it is missing.
@@ -968,6 +956,9 @@ func (s *Service) CreateRequest(ctx context.Context, viewer Viewer, input Create
 		return nil, err
 	}
 	s.notifyLifecycle(ctx, *req, LifecycleNotifier.RequestSubmitted)
+	if req.Status == StatusPending || req.Status == StatusApproved {
+		s.scheduleEnrichment(ctx, req.ID)
+	}
 	if req.Status == StatusApproved {
 		// Auto-approval is a real approval transition; channels subscribed to
 		// approvals see it alongside the submission.
@@ -1494,6 +1485,10 @@ func (s *Service) CreateIntegration(ctx context.Context, viewer Viewer, in Integ
 	if err := s.validateViaPlugin(ctx, in); err != nil {
 		return nil, err
 	}
+	if isVirtualIntegration(in.InstallationID, in.CapabilityID) {
+		in.BaseURL = VirtualLibraryBaseURL
+		in.APIKeyRef = VirtualLibraryAPIKey
+	}
 	return s.store.SaveIntegrationWithDefaults(ctx, in, true)
 }
 
@@ -1520,6 +1515,14 @@ func (s *Service) UpdateIntegration(ctx context.Context, viewer Viewer, in Integ
 // connection config on save. Field/form errors are surfaced as *ValidationError
 // so the API layer can render them inline.
 func (s *Service) validateViaPlugin(ctx context.Context, in Integration) error {
+	if isVirtualIntegration(in.InstallationID, in.CapabilityID) {
+		if s.hasDefaultVirtualRouter != nil && !s.hasActiveDefaultVirtualRouter() {
+			return &ValidationError{FormError: "virtual library routing is not active"}
+		}
+		in.BaseURL = VirtualLibraryBaseURL
+		in.APIKeyRef = VirtualLibraryAPIKey
+		return nil
+	}
 	if s.router == nil || in.InstallationID == nil {
 		return nil
 	}

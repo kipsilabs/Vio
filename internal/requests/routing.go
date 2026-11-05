@@ -399,6 +399,13 @@ func (s *Service) routedConnection(ctx context.Context, fc *fulfillContext, d Ro
 	case in.InstallationID == nil || in.CapabilityID == "":
 		return ResolvedRouterConnection{}, 0, "", fmt.Errorf("%s (route %q)", msgRouterUnbound, d.RouteName)
 	}
+	virtual := isVirtualIntegration(in.InstallationID, in.CapabilityID)
+	if virtual {
+		if s.hasDefaultVirtualRouter != nil && !s.hasActiveDefaultVirtualRouter() {
+			return ResolvedRouterConnection{}, 0, "", fmt.Errorf("route %q sends to an inactive virtual library", d.RouteName)
+		}
+		return ResolvedRouterConnection{ID: in.ID, BaseURL: VirtualLibraryBaseURL, APIKey: VirtualLibraryAPIKey, Config: maps.Clone(in.PluginConfig)}, *in.InstallationID, in.CapabilityID, nil
+	}
 	missing, err := s.missingAPIKey(ctx, fc, *in)
 	switch {
 	case err != nil:
