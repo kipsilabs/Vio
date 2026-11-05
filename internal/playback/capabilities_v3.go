@@ -142,6 +142,9 @@ func videoEligibleV3(source SourceDescriptorV3, request StartRequestV3) (bool, b
 			if len(capability.BitDepths) > 0 && !containsIntV3(capability.BitDepths, source.BitDepth) {
 				continue
 			}
+			if len(capability.Levels) > 0 && (source.VideoLevel <= 0 || !containsAtLeastV3(capability.Levels, source.VideoLevel)) {
+				continue
+			}
 			if request.Capabilities.VideoEvidence != EvidenceExactV3 && capability.MaxFrameRate > 0 && source.FrameRate > capability.MaxFrameRate {
 				continue
 			}
