@@ -75,9 +75,11 @@ type TranscodeOpts struct {
 	// mechanism. A copy target never invokes it. Runtime-only: no-op when nil.
 	OnSourceRejected func(ctx context.Context, mediaFileID int, canonicalPath string) error
 	OutputDir        string // e.g., /tmp/silo-transcode/{session_id}/
-	// subtitleFilterInputPath is a parser-safe local alias used only by the
-	// libass subtitles filter. FFmpeg still opens InputPath as the media input.
+	// subtitleFilterInputPath is the libass subtitles filter input: the staged
+	// subtitle track, or a parser-safe local alias of the media file.
 	subtitleFilterInputPath string
+	// subtitleFilterFontsDir holds attached fonts for a staged subtitle track.
+	subtitleFilterFontsDir string
 	// OutputSubdir is the signed, root-relative reconstruction directory. Empty
 	// retains the legacy flat {session_id} layout.
 	OutputSubdir         string
@@ -720,7 +722,7 @@ func StartTranscode(ctx context.Context, opts TranscodeOpts) (*TranscodeSession,
 		releaseHWDevice()
 		return nil, fmt.Errorf("create output dir: %w", err)
 	}
-	if err := prepareSubtitleFilterInput(&opts); err != nil {
+	if err := prepareSubtitleFilterInput(ctx, &opts); err != nil {
 		releaseHWDevice()
 		return nil, err
 	}
@@ -2597,20 +2599,47 @@ const subtitleFilterAliasName = "subtitle-source.media"
 // by the filtergraph parser even after it was escaped for the subtitles filter.
 // A stable alias in the session directory keeps the media input unchanged and
 // is retained for seek restarts with the rest of TranscodeOpts.
-func prepareSubtitleFilterInput(opts *TranscodeOpts) error {
+// textSubtitleFilter is the libass subtitles filter of a text burn-in: the
+// staged track, the only stream of its file, with its fonts, or else the
+// track's index in the media file.
+func textSubtitleFilter(opts TranscodeOpts) string {
+	if opts.subtitleFilterFontsDir != "" {
+		return fmt.Sprintf("subtitles=filename='%s':fontsdir='%s'",
+			escapeFilterPath(opts.subtitleFilterInputPath), escapeFilterPath(opts.subtitleFilterFontsDir))
+	}
+	subtitleInputPath := opts.InputPath
+	if opts.subtitleFilterInputPath != "" {
+		subtitleInputPath = opts.subtitleFilterInputPath
+	}
+	return fmt.Sprintf("subtitles=filename='%s':si=%d", escapeFilterPath(subtitleInputPath), opts.SubtitleTrackIndex)
+}
+
+// prepareSubtitleFilterInput gives the libass subtitles filter of a text
+// burn-in its input. It stages the track on its own first
+// (stageBurnInSubtitle), because given the media file libass reads all of it
+// before the first frame. When the track can't be staged, the filter reads
+// the media file through a stable alias in the session directory, which
+// avoids passing the library filename through FFmpeg's nested filter
+// parsers: an apostrophe can be consumed by the filtergraph parser even after
+// it was escaped for the subtitles filter. Both are retained for seek
+// restarts with the rest of TranscodeOpts.
+func prepareSubtitleFilterInput(ctx context.Context, opts *TranscodeOpts) error {
 	if !opts.SubtitleBurnIn || opts.SubtitleTrackIndex < 0 || NeedsBurnIn(opts.SubtitleCodec) {
 		return nil
 	}
 
-	lowerInput := strings.ToLower(strings.TrimSpace(opts.InputPath))
-	if strings.HasPrefix(lowerInput, "http://") || strings.HasPrefix(lowerInput, "https://") {
-		// When InputPath is an HTTP/HTTPS stream URL (e.g. virtual stream playback),
-		// creating a local symlink pointing to an HTTP URL string causes libass / POSIX
-		// file I/O in FFmpeg's subtitles= filter to fail with exit status 254.
-		// Set subtitleFilterInputPath directly to opts.InputPath.
-		opts.subtitleFilterInputPath = opts.InputPath
+	staged, err := stageBurnInSubtitle(ctx, *opts)
+	if err == nil {
+		opts.subtitleFilterInputPath = staged.trackPath
+		opts.subtitleFilterFontsDir = staged.fontsDir
 		return nil
 	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	slog.InfoContext(ctx, "burn-in subtitle not staged; libass reads the media file",
+		"component", "playback", "playback_session_id", opts.SessionID, "subtitle_track", opts.SubtitleTrackIndex, "error", err)
+	opts.subtitleFilterFontsDir = ""
 
 	aliasPath := filepath.Join(opts.OutputDir, subtitleFilterAliasName)
 	// InputPath is fspath-encoded; the link must point at the real file name.
