@@ -1568,6 +1568,16 @@ func TestCopyRemuxSubtitleRenditionRealFFmpeg(t *testing.T) {
 	if _, err := exec.LookPath(ffprobePathFromFFmpeg(ffmpeg)); err != nil {
 		t.Skip("ffprobe is not installed")
 	}
+	// The fixture's cue timing assumes FFmpeg 7's copy-remux seek behavior. On
+	// FFmpeg 6 the same inputs land cues on a different seek origin (reproduced
+	// outside Silo), so the assertions below would report an environment
+	// difference, not a server regression.
+	if out, err := exec.Command(ffmpeg, "-version").Output(); err == nil {
+		var major int
+		if _, scanErr := fmt.Sscanf(string(out), "ffmpeg version %d", &major); scanErr == nil && major < 7 {
+			t.Skipf("needs FFmpeg 7 copy-remux seek behavior; found FFmpeg %d", major)
+		}
+	}
 	ctx, cancel := context.WithTimeout(t.Context(), 4*time.Minute)
 	defer cancel()
 	base, shifted := copyRemuxRealSources(ctx, t, ffmpeg)
