@@ -132,7 +132,10 @@ func documentDeclaration(op *Operation, input reflect.Type) {
 	}
 	op.Security = []map[string][]string{{securitySchemeBearer: {}}}
 	if resolvesProfile(op.Class) {
-		op.Parameters = append(op.Parameters, profileHeaderFor(op), profileTokenHeaderParam())
+		op.Parameters = append(op.Parameters, profileHeaderFor(op))
+		if op.OperationID != "exportProfile" && op.OperationID != "importProfile" && !strings.HasPrefix(op.OperationID, "getAdminBackup") && !strings.HasPrefix(op.OperationID, "listAdminBackup") && !strings.HasPrefix(op.OperationID, "previewAdminBackup") {
+			op.Parameters = append(op.Parameters, profileTokenHeaderParam())
+		}
 	}
 }
 
