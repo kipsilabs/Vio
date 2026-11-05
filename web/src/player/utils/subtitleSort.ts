@@ -240,6 +240,12 @@ export interface SubtitleAutoSelectOptions {
   preferredTrackSignature?: PlayerSubtitleTrackSignature | null;
   /** Language of the audio track that plays; null or und when unknown. */
   audioLanguage: string | null;
+  /**
+   * The profile's audio language. It is a fallback only while the playing
+   * audio's language is unknown (`null` or `und`); when the audio language is
+   * known, the #3008 rule (subtitle language, never the profile) applies.
+   */
+  profileLanguage?: string | null;
   showForcedSubtitles: boolean;
 }
 
@@ -267,12 +273,26 @@ function findForcedSubtitleIndex(
  * subtitles. Unknown audio never counts as a match.
  */
 export function resolveSubtitleAutoSelect(options: SubtitleAutoSelectOptions): number | null {
-  const { mode, tracks, preferredLanguage, preferredTrackSignature, showForcedSubtitles } = options;
+  const {
+    mode,
+    tracks,
+    preferredLanguage,
+    preferredTrackSignature,
+    showForcedSubtitles,
+    profileLanguage,
+  } = options;
   const signature = preferredTrackSignature ?? null;
 
   if (tracks.length === 0) return null;
   const preferredSubtitleLang = normalizeConcreteLanguage(preferredLanguage);
   const audioLang = normalizeConcreteLanguage(options.audioLanguage);
+  // Fork fallback, restored only for unknown audio (`null`/`und`). A known
+  // audio language keeps the #3008 rule below: the subtitle preference decides,
+  // the profile's audio language never does. The fork read the profile language
+  // as the audio language and fell back to English when it was unset.
+  const profileFallback = audioLang === null ? profileSubtitleFallback(profileLanguage) : null;
+  // Forced tracks always match the playing audio itself. Unknown audio has no
+  // language to match, even when the full-subtitle fallback below is used.
   const forcedForAudio = () =>
     showForcedSubtitles ? findForcedSubtitleIndex(tracks, audioLang) : null;
 
@@ -290,18 +310,38 @@ export function resolveSubtitleAutoSelect(options: SubtitleAutoSelectOptions): n
 
     case "auto": {
       if (preferredLanguage === "") return null;
-      if (!preferredSubtitleLang || sameLanguageCode(audioLang, preferredSubtitleLang)) {
-        return forcedForAudio();
+      // Known audio: #3008 rules. Audio in the subtitle language needs no full
+      // subtitles; other audio gets that language's best full track.
+      if (audioLang !== null) {
+        if (!preferredSubtitleLang || sameLanguageCode(audioLang, preferredSubtitleLang)) {
+          return forcedForAudio();
+        }
+        const match = findPreferredSubtitleIndexWithSignature(
+          tracks,
+          preferredSubtitleLang,
+          signature,
+        );
+        return match >= 0 ? match : null;
       }
-      const match = findPreferredSubtitleIndexWithSignature(
-        tracks,
-        preferredSubtitleLang,
-        signature,
-      );
+      // Unknown audio: the fork fallback may name a full-subtitle language when
+      // none is set. A set subtitle preference still wins.
+      const lang = preferredSubtitleLang ?? profileFallback;
+      if (!lang) return forcedForAudio();
+      const match = findPreferredSubtitleIndexWithSignature(tracks, lang, signature);
       return match >= 0 ? match : null;
     }
 
     default:
       return null;
   }
+}
+
+/**
+ * The fork's profile-language fallback, for the unknown-audio branch only.
+ * An unset profile language fell back to English in the fork; "original" and
+ * `und` resolve to no fallback, exactly as they did there.
+ */
+function profileSubtitleFallback(profileLanguage: string | null | undefined): string | null {
+  if (normalize(profileLanguage) === "") return "en";
+  return normalizeConcreteLanguage(profileLanguage);
 }

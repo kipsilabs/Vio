@@ -221,7 +221,7 @@ describe("app boot request budget", () => {
       // Includes the speed test schedule's capabilities read, which keeps the
       // connection reading current for a playback start in the first seconds,
       // and the images capability read, which sizes artwork requests.
-      total: 15,
+      total: 14,
     });
     // The shell's theme, date/time, customization and playback preference hooks
     // all resolve into one default-context batch, not one GET per hook.

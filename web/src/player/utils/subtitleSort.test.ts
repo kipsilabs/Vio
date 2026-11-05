@@ -97,6 +97,7 @@ describe("resolveSubtitleAutoSelect", () => {
     tracks?: Partial<PlayerSubtitleInfo>[];
     preferredLanguage?: string | null;
     audioLanguage?: string | null;
+    profileLanguage?: string | null;
     showForcedSubtitles?: boolean;
   };
   function opts(overrides: Options) {
@@ -105,6 +106,7 @@ describe("resolveSubtitleAutoSelect", () => {
       tracks: (overrides.tracks ?? []).map((t) => makeSub(t)),
       preferredLanguage: overrides.preferredLanguage ?? null,
       audioLanguage: overrides.audioLanguage ?? null,
+      profileLanguage: overrides.profileLanguage ?? null,
       showForcedSubtitles: overrides.showForcedSubtitles ?? true,
     };
   }
@@ -332,6 +334,51 @@ describe("resolveSubtitleAutoSelect", () => {
           tracks: [{ index: 0, language: "fr", source: "embedded" }],
           preferredLanguage: "en",
           audioLanguage: "ja",
+        },
+        null,
+      ],
+      // Fork fallback, restored only while the audio language is unknown.
+      [
+        "uses the profile language for unknown audio when no subtitle language is set",
+        {
+          mode: "auto",
+          tracks: englishAndFrench,
+          preferredLanguage: null,
+          audioLanguage: null,
+          profileLanguage: "fr",
+        },
+        2,
+      ],
+      [
+        "treats und audio as unknown for the profile fallback",
+        {
+          mode: "auto",
+          tracks: englishAndFrench,
+          preferredLanguage: null,
+          audioLanguage: "und",
+          profileLanguage: "fr",
+        },
+        2,
+      ],
+      [
+        "prefers the subtitle language over the profile fallback",
+        {
+          mode: "auto",
+          tracks: englishAndFrench,
+          preferredLanguage: "en",
+          audioLanguage: "und",
+          profileLanguage: "fr",
+        },
+        0,
+      ],
+      [
+        "keeps the profile out of a known audio language's auto choice",
+        {
+          mode: "auto",
+          tracks: englishAndFrench,
+          preferredLanguage: null,
+          audioLanguage: "ja",
+          profileLanguage: "fr",
         },
         null,
       ],

@@ -34,6 +34,7 @@ const controls = vi.hoisted(() => ({
     onSeek: (seconds: number) => void;
     activeSubtitleIndex: number | null;
     subtitleTracks: PlayerSubtitleInfo[];
+    onSubtitleSelect?: (index: number | null) => void;
     visible: boolean;
     onSkip?: { back: () => void; forward: () => void };
     skipSeconds?: { back: number; forward: number };
@@ -160,7 +161,6 @@ vi.mock("../bandwidth-probe", async (importOriginal) => {
     },
   };
 });
-vi.mock("../hooks/useKeyboardShortcuts", () => ({ useKeyboardShortcuts: vi.fn() }));
 vi.mock("../hooks/useRemuxSeeking", () => ({
   useRemuxSeeking: () => ({ handleSeek: playerSeek }),
 }));
@@ -304,6 +304,7 @@ vi.mock("./PlayerControls", () => ({
       onSeek: (seconds: number) => void;
       activeSubtitleIndex: number | null;
       subtitleTracks: PlayerSubtitleInfo[];
+      onSubtitleSelect?: (index: number | null) => void;
       visible: boolean;
       onSurfaceTap?: (event: React.MouseEvent<HTMLElement>) => void;
       isFullscreen?: boolean;
@@ -6732,7 +6733,6 @@ describe("VideoPlayer lost connection", () => {
     });
     await act(async () => Promise.resolve());
 
-    console.log("onSubtitleTrackChange calls:", onSubtitleTrackChange.mock.calls);
     expect(controls.current?.activeSubtitleIndex).toBeNull();
     // The turn-off must be the last word: an adopt echo for the initial
     // selection may precede it now that inventory resolves in stages, but no
