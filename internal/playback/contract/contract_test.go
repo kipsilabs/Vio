@@ -479,8 +479,17 @@ func TestSchemasRejectMutatedGoldenBodies(t *testing.T) {
 			body["protocol_versions"] = []any{}
 		}},
 		{"capability response that omitted a baseline feature", "capability_response.json", func(body map[string]any) {
+			// Drop a feature the schema names as baseline. The list grows
+			// additively, so slicing off the last entry would stop testing the
+			// baseline as soon as a new optional feature is appended.
 			features := body["features"].([]any)
-			body["features"] = features[:len(features)-1]
+			kept := make([]any, 0, len(features))
+			for _, feature := range features {
+				if feature != "plan_source_duration_v1" {
+					kept = append(kept, feature)
+				}
+			}
+			body["features"] = kept
 		}},
 		{"partial delivery registry", "capability_response.json", func(body map[string]any) {
 			body["deliveries"] = []any{"original_http"}
