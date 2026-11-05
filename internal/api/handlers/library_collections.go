@@ -493,11 +493,14 @@ type importCollectionResponse struct {
 	SyncRun    *models.LibraryCollectionSyncRun `json:"sync_run,omitempty"`
 }
 
+func resolveVirtualPlayback(v *bool) bool { return v != nil && *v }
+
 type applyTemplateBundleRequest struct {
-	LibraryIDs     []int                          `json:"library_ids"`
-	DryRun         bool                           `json:"dry_run"`
-	DeleteExisting bool                           `json:"delete_existing"`
-	Featured       *templateBundleFeaturedRequest `json:"featured,omitempty"`
+	LibraryIDs      []int                          `json:"library_ids"`
+	DryRun          bool                           `json:"dry_run"`
+	DeleteExisting  bool                           `json:"delete_existing"`
+	VirtualPlayback *bool                          `json:"virtual_playback,omitempty"`
+	Featured        *templateBundleFeaturedRequest `json:"featured,omitempty"`
 }
 
 type templateBundleFeaturedRequest struct {

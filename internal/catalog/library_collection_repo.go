@@ -22,6 +22,7 @@ import (
 var ErrLibraryCollectionNotFound = errors.New("library collection not found")
 
 type CreateLibraryCollectionInput struct {
+	ID                  string
 	LibraryID           int
 	LibraryIDs          []int
 	Slug                string
