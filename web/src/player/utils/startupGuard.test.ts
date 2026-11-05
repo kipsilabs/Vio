@@ -3,7 +3,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
-  MAX_STALE_GENERATION_RECOVERIES,
   STARTUP_TIMEOUT_MS,
   StartupGuard,
   isStaleGenerationError,

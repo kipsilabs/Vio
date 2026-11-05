@@ -19,7 +19,7 @@ function render(collections?: ItemCollection[], posterSize: "compact" | "standar
     <MemoryRouter>
       <UICustomizationContext.Provider
         value={{
-          cardPresentation: { poster_size: posterSize, caption: "title" },
+          cardPresentation: { poster_size: posterSize },
           cardPresentationSource: "profile_client",
           primaryMenu: null,
           primaryMenuSource: "default",

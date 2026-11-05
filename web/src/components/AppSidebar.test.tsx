@@ -245,6 +245,12 @@ describe("AppSidebar", () => {
     expect(sectionHrefs(withRequests, "Discover")).toEqual(["/requests"]);
   });
 
+  it("uses the shared platform-aware label for the search shortcut", () => {
+    const markup = renderSidebar("/");
+
+    expect(markup).toContain(`>${SEARCH_SHORTCUT_LABEL}</kbd>`);
+  });
+
   it("drops library-scoped menu targets when their library is not visible", () => {
     mockPrimaryMenu = {
       items: [
