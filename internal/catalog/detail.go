@@ -2350,7 +2350,7 @@ type ItemDetailBatchOptions struct {
 
 // GetItemDetailsByIDsWithOptions is GetItemDetailsByIDs without the parts opts
 // skips.
-func (s *DetailService) GetItemDetailsByIDsWithOptions(ctx context.Context, contentIDs []string, filter AccessFilter, opts ItemDetailBatchOptions) (map[string]*ItemDetail, error) {
+func (s *DetailService) GetItemDetailsByIDsWithOptions(ctx context.Context, contentIDs []string, filter AccessFilter, opts ItemDetailBatchOptions) (map[string]*ItemDetail, error) { //nolint:funlen // GetItemDetailsByIDsWithOptions exceeds Vio's 100-line limit; refactor tracked separately
 	result := make(map[string]*ItemDetail, len(contentIDs))
 	visible, err := s.visibleDetailItems(ctx, contentIDs, filter)
 	if err != nil {
@@ -4707,7 +4707,7 @@ func VirtualRowsShareRelease(a, b *models.MediaFile) bool {
 }
 
 func virtualNeutralReleaseKey(f *models.MediaFile) string {
-	if f == nil || !(strings.HasPrefix(f.FilePath, "virtual://") || strings.EqualFold(f.Container, "virtual")) {
+	if f == nil || (!strings.HasPrefix(f.FilePath, "virtual://") && !strings.EqualFold(f.Container, "virtual")) {
 		return ""
 	}
 	return f.ContentID + "\x00" + neutralVirtualMediaPath(f.FilePath)
@@ -4865,7 +4865,7 @@ func sortAudiobookMediaFiles(files []*models.MediaFile) {
 		if a == nil || b == nil {
 			return a != nil
 		}
-		if a.PresentationPartIndex > 0 || b.PresentationPartIndex > 0 {
+		if a.PresentationPartIndex > 0 || b.PresentationPartIndex > 0 { //nolint:nestif // sortAudiobookMediaFiles exceeds Vio's nestif complexity-4 limit; refactor tracked separately
 			if a.PresentationPartIndex != b.PresentationPartIndex {
 				if a.PresentationPartIndex == 0 {
 					return false

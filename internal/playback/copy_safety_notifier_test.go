@@ -295,7 +295,7 @@ func TestCopySafetyNotifierWaitsOutTheSettleWindowBeforeStopping(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatalf("no command pushed after the settle window; stopped = %v", control.stoppedSessions())
 		}
-		time.Sleep(time.Millisecond)
+		time.Sleep(time.Millisecond) //nolint:forbidigo // polls the notifier's asynchronous delivery
 	}
 	sent := conn.sent()
 	if command, ok := sent[0].(CommandEnvelope); !ok || command.Name != CommandPlanInvalidated {
@@ -397,7 +397,7 @@ func TestCopySafetyNotifierCompletedResultKeepsSession(t *testing.T) {
 	tracker.Ack(command.CommandID)
 	tracker.Result(command.CommandID)
 
-	time.Sleep(150 * time.Millisecond)
+	time.Sleep(150 * time.Millisecond) //nolint:forbidigo // waits past the notifier deadline to prove the settled command did not stop the session
 	if stopped := control.stoppedSessions(); len(stopped) != 0 {
 		t.Fatalf("stopped = %v, want the session kept after a completed replan", stopped)
 	}

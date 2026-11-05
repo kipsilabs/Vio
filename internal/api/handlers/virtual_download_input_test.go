@@ -164,7 +164,7 @@ func TestResolveVirtualDownloadMetadataStampsPlannerCompleteEvidence(t *testing.
 			transient.Resolution = "2160p"
 			transient.VideoTracks = []models.VideoTrack{{
 				Codec: "hevc", Width: 3840, Height: 2160,
-				VideoRange: "SDR", VideoRangeType: "SDR",
+				VideoRange: videoRangeSDR, VideoRangeType: videoRangeSDR,
 			}}
 			return transient, nil
 		},

@@ -12,13 +12,9 @@ import (
 	"github.com/google/uuid"
 )
 
-type markerUpdateSessionLookup interface {
-	GetSessionsByMediaFileID(fileID int) []*Session
-}
-
 // MarkerUpdateNotifier publishes live marker updates to active playback sessions.
 type MarkerUpdateNotifier struct {
-	sessions markerUpdateSessionLookup
+	sessions sessionLookup
 	hub      *RealtimeHub
 	sourceID string
 
@@ -34,7 +30,7 @@ type markerUpdateSnapshot struct {
 	Segments []models.MarkerSegment `json:"marker_segments"`
 }
 
-func NewMarkerUpdateNotifier(sessions markerUpdateSessionLookup, hub *RealtimeHub) *MarkerUpdateNotifier {
+func NewMarkerUpdateNotifier(sessions sessionLookup, hub *RealtimeHub) *MarkerUpdateNotifier {
 	if sessions == nil || hub == nil {
 		return nil
 	}

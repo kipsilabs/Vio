@@ -13,10 +13,6 @@ import (
 	"github.com/google/uuid"
 )
 
-type subtitleReadySessionLookup interface {
-	GetSessionsByMediaFileID(fileID int) []*Session
-}
-
 // SubtitleInventoryResolver resolves the frozen combined-ordinal inventory for
 // a file so realtime events can name a new track by its ordinal, identity, and
 // stream URL rather than leaving the client to reconstruct one.
@@ -38,7 +34,7 @@ type SubtitleInventoryResolver interface {
 // It satisfies the subtitles/ai Notifier interface structurally, keeping the ai
 // package free of any playback dependency.
 type SubtitleReadyNotifier struct {
-	sessions           subtitleReadySessionLookup
+	sessions           sessionLookup
 	hub                *RealtimeHub
 	inventory          SubtitleInventoryResolver
 	translationSession *Session
@@ -98,7 +94,7 @@ func (c timingChange) valid() bool { return c.fileID > 0 && c.syncKey != "" }
 // missing (callers treat a nil notifier as a no-op). A nil inventory resolver
 // is allowed: events then omit the track block and the client refetches its
 // plan to learn the new ordinal.
-func NewSubtitleReadyNotifier(sessions subtitleReadySessionLookup, hub *RealtimeHub, inventory SubtitleInventoryResolver) *SubtitleReadyNotifier {
+func NewSubtitleReadyNotifier(sessions sessionLookup, hub *RealtimeHub, inventory SubtitleInventoryResolver) *SubtitleReadyNotifier {
 	if sessions == nil || hub == nil {
 		return nil
 	}

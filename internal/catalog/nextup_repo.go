@@ -788,7 +788,7 @@ func (res *nextUpResolver) resolveBatch(ctx context.Context, candidates []nextUp
 	stateIDs := make(map[string]struct{})
 	inProgressBlocks := make(map[string]bool, len(candidates))
 
-	if len(regular) > 0 {
+	if len(regular) > 0 { //nolint:nestif // resolveBatch exceeds Vio's nestif complexity-4 limit; refactor tracked separately
 		episodeToSeries, err := res.repo.nextUpPostAnchorEpisodes(ctx, regular)
 		if err != nil {
 			return err
@@ -824,7 +824,7 @@ func (res *nextUpResolver) resolveBatch(ctx context.Context, candidates []nextUp
 		}
 	}
 
-	if len(special) > 0 {
+	if len(special) > 0 { //nolint:nestif // resolveBatch exceeds Vio's nestif complexity-4 limit; refactor tracked separately
 		seriesIDs := make([]string, len(special))
 		for i, candidate := range special {
 			seriesIDs[i] = candidate.SeriesID

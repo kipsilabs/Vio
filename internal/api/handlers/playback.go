@@ -100,7 +100,7 @@ func (h *PlaybackHandler) ensureUserTranscodingAllowed(w http.ResponseWriter, r 
 	}
 	if err := checker.CheckTranscodingAllowed(r.Context(), userID, requiresVideoTranscode); err != nil {
 		if errors.Is(err, playback.ErrTranscodingDisabled) {
-			writeError(w, http.StatusForbidden, "transcoding_disabled", "Transcoding is disabled for your user")
+			writeError(w, http.StatusForbidden, transcodingDisabledCode, "Transcoding is disabled for your user")
 			return false
 		}
 		if errors.Is(err, playback.ErrAudioTranscodingDisabled) {
@@ -2372,7 +2372,7 @@ func (h *PlaybackHandler) notifyStoppedSession(ctx context.Context, session *pla
 	// A realtime stop's confirmed finalizer can defer the provider event to the
 	// caller that owns the confirmed snapshot; honor that here so the finalizer
 	// does not send it twice.
-	if h.WatchScrobbler != nil && !leaveProviderNotice(ctx) {
+	if h.WatchScrobbler != nil && !leaveProviderNotice(ctx) { //nolint:nestif // notifyStoppedSession exceeds Vio's nestif complexity-4 limit; refactor tracked separately
 		if event, ok := h.scrobbleEventForStoppedSession(ctx, session, stopResult); ok && (reason.userInitiated() || stopResult.Completed) {
 			if err := h.WatchScrobbler.ScrobbleStop(ctx, event); err != nil {
 				slog.WarnContext(ctx, "failed to queue watch provider stop scrobble", "component", "api", "session", session.ID, "error", err)

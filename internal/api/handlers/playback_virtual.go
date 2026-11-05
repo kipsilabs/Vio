@@ -7887,17 +7887,17 @@ func mergeVirtualCandidateTracks(probed *models.MediaFile, candidate VirtualPlay
 	}
 	defaultProfile, defaultLevel, defaultBitDepth := defaultVirtualVideoProfileAndLevel(videoCodec, isHDR, isDV, probed.Resolution)
 	if len(probed.VideoTracks) == 0 && probed.Resolution != "" {
-		videoRange := "SDR"
-		videoRangeType := "SDR"
+		videoRange := videoRangeSDR
+		videoRangeType := videoRangeSDR
 		if isDV {
 			if dvProfile == 0 {
 				dvProfile = 8
 			}
 			videoRange = "DolbyVision"
-			videoRangeType = "DOVI"
+			videoRangeType = videoRangeDOVI
 		} else if isHDR {
 			videoRange = "HDR"
-			videoRangeType = "HDR10"
+			videoRangeType = videoRangeHDR10
 		}
 		vt := models.VideoTrack{
 			Codec:          videoCodec,
@@ -8020,7 +8020,7 @@ func mergeVirtualCandidateTracks(probed *models.MediaFile, candidate VirtualPlay
 				(strings.TrimSpace(probed.VideoTracks[i].VideoRange) == "" ||
 					strings.EqualFold(strings.TrimSpace(probed.VideoTracks[i].VideoRange), "sdr")) {
 				probed.VideoTracks[i].VideoRange = "DolbyVision"
-				probed.VideoTracks[i].VideoRangeType = "DOVI"
+				probed.VideoTracks[i].VideoRangeType = videoRangeDOVI
 			}
 			if profile != 5 && !probed.VideoTracks[i].DVConfigPresent {
 				probed.VideoTracks[i].DVConfigPresent = true
@@ -8032,8 +8032,8 @@ func mergeVirtualCandidateTracks(probed *models.MediaFile, candidate VirtualPlay
 			(strings.TrimSpace(probed.VideoTracks[i].VideoRange) == "" ||
 				strings.EqualFold(strings.TrimSpace(probed.VideoTracks[i].VideoRange), "sdr")) {
 			probed.VideoTracks[i].VideoRange = "HDR"
-			probed.VideoTracks[i].VideoRangeType = "HDR10"
-		} else if isHDR && repaintable && probed.VideoTracks[i].VideoRange == "SDR" && probed.VideoTracks[i].VideoRangeType == "" {
+			probed.VideoTracks[i].VideoRangeType = videoRangeHDR10
+		} else if isHDR && repaintable && probed.VideoTracks[i].VideoRange == videoRangeSDR && probed.VideoTracks[i].VideoRangeType == "" {
 			// A stale SDR range string the probe left without a type (the
 			// pre-type era wrote range-only rows): repaint it. A corroborated
 			// range never reaches here because repaintable was frozen false
@@ -8041,11 +8041,11 @@ func mergeVirtualCandidateTracks(probed *models.MediaFile, candidate VirtualPlay
 			// already copied range→type; kept explicit for the exact stale
 			// shape.)
 			probed.VideoTracks[i].VideoRange = "HDR"
-			probed.VideoTracks[i].VideoRangeType = "HDR10"
+			probed.VideoTracks[i].VideoRangeType = videoRangeHDR10
 		}
 		if probed.VideoTracks[i].VideoRange == "" && !probed.HDR {
-			probed.VideoTracks[i].VideoRange = "SDR"
-			probed.VideoTracks[i].VideoRangeType = "SDR"
+			probed.VideoTracks[i].VideoRange = videoRangeSDR
+			probed.VideoTracks[i].VideoRangeType = videoRangeSDR
 		}
 		if probed.VideoTracks[i].VideoRangeType == "" && probed.VideoTracks[i].VideoRange != "" {
 			probed.VideoTracks[i].VideoRangeType = probed.VideoTracks[i].VideoRange
@@ -8251,10 +8251,10 @@ func mediaFileHDRString(file *models.MediaFile) string {
 		if vt.DolbyVision != "" {
 			return vt.DolbyVision
 		}
-		if strings.EqualFold(vt.VideoRange, "DolbyVision") || strings.EqualFold(vt.VideoRangeType, "DOVI") {
+		if strings.EqualFold(vt.VideoRange, "DolbyVision") || strings.EqualFold(vt.VideoRangeType, videoRangeDOVI) {
 			return "Dolby Vision"
 		}
-		if vt.VideoRange != "" && !strings.EqualFold(vt.VideoRange, "SDR") {
+		if vt.VideoRange != "" && !strings.EqualFold(vt.VideoRange, videoRangeSDR) {
 			return vt.VideoRange
 		}
 	}

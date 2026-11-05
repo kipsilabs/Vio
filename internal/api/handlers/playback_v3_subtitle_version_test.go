@@ -29,7 +29,7 @@ func subtitleBlockedHDRFixtureV3(t *testing.T) (*PlaybackHandler, *models.MediaF
 	source.VideoTracks = []models.VideoTrack{{
 		Codec: "hevc", Profile: "main 10", Level: 153, Width: 3840, Height: 2160,
 		FrameRate: "24000/1001", Bitrate: 64_000, BitDepth: 10,
-		VideoRange: "HDR10", VideoRangeType: "HDR10",
+		VideoRange: videoRangeHDR10, VideoRangeType: videoRangeHDR10,
 	}}
 	source.SubtitleTracks = []models.SubtitleTrack{{Index: 4, Codec: "hdmv_pgs_subtitle", Language: "eng", Title: "English"}}
 
@@ -43,7 +43,7 @@ func subtitleBlockedHDRFixtureV3(t *testing.T) (*PlaybackHandler, *models.MediaF
 	alternate.VideoTracks = []models.VideoTrack{{
 		Codec: "h264", Profile: "high", Level: 41, Width: 1920, Height: 1080,
 		FrameRate: "24000/1001", Bitrate: 8_000, BitDepth: 8,
-		VideoRange: "SDR", VideoRangeType: "SDR",
+		VideoRange: videoRangeSDR, VideoRangeType: videoRangeSDR,
 	}}
 	alternate.SubtitleTracks = nil
 
@@ -255,7 +255,7 @@ func TestHandleReplanPlaybackV3OutputChangeReturnsToRequestedEditionAheadOfOther
 	lower.VideoTracks = []models.VideoTrack{{
 		Codec: "h264", Profile: "high", Level: 31, Width: 1280, Height: 720,
 		FrameRate: "24000/1001", Bitrate: 3_000, BitDepth: 8,
-		VideoRange: "SDR", VideoRangeType: "SDR",
+		VideoRange: videoRangeSDR, VideoRangeType: videoRangeSDR,
 	}}
 	handler.FileVersionFetcher = testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{
 		active.ContentID: {active, requested, lower},

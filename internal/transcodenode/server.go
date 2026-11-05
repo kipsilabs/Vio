@@ -289,6 +289,9 @@ type HealthResponse struct {
 // whose audience vanished (e.g. a v3 replan retired its transport id and a
 // stale in-flight token resurrected the old one) encodes to end-of-file for
 // nobody.
+// nodeTypeTranscode is the node-type label a transcode worker reports.
+const nodeTypeTranscode = "transcode"
+
 const sessionIdleTTL = 10 * time.Minute
 
 // sessionReapInterval is how often the idle reaper sweeps for stale jobs.
@@ -2005,7 +2008,7 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		SubtitleRenditionSource: req.SubtitleRenditionSource,
 		TotalDuration:           req.TotalDuration,
 		FastStart:               true,
-		NodeType:                "transcode",
+		NodeType:                nodeTypeTranscode,
 		ExecutionMode:           "transcode_node",
 		FFmpegLogSink:           s.ffmpegSink,
 	}
@@ -2144,7 +2147,7 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		SessionID:   req.SessionID,
 		NodeURL:     s.tracker.NodeURL(),
 		NodeName:    s.tracker.NodeName(),
-		Type:        "transcode",
+		Type:        nodeTypeTranscode,
 		CodecVideo:  req.TargetCodecVideo,
 		CodecAudio:  req.TargetCodecAudio,
 		Resolution:  req.TargetResolution,
@@ -2345,7 +2348,8 @@ func recipeIsComplete(card playback.RecipeCard) bool {
 // single-flight in reconstructFromToken, so it is the sole writer racing to
 // register sessionID. Returns nil if the spawn fails or the slot wait is canceled.
 func (s *Server) spawnReconstruct(r *http.Request, sessionID string, requestedSegment int, card playback.RecipeCard) (*playback.TranscodeSession, error) {
-	defer s.trackInFlight()()
+	trackDone := s.trackInFlight()
+	defer trackDone()
 	if !s.validSessionID(sessionID) {
 		slog.WarnContext(r.Context(), "transcode node reconstruct session id rejected", "component", "transcodenode", "session", sessionID)
 		return nil, nil
@@ -2391,7 +2395,7 @@ func (s *Server) spawnReconstruct(r *http.Request, sessionID string, requestedSe
 	opts.HWAccel = cfg.Playback.HWAccel
 	opts.HWDevice = cfg.Playback.HWDevice
 	opts.SegmentRetentionSeconds = cfg.Playback.SegmentRetentionSeconds
-	opts.NodeType = "transcode"
+	opts.NodeType = nodeTypeTranscode
 	opts.ExecutionMode = "transcode_node"
 	if toneMapRecipeRequested(opts) {
 		err := s.resolveToneMapRecipe(context.WithoutCancel(r.Context()), &opts)
@@ -2542,7 +2546,7 @@ func (s *Server) spawnReconstruct(r *http.Request, sessionID string, requestedSe
 		SessionID:   sessionID,
 		NodeURL:     s.tracker.NodeURL(),
 		NodeName:    s.tracker.NodeName(),
-		Type:        "transcode",
+		Type:        nodeTypeTranscode,
 		CodecVideo:  card.TargetCodecVideo,
 		CodecAudio:  card.TargetCodecAudio,
 		Resolution:  card.TargetResolution,

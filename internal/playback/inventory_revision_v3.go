@@ -25,11 +25,7 @@ func ComputeInventoryRevisionV3(status string, audio []AudioInventoryItemV3, sub
 	if len(source) > 0 {
 		i = source[0]
 	}
-	b, e := json.Marshal(inventoryRevisionEnvelopeV3{status, audio, subs, i.EffectiveMediaFileID, i.EffectiveVirtualURI, i.VirtualSourceRevision})
-	if e != nil {
-		h := sha256.Sum256([]byte(fmt.Sprintf("%s:%d:%d", status, len(audio), len(subs))))
-		return fmt.Sprintf("inv:%x", h[:16])
-	}
+	b, _ := json.Marshal(inventoryRevisionEnvelopeV3{status, audio, subs, i.EffectiveMediaFileID, i.EffectiveVirtualURI, i.VirtualSourceRevision})
 	h := sha256.Sum256(b)
 	return fmt.Sprintf("inv:%x", h[:16])
 }

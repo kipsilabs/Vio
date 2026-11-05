@@ -86,7 +86,7 @@ func playedAudioIndexV3(file *models.MediaFile, index int) int {
 	return index
 }
 
-func ResolveSubtitlePolicyV3(file *models.MediaFile, request StartRequestV3, transcodeAllowed bool, deliveryClass string, additional []SubtitleInventoryEntryV3, audioIndex int, facts SubtitleTrackFactsV3) SubtitlePolicyResultV3 {
+func ResolveSubtitlePolicyV3(file *models.MediaFile, request StartRequestV3, transcodeAllowed bool, deliveryClass string, additional []SubtitleInventoryEntryV3, audioIndex int, facts SubtitleTrackFactsV3) SubtitlePolicyResultV3 { //nolint:funlen,gocyclo // ResolveSubtitlePolicyV3 exceeds Vio's 100-line and complexity-30 limits; refactor tracked separately
 	index := -1
 	if request.SubtitleTrackIndex != nil {
 		index = *request.SubtitleTrackIndex

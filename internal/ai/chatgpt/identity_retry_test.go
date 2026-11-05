@@ -152,7 +152,7 @@ func TestLoginRetriesTransientIdentityMetadata(t *testing.T) {
 	}
 }
 
-func TestLoginIdentityRetryHonorsRetryAfterAndExhaustion(t *testing.T) {
+func TestLoginIdentityRetryHonorsRetryAfterAndExhaustion(t *testing.T) { //nolint:gocyclo // TestLoginIdentityRetryHonorsRetryAfterAndExhaustion exceeds Vio's complexity-30 limit; refactor tracked separately
 	key := testSigningKey(t)
 	for _, test := range []struct {
 		name   string

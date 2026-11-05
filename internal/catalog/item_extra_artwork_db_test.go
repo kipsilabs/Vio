@@ -84,7 +84,7 @@ func TestItemExtraArtworkSlotsRoundTripDB(t *testing.T) {
 	}
 }
 
-func TestItemBackdropRepositoryDB(t *testing.T) {
+func TestItemBackdropRepositoryDB(t *testing.T) { //nolint:gocyclo // TestItemBackdropRepositoryDB exceeds Vio's complexity-30 limit; refactor tracked separately
 	pool := newTestPool(t)
 	ctx := context.Background()
 	items := NewItemRepository(pool)

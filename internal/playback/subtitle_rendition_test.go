@@ -1345,8 +1345,8 @@ func TestCopyHLSVideoRange(t *testing.T) {
 	for _, tc := range []struct {
 		name, transfer, filter, sampleEntry, want string
 	}{
-		{"HDR10", "smpte2084", "", VideoSampleEntryHVC1, HLSVideoRangePQ},
-		{"HLG", "arib-std-b67", "", "", HLSVideoRangeHLG},
+		{"HDR10", colorTransferPQ, "", VideoSampleEntryHVC1, HLSVideoRangePQ},
+		{"HLG", colorTransferHLG, "", "", HLSVideoRangeHLG},
 		{"SDR", "bt709", "", "", ""},
 		// Dolby Vision 8.2 has an SDR base layer.
 		{"Dolby Vision SDR base", "bt709", "", VideoSampleEntryDVH1, ""},

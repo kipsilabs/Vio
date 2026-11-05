@@ -316,15 +316,15 @@ func virtualVideoTrackFromDescriptorV3(source playback.SourceDescriptorV3) model
 func virtualVideoRangeTypeFromDescriptorV3(source playback.SourceDescriptorV3) string {
 	switch source.DynamicRange {
 	case playback.DynamicRangeDolbyVisionV3:
-		return "DOVI"
+		return videoRangeDOVI
 	case playback.DynamicRangeHDR10PlusV3:
 		return "HDR10Plus"
 	case playback.DynamicRangeHLGV3:
-		return "HLG"
+		return videoRangeHLG
 	case playback.DynamicRangeHDR10V3:
-		return "HDR10"
+		return videoRangeHDR10
 	case playback.DynamicRangeSDRV3:
-		return "SDR"
+		return videoRangeSDR
 	default:
 		return ""
 	}
@@ -386,7 +386,7 @@ func fillVirtualVideoTrackFromDescriptorV3(track *models.VideoTrack, source play
 	// the route resolver can trust, so the whole DV block is gated on the
 	// descriptor naming a profile — the same fail-closed posture the previous
 	// reconstruction used. Within that, each sub-field is a gap fill.
-	if source.DVProfile > 0 {
+	if source.DVProfile > 0 { //nolint:nestif // fillVirtualVideoTrackFromDescriptorV3 exceeds Vio's nestif complexity-4 limit; refactor tracked separately
 		if track.DVProfile == 0 {
 			track.DVProfile = source.DVProfile
 		}
@@ -439,12 +439,12 @@ func virtualReplanRotationExhaustedV3(err error) bool {
 		strings.Contains(msg, "provider unavailable")
 }
 
-func classifyVirtualReplanExhaustionV3(initialVirtualErr error, candidateErrs []*candidateErrorV3) *transportErrorV3 {
+func classifyVirtualReplanExhaustionV3(initialVirtualErr error, candidateErrs []*candidateV3Error) *transportErrorV3 { //nolint:funlen,gocyclo // classifyVirtualReplanExhaustionV3 exceeds Vio's 100-line and complexity-30 limits; refactor tracked separately
 	var joinedErr error
 	if initialVirtualErr != nil {
 		joinedErr = initialVirtualErr
 	}
-	var highestCandidate *candidateErrorV3
+	var highestCandidate *candidateV3Error
 	highestPriority := -1
 	for _, ce := range candidateErrs {
 		if ce != nil {
@@ -463,8 +463,8 @@ func classifyVirtualReplanExhaustionV3(initialVirtualErr error, candidateErrs []
 
 	if errors.Is(initialVirtualErr, context.DeadlineExceeded) && (highestCandidate == nil || highestCandidate.Stage == candidateStageResolve) {
 		return &transportErrorV3{
-			reason:    "replan_virtual_input_timeout",
-			message:   "Virtual stream input resolution timed out during replan.",
+			reason:    replanVirtualInputTimeoutReasonV3,
+			message:   replanVirtualInputTimeoutMessageV3,
 			retryable: true,
 			cause:     joinedErr,
 		}
@@ -473,8 +473,8 @@ func classifyVirtualReplanExhaustionV3(initialVirtualErr error, candidateErrs []
 		if ce != nil && ce.Stage == candidateStageResolve && errors.Is(ce.Err, context.DeadlineExceeded) {
 			if highestCandidate == nil || highestCandidate.Stage == candidateStageResolve {
 				return &transportErrorV3{
-					reason:    "replan_virtual_input_timeout",
-					message:   "Virtual stream input resolution timed out during replan.",
+					reason:    replanVirtualInputTimeoutReasonV3,
+					message:   replanVirtualInputTimeoutMessageV3,
 					retryable: true,
 					cause:     joinedErr,
 				}
@@ -559,7 +559,7 @@ func classifyVirtualReplanExhaustionV3(initialVirtualErr error, candidateErrs []
 			}
 		case candidateStageTranscodePerm:
 			return &transportErrorV3{
-				reason:    "transcoding_disabled",
+				reason:    transcodingDisabledCode,
 				message:   "The required server adaptation is disabled for this user.",
 				retryable: false,
 				cause:     joinedErr,
@@ -575,7 +575,7 @@ func classifyVirtualReplanExhaustionV3(initialVirtualErr error, candidateErrs []
 	}
 
 	return &transportErrorV3{
-		reason:    "virtual_source_unavailable",
+		reason:    virtualSourceUnavailableReasonV3,
 		message:   "The virtual source could not be refreshed for playback.",
 		retryable: true,
 		cause:     joinedErr,
@@ -626,7 +626,7 @@ const (
 	candidateStageSubtitleArtifact candidateFailureStage = "subtitle_artifact"
 )
 
-type candidateErrorV3 struct {
+type candidateV3Error struct {
 	Stage          candidateFailureStage
 	Reason         string
 	Message        string
@@ -662,7 +662,7 @@ func candidateStagePriority(s candidateFailureStage) int {
 	}
 }
 
-func (e *candidateErrorV3) Error() string {
+func (e *candidateV3Error) Error() string {
 	if e == nil {
 		return ""
 	}
@@ -672,7 +672,7 @@ func (e *candidateErrorV3) Error() string {
 	return fmt.Sprintf("[%s] %s", e.Stage, e.Message)
 }
 
-func (e *candidateErrorV3) Unwrap() error {
+func (e *candidateV3Error) Unwrap() error {
 	if e == nil {
 		return nil
 	}
@@ -685,7 +685,7 @@ func (e *candidateErrorV3) Unwrap() error {
 // changes the release less than skipping it for a sibling that also cannot
 // honor the selection. A video/transport rejection is deliberately excluded so
 // the genuine failover paths are untouched.
-func candidateSubtitleLocalFailureV3(err *candidateErrorV3) bool {
+func candidateSubtitleLocalFailureV3(err *candidateV3Error) bool {
 	if err == nil {
 		return false
 	}
@@ -716,21 +716,21 @@ func (h *PlaybackHandler) evaluateReplanCandidateV3(
 	plannerSettings playback.PlannerSettingsV3,
 	plannerSettingsErr error,
 	attemptedKeys []string,
-) (*candidateEvaluationV3, *candidateErrorV3) {
+) (*candidateEvaluationV3, *candidateV3Error) {
 	if candidateAlternate == nil {
-		return nil, &candidateErrorV3{Stage: candidateStageResolve, Message: "nil candidate alternate"}
+		return nil, &candidateV3Error{Stage: candidateStageResolve, Message: "nil candidate alternate"}
 	}
 	candidateFile, candidateProvenance, err := h.prepareVirtualAlternateFileV3(r, candidateAlternate, record.ProfileID)
 	if err != nil || candidateFile == nil {
 		if err == nil {
 			err = errors.New("candidate alternate unavailable")
 		}
-		return nil, &candidateErrorV3{Stage: candidateStageResolve, Message: fmt.Sprintf("candidate %d resolution failed", candidateAlternate.ID), Err: err}
+		return nil, &candidateV3Error{Stage: candidateStageResolve, Message: fmt.Sprintf("candidate %d resolution failed", candidateAlternate.ID), Err: err}
 	}
 	return h.evaluatePreparedReplanCandidateV3(r, session, record, req, baseStart, sourceFile, candidateFile, candidateProvenance, plannerRequestedFile, plannerSettings, plannerSettingsErr, attemptedKeys, false)
 }
 
-func (h *PlaybackHandler) evaluatePreparedReplanCandidateV3(
+func (h *PlaybackHandler) evaluatePreparedReplanCandidateV3( //nolint:funlen // evaluatePreparedReplanCandidateV3 exceeds Vio's 100-line limit; refactor tracked separately
 	r *http.Request,
 	session *playback.Session,
 	record *playback.AttemptRecordV3,
@@ -744,7 +744,7 @@ func (h *PlaybackHandler) evaluatePreparedReplanCandidateV3(
 	plannerSettingsErr error,
 	attemptedKeys []string,
 	planOnly bool,
-) (*candidateEvaluationV3, *candidateErrorV3) {
+) (*candidateEvaluationV3, *candidateV3Error) {
 	candidateStart := baseStart
 	// A carried selection was minted against the plan-time inventory. Use the
 	// session's captured evidence as the remap source for a virtual session:
@@ -753,11 +753,11 @@ func (h *PlaybackHandler) evaluatePreparedReplanCandidateV3(
 	// still names the previous release's track.
 	remapSource := h.replanRemapSourceV3(r.Context(), sourceFile, session, nil).file
 	if err := remapAudioSelectionV3(remapSource, candidateFile, &candidateStart); err != nil {
-		return nil, &candidateErrorV3{Stage: candidateStageAudioRemap, Message: fmt.Sprintf("candidate %d audio remap failed", candidateFile.ID), Err: err}
+		return nil, &candidateV3Error{Stage: candidateStageAudioRemap, Message: fmt.Sprintf("candidate %d audio remap failed", candidateFile.ID), Err: err}
 	}
 	candidateAudioIndex, _, err := resolveV3AudioIndex(candidateFile, candidateStart.AudioTrackID, candidateStart.AudioTrackIndex)
 	if err != nil {
-		return nil, &candidateErrorV3{Stage: candidateStageAudioRemap, Message: fmt.Sprintf("candidate %d audio track resolve failed", candidateFile.ID), Err: err}
+		return nil, &candidateV3Error{Stage: candidateStageAudioRemap, Message: fmt.Sprintf("candidate %d audio track resolve failed", candidateFile.ID), Err: err}
 	}
 	var candidateResult playback.PlannerResultV3
 	var candidateToneMapErr error
@@ -786,14 +786,14 @@ func (h *PlaybackHandler) evaluatePreparedReplanCandidateV3(
 			start:      candidateStart,
 			result:     candidateResult,
 			toneMapErr: candidateToneMapErr,
-		}, &candidateErrorV3{Stage: candidateStageSubtitleRemap, TerminalReason: terminalSubtitleUnavailableInVersionV3, Message: fmt.Sprintf("candidate %d subtitle remap failed", candidateFile.ID), Err: err}
+		}, &candidateV3Error{Stage: candidateStageSubtitleRemap, TerminalReason: terminalSubtitleUnavailableInVersionV3, Message: fmt.Sprintf("candidate %d subtitle remap failed", candidateFile.ID), Err: err}
 	} else {
 		candidateStart.FileID = candidateFile.ID
 		if _, err := candidateStart.NormalizeAndValidate(); err != nil {
-			return nil, &candidateErrorV3{Stage: candidateStageNormalize, Message: fmt.Sprintf("candidate %d normalize failed", candidateFile.ID), Err: err}
+			return nil, &candidateV3Error{Stage: candidateStageNormalize, Message: fmt.Sprintf("candidate %d normalize failed", candidateFile.ID), Err: err}
 		}
 		if err := preflightPlaybackFile(r.Context(), candidateFile, h.MissingMarker, h.EventsHub); err != nil {
-			return nil, &candidateErrorV3{Stage: candidateStagePreflight, Message: fmt.Sprintf("candidate %d preflight failed", candidateFile.ID), Err: err}
+			return nil, &candidateV3Error{Stage: candidateStagePreflight, Message: fmt.Sprintf("candidate %d preflight failed", candidateFile.ID), Err: err}
 		}
 		candidateResult, candidateToneMapErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{
 			Request: candidateStart, RequestedFile: plannerRequestedFile, EffectiveFile: candidateFile,
@@ -812,14 +812,14 @@ func (h *PlaybackHandler) evaluatePreparedReplanCandidateV3(
 			start:      candidateStart,
 			result:     candidateResult,
 			toneMapErr: candidateToneMapErr,
-		}, &candidateErrorV3{Stage: candidateStagePlan, TerminalReason: candidateResult.Terminal.Reason, Message: fmt.Sprintf("candidate %d planner terminal %s: %s", candidateFile.ID, candidateResult.Terminal.Reason, candidateResult.Terminal.Message)}
+		}, &candidateV3Error{Stage: candidateStagePlan, TerminalReason: candidateResult.Terminal.Reason, Message: fmt.Sprintf("candidate %d planner terminal %s: %s", candidateFile.ID, candidateResult.Terminal.Reason, candidateResult.Terminal.Message)}
 	}
 
 	candidateResult.Plan.SessionID = session.ID
 	var candidateReservationHeld bool
 	if checker, ok := h.sessionMgr.(replacementAdmissionCheckerV3); ok {
 		if err := checker.CheckReplacementAllowed(r.Context(), session.ID, candidateResult.PlayMethod, candidateResult.TranscodeAudio); err != nil {
-			return nil, &candidateErrorV3{Stage: candidateStageAdmission, Message: fmt.Sprintf("candidate %d replacement admission denied", candidateFile.ID), Err: err}
+			return nil, &candidateV3Error{Stage: candidateStageAdmission, Message: fmt.Sprintf("candidate %d replacement admission denied", candidateFile.ID), Err: err}
 		}
 		_, candidateReservationHeld = h.sessionMgr.(replacementReservationCancellerV3)
 	}
@@ -835,7 +835,7 @@ func (h *PlaybackHandler) evaluatePreparedReplanCandidateV3(
 	if checker, ok := h.sessionMgr.(transcodePermissionChecker); ok && (candidateResult.PlayMethod == playback.PlayTranscode || candidateResult.TranscodeAudio) {
 		if err := checker.CheckTranscodingAllowed(r.Context(), session.UserID, candidateResult.PlayMethod == playback.PlayTranscode); err != nil {
 			cancelCandidateReservation()
-			return nil, &candidateErrorV3{Stage: candidateStageTranscodePerm, Message: fmt.Sprintf("candidate %d transcoding disallowed", candidateFile.ID), Err: err}
+			return nil, &candidateV3Error{Stage: candidateStageTranscodePerm, Message: fmt.Sprintf("candidate %d transcoding disallowed", candidateFile.ID), Err: err}
 		}
 	}
 
@@ -857,7 +857,7 @@ func (h *PlaybackHandler) evaluatePreparedReplanCandidateV3(
 		if transportErr.cause != nil {
 			errMsg = fmt.Sprintf("%s (%v)", transportErr.message, logredact.SanitizeURLError(transportErr.cause))
 		}
-		return nil, &candidateErrorV3{Stage: candidateStageTransport, Reason: transportErr.reason, Message: fmt.Sprintf("candidate %d transport preparation failed (%s): %s", candidateFile.ID, transportErr.reason, errMsg), TransportErr: transportErr, Err: transportErr.cause}
+		return nil, &candidateV3Error{Stage: candidateStageTransport, Reason: transportErr.reason, Message: fmt.Sprintf("candidate %d transport preparation failed (%s): %s", candidateFile.ID, transportErr.reason, errMsg), TransportErr: transportErr, Err: transportErr.cause}
 	}
 
 	applyTransportToneMapModeV3(&candidateResult, candTransport)
@@ -865,14 +865,14 @@ func (h *PlaybackHandler) evaluatePreparedReplanCandidateV3(
 	if frozenErr != nil {
 		candTransport.rollback()
 		cancelCandidateReservation()
-		return nil, &candidateErrorV3{Stage: candidateStageRecipe, Message: fmt.Sprintf("candidate %d freeze recipe failed", candidateFile.ID), Err: frozenErr}
+		return nil, &candidateV3Error{Stage: candidateStageRecipe, Message: fmt.Sprintf("candidate %d freeze recipe failed", candidateFile.ID), Err: frozenErr}
 	}
 
 	candidateResult.Plan.Stream.URL = candTransport.url
 	if err := h.attachSubtitleArtifactV3(r.Context(), session.ID, candidateFile, candidateResult.Plan, candidateResult.SubtitleTrackIndex, &candidateFrozenRecipe, req.ClientFeatures); err != nil {
 		candTransport.rollback()
 		cancelCandidateReservation()
-		return nil, &candidateErrorV3{Stage: candidateStageSubtitleArtifact, Message: fmt.Sprintf("candidate %d attach subtitle artifact failed", candidateFile.ID), Err: err}
+		return nil, &candidateV3Error{Stage: candidateStageSubtitleArtifact, Message: fmt.Sprintf("candidate %d attach subtitle artifact failed", candidateFile.ID), Err: err}
 	}
 
 	return &candidateEvaluationV3{
@@ -898,7 +898,7 @@ func (h *PlaybackHandler) evaluateSubtitleDegradedCandidateV3(
 	plannerSettings playback.PlannerSettingsV3,
 	plannerSettingsErr error,
 	attemptedKeys []string,
-) (*candidateEvaluationV3, *candidateErrorV3) {
+) (*candidateEvaluationV3, *candidateV3Error) {
 	degradedStart := subtitleDegradedStartV3(baseStart)
 	eval, evalErr := h.evaluateReplanCandidateV3(r, session, record, req, degradedStart, sourceFile, candidateAlternate, plannerRequestedFile, plannerSettings, plannerSettingsErr, attemptedKeys)
 	if eval != nil {
@@ -919,9 +919,9 @@ func (h *PlaybackHandler) evaluateSubtitleDegradeInPlaceV3(
 	plannerSettings playback.PlannerSettingsV3,
 	plannerSettingsErr error,
 	attemptedKeys []string,
-) (*candidateEvaluationV3, *candidateErrorV3) {
+) (*candidateEvaluationV3, *candidateV3Error) {
 	if file == nil {
-		return nil, &candidateErrorV3{Stage: candidateStageResolve, Message: "nil same-release subtitle degrade target"}
+		return nil, &candidateV3Error{Stage: candidateStageResolve, Message: "nil same-release subtitle degrade target"}
 	}
 	degradedStart := subtitleDegradedStartV3(baseStart)
 	eval, evalErr := h.evaluatePreparedReplanCandidateV3(r, session, record, req, degradedStart, file, file, provenance, plannerRequestedFile, plannerSettings, plannerSettingsErr, attemptedKeys, true)
@@ -935,14 +935,14 @@ func (h *PlaybackHandler) evaluateSubtitleDegradeInPlaceV3(
 		// try a playable sibling.
 		audioIndex, _, indexErr := resolveV3AudioIndex(file, eval.start.AudioTrackID, eval.start.AudioTrackIndex)
 		if indexErr != nil {
-			return nil, &candidateErrorV3{Stage: candidateStageAudioRemap, Message: "subtitle degrade audio track resolve failed", Err: indexErr}
+			return nil, &candidateV3Error{Stage: candidateStageAudioRemap, Message: "subtitle degrade audio track resolve failed", Err: indexErr}
 		}
 		input := h.plannerInputV3(r.Context(), eval.start, plannerRequestedFile, file, audioIndex, attemptedKeys, provenance)
 		escalated, escalateErr := h.escalateRefusedProgressiveRemuxV3(
 			r.Context(), headerAuthenticatedMediaV3(eval.start.ClientFeatures),
 			func() playback.PlannerInputV3 { return input }, eval.result)
 		if escalateErr != nil {
-			return nil, &candidateErrorV3{Stage: candidateStageTransport, Reason: escalateErr.reason, Message: escalateErr.message, TransportErr: escalateErr, Err: escalateErr.cause}
+			return nil, &candidateV3Error{Stage: candidateStageTransport, Reason: escalateErr.reason, Message: escalateErr.message, TransportErr: escalateErr, Err: escalateErr.cause}
 		}
 		eval.result = escalated
 	}

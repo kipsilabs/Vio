@@ -1,8 +1,9 @@
 package playback
 
 import (
-	"github.com/Silo-Server/silo-server/internal/models"
 	"reflect"
+
+	"github.com/Silo-Server/silo-server/internal/models"
 )
 
 // DesiredTracksV3 is the audio and subtitle the viewer asked for during one

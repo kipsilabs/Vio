@@ -365,7 +365,7 @@ func TestBufferedAutoPicksTheBestFittingVersion(t *testing.T) {
 			track := source.VideoTracks[0]
 			track.Codec, track.Bitrate = tc.codec, 30_000
 			if !tc.hdr {
-				track.Profile, track.Level, track.BitDepth, track.VideoRange, track.VideoRangeType = "high", 51, 8, "SDR", "SDR"
+				track.Profile, track.Level, track.BitDepth, track.VideoRange, track.VideoRangeType = "high", 51, 8, videoRangeSDR, videoRangeSDR
 			}
 			lower.VideoTracks = []models.VideoTrack{track}
 			handler.FileVersionFetcher = testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{source.ContentID: {source, sdr, lower}}}

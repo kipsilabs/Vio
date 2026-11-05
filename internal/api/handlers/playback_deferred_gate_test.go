@@ -625,7 +625,7 @@ func TestTerminalSaveCollisionKeepsSurfaceGuard(t *testing.T) {
 		if v2 {
 			ctx = WithNativeAPIV2(ctx)
 		}
-		terminal := playback.NewTerminalResponseV3("source_unavailable", "The provider listed no streams for this title.", true)
+		terminal := playback.NewTerminalResponseV3(sourceUnavailableReason, "The provider listed no streams for this title.", true)
 		return h.persistTerminalStartDecisionV3(ctx, 1, "profile-1", req, digests, 42, 42, terminal)
 	}
 
@@ -679,13 +679,13 @@ func TestTerminalSaveCollisionKeepsSurfaceGuard(t *testing.T) {
 		// skipped for it: a terminal collision must still replay through the
 		// other surface. This is the exception the playable-only guard protects.
 		rec := record("attempt-tsc-terminal", deferred, deferred)
-		rec.StartResponse = playback.NewTerminalResponseV3("source_unavailable", "The provider listed no streams for this title.", true)
+		rec.StartResponse = playback.NewTerminalResponseV3(sourceUnavailableReason, "The provider listed no streams for this title.", true)
 		h := seedTerminalSaveCollisionStore(t, rec)
 		response, err := call(t, h, false, "attempt-tsc-terminal", deferred)
 		if err != nil {
 			t.Fatalf("cross-surface terminal collision = %v, want the terminal replay", err)
 		}
-		if response.Terminal == nil || response.Terminal.Reason != "source_unavailable" {
+		if response.Terminal == nil || response.Terminal.Reason != sourceUnavailableReason {
 			t.Fatalf("cross-surface terminal collision = %#v, want the terminal replay", response)
 		}
 	})

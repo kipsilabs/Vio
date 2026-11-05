@@ -3,8 +3,9 @@ package handlers
 import (
 	"context"
 	"encoding/json"
-	"github.com/Silo-Server/silo-server/internal/playback"
 	"time"
+
+	"github.com/Silo-Server/silo-server/internal/playback"
 )
 
 type staleFirstGetAttemptPlanStoreV3 struct {

@@ -144,7 +144,7 @@ func TestResolveSourceClassifiesPQByRange(t *testing.T) {
 	}{
 		{name: "HDR10 limited", dynamicRange: DynamicRangeHDR10, colorRange: "tv", want: SourcePQ},
 		{name: "HDR10 full", dynamicRange: DynamicRangeHDR10, colorRange: "pc", want: SourcePQFullRange, wantPreflight: true},
-		{name: "HDR10 jpeg", dynamicRange: DynamicRangeHDR10, colorRange: "jpeg", want: SourcePQFullRange, wantPreflight: true},
+		{name: "HDR10 jpeg", dynamicRange: DynamicRangeHDR10, colorRange: rangeJPEG, want: SourcePQFullRange, wantPreflight: true},
 		{name: "HDR10 untagged range", dynamicRange: DynamicRangeHDR10, colorRange: "", want: SourcePQ, wantPreflight: true},
 		{name: "HDR10+ full", dynamicRange: DynamicRangeHDR10Plus, colorRange: "pc", want: SourcePQFullRange, wantPreflight: true},
 		{name: "HLG full stays rejected by preflight", dynamicRange: DynamicRangeHLG, colorRange: "pc", want: SourceHLG, wantPreflight: true},
@@ -205,7 +205,7 @@ func TestSoftwareToneMapReadsFullRangePQAtItsOwnLevels(t *testing.T) {
 	// picture from black to about 1,000 nits, the peak the graphs map from,
 	// with saturated chroma.
 	sources := map[string]string{}
-	for _, levels := range []struct{ ffmpeg, zimg string }{{"tv", "limited"}, {"pc", "full"}} {
+	for _, levels := range []struct{ ffmpeg, zimg string }{{"tv", "limited"}, {"pc", rangeFull}} {
 		// Y4M carries the range into the decoded frames, as a bitstream does.
 		path := filepath.Join(dir, "source-"+levels.ffmpeg+".y4m")
 		run(t, "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=1,format=gbrp,lutrgb=r=val*0.75:g=val*0.75:b=val*0.75",

@@ -300,9 +300,9 @@ func virtualStartUnresolvedTerminalV3(resolveErr error) playback.DecisionRespons
 	case errors.Is(resolveErr, resolver.ErrProviderUnavailable):
 		return playback.NewTerminalResponseV3(providerUnavailableReasonV3, "The virtual source provider is temporarily unavailable.", true)
 	case strings.Contains(strings.ToLower(fmt.Sprint(resolveErr)), "no streams available"):
-		return playback.NewTerminalResponseV3("virtual_source_unavailable", "The provider listed no streams for this title.", true)
+		return playback.NewTerminalResponseV3(virtualSourceUnavailableReasonV3, "The provider listed no streams for this title.", true)
 	default:
-		return playback.NewTerminalResponseV3("virtual_source_unavailable", "The virtual source could not be resolved for playback.", true)
+		return playback.NewTerminalResponseV3(virtualSourceUnavailableReasonV3, "The virtual source could not be resolved for playback.", true)
 	}
 }
 

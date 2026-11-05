@@ -14,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Silo-Server/silo-server/internal/tonemap"
 )
 
 // An HLS subtitle rendition delivers the selected embedded text track inside
@@ -41,6 +43,13 @@ import (
 // SubtitleRenditionQueryParam selects a playlist of a session that publishes
 // a subtitle rendition. Absent, master.m3u8 answers the multivariant playlist.
 const SubtitleRenditionQueryParam = "silo_rendition"
+
+// colorTransferPQ and colorTransferHLG are the transfer-characteristic
+// spellings a container carries; tonemap owns the canonical values.
+const (
+	colorTransferPQ  = tonemap.ColorTransferPQ
+	colorTransferHLG = tonemap.ColorTransferHLG
+)
 
 const (
 	subtitleRenditionVideo     = "video"
@@ -71,6 +80,9 @@ const (
 	// encode; a single variant only uses it as a startup hint.
 	subtitleRenditionDefaultVideoKbps = 8000
 	subtitleRenditionDefaultAudioKbps = 192
+	// hlsAttributeYes is the EXT-X-MEDIA DEFAULT/FORCED value HLS spells in
+	// upper case.
+	hlsAttributeYes = "YES"
 )
 
 // SubtitleRenditionCodecSupported reports whether ffmpeg can write a source
@@ -864,33 +876,6 @@ func ParseSubtitleSegmentNumber(name string) (int, bool) {
 	return segNum, true
 }
 
-func (s *TranscodeSession) generateCopySubtitlePlaylist(segPrefix, rawQuery, track string) []byte {
-	queryCount := len(s.copyPlan.durations)
-	if s.opts.TotalDuration > 0 {
-		queryCount = syntheticSegmentCount(s.opts.TotalDuration, s.opts.SegmentDuration)
-	}
-	queryDefinition, suffix, queryVersion := syntheticManifestQuery(queryCount, rawQuery)
-	version := max(3, queryVersion)
-	var out bytes.Buffer
-	out.WriteString("#EXTM3U\n")
-	fmt.Fprintf(&out, "#EXT-X-VERSION:%d\n", version)
-	out.WriteString(queryDefinition)
-	playlistType := "VOD"
-	if strings.EqualFold(s.Opts().TargetCodecVideo, "copy") {
-		playlistType = "EVENT"
-	}
-	fmt.Fprintf(&out, "#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:%s\n", playlistType)
-	for i, d := range s.copyPlan.durations {
-		name := subtitleSegmentPrefix + fmt.Sprintf("%05d", i) + subtitleSegmentExt
-		if track != "" {
-			name = subtitleSegmentPrefix + track + "_" + fmt.Sprintf("%05d", i) + subtitleSegmentExt
-		}
-		fmt.Fprintf(&out, "#EXTINF:%.6f,\n%s\n", d, segPrefix+name+suffix)
-	}
-	out.WriteString("#EXT-X-ENDLIST\n")
-	return out.Bytes()
-}
-
 // HasSubtitleRendition reports whether this session publishes a subtitle
 // rendition, so master.m3u8 is a multivariant playlist.
 func (s *TranscodeSession) HasSubtitleRendition() bool {
@@ -981,15 +966,6 @@ func subtitleSegmentURI(uri []byte, namePrefix string) []byte {
 	return renamed
 }
 
-func anyDefaultTrack(tracks []SubtitleRenditionTrack) bool {
-	for _, track := range tracks {
-		if track.Default {
-			return true
-		}
-	}
-	return false
-}
-
 // subtitleRenditionMultivariantPlaylist lists the transcode as one variant
 // whose SUBTITLES group holds the selected track. Both URIs are master.m3u8
 // relative to itself, so the playlist works behind every relay path.
@@ -1046,7 +1022,7 @@ func subtitleRenditionMultivariantPlaylist(opts TranscodeOpts, query string) []b
 		name := hlsQuotedStringValue(names[i])
 		language := track.Language
 		if language == "" {
-			language = "und"
+			language = langUndetermined
 		}
 		trackURI := "master.m3u8?" + SubtitleRenditionQueryParam + "=" + subtitleRenditionSubtitles
 		if len(tracks) > 1 {
@@ -1056,14 +1032,14 @@ func subtitleRenditionMultivariantPlaylist(opts TranscodeOpts, query string) []b
 			trackURI += "&" + query
 		}
 		languageAttr := ""
-		if language != "" && language != "und" {
-			if language == "eng" {
+		if language != "" && language != langUndetermined {
+			if language == "eng" { //nolint:goconst // ISO 639-2 code listed verbatim beside its sibling tags
 				language = "en"
 			}
 			languageAttr = fmt.Sprintf(",LANGUAGE=%q", language)
 		}
 		fmt.Fprintf(&buf, "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=%q,NAME=%q%s,DEFAULT=%s,AUTOSELECT=YES,FORCED=%s,URI=%q\n",
-			SubtitleRenditionGroupID, name, languageAttr, map[bool]string{true: "YES", false: "NO"}[track.Default], map[bool]string{true: "YES", false: "NO"}[track.Forced], trackURI)
+			SubtitleRenditionGroupID, name, languageAttr, map[bool]string{true: hlsAttributeYes, false: "NO"}[track.Default], map[bool]string{true: hlsAttributeYes, false: "NO"}[track.Forced], trackURI)
 	}
 	var rangeAttr string
 	if opts.VideoRange != "" {
@@ -1079,13 +1055,13 @@ func CopyHLSVideoRange(transfer, filter, sampleEntry string) string {
 	if filter == DV7ToHDR10BitstreamFilter {
 		return HLSVideoRangePQ
 	}
-	if sampleEntry == VideoSampleEntryDVH1 && transfer == "unknown" {
+	if sampleEntry == VideoSampleEntryDVH1 && transfer == "unknown" { //nolint:goconst // Probe vocabulary sentinel, not only a language code
 		return HLSVideoRangePQ
 	}
-	if transfer == "smpte2084" {
+	if transfer == colorTransferPQ {
 		return HLSVideoRangePQ
 	}
-	if transfer == "arib-std-b67" {
+	if transfer == colorTransferHLG {
 		return HLSVideoRangeHLG
 	}
 	return ""

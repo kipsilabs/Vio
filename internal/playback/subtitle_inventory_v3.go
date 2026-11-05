@@ -17,6 +17,9 @@ const (
 	SubtitleSourceExternalV3   = "external"
 	SubtitleSourceEmbeddedV3   = "embedded"
 	SubtitleSourceDownloadedV3 = "downloaded"
+	// subtitleCodecAribCaption is the ARIB caption codec, which has no
+	// validated client render path.
+	subtitleCodecAribCaption = "arib_caption"
 )
 
 // Sidecar file extensions the stream handler serves a subtitle track as. The
@@ -137,7 +140,7 @@ func BuildSubtitleInventoryV3(file *models.MediaFile, additional []SubtitleInven
 		streamIndex := track.Index
 		item.StreamIndex = &streamIndex
 		item.ContainerTrackID = track.ContainerTrackID
-		item.Unplayable = normalizeCodecV3(track.Codec) == "arib_caption" || normalizeCodecV3(track.Codec) == ""
+		item.Unplayable = normalizeCodecV3(track.Codec) == subtitleCodecAribCaption || normalizeCodecV3(track.Codec) == ""
 		items = append(items, item)
 	}
 	for index, entry := range additional {

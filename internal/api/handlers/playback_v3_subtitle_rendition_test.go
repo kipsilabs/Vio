@@ -467,7 +467,7 @@ func switchOnDemandRenditionV3(t *testing.T, handler *PlaybackHandler, request p
 		replan.SelectedTracks.Subtitle = &playback.TrackIdentityV3{ID: playback.TrackIDV3(request.FileID, "subtitle", *selected), Index: selected}
 	}
 	if recovery {
-		replan.Operation, replan.Failure = playback.ReplanOperationFailureRecoveryV3, playback.FailureV3{Classification: "subtitle_track_changed"}
+		replan.Operation, replan.Failure = playback.ReplanOperationFailureRecoveryV3, playback.FailureV3{Classification: failureSubtitleTrackChangedV3}
 	}
 	caller := PlaybackCaller{UserID: 1, ProfileID: "profile-1", InstallationID: serviceInstallation}
 	response, err := handler.ReplanPlaybackV2(newAuthorizedPlaybackContext(), caller, sessionID,

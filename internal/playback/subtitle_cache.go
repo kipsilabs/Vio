@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -1150,7 +1151,7 @@ func (c *SubtitleCache) ServeSUPExtract(w http.ResponseWriter, r *http.Request, 
 	// Reserve before committing response headers. If another request owns the
 	// fill, wait here so a committed result can use ServeContent (and retain
 	// range/Last-Modified semantics) rather than becoming a streamed 200.
-	if c != nil {
+	if c != nil { //nolint:nestif // ServeSUPExtract exceeds Vio's nestif complexity-4 limit; refactor tracked separately
 		reserved, inflight := c.reserveFill(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, subtitleFormatSUP, true)
 		if reserved != nil {
 			reserved.Discard()
@@ -1730,7 +1731,7 @@ func (c *SubtitleCache) lookup(inputPath string, args ...interface{}) (f *os.Fil
 	if len(args) == 3 {
 		cacheIdentity, _ = args[0].(string)
 		trackIndex, _ = args[1].(int)
-		format, _ = args[2].(string)
+		format, _ = args[2].(string) //nolint:gosec // The index is guarded by len(args) == 3 above.
 	} else if len(args) == 2 {
 		trackIndex, _ = args[0].(int)
 		format, _ = args[1].(string)
@@ -2127,7 +2128,7 @@ func VirtualSubtitleCacheIdentity(fileID int, virtualSourceURI string, trackInde
 	}
 	if inv != "" {
 		sum := sha256.Sum256([]byte(fmt.Sprintf("%d|%s|%d|%s", fileID, pinned, trackIndex, inv)))
-		return fmt.Sprintf("%x", sum[:12])
+		return hex.EncodeToString(sum[:12])
 	}
 	sum := sha256.Sum256([]byte(fmt.Sprintf("%d|%s|%d", fileID, pinned, trackIndex)))
 	return fmt.Sprintf("%x", sum[:12])
@@ -2145,7 +2146,7 @@ func VirtualSubtitleCacheIdentity(fileID int, virtualSourceURI string, trackInde
 // artifact for cosmetic changes.
 func SubtitleInventoryToken(tracks []models.SubtitleTrack) string {
 	if len(tracks) == 0 {
-		return "none"
+		return "none" //nolint:goconst // Conditional-playback sentinel; other "none" literals in this package mean different values
 	}
 	var b strings.Builder
 	for _, track := range tracks {
@@ -2163,7 +2164,7 @@ func SubtitleInventoryToken(tracks []models.SubtitleTrack) string {
 		b.WriteByte('|')
 	}
 	sum := sha256.Sum256([]byte(b.String()))
-	return fmt.Sprintf("%x", sum[:8])
+	return hex.EncodeToString(sum[:8])
 }
 
 // LookupFontBundle returns the cached encoded font-bundle JSON for the key, or

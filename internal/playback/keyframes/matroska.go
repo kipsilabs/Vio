@@ -555,7 +555,7 @@ func walkCuePoints(cues []byte, video uint64, fn func(ticks uint64, cluster int6
 					case idCueTrack:
 						track = readUint(v)
 					case idCueClusterPosition:
-						pos = int64(readUint(v))
+						pos = int64(readUint(v)) //nolint:gosec // A cue cluster position is a container offset; negative or out-of-range values are rejected when seeked.
 					case idCueReference:
 						dependent = true
 					case idCueCodecState:

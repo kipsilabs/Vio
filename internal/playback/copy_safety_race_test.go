@@ -163,7 +163,7 @@ func waitForStop(t *testing.T, control *fakeCopySafetyControl, sessionID string)
 		if time.Now().After(deadline) {
 			t.Fatalf("stopped = %v, want the copy-routed session %q", stopped, sessionID)
 		}
-		time.Sleep(time.Millisecond)
+		time.Sleep(time.Millisecond) //nolint:forbidigo // polls observable session state after a race scan
 	}
 }
 
@@ -187,7 +187,7 @@ func TestCopySafetyRaceKeepsSessionsWhenCopySafe(t *testing.T) {
 	race.RaceScan(100)
 
 	waitForScans(t, scanner, 1)
-	time.Sleep(20 * time.Millisecond)
+	time.Sleep(20 * time.Millisecond) //nolint:forbidigo // gives the asynchronous verdict a settle window before asserting the scan did not run
 	if stopped := control.stoppedSessions(); len(stopped) != 0 {
 		t.Fatalf("stopped = %v, want no session touched by a copy-safe verdict", stopped)
 	}
@@ -242,7 +242,7 @@ func TestCopySafetyRaceSkipsFilesWithNothingToScan(t *testing.T) {
 
 	race.RaceScan(100)
 
-	time.Sleep(20 * time.Millisecond)
+	time.Sleep(20 * time.Millisecond) //nolint:forbidigo // gives the asynchronous verdict a settle window before asserting the other file stays untouched
 	if got := scanner.scanCount(); got != 0 {
 		t.Fatalf("scans = %d, want 0 when the verdict is already known", got)
 	}
@@ -343,7 +343,7 @@ func TestCopySafetyRaceIgnoresAVerdictForASupersededGeneration(t *testing.T) {
 	race.RaceScan(100)
 
 	waitForScans(t, scanner, 1)
-	time.Sleep(20 * time.Millisecond)
+	time.Sleep(20 * time.Millisecond) //nolint:forbidigo // lets queued scans reach the concurrency cap before observing it
 	if stopped := control.stoppedSessions(); len(stopped) != 0 {
 		t.Fatalf("stopped = %v, want no session withdrawn on a verdict for bytes it is not playing", stopped)
 	}
@@ -452,7 +452,7 @@ func TestCopySafetyRaceCapsConcurrentScans(t *testing.T) {
 	}
 
 	waitForScans(t, scanner, copySafetyScanConcurrency)
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(50 * time.Millisecond) //nolint:forbidigo // gives a skipped scan a settle window before asserting it never ran
 	if got := scanner.scanCount(); got != copySafetyScanConcurrency {
 		t.Fatalf("scans = %d, want %d in flight while every slot is held", got, copySafetyScanConcurrency)
 	}
@@ -489,7 +489,7 @@ func TestCopySafetyRaceForPlanOnlyChasesCopyRoutes(t *testing.T) {
 				waitForScans(t, scanner, tc.wantScans)
 				return
 			}
-			time.Sleep(20 * time.Millisecond)
+			time.Sleep(20 * time.Millisecond) //nolint:forbidigo // polls the loader's observable load count
 			if got := scanner.scanCount(); got != 0 {
 				t.Fatalf("scans = %d, want 0 for delivery %q", got, tc.delivery)
 			}
@@ -519,7 +519,7 @@ func waitForLoads(t *testing.T, loader *fakeFileLoader, want int) {
 		if time.Now().After(deadline) {
 			t.Fatalf("file loads = %d, want %d", loader.loadCount(), want)
 		}
-		time.Sleep(time.Millisecond)
+		time.Sleep(time.Millisecond) //nolint:forbidigo // polls the scanner's observable scan count
 	}
 }
 
@@ -533,6 +533,6 @@ func waitForScans(t *testing.T, scanner *fakeCopySafetyScanner, want int) {
 		if time.Now().After(deadline) {
 			t.Fatalf("scans = %d, want %d", scanner.scanCount(), want)
 		}
-		time.Sleep(time.Millisecond)
+		time.Sleep(time.Millisecond) //nolint:forbidigo // polls the scanner's observable scan count
 	}
 }

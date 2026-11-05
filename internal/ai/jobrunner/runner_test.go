@@ -130,7 +130,7 @@ func TestCancelWhileQueuedCallsOnAbort(t *testing.T) {
 	}
 }
 
-// The run context is cancelled by Cancel(id) so an in-flight job can stop.
+// The run context is canceled by Cancel(id) so an in-flight job can stop.
 func TestCancelRunningJobCancelsContext(t *testing.T) {
 	r := New(context.Background(), NewSemaphore(1), &fakeStore{}, "test", nil)
 	started := make(chan struct{})

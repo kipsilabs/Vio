@@ -9,9 +9,10 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/redis/go-redis/v9"
+
 	"github.com/Silo-Server/silo-server/internal/clientip"
 	"github.com/Silo-Server/silo-server/internal/netaccess"
-	"github.com/redis/go-redis/v9"
 )
 
 func testAttemptRedisClient(t *testing.T) *redis.Client {

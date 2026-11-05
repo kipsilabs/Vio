@@ -38,6 +38,9 @@ const (
 	DynamicRangeHDR10       = "hdr10"
 	ColorTransferHLG        = "arib-std-b67"
 	ColorTransferPQ         = "smpte2084"
+	// FFmpeg's names for full-range video levels.
+	rangeFull = "full"
+	rangeJPEG = "jpeg"
 
 	colorBT709             = "bt709"
 	colorBT2020            = "bt2020"
@@ -492,7 +495,7 @@ func colorIsBT2020(value string) bool {
 
 // rangeIsFull recognizes FFmpeg's names for full-range video levels.
 func rangeIsFull(value string) bool {
-	return value == "pc" || value == "full" || value == "jpeg"
+	return value == "pc" || value == rangeFull || value == rangeJPEG
 }
 
 // rangeIsLimited recognizes FFmpeg's names for limited-range video levels.
@@ -503,7 +506,7 @@ func rangeIsLimited(value string) bool {
 // rangeIsValid recognizes supported color range values (limited and full);
 // virtual sources frequently report pc/full/jpeg where local files say tv.
 func rangeIsValid(value string) bool {
-	return rangeIsLimited(value) || value == "pc" || value == "full" || value == "jpeg"
+	return rangeIsLimited(value) || value == "pc" || value == rangeFull || value == rangeJPEG
 }
 
 // SourceKindFor maps already trusted dynamic-range metadata to a base signal.

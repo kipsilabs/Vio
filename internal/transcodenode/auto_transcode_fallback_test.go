@@ -87,7 +87,7 @@ func autoTranscodeStartRequest(req TranscodeStartRequest) TranscodeStartRequest 
 
 func TestHandleStartRequireReadyAutoKeepsGPUEncodeWithCPUDecode(t *testing.T) {
 	server := newTestServer(t)
-	server.tracker = nodesessions.NewTracker(nil, "http://node", "node", "transcode")
+	server.tracker = nodesessions.NewTracker(nil, "http://node", "node", nodeTypeTranscode)
 	ffmpegPath, logPath := writeNodeFFmpegFailingOn(t, "-hwaccel cuda")
 	server.watcher.Config().Playback.FFmpegPath = ffmpegPath
 	useAutoNVENCPipeline(t, server)
@@ -163,7 +163,7 @@ func TestHandleStartAutoReplacementFailureLeavesLiveSession(t *testing.T) {
 
 func TestSpawnReconstructAutoKeepsGPUEncodeWithCPUDecode(t *testing.T) {
 	server := newTestServer(t)
-	server.tracker = nodesessions.NewTracker(nil, "http://node", "node", "transcode")
+	server.tracker = nodesessions.NewTracker(nil, "http://node", "node", nodeTypeTranscode)
 	ffmpegPath, logPath := writeNodeFFmpegFailingOn(t, "-hwaccel cuda")
 	cfg := server.watcher.Config()
 	cfg.Playback.FFmpegPath = ffmpegPath
@@ -197,7 +197,7 @@ func TestSpawnReconstructAutoKeepsGPUEncodeWithCPUDecode(t *testing.T) {
 
 func TestHandleStartRequireReadyKeepsVideoToolboxSoftwareRetry(t *testing.T) {
 	server := newTestServer(t)
-	server.tracker = nodesessions.NewTracker(nil, "http://node", "node", "transcode")
+	server.tracker = nodesessions.NewTracker(nil, "http://node", "node", nodeTypeTranscode)
 	fakePath, logPath := writeNodeFFmpegFailingOn(t, "h264_videotoolbox")
 	// Answer the VideoToolbox capability probes, then hand real transcodes to
 	// the fake that fails hardware encodes.
@@ -224,7 +224,7 @@ func TestHandleStartRequireReadyKeepsVideoToolboxSoftwareRetry(t *testing.T) {
 // the first manifest and walk the safer paths.
 func TestHandleStartAutoFallbackReadyWalksEnabledPipeline(t *testing.T) {
 	server := newTestServer(t)
-	server.tracker = nodesessions.NewTracker(nil, "http://node", "node", "transcode")
+	server.tracker = nodesessions.NewTracker(nil, "http://node", "node", nodeTypeTranscode)
 	ffmpegPath, logPath := writeNodeFFmpegFailingOn(t, "-hwaccel cuda")
 	server.watcher.Config().Playback.FFmpegPath = ffmpegPath
 	useAutoNVENCPipeline(t, server)
@@ -239,7 +239,7 @@ func TestHandleStartAutoFallbackReadyWalksEnabledPipeline(t *testing.T) {
 // software encoder would otherwise be closed at the readiness deadline.
 func TestHandleStartAutoFallbackReadyWithoutPipelineDoesNotWait(t *testing.T) {
 	server := newTestServer(t)
-	server.tracker = nodesessions.NewTracker(nil, "http://node", "node", "transcode")
+	server.tracker = nodesessions.NewTracker(nil, "http://node", "node", nodeTypeTranscode)
 	// Capability queries finish immediately; only the software encode is slow.
 	useFakeFFmpeg(t, server, "#!/bin/sh\ncase \" $* \" in\n*' -f hls '*) exec sleep 30 ;;\nesac\n")
 	server.autoTranscodePipelineFn = func(ctx context.Context, opts playback.TranscodeOpts) *playback.AutoTranscodePipeline {

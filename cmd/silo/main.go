@@ -2563,7 +2563,7 @@ func main() {
 			userStoreProvider = pgstore.NewPostgresProvider(deps.DB)
 			slog.Info("user store initialized", "backend", "postgres")
 		}
-		defer userStoreProvider.Close()
+		defer func() { _ = userStoreProvider.Close() }()
 	}
 
 	var policySystem *policy.System
@@ -4162,7 +4162,7 @@ func main() {
 
 	// Run non-critical startup work in the background so it doesn't delay the
 	// HTTP listener from accepting connections. Steps run sequentially and stop
-	// early if the app context is cancelled (shutdown).
+	// early if the app context is canceled (shutdown).
 	if len(backgroundInit) > 0 {
 		go func() {
 			start := time.Now()

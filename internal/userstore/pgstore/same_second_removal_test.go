@@ -13,7 +13,7 @@ import (
 // removal hides everything at or before its watermark, to the microsecond. A
 // write later in the same second as the removal must stay visible, while one
 // at or before the removal stays hidden.
-func TestImportedWritesAfterSameSecondRemovalDB(t *testing.T) {
+func TestImportedWritesAfterSameSecondRemovalDB(t *testing.T) { //nolint:funlen,gocyclo // TestImportedWritesAfterSameSecondRemovalDB exceeds Vio's 100-line and complexity-30 limits; refactor tracked separately
 	pool := testPool(t)
 	ctx := t.Context()
 	userID := seedTestUser(t, pool, "same-second-removal")

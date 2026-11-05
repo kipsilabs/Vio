@@ -657,7 +657,7 @@ func TestStopFinalizationLifecycleWaitBoundedByDeadline(t *testing.T) {
 		unlock := f.handler.tm.LockSessionLifecycle(f.session.ID)
 		holderDone := make(chan struct{})
 		go func() {
-			time.Sleep(6 * time.Second)
+			time.Sleep(6 * time.Second) //nolint:forbidigo // holds the lifecycle lock past the stop deadline; the delay is the scenario under test
 			unlock()
 			close(holderDone)
 		}()

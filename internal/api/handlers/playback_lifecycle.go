@@ -305,21 +305,6 @@ func (h *PlaybackHandler) SessionPauseReported(ctx context.Context, sessionID st
 	}
 }
 
-// publishSequencedPause announces a pause or resume a native client's
-// accepted progress made (ApplyProgress commits it with the sample).
-func (h *PlaybackHandler) publishSequencedPause(ctx context.Context, sessionID string, change *playback.LifecycleChangeV3) {
-	if change == nil {
-		return
-	}
-	if _, ok := h.lifecycleEventsReady(); !ok {
-		return
-	}
-	t := LifecycleTransition{SessionID: sessionID, Seq: change.Seq, At: change.At, State: lifecycleState(change.Paused)}
-	ctx, cancel := lifecycleContext(ctx)
-	defer cancel()
-	h.publishLifecycle(ctx, t, PlaybackSessionsQuery{SessionID: sessionID})
-}
-
 // lifecycleWriteTimeout bounds the lifecycle work a start or a progress
 // report does inline, so a stalled database or event bus delays the request
 // by at most this much.

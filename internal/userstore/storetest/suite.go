@@ -12,9 +12,10 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/crypto/bcrypt"
+
 	"github.com/Silo-Server/silo-server/internal/auth/passwordhash"
 	"github.com/Silo-Server/silo-server/internal/userstore"
-	"golang.org/x/crypto/bcrypt"
 )
 
 // RunMarkWatchedBatch checks series and season mark-watched behavior on each backend.

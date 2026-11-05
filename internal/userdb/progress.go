@@ -1257,7 +1257,7 @@ func inHistoryCutoffTx(db *sql.DB, op string, fn func(*sql.Tx) error) error {
 	if err != nil {
 		return fmt.Errorf("begin %s: %w", op, err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	if err := fn(tx); err != nil {
 		return err
 	}

@@ -277,7 +277,7 @@ func TestPrepareFileDoesNotDropHardwareToneMapGraphOnSoftwareRetry(t *testing.T)
 	}
 	track := models.VideoTrack{
 		Codec: "hevc", Profile: "Main 10", Level: 153, Width: 3840, Height: 2160, FrameRate: "23.976",
-		ColorRange: "tv", ColorPrimaries: "bt2020", ColorTransfer: "smpte2084", ColorSpace: "bt2020nc",
+		ColorRange: "tv", ColorPrimaries: "bt2020", ColorTransfer: colorTransferPQ, ColorSpace: "bt2020nc",
 		BitDepth: 10, PixelFormat: "yuv420p10le",
 	}
 	revision := tonemap.RevisionForFile(&models.MediaFile{ID: 42, FileSize: info.Size(), VideoTracks: []models.VideoTrack{track}})

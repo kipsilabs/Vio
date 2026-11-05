@@ -3,9 +3,10 @@ package handlers
 import (
 	"context"
 	"fmt"
+	"time"
+
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
-	"time"
 )
 
 type cueIndexReadsKeyV3 struct{}

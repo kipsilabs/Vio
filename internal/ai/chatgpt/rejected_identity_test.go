@@ -37,7 +37,7 @@ func newRejectedIdentityFixture(t *testing.T, key *rsa.PrivateKey, unbound bool)
 	return f
 }
 
-func TestLoginRevokesDifferentReturningIdentity(t *testing.T) {
+func TestLoginRevokesDifferentReturningIdentity(t *testing.T) { //nolint:funlen,gocyclo // TestLoginRevokesDifferentReturningIdentity exceeds Vio's 100-line and complexity-30 limits; refactor tracked separately
 	key := testSigningKey(t)
 	for _, test := range []struct {
 		name                                          string
@@ -159,7 +159,7 @@ func TestLoginRevokesDifferentReturningIdentity(t *testing.T) {
 	}
 }
 
-func TestLoginRejectedIdentityRevocationRetriesAndBounds(t *testing.T) {
+func TestLoginRejectedIdentityRevocationRetriesAndBounds(t *testing.T) { //nolint:gocyclo // TestLoginRejectedIdentityRevocationRetriesAndBounds exceeds Vio's complexity-30 limit; refactor tracked separately
 	key := testSigningKey(t)
 	for _, target := range []string{"discovery", "revocation"} {
 		for _, outcome := range []string{"recovered", "exhausted", "deadline", "long delay"} {

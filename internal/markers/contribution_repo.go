@@ -75,9 +75,9 @@ func NewContributionStore(pool *pgxpool.Pool) *ContributionStore {
 // amend is sent the new value for a target it already holds.
 func ContentHash(segmentKind string, startMs, endMs, durationMs *int64, parts ...string) string {
 	h := sha256.New()
-	fmt.Fprintf(h, "%s|%s|%s|%s", segmentKind, ptrIntStr(startMs), ptrIntStr(endMs), ptrIntStr(durationMs))
+	_, _ = fmt.Fprintf(h, "%s|%s|%s|%s", segmentKind, ptrIntStr(startMs), ptrIntStr(endMs), ptrIntStr(durationMs))
 	for _, part := range parts {
-		fmt.Fprintf(h, "|%s", part)
+		_, _ = fmt.Fprintf(h, "|%s", part)
 	}
 	return hex.EncodeToString(h.Sum(nil))[:32]
 }

@@ -147,7 +147,7 @@ func newDecodeRotationFixture(t *testing.T, opt decodeRotationOptions) *decodeRo
 	source.VideoTracks = []models.VideoTrack{{
 		Codec: "hevc", Profile: "Main", Level: 120, Width: 1920, Height: 1080,
 		FrameRate: "24000/1001", Bitrate: 8_000, BitDepth: 8,
-		VideoRange: "SDR", VideoRangeType: "SDR",
+		VideoRange: videoRangeSDR, VideoRangeType: videoRangeSDR,
 	}}
 	source.Container = "virtual"
 	if opt.probeEvidence {

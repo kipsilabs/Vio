@@ -51,7 +51,7 @@ func TestFixedSourceAllowsIndependentViewerQuality(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			file := detailedFixtureFileV3()
 			file.VideoTracks[0].ColorPrimaries = "bt2020"
-			file.VideoTracks[0].ColorTransfer = "smpte2084"
+			file.VideoTracks[0].ColorTransfer = colorTransferPQ
 			file.VideoTracks[0].ColorSpace = "bt2020nc"
 			if test.sourceSDR {
 				file.VideoTracks[0].VideoRange = "SDR"

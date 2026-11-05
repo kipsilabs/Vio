@@ -56,7 +56,7 @@ func TestRemoteCompatSegmentEndsHungBodyBeforeViewerCancellation(t *testing.T) {
 		var recovered any
 		func() {
 			defer func() { recovered = recover() }()
-			handler.proxyRemoteCompatSegment(rr, req, scheme+"://hung-node.test", "remote-session", "seg_00007.ts")
+			_ = handler.proxyRemoteCompatSegment(rr, req, scheme+"://hung-node.test", "remote-session", "seg_00007.ts")
 		}()
 		if ctx.Err() != nil {
 			t.Fatalf("segment relay waits for viewer cancellation: elapsed = %v, request error = %v", time.Since(started), ctx.Err())

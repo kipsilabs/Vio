@@ -115,7 +115,7 @@ func ExtractSubtitleFromZip(data []byte, target DownloadTarget) ([]byte, Subtitl
 	case first != nil:
 		return readZipEntry(first)
 	}
-	return nil, "", fmt.Errorf("no subtitle file found in zip archive")
+	return nil, "", errors.New("no subtitle file found in zip archive")
 }
 
 // readZipEntry reads an entry whose name has a subtitle extension.

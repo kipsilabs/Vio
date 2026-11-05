@@ -1573,7 +1573,7 @@ func listRenderDevices(driDir string) []string {
 	var accessible []string
 	for _, dev := range matches {
 		if f, err := os.Open(dev); err == nil {
-			f.Close()
+			_ = f.Close()
 			accessible = append(accessible, dev)
 		}
 	}

@@ -2472,7 +2472,7 @@ func TestReconstructFromToken_TokenlessWithoutARecipeIsNotFound(t *testing.T) {
 func TestHandleStop_DeletesRecipe(t *testing.T) {
 	const sid = "stop-sess-1"
 	s := newTestServer(t)
-	s.tracker = nodesessions.NewTracker(nil, "node-url", "node-name", "transcode")
+	s.tracker = nodesessions.NewTracker(nil, "node-url", "node-name", nodeTypeTranscode)
 	store := &stubRecipeStore{}
 	s.SetRecipeStore(store)
 
@@ -2515,7 +2515,7 @@ func TestHandleStop_KeepsRecipeMovedToAnotherNode(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := newTestServer(t)
-			s.tracker = nodesessions.NewTracker(nil, "node-url", "node-name", "transcode")
+			s.tracker = nodesessions.NewTracker(nil, "node-url", "node-name", nodeTypeTranscode)
 			s.nodeRowID = func() (int, bool) { return tc.nodeRowID, true }
 			s.registeredNodeURL = func() (string, bool) { return "http://old:9000", true }
 			card := tc.card
@@ -2561,7 +2561,7 @@ func TestHandleStop_JudgesRecipeByTheIdentityTheJobStartedUnder(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := newTestServer(t)
-			s.tracker = nodesessions.NewTracker(nil, "node-url", "node-name", "transcode")
+			s.tracker = nodesessions.NewTracker(nil, "node-url", "node-name", nodeTypeTranscode)
 			s.nodeRowID = func() (int, bool) { return tc.currentID, tc.currentID > 0 }
 			s.registeredNodeURL = func() (string, bool) { return tc.currentURL, tc.currentURL != "" }
 			card := tc.card
@@ -2608,7 +2608,7 @@ func TestForceReloadTeardownKeepsRecipeMovedToAnotherNode(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := newTestServer(t)
-			s.tracker = nodesessions.NewTracker(nil, "node-url", "node-name", "transcode")
+			s.tracker = nodesessions.NewTracker(nil, "node-url", "node-name", nodeTypeTranscode)
 			s.nodeRowID = func() (int, bool) { return 1, true }
 			s.registeredNodeURL = func() (string, bool) { return "http://old:9000", true }
 			card := tc.card
@@ -2645,7 +2645,7 @@ func TestHandleStop_LateSegmentDoesNotRebuildStoppedTranscode(t *testing.T) {
 	}
 	newNode := func() *Server {
 		s := newTestServer(t)
-		s.tracker = nodesessions.NewTracker(nil, "http://node", "node", "transcode")
+		s.tracker = nodesessions.NewTracker(nil, "http://node", "node", nodeTypeTranscode)
 		s.watcher.Config().Playback.FFmpegPath = ffmpegPath
 		return s
 	}
@@ -2724,7 +2724,7 @@ func TestHandleStop_LateSegmentDoesNotRebuildStoppedTranscode(t *testing.T) {
 func TestHandleStart_LiftsStopFence(t *testing.T) {
 	const sessionID = "sess-restarted-after-stop"
 	s := newTestServer(t)
-	s.tracker = nodesessions.NewTracker(nil, "http://node", "node", "transcode")
+	s.tracker = nodesessions.NewTracker(nil, "http://node", "node", nodeTypeTranscode)
 	ffmpegPath := filepath.Join(t.TempDir(), "looping-ffmpeg.sh")
 	if err := os.WriteFile(ffmpegPath, []byte("#!/bin/sh\nwhile :; do sleep 0.1; done\n"), 0o755); err != nil {
 		t.Fatal(err)
@@ -2767,7 +2767,7 @@ func TestHandleStart_LiftsStopFence(t *testing.T) {
 // TranscodeSessions Close without ffmpeg, so this runs without a real spawn.
 func TestReapIdleSessions_ClosesOnlyIdleJobs(t *testing.T) {
 	s := newTestServer(t)
-	s.tracker = nodesessions.NewTracker(nil, "node-url", "node-name", "transcode")
+	s.tracker = nodesessions.NewTracker(nil, "node-url", "node-name", nodeTypeTranscode)
 
 	s.sessions["fresh-1"] = &playback.TranscodeSession{}
 	s.sessions["stale-1"] = &playback.TranscodeSession{}

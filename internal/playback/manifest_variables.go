@@ -87,20 +87,6 @@ func manifestVariable(name, value string, minSavingPerURI int) (definition, refe
 	return fmt.Sprintf("#EXT-X-DEFINE:NAME=\"%s\",VALUE=\"%s\"", name, value), reference
 }
 
-// syntheticManifestQuery returns the header line, URI suffix, and minimum HLS
-// version for a playlist the server builds whose segmentCount URIs all end in
-// ?rawQuery.
-func syntheticManifestQueryVariables(segmentCount int, rawQuery string) (definition, suffix string, minVersion int) {
-	if rawQuery == "" {
-		return "", "", 0
-	}
-	definition, reference := manifestVariable(manifestQueryVariable, rawQuery, 1)
-	if definition == "" || int64(segmentCount)*int64(len(rawQuery)-len(reference)) < minManifestQuerySubstitutionSavings {
-		return "", "?" + rawQuery, 0
-	}
-	return definition + "\n", "?" + reference, manifestVariableMinVersion
-}
-
 // isMediaPlaylist reports whether lines form a media playlist rather than a
 // multivariant playlist. EXT-X-TARGETDURATION is required in every media
 // playlist, including a growing EVENT playlist that lists no segment yet, and

@@ -2677,7 +2677,7 @@ func (h *PlaybackHandler) handlePlaybackReport(w http.ResponseWriter, r *http.Re
 	// report, not just on track changes. Restarting ffmpeg on each report
 	// (every ~10s) tears down segments the player is still appending and
 	// causes an hls.js retry loop. Only act when the index actually changes.
-	if (!stop || !unidentified) && req.AudioStreamIndex != nil && audioSelectionChanged(playSession, req.MediaSourceID, req.AudioStreamIndex.value) {
+	if (!stop || !unidentified) && req.AudioStreamIndex != nil && audioSelectionChanged(playSession, req.MediaSourceID, req.AudioStreamIndex.value) { //nolint:nestif // handlePlaybackReport exceeds Vio's nestif complexity-4 limit; refactor tracked separately
 		selectedAudioStreamIndex := req.AudioStreamIndex.value
 		updatedPlaySession, updatedSource, restarted, selectionErr := h.applyCompatAudioSelection(
 			r.Context(), playSession, req.MediaSourceID, selectedAudioStreamIndex, positionSeconds,
@@ -4126,8 +4126,8 @@ func mediaSourceByFileID(session *PlaybackSession, fileID int) *PlaybackMediaSou
 	}
 	for _, source := range session.MediaSources {
 		if source.FileID == fileID {
-			copy := source
-			return &copy
+			sourceCopy := source
+			return &sourceCopy
 		}
 	}
 	return nil

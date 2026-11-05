@@ -58,7 +58,7 @@ const (
 // suffix answers, so "harry potter box set" and "harry potter collection"
 // both find "Harry Potter Collection". They count only beside a word the rest
 // of the name matches: "box" alone does not find every box set.
-var boxSetSuffixWords = map[string]bool{"box": true, "set": true, boxSetNameSuffix: true}
+var boxSetSuffixWords = map[string]bool{"box": true, "set": true, boxSetNameSuffix: true} //nolint:goconst // query words for the "Box Set" suffix, kept inline as a literal list
 
 // boxSetNameSuffix ends a TMDB collection's name ("Harry Potter Collection").
 const boxSetNameSuffix = "collection"

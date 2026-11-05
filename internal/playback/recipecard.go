@@ -509,9 +509,10 @@ func (c RecipeCard) ToClaims() streamtoken.Claims {
 			playMethod = streamtoken.PlayMethodAudioDownmixRemux
 		}
 	} else if len(c.SubtitleRenditionTracks) > 0 {
-		if c.PlayMethod == playMethodCopyFMP4V1 {
+		switch c.PlayMethod {
+		case playMethodCopyFMP4V1:
 			playMethod = streamtoken.PlayMethodSubtitleRenditionsCopyFMP4
-		} else if c.PlayMethod == PlayTranscode {
+		case PlayTranscode:
 			playMethod = streamtoken.PlayMethodSubtitleRenditionsTranscode
 		}
 	} else if c.PlayMethod == PlayTranscode && c.ToneMapMode != "" {

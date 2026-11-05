@@ -49,7 +49,7 @@ func RunProgressHints(t *testing.T, newStore func(*testing.T) userstore.UserStor
 	// The row starts with no hints, so the first write is a change. The blank
 	// edition key is stored as NULL. Each change is then repeated, as the next
 	// heartbeat would, and the repeat must not reach the delta.
-	hints := userstore.VersionHints{FileID: 1, Resolution: "1080p", CodecVideo: "h264"}
+	hints := userstore.VersionHints{FileID: 1, Resolution: "1080p", CodecVideo: "h264"} //nolint:goconst // Fixture resolution and codec keep the store scenario readable
 	wantUnchanged := func(step string) {
 		t.Helper()
 		if delta := writeHints(hints); len(delta) != 0 {
@@ -63,9 +63,9 @@ func RunProgressHints(t *testing.T, newStore func(*testing.T) userstore.UserStor
 		edit func(*userstore.VersionHints)
 	}{
 		{"file", func(h *userstore.VersionHints) { h.FileID = 2 }},
-		{"resolution", func(h *userstore.VersionHints) { h.Resolution = "2160p" }},
+		{"resolution", func(h *userstore.VersionHints) { h.Resolution = "2160p" }}, //nolint:goconst // Fixture resolution keeps the store scenario readable
 		{"hdr", func(h *userstore.VersionHints) { h.HDR = true }},
-		{"codec", func(h *userstore.VersionHints) { h.CodecVideo = "hevc" }},
+		{"codec", func(h *userstore.VersionHints) { h.CodecVideo = "hevc" }}, //nolint:goconst // Fixture codec keeps the store scenario readable
 		{"edition set", func(h *userstore.VersionHints) { h.EditionKey = "directors-cut" }},
 		{"edition cleared", func(h *userstore.VersionHints) { h.EditionKey = "" }},
 	} {

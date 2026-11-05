@@ -273,11 +273,11 @@ func (p DeviceProfile) codecProfileCompatibilityWithMatcher(
 
 func codecProfileTarget(profile CodecProfile) string {
 	typ := normalizeConditionToken(profile.Type)
-	switch {
-	case typ == "videoaudio" || typ == "audio":
+	switch typ {
+	case "videoaudio", "audio":
 		return "audio"
-	case typ == "" || typ == "video":
-		return "video"
+	case "", codecProfileTargetVideo:
+		return codecProfileTargetVideo
 	default:
 		return ""
 	}

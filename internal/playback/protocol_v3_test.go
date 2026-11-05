@@ -1375,7 +1375,7 @@ func TestPlanPlaybackV3PackagesHLSCopyRemuxAsMPEGTSOnRequest(t *testing.T) {
 		file.VideoTracks[0].DVProfile = 8
 		file.VideoTracks[0].DVBLCompatID = 1
 		file.VideoTracks[0].DVLevel = 6
-		file.VideoTracks[0].ColorTransfer = "smpte2084"
+		file.VideoTracks[0].ColorTransfer = colorTransferPQ
 		file.VideoTracks[0].VideoRange = "DolbyVision"
 		file.VideoTracks[0].VideoRangeType = "DOVIWithHDR10"
 		return file
@@ -1514,7 +1514,7 @@ func TestPlanPlaybackV3AndroidMedia3HLSRecipesAcrossSourceQualities(t *testing.T
 				file.VideoTracks[0].DVProfile = profile.profile
 				file.VideoTracks[0].DVBLCompatID = profile.compatibility
 				file.VideoTracks[0].DVLevel = 6
-				file.VideoTracks[0].ColorTransfer = "smpte2084"
+				file.VideoTracks[0].ColorTransfer = colorTransferPQ
 				file.VideoTracks[0].VideoRange = "DolbyVision"
 				file.VideoTracks[0].VideoRangeType = profile.videoRangeType
 
@@ -2155,7 +2155,7 @@ func TestPlanPlaybackV3SubtitleTerminalPrecedence(t *testing.T) {
 func TestPlanPlaybackV3ToneMapSettingsSelectValidatedExecutor(t *testing.T) {
 	file := detailedFixtureFileV3()
 	file.VideoTracks[0].ColorPrimaries = "bt2020"
-	file.VideoTracks[0].ColorTransfer = "smpte2084"
+	file.VideoTracks[0].ColorTransfer = colorTransferPQ
 	file.VideoTracks[0].ColorSpace = "bt2020nc"
 	req := validStartRequestV3()
 	req.QualityPreference = QualityRung2160pMediumV3
@@ -2213,7 +2213,7 @@ func TestPlanPlaybackV3ToneMapSettingsSelectValidatedExecutor(t *testing.T) {
 func TestPlanPlaybackV3ResolvesToneMapRecipeOnce(t *testing.T) {
 	file := detailedFixtureFileV3()
 	file.VideoTracks[0].ColorPrimaries = "bt2020"
-	file.VideoTracks[0].ColorTransfer = "smpte2084"
+	file.VideoTracks[0].ColorTransfer = colorTransferPQ
 	file.VideoTracks[0].ColorSpace = "bt2020nc"
 	req := validStartRequestV3()
 	req.QualityPreference = "1080p"
@@ -2279,7 +2279,7 @@ func TestPlanPlaybackV3ClassifiesDolbyOnlyAndFreezesAmbiguousFallbacks(t *testin
 			track.DVConfigPresent, track.DVBLCompatIDPresent = false, false
 		}, wantTerminal: true},
 		{name: "contradictory transfer", mutate: func(track *models.VideoTrack) {
-			track.ColorTransfer = "arib-std-b67"
+			track.ColorTransfer = colorTransferHLG
 		}, wantKind: tonemap.SourcePQ, wantPreflight: true},
 	}
 	for _, tt := range tests {
@@ -2289,7 +2289,7 @@ func TestPlanPlaybackV3ClassifiesDolbyOnlyAndFreezesAmbiguousFallbacks(t *testin
 			track.DVProfile, track.DVBLCompatID = 7, 6
 			track.DVConfigPresent, track.DVBLCompatIDPresent, track.DVBLPresent, track.DVRPUPresent = true, true, true, true
 			track.VideoRangeType = "DOVIWithHDR10"
-			track.ColorRange, track.ColorPrimaries, track.ColorTransfer, track.ColorSpace = "tv", "bt2020", "smpte2084", "bt2020nc"
+			track.ColorRange, track.ColorPrimaries, track.ColorTransfer, track.ColorSpace = "tv", "bt2020", colorTransferPQ, "bt2020nc"
 			tt.mutate(track)
 			req := validStartRequestV3()
 			req.QualityPreference = "1080p"
@@ -5433,7 +5433,7 @@ func TestPlanPlaybackV3HDRTerminalNamesTheMissingPiece(t *testing.T) {
 	newHDRFile := func() *models.MediaFile {
 		file := detailedFixtureFileV3()
 		file.VideoTracks[0].ColorPrimaries = "bt2020"
-		file.VideoTracks[0].ColorTransfer = "smpte2084"
+		file.VideoTracks[0].ColorTransfer = colorTransferPQ
 		file.VideoTracks[0].ColorSpace = "bt2020nc"
 		return file
 	}

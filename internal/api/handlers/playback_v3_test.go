@@ -260,7 +260,7 @@ func TestHandleStartPlaybackV3TriesAlternateAfterHDRTerminal(t *testing.T) {
 			alternate.Bitrate = 8_000
 			alternate.VideoTracks = []models.VideoTrack{{
 				Codec: "h264", Profile: "high", Level: 41, Width: 1920, Height: 1080,
-				FrameRate: "24000/1001", Bitrate: 8_000, BitDepth: 8, VideoRange: "SDR", VideoRangeType: "SDR",
+				FrameRate: "24000/1001", Bitrate: 8_000, BitDepth: 8, VideoRange: videoRangeSDR, VideoRangeType: videoRangeSDR,
 			}}
 
 			handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), testPlaybackFileResolver{file: source})
@@ -373,7 +373,7 @@ func TestHandleStartPlaybackV3SubtitleReasonWithBlockedVideoStillMovesVersion(t 
 	source.CodecVideo = "hevc"
 	source.VideoTracks = []models.VideoTrack{{
 		Codec: "hevc", Profile: "main", Level: 41, Width: 1920, Height: 1080,
-		FrameRate: "24000/1001", Bitrate: 8_000, BitDepth: 8, VideoRange: "SDR", VideoRangeType: "SDR",
+		FrameRate: "24000/1001", Bitrate: 8_000, BitDepth: 8, VideoRange: videoRangeSDR, VideoRangeType: videoRangeSDR,
 	}}
 	source.SubtitleTracks = []models.SubtitleTrack{{Index: 4, Codec: "hdmv_pgs_subtitle", Language: "eng", Title: "English"}}
 
@@ -383,7 +383,7 @@ func TestHandleStartPlaybackV3SubtitleReasonWithBlockedVideoStillMovesVersion(t 
 	alternate.CodecVideo = "h264"
 	alternate.VideoTracks = []models.VideoTrack{{
 		Codec: "h264", Profile: "high", Level: 41, Width: 1920, Height: 1080,
-		FrameRate: "24000/1001", Bitrate: 8_000, BitDepth: 8, VideoRange: "SDR", VideoRangeType: "SDR",
+		FrameRate: "24000/1001", Bitrate: 8_000, BitDepth: 8, VideoRange: videoRangeSDR, VideoRangeType: videoRangeSDR,
 	}}
 	alternate.SubtitleTracks = nil
 
@@ -447,7 +447,7 @@ func TestHandleStartPlaybackV3TriesLater4KAlternateAfterNon4KTerminal(t *testing
 	playable.VideoTracks = []models.VideoTrack{{
 		Codec: "h264", Profile: "high", Level: 52, Width: 3840, Height: 2160,
 		FrameRate: "24000/1001", Bitrate: 12_000, BitDepth: 8,
-		VideoRange: "SDR", VideoRangeType: "SDR",
+		VideoRange: videoRangeSDR, VideoRangeType: videoRangeSDR,
 	}}
 
 	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), testPlaybackFileResolver{file: source})
@@ -497,8 +497,8 @@ func TestHandleReplanPlaybackV3TriesLater4KAlternateAfterNon4KTerminal(t *testin
 			lower.VideoTracks[0].Width = 1920
 			lower.VideoTracks[0].Height = 1080
 			lower.VideoTracks[0].Bitrate = 8_000
-			lower.VideoTracks[0].VideoRange = "HDR10"
-			lower.VideoTracks[0].VideoRangeType = "HDR10"
+			lower.VideoTracks[0].VideoRange = videoRangeHDR10
+			lower.VideoTracks[0].VideoRangeType = videoRangeHDR10
 
 			playableValue := *source
 			playable := &playableValue
@@ -509,7 +509,7 @@ func TestHandleReplanPlaybackV3TriesLater4KAlternateAfterNon4KTerminal(t *testin
 			playable.VideoTracks = []models.VideoTrack{{
 				Codec: "hevc", Profile: "main", Level: 52, Width: 3840, Height: 2160,
 				FrameRate: "24000/1001", Bitrate: 12_000, BitDepth: 8,
-				VideoRange: "SDR", VideoRangeType: "SDR",
+				VideoRange: videoRangeSDR, VideoRangeType: videoRangeSDR,
 			}}
 
 			manager := playback.NewSessionManager(0, 0)
@@ -1354,7 +1354,7 @@ func TestHandleReplanPlaybackV3FailureDoesNotReplaceDurableStartDecision(t *test
 		ClientPlaybackContext: startRequest.ClientPlaybackContext,
 	}
 	failed := postPlaybackReplanV3(t, handler, started.SessionID, replan)
-	if failed.Terminal == nil || failed.Terminal.Reason != "source_unavailable" {
+	if failed.Terminal == nil || failed.Terminal.Reason != sourceUnavailableReason {
 		t.Fatalf("failed replan response = %#v", failed)
 	}
 
@@ -1674,7 +1674,7 @@ func TestHandleReplanPlaybackV3SeekReanchorKeepsCurrentRecipeEligible(t *testing
 	missing.ReplanRequestID = "seek-reanchor-missing-source-0001"
 	missing.PositionSeconds = 600
 	missingRR := servePlaybackReplanRequestV3(t, handler, started.SessionID, missing)
-	if missingRR.Code != http.StatusOK || !strings.Contains(missingRR.Body.String(), "source_unavailable") {
+	if missingRR.Code != http.StatusOK || !strings.Contains(missingRR.Body.String(), sourceUnavailableReason) {
 		t.Fatalf("missing-source reanchor status = %d, body = %s", missingRR.Code, missingRR.Body.String())
 	}
 	unchanged, err := handler.PlanStoreV3.GetAttempt(context.Background(), started.SessionID)
@@ -1918,7 +1918,7 @@ func TestHandleReplanPlaybackV3SeekFailureRecoveryNeverChangesMediaVersion(t *te
 			missing.Failure = playback.FailureV3{}
 		}
 		missingRR := servePlaybackReplanRequestV3(t, handler, started.SessionID, missing)
-		if missingRR.Code != http.StatusOK || !strings.Contains(missingRR.Body.String(), "source_unavailable") {
+		if missingRR.Code != http.StatusOK || !strings.Contains(missingRR.Body.String(), sourceUnavailableReason) {
 			t.Fatalf("missing current %s status = %d, body = %s", operation, missingRR.Code, missingRR.Body.String())
 		}
 	}
@@ -3572,7 +3572,7 @@ func TestSessionStartErrorV3SeparatesAccountLimitsFromServerCapacity(t *testing.
 	}{
 		{err: playback.ErrTooManyStreams, reason: "stream_limit_reached", retryable: true},
 		{err: playback.ErrTooManyTranscodes, reason: "transcode_limit_reached", retryable: true},
-		{err: playback.ErrTranscodingDisabled, reason: "transcoding_disabled"},
+		{err: playback.ErrTranscodingDisabled, reason: transcodingDisabledCode},
 		{err: playback.ErrPlaybackNotAllowed, reason: "policy_denied"},
 	} {
 		got := sessionStartErrorV3(fmt.Errorf("wrapped: %w", tc.err))
@@ -4276,7 +4276,7 @@ func TestRouteEventV3HasPerUserLimitAcrossAttemptIDs(t *testing.T) {
 
 func v3HandlerFixtureFile(t *testing.T) *models.MediaFile {
 	t.Helper()
-	return &models.MediaFile{ID: 42, ContentID: "movie-1", FilePath: writePlaybackTestMediaFile(t, "movie.mp4"), Container: "mp4", CodecVideo: "h264", CodecAudio: "aac", Resolution: "1080p", Bitrate: 8_000, AudioChannels: 2, Duration: 3600, VideoTracks: []models.VideoTrack{{Codec: "h264", Profile: "high", Level: 41, Width: 1920, Height: 1080, FrameRate: "24000/1001", Bitrate: 8_000, BitDepth: 8, VideoRange: "SDR", VideoRangeType: "SDR"}}, AudioTracks: []models.AudioTrack{{Codec: "aac", Channels: 2, Layout: "stereo", Default: true}}}
+	return &models.MediaFile{ID: 42, ContentID: "movie-1", FilePath: writePlaybackTestMediaFile(t, "movie.mp4"), Container: "mp4", CodecVideo: "h264", CodecAudio: "aac", Resolution: "1080p", Bitrate: 8_000, AudioChannels: 2, Duration: 3600, VideoTracks: []models.VideoTrack{{Codec: "h264", Profile: "high", Level: 41, Width: 1920, Height: 1080, FrameRate: "24000/1001", Bitrate: 8_000, BitDepth: 8, VideoRange: videoRangeSDR, VideoRangeType: videoRangeSDR}}, AudioTracks: []models.AudioTrack{{Codec: "aac", Channels: 2, Layout: "stereo", Default: true}}}
 }
 
 func stubCopySeekAnchorV3(handler *PlaybackHandler) {
@@ -8850,7 +8850,7 @@ func TestHandleStartPlaybackV3SkipsUnresolvableVirtualAlternateForLaterWorkingAl
 	source.VirtualOwnerInstallationID = 5
 	source.VideoTracks[0] = models.VideoTrack{
 		Codec: "hevc", Profile: "main 10", Level: 150, Width: 3840, Height: 2160,
-		BitDepth: 10, VideoRange: "HDR10", VideoRangeType: "HDR10",
+		BitDepth: 10, VideoRange: videoRangeHDR10, VideoRangeType: videoRangeHDR10,
 	}
 
 	altBroken := *source
@@ -8861,7 +8861,7 @@ func TestHandleStartPlaybackV3SkipsUnresolvableVirtualAlternateForLaterWorkingAl
 	altBroken.HDR = false
 	altBroken.VideoTracks = []models.VideoTrack{{
 		Codec: "h264", Profile: "high", Level: 40, Width: 1920, Height: 1080,
-		BitDepth: 8, VideoRange: "SDR", VideoRangeType: "SDR",
+		BitDepth: 8, VideoRange: videoRangeSDR, VideoRangeType: videoRangeSDR,
 	}}
 
 	altGood := *source
@@ -8872,7 +8872,7 @@ func TestHandleStartPlaybackV3SkipsUnresolvableVirtualAlternateForLaterWorkingAl
 	altGood.HDR = false
 	altGood.VideoTracks = []models.VideoTrack{{
 		Codec: "h264", Profile: "high", Level: 40, Width: 1920, Height: 1080,
-		BitDepth: 8, VideoRange: "SDR", VideoRangeType: "SDR",
+		BitDepth: 8, VideoRange: videoRangeSDR, VideoRangeType: videoRangeSDR,
 	}}
 	// The persisted row that owns the working alternate's resolved URI is a
 	// different catalog row from the version-list alternate. The plan's
@@ -8985,7 +8985,7 @@ func TestHandleStartPlaybackV3TriesLaterVirtual4KAlternateAfterVirtualNon4KTermi
 	playable.VideoTracks = []models.VideoTrack{{
 		Codec: "h264", Profile: "high", Level: 52, Width: 3840, Height: 2160,
 		FrameRate: "24000/1001", Bitrate: 12_000, BitDepth: 8,
-		VideoRange: "SDR", VideoRangeType: "SDR",
+		VideoRange: videoRangeSDR, VideoRangeType: videoRangeSDR,
 	}}
 
 	files := map[int]*models.MediaFile{source.ID: source, lower.ID: lower, playable.ID: playable}
@@ -9131,7 +9131,7 @@ func TestHandleReplanPlaybackV3VirtualRehydrationAllAlternatesFailReturnsVirtual
 		ClientPlaybackContext: startRequest.ClientPlaybackContext,
 	}
 	response := postPlaybackReplanV3(t, handler, started.SessionID, replanReq)
-	if response.Terminal == nil || response.Terminal.Reason != "virtual_source_unavailable" || !response.Terminal.Retryable {
+	if response.Terminal == nil || response.Terminal.Reason != virtualSourceUnavailableReasonV3 || !response.Terminal.Retryable {
 		t.Fatalf("expected retryable virtual_source_unavailable terminal, got %#v", response)
 	}
 
@@ -9144,7 +9144,7 @@ func TestHandleReplanPlaybackV3VirtualRehydrationAllAlternatesFailReturnsVirtual
 	}
 
 	replayed := postPlaybackReplanV3(t, handler, started.SessionID, replanReq)
-	if replayed.Terminal == nil || replayed.Terminal.Reason != "virtual_source_unavailable" {
+	if replayed.Terminal == nil || replayed.Terminal.Reason != virtualSourceUnavailableReasonV3 {
 		t.Fatalf("idempotent replay failed, got %#v", replayed)
 	}
 }
@@ -9202,7 +9202,7 @@ func TestHandleReplanPlaybackV3VirtualRehydrationDeadlineExceededReturnsTimeout(
 		ClientPlaybackContext: startRequest.ClientPlaybackContext,
 	}
 	response := postPlaybackReplanV3(t, handler, started.SessionID, replanReq)
-	if response.Terminal == nil || response.Terminal.Reason != "replan_virtual_input_timeout" || !response.Terminal.Retryable {
+	if response.Terminal == nil || response.Terminal.Reason != replanVirtualInputTimeoutReasonV3 || !response.Terminal.Retryable {
 		t.Fatalf("expected retryable replan_virtual_input_timeout terminal, got %#v", response)
 	}
 }
@@ -9446,7 +9446,7 @@ func TestHandleReplanPlaybackV3VirtualRehydrationSeekRecoveryPinsCurrentVersion(
 		// A seek failure recovery is not a user-intent operation: it still
 		// re-resolves, and an offline pin surfaces as a retryable source
 		// terminal rather than a silent release swap.
-		if response.Terminal == nil || (response.Terminal.Reason != "virtual_source_unavailable" && response.Terminal.Reason != "source_unavailable") {
+		if response.Terminal == nil || (response.Terminal.Reason != virtualSourceUnavailableReasonV3 && response.Terminal.Reason != sourceUnavailableReason) {
 			t.Fatalf("seek operation %q should have produced source unavailable terminal, got terminal=%#v", op, response.Terminal)
 		}
 	}
@@ -9525,7 +9525,7 @@ func TestHandleStartPlaybackV3SubtitleRemapFailurePreservesOriginalSelectionForL
 	altNoSubs.HDR = false
 	altNoSubs.VideoTracks = []models.VideoTrack{{
 		Codec: "h264", Profile: "high", Level: 40, Width: 1920, Height: 1080,
-		BitDepth: 8, VideoRange: "SDR", VideoRangeType: "SDR",
+		BitDepth: 8, VideoRange: videoRangeSDR, VideoRangeType: videoRangeSDR,
 	}}
 
 	altWithSubs := *source
@@ -9539,7 +9539,7 @@ func TestHandleStartPlaybackV3SubtitleRemapFailurePreservesOriginalSelectionForL
 	altWithSubs.HDR = false
 	altWithSubs.VideoTracks = []models.VideoTrack{{
 		Codec: "h264", Profile: "high", Level: 40, Width: 1920, Height: 1080,
-		BitDepth: 8, VideoRange: "SDR", VideoRangeType: "SDR",
+		BitDepth: 8, VideoRange: videoRangeSDR, VideoRangeType: videoRangeSDR,
 	}}
 
 	files := map[int]*models.MediaFile{source.ID: source, altNoSubs.ID: &altNoSubs, altWithSubs.ID: &altWithSubs}

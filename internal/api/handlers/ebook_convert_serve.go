@@ -148,7 +148,7 @@ func setConvertedEpubHeaders(w http.ResponseWriter, file *models.MediaFile, key 
 // setConvertedEpubHeaders) and closes it. For a HEAD, ServeContent emits the
 // headers and Content-Length without a body.
 func serveConvertedEpub(w http.ResponseWriter, r *http.Request, file *models.MediaFile, f *os.File, key ebookconvert.SourceKey) error {
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	stat, err := f.Stat()
 	if err != nil {
 		return fmt.Errorf("stat converted epub: %w", err)

@@ -22,7 +22,7 @@ func dv8BaseLayerFileV3(t *testing.T) *models.MediaFile {
 	file.VideoTracks[0] = models.VideoTrack{
 		Codec: "hevc", Profile: "main 10", Level: 153, Width: 3840, Height: 2160,
 		FrameRate: "24000/1001", Bitrate: 32_000, BitDepth: 10, PixelFormat: "yuv420p10le",
-		VideoRange: "DolbyVision", VideoRangeType: "DOVI", DVProfile: 8, DVBLCompatID: 1,
+		VideoRange: "DolbyVision", VideoRangeType: videoRangeDOVI, DVProfile: 8, DVBLCompatID: 1,
 		DVConfigPresent: true, DVBLCompatIDPresent: true, DVBLPresent: true,
 	}
 	return file

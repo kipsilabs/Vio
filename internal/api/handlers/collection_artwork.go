@@ -44,7 +44,7 @@ const (
 // it unchanged, so the answer says nothing about what listens there.
 var errCollectionImageSourceNotAllowed = &APIError{
 	Status:  http.StatusBadRequest,
-	Code:    "bad_request",
+	Code:    "bad_request", //nolint:goconst // HTTP error code shared by APIError values; the package keeps error codes inline.
 	Message: "the image URL must be a public internet address",
 }
 
@@ -192,20 +192,6 @@ func downloadCollectionImageURL(ctx context.Context, client *http.Client, rawURL
 		return nil, invalidCollectionImage("The image exceeds the 10 MB limit.", nil)
 	}
 	return data, nil
-}
-
-// uploadCollectionImageVariants generates resized variants for the given
-// image bytes, uploads them as revisioned artwork keys under
-// "{prefix}/{collectionID}/{imageType}/" (e.g. "original.{revision}.webp"), and
-// returns the S3 path of the original variant plus a thumbhash computed from
-// the w300 variant. The content revision gives replacement artwork a new URL
-// (issue #1258).
-func removeCollectionImageVariants(ctx context.Context, store blobstore.Store, prefix, collectionID, imageType string) error {
-	if store == nil {
-		return nil
-	}
-	_, err := store.Delete(ctx, []string{fmt.Sprintf("%s/%s/%s", prefix, collectionID, imageType)})
-	return err
 }
 
 func uploadCollectionImageVariants(

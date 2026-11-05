@@ -8,7 +8,7 @@ import (
 
 func hdr10PlusFixtureFileV3() *models.MediaFile {
 	file := detailedFixtureFileV3()
-	file.VideoTracks[0].ColorTransfer = "smpte2084"
+	file.VideoTracks[0].ColorTransfer = colorTransferPQ
 	file.VideoTracks[0].HDR10Plus = true
 	file.VideoTracks[0].VideoRangeType = "HDR10Plus"
 	return file

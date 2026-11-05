@@ -123,7 +123,7 @@ func assertExhaustedRotationFailsFast(t *testing.T, handler *PlaybackHandler, st
 	if response.PlaybackPlan != nil {
 		t.Fatalf("replan returned a plan (%#v), want the exhausted-rotation terminal", response.PlaybackPlan)
 	}
-	if response.Terminal == nil || response.Terminal.Reason != "virtual_source_unavailable" || !response.Terminal.Retryable {
+	if response.Terminal == nil || response.Terminal.Reason != virtualSourceUnavailableReasonV3 || !response.Terminal.Retryable {
 		t.Fatalf("terminal = %#v, want retryable virtual_source_unavailable", response.Terminal)
 	}
 	if got := alternateResolves.Load(); got != 0 {

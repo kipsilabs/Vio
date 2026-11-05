@@ -187,7 +187,7 @@ func queryAdminStats(ctx context.Context, pool *pgxpool.Pool, providers WatchPro
 // queryAdminCountStats reads every count queryAdminStats reports in one
 // statement. Tests pass a transaction that holds one snapshot while other
 // tests write the shared database.
-func queryAdminCountStats(ctx context.Context, q rowQuerier) (AdminStats, error) {
+func queryAdminCountStats(ctx context.Context, q VirtualFileMetadataDB) (AdminStats, error) {
 	var s AdminStats
 	err := q.QueryRow(ctx, `
 		WITH user_stats AS (

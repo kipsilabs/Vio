@@ -63,7 +63,7 @@ func TestExplicitPinReplanDoesNotHuntAlternateOnRehydrationFailure(t *testing.T)
 		source.ProviderReleaseName = "Movie.Pinned.1080p"
 		source.VideoTracks = []models.VideoTrack{{
 			Codec: "hevc", Profile: "Main", Level: 120, Width: 1920, Height: 1080,
-			FrameRate: "24000/1001", Bitrate: 8_000, BitDepth: 8, VideoRange: "SDR", VideoRangeType: "SDR",
+			FrameRate: "24000/1001", Bitrate: 8_000, BitDepth: 8, VideoRange: videoRangeSDR, VideoRangeType: videoRangeSDR,
 		}}
 
 		alternate := *source

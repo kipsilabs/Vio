@@ -228,8 +228,8 @@ func TestSameTrackLanguageV3(t *testing.T) {
 		{"fre", "fra", true},
 		{"English", "en", true},
 		{"eng", "jpn", false},
-		{"und", "und", true},
-		{"und", "eng", false},
+		{langUndetermined, langUndetermined, true},
+		{langUndetermined, "eng", false},
 		{"", "eng", false},
 		{"", "", false},
 	} {

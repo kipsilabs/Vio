@@ -37,7 +37,9 @@ const copySafetyReconsiderTimeout = 30 * time.Second
 // distinct from the "admin" commands an operator sends from the admin surface.
 const CommandIssuedByServer = "server"
 
-type copySafetySessionLookup interface {
+// sessionLookup lists the live sessions for one media file; every notifier
+// needs only this one read from the session manager.
+type sessionLookup interface {
 	GetSessionsByMediaFileID(fileID int) []*Session
 }
 
@@ -79,7 +81,7 @@ type CopySafetySessionControl interface {
 // on the sessions this replica owns, which are exactly the ones whose realtime
 // connections it holds.
 type CopySafetyNotifier struct {
-	sessions   copySafetySessionLookup
+	sessions   sessionLookup
 	attempts   copySafetyAttemptLookup
 	dispatcher *CommandDispatcher
 	control    CopySafetySessionControl
@@ -90,7 +92,7 @@ type CopySafetyNotifier struct {
 // NewCopySafetyNotifier returns a notifier, or nil when a dependency it cannot
 // work without is missing. A nil notifier is safe to call.
 func NewCopySafetyNotifier(
-	sessions copySafetySessionLookup,
+	sessions sessionLookup,
 	attempts copySafetyAttemptLookup,
 	dispatcher *CommandDispatcher,
 	control CopySafetySessionControl,

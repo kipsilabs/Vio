@@ -25,7 +25,7 @@ func TestNodeServesSubtitleRenditionThroughManifestAndSegmentRoutes(t *testing.T
 		name, videoCodec, subtitlePlaylistType string
 		copyVideoMPEGTS                        bool
 	}{
-		{"transcode", "h264", "VOD", false},
+		{nodeTypeTranscode, "h264", "VOD", false},
 		// A copy remux without a keyframe plan follows FFmpeg's EVENT playlist.
 		{"copy remux", "copy", "EVENT", true},
 	} {

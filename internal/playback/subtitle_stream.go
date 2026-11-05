@@ -381,7 +381,7 @@ func streamExtractArgs(opts StreamExtractOpts) []string {
 	args = append(args, "-f", outFormat, "pipe:1")
 	if opts.KeepPath != "" && !seekApplied {
 		args = append(args, "-map", fmt.Sprintf("0:s:%d", trackIndex), "-c:s", "copy", "-output_ts_offset", strconv.FormatFloat(opts.KeepOffset.Seconds(), 'f', 6, 64), "-flush_packets", "1", "-fs", strconv.FormatInt(opts.demuxCopyLimit(), 10))
-		if opts.KeepFormat == "mp4" {
+		if opts.KeepFormat == "mp4" { //nolint:goconst // Container token shared with capability fixtures; names stay inline
 			args = append(args, "-movflags", "+faststart")
 		}
 		args = append(args, "-f", opts.KeepFormat, "file:"+opts.KeepPath)

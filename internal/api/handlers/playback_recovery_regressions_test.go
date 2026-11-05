@@ -460,7 +460,7 @@ func TestHandleReplanPlaybackV3CarriesDescriptorForSameCandidateRecovery(t *test
 		VirtualOwnerInstallationID: complete.VirtualOwnerInstallationID,
 		VideoTracks: []models.VideoTrack{{
 			Codec: "h264", Profile: "high", Level: 41, Width: 1920, Height: 1080, BitDepth: 8,
-			VideoRange: "SDR", VideoRangeType: "SDR",
+			VideoRange: videoRangeSDR, VideoRangeType: videoRangeSDR,
 		}},
 		AudioTracks: complete.AudioTracks,
 	}

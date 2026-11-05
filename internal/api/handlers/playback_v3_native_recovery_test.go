@@ -253,9 +253,9 @@ func TestRemapSubtitleSelectionKeepsDownloadedSelectionWhenLookupFails(t *testin
 // The client then applies the plan in place.
 func TestNativeSubtitleSwitchReplansTheSameMedia(t *testing.T) {
 	for name, replan := range map[string]func(*playback.ReplanRequestV3){
-		"subtitle_track_changed": func(r *playback.ReplanRequestV3) {
+		failureSubtitleTrackChangedV3: func(r *playback.ReplanRequestV3) {
 			r.Operation = playback.ReplanOperationFailureRecoveryV3
-			r.Failure = playback.FailureV3{Classification: "subtitle_track_changed"}
+			r.Failure = playback.FailureV3{Classification: failureSubtitleTrackChangedV3}
 		},
 		"track_change": func(r *playback.ReplanRequestV3) {
 			r.Operation = playback.ReplanOperationTrackChangeV3
@@ -371,7 +371,7 @@ func TestSubtitleTrackChangedRecoveryStaysOnEffectiveAlternate(t *testing.T) {
 	spanish := 1
 	after := postPlaybackReplanV3(t, handler, started.SessionID, playback.ReplanRequestV3{
 		ProtocolVersion: playback.ProtocolV3, Operation: playback.ReplanOperationFailureRecoveryV3,
-		Failure:           playback.FailureV3{Classification: "subtitle_track_changed"},
+		Failure:           playback.FailureV3{Classification: failureSubtitleTrackChangedV3},
 		PlaybackAttemptID: start.PlaybackAttemptID, ReplanRequestID: "alternate-subtitle-recovery-0001",
 		FailedPlanID: before.PlanID, PlanAttemptID: "alternate-subtitle-recovery-attempt-0001",
 		PlanAttemptKey: before.PlanAttemptKey, AttemptedPlanKeys: []string{before.PlanAttemptKey}, AttemptCount: 1, PositionSeconds: 30,

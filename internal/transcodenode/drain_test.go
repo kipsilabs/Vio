@@ -51,7 +51,7 @@ func healthStatusOf(t *testing.T, s *Server) HealthResponse {
 func newLoopingFFmpegServer(t *testing.T) *Server {
 	t.Helper()
 	s := newTestServer(t)
-	s.tracker = nodesessions.NewTracker(nil, "http://node", "node", "transcode")
+	s.tracker = nodesessions.NewTracker(nil, "http://node", "node", nodeTypeTranscode)
 	useFakeFFmpeg(t, s, "#!/bin/sh\nwhile :; do sleep 0.1; done\n")
 	return s
 }

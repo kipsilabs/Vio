@@ -211,12 +211,7 @@ type AdminDashboardLayoutView struct {
 	Revision  string
 }
 
-// rowQuerier reads one row through a pool or a transaction.
-type rowQuerier interface {
-	QueryRow(context.Context, string, ...any) pgx.Row
-}
-
-func readDashboardLayout(ctx context.Context, q rowQuerier, userID int) (AdminDashboardLayoutView, error) {
+func readDashboardLayout(ctx context.Context, q VirtualFileMetadataDB, userID int) (AdminDashboardLayoutView, error) {
 	var view AdminDashboardLayoutView
 	err := q.QueryRow(ctx, `SELECT l.layout, l.updated_at, COALESCE(r.revision::text, 'initial')
       FROM users u LEFT JOIN admin_dashboard_layouts l ON l.user_id = u.id

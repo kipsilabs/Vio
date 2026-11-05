@@ -42,7 +42,7 @@ func TestResolveSubtitlePolicyV3DoesNotOfferDVBTeletextAsClientBitmap(t *testing
 
 func TestResolveSubtitlePolicyV3UnknownCodecIsExplicitlyUnsupported(t *testing.T) {
 	for codec, message := range map[string]string{
-		"arib_caption": "Subtitle format arib_caption has no validated rendering or burn-in route.",
+		subtitleCodecAribCaption: "Subtitle format arib_caption has no validated rendering or burn-in route.",
 		// A format the probe couldn't name has no name to give.
 		"": "The subtitle track's format was not recognized, so it has no validated rendering or burn-in route.",
 	} {
@@ -61,7 +61,7 @@ func TestResolveSubtitlePolicyV3UnknownCodecIsExplicitlyUnsupported(t *testing.T
 func TestSubtitleInventoryV3MarksTracksWithoutARouteUnplayable(t *testing.T) {
 	file := detailedFixtureFileV3()
 	file.ExternalSubtitles = []models.ExternalSubtitle{{Format: "srt"}}
-	file.SubtitleTracks = []models.SubtitleTrack{{Index: 2, Codec: ""}, {Index: 3, Codec: "webvtt", IndexOnly: true}, {Index: 4, Codec: "dvd_subtitle"}, {Index: 5, Codec: "arib_caption"}}
+	file.SubtitleTracks = []models.SubtitleTrack{{Index: 2, Codec: ""}, {Index: 3, Codec: "webvtt", IndexOnly: true}, {Index: 4, Codec: "dvd_subtitle"}, {Index: 5, Codec: subtitleCodecAribCaption}}
 	want := []bool{false, true, false, false, true}
 	items := BuildSubtitleInventoryV3(file, nil)
 	for i, item := range items {

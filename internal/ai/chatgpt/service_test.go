@@ -575,7 +575,7 @@ func TestLoginStateExpiryConsentAndReauthorization(t *testing.T) {
 	}
 }
 
-func TestDisconnectRetriesTransientRevocation(t *testing.T) {
+func TestDisconnectRetriesTransientRevocation(t *testing.T) { //nolint:gocyclo // TestDisconnectRetriesTransientRevocation exceeds Vio's complexity-30 limit; refactor tracked separately
 	for _, tc := range []struct {
 		name        string
 		status      int

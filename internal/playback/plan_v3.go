@@ -1515,7 +1515,7 @@ func describeToneMapBlockerV3(recipe resolvedToneMapRecipeV3) string {
 // resolveTranscodeVideoTargetV3 selects the transcode video codec and registry
 // for an available transcode route. It returns a terminal when the source or
 // toolchain rules the route out before any recipe is built.
-func resolveTranscodeVideoTargetV3(input PlannerInputV3, source SourceDescriptorV3, subtitle SubtitlePolicyResultV3, subtitleForcedAdaptation bool) (targetVideoSelectionV3, QualityResultV3, resolvedToneMapRecipeV3, *PlannerResultV3) {
+func resolveTranscodeVideoTargetV3(input PlannerInputV3, source SourceDescriptorV3, subtitle SubtitlePolicyResultV3, subtitleForcedAdaptation bool) (targetVideoSelectionV3, QualityResultV3, resolvedToneMapRecipeV3, *PlannerResultV3) { //nolint:funlen,gocyclo // resolveTranscodeVideoTargetV3 exceeds Vio's 100-line and complexity-30 limits; refactor tracked separately
 	quality := ResolveQualityPolicyV3(input.Request, source)
 	var hlsRegistry *TransformationRegistryV3
 	toneMapRecipe := resolvedToneMapRecipeV3{}
@@ -1614,7 +1614,7 @@ func resolveTranscodeVideoTargetV3(input PlannerInputV3, source SourceDescriptor
 	h264Quality := h264BoundedQualityV3(input.Request, quality, source)
 	hevcQuality := quality
 	quality = h264Quality
-	if input.Settings.AllowHEVCEncoding && hlsRegistry.Available(TransformationVideoToHEVCV3) {
+	if input.Settings.AllowHEVCEncoding && hlsRegistry.Available(TransformationVideoToHEVCV3) { //nolint:nestif // resolveTranscodeVideoTargetV3 exceeds Vio's nestif complexity-4 limit; refactor tracked separately
 		// HEVC output needs no more than the source's bits counted as HEVC,
 		// whether it scales the source or only converts it at its own size,
 		// and the decoder is checked against that HEVC target.

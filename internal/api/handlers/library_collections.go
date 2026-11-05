@@ -254,27 +254,6 @@ func (h *LibraryCollectionHandler) collageComposer() collectionCollageComposer {
 	return collectionCollageComposer{prefix: adminCollectionImagePrefix, store: h.ArtworkStore, posters: h.detailSvc, signer: h.ArtworkSigner, httpClient: h.httpClient}
 }
 
-// fetchImageURL downloads an image from a resolved URL.
-func (h *LibraryCollectionHandler) fetchImageURL(ctx context.Context, imageURL string) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, imageURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	client := h.httpClient
-	if client == nil {
-		client = http.DefaultClient
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("image fetch returned status %d", resp.StatusCode)
-	}
-	return io.ReadAll(io.LimitReader(resp.Body, collectionImageMaxBytes))
-}
-
 // viewerCollectionCounts returns viewer-specific counts, preserving absent counts on errors.
 func (h *LibraryCollectionHandler) viewerCollectionCounts(ctx context.Context, collections []*models.LibraryCollection, access catalog.AccessFilter) map[string]catalog.ViewerCollectionCount {
 	if h.repo == nil {
@@ -3238,52 +3217,6 @@ func buildTMDBDiscoverSourceURL(mediaType, sortBy string) string {
 	return fmt.Sprintf("tmdb://discover/%s?sort_by=%s", mediaType, sortBy)
 }
 
-// buildTraktListSourceConfig builds the source config for a user-authored
-// Trakt list (mode trakt_list, issue #214).
-func buildTraktListSourceConfig(listURL string, limit *int, virtualPlayback bool) (json.RawMessage, error) {
-	payload := struct {
-		Mode            string `json:"mode"`
-		Provider        string `json:"provider"`
-		URL             string `json:"url"`
-		ListURL         string `json:"list_url"`
-		Limit           *int   `json:"limit,omitempty"`
-		VirtualPlayback bool   `json:"virtual_playback,omitempty"`
-	}{
-		Mode:            "trakt_list",
-		Provider:        "trakt",
-		URL:             listURL,
-		ListURL:         listURL,
-		Limit:           limit,
-		VirtualPlayback: virtualPlayback,
-	}
-	return json.Marshal(payload)
-}
-
-func buildTraktSourceConfig(preset, mediaType, profileID string, limit *int, virtualPlayback bool) (json.RawMessage, error) {
-	payload := struct {
-		Mode            string `json:"mode"`
-		Provider        string `json:"provider"`
-		Preset          string `json:"preset"`
-		MediaType       string `json:"media_type"`
-		ProfileID       string `json:"profile_id,omitempty"`
-		Limit           *int   `json:"limit,omitempty"`
-		VirtualPlayback bool   `json:"virtual_playback,omitempty"`
-	}{
-		Mode:            "trakt_preset",
-		Provider:        "trakt",
-		Preset:          preset,
-		MediaType:       mediaType,
-		ProfileID:       profileID,
-		Limit:           limit,
-		VirtualPlayback: virtualPlayback,
-	}
-	raw, err := json.Marshal(payload)
-	if err != nil {
-		return nil, err
-	}
-	return raw, nil
-}
-
 func normalizeTMDBPresetRequest(preset, mediaType, timeWindow string) (string, string, string, error) {
 	switch preset {
 	case "trending":
@@ -3320,43 +3253,11 @@ func normalizeTMDBPresetRequest(preset, mediaType, timeWindow string) (string, s
 	}
 }
 
-func normalizeTraktPresetRequest(preset, mediaType, profileID string) (string, string, string, error) {
-	preset = strings.TrimSpace(strings.ToLower(preset))
-	mediaType = strings.TrimSpace(strings.ToLower(mediaType))
-	profileID = strings.TrimSpace(profileID)
-
-	switch preset {
-	case "trending", "popular":
-	case "recommended":
-		if profileID == "" {
-			return "", "", "", fmt.Errorf("profile_id is required for Trakt recommended collections")
-		}
-	default:
-		return "", "", "", fmt.Errorf("preset must be one of \"trending\", \"popular\", or \"recommended\"")
-	}
-	switch mediaType {
-	case "movie", "tv":
-	default:
-		return "", "", "", fmt.Errorf("media_type must be \"movie\" or \"tv\"")
-	}
-	if preset != "recommended" {
-		profileID = ""
-	}
-	return preset, mediaType, profileID, nil
-}
-
 func buildTMDBSourceURL(preset, mediaType, timeWindow string) string {
 	if preset == "trending" {
 		return fmt.Sprintf("tmdb://%s/%s/%s", preset, mediaType, timeWindow)
 	}
 	return fmt.Sprintf("tmdb://%s/%s", preset, mediaType)
-}
-
-func buildTraktSourceURL(preset, mediaType, profileID string) string {
-	if preset == "recommended" {
-		return fmt.Sprintf("trakt://%s/%s/%s", preset, mediaType, profileID)
-	}
-	return fmt.Sprintf("trakt://%s/%s", preset, mediaType)
 }
 
 func (h *LibraryCollectionHandler) processCollectionImage(
@@ -3366,10 +3267,6 @@ func (h *LibraryCollectionHandler) processCollectionImage(
 	fileData []byte,
 ) (s3Path string, thumbhashStr string, err error) {
 	return uploadCollectionImageVariants(ctx, h.ArtworkStore, adminCollectionImagePrefix, collectionID, imageType, fileData)
-}
-
-func (h *LibraryCollectionHandler) deleteCollectionImages(ctx context.Context, collectionID, imageType string) error {
-	return removeCollectionImageVariants(ctx, h.ArtworkStore, adminCollectionImagePrefix, collectionID, imageType)
 }
 
 // adminCollectionImagePath returns the stored path of one admin collection

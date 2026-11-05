@@ -25,7 +25,7 @@ func RunProfilePINRevisionTransactions(t *testing.T, newStore func(*testing.T) u
 			id       string
 			revision int64
 			matches  bool
-		}{{parentID, 0, true}, {parentID, 1, false}, {"missing", 0, false}} {
+		}{{parentID, 0, true}, {parentID, 1, false}, {"missing", 0, false}} { //nolint:goconst // Fixture id names a row that does not exist
 			got, err := w.CheckProfilePINRevision(ctx, tc.id, tc.revision)
 			if err != nil || got != tc.matches {
 				t.Errorf("revision check %s/%d = %v, %v", tc.id, tc.revision, got, err)

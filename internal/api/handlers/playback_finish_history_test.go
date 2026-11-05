@@ -401,7 +401,7 @@ func TestAdminPlaybackWatchTimeDB(t *testing.T) {
 // decisions are filled once whether or not a finalization advanced the
 // counters, the end reason follows the latest finalization, and the listing
 // windows ended_at inclusive below and exclusive above.
-func TestAdminPlaybackHistoryFactsDB(t *testing.T) {
+func TestAdminPlaybackHistoryFactsDB(t *testing.T) { //nolint:funlen // TestAdminPlaybackHistoryFactsDB exceeds Vio's 100-line limit; refactor tracked separately
 	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("SILO_TEST_DATABASE_URL is not set")
