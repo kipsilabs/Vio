@@ -192,8 +192,28 @@ func dumpFontAttachments(ctx context.Context, inputPath string, ffmpegPath strin
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("subtitle fonts: start attachment extract: %w", err)
 	}
-	data, readErr := io.ReadAll(io.LimitReader(stdout, expected+1))
-	if readErr != nil || int64(len(data)) > expected {
+	var data bytes.Buffer
+	buf := make([]byte, 32<<10)
+	for data.Len() <= int(expected) {
+		n, readErr := stdout.Read(buf)
+		if n > 0 {
+			_, _ = data.Write(buf[:n])
+		}
+		if data.Len() > int(expected) {
+			_ = procgroup.Kill(cmd)
+			_ = cmd.Wait()
+			return nil, errors.New("subtitle fonts: attachment data exceeds probed size or could not be read")
+		}
+		if readErr != nil {
+			if readErr != io.EOF {
+				_ = procgroup.Kill(cmd)
+				_ = cmd.Wait()
+				return nil, errors.New("subtitle fonts: attachment data exceeds probed size or could not be read")
+			}
+			break
+		}
+	}
+	if int64(data.Len()) > expected {
 		_ = procgroup.Kill(cmd)
 		_ = cmd.Wait()
 		return nil, errors.New("subtitle fonts: attachment data exceeds probed size or could not be read")
