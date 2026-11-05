@@ -968,30 +968,3 @@ func tighterBoundFloatV3(a, b float64) float64 {
 		return a
 	}
 }
-
-func decoderTakesFrameRateV3(decoder VideoDecodeCapabilityV3, frameRate float64) bool {
-	return decoder.MaxFrameRate <= 0 || frameRate <= decoder.MaxFrameRate+0.01
-}
-
-// decoderTakesFrameV3 reports whether a decoder takes width x height video at
-// frameRate. The maximum width and height always bind. With rateAtMaxSize the
-// reported rate holds at the decoder's largest size (Android derives it
-// there), so a smaller frame may run faster within the same macroblock rate,
-// counted in 16x16 macroblocks as Android's performance points are: a 4K30
-// decoder takes 1080p60 but not 1080p120, and a 1080p30 one takes 720p60 but
-// not 1080p60. Otherwise, or without both sizes, the rate is absolute.
-func decoderTakesFrameV3(decoder VideoDecodeCapabilityV3, width, height int, frameRate float64, rateAtMaxSize bool) bool {
-	if (decoder.MaxWidth > 0 && width > decoder.MaxWidth) || (decoder.MaxHeight > 0 && height > decoder.MaxHeight) {
-		return false
-	}
-	if decoderTakesFrameRateV3(decoder, frameRate) {
-		return true
-	}
-	return rateAtMaxSize && decoder.MaxWidth > 0 && decoder.MaxHeight > 0 && width > 0 && height > 0 &&
-		float64(macroblocksV3(width, height))*frameRate <= float64(macroblocksV3(decoder.MaxWidth, decoder.MaxHeight))*(decoder.MaxFrameRate+0.01)
-}
-
-// macroblocksV3 counts the 16x16 macroblocks that cover a frame.
-func macroblocksV3(width, height int) int {
-	return ((width + 15) / 16) * ((height + 15) / 16)
-}
