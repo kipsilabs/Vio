@@ -300,3 +300,17 @@ func videoCopyUnsafeFile(file *models.MediaFile) bool {
 	}
 	return false
 }
+
+// preparedRemuxEncodesAudio reports whether a remux would encode any audio track.
+func preparedRemuxEncodesAudio(file *models.MediaFile) bool {
+	if !PreparedTracksAvailable(file) {
+		return !preparedAudioCopyable(file.CodecAudio, normalizeCodecV3(file.CodecAudio))
+	}
+	primary := normalizeCodecV3(file.CodecAudio)
+	for _, track := range file.AudioTracks {
+		if !preparedAudioCopyable(track.Codec, primary) {
+			return true
+		}
+	}
+	return false
+}
