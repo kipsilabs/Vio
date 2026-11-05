@@ -241,8 +241,6 @@ type TranscodeOpts struct {
 // mapping cannot separate, so filter_units removes those units.
 const DV7ToDV81BitstreamFilter = "filter_units=remove_types=63"
 
-const DV7ToDV81BitstreamFilter = "filter_units=remove_types=63"
-
 const DV7ToHDR10BitstreamFilter = "dovi_rpu=strip=1,filter_units=remove_types=63"
 
 // CopyFMP4RecipeVersion identifies the byte-affecting copy-video HLS recipe.
@@ -2613,7 +2611,7 @@ func textSubtitleFilter(opts TranscodeOpts) string {
 	return fmt.Sprintf("subtitles=filename='%s':si=%d", escapeFilterPath(p), opts.SubtitleTrackIndex)
 }
 
-func prepareSubtitleFilterInput(opts *TranscodeOpts) error {
+func prepareSubtitleFilterInput(_ context.Context, opts *TranscodeOpts) error {
 	if !opts.SubtitleBurnIn || opts.SubtitleTrackIndex < 0 || NeedsBurnIn(opts.SubtitleCodec) {
 		return nil
 	}
