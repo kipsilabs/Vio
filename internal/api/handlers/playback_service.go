@@ -565,8 +565,18 @@ func (h *PlaybackHandler) writeProgressSideEffectsV2(ctx context.Context, record
 	session, err := h.sessionMgr.GetSession(sessionID)
 	if err == nil && session != nil {
 		wasPaused := session.IsPaused
-		if err := h.sessionMgr.UpdateProgress(sessionID, sample.Position, sample.IsPaused); err != nil && !errors.Is(err, playback.ErrSessionNotFound) {
-			slog.WarnContext(ctx, "failed to update live playback progress", "component", "api", "session", sessionID, "playback_session_id", sessionID, "error", err)
+		var updateErr error
+		if mgr, ok := h.sessionMgr.(interface {
+			UpdateProgressSample(string, playback.ProgressSampleV3) error
+		}); ok {
+			// Sequence the update so a replayed accepted sample cannot overwrite
+			// a pause state the player confirmed over the control lane after it.
+			updateErr = mgr.UpdateProgressSample(sessionID, sample)
+		} else {
+			updateErr = h.sessionMgr.UpdateProgress(sessionID, sample.Position, sample.IsPaused)
+		}
+		if updateErr != nil && !errors.Is(updateErr, playback.ErrSessionNotFound) {
+			slog.WarnContext(ctx, "failed to update live playback progress", "component", "api", "session", sessionID, "playback_session_id", sessionID, "error", updateErr)
 		}
 		if current, getErr := h.sessionMgr.GetSession(sessionID); getErr == nil && current != nil {
 			// A pause/resume transition can only be emitted once: the next
