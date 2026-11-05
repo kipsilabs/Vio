@@ -13050,29 +13050,6 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
   schemas: {
-    AdminVirtualItem: {
-      id: number;
-      title: string;
-      type: string;
-      library_id: number;
-      library_name: string;
-      installation_id: number;
-      candidate_count: number;
-      failed_count: number;
-      last_delivered_at?: string;
-      last_seen_at?: string;
-      release_names: string[];
-    };
-    AdminVirtualItemCollection: {
-      items: components["schemas"]["AdminVirtualItem"][];
-    };
-    PlaybackInventoryV3: {
-      session_id: string;
-      inventory_revision: string;
-      inventory_status: string;
-      audio_tracks: components["schemas"]["AudioInventoryItemV3"][];
-      subtitle_inventory: components["schemas"]["SubtitleInventoryItemV3"][];
-    };
     Account: {
       /**
        * @description Whether the effective policy permits downloads
@@ -16771,10 +16748,6 @@ export interface components {
       /** @description An original_url from this item's image list, sent back unchanged; not validated as a URI */
       original_url: string;
       provider_id?: string;
-      /**
-       * @description One of poster, backdrop, logo, still, or titlecard. still and titlecard name the same episode title card and are accepted only for an episode; a movie, series, or season is refused with 400 unsupported_image_type. An episode stores any applied image as its still.
-       * @example poster
-       */
       type: string;
     };
     AdminImagesPage: {
@@ -18543,7 +18516,7 @@ export interface components {
       repository_name: string;
       routes: components["schemas"]["PluginRoute"][];
       /** @enum {string} */
-      source_kind: "silo" | "vio" | "approved_community" | "external";
+      source_kind: "silo" | "approved_community" | "external";
       user_config_schema: components["schemas"]["AdminPluginConfigSchema"][];
       version: string;
     };
@@ -21596,6 +21569,47 @@ export interface components {
       /** Format: double */
       watched_seconds: number;
     };
+    AdminVirtualItem: {
+      /** Format: int64 */
+      candidate_count: number;
+      /** Format: int64 */
+      failed_count: number;
+      /**
+       * @description Opaque identifier
+       * @example 1
+       */
+      id: string;
+      /**
+       * @description Opaque identifier
+       * @example 1
+       */
+      installation_id: string;
+      /**
+       * Format: date-time
+       * @description RFC 3339 instant in UTC with millisecond precision
+       */
+      last_delivered_at?: string;
+      /**
+       * Format: date-time
+       * @description RFC 3339 instant in UTC with millisecond precision
+       */
+      last_seen_at?: string;
+      /**
+       * @description Opaque identifier
+       * @example 1
+       */
+      library_id: string;
+      library_name: string;
+      release_names: string[];
+      title: string;
+      type: string;
+    };
+    AdminVirtualItemCollection: {
+      /** @description The page's items; empty, never null */
+      items: components["schemas"]["AdminVirtualItem"][];
+      /** @description Cursor state; absent for bounded unpaginated collections */
+      page?: components["schemas"]["PageInfo"];
+    };
     AdminWatchProvider: {
       /**
        * Format: int64
@@ -21934,6 +21948,8 @@ export interface components {
       codec?: string;
       default: boolean;
       embedded_title?: string;
+      /** Format: int64 */
+      index?: number;
       /** @description Track language from the file: BCP 47 tag, ISO 639-1 where one exists (en, pt-BR); und when the file marks it undetermined. Older scans may carry an ISO 639-2 code or the file's raw tag */
       language?: string;
       languages?: string[];
@@ -22663,8 +22679,8 @@ export interface components {
        * @description Presigned, short-lived. Transparent cut-out art. Movies and series only
        */
       clearart_url?: string;
-      /** @description Visible collections containing this item (movies and series); empty, never null */
-      collections: components["schemas"]["ItemCollection"][];
+      /** @description Collections containing this item; empty, never null */
+      collections: components["schemas"]["ItemCollectionView"][];
       /**
        * @description Deterministic catalog identifier
        * @example movie:heat-1995
@@ -22802,7 +22818,7 @@ export interface components {
        */
       release_date?: string;
       /**
-       * @description Episode release timing derived from air_date: upcoming when the calendar date is after today (UTC), released otherwise; absent when the air date is unknown or the item is not an episode
+       * @description Episode release timing derived from air_date; absent for unknown dates and non-episodes
        * @enum {string}
        */
       release_state?: "upcoming" | "released";
@@ -24181,6 +24197,7 @@ export interface components {
       logo_url?: string;
       /** @description Stored artwork reference (storage key, plugin path, or URL), not a fetchable URL; not validated as a URI */
       poster_url?: string;
+      /** @description Stored episode title-card reference; absent when the item has no title card */
       still_url?: string;
     };
     DecideDeviceLoginInputBody: {
@@ -25278,6 +25295,7 @@ export interface components {
       /** Format: int64 */
       height?: number;
       segment_container?: string;
+      software_video_decode?: boolean;
       video_codec?: string;
       video_sample_entry?: string;
       /** Format: int64 */
@@ -25529,7 +25547,7 @@ export interface components {
       /** @description The episode's IMDb and TMDB ratings, in the shape a title page's ratings use. Absent when the episode has no rating. */
       ratings?: components["schemas"]["CatalogRating"][];
       /**
-       * @description Release timing derived from air_date: upcoming when the calendar date is after today (UTC), released otherwise; absent when the air date is unknown
+       * @description Release timing derived from air_date; absent for unknown dates
        * @enum {string}
        */
       release_state?: "upcoming" | "released";
@@ -26564,20 +26582,6 @@ export interface components {
       server_name: string;
       show_tour: boolean;
     };
-    ItemCollection: {
-      /** @example 01J9Z8C3W4R5T6Y7U8I9O0P1Q2 */
-      id: string;
-      /**
-       * Format: int64
-       * @example 3
-       */
-      item_count: number;
-      poster_thumbhash?: string;
-      /** @description Presigned, short-lived; empty when none */
-      poster_url: string;
-      /** @example Dune Saga */
-      title: string;
-    };
     ItemCollectionsCapability: {
       /** @description Whether the current principal may use the capability */
       allowed: boolean;
@@ -26588,6 +26592,14 @@ export interface components {
        * @enum {string}
        */
       state: "available" | "disabled" | "not_configured" | "unsupported";
+    };
+    ItemCollectionView: {
+      id: string;
+      /** Format: int64 */
+      item_count: number;
+      poster_thumbhash?: string;
+      poster_url: string;
+      title: string;
     };
     ItemExtraInfo: {
       content_id: string;
@@ -29583,6 +29595,18 @@ export interface components {
       session_id?: string;
       terminal?: components["schemas"]["TerminalV3"];
     };
+    PlaybackInventoryV3: {
+      audio_tracks: components["schemas"]["AudioInventoryItemV3"][];
+      /** Format: int64 */
+      effective_media_file_id?: number;
+      effective_virtual_uri?: string;
+      inventory_revision: string;
+      inventory_status: string;
+      offered_virtual_uri?: string;
+      session_id: string;
+      subtitle_inventory: components["schemas"]["SubtitleInventoryItemV3"][];
+      virtual_source_revision?: string;
+    };
     PlaybackLearnedLimit: {
       /**
        * Format: date-time
@@ -29632,6 +29656,7 @@ export interface components {
       effective_recipe: components["schemas"]["EffectiveRecipeV3"];
       effective_virtual_uri?: string;
       expires_at?: string;
+      /** Format: uri-reference */
       inventory_url?: string;
       plan_attempt_key: string;
       plan_id: string;
@@ -29712,8 +29737,6 @@ export interface components {
       /** Format: int64 */
       attempt_count: number;
       attempted_plan_keys: string[];
-      /** @description Re-negotiates the session's version-fallback intent. Set true when the viewer re-arms Auto mid-session; omitted leaves the start-time intent unchanged. Never authorizes a healthy mid-play switch. */
-      auto_fallback?: boolean;
       /** Format: int64 */
       bandwidth_cap_kbps?: number;
       /**
@@ -30205,6 +30228,7 @@ export interface components {
       bandwidth_estimate_kbps?: number;
       /** @enum {string} */
       bandwidth_estimate_source?: "probe" | "observed_rebuffer";
+      carried_audio_track_id?: string;
       client_capabilities: components["schemas"]["ClientCodecCapabilitiesV3"];
       client_features: string[];
       client_playback_context: components["schemas"]["ClientPlaybackContextV3"];
@@ -30233,6 +30257,7 @@ export interface components {
        * @description What the plan that kept buffering received, measured as plan_summary throughput_kbps. Only with bandwidth_estimate_source observed_rebuffer; the server plans with, and learns, the lower of it and bandwidth_estimate_kbps.
        */
       observed_throughput_kbps?: number;
+      offered_virtual_uri?: string;
       playback_attempt_id: string;
       /** @description The attempt whose explicit audio and subtitle selections this restart should carry when the request names neither. Omit it for legacy client-identity carry. */
       previous_playback_attempt_id?: string;
@@ -31762,16 +31787,14 @@ export interface components {
       availability: "missing" | "partial" | "available";
       /**
        * Format: int64
-       * @description Episodes the series metadata provider lists for the season, aired or not
+       * @description Episodes TMDB lists for the season, aired or not
        * @example 10
        */
       episode_count: number;
       /** @example Season 2 */
       name?: string;
-      /** @description TMDB image path, when available */
+      /** @description TMDB image path */
       poster_path?: string;
-      /** @description Absolute artwork URL when the series metadata provider supplies one */
-      poster_url?: string;
       /** @description The title's active request covers this season */
       requested: boolean;
       /**
@@ -33178,7 +33201,6 @@ export interface components {
       codec?: string;
       /** Format: int64 */
       combined_index: number;
-      /** @description Embedded tracks only: the Matroska TrackNumber or MP4 track ID, omitted when unknown */
       container_track_id?: string;
       default: boolean;
       delivery: string;
@@ -33186,22 +33208,16 @@ export interface components {
       font_bundle_url?: string;
       forced: boolean;
       hearing_impaired: boolean;
-      /** @description Embedded text tracks of an HLS plan under hls_subtitle_renditions_all_v1: the track's WebVTT rendition in the stream's SUBTITLES group. The client may select it in its player and report the change with a subtitle_track_changed replan, which keeps the stream; url stays the fallback. */
       hls_rendition?: components["schemas"]["SubtitleInventoryHLSRenditionV3"];
       label?: string;
       /** @description Subtitle language: BCP 47 tag (en, pt-BR), empty when unknown; older rows may carry a legacy value */
       language?: string;
-      /** @description Embedded tracks only: selecting this track, with the plan's delivery and audio, yields subtitle.embedded. The client may switch to it locally and report the change with a subtitle_track_changed replan, which returns a plan for the same media; url, when the row has one, stays the fallback; a bitmap track delivered only by burn-in has none. */
       native_selectable?: boolean;
       source: string;
-      /**
-       * Format: int64
-       * @description Embedded tracks only: the absolute probed stream index, the namespace of subtitle.embedded.stream_index and the sidecar URL's embedded_stream_index
-       */
+      /** Format: int64 */
       stream_index?: number;
       sync_key?: string;
       track_id: string;
-      /** @description No route can show this track: the server has no rendering, conversion, or burn-in route for its format, or doesn't recognize the format at all. Selecting it gets a subtitle_codec_unsupported terminal, so a client should list it as unavailable. */
       unplayable?: boolean;
       /** Format: uri-reference */
       url?: string;
@@ -34046,7 +34062,6 @@ export interface components {
       index?: number;
       /** @description Track language from the file: BCP 47 tag, ISO 639-1 where one exists (en, pt-BR); und when the file marks it undetermined. Older scans may carry an ISO 639-2 code or the file's raw tag; an external track's comes from its file name */
       language?: string;
-      path_key?: string;
       resolution?: string;
       title?: string;
     };
@@ -34287,16 +34302,12 @@ export interface components {
        * @description Bytes
        */
       file_size: number;
-      /**
-       * Format: int64
-       * @description Custom-format score the virtual ranking assigned this candidate; absent when the row is unscored (local files, no ranking)
-       */
+      /** Format: int64 */
       format_score?: number;
       hdr: boolean;
       intro?: components["schemas"]["WatchMarker"];
       /** @description All effective marker occurrences for this file in source-time order; empty, never null */
       marker_segments: components["schemas"]["MarkerOccurrence"][];
-      /** @description Names of the enabled, non-rejecting custom formats the ranking matched on this candidate, best score first, then name; absent when the row is unscored or matched none */
       matched_formats?: string[];
       /** Format: int64 */
       multi_episode_end?: number;
@@ -34317,7 +34328,7 @@ export interface components {
       recap?: components["schemas"]["WatchMarker"];
       /** @example 1080p */
       resolution: string;
-      source_mismatch?: components["schemas"]["VersionSourceMismatch"];
+      source_mismatch?: components["schemas"]["WatchSourceMismatch"];
       subtitle_tracks?: components["schemas"]["WatchSubtitleTrack"][];
       /** @description Whether seek-bar previews are published for this file; read them with getWatchTrickplay */
       trickplay_available: boolean;
@@ -34785,6 +34796,12 @@ export interface components {
        * @enum {string}
        */
       direction: "asc" | "desc";
+    };
+    WatchSourceMismatch: {
+      /** Format: int64 */
+      declared_bytes: number;
+      /** Format: int64 */
+      served_bytes: number;
     };
     WatchSubtitle: {
       codec?: string;
@@ -96640,7 +96657,7 @@ export interface operations {
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
         /** @description The stable device identifier used to resolve device-scoped playback preferences; absent resolves the profile's preferences */
-        "X-Vio-Device-Id"?: string;
+        "X-Silo-Device-Id"?: string;
       };
       path: {
         /** @description Content id */
@@ -97821,7 +97838,7 @@ export interface operations {
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
         /** @description The stable device identifier used to resolve device-scoped playback preferences; absent resolves the profile's preferences */
-        "X-Vio-Device-Id"?: string;
+        "X-Silo-Device-Id"?: string;
       };
       path: {
         /** @description Content id */
@@ -126015,6 +126032,14 @@ export interface operations {
         "X-Silo-Client-Version"?: string;
         /** @description The client's stable device identifier; a successful start records it in the profile's device registry (first 128 characters) */
         "X-Silo-Device-Id"?: string;
+        /** @description App name first-party Vio clients send */
+        "X-Vio-Client"?: string;
+        /** @description Opaque build identifier paired with X-Vio-Client */
+        "X-Vio-Client-Build"?: string;
+        /** @description Opaque distribution channel paired with X-Vio-Client */
+        "X-Vio-Client-Channel"?: string;
+        /** @description Marketing version paired with X-Vio-Client */
+        "X-Vio-Client-Version"?: string;
       };
       path: {
         /** @description Opaque identifier */
@@ -126297,6 +126322,14 @@ export interface operations {
         "X-Silo-Client-Version"?: string;
         /** @description The client's stable device identifier; a successful start records it in the profile's device registry (first 128 characters) */
         "X-Silo-Device-Id"?: string;
+        /** @description App name first-party Vio clients send */
+        "X-Vio-Client"?: string;
+        /** @description Opaque build identifier paired with X-Vio-Client */
+        "X-Vio-Client-Build"?: string;
+        /** @description Opaque distribution channel paired with X-Vio-Client */
+        "X-Vio-Client-Channel"?: string;
+        /** @description Marketing version paired with X-Vio-Client */
+        "X-Vio-Client-Version"?: string;
       };
       path: {
         /** @description Opaque identifier */
@@ -126466,6 +126499,14 @@ export interface operations {
         "X-Silo-Client-Version"?: string;
         /** @description The client's stable device identifier; a successful start records it in the profile's device registry (first 128 characters) */
         "X-Silo-Device-Id"?: string;
+        /** @description App name first-party Vio clients send */
+        "X-Vio-Client"?: string;
+        /** @description Opaque build identifier paired with X-Vio-Client */
+        "X-Vio-Client-Build"?: string;
+        /** @description Opaque distribution channel paired with X-Vio-Client */
+        "X-Vio-Client-Channel"?: string;
+        /** @description Marketing version paired with X-Vio-Client */
+        "X-Vio-Client-Version"?: string;
       };
       path: {
         /** @description Opaque identifier */
@@ -126967,11 +127008,7 @@ export interface operations {
   getPlaybackConnection: {
     parameters: {
       query?: never;
-      header: {
-        /** @description The household profile acting for this request; it must belong to the authenticated account. */
-        "X-Profile-Id": string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
+      header?: {
         "X-Silo-Device-Id"?: string;
       };
       path?: never;
@@ -127000,24 +127037,6 @@ export interface operations {
       };
       /** @description Unauthorized */
       401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
         headers: {
           [name: string]: unknown;
         };
@@ -127076,10 +127095,6 @@ export interface operations {
     parameters: {
       query?: never;
       header: {
-        /** @description The household profile acting for this request; it must belong to the authenticated account. */
-        "X-Profile-Id": string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
         "X-Silo-Device-Id": string;
       };
       path?: never;
@@ -127105,24 +127120,6 @@ export interface operations {
       };
       /** @description Unauthorized */
       401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
         headers: {
           [name: string]: unknown;
         };
@@ -127205,6 +127202,14 @@ export interface operations {
         "X-Silo-Client-Version"?: string;
         /** @description The client's stable device identifier; a successful start records it in the profile's device registry (first 128 characters) */
         "X-Silo-Device-Id"?: string;
+        /** @description App name first-party Vio clients send */
+        "X-Vio-Client"?: string;
+        /** @description Opaque build identifier paired with X-Vio-Client */
+        "X-Vio-Client-Build"?: string;
+        /** @description Opaque distribution channel paired with X-Vio-Client */
+        "X-Vio-Client-Channel"?: string;
+        /** @description Marketing version paired with X-Vio-Client */
+        "X-Vio-Client-Version"?: string;
       };
       path?: never;
       cookie?: never;
@@ -137272,11 +137277,11 @@ export interface operations {
         /** @description The client family whose profile_client values take part; optional, and absence skips the profile_client layer */
         "X-Silo-Client-Family"?: "tv" | "mobile" | "tablet" | "desktop" | "web";
         /** @description The client's stable device identifier; its profile_device values take part */
-        "X-Vio-Device-Id"?: string;
+        "X-Silo-Device-Id"?: string;
         /** @description Optional display name recorded on the device registry */
-        "X-Vio-Device-Name"?: string;
+        "X-Silo-Device-Name"?: string;
         /** @description Optional platform recorded on the device registry */
-        "X-Vio-Device-Platform"?: string;
+        "X-Silo-Device-Platform"?: string;
       };
       path?: never;
       cookie?: never;
@@ -137386,11 +137391,11 @@ export interface operations {
         /** @description The client family whose profile_client values take part; optional, and absence skips the profile_client layer */
         "X-Silo-Client-Family"?: "tv" | "mobile" | "tablet" | "desktop" | "web";
         /** @description The client's stable device identifier; its profile_device values take part */
-        "X-Vio-Device-Id"?: string;
+        "X-Silo-Device-Id"?: string;
         /** @description Optional display name recorded on the device registry */
-        "X-Vio-Device-Name"?: string;
+        "X-Silo-Device-Name"?: string;
         /** @description Optional platform recorded on the device registry */
-        "X-Vio-Device-Platform"?: string;
+        "X-Silo-Device-Platform"?: string;
       };
       path?: never;
       cookie?: never;
