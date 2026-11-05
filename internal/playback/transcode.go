@@ -723,7 +723,7 @@ func StartTranscode(ctx context.Context, opts TranscodeOpts) (*TranscodeSession,
 		releaseHWDevice()
 		return nil, fmt.Errorf("create output dir: %w", err)
 	}
-	if err := prepareSubtitleFilterInput(&opts); err != nil {
+	if err := prepareSubtitleFilterInput(context.Background(), &opts); err != nil {
 		releaseHWDevice()
 		return nil, err
 	}
