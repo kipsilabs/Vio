@@ -7170,7 +7170,8 @@
             "software_video_decode_v1",
             "plan_invalidated_v1",
             "default_audio_reconcile_response_v1",
-            "plan_source_duration_v1"
+            "plan_source_duration_v1",
+            "audio_track_unverified_v1"
           ],
           "outcome": "adaptation_unavailable",
           "terminal": {
