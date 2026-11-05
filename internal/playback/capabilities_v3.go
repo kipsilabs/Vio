@@ -1,6 +1,7 @@
 package playback
 
 import (
+	"slices"
 	"strconv"
 	"strings"
 	"unicode"
@@ -29,7 +30,7 @@ func SourceDescriptorFromFileV3(file *models.MediaFile, audioIndex int) SourceDe
 	source := SourceDescriptorV3{
 		MediaFileID:        file.ID,
 		DurationSeconds:    SourceDurationSecondsV3(file),
-		Container:          normalizeContainerV3(file.Container),
+		Container:          normalizeCodecV3(file.Container),
 		VideoCodec:         normalizeCodecV3(file.CodecVideo),
 		AudioCodec:         normalizeCodecV3(file.CodecAudio),
 		AudioChannels:      file.AudioChannels,
@@ -118,6 +119,8 @@ const h264BaselineProfileV3 = "baseline"
 // result reports that the route was blocked by insufficient evidence for the
 // tier — the client claims the codec in its flat lists but the tier's
 // validation could not confirm the stream — rather than by device facts.
+// An exact decoder's frame rate may trade against its size up to
+// maxTradedFrameRateV3 (see decoderTakesFrameV3).
 func videoEligibleV3(source SourceDescriptorV3, request StartRequestV3) (bool, bool) {
 	if !routeVideoMetadataCompleteV3(source) {
 		return false, false
@@ -126,34 +129,25 @@ func videoEligibleV3(source SourceDescriptorV3, request StartRequestV3) (bool, b
 		containsFoldV3(request.Capabilities.CodecsVideoHardware, source.VideoCodec)
 	switch request.Capabilities.VideoEvidence {
 	case EvidenceDeclaredV3:
-		// A declared decode entry narrows the flat codec claim when present.
-		// Unlike exact evidence it does not assert profile/level support, but
-		// its explicit bit-depth and envelope limits are still meaningful.
-		if len(request.Capabilities.VideoDecode) == 0 {
-			return flatClaims, false
+		// Boolean support statements: copy routes are granted on a flat codec
+		// match (container and dynamic range are gated separately by the
+		// planner). A declared decode entry can only narrow that claim: the
+		// web names the bit depths its codec probes accepted, so a browser
+		// that refuses H.264 High 10 is not handed a 10-bit copy.
+		if !flatClaims {
+			return false, false
 		}
-		matchedCodec := false
+		named := false
 		for _, capability := range request.Capabilities.VideoDecode {
 			if !strings.EqualFold(capability.Codec, source.VideoCodec) {
 				continue
 			}
-			matchedCodec = true
-			if len(capability.BitDepths) > 0 && !containsIntV3(capability.BitDepths, source.BitDepth) {
-				continue
+			named = true
+			if videoDecodeTakesSourceV3(capability, source, false, false, false) {
+				return true, false
 			}
-			if request.Capabilities.VideoEvidence != EvidenceExactV3 && capability.MaxFrameRate > 0 && source.FrameRate > capability.MaxFrameRate {
-				continue
-			}
-			if !decoderEnvelopeFitsV3(source, capability, request.Capabilities.VideoEvidence == EvidenceExactV3) {
-				continue
-			}
-			return flatClaims, false
 		}
-		if matchedCodec {
-			return false, flatClaims
-		}
-		return flatClaims, false
-
+		return !named, false
 	case EvidenceExactV3, EvidencePlatformAttestedV3:
 		softwareDecodeOptIn := HasFeatureV3(request.ClientFeatures, FeatureSoftwareVideoDecodeV3)
 		matchedCodec := false
@@ -164,24 +158,17 @@ func videoEligibleV3(source SourceDescriptorV3, request StartRequestV3) (bool, b
 			}
 			matchedCodec = true
 			skipProfileLevel := request.Capabilities.VideoEvidence == EvidencePlatformAttestedV3 && capability.Hardware
-			if !skipProfileLevel {
-				if len(capability.Profiles) > 0 && !videoProfileSupportedV3(source.VideoCodec, source.VideoProfile, capability.Profiles) {
-					continue
-				}
-				if len(capability.Levels) > 0 && (source.VideoLevel <= 0 || !containsAtLeastV3(capability.Levels, source.VideoLevel)) {
-					continue
-				}
+			// Only an exact entry reports a rate measured at its largest size;
+			// a platform-attested entry is a fixed, tested envelope. Android
+			// also caps a smaller frame's rate by the codec's overall
+			// frame-rate range, which the entry does not report, so the trade
+			// stops at maxTradedFrameRateV3.
+			rateAtMaxSize := request.Capabilities.VideoEvidence == EvidenceExactV3 &&
+				source.FrameRate <= maxTradedFrameRateV3+0.01
+			hevcLevelInFamily := request.Capabilities.VideoEvidence == EvidenceExactV3 && capability.Hardware
+			if videoDecodeTakesSourceV3(capability, source, skipProfileLevel, rateAtMaxSize, hevcLevelInFamily) {
+				return true, false
 			}
-			if len(capability.BitDepths) > 0 && !containsIntV3(capability.BitDepths, source.BitDepth) {
-				continue
-			}
-			if request.Capabilities.VideoEvidence != EvidenceExactV3 && capability.MaxFrameRate > 0 && source.FrameRate > capability.MaxFrameRate {
-				continue
-			}
-			if !decoderEnvelopeFitsV3(source, capability, request.Capabilities.VideoEvidence == EvidenceExactV3) {
-				continue
-			}
-			return true, false
 		}
 		// A flat-list claim with no validating decode entry means the tier's
 		// evidence could not confirm the stream, not that the device refused
@@ -192,25 +179,115 @@ func videoEligibleV3(source SourceDescriptorV3, request StartRequestV3) (bool, b
 	}
 }
 
-func decoderEnvelopeFitsV3(source SourceDescriptorV3, capability VideoDecodeCapabilityV3, rateAtMaxSize bool) bool {
-	if capability.MaxWidth > 0 && source.Width > capability.MaxWidth || capability.MaxHeight > 0 && source.Height > capability.MaxHeight || capability.MaxBitrateKbps > 0 && source.BitrateKbps > capability.MaxBitrateKbps {
-		return false
-	}
-	if capability.MaxFrameRate > 0 && source.FrameRate > capability.MaxFrameRate {
-		// A decoder's maximum frame rate trades against resolution. Preserve
-		// the pixel-rate envelope, but never allow more than double the stated
-		// rate (the protocol deliberately does not claim a general range).
-		if capability.MaxWidth <= 0 || capability.MaxHeight <= 0 || source.FrameRate > capability.MaxFrameRate*2 ||
-			// A reported rate is an exact ceiling at the largest size. Do not
-			// infer a 4K decoder's behavior for a 1080p source; the supported
-			// trade is between adjacent tested sizes (for example 1080p30 ->
-			// 720p60).
-			(!rateAtMaxSize && capability.MaxWidth >= 3840 && capability.MaxHeight >= 2160 && source.Width >= 1920 && source.Height >= 1080) ||
-			float64(source.Width*source.Height)*source.FrameRate > float64(capability.MaxWidth*capability.MaxHeight)*capability.MaxFrameRate {
+// videoDecodeTakesSourceV3 reports whether one decode entry's bounds admit
+// the source. An omitted bound is unconstrained. rateAtMaxSize lets the
+// source trade frame rate against size as decoderTakesFrameV3 describes;
+// otherwise the entry's rate is absolute. hevcLevelInFamily lets an HEVC
+// level tag exceed the entry's levels as hevcLevelFitsDecoderV3 describes.
+func videoDecodeTakesSourceV3(capability VideoDecodeCapabilityV3, source SourceDescriptorV3, skipProfileLevel, rateAtMaxSize, hevcLevelInFamily bool) bool {
+	if !skipProfileLevel {
+		if len(capability.Profiles) > 0 && !videoProfileSupportedV3(source.VideoCodec, source.VideoProfile, capability.Profiles) {
 			return false
 		}
+		if len(capability.Levels) > 0 {
+			levelFits := (source.VideoLevel > 0 && containsAtLeastV3(capability.Levels, source.VideoLevel)) ||
+				(hevcLevelInFamily && hevcLevelFitsDecoderV3(source, slices.Max(capability.Levels)))
+			if !levelFits {
+				return false
+			}
+		}
 	}
-	return true
+	if len(capability.BitDepths) > 0 && !containsIntV3(capability.BitDepths, source.BitDepth) {
+		return false
+	}
+	return decoderTakesFrameV3(capability, source.Width, source.Height, source.FrameRate, rateAtMaxSize) &&
+		(capability.MaxBitrateKbps <= 0 || source.BitrateKbps <= capability.MaxBitrateKbps)
+}
+
+// hevcLevelLimitV3 holds H.265 level limits for one level_idc: maxLumaPs
+// (Table A.8; levels sharing it also share the decoded picture buffer,
+// slice-segment and tile limits), and maxLumaSr and maxBRKbps (Table A.9,
+// Main tier, since Android reports levels without a tier).
+type hevcLevelLimitV3 struct {
+	maxLumaPs int
+	maxLumaSr int
+	maxBRKbps int
+}
+
+var hevcLevelLimitsV3 = map[int]hevcLevelLimitV3{
+	30:  {36_864, 552_960, 128},
+	60:  {122_880, 3_686_400, 1_500},
+	63:  {245_760, 7_372_800, 3_000},
+	90:  {552_960, 16_588_800, 6_000},
+	93:  {983_040, 33_177_600, 10_000},
+	120: {2_228_224, 66_846_720, 12_000},
+	123: {2_228_224, 133_693_440, 20_000},
+	150: {8_912_896, 267_386_880, 25_000},
+	153: {8_912_896, 534_773_760, 40_000},
+	156: {8_912_896, 1_069_547_520, 60_000},
+	180: {35_651_584, 1_069_547_520, 60_000},
+	183: {35_651_584, 2_139_095_040, 120_000},
+	186: {35_651_584, 4_278_190_080, 240_000},
+}
+
+// hevcLevelFitsDecoderV3 reports whether an HEVC source tagged above a
+// decoder's highest level stays within that level's decoding work. Encoders
+// pick the level from the declared buffer and peak bitrate as well as picture
+// size and rate, so a 4K24 encode with a high VBV ceiling is tagged 5.2
+// though a 5.1 decoder handles its pictures. The tag must share the decoder
+// level's picture-size family, and the source's sample rate and average
+// bitrate must fit the decoder's level. Peaks and per-picture slice counts
+// are not in the metadata, which is why the bitrate bound is Main tier's.
+// The stored frame rate is an average too, so a variable-rate stream could
+// hide faster stretches: the sample rate is checked at no less than
+// maxTradedFrameRateV3.
+func hevcLevelFitsDecoderV3(source SourceDescriptorV3, decoderLevel int) bool {
+	sourceLimit, sourceKnown := hevcLevelLimitsV3[source.VideoLevel]
+	decoderLimit, decoderKnown := hevcLevelLimitsV3[decoderLevel]
+	if !strings.EqualFold(source.VideoCodec, transcodeCodecHEVC) || !sourceKnown || !decoderKnown ||
+		sourceLimit.maxLumaPs != decoderLimit.maxLumaPs {
+		return false
+	}
+	lumaPs := source.Width * source.Height
+	frameRate := max(source.FrameRate, maxTradedFrameRateV3)
+	return lumaPs > 0 && lumaPs <= decoderLimit.maxLumaPs &&
+		float64(lumaPs)*frameRate <= float64(decoderLimit.maxLumaSr) &&
+		source.BitrateKbps > 0 && source.BitrateKbps <= decoderLimit.maxBRKbps
+}
+
+// maxTradedFrameRateV3 is the highest source frame rate a copy route admits
+// by trading an exact decoder's rate against its size. It covers the 50 and
+// 60 fps sources the trade is for without assuming a frame-rate range the
+// decoder never reported.
+const maxTradedFrameRateV3 = 60
+
+// decoderTakesFrameRateV3 reports whether a decoder takes a frame rate at its
+// largest size; an unknown rate or limit always passes.
+func decoderTakesFrameRateV3(decoder VideoDecodeCapabilityV3, frameRate float64) bool {
+	return decoder.MaxFrameRate <= 0 || frameRate <= decoder.MaxFrameRate+0.01
+}
+
+// decoderTakesFrameV3 reports whether a decoder takes width x height video at
+// frameRate. The maximum width and height always bind. With rateAtMaxSize the
+// reported rate holds at the decoder's largest size (Android derives it
+// there), so a smaller frame may run faster within the same macroblock rate,
+// counted in 16x16 macroblocks as Android's performance points are: a 4K30
+// decoder takes 1080p60 but not 1080p120, and a 1080p30 one takes 720p60 but
+// not 1080p60. Otherwise, or without both sizes, the rate is absolute.
+func decoderTakesFrameV3(decoder VideoDecodeCapabilityV3, width, height int, frameRate float64, rateAtMaxSize bool) bool {
+	if (decoder.MaxWidth > 0 && width > decoder.MaxWidth) || (decoder.MaxHeight > 0 && height > decoder.MaxHeight) {
+		return false
+	}
+	if decoderTakesFrameRateV3(decoder, frameRate) {
+		return true
+	}
+	return rateAtMaxSize && decoder.MaxWidth > 0 && decoder.MaxHeight > 0 && width > 0 && height > 0 &&
+		float64(macroblocksV3(width, height))*frameRate <= float64(macroblocksV3(decoder.MaxWidth, decoder.MaxHeight))*(decoder.MaxFrameRate+0.01)
+}
+
+// macroblocksV3 counts the 16x16 macroblocks that cover a frame.
+func macroblocksV3(width, height int) int {
+	return ((width + 15) / 16) * ((height + 15) / 16)
 }
 
 // videoProfileSupportedV3 compares a source profile with the profiles an exact
@@ -265,32 +342,6 @@ func routeVideoMetadataCompleteV3(source SourceDescriptorV3) bool {
 		source.Height > 0 &&
 		source.FrameRate > 0 &&
 		source.BitrateKbps > 0
-}
-
-// VirtualRouteVideoMetadataCompleteV3 is the row-level form of
-// routeVideoMetadataCompleteV3 for a media file that has not yet been planned.
-// The virtual playback fast paths use it so a stored-URL resume cannot skip the
-// resolve+probe the planner depends on: a row whose video fields are not
-// planner-complete must fall through to a real probe. Audio-only files have no
-// video route to validate, so they report false here and callers exempt them
-// explicitly. Frame rate is parsed through the same parseFrameRateV3 the source
-// descriptor uses, so the stored "30000/1001"-style strings stay compatible.
-func VirtualRouteVideoMetadataCompleteV3(file *models.MediaFile) bool {
-	if file == nil || file.IsAudioOnly() {
-		return false
-	}
-	return routeVideoMetadataCompleteV3(SourceDescriptorFromFileV3(file, -1))
-}
-
-// VirtualRouteVideoMetadataGapsV3 is the row-level counterpart of
-// routeVideoMetadataGapsDetailV3. It names the missing video fields in the same
-// order and wording the source_metadata_incomplete terminal uses, so a
-// fast-path skip log can be correlated with the terminal it prevents.
-func VirtualRouteVideoMetadataGapsV3(file *models.MediaFile) string {
-	if file == nil || file.IsAudioOnly() {
-		return ""
-	}
-	return routeVideoMetadataGapsDetailV3(SourceDescriptorFromFileV3(file, -1))
 }
 
 // nativeOutputHDRV3 resolves the HDR facts a native HDR/DV presentation may be
@@ -462,50 +513,13 @@ func outputRangeEligibleV3(source SourceDescriptorV3, request StartRequestV3) (b
 // says the original-file executor can inspect the source and choose its own
 // display presentation after delivery; it does not make the same HDR source
 // safe for a server-produced progressive or HLS stream.
-//
-// Dolby Vision takes a narrower path: presentation depends on a compatible
-// base layer, so the generic claim is not enough. The source row must prove its
-// base layer and carry an explicit compatibility id, and the client must claim
-// that exact id. An absent or unknown id has no claim and fails closed.
 func clientManagesOriginalDynamicRangeV3(source SourceDescriptorV3, request StartRequestV3) bool {
 	if source.DynamicRange == "" || source.DynamicRange == DynamicRangeSDRV3 {
 		return false
 	}
-	// A client that manages its own dynamic-range presentation still needs a
-	// decodable base layer for Dolby Vision. Compatibility IDs 1 (HDR10),
-	// 2 (SDR), 4 (HLG) and 6 (HDR10) guarantee one. An absent ID or any other
-	// value (for example profile 5) does not, so the claim is refused and the
-	// planner keeps the routes that carry a validated range.
-	if source.DynamicRange == DynamicRangeDolbyVisionV3 && !crossCompatibleDVBaseLayerV3(source.DVBLCompatID) {
-		return false
-	}
 	delivery, ok := request.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3]
 	return ok && delivery.Enabled && delivery.SupportedOnDevice &&
-		deliveryManagesOriginalDynamicRangeV3(delivery, source)
-}
-
-// deliveryManagesOriginalDynamicRangeV3 is the single rule for the per-delivery
-// managed-range bypass. Planning and the finished-plan check in
-// deliverySupportsPlanV3 share it so a Dolby Vision source cannot reach direct
-// play on the generic claim alone.
-func deliveryManagesOriginalDynamicRangeV3(delivery DeliveryCapabilityV3, source SourceDescriptorV3) bool {
-	if source.DynamicRange == DynamicRangeDolbyVisionV3 {
-		return deliveryManagedDVBaseLayerV3(delivery, source)
-	}
-	return containsFoldV3(delivery.ValidatedClaims, ClaimClientManagedDynamicRangeV3)
-}
-
-// deliveryManagedDVBaseLayerV3 reports whether the executor claims the base
-// layer for this source's compatibility id. Profiles 7 and 8 are the composite
-// Dolby Vision profiles whose standard base layer an ordinary decoder can
-// present; profiles without a base layer, an unproven base-layer record, or an
-// id the client never claimed are all refused rather than assumed.
-func deliveryManagedDVBaseLayerV3(delivery DeliveryCapabilityV3, source SourceDescriptorV3) bool {
-	if !source.DVBaseLayerProven || (source.DVProfile != 7 && source.DVProfile != 8) {
-		return false
-	}
-	claim := ClientManagedDVBaseLayerClaimV3(source.DVBLCompatID)
-	return claim != "" && containsFoldV3(delivery.ValidatedClaims, claim)
+		containsFoldV3(delivery.ValidatedClaims, ClaimClientManagedDynamicRangeV3)
 }
 
 // clientSelectsOriginalAudioTrackV3 is delivery-scoped because original HTTP
@@ -589,81 +603,31 @@ func dolbyVisionBaseLayerRangeV3(compatID int) (string, bool) {
 	}
 }
 
-// crossCompatibleDVBaseLayerV3 reports whether a Dolby Vision base-layer
-// compatibility ID guarantees a decodable base layer (compatibility IDs 1,
-// 2, 4, or 6) that an executor can present without a specialized decoder.
-func crossCompatibleDVBaseLayerV3(compatID int) bool {
-	switch compatID {
-	case 1, 2, 4, 6:
-		return true
-	}
-	return false
-}
-
-// audioRenderModeV3 classifies how a client can render an audio codec without a
-// server transform.
-type audioRenderModeV3 int
-
-const (
-	audioRenderUnsupportedV3 audioRenderModeV3 = iota
-	audioRenderDecodeV3
-	audioRenderPassthroughV3
-)
-
-// audioRenderModeForTrackV3 is the single rule shared by the planner's
-// audioEligibilityV3 and the track selector's playability predicate, so both
-// agree on exactly which codecs/channels/layouts are directly renderable.
-//
-// Passthrough claims require exact audio evidence and the layout-passthrough
-// feature: only a client that can attest real sink layouts (Android audio HAL
-// enumeration) may earn a validated passthrough claim, and it must still name a
-// matching channel/layout entry. platform_attested and declared decode evidence
-// still qualifies for the decode path.
-func audioRenderModeForTrackV3(codec string, channels int, layout string, request StartRequestV3) audioRenderModeV3 {
-	passthroughCaps := request.ClientPlaybackContext.Output.AudioPassthrough
-	if passthroughCaps == nil {
-		passthroughCaps = request.Capabilities.AudioPassthrough
-	}
-	if request.Capabilities.AudioEvidence == EvidenceExactV3 &&
-		passthroughCaps != nil && containsFoldV3(passthroughCaps.PassthroughCodecs, codec) &&
-		HasFeatureV3(request.ClientFeatures, FeatureLayoutPassthrough) {
-		for _, entry := range passthroughCaps.Entries {
-			if !strings.EqualFold(entry.Codec, codec) || len(entry.ChannelCounts) == 0 || len(entry.Layouts) == 0 ||
-				!containsIntV3(entry.ChannelCounts, channels) || !containsFoldV3(entry.Layouts, layout) {
-				continue
-			}
-			return audioRenderPassthroughV3
-		}
-	}
-	if containsFoldV3(request.Capabilities.CodecsAudio, codec) {
-		return audioRenderDecodeV3
-	}
-	return audioRenderUnsupportedV3
-}
-
-// AudioTrackPlayableFuncV3 returns a predicate reporting whether the client can
-// render an audio track without a server transform. The track selector uses it
-// so it prefers exactly the tracks audioEligibilityV3 would accept, including
-// only the passthrough claims that pass the evidence/layout/feature gate.
-func AudioTrackPlayableFuncV3(request StartRequestV3) func(models.AudioTrack) bool {
-	return func(track models.AudioTrack) bool {
-		return audioRenderModeForTrackV3(track.Codec, track.Channels, track.Layout, request) != audioRenderUnsupportedV3
-	}
-}
-
 func audioEligibilityV3(source SourceDescriptorV3, request StartRequestV3) (copyOK, passthrough bool, claim AudioClaimsV3) {
 	claim.Codec = source.AudioCodec
 	passthroughCaps := request.ClientPlaybackContext.Output.AudioPassthrough
 	if passthroughCaps == nil {
 		passthroughCaps = request.Capabilities.AudioPassthrough
 	}
-	switch audioRenderModeForTrackV3(source.AudioCodec, source.AudioChannels, source.AudioLayout, request) {
-	case audioRenderPassthroughV3:
-		claim.Passthrough = true
-		claim.AtmosPreserved = strings.Contains(strings.ToLower(source.AudioLayout), "joc") || strings.Contains(strings.ToLower(source.AudioLayout), "atmos")
-		claim.Reason = "sink_passthrough_validated"
-		return true, true, claim
-	case audioRenderDecodeV3:
+	// Passthrough claims require exact audio evidence: only a client that can
+	// attest real sink layouts (Android audio HAL enumeration) may earn a
+	// validated passthrough claim. platform_attested and declared decode
+	// evidence still qualifies for copy routes below.
+	if request.Capabilities.AudioEvidence == EvidenceExactV3 &&
+		passthroughCaps != nil && containsFoldV3(passthroughCaps.PassthroughCodecs, source.AudioCodec) &&
+		HasFeatureV3(request.ClientFeatures, FeatureLayoutPassthrough) {
+		for _, entry := range passthroughCaps.Entries {
+			if !strings.EqualFold(entry.Codec, source.AudioCodec) || len(entry.ChannelCounts) == 0 || len(entry.Layouts) == 0 ||
+				!containsIntV3(entry.ChannelCounts, source.AudioChannels) || !containsFoldV3(entry.Layouts, source.AudioLayout) {
+				continue
+			}
+			claim.Passthrough = true
+			claim.AtmosPreserved = strings.Contains(strings.ToLower(source.AudioLayout), "joc") || strings.Contains(strings.ToLower(source.AudioLayout), "atmos")
+			claim.Reason = "sink_passthrough_validated"
+			return true, true, claim
+		}
+	}
+	if containsFoldV3(request.Capabilities.CodecsAudio, source.AudioCodec) {
 		claim.Reason = "client_decode_supported"
 		return true, false, claim
 	}
@@ -712,21 +676,6 @@ func normalizeBitrateKbpsV3(value int) int {
 	return value
 }
 
-// parseWxHResolution parses a "WIDTHxHEIGHT" resolution string.
-func parseWxHResolution(value string) (int, int, bool) {
-	value = strings.ToLower(strings.TrimSpace(value))
-	left, right, ok := strings.Cut(value, "x")
-	if !ok {
-		return 0, 0, false
-	}
-	w, err1 := strconv.Atoi(left)
-	h, err2 := strconv.Atoi(right)
-	if err1 != nil || err2 != nil || w <= 0 || h <= 0 || w > 32768 || h > 32768 || right != strconv.Itoa(h) {
-		return 0, 0, false
-	}
-	return w, h, true
-}
-
 func dimensionsFromResolutionV3(value string) (int, int) {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case "4320p", "8k":
@@ -740,37 +689,8 @@ func dimensionsFromResolutionV3(value string) (int, int) {
 	case "480p", "sd":
 		return 854, 480
 	default:
-		if w, h, ok := parseWxHResolution(value); ok {
-			return w, h
-		}
 		return 0, 0
 	}
-}
-
-func normalizeContainerV3(value string) string {
-	parts := strings.Split(strings.ToLower(strings.TrimSpace(value)), ",")
-	for _, part := range parts {
-		switch strings.TrimSpace(part) {
-		case "matroska", "webm":
-			return "mkv"
-		case "mov", "m4a":
-			return "mp4"
-		case "mpegts", "mpeg-ts":
-			return "ts"
-		case "mp4", "mkv", "ts", "m2ts", "avi", "flv", "wmv", "mpeg", "mpg", "ogv", "3gp":
-			return strings.TrimSpace(part)
-		}
-	}
-	return strings.ToLower(strings.TrimSpace(value))
-}
-
-// CodecsAgreeV3 reports whether two codec spellings name the same codec under
-// the planner's own normalization, so "h265"/"hevc" and "h264"/"avc" compare
-// equal. Callers outside the playback package use it to refuse to mix a
-// declared codec with descriptor evidence for a different one instead of
-// duplicating the normalization table.
-func CodecsAgreeV3(left, right string) bool {
-	return normalizeCodecV3(left) == normalizeCodecV3(right)
 }
 
 func normalizeCodecV3(value string) string {
@@ -829,33 +749,6 @@ func containsAtLeastV3(values []int, wanted int) bool {
 	return false
 }
 
-// routeVideoMetadataGapsDetailV3 names the descriptor fields that left a
-// source unroutable, so terminals and decision logs identify the probe
-// deficiency directly instead of leaving every report to guess which field
-// the scanner never filled.
-func routeVideoMetadataGapsDetailV3(source SourceDescriptorV3) string {
-	var missing []string
-	if source.VideoCodec == "" {
-		missing = append(missing, "video codec")
-	}
-	if source.BitDepth <= 0 {
-		missing = append(missing, "bit depth")
-	}
-	if source.Width <= 0 || source.Height <= 0 {
-		missing = append(missing, "resolution")
-	}
-	if source.FrameRate <= 0 {
-		missing = append(missing, "frame rate")
-	}
-	if source.BitrateKbps <= 0 {
-		missing = append(missing, "bitrate")
-	}
-	if len(missing) == 0 {
-		return ""
-	}
-	return "missing: " + strings.Join(missing, ", ")
-}
-
 func tighterBoundV3(a, b int) int {
 	switch {
 	case a == 0:
@@ -880,31 +773,4 @@ func tighterBoundFloatV3(a, b float64) float64 {
 	default:
 		return a
 	}
-}
-
-func decoderTakesFrameRateV3(decoder VideoDecodeCapabilityV3, frameRate float64) bool {
-	return decoder.MaxFrameRate <= 0 || frameRate <= decoder.MaxFrameRate+0.01
-}
-
-// decoderTakesFrameV3 reports whether a decoder takes width x height video at
-// frameRate. The maximum width and height always bind. With rateAtMaxSize the
-// reported rate holds at the decoder's largest size (Android derives it
-// there), so a smaller frame may run faster within the same macroblock rate,
-// counted in 16x16 macroblocks as Android's performance points are: a 4K30
-// decoder takes 1080p60 but not 1080p120, and a 1080p30 one takes 720p60 but
-// not 1080p60. Otherwise, or without both sizes, the rate is absolute.
-func decoderTakesFrameV3(decoder VideoDecodeCapabilityV3, width, height int, frameRate float64, rateAtMaxSize bool) bool {
-	if (decoder.MaxWidth > 0 && width > decoder.MaxWidth) || (decoder.MaxHeight > 0 && height > decoder.MaxHeight) {
-		return false
-	}
-	if decoderTakesFrameRateV3(decoder, frameRate) {
-		return true
-	}
-	return rateAtMaxSize && decoder.MaxWidth > 0 && decoder.MaxHeight > 0 && width > 0 && height > 0 &&
-		float64(macroblocksV3(width, height))*frameRate <= float64(macroblocksV3(decoder.MaxWidth, decoder.MaxHeight))*(decoder.MaxFrameRate+0.01)
-}
-
-// macroblocksV3 counts the 16x16 macroblocks that cover a frame.
-func macroblocksV3(width, height int) int {
-	return ((width + 15) / 16) * ((height + 15) / 16)
 }
