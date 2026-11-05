@@ -225,7 +225,7 @@ func dumpFontAttachments(ctx context.Context, inputPath string, ffmpegPath strin
 		}
 		return nil, fmt.Errorf("subtitle fonts: extract attachments: %w", err)
 	}
-	if int64(len(data)) != expected {
+	if int64(data.Len()) != expected {
 		return nil, errors.New("subtitle fonts: attachment data differs from probed size")
 	}
 	fonts := make([]SubtitleFontAttachment, 0, len(streams))
@@ -235,7 +235,7 @@ func dumpFontAttachments(ctx context.Context, inputPath string, ffmpegPath strin
 		fonts = append(fonts, SubtitleFontAttachment{
 			StreamIndex: stream.Index,
 			Name:        safeAttachmentDisplayName(stream, fmt.Sprintf("attachment-%d%s", i, fontAttachmentExt(stream))),
-			Data:        data[offset:end:end],
+			Data:        data.Bytes()[offset:end:end],
 		})
 		offset = end
 	}
