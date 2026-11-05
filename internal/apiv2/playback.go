@@ -74,7 +74,7 @@ type PlaybackStartBody struct {
 	AudioTrackIndex            *int                               `json:"audio_track_index,omitempty" nullable:"false"`
 	CarriedAudioTrackID        string                             `json:"carried_audio_track_id,omitempty"`
 	FileSelection              playback.FileSelectionV3           `json:"file_selection,omitempty" enum:"auto,explicit"`
-	OfferedVirtualURI          string                             `json:"offered_virtual_uri,omitempty"`
+	OfferedVirtualURI          string                             `json:"offered_virtual_uri,omitempty" doc:"Virtual candidate URI the client offered; not validated as a URI"`
 	ForceRelink                bool                               `json:"force_relink,omitempty"`
 	SubtitleTrackID            string                             `json:"subtitle_track_id,omitempty"`
 	SubtitleTrackIndex         *int                               `json:"subtitle_track_index,omitempty" nullable:"false"`
@@ -123,7 +123,7 @@ type PlaybackPlan struct {
 	TracksPending          bool                            `json:"tracks_pending,omitempty"`
 	DeliveryChange         *DeliveryChange                 `json:"delivery_change,omitempty"`
 	VirtualSourceRevision  string                          `json:"virtual_source_revision,omitempty"`
-	EffectiveVirtualURI    string                          `json:"effective_virtual_uri,omitempty"`
+	EffectiveVirtualURI    string                          `json:"effective_virtual_uri,omitempty" doc:"Virtual candidate URI that is playing; not validated as a URI"`
 }
 
 // DeliveryChange is the v2 projection of a mid-session serving-route change on

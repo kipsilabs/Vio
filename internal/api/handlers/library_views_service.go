@@ -102,7 +102,7 @@ type CollectionItemView = itemListResponse
 type ItemCollectionView struct {
 	ID              string `json:"id"`
 	Title           string `json:"title"`
-	PosterURL       string `json:"poster_url"`
+	PosterURL       string `json:"poster_url" doc:"Stored artwork reference; not validated as a URI"`
 	PosterThumbhash string `json:"poster_thumbhash,omitempty"`
 	ItemCount       int    `json:"item_count"`
 }

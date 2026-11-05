@@ -1112,17 +1112,17 @@ type PlaybackInventoryV3 struct {
 	AudioTracks           []AudioInventoryItemV3    `json:"audio_tracks"`
 	SubtitleInventory     []SubtitleInventoryItemV3 `json:"subtitle_inventory"`
 	EffectiveMediaFileID  int                       `json:"effective_media_file_id,omitempty"`
-	EffectiveVirtualURI   string                    `json:"effective_virtual_uri,omitempty"`
+	EffectiveVirtualURI   string                    `json:"effective_virtual_uri,omitempty" doc:"Virtual candidate URI that is playing; not validated as a URI"`
 	VirtualSourceRevision string                    `json:"virtual_source_revision,omitempty"`
-	OfferedVirtualURI     string                    `json:"offered_virtual_uri,omitempty"`
+	OfferedVirtualURI     string                    `json:"offered_virtual_uri,omitempty" doc:"Virtual candidate URI the client offered; not validated as a URI"`
 }
 
 type AudioInventoryItemV3 struct {
 	Index          int      `json:"index,omitempty"`
 	Title          string   `json:"title,omitempty"`
 	EmbeddedTitle  string   `json:"embedded_title,omitempty"`
-	Language       string   `json:"language,omitempty"`
-	Languages      []string `json:"languages,omitempty"`
+	Language       string   `json:"language,omitempty" doc:"Primary track language: a BCP 47 tag, ISO 639-1 where one exists (en, pt-BR)"`
+	Languages      []string `json:"languages,omitempty" doc:"All track languages as BCP 47 tags, ISO 639-1 where one exists"`
 	Codec          string   `json:"codec,omitempty"`
 	Profile        string   `json:"profile,omitempty"`
 	Layout         string   `json:"layout,omitempty"`
@@ -1448,7 +1448,7 @@ type PlanV3 struct {
 	InventoryURL           string                 `json:"inventory_url,omitempty" format:"uri-reference"`
 	DeliveryChange         *DeliveryChangeV3      `json:"delivery_change,omitempty"`
 	TracksPending          bool                   `json:"tracks_pending,omitempty"`
-	EffectiveVirtualURI    string                 `json:"effective_virtual_uri,omitempty"`
+	EffectiveVirtualURI    string                 `json:"effective_virtual_uri,omitempty" doc:"Virtual candidate URI that is playing; not validated as a URI"`
 	VirtualSourceRevision  string                 `json:"virtual_source_revision,omitempty"`
 	Source                 SourceDescriptorV3     `json:"source"`
 	SubtitleFidelityPolicy string                 `json:"subtitle_fidelity_policy"`

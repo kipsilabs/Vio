@@ -205,5 +205,5 @@ type CurrentImages struct {
 	PosterURL   string `json:"poster_url,omitempty" doc:"Stored artwork reference (storage key, plugin path, or URL), not a fetchable URL; not validated as a URI"`
 	BackdropURL string `json:"backdrop_url,omitempty" doc:"Stored artwork reference (storage key, plugin path, or URL), not a fetchable URL; not validated as a URI"`
 	LogoURL     string `json:"logo_url,omitempty" doc:"Stored artwork reference (storage key, plugin path, or URL), not a fetchable URL; not validated as a URI"`
-	StillURL    string `json:"still_url,omitempty" doc:"Stored episode title-card reference; absent when the item has no title card"`
+	StillURL    string `json:"still_url,omitempty" doc:"Stored episode title-card reference; absent when the item has no title card; not validated as a URI"`
 }

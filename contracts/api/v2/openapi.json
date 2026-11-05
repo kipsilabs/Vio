@@ -23108,9 +23108,11 @@
             "type": "integer"
           },
           "language": {
+            "description": "Primary track language: a BCP 47 tag, ISO 639-1 where one exists (en, pt-BR)",
             "type": "string"
           },
           "languages": {
+            "description": "All track languages as BCP 47 tags, ISO 639-1 where one exists",
             "items": {
               "type": "string"
             },
@@ -23321,6 +23323,7 @@
             "type": "string"
           },
           "languages": {
+            "description": "All track languages as BCP 47 tags, ISO 639-1 where one exists",
             "items": {
               "type": "string"
             },
@@ -29160,7 +29163,7 @@
             "type": "string"
           },
           "still_url": {
-            "description": "Stored episode title-card reference; absent when the item has no title card",
+            "description": "Stored episode title-card reference; absent when the item has no title card; not validated as a URI",
             "type": "string"
           }
         },
@@ -34859,6 +34862,7 @@
             "type": "string"
           },
           "poster_url": {
+            "description": "Stored artwork reference; not validated as a URI",
             "type": "string"
           },
           "title": {
@@ -42111,6 +42115,7 @@
             "type": "integer"
           },
           "effective_virtual_uri": {
+            "description": "Virtual candidate URI that is playing; not validated as a URI",
             "type": "string"
           },
           "inventory_revision": {
@@ -42120,6 +42125,7 @@
             "type": "string"
           },
           "offered_virtual_uri": {
+            "description": "Virtual candidate URI the client offered; not validated as a URI",
             "type": "string"
           },
           "session_id": {
@@ -42263,6 +42269,7 @@
             "$ref": "#/components/schemas/EffectiveRecipeV3"
           },
           "effective_virtual_uri": {
+            "description": "Virtual candidate URI that is playing; not validated as a URI",
             "type": "string"
           },
           "expires_at": {
@@ -43574,6 +43581,7 @@
             "type": "integer"
           },
           "offered_virtual_uri": {
+            "description": "Virtual candidate URI the client offered; not validated as a URI",
             "type": "string"
           },
           "playback_attempt_id": {

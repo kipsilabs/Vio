@@ -21869,7 +21869,9 @@ export interface components {
       embedded_title?: string;
       /** Format: int64 */
       index?: number;
+      /** @description Primary track language: a BCP 47 tag, ISO 639-1 where one exists (en, pt-BR) */
       language?: string;
+      /** @description All track languages as BCP 47 tags, ISO 639-1 where one exists */
       languages?: string[];
       layout?: string;
       profile?: string;
@@ -21952,6 +21954,7 @@ export interface components {
       index?: number;
       /** @description Track language from the file: BCP 47 tag, ISO 639-1 where one exists (en, pt-BR); und when the file marks it undetermined. Older scans may carry an ISO 639-2 code or the file's raw tag */
       language?: string;
+      /** @description All track languages as BCP 47 tags, ISO 639-1 where one exists */
       languages?: string[];
       layout?: string;
       profile?: string;
@@ -24197,7 +24200,7 @@ export interface components {
       logo_url?: string;
       /** @description Stored artwork reference (storage key, plugin path, or URL), not a fetchable URL; not validated as a URI */
       poster_url?: string;
-      /** @description Stored episode title-card reference; absent when the item has no title card */
+      /** @description Stored episode title-card reference; absent when the item has no title card; not validated as a URI */
       still_url?: string;
     };
     DecideDeviceLoginInputBody: {
@@ -26598,6 +26601,7 @@ export interface components {
       /** Format: int64 */
       item_count: number;
       poster_thumbhash?: string;
+      /** @description Stored artwork reference; not validated as a URI */
       poster_url: string;
       title: string;
     };
@@ -29599,9 +29603,11 @@ export interface components {
       audio_tracks: components["schemas"]["AudioInventoryItemV3"][];
       /** Format: int64 */
       effective_media_file_id?: number;
+      /** @description Virtual candidate URI that is playing; not validated as a URI */
       effective_virtual_uri?: string;
       inventory_revision: string;
       inventory_status: string;
+      /** @description Virtual candidate URI the client offered; not validated as a URI */
       offered_virtual_uri?: string;
       session_id: string;
       subtitle_inventory: components["schemas"]["SubtitleInventoryItemV3"][];
@@ -29654,6 +29660,7 @@ export interface components {
        */
       effective_media_file_id: string;
       effective_recipe: components["schemas"]["EffectiveRecipeV3"];
+      /** @description Virtual candidate URI that is playing; not validated as a URI */
       effective_virtual_uri?: string;
       expires_at?: string;
       /** Format: uri-reference */
@@ -30257,6 +30264,7 @@ export interface components {
        * @description What the plan that kept buffering received, measured as plan_summary throughput_kbps. Only with bandwidth_estimate_source observed_rebuffer; the server plans with, and learns, the lower of it and bandwidth_estimate_kbps.
        */
       observed_throughput_kbps?: number;
+      /** @description Virtual candidate URI the client offered; not validated as a URI */
       offered_virtual_uri?: string;
       playback_attempt_id: string;
       /** @description The attempt whose explicit audio and subtitle selections this restart should carry when the request names neither. Omit it for legacy client-identity carry. */
