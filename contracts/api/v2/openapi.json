@@ -68828,17 +68828,6 @@
               ],
               "type": "string"
             }
-          },
-          {
-            "description": "Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked",
-            "in": "header",
-            "name": "X-Profile-Token",
-            "schema": {
-              "examples": [
-                "pvt_5f3a9c1e7b2d4e8fa0c6"
-              ],
-              "type": "string"
-            }
           }
         ],
         "responses": {
@@ -69170,17 +69159,6 @@
               ],
               "type": "string"
             }
-          },
-          {
-            "description": "Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked",
-            "in": "header",
-            "name": "X-Profile-Token",
-            "schema": {
-              "examples": [
-                "pvt_5f3a9c1e7b2d4e8fa0c6"
-              ],
-              "type": "string"
-            }
           }
         ],
         "requestBody": {
@@ -69361,17 +69339,6 @@
             "schema": {
               "examples": [
                 "1"
-              ],
-              "type": "string"
-            }
-          },
-          {
-            "description": "Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked",
-            "in": "header",
-            "name": "X-Profile-Token",
-            "schema": {
-              "examples": [
-                "pvt_5f3a9c1e7b2d4e8fa0c6"
               ],
               "type": "string"
             }
@@ -69677,17 +69644,6 @@
               ],
               "type": "string"
             }
-          },
-          {
-            "description": "Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked",
-            "in": "header",
-            "name": "X-Profile-Token",
-            "schema": {
-              "examples": [
-                "pvt_5f3a9c1e7b2d4e8fa0c6"
-              ],
-              "type": "string"
-            }
           }
         ],
         "requestBody": {
@@ -69873,17 +69829,6 @@
             }
           },
           {
-            "description": "Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked",
-            "in": "header",
-            "name": "X-Profile-Token",
-            "schema": {
-              "examples": [
-                "pvt_5f3a9c1e7b2d4e8fa0c6"
-              ],
-              "type": "string"
-            }
-          },
-          {
             "in": "path",
             "name": "upload_id",
             "required": true,
@@ -70024,17 +69969,6 @@
             "schema": {
               "examples": [
                 "1"
-              ],
-              "type": "string"
-            }
-          },
-          {
-            "description": "Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked",
-            "in": "header",
-            "name": "X-Profile-Token",
-            "schema": {
-              "examples": [
-                "pvt_5f3a9c1e7b2d4e8fa0c6"
               ],
               "type": "string"
             }
@@ -70187,17 +70121,6 @@
             "schema": {
               "examples": [
                 "1"
-              ],
-              "type": "string"
-            }
-          },
-          {
-            "description": "Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked",
-            "in": "header",
-            "name": "X-Profile-Token",
-            "schema": {
-              "examples": [
-                "pvt_5f3a9c1e7b2d4e8fa0c6"
               ],
               "type": "string"
             }
@@ -70405,17 +70328,6 @@
             "schema": {
               "examples": [
                 "1"
-              ],
-              "type": "string"
-            }
-          },
-          {
-            "description": "Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked",
-            "in": "header",
-            "name": "X-Profile-Token",
-            "schema": {
-              "examples": [
-                "pvt_5f3a9c1e7b2d4e8fa0c6"
               ],
               "type": "string"
             }
@@ -70786,17 +70698,6 @@
             }
           },
           {
-            "description": "Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked",
-            "in": "header",
-            "name": "X-Profile-Token",
-            "schema": {
-              "examples": [
-                "pvt_5f3a9c1e7b2d4e8fa0c6"
-              ],
-              "type": "string"
-            }
-          },
-          {
             "in": "path",
             "name": "id",
             "required": true,
@@ -70939,17 +70840,6 @@
             "schema": {
               "examples": [
                 "1"
-              ],
-              "type": "string"
-            }
-          },
-          {
-            "description": "Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked",
-            "in": "header",
-            "name": "X-Profile-Token",
-            "schema": {
-              "examples": [
-                "pvt_5f3a9c1e7b2d4e8fa0c6"
               ],
               "type": "string"
             }
@@ -71238,17 +71128,6 @@
             "schema": {
               "examples": [
                 "1"
-              ],
-              "type": "string"
-            }
-          },
-          {
-            "description": "Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked",
-            "in": "header",
-            "name": "X-Profile-Token",
-            "schema": {
-              "examples": [
-                "pvt_5f3a9c1e7b2d4e8fa0c6"
               ],
               "type": "string"
             }
@@ -139082,17 +138961,6 @@
             }
           },
           {
-            "description": "Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked",
-            "in": "header",
-            "name": "X-Profile-Token",
-            "schema": {
-              "examples": [
-                "pvt_5f3a9c1e7b2d4e8fa0c6"
-              ],
-              "type": "string"
-            }
-          },
-          {
             "description": "The account",
             "in": "path",
             "name": "id",
@@ -139299,17 +139167,6 @@
             }
           },
           {
-            "description": "Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked",
-            "in": "header",
-            "name": "X-Profile-Token",
-            "schema": {
-              "examples": [
-                "pvt_5f3a9c1e7b2d4e8fa0c6"
-              ],
-              "type": "string"
-            }
-          },
-          {
             "description": "The account",
             "in": "path",
             "name": "id",
@@ -139474,17 +139331,6 @@
             }
           },
           {
-            "description": "Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked",
-            "in": "header",
-            "name": "X-Profile-Token",
-            "schema": {
-              "examples": [
-                "pvt_5f3a9c1e7b2d4e8fa0c6"
-              ],
-              "type": "string"
-            }
-          },
-          {
             "description": "The account",
             "in": "path",
             "name": "id",
@@ -139639,17 +139485,6 @@
             "schema": {
               "examples": [
                 "1"
-              ],
-              "type": "string"
-            }
-          },
-          {
-            "description": "Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked",
-            "in": "header",
-            "name": "X-Profile-Token",
-            "schema": {
-              "examples": [
-                "pvt_5f3a9c1e7b2d4e8fa0c6"
               ],
               "type": "string"
             }
@@ -150024,17 +149859,6 @@
             "schema": {
               "examples": [
                 "1"
-              ],
-              "type": "string"
-            }
-          },
-          {
-            "description": "Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked",
-            "in": "header",
-            "name": "X-Profile-Token",
-            "schema": {
-              "examples": [
-                "pvt_5f3a9c1e7b2d4e8fa0c6"
               ],
               "type": "string"
             }
