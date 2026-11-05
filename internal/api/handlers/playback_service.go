@@ -1182,7 +1182,7 @@ func (h *PlaybackHandler) playbackInventoryForSession(ctx context.Context, sessi
 			candidateURI = strings.TrimSpace(file.FilePath)
 		}
 		effectiveVirtualURI = candidateURI
-		file = h.inventoryEffectiveFile(ctx, file, session, candidateURI)
+		file = h.inventoryEffectiveFile(ctx, file, session, record, candidateURI)
 	}
 
 	return h.playbackInventoryForFileV3(ctx, session, record, file, effectiveVirtualURI)
@@ -1275,7 +1275,7 @@ func (h *PlaybackHandler) playbackInventoryForFileV3(ctx context.Context, sessio
 // when it still matches that bound release. When no row names the bound release
 // and the loaded row is a different one, an identity-only copy with no tracks is
 // returned, so the previous release's inventory is never shown for it.
-func (h *PlaybackHandler) inventoryEffectiveFile(ctx context.Context, file *models.MediaFile, session *playback.Session, candidateURI string) *models.MediaFile {
+func (h *PlaybackHandler) inventoryEffectiveFile(ctx context.Context, file *models.MediaFile, session *playback.Session, record *playback.AttemptRecordV3, candidateURI string) *models.MediaFile {
 	if file == nil {
 		return nil
 	}
@@ -1283,23 +1283,66 @@ func (h *PlaybackHandler) inventoryEffectiveFile(ctx context.Context, file *mode
 		return bindSessionVirtualSourceWithTracks(ctx, file, session, h.fileResolver)
 	}
 	base := file
-	if h.VirtualFileLookup != nil {
-		if row, err := h.VirtualFileLookup(ctx, candidateURI); err == nil && row != nil {
-			base = row
+	if !virtualRowNamesCandidate(file, candidateURI) {
+		// The held row does not name the bound release. The plan's committed
+		// effective row is tried first: it is the row the transport and the
+		// deferred probe committed to, and unlike a path lookup it cannot land
+		// on a duplicate sibling of the same URI.
+		if record != nil && record.EffectiveMediaFileID > 0 && record.EffectiveMediaFileID != file.ID {
+			if planned, err := h.fileResolver.GetByID(ctx, record.EffectiveMediaFileID); err == nil && virtualRowNamesCandidate(planned, candidateURI) {
+				base = planned
+			}
+		}
+		if base == file && h.VirtualFileLookup != nil {
+			if row, err := h.VirtualFileLookup(ctx, candidateURI); err == nil && row != nil && virtualRowNamesCandidate(row, candidateURI) {
+				base = row
+			}
 		}
 	}
-	if base == file && strings.TrimSpace(file.FilePath) != candidateURI {
+	// Late owner-row adoption: a first-ever auto start can pin the session to a
+	// provider-neutral row before the concrete result row exists. When that row
+	// appears later, move the session onto it and re-anchor its evidence so the
+	// verified overlay is served instead of rejected as a different candidate.
+	if adopted, refreshed := reanchorLateVirtualOwnerRow(ctx, h.fileResolver, h.sessionMgr, file, session, candidateURI); adopted != nil && adopted.ID != file.ID {
+		base = adopted
+		session = refreshed
+	}
+	if !virtualRowNamesCandidate(base, candidateURI) {
 		// No row names the bound release. Do not serve the loaded row's
 		// inventory under the bound identity.
-		placeholder := *file
+		placeholder := *base
 		placeholder.FilePath = candidateURI
 		placeholder.AudioTracks = nil
 		placeholder.SubtitleTracks = nil
 		placeholder.ExternalSubtitles = nil
 		placeholder.ProbeUpdatedAt = nil
 		base = &placeholder
+		// Name the fail-closed decision so an operator can correlate an empty
+		// menu with the reason it is empty: no catalog row names the bound
+		// candidate, so no row's inventory may be shown for it. The bound
+		// candidate URI is not logged raw — its query can carry provider
+		// identifiers — so the log carries the provider-neutral path and the
+		// concrete candidate id instead.
+		slog.InfoContext(ctx, "virtual inventory serving fail-closed placeholder: no catalog row names the bound candidate",
+			"component", "api",
+			"file_id", file.ID,
+			"base_id", placeholder.ID,
+			"candidate_path", virtualPlaybackNeutralKey(candidateURI),
+			"candidate_id", virtualResultCandidateID(candidateURI))
 	}
 	return bindSessionVirtualSourceWithTracks(ctx, base, session, h.fileResolver)
+}
+
+// virtualRowNamesCandidate reports whether a catalog row's stored path names the
+// bound candidate URI. Duplicate catalog rows for one release share the same
+// path, so an exact-path lookup can return a different row than the one the plan
+// committed to or the session carries evidence for; caller code uses this to
+// keep the row it already holds instead of swapping in an arbitrary duplicate.
+func virtualRowNamesCandidate(file *models.MediaFile, candidateURI string) bool {
+	if file == nil {
+		return false
+	}
+	return sameVirtualCandidate(file.FilePath, candidateURI)
 }
 
 // PublishSourceCommitted pushes the effective version and its declared
@@ -1911,11 +1954,15 @@ func (h *PlaybackHandler) publishInventoryUpdatedToSession(ctx context.Context, 
 		}
 	}
 	var inventory playback.PlaybackInventoryV3
-	if override := h.refusedProbeInventoryFile(ctx, live, probedFileID, candidateURI, probed); override != nil {
+	override := h.refusedProbeInventoryFile(ctx, live, probedFileID, candidateURI, probed)
+	if override != nil {
 		// Refused (unwritten) evidence for the exact release this session is
 		// bound to: serve the probed tracks in memory. The catalog row is
 		// untouched, so the effective identity stays the row's own id and the
-		// client's revision gate still sees a new revision.
+		// client's revision gate still sees a new revision. The status is
+		// declared: the override carries an explicit uncommitted marker, so the
+		// live menu receives the measured tracks without claiming they were
+		// persisted as verified.
 		inventory, err = h.playbackInventoryForFileV3(ctx, live, record, override, candidateURI)
 	} else {
 		inventory, err = h.playbackInventoryForSession(ctx, live, record)
@@ -1928,7 +1975,7 @@ func (h *PlaybackHandler) publishInventoryUpdatedToSession(ctx context.Context, 
 		// acking an undelivered terminal status.
 		return "", inventoryPublishRetryable
 	}
-	if inventory.InventoryStatus != string(ProbeProvenanceVerified) && inventory.InventoryStatus != string(ProbeProvenanceFailed) {
+	if override == nil && inventory.InventoryStatus != string(ProbeProvenanceVerified) && inventory.InventoryStatus != string(ProbeProvenanceFailed) {
 		// The probe has not upgraded this session's bound release and no
 		// deferred probe has terminally failed, so the client already holds
 		// exactly this declared inventory. A failed status is new information —
