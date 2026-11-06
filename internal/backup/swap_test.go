@@ -463,7 +463,11 @@ func newSwapFixtureWith(t *testing.T, entries []tarEntry) *swapFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &swapFixture{t: t, ctl: newFakeControl(t), root: root, live: live, src: writeTestBackup(t, entries), workDir: t.TempDir(), cipher: cipher,
+	workDir := t.TempDir()
+	if err := os.Chmod(workDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return &swapFixture{t: t, ctl: newFakeControl(t), root: root, live: live, src: writeTestBackup(t, entries), workDir: workDir, cipher: cipher,
 		validate: ValidateOptions{KeyCheck: testKeyCheck, ManifestKey: testManifestKey}}
 }
 
