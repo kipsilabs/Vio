@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { Play, ChevronLeft, ChevronRight } from "lucide-react";
+import { CalendarClock, Play, ChevronLeft, ChevronRight } from "lucide-react";
 import type { EpisodeListItem } from "@/api/types";
 import { WatchedCheckIndicator } from "@/components/CardWatchedBadge";
 import { toEpisodeUserState } from "@/components/episodeUserState";
@@ -14,6 +14,7 @@ import { usePrefetchCatalogItemDetail } from "@/hooks/queries/catalogRead";
 import { useDwellPrefetch } from "@/hooks/useDwellPrefetch";
 import { useEpisodeSpoilerPrefs } from "@/hooks/useEpisodeSpoilerPrefs";
 import { useOverlayPrefs } from "@/hooks/useOverlayPrefs";
+import { isUpcomingEpisode, useEpisodeReleaseCapability } from "@/hooks/queries/episodeRelease";
 import type { CardQuickActionMode } from "@/lib/cardQuickActions";
 import type { ScrollPreservingState } from "@/hooks/useScrollRestoration";
 import { buildItemHref } from "@/lib/mediaNavigation";
@@ -39,6 +40,10 @@ export default function EpisodeCarousel({
   const prefetchScopedEpisode = usePrefetchCatalogItemDetail(libraryId);
   const prefetchEpisode = usePrefetchCatalogItemDetail();
   const { quickActionMode } = useOverlayPrefs();
+  // Capability-gated upcoming treatment: older servers without release_state
+  // keep today's plain carousel rendering.
+  const { data: releaseCapability } = useEpisodeReleaseCapability();
+  const releaseSupported = releaseCapability?.available ?? false;
   const { hideImages, hideOverviews } = useEpisodeSpoilerPrefs();
   // Moving between siblings keeps the viewer where they scrolled to: the page
   // keeps its layout, and the carousel re-centres on the new episode.
@@ -83,6 +88,7 @@ export default function EpisodeCarousel({
                 episodeLinkState={linkState}
                 libraryId={libraryId}
                 quickActionMode={quickActionMode}
+                upcoming={isUpcomingEpisode(ep, releaseSupported)}
                 hideImageIfUnwatched={hideImages}
                 hideOverviewIfUnwatched={hideOverviews}
                 onPrefetch={() =>
@@ -116,6 +122,7 @@ function EpisodeCarouselCard({
   episodeLinkState,
   libraryId,
   quickActionMode,
+  upcoming,
   hideImageIfUnwatched,
   hideOverviewIfUnwatched,
   onPrefetch,
@@ -125,6 +132,7 @@ function EpisodeCarouselCard({
   episodeLinkState?: EpisodeNavigationState;
   libraryId?: number;
   quickActionMode: CardQuickActionMode;
+  upcoming: boolean;
   hideImageIfUnwatched: boolean;
   hideOverviewIfUnwatched: boolean;
   onPrefetch: () => void;
@@ -185,13 +193,33 @@ function EpisodeCarouselCard({
                 <img
                   src={ep.still_url}
                   alt={episodeTitle}
-                  className={cn("h-full w-full object-cover", hideImage && SPOILER_IMAGE_CLASS)}
+                  className={cn(
+                    "h-full w-full object-cover",
+                    upcoming && "opacity-45 saturate-50",
+                    hideImage && SPOILER_IMAGE_CLASS,
+                  )}
                   loading="lazy"
                   decoding="async"
                 />
+              ) : upcoming ? (
+                <div className="bg-accent/30 flex h-full w-full items-center justify-center">
+                  <CalendarClock
+                    size={28}
+                    className="text-muted-foreground/50"
+                    aria-label="Upcoming"
+                  />
+                </div>
               ) : (
                 <div className="bg-accent/30 flex h-full w-full items-center justify-center">
                   <Play size={28} className="text-muted-foreground/30" />
+                </div>
+              )}
+              {upcoming && ep.still_url && (
+                <div className="absolute inset-0 flex items-center justify-center bg-black/35">
+                  <span className="metadata-badge gap-1">
+                    <CalendarClock className="size-3" aria-hidden="true" />
+                    Upcoming
+                  </span>
                 </div>
               )}
               {isCurrent && (
@@ -238,6 +266,7 @@ function EpisodeCarouselCard({
             hideOverview={hideOverviewIfUnwatched && isEpisodeUnwatched(ep.user_data)}
             isCurrent={isCurrent}
             badges={ep.user_data?.played && <WatchedCheckIndicator />}
+            notice={upcoming ? "Upcoming" : undefined}
           />
         </ViewTransitionLink>
       </div>
