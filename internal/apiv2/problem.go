@@ -282,7 +282,7 @@ func fromHumaError(requestID string, status int, msg string, errs []error, bodyL
 	if status >= http.StatusInternalServerError {
 		for _, err := range errs {
 			if err != nil {
-				p.withCause(err)
+				_ = p.withCause(err)
 				break
 			}
 		}
@@ -499,11 +499,15 @@ func installErrorAdapter() {
 		if ctx != nil {
 			requestID = requestIDFrom(ctx.Context())
 			limit = operationBodyLimit(ctx.Operation())
-		}
-		for _, err := range errs {
-			if err != nil {
-				noteOperationError(ctx.Context(), err)
-				break
+			// A handler that returned a plain (non-StatusError) error reaches
+			// Huma here, which would otherwise reduce it to the fixed 500
+			// envelope with the cause discarded. Record it so the request log
+			// carries the actual failure under the same request ID. Validation
+			// failures are left out: their text echoes client input.
+			if status >= http.StatusInternalServerError {
+				for _, err := range errs {
+					noteOperationError(ctx.Context(), err)
+				}
 			}
 		}
 		return fromHumaError(requestID, status, msg, errs, limit)

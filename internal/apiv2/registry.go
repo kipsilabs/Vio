@@ -313,9 +313,6 @@ func Register[I, O any](reg *Registry, op Operation, handler func(context.Contex
 	handler = func(ctx context.Context, in *I) (*O, error) {
 		out, err := wrapped(ctx, in)
 		noteOperationError(ctx, err)
-		if p, ok := err.(*Problem); ok && p.cause != nil {
-			noteOperationError(ctx, p.cause)
-		}
 		return out, err
 	}
 	var in I
