@@ -1,0 +1,87 @@
+name: Upstream synchronization
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    name: Sync upstream main
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out Vio main
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+          ref: main
+
+      - name: Configure Git
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/Silo-Server/silo-server.git
+          git fetch --prune upstream main
+          git fetch --prune origin main automation/upstream-sync
+
+      - name: Prepare synchronization branch
+        run: |
+          if git show-ref --verify --quiet refs/remotes/origin/automation/upstream-sync; then
+            git checkout -B automation/upstream-sync origin/automation/upstream-sync
+            git merge --no-ff --no-edit origin/main
+          else
+            git checkout -B automation/upstream-sync origin/main
+          fi
+          git merge --no-ff --no-edit upstream/main
+
+      - name: Verify fork invariants
+        run: make verify-fork-invariants
+
+      - name: Verify v2 contract
+        run: make verify-apiv2-contract BASE_REF=origin/main
+
+      - name: Push synchronization branch
+        run: git push --force-with-lease origin HEAD:automation/upstream-sync
+
+      - name: Create or update synchronization pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          upstream_sha="$(git rev-parse upstream/main)"
+          upstream_count="$(git rev-list --count origin/main..upstream/main)"
+          short_sha="${upstream_sha:0:12}"
+          title="chore: sync upstream main (${short_sha}, ${upstream_count} commit$( [ "$upstream_count" = 1 ] || printf 's' ))"
+          body=$(cat <<EOF
+          ## Upstream synchronization
+
+          This pull request tracks the stable \\`automation/upstream-sync\\` branch and merges \\`Silo-Server/silo-server:main\\` into Vio with a non-fast-forward merge.
+
+          - Upstream SHA: \\`$upstream_sha\\`
+          - Upstream commits ahead of Vio main: \\`$upstream_count\\`
+          - Conflict handling: conflicts stop the workflow and require manual resolution.
+          - Auto-merge: intentionally not enabled.
+
+          Checks run by the synchronization workflow:
+          - \\`make verify-fork-invariants\\`
+          - \\`make verify-apiv2-contract BASE_REF=origin/main\\`
+          EOF
+          )
+          pr_number=$(gh pr list --repo "$GH_REPO" --state open --head automation/upstream-sync --base main --json number --jq '.[0].number // empty')
+          if [ -n "$pr_number" ]; then
+            gh pr edit "$pr_number" --repo "$GH_REPO" --title "$title" --body "$body"
+          else
+            gh pr create --repo "$GH_REPO" --base main --head automation/upstream-sync --title "$title" --body "$body"
+          fi
