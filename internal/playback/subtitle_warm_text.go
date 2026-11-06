@@ -23,7 +23,7 @@ import (
 // track, bounded below.
 //
 // Correctness rests on source-time ordering: the ASS muxer emits events in
-// order of their start time, so once the highest emitted event end has passed
+// order of their start time, so once the highest emitted event start has passed
 // a window's end, every event that can overlap that window has already been
 // written. The window is then reconstructed as the script header plus the
 // events that overlap the requested range, which is exactly what a windowed
