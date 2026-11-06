@@ -1355,7 +1355,7 @@ func normalizeProwlarrBaseURL(value string) (string, error) {
 		return "", nil
 	}
 	if len(value) > 4096 {
-		return "", fmt.Errorf("virtual_library.indexer_rss_url exceeds 4096 bytes")
+		return "", errors.New("virtual_library.indexer_rss_url exceeds 4096 bytes")
 	}
 	if !strings.Contains(value, "://") {
 		value = "http://" + value
@@ -1363,7 +1363,7 @@ func normalizeProwlarrBaseURL(value string) (string, error) {
 	value = strings.TrimRight(value, "/")
 	parsed, err := url.Parse(value)
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return "", fmt.Errorf("virtual_library.indexer_rss_url must be a valid http(s) base URL, for example http://prowlarr:9696")
+		return "", errors.New("virtual_library.indexer_rss_url must be a valid http(s) base URL, for example http://prowlarr:9696")
 	}
 	return value, nil
 }
