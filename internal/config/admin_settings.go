@@ -19,6 +19,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/settingscontract"
+	"github.com/Silo-Server/silo-server/internal/virtuallibrary/quality"
 	redisv9 "github.com/redis/go-redis/v9"
 	"github.com/robfig/cron/v3"
 )
@@ -430,17 +431,43 @@ const ServerSettingsMutationLock = "silo:server_settings:mutation"
 //
 //nolint:goconst
 var adminSettingDefaults = map[string]string{
-	"auth.access_token_expiry":              "8h",
-	"auth.refresh_token_expiry":             "30d",
-	"server.log_level":                      "info",
-	"server.log_quiet":                      "",
-	"server.public_url":                     "",
-	"virtual_library.allow_private_streams": "false",
-	"virtual_library.allow_insecure_http":   "false",
-	"branding.server_name":                  "Silo",
-	"branding.login_subtitle":               "Sign in with an existing account.",
-	"clientip.trusted_proxies":              "10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8, ::1/128",
-	"theme.catalog_url":                     DefaultThemeCatalogURL,
+	"auth.access_token_expiry":                        "8h",
+	"auth.refresh_token_expiry":                       "30d",
+	"server.log_level":                                "info",
+	"server.log_quiet":                                "",
+	"server.public_url":                               "",
+	"virtual_library.enabled":                         "true",
+	"virtual_library.discover_before_playback":        "false",
+	"virtual_library.manifest_url":                    "",
+	"virtual_library.movie_library_id":                "1",
+	"virtual_library.series_library_id":               "2",
+	"virtual_library.tmdb_api_key":                    "",
+	"virtual_library.allow_insecure_http":             "false",
+	"virtual_library.allow_private_streams":           "false",
+	"virtual_library.cache_ttl_minutes":               "10",
+	VirtualLibraryPlaybackProbeCacheMinutesSettingKey: strconv.Itoa(DefaultVirtualLibraryPlaybackProbeCacheMinutes),
+	VirtualLibraryCatalogDiscoveryBudgetMsSettingKey:  strconv.Itoa(DefaultVirtualLibraryCatalogDiscoveryBudgetMs),
+	"virtual_library.candidate_store_hours":           "720",
+	"virtual_library.schedule_refresh_minutes":        "360",
+	"virtual_library.monitor_file":                    ".vio-virtual-library-monitored.json",
+	"virtual_library.enable_quality_profiles":         "false",
+	"virtual_library.quality_preset":                  "custom",
+	"virtual_library.custom_format_preset":            "custom",
+	"virtual_library.single_stream_with_failover":     "true",
+	"virtual_library.fallback_to_any_stream":          "false",
+	"virtual_library.quality_profiles":                "",
+	"virtual_library.custom_formats":                  "",
+	"virtual_library.indexer_rss_url":                 "",
+	"virtual_library.indexer_api_key":                 "",
+	"virtual_library.indexer_rss_check_minutes":       "15",
+	"virtual_library.indexer_search_timeout_seconds":  "20",
+	"virtual_library.altmount_url":                    "",
+	"virtual_library.altmount_api_key":                "",
+	"virtual_library.altmount_check_minutes":          "15",
+	"branding.server_name":                            "Vio",
+	"branding.login_subtitle":                         "Sign in with an existing account.",
+	"clientip.trusted_proxies":                        "10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8, ::1/128",
+	"theme.catalog_url":                               DefaultThemeCatalogURL,
 
 	ServerLANDiscoverySettingKey:              "true",
 	ServerLocalURLSettingKey:                  "",
@@ -493,6 +520,7 @@ var adminSettingDefaults = map[string]string{
 	playbackTranscodeDirSettingKey:                   DefaultTranscodeDir,
 	playbackSegmentRetentionSettingKey:               "600",
 	"playback.hw_accel":                              "auto",
+	"playback.software_fallback":                     "allow",
 	"playback.transcode_enabled":                     "true",
 	PlaybackAllowHEVCEncodingSettingKey:              "false",
 	PlaybackPreferLowerVersionTranscodeSettingKey:    "true",
@@ -518,6 +546,7 @@ var adminSettingDefaults = map[string]string{
 	CatalogExtraRatingSourcesSettingKey:              "",
 	"playback.watched_threshold":                     "90",
 	"playback.min_resume_threshold":                  "5",
+	"playback.max_virtual_failover_attempts":         "5",
 	Allow4KTranscodeSettingKey:                       "true",
 	playback.TranscodeThrottleEnabledSettingKey:      strconv.FormatBool(playback.DefaultTranscodeThrottleEnabled),
 	playback.TranscodeThrottleSecondsSettingKey:      strconv.Itoa(playback.DefaultTranscodeThrottleSeconds),
@@ -526,7 +555,7 @@ var adminSettingDefaults = map[string]string{
 	"jellyfin_compat.enabled":                 "true",
 	"jellyfin_compat.public_url":              "http://127.0.0.1:8096",
 	"jellyfin_compat.emulated_server_version": DefaultJellyfinCompatEmulatedServerVersion,
-	"jellyfin_compat.server_name":             "Silo",
+	"jellyfin_compat.server_name":             "Vio",
 	"jellyfin_compat.web_enabled":             "true",
 	"jellyfin_compat.web_version":             DefaultJellyfinWebVersion,
 	"jellyfin_compat.web_install_dir":         DefaultJellyfinWebInstallDir,
@@ -584,7 +613,7 @@ var adminSettingDefaults = map[string]string{
 	"email.enabled":       "false",
 	"email.smtp_port":     "587",
 	"email.smtp_security": "starttls",
-	"email.from_name":     "Silo",
+	"email.from_name":     "Vio",
 
 	"notifications.release_events_enabled":                     "true",
 	"notifications.fanout_enabled":                             "true",
@@ -636,7 +665,7 @@ var adminSettingDefaults = map[string]string{
 	"password_reset.self_service_enabled": "false",
 
 	"catalog.search.provider":                             "postgres",
-	"catalog.search.meilisearch.index":                    "silo_media_items",
+	"catalog.search.meilisearch.index":                    "vio_media_items",
 	"catalog.search.meilisearch.timeout_ms":               "800",
 	"catalog.search.meilisearch.matching_strategy":        "last",
 	"catalog.search.meilisearch.sync_batch_size":          "500",
@@ -644,7 +673,7 @@ var adminSettingDefaults = map[string]string{
 	"catalog.search.meilisearch.rebuild_task_queue_depth": "4",
 	"catalog.search.meilisearch.semantic_enabled":         "false",
 	"catalog.search.meilisearch.semantic_ratio":           "0.5",
-	"catalog.search.meilisearch.embedder":                 "silo_recommendations",
+	"catalog.search.meilisearch.embedder":                 "vio_recommendations",
 	"catalog.search.meilisearch.binary_quantized":         "false",
 
 	PlaybackKeyframePlaylistSettingKey: "false",
@@ -810,6 +839,11 @@ func NormalizeAdminSetting(key, raw string) (string, error) {
 		"notifications.apple_push_delivery_enabled", "notifications.android_push_delivery_enabled",
 		"catalog.search.meilisearch.semantic_enabled", "catalog.search.meilisearch.binary_quantized",
 		"s3.public_path_style", "s3.private_path_style", "s3.user_db_path_style",
+		"virtual_library.enabled", "virtual_library.discover_before_playback", "virtual_library.allow_insecure_http",
+		"virtual_library.allow_private_streams",
+		"virtual_library.enable_quality_profiles",
+		"virtual_library.single_stream_with_failover",
+		"virtual_library.fallback_to_any_stream",
 		AuthLocalPasswordLoginSettingKey, AuthEmailAutoMatchSettingKey, ServerLANDiscoverySettingKey,
 		BackupEnabledSettingKey, BackupIncludeIntroFingerprintsSettingKey, BackupIncludeSubtitlesSettingKey,
 		BackupS3PathStyleSettingKey:
@@ -891,6 +925,65 @@ func NormalizeAdminSetting(key, raw string) (string, error) {
 		return normalizeAdminInt(key, value, 1, 100)
 	case "playback.min_resume_threshold":
 		return normalizeAdminInt(key, value, 1, 99)
+	case "playback.max_virtual_failover_attempts":
+		return normalizeAdminInt(key, value, 1, 50)
+	case "virtual_library.movie_library_id", "virtual_library.series_library_id":
+		return normalizeAdminInt(key, value, 1, 1000000)
+	case "virtual_library.cache_ttl_minutes", "virtual_library.indexer_rss_check_minutes", "virtual_library.altmount_check_minutes":
+		return normalizeAdminInt(key, value, 1, 10080)
+	case VirtualLibraryPlaybackProbeCacheMinutesSettingKey:
+		return normalizeAdminInt(key, value, MinVirtualLibraryPlaybackProbeCacheMinutes, MaxVirtualLibraryPlaybackProbeCacheMinutes)
+	case VirtualLibraryCatalogDiscoveryBudgetMsSettingKey:
+		return normalizeAdminInt(key, value, MinVirtualLibraryCatalogDiscoveryBudgetMs, MaxVirtualLibraryCatalogDiscoveryBudgetMs)
+	case "virtual_library.indexer_search_timeout_seconds":
+		return normalizeAdminInt(key, value, 5, 900)
+	case "virtual_library.candidate_store_hours":
+		// 0 disables the trust window and keeps the pre-window behavior.
+		return normalizeAdminInt(key, value, 0, 8760)
+	case "virtual_library.schedule_refresh_minutes":
+		return normalizeAdminInt(key, value, 30, 10080)
+	case "virtual_library.manifest_url", "virtual_library.tmdb_api_key",
+		"virtual_library.monitor_file",
+		"virtual_library.indexer_api_key", "virtual_library.altmount_url",
+		"virtual_library.altmount_api_key":
+		if len(value) > 4096 {
+			return "", fmt.Errorf("%s exceeds 4096 bytes", key)
+		}
+		return value, nil
+	case "virtual_library.indexer_rss_url":
+		return normalizeProwlarrBaseURL(value)
+	case "virtual_library.quality_preset", "virtual_library.custom_format_preset":
+		if value == "" {
+			return "custom", nil
+		}
+		if len(value) > 64 {
+			return "", fmt.Errorf("%s exceeds 64 bytes", key)
+		}
+		return value, nil
+	case "virtual_library.quality_profiles":
+		if len(value) > 65536 {
+			return "", fmt.Errorf("%s exceeds 65536 bytes", key)
+		}
+		return value, nil
+	case "virtual_library.custom_formats":
+		if len(value) > 65536 {
+			return "", fmt.Errorf("%s exceeds 65536 bytes", key)
+		}
+		// Reject uncompilable patterns at save time with a field error, so
+		// the operator fixes the regex before persisting it instead of
+		// discovering a dormant virtual library after the next restart.
+		// Boot activation stays lenient (skips bad formats) for rows
+		// written by other means; Validate here is deliberately strict.
+		if strings.TrimSpace(value) != "" {
+			var formats []quality.CustomFormat
+			if err := json.Unmarshal([]byte(value), &formats); err != nil {
+				return "", fmt.Errorf("%s is not valid JSON: %w", key, err)
+			}
+			if err := (&quality.QualityConfig{CustomFormats: formats}).Validate(); err != nil {
+				return "", fmt.Errorf("%s invalid: %w", key, err)
+			}
+		}
+		return value, nil
 	case playback.TranscodeThrottleSecondsSettingKey:
 		return normalizeAdminInt(key, value, 60, 86400)
 	case playbackSegmentRetentionSettingKey:
@@ -997,6 +1090,8 @@ func NormalizeAdminSetting(key, raw string) (string, error) {
 		return normalizeAdminEnum(key, value, "postgres", "sqlite")
 	case "playback.hw_accel":
 		return normalizeAdminEnum(key, value, "auto", "qsv", "vaapi", "nvenc", "videotoolbox", "none")
+	case "playback.software_fallback":
+		return normalizeAdminEnum(key, value, "allow", "gpu_only")
 	case PlaybackRoutingRemuxExecutionSettingKey, PlaybackRoutingVideoTranscodeExecutionSettingKey:
 		return normalizeAdminEnum(key, value,
 			string(PlaybackExecutionPreferWorker), string(PlaybackExecutionPreferTranscode),
@@ -1244,6 +1339,31 @@ func NormalizeRedisURL(raw string) (string, error) {
 	}
 	if _, _, err := ParseRedisURL(value); err != nil {
 		return "", fmt.Errorf("redis.url must be a valid redis://, rediss://, or unix:// URL: %w", err)
+	}
+	return value, nil
+}
+
+// normalizeProwlarrBaseURL canonicalizes virtual_library.indexer_rss_url. A
+// scheme-less value like "one.vio" is prepended with http:// so it becomes a
+// usable base URL instead of a value that fails every staleness refresh with
+// "expected the server base URL with a scheme". The runtime Prowlarr client
+// applies the stricter path/query shape check (see prowlarr.NormalizeBaseURL)
+// and leaves Prowlarr unconfigured, with a warning, when a value is still
+// unusable; this only guarantees a scheme and a host at save time.
+func normalizeProwlarrBaseURL(value string) (string, error) {
+	if value == "" {
+		return "", nil
+	}
+	if len(value) > 4096 {
+		return "", fmt.Errorf("virtual_library.indexer_rss_url exceeds 4096 bytes")
+	}
+	if !strings.Contains(value, "://") {
+		value = "http://" + value
+	}
+	value = strings.TrimRight(value, "/")
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "", fmt.Errorf("virtual_library.indexer_rss_url must be a valid http(s) base URL, for example http://prowlarr:9696")
 	}
 	return value, nil
 }
