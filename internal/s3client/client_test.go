@@ -255,22 +255,18 @@ func TestDeleteObjectsCountsOnlyMissingObjectBatchErrors(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 	client := NewClient(BucketConfig{Endpoint: server.URL, Region: "us-east-1", Bucket: "silo", PathStyle: true, AccessKey: "test", SecretKey: "test"})
-	var logs bytes.Buffer
-	previous := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
-	t.Cleanup(func() { slog.SetDefault(previous) })
 	deleted, err := client.DeleteObjects(t.Context(), client.Bucket(), []string{"missing.webp", "existing.webp", "denied.webp"})
-	if err != nil || deleted != 2 {
-		t.Fatalf("DeleteObjects() = %d, %v; want 2 and no error (best-effort accounting)", deleted, err)
+	if err == nil || deleted != 2 {
+		t.Fatalf("DeleteObjects() = %d, %v; want 2 and an error", deleted, err)
 	}
-	if !strings.Contains(logs.String(), "denied.webp") {
-		t.Fatal("DeleteObjects() did not log denied.webp")
+	if !strings.Contains(err.Error(), "denied.webp") {
+		t.Fatal("DeleteObjects() error did not name denied.webp")
 	}
-	if !strings.Contains(logs.String(), "AccessDenied") {
-		t.Fatal("DeleteObjects() log did not carry the AccessDenied error code")
+	if !strings.Contains(err.Error(), "AccessDenied") {
+		t.Fatal("DeleteObjects() error did not carry the AccessDenied error code")
 	}
-	if strings.Contains(logs.String(), "SECRETSIG") {
-		t.Fatal("DeleteObjects() log echoed the backend message")
+	if strings.Contains(err.Error(), "SECRETSIG") {
+		t.Fatal("DeleteObjects() error echoed the backend message")
 	}
 }
 
@@ -340,23 +336,16 @@ func TestDeleteObjectsDoesNotEchoAnUnrequestedKey(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 	client := NewClient(BucketConfig{Endpoint: server.URL, Region: "us-east-1", Bucket: "silo", PathStyle: true, AccessKey: "test", SecretKey: "test"})
-	var logs bytes.Buffer
-	previous := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
-	t.Cleanup(func() { slog.SetDefault(previous) })
 	deleted, err := client.DeleteObjects(t.Context(), client.Bucket(), []string{"a.webp"})
-	if err != nil || deleted != 0 {
-		t.Fatalf("DeleteObjects() = %d, %v; want 0 and no error (best-effort accounting)", deleted, err)
+	if err == nil || deleted != 0 {
+		t.Fatal("DeleteObjects() must report the failed entry")
 	}
-	if strings.Contains(logs.String(), "SECRETSIG") {
-		t.Fatal("DeleteObjects() log echoed a key the caller never requested")
-	}
-	if !strings.Contains(logs.String(), "unrecognized key") {
-		t.Fatal("DeleteObjects() did not label the unrequested key")
+	if strings.Contains(err.Error(), "SECRETSIG") {
+		t.Fatal("DeleteObjects() error echoed a key the caller never requested")
 	}
 }
 
-func TestDeleteObjectsFallbackCountsFailedKeysWithoutError(t *testing.T) {
+func TestDeleteObjectsFallbackReturnsErrorForFailedKeys(t *testing.T) {
 	for name, rejection := range map[string]struct {
 		status int
 		body   string
@@ -385,8 +374,8 @@ func TestDeleteObjectsFallbackCountsFailedKeysWithoutError(t *testing.T) {
 			t.Cleanup(server.Close)
 			client := NewClient(BucketConfig{Endpoint: server.URL, Region: "us-east-1", Bucket: "silo", PathStyle: true, AccessKey: "test", SecretKey: "test"})
 			deleted, err := client.DeleteObjects(t.Context(), client.Bucket(), []string{"ok.webp", "denied.webp"})
-			if err != nil || deleted != 1 {
-				t.Fatalf("DeleteObjects() = %d, %v; want 1 and no error (best-effort accounting)", deleted, err)
+			if err == nil || deleted != 1 {
+				t.Fatalf("DeleteObjects() = %d, %v; want 1 and an error", deleted, err)
 			}
 		})
 	}
@@ -738,7 +727,7 @@ func TestDeleteObjectsTreatsAlreadyAbsentKeysAsSuccess(t *testing.T) {
 	}
 }
 
-func TestDeleteObjectsCountsGenuineFailuresWithoutError(t *testing.T) {
+func TestDeleteObjectsCountsGenuineFailures(t *testing.T) {
 	server := newDeleteObjectsFailureServer(t, map[string]string{
 		"denied.webp":  "AccessDenied",
 		"missing.webp": "NoSuchKey",
@@ -752,8 +741,8 @@ func TestDeleteObjectsCountsGenuineFailuresWithoutError(t *testing.T) {
 	t.Cleanup(func() { slog.SetDefault(previous) })
 
 	deleted, err := client.DeleteObjects(context.Background(), "artwork", []string{"denied.webp", "missing.webp", "ok.webp"})
-	if err != nil {
-		t.Fatalf("DeleteObjects() error = %v, want nil (best-effort accounting)", err)
+	if err == nil || !strings.Contains(err.Error(), "denied.webp") {
+		t.Fatalf("DeleteObjects() error = %v, want the denied key named", err)
 	}
 	if deleted != 2 {
 		t.Fatalf("DeleteObjects() deleted = %d, want 2 (one deleted, one already absent)", deleted)
@@ -766,15 +755,15 @@ func TestDeleteObjectsCountsGenuineFailuresWithoutError(t *testing.T) {
 	}
 }
 
-func TestDeleteObjectsCountsDeniedKeysWithoutError(t *testing.T) {
+func TestDeleteObjectsCountsDeniedKeys(t *testing.T) {
 	server := newDeleteObjectsFailureServer(t, map[string]string{"denied.webp": "AccessDenied"})
 	client := NewClient(BucketConfig{
 		Endpoint: server.URL, Bucket: "artwork", PathStyle: true, AccessKey: "test", SecretKey: "test",
 	})
 
 	deleted, err := client.DeleteObjects(context.Background(), "artwork", []string{"denied.webp"})
-	if err != nil {
-		t.Fatalf("DeleteObjects() error = %v, want nil (best-effort accounting)", err)
+	if err == nil || !strings.Contains(err.Error(), "AccessDenied") {
+		t.Fatalf("DeleteObjects() error = %v, want AccessDenied", err)
 	}
 	if deleted != 0 {
 		t.Fatalf("DeleteObjects() deleted = %d, want 0", deleted)
