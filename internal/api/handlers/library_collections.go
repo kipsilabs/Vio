@@ -108,6 +108,10 @@ const (
 	// collectionSourceModeTMDBList is the `source_config.mode` value used for
 	// collections that follow a public, user-authored TMDB list.
 	collectionSourceModeTMDBList = "tmdb_list"
+
+	// successKey is the JSON key shared by the admin action responses that
+	// report whether the work ran.
+	successKey = "success"
 )
 
 func NewLibraryCollectionHandler(
@@ -1505,7 +1509,7 @@ func (h *LibraryCollectionHandler) applyTemplateBundle(
 			// in_use_by_section). The adoption flags itself with that reason so
 			// admins can tell "adopted because delete failed" apart from a
 			// straight "already_exists".
-			if !(req.DryRun && req.DeleteExisting) {
+			if !req.DryRun || !req.DeleteExisting {
 				existingBySlug := remainingByLibrarySlug[templateBundleExistingCollectionKey{
 					LibraryID: library.ID,
 					Slug:      slugifyCollectionName(tmpl.Title),
@@ -2837,13 +2841,15 @@ func (h *LibraryCollectionHandler) PurgeVirtualPlaybackItems(w http.ResponseWrit
 		message += fmt.Sprintf(" (%d stale playback-state and metadata rows, %d collection references pruned)",
 			purgeResult.StateRowsDeleted, purgeResult.CollectionsPruned)
 	}
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"success": true, "dry_run": dryRun,
+	if err := json.NewEncoder(w).Encode(map[string]any{
+		successKey: true, "dry_run": dryRun,
 		"files_deleted": purgeResult.FilesDeleted, "items_deleted": purgeResult.ItemsDeleted,
-		"state_rows_deleted": purgeResult.StateRowsDeleted,
-		"collections_pruned": purgeResult.CollectionsPruned,
-		"message":            message,
-	})
+		"state_rows_deleted":  purgeResult.StateRowsDeleted,
+		"collections_pruned":  purgeResult.CollectionsPruned,
+		displayMessageTextKey: message,
+	}); err != nil {
+		slog.WarnContext(r.Context(), "failed to encode purge response", "component", "api", "error", err)
+	}
 }
 
 // SubscribePurgeInvalidations listens for virtual_purge_complete events from
@@ -2977,26 +2983,7 @@ func (h *LibraryCollectionHandler) HandleMaterializeAdminCollectionItem(w http.R
 	defer cancel()
 	res, err := h.service.EnsureCollectionItemMaterialized(workCtx, collection, item)
 	if err != nil {
-		if errors.Is(err, catalog.ErrCollectionItemNotMember) {
-			writeError(w, http.StatusNotFound, "not_found", "item is not in this collection")
-			return
-		}
-		if errors.Is(err, catalog.ErrLibraryCollectionNotFound) {
-			writeError(w, http.StatusNotFound, "not_found", "collection not found")
-			return
-		}
-		if errors.Is(err, catalog.ErrIncompatibleLibrary) || errors.Is(err, catalog.ErrVirtualPlaybackDisabled) {
-			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
-			return
-		}
-		if errors.Is(err, catalog.ErrProviderUnavailable) ||
-			strings.Contains(err.Error(), "provider unavailable") ||
-			strings.Contains(err.Error(), "owning provider installation") {
-			writeError(w, http.StatusServiceUnavailable, "provider_unavailable", err.Error())
-			return
-		}
-		slog.ErrorContext(r.Context(), "failed to materialize virtual item", "collection_id", collectionID, "item_id", itemID, "error", err)
-		writeError(w, http.StatusInternalServerError, "internal_error", "failed to materialize virtual item")
+		writeMaterializeCollectionItemError(r.Context(), w, collectionID, itemID, err)
 		return
 	}
 
@@ -3005,14 +2992,34 @@ func (h *LibraryCollectionHandler) HandleMaterializeAdminCollectionItem(w http.R
 	sections.InvalidateResolvedListCache()
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"success":               true,
-		"content_id":            res.ContentID,
+		successKey:              true,
+		contentIDKey:            res.ContentID,
 		"media_type":            res.MediaType,
 		"files_created":         res.FilesCreated,
 		"files_existing":        res.FilesExisting,
 		"episodes_materialized": res.EpisodesMaterialized,
-		"message":               fmt.Sprintf("Materialized %d virtual files (%d existing) for %s (%s)", res.FilesCreated, res.FilesExisting, res.ContentID, res.MediaType),
+		displayMessageTextKey:   fmt.Sprintf("Materialized %d virtual files (%d existing) for %s (%s)", res.FilesCreated, res.FilesExisting, res.ContentID, res.MediaType),
 	})
+}
+
+// writeMaterializeCollectionItemError maps a materialization failure to the
+// response the collection item endpoint returns.
+func writeMaterializeCollectionItemError(ctx context.Context, w http.ResponseWriter, collectionID, itemID string, err error) {
+	switch {
+	case errors.Is(err, catalog.ErrCollectionItemNotMember):
+		writeError(w, http.StatusNotFound, "not_found", "item is not in this collection")
+	case errors.Is(err, catalog.ErrLibraryCollectionNotFound):
+		writeError(w, http.StatusNotFound, "not_found", "collection not found")
+	case errors.Is(err, catalog.ErrIncompatibleLibrary), errors.Is(err, catalog.ErrVirtualPlaybackDisabled):
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+	case errors.Is(err, catalog.ErrProviderUnavailable) ||
+		strings.Contains(err.Error(), "provider unavailable") ||
+		strings.Contains(err.Error(), "owning provider installation"):
+		writeError(w, http.StatusServiceUnavailable, "provider_unavailable", err.Error())
+	default:
+		slog.ErrorContext(ctx, "failed to materialize virtual item", "collection_id", collectionID, "item_id", itemID, "error", err)
+		writeError(w, http.StatusInternalServerError, "internal_error", "failed to materialize virtual item")
+	}
 }
 
 func (h *LibraryCollectionHandler) setListingLogos(ctx context.Context, cards []itemListResponse, items []*models.MediaItem, access catalog.AccessFilter) {
@@ -3401,20 +3408,7 @@ func buildTMDBDiscoverSourceConfig(mediaType string, spec importTMDBDiscoverSpec
 		MediaType:       mediaType,
 		Limit:           limit,
 		VirtualPlayback: virtualPlayback,
-		Discover: tmdbDiscoverConfigBody{
-			WithGenres:       spec.WithGenres,
-			WithoutGenres:    spec.WithoutGenres,
-			SortBy:           spec.SortBy,
-			VoteCountGte:     spec.VoteCountGte,
-			VoteAverageGte:   spec.VoteAverageGte,
-			ReleaseDateGte:   spec.ReleaseDateGte,
-			ReleaseDateLte:   spec.ReleaseDateLte,
-			Certifications:   spec.Certifications,
-			CertificationLte: spec.CertificationLte,
-			WithRuntimeGte:   spec.WithRuntimeGte,
-			WithRuntimeLte:   spec.WithRuntimeLte,
-			OriginalLanguage: spec.OriginalLanguage,
-		},
+		Discover:        tmdbDiscoverConfigBody(spec),
 	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
