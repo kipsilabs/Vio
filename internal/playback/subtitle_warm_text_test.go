@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 const warmTextASSHeader = `[Script Info]
@@ -91,6 +92,42 @@ func TestSubtitleWarmTextProgressDisablesOnMalformedEvent(t *testing.T) {
 	}
 }
 
+// An event start below the retained maximum disproves the source-time
+// ordering the prefix relies on, so later overlapping events may still arrive.
+// The layer must disable instead of continuing to report coverage.
+func TestSubtitleWarmTextProgressDisablesOnOutOfOrderEvent(t *testing.T) {
+	before := subtitleWarmTextDisables.Load()
+	p := newSubtitleWarmTextProgress()
+	p.observe([]byte(warmTextASSHeader))
+	// Separate writes, as ffmpeg delivers them, with the watermark pushed to
+	// 180 s so [0,120] is covered on the ordered path.
+	p.observe([]byte(subtitleASSEventDialogue + " 0,0:00:10.00,0:02:10.00,Default,,0,0,0,,Hello\n"))
+	p.observe([]byte(subtitleASSEventDialogue + " 0,0:03:00.00,0:03:10.00,Default,,0,0,0,,Far\n"))
+	if _, ok := p.render(0, 120); !ok {
+		t.Fatal("ordered prefix did not cover [0,120]")
+	}
+	// Equal starts are non-decreasing and common in ASS files; they must not
+	// disable the layer.
+	p.observe([]byte(subtitleASSEventDialogue + " 0,0:03:00.00,0:03:20.00,Default,,0,0,0,,Same\n"))
+	if _, ok := p.render(0, 120); !ok {
+		t.Fatal("an equal event start disabled the ordered prefix")
+	}
+	if got := subtitleWarmTextDisables.Load() - before; got != 0 {
+		t.Fatalf("disable signal count = %d before any regression, want zero", got)
+	}
+
+	p.observe([]byte(subtitleASSEventDialogue + " 0,0:00:20.00,0:00:30.00,Default,,0,0,0,,Early\n"))
+	if _, ok := p.render(0, 120); ok {
+		t.Fatal("progress served a window after an out-of-order event")
+	}
+	// The disable is signaled once per warm: a later malformed chunk must not
+	// count the same fallback again.
+	p.observe([]byte(subtitleASSEventDialogue + " 0,not-a-time,0:00:40.00,Default,,0,0,0,,Broken\n"))
+	if got := subtitleWarmTextDisables.Load() - before; got != 1 {
+		t.Fatalf("disable signal count = %d, want exactly one per warm", got)
+	}
+}
+
 func TestSubtitleWarmTextProgressHonorsFormatColumns(t *testing.T) {
 	p := newSubtitleWarmTextProgress()
 	p.observe([]byte("[Events]\nFormat: Start, End, Style, Text\n"))
@@ -161,6 +198,103 @@ func TestServeExtractWindowServedFromInProgressASSWarm(t *testing.T) {
 
 	close(release)
 	<-done
+}
+
+// An event start that regresses below the retained maximum disproves the
+// ordering the prefix relies on. A bounded window the watermark already covers
+// must then be extracted, not served from the prefix, because later events may
+// still overlap it.
+func TestServeExtractWindowFallsBackAfterOutOfOrderEvent(t *testing.T) {
+	before := subtitleWarmTextDisables.Load()
+	c, source := newTestCache(t)
+	warmOpts := StreamExtractOpts{InputPath: source, SourceCodec: "ass", TrackIndex: 0}
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	regressed := make(chan struct{})
+	finish := make(chan struct{})
+	var calls atomic.Int64
+	windowPayload := "[Script Info]\n" + subtitleASSEventDialogue + " 0,0:00:10.00,0:01:10.00,Default,,0,0,0,,Extracted\n"
+	extract := func(_ context.Context, opts StreamExtractOpts) error {
+		if calls.Add(1) > 1 {
+			_, err := io.WriteString(opts.Writer, windowPayload)
+			return err
+		}
+		// Ordered prefix: 10 s then 180 s, so [0,120] is provably complete.
+		if _, err := io.WriteString(opts.Writer,
+			warmTextASSHeader+
+				subtitleASSEventDialogue+" 0,0:00:10.00,0:02:10.00,Default,,0,0,0,,Hello\n"+
+				subtitleASSEventDialogue+" 0,0:03:00.00,0:03:10.00,Default,,0,0,0,,Far\n"); err != nil {
+			return err
+		}
+		close(started)
+		<-release
+		// A later event starts at 20 s, below the 180 s watermark.
+		if _, err := io.WriteString(opts.Writer,
+			subtitleASSEventDialogue+" 0,0:00:20.00,0:00:30.00,Default,,0,0,0,,Early\n"); err != nil {
+			return err
+		}
+		close(regressed)
+		<-finish
+		return nil
+	}
+	done := c.WarmTrackInBackground(warmOpts, extract, "")
+	<-started
+
+	// The ordered control is served from the warm without an extract.
+	orderedOpts := StreamExtractOpts{
+		InputPath:             source,
+		SourceCodec:           "ass",
+		TrackIndex:            0,
+		WindowRequested:       true,
+		SeekSeconds:           0,
+		DurationSeconds:       120,
+		DisableBackgroundWarm: true,
+	}
+	rec := httptest.NewRecorder()
+	err := c.ServeExtract(rec, httptest.NewRequest(http.MethodGet, "/subtitle.ass?position=0&duration=120", nil), orderedOpts, extract)
+	if err != nil {
+		t.Fatalf("serve ordered window: %v", err)
+	}
+	if body := rec.Body.String(); !strings.Contains(body, "Hello") {
+		t.Fatalf("ordered window body = %q, want the warm's overlapping event", body)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("extractor calls = %d before the regression, want only the warm", got)
+	}
+
+	close(release)
+	select {
+	case <-regressed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("warm did not observe the out-of-order event")
+	}
+
+	// The watermark covers [0,180], but the regression means that coverage is
+	// no longer trustworthy: the request must take the extract path.
+	unorderedOpts := orderedOpts
+	unorderedOpts.DurationSeconds = 180
+	rec = httptest.NewRecorder()
+	err = c.ServeExtract(rec, httptest.NewRequest(http.MethodGet, "/subtitle.ass?position=0&duration=180", nil), unorderedOpts, extract)
+	if err != nil {
+		t.Fatalf("serve window after regression: %v", err)
+	}
+	if body := rec.Body.String(); body != windowPayload {
+		t.Fatalf("window body after regression = %q, want the extract path's %q", body, windowPayload)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("extractor calls = %d after the regression, want the window's own extract", got)
+	}
+	if got := subtitleWarmTextDisables.Load() - before; got != 1 {
+		t.Fatalf("disable signal count = %d, want exactly one per warm", got)
+	}
+
+	close(finish)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("background warm did not finish")
+	}
 }
 
 // A window the warm has not reached yet must fall back to its own extract.

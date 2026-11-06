@@ -27,7 +27,10 @@ import (
 // a window's end, every event that can overlap that window has already been
 // written. The window is then reconstructed as the script header plus the
 // events that overlap the requested range, which is exactly what a windowed
-// extract from the committed full-track artifact would produce.
+// extract from the committed full-track artifact would produce. If an event
+// start regresses below the retained maximum, that ordering is disproven and
+// the layer permanently disables for the warm; windows then take the extract
+// path.
 
 const (
 	// subtitleWarmTextMaxBytes bounds the retained script. A feature-length
@@ -83,7 +86,9 @@ type subtitleWarmTextProgress struct {
 	retainedBytes int
 	// watermark is the latest event start emitted so far. Events arrive in
 	// start-time order, so once the watermark has reached a window's end every
-	// event that can start inside that window has already been written.
+	// event that can start inside that window has already been written. An
+	// observed start below the watermark disproves that ordering and disables
+	// the layer.
 	watermark float64
 	// seenEvents is true once any event line was retained, so an empty prefix
 	// is not mistaken for a covered range.
@@ -123,9 +128,10 @@ func (t *subtitleWarmTextTap) Flush() {
 }
 
 // observe parses a chunk into complete lines. A malformed event (unparseable
-// timestamps, a field count that cannot carry Start/End) disables the layer:
-// serving a window from a prefix whose ordering cannot be trusted is worse
-// than falling back to the existing extract path.
+// timestamps, a field count that cannot carry Start/End) disables the layer, as
+// does an event start below the retained maximum: serving a window from a
+// prefix whose ordering cannot be trusted is worse than falling back to the
+// existing extract path.
 func (p *subtitleWarmTextProgress) observe(chunk []byte) {
 	if p == nil || len(chunk) == 0 {
 		return
@@ -187,6 +193,14 @@ func (p *subtitleWarmTextProgress) consumeLineLocked(line string) bool {
 		}
 		if len(p.events) >= subtitleWarmTextMaxEvents {
 			p.disableLocked("event_budget")
+			return false
+		}
+		// Event starts are expected to be non-decreasing. A start below the
+		// retained maximum disproves that ordering: an event overlapping an
+		// already-covered window may still arrive, so the retained prefix can
+		// no longer prove coverage. Fail closed to the extract path.
+		if start < p.watermark {
+			p.disableLocked("unordered_event")
 			return false
 		}
 		p.events = append(p.events, subtitleWarmTextEvent{line: line, start: start, end: end})
