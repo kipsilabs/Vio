@@ -36,6 +36,22 @@ func TestMigrationTimeout(t *testing.T) {
 	}
 }
 
+func TestMigrationTimeoutLegacyFallback(t *testing.T) {
+	t.Setenv("VIO_MIGRATE_TIMEOUT", "")
+	t.Setenv("SILO_MIGRATE_TIMEOUT", "7m")
+	if got := MigrationTimeout(); got != 7*time.Minute {
+		t.Fatalf("MigrationTimeout() = %v, want 7m", got)
+	}
+}
+
+func TestMigrationTimeoutPrimaryWins(t *testing.T) {
+	t.Setenv("VIO_MIGRATE_TIMEOUT", "3m")
+	t.Setenv("SILO_MIGRATE_TIMEOUT", "7m")
+	if got := MigrationTimeout(); got != 3*time.Minute {
+		t.Fatalf("MigrationTimeout() = %v, want 3m", got)
+	}
+}
+
 func TestMigrationContextDeadline(t *testing.T) {
 	// A positive timeout yields a context with a deadline.
 	t.Setenv("SILO_MIGRATE_TIMEOUT", "50ms")

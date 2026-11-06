@@ -78,6 +78,17 @@ func TestAccessSettingsAreComparedOnRestore(t *testing.T) {
 // or sign-in trust toggle (private destinations, trusted proxies, origins,
 // TLS verification, sign-up and sign-in switches) is a stricter setting, so
 // no restore loosens it.
+func TestVirtualLibraryTrustSettingsAreStricter(t *testing.T) {
+	for _, key := range []string{"virtual_library.allow_private_streams", "virtual_library.allow_insecure_http"} {
+		if kind, _ := SettingKindOf(key); kind != SettingKindStricter {
+			t.Errorf("%s is %s, want stricter", key, kind)
+		}
+		if !accessSettings[key]("true", "false") {
+			t.Errorf("%s true over false should be wider", key)
+		}
+	}
+}
+
 func TestTrustSettingsAreStricter(t *testing.T) {
 	looksLikeTrust := regexp.MustCompile(`allow_private|trusted|allowed_origins|cors|insecure|skip_verify|tls_verify|signup\.enabled|local_password_login|email_auto_match|self_service`)
 	for _, key := range settingRegistry() {
