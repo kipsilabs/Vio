@@ -126,7 +126,7 @@ func NewClient(cfg BucketConfig) *Client {
 	// URL signing is local work, so it must not appear as a storage call.
 	presignClient := s3.NewPresignClient(s3Client, s3.WithPresignClientFromClientOptions(func(o *s3.Options) {
 		o.APIOptions = append(o.APIOptions, func(stack *middleware.Stack) error {
-			_, _ = stack.Initialize.Remove("SiloObserve")
+			_, _ = stack.Initialize.Remove("VioObserve")
 			return nil
 		})
 	}))
@@ -193,7 +193,7 @@ func (c *Client) GetObject(ctx context.Context, bucket, key string) ([]byte, err
 		}
 		return nil, fmt.Errorf("s3 GetObject %s/%s: %w", bucket, key, err)
 	}
-	defer out.Body.Close()
+	defer func() { _ = out.Body.Close() }()
 
 	data, err := io.ReadAll(out.Body)
 	if err != nil {
@@ -347,11 +347,11 @@ func (c *Client) PutObjectStreamParts(ctx context.Context, bucket, key string, r
 		input.ContentType = aws.String(ct)
 	}
 
-	uploader := manager.NewUploader(c.s3Client, func(u *manager.Uploader) {
+	uploader := manager.NewUploader(c.s3Client, func(u *manager.Uploader) { //nolint:staticcheck // SA1019: the multipart Uploader is the streaming path until the transfer manager migration.
 		u.PartSize = partSize
 		u.Concurrency = 1
 	})
-	if _, err := uploader.Upload(ctx, input); err != nil {
+	if _, err := uploader.Upload(ctx, input); err != nil { //nolint:staticcheck // SA1019: see NewUploader above.
 		return fmt.Errorf("s3 PutObject stream %s/%s: %w", bucket, key, err)
 	}
 
@@ -386,7 +386,7 @@ func (c *Client) UploadFile(ctx context.Context, bucket, key, path, contentType 
 	if err != nil {
 		return 0, fmt.Errorf("opening upload file %s: %w", path, err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	info, err := file.Stat()
 	if err != nil {
