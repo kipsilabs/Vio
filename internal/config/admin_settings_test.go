@@ -454,6 +454,30 @@ func TestVirtualProbeTuningReadersFallBackAndClamp(t *testing.T) {
 	}
 }
 
+// TestVirtualLibraryCatalogDiscoveryBudgetMsStoredValueWins pins the discovery
+// budget policy: a saved value inside [500, 20000] is returned unchanged, and a
+// missing or unparseable value is the 20 s default. Saved admin settings are not
+// rewritten to a newer default; an operator raises a pinned old ceiling.
+func TestVirtualLibraryCatalogDiscoveryBudgetMsStoredValueWins(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		raw  string
+		want int
+	}{
+		{"minimum", "500", 500},
+		{"old ceiling", "10000", 10000},
+		{"new ceiling", "20000", 20000},
+		{"missing", "", 20000},
+		{"unparseable", "soon", 20000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := VirtualLibraryCatalogDiscoveryBudgetMs(tc.raw); got != tc.want {
+				t.Fatalf("VirtualLibraryCatalogDiscoveryBudgetMs(%q) = %d, want %d", tc.raw, got, tc.want)
+			}
+		})
+	}
+}
+
 func containsString(haystack []string, needle string) bool {
 	for _, s := range haystack {
 		if s == needle {
