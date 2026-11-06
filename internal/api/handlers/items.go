@@ -158,14 +158,9 @@ type VirtualPrefetcher interface {
 	PrefetchVirtualPlayback(ctx context.Context, files []*models.MediaFile, profileID string)
 }
 
-// VirtualFileByID loads one media file row for prefetch warming.
-type VirtualFileByID interface {
-	GetByID(ctx context.Context, id int) (*models.MediaFile, error)
-}
-
 // SetVirtualPrefetcher wires watch-detail prefetch. Either arg may be nil to
 // keep prefetch disabled.
-func (h *ItemsHandler) SetVirtualPrefetcher(p VirtualPrefetcher, files VirtualFileByID) {
+func (h *ItemsHandler) SetVirtualPrefetcher(p VirtualPrefetcher, files FilePathResolver) {
 	if h == nil {
 		return
 	}
