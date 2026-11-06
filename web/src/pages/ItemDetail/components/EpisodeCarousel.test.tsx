@@ -2,6 +2,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { EpisodeListItem } from "@/api/types";
 import EpisodeCarousel from "./EpisodeCarousel";
 
 vi.mock("@/lib/thumbhash", () => ({ decodeThumbhash: () => "data:image/png;base64,fixture" }));
@@ -45,6 +46,22 @@ vi.mock("@/hooks/useCarouselEmbla", () => ({
     scrollNext: () => {},
   }),
 }));
+
+function episode(number: number, overrides: Partial<EpisodeListItem> = {}): EpisodeListItem {
+  return {
+    content_id: `ep-${number}`,
+    season_number: 1,
+    episode_number: number,
+    title: "",
+    overview: "",
+    air_date: null,
+    runtime: 42,
+    still_url: "",
+    still_thumbhash: "",
+    files: [],
+    ...overrides,
+  };
+}
 
 // Capability gating: the carousel stands in for the resolved answer
 // (available) so the badge path is exercised without a QueryClient.

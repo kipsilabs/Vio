@@ -13,6 +13,12 @@ vi.mock("@/components/MediaItemMenu", () => ({
   },
 }));
 
+vi.mock("@/components/CardPlayOverlay", () => ({
+  default: ({ contentId, title }: { contentId: string; title: string }) => (
+    <a href={`/watch/${contentId}`}>Play {title}</a>
+  ),
+}));
+
 vi.mock("@/hooks/useOverlayPrefs", () => ({
   useOverlayPrefs: () => ({ prefs: null, quickActionMode: "watched" }),
 }));

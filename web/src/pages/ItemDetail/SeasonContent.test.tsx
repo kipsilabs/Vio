@@ -1,3 +1,4 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { fireEvent, render, screen } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
@@ -127,9 +128,27 @@ function makeSeasonItem(overrides: Partial<ItemDetail> = {}) {
 
 function renderSeasonMarkup(item = makeSeasonItem()) {
   return renderToStaticMarkup(
-    <MemoryRouter initialEntries={["/item/season-1"]}>
-      <SeasonContent item={item} />
-    </MemoryRouter>,
+    withQueryClient(
+      <MemoryRouter initialEntries={["/item/season-1"]}>
+        <SeasonContent item={item} />
+      </MemoryRouter>,
+    ),
+  );
+}
+
+// SeasonContent renders WatchedActionBar, which reads the QueryClient; every
+// render here must sit under a provider.
+function withQueryClient(ui: ReactNode) {
+  return (
+    <QueryClientProvider
+      client={
+        new QueryClient({
+          defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+        })
+      }
+    >
+      {ui}
+    </QueryClientProvider>
   );
 }
 
@@ -221,9 +240,11 @@ describe("SeasonContent", () => {
     });
     const item = makeSeasonItem();
     const markup = renderToStaticMarkup(
-      <MemoryRouter initialEntries={["/item/season-1?libraryId=4"]}>
-        <SeasonContent item={item} libraryId={4} />
-      </MemoryRouter>,
+      withQueryClient(
+        <MemoryRouter initialEntries={["/item/season-1?libraryId=4"]}>
+          <SeasonContent item={item} libraryId={4} />
+        </MemoryRouter>,
+      ),
     );
 
     expect(mocks.useItemEpisodes).toHaveBeenCalledWith(item.content_id, 4);
@@ -256,9 +277,11 @@ describe("SeasonContent", () => {
         : { data: undefined, isLoading: true, error: null },
     );
     renderToStaticMarkup(
-      <MemoryRouter initialEntries={["/item/season-1?libraryId=4"]}>
-        <SeasonContent item={makeSeasonItem()} libraryId={4} />
-      </MemoryRouter>,
+      withQueryClient(
+        <MemoryRouter initialEntries={["/item/season-1?libraryId=4"]}>
+          <SeasonContent item={makeSeasonItem()} libraryId={4} />
+        </MemoryRouter>,
+      ),
     );
 
     expect(mocks.capturedActionBarProps.value?.onShuffle).toBeTypeOf("function");
@@ -298,9 +321,11 @@ describe("SeasonContent", () => {
     }));
     const item = makeSeasonItem();
     const html = renderToStaticMarkup(
-      <MemoryRouter initialEntries={["/item/season-1?libraryId=4"]}>
-        <SeasonContent item={item} libraryId={4} />
-      </MemoryRouter>,
+      withQueryClient(
+        <MemoryRouter initialEntries={["/item/season-1?libraryId=4"]}>
+          <SeasonContent item={item} libraryId={4} />
+        </MemoryRouter>,
+      ),
     );
 
     expect(mocks.useItemEpisodes).toHaveBeenCalledWith(item.content_id);
@@ -362,9 +387,11 @@ describe("SeasonContent", () => {
     const translate = vi.fn();
     mocks.useOnViewTranslation.mockReturnValue({ translating: false, onTranslate: translate });
     render(
-      <MemoryRouter>
-        <SeasonContent item={makeSeasonItem({ overview: "" })} />
-      </MemoryRouter>,
+      withQueryClient(
+        <MemoryRouter>
+          <SeasonContent item={makeSeasonItem({ overview: "" })} />
+        </MemoryRouter>,
+      ),
     );
     fireEvent.click(screen.getByRole("button", { name: "Translate episodes" }));
     expect(translate).toHaveBeenCalledTimes(1);
@@ -374,9 +401,11 @@ describe("SeasonContent", () => {
     const translate = vi.fn();
     mocks.useOnViewTranslation.mockReturnValue({ translating: false, onTranslate: translate });
     render(
-      <MemoryRouter>
-        <SeasonContent item={makeSeasonItem()} />
-      </MemoryRouter>,
+      withQueryClient(
+        <MemoryRouter>
+          <SeasonContent item={makeSeasonItem()} />
+        </MemoryRouter>,
+      ),
     );
     expect(screen.queryByRole("button", { name: "Translate episodes" })).not.toBeInTheDocument();
     expect(mocks.capturedDetailHeroProps.value).toMatchObject({ onTranslateOverview: translate });
@@ -397,9 +426,11 @@ describe("SeasonContent", () => {
       },
     });
     render(
-      <MemoryRouter>
-        <SeasonContent item={makeSeasonItem()} />
-      </MemoryRouter>,
+      withQueryClient(
+        <MemoryRouter>
+          <SeasonContent item={makeSeasonItem()} />
+        </MemoryRouter>,
+      ),
     );
     fireEvent.click(screen.getByRole("button", { name: "Translate episodes" }));
     expect(translate).toHaveBeenCalledTimes(1);
