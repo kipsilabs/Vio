@@ -26,7 +26,11 @@ const (
 	StatusRunning   = "running"
 	StatusCompleted = "completed"
 	StatusFailed    = "failed"
-	StatusCancelled = "cancelled"
+	// StatusCancelled is the durable status value. It matches the
+	// admin_jobs_status_check constraint (migration 178) and the literals the
+	// cancel-on-completion paths write in Complete and Fail; a different
+	// spelling would violate the constraint and lose the cancellation.
+	StatusCancelled = "cancelled" //nolint:misspell // Persisted DB enum value (migration 178).
 )
 
 var (
@@ -723,7 +727,7 @@ func (r *Repository) Fail(ctx context.Context, id string, input FailJobInput) er
 
 func (r *Repository) Cancel(ctx context.Context, id, message string, expiresAt time.Time) (*models.AdminJob, error) {
 	if message == "" {
-		message = "Admin job cancelled"
+		message = "Admin job cancelled" //nolint:misspell // Job text shown beside the persisted cancelled status.
 	}
 	job, err := scanAdminJob(r.pool.QueryRow(ctx, `
 		UPDATE admin_jobs
@@ -804,7 +808,7 @@ func (r *Repository) CancelState(ctx context.Context, id string) (cancelRequeste
 
 func (r *Repository) CancelQueued(ctx context.Context, id, message string, expiresAt time.Time) (*models.AdminJob, error) {
 	if message == "" {
-		message = "Admin job cancelled"
+		message = "Admin job cancelled" //nolint:misspell // Job text shown beside the persisted cancelled status.
 	}
 	job, err := scanAdminJob(r.pool.QueryRow(ctx, `
 		UPDATE admin_jobs

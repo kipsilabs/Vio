@@ -313,7 +313,7 @@ const defaultLocalImportDir = "/catalog-seeds"
 
 var (
 	errCatalogSeedImportSourceUnavailable = errors.New("catalog imports from stored artifacts require configured storage")
-	errCatalogSeedImportInvalidLocalPath  = errors.New("Local path must point to an existing .json.gz file")
+	errCatalogSeedImportInvalidLocalPath  = errors.New("local path must point to an existing .json.gz file")
 )
 
 func (h *CatalogSeedHandler) SetLocalImportDir(dir string) {
@@ -385,7 +385,7 @@ func parseCatalogImportOptions(r *http.Request) (catalogseed.ImportOptions, erro
 	var rewrites []catalogseed.PathRewrite
 	if raw := r.FormValue("path_rewrites"); raw != "" {
 		if err := json.Unmarshal([]byte(raw), &rewrites); err != nil {
-			return catalogseed.ImportOptions{}, errors.New("Invalid path_rewrites")
+			return catalogseed.ImportOptions{}, errors.New("invalid path_rewrites")
 		}
 	}
 

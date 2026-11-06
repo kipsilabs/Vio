@@ -18,6 +18,11 @@ import (
 	"github.com/Silo-Server/silo-server/internal/secret"
 )
 
+const (
+	settingVirtualLibraryAllowPrivateStreams = "virtual_library.allow_private_streams"
+	settingVirtualLibraryAllowInsecureHTTP   = "virtual_library.allow_insecure_http"
+)
+
 // accessSettings are the server settings that decide who can sign in, how
 // they may, what reaches this server and what it reaches, and what a viewer
 // sees. Each compares a restored value with the live one and reports
@@ -54,8 +59,8 @@ var accessSettings = func() map[string]widerFunc {
 		// Where this server's traffic and trust reach.
 		"notifications.webhooks.allow_private_destinations": on,
 		"media_servers.allow_private_destinations":          on,
-		"virtual_library.allow_private_streams":             on,
-		"virtual_library.allow_insecure_http":               on,
+		settingVirtualLibraryAllowPrivateStreams:            on,
+		settingVirtualLibraryAllowInsecureHTTP:              on,
 		settingTrustedProxies:                               moreNetworks,
 		settingSMTPSecurity:                                 byRank(map[string]int64{smtpStartTLS: 0, smtpTLS: 0, smtpNone: 1}),
 		// What delivers notifications and mail to destinations without a

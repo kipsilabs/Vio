@@ -9,7 +9,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/blobstore"
 )
 
-func TestPlanRotation(t *testing.T) {
+func TestPlanRotation(t *testing.T) { //nolint:funlen // One table pins the keep rules, verification warnings, and kind ordering together.
 	now := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
 	day := func(n int) time.Time { return now.Add(-time.Duration(n) * 24 * time.Hour) }
 	clean := &Manifest{}

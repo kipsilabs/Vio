@@ -457,26 +457,9 @@ func CreateLibraryCollectionInTx(ctx context.Context, tx pgx.Tx, input CreateLib
 		return "", fmt.Errorf("creating library collection: %w", err)
 	}
 
-	var groupLibraryID *int
-	if input.GroupID != nil {
-		var (
-			libraryID int
-			kind      models.LibraryCollectionGroupKind
-		)
-		if err := tx.QueryRow(ctx, `
-			SELECT library_id, kind
-			FROM library_collection_groups
-			WHERE id = $1
-		`, *input.GroupID).Scan(&libraryID, &kind); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return "", ErrLibraryCollectionGroupNotFound
-			}
-			return "", fmt.Errorf("loading collection group: %w", err)
-		}
-		if kind == models.GroupKindUserCollections {
-			return "", errors.New("user-collections group cannot accept admin collections")
-		}
-		groupLibraryID = &libraryID
+	groupLibraryID, err := libraryCollectionGroupLibraryID(ctx, tx, input.GroupID)
+	if err != nil {
+		return "", err
 	}
 
 	if err := lockLibraryCollectionOrderRevisions(ctx, tx, input.LibraryIDs); err != nil {
@@ -509,6 +492,33 @@ func CreateLibraryCollectionInTx(ctx context.Context, tx pgx.Tx, input CreateLib
 	}
 
 	return id, nil
+}
+
+// libraryCollectionGroupLibraryID reads the library an admin collection's
+// group belongs to. A nil groupID has no library. A user-collections group
+// cannot take admin collections.
+func libraryCollectionGroupLibraryID(ctx context.Context, tx pgx.Tx, groupID *string) (*int, error) {
+	if groupID == nil {
+		return nil, nil
+	}
+	var (
+		libraryID int
+		kind      models.LibraryCollectionGroupKind
+	)
+	if err := tx.QueryRow(ctx, `
+		SELECT library_id, kind
+		FROM library_collection_groups
+		WHERE id = $1
+	`, *groupID).Scan(&libraryID, &kind); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrLibraryCollectionGroupNotFound
+		}
+		return nil, fmt.Errorf("loading collection group: %w", err)
+	}
+	if kind == models.GroupKindUserCollections {
+		return nil, errors.New("user-collections group cannot accept admin collections")
+	}
+	return &libraryID, nil
 }
 
 func (r *LibraryCollectionRepository) GetByID(ctx context.Context, id string) (*models.LibraryCollection, error) {
@@ -2307,7 +2317,6 @@ func UpdateLibraryCollectionColumnsInTx(ctx context.Context, tx pgx.Tx, input Up
 	return nil
 }
 
-//nolint:funlen,gocyclo // the scope and group writes of one transaction; its column assignments moved to libraryCollectionColumnSets
 func AddMissingItemsInTx(ctx context.Context, tx pgx.Tx, collectionID string, mediaItemIDs []string) ([]string, error) {
 	if len(mediaItemIDs) == 0 {
 		return nil, nil
@@ -2362,131 +2371,86 @@ func AddMissingItemsInTx(ctx context.Context, tx pgx.Tx, collectionID string, me
 
 func libraryCollectionColumnSets(input UpdateLibraryCollectionInput) (sets []string, args []any, argIdx int) {
 	argIdx = 1
+	add := func(column string, value any) {
+		sets = append(sets, fmt.Sprintf("%s = $%d", column, argIdx))
+		args = append(args, value)
+		argIdx++
+	}
 
 	if input.Slug != nil {
-		sets = append(sets, fmt.Sprintf("slug = $%d", argIdx))
-		args = append(args, *input.Slug)
-		argIdx++
+		add("slug", *input.Slug)
 	}
 	if input.Title != nil {
-		sets = append(sets, fmt.Sprintf("title = $%d", argIdx))
-		args = append(args, *input.Title)
-		argIdx++
+		add("title", *input.Title)
 	}
 	if input.Description != nil {
-		sets = append(sets, fmt.Sprintf("description = $%d", argIdx))
-		args = append(args, *input.Description)
-		argIdx++
+		add("description", *input.Description)
 	}
 	if input.CollectionType != nil {
-		sets = append(sets, fmt.Sprintf("collection_type = $%d", argIdx))
-		args = append(args, *input.CollectionType)
-		argIdx++
+		add("collection_type", *input.CollectionType)
 	}
 	if input.Visibility != nil {
-		sets = append(sets, fmt.Sprintf("visibility = $%d", argIdx))
-		args = append(args, *input.Visibility)
-		argIdx++
+		add("visibility", *input.Visibility)
 	}
 	if input.SortOrder != nil {
-		sets = append(sets, fmt.Sprintf("sort_order = $%d", argIdx))
-		args = append(args, *input.SortOrder)
-		argIdx++
+		add("sort_order", *input.SortOrder)
 	}
 	if input.Featured != nil {
-		sets = append(sets, fmt.Sprintf("featured = $%d", argIdx))
-		args = append(args, *input.Featured)
-		argIdx++
+		add("featured", *input.Featured)
 	}
 	if input.PosterURL != nil {
-		sets = append(sets, fmt.Sprintf("poster_url = $%d", argIdx))
-		args = append(args, *input.PosterURL)
-		argIdx++
+		add("poster_url", *input.PosterURL)
 	}
 	if input.BackdropURL != nil {
-		sets = append(sets, fmt.Sprintf("backdrop_url = $%d", argIdx))
-		args = append(args, *input.BackdropURL)
-		argIdx++
+		add("backdrop_url", *input.BackdropURL)
 	}
 	if input.PosterThumbhash != nil {
-		sets = append(sets, fmt.Sprintf("poster_thumbhash = $%d", argIdx))
-		args = append(args, *input.PosterThumbhash)
-		argIdx++
+		add("poster_thumbhash", *input.PosterThumbhash)
 	}
 	if input.BackdropThumbhash != nil {
-		sets = append(sets, fmt.Sprintf("backdrop_thumbhash = $%d", argIdx))
-		args = append(args, *input.BackdropThumbhash)
-		argIdx++
+		add("backdrop_thumbhash", *input.BackdropThumbhash)
 	}
 	if input.PosterAutoGenerated != nil {
-		sets = append(sets, fmt.Sprintf("poster_auto_generated = $%d", argIdx))
-		args = append(args, *input.PosterAutoGenerated)
-		argIdx++
+		add("poster_auto_generated", *input.PosterAutoGenerated)
 	}
 	if input.PosterFromTemplate != nil {
-		sets = append(sets, fmt.Sprintf("poster_from_template = $%d", argIdx))
-		args = append(args, *input.PosterFromTemplate)
-		argIdx++
+		add("poster_from_template", *input.PosterFromTemplate)
 	}
 	if input.SourceURL != nil {
-		sets = append(sets, fmt.Sprintf("source_url = $%d", argIdx))
-		args = append(args, *input.SourceURL)
-		argIdx++
+		add("source_url", *input.SourceURL)
 	}
 	if len(input.QueryDefinition) > 0 {
-		sets = append(sets, fmt.Sprintf("query_definition = $%d", argIdx))
-		args = append(args, input.QueryDefinition)
-		argIdx++
+		add("query_definition", input.QueryDefinition)
 	}
 	if len(input.SortConfig) > 0 {
-		sets = append(sets, fmt.Sprintf("sort_config = $%d", argIdx))
-		args = append(args, input.SortConfig)
-		argIdx++
+		add("sort_config", input.SortConfig)
 	}
 	if len(input.SourceConfig) > 0 {
-		sets = append(sets, fmt.Sprintf("source_config = $%d", argIdx))
-		args = append(args, input.SourceConfig)
-		argIdx++
+		add("source_config", input.SourceConfig)
 	}
 	if input.ManagementMode != nil {
-		sets = append(sets, fmt.Sprintf("management_mode = $%d", argIdx))
-		args = append(args, *input.ManagementMode)
-		argIdx++
+		add("management_mode", *input.ManagementMode)
 	}
 	if input.ManagementSource != nil {
-		sets = append(sets, fmt.Sprintf("management_source = $%d", argIdx))
-		args = append(args, *input.ManagementSource)
-		argIdx++
+		add("management_source", *input.ManagementSource)
 	}
 	if input.ManagementKey != nil {
-		sets = append(sets, fmt.Sprintf("management_key = $%d", argIdx))
-		args = append(args, *input.ManagementKey)
-		argIdx++
+		add("management_key", *input.ManagementKey)
 	}
 	if input.SyncSchedule != nil {
 		if *input.SyncSchedule == "" {
 			// Clearing schedule: null both columns.
-			sets = append(sets, fmt.Sprintf("sync_schedule = $%d", argIdx))
-			args = append(args, nil)
-			argIdx++
-			sets = append(sets, fmt.Sprintf("next_sync_at = $%d", argIdx))
-			args = append(args, nil)
-			argIdx++
+			add("sync_schedule", nil)
+			add("next_sync_at", nil)
 		} else {
-			sets = append(sets, fmt.Sprintf("sync_schedule = $%d", argIdx))
-			args = append(args, *input.SyncSchedule)
-			argIdx++
-			sets = append(sets, fmt.Sprintf("next_sync_at = $%d", argIdx))
-			args = append(args, computeNextSyncAt(input.SyncSchedule))
-			argIdx++
+			add("sync_schedule", *input.SyncSchedule)
+			add("next_sync_at", computeNextSyncAt(input.SyncSchedule))
 		}
 	}
 	// Only set NextSyncAt directly if SyncSchedule was not already handled above
 	// (which computes next_sync_at automatically).
 	if input.NextSyncAt != nil && input.SyncSchedule == nil {
-		sets = append(sets, fmt.Sprintf("next_sync_at = $%d", argIdx))
-		args = append(args, *input.NextSyncAt)
-		argIdx++
+		add("next_sync_at", *input.NextSyncAt)
 	}
 
 	return sets, args, argIdx

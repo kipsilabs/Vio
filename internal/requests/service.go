@@ -707,7 +707,7 @@ func (s *Service) getDetail(ctx context.Context, viewer Viewer, mediaType MediaT
 	if ceiling != "" {
 		client, ok := s.tmdb.(TMDBCertificationClient)
 		if !ok {
-			return nil, fmt.Errorf("requests: tmdb client cannot resolve certifications")
+			return nil, errors.New("requests: tmdb client cannot resolve certifications")
 		}
 		cert, err := client.GetCertification(ctx, tmdbMediaType(mediaType), tmdbID)
 		if err != nil {
@@ -900,28 +900,8 @@ func (s *Service) CreateRequest(ctx context.Context, viewer Viewer, input Create
 		facts = s.routingFacts(ctx, detail)
 	}
 	if normalized.MediaType == MediaTypeSeries && !normalized.WholeSeries {
-		// A series partly in the library can still be requested for the
-		// seasons it is missing.
-		tvdbID := 0
-		if normalized.TVDBID != nil {
-			tvdbID = *normalized.TVDBID
-		}
-		seasonList, _, fromTVDB, seasonListAvailable, err := s.seriesSeasonSource(ctx, detail, tvdbID, normalized.SeasonSource)
-		if err != nil {
+		if err := s.resolvePartialSeriesSeasons(ctx, &normalized, detail, match); err != nil {
 			return nil, err
-		}
-		joinCounts := seasonCountsCompatible(fromTVDB, match)
-		seasons, err := s.resolveRequestedSeasons(ctx, normalized.Seasons, seasonList, seasonListAvailable, match, joinCounts)
-		if err != nil {
-			return nil, err
-		}
-		normalized.Seasons = seasons
-		if normalized.SeasonSource == "" && seasonListAvailable {
-			if fromTVDB {
-				normalized.SeasonSource = SeasonSourceTVDB
-			} else {
-				normalized.SeasonSource = SeasonSourceTMDB
-			}
 		}
 	}
 
@@ -990,6 +970,34 @@ func (s *Service) CreateRequest(ctx context.Context, viewer Viewer, input Create
 		return s.withLibraryContent(ctx, s.submitAfterCommit(ctx, *req, viewer)), nil
 	}
 	return s.withLibraryContent(ctx, req), nil
+}
+
+// resolvePartialSeriesSeasons fills in a partly-in-library series' requested
+// seasons and season source from the season list. A series partly in the
+// library can still be requested for the seasons it is missing.
+func (s *Service) resolvePartialSeriesSeasons(ctx context.Context, normalized *CreateRequestInput, detail *tmdb.MediaDetail, match PresenceMatch) error {
+	tvdbID := 0
+	if normalized.TVDBID != nil {
+		tvdbID = *normalized.TVDBID
+	}
+	seasonList, _, fromTVDB, seasonListAvailable, err := s.seriesSeasonSource(ctx, detail, tvdbID, normalized.SeasonSource)
+	if err != nil {
+		return err
+	}
+	joinCounts := seasonCountsCompatible(fromTVDB, match)
+	seasons, err := s.resolveRequestedSeasons(ctx, normalized.Seasons, seasonList, seasonListAvailable, match, joinCounts)
+	if err != nil {
+		return err
+	}
+	normalized.Seasons = seasons
+	if normalized.SeasonSource == "" && seasonListAvailable {
+		if fromTVDB {
+			normalized.SeasonSource = SeasonSourceTVDB
+		} else {
+			normalized.SeasonSource = SeasonSourceTMDB
+		}
+	}
+	return nil
 }
 
 func (s *Service) ListMine(ctx context.Context, viewer Viewer, filter ListFilter) ([]*Request, error) {

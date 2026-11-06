@@ -172,7 +172,9 @@ func videoEligibleV3(source SourceDescriptorV3, request StartRequestV3) (bool, b
 				if len(capability.Profiles) > 0 && !videoProfileSupportedV3(source.VideoCodec, source.VideoProfile, capability.Profiles) {
 					continue
 				}
-				if len(capability.Levels) > 0 && (source.VideoLevel <= 0 || !(containsAtLeastV3(capability.Levels, source.VideoLevel) || (request.Capabilities.VideoEvidence == EvidenceExactV3 && capability.Hardware && hevcLevelFitsDecoderV3(source, slices.Max(capability.Levels))))) {
+				acceptsLevel := len(capability.Levels) > 0 && containsAtLeastV3(capability.Levels, source.VideoLevel)
+				decoderCoversTopLevel := len(capability.Levels) > 0 && request.Capabilities.VideoEvidence == EvidenceExactV3 && capability.Hardware && hevcLevelFitsDecoderV3(source, slices.Max(capability.Levels))
+				if len(capability.Levels) > 0 && (source.VideoLevel <= 0 || (!acceptsLevel && !decoderCoversTopLevel)) {
 					continue
 				}
 			}
