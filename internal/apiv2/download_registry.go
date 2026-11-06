@@ -100,6 +100,9 @@ type DownloadCapability struct {
 	// monitors store a quality and register episodes in it.
 	BulkQuality    bool `json:"bulk_quality"`
 	MonitorQuality bool `json:"monitor_quality"`
+	// BatchVersion: a season or series page accepts media_file_id as a
+	// version template; each episode gets its version closest to that file.
+	BatchVersion bool `json:"batch_version"`
 	// PreparationProgress: listed preparing entries carry `preparation`.
 	PreparationProgress bool `json:"preparation_progress"`
 	// DirectDownloadLinks: POST /direct-download/links mints the
@@ -322,6 +325,7 @@ func (reg *Registry) getDownloadCapability(ctx context.Context, _ *CapabilityInp
 		out.BoundedCreation = reg.deps.DownloadCreation != nil
 		out.BoundedSubscriptionSync = reg.deps.DownloadSubscriptionSync != nil
 		out.BulkQuality = out.BoundedCreation
+		out.BatchVersion = out.BoundedCreation
 		out.MonitorQuality = out.SubscriptionMutations
 		out.PreparationProgress = true
 		if reg.deps.DownloadProxyDelivery != nil {
