@@ -3022,19 +3022,11 @@ func (h *LibraryCollectionHandler) setListingLogos(ctx context.Context, cards []
 	}
 }
 
-func (h *LibraryCollectionHandler) presignURL(r *http.Request, path string, variant string) string {
-	return h.presignURLCtx(r.Context(), path, variant)
-}
-
 func (h *LibraryCollectionHandler) presignURLCtx(ctx context.Context, path string, variant string) string {
 	if h.detailSvc != nil {
 		return h.detailSvc.PresignURL(ctx, path, variant)
 	}
 	return ""
-}
-
-func (h *LibraryCollectionHandler) presignGPURL(r *http.Request, path string) string {
-	return h.presignGPURLCtx(r.Context(), path)
 }
 
 func (h *LibraryCollectionHandler) presignGPURLCtx(ctx context.Context, path string) string {
