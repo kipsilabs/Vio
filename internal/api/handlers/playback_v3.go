@@ -15060,7 +15060,7 @@ func applyDVPinToEffectiveFileV3(session *playback.Session, file *models.MediaFi
 	if session == nil || file == nil {
 		return
 	}
-	playback.ApplyDVPinToFileV3(file, session.DVProfilePin)
+	file.VideoTracks = playback.ApplyDVPinToFileV3(file, session.DVProfilePin)
 }
 
 func videoBitstreamFilterForPlanV3(plan *playback.PlanV3) string {

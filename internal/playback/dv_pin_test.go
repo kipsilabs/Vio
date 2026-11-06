@@ -58,20 +58,20 @@ func TestDVPinV3ZeroProfileIsNotEvidence(t *testing.T) {
 // file identity; another file's fresh read is left alone.
 func TestApplyDVPinToFileV3ScopesToThePinnedFile(t *testing.T) {
 	pinned := &models.MediaFile{ID: 42, FilePath: "/media/movie.mkv", VideoTracks: []models.VideoTrack{{DVProfile: 7}}}
-	ApplyDVPinToFileV3(pinned, DVPinV3{FileID: 42, Source: "/media/movie.mkv", Profile: 8})
+	pinned.VideoTracks = ApplyDVPinToFileV3(pinned, DVPinV3{FileID: 42, Source: "/media/movie.mkv", Profile: 8})
 	if pinned.VideoTracks[0].DVProfile != 8 {
 		t.Fatalf("pinned profile = %d, want 8", pinned.VideoTracks[0].DVProfile)
 	}
 
 	other := &models.MediaFile{ID: 84, FilePath: "/media/other.mkv", VideoTracks: []models.VideoTrack{{DVProfile: 7}}}
-	ApplyDVPinToFileV3(other, DVPinV3{FileID: 42, Source: "/media/movie.mkv", Profile: 8})
+	other.VideoTracks = ApplyDVPinToFileV3(other, DVPinV3{FileID: 42, Source: "/media/movie.mkv", Profile: 8})
 	if other.VideoTracks[0].DVProfile != 7 {
 		t.Fatalf("a different file was overwritten by another file's pin: %d", other.VideoTracks[0].DVProfile)
 	}
 
 	// Same row id, rotated source: the pin must not apply.
 	rotated := &models.MediaFile{ID: 42, FilePath: "virtual://movie/tt?result=B", VideoTracks: []models.VideoTrack{{DVProfile: 7}}}
-	ApplyDVPinToFileV3(rotated, DVPinV3{FileID: 42, Source: "virtual://movie/tt?result=A", Profile: 8})
+	rotated.VideoTracks = ApplyDVPinToFileV3(rotated, DVPinV3{FileID: 42, Source: "virtual://movie/tt?result=A", Profile: 8})
 	if rotated.VideoTracks[0].DVProfile != 7 {
 		t.Fatalf("a rotated release inherited the previous pin: %d", rotated.VideoTracks[0].DVProfile)
 	}
