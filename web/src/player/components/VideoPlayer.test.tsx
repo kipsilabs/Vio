@@ -136,14 +136,14 @@ vi.mock("../hooks/useSubtitleTracks", () => ({
     subtitleTimeline.liveKey = args[8] as string | null;
     subtitleTimeline.streamGeneration = args[9] as number;
     subtitleTimeline.setLoadState = args[10] as (state: string) => void;
-    subtitleTimeline.cueRevision = args[11] as number;
+    subtitleTimeline.cueRevision = args[13] as number;
     return [];
   },
 }));
 vi.mock("../hooks/useASSSubtitles", () => ({
   useASSSubtitles: (...args: unknown[]) => {
     subtitleTimeline.assOffsetSeconds = args[4] as number;
-    subtitleTimeline.assCueRevision = args[9] as number;
+    subtitleTimeline.assCueRevision = args[11] as number;
     return { isActive: false };
   },
 }));
@@ -1870,14 +1870,15 @@ describe("VideoPlayer room catch-up", () => {
     await correct("correction-2", 110);
     expect(playerSeek).toHaveBeenCalledTimes(1);
 
-    // Buffered media is reached at once, whatever the budget.
+    // Buffered media is reached at once, whatever the budget: the
+    // buffer-first seek applies it locally without a remux seek call.
     Object.defineProperty(video, "buffered", {
       configurable: true,
       value: { length: 1, start: () => 0, end: () => 200 } as unknown as TimeRanges,
     });
     await correct("correction-3", 120);
-    expect(playerSeek).toHaveBeenCalledTimes(2);
-    expect(playerSeek).toHaveBeenLastCalledWith(120);
+    expect(playerSeek).toHaveBeenCalledTimes(1);
+    expect(video.currentTime).toBe(120);
   });
 
   it("does not settle a correction reload on an unrelated stream swap", async () => {
@@ -3698,7 +3699,7 @@ describe("VideoPlayer plan failure recovery", () => {
     });
 
     await waitFor(() => expect(onSubtitleTrackChange).toHaveBeenCalledOnce());
-    expect(onSubtitleTrackChange).toHaveBeenCalledWith(2, 0);
+    expect(onSubtitleTrackChange).toHaveBeenCalledWith(2, 0, expect.objectContaining({ index: 2 }));
 
     rerenderPlayer({ replanError: "Silo could not apply the subtitle selection." });
 
@@ -3715,7 +3716,11 @@ describe("VideoPlayer plan failure recovery", () => {
 
     await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(2));
     expect(onSubtitleTrackChange).toHaveBeenCalledTimes(2);
-    expect(onSubtitleTrackChange).toHaveBeenLastCalledWith(2, 0);
+    expect(onSubtitleTrackChange).toHaveBeenLastCalledWith(
+      2,
+      0,
+      expect.objectContaining({ index: 2 }),
+    );
   });
 
   // A sync request built from the player's stale "off" would turn the restored
@@ -5280,7 +5285,11 @@ describe("VideoPlayer translation handoff", () => {
     });
 
     await waitFor(() => expect(onSubtitleChanged).toHaveBeenCalledWith(4, undefined));
-    expect(onSubtitleTrackChange).toHaveBeenCalledWith(4, expect.any(Number));
+    expect(onSubtitleTrackChange).toHaveBeenCalledWith(
+      4,
+      expect.any(Number),
+      expect.objectContaining({ index: 4 }),
+    );
     expect(controls.current?.activeSubtitleIndex).toBe(4);
     expect(controls.current?.subtitleTracks).toEqual([downloadedTrack]);
   });
@@ -5835,7 +5844,7 @@ describe("VideoPlayer lost connection", () => {
         controls.current as unknown as { onSubtitleSelect: (i: number | null) => void }
       ).onSubtitleSelect(null),
     );
-    await waitFor(() => expect(onSubtitleTrackChange).toHaveBeenCalledWith(null, 0));
+    await waitFor(() => expect(onSubtitleTrackChange).toHaveBeenCalledWith(null, 0, null));
     rerenderPlayer({ plan: directPlan, planRevision: 2 });
 
     // The server restarts: the reconnect starts session-2 with no subtitle.
