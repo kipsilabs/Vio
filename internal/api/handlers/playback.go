@@ -909,6 +909,13 @@ type PlaybackHandler struct {
 	// expire the wait promptly without mutating a package global a leaked
 	// watchdog goroutine may be reading. Zero uses virtualBackgroundProbeBudget.
 	probeGateWaitOverride time.Duration
+	// backgroundProbeBudgetOverride, when positive, replaces
+	// virtualBackgroundProbeBudget as this handler's background/deferred probe
+	// execution budget and the bound the convergence watchdog derives from it.
+	// A test sets it before the probe goroutines start instead of mutating the
+	// package global, which outliving goroutines from earlier tests may still
+	// read. Zero uses virtualBackgroundProbeBudget.
+	backgroundProbeBudgetOverride time.Duration
 
 	// prefetchOnce guards the lazy prefetch worker pool. Prefetch work is
 	// admitted into a bounded queue (prefetchQueue) before any goroutine

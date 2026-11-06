@@ -218,7 +218,18 @@ func (h *PlaybackHandler) probeConvergenceBound() time.Duration {
 	if h != nil && h.probeConvergenceOverride > 0 {
 		return h.probeConvergenceOverride
 	}
-	return virtualBackgroundProbeBudget + virtualProbeConvergenceSlack
+	return h.probeBackgroundBudget() + virtualProbeConvergenceSlack
+}
+
+// probeBackgroundBudget is the execution budget for this handler's background
+// and deferred probes. It honors a handler-level test override so a test can
+// shrink the budget without mutating the package global, which outliving probe
+// or watchdog goroutines may still be reading.
+func (h *PlaybackHandler) probeBackgroundBudget() time.Duration {
+	if h != nil && h.backgroundProbeBudgetOverride > 0 {
+		return h.backgroundProbeBudgetOverride
+	}
+	return virtualBackgroundProbeBudget
 }
 
 // probeWatchdogCadence is the effective scan interval, honoring a test override.
@@ -997,7 +1008,7 @@ func (h *PlaybackHandler) runDeferredVirtualProbe(deferred *virtualDeferredProbe
 		h.signalDeferredProbeRetry()
 		return
 	}
-	bgCtx, bgCancel := h.virtualDetachedContext(h.ServiceContext, virtualBackgroundProbeBudget)
+	bgCtx, bgCancel := h.virtualDetachedContext(h.ServiceContext, h.probeBackgroundBudget())
 	defer bgCancel()
 	outcome, committed := h.probeVirtualSourceAndPersistWith(bgCtx, deferred.stickyKey, deferred.file, deferred.streamURL, *deferred.probeTransient, deferred.cand, deferred.candidate.tiers(), deferred.expectedRuntimeMinutes, deferred.ownerID, true, h.deferredProbeBindingIntact(deferred))
 	// The probe is done with the shared gate: release this worker's slot before

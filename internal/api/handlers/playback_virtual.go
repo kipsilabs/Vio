@@ -3622,7 +3622,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 					probeCand := cand
 					expectedRuntimeMinutes := h.virtualExpectedRuntimeMinutes(r.Context(), file)
 					if gate := h.detachedGate(); gate.tryAcquire() {
-						bgCtx, bgCancel := h.virtualDetachedContext(r.Context(), virtualBackgroundProbeBudget)
+						bgCtx, bgCancel := h.virtualDetachedContext(r.Context(), h.probeBackgroundBudget())
 						go func() {
 							defer gate.release()
 							defer bgCancel()
@@ -3715,7 +3715,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				probeBgFile.Duration = 0
 				probeBgCand := cand
 				if gate := h.detachedGate(); gate.tryAcquire() {
-					bgCtx, bgCancel := h.virtualDetachedContext(r.Context(), virtualBackgroundProbeBudget)
+					bgCtx, bgCancel := h.virtualDetachedContext(r.Context(), h.probeBackgroundBudget())
 					go func() {
 						defer gate.release()
 						defer bgCancel()
@@ -4491,7 +4491,7 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 	// Carry the expected runtime on the probe input so the probe cache applies
 	// the same size/duration identity rule it is stored under.
 	probeTransient.VirtualExpectedRuntimeMinutes = expectedRuntimeMinutes
-	probeCtx, probeCancel := context.WithTimeout(bgCtx, virtualBackgroundProbeBudget)
+	probeCtx, probeCancel := context.WithTimeout(bgCtx, h.probeBackgroundBudget())
 	probed, probeErr := h.probeVirtualSource(probeCtx, probeURL, &probeTransient, probeCand.RequestHeaders)
 	probeCancel()
 	// The probe (the last blocking call) can outlive the binding it was

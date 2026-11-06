@@ -1526,7 +1526,7 @@ func (h *PlaybackHandler) refreshRotatedVirtualCandidateBackground(ctx context.C
 	}
 	go func() {
 		defer gate.release()
-		bgCtx, cancel := h.virtualDetachedContext(ctx, virtualBackgroundProbeBudget)
+		bgCtx, cancel := h.virtualDetachedContext(ctx, h.probeBackgroundBudget())
 		defer cancel()
 		h.probeRotatedVirtualCandidate(bgCtx, session, file, generation)
 	}()
