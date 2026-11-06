@@ -316,6 +316,12 @@ func (e *SubtitleExtractionRetryError) Error() string {
 type subtitleWindowResult struct {
 	data     []byte
 	storedAt time.Time
+	// warmPrefix is non-nil when data was rendered by an in-progress ASS warm's
+	// prefix rather than extracted from a source or committed artifact. Such a
+	// slice is only as complete as that layer's event-ordering guarantee, so
+	// disabling the layer evicts these entries and lets the same window fall
+	// through to the extraction path.
+	warmPrefix *subtitleWarmTextProgress
 }
 
 // subtitleWindowFlight is a per-window in-flight marker; done closes when the
@@ -535,9 +541,13 @@ func (c *SubtitleCache) ServeExtractWithResult(w http.ResponseWriter, r *http.Re
 		// first commit land quickly instead of competing with every window.
 		if warmTextKey != "" && !result.ServedCommittedArtifact {
 			if windowed, start, end, openEnded := opts.WindowCoverage(); windowed && !openEnded {
-				if data, ok := c.warmTextWindow(warmTextKey, start, end); ok {
+				if progress, data, ok := c.warmTextWindow(warmTextKey, start, end); ok {
 					if windowKey != "" {
-						c.storeWindowResult(windowKey, opts, data)
+						// Record it as prefix-derived. The slice is only
+						// complete while the warm's event ordering holds; an
+						// ordering failure evicts it so a repeat of this exact
+						// window extracts instead of replaying stale bytes.
+						c.storeWindowResultFrom(windowKey, opts, data, progress)
 					}
 					w.Header().Set("Cache-Control", "no-store")
 					w.WriteHeader(http.StatusOK)
@@ -874,13 +884,50 @@ func (c *SubtitleCache) lookupWindowResult(key string) ([]byte, bool) {
 		c.windowBytes -= int64(len(entry.data))
 		return nil, false
 	}
+	// A prefix-derived slice stops being trustworthy the moment the warm's
+	// ordering guarantee fails. The disable hook evicts these eagerly; this
+	// covers an entry stored either side of the hook.
+	if entry.warmPrefix != nil && entry.warmPrefix.prefixDisabled() {
+		delete(c.windowResults, key)
+		c.windowBytes -= int64(len(entry.data))
+		return nil, false
+	}
 	// An actively-used last-good copy stays available through a long outage.
 	entry.storedAt = now
 	c.windowResults[key] = entry
 	return entry.data, true
 }
 
+// dropWarmTextWindowResults evicts the windows one warm prefix produced when
+// that layer disables. Those slices were rendered from a prefix whose
+// completeness is no longer proven, so a repeat of the same exact window must
+// reach the extraction path rather than replay cues the prefix may have missed.
+// Windows served from a committed artifact or a finished extract carry no
+// prefix and stay.
+func (c *SubtitleCache) dropWarmTextWindowResults(progress *subtitleWarmTextProgress) {
+	if c == nil || progress == nil {
+		return
+	}
+	c.windowMu.Lock()
+	defer c.windowMu.Unlock()
+	for key, entry := range c.windowResults {
+		if entry.warmPrefix != progress {
+			continue
+		}
+		delete(c.windowResults, key)
+		c.windowBytes -= int64(len(entry.data))
+	}
+}
+
 func (c *SubtitleCache) storeWindowResult(key string, opts StreamExtractOpts, data []byte) {
+	c.storeWindowResultFrom(key, opts, data, nil)
+}
+
+// storeWindowResultFrom stores data as the last-good copy for key. A non-nil
+// warmPrefix marks bytes rendered by an unfinished warm prefix, so the entry is
+// dropped if that layer disables. A store that races the disable either sees the
+// flag here or lands before the eviction hook, which waits for windowMu.
+func (c *SubtitleCache) storeWindowResultFrom(key string, opts StreamExtractOpts, data []byte, warmPrefix *subtitleWarmTextProgress) {
 	if c == nil || key == "" || len(data) == 0 || len(data) > subtitleWindowResultMaxEntryBytes {
 		return
 	}
@@ -890,6 +937,9 @@ func (c *SubtitleCache) storeWindowResult(key string, opts StreamExtractOpts, da
 	now := time.Now()
 	c.windowMu.Lock()
 	defer c.windowMu.Unlock()
+	if warmPrefix != nil && warmPrefix.prefixDisabled() {
+		return
+	}
 	if c.windowResults == nil {
 		c.windowResults = make(map[string]subtitleWindowResult)
 	}
@@ -899,8 +949,9 @@ func (c *SubtitleCache) storeWindowResult(key string, opts StreamExtractOpts, da
 	copyOfData := make([]byte, len(data))
 	copy(copyOfData, data)
 	c.windowResults[key] = subtitleWindowResult{
-		data:     copyOfData,
-		storedAt: now,
+		data:       copyOfData,
+		storedAt:   now,
+		warmPrefix: warmPrefix,
 	}
 	c.windowBytes += int64(len(copyOfData))
 	c.evictWindowResultsLocked(now)

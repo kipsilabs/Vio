@@ -93,7 +93,16 @@ type subtitleWarmTextProgress struct {
 	// seenEvents is true once any event line was retained, so an empty prefix
 	// is not mistaken for a covered range.
 	seenEvents bool
-	disabled   bool
+	// disabled is set once when the layer fails closed. It is atomic because
+	// the window cache checks it while holding its own lock, so an ordering
+	// failure can invalidate the windows this prefix produced without taking
+	// mu.
+	disabled atomic.Bool
+	// onDisable, when set, runs once after the layer disables. It is assigned
+	// before the progress is published to the cache, so it needs no
+	// synchronization. The cache uses it to evict windows rendered from this
+	// prefix, which are only complete while the ordering guarantee holds.
+	onDisable func()
 
 	// partialLine carries an unterminated line between chunks.
 	partialLine []byte
@@ -137,10 +146,24 @@ func (p *subtitleWarmTextProgress) observe(chunk []byte) {
 		return
 	}
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.disabled {
+	if p.prefixDisabled() {
+		p.mu.Unlock()
 		return
 	}
+	p.observeLocked(chunk)
+	disabled := p.prefixDisabled()
+	hook := p.onDisable
+	p.mu.Unlock()
+	// Run the invalidation outside mu: the hook takes the window cache's own
+	// lock, and holding mu across it would couple the two for no gain.
+	if disabled && hook != nil {
+		hook()
+	}
+}
+
+// observeLocked parses a chunk into complete lines. Caller holds mu and has
+// already checked that the layer is enabled.
+func (p *subtitleWarmTextProgress) observeLocked(chunk []byte) {
 	if p.retainedBytes+len(p.partialLine)+len(chunk) > subtitleWarmTextMaxBytes {
 		p.disableLocked("bundle_byte_budget")
 		return
@@ -273,10 +296,10 @@ func (p *subtitleWarmTextProgress) parseEventTimesLocked(line string) (start, en
 }
 
 func (p *subtitleWarmTextProgress) disableLocked(reason string) {
-	if p.disabled {
+	if p.prefixDisabled() {
 		return
 	}
-	p.disabled = true
+	p.disabled.Store(true)
 	events, retainedBytes, watermark := len(p.events), p.retainedBytes, p.watermark
 	p.header.Reset()
 	p.events = nil
@@ -295,6 +318,29 @@ func (p *subtitleWarmTextProgress) disableLocked(reason string) {
 		"watermark_seconds", watermark)
 }
 
+// prefixDisabled reports whether the layer has failed closed. It reads an
+// atomic flag, so callers that do not hold mu (the window cache does not) can
+// use it. A nil progress is disabled: it never serves.
+func (p *subtitleWarmTextProgress) prefixDisabled() bool {
+	return p == nil || p.disabled.Load()
+}
+
+// releaseRetained drops the script the prefix kept in memory once the warm has
+// settled. The committed artifact (or a failed warm) supersedes it; windows
+// already rendered from the prefix keep their stored bytes, but do not pin the
+// retained script until their own TTL.
+func (p *subtitleWarmTextProgress) releaseRetained() {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.header.Reset()
+	p.events = nil
+	p.partialLine = nil
+	p.retainedBytes = 0
+}
+
 // render returns a self-contained ASS window for [start,end] when the warm has
 // already emitted every event that can overlap it. The caller must not serve
 // the bytes under a wider coverage than it asked for.
@@ -304,7 +350,7 @@ func (p *subtitleWarmTextProgress) render(start, end float64) ([]byte, bool) {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.disabled || !p.seenEvents || p.header.Len() == 0 {
+	if p.prefixDisabled() || !p.seenEvents || p.header.Len() == 0 {
 		return nil, false
 	}
 	if p.watermark < end {
@@ -359,6 +405,8 @@ func (c *SubtitleCache) beginWarmTextProgress(key string) *subtitleWarmTextProgr
 		return nil
 	}
 	progress := newSubtitleWarmTextProgress()
+	// Evict windows this prefix produced if its ordering guarantee fails.
+	progress.onDisable = func() { c.dropWarmTextWindowResults(progress) }
 	c.warmTextMu.Lock()
 	if c.warmText == nil {
 		c.warmText = make(map[string]*subtitleWarmTextProgress)
@@ -379,18 +427,27 @@ func (c *SubtitleCache) endWarmTextProgress(key string, progress *subtitleWarmTe
 		delete(c.warmText, key)
 	}
 	c.warmTextMu.Unlock()
+	// The warm is over and the committed artifact (or the failed warm)
+	// supersedes the prefix, so drop the retained script instead of letting
+	// prefix-derived window entries pin it until their own TTL.
+	progress.releaseRetained()
 }
 
 // warmTextWindow renders a windowed ASS request from an in-progress warm when
-// that warm has already passed the requested range.
-func (c *SubtitleCache) warmTextWindow(key string, start, end float64) ([]byte, bool) {
+// that warm has already passed the requested range. It also returns the warm's
+// progress so the caller can mark a cached window as prefix-derived.
+func (c *SubtitleCache) warmTextWindow(key string, start, end float64) (*subtitleWarmTextProgress, []byte, bool) {
 	if c == nil || key == "" {
-		return nil, false
+		return nil, nil, false
 	}
 	c.warmTextMu.Lock()
 	progress := c.warmText[key]
 	c.warmTextMu.Unlock()
-	return progress.render(start, end)
+	data, ok := progress.render(start, end)
+	if !ok {
+		return nil, nil, false
+	}
+	return progress, data, true
 }
 
 // logWarmTextServe records a window answered from the in-progress warm.

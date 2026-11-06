@@ -203,7 +203,8 @@ func TestServeExtractWindowServedFromInProgressASSWarm(t *testing.T) {
 // An event start that regresses below the retained maximum disproves the
 // ordering the prefix relies on. A bounded window the watermark already covers
 // must then be extracted, not served from the prefix, because later events may
-// still overlap it.
+// still overlap it. That includes a window already served and cached from the
+// prefix before the regression: the cached slice must not survive the disable.
 func TestServeExtractWindowFallsBackAfterOutOfOrderEvent(t *testing.T) {
 	before := subtitleWarmTextDisables.Load()
 	c, source := newTestCache(t)
@@ -270,20 +271,22 @@ func TestServeExtractWindowFallsBackAfterOutOfOrderEvent(t *testing.T) {
 		t.Fatal("warm did not observe the out-of-order event")
 	}
 
-	// The watermark covers [0,180], but the regression means that coverage is
-	// no longer trustworthy: the request must take the extract path.
-	unorderedOpts := orderedOpts
-	unorderedOpts.DurationSeconds = 180
+	// The ordered control cached [0,120] from the prefix before the
+	// regression. Repeating that exact window must not replay those bytes:
+	// the cached slice came from an unfinished prefix whose completeness is
+	// now disproven, so it is evicted and the request takes the extract
+	// path. Reusing the original duration is what makes this a cache probe —
+	// a wider window would miss the cache for an unrelated reason.
 	rec = httptest.NewRecorder()
-	err = c.ServeExtract(rec, httptest.NewRequest(http.MethodGet, "/subtitle.ass?position=0&duration=180", nil), unorderedOpts, extract)
+	err = c.ServeExtract(rec, httptest.NewRequest(http.MethodGet, "/subtitle.ass?position=0&duration=120", nil), orderedOpts, extract)
 	if err != nil {
-		t.Fatalf("serve window after regression: %v", err)
+		t.Fatalf("serve repeated window after regression: %v", err)
 	}
 	if body := rec.Body.String(); body != windowPayload {
-		t.Fatalf("window body after regression = %q, want the extract path's %q", body, windowPayload)
+		t.Fatalf("repeated window body after regression = %q, want the extract path's %q", body, windowPayload)
 	}
 	if got := calls.Load(); got != 2 {
-		t.Fatalf("extractor calls = %d after the regression, want the window's own extract", got)
+		t.Fatalf("extractor calls = %d after the regression, want the repeated window's own extract", got)
 	}
 	if got := subtitleWarmTextDisables.Load() - before; got != 1 {
 		t.Fatalf("disable signal count = %d, want exactly one per warm", got)
