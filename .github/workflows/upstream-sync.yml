@@ -113,7 +113,7 @@ jobs:
           - \\`make verify-apiv2-contract BASE_REF=origin/main\\`
           EOF
           )
-          pr_number=$(gh pr list --repo "$GH_REPO" --state open --head automation/upstream-sync --base main --json number --jq '.[0].number // empty')
+          pr_number=$(gh pr list --repo "$GH_REPO" --state open --head \"$branch\" --base main --json number --jq '.[0].number // empty')
           if [ -n "$pr_number" ]; then
             gh pr edit "$pr_number" --repo "$GH_REPO" --title "$title" --body "$body"
           else
