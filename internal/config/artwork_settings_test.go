@@ -64,6 +64,35 @@ func TestArtworkLocalPathPreservesRecordedStorageIdentity(t *testing.T) {
 			want:   DefaultArtworkLocalPath,
 		},
 		{
+			name:   "explicit path wins with no identity row",
+			stored: map[string]string{"artwork.local_path": "/srv/artwork"},
+			want:   "/srv/artwork",
+		},
+		{
+			name: "blank path and empty local identity root keep the legacy root",
+			stored: map[string]string{
+				"artwork.local_path":      "",
+				artworkIdentitySettingKey: "local|",
+			},
+			want: legacyDefaultArtworkLocalPath,
+		},
+		{
+			name: "blank path and relative local identity keep the legacy root",
+			stored: map[string]string{
+				"artwork.local_path":      "  ",
+				artworkIdentitySettingKey: "local|relative",
+			},
+			want: legacyDefaultArtworkLocalPath,
+		},
+		{
+			name: "whitespace-only identity is a fresh install",
+			stored: map[string]string{
+				"artwork.local_path":      "   ",
+				artworkIdentitySettingKey: "   ",
+			},
+			want: DefaultArtworkLocalPath,
+		},
+		{
 			name: "legacy local identity keeps its recorded root",
 			stored: map[string]string{
 				"artwork.local_path":      "",
