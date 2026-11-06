@@ -1004,3 +1004,8 @@
 ./internal/backup TestBeforeUpgradeWaitsForANightlyBackupDB
 ./internal/backup TestBeforeUpgradeDestinationsDB
 ./internal/backup TestBeforeUpgradeRetriesDB
+
+# Collections: virtual_playback resolves to on when omitted at the API
+# boundary, stays explicit when sent, and survives the template-apply job.
+./internal/api/handlers TestQueueAdminCollectionTemplatePersistsResolvedVirtualPlayback
+./internal/api/handlers TestImportCreationPersistsResolvedVirtualPlayback

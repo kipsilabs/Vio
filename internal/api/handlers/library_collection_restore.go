@@ -25,7 +25,7 @@ func (h *LibraryCollectionHandler) TemplateCollectionDefaults(bundleID, template
 	if !found || !templateEligibleForLibrary(tmpl, &models.MediaFolder{Type: libraryType}) {
 		return "", catalog.CreateLibraryCollectionInput{}, false, false, nil
 	}
-	input, err = templateCollectionInput(bundleID, tmpl, libraryID, templateBundleManagementKey(bundleID, templateID, libraryID))
+	input, err = templateCollectionInput(bundleID, tmpl, libraryID, templateBundleManagementKey(bundleID, templateID, libraryID), true)
 	if err != nil {
 		return "", catalog.CreateLibraryCollectionInput{}, false, false, err
 	}
