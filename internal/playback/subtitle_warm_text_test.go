@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -151,6 +152,8 @@ func TestServeExtractWindowServedFromInProgressASSWarm(t *testing.T) {
 
 	started := make(chan struct{})
 	release := make(chan struct{})
+	var startedOnce, releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
 	var calls atomic.Int64
 	extract := func(_ context.Context, opts StreamExtractOpts) error {
 		calls.Add(1)
@@ -162,14 +165,18 @@ func TestServeExtractWindowServedFromInProgressASSWarm(t *testing.T) {
 				subtitleASSEventDialogue+" 0,0:02:10.00,0:02:20.00,Default,,0,0,0,,After\n"); err != nil {
 			return err
 		}
-		close(started)
+		startedOnce.Do(func() { close(started) })
 		<-release
 		_, err := io.WriteString(opts.Writer,
 			subtitleASSEventDialogue+" 0,0:03:00.00,0:03:10.00,Default,,0,0,0,,Later\n")
 		return err
 	}
 	done := c.WarmTrackInBackground(warmOpts, extract, "")
-	<-started
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("background warm did not start")
+	}
 
 	windowOpts := StreamExtractOpts{
 		InputPath:             source,
@@ -196,8 +203,12 @@ func TestServeExtractWindowServedFromInProgressASSWarm(t *testing.T) {
 		t.Fatalf("extractor calls = %d, want only the warm's extract", got)
 	}
 
-	close(release)
-	<-done
+	releaseOnce.Do(func() { close(release) })
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("background warm did not finish")
+	}
 }
 
 // An event start that regresses below the retained maximum disproves the
@@ -214,6 +225,9 @@ func TestServeExtractWindowFallsBackAfterOutOfOrderEvent(t *testing.T) {
 	release := make(chan struct{})
 	regressed := make(chan struct{})
 	finish := make(chan struct{})
+	var startedOnce, releaseOnce, regressedOnce, finishOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	t.Cleanup(func() { finishOnce.Do(func() { close(finish) }) })
 	var calls atomic.Int64
 	windowPayload := "[Script Info]\n" + subtitleASSEventDialogue + " 0,0:00:10.00,0:01:10.00,Default,,0,0,0,,Extracted\n"
 	extract := func(_ context.Context, opts StreamExtractOpts) error {
@@ -228,19 +242,23 @@ func TestServeExtractWindowFallsBackAfterOutOfOrderEvent(t *testing.T) {
 				subtitleASSEventDialogue+" 0,0:03:00.00,0:03:10.00,Default,,0,0,0,,Far\n"); err != nil {
 			return err
 		}
-		close(started)
+		startedOnce.Do(func() { close(started) })
 		<-release
 		// A later event starts at 20 s, below the 180 s watermark.
 		if _, err := io.WriteString(opts.Writer,
 			subtitleASSEventDialogue+" 0,0:00:20.00,0:00:30.00,Default,,0,0,0,,Early\n"); err != nil {
 			return err
 		}
-		close(regressed)
+		regressedOnce.Do(func() { close(regressed) })
 		<-finish
 		return nil
 	}
 	done := c.WarmTrackInBackground(warmOpts, extract, "")
-	<-started
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("background warm did not start")
+	}
 
 	// The ordered control is served from the warm without an extract.
 	orderedOpts := StreamExtractOpts{
@@ -264,7 +282,7 @@ func TestServeExtractWindowFallsBackAfterOutOfOrderEvent(t *testing.T) {
 		t.Fatalf("extractor calls = %d before the regression, want only the warm", got)
 	}
 
-	close(release)
+	releaseOnce.Do(func() { close(release) })
 	select {
 	case <-regressed:
 	case <-time.After(5 * time.Second):
@@ -292,7 +310,7 @@ func TestServeExtractWindowFallsBackAfterOutOfOrderEvent(t *testing.T) {
 		t.Fatalf("disable signal count = %d, want exactly one per warm", got)
 	}
 
-	close(finish)
+	finishOnce.Do(func() { close(finish) })
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
@@ -307,6 +325,8 @@ func TestServeExtractWindowFallsBackBeforeWarmCoverage(t *testing.T) {
 
 	started := make(chan struct{})
 	release := make(chan struct{})
+	var startedOnce, releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
 	var calls atomic.Int64
 	extract := func(_ context.Context, opts StreamExtractOpts) error {
 		if calls.Add(1) == 1 {
@@ -314,14 +334,18 @@ func TestServeExtractWindowFallsBackBeforeWarmCoverage(t *testing.T) {
 				warmTextASSHeader+subtitleASSEventDialogue+" 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,Early\n"); err != nil {
 				return err
 			}
-			close(started)
+			startedOnce.Do(func() { close(started) })
 			<-release
 			return nil
 		}
 		return nil
 	}
 	done := c.WarmTrackInBackground(warmOpts, extract, "")
-	<-started
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("background warm did not start")
+	}
 
 	windowOpts := StreamExtractOpts{
 		InputPath:             source,
@@ -341,8 +365,12 @@ func TestServeExtractWindowFallsBackBeforeWarmCoverage(t *testing.T) {
 		t.Fatalf("extractor calls = %d, want the warm plus the window's own extract", got)
 	}
 
-	close(release)
-	<-done
+	releaseOnce.Do(func() { close(release) })
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("background warm did not finish")
+	}
 }
 
 // A leader whose request context is canceled mid-extract must still commit the
@@ -364,10 +392,12 @@ func TestServeExtractWindowedLeaderCancellationStillCommits(t *testing.T) {
 
 	started := make(chan struct{})
 	release := make(chan struct{})
+	var startedOnce, releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
 	var calls atomic.Int64
 	extract := func(ctx context.Context, extractOpts StreamExtractOpts) error {
 		if calls.Add(1) == 1 {
-			close(started)
+			startedOnce.Do(func() { close(started) })
 			<-release
 			// The leader's request is canceled by now. A request-owned extract
 			// would see that here and discard the work.
@@ -391,12 +421,21 @@ func TestServeExtractWindowedLeaderCancellationStillCommits(t *testing.T) {
 			extract,
 		)
 	}()
-	<-started
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("leader extract did not start")
+	}
 	cancel()
-	close(release)
+	releaseOnce.Do(func() { close(release) })
 
-	if err := <-leaderDone; err != nil {
-		t.Fatalf("leader error = %v, want the detached extract to commit", err)
+	select {
+	case err := <-leaderDone:
+		if err != nil {
+			t.Fatalf("leader error = %v, want the detached extract to commit", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("leader ServeExtract did not return")
 	}
 	followerRec := httptest.NewRecorder()
 	if err := c.ServeExtract(followerRec, httptest.NewRequest(http.MethodGet, "/subtitle.ass?position=0&duration=120", nil), opts, extract); err != nil {
