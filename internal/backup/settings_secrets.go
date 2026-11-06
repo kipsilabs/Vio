@@ -55,7 +55,8 @@ var restoredSecretSettings = strings.Fields(`
 	catalog.search.meilisearch.api_key watchsync.simkl.client_id watchsync.simkl.client_secret
 	requests.radarr.api_key requests.sonarr.api_key email.smtp_password
 	discord.client_secret discord.bot_token
-	notifications.web_push.vapid_keypair notifications.push_relay_api_key`)
+	notifications.web_push.vapid_keypair notifications.push_relay_api_key
+	remuxdb.token virtual_library.indexer_api_key virtual_library.altmount_api_key`)
 
 // RotateSigningSecrets writes a fresh value for each rotatedSettings key
 // into dbURL, encrypted with cipher as the settings store encrypts it, or

@@ -430,15 +430,17 @@ const ServerSettingsMutationLock = "silo:server_settings:mutation"
 //
 //nolint:goconst
 var adminSettingDefaults = map[string]string{
-	"auth.access_token_expiry":  "8h",
-	"auth.refresh_token_expiry": "30d",
-	"server.log_level":          "info",
-	"server.log_quiet":          "",
-	"server.public_url":         "",
-	"branding.server_name":      "Silo",
-	"branding.login_subtitle":   "Sign in with an existing account.",
-	"clientip.trusted_proxies":  "10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8, ::1/128",
-	"theme.catalog_url":         DefaultThemeCatalogURL,
+	"auth.access_token_expiry":              "8h",
+	"auth.refresh_token_expiry":             "30d",
+	"server.log_level":                      "info",
+	"server.log_quiet":                      "",
+	"server.public_url":                     "",
+	"virtual_library.allow_private_streams": "false",
+	"virtual_library.allow_insecure_http":   "false",
+	"branding.server_name":                  "Silo",
+	"branding.login_subtitle":               "Sign in with an existing account.",
+	"clientip.trusted_proxies":              "10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8, ::1/128",
+	"theme.catalog_url":                     DefaultThemeCatalogURL,
 
 	ServerLANDiscoverySettingKey:              "true",
 	ServerLocalURLSettingKey:                  "",

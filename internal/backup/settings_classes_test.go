@@ -108,7 +108,7 @@ func TestEveryCredentialSettingIsDecided(t *testing.T) {
 	own := func(key string) bool {
 		return key == settingJWTSecret || key == settingABSJWTSecret || key == "storage.transition.target" ||
 			key == "notifications.web_push.vapid_keypair" || strings.HasPrefix(key, "s3.") || strings.HasPrefix(key, "redis.") ||
-			strings.HasPrefix(key, backupBucketSettingPrefix)
+			strings.HasPrefix(key, backupBucketSettingPrefix) || strings.HasPrefix(key, "virtual_library.") || key == "remuxdb.token"
 	}
 	outbound := outboundKeys()
 	for key := range catalog.SensitiveSettingKeys {

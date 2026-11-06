@@ -27,7 +27,11 @@ func appendRaw(t *testing.T, path, data string) {
 // before appending, so the next record never lands after damaged bytes and
 // every complete record survives.
 func TestJournalSurvivesTwoInterruptedRecoveries(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "restore.journal")
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "restore.journal")
 	j, err := createJournal(path, journalHeader{Time: "t", LiveDatabase: "silo", LiveOID: 100}, testJournalKey)
 	if err != nil {
 		t.Fatal(err)
@@ -71,7 +75,11 @@ func TestJournalSurvivesTwoInterruptedRecoveries(t *testing.T) {
 // TestJournalRefusesInteriorDamage: damage before the last record is not a
 // torn write, and recovery must not guess past it.
 func TestJournalRefusesInteriorDamage(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "restore.journal")
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "restore.journal")
 	j, err := createJournal(path, journalHeader{Time: "t", LiveDatabase: "silo"}, testJournalKey)
 	if err != nil {
 		t.Fatal(err)
@@ -93,7 +101,11 @@ var testJournalKey = []byte("restore-journal-test-key-0123456789")
 func TestJournalAcceptsOnlyWhatItsKeyWrote(t *testing.T) {
 	write := func(t *testing.T) string {
 		t.Helper()
-		path := filepath.Join(t.TempDir(), "restore.journal")
+		dir := t.TempDir()
+		if err := os.Chmod(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(dir, "restore.journal")
 		j, err := createJournal(path, journalHeader{Time: "t", LiveDatabase: "silo", LiveOID: 100, RestoredOID: 200}, testJournalKey)
 		if err != nil {
 			t.Fatal(err)

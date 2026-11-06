@@ -50,6 +50,7 @@ var serverSpecificSettings = strings.Fields(`
 	jellyfin_compat.public_url jellyfin_compat.web_install_dir
 	recommendations.embedding_provider_id recommendations.embedding_lock recommendations.policy_marked_generation
 	media_images. chapter_thumbnails. ui.dashboard.hidden_attention
+	virtual_library. remuxdb.
 `)
 
 // restoredSettings are the keys and prefixes restored as the backup has
@@ -101,6 +102,7 @@ var restoredFlagSettings = map[string]string{
 	"playback.prefer_lower_version_transcode":              whyTuning,
 	"playback.transcode_enabled":                           "transcoding capacity: it changes how a permitted stream plays, not who may play",
 	"playback.transcode_hardware_tone_map_enabled":         whyLocal,
+	"playback.transcode_vpp_tone_map_enabled":              whyLocal,
 	"playback.transcode_software_tone_map_enabled":         whyLocal,
 	"policy.editor_enabled":                                "the admin policy editor; admins only",
 	"scanner.empty_trash_after_scan":                       "catalog upkeep",

@@ -226,6 +226,8 @@ var settingRulesByPage = []struct {
 		"backup.": SettingServerSpecific,
 	}},
 	{pageOther, map[string]SettingClass{
+		"virtual_library.":              SettingServerSpecific,
+		"remuxdb.token":                 SettingServerSpecific,
 		"setup.":                        SettingServerSpecific,
 		"media_images.":                 SettingServerSpecific,
 		"chapter_thumbnails.":           SettingServerSpecific,
