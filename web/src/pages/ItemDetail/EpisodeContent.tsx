@@ -53,7 +53,6 @@ import {
 } from "@/lib/permissions";
 import { isEpisodeUnwatched } from "@/lib/episodeSpoilers";
 import { buildItemHref } from "@/lib/mediaNavigation";
-import { formatDate } from "@/lib/datetime";
 import { formatRuntimeMinutes } from "@/lib/mediaFormat";
 import { useQualityPreference } from "@/hooks/queries/qualityPreference";
 import { applyVersionAvailability, useVersionLiveness } from "@/hooks/queries/versionLiveness";

@@ -243,7 +243,7 @@ func probeFileFastWithin(ctx context.Context, ffprobePath string, filePath strin
 		return nil, err
 	}
 	probe := convertProbeData(raw)
-	applyMatroskaSubtitleTrackIDs(ctx, filePath, probe)
+	applyMatroskaSubtitleTracks(ctx, filePath, probe)
 	return probe, nil
 }
 
@@ -261,7 +261,7 @@ func probeMediaFile(ctx context.Context, ffprobePath string, filePath string, li
 		}
 	}
 	probe := convertProbeData(raw)
-	applyMatroskaSubtitleTrackIDs(ctx, filePath, probe)
+	applyMatroskaSubtitleTracks(ctx, filePath, probe)
 	if probe.Duration == 0 {
 		applyVideoPacketDuration(ctx, ffprobePath, filePath, raw, probe, limits)
 	}
@@ -344,28 +344,8 @@ func runProbeArgs(ctx context.Context, ffprobePath string, filePath string, args
 	if len(raw.Streams) > maxFFprobeStreams {
 		return nil, fmt.Errorf("ffprobe returned %d streams (maximum %d)", len(raw.Streams), maxFFprobeStreams)
 	}
-
-	probe := convertProbeData(&raw)
-	applyMatroskaSubtitleTracks(ctx, filePath, probe)
-	if probe.Duration == 0 {
-		if frameRate, hasVideo := primaryVideoFrameRate(raw.Streams); hasVideo {
-			// A failed or empty packet scan must not discard the codec and
-			// track metadata that already parsed successfully: callers persist
-			// the partial probe, and the repair layer retries rows whose
-			// duration is still unknown.
-			size, _ := strconv.ParseInt(raw.Format.Size, 10, 64)
-			duration, packetErr := probeVideoPacketDuration(ctx, ffprobePath, filePath, frameRate, limits.packetScan(size), limits.waitDelay)
-			if packetErr == nil && duration > 0 {
-				probe.Duration = duration
-			}
-			if errors.Is(packetErr, errProbeTimeout) {
-				slog.WarnContext(ctx, "scanner: ffprobe packet scan timed out; the duration stays unknown until a later probe",
-					"component", "scanner",
-					"path", filePath,
-					"error", packetErr,
-				)
-			}
-		}
+	if len(raw.Chapters) > maxFFprobeChapters {
+		return nil, fmt.Errorf("ffprobe returned %d chapters (maximum %d)", len(raw.Chapters), maxFFprobeChapters)
 	}
 	return &raw, nil
 }
