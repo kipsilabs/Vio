@@ -1,0 +1,146 @@
+name: Upstream synchronization
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    name: Sync upstream main
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out Vio main
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+          ref: main
+
+      - name: Configure Git
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git config merge.ours.driver true
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/Silo-Server/silo-server.git
+          git fetch --prune upstream main
+          git fetch --prune origin main
+
+      - name: Select synchronization branch
+        id: sync-branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # Reuse any open sync PR, including legacy per-run branches.
+          branch=$(gh pr list --repo "$GH_REPO" --state open --base main --limit 100 \
+            --json headRefName --jq '.[] | select(.headRefName == "automation/upstream-sync" or (.headRefName | startswith("upstream-sync-"))) | .headRefName' | head -n 1)
+          branch=${branch:-automation/upstream-sync}
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          git fetch --prune origin "$branch:$branch" || true
+
+      - name: Check for upstream commits
+        id: upstream
+        run: |
+          count=$(git rev-list --count origin/main..upstream/main)
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          if [ "$count" -eq 0 ]; then
+            echo 'No upstream commits remain; synchronization is complete.'
+            echo 'needed=false' >> "$GITHUB_OUTPUT"
+          else
+            echo 'needed=true' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Prepare synchronization branch
+        if: steps.upstream.outputs.needed == 'true'
+        id: prepare-merge
+        env:
+          BRANCH: ${{ steps.sync-branch.outputs.branch }}
+        run: |
+          if git show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
+            git checkout -B "$BRANCH" "origin/$BRANCH"
+            git merge --no-ff --no-edit origin/main || {
+              echo "Merge from origin/main failed"
+              exit 1
+            }
+          else
+            git checkout -B "$BRANCH" origin/main
+          fi
+          if ! git merge --no-ff --no-edit upstream/main; then
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::Merge conflict encountered merging upstream/main into $BRANCH"
+          else
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify fork invariants
+        if: steps.upstream.outputs.needed == 'true' && steps.prepare-merge.outputs.conflict != 'true'
+        run: make verify-fork-invariants
+
+      - name: Verify v2 contract
+        if: steps.upstream.outputs.needed == 'true' && steps.prepare-merge.outputs.conflict != 'true'
+        run: make verify-apiv2-contract BASE_REF=origin/main
+
+      - name: Push synchronization branch
+        if: steps.upstream.outputs.needed == 'true'
+        env:
+          BRANCH: ${{ steps.sync-branch.outputs.branch }}
+          CONFLICT: ${{ steps.prepare-merge.outputs.conflict }}
+        run: |
+          if [ "$CONFLICT" = "true" ]; then
+            git commit -am "chore(merge): WIP sync upstream main with conflicts" || true
+          fi
+          git push --force-with-lease origin HEAD:"$BRANCH"
+
+      - name: Create or update synchronization pull request
+        if: steps.upstream.outputs.needed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BRANCH: ${{ steps.sync-branch.outputs.branch }}
+          CONFLICT: ${{ steps.prepare-merge.outputs.conflict }}
+        run: |
+          upstream_sha="$(git rev-parse upstream/main)"
+          upstream_count="$(git rev-list --count origin/main..upstream/main)"
+          short_sha="${upstream_sha:0:12}"
+          if [ "$CONFLICT" = "true" ]; then
+            title="chore: sync upstream main (${short_sha}, ${upstream_count} commits) [CONFLICTS]"
+          else
+            title="chore: sync upstream main (${short_sha}, ${upstream_count} commit$( [ "$upstream_count" = 1 ] || printf 's' ))"
+          fi
+          body=$(cat <<EOF
+          ## Upstream synchronization
+
+          This pull request tracks the \`$BRANCH\` branch and merges \`Silo-Server/silo-server:main\` into Vio with a non-fast-forward merge.
+
+          - Upstream SHA: \`$upstream_sha\`
+          - Upstream commits ahead of Vio main: \`$upstream_count\`
+          - Conflict status: $( [ "$CONFLICT" = "true" ] && echo "**Conflicts require manual resolution**" || echo "Clean merge" )
+          - Auto-merge: intentionally not enabled.
+
+          Checks run by the synchronization workflow:
+          - \`make verify-fork-invariants\`
+          - \`make verify-apiv2-contract BASE_REF=origin/main\`
+          EOF
+          )
+          pr_number=$(gh pr list --repo "$GH_REPO" --state open --head "$BRANCH" --base main --json number --jq '.[0].number // empty')
+          if [ -n "$pr_number" ]; then
+            gh pr edit "$pr_number" --repo "$GH_REPO" --title "$title" --body "$body"
+          else
+            gh pr create --repo "$GH_REPO" --base main --head "$BRANCH" --title "$title" --body "$body" $( [ "$CONFLICT" = "true" ] && echo "--draft" || true )
+          fi
+          if [ "$CONFLICT" = "true" ]; then
+            echo "::error::Synchronization branch has merge conflicts requiring manual resolution."
+            exit 1
+          fi
