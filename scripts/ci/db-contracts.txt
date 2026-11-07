@@ -13,6 +13,7 @@
 ./internal/catalog TestMixedCatalogMangaCounts
 ./internal/catalog TestContentRatingCeilingAcrossSystemsDB
 ./internal/catalog TestRatingsPageFollowsAccessDB
+./internal/userstore/pgstore TestTitleAllowancesLiftProfileLimitsDB
 ./internal/catalog TestJellyfinPersonReadsMatchNativeVisibilityPostgres
 ./internal/recommendations TestRecentCompletedItemIDsGroupsSeriesBeforeLimit
 ./internal/sections TestCompatibilityRecentlyAddedReturnsFlatDistinctSeries
@@ -29,6 +30,7 @@
 ./internal/sections TestRuleRowsReadTheViewersWatchStatePostgres
 ./internal/scanner TestFileRepositoryPreservesFirstSeenScanProvenance
 ./internal/scanner TestMultiEpisodeFileServesSpannedEpisodesDB
+./internal/scanner TestScannedGroupForItemDB
 ./internal/scanner TestMatroskaTrackBackfillRecordsTrackNumbers
 ./internal/scanner TestMatroskaTrackBackfillStopsOnStalledStorage
 ./internal/scanner TestMatroskaTrackBackfillStopsOnIntermittentStalls
@@ -286,6 +288,23 @@
 ./internal/notifications TestLegacyMobilePushPreservesOrderedProofDB
 ./internal/notifications TestLegacyMobilePushWaitsForOwnershipDB
 ./internal/notifications TestLegacyPushRegistrationStaysOnTheAccount
+
+# Push stops when the login session that registered the device ends, however it
+# ended, including for a push already queued, and retention removes the token.
+./internal/notifications TestPushStopsWhenTheRegisteringLoginEndsDB
+./internal/notifications TestQueuedPushStopsWhenTheRegisteringLoginEndsDB
+./internal/notifications TestAppleRenewalRecordsTheLoginOfAnOlderRegistrationDB
+# An older registration with no recorded login stops only on evidence its device
+# has no live login, and comes back at the next sign-in.
+./internal/notifications TestSweepOfUnboundRegistrationsDB
+./internal/notifications TestSweptPhoneRegistersAgainAtSignInDB
+# Web push stops when the login session that registered the browser ends, however
+# it ended, including for a push already queued; retention removes the keys and
+# subscribing again records the new login.
+./internal/notifications TestWebPushStopsWhenTheRegisteringLoginEndsDB
+./internal/notifications TestWebPushResubscribeRecordsTheNewLoginDB
+./internal/notifications TestWebPushSweepOfUnboundSubscriptionsDB
+./internal/notifications TestQueuedWebPushStopsWhenTheRegisteringLoginEndsDB
 
 # Session-less Android push retirement is ordered against registration by generation.
 ./internal/notifications TestRetireAndroidPushStopsDeliveryAndOrdersAgainstRegistrationDB
@@ -824,6 +843,10 @@
 # A Watch Together room's suggestion cap holds when creators on two API servers
 # race on the v1 and v2 create paths.
 ./internal/watchtogether TestSuggestionRoomLimitPG
+
+# A stuck settings store does not hold a Watch Party room while the host's
+# playback choice is saved.
+./internal/watchtogether TestSlowGuestControlSaveDoesNotHoldTheRoomPG
 
 # The catalog item change outbox: what each membership and file write queues
 # (and what routine scan writes do not), key moves, coalescing, the cluster-wide

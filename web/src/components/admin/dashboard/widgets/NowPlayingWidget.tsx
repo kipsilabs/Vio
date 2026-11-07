@@ -39,7 +39,7 @@ export function NowPlayingWidget() {
   const sessions = sessionsQuery.data ?? [];
   const fixedRows = useMediaQuery(FIXED_ROWS_QUERY, true);
   const rendered = sessions.slice(0, fixedRows ? MAX_RENDERED_STREAMS : STACKED_STREAM_LIMIT);
-  const { setViewport, setGrid, visibleCount } = useFittedCardCount(rendered.length);
+  const { setViewport, setGrid, observeCard, visibleCount } = useFittedCardCount(rendered.length);
 
   // Only a successful, genuinely empty load earns the strip. A skeleton or an
   // error keeps its full height: shrinking the widget to announce a failure
@@ -92,6 +92,10 @@ export function NowPlayingWidget() {
           /* The empty case never reaches here — it returned the collapsed strip
              above — so this branch always has at least one stream to show. */
           <>
+            {/* Grid items stretch to their row, so both cards in a row match
+                height. Rows stay sized to their own cards: auto-rows-fr would
+                size every row to the tallest card, hidden ones included, and
+                one wrapped hidden card would push rows out of the fit. */}
             <div ref={setGrid} className="grid grid-cols-1 gap-3.5 lg:grid-cols-2">
               {rendered.map((session, index) => {
                 // Cards past the fit stay laid out, so a taller widget can
@@ -100,7 +104,8 @@ export function NowPlayingWidget() {
                 return (
                   <div
                     key={session.session_id}
-                    className={hidden ? "invisible" : undefined}
+                    ref={observeCard}
+                    className={cn("flex", hidden && "invisible")}
                     inert={hidden}
                   >
                     <StreamCard session={session} showPoster={!hidden} />
@@ -136,10 +141,11 @@ export function NowPlayingWidget() {
  * derived. Every card stays laid out (hidden ones are only invisible), so the
  * count can grow again when the widget is resized taller.
  *
- * Adding or removing a card changes the grid's height, which the observer
- * reports. The one change it misses, a card joining a half-full last row, is
- * covered by storing "everything fits" as Infinity rather than a count that
- * would go stale.
+ * Rows size to their own cards, so a refresh can move a tall card between rows
+ * without changing the grid's height; the observer watches every card as well
+ * as the grid to catch that. The one change it still misses, a card joining a
+ * half-full last row, is covered by storing "everything fits" as Infinity
+ * rather than a count that would go stale.
  */
 function useFittedCardCount(cardCount: number) {
   const viewportRef = useRef<HTMLDivElement | null>(null);
@@ -175,12 +181,24 @@ function useFittedCardCount(cardCount: number) {
     observerRef.current = null;
     if (typeof ResizeObserver === "undefined") return;
     const observer = new ResizeObserver(measure);
-    // The viewport tracks widget resizes; the grid tracks cards growing or
-    // shrinking as their content changes.
+    // The viewport tracks widget resizes; the grid and its cards track cards
+    // growing, shrinking, or trading rows as their content changes.
     if (viewportRef.current) observer.observe(viewportRef.current);
-    if (gridRef.current) observer.observe(gridRef.current);
+    if (gridRef.current) {
+      observer.observe(gridRef.current);
+      for (const card of gridRef.current.children) observer.observe(card);
+    }
     observerRef.current = observer;
   }, [measure]);
+
+  // Cards mounted before the observer exists are picked up by observe() above;
+  // this covers cards that arrive with a later refresh. Always return the
+  // cleanup: a callback ref that returns none is called again with null on
+  // unmount.
+  const observeCard = useCallback((node: HTMLDivElement) => {
+    observerRef.current?.observe(node);
+    return () => observerRef.current?.unobserve(node);
+  }, []);
 
   // Callback refs: the grid mounts only after loading finishes, so an effect
   // keyed on nothing would never see it.
@@ -199,7 +217,7 @@ function useFittedCardCount(cardCount: number) {
     [observe],
   );
 
-  return { setViewport, setGrid, visibleCount: Math.min(visibleCount, cardCount) };
+  return { setViewport, setGrid, observeCard, visibleCount: Math.min(visibleCount, cardCount) };
 }
 
 // A hidden card skips its poster request (the placeholder icon stands in); the
@@ -221,10 +239,10 @@ function StreamCard({ session, showPoster }: { session: AdminSession; showPoster
   const methodMeta = activityMethodMeta(method);
 
   return (
-    <div className="surface-panel flex gap-3.5 rounded-2xl border-0 p-3.5 transition-colors duration-150">
+    <div className="surface-panel flex flex-1 gap-3.5 rounded-2xl border-0 p-3.5 transition-colors duration-150">
       {/* Poster */}
       <div
-        className="bg-surface border-border relative flex w-[70px] flex-shrink-0 items-center justify-center overflow-hidden rounded-lg border"
+        className="bg-surface border-border relative flex w-[60px] flex-shrink-0 items-center justify-center self-start overflow-hidden rounded-lg border"
         style={{ aspectRatio: "2/3" }}
       >
         {showPoster && session.poster_url ? (
@@ -260,7 +278,7 @@ function StreamCard({ session, showPoster }: { session: AdminSession; showPoster
             ) : (
               <div className="truncate text-sm font-bold">{title}</div>
             )}
-            <div className="text-muted-foreground mb-1.5 text-xs">
+            <div className="text-muted-foreground mb-1.5 truncate text-xs">
               S{session.season_number} · E{session.episode_number}
               {session.series_name ? ` — ${session.series_name}` : ""}
             </div>
@@ -278,7 +296,7 @@ function StreamCard({ session, showPoster }: { session: AdminSession; showPoster
               <div className="truncate text-sm font-bold">{title}</div>
             )}
             {session.media_type && (
-              <div className="text-muted-foreground mb-1.5 text-xs">
+              <div className="text-muted-foreground mb-1.5 truncate text-xs">
                 {session.media_type === "movie" ? "Movie" : "Series"}
               </div>
             )}
@@ -310,13 +328,13 @@ function StreamCard({ session, showPoster }: { session: AdminSession; showPoster
         {/* User */}
         <div className="mt-auto flex items-center gap-1.5">
           <div
-            className="text-primary-foreground flex h-[22px] w-[22px] items-center justify-center rounded-full text-[9px] font-bold"
+            className="text-primary-foreground flex h-[22px] w-[22px] shrink-0 items-center justify-center rounded-full text-[9px] font-bold"
             style={{ background: `var(--primary)` }}
           >
             {username.charAt(0).toUpperCase()}
           </div>
-          <span className="text-xs font-medium">{username}</span>
-          <span className="text-muted-foreground ml-auto text-[10px]">{elapsed}</span>
+          <span className="min-w-0 truncate text-xs font-medium">{username}</span>
+          <span className="text-muted-foreground ml-auto shrink-0 text-[10px]">{elapsed}</span>
         </div>
       </div>
     </div>

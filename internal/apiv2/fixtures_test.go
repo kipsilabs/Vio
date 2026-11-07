@@ -1778,6 +1778,7 @@ func fixtureCases() []fixtureCase {
 	cases = append(cases, personalListMembershipFixtureCases()...)
 	cases = append(cases, sectionItemLimitFixtureCases()...)
 	cases = append(cases, adminCatalogItemsFixtureCases()...)
+	cases = append(cases, adminCatalogMatchHintsFixtureCases()...)
 	return append(cases, deviceLoginBindingFixtureCases()...)
 }
 

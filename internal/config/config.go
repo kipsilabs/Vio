@@ -264,7 +264,11 @@ type PlaybackConfig struct {
 	// SubtitleSyncNodeCapacity is how many media sampling runs (subtitle sync
 	// speech decoding) one transcode node admits at once, across every API
 	// server that sends it work (subtitles.sync_node_capacity).
-	SubtitleSyncNodeCapacity   int                   `yaml:"-"`
+	SubtitleSyncNodeCapacity int `yaml:"-"`
+	// TrickplayNodeCapacity is how many seek-preview runs one transcode node
+	// admits at once, across every API server that sends it work
+	// (playback.trickplay_node_capacity).
+	TrickplayNodeCapacity      int                   `yaml:"-"`
 	TranscodeEnabled           bool                  `yaml:"transcode_enabled"`
 	Routing                    PlaybackRoutingPolicy `yaml:"-"`
 	MaxVirtualFailoverAttempts int                   `yaml:"max_virtual_failover_attempts"`
@@ -698,6 +702,7 @@ func setDefaults() *configRaw {
 			ChapterThumbnailExecution:    "local",
 			ChapterThumbnailNodeCapacity: 1,
 			SubtitleSyncNodeCapacity:     1,
+			TrickplayNodeCapacity:        1,
 			TranscodeEnabled:             true,
 		},
 		RateLimit: RateLimitConfig{

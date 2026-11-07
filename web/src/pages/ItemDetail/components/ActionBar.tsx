@@ -34,6 +34,7 @@ import {
   Scissors,
   RotateCcw,
   Shuffle,
+  ShieldCheck,
   Tags,
   Trash2,
   TimerReset,
@@ -252,6 +253,10 @@ export interface ActionBarProps {
   /** Marks or clears Not interested; movies and series only. */
   onToggleNotInterested?: () => void;
   notInterested?: boolean;
+  /** Opens "Allow for…" for the household's limited profiles; primary profile only. */
+  onAllowForProfiles?: () => void;
+  /** The menu label for onAllowForProfiles, e.g. "Allowed for Emma". */
+  allowForLabel?: string;
   onRefresh?: (mode: RefreshItemMetadataMode) => void;
   isRefreshing?: boolean;
   /** Re-detects local markers; without redetectKind the admin picks intro, credits, or both. */
@@ -341,6 +346,8 @@ export default function ActionBar({
   inWatchlist = false,
   onToggleNotInterested,
   notInterested = false,
+  onAllowForProfiles,
+  allowForLabel = "Allow for…",
   onRefresh,
   isRefreshing = false,
   onRedetectMarkers,
@@ -955,6 +962,16 @@ export default function ActionBar({
       >
         <ThumbsDown className={cn("size-4", notInterested && "fill-current")} />
         {notInterested ? "Show in Recommendations" : "Not Interested"}
+      </DetailOverflowMenuItem>
+    ),
+    onAllowForProfiles && (
+      <DetailOverflowMenuItem
+        key="allow-for-profiles"
+        closeMenu={closeOverflowMenu}
+        onAction={onAllowForProfiles}
+      >
+        <ShieldCheck className="size-4" />
+        {allowForLabel}
       </DetailOverflowMenuItem>
     ),
   ];

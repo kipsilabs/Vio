@@ -9,7 +9,7 @@
 package settingskeys
 
 // Revision is the manifest revision these bindings were generated from.
-const Revision = 26
+const Revision = 27
 
 // Setting keys, one constant per definition.
 const (
@@ -173,6 +173,8 @@ const (
 	UiTimeFormat = "ui.time_format"
 	// Show title art
 	UiTitleArt = "ui.title_art"
+	// Watch Party playback controls
+	WatchPartyGuestControlPolicy = "watch_party.guest_control_policy"
 )
 
 // Remote lists every key the server stores.
@@ -249,6 +251,7 @@ var Remote = []string{
 	UiThemeMusicLoop,
 	UiTimeFormat,
 	UiTitleArt,
+	WatchPartyGuestControlPolicy,
 }
 
 // ClientLocal lists keys the contract defines but the server never stores.
