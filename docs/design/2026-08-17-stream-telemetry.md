@@ -1,7 +1,7 @@
 # Stream Telemetry
 
-> **Status.** P0 (a–d) is **built** on `feat/stream-telemetry-enforcer`, cut from `main`
-> @ `edd919c5`. It observes only: nothing is blocked, throttled, cut or banned.
+> **Status.** P0 (a–d) is on `main` (#667) and on by default. It observes only: nothing
+> is blocked, throttled, cut or banned.
 > Enforcement (P1), harvest (P2) and heuristics (P3) are **deferred** — see §3 and §5.
 >
 > **Validated in production.** An 18-hour soak on a live deployment (185 samples,
@@ -603,9 +603,7 @@ merge (§2.5, §8). Still read-only, so no election and no sanctions are needed 
 
 `GET /api/v1/admin/stream-telemetry/parity`, a new additive admin endpoint behind the
 same authorization as `/admin/sessions`. Read-only: no `/api/v1` response changed, no
-migration, no Postgres or Redis write. The v2 contract exposes the same projection
-at `GET /api/v2/admin/stream-telemetry/parity`; the v1 route is the pre-1.0 bridge
-alias and retires with the rest of `/api/v1`.
+migration, no Postgres or Redis write.
 
 The phase was specified as "serve a debug projection, **compare it against both legacy
 projections**, *then* repoint admin sessions, stats and events". **The comparison
@@ -890,8 +888,8 @@ fence token, not a timestamp comparison, is what makes mutations safe.
   principal was already authorized for that file — but a telemetry-classification
   wrinkle at an abuse boundary. Changing the proxy's token-scope model is its own
   concern.
-- **`api.Dependencies.ABSHandler` is dead config**, declared and never called by
-  `internal/api`. Pre-existing.
+- **`api.Dependencies.ABSHandler` is not mounted by `internal/api`.** Only `cmd/silo`
+  reads it, to start the separate Audiobookshelf listener. Pre-existing.
 - **A pre-existing data race** in `TestHandleReplanPlaybackV3BoundsDeferredLeaseRelease`
   reproduces identically on a clean `main` worktree.
 
@@ -947,10 +945,8 @@ is configured; nothing has to be set to get a parity read.
 ```bash
 # 1. nothing to set: every family observed by default (native, proxy,
 #    transcode_node, jellycompat, abs), distributed merge on wherever Redis is
-#    configured.
-curl -fsS localhost:8091/api/v1/admin/stream-telemetry/parity
-# or the native contract route, same projection:
-curl -fsS localhost:8091/api/v2/admin/stream-telemetry/parity
+#    configured. Read GET /api/v2/admin/stream-telemetry/parity as an acting
+#    administrator (docs/admin-api.md).
 
 # 2. read repeatedly, over days — one report is a sample, not proof
 

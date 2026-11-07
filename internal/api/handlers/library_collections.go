@@ -8,7 +8,6 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
-	neturl "net/url"
 	"runtime/debug"
 	"slices"
 	"sort"
@@ -27,11 +26,9 @@ import (
 	"github.com/Silo-Server/silo-server/internal/access"
 	"github.com/Silo-Server/silo-server/internal/adminjob"
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
-	"github.com/Silo-Server/silo-server/internal/artworkkey"
 	"github.com/Silo-Server/silo-server/internal/artworkurl"
 	"github.com/Silo-Server/silo-server/internal/blobstore"
 	"github.com/Silo-Server/silo-server/internal/catalog"
-	"github.com/Silo-Server/silo-server/internal/collage"
 	"github.com/Silo-Server/silo-server/internal/collections/templates"
 	"github.com/Silo-Server/silo-server/internal/collectionutil"
 	evt "github.com/Silo-Server/silo-server/internal/events"
@@ -42,6 +39,14 @@ import (
 	"github.com/Silo-Server/silo-server/internal/userstore"
 )
 
+type ArtworkRepairEnqueuer interface {
+	EnqueueArtworkRepair(context.Context, []string, int) (int, error)
+}
+
+type itemCollectionIndex interface {
+	ListContainingItem(context.Context, string) ([]*models.LibraryCollection, error)
+}
+
 type LibraryCollectionHandler struct {
 	repo                  *catalog.LibraryCollectionRepository
 	service               *catalog.LibraryCollectionService
@@ -51,7 +56,6 @@ type LibraryCollectionHandler struct {
 	httpClient            *http.Client
 	ArtworkStore          blobstore.Store
 	ArtworkResolver       artworkurl.Resolver
-	ArtworkSigner         *artworkurl.Signer
 	FrontendFS            fs.FS
 	SectionRepo           *sections.Repository
 	UserCollectionPool    *pgxpool.Pool
@@ -62,21 +66,22 @@ type LibraryCollectionHandler struct {
 	JobRepo               *adminjob.Repository
 	EventsHub             *evt.Hub
 	SortPreferenceCleaner *userstore.CollectionSortPreferenceCleaner
-	PersonalMemberCounts  *catalog.PersonalCollectionMemberCounts
-	CollectionOwners      catalog.PersonalCollectionAccess
-	PersonalCollages      *catalog.PersonalCollectionCollages
-
-	// itemCollectionIndex answers the item→collections reverse lookup behind
-	// the item detail "collections" field. Nil means use repo; tests inject a
-	// fake so the lookup is exercised without a database.
-	itemCollectionIndex itemCollectionIndex
-}
-
-// itemCollectionIndex is the reverse membership lookup the item detail
-// "collections" field needs: the visible collections that store a membership
-// row for one item. *catalog.LibraryCollectionRepository implements it.
-type itemCollectionIndex interface {
-	ListContainingItem(ctx context.Context, mediaItemID string) ([]*models.LibraryCollection, error)
+	// CollectionOwners resolves the owner's access for another profile's
+	// shared collection opted into the library tab.
+	CollectionOwners catalog.PersonalCollectionAccess
+	// PersonalCollages serves the collages of the personal collections opted
+	// into a library tab; nil when artwork storage is not configured.
+	PersonalCollages *catalog.PersonalCollectionCollages
+	// ArtworkSigner signs the artwork URLs local storage serves; collages
+	// read those posters from ArtworkStore. Nil when storage serves its own
+	// URLs.
+	ArtworkSigner *artworkurl.Signer
+	// PersonalMemberCounts counts the members a viewer sees in the
+	// hand-picked and imported personal collections opted into a library
+	// tab and remembers the counts between reads; nil counts on every read.
+	PersonalMemberCounts *catalog.PersonalCollectionMemberCounts
+	itemCollectionIndex  itemCollectionIndex
+	ArtworkRepair        ArtworkRepairEnqueuer
 }
 
 var errLibraryCollectionInUse = catalog.ErrLibraryCollectionInUse
@@ -103,6 +108,10 @@ const (
 	// collectionSourceModeTMDBList is the `source_config.mode` value used for
 	// collections that follow a public, user-authored TMDB list.
 	collectionSourceModeTMDBList = "tmdb_list"
+
+	// successKey is the JSON key shared by the admin action responses that
+	// report whether the work ran.
+	successKey = "success"
 )
 
 func NewLibraryCollectionHandler(
@@ -112,7 +121,7 @@ func NewLibraryCollectionHandler(
 	httpClient *http.Client,
 ) *LibraryCollectionHandler {
 	if httpClient == nil {
-		httpClient = http.DefaultClient
+		httpClient = newCollectionImageClient()
 	}
 
 	return &LibraryCollectionHandler{
@@ -193,77 +202,19 @@ func (h *LibraryCollectionHandler) storeBundledTemplatePoster(
 	return true, storedPath, thumbhash, nil
 }
 
-// ComposeCollectionCollage implements catalog.CollageGenerator. It fetches the
-// source posters, composes them, and stores the result in the collection's
-// collage directory with key as its revision, so every node that builds the
-// same collage writes the same objects.
+// ComposeCollectionCollage implements catalog.CollageGenerator for server
+// collections; see collectionCollageComposer.
 func (h *LibraryCollectionHandler) ComposeCollectionCollage(ctx context.Context, collectionID, key string, sources []string) (string, string, error) {
-	if len(sources) == 0 {
-		return "", "", collage.ErrNotEnoughImages
-	}
-
-	slog.InfoContext(ctx, "collage: generating poster", "component", "api", "collection_id", collectionID, "item_poster_count", len(sources))
-
-	// Resolve poster paths to fetchable URLs. The collage is stored under the
-	// key of all its sources, so a source that doesn't resolve or download
-	// fails the build rather than being left out. A later read retries it.
-	resolved := h.detailSvc.PresignImageURLs(ctx, sources, "poster", "small")
-	imageData := make([][]byte, 0, len(sources))
-	for _, path := range sources {
-		url := resolved[path]
-		if url == "" {
-			return "", "", fmt.Errorf("collage source %q did not resolve", path)
-		}
-		data, err := h.collageComposer().fetchImage(ctx, url)
-		if err != nil {
-			// A transport error names the presigned URL; keep it out of logs.
-			var urlErr *neturl.Error
-			if errors.As(err, &urlErr) {
-				err = urlErr.Err
-			}
-			return "", "", fmt.Errorf("fetching collage source %q: %w", path, err)
-		}
-		imageData = append(imageData, data)
-	}
-
-	// Compose the collage.
-	composited, err := collage.ComposePoster(imageData)
-	if err != nil {
-		return "", "", err
-	}
-
-	// Process through the standard image pipeline (generates WebP variants + thumbhash).
-	s3Path, thumbhash, err := putCollectionImageVariants(ctx, h.ArtworkStore, collectionCollageDir(adminCollectionImagePrefix, collectionID), key, collectionPosterWidths, composited)
-	if err != nil {
-		return "", "", fmt.Errorf("processing collage image: %w", err)
-	}
-	if want := h.CollectionCollagePath(collectionID, key); s3Path != want {
-		return "", "", fmt.Errorf("collage stored at %q, want %q", s3Path, want)
-	}
-
-	slog.InfoContext(ctx, "collage: poster generated successfully", "component", "api", "collection_id", collectionID, "s3_path", s3Path)
-	return s3Path, thumbhash, nil
+	return h.collageComposer().ComposeCollectionCollage(ctx, collectionID, key, sources)
 }
 
 // CollectionCollagePath implements catalog.CollageGenerator.
 func (h *LibraryCollectionHandler) CollectionCollagePath(collectionID, key string) string {
-	return artworkkey.Original(collectionCollageDir(adminCollectionImagePrefix, collectionID), key, ".webp")
+	return h.collageComposer().CollectionCollagePath(collectionID, key)
 }
 
 func (h *LibraryCollectionHandler) collageComposer() collectionCollageComposer {
-	return collectionCollageComposer{prefix: adminCollectionImagePrefix, store: h.ArtworkStore, posters: h.detailSvc, signer: h.ArtworkSigner, httpClient: h.httpClient}
-}
-
-// viewerCollectionCounts returns viewer-specific counts, preserving absent counts on errors.
-func (h *LibraryCollectionHandler) viewerCollectionCounts(ctx context.Context, collections []*models.LibraryCollection, access catalog.AccessFilter) map[string]catalog.ViewerCollectionCount {
-	if h.repo == nil {
-		return nil
-	}
-	counts, err := h.repo.ViewerCollectionCounts(ctx, collections, access)
-	if err != nil {
-		slog.WarnContext(ctx, "counting server collections for the viewer failed", "component", "collections", "error", err)
-	}
-	return counts
+	return collectionCollageComposer{prefix: adminCollectionImagePrefix, store: h.ArtworkStore, posters: h.detailSvc, signer: h.ArtworkSigner, repair: h.ArtworkRepair, httpClient: h.httpClient}
 }
 
 type libraryCollectionResponse struct {
@@ -297,7 +248,8 @@ type libraryCollectionResponse struct {
 	ItemCount         int             `json:"item_count"`
 	CreatedAt         string          `json:"created_at"`
 	UpdatedAt         string          `json:"updated_at"`
-	// PosterIsCollage reports viewer-specific collage state without changing the frozen v1 wire shape.
+	// PosterIsCollage reports that PosterURL is the viewer's collage of the
+	// collection's members (withViewerPosters). Only /api/v2 carries it.
 	PosterIsCollage bool `json:"-"`
 }
 
@@ -311,13 +263,11 @@ type libraryCollectionGroupResponse struct {
 	SortOrder       int    `json:"sort_order"`
 }
 
-//nolint:unused // Retained for compatibility with dormant integration paths.
 type libraryCollectionGroupsListResponse struct {
 	Groups             []libraryCollectionGroupResponse `json:"groups"`
 	UngroupedSortOrder int                              `json:"ungrouped_sort_order"`
 }
 
-//nolint:unused // Retained for compatibility with dormant integration paths.
 type createLibraryCollectionGroupRequest struct {
 	LibraryID       int    `json:"library_id"`
 	Name            string `json:"name"`
@@ -325,21 +275,15 @@ type createLibraryCollectionGroupRequest struct {
 	DefaultSortMode string `json:"default_sort_mode"`
 }
 
-//nolint:unused // Retained for compatibility with dormant integration paths.
 type updateLibraryCollectionGroupRequest struct {
 	Name            *string `json:"name"`
 	Slug            *string `json:"slug"`
 	DefaultSortMode *string `json:"default_sort_mode"`
 }
 
-//nolint:unused // Retained for compatibility with dormant integration paths.
 type reorderLibraryCollectionGroupsRequest struct {
 	LibraryID  int      `json:"library_id"`
 	OrderedIDs []string `json:"ordered_ids"`
-}
-
-type ArtworkRepairEnqueuer interface {
-	EnqueueArtworkRepair(context.Context, []string, int) (int, error)
 }
 
 type libraryCollectionsListResponse struct {
@@ -370,7 +314,8 @@ type createLibraryCollectionRequest struct {
 	ManagementSource  string          `json:"management_source"`
 	ManagementKey     string          `json:"management_key"`
 	SyncSchedule      string          `json:"sync_schedule"`
-	V1Rules           bool            `json:"-"`
+	// V1Rules: see PersonalCollectionPreviewRequest.
+	V1Rules bool `json:"-"`
 }
 
 type updateLibraryCollectionRequest struct {
@@ -395,7 +340,8 @@ type updateLibraryCollectionRequest struct {
 	ManagementSource  *string                `json:"management_source"`
 	ManagementKey     *string                `json:"management_key"`
 	SyncSchedule      *string                `json:"sync_schedule"`
-	V1Rules           bool                   `json:"-"`
+	// V1Rules: see PersonalCollectionPreviewRequest.
+	V1Rules bool `json:"-"`
 }
 
 type importMDBListRequest struct {
@@ -521,6 +467,22 @@ type importTMDBDiscoverRequest struct {
 	PosterFromTemplate bool                       `json:"-"`
 }
 
+type importTraktRequest struct {
+	SortConfig  json.RawMessage `json:"sort_config,omitempty"`
+	LibraryID   int             `json:"library_id"`
+	LibraryIDs  []int           `json:"library_ids"`
+	Title       string          `json:"title"`
+	Description string          `json:"description"`
+	Preset      string          `json:"preset"`
+	MediaType   string          `json:"media_type"`
+	ProfileID   string          `json:"profile_id,omitempty"`
+	ListURL     string          `json:"list_url,omitempty"`
+	Limit       *int            `json:"limit,omitempty"`
+	// VirtualPlayback is part of the frozen v1 request shape. Trakt imports
+	// are retired and answer 410, so nothing reads it.
+	VirtualPlayback *bool `json:"virtual_playback,omitempty"`
+}
+
 // importTMDBDiscoverSpecBody mirrors templates.TMDBDiscoverSpec without the
 // media_type field, which lives on the request envelope.
 type importTMDBDiscoverSpecBody struct {
@@ -538,41 +500,9 @@ type importTMDBDiscoverSpecBody struct {
 	OriginalLanguage string   `json:"original_language,omitempty"`
 }
 
-type importTraktRequest struct {
-	SortConfig  json.RawMessage `json:"sort_config,omitempty"`
-	LibraryID   int             `json:"library_id"`
-	LibraryIDs  []int           `json:"library_ids"`
-	Title       string          `json:"title"`
-	Description string          `json:"description"`
-	Preset      string          `json:"preset"`
-	MediaType   string          `json:"media_type"`
-	ProfileID   string          `json:"profile_id,omitempty"`
-	// ListURL selects a user-authored Trakt list
-	// (https://trakt.tv/users/{user}/lists/{slug}) instead of a preset.
-	ListURL           string `json:"list_url,omitempty"`
-	Limit             *int   `json:"limit,omitempty"`
-	VirtualPlayback   *bool  `json:"virtual_playback,omitempty"`
-	Featured          bool   `json:"featured"`
-	PosterURL         string `json:"poster_url"`
-	PosterSourceURL   string `json:"poster_source_url"`
-	BackdropSourceURL string `json:"backdrop_source_url"`
-	SyncSchedule      string `json:"sync_schedule"`
-	ManagementMode    string `json:"management_mode,omitempty"`
-	ManagementSource  string `json:"management_source,omitempty"`
-	ManagementKey     string `json:"management_key,omitempty"`
-}
-
 type importCollectionResponse struct {
 	Collection libraryCollectionResponse        `json:"collection"`
 	SyncRun    *models.LibraryCollectionSyncRun `json:"sync_run,omitempty"`
-}
-
-type applyTemplateBundleRequest struct {
-	LibraryIDs      []int                          `json:"library_ids"`
-	DryRun          bool                           `json:"dry_run"`
-	DeleteExisting  bool                           `json:"delete_existing"`
-	VirtualPlayback *bool                          `json:"virtual_playback,omitempty"`
-	Featured        *templateBundleFeaturedRequest `json:"featured,omitempty"`
 }
 
 // resolveVirtualPlayback applies the collection-creation default for
@@ -591,6 +521,14 @@ func resolveVirtualPlayback(v *bool) bool {
 		return true
 	}
 	return *v
+}
+
+type applyTemplateBundleRequest struct {
+	LibraryIDs      []int                          `json:"library_ids"`
+	DryRun          bool                           `json:"dry_run"`
+	DeleteExisting  bool                           `json:"delete_existing"`
+	VirtualPlayback *bool                          `json:"virtual_playback,omitempty"`
+	Featured        *templateBundleFeaturedRequest `json:"featured,omitempty"`
 }
 
 type templateBundleFeaturedRequest struct {
@@ -802,7 +740,7 @@ func templateEligibleForLibrary(tmpl templates.Template, library *models.MediaFo
 		return tmpl.MediaKind == templates.MediaTV || tmpl.MediaKind == templates.MediaMixed
 	case "audiobook", "audiobooks":
 		// Audiobook libraries only accept audiobook-targeted templates.
-		// Today the catalog has none (built-ins are TMDB/Trakt/MDBList
+		// Today the catalog has none (built-ins are TMDB/MDBList
 		// movie/TV imports), so this evaluates to an empty gallery —
 		// the correct UX. Previously this fell through to default:true
 		// and offered admins broken movie/TV templates.
@@ -829,14 +767,21 @@ type libraryTabCollection struct {
 	ItemCount        int     `json:"item_count"`
 	Featured         bool    `json:"featured,omitempty"`
 	CreatorProfileID *string `json:"creator_profile_id,omitempty"`
-	PosterIsCollage  bool    `json:"-"`
+	// PosterIsCollage reports that PosterURL is the viewer's collage. The
+	// frozen /api/v1 shape does not carry it.
+	PosterIsCollage bool `json:"-"`
 }
 
-// libraryTabCardOf is the card of a server collection whose poster is already viewer-specific.
+// libraryTabCardOf is the card of a server collection whose poster is already
+// the viewer's (withViewerPosters).
 func (h *LibraryCollectionHandler) libraryTabCardOf(ctx context.Context, c *models.LibraryCollection) libraryTabCollection {
 	return libraryTabCollection{
-		ID: c.ID, Title: c.Title, PosterURL: h.presignGPURLCtx(ctx, c.PosterURL),
-		PosterThumbhash: c.PosterThumbhash, ItemCount: c.ItemCount, Featured: c.Featured,
+		ID:              c.ID,
+		Title:           c.Title,
+		PosterURL:       h.presignGPURLCtx(ctx, c.PosterURL),
+		PosterThumbhash: c.PosterThumbhash,
+		ItemCount:       c.ItemCount,
+		Featured:        c.Featured,
 		PosterIsCollage: c.PosterAutoGenerated && c.PosterURL != "",
 	}
 }
@@ -862,10 +807,9 @@ type libraryTabResponse struct {
 	Ungrouped   *libraryTabUngrouped        `json:"ungrouped,omitempty"`
 }
 
-// HandleListLibraryUserCollections returns the viewer's own personal
-// collections that they've opted into their library Collections tab and whose
-// library scope matches the requested library. Personal collections are
-// private to their owner; this endpoint never reveals other users' rows.
+// HandleListLibraryUserCollections serves LibraryUserCollections: the
+// personal collections on the library's Collections tab that the viewer can
+// see, never another login's.
 func (h *LibraryCollectionHandler) HandleListLibraryUserCollections(w http.ResponseWriter, r *http.Request) {
 	libraryID, ok := parsePathLibraryID(w, r)
 	if !ok {
@@ -1013,6 +957,7 @@ func (h *LibraryCollectionHandler) HandleCreateAdminCollection(w http.ResponseWr
 		writeError(w, http.StatusBadRequest, "bad_request", "Invalid request body")
 		return
 	}
+	req.V1Rules = true
 	resp, err := h.createAdminCollection(r.Context(), req, func(id, p, b string) error { return h.processArtworkInputs(r, id, p, b) })
 	if err != nil {
 		writeAPIError(w, err)
@@ -1033,6 +978,7 @@ func (h *LibraryCollectionHandler) HandleUpdateAdminCollection(w http.ResponseWr
 		writeError(w, http.StatusBadRequest, "bad_request", "Invalid request body")
 		return
 	}
+	req.V1Rules = true
 	resp, err := h.updateAdminCollection(r.Context(), collectionID, req, func(id, p, b string) error { return h.processArtworkInputs(r, id, p, b) })
 	if err != nil {
 		writeAPIError(w, err)
@@ -1052,6 +998,7 @@ func (h *LibraryCollectionHandler) HandlePreviewAdminCollection(w http.ResponseW
 		writeError(w, http.StatusBadRequest, "bad_request", "Invalid request body")
 		return
 	}
+	req.V1Rules = true
 
 	resp, err := h.PreviewAdminCollection(r.Context(), req)
 	if err != nil {
@@ -1102,14 +1049,7 @@ func (h *LibraryCollectionHandler) cleanupDeletedCollection(ctx context.Context,
 	if h.SortPreferenceCleaner != nil {
 		h.SortPreferenceCleaner.DeleteForCollection(ctx, userstore.CollectionKindLibrary, collectionID)
 	}
-	store := h.ArtworkStore
-	if store == nil {
-		return
-	}
-	prefix := fmt.Sprintf("collection-images/%s/", collectionID)
-	if _, err := store.DeletePrefix(ctx, prefix); err != nil {
-		slog.WarnContext(ctx, "collection delete: removing artwork failed", "component", "api", "collection_id", collectionID, "error", err)
-	}
+	removeDeletedCollectionArtwork(ctx, h.ArtworkStore, adminCollectionImagePrefix, collectionID)
 }
 
 type adminReorderCollectionsRequest struct {
@@ -1172,7 +1112,7 @@ func (h *LibraryCollectionHandler) requireManualCollection(w http.ResponseWriter
 }
 
 // HandleReorderAdminCollectionItems handles PUT /admin/collections/{id}/items/order.
-// Manual collections only — synced types (mdblist/tmdb/trakt) and smart
+// Manual collections only — synced types (mdblist/tmdb) and smart
 // collections reject the call.
 func (h *LibraryCollectionHandler) HandleReorderAdminCollectionItems(w http.ResponseWriter, r *http.Request) {
 	collectionID, ok := h.requireManualCollection(w, r)
@@ -1233,15 +1173,6 @@ func (h *LibraryCollectionHandler) HandleRemoveAdminCollectionItem(w http.Respon
 		return
 	}
 	if err := h.repo.RemoveItem(r.Context(), collectionID, itemID); err != nil {
-		if errors.Is(err, catalog.ErrLibraryCollectionNotFound) {
-			writeError(w, http.StatusNotFound, "not_found", "Collection not found")
-			return
-		}
-		if errors.Is(err, catalog.ErrCollectionItemNotMember) {
-			writeError(w, http.StatusNotFound, "not_found", "Item is not in this collection")
-			return
-		}
-		slog.ErrorContext(r.Context(), "failed to remove collection item", "collection_id", collectionID, "item_id", itemID, "error", err)
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to remove collection item")
 		return
 	}
@@ -1620,7 +1551,7 @@ func (h *LibraryCollectionHandler) applyTemplateBundle(
 			}
 			entry.CollectionID = collection.ID
 			rememberTemplateBundleExistingCollection(remainingByLibrarySlug, library.ID, collection)
-			if templateBundleTemplateCanInitialSync(tmpl) {
+			if !tmpl.NeedsSetup() {
 				pendingSyncs = append(pendingSyncs, pendingTemplateBundleSync{
 					CollectionID: collection.ID,
 					SyncSchedule: collection.SyncSchedule,
@@ -1742,13 +1673,6 @@ func (h *LibraryCollectionHandler) ensureTemplatePoster(
 
 func shouldQueueTemplateBundleSyncs(bundle templates.Bundle, pendingCount int) bool {
 	return bundle.ID == "all_defaults" || pendingCount > templateBundleInlineSyncLimit
-}
-
-func templateBundleTemplateCanInitialSync(tmpl templates.Template) bool {
-	if tmpl.Source == templates.SourceTMDBCollection {
-		return tmpl.TMDBCollection != nil && tmpl.TMDBCollection.CollectionID > 0
-	}
-	return true
 }
 
 func templateBundleCreatedEntries(pending []pendingTemplateBundleSync) []templateBundleApplyEntry {
@@ -2087,6 +2011,11 @@ func (h *LibraryCollectionHandler) upsertTemplateBundleFeaturedSection(
 	if err == nil {
 		existing.SectionType = sections.SectionCollection
 		existing.Title = ref.Template.Title
+		// A row that becomes the hero starts on every client, as an admin
+		// update does: web_only an older node left on the demoted row stays off.
+		if !existing.Featured {
+			existing.WebOnly = false
+		}
 		existing.Featured = true
 		existing.ItemLimit = templateBundleFeaturedSectionItemLimit
 		existing.Config = config
@@ -2153,13 +2082,32 @@ func (h *LibraryCollectionHandler) createCollectionFromTemplate(
 	managementKey string,
 	virtualPlayback bool,
 ) (*models.LibraryCollection, error) {
+	input, err := templateCollectionInput(bundleID, tmpl, libraryID, managementKey, virtualPlayback)
+	if err != nil {
+		return nil, err
+	}
+	return h.createImportedCollection(ctx, input, tmpl.PosterPath, tmpl.PosterPath != "")
+}
+
+// templateCollectionInput builds the collection a bundle apply creates from
+// tmpl for a library: the one definition of a template collection's
+// defaults, which a restore uses too.
+//
+//nolint:funlen // one request per template source, moved from createCollectionFromTemplate
+func templateCollectionInput(
+	bundleID string,
+	tmpl templates.Template,
+	libraryID int,
+	managementKey string,
+	virtualPlayback bool,
+) (catalog.CreateLibraryCollectionInput, error) {
 	limit := templateLimitPtr(tmpl)
 	switch tmpl.Source {
 	case templates.SourceTMDB:
 		if tmpl.TMDB == nil {
-			return nil, fmt.Errorf("template %q is missing TMDB config", tmpl.ID)
+			return catalog.CreateLibraryCollectionInput{}, fmt.Errorf("template %q is missing TMDB config", tmpl.ID)
 		}
-		return h.createTMDBCollection(ctx, importTMDBRequest{
+		return tmdbCollectionInput(importTMDBRequest{
 			LibraryID:          libraryID,
 			Title:              tmpl.Title,
 			Description:        tmpl.Description,
@@ -2179,9 +2127,9 @@ func (h *LibraryCollectionHandler) createCollectionFromTemplate(
 		})
 	case templates.SourceMDBList:
 		if tmpl.MDBList == nil || strings.TrimSpace(tmpl.MDBList.URL) == "" {
-			return nil, fmt.Errorf("template %q is missing MDBList URL", tmpl.ID)
+			return catalog.CreateLibraryCollectionInput{}, fmt.Errorf("template %q is missing MDBList URL", tmpl.ID)
 		}
-		return h.createMDBListCollection(ctx, importMDBListRequest{
+		return mdbListCollectionInput(importMDBListRequest{
 			LibraryID:          libraryID,
 			Title:              tmpl.Title,
 			Description:        tmpl.Description,
@@ -2199,9 +2147,9 @@ func (h *LibraryCollectionHandler) createCollectionFromTemplate(
 		})
 	case templates.SourceTMDBList:
 		if tmpl.TMDBList == nil || strings.TrimSpace(tmpl.TMDBList.URL) == "" {
-			return nil, fmt.Errorf("template %q is missing TMDB list URL", tmpl.ID)
+			return catalog.CreateLibraryCollectionInput{}, fmt.Errorf("template %q is missing TMDB list URL", tmpl.ID)
 		}
-		return h.createTMDBListCollection(ctx, importTMDBListRequest{
+		return tmdbListCollectionInput(importTMDBListRequest{
 			LibraryID:          libraryID,
 			Title:              tmpl.Title,
 			Description:        tmpl.Description,
@@ -2218,15 +2166,15 @@ func (h *LibraryCollectionHandler) createCollectionFromTemplate(
 		})
 	case templates.SourceTMDBCollection:
 		if tmpl.TMDBCollection == nil {
-			return nil, fmt.Errorf("template %q is missing TMDBCollection config", tmpl.ID)
+			return catalog.CreateLibraryCollectionInput{}, fmt.Errorf("template %q is missing TMDBCollection config", tmpl.ID)
 		}
-		return h.createTMDBFranchiseCollection(ctx, importTMDBFranchiseRequest{
+		return tmdbFranchiseCollectionInput(importTMDBFranchiseRequest{
 			LibraryID:          libraryID,
 			Title:              tmpl.Title,
 			Description:        tmpl.Description,
 			CollectionID:       tmpl.TMDBCollection.CollectionID,
-			VirtualPlayback:    &virtualPlayback,
 			Limit:              limit,
+			VirtualPlayback:    &virtualPlayback,
 			Featured:           tmpl.Featured,
 			SortOrder:          tmpl.DefaultSortOrder,
 			PosterURL:          tmpl.PosterPath,
@@ -2238,14 +2186,13 @@ func (h *LibraryCollectionHandler) createCollectionFromTemplate(
 		})
 	case templates.SourceTMDBDiscover:
 		if tmpl.TMDBDiscover == nil {
-			return nil, fmt.Errorf("template %q is missing TMDBDiscover config", tmpl.ID)
+			return catalog.CreateLibraryCollectionInput{}, fmt.Errorf("template %q is missing TMDBDiscover config", tmpl.ID)
 		}
-		return h.createTMDBDiscoverCollection(ctx, importTMDBDiscoverRequest{
-			LibraryID:       libraryID,
-			Title:           tmpl.Title,
-			Description:     tmpl.Description,
-			MediaType:       tmpl.TMDBDiscover.MediaType,
-			VirtualPlayback: &virtualPlayback,
+		return tmdbDiscoverCollectionInput(importTMDBDiscoverRequest{
+			LibraryID:   libraryID,
+			Title:       tmpl.Title,
+			Description: tmpl.Description,
+			MediaType:   tmpl.TMDBDiscover.MediaType,
 			Spec: importTMDBDiscoverSpecBody{
 				WithGenres:       tmpl.TMDBDiscover.WithGenres,
 				WithoutGenres:    tmpl.TMDBDiscover.WithoutGenres,
@@ -2261,6 +2208,7 @@ func (h *LibraryCollectionHandler) createCollectionFromTemplate(
 				OriginalLanguage: tmpl.TMDBDiscover.OriginalLanguage,
 			},
 			Limit:              limit,
+			VirtualPlayback:    &virtualPlayback,
 			Featured:           tmpl.Featured,
 			SortOrder:          tmpl.DefaultSortOrder,
 			PosterURL:          tmpl.PosterPath,
@@ -2271,39 +2219,68 @@ func (h *LibraryCollectionHandler) createCollectionFromTemplate(
 			PosterFromTemplate: tmpl.PosterPath != "",
 		})
 	default:
-		return nil, fmt.Errorf("template source %q is not supported by bundles", tmpl.Source)
+		return catalog.CreateLibraryCollectionInput{}, fmt.Errorf("template source %q is not supported by bundles", tmpl.Source)
 	}
+}
+
+// createImportedCollection creates an imported collection and stores the
+// bundled template poster it names.
+func (h *LibraryCollectionHandler) createImportedCollection(ctx context.Context, input catalog.CreateLibraryCollectionInput, posterURL string, posterFromTemplate bool) (*models.LibraryCollection, error) {
+	collection, err := h.repo.Create(ctx, input)
+	if err != nil {
+		return nil, fmt.Errorf("creating collection: %w", err)
+	}
+	if stored, path, thumbhash, err := h.storeBundledTemplatePoster(ctx, collection.ID, posterURL, posterFromTemplate); err != nil {
+		return nil, err
+	} else if stored {
+		collection.PosterURL = path
+		collection.PosterThumbhash = thumbhash
+		collection.PosterAutoGenerated = false
+		if posterFromTemplate {
+			collection.PosterFromTemplate = true
+		}
+	}
+	return collection, nil
 }
 
 func (h *LibraryCollectionHandler) createMDBListCollection(
 	ctx context.Context,
 	req importMDBListRequest,
 ) (*models.LibraryCollection, error) {
+	input, err := mdbListCollectionInput(req)
+	if err != nil {
+		return nil, err
+	}
+	return h.createImportedCollection(ctx, input, req.PosterURL, req.PosterFromTemplate)
+}
+
+// mdbListCollectionInput validates req and builds the collection it creates.
+func mdbListCollectionInput(req importMDBListRequest) (catalog.CreateLibraryCollectionInput, error) {
 	var syncSchedule *string
 	if s := strings.TrimSpace(req.SyncSchedule); s != "" {
 		if err := catalog.ParseCronExpression(s); err != nil {
-			return nil, requestValidationError{err: err}
+			return catalog.CreateLibraryCollectionInput{}, requestValidationError{err: err}
 		}
 		syncSchedule = &s
 	}
 
 	normalizedURL, err := usercollections.CanonicalMDBListURL(req.URL)
 	if err != nil {
-		return nil, requestValidationError{err: err}
+		return catalog.CreateLibraryCollectionInput{}, requestValidationError{err: err}
 	}
 	sourceConfig, err := buildMDBListSourceConfig(normalizedURL, req.Limit, resolveVirtualPlayback(req.VirtualPlayback))
 	if err != nil {
-		return nil, fmt.Errorf("building MDBList source config: %w", err)
+		return catalog.CreateLibraryCollectionInput{}, fmt.Errorf("building MDBList source config: %w", err)
 	}
 	managementMode, managementSource, managementKey, err := normalizeCollectionManagementFields(req.ManagementMode, req.ManagementSource, req.ManagementKey)
 	if err != nil {
-		return nil, requestValidationError{err: err}
+		return catalog.CreateLibraryCollectionInput{}, requestValidationError{err: err}
 	}
 	sortConfig, err := NormalizeCollectionSortConfig(req.SortConfig, false)
 	if err != nil {
-		return nil, requestValidationError{err: err}
+		return catalog.CreateLibraryCollectionInput{}, requestValidationError{err: err}
 	}
-	collection, err := h.repo.Create(ctx, catalog.CreateLibraryCollectionInput{
+	return catalog.CreateLibraryCollectionInput{
 		LibraryID:          req.LibraryID,
 		LibraryIDs:         req.LibraryIDs,
 		Slug:               slugifyCollectionName(req.Title),
@@ -2322,53 +2299,48 @@ func (h *LibraryCollectionHandler) createMDBListCollection(
 		ManagementSource:   managementSource,
 		ManagementKey:      managementKey,
 		SyncSchedule:       syncSchedule,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("creating collection: %w", err)
-	}
-	if stored, path, thumbhash, err := h.storeBundledTemplatePoster(ctx, collection.ID, req.PosterURL, req.PosterFromTemplate); err != nil {
-		return nil, err
-	} else if stored {
-		collection.PosterURL = path
-		collection.PosterThumbhash = thumbhash
-		collection.PosterAutoGenerated = false
-		if req.PosterFromTemplate {
-			collection.PosterFromTemplate = true
-		}
-	}
-	return collection, nil
+	}, nil
 }
 
 func (h *LibraryCollectionHandler) createTMDBCollection(
 	ctx context.Context,
 	req importTMDBRequest,
 ) (*models.LibraryCollection, error) {
+	input, err := tmdbCollectionInput(req)
+	if err != nil {
+		return nil, err
+	}
+	return h.createImportedCollection(ctx, input, req.PosterURL, req.PosterFromTemplate)
+}
+
+// tmdbCollectionInput validates req and builds the collection it creates.
+func tmdbCollectionInput(req importTMDBRequest) (catalog.CreateLibraryCollectionInput, error) {
 	preset, mediaType, timeWindow, err := normalizeTMDBPresetRequest(req.Preset, req.MediaType, req.TimeWindow)
 	if err != nil {
-		return nil, requestValidationError{err: err}
+		return catalog.CreateLibraryCollectionInput{}, requestValidationError{err: err}
 	}
 
 	var syncSchedule *string
 	if s := strings.TrimSpace(req.SyncSchedule); s != "" {
 		if err := catalog.ParseCronExpression(s); err != nil {
-			return nil, requestValidationError{err: err}
+			return catalog.CreateLibraryCollectionInput{}, requestValidationError{err: err}
 		}
 		syncSchedule = &s
 	}
 
 	sourceConfig, err := buildTMDBSourceConfig(preset, mediaType, timeWindow, req.Limit, resolveVirtualPlayback(req.VirtualPlayback))
 	if err != nil {
-		return nil, fmt.Errorf("building TMDB source config: %w", err)
+		return catalog.CreateLibraryCollectionInput{}, fmt.Errorf("building TMDB source config: %w", err)
 	}
 	managementMode, managementSource, managementKey, err := normalizeCollectionManagementFields(req.ManagementMode, req.ManagementSource, req.ManagementKey)
 	if err != nil {
-		return nil, requestValidationError{err: err}
+		return catalog.CreateLibraryCollectionInput{}, requestValidationError{err: err}
 	}
 	tmdbSortConfig, err := NormalizeCollectionSortConfig(req.SortConfig, false)
 	if err != nil {
-		return nil, requestValidationError{err: err}
+		return catalog.CreateLibraryCollectionInput{}, requestValidationError{err: err}
 	}
-	collection, err := h.repo.Create(ctx, catalog.CreateLibraryCollectionInput{
+	return catalog.CreateLibraryCollectionInput{
 		LibraryID:          req.LibraryID,
 		LibraryIDs:         req.LibraryIDs,
 		Slug:               slugifyCollectionName(req.Title),
@@ -2387,21 +2359,7 @@ func (h *LibraryCollectionHandler) createTMDBCollection(
 		ManagementSource:   managementSource,
 		ManagementKey:      managementKey,
 		SyncSchedule:       syncSchedule,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("creating collection: %w", err)
-	}
-	if stored, path, thumbhash, err := h.storeBundledTemplatePoster(ctx, collection.ID, req.PosterURL, req.PosterFromTemplate); err != nil {
-		return nil, err
-	} else if stored {
-		collection.PosterURL = path
-		collection.PosterThumbhash = thumbhash
-		collection.PosterAutoGenerated = false
-		if req.PosterFromTemplate {
-			collection.PosterFromTemplate = true
-		}
-	}
-	return collection, nil
+	}, nil
 }
 
 // createTMDBListCollection persists a library collection that follows a
@@ -2410,32 +2368,41 @@ func (h *LibraryCollectionHandler) createTMDBListCollection(
 	ctx context.Context,
 	req importTMDBListRequest,
 ) (*models.LibraryCollection, error) {
+	input, err := tmdbListCollectionInput(req)
+	if err != nil {
+		return nil, err
+	}
+	return h.createImportedCollection(ctx, input, req.PosterURL, req.PosterFromTemplate)
+}
+
+// tmdbListCollectionInput validates req and builds the collection it creates.
+func tmdbListCollectionInput(req importTMDBListRequest) (catalog.CreateLibraryCollectionInput, error) {
 	listURL, err := collectionutil.CanonicalTMDBListURL(req.URL)
 	if err != nil {
-		return nil, requestValidationError{err: err}
+		return catalog.CreateLibraryCollectionInput{}, requestValidationError{err: err}
 	}
 
 	var syncSchedule *string
 	if s := strings.TrimSpace(req.SyncSchedule); s != "" {
 		if err := catalog.ParseCronExpression(s); err != nil {
-			return nil, requestValidationError{err: err}
+			return catalog.CreateLibraryCollectionInput{}, requestValidationError{err: err}
 		}
 		syncSchedule = &s
 	}
 
 	sourceConfig, err := buildTMDBListSourceConfig(listURL, req.Limit)
 	if err != nil {
-		return nil, fmt.Errorf("building TMDB list source config: %w", err)
+		return catalog.CreateLibraryCollectionInput{}, fmt.Errorf("building TMDB list source config: %w", err)
 	}
 	managementMode, managementSource, managementKey, err := normalizeCollectionManagementFields(req.ManagementMode, req.ManagementSource, req.ManagementKey)
 	if err != nil {
-		return nil, requestValidationError{err: err}
+		return catalog.CreateLibraryCollectionInput{}, requestValidationError{err: err}
 	}
 	sortConfig, err := NormalizeCollectionSortConfig(req.SortConfig, false)
 	if err != nil {
-		return nil, requestValidationError{err: err}
+		return catalog.CreateLibraryCollectionInput{}, requestValidationError{err: err}
 	}
-	collection, err := h.repo.Create(ctx, catalog.CreateLibraryCollectionInput{
+	return catalog.CreateLibraryCollectionInput{
 		LibraryID:          req.LibraryID,
 		LibraryIDs:         req.LibraryIDs,
 		Slug:               slugifyCollectionName(req.Title),
@@ -2454,21 +2421,7 @@ func (h *LibraryCollectionHandler) createTMDBListCollection(
 		ManagementSource:   managementSource,
 		ManagementKey:      managementKey,
 		SyncSchedule:       syncSchedule,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("creating collection: %w", err)
-	}
-	if stored, path, thumbhash, err := h.storeBundledTemplatePoster(ctx, collection.ID, req.PosterURL, req.PosterFromTemplate); err != nil {
-		return nil, err
-	} else if stored {
-		collection.PosterURL = path
-		collection.PosterThumbhash = thumbhash
-		collection.PosterAutoGenerated = false
-		if req.PosterFromTemplate {
-			collection.PosterFromTemplate = true
-		}
-	}
-	return collection, nil
+	}, nil
 }
 
 // createTMDBFranchiseCollection persists a TMDB-franchise-backed library
@@ -2485,27 +2438,36 @@ func (h *LibraryCollectionHandler) createTMDBFranchiseCollection(
 	ctx context.Context,
 	req importTMDBFranchiseRequest,
 ) (*models.LibraryCollection, error) {
+	input, err := tmdbFranchiseCollectionInput(req)
+	if err != nil {
+		return nil, err
+	}
+	return h.createImportedCollection(ctx, input, req.PosterURL, req.PosterFromTemplate)
+}
+
+// tmdbFranchiseCollectionInput validates req and builds the collection it creates.
+func tmdbFranchiseCollectionInput(req importTMDBFranchiseRequest) (catalog.CreateLibraryCollectionInput, error) {
 	if req.CollectionID < 0 {
-		return nil, requestValidationError{err: fmt.Errorf("collection_id must be >= 0")}
+		return catalog.CreateLibraryCollectionInput{}, requestValidationError{err: errors.New("collection_id must be >= 0")}
 	}
 
 	var syncSchedule *string
 	if s := strings.TrimSpace(req.SyncSchedule); s != "" {
 		if err := catalog.ParseCronExpression(s); err != nil {
-			return nil, requestValidationError{err: err}
+			return catalog.CreateLibraryCollectionInput{}, requestValidationError{err: err}
 		}
 		syncSchedule = &s
 	}
 
 	sourceConfig, err := buildTMDBCollectionSourceConfig(req.CollectionID, req.Limit, resolveVirtualPlayback(req.VirtualPlayback))
 	if err != nil {
-		return nil, fmt.Errorf("building TMDB franchise source config: %w", err)
+		return catalog.CreateLibraryCollectionInput{}, fmt.Errorf("building TMDB franchise source config: %w", err)
 	}
 	managementMode, managementSource, managementKey, err := normalizeCollectionManagementFields(req.ManagementMode, req.ManagementSource, req.ManagementKey)
 	if err != nil {
-		return nil, requestValidationError{err: err}
+		return catalog.CreateLibraryCollectionInput{}, requestValidationError{err: err}
 	}
-	collection, err := h.repo.Create(ctx, catalog.CreateLibraryCollectionInput{
+	return catalog.CreateLibraryCollectionInput{
 		LibraryID:          req.LibraryID,
 		LibraryIDs:         req.LibraryIDs,
 		Slug:               slugifyCollectionName(req.Title),
@@ -2523,21 +2485,7 @@ func (h *LibraryCollectionHandler) createTMDBFranchiseCollection(
 		ManagementSource:   managementSource,
 		ManagementKey:      managementKey,
 		SyncSchedule:       syncSchedule,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("creating collection: %w", err)
-	}
-	if stored, path, thumbhash, err := h.storeBundledTemplatePoster(ctx, collection.ID, req.PosterURL, req.PosterFromTemplate); err != nil {
-		return nil, err
-	} else if stored {
-		collection.PosterURL = path
-		collection.PosterThumbhash = thumbhash
-		collection.PosterAutoGenerated = false
-		if req.PosterFromTemplate {
-			collection.PosterFromTemplate = true
-		}
-	}
-	return collection, nil
+	}, nil
 }
 
 // createTMDBDiscoverCollection persists a TMDB-discover-backed library
@@ -2548,27 +2496,36 @@ func (h *LibraryCollectionHandler) createTMDBDiscoverCollection(
 	ctx context.Context,
 	req importTMDBDiscoverRequest,
 ) (*models.LibraryCollection, error) {
+	input, err := tmdbDiscoverCollectionInput(req)
+	if err != nil {
+		return nil, err
+	}
+	return h.createImportedCollection(ctx, input, req.PosterURL, req.PosterFromTemplate)
+}
+
+// tmdbDiscoverCollectionInput validates req and builds the collection it creates.
+func tmdbDiscoverCollectionInput(req importTMDBDiscoverRequest) (catalog.CreateLibraryCollectionInput, error) {
 	if err := validateTMDBDiscoverRequest(req); err != nil {
-		return nil, requestValidationError{err: err}
+		return catalog.CreateLibraryCollectionInput{}, requestValidationError{err: err}
 	}
 
 	var syncSchedule *string
 	if s := strings.TrimSpace(req.SyncSchedule); s != "" {
 		if err := catalog.ParseCronExpression(s); err != nil {
-			return nil, requestValidationError{err: err}
+			return catalog.CreateLibraryCollectionInput{}, requestValidationError{err: err}
 		}
 		syncSchedule = &s
 	}
 
 	sourceConfig, err := buildTMDBDiscoverSourceConfig(req.MediaType, req.Spec, req.Limit, resolveVirtualPlayback(req.VirtualPlayback))
 	if err != nil {
-		return nil, fmt.Errorf("building TMDB discover source config: %w", err)
+		return catalog.CreateLibraryCollectionInput{}, fmt.Errorf("building TMDB discover source config: %w", err)
 	}
 	managementMode, managementSource, managementKey, err := normalizeCollectionManagementFields(req.ManagementMode, req.ManagementSource, req.ManagementKey)
 	if err != nil {
-		return nil, requestValidationError{err: err}
+		return catalog.CreateLibraryCollectionInput{}, requestValidationError{err: err}
 	}
-	collection, err := h.repo.Create(ctx, catalog.CreateLibraryCollectionInput{
+	return catalog.CreateLibraryCollectionInput{
 		LibraryID:          req.LibraryID,
 		LibraryIDs:         req.LibraryIDs,
 		Slug:               slugifyCollectionName(req.Title),
@@ -2586,21 +2543,7 @@ func (h *LibraryCollectionHandler) createTMDBDiscoverCollection(
 		ManagementSource:   managementSource,
 		ManagementKey:      managementKey,
 		SyncSchedule:       syncSchedule,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("creating collection: %w", err)
-	}
-	if stored, path, thumbhash, err := h.storeBundledTemplatePoster(ctx, collection.ID, req.PosterURL, req.PosterFromTemplate); err != nil {
-		return nil, err
-	} else if stored {
-		collection.PosterURL = path
-		collection.PosterThumbhash = thumbhash
-		collection.PosterAutoGenerated = false
-		if req.PosterFromTemplate {
-			collection.PosterFromTemplate = true
-		}
-	}
-	return collection, nil
+	}, nil
 }
 
 // validateTMDBDiscoverRequest performs basic sanity checks on the request
@@ -2651,18 +2594,20 @@ func (h *LibraryCollectionHandler) HandleImportTMDBCollection(w http.ResponseWri
 	writeJSON(w, http.StatusCreated, resp)
 }
 
+// HandleImportTraktCollection answers the frozen v1 admin Trakt import route.
+// Silo no longer supports Trakt, so every well-formed request is refused.
 func (h *LibraryCollectionHandler) HandleImportTraktCollection(w http.ResponseWriter, r *http.Request) {
-	var req importTraktRequest
+	var req struct{}
 	if err := decodeJSONOrMultipart(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", "Invalid request body")
 		return
 	}
-	resp, err := h.importAdminTrakt(r.Context(), req, func(id, p, b string) error { return h.processArtworkInputs(r, id, p, b) })
-	if err != nil {
-		writeAPIError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusCreated, resp)
+	writeAPIError(w, traktImportRetired())
+}
+
+// traktImportRetired is the error the frozen v1 Trakt import routes return.
+func traktImportRetired() error {
+	return apiError(http.StatusGone, "unsupported_source", "new Trakt collections are not supported")
 }
 
 // loadOrderedCollectionItems answers a manual collection's stored items in
@@ -2826,8 +2771,262 @@ func (h *LibraryCollectionHandler) itemListResponseOf(ctx context.Context, item 
 	return resp
 }
 
-func (h *LibraryCollectionHandler) presignURL(r *http.Request, path string, variant string) string {
-	return h.presignURLCtx(r.Context(), path, variant)
+// setListingLogos fills in the logo of each card on a v2 collection page,
+// signed in one batch. items are the cards' media items in any order.
+// PurgeVirtualPlaybackItems handles POST /api/v1/admin/collections/purge-virtual.
+func (h *LibraryCollectionHandler) PurgeVirtualPlaybackItems(w http.ResponseWriter, r *http.Request) {
+	if h.itemRepo == nil {
+		http.Error(w, "item repository unavailable", http.StatusInternalServerError)
+		return
+	}
+	query := r.URL.Query()
+	parsePositive := func(key string) (int, error) {
+		value := strings.TrimSpace(query.Get(key))
+		if value == "" {
+			return 0, nil
+		}
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed < 0 {
+			return 0, fmt.Errorf("%s must be a non-negative integer", key)
+		}
+		return parsed, nil
+	}
+	libraryID, err := parsePositive("library_id")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	installationID, err := parsePositive("installation_id")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	dryRun := strings.EqualFold(strings.TrimSpace(query.Get("dry_run")), "true") || query.Get("dry_run") == "1"
+	purgeCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 2*time.Minute)
+	defer cancel()
+	purgeResult, err := h.itemRepo.PurgeVirtualPlaybackItems(purgeCtx, catalog.VirtualPurgeOptions{
+		DryRun: dryRun, LibraryID: libraryID, InstallationID: installationID,
+	})
+	if err != nil {
+		slog.ErrorContext(r.Context(), "failed to purge virtual playback items", "component", "api", "error", err)
+		http.Error(w, fmt.Sprintf("purge failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+	if !dryRun {
+		// Hard purge invalidation: every Home rail (not just recently_added)
+		// plus the editorial candidate caches are dropped synchronously, so
+		// purged titles cannot linger on Home. DB deletes already committed
+		// inside PurgeVirtualPlaybackItems; dry-run never reaches here.
+		sections.InvalidateAllResolvedListCachesForPurge()
+		if h.EventsHub != nil {
+			// Publish on a context detached from the request: the purge
+			// transaction already committed, so request cancellation must not
+			// abort fan-out to other replicas.
+			publishCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
+			defer cancel()
+			if err := h.EventsHub.PublishJSON(publishCtx, evt.ChannelCatalog, "virtual_purge_complete",
+				map[string]any{"library_id": libraryID, "installation_id": installationID, "purge_revision": purgeResult.PurgeRevision}, evt.PublishOptions{}); err != nil {
+				slog.WarnContext(r.Context(), "purge: failed to publish virtual_purge_complete",
+					"component", "api", "error", err)
+			}
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	message := fmt.Sprintf("%s %d virtual files and %d virtual media items",
+		map[bool]string{true: "Would purge", false: "Purged"}[dryRun],
+		purgeResult.FilesDeleted, purgeResult.ItemsDeleted)
+	if dryRun {
+		message += " (cleanup rows not estimated in dry-run)"
+	} else {
+		message += fmt.Sprintf(" (%d stale playback-state and metadata rows, %d collection references pruned)",
+			purgeResult.StateRowsDeleted, purgeResult.CollectionsPruned)
+	}
+	if err := json.NewEncoder(w).Encode(map[string]any{
+		successKey: true, "dry_run": dryRun,
+		"files_deleted": purgeResult.FilesDeleted, "items_deleted": purgeResult.ItemsDeleted,
+		"state_rows_deleted":  purgeResult.StateRowsDeleted,
+		"collections_pruned":  purgeResult.CollectionsPruned,
+		displayMessageTextKey: message,
+	}); err != nil {
+		slog.WarnContext(r.Context(), "failed to encode purge response", "component", "api", "error", err)
+	}
+}
+
+// SubscribePurgeInvalidations listens for virtual_purge_complete events from
+// other API replicas and reconciles the carried purge revision locally. Each
+// instance must call this once at startup; the subscription lives until ctx is
+// canceled. Events that carry a purge revision reconcile by revision; events
+// without one (legacy publishers) force reconciliation without advancing the
+// watermark. The local publisher's own echo reconciles too (it carries the
+// just-committed revision), which costs one redundant invalidation; the
+// subsequent duplicate is a no-op by revision comparison.
+func (h *LibraryCollectionHandler) SubscribePurgeInvalidations(ctx context.Context) {
+	if h == nil || h.EventsHub == nil || ctx == nil {
+		return
+	}
+	events, unsubscribe := h.EventsHub.Subscribe()
+	go func() {
+		defer unsubscribe()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case env, ok := <-events:
+				if !ok {
+					return
+				}
+				if env.Channel != evt.ChannelCatalog || env.Event != "virtual_purge_complete" {
+					continue
+				}
+				revision := int64(-1)
+				if len(env.Data) > 0 {
+					var payload struct {
+						PurgeRevision *int64 `json:"purge_revision"`
+					}
+					if err := json.Unmarshal(env.Data, &payload); err == nil && payload.PurgeRevision != nil {
+						revision = *payload.PurgeRevision
+					}
+				}
+				sections.ReconcilePurgeRevision(revision)
+			}
+		}
+	}()
+}
+
+// HandleMaterializeAdminCollectionItem handles
+// POST /api/v1/admin/collections/{id}/materialize/{item_id}.
+//
+// This is the recovery path when a virtual playback item is in a collection
+// (so it's authoritative) but never received its placeholder virtual file.
+// Typical causes:
+//
+//   - the owning provider installation was disabled or removed at the time
+//     the original TMDB/Trakt sync ran, so the per-row check rejected
+//     "virtual playback item requires an owning provider installation";
+//   - a prior purge reset the media_files row without re-creating it.
+//
+// The endpoint materializes the item (and, for series, its released
+// episodes) idempotently. Re-runs are safe and report zero new rows when
+// nothing changed.
+func (h *LibraryCollectionHandler) HandleMaterializeAdminCollectionItem(w http.ResponseWriter, r *http.Request) {
+	if h.itemRepo == nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "item repository unavailable")
+		return
+	}
+	collectionID := chi.URLParam(r, "id")
+	itemID := chi.URLParam(r, "item_id")
+	if collectionID == "" || itemID == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "collection id and item id are required")
+		return
+	}
+
+	// Verify the collection and membership so this cannot be used as a side
+	// door to materialize arbitrary catalog entries outside its collection.
+	if h.repo == nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "collection repository unavailable")
+		return
+	}
+	collection, err := h.repo.GetByID(r.Context(), collectionID)
+	if err != nil {
+		if errors.Is(err, catalog.ErrLibraryCollectionNotFound) || errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "not_found", "collection not found")
+			return
+		}
+		slog.ErrorContext(r.Context(), "failed to look up collection for materialization", "collection_id", collectionID, "error", err)
+		writeError(w, http.StatusInternalServerError, "internal_error", "failed to look up collection")
+		return
+	}
+	member, err := h.repo.HasItem(r.Context(), collectionID, itemID)
+	if err != nil {
+		slog.ErrorContext(r.Context(), "failed to check collection membership", "collection_id", collectionID, "item_id", itemID, "error", err)
+		writeError(w, http.StatusInternalServerError, "internal_error", "failed to check collection membership")
+		return
+	}
+	if !member {
+		writeError(w, http.StatusNotFound, "not_found", "item is not in this collection")
+		return
+	}
+
+	item, err := h.itemRepo.GetByID(r.Context(), itemID)
+	if err != nil {
+		if errors.Is(err, catalog.ErrItemNotFound) || errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "not_found", "item not found")
+			return
+		}
+		slog.ErrorContext(r.Context(), "failed to look up item for materialization", "item_id", itemID, "error", err)
+		writeError(w, http.StatusInternalServerError, "internal_error", "failed to look up item")
+		return
+	}
+	if item == nil {
+		writeError(w, http.StatusNotFound, "not_found", "item not found")
+		return
+	}
+	// Only virtual playback media types can be materialized through the
+	// virtual pipeline. Other media is fully resolved on demand; trying to
+	// create a virtual placeholder for it would silently desynchronize the
+	// catalog from the actual playable file.
+	if item.Type != "movie" && item.Type != "series" {
+		writeError(w, http.StatusBadRequest, "bad_request", fmt.Sprintf("item type %q is not eligible for virtual materialization", item.Type))
+		return
+	}
+
+	if !catalog.SourceEnablesVirtualPlayback(collection.SourceConfig) {
+		writeError(w, http.StatusBadRequest, "bad_request", catalog.ErrVirtualPlaybackDisabled.Error())
+		return
+	}
+
+	if h.service == nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "collection service unavailable")
+		return
+	}
+	workCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 2*time.Minute)
+	defer cancel()
+	res, err := h.service.EnsureCollectionItemMaterialized(workCtx, collection, item)
+	if err != nil {
+		writeMaterializeCollectionItemError(r.Context(), w, collectionID, itemID, err)
+		return
+	}
+
+	// Cached watch responses and resolved lists may have cached a
+	// pre-materialization "no playback target" answer.
+	sections.InvalidateResolvedListCache()
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		successKey:              true,
+		contentIDKey:            res.ContentID,
+		"media_type":            res.MediaType,
+		"files_created":         res.FilesCreated,
+		"files_existing":        res.FilesExisting,
+		"episodes_materialized": res.EpisodesMaterialized,
+		displayMessageTextKey:   fmt.Sprintf("Materialized %d virtual files (%d existing) for %s (%s)", res.FilesCreated, res.FilesExisting, res.ContentID, res.MediaType),
+	})
+}
+
+// writeMaterializeCollectionItemError maps a materialization failure to the
+// response the collection item endpoint returns.
+func writeMaterializeCollectionItemError(ctx context.Context, w http.ResponseWriter, collectionID, itemID string, err error) {
+	switch {
+	case errors.Is(err, catalog.ErrCollectionItemNotMember):
+		writeError(w, http.StatusNotFound, "not_found", "item is not in this collection")
+	case errors.Is(err, catalog.ErrLibraryCollectionNotFound):
+		writeError(w, http.StatusNotFound, "not_found", "collection not found")
+	case errors.Is(err, catalog.ErrIncompatibleLibrary), errors.Is(err, catalog.ErrVirtualPlaybackDisabled):
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+	case errors.Is(err, catalog.ErrProviderUnavailable) ||
+		strings.Contains(err.Error(), "provider unavailable") ||
+		strings.Contains(err.Error(), "owning provider installation"):
+		writeError(w, http.StatusServiceUnavailable, "provider_unavailable", err.Error())
+	default:
+		slog.ErrorContext(ctx, "failed to materialize virtual item", "collection_id", collectionID, "item_id", itemID, "error", err)
+		writeError(w, http.StatusInternalServerError, "internal_error", "failed to materialize virtual item")
+	}
+}
+
+func (h *LibraryCollectionHandler) setListingLogos(ctx context.Context, cards []itemListResponse, items []*models.MediaItem, access catalog.AccessFilter) {
+	urls := signListingLogos(ctx, h.detailSvc, localizedLogoPaths(ctx, h.detailSvc, items, access), access.ImageSizeFor(imagesize.SlotLogo))
+	for i := range cards {
+		cards[i].LogoURL = urls[cards[i].ContentID]
+	}
 }
 
 func (h *LibraryCollectionHandler) presignURLCtx(ctx context.Context, path string, variant string) string {
@@ -2837,19 +3036,12 @@ func (h *LibraryCollectionHandler) presignURLCtx(ctx context.Context, path strin
 	return ""
 }
 
-func (h *LibraryCollectionHandler) presignGPURL(r *http.Request, path string) string {
-	return h.presignGPURLCtx(r.Context(), path)
-}
-
 func (h *LibraryCollectionHandler) presignGPURLCtx(ctx context.Context, path string) string {
 	if path == "" {
 		return ""
 	}
-	if strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://") {
-		return path
-	}
-	if strings.HasPrefix(path, "/") {
-		return path
+	if strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://") || strings.HasPrefix(path, "/") {
+		return catalog.ImageURLOrEmpty(path)
 	}
 	if h.ArtworkResolver == nil {
 		return ""
@@ -2878,6 +3070,21 @@ func (h *LibraryCollectionHandler) withViewerPosters(ctx context.Context, collec
 		out = append(out, &viewed)
 	}
 	return out
+}
+
+// viewerCollectionCounts returns what each collection shows the viewer
+// described by access (catalog ViewerCollectionCounts), or nil
+// when access narrows nothing and the stored counts are the viewer's. A
+// collection whose count could not be read is absent and logged.
+func (h *LibraryCollectionHandler) viewerCollectionCounts(ctx context.Context, collections []*models.LibraryCollection, access catalog.AccessFilter) map[string]catalog.ViewerCollectionCount {
+	if h.repo == nil {
+		return nil
+	}
+	counts, err := h.repo.ViewerCollectionCounts(ctx, collections, access)
+	if err != nil {
+		slog.WarnContext(ctx, "counting server collections for the viewer failed", "component", "collections", "error", err)
+	}
+	return counts
 }
 
 // withViewerPoster is withViewerPosters for one collection and the viewer in
@@ -3188,7 +3395,7 @@ type tmdbDiscoverConfigBody struct {
 //
 // The discover sub-object exists so additional discover-only fields don't
 // pollute the top-level libraryCollectionSourceConfig struct used for the
-// existing tmdb_preset / trakt_preset / mdblist_json modes.
+// existing tmdb_preset / mdblist_json modes.
 func buildTMDBDiscoverSourceConfig(mediaType string, spec importTMDBDiscoverSpecBody, limit *int, virtualPlayback bool) (json.RawMessage, error) {
 	payload := struct {
 		Mode            string                 `json:"mode"`
@@ -3283,7 +3490,7 @@ func (h *LibraryCollectionHandler) adminCollectionImagePath(ctx context.Context,
 }
 
 // cleanUpReplacedCollectionImage removes the revision that a committed
-// replacement of an admin collection image superseded.
+// replacement or clear of an admin collection image superseded.
 func (h *LibraryCollectionHandler) cleanUpReplacedCollectionImage(ctx context.Context, collectionID, imageType, oldPath string) {
 	cleanUpReplacedCollectionImage(ctx, h.ArtworkStore, adminCollectionImagePrefix, collectionID, imageType, oldPath, func(ctx context.Context) (string, error) {
 		return h.adminCollectionImagePath(ctx, collectionID, imageType)
@@ -3314,7 +3521,7 @@ func (h *LibraryCollectionHandler) processArtworkInputs(r *http.Request, collect
 			if sourceByType[imageType] == "" {
 				continue
 			}
-			fileData, err = downloadCollectionImageURL(r.Context(), h.httpClient, sourceByType[imageType])
+			fileData, err = downloadCollectionImageURL(adminCollectionImageContext(r.Context()), h.httpClient, sourceByType[imageType])
 			if err != nil {
 				return fmt.Errorf("%s source: %w", imageType, err)
 			}
@@ -3382,257 +3589,4 @@ func pointerStringValue(value *string) string {
 		return ""
 	}
 	return *value
-}
-
-// PurgeVirtualPlaybackItems handles POST /api/v1/admin/collections/purge-virtual.
-func (h *LibraryCollectionHandler) PurgeVirtualPlaybackItems(w http.ResponseWriter, r *http.Request) {
-	if h.itemRepo == nil {
-		http.Error(w, "item repository unavailable", http.StatusInternalServerError)
-		return
-	}
-	query := r.URL.Query()
-	parsePositive := func(key string) (int, error) {
-		value := strings.TrimSpace(query.Get(key))
-		if value == "" {
-			return 0, nil
-		}
-		parsed, err := strconv.Atoi(value)
-		if err != nil || parsed < 0 {
-			return 0, fmt.Errorf("%s must be a non-negative integer", key)
-		}
-		return parsed, nil
-	}
-	libraryID, err := parsePositive("library_id")
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	installationID, err := parsePositive("installation_id")
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	dryRun := strings.EqualFold(strings.TrimSpace(query.Get("dry_run")), "true") || query.Get("dry_run") == "1"
-	purgeCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 2*time.Minute)
-	defer cancel()
-	purgeResult, err := h.itemRepo.PurgeVirtualPlaybackItems(purgeCtx, catalog.VirtualPurgeOptions{
-		DryRun: dryRun, LibraryID: libraryID, InstallationID: installationID,
-	})
-	if err != nil {
-		slog.ErrorContext(r.Context(), "failed to purge virtual playback items", "component", "api", "error", err)
-		http.Error(w, fmt.Sprintf("purge failed: %v", err), http.StatusInternalServerError)
-		return
-	}
-	if !dryRun {
-		// Hard purge invalidation: every Home rail (not just recently_added)
-		// plus the editorial candidate caches are dropped synchronously, so
-		// purged titles cannot linger on Home. DB deletes already committed
-		// inside PurgeVirtualPlaybackItems; dry-run never reaches here.
-		sections.InvalidateAllResolvedListCachesForPurge()
-		if h.EventsHub != nil {
-			// Publish on a context detached from the request: the purge
-			// transaction already committed, so request cancellation must not
-			// abort fan-out to other replicas.
-			publishCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
-			defer cancel()
-			if err := h.EventsHub.PublishJSON(publishCtx, evt.ChannelCatalog, "virtual_purge_complete",
-				map[string]any{"library_id": libraryID, "installation_id": installationID, "purge_revision": purgeResult.PurgeRevision}, evt.PublishOptions{}); err != nil {
-				slog.WarnContext(r.Context(), "purge: failed to publish virtual_purge_complete",
-					"component", "api", "error", err)
-			}
-		}
-	}
-	w.Header().Set("Content-Type", "application/json")
-	message := fmt.Sprintf("%s %d virtual files and %d virtual media items",
-		map[bool]string{true: "Would purge", false: "Purged"}[dryRun],
-		purgeResult.FilesDeleted, purgeResult.ItemsDeleted)
-	if dryRun {
-		message += " (cleanup rows not estimated in dry-run)"
-	} else {
-		message += fmt.Sprintf(" (%d stale playback-state and metadata rows, %d collection references pruned)",
-			purgeResult.StateRowsDeleted, purgeResult.CollectionsPruned)
-	}
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"success": true, "dry_run": dryRun,
-		"files_deleted": purgeResult.FilesDeleted, "items_deleted": purgeResult.ItemsDeleted,
-		"state_rows_deleted": purgeResult.StateRowsDeleted,
-		"collections_pruned": purgeResult.CollectionsPruned,
-		"message":            message,
-	})
-}
-
-// SubscribePurgeInvalidations listens for virtual_purge_complete events from
-// other API replicas and reconciles the carried purge revision locally. Each
-// instance must call this once at startup; the subscription lives until ctx is
-// canceled. Events that carry a purge revision reconcile by revision; events
-// without one (legacy publishers) force reconciliation without advancing the
-// watermark. The local publisher's own echo reconciles too (it carries the
-// just-committed revision), which costs one redundant invalidation; the
-// subsequent duplicate is a no-op by revision comparison.
-func (h *LibraryCollectionHandler) SubscribePurgeInvalidations(ctx context.Context) {
-	if h == nil || h.EventsHub == nil || ctx == nil {
-		return
-	}
-	events, unsubscribe := h.EventsHub.Subscribe()
-	go func() {
-		defer unsubscribe()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case env, ok := <-events:
-				if !ok {
-					return
-				}
-				if env.Channel != evt.ChannelCatalog || env.Event != "virtual_purge_complete" {
-					continue
-				}
-				revision := int64(-1)
-				if len(env.Data) > 0 {
-					var payload struct {
-						PurgeRevision *int64 `json:"purge_revision"`
-					}
-					if err := json.Unmarshal(env.Data, &payload); err == nil && payload.PurgeRevision != nil {
-						revision = *payload.PurgeRevision
-					}
-				}
-				sections.ReconcilePurgeRevision(revision)
-			}
-		}
-	}()
-}
-
-// HandleMaterializeAdminCollectionItem handles
-// POST /api/v1/admin/collections/{id}/materialize/{item_id}.
-//
-// This is the recovery path when a virtual playback item is in a collection
-// (so it's authoritative) but never received its placeholder virtual file.
-// Typical causes:
-//
-//   - the owning provider installation was disabled or removed at the time
-//     the original TMDB/Trakt sync ran, so the per-row check rejected
-//     "virtual playback item requires an owning provider installation";
-//   - a prior purge reset the media_files row without re-creating it.
-//
-// The endpoint materializes the item (and, for series, its released
-// episodes) idempotently. Re-runs are safe and report zero new rows when
-// nothing changed.
-func (h *LibraryCollectionHandler) HandleMaterializeAdminCollectionItem(w http.ResponseWriter, r *http.Request) {
-	if h.itemRepo == nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", "item repository unavailable")
-		return
-	}
-	collectionID := chi.URLParam(r, "id")
-	itemID := chi.URLParam(r, "item_id")
-	if collectionID == "" || itemID == "" {
-		writeError(w, http.StatusBadRequest, "bad_request", "collection id and item id are required")
-		return
-	}
-
-	// Verify the collection and membership so this cannot be used as a side
-	// door to materialize arbitrary catalog entries outside its collection.
-	if h.repo == nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", "collection repository unavailable")
-		return
-	}
-	collection, err := h.repo.GetByID(r.Context(), collectionID)
-	if err != nil {
-		if errors.Is(err, catalog.ErrLibraryCollectionNotFound) || errors.Is(err, pgx.ErrNoRows) {
-			writeError(w, http.StatusNotFound, "not_found", "collection not found")
-			return
-		}
-		slog.ErrorContext(r.Context(), "failed to look up collection for materialization", "collection_id", collectionID, "error", err)
-		writeError(w, http.StatusInternalServerError, "internal_error", "failed to look up collection")
-		return
-	}
-	member, err := h.repo.HasItem(r.Context(), collectionID, itemID)
-	if err != nil {
-		slog.ErrorContext(r.Context(), "failed to check collection membership", "collection_id", collectionID, "item_id", itemID, "error", err)
-		writeError(w, http.StatusInternalServerError, "internal_error", "failed to check collection membership")
-		return
-	}
-	if !member {
-		writeError(w, http.StatusNotFound, "not_found", "item is not in this collection")
-		return
-	}
-
-	item, err := h.itemRepo.GetByID(r.Context(), itemID)
-	if err != nil {
-		if errors.Is(err, catalog.ErrItemNotFound) || errors.Is(err, pgx.ErrNoRows) {
-			writeError(w, http.StatusNotFound, "not_found", "item not found")
-			return
-		}
-		slog.ErrorContext(r.Context(), "failed to look up item for materialization", "item_id", itemID, "error", err)
-		writeError(w, http.StatusInternalServerError, "internal_error", "failed to look up item")
-		return
-	}
-	if item == nil {
-		writeError(w, http.StatusNotFound, "not_found", "item not found")
-		return
-	}
-	// Only virtual playback media types can be materialized through the
-	// virtual pipeline. Other media is fully resolved on demand; trying to
-	// create a virtual placeholder for it would silently desynchronize the
-	// catalog from the actual playable file.
-	if item.Type != "movie" && item.Type != "series" {
-		writeError(w, http.StatusBadRequest, "bad_request", fmt.Sprintf("item type %q is not eligible for virtual materialization", item.Type))
-		return
-	}
-
-	if !catalog.SourceEnablesVirtualPlayback(collection.SourceConfig) {
-		writeError(w, http.StatusBadRequest, "bad_request", catalog.ErrVirtualPlaybackDisabled.Error())
-		return
-	}
-
-	if h.service == nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", "collection service unavailable")
-		return
-	}
-	workCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 2*time.Minute)
-	defer cancel()
-	res, err := h.service.EnsureCollectionItemMaterialized(workCtx, collection, item)
-	if err != nil {
-		if errors.Is(err, catalog.ErrCollectionItemNotMember) {
-			writeError(w, http.StatusNotFound, "not_found", "item is not in this collection")
-			return
-		}
-		if errors.Is(err, catalog.ErrLibraryCollectionNotFound) {
-			writeError(w, http.StatusNotFound, "not_found", "collection not found")
-			return
-		}
-		if errors.Is(err, catalog.ErrIncompatibleLibrary) || errors.Is(err, catalog.ErrVirtualPlaybackDisabled) {
-			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
-			return
-		}
-		if errors.Is(err, catalog.ErrProviderUnavailable) ||
-			strings.Contains(err.Error(), "provider unavailable") ||
-			strings.Contains(err.Error(), "owning provider installation") {
-			writeError(w, http.StatusServiceUnavailable, "provider_unavailable", err.Error())
-			return
-		}
-		slog.ErrorContext(r.Context(), "failed to materialize virtual item", "collection_id", collectionID, "item_id", itemID, "error", err)
-		writeError(w, http.StatusInternalServerError, "internal_error", "failed to materialize virtual item")
-		return
-	}
-
-	// Cached watch responses and resolved lists may have cached a
-	// pre-materialization "no playback target" answer.
-	sections.InvalidateResolvedListCache()
-
-	writeJSON(w, http.StatusOK, map[string]any{
-		"success":               true,
-		"content_id":            res.ContentID,
-		"media_type":            res.MediaType,
-		"files_created":         res.FilesCreated,
-		"files_existing":        res.FilesExisting,
-		"episodes_materialized": res.EpisodesMaterialized,
-		"message":               fmt.Sprintf("Materialized %d virtual files (%d existing) for %s (%s)", res.FilesCreated, res.FilesExisting, res.ContentID, res.MediaType),
-	})
-}
-
-func (h *LibraryCollectionHandler) setListingLogos(ctx context.Context, cards []itemListResponse, items []*models.MediaItem, access catalog.AccessFilter) {
-	urls := signListingLogos(ctx, h.detailSvc, localizedLogoPaths(ctx, h.detailSvc, items, access), access.ImageSizeFor(imagesize.SlotLogo))
-	for i := range cards {
-		cards[i].LogoURL = urls[cards[i].ContentID]
-	}
 }

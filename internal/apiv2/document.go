@@ -132,7 +132,10 @@ func documentDeclaration(op *Operation, input reflect.Type) {
 	}
 	op.Security = []map[string][]string{{securitySchemeBearer: {}}}
 	if resolvesProfile(op.Class) {
-		op.Parameters = append(op.Parameters, profileHeaderFor(op), profileTokenHeaderParam())
+		op.Parameters = append(op.Parameters, profileHeaderFor(op))
+		if op.OperationID != "exportProfile" && op.OperationID != "importProfile" && op.OperationID != "getProfileExportCapability" && !strings.HasPrefix(op.OperationID, "getAdminBackup") && !strings.HasPrefix(op.OperationID, "listAdminBackup") && !strings.HasPrefix(op.OperationID, "previewAdminBackup") && !strings.HasPrefix(op.OperationID, "createAdminBackup") && !strings.HasPrefix(op.OperationID, "completeAdminBackup") && !strings.HasPrefix(op.OperationID, "putAdminBackup") && !strings.HasPrefix(op.OperationID, "deleteAdminBackup") && !strings.HasPrefix(op.OperationID, "startAdminBackup") && !strings.HasPrefix(op.OperationID, "acknowledgeAdminBackup") && !strings.HasSuffix(op.OperationID, "AdminUserProfile") && op.OperationID != "testAdminBackupS3" {
+			op.Parameters = append(op.Parameters, profileTokenHeaderParam())
+		}
 	}
 }
 
@@ -587,6 +590,7 @@ func registerAll(reg *Registry) {
 	registerAdminRequestUsage(reg)
 	registerAdminAccountSettings(reg)
 	registerAdminProfileSections(reg)
+	registerAdminProfiles(reg)
 	registerAdminAccessGroups(reg)
 	registerPreferences(reg)
 	registerHome(reg)
@@ -625,6 +629,8 @@ func registerAll(reg *Registry) {
 	registerAdminDiagnosticDownload(reg)
 	registerAdminJobArtifactDownload(reg)
 	registerAdminJobArtifactCapabilities(reg)
+	registerAdminBackups(reg)
+	registerProfileTransfer(reg)
 	registerAdminDiagnosticReads(reg)
 	registerAdminDiagnosticDelete(reg)
 	registerAdminDashboardInsights(reg)

@@ -3,6 +3,7 @@ package apiv2
 import (
 	"bufio"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -141,9 +142,18 @@ func noteOperationError(ctx context.Context, err error) {
 	if err == nil {
 		return
 	}
-	if o := observationFrom(ctx); o != nil && o.operationError == nil {
-		o.operationError = err
+	o := observationFrom(ctx)
+	if o == nil || o.operationError != nil {
+		return
 	}
+	// A masked 5xx problem carries the failure it hides as an out-of-band
+	// cause; the request log names that instead of the generic envelope. A 4xx
+	// problem is logged by its own safe message, never its cause.
+	if p, ok := errors.AsType[*Problem](err); ok && p.cause != nil && p.Status >= http.StatusInternalServerError {
+		o.operationError = p.cause
+		return
+	}
+	o.operationError = err
 }
 
 // observedClientName is the clamped X-Silo-Client name the observe middleware

@@ -1388,6 +1388,7 @@ func (m *ArtifactManager) buildOpts(file *models.MediaFile, a *Artifact) playbac
 		ToneMapDVRPUPresent:        a.ToneMapDVRPUPresent,
 		AudioTrackIndex:            a.AudioTrackIndex,
 		SourceAudioChannels:        sourceAudioChannels,
+		AudioOnly:                  file.IsAudioOnly(),
 		SubtitleTrackIndex:         -1,
 		PreparedTracks:             preparedTracks,
 		FFmpegPath:                 cfg.Playback.FFmpegPath,

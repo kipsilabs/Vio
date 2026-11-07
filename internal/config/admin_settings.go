@@ -9,6 +9,7 @@ import (
 	"net/mail"
 	"net/url"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -285,6 +286,63 @@ const MarkersDetectionWorkersSettingKey = "markers.detection_workers"
 // takes effect on restart.
 const ServerLANDiscoverySettingKey = "server.lan_discovery"
 
+// Backup settings (docs/architecture/backups.md). internal/backup reads them
+// live at each run, so none needs a restart.
+const (
+	// BackupEnabledSettingKey turns the nightly backup on. "Back up now" works
+	// either way.
+	BackupEnabledSettingKey = "backup.enabled"
+	// BackupTimeSettingKey is the server-local HH:MM the nightly backup starts.
+	BackupTimeSettingKey = "backup.time"
+	// BackupKeepSettingKey is how many nightly and manual backups rotation
+	// keeps, from MinBackupKeep to MaxBackupKeep.
+	BackupKeepSettingKey = "backup.keep"
+	// BackupIncludeIntroFingerprintsSettingKey keeps intro fingerprint data in
+	// the dump. Without it, intro detection analyzes a season again when its
+	// next episode arrives.
+	BackupIncludeIntroFingerprintsSettingKey = "backup.include_intro_fingerprints"
+	// BackupIncludeSubtitlesSettingKey copies downloaded subtitles into the
+	// backup's blobs.
+	BackupIncludeSubtitlesSettingKey = "backup.include_subtitles"
+	// BackupDestinationSettingKey names where backups are written:
+	// BackupDestinationDefault, the operational blob store, or
+	// BackupDestinationS3, the dedicated bucket the backup.s3.* keys name.
+	BackupDestinationSettingKey = "backup.destination"
+	BackupDestinationDefault    = "default"
+	BackupDestinationS3         = "s3"
+	// The dedicated backup bucket. The secret key is encrypted at rest.
+	BackupS3EndpointSettingKey  = "backup.s3.endpoint"
+	BackupS3RegionSettingKey    = "backup.s3.region"
+	BackupS3PathStyleSettingKey = "backup.s3.path_style"
+	BackupS3BucketSettingKey    = "backup.s3.bucket"
+	BackupS3KeyPrefixSettingKey = "backup.s3.key_prefix"
+	BackupS3AccessKeySettingKey = "backup.s3.access_key"
+	BackupS3SecretKeySettingKey = "backup.s3.secret_key"
+	// BackupS3KeyAcknowledgedSettingKey is the SECRET_KEY check value the
+	// admin confirmed keeping a copy of. S3 backups run only while it equals
+	// this server's; only the acknowledge-key endpoint writes it.
+	BackupS3KeyAcknowledgedSettingKey = "backup.s3.key_acknowledged"
+	MinBackupKeep                     = 1
+	MaxBackupKeep                     = 60
+	DefaultBackupTime                 = "04:00"
+	DefaultBackupKeep                 = 7
+)
+
+// ParseBackupTime reads a backup.time value, "H:MM" or "HH:MM" on a 24-hour
+// clock.
+func ParseBackupTime(value string) (hour, minute int, ok bool) {
+	h, m, found := strings.Cut(strings.TrimSpace(value), ":")
+	if !found || len(h) < 1 || len(h) > 2 || len(m) != 2 {
+		return 0, 0, false
+	}
+	hour, errH := strconv.Atoi(h)
+	minute, errM := strconv.Atoi(m)
+	if errH != nil || errM != nil || hour < 0 || hour > 23 || minute < 0 || minute > 59 {
+		return 0, 0, false
+	}
+	return hour, minute, true
+}
+
 // ServerLocalURLSettingKey is the API server's address on the local network,
 // for a deployment whose LAN advertisement cannot reach the network or names
 // the wrong port (Docker bridge networking). Signed-in clients read it from the
@@ -378,15 +436,43 @@ const ServerSettingsMutationLock = "silo:server_settings:mutation"
 //
 //nolint:goconst
 var adminSettingDefaults = map[string]string{
-	"auth.access_token_expiry":  "8h",
-	"auth.refresh_token_expiry": "30d",
-	"server.log_level":          "info",
-	"server.log_quiet":          "",
-	"server.public_url":         "",
-	"branding.server_name":      "Vio",
-	"branding.login_subtitle":   "Sign in with an existing account.",
-	"clientip.trusted_proxies":  "10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8, ::1/128",
-	"theme.catalog_url":         DefaultThemeCatalogURL,
+	"auth.access_token_expiry":                        "8h",
+	"auth.refresh_token_expiry":                       "30d",
+	"server.log_level":                                "info",
+	"server.log_quiet":                                "",
+	"server.public_url":                               "",
+	"virtual_library.enabled":                         "true",
+	"virtual_library.discover_before_playback":        "false",
+	"virtual_library.manifest_url":                    "",
+	"virtual_library.movie_library_id":                "1",
+	"virtual_library.series_library_id":               "2",
+	"virtual_library.tmdb_api_key":                    "",
+	"virtual_library.allow_insecure_http":             "false",
+	"virtual_library.allow_private_streams":           "false",
+	"virtual_library.cache_ttl_minutes":               "10",
+	VirtualLibraryPlaybackProbeCacheMinutesSettingKey: strconv.Itoa(DefaultVirtualLibraryPlaybackProbeCacheMinutes),
+	VirtualLibraryCatalogDiscoveryBudgetMsSettingKey:  strconv.Itoa(DefaultVirtualLibraryCatalogDiscoveryBudgetMs),
+	"virtual_library.candidate_store_hours":           "720",
+	"virtual_library.schedule_refresh_minutes":        "360",
+	"virtual_library.monitor_file":                    ".vio-virtual-library-monitored.json",
+	"virtual_library.enable_quality_profiles":         "false",
+	"virtual_library.quality_preset":                  "custom",
+	"virtual_library.custom_format_preset":            "custom",
+	"virtual_library.single_stream_with_failover":     "true",
+	"virtual_library.fallback_to_any_stream":          "false",
+	"virtual_library.quality_profiles":                "",
+	"virtual_library.custom_formats":                  "",
+	"virtual_library.indexer_rss_url":                 "",
+	"virtual_library.indexer_api_key":                 "",
+	"virtual_library.indexer_rss_check_minutes":       "15",
+	"virtual_library.indexer_search_timeout_seconds":  "20",
+	"virtual_library.altmount_url":                    "",
+	"virtual_library.altmount_api_key":                "",
+	"virtual_library.altmount_check_minutes":          "15",
+	"branding.server_name":                            "Vio",
+	"branding.login_subtitle":                         "Sign in with an existing account.",
+	"clientip.trusted_proxies":                        "10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8, ::1/128",
+	"theme.catalog_url":                               DefaultThemeCatalogURL,
 
 	ServerLANDiscoverySettingKey:              "true",
 	ServerLocalURLSettingKey:                  "",
@@ -430,35 +516,6 @@ var adminSettingDefaults = map[string]string{
 	// Unset until the admin saves the setup wizard's sharing choice; a
 	// migration stored true on servers set up before the wizard saved it.
 	"markers.share_by_default": "",
-
-	"virtual_library.enabled":                         "true",
-	"virtual_library.discover_before_playback":        "false",
-	"virtual_library.manifest_url":                    "",
-	"virtual_library.movie_library_id":                "1",
-	"virtual_library.series_library_id":               "2",
-	"virtual_library.tmdb_api_key":                    "",
-	"virtual_library.allow_insecure_http":             "false",
-	"virtual_library.allow_private_streams":           "false",
-	"virtual_library.cache_ttl_minutes":               "10",
-	VirtualLibraryPlaybackProbeCacheMinutesSettingKey: strconv.Itoa(DefaultVirtualLibraryPlaybackProbeCacheMinutes),
-	VirtualLibraryCatalogDiscoveryBudgetMsSettingKey:  strconv.Itoa(DefaultVirtualLibraryCatalogDiscoveryBudgetMs),
-	"virtual_library.candidate_store_hours":           "720",
-	"virtual_library.schedule_refresh_minutes":        "360",
-	"virtual_library.monitor_file":                    ".vio-virtual-library-monitored.json",
-	"virtual_library.enable_quality_profiles":         "false",
-	"virtual_library.quality_preset":                  "custom",
-	"virtual_library.custom_format_preset":            "custom",
-	"virtual_library.single_stream_with_failover":     "true",
-	"virtual_library.fallback_to_any_stream":          "false",
-	"virtual_library.quality_profiles":                "",
-	"virtual_library.custom_formats":                  "",
-	"virtual_library.indexer_rss_url":                 "",
-	"virtual_library.indexer_api_key":                 "",
-	"virtual_library.indexer_rss_check_minutes":       "15",
-	"virtual_library.indexer_search_timeout_seconds":  "20",
-	"virtual_library.altmount_url":                    "",
-	"virtual_library.altmount_api_key":                "",
-	"virtual_library.altmount_check_minutes":          "15",
 
 	// Background person metadata lookups per API node per minute.
 	MetadataPersonRefreshPerMinuteSettingKey: "120",
@@ -628,6 +685,19 @@ var adminSettingDefaults = map[string]string{
 
 	PlaybackBandwidthProbeAutomaticSettingKey:  "true",
 	PlaybackBandwidthProbeMaxAgeDaysSettingKey: strconv.Itoa(DefaultBandwidthProbeMaxAgeDays),
+
+	BackupEnabledSettingKey:                  "true",
+	BackupTimeSettingKey:                     DefaultBackupTime,
+	BackupKeepSettingKey:                     strconv.Itoa(DefaultBackupKeep),
+	BackupIncludeIntroFingerprintsSettingKey: "false",
+	BackupIncludeSubtitlesSettingKey:         "true",
+	BackupDestinationSettingKey:              BackupDestinationDefault,
+	BackupS3EndpointSettingKey:               "",
+	BackupS3RegionSettingKey:                 "",
+	BackupS3PathStyleSettingKey:              "false",
+	BackupS3BucketSettingKey:                 "",
+	BackupS3KeyPrefixSettingKey:              "",
+	BackupS3AccessKeySettingKey:              "",
 }
 
 var legacyAdminSettingFallbacks = []struct {
@@ -654,6 +724,17 @@ var legacyAdminSettingFallbacks = []struct {
 	{"s3.private_access_key", "s3.operational_access_key"},
 	{"s3.private_secret_key", "s3.operational_secret_key"},
 	{"ai.chat_model", "subtitle_ai.chat_model"},
+}
+
+// AdminSettingDefaultKeys lists every key with an admin default, sorted. The
+// backup restore table must classify each one.
+func AdminSettingDefaultKeys() []string {
+	keys := make([]string, 0, len(adminSettingDefaults))
+	for key := range adminSettingDefaults {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // EffectiveAdminSettings overlays persisted values onto the runtime defaults
@@ -776,8 +857,25 @@ func NormalizeAdminSetting(key, raw string) (string, error) {
 		"virtual_library.enable_quality_profiles",
 		"virtual_library.single_stream_with_failover",
 		"virtual_library.fallback_to_any_stream",
-		AuthLocalPasswordLoginSettingKey, AuthEmailAutoMatchSettingKey, ServerLANDiscoverySettingKey:
+		AuthLocalPasswordLoginSettingKey, AuthEmailAutoMatchSettingKey, ServerLANDiscoverySettingKey,
+		BackupEnabledSettingKey, BackupIncludeIntroFingerprintsSettingKey, BackupIncludeSubtitlesSettingKey,
+		BackupS3PathStyleSettingKey:
 		return normalizeAdminBool(key, value)
+
+	case BackupTimeSettingKey:
+		hour, minute, ok := ParseBackupTime(value)
+		if !ok {
+			return "", fmt.Errorf("%s must be a 24-hour time such as 04:00", key)
+		}
+		return fmt.Sprintf("%02d:%02d", hour, minute), nil
+	case BackupKeepSettingKey:
+		return normalizeAdminInt(key, value, MinBackupKeep, MaxBackupKeep)
+	case BackupDestinationSettingKey:
+		return normalizeAdminEnum(key, value, BackupDestinationDefault, BackupDestinationS3)
+	case BackupS3EndpointSettingKey:
+		return normalizeAdminURL(key, value)
+	case BackupS3KeyPrefixSettingKey:
+		return strings.Trim(value, "/"), nil
 
 	case AuthProviderRecheckIntervalSettingKey:
 		parsed, err := parseDuration(value)
@@ -1270,7 +1368,7 @@ func normalizeProwlarrBaseURL(value string) (string, error) {
 		return "", nil
 	}
 	if len(value) > 4096 {
-		return "", fmt.Errorf("virtual_library.indexer_rss_url exceeds 4096 bytes")
+		return "", errors.New("virtual_library.indexer_rss_url exceeds 4096 bytes")
 	}
 	if !strings.Contains(value, "://") {
 		value = "http://" + value
@@ -1278,7 +1376,7 @@ func normalizeProwlarrBaseURL(value string) (string, error) {
 	value = strings.TrimRight(value, "/")
 	parsed, err := url.Parse(value)
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return "", fmt.Errorf("virtual_library.indexer_rss_url must be a valid http(s) base URL, for example http://prowlarr:9696")
+		return "", errors.New("virtual_library.indexer_rss_url must be a valid http(s) base URL, for example http://prowlarr:9696")
 	}
 	return value, nil
 }

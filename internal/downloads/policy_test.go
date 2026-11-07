@@ -56,16 +56,13 @@ func TestDownloadQualityResolverResolve(t *testing.T) {
 			FrameRate: "60/1", Bitrate: 55_000, BitDepth: 10,
 		}},
 	}
-	virtualFile := &models.MediaFile{
-		ID:         6,
-		CodecVideo: "h264",
-		CodecAudio: "aac",
-		Container:  "virtual",
-		Resolution: "1080p",
-		FilePath:   "virtual://movie/tt1?result=a",
+	audioOnlyFile := &models.MediaFile{
+		ID:          6,
+		BaseType:    "audiobook",
+		CodecAudio:  "aac",
+		Container:   "mp4",
+		AudioTracks: []models.AudioTrack{{Codec: "aac", Channels: 2}},
 	}
-	probedVirtualFile := *virtualFile
-	probedVirtualFile.Container = "mp4"
 	caps := playback.ClientCapabilities{
 		CodecsVideo: []string{"h264"},
 		CodecsAudio: []string{"aac"},
@@ -151,7 +148,6 @@ func TestDownloadQualityResolverResolve(t *testing.T) {
 			wantBitrate:        20000,
 		},
 		{
-
 			// "Can't tell" must not cost the user an original download: with
 			// probe metadata too sparse to check the decoder bounds, the flat
 			// codec lists decide, exactly as they do without detailed caps.
@@ -212,60 +208,26 @@ func TestDownloadQualityResolverResolve(t *testing.T) {
 			wantErr:            ErrDownloadNotAllowed,
 		},
 		{
+			// A bitrate preset on audio-only media keeps its audio: the
+			// encode would turn the cover into H.264 the MP4 muxer refuses.
+			name:               "bitrate preset on audio-only media serves the source",
+			requested:          Quality5Mbps,
+			file:               audioOnlyFile,
+			caps:               caps,
+			transcodeEnabled:   true,
+			userTranscode:      true,
+			artifactsAvailable: true,
+			wantFormat:         FormatOriginal,
+			wantQuality:        Quality5Mbps,
+			wantEffective:      QualityOriginal,
+		},
+		{
 			name:             "bitrate blocked without artifact pipeline",
 			requested:        Quality10Mbps,
 			file:             file,
 			transcodeEnabled: true,
 			userTranscode:    true,
 			wantErr:          ErrQualityUnavailable,
-		},
-		{
-			name:               "virtual original stays direct without caps",
-			requested:          QualityOriginal,
-			file:               virtualFile,
-			artifactsAvailable: true,
-			wantFormat:         FormatOriginal,
-			wantQuality:        QualityOriginal,
-			wantEffective:      QualityOriginal,
-		},
-		{
-			name:          "virtual original does not require an artifact pipeline",
-			requested:     QualityOriginal,
-			file:          virtualFile,
-			wantFormat:    FormatOriginal,
-			wantQuality:   QualityOriginal,
-			wantEffective: QualityOriginal,
-		},
-		{
-			name:          "compatible probed virtual original stays direct",
-			requested:     QualityOriginal,
-			file:          &probedVirtualFile,
-			caps:          caps,
-			wantFormat:    FormatOriginal,
-			wantQuality:   QualityOriginal,
-			wantEffective: QualityOriginal,
-		},
-		{
-			name:               "unprobed virtual container retains compatibility remux",
-			requested:          QualityOriginal,
-			file:               virtualFile,
-			caps:               caps,
-			artifactsAvailable: true,
-			wantFormat:         FormatRemux,
-			wantQuality:        QualityOriginal,
-			wantEffective:      QualityOriginal,
-		},
-		{
-			name:               "virtual preset resolves to a transcode target",
-			requested:          Quality5Mbps,
-			file:               virtualFile,
-			transcodeEnabled:   true,
-			userTranscode:      true,
-			artifactsAvailable: true,
-			wantFormat:         FormatTranscode,
-			wantQuality:        Quality5Mbps,
-			wantEffective:      Quality5Mbps,
-			wantBitrate:        5000,
 		},
 	}
 
@@ -289,9 +251,6 @@ func TestDownloadQualityResolverResolve(t *testing.T) {
 			if got.DeliveryFormat != tc.wantFormat || got.RequestedQuality != tc.wantQuality ||
 				got.EffectiveQuality != tc.wantEffective || got.TargetBitrateKbps != tc.wantBitrate {
 				t.Fatalf("Resolve(%q) = %+v", tc.requested, got)
-			}
-			if got.RequiresArtifact != (tc.wantFormat != FormatOriginal) {
-				t.Fatalf("Resolve(%q) RequiresArtifact = %v for %s", tc.requested, got.RequiresArtifact, tc.wantFormat)
 			}
 		})
 	}

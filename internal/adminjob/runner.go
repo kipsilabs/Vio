@@ -5,10 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
-	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -28,8 +25,6 @@ type ArtifactStore interface {
 	UploadFile(ctx context.Context, bucket, key, path, contentType string) (int64, error)
 	DeleteObject(ctx context.Context, bucket, key string) error
 }
-
-const remoteCatalogImportTimeout = 10 * time.Minute
 
 const (
 	// imageCacheCleanupMaxStalledClaims bounds how long a cleanup keeps
@@ -70,6 +65,7 @@ type Runner struct {
 	storageTransitionCommitted func(context.Context) error
 	virtualRefresh             VirtualCandidatesRefreshExecutor
 	virtualIdentityBackfill    VirtualIdentityBackfillExecutor
+	backupRestore              backupRestoreExecutor
 	realtimeHub                *notifications.Hub
 	imageCacheCleanupSlice     time.Duration
 	pollInterval               time.Duration
@@ -234,6 +230,7 @@ func (r *Runner) runNext() {
 		JobTypeStorageTransition,
 		JobTypeVirtualCandidatesRefresh,
 		JobTypeVirtualIdentityBackfill,
+		JobTypeBackupRestore,
 	})
 	cancel()
 	if err != nil {
@@ -266,6 +263,7 @@ func (r *Runner) runNext() {
 		storageTransitionCommitted: r.storageTransitionCommitted,
 		virtualRefresh:             r.virtualRefresh,
 		virtualIdentityBackfill:    r.virtualIdentityBackfill,
+		backupRestore:              r.backupRestore,
 		realtimeHub:                r.realtimeHub, heartbeatInterval: r.heartbeatInterval, retention: r.retention, cancelRegistry: r.cancelRegistry,
 		storageRestart: r.storageRestart, stop: r.stop,
 	}
@@ -279,6 +277,9 @@ func (r *Runner) runNext() {
 		message := "Library metadata refresh canceled"
 		if job.JobType == JobTypeImageCacheCleanup {
 			message = QueuedImageCacheCleanupCanceledMessage(job.ProgressCurrent, job.ProgressTotal)
+		}
+		if job.JobType == JobTypeBackupRestore {
+			message = "Restore canceled"
 		}
 		if job.JobType == JobTypeStorageTransition {
 			message = "Storage transition canceled; verified copy checkpoints retained"
@@ -328,6 +329,8 @@ func (r *Runner) runNext() {
 		r.executeVirtualCandidatesRefresh(job)
 	case JobTypeVirtualIdentityBackfill:
 		r.executeVirtualIdentityBackfill(job)
+	case JobTypeBackupRestore:
+		r.executeBackupRestore(job)
 	default:
 		r.failJob(job.ID, 0, 0, "Admin job failed", "unsupported admin job type")
 	}
@@ -874,7 +877,7 @@ func (r *Runner) executeLibraryRefresh(job *models.AdminJob) {
 	})
 	if err != nil {
 		if errors.Is(ctx.Err(), context.Canceled) {
-			r.cancelJob(job.ID, current, total, "Library metadata refresh canceled")
+			r.cancelJob(job.ID, current, total, "Library metadata refresh cancelled") //nolint:misspell // Job text shown beside the persisted cancelled status.
 			return
 		}
 		msg := err.Error()
@@ -1111,7 +1114,7 @@ func (r *Runner) executeCatalogImport(job *models.AdminJob) {
 			r.publishJobByID(ctx, notifications.TypeJobProgress, job.ID)
 		}
 		var err error
-		data, err = downloadRemoteCatalogSeed(ctx, req.RemoteURL)
+		data, err = catalogseed.DownloadRemoteBundle(ctx, req.RemoteURL)
 		if err != nil {
 			r.failJob(job.ID, 0, 0, "Catalog import failed", err.Error())
 			return
@@ -1177,44 +1180,6 @@ func (r *Runner) executeCatalogImport(job *models.AdminJob) {
 		return
 	}
 	r.publishJobByID(completeCtx, notifications.TypeJobCompleted, job.ID)
-}
-
-func downloadRemoteCatalogSeed(ctx context.Context, remoteURL string) ([]byte, error) {
-	parsed, err := url.Parse(remoteURL)
-	if err != nil {
-		return nil, fmt.Errorf("invalid remote URL: %w", err)
-	}
-	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return nil, fmt.Errorf("invalid remote URL scheme")
-	}
-	if !strings.HasSuffix(strings.ToLower(parsed.Path), ".json.gz") {
-		return nil, fmt.Errorf("remote URL must point to a .json.gz file")
-	}
-
-	reqCtx, cancel := context.WithTimeout(ctx, remoteCatalogImportTimeout)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, remoteURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("building remote import request: %w", err)
-	}
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("downloading remote catalog seed: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("downloading remote catalog seed: unexpected status %d", resp.StatusCode)
-	}
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("reading remote catalog seed: %w", err)
-	}
-
-	return data, nil
 }
 
 func (r *Runner) executeItemRefresh(job *models.AdminJob) {
@@ -1615,7 +1580,7 @@ func (r *Runner) cancelJob(id string, current, total int, message string) {
 	}
 	job, err := r.repo.Cancel(ctx, id, message, time.Now().UTC().Add(r.retention))
 	if err != nil {
-		slog.Warn("admin jobs: failed to mark job canceled", "job_id", id, "error", err)
+		slog.Warn("admin jobs: failed to mark job cancelled", "job_id", id, "error", err) //nolint:misspell // The status it writes is "cancelled".
 		return
 	}
 	if r.observation != nil {

@@ -504,6 +504,7 @@ const (
 	TransformationVideoToHEVCV3     = "video_to_hevc"
 	TransformationVideoToAV1V3      = "video_to_av1"
 	TransformationServerDV7HDR10V3  = "server_dv7_to_hdr10"
+	TransformationServerDV7DV81V3   = "server_dv7_to_dv81"
 	TransformationHDRToSDRToneMapV3 = "hdr_to_sdr_tonemap"
 
 	TransformationVideoToH264RecipeVersionV3     = "2"
@@ -515,6 +516,9 @@ const (
 	// enhancement-layer NAL units (see DV7ToHDR10BitstreamFilter), so an
 	// executor still on version 1 cannot claim the corrected output.
 	TransformationServerDV7HDR10RecipeVersionV3 = "2"
+	// TransformationServerDV7DV81RecipeVersionV3 names the bytes dovirpu
+	// writes; bump it whenever the converted RPUs or segments change.
+	TransformationServerDV7DV81RecipeVersionV3 = "1"
 )
 
 // Target video codecs a server HLS transcode may emit. H.264 is the floor:
@@ -545,6 +549,7 @@ const (
 	ClaimDolbyVisionMetadataRemovedV3 = "dolby_vision_metadata_removed"
 	ClaimHDR10BaseLayerPreservedV3    = "hdr10_base_layer_preserved"
 	ClaimEnhancementLayerDiscardedV3  = "enhancement_layer_discarded"
+	ClaimProfile7RPUToProfile81V3     = "profile7_rpu_converted_to_profile81"
 	ClaimHDRMetadataRemovedV3         = "hdr_metadata_removed"
 	ClaimSDRBT709OutputV3             = "sdr_bt709_output"
 )
@@ -553,6 +558,12 @@ const (
 // asserts. A fresh slice keeps callers from mutating the shared contract.
 func DV7ToHDR10ClaimsV3() []string {
 	return []string{ClaimDolbyVisionMetadataRemovedV3, ClaimHDR10BaseLayerPreservedV3, ClaimEnhancementLayerDiscardedV3}
+}
+
+// DV7ToDV81ClaimsV3 returns the claims the server DV7→DV8.1 transformation
+// asserts, the same ones the client-side conversion makes.
+func DV7ToDV81ClaimsV3() []string {
+	return []string{ClaimProfile7RPUToProfile81V3, ClaimHDR10BaseLayerPreservedV3, ClaimEnhancementLayerDiscardedV3}
 }
 
 // Terminal reasons reported when a required conversion toolchain is absent.
@@ -1792,6 +1803,9 @@ func (r *ReplanRequestV3) Validate() error {
 	if err := validateCapabilitiesStructureV3(&r.Capabilities, &r.ClientPlaybackContext, r.ClientFeatures); err != nil {
 		return err
 	}
+	r.ClientPlaybackContext.AppVersion = normalizeClientMetadataValue(r.ClientPlaybackContext.AppVersion, 64)
+	r.ClientPlaybackContext.AppBuild = normalizeClientMetadataValue(r.ClientPlaybackContext.AppBuild, 64)
+	r.ClientPlaybackContext.AppChannel = normalizeClientMetadataValue(r.ClientPlaybackContext.AppChannel, 32)
 	return nil
 }
 
@@ -2183,7 +2197,9 @@ func validateHDRCapabilitiesV3(hdr *HDRCapabilitiesV3) error {
 	}
 	seenProfiles := make(map[int]struct{}, len(hdr.DolbyVisionProfileLevels))
 	for _, capability := range hdr.DolbyVisionProfileLevels {
-		if capability.Profile <= 0 || capability.MaxLevel < 1 || capability.MaxLevel > 13 {
+		// Profile 0 (dvav.per) is a real, if legacy, profile; MediaTek TV
+		// decoders list it alongside the modern ones.
+		if capability.Profile < 0 || capability.MaxLevel < 1 || capability.MaxLevel > 13 {
 			return errors.New("invalid dolby vision profile level capability")
 		}
 		if _, exists := seenProfiles[capability.Profile]; exists {

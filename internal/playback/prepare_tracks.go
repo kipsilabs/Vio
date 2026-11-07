@@ -206,7 +206,9 @@ func PreparedSubtitleSidecarFormat(codec string) string {
 // title (MP4 handler name), and disposition are written explicitly.
 func appendPreparedTrackArgs(args []string, opts TranscodeOpts) []string {
 	plan := opts.PreparedTracks
-	args = append(args, "-map", "0:v:0")
+	if !opts.AudioOnly {
+		args = append(args, "-map", "0:v:0")
+	}
 	for _, track := range plan.Audio {
 		args = append(args, "-map", fmt.Sprintf("0:a:%d", track.SourceIndex))
 	}

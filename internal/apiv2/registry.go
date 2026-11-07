@@ -309,6 +309,12 @@ func Register[I, O any](reg *Registry, op Operation, handler func(context.Contex
 			return audited(auditmutation.WithDomainAudit(ctx), in)
 		}
 	}
+	wrapped := handler
+	handler = func(ctx context.Context, in *I) (*O, error) {
+		out, err := wrapped(ctx, in)
+		noteOperationError(ctx, err)
+		return out, err
+	}
 	var in I
 	if err := checkInput(reflect.TypeOf(in)); err != nil {
 		panic(fmt.Sprintf("apiv2: %s: %v", op.OperationID, err))

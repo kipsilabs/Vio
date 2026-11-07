@@ -25,6 +25,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/fspath"
 	"github.com/Silo-Server/silo-server/internal/mediaprobe"
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/playback/dovirpu"
 	"github.com/Silo-Server/silo-server/internal/processmetrics"
 	"github.com/Silo-Server/silo-server/internal/procgroup"
 	"github.com/Silo-Server/silo-server/internal/tonemap"
@@ -42,6 +43,7 @@ func init() {
 
 // TranscodeOpts holds configuration for an HLS transcode session.
 type TranscodeOpts struct {
+	AudioOnly bool
 	// InputPath is the concrete source opened by FFmpeg for this process.
 	InputPath string
 	// MediaFileID identifies the catalog row behind InputPath. It is runtime
@@ -74,9 +76,11 @@ type TranscodeOpts struct {
 	// mechanism. A copy target never invokes it. Runtime-only: no-op when nil.
 	OnSourceRejected func(ctx context.Context, mediaFileID int, canonicalPath string) error
 	OutputDir        string // e.g., /tmp/silo-transcode/{session_id}/
-	// subtitleFilterInputPath is a parser-safe local alias used only by the
-	// libass subtitles filter. FFmpeg still opens InputPath as the media input.
+	// subtitleFilterInputPath is the libass subtitles filter input: the staged
+	// subtitle track, or a parser-safe local alias of the media file.
 	subtitleFilterInputPath string
+	// subtitleFilterFontsDir holds attached fonts for a staged subtitle track.
+	subtitleFilterFontsDir string
 	// OutputSubdir is the signed, root-relative reconstruction directory. Empty
 	// retains the legacy flat {session_id} layout.
 	OutputSubdir         string
@@ -330,6 +334,9 @@ type TranscodeSession struct {
 	copyTimeline         observedCopyTimeline
 	segmentGeneration    uint64
 	segmentIncarnation   string
+	dv81Mu               sync.Mutex
+	dv81Converted        map[string]uint64
+	dv81Track            dovirpu.Track
 	// restartStartSegment is the absolute HLS segment number the most recent
 	// in-place restart began producing at. Zero means no restart has happened
 	// (or the restart cut from zero, as a planned copy stream does), so segment
@@ -734,7 +741,7 @@ func StartTranscode(ctx context.Context, opts TranscodeOpts) (*TranscodeSession,
 		releaseHWDevice()
 		return nil, fmt.Errorf("create output dir: %w", err)
 	}
-	if err := prepareSubtitleFilterInput(&opts); err != nil {
+	if err := prepareSubtitleFilterInput(ctx, &opts); err != nil {
 		releaseHWDevice()
 		return nil, err
 	}
@@ -1425,7 +1432,9 @@ func burnInPeakCapArgs(opts TranscodeOpts) []string {
 // mapping both would emit two video streams into the HLS mux.
 func appendStreamSelectionArgs(args []string, opts TranscodeOpts) []string {
 	audioTrackIndex := opts.AudioTrackIndex
-	if bitmapBurnInActive(opts) {
+	if opts.AudioOnly {
+		// Audio-only prepared media has no video stream to map.
+	} else if bitmapBurnInActive(opts) {
 		args = append(args, "-map", "[vout]")
 	} else {
 		args = append(args, "-map", "0:v:0")
@@ -2616,20 +2625,47 @@ const subtitleFilterAliasName = "subtitle-source.media"
 // by the filtergraph parser even after it was escaped for the subtitles filter.
 // A stable alias in the session directory keeps the media input unchanged and
 // is retained for seek restarts with the rest of TranscodeOpts.
-func prepareSubtitleFilterInput(opts *TranscodeOpts) error {
+// textSubtitleFilter is the libass subtitles filter of a text burn-in: the
+// staged track, the only stream of its file, with its fonts, or else the
+// track's index in the media file.
+func textSubtitleFilter(opts TranscodeOpts) string {
+	if opts.subtitleFilterFontsDir != "" {
+		return fmt.Sprintf("subtitles=filename='%s':fontsdir='%s'",
+			escapeFilterPath(opts.subtitleFilterInputPath), escapeFilterPath(opts.subtitleFilterFontsDir))
+	}
+	subtitleInputPath := opts.InputPath
+	if opts.subtitleFilterInputPath != "" {
+		subtitleInputPath = opts.subtitleFilterInputPath
+	}
+	return fmt.Sprintf("subtitles=filename='%s':si=%d", escapeFilterPath(subtitleInputPath), opts.SubtitleTrackIndex)
+}
+
+// prepareSubtitleFilterInput gives the libass subtitles filter of a text
+// burn-in its input. It stages the track on its own first
+// (stageBurnInSubtitle), because given the media file libass reads all of it
+// before the first frame. When the track can't be staged, the filter reads
+// the media file through a stable alias in the session directory, which
+// avoids passing the library filename through FFmpeg's nested filter
+// parsers: an apostrophe can be consumed by the filtergraph parser even after
+// it was escaped for the subtitles filter. Both are retained for seek
+// restarts with the rest of TranscodeOpts.
+func prepareSubtitleFilterInput(ctx context.Context, opts *TranscodeOpts) error {
 	if !opts.SubtitleBurnIn || opts.SubtitleTrackIndex < 0 || NeedsBurnIn(opts.SubtitleCodec) {
 		return nil
 	}
 
-	lowerInput := strings.ToLower(strings.TrimSpace(opts.InputPath))
-	if strings.HasPrefix(lowerInput, "http://") || strings.HasPrefix(lowerInput, "https://") {
-		// When InputPath is an HTTP/HTTPS stream URL (e.g. virtual stream playback),
-		// creating a local symlink pointing to an HTTP URL string causes libass / POSIX
-		// file I/O in FFmpeg's subtitles= filter to fail with exit status 254.
-		// Set subtitleFilterInputPath directly to opts.InputPath.
-		opts.subtitleFilterInputPath = opts.InputPath
+	staged, err := stageBurnInSubtitle(ctx, *opts)
+	if err == nil {
+		opts.subtitleFilterInputPath = staged.trackPath
+		opts.subtitleFilterFontsDir = staged.fontsDir
 		return nil
 	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	slog.InfoContext(ctx, "burn-in subtitle not staged; libass reads the media file",
+		"component", "playback", "playback_session_id", opts.SessionID, "subtitle_track", opts.SubtitleTrackIndex, "error", err)
+	opts.subtitleFilterFontsDir = ""
 
 	aliasPath := filepath.Join(opts.OutputDir, subtitleFilterAliasName)
 	// InputPath is fspath-encoded; the link must point at the real file name.
@@ -3946,8 +3982,23 @@ func (l *SegmentLease) Close() error {
 // subtitle filter alias points at the source media and must never be served as
 // a segment.
 func (s *TranscodeSession) OpenSegment(name string) (*SegmentLease, error) {
+	lease, dv81, sessionID, err := s.openSegment(name)
+	if err != nil || !dv81 {
+		return lease, err
+	}
+	if err := s.convertDV81(name, lease, sessionID); err != nil {
+		_ = lease.Close()
+		return nil, err
+	}
+	return lease, nil
+}
+
+// openSegment is OpenSegment under s.mu. dv81 reports a
+// DV7ToDV81BitstreamFilter session, whose file OpenSegment converts next;
+// sessionID is read here because a restart replaces s.opts under s.mu.
+func (s *TranscodeSession) openSegment(name string) (lease *SegmentLease, dv81 bool, sessionID string, err error) {
 	if !servableSegmentName(name) {
-		return nil, ErrSegmentNotFound
+		return nil, false, "", ErrSegmentNotFound
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -3957,34 +4008,41 @@ func (s *TranscodeSession) OpenSegment(name string) (*SegmentLease, error) {
 	// the client trying.
 	s.segmentRequested = true
 	if s.restarting != nil {
-		return nil, ErrSegmentNotFound
+		return nil, false, "", ErrSegmentNotFound
 	}
 
 	root, err := os.OpenRoot(s.outputDir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, ErrSegmentNotFound
+			return nil, false, "", ErrSegmentNotFound
 		}
-		return nil, fmt.Errorf("open segment directory: %w", err)
+		return nil, false, "", fmt.Errorf("open segment directory: %w", err)
 	}
 	// Files opened through a Root hold their own descriptor and stay valid
 	// after the Root closes.
 	defer func() { _ = root.Close() }()
-	segment, err := root.Open(name)
+	// A DV7ToDV81BitstreamFilter session rewrites the leased file itself, so
+	// a restart that replaces the name meanwhile cannot split what is
+	// converted from what is served.
+	flag := os.O_RDONLY
+	if s.opts.VideoBitstreamFilter == DV7ToDV81BitstreamFilter {
+		flag = os.O_RDWR
+	}
+	segment, err := root.OpenFile(name, flag, 0)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, ErrSegmentNotFound
+			return nil, false, "", ErrSegmentNotFound
 		}
-		return nil, fmt.Errorf("open segment: %w", err)
+		return nil, false, "", fmt.Errorf("open segment: %w", err)
 	}
 	info, err := segment.Stat()
 	if err != nil {
 		_ = segment.Close()
-		return nil, fmt.Errorf("stat segment: %w", err)
+		return nil, false, "", fmt.Errorf("stat segment: %w", err)
 	}
 	if !info.Mode().IsRegular() || info.Size() <= 0 {
 		_ = segment.Close()
-		return nil, ErrSegmentNotFound
+		return nil, false, "", ErrSegmentNotFound
 	}
 	if s.segmentIncarnation == "" {
 		s.segmentIncarnation = uuid.NewString()
@@ -3994,7 +4052,79 @@ func (s *TranscodeSession) OpenSegment(name string) (*SegmentLease, error) {
 		Info:            info,
 		Generation:      s.segmentGeneration,
 		GenerationToken: s.segmentGenerationTokenLocked(),
-	}, nil
+	}, s.opts.VideoBitstreamFilter == DV7ToDV81BitstreamFilter, s.opts.SessionID, nil
+}
+
+// convertDV81 rewrites a served file of a DV7ToDV81BitstreamFilter session
+// in place before it is handed out: init.mp4's DOVI record, or a media
+// segment's RPUs. dv81Mu serializes it, so no request sees a file mid-rewrite,
+// without holding s.mu over the file I/O. It fails closed: a segment it cannot
+// convert is not served under the plan's Dolby Vision 8.1 claim, so the client
+// replans onto the next recipe. An init.mp4 that does not parse yet reads as
+// not ready, like an empty one; one that parses but cannot carry 8.1 fails.
+func (s *TranscodeSession) convertDV81(name string, lease *SegmentLease, sessionID string) error {
+	s.dv81Mu.Lock()
+	defer s.dv81Mu.Unlock()
+	if name != hlsInitSegmentName && (!strings.HasSuffix(name, ".m4s") || s.dv81Converted[name] == lease.Generation+1) {
+		return nil
+	}
+	// init.mp4 is converted only through its own lease. A media segment needs
+	// just its track id and NAL length size: from the init already served, or
+	// else read from the current init.mp4 without writing to it, which FFmpeg
+	// may be rewriting after a restart.
+	track := s.dv81Track
+	if name == hlsInitSegmentName || track.NALLength == 0 {
+		initTrack, err := s.dv81InitTrack(name, lease)
+		switch {
+		case errors.Is(err, dovirpu.ErrUnsupportedInit):
+			slog.Error("playback: dolby vision 8.1 init segment cannot be converted", "session", sessionID, "error", err)
+			return fmt.Errorf("convert init segment to dolby vision 8.1: %w", err)
+		case err != nil:
+			slog.Warn("playback: dolby vision 8.1 init segment not convertible yet", "session", sessionID, "error", err)
+			return ErrSegmentNotFound
+		}
+		track, s.dv81Track = initTrack, initTrack
+	}
+	if name == hlsInitSegmentName {
+		return nil
+	}
+	// A segment that cannot be converted, including one where no RPU
+	// converted (dovirpu.ErrNoRPUConverted), is left unchanged and fails
+	// every request.
+	stats, err := dovirpu.ConvertSegmentFile(lease.File, track)
+	if err != nil {
+		slog.Error("playback: dolby vision 8.1 segment conversion failed", "session", sessionID, "segment", name, "error", err)
+		return fmt.Errorf("convert segment to dolby vision 8.1: %w", err)
+	}
+	if stats.Dropped > 0 {
+		slog.Warn("playback: dolby vision 8.1 RPUs left as HDR10", "session", sessionID, "segment", name,
+			"dropped", stats.Dropped, "converted", stats.Converted)
+	}
+	if s.dv81Converted == nil {
+		s.dv81Converted = make(map[string]uint64)
+	}
+	// Stored as generation+1 so the zero value means "never converted".
+	s.dv81Converted[name] = lease.Generation + 1
+	return nil
+}
+
+// dv81InitTrack converts the leased init.mp4 in place and returns its video
+// track. For a media segment it reads the current init.mp4 read-only.
+func (s *TranscodeSession) dv81InitTrack(name string, lease *SegmentLease) (dovirpu.Track, error) {
+	if name == hlsInitSegmentName {
+		return dovirpu.ConvertInitFile(lease.File)
+	}
+	root, err := os.OpenRoot(s.outputDir)
+	if err != nil {
+		return dovirpu.Track{}, err
+	}
+	defer func() { _ = root.Close() }()
+	f, err := root.Open(hlsInitSegmentName)
+	if err != nil {
+		return dovirpu.Track{}, err
+	}
+	defer func() { _ = f.Close() }()
+	return dovirpu.InitTrack(f)
 }
 
 // servableSegmentName reports whether name is a plain file name the segment
@@ -6689,3 +6819,5 @@ func syntheticManifestQuery(segmentCount int, rawQuery string) (definition, suff
 
 // SegmentLease binds an opened segment descriptor to the FFmpeg generation it
 // came from. Keeping the descriptor open makes it a filesystem-backed lease: a
+
+const DV7ToDV81BitstreamFilter = "filter_units=remove_types=63"

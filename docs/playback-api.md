@@ -443,6 +443,14 @@ The completed job result carries the retained `indexer_releases` list in the
 same wire shape the watch detail uses. The synchronous behavior this endpoint
 previously had is gone; there is no second endpoint.
 
+## Watch library context
+
+On `GET /api/v2/watch/{id}`, `library_id` accepts an episode when either the
+episode or its series belongs to that library. The series must still pass the
+viewer's access checks. The response includes every file the viewer may access,
+even if the selected library has none of that episode's files;
+`catalog.scope_versions_to_library` does not narrow watch responses.
+
 ## Watch artwork
 
 `GET /api/v2/watch/{id}` includes optional `poster_url`, `poster_thumbhash`,

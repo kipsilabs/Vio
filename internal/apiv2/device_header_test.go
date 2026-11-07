@@ -28,7 +28,7 @@ func TestDeviceHeaderGuardRefusesRepeatedAndMalformedValues(t *testing.T) {
 		r.Header.Set("Authorization", "Bearer "+memberToken)
 		r.Header.Set("X-Profile-Id", "p-owner")
 		for _, line := range lines {
-			r.Header.Add("X-Vio-Device-Id", line)
+			r.Header.Add("X-Silo-Device-Id", line)
 		}
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, r)
@@ -76,27 +76,6 @@ func TestDeviceHeaderGuardRefusesRepeatedAndMalformedValues(t *testing.T) {
 	}
 }
 
-// The legacy X-Silo-Device-Id spelling is accepted on ingest (see
-// rejectMalformedDeviceHeader): a request carrying only the legacy spelling
-// has it promoted to X-Vio-Device-Id before the operation binds it.
-func TestDeviceHeaderGuardPromotesLegacySpelling(t *testing.T) {
-	svc := &fakeDownloadCreation{row: &downloads.Download{ID: "entry", ContentID: "movie", MediaFileID: 42, Revision: 1, CreatedAt: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)}}
-	deps := pilotDeps(nil, nil)
-	deps.DownloadCreation = svc
-	h := newTestHandler(t, deps)
-	body := `{"content_id":"movie","media_file_id":"42","expected_revision":0}`
-	r := httptest.NewRequest(http.MethodPost, Prefix+"/downloads", strings.NewReader(body))
-	r.Header.Set("Content-Type", "application/json")
-	r.Header.Set("Authorization", "Bearer "+memberToken)
-	r.Header.Set("X-Profile-Id", "p-owner")
-	r.Header.Set("X-Silo-Device-Id", "legacy-tv-1")
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, r)
-	if rec.Code != http.StatusAccepted || svc.req.DeviceID != "legacy-tv-1" {
-		t.Fatalf("legacy header: %d %s %q", rec.Code, rec.Body.String(), svc.req.DeviceID)
-	}
-}
-
 // The guard runs for every v2 operation, including ones that never bind the
 // header, and its refusal is a problem document with the request id.
 func TestDeviceHeaderGuardCoversEveryOperation(t *testing.T) {
@@ -105,8 +84,8 @@ func TestDeviceHeaderGuardCoversEveryOperation(t *testing.T) {
 		r := httptest.NewRequest(http.MethodGet, path, nil)
 		r.Header.Set("Authorization", "Bearer "+memberToken)
 		r.Header.Set("X-Profile-Id", "p-owner")
-		r.Header.Add("X-Vio-Device-Id", "one")
-		r.Header.Add("X-Vio-Device-Id", "two")
+		r.Header.Add("X-Silo-Device-Id", "one")
+		r.Header.Add("X-Silo-Device-Id", "two")
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, r)
 		requireProblem(t, rec, TypeValidationFailed)
@@ -116,28 +95,37 @@ func TestDeviceHeaderGuardCoversEveryOperation(t *testing.T) {
 	}
 }
 
-// The legacy X-Silo-Client-Family spelling is promoted to X-Vio-Client-Family
-// before binding, like the legacy device header. Canonical wins when both are
-// present; an invalid legacy value is left for the operation's own enum
-// validation.
-func TestClientFamilyHeaderPromotesLegacySpelling(t *testing.T) {
-	promote := func(headers map[string]string) string {
-		rr := httptest.NewRequest(http.MethodGet, Prefix+"/system/info", nil)
-		for k, v := range headers {
-			rr.Header.Set(k, v)
+// Every operation that records X-Silo-Device-* on the login session it opens
+// declares the headers, so an over-long device id is the declared
+// out_of_range refusal there, as on the settings operations, rather than a
+// sign-in that silently records no device id.
+func TestSignInOperationsBoundDeviceID(t *testing.T) {
+	h := newTestHandler(t, pilotDeps(nil, nil))
+	for _, path := range []string{
+		"/auth/login",
+		"/auth/network/5/sign-in",
+		"/auth/oauth/complete",
+		"/auth/setup",
+		"/auth/signup",
+		"/invitations/tok/accept",
+		"/password-resets/tok/complete",
+		"/auth/device/poll",
+	} {
+		p := requireProblem(t, do(t, h, http.MethodPost, Prefix+path, `{}`, map[string]string{"X-Silo-Device-Id": strings.Repeat("x", 129)}), TypeValidationFailed)
+		found := false
+		for _, e := range p.Errors {
+			found = found || strings.EqualFold(e.Location, "header.X-Silo-Device-Id") && e.Code == "out_of_range"
 		}
-		rejectMalformedDeviceHeader(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-			w.Header().Set("X-Promoted-Family", req.Header.Get(clientFamilyHeader))
-		})).ServeHTTP(httptest.NewRecorder(), rr)
-		return rr.Header.Get(clientFamilyHeader)
+		if !found {
+			t.Fatalf("%s: over-long device id not refused: %+v", path, p.Errors)
+		}
 	}
-	if got := promote(map[string]string{"X-Silo-Client-Family": "tv"}); got != "tv" {
-		t.Fatalf("legacy-only not promoted: %q", got)
-	}
-	if got := promote(map[string]string{"X-Vio-Client-Family": "mobile", "X-Silo-Client-Family": "tv"}); got != "mobile" {
-		t.Fatalf("canonical must win: %q", got)
-	}
-	if got := promote(map[string]string{"X-Silo-Client-Family": "not-a-family"}); got != "not-a-family" {
-		t.Fatalf("invalid legacy must pass through to operation validation: %q", got)
+	// A 128-character id is still recorded on the session.
+	deps := pilotDeps(nil, nil)
+	sessions := deps.Sessions.(*fakeSessionService)
+	id := strings.Repeat("a", 128)
+	rec := do(t, newTestHandler(t, deps), http.MethodPost, Prefix+"/auth/login", `{"username":"laura","password":"pw"}`, map[string]string{"X-Silo-Device-Id": id, "X-Silo-Device-Name": strings.Repeat("n", 200)})
+	if rec.Code != http.StatusOK || sessions.lastLoginDevice.ID != id || len(sessions.lastLoginDevice.Name) != 120 {
+		t.Fatalf("%d %s %+v", rec.Code, rec.Body.String(), sessions.lastLoginDevice)
 	}
 }

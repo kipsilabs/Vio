@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -37,6 +36,7 @@ var (
 	TypeProviderAlreadyEnabled  = ProblemType{"provider_already_enabled", http.StatusConflict, "Provider already enabled"}
 	TypeBreakGlassRequired      = ProblemType{"break_glass_required", http.StatusConflict, "Break-glass account required"}
 	TypeLastSignInMethod        = ProblemType{"last_sign_in_method", http.StatusConflict, "Last sign-in method"}
+	TypeProviderUnavailable     = ProblemType{"provider_unavailable", http.StatusServiceUnavailable, "Provider unavailable"}
 	// Directory linking (linkAccountIdentityWithCredentials) refusals.
 	TypeAccountDisabled       = ProblemType{"account_disabled", http.StatusForbidden, "Account disabled"}
 	TypeLocalPasswordRequired = ProblemType{"local_password_required", http.StatusConflict, "Local password required"}
@@ -54,6 +54,21 @@ var (
 // from the server. The client keeps its copy and calls prepareDownloadAgain
 // before fetching the file again.
 var TypePreparedFileExpired = ProblemType{"prepared_file_expired", http.StatusConflict, "Prepared file expired"}
+
+// TypeDeviceBindingMismatch: a poll of a device sign-in request started with
+// a session binding did not carry the secret the binding was made from
+// (docs/architecture/device-login.md, "Session binding").
+var TypeDeviceBindingMismatch = ProblemType{"device_binding_mismatch", http.StatusForbidden, "Device binding mismatch"}
+
+// TypeRestoreSetChanged: a restore request carries a digest the backup's
+// restore set no longer has; preview the backup again.
+var TypeRestoreSetChanged = ProblemType{"restore_set_changed", http.StatusConflict, "Restore set changed"}
+
+// TypeBackupUnauthenticated: this server cannot authenticate the backup's
+// manifest (another SECRET_KEY, or a build that did not record what checking
+// it needs), so it reads the backup only with the admin's confirmation
+// (accept_unauthenticated).
+var TypeBackupUnauthenticated = ProblemType{"backup_unauthenticated", http.StatusConflict, "Backup not authenticated"}
 
 // ProblemType is one entry of the shared problem catalog.
 type ProblemType struct {
@@ -109,28 +124,16 @@ var (
 	TypeInternalError                                 = ProblemType{"internal_error", http.StatusInternalServerError, "Internal error"}
 	TypeCapabilityUnsupported                         = ProblemType{"capability_unsupported", http.StatusNotImplemented, "Capability unsupported"}
 	TypeDependencyUnavailable                         = ProblemType{"dependency_unavailable", http.StatusServiceUnavailable, "Dependency unavailable"}
-	TypeProviderUnavailable                           = ProblemType{"provider_unavailable", http.StatusServiceUnavailable, "Provider unavailable"} // transient upstream provider outage; retry
 	TypeClientUpgradeRequired                         = ProblemType{"client_upgrade_required", http.StatusGone, "Client upgrade required"}
-	catalog                                           = []ProblemType{TypeRangeNotSatisfiable, TypeDeviceLoginExpired, TypeUnsupportedSource, TypeMalformedRequest, TypeInvalidCursor, TypeAuthenticationRequired, TypeInvalidToken, TypeSessionExpired, TypePermissionDenied, TypeProfileVerificationRequired, TypePushInstallationKeyMismatch, TypeNotFound, TypeMethodNotAllowed, TypeNotAcceptable, TypeRequestTimeout, TypeConflict, TypeIdempotencyConflict, TypeJobNotCancelable, TypeCapabilityDisabled, TypeCapabilityNotConfigured, TypePreconditionFailed, TypePayloadTooLarge, TypeUnsupportedMediaType, TypeValidationFailed, TypePreconditionRequired, TypeRateLimited, TypeInternalError, TypeCapabilityUnsupported, TypeDependencyUnavailable, TypeClientUpgradeRequired, TypeSyncResetRequired, TypeSnapshotRequestConflict, TypeProgressSnapshotTooLarge, TypePlaybackInstallationChanged, TypePlaybackSessionEnded, TypePlaybackProgressConflict, TypePasswordChangeRequired, TypeNotPermitted, TypeAccountRequired, TypeLocalLoginDisabled, TypeProviderPasswordExpired, TypeEmailInUse, TypeIdentityLinkedElsewhere, TypeProviderAlreadyEnabled, TypeBreakGlassRequired, TypeLastSignInMethod, TypeProviderUnavailable, TypeInvalidGrant, TypeAccountDisabled, TypeLocalPasswordRequired, TypeAlreadyLinked, TypeTokenRefreshRequired, TypeNetworkIdentityRequired, TypePreparedFileExpired, TypeFileUnavailable, TypeFileAccessDenied, TypeFormatUnavailable}
+	TypeFileUnavailable                               = ProblemType{"file_unavailable", http.StatusNotFound, "File unavailable"}
+	TypeFileAccessDenied                              = ProblemType{"file_access_denied", http.StatusForbidden, "File access denied"}
+	TypeFormatUnavailable                             = ProblemType{"format_unavailable", http.StatusNotAcceptable, "Format unavailable"}
+	catalog                                           = []ProblemType{TypeRangeNotSatisfiable, TypeDeviceLoginExpired, TypeUnsupportedSource, TypeMalformedRequest, TypeInvalidCursor, TypeAuthenticationRequired, TypeInvalidToken, TypeSessionExpired, TypePermissionDenied, TypeProfileVerificationRequired, TypePushInstallationKeyMismatch, TypeNotFound, TypeMethodNotAllowed, TypeNotAcceptable, TypeRequestTimeout, TypeConflict, TypeIdempotencyConflict, TypeJobNotCancelable, TypeCapabilityDisabled, TypeCapabilityNotConfigured, TypePreconditionFailed, TypePayloadTooLarge, TypeUnsupportedMediaType, TypeValidationFailed, TypePreconditionRequired, TypeRateLimited, TypeInternalError, TypeCapabilityUnsupported, TypeDependencyUnavailable, TypeClientUpgradeRequired, TypeSyncResetRequired, TypeSnapshotRequestConflict, TypeProgressSnapshotTooLarge, TypePlaybackInstallationChanged, TypePlaybackSessionEnded, TypePlaybackProgressConflict, TypePasswordChangeRequired, TypeNotPermitted, TypeAccountRequired, TypeLocalLoginDisabled, TypeProviderPasswordExpired, TypeEmailInUse, TypeIdentityLinkedElsewhere, TypeProviderAlreadyEnabled, TypeBreakGlassRequired, TypeLastSignInMethod, TypeProviderUnavailable, TypeInvalidGrant, TypeAccountDisabled, TypeLocalPasswordRequired, TypeAlreadyLinked, TypeTokenRefreshRequired, TypeNetworkIdentityRequired, TypePreparedFileExpired, TypeDeviceBindingMismatch, TypeRestoreSetChanged, TypeBackupUnauthenticated, TypeUploadLimitReached}
 	defaultTypeByStatus                               = map[int]ProblemType{}
 	problemContentType                                = "application/problem+json"
 	_                               error             = (*Problem)(nil)
 	_                               huma.StatusError  = (*Problem)(nil)
 	_                               huma.HeadersError = (*Problem)(nil)
-)
-
-// Direct-download resolve refusals. file_unavailable is a stale or unknown
-// file_id (refresh the version list); file_access_denied is a file the caller's
-// access filter refuses (keep showing the account's denial); format_unavailable
-// is a version with no downloadable original bytes (a non-original format or a
-// virtual provider placeholder). Declared separately so the main catalog's
-// alignment is not disturbed; their statuses are appended to the catalog below
-// so the status-derived default still resolves to not_found / permission_denied
-// / capability_unsupported.
-var (
-	TypeFileUnavailable   = ProblemType{"file_unavailable", http.StatusNotFound, "File unavailable"}
-	TypeFileAccessDenied  = ProblemType{"file_access_denied", http.StatusForbidden, "File access denied"}
-	TypeFormatUnavailable = ProblemType{"format_unavailable", http.StatusNotImplemented, "Format unavailable"}
 )
 
 func init() {
@@ -174,25 +177,19 @@ type Problem struct {
 	Errors   []ProblemError `json:"errors,omitempty" doc:"Field-level validation details"`
 
 	headers http.Header
-	// cause is the application error an operation swallowed while building a
-	// safe envelope (see serviceProblem). It is never serialized; the observe
-	// middleware logs it under the request ID so a 500 names its underlying
-	// failure instead of only the generic problem code.
-	cause error
-}
-
-// withCause attaches the underlying application error to a problem. It keeps
-// the first cause so a wrapped/annotated problem cannot replace the original.
-func (p *Problem) withCause(err error) *Problem {
-	if p != nil && err != nil && p.cause == nil {
-		p.cause = err
-	}
-	return p
+	cause   error
 }
 
 // NewProblem builds an application problem of type t.
 func NewProblem(t ProblemType, detail string) *Problem {
 	return &Problem{Type: t.URI(), Title: t.Title, Status: t.Status, Detail: detail}
+}
+
+func (p *Problem) withCause(err error) *Problem {
+	if p != nil && err != nil && p.cause == nil {
+		p.cause = err
+	}
+	return p
 }
 
 // WithErrors attaches validation details.
@@ -279,6 +276,17 @@ func fromHumaError(requestID string, status int, msg string, errs []error, bodyL
 	t := humaStatusType(status, msg)
 	p := NewProblem(t, humaDetail(t, msg, bodyLimit))
 	p.Instance = requestInstance(requestID)
+	// Huma converts handler errors into its status error before the response
+	// transformer sees them. Preserve the original error as an out-of-band
+	// cause so request observation can still log it; never serialize it.
+	if status >= http.StatusInternalServerError {
+		for _, err := range errs {
+			if err != nil {
+				_ = p.withCause(err)
+				break
+			}
+		}
+	}
 	if status != http.StatusUnprocessableEntity && status != http.StatusBadRequest {
 		// Only validation-shaped failures carry field details; a 406 or 413
 		// has nothing field-level to say and Huma's message would leak.
@@ -306,13 +314,6 @@ func fromHumaError(requestID string, status int, msg string, errs []error, bodyL
 			Code:     validationCode(detail.Message),
 			Detail:   validationDetail(detail.Message),
 		})
-	}
-	if status == http.StatusUnprocessableEntity && len(p.Errors) > 0 {
-		var codes []string
-		for _, e := range p.Errors {
-			codes = append(codes, e.Code)
-		}
-		slog.Warn("validation_failed", "request_id", requestID, "error_count", len(p.Errors), "codes", codes)
 	}
 	return p
 }
@@ -501,8 +502,9 @@ func installErrorAdapter() {
 			// A handler that returned a plain (non-StatusError) error reaches
 			// Huma here, which would otherwise reduce it to the fixed 500
 			// envelope with the cause discarded. Record it so the request log
-			// carries the actual failure under the same request ID.
-			if status >= 500 {
+			// carries the actual failure under the same request ID. Validation
+			// failures are left out: their text echoes client input.
+			if status >= http.StatusInternalServerError {
 				for _, err := range errs {
 					noteOperationError(ctx.Context(), err)
 				}
