@@ -896,6 +896,24 @@ type PlaybackHandler struct {
 	// whose deferred probe has stayed pending past the convergence bound, so
 	// the pending state is always bounded.
 	deferredProbeWatchdogOnce sync.Once
+	// deferredProbeWatchdogInitOnce and deferredProbeWatchdogStopOnce make the
+	// watchdog's stop/done channels lazy and its shutdown single-flight. The
+	// channels are created lazily rather than in the constructor so a
+	// zero-value handler (tests build some as struct literals) still has a
+	// working termination path.
+	deferredProbeWatchdogInitOnce sync.Once
+	deferredProbeWatchdogStopOnce sync.Once
+	// deferredProbeWatchdogStop is closed by StopDeferredProbeWatchdog to end the
+	// convergence watchdog even when ServiceContext is context.Background()
+	// and can never be canceled (the default before the router installs the
+	// service lifecycle, and the context tests and minimal embedders use).
+	// Without it a handler's watchdog outlives the handler for the life of the
+	// process.
+	deferredProbeWatchdogStop chan struct{}
+	// deferredProbeWatchdogDone is closed when the watchdog goroutine returns,
+	// letting shutdown and tests observe that termination actually completed
+	// rather than assuming the stop signal was enough.
+	deferredProbeWatchdogDone chan struct{}
 	// probeConvergenceOverride, when positive, replaces the production
 	// convergence bound so a test can observe the watchdog without waiting the
 	// full bound. Zero uses virtualBackgroundProbeBudget plus the slack.

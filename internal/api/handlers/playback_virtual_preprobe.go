@@ -251,13 +251,49 @@ func (h *PlaybackHandler) probeGateWaitBudget() time.Duration {
 }
 
 // startDeferredProbeWatchdog lazily starts the single convergence watchdog. It
-// is tied to the service context so it exits at shutdown and never leaks.
+// exits with the service context at server shutdown, and also on
+// StopDeferredProbeWatchdog so a handler whose service context can never be canceled
+// still terminates it.
 func (h *PlaybackHandler) startDeferredProbeWatchdog() {
 	if h == nil {
 		return
 	}
 	h.deferredProbeWatchdogOnce.Do(func() {
-		go h.runDeferredProbeWatchdog()
+		stop, done := h.deferredProbeWatchdogChannels()
+		go func() {
+			defer close(done)
+			h.runDeferredProbeWatchdog(stop)
+		}()
+	})
+}
+
+// deferredProbeWatchdogChannels returns the watchdog's stop and done channels,
+// creating them once. Both start and stop go through here so neither depends on
+// the other having run first: a stop before the first start closes the channel
+// the later goroutine immediately observes, and a start after a stop still has
+// the same closed channel to select on.
+func (h *PlaybackHandler) deferredProbeWatchdogChannels() (stop, done chan struct{}) {
+	h.deferredProbeWatchdogInitOnce.Do(func() {
+		h.deferredProbeWatchdogStop = make(chan struct{})
+		h.deferredProbeWatchdogDone = make(chan struct{})
+	})
+	return h.deferredProbeWatchdogStop, h.deferredProbeWatchdogDone
+}
+
+// StopDeferredProbeWatchdog terminates the deferred-probe convergence watchdog. The
+// application shutdown sequence calls it explicitly (wired through
+// api.Dependencies.RegisterShutdownFunc), and tests call it from cleanup so a
+// handler's goroutine never outlives the handler. It is idempotent and safe to
+// call before the watchdog starts or concurrently with its lazy start: closing
+// the stop channel is what ends the goroutine, and the watchdog owns the done
+// channel, so a later caller can wait for the actual exit.
+func (h *PlaybackHandler) StopDeferredProbeWatchdog() {
+	if h == nil {
+		return
+	}
+	stop, _ := h.deferredProbeWatchdogChannels()
+	h.deferredProbeWatchdogStopOnce.Do(func() {
+		close(stop)
 	})
 }
 
@@ -270,7 +306,10 @@ func (h *PlaybackHandler) startDeferredProbeWatchdog() {
 // whole life. A failure write is followed by the same terminal-notification
 // publish every other failed outcome uses, so the push and the poll agree and a
 // client leaves its loading state either way.
-func (h *PlaybackHandler) runDeferredProbeWatchdog() {
+//
+// It exits when the service context ends or when the handler stops it, so it
+// never outlives whichever lifecycle owns the handler.
+func (h *PlaybackHandler) runDeferredProbeWatchdog(stop <-chan struct{}) {
 	base := h.ServiceContext
 	if base == nil {
 		base = context.Background()
@@ -280,6 +319,8 @@ func (h *PlaybackHandler) runDeferredProbeWatchdog() {
 	for {
 		select {
 		case <-base.Done():
+			return
+		case <-stop:
 			return
 		case <-ticker.C:
 			h.failOverdueDeferredProbes(time.Now().Add(-h.probeConvergenceBound()))

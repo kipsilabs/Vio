@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -206,5 +207,26 @@ func TestDeferredProbeConvergenceBoundDocumentsBudget(t *testing.T) {
 	}
 	if h.probeConvergenceBound() > 2*time.Minute {
 		t.Fatalf("convergence bound %s exceeds a client-tolerable wait", h.probeConvergenceBound())
+	}
+}
+
+// TestDeferredProbeWatchdogStopsWithHandler pins the watchdog's termination
+// contract. A handler defaults to context.Background(), which can never be
+// canceled, so without an explicit stop the convergence goroutine outlives the
+// handler and keeps reading its budget. StopDeferredProbeWatchdog must end it, be
+// idempotent, and expose the actual exit so shutdown (or a test) can observe
+// that the goroutine is gone rather than merely signaled.
+func TestDeferredProbeWatchdogStopsWithHandler(t *testing.T) {
+	h := &PlaybackHandler{ServiceContext: context.Background()}
+	h.startDeferredProbeWatchdog()
+	_, done := h.deferredProbeWatchdogChannels()
+
+	h.StopDeferredProbeWatchdog()
+	h.StopDeferredProbeWatchdog()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("convergence watchdog did not stop with its handler")
 	}
 }

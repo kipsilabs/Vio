@@ -75,6 +75,10 @@ func newDeferredGateFixture(t *testing.T, fileID int) *deferredGateFixture {
 		return VirtualFileMetadataUpdateResult{MetadataUpdated: true, RowsAffected: 1}, nil
 	}
 	t.Cleanup(fx.releaseProbe)
+	// The fixture's handler defaults to context.Background(), which can never
+	// be canceled. Stop the convergence watchdog with the fixture so it does
+	// not outlive the test that created the handler.
+	t.Cleanup(fx.handler.StopDeferredProbeWatchdog)
 	return fx
 }
 
