@@ -667,10 +667,10 @@ func TestResolveVirtualProbeSuccessClearsFailureMarker(t *testing.T) {
 			CodecVideo: "h264", CodecAudio: "aac", Container: "mkv",
 		}}, nil
 	})
-	var probeCalls atomic.Int64
+	probeCalls := 0
 	h := virtualProbeGateCandidateHandler(stored, lister,
 		func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
-			probeCalls.Add(1)
+			probeCalls++
 			f.VideoTracks = []models.VideoTrack{{Codec: "h264", Width: 1920, Height: 1080}}
 			f.AudioTracks = []models.AudioTrack{{Codec: "aac", Channels: 2, Language: "eng"}}
 			f.CodecVideo, f.CodecAudio, f.Resolution, f.Container = "h264", "aac", "1080p", "mkv"
@@ -699,7 +699,7 @@ func TestResolveVirtualProbeSuccessClearsFailureMarker(t *testing.T) {
 	// The background probe runs detached: wait for it to complete, then the
 	// seeded stale marker must be gone and no live failure may remain.
 	deadline := time.Now().Add(5 * time.Second)
-	for probeCalls.Load() < 1 {
+	for probeCalls < 1 {
 		if time.Now().After(deadline) {
 			t.Fatal("background probe never ran")
 		}
@@ -708,8 +708,8 @@ func TestResolveVirtualProbeSuccessClearsFailureMarker(t *testing.T) {
 	if virtualProbeFailures.recent(key) {
 		t.Fatal("stale failure marker survived a successful background probe")
 	}
-	if probeCalls.Load() != 1 {
-		t.Fatalf("prober called %d times, want 1", probeCalls.Load())
+	if probeCalls != 1 {
+		t.Fatalf("prober called %d times, want 1", probeCalls)
 	}
 }
 
@@ -1222,10 +1222,10 @@ func TestResolveVirtualProbeDamperIsolatesCandidates(t *testing.T) {
 	}
 
 	// Candidate A fails its probe; the failure is remembered for A only.
-	var probeACalls atomic.Int64
+	probeACalls := 0
 	hA := virtualProbeGateCandidateHandler(resolveVirtualDamperFile(owner, 910, uriA), resolveVirtualDamperLister(uriA),
 		func(_ context.Context, _ string, _ *models.MediaFile) (*models.MediaFile, error) {
-			probeACalls.Add(1)
+			probeACalls++
 			return nil, errors.New("probe A failed")
 		}, nil)
 	resolvedA := resolve(hA, resolveVirtualDamperFile(owner, 910, uriA))
@@ -1240,15 +1240,15 @@ func TestResolveVirtualProbeDamperIsolatesCandidates(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if probeACalls.Load() != 1 {
-		t.Fatalf("candidate A: probeCalls=%d, want 1", probeACalls.Load())
+	if probeACalls != 1 {
+		t.Fatalf("candidate A: probeCalls=%d, want 1", probeACalls)
 	}
 
 	// Candidate B under the same neutral path must still be probed.
-	var probeBCalls atomic.Int64
+	probeBCalls := 0
 	hB := virtualProbeGateCandidateHandler(resolveVirtualDamperFile(owner, 911, uriB), resolveVirtualDamperLister(uriB),
 		func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
-			probeBCalls.Add(1)
+			probeBCalls++
 			f.VideoTracks = []models.VideoTrack{{Codec: "h264", Width: 1920, Height: 1080}}
 			f.AudioTracks = []models.AudioTrack{{Codec: "aac", Channels: 2, Language: "eng"}}
 			f.CodecVideo, f.CodecAudio, f.Resolution, f.Container = "h264", "aac", "1080p", "mkv"
@@ -1261,7 +1261,7 @@ func TestResolveVirtualProbeDamperIsolatesCandidates(t *testing.T) {
 	// Candidate B under the same neutral path must still be probed in the
 	// background: a failure for A must not damp B.
 	deadlineB := time.Now().Add(5 * time.Second)
-	for probeBCalls.Load() < 1 {
+	for probeBCalls < 1 {
 		if time.Now().After(deadlineB) {
 			t.Fatal("candidate B was never probed in the background: failure for A damped B")
 		}
@@ -1285,10 +1285,10 @@ func TestResolveVirtualProbeDamperIsolatesOwners(t *testing.T) {
 	}
 
 	// Owner 5 exhausts its probe budget for this candidate.
-	var probeCalls5 atomic.Int64
+	probeCalls5 := 0
 	h5 := virtualProbeGateCandidateHandler(resolveVirtualDamperFile(5, 920, uri), resolveVirtualDamperLister(uri),
 		func(_ context.Context, _ string, _ *models.MediaFile) (*models.MediaFile, error) {
-			probeCalls5.Add(1)
+			probeCalls5++
 			return nil, errors.New("probe owner 5 failed")
 		}, nil)
 	resolved5 := resolve(h5, 5)
@@ -1296,7 +1296,7 @@ func TestResolveVirtualProbeDamperIsolatesOwners(t *testing.T) {
 		t.Fatalf("owner 5: provenance=%q, want declared instant response", resolved5.Provenance)
 	}
 	deadline5 := time.Now().Add(5 * time.Second)
-	for probeCalls5.Load() < 1 {
+	for probeCalls5 < 1 {
 		if time.Now().After(deadline5) {
 			t.Fatal("owner 5 background probe never ran")
 		}
@@ -1304,10 +1304,10 @@ func TestResolveVirtualProbeDamperIsolatesOwners(t *testing.T) {
 	}
 
 	// Owner 6 must probe the same candidate independently.
-	var probeCalls6 atomic.Int64
+	probeCalls6 := 0
 	h6 := virtualProbeGateCandidateHandler(resolveVirtualDamperFile(6, 921, uri), resolveVirtualDamperLister(uri),
 		func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
-			probeCalls6.Add(1)
+			probeCalls6++
 			f.VideoTracks = []models.VideoTrack{{Codec: "h264", Width: 1920, Height: 1080}}
 			f.AudioTracks = []models.AudioTrack{{Codec: "aac", Channels: 2, Language: "eng"}}
 			f.CodecVideo, f.CodecAudio, f.Resolution, f.Container = "h264", "aac", "1080p", "mkv"
@@ -1320,7 +1320,7 @@ func TestResolveVirtualProbeDamperIsolatesOwners(t *testing.T) {
 	// Owner 6 must probe the same candidate independently in the background:
 	// owner 5's failure must not damp owner 6.
 	deadline6 := time.Now().Add(5 * time.Second)
-	for probeCalls6.Load() < 1 {
+	for probeCalls6 < 1 {
 		if time.Now().After(deadline6) {
 			t.Fatal("owner 6 was never probed in the background: owner 5's failure damped owner 6")
 		}

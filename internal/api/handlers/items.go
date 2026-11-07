@@ -126,74 +126,18 @@ type ItemsHandler struct {
 	DeviceProfileReader      plugins.DeviceCapabilityProfileSource
 	virtualPrefetcher        VirtualPrefetcher
 	virtualFileByID          FilePathResolver
+	virtualPrefetchInflight  sync.Map
+	virtualPrefetchLoadSem   chan struct{}
+	prefetchSemOnce          sync.Once
 	AccessGroups             access.GroupPolicyProvider // optional; resolves inherited library access when no scope is in context
 	MarkerPopulation         MarkerPopulationService
 	MarkerFileResolver       FilePathResolver
 	// virtualSelectionProber schedules the pre-play probe for an explicitly
 	// selected virtual version whose inventory is still missing.
 	virtualSelectionProber VirtualSelectionProber
-	// virtualSelectionPreprober runs that same probe inline for a caller that
-	// waits on its tracks (the single-file versions check). Nil disables the
-	// synchronous mode. Set via SetVirtualSelectionPreprober.
-	virtualSelectionPreprober VirtualSelectionPreprober
-	// virtualPrefetchInflight collapses repeated catalog reads for the same
-	// file+profile before any row load or goroutine: the entry lives only
-	// while the background load runs. Delete is deferred as the goroutine's
-	// first statement, so it runs even on panic unwind; no reaper needed.
-	virtualPrefetchInflight sync.Map // string -> struct{}
-	// virtualPrefetchLoadSem bounds concurrent background row-loads across
-	// distinct keys. Created once via prefetchSemOnce; the local captured in
-	// prefetchVirtualFileIDs is used for both acquire and release so a
-	// concurrent init can never split them across channels.
-	virtualPrefetchLoadSem chan struct{}
-	prefetchSemOnce        sync.Once
 	MarkerImageURLs        interface {
 		ResolveURLs(context.Context, []string) map[string]catalog.ResolvedImageURL
 	}
-}
-
-// VirtualPrefetcher warms virtual playback listings off the click path.
-// Satisfied by *PlaybackHandler.PrefetchVirtualPlayback.
-type VirtualPrefetcher interface {
-	PrefetchVirtualPlayback(ctx context.Context, files []*models.MediaFile, profileID string)
-}
-
-// SetVirtualPrefetcher wires watch-detail prefetch. Either arg may be nil to
-// keep prefetch disabled.
-func (h *ItemsHandler) SetVirtualPrefetcher(p VirtualPrefetcher, files FilePathResolver) {
-	if h == nil {
-		return
-	}
-	h.virtualPrefetcher = p
-	h.virtualFileByID = files
-}
-
-// VirtualSelectionPreprober runs one selected virtual row's inventory probe
-// synchronously so the caller can answer with the enumerated tracks in the same
-// response. *PlaybackHandler implements it; the caller bounds the wait with its
-// own deadline and treats any non-verified answer as "declared metadata only".
-type VirtualSelectionPreprober interface {
-	PreprobeSelectedFile(ctx context.Context, contentID string, fileID int, filter catalog.AccessFilter) VirtualPreprobeStatus
-}
-
-// SetVirtualSelectionPreprober wires the synchronous inventory mode of the
-// versions check. Nil keeps that mode unavailable while the ordinary batched
-// liveness check stays exactly as it is.
-func (h *ItemsHandler) SetVirtualSelectionPreprober(p VirtualSelectionPreprober) {
-	if h == nil {
-		return
-	}
-	h.virtualSelectionPreprober = p
-}
-
-// preprobeSelectedVirtualFile is the nil-safe seam the versions check calls. It
-// reports VirtualPreprobeDeclined when no preprober is wired, so the read keeps
-// answering declared metadata.
-func (h *ItemsHandler) preprobeSelectedVirtualFile(ctx context.Context, contentID string, fileID int, filter catalog.AccessFilter) VirtualPreprobeStatus {
-	if h == nil || h.virtualSelectionPreprober == nil {
-		return VirtualPreprobeDeclined
-	}
-	return h.virtualSelectionPreprober.PreprobeSelectedFile(ctx, contentID, fileID, filter)
 }
 
 // NewItemsHandler creates a new ItemsHandler.
@@ -3037,6 +2981,20 @@ func hasMaskedMetadataCuration(ctx context.Context, user *models.User, groups ac
 		return false
 	}
 	return slices.Contains(auth.PolicyPermissions(effective), string(auth.PermissionMetadataCuration))
+}
+
+type VirtualPrefetcher interface {
+	PrefetchVirtualPlayback(ctx context.Context, files []*models.MediaFile, profileID string)
+}
+
+// SetVirtualPrefetcher wires watch-detail prefetch. Either arg may be nil to
+// keep prefetch disabled.
+func (h *ItemsHandler) SetVirtualPrefetcher(p VirtualPrefetcher, files FilePathResolver) {
+	if h == nil {
+		return
+	}
+	h.virtualPrefetcher = p
+	h.virtualFileByID = files
 }
 
 // prefetchWatchDetailVirtual warms virtual candidate listings for the rows a

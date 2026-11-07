@@ -473,68 +473,6 @@ func TestPlaybackDecisionV2ProjectsSubtitleURLsWithoutMutatingSource(t *testing.
 	}
 }
 
-func TestPlaybackSubtitleFontsV2CarriesSystemFontFallbackMarker(t *testing.T) {
-	deps, _ := catalogDeps(t)
-	deps.PlaybackMedia = &PlaybackMediaHandlers{
-		SubtitleFonts: fakeSubtitleFontFallbackService{
-			fakeSubtitleFontService: func(context.Context, handlers.SubtitleFontRequest) ([]playback.SubtitleFontBundleItem, bool, error) {
-				return nil, true, nil
-			},
-			fallback: playback.SubtitleFontFallbackSubsetUnavailable,
-		},
-	}
-	h := newTestHandler(t, deps)
-	resp := do(t, h, http.MethodGet, Prefix+"/stream/"+deliveryTestSession+"/subtitles/1/fonts?file_id=42&st=opaque", "", viewerHeaders())
-	if resp.Code != http.StatusOK {
-		t.Fatalf("fonts status = %d, body = %s", resp.Code, resp.Body.String())
-	}
-	if got := resp.Header().Get("X-Vio-Font-Bundle-Fallback"); got != playback.SubtitleFontFallbackSubsetUnavailable {
-		t.Fatalf("fallback header = %q, want %q", got, playback.SubtitleFontFallbackSubsetUnavailable)
-	}
-	if got := resp.Header().Get("X-Vio-Font-Bundle-Pending"); got != "true" {
-		t.Fatalf("pending header = %q, want true", got)
-	}
-	if got := resp.Header().Get("Cache-Control"); got != "no-store" {
-		t.Fatalf("cache-control = %q, want no-store", got)
-	}
-}
-
-// fakeSubtitleFontFallbackService implements the optional detailed extension
-// while keeping the historical two-result fake usable for other tests.
-type fakeSubtitleFontFallbackService struct {
-	fakeSubtitleFontService
-	fallback string
-}
-
-func (f fakeSubtitleFontFallbackService) SubtitleFontsWithFallback(ctx context.Context, in handlers.SubtitleFontRequest) ([]playback.SubtitleFontBundleItem, bool, string, error) {
-	items, pending, err := f.fakeSubtitleFontService(ctx, in)
-	return items, pending, f.fallback, err
-}
-
-func TestPlaybackDecisionV2EmptySubtitleInventoryIsArray(t *testing.T) {
-	for _, tc := range []struct {
-		name      string
-		inventory []playback.SubtitleInventoryItemV3
-	}{{"nil", nil}, {"empty", []playback.SubtitleInventoryItemV3{}}} {
-		t.Run(tc.name, func(t *testing.T) {
-			in := playback.DecisionResponseV3{PlaybackPlan: &playback.PlanV3{
-				Subtitle: playback.SubtitleDecisionV3{Mode: playback.SubtitleOffV3, Inventory: tc.inventory},
-			}}
-			out := playbackDecision(in)
-			raw, err := json.Marshal(out.PlaybackPlan.Subtitle)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !strings.Contains(string(raw), `"inventory":[]`) {
-				t.Fatalf("v2 inventory must be an array: %s", raw)
-			}
-			if (in.PlaybackPlan.Subtitle.Inventory == nil) != (tc.inventory == nil) || len(in.PlaybackPlan.Subtitle.Inventory) != 0 {
-				t.Fatal("projection mutated the source inventory")
-			}
-		})
-	}
-}
-
 func TestPlaybackDecisionV2PublishesTheActiveQuality(t *testing.T) {
 	in := playback.DecisionResponseV3{PlaybackPlan: &playback.PlanV3{ActiveQuality: playback.QualityRung1080pLowV3}}
 	raw, err := json.Marshal(playbackDecision(in).PlaybackPlan)

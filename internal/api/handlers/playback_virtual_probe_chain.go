@@ -77,26 +77,6 @@ const (
 // same as an explicit selection's warm-up; only the trigger label differs.
 const virtualSelectionWarmTriggerDefault = "detail:default"
 
-// VirtualPreprobeStatus reports what a synchronous single-file inventory
-// preprobe established. The zero value means no probe ran, so the caller keeps
-// the row's declared metadata.
-type VirtualPreprobeStatus string
-
-const (
-	// VirtualPreprobeDeclined means the probe did not run: the row was not a
-	// probe target, the failure damper refused it, the handler is not wired for
-	// it, or no detached slot was free.
-	VirtualPreprobeDeclined VirtualPreprobeStatus = ""
-	// VirtualPreprobeVerified means the probe enumerated the row's bytes and
-	// its durable evidence write committed, so a re-read carries the tracks.
-	VirtualPreprobeVerified VirtualPreprobeStatus = "verified"
-	// VirtualPreprobePending means a probe covers this row but left no
-	// committed evidence yet (it ran and failed, timed out, or its evidence was
-	// withheld, or another chain is still enumerating the same row), so the row
-	// still answers with declared metadata.
-	VirtualPreprobePending VirtualPreprobeStatus = "pending"
-)
-
 // Reasons a discovered or selected item ends up not probed. They are log
 // values only — nothing branches on them — so an operator can tell a chain
 // that was never admitted (schedule_refused) from one that ran out of budget
@@ -609,8 +589,7 @@ func (h *PlaybackHandler) scheduleFileProbe(contentID string, source *models.Med
 			cancel()
 			h.probeChainWG.Done()
 		}()
-		// The detached chain reports through its logs and its catalog write.
-		_, _ = h.runFileProbeChain(ctx, contentID, probeSource, streamsSnapshot, filterSnapshot, trigger, explicitSelection)
+		h.runFileProbeChain(ctx, contentID, probeSource, streamsSnapshot, filterSnapshot, trigger, explicitSelection)
 	}()
 }
 
@@ -705,15 +684,10 @@ func (h *PlaybackHandler) resolveFileProbeTarget(ctx context.Context, contentID 
 // write, and the versions_updated publish are the same for both. Every step is
 // bounded by the chain context; a failure or an unsafe target leaves one
 // structured skip line naming the reason (see logVirtualProbeChainSkip).
-//
-// It reports the probe's outcome (empty when no probe ran) and whether that
-// outcome's evidence write committed. The detached scheduler ignores both; the
-// synchronous preprobe uses them to tell an enumerated row from one that still
-// answers with declared metadata.
-func (h *PlaybackHandler) runFileProbeChain(ctx context.Context, contentID string, source *models.MediaFile, streams []VirtualPlaybackStream, filter catalog.AccessFilter, trigger string, explicitSelection bool) (string, bool) {
+func (h *PlaybackHandler) runFileProbeChain(ctx context.Context, contentID string, source *models.MediaFile, streams []VirtualPlaybackStream, filter catalog.AccessFilter, trigger string, explicitSelection bool) {
 	row, ok := h.resolveFileProbeTarget(ctx, contentID, filter, trigger, explicitSelection)
 	if !ok {
-		return "", false
+		return
 	}
 	// Stamp skip and damper check happen inside admitted work — the admission
 	// callback only reserves the slot, by design. A selection whose row already
@@ -721,7 +695,7 @@ func (h *PlaybackHandler) runFileProbeChain(ctx context.Context, contentID strin
 	if row.ProbeUpdatedAt != nil {
 		logVirtualProbeChainSkip(ctx, slog.LevelDebug, trigger, contentID,
 			virtualProbeChainReasonAlreadyProbed, "", virtualEvidenceLogKeyFileID, row.ID)
-		return "", false
+		return
 	}
 	oid := row.VirtualOwnerInstallationID
 	var probeCand *VirtualPlaybackStream
@@ -739,12 +713,12 @@ func (h *PlaybackHandler) runFileProbeChain(ctx context.Context, contentID strin
 		// must never guess.
 		logVirtualProbeChainSkip(ctx, slog.LevelDebug, trigger, contentID,
 			virtualProbeChainReasonNoExactCandidate, "", virtualEvidenceLogKeyFileID, row.ID)
-		return "", false
+		return
 	}
 	if virtualProbeBackedOff(virtualProbeFailureKey(probeCand.URI, oid)) {
 		logVirtualProbeChainSkip(ctx, slog.LevelDebug, trigger, contentID,
 			virtualProbeChainReasonRecentlyFailed, "", virtualEvidenceLogKeyFileID, row.ID)
-		return "", false
+		return
 	}
 	// The enumeration runs behind the shared detached gate, the same bounded
 	// admission every background virtual probe uses. No slot, no probe.
@@ -752,7 +726,7 @@ func (h *PlaybackHandler) runFileProbeChain(ctx context.Context, contentID strin
 	if gate == nil || !gate.tryAcquire() {
 		logVirtualProbeChainSkip(ctx, slog.LevelInfo, trigger, contentID,
 			virtualProbeChainReasonGateBusy, "", virtualEvidenceLogKeyFileID, row.ID)
-		return "", false
+		return
 	}
 	defer gate.release()
 	expectedRuntimeMinutes := h.virtualExpectedRuntimeMinutes(ctx, row)
@@ -765,7 +739,7 @@ func (h *PlaybackHandler) runFileProbeChain(ctx context.Context, contentID strin
 	if !hasProbeURL {
 		logVirtualProbeChainSkip(ctx, slog.LevelDebug, trigger, contentID,
 			virtualProbeChainReasonNoExactCandidate, "no_provider_url", virtualEvidenceLogKeyFileID, row.ID)
-		return "", false
+		return
 	}
 	probeCand.RequestHeaders = probeHeaders
 	// The chain probes the selected/default row's own candidate bytes and uses
@@ -773,15 +747,11 @@ func (h *PlaybackHandler) runFileProbeChain(ctx context.Context, contentID strin
 	// be invalidated after the tracks are actually committed. No session binding
 	// exists here, so the fence is nil and the identity tiers are zero — the same
 	// posture the unstamped-row fast path takes, where the row owns its candidate.
-	outcome, carried := h.probeVirtualSourceAndPersistWith(
+	outcome, _ := h.probeVirtualSourceAndPersistWith(
 		ctx, stickyKey, row, probeURL, probeTransient, *probeCand,
 		resolver.PersistedIdentityTiers{}, expectedRuntimeMinutes, oid, true, nil,
 	)
-	// A verified outcome with an unwritten carrier means the row keeps its
-	// previous evidence: the serve recorded a pin's first served-size
-	// observation, so there is no catalog change for a detail page to refresh
-	// (see virtualProbeEvidenceWithholdsIdentity).
-	if outcome == probeOutcomeVerified && carried.written && h.EventsHub != nil {
+	if outcome == probeOutcomeVerified && h.EventsHub != nil {
 		publishCtx, publishCancel := context.WithTimeout(context.WithoutCancel(ctx), virtualCandidatePublishBudget)
 		publishVirtualVersionsUpdatedEvent(publishCtx, nil, h.EventsHub, contentID)
 		publishCancel()
@@ -791,65 +761,13 @@ func (h *PlaybackHandler) runFileProbeChain(ctx context.Context, contentID strin
 		if ctx.Err() != nil {
 			logVirtualProbeChainSkip(ctx, slog.LevelInfo, trigger, contentID,
 				virtualProbeChainReasonBudgetExpired, "probe", virtualEvidenceLogKeyError, ctx.Err())
-			return outcome, false
+			return
 		}
 		logVirtualProbeChainSkip(ctx, slog.LevelInfo, trigger, contentID,
 			virtualProbeChainReasonProbeFailed, "probe", virtualEvidenceLogKeyFileID, row.ID)
 	case probeOutcomePartial:
 		logVirtualProbeChainSkip(ctx, slog.LevelInfo, trigger, contentID,
 			virtualProbeChainReasonProbeIncomplete, "probe", virtualEvidenceLogKeyFileID, row.ID)
-	}
-	return outcome, carried.written
-}
-
-// PreprobeSelectedFile runs one explicitly selected virtual row's inventory
-// probe synchronously for a caller that is going to answer with the row's
-// tracks. It is the versions check's single-file inventory mode: the same
-// target read, exact-candidate match, damper, detached gate and durable
-// evidence write the detached selection chain uses, inline instead of spawned.
-//
-// The caller owns the deadline: the request context bounds the whole call, so a
-// slow provider ends as VirtualPreprobePending with the row's declared metadata
-// intact and never as an error. Admission is shared with the detached chains
-// (one live chain per content and selected file), so a row already being probed
-// elsewhere reports pending instead of opening a second ffprobe on the same
-// relay bytes.
-func (h *PlaybackHandler) PreprobeSelectedFile(ctx context.Context, contentID string, fileID int, filter catalog.AccessFilter) VirtualPreprobeStatus {
-	if h == nil || contentID == "" || fileID <= 0 {
-		return VirtualPreprobeDeclined
-	}
-	// A chain already enumerating this exact row owns the work; it answers
-	// pending so the caller keeps declared metadata and lets that chain land.
-	filter.SelectedFileID = fileID
-	key := contentID + "\x00" + strconv.Itoa(fileID)
-	if h.defaultProbeChains.isLive(key) {
-		return VirtualPreprobePending
-	}
-	// The same wiring the detached scheduler requires: without either seam the
-	// probe could only fail, and a misconfigured server must answer declared
-	// metadata rather than a spurious pending.
-	if h.DefaultProbeTarget == nil || (h.VirtualPlaybackSourceProber == nil && h.VirtualPlaybackSourceProberWithHeaders == nil) {
-		return VirtualPreprobeDeclined
-	}
-	release, refusal := h.defaultProbeChains.acquire(key)
-	if refusal != defaultProbeChainRefusalNone {
-		return VirtualPreprobeDeclined
-	}
-	defer release()
-	outcome, written := h.runFileProbeChain(ctx, contentID, nil, nil, filter, virtualProbeChainTriggerSelection, true)
-	switch {
-	case outcome == probeOutcomeVerified && written:
-		return VirtualPreprobeVerified
-	case outcome == "":
-		if ctx.Err() != nil {
-			// The caller's deadline ended the wait before the chain could run.
-			// Nothing committed, but a probe was attempted for this row.
-			return VirtualPreprobePending
-		}
-		// Nothing ran: the row was not a probe target or the damper refused it.
-		return VirtualPreprobeDeclined
-	default:
-		return VirtualPreprobePending
 	}
 }
 

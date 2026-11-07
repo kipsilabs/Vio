@@ -583,9 +583,6 @@ func TestServeExtractTextWaitsForInFlightFillAndServesCommitted(t *testing.T) {
 		calls int
 	)
 	started, release := make(chan struct{}), make(chan struct{})
-	var releaseOnce sync.Once
-	releaseFn := func() { releaseOnce.Do(func() { close(release) }) }
-	t.Cleanup(releaseFn)
 	done := c.WarmTrackInBackground(opts, func(ctx context.Context, o StreamExtractOpts) error {
 		mu.Lock()
 		calls++
@@ -599,11 +596,7 @@ func TestServeExtractTextWaitsForInFlightFillAndServesCommitted(t *testing.T) {
 		_, err := io.WriteString(o.Writer, "WARM TRACK")
 		return err
 	}, "")
-	select {
-	case <-started:
-	case <-time.After(5 * time.Second):
-		t.Fatal("background warm did not start")
-	}
+	<-started
 
 	clientDone := make(chan error, 1)
 	rec := httptest.NewRecorder()
@@ -624,15 +617,11 @@ func TestServeExtractTextWaitsForInFlightFillAndServesCommitted(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 
-	releaseFn()
+	close(release)
 	if err := <-clientDone; err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("background warm did not finish")
-	}
+	<-done
 
 	if got := rec.Body.String(); got != "WARM TRACK" {
 		t.Fatalf("client body = %q, want the warm's committed bytes", got)
@@ -1617,11 +1606,7 @@ func TestServeSUPExtractWindowedCoalescesConcurrentRepeats(t *testing.T) {
 
 	// The leader holds the extraction open; the others either join its flight
 	// or, if they arrive after it stores the slice, serve that stored copy.
-	select {
-	case <-started:
-	case <-time.After(5 * time.Second):
-		t.Fatal("coalesced window extract did not start")
-	}
+	<-started
 	releaseOnce.Do(func() { close(release) })
 
 	for range requests {
@@ -2124,11 +2109,7 @@ func TestWarmTrackInBackgroundFailedWarmCooldown(t *testing.T) {
 		mu.Unlock()
 		return errors.New("relay unavailable")
 	}
-	select {
-	case <-c.WarmTrackInBackground(opts, extract, ""):
-	case <-time.After(5 * time.Second):
-		t.Fatal("first warm did not finish")
-	}
+	<-c.WarmTrackInBackground(opts, extract, "")
 	mu.Lock()
 	if calls != 1 {
 		t.Fatalf("first warm calls = %d, want 1", calls)
@@ -2136,11 +2117,7 @@ func TestWarmTrackInBackgroundFailedWarmCooldown(t *testing.T) {
 	mu.Unlock()
 
 	// Immediate retry: suppressed by the failure cooldown.
-	select {
-	case <-c.WarmTrackInBackground(opts, extract, ""):
-	case <-time.After(5 * time.Second):
-		t.Fatal("suppressed retry warm did not finish")
-	}
+	<-c.WarmTrackInBackground(opts, extract, "")
 	mu.Lock()
 	if calls != 1 {
 		t.Fatalf("immediate retry calls = %d, want still 1 (cooldown)", calls)
@@ -2157,11 +2134,7 @@ func TestWarmTrackInBackgroundFailedWarmCooldown(t *testing.T) {
 	guard.retryAt = time.Now().Add(-time.Second)
 	c.warmGuard[key] = guard
 	c.warmMu.Unlock()
-	select {
-	case <-c.WarmTrackInBackground(opts, extract, ""):
-	case <-time.After(5 * time.Second):
-		t.Fatal("post-cooldown warm did not finish")
-	}
+	<-c.WarmTrackInBackground(opts, extract, "")
 	mu.Lock()
 	if calls != 2 {
 		t.Fatalf("post-cooldown warm calls = %d, want 2", calls)
@@ -2216,14 +2189,10 @@ func TestWarmTrackInBackgroundCancellationReleasesSlot(t *testing.T) {
 	}
 	// The canceled warm counts as a failure, so an immediate retry is gated.
 	calls := 0
-	select {
-	case <-c.WarmTrackInBackground(opts, func(context.Context, StreamExtractOpts) error {
+	<-c.WarmTrackInBackground(opts, func(context.Context, StreamExtractOpts) error {
 		calls++
 		return nil
-	}, ""):
-	case <-time.After(5 * time.Second):
-		t.Fatal("gated retry warm did not finish")
-	}
+	}, "")
 	if calls != 0 {
 		t.Fatalf("immediate retry after cancellation ran %d times, want 0", calls)
 	}

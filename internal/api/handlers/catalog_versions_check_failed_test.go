@@ -158,7 +158,7 @@ func TestCatalogVersionsCheckDeniedRowHidesFailedVerdict(t *testing.T) {
 	if len(resp.Results) != 1 {
 		t.Fatalf("results = %#v, want 1", resp.Results)
 	}
-	want := VersionCheckResult{FileID: file.ID}
+	want := versionCheckResult{FileID: file.ID}
 	if resp.Results[0] != want {
 		t.Fatalf("denied failed row leaked row state: %#v, want %#v", resp.Results[0], want)
 	}

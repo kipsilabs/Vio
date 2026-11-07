@@ -590,10 +590,6 @@ func RemuxContentType(audioOnly bool) string {
 // logKeyComponent names the slog attribute every playback log line carries.
 const logKeyComponent = "component"
 
-// logValuePlayback is the component value for playback log lines, shared so
-// repeated slog attribute lists do not duplicate the string literal.
-const logValuePlayback = "playback"
-
 func logRemuxSeekTiming(ctx context.Context, seekSeconds float64, filePath, outputFormat string, timingStart, spawnStart, spawnDone, firstByte time.Time) {
 	if seekSeconds <= 0 {
 		return

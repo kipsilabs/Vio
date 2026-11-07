@@ -356,10 +356,10 @@ func ProbeAudioStartOffset(ctx context.Context, filePath string, audioTrackIndex
 	if audioTrackIndex < 0 {
 		audioTrackIndex = 0
 	}
-	ffprobe := ffprobeBinary
+	ffprobe := "ffprobe"
 	if ffmpegPath != "" {
 		// ffprobe ships next to ffmpeg in every distribution Silo supports.
-		ffprobe = filepath.Join(filepath.Dir(ffmpegPath), ffprobeBinary)
+		ffprobe = filepath.Join(filepath.Dir(ffmpegPath), "ffprobe")
 	}
 
 	cmd := fspath.CommandContext(ctx, ffprobe,

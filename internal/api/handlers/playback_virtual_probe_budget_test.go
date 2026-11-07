@@ -129,6 +129,10 @@ func TestProbeFailureMarkDoesNotChangeCandidateRanking(t *testing.T) {
 // here to keep the test fast; the resolver blocks longer than it, and the probe
 // still succeeds because the goroutine gets a fresh budget after the fetch.
 func TestBackgroundProbeBudgetIndependentOfProviderFetch(t *testing.T) {
+	old := virtualBackgroundProbeBudget
+	virtualBackgroundProbeBudget = 300 * time.Millisecond
+	t.Cleanup(func() { virtualBackgroundProbeBudget = old })
+
 	uri := "virtual://movie/tt-bg-fetch?result=cand-1"
 	stored := &models.MediaFile{
 		ID:                         401,
@@ -152,15 +156,11 @@ func TestBackgroundProbeBudgetIndependentOfProviderFetch(t *testing.T) {
 			saverDone <- struct{}{}
 			return 1, nil
 		})
-	// Shrink this handler's background probe budget instead of the package
-	// global, which a watchdog goroutine leaked by an earlier test may still be
-	// reading.
-	h.backgroundProbeBudgetOverride = 300 * time.Millisecond
 	// The provider fetch blocks for longer than the background budget. A naive
 	// implementation that created the probe context before resolving would
 	// leave the probe with no budget and no evidence would be persisted.
 	h.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(func(_ context.Context, path string, _ int, _ string, _ int) (string, error) {
-		time.Sleep(2 * h.probeBackgroundBudget()) //nolint:forbidigo // The resolver must block longer than the probe budget; that overrun is the timing scenario under test.
+		time.Sleep(2 * virtualBackgroundProbeBudget)
 		return "http://provider.example/stream?path=" + path, nil
 	})
 

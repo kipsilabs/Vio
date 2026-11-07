@@ -43,7 +43,7 @@ func newTraceCountingProvider(t *testing.T) (*httptest.Server, *int) {
 func TestObserveVirtualProviderFetchesCountsDiscoveryThenReuse(t *testing.T) {
 	server, calls := newTraceCountingProvider(t)
 	r := resolver.New(resolver.Config{ManifestURL: server.URL + "/manifest.json", AllowInsecure: true})
-	ctx, snapshot := observeVirtualProviderFetches(context.Background(), "")
+	ctx, snapshot := observeVirtualProviderFetches(context.Background())
 
 	if _, _, _, err := r.GetCandidates(ctx, "virtual://movie/tt-trace-fetch"); err != nil {
 		t.Fatalf("first GetCandidates: %v", err)

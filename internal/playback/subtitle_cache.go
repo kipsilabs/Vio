@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -19,10 +18,9 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/sync/singleflight"
-
 	"github.com/Silo-Server/silo-server/internal/httpstream"
 	"github.com/Silo-Server/silo-server/internal/models"
+	"golang.org/x/sync/singleflight"
 )
 
 // SubtitleCache stores complete SUP, VTT, and ASS subtitle extracts on disk
@@ -100,32 +98,9 @@ type SubtitleCache struct {
 	// fontFailureMu guards fontFailureRetryAt, the per-font-bundle extraction
 	// backoff. A failed font extraction is optional to playback, so callers
 	// degrade to an empty pending bundle instead of retrying a flapping
-	// provider on every request. fontFailureFallback records the failures that
-	// are permanent for this key (subsetting exhausted the only paths to a
-	// bundle), so responses keep an explicit system-font fallback marker while
-	// the backoff lasts.
-	fontFailureMu       sync.Mutex
-	fontFailureRetryAt  map[string]time.Time
-	fontFailureFallback map[string]string
-
-	// warmTextMu guards warmText, the in-progress full-track ASS warms. A
-	// windowed request whose range a warm has already produced is answered
-	// from this memory copy instead of demuxing the relay source again.
-	warmTextMu sync.Mutex
-	warmText   map[string]*subtitleWarmTextProgress
-
-	// demuxBusyWarnMu guards demuxBusyWarnAt, the interval throttle for the
-	// relay-shed warning. Shedding a client-facing subtitle read answers a
-	// retryable 503; a viewer who keeps retrying can burn a client's retry
-	// budget before anyone notices, so each shed is worth a warning, but a
-	// saturated source sheds every request in a retry loop. One warning per
-	// subtitleDemuxBusyWarnEvery per cache makes the contention visible
-	// without flooding the log. The interval and clock are fields so tests can
-	// drive them without touching package state.
-	demuxBusyWarnMu    sync.Mutex
-	demuxBusyWarnAt    time.Time
-	demuxBusyWarnEvery time.Duration
-	demuxBusyWarnNow   func() time.Time
+	// provider on every request.
+	fontFailureMu      sync.Mutex
+	fontFailureRetryAt map[string]time.Time
 }
 
 const (
@@ -163,12 +138,6 @@ const (
 	// warmed artifact across a viewing session while still bounding that
 	// residual risk.
 	subtitleCacheGenerationBucket = 24 * time.Hour
-	// subtitleDemuxBusyWarnEvery bounds how often one cache warns that it shed
-	// a client-facing subtitle read because the relay source was saturated.
-	// The shed itself is expected backpressure; the warning exists so repeated
-	// multi-viewer contention is visible before clients exhaust their retry
-	// budgets, without one log line per retry.
-	subtitleDemuxBusyWarnEvery = time.Minute
 	// subtitleFontBundleExtractTimeout bounds one detached font-bundle
 	// extraction. The extraction runs single-flighted and detached from the
 	// request that triggered it, and its successful result is written through
@@ -277,18 +246,6 @@ const (
 	subtitleFontBundleFailureMaxEntries = 512
 )
 
-// errSubtitleFontBundleFlightSkipped reports a font flight dropped because the
-// relay was already at its font-demux ceiling. It is expected backpressure, not
-// a failed extraction, and is reported separately from a timeout.
-var errSubtitleFontBundleFlightSkipped = errors.New("subtitle font bundle extraction skipped: relay demux busy")
-
-// SubtitleFontFallbackSubsetUnavailable is the response marker a font-bundle
-// failure carries when the client must use system fonts: the complete pack is
-// past the ceiling and script-driven subsetting could not produce one (an
-// unreadable script, too many tracks, too many decoded bytes, or no referenced
-// attachment matched). It is not a transient pending state.
-const SubtitleFontFallbackSubsetUnavailable = "subset_unavailable"
-
 // subtitleExtractRetryDelays returns the bounded in-request retry schedule for
 // an extraction that failed on an upstream 5xx before emitting any bytes. Each
 // delay is the pause before the next attempt; the final count is small because
@@ -316,12 +273,6 @@ func (e *SubtitleExtractionRetryError) Error() string {
 type subtitleWindowResult struct {
 	data     []byte
 	storedAt time.Time
-	// warmPrefix is non-nil when data was rendered by an in-progress ASS warm's
-	// prefix rather than extracted from a source or committed artifact. Such a
-	// slice is only as complete as that layer's event-ordering guarantee, so
-	// disabling the layer evicts these entries and lets the same window fall
-	// through to the extraction path.
-	warmPrefix *subtitleWarmTextProgress
 }
 
 // subtitleWindowFlight is a per-window in-flight marker; done closes when the
@@ -435,16 +386,13 @@ func (c *SubtitleCache) ServeExtractWithResult(w http.ResponseWriter, r *http.Re
 		w.Header().Set("Content-Type", "text/x-ssa; charset=utf-8")
 	}
 	var result ServeExtractResult
+	var fill *SubtitleCacheFill
 	// Compute the last-good window key before any rewrite of InputPath (a
 	// windowed extract may be redirected to a committed artifact below, whose
 	// path/mtime is not the source identity the window is cached under).
 	windowKey := ""
-	warmTextKey := ""
 	if opts.windowIntent() {
 		windowKey, _ = c.windowResultKey(opts, format)
-		if format == subtitleFormatASS {
-			warmTextKey, _ = c.formatEntryKey(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, format)
-		}
 	}
 	windowLeader := false
 	if !opts.windowIntent() {
@@ -459,18 +407,7 @@ func (c *SubtitleCache) ServeExtractWithResult(w http.ResponseWriter, r *http.Re
 		}
 		w.Header().Set("Cache-Control", "no-store")
 		counter := &subtitleCountingWriter{w: w}
-		// This serve is a heavy relay read: admit it per relay source in its own
-		// class so it does not compete with the same session's other reads for a
-		// single slow pipe. The response is still uncommitted here, so a
-		// saturated budget answers the existing retryable shape instead of
-		// stacking another demux on it.
-		admittedCtx, releaseRelayDemux, admitErr := acquireRelayDemuxRead(relayDemuxAdmissionContext(r.Context(), opts), opts.InputPath)
-		if admitErr != nil {
-			c.warnDemuxBusy(r.Context(), opts, format)
-			return result, &SubtitleExtractionRetryError{RetryAfter: subtitleFillBusyRetryAfter}
-		}
-		defer releaseRelayDemux()
-		err := c.streamFullTrack(admittedCtx, counter, opts, format, extract)
+		err := c.streamFullTrack(r.Context(), counter, opts, format, extract)
 		outcome := subtitleTraceOutcome(r.Context(), err)
 		level := slog.LevelInfo
 		if outcome != SubtitleTraceOutcomeSuccess {
@@ -535,31 +472,6 @@ func (c *SubtitleCache) ServeExtractWithResult(w http.ResponseWriter, r *http.Re
 				return result, nil
 			}
 		}
-		// An in-progress full-track ASS warm may already have produced this
-		// window's range. Serving it here avoids a second relay demux and
-		// leaves the warm's bandwidth untouched, which is what lets the
-		// first commit land quickly instead of competing with every window.
-		if warmTextKey != "" && !result.ServedCommittedArtifact {
-			if windowed, start, end, openEnded := opts.WindowCoverage(); windowed && !openEnded {
-				if progress, data, ok := c.warmTextWindow(warmTextKey, start, end); ok {
-					if windowKey != "" {
-						// Record it as prefix-derived. The slice is only
-						// complete while the warm's event ordering holds; an
-						// ordering failure evicts it so a repeat of this exact
-						// window extracts instead of replaying stale bytes.
-						c.storeWindowResultFrom(windowKey, opts, data, progress)
-					}
-					w.Header().Set("Cache-Control", "no-store")
-					w.WriteHeader(http.StatusOK)
-					n, writeErr := w.Write(data)
-					if writeErr == nil && n != len(data) {
-						writeErr = io.ErrShortWrite
-					}
-					logWarmTextServe(r, opts, n, start, end)
-					return result, writeErr
-				}
-			}
-		}
 		if !result.ServedCommittedArtifact {
 			// No last-good copy: suppress a provider retry that is known to be
 			// inside its backoff window. An artifact-backed extraction reads a
@@ -613,22 +525,12 @@ func (c *SubtitleCache) ServeExtractWithResult(w http.ResponseWriter, r *http.Re
 		}
 	}
 
-	// This serve is about to become a heavy relay read: the request path's
-	// window extract, or the upgrade probe's detached full-track fill. Admit it
-	// per relay source in its own class so it does not compete with the same
-	// session's other reads for a single slow pipe. The response is still
-	// uncommitted here, so a saturated budget answers the existing retryable
-	// shape instead of stacking another demux on it.
-	admittedCtx, releaseRelayDemux, admitErr := acquireRelayDemuxRead(relayDemuxAdmissionContext(r.Context(), opts), opts.InputPath)
-	if admitErr != nil {
-		c.warnDemuxBusy(r.Context(), opts, format)
-		return result, &SubtitleExtractionRetryError{RetryAfter: subtitleFillBusyRetryAfter}
-	}
-	defer releaseRelayDemux()
-
 	w.Header().Set("Cache-Control", "no-store")
 	counter := &subtitleCountingWriter{w: w}
 	var writer io.Writer = counter
+	if fill != nil {
+		writer = fill.Tee(counter)
+	}
 	var capture *subtitleWindowCapture
 	if windowLeader {
 		// Keep the successful slice as the last-good copy. The capture bound is
@@ -637,17 +539,11 @@ func (c *SubtitleCache) ServeExtractWithResult(w http.ResponseWriter, r *http.Re
 		writer = capture
 	}
 	opts.Writer = writer
-	// A coalesced extraction belongs to the flight, not only to the leader
-	// request. Detach it from the leader's cancellation (bounded by the
-	// timeout) so a leader disconnect does not throw away work that waiters
-	// can still consume from the last-good cache. The window capture already
-	// swallows write failures, so the detached extract keeps producing after
-	// the response writer goes away.
-	extractCtx := admittedCtx
+	extractCtx := r.Context()
 	if windowLeader {
 		var cancel context.CancelFunc
 		extractCtx, cancel = context.WithTimeout(
-			context.WithoutCancel(admittedCtx),
+			context.WithoutCancel(r.Context()),
 			subtitleWindowExtractTimeout,
 		)
 		defer cancel()
@@ -664,6 +560,16 @@ func (c *SubtitleCache) ServeExtractWithResult(w http.ResponseWriter, r *http.Re
 		}
 	}
 	outcome := subtitleTraceOutcome(r.Context(), err)
+	if fill != nil {
+		if err != nil {
+			fill.Discard()
+		} else if commitErr := fill.Commit(); commitErr != nil {
+			outcome = SubtitleTraceOutcomeCommitFailed
+			slog.Log(r.Context(), slog.LevelWarn, "subtitle cache commit failed",
+				subtitleTraceAttrs(r.Context(), opts.SourceCodec, SubtitleTracePhaseServe, counter.bytes, outcome, -1,
+					"track", opts.TrackIndex, "format", format, "error", commitErr)...)
+		}
+	}
 	level := slog.LevelInfo
 	if outcome != SubtitleTraceOutcomeSuccess {
 		level = slog.LevelWarn
@@ -884,50 +790,13 @@ func (c *SubtitleCache) lookupWindowResult(key string) ([]byte, bool) {
 		c.windowBytes -= int64(len(entry.data))
 		return nil, false
 	}
-	// A prefix-derived slice stops being trustworthy the moment the warm's
-	// ordering guarantee fails. The disable hook evicts these eagerly; this
-	// covers an entry stored either side of the hook.
-	if entry.warmPrefix != nil && entry.warmPrefix.prefixDisabled() {
-		delete(c.windowResults, key)
-		c.windowBytes -= int64(len(entry.data))
-		return nil, false
-	}
 	// An actively-used last-good copy stays available through a long outage.
 	entry.storedAt = now
 	c.windowResults[key] = entry
 	return entry.data, true
 }
 
-// dropWarmTextWindowResults evicts the windows one warm prefix produced when
-// that layer disables. Those slices were rendered from a prefix whose
-// completeness is no longer proven, so a repeat of the same exact window must
-// reach the extraction path rather than replay cues the prefix may have missed.
-// Windows served from a committed artifact or a finished extract carry no
-// prefix and stay.
-func (c *SubtitleCache) dropWarmTextWindowResults(progress *subtitleWarmTextProgress) {
-	if c == nil || progress == nil {
-		return
-	}
-	c.windowMu.Lock()
-	defer c.windowMu.Unlock()
-	for key, entry := range c.windowResults {
-		if entry.warmPrefix != progress {
-			continue
-		}
-		delete(c.windowResults, key)
-		c.windowBytes -= int64(len(entry.data))
-	}
-}
-
 func (c *SubtitleCache) storeWindowResult(key string, opts StreamExtractOpts, data []byte) {
-	c.storeWindowResultFrom(key, opts, data, nil)
-}
-
-// storeWindowResultFrom stores data as the last-good copy for key. A non-nil
-// warmPrefix marks bytes rendered by an unfinished warm prefix, so the entry is
-// dropped if that layer disables. A store that races the disable either sees the
-// flag here or lands before the eviction hook, which waits for windowMu.
-func (c *SubtitleCache) storeWindowResultFrom(key string, opts StreamExtractOpts, data []byte, warmPrefix *subtitleWarmTextProgress) {
 	if c == nil || key == "" || len(data) == 0 || len(data) > subtitleWindowResultMaxEntryBytes {
 		return
 	}
@@ -937,9 +806,6 @@ func (c *SubtitleCache) storeWindowResultFrom(key string, opts StreamExtractOpts
 	now := time.Now()
 	c.windowMu.Lock()
 	defer c.windowMu.Unlock()
-	if warmPrefix != nil && warmPrefix.prefixDisabled() {
-		return
-	}
 	if c.windowResults == nil {
 		c.windowResults = make(map[string]subtitleWindowResult)
 	}
@@ -949,9 +815,8 @@ func (c *SubtitleCache) storeWindowResultFrom(key string, opts StreamExtractOpts
 	copyOfData := make([]byte, len(data))
 	copy(copyOfData, data)
 	c.windowResults[key] = subtitleWindowResult{
-		data:       copyOfData,
-		storedAt:   now,
-		warmPrefix: warmPrefix,
+		data:     copyOfData,
+		storedAt: now,
 	}
 	c.windowBytes += int64(len(copyOfData))
 	c.evictWindowResultsLocked(now)
@@ -1249,76 +1114,6 @@ func (c *SubtitleCache) HasCommittedEntry(inputPath, cacheIdentity string, track
 	return ok
 }
 
-// HasWarmingEntry reports whether a full-track fill is already in flight for
-// the source identity + track ordinal in the format this codec/target maps to:
-// the detached warm a windowed miss starts, a request-owned fill, or another
-// waiting request's fill. Like HasCommittedEntry this is a non-binding snapshot
-// for admission decisions; it never reserves or mutates the fill.
-//
-// It distinguishes a client's upgrade probe from a cold whole-track fetch: a
-// probe targets a track whose full-track fill is already warming (the probe
-// exists to discover that commit), whereas a cold fetch has no fill to join.
-// A codec with no sidecar class, an unkeyable source, or a nil cache reads as
-// false.
-func (c *SubtitleCache) HasWarmingEntry(inputPath, cacheIdentity string, trackIndex int, codec, targetFormat string) bool {
-	if c == nil || c.dir() == "" {
-		return false
-	}
-	format := subtitleCacheFormat(codec, targetFormat)
-	if format == "" {
-		return false
-	}
-	identity, modTime, size, ok := subtitleCacheSource(inputPath, cacheIdentity, time.Now())
-	if !ok {
-		return false
-	}
-	key := subtitleCacheFormatKey(identity, trackIndex, modTime, size, format)
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	_, warming := c.inflight[key]
-	return warming
-}
-
-// warnDemuxBusy reports that this serve shed a client-facing subtitle read
-// because the relay source was saturated. The first shed per interval warns;
-// repeats in the same interval drop to debug, so a client retry loop keeps a
-// diagnostic trail without flooding the log.
-func (c *SubtitleCache) warnDemuxBusy(ctx context.Context, opts StreamExtractOpts, format string) {
-	interval := subtitleDemuxBusyWarnEvery
-	now := time.Now
-	if c != nil {
-		if c.demuxBusyWarnEvery > 0 {
-			interval = c.demuxBusyWarnEvery
-		}
-		if c.demuxBusyWarnNow != nil {
-			now = c.demuxBusyWarnNow
-		}
-	}
-	shouldWarn := true
-	if c != nil {
-		at := now()
-		c.demuxBusyWarnMu.Lock()
-		if !c.demuxBusyWarnAt.IsZero() && at.Sub(c.demuxBusyWarnAt) < interval {
-			shouldWarn = false
-		} else {
-			c.demuxBusyWarnAt = at
-		}
-		c.demuxBusyWarnMu.Unlock()
-	}
-	attrs := []any{
-		logKeyComponent, logValuePlayback,
-		"input", opts.InputPath,
-		"track", opts.TrackIndex,
-		"format", format,
-		"retry_after_seconds", int(subtitleFillBusyRetryAfter.Seconds()),
-	}
-	if !shouldWarn {
-		slog.DebugContext(ctx, "subtitle extract deferred: relay source saturated", attrs...)
-		return
-	}
-	slog.WarnContext(ctx, "subtitle extract shed: relay source saturated", attrs...)
-}
-
 // ServeSUPExtract serves the .sup extract for one source+track described by
 // opts (opts.Writer is ignored; the cache supplies it). Full-track requests
 // (no AllowWindow): a cache hit is served with http.ServeContent (Range
@@ -1371,22 +1166,11 @@ func (c *SubtitleCache) ServeSUPExtract(w http.ResponseWriter, r *http.Request, 
 		}
 	}
 
-	// A whole-track PGS serve is a heavy relay read: the request path's for a
-	// client whole-track fetch, detached for the param-less probe. Admit it in
-	// its class per relay source before the 200 commits, so a taken budget
-	// answers retryable instead of stacking another full demux on the same pipe.
-	admittedCtx, releaseRelayDemux, admitErr := acquireRelayDemuxRead(relayDemuxAdmissionContext(r.Context(), opts), opts.InputPath)
-	if admitErr != nil {
-		c.warnDemuxBusy(r.Context(), opts, subtitleFormatSUP)
-		return &SubtitleExtractionRetryError{RetryAfter: subtitleFillBusyRetryAfter}
-	}
-	defer releaseRelayDemux()
-
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Cache-Control", "no-store")
 
 	counter := &subtitleCountingWriter{w: w}
-	err := c.streamFullTrack(admittedCtx, counter, opts, subtitleFormatSUP, extract)
+	err := c.streamFullTrack(r.Context(), counter, opts, subtitleFormatSUP, extract)
 	outcome := subtitleTraceOutcome(r.Context(), err)
 	level := slog.LevelInfo
 	if outcome != SubtitleTraceOutcomeSuccess {
@@ -1542,17 +1326,6 @@ func (c *SubtitleCache) serveWindowedSUP(w http.ResponseWriter, r *http.Request,
 		}
 	}
 
-	// A windowed PGS serve is a heavy relay read in its own admission class
-	// (request path, unless this request is the param-less probe): admit it per
-	// relay source before the 200 commits so a taken budget still answers
-	// retryable.
-	admittedCtx, releaseRelayDemux, admitErr := acquireRelayDemuxRead(relayDemuxAdmissionContext(r.Context(), opts), opts.InputPath)
-	if admitErr != nil {
-		c.warnDemuxBusy(r.Context(), opts, subtitleFormatSUP)
-		return &SubtitleExtractionRetryError{RetryAfter: subtitleFillBusyRetryAfter}
-	}
-	defer releaseRelayDemux()
-
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Cache-Control", "no-store")
 
@@ -1570,11 +1343,11 @@ func (c *SubtitleCache) serveWindowedSUP(w http.ResponseWriter, r *http.Request,
 	// request. Detach it from the leader's cancellation (bounded by the
 	// timeout) so a leader disconnect does not throw away work that waiters
 	// can still consume from the last-good cache.
-	extractCtx := admittedCtx
+	extractCtx := r.Context()
 	if leader {
 		var cancel context.CancelFunc
 		extractCtx, cancel = context.WithTimeout(
-			context.WithoutCancel(admittedCtx),
+			context.WithoutCancel(r.Context()),
 			subtitleWindowExtractTimeout,
 		)
 		defer cancel()
@@ -1773,20 +1546,6 @@ func (c *SubtitleCache) WarmInBackground(opts StreamExtractOpts, extract SUPExtr
 		start := time.Now()
 		slog.Info("subtitle cache warm started",
 			"input", opts.InputPath, "track", opts.TrackIndex)
-		// A warm is opportunistic: when the relay is already at its demux
-		// ceiling it is dropped rather than queued, and the next windowed miss
-		// re-attempts it. Queueing would make it contend with the window a
-		// client is waiting on, which is exactly the pileup that made warm
-		// demuxes (and their layout probes) time out.
-		warmCtx, releaseRelayDemux, demuxErr := acquireRelayDemuxRead(detachedRelayDemux(ctx), opts.InputPath)
-		if demuxErr != nil {
-			fill.Discard()
-			slog.DebugContext(ctx, "subtitle cache warm skipped: relay source saturated",
-				"input", opts.InputPath, "track", opts.TrackIndex)
-			return
-		}
-		defer releaseRelayDemux()
-		ctx = warmCtx
 		if err := extract(ctx, opts); err != nil {
 			fill.fail(err)
 			if errors.Is(err, ErrSubtitleWarmCanceled) {
@@ -1887,45 +1646,18 @@ func (c *SubtitleCache) WarmTrackInBackground(opts StreamExtractOpts, extract SU
 	opts.AllowWindow = false
 	opts.InputIsExtractedSup = false
 	opts.InputIsExtractedText = ""
-	warmWriter := fill.Tee(io.Discard)
-	// ASS is line-oriented and small; retain the warm's output as it streams
-	// so windows whose range it has already passed are served from memory
-	// instead of opening another relay read. Registered before the extract
-	// starts so an early window can find it.
-	var warmText *subtitleWarmTextProgress
-	warmTextKey := ""
-	if format == subtitleFormatASS {
-		warmTextKey, _ = c.formatEntryKey(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, format)
-		warmText = c.beginWarmTextProgress(warmTextKey)
-		if warmText != nil {
-			warmWriter = &subtitleWarmTextTap{dst: warmWriter, progress: warmText}
-		}
-	}
-	counter := &subtitleCountingWriter{w: warmWriter}
+	counter := &subtitleCountingWriter{w: fill.Tee(io.Discard)}
 	opts.Writer = counter
 
 	go func() {
 		defer close(done)
 		defer func() { <-c.warmSem }()
-		defer c.endWarmTextProgress(warmTextKey, warmText)
 		ctx, cancel := context.WithTimeout(context.Background(), subtitleCacheWarmTimeout)
 		defer cancel()
 
 		start := time.Now()
 		slog.Info("subtitle cache warm started",
 			"input", opts.InputPath, "track", opts.TrackIndex, "format", format)
-		// Detached: skip a saturated relay source instead of queueing behind
-		// the request-path reads it exists to protect. The next windowed miss
-		// re-attempts the warm.
-		warmCtx, releaseRelayDemux, demuxErr := acquireRelayDemuxRead(detachedRelayDemux(ctx), opts.InputPath)
-		if demuxErr != nil {
-			fill.Discard()
-			slog.DebugContext(ctx, "subtitle cache warm skipped: relay source saturated",
-				"input", opts.InputPath, "track", opts.TrackIndex, "format", format)
-			return
-		}
-		defer releaseRelayDemux()
-		ctx = warmCtx
 		if err := extract(ctx, opts); err != nil {
 			fill.fail(err)
 			if errors.Is(err, ErrSubtitleWarmCanceled) {
@@ -2320,46 +2052,29 @@ func subtitleCacheSource(inputPath, cacheIdentity string, now time.Time) (string
 }
 
 // FontBundleKey is a stable identity for font-bundle caching. Virtual rows
-// key on the release's durable provider identity, the row's probed subtitle
-// inventory, and a generation bucket — not on the pinned result candidate or a
-// resolved relay URL, both of which rotate per registration and would strand
-// warmed bundles under keys requests never ask for.
-//
-// The inventory alone is not enough: a rotated release (or a re-grabbed file
-// behind the same row) can keep an identical subtitle layout while shipping
-// different attached fonts or an edited script, and the bundle would then be
-// served from the previous release for the rest of the bucket. ReleaseIdentity
-// is the provider's durable identity for the release, the same tiers
-// boundRowSharesRelease compares, so a candidate rotation to different bytes
-// re-keys while an unchanged release keeps its warmed bundle. An identity-empty
-// row still keys by file id + inventory + bucket.
-//
-// Local rows key on the file row's size and mtime so a re-probed or replaced
-// file reads as a miss.
+// key on the pinned result id — resolved relay URLs rotate per registration
+// and would defeat the cache (mirror of the DV RPU memo key). Local rows key
+// on the file row's size and mtime so a re-probed or replaced file reads as a
+// miss.
 type FontBundleKey struct {
-	FileID          int
-	Virtual         bool
-	ReleaseIdentity string // durable provider identity; "" means unknown
-	InventoryToken  string // probed subtitle inventory; "" is a stable layout token
-	Size            int64
-	MtimeUnixNano   int64
-	FFmpegPath      string
+	FileID        int
+	PinnedResult  string // "" for local files
+	Size          int64
+	MtimeUnixNano int64
+	FFmpegPath    string
 }
 
 // source resolves the stable cache identity and invalidation coordinates for
 // the key, mirroring subtitleCacheSource's two modes. Local rows use the file
 // row's mtime/size verbatim (no generation bucket); virtual rows key on the
-// release identity and subtitle inventory plus a generation bucket so a
-// rotated source can never be served past the bucket boundary. A virtual row
-// without either identity still keys by file id + bucket. ok is false for rows
-// that cannot be keyed reliably (a local row without a usable mtime/size),
-// which callers treat as "do not cache" — the same fallback the DV RPU memo
-// uses.
+// pinned result id plus a generation bucket so a rotated source can
+// never be served past the bucket boundary. ok is false for rows that cannot
+// be keyed reliably (a local row without a usable mtime/size), which callers
+// treat as "do not cache" — the same fallback the DV RPU memo uses.
 func (k FontBundleKey) source(now time.Time) (identity string, modTime time.Time, size int64, ok bool) {
-	if k.Virtual {
+	if k.PinnedResult != "" {
 		bucket := now.Unix() / int64(subtitleCacheGenerationBucket/time.Second)
-		variant := k.ReleaseIdentity + "\x1f" + k.InventoryToken
-		return fontBundleIdentity(k.FileID, variant, k.FFmpegPath, bucket),
+		return fontBundleIdentity(k.FileID, k.PinnedResult, k.FFmpegPath, bucket),
 			time.Unix(bucket*int64(subtitleCacheGenerationBucket/time.Second), 0), 0, true
 	}
 	if k.MtimeUnixNano == 0 || k.Size <= 0 {
@@ -2369,11 +2084,10 @@ func (k FontBundleKey) source(now time.Time) (identity string, modTime time.Time
 }
 
 // fontBundleIdentity hashes the stable components of a font-bundle cache key.
-// variant carries the virtual row's release identity and inventory token
-// (empty for local rows). The ffmpeg path is included so a binary relocation
-// (which can change extraction output) starts a fresh cache.
-func fontBundleIdentity(fileID int, variant, ffmpegPath string, bucket int64) string {
-	sum := sha256.Sum256([]byte(fmt.Sprintf("%d|%s|%s|%d", fileID, variant, ffmpegPath, bucket)))
+// The ffmpeg path is included so a binary relocation (which can change
+// extraction output) starts a fresh cache.
+func fontBundleIdentity(fileID int, pinnedResult, ffmpegPath string, bucket int64) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%d|%s|%s|%d", fileID, pinnedResult, ffmpegPath, bucket)))
 	return fmt.Sprintf("%x", sum[:12])
 }
 
@@ -2504,13 +2218,12 @@ func (c *SubtitleCache) FontBundleRetryAfter(key FontBundleKey) (time.Duration, 
 	}
 	if !now.Before(retryAt) {
 		delete(c.fontFailureRetryAt, flightKey)
-		delete(c.fontFailureFallback, flightKey)
 		return 0, false
 	}
 	return retryAt.Sub(now), true
 }
 
-func (c *SubtitleCache) noteFontBundleFailure(flightKey string, extractErr error) {
+func (c *SubtitleCache) noteFontBundleFailure(flightKey string) {
 	if c == nil || flightKey == "" {
 		return
 	}
@@ -2519,18 +2232,11 @@ func (c *SubtitleCache) noteFontBundleFailure(flightKey string, extractErr error
 	if c.fontFailureRetryAt == nil {
 		c.fontFailureRetryAt = make(map[string]time.Time)
 	}
-	if errors.Is(extractErr, ErrSubtitleFontSubsetUnavailable) {
-		if c.fontFailureFallback == nil {
-			c.fontFailureFallback = make(map[string]string)
-		}
-		c.fontFailureFallback[flightKey] = SubtitleFontFallbackSubsetUnavailable
-	}
 	if len(c.fontFailureRetryAt) >= subtitleFontBundleFailureMaxEntries {
 		now := time.Now()
 		for key, retryAt := range c.fontFailureRetryAt {
 			if !now.Before(retryAt) {
 				delete(c.fontFailureRetryAt, key)
-				delete(c.fontFailureFallback, key)
 			}
 		}
 		if len(c.fontFailureRetryAt) >= subtitleFontBundleFailureMaxEntries {
@@ -2544,36 +2250,9 @@ func (c *SubtitleCache) noteFontBundleFailure(flightKey string, extractErr error
 				}
 			}
 			delete(c.fontFailureRetryAt, victim)
-			delete(c.fontFailureFallback, victim)
 		}
 	}
 	c.fontFailureRetryAt[flightKey] = time.Now().Add(subtitleFontBundleFailureCooldown)
-}
-
-// FontBundleFallback reports the permanent fallback reason recorded for a key's
-// last font-bundle extraction, or "" when the failure was transient or absent.
-// It is meaningful only while the failure backoff is active; an expired entry
-// is cleared like FontBundleRetryAfter does.
-func (c *SubtitleCache) FontBundleFallback(key FontBundleKey) string {
-	if c == nil {
-		return ""
-	}
-	flightKey, ok := c.fontBundleFlightKey(key, time.Now())
-	if !ok {
-		return ""
-	}
-	c.fontFailureMu.Lock()
-	defer c.fontFailureMu.Unlock()
-	reason := c.fontFailureFallback[flightKey]
-	if reason == "" {
-		return ""
-	}
-	retryAt, cooling := c.fontFailureRetryAt[flightKey]
-	if !cooling || !time.Now().Before(retryAt) {
-		delete(c.fontFailureFallback, flightKey)
-		return ""
-	}
-	return reason
 }
 
 func (c *SubtitleCache) noteFontBundleSuccess(flightKey string) {
@@ -2582,7 +2261,6 @@ func (c *SubtitleCache) noteFontBundleSuccess(flightKey string) {
 	}
 	c.fontFailureMu.Lock()
 	delete(c.fontFailureRetryAt, flightKey)
-	delete(c.fontFailureFallback, flightKey)
 	c.fontFailureMu.Unlock()
 }
 
@@ -2607,30 +2285,11 @@ func (c *SubtitleCache) startFontBundleFlight(ctx context.Context, key FontBundl
 		defer cancel()
 		data, extractErr := extract(extractCtx)
 		if extractErr != nil {
-			if errors.Is(extractErr, ErrRelayDemuxBusy) {
-				// The relay is already at its demux ceiling. Fonts are optional
-				// to playback, so this attempt is skipped without arming the
-				// failure backoff: a waiter gets the pending (empty bundle)
-				// shape and the next request retries once the pipe frees up.
-				return nil, errSubtitleFontBundleFlightSkipped
-			}
-			c.noteFontBundleFailure(flightKey, extractErr)
+			c.noteFontBundleFailure(flightKey)
 			return nil, extractErr
 		}
 		if storeErr := c.storeFontBundle(key, data); storeErr != nil {
 			slog.WarnContext(ctx, "subtitle font bundle cache store failed", "error", storeErr)
-		}
-		items := fontBundleItemCount(data)
-		if items == 0 {
-			// A completed extraction with no attachments is a definitive empty
-			// bundle, not a failed one: the client should cache it and stop
-			// polling. Say so explicitly so it is distinguishable from the
-			// silent timeout shape below.
-			slog.InfoContext(ctx, "subtitle font bundle stored with no attachments",
-				"file_id", key.FileID, "bytes", len(data))
-		} else {
-			slog.DebugContext(ctx, "subtitle font bundle stored",
-				"file_id", key.FileID, "items", items, "bytes", len(data))
 		}
 		c.noteFontBundleSuccess(flightKey)
 		return data, nil
@@ -2646,33 +2305,13 @@ func (c *SubtitleCache) startFontBundleFlight(ctx context.Context, key FontBundl
 // degrade to the pending empty bundle instead of failing playback.
 func fontBundleFlightOutcome(res singleflight.Result) ([]byte, bool, error) {
 	if res.Err != nil {
-		if errors.Is(res.Err, context.DeadlineExceeded) ||
-			errors.Is(res.Err, context.Canceled) ||
-			errors.Is(res.Err, errSubtitleFontBundleFlightSkipped) {
+		if errors.Is(res.Err, context.DeadlineExceeded) || errors.Is(res.Err, context.Canceled) {
 			return nil, false, nil
 		}
 		return nil, false, res.Err
 	}
 	data, _ := res.Val.([]byte)
 	return data, true, nil
-}
-
-// fontBundleItemCount reports how many attachments an encoded bundle carries.
-// The cache stores the handler's bare JSON array; an unparseable payload still
-// has non-zero bytes, so callers can distinguish it from a definitive empty
-// bundle by size.
-func fontBundleItemCount(data []byte) int {
-	if len(data) == 0 {
-		return 0
-	}
-	var items []json.RawMessage
-	if err := json.Unmarshal(data, &items); err != nil {
-		if len(bytes.TrimSpace(data)) == 0 {
-			return 0
-		}
-		return -1
-	}
-	return len(items)
 }
 
 // ExtractFontBundle returns the encoded font-bundle JSON for the key, reusing
@@ -2769,7 +2408,7 @@ func (c *SubtitleCache) WarmFontBundleInBackground(key FontBundleKey, extract fu
 		close(done)
 		return done
 	}
-	resultCh, ok := c.startFontBundleFlight(detachedRelayDemux(context.Background()), key, extract)
+	resultCh, ok := c.startFontBundleFlight(context.Background(), key, extract)
 	if !ok {
 		<-c.warmSem
 		close(done)
@@ -2782,31 +2421,14 @@ func (c *SubtitleCache) WarmFontBundleInBackground(key FontBundleKey, extract fu
 		defer close(done)
 		defer func() { <-c.warmSem }()
 		start := time.Now()
-		elapsed := func() int64 { return time.Since(start).Milliseconds() }
-		res := <-resultCh
-		switch {
-		case errors.Is(res.Err, errSubtitleFontBundleFlightSkipped):
-			// Expected backpressure, not a source failure: the next trigger
-			// retries once the relay's font budget frees up.
-			slog.Debug("font bundle warm skipped: relay demux busy",
-				"file_id", key.FileID, "elapsed_ms", elapsed())
-		case errors.Is(res.Err, context.DeadlineExceeded), errors.Is(res.Err, context.Canceled):
-			// The production failure this reporting exists for: every cold
-			// dump hit its deadline and stored nothing, which the old
-			// "finished" line hid while the client kept polling.
-			slog.Warn("font bundle warm produced no bundle",
-				"file_id", key.FileID, "elapsed_ms", elapsed(),
-				"reason", "extraction deadline exceeded or was canceled")
-		case res.Err != nil:
+		_, _, err := fontBundleFlightOutcome(<-resultCh)
+		if err != nil {
 			slog.Warn("font bundle warm failed",
-				"file_id", key.FileID, "elapsed_ms", elapsed(), "error", res.Err)
-		default:
-			data, _ := res.Val.([]byte)
-			items := fontBundleItemCount(data)
-			slog.Info("font bundle warm finished",
-				"file_id", key.FileID, "elapsed_ms", elapsed(),
-				"items", items, "bytes", len(data))
+				"file_id", key.FileID, "elapsed_ms", time.Since(start).Milliseconds(), "error", err)
+			return
 		}
+		slog.Info("font bundle warm finished",
+			"file_id", key.FileID, "elapsed_ms", time.Since(start).Milliseconds())
 	}()
 	return done
 }

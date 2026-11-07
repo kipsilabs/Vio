@@ -8,7 +8,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 )
 
 // TestExtractTextSharesInFlightFill: a request for a track another request is
@@ -23,8 +22,6 @@ func TestExtractTextSharesInFlightFill(t *testing.T) {
 	var calls atomic.Int32
 	started := make(chan struct{})
 	release := make(chan struct{})
-	var releaseOnce sync.Once
-	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
 	extract := func(context.Context) ([]byte, error) {
 		if calls.Add(1) == 1 {
 			close(started)
@@ -41,11 +38,7 @@ func TestExtractTextSharesInFlightFill(t *testing.T) {
 		defer wg.Done()
 		results[0], errs[0] = cache.ExtractText(context.Background(), source, 0, "srt", extract)
 	}()
-	select {
-	case <-started:
-	case <-time.After(5 * time.Second):
-		t.Fatal("first extraction did not start")
-	}
+	<-started
 	// Release the first extraction only once the second request is waiting
 	// on it, so the test exercises the shared fill, not a later cache hit.
 	busy := make(chan struct{})
@@ -57,12 +50,8 @@ func TestExtractTextSharesInFlightFill(t *testing.T) {
 		defer wg.Done()
 		results[1], errs[1] = cache.ExtractText(context.Background(), source, 0, "srt", extract)
 	}()
-	select {
-	case <-busy:
-	case <-time.After(5 * time.Second):
-		t.Fatal("second request did not start waiting on the fill")
-	}
-	releaseOnce.Do(func() { close(release) })
+	<-busy
+	close(release)
 	wg.Wait()
 
 	for i := range errs {

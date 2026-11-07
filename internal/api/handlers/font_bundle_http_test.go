@@ -22,26 +22,6 @@ const fontProbeJSON = `cat <<'JSON'
 JSON
 `
 
-func TestPendingFontBundleResponseCarriesFallbackMarker(t *testing.T) {
-	recorder := httptest.NewRecorder()
-	writePendingFontBundleResponse(recorder, playback.SubtitleFontFallbackSubsetUnavailable)
-	if got := recorder.Header().Get(fontBundleFallbackHeader); got != playback.SubtitleFontFallbackSubsetUnavailable {
-		t.Fatalf("fallback header = %q, want %q", got, playback.SubtitleFontFallbackSubsetUnavailable)
-	}
-	if got := recorder.Header().Get(fontBundlePendingHeader); got != "true" {
-		t.Fatalf("pending header = %q, want true", got)
-	}
-	if body := strings.TrimSpace(recorder.Body.String()); body != "[]" {
-		t.Fatalf("fallback body = %q, want an empty bundle", body)
-	}
-
-	ordinary := httptest.NewRecorder()
-	writePendingFontBundleResponse(ordinary, "")
-	if got := ordinary.Header().Get(fontBundleFallbackHeader); got != "" {
-		t.Fatalf("ordinary pending bundle carried fallback %q", got)
-	}
-}
-
 func writeExecutableScript(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
@@ -51,11 +31,11 @@ func writeExecutableScript(t *testing.T, path, content string) {
 
 func fontProbeScript(probeLog, gatePath string, gate bool, fail bool) string {
 	script := "#!/bin/sh\necho probe >> '" + probeLog + "'\n"
-	if gate {
-		script += "while [ ! -f '" + gatePath + "' ]; do sleep 0.01; done\n"
-	}
 	if fail {
 		return script + "exit 1\n"
+	}
+	if gate {
+		script += "while [ ! -f '" + gatePath + "' ]; do sleep 0.01; done\n"
 	}
 	return script + fontProbeJSON
 }
@@ -101,12 +81,7 @@ func newFontBundleHTTPFixture(t *testing.T, tracks []models.SubtitleTrack, probe
 	probeLog := filepath.Join(dir, "probe.log")
 	dumpLog := filepath.Join(dir, "dump.log")
 	gatePath := filepath.Join(dir, "gate")
-	writeExecutableScript(t, filepath.Join(dir, "ffprobe"), fontProbeScript(
-		probeLog,
-		gatePath,
-		probeMode == "gate" || probeMode == "gate-fail",
-		probeMode == "fail" || probeMode == "gate-fail",
-	))
+	writeExecutableScript(t, filepath.Join(dir, "ffprobe"), fontProbeScript(probeLog, gatePath, probeMode == "gate", probeMode == "fail"))
 	writeExecutableScript(t, filepath.Join(dir, "ffmpeg"), fontFFmpegDumpScript(dumpLog))
 
 	mediaPath := writePlaybackTestMediaFile(t, "movie.mkv")
@@ -175,7 +150,7 @@ func TestHandleSubtitleFontsReturnsEmptyBeforeDetachedExtractionCompletes(t *tes
 	if err := os.WriteFile(gatePath, []byte("go"), 0o600); err != nil {
 		t.Fatalf("release gate: %v", err)
 	}
-	key := fontBundleCacheKey(file, handler.ffmpegPath())
+	key := fontBundleCacheKey(file, "", handler.ffmpegPath())
 	if !pollHandlerFontBundle(t, handler.SubtitleCache, key) {
 		t.Fatal("detached extraction never committed to the cache")
 	}
@@ -294,7 +269,7 @@ func TestHandleSubtitleFontsCoalescesParallelTrackRequests(t *testing.T) {
 	if err := os.WriteFile(gatePath, []byte("go"), 0o600); err != nil {
 		t.Fatalf("release gate: %v", err)
 	}
-	key := fontBundleCacheKey(file, handler.ffmpegPath())
+	key := fontBundleCacheKey(file, "", handler.ffmpegPath())
 	if !pollHandlerFontBundle(t, handler.SubtitleCache, key) {
 		t.Fatal("coalesced extraction never committed to the cache")
 	}

@@ -499,13 +499,6 @@ type Dependencies struct {
 	// CatalogItems answers item, season, and episode reads
 	// (*handlers.CatalogResourceHandler).
 	CatalogItems CatalogItemService
-	// CatalogVersionsCheck answers the batched versions liveness probe
-	// (*handlers.CatalogResourceHandler). A nil seam makes only
-	// checkCatalogVersions answer dependency_unavailable.
-	CatalogVersionsCheck CatalogVersionCheckService
-	// CatalogVersionsWarm warms the virtual listings a versions read
-	// surfaced (*handlers.CatalogResourceHandler). Nil disables warming.
-	CatalogVersionsWarm CatalogVersionWarmService
 	// CatalogTrailers answers the trailer capability and refresh action
 	// (*handlers.ItemsHandler).
 	CatalogTrailers CatalogTrailerService
@@ -1190,20 +1183,6 @@ type CatalogItemService interface {
 	SeriesSeasons(ctx context.Context, v handlers.ItemViewer, id string, includeArtwork bool) ([]handlers.SeasonView, error)
 	SeriesSeason(ctx context.Context, v handlers.ItemViewer, id string, num int) (handlers.SeasonView, error)
 	SeasonEpisodes(ctx context.Context, v handlers.ItemViewer, id string, num int) ([]handlers.EpisodeView, error)
-}
-
-// CatalogVersionCheckService is the slice of *handlers.CatalogResourceHandler
-// the v2 versions liveness check calls. A missing service makes only that
-// operation answer dependency_unavailable.
-type CatalogVersionCheckService interface {
-	CheckVersions(ctx context.Context, fileIDs []int) []handlers.VersionCheckResult
-}
-
-// CatalogVersionWarmService warms the metadata-only virtual candidate
-// listings a versions read surfaced. *handlers.CatalogResourceHandler
-// implements it; nil leaves the read free of warming.
-type CatalogVersionWarmService interface {
-	PrefetchItemVersionsVirtual(ctx context.Context, versions []mediacatalog.FileVersion, profileID string)
 }
 
 // CatalogTrailerService is the slice of *handlers.ItemsHandler the trailer

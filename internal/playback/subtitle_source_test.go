@@ -796,10 +796,6 @@ func TestWarmEmbeddedTextTracksKeepsItsSlotForTheBatch(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the batch never ran")
 	}
-	// The batch hands back before the warm publishes its files; wait for it
-	// to free its slot so no write lands after the test's temp dir is torn
-	// down. Every other slot stays busy, so this leaves capacity minus one.
-	waitForCondition(t, func() bool { return len(c.warmSem) == cap(c.warmSem)-1 }, func() {})
 }
 
 type timedFallbackSource struct{ *fakeEmbeddedSource }

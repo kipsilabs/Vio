@@ -1421,130 +1421,42 @@ type BandwidthLimitV3 struct {
 }
 
 type PlanV3 struct {
-	BandwidthLimit  *BandwidthLimitV3 `json:"bandwidth_limit,omitempty"`
-	ProtocolVersion int               `json:"protocol_version"`
-	PlanID          string            `json:"plan_id"`
-	// CanonicalPlanID is the unsalted plan ID that identifies the recipe for
-	// this attempt. Replan installations incorporate a unique generation salt
-	// into PlanID for transport identity; CanonicalPlanID stays invariant so
-	// server-side recipe exclusion and PlanAttemptKey are computed consistently.
-	CanonicalPlanID string `json:"canonical_plan_id,omitempty"`
-	// PlanAttemptKey is the server-computed opaque loop-prevention token for
-	// this plan. Clients store the keys of attempted plans and echo them in
-	// attempted_plan_keys on replan; they never compute keys themselves.
-	PlanAttemptKey       string                 `json:"plan_attempt_key"`
-	SessionID            string                 `json:"session_id,omitempty"`
-	ExpiresAt            string                 `json:"expires_at,omitempty"`
-	Delivery             DeliveryV3             `json:"delivery"`
-	Stream               StreamV3               `json:"stream"`
-	Timeline             TimelineV3             `json:"timeline"`
-	SelectedTracks       SelectedTracksV3       `json:"selected_tracks"`
-	EffectiveRecipe      EffectiveRecipeV3      `json:"effective_recipe"`
-	Claims               ValidationClaimsV3     `json:"claims"`
-	Subtitle             SubtitleDecisionV3     `json:"subtitle"`
-	Transformations      []TransformationV3     `json:"transformations"`
-	AppliedQuirks        []AppliedQuirkV3       `json:"applied_quirks"`
-	RuntimeCorrections   []string               `json:"runtime_corrections"`
-	AvailableQualities   []AvailableQualityV3   `json:"available_qualities"`
-	DegradationWarnings  []DegradationWarningV3 `json:"degradation_warnings"`
-	DecisionReason       string                 `json:"decision_reason"`
-	RequestedMediaFileID int                    `json:"requested_media_file_id"`
-	EffectiveMediaFileID int                    `json:"effective_media_file_id"`
-	// SubstitutedFromFileID names the catalog row the client asked for when the
-	// effective release differs from it; it is the requested row id and is
-	// omitted when the effective row is the requested one. It exists so a
-	// client can surface an honest substitution notice without first diffing
-	// the requested/effective ids, and carries SubstitutionReason alongside.
-	// UI-only, like the inventory hints below: it is set after plan identity is
-	// finalized and is deliberately excluded from plan identity hashing.
-	SubstitutedFromFileID int `json:"substituted_from_file_id,omitempty"`
-	// SubstitutionReason is the machine-readable cause of a version
-	// substitution, present only with SubstitutedFromFileID: a dead release, a
-	// provider listing failure, a transport failure, or a decode rejection.
-	// The set is additive; clients treat an unknown value as a generic
-	// substitution rather than failing to render.
-	SubstitutionReason string `json:"substitution_reason,omitempty"`
-	// DeliveryChange, when present, records that this plan changed the serving
-	// route mid-session: the delivery and/or play method differs from the plan
-	// the session was previously serving. A failure-recovery replan may
-	// legitimately move from one delivery to another (for example
-	// server_transcode_hls to server_remux_progressive), and without an explicit
-	// marker the client only sees the new plan body and cannot tell a silent
-	// mid-play route swap from a planned change. It is a UI-only signal, set
-	// after plan identity is finalized and deliberately excluded from plan
-	// identity hashing, like the substitution and inventory hints beside it.
-	DeliveryChange *DeliveryChangeV3 `json:"delivery_change,omitempty"`
-	// EffectiveVirtualURI is the provider-neutral virtual:// candidate URI the
-	// planner selected and probed when it substituted a real candidate for a
-	// neutral catalog row. UI-only: clients use it to keep the version menu in
-	// sync with the version that actually played. It is deliberately excluded
-	// from plan identity hashing, like the inventory fields above.
-	EffectiveVirtualURI string `json:"effective_virtual_uri,omitempty"`
-	// VirtualSourceRevision is an opaque, non-secret revision of the resolved
-	// virtual source media generation. It changes when the planner resolves a
-	// different candidate (a release rotation) and when the track evidence is
-	// repaired under the same candidate, and stays fixed while the same
-	// generation is served, so clients can re-arm source-change recovery on a
-	// rotation even when the published effective_media_file_id and
-	// effective_virtual_uri are unchanged. Its inputs are the provider-neutral
-	// candidate identity (the `?result=` fingerprint) plus the evidence
-	// generation (probe stamp, probe version, canonical track fingerprint) — never a provider
-	// URL, token, or header; the value is a domain-separated SHA-256. Empty
-	// for a non-virtual source. Like EffectiveVirtualURI it is a UI hint and
-	// is deliberately excluded from plan identity hashing.
-	VirtualSourceRevision  string             `json:"virtual_source_revision,omitempty"`
-	Source                 SourceDescriptorV3 `json:"source"`
-	SubtitleFidelityPolicy string             `json:"subtitle_fidelity_policy"`
-	// AudioTracks is the authoritative per-track audio inventory of the
-	// effective source, mirroring the subtitle inventory. Clients should
-	// prefer it over item metadata: after a version fallback the effective
-	// file can differ from the requested catalog row, and only this list
-	// reflects the tracks the plan actually plays. Select a track by echoing an
-	// entry's track_id or selection_index, never by its raw index.
-	AudioTracks []AudioInventoryItemV3 `json:"audio_tracks,omitempty"`
-	// InventoryRevision is an opaque, deterministic revision of the plan's
-	// authoritative audio and subtitle inventories. It advances when the
-	// background probe populates or repairs tracks under a live virtual session.
-	InventoryRevision string `json:"inventory_revision,omitempty"`
-	// InventoryStatus indicates whether the track inventory is "declared"
-	// (placeholder from candidate metadata) or "verified" (probed by ffprobe).
-	InventoryStatus string `json:"inventory_status,omitempty"`
-	// InventoryProvenance qualifies InventoryStatus with the resolver's own
-	// provenance for a virtual source: "verified" (this resolve probed the
-	// served bytes), "declared" (provider metadata only), "pending" (a probe
-	// is deferred), or "failed" (a probe ran and failed, so declared metadata
-	// is served). It is empty for a non-virtual source. InventoryStatus is
-	// inferred from the row's probe stamp alone, which a stale stamp or a
-	// served declared fallback can make look "verified"; this field reports
-	// what the resolve that produced the plan actually did. Like the inventory
-	// fields beside it, it is a UI hint and is deliberately excluded from plan
-	// identity hashing; it never changes selection.
-	InventoryProvenance string `json:"inventory_provenance,omitempty"`
-	ActiveQuality       string `json:"active_quality,omitempty"`
-	// InventoryURL is the relative URL clients can fetch (with ETag/If-None-Match)
-	// to retrieve refreshed audio and subtitle inventories without replanning.
-	InventoryURL string `json:"inventory_url,omitempty" format:"uri-reference"`
-	// TracksPending marks a plan whose audio and subtitle inventory is
-	// deliberately provisional: the first-byte URL was handed back with the
-	// minimal executable recipe (video plus the default audio) and the full
-	// track enumeration is still being probed. It is additive and omitted on a
-	// plan whose inventory is already complete. A client shows its track menu
-	// as loading until the follow-up `inventory_updated` push (or the existing
-	// inventory poll) replaces the provisional list; the value never changes
-	// stream selection or the executable recipe, and it is excluded from plan
-	// identity hashing like the inventory fields beside it.
-	TracksPending bool `json:"tracks_pending,omitempty"`
-	// AudioSelectionPending marks a committed cross-release fallback whose
-	// selected audio ordinal could not be verified on the replacement: the
-	// replacement's inventory was never probed, so the request's ordinal was
-	// passed to the transport unchanged. It may name the selected track,
-	// another stream, or no stream at all. It is additive, UI-only, and set
-	// after plan identity is finalized (like the inventory hints beside it),
-	// so it is excluded from plan identity hashing; the plan also carries the
-	// audio_track_unverified degradation warning. A client must render the
-	// audio pick as pending/unverified rather than confirmed while this is
-	// true, even if it ignores degradation warnings.
-	AudioSelectionPending bool `json:"audio_selection_pending,omitempty"`
+	BandwidthLimit         *BandwidthLimitV3      `json:"bandwidth_limit,omitempty"`
+	ProtocolVersion        int                    `json:"protocol_version"`
+	PlanID                 string                 `json:"plan_id"`
+	CanonicalPlanID        string                 `json:"canonical_plan_id,omitempty"`
+	PlanAttemptKey         string                 `json:"plan_attempt_key"`
+	SessionID              string                 `json:"session_id,omitempty"`
+	ExpiresAt              string                 `json:"expires_at,omitempty"`
+	Delivery               DeliveryV3             `json:"delivery"`
+	Stream                 StreamV3               `json:"stream"`
+	Timeline               TimelineV3             `json:"timeline"`
+	SelectedTracks         SelectedTracksV3       `json:"selected_tracks"`
+	EffectiveRecipe        EffectiveRecipeV3      `json:"effective_recipe"`
+	Claims                 ValidationClaimsV3     `json:"claims"`
+	Subtitle               SubtitleDecisionV3     `json:"subtitle"`
+	Transformations        []TransformationV3     `json:"transformations"`
+	AppliedQuirks          []AppliedQuirkV3       `json:"applied_quirks"`
+	RuntimeCorrections     []string               `json:"runtime_corrections"`
+	AvailableQualities     []AvailableQualityV3   `json:"available_qualities"`
+	DegradationWarnings    []DegradationWarningV3 `json:"degradation_warnings"`
+	DecisionReason         string                 `json:"decision_reason"`
+	RequestedMediaFileID   int                    `json:"requested_media_file_id"`
+	EffectiveMediaFileID   int                    `json:"effective_media_file_id"`
+	SubstitutedFromFileID  int                    `json:"substituted_from_file_id,omitempty"`
+	SubstitutionReason     string                 `json:"substitution_reason,omitempty"`
+	InventoryURL           string                 `json:"inventory_url,omitempty" format:"uri-reference"`
+	DeliveryChange         *DeliveryChangeV3      `json:"delivery_change,omitempty"`
+	TracksPending          bool                   `json:"tracks_pending,omitempty"`
+	EffectiveVirtualURI    string                 `json:"effective_virtual_uri,omitempty" doc:"Virtual candidate URI that is playing; not validated as a URI"`
+	VirtualSourceRevision  string                 `json:"virtual_source_revision,omitempty"`
+	Source                 SourceDescriptorV3     `json:"source"`
+	SubtitleFidelityPolicy string                 `json:"subtitle_fidelity_policy"`
+	AudioTracks            []AudioInventoryItemV3 `json:"audio_tracks,omitempty"`
+	InventoryRevision      string                 `json:"inventory_revision,omitempty"`
+	InventoryStatus        string                 `json:"inventory_status,omitempty"`
+	InventoryProvenance    string                 `json:"inventory_provenance,omitempty"`
+	ActiveQuality          string                 `json:"active_quality,omitempty"`
 }
 
 type TerminalV3 struct {

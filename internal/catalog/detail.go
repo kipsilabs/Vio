@@ -598,63 +598,45 @@ type PersonCredit struct {
 // FileVersion represents a single file version available for playback.
 type FileVersion struct {
 	providerOrder            *int
-	FileID                   int       `json:"file_id"`
-	FileName                 string    `json:"file_name,omitempty"`
-	FilePath                 string    `json:"file_path,omitempty"`
-	Resolution               string    `json:"resolution"`
-	CodecVideo               string    `json:"codec_video"`
-	CodecAudio               string    `json:"codec_audio"`
-	HDR                      bool      `json:"hdr"`
-	Container                string    `json:"container"`
-	FileSize                 int64     `json:"file_size"`
-	Duration                 int       `json:"duration"`
-	Bitrate                  int       `json:"bitrate"`
-	AddedAt                  time.Time `json:"added_at"`
-	EditionRaw               string    `json:"edition_raw,omitempty"`
-	EditionKey               string    `json:"edition_key,omitempty"`
-	ReleaseName              string    `json:"release_name,omitempty"`
-	ReleaseGroup             string    `json:"release_group,omitempty"`
-	PresentationKind         string    `json:"presentation_kind,omitempty"`
-	PresentationGroupKey     string    `json:"presentation_group_key,omitempty"`
-	PresentationPartIndex    int       `json:"presentation_part_index,omitempty"`
-	PresentationPartTotal    int       `json:"presentation_part_total,omitempty"`
-	MultiEpisodeStart        int       `json:"multi_episode_start,omitempty"`
-	MultiEpisodeEnd          int       `json:"multi_episode_end,omitempty"`
-	EffectiveAudioTrackIndex *int      `json:"effective_audio_track_index,omitempty"`
-	EffectiveAudioLanguage   string    `json:"effective_audio_language,omitempty"`
-	Failed                   bool      `json:"failed,omitempty"`
-	// FailedAt is when the catalog stamped media_files.failed_at for a virtual
-	// row, nil for a live row or a failed flag without a durable stamp.
-	// Server-side only: the verdict backstop age (FailedVerdictMaxAge) decides
-	// whether it still excludes the row, so each surface applies the same
-	// windowing rather than reading the timeless Failed flag alone.
-	FailedAt *time.Time `json:"-"`
-	// Available reports the durable per-version health signal: a virtual
-	// candidate is available when it has not been stamped failed (failed_at is
-	// NULL), a local file when it is not marked missing (missing_since is
-	// NULL). Omitted when the version is available, so an absent field means
-	// available/unknown; false means the version is currently unavailable.
-	Available *bool `json:"available,omitempty"`
-	// FormatScore is the custom-format score the virtual ranking assigned to a
-	// virtual candidate under the active quality profile. Absent for local
-	// files and when no ranking ran, so an unscored row shows nothing. It is a
-	// display-only hint and is never used for ordering here.
-	FormatScore *int `json:"format_score,omitempty"`
-	// MatchedFormats names the enabled, non-rejecting custom formats the
-	// virtual ranking matched on this candidate, ordered score-descending then
-	// name-ascending. It accompanies FormatScore and is absent on the same
-	// unscored rows. Display-only: ordering never consults it.
-	MatchedFormats []string               `json:"matched_formats,omitempty"`
-	VideoTracks    []models.VideoTrack    `json:"video_tracks,omitempty"`
-	AudioTracks    []models.AudioTrack    `json:"audio_tracks,omitempty"`
-	SubtitleTracks []VersionSubtitleTrack `json:"subtitle_tracks,omitempty"`
-	Chapters       []VersionChapter       `json:"chapters,omitempty"`
-	Intro          *Marker                `json:"intro,omitempty"`
-	Credits        *Marker                `json:"credits,omitempty"`
-	Recap          *Marker                `json:"recap,omitempty"`
-	Preview        *Marker                `json:"preview,omitempty"`
-	MarkerSegments []models.MarkerSegment `json:"-"`
-	MarkerPreviews []VersionMarkerPreview `json:"-"`
+	Failed                   bool                   `json:"failed,omitempty"`
+	Available                *bool                  `json:"available,omitempty"`
+	FormatScore              *int                   `json:"format_score,omitempty"`
+	MatchedFormats           []string               `json:"matched_formats,omitempty"`
+	ProbedAt                 *time.Time             `json:"-"`
+	FileID                   int                    `json:"file_id"`
+	FileName                 string                 `json:"file_name,omitempty"`
+	FilePath                 string                 `json:"file_path,omitempty"`
+	Resolution               string                 `json:"resolution"`
+	CodecVideo               string                 `json:"codec_video"`
+	CodecAudio               string                 `json:"codec_audio"`
+	HDR                      bool                   `json:"hdr"`
+	Container                string                 `json:"container"`
+	FileSize                 int64                  `json:"file_size"`
+	Duration                 int                    `json:"duration"`
+	Bitrate                  int                    `json:"bitrate"`
+	AddedAt                  time.Time              `json:"added_at"`
+	EditionRaw               string                 `json:"edition_raw,omitempty"`
+	EditionKey               string                 `json:"edition_key,omitempty"`
+	ReleaseName              string                 `json:"release_name,omitempty"`
+	ReleaseGroup             string                 `json:"release_group,omitempty"`
+	PresentationKind         string                 `json:"presentation_kind,omitempty"`
+	PresentationGroupKey     string                 `json:"presentation_group_key,omitempty"`
+	PresentationPartIndex    int                    `json:"presentation_part_index,omitempty"`
+	PresentationPartTotal    int                    `json:"presentation_part_total,omitempty"`
+	MultiEpisodeStart        int                    `json:"multi_episode_start,omitempty"`
+	MultiEpisodeEnd          int                    `json:"multi_episode_end,omitempty"`
+	EffectiveAudioTrackIndex *int                   `json:"effective_audio_track_index,omitempty"`
+	EffectiveAudioLanguage   string                 `json:"effective_audio_language,omitempty"`
+	VideoTracks              []models.VideoTrack    `json:"video_tracks,omitempty"`
+	AudioTracks              []models.AudioTrack    `json:"audio_tracks,omitempty"`
+	SubtitleTracks           []VersionSubtitleTrack `json:"subtitle_tracks,omitempty"`
+	Chapters                 []VersionChapter       `json:"chapters,omitempty"`
+	Intro                    *Marker                `json:"intro,omitempty"`
+	Credits                  *Marker                `json:"credits,omitempty"`
+	Recap                    *Marker                `json:"recap,omitempty"`
+	Preview                  *Marker                `json:"preview,omitempty"`
+	MarkerSegments           []models.MarkerSegment `json:"-"`
+	MarkerPreviews           []VersionMarkerPreview `json:"-"`
 	// Trickplay is the layout of the file's servable seek-bar previews, nil
 	// when it has none. The v2 watch and Jellyfin views carry it; the frozen
 	// v1 view does not.
@@ -663,42 +645,13 @@ type FileVersion struct {
 	// and nothing usable is recorded for it, so it cannot play until it is
 	// replaced. Jellyfin PlaybackInfo leaves such versions out. Neither the v1
 	// nor the v2 view carries the flag.
-	Unreadable bool `json:"-"`
-	// ProbedAt is when ffprobe last enumerated the file's real stream table;
-	// nil means the row still carries declared metadata only. Server-side
-	// only: the pre-play probe scheduler uses it to leave a selected row with
-	// fresh inventory alone. The v2 projection exposes the same instant as
-	// probed_at so a client can tell fresh inventory from declared hints.
-	ProbedAt *time.Time `json:"-"`
-	// SourceMismatch is the process-local wrong-source probe verdict for this
-	// row, when the node still holds it. Advisory only: it never changes
-	// Failed or Available and is never persisted. Server-side only; the v2
-	// projection carries it as source_mismatch.
+	Unreadable     bool                   `json:"-"`
 	SourceMismatch *VersionSourceMismatch `json:"-"`
 }
 
 type VersionSourceMismatch struct {
 	ServedBytes   int64 `json:"served_bytes"`
 	DeclaredBytes int64 `json:"declared_bytes"`
-}
-
-// FailedVerdictMaxAge is the backstop age after which a media_files.failed_at
-// verdict stops excluding a candidate. The primary lifecycle is explicit: a
-// verdict is cleared by a real delivery, by an explicit user retry, or by a
-// fresh candidate listing replacing the row. This age exists only so a row that
-// is never listed again cannot stay excluded forever; it is deliberately long
-// so a genuinely dead provider URL is not retried on every start. Every surface
-// that excludes by Failed must apply the same window, or a transient stamp
-// becomes permanent on that surface.
-const FailedVerdictMaxAge = 24 * time.Hour
-
-// FailedVerdictActive reports whether a failed_at stamp still excludes a
-// candidate from selection at now. A nil stamp is never active.
-func FailedVerdictActive(failedAt *time.Time, now time.Time, maxAge time.Duration) bool {
-	if failedAt == nil {
-		return false
-	}
-	return !now.After(failedAt.Add(maxAge))
 }
 
 type VersionSourceMismatchSource func(*models.MediaFile) *VersionSourceMismatch
@@ -5057,7 +5010,6 @@ func (s *DetailService) buildPlaybackInfoWith(
 			EffectiveAudioTrackIndex: intPtr(effectiveAudioSelection.Index),
 			EffectiveAudioLanguage:   effectiveAudioSelection.Language,
 			Failed:                   f.FailedAt != nil,
-			FailedAt:                 f.FailedAt,
 			// Available is the durable per-version health signal: a virtual
 			// candidate is available when it has not been stamped failed
 			// (failed_at IS NULL), a local file when it is not marked missing
@@ -5659,17 +5611,6 @@ func (s *DetailService) buildVersionChapters(ctx context.Context, file *models.M
 		chapters = append(chapters, ch)
 	}
 	return chapters
-}
-
-// VersionSubtitleTracks projects a row's embedded and external subtitle tracks
-// into the version wire shape. It is the projection a version row carries, so a
-// caller that reports inventory outside a version list can answer with the same
-// shape instead of a second one.
-func VersionSubtitleTracks(file *models.MediaFile) []VersionSubtitleTrack {
-	if file == nil {
-		return nil
-	}
-	return buildVersionSubtitleTracks(file)
 }
 
 func buildVersionSubtitleTracks(file *models.MediaFile) []VersionSubtitleTrack {

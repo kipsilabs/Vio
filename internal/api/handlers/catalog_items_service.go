@@ -394,10 +394,6 @@ func (h *CatalogResourceHandler) ItemDetail(ctx context.Context, v ItemViewer, i
 		slog.WarnContext(ctx, "catalog: item detail failed", "component", "api", "item_id", id, "error", err)
 		return nil, apiError(http.StatusInternalServerError, "internal_error", "Failed to get item detail")
 	}
-	// A read that names a version is the media page's selection signal: run the
-	// same probe-and-warm scheduling the watch detail does for that row, before
-	// enrichment strips file paths the scheduler reads.
-	h.items.scheduleSelectedVirtualProbe(detail.ContentID, detail.Type, detail.Versions, v.Access)
 	h.enrichItemDetail(ctx, v, detail, curates)
 	h.items.maybeRequestStaleDetailMetadataRefresh(ctx, detail)
 	return detail, nil

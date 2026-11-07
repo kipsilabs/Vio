@@ -19,70 +19,6 @@ const ArtworkBackendAuto = "auto"
 
 const artworkBackendAuto = ArtworkBackendAuto
 
-// DefaultArtworkLocalPath is the local artwork root a new installation uses.
-// It matches the directory the image creates (Dockerfile) and the deployment
-// compose file persists, so the volume an operator keeps is the tree the
-// server reads.
-const DefaultArtworkLocalPath = "/var/lib/vio/artwork"
-
-// legacyDefaultArtworkLocalPath was the local artwork root before the default
-// moved under /var/lib/vio. Existing installations keep serving it; see
-// artworkLocalPath.
-const legacyDefaultArtworkLocalPath = "/var/lib/silo/artwork"
-
-// artworkIdentitySettingKey mirrors blobstore.IdentitySettingKey. config must
-// not import internal/blobstore, which would link the S3 client into every
-// settings reader, and this decision needs only the row name.
-// artwork_settings_test.go keeps the two in sync.
-const artworkIdentitySettingKey = "artwork.storage_identity"
-
-// artworkLocalRootIdentityPrefix mirrors blobstore.BackendLocal. The identity
-// row is "local|<absolute root>"; config parses only that shape and falls back
-// to the legacy default for any other recorded identity.
-const artworkLocalRootIdentityPrefix = "local|"
-
-// artworkLocalPath resolves artwork.local_path from stored server_settings.
-//
-// The artwork store records its filesystem root as a storage identity on the
-// first write, and startup refuses to open a different root
-// (blobstore.ErrLocationMoved) because catalog rows name keys beneath it. A
-// stored path therefore always wins. With no stored path, a recorded local
-// identity wins next: it names the exact root the store already serves, so an
-// install keeps its recorded path across the default change. That includes a
-// fresh install that adopted DefaultArtworkLocalPath and then recorded its
-// identity on the first write; resolving the legacy default there would make
-// the next start refuse a root it recorded itself. An S3 identity keeps the
-// legacy local default unused by S3; only an installation with no recorded
-// identity, a genuine fresh install, adopts DefaultArtworkLocalPath.
-//
-// Existing installations move to the new default only through the managed
-// storage transition in Admin settings, which copies the data and rewrites the
-// identity row; the path itself is never edited directly.
-func artworkLocalPath(stored map[string]string) string {
-	if path := strings.TrimSpace(stored["artwork.local_path"]); path != "" {
-		return path
-	}
-	if root, ok := artworkLocalRootFromIdentity(stored[artworkIdentitySettingKey]); ok {
-		return root
-	}
-	if strings.TrimSpace(stored[artworkIdentitySettingKey]) != "" {
-		return legacyDefaultArtworkLocalPath
-	}
-	return DefaultArtworkLocalPath
-}
-
-// artworkLocalRootFromIdentity extracts the absolute root from a recorded
-// local storage identity. The identity is written from blobstore's resolved
-// root, so the parsed value is already absolute and clean; a missing prefix or
-// an empty root is not a local identity.
-func artworkLocalRootFromIdentity(identity string) (string, bool) {
-	root, ok := strings.CutPrefix(strings.TrimSpace(identity), artworkLocalRootIdentityPrefix)
-	if !ok || !filepath.IsAbs(root) {
-		return "", false
-	}
-	return filepath.Clean(root), true
-}
-
 // ServerConfig holds HTTP server settings.
 type ServerConfig struct {
 	Listen    string `yaml:"listen"`
@@ -678,7 +614,7 @@ func setDefaults() *configRaw {
 			MaxConcurrentScoped:    2,
 			RealtimeMonitoring:     true,
 		},
-		Artwork: ArtworkConfig{StorageBackend: artworkBackendAuto, LocalPath: DefaultArtworkLocalPath},
+		Artwork: ArtworkConfig{StorageBackend: artworkBackendAuto, LocalPath: "/var/lib/silo/artwork"},
 		Matcher: MatcherConfig{
 			Workers:                 8,
 			BatchSize:               500,

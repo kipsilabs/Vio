@@ -17,13 +17,11 @@ import (
 	"github.com/Silo-Server/silo-server/internal/remotestream"
 )
 
-// TestPrepareTransportTimelineSlowAnchorRetriesOnceThenFailsSeekFast proves the
-// copy-video seek-anchor resolve is bounded well inside the replan budget. A
-// relay that never answers costs the one same-pin retry a budget timeout
-// allows — each attempt bounded by the anchor budget — and returns the
-// retryable seek classification, instead of holding the request for the full
-// probe timeout.
-func TestPrepareTransportTimelineSlowAnchorRetriesOnceThenFailsSeekFast(t *testing.T) {
+// TestPrepareTransportTimelineSlowAnchorFailsSeekFast proves the copy-video
+// seek-anchor resolve is bounded well inside the replan budget. A relay that
+// never answers costs one probe and returns the retryable seek classification,
+// instead of holding the request for the full probe timeout.
+func TestPrepareTransportTimelineSlowAnchorFailsSeekFast(t *testing.T) {
 	previous := copySeekAnchorSeekResolveTimeout
 	copySeekAnchorSeekResolveTimeout = 40 * time.Millisecond
 	defer func() { copySeekAnchorSeekResolveTimeout = previous }()
@@ -49,10 +47,10 @@ func TestPrepareTransportTimelineSlowAnchorRetriesOnceThenFailsSeekFast(t *testi
 	)
 	elapsed := time.Since(started)
 	if elapsed > time.Second {
-		t.Fatalf("slow anchor resolve took %v, want it bounded near two attempts of %v", elapsed, copySeekAnchorSeekResolveTimeout)
+		t.Fatalf("slow anchor resolve took %v, want it bounded near %v", elapsed, copySeekAnchorSeekResolveTimeout)
 	}
-	if got := probes.Load(); got != 2 {
-		t.Fatalf("anchor probes = %d, want exactly 2: one attempt and the one same-pin retry a budget timeout allows", got)
+	if got := probes.Load(); got != 1 {
+		t.Fatalf("anchor probes = %d, want exactly 1 after the anchor budget expired", got)
 	}
 	if transportErr == nil || !transportErr.retryable || !transportErr.seekFailure || transportErr.reason != transcodeStartFailedReasonV3 {
 		t.Fatalf("transport error = %#v, want a retryable seek failure with the existing transcode_start_failed code", transportErr)

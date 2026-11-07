@@ -44,27 +44,19 @@ type VirtualSelectionWarmService interface {
 	ScheduleSelectedFileWarm(contentID string, fileID int, filter catalogpkg.AccessFilter)
 }
 
-// preplayDiscoveryWatchBudget bounds version discovery started from
-// GET /watch/{id}. The caller is about to play, but the discovery work is
-// detached and the start path resolves its own candidate; waiting longer
-// only delays the player's first request. Production provider listings
-// measured 17–25 s, so the old 2 s gave up before even a mid-band listing
-// landed and the start proceeded on the fast path with no fresh candidates.
-// Five seconds covers the fast and mid band while keeping a cold watch read
-// from turning into a multi-second stall; the long tail still degrades to
-// the start path's own resolve. A var so tests can shrink the wait.
-var preplayDiscoveryWatchBudget = 5 * time.Second
-
 const (
+	// preplayDiscoveryWatchBudget bounds version discovery started from
+	// GET /watch/{id}. The caller is about to play, but the discovery work is
+	// detached and the start path resolves its own candidate; waiting longer
+	// only delays the player's first request.
+	preplayDiscoveryWatchBudget = 2 * time.Second
 	// preplayDiscoveryCatalogBudget bounds the detached discovery a catalog
 	// leaf detail read starts. The read never waits for it: it answers from the
 	// persisted version list and the detached run publishes versions_updated
 	// when its listing lands, so this budget only bounds how long that provider
-	// work may run. Twenty seconds admits the observed 17–25 s low band that the
-	// old one-second default (and ten-second ceiling) cut off; work still runs
-	// detached, so the value costs the reader nothing. Deployments tune it with
-	// the admin Streaming setting virtual_library.catalog_discovery_budget_ms.
-	preplayDiscoveryCatalogBudget = 20 * time.Second
+	// work may run. Deployments tune it with the admin Streaming setting
+	// virtual_library.catalog_discovery_budget_ms.
+	preplayDiscoveryCatalogBudget = 1 * time.Second
 
 	// preplayDiscoveryDetailRepeatWindow is how long a successful detail
 	// discovery suppresses another list for the same viewer, item, selected

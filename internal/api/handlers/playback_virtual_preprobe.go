@@ -169,12 +169,6 @@ type virtualCommittedProbeInventory struct {
 	audio        []models.AudioTrack
 	subtitles    []models.SubtitleTrack
 	external     []models.ExternalSubtitle
-	// written reports that this carrier records a catalog write that actually
-	// committed. A carrier can also come from a serve whose evidence was
-	// deliberately not written (see probeInventoryCarrier): its tracks still
-	// belong to the session overlay, but no row changed, so nothing may be
-	// announced as a catalog update.
-	written bool
 }
 
 // committed reports whether the carrier names a real committed catalog row.
@@ -218,18 +212,7 @@ func (h *PlaybackHandler) probeConvergenceBound() time.Duration {
 	if h != nil && h.probeConvergenceOverride > 0 {
 		return h.probeConvergenceOverride
 	}
-	return h.probeBackgroundBudget() + virtualProbeConvergenceSlack
-}
-
-// probeBackgroundBudget is the execution budget for this handler's background
-// and deferred probes. It honors a handler-level test override so a test can
-// shrink the budget without mutating the package global, which outliving probe
-// or watchdog goroutines may still be reading.
-func (h *PlaybackHandler) probeBackgroundBudget() time.Duration {
-	if h != nil && h.backgroundProbeBudgetOverride > 0 {
-		return h.backgroundProbeBudgetOverride
-	}
-	return virtualBackgroundProbeBudget
+	return virtualBackgroundProbeBudget + virtualProbeConvergenceSlack
 }
 
 // probeWatchdogCadence is the effective scan interval, honoring a test override.
@@ -251,49 +234,13 @@ func (h *PlaybackHandler) probeGateWaitBudget() time.Duration {
 }
 
 // startDeferredProbeWatchdog lazily starts the single convergence watchdog. It
-// exits with the service context at server shutdown, and also on
-// StopDeferredProbeWatchdog so a handler whose service context can never be canceled
-// still terminates it.
+// is tied to the service context so it exits at shutdown and never leaks.
 func (h *PlaybackHandler) startDeferredProbeWatchdog() {
 	if h == nil {
 		return
 	}
 	h.deferredProbeWatchdogOnce.Do(func() {
-		stop, done := h.deferredProbeWatchdogChannels()
-		go func() {
-			defer close(done)
-			h.runDeferredProbeWatchdog(stop)
-		}()
-	})
-}
-
-// deferredProbeWatchdogChannels returns the watchdog's stop and done channels,
-// creating them once. Both start and stop go through here so neither depends on
-// the other having run first: a stop before the first start closes the channel
-// the later goroutine immediately observes, and a start after a stop still has
-// the same closed channel to select on.
-func (h *PlaybackHandler) deferredProbeWatchdogChannels() (stop, done chan struct{}) {
-	h.deferredProbeWatchdogInitOnce.Do(func() {
-		h.deferredProbeWatchdogStop = make(chan struct{})
-		h.deferredProbeWatchdogDone = make(chan struct{})
-	})
-	return h.deferredProbeWatchdogStop, h.deferredProbeWatchdogDone
-}
-
-// StopDeferredProbeWatchdog terminates the deferred-probe convergence watchdog. The
-// application shutdown sequence calls it explicitly (wired through
-// api.Dependencies.RegisterShutdownFunc), and tests call it from cleanup so a
-// handler's goroutine never outlives the handler. It is idempotent and safe to
-// call before the watchdog starts or concurrently with its lazy start: closing
-// the stop channel is what ends the goroutine, and the watchdog owns the done
-// channel, so a later caller can wait for the actual exit.
-func (h *PlaybackHandler) StopDeferredProbeWatchdog() {
-	if h == nil {
-		return
-	}
-	stop, _ := h.deferredProbeWatchdogChannels()
-	h.deferredProbeWatchdogStopOnce.Do(func() {
-		close(stop)
+		go h.runDeferredProbeWatchdog()
 	})
 }
 
@@ -306,10 +253,7 @@ func (h *PlaybackHandler) StopDeferredProbeWatchdog() {
 // whole life. A failure write is followed by the same terminal-notification
 // publish every other failed outcome uses, so the push and the poll agree and a
 // client leaves its loading state either way.
-//
-// It exits when the service context ends or when the handler stops it, so it
-// never outlives whichever lifecycle owns the handler.
-func (h *PlaybackHandler) runDeferredProbeWatchdog(stop <-chan struct{}) {
+func (h *PlaybackHandler) runDeferredProbeWatchdog() {
 	base := h.ServiceContext
 	if base == nil {
 		base = context.Background()
@@ -319,8 +263,6 @@ func (h *PlaybackHandler) runDeferredProbeWatchdog(stop <-chan struct{}) {
 	for {
 		select {
 		case <-base.Done():
-			return
-		case <-stop:
 			return
 		case <-ticker.C:
 			h.failOverdueDeferredProbes(time.Now().Add(-h.probeConvergenceBound()))
@@ -1049,7 +991,7 @@ func (h *PlaybackHandler) runDeferredVirtualProbe(deferred *virtualDeferredProbe
 		h.signalDeferredProbeRetry()
 		return
 	}
-	bgCtx, bgCancel := h.virtualDetachedContext(h.ServiceContext, h.probeBackgroundBudget())
+	bgCtx, bgCancel := h.virtualDetachedContext(h.ServiceContext, virtualBackgroundProbeBudget)
 	defer bgCancel()
 	outcome, committed := h.probeVirtualSourceAndPersistWith(bgCtx, deferred.stickyKey, deferred.file, deferred.streamURL, *deferred.probeTransient, deferred.cand, deferred.candidate.tiers(), deferred.expectedRuntimeMinutes, deferred.ownerID, true, h.deferredProbeBindingIntact(deferred))
 	// The probe is done with the shared gate: release this worker's slot before
@@ -1058,21 +1000,16 @@ func (h *PlaybackHandler) runDeferredVirtualProbe(deferred *virtualDeferredProbe
 	// notifications need no drain call here — the dispatcher owns wakeups and
 	// re-checks its map on its own signal and backstop ticker.
 	gate.release()
-	// A verified outcome carries the exact inventory the session will serve; run
-	// the shared cold-start default-audio reconciliation against that carried
-	// inventory — never a reread of the mutable row — with the gate released so
-	// its own catalog/session sweep is not charged to this worker's slot. The
-	// carrier is either a durable write or a serve whose evidence was
-	// deliberately not written because it only recorded the pin's first
-	// served-size observation (see probeInventoryCarrier); both name the row and
-	// the tracks the session is served, and the reconcile is a session-state
-	// decision rather than a catalog write, so it runs for the carried-but-
-	// unwritten case too. It runs BEFORE the overlay is updated so it compares
-	// the plan-time selection against the verified inventory, exactly as the
-	// direct and queued evidence paths do. The probe's binding fence already
-	// refuses a superseded verdict, and the carrier is the record of what was
-	// verified, so an in-place adoption between the write and this reconcile
-	// cannot substitute another release's tracks into the decision.
+	// The durable write committed verified evidence on committed.fileID; run the
+	// shared cold-start default-audio reconciliation against the exact inventory
+	// that write produced — never a reread of the mutable row — with the gate
+	// released so its own catalog/session sweep is not charged to this worker's
+	// slot. It runs BEFORE the overlay is updated so it compares the plan-time
+	// selection against the verified inventory, exactly as the direct and queued
+	// evidence paths do. The probe's binding fence already refuses a superseded
+	// verdict, and the committed carrier is the record of what was written, so an
+	// in-place adoption between the write and this reconcile cannot substitute
+	// another release's tracks into the decision.
 	if outcome == probeOutcomeVerified && committed.committed() {
 		h.reconcileVerifiedDefaultAudioFromCommitted(context.Background(), committed)
 	}

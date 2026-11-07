@@ -462,16 +462,13 @@ func TestVirtualTranscodeStartupFailoverDeclaresCandidateRotation(t *testing.T) 
 	}
 }
 
-// TestVirtualTranscodeCrossReleaseFallbackKeepsSelectionsOnUnknownInventory is
-// the #96 regression, rescoped to what an unprobed replacement can support. A
-// fallback attempt that serves a release whose inventory was never measured
-// must not reuse the pinned release's probed source facts, but it also must not
-// reset the viewer's audio/subtitle selections: unknown inventory is not
-// evidence that the selected streams are absent, and a reset would wipe the
-// pick for the rest of the session. The selections stay pending (burn-in off,
-// because an unverified subtitle ordinal cannot be burned in), while the pinned
+// TestVirtualTranscodeCrossReleaseFallbackResetsPerReleaseOpts is the #96
+// regression: a fallback attempt that serves a different release must not
+// reuse the pinned release's track ordinals or probed source facts. The
+// fallback attempt resets audio/subtitle selections (plus burn-in) to the
+// container default and clears source video/audio facts, while the pinned
 // first attempt keeps the plan's selections untouched.
-func TestVirtualTranscodeCrossReleaseFallbackKeepsSelectionsOnUnknownInventory(t *testing.T) {
+func TestVirtualTranscodeCrossReleaseFallbackResetsPerReleaseOpts(t *testing.T) {
 	tempDir := t.TempDir()
 	fileRes := &fakePinFileResolver{file: &models.MediaFile{
 		ID:                         10,
@@ -525,8 +522,8 @@ func TestVirtualTranscodeCrossReleaseFallbackKeepsSelectionsOnUnknownInventory(t
 			pinned.AudioTrackIndex, pinned.SubtitleTrackIndex, pinned.SubtitleBurnIn)
 	}
 	fallback := attemptOpts[1]
-	if fallback.AudioTrackIndex != 3 || fallback.SubtitleTrackIndex != 2 || fallback.SubtitleBurnIn {
-		t.Fatalf("fallback attempt reset an unproven selection: audio=%d subtitle=%d burn=%v, want the requested 3/2 kept pending with burn-in off",
+	if fallback.AudioTrackIndex != -1 || fallback.SubtitleTrackIndex != -1 || fallback.SubtitleBurnIn {
+		t.Fatalf("fallback attempt kept pinned selections: audio=%d subtitle=%d burn=%v, want -1/-1/false",
 			fallback.AudioTrackIndex, fallback.SubtitleTrackIndex, fallback.SubtitleBurnIn)
 	}
 	if fallback.SourceVideoCodec != "" || fallback.SourceVideoProfile != "" || fallback.SourceVideoBitDepth != 0 {

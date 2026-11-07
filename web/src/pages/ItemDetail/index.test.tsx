@@ -133,7 +133,7 @@ describe("ItemDetail", () => {
 
     renderToStaticMarkup(<ItemDetail />);
 
-    expect(mocks.useCatalogItemDetail).toHaveBeenCalledWith("movie-123", undefined, undefined);
+    expect(mocks.useCatalogItemDetail).toHaveBeenCalledWith("movie-123", undefined);
   });
 
   describe("when the item cannot be shown", () => {

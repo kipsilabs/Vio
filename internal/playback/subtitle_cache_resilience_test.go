@@ -106,11 +106,7 @@ func TestServeSUPExtractWindowedLeaderWriteFailureStillCommits(t *testing.T) {
 		)
 	}()
 
-	select {
-	case <-started:
-	case <-time.After(5 * time.Second):
-		t.Fatal("leader extraction did not start")
-	}
+	<-started
 	followerRec := httptest.NewRecorder()
 	followerResult := make(chan error, 1)
 	go func() {
@@ -415,11 +411,7 @@ func TestServeExtractWindowedCoalescesConcurrentRepeats(t *testing.T) {
 
 	// The leader holds the extraction open; the others either join its flight
 	// or, if they arrive after it stores the slice, serve that stored copy.
-	select {
-	case <-started:
-	case <-time.After(5 * time.Second):
-		t.Fatal("coalesced window extract did not start")
-	}
+	<-started
 	releaseOnce.Do(func() { close(release) })
 
 	for i := 0; i < requests; i++ {
