@@ -90,6 +90,17 @@ func SpanningEpisodeFileExistsSQL(episodeExpr, fileCondition string) string {
 	)`
 }
 
+// episodeServingFileExistsSQL holds when the episode whose content ID is
+// episodeExpr has a present file a read must treat as its own: a file linked
+// to it, a present file owned by one of its alias rows, or a multi-episode
+// file spanning it from an earlier episode. fileCondition is an SQL condition
+// on media_files mf and already includes the missing-file condition.
+// episodeExpr is built from package-owned aliases, never caller input.
+func episodeServingFileExistsSQL(episodeExpr, fileCondition string) string {
+	return "(" + canonicalEpisodeFileExistsSQL(episodeExpr, fileCondition) +
+		" OR " + SpanningEpisodeFileExistsSQL(episodeExpr, fileCondition) + ")"
+}
+
 // SpannedEpisodesSQL selects (content_id, season_number, episode_number) of
 // the later episodes that the present multi-episode files matching
 // filePredicate, an SQL condition on media_files mf, serve.
