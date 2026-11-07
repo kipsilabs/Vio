@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { renderToStaticMarkup } from "react-dom/server";
 import { act, render } from "@testing-library/react";
 import { MemoryRouter } from "react-router";
@@ -6,6 +7,14 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { FileVersion, ItemDetail } from "@/api/types";
 import { readRequestedFileId, rememberRequestedFileId } from "@/playback/requestedVersion";
 import MovieContent from "./MovieContent";
+
+// The page renders query hooks this file does not mock (the household
+// allowance check on the action bar), so every render carries a provider.
+const renderInQueryClient = (ui: ReactNode) =>
+  render(<QueryClientProvider client={new QueryClient()}>{ui}</QueryClientProvider>);
+
+const renderMarkupInQueryClient = (ui: ReactNode) =>
+  renderToStaticMarkup(<QueryClientProvider client={new QueryClient()}>{ui}</QueryClientProvider>);
 
 const mocks = vi.hoisted(() => {
   let capturedActionBarProps: Record<string, unknown> | null = null;
@@ -133,15 +142,14 @@ vi.mock("@/hooks/useAuth", () => ({
 }));
 
 vi.mock("@/hooks/queries/qualityPreference", () => ({
-  // The resolution cap comes from the settings contract; these tests render
-  // without a QueryClient, so the hook stands in for the resolved answer.
+  // The resolution cap comes from the settings contract; the hook stands in
+  // for the resolved answer so the render stays offline and deterministic.
   useQualityPreference: (fallback?: string | null) => fallback ?? null,
 }));
 
 vi.mock("@/hooks/queries/versionLiveness", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/hooks/queries/versionLiveness")>()),
-  // These tests render without a QueryClient; the liveness check is a no-op
-  // that leaves item metadata untouched.
+  // The liveness check is a no-op that leaves item metadata untouched.
   useVersionLiveness: (...args: unknown[]) => mocks.useVersionLiveness(...args),
 }));
 
@@ -334,7 +342,7 @@ describe("MovieContent", () => {
       edition_key: "directors_cut",
     });
 
-    render(
+    renderInQueryClient(
       <MemoryRouter initialEntries={["/item/movie-1"]}>
         <MovieContent item={makeMovieItem({ runtime: 163, versions: [standard, directorsCut] })} />
       </MemoryRouter>,
@@ -377,7 +385,7 @@ describe("MovieContent", () => {
     const requested = makeFileVersion({ file_id: 2, resolution: "1080p" });
     rememberRequestedFileId("movie-1", requested.file_id, PROFILE_ID);
 
-    render(
+    renderInQueryClient(
       <MemoryRouter initialEntries={["/item/movie-1"]}>
         <MovieContent
           item={makeMovieItem({
@@ -404,7 +412,7 @@ describe("MovieContent", () => {
     const first = makeFileVersion({ file_id: 1 });
     const second = makeFileVersion({ file_id: 2, resolution: "1080p" });
 
-    render(
+    renderInQueryClient(
       <MemoryRouter initialEntries={["/item/movie-1"]}>
         <MovieContent item={makeMovieItem({ versions: [first, second] })} />
       </MemoryRouter>,
@@ -427,7 +435,7 @@ describe("MovieContent", () => {
     mocks.useCurrentProfile.mockReturnValue({ profile: { id: PROFILE_ID } });
     rememberRequestedFileId("movie-1", 3, PROFILE_ID);
 
-    render(
+    renderInQueryClient(
       <MemoryRouter initialEntries={["/item/movie-1"]}>
         <MovieContent
           item={makeMovieItem({
@@ -447,7 +455,7 @@ describe("MovieContent", () => {
     const resetProgress = vi.fn();
     resetProgressMocks.useResetProgressAction.mockImplementation(() => resetProgress);
     try {
-      renderToStaticMarkup(
+      renderMarkupInQueryClient(
         <MemoryRouter initialEntries={["/item/movie-1"]}>
           <MovieContent
             item={makeMovieItem({
@@ -472,7 +480,7 @@ describe("MovieContent", () => {
   });
 
   it("passes restartHref when the movie is partially watched", () => {
-    renderToStaticMarkup(
+    renderMarkupInQueryClient(
       <MemoryRouter initialEntries={["/item/movie-1"]}>
         <MovieContent
           item={makeMovieItem({
@@ -494,7 +502,7 @@ describe("MovieContent", () => {
   });
 
   it("does not pass restartHref when the movie is already completed", () => {
-    renderToStaticMarkup(
+    renderMarkupInQueryClient(
       <MemoryRouter initialEntries={["/item/movie-1"]}>
         <MovieContent
           item={makeMovieItem({
@@ -516,7 +524,7 @@ describe("MovieContent", () => {
   });
 
   it("offers resume and restart during a rewatch of a completed movie", () => {
-    renderToStaticMarkup(
+    renderMarkupInQueryClient(
       <MemoryRouter initialEntries={["/item/movie-1"]}>
         <MovieContent
           item={makeMovieItem({
@@ -542,7 +550,7 @@ describe("MovieContent", () => {
       user: { role: "user", permissions: ["marker_edit"], download_allowed: true },
     });
 
-    renderToStaticMarkup(
+    renderMarkupInQueryClient(
       <MemoryRouter initialEntries={["/item/movie-1"]}>
         <MovieContent item={makeMovieItem()} />
       </MemoryRouter>,
@@ -564,7 +572,7 @@ describe("MovieContent", () => {
     mocks.useAuth.mockReturnValue({ user });
     mocks.useLibraryCapabilities.mockReturnValue(capability);
 
-    renderToStaticMarkup(
+    renderMarkupInQueryClient(
       <MemoryRouter initialEntries={["/item/movie-1"]}>
         <MovieContent item={makeMovieItem()} />
       </MemoryRouter>,
@@ -582,7 +590,7 @@ describe("MovieContent", () => {
       data: { redetect_markers: true, movie_credits: true },
     });
 
-    renderToStaticMarkup(
+    renderMarkupInQueryClient(
       <MemoryRouter initialEntries={["/item/movie-1"]}>
         <MovieContent item={makeMovieItem()} />
       </MemoryRouter>,
@@ -599,7 +607,7 @@ describe("MovieContent", () => {
     expect(redetect).toHaveBeenCalledWith({ itemId: "movie-1", kind: "credits" });
 
     mocks.useAuth.mockReturnValue({ user: null });
-    renderToStaticMarkup(
+    renderMarkupInQueryClient(
       <MemoryRouter initialEntries={["/item/movie-1"]}>
         <MovieContent item={makeMovieItem()} />
       </MemoryRouter>,
@@ -622,7 +630,7 @@ describe("MovieContent", () => {
     mocks.useAuth.mockReturnValue({ user: { role: "admin" } });
     mocks.useAdminMarkerCapabilities.mockReturnValue(capability);
 
-    renderToStaticMarkup(
+    renderMarkupInQueryClient(
       <MemoryRouter initialEntries={["/item/movie-1"]}>
         <MovieContent item={makeMovieItem()} />
       </MemoryRouter>,
@@ -633,7 +641,7 @@ describe("MovieContent", () => {
   });
 
   it("does not pass playHref or restartHref when the movie has no versions or play targets", () => {
-    renderToStaticMarkup(
+    renderMarkupInQueryClient(
       <MemoryRouter initialEntries={["/item/movie-1"]}>
         <MovieContent
           item={makeMovieItem({
@@ -652,7 +660,7 @@ describe("MovieContent", () => {
   });
 
   it("passes playHref when the movie has a play target but no local versions", () => {
-    renderToStaticMarkup(
+    renderMarkupInQueryClient(
       <MemoryRouter initialEntries={["/item/movie-1"]}>
         <MovieContent
           item={makeMovieItem({
@@ -673,7 +681,7 @@ describe("MovieContent", () => {
     const standard = makeFileVersion({ file_id: 1, resolution: "1080p" });
     const uhd = makeFileVersion({ file_id: 2, resolution: "2160p" });
 
-    render(
+    renderInQueryClient(
       <MemoryRouter initialEntries={["/item/movie-1"]}>
         <MovieContent item={makeMovieItem({ versions: [standard, uhd] })} />
       </MemoryRouter>,
@@ -685,7 +693,7 @@ describe("MovieContent", () => {
   });
 
   it("renders a Collections row when the movie belongs to collections", () => {
-    const markup = renderToStaticMarkup(
+    const markup = renderMarkupInQueryClient(
       <MemoryRouter initialEntries={["/item/movie-1"]}>
         <MovieContent
           item={makeMovieItem({
@@ -708,7 +716,7 @@ describe("MovieContent", () => {
   });
 
   it("renders no Collections row when the movie is in no collections", () => {
-    const markup = renderToStaticMarkup(
+    const markup = renderMarkupInQueryClient(
       <MemoryRouter initialEntries={["/item/movie-1"]}>
         <MovieContent item={makeMovieItem({ collections: [] })} />
       </MemoryRouter>,
