@@ -1766,13 +1766,14 @@ func newChiRouter(deps Dependencies) chi.Router {
 			// service-context watcher, but that is only a safety net: this
 			// registration makes application shutdown call the drain and wait
 			// for accepted, in-memory evidence rather than firing it detached.
-			deps.RegisterShutdownFunc("virtual-evidence-drain", playbackHandler.StopVirtualEvidence)
-			// Explicit termination for the deferred-probe convergence
-			// watchdog. The service context already ends it at shutdown; this
-			// registration makes the handler's own shutdown path deterministic
-			// and keeps the watchdog from outliving the handler when the
-			// service context is never canceled.
-			deps.RegisterShutdownFunc("virtual-probe-watchdog-stop", playbackHandler.StopDeferredProbeWatchdog)
+			// The deferred-probe convergence watchdog is stopped in the same
+			// step so a handler whose service context is never canceled still
+			// terminates it; both stop methods are idempotent, and one step
+			// keeps the handler's shutdown surface a single named unit.
+			deps.RegisterShutdownFunc("virtual-evidence-drain", func() {
+				playbackHandler.StopDeferredProbeWatchdog()
+				playbackHandler.StopVirtualEvidence()
+			})
 		}
 		if deps.VirtualLibraryService != nil {
 			// The detailed resolver threads the edge id itself
