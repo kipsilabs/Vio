@@ -289,23 +289,31 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GHCR_PAT }}
 
-      # Option B: this fork publishes the base image directly under the plain
-      # tags the pre-#418 pipeline used. The omnibus jobs below build through
+      # Option B: this fork publishes the base image (no bundled PostgreSQL,
+      # Redis, or Meilisearch) directly under the plain tags the pre-#418
+      # pipeline used. The omnibus jobs below build through
       # Silo-Server/silo-server's reusable workflow, which is gated on that
       # repository and never runs in this fork, so routing plain tags through
       # them left only -base able to publish.
+      #
+      # Plain-tag ownership is mutually exclusive. `vars.ENABLE_OMNIBUS`
+      # (unset/off in this fork) keeps the plain tags, including the bare SHA,
+      # on this job. Turning it on disables them here and admits the omnibus
+      # pipeline, so exactly one job publishes the bare SHA and the other plain
+      # tags under either gate condition. `-base` is always published here
+      # because the omnibus build consumes it.
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_LC }}
           tags: |
-            type=raw,value=dev,enable=${{ github.event_name != 'release' && (github.event.workflow_run.head_branch == github.event.repository.default_branch || (github.event_name == 'workflow_dispatch' && github.ref_name == github.event.repository.default_branch)) }}
-            type=raw,value=latest,enable=${{ needs.prepare.outputs.is_stable == 'true' || (github.event_name == 'workflow_dispatch' && inputs.publish_latest == true) }}
-            type=raw,value=${{ github.event.release.tag_name }},enable=${{ github.event_name == 'release' && startsWith(github.event.release.tag_name, 'v') }}
-            type=raw,value=build-${{ needs.prepare.outputs.build_number }},enable=${{ github.event_name != 'release' && (github.event.workflow_run.head_branch == github.event.repository.default_branch || (github.event_name == 'workflow_dispatch' && github.ref_name == github.event.repository.default_branch)) && needs.prepare.outputs.build_number != '' }}
-            type=raw,value=apiv2,enable=${{ github.event.workflow_run.head_branch == 'apiv2' || (github.event_name == 'workflow_dispatch' && github.ref_name == 'apiv2') }}
-            type=raw,value=${{ github.event.workflow_run.head_sha || github.sha }}
+            type=raw,value=dev,enable=${{ vars.ENABLE_OMNIBUS != 'true' && github.event_name != 'release' && (github.event.workflow_run.head_branch == github.event.repository.default_branch || (github.event_name == 'workflow_dispatch' && github.ref_name == github.event.repository.default_branch)) }}
+            type=raw,value=latest,enable=${{ vars.ENABLE_OMNIBUS != 'true' && (needs.prepare.outputs.is_stable == 'true' || (github.event_name == 'workflow_dispatch' && inputs.publish_latest == true)) }}
+            type=raw,value=${{ github.event.release.tag_name }},enable=${{ vars.ENABLE_OMNIBUS != 'true' && github.event_name == 'release' && startsWith(github.event.release.tag_name, 'v') }}
+            type=raw,value=build-${{ needs.prepare.outputs.build_number }},enable=${{ vars.ENABLE_OMNIBUS != 'true' && github.event_name != 'release' && (github.event.workflow_run.head_branch == github.event.repository.default_branch || (github.event_name == 'workflow_dispatch' && github.ref_name == github.event.repository.default_branch)) && needs.prepare.outputs.build_number != '' }}
+            type=raw,value=apiv2,enable=${{ vars.ENABLE_OMNIBUS != 'true' && (github.event.workflow_run.head_branch == 'apiv2' || (github.event_name == 'workflow_dispatch' && github.ref_name == 'apiv2')) }}
+            type=raw,value=${{ github.event.workflow_run.head_sha || github.sha }},enable=${{ vars.ENABLE_OMNIBUS != 'true' }}
             type=raw,value=${{ github.event.workflow_run.head_sha || github.sha }}-base
 
       - name: Create and push manifest list
@@ -324,26 +332,31 @@ jobs:
           PUBLISH_LATEST: ${{ inputs.publish_latest }}
           EVENT_NAME: ${{ github.event_name }}
           IS_STABLE: ${{ needs.prepare.outputs.is_stable }}
+          ENABLE_OMNIBUS: ${{ vars.ENABLE_OMNIBUS }}
         run: |
-          docker buildx imagetools inspect "${REGISTRY}/${IMAGE_LC}:${{ github.event.workflow_run.head_sha || github.sha }}"
           docker buildx imagetools inspect "${REGISTRY}/${IMAGE_LC}:${{ github.event.workflow_run.head_sha || github.sha }}-base"
-          if [[ -n "${BUILD_NUMBER}" ]]; then
-            docker buildx imagetools inspect "${REGISTRY}/${IMAGE_LC}:build-${BUILD_NUMBER}"
-          fi
-          if [[ "${EVENT_NAME}" != "release" && "${TARGET_BRANCH}" == "${DEFAULT_BRANCH}" ]]; then
-            docker buildx imagetools inspect "${REGISTRY}/${IMAGE_LC}:dev"
-          fi
-          if [[ "${IS_STABLE}" == "true" || "${PUBLISH_LATEST}" == "true" ]]; then
-            docker buildx imagetools inspect "${REGISTRY}/${IMAGE_LC}:latest"
+          if [[ "${ENABLE_OMNIBUS}" != "true" ]]; then
+            docker buildx imagetools inspect "${REGISTRY}/${IMAGE_LC}:${{ github.event.workflow_run.head_sha || github.sha }}"
+            if [[ -n "${BUILD_NUMBER}" ]]; then
+              docker buildx imagetools inspect "${REGISTRY}/${IMAGE_LC}:build-${BUILD_NUMBER}"
+            fi
+            if [[ "${EVENT_NAME}" != "release" && "${TARGET_BRANCH}" == "${DEFAULT_BRANCH}" ]]; then
+              docker buildx imagetools inspect "${REGISTRY}/${IMAGE_LC}:dev"
+            fi
+            if [[ "${IS_STABLE}" == "true" || "${PUBLISH_LATEST}" == "true" ]]; then
+              docker buildx imagetools inspect "${REGISTRY}/${IMAGE_LC}:latest"
+            fi
           fi
 
   # The published image: PostgreSQL, Redis, Meilisearch, and s6-overlay
   # layered on the base image the merge job just pushed. It carries latest,
   # build-N, apiv2, and the commit SHA. Its digest artifacts are named so the
-  # merge job's digests-* pattern never picks them up.
+  # merge job's digests-* pattern never picks them up. Gated on the same
+  # `vars.ENABLE_OMNIBUS` switch that removes the plain tags from `merge`, so
+  # only one job owns them.
   omnibus:
     needs: [prepare, merge]
-    if: "!cancelled() && needs.merge.result == 'success'"
+    if: "vars.ENABLE_OMNIBUS == 'true' && !cancelled() && needs.merge.result == 'success'"
     strategy:
       fail-fast: false
       matrix:
