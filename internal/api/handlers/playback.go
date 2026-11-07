@@ -627,6 +627,12 @@ type PlaybackHandler struct {
 	// probeChainWG tracks live pre-play probe chains so tests can wait for
 	// them to settle. Production never waits.
 	probeChainWG sync.WaitGroup
+	// VirtualReleaseCacheStatus reports whether a pinned release already has a
+	// cached copy on the provider (AltMount's completion signal). A completed,
+	// duration-verified release is sticky: a transport hiccup retries it before
+	// the start walks to a different release. Optional: nil falls back to the
+	// row's own complete probe inventory as completion evidence.
+	VirtualReleaseCacheStatus VirtualReleaseCacheStatusFunc
 	// VirtualReleaseCacheWarmup starts a provider-side fetch for an explicitly
 	// selected virtual release before playback. It is the same fill/listing
 	// call playback start issues (see StreamHandler.VirtualReleaseCacheFiller),
@@ -890,6 +896,24 @@ type PlaybackHandler struct {
 	// whose deferred probe has stayed pending past the convergence bound, so
 	// the pending state is always bounded.
 	deferredProbeWatchdogOnce sync.Once
+	// deferredProbeWatchdogInitOnce and deferredProbeWatchdogStopOnce make the
+	// watchdog's stop/done channels lazy and its shutdown single-flight. The
+	// channels are created lazily rather than in the constructor so a
+	// zero-value handler (tests build some as struct literals) still has a
+	// working termination path.
+	deferredProbeWatchdogInitOnce sync.Once
+	deferredProbeWatchdogStopOnce sync.Once
+	// deferredProbeWatchdogStop is closed by StopDeferredProbeWatchdog to end the
+	// convergence watchdog even when ServiceContext is context.Background()
+	// and can never be canceled (the default before the router installs the
+	// service lifecycle, and the context tests and minimal embedders use).
+	// Without it a handler's watchdog outlives the handler for the life of the
+	// process.
+	deferredProbeWatchdogStop chan struct{}
+	// deferredProbeWatchdogDone is closed when the watchdog goroutine returns,
+	// letting shutdown and tests observe that termination actually completed
+	// rather than assuming the stop signal was enough.
+	deferredProbeWatchdogDone chan struct{}
 	// probeConvergenceOverride, when positive, replaces the production
 	// convergence bound so a test can observe the watchdog without waiting the
 	// full bound. Zero uses virtualBackgroundProbeBudget plus the slack.
@@ -903,6 +927,13 @@ type PlaybackHandler struct {
 	// expire the wait promptly without mutating a package global a leaked
 	// watchdog goroutine may be reading. Zero uses virtualBackgroundProbeBudget.
 	probeGateWaitOverride time.Duration
+	// backgroundProbeBudgetOverride, when positive, replaces
+	// virtualBackgroundProbeBudget as this handler's background/deferred probe
+	// execution budget and the bound the convergence watchdog derives from it.
+	// A test sets it before the probe goroutines start instead of mutating the
+	// package global, which outliving goroutines from earlier tests may still
+	// read. Zero uses virtualBackgroundProbeBudget.
+	backgroundProbeBudgetOverride time.Duration
 
 	// prefetchOnce guards the lazy prefetch worker pool. Prefetch work is
 	// admitted into a bounded queue (prefetchQueue) before any goroutine

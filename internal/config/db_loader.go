@@ -323,7 +323,7 @@ func LoadFromDB(m map[string]string) (*Config, error) {
 
 	// Artwork
 	cfg.Artwork.StorageBackend = stringOr(m, "artwork.storage_backend", "auto")
-	cfg.Artwork.LocalPath = stringOr(m, "artwork.local_path", "/var/lib/silo/artwork")
+	cfg.Artwork.LocalPath = artworkLocalPath(m)
 
 	// Metadata
 	cacheImages, err := boolOr(m, "metadata.cache_images", true)

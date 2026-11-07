@@ -499,9 +499,16 @@ describe("EpisodeContent", () => {
     function stubWrites(respond: (call: number) => Promise<Response>) {
       const requests: { method: string; path: string; body: unknown }[] = [];
       const fetchMock = vi.fn<typeof fetch>(async (url, init) => {
+        const path = new URL(String(url), "http://silo.test").pathname;
+        // The page also runs the version liveness check on mount. This test
+        // covers the order of the preference writes, so the liveness read
+        // answers empty and stays out of the recorded sequence.
+        if (!path.startsWith("/api/v2/audio-prefs/")) {
+          return jsonResponse({ results: [] });
+        }
         requests.push({
           method: init?.method ?? "GET",
-          path: new URL(String(url), "http://silo.test").pathname,
+          path,
           body: init?.body ? JSON.parse(String(init.body)) : undefined,
         });
         return respond(requests.length);

@@ -219,6 +219,10 @@
 # Scoped administrator keys cannot redirect recovery through either API version.
 ./internal/apiv2 TestScopedAdminKeyCannotRedirectRecoveryDB
 
+# A pin the v2 liveness check stamps dead is the same durable row the versions
+# read reports failed, so a client can trust the check's verdict in its menu.
+./internal/apiv2 TestCheckCatalogVersionsStampVisibleInVersionsDB
+
 # API key verifiers preserve credentials without retaining recoverable bearers.
 ./internal/auth TestAPIKeyStorageDoesNotRetainBearer
 ./internal/auth TestAPIKeyVerifierUpgrade

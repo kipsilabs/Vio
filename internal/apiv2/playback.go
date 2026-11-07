@@ -118,12 +118,47 @@ type PlaybackPlan struct {
 	EffectiveMediaFileID   ID                              `json:"effective_media_file_id"`
 	Source                 PlaybackSource                  `json:"source"`
 	SubtitleFidelityPolicy string                          `json:"subtitle_fidelity_policy"`
-	ActiveQuality          string                          `json:"active_quality,omitempty" doc:"The available_qualities label this plan delivers, so a client can mark that menu entry: the label quality_preference named while the menu lists it and the encode keeps its resolution, otherwise the rung whose resolution class and bitrate the encode matches. Absent when the plan delivers no listed entry, such as the source played unchanged or a plain-resolution or auto request whose capped encode falls between two rungs. Present on servers that advertise plan_active_quality_v1."`
-	InventoryURL           string                          `json:"inventory_url,omitempty" format:"uri-reference"`
-	TracksPending          bool                            `json:"tracks_pending,omitempty"`
-	DeliveryChange         *DeliveryChange                 `json:"delivery_change,omitempty"`
-	VirtualSourceRevision  string                          `json:"virtual_source_revision,omitempty"`
-	EffectiveVirtualURI    string                          `json:"effective_virtual_uri,omitempty" doc:"Virtual candidate URI that is playing; not validated as a URI"`
+	// EffectiveVirtualURI is the provider-neutral virtual:// candidate URI the
+	// planner selected and probed when it substituted a real candidate for a
+	// neutral catalog row, so a client can adopt the substituted candidate in
+	// its version menu. Empty for a non-virtual source. It carries no provider
+	// URL, token, or header.
+	EffectiveVirtualURI string `json:"effective_virtual_uri,omitempty" doc:"Virtual candidate URI that is playing; not validated as a URI"`
+	// DeliveryChange, when present, records that this replan changed the
+	// serving route mid-session (the delivery and/or play method differs from
+	// the plan the session was previously serving). It mirrors
+	// PlanV3.DeliveryChange so a v2 client can tell a planned route change from
+	// a silent mid-play swap. UI-only, additive. It is projected into this
+	// apiv2-owned DTO (rather than reusing the domain type) so the native v2
+	// schema is owned by the transport package, not a shared domain struct.
+	DeliveryChange *DeliveryChange `json:"delivery_change,omitempty"`
+	// VirtualSourceRevision is an opaque, non-secret revision of the resolved
+	// virtual source candidate; it changes on a release rotation and stays fixed
+	// while the same candidate is served. Empty for a non-virtual source.
+	VirtualSourceRevision string `json:"virtual_source_revision,omitempty"`
+	// TracksPending marks a plan whose audio and subtitle inventory is
+	// deliberately provisional: the first-byte URL was handed back with the
+	// minimal executable recipe (video plus the default audio) and the full
+	// track enumeration is still being probed. It mirrors PlanV3.TracksPending
+	// so the promised v2 wire contract carries it; a client that negotiated
+	// deferred_track_inventory_v1 reads it and keeps the menu loading until the
+	// follow-up inventory_updated push (or a poll of InventoryURL) lands. It
+	// never changes stream selection.
+	TracksPending bool `json:"tracks_pending,omitempty"`
+	// AudioSelectionPending marks a plan whose selected audio track is
+	// unverified: a cross-release fallback committed the request's ordinal onto
+	// a replacement whose audio inventory could not be measured. It mirrors
+	// PlanV3.AudioSelectionPending so a v2 client can render the selection as
+	// pending instead of confirmed; the plan also carries the
+	// audio_track_unverified degradation warning. It never changes stream
+	// selection.
+	AudioSelectionPending bool `json:"audio_selection_pending,omitempty"`
+	// InventoryURL is the relative URL a client fetches (with ETag /
+	// If-None-Match) to retrieve the refreshed audio and subtitle inventories
+	// without replanning. It mirrors PlanV3.InventoryURL so a deferred v2 client
+	// can poll for the pending → terminal inventory transition.
+	InventoryURL  string `json:"inventory_url,omitempty" format:"uri-reference"`
+	ActiveQuality string `json:"active_quality,omitempty" doc:"The available_qualities label this plan delivers, so a client can mark that menu entry: the label quality_preference named while the menu lists it and the encode keeps its resolution, otherwise the rung whose resolution class and bitrate the encode matches. Absent when the plan delivers no listed entry, such as the source played unchanged or a plain-resolution or auto request whose capped encode falls between two rungs. Present on servers that advertise plan_active_quality_v1."`
 }
 
 // DeliveryChange is the v2 projection of a mid-session serving-route change on
@@ -643,7 +678,7 @@ func playbackDecision(in playback.DecisionResponseV3) PlaybackDecision {
 		p := in.PlaybackPlan
 		stream := p.Stream
 		stream.URL = playbackV2MediaURL(stream.URL)
-		out.PlaybackPlan = &PlaybackPlan{ProtocolVersion: p.ProtocolVersion, PlanID: p.PlanID, PlanAttemptKey: p.PlanAttemptKey, SessionID: p.SessionID, ExpiresAt: p.ExpiresAt, Delivery: p.Delivery, Stream: stream, Timeline: p.Timeline, SelectedTracks: p.SelectedTracks, AudioTracks: p.AudioTracks, EffectiveRecipe: p.EffectiveRecipe, BandwidthLimit: playbackBandwidthLimit(p.BandwidthLimit), Claims: p.Claims, Subtitle: playbackV2Subtitle(p.Subtitle), Transformations: p.Transformations, AppliedQuirks: p.AppliedQuirks, RuntimeCorrections: p.RuntimeCorrections, AvailableQualities: playbackQualities(p.AvailableQualities), DegradationWarnings: p.DegradationWarnings, DecisionReason: p.DecisionReason, RequestedMediaFileID: ID(strconv.Itoa(p.RequestedMediaFileID)), EffectiveMediaFileID: ID(strconv.Itoa(p.EffectiveMediaFileID)), Source: playbackSource(p.Source), SubtitleFidelityPolicy: p.SubtitleFidelityPolicy, ActiveQuality: p.ActiveQuality, InventoryURL: playbackV2InventoryURL(p.InventoryURL), TracksPending: p.TracksPending, DeliveryChange: playbackV2DeliveryChange(p.DeliveryChange), VirtualSourceRevision: p.VirtualSourceRevision, EffectiveVirtualURI: p.EffectiveVirtualURI}
+		out.PlaybackPlan = &PlaybackPlan{ProtocolVersion: p.ProtocolVersion, PlanID: p.PlanID, PlanAttemptKey: p.PlanAttemptKey, SessionID: p.SessionID, ExpiresAt: p.ExpiresAt, Delivery: p.Delivery, Stream: stream, Timeline: p.Timeline, SelectedTracks: p.SelectedTracks, EffectiveRecipe: p.EffectiveRecipe, BandwidthLimit: playbackBandwidthLimit(p.BandwidthLimit), Claims: p.Claims, Subtitle: playbackV2Subtitle(p.Subtitle), AudioTracks: p.AudioTracks, Transformations: p.Transformations, AppliedQuirks: p.AppliedQuirks, RuntimeCorrections: p.RuntimeCorrections, AvailableQualities: playbackQualities(p.AvailableQualities), DegradationWarnings: p.DegradationWarnings, DecisionReason: p.DecisionReason, RequestedMediaFileID: ID(strconv.Itoa(p.RequestedMediaFileID)), EffectiveMediaFileID: ID(strconv.Itoa(p.EffectiveMediaFileID)), EffectiveVirtualURI: p.EffectiveVirtualURI, DeliveryChange: playbackV2DeliveryChange(p.DeliveryChange), VirtualSourceRevision: p.VirtualSourceRevision, TracksPending: p.TracksPending, AudioSelectionPending: p.AudioSelectionPending, InventoryURL: playbackV2InventoryURL(p.InventoryURL), Source: playbackSource(p.Source), SubtitleFidelityPolicy: p.SubtitleFidelityPolicy, ActiveQuality: p.ActiveQuality}
 	}
 	return out
 }

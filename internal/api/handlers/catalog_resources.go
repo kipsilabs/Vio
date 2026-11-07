@@ -70,7 +70,64 @@ func (h *CatalogResourceHandler) HandleGetItemDetail(w http.ResponseWriter, r *h
 		writeAPIError(w, err)
 		return
 	}
+	h.prefetchItemDetailVirtual(r.Context(), view, requestProfileID(r))
 	writeJSON(w, http.StatusOK, view)
+}
+
+// prefetchItemDetailVirtual warms virtual listings for a movie/episode detail
+// view. Series details carry no versions and are skipped; per-episode warming
+// happens on the season-episodes read instead.
+func (h *CatalogResourceHandler) prefetchItemDetailVirtual(ctx context.Context, view *catalog.ItemDetail, profileID string) {
+	if h == nil || h.items == nil || view == nil {
+		return
+	}
+	h.prefetchVersionsVirtual(ctx, view.Versions, profileID)
+}
+
+// PrefetchItemVersionsVirtual warms the metadata-only virtual candidate
+// listings a versions read surfaced. It is the same detached cap-2 warm the
+// detail read uses: the read answers from the persisted rows and never waits
+// for a provider listing. Both the v1 route and the v2 operation call it.
+func (h *CatalogResourceHandler) PrefetchItemVersionsVirtual(ctx context.Context, versions []catalog.FileVersion, profileID string) {
+	if h == nil || h.items == nil || len(versions) == 0 {
+		return
+	}
+	h.prefetchVersionsVirtual(ctx, versions, profileID)
+}
+
+// prefetchVersionsVirtual shares the cap-2 warm between the detail and
+// versions reads. nil items or an unwired prefetcher makes it a no-op.
+func (h *CatalogResourceHandler) prefetchVersionsVirtual(ctx context.Context, versions []catalog.FileVersion, profileID string) {
+	fileIDs := make([]int, 0, 2)
+	for _, v := range versions {
+		if v.FileID != 0 {
+			fileIDs = append(fileIDs, v.FileID)
+		}
+		if len(fileIDs) >= 2 {
+			break
+		}
+	}
+	h.items.prefetchVirtualFileIDs(ctx, fileIDs, profileID)
+}
+
+// prefetchEpisodeViewsVirtual warms the first episode's files only: it is the
+// likely next play (autoplay/next-up order), and warming a whole season would
+// fan out provider listings per episode. Bounded to 2 file rows like the
+// other triggers.
+func (h *CatalogResourceHandler) prefetchEpisodeViewsVirtual(ctx context.Context, views []EpisodeView, profileID string) {
+	if h == nil || h.items == nil || len(views) == 0 {
+		return
+	}
+	fileIDs := make([]int, 0, 2)
+	for _, f := range views[0].Files {
+		if f.FileID != 0 {
+			fileIDs = append(fileIDs, f.FileID)
+		}
+		if len(fileIDs) >= 2 {
+			break
+		}
+	}
+	h.items.prefetchVirtualFileIDs(ctx, fileIDs, profileID)
 }
 
 func (h *CatalogResourceHandler) HandleGetItemVersions(w http.ResponseWriter, r *http.Request) {
@@ -88,6 +145,7 @@ func (h *CatalogResourceHandler) HandleGetItemVersions(w http.ResponseWriter, r 
 		writeAPIError(w, err)
 		return
 	}
+	h.PrefetchItemVersionsVirtual(r.Context(), view, requestProfileID(r))
 	writeJSON(w, http.StatusOK, view)
 }
 
@@ -126,6 +184,7 @@ func (h *CatalogResourceHandler) HandleGetItemEpisodes(w http.ResponseWriter, r 
 		writeAPIError(w, err)
 		return
 	}
+	h.prefetchEpisodeViewsVirtual(r.Context(), view, requestProfileID(r))
 	writeJSON(w, http.StatusOK, episodesListResponse{Episodes: view})
 }
 
@@ -199,6 +258,7 @@ func (h *CatalogResourceHandler) HandleGetEpisodes(w http.ResponseWriter, r *htt
 		writeAPIError(w, err)
 		return
 	}
+	h.prefetchEpisodeViewsVirtual(r.Context(), view, requestProfileID(r))
 	writeJSON(w, http.StatusOK, episodesListResponse{Episodes: view})
 }
 

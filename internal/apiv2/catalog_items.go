@@ -696,6 +696,16 @@ func registerCatalogItems(reg *Registry) {
 		"The chapter files of a manga series, as file descriptors.")), reg.listCatalogItemMangaFiles)
 	Register(reg, viewerOperation(humaOp(http.MethodGet, Prefix+"/catalog/items/{id}/versions", "listCatalogItemVersions", "catalog",
 		"The playable file versions of an item.")), reg.listCatalogItemVersions)
+	checkVersions := humaOp(http.MethodPost, Prefix+"/catalog/versions/check", opCheckCatalogVersions, "catalog",
+		"Probe the liveness of up to 40 file versions and stamp the durable failed signal.")
+	Register(reg, Operation{
+		Operation:     checkVersions,
+		Class:         ClassProfileScoped,
+		ServiceBacked: true,
+		// Repeated checks converge on the same durable verdict; the stamp is
+		// fenced against a row rotated while the probe was in flight.
+		RetrySafety: RetrySafetyNaturalIdempotent,
+	}, reg.checkCatalogVersions)
 	Register(reg, viewerOperation(humaOp(http.MethodGet, Prefix+"/catalog/series/{id}/seasons", "listSeriesSeasons", "catalog",
 		"The seasons of a series with the viewer's rollups.")), reg.listSeriesSeasons)
 	Register(reg, viewerOperation(humaOp(http.MethodGet, Prefix+"/catalog/series/{id}/seasons/{num}", "getSeriesSeason", "catalog",
@@ -1350,6 +1360,11 @@ func (reg *Registry) listCatalogItemVersions(ctx context.Context, in *CatalogIte
 	versions, err := svc.ItemVersions(ctx, viewer, in.ID)
 	if err != nil {
 		return nil, serviceProblem(err)
+	}
+	// Warm the same metadata-only, cap-2 listings the detail read warms. The
+	// response never waits for it, and an unwired seam is a no-op.
+	if reg.deps.CatalogVersionsWarm != nil {
+		reg.deps.CatalogVersionsWarm.PrefetchItemVersionsVirtual(ctx, versions, profileFrom(ctx))
 	}
 	return &FileVersionCollectionOutput{Body: FileVersionCollection{Collection: NewCollection(fileVersionsOf(versions))}}, nil
 }

@@ -4,14 +4,17 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/Silo-Server/silo-server/internal/fspath"
 
@@ -28,6 +31,33 @@ const (
 	subtitleFontTTFMIME      = "font/ttf"
 	subtitleFontFallbackMIME = "application/octet-stream"
 )
+
+// subtitleFontDumpBudget scales the attachment-dump deadline with the payload
+// the probe reported. A small pack keeps the 30s floor; a multi-MiB pack gets
+// enough time to stream at a conservative relay rate, capped so the extraction
+// always settles inside the detached single-flight budget.
+//
+// When the probe reports no sizes for any attachment, a count-based estimate
+// drives the same scaling instead of leaving every unknown pack on the floor.
+func subtitleFontDumpBudget(streams []attachmentProbeStream) time.Duration {
+	var total int64
+	for _, stream := range streams {
+		if stream.ExtraDataSize > 0 {
+			total += stream.ExtraDataSize
+		}
+	}
+	if total == 0 && len(streams) > 0 {
+		total = int64(len(streams)) * subtitleFontDumpUnknownStreamBytes
+	}
+	budget := subtitleFontDumpBaseBudget
+	if total >= subtitleFontDumpBytesPerSecond {
+		budget += time.Duration(total/subtitleFontDumpBytesPerSecond) * time.Second
+	}
+	if budget > subtitleFontDumpMaxBudget {
+		return subtitleFontDumpMaxBudget
+	}
+	return budget
+}
 
 // SubtitleFontAttachment is a font attached to a media container for ASS/SSA
 // subtitle rendering.
@@ -75,6 +105,11 @@ func ListAttachedSubtitleFonts(ctx context.Context, inputPath, ffmpegPath string
 	default:
 		return nil, errors.New("subtitle font probes busy")
 	}
+	ctx, releaseRelayDemux, demuxErr := acquireRelayDemuxRead(ctx, inputPath)
+	if demuxErr != nil {
+		return nil, demuxErr
+	}
+	defer releaseRelayDemux()
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	streams, _, err := probeFontAttachmentStreams(ctx, inputPath, ffprobePathFromFFmpeg(ffmpegPath))
@@ -97,22 +132,28 @@ func ListAttachedSubtitleFonts(ctx context.Context, inputPath, ffmpegPath string
 // loading them into JASSUB is the closest browser equivalent to libass on a
 // native player.
 func ExtractAttachedSubtitleFonts(ctx context.Context, inputPath string, ffmpegPath string) ([]SubtitleFontAttachment, error) {
-	return extractAttachedSubtitleFonts(ctx, inputPath, ffmpegPath, nil)
+	return extractAttachedSubtitleFonts(ctx, inputPath, ffmpegPath, nil, maxSubtitleFontBytes)
 }
 
 // ExtractAttachedSubtitleFont extracts only the requested container stream.
 // The same font validation, attachment count and byte limits apply as to bundles.
 func ExtractAttachedSubtitleFont(ctx context.Context, inputPath, ffmpegPath string, index int) (*SubtitleFontAttachment, error) {
-	fonts, err := extractAttachedSubtitleFonts(ctx, inputPath, ffmpegPath, &index)
+	fonts, err := extractAttachedSubtitleFonts(ctx, inputPath, ffmpegPath, &index, maxSubtitleFontBytes)
 	if err != nil || len(fonts) == 0 {
 		return nil, err
 	}
 	return &fonts[0], nil
 }
 
-func extractAttachedSubtitleFonts(ctx context.Context, inputPath, ffmpegPath string, index *int) ([]SubtitleFontAttachment, error) {
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
+// ErrSubtitleFontSubsetUnavailable reports that script-driven subsetting could
+// not rescue an oversized font pack: the script or its references were
+// unusable (or the subset still exceeded the ceiling), and the bounded
+// whole-pack dump that follows also failed. A client then falls back to system
+// fonts; the handler marks that response so it is not mistaken for an ordinary
+// empty bundle (a file with no attachments) or for a still-running extraction.
+var ErrSubtitleFontSubsetUnavailable = errors.New("subtitle font subsetting unavailable")
+
+func extractAttachedSubtitleFonts(ctx context.Context, inputPath, ffmpegPath string, index *int, maxBytes int64) ([]SubtitleFontAttachment, error) {
 	if strings.TrimSpace(inputPath) == "" {
 		return nil, fmt.Errorf("subtitle fonts: input path is required")
 	}
@@ -137,6 +178,13 @@ func extractAttachedSubtitleFonts(ctx context.Context, inputPath, ffmpegPath str
 		streams = streams[selected : selected+1]
 	}
 
+	// The probe above reports each attachment's payload size, so the streaming
+	// phase can be budgeted for the bytes it actually has to move. Keep the
+	// caller's deadline (context.WithTimeout inherits an earlier one).
+	dumpCtx, cancelDump := context.WithTimeout(ctx, subtitleFontDumpBudget(streams))
+	defer cancelDump()
+	ctx = dumpCtx
+
 	bin := ffmpegPath
 	if strings.TrimSpace(bin) == "" {
 		bin = "ffmpeg"
@@ -147,6 +195,42 @@ func extractAttachedSubtitleFonts(ctx context.Context, inputPath, ffmpegPath str
 		fonts[0].Name = selectedName
 	}
 	return fonts, err
+}
+
+// attachmentPayloadExceeds reports whether the complete probed payload is past
+// the retained-bundle ceiling, which is the only case where script-driven
+// subsetting is attempted.
+// extractReferencedFontSubset attempts the script-driven reduction. done is
+// false when the caller should fall back to the bounded whole-pack dump
+// (unavailable script, no references, or no matching attachment), and an error
+// reports a real extraction failure that must propagate.
+func extractReferencedFontSubset(ctx context.Context, inputPath, ffmpegPath, ffprobePath string, streams []attachmentProbeStream, maxBytes int64) ([]SubtitleFontAttachment, bool, error) {
+	referenced, ok := assReferencedFontFamilies(ctx, inputPath, ffprobePath)
+	if !ok || len(referenced) == 0 {
+		return nil, false, nil
+	}
+	fonts, err := dumpFontAttachmentsSubset(ctx, inputPath, ffmpegPath, streams, maxBytes, referenced)
+	if err == nil {
+		return fonts, true, nil
+	}
+	if errors.Is(err, errSubtitleFontSubsetEmpty) {
+		return nil, false, nil
+	}
+	return nil, false, err
+}
+
+func attachmentPayloadExceeds(streams []attachmentProbeStream, maxBytes int64) bool {
+	var total int64
+	for _, stream := range streams {
+		if stream.ExtraDataSize <= 0 {
+			return false
+		}
+		if total > maxBytes-stream.ExtraDataSize {
+			return true
+		}
+		total += stream.ExtraDataSize
+	}
+	return false
 }
 
 // EncodeSubtitleFontBundle converts raw font attachments to base64 JSON items.
@@ -262,7 +346,7 @@ func attachmentDumpOutputArgs(videoStream int) []string {
 func probeFontAttachmentStreams(ctx context.Context, inputPath string, ffprobePath string) ([]attachmentProbeStream, int, error) {
 	bin := ffprobePath
 	if strings.TrimSpace(bin) == "" {
-		bin = "ffprobe"
+		bin = ffprobeBinary
 	}
 	cmd := fspath.CommandContext(ctx, bin,
 		"-v", "error",
@@ -391,11 +475,11 @@ func SubtitleFontMIMEType(name string) string {
 func ffprobePathFromFFmpeg(ffmpegPath string) string {
 	ffmpegPath = strings.TrimSpace(ffmpegPath)
 	if ffmpegPath == "" {
-		return "ffprobe"
+		return ffprobeBinary
 	}
 	base := filepath.Base(ffmpegPath)
 	if i := strings.LastIndex(base, "ffmpeg"); i >= 0 {
-		return filepath.Join(filepath.Dir(ffmpegPath), base[:i]+"ffprobe"+base[i+len("ffmpeg"):])
+		return filepath.Join(filepath.Dir(ffmpegPath), base[:i]+ffprobeBinary+base[i+len("ffmpeg"):])
 	}
-	return "ffprobe"
+	return ffprobeBinary
 }

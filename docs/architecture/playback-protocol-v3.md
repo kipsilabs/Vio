@@ -108,13 +108,13 @@ the document is always the full one:
                "neutral_playback_v3_contract_v1", "embedded_subtitles_v1", "layout_aware_passthrough", "playback_route_diagnostics",
                "device_quirks_v1", "seek_reanchor_v1", "output_change_v1", "output_display_evidence_v1", "direct_stream_resume_v1",
                "header_authenticated_media_v1", "authorized_media_origins_v1", "software_video_decode_v1",
-               "plan_invalidated_v1", "plan_source_duration_v1"],
+               "plan_invalidated_v1", "default_audio_reconcile_response_v1", "plan_source_duration_v1", "audio_track_unverified_v1"],
   "deliveries": ["original_http", "server_remux_progressive", "server_remux_hls", "server_transcode_hls"],
   "transformations": [{"name": "audio_to_aac", "executor": "server", "recipe_version": "4", "validated_claims": ["audio_decode"]}]
 }
 ```
 
-The seventeen feature strings above are the full set this server version advertises on `/api/v1`. `/api/v2` advertises them plus `buffering_quality_v1`, `playback_plan_summary_v1`, `subrip_sidecar_v1`, `marker_thumbnails_v1`, `hls_subtitle_renditions_v1`, `plan_active_quality_v1`, `hls_remux_subtitle_renditions_v1`, `hls_copy_mpegts_v1`, `hls_variable_substitution_v1`, `codec_channel_ceilings_v1`, `native_embedded_limitations_v1`, and `hls_subtitle_renditions_all_v1`:
+The nineteen feature strings above are the full set this server version advertises on `/api/v1`. `/api/v2` advertises them plus `buffering_quality_v1`, `playback_plan_summary_v1`, `subrip_sidecar_v1`, `marker_thumbnails_v1`, `hls_subtitle_renditions_v1`, `plan_active_quality_v1`, `hls_remux_subtitle_renditions_v1`, `hls_copy_mpegts_v1`, `hls_variable_substitution_v1`, `codec_channel_ceilings_v1`, `native_embedded_limitations_v1`, `hls_subtitle_renditions_all_v1`, and `source_committed_event_v1`:
 
 | Feature | What it promises |
 | --- | --- |
@@ -133,7 +133,9 @@ The seventeen feature strings above are the full set this server version adverti
 | `authorized_media_origins_v1` | Meaningful only with the token above: the client also honors credential-free absolute media URLs on server-designated proxy origins, which restores distributed egress for a header-authenticated attempt (§4.1) |
 | `software_video_decode_v1` | Exact/platform-attested clients may qualify bounded `video_decode[]` entries with `hardware: false` for direct/original delivery; without the opt-in those evidence tiers remain hardware-only (§3) |
 | `plan_invalidated_v1` | The client can be told mid-session that the plan it is playing was withdrawn, over the realtime `plan_invalidated` command, and replans off it. A session that did not negotiate it is stopped instead (§6.1) |
+| `default_audio_reconcile_response_v1` | A client can answer the `default_audio_reconciliation` withdrawal through the dedicated `answers_plan_invalidation` correlation instead of ordinary failure recovery |
 | `plan_source_duration_v1` | `source.duration_seconds` is populated when known, so its absence means *unknown* rather than *unsupported* (§5) |
+| `audio_track_unverified_v1` | A plan may carry `audio_selection_pending` alongside the `audio_track_unverified` degradation warning; a client that sees the flag renders the audio pick as pending, not confirmed (§7.2) |
 | `buffering_quality_v1` | `/api/v2` only. An opted-in client may send the optional buffering fields on start and replan, and the server records and applies learned limits for it ([Buffering quality](#buffering-quality-native-v2)) |
 | `playback_plan_summary_v1` | `/api/v2` only. `POST /playback/route-events` accepts the `plan_summary` event (§7.4, [Buffering quality](#buffering-quality-native-v2)) |
 | `marker_thumbnails_v1` | `/api/v2` only. Marker occurrences in watch and marker reads may carry preview image fields, and an attempt that opted in at start receives realtime `marker_thumbnail_ready` events ([markers API](../markers-api.md#marker-preview-images-v2)) |
@@ -1423,6 +1425,140 @@ failure path, even when an earlier transport of the same viewing played: the
 new route may be one this client cannot reach. If that recovery then cannot
 reach the server, it joins the reconnect and continues the same budget.
 
+The server applies the same distinction from its own evidence when a client
+reports the loss through `failure_recovery` anyway. A failure recovery on an
+attempt whose durable progress shows at least one accepted sample
+(`LastSequence > 0`) keeps the route that just played eligible for one reissue:
+same delivery and recipe, with a fresh plan id and stream token. The recovery
+chain's `attempt_count` bounds it, so the reissued transport's next failure
+retires the route as usual. A failure with no progress sample keeps the
+ordinary ladder, and a classification that retires the whole delivery
+(`decoder_failure`, `decode_error`, `player_failure`, `http_failure`,
+`parser_failure`) is not reissued. If that history already excluded the
+source-preserving routes and only video adaptation remains while transcoding is
+disabled, the terminal is the retryable `routes_exhausted`;
+`transcoding_disabled` stays reserved for a first plan whose source really
+needs an encode.
+
+The server applies one more distinction from its own evidence: whether the
+client ever read from the stream it is indicting. A `failure_recovery` that
+arrives after the server answered this attempt's playlist but before a single
+segment request is a client that stopped reading, not a verdict on the route:
+the player reached the stream, asked for no media, and then reported a failure.
+The server answers it as `playback_session_not_found` and stops the session
+instead of rotating, demoting the delivery, or persisting a failure for a recipe
+that was never exercised. A recovery that arrives before the playlist was served
+is a failure the client met inside the stream and keeps the ordinary ladder, and
+so does every session that already served a segment request.
+
+### 6.3 `source_committed_event_v1` — the committed version is published at commit
+
+A serve-layer rotation can move a live session to a sibling release without ever
+building a new plan: the pinned candidate stops resolving and the stream handler
+rebinds the session to a live sibling (§2.2, "Residual candidate-identity
+notes"). Until now the client learned about that move only indirectly — a
+subtitle fetch answered `409 subtitle_source_changed`, or a later replan — so a
+client with no subtitle traffic could keep naming the previous release and its
+tracks indefinitely.
+
+`source_committed` is the direct signal. The server pushes it as a realtime
+**event** (not a command; there is nothing to ack) on the session control socket
+the moment the transport commits to an effective version:
+
+```json
+{
+  "type": "event",
+  "session_id": "…",
+  "name": "source_committed",
+  "payload": {
+    "session_id": "…",
+    "effective_media_file_id": 200,
+    "effective_virtual_uri": "virtual://movie/…?result=B",
+    "virtual_source_revision": "",
+    "inventory_status": "declared",
+    "audio_tracks": [{"language": "deu", "codec": "eac3", "default": true}]
+  }
+}
+```
+
+`effective_virtual_uri` is the identity the version menu keys on; it is the
+live session binding, so it follows a rotation even though the plan still names
+release A. `audio_tracks` is the committed release's **declared** inventory and
+is always present (an empty release declares `[]`, never an absent field), and it
+is never the previous release's list. A client that adopts
+the payload re-keys its version and audio menus to the streamed release
+immediately and leaves the audio list provisional, exactly as it does for a plan
+with `inventory_provenance: "declared"`.
+
+The event carries the commit, not the probe. When the background ffprobe lands,
+its evidence is persisted to the catalog row and the client's existing inventory
+poll (or a verified replan) upgrades the declared list to real tracks: the same
+provenance path a deferred start already uses. A client that never receives the
+event — an older build, or a session without a live realtime connection — keeps
+its previous behavior and still converges through the subtitle `409` and replan
+paths.
+
+A `verified` `inventory_updated` revision is the server's own inventory for the
+live session, so the client applies it in place whenever its
+`effective_virtual_uri` names the candidate the session is bound to, even when
+its `effective_media_file_id` is a catalog row that appeared only after the plan
+committed. A differing `effective_virtual_uri` remains a foreign source and is
+dropped. This is what lets a cold plan whose inventory is empty or declared-only grow its
+audio and subtitle menus from the first verified push instead of staying empty
+until a stop/resume; it never replans, re-keys the transport, or reloads the
+element.
+
+The server pushes the event best-effort and does not gate it on a negotiated
+feature; a client that does not know the name ignores it. `/api/v2` advertises
+`source_committed_event_v1` in `features` so a client can tell a server that
+sends it apart from one that does not.
+
+**Inventory adoption is in place.** Folding the real video/audio/subtitle track
+lists from a deferred probe, a `source_committed`, or an `inventory_updated`
+push is menu data: it must never replan, switch rows or files, or reload the
+media element. What is already playing keeps playing, and only the lists the
+watch page and in-player menus render change. A client that adopts a *verified*
+inventory for a source must also refuse to regress it to a declared or pending
+list when a later plan for the same source is adopted — a replan can have been
+built before the probe persisted, and the menus must stay on the real evidence.
+
+### 6.3 `inventory_updated_event_v1` — a vanished pin still offers the row's menu
+
+A row pinned to a concrete `?result=` candidate can have the provider renumber
+or drop that candidate mid-session. The transport keeps playing the already-open
+relay, and every rotation path correctly refuses to swap a different release into
+the playing row, so the track menus would otherwise stay empty until a
+stop/resume. When the refused evidence is the row's own current listing, the
+server pushes it as a display-only `inventory_updated` revision:
+
+```json
+{
+  "type": "event",
+  "session_id": "…",
+  "name": "inventory_updated",
+  "payload": {
+    "session_id": "…",
+    "inventory_revision": "inv:…",
+    "inventory_status": "verified",
+    "effective_media_file_id": 200,
+    "offered_virtual_uri": "virtual://movie/…?result=C",
+    "audio_tracks": [{"language": "eng", "codec": "eac3", "default": true}],
+    "subtitle_inventory": []
+  }
+}
+```
+
+`offered_virtual_uri` names the candidate the row offers now. The payload
+deliberately omits `effective_virtual_uri` and carries only the bound row in
+`effective_media_file_id`, so a client can never mistake the offer for the
+playing identity: the transport, session and plan revisions are untouched and no
+replan is issued. A client that ignores the field keeps its existing behavior
+(the file-only revision is dropped as ambiguous). The offered track lists are
+display data; selecting a track from the offered release must go through the
+explicit rotation/replan path, never an in-place switch. The server pushes it
+best-effort and does not gate it on a negotiated feature; the field is additive
+and absent on every ordinary read.
+
 ---
 
 ## 7. Registries
@@ -1460,7 +1596,21 @@ The plan will play, but something the user might notice was given up.
 | `bandwidth_cap_applied` | `bandwidth_cap_kbps` limited the selection |
 | `evidence_insufficient_for_direct` | Evidence tier blocked a direct route |
 | `audio_track_unavailable` | The selected audio track is not on the effective file; its default track plays |
+| `audio_track_unverified` | The effective file's audio inventory could not be measured (a cross-release fallback onto an unprobed replacement). The selected ordinal is passed through unverified: it may name another stream, or none, in which case playback has no audio. The plan also sets `audio_selection_pending: true`, so a client that ignores degradation warnings still sees the selection is unconfirmed |
 | `subtitle_track_unavailable` | The selected subtitle has no equivalent on the effective file, or is on it but cannot be shown there; playback continues with subtitles off. `message` says which |
+
+`playback_plan.audio_selection_pending` makes the unverified-audio state
+explicit outside the warning list. It is set only when a cross-release fallback
+committed the request's audio ordinal onto a replacement whose inventory was
+never probed, and it is omitted otherwise (including a measured mismatch, which
+plays a known track and reports `audio_track_unavailable`). Like the other
+inventory hints it is set after plan identity is finalized and is excluded from
+`plan_id` and `plan_attempt_key`. A client that negotiated
+`audio_track_unverified_v1` must render the audio pick as pending/unverified
+while the flag is set instead of presenting the requested track as confirmed;
+the flag never changes stream selection. The Jellyfin-compatibility surface has
+no degradation channel and never takes this cross-release fallback, so it is
+unaffected.
 
 ### 7.3 Terminal reasons
 
@@ -1971,12 +2121,39 @@ their timing correction applied before any conversion (an `original=1` SRT
 included) and `Cache-Control: private, no-cache`, since a correction changes
 the bytes behind the same URL.
 
-Complete embedded text and PGS extracts are cached by source file identity,
-modification time, size, subtitle ordinal, and output format. Partial or failed
-extracts are never published. Text cache misses stream while extracting; repeated
-complete text requests reuse the finished artifact. A failed extraction returns
-an error response before output begins, or aborts an already-started stream so
-clients can distinguish failure from a complete track and retry.
+For an embedded track on a large or unknown-size virtual/remote release the
+default is a bounded first window rather than the complete track: extracting
+every byte of a multi-GB provider stream cannot finish within a client fetch
+deadline, and the aborted extraction commits nothing, so the whole-track default
+never converges. The server returns the playback-sized window described in §4.2
+and advertises it with `X-Subtitle-Coverage` and `X-Subtitle-Windowed`. This
+applies to converted text (WebVTT), lossless ASS/SSA, and PGS alike, and lasts
+only until a complete artifact has been committed; once one exists the whole
+artifact is served and both headers are absent. A client that requested the
+whole track therefore cannot assume a complete body: it reads the headers and
+requests subsequent windows from the advertised end, or treats the response as
+that one window. Explicit `position`/`duration` (and PGS `windowed=1`) always
+override the implicit window. External and downloaded sidecars are always
+returned whole. First-party native clients that fetch a complete embedded
+sidecar in one request (`silo-apple`, `silo-android`) must handle the bounded
+default and are coordinated with this change.
+
+Complete embedded text, ASS/SSA, and PGS extracts are cached by source file
+identity, modification time, size, subtitle ordinal, and output format. Partial
+or failed extracts are never published. Text and ASS cache misses stream while
+extracting; repeated complete requests reuse the finished artifact. A windowed
+miss on a large virtual source starts a detached full-track warm while the
+viewer is playing (text and ASS) or paused (bitmap), so later requests read the
+small cached artifact instead of re-demuxing the source. While an ASS warm is
+still filling, the server retains the script prefix it has produced and answers
+a window whose source range that prefix has already passed from memory. The
+prefix is served only once the warm's highest emitted event start has reached
+the requested end, so an event starting inside the window cannot still be
+missing; the body is the same header-plus-overlapping-events shape a windowed
+extract from the committed artifact produces, and the advertised coverage stays
+the requested range. A failed extraction returns an error response before
+output begins, or aborts an already-started stream so clients can distinguish
+failure from a complete track and retry.
 
 ---
 

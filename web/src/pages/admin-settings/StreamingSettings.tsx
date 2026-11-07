@@ -217,7 +217,7 @@ export default function StreamingSettings() {
           <SettingField
             label="Discovery wait (ms)"
             type="number"
-            description="How long opening a movie or episode waits for version discovery before answering with what is stored. 500–10000; 3000 default."
+            description="How long the detached catalog discovery may run per item before it answers from what is stored. 500–20000; 20000 default. Opening an item never waits on it."
             value={form.getValue("virtual_library.catalog_discovery_budget_ms")}
             onChange={(v) => form.setValue("virtual_library.catalog_discovery_budget_ms", v)}
             restartRequired={restartKeys.has("virtual_library.catalog_discovery_budget_ms")}

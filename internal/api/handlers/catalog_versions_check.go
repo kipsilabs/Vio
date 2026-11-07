@@ -40,6 +40,29 @@ const (
 	// one absolute deadline rather than a per-row allowance, so a blocked
 	// database cannot extend the handler proportionally to the batch size.
 	versionCheckPostBudget = 1 * time.Second
+	// versionCheckPreprobeBudget bounds the single-file inventory mode's
+	// synchronous inventory enumeration. It is separate from the liveness
+	// budgets above because that mode is the only one that waits for provider
+	// bytes: the detached selection chain runs the same probe under its own
+	// 90 s chain budget, and a client that opted in is better served by
+	// declared metadata after 5 s than by an unbounded wait.
+	versionCheckPreprobeBudget = 5 * time.Second
+)
+
+// The single-file inventory mode reports how much of a version's track
+// inventory is evidence rather than registration metadata. These values are
+// part of the check's wire contract.
+const (
+	// VersionInventoryDeclared means the row carries provider-declared hints
+	// only; nothing has enumerated its bytes.
+	VersionInventoryDeclared = "declared"
+	// VersionInventoryPending means an inventory probe ran for this read but
+	// no committed evidence reached the row yet, so the tracks below are still
+	// the declared placeholders.
+	VersionInventoryPending = "pending"
+	// VersionInventoryVerified means a probe enumerated the row and its
+	// evidence is stamped on it.
+	VersionInventoryVerified = "verified"
 )
 
 // versionCheckDetached returns a context for post-verdict work that must
@@ -67,9 +90,14 @@ func versionCheckDetached(ctx context.Context) (context.Context, context.CancelF
 
 type versionCheckRequest struct {
 	FileIDs []int `json:"file_ids"`
+	// Preprobe asks for the single file's enumerated track inventory in the
+	// same answer. The v1 route is frozen and stays liveness-only.
+	Preprobe bool `json:"preprobe,omitempty"`
 }
 
-type versionCheckResult struct {
+// VersionCheckResult is one file's liveness verdict. It is the shared seam
+// answer behind the v1 route and the v2 checkCatalogVersions operation.
+type VersionCheckResult struct {
 	FileID    int  `json:"file_id"`
 	Available bool `json:"available"`
 	// Failed is true when the row carries a durable failed verdict (either
@@ -84,19 +112,41 @@ type versionCheckResult struct {
 	// the short wrong-source marker (no database column). A mismatch never
 	// means the release is dead, so it never travels with failed and never
 	// changes available.
-	SourceMismatch *versionCheckSourceMismatch `json:"source_mismatch,omitempty"`
+	SourceMismatch *VersionCheckSourceMismatch `json:"source_mismatch,omitempty"`
+	// Inventory is present only in the single-file inventory mode
+	// (CheckVersionsWithInventory). It carries the row's enumerated tracks and
+	// how much of them is probe evidence rather than declared metadata. It is a
+	// pointer so the batched answer keeps its exact previous shape and value
+	// semantics.
+	Inventory *VersionCheckInventory `json:"inventory,omitempty"`
 }
 
-// versionCheckSourceMismatch carries the served-vs-declared byte sizes of a
+// VersionCheckInventory is the track inventory the versions check's single-file
+// mode returns for the requested row.
+type VersionCheckInventory struct {
+	// Provenance says whether the tracks below are probe evidence (verified),
+	// an attempted probe with no committed evidence yet (pending), or the
+	// row's declared registration metadata (declared).
+	Provenance string `json:"inventory_provenance"`
+	// ProbedAt is when a probe last enumerated this row's real stream table.
+	ProbedAt *time.Time `json:"probed_at,omitempty"`
+	// The track lists are the same projections the version rows carry, so a
+	// client can apply them without reshaping.
+	VideoTracks    []models.VideoTrack            `json:"video_tracks,omitempty"`
+	AudioTracks    []models.AudioTrack            `json:"audio_tracks,omitempty"`
+	SubtitleTracks []catalog.VersionSubtitleTrack `json:"subtitle_tracks,omitempty"`
+}
+
+// VersionCheckSourceMismatch carries the served-vs-declared byte sizes of a
 // rejected probe so the version list can render a distinct source-mismatch
 // state instead of the generic unprobed/retry presentation.
-type versionCheckSourceMismatch struct {
+type VersionCheckSourceMismatch struct {
 	ServedBytes   int64 `json:"served_bytes"`
 	DeclaredBytes int64 `json:"declared_bytes"`
 }
 
 type versionCheckResponse struct {
-	Results []versionCheckResult `json:"results"`
+	Results []VersionCheckResult `json:"results"`
 }
 
 // versionCheckOutcome is one file's liveness verdict before stamps are
@@ -125,7 +175,7 @@ type versionCheckOutcome struct {
 	// sourceMismatch carries a recent rejected probe's byte verdict for this
 	// row. It is advisory only: it never sets stamp, never changes available,
 	// and never marks the row failed.
-	sourceMismatch *versionCheckSourceMismatch
+	sourceMismatch *VersionCheckSourceMismatch
 }
 
 const (
@@ -195,14 +245,25 @@ func (h *CatalogResourceHandler) HandleCheckVersions(w http.ResponseWriter, r *h
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), versionCheckOverallBudget)
+	// The frozen v1 route stays the batched liveness check: preprobe is a v2
+	// inventory mode and is ignored here rather than answered without inventory.
+	writeJSON(w, http.StatusOK, versionCheckResponse{Results: h.CheckVersions(r.Context(), req.FileIDs)})
+}
+
+// CheckVersions is the liveness probe behind the v1 route and the v2
+// checkCatalogVersions operation. Callers validate the batch (one to
+// maxVersionCheckFiles IDs) before calling; the seam applies the per-file
+// concurrency, timeout and stamping rules and never fails the whole batch on
+// one file.
+func (h *CatalogResourceHandler) CheckVersions(ctx context.Context, fileIDs []int) []VersionCheckResult {
+	ctx, cancel := context.WithTimeout(ctx, versionCheckOverallBudget)
 	defer cancel()
 
-	outcomes := make([]versionCheckOutcome, 0, len(req.FileIDs))
+	outcomes := make([]versionCheckOutcome, 0, len(fileIDs))
 	var mu sync.Mutex
 	eg, egCtx := errgroup.WithContext(ctx)
 	eg.SetLimit(versionCheckConcurrency)
-	for _, id := range req.FileIDs {
+	for _, id := range fileIDs {
 		if id <= 0 {
 			continue
 		}
@@ -222,7 +283,7 @@ func (h *CatalogResourceHandler) HandleCheckVersions(w http.ResponseWriter, r *h
 	// All post-processing shares one absolute deadline. A blocked write must
 	// not extend the handler per row, so work that does not fit is logged and
 	// reported unconfirmed rather than assumed to have landed.
-	postCtx, postCancel := context.WithTimeout(context.WithoutCancel(r.Context()), versionCheckPostBudget)
+	postCtx, postCancel := context.WithTimeout(context.WithoutCancel(ctx), versionCheckPostBudget)
 	defer postCancel()
 
 	// Stamps apply only after the whole batch is judged: one volatile
@@ -232,7 +293,7 @@ func (h *CatalogResourceHandler) HandleCheckVersions(w http.ResponseWriter, r *h
 	for _, id := range toStamp {
 		stampByID[id] = struct{}{}
 	}
-	results := make([]versionCheckResult, 0, len(final))
+	results := make([]VersionCheckResult, 0, len(final))
 	for _, outcome := range final {
 		stamped := false
 		if _, ok := stampByID[outcome.fileID]; ok {
@@ -245,15 +306,78 @@ func (h *CatalogResourceHandler) HandleCheckVersions(w http.ResponseWriter, r *h
 				stamped = h.stampVirtualCandidateFailed(postCtx, outcome.fileID, outcome.file)
 			}
 		}
-		results = append(results, versionCheckResult{
+		results = append(results, VersionCheckResult{
 			FileID:         outcome.fileID,
 			Available:      outcome.available,
 			Failed:         versionCheckFailed(outcome, stamped),
 			SourceMismatch: outcome.sourceMismatch,
 		})
 	}
+	return results
+}
 
-	writeJSON(w, http.StatusOK, versionCheckResponse{Results: results})
+// CheckVersionsWithInventory is the versions check's single-file inventory
+// mode. It answers the ordinary liveness verdict first — the budgets, stamping
+// and authorization above are unchanged — and then, for the one requested row,
+// enumerates its track inventory synchronously under
+// versionCheckPreprobeBudget so the answer can carry probe evidence instead of
+// the registration placeholders a version row starts with.
+//
+// The mode is additive and never fails a read: an inaccessible or unknown ID
+// answers exactly like the liveness check does, an unwired preprobe seam or a
+// probe that does not commit reports declared/pending metadata with the row's
+// current tracks, and the batch form keeps its liveness-only shape. Callers pass
+// one validated file ID (the v2 adapter enforces that).
+func (h *CatalogResourceHandler) CheckVersionsWithInventory(ctx context.Context, fileIDs []int) []VersionCheckResult {
+	results := h.CheckVersions(ctx, fileIDs)
+	if len(results) != 1 {
+		return results
+	}
+	if h == nil || h.FileResolver == nil {
+		return results
+	}
+	result := &results[0]
+	if result.FileID <= 0 {
+		return results
+	}
+	file, err := h.FileResolver.GetByID(ctx, result.FileID)
+	if err != nil || file == nil || !h.fileAccessible(ctx, file) {
+		return results
+	}
+	status := VirtualPreprobeDeclined
+	// Only an unstamped, not-yet-failed virtual row has provider bytes left to
+	// enumerate: a stamped row already carries its answer, and a dead pin is not
+	// worth a synchronous provider read.
+	if isVirtualPlaybackFile(file) && file.ProbeUpdatedAt == nil && file.FailedAt == nil && h.items != nil {
+		probeCtx, cancel := context.WithTimeout(ctx, versionCheckPreprobeBudget)
+		status = h.items.preprobeSelectedVirtualFile(probeCtx, file.ContentID, file.ID, h.versionCheckAccessFilter(ctx))
+		cancel()
+		if refreshed, reloadErr := h.reloadVirtualFileAfterWrite(ctx, file.ID); reloadErr == nil && refreshed != nil {
+			file = refreshed
+		}
+	}
+	result.Inventory = &VersionCheckInventory{
+		Provenance:     versionCheckInventoryProvenance(file, status),
+		ProbedAt:       file.ProbeUpdatedAt,
+		VideoTracks:    append([]models.VideoTrack(nil), file.VideoTracks...),
+		AudioTracks:    append([]models.AudioTrack(nil), file.AudioTracks...),
+		SubtitleTracks: catalog.VersionSubtitleTracks(file),
+	}
+	return results
+}
+
+// versionCheckInventoryProvenance classifies the inventory a check result
+// carries. The row's own probe stamp outranks what this read attempted: a stamp
+// is durable evidence from any probe, while an attempt that did not commit
+// leaves the row on declared metadata.
+func versionCheckInventoryProvenance(file *models.MediaFile, status VirtualPreprobeStatus) string {
+	if file != nil && file.ProbeUpdatedAt != nil {
+		return VersionInventoryVerified
+	}
+	if status == VirtualPreprobeVerified || status == VirtualPreprobePending {
+		return VersionInventoryPending
+	}
+	return VersionInventoryDeclared
 }
 
 // checkVersion tests one media file's liveness and returns whether it is
@@ -430,7 +554,7 @@ func (h *CatalogResourceHandler) checkVersion(ctx context.Context, fileID int) v
 // playback probe cache), so it is intentionally absent after a restart or on a
 // node that did not run the probe; the version list then keeps its generic
 // unprobed presentation instead of inventing a mismatch.
-func versionCheckSourceMismatchFor(file *models.MediaFile) *versionCheckSourceMismatch {
+func versionCheckSourceMismatchFor(file *models.MediaFile) *VersionCheckSourceMismatch {
 	if file == nil || !isVirtualPlaybackFile(file) {
 		return nil
 	}
@@ -440,7 +564,7 @@ func versionCheckSourceMismatchFor(file *models.MediaFile) *versionCheckSourceMi
 	if !ok {
 		return nil
 	}
-	return &versionCheckSourceMismatch{ServedBytes: served, DeclaredBytes: declared}
+	return &VersionCheckSourceMismatch{ServedBytes: served, DeclaredBytes: declared}
 }
 
 // VersionSourceMismatch projects the same process-local wrong-source verdict
@@ -598,16 +722,7 @@ func (h *CatalogResourceHandler) fileAccessible(ctx context.Context, file *model
 	if h == nil || h.ItemAccess == nil {
 		return false
 	}
-	filter := catalog.AccessFilter{
-		AllowedLibraryIDs:  accessScopeAllowedLibraryIDs(ctx),
-		DisabledLibraryIDs: accessScopeDisabledLibraryIDs(ctx),
-		MaxPlaybackQuality: accessScopeMaxPlaybackQuality(ctx),
-		UserID:             apimw.GetUserID(ctx),
-		ProfileID:          apimw.GetProfileID(ctx),
-	}
-	if scope, ok := access.GetScope(ctx); ok {
-		filter.MaturityLimits = scope.MaturityLimits
-	}
+	filter := h.versionCheckAccessFilter(ctx)
 	switch {
 	case file.EpisodeID != "":
 		if h.EpisodeLookup == nil {
@@ -731,11 +846,28 @@ func isVirtualCandidateDeadError(err error) bool {
 		strings.Contains(msg, "no usable stream")
 }
 
-// The access-scope extractors below mirror requestAccessFilter's mapping of
-// the resolved access scope onto a catalog.AccessFilter, but take a context
-// instead of an *http.Request because the liveness check fans out per file
-// through an errgroup. A missing scope yields the unrestricted zero values,
-// exactly like requestAccessFilter.
+// versionCheckAccessFilter builds the filter the check authorizes and probes
+// under. The liveness fan-out and the single-file inventory mode share it, so a
+// preprobe never runs with a wider policy than the verdict that admitted it.
+//
+// The access-scope extractors below mirror requestAccessFilter's mapping of the
+// resolved access scope onto a catalog.AccessFilter, but take a context instead
+// of an *http.Request because the liveness check fans out per file through an
+// errgroup. A missing scope yields the unrestricted zero values, exactly like
+// requestAccessFilter.
+func (h *CatalogResourceHandler) versionCheckAccessFilter(ctx context.Context) catalog.AccessFilter {
+	filter := catalog.AccessFilter{
+		AllowedLibraryIDs:  accessScopeAllowedLibraryIDs(ctx),
+		DisabledLibraryIDs: accessScopeDisabledLibraryIDs(ctx),
+		MaxPlaybackQuality: accessScopeMaxPlaybackQuality(ctx),
+		UserID:             apimw.GetUserID(ctx),
+		ProfileID:          apimw.GetProfileID(ctx),
+	}
+	if scope, ok := access.GetScope(ctx); ok {
+		filter.MaturityLimits = scope.MaturityLimits
+	}
+	return filter
+}
 
 func accessScopeAllowedLibraryIDs(ctx context.Context) []int {
 	if scope, ok := access.GetScope(ctx); ok {

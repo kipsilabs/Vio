@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -29,6 +30,11 @@ const warmSubtitleVTT = "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhello\n"
 func newVirtualSubtitleWindowFixture(t *testing.T, dir, ffmpegScript string) (*StreamHandler, *playback.Session, *models.MediaFile, string) {
 	t.Helper()
 	writeExecutableScript(t, filepath.Join(dir, "ffmpeg"), ffmpegScript)
+	// A detached warm validates the layout of its own relay registration
+	// before extracting, so the default probe must agree with the fixture row.
+	// Tests that change file.SubtitleTracks install a matching probe with
+	// writeSubtitleLayoutProbe.
+	writeSubtitleLayoutProbe(t, dir, models.SubtitleTrack{Index: 0, Codec: "subrip"})
 
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("provider-media"))
@@ -64,6 +70,47 @@ func newVirtualSubtitleWindowFixture(t *testing.T, dir, ffmpegScript string) (*S
 	// LIFO runs this wait first — the warm needs the relay it resolved through.
 	t.Cleanup(handler.waitForBackgroundSubtitleWarms)
 	return handler, session, file, virtualURI
+}
+
+// writeSubtitleLayoutProbe installs an ffprobe that reports the given subtitle
+// layout for any input. The detached warm probes its own relay registration
+// before extracting, so a test whose row differs from the fixture default must
+// make the probe agree or the warm abandons as unvalidated.
+func writeSubtitleLayoutProbe(t *testing.T, dir string, tracks ...models.SubtitleTrack) {
+	t.Helper()
+	type probedStream struct {
+		Index       int               `json:"index"`
+		CodecName   string            `json:"codec_name"`
+		CodecType   string            `json:"codec_type"`
+		Tags        map[string]string `json:"tags"`
+		Disposition map[string]int    `json:"disposition"`
+	}
+	streams := make([]probedStream, 0, len(tracks))
+	for _, track := range tracks {
+		streams = append(streams, probedStream{
+			Index:     track.Index,
+			CodecName: track.Codec,
+			CodecType: "subtitle",
+			Tags:      map[string]string{"language": track.Language},
+			Disposition: map[string]int{
+				"default": boolFlag(track.Default),
+				"forced":  boolFlag(track.Forced),
+			},
+		})
+	}
+	payload, err := json.Marshal(map[string]any{"streams": streams})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeExecutableScript(t, filepath.Join(dir, "ffprobe"),
+		"#!/bin/sh\nprintf '%s' '"+string(payload)+"'\n")
+}
+
+func boolFlag(set bool) int {
+	if set {
+		return 1
+	}
+	return 0
 }
 
 // warmArgsLogScript logs every invocation and distinguishes the full-track
@@ -261,6 +308,145 @@ func TestVirtualTextWindowCommittedEntrySkipsDriftProbe(t *testing.T) {
 	}
 }
 
+// Adjacent windows on the same pinned release share the drift-probe verdict:
+// the first request probes, the next reuses the mapping instead of paying the
+// ffprobe tax again before it can extract. The warm is made to fail so no
+// committed artifact can short-circuit the test through the other skip path.
+func TestVirtualSubtitleDriftProbeReusedWithinTTL(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+	dir := t.TempDir()
+	probeLog := filepath.Join(dir, "ffprobe.log")
+	script := "#!/bin/sh\n" +
+		"case \"$*\" in\n" +
+		"  *-ss*) cat <<'VTT'\n" + warmSubtitleVTT + "VTT\n    ;;\n" +
+		"  *) exit 1 ;;\n" +
+		"esac\n"
+	handler, session, file, _ := newVirtualSubtitleWindowFixture(t, dir, script)
+	// Only serve-path probes belong in probeLog. Parking an empty session
+	// manager makes the detached warm's session lookup fail, so no warm starts
+	// (and probes) behind the assertions.
+	handler.sessionMgr = playback.NewSessionManager(0, 0)
+	writeExecutableScript(t, filepath.Join(dir, "ffprobe"),
+		"#!/bin/sh\necho probe >> '"+probeLog+"'\n"+
+			"printf '%s' '{\"streams\":[{\"index\":0,\"codec_name\":\"subrip\",\"codec_type\":\"subtitle\",\"tags\":{}}]}'\n")
+
+	serve := func(position int) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet,
+			"/subtitle?position="+strconv.Itoa(position)+"&duration=120", nil)
+		rec := httptest.NewRecorder()
+		handler.streamEmbeddedSubtitle(rec, req, file, 0, session, true, "vtt")
+		return rec
+	}
+	for _, position := range []int{100, 220} {
+		if rec := serve(position); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "WEBVTT") {
+			t.Fatalf("window %d: status=%d body=%q", position, rec.Code, rec.Body.String())
+		}
+	}
+	if got := countLogLines(t, probeLog); got != 1 {
+		t.Fatalf("drift probes = %d, want 1 (the second window reuses the verdict)", got)
+	}
+}
+
+// A verdict older than the TTL is dropped, so a long playback revalidates the
+// live layout instead of trusting a mapping forever.
+func TestVirtualSubtitleLayoutReuseExpires(t *testing.T) {
+	handler := &StreamHandler{}
+	opts := &playback.StreamExtractOpts{CacheIdentity: "identity-a", TrackIndex: 0, SourceCodec: "subrip"}
+	verifiedAt := time.Now()
+	handler.rememberVirtualSubtitleLayout(virtualSubtitleLayoutKey(opts.CacheIdentity, opts.TrackIndex),
+		playback.StreamExtractOpts{CacheIdentity: opts.CacheIdentity, TrackIndex: 2, SourceCodec: "ass"}, verifiedAt)
+
+	verdict, ok := handler.reuseVirtualSubtitleLayout(opts, verifiedAt.Add(virtualSubtitleLayoutCacheTTL-time.Second))
+	if !ok || verdict.trackIndex != 2 || verdict.sourceCodec != "ass" {
+		t.Fatalf("verdict inside TTL = %+v ok=%v, want the remapped ordinal", verdict, ok)
+	}
+	if _, ok := handler.reuseVirtualSubtitleLayout(opts, verifiedAt.Add(virtualSubtitleLayoutCacheTTL+time.Second)); ok {
+		t.Fatal("verdict must expire after the TTL")
+	}
+}
+
+// The probe memo is keyed on the pre-probe cache identity, and that identity
+// folds in the row's subtitle inventory token. A re-probe that establishes a
+// different layout therefore re-keys the identity, so a verdict recorded for
+// the previous inventory must not be reused inside the TTL.
+func TestVirtualSubtitleLayoutReuseMissesAfterInventoryChanges(t *testing.T) {
+	handler := &StreamHandler{}
+	uri := "virtual://movie/tt-inventory?result=cand-inventory"
+	file := &models.MediaFile{
+		ID:             7,
+		SubtitleTracks: []models.SubtitleTrack{{Index: 0, Codec: "subrip", Language: "eng"}},
+	}
+	verifiedAt := time.Now()
+	before := playback.StreamExtractOpts{
+		CacheIdentity: virtualSubtitleCacheIdentity(file, uri, 0),
+		TrackIndex:    0,
+		SourceCodec:   "subrip",
+	}
+	handler.rememberVirtualSubtitleLayout(
+		virtualSubtitleLayoutKey(before.CacheIdentity, before.TrackIndex), before, verifiedAt)
+	if _, ok := handler.reuseVirtualSubtitleLayout(&before, verifiedAt.Add(time.Second)); !ok {
+		t.Fatal("verdict was not reused for an unchanged inventory inside the TTL")
+	}
+
+	file.SubtitleTracks = []models.SubtitleTrack{
+		{Index: 0, Codec: "subrip", Language: "eng"},
+		{Index: 1, Codec: "ass", Language: "fre"},
+	}
+	after := playback.StreamExtractOpts{
+		CacheIdentity: virtualSubtitleCacheIdentity(file, uri, 0),
+		TrackIndex:    0,
+		SourceCodec:   "subrip",
+	}
+	if after.CacheIdentity == before.CacheIdentity {
+		t.Fatal("inventory token did not re-key the cache identity")
+	}
+	if _, ok := handler.reuseVirtualSubtitleLayout(&after, verifiedAt.Add(time.Second)); ok {
+		t.Fatal("verdict recorded for the previous inventory was reused after the layout changed")
+	}
+}
+
+// A text warm survives a resume but still stops when the playhead leaves the
+// position the warm was started at, or when the session ends. The abort itself
+// is ErrSubtitleWarmCanceled, which the cache treats as an intentional
+// abandonment rather than a source failure.
+func TestVirtualSubtitleWarmCancelReason(t *testing.T) {
+	manager := playback.NewSessionManager(0, 0)
+	session, err := manager.StartSession(1, "profile-1", 91, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := &StreamHandler{sessionMgr: manager}
+	anchorAt := time.Now()
+	const anchor = 100.0
+	if err := manager.UpdateProgress(session.ID, anchor, false); err != nil {
+		t.Fatal(err)
+	}
+
+	if reason := handler.virtualSubtitleWarmCancelReason(session, anchor, anchorAt, anchorAt.Add(30*time.Second)); reason != "" {
+		t.Fatalf("normal playback canceled the warm: %q", reason)
+	}
+	if err := manager.UpdateProgress(session.ID, anchor+500, false); err != nil {
+		t.Fatal(err)
+	}
+	if reason := handler.virtualSubtitleWarmCancelReason(session, anchor, anchorAt, anchorAt.Add(2*time.Second)); reason != "seek forward" {
+		t.Fatalf("forward-seek reason = %q", reason)
+	}
+	if err := manager.UpdateProgress(session.ID, anchor-60, false); err != nil {
+		t.Fatal(err)
+	}
+	if reason := handler.virtualSubtitleWarmCancelReason(session, anchor, anchorAt, anchorAt.Add(3*time.Second)); reason != "seek backward" {
+		t.Fatalf("backward-seek reason = %q", reason)
+	}
+	if err := manager.StopSession(session.ID); err != nil {
+		t.Fatal(err)
+	}
+	if reason := handler.virtualSubtitleWarmCancelReason(session, anchor, anchorAt, anchorAt.Add(4*time.Second)); reason != "session ended" {
+		t.Fatalf("session-end reason = %q", reason)
+	}
+}
+
 // The window-miss warm keys on the exact ordinal the serve path hands it, so
 // after a drift remap the post-remap identity is what gets populated and the
 // remapped serve path finds it. The start-path warm still keys on the plan
@@ -279,7 +465,7 @@ func TestVirtualTextWindowWarmKeysOnServeOrdinalAfterRemap(t *testing.T) {
 	// This is the identity the remapped serve path computes; the warm must
 	// commit under it.
 	serveIdentity := virtualSubtitleCacheIdentity(file, virtualURI, remappedOrdinal)
-	handler.warmVirtualSubtitleAfterWindowMiss(file, session, playback.StreamExtractOpts{
+	handler.warmVirtualSubtitleAfterWindowMiss(file, file.SubtitleTracks[0], session, playback.StreamExtractOpts{
 		InputPath:       "unused",
 		CacheIdentity:   serveIdentity,
 		TrackIndex:      remappedOrdinal,
@@ -287,13 +473,102 @@ func TestVirtualTextWindowWarmKeysOnServeOrdinalAfterRemap(t *testing.T) {
 		SeekSeconds:     600,
 		DurationSeconds: 600,
 		FFmpegPath:      filepath.Join(dir, "ffmpeg"),
-	}, true, "")
+	}, nil, true, "")
 	waitForCommittedTextEntry(t, handler.SubtitleCache, serveIdentity, remappedOrdinal, "subrip")
 
 	planIdentity := virtualSubtitleCacheIdentity(file, virtualURI, 0)
 	if handler.SubtitleCache.HasCommittedTextEntry("unused", planIdentity, 0, "subrip", "") {
 		t.Fatal("warm must not commit under the orphaned plan ordinal")
 	}
+}
+
+// The warm resolves its own relay registration, so it validates that
+// registration before extracting. When the live release rotated, it remaps
+// onto the same-class live track and extracts that stream; the artifact still
+// commits under the identity the fill was admitted with, which is the pre-probe
+// key every later serve for this row and ordinal computes.
+func TestVirtualSubtitleWarmRemapsOntoLiveLayoutBeforeCommit(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+	dir := t.TempDir()
+	argsLog := filepath.Join(dir, "ffmpeg.args")
+	handler, session, file, virtualURI := newVirtualSubtitleWindowFixture(t, dir,
+		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\ncat <<'VTT'\n"+warmSubtitleVTT+"VTT\n")
+	file.SubtitleTracks = []models.SubtitleTrack{{Index: 0, Codec: "subrip", Language: "eng"}}
+	session.VirtualSubtitleTracks = file.SubtitleTracks
+	// The live release rotated: two subrip tracks, and the planned English one
+	// is now the second.
+	writeSubtitleLayoutProbe(t, dir,
+		models.SubtitleTrack{Index: 3, Codec: "subrip", Language: "jpn"},
+		models.SubtitleTrack{Index: 7, Codec: "subrip", Language: "eng"},
+	)
+
+	handler.warmVirtualSubtitleAfterWindowMiss(file, file.SubtitleTracks[0], session, playback.StreamExtractOpts{
+		InputPath:       "unused",
+		CacheIdentity:   virtualSubtitleCacheIdentity(file, virtualURI, 0),
+		TrackIndex:      0,
+		SourceCodec:     "subrip",
+		SeekSeconds:     600,
+		DurationSeconds: 600,
+		FFmpegPath:      filepath.Join(dir, "ffmpeg"),
+	}, nil, true, "")
+
+	const remappedOrdinal = 1
+	planIdentity := virtualSubtitleCacheIdentity(file, virtualURI, 0)
+	waitForCommittedTextEntry(t, handler.SubtitleCache, planIdentity, 0, "subrip")
+	if handler.SubtitleCache.HasCommittedTextEntry("unused",
+		virtualSubtitleCacheIdentity(file, virtualURI, remappedOrdinal), remappedOrdinal, "subrip", "") {
+		t.Fatal("warm committed under the live ordinal instead of the key its fill was admitted with")
+	}
+	data, err := os.ReadFile(argsLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	warmArgs := strings.TrimSpace(string(data))
+	if !strings.Contains(warmArgs, "-map 0:s:1") {
+		t.Fatalf("warm args = %q, want the remapped 0:s:1", warmArgs)
+	}
+}
+
+// A live layout with no same-class track cannot be remapped, so the warm
+// abandons before extracting: nothing is committed, and because that is an
+// intentional abandonment rather than a source failure, the failure cooldown
+// stays clear and a later warm can still commit.
+func TestVirtualSubtitleWarmAbandonsUnmatchedLayoutWithoutCooldown(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+	dir := t.TempDir()
+	argsLog := filepath.Join(dir, "ffmpeg.args")
+	handler, session, file, virtualURI := newVirtualSubtitleWindowFixture(t, dir,
+		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\ncat <<'VTT'\n"+warmSubtitleVTT+"VTT\n")
+	writeSubtitleLayoutProbe(t, dir, models.SubtitleTrack{Index: 0, Codec: "hdmv_pgs_subtitle"})
+
+	opts := playback.StreamExtractOpts{
+		InputPath:       "unused",
+		CacheIdentity:   virtualSubtitleCacheIdentity(file, virtualURI, 0),
+		TrackIndex:      0,
+		SourceCodec:     "subrip",
+		SeekSeconds:     600,
+		DurationSeconds: 600,
+		FFmpegPath:      filepath.Join(dir, "ffmpeg"),
+	}
+	handler.warmVirtualSubtitleAfterWindowMiss(file, file.SubtitleTracks[0], session, opts, nil, true, "")
+	handler.waitForBackgroundSubtitleWarms()
+
+	if _, err := os.Stat(argsLog); !os.IsNotExist(err) {
+		t.Fatalf("warm extracted from an unmatched live layout: %v", err)
+	}
+	if handler.SubtitleCache.HasCommittedTextEntry("unused", opts.CacheIdentity, 0, "subrip", "") {
+		t.Fatal("warm committed an entry it never validated")
+	}
+
+	// A matching probe on the next attempt proves the abandonment did not arm
+	// the per-identity failure cooldown.
+	writeSubtitleLayoutProbe(t, dir, models.SubtitleTrack{Index: 0, Codec: "subrip"})
+	handler.warmVirtualSubtitleAfterWindowMiss(file, file.SubtitleTracks[0], session, opts, nil, true, "")
+	waitForCommittedTextEntry(t, handler.SubtitleCache, opts.CacheIdentity, 0, "subrip")
 }
 
 // A non-virtual handler (virtualActive false) must not start any warm: local
@@ -308,7 +583,7 @@ func TestVirtualTextWindowWarmSkipsNonVirtual(t *testing.T) {
 		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\n")
 	identity := virtualSubtitleCacheIdentity(file, virtualURI, 0)
 
-	handler.warmVirtualSubtitleAfterWindowMiss(file, session, playback.StreamExtractOpts{
+	handler.warmVirtualSubtitleAfterWindowMiss(file, file.SubtitleTracks[0], session, playback.StreamExtractOpts{
 		InputPath:       "unused",
 		CacheIdentity:   identity,
 		TrackIndex:      0,
@@ -316,28 +591,30 @@ func TestVirtualTextWindowWarmSkipsNonVirtual(t *testing.T) {
 		SeekSeconds:     100,
 		DurationSeconds: 600,
 		FFmpegPath:      filepath.Join(dir, "ffmpeg"),
-	}, false, "")
+	}, nil, false, "")
 
 	if _, err := os.Stat(argsLog); !os.IsNotExist(err) {
 		t.Fatalf("no warm should run for a non-virtual request: %v", err)
 	}
 }
 
-// A playing session must not start the second full-source read. The window
-// result cache and the client's next window are enough while playback is
-// active; the full-track warm is reserved for the paused path.
-func TestVirtualTextWindowWarmSkipsActivePlayback(t *testing.T) {
+// A playing session may start one detached text warm. Without it, every
+// window on a large virtual source re-demuxes the relay input and the
+// full-track artifact never appears while the viewer keeps watching, so
+// rendering stops when the client's lookahead runs out. Coalescing through
+// WarmTrackInBackground still keeps it single-flighted.
+func TestVirtualTextWindowWarmStartsDuringPlayback(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell script test helper is unix-only")
 	}
 	dir := t.TempDir()
 	argsLog := filepath.Join(dir, "ffmpeg.args")
 	handler, session, file, virtualURI := newVirtualSubtitleWindowFixture(t, dir,
-		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\n")
+		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\ncat <<'VTT'\n"+warmSubtitleVTT+"VTT\n")
 	session.IsPaused = false
 	identity := virtualSubtitleCacheIdentity(file, virtualURI, 0)
 
-	handler.warmVirtualSubtitleAfterWindowMiss(file, session, playback.StreamExtractOpts{
+	handler.warmVirtualSubtitleAfterWindowMiss(file, file.SubtitleTracks[0], session, playback.StreamExtractOpts{
 		InputPath:       "unused",
 		CacheIdentity:   identity,
 		TrackIndex:      0,
@@ -345,10 +622,36 @@ func TestVirtualTextWindowWarmSkipsActivePlayback(t *testing.T) {
 		SeekSeconds:     100,
 		DurationSeconds: 120,
 		FFmpegPath:      filepath.Join(dir, "ffmpeg"),
-	}, true, "")
+	}, nil, true, "")
+
+	waitForCommittedTextEntry(t, handler.SubtitleCache, identity, 0, "subrip")
+}
+
+// The text exception is text-only: a bitmap .sup full track is tens of
+// megabytes and stays paused-only, so a playing session never warms it.
+func TestVirtualPGSWindowWarmSkipsActivePlayback(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+	dir := t.TempDir()
+	argsLog := filepath.Join(dir, "ffmpeg.args")
+	handler, session, file, virtualURI := newVirtualSubtitleWindowFixture(t, dir,
+		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\nprintf 'PG'\n")
+	session.IsPaused = false
+	identity := virtualSubtitleCacheIdentity(file, virtualURI, 0)
+
+	handler.warmVirtualSubtitleAfterWindowMiss(file, file.SubtitleTracks[0], session, playback.StreamExtractOpts{
+		InputPath:       "unused",
+		CacheIdentity:   identity,
+		TrackIndex:      0,
+		SourceCodec:     "hdmv_pgs_subtitle",
+		SeekSeconds:     100,
+		DurationSeconds: 120,
+		FFmpegPath:      filepath.Join(dir, "ffmpeg"),
+	}, nil, true, "")
 
 	if _, err := os.Stat(argsLog); !os.IsNotExist(err) {
-		t.Fatalf("no warm should run while the session is playing: %v", err)
+		t.Fatalf("no PGS warm should run while the session is playing: %v", err)
 	}
 }
 
@@ -370,6 +673,7 @@ func TestVirtualPGSWholeTrackFetchServesImplicitWindowThenWarms(t *testing.T) {
 	t.Cleanup(func() { _ = os.WriteFile(gate, []byte("go"), 0o644) })
 	file.SubtitleTracks = []models.SubtitleTrack{{Index: 0, Codec: "hdmv_pgs_subtitle"}}
 	session.VirtualSubtitleTracks = file.SubtitleTracks
+	writeSubtitleLayoutProbe(t, dir, file.SubtitleTracks...)
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/subtitle", nil)
@@ -410,6 +714,7 @@ func TestVirtualImplicitWindowAppliesToASS(t *testing.T) {
 		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\ncat <<'VTT'\n"+warmSubtitleVTT+"VTT\n")
 	file.SubtitleTracks = []models.SubtitleTrack{{Index: 0, Codec: "ass"}}
 	session.VirtualSubtitleTracks = file.SubtitleTracks
+	writeSubtitleLayoutProbe(t, dir, file.SubtitleTracks...)
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/subtitle", nil)
@@ -551,8 +856,8 @@ func TestVirtualTextWindowWarmResolveTimeoutReleasesSlot(t *testing.T) {
 	}
 
 	// Occupy both warm slots with resolvers that block until canceled.
-	handler.warmVirtualSubtitleAfterWindowMiss(file, session, optsFor(0), true, "")
-	handler.warmVirtualSubtitleAfterWindowMiss(file, session, optsFor(1), true, "")
+	handler.warmVirtualSubtitleAfterWindowMiss(file, file.SubtitleTracks[0], session, optsFor(0), nil, true, "")
+	handler.warmVirtualSubtitleAfterWindowMiss(file, file.SubtitleTracks[0], session, optsFor(1), nil, true, "")
 	for i := 0; i < 2; i++ {
 		select {
 		case <-entered:
@@ -562,7 +867,7 @@ func TestVirtualTextWindowWarmResolveTimeoutReleasesSlot(t *testing.T) {
 	}
 
 	// With both slots held, a third warm is dropped rather than queued.
-	handler.warmVirtualSubtitleAfterWindowMiss(file, session, optsFor(2), true, "")
+	handler.warmVirtualSubtitleAfterWindowMiss(file, file.SubtitleTracks[0], session, optsFor(2), nil, true, "")
 	if _, err := os.Stat(argsLog); !os.IsNotExist(err) {
 		t.Fatalf("a warm extracted while both slots were held: %v", err)
 	}
@@ -580,7 +885,7 @@ func TestVirtualTextWindowWarmResolveTimeoutReleasesSlot(t *testing.T) {
 	identity := virtualSubtitleCacheIdentity(file, virtualURI, 2)
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		handler.warmVirtualSubtitleAfterWindowMiss(file, session, optsFor(2), true, "")
+		handler.warmVirtualSubtitleAfterWindowMiss(file, file.SubtitleTracks[0], session, optsFor(2), nil, true, "")
 		if handler.SubtitleCache.HasCommittedTextEntry("unused", identity, 2, "subrip", "") {
 			return
 		}
@@ -723,7 +1028,7 @@ func TestHandleSubtitleFontsKeepsRelayForDetachedFlight(t *testing.T) {
 	if err := os.WriteFile(gate, []byte("go"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	key := fontBundleCacheKey(file, virtualURI, handler.ffmpegPath())
+	key := fontBundleCacheKey(file, handler.ffmpegPath())
 	if !pollHandlerFontBundle(t, handler.SubtitleCache, key) {
 		t.Fatal("detached extraction never committed after the HTTP waiter returned")
 	}
@@ -1101,5 +1406,367 @@ func TestImplicitVirtualWindowStart(t *testing.T) {
 	}
 	if got := implicitVirtualWindowStart(&playback.Session{Position: 3600}); got != 3598 {
 		t.Fatalf("resumed session start = %v, want 3598", got)
+	}
+}
+
+// A warm opens its own relay registration, so a layout verdict the triggering
+// serve established is only an ordinal hint: it never authorizes the bytes the
+// warm reads. Even with a matching, fresh seed the warm must probe its own
+// registration, and a probe that cannot establish the layout fails closed
+// without committing anything.
+func TestVirtualSubtitleWarmProbesOwnRegistrationDespiteInheritedVerdict(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+	dir := t.TempDir()
+	argsLog := filepath.Join(dir, "ffmpeg.args")
+	probeLog := filepath.Join(dir, "ffprobe.args")
+	handler, session, file, virtualURI := newVirtualSubtitleWindowFixture(t, dir,
+		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\ncat <<'VTT'\n"+warmSubtitleVTT+"VTT\n")
+	writeExecutableScript(t, filepath.Join(dir, "ffprobe"),
+		"#!/bin/sh\nprintf 'probe\\n' >> '"+probeLog+"'\nexit 1\n")
+
+	identity := virtualSubtitleCacheIdentity(file, virtualURI, 0)
+	handler.warmVirtualSubtitleAfterWindowMiss(file, file.SubtitleTracks[0], session, playback.StreamExtractOpts{
+		InputPath:       "unused",
+		CacheIdentity:   identity,
+		TrackIndex:      0,
+		SourceCodec:     "subrip",
+		SeekSeconds:     600,
+		DurationSeconds: 600,
+		FFmpegPath:      filepath.Join(dir, "ffmpeg"),
+	}, &virtualSubtitleLayoutSeed{
+		cacheIdentity: identity,
+		trackIndex:    0,
+		sourceCodec:   "subrip",
+		verifiedAt:    time.Now(),
+	}, true, "")
+	handler.waitForBackgroundSubtitleWarms()
+
+	if data, err := os.ReadFile(probeLog); err != nil || strings.TrimSpace(string(data)) == "" {
+		t.Fatalf("warm trusted the serve's verdict instead of probing its own registration (probe log %q, err %v)", data, err)
+	}
+	if handler.SubtitleCache.HasCommittedTextEntry("unused", identity, 0, "subrip", "") {
+		t.Fatal("warm committed bytes after failing to establish its own live layout")
+	}
+	if _, err := os.Stat(argsLog); !os.IsNotExist(err) {
+		t.Fatalf("warm extracted without a validated layout: %v", err)
+	}
+}
+
+// Inheritance is identity-keyed: a verdict recorded for a different pinned
+// result or inventory must not authorize this warm. It falls back to its own
+// probe and fails closed when the layout cannot be established, committing
+// nothing.
+func TestVirtualSubtitleWarmStaleIdentityStillReprobesAndFailsClosed(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+	dir := t.TempDir()
+	argsLog := filepath.Join(dir, "ffmpeg.args")
+	probeLog := filepath.Join(dir, "ffprobe.args")
+	handler, session, file, virtualURI := newVirtualSubtitleWindowFixture(t, dir,
+		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\ncat <<'VTT'\n"+warmSubtitleVTT+"VTT\n")
+	writeExecutableScript(t, filepath.Join(dir, "ffprobe"),
+		"#!/bin/sh\nprintf 'probe\\n' >> '"+probeLog+"'\nexit 1\n")
+
+	identity := virtualSubtitleCacheIdentity(file, virtualURI, 0)
+	staleIdentity := virtualSubtitleCacheIdentity(file, "virtual://movie/tt-window?result=previous", 0)
+	handler.warmVirtualSubtitleAfterWindowMiss(file, file.SubtitleTracks[0], session, playback.StreamExtractOpts{
+		InputPath:       "unused",
+		CacheIdentity:   identity,
+		TrackIndex:      0,
+		SourceCodec:     "subrip",
+		SeekSeconds:     600,
+		DurationSeconds: 600,
+		FFmpegPath:      filepath.Join(dir, "ffmpeg"),
+	}, &virtualSubtitleLayoutSeed{
+		cacheIdentity: staleIdentity,
+		trackIndex:    0,
+		sourceCodec:   "subrip",
+		verifiedAt:    time.Now(),
+	}, true, "")
+	handler.waitForBackgroundSubtitleWarms()
+
+	if data, err := os.ReadFile(probeLog); err != nil || strings.TrimSpace(string(data)) == "" {
+		t.Fatalf("warm trusted a verdict for a different identity (probe log %q, err %v)", data, err)
+	}
+	if handler.SubtitleCache.HasCommittedTextEntry("unused", identity, 0, "subrip", "") {
+		t.Fatal("warm committed bytes after failing to establish the live layout")
+	}
+	if _, err := os.Stat(argsLog); !os.IsNotExist(err) {
+		t.Fatalf("warm extracted without a validated layout: %v", err)
+	}
+}
+
+// A serve that trusted its plan-time evidence instead of probing has no live
+// layout verdict to lend. If it hands the warm a seed anyway, the warm must
+// still probe its own registration, and a probe that cannot establish the
+// layout fails closed without committing anything.
+func TestVirtualSubtitleWarmProbesOwnRegistrationDespiteEvidenceSeed(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+	dir := t.TempDir()
+	argsLog := filepath.Join(dir, "ffmpeg.args")
+	probeLog := filepath.Join(dir, "ffprobe.args")
+	handler, session, file, virtualURI := newVirtualSubtitleWindowFixture(t, dir,
+		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\ncat <<'VTT'\n"+warmSubtitleVTT+"VTT\n")
+	writeExecutableScript(t, filepath.Join(dir, "ffprobe"),
+		"#!/bin/sh\nprintf 'probe\\n' >> '"+probeLog+"'\nexit 1\n")
+
+	identity := virtualSubtitleCacheIdentity(file, virtualURI, 0)
+	handler.warmVirtualSubtitleAfterWindowMiss(file, file.SubtitleTracks[0], session, playback.StreamExtractOpts{
+		InputPath:       "unused",
+		CacheIdentity:   identity,
+		TrackIndex:      0,
+		SourceCodec:     "subrip",
+		SeekSeconds:     600,
+		DurationSeconds: 600,
+		FFmpegPath:      filepath.Join(dir, "ffmpeg"),
+	}, &virtualSubtitleLayoutSeed{
+		cacheIdentity: identity,
+		trackIndex:    0,
+		sourceCodec:   "subrip",
+		verifiedAt:    time.Now(),
+	}, true, "")
+	handler.waitForBackgroundSubtitleWarms()
+
+	if data, err := os.ReadFile(probeLog); err != nil || strings.TrimSpace(string(data)) == "" {
+		t.Fatalf("warm trusted an evidence seed instead of probing its own registration (probe log %q, err %v)", data, err)
+	}
+	if handler.SubtitleCache.HasCommittedTextEntry("unused", identity, 0, "subrip", "") {
+		t.Fatal("warm committed bytes after failing to establish its own live layout")
+	}
+	if _, err := os.Stat(argsLog); !os.IsNotExist(err) {
+		t.Fatalf("warm extracted without a validated layout: %v", err)
+	}
+}
+
+// An inherited ordinal hint is bounded by the same TTL as the layout memo. A
+// seed older than that is not a hint the serve established for this identity
+// any more, so the warm ignores it, probes its own registration, and fails
+// closed when the layout cannot be established.
+func TestVirtualSubtitleWarmExpiredHintReprobesAndFailsClosed(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+	dir := t.TempDir()
+	argsLog := filepath.Join(dir, "ffmpeg.args")
+	probeLog := filepath.Join(dir, "ffprobe.args")
+	handler, session, file, virtualURI := newVirtualSubtitleWindowFixture(t, dir,
+		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\ncat <<'VTT'\n"+warmSubtitleVTT+"VTT\n")
+	writeExecutableScript(t, filepath.Join(dir, "ffprobe"),
+		"#!/bin/sh\nprintf 'probe\\n' >> '"+probeLog+"'\nexit 1\n")
+
+	identity := virtualSubtitleCacheIdentity(file, virtualURI, 0)
+	handler.warmVirtualSubtitleAfterWindowMiss(file, file.SubtitleTracks[0], session, playback.StreamExtractOpts{
+		InputPath:       "unused",
+		CacheIdentity:   identity,
+		TrackIndex:      0,
+		SourceCodec:     "subrip",
+		SeekSeconds:     600,
+		DurationSeconds: 600,
+		FFmpegPath:      filepath.Join(dir, "ffmpeg"),
+	}, &virtualSubtitleLayoutSeed{
+		cacheIdentity: identity,
+		trackIndex:    0,
+		sourceCodec:   "subrip",
+		verifiedAt:    time.Now().Add(-virtualSubtitleLayoutCacheTTL - time.Second),
+	}, true, "")
+	handler.waitForBackgroundSubtitleWarms()
+
+	if data, err := os.ReadFile(probeLog); err != nil || strings.TrimSpace(string(data)) == "" {
+		t.Fatalf("warm trusted an expired hint (probe log %q, err %v)", data, err)
+	}
+	if handler.SubtitleCache.HasCommittedTextEntry("unused", identity, 0, "subrip", "") {
+		t.Fatal("warm committed bytes after failing to establish the live layout")
+	}
+	if _, err := os.Stat(argsLog); !os.IsNotExist(err) {
+		t.Fatalf("warm extracted without a validated layout: %v", err)
+	}
+}
+
+// The production shape of the regression: a windowed request whose ordinal is
+// evidence-bound serves without a drift probe. It therefore has no live-layout
+// verdict to hand the warm, which must probe its own registration. Here that
+// probe sees a rotated release whose subtitle class no longer matches, so the
+// warm fails closed and commits nothing while the serve itself still answers.
+func TestVirtualTextWindowEvidenceBoundServeWarmProbesAndFailsClosedOnRotation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+	dir := t.TempDir()
+	argsLog := filepath.Join(dir, "ffmpeg.args")
+	probeLog := filepath.Join(dir, "ffprobe.args")
+	handler, session, file, virtualURI := newVirtualSubtitleWindowFixture(t, dir,
+		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\ncat <<'VTT'\n"+warmSubtitleVTT+"VTT\n")
+	// A rotated release now exposes only a bitmap track, so the warm's own
+	// probe cannot map the planned text track and must abandon.
+	writeExecutableScript(t, filepath.Join(dir, "ffprobe"),
+		"#!/bin/sh\nprintf 'probe\\n' >> '"+probeLog+"'\n"+
+			"printf '%s' '{\"streams\":[{\"index\":0,\"codec_name\":\"pgs\",\"codec_type\":\"subtitle\"}]}'\n")
+
+	req := httptest.NewRequest(http.MethodGet, "/subtitle?position=600&duration=600", nil)
+	rec := httptest.NewRecorder()
+	// driftSuspected=false and the session's evidence still describes this
+	// row: exactly the state handleSubtitle derives for an uninterrupted
+	// virtual release. The serve must not probe; the warm must, because the
+	// serve's evidence is not a verdict on the warm's own registration.
+	session.VirtualSubtitleEvidenceSet = true
+	session.VirtualSubtitleEvidenceFileID = file.ID
+	session.VirtualSubtitleTracks = file.SubtitleTracks
+	handler.streamEmbeddedSubtitle(rec, req, file, 0, session, false, "vtt")
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "WEBVTT") {
+		t.Fatalf("window serve: status=%d body=%q", rec.Code, rec.Body.String())
+	}
+	handler.waitForBackgroundSubtitleWarms()
+
+	if data, err := os.ReadFile(probeLog); err != nil || strings.TrimSpace(string(data)) == "" {
+		t.Fatalf("warm used the serve's evidence instead of probing its own registration (probe log %q, err %v)", data, err)
+	}
+	identity := virtualSubtitleCacheIdentity(file, virtualURI, 0)
+	if handler.SubtitleCache.HasCommittedTextEntry("unused", identity, 0, "subrip", "") {
+		t.Fatal("warm committed bytes after its own probe found no matching track")
+	}
+	if _, warm := ffmpegLogLines(t, argsLog); warm != 0 {
+		t.Fatalf("warm extracted after its own probe failed closed: %d warm invocations", warm)
+	}
+}
+
+// A fresh inherited seed may steer the warm's own probe toward the ordinal the
+// serve settled on, but the probe still runs and the extraction maps the
+// ordinal the probe establishes. Here the live release rotated the text tracks
+// and the requested language now sits at ordinal 1.
+func TestVirtualSubtitleWarmAppliesInheritedOrdinalHintAfterOwnProbe(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+	dir := t.TempDir()
+	argsLog := filepath.Join(dir, "ffmpeg.args")
+	probeLog := filepath.Join(dir, "ffprobe.args")
+	handler, session, file, virtualURI := newVirtualSubtitleWindowFixture(t, dir,
+		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\ncat <<'VTT'\n"+warmSubtitleVTT+"VTT\n")
+
+	// The plan row has English at ordinal 0 and French at ordinal 1; the live
+	// release rotated them, so the requested English track is now ordinal 1.
+	file.SubtitleTracks = []models.SubtitleTrack{
+		{Index: 0, Codec: "subrip", Language: "eng"},
+		{Index: 1, Codec: "subrip", Language: "fre"},
+	}
+	writeExecutableScript(t, filepath.Join(dir, "ffprobe"),
+		"#!/bin/sh\nprintf 'probe\\n' >> '"+probeLog+"'\n"+
+			"printf '%s' '{\"streams\":[{\"index\":0,\"codec_name\":\"subrip\",\"codec_type\":\"subtitle\",\"tags\":{\"language\":\"fre\"}},{\"index\":1,\"codec_name\":\"subrip\",\"codec_type\":\"subtitle\",\"tags\":{\"language\":\"eng\"}}]}'\n")
+
+	identity := virtualSubtitleCacheIdentity(file, virtualURI, 0)
+	handler.warmVirtualSubtitleAfterWindowMiss(file, file.SubtitleTracks[0], session, playback.StreamExtractOpts{
+		InputPath:       "unused",
+		CacheIdentity:   identity,
+		TrackIndex:      0,
+		SourceCodec:     "subrip",
+		SeekSeconds:     600,
+		DurationSeconds: 600,
+		FFmpegPath:      filepath.Join(dir, "ffmpeg"),
+	}, &virtualSubtitleLayoutSeed{
+		cacheIdentity: identity,
+		trackIndex:    1,
+		sourceCodec:   "subrip",
+		verifiedAt:    time.Now(),
+	}, true, "")
+	waitForCommittedTextEntry(t, handler.SubtitleCache, identity, 0, "subrip")
+
+	if data, err := os.ReadFile(probeLog); err != nil || strings.TrimSpace(string(data)) == "" {
+		t.Fatalf("warm skipped its own probe (probe log %q, err %v)", data, err)
+	}
+	args, err := os.ReadFile(argsLog)
+	if err != nil {
+		t.Fatalf("warm never invoked ffmpeg: %v", err)
+	}
+	if !strings.Contains(string(args), "-map 0:s:1") {
+		t.Fatalf("warm did not extract the probed ordinal: args = %q", string(args))
+	}
+}
+
+// A param-less virtual fetch on a cold track is the native client's one-shot
+// whole-track read, not an upgrade probe: it has no windowing contract and no
+// probe cadence that would re-issue a shed read, so a saturated detached budget
+// must not shed it. Here an unrelated track's detached warm holds the only
+// detached slot while the fetch is served from the request-path pool.
+func TestParamlessVirtualFetchAdmittedWhileDetachedBudgetSaturated(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+	dir := t.TempDir()
+	argsLog := filepath.Join(dir, "ffmpeg.args")
+	gate := filepath.Join(dir, "warm.gate")
+	handler, session, file, _ := newVirtualSubtitleWindowFixture(t, dir, warmArgsLogScript(argsLog, gate))
+	t.Cleanup(func() { _ = os.WriteFile(gate, []byte("go"), 0o644) })
+
+	serve := func(f *models.MediaFile, s *playback.Session, query string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/subtitle"+query, nil)
+		handler.streamEmbeddedSubtitle(rec, req, f, 0, s, false, "vtt")
+		return rec
+	}
+
+	// A windowed miss starts the fixture track's detached full-track warm and
+	// leaves it blocked on the gate, holding the source's only detached slot.
+	if rec := serve(file, session, "?position=600&duration=600"); rec.Code != http.StatusOK {
+		t.Fatalf("warm-triggering window = %d %q, want 200", rec.Code, rec.Body.String())
+	}
+	waitForWarmInvocation(t, argsLog)
+
+	// Same virtual release and relay source, distinct cache identity (file ID),
+	// so this request has no committed or warming track of its own: it is the
+	// cold param-less shape a native client sends.
+	otherFile := *file
+	otherFile.ID = file.ID + 1
+	otherSession := *session
+	otherSession.MediaFileID = otherFile.ID
+
+	probe := serve(&otherFile, &otherSession, "")
+	if probe.Code != http.StatusOK {
+		t.Fatalf("cold param-less fetch under detached saturation = %d %q, want 200", probe.Code, probe.Body.String())
+	}
+	if !strings.Contains(probe.Body.String(), "WEBVTT") {
+		t.Fatalf("cold param-less fetch body = %q", probe.Body.String())
+	}
+}
+
+// A param-less fetch against a track whose full-track warm is already in
+// flight is the web player's upgrade probe. It stays on the detached budget: a
+// saturated detached source skips this probe round (the probe cadence re-issues
+// it) instead of stacking a second demux beside the warm.
+func TestWarmingParamlessVirtualFetchSkipsDetachedBudget(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+	dir := t.TempDir()
+	argsLog := filepath.Join(dir, "ffmpeg.args")
+	gate := filepath.Join(dir, "warm.gate")
+	handler, session, file, _ := newVirtualSubtitleWindowFixture(t, dir, warmArgsLogScript(argsLog, gate))
+	t.Cleanup(func() { _ = os.WriteFile(gate, []byte("go"), 0o644) })
+
+	serve := func(query string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/subtitle"+query, nil)
+		handler.streamEmbeddedSubtitle(rec, req, file, 0, session, false, "vtt")
+		return rec
+	}
+
+	if rec := serve("?position=600&duration=600"); rec.Code != http.StatusOK {
+		t.Fatalf("warm-triggering window = %d %q, want 200", rec.Code, rec.Body.String())
+	}
+	waitForWarmInvocation(t, argsLog)
+
+	probe := serve("")
+	if probe.Code != http.StatusServiceUnavailable {
+		t.Fatalf("warming param-less probe = %d %q, want 503 retryable", probe.Code, probe.Body.String())
+	}
+	if probe.Header().Get("Retry-After") == "" {
+		t.Fatal("skipped probe did not advertise Retry-After")
+	}
+	if window, warm := ffmpegLogLines(t, argsLog); window != 1 || warm != 1 {
+		t.Fatalf("ffmpeg invocations after skipped probe = %d window, %d warm; want 1/1", window, warm)
 	}
 }

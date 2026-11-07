@@ -54,14 +54,29 @@ func PinDVPinV3(pin DVPinV3, file *models.MediaFile, profile int) DVPinV3 {
 	return DVPinV3{FileID: file.ID, Source: file.FilePath, Profile: profile}
 }
 
-// ApplyDVPinToFileV3 overwrites a loaded media file's primary video-track
-// Dolby Vision profile with the session's pinned value when the pin names that
-// same file identity. It is how a replan feeds stable DV evidence into the
-// planner without touching catalog state: the file is a per-request load,
-// never the shared catalog row.
-func ApplyDVPinToFileV3(file *models.MediaFile, pin DVPinV3) {
-	if !dvPinMatchesFileV3(pin, file) || len(file.VideoTracks) == 0 {
-		return
+// ApplyDVPinToFileV3 returns the loaded media file's video-track slice with its
+// primary track's Dolby Vision profile replaced by the session's pinned value
+// when the pin names that same file identity. It is how a replan feeds stable DV
+// evidence into the planner without touching catalog state: the file is a
+// per-request load, never the shared catalog row.
+//
+// The write is copy-on-write. The loaded file is per-request, but its
+// VideoTracks backing array can still be shared with a detached probe for the
+// same row: a prober may hand its probe input a slice that aliases the catalog
+// row (and therefore the replan's effective file), and the probe reads tracks
+// by value in mergeVirtualCandidateTracks while the replan plans. Writing
+// through the shared backing array would race that reader, so the slice is
+// cloned and only the private copy's first track is changed. Callers assign the
+// returned slice to the file they are about to plan.
+func ApplyDVPinToFileV3(file *models.MediaFile, pin DVPinV3) []models.VideoTrack {
+	if file == nil {
+		return nil
 	}
-	file.VideoTracks[0].DVProfile = pin.Profile
+	if !dvPinMatchesFileV3(pin, file) || len(file.VideoTracks) == 0 {
+		return file.VideoTracks
+	}
+	tracks := make([]models.VideoTrack, len(file.VideoTracks))
+	copy(tracks, file.VideoTracks)
+	tracks[0].DVProfile = pin.Profile
+	return tracks
 }

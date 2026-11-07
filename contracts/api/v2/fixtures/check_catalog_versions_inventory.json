@@ -1,0 +1,41 @@
+{
+  "results": [
+    {
+      "file_id": "124",
+      "available": true,
+      "inventory_provenance": "verified",
+      "probed_at": "2026-01-02T03:04:05.000Z",
+      "video_tracks": [
+        {
+          "codec": "hevc",
+          "dv_config_present": false,
+          "dv_bl_compat_id_present": false,
+          "width": 3840,
+          "height": 2160,
+          "interlaced": false,
+          "hdr10_plus": false
+        }
+      ],
+      "audio_tracks": [
+        {
+          "index": 1,
+          "language": "eng",
+          "codec": "truehd",
+          "channels": 8,
+          "default": false
+        }
+      ],
+      "subtitle_tracks": [
+        {
+          "index": 2,
+          "language": "eng",
+          "codec": "subrip",
+          "forced": false,
+          "default": false,
+          "hearing_impaired": false,
+          "external": false
+        }
+      ]
+    }
+  ]
+}

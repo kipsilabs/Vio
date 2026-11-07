@@ -85,6 +85,18 @@ type StreamExtractOpts struct {
 	// (StreamHandler.warmVirtualSubtitleAfterWindowMiss). Local files leave
 	// this false and retain the normal cache-warm behavior.
 	DisableBackgroundWarm bool
+
+	// DetachedRelayDemux marks this extract as a whole-track upgrade probe
+	// against a track that is already committed or has a full-track fill
+	// warming. Its output is the committed full-track artifact the next window
+	// (or probe) reads, not a window a client is waiting on, so its relay read
+	// draws from the detached demux budget and can never take a slot a
+	// foreground window needs. When the detached budget is taken the probe is
+	// skipped and answered retryable; the client's probe cadence re-issues it.
+	// A cold param-less fetch (a native client's one-shot whole-track request)
+	// has no such cadence and stays on the request-path budget. Explicit
+	// windowed requests leave this false.
+	DetachedRelayDemux bool
 	// FreshSourceRetry marks a caller's bounded retry after it replaced
 	// InputPath with a newly resolved URL for the same cache identity. The
 	// per-identity extraction backoff exists to stop repeated client retries

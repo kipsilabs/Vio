@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -12,6 +13,14 @@ import (
 	"github.com/Silo-Server/silo-server/internal/plugins"
 	"github.com/Silo-Server/silo-server/internal/userstore"
 )
+
+// virtualFallbackSiblingListBudget bounds the listing a cross-release fallback
+// spends looking for a probed sibling. It runs only on an attempt that already
+// indicted the pinned release, and a provider answer is normally served from
+// the listing cache the resolve just populated, so the bound exists to keep a
+// slow provider from spending the startup budget it would otherwise leave for
+// the fallback itself.
+const virtualFallbackSiblingListBudget = 3 * time.Second
 
 // DeviceCapabilityProfileSource resolves the persisted device capabilities used
 // for candidate ranking. It is an interface so tests can inject a deterministic
@@ -110,6 +119,86 @@ func (h *PlaybackHandler) virtualCandidateHasProbeEvidence(ctx context.Context, 
 		return false
 	}
 	return completeVirtualVideoEvidenceV3(row) && completeVirtualAudioEvidenceV3(row) && completeVirtualContainerEvidenceV3(row)
+}
+
+// virtualCandidateHasProbedInventory reports whether the catalog row owning a
+// candidate carries measured audio or subtitle inventory. It is deliberately
+// narrower than virtualCandidateHasProbeEvidence: a cross-release fallback only
+// needs to know which stream ordinals address real streams, not whether the row
+// is fully planner-grade. A row with no probe stamp is UNKNOWN inventory, not
+// empty inventory, so it never qualifies.
+func (h *PlaybackHandler) virtualCandidateHasProbedInventory(ctx context.Context, candidateURI string, file *models.MediaFile, ownerID int) bool {
+	if h == nil || candidateURI == "" {
+		return false
+	}
+	contentID, episodeID := "", ""
+	if file != nil {
+		contentID, episodeID = file.ContentID, file.EpisodeID
+	}
+	row, found, err := h.lookupVirtualCandidateRowDetailed(ctx, candidateURI, contentID, episodeID, ownerID)
+	if err != nil || !found || row == nil || row.ProbeUpdatedAt == nil {
+		return false
+	}
+	return len(row.AudioTracks) > 0 || len(row.SubtitleTracks) > 0
+}
+
+// preferredProbedFallbackCandidate returns the id of the best remaining
+// candidate whose catalog row carries measured inventory, so a cross-release
+// fallback can bind a release it can actually carry the viewer's audio and
+// subtitle selections onto instead of stepping through unprobed stubs one hop
+// at a time. It returns "" when the current preference is already that probed
+// candidate, when no probed sibling remains, or when the listing cannot answer:
+// the caller then keeps the ordinary walk, and an unknown-inventory attempt no
+// longer resets the selections. Best-effort by design — a listing failure must
+// never fail the fallback.
+func (h *PlaybackHandler) preferredProbedFallbackCandidate(ctx context.Context, file *models.MediaFile, excludedCandidateIDs []string, currentPreference string, userID int, profileID string) string {
+	if h == nil || h.VirtualPlaybackStreamLister == nil || file == nil {
+		return ""
+	}
+	listCtx, cancel := context.WithTimeout(ctx, virtualFallbackSiblingListBudget)
+	defer cancel()
+	streams, err := h.VirtualPlaybackStreamLister.ListVirtualPlaybackStreams(
+		listCtx, file.FilePath, userID, profileID, file.VirtualOwnerInstallationID,
+	)
+	if err != nil || len(streams) == 0 {
+		return ""
+	}
+	// Keep the same sibling set the start path's own candidate list uses: same
+	// release identity, same profile, and no provider-order override. Trusting
+	// the provider's order is an explicit operator choice, so the fallback must
+	// not reorder it either.
+	streams = visibleVirtualPlaybackStreams(streams)
+	if virtualProviderOrderPreserved(streams) {
+		return ""
+	}
+	streams = filterVirtualPlaybackStreams(file, streams)
+	if len(streams) == 0 {
+		return ""
+	}
+	excluded := make(map[string]struct{}, len(excludedCandidateIDs))
+	for _, id := range excludedCandidateIDs {
+		excluded[id] = struct{}{}
+	}
+	for _, cand := range streams {
+		id := strings.TrimSpace(cand.ID)
+		if id == "" || cand.Rejected {
+			// A custom-format-rejected release never jumps an accepted one,
+			// probed or not: compatibility still wins the top slot.
+			continue
+		}
+		if _, skip := excluded[id]; skip {
+			continue
+		}
+		if !h.virtualCandidateHasProbedInventory(listCtx, cand.URI, file, file.VirtualOwnerInstallationID) {
+			continue
+		}
+		if id == currentPreference {
+			// The resolver is already bound to this release; nothing to change.
+			return ""
+		}
+		return id
+	}
+	return ""
 }
 
 // partitionVirtualStreamsAcceptedFirst stably moves rejected streams behind
