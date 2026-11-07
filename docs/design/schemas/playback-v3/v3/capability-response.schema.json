@@ -31,7 +31,7 @@
     "features": {
       "type": "array",
       "description": "Server feature flags. The list grows additively within v3, so an unrecognized entry is expected and must be ignored, not treated as an error.",
-      "minItems": 8,
+      "minItems": 9,
       "uniqueItems": true,
       "allOf": [
         { "contains": { "const": "playback_plan_v3" } },
@@ -41,7 +41,8 @@
         { "contains": { "const": "device_quirks_v1" } },
         { "contains": { "const": "seek_reanchor_v1" } },
         { "contains": { "const": "direct_stream_resume_v1" } },
-        { "contains": { "const": "plan_source_duration_v1" } }
+        { "contains": { "const": "plan_source_duration_v1" } },
+        { "contains": { "const": "audio_track_unverified_v1" } }
       ],
       "items": {
         "type": "string"

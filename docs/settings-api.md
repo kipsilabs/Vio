@@ -1049,8 +1049,11 @@ endpoint so admin tooling does not need to invent them.
 
 The server admin settings include `artwork.storage_backend` (`auto`, `local`, or
 `s3`) and `artwork.local_path` (an absolute filesystem path, defaulting to
-`/var/lib/silo/artwork`). Artwork storage settings take effect after a server
-restart.
+`/var/lib/vio/artwork`). An installation that already recorded a local storage
+identity keeps the exact root that identity names instead, normally
+`/var/lib/silo/artwork`, until a managed storage transition moves it; an install
+with no recorded identity adopts the default. Artwork storage settings take
+effect after a server restart.
 
 The first write to the assets store records its storage identity; writes to a
 shared local root count too. At startup, Silo records any configured private

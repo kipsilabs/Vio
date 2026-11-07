@@ -1427,7 +1427,7 @@ func TestWatchDetailSelectionSchedulesProbeOnlyForUnprobedVirtualRow(t *testing.
 	}
 
 	// A bare read carries no selection: nothing is scheduled.
-	h.scheduleSelectedVirtualProbe(detail, catalog.AccessFilter{})
+	h.scheduleSelectedVirtualProbe(detail.ContentID, detail.Type, detail.Versions, catalog.AccessFilter{})
 	if got := prober.snapshot(); len(got) != 0 {
 		t.Fatalf("bare read scheduled %d probes, want none", len(got))
 	}
@@ -1437,7 +1437,7 @@ func TestWatchDetailSelectionSchedulesProbeOnlyForUnprobedVirtualRow(t *testing.
 
 	// An explicit selection of the virtual row schedules exactly that row's
 	// probe and its warm-up.
-	h.scheduleSelectedVirtualProbe(detail, catalog.AccessFilter{SelectedFileID: 22})
+	h.scheduleSelectedVirtualProbe(detail.ContentID, detail.Type, detail.Versions, catalog.AccessFilter{SelectedFileID: 22})
 	got := prober.snapshot()
 	if len(got) != 1 {
 		t.Fatalf("explicit selection scheduled %d probes, want 1", len(got))
@@ -1454,7 +1454,7 @@ func TestWatchDetailSelectionSchedulesProbeOnlyForUnprobedVirtualRow(t *testing.
 	}
 
 	// Selecting a local row has no provider bytes to enumerate or fetch.
-	h.scheduleSelectedVirtualProbe(detail, catalog.AccessFilter{SelectedFileID: 21})
+	h.scheduleSelectedVirtualProbe(detail.ContentID, detail.Type, detail.Versions, catalog.AccessFilter{SelectedFileID: 21})
 	if got := prober.snapshot(); len(got) != 1 {
 		t.Fatalf("local selection scheduled %d probes, want none", len(got)-1)
 	}
@@ -1466,11 +1466,43 @@ func TestWatchDetailSelectionSchedulesProbeOnlyForUnprobedVirtualRow(t *testing.
 	// bytes may be cold even though the inventory is known.
 	probedAt := time.Now()
 	detail.Versions[1].ProbedAt = &probedAt
-	h.scheduleSelectedVirtualProbe(detail, catalog.AccessFilter{SelectedFileID: 22})
+	h.scheduleSelectedVirtualProbe(detail.ContentID, detail.Type, detail.Versions, catalog.AccessFilter{SelectedFileID: 22})
 	if got := prober.snapshot(); len(got) != 1 {
 		t.Fatalf("fresh selection scheduled %d probes, want none", len(got)-1)
 	}
 	if got := prober.warmSnapshot(); len(got) != 2 {
 		t.Fatalf("fresh selection scheduled %d warm-ups, want a second one", len(got))
+	}
+}
+
+// TestPreprobeSelectedFileDeclinesWithoutAProbeTarget: the synchronous mode
+// never invents work. A nil handler, an unknown row, or an unwired target
+// reports declined so the caller answers declared metadata.
+func TestPreprobeSelectedFileDeclinesWithoutAProbeTarget(t *testing.T) {
+	var nilHandler *PlaybackHandler
+	if got := nilHandler.PreprobeSelectedFile(t.Context(), "movie:1", 5, catalog.AccessFilter{}); got != VirtualPreprobeDeclined {
+		t.Fatalf("nil handler preprobe = %q, want declined", got)
+	}
+	h := &PlaybackHandler{}
+	if got := h.PreprobeSelectedFile(t.Context(), "", 5, catalog.AccessFilter{}); got != VirtualPreprobeDeclined {
+		t.Fatalf("empty content preprobe = %q, want declined", got)
+	}
+	if got := h.PreprobeSelectedFile(t.Context(), "movie:1", 5, catalog.AccessFilter{}); got != VirtualPreprobeDeclined {
+		t.Fatalf("unwired target preprobe = %q, want declined", got)
+	}
+}
+
+// TestPreprobeSelectedFileReportsPendingWhenAChainIsLive: admission is shared
+// with the detached chains, so a row another chain is already enumerating
+// reports pending instead of opening a second probe on the same bytes.
+func TestPreprobeSelectedFileReportsPendingWhenAChainIsLive(t *testing.T) {
+	h := &PlaybackHandler{}
+	release, refusal := h.defaultProbeChains.acquire("movie:1\x005")
+	if refusal != defaultProbeChainRefusalNone {
+		t.Fatalf("admission refused: %s", refusal)
+	}
+	defer release()
+	if got := h.PreprobeSelectedFile(t.Context(), "movie:1", 5, catalog.AccessFilter{}); got != VirtualPreprobePending {
+		t.Fatalf("preprobe with a live chain = %q, want pending", got)
 	}
 }

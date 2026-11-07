@@ -527,7 +527,7 @@ func TestCatalogVersionsCheckAccessHidesFailedVerdict(t *testing.T) {
 		// Both the denied failed row and the unknown id must serialize to the
 		// same verdict shape: unavailable with no failed field.
 		result.FileID = 0
-		if result != (versionCheckResult{}) {
+		if result != (VersionCheckResult{}) {
 			t.Fatalf("denied/unknown result leaked row state: %#v", result)
 		}
 	}

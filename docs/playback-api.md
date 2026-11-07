@@ -159,7 +159,7 @@ and `allowed` is `true`; a server without playback wired answers
 server instance UUID that diagnostics also report. `protocol_versions` is
 `[3]`. `features` is the v3 server feature set plus `sequenced_progress_v1`,
 `fixed_media_file_v1`, `marker_segments_v1`, `trickplay_v1`,
-`bandwidth_probe_v1` and `connection_speed_v1`. With `connection_speed_v1` the
+`bandwidth_probe_v1`, `connection_speed_v1`, and `versions_check_v1`. With `connection_speed_v1` the
 response adds `bandwidth_probe_url`, the media-path probe below, on the origin
 the request arrived on. A reverse proxy that rewrites `Host` to a bare IP
 address and sends no `X-Forwarded-Host` leaves only the address it dialed;
@@ -183,6 +183,12 @@ membership, command-aware readiness, and ready/buffering/syncing member status.
 `deliveries` lists `original_http`, `server_remux_progressive`,
 `server_remux_hls` and, when transcoding is enabled, `server_transcode_hls`.
 `revision` is a digest of the rest.
+
+The `bandwidth_probe_v1` and `versions_check_v1` entries are additive
+discovery: a client that ignores either keeps its previous behavior. No start,
+replan, or other playback path requires calling the bandwidth probe or the
+catalog versions check, and the capabilities response gains no required member
+when it advertises them.
 
 ## Bandwidth probe
 
@@ -314,29 +320,30 @@ When enabled, `GET /api/v2/watch/{id}` also discovers versions after checking
 access for a virtual movie or individual episode. It uses the same cached
 discovery service and re-reads watch detail before answering, so existing
 native clients receive the persisted versions without calling the
-discovery operation themselves. Discovery has a 15-second waiting budget.
-On failure, the original detail is returned; shared provider work may finish
-after that wait and be visible on a later request.
+discovery operation themselves. Discovery has a 5-second waiting budget. A
+provider listing that takes longer than that is abandoned and the original
+detail is returned, so a cold provider never blocks the read beyond the budget;
+shared provider work may finish after that wait and be visible on a later
+request.
 
 When enabled, a leaf catalog detail read — `GET /api/v2/catalog/items/{id}`
-resolving to a virtual movie or individual episode — runs the same discovery
-and re-reads the item detail before answering, under a 3-second waiting
-budget: browsing is the hot path and native clients such as Android read item
-detail alone before play. Shared provider work keeps running detached from
-the request, so a listing that finishes after the budget is visible on a
-later read. Discovery failure, a timeout, or a failed detail re-read returns
-the original detail. Eligibility reads the stored source rows and never the
-response's redacted file paths, so viewers without file-path visibility reach
-the same discovery.
+resolving to a virtual movie or individual episode — starts the same discovery
+detached and answers immediately from the persisted version list: browsing is
+the hot path and native clients such as Android read item detail alone before
+play. Shared provider work keeps running after the response under its own
+budget, so a listing that finishes later is visible on a later read. Discovery
+failure or a timeout changes nothing in the answer. Eligibility reads the
+stored source rows and never the response's redacted file paths, so viewers
+without file-path visibility reach the same discovery.
 
-The catalog wait is tuned with the admin Streaming setting
-`virtual_library.catalog_discovery_budget_ms` (500-10000, default 1000). It
+The detached catalog budget is tuned with the admin Streaming setting
+`virtual_library.catalog_discovery_budget_ms` (500-20000, default 20000). It
 is read on each detail request, so saving it does not require a restart.
-Measured provider scrapes vary from tens of milliseconds to about 2.5s, and
-the built-in default absorbs the wall-clocked overhead the scrape accrues
-before persistence; the watch path keeps a short 2-second wait. Both paths
-continue the provider work detached after the response, so a cold scrape is
-not lost when the response returns first.
+Measured provider scrapes were observed at 17–25 seconds, which is why the
+budget is sized to admit that band; the watch path keeps a shorter 5-second
+wait because its caller is opening the player. Both paths continue the provider
+work detached after the response, so a cold scrape is not lost when the
+response returns first.
 
 Leaf answers carry an additive `has_virtual_source` boolean. It reports
 whether the item holds persisted virtual candidate groups, read from the same
@@ -784,6 +791,17 @@ reanchor, and is excluded from plan identity.
 | Subtitle sidecar | GET/HEAD `/api/v2/stream/{session_id}/subtitles/{track}` |
 | Subtitle fonts | GET `/api/v2/stream/{session_id}/subtitles/{track}/fonts`, JSON `{items: [{name, data}]}` |
 
+A font bundle that is still being extracted answers an empty collection with
+`Cache-Control: no-store` and `X-Vio-Font-Bundle-Pending: true`; the client
+falls back to default fonts and re-fetches. When the complete attached pack is
+past the 48 MiB ceiling and script-driven subsetting cannot produce a bundle
+(the script is unreadable, more than eight tracks, more than 8 MiB of decoded
+script, or no referenced attachment matched), the response also carries
+`X-Vio-Font-Bundle-Fallback: subset_unavailable`. That marker means the server
+has answered for this source and the client is on system fonts; it is not a
+still-running extraction. A definitive empty bundle for a file with no
+attachments keeps the cacheable response and carries neither marker.
+
 These reuse the shared byte-delivery handlers behind the v2 listener, as the raw
 playback registry allows. The plan's URLs
 carry the signed stream reference `st`; a media element that cannot set headers
@@ -814,7 +832,18 @@ the replacement's inventory by the concrete language it carries (the same
 language-carriage rule a version switch uses); codec and channel layout may
 differ between releases and are not required to match. When no track carries
 that language, the fallback starts on the replacement's default and reports an
-audio-unavailable degradation warning instead of silently resetting.
+audio-unavailable degradation warning instead of silently resetting. When the
+replacement's inventory could not be measured at all, the requested ordinal is
+passed through unverified: the plan reports `audio_track_unverified` and sets
+`audio_selection_pending: true`, because the ordinal may name another stream or
+no stream. A client must render that audio pick as pending/unverified rather
+than confirmed while the flag is set, and must not treat it as a known
+degradation to the file's default (`audio_track_unavailable`). A client that
+negotiated `audio_track_unverified_v1` can rely on the flag; older v2 clients
+still see the warning and are otherwise unchanged. The marker is outside plan
+identity and never changes stream selection. Jellyfin-protocol clients are
+unaffected: that surface has no degradation channel and never takes this
+cross-release fallback.
 
 A subtitle selection is carried across a candidate rotation by identity. The
 track source (external sidecar, embedded, or downloaded), the output muxer class

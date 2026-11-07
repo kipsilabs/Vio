@@ -87,17 +87,22 @@ const (
 	MaxVirtualLibraryPlaybackProbeCacheMinutes     = 10080
 )
 
-// VirtualLibraryCatalogDiscoveryBudgetMsSettingKey bounds how long one
-// catalog leaf detail read (v2 item detail; the browse path Android opens
-// first) waits for pre-play virtual version discovery before answering with
-// whatever is already persisted. Discovery keeps running detached either way;
-// this only prices the wait in the response. The pre-play probe chain carries
-// its own separate budget and never inherits this number.
+// VirtualLibraryCatalogDiscoveryBudgetMsSettingKey bounds how long the detached
+// pre-play virtual version discovery started by a catalog leaf detail read (v2
+// item detail; the browse path Android opens first) may run before it is
+// stopped. The read itself never waits: it answers from whatever is already
+// persisted and the detached run publishes versions_updated when its listing
+// lands. The pre-play probe chain carries its own separate budget and never
+// inherits this number.
 const (
 	VirtualLibraryCatalogDiscoveryBudgetMsSettingKey = "virtual_library.catalog_discovery_budget_ms"
-	DefaultVirtualLibraryCatalogDiscoveryBudgetMs    = 1000
-	MinVirtualLibraryCatalogDiscoveryBudgetMs        = 500
-	MaxVirtualLibraryCatalogDiscoveryBudgetMs        = 10000
+	// 20 s admits the observed 17–25 s provider-listing low band that the old
+	// one-second default (and ten-second ceiling) cut off, while keeping one
+	// detached listing bounded. Stored values are not rewritten: a deployment
+	// that pinned the old 10 s ceiling must raise it to the new maximum.
+	DefaultVirtualLibraryCatalogDiscoveryBudgetMs = 20000
+	MinVirtualLibraryCatalogDiscoveryBudgetMs     = 500
+	MaxVirtualLibraryCatalogDiscoveryBudgetMs     = 20000
 )
 
 // VirtualLibraryPlaybackProbeCacheMinutes reads a stored
@@ -415,7 +420,7 @@ var adminSettingDefaults = map[string]string{
 	"matcher.enable_tv_series_group_queue": "false",
 	"metadata.cache_images":                "true",
 	"artwork.storage_backend":              "auto",
-	"artwork.local_path":                   "/var/lib/silo/artwork",
+	"artwork.local_path":                   DefaultArtworkLocalPath,
 	"markers.mode":                         "both",
 	"markers.lazy_playback":                "true",
 	MarkersDetectionWorkersSettingKey:      "1",
@@ -684,6 +689,14 @@ func EffectiveAdminSettings(stored map[string]string) map[string]string {
 		"ai.max_concurrent_jobs",
 		"subtitle_ai.max_concurrent_jobs",
 	)
+	// An installation that recorded a storage identity keeps the artwork root
+	// it has been serving, even though a new installation defaults to
+	// DefaultArtworkLocalPath. Show the root runtime actually opens so an
+	// untouched form submits the value it was loaded with instead of opening a
+	// transition for a move the operator never made.
+	if strings.TrimSpace(stored["artwork.local_path"]) == "" {
+		effective["artwork.local_path"] = artworkLocalPath(stored)
+	}
 	return effective
 }
 

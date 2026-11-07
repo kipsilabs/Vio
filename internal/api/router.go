@@ -1766,7 +1766,14 @@ func newChiRouter(deps Dependencies) chi.Router {
 			// service-context watcher, but that is only a safety net: this
 			// registration makes application shutdown call the drain and wait
 			// for accepted, in-memory evidence rather than firing it detached.
-			deps.RegisterShutdownFunc("virtual-evidence-drain", playbackHandler.StopVirtualEvidence)
+			// The deferred-probe convergence watchdog is stopped in the same
+			// step so a handler whose service context is never canceled still
+			// terminates it; both stop methods are idempotent, and one step
+			// keeps the handler's shutdown surface a single named unit.
+			deps.RegisterShutdownFunc("virtual-evidence-drain", func() {
+				playbackHandler.StopDeferredProbeWatchdog()
+				playbackHandler.StopVirtualEvidence()
+			})
 		}
 		if deps.VirtualLibraryService != nil {
 			// The detailed resolver threads the edge id itself
@@ -1804,6 +1811,10 @@ func newChiRouter(deps Dependencies) chi.Router {
 			// virtual version schedules the shared pre-play chain for that
 			// row, so its track menus are populated before the first play.
 			itemsHandler.SetVirtualSelectionProber(playbackHandler)
+			// The versions check's single-file inventory mode runs that same
+			// probe inline under its own short request bound, so a client that
+			// asked for the tracks gets them without a second round trip.
+			itemsHandler.SetVirtualSelectionPreprober(playbackHandler)
 		}
 		if deps.UserStoreProvider != nil {
 			// Device-aware candidate ranking: resolve the caller's persisted
@@ -2151,6 +2162,10 @@ func newChiRouter(deps Dependencies) chi.Router {
 			// pay the cold fetch. Nil (no monitor or no virtual library service)
 			// leaves selection warm-ups disabled.
 			playbackHandler.VirtualReleaseCacheWarmup = sh.VirtualReleaseCacheFiller
+			// The same completion signal makes a completed, duration-verified
+			// pinned release sticky on the start path: a transient resolve
+			// failure retries that release before the cross-release walk.
+			playbackHandler.VirtualReleaseCacheStatus = sh.VirtualReleaseCacheStatus
 			// Install the completion observer last so the waiter registry is
 			// already wired when the first confirmation can arrive.
 			svc.Monitor.SetReleaseConfirmedObserver(sh.HandleVirtualReleaseConfirmed)
@@ -4015,6 +4030,8 @@ func newChiRouter(deps Dependencies) chi.Router {
 	}
 	if catalogResourceHandler != nil {
 		v2deps.CatalogItems = catalogResourceHandler
+		v2deps.CatalogVersionsCheck = catalogResourceHandler
+		v2deps.CatalogVersionsWarm = catalogResourceHandler
 	}
 	if shuffleService != nil {
 		v2deps.Shuffles = shuffleService

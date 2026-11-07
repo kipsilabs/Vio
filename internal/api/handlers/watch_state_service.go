@@ -49,13 +49,15 @@ func (h *ItemsHandler) WatchDetail(ctx context.Context, userID int, profileID, c
 		detail.UserData = h.leafUserData(ctx, userID, profileID, detail.ContentID, detail.Type)
 		applyEffectiveEditionPreference(detail.UserData, &detail.EffectiveVersionEditionKey)
 	}
-	h.scheduleSelectedVirtualProbe(detail, filter)
+	h.scheduleSelectedVirtualProbe(detail.ContentID, detail.Type, detail.Versions, filter)
 	return detail, nil
 }
 
 // scheduleSelectedVirtualProbe schedules the pre-play work for an explicitly
 // selected virtual version: the probe chain when its track inventory has not
-// been enumerated yet, and the provider fetch warm-up in every case.
+// been enumerated yet, and the provider fetch warm-up in every case. The
+// versions are the access-filtered rows the caller is about to answer with; the
+// selection is filter.SelectedFileID.
 //
 // Probe-on-select exists because selecting a non-default row previously left
 // its audio/subtitle menus unknown until the row played. Warm-on-select exists
@@ -65,15 +67,15 @@ func (h *ItemsHandler) WatchDetail(ctx context.Context, userID int, profileID, c
 // same fill a play would. The warm-up is fire-and-forget and re-reads the row
 // under the same access filter, so a bare listing or polling read (no explicit
 // selection) schedules neither.
-func (h *ItemsHandler) scheduleSelectedVirtualProbe(detail *catalog.WatchDetail, filter catalog.AccessFilter) {
-	if h == nil || h.virtualSelectionProber == nil || detail == nil || filter.SelectedFileID <= 0 {
+func (h *ItemsHandler) scheduleSelectedVirtualProbe(contentID, itemType string, versions []catalog.FileVersion, filter catalog.AccessFilter) {
+	if h == nil || h.virtualSelectionProber == nil || contentID == "" || filter.SelectedFileID <= 0 {
 		return
 	}
-	if detail.Type != itemTypeMovie && detail.Type != itemTypeEpisode {
+	if itemType != itemTypeMovie && itemType != itemTypeEpisode {
 		return
 	}
-	for i := range detail.Versions {
-		version := &detail.Versions[i]
+	for i := range versions {
+		version := &versions[i]
 		if version.FileID != filter.SelectedFileID {
 			continue
 		}
@@ -89,9 +91,9 @@ func (h *ItemsHandler) scheduleSelectedVirtualProbe(detail *catalog.WatchDetail,
 		// starts the same fetch), while a refused probe leaves the warm-up to
 		// start the fetch on its own.
 		if version.ProbedAt == nil {
-			h.virtualSelectionProber.ScheduleSelectedFileProbe(detail.ContentID, version.FileID, filter)
+			h.virtualSelectionProber.ScheduleSelectedFileProbe(contentID, version.FileID, filter)
 		}
-		h.virtualSelectionProber.ScheduleSelectedFileWarm(detail.ContentID, version.FileID, filter)
+		h.virtualSelectionProber.ScheduleSelectedFileWarm(contentID, version.FileID, filter)
 		return
 	}
 }

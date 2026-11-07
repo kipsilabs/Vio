@@ -65,8 +65,14 @@ export const catalogKeys = {
   allLetters: ["catalog", "letters"] as const,
   letters: (params: Pick<CatalogParams, "library_id" | "type" | "query_fingerprint">) =>
     ["catalog", "letters", params] as const,
-  itemDetail: (id: string, libraryId?: number) =>
-    ["catalog", "items", id, "detail", libraryId ?? "default"] as const,
+  // The detail key carries the viewer's selected file only when one is passed:
+  // the selection changes the effective playback answer, so it is its own
+  // cache entry. Callers that pass no file keep the original key, and every
+  // prefix-based invalidation of the item's detail still reaches both.
+  itemDetail: (id: string, libraryId?: number, fileId?: number) =>
+    fileId != null
+      ? (["catalog", "items", id, "detail", libraryId ?? "default", fileId] as const)
+      : (["catalog", "items", id, "detail", libraryId ?? "default"] as const),
   itemVersions: (id: string) => ["catalog", "items", id, "versions"] as const,
   // Batched liveness verdicts for a set of file_ids (see versionLiveness.ts).
   // Prefix-matched to invalidate every mounted batch at once.

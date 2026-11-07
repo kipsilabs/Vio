@@ -59,6 +59,10 @@ vi.mock("@/hooks/queries/settingValues", () => ({
   settingsCapabilitiesSupportKey: () => false,
   useEffectiveSettings: () => ({ data: undefined }),
   useSettingsCapabilities: () => ({ data: undefined, isSuccess: false }),
+  // The post-roll screen reads auto_play_next through these, so the mock has
+  // to answer them even though this file renders a stand-in for it.
+  useSetSettingValue: () => ({ isPending: false, mutateAsync: vi.fn() }),
+  useClearSettingValue: () => ({ isPending: false, mutateAsync: vi.fn() }),
 }));
 vi.mock("@/hooks/queries/progress", () => ({
   useContinueWatching: () => ({ items: [] }),

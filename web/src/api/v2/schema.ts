@@ -7294,6 +7294,23 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/api/v2/catalog/versions/check": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /** Probe the liveness of up to 40 file versions and stamp the durable failed signal. */
+    post: operations["checkCatalogVersions"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   "/api/v2/catalog/works/{work_id}": {
     parameters: {
       query?: never;
@@ -23254,6 +23271,48 @@ export interface components {
       /** @description Distinct subtitle languages in scope as BCP 47 tags; a stored value that is not a recognizable language passes through */
       subtitle_languages: string[];
     };
+    CatalogVersionCheckResult: {
+      /** @description The row's audio tracks; present only in the single-file inventory mode */
+      audio_tracks?: components["schemas"]["AudioTrack"][];
+      available: boolean;
+      failed?: boolean;
+      /**
+       * @description The probed file identifier
+       * @example 1
+       */
+      file_id: string;
+      /**
+       * @description How much of the returned inventory is evidence: verified (probe-enumerated and stamped), pending (a probe ran for this read without committed evidence), or declared (registration metadata only)
+       * @enum {string}
+       */
+      inventory_provenance?: "declared" | "pending" | "verified";
+      /**
+       * Format: date-time
+       * @description When a probe last enumerated this row's stream table; absent means declared metadata only
+       */
+      probed_at?: string;
+      source_mismatch?: components["schemas"]["VersionSourceMismatch"];
+      /** @description The row's embedded and external subtitle tracks; present only in the single-file inventory mode */
+      subtitle_tracks?: components["schemas"]["VersionSubtitleTrack"][];
+      /** @description The row's video tracks; present only in the single-file inventory mode */
+      video_tracks?: components["schemas"]["VideoTrack"][];
+    };
+    CatalogVersionsCheck: {
+      /** @description One result per requested file identifier; empty, never null */
+      results: components["schemas"]["CatalogVersionCheckResult"][];
+    };
+    CatalogVersionsCheckInputBody: {
+      /**
+       * @description File identifiers from listCatalogItemVersions, at most 40 per request
+       * @example [
+       *       "120",
+       *       "121"
+       *     ]
+       */
+      file_ids: string[];
+      /** @description Ask for the single file's track inventory, enumerated synchronously under a short bound; requires exactly one file identifier */
+      preprobe?: boolean;
+    };
     CatalogWorkFormat: {
       /** @example audiobook:dune */
       content_id: string;
@@ -29645,6 +29704,7 @@ export interface components {
       /** @description The available_qualities label this plan delivers, so a client can mark that menu entry: the label quality_preference named while the menu lists it and the encode keeps its resolution, otherwise the rung whose resolution class and bitrate the encode matches. Absent when the plan delivers no listed entry, such as the source played unchanged or a plain-resolution or auto request whose capped encode falls between two rungs. Present on servers that advertise plan_active_quality_v1. */
       active_quality?: string;
       applied_quirks: components["schemas"]["AppliedQuirkV3"][];
+      audio_selection_pending?: boolean;
       audio_tracks?: components["schemas"]["AudioInventoryItemV3"][];
       /** @description Fixed quality rungs a quality_change replan may request, in menu order. The source is not listed: quality_preference auto returns to it. Empty when no rung applies. */
       available_qualities: components["schemas"]["AvailableQualityV3"][];
@@ -99248,6 +99308,143 @@ export interface operations {
       };
     };
   };
+  checkCatalogVersions: {
+    parameters: {
+      query?: never;
+      header: {
+        /** @description The household profile acting for this request; it must belong to the authenticated account. */
+        "X-Profile-Id": string;
+        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
+        "X-Profile-Token"?: string;
+      };
+      path?: never;
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["CatalogVersionsCheckInputBody"];
+      };
+    };
+    responses: {
+      /** @description OK */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["CatalogVersionsCheck"];
+        };
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unauthorized */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Forbidden */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Found */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Acceptable */
+      406: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Request Timeout */
+      408: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Request Entity Too Large */
+      413: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unsupported Media Type */
+      415: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unprocessable Entity */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Too Many Requests */
+      429: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
   getLiteraryWork: {
     parameters: {
       query?: never;
@@ -139236,6 +139433,7 @@ export interface operations {
       200: {
         headers: {
           "Cache-Control"?: string;
+          "X-Vio-Font-Bundle-Fallback"?: string;
           "X-Vio-Font-Bundle-Pending"?: string;
           [name: string]: unknown;
         };

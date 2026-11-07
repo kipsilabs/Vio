@@ -194,14 +194,16 @@ const (
 // singleflight slot (claimCapabilityRefreshLockedV3).
 const v3NodeCapabilityRefreshInterval = v3NodeCapabilityTTL / 4
 
-// copySeekAnchorSeekResolveTimeout bounds one copy-video seek-anchor resolve
-// (the pinned-relay lookup and the FFmpeg keyframe probe) on a start that seeks.
-// A healthy probe costs ~1.8s; anything slower is a stuck upstream and must not
-// consume the 30s replan budget. The cap is a var so tests can shorten it. It
-// only shortens work on a seek start: a caller with no seek position never
-// resolves an anchor. When it elapses the failure is classified as a retryable
-// seek error, not evidence against the release, so the transport is not rotated
-// or torn down over it.
+// copySeekAnchorSeekResolveTimeout is the floor for one copy-video seek-anchor
+// resolve (the pinned-relay lookup and the FFmpeg keyframe probe) on a start
+// that seeks. A healthy probe costs ~1.8s, so a link that answers inside this
+// budget behaves exactly as it did when the budget was fixed; a link whose own
+// recent provider round trips exceeded it is extended instead, up to
+// copySeekAnchorSeekResolveTimeoutCap (see copySeekAnchorResolveBudget). The
+// floor is a var so tests can shorten it. It only shortens work on a seek
+// start: a caller with no seek position never resolves an anchor. When it
+// elapses the failure is classified as a retryable seek error, not evidence
+// against the release, so the transport is not rotated or torn down over it.
 var copySeekAnchorSeekResolveTimeout = 5 * time.Second
 
 type serverBitrateCapContextKeyV3 struct{}
@@ -4908,11 +4910,14 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 				return preparedTimelineV3{}, &transportErrorV3{reason: transcodeStartFailedReasonV3, message: remuxSeekPositionFailureMessageV3, retryable: true, cause: errors.New("copy seek anchor requires a media file path"), seekFailure: true}
 			}
 			// The whole anchor resolve — pinned-relay lookup and FFmpeg probe —
-			// runs under a cap well inside the replan budget. A relay that is
-			// stuck (not merely returning 5xx) must fail the seek quickly instead
-			// of spending the budget the rest of the replan needs.
-			anchorCtx, cancelAnchor := context.WithTimeout(ctx, copySeekAnchorSeekResolveTimeout)
-			defer cancelAnchor()
+			// runs under a per-attempt budget derived from the link's recent
+			// provider latency (see copySeekAnchorResolveBudget). The floor is
+			// the fixed budget this used to be, so a fast link keeps exactly
+			// the old behavior; only a link that recently answered slower than
+			// that floor gets room to open. A relay that is stuck (not merely
+			// returning 5xx) still fails the seek well inside the replan
+			// budget, and every attempt stays bounded by the caller's deadline.
+			linkKey := virtualProviderLinkLatencyKey(file)
 			// The stable source identity is the un-resolved file path: for a
 			// virtual file that is the provider-neutral URI, identical across
 			// concurrent starts even though each start pins its own relay URL.
@@ -4957,13 +4962,26 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 				releaseAnchor = cleanup
 				return nil
 			}
-			if virtualAnchor {
+			// resolveFailure carries the terminal a pinned-relay lookup failure
+			// classifies into, so the caller still answers exactly the
+			// provider-unavailable shape it answered before the anchor had a
+			// retry.
+			var resolveFailure *transportErrorV3
+			// resolveAnchorForAttempt performs the pinned-relay lookup for one
+			// attempt. retry marks a second attempt, which must probe fresh
+			// bytes: the fresh-registration context mints a new relay entry so
+			// the same token is never presented twice.
+			resolveAnchorForAttempt := func(attemptCtx context.Context, retry bool) error {
 				// Route the anchor through the same absent-pin rotation policy as
 				// the serve layer and the replan rehydration: a provider that
 				// renumbered its result ids must not terminal a remux seek when a
 				// same-identity candidate is still listed. A different release is
 				// refused rather than silently anchored.
-				if resolveErr := resolveAnchorInput(anchorCtx); resolveErr != nil {
+				resolveCtx := attemptCtx
+				if retry {
+					resolveCtx = withVirtualRelayFreshRegistration(attemptCtx)
+				}
+				if resolveErr := resolveAnchorInput(resolveCtx); resolveErr != nil {
 					// This is the first live provider listing for an already-built
 					// plan: a remux seek start binds the row's probe evidence via
 					// the P0 fast path with no liveness check, by design. A
@@ -4976,20 +4994,21 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 					// still runs.
 					classified := classifyVirtualAnchorProviderOutage(resolveErr)
 					fallback := &transportErrorV3{reason: transcodeStartFailedReasonV3, message: remuxSeekPositionFailureMessageV3, retryable: true, cause: classified}
-					if anchorCtx.Err() != nil && ctx.Err() == nil {
+					if attemptCtx.Err() != nil && ctx.Err() == nil {
 						// Our bounded anchor budget elapsed while looking the
 						// candidate up. That is a slow relay, not a release
 						// verdict, so the start must not rotate over it.
 						fallback.seekFailure = true
 					}
-					return preparedTimelineV3{}, transportStartFailureV3(classified, fallback)
+					resolveFailure = transportStartFailureV3(classified, fallback)
+					return classified
 				}
 				// A stored URL that has already lapsed is renewed before the probe,
 				// bounded to virtualProbeBudget, so the seek does not fail on a
 				// dead token. Best-effort: a failed renewal keeps the existing
 				// registration and lets the probe/retry carry the verdict.
 				if virtualResolvedURLExpired(anchorExpiresAt, time.Now()) {
-					refreshCtx, refreshCancel := context.WithTimeout(anchorCtx, virtualProbeBudget)
+					refreshCtx, refreshCancel := context.WithTimeout(attemptCtx, virtualProbeBudget)
 					if resolveErr := resolveAnchorInput(refreshCtx); resolveErr != nil {
 						slog.WarnContext(ctx, "virtual seek anchor stored-url refresh failed; probing the existing registration",
 							"component", "api",
@@ -5000,6 +5019,7 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 					}
 					refreshCancel()
 				}
+				return nil
 			}
 			probeAnchor := func(probeCtx context.Context) (float64, int, error) {
 				if h.copySeekAnchor != nil {
@@ -5008,17 +5028,17 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 				return playback.ResolveCopySeekAnchorForSource(probeCtx, ffmpegPath, sourceIdentity, anchorInput, requested, playback.DefaultSegmentDuration)
 			}
 			// Virtual upstreams occasionally serve a range request slowly
-			// enough to blow the anchor probe budget. One bounded retry
-			// converts most of those transient timeouts into successful
-			// seeks. The retry is skipped when the caller's remaining budget
-			// cannot fit another full probe: a second attempt would consume the
-			// rest of the budget and fail with the caller deadline instead of
-			// the probe error, so failing fast on the first probe error is both
-			// cheaper and clearer. A caller with no deadline keeps the retry.
+			// enough to blow the anchor budget. One bounded retry converts most
+			// of those transient timeouts into successful seeks. The retry is
+			// skipped when the caller's remaining budget cannot fit another
+			// attempt: a second attempt would consume the rest of the budget and
+			// fail with the caller deadline instead of the anchor error, so
+			// failing fast on the first error is both cheaper and clearer. A
+			// caller with no deadline keeps the retry.
 			//
 			// The retry budget is reserved up front: a caller that cannot hold
 			// two full probes plus the scheduling margin never plans a retry, so
-			// a second probe cannot be started only to be truncated by the
+			// a second attempt cannot be started only to be truncated by the
 			// deadline.
 			//
 			// An upstream 5xx and a probe signal-killed from outside (the OOM
@@ -5027,29 +5047,75 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 			// provider that is already failing is not hammered by an immediate
 			// re-probe. A caller cancellation never reaches this branch: the
 			// loop stops before scheduling a retry.
+			//
+			// Our own budget expiring is its own case: it says the link is slow,
+			// not that the release or the provider failed, so the same pinned
+			// release is retried once under a budget re-derived from the
+			// observation the attempt just recorded. A second expiry is the
+			// verdict and surfaces the retryable seek error.
 			retryReserved := copySeekAnchorRetryReserved(ctx)
 			lastProbedInput := ""
+			anchorBudgetElapsed := false
 			var err error
+			var cancelAttempt context.CancelFunc = func() {}
+			defer func() { cancelAttempt() }()
 			for attempt := 1; attempt <= 2; attempt++ {
-				if attempt > 1 && virtualAnchor {
-					// A retry must probe fresh bytes: re-resolve the candidate
-					// and register a new relay entry so the same token is never
-					// probed twice. The fresh-registration context bypasses the
-					// relay's content-key reuse, which would otherwise hand back
-					// the live token for an unchanged provider URL and suppress
-					// this retry before its second probe. A re-resolve that still
-					// yields the same input means no new token is available, so a
-					// second probe would repeat the request that just failed.
-					if resolveErr := resolveAnchorInput(withVirtualRelayFreshRegistration(anchorCtx)); resolveErr != nil {
-						slog.WarnContext(ctx, "virtual seek anchor re-resolve failed; skipping retry",
+				// Release the previous attempt's budget before deriving this
+				// one. Each attempt re-derives it because a timed-out attempt
+				// just recorded the link's observed cost, so a retry is sized
+				// from that measurement instead of inheriting an expired
+				// context whose budget is the reason for retrying.
+				cancelAttempt()
+				resolveFailure = nil
+				attemptStarted := time.Now()
+				attemptBudget := copySeekAnchorResolveBudgetFor(file)
+				attemptCtx, cancel := context.WithTimeout(ctx, attemptBudget)
+				cancelAttempt = cancel
+				if virtualAnchor {
+					if resolveErr := resolveAnchorForAttempt(attemptCtx, attempt > 1); resolveErr != nil {
+						anchorBudgetElapsed = attemptCtx.Err() != nil && ctx.Err() == nil
+						recordVirtualProviderLinkLatency(linkKey, time.Since(attemptStarted), time.Now())
+						if attempt > 1 {
+							// The retry's own re-resolve failed: surface this
+							// attempt's failure, exactly as a single resolve
+							// failure would. resolveFailure already carries the
+							// classification resolved above, so a proven
+							// provider outage still answers provider_unavailable
+							// instead of being demoted to a stale
+							// transcode_start_failed verdict from attempt 1.
+							slog.WarnContext(ctx, "virtual seek anchor re-resolve failed; skipping retry",
+								"component", "api",
+								"playback_session_id", session.ID,
+								"requested_seek_seconds", requested,
+								"error", resolveErr,
+							)
+							err = resolveErr
+							break
+						}
+						err = resolveErr
+						if !anchorBudgetElapsed {
+							break
+						}
+						if fits, remaining := copySeekAnchorAttemptFits(ctx, copySeekAnchorResolveBudgetFor(file)); !fits {
+							slog.WarnContext(ctx, "virtual seek anchor resolve retry skipped: insufficient remaining budget",
+								"component", "api",
+								"playback_session_id", session.ID,
+								"requested_seek_seconds", requested,
+								"remaining", remaining,
+								"error", err,
+							)
+							break
+						}
+						slog.WarnContext(ctx, "virtual seek anchor resolve hit its own budget; retrying the same pinned release with a fresh budget",
 							"component", "api",
 							"playback_session_id", session.ID,
 							"requested_seek_seconds", requested,
-							"error", resolveErr,
+							"budget", attemptBudget,
+							"error", err,
 						)
-						break
+						continue
 					}
-					if anchorInput == lastProbedInput {
+					if attempt > 1 && !anchorBudgetElapsed && anchorInput == lastProbedInput {
 						// The re-resolve handed back the token that just 5xxed:
 						// probing it again repeats a known failure. On a
 						// transient provider error, walk to an alternate
@@ -5079,21 +5145,45 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 							break
 						}
 					}
-					if fits, remaining := copySeekAnchorRetryFits(ctx); !fits {
-						slog.WarnContext(ctx, "copy-video seek anchor retry skipped after re-resolve: insufficient remaining budget",
-							"component", "api",
-							"playback_session_id", session.ID,
-							"requested_seek_seconds", requested,
-							"remaining", remaining,
-						)
-						break
+					if attempt > 1 && !anchorBudgetElapsed {
+						if fits, remaining := copySeekAnchorRetryFits(ctx); !fits {
+							slog.WarnContext(ctx, "copy-video seek anchor retry skipped after re-resolve: insufficient remaining budget",
+								"component", "api",
+								"playback_session_id", session.ID,
+								"requested_seek_seconds", requested,
+								"remaining", remaining,
+							)
+							break
+						}
 					}
 				}
 				lastProbedInput = anchorInput
 				probeStarted := time.Now()
-				origin, startSegment, err = probeAnchor(anchorCtx)
-				if err == nil || ctx.Err() != nil || anchorCtx.Err() != nil || attempt == 2 {
+				origin, startSegment, err = probeAnchor(attemptCtx)
+				anchorBudgetElapsed = err != nil && attemptCtx.Err() != nil && ctx.Err() == nil
+				recordVirtualProviderLinkLatency(linkKey, time.Since(attemptStarted), time.Now())
+				if err == nil || ctx.Err() != nil || attempt == 2 {
 					break
+				}
+				if anchorBudgetElapsed {
+					if fits, remaining := copySeekAnchorAttemptFits(ctx, copySeekAnchorResolveBudgetFor(file)); !fits {
+						slog.WarnContext(ctx, "copy-video seek anchor probe retry skipped: insufficient remaining budget",
+							"component", "api",
+							"playback_session_id", session.ID,
+							"requested_seek_seconds", requested,
+							"remaining", remaining,
+							"error", err,
+						)
+						break
+					}
+					slog.WarnContext(ctx, "copy-video seek anchor probe hit its own budget; retrying the same pinned release with a fresh budget",
+						"component", "api",
+						"playback_session_id", session.ID,
+						"requested_seek_seconds", requested,
+						"budget", attemptBudget,
+						"error", err,
+					)
+					continue
 				}
 				fits, remaining := copySeekAnchorRetryFits(ctx)
 				// A fast transient failure (relay 5xx in milliseconds, not a
@@ -5115,7 +5205,7 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 					break
 				}
 				if playback.IsTransientProviderError(err) {
-					if !h.waitCopySeekAnchorBackoff(anchorCtx, remaining) {
+					if !h.waitCopySeekAnchorBackoff(attemptCtx, remaining) {
 						slog.WarnContext(ctx, "copy-video seek anchor retry skipped: no budget for the provider backoff",
 							"component", "api",
 							"playback_session_id", session.ID,
@@ -5141,6 +5231,13 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 			}
 			releaseAnchor()
 			if err != nil {
+				if resolveFailure != nil {
+					// A pinned-relay lookup that never opened is not a probe
+					// verdict: answer the same provider-unavailable terminal the
+					// lookup classified, exactly as it did before the anchor
+					// could retry.
+					return preparedTimelineV3{}, resolveFailure
+				}
 				slog.ErrorContext(ctx, "failed to resolve protocol v3 copy-video seek anchor",
 					"component", "api",
 					"playback_session_id", session.ID,
@@ -5152,7 +5249,7 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 				// error so the client retries the seek instead of the start path
 				// rotating the version or a replan tearing down the transport.
 				seekFailure := playback.IsTransientProviderError(err) ||
-					(anchorCtx.Err() != nil && ctx.Err() == nil)
+					(anchorBudgetElapsed && ctx.Err() == nil)
 				return preparedTimelineV3{}, &transportErrorV3{reason: transcodeStartFailedReasonV3, message: remuxSeekPositionFailureMessageV3, retryable: true, cause: err, seekFailure: seekFailure}
 			}
 		}
@@ -6260,18 +6357,29 @@ func (h *PlaybackHandler) preferredAudioTrackIndexV3(ctx context.Context, userID
 		slog.ErrorContext(ctx, "protocol v3 start: canonical audio preference lookup failed", "component", "api", "profile_id", profileID, "device_id", deviceID, "error", err)
 		return 0, false, err
 	}
-	if playback.IsOriginalLanguagePreference(preferredLang) {
-		preferredLang = h.resolveOriginalLanguage(ctx, file)
-		if preferredLang == "" {
-			preferredLang, err = resolvedPlaybackAudioLanguage(ctx, store, settingsresolve.Context{ProfileID: profileID})
-			if err != nil {
-				slog.ErrorContext(ctx, "protocol v3 start: profile audio preference fallback failed", "component", "api", "profile_id", profileID, "error", err)
-				return 0, false, err
-			}
-			if playback.IsOriginalLanguagePreference(preferredLang) {
-				preferredLang = h.resolveOriginalLanguage(ctx, file)
-			}
+	// The "original language" sentinel resolves to the file's own detected
+	// language. When the file carries none, the profile's preference answers,
+	// and a second sentinel there falls back to the file again.
+	resolveOriginal := func(current string) (string, error) {
+		if !playback.IsOriginalLanguagePreference(current) {
+			return current, nil
 		}
+		if lang := h.resolveOriginalLanguage(ctx, file); lang != "" {
+			return lang, nil
+		}
+		lang, lookupErr := resolvedPlaybackAudioLanguage(ctx, store, settingsresolve.Context{ProfileID: profileID})
+		if lookupErr != nil {
+			slog.ErrorContext(ctx, "protocol v3 start: profile audio preference fallback failed", "component", "api", "profile_id", profileID, "error", lookupErr)
+			return "", lookupErr
+		}
+		if playback.IsOriginalLanguagePreference(lang) {
+			lang = h.resolveOriginalLanguage(ctx, file)
+		}
+		return lang, nil
+	}
+	preferredLang, err = resolveOriginal(preferredLang)
+	if err != nil {
+		return 0, false, err
 	}
 	if seriesPref != nil {
 		// The specialized row supplies concrete track identity; canonical
@@ -7766,6 +7874,19 @@ func (h *PlaybackHandler) v3SessionStreamState(ctx context.Context, session *pla
 			evidenceSet = session.VirtualSubtitleEvidenceSet
 		}
 		state.VirtualSubtitleEvidenceSet = evidenceSet
+		// Freeze the font-bundle identity with the plan-time file row. A
+		// background probe persists provider identity and inventory onto the
+		// mutable row after this commit; re-deriving the key at serve time would
+		// move every warmed entry out from under its readers. The warm and both
+		// serve paths reuse this key while it still names the same file row.
+		state.VirtualFontBundleKey = playback.FontBundleKey{
+			FileID:          file.ID,
+			Virtual:         true,
+			ReleaseIdentity: virtualFontReleaseIdentity(file),
+			InventoryToken:  playback.SubtitleInventoryToken(file.SubtitleTracks),
+			FFmpegPath:      h.playbackConfig().FFmpegPath,
+		}
+		state.VirtualFontBundleKeySet = true
 		// The new evidence generation is committed with this write, so the
 		// viewer's subtitle position must be re-keyed onto it in the same
 		// commit. A recorded rotation (the replan drift carry, or a candidate
@@ -7927,8 +8048,18 @@ func (h *PlaybackHandler) scheduleVirtualWarmAfterTransportV3(ctx context.Contex
 		return
 	}
 	warmCtx := context.WithoutCancel(ctx)
+	// The start path's session copy predates the stream-state commit that froze
+	// the font-bundle key, so read the live copy back before the warm derives its
+	// key. Without this the warm would key from the plan-time row and the serve
+	// path from the frozen identity.
+	warmSession := session
+	if h.sessionMgr != nil {
+		if live, err := h.sessionMgr.GetSession(session.ID); err == nil && live != nil {
+			warmSession = live
+		}
+	}
 	go func() {
-		h.warmVirtualFontBundleV3(warmCtx, session, file)
+		h.warmVirtualFontBundleV3(warmCtx, warmSession, file)
 	}()
 }
 
@@ -7981,12 +8112,22 @@ func (h *PlaybackHandler) warmVirtualFontBundleV3(ctx context.Context, session *
 		return done
 	}
 	ffmpegPath := h.playbackConfig().FFmpegPath
-	cacheKey := fontBundleCacheKey(file, virtualURI, ffmpegPath)
-	if cacheKey.PinnedResult == "" {
-		// Uncacheable without the pinned candidate anchor: the identity would
-		// rotate with the relay URL, so there is nothing stable to warm.
-		close(done)
-		return done
+	// The serve path binds the session's captured subtitle evidence before it
+	// builds the cache key, so the warm must key the same inventory or it
+	// commits under an identity no request will ask for.
+	keyFile := file
+	if session.VirtualSubtitleEvidenceSet {
+		bound := *file
+		bound.SubtitleTracks = session.VirtualSubtitleTracks
+		keyFile = &bound
+	}
+	cacheKey := fontBundleCacheKey(keyFile, ffmpegPath)
+	if session.VirtualFontBundleKeySet {
+		// The plan-time commit froze the identity both this warm and the serve
+		// paths must use. Deriving from keyFile again would re-key the warm when
+		// the background probe has already persisted provider identity onto the
+		// row.
+		cacheKey = session.VirtualFontBundleKey
 	}
 	go func() {
 		defer close(done)
@@ -9425,6 +9566,32 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	seekSubtitleDegraded := false
 	seekFailureRecovery := operation == playback.ReplanOperationSeekFailureRecoveryV3
 	seekScopedRecovery := seekReanchor || seekFailureRecovery
+	// A failure recovery on a transcode session that answered the playlist and
+	// never served a single segment request is a client that walked away after
+	// fetching the manifest: the encode was live, the bytes were ready, and
+	// nobody ever collected one. Nothing here is evidence against the plan, so
+	// stopping the abandoned session and answering "gone" is the honest reply.
+	// Rotating instead would indict a healthy recipe, spend the adaptation
+	// budget, and persist a failure for a route that never delivered a byte to
+	// the player.
+	if failureRecoveryOperationV3(operation) && h.abandonedBeforeFirstSegmentV3(record.SessionID) {
+		if session, err := h.sessionMgr.GetSession(record.SessionID); err == nil {
+			slog.InfoContext(r.Context(), "playback failure recovery abandoned before the first segment",
+				logComponentKey, playbackLogValueV3,
+				"session_id", record.SessionID,
+				"operation", string(operation),
+				"failure_classification", req.Failure.Classification,
+			)
+			_ = h.abortPlaybackSession(context.WithoutCancel(r.Context()), session)
+		}
+		// Answered as a gone session, which is what it now is: the durable
+		// attempt is stopped, no plan is indicted, and the deferred lease
+		// release leaves no terminal decision behind.
+		return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{
+			reason:  "session_expired",
+			message: "The playback session has ended.",
+		}
+	}
 	// A seek reanchor must keep its route; every other replan first finds out
 	// whether the session's nodes still answer, so neither the plan nor the
 	// route is built on a node that went away.
@@ -14151,6 +14318,17 @@ func failureRecoveryOperationV3(operation playback.ReplanOperationV3) bool {
 		operation == playback.ReplanOperationSeekFailureRecoveryV3
 }
 
+// abandonedBeforeFirstSegmentV3 reports whether the live transcode session for
+// this attempt served the playlist and never one segment request. See
+// playback.TranscodeSession.AbandonedBeforeFirstSegment: the session carries
+// the evidence, this is only the handler-side lookup. A session with no local
+// transcode handle (direct play, or a route this replica does not own) reports
+// false and keeps the ordinary failure handling.
+func (h *PlaybackHandler) abandonedBeforeFirstSegmentV3(sessionID string) bool {
+	ts := h.tm.GetTranscodeSession(sessionID)
+	return ts != nil && ts.AbandonedBeforeFirstSegment()
+}
+
 // clientCanceledRecoveryWindow bounds how long after an observed transport
 // cancel a failure_recovery that still names the same route is reported as a
 // zombie candidate. It only colors the diagnostic: a cancel is never proof the
@@ -14882,7 +15060,7 @@ func applyDVPinToEffectiveFileV3(session *playback.Session, file *models.MediaFi
 	if session == nil || file == nil {
 		return
 	}
-	playback.ApplyDVPinToFileV3(file, session.DVProfilePin)
+	file.VideoTracks = playback.ApplyDVPinToFileV3(file, session.DVProfilePin)
 }
 
 func videoBitstreamFilterForPlanV3(plan *playback.PlanV3) string {
