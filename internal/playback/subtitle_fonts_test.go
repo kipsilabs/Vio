@@ -361,7 +361,7 @@ done
 	}
 
 	if _, err := dumpFontAttachments(context.Background(), "input.mkv", ffmpeg,
-		[]attachmentProbeStream{{Index: 2, ExtraDataSize: maxSubtitleFontBytes + 1}}, maxSubtitleFontBytes); err == nil {
+		[]attachmentProbeStream{{Index: 2, ExtraDataSize: maxSubtitleFontBytes + 1}}, 0, maxSubtitleFontBytes); err == nil {
 		t.Fatal("a pack past the hard ceiling must fail closed instead of buffering")
 	}
 }
