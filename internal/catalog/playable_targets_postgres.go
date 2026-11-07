@@ -62,7 +62,7 @@ func (r *PlayableTargetResolver) resolvePostgresTargets(ctx context.Context, arg
 				CASE WHEN requested.media_type = 'movie' AND EXISTS (
 					SELECT 1 FROM media_files mf WHERE mf.content_id = requested.content_id AND %[1]s
 				) THEN requested.content_id
-				WHEN requested.media_type = 'episode' AND `+canonicalEpisodeFileExistsSQL("requested.content_id", "%[1]s")+` THEN requested.content_id END,
+				WHEN requested.media_type = 'episode' AND `+episodeServingFileExistsSQL("requested.content_id", "%[1]s")+` THEN requested.content_id END,
 				(SELECT episode.content_id
 				 FROM target_scopes scope
 				 JOIN episodes episode ON episode.series_id = scope.series_id
@@ -110,11 +110,11 @@ func (r *PlayableTargetResolver) resolvePostgresTargets(ctx context.Context, arg
 
 // buildPostgresPlayableTargetsQuery renders the SQL winner path. fileSQL
 // references the media_files alias mf; progress names the profile progress
-// relation. Canonical episodes may be backed by a direct file or by a present
-// file owned by one of their alias rows.
+// relation. Canonical episodes may be backed by a direct file, a present file
+// owned by one of their alias rows, or a multi-episode file spanning them.
 func buildPostgresPlayableTargetsQuery(fileSQL, progress, completedSQL string) string {
 	episodeFileSQL := canonicalEpisodeFileExistsSQL("episode.content_id", fileSQL)
-	leafFileSQL := canonicalEpisodeFileExistsSQL("requested.content_id", fileSQL)
+	leafFileSQL := episodeServingFileExistsSQL("requested.content_id", fileSQL)
 	excludeAliases := episodeAliasExclusionPredicateFor("episode")
 	return fmt.Sprintf(`
 		WITH requested AS (

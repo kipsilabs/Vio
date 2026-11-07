@@ -132,7 +132,7 @@ func (r *PlayableTargetResolver) Resolve(ctx context.Context, q PlayableTargetQu
 // missing-file condition.
 func buildPlayableTargetsQuery(fileConditions []string) string { //nolint:funlen // one SQL statement; splitting the CTEs would hide the selection flow
 	fileSQL := strings.Join(fileConditions, " AND ")
-	leafFileSQL := canonicalEpisodeFileExistsSQL("requested.content_id", fileSQL)
+	leafFileSQL := episodeServingFileExistsSQL("requested.content_id", fileSQL)
 	candidateFileSQL := canonicalEpisodeFileExistsSQL("candidate.content_id", fileSQL)
 	return fmt.Sprintf(`
 		WITH requested AS (
@@ -145,7 +145,8 @@ func buildPlayableTargetsQuery(fileConditions []string) string { //nolint:funlen
 			-- rather than one CASE expression: a CASE over both columns keeps
 			-- PostgreSQL from using either media_files index and forces a scan
 			-- of the whole table per requested card. An episode leaf also
-			-- accepts a present file owned by one of its alias rows.
+			-- accepts a present file owned by one of its alias rows or one
+			-- spanning it from an earlier episode.
 			SELECT requested.ord, requested.content_id, requested.content_id AS play_content_id,
 			       leaf_episode.season_number AS target_season
 			FROM requested
