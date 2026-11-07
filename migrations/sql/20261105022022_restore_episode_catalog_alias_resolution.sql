@@ -330,17 +330,33 @@ $$;
 
 -- +goose StatementEnd
 
--- Rebuild every entry from its membership so an alias-keyed row written by the
--- previous function converges to the canonical id.
+-- Rebuild entries affected by alias mappings so an alias-keyed row written by the
+-- previous function converges to the canonical id. Only memberships whose
+-- episode participates in an alias mapping (as canonical or alias) need to be
+-- refreshed; entries for non-alias episodes were already canonical and untouched.
 DELETE FROM public.episode_catalog_entries ece
 USING public.episode_aliases ea
 WHERE ece.episode_id = ea.alias_episode_id;
 
-SELECT public.refresh_episode_catalog_entry(members.episode_id, members.media_folder_id)
+WITH alias_members AS (
+    SELECT canonical_episode_id AS canonical_id, canonical_episode_id AS member_id
+    FROM public.episode_aliases
+    UNION
+    SELECT canonical_episode_id, alias_episode_id
+    FROM public.episode_aliases
+    WHERE alias_episode_id IS NOT NULL
+)
+SELECT public.refresh_episode_catalog_entry(t.canonical_id, t.media_folder_id)
 FROM (
-    SELECT DISTINCT episode_id, media_folder_id
-    FROM public.episode_libraries
-) members;
+    SELECT am.canonical_id, el.media_folder_id
+    FROM alias_members am
+    JOIN public.episode_libraries el ON el.episode_id = am.member_id
+    UNION
+    -- Canonical rows left with no member membership (the refresh function deletes them)
+    SELECT am.canonical_id, ece.media_folder_id
+    FROM alias_members am
+    JOIN public.episode_catalog_entries ece ON ece.episode_id = am.canonical_id
+) t;
 
 -- +goose Down
 -- Restore the alias-unaware spanned-files refresh.
