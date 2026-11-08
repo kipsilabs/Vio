@@ -58,9 +58,11 @@ func TestBackgroundProbeTransientTimeoutDoesNotUnpinActivePin(t *testing.T) {
 	}
 }
 
-// A context error is not a definitive candidate failure: one occurrence leaves
-// the pin in place and the count below the repeat threshold; a second
-// consecutive occurrence is what releases the pin.
+// A context error is not a verdict about the candidate: the probe may have been
+// canceled by playback start itself (the request went away, the attempt was
+// superseded) and may still land in the cache under its own timeout. It must
+// never arm the failure damper or consume the repeat budget, however often it
+// repeats, and must not release the pin on its own.
 func TestBackgroundProbeContextErrorDoesNotMarkDefinitiveFailure(t *testing.T) {
 	uri := "virtual://series/tt-bg-context/3/5?result=cand-1"
 	key := virtualProbeFailureKey(uri, 5)
@@ -77,20 +79,17 @@ func TestBackgroundProbeContextErrorDoesNotMarkDefinitiveFailure(t *testing.T) {
 	file := &models.MediaFile{ID: 502, ContentID: "series-tt", EpisodeID: "ep-1", FilePath: uri, VirtualOwnerInstallationID: 5}
 	cand := VirtualPlaybackStream{ID: "cand-1", URI: uri}
 
-	h.probeVirtualSourceAndPersist(context.Background(), stickyKey, file, "http://provider.example/stream", *file, cand, noCandidateIdentity, 0, 5)
-	if got := h.peekVirtualSticky(stickyKey); got != uri {
-		t.Fatalf("first context error released the pin: got %q, want %q", got, uri)
-	}
-	if got := virtualProbeFailures.count(key); got >= virtualProbeFailureRepeatThreshold {
-		t.Fatalf("first context error counted %d failures, want fewer than %d", got, virtualProbeFailureRepeatThreshold)
-	}
-
-	h.probeVirtualSourceAndPersist(context.Background(), stickyKey, file, "http://provider.example/stream", *file, cand, noCandidateIdentity, 0, 5)
-	if got := h.peekVirtualSticky(stickyKey); got != "" {
-		t.Fatalf("second consecutive context error kept the pin: %q", got)
-	}
-	if got := virtualProbeFailures.count(key); got < virtualProbeFailureRepeatThreshold {
-		t.Fatalf("second context error count = %d, want at least %d", got, virtualProbeFailureRepeatThreshold)
+	for attempt := 0; attempt < virtualProbeFailureRepeatThreshold+1; attempt++ {
+		h.probeVirtualSourceAndPersist(context.Background(), stickyKey, file, "http://provider.example/stream", *file, cand, noCandidateIdentity, 0, 5)
+		if got := h.peekVirtualSticky(stickyKey); got != uri {
+			t.Fatalf("context error %d released the pin: got %q, want %q", attempt+1, got, uri)
+		}
+		if got := virtualProbeFailures.count(key); got != 0 {
+			t.Fatalf("context error %d consumed %d failure marks, want 0", attempt+1, got)
+		}
+		if virtualProbeFailures.recent(key) {
+			t.Fatalf("context error %d armed the failure damper", attempt+1)
+		}
 	}
 }
 
