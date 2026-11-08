@@ -9726,7 +9726,17 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			// would silently reset a fixed rung to "auto".
 			start.QualityPreference = req.QualityPreference
 		}
-		start.StartPosition = &req.PositionSeconds
+		// A non-seek replan (track_change, quality_change, output_change) keeps
+		// the playhead where the viewer is. The client's position_seconds is a
+		// snapshot from before its replan round trip, and a client that
+		// rebuilds its media element for a subtitle switch can report the old
+		// element's position or a zero it has not filled in yet. Echoing that
+		// re-anchors the new route at the start (or a stale point) instead of
+		// where the viewer is. The live session position is the authoritative
+		// value, so prefer it and fall back to the client's number only when
+		// the session has not reported one. Seek operations above keep the
+		// client's target: there the requested position IS the intent.
+		start.StartPosition = h.nonSeekReplanPositionV3(record.SessionID, req.PositionSeconds)
 		start.Metered = req.Metered
 		start.BandwidthEstimateKbps = copyOptionalIntV3(req.BandwidthEstimateKbps)
 		start.BandwidthEstimateSource = req.BandwidthEstimateSource
@@ -12025,6 +12035,29 @@ func seekReanchorNoMovementV3(record *playback.AttemptRecordV3, session *playbac
 		return false
 	}
 	return session == nil || math.Abs(session.Position-position) <= seekNoMovementToleranceSecondsV3
+}
+
+// nonSeekReplanPositionV3 is where a non-seek replan resumes: the session's
+// live position when it has one, else the client's reported position.
+//
+// A track change never moves the playhead, so the server must not let the
+// client's snapshot decide it. The browser reports its position from an element
+// it may already have torn down (or has not attached yet), so a subtitle switch
+// can arrive with the route's start position and the replacement route then
+// restarts there. The session position advances with progress reports, which is
+// the only server-side evidence of where playback actually is.
+func (h *PlaybackHandler) nonSeekReplanPositionV3(sessionID string, requested float64) *float64 {
+	position := requested
+	if sessionID != "" {
+		if current, err := h.sessionMgr.GetSession(sessionID); err == nil && current != nil &&
+			current.Position > 0 && (!math.IsNaN(current.Position) && !math.IsInf(current.Position, 0)) {
+			position = current.Position
+		}
+	}
+	if math.IsNaN(position) || math.IsInf(position, 0) || position < 0 {
+		position = 0
+	}
+	return &position
 }
 
 func frozenSeekReanchorResultV3(record *playback.AttemptRecordV3, position float64, now time.Time) (playback.PlannerResultV3, error) {
