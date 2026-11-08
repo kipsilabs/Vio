@@ -3003,6 +3003,13 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	// path so the candidate loop can return it immediately instead of treating
 	// a deferred (ProbeSucceeded=false) pinned result as a failed candidate.
 	fastPathHit := false
+	// incompleteMetadataFastPathSkip records that a stored-URL fast path was
+	// refused because the row lacks planner-grade video evidence. The resolve
+	// below can then merge the candidate's declared labels into
+	// complete-looking evidence and take the skipProbe shortcut, publishing a
+	// "verified" plan whose subtitle inventory is empty because no probe ever
+	// enumerated it. Keep the probe admitted for this candidate instead.
+	incompleteMetadataFastPathSkip := false
 
 	resolveAndProbe := func(i int, cand VirtualPlaybackStream) (*resolvedVirtualPlaybackSource, error) {
 		// requestedURI is the candidate this iteration asked the resolver for.
@@ -3107,6 +3114,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		if durableResumeFastPath {
 			if !virtualFastPathPlannerVideoCompleteV3(file) {
 				logVirtualFastPathSkippedV3(attemptCtx, "durable_resume", file, cand.URI)
+				incompleteMetadataFastPathSkip = true
 			} else {
 				fastPathHit = true
 				trace.fastPath = true
@@ -3180,6 +3188,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		if optimisticFastPath {
 			if !virtualFastPathPlannerVideoCompleteV3(file) {
 				logVirtualFastPathSkippedV3(attemptCtx, "delivery_grace", file, cand.URI)
+				incompleteMetadataFastPathSkip = true
 			} else {
 				fastPathHit = true
 				trace.fastPath = true
@@ -3487,7 +3496,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			// the persisted evidence and its stamp advance once validated.
 			skipProbe = false
 		}
-		if !skipProbe && cand.CodecVideo != "" && cand.Resolution != "" && cand.CodecAudio != "" && canSkipProbeForContainer(cand.Container) {
+		if !skipProbe && !incompleteMetadataFastPathSkip && cand.CodecVideo != "" && cand.Resolution != "" && cand.CodecAudio != "" && canSkipProbeForContainer(cand.Container) {
 			mergeVirtualCandidateTracks(&transient, cand)
 			if !transient.HDR && cand.HDR != "" {
 				transient.HDR = true
@@ -3496,6 +3505,18 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			hasCompleteAudioEvidence = completeVirtualAudioEvidenceV3(&transient)
 			hasCompleteContainerEvidence = completeVirtualContainerEvidenceV3(&transient)
 			skipProbe = hasCompleteVideoEvidence && hasCompleteAudioEvidence && hasCompleteContainerEvidence
+		}
+		if incompleteMetadataFastPathSkip {
+			// The stored-URL fast path was refused for this row because its
+			// planner video evidence is incomplete. The candidate's declared
+			// labels can make the merged evidence look complete in the fields
+			// the shortcut above checks, but a declaration never enumerated the
+			// subtitle inventory: taking the shortcut would publish a
+			// "verified" plan with an empty track menu and leave nothing to
+			// repair it. Admit the probe instead. It either lands an inventory
+			// now (bounded sync budget) or hands a deferred probe to the
+			// committed session and keeps tracks_pending until it does.
+			skipProbe = false
 		}
 		if skipProbe && !storedProbeMissing {
 			h.pinVirtualStickyAt(stickyKey, cand.URI, generation)
@@ -3814,7 +3835,15 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				}
 				return resolved, err
 			}
-			virtualProbeFailures.mark(probeKey)
+			// A playback start that cancels this probe (the client went away,
+			// the attempt was superseded, or the outer budget fired) leaves
+			// the candidate's health unknown; the probe runs under its own
+			// timeout and may still land in the cache. Marking the damper here
+			// would poison the candidate for every later start and serve an
+			// empty declared inventory that nothing repairs.
+			if !virtualProbeVerdictUnknown(probeErr) {
+				virtualProbeFailures.mark(probeKey)
+			}
 			slog.DebugContext(r.Context(), "virtual stream probe timed out or failed; using candidate metadata", "component", "api", "candidate_uri", cand.URI, "error", probeErr)
 			return declaredFallback()
 		}
@@ -4527,13 +4556,18 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 				"component", "api", "candidate_uri", probeCand.URI, "file_id", catalogFile.ID)
 			return probeOutcomePartial, virtualCommittedProbeInventory{}
 		}
-		virtualProbeFailures.mark(probeKey)
-		slog.WarnContext(bgCtx, "background virtual stream probe failed", "component", "api", "candidate_uri", probeCand.URI, "error", probeErr)
 		// A context error (outer budget fired, request canceled) means the
 		// verdict is unknown: the inner probe keeps its own timeout and may
-		// still complete and land in the cache. A candidate-specific rejection
-		// is definitive; every other error must repeat before the pin is
-		// released, so one slow provider cannot steer later starts.
+		// still complete and land in the cache, so it must not arm the damper.
+		// Arming it here is what let one canceled background probe serve an
+		// empty declared inventory for every later start of the candidate.
+		// A candidate-specific rejection is definitive; every other error must
+		// repeat before the pin is released, so one slow provider cannot steer
+		// later starts.
+		if !virtualProbeVerdictUnknown(probeErr) {
+			virtualProbeFailures.mark(probeKey)
+		}
+		slog.WarnContext(bgCtx, "background virtual stream probe failed", "component", "api", "candidate_uri", probeCand.URI, "error", probeErr)
 		if errors.Is(probeErr, scanner.ErrVirtualProbeNoTracks) ||
 			virtualProbeFailures.count(probeKey) >= virtualProbeFailureRepeatThreshold {
 			h.unpinVirtualSticky(stickyKey, probeCand.URI)

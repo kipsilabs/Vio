@@ -475,3 +475,51 @@ func TestPlanPlaybackV3VirtualSourceRevisionIgnoresURLRenewal(t *testing.T) {
 		t.Fatalf("URL-equivalent replan moved revision: %q -> %q", first.VirtualSourceRevision, stable.VirtualSourceRevision)
 	}
 }
+
+// An empty subtitle list only means "this file has no subtitles" when a probe
+// established it. A plan built from declared metadata (or a deferred, canceled,
+// or failed probe) must say the inventory is unavailable instead of publishing
+// a confident empty menu that a client then treats as final.
+func TestPlanPlaybackV3MarksUnavailableSubtitleInventory(t *testing.T) {
+	planFor := func(file *models.MediaFile, provenance string) *PlanV3 {
+		t.Helper()
+		req := validStartRequestV3()
+		req.Capabilities.VideoDecode = hevcMain10DecodeV3()
+		req.Capabilities.HDRDetails = &HDRCapabilitiesV3{HDR10: true}
+		result := PlanPlaybackV3(PlannerInputV3{
+			Request: req, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0,
+			Settings:            PlannerSettingsV3{TranscodeEnabled: true, Allow4KTranscode: true},
+			InventoryProvenance: provenance,
+		})
+		if result.Plan == nil {
+			t.Fatalf("result = %#v, want a plan", result)
+		}
+		return result.Plan
+	}
+
+	unprobed := planFor(detailedFixtureFileV3(), "")
+	if len(unprobed.Subtitle.Inventory) != 0 {
+		t.Fatalf("fixture subtitle inventory = %d, want empty", len(unprobed.Subtitle.Inventory))
+	}
+	if got := unprobed.Claims.Subtitles.Reason; got != SubtitleReasonInventoryUnavailableV3 {
+		t.Fatalf("unprobed empty inventory reason = %q, want %q", got, SubtitleReasonInventoryUnavailableV3)
+	}
+
+	declared := planFor(detailedFixtureFileV3(), InventoryProvenanceDeclaredV3)
+	if got := declared.Claims.Subtitles.Reason; got != SubtitleReasonInventoryUnavailableV3 {
+		t.Fatalf("declared empty inventory reason = %q, want %q", got, SubtitleReasonInventoryUnavailableV3)
+	}
+
+	stamped := detailedFixtureFileV3()
+	probedAt := time.Now()
+	stamped.ProbeUpdatedAt = &probedAt
+	verified := planFor(stamped, "")
+	if got := verified.Claims.Subtitles.Reason; got != "" {
+		t.Fatalf("verified empty inventory reason = %q, want no reason (a real \"no subtitles\")", got)
+	}
+
+	explicitlyVerified := planFor(detailedFixtureFileV3(), InventoryProvenanceVerifiedV3)
+	if got := explicitlyVerified.Claims.Subtitles.Reason; got != "" {
+		t.Fatalf("resolver-verified empty inventory reason = %q, want no reason", got)
+	}
+}

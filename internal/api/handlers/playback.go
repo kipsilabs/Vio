@@ -472,6 +472,12 @@ type PlaybackHandler struct {
 	// progressSideEffectLocks.
 	inventoryPublishLocks   map[string]*sessionSideEffectLockEntry
 	inventoryPublishLocksMu sync.Mutex
+	// subtitleSelectionBreaker keeps the last unhonorable subtitle pick a
+	// track_change replan rejected for each session. A client that ignores
+	// selection_unavailable and replays the identical pick gets the current
+	// plan unchanged instead of a fresh plan; the entry is bounded and dropped
+	// when the session ends or the pick resolves.
+	subtitleSelectionBreaker subtitleSelectionBreakerV3
 	// virtualDeliveryCleared records playback sessions whose first fully
 	// delivered HLS/transcode segment already recorded delivery evidence and
 	// cleared the candidate's failed mark. One entry per served session keeps a
@@ -2356,6 +2362,7 @@ func (h *PlaybackHandler) finalizeSessionStopWithResult(ctx context.Context, ses
 	if h == nil || session == nil || session.ID == "" {
 		return watchstate.PlaybackStopResult{}, nil
 	}
+	h.subtitleSelectionBreaker.forget(session.ID)
 	// Cancel and await the session's start side effects under their own bounded
 	// budget before taking the durable-write budget. The wait can run as long as
 	// playbackStartSideEffectsTimeoutV3, so ordering it after teardownContext (as
@@ -2516,6 +2523,7 @@ func (h *PlaybackHandler) finalizeSessionAbort(ctx context.Context, session *pla
 	if h == nil || session == nil || session.ID == "" {
 		return
 	}
+	h.subtitleSelectionBreaker.forget(session.ID)
 	// Same split as finalizeSessionStopWithResult: settle the start side effects
 	// under their own budget, then take a fresh budget for the durable writes.
 	h.cancelPlaybackStartSideEffectsV3(ctx, session.ID)

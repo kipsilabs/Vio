@@ -4968,6 +4968,166 @@ describe("usePlaybackSession held track picks", () => {
     unmount();
   });
 
+  it("treats a selection_unavailable subtitle answer as terminal for that pick", async () => {
+    const english = fixtureSubtitleInventoryItemV3({
+      track_id: "file:7:subtitle:0",
+      combined_index: 0,
+      source: "external",
+      codec: "srt",
+      language: "eng",
+      label: "English",
+      url: "/stream/session-1/subtitles/0.vtt?file_id=7",
+    });
+    const french = fixtureSubtitleInventoryItemV3({
+      track_id: "file:7:subtitle:1",
+      combined_index: 1,
+      source: "external",
+      codec: "srt",
+      language: "fra",
+      label: "French",
+      url: "/stream/session-1/subtitles/1.vtt?file_id=7",
+    });
+    const initialPlan = fixturePlanV3({
+      subtitle: { mode: "off", inventory: [english, french] },
+    });
+    const rejectedPlan = fixturePlanV3({
+      plan_id: "plan:subreject000000001",
+      plan_attempt_key: "v3:subreject000000001",
+      subtitle: { mode: "off", inventory: [english, french] },
+      claims: {
+        video: { hdr10: false, hdr10_plus: false, hlg: false, dolby_vision: false },
+        audio: { codec: "aac", passthrough: false, atmos_preserved: false },
+        subtitles: {
+          ass_styling_preserved: false,
+          bitmap_overlay: false,
+          bitmap_sidecar: false,
+          reason: "selection_unavailable",
+        },
+      },
+      degradation_warnings: [
+        { code: "subtitle_track_unavailable", message: "The selected subtitle is unavailable." },
+      ],
+    });
+    const replanBodies: Array<Record<string, unknown>> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: initialPlan,
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/session-1/replan")) {
+        replanBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        return jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "playable",
+          session_id: "session-1",
+          playback_plan: rejectedPlan,
+        });
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan?.session_id).toBe("session-1"));
+
+    act(() => result.current.changeSubtitleTrack(1, 45));
+    await waitFor(() => expect(replanBodies).toHaveLength(1));
+    // The answer is a rejection, not a successful subtitles-off change.
+    await waitFor(() =>
+      expect(result.current.trackSelectionNotice?.message).toContain("subtitle track"),
+    );
+
+    // Replaying the same pick against the same inventory is terminal: the
+    // client stops instead of sending the request the server already answered.
+    act(() => result.current.changeSubtitleTrack(1, 45));
+    await waitFor(() => expect(replanBodies).toHaveLength(1));
+    expect(replanBodies).toHaveLength(1);
+
+    unmount();
+  });
+
+  it("holds a subtitle pick whose ordinal space the plan has not established", async () => {
+    const englishFallback: PlayerSubtitleInfo = {
+      index: 0,
+      media_file_id: 7,
+      track_id: "file:7:subtitle:0",
+      language: "eng",
+      codec: "srt",
+      label: "English",
+      source: "external",
+      url: "",
+    };
+    const initialPlan = fixturePlanV3({
+      subtitle: { mode: "off", inventory: [] },
+      tracks_pending: true,
+    });
+    const replanBodies: Array<Record<string, unknown>> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: initialPlan,
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/session-1/replan")) {
+        replanBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        return jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "playable",
+          session_id: "session-1",
+          playback_plan: initialPlan,
+        });
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan?.session_id).toBe("session-1"));
+
+    act(() => result.current.changeSubtitleTrack(0, 45, englishFallback));
+    await waitFor(() =>
+      expect(result.current.trackSelectionNotice?.message).toContain("subtitle track"),
+    );
+    // The one permitted refresh replan carries no subtitle identity: the plan
+    // published no inventory, so a bare catalog ordinal would address a slot
+    // this file may not have.
+    for (const body of replanBodies) {
+      expect(body).not.toHaveProperty("subtitle_track_index");
+      expect(body).not.toHaveProperty("subtitle_track_id");
+    }
+
+    unmount();
+  });
+
   it("replays a held pick without a captured row at its exact ordinal", async () => {
     const initialPlan = fixturePlanV3({
       audio_tracks: [audioRows[0]!],

@@ -3,6 +3,7 @@ import {
   PROVISIONAL_INVENTORY_TIMEOUT_MS,
   isInventoryProvisional,
   isOverlayInventoryProvisional,
+  isPlanSubtitleInventoryProvisional,
   isProvisionalInventoryExpired,
 } from "./inventoryProvenance";
 
@@ -44,6 +45,38 @@ describe("isInventoryProvisional", () => {
     expect(isInventoryProvisional("verified", "verified", false)).toBe(false);
     expect(isInventoryProvisional("verified", "verified", undefined)).toBe(false);
     expect(isInventoryProvisional("verified", "verified", null)).toBe(false);
+  });
+});
+
+describe("isPlanSubtitleInventoryProvisional", () => {
+  it("treats the server's inventory_unavailable answer as provisional", () => {
+    expect(
+      isPlanSubtitleInventoryProvisional({
+        inventory_status: "verified",
+        inventory_provenance: "verified",
+        claims: { subtitles: { reason: "inventory_unavailable" } },
+      }),
+    ).toBe(true);
+  });
+
+  it("stays provisional for tracks_pending and declared provenance", () => {
+    expect(isPlanSubtitleInventoryProvisional({ tracks_pending: true })).toBe(true);
+    expect(
+      isPlanSubtitleInventoryProvisional({
+        inventory_status: "verified",
+        inventory_provenance: "declared",
+      }),
+    ).toBe(true);
+  });
+
+  it("is confident for a verified inventory with no unavailable reason", () => {
+    expect(
+      isPlanSubtitleInventoryProvisional({
+        inventory_status: "verified",
+        inventory_provenance: "verified",
+        claims: { subtitles: {} },
+      }),
+    ).toBe(false);
   });
 });
 

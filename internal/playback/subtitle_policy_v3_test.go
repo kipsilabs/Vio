@@ -153,6 +153,9 @@ func TestResolveSubtitlePolicyV3DegradesOutOfRangeSelectionToOff(t *testing.T) {
 	if !result.Degraded {
 		t.Fatal("the fallback was not reported as a degradation")
 	}
+	if result.Claims.Reason != SubtitleReasonSelectionUnavailableV3 {
+		t.Fatalf("claims reason = %q, want %q: a rejected pick must be a stable, documented answer", result.Claims.Reason, SubtitleReasonSelectionUnavailableV3)
+	}
 }
 
 // Malformed selections stay terminal: a bad identity is a client bug, and

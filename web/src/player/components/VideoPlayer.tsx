@@ -114,6 +114,7 @@ import type { PlayerTrickplay } from "../trickplay";
 import type { FailureV3, PlanV3, SubtitleInventoryItemV3 } from "../protocol-v3";
 import {
   mediaDurationSeconds,
+  subtitleChangePositionSeconds,
   subtitleStartPositionSeconds,
   toMediaTime,
   toPlayerTime,
@@ -4482,15 +4483,24 @@ export function VideoPlayer({
     if (requestedSubtitleTrackChangeRef.current === requestKey) return;
     requestedSubtitleTrackChangeRef.current = requestKey;
 
-    // Until the element has media loaded (an auto-selected bitmap preference at
-    // session start, or a stream reload), currentTime still reads 0 rather than
-    // the resume/seek target — use the intended position, as the subtitle
-    // window fetcher does.
-    const position = subtitleStartPositionSeconds(
-      videoRef.current?.readyState ?? 0,
-      currentTimeRef.current,
-      subtitleFetchAnchorRef.current,
-    );
+    // Where the switch is issued from. The element's live position wins; a seek
+    // still in flight names the target it is heading to; the last position this
+    // transport reported covers a reload that has already torn the element down.
+    // The fetch anchor is the final fallback only: after a reload readyState
+    // drops to 0 while currentTime still reads 0, and the anchor then names the
+    // plan's start (the resume point), which used to re-anchor a mid-movie
+    // subtitle switch at that resume point.
+    const liveElement = videoRef.current;
+    const livePosition =
+      liveElement && liveElement.readyState > 0
+        ? toMediaTime(liveElement.currentTime, timelineOffsetRef.current)
+        : null;
+    const position = subtitleChangePositionSeconds({
+      liveElementSeconds: livePosition,
+      pendingSeekSeconds: pendingSeekTimeRef.current,
+      lastPlayedSeconds: streamPlayedRef.current ? currentTimeRef.current : null,
+      fetchAnchorSeconds: subtitleFetchAnchorRef.current,
+    });
     onSubtitleTrackChange?.(
       desiredServerIndex,
       position,

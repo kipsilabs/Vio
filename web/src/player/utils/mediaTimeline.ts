@@ -41,3 +41,35 @@ export function mediaDurationSeconds(
   }
   return undefined;
 }
+
+/**
+ * The position a subtitle track change reports to the server.
+ *
+ * A track change does not move the playhead, so the position should be where
+ * the viewer is, not where the route started. The element's live position is
+ * the best evidence; a seek still in flight names the target it is heading to;
+ * the last position the transport reported covers a reload that has already
+ * torn the element down. The fetch anchor is the last resort only: before the
+ * element has media loaded it names the plan's start (the resume point), and
+ * reporting it on a mid-movie switch restarts playback there.
+ *
+ * Candidates are accepted in order and must be finite and non-negative; a
+ * missing or invalid one falls through to the next.
+ */
+export function subtitleChangePositionSeconds(input: {
+  liveElementSeconds: number | null;
+  pendingSeekSeconds: number | null;
+  lastPlayedSeconds: number | null;
+  fetchAnchorSeconds: number | null | undefined;
+}): number {
+  for (const candidate of [
+    input.liveElementSeconds,
+    input.pendingSeekSeconds,
+    input.lastPlayedSeconds,
+  ]) {
+    if (candidate !== null && Number.isFinite(candidate) && candidate >= 0) {
+      return candidate;
+    }
+  }
+  return input.fetchAnchorSeconds ?? 0;
+}

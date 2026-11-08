@@ -7,6 +7,7 @@ import {
   isSameSubtitleTrack,
   pendingServerSubtitleSelection,
   resolvePlayableSubtitles,
+  resolveSubtitleMenuTracks,
   subtitleArtifactIdentity,
   subtitleIdentitiesNameSameAsset,
   subtitleSelectionAcknowledgesPending,
@@ -109,6 +110,30 @@ describe("hasSelectableSessionSubtitles", () => {
 
   it("is false for an empty inventory", () => {
     expect(hasSelectableSessionSubtitles([])).toBe(false);
+  });
+});
+
+describe("resolveSubtitleMenuTracks", () => {
+  it("does not offer catalog ordinals while the plan's inventory is provisional", () => {
+    const detailTrack = makeSubtitle({ index: 0, source: "embedded", url: "" });
+
+    expect(resolveSubtitleMenuTracks([], [detailTrack], true)).toEqual([]);
+  });
+
+  it("offers plan-published rows once the inventory is confirmed", () => {
+    const sessionTrack = makeSubtitle({
+      index: 2,
+      source: "embedded",
+      url: "/stream/session/subtitles/2",
+    });
+
+    expect(resolveSubtitleMenuTracks([sessionTrack], [], false)).toEqual([sessionTrack]);
+  });
+
+  it("keeps the catalog fallback for a plan that is not provisional", () => {
+    const detailTrack = makeSubtitle({ index: 0, source: "embedded", url: "" });
+
+    expect(resolveSubtitleMenuTracks([], [detailTrack], false)).toEqual([detailTrack]);
   });
 });
 

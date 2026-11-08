@@ -118,6 +118,68 @@ func TestSyncProbePartialEnumerationHasBoundedStreak(t *testing.T) {
 	}
 }
 
+// TestResolveVirtualPlaybackSourceCanceledProbeDoesNotArmFailureDamper pins the
+// cancel rule: a probe canceled while playback start is still setting up (the
+// request went away, the attempt was superseded, the outer budget fired) says
+// nothing about the candidate's bytes. Arming the process-wide damper here is
+// what let one canceled probe serve an empty declared inventory for every
+// later start of the same candidate; the retry below proves the candidate is
+// still admitted and can reach verified evidence.
+func TestResolveVirtualPlaybackSourceCanceledProbeDoesNotArmFailureDamper(t *testing.T) {
+	stored := provenanceResolveRow()
+	probeKey := virtualProbeFailureKey(stored.FilePath, stored.VirtualOwnerInstallationID)
+	virtualProbeFailures.clear(probeKey)
+	t.Cleanup(func() { virtualProbeFailures.clear(probeKey) })
+
+	proberCalls := 0
+	h := virtualProvenanceResolution(stored, func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
+		proberCalls++
+		if proberCalls == 1 {
+			return nil, context.Canceled
+		}
+		f.VideoTracks = []models.VideoTrack{{Codec: "h264", Width: 1920, Height: 1080, FrameRate: "24000/1001", BitDepth: 8, Bitrate: 10_000}}
+		f.AudioTracks = []models.AudioTrack{{Codec: "aac", Channels: 2, Language: "eng"}}
+		f.SubtitleTracks = []models.SubtitleTrack{{Codec: "subrip", Language: "eng", Index: 0}}
+		f.CodecVideo, f.CodecAudio, f.Resolution, f.Container = "h264", "aac", "1080p", "mkv"
+		f.Bitrate = 10_000
+		return f, nil
+	})
+	h.VirtualPlaybackStreamLister = VirtualPlaybackStreamListerFunc(func(_ context.Context, _ string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
+		return []VirtualPlaybackStream{{
+			ID: "cand-1", URI: stored.FilePath,
+			Resolution: "1080p", CodecVideo: "h264", Container: "mkv",
+		}}, nil
+	})
+
+	canceled, err := h.resolveVirtualPlaybackSource(provenanceResolveRequest(), stored, "profile-1", false, nil, "", "", 0, false)
+	if err != nil {
+		t.Fatalf("canceled resolve error: %v", err)
+	}
+	if canceled.Provenance != ProbeProvenanceFailed {
+		t.Fatalf("canceled probe provenance = %q, want failed (declared metadata served)", canceled.Provenance)
+	}
+	if virtualProbeFailures.recent(probeKey) {
+		t.Fatal("a probe canceled by playback start armed the failure damper")
+	}
+	if got := virtualProbeFailures.count(probeKey); got != 0 {
+		t.Fatalf("canceled probe consumed %d failure marks", got)
+	}
+
+	retried, err := h.resolveVirtualPlaybackSource(provenanceResolveRequest(), stored, "profile-1", false, nil, "", "", 0, false)
+	if err != nil {
+		t.Fatalf("retry resolve error: %v", err)
+	}
+	if proberCalls != 2 {
+		t.Fatalf("retry ran %d probes, want the candidate to be re-admitted (2 total)", proberCalls)
+	}
+	if retried.Provenance != ProbeProvenanceVerified || !retried.ProbeSucceeded {
+		t.Fatalf("retry provenance = %q succeeded = %v, want verified; a canceled probe must not poison the candidate", retried.Provenance, retried.ProbeSucceeded)
+	}
+	if virtualProbeFailures.recent(probeKey) {
+		t.Fatal("the successful retry left the failure damper armed")
+	}
+}
+
 // TestDeferredProbePartialEnumerationStaysPending drives the post-commit durable
 // probe with a partial enumeration. The result must not be persisted, must not
 // be recorded as verified, and must not publish an inventory_updated event;

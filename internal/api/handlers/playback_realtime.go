@@ -93,6 +93,7 @@ func (h *PlaybackHandler) endPlaybackSessionAuthority(ctx context.Context, sessi
 	if err := h.sessionMgr.StopSession(session.ID); err != nil {
 		return nil, err
 	}
+	h.subtitleSelectionBreaker.forget(session.ID)
 	if userInitiated {
 		// A user or admin stop is final: revoke the session's stream tokens on
 		// every replica, not just the live entry here.

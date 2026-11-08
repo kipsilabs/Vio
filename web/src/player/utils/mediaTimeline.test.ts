@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   mediaDurationSeconds,
+  subtitleChangePositionSeconds,
   subtitleStartPositionSeconds,
   toMediaTime,
   toPlayerTime,
@@ -50,5 +51,59 @@ describe("subtitleStartPositionSeconds", () => {
     const resumePosition = toMediaTime(60, 3000);
 
     expect(subtitleStartPositionSeconds(0, 0, resumePosition)).toBe(3060);
+  });
+});
+
+describe("subtitleChangePositionSeconds", () => {
+  it("prefers the element's live position over the plan's start anchor", () => {
+    expect(
+      subtitleChangePositionSeconds({
+        liveElementSeconds: 187.5,
+        pendingSeekSeconds: null,
+        lastPlayedSeconds: 180,
+        fetchAnchorSeconds: 0,
+      }),
+    ).toBe(187.5);
+  });
+
+  it("uses an in-flight seek target when the element has no media yet", () => {
+    expect(
+      subtitleChangePositionSeconds({
+        liveElementSeconds: null,
+        pendingSeekSeconds: 900,
+        lastPlayedSeconds: 180,
+        fetchAnchorSeconds: 0,
+      }),
+    ).toBe(900);
+  });
+
+  it("uses the last reported position after a reload before the anchor", () => {
+    expect(
+      subtitleChangePositionSeconds({
+        liveElementSeconds: null,
+        pendingSeekSeconds: null,
+        lastPlayedSeconds: 180,
+        fetchAnchorSeconds: 0,
+      }),
+    ).toBe(180);
+  });
+
+  it("falls back to the fetch anchor before the transport has played", () => {
+    expect(
+      subtitleChangePositionSeconds({
+        liveElementSeconds: null,
+        pendingSeekSeconds: null,
+        lastPlayedSeconds: null,
+        fetchAnchorSeconds: 45,
+      }),
+    ).toBe(45);
+    expect(
+      subtitleChangePositionSeconds({
+        liveElementSeconds: Number.NaN,
+        pendingSeekSeconds: -1,
+        lastPlayedSeconds: null,
+        fetchAnchorSeconds: null,
+      }),
+    ).toBe(0);
   });
 });

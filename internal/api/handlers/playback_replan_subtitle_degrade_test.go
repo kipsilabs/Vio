@@ -1,11 +1,14 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
@@ -141,4 +144,159 @@ func planWarnsSubtitleUnavailableV3(plan *playback.PlanV3) bool {
 		}
 	}
 	return false
+}
+
+// A track_change naming a subtitle the effective file's inventory cannot honor
+// must answer with a stable, documented rejection instead of a bare
+// subtitles-off success. The plan stays playable, but the claims reason is the
+// terminal signal a client stops retrying on.
+func TestReplanOutOfRangeSubtitlePickReportsSelectionUnavailable(t *testing.T) {
+	file := subtitleReplanFixtureFile(t, 3)
+	handler := subtitleReplanHandler(t, file)
+	sessionID, started, start := startSubtitleReplanSessionV3(t, handler)
+
+	request := subtitleReplanTrackChangeV3(started, start, file.ID, 20, "selection-rejected-0001")
+	response := postPlaybackReplanV3(t, handler, sessionID, request)
+	if response.Terminal != nil {
+		t.Fatalf("an out-of-range subtitle pick must not refuse playback: %#v", response.Terminal)
+	}
+	if response.PlaybackPlan == nil {
+		t.Fatal("replan returned no plan")
+	}
+	if response.PlaybackPlan.Subtitle.Mode != playback.SubtitleOffV3 {
+		t.Fatalf("subtitle mode = %q, want off for an unhonorable pick", response.PlaybackPlan.Subtitle.Mode)
+	}
+	if got := response.PlaybackPlan.Claims.Subtitles.Reason; got != playback.SubtitleReasonSelectionUnavailableV3 {
+		t.Fatalf("claims.subtitles.reason = %q, want %q", got, playback.SubtitleReasonSelectionUnavailableV3)
+	}
+	if !planWarnsSubtitleUnavailableV3(response.PlaybackPlan) {
+		t.Fatal("the rejected pick must still carry the degradation warning")
+	}
+}
+
+// A client that ignores selection_unavailable can replay the same rejected
+// subtitle pick forever. The first rejection is still explicit so a capable
+// client learns it; every identical repeat must return the durable plan
+// unchanged, with the same plan id and playhead, instead of minting a fresh
+// plan and rebuilding the transport.
+func TestReplanRepeatedUnhonorableSubtitlePickReturnsCurrentPlan(t *testing.T) {
+	file := subtitleReplanFixtureFile(t, 3)
+	handler := subtitleReplanHandler(t, file)
+	sessionID, started, start := startSubtitleReplanSessionV3(t, handler)
+
+	const livePosition = 187.5
+	if err := handler.sessionMgr.UpdateProgress(sessionID, livePosition, false); err != nil {
+		t.Fatalf("update progress: %v", err)
+	}
+
+	first := postPlaybackReplanV3(t, handler, sessionID,
+		subtitleReplanTrackChangeV3(started, start, file.ID, 20, "subtitle-loop-0001"))
+	if first.PlaybackPlan == nil {
+		t.Fatalf("first replan returned no plan: %#v", first.Terminal)
+	}
+	if got := first.PlaybackPlan.Claims.Subtitles.Reason; got != playback.SubtitleReasonSelectionUnavailableV3 {
+		t.Fatalf("first claims.subtitles.reason = %q, want %q", got, playback.SubtitleReasonSelectionUnavailableV3)
+	}
+	firstPlanID := first.PlaybackPlan.PlanID
+	firstStart := first.PlaybackPlan.Timeline.PlayerStartSeconds
+	firstSourceStart := first.PlaybackPlan.Timeline.SourceStartSeconds
+
+	// The identical retry: same file, same raw subtitle identity. The stale
+	// position echo must not move the plan either.
+	repeat := subtitleReplanTrackChangeV3(first, start, file.ID, 20, "subtitle-loop-0002")
+	repeat.PositionSeconds = 12
+	second := postPlaybackReplanV3(t, handler, sessionID, repeat)
+	if second.PlaybackPlan == nil {
+		t.Fatalf("the repeated pick returned no plan: %#v", second.Terminal)
+	}
+	if got := second.PlaybackPlan.PlanID; got != firstPlanID {
+		t.Fatalf("repeated pick minted a new plan %q, want the current plan %q", got, firstPlanID)
+	}
+	if got := second.PlaybackPlan.Timeline.PlayerStartSeconds; got != firstStart {
+		t.Fatalf("repeated pick moved player_start_seconds to %v, want %v", got, firstStart)
+	}
+	if got := second.PlaybackPlan.Timeline.SourceStartSeconds; got != firstSourceStart {
+		t.Fatalf("repeated pick moved source start to %v, want %v", got, firstSourceStart)
+	}
+	if second.PlaybackPlan.Timeline.SourceStartSeconds != livePosition {
+		t.Fatalf("repeated pick reset the playhead to %v, want the live position %v",
+			second.PlaybackPlan.Timeline.SourceStartSeconds, livePosition)
+	}
+	if got := second.PlaybackPlan.Claims.Subtitles.Reason; got != playback.SubtitleReasonSelectionUnavailableV3 {
+		t.Fatalf("no-op claims.subtitles.reason = %q, want the original rejection %q", got, playback.SubtitleReasonSelectionUnavailableV3)
+	}
+
+	// A different unhonorable pick is a new intent and must still be answered
+	// explicitly before it, too, becomes a no-op on repetition.
+	third := postPlaybackReplanV3(t, handler, sessionID,
+		subtitleReplanTrackChangeV3(second, start, file.ID, 21, "subtitle-loop-0003"))
+	if third.PlaybackPlan == nil {
+		t.Fatalf("a different unhonorable pick returned no plan: %#v", third.Terminal)
+	}
+	if got := third.PlaybackPlan.Claims.Subtitles.Reason; got != playback.SubtitleReasonSelectionUnavailableV3 {
+		t.Fatalf("third claims.subtitles.reason = %q, want %q", got, playback.SubtitleReasonSelectionUnavailableV3)
+	}
+	// Two rejected picks with subtitles off can resolve to the same plan body,
+	// so plan identity alone cannot tell a new rejection from a no-op. The
+	// tracker must have moved to the new pick: the old one is no longer what a
+	// repeat would fold, and the new one now is.
+	key20 := subtitleSelectionTestKeyV3(file.ID, 20)
+	key21 := subtitleSelectionTestKeyV3(file.ID, 21)
+	if handler.subtitleSelectionBreaker.repeated(sessionID, key20, time.Now()) {
+		t.Fatal("the previous pick must not remain the tracked rejection after a different pick")
+	}
+	if !handler.subtitleSelectionBreaker.repeated(sessionID, key21, time.Now()) {
+		t.Fatal("a different unhonorable pick must be recorded as the new rejection, not treated as a no-op")
+	}
+
+	// Stopping the session drops the per-session entry.
+	session, err := handler.sessionMgr.GetSession(sessionID)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	if _, err := handler.endPlaybackSessionAuthority(context.Background(), session, true); err != nil {
+		t.Fatalf("end session: %v", err)
+	}
+	if got := handler.subtitleSelectionBreaker.size(); got != 0 {
+		t.Fatalf("subtitle loop breaker kept %d entries after the session ended, want 0", got)
+	}
+}
+
+func TestSubtitleSelectionBreakerIsBoundedAndForgets(t *testing.T) {
+	var breaker subtitleSelectionBreakerV3
+	key := subtitleSelectionKeyV3{fileID: 7, trackID: playback.TrackIDV3(7, "subtitle", 3)}
+	now := time.Now()
+
+	breaker.record("session-a", key, now)
+	if !breaker.repeated("session-a", key, now) {
+		t.Fatal("a recorded pick must be recognized as a repeat")
+	}
+	breaker.forget("session-a")
+	if breaker.repeated("session-a", key, now) {
+		t.Fatal("a forgotten session must not match")
+	}
+
+	breaker.record("session-b", key, now.Add(-subtitleSelectionBreakerTTL-time.Minute))
+	if breaker.repeated("session-b", key, now) {
+		t.Fatal("an entry older than the TTL must not match")
+	}
+	if got := breaker.size(); got != 0 {
+		t.Fatalf("expired entry was not dropped: size = %d", got)
+	}
+
+	for i := 0; i < subtitleSelectionBreakerMaxSessions+10; i++ {
+		breaker.record(fmt.Sprintf("bounded-%d", i), key, now.Add(time.Duration(i)*time.Millisecond))
+	}
+	if got := breaker.size(); got > subtitleSelectionBreakerMaxSessions {
+		t.Fatalf("breaker size = %d, want at most %d", got, subtitleSelectionBreakerMaxSessions)
+	}
+}
+
+func subtitleSelectionTestKeyV3(fileID, ordinal int) subtitleSelectionKeyV3 {
+	index := ordinal
+	key, _ := subtitleSelectionKeyForRequestV3(fileID, &playback.TrackIdentityV3{
+		ID:    playback.TrackIDV3(fileID, "subtitle", ordinal),
+		Index: &index,
+	})
+	return key
 }

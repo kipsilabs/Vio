@@ -828,3 +828,34 @@ func TestPinnedHLSPlaceholderSatisfiesReplanSchema(t *testing.T) {
 		t.Fatalf("pinned replan violates the schema: %v", err)
 	}
 }
+
+// TestSubtitleRejectionReasonsAreAPublishedContract pins the two additive
+// subtitle answers a client can stop on and the capabilities that gate them.
+// The reasons travel in claims.subtitles.reason, which the decision schema
+// describes; the capability names are the only way a client can tell a server
+// that emits them apart from one whose subtitles-off is unconditional.
+func TestSubtitleRejectionReasonsAreAPublishedContract(t *testing.T) {
+	if got := playback.SubtitleReasonSelectionUnavailableV3; got != "selection_unavailable" {
+		t.Fatalf("selection rejection reason = %q, want selection_unavailable", got)
+	}
+	if got := playback.SubtitleReasonInventoryUnavailableV3; got != "inventory_unavailable" {
+		t.Fatalf("inventory unavailable reason = %q, want inventory_unavailable", got)
+	}
+	native := playback.NativeServerFeaturesV3()
+	shared := playback.ServerFeaturesV3()
+	for _, feature := range []string{
+		playback.FeatureSubtitleSelectionRejectedV3,
+		playback.FeatureSubtitleInventoryUnavailableV3,
+	} {
+		if !slices.Contains(native, feature) {
+			t.Fatalf("/api/v2 feature set is missing %q", feature)
+		}
+		if slices.Contains(shared, feature) {
+			t.Fatalf("frozen /api/v1 feature set grew %q", feature)
+		}
+	}
+	decision := mustReadObject(t, filepath.Join(schemaRootV3, "v3", "decision-response.schema.json"))
+	if got := schemaValue(t, decision, "$defs", "claims", "properties", "subtitles", "properties", "reason", "type"); got != "string" {
+		t.Fatalf("claims.subtitles.reason.type = %v, want string", got)
+	}
+}
