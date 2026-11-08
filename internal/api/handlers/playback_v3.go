@@ -10593,6 +10593,10 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 
 	var preparedTransport *preparedTransportV3
 	var artifactRecipe playback.ExecutableRecipeV3
+	// recordSubtitleBreaker arms the repeated-unhonorable-subtitle no-op after
+	// the rejection plan commits. A failed replan must not leave a rejection
+	// recorded for a plan the client never received.
+	var recordSubtitleBreaker func()
 	// replanCapabilityWarnings holds the degradation warnings produced by the
 	// one normalization of the merged start request, so they can be surfaced on
 	// whichever plan this replan ultimately returns.
@@ -11564,6 +11568,21 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	} else {
 		result.Plan.DeliveryChange = nil
 	}
+	// A client that ignores selection_unavailable and replays the exact same
+	// unhonorable subtitle pick would otherwise receive a brand-new playable
+	// plan every time, minting a new plan id and rebuilding the transport at
+	// the live position. Once that pick has already been rejected for this
+	// session and file, answer the identical replan with the durable plan
+	// unchanged. The first rejection still returns the explicit plan below, so
+	// a capable client learns the reason; this is only the server-side guarantee
+	// for clients that do not.
+	loopResponse, recordBreaker, handled := h.replanSubtitleLoopBreakerV3(
+		r, record, req, operation, trackChange, effectiveFile, result.Plan, clientInfo,
+	)
+	if handled {
+		return loopResponse, *record, nil, nil
+	}
+	recordSubtitleBreaker = recordBreaker
 	replanLogAttrs := []any{
 		logComponentKey, "playback",
 		"outcome", "plan",
@@ -11920,6 +11939,18 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			}
 			cancelReservation()
 			return nil
+		}
+	}
+	if recordSubtitleBreaker != nil {
+		// Arm the breaker only after the rejection plan is durable. The
+		// existing after-commit work runs first so its side effects are never
+		// skipped by a panic in the tracker.
+		previousAfterCommit := transport.afterDurableCommit
+		transport.afterDurableCommit = func() {
+			if previousAfterCommit != nil {
+				previousAfterCommit()
+			}
+			recordSubtitleBreaker()
 		}
 	}
 	reservationHandedOff = true
