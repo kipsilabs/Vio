@@ -567,7 +567,8 @@ function WatchPagePlayer({
   // another inventory; the menu stays in discovery instead of letting a click
   // address a slot this file may not carry.
   const subtitleMenuTracks = useMemo(
-    () => resolveSubtitleMenuTracks(session.subtitleUrls, versionSubtitles, subtitleMenuProvisional),
+    () =>
+      resolveSubtitleMenuTracks(session.subtitleUrls, versionSubtitles, subtitleMenuProvisional),
     [session.subtitleUrls, versionSubtitles, subtitleMenuProvisional],
   );
 

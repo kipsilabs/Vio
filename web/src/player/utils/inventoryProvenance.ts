@@ -85,7 +85,6 @@ export function isProvisionalInventoryExpired(
   return now - provisionalSince >= timeoutMs;
 }
 
-
 /**
  * Whether a plan's subtitle inventory is provisional, including the explicit
  * `inventory_unavailable` answer. An empty inventory the server has not

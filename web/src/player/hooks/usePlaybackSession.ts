@@ -43,7 +43,10 @@ import {
 } from "../utils/audioTrackMatch";
 import { buildPublishedSubtitleTracks, subtitleLanguageBase } from "../utils/subtitleInventory";
 import { isBitmapCodec } from "../utils/subtitleCodecs";
-import { isInventoryProvisional, isPlanSubtitleInventoryProvisional } from "../utils/inventoryProvenance";
+import {
+  isInventoryProvisional,
+  isPlanSubtitleInventoryProvisional,
+} from "../utils/inventoryProvenance";
 import { isNeutralVirtualVersion } from "../utils/neutralVirtualVersion";
 import { normalizeSubtitleMode } from "../utils/subtitleMode";
 import {
@@ -1249,8 +1252,7 @@ const MAX_SUBTITLE_PICK_REJECTIONS_V3 = 1;
 function subtitlePickRejectionKey(plan: PlanV3, identity: TrackIdentityV3): string | null {
   const id = identity.id?.trim();
   const index = identity.index;
-  const asset =
-    id && id.length > 0 ? id : index != null && index >= 0 ? `index:${index}` : "";
+  const asset = id && id.length > 0 ? id : index != null && index >= 0 ? `index:${index}` : "";
   if (asset === "") return null;
   const inventoryRevision = plan.inventory_revision ?? "";
   return `${plan.effective_media_file_id}|${inventoryRevision}|${asset}`;

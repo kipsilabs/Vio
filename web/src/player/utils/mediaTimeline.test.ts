@@ -54,7 +54,6 @@ describe("subtitleStartPositionSeconds", () => {
   });
 });
 
-
 describe("subtitleChangePositionSeconds", () => {
   it("prefers the element's live position over the plan's start anchor", () => {
     expect(
