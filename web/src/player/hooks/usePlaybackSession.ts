@@ -43,7 +43,7 @@ import {
 } from "../utils/audioTrackMatch";
 import { buildPublishedSubtitleTracks, subtitleLanguageBase } from "../utils/subtitleInventory";
 import { isBitmapCodec } from "../utils/subtitleCodecs";
-import { isInventoryProvisional } from "../utils/inventoryProvenance";
+import { isInventoryProvisional, isPlanSubtitleInventoryProvisional } from "../utils/inventoryProvenance";
 import { isNeutralVirtualVersion } from "../utils/neutralVirtualVersion";
 import { normalizeSubtitleMode } from "../utils/subtitleMode";
 import {
@@ -51,6 +51,8 @@ import {
   MAX_ATTEMPT_COUNT_V3,
   MAX_ATTEMPTED_PLAN_KEYS_V3,
   QUALITY_ORIGINAL_V3,
+  SUBTITLE_REASON_INVENTORY_UNAVAILABLE_V3,
+  SUBTITLE_REASON_SELECTION_UNAVAILABLE_V3,
   type DecisionResponseV3,
   type FailureV3,
   type AudioTrackV3,
@@ -1143,12 +1145,22 @@ function resolveSubtitleTrackChange(
   if (!Number.isInteger(combinedIndex) || combinedIndex < 0) return null;
 
   const inventory = plan.subtitle.inventory;
-  if (inventory.length === 0) return { id: "", index: combinedIndex };
-
   const picked =
     pickedTrack !== undefined
       ? pickedTrack
       : displayed.find((item) => item.index === combinedIndex);
+  if (inventory.length === 0) {
+    // The plan publishes no inventory, so its ordinal space is unknown. The
+    // menu rows a pick came from can belong to the catalog (this file before a
+    // probe, or another release), and echoing their ordinal addresses a slot
+    // this file may not have. While the server says the inventory is still
+    // unestablished, hold the pick until a verified list lands instead of
+    // sending a bare ordinal; a plan with no such signal keeps the historical
+    // bare ordinal for menus that have no identity to reconcile against.
+    if (picked && planSubtitleInventoryUnavailable(plan)) return null;
+    return { id: "", index: combinedIndex };
+  }
+
   if (picked) {
     // An equal `track_id` is only evidence while the plan publishes the same
     // order the menu was read from. When the row it names has another
@@ -1218,6 +1230,48 @@ type PendingTrackPick =
       inventoryIdentity: string;
       refreshAttempted: boolean;
     };
+
+/**
+ * How many times one subtitle pick may be sent against one inventory before the
+ * client stops trying. The server's `selection_unavailable` already ends it
+ * after the first; the bound also covers a server that answers `mode: "off"`
+ * without the reason, so a replay (the pending-pick flush, a retry timer) cannot
+ * loop on the same pick.
+ */
+const MAX_SUBTITLE_PICK_REJECTIONS_V3 = 1;
+
+/**
+ * Key for the subtitle-pick rejection ledger: the effective file, the inventory
+ * revision the pick was placed against, and the stable track identity. A new
+ * click on another track, or a verified inventory that advances the revision,
+ * is a different key and gets its own attempt.
+ */
+function subtitlePickRejectionKey(plan: PlanV3, identity: TrackIdentityV3): string | null {
+  const id = identity.id?.trim();
+  const index = identity.index;
+  const asset =
+    id && id.length > 0 ? id : index != null && index >= 0 ? `index:${index}` : "";
+  if (asset === "") return null;
+  const inventoryRevision = plan.inventory_revision ?? "";
+  return `${plan.effective_media_file_id}|${inventoryRevision}|${asset}`;
+}
+
+/** Whether the plan answers the client's pick with the stable rejection reason. */
+function planRejectsSubtitleSelection(plan: PlanV3): boolean {
+  return plan.claims?.subtitles?.reason === SUBTITLE_REASON_SELECTION_UNAVAILABLE_V3;
+}
+
+/**
+ * Whether the plan says its (empty) subtitle inventory was never established.
+ * The menu must stay in its discovery state and a pick has no ordinal space to
+ * address yet.
+ */
+function planSubtitleInventoryUnavailable(plan: PlanV3): boolean {
+  return (
+    plan.claims?.subtitles?.reason === SUBTITLE_REASON_INVENTORY_UNAVAILABLE_V3 ||
+    plan.tracks_pending === true
+  );
+}
 
 function trackPickOptions(plan: PlanV3, pick: PendingTrackPick): ReplanOptions | null {
   if (pick.kind === "audio") {
@@ -1334,11 +1388,7 @@ function planToSessionState(
       plan.inventory_provenance,
       plan.tracks_pending,
     ),
-    subtitleInventoryProvisional: isInventoryProvisional(
-      plan.inventory_status,
-      plan.inventory_provenance,
-      plan.tracks_pending,
-    ),
+    subtitleInventoryProvisional: isPlanSubtitleInventoryProvisional(plan),
     subtitleUrls: mapSubtitleInventory(
       plan.subtitle.inventory,
       plan.effective_media_file_id,
@@ -1760,6 +1810,14 @@ export function usePlaybackSession(
     ) => Promise<boolean>
   >(async () => false);
   const trackSelectionNoticeIdRef = useRef(0);
+  // Per-(effective file, inventory revision, subtitle identity) rejection
+  // ledger. A server answer of selection_unavailable is terminal for that pick:
+  // the same request against the same inventory cannot succeed, so a replay —
+  // the pending-pick flush, a timer — must not issue it again.
+  const subtitlePickRejectionsRef = useRef(new Map<string, number>());
+  // Late-bound surface for a rejected subtitle pick, bound next to
+  // `surfaceTrackPickFailure` below (declared after `replan`).
+  const surfaceSubtitlePickRejectionRef = useRef<() => void>(() => {});
   // Latest-wins target for a reanchor dropped while a version switch owned the
   // session. The switch completion replays it against the settled plan so a
   // cold-start seek issued mid-switch is not silently lost — but only if the
@@ -2972,6 +3030,24 @@ export function usePlaybackSession(
         : [];
       const attemptCount = isFailureRecovery ? attemptCountRef.current : 1;
 
+      // A subtitle pick the server already answered with selection_unavailable
+      // is terminal for that (file, identity, inventory revision): the same
+      // request against the same inventory cannot succeed, and replaying it is
+      // the mid-stream loop this guard exists for. A new click, an inventory
+      // that advanced, or a different track produces a different key.
+      const subtitlePickKey =
+        options.operation === "track_change" && options.subtitle
+          ? subtitlePickRejectionKey(plan, options.subtitle)
+          : null;
+      if (
+        subtitlePickKey !== null &&
+        (subtitlePickRejectionsRef.current.get(subtitlePickKey) ?? 0) >=
+          MAX_SUBTITLE_PICK_REJECTIONS_V3
+      ) {
+        surfaceSubtitlePickRejectionRef.current();
+        return false;
+      }
+
       const body = buildReplanRequestV3({
         ...options,
         extraClientFeatures: VIDEO_CLIENT_FEATURES_V3,
@@ -3037,6 +3113,23 @@ export function usePlaybackSession(
           options.operation === "track_change" && options.subtitle !== undefined ? null : undefined,
           isFailureRecovery,
         );
+        if (
+          subtitlePickKey !== null &&
+          decision.playback_plan &&
+          planRejectsSubtitleSelection(decision.playback_plan)
+        ) {
+          // The server kept playback alive but rejected the pick. That is not a
+          // successful subtitles-off change: count it against the pick, surface
+          // the failure, and let the ledger stop any replay of the same
+          // request against the same inventory.
+          subtitlePickRejectionsRef.current.set(
+            subtitlePickKey,
+            (subtitlePickRejectionsRef.current.get(subtitlePickKey) ?? 0) + 1,
+          );
+          surfaceSubtitlePickRejectionRef.current();
+        } else if (subtitlePickKey !== null && adopted) {
+          subtitlePickRejectionsRef.current.delete(subtitlePickKey);
+        }
         if (
           !adopted &&
           isFailureRecovery &&
@@ -3310,6 +3403,17 @@ export function usePlaybackSession(
       },
     }));
   }, []);
+  // The rejection path above runs before this callback exists in render order;
+  // bind it once per render so both entry points raise the same notice.
+  surfaceSubtitlePickRejectionRef.current = () =>
+    surfaceTrackPickFailure({
+      kind: "subtitle",
+      index: null,
+      positionSeconds: playbackPositionRef.current,
+      track: undefined,
+      inventoryIdentity: "",
+      refreshAttempted: true,
+    });
 
   const holdTrackPick = useCallback((pick: PendingTrackPick) => {
     // One pick per kind: a second audio click supersedes the first, while an

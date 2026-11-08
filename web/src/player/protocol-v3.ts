@@ -22,6 +22,22 @@ export const MAX_ATTEMPTED_PLAN_KEYS_V3 = 16;
 export const MAX_ATTEMPT_COUNT_V3 = 8;
 
 /**
+ * `claims.subtitles.reason` value for a subtitle the request named but the
+ * effective file's inventory cannot honor. The plan stays playable with
+ * subtitles off; this is the terminal answer for that pick, so a client
+ * surfaces it and never replays the same `(file, subtitle identity)`.
+ */
+export const SUBTITLE_REASON_SELECTION_UNAVAILABLE_V3 = "selection_unavailable";
+
+/**
+ * `claims.subtitles.reason` value for an empty subtitle inventory the server
+ * has not established yet (declared metadata, a deferred probe, or a probe
+ * that was canceled or failed). Unlike an empty list with no reason, this does
+ * not mean the file has no subtitles: the menu stays pending.
+ */
+export const SUBTITLE_REASON_INVENTORY_UNAVAILABLE_V3 = "inventory_unavailable";
+
+/**
  * How the server delivers the stream. Clients negotiate in delivery *classes*
  * (see {@link DeliveryClassV3}); these finer-grained values only appear on a
  * plan, describing what the server actually did.
