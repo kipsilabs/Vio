@@ -520,16 +520,16 @@ exec sleep 30
 		t.Fatalf("StartTranscode: %v", err)
 	}
 	t.Cleanup(func() { _ = transcodeSession.Close() })
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		if _, statErr := os.Stat(filepath.Join(outputDir, "seg_00011.ts")); statErr == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("initial fake transcode did not become observable")
-		}
-		time.Sleep(time.Millisecond)
-	}
+	// Gate on the produced head the handler will read, not on the file's
+	// existence. The fake script creates seg_00011 before writing its bytes,
+	// and a request landing in that window makes SegmentProgress report an
+	// unset head, so recovery holds for a startup manifest instead of
+	// regenerating the segment immediately. SegmentProgress counts only
+	// non-empty files and parses the manifest, so this is the handler's view.
+	waitForCondition(t, func() bool {
+		progress := transcodeSession.SegmentProgress(time.Now())
+		return progress.HasManifest && progress.ProducedHead >= 11
+	}, "initial fake transcode did not produce the manifest and seg_00011")
 
 	sessions := playback.NewSessionManager(0, 0)
 	sessions.RegisterReconstructed(&playback.Session{ID: sessionID, UserID: 1, PlayMethod: playback.PlayTranscode})
