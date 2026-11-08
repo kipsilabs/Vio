@@ -492,7 +492,8 @@
           "subtitles": {
             "ass_styling_preserved": false,
             "bitmap_overlay": false,
-            "bitmap_sidecar": false
+            "bitmap_sidecar": false,
+            "reason": "inventory_unavailable"
           }
         },
         "available_qualities": [
@@ -744,7 +745,8 @@
           "subtitles": {
             "ass_styling_preserved": false,
             "bitmap_overlay": false,
-            "bitmap_sidecar": false
+            "bitmap_sidecar": false,
+            "reason": "inventory_unavailable"
           }
         },
         "available_qualities": [
@@ -1015,7 +1017,8 @@
           "subtitles": {
             "ass_styling_preserved": false,
             "bitmap_overlay": false,
-            "bitmap_sidecar": false
+            "bitmap_sidecar": false,
+            "reason": "inventory_unavailable"
           }
         },
         "available_qualities": [
@@ -1211,7 +1214,8 @@
           "subtitles": {
             "ass_styling_preserved": false,
             "bitmap_overlay": false,
-            "bitmap_sidecar": false
+            "bitmap_sidecar": false,
+            "reason": "inventory_unavailable"
           }
         },
         "available_qualities": [
@@ -2483,7 +2487,8 @@
           "subtitles": {
             "ass_styling_preserved": false,
             "bitmap_overlay": false,
-            "bitmap_sidecar": false
+            "bitmap_sidecar": false,
+            "reason": "inventory_unavailable"
           }
         },
         "available_qualities": [
@@ -3047,7 +3052,8 @@
           "subtitles": {
             "ass_styling_preserved": false,
             "bitmap_overlay": false,
-            "bitmap_sidecar": false
+            "bitmap_sidecar": false,
+            "reason": "inventory_unavailable"
           }
         },
         "available_qualities": [
@@ -3282,7 +3288,8 @@
           "subtitles": {
             "ass_styling_preserved": false,
             "bitmap_overlay": false,
-            "bitmap_sidecar": false
+            "bitmap_sidecar": false,
+            "reason": "inventory_unavailable"
           }
         },
         "available_qualities": [
@@ -4588,7 +4595,8 @@
           "subtitles": {
             "ass_styling_preserved": false,
             "bitmap_overlay": false,
-            "bitmap_sidecar": false
+            "bitmap_sidecar": false,
+            "reason": "inventory_unavailable"
           }
         },
         "available_qualities": [
@@ -5595,7 +5603,8 @@
           "subtitles": {
             "ass_styling_preserved": false,
             "bitmap_overlay": false,
-            "bitmap_sidecar": false
+            "bitmap_sidecar": false,
+            "reason": "inventory_unavailable"
           }
         },
         "available_qualities": [

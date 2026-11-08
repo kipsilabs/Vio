@@ -150,6 +150,25 @@ than selecting track 0, and an out-of-range audio index degrades to the file's
 default track; neither is a `400`. Once the plan publishes an inventory,
 reconcile by `track_id` first rather than by ordinal.
 
+A deferred (or otherwise unestablished) inventory is now explicitly labeled on
+the plan. When `subtitle.inventory` is empty for a reason other than a verified
+"this file has no subtitles", the plan carries
+`claims.subtitles.reason: "inventory_unavailable"`, and `tracks_pending: true`
+when the deferred lifecycle applies. A client that negotiated
+`subtitle_inventory_unavailable_v1` renders the menu as still discovering (not
+as final-and-empty) and must not turn a catalog fallback row into a selectable
+ordinal: the ordinal it shows belongs to another inventory. Prefer `track_id`,
+and hold a pick until a verified inventory publishes.
+
+A `track_change` whose subtitle this inventory cannot honor answers with the
+plan still playable, `subtitle.mode: "off"`, and
+`claims.subtitles.reason: "selection_unavailable"`. That is a terminal answer
+for the pick: the client surfaces it, clears the optimistic row, and does not
+replay the same `(file, subtitle identity)` until the inventory or the user's
+choice changes. A client that negotiated `subtitle_selection_rejected_v1`
+treats the reason as authoritative instead of reading subtitles-off as a
+successful pick. An explicit subtitles-off request carries no reason.
+
 ## Capabilities
 
 The response is `{installation_id, revision, state, allowed, protocol_versions,

@@ -1198,6 +1198,42 @@ without it, if no version that keeps it can play. Malformed
 selections (a track identity that does not parse or names another file, or a
 negative index) are still rejected.
 
+**A rejected pick is an answer, not a silent success.** When a `track_change`
+names a subtitle the effective file's inventory cannot honor — an ordinal past
+the end of the combined space, or an identity minted for another file — the
+plan stays playable with `subtitle.mode: "off"`, but it also carries
+`claims.subtitles.reason: "selection_unavailable"`. That reason is the terminal
+signal for that pick: the client surfaces the failure, releases the optimistic
+menu marker, and must not replay the same `(file, subtitle identity)` again.
+Retrying it unchanged cannot succeed, because nothing about the request or the
+inventory changed. The identical retry keeps the reason (the server reuses the
+out-of-range outcome) and still carries the `subtitle_track_unavailable`
+degradation warning. A client that negotiated
+`subtitle_selection_rejected_v1` may read the reason as authoritative; one that
+did not keeps the pre-existing behavior of treating the plan as subtitles-off.
+The reason is only set by a rejected selection, never by an explicit
+`selected_tracks.subtitle: null` (subtitles off) or by a selection that was
+honored.
+
+An empty `subtitle.inventory` is not always "this file has no subtitles". A
+plan built from declared metadata, or after a probe that was deferred, canceled,
+or failed, has not established the inventory; it publishes
+`claims.subtitles.reason: "inventory_unavailable"` and, where the deferred
+lifecycle applies, `tracks_pending: true`. A verified-empty inventory carries no
+reason. Clients that negotiated `subtitle_inventory_unavailable_v1` keep the
+subtitle menu in its discovery state instead of presenting an empty list as
+final, and defer a menu pick until a verified inventory lands rather than
+sending a bare ordinal in an unknown ordinal space.
+
+**A non-seek replan keeps the live playhead.** `position_seconds` on a
+`track_change`, `quality_change`, or `output_change` is a client snapshot, and a
+client that rebuilds its media element for the change can report the route's
+start position (or a zero it has not filled in). The server therefore resumes a
+non-seek replan at the session's own live position when the session has
+reported one, and uses the request's value only when it has not. `seek_reanchor`
+and `seek_failure_recovery` keep the requested position: there the target is
+the intent.
+
 `local_mutations` (up to 8 entries, 64 chars each) reports client-side
 adjustments — a transport reopen, a PCM decode fallback — that change the
 effective route without changing the plan. They feed the attempt key, so a plan
@@ -1747,6 +1783,16 @@ so a client lists it as unavailable.
 `playback_plan.subtitle.inventory` is the authoritative list. A client selects a
 track by echoing an entry's `track_id` or `combined_index`. It must never derive
 an ordinal by counting tracks, summing array lengths, or taking `max(index)+1`.
+
+The list can be empty for two different reasons, and the plan distinguishes
+them. `claims.subtitles.reason: "inventory_unavailable"` means the effective
+source's inventory has not been established — declared metadata only, a
+deferred probe, or a probe that was canceled or failed — so the menu is still
+pending and a pick must wait for a verified inventory. No reason on an empty
+list means a verified inventory proved the file has no subtitles. On a
+`track_change`, a pick this inventory cannot honor answers with
+`claims.subtitles.reason: "selection_unavailable"` and subtitles off; that is a
+terminal answer for the pick, not a successful change.
 
 Each entry carries `source` (`external` | `embedded` | `downloaded`), `delivery`
 (`sidecar` | `burn_in_only`), the `forced` / `default` / `hearing_impaired`

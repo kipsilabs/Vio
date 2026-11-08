@@ -646,7 +646,8 @@
               "type": "boolean"
             },
             "reason": {
-              "type": "string"
+              "type": "string",
+              "description": "Why the subtitle claim holds. Descriptive values (for example client_render_supported) accompany a delivered track; two values are terminal answers a client must act on. selection_unavailable means the request named a subtitle this file's inventory cannot honor: the plan plays with subtitles off and the pick must not be replayed. inventory_unavailable means the empty subtitle inventory has not been established (declared metadata, a deferred probe, or a canceled/failed probe), so the menu is still pending rather than verified-empty."
             }
           },
           "additionalProperties": true
