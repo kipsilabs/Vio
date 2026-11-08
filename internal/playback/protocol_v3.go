@@ -154,6 +154,23 @@ const (
 	// active_quality means "no entry" rather than "a server that predates
 	// the field". It exists only on /api/v2 (see NativeServerFeaturesV3).
 	FeaturePlanActiveQualityV3 = "plan_active_quality_v1"
+	// FeatureSubtitleSelectionRejectedV3 is the client's promise to read
+	// claims.subtitles.reason == "selection_unavailable" on a plan whose
+	// subtitle mode is off after the client asked for a specific track. The
+	// answer is terminal for that pick: the server honored playback but not the
+	// selection, so the client stops replaying the same identity, surfaces the
+	// failure, and does not treat subtitles-off as the requested success. It
+	// exists only on /api/v2 (see NativeServerFeaturesV3).
+	FeatureSubtitleSelectionRejectedV3 = "subtitle_selection_rejected_v1"
+	// FeatureSubtitleInventoryUnavailableV3 is the client's promise to read
+	// claims.subtitles.reason == "inventory_unavailable" on a plan that
+	// publishes no subtitle rows because the effective source's inventory has
+	// not been established yet (declared metadata, a deferred probe, or a
+	// canceled/failed probe). The client keeps the subtitle menu pending until
+	// a verified inventory lands instead of presenting an empty list as the
+	// file's final answer. It exists only on /api/v2 (see
+	// NativeServerFeaturesV3).
+	FeatureSubtitleInventoryUnavailableV3 = "subtitle_inventory_unavailable_v1"
 	// FeatureHLSCopyMPEGTSV3 is an hls delivery feature: a client lists it in
 	// deliveries.hls.features to have HLS copy remuxes of H.264 or HEVC video
 	// packaged as MPEG-TS segments instead of fragmented MP4. Players such as
@@ -400,7 +417,7 @@ func ServerFeaturesV3() []string {
 // advertises and honors only on /api/v2. They postdate the /api/v1 freeze, so
 // the frozen surface neither advertises nor negotiates them.
 func NativeServerFeaturesV3() []string {
-	return append(ServerFeaturesV3(), FeatureBufferingQualityV1, FeaturePlaybackPlanSummaryV1, FeatureSubripSidecarV3, FeatureLiveInventoryV3, FeatureSourceCommittedV3, FeatureInventoryUpdatedV3, FeatureDeferredTrackInventoryV3, FeatureMarkerThumbnailsV3, FeatureHLSSubtitleRenditionsV3, FeaturePlanActiveQualityV3, FeatureHLSRemuxSubtitleRenditionsV3, FeatureHLSCopyMPEGTSV3, FeatureHLSVariableSubstitutionV3, FeatureCodecChannelCeilingsV3, FeatureNativeEmbeddedLimitationsV3, FeatureHLSSubtitleRenditionsAllV3)
+	return append(ServerFeaturesV3(), FeatureBufferingQualityV1, FeaturePlaybackPlanSummaryV1, FeatureSubripSidecarV3, FeatureLiveInventoryV3, FeatureSourceCommittedV3, FeatureInventoryUpdatedV3, FeatureDeferredTrackInventoryV3, FeatureMarkerThumbnailsV3, FeatureHLSSubtitleRenditionsV3, FeaturePlanActiveQualityV3, FeatureHLSRemuxSubtitleRenditionsV3, FeatureHLSCopyMPEGTSV3, FeatureHLSVariableSubstitutionV3, FeatureCodecChannelCeilingsV3, FeatureNativeEmbeddedLimitationsV3, FeatureHLSSubtitleRenditionsAllV3, FeatureSubtitleSelectionRejectedV3, FeatureSubtitleInventoryUnavailableV3)
 }
 
 // HLSVariableSubstitutionV3 reports whether the request's hls delivery
@@ -1277,6 +1294,27 @@ type SubtitleClaimsV3 struct {
 	BitmapSidecar       bool   `json:"bitmap_sidecar"`
 	Reason              string `json:"reason,omitempty"`
 }
+
+// SubtitleClaimsV3.Reason values that carry a terminal answer rather than a
+// description of a delivered track. They are part of the additive v2 contract:
+// a client that negotiated subtitle_selection_rejected_v1 stops retrying the
+// same pick on SubtitleReasonSelectionUnavailableV3, and one that negotiated
+// subtitle_inventory_unavailable_v1 renders the menu as unavailable instead of
+// "no subtitles" on SubtitleReasonInventoryUnavailableV3.
+const (
+	// SubtitleReasonSelectionUnavailableV3: the request named a subtitle that
+	// the effective file's inventory cannot honor (out of range, or an identity
+	// minted for another file). Playback continues with subtitles off, but the
+	// pick was rejected — not silently satisfied — so the client must surface
+	// the failure and must not replay the same identity.
+	SubtitleReasonSelectionUnavailableV3 = "selection_unavailable"
+	// SubtitleReasonInventoryUnavailableV3: the plan publishes no subtitle rows
+	// because the effective source's inventory has not been established
+	// (declared metadata only, a deferred probe, or a canceled/failed probe),
+	// not because the file has no subtitles. The server keeps the inventory
+	// pending so a terminal answer can still arrive.
+	SubtitleReasonInventoryUnavailableV3 = "inventory_unavailable"
+)
 
 type ValidationClaimsV3 struct {
 	Video     VideoClaimsV3    `json:"video"`

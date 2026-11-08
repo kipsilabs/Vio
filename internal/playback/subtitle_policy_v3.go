@@ -103,7 +103,12 @@ func ResolveSubtitlePolicyV3(file *models.MediaFile, request StartRequestV3, tra
 				slog.Info("carried subtitle identity belongs to a different file; subtitles disabled",
 					"component", "playback", "file_id", file.ID, "carried_file_id", fileID)
 			}
-			return SubtitlePolicyResultV3{Decision: SubtitleDecisionV3{Mode: SubtitleOffV3}, SelectedIndex: -1, TransportIndex: -1}
+			return SubtitlePolicyResultV3{
+				Decision:       SubtitleDecisionV3{Mode: SubtitleOffV3},
+				Claims:         SubtitleClaimsV3{Reason: SubtitleReasonSelectionUnavailableV3},
+				SelectedIndex:  -1,
+				TransportIndex: -1,
+			}
 		}
 		index = ordinal
 	}
@@ -121,6 +126,7 @@ func ResolveSubtitlePolicyV3(file *models.MediaFile, request StartRequestV3, tra
 		}
 		return SubtitlePolicyResultV3{
 			Decision:       SubtitleDecisionV3{Mode: SubtitleOffV3},
+			Claims:         SubtitleClaimsV3{Reason: SubtitleReasonSelectionUnavailableV3},
 			SelectedIndex:  -1,
 			TransportIndex: -1,
 			Degraded:       true,
@@ -366,6 +372,7 @@ func reusedSubtitleDegradeV3(input PlannerInputV3, file *models.MediaFile, inven
 	}
 	return SubtitlePolicyResultV3{
 		Decision:       SubtitleDecisionV3{Mode: SubtitleOffV3},
+		Claims:         SubtitleClaimsV3{Reason: SubtitleReasonSelectionUnavailableV3},
 		SelectedIndex:  -1,
 		TransportIndex: -1,
 		Degraded:       true,

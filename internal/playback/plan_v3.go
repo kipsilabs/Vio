@@ -543,6 +543,17 @@ func planPlaybackOnceV3(input PlannerInputV3) (result PlannerResultV3) {
 	// The resolver's own provenance for the effective virtual source, distinct
 	// from the coarse stamp-derived status above. Empty for a local source.
 	base.InventoryProvenance = input.InventoryProvenance
+	// An empty subtitle list is only evidence that the file has no subtitles
+	// when the inventory is verified. A plan built from declared metadata (or
+	// from a probe that was deferred, canceled, or failed) has not learned the
+	// file's tracks; publishing its empty list without a word is what made
+	// clients render a complete, empty menu and stop asking. Say so instead,
+	// additively, so a client can keep the menu pending and a pick can be
+	// judged against an inventory that still has a chance to arrive.
+	if len(subtitleInventory) == 0 && base.Claims.Subtitles.Reason == "" &&
+		!subtitleInventoryVerifiedV3(file, input.InventoryProvenance) {
+		base.Claims.Subtitles.Reason = SubtitleReasonInventoryUnavailableV3
+	}
 	base.Claims.Audio.Passthrough = passthrough
 	if mkvQuirkFired {
 		appendAppliedQuirkV3(&base, *mkvQuirk, "")
@@ -3277,6 +3288,30 @@ func subtitlePolicyNameV3(f SubtitleFidelityV3) string {
 	}
 	return "allow_simplified_rendering"
 }
+
+// subtitleInventoryVerifiedV3 reports whether the effective source's track
+// inventory has positive probe evidence. The resolver's own provenance wins
+// when present; without it (a local source, or an older caller) the row's probe
+// stamp decides, matching the stamp-derived InventoryStatus published beside it.
+func subtitleInventoryVerifiedV3(file *models.MediaFile, provenance string) bool {
+	switch provenance {
+	case InventoryProvenanceVerifiedV3:
+		return true
+	case InventoryProvenanceDeclaredV3, InventoryProvenancePendingV3, InventoryProvenanceFailedV3:
+		return false
+	}
+	return file != nil && file.ProbeUpdatedAt != nil
+}
+
+// Inventory provenance values. They mirror the handler-side ProbeProvenance
+// vocabulary; the planner reads only the published string.
+const (
+	InventoryProvenanceVerifiedV3 = "verified"
+	InventoryProvenanceDeclaredV3 = "declared"
+	InventoryProvenancePendingV3  = "pending"
+	InventoryProvenanceFailedV3   = "failed"
+)
+
 func floatOrZeroV3(v *float64) float64 {
 	if v == nil {
 		return 0

@@ -142,3 +142,31 @@ func planWarnsSubtitleUnavailableV3(plan *playback.PlanV3) bool {
 	}
 	return false
 }
+
+// A track_change naming a subtitle the effective file's inventory cannot honor
+// must answer with a stable, documented rejection instead of a bare
+// subtitles-off success. The plan stays playable, but the claims reason is the
+// terminal signal a client stops retrying on.
+func TestReplanOutOfRangeSubtitlePickReportsSelectionUnavailable(t *testing.T) {
+	file := subtitleReplanFixtureFile(t, 3)
+	handler := subtitleReplanHandler(t, file)
+	sessionID, started, start := startSubtitleReplanSessionV3(t, handler)
+
+	request := subtitleReplanTrackChangeV3(started, start, file.ID, 20, "selection-rejected-0001")
+	response := postPlaybackReplanV3(t, handler, sessionID, request)
+	if response.Terminal != nil {
+		t.Fatalf("an out-of-range subtitle pick must not refuse playback: %#v", response.Terminal)
+	}
+	if response.PlaybackPlan == nil {
+		t.Fatal("replan returned no plan")
+	}
+	if response.PlaybackPlan.Subtitle.Mode != playback.SubtitleOffV3 {
+		t.Fatalf("subtitle mode = %q, want off for an unhonorable pick", response.PlaybackPlan.Subtitle.Mode)
+	}
+	if got := response.PlaybackPlan.Claims.Subtitles.Reason; got != playback.SubtitleReasonSelectionUnavailableV3 {
+		t.Fatalf("claims.subtitles.reason = %q, want %q", got, playback.SubtitleReasonSelectionUnavailableV3)
+	}
+	if !planWarnsSubtitleUnavailableV3(response.PlaybackPlan) {
+		t.Fatal("the rejected pick must still carry the degradation warning")
+	}
+}
