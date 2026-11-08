@@ -16,6 +16,7 @@ import { usePlayerConfig } from "../context/PlayerConfigContext";
 import {
   hasSelectableSessionSubtitles,
   resolvePlayableSubtitles,
+  resolveSubtitleMenuTracks,
 } from "../utils/playableSubtitles";
 import { isOverlayInventoryProvisional } from "../utils/inventoryProvenance";
 import { patchVersionMarkers, resolveActiveVersionMarkers } from "../utils/watchPageMarkers";
@@ -560,6 +561,14 @@ function WatchPagePlayer({
     session.subtitleInventoryProvisional,
     hasSelectableSessionSubtitles(session.subtitleUrls),
     playableSubtitles.length,
+  );
+  // What the menu may actually offer. A provisional inventory with no selectable
+  // rows of its own leaves only catalog fallback rows, whose ordinals belong to
+  // another inventory; the menu stays in discovery instead of letting a click
+  // address a slot this file may not carry.
+  const subtitleMenuTracks = useMemo(
+    () => resolveSubtitleMenuTracks(session.subtitleUrls, versionSubtitles, subtitleMenuProvisional),
+    [session.subtitleUrls, versionSubtitles, subtitleMenuProvisional],
   );
 
   const handleSwitchVersion = useCallback(
@@ -1642,7 +1651,7 @@ function WatchPagePlayer({
         autoFallback={session.autoFallback}
         onRefreshVersions={handleRefreshVersions}
         onCancelRefresh={handleCancelRefresh}
-        subtitleUrls={playableSubtitles}
+        subtitleUrls={subtitleMenuTracks}
         initialPosition={session.initialPosition}
         onQualitySelect={session.changeQuality}
         onSubtitleTrackChange={session.changeSubtitleTrack}

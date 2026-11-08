@@ -747,9 +747,10 @@ describe("WatchPage overlay inventory provenance", () => {
       shouldAutoPlay?: boolean;
       streamUrl?: string | null;
     };
-    // The pre-probe catalog rows still reach the player for selection, but the
-    // overlay marks them provisional because they are not probe evidence.
-    expect(props.subtitleUrls).toEqual([catalogSubtitle]);
+    // The pre-probe catalog rows are not offered as selectable rows: their
+    // ordinals belong to the catalog file, not the effective source, so the
+    // menus show their discovery state until the probe publishes real rows.
+    expect(props.subtitleUrls).toEqual([]);
     expect(props.subtitleInventoryProvisional).toBe(true);
     // Only the menu rows wait for the probe; playback starts unblocked.
     expect(props.shouldAutoPlay).toBe(true);

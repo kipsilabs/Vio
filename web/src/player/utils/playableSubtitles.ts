@@ -380,3 +380,24 @@ export function pendingServerSubtitleSelection(
   // to a single request until the plan acknowledges the selection.
   return active.index;
 }
+
+/**
+ * The rows the subtitle menu may present.
+ *
+ * A provisional inventory that published no selectable rows of its own leaves
+ * the menu with catalog fallback rows only. Those rows are another inventory's
+ * ordinals — this file before a probe, or a sibling release — so presenting
+ * them as choices is what makes a client address a track the effective source
+ * may not have. Keep the menu in its discovery state instead; the verified
+ * inventory replaces it when the probe lands.
+ */
+export function resolveSubtitleMenuTracks(
+  sessionTracks: PlayerSubtitleInfo[],
+  fallbackTracks: PlayerSubtitleInfo[],
+  provisional: boolean,
+): PlayerSubtitleInfo[] {
+  if (provisional && !hasSelectableSessionSubtitles(sessionTracks)) {
+    return [];
+  }
+  return resolvePlayableSubtitles(sessionTracks, fallbackTracks);
+}

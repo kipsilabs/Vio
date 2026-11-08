@@ -84,3 +84,25 @@ export function isProvisionalInventoryExpired(
   if (!provisional || provisionalSince === null) return false;
   return now - provisionalSince >= timeoutMs;
 }
+
+
+/**
+ * Whether a plan's subtitle inventory is provisional, including the explicit
+ * `inventory_unavailable` answer. An empty inventory the server has not
+ * established carries that reason even when the stamp and provenance look
+ * confident; the menu must stay pending rather than present the empty list as
+ * final. `isInventoryProvisional` alone cannot see it.
+ */
+export function isPlanSubtitleInventoryProvisional(plan: {
+  inventory_status?: string | null;
+  inventory_provenance?: string | null;
+  tracks_pending?: boolean | null;
+  claims?: { subtitles?: { reason?: string } | null } | null;
+}): boolean {
+  if (plan.claims?.subtitles?.reason === "inventory_unavailable") return true;
+  return isInventoryProvisional(
+    plan.inventory_status,
+    plan.inventory_provenance,
+    plan.tracks_pending,
+  );
+}
