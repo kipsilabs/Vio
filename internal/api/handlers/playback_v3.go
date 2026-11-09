@@ -4945,6 +4945,26 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 			releaseAnchor := func() {}
 			virtualAnchor := isVirtualPlaybackFile(file) && h.RemoteStreamRelay != nil && (h.VirtualMediaResolver != nil || h.VirtualMediaDetailedResolver != nil)
 			anchorExpiresAt := time.Time{}
+			// A seek that re-anchors an active copy transport already has a
+			// live registration for these bytes: the running generation's
+			// input. Probing it skips the provider resolve a seek used to pay
+			// on top of its anchor probe. The reuse is gated on the session
+			// still being bound to this candidate and the registration still
+			// being live, so a moved binding or a dead token falls back to the
+			// normal resolve below. A retry always re-resolves (and mints a
+			// fresh token), so the same registration is never presented twice.
+			liveAnchorInput, liveAnchorReusable := "", false
+			if virtualAnchor {
+				if input, ok := h.livePinnedAnchorInputV3(session, file); ok {
+					liveAnchorInput, liveAnchorReusable = input, true
+					slog.InfoContext(ctx, "copy seek anchor probing the live pinned transport without a provider call",
+						logComponentKey, playbackLogValueV3,
+						"playback_session_id", session.ID,
+						"requested_seek_seconds", requested,
+						"virtual_uri", file.FilePath,
+					)
+				}
+			}
 			// resolveAnchorInput resolves the candidate to a pinned-IP relay URL
 			// — the same resolution the transcode transport performs — and
 			// adopts the fresh registration. It runs again before a retry so the
@@ -4972,6 +4992,16 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 			// bytes: the fresh-registration context mints a new relay entry so
 			// the same token is never presented twice.
 			resolveAnchorForAttempt := func(attemptCtx context.Context, retry bool) error {
+				if liveAnchorReusable && !retry {
+					// The running generation is already reading these bytes
+					// through a live registration. Probe that registration
+					// instead of re-listing the provider for a token the
+					// transport holds; a failed probe re-resolves on the retry,
+					// which always takes the fresh-registration path below.
+					anchorInput = liveAnchorInput
+					anchorExpiresAt = time.Time{}
+					return nil
+				}
 				// Route the anchor through the same absent-pin rotation policy as
 				// the serve layer and the replan rehydration: a provider that
 				// renumbered its result ids must not terminal a remux seek when a

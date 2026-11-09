@@ -134,6 +134,46 @@ func (p *pinnedRelayRegistration) clearIfVersion(version uint64) bool {
 	return true
 }
 
+// livePinnedAnchorInputV3 returns the relay URL the session's running copy
+// transport is already reading, when this anchor probe would observe the same
+// candidate. A seek that rebuilds a copy transport currently pays a provider
+// resolve for a token the live generation already holds: the session is bound
+// to the candidate, the transport registered a relay URL for it, and that
+// registration is still live. Probing that URL skips the provider round trip
+// (the re-list a seek used to pay on top of its anchor probe) without changing
+// the bytes observed.
+//
+// Reuse is gated on evidence, never presence: the session's pin must name the
+// candidate being probed (so a moved binding, a rotation, or a frozen-recipe
+// replay of a different release falls back to the normal resolve), the
+// transport must still be running, and the relay registration must still be
+// live. An expired, evicted, or auth-rejected registration falls back to the
+// resolve, which mints a fresh token. The probe itself is read-only, so sharing
+// the running generation's registration is safe.
+func (h *PlaybackHandler) livePinnedAnchorInputV3(session *playback.Session, file *models.MediaFile) (string, bool) {
+	if h == nil || h.RemoteStreamRelay == nil || h.tm == nil || session == nil || file == nil {
+		return "", false
+	}
+	if !isVirtualPlaybackFile(file) {
+		return "", false
+	}
+	if !sameVirtualCandidate(file.FilePath, session.VirtualSourceURI) {
+		return "", false
+	}
+	transcodeSession := h.tm.GetTranscodeSession(session.ID)
+	if transcodeSession == nil || !transcodeSession.IsRunning() {
+		return "", false
+	}
+	input := strings.TrimSpace(transcodeSession.Opts().InputPath)
+	if input == "" || strings.HasPrefix(strings.ToLower(input), virtualPlaybackPrefix) {
+		return "", false
+	}
+	if h.pinnedRelayStatus(input) != remotestream.RegistrationLive {
+		return "", false
+	}
+	return input, true
+}
+
 // pinnedRelayStatus reports the live state of a pinned relay registration. It
 // prefers the injected RelayRegistrationStatus seam so tests can exercise
 // absent, expired, and upstream-rejected pins, and otherwise queries the
