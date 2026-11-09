@@ -11775,7 +11775,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	if seekReanchor && record.CurrentPlan.Delivery == playback.DeliveryOriginalHTTPV3 && result.Plan.Delivery == playback.DeliveryOriginalHTTPV3 {
 		transportReused = true
 	} else if ((trackChange && len(unreachableNodes) == 0) ||
-		(seekReanchor && seekReanchorWithinActiveWindowV3(record.CurrentPlan, req.PositionSeconds))) &&
+		(seekReanchor && h.seekReanchorWithinActiveWindowV3(session, record.CurrentPlan, req.PositionSeconds))) &&
 		h.hasActiveReusableTransportV3(session, record.CurrentPlan.Delivery) {
 		proxyAllowed := mode.proxyEgress || (!mode.headerAuth && h.JWTSecret != "")
 		policy := h.playbackRoutingPolicyForContextV3(r.Context())
@@ -12717,6 +12717,72 @@ func seekReanchorWithinActiveWindowV3(plan playback.PlanV3, position float64) bo
 		return false
 	}
 	return true
+}
+
+// seekReanchorWithinActiveWindowV3 is the live-session form of the check
+// above. A transport that has published a closed or can_seek_anywhere window
+// can serve any target inside it from its segment layer, so reuse is safe. A
+// growing manifest has no published end: a target beyond the segments the
+// session has actually produced cannot be served by the reused generation
+// without an encoder restart that leaves the client clamped to the live edge,
+// so it must rebuild the transport at the target. The produced head comes from
+// the live transcode session, not from the plan, because only the session
+// knows how far FFmpeg has actually written.
+func (h *PlaybackHandler) seekReanchorWithinActiveWindowV3(session *playback.Session, plan playback.PlanV3, position float64) bool {
+	if !seekReanchorWithinActiveWindowV3(plan, position) {
+		return false
+	}
+	if plan.Timeline.CanSeekAnywhere || plan.Timeline.SeekWindowEndSeconds != nil {
+		return true
+	}
+	headEnd, ok := h.producedHeadEndSecondsV3(session)
+	return seekReanchorWithinActiveWindowAtHeadV3(plan, position, headEnd, ok)
+}
+
+// seekReanchorWithinActiveWindowAtHeadV3 reports whether a growing HLS
+// transport, whose produced content ends at producedHeadEnd, can answer
+// position in place. Without a session that reports a head, the previous
+// permissive behavior is kept: only an in-place restart is then possible, and
+// rebuilding would lose the only stream that can serve it.
+func seekReanchorWithinActiveWindowAtHeadV3(plan playback.PlanV3, position, producedHeadEnd float64, haveHead bool) bool {
+	if !seekReanchorWithinActiveWindowV3(plan, position) {
+		return false
+	}
+	if plan.Timeline.CanSeekAnywhere || plan.Timeline.SeekWindowEndSeconds != nil {
+		return true
+	}
+	if !haveHead {
+		return true
+	}
+	return position <= producedHeadEnd
+}
+
+// producedHeadEndSecondsV3 reports the source-timeline end of the last segment
+// the live session has fully produced. The head's start comes from the
+// session's real manifest and its duration from the configured segment length;
+// a missing session or an unreadable timeline reports no head, which keeps the
+// caller on the reuse path.
+func (h *PlaybackHandler) producedHeadEndSecondsV3(session *playback.Session) (float64, bool) {
+	if h == nil || h.tm == nil || session == nil {
+		return 0, false
+	}
+	transcodeSession := h.tm.GetTranscodeSession(session.ID)
+	if transcodeSession == nil {
+		return 0, false
+	}
+	progress := transcodeSession.SegmentProgress(time.Now())
+	if progress.ProducedHead < 0 {
+		return 0, false
+	}
+	headStart, ok, err := transcodeSession.SegmentStartTime(progress.ProducedHead)
+	if err != nil || !ok {
+		return 0, false
+	}
+	segmentSeconds := float64(progress.SegmentDuration)
+	if segmentSeconds <= 0 {
+		segmentSeconds = playback.DefaultSegmentDuration
+	}
+	return headStart + segmentSeconds, true
 }
 
 // sameExecutableAVRecipeV3 reports whether two frozen A/V recipes are equivalent.
