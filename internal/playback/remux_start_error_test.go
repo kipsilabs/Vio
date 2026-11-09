@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -234,5 +235,31 @@ func TestServeRemuxMidStreamFailureKeepsCommittedResponse(t *testing.T) {
 	}
 	if w.rejected {
 		t.Fatalf("mid-stream failure was rewritten into a rejected response")
+	}
+}
+
+// A remux that produced no output must say why. FFmpeg's stderr is the only
+// place the reason appears, and a production failure (session
+// a88e6d0c-2edd-463b-a052-e19c41bf6ebc) reached the log as a bare EOF because
+// the transport never captured it.
+func TestServeRemuxNoOutputLogsFFmpegStderr(t *testing.T) {
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	err := ServeRemuxWithOptions(&failoverResponseWriter{}, httptest.NewRequest(http.MethodGet, "/api/v2/stream/session-1", nil),
+		"virtual://movie/tt11378946?result=cand-a", "mp4", 0, false, 0, 0, RemuxServeOptions{
+			FFmpegPath:      remuxFakeFFmpeg(t, "echo 'Protocol not found' >&2\nexit 1\n"),
+			DeferStartError: true,
+		})
+	if !errors.Is(err, errRemuxNoOutput) {
+		t.Fatalf("error = %v, want the no-output failure", err)
+	}
+	line := logs.String()
+	for _, want := range []string{"remux produced no output", "input_kind", "virtual", "Protocol not found"} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("log = %s, want it to contain %q", line, want)
+		}
 	}
 }

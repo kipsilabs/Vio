@@ -99,8 +99,9 @@ const (
 	VirtualLibraryCatalogDiscoveryBudgetMsSettingKey = "virtual_library.catalog_discovery_budget_ms"
 	// 20 s admits the observed 17–25 s provider-listing low band that the old
 	// one-second default (and ten-second ceiling) cut off, while keeping one
-	// detached listing bounded. Stored values are not rewritten: a deployment
-	// that pinned the old 10 s ceiling must raise it to the new maximum.
+	// detached listing bounded. A deployment that saved the Streaming settings
+	// form under the old ceiling keeps a stored 10 s, and stored values win, so
+	// migration 20261108201341 raises the old band to this maximum.
 	DefaultVirtualLibraryCatalogDiscoveryBudgetMs = 20000
 	MinVirtualLibraryCatalogDiscoveryBudgetMs     = 500
 	MaxVirtualLibraryCatalogDiscoveryBudgetMs     = 20000

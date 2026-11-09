@@ -180,6 +180,39 @@ type RemuxSession struct {
 	outputPipe io.ReadCloser
 	closeOnce  sync.Once
 	closeErr   error
+	stderr     *remuxStderrTail
+}
+
+// remuxStderrLimit bounds the captured FFmpeg stderr. A remux logs at
+// -loglevel error, so a start failure fits in a few hundred bytes; the cap
+// only keeps a pathological process from growing the buffer.
+const remuxStderrLimit = 4 << 10
+
+// remuxStderrTail keeps the last remuxStderrLimit bytes FFmpeg wrote to
+// stderr. Without it a remux that produced no output reports only EOF: the
+// transport sees a closed pipe, never the reason FFmpeg refused the input.
+type remuxStderrTail struct {
+	mu  sync.Mutex
+	buf []byte
+}
+
+func (t *remuxStderrTail) Write(p []byte) (int, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.buf = append(t.buf, p...)
+	if len(t.buf) > remuxStderrLimit {
+		t.buf = append(t.buf[:0], t.buf[len(t.buf)-remuxStderrLimit:]...)
+	}
+	return len(p), nil
+}
+
+func (t *remuxStderrTail) String() string {
+	if t == nil {
+		return ""
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return strings.TrimSpace(string(t.buf))
 }
 
 // RemuxDVMode makes Profile 7 handling an explicit byte-level recipe choice.
@@ -431,6 +464,8 @@ func startRemuxWithOptions(ctx context.Context, filePath, outputFormat string, s
 		cancel()
 		return nil, fmt.Errorf("stdout pipe: %w", err)
 	}
+	stderrTail := &remuxStderrTail{}
+	cmd.Stderr = stderrTail
 
 	if err := cmd.Start(); err != nil {
 		processmetrics.Record(processmetrics.Remux, nil, err, ctx.Err())
@@ -443,6 +478,7 @@ func startRemuxWithOptions(ctx context.Context, filePath, outputFormat string, s
 		ctx:        ctx,
 		cancel:     cancel,
 		outputPipe: stdout,
+		stderr:     stderrTail,
 	}, nil
 }
 
@@ -482,6 +518,42 @@ func (s *RemuxSession) Close() error {
 // wrapped alongside it so the cause stays diagnosable while callers get a
 // stable identity to match.
 var errRemuxNoOutput = errors.New("remux produced no output")
+
+// Kind values for remuxInputKind.
+const (
+	remuxInputVirtual = "virtual"
+	remuxInputRemote  = "remote"
+	remuxInputLocal   = "local"
+)
+
+// remuxInputKind names the shape of the input a remux was handed, which is the
+// first thing to check when ffmpeg produced no output: an unresolved
+// "virtual://" identity is not a protocol ffmpeg can open.
+func remuxInputKind(filePath string) string {
+	lower := strings.ToLower(strings.TrimSpace(filePath))
+	switch {
+	case strings.HasPrefix(lower, "virtual://"):
+		return remuxInputVirtual
+	case strings.HasPrefix(lower, "http://"), strings.HasPrefix(lower, "https://"):
+		return remuxInputRemote
+	default:
+		return remuxInputLocal
+	}
+}
+
+// logRemuxNoOutput records why a remux produced no media byte. FFmpeg's own
+// stderr is the only place the reason appears; without it the failure reads as
+// a bare EOF and a broken argument, an unsupported input scheme, and a dead
+// provider are indistinguishable.
+func logRemuxNoOutput(ctx context.Context, filePath string, session *RemuxSession) {
+	attrs := []any{logKeyComponent, logValuePlayback, "input_kind", remuxInputKind(filePath)}
+	if session != nil {
+		if tail := session.stderr.String(); tail != "" {
+			attrs = append(attrs, "ffmpeg_stderr", tail)
+		}
+	}
+	slog.WarnContext(ctx, "remux produced no output", attrs...)
+}
 
 // writeStartError records a remux failure that happened before any media byte
 // reached the client. When deferToCaller is set the failure is left
@@ -730,6 +802,11 @@ func ServeRemuxWithOptions(w http.ResponseWriter, r *http.Request, filePath, out
 		n, readErr = result.n, result.err
 	case <-time.After(firstTimeout):
 		session.Abort()
+		// Reap before logging: Close is what waits for FFmpeg and for its
+		// stderr to be copied, and the deferred Close would otherwise run
+		// after the diagnostic line was written.
+		_ = session.Close()
+		logRemuxNoOutput(r.Context(), filePath, session)
 		err := fmt.Errorf("%w: first output timeout after %s: %w", errRemuxNoOutput, firstTimeout, io.EOF)
 		writeStartError(w, opts.DeferStartError, "failed to remux", http.StatusBadGateway)
 		return err
@@ -737,6 +814,8 @@ func ServeRemuxWithOptions(w http.ResponseWriter, r *http.Request, filePath, out
 	if n > 0 {
 		first = append(first, buf[:n]...)
 	} else if readErr != nil {
+		_ = session.Close()
+		logRemuxNoOutput(r.Context(), filePath, session)
 		err := fmt.Errorf("%w: %w", errRemuxNoOutput, readErr)
 		writeStartError(w, opts.DeferStartError, "failed to remux", http.StatusBadGateway)
 		return err

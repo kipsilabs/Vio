@@ -2144,7 +2144,14 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 			// delivery evidence (remux.go can return nil when the first
 			// client write fails) — recovery is gated on positive bytes.
 			remuxWriter := httpstream.NewRollingDeadlineWriter(w)
-			err := playback.ServeRemuxWithOptions(remuxWriter, r, file.FilePath, "mp4", seekSeconds, session.TranscodeAudio, session.AudioTrackIndex, file.PrimaryDVProfile(), playback.RemuxServeOptions{
+			// FFmpeg opens the input this transport serves. A virtual row's
+			// FilePath is the session's virtual:// identity, which FFmpeg
+			// cannot open: handing it over makes FFmpeg exit before its first
+			// media byte and the remux reports "produced no output". Serve the
+			// resolved relay URL instead, exactly as direct play does, so the
+			// cache heal and sibling rotation below (which update inputPath)
+			// also reach the retry.
+			err := playback.ServeRemuxWithOptions(remuxWriter, r, inputPath, "mp4", seekSeconds, session.TranscodeAudio, session.AudioTrackIndex, file.PrimaryDVProfile(), playback.RemuxServeOptions{
 				DVMode:                    session.RemuxDVMode,
 				FFmpegPath:                h.ffmpegPath(),
 				DropResumeLeadingPictures: session.RemuxResumeLeadingPictureDrop,
