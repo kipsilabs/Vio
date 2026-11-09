@@ -366,6 +366,13 @@ func TestPlannedSegmentRecoveryTargetUsesThePlanBoundary(t *testing.T) {
 	if target.SeekSeconds != 81.5 || target.StreamOriginSeconds != 81 || target.StartSegmentNumber != 40 || !target.CopySeekAnchorResolved {
 		t.Fatalf("target = %+v, want segment 40 at 81s (+0.5s seek bias)", target)
 	}
+
+	// A segment outside the plan cannot be placed on the timeline. Reporting
+	// it unresolved makes the handler answer 404 instead of restarting FFmpeg
+	// at a fabricated position for every retry.
+	if _, ok, err := s.ResolveSegmentRecoveryTarget(context.Background(), len(durations)); err != nil || ok {
+		t.Fatalf("out-of-plan segment = ok %v, err %v; want unresolved without error", ok, err)
+	}
 }
 
 func TestCopySegmentPlanSeekTarget(t *testing.T) {

@@ -1,6 +1,7 @@
 package playback
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -88,6 +89,74 @@ func TestRemuxRecipeChangeDiscardsRetainedSegments(t *testing.T) {
 	// Retained segments below the restart point still survive the clean.
 	if _, err := os.Stat(filepath.Join(dir, segmentFilename(5, previous))); err != nil {
 		t.Fatalf("pre-restart segment was removed by the clean: %v", err)
+	}
+}
+
+// A planned (keyframe VOD) stream keeps its prefix for backward seeking only
+// while the replacement emits the same recipe. An audio switch changes the
+// emitted audio, so a restart that lands at segment 7 must discard segments
+// 0..6 as well: they still hold the pre-switch track under numbers the
+// replacement generation serves, and a backward seek would deliver them as
+// current media.
+func TestPlannedRestartDiscardsPrefixOnRecipeChange(t *testing.T) {
+	tests := []struct {
+		name        string
+		switchAudio bool
+		wantKept    int
+	}{
+		{name: "unchanged recipe keeps the prefix", wantKept: 7},
+		{name: "audio switch discards the prefix", switchAudio: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			truePath := trueBinaryPath(t)
+			dir := t.TempDir()
+			opts := TranscodeOpts{
+				OutputDir:           dir,
+				TargetCodecVideo:    "copy",
+				TargetCodecAudio:    "aac",
+				AudioTrackIndex:     1,
+				SourceAudioChannels: 6,
+				SegmentDuration:     2,
+				FFmpegPath:          truePath,
+			}
+			plan := &copySegmentPlan{durations: make([]float64, 10)}
+			for i := range plan.durations {
+				plan.durations[i] = 2
+			}
+			for i := range plan.durations {
+				writeSegmentFile(t, dir, segmentFilename(i, opts), []byte("old track"), time.Now())
+			}
+			writeManifestRange(t, dir, 0, len(plan.durations)-1, hlsSegmentExtension(opts))
+
+			session := &TranscodeSession{
+				outputDir:     dir,
+				opts:          opts,
+				runningRecipe: emittedRecipeOf(opts),
+				copyPlan:      plan,
+			}
+			if tc.switchAudio {
+				session.SetAudioTrackIndex(2)
+				session.SetSourceAudioChannels(2)
+			}
+			if err := session.Restart(context.Background(), 14, 7); err != nil {
+				t.Fatalf("Restart: %v", err)
+			}
+			t.Cleanup(func() { _ = session.Close() })
+
+			for i := range plan.durations {
+				_, err := os.Stat(filepath.Join(dir, segmentFilename(i, opts)))
+				if i < tc.wantKept {
+					if err != nil {
+						t.Fatalf("segment %d below the restart point was removed: %v", i, err)
+					}
+					continue
+				}
+				if !os.IsNotExist(err) {
+					t.Fatalf("segment %d survived the restart", i)
+				}
+			}
+		})
 	}
 }
 

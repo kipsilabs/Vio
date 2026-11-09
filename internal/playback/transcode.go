@@ -4778,19 +4778,30 @@ func (s *TranscodeSession) restart(
 	// running process's frozen recipe, not the caller's opts (which already
 	// carry any pre-restart audio selection mutation).
 	var cleanedOutput bool
+	cleanedFrom := startSegment
 	if s.copyPlan != nil {
 		// A planned generation's segment boundaries are fixed by the plan, but
 		// a replacement that starts inside the produced window must not leave
-		// fragments another restart cut. Regenerate the range at and after the
-		// target; segments before it remain for backward seeking.
-		s.cleanStaleSegments(startSegment)
+		// fragments another restart cut. With the recipe unchanged, the bytes
+		// before the target are the same media: regenerate the range at and
+		// after it and keep the prefix for backward seeking.
+		//
+		// A recipe change invalidates that prefix too. Segments emitted before
+		// the restart hold the old track, filter, or packaging under numbering
+		// the replacement generation keeps serving, so a backward seek would
+		// deliver them as current media. Discard the whole output, exactly as
+		// the pre-plan restart did when it restarted planned streams at zero.
+		if !recipeUnchanged {
+			cleanedFrom = 0
+		}
+		s.cleanStaleSegments(cleanedFrom)
 		cleanedOutput = true
 	} else {
 		cleanedOutput = s.cleanStaleOutputForRestart(nextRecipe, startSegment)
 	}
 	if cleanedOutput {
 		log.Printf("playback: cleaned stale transcode output at/after segment %d before restart (video %q -> %q)",
-			startSegment, previousRecipe.videoCodec, opts.TargetCodecVideo)
+			cleanedFrom, previousRecipe.videoCodec, opts.TargetCodecVideo)
 	}
 
 	args := buildFFmpegArgs(opts)
