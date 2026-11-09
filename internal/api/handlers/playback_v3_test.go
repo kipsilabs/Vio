@@ -6271,6 +6271,143 @@ func TestSeekReanchorWithinActiveWindowV3(t *testing.T) {
 	}
 }
 
+// A growing HLS transport (no published window end) can only answer a seek at
+// or before the last segment it has actually produced. A target past that head
+// needs a replacement generation at the target; reusing the growing one leaves
+// the client clamped to the live edge.
+func TestSeekReanchorWithinProducedHeadV3(t *testing.T) {
+	start := 0.0
+	openPlan := playback.PlanV3{
+		Delivery: playback.DeliveryRemuxHLSV3,
+		Timeline: playback.TimelineV3{SeekWindowStartSeconds: &start},
+	}
+
+	if !seekReanchorWithinActiveWindowAtHeadV3(openPlan, 60, 60, true) {
+		t.Fatal("a target at the produced head must reuse the active transport")
+	}
+	if seekReanchorWithinActiveWindowAtHeadV3(openPlan, 60.01, 60, true) {
+		t.Fatal("a target past the produced head must rebuild the transport")
+	}
+	// A session that cannot report a head keeps the previous permissive
+	// behavior: rebuilding would lose the only stream that can serve it.
+	if !seekReanchorWithinActiveWindowAtHeadV3(openPlan, 10_000, 0, false) {
+		t.Fatal("an unknown produced head must keep the reuse path")
+	}
+	// A plan that publishes a closed window or can_seek_anywhere answers from
+	// its segment layer for any target inside the window, whatever the head.
+	end := 3600.0
+	closedPlan := openPlan
+	closedPlan.Timeline.SeekWindowEndSeconds = &end
+	if !seekReanchorWithinActiveWindowAtHeadV3(closedPlan, 3599, 0, true) {
+		t.Fatal("a closed seekable window must reuse the active transport")
+	}
+	vodPlan := playback.PlanV3{
+		Delivery: playback.DeliveryRemuxHLSV3,
+		Timeline: playback.TimelineV3{CanSeekAnywhere: true},
+	}
+	if !seekReanchorWithinActiveWindowAtHeadV3(vodPlan, 2926, 0, true) {
+		t.Fatal("a VOD planned session must reuse its transport for any planned target")
+	}
+}
+
+// The handler reads the head from the live transcode session, not from the
+// plan: only the session knows how far FFmpeg has written.
+func TestSeekReanchorReadsTheLiveProducedHeadV3(t *testing.T) {
+	dir := t.TempDir()
+	outputDir := filepath.Join(dir, "out")
+	if err := os.MkdirAll(outputDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// The fake producer writes the first three segments of a growing playlist.
+	manifest := "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:2.0,\nseg_00000.m4s\n#EXTINF:2.0,\nseg_00001.m4s\n#EXTINF:2.0,\nseg_00002.m4s\n"
+	ffmpegPath := filepath.Join(dir, "ffmpeg")
+	script := `#!/bin/sh
+printf '%b' '` + manifest + `' > '` + filepath.Join(outputDir, "stream.m3u8") + `'
+printf a > '` + filepath.Join(outputDir, "seg_00000.m4s") + `'
+printf b > '` + filepath.Join(outputDir, "seg_00001.m4s") + `'
+printf c > '` + filepath.Join(outputDir, "seg_00002.m4s") + `'
+exec sleep 30
+`
+	if err := os.WriteFile(ffmpegPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const sessionID = "growing-head-session"
+	transcodeSession, err := playback.StartTranscode(context.Background(), playback.TranscodeOpts{
+		SessionID:        sessionID,
+		InputPath:        "/media/movie.mkv",
+		OutputDir:        outputDir,
+		FFmpegPath:       ffmpegPath,
+		TargetCodecVideo: "copy",
+		TargetCodecAudio: "copy",
+		SegmentDuration:  2,
+		CopyVideoMPEGTS:  false,
+		TotalDuration:    600,
+	})
+	if err != nil {
+		t.Fatalf("StartTranscode: %v", err)
+	}
+	t.Cleanup(func() { _ = transcodeSession.Close() })
+
+	waitForCondition(t, func() bool {
+		progress := transcodeSession.SegmentProgress(time.Now())
+		return progress.HasManifest && progress.ProducedHead >= 2
+	}, "fake transcode did not produce a manifest head")
+
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	handler.TranscodeManager().RegisterTranscodeSession(sessionID, transcodeSession)
+	session := &playback.Session{ID: sessionID, PlayMethod: playback.PlayTranscode}
+
+	start := 0.0
+	openPlan := playback.PlanV3{
+		Delivery: playback.DeliveryRemuxHLSV3,
+		Timeline: playback.TimelineV3{SeekWindowStartSeconds: &start},
+	}
+	// Produced head is segment 2: it starts at 4s and ends at 6s.
+	if !handler.seekReanchorWithinActiveWindowV3(session, openPlan, 5.9) {
+		t.Fatal("a target inside the produced head must reuse the active transport")
+	}
+	if handler.seekReanchorWithinActiveWindowV3(session, openPlan, 6.1) {
+		t.Fatal("a target past the produced head must rebuild the transport")
+	}
+	// A VOD plan (the copy keyframe playlist) is seekable regardless of head.
+	vodPlan := playback.PlanV3{
+		Delivery: playback.DeliveryRemuxHLSV3,
+		Timeline: playback.TimelineV3{CanSeekAnywhere: true},
+	}
+	if !handler.seekReanchorWithinActiveWindowV3(session, vodPlan, 590) {
+		t.Fatal("a planned VOD session must seek natively, not rebuild")
+	}
+}
+
+// configureCopyVODTimelineV3 publishes the plan's whole extent so clients seek
+// by segment instead of following a growing live edge.
+func TestConfigureCopyVODTimelineV3(t *testing.T) {
+	plan := &playback.PlanV3{}
+	plan.Timeline.SourceStartSeconds = 655
+	configureCopyVODTimelineV3(plan, playback.CopyVODPlan{Origin: 0, Duration: 2926, Segments: 1463})
+	if plan.Timeline.SeekWindowStartSeconds == nil || *plan.Timeline.SeekWindowStartSeconds != 0 {
+		t.Fatalf("window start = %v, want 0", plan.Timeline.SeekWindowStartSeconds)
+	}
+	if plan.Timeline.SeekWindowEndSeconds == nil || *plan.Timeline.SeekWindowEndSeconds != 2926 {
+		t.Fatalf("window end = %v, want 2926", plan.Timeline.SeekWindowEndSeconds)
+	}
+	if !plan.Timeline.CanSeekAnywhere || plan.Timeline.PlayerStartSeconds != 655 || plan.Timeline.StreamOriginSeconds != 0 {
+		t.Fatalf("timeline = %+v, want can_seek_anywhere from a 655s player start", plan.Timeline)
+	}
+	// A source whose first keyframe is later than zero keeps the same origin
+	// on both ends of the window.
+	later := &playback.PlanV3{}
+	later.Timeline.SourceStartSeconds = 8
+	configureCopyVODTimelineV3(later, playback.CopyVODPlan{Origin: 7, Duration: 8.2, Segments: 3})
+	if later.Timeline.SeekWindowStartSeconds == nil || *later.Timeline.SeekWindowStartSeconds != 7 ||
+		later.Timeline.SeekWindowEndSeconds == nil || math.Abs(*later.Timeline.SeekWindowEndSeconds-15.2) > 1e-9 {
+		t.Fatalf("window = %v..%v, want 7..15.2", later.Timeline.SeekWindowStartSeconds, later.Timeline.SeekWindowEndSeconds)
+	}
+	if later.Timeline.PlayerStartSeconds != 1 {
+		t.Fatalf("player start = %v, want 1 (8s source position on a 7s origin)", later.Timeline.PlayerStartSeconds)
+	}
+}
+
 func TestLazyDVRPUStrippableV3MemoizesOnFileRowIdentity(t *testing.T) {
 	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
 	// A missing binary would make any real probe fail open to true; the memo

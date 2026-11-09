@@ -753,7 +753,18 @@ func StartTranscode(ctx context.Context, opts TranscodeOpts) (*TranscodeSession,
 		return nil, fmt.Errorf("plan rebuilt keyframe playlist: %w", ctx.Err())
 	}
 	if copyPlan != nil {
-		log.Printf("playback: session %s serves a %d-segment keyframe playlist", opts.SessionID, len(copyPlan.durations))
+		// The complete playlist is numbered from segment zero, so FFmpeg
+		// starts at the planned boundary containing the requested position
+		// and writes that segment under its playlist number. An initial
+		// resume therefore skips the copied prefix without changing the
+		// playlist the client receives.
+		if start, segment, ok := copyPlan.seekTarget(opts.SeekSeconds); ok {
+			opts.SeekSeconds, _ = copyPlan.segmentSeekPosition(segment)
+			opts.StartSegmentNumber = segment
+			opts.StreamOriginSeconds = start
+			opts.CopySeekAnchorResolved = true
+		}
+		log.Printf("playback: session %s serves a %d-segment keyframe playlist from segment %d", opts.SessionID, len(copyPlan.durations), opts.StartSegmentNumber)
 	}
 
 	// The synchronous source guard above is bounded by the caller's startup
@@ -4644,13 +4655,31 @@ func (s *TranscodeSession) restart(
 	}
 	s.closeSubtitleSpan()
 
-	// A planned stream's segments only match its playlist when FFmpeg cuts
-	// them from the beginning, so it always restarts there. The requested
-	// segment stays the throttler's target, so FFmpeg runs on to reach it.
-	requestedSegment := startSegment
+	// A planned stream's complete VOD playlist keeps the same segment numbers
+	// across a restart, so a seek restart lands on the plan's exact segment
+	// boundary and FFmpeg continues from there. Backward segments stay on
+	// disk; the requested segment remains the throttler's target.
 	if s.copyPlan != nil {
-		seekSeconds, startSegment, streamOriginSeconds, copySeekAnchorResolved = 0, 0, 0, true
+		if !copySeekAnchorResolved {
+			// A direct restart (an audio switch, or a caller that resolved no
+			// anchor) still starts at the planned boundary containing the
+			// request, so the replacement cuts the plan's own segments.
+			if segmentStart, segment, ok := s.copyPlan.seekTarget(seekSeconds); ok {
+				seekSeconds, _ = s.copyPlan.segmentSeekPosition(segment)
+				startSegment = segment
+				streamOriginSeconds = segmentStart
+				copySeekAnchorResolved = true
+			}
+		}
+		if copySeekAnchorResolved && startSegment >= 0 && startSegment < len(s.copyPlan.durations) {
+			// The caller's request already names a planned segment; add its
+			// bias so the demuxer lands on that boundary keyframe.
+			if request, ok := s.copyPlan.segmentSeekPosition(startSegment); ok {
+				seekSeconds = request
+			}
+		}
 	}
+	requestedSegment := startSegment
 
 	s.mu.Lock()
 	s.running = false
@@ -4748,9 +4777,31 @@ func (s *TranscodeSession) restart(
 	// have to go before the replacement process starts. The comparison uses the
 	// running process's frozen recipe, not the caller's opts (which already
 	// carry any pre-restart audio selection mutation).
-	if s.cleanStaleOutputForRestart(nextRecipe, startSegment) {
+	var cleanedOutput bool
+	cleanedFrom := startSegment
+	if s.copyPlan != nil {
+		// A planned generation's segment boundaries are fixed by the plan, but
+		// a replacement that starts inside the produced window must not leave
+		// fragments another restart cut. With the recipe unchanged, the bytes
+		// before the target are the same media: regenerate the range at and
+		// after it and keep the prefix for backward seeking.
+		//
+		// A recipe change invalidates that prefix too. Segments emitted before
+		// the restart hold the old track, filter, or packaging under numbering
+		// the replacement generation keeps serving, so a backward seek would
+		// deliver them as current media. Discard the whole output, exactly as
+		// the pre-plan restart did when it restarted planned streams at zero.
+		if !recipeUnchanged {
+			cleanedFrom = 0
+		}
+		s.cleanStaleSegments(cleanedFrom)
+		cleanedOutput = true
+	} else {
+		cleanedOutput = s.cleanStaleOutputForRestart(nextRecipe, startSegment)
+	}
+	if cleanedOutput {
 		log.Printf("playback: cleaned stale transcode output at/after segment %d before restart (video %q -> %q)",
-			startSegment, previousRecipe.videoCodec, opts.TargetCodecVideo)
+			cleanedFrom, previousRecipe.videoCodec, opts.TargetCodecVideo)
 	}
 
 	args := buildFFmpegArgs(opts)
@@ -5300,6 +5351,20 @@ func (s *TranscodeSession) IsCopyVideo() bool {
 	return strings.EqualFold(s.opts.TargetCodecVideo, "copy")
 }
 
+// CopyVODPlan reports the complete VOD timeline a planned copy session serves.
+// A false result means the session uses FFmpeg's growing playlist instead, so
+// the caller must keep the copy pre-roll timeline rather than claim the media
+// is seekable.
+func (s *TranscodeSession) CopyVODPlan() (CopyVODPlan, bool) {
+	s.mu.Lock()
+	plan := s.copyPlan
+	s.mu.Unlock()
+	if plan == nil || len(plan.durations) == 0 {
+		return CopyVODPlan{}, false
+	}
+	return CopyVODPlan{Origin: plan.origin, Duration: plan.totalDuration(), Segments: len(plan.durations)}, true
+}
+
 // SegmentStartTime reports the source-timeline start time of the requested
 // segment using the current on-disk manifest. The bool return is false when
 // the segment is not present in the manifest yet.
@@ -5398,8 +5463,21 @@ type SegmentRecoveryTarget struct {
 // URI-to-source-time mapping across a missing-segment restart.
 func (s *TranscodeSession) ResolveSegmentRecoveryTarget(ctx context.Context, segNum int) (SegmentRecoveryTarget, bool, error) {
 	if s.copyPlan != nil {
-		// restart regenerates a planned stream from the beginning.
-		return SegmentRecoveryTarget{StartSegmentNumber: segNum, CopySeekAnchorResolved: true}, true, nil
+		// The plan already knows every segment's source-timeline start, so a
+		// seek restarts FFmpeg at exactly that boundary with the segment
+		// numbering the client's complete VOD playlist already names. Nothing
+		// about the served playlist changes, and the transport is reused.
+		seekSeconds, ok := s.copyPlan.segmentStart(segNum)
+		if !ok {
+			return SegmentRecoveryTarget{}, false, nil
+		}
+		requestSeconds, _ := s.copyPlan.segmentSeekPosition(segNum)
+		return SegmentRecoveryTarget{
+			SeekSeconds:            requestSeconds,
+			StreamOriginSeconds:    seekSeconds,
+			StartSegmentNumber:     segNum,
+			CopySeekAnchorResolved: true,
+		}, true, nil
 	}
 	seekSeconds, ok, err := s.RestartSeekTarget(segNum)
 	if err != nil || !ok {

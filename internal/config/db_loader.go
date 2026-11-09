@@ -362,7 +362,7 @@ func LoadFromDB(m map[string]string) (*Config, error) {
 		return nil, fmt.Errorf("%s must be 0 or between 120 and 86400", playbackSegmentRetentionSettingKey)
 	}
 	cfg.Playback.SegmentRetentionSeconds = segmentRetentionSeconds
-	keyframePlaylist, err := boolOr(m, PlaybackKeyframePlaylistSettingKey, false)
+	keyframePlaylist, err := boolOr(m, PlaybackKeyframePlaylistSettingKey, true)
 	if err != nil {
 		return nil, err
 	}

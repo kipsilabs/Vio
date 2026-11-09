@@ -107,7 +107,16 @@ type matroskaIndex struct {
 	frameSeconds float64
 }
 
-func readMatroska(r io.ReaderAt, size int64) (matroskaIndex, error) { //nolint:funlen,gocyclo // upstream readMatroska exceeds Vio's 100-line and complexity-30 limits; refactor tracked separately
+func readMatroska(r io.ReaderAt, size int64) (matroskaIndex, error) {
+	return readMatroskaWithCoverage(r, size, true)
+}
+
+// readMatroskaWithCoverage is readMatroska with the cluster-coverage sample
+// made optional. A remote HTTP read skips it because every sampled block
+// header is a separate range request; the cues still have to name the video
+// track, but the sample that catches a muxer leaving most keyframes out of
+// them is local-only.
+func readMatroskaWithCoverage(r io.ReaderAt, size int64, checkCoverage bool) (matroskaIndex, error) { //nolint:funlen,gocyclo // upstream readMatroska exceeds Vio's 100-line and complexity-30 limits; refactor tracked separately
 	id, dataSize, headerLen, err := readElementHeader(r, 0)
 	if err != nil {
 		if isShortRead(err) {
@@ -261,8 +270,10 @@ func readMatroska(r io.ReaderAt, size int64) (matroskaIndex, error) { //nolint:f
 		// a boundary a segment can start at.
 		return matroskaIndex{}, ErrNoIndex
 	}
-	if err := checkCueCoverage(r, segStart, segEnd, video, ticks, clusters); err != nil {
-		return matroskaIndex{}, err
+	if checkCoverage {
+		if err := checkCueCoverage(r, segStart, segEnd, video, ticks, clusters); err != nil {
+			return matroskaIndex{}, err
+		}
 	}
 	idx := Index{Keyframes: make([]float64, len(ticks))}
 	for i, t := range ticks {
