@@ -10650,9 +10650,10 @@ func pausedVersionSwitchRequestV3(f *pausedVersionSwitchFixtureV3, started playb
 // the version while paused must keep the source position and the paused state,
 // must not tear down a healthy HLS generation merely because the viewer paused,
 // must reuse the session's HLS transport identity while rebuilding exactly one
-// generation for the new version, and must refuse a queued duplicate of the
-// switch while that switch owns the replan lease.
-func TestHandleReplanPlaybackV3VersionSwitchWhilePausedKeepsPlayheadAndPause(t *testing.T) { //nolint:funlen,gocyclo // the manual switch, automatic fallback, and queued-duplicate race share one paused HLS fixture; splitting duplicates its setup.
+// generation for the new version, must resume a pinned progressive start at the
+// paused position, and must refuse a queued duplicate of the switch while that
+// switch owns the replan lease.
+func TestHandleReplanPlaybackV3VersionSwitchWhilePausedKeepsPlayheadAndPause(t *testing.T) { //nolint:funlen,gocyclo // the manual switch, pinned progressive start, automatic fallback, and queued-duplicate race share one paused fixture; splitting duplicates its setup.
 	const pausedAt = 100.0
 
 	t.Run("hls manual quality pick", func(t *testing.T) {
@@ -10709,6 +10710,49 @@ func TestHandleReplanPlaybackV3VersionSwitchWhilePausedKeepsPlayheadAndPause(t *
 		}
 		if retained := f.handler.tm.GetRetainedTranscodeSession(started.SessionID); retained != before {
 			t.Fatal("the displaced generation was not retired exactly once")
+		}
+	})
+
+	t.Run("pinned file start on the progressive route", func(t *testing.T) {
+		f := newPausedVersionSwitchFixtureV3(t)
+		f.start.ClientPlaybackContext.Deliveries = map[string]playback.DeliveryCapabilityV3{
+			playback.DeliveryClassOriginalHTTPV3: {
+				Enabled: true, SupportedOnDevice: true,
+				Subtitles: playback.DeliverySubtitleCapabilitiesV3{EmbeddedText: true, SidecarText: true},
+			},
+		}
+		f.start.Capabilities.Containers = []string{"mkv", "matroska"}
+		started := startV3PlaybackForHandlerTest(t, f.handler, f.start)
+		if started.PlaybackPlan == nil || started.PlaybackPlan.Delivery != playback.DeliveryOriginalHTTPV3 {
+			t.Fatalf("start plan = %#v terminal = %+v, want direct play", started.PlaybackPlan, started.Terminal)
+		}
+		pausePlaybackAtV3(t, f.handler, started.SessionID, pausedAt)
+
+		// The client's version switch is a fresh start pinned to the other
+		// file. It must resume at the paused position and stay on that exact
+		// file; an explicit pin is never substituted.
+		pinned := f.start
+		pinned.FileID = f.alternate.ID
+		pinned.PlaybackAttemptID = "paused-pinned-version-attempt-0002"
+		pinned.FileSelection = playback.FileSelectionExplicitV3
+		pinned.AllowAlternateVersions = new(false)
+		pinned.StartPosition = new(pausedAt)
+		pinned.CarriedAudioTrackID = started.PlaybackPlan.SelectedTracks.Audio.ID
+		switched := startV3PlaybackForHandlerTest(t, f.handler, pinned)
+		if switched.PlaybackPlan == nil {
+			t.Fatalf("pinned start terminal = %+v", switched.Terminal)
+		}
+		if switched.SessionID == started.SessionID {
+			t.Fatal("pinned version switch reused the old playback session")
+		}
+		if switched.PlaybackPlan.EffectiveMediaFileID != f.alternate.ID {
+			t.Fatalf("pinned switch file = %d, want %d", switched.PlaybackPlan.EffectiveMediaFileID, f.alternate.ID)
+		}
+		if switched.PlaybackPlan.Timeline.SourceStartSeconds != pausedAt {
+			t.Fatalf("pinned switch position = %v, want %v", switched.PlaybackPlan.Timeline.SourceStartSeconds, pausedAt)
+		}
+		if !strings.HasPrefix(switched.PlaybackPlan.Stream.URL, "/stream/"+switched.SessionID) {
+			t.Fatalf("pinned switch stream = %q, want the new session's direct stream", switched.PlaybackPlan.Stream.URL)
 		}
 	})
 
