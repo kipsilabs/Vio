@@ -3450,9 +3450,7 @@ func (h *StreamHandler) syncSessionsNow(ctx context.Context, reason string) {
 	if h == nil || h.SessionSyncer == nil {
 		return
 	}
-	if err := h.SessionSyncer.SyncNow(ctx); err != nil {
-		slog.ErrorContext(ctx, "failed to sync sessions", "component", "api", "reason", reason, "error", err)
-	}
+	logSyncSessionsFailure(ctx, reason, h.SessionSyncer.SyncNow(ctx))
 }
 
 func (h *StreamHandler) finalizeSessionAbort(ctx context.Context, session *playback.Session, syncNow bool, syncReason string) {

@@ -2241,13 +2241,39 @@ func (h *PlaybackHandler) buildAdminHistoryEntry(
 	return entry, nil
 }
 
+// syncSessionsTeardownRace reports whether a sync error is the sync's own
+// context ending rather than a failure to reach the session store. A replan
+// schedules its after-commit sync on a detached context whose teardown can
+// already have run by the time the sync starts, so the call returns
+// context.Canceled even though the replan itself succeeded. The periodic
+// reconcile retries the snapshot, so that race is a debug event; a store
+// error, or a context error on a live context, stays a real failure.
+func syncSessionsTeardownRace(ctx context.Context, err error) bool {
+	if ctx == nil || ctx.Err() == nil {
+		return false
+	}
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+// logSyncSessionsFailure records a failed session sync at the level its cause
+// warrants.
+func logSyncSessionsFailure(ctx context.Context, reason string, err error) {
+	if err == nil {
+		return
+	}
+	if syncSessionsTeardownRace(ctx, err) {
+		slog.DebugContext(ctx, "session sync stopped with its own context",
+			"component", "api", "reason", reason, "error", err)
+		return
+	}
+	slog.ErrorContext(ctx, "failed to sync sessions", "component", "api", "reason", reason, "error", err)
+}
+
 func (h *PlaybackHandler) syncSessionsNow(ctx context.Context, reason string) {
 	if h.SessionSyncer == nil {
 		return
 	}
-	if err := h.SessionSyncer.SyncNow(ctx); err != nil {
-		slog.ErrorContext(ctx, "failed to sync sessions", "component", "api", "reason", reason, "error", err)
-	}
+	logSyncSessionsFailure(ctx, reason, h.SessionSyncer.SyncNow(ctx))
 }
 
 // syncSessionsOnPauseChange syncs after a progress sample only when it flips
