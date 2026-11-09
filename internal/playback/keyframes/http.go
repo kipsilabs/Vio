@@ -16,6 +16,14 @@ import (
 // playback can retry the same source.
 var ErrTransient = errors.New("keyframes: transient source read failure")
 
+// errRangeUnsupported declines an origin that does not honor byte ranges.
+// ReadHTTP reads an index only through bounded Range requests; an origin that
+// answers every request with the whole file would make a metadata read near
+// EOF cost the media's length, which is exactly the download the remote reader
+// exists to avoid. Reporting ErrNoIndex makes callers fall back to FFmpeg's
+// growing playlist, which needs no index.
+var errRangeUnsupported = fmt.Errorf("%w: source ignores byte ranges", ErrNoIndex)
+
 const (
 	// httpRangeReadBudget bounds one remote index read. The quick Matroska
 	// scan reads a handful of metadata elements; a source that needs more
@@ -29,8 +37,14 @@ const (
 // requests, without downloading the media. It runs the quick check only: the
 // cluster-coverage sample is skipped because it costs one request per block
 // header, and a remote relay bills every range. A source whose container
-// index is incomplete therefore plans from the cues it declares; the segment
-// recovery path re-probes any segment that turns out not to line up.
+// index is incomplete therefore plans from the cues it declares; a missing
+// segment is recovered by a seek restart at the plan's own boundary rather
+// than by re-reading the source.
+//
+// A source whose origin ignores Range is declined with ErrNoIndex. Reading it
+// through prefix discards would stream the file from zero for every metadata
+// read, so the caller keeps FFmpeg's growing playlist instead (see
+// errRangeUnsupported).
 //
 // The returned Index carries Duration but never VideoEnd, because only the
 // full cluster verification knows where the video track ends. Callers that
@@ -39,12 +53,15 @@ func ReadHTTP(ctx context.Context, client *http.Client, source string) (Index, e
 	if client == nil {
 		client = http.DefaultClient
 	}
-	size, err := httpSourceSize(ctx, client, source)
+	size, rangeSupported, err := httpSourceSize(ctx, client, source)
 	if err != nil {
 		return Index{}, err
 	}
 	if size <= 0 {
 		return Index{}, fmt.Errorf("%w: empty source", ErrTransient)
+	}
+	if !rangeSupported {
+		return Index{}, errRangeUnsupported
 	}
 	r := &httpRangeReaderAt{
 		ctx:      ctx,
@@ -55,6 +72,13 @@ func ReadHTTP(ctx context.Context, client *http.Client, source string) (Index, e
 		maxReads: httpRangeReadCount,
 	}
 	m, err := readMatroskaWithCoverage(r, size, false)
+	if r.nonRange {
+		// A HEAD that reported a length does not prove the origin honors
+		// Range on a GET. The parser may have wrapped the reader's sentinel
+		// (or turned the first 200 into a short read); declining is the only
+		// verdict the reader can reach, so report it plainly.
+		return Index{}, errRangeUnsupported
+	}
 	if err != nil {
 		return Index{}, settleHTTPIndexError(err)
 	}
@@ -79,18 +103,20 @@ func settleHTTPIndexError(err error) error {
 
 // httpSourceSize reports the source's length without reading its body. A HEAD
 // is preferred; a Range request that asks for the first byte covers origins
-// (and relays) that answer HEAD with 405/501 or no length.
-func httpSourceSize(ctx context.Context, client *http.Client, source string) (int64, error) {
+// (and relays) that answer HEAD with 405/501 or no length. The bool reports
+// whether the origin honored that Range request; a HEAD answer cannot tell, so
+// it is assumed to support ranges and the first real read verifies it.
+func httpSourceSize(ctx context.Context, client *http.Client, source string) (int64, bool, error) {
 	request, err := http.NewRequestWithContext(ctx, http.MethodHead, source, nil)
 	if err != nil {
-		return 0, fmt.Errorf("%w: %w", ErrTransient, err)
+		return 0, false, fmt.Errorf("%w: %w", ErrTransient, err)
 	}
 	response, err := client.Do(request)
 	if err == nil {
 		_ = response.Body.Close()
 		if response.StatusCode >= 200 && response.StatusCode < 300 {
 			if length, parseErr := strconv.ParseInt(strings.TrimSpace(response.Header.Get("Content-Length")), 10, 64); parseErr == nil && length > 0 {
-				return length, nil
+				return length, true, nil
 			}
 		}
 	}
@@ -98,29 +124,31 @@ func httpSourceSize(ctx context.Context, client *http.Client, source string) (in
 }
 
 // httpRangeSourceSize asks for the first byte and reads the total from
-// Content-Range, or Content-Length when the origin ignored the Range.
-func httpRangeSourceSize(ctx context.Context, client *http.Client, source string) (int64, error) {
+// Content-Range, or Content-Length when the origin ignored the Range. A 200
+// means the origin does not honor byte ranges, and the bool reports that so
+// the caller can decline before any read streams the file.
+func httpRangeSourceSize(ctx context.Context, client *http.Client, source string) (int64, bool, error) {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, source, nil)
 	if err != nil {
-		return 0, fmt.Errorf("%w: %w", ErrTransient, err)
+		return 0, false, fmt.Errorf("%w: %w", ErrTransient, err)
 	}
 	request.Header.Set("Range", "bytes=0-0")
 	response, err := client.Do(request)
 	if err != nil {
-		return 0, fmt.Errorf("%w: %w", ErrTransient, err)
+		return 0, false, fmt.Errorf("%w: %w", ErrTransient, err)
 	}
 	defer func() { _ = response.Body.Close() }()
 	switch response.StatusCode {
 	case http.StatusPartialContent:
 		if total := totalFromContentRange(response.Header.Get("Content-Range")); total > 0 {
-			return total, nil
+			return total, true, nil
 		}
 	case http.StatusOK:
 		if length, parseErr := strconv.ParseInt(strings.TrimSpace(response.Header.Get("Content-Length")), 10, 64); parseErr == nil && length > 0 {
-			return length, nil
+			return length, false, nil
 		}
 	}
-	return 0, fmt.Errorf("%w: source length unavailable (HTTP %d)", ErrTransient, response.StatusCode)
+	return 0, false, fmt.Errorf("%w: source length unavailable (HTTP %d)", ErrTransient, response.StatusCode)
 }
 
 // totalFromContentRange parses "bytes 0-0/12345" and returns 12345.
@@ -150,6 +178,10 @@ type httpRangeReaderAt struct {
 	maxReads int
 	read     int64
 	reads    int
+	// nonRange records that the origin answered a Range request with the
+	// whole file. ReadHTTP turns that into a decline even when the parser
+	// reports a different error for the failed read.
+	nonRange bool
 }
 
 func (r *httpRangeReaderAt) ReadAt(p []byte, off int64) (int, error) {
@@ -161,6 +193,9 @@ func (r *httpRangeReaderAt) ReadAt(p []byte, off int64) (int, error) {
 	}
 	if off >= r.size {
 		return 0, io.EOF
+	}
+	if r.nonRange {
+		return 0, errRangeUnsupported
 	}
 	end := off + int64(len(p)) - 1
 	if end >= r.size {
@@ -187,14 +222,13 @@ func (r *httpRangeReaderAt) ReadAt(p []byte, off int64) (int, error) {
 	case http.StatusPartialContent:
 		return readRangeBody(response.Body, p)
 	case http.StatusOK:
-		// An origin that ignores Range streams the file from zero. Discard
-		// the prefix and take only the requested window.
-		if off > 0 {
-			if _, err := io.CopyN(io.Discard, response.Body, off); err != nil {
-				return 0, fmt.Errorf("%w: %w", ErrTransient, err)
-			}
-		}
-		return readRangeBody(response.Body, p)
+		// The origin ignored Range and is streaming the file from byte zero.
+		// Discarding `off` bytes would make a metadata read near EOF cost the
+		// whole media, unbounded by the read budget, so decline without
+		// reading the body. The caller falls back to FFmpeg's growing
+		// playlist (see errRangeUnsupported).
+		r.nonRange = true
+		return 0, errRangeUnsupported
 	case http.StatusRequestedRangeNotSatisfiable:
 		return 0, io.EOF
 	default:
