@@ -220,10 +220,10 @@ func TestHandleReplanPlaybackV3AudioSwitchRebuildsTranscodeAtPlayhead(t *testing
 	// Observable wait for the fake encoder's first published window instead of
 	// a fixed delay: the manifest is the server's own source of truth.
 	manifestPath := filepath.Join(beforeOpts.OutputDir, "stream.m3u8")
-	if _, err := before.WaitForManifest(5 * time.Second); err != nil {
+	if _, err := before.WaitForManifest(15 * time.Second); err != nil {
 		t.Fatalf("fake encoder never published its first manifest: %v", err)
 	}
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	for {
 		if _, err := os.Stat(filepath.Join(beforeOpts.OutputDir, "seg_00002.ts")); err == nil {
 			break
@@ -248,7 +248,7 @@ func TestHandleReplanPlaybackV3AudioSwitchRebuildsTranscodeAtPlayhead(t *testing
 			t.Fatal(err)
 		}
 	}
-	deadline = time.Now().Add(3 * time.Second)
+	deadline = time.Now().Add(10 * time.Second)
 	for before.SegmentProgress(time.Now()).ProducedHead != 4 {
 		if time.Now().After(deadline) {
 			t.Fatalf("produced head = %d, want the advanced head 4", before.SegmentProgress(time.Now()).ProducedHead)

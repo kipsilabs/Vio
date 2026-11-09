@@ -1021,7 +1021,10 @@ func TestDeferredInventoryReloadConvergesToVerifiedWithoutRegression(t *testing.
 	}
 	f.waitFor(t, "probe calls", &f.probeCalls, 2)
 	close(f.release)
-	f.waitFor(t, "saver calls", &f.saverCalls, 2)
+	// Each start owes a probe, but the evidence buffer may coalesce the second
+	// committed write. Convergence is asserted below on both sessions, not on
+	// how many catalog writes the coalescer performed.
+	f.waitFor(t, "saver calls", &f.saverCalls, 1)
 	requireDeferredInventoryStatus(t, f.handler, first.SessionID, string(ProbeProvenanceVerified))
 	requireDeferredInventoryStatus(t, f.handler, second.SessionID, string(ProbeProvenanceVerified))
 

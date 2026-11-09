@@ -10720,6 +10720,10 @@ func TestHandleReplanPlaybackV3VersionSwitchWhilePausedKeepsPlayheadAndPause(t *
 		if started.PlaybackPlan == nil || started.PlaybackPlan.EffectiveMediaFileID != f.source.ID {
 			t.Fatalf("start plan = %#v terminal = %+v", started.PlaybackPlan, started.Terminal)
 		}
+		before := f.handler.tm.GetTranscodeSession(started.SessionID)
+		if before == nil {
+			t.Fatal("HLS start registered no transcode generation")
+		}
 		pausePlaybackAtV3(t, f.handler, started.SessionID, pausedAt)
 
 		request := pausedVersionSwitchRequestV3(f, started, "paused-auto-version-0001", playback.QualityAutoV3, 12)
@@ -10737,6 +10741,10 @@ func TestHandleReplanPlaybackV3VersionSwitchWhilePausedKeepsPlayheadAndPause(t *
 		}
 		if plan.Timeline.SourceStartSeconds != pausedAt {
 			t.Fatalf("automatic fallback source position = %v, want %v", plan.Timeline.SourceStartSeconds, pausedAt)
+		}
+		after := f.handler.tm.GetTranscodeSession(started.SessionID)
+		if after == nil || after == before || after.GenerationToken() == before.GenerationToken() {
+			t.Fatal("automatic fallback did not publish a replacement generation")
 		}
 		assertPausedPlayheadV3(t, f.handler, started.SessionID, pausedAt)
 	})
