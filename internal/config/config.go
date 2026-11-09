@@ -273,7 +273,8 @@ type PlaybackConfig struct {
 	Routing                    PlaybackRoutingPolicy `yaml:"-"`
 	MaxVirtualFailoverAttempts int                   `yaml:"max_virtual_failover_attempts"`
 	// KeyframePlaylist is playback.copy_keyframe_playlist: copy-remux HLS
-	// from one complete keyframe-planned playlist (#1466).
+	// from one complete keyframe-planned VOD playlist (#1466), which makes
+	// seeking native.
 	KeyframePlaylist bool `yaml:"-"`
 	// AutomaticBandwidthProbeOff is playback.bandwidth_probe_automatic turned
 	// off, so a zero config keeps automatic speed tests on.

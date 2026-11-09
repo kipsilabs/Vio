@@ -6799,6 +6799,37 @@ func configureCopyRemuxTimelineV3(plan *playback.PlanV3, origin float64) {
 	plan.Timeline.SeekRestoration = "source_position"
 }
 
+// configureCopyVODTimelineV3 publishes a planned copy session's complete
+// playlist as a seekable source-timeline window. The player clock starts at
+// the playlist's own origin (the first copied keyframe, normally zero), and
+// both ends of the window are known, so a client seeks natively by requesting
+// the target segment. The segment layer restarts FFmpeg in place at that
+// segment's planned boundary when it has not been produced yet; the transport
+// and the playlist stay exactly as they are.
+func configureCopyVODTimelineV3(plan *playback.PlanV3, vod playback.CopyVODPlan) {
+	if plan == nil || vod.Duration <= 0 {
+		return
+	}
+	origin := max(0, vod.Origin)
+	end := origin + vod.Duration
+	requested := plan.Timeline.SourceStartSeconds
+	if requested < origin {
+		requested = origin
+	}
+	if requested > end {
+		requested = end
+	}
+	windowStart := origin
+	windowEnd := end
+	plan.Timeline.PlayerStartSeconds = max(0, requested-origin)
+	plan.Timeline.StreamOriginSeconds = origin
+	plan.Timeline.TimelineOffsetSeconds = origin
+	plan.Timeline.SeekWindowStartSeconds = &windowStart
+	plan.Timeline.SeekWindowEndSeconds = &windowEnd
+	plan.Timeline.CanSeekAnywhere = true
+	plan.Timeline.SeekRestoration = "source_position"
+}
+
 func appendPlaybackQueryV3(rawURL, key, value string) string {
 	separator := "?"
 	if strings.ContainsRune(rawURL, '?') {
@@ -7200,6 +7231,14 @@ func (h *PlaybackHandler) prepareLocalTransportV3(r *http.Request, session *play
 			reason:  candidateSourceDecodeRejectedReasonV3,
 			message: candidateSourceDecodeRejectedMessageV3,
 		}
+	}
+	// A copy session that planned the whole media as one VOD playlist is
+	// genuinely seekable: every segment boundary is known before FFmpeg starts,
+	// so the client can request any segment directly. Publish that full window
+	// instead of the copy pre-roll window, whose open end forced every seek
+	// back through a replan.
+	if vod, ok := ts.CopyVODPlan(); ok {
+		configureCopyVODTimelineV3(result.Plan, vod)
 	}
 	cardOpts := ts.Opts()
 	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(file.FilePath)), "virtual://") {
@@ -12646,16 +12685,17 @@ func reuseEligibleDeliveryV3(delivery playback.DeliveryV3) bool {
 // seekReanchorWithinActiveWindowV3 reports whether a seek target can be served
 // in place by the active transport's window. Only a segment-addressable HLS
 // transport can: its manifest resolves an arbitrary position against the
-// growing generation, and the segment layer restarts FFmpeg in place for
-// targets past the produced head. A progressive remux response is a single
-// continuous byte stream from its original start, so reusing it for a seek
-// hands the client a URL whose bytes already (or never) cover the target; a
-// progressive reanchor must rebuild instead.
+// generation's timeline. A progressive remux response is a single continuous
+// byte stream from its original start, so reusing it for a seek hands the
+// client a URL whose bytes already (or never) cover the target; a progressive
+// reanchor must rebuild instead.
 //
 // A target before an HLS window's start needs a fresh generation (the reused
-// one cannot produce bytes before its origin); a target past the produced head
-// is deliberately allowed through. A closed window end is honored so reuse
-// never claims a range the transport no longer serves.
+// one cannot produce bytes before its origin). A closed window end is honored
+// so reuse never claims a range the transport no longer serves. A growing
+// playlist publishes no end, so this check alone cannot tell whether the target
+// has been produced; seekReanchorWithinActiveWindowV3 on the handler adds that
+// comparison against the live session's produced head.
 //
 // A can_seek_anywhere plan publishes no window start, but the reused generation
 // still begins at a known stream origin: the segment layer can only serve

@@ -145,10 +145,12 @@ const (
 )
 
 // PlaybackKeyframePlaylistSettingKey serves copy-remux HLS as one complete
-// playlist planned from the source's keyframes, instead of FFmpeg's growing
-// one (#1466). It is off while restarts in the middle of such a stream are
-// still being built; a planned stream that has to restart starts again from
-// the beginning.
+// VOD playlist planned from the source's keyframes, instead of FFmpeg's
+// growing one (#1466). A complete playlist makes seeking native: the client
+// asks for the target segment, and a session that has not produced it yet
+// restarts its copy process at that segment's planned boundary without
+// rebuilding the transport. It is on by default; disabling it falls back to
+// FFmpeg's growing playlist and server-side seek reanchors.
 const PlaybackKeyframePlaylistSettingKey = "playback.copy_keyframe_playlist"
 
 // The connection speed test's schedule, delivered to clients with the probe
@@ -682,7 +684,7 @@ var adminSettingDefaults = map[string]string{
 	"catalog.search.meilisearch.embedder":                 "vio_recommendations",
 	"catalog.search.meilisearch.binary_quantized":         "false",
 
-	PlaybackKeyframePlaylistSettingKey: "false",
+	PlaybackKeyframePlaylistSettingKey: "true",
 
 	PlaybackBandwidthProbeAutomaticSettingKey:  "true",
 	PlaybackBandwidthProbeMaxAgeDaysSettingKey: strconv.Itoa(DefaultBandwidthProbeMaxAgeDays),

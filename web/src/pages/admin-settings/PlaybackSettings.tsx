@@ -566,8 +566,8 @@ export default function PlaybackSettings() {
             <SettingField
               label="Complete playlists for copied video"
               type="toggle"
-              description="Experimental. When Silo copies a file's video, list every segment from the start, using the file's keyframes, instead of a playlist that grows as Silo copies. Stops Safari freezing partway through. A seek ahead of what Silo has copied waits for it to get there."
-              value={form.getValue("playback.copy_keyframe_playlist") || "false"}
+              description="When Silo copies a file's video, list every segment from the start, using the file's keyframes, instead of a playlist that grows as Silo copies. Seeking is native: the player asks for the target segment and Silo copies it from the source. Also stops Safari freezing partway through. Turn this off only if a copy route misbehaves."
+              value={form.getValue("playback.copy_keyframe_playlist") || "true"}
               onChange={(v) => form.setValue("playback.copy_keyframe_playlist", v)}
               restartRequired={restartKeys.has("playback.copy_keyframe_playlist")}
             />
