@@ -52,11 +52,10 @@ const copySeekBiasSeconds = 0.5
 // starting at start. A keyframe immediately after the boundary leaves little
 // room, so the request moves to the midpoint between the two; the demuxer
 // resolves it to the boundary whenever the request lands inside its interval.
+// copySeekBiases only calls this with a keyframe after start (or +Inf for the
+// final boundary), so the gap is always positive.
 func copySeekBias(nextKeyframe, start float64) float64 {
 	gap := nextKeyframe - start
-	if gap <= 0 {
-		return copySeekBiasSeconds
-	}
 	return min(copySeekBiasSeconds, gap/2)
 }
 
