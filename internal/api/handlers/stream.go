@@ -1257,8 +1257,8 @@ const (
 // request context, so the viewer navigating away already aborted it. Answering
 // 502 there records a server-error and logs a virtual_stream_unavailable ERROR
 // for a request whose client never saw it. A 4xx request-timeout keeps the
-// response honest for a half-closed client and lets the activity log record the
-// attempt as abandoned.
+// response honest for a half-closed client and keeps the outcome in the client
+// error class instead of counting a server error.
 func virtualProxyFailureStatus(ctx context.Context, proxyErr error) (status int, code, message string) {
 	if isClientCancellation(ctx, proxyErr) {
 		return http.StatusRequestTimeout, virtualProxyDispositionClientCanceled, "Client closed the request"
