@@ -1,9 +1,11 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,7 +13,9 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -124,6 +128,102 @@ func warmArgsLogScript(argsLog, gate string) string {
 		"esac\n"
 }
 
+// warmPidLogScript is warmArgsLogScript plus a pid log: a full-track warm
+// records its own process id before blocking on the gate, so a test can tell a
+// resumed warm (phase 1 yields the pipe to an admitted page and resumes) from
+// a second concurrent warm for the same identity.
+func warmPidLogScript(argsLog, gate, pidLog string) string {
+	return "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '" + argsLog + "'\n" +
+		"case \"$*\" in\n" +
+		"  *-ss*)\n    cat <<'VTT'\n" + warmSubtitleVTT + "VTT\n    ;;\n" +
+		"  *)\n    printf '%s\\n' \"$$\" >> '" + pidLog + "'\n" +
+		"    while [ ! -f '" + gate + "' ]; do sleep 0.01; done\n    cat <<'VTT'\n" + warmSubtitleVTT + "VTT\n    ;;\n" +
+		"esac\n"
+}
+
+// readWarmProcesses returns the process ids of the full-track warms logged so
+// far. A writer appends one pid per line, so a torn trailing line is skipped.
+func readWarmProcesses(t *testing.T, pidLog string) []int {
+	t.Helper()
+	data, err := os.ReadFile(pidLog)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pids []int
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		pid, err := strconv.Atoi(strings.TrimSpace(line))
+		if err != nil {
+			continue
+		}
+		pids = append(pids, pid)
+	}
+	return pids
+}
+
+// warmLogBuffer collects the cache's warm log lines. The detached warm logs
+// from its own goroutine while the test reads, so the buffer is guarded.
+type warmLogBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *warmLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *warmLogBuffer) count(marker string) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return strings.Count(b.buf.String(), marker)
+}
+
+func (b *warmLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// waitForWarmProcesses waits until want full-track warm processes have logged
+// their pid, then returns every pid seen. Reaching two means the admitted page
+// yielded the first warm and it resumed, so the two processes are one logical
+// warm rather than a duplicated fill.
+func waitForWarmProcesses(t *testing.T, pidLog string, want int) []int {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if pids := readWarmProcesses(t, pidLog); len(pids) >= want {
+			return pids
+		}
+		//nolint:forbidigo // Polls the warm pid log: observable state the fake ffmpeg appends to, not a timing guess.
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("full-track warm processes = %d, want %d: the admitted page must yield the first warm and it must resume",
+		len(readWarmProcesses(t, pidLog)), want)
+	return nil
+}
+
+// liveProcessCount reports how many of pids are still running. The killed
+// extract of a yielded warm is waited on before the resume starts, so its pid
+// is already gone here and only a concurrent duplicate would still be alive.
+func liveProcessCount(pids []int) int {
+	live := 0
+	for _, pid := range pids {
+		p, err := os.FindProcess(pid)
+		if err != nil {
+			continue
+		}
+		if err := p.Signal(syscall.Signal(0)); err == nil {
+			live++
+		}
+	}
+	return live
+}
+
 func ffmpegLogLines(t *testing.T, argsLog string) (window, warm int) {
 	t.Helper()
 	data, err := os.ReadFile(argsLog)
@@ -171,16 +271,32 @@ func waitForCommittedTextEntry(t *testing.T, c *playback.SubtitleCache, identity
 }
 
 // A windowed virtual text miss must stream its own window and then start
-// exactly one detached full-track warm under the serve identity. A second
-// window miss while that warm is in flight must not start a second fill.
-func TestVirtualTextWindowMissWarmsOnceWithServeIdentity(t *testing.T) {
+// exactly one logical detached full-track warm under the serve identity. A
+// second window miss while that warm is in flight must not start a second fill.
+//
+// One logical warm can spawn two ffmpeg processes: an admitted page yields the
+// running warm (phase 1 cancels its extract with ErrSubtitleWarmCanceled and
+// resumes it once the page settles), so the process count is not the warm
+// count. The assertions below count logical warms — a resumed warm is the same
+// run — and prove the two processes never overlapped.
+func TestVirtualTextWindowMissStartsOneLogicalWarmWithServeIdentity(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell script test helper is unix-only")
 	}
 	dir := t.TempDir()
 	argsLog := filepath.Join(dir, "ffmpeg.args")
+	pidLog := filepath.Join(dir, "ffmpeg.warm.pids")
 	gate := filepath.Join(dir, "warm.gate")
-	handler, session, file, _ := newVirtualSubtitleWindowFixture(t, dir, warmArgsLogScript(argsLog, gate))
+	// The cache logs one "warm started" per admitted logical warm, before its
+	// first extract, so the log is the only place a duplicate fill shows up
+	// even when relay admission sheds the duplicate before ffmpeg runs.
+	warmLogs := &warmLogBuffer{}
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(warmLogs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	// Registered before the fixture, so LIFO restores the logger after the
+	// fixture has waited for its detached warms to settle.
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+	handler, session, file, _ := newVirtualSubtitleWindowFixture(t, dir, warmPidLogScript(argsLog, gate, pidLog))
 	// Always release the warm, even if an assertion fails, so the blocked fake
 	// ffmpeg cannot outlive the test. Registered after the fixture's wait
 	// cleanup so LIFO releases the gate before the wait blocks on it.
@@ -205,6 +321,14 @@ func TestVirtualTextWindowMissWarmsOnceWithServeIdentity(t *testing.T) {
 		t.Fatalf("second window: status=%d body=%q", rec.Code, rec.Body.String())
 	}
 
+	// The second miss was served from an admitted page, which yielded the
+	// warm. Wait for its resume, so both run ids are recorded and the second
+	// one is known to belong to the same logical warm.
+	warmPids := waitForWarmProcesses(t, pidLog, 2)
+	if live := liveProcessCount(warmPids); live != 1 {
+		t.Fatalf("concurrent full-track warms = %d, want 1: a resumed warm is one logical run", live)
+	}
+
 	// Release the warm and wait for the entry it commits.
 	if err := os.WriteFile(gate, []byte("go"), 0o644); err != nil {
 		t.Fatal(err)
@@ -216,8 +340,18 @@ func TestVirtualTextWindowMissWarmsOnceWithServeIdentity(t *testing.T) {
 	if window != 2 {
 		t.Fatalf("windowed extracts = %d, want 2", window)
 	}
-	if warm != 1 {
-		t.Fatalf("full-track warms = %d, want exactly 1 (coalesced)", warm)
+	// One logical warm: the cache admits one fill and logs one "warm started".
+	// Phase 1 may run its extract twice (the admitted page cancels the first,
+	// the warm resumes), so process spawns are not the warm count — but a
+	// second window miss that started its own fill would log a second start.
+	if logical := warmLogs.count("subtitle cache warm started"); logical != 1 {
+		t.Fatalf("logical full-track warms = %d, want exactly 1: the second window miss must not start a second fill\n%s",
+			logical, warmLogs.String())
+	}
+	// The single logical warm spawns one process and, after the yielded page
+	// settles, one resume.
+	if warm != 2 {
+		t.Fatalf("full-track ffmpeg runs = %d, want 2 (one logical warm: extract + phase-1 resume)", warm)
 	}
 }
 
