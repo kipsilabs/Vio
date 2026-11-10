@@ -192,7 +192,7 @@ describe("useSubtitleTracks", () => {
     videoRef.current!.dispatchEvent(new Event("timeupdate"));
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
-    expect(String(fetchMock.mock.calls[1]![0])).toContain("position=578");
+    expect(String(fetchMock.mock.calls[1]![0])).toContain("position=570");
   });
 
   it("stops prefetching once the window reaches the media duration", async () => {
@@ -225,8 +225,50 @@ describe("useSubtitleTracks", () => {
     });
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
-    expect(String(fetchMock.mock.calls[0]![0])).toContain("position=1398&duration=120");
+    expect(String(fetchMock.mock.calls[0]![0])).toContain("position=1380&duration=120");
     expect(String(fetchMock.mock.calls[0]![0])).toContain("token=abc");
+  });
+
+  it("snaps a resumed position to the window grid so nearby polls share one request", async () => {
+    fetchMock.mockResolvedValue(vttResponse("WEBVTT\n\n23:20.000 --> 23:22.000\nresumed\n\n"));
+
+    // 100.5 s is inside the [90, 210) grid cell: a poll at 101.2 s must ask
+    // for the same window instead of re-demuxing 115 of 120 s.
+    renderTracks({
+      origin: 0,
+      durationRef: { current: 7200 },
+      anchorRef: { current: 100.5 },
+      readyState: 0,
+    });
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(String(fetchMock.mock.calls[0]![0])).toContain("position=90&duration=120");
+  });
+
+  it("coalesces a burst of identical in-flight window requests", async () => {
+    let releaseFetch: ((value: unknown) => void) | undefined;
+    fetchMock.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          releaseFetch = resolve;
+        }),
+    );
+
+    const { videoRef } = renderTracks({ origin: 0, durationRef: { current: 7200 } });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+    // timeupdate + seeking/seeked bursts can arrive within a few milliseconds.
+    for (const time of [1, 2, 3]) {
+      videoRef.current!.currentTime = time;
+      videoRef.current!.dispatchEvent(new Event("timeupdate"));
+      videoRef.current!.dispatchEvent(new Event("seeking"));
+      videoRef.current!.dispatchEvent(new Event("seeked"));
+    }
+    await new Promise((r) => setTimeout(r, 10));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    releaseFetch?.(vttResponse("WEBVTT\n\n00:00:01.000 --> 00:00:03.000\nburst\n\n"));
+    await waitFor(() => expect(createdTracks[0]?.cues.map((c) => c.text)).toEqual(["burst"]));
   });
 
   it("resets and refetches on a forward seek past the covered window", async () => {
@@ -245,7 +287,7 @@ describe("useSubtitleTracks", () => {
     videoRef.current!.dispatchEvent(new Event("seeked"));
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
-    expect(String(fetchMock.mock.calls[1]![0])).toContain("position=1398");
+    expect(String(fetchMock.mock.calls[1]![0])).toContain("position=1380");
     // Reset dropped the old window's cues and loaded the new window's.
     await waitFor(() => expect(createdTracks[0]!.cues.map((c) => c.text)).toEqual(["late"]));
   });
@@ -667,7 +709,7 @@ describe("useSubtitleTracks", () => {
       now += 6_000;
       videoRef.current!.dispatchEvent(new Event("timeupdate"));
       await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
-      expect(String(fetchMock.mock.calls[2]![0])).toContain("position=115");
+      expect(String(fetchMock.mock.calls[2]![0])).toContain("position=90");
       await waitFor(() =>
         expect(createdTracks[0]!.cues.map((c) => c.text)).toEqual(["first", "second"]),
       );
@@ -790,7 +832,7 @@ describe("useSubtitleTracks", () => {
       videoRef.current!.currentTime = 1400;
       videoRef.current!.dispatchEvent(new Event("seeked"));
       await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
-      expect(String(fetchMock.mock.calls[2]![0])).toContain("position=1398");
+      expect(String(fetchMock.mock.calls[2]![0])).toContain("position=1380");
       await waitFor(() => expect(createdTracks[0]!.cues.map((c) => c.text)).toEqual(["late"]));
     } finally {
       nowSpy.mockRestore();
@@ -823,7 +865,7 @@ describe("useSubtitleTracks", () => {
       videoRef.current!.currentTime = 1400;
       videoRef.current!.dispatchEvent(new Event("seeked"));
       await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
-      expect(String(fetchMock.mock.calls[1]![0])).toContain("position=1398");
+      expect(String(fetchMock.mock.calls[1]![0])).toContain("position=1380");
       await waitFor(() => expect(createdTracks[0]!.cues.map((c) => c.text)).toEqual(["late"]));
     } finally {
       nowSpy.mockRestore();

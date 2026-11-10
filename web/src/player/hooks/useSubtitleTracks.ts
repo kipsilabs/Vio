@@ -31,6 +31,12 @@ const WINDOW_OVERLAP = 5;
 // Pull back this many seconds from the current position when starting
 // a fresh fetch, so a quick scrub back still lands inside the window.
 const SEEK_BACKOFF = 2;
+// Start windows on a coarse source-time grid instead of at the exact
+// playhead. Repeated polls while the playhead advances would otherwise ask
+// for a new 120 s window every second and re-demux almost the whole slice;
+// every position inside one grid cell asks for the same window, and the
+// server can answer a shifted request from a covering cached window.
+const WINDOW_ALIGN_SECONDS = 30;
 // Abort a window fetch when the response goes this long without delivering
 // a chunk. Extraction streams cues progressively, so a healthy-but-slow
 // ffmpeg keeps resetting the clock; only a genuinely hung one trips it.
@@ -191,10 +197,29 @@ function addCuesToTrack(
   }
 }
 
+/**
+ * Round a source position down to whole seconds, matching the ASS fetcher.
+ * The server keys a window on its exact `position` parameter, so two polls at
+ * 100.2 s and 100.8 s must produce the same request to share its cached slice.
+ */
+function wholeSecondPosition(position: number): number {
+  return Math.max(0, Math.floor(position));
+}
+
+/**
+ * Snap a fetch anchor to the window grid. The request starts up to one grid
+ * cell behind the playhead, so the current cue stays covered while every
+ * position in that cell shares one server window.
+ */
+function alignWindowStart(position: number): number {
+  const anchored = Math.max(0, position - SEEK_BACKOFF);
+  return Math.floor(anchored / WINDOW_ALIGN_SECONDS) * WINDOW_ALIGN_SECONDS;
+}
+
 /** Request the same bounded interval used by the coverage tracker. */
 function appendPosition(url: string, position: number): string {
   const sep = url.includes("?") ? "&" : "?";
-  return `${url}${sep}position=${position}&duration=${WINDOW_DURATION}`;
+  return `${url}${sep}position=${wholeSecondPosition(position)}&duration=${WINDOW_DURATION}`;
 }
 
 /**
@@ -476,6 +501,7 @@ export function useSubtitleTracks(
     let atEOF = restored?.atEOF ?? false;
     let inflight: AbortController | null = null;
     let inflightStart = 0;
+    let inflightURL: string | null = null;
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
     if (restored?.hasFetched) onLoadStateRef.current?.("ready");
     // Set on a failed (errored or stalled) window fetch; maybeFetch waits out
@@ -600,12 +626,32 @@ export function useSubtitleTracks(
     async function fetchWindow(seekStart: number | null, resetExisting: boolean) {
       if (!activeUrl) return;
 
+      // A player event burst can ask for the same window two or three times
+      // within a few milliseconds (timeupdate plus seeking/seeked). Restarting
+      // it aborts a healthy extraction and spawns a second ffmpeg for the same
+      // bytes, so coalesce onto the identical in-flight request.
+      const url = seekStart === null ? activeUrl : appendPosition(activeUrl, seekStart);
+      if (inflight && inflightURL === url) {
+        if (resetExisting) {
+          // Preserve the caller's reset intent without replacing the fetch:
+          // the in-flight window already covers this range.
+          if (retryTimer !== null) clearTimeout(retryTimer);
+          if (!placeholders) clearCues();
+          coverageStart = seekStart ?? 0;
+          windowEnd = seekStart ?? 0;
+          atEOF = false;
+          onLoadStateRef.current?.(placeholders ? "refreshing" : "loading");
+        }
+        return;
+      }
+
       // Only one window on the wire at a time: each fetch keeps an
       // ffmpeg process alive, double-fetching wastes that.
       inflight?.abort();
       const controller = new AbortController();
       inflight = controller;
       inflightStart = seekStart ?? 0;
+      inflightURL = url;
       if (retryTimer !== null) clearTimeout(retryTimer);
       if (resetExisting) onLoadStateRef.current?.(placeholders ? "refreshing" : "loading");
 
@@ -626,7 +672,6 @@ export function useSubtitleTracks(
         stallTimer = setTimeout(() => controller.abort(), FETCH_STALL_TIMEOUT_MS);
       };
 
-      const url = seekStart === null ? activeUrl : appendPosition(activeUrl, seekStart);
       let succeeded = false;
       lastResponseStatus = 0;
       try {
@@ -719,6 +764,7 @@ export function useSubtitleTracks(
         const superseded = inflight !== controller;
         if (inflight === controller) {
           inflight = null;
+          inflightURL = null;
         }
         if (succeeded && !cancelled && !superseded) {
           // A corrected window without cues still replaces the placeholders.
@@ -831,7 +877,7 @@ export function useSubtitleTracks(
         )
           return;
         // A seek outside the requested range must not wait for extraction.
-        fetchWindow(Math.max(0, mediaTime - SEEK_BACKOFF), true);
+        fetchWindow(alignWindowStart(mediaTime), true);
         return;
       }
       // Ahead of the backoff and terminal gates: a deliberate seek deserves a
@@ -848,7 +894,7 @@ export function useSubtitleTracks(
         if (seekNeedsFreshWindow) {
           resetFailureBudget();
           atEOF = false;
-          fetchWindow(Math.max(0, mediaTime - SEEK_BACKOFF), true);
+          fetchWindow(alignWindowStart(mediaTime), true);
           return;
         }
       }
@@ -863,21 +909,21 @@ export function useSubtitleTracks(
         return;
       }
       if (!hasFetched) {
-        fetchWindow(Math.max(0, mediaTime - SEEK_BACKOFF), true);
+        fetchWindow(alignWindowStart(mediaTime), true);
         return;
       }
       if (mediaTime < coverageStart - 1) {
         atEOF = false;
-        fetchWindow(Math.max(0, mediaTime - SEEK_BACKOFF), true);
+        fetchWindow(alignWindowStart(mediaTime), true);
         return;
       }
       if (mediaTime > windowEnd + 1) {
         atEOF = false;
-        fetchWindow(Math.max(0, mediaTime - SEEK_BACKOFF), true);
+        fetchWindow(alignWindowStart(mediaTime), true);
         return;
       }
       if (!atEOF && mediaTime > windowEnd - PREFETCH_LEAD) {
-        const nextStart = Math.max(windowEnd - WINDOW_OVERLAP, mediaTime);
+        const nextStart = alignWindowStart(Math.max(windowEnd - WINDOW_OVERLAP, mediaTime));
         fetchWindow(nextStart, false);
       }
     }
