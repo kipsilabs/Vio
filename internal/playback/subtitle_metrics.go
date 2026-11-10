@@ -70,7 +70,7 @@ var subtitleLayoutProbes = promauto.NewCounterVec(prometheus.CounterOpts{
 
 var subtitleRelayAdmissions = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "vio_subtitle_relay_admission_total",
-	Help: "Relay subtitle demux admission outcomes by class and relay source. Measurement only.",
+	Help: "Relay subtitle demux admission outcomes by class and relay source. Includes layout-probe admissions, which draw from the same per-source budgets. Measurement only.",
 }, []string{subtitleMetricLabelClass, subtitleMetricLabelResult, subtitleMetricLabelSource})
 
 var subtitleRelayAdmissionWait = promauto.NewHistogramVec(prometheus.HistogramOpts{

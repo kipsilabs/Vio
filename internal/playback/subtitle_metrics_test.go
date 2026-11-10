@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -23,6 +24,17 @@ func labeledCounterValue(t testing.TB, vec *prometheus.CounterVec, labels ...str
 		t.Fatalf("read counter %v: %v", labels, err)
 	}
 	return metric.GetCounter().GetValue()
+}
+
+// labeledHistogramSamples reads how many observations one labeled child of a
+// histogram vec has recorded.
+func labeledHistogramSamples(t testing.TB, vec *prometheus.HistogramVec, labels ...string) uint64 {
+	t.Helper()
+	metric := &dto.Metric{}
+	if err := vec.WithLabelValues(labels...).(prometheus.Metric).Write(metric); err != nil {
+		t.Fatalf("read histogram %v: %v", labels, err)
+	}
+	return metric.GetHistogram().GetSampleCount()
 }
 
 // delta wraps a counter read: it returns a function that reports how much the
@@ -208,20 +220,31 @@ func TestSubtitleLayoutProbeMetricsCountsRunsAndReuse(t *testing.T) {
 	if got := ranDelta(); got != 1 {
 		t.Fatalf("ran delta after skip = %v, want 1", got)
 	}
+
+	// A missing binary never spawns, so it is not a run either.
+	if _, err := ProbeSubtitleLayoutWithin(context.Background(), filepath.Join(t.TempDir(), "no-ffprobe"), "/media/movie.mkv", 5*time.Second); err == nil {
+		t.Fatal("missing-binary probe reported success")
+	}
+	if got := ranDelta(); got != 1 {
+		t.Fatalf("ran delta after spawn failure = %v, want 1", got)
+	}
 }
 
 // TestSubtitleRelayAdmissionMetricsCountsShedPerClass proves each admission
-// class reports its own admitted/shed outcome and that a local read, which is
-// never admitted, records nothing.
+// class reports its own admitted/shed outcome, that only the two waiting
+// classes observe a wait, and that a local read, which is never admitted,
+// records nothing.
 func TestSubtitleRelayAdmissionMetricsCountsShedPerClass(t *testing.T) {
 	cases := []struct {
-		name  string
-		class relayDemuxClass
-		label string
+		name         string
+		class        relayDemuxClass
+		label        string
+		waitsForSlot bool
 	}{
-		{name: "request", class: relayDemuxRequestPath, label: relayDemuxClassRequestLabel},
+		{name: "request", class: relayDemuxRequestPath, label: relayDemuxClassRequestLabel, waitsForSlot: true},
 		{name: "detached", class: relayDemuxDetached, label: relayDemuxClassDetachedLabel},
-		{name: "font", class: relayDemuxFont, label: relayDemuxClassFontLabel},
+		{name: "font", class: relayDemuxFont, label: relayDemuxClassFontLabel, waitsForSlot: true},
+		{name: "font_detached", class: relayDemuxFontDetached, label: relayDemuxClassFontLabel},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -230,6 +253,7 @@ func TestSubtitleRelayAdmissionMetricsCountsShedPerClass(t *testing.T) {
 			input := source + "/session/token"
 			admittedDelta := delta(t, subtitleRelayAdmissions, tc.label, "admitted", source)
 			shedDelta := delta(t, subtitleRelayAdmissions, tc.label, "shed", source)
+			waitBefore := labeledHistogramSamples(t, subtitleRelayAdmissionWait, tc.label)
 
 			release, ok := g.acquire(context.Background(), input, tc.class)
 			if !ok {
@@ -248,12 +272,26 @@ func TestSubtitleRelayAdmissionMetricsCountsShedPerClass(t *testing.T) {
 				t.Fatalf("shed delta = %v, want 1", got)
 			}
 
+			// Only a class that queues on a pool observes a wait: the two
+			// waiting classes record one per acquire attempt (admit and shed),
+			// and the two non-blocking classes record none.
+			wantWaits := uint64(0)
+			if tc.waitsForSlot {
+				wantWaits = 2
+			}
+			if got := labeledHistogramSamples(t, subtitleRelayAdmissionWait, tc.label) - waitBefore; got != wantWaits {
+				t.Fatalf("wait observations delta = %v, want %v", got, wantWaits)
+			}
+
 			// A local input is outside the relay budget and is not counted.
 			if _, ok := g.acquire(context.Background(), "/media/movie.mkv", tc.class); !ok {
 				t.Fatal("local read was not admitted")
 			}
 			if got := admittedDelta(); got != 1 {
 				t.Fatalf("local read counted as an admission: delta = %v", got)
+			}
+			if got := labeledHistogramSamples(t, subtitleRelayAdmissionWait, tc.label) - waitBefore; got != wantWaits {
+				t.Fatalf("local read observed a wait: delta = %v", got)
 			}
 		})
 	}

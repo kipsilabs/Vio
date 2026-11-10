@@ -1,6 +1,7 @@
 package playback
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -196,7 +197,7 @@ func ProbeSubtitleLayoutWithin(ctx context.Context, ffprobePathOrFFmpeg, inputUR
 	probeCtx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 
-	recordSubtitleLayoutProbeRan()
+	var stdout bytes.Buffer
 	cmd := exec.CommandContext(probeCtx, probeSubtitleBin(ffprobePathOrFFmpeg),
 		"-v", "error",
 		"-print_format", "json",
@@ -204,13 +205,21 @@ func ProbeSubtitleLayoutWithin(ctx context.Context, ffprobePathOrFFmpeg, inputUR
 		"-select_streams", "s",
 		inputURL,
 	)
-	output, err := cmd.Output()
-	if err != nil {
+	cmd.Stdout = &stdout
+	if err := cmd.Start(); err != nil {
+		// No process: a missing or unexecutable ffprobe is not a probe run.
+		return nil, fmt.Errorf("probe subtitle layout failed for %s: %w", inputURL, err)
+	}
+	// The child exists, so this is a real probe even if it later times out or
+	// reports a bad layout.
+	recordSubtitleLayoutProbeRan()
+	if err := cmd.Wait(); err != nil {
 		if probeCtx.Err() != nil {
 			return nil, fmt.Errorf("probe subtitle layout timed out for %s: %w", inputURL, probeCtx.Err())
 		}
 		return nil, fmt.Errorf("probe subtitle layout failed for %s: %w", inputURL, err)
 	}
+	output := stdout.Bytes()
 
 	var probed struct {
 		Streams []mediaprobe.Stream `json:"streams"`
