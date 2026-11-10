@@ -36,6 +36,12 @@ const (
 	cpuExtractTimeoutSDR       = 10 * time.Second
 	cpuExtractTimeoutHDR       = 25 * time.Second
 
+	// chapterThumbnailFolderStateTTL bounds how long an enqueue trusts a cached
+	// folder eligibility verdict. Library settings change rarely; a bounded
+	// cache keeps a queue sweep from reading the same folder row per file while
+	// still picking up a toggle within a minute.
+	chapterThumbnailFolderStateTTL = time.Minute
+
 	chapterThumbnailHDRPolicySetting    = "playback.chapter_thumbnail_hdr_policy"
 	chapterThumbnailHDRPolicyDefault    = "best_effort"
 	chapterThumbnailHDRPolicyDisabled   = "disabled"
@@ -125,6 +131,12 @@ type ChapterThumbnailRequest struct {
 	priority bool
 }
 
+// chapterThumbnailFolderState is one cached folder eligibility verdict.
+type chapterThumbnailFolderState struct {
+	enabled   bool
+	checkedAt time.Time
+}
+
 type Service struct {
 	fileRepo     FileRepository
 	folderRepo   FolderRepository
@@ -164,6 +176,13 @@ type Service struct {
 	priorityWorkerCount int
 	priorityBatchSize   int
 	normalBatchSize     int
+
+	// folderEnabledMu guards the folder eligibility memo the queue methods use
+	// to avoid enqueuing files whose library has chapter thumbnails disabled.
+	// The worker re-checks the folder under its lock, so this memo only saves
+	// the repeated skip work (and the skip log) for a disabled library.
+	folderEnabledMu sync.Mutex
+	folderEnabled   map[int]chapterThumbnailFolderState
 
 	mu              sync.Mutex
 	priorityQueue   []int
@@ -294,22 +313,28 @@ func (s *Service) Start(ctx context.Context) {
 	go s.followPreviewWidth(ctx)
 }
 
-func (s *Service) QueueFileIDs(_ context.Context, fileIDs []int) {
+func (s *Service) QueueFileIDs(ctx context.Context, fileIDs []int) {
 	if s == nil {
 		return
 	}
 	for _, fileID := range fileIDs {
+		if !s.chapterThumbnailsEnabled(ctx, fileID) {
+			continue
+		}
 		if s.enqueue(ChapterThumbnailRequest{FileID: fileID}, false) {
 			s.notifyNormalWorker()
 		}
 	}
 }
 
-func (s *Service) QueuePriorityFileIDs(_ context.Context, fileIDs []int) {
+func (s *Service) QueuePriorityFileIDs(ctx context.Context, fileIDs []int) {
 	if s == nil {
 		return
 	}
 	for _, fileID := range fileIDs {
+		if !s.chapterThumbnailsEnabled(ctx, fileID) {
+			continue
+		}
 		if s.enqueue(ChapterThumbnailRequest{FileID: fileID}, true) {
 			s.notifyPriorityWorker()
 			s.notifyNormalWorker()
@@ -317,8 +342,11 @@ func (s *Service) QueuePriorityFileIDs(_ context.Context, fileIDs []int) {
 	}
 }
 
-func (s *Service) QueuePriorityFileAtPosition(_ context.Context, fileID int, targetSeconds float64) {
+func (s *Service) QueuePriorityFileAtPosition(ctx context.Context, fileID int, targetSeconds float64) {
 	if s == nil {
+		return
+	}
+	if !s.chapterThumbnailsEnabled(ctx, fileID) {
 		return
 	}
 	target := targetSeconds
@@ -326,6 +354,55 @@ func (s *Service) QueuePriorityFileAtPosition(_ context.Context, fileID int, tar
 		s.notifyPriorityWorker()
 		s.notifyNormalWorker()
 	}
+}
+
+// chapterThumbnailsEnabled reports whether a file's library currently opts into
+// chapter thumbnails. Enqueuing a file from a disabled library only to have the
+// worker skip it is pure churn: the production log carried thousands of
+// folder_disabled skips for libraries that never had thumbnails enabled.
+//
+// A missing file or folder is a skip (the worker would skip it too). A lookup
+// error fails open: the worker still re-checks under its lock, so a transient
+// database problem must not silently drop a valid request.
+func (s *Service) chapterThumbnailsEnabled(ctx context.Context, fileID int) bool {
+	if s == nil || s.fileRepo == nil || s.folderRepo == nil {
+		return true
+	}
+	file, err := s.fileRepo.GetByID(ctx, fileID)
+	if err != nil {
+		return true
+	}
+	if file == nil {
+		return false
+	}
+	return s.folderAllowsChapterThumbnails(ctx, file.MediaFolderID)
+}
+
+func (s *Service) folderAllowsChapterThumbnails(ctx context.Context, folderID int) bool {
+	if folderID <= 0 {
+		return false
+	}
+	now := time.Now()
+	s.folderEnabledMu.Lock()
+	if state, ok := s.folderEnabled[folderID]; ok && now.Sub(state.checkedAt) < chapterThumbnailFolderStateTTL {
+		s.folderEnabledMu.Unlock()
+		return state.enabled
+	}
+	s.folderEnabledMu.Unlock()
+
+	folder, err := s.folderRepo.GetByID(ctx, folderID)
+	if err != nil {
+		return true
+	}
+	enabled := folder != nil && folder.Enabled && folder.ChapterThumbnailsEnabled
+
+	s.folderEnabledMu.Lock()
+	if s.folderEnabled == nil {
+		s.folderEnabled = make(map[int]chapterThumbnailFolderState)
+	}
+	s.folderEnabled[folderID] = chapterThumbnailFolderState{enabled: enabled, checkedAt: now}
+	s.folderEnabledMu.Unlock()
+	return enabled
 }
 
 func (s *Service) BackfillMissing(ctx context.Context, limit int) (int, error) {

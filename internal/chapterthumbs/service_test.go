@@ -72,6 +72,36 @@ func TestQueueFileIDsDedupes(t *testing.T) {
 	}
 }
 
+// A file from a library with chapter thumbnails disabled must never reach the
+// queue: the worker would only log folder_disabled and release it, which was
+// thousands of skip events in production.
+func TestQueueFileIDsSkipsDisabledChapterThumbnailFolder(t *testing.T) {
+	file := &models.MediaFile{ID: 7, MediaFolderID: 9}
+	service := &Service{
+		fileRepo:       &testFileRepo{file: file},
+		folderRepo:     &testFolderRepo{folder: &models.MediaFolder{ID: 9, Enabled: true, ChapterThumbnailsEnabled: false}},
+		notifyNormal:   make(chan struct{}, 8),
+		notifyPriority: make(chan struct{}, 8),
+		queuedPriority: make(map[int]ChapterThumbnailRequest),
+		queuedNormal:   make(map[int]ChapterThumbnailRequest),
+		inProgress:     make(map[int]struct{}),
+	}
+
+	service.QueueFileIDs(context.Background(), []int{7})
+	if len(service.queuedNormal) != 0 {
+		t.Fatalf("disabled library queued %d files, want 0", len(service.queuedNormal))
+	}
+
+	// Re-enabling the library makes the same file eligible. The memo is cleared
+	// so the test observes the new setting immediately.
+	service.folderRepo = &testFolderRepo{folder: &models.MediaFolder{ID: 9, Enabled: true, ChapterThumbnailsEnabled: true}}
+	service.folderEnabled = nil
+	service.QueueFileIDs(context.Background(), []int{7})
+	if len(service.queuedNormal) != 1 {
+		t.Fatalf("enabled library queued %d files, want 1", len(service.queuedNormal))
+	}
+}
+
 func TestQueuePriorityPromotesExistingFile(t *testing.T) {
 	service := &Service{
 		notifyNormal:   make(chan struct{}, 8),
