@@ -889,3 +889,266 @@ func TestPlaceholderInventoryServesCarriedAudio(t *testing.T) {
 		t.Fatal("polled inventory serialized audio_tracks null")
 	}
 }
+
+// deferredInventoryReloadFixture is a full virtual start whose deferred probe
+// is held open until the test releases it, and whose evidence write commits the
+// probed inventory onto the catalog row the reload re-reads. It exists to drive
+// the two client-visible orderings around that write: reload before the
+// verified inventory lands, and a verified push that is still in flight while
+// the viewer changes tracks.
+type deferredInventoryReloadFixture struct {
+	handler    *PlaybackHandler
+	manager    *playback.SessionManager
+	resolver   *syncPlaybackFileResolver
+	source     *models.MediaFile
+	release    chan struct{}
+	probeCalls atomic.Int32
+	saverCalls atomic.Int32
+}
+
+func newDeferredInventoryReloadFixture(t *testing.T, fileID int) *deferredInventoryReloadFixture {
+	t.Helper()
+	source := v3HandlerFixtureFile(t)
+	source.ID = fileID
+	source.ContentID = fmt.Sprintf("movie-deferred-reload-%d", fileID)
+	source.FilePath = fmt.Sprintf("virtual://movie/tt-deferred-reload-%d?result=cand-1", fileID)
+	source.VirtualOwnerInstallationID = 5
+	source.ProbeUpdatedAt = nil
+	source.AudioTracks = []models.AudioTrack{{Index: 1, Codec: "aac", Channels: 2, Language: "eng", Default: true}}
+
+	probedAt := time.Now().UTC()
+	manager := playback.NewSessionManager(0, 0)
+	resolver := &syncPlaybackFileResolver{file: *source}
+	handler := NewPlaybackHandler(manager, resolver)
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "true"}}
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	handler.PlaybackConfig = playbackTestConfig("", "")
+	handler.RealtimeHub = playback.NewRealtimeHub()
+	stubCopySeekAnchorV3(handler)
+	handler.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(func(_ context.Context, path string, _ int, _ string, _ int) (string, error) {
+		return "http://127.0.0.1:8080/stream?path=" + path, nil
+	})
+	// The terminal-notification dispatcher and the deferred watchdog both end
+	// with the handler's service context; cancel it at cleanup so a test cannot
+	// leave those goroutines behind.
+	serviceCtx, serviceCancel := context.WithCancel(context.Background())
+	handler.ServiceContext = serviceCtx //nolint:fatcontext // The handler owns its service context for the test's lifetime, exactly as production does.
+	t.Cleanup(serviceCancel)
+
+	f := &deferredInventoryReloadFixture{
+		handler: handler, manager: manager, resolver: resolver, source: source,
+		release: make(chan struct{}),
+	}
+	handler.VirtualPlaybackSourceProber = func(_ context.Context, _ string, file *models.MediaFile) (*models.MediaFile, error) {
+		f.probeCalls.Add(1)
+		<-f.release
+		file.AudioTracks = []models.AudioTrack{
+			{Index: 1, Codec: "aac", Channels: 2, Language: "eng", Default: true},
+			{Index: 3, Codec: "aac", Channels: 2, Language: "deu"},
+		}
+		file.SubtitleTracks = []models.SubtitleTrack{{Index: 2, Codec: "subrip", Language: "eng"}}
+		return file, nil
+	}
+	handler.VirtualFileMetadataSaver = func(_ context.Context, args models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error) {
+		var audio []models.AudioTrack
+		if err := json.Unmarshal(args.AudioTracks, &audio); err != nil {
+			return VirtualFileMetadataUpdateResult{}, err
+		}
+		var subs []models.SubtitleTrack
+		if err := json.Unmarshal(args.SubtitleTracks, &subs); err != nil {
+			return VirtualFileMetadataUpdateResult{}, err
+		}
+		resolver.update(func(row *models.MediaFile) {
+			row.AudioTracks, row.SubtitleTracks = audio, subs
+			row.ProbeUpdatedAt = &probedAt
+		})
+		f.saverCalls.Add(1)
+		return VirtualFileMetadataUpdateResult{MetadataUpdated: true, RowsAffected: 1}, nil
+	}
+	return f
+}
+
+func (f *deferredInventoryReloadFixture) startRequest(attemptID string) playback.StartRequestV3 {
+	request := v3HandlerStartRequest()
+	request.FileID = f.source.ID
+	request.QualityPreference = "original"
+	request.PlaybackAttemptID = attemptID
+	request.ClientFeatures = append(request.ClientFeatures, playback.FeatureDeferredTrackInventoryV3)
+	original := request.ClientPlaybackContext.Deliveries[playback.DeliveryClassOriginalHTTPV3]
+	original.ValidatedClaims = []string{playback.ClaimClientSelectedAudioTrackV3}
+	request.ClientPlaybackContext.Deliveries[playback.DeliveryClassOriginalHTTPV3] = original
+	request.ClientPlaybackContext.Deliveries[playback.DeliveryClassProgressiveV3] = playback.DeliveryCapabilityV3{
+		Enabled: true, SupportedOnDevice: true,
+		Subtitles: playback.DeliverySubtitleCapabilitiesV3{EmbeddedText: true, SidecarText: true},
+	}
+	return request
+}
+
+func (f *deferredInventoryReloadFixture) start(t *testing.T, attemptID string) (playback.DecisionResponseV3, playback.StartRequestV3) {
+	t.Helper()
+	request := f.startRequest(attemptID)
+	return startV3PlaybackV2ForHandlerTest(t, f.handler, request), request
+}
+
+func (f *deferredInventoryReloadFixture) waitFor(t *testing.T, what string, count *atomic.Int32, want int32) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for count.Load() < want {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s = %d, want %d", what, count.Load(), want)
+		}
+		time.Sleep(5 * time.Millisecond) //nolint:forbidigo // The probe/saver call counters are the observable state being polled.
+	}
+}
+
+// TestDeferredInventoryReloadConvergesToVerifiedWithoutRegression covers the
+// reload half of the third highest-risk matrix cell: a reload issued while the
+// deferred enumeration is still outstanding must keep the provisional plan,
+// and once the verified evidence commits, a later reload must present the
+// verified menu instead of falling back to the declared one or re-marking the
+// plan tracks_pending.
+func TestDeferredInventoryReloadConvergesToVerifiedWithoutRegression(t *testing.T) {
+	f := newDeferredInventoryReloadFixture(t, 960)
+	t.Cleanup(func() { f.handler.StopDeferredProbeWatchdog() })
+
+	first, _ := f.start(t, "deferred-reload-attempt-1")
+	if first.PlaybackPlan == nil || !first.PlaybackPlan.TracksPending || first.PlaybackPlan.InventoryURL == "" {
+		t.Fatalf("first start = %#v terminal = %+v", first.PlaybackPlan, first.Terminal)
+	}
+	second, _ := f.start(t, "deferred-reload-attempt-2")
+	if second.PlaybackPlan == nil || !second.PlaybackPlan.TracksPending || second.PlaybackPlan.InventoryURL == "" {
+		t.Fatalf("reload before the verified push = %#v terminal = %+v", second.PlaybackPlan, second.Terminal)
+	}
+	f.waitFor(t, "probe calls", &f.probeCalls, 2)
+	close(f.release)
+	// Each start owes a probe, but the evidence buffer may coalesce the second
+	// committed write. Convergence is asserted below on both sessions, not on
+	// how many catalog writes the coalescer performed.
+	f.waitFor(t, "saver calls", &f.saverCalls, 1)
+	requireDeferredInventoryStatus(t, f.handler, first.SessionID, string(ProbeProvenanceVerified))
+	requireDeferredInventoryStatus(t, f.handler, second.SessionID, string(ProbeProvenanceVerified))
+
+	reloaded, _ := f.start(t, "deferred-reload-attempt-3")
+	if reloaded.PlaybackPlan == nil || reloaded.PlaybackPlan.TracksPending {
+		t.Fatalf("reload after verified = %#v, want a final plan", reloaded.PlaybackPlan)
+	}
+	if reloaded.PlaybackPlan.InventoryProvenance != string(ProbeProvenanceVerified) {
+		t.Fatalf("reloaded provenance = %q, want verified", reloaded.PlaybackPlan.InventoryProvenance)
+	}
+	if len(reloaded.PlaybackPlan.AudioTracks) != 2 || reloaded.PlaybackPlan.AudioTracks[1].Language != "deu" {
+		t.Fatalf("reloaded audio = %+v, want the probed two-track menu", reloaded.PlaybackPlan.AudioTracks)
+	}
+
+	// The idempotent replay of that reload must stay on the verified decision.
+	replay, _ := f.start(t, "deferred-reload-attempt-3")
+	if replay.PlaybackPlan == nil || replay.PlaybackPlan.TracksPending ||
+		replay.PlaybackPlan.InventoryProvenance != string(ProbeProvenanceVerified) ||
+		len(replay.PlaybackPlan.AudioTracks) != 2 {
+		t.Fatalf("reload replay regressed: %#v", replay.PlaybackPlan)
+	}
+	if replay.PlaybackPlan.PlanID != reloaded.PlaybackPlan.PlanID || replay.SessionID != reloaded.SessionID {
+		t.Fatalf("reload replay changed identity: %q/%q -> %q/%q",
+			reloaded.SessionID, reloaded.PlaybackPlan.PlanID, replay.SessionID, replay.PlaybackPlan.PlanID)
+	}
+}
+
+// TestDeferredInventoryVerifiedPushRacingTrackChangeKeepsTransportStable covers
+// the ordering half: a verified inventory_updated is still in flight when the
+// viewer switches to a track the probe discovered. The replan must mint against
+// the verified menu (never the declared one), keep the direct transport and its
+// URL unchanged, and the late push must deliver verified without any later
+// regression to declared.
+func TestDeferredInventoryVerifiedPushRacingTrackChangeKeepsTransportStable(t *testing.T) {
+	f := newDeferredInventoryReloadFixture(t, 961)
+	t.Cleanup(func() { f.handler.StopDeferredProbeWatchdog() })
+	started, startRequest := f.start(t, "deferred-race-attempt-1")
+	if started.PlaybackPlan == nil {
+		t.Fatalf("start terminal = %+v", started.Terminal)
+	}
+	if err := f.manager.SetRealtimeConnection(started.SessionID, true); err != nil {
+		t.Fatal(err)
+	}
+	conn := newGatingInventoryPush()
+	registration := f.handler.RealtimeHub.Register(started.SessionID, conn)
+	if registration == nil {
+		t.Fatal("expected a realtime registration")
+	}
+	t.Cleanup(func() {
+		conn.release()
+		f.handler.RealtimeHub.Unregister(registration)
+	})
+
+	f.waitFor(t, "probe calls", &f.probeCalls, 1)
+	close(f.release)
+	f.waitFor(t, "saver calls", &f.saverCalls, 1)
+	select {
+	case <-conn.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the verified inventory_updated push never reached the wire")
+	}
+
+	live, err := f.manager.GetSession(started.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if live.VirtualProbeOutcome != playback.VirtualProbeOutcomeVerified || len(live.VirtualAudioTracks) != 2 {
+		t.Fatalf("live inventory = %q/%d, want verified with two tracks", live.VirtualProbeOutcome, len(live.VirtualAudioTracks))
+	}
+
+	german := 1
+	request := playback.ReplanRequestV3{
+		ProtocolVersion: playback.ProtocolV3, ClientFeatures: startRequest.ClientFeatures,
+		Operation:         playback.ReplanOperationTrackChangeV3,
+		PlaybackAttemptID: startRequest.PlaybackAttemptID, ReplanRequestID: "deferred-race-track-0001",
+		FailedPlanID: started.PlaybackPlan.PlanID, PlanAttemptID: "deferred-race-track-attempt-0001",
+		PlanAttemptKey: started.PlaybackPlan.PlanAttemptKey, AttemptCount: 1,
+		QualityPreference: startRequest.QualityPreference, PositionSeconds: 0,
+		SelectedTracks: playback.SelectedTracksV3{Audio: &playback.TrackIdentityV3{
+			ID: playback.TrackIDV3(f.source.ID, "audio", german), Index: &german,
+		}},
+		Capabilities:          startRequest.Capabilities,
+		ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	}
+	next := postPlaybackReplanV2ForHandlerTest(t, f.handler, started.SessionID, request)
+	if next.Terminal != nil {
+		t.Fatalf("track change terminal = %#v", next.Terminal)
+	}
+	plan := next.PlaybackPlan
+	if plan == nil {
+		t.Fatal("track change returned no plan")
+	}
+	if plan.SelectedTracks.Audio == nil || plan.SelectedTracks.Audio.Index == nil || *plan.SelectedTracks.Audio.Index != german {
+		t.Fatalf("selected audio = %#v, want the probed track %d", plan.SelectedTracks.Audio, german)
+	}
+	if len(plan.AudioTracks) != 2 || plan.AudioTracks[1].Language != "deu" {
+		t.Fatalf("track change audio menu = %+v, want the verified two-track menu", plan.AudioTracks)
+	}
+	// No reload: the same direct transport and URL carry the new selection.
+	if plan.Delivery != started.PlaybackPlan.Delivery || plan.Stream.URL != started.PlaybackPlan.Stream.URL {
+		t.Fatalf("track change reloaded the transport: %s %q -> %s %q",
+			started.PlaybackPlan.Delivery, started.PlaybackPlan.Stream.URL, plan.Delivery, plan.Stream.URL)
+	}
+
+	conn.release()
+	select {
+	case payload := <-conn.ch:
+		if payload.InventoryStatus != string(ProbeProvenanceVerified) || len(payload.AudioTracks) != 2 {
+			t.Fatalf("late push = status %q audio %+v, want verified with two tracks", payload.InventoryStatus, payload.AudioTracks)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("the held verified push was never delivered")
+	}
+	requireDeferredInventoryStatus(t, f.handler, started.SessionID, string(ProbeProvenanceVerified))
+	for _, payload := range conn.recorded() {
+		if payload.InventoryStatus != string(ProbeProvenanceVerified) {
+			t.Fatalf("inventory_updated regressed to %q after verified", payload.InventoryStatus)
+		}
+	}
+
+	reloaded, _ := f.start(t, "deferred-race-attempt-2")
+	if reloaded.PlaybackPlan == nil || reloaded.PlaybackPlan.TracksPending ||
+		reloaded.PlaybackPlan.InventoryProvenance != string(ProbeProvenanceVerified) ||
+		len(reloaded.PlaybackPlan.AudioTracks) != 2 {
+		t.Fatalf("reload after the verified push = %#v", reloaded.PlaybackPlan)
+	}
+}
