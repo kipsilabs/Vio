@@ -1656,8 +1656,19 @@ func (c *SubtitleCache) serveWindowedSUP(w http.ResponseWriter, r *http.Request,
 		}
 	}
 	// For bounded and uncached open-ended windows, consult the embedded source
-	// before any raw demux. Cached open-ended windows intentionally fall through
-	// to the artifact path above.
+	// before any raw demux. This is the safe PGS page path: ReadPackets returns
+	// the packets that show anywhere in [from, to), including display-set
+	// segments that started just before the window and are still on screen, so
+	// a bitmap straddling the boundary is not lost. A direct FFmpeg "-ss" slice
+	// of the source (the fallthrough below) cannot make that guarantee: an
+	// input seek lands on whatever packet precedes the seek point, not on the
+	// opening display set. cachedSupSeekSlack and windowFromCachedSup only
+	// compensate on the extracted-artifact path. The raw slice is a last-resort
+	// fallback, not a page path: a source without usable cues should stay on the
+	// implicit 600 s window and warm its .sup artifact, which is the safe steady
+	// state.
+	// Cached open-ended windows intentionally fall through to the artifact path
+	// above.
 	if opts.DurationSeconds > 0 || (opts.DurationSeconds <= 0 && opts.InputPath == sourceOpts.InputPath) {
 		if served, sourceErr := c.serveWindowFromSource(r.Context(), w, opts, extract); served {
 			if sourceErr == nil && !sourceOpts.DisableBackgroundWarm {

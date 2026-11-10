@@ -87,6 +87,12 @@ packet that started earlier than any packet read can still be missed. The
 frames of a laced block are kept or dropped together, since FFmpeg converts
 each frame with the ones after it in view.
 
+PGS windows are the bitmap case of the same rule: the display-set segments
+that started just before the window and are still on screen are included. A
+direct FFmpeg `-ss` slice of the source is not a page path, because an input
+seek can land past the opening display set; `cachedSupSeekSlack` compensates
+only on the extracted-artifact path.
+
 ## Use
 
 An `Index` is immutable and safe for concurrent use; `Cache` keeps them by
