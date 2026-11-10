@@ -173,6 +173,53 @@ func TestVirtualSubtitleCacheArtifactSurvivesPastTenMinuteBucket(t *testing.T) {
 	}
 }
 
+// A shifted window that a cached slice already covers must be served from that
+// slice instead of re-demuxing the source. Exact repeats stay on the fast path;
+// this exercises only the covering fallback.
+func TestServeExtractTextWindowedShiftedRangeServesCoveringWindow(t *testing.T) {
+	c, source := newTestCache(t)
+	base := StreamExtractOpts{
+		InputPath:             source,
+		SourceCodec:           "subrip",
+		TrackIndex:            0,
+		SeekSeconds:           90,
+		DurationSeconds:       150,
+		DisableBackgroundWarm: true,
+	}
+	calls := 0
+	extract := func(_ context.Context, opts StreamExtractOpts) error {
+		calls++
+		_, err := io.WriteString(opts.Writer, "COVERING WINDOW")
+		return err
+	}
+	serve := func(seek, duration float64) *httptest.ResponseRecorder {
+		opts := base
+		opts.SeekSeconds = seek
+		opts.DurationSeconds = duration
+		rec := httptest.NewRecorder()
+		if err := c.ServeExtract(rec, httptest.NewRequest(http.MethodGet, "/subtitle", nil), opts, extract); err != nil {
+			t.Fatal(err)
+		}
+		return rec
+	}
+
+	if rec := serve(90, 150); rec.Body.String() != "COVERING WINDOW" {
+		t.Fatalf("first body = %q", rec.Body.String())
+	}
+	// 120..240 is contained by the cached 90..240 slice.
+	if rec := serve(120, 120); rec.Body.String() != "COVERING WINDOW" {
+		t.Fatalf("shifted body = %q", rec.Body.String())
+	}
+	if calls != 1 {
+		t.Fatalf("extract calls after shifted request = %d, want 1", calls)
+	}
+	// A range outside the cached slice must still extract.
+	serve(400, 120)
+	if calls != 2 {
+		t.Fatalf("extract calls after uncovered request = %d, want 2", calls)
+	}
+}
+
 func TestServeExtractTextWindowDoesNotPoisonFullTrack(t *testing.T) {
 	c, source := newTestCache(t)
 	opts := StreamExtractOpts{InputPath: source, SourceCodec: "subrip", DurationSeconds: 600}

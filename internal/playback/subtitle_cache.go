@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -332,16 +333,52 @@ func (e *SubtitleExtractionRetryError) Error() string {
 }
 
 // subtitleWindowResult is one successfully extracted bounded window kept as the
-// last-good copy for exact repeats.
+// last-good copy for exact repeats and for shifted requests inside its range.
 type subtitleWindowResult struct {
 	data     []byte
 	storedAt time.Time
+	// base is the source identity half of the window key (everything before the
+	// start/end/open-ended suffix). A covering lookup compares it so a window
+	// from another track, format, or source generation can never answer.
+	base string
+	// startSeconds, endSeconds, and openEnded are the source-time range this
+	// slice actually covers. They mirror the extract options that produced it,
+	// not the range a later request asked for.
+	startSeconds float64
+	endSeconds   float64
+	openEnded    bool
 	// warmPrefix is non-nil when data was rendered by an in-progress ASS warm's
 	// prefix rather than extracted from a source or committed artifact. Such a
 	// slice is only as complete as that layer's event-ordering guarantee, so
 	// disabling the layer evicts these entries and lets the same window fall
 	// through to the extraction path.
 	warmPrefix *subtitleWarmTextProgress
+}
+
+// covers reports whether this slice's source-time range contains the requested
+// range. An open-ended request (start to EOF) is only covered by an open-ended
+// slice; a bounded request is covered by an open-ended slice that starts at or
+// before it.
+func (e subtitleWindowResult) covers(startSeconds, endSeconds float64, openEnded bool) bool {
+	const epsilon = 1e-6
+	if e.startSeconds > startSeconds+epsilon {
+		return false
+	}
+	if openEnded {
+		return e.openEnded
+	}
+	if e.openEnded {
+		return true
+	}
+	return e.endSeconds >= endSeconds-epsilon
+}
+
+// spanSeconds is the coverage width used to prefer the tightest covering slice.
+func (e subtitleWindowResult) spanSeconds() float64 {
+	if e.openEnded {
+		return math.Inf(1)
+	}
+	return e.endSeconds - e.startSeconds
 }
 
 // subtitleWindowFlight is a per-window in-flight marker; done closes when the
@@ -909,6 +946,15 @@ func (c *SubtitleCache) windowResultKey(opts StreamExtractOpts, format string) (
 func (c *SubtitleCache) serveWindowResult(w http.ResponseWriter, r *http.Request, opts StreamExtractOpts, format, key string) (served bool, err error) {
 	data, ok := c.lookupWindowResult(key)
 	if !ok {
+		// Exact repeats are the fast path; a client that shifts its playhead by
+		// a few seconds asks for a different exact window even though a cached
+		// slice already covers the range. Fall back to the tightest covering
+		// window only when no exact entry exists. The key is authoritative for
+		// the source identity: opts.InputPath may already name a committed
+		// artifact rather than the source the window was cached under.
+		data, ok = c.lookupCoveringWindowResult(windowResultKeyBase(key), opts)
+	}
+	if !ok {
 		return false, nil
 	}
 	recordSubtitleServeSource(subtitleServeMemoryWindow)
@@ -962,6 +1008,74 @@ func (c *SubtitleCache) lookupWindowResult(key string) ([]byte, bool) {
 	return entry.data, true
 }
 
+// lookupCoveringWindowResult serves a cached slice whose source-time range
+// contains the requested window. The client's window starts move with the
+// playhead, so an exact-key lookup re-demuxes a window that is 95% already
+// cached. A covering slice is a correct answer: it is the same source
+// identity, track, and output format, and it contains every cue in the
+// requested range. The tightest match wins so an oversized slice is not served
+// when a closer one is present. Expired/prefix-disabled entries are skipped
+// exactly like the exact lookup.
+func (c *SubtitleCache) lookupCoveringWindowResult(base string, opts StreamExtractOpts) ([]byte, bool) {
+	if c == nil || base == "" {
+		return nil, false
+	}
+	windowed, start, end, openEnded := opts.WindowCoverage()
+	if !windowed {
+		return nil, false
+	}
+	now := time.Now()
+	c.windowMu.Lock()
+	defer c.windowMu.Unlock()
+	bestKey := ""
+	bestSpan := math.Inf(1)
+	for key, entry := range c.windowResults {
+		if entry.base != base {
+			continue
+		}
+		if now.Sub(entry.storedAt) >= subtitleWindowResultTTL {
+			continue
+		}
+		if entry.warmPrefix != nil && entry.warmPrefix.prefixDisabled() {
+			continue
+		}
+		if !entry.covers(start, end, openEnded) {
+			continue
+		}
+		if span := entry.spanSeconds(); span < bestSpan {
+			bestKey, bestSpan = key, span
+		}
+	}
+	if bestKey == "" {
+		return nil, false
+	}
+	entry := c.windowResults[bestKey]
+	entry.storedAt = now
+	c.windowResults[bestKey] = entry
+	return entry.data, true
+}
+
+// windowResultKeyBase strips the start/end/open-ended suffix from a window key,
+// leaving the source identity the covering lookup compares. The key format is
+// `base|%.3f|%.3f|%t`, so three separators are removed from the right; a base
+// containing `|` (a path or identity can) stays intact.
+func windowResultKeyBase(key string) string {
+	last := strings.LastIndexByte(key, '|')
+	if last < 0 {
+		return ""
+	}
+	prev := strings.LastIndexByte(key[:last], '|')
+	if prev < 0 {
+		return ""
+	}
+	base := key[:prev]
+	prev = strings.LastIndexByte(base, '|')
+	if prev < 0 {
+		return ""
+	}
+	return base[:prev]
+}
+
 // dropWarmTextWindowResults evicts the windows one warm prefix produced when
 // that layer disables. Those slices were rendered from a prefix whose
 // completeness is no longer proven, so a repeat of the same exact window must
@@ -995,7 +1109,8 @@ func (c *SubtitleCache) storeWindowResultFrom(key string, opts StreamExtractOpts
 	if c == nil || key == "" || len(data) == 0 || len(data) > subtitleWindowResultMaxEntryBytes {
 		return
 	}
-	if windowed, _, _, _ := opts.WindowCoverage(); !windowed {
+	windowed, start, end, openEnded := opts.WindowCoverage()
+	if !windowed {
 		return
 	}
 	now := time.Now()
