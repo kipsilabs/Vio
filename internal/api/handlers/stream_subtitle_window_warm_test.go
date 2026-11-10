@@ -349,6 +349,31 @@ func TestVirtualSubtitleDriftProbeReusedWithinTTL(t *testing.T) {
 	}
 }
 
+// The drift-probe memo must cover a steady viewer's page cadence: the web
+// player asks for the next 120 s window with a 60 s prefetch, so a TTL shorter
+// than a few page cycles re-probes the live layout (seconds of work) on every
+// second or third page even though the pinned release has not changed. Three
+// consecutive cadence steps must reuse one verdict. The identity re-key that a
+// layout change causes is covered by
+// TestVirtualSubtitleLayoutReuseMissesAfterInventoryChanges.
+func TestVirtualSubtitleLayoutReuseCoversPageCadence(t *testing.T) {
+	if virtualSubtitleLayoutCacheTTL < 5*time.Minute {
+		t.Fatalf("layout probe TTL = %v, want at least 5m to cover a 120s page cadence", virtualSubtitleLayoutCacheTTL)
+	}
+	handler := &StreamHandler{}
+	opts := &playback.StreamExtractOpts{CacheIdentity: "identity-cadence", TrackIndex: 0, SourceCodec: "subrip"}
+	verifiedAt := time.Now()
+	handler.rememberVirtualSubtitleLayout(
+		virtualSubtitleLayoutKey(opts.CacheIdentity, opts.TrackIndex), *opts, verifiedAt)
+
+	for page := 1; page <= 3; page++ {
+		at := verifiedAt.Add(time.Duration(page) * 120 * time.Second)
+		if _, ok := handler.reuseVirtualSubtitleLayout(opts, at); !ok {
+			t.Fatalf("page %d at +%s re-probed inside the memo window", page, at.Sub(verifiedAt))
+		}
+	}
+}
+
 // A verdict older than the TTL is dropped, so a long playback revalidates the
 // live layout instead of trusting a mapping forever.
 func TestVirtualSubtitleLayoutReuseExpires(t *testing.T) {

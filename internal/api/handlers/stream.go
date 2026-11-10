@@ -4220,12 +4220,15 @@ const (
 
 // virtualSubtitleLayoutCacheTTL bounds how long a successful drift-probe
 // verdict is reused for the same (CacheIdentity, plan ordinal). A windowed
-// player asks for the same track roughly every window, and a re-probe costs
-// seconds before extraction starts. Two minutes covers a burst of adjacent
-// window fetches and a client retry cycle; a release rotation changes the
-// pinned result and therefore the identity, so the TTL only hides residual
-// same-candidate change.
-const virtualSubtitleLayoutCacheTTL = 2 * time.Minute
+// player asks for the same track once per window — 120 s with a 60 s prefetch
+// — and a re-probe costs seconds before extraction starts. The TTL must
+// comfortably cover several consecutive pages or every fourth request pays
+// the probe again even though nothing about the pinned release changed; eight
+// minutes covers a 120 s page cadence with room for retries and prefetch
+// bursts while still re-probing a long playback periodically. A release
+// rotation changes the pinned result and therefore the identity, so the TTL
+// only hides residual same-candidate change, which stays bounded by the TTL.
+const virtualSubtitleLayoutCacheTTL = 8 * time.Minute
 
 // virtualSubtitleLayoutCacheMaxEntries caps the probe memo. Live entries are
 // identities probed inside the TTL; a long-lived server would otherwise
