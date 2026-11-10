@@ -4537,6 +4537,14 @@ func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(file *models.MediaFil
 			}
 		}()
 		extract := func(extractCtx context.Context, extractOpts playback.StreamExtractOpts) error {
+			// The cache may re-invoke this closure after yielding the relay
+			// pipe to an admitted page (WarmTrackInBackground). Release the
+			// previous attempt's registration before resolving a fresh one so a
+			// restart cannot strand it.
+			if cleanup != nil {
+				cleanup()
+				cleanup = nil
+			}
 			// Resolve on a child of the extraction context, never the detached
 			// request context: a resolver that hangs is canceled when the warm
 			// budget is exhausted, releasing the warm slot and fill instead of

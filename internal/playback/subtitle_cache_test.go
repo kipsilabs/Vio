@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -2226,5 +2227,131 @@ func TestWarmTrackInBackgroundCancellationReleasesSlot(t *testing.T) {
 	}
 	if calls != 0 {
 		t.Fatalf("immediate retry after cancellation ran %d times, want 0", calls)
+	}
+}
+
+// An admitted page extract on the same track owns the shared relay pipe, so an
+// in-flight full-track warm must stop, wait for the page, and resume. The yield
+// is intentional and must not arm the failed-warm cooldown.
+func TestWarmTrackInBackgroundYieldsToAdmittedPage(t *testing.T) {
+	c, source := newTestCache(t)
+	opts := StreamExtractOpts{
+		InputPath:     source,
+		SourceCodec:   "ass",
+		TrackIndex:    0,
+		CacheIdentity: "virtual-page-yield",
+	}
+	format := subtitleCacheFormat(opts.SourceCodec, opts.TargetFormat)
+
+	var calls atomic.Int32
+	started := make(chan int32, 4)
+	canceled := make(chan struct{})
+	extract := func(ctx context.Context, extractOpts StreamExtractOpts) error {
+		n := calls.Add(1)
+		started <- n
+		if n == 1 {
+			<-ctx.Done()
+			close(canceled)
+			return ctx.Err()
+		}
+		_, err := io.WriteString(extractOpts.Writer, "complete ass track")
+		return err
+	}
+
+	done := c.WarmTrackInBackground(opts, extract, "")
+	select {
+	case n := <-started:
+		if n != 1 {
+			t.Fatalf("first warm extract call = %d, want 1", n)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("warm never started extracting")
+	}
+
+	// The page is admitted while the warm is reading. That must cancel the warm
+	// rather than let both demux the same source.
+	endPage := c.beginPageFlight(opts, format)
+	select {
+	case <-canceled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("admitted page did not preempt the running warm")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("warm restarted while the page was still admitted: calls = %d", got)
+	}
+
+	// Once the page settles the warm resumes and commits.
+	endPage()
+	select {
+	case n := <-started:
+		if n != 2 {
+			t.Fatalf("restarted warm call = %d, want 2", n)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("warm did not resume after the page settled")
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("warm never settled after resuming")
+	}
+	if !c.HasCommittedTextEntry(source, opts.CacheIdentity, 0, "ass", "") {
+		t.Fatal("resumed warm did not commit the track")
+	}
+	key, ok := c.formatEntryKey(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, format)
+	if !ok {
+		t.Fatal("warm key not derivable")
+	}
+	if !c.warmAdmitted(key, time.Now()) {
+		t.Fatal("yielding to a page armed the failed-warm cooldown")
+	}
+}
+
+// A page already admitted when the warm starts keeps it out of the relay pipe
+// entirely: the warm waits for the page and then extracts once.
+func TestWarmTrackInBackgroundWaitsForAdmittedPageAtStart(t *testing.T) {
+	c, source := newTestCache(t)
+	opts := StreamExtractOpts{
+		InputPath:     source,
+		SourceCodec:   "ass",
+		TrackIndex:    0,
+		CacheIdentity: "virtual-page-start",
+	}
+	format := subtitleCacheFormat(opts.SourceCodec, opts.TargetFormat)
+	endPage := c.beginPageFlight(opts, format)
+
+	var calls atomic.Int32
+	started := make(chan struct{}, 2)
+	extract := func(_ context.Context, extractOpts StreamExtractOpts) error {
+		calls.Add(1)
+		started <- struct{}{}
+		_, err := io.WriteString(extractOpts.Writer, "complete ass track")
+		return err
+	}
+
+	done := c.WarmTrackInBackground(opts, extract, "")
+	// No extract may run while the page holds the track. The warm goroutine is
+	// parked in its settle wait, so a non-blocking channel read is decisive.
+	select {
+	case <-started:
+		t.Fatal("warm extracted while a page was already admitted")
+	default:
+	}
+	endPage()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("warm never extracted after the page settled")
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("warm never settled")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("warm extract calls = %d, want 1", got)
+	}
+	if !c.HasCommittedTextEntry(source, opts.CacheIdentity, 0, "ass", "") {
+		t.Fatal("warm did not commit after waiting for the page")
 	}
 }
