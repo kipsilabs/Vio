@@ -2064,6 +2064,152 @@ func TestVirtualSubtitleWarmReKeysAfterOwnProbeRemap(t *testing.T) {
 	}
 }
 
+// remapBlockState parks the test at a warm's drift-remap verdict: the probe has
+// established a different effective ordinal, but the extract invocation has not
+// returned its re-key decision yet. That is the window in which an admitted
+// page can preempt the same invocation.
+type remapBlockState struct {
+	once    sync.Once
+	blocked chan struct{}
+	release chan struct{}
+}
+
+func (s *remapBlockState) wait() {
+	s.once.Do(func() { close(s.blocked) })
+	<-s.release
+}
+
+// remapBlockingHandler forwards records to a text handler and blocks the first
+// remap verdict until the test releases it.
+type remapBlockingHandler struct {
+	inner slog.Handler
+	gate  *remapBlockState
+}
+
+func (h *remapBlockingHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	return h.inner.Enabled(ctx, level)
+}
+
+func (h *remapBlockingHandler) Handle(ctx context.Context, r slog.Record) error {
+	if strings.Contains(r.Message, "remapped onto live layout") {
+		h.gate.wait()
+	}
+	return h.inner.Handle(ctx, r)
+}
+
+func (h *remapBlockingHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &remapBlockingHandler{inner: h.inner.WithAttrs(attrs), gate: h.gate}
+}
+
+func (h *remapBlockingHandler) WithGroup(name string) slog.Handler {
+	return &remapBlockingHandler{inner: h.inner.WithGroup(name), gate: h.gate}
+}
+
+// An admitted page can restart the warm's extract after the invocation had
+// already decided to re-key. The replay re-runs the probe under the same
+// admitted identity, finds it authoritative, and commits. That re-key decision
+// belonged to the invocation that made it: a stale pointer left behind would
+// re-key the warm after it had already settled, starting a second logical warm
+// for an identity the committed fill did not use.
+func TestVirtualSubtitleWarmPageReplayClearsStaleRekeyDecision(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+	dir := t.TempDir()
+	argsLog := filepath.Join(dir, "ffmpeg.args")
+	probeCount := filepath.Join(dir, "ffprobe.count")
+
+	warmLogs := &warmLogBuffer{}
+	gate := &remapBlockState{blocked: make(chan struct{}), release: make(chan struct{})}
+	var releaseOnce sync.Once
+	releaseGate := func() { releaseOnce.Do(func() { close(gate.release) }) }
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(&remapBlockingHandler{
+		inner: slog.NewTextHandler(warmLogs, &slog.HandlerOptions{Level: slog.LevelDebug}),
+		gate:  gate,
+	}))
+	// Registered before the fixture, so it runs after the fixture's warm wait.
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+
+	handler, session, file, virtualURI := newVirtualSubtitleWindowFixture(t, dir,
+		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\ncat <<'VTT'\n"+warmSubtitleVTT+"VTT\n")
+	// Registered after the fixture, so LIFO releases a blocked warm before the
+	// fixture waits on it.
+	t.Cleanup(releaseGate)
+
+	// The plan row has English at ordinal 0 and French at ordinal 1. The live
+	// release the warm's own probe sees rotated them, so the requested English
+	// track is ordinal 1 there; every later probe sees the plan layout again.
+	file.SubtitleTracks = []models.SubtitleTrack{
+		{Index: 0, Codec: "subrip", Language: "eng"},
+		{Index: 1, Codec: "subrip", Language: "fre"},
+	}
+	session.VirtualSubtitleTracks = file.SubtitleTracks
+	probeLayout := func(language0, language1 string) string {
+		return `{"streams":[{"index":0,"codec_name":"subrip","codec_type":"subtitle","tags":{"language":"` + language0 + `"}},` +
+			`{"index":1,"codec_name":"subrip","codec_type":"subtitle","tags":{"language":"` + language1 + `"}}]}`
+	}
+	writeExecutableScript(t, filepath.Join(dir, "ffprobe"), "#!/bin/sh\n"+
+		"n=$(cat '"+probeCount+"' 2>/dev/null || echo 0)\n"+
+		"n=$((n+1))\n"+
+		"printf '%s' \"$n\" > '"+probeCount+"'\n"+
+		"if [ \"$n\" -eq 1 ]; then\n"+
+		"  printf '%s' '"+probeLayout("fre", "eng")+"'\n"+
+		"else\n"+
+		"  printf '%s' '"+probeLayout("eng", "fre")+"'\n"+
+		"fi\n")
+
+	planIdentity := virtualSubtitleCacheIdentity(file, virtualURI, 0)
+	remappedIdentity := virtualSubtitleCacheIdentity(file, virtualURI, 1)
+
+	handler.warmVirtualSubtitleAfterWindowMiss(file, file.SubtitleTracks[0], session, playback.StreamExtractOpts{
+		InputPath:       "unused",
+		CacheIdentity:   planIdentity,
+		TrackIndex:      0,
+		SourceCodec:     "subrip",
+		SeekSeconds:     600,
+		DurationSeconds: 600,
+		FFmpegPath:      filepath.Join(dir, "ffmpeg"),
+	}, nil, true, "")
+
+	// Wait until the warm's probe has decided the plan ordinal now lives at
+	// ordinal 1, then admit a page before that invocation returns.
+	select {
+	case <-gate.blocked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("warm's drift probe never reported its remap verdict")
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/subtitle?position=600&duration=600", nil)
+	// driftSuspected=false: this serve skips its own probe and goes straight to
+	// the page admission that preempts the warm's in-flight invocation.
+	handler.streamEmbeddedSubtitle(rec, req, file, 0, session, false, "vtt")
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "WEBVTT") {
+		t.Fatalf("page window: status=%d body=%q", rec.Code, rec.Body.String())
+	}
+	releaseGate()
+
+	handler.waitForBackgroundSubtitleWarms()
+
+	// The replayed invocation's probe established the admitted identity, so the
+	// committed fill must land there and nowhere else.
+	waitForCommittedTextEntry(t, handler.SubtitleCache, planIdentity, 0, "subrip")
+	if handler.SubtitleCache.HasCommittedTextEntry("unused", remappedIdentity, 1, "subrip", "") {
+		t.Fatal("warm committed under the remapped identity the replay did not establish")
+	}
+	// One logical warm: the preempted invocation and its replay are the same
+	// run. A stale re-key decision adds a second warm start.
+	if got := warmLogs.count("subtitle cache warm started"); got != 1 {
+		t.Fatalf("logical full-track warms = %d, want exactly 1: a replayed invocation is the same warm\n%s",
+			got, warmLogs.String())
+	}
+	if got := warmLogs.count("virtual subtitle warm re-keyed after its drift probe"); got != 0 {
+		t.Fatalf("redundant re-keys = %d, want 0: the replayed invocation committed under its probe's identity\n%s",
+			got, warmLogs.String())
+	}
+}
+
 // A param-less virtual fetch on a cold track is the native client's one-shot
 // whole-track read, not an upgrade probe: it has no windowing contract and no
 // probe cadence that would re-issue a shed read, so a saturated detached budget

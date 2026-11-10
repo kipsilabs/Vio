@@ -4569,6 +4569,14 @@ func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(file *models.MediaFil
 			// WarmTrackInBackground closes its done channel, which orders the two.
 			var rekeyed *playback.StreamExtractOpts
 			extract := func(extractCtx context.Context, extractOpts playback.StreamExtractOpts) error {
+				// A re-key decision belongs to the invocation that made it. The
+				// cache may re-invoke this closure after a page yield
+				// (WarmTrackInBackground), and that replay can establish the
+				// admitted identity and commit normally. Clearing the decision
+				// here keeps a stale pointer from a yielded invocation from
+				// re-keying a warm that has already settled under its
+				// probe-established identity.
+				rekeyed = nil
 				// The cache may re-invoke this closure after yielding the relay
 				// pipe to an admitted page (WarmTrackInBackground), or this loop
 				// may re-key it. Release the previous attempt's registration
