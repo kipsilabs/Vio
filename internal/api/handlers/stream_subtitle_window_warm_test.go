@@ -566,6 +566,57 @@ func TestVirtualSubtitleLayoutReuseMissesAfterInventoryChanges(t *testing.T) {
 	}
 }
 
+// A probe verdict is scoped to the exact identity it was established for. A
+// drift remap re-keys the request onto the effective ordinal, and a candidate
+// rotation changes the pinned result, so neither may reuse a verdict recorded
+// for the plan-ordinal identity. (Inventory changes are covered above; this
+// pins the other two re-key events a rotation produces.)
+func TestVirtualSubtitleLayoutVerdictNotReusedAcrossRemapOrRotation(t *testing.T) {
+	handler := &StreamHandler{}
+	uri := "virtual://movie/tt-remap-verdict?result=cand-a"
+	file := &models.MediaFile{ID: 11, SubtitleTracks: []models.SubtitleTrack{
+		{Index: 0, Codec: "subrip", Language: "eng"},
+		{Index: 1, Codec: "subrip", Language: "fre"},
+	}}
+	verifiedAt := time.Now()
+	plan := playback.StreamExtractOpts{
+		CacheIdentity: virtualSubtitleCacheIdentity(file, uri, 0),
+		TrackIndex:    0,
+		SourceCodec:   "subrip",
+	}
+	// The plan-ordinal probe established that this request's track now lives at
+	// the other ordinal.
+	handler.rememberVirtualSubtitleLayout(
+		virtualSubtitleLayoutKey(plan.CacheIdentity, plan.TrackIndex),
+		playback.StreamExtractOpts{CacheIdentity: plan.CacheIdentity, TrackIndex: 1, SourceCodec: "subrip"},
+		verifiedAt,
+	)
+	if verdict, ok := handler.reuseVirtualSubtitleLayout(&plan, verifiedAt.Add(time.Second)); !ok || verdict.trackIndex != 1 {
+		t.Fatalf("plan request did not reuse its own verdict: %+v ok=%v", verdict, ok)
+	}
+
+	remapped := playback.StreamExtractOpts{
+		CacheIdentity: virtualSubtitleCacheIdentity(file, uri, 1),
+		TrackIndex:    1,
+		SourceCodec:   "subrip",
+	}
+	if _, ok := handler.reuseVirtualSubtitleLayout(&remapped, verifiedAt.Add(time.Second)); ok {
+		t.Fatal("post-remap identity reused the plan-ordinal verdict")
+	}
+
+	rotated := playback.StreamExtractOpts{
+		CacheIdentity: virtualSubtitleCacheIdentity(file, "virtual://movie/tt-remap-verdict?result=cand-b", 0),
+		TrackIndex:    0,
+		SourceCodec:   "subrip",
+	}
+	if rotated.CacheIdentity == plan.CacheIdentity {
+		t.Fatal("candidate rotation did not re-key the cache identity")
+	}
+	if _, ok := handler.reuseVirtualSubtitleLayout(&rotated, verifiedAt.Add(time.Second)); ok {
+		t.Fatal("rotated candidate reused the previous candidate's verdict")
+	}
+}
+
 // A text warm survives a resume but still stops when the playhead leaves the
 // position the warm was started at, or when the session ends. The abort itself
 // is ErrSubtitleWarmCanceled, which the cache treats as an intentional
@@ -643,9 +694,11 @@ func TestVirtualTextWindowWarmKeysOnServeOrdinalAfterRemap(t *testing.T) {
 
 // The warm resolves its own relay registration, so it validates that
 // registration before extracting. When the live release rotated, it remaps
-// onto the same-class live track and extracts that stream; the artifact still
-// commits under the identity the fill was admitted with, which is the pre-probe
-// key every later serve for this row and ordinal computes.
+// onto the same-class live track and extracts that stream. The fill was admitted
+// under the plan-ordinal identity the serve handed it, so the warm discards that
+// fill and re-keys onto the identity its own probe established: the artifact
+// commits under the same key the remapped serve path computes, and a concurrent
+// page for the same logical track finds it instead of demuxing a second time.
 func TestVirtualSubtitleWarmRemapsOntoLiveLayoutBeforeCommit(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell script test helper is unix-only")
@@ -674,11 +727,11 @@ func TestVirtualSubtitleWarmRemapsOntoLiveLayoutBeforeCommit(t *testing.T) {
 	}, nil, true, "")
 
 	const remappedOrdinal = 1
+	serveIdentity := virtualSubtitleCacheIdentity(file, virtualURI, remappedOrdinal)
+	waitForCommittedTextEntry(t, handler.SubtitleCache, serveIdentity, remappedOrdinal, "subrip")
 	planIdentity := virtualSubtitleCacheIdentity(file, virtualURI, 0)
-	waitForCommittedTextEntry(t, handler.SubtitleCache, planIdentity, 0, "subrip")
-	if handler.SubtitleCache.HasCommittedTextEntry("unused",
-		virtualSubtitleCacheIdentity(file, virtualURI, remappedOrdinal), remappedOrdinal, "subrip", "") {
-		t.Fatal("warm committed under the live ordinal instead of the key its fill was admitted with")
+	if handler.SubtitleCache.HasCommittedTextEntry("unused", planIdentity, 0, "subrip", "") {
+		t.Fatal("warm committed under the plan ordinal instead of the identity its probe established")
 	}
 	data, err := os.ReadFile(argsLog)
 	if err != nil {
@@ -687,6 +740,120 @@ func TestVirtualSubtitleWarmRemapsOntoLiveLayoutBeforeCommit(t *testing.T) {
 	warmArgs := strings.TrimSpace(string(data))
 	if !strings.Contains(warmArgs, "-map 0:s:1") {
 		t.Fatalf("warm args = %q, want the remapped 0:s:1", warmArgs)
+	}
+	// The remapped serve path must find the committed artifact with no second
+	// source demux: the warm key and the serve key are the same key. A windowed
+	// serve still runs the converter, but only against the local artifact.
+	var extracts atomic.Int32
+	var servedFromSource atomic.Bool
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/subtitle?position=600&duration=600", nil)
+	result, serveErr := handler.SubtitleCache.ServeExtractWithResult(rec, req, playback.StreamExtractOpts{
+		InputPath:       "unused",
+		CacheIdentity:   serveIdentity,
+		TrackIndex:      remappedOrdinal,
+		SourceCodec:     "subrip",
+		SeekSeconds:     600,
+		DurationSeconds: 600,
+		FFmpegPath:      filepath.Join(dir, "ffmpeg"),
+	}, func(_ context.Context, o playback.StreamExtractOpts) error {
+		extracts.Add(1)
+		if o.InputIsExtractedText == "" && !strings.Contains(o.InputPath, "subtitle-cache") {
+			servedFromSource.Store(true)
+		}
+		_, err := o.Writer.Write([]byte(warmSubtitleVTT))
+		return err
+	})
+	if serveErr != nil {
+		t.Fatalf("serve on the warm identity: %v", serveErr)
+	}
+	if !result.ServedCommittedArtifact || rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "WEBVTT") {
+		t.Fatalf("remapped serve did not use the warm artifact: result=%+v status=%d body=%q",
+			result, rec.Code, rec.Body.String())
+	}
+	if servedFromSource.Load() {
+		t.Fatalf("remapped serve demuxed the source (%d extract calls) despite the warm artifact", extracts.Load())
+	}
+}
+
+// A paging request that races an inventory rotation must not replay the
+// previous inventory's window slice and must not warm under the old identity.
+// The window cache, the committed artifact, and the warm all key on the
+// identity, so the rotated row re-keys them together even for the exact same
+// source-time range.
+func TestVirtualTextWindowPagingRekeysAfterInventoryRotation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+	dir := t.TempDir()
+	argsLog := filepath.Join(dir, "ffmpeg.args")
+	rotated := filepath.Join(dir, "rotated.marker")
+	// The fake extractor labels its output by the rotation marker, so a stale
+	// window slice from before the rotation is visible in the response body.
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '" + argsLog + "'\n" +
+		"if [ -f '" + rotated + "' ]; then\ncat <<'VTT'\nWEBVTT\n\n00:00:00.000 --> 00:00:01.000\nROTATED\nVTT\n" +
+		"else\ncat <<'VTT'\nWEBVTT\n\n00:00:00.000 --> 00:00:01.000\nPLAN\nVTT\nfi\n"
+	handler, session, file, virtualURI := newVirtualSubtitleWindowFixture(t, dir, script)
+	planTracks := file.SubtitleTracks
+	session.VirtualSubtitleEvidenceSet = true
+	session.VirtualSubtitleEvidenceFileID = file.ID
+	session.VirtualSubtitleEvidenceURI = virtualURI
+	session.VirtualSubtitleTracks = planTracks
+
+	serve := func(position int, drift bool) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/subtitle?position="+strconv.Itoa(position)+"&duration=600", nil)
+		handler.streamEmbeddedSubtitle(rec, req, file, 0, session, drift, "vtt")
+		return rec
+	}
+
+	// Page 1 is evidence-bound: the row still matches the carried inventory, so
+	// it serves and warms under the plan identity.
+	first := serve(600, false)
+	if first.Code != http.StatusOK || !strings.Contains(first.Body.String(), "PLAN") {
+		t.Fatalf("first page: status=%d body=%q", first.Code, first.Body.String())
+	}
+	handler.waitForBackgroundSubtitleWarms()
+	planIdentity := virtualSubtitleCacheIdentity(file, virtualURI, 0)
+	if !handler.SubtitleCache.HasCommittedTextEntry("unused", planIdentity, 0, "subrip", "") {
+		t.Fatal("first page did not warm under the plan identity")
+	}
+
+	// The catalog row rotates its inventory (a second track appears) and the
+	// live release matches the new row, while the session still carries the
+	// plan-time inventory. The next page must treat the row as drifted.
+	file.SubtitleTracks = []models.SubtitleTrack{
+		{Index: 0, Codec: "subrip"},
+		{Index: 1, Codec: "ass", Language: "fre"},
+	}
+	writeSubtitleLayoutProbe(t, dir, file.SubtitleTracks...)
+	if err := os.WriteFile(rotated, []byte("rotated"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	second := serve(600, true)
+	if second.Code != http.StatusOK {
+		t.Fatalf("second page: status=%d body=%q", second.Code, second.Body.String())
+	}
+	if strings.Contains(second.Body.String(), "PLAN") {
+		t.Fatalf("second page replayed the pre-rotation window: body=%q", second.Body.String())
+	}
+	if !strings.Contains(second.Body.String(), "ROTATED") {
+		t.Fatalf("second page did not read the rotated release: body=%q", second.Body.String())
+	}
+	rotatedIdentity := virtualSubtitleCacheIdentity(file, virtualURI, 0)
+	if rotatedIdentity == planIdentity {
+		t.Fatal("inventory rotation did not re-key the cache identity")
+	}
+	if window, _ := ffmpegLogLines(t, argsLog); window != 2 {
+		t.Fatalf("windowed extracts = %d, want 2: the rotated page must not reuse the pre-rotation window", window)
+	}
+	handler.waitForBackgroundSubtitleWarms()
+	if !handler.SubtitleCache.HasCommittedTextEntry("unused", rotatedIdentity, 0, "subrip", "") {
+		t.Fatal("rotated page did not warm under the rotated identity")
+	}
+	if !handler.SubtitleCache.HasCommittedTextEntry("unused", planIdentity, 0, "subrip", "") {
+		t.Fatal("rotation discarded the pre-rotation artifact instead of leaving it under its own key")
 	}
 }
 
@@ -1842,8 +2009,9 @@ func TestVirtualTextWindowEvidenceBoundServeWarmProbesAndFailsClosedOnRotation(t
 // A fresh inherited seed may steer the warm's own probe toward the ordinal the
 // serve settled on, but the probe still runs and the extraction maps the
 // ordinal the probe establishes. Here the live release rotated the text tracks
-// and the requested language now sits at ordinal 1.
-func TestVirtualSubtitleWarmAppliesInheritedOrdinalHintAfterOwnProbe(t *testing.T) {
+// and the requested language now sits at ordinal 1, so the warm re-keys the fill
+// it admitted under the plan identity onto the identity its probe established.
+func TestVirtualSubtitleWarmReKeysAfterOwnProbeRemap(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell script test helper is unix-only")
 	}
@@ -1863,22 +2031,26 @@ func TestVirtualSubtitleWarmAppliesInheritedOrdinalHintAfterOwnProbe(t *testing.
 		"#!/bin/sh\nprintf 'probe\\n' >> '"+probeLog+"'\n"+
 			"printf '%s' '{\"streams\":[{\"index\":0,\"codec_name\":\"subrip\",\"codec_type\":\"subtitle\",\"tags\":{\"language\":\"fre\"}},{\"index\":1,\"codec_name\":\"subrip\",\"codec_type\":\"subtitle\",\"tags\":{\"language\":\"eng\"}}]}'\n")
 
-	identity := virtualSubtitleCacheIdentity(file, virtualURI, 0)
+	planIdentity := virtualSubtitleCacheIdentity(file, virtualURI, 0)
 	handler.warmVirtualSubtitleAfterWindowMiss(file, file.SubtitleTracks[0], session, playback.StreamExtractOpts{
 		InputPath:       "unused",
-		CacheIdentity:   identity,
+		CacheIdentity:   planIdentity,
 		TrackIndex:      0,
 		SourceCodec:     "subrip",
 		SeekSeconds:     600,
 		DurationSeconds: 600,
 		FFmpegPath:      filepath.Join(dir, "ffmpeg"),
 	}, &virtualSubtitleLayoutSeed{
-		cacheIdentity: identity,
+		cacheIdentity: planIdentity,
 		trackIndex:    1,
 		sourceCodec:   "subrip",
 		verifiedAt:    time.Now(),
 	}, true, "")
-	waitForCommittedTextEntry(t, handler.SubtitleCache, identity, 0, "subrip")
+	serveIdentity := virtualSubtitleCacheIdentity(file, virtualURI, 1)
+	waitForCommittedTextEntry(t, handler.SubtitleCache, serveIdentity, 1, "subrip")
+	if handler.SubtitleCache.HasCommittedTextEntry("unused", planIdentity, 0, "subrip", "") {
+		t.Fatal("warm committed the remapped bytes under the plan-ordinal identity")
+	}
 
 	if data, err := os.ReadFile(probeLog); err != nil || strings.TrimSpace(string(data)) == "" {
 		t.Fatalf("warm skipped its own probe (probe log %q, err %v)", data, err)

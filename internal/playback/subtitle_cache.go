@@ -2738,10 +2738,11 @@ func fontBundleCacheFileName(identity string, modTime time.Time, size int64) str
 //
 // The hash is deliberately ordinal-based: folding in a container track id
 // would change every key and orphan entries committed by earlier releases.
-// Across a drift remap the start-path warm, which keys on the plan ordinal,
-// can therefore miss the post-remap serve identity; the serve-path window warm
-// is the authoritative populator and re-keys to the post-remap ordinal, so an
-// orphaned plan-ordinal entry self-heals on the next window.
+// Across a drift remap the start-path warm, which keys on the plan ordinal, can
+// therefore miss the post-remap serve identity; the serve-path window warm
+// abandons a fill whose own probe establishes a different identity and re-keys
+// onto the post-remap ordinal before committing, so an orphaned plan-ordinal
+// entry is never published and self-heals on the next window.
 func VirtualSubtitleCacheIdentity(fileID int, virtualSourceURI string, trackIndex int, inventory ...string) string {
 	pinned := ""
 	if parsed, err := url.Parse(strings.TrimSpace(virtualSourceURI)); err == nil {
