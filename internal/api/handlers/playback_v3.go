@@ -9605,9 +9605,20 @@ func annotateAudioTrackSubstitutedV3(result *playback.PlannerResultV3, index int
 	})
 }
 
+// syncSessionsAfterReplanDetached persists the post-replan session snapshot on
+// a context that outlives the replan request. The durable commit (and its
+// afterDurableCommit callback) can run after executeReplanV3 returns, at which
+// point the request context is canceled; a sync bound to it failed with
+// context.Canceled on every replan, leaving the shared admin snapshot stale.
+// WithoutCancel keeps the request's logging/trace values while dropping that
+// cancellation, and the bound keeps a wedged syncer from holding the response.
+func (h *PlaybackHandler) syncSessionsAfterReplanDetached(ctx context.Context) {
+	syncCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	h.syncSessionsNow(syncCtx, "v3_replan")
+}
+
 func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.AttemptRecordV3, req playback.ReplanRequestV3) (playback.DecisionResponseV3, playback.AttemptRecordV3, *preparedTransportV3, *transportErrorV3) {
-	afterCtx, afterCancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
-	defer afterCancel()
 	r = r.WithContext(withPlaybackRoutingPolicySnapshotV3(r.Context(), h.playbackRoutingPolicyV3()))
 	r = r.WithContext(withServerBitrateCapV3(r.Context(), record.ServerBitrateCapKbps))
 	r = r.WithContext(withCueIndexReadsV3(r.Context()))
@@ -12000,7 +12011,13 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			// must not become a stored preference.
 			h.persistLegacyAudioPreferenceV3(r.Context(), session.ID, session.UserID, session.ProfileID, effectiveFile, plannedAudioTrackIndexV3(result, session.AudioTrackIndex))
 		}
-		h.syncSessionsNow(afterCtx, "v3_replan")
+		// afterDurableCommit runs after executeReplanV3 returns and its request
+		// context may already be canceled. A sync bound to that context always
+		// failed with context.Canceled, so the replanned session was never
+		// persisted to the shared admin snapshot. Detach it while keeping the
+		// request's logging/trace values and bound it so a wedged syncer cannot
+		// hold the response open forever.
+		h.syncSessionsAfterReplanDetached(r.Context())
 		event := playback.RouteEventPlanSelectedV3
 		clientModel := req.ClientPlaybackContext.Device.Model
 		if seekReanchor {
