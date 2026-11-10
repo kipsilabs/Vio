@@ -235,10 +235,10 @@ const (
 	// shared relay pipe; waiting past this hands its warm slot back instead of
 	// pinning it behind a long page. The next windowed miss re-attempts.
 	subtitleWarmPageYieldWait = 20 * time.Second
-	// subtitleWarmPageYieldAttempts caps how many times one warm may be
-	// interrupted by pages before it abandons. Each restart repeats work
-	// already done, so a page storm that never leaves a gap is better served
-	// by the next miss than by a warm that keeps demuxing from the start.
+	// subtitleWarmPageYieldAttempts caps how many page interruptions one warm
+	// tolerates before it abandons. Each restart repeats work already done, so
+	// a page storm that never leaves a gap is better served by the next miss
+	// than by a warm that keeps demuxing from the start.
 	subtitleWarmPageYieldAttempts = 4
 	// subtitleWindowResultTTL bounds how long a successful bounded window stays
 	// servable as the last-good copy. A hit refreshes the deadline, so a client
@@ -2048,8 +2048,8 @@ func (c *SubtitleCache) WarmInBackground(opts StreamExtractOpts, extract SUPExtr
 // track (see beginPageFlight): the page is what the viewer is waiting on, so
 // the running extract is canceled with ErrSubtitleWarmCanceled, the partial
 // fill is discarded, and the warm resumes once the page settles. A yield never
-// arms the failure cooldown. The warm abandons after
-// subtitleWarmPageYieldAttempts interruptions or subtitleWarmPageYieldWait
+// arms the failure cooldown. The warm abandons once pages have interrupted it
+// subtitleWarmPageYieldAttempts times, or after subtitleWarmPageYieldWait
 // without a gap; the next windowed miss re-kicks it.
 //
 // Staleness for identity-keyed (virtual) sources follows the same generation
@@ -2154,7 +2154,7 @@ func (c *SubtitleCache) WarmTrackInBackground(opts StreamExtractOpts, extract SU
 				cancel(nil)
 				// A page was admitted between the settle wait and registration.
 				yields++
-				if yields > subtitleWarmPageYieldAttempts {
+				if yields >= subtitleWarmPageYieldAttempts {
 					fill.Discard()
 					return
 				}
@@ -2177,14 +2177,18 @@ func (c *SubtitleCache) WarmTrackInBackground(opts StreamExtractOpts, extract SU
 				// non-cooperative extract that ignored the cancel and returned
 				// a complete track (err == nil) falls through and commits
 				// instead of repeating the whole read.
-				fill, warmText, counter = c.rebuildWarmFill(
-					&opts, format, key, fill, warmText, warmTextKey,
+				newFill, newWarmText, newCounter := c.rebuildWarmFill(
+					&opts, format, fill, warmText, warmTextKey,
 				)
-				if fill == nil {
+				if newFill == nil {
+					// Another fill now owns the key. Leave warmText as it is:
+					// the deferred endWarmTextProgress below releases the old
+					// ASS prefix instead of orphaning its retained script.
 					return
 				}
+				fill, warmText, counter = newFill, newWarmText, newCounter
 				yields++
-				if yields > subtitleWarmPageYieldAttempts {
+				if yields >= subtitleWarmPageYieldAttempts {
 					fill.Discard()
 					return
 				}
@@ -2237,9 +2241,14 @@ func (c *SubtitleCache) WarmTrackInBackground(opts StreamExtractOpts, extract SU
 // and returns the new fill with the writers/counter the caller must use for
 // the next attempt. A nil fill means another fill now owns the key (or the
 // cache is unusable), so the warm must stop rather than duplicate the work.
+//
+// The reserve re-derives the key from cacheIdentity, so a fill that lands
+// across a generation-bucket roll commits under the new bucket while the
+// caller's admission/flight key stays on the old one; the next windowed miss
+// then re-kicks the warm under the new key.
 func (c *SubtitleCache) rebuildWarmFill(
 	opts *StreamExtractOpts,
-	format, key string,
+	format string,
 	oldFill *SubtitleCacheFill,
 	warmText *subtitleWarmTextProgress,
 	warmTextKey string,

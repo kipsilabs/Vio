@@ -2355,3 +2355,89 @@ func TestWarmTrackInBackgroundWaitsForAdmittedPageAtStart(t *testing.T) {
 		t.Fatal("warm did not commit after waiting for the page")
 	}
 }
+
+// A page that preempts an ASS warm while the track key has been taken over by
+// another fill must end the warm cleanly. Losing the re-reserve leaves the
+// retained prefix and its progress entry behind unless the deferred cleanup
+// still owns them, and a stale entry would let a later window render from a
+// prefix no warm is filling.
+func TestWarmTrackInBackgroundLostReserveReleasesASSPrefix(t *testing.T) {
+	c, source := newTestCache(t)
+	opts := StreamExtractOpts{
+		InputPath:     source,
+		SourceCodec:   "ass",
+		TrackIndex:    0,
+		CacheIdentity: "virtual-lost-reserve",
+	}
+	format := subtitleCacheFormat(opts.SourceCodec, opts.TargetFormat)
+	key, ok := c.formatEntryKey(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, format)
+	if !ok {
+		t.Fatal("warm key not derivable")
+	}
+
+	const prefix = "[Script Info]\nScriptType: v4.00+\n\n[Events]\n" +
+		"Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n" +
+		"Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,hello\n" //nolint:misspell // ASS/SSA event keyword
+
+	var calls atomic.Int32
+	started := make(chan struct{})
+	extract := func(ctx context.Context, extractOpts StreamExtractOpts) error {
+		calls.Add(1)
+		if _, err := io.WriteString(extractOpts.Writer, prefix); err != nil {
+			return err
+		}
+		close(started)
+		<-ctx.Done()
+		// Stand in for a competing fill that took the key: the warm's own
+		// Discard only releases an entry it still owns, so the re-reserve
+		// after it reads as busy and the warm must stop.
+		c.mu.Lock()
+		c.inflight[key] = &SubtitleCacheFill{key: key}
+		c.mu.Unlock()
+		return ctx.Err()
+	}
+
+	done := c.WarmTrackInBackground(opts, extract, "")
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("warm never started extracting")
+	}
+	c.warmTextMu.Lock()
+	progress := c.warmText[key]
+	c.warmTextMu.Unlock()
+	if progress == nil {
+		t.Fatal("warm did not register ASS prefix progress")
+	}
+
+	endPage := c.beginPageFlight(opts, format)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("warm never settled after losing the re-reserve")
+	}
+	endPage()
+
+	c.mu.Lock()
+	delete(c.inflight, key)
+	c.mu.Unlock()
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("warm extract calls = %d, want 1", got)
+	}
+	c.warmTextMu.Lock()
+	leftover := c.warmText[key]
+	c.warmTextMu.Unlock()
+	if leftover != nil {
+		t.Fatal("warm left stale ASS progress registered after losing the re-reserve")
+	}
+	progress.mu.Lock()
+	headerLen, retained := progress.header.Len(), progress.retainedBytes
+	progress.mu.Unlock()
+	if headerLen != 0 || retained != 0 {
+		t.Fatalf("warm prefix not released: header=%d bytes=%d", headerLen, retained)
+	}
+	if c.HasCommittedTextEntry(source, opts.CacheIdentity, 0, "ass", "") {
+		t.Fatal("aborted warm committed a track")
+	}
+}
