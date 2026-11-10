@@ -1664,9 +1664,9 @@ func (c *SubtitleCache) serveWindowedSUP(w http.ResponseWriter, r *http.Request,
 	// input seek lands on whatever packet precedes the seek point, not on the
 	// opening display set. cachedSupSeekSlack and windowFromCachedSup only
 	// compensate on the extracted-artifact path. The raw slice is a last-resort
-	// fallback, not a page path: a source without usable cues should stay on the
-	// implicit 600 s window and warm its .sup artifact, which is the safe steady
-	// state.
+	// fallback, not a page path: a source without usable cues should be left on
+	// the open-ended (whole-track) path, which warms its .sup artifact and is
+	// the safe steady state.
 	// Cached open-ended windows intentionally fall through to the artifact path
 	// above.
 	if opts.DurationSeconds > 0 || (opts.DurationSeconds <= 0 && opts.InputPath == sourceOpts.InputPath) {

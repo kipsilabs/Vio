@@ -963,6 +963,27 @@ describe("useASSSubtitles windowed ASS extraction", () => {
     },
   );
 
+  it("scales the prefetch lead linearly below the cap", async () => {
+    const videoRef = makeVideoRef(1);
+    // 60 s x 1.25 is a 75 s lead, well under the 90 s cap, so the trigger for
+    // [0, 120] is at 45 rather than the 30 a capped lead would give.
+    videoRef.current!.playbackRate = 1.25;
+
+    renderHook(() => useASSSubtitles(videoRef, [germanTrack], 6, false, 0, 0));
+    await waitFor(() => expect(constructorOpts).toHaveLength(1));
+
+    videoRef.current!.currentTime = 45;
+    videoRef.current!.dispatchEvent(new Event("timeupdate"));
+    await act(async () => {});
+    expect(fetch).toHaveBeenCalledTimes(1);
+
+    videoRef.current!.currentTime = 46;
+    videoRef.current!.dispatchEvent(new Event("timeupdate"));
+    await waitFor(() => expect(constructorOpts).toHaveLength(2));
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(String(vi.mocked(fetch).mock.calls[1]![0])).toContain("position=26&duration=120");
+  });
+
   it("recomputes the prefetch trigger when the rate changes mid-playback", async () => {
     const videoRef = makeVideoRef(1);
 
