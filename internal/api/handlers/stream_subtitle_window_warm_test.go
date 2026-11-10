@@ -802,6 +802,52 @@ func TestVirtualPGSWholeTrackFetchServesCommittedWholeTrack(t *testing.T) {
 	}
 }
 
+// A cold PGS fetch that opts into windowed mode without supplying bounds
+// (?windowed=1 only) is still a whole-track read: it must join the server's
+// implicit window rather than demux the container to EOF, advertise the
+// covered range so the client re-fetches, and warm the full .sup.
+func TestVirtualPGSBareWindowedFetchJoinsImplicitWindow(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+	dir := t.TempDir()
+	argsLog := filepath.Join(dir, "ffmpeg.args")
+	gate := filepath.Join(dir, "warm.gate")
+	handler, session, file, virtualURI := newVirtualSubtitleWindowFixture(t, dir, warmArgsLogScript(argsLog, gate))
+	t.Cleanup(func() { _ = os.WriteFile(gate, []byte("go"), 0o644) })
+	file.SubtitleTracks = []models.SubtitleTrack{{Index: 0, Codec: "hdmv_pgs_subtitle"}}
+	session.VirtualSubtitleTracks = file.SubtitleTracks
+	writeSubtitleLayoutProbe(t, dir, file.SubtitleTracks...)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/subtitle?windowed=1", nil)
+	handler.streamEmbeddedSubtitle(rec, req, file, 0, session, false)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PGS bare windowed fetch = %d %q", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get(playback.SubtitleCoverageHeader); got != "0.000-600.000" {
+		t.Fatalf("PGS bare windowed coverage header = %q, want 0.000-600.000", got)
+	}
+	if got := rec.Header().Get(playback.SubtitleWindowedHeader); got != "true" {
+		t.Fatalf("PGS bare windowed header = %q, want true", got)
+	}
+
+	waitForWarmInvocation(t, argsLog)
+	if err := os.WriteFile(gate, []byte("go"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	identity := virtualSubtitleCacheIdentity(file, virtualURI, 0)
+	waitForCommittedEntry(t, handler.SubtitleCache, identity, 0, "hdmv_pgs_subtitle")
+
+	window, warm := ffmpegLogLines(t, argsLog)
+	if window != 1 {
+		t.Fatalf("windowed PGS extracts = %d, want exactly 1", window)
+	}
+	if warm != 1 {
+		t.Fatalf("full-track PGS warms = %d, want exactly 1", warm)
+	}
+}
+
 // windowedFFmpegArgs returns the single logged invocation that carries -ss.
 func windowedFFmpegArgs(t *testing.T, argsLog string) string {
 	t.Helper()

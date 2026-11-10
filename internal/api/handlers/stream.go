@@ -4683,8 +4683,10 @@ const (
 //
 // A position without a duration is window intent but open-ended: its missing
 // cap is filled with the implicit window (the caller's position is kept) so it
-// cannot demux to EOF and advertise `start-*`. A codec that cannot window
-// (PGS without the ?windowed=1 opt-in) is left untouched.
+// cannot demux to EOF and advertise `start-*`. A PGS request is granted
+// AllowWindow for this server-authored window even without the client's
+// ?windowed=1 opt-in; the response coverage headers are what tell such a
+// client to re-fetch at the window boundary.
 func (h *StreamHandler) applyImplicitVirtualWindow(opts *playback.StreamExtractOpts, file *models.MediaFile, session *playback.Session, virtualActive bool) {
 	if h == nil || opts == nil || !virtualActive {
 		return
@@ -4718,9 +4720,13 @@ func (h *StreamHandler) applyImplicitVirtualWindow(opts *playback.StreamExtractO
 			"track", opts.TrackIndex)
 		return
 	}
-	// Any other explicit intent is authoritative: a position-only codec that
-	// cannot window, or the PGS ?windowed=1 opt-in with no position/duration.
-	if opts.WindowRequested || opts.SeekSeconds > 0 || opts.AllowWindow {
+	// Any other explicit intent is authoritative. A PGS `?windowed=1` opt-in
+	// with no position or duration is not: it only selects the windowed serve
+	// path, and PGSWindowRequest parses bounds only alongside that flag, so a
+	// bare flag would otherwise demux the whole container to EOF. Fall through
+	// and give it the same implicit window a cold whole-track fetch gets; the
+	// coverage headers tell the client to re-fetch.
+	if opts.WindowRequested || opts.SeekSeconds > 0 {
 		return
 	}
 
@@ -4729,8 +4735,8 @@ func (h *StreamHandler) applyImplicitVirtualWindow(opts *playback.StreamExtractO
 	opts.DurationSeconds = virtualSubtitleImplicitWindowSeconds
 	if playback.IsPGS(opts.SourceCodec) {
 		// PGS routes through ServeSUPExtract, which windows only when
-		// AllowWindow is set (the explicit ?windowed=1 opt-in). This window is
-		// server-authored, so grant it here.
+		// AllowWindow is set (the client's ?windowed=1 opt-in or a server-
+		// authored window like this one), so grant it here.
 		opts.AllowWindow = true
 	}
 	slog.Info("virtual subtitle served as an implicit window",
