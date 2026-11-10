@@ -293,6 +293,117 @@ func TestBuildPlaybackManifest_EncodedTranscodeUsesSyntheticVODManifest(t *testi
 	}
 }
 
+// A resume generation starts at the segment boundary before the requested
+// position. Listing the segments before it advertised media the generation
+// cannot produce; a player prefetching the playlist's first entry requested
+// one, and the segment layer restarted a healthy encoder for it.
+func TestGenerateFullManifestStartsAtSeekAnchor(t *testing.T) {
+	session := &TranscodeSession{opts: TranscodeOpts{
+		TargetCodecVideo: "h264",
+		TargetCodecAudio: "aac",
+		SegmentDuration:  2,
+		TotalDuration:    9010,
+		SeekSeconds:      1632,
+		// The v3 resume plan publishes the seek anchor as the transport origin.
+		StreamOriginSeconds: 1632,
+		StartSegmentNumber:  816,
+	}}
+
+	text := string(session.GenerateFullManifest("segment/", "token=test"))
+	for _, want := range []string{
+		"#EXT-X-PLAYLIST-TYPE:VOD",
+		"#EXT-X-MEDIA-SEQUENCE:816",
+		"segment/seg_00816.ts?token=test",
+		"segment/seg_04504.ts?token=test",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("resume manifest missing %q:\n%s", want, text)
+		}
+	}
+	for _, unwanted := range []string{"seg_00000", "seg_00815"} {
+		if strings.Contains(text, unwanted) {
+			t.Fatalf("resume manifest advertises unproducible segment %q:\n%s", unwanted, text)
+		}
+	}
+
+	timeline, err := parseManifestTimeline([]byte(text))
+	if err != nil {
+		t.Fatalf("parse manifest: %v", err)
+	}
+	if len(timeline.entries) != 4505-816 || timeline.entries[0].number != 816 {
+		t.Fatalf("manifest lists %d entries starting at %d, want %d from 816",
+			len(timeline.entries), timeline.entries[0].number, 4505-816)
+	}
+}
+
+// A session that began at the source start restarts at a later segment when the
+// player seeks; its playlist must keep the whole source timeline so those
+// positions stay addressable.
+func TestGenerateFullManifestKeepsWholeTimelineAfterSourceZeroRestart(t *testing.T) {
+	session := &TranscodeSession{opts: TranscodeOpts{
+		TargetCodecVideo:   "h264",
+		TargetCodecAudio:   "aac",
+		SegmentDuration:    2,
+		TotalDuration:      20,
+		SeekSeconds:        16,
+		StartSegmentNumber: 8,
+	}}
+
+	text := string(session.GenerateFullManifest("", ""))
+	for _, want := range []string{"#EXT-X-MEDIA-SEQUENCE:0", "seg_00000.ts", "seg_00009.ts"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("source-zero restart manifest missing %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "#EXT-X-MEDIA-SEQUENCE:8") {
+		t.Fatalf("source-zero restart manifest moved its timeline to the restart segment:\n%s", text)
+	}
+}
+
+func TestSegmentRecoveryDecisionLeavesBeforeAnchorRequestsToTheClient(t *testing.T) {
+	session := &TranscodeSession{
+		outputDir: t.TempDir(),
+		running:   true,
+		opts: TranscodeOpts{
+			TargetCodecVideo:    "h264",
+			SegmentDuration:     2,
+			TotalDuration:       9010,
+			StartSegmentNumber:  816,
+			StreamOriginSeconds: 1632,
+		},
+	}
+
+	before := session.SegmentRecoveryDecision(0, time.Now())
+	if before.Wait || before.RestartOnTimeout || before.Reason != "before_playlist_start" {
+		t.Fatalf("before-anchor decision = %#v, want no wait and no restart", before)
+	}
+
+	resume := session.SegmentRecoveryDecision(816, time.Now())
+	if !resume.Wait || resume.RestartOnTimeout || resume.Reason != "startup_manifest_not_ready" {
+		t.Fatalf("resume-segment decision = %#v, want a startup wait", resume)
+	}
+}
+
+// A whole-timeline session keeps the historical recovery: a backward request
+// restarts FFmpeg at that segment, because its playlist still lists it.
+func TestSegmentRecoveryDecisionRestartsBackwardSeekOnWholeTimeline(t *testing.T) {
+	session := &TranscodeSession{
+		outputDir: t.TempDir(),
+		running:   true,
+		opts: TranscodeOpts{
+			TargetCodecVideo:   "h264",
+			SegmentDuration:    2,
+			TotalDuration:      9010,
+			StartSegmentNumber: 600,
+		},
+	}
+
+	decision := session.SegmentRecoveryDecision(0, time.Now())
+	if !decision.RestartOnTimeout || decision.Reason != "before_start_segment" {
+		t.Fatalf("backward-seek decision = %#v, want a seek restart", decision)
+	}
+}
+
 // TestLongTitlePlaylistsCarryTheSignedQueryOnce renders each path that builds
 // or rewrites a v3 media playlist, for a client that negotiated
 // hls_variable_substitution_v1, and checks a four-hour title stays well under

@@ -50,6 +50,19 @@ describe("invalidateMediaSurfaceQueries", () => {
     expect(cancel.mock.calls[0]?.[1]?.revert).not.toBe(false);
   });
 
+  it("leaves version-liveness checks to their own trigger", async () => {
+    // A catalog sweep fires per scan event and per item change. Liveness rows
+    // are expensive to re-probe (a provider resolution each), so only
+    // `versions_updated` may invalidate them.
+    const queryClient = new QueryClient();
+    const livenessKey = [...catalogKeys.versionLiveness, [7, 8]] as const;
+    queryClient.setQueryData(livenessKey, { results: [] });
+
+    await invalidateMediaSurfaceQueries(queryClient);
+
+    expect(queryClient.getQueryState(livenessKey)?.isInvalidated).toBe(false);
+  });
+
   it("marks item, section, progress, history, favorites, watchlist, and collection queries stale", async () => {
     const queryClient = new QueryClient();
     const browseKey = itemKeys.browse({
