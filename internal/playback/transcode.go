@@ -3827,6 +3827,18 @@ func (s *TranscodeSession) SegmentRecoveryDecision(segNum int, now time.Time) Se
 	case !progress.Running:
 		decision.Reason = "transcode_not_running"
 	case segNum < progress.StartSegmentNumber:
+		if anchor := s.playlistStartSegment(); anchor > 0 && segNum < anchor {
+			// A seek-anchored playlist begins at this segment. A request below
+			// it cannot name a segment this transport publishes, so it is a
+			// stale playlist (or one the server never served) rather than a
+			// seek this generation can satisfy. Restarting for it would kill a
+			// healthy encoder and still leave the segment unlisted; let the
+			// request fail so the client reloads the playlist it has.
+			decision.Wait = false
+			decision.RestartOnTimeout = false
+			decision.Reason = "before_playlist_start"
+			break
+		}
 		decision.Reason = "before_start_segment"
 	case segNum <= progress.ProducedHead:
 		decision.Reason = "segment_missing_behind_produced_head"
@@ -3877,6 +3889,13 @@ func (s *TranscodeSession) GenerateFullManifest(segPrefix, rawQuery string) []by
 	return s.generateSyntheticPlaylist(segPrefix, rawQuery, "seg_", segExt, segExt == ".m4s")
 }
 
+// playlistStartSegment is the first segment this session's complete VOD
+// playlist lists, or zero for the historical whole-timeline playlist.
+func (s *TranscodeSession) playlistStartSegment() int {
+	opts := s.Opts()
+	return syntheticPlaylistStartSegment(opts, syntheticSegmentCount(opts.TotalDuration, opts.SegmentDuration))
+}
+
 // syntheticSegmentCount is the number of fixed-duration segments the
 // synthetic playlist lists for the media.
 func syntheticSegmentCount(totalDuration float64, segmentDuration int) int {
@@ -3889,9 +3908,13 @@ func syntheticSegmentCount(totalDuration float64, segmentDuration int) int {
 	return max(1, int(math.Ceil(totalDuration/float64(segmentDuration))))
 }
 
-// generateSyntheticPlaylist lists every fixed-duration segment of the media
+// generateSyntheticPlaylist lists the fixed-duration segments of the media
 // under namePrefix%05d+ext. The video playlist and the subtitle rendition
 // playlist share it, so both carry exactly the same segment timeline.
+//
+// A session whose transport begins at a seek anchor lists from that anchor
+// (see syntheticPlaylistStartSegment) and publishes it as the media sequence,
+// so the playlist describes only what the generation produces.
 func (s *TranscodeSession) generateSyntheticPlaylist(segPrefix, rawQuery, namePrefix, segExt string, initMap bool) []byte {
 	opts := s.Opts()
 	totalDur := opts.TotalDuration
@@ -3903,8 +3926,9 @@ func (s *TranscodeSession) generateSyntheticPlaylist(segPrefix, rawQuery, namePr
 		totalDur = float64(segDur) // fallback: single segment
 	}
 	segCount := syntheticSegmentCount(totalDur, segDur)
+	start := syntheticPlaylistStartSegment(opts, segCount)
 
-	queryDefinition, suffix, queryVersion := syntheticManifestQuery(segCount, rawQuery)
+	queryDefinition, suffix, queryVersion := syntheticManifestQuery(segCount-start, rawQuery)
 
 	hlsVersion := 3
 	if initMap {
@@ -3924,14 +3948,14 @@ func (s *TranscodeSession) generateSyntheticPlaylist(segPrefix, rawQuery, namePr
 	// SegDuration+1. EXTINF keeps the nominal duration and segment indexing is
 	// unchanged.
 	fmt.Fprintf(&buf, "#EXT-X-TARGETDURATION:%d\n", segDur+1)
-	buf.WriteString("#EXT-X-MEDIA-SEQUENCE:0\n")
+	fmt.Fprintf(&buf, "#EXT-X-MEDIA-SEQUENCE:%d\n", start)
 	buf.WriteString("#EXT-X-PLAYLIST-TYPE:VOD\n")
 
 	if initMap {
 		fmt.Fprintf(&buf, "#EXT-X-MAP:URI=\"%sinit.mp4%s\"\n", segPrefix, suffix)
 	}
 
-	for i := range segCount {
+	for i := start; i < segCount; i++ {
 		dur := float64(segDur)
 		if i == segCount-1 {
 			// Last segment covers the remainder.
@@ -3946,6 +3970,38 @@ func (s *TranscodeSession) generateSyntheticPlaylist(segPrefix, rawQuery, namePr
 
 	buf.WriteString("#EXT-X-ENDLIST\n")
 	return buf.Bytes()
+}
+
+// syntheticPlaylistStartSegment is the first segment of a complete VOD
+// playlist. An encoded generation that begins at a seek anchor produces
+// segment files from that anchor; listing the earlier ones advertises media
+// this generation cannot produce, and a player that prefetches the playlist's
+// first entry would request one of them, making the segment layer restart a
+// healthy encoder for bytes the player never plays. v3 plans anchored on a
+// seek publish the same position as their timeline origin (see
+// configureHLSTimelineV3), so the playlist's own clock and the client's agree.
+//
+// Every other caller keeps the historical whole-timeline playlist from segment
+// zero: v1, Jellyfin compatibility, and seek restarts of a session that began
+// at the source start all publish source-zero playlists.
+func syntheticPlaylistStartSegment(opts TranscodeOpts, segCount int) int {
+	if opts.StreamOriginSeconds <= 0 || strings.EqualFold(opts.TargetCodecVideo, "copy") {
+		return 0
+	}
+	segDur := opts.SegmentDuration
+	if segDur <= 0 {
+		segDur = defaultSegmentDuration
+	}
+	start := int(math.Round(opts.StreamOriginSeconds / float64(segDur)))
+	if start <= 0 {
+		return 0
+	}
+	if segCount <= 0 {
+		return 0
+	}
+	// A duration that rounds short of the anchor still lists its last segment
+	// rather than an empty playlist.
+	return min(start, segCount-1)
 }
 
 // GetSegment returns the file path of a named segment if it exists.

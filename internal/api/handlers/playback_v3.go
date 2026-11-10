@@ -15430,7 +15430,31 @@ func configureHLSTimelineV3(plan *playback.PlanV3, videoCodec string, segmentDur
 	startSegment := computeStartSegment(seek, segmentDuration)
 	plan.Timeline.SourceStartSeconds = requested
 	usesGrowingManifest := !playback.CanGenerateSyntheticManifest(durationSeconds, segmentDuration)
-	if usesGrowingManifest {
+	if startSegment > 0 && !usesGrowingManifest {
+		// A resume starts the generation at the segment boundary before the
+		// requested position, and the complete VOD playlist begins there (see
+		// generateSyntheticPlaylist). The transport's clock zero is therefore
+		// that seek anchor, not the source start: the client seeks to the
+		// requested position expressed on the playlist's own timeline. The
+		// previous source-zero shape advertised segments the generation never
+		// produced, so a player that prefetches the playlist's first entry
+		// requested one of them and the segment layer restarted a healthy
+		// encoder just to serve a segment the client then discarded.
+		//
+		// The playlist is complete, so the window is closed. Positions after
+		// the anchor are served in place; a target before it belongs to
+		// another generation, so the plan routes that seek back through the
+		// server rather than letting the player clamp to the anchor.
+		plan.Timeline.PlayerStartSeconds = max(0, requested-seek)
+		plan.Timeline.StreamOriginSeconds = seek
+		plan.Timeline.TimelineOffsetSeconds = seek
+		windowStart := seek
+		windowEnd := durationSeconds
+		plan.Timeline.SeekWindowStartSeconds = &windowStart
+		plan.Timeline.SeekWindowEndSeconds = &windowEnd
+		plan.Timeline.CanSeekAnywhere = false
+		plan.Timeline.SeekRestoration = "source_position"
+	} else if usesGrowingManifest {
 		// Encoded streams seek to the preceding segment boundary. Preserve the
 		// requested sub-segment offset so playback still begins at the exact
 		// requested source position. Copy remuxes are configured separately with
