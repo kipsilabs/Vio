@@ -196,6 +196,7 @@ func ProbeSubtitleLayoutWithin(ctx context.Context, ffprobePathOrFFmpeg, inputUR
 	probeCtx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 
+	recordSubtitleLayoutProbeRan()
 	cmd := exec.CommandContext(probeCtx, probeSubtitleBin(ffprobePathOrFFmpeg),
 		"-v", "error",
 		"-print_format", "json",

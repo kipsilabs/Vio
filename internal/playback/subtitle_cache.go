@@ -470,7 +470,13 @@ func (c *SubtitleCache) ServeExtractWithResult(w http.ResponseWriter, r *http.Re
 			return result, &SubtitleExtractionRetryError{RetryAfter: subtitleFillBusyRetryAfter}
 		}
 		defer releaseRelayDemux()
+		warmOverlap := c.warmInFlight(opts, format)
+		overlapStart := time.Now()
+		recordSubtitleServeSource(subtitleServeSourceExtract)
 		err := c.streamFullTrack(admittedCtx, counter, opts, format, extract)
+		if warmOverlap {
+			recordSubtitleWarmPageOverlap(format, time.Since(overlapStart))
+		}
 		outcome := subtitleTraceOutcome(r.Context(), err)
 		level := slog.LevelInfo
 		if outcome != SubtitleTraceOutcomeSuccess {
@@ -555,6 +561,7 @@ func (c *SubtitleCache) ServeExtractWithResult(w http.ResponseWriter, r *http.Re
 					if writeErr == nil && n != len(data) {
 						writeErr = io.ErrShortWrite
 					}
+					recordSubtitleServeSource(subtitleServeWarmPrefix)
 					logWarmTextServe(r, opts, n, start, end)
 					return result, writeErr
 				}
@@ -652,7 +659,13 @@ func (c *SubtitleCache) ServeExtractWithResult(w http.ResponseWriter, r *http.Re
 		)
 		defer cancel()
 	}
+	warmOverlap := c.warmInFlight(opts, format)
+	overlapStart := time.Now()
+	recordSubtitleServeSource(subtitleServeSourceExtract)
 	err := c.runExtract(extractCtx, opts, extract, counter)
+	if warmOverlap {
+		recordSubtitleWarmPageOverlap(format, time.Since(overlapStart))
+	}
 	if err != nil {
 		if r.Context().Err() == nil && IsSubtitleUpstreamError(err) {
 			c.noteExtractionFailure(opts, format)
@@ -804,6 +817,7 @@ func (c *SubtitleCache) serveCached(w http.ResponseWriter, r *http.Request, opts
 	if !ok {
 		return false
 	}
+	recordSubtitleServeSource(subtitleServeArtifact)
 	defer func() { _ = cached.Close() }()
 	size := int64(SubtitleTraceBytesUnknown)
 	if info, statErr := cached.Stat(); statErr == nil {
@@ -848,6 +862,7 @@ func (c *SubtitleCache) serveWindowResult(w http.ResponseWriter, r *http.Request
 	if !ok {
 		return false, nil
 	}
+	recordSubtitleServeSource(subtitleServeMemoryWindow)
 	slog.Log(r.Context(), slog.LevelDebug, "windowed subtitle served from last-good cache",
 		subtitleTraceAttrs(r.Context(), opts.SourceCodec, SubtitleTracePhaseServe, int64(len(data)), SubtitleTraceOutcomeCacheHit, -1,
 			"track", opts.TrackIndex, "format", format)...)
@@ -1386,7 +1401,13 @@ func (c *SubtitleCache) ServeSUPExtract(w http.ResponseWriter, r *http.Request, 
 	w.Header().Set("Cache-Control", "no-store")
 
 	counter := &subtitleCountingWriter{w: w}
+	warmOverlap := c.warmInFlight(opts, subtitleFormatSUP)
+	overlapStart := time.Now()
+	recordSubtitleServeSource(subtitleServePGSSupSource)
 	err := c.streamFullTrack(admittedCtx, counter, opts, subtitleFormatSUP, extract)
+	if warmOverlap {
+		recordSubtitleWarmPageOverlap(subtitleFormatSUP, time.Since(overlapStart))
+	}
 	outcome := subtitleTraceOutcome(r.Context(), err)
 	level := slog.LevelInfo
 	if outcome != SubtitleTraceOutcomeSuccess {
@@ -1408,6 +1429,7 @@ func (c *SubtitleCache) serveSUPEntry(w http.ResponseWriter, r *http.Request, op
 	if !ok {
 		return false
 	}
+	recordSubtitleServeSource(subtitleServePGSSupArtifact)
 	defer func() { _ = cached.Close() }()
 	size := int64(SubtitleTraceBytesUnknown)
 	if info, statErr := cached.Stat(); statErr == nil {
@@ -1579,7 +1601,13 @@ func (c *SubtitleCache) serveWindowedSUP(w http.ResponseWriter, r *http.Request,
 		)
 		defer cancel()
 	}
+	warmOverlap := c.warmInFlight(sourceOpts, subtitleFormatSUP)
+	overlapStart := time.Now()
+	recordSubtitleServeSource(subtitleServePGSSupSource)
 	err := c.runExtract(extractCtx, opts, extract, counter)
+	if warmOverlap {
+		recordSubtitleWarmPageOverlap(subtitleFormatSUP, time.Since(overlapStart))
+	}
 	if err != nil {
 		if r.Context().Err() == nil && IsSubtitleUpstreamError(err) {
 			// Recorded against the original source identity (sourceOpts), not
@@ -1754,6 +1782,9 @@ func (c *SubtitleCache) WarmInBackground(opts StreamExtractOpts, extract SUPExtr
 		<-c.warmSem
 		return
 	}
+	c.mu.Lock()
+	fill.background = true
+	c.mu.Unlock()
 
 	// Full-track options: the warm ignores the triggering request's window
 	// and writes only to the cache temp file (no response writer).
@@ -1878,6 +1909,9 @@ func (c *SubtitleCache) WarmTrackInBackground(opts StreamExtractOpts, extract SU
 		close(done)
 		return done
 	}
+	c.mu.Lock()
+	fill.background = true
+	c.mu.Unlock()
 
 	// Full-track options: the warm ignores the triggering request's window
 	// and writes only to the cache temp file (no response writer).
@@ -2182,6 +2216,11 @@ type SubtitleCacheFill struct {
 	// temp file grows as the extract runs and requests can watch it. A text
 	// batch writes its files directly and only at the end.
 	progressive bool
+	// background marks a fill owned by a detached background warm rather than
+	// a client request. It exists only so the serve path can count a page
+	// extract that runs alongside the warm's demux on the same relay pipe; no
+	// scheduling decision reads it. Guarded by the cache's mu.
+	background bool
 	// done closes exactly once when the fill settles (Commit or Discard),
 	// releasing any request that is waiting to serve the committed entry.
 	done chan struct{}
@@ -2305,6 +2344,24 @@ func (c *SubtitleCache) reserveFill(inputPath, cacheIdentity string, trackIndex 
 	}
 	fill.tmp = tmp
 	return fill, nil
+}
+
+// warmInFlight reports whether a background warm is currently filling the
+// committed artifact for opts' identity. It is observation only: the serve
+// path uses it to count a page extract that shares the relay pipe with the
+// warm, never to choose a path or wait differently.
+func (c *SubtitleCache) warmInFlight(opts StreamExtractOpts, format string) bool {
+	if c == nil {
+		return false
+	}
+	key, ok := c.formatEntryKey(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, format)
+	if !ok {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	fill := c.inflight[key]
+	return fill != nil && fill.background
 }
 
 func subtitleCacheSource(inputPath, cacheIdentity string, now time.Time) (string, time.Time, int64, bool) {

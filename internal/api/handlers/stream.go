@@ -4282,6 +4282,7 @@ func (h *StreamHandler) reuseVirtualSubtitleLayout(opts *playback.StreamExtractO
 		delete(h.virtualSubtitleLayouts, key)
 		return virtualSubtitleLayoutVerdict{}, false
 	}
+	playback.ObserveSubtitleLayoutProbeReused()
 	return verdict, true
 }
 
