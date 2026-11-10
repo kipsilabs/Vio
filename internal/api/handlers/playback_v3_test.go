@@ -3706,6 +3706,14 @@ func TestPrepareTransportTimelineV3StartsTranscodeAtResumePosition(t *testing.T)
 	if timeline.seekSeconds != 870 || timeline.startSegmentNumber != 435 {
 		t.Fatalf("resume timeline = %#v, want seek 870s at segment 435", timeline)
 	}
+	// The complete playlist begins at the same anchor, so the transport origin
+	// and the client's clock zero are that segment's source position.
+	if timeline.streamOriginSeconds != 870 || plan.Timeline.StreamOriginSeconds != 870 || plan.Timeline.TimelineOffsetSeconds != 870 {
+		t.Fatalf("resume origin = %v (plan %#v), want 870s", timeline.streamOriginSeconds, plan.Timeline)
+	}
+	if math.Abs(plan.Timeline.PlayerStartSeconds-0.6) > 0.0001 || plan.Timeline.SeekWindowStartSeconds == nil || *plan.Timeline.SeekWindowStartSeconds != 870 {
+		t.Fatalf("resume player timeline = %#v, want 0.6s inside an 870s-anchored window", plan.Timeline)
+	}
 }
 
 func TestConfigureHLSTimelineV3MatchesTransportSeekSemantics(t *testing.T) {
@@ -3723,12 +3731,28 @@ func TestConfigureHLSTimelineV3MatchesTransportSeekSemantics(t *testing.T) {
 		t.Fatalf("copy timeline=%#v", copyPlan.Timeline)
 	}
 
+	// A resume starts the generation at the seek anchor, so the complete VOD
+	// playlist begins there and the plan's clock zero is that anchor rather
+	// than the source start. A prefetch of the playlist's first entry then
+	// requests a segment this generation produces instead of one it never
+	// would.
 	encodePlan := &playback.PlanV3{Timeline: playback.TimelineV3{SourceStartSeconds: 17.3}}
 	encodeSeek, encodeSegment := configureHLSTimelineV3(encodePlan, "h264", 2, 600)
-	if encodeSeek != 16 || encodeSegment != 8 || encodePlan.Timeline.StreamOriginSeconds != 0 || encodePlan.Timeline.TimelineOffsetSeconds != 0 || encodePlan.Timeline.PlayerStartSeconds != 17.3 || !encodePlan.Timeline.CanSeekAnywhere ||
-		encodePlan.Timeline.SeekWindowStartSeconds != nil || encodePlan.Timeline.SeekWindowEndSeconds != nil ||
-		encodePlan.Timeline.SeekRestoration != "player_position" {
+	if encodeSeek != 16 || encodeSegment != 8 || encodePlan.Timeline.StreamOriginSeconds != 16 || encodePlan.Timeline.TimelineOffsetSeconds != 16 || math.Abs(encodePlan.Timeline.PlayerStartSeconds-1.3) > 0.0001 || encodePlan.Timeline.CanSeekAnywhere ||
+		encodePlan.Timeline.SeekWindowStartSeconds == nil || *encodePlan.Timeline.SeekWindowStartSeconds != 16 ||
+		encodePlan.Timeline.SeekWindowEndSeconds == nil || *encodePlan.Timeline.SeekWindowEndSeconds != 600 ||
+		encodePlan.Timeline.SeekRestoration != "source_position" {
 		t.Fatalf("encode timeline=%#v seek=%v segment=%d", encodePlan.Timeline, encodeSeek, encodeSegment)
+	}
+
+	// The source-start shape is unchanged: a position of zero keeps the
+	// historical whole-timeline playlist and its source-zero plan.
+	sourceStartPlan := &playback.PlanV3{Timeline: playback.TimelineV3{SourceStartSeconds: 0}}
+	sourceStartSeek, sourceStartSegment := configureHLSTimelineV3(sourceStartPlan, "h264", 2, 600)
+	if sourceStartSeek != 0 || sourceStartSegment != 0 || sourceStartPlan.Timeline.StreamOriginSeconds != 0 || sourceStartPlan.Timeline.TimelineOffsetSeconds != 0 || sourceStartPlan.Timeline.PlayerStartSeconds != 0 || !sourceStartPlan.Timeline.CanSeekAnywhere ||
+		sourceStartPlan.Timeline.SeekWindowStartSeconds != nil || sourceStartPlan.Timeline.SeekWindowEndSeconds != nil ||
+		sourceStartPlan.Timeline.SeekRestoration != "player_position" {
+		t.Fatalf("source-start timeline=%#v seek=%v segment=%d", sourceStartPlan.Timeline, sourceStartSeek, sourceStartSegment)
 	}
 
 	longEncodePlan := &playback.PlanV3{Timeline: playback.TimelineV3{SourceStartSeconds: 17.3}}

@@ -414,6 +414,13 @@ function shouldInvalidateMediaSurfaceQuery(
     }
   }
 
+  if (queryKeyStartsWith(queryKey, catalogKeys.versionLiveness)) {
+    // Version liveness has its own trigger (`versions_updated`) and a
+    // freshness window. A catalog sweep fires for every scan and item change,
+    // so letting it match this key re-probed every version row of the open
+    // title seconds apart — a full provider resolution per row.
+    return false;
+  }
   if (queryKeyStartsWith(queryKey, catalogKeys.all)) {
     return activeCatalogQueryMatchesLibrary(queryKey, options.libraryId);
   }
