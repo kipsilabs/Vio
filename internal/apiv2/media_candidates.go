@@ -73,11 +73,33 @@ const (
 	// would rewrite all candidates and invalidate the probe's CAS snapshot.
 	// Manual refresh and the explicit :discover operation do not use this memo.
 	preplayDiscoveryDetailRepeatWindow = 30 * time.Second
+	// preplayDiscoveryCatalogRepeatWindow is the catalog leaf read's memo
+	// window. That read never selects a version (Android and other thin clients
+	// pick client-side), and a remount used to miss the memo whenever the
+	// selected row changed. The listing itself is item-wide, so a short
+	// item-scoped window suppresses the 80–465-candidate re-enumeration a
+	// remount repeats. It stays short enough that a genuinely new release shows
+	// up on the next page visit.
+	preplayDiscoveryCatalogRepeatWindow = 2 * time.Minute
+	// preplayDiscoveryMaxRepeatWindow is the longest window any trigger uses;
+	// only memo pruning reads it.
+	preplayDiscoveryMaxRepeatWindow = preplayDiscoveryCatalogRepeatWindow
 	// Bound the per-process memo so a busy catalog cannot grow it without
 	// limit. Expired entries are swept first; if the map is still full, it is
 	// cleared, which only costs one extra discovery per item.
 	preplayDiscoveryDetailMemoMaxEntries = 512
 )
+
+// preplayDiscoveryRepeatWindow returns the memo window for one detail trigger.
+// The catalog leaf read is item-scoped and lives longer because it answers a
+// browse read that remounts; the watch read is selection-scoped and about to
+// play, so it keeps the short poll-coalescing window.
+func preplayDiscoveryRepeatWindow(trigger string) time.Duration {
+	if trigger == "catalog_detail" {
+		return preplayDiscoveryCatalogRepeatWindow
+	}
+	return preplayDiscoveryDetailRepeatWindow
+}
 
 const (
 	// maxDetailVirtualWarmVersions caps how many virtual versions one catalog
@@ -95,10 +117,13 @@ const (
 	detailVirtualWarmMemoMaxEntries = 512
 )
 
-// preplayDiscoveryMemoKey identifies one viewer's detail read for one item and
-// selected version. The selected file is part of the key: switching versions
-// must run discovery for the newly selected row even inside the repeat window.
-func preplayDiscoveryMemoKey(ctx context.Context, contentID string, filter catalogpkg.AccessFilter) string {
+// preplayDiscoveryMemoKey identifies one viewer's detail read for one item.
+// The watch read is selection-scoped: switching versions must run discovery for
+// the newly selected row even inside the repeat window. The catalog leaf read
+// is item-scoped: its listing is the same for every row and the page remounts
+// with whatever selection the client last had, so the selected file must not
+// create a fresh memo entry per mount.
+func preplayDiscoveryMemoKey(ctx context.Context, contentID string, filter catalogpkg.AccessFilter, selectionScoped bool) string {
 	userID := 0
 	if claims := claimsFrom(ctx); claims != nil {
 		userID = claims.UserID
@@ -107,18 +132,22 @@ func preplayDiscoveryMemoKey(ctx context.Context, contentID string, filter catal
 	if filter.PresentationLibraryID != nil {
 		libraryID = *filter.PresentationLibraryID
 	}
-	return strconv.Itoa(userID) + "\x00" + profileFrom(ctx) + "\x00" + contentID + "\x00" +
-		strconv.Itoa(filter.SelectedFileID) + "\x00" + strconv.Itoa(libraryID)
+	key := strconv.Itoa(userID) + "\x00" + profileFrom(ctx) + "\x00" + contentID + "\x00" +
+		strconv.Itoa(libraryID)
+	if selectionScoped {
+		key += "\x00" + strconv.Itoa(filter.SelectedFileID)
+	}
+	return key
 }
 
-func (reg *Registry) preplayDiscoveryRecentlyRan(key string) bool {
+func (reg *Registry) preplayDiscoveryRecentlyRan(key string, window time.Duration) bool {
 	if reg == nil || key == "" {
 		return false
 	}
 	reg.preplayDiscoveryMu.Lock()
 	defer reg.preplayDiscoveryMu.Unlock()
 	seen, ok := reg.preplayDiscoverySeen[key]
-	return ok && time.Since(seen) < preplayDiscoveryDetailRepeatWindow
+	return ok && time.Since(seen) < window
 }
 
 func (reg *Registry) rememberPreplayDiscovery(key string) {
@@ -133,7 +162,7 @@ func (reg *Registry) rememberPreplayDiscovery(key string) {
 	}
 	if len(reg.preplayDiscoverySeen) >= preplayDiscoveryDetailMemoMaxEntries {
 		for existing, seen := range reg.preplayDiscoverySeen {
-			if now.Sub(seen) >= preplayDiscoveryDetailRepeatWindow {
+			if now.Sub(seen) >= preplayDiscoveryMaxRepeatWindow {
 				delete(reg.preplayDiscoverySeen, existing)
 			}
 		}
@@ -141,6 +170,9 @@ func (reg *Registry) rememberPreplayDiscovery(key string) {
 			reg.preplayDiscoverySeen = make(map[string]time.Time)
 		}
 	}
+	// The window only decides freshness on read; retention uses the longest
+	// window any trigger can ask for, so a shorter caller never evicts a live
+	// catalog entry.
 	reg.preplayDiscoverySeen[key] = now
 }
 
@@ -194,7 +226,7 @@ func (reg *Registry) endPreplayDiscovery(key string) {
 // admitted is true only when the caller may run the listing; key names the
 // coalescing identity for it. The caller decides whether to claim that key as
 // an in-flight run (see startDetailVersionDiscovery).
-func (reg *Registry) detailDiscoveryAdmission(ctx context.Context, contentID, mediaType string, filter catalogpkg.AccessFilter, trigger string) (claims *auth.Claims, hasVirtualSource bool, key string, admitted bool) {
+func (reg *Registry) detailDiscoveryAdmission(ctx context.Context, contentID, mediaType string, filter catalogpkg.AccessFilter, trigger string, selectionScoped bool) (claims *auth.Claims, hasVirtualSource bool, key string, admitted bool) {
 	claims = claimsFrom(ctx)
 	if claims == nil || (mediaType != themeOwnerMovie && mediaType != themeOwnerEpisode) ||
 		reg.deps.VirtualCandidatesDiscovery == nil {
@@ -218,8 +250,8 @@ func (reg *Registry) detailDiscoveryAdmission(ctx context.Context, contentID, me
 	if reg.deps.PreplayDiscoveryEnabled == nil || !reg.deps.PreplayDiscoveryEnabled(ctx) {
 		return nil, hasVirtualSource, "", false
 	}
-	key = preplayDiscoveryMemoKey(ctx, contentID, filter)
-	if reg.preplayDiscoveryRecentlyRan(key) {
+	key = preplayDiscoveryMemoKey(ctx, contentID, filter, selectionScoped)
+	if reg.preplayDiscoveryRecentlyRan(key, preplayDiscoveryRepeatWindow(trigger)) {
 		// The player polls watch detail for inventory while the pre-play probe
 		// is still running. Re-listing on that poll rewrites every candidate and
 		// invalidates the probe write's catalog snapshot; the first read in this
@@ -280,7 +312,7 @@ func (reg *Registry) runDetailDiscovery(ctx context.Context, claims *auth.Claims
 // short pre-play budget because the caller is about to start playback, and the
 // start path's own candidate resolution depends on that fresh listing.
 func (reg *Registry) startDetailVersionDiscovery(ctx context.Context, contentID, mediaType string, filter catalogpkg.AccessFilter, trigger string, budget time.Duration) (hasVirtualSource bool) {
-	claims, hasVirtualSource, key, admitted := reg.detailDiscoveryAdmission(ctx, contentID, mediaType, filter, trigger)
+	claims, hasVirtualSource, key, admitted := reg.detailDiscoveryAdmission(ctx, contentID, mediaType, filter, trigger, false)
 	if !admitted {
 		return hasVirtualSource
 	}
@@ -311,7 +343,7 @@ func (reg *Registry) startDetailVersionDiscovery(ctx context.Context, contentID,
 // into the answer. Catalog detail uses startDetailVersionDiscovery instead and
 // never waits.
 func (reg *Registry) discoverDetailVersions(ctx context.Context, contentID, mediaType string, filter catalogpkg.AccessFilter, trigger string, budget time.Duration) (discovered, hasVirtualSource bool) {
-	claims, hasVirtualSource, key, admitted := reg.detailDiscoveryAdmission(ctx, contentID, mediaType, filter, trigger)
+	claims, hasVirtualSource, key, admitted := reg.detailDiscoveryAdmission(ctx, contentID, mediaType, filter, trigger, true)
 	if !admitted {
 		return false, hasVirtualSource
 	}
