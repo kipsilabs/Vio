@@ -5189,8 +5189,12 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 				}
 				lastProbedInput = anchorInput
 				probeStarted := time.Now()
-				origin, startSegment, err = probeAnchor(attemptCtx)
-				anchorBudgetElapsed = err != nil && attemptCtx.Err() != nil && ctx.Err() == nil
+				// The probe gets its own adaptive budget on a measured link, so
+				// a resolve that spent most of the attempt cannot truncate it.
+				probeCtx, probeCancel := copySeekProbeContext(ctx, attemptCtx, recentVirtualProviderLinkLatency(linkKey))
+				origin, startSegment, err = probeAnchor(probeCtx)
+				anchorBudgetElapsed = err != nil && probeCtx.Err() != nil && ctx.Err() == nil
+				probeCancel()
 				recordVirtualProviderLinkLatency(linkKey, time.Since(attemptStarted), time.Now())
 				if err == nil || ctx.Err() != nil || attempt == 2 {
 					break

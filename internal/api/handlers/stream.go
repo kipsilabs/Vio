@@ -3952,7 +3952,7 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 			// opts.TrackIndex, but later requests still arrive with the plan
 			// ordinal.
 			planLayoutKey := virtualSubtitleLayoutKey(opts.CacheIdentity, opts.TrackIndex)
-			proceed, probeErr := h.verifyVirtualSubtitleLayout(r.Context(), track, file.SubtitleTracks, &opts)
+			proceed, probeErr := h.verifyVirtualSubtitleLayout(r.Context(), file, track, file.SubtitleTracks, &opts)
 			if !proceed {
 				writeSubtitleSourceChanged(w)
 				return
@@ -4006,7 +4006,7 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 		// pin, validate the live layout, and retry rather than stream an
 		// unvalidated source extract.
 		opts.PinnedTextArtifact = nil
-		proceed, probeErr := h.verifyVirtualSubtitleLayout(r.Context(), track, file.SubtitleTracks, &opts)
+		proceed, probeErr := h.verifyVirtualSubtitleLayout(r.Context(), file, track, file.SubtitleTracks, &opts)
 		if !proceed {
 			writeSubtitleSourceChanged(w)
 			return
@@ -4102,7 +4102,7 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 		// relay URL once — no second resolve — and re-map; a source that still
 		// cannot satisfy the requested representation gets a clean retryable 4xx
 		// instead of a 500.
-		proceed, probeErr := h.verifyVirtualSubtitleLayout(r.Context(), track, file.SubtitleTracks, &opts)
+		proceed, probeErr := h.verifyVirtualSubtitleLayout(r.Context(), file, track, file.SubtitleTracks, &opts)
 		if !proceed {
 			writeSubtitleSourceChanged(w)
 			return
@@ -4426,7 +4426,7 @@ func (h *StreamHandler) resolveWarmExtractLayout(warmCtx context.Context, file *
 		extractOpts.TrackIndex = inherited.trackIndex
 		extractOpts.SourceCodec = inherited.sourceCodec
 	}
-	proceed, validateErr := h.verifyVirtualSubtitleLayout(warmCtx, track, planTracks, extractOpts)
+	proceed, validateErr := h.verifyVirtualSubtitleLayout(warmCtx, file, track, planTracks, extractOpts)
 	if !proceed {
 		// The live layout no longer carries a same-class track for this
 		// plan track. Nothing was committed (the fill is discarded on
@@ -4754,11 +4754,19 @@ func implicitVirtualWindowStart(session *playback.Session) float64 {
 // same-ordinal rotation never trips the post-spawn map net. Virtual inputs are
 // request-local probe state; the session's published evidence is never
 // rewritten.
-func (h *StreamHandler) verifyVirtualSubtitleLayout(ctx context.Context, requestedTrack models.SubtitleTrack, expected []models.SubtitleTrack, opts *playback.StreamExtractOpts) (bool, error) {
+func (h *StreamHandler) verifyVirtualSubtitleLayout(ctx context.Context, file *models.MediaFile, requestedTrack models.SubtitleTrack, expected []models.SubtitleTrack, opts *playback.StreamExtractOpts) (bool, error) {
 	if opts == nil || strings.TrimSpace(opts.InputPath) == "" {
 		return true, nil
 	}
-	liveTracks, err := playback.ProbeSubtitleLayout(ctx, h.ffmpegPath(), opts.InputPath)
+	budget := remoteProbeBudget(ctx, file, playback.RemoteProbeFloor, playback.SubtitleProbeMax)
+	if budget > playback.RemoteProbeFloor {
+		slog.InfoContext(ctx, "virtual subtitle layout probe extended for a slow provider link",
+			"component", "api",
+			"track_codec", requestedTrack.Codec,
+			"budget", budget,
+			"observed_link_latency", recentVirtualProviderLinkLatency(virtualProviderLinkLatencyKey(file)))
+	}
+	liveTracks, err := playback.ProbeSubtitleLayoutWithin(ctx, h.ffmpegPath(), opts.InputPath, budget)
 	if err != nil {
 		// A probe failure (context canceled, relay timeout, transient upstream
 		// error) is not evidence that the pinned source rotated, but without

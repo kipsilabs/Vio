@@ -23,11 +23,18 @@ import (
 // path verify the live layout cheaply and re-map the plan ordinal onto a
 // same-class live track instead of letting ffmpeg fail on `0:s:N`.
 
-// subtitleProbeTimeout bounds the live-layout ffprobe. Subtitle streams are
-// described near the container head, so a healthy probe finishes in well under
-// a second; anything slower is a stuck upstream and should not hold the
-// request.
-const subtitleProbeTimeout = 5 * time.Second
+// subtitleProbeTimeout is the floor for the live-layout ffprobe. Subtitle
+// streams are described near the container head, so a healthy probe finishes in
+// well under a second. The floor is not a wall: a provider link that just took
+// seconds to answer a listing gets a proportionally longer probe (see
+// AdaptiveProbeBudget), because the same upstream first-byte spike that slowed
+// the listing also delays the header this probe reads.
+const subtitleProbeTimeout = RemoteProbeFloor
+
+// SubtitleProbeMax caps an adaptive layout-probe budget. A slow link gets room
+// to answer, but a stuck upstream must not hold the subtitle request: past this
+// bound the caller fails closed and the client falls back to subtitles off.
+const SubtitleProbeMax = 15 * time.Second
 
 // SubtitleLayoutsEqual reports whether two embedded subtitle layouts are
 // track-for-track identical on every attribute the extraction path depends on:
@@ -160,9 +167,19 @@ func stringSlicesEqualFold(a, b []string) bool {
 //
 // ffprobePathOrFFmpeg may be either an ffprobe path or the configured ffmpeg
 // path (ffprobe ships next to ffmpeg in every distribution Silo supports).
-// The probe is bounded to subtitleProbeTimeout; a failure returns an error so
-// the caller can decide whether a spawn can proceed unverified.
+// The probe runs under the floor budget (subtitleProbeTimeout); callers that
+// observed a slower link use ProbeSubtitleLayoutWithin. A failure returns an
+// error so the caller can decide whether a spawn can proceed unverified.
 func ProbeSubtitleLayout(ctx context.Context, ffprobePathOrFFmpeg, inputURL string) ([]models.SubtitleTrack, error) {
+	return ProbeSubtitleLayoutWithin(ctx, ffprobePathOrFFmpeg, inputURL, subtitleProbeTimeout)
+}
+
+// ProbeSubtitleLayoutWithin is ProbeSubtitleLayout with an explicit budget,
+// normally playback.AdaptiveProbeBudget sized from the link's recent provider
+// latency. A non-positive budget means no probe time is left and is reported
+// without spawning ffprobe, so a caller that cannot afford a normal probe fails
+// fast instead of being killed by its own deadline mid-read.
+func ProbeSubtitleLayoutWithin(ctx context.Context, ffprobePathOrFFmpeg, inputURL string, budget time.Duration) ([]models.SubtitleTrack, error) {
 	// A layout probe against a relay URL is a remote read like any other
 	// subtitle demux, so it is admitted on the same per-source budget; a
 	// probe that is skipped this way is a "can't validate right now" answer
@@ -172,8 +189,11 @@ func ProbeSubtitleLayout(ctx context.Context, ffprobePathOrFFmpeg, inputURL stri
 		return nil, fmt.Errorf("probe subtitle layout skipped: %w", demuxErr)
 	}
 	defer releaseRelayDemux()
+	if budget <= 0 {
+		return nil, fmt.Errorf("probe subtitle layout skipped for %s: no remaining probe budget", inputURL)
+	}
 
-	probeCtx, cancel := context.WithTimeout(ctx, subtitleProbeTimeout)
+	probeCtx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 
 	cmd := exec.CommandContext(probeCtx, probeSubtitleBin(ffprobePathOrFFmpeg),
