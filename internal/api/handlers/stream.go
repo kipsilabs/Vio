@@ -1237,6 +1237,9 @@ const (
 	virtualProxyDispositionRelayTemporary = "relay_temporary"
 	virtualProxyDispositionCommitted      = "committed"
 	virtualProxyDispositionFailedOpen     = "failed_open"
+
+	virtualStreamUnavailableCode    = "virtual_stream_unavailable"
+	virtualStreamUnavailableMessage = "Failed to stream virtual media source"
 )
 
 // Attribute keys for the proxy verdict line. The verdict is the single site
@@ -1247,6 +1250,21 @@ const (
 	virtualVerdictLogKeySession         = "session"
 	virtualVerdictLogKeyPlaybackSession = "playback_session_id"
 )
+
+// virtualProxyFailureStatus maps the first-attempt proxy failure to the
+// response written when nothing has been committed. A client cancellation is an
+// abandoned request, not a dependency failure: the upstream fetch runs on the
+// request context, so the viewer navigating away already aborted it. Answering
+// 502 there records a server-error and logs a virtual_stream_unavailable ERROR
+// for a request whose client never saw it. A 4xx request-timeout keeps the
+// response honest for a half-closed client and lets the activity log record the
+// attempt as abandoned.
+func virtualProxyFailureStatus(ctx context.Context, proxyErr error) (status int, code, message string) {
+	if isClientCancellation(ctx, proxyErr) {
+		return http.StatusRequestTimeout, virtualProxyDispositionClientCanceled, "Client closed the request"
+	}
+	return http.StatusBadGateway, virtualStreamUnavailableCode, virtualStreamUnavailableMessage
+}
 
 // virtualProxyDisposition names how a failed direct-play proxy attempt ended
 // before any heal or rotation runs: the first-attempt verdict the verdict log
@@ -2086,7 +2104,8 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 					h.handleTransportStartFailure(r.Context(), session, file, lastProxyErr)
 					if streamWriter.StatusCode() == 0 {
 						logVirtualStreamFailure(r.Context(), sessionID, file, lastProxyErr, deliveredPath)
-						writeErrorCause(streamWriter, http.StatusBadGateway, "virtual_stream_unavailable", "Failed to stream virtual media source", lastProxyErr)
+						status, code, message := virtualProxyFailureStatus(r.Context(), lastProxyErr)
+						writeErrorCause(streamWriter, status, code, message, lastProxyErr)
 					}
 				}
 			}
