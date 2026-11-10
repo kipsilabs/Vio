@@ -224,6 +224,31 @@ describe("useVersionLiveness", () => {
     expect(result.current.get(1)?.available).toBe(true);
   });
 
+  it("does not re-fire for an unchanged selection", async () => {
+    // The watch page rebuilds its version rows on every payload refresh. A
+    // fresh array with the same virtual ids must keep the cached chunk keys,
+    // or the check re-probes the same rows for every re-render.
+    const rows = [makeVersion({ file_id: 1, container: "virtual" })];
+    mocks.api.mockResolvedValue({ results: [{ file_id: 1, available: true }] });
+
+    const { result, rerender } = renderHook(
+      ({ versions }: { versions: FileVersion[] }) => useVersionLiveness(versions, true),
+      {
+        wrapper: createWrapper(createQueryClient()),
+        initialProps: { versions: rows },
+      },
+    );
+
+    await waitFor(() => expect(result.current.get(1)?.available).toBe(true));
+    expect(mocks.api).toHaveBeenCalledTimes(1);
+
+    rerender({ versions: [makeVersion({ file_id: 1, container: "virtual" })] });
+    rerender({ versions: [makeVersion({ file_id: 1, container: "virtual", resolution: "4k" })] });
+
+    await waitFor(() => expect(result.current.get(1)?.available).toBe(true));
+    expect(mocks.api).toHaveBeenCalledTimes(1);
+  });
+
   it("caches results across re-enables (no second request while fresh)", async () => {
     const versions = [makeVersion({ file_id: 1, container: "virtual" })];
     mocks.api.mockResolvedValue({ results: [{ file_id: 1, available: false }] });
