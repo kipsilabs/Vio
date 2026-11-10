@@ -241,6 +241,12 @@ const (
 	// a page storm that never leaves a gap is better served by the next miss
 	// than by a warm that keeps demuxing from the start.
 	subtitleWarmPageYieldAttempts = 4
+	// subtitleWarmRequestShedQuietWindow keeps a new warm off a relay source
+	// whose request-path admission recently shed a client read. The warm is
+	// opportunistic: adding a full-track demux to a pipe that is already
+	// refusing the window the viewer waits on makes both slower. Once the
+	// source stops shedding for this long, the next windowed miss re-attempts.
+	subtitleWarmRequestShedQuietWindow = 15 * time.Second
 	// subtitleWindowResultTTL bounds how long a successful bounded window stays
 	// servable as the last-good copy. A hit refreshes the deadline, so a client
 	// that keeps retrying the same window through an upstream outage keeps its
@@ -1128,9 +1134,13 @@ func (c *SubtitleCache) storeWindowResultFrom(key string, opts StreamExtractOpts
 	copyOfData := make([]byte, len(data))
 	copy(copyOfData, data)
 	c.windowResults[key] = subtitleWindowResult{
-		data:       copyOfData,
-		storedAt:   now,
-		warmPrefix: warmPrefix,
+		data:         copyOfData,
+		storedAt:     now,
+		base:         windowResultKeyBase(key),
+		startSeconds: start,
+		endSeconds:   end,
+		openEnded:    openEnded,
+		warmPrefix:   warmPrefix,
 	}
 	c.windowBytes += int64(len(copyOfData))
 	c.evictWindowResultsLocked(now)
@@ -2067,6 +2077,11 @@ func (c *SubtitleCache) WarmInBackground(opts StreamExtractOpts, extract SUPExtr
 	if !keyOK {
 		return
 	}
+	if relayDemuxRequestPathShedding(opts.InputPath, subtitleWarmRequestShedQuietWindow) {
+		slog.Debug("subtitle cache warm skipped: request-path admission is shedding",
+			"input", opts.InputPath, "track", opts.TrackIndex)
+		return
+	}
 	if !c.warmAdmitted(key, time.Now()) {
 		slog.Debug("subtitle cache warm skipped: failure cooldown",
 			"input", opts.InputPath, "track", opts.TrackIndex)
@@ -2108,6 +2123,15 @@ func (c *SubtitleCache) WarmInBackground(opts StreamExtractOpts, extract SUPExtr
 		start := time.Now()
 		slog.Info("subtitle cache warm started",
 			"input", opts.InputPath, "track", opts.TrackIndex)
+		// A request-path shed that started after this warm was admitted means
+		// the pipe is now serving viewers at its limit; yield the fill rather
+		// than adding a full-track demux to it.
+		if relayDemuxRequestPathShedding(opts.InputPath, subtitleWarmRequestShedQuietWindow) {
+			fill.Discard()
+			slog.DebugContext(ctx, "subtitle cache warm skipped: request-path admission is shedding",
+				"input", opts.InputPath, "track", opts.TrackIndex)
+			return
+		}
 		// A warm is opportunistic: when the relay is already at its demux
 		// ceiling it is dropped rather than queued, and the next windowed miss
 		// re-attempts it. Queueing would make it contend with the window a
@@ -2199,6 +2223,12 @@ func (c *SubtitleCache) WarmTrackInBackground(opts StreamExtractOpts, extract SU
 		close(done)
 		return done
 	}
+	if relayDemuxRequestPathShedding(opts.InputPath, subtitleWarmRequestShedQuietWindow) {
+		slog.Debug("subtitle cache warm skipped: request-path admission is shedding",
+			"input", opts.InputPath, "track", opts.TrackIndex, "format", format)
+		close(done)
+		return done
+	}
 	if !c.warmAdmitted(key, time.Now()) {
 		slog.Debug("subtitle cache warm skipped: failure cooldown",
 			"input", opts.InputPath, "track", opts.TrackIndex, "format", format)
@@ -2262,6 +2292,16 @@ func (c *SubtitleCache) WarmTrackInBackground(opts StreamExtractOpts, extract SU
 			"input", opts.InputPath, "track", opts.TrackIndex, "format", format)
 		yields := 0
 		for {
+			// A request-path shed while this warm was settling means viewers
+			// are already waiting at the pipe's limit. Drop the opportunistic
+			// full-track read; the next windowed miss re-attempts it once the
+			// source stops shedding.
+			if relayDemuxRequestPathShedding(opts.InputPath, subtitleWarmRequestShedQuietWindow) {
+				fill.Discard()
+				slog.Debug("subtitle cache warm skipped: request-path admission is shedding",
+					"input", opts.InputPath, "track", opts.TrackIndex, "format", format)
+				return
+			}
 			// An admitted page owns the pipe; wait for it (bounded) instead of
 			// demuxing the same source alongside it. This also covers the race
 			// where a page is admitted between our start and the first read.
