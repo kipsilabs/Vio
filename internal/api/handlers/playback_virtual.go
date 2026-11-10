@@ -3003,6 +3003,14 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	// path so the candidate loop can return it immediately instead of treating
 	// a deferred (ProbeSucceeded=false) pinned result as a failed candidate.
 	fastPathHit := false
+	// candidateProviderRelist carries the forced-relist intent for the candidate
+	// being resolved. The provider is listed once per resolve, not once per
+	// candidate: the first candidate pays the forced listing a recovery or
+	// rotation asked for, and every later candidate resolves against that fresh
+	// answer. Forcing a list per candidate multiplied one replan into one
+	// multi-second provider round-trip per result (five sequential 2.6-4.8s
+	// listings in production) while returning the same candidate set every time.
+	candidateProviderRelist := providerRelist
 	// incompleteMetadataFastPathSkip records that a stored-URL fast path was
 	// refused because the row lacks planner-grade video evidence. The resolve
 	// below can then merge the candidate's declared labels into
@@ -3263,7 +3271,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				candidateCtx = virtualResolveContextWithPersistedTrust(attemptCtx, file, time.Now(), h.virtualCandidateTrustWindow(), h.storedVirtualURLAllowInsecure(file, oid))
 			}
 			res, err := h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
-				candidateCtx, cand.URI, oid, userID, profileID, providerRelist, excludedCandidateIDs, preferredCandidateID,
+				candidateCtx, cand.URI, oid, userID, profileID, candidateProviderRelist, excludedCandidateIDs, preferredCandidateID,
 			)
 			if err == nil {
 				streamURL = res.URL
@@ -3406,10 +3414,12 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			// source, on a prior attempt). An explicit selection and a forced
 			// relink allow a manual retry; a decode-driven rotation carries its
 			// exclusion explicitly so it never depends on the async stamp.
-			// The verdict binds only the row's own release identity: a
-			// failed sibling under the same neutral key must not veto this
-			// pick (it is tried once and re-indicted under its own id if
-			// still dead). Metadata adoption below is unaffected.
+			// The verdict binds only the candidate its own row names: a failed
+			// sibling under the same neutral key must not veto this pick, and
+			// the neutral fallback lookup returning the session's pinned row
+			// must not re-indict a sibling with the pin's stamp. The candidate
+			// is tried once and indicted under its own id if still dead.
+			// Metadata adoption below is unaffected.
 			if !allowFailed && virtualCandidateVerdictBindsRow(dbFile, cand.URI) &&
 				virtualCandidateVerdictActive(dbFile.FailedAt, time.Now()) {
 				// Name the candidate this attempt is about first. On a
@@ -3867,6 +3877,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	var firstResolved *resolvedVirtualPlaybackSource
 	var attemptErr error
 	for i, candidate := range candidates {
+		candidateProviderRelist = providerRelist && i == 0
 		result, err := resolveAndProbe(i, candidate)
 		if fastPathHit {
 			// The repeat-play fast path already committed the persisted
@@ -6464,10 +6475,12 @@ func (h *PlaybackHandler) virtualCandidateVerdictError(ctx context.Context, cand
 		// No catalog row owns the candidate: there is no verdict to enforce.
 		return nil
 	}
-	// The row's verdict binds only its own release identity: a failed sibling
-	// row under the same neutral key (same episode/profile, different
-	// ?result= pick) must never veto a different pick. A renumbered dead
-	// release is tried once and re-indicted under its new id instead.
+	// The row's verdict binds only the candidate its own row names: a failed
+	// sibling row under the same neutral key (same episode/profile, different
+	// ?result= pick) must never veto a different pick, and the neutral fallback
+	// lookup returning the pinned row must not re-indict a sibling with the
+	// pin's stamp. A renumbered dead release is tried once and re-indicted under
+	// its new id instead.
 	if virtualCandidateVerdictBindsRow(row, candidateURI) &&
 		virtualCandidateVerdictActive(row.FailedAt, now) {
 		return fmt.Errorf("%w: candidate %s is marked failed", ErrVirtualCandidateMarkedFailed, candidateURI)
@@ -6476,23 +6489,20 @@ func (h *PlaybackHandler) virtualCandidateVerdictError(ctx context.Context, cand
 }
 
 // virtualCandidateVerdictBindsRow reports whether a failed catalog row's
-// verdict binds a candidate URI. Same-identity rows always bind. A row
-// carrying durable identity (hash, GUID, or release name) binds only its own
-// release: a failed sibling must never veto a different pick. A row without
-// identity binds neutral matches, preserving the legacy conservative behavior
-// for rows that predate identity persistence (and for renumbered releases
-// neither side can re-identify: the candidate is tried once and re-indicted
-// under its own id if still dead).
+// verdict binds a candidate URI. A verdict is evidence about the bytes its own
+// row names, so it binds that candidate (the exact URI, or the same concrete
+// result id under the same release key). It does not bind a different sibling
+// pick under the same provider-neutral key: the neutral fallback lookup returns
+// the session's pinned row (or the lowest-id row for the title), and binding its
+// failed stamp to every sibling made a rotation walk reject every candidate
+// with "is marked failed" without ever testing one. A renumbered same-release
+// candidate is the identity rematch's job, not the verdict gate's; an unknown
+// candidate is tried once and indicted under its own id if still dead.
 func virtualCandidateVerdictBindsRow(row *models.MediaFile, candidateURI string) bool {
 	if row == nil || candidateURI == "" {
 		return false
 	}
-	if sameVirtualReleaseIdentity(row.FilePath, candidateURI) {
-		return true
-	}
-	return strings.TrimSpace(row.ProviderVideoHash) == "" &&
-		strings.TrimSpace(row.ProviderGUID) == "" &&
-		strings.TrimSpace(row.ProviderReleaseName) == ""
+	return sameVirtualReleaseIdentity(row.FilePath, candidateURI)
 }
 
 // virtualCandidateRowVerified reports whether a catalog lookup result actually

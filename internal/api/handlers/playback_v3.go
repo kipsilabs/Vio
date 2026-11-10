@@ -3701,6 +3701,14 @@ func retainedVirtualBoundFileV3(effective *models.MediaFile, previous *playback.
 // file so each alternate planner input can publish the same inventory
 // provenance the primary plan carries; a local alternate has no resolver and
 // reports empty provenance.
+//
+// The resolve reuses a fresh provider answer instead of forcing a re-list.
+// Every alternate of one title shares a provider-neutral cache key, so forcing
+// the listing per alternate turned one replan into one multi-second provider
+// round-trip per sibling for the same candidate set. A listing that is stale
+// past the TTL still fetches (a miss, a stale-grace refresh, or the failure
+// path's own rotation), so a moved or dead release is re-listed when that is
+// what the evidence says, not on every sibling.
 func (h *PlaybackHandler) prepareVirtualAlternateFileV3(r *http.Request, alternate *models.MediaFile, profileID string) (*models.MediaFile, ProbeProvenance, error) {
 	if alternate == nil {
 		return nil, "", errors.New("nil alternate file")
@@ -3708,7 +3716,7 @@ func (h *PlaybackHandler) prepareVirtualAlternateFileV3(r *http.Request, alterna
 	if !isVirtualPlaybackFile(alternate) {
 		return h.ensurePlaybackProbe(r.Context(), alternate), "", nil
 	}
-	resolved, err := h.resolveVirtualPlaybackSource(r, alternate, profileID, false, nil, "", "", 0, false, virtualResolveOptionsV3{sessionBound: false, bypassProviderFloor: true})
+	resolved, err := h.resolveVirtualPlaybackSource(r, alternate, profileID, false, nil, "", "", 0, false, virtualResolveOptionsV3{sessionBound: false})
 	if err != nil {
 		return nil, "", err
 	}
@@ -5189,8 +5197,12 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 				}
 				lastProbedInput = anchorInput
 				probeStarted := time.Now()
-				origin, startSegment, err = probeAnchor(attemptCtx)
-				anchorBudgetElapsed = err != nil && attemptCtx.Err() != nil && ctx.Err() == nil
+				// The probe gets its own adaptive budget on a measured link, so
+				// a resolve that spent most of the attempt cannot truncate it.
+				probeCtx, probeCancel := copySeekProbeContext(ctx, attemptCtx, recentVirtualProviderLinkLatency(linkKey))
+				origin, startSegment, err = probeAnchor(probeCtx)
+				anchorBudgetElapsed = err != nil && probeCtx.Err() != nil && ctx.Err() == nil
+				probeCancel()
 				recordVirtualProviderLinkLatency(linkKey, time.Since(attemptStarted), time.Now())
 				if err == nil || ctx.Err() != nil || attempt == 2 {
 					break
@@ -10582,7 +10594,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				// The terminal-driven alternate-file hunt below is separately
 				// gated by the negotiated fallback policy, so a failed
 				// rehydration never silently swaps in a sibling version.
-				resolved, resolveErr := h.resolveRehydratedVirtualSourceWithAttemptV3(r, &pinnedFile, record.ProfileID, excludedCandidateIDs, preferredCandidateID, start.QualityPreference, intOrZeroHandlerV3(start.BandwidthCapKbps), virtualResolveOptionsV3{allowFailedCandidate: false, rotateCandidates: virtualDecodeRotation, sessionBound: true, sessionAnchorURI: session.VirtualSourceURI, bypassProviderFloor: true}, record)
+				resolved, resolveErr := h.resolveRehydratedVirtualSourceWithAttemptV3(r, &pinnedFile, record.ProfileID, excludedCandidateIDs, preferredCandidateID, start.QualityPreference, intOrZeroHandlerV3(start.BandwidthCapKbps), virtualResolveOptionsV3{allowFailedCandidate: false, rotateCandidates: virtualDecodeRotation, sessionBound: true, sessionAnchorURI: session.VirtualSourceURI, bypassProviderFloor: virtualReplanNeedsFreshProviderListingV3(operation, req.Failure.Classification, virtualDecodeRotation)}, record)
 				if resolveErr != nil {
 					slog.WarnContext(r.Context(), "virtual playback rehydration failed", "component", "api", "session_id", record.SessionID, "file_id", currentEffectiveFile.ID, "owner_installation_id", session.VirtualSourceOwnerInstallationID, "error", logredact.SanitizeURLError(resolveErr))
 					virtualRehydrationFailed = true
@@ -14516,6 +14528,32 @@ func failureRecoveryAbandonedDeliveryV3(operation playback.ReplanOperationV3, fa
 func failureRecoveryOperationV3(operation playback.ReplanOperationV3) bool {
 	return operation == playback.ReplanOperationFailureRecoveryV3 ||
 		operation == playback.ReplanOperationSeekFailureRecoveryV3
+}
+
+// virtualReplanNeedsFreshProviderListingV3 reports whether a session-bound
+// virtual replan must ask the provider for a new listing instead of reusing a
+// fresh resolved source. Only a cause that indicts the source qualifies: a
+// confirmed decode rejection, a seek failure recovery, or a failure recovery
+// that is not a track change reported as one. A user-intent replan (track,
+// quality, or output change, and a seek reanchor) re-selects within the release
+// already playing, so the resolver's fresh-serve floor and candidate TTL are the
+// right reuse: forcing a listing there paid a multi-second provider round-trip
+// per replan for an answer nothing had invalidated. A source that actually moved
+// or stopped serving still re-lists on the failure path below, so reuse never
+// keeps a dead release pinned.
+func virtualReplanNeedsFreshProviderListingV3(operation playback.ReplanOperationV3, failureClassification string, decodeRotation bool) bool {
+	if decodeRotation {
+		return true
+	}
+	switch operation {
+	case playback.ReplanOperationSeekFailureRecoveryV3:
+		return true
+	case playback.ReplanOperationFailureRecoveryV3:
+		key := failureClassificationKeyV3(failureClassification)
+		return key != failureSubtitleTrackChangedV3 && key != failureAudioTrackChangedV3
+	default:
+		return false
+	}
 }
 
 // abandonedBeforeFirstSegmentV3 reports whether the live transcode session for

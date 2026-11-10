@@ -369,8 +369,11 @@ func TestVerdictLookupAcceptsRotatedConcreteRow(t *testing.T) {
 		t.Fatalf("rotated concrete row refused the verdict gate: %v", err)
 	}
 
-	// The rotation relaxation is not a blanket acceptance: a live failed_at on
-	// the same rotated row still refuses.
+	// A concrete pick is a distinct candidate, so the old pick's verdict does
+	// not veto it. A renumbered same-release candidate is re-identified by its
+	// durable identity on the resolve path, not by reading a sibling's failed
+	// stamp; binding that stamp here is what made a rotation walk reject every
+	// index with "is marked failed" without testing one.
 	failedAt := time.Now()
 	failed := &PlaybackHandler{
 		VirtualFileLookup: func(context.Context, string) (*models.MediaFile, error) {
@@ -380,8 +383,17 @@ func TestVerdictLookupAcceptsRotatedConcreteRow(t *testing.T) {
 			return &models.MediaFile{ID: 77, FilePath: stale, FailedAt: &failedAt}, nil
 		},
 	}
-	if err := failed.virtualCandidateVerdictError(context.Background(), candidate, file, 5, false); err == nil {
-		t.Fatal("a genuinely failed rotated row was accepted")
+	if err := failed.virtualCandidateVerdictError(context.Background(), candidate, file, 5, false); err != nil {
+		t.Fatalf("the old pick's verdict vetoed a different concrete candidate: %v", err)
+	}
+	// The candidate's own verdict still refuses.
+	exact := &PlaybackHandler{
+		VirtualFileLookup: func(_ context.Context, path string) (*models.MediaFile, error) {
+			return &models.MediaFile{ID: 78, FilePath: path, FailedAt: &failedAt}, nil
+		},
+	}
+	if err := exact.virtualCandidateVerdictError(context.Background(), candidate, file, 5, false); !errors.Is(err, ErrVirtualCandidateMarkedFailed) {
+		t.Fatalf("the candidate's own failed verdict = %v, want %v", err, ErrVirtualCandidateMarkedFailed)
 	}
 }
 
