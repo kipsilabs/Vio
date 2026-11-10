@@ -49,6 +49,14 @@ const ASS_WINDOW_LEAD_SECONDS = 20;
 // end. The replacement window restarts `ASS_WINDOW_LEAD_SECONDS` behind the
 // playhead, so it overlaps the outgoing window and the swap drops no cues.
 const ASS_WINDOW_PREFETCH_LEAD_SECONDS = 60;
+// The prefetch lead is source-time seconds, so at 2x/4x the fixed 60 s above is
+// only 30 s/15 s of wall clock and a cold extraction can miss the window
+// boundary. Scale it with the playback rate, but cap it below the window
+// duration: at 4x the raw scaled lead (240 s) exceeds a whole 120 s window, so
+// the next page would be requested the instant the current one commits. 90 s
+// keeps at most one prefetch per window while still leaving 22.5 s of wall
+// clock at 4x.
+const ASS_WINDOW_MAX_PREFETCH_LEAD_SECONDS = 90;
 // A forward seek whose computed window start is within this many seconds of
 // the attempt already in flight is covered by that request and must not
 // restart it. The paired seeking/seeked events (and a playhead that advances
@@ -537,6 +545,28 @@ export function useASSSubtitles(
       return (video!.readyState > 0 ? video!.currentTime : 0) + sourceOriginRef.current;
     }
 
+    /** The element's playback rate, coerced to a usable positive value. */
+    function playbackRate(): number {
+      const rate = video!.playbackRate;
+      return Number.isFinite(rate) && rate > 0 ? rate : 1;
+    }
+
+    /**
+     * Source-time lead before the current window's end at which the next page
+     * is fetched. JASSUB cannot render a page until its whole script arrives,
+     * so the lead has to cover extraction in wall-clock terms; scaling by the
+     * playback rate keeps that margin from collapsing at 2x/4x. A negative or
+     * unreadable rate counts as 1x, and a rate back to 1x restores the fixed
+     * lead. The cap keeps a fast rate from requesting the next page before the
+     * current one has played any of its window.
+     */
+    function prefetchLeadSeconds(): number {
+      return Math.min(
+        ASS_WINDOW_PREFETCH_LEAD_SECONDS * Math.max(1, playbackRate()),
+        ASS_WINDOW_MAX_PREFETCH_LEAD_SECONDS,
+      );
+    }
+
     /**
      * Attaches a completed font bundle to the live renderer without reloading
      * the subtitle script or the track: libass picks the newly registered fonts
@@ -1020,7 +1050,7 @@ export function useASSSubtitles(
       if (cancelled || terminal || usingWholeTrack || !jassubRef.current) return;
       const source = sourcePosition();
       const outside = source < windowStart - 1 || source > windowEnd + 1;
-      const nearEnd = !outside && source > windowEnd - ASS_WINDOW_PREFETCH_LEAD_SECONDS;
+      const nearEnd = !outside && source > windowEnd - prefetchLeadSeconds();
       if (!outside && !nearEnd) return;
       // Restart a full lead behind the playhead so the replacement window
       // overlaps the cue currently on screen regardless of why it fired.
@@ -1237,10 +1267,17 @@ export function useASSSubtitles(
 
     const handleTimeUpdate = () => maybeRefreshWindow(false);
     const handleSeek = () => maybeRefreshWindow(true);
+    // A rate change moves the wall-clock point at which the current window
+    // needs its successor: recompute the trigger at once instead of waiting
+    // for the next timeupdate. This is a no-op unless the playhead is already
+    // inside the (possibly new) prefetch lead, and the in-flight guard in
+    // maybeRefreshWindow keeps repeated rate events from double-fetching.
+    const handleRateChange = () => maybeRefreshWindow(false);
     void attempt(windowStart, false, !resumedAtUnknownPlayhead);
     video.addEventListener("timeupdate", handleTimeUpdate);
     video.addEventListener("seeking", handleSeek);
     video.addEventListener("seeked", handleSeek);
+    video.addEventListener("ratechange", handleRateChange);
 
     return () => {
       cancelled = true;
@@ -1254,6 +1291,7 @@ export function useASSSubtitles(
       video.removeEventListener("timeupdate", handleTimeUpdate);
       video.removeEventListener("seeking", handleSeek);
       video.removeEventListener("seeked", handleSeek);
+      video.removeEventListener("ratechange", handleRateChange);
       // Destroy the current instance if the effect is being torn down
       // (e.g. track switch or unmount). This covers the common case where
       // initJASSUB has already completed and stored the instance.

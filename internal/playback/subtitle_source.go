@@ -235,6 +235,7 @@ func (c *SubtitleCache) serveWindowFromSource(ctx context.Context, w io.Writer, 
 			"file_id", opts.Embedded.MediaFileID, "stream_index", opts.Embedded.StreamIndex, "error", err)
 		return false, nil
 	}
+	recordSubtitleServeSourceFor(subtitleServeSourceExtract, IsPGS(opts.SourceCodec))
 	return true, err
 }
 

@@ -2191,8 +2191,10 @@ only until a complete artifact has been committed; once one exists the whole
 artifact is served and both headers are absent. A client that requested the
 whole track therefore cannot assume a complete body: it reads the headers and
 requests subsequent windows from the advertised end, or treats the response as
-that one window. Explicit `position`/`duration` (and PGS `windowed=1`) always
-override the implicit window. External and downloaded sidecars are always
+that one window. Explicit `position`/`duration` (and PGS `windowed=1` with
+bounds) always override the implicit window; a PGS `windowed=1` with no
+position or duration names no range, so it still receives the implicit first
+window. External and downloaded sidecars are always
 returned whole. First-party native clients that fetch a complete embedded
 sidecar in one request (`silo-apple`, `silo-android`) must handle the bounded
 default and are coordinated with this change.
