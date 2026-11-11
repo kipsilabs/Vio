@@ -5115,7 +5115,7 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 			// observation the attempt just recorded. A second expiry is the
 			// verdict and surfaces the retryable seek error.
 			retryReserved := false
-			retryRemaining := time.Duration(0)
+			var retryRemaining time.Duration
 			lastProbedInput := ""
 			anchorBudgetElapsed := false
 			var err error

@@ -40,16 +40,6 @@ const (
 	copySeekAnchorCacheMax = 256
 )
 
-// CopySeekProbeRetryBudget is the wall-clock budget a caller must reserve
-// before the first copy-video seek-anchor probe for one retry to fit: two full
-// probes. A caller with less than this plus its own scheduling margin must skip
-// the retry rather than start a second probe the deadline will truncate; the
-// caller adds the margin because process startup, probe-slot waits, and result
-// handling sit outside the probe timeout.
-func CopySeekProbeRetryBudget() time.Duration {
-	return 2 * CopySeekProbeTimeout
-}
-
 var (
 	copySeekProbeGroup singleflight.Group
 	copySeekProbeSlots = make(chan struct{}, maxConcurrentCopySeekProbes)

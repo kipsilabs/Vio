@@ -440,7 +440,12 @@ type TranscodeSession struct {
 	// written by a previous generation (or a previous session sharing the
 	// directory) and describes media this process has not produced yet.
 	generationStartedAt time.Time
-	inputCleanupOnce    sync.Once
+	// observedStartupLatency is the most recent measured time from a generation's
+	// spawn to its first produced segment, kept across generations so a restarted
+	// generation that has produced nothing yet can still be judged by what this
+	// session's own restarts cost. Guarded by mu.
+	observedStartupLatency time.Duration
+	inputCleanupOnce       sync.Once
 	// inheritedManifest is the stream.m3u8 an earlier generation left in the
 	// output directory before this process spawned, or nil. FFmpeg replaces the
 	// playlist through a temp file and rename on every write, so a manifest that
@@ -506,7 +511,12 @@ type SegmentProgress struct {
 	// started a process. Output stamped before it belongs to an earlier
 	// generation and must not be read as this process's progress.
 	GenerationStartedAt time.Time
-	HasManifest         bool
+	// StartupLatency is how long the current generation needed from spawn to its
+	// first produced segment: the encoder's observed cost of opening the source
+	// at the position that generation starts at. Zero until the generation has
+	// produced a segment, and for sessions that never started a process.
+	StartupLatency time.Duration
+	HasManifest    bool
 	// ProducedHeadCurrentGeneration is ProducedHead restricted to segments this
 	// generation's process actually wrote, judged by file mtime at or after
 	// GenerationStartedAt. On a restart that keeps a prior generation's segments
@@ -3699,6 +3709,10 @@ func (s *TranscodeSession) SegmentProgress(time.Time) SegmentProgress {
 	}
 
 	manifestPath := filepath.Join(s.outputDir, "stream.m3u8")
+	// The earliest segment this generation wrote is its first output; the gap
+	// from the spawn stamp to it is how long the encoder needed to open the
+	// source at this generation's start position.
+	var firstGenerationSegmentAt time.Time
 	manifestInfo, statErr := os.Stat(manifestPath)
 	var timeline manifestTimeline
 	var parseOK bool
@@ -3731,6 +3745,9 @@ func (s *TranscodeSession) SegmentProgress(time.Time) SegmentProgress {
 				if entry.number > progress.ProducedHeadCurrentGeneration {
 					progress.ProducedHeadCurrentGeneration = entry.number
 				}
+				if firstGenerationSegmentAt.IsZero() || info.ModTime().Before(firstGenerationSegmentAt) {
+					firstGenerationSegmentAt = info.ModTime()
+				}
 			}
 		}
 	} else if s.outputDir != "" {
@@ -3761,6 +3778,9 @@ func (s *TranscodeSession) SegmentProgress(time.Time) SegmentProgress {
 					if segNum > progress.ProducedHeadCurrentGeneration {
 						progress.ProducedHeadCurrentGeneration = segNum
 					}
+					if firstGenerationSegmentAt.IsZero() || info.ModTime().Before(firstGenerationSegmentAt) {
+						firstGenerationSegmentAt = info.ModTime()
+					}
 				}
 			}
 			if statErr == nil && progress.ProducedCount > 0 {
@@ -3769,8 +3789,39 @@ func (s *TranscodeSession) SegmentProgress(time.Time) SegmentProgress {
 			}
 		}
 	}
+	if latency := startupLatencyOf(progress.GenerationStartedAt, firstGenerationSegmentAt); latency > 0 {
+		progress.StartupLatency = latency
+		s.mu.Lock()
+		s.observedStartupLatency = latency
+		s.mu.Unlock()
+	}
 	scanActiveTempProgress(s.outputDir, &progress)
 	return progress
+}
+
+// startupLatencyOf reports how long a generation needed from its spawn stamp to
+// its first produced segment, or zero when either stamp is missing.
+func startupLatencyOf(generationStartedAt, firstSegmentAt time.Time) time.Duration {
+	if generationStartedAt.IsZero() || firstSegmentAt.IsZero() {
+		return 0
+	}
+	if latency := firstSegmentAt.Sub(generationStartedAt); latency > 0 {
+		return latency
+	}
+	return 0
+}
+
+// StartupLatency reports this session's most recently measured generation
+// startup: the time between a generation's spawn and its first produced
+// segment. It falls back to the current generation's measurement when one was
+// just scanned, and is zero before any generation has produced output.
+func (s *TranscodeSession) StartupLatency() time.Duration {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.observedStartupLatency
 }
 
 func scanActiveTempProgress(outputDir string, progress *SegmentProgress) {
@@ -5855,6 +5906,16 @@ func (s *TranscodeSession) WaitForRestartContinuation(name string) (*SegmentLeas
 // SeekRestartServeTimeout. A spent budget answers the stale-generation verdict
 // without waiting; the detached restart still produces the segment for the
 // client's playlist reload.
+//
+// The hold is also skipped when this session's own restarts are known to need
+// longer than the stall window to produce their first segment. A virtual
+// provider that opens in 4.7-10s cannot reach the stall window, so holding the
+// request spends the client's read budget on a wait that is already lost — the
+// production 3.5s-then-412 for a 2062s seek. Answering the stale-generation
+// verdict immediately is the same outcome the client gets after the hold, minus
+// the wait; the restart keeps producing for the playlist reload it triggers. A
+// session whose restarts start inside the stall window keeps the hold, so a
+// seek that the encoder serves in a few hundred milliseconds is still served.
 func (s *TranscodeSession) WaitForRestartContinuationWithin(name string, budget time.Duration) (*SegmentLease, error) {
 	if budget <= 0 {
 		if restartErr := s.AsyncRestartFailure(); restartErr != nil {
@@ -5865,6 +5926,20 @@ func (s *TranscodeSession) WaitForRestartContinuationWithin(name string, budget 
 	stall := SeekRestartStallTimeout
 	if budget < stall {
 		stall = budget
+	}
+	if startup := s.StartupLatency(); startup > 0 && startup > stall {
+		if restartErr := s.AsyncRestartFailure(); restartErr != nil {
+			return nil, restartErr
+		}
+		slog.Debug("transcode restart continuation answered without a hold: this session's restarts start slower than the stall window",
+			"component", "playback",
+			"segment", name,
+			"startup_latency_ms", startup.Milliseconds(),
+			"stall_ms", stall.Milliseconds(),
+			"budget_ms", budget.Milliseconds(),
+			"session", s.Opts().SessionID,
+		)
+		return nil, ErrStaleSegmentGeneration
 	}
 	lease, err := s.WaitForOpenSegmentWithStall(name, budget, stall)
 	if err == nil {
