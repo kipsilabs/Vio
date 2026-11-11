@@ -1475,19 +1475,19 @@ new route may be one this client cannot reach. If that recovery then cannot
 reach the server, it joins the reconnect and continues the same budget.
 
 The server applies the same distinction from its own evidence when a client
-reports the loss through `failure_recovery` anyway. A failure recovery on an
-attempt whose durable progress shows at least one accepted sample
-(`LastSequence > 0`) keeps the route that just played eligible for one reissue:
-same delivery and recipe, with a fresh plan id and stream token. The recovery
-chain's `attempt_count` bounds it, so the reissued transport's next failure
-retires the route as usual. A failure with no progress sample keeps the
-ordinary ladder, and a classification that retires the whole delivery
-(`decoder_failure`, `decode_error`, `player_failure`, `http_failure`,
-`parser_failure`) is not reissued. If that history already excluded the
-source-preserving routes and only video adaptation remains while transcoding is
-disabled, the terminal is the retryable `routes_exhausted`;
-`transcoding_disabled` stays reserved for a first plan whose source really
-needs an encode.
+reports the loss through `failure_recovery` anyway. A failure recovery whose
+classification is a connectivity loss (`transport_stall`, `network_error`,
+`network_failure`) on an attempt whose current transport already showed its
+first frame (`current_transport_rendered`) keeps the route that just played
+eligible for one reissue: same delivery and recipe, with a fresh plan id and
+stream token. The recovery chain's `attempt_count` bounds it, so the reissued
+transport's next failure retires the route as usual. A failure before the
+transport's own first frame keeps the ordinary ladder, because the new route may
+be one this client cannot reach, and any other classification is not a lost
+connection at all. If that history already excluded the source-preserving routes
+and only video adaptation remains while transcoding is disabled, the terminal is
+the retryable `routes_exhausted`; `transcoding_disabled` stays reserved for a
+first plan whose source really needs an encode.
 
 A transport failure that abandons a delivery retires the recipe, not the
 delivery class. Three cases are worth keeping apart:
@@ -1528,11 +1528,11 @@ client ever read from the stream it is indicting. A `failure_recovery` that
 arrives after the server answered this attempt's playlist but before a single
 segment request is a client that stopped reading, not a verdict on the route:
 the player reached the stream, asked for no media, and then reported a failure.
-The server answers it as `playback_session_not_found` and stops the session
-instead of rotating, demoting the delivery, or persisting a failure for a recipe
-that was never exercised. A recovery that arrives before the playlist was served
-is a failure the client met inside the stream and keeps the ordinary ladder, and
-so does every session that already served a segment request.
+The server stops the session and answers it as `session_expired` instead of
+rotating, demoting the delivery, or persisting a failure for a recipe that was
+never exercised. A recovery that arrives before the playlist was served is a
+failure the client met inside the stream and keeps the ordinary ladder, and so
+does every session that already served a segment request.
 
 ### 6.2.1 An audio-output failure is not a transport failure
 
