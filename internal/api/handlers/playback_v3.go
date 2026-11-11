@@ -79,12 +79,6 @@ const (
 	videoRangeHLG   = "HLG"
 	videoRangeHDR10 = "HDR10"
 	videoRangeSDR   = "SDR"
-	// copySeekProbeRetryMargin is the slack a replan keeps beyond a second full
-	// copy-video seek-anchor probe before attempting it. Process startup, the
-	// probe-slot wait and result handling all sit outside the probe timeout, so
-	// a retry without this margin would spend the caller's last budget and fail
-	// with the caller deadline instead of the probe error.
-	copySeekProbeRetryMargin = 5 * time.Second
 	// maxHLSRouteAttemptLoopV3 bounds the transport route-selection loop. Without
 	// it, a chain of fast-failing remote candidates (e.g. HTTP 500 from a node
 	// missing a recipe) can spend 32 × (remote timeout + local spawn) inside
@@ -98,8 +92,7 @@ const (
 	// same candidate after an upstream 5xx. The provider is already failing, so
 	// an immediate second probe hammers it; the pause is short enough to still
 	// fit a resumed session's seek budget.
-	copySeekAnchorTransientBackoff = 750 * time.Millisecond
-	// maxVirtualTransientTransportAlternates bounds how many compatible
+	copySeekAnchorTransientBackoff = 750 * time.Millisecond // maxVirtualTransientTransportAlternates bounds how many compatible
 	// alternates one start may try after a transport failure whose cause is a
 	// transient provider error (upstream 5xx). A failing upstream should not be
 	// hammered once per alternate; one alternate keeps a chance to recover on a
@@ -205,6 +198,12 @@ const v3NodeCapabilityRefreshInterval = v3NodeCapabilityTTL / 4
 // elapses the failure is classified as a retryable seek error, not evidence
 // against the release, so the transport is not rotated or torn down over it.
 var copySeekAnchorSeekResolveTimeout = 5 * time.Second
+
+// copySeekProbeRetryMargin is the slack one anchor attempt keeps beyond its own
+// window, so process startup, the probe-slot wait, and result handling never
+// spend the caller's last budget. It is a var so tests can shorten it alongside
+// copySeekAnchorSeekResolveTimeout.
+var copySeekProbeRetryMargin = 5 * time.Second
 
 type serverBitrateCapContextKeyV3 struct{}
 
@@ -4745,34 +4744,58 @@ func (h *PlaybackHandler) validateLocalProgressiveCapabilitiesV3(ctx context.Con
 	return nil
 }
 
-// copySeekAnchorRetryFits reports whether the caller's remaining budget can
-// accommodate a second copy-video seek-anchor probe. Without an explicit
-// deadline the probe's own per-attempt cap bounds the retry, so it is allowed.
-// With a deadline, a retry only helps when more than a full probe plus the
-// scheduling margin remains; otherwise it would spend the rest of the budget
-// and surface the caller deadline instead of the probe error.
-func copySeekAnchorRetryFits(ctx context.Context) (bool, time.Duration) {
+// copySeekAnchorAttemptBudget sizes one copy-video seek-anchor attempt against
+// the link's adaptive per-attempt budget and the caller's remaining time, and
+// reports whether a retry is reserved for it. remaining is the caller's whole
+// remaining budget, for logging.
+//
+// The budget is the adaptive attempt size clamped to what the caller has left
+// after the scheduling margin, so an attempt started here can never be
+// truncated by the caller's deadline and answer that deadline instead of the
+// anchor failure. When the caller can hold two adaptive attempts the first one
+// is capped at its adaptive size and a retry is reserved; when it cannot, the
+// first attempt keeps everything usable and no retry is planned, because
+// splitting a window that cannot hold two full attempts would truncate both of
+// them — a link whose probe needs 4.7s cut to half its window twice serves
+// neither attempt, while one honest attempt plus a clear retryable verdict
+// leaves the client's own seek retry the chance to land.
+//
+// This replaces the previous "does a full second probe still fit?" gate, which
+// compared a *freshly re-derived* adaptive attempt (sized from the observation
+// the expired attempt had just recorded, so twice a 10s stall) against the
+// remaining deadline. On a slow-but-alive provider that gate could never pass,
+// so the retry was skipped and one slow attempt ended the session.
+func copySeekAnchorAttemptBudget(ctx context.Context, adaptive time.Duration, reserveRetry bool) (budget time.Duration, retryReserved bool, remaining time.Duration) {
+	if ctx == nil {
+		return adaptive, reserveRetry, 0
+	}
 	deadline, ok := ctx.Deadline()
 	if !ok {
-		return true, 0
+		return adaptive, reserveRetry, 0
 	}
-	remaining := time.Until(deadline)
-	return remaining > playback.CopySeekProbeTimeout+copySeekProbeRetryMargin, remaining
-}
-
-// copySeekAnchorRetryReserved reports whether the caller's remaining budget can
-// hold a retry reserved from the start of the copy-video seek-anchor
-// resolution: two full probes plus the scheduling margin. A caller that fails
-// this gate never plans a retry, so the deadline cannot truncate a second probe
-// mid-flight. It is the up-front reservation the in-loop copySeekAnchorRetryFits
-// gate then narrows to the single retry probe once the first attempt has run. A
-// caller with no deadline reserves the full probe cap and keeps the retry.
-func copySeekAnchorRetryReserved(ctx context.Context) bool {
-	deadline, ok := ctx.Deadline()
-	if !ok {
-		return true
+	remaining = time.Until(deadline)
+	usable := remaining - copySeekProbeRetryMargin
+	if usable <= 0 {
+		// No room to reserve a retry. One attempt bounded by what is actually
+		// left keeps the single-probe behavior a tight caller had before: a fast
+		// provider still lands, and a slow one fails with the retryable anchor
+		// verdict instead of being handed a second attempt the deadline would
+		// truncate.
+		if remaining <= 0 {
+			return 0, false, remaining
+		}
+		if adaptive > remaining {
+			adaptive = remaining
+		}
+		return adaptive, false, remaining
 	}
-	return time.Until(deadline) > playback.CopySeekProbeRetryBudget()+copySeekProbeRetryMargin
+	if adaptive > usable {
+		adaptive = usable
+		retryReserved = false
+	} else {
+		retryReserved = reserveRetry && usable >= 2*adaptive
+	}
+	return adaptive, retryReserved, remaining
 }
 
 // virtualTransportSameReleaseRetryKey marks a start request that has already
@@ -4845,16 +4868,15 @@ func (h *PlaybackHandler) recoverVirtualTransportSameReleaseV3(
 }
 
 // waitCopySeekAnchorBackoff pauses before retrying a candidate after a
-// transient provider (upstream 5xx) failure. It returns false when the wait or
-// its result cannot fit the caller's remaining budget, so the retry is skipped
-// instead of started without time to finish. remaining is the value already
-// returned by copySeekAnchorRetryFits; 0 means the caller had no deadline.
+// transient provider (upstream 5xx) failure. It returns false when the pause
+// would leave no room for the retry it precedes, so the retry is skipped
+// instead of started without time to finish. remaining is the caller's whole
+// remaining budget as reported by copySeekAnchorAttemptBudget; 0 means the
+// caller had no deadline.
 func (h *PlaybackHandler) waitCopySeekAnchorBackoff(ctx context.Context, remaining time.Duration) bool {
 	d := copySeekAnchorTransientBackoff
-	if remaining > 0 {
-		if room := remaining - (playback.CopySeekProbeTimeout + copySeekProbeRetryMargin); room < d {
-			d = room
-		}
+	if remaining > 0 && remaining <= copySeekProbeRetryMargin+d {
+		return false
 	}
 	if d <= 0 {
 		return false
@@ -5074,10 +5096,11 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 			// failing fast on the first error is both cheaper and clearer. A
 			// caller with no deadline keeps the retry.
 			//
-			// The retry budget is reserved up front: a caller that cannot hold
-			// two full probes plus the scheduling margin never plans a retry, so
-			// a second attempt cannot be started only to be truncated by the
-			// deadline.
+			// The retry budget is reserved by the per-attempt sizing below: an
+			// attempt is never granted more than the caller has left after the
+			// scheduling margin (so it cannot be truncated by the deadline),
+			// and the first attempt only reserves a retry when the caller can
+			// hold a second attempt of the same adaptive size.
 			//
 			// An upstream 5xx and a probe signal-killed from outside (the OOM
 			// killer or an operator) are transient failures: they are retried
@@ -5091,7 +5114,8 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 			// release is retried once under a budget re-derived from the
 			// observation the attempt just recorded. A second expiry is the
 			// verdict and surfaces the retryable seek error.
-			retryReserved := copySeekAnchorRetryReserved(ctx)
+			retryReserved := false
+			retryRemaining := time.Duration(0)
 			lastProbedInput := ""
 			anchorBudgetElapsed := false
 			var err error
@@ -5106,7 +5130,19 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 				cancelAttempt()
 				resolveFailure = nil
 				attemptStarted := time.Now()
-				attemptBudget := copySeekAnchorResolveBudgetFor(file)
+				attemptBudget, reserved, remaining := copySeekAnchorAttemptBudget(ctx, copySeekAnchorResolveBudgetFor(file), attempt == 1)
+				if attempt == 1 {
+					retryReserved = reserved
+				}
+				retryRemaining = remaining
+				if attemptBudget <= 0 {
+					// No caller time is left for an attempt at all. Report it
+					// as our own budget expiring below: a slow caller, not a
+					// verdict about the release.
+					anchorBudgetElapsed = ctx.Err() == nil
+					err = fmt.Errorf("resolve copy seek anchor: no attempt budget left: %w", context.DeadlineExceeded)
+					break
+				}
 				attemptCtx, cancel := context.WithTimeout(ctx, attemptBudget)
 				cancelAttempt = cancel
 				if virtualAnchor {
@@ -5134,7 +5170,7 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 						if !anchorBudgetElapsed {
 							break
 						}
-						if fits, remaining := copySeekAnchorAttemptFits(ctx, copySeekAnchorResolveBudgetFor(file)); !fits {
+						if !retryReserved {
 							slog.WarnContext(ctx, "virtual seek anchor resolve retry skipped: insufficient remaining budget",
 								"component", "api",
 								"playback_session_id", session.ID,
@@ -5183,16 +5219,14 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 							break
 						}
 					}
-					if attempt > 1 && !anchorBudgetElapsed {
-						if fits, remaining := copySeekAnchorRetryFits(ctx); !fits {
-							slog.WarnContext(ctx, "copy-video seek anchor retry skipped after re-resolve: insufficient remaining budget",
-								"component", "api",
-								"playback_session_id", session.ID,
-								"requested_seek_seconds", requested,
-								"remaining", remaining,
-							)
-							break
-						}
+					if attempt > 1 && !anchorBudgetElapsed && !retryReserved {
+						slog.WarnContext(ctx, "copy-video seek anchor retry skipped after re-resolve: insufficient remaining budget",
+							"component", "api",
+							"playback_session_id", session.ID,
+							"requested_seek_seconds", requested,
+							"remaining", retryRemaining,
+						)
+						break
 					}
 				}
 				lastProbedInput = anchorInput
@@ -5200,6 +5234,12 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 				// The probe gets its own adaptive budget on a measured link, so
 				// a resolve that spent most of the attempt cannot truncate it.
 				probeCtx, probeCancel := copySeekProbeContext(ctx, attemptCtx, recentVirtualProviderLinkLatency(linkKey))
+				if retryReserved {
+					// A retry is reserved: keep this probe inside the attempt
+					// window it was granted so it cannot spend the retry's
+					// share on one provider open.
+					probeCtx, probeCancel = capProbeToAttempt(probeCtx, probeCancel, attemptCtx)
+				}
 				origin, startSegment, err = probeAnchor(probeCtx)
 				anchorBudgetElapsed = err != nil && probeCtx.Err() != nil && ctx.Err() == nil
 				probeCancel()
@@ -5208,12 +5248,12 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 					break
 				}
 				if anchorBudgetElapsed {
-					if fits, remaining := copySeekAnchorAttemptFits(ctx, copySeekAnchorResolveBudgetFor(file)); !fits {
+					if !retryReserved {
 						slog.WarnContext(ctx, "copy-video seek anchor probe retry skipped: insufficient remaining budget",
 							"component", "api",
 							"playback_session_id", session.ID,
 							"requested_seek_seconds", requested,
-							"remaining", remaining,
+							"remaining", retryRemaining,
 							"error", err,
 						)
 						break
@@ -5227,27 +5267,24 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 					)
 					continue
 				}
-				fits, remaining := copySeekAnchorRetryFits(ctx)
-				// A fast transient failure (relay 5xx in milliseconds, not a
-				// consumed 15s probe) leaves room for a full second probe:
-				// gate the retry on the single-probe fit rather than the
-				// up-front two-probe reservation, which a slow resolve may
-				// already have spent. Slow failures keep the conservative
+				// A fast transient failure (a relay 5xx in milliseconds, not a
+				// consumed attempt) leaves room for a real second attempt even
+				// when the first could not reserve one: the failed attempt
+				// barely spent its window. A slow failure keeps the reserved
 				// gate so a truncated second probe cannot mask the error.
 				fastTransient := playback.IsTransientProviderError(err) && time.Since(probeStarted) < playback.CopySeekProbeTimeout
-				if !fits || (!retryReserved && !fastTransient) {
+				if !retryReserved && !fastTransient {
 					slog.WarnContext(ctx, "copy-video seek anchor retry skipped: insufficient remaining budget",
 						"component", "api",
 						"playback_session_id", session.ID,
 						"requested_seek_seconds", requested,
-						"remaining", remaining,
-						"required", playback.CopySeekProbeRetryBudget()+copySeekProbeRetryMargin,
+						"remaining", retryRemaining,
 						"error", err,
 					)
 					break
 				}
 				if playback.IsTransientProviderError(err) {
-					if !h.waitCopySeekAnchorBackoff(attemptCtx, remaining) {
+					if !h.waitCopySeekAnchorBackoff(ctx, retryRemaining) {
 						slog.WarnContext(ctx, "copy-video seek anchor retry skipped: no budget for the provider backoff",
 							"component", "api",
 							"playback_session_id", session.ID,

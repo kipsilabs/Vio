@@ -98,6 +98,30 @@ func copySeekProbeContext(ctx, attemptCtx context.Context, observed time.Duratio
 	return context.WithDeadline(ctx, deadline)
 }
 
+// capProbeToAttempt keeps a probe inside its attempt's own window. A measured
+// link's probe is allowed to outlive the attempt context (see
+// copySeekProbeContext) because the resolve leg has already spent part of it,
+// which is exactly what lets a slow resolve still leave a full probe. When the
+// attempt's retry is reserved, that latitude would let the first probe run into
+// the slice the retry needs and leave nothing for it — the production shape
+// where one 10s provider open consumed the whole attempt budget. The attempt
+// budget is sized from the same observation as the probe, so bounding the probe
+// at it costs a measured link nothing it was promised.
+func capProbeToAttempt(probeCtx context.Context, probeCancel context.CancelFunc, attemptCtx context.Context) (context.Context, context.CancelFunc) {
+	attemptDeadline, ok := attemptCtx.Deadline()
+	if !ok {
+		return probeCtx, probeCancel
+	}
+	if probeDeadline, ok := probeCtx.Deadline(); ok && !probeDeadline.After(attemptDeadline) {
+		return probeCtx, probeCancel
+	}
+	cappedCtx, cappedCancel := context.WithDeadline(probeCtx, attemptDeadline)
+	return cappedCtx, func() {
+		cappedCancel()
+		probeCancel()
+	}
+}
+
 // remoteProbeBudget sizes one probe attempt against file's provider link from
 // that link's slowest recent observation and the caller's remaining budget. It
 // is the handler-side entry to playback.AdaptiveProbeBudget: a link whose
@@ -114,21 +138,6 @@ func remoteProbeBudget(ctx context.Context, file *models.MediaFile, floor, maxBu
 		}
 	}
 	return playback.AdaptiveProbeBudget(floor, maxBudget, recentVirtualProviderLinkLatency(virtualProviderLinkLatencyKey(file)), remaining)
-}
-
-// copySeekAnchorAttemptFits reports whether the caller's remaining budget can
-// hold one more anchor resolve attempt at budget, plus the scheduling margin
-// process startup, probe-slot waits, and result handling need. A retry that
-// only half fits would be truncated by the caller deadline and surface that
-// deadline instead of the anchor failure, so it is skipped instead. A caller
-// with no deadline keeps the retry.
-func copySeekAnchorAttemptFits(ctx context.Context, budget time.Duration) (bool, time.Duration) {
-	deadline, ok := ctx.Deadline()
-	if !ok {
-		return true, 0
-	}
-	remaining := time.Until(deadline)
-	return remaining > budget+copySeekProbeRetryMargin, remaining
 }
 
 // virtualProviderLinkLatencyKey names the provider link a source is served
