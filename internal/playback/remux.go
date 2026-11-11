@@ -545,12 +545,24 @@ func remuxInputKind(filePath string) string {
 // stderr is the only place the reason appears; without it the failure reads as
 // a bare EOF and a broken argument, an unsupported input scheme, and a dead
 // provider are indistinguishable.
+//
+// A client that walked away ends the request context, and the owner answers it
+// by aborting the remux; the closed pipe that produces is our own teardown, not
+// the encoder's or the source's verdict. Those are recorded at debug so a
+// normal cancel does not read as an encoder failure (every production instance
+// of this warning was a client cancel that had already delivered media) while a
+// remux that produced nothing with the request still live keeps the warning.
 func logRemuxNoOutput(ctx context.Context, filePath string, session *RemuxSession) {
 	attrs := []any{logKeyComponent, logValuePlayback, "input_kind", remuxInputKind(filePath)}
 	if session != nil {
 		if tail := session.stderr.String(); tail != "" {
 			attrs = append(attrs, "ffmpeg_stderr", tail)
 		}
+	}
+	if ctx != nil && ctx.Err() != nil {
+		attrs = append(attrs, "reason", "client_canceled")
+		slog.DebugContext(ctx, "remux produced no output before the request ended", attrs...)
+		return
 	}
 	slog.WarnContext(ctx, "remux produced no output", attrs...)
 }

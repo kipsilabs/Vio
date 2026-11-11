@@ -2,6 +2,7 @@ package playback
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"log/slog"
@@ -261,5 +262,37 @@ func TestServeRemuxNoOutputLogsFFmpegStderr(t *testing.T) {
 		if !strings.Contains(line, want) {
 			t.Fatalf("log = %s, want it to contain %q", line, want)
 		}
+	}
+}
+
+// TestRemuxNoOutputDowngradesClientTeardown proves a remux whose read ends
+// because the client left is recorded at debug, while the same failure with the
+// request still live stays a warning. Every production instance of the warning
+// was co-timed to a client cancel after the session had already delivered
+// media, so the warn level told operators nothing about the encoder.
+func TestRemuxNoOutputDowngradesClientTeardown(t *testing.T) {
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	session := &RemuxSession{stderr: &remuxStderrTail{}}
+	_, _ = session.stderr.Write([]byte("Error opening input file"))
+
+	logRemuxNoOutput(context.Background(), "/media/movie.mkv", session)
+	if line := logs.String(); !strings.Contains(line, `"level":"WARN"`) || !strings.Contains(line, "Error opening input file") {
+		t.Fatalf("live-request log = %s, want the encoder warning with FFmpeg stderr", line)
+	}
+
+	logs.Reset()
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	logRemuxNoOutput(canceled, "/media/movie.mkv", session)
+	line := logs.String()
+	if strings.Contains(line, `"level":"WARN"`) {
+		t.Fatalf("client-cancel log = %s, want no encoder warning", line)
+	}
+	if !strings.Contains(line, `"level":"DEBUG"`) || !strings.Contains(line, `"reason":"client_canceled"`) {
+		t.Fatalf("client-cancel log = %s, want the debug teardown line", line)
 	}
 }
