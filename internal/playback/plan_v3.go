@@ -128,6 +128,10 @@ type PlannerInputV3 struct {
 	// surround one. It is set only for the single bounded retry the handler
 	// allows per delivery, and it never changes the delivery itself.
 	AudioShapeRetry bool
+	// AudioInitFailureDetail names the client's audio-output failure when the
+	// attempt's most recent failure was one. The planner uses it to report a
+	// specific terminal instead of a generic adaptation refusal.
+	AudioInitFailureDetail string
 	// LocalNetwork reports that the request came from the server's local
 	// network (streamlocation.Local). False is treated as remote.
 	LocalNetwork bool
@@ -990,6 +994,14 @@ func planPlaybackOnceV3(input PlannerInputV3) (result PlannerResultV3) {
 		return planVideoTranscodeV3(input, base, source, quality, hlsSubtitle, "copy_routes_exhausted", false, compatibleRouteExcludedByHistory)
 	}
 
+	if input.AudioInitFailureDetail != "" {
+		// The attempt's most recent failure was the device's audio output
+		// failing to initialize, and no recipe survived the ladder. Name that
+		// cause instead of the generic route refusal, and stay retryable: a
+		// different audio track or device output setting can make the same
+		// source play. The detail carries the client's own failing code.
+		return terminalPlannerResultV3WithDetail(TerminalAudioOutputUnsupportedV3, TerminalAudioOutputUnsupportedMessageV3, input.AudioInitFailureDetail, true)
+	}
 	return terminalPlannerResultV3("adaptation_unavailable", "No validated playback route is available for this source and output route.", false)
 }
 

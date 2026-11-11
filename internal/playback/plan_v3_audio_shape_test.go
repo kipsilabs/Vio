@@ -118,6 +118,42 @@ func TestPlanPlaybackV3AudioShapeRetryLeavesStereoSourcesAlone(t *testing.T) {
 	}
 }
 
+// Every route is gone and the last failure was the audio output failing to
+// initialize: name that cause, keep it retryable, and carry the player's own
+// code in the detail.
+func TestPlanPlaybackV3ReportsAudioOutputUnsupportedInsteadOfAGenericTerminal(t *testing.T) {
+	input := audioShapePlannerInputV3()
+	first := PlanPlaybackV3(input)
+	if first.Plan == nil || first.Plan.Delivery != DeliveryOriginalHTTPV3 {
+		t.Fatalf("first plan = %s, want direct play", ExplainPlannerResultV3(first))
+	}
+	input.AttemptedKeys = []string{PlanAttemptKeyV3(*first.Plan, input.Request.ClientPlaybackContext.Output.OutputContextID, nil)}
+	// Nothing is left to adapt: only direct play was advertised.
+	input.Request.ClientPlaybackContext.Deliveries = map[string]DeliveryCapabilityV3{
+		DeliveryClassOriginalHTTPV3: input.Request.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3],
+	}
+
+	generic := PlanPlaybackV3(input)
+	if generic.Terminal == nil || generic.Terminal.Reason != "adaptation_unavailable" || generic.Terminal.Retryable {
+		t.Fatalf("terminal without audio-init evidence = %s", ExplainPlannerResultV3(generic))
+	}
+
+	input.AudioInitFailureDetail = "media3 code 5001 ERROR_CODE_AUDIO_TRACK_INIT_FAILED"
+	specific := PlanPlaybackV3(input)
+	if specific.Terminal == nil || specific.Terminal.Reason != TerminalAudioOutputUnsupportedV3 {
+		t.Fatalf("terminal = %s, want %q", ExplainPlannerResultV3(specific), TerminalAudioOutputUnsupportedV3)
+	}
+	if !specific.Terminal.Retryable {
+		t.Fatal("audio_output_unsupported must be retryable: another audio track can play")
+	}
+	if !strings.Contains(specific.Terminal.Detail, "5001") || !strings.Contains(specific.Terminal.Detail, "ERROR_CODE_AUDIO_TRACK_INIT_FAILED") {
+		t.Fatalf("terminal detail = %q, want the failing player code", specific.Terminal.Detail)
+	}
+	if specific.Terminal.Message == generic.Terminal.Message {
+		t.Fatal("audio_output_unsupported shares the generic message; the user-facing wording must name the audio output")
+	}
+}
+
 func TestAudioInitFailureDetailV3ReadsDiagnosticsAndMessages(t *testing.T) {
 	for _, test := range []struct {
 		name    string

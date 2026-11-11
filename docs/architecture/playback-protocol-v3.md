@@ -1528,6 +1528,12 @@ handled exactly as before. A converted channel count that differs from the
 source's own layout participates in the plan identifier, so the stereo retry is
 a distinct plan from the surround recipe it replaces.
 
+When the ladder ends with no route left and the attempt's most recent failure
+was an audio-output initialization failure, the terminal is
+`audio_output_unsupported` (§7.3) rather than the generic
+`adaptation_unavailable`. Every other transport failure demotes exactly as it
+did before.
+
 ### 6.3 `source_committed_event_v1` — the committed version is published at commit
 
 A serve-layer rotation can move a live session to a sibling release without ever
@@ -1698,13 +1704,21 @@ help. Delivered inside a `201` (start) or `200` (replan), never a 4xx.
 `client_hls_unsupported`, `conversion_tool_unavailable`,
 `hdr_transcode_unsupported`, `no_alternate_version`,
 `source_metadata_incomplete`, `source_unavailable`, `source_unreadable`,
-`audio_conversion_unsupported`, `video_conversion_unsupported`,
+`audio_conversion_unsupported`, `audio_output_unsupported`,
+`video_conversion_unsupported`,
 `dv_conversion_unsupported`, `transcoding_disabled`,
 `subtitle_conversion_unsupported`, `bitrate_policy_unavailable` (no route fits
 the administrator's local or remote per-stream bitrate limit). `audio_conversion_unsupported` is not
 retryable when the selected audio track has no codec FFmpeg can name, and so
 no decoder: the planner refuses it before any route is tried, and choosing
-another track is the remedy. `source_metadata_incomplete` is retryable:
+another track is the remedy. `audio_output_unsupported` is the audio-output
+counterpart of a route refusal: the device's audio sink failed to initialize
+every recipe the server could build, and the terminal is retryable because
+choosing another audio track or changing the device's audio output setting can
+make the same source play. Its `detail` carries the client's own failing code
+(for example `media3 code 5001 ERROR_CODE_AUDIO_TRACK_INIT_FAILED`); without
+audio-output evidence the same exhaustion stays the non-retryable
+`adaptation_unavailable`. `source_metadata_incomplete` is retryable:
 the file has not been probed yet or lacks a field a route needs.
 `source_unreadable` is not: ffprobe rejected the effective file (empty,
 corrupt, truncated) and it carries no stream metadata. The scanner and the

@@ -591,6 +591,17 @@ const (
 	TerminalDVConversionUnsupportedV3    = "dv_conversion_unsupported"
 )
 
+// TerminalAudioOutputUnsupportedV3 reports that the device's audio output
+// could not start with any recipe the server could build for this source. It
+// is the specific terminal for an audio-initialization failure that exhausted
+// the route ladder, and it is retryable: changing the selected audio track or
+// the device's audio output setting can make the same source play.
+const TerminalAudioOutputUnsupportedV3 = "audio_output_unsupported"
+
+// TerminalAudioOutputUnsupportedMessageV3 keeps the user-facing wording
+// separate from the machine-readable reason.
+const TerminalAudioOutputUnsupportedMessageV3 = "This device's audio output could not start with the audio formats available for this source. Choose another audio track or change the device's audio output setting, then try again."
+
 // TerminalSourceUnreadableV3 reports that ffprobe rejected the effective file
 // (zero-byte, corrupt, truncated) and no stream metadata exists for it. Unlike
 // source_metadata_incomplete, which covers a file that has not been probed

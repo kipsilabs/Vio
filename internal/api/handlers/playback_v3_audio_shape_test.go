@@ -114,8 +114,8 @@ func TestReplanV3AudioInitFailureRetriesStereoInsteadOfDemotingTheDelivery(t *te
 }
 
 // A second audio-init failure on the already-stereo retry demotes the delivery
-// instead of looping.
-func TestReplanV3SecondAudioInitFailureDemotes(t *testing.T) {
+// and reports the specific terminal instead of looping.
+func TestReplanV3SecondAudioInitFailureDemotesAndNamesTheAudioOutput(t *testing.T) {
 	file := audioShapeHandlerSource(t)
 	handler := newAudioShapeHandler(t, file)
 	start := audioShapeStartRequest()
@@ -132,8 +132,11 @@ func TestReplanV3SecondAudioInitFailureDemotes(t *testing.T) {
 	second := audioShapeReplanRequestV3(start, recovered.PlaybackPlan, "0002", audioInitFailureV3(), firstFailure.AttemptedPlanKeys)
 	second.AttemptCount = 2
 	failed := postPlaybackReplanV3(t, handler, started.SessionID, second)
-	if failed.Terminal == nil || failed.PlaybackPlan != nil {
-		t.Fatalf("second failure = %#v, want a terminal once every delivery is spent", failed)
+	if failed.Terminal == nil || failed.Terminal.Reason != playback.TerminalAudioOutputUnsupportedV3 || !failed.Terminal.Retryable {
+		t.Fatalf("second failure terminal = %#v, want retryable %q", failed.Terminal, playback.TerminalAudioOutputUnsupportedV3)
+	}
+	if failed.Terminal.Detail == "" || len(failed.Terminal.Detail) < len("5001") {
+		t.Fatalf("terminal detail = %q, want the player's failing code", failed.Terminal.Detail)
 	}
 
 	record, err := handler.PlanStoreV3.GetAttempt(t.Context(), started.SessionID)
