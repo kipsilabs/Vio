@@ -206,3 +206,104 @@ func TestPrefetchWindowsSkipsWhenDetachedBudgetTaken(t *testing.T) {
 		t.Fatalf("window prefetch extracted %d times with no detached capacity, want 0", calls.Load())
 	}
 }
+
+// A prefetch kick launched while the request path is already at its slot
+// capacity must not start at all. A shed is only recorded after a client read
+// has waited out its whole admission window, so the shed gate alone let a kick
+// slip in during exactly that window: the client's own read then timed out on a
+// pipe the prefetch had just joined (production: one 503 at the full 753ms slot
+// wait, then five shed-skipped kicks).
+func TestPrefetchWindowsSkipsWhileRequestPathSaturated(t *testing.T) {
+	guard := newRelayDemuxGuardWithDetached(2, 1, 5*time.Millisecond)
+	swapRelayDemuxGuardForTest(t, guard)
+	const remote = "http://relay-prefetch-full.test/source/tok/movie.mkv"
+
+	// Hold every request-path slot without shedding once: this is the state the
+	// prefetch used to miss.
+	var releases []func()
+	for i := 0; i < 2; i++ {
+		release, ok := guard.acquire(context.Background(), remote, relayDemuxRequestPath)
+		if !ok {
+			t.Fatalf("request-path read %d was not admitted to an unsaturated source", i+1)
+		}
+		releases = append(releases, release)
+	}
+	defer func() {
+		for _, release := range releases {
+			release()
+		}
+	}()
+	if !relayDemuxRequestPathSaturated(remote) {
+		t.Fatal("request path is not saturated after taking every slot")
+	}
+
+	cache := NewSubtitleCache(func() string { return t.TempDir() })
+	var calls atomic.Int32
+	opts := StreamExtractOpts{
+		InputPath:     remote,
+		CacheIdentity: "prefetch-saturated-request-path",
+		TrackIndex:    0,
+		SourceCodec:   "subrip",
+	}
+	select {
+	case <-cache.PrefetchWindowsInBackground(opts, []SubtitlePrefetchWindow{{StartSeconds: 240, DurationSeconds: 120}}, func(context.Context, StreamExtractOpts) error {
+		calls.Add(1)
+		return nil
+	}, "prefetch-saturated-request-path"):
+	case <-time.After(time.Second):
+		t.Fatal("window prefetch did not settle against a saturated request path")
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("window prefetch extracted %d times against a saturated request path, want 0", calls.Load())
+	}
+}
+
+// A prefetch that is already running must stop adding windows once the request
+// path fills: the saturation it must yield to can appear after its kick, and
+// each window is another demux on the pipe a client read is now waiting on.
+func TestPrefetchWindowsStopsWhenRequestPathFills(t *testing.T) {
+	guard := newRelayDemuxGuardWithDetached(2, 1, 5*time.Millisecond)
+	swapRelayDemuxGuardForTest(t, guard)
+	const remote = "http://relay-prefetch-fills.test/source/tok/movie.mkv"
+
+	cache := NewSubtitleCache(func() string { return t.TempDir() })
+	var calls atomic.Int32
+	var held []func()
+	opts := StreamExtractOpts{
+		InputPath:     remote,
+		CacheIdentity: "prefetch-fills",
+		TrackIndex:    0,
+		SourceCodec:   "subrip",
+	}
+	extract := func(_ context.Context, windowOpts StreamExtractOpts) error {
+		calls.Add(1)
+		// Two client reads arrive during this window and take every
+		// request-path slot.
+		for i := 0; i < 2; i++ {
+			release, ok := guard.acquire(context.Background(), remote, relayDemuxRequestPath)
+			if !ok {
+				return nil
+			}
+			held = append(held, release)
+		}
+		_, err := io.WriteString(windowOpts.Writer, prefetchWindowVTT)
+		return err
+	}
+	defer func() {
+		for _, release := range held {
+			release()
+		}
+	}()
+
+	select {
+	case <-cache.PrefetchWindowsInBackground(opts, []SubtitlePrefetchWindow{
+		{StartSeconds: 240, DurationSeconds: 120},
+		{StartSeconds: 360, DurationSeconds: 120},
+	}, extract, "prefetch-fills"):
+	case <-time.After(5 * time.Second):
+		t.Fatal("window prefetch did not settle")
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("window prefetch extracts = %d, want the first window only", calls.Load())
+	}
+}

@@ -33,9 +33,11 @@ const subtitlePrefetchMaxWindows = 2
 //
 // The prefetch is deliberately opportunistic, like every other detached warm:
 //
-//   - It skips while the request path is shedding for the source, so it never
-//
-// adds a demux to a relay pipe that is already refusing client reads.
+//   - It skips while the request path is saturated for the source — every slot
+//     held, or a client read shed inside the quiet window — so it never adds a
+//     demux to a relay pipe that is already refusing client reads. The check
+//     runs before the kick and before every window, so capacity that fills
+//     after the kick still stops the remaining windows.
 //
 //   - It draws from the detached admission budget and shares warmSem with the
 //     full-track warms, so a burst of kicks and an idle warm cannot stack
@@ -57,7 +59,7 @@ func (c *SubtitleCache) PrefetchWindowsInBackground(opts StreamExtractOpts, wind
 	if len(windows) > subtitlePrefetchMaxWindows {
 		windows = windows[:subtitlePrefetchMaxWindows]
 	}
-	if relayDemuxRequestPathShedding(opts.InputPath, subtitleWarmRequestShedQuietWindow) {
+	if relayDemuxDetachedBlocked(opts.InputPath, subtitleWarmRequestShedQuietWindow) {
 		slog.Debug("subtitle window prefetch skipped: request-path admission is shedding",
 			"input", opts.InputPath, "track", opts.TrackIndex, "format", format)
 		close(done)
@@ -94,7 +96,7 @@ func (c *SubtitleCache) PrefetchWindowsInBackground(opts StreamExtractOpts, wind
 			if window.DurationSeconds <= 0 {
 				continue
 			}
-			if relayDemuxRequestPathShedding(opts.InputPath, subtitleWarmRequestShedQuietWindow) {
+			if relayDemuxDetachedBlocked(opts.InputPath, subtitleWarmRequestShedQuietWindow) {
 				slog.Debug("subtitle window prefetch stopped: request-path admission is shedding",
 					"input", opts.InputPath, "track", opts.TrackIndex, "format", format)
 				return

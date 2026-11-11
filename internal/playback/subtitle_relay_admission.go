@@ -286,10 +286,43 @@ func (g *relayDemuxGuard) requestPathSheddingRecently(input string, within time.
 	return ok && time.Since(at) < within
 }
 
+// requestPathSaturated reports whether every request-path slot for input is
+// held right now, so the next client read would have to wait for one. Detached
+// work consults it before it starts: a pipe whose request path is at capacity
+// has nothing to spare for opportunistic reads.
+//
+// The shed timestamp alone cannot answer this. A shed is recorded only after a
+// client read has already waited out its whole admission window, so a prefetch
+// kick launched against a saturated-but-not-yet-shedding source used to start,
+// take its detached slot, and add the demux the client read was waiting behind
+// — the production 503 (753ms, the full request-path wait) followed by five
+// shed-skipped kicks.
+func (g *relayDemuxGuard) requestPathSaturated(input string) bool {
+	source, remote := relayDemuxSource(input)
+	if !remote {
+		return false
+	}
+	pools := g.pools(source)
+	return len(pools.requestPath) >= cap(pools.requestPath)
+}
+
 // relayDemuxRequestPathShedding reports whether the process-wide guard shed a
 // client-facing read for input inside the quiet window.
 func relayDemuxRequestPathShedding(input string, within time.Duration) bool {
 	return activeRelayDemuxGuard().requestPathSheddingRecently(input, within)
+}
+
+// relayDemuxRequestPathSaturated reports whether the process-wide guard's
+// request-path budget for input is fully held right now.
+func relayDemuxRequestPathSaturated(input string) bool {
+	return activeRelayDemuxGuard().requestPathSaturated(input)
+}
+
+// relayDemuxDetachedBlocked reports whether an opportunistic detached read of
+// input must stay off the source: a client-facing read is waiting (or about to
+// wait) for a request-path slot, or one was shed inside the quiet window.
+func relayDemuxDetachedBlocked(input string, within time.Duration) bool {
+	return relayDemuxRequestPathSaturated(input) || relayDemuxRequestPathShedding(input, within)
 }
 
 // relayDemuxClassLabel is the bounded metric label for an admission class.
