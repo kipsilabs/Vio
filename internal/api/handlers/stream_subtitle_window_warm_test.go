@@ -2293,3 +2293,100 @@ func TestWarmingParamlessVirtualFetchSkipsDetachedBudget(t *testing.T) {
 		t.Fatalf("ffmpeg invocations after skipped probe = %d window, %d warm; want 1/1", window, warm)
 	}
 }
+
+// A window miss from a mid-file playhead must prefetch bounded windows on the
+// request's grid instead of starting a full-track warm, which would extract
+// from source zero and publish a tail slice under the whole-track artifact key.
+// A later request for the window the playhead fell in is served from the
+// prefetched window cache.
+func TestVirtualSubtitleWarmPrefetchesPlayheadWindowInsteadOfFullTrack(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+	dir := t.TempDir()
+	argsLog := filepath.Join(dir, "ffmpeg.args")
+	handler, session, file, virtualURI := newVirtualSubtitleWindowFixture(t, dir,
+		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\ncat <<'VTT'\n"+warmSubtitleVTT+"VTT\n")
+	session.IsPaused = false
+	session.Position = 300
+	identity := virtualSubtitleCacheIdentity(file, virtualURI, 0)
+
+	opts := playback.StreamExtractOpts{
+		InputPath:       "unused",
+		CacheIdentity:   identity,
+		TrackIndex:      0,
+		SourceCodec:     "subrip",
+		SeekSeconds:     0,
+		DurationSeconds: 120,
+		WindowRequested: true,
+		FFmpegPath:      filepath.Join(dir, "ffmpeg"),
+	}
+	handler.warmVirtualSubtitleAfterWindowMiss(file, file.SubtitleTracks[0], session, opts, nil, true, "")
+	handler.waitForBackgroundSubtitleWarms()
+
+	window, warm := ffmpegLogLines(t, argsLog)
+	if warm != 0 {
+		t.Fatalf("mid-file warm ran %d full-track extracts, want 0", warm)
+	}
+	if window != 2 {
+		t.Fatalf("window prefetch extracts = %d, want 2 (playhead window + next)", window)
+	}
+	if handler.SubtitleCache.HasCommittedTextEntry("unused", identity, 0, "subrip", "") {
+		t.Fatal("mid-file prefetch committed a whole-track artifact")
+	}
+
+	// The playhead at 300 s falls in the [240, 360) window; a client request for
+	// it is served from the prefetched slice without another ffmpeg run.
+	reqOpts := opts
+	reqOpts.SeekSeconds = 240
+	reqOpts.DurationSeconds = 120
+	reqOpts.DisableBackgroundWarm = true
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/subtitle?position=240&duration=120", nil)
+	if _, err := handler.SubtitleCache.ServeExtractWithResult(rec, req, reqOpts, func(context.Context, playback.StreamExtractOpts) error {
+		t.Error("covering window request re-extracted a prefetched slice")
+		return nil
+	}); err != nil {
+		t.Fatalf("serve prefetched covering window: %v", err)
+	}
+	if !strings.Contains(rec.Body.String(), "hello") {
+		t.Fatalf("prefetched window body = %q", rec.Body.String())
+	}
+	if after, _ := ffmpegLogLines(t, argsLog); after != 2 {
+		t.Fatalf("ffmpeg window extracts after cached serve = %d, want 2", after)
+	}
+}
+
+// A session still at the start keeps the full-track warm: that artifact is what
+// the opening playback reads, and a window prefetch there would only duplicate
+// the request path's own slice.
+func TestVirtualSubtitleWarmStaysFullTrackAtStart(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+	dir := t.TempDir()
+	argsLog := filepath.Join(dir, "ffmpeg.args")
+	handler, session, file, virtualURI := newVirtualSubtitleWindowFixture(t, dir,
+		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\ncat <<'VTT'\n"+warmSubtitleVTT+"VTT\n")
+	session.IsPaused = false
+	session.Position = 0
+	identity := virtualSubtitleCacheIdentity(file, virtualURI, 0)
+
+	handler.warmVirtualSubtitleAfterWindowMiss(file, file.SubtitleTracks[0], session, playback.StreamExtractOpts{
+		InputPath:       "unused",
+		CacheIdentity:   identity,
+		TrackIndex:      0,
+		SourceCodec:     "subrip",
+		SeekSeconds:     0,
+		DurationSeconds: 120,
+		WindowRequested: true,
+		FFmpegPath:      filepath.Join(dir, "ffmpeg"),
+	}, nil, true, "")
+	handler.waitForBackgroundSubtitleWarms()
+
+	window, warm := ffmpegLogLines(t, argsLog)
+	if window != 0 || warm != 1 {
+		t.Fatalf("from-start warm ffmpeg invocations = %d window, %d full-track; want 0/1", window, warm)
+	}
+	waitForCommittedTextEntry(t, handler.SubtitleCache, identity, 0, "subrip")
+}

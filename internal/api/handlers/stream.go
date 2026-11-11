@@ -4353,10 +4353,19 @@ func (h *StreamHandler) rememberVirtualSubtitleLayout(planKey string, opts playb
 	}
 }
 
-// warmVirtualSubtitleAfterWindowMiss starts a detached full-track warm for a
+// warmVirtualSubtitleAfterWindowMiss starts detached cache fill work for a
 // windowed virtual subtitle request (text, ASS/SSA, or PGS) that could not be
 // served from the cache. It is called after the window itself has streamed, so
 // the warm cannot contend with the triggering request's own read.
+//
+// When the live playhead has moved into the file, the fill is a bounded window
+// prefetch around that playhead (PrefetchWindowsInBackground): the client's next
+// page or two are extracted and kept as last-good windows. A full-track warm
+// always extracts from source zero and commits under the whole-track artifact
+// key, so starting one here would publish a tail slice as the complete track —
+// wrong offsets and every cue before the seek missing. Only a session still at
+// the start keeps the full-track shape, where that artifact is what the opening
+// playback actually reads.
 //
 // The warm resolves and holds its own relay registration: the request's
 // registration is released when the request ends, which is exactly why the
@@ -4567,12 +4576,6 @@ func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(file *models.MediaFil
 	h.subtitleWarmWG.Add(1)
 	go func() {
 		defer h.subtitleWarmWG.Done()
-		var cleanup func()
-		defer func() {
-			if cleanup != nil {
-				cleanup()
-			}
-		}()
 		// The serve request may have pinned a committed artifact to skip its own
 		// drift probe. That pin is a claim about one validated serve, and this
 		// warm opens its own registration and validates it below, so it must not
@@ -4582,120 +4585,211 @@ func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(file *models.MediaFil
 		warmOpts := opts
 		warmOpts.PinnedTextArtifact = nil
 		seed := inherited
+
+		// A known playhead prefers the bounded window prefetch. It covers the
+		// pages the viewer is about to need without ever publishing a mid-file
+		// slice as the whole track. The full-track warm below stays the
+		// from-start/idle shape, where the artifact is what the opening playback
+		// reads.
+		if windows, prefetch := virtualSubtitleWarmPrefetchWindows(opts, live.Position); prefetch {
+			extract, _, release := h.virtualSubtitleWarmExtractor(file, track, session, planTracks, seed, warmOpts, live)
+			defer release()
+			<-h.SubtitleCache.PrefetchWindowsInBackground(warmOpts, windows, extract, requestID)
+			return
+		}
+
 		for attempt := 0; attempt < virtualSubtitleWarmRekeyAttempts; attempt++ {
 			attemptOpts := warmOpts
-			// rekeyed is written by the extract below and read after
-			// WarmTrackInBackground closes its done channel, which orders the two.
-			var rekeyed *playback.StreamExtractOpts
-			extract := func(extractCtx context.Context, extractOpts playback.StreamExtractOpts) error {
-				// A re-key decision belongs to the invocation that made it. The
-				// cache may re-invoke this closure after a page yield
-				// (WarmTrackInBackground), and that replay can establish the
-				// admitted identity and commit normally. Clearing the decision
-				// here keeps a stale pointer from a yielded invocation from
-				// re-keying a warm that has already settled under its
-				// probe-established identity.
-				rekeyed = nil
-				// The cache may re-invoke this closure after yielding the relay
-				// pipe to an admitted page (WarmTrackInBackground), or this loop
-				// may re-key it. Release the previous attempt's registration
-				// before resolving a fresh one so a restart cannot strand it.
-				if cleanup != nil {
-					cleanup()
-					cleanup = nil
-				}
-				// Resolve on a child of the extraction context, never the detached
-				// request context: a resolver that hangs is canceled when the warm
-				// budget is exhausted, releasing the warm slot and fill instead of
-				// holding them forever.
-				warmCtx, cancelWarm := context.WithCancel(extractCtx)
-				defer cancelWarm()
-				if h.sessionMgr != nil {
-					anchorPosition := live.Position
-					anchorAt := time.Now()
-					go func() {
-						ticker := time.NewTicker(time.Second)
-						defer ticker.Stop()
-						for {
-							select {
-							case <-warmCtx.Done():
-								return
-							case now := <-ticker.C:
-								if reason := h.virtualSubtitleWarmCancelReason(session, anchorPosition, anchorAt, now); reason != "" {
-									slog.DebugContext(warmCtx, "virtual subtitle warm canceled",
-										"component", "api", "session", session.ID, "file_id", file.ID, "reason", reason)
-									cancelWarm()
-									return
-								}
-							}
-						}
-					}()
-				}
-				resolveCtx, cancel := context.WithTimeout(warmCtx, virtualSubtitleWarmResolveTimeout)
-				defer cancel()
-				resolved, resolvedCleanup, err := h.resolveVirtualInputURI(resolveCtx, file, session.UserID, session.ProfileID, false)
-				if err != nil {
-					if warmCtx.Err() != nil {
-						// The abort ticker canceled an in-flight resolve: an
-						// intentional abandonment, not a source failure, and it must
-						// not arm the failure cooldown.
-						return playback.ErrSubtitleWarmCanceled
-					}
-					logVirtualStreamFailure(resolveCtx, session.ID, file, err)
-					return fmt.Errorf("resolve virtual input for subtitle warm: %w", err)
-				}
-				cleanup = resolvedCleanup
-				extractOpts.InputPath = resolved.URL
-				// Validate the warm's own relay registration against the live
-				// layout. The serve's ordinal is at most a hint; this probe is the
-				// only authority for the bytes the warm is about to commit.
-				if err := h.resolveWarmExtractLayout(warmCtx, file, session, track, planTracks, seed, &extractOpts); err != nil {
-					return err
-				}
-				if extractOpts.CacheIdentity != attemptOpts.CacheIdentity ||
-					extractOpts.TrackIndex != attemptOpts.TrackIndex {
-					// The probe settled on a different effective identity than the
-					// one this fill was admitted under. Do not commit these bytes
-					// under the stale key: abandon the fill (ErrSubtitleWarmCanceled
-					// is an intentional yield, so it arms no cooldown) and re-key the
-					// warm onto the identity the probe established.
-					next := attemptOpts
-					next.InputPath = extractOpts.InputPath
-					next.CacheIdentity = extractOpts.CacheIdentity
-					next.TrackIndex = extractOpts.TrackIndex
-					next.SourceCodec = extractOpts.SourceCodec
-					next.PinnedTextArtifact = nil
-					rekeyed = &next
-					return playback.ErrSubtitleWarmCanceled
-				}
-				err = playback.StreamExtractSubtitle(warmCtx, extractOpts)
-				if warmCtx.Err() != nil {
-					return playback.ErrSubtitleWarmCanceled
-				}
-				return err
-			}
+			extract, rekeyed, release := h.virtualSubtitleWarmExtractor(file, track, session, planTracks, seed, attemptOpts, live)
 			<-h.SubtitleCache.WarmTrackInBackground(attemptOpts, extract, requestID)
-			if rekeyed == nil {
+			next := rekeyed()
+			release()
+			if next == nil {
 				return
 			}
 			slog.InfoContext(context.Background(), "virtual subtitle warm re-keyed after its drift probe",
 				"component", "api", "session", session.ID, "file_id", file.ID,
-				"from_track", attemptOpts.TrackIndex, "to_track", rekeyed.TrackIndex)
+				"from_track", attemptOpts.TrackIndex, "to_track", next.TrackIndex)
 			// Start the re-keyed attempt from the identity the probe just
 			// established, so its own probe confirms rather than re-derives a
 			// different mapping.
 			seed = &virtualSubtitleLayoutSeed{
-				cacheIdentity: rekeyed.CacheIdentity,
-				trackIndex:    rekeyed.TrackIndex,
-				sourceCodec:   rekeyed.SourceCodec,
+				cacheIdentity: next.CacheIdentity,
+				trackIndex:    next.TrackIndex,
+				sourceCodec:   next.SourceCodec,
 				verifiedAt:    time.Now(),
 			}
-			warmOpts = *rekeyed
+			warmOpts = *next
 		}
 		slog.InfoContext(context.Background(), "virtual subtitle warm abandoned: identity kept moving under its drift probe",
 			"component", "api", "session", session.ID, "file_id", file.ID,
 			"attempts", virtualSubtitleWarmRekeyAttempts)
 	}()
+}
+
+// virtualSubtitleWarmAtStartPositionSeconds is the playhead below which a
+// window-miss warm keeps the full-track shape. A session at the start consumes
+// the artifact from source zero, so the artifact is the work playback needs;
+// prefetching windows there would only duplicate the slice the client already
+// asked for and would never produce the artifact the opening fetch reads.
+const virtualSubtitleWarmAtStartPositionSeconds = 1.0
+
+// virtualSubtitleWarmPrefetchWindows returns the bounded windows a mid-file
+// warm should prefetch, aligned to the request's window grid: the window the
+// playhead falls in and the one after it. ok is false while the playhead is
+// still at the start, where the full-track warm is the right shape.
+//
+// Alignment to the request's start and length matters: the client asks for its
+// next page at start+duration, so a prefetch on the same grid is exactly the
+// slice fix 2's covering-window lookup can serve. An arbitrary playhead-aligned
+// grid would usually miss by the offset between the client's window and the
+// playhead.
+func virtualSubtitleWarmPrefetchWindows(opts playback.StreamExtractOpts, position float64) ([]playback.SubtitlePrefetchWindow, bool) {
+	if position <= virtualSubtitleWarmAtStartPositionSeconds {
+		return nil, false
+	}
+	// Only a request that actually windowed establishes the grid the prefetch
+	// mirrors. A duration-only ASS request or a PGS request without the windowed
+	// opt-in is served as a whole slice, so mirroring it would cache slices no
+	// later request computes a key for.
+	if windowed, _, _, _ := opts.WindowCoverage(); !windowed {
+		return nil, false
+	}
+	duration := opts.DurationSeconds
+	if duration <= 0 {
+		// A position without a duration is window intent with its cap filled in
+		// by applyImplicitVirtualWindow; mirror that bound so the prefetch is
+		// always bounded.
+		duration = virtualSubtitleImplicitWindowSeconds
+	}
+	base := opts.SeekSeconds
+	if base < 0 {
+		base = 0
+	}
+	index := math.Floor((position - base) / duration)
+	if index < 0 {
+		index = 0
+	}
+	start := base + index*duration
+	windows := make([]playback.SubtitlePrefetchWindow, 0, 2)
+	for i := 0; i < 2; i++ {
+		windows = append(windows, playback.SubtitlePrefetchWindow{
+			StartSeconds:    start + float64(i)*duration,
+			DurationSeconds: duration,
+		})
+	}
+	return windows, true
+}
+
+// virtualSubtitleWarmExtractor builds the extract closure shared by the
+// detached full-track warm and the bounded window prefetch. The cache supplies
+// the options to extract with, so the full-track warm's zeroed bounds and the
+// prefetch's window bounds are both honored, and the closure owns the relay
+// registration for exactly the length of one extraction.
+//
+// admitted is the identity and ordinal the caller's fill was admitted under.
+// The closure always probes its own relay registration, and when that probe
+// settles on a different identity it reports the effective options through
+// rekeyed and returns ErrSubtitleWarmCanceled without extracting. Bytes are
+// therefore never published under a stale key. release releases the last
+// resolved registration; the caller invokes it once the extraction settles.
+func (h *StreamHandler) virtualSubtitleWarmExtractor(file *models.MediaFile, track models.SubtitleTrack, session *playback.Session, planTracks []models.SubtitleTrack, seed *virtualSubtitleLayoutSeed, admitted playback.StreamExtractOpts, live *playback.Session) (playback.SUPExtractFunc, func() *playback.StreamExtractOpts, func()) {
+	var cleanup func()
+	var rekeyed *playback.StreamExtractOpts
+	extract := func(extractCtx context.Context, extractOpts playback.StreamExtractOpts) error {
+		// A re-key decision belongs to the invocation that made it. The cache may
+		// re-invoke this closure after a page yield (WarmTrackInBackground), and
+		// that replay can establish the admitted identity and commit normally.
+		// Clearing the decision here keeps a stale pointer from a yielded
+		// invocation from re-keying a warm that has already settled under its
+		// probe-established identity.
+		rekeyed = nil
+		// The cache may re-invoke this closure after yielding the relay pipe to
+		// an admitted page (WarmTrackInBackground), or the warm loop may re-key
+		// it. Release the previous attempt's registration before resolving a
+		// fresh one so a restart cannot strand it.
+		if cleanup != nil {
+			cleanup()
+			cleanup = nil
+		}
+		// Resolve on a child of the extraction context, never the detached
+		// request context: a resolver that hangs is canceled when the warm budget
+		// is exhausted, releasing the warm slot and fill instead of holding them
+		// forever.
+		warmCtx, cancelWarm := context.WithCancel(extractCtx)
+		defer cancelWarm()
+		if h.sessionMgr != nil {
+			anchorPosition := live.Position
+			anchorAt := time.Now()
+			go func() {
+				ticker := time.NewTicker(time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-warmCtx.Done():
+						return
+					case now := <-ticker.C:
+						if reason := h.virtualSubtitleWarmCancelReason(session, anchorPosition, anchorAt, now); reason != "" {
+							slog.DebugContext(warmCtx, "virtual subtitle warm canceled",
+								"component", "api", "session", session.ID, "file_id", file.ID, "reason", reason)
+							cancelWarm()
+							return
+						}
+					}
+				}
+			}()
+		}
+		resolveCtx, cancel := context.WithTimeout(warmCtx, virtualSubtitleWarmResolveTimeout)
+		defer cancel()
+		resolved, resolvedCleanup, err := h.resolveVirtualInputURI(resolveCtx, file, session.UserID, session.ProfileID, false)
+		if err != nil {
+			if warmCtx.Err() != nil {
+				// The abort ticker canceled an in-flight resolve: an
+				// intentional abandonment, not a source failure, and it must
+				// not arm the failure cooldown.
+				return playback.ErrSubtitleWarmCanceled
+			}
+			logVirtualStreamFailure(resolveCtx, session.ID, file, err)
+			return fmt.Errorf("resolve virtual input for subtitle warm: %w", err)
+		}
+		cleanup = resolvedCleanup
+		extractOpts.InputPath = resolved.URL
+		// Validate the warm's own relay registration against the live layout.
+		// The serve's ordinal is at most a hint; this probe is the only authority
+		// for the bytes this fill will hold.
+		if err := h.resolveWarmExtractLayout(warmCtx, file, session, track, planTracks, seed, &extractOpts); err != nil {
+			return err
+		}
+		if extractOpts.CacheIdentity != admitted.CacheIdentity ||
+			extractOpts.TrackIndex != admitted.TrackIndex {
+			// The probe settled on a different effective identity than the one
+			// this fill was admitted under. Do not publish these bytes under the
+			// stale key: abandon the fill (ErrSubtitleWarmCanceled is an
+			// intentional yield, so it arms no cooldown) and report the identity
+			// the probe established so the full-track warm can re-key onto it. A
+			// prefetch simply drops the kick; the next window miss re-attempts it.
+			next := admitted
+			next.InputPath = extractOpts.InputPath
+			next.CacheIdentity = extractOpts.CacheIdentity
+			next.TrackIndex = extractOpts.TrackIndex
+			next.SourceCodec = extractOpts.SourceCodec
+			next.PinnedTextArtifact = nil
+			rekeyed = &next
+			return playback.ErrSubtitleWarmCanceled
+		}
+		err = playback.StreamExtractSubtitle(warmCtx, extractOpts)
+		if warmCtx.Err() != nil {
+			return playback.ErrSubtitleWarmCanceled
+		}
+		return err
+	}
+	release := func() {
+		if cleanup != nil {
+			cleanup()
+			cleanup = nil
+		}
+	}
+	return extract, func() *playback.StreamExtractOpts { return rekeyed }, release
 }
 
 // Defaults for the implicit first window served to a cold whole-track subtitle

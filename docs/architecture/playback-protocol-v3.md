@@ -2203,11 +2203,20 @@ Complete embedded text, ASS/SSA, and PGS extracts are cached by source file
 identity, modification time, size, subtitle ordinal, and output format. Partial
 or failed extracts are never published. Text and ASS cache misses stream while
 extracting; repeated complete requests reuse the finished artifact. A windowed
-miss on a large virtual source starts a detached full-track warm while the
-viewer is playing (text and ASS) or paused (bitmap), so later requests read the
-small cached artifact instead of re-demuxing the source. While an ASS warm is
-still filling, the server retains the script prefix it has produced and answers
-a window whose source range that prefix has already passed from memory. The
+miss on a large virtual source starts detached fill work so later requests do
+not re-demux the source. A session still at the start warms the complete track
+(text and ASS while playing, bitmap while paused), and later requests read the
+small cached artifact. A session whose playhead has moved into the file
+prefetches at most two bounded windows on the request's window grid — the window
+covering the playhead and the one after it — and keeps them as last-good window
+slices, never as a complete-track artifact: a full-track extract always starts at
+source zero, so publishing one mid-file would claim a tail slice as the whole
+track, with offsets that do not match the source timeline and without the cues
+before the seek. The prefetch skips while the relay is shedding client reads or
+when no detached capacity is free, and identical concurrent windows coalesce.
+While a full-track ASS warm is still filling, the server retains the script
+prefix it has produced and answers a window whose source range that prefix has
+already passed from memory. The
 prefix is served only once the warm's highest emitted event start has reached
 the requested end, so an event starting inside the window cannot still be
 missing; the body is the same header-plus-overlapping-events shape a windowed
