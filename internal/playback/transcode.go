@@ -440,10 +440,13 @@ type TranscodeSession struct {
 	// written by a previous generation (or a previous session sharing the
 	// directory) and describes media this process has not produced yet.
 	generationStartedAt time.Time
-	// observedStartupLatency is the most recent measured time from a generation's
-	// spawn to its first produced segment, kept across generations so a restarted
-	// generation that has produced nothing yet can still be judged by what this
-	// session's own restarts cost. Guarded by mu.
+	// observedStartupLatency is the time from the owning generation's spawn to
+	// its first produced segment, latched once per generation. It is reset
+	// whenever a generation starts so a restarted generation is never judged by
+	// what an earlier one cost, and it is latched on the first measurement so a
+	// later scan whose earliest surviving segment the pruner already deleted
+	// cannot inflate it. Zero means the current generation has no measurement
+	// yet, which keeps the restart hold. Guarded by mu.
 	observedStartupLatency time.Duration
 	inputCleanupOnce       sync.Once
 	// inheritedManifest is the stream.m3u8 an earlier generation left in the
@@ -841,7 +844,7 @@ func StartTranscode(ctx context.Context, opts TranscodeOpts) (*TranscodeSession,
 	}
 	s.cmd = cmd
 	s.stdinPipe = stdinPipe
-	s.generationStartedAt = startedAt
+	s.beginGeneration(startedAt)
 	s.inheritedManifest = inheritedManifest
 	s.startSubtitleSpanLocked(opts)
 	s.saveSubtitleSpans()
@@ -3792,11 +3795,27 @@ func (s *TranscodeSession) SegmentProgress(time.Time) SegmentProgress {
 	if latency := startupLatencyOf(progress.GenerationStartedAt, firstGenerationSegmentAt); latency > 0 {
 		progress.StartupLatency = latency
 		s.mu.Lock()
-		s.observedStartupLatency = latency
+		// Latch the first measurement for the generation this scan measured.
+		// A generation that started while the scan was running owns a different
+		// spawn stamp, so its (unmeasured) slot is left alone; a later scan of
+		// this same generation cannot replace the first value, which is the one
+		// a pruning floor cannot reach.
+		if s.generationStartedAt.Equal(progress.GenerationStartedAt) && s.observedStartupLatency == 0 {
+			s.observedStartupLatency = latency
+		}
 		s.mu.Unlock()
 	}
 	scanActiveTempProgress(s.outputDir, &progress)
 	return progress
+}
+
+// beginGeneration records that a new owning ffmpeg generation spawned at
+// startedAt. Callers hold mu, except StartTranscode before it publishes the
+// session. Startup latency is measured per generation, so a replacement starts
+// unmeasured instead of inheriting what an earlier generation cost.
+func (s *TranscodeSession) beginGeneration(startedAt time.Time) {
+	s.generationStartedAt = startedAt
+	s.observedStartupLatency = 0
 }
 
 // startupLatencyOf reports how long a generation needed from its spawn stamp to
@@ -3811,10 +3830,11 @@ func startupLatencyOf(generationStartedAt, firstSegmentAt time.Time) time.Durati
 	return 0
 }
 
-// StartupLatency reports this session's most recently measured generation
-// startup: the time between a generation's spawn and its first produced
-// segment. It falls back to the current generation's measurement when one was
-// just scanned, and is zero before any generation has produced output.
+// StartupLatency reports the owning generation's measured startup: the time
+// between its spawn and its first produced segment. The measurement belongs to
+// one generation and is latched on its first scan, so it is zero until the
+// current generation has produced output and never describes an earlier
+// generation. Zero keeps the restart hold.
 func (s *TranscodeSession) StartupLatency() time.Duration {
 	if s == nil {
 		return 0
@@ -4995,7 +5015,7 @@ func (s *TranscodeSession) restart(
 	s.stdinPipe = stdinPipe
 	s.lastRequestedSegment = requestedSegment
 	s.lastCompletedSegment = startSegment - 1
-	s.generationStartedAt = startedAt
+	s.beginGeneration(startedAt)
 	// The verdict generation was already opened when the old process died,
 	// before this replacement's stderr writer was created; do not bump it
 	// again here or that writer would be fenced as stale.
@@ -5907,8 +5927,8 @@ func (s *TranscodeSession) WaitForRestartContinuation(name string) (*SegmentLeas
 // without waiting; the detached restart still produces the segment for the
 // client's playlist reload.
 //
-// The hold is also skipped when this session's own restarts are known to need
-// longer than the stall window to produce their first segment. A virtual
+// The hold is also skipped when the current generation's own startup is known
+// to need longer than the stall window to produce its first segment. A virtual
 // provider that opens in 4.7-10s cannot reach the stall window, so holding the
 // request spends the client's read budget on a wait that is already lost — the
 // production 3.5s-then-412 for a 2062s seek. Answering the stale-generation
@@ -5916,6 +5936,8 @@ func (s *TranscodeSession) WaitForRestartContinuation(name string) (*SegmentLeas
 // the wait; the restart keeps producing for the playlist reload it triggers. A
 // session whose restarts start inside the stall window keeps the hold, so a
 // seek that the encoder serves in a few hundred milliseconds is still served.
+// The measurement describes one generation, and a generation that has not
+// produced a segment yet has none, so its hold is never skipped unmeasured.
 func (s *TranscodeSession) WaitForRestartContinuationWithin(name string, budget time.Duration) (*SegmentLease, error) {
 	if budget <= 0 {
 		if restartErr := s.AsyncRestartFailure(); restartErr != nil {
