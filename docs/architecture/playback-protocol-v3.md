@@ -2188,13 +2188,25 @@ never converges. The server returns the playback-sized window described in §4.2
 and advertises it with `X-Subtitle-Coverage` and `X-Subtitle-Windowed`. This
 applies to converted text (WebVTT), lossless ASS/SSA, and PGS alike, and lasts
 only until a complete artifact has been committed; once one exists the whole
-artifact is served and both headers are absent. A client that requested the
-whole track therefore cannot assume a complete body: it reads the headers and
-requests subsequent windows from the advertised end, or treats the response as
-that one window. Explicit `position`/`duration` (and PGS `windowed=1` with
-bounds) always override the implicit window; a PGS `windowed=1` with no
-position or duration names no range, so it still receives the implicit first
-window. External and downloaded sidecars are always
+artifact is served and both headers are absent.
+
+The implicit window starts on a fixed grid derived from its own length, not at
+the live playhead. A page anchored a few seconds behind the playhead is never
+reused: the next request's range runs past the page the previous one produced,
+no stored page contains it, and the server demuxes the source again for every
+request. The same grid is what the window prefetch below mirrors. Text pages are
+600 s. A bitmap (PGS) page is 120 s, the page the web player already requests,
+because a bitmap page can only be produced by demuxing the container: on a
+50 GB / 2h52m release a 600 s page reads about 2.9 GB and measured 65-105 s per
+request, longer than the fetch that asked for it, so it was abandoned and never
+stored.
+
+A client that requested the whole track therefore cannot assume a complete body:
+it reads the headers and requests subsequent windows from the advertised end, or
+treats the response as that one window. Explicit `position`/`duration` (and PGS
+`windowed=1` with bounds) always override the implicit window; a PGS
+`windowed=1` with no position or duration names no range, so it still receives
+the implicit first window. External and downloaded sidecars are always
 returned whole. First-party native clients that fetch a complete embedded
 sidecar in one request (`silo-apple`, `silo-android`) must handle the bounded
 default and are coordinated with this change.
@@ -2212,7 +2224,10 @@ covering the playhead and the one after it — and keeps them as last-good windo
 slices, never as a complete-track artifact: a full-track extract always starts at
 source zero, so publishing one mid-file would claim a tail slice as the whole
 track, with offsets that do not match the source timeline and without the cues
-before the seek. The prefetch skips while the relay is shedding client reads or
+before the seek. That bounded prefetch also runs for a bitmap track while
+playing, because a playing bitmap track otherwise re-demuxes the source at every
+page boundary; the complete-track bitmap warm itself stays paused-only. The
+prefetch skips while the relay is shedding client reads or
 when no detached capacity is free, and identical concurrent windows coalesce.
 While a full-track ASS warm is still filling, the server retains the script
 prefix it has produced and answers a window whose source range that prefix has

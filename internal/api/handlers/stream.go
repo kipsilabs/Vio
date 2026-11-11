@@ -4407,27 +4407,6 @@ func (h *StreamHandler) virtualSubtitleWarmSession(session *playback.Session) (*
 	return current, true
 }
 
-// virtualSubtitleWarmAllowed returns the live session when a full-track
-// virtual subtitle warm may run now, or nil when it may not. A paused session
-// warms every sidecar class. A playing session warms text (WebVTT/ASS) only:
-// the warm exists to stop every window from re-demuxing a multi-GB relay
-// source, and a text artifact is a few megabytes. Bitmap (PGS) warms stay
-// paused-only — a full-track .sup is tens of megabytes and is never the next
-// thing playback needs.
-func (h *StreamHandler) virtualSubtitleWarmAllowed(session *playback.Session, sourceCodec string) *playback.Session {
-	live, ok := h.virtualSubtitleWarmSession(session)
-	if !ok {
-		return nil
-	}
-	if live.IsPaused {
-		return live
-	}
-	if playback.NeedsBurnIn(sourceCodec) {
-		return nil
-	}
-	return live
-}
-
 // virtualSubtitleWarmCancelReason reports why a detached warm must stop now,
 // or "" to keep going. Because text warms may run while playing, a pause/resume
 // is no longer a cancel condition: the warm stops when its session ends or the
@@ -4539,12 +4518,15 @@ func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(file *models.MediaFil
 	// worth that read even while the viewer is playing: without one, every
 	// 120 s window on a large virtual source re-demuxes the relay input and the
 	// small artifact never appears, so rendering stops once the client's
-	// lookahead runs out. Bitmap (PGS) warms remain paused-only. The warm stays
-	// single-flighted through WarmTrackInBackground (warmSem + beginFill), so a
-	// burst of windows still demuxes once.
-	live := h.virtualSubtitleWarmAllowed(session, opts.SourceCodec)
-	if live == nil {
-		slog.DebugContext(context.Background(), "virtual subtitle warm skipped: session ended or bitmap track while playing",
+	// lookahead runs out. The same continuation argument holds for a bitmap
+	// (PGS) track, but only for the bounded page prefetch below: a full .sup is
+	// tens of megabytes demuxed from the whole container, so the full-track
+	// shape stays paused-only. The warm stays single-flighted through
+	// WarmTrackInBackground / PrefetchWindowsInBackground (warmSem + beginFill),
+	// so a burst of windows still demuxes once.
+	live, liveOK := h.virtualSubtitleWarmSession(session)
+	if !liveOK || live == nil {
+		slog.DebugContext(context.Background(), "virtual subtitle warm skipped: session ended",
 			"component", "api", "session", session.ID, "file_id", file.ID, "codec", opts.SourceCodec)
 		return
 	}
@@ -4595,6 +4577,16 @@ func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(file *models.MediaFil
 			extract, _, release := h.virtualSubtitleWarmExtractor(file, track, session, planTracks, seed, warmOpts, live)
 			defer release()
 			<-h.SubtitleCache.PrefetchWindowsInBackground(warmOpts, windows, extract, requestID)
+			return
+		}
+		// Past the prefetch, only a text track may warm whole while playing (the
+		// artifact is small and the next fetch reads it). A bitmap track falls
+		// through only when the viewer is paused: a whole .sup is tens of
+		// megabytes read from the entire container, and it is never the page
+		// playback needs next.
+		if !live.IsPaused && playback.NeedsBurnIn(opts.SourceCodec) {
+			slog.DebugContext(context.Background(), "virtual subtitle warm skipped: bitmap full-track warm stays paused-only",
+				"component", "api", "session", session.ID, "file_id", file.ID, "codec", opts.SourceCodec)
 			return
 		}
 
@@ -4794,14 +4786,26 @@ func (h *StreamHandler) virtualSubtitleWarmExtractor(file *models.MediaFile, tra
 
 // Defaults for the implicit first window served to a cold whole-track subtitle
 // request against a large/unknown virtual/remote source. The web player asks
-// for its own 120 s windows; this legacy implicit bound stays at 600 s for
+// for its own 120 s windows; this implicit bound stays at 600 s for text
 // clients that request a whole track and have no windowing contract, so a
 // native client that does not refetch cannot lose subtitles after two minutes.
-// The backoff pulls the window start behind the session position so a small
-// scrub back stays covered, mirroring the player's SEEK_BACKOFF.
+// The window starts on a span-aligned page that contains the session position,
+// so a retry from the same page asks for the window the previous request
+// produced instead of a range shifted a few seconds later (see
+// implicitVirtualWindowStart).
 const (
-	virtualSubtitleImplicitWindowSeconds        = 600.0
-	virtualSubtitleImplicitWindowBackoffSeconds = 2.0
+	virtualSubtitleImplicitWindowSeconds = 600.0
+	// virtualSubtitleBitmapImplicitWindowSeconds is the implicit page for a
+	// bitmap (PGS) track. A bitmap page can only be produced by demuxing the
+	// container, so its cost scales with the page length: on a 50 GB / 2h52m
+	// remux a 600 s page reads ~2.9 GB, which measured 65-105 s per request
+	// against a client fetch deadline of the same order. Those pages were
+	// abandoned before they completed, and an abandoned page is never stored,
+	// so every retry repeated the whole read. 120 s is already the page the web
+	// player requests, and it completes in ~13 s on the same source: fast
+	// enough to finish inside a fetch, and therefore able to answer the next
+	// request from the covering-window cache.
+	virtualSubtitleBitmapImplicitWindowSeconds = 120.0
 	// virtualSubtitleImplicitWindowMinSourceBytes is the source size above
 	// which a whole-track virtual read is considered untenable and is bounded
 	// to the implicit window. A small known source is read whole (cheap and
@@ -4887,10 +4891,16 @@ func (h *StreamHandler) applyImplicitVirtualWindow(opts *playback.StreamExtractO
 	if h.SubtitleCache.HasCommittedEntry(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, opts.SourceCodec, opts.TargetFormat) {
 		return
 	}
+	// The page length is a per-class decision: a text page is cheap to slice
+	// 600 s at a time, a bitmap page is not (its cost is the container read).
+	spanSeconds := virtualSubtitleImplicitWindowSeconds
+	if playback.IsPGS(opts.SourceCodec) {
+		spanSeconds = virtualSubtitleBitmapImplicitWindowSeconds
+	}
 	// A position without a duration is window intent but open-ended: fill in the
 	// implicit window so it cannot extract to EOF (advertised as `start-*`). The
 	// caller's position is kept; only the missing cap is supplied.
-	if opts.ClampOpenEndedWindow(virtualSubtitleImplicitWindowSeconds) {
+	if opts.ClampOpenEndedWindow(spanSeconds) {
 		slog.Info("virtual subtitle open window clamped to implicit window",
 			"component", "api",
 			"codec", opts.SourceCodec,
@@ -4910,8 +4920,8 @@ func (h *StreamHandler) applyImplicitVirtualWindow(opts *playback.StreamExtractO
 	}
 
 	opts.WindowRequested = true
-	opts.SeekSeconds = implicitVirtualWindowStart(session)
-	opts.DurationSeconds = virtualSubtitleImplicitWindowSeconds
+	opts.SeekSeconds = implicitVirtualWindowStart(session, spanSeconds)
+	opts.DurationSeconds = spanSeconds
 	if playback.IsPGS(opts.SourceCodec) {
 		// PGS routes through ServeSUPExtract, which windows only when
 		// AllowWindow is set (the client's ?windowed=1 opt-in or a server-
@@ -4927,14 +4937,27 @@ func (h *StreamHandler) applyImplicitVirtualWindow(opts *playback.StreamExtractO
 }
 
 // implicitVirtualWindowStart returns the source-time start of the implicit
-// window: the session position pulled back slightly, or zero when the session
-// has no meaningful position yet (a fresh start, so the window covers the
-// opening of the track).
-func implicitVirtualWindowStart(session *playback.Session) float64 {
-	if session == nil || session.Position <= virtualSubtitleImplicitWindowBackoffSeconds {
+// window: the span-aligned page that contains the session position, or zero
+// when the session has no meaningful position yet (a fresh start, so the page
+// covers the opening of the track).
+//
+// Alignment is what makes a repeated whole-track fetch cheap. The covering
+// window cache only answers a request whose range a stored page fully
+// contains, so a page anchored to the live playhead (position minus a small
+// backoff) is never reused: the client's next fetch is a few seconds later, its
+// range extends past the page it just received, and the server pays the whole
+// extraction again. Snapping to the page grid makes every request inside one
+// page name the same window, so the first completed page serves the rest of
+// them — and so the prefetch grid derived from the request mirrors real pages.
+func implicitVirtualWindowStart(session *playback.Session, spanSeconds float64) float64 {
+	if session == nil || spanSeconds <= 0 || session.Position <= 0 {
 		return 0
 	}
-	return session.Position - virtualSubtitleImplicitWindowBackoffSeconds
+	start := math.Floor(session.Position/spanSeconds) * spanSeconds
+	if start < 0 {
+		return 0
+	}
+	return start
 }
 
 // verifyVirtualSubtitleLayout probes the live relay input once and, when its
