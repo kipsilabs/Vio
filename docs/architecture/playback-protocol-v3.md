@@ -1489,6 +1489,40 @@ disabled, the terminal is the retryable `routes_exhausted`;
 `transcoding_disabled` stays reserved for a first plan whose source really
 needs an encode.
 
+A transport failure that abandons a delivery retires the recipe, not the
+delivery class. Three cases are worth keeping apart:
+
+- **The class is unusable.** Only the client's capabilities can establish that,
+  and they do at start: a class the device does not advertise is never planned.
+  An abort cannot prove it, because the client parsed the plan and started
+  fetching it.
+- **The recipe is unusable.** `decoder_failure`, `decode_error`, and
+  `parser_failure` name a property of the recipe — a codec, a pixel format, a
+  container — that the planner can act on. They retire the delivery class,
+  subject to the software-decode and candidate-rotation deferrals, because the
+  next recipe behind the same class would use the same decoders.
+- **The abort is unrelated to delivery.** `player_failure` and `http_failure`
+  are what a viewer backing out, a player-side glitch, and a transient fetch
+  error all produce. The server cannot tell those apart from a real route
+  failure, so it deliberately treats them as recipe-scoped: the class stays
+  eligible, because one class serves several recipes (`server_remux_hls` and
+  `server_transcode_hls` are both `hls`) and a spent copy recipe must not take
+  the transcode fallback with it.
+
+The plan attempt key is what keeps a failed recipe from coming back. The
+abandoned recipe's key is excluded from the replan that answers the failure and
+is recorded on the attempt (`recovery_state.recipe_exclusions`, bounded to
+sixteen keys). Every later same-output replan adds those keys to the planner's
+loop guard, because a `track_change` or `quality_change` echoes no attempted-key
+history of its own. An `output_change` is exempt: its `OutputContextID` is part
+of every attempt key, so a recipe retired for one output is a different question
+for another. Delivery stickiness is unchanged — it keeps a same-output replan on
+the class that is playing, which is a preference, not evidence about a recipe.
+
+An audio-output initialization failure is a verdict on the audio shape the
+recipe delivered (§6.2.1); once its one stereo retry is spent, the class retires
+as it always did.
+
 The server applies one more distinction from its own evidence: whether the
 client ever read from the stream it is indicting. A `failure_recovery` that
 arrives after the server answered this attempt's playlist but before a single
@@ -1531,8 +1565,9 @@ a distinct plan from the surround recipe it replaces.
 When the ladder ends with no route left and the attempt's most recent failure
 was an audio-output initialization failure, the terminal is
 `audio_output_unsupported` (§7.3) rather than the generic
-`adaptation_unavailable`. Every other transport failure demotes exactly as it
-did before.
+`adaptation_unavailable`. A spent audio-shape retry retires the delivery class
+like a decoder failure: the failure named a property of the recipe, not the
+client's appetite.
 
 ### 6.3 `source_committed_event_v1` — the committed version is published at commit
 

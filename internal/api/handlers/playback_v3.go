@@ -9747,14 +9747,37 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		(operation == playback.ReplanOperationFailureRecoveryV3 && req.Failure.Classification == failureSubtitleTrackChangedV3)
 	qualityChange := operation == playback.ReplanOperationQualityChangeV3
 	outputChange := operation == playback.ReplanOperationOutputChangeV3
-	// A failure recovery that abandoned a delivery for a transport reason
-	// demotes that delivery on the durable request, so every later replan in
-	// this attempt plans with it disabled. Without the stickiness a
-	// track_change replan re-reads the client's still-advertised claims and
-	// steers straight back to a route that just failed, thrashing the player
-	// between direct play and remux (each flip reloading the stream and
+	// A same-output replan plans again for the output context the durable plan
+	// was built for, so a recipe that already failed there is a recipe for this
+	// same question. That is what lets the durable recipe-exclusion chain below
+	// apply whatever the operation: a track_change re-reads the client's
+	// still-advertised claims and would otherwise steer straight back to a
+	// recipe the client already abandoned. An output change re-targets the plan
+	// at a different output context, which PlanAttemptKeyV3 folds into every
+	// key, so the previous recipe is a different question there. A seek reanchor
+	// replays a frozen recipe by design and never consults the ladder.
+	sameOutputReplan := !seekReanchor && !outputChange
+	// A failure recovery that abandoned a delivery for a transport reason used
+	// to demote that delivery on the durable request, so every later replan in
+	// this attempt planned with it disabled. The demotion is what kept a
+	// track_change replan from re-reading the client's still-advertised claims
+	// and steering straight back to a route that just failed, thrashing the
+	// player between direct play and remux (each flip reloading the stream and
 	// orphaning the client's subtitle track state — the field symptom where a
 	// menu shows a selection that is not actually playing).
+	//
+	// That demotion was too broad. Delivery classes pool recipes that are not
+	// interchangeable — server_remux_hls and server_transcode_hls are both
+	// DeliveryClassHLSV3 — so one aborted copy recipe retired a transcode
+	// fallback the device never tried. An abort also cannot be evidence about a
+	// class: the client parsed the plan and started fetching it, which proves
+	// the class reached the device, and a user backing out or a transient fetch
+	// error produces the same report. Only classifications that name a recipe
+	// property (decode, parser) retire the class
+	// (abandonmentDoesNotIndictDeliveryClassV3). The aborted recipe itself is
+	// retired by excluding its plan key from this replan and from same-output
+	// replans after it, which keeps the thrash guard without spending a class
+	// the ladder has not finished with.
 	//
 	// The demotion is a server-side evidence write on the durable attempt, not
 	// a client-authority change: a fresh start of the same file still negotiates
@@ -9795,19 +9818,30 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	}
 	// A node that stopped answering indicts the node, not the delivery: keep
 	// the delivery class eligible so the same recipe can run on another node.
+	// An abandonment (player_failure, http_failure) indicts only the recipe the
+	// client already reached: the class stays eligible, and the abandoned
+	// recipe key is what keeps a later replan from replaying it.
+	abandonedRecipe := false
 	if !audioShapeRetry &&
 		failureRecoveryAbandonedDeliveryV3(operation, req.Failure.Classification) &&
 		len(unreachableNodes) == 0 &&
 		(!decodeFailureClassificationV3(req.Failure.Classification) ||
 			(!h.softwareDecodeRetryPendingV3(record, req) && !virtualDecodeRotation)) {
-		// Demote on both copies: the record (the durable attempt this replan
-		// may still terminal-persist) and the seeded start, whose payload the
-		// success commit writes back via updated.NormalizedRequest. Demoting
-		// only the record would be wiped by that write-back — the seed was
-		// copied before the demotion and the overlay re-enables the client's
-		// still-advertised claim.
-		demoteDeliveryCapabilityV3(&record.NormalizedRequest, record.CurrentPlan.Delivery)
-		demoteDeliveryCapabilityV3(&start, record.CurrentPlan.Delivery)
+		// An audio-output init failure is evidence about the audio shape this
+		// delivery's recipe produced, not about the client walking away: once
+		// the one stereo retry is spent, the class retires as it always did.
+		if audioInitFailureDetail != "" || !abandonmentDoesNotIndictDeliveryClassV3(req.Failure.Classification) {
+			// Demote on both copies: the record (the durable attempt this replan
+			// may still terminal-persist) and the seeded start, whose payload the
+			// success commit writes back via updated.NormalizedRequest. Demoting
+			// only the record would be wiped by that write-back — the seed was
+			// copied before the demotion and the overlay re-enables the client's
+			// still-advertised claim.
+			demoteDeliveryCapabilityV3(&record.NormalizedRequest, record.CurrentPlan.Delivery)
+			demoteDeliveryCapabilityV3(&start, record.CurrentPlan.Delivery)
+		} else {
+			abandonedRecipe = true
+		}
 	}
 	// User-intent operations replace the legacy audio PATCH and client-recipe
 	// transcode start. Nothing failed, so their previous route stays eligible:
@@ -10128,7 +10162,34 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	nodeRecovery = !userIntentOperation && len(unreachableNodes) > 0
 	currentKey := playback.PlanAttemptKeyV3(record.CurrentPlan, record.NormalizedRequest.ClientPlaybackContext.Output.OutputContextID, req.LocalMutations)
 	unmutatedKey := playback.PlanAttemptKeyV3(record.CurrentPlan, record.NormalizedRequest.ClientPlaybackContext.Output.OutputContextID, nil)
+	if abandonedRecipe {
+		// Retire the recipe durably rather than only for this replan: a later
+		// track_change or quality pick echoes no attempted-key history, so the
+		// attempt's own chain is the only thing that keeps the abandoned recipe
+		// from coming back (§6.2).
+		if err := h.appendRecipeExclusionsV3(r.Context(), record, abandonedRecipeAttemptKeysV3(record, req)); err != nil {
+			slog.WarnContext(r.Context(), "playback abandoned recipe was not recorded",
+				logComponentKey, playbackLogValueV3,
+				"session_id", record.SessionID,
+				"delivery", record.CurrentPlan.Delivery,
+				"error", err,
+			)
+		}
+	}
 	attemptedKeys := []string(nil)
+	// The durable recipe-exclusion chain carries the keys an abandonment
+	// retired. A same-output replan re-asks the question that recipe already
+	// answered badly, and it usually brings no history of its own, so the chain
+	// is what keeps an abandoned recipe from being planned again. An output
+	// change plans for a different output context, whose keys the chain cannot
+	// contain, and a seek reanchor never consults the ladder.
+	if sameOutputReplan {
+		for _, key := range record.RecoveryState.RecipeExclusions {
+			if !containsStringExactV3(attemptedKeys, key) {
+				attemptedKeys = append(attemptedKeys, key)
+			}
+		}
+	}
 	if !intentChange && !seekReanchor && !userIntentOperation {
 		failedKey := strings.TrimSpace(req.PlanAttemptKey)
 		for _, key := range req.AttemptedPlanKeys {
@@ -11232,6 +11293,16 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			}
 		}
 		attemptedKeys = []string(nil)
+		// The durable recipe-exclusion chain applies to this pass exactly as it
+		// does to the first one: an abandoned recipe stays retired whatever
+		// operation asks for the next plan.
+		if sameOutputReplan {
+			for _, key := range record.RecoveryState.RecipeExclusions {
+				if !containsStringExactV3(attemptedKeys, key) {
+					attemptedKeys = append(attemptedKeys, key)
+				}
+			}
+		}
 		currentKey := playback.PlanAttemptKeyV3(record.CurrentPlan, record.NormalizedRequest.ClientPlaybackContext.Output.OutputContextID, req.LocalMutations)
 		unmutatedKey := playback.PlanAttemptKeyV3(record.CurrentPlan, record.NormalizedRequest.ClientPlaybackContext.Output.OutputContextID, nil)
 		if !intentChange && !seekReanchor && !userIntentOperation {
@@ -14688,6 +14759,37 @@ func planHasVideoEncodeV3(plan playback.PlanV3) bool {
 	return false
 }
 
+// abandonmentDoesNotIndictDeliveryClassV3 reports whether a failure
+// classification records a client that walked away from a delivery it had
+// already reached, rather than evidence that the delivery class itself cannot
+// serve this output.
+//
+// A player_failure or http_failure arrives after the client parsed the plan and
+// started fetching it, so it proves the class reached the device; the same
+// shape is also what a viewer backing out, a glitch on one recipe, or a
+// transient fetch error produces, and the server cannot tell those apart. None
+// of them is evidence about the class, and one class serves several recipes
+// (server_remux_hls and server_transcode_hls are both DeliveryClassHLSV3), so
+// retiring it also retires every untried recipe behind it. What a delivery
+// class can do is knowable when the attempt starts, from the client's
+// capabilities.
+//
+// Decode- and parser-shaped classifications are different evidence: they name a
+// property of the recipe (codec, pixel format, container) rather than the
+// client's appetite, so they still retire the class. Audio-output initialization
+// failures are handled earlier by the audio-shape retry (see
+// audioShapeRetryApplicableV3) and keep the ordinary demotion once that retry is
+// spent. The failing recipe itself is retired by plan-key exclusion (§6.2), not
+// by the class demotion this predicate suppresses.
+func abandonmentDoesNotIndictDeliveryClassV3(classification string) bool {
+	switch failureClassificationKeyV3(classification) {
+	case "player_failure", "http_failure":
+		return true
+	default:
+		return false
+	}
+}
+
 // decodeFailureClassificationV3 reports whether a client failure classification
 // indicts the video decoder specifically. Only these defer delivery demotion
 // for a pending software-decode variant; other transport failures demote as
@@ -14880,6 +14982,64 @@ func (h *PlaybackHandler) appendRecoveryExclusionsV3(ctx context.Context, record
 // same attempt, so a handful of retries converges; the bound keeps a
 // pathological writer loop from spinning a replan.
 const recoveryAppendMaxAttempts = 8
+
+// appendRecipeExclusionsV3 durably records the plan attempt keys an abandonment
+// retired so no later same-output replan can replay them (§6.2). It uses the
+// same revision-checked union as the candidate chain and retries a losing
+// compare. Unlike a confirmed candidate rotation, a failure to persist here
+// must not fail playback: the delivery class is still eligible and the client's
+// own echoed history still applies, so the guard degrades to that history and
+// the caller only logs the error.
+func (h *PlaybackHandler) appendRecipeExclusionsV3(ctx context.Context, record *playback.AttemptRecordV3, keys []string) error {
+	if record == nil || len(keys) == 0 {
+		return nil
+	}
+	store := h.recoveryStateStoreV3()
+	if store == nil {
+		return errors.New("recovery state store unavailable")
+	}
+	revision := record.RecoveryRevision
+	var lastErr error
+	for attempt := 0; attempt < recoveryAppendMaxAttempts; attempt++ {
+		state, newRevision, err := store.AppendRecipeExclusions(ctx, record.SessionID, revision, keys)
+		if err == nil {
+			record.RecoveryState = state
+			record.RecoveryRevision = newRevision
+			return nil
+		}
+		if !errors.Is(err, playback.ErrRecoveryRevisionConflictV3) {
+			return err
+		}
+		lastErr = err
+		// The committed chain advanced after this record was read. Re-read and
+		// retry the union against the newer revision.
+		_, currentRevision, readErr := store.GetRecoveryState(ctx, record.SessionID)
+		if readErr != nil {
+			return readErr
+		}
+		revision = currentRevision
+	}
+	return lastErr
+}
+
+// abandonedRecipeAttemptKeysV3 returns the plan attempt keys an abandonment
+// indicted: the durable recipe as this output planned it, plus its unmutated
+// form when the client reports a local mutation. The server hashed that
+// variation into the plan key, so both spellings name recipes that already
+// failed for this output.
+func abandonedRecipeAttemptKeysV3(record *playback.AttemptRecordV3, req playback.ReplanRequestV3) []string {
+	if record == nil {
+		return nil
+	}
+	outputContextID := record.NormalizedRequest.ClientPlaybackContext.Output.OutputContextID
+	if len(req.LocalMutations) == 0 {
+		return []string{playback.PlanAttemptKeyV3(record.CurrentPlan, outputContextID, nil)}
+	}
+	return []string{
+		playback.PlanAttemptKeyV3(record.CurrentPlan, outputContextID, req.LocalMutations),
+		playback.PlanAttemptKeyV3(record.CurrentPlan, outputContextID, nil),
+	}
+}
 
 // virtualCandidateReleaseIdentityV3 returns the durable release identity for a
 // session-bound candidate (provider GUID or video hash), so an exclusion can

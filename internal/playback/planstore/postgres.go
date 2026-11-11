@@ -307,6 +307,55 @@ func (s *Postgres) AppendRecoveryExclusions(ctx context.Context, sessionID strin
 	return merged, next, nil
 }
 
+func (s *Postgres) AppendRecipeExclusions(ctx context.Context, sessionID string, baseRevision int64, keys []string) (playback.RecoveryStateV3, int64, error) {
+	if len(keys) == 0 {
+		return playback.RecoveryStateV3{}, 0, nil
+	}
+	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return playback.RecoveryStateV3{}, 0, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var stateJSON []byte
+	var revision int64
+	err = tx.QueryRow(ctx, `
+		SELECT recovery_state, recovery_revision FROM playback_v3_attempts
+		WHERE session_id = $1::uuid AND expires_at > NOW()
+		FOR UPDATE`, sessionID).Scan(&stateJSON, &revision)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return playback.RecoveryStateV3{}, 0, playback.ErrSessionNotFound
+	}
+	if err != nil {
+		return playback.RecoveryStateV3{}, 0, err
+	}
+	if baseRevision >= 0 && revision != baseRevision {
+		return playback.RecoveryStateV3{}, revision, playback.ErrRecoveryRevisionConflictV3
+	}
+	var state playback.RecoveryStateV3
+	if len(stateJSON) > 0 {
+		if err := json.Unmarshal(stateJSON, &state); err != nil {
+			return playback.RecoveryStateV3{}, 0, err
+		}
+	}
+	state.RecipeExclusions = playback.UnionRecipeExclusions(state.RecipeExclusions, keys)
+	mergedJSON, err := json.Marshal(state)
+	if err != nil {
+		return playback.RecoveryStateV3{}, 0, err
+	}
+	var next int64
+	if err := tx.QueryRow(ctx, `
+		UPDATE playback_v3_attempts
+		SET recovery_state = $2, recovery_revision = recovery_revision + 1, updated_at = NOW()
+		WHERE session_id = $1::uuid AND expires_at > NOW()
+		RETURNING recovery_revision`, sessionID, mergedJSON).Scan(&next); err != nil {
+		return playback.RecoveryStateV3{}, 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return playback.RecoveryStateV3{}, 0, err
+	}
+	return state, next, nil
+}
+
 // RecordAudioReconciliation appends the settled reconciliation decision to
 // the attempt's durable ledger under a row lock. The transaction serializes
 // concurrent records on the attempt row, and the base-revision compare makes

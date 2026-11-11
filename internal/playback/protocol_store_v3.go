@@ -141,6 +141,46 @@ type ProgressStoreV3 interface {
 
 type RecoveryStateV3 struct {
 	Exclusions []RecoveryExclusionV3 `json:"exclusions,omitempty"`
+	// RecipeExclusions lists the plan attempt keys a failure recovery abandoned
+	// without retiring their delivery class (an abort on a reachable node, see
+	// the handler's abandonment rule). The class stays eligible, so this chain
+	// is what keeps the abandoned recipe itself from coming back: a later
+	// track_change or quality_change replan echoes no attempted-key history,
+	// and only the attempt's own record remembers which recipes already failed
+	// for this output. Keys are opaque PlanAttemptKeyV3 values and already fold
+	// in the output context, so they can only match a plan for the same output.
+	RecipeExclusions []string `json:"recipe_exclusions,omitempty"`
+}
+
+// RecipeExclusionLimitV3 bounds the durable recipe-exclusion chain. A session's
+// ladder is short -- the failure-recovery attempt count is capped -- so a few
+// keys cover every abandoned recipe; the bound keeps a pathological writer from
+// growing the attempt's row without limit.
+const RecipeExclusionLimitV3 = 16
+
+// UnionRecipeExclusions appends the incoming plan attempt keys to base,
+// preserving first-seen order, dropping blanks and duplicates, and keeping the
+// chain inside RecipeExclusionLimitV3. The oldest entries win the bound: they
+// are the recipes the ladder abandoned first, and the budget is spent before a
+// later abandonment can push them out.
+func UnionRecipeExclusions(base, incoming []string) []string {
+	if len(base) == 0 && len(incoming) == 0 {
+		return nil
+	}
+	merged := make([]string, 0, min(RecipeExclusionLimitV3, len(base)+len(incoming)))
+	seen := make(map[string]struct{}, len(base)+len(incoming))
+	for _, key := range append(append([]string(nil), base...), incoming...) {
+		key = strings.TrimSpace(key)
+		if key == "" || len(merged) >= RecipeExclusionLimitV3 {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		merged = append(merged, key)
+	}
+	return merged
 }
 
 func RecoveryExclusionKeyV3(providerSource, candidateID string) string {
@@ -354,6 +394,12 @@ type RecoveryStateStoreV3 interface {
 	// baseRevision unions unconditionally. It returns ErrSessionNotFound when
 	// there is no live attempt row.
 	AppendRecoveryExclusions(ctx context.Context, sessionID string, baseRevision int64, exclusions []RecoveryExclusionV3) (RecoveryStateV3, int64, error)
+	// AppendRecipeExclusions adds abandoned-recipe plan attempt keys to the
+	// attempt's durable recipe-exclusion chain under the same revision
+	// protocol: the union grows, a stale baseRevision loses with
+	// ErrRecoveryRevisionConflictV3, and a negative baseRevision unions
+	// unconditionally.
+	AppendRecipeExclusions(ctx context.Context, sessionID string, baseRevision int64, keys []string) (RecoveryStateV3, int64, error)
 	// GetRecoveryState reads the durable chain and its current revision.
 	GetRecoveryState(ctx context.Context, sessionID string) (RecoveryStateV3, int64, error)
 }
@@ -481,9 +527,9 @@ func UnionRecoveryExclusions(base RecoveryStateV3, incoming []RecoveryExclusionV
 		merged = append(merged, exclusion)
 	}
 	if len(merged) == 0 {
-		return RecoveryStateV3{}
+		return RecoveryStateV3{RecipeExclusions: base.RecipeExclusions}
 	}
-	return RecoveryStateV3{Exclusions: merged}
+	return RecoveryStateV3{Exclusions: merged, RecipeExclusions: base.RecipeExclusions}
 }
 
 // RecoveryCandidateExcludedV3 reports whether candidateID is excluded for the
@@ -803,6 +849,27 @@ func (s *MemoryPlanStoreV3) AppendRecoveryExclusions(_ context.Context, sessionI
 	record.RecoveryRevision++
 	s.attempts[attemptID] = *record
 	return merged, record.RecoveryRevision, nil
+}
+
+// AppendRecipeExclusions unions abandoned-recipe plan attempt keys into the
+// attempt's durable recipe-exclusion chain, with the same compare-and-set on
+// RecoveryRevision as AppendRecoveryExclusions.
+func (s *MemoryPlanStoreV3) AppendRecipeExclusions(_ context.Context, sessionID string, baseRevision int64, keys []string) (RecoveryStateV3, int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	attemptID, record := s.findAttemptLocked(sessionID)
+	if record == nil {
+		return RecoveryStateV3{}, 0, ErrSessionNotFound
+	}
+	if baseRevision >= 0 && record.RecoveryRevision != baseRevision {
+		return RecoveryStateV3{}, record.RecoveryRevision, ErrRecoveryRevisionConflictV3
+	}
+	state := record.RecoveryState
+	state.RecipeExclusions = UnionRecipeExclusions(state.RecipeExclusions, keys)
+	record.RecoveryState = state
+	record.RecoveryRevision++
+	s.attempts[attemptID] = *record
+	return state, record.RecoveryRevision, nil
 }
 
 // GetRecoveryState reads the durable chain and its revision.
