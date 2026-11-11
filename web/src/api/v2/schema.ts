@@ -27361,6 +27361,9 @@ export interface components {
     FailureV3: {
       classification: string;
       decoder_name?: string;
+      diagnostics?: {
+        [key: string]: string;
+      };
       message?: string;
     };
     FavoriteCollection: {

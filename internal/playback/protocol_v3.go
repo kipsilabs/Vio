@@ -1021,6 +1021,21 @@ type FailureV3 struct {
 	Classification string `json:"classification"`
 	Message        string `json:"message,omitempty"`
 	DecoderName    string `json:"decoder_name,omitempty"`
+	// Diagnostics carries the structured failure evidence a client already
+	// reports on its plan_failed route event: player error code, error name,
+	// and cause. A recovery decision reads it as client-reported failure
+	// evidence, never as a control channel from the telemetry stream, so the
+	// same failing code can steer the recovery without making route events
+	// authoritative. Keys outside the documented set are ignored; the map is
+	// bounded like a route event's diagnostics.
+	Diagnostics map[string]string `json:"diagnostics,omitempty" maxProperties:"32"`
+}
+
+// IsZero reports whether the failure carries no evidence at all. A map field
+// makes the struct non-comparable, so callers that used to compare against the
+// zero value ask this instead.
+func (f FailureV3) IsZero() bool {
+	return f.Classification == "" && f.Message == "" && f.DecoderName == "" && len(f.Diagnostics) == 0
 }
 
 type ReplanOperationV3 string
@@ -1759,6 +1774,14 @@ func (r *ReplanRequestV3) Validate() error {
 	if len(r.AttemptedPlanKeys) > 16 || len(r.Failure.Classification) > 64 || len(r.Failure.Message) > 512 || len(r.Failure.DecoderName) > 128 || !isFiniteV3(r.PositionSeconds) || r.PositionSeconds < 0 || r.PositionSeconds > 31_536_000 {
 		return errors.New("replan bounds exceeded")
 	}
+	if len(r.Failure.Diagnostics) > 32 {
+		return errors.New("failure diagnostics exceeds supported size")
+	}
+	for key, value := range r.Failure.Diagnostics {
+		if len(key) > 64 || len(value) > 512 {
+			return errors.New("failure diagnostic exceeds supported size")
+		}
+	}
 	if len(r.LocalMutations) > 8 {
 		return errors.New("local_mutations exceeds supported size")
 	}
@@ -1796,7 +1819,7 @@ func (r *ReplanRequestV3) Validate() error {
 		// and never selects seek semantics.
 	case ReplanOperationTrackChangeV3:
 		// A user track change is not a failure; no classification is required.
-		if r.Failure != (FailureV3{}) {
+		if !r.Failure.IsZero() {
 			return errors.New("track_change must not include failure")
 		}
 	case ReplanOperationQualityChangeV3:
@@ -1807,12 +1830,12 @@ func (r *ReplanRequestV3) Validate() error {
 		if strings.TrimSpace(r.QualityPreference) == "" {
 			return errors.New("quality_change requires a quality_preference")
 		}
-		if r.Failure != (FailureV3{}) {
+		if !r.Failure.IsZero() {
 			return errors.New("quality_change must not include failure")
 		}
 	case ReplanOperationOutputChangeV3:
 		// Output capability refreshes are intent changes, not route failures.
-		if r.Failure != (FailureV3{}) {
+		if !r.Failure.IsZero() {
 			return errors.New("output_change must not include failure")
 		}
 	default:

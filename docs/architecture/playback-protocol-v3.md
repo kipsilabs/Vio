@@ -1500,6 +1500,34 @@ that was never exercised. A recovery that arrives before the playlist was served
 is a failure the client met inside the stream and keeps the ordinary ladder, and
 so does every session that already served a segment request.
 
+### 6.2.1 An audio-output failure is not a transport failure
+
+A player whose audio sink cannot initialize a track has not indicted the video
+route: the same stream can play once its audio is re-shaped for the device.
+`failure.diagnostics` therefore accepts the structured player evidence a client
+already reports on its `plan_failed` route event — `error_code`,
+`error_code_name`, and `error_cause` — and the recovery decision reads it
+directly. The asynchronous route-event stream stays diagnostics-only and is not
+authoritative for control.
+
+The failures the server treats as audio-output initialization failures are the
+Media3 audio-sink family (`5001 ERROR_CODE_AUDIO_TRACK_INIT_FAILED`,
+`5003`/`5004` offload write and init failures), the matching names in
+`failure.diagnostics` or `failure.message`, and the bare
+`failure.classification: "audio_renderer_error"` family classification.
+
+On such a failure the server does not demote the delivery. When the current
+plan delivers more than two channels, it re-plans the *same* delivery class once
+with a stereo AAC audio recipe: the video route is unchanged, and only the audio
+shape shrinks. The one retry is recorded on the attempt's delivery capability
+(`failure_reason: "audio_init_failed_shape_retry"`) and survives the client's
+capability overlay like a demotion, so a second audio-output failure on the
+already-stereo plan falls through to the ordinary demotion path instead of
+looping. A plan that already delivers stereo has nothing smaller to try and is
+handled exactly as before. A converted channel count that differs from the
+source's own layout participates in the plan identifier, so the stereo retry is
+a distinct plan from the surround recipe it replaces.
+
 ### 6.3 `source_committed_event_v1` — the committed version is published at commit
 
 A serve-layer rotation can move a live session to a sibling release without ever

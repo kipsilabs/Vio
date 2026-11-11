@@ -9265,6 +9265,9 @@ type replanPlanningV3 struct {
 	// so a track change plans the same renditions without reading the index
 	// again and can keep the stream. Nil reads the index.
 	renditionTracks *pinnedRenditionTracksV3
+	// audioShapeRetry rebuilds the failed delivery's audio as stereo after an
+	// audio-output initialization failure.
+	audioShapeRetry bool
 }
 
 // pinnedRenditionTracksV3 is the set of on-demand rendition tracks the
@@ -9358,7 +9361,7 @@ func (h *PlaybackHandler) planReplanV3(r *http.Request, p replanPlanningV3, star
 		// and the viewer can repeat the change.
 		return replanPassV3{}, subtitleArtifactErrorV3("Downloaded subtitles are temporarily unavailable.", inventoryErr)
 	}
-	result, toneMapCapabilityErr := h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: start, RequestedFile: p.plannerRequestedFile, EffectiveFile: effectiveFile, LowerVersion: lowerVersionForFileV3(p.lowerVersion, effectiveFile), ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), AudioTrackIndex: audioIndex, Settings: p.settings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: p.attemptedKeys, AdditionalSubtitles: additional, CueIndexedSubtitleTracks: p.renditionTracks.cueIndexedSubtitleTracks(effectiveFile, start)})
+	result, toneMapCapabilityErr := h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: start, RequestedFile: p.plannerRequestedFile, EffectiveFile: effectiveFile, LowerVersion: lowerVersionForFileV3(p.lowerVersion, effectiveFile), ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), AudioTrackIndex: audioIndex, Settings: p.settings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: p.attemptedKeys, AdditionalSubtitles: additional, AudioShapeRetry: p.audioShapeRetry, CueIndexedSubtitleTracks: p.renditionTracks.cueIndexedSubtitleTracks(effectiveFile, start)})
 	if p.operation == playback.ReplanOperationOutputChangeV3 && result.Terminal != nil && effectiveFile.ID != p.currentEffectiveFile.ID {
 		// Returning to the requested edition is speculative during an output
 		// refresh. Any terminal from that probe must fall back to the edition
@@ -9372,7 +9375,7 @@ func (h *PlaybackHandler) planReplanV3(r *http.Request, p replanPlanningV3, star
 		if err != nil {
 			return replanPassV3{}, &transportErrorV3{reason: trackUnavailableReasonV3, message: err.Error()}
 		}
-		result, toneMapCapabilityErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: start, RequestedFile: p.plannerRequestedFile, EffectiveFile: effectiveFile, LowerVersion: lowerVersionForFileV3(p.lowerVersion, effectiveFile), ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), AudioTrackIndex: audioIndex, Settings: p.settings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: p.attemptedKeys, AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), effectiveFile), CueIndexedSubtitleTracks: p.renditionTracks.cueIndexedSubtitleTracks(effectiveFile, start)})
+		result, toneMapCapabilityErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: start, RequestedFile: p.plannerRequestedFile, EffectiveFile: effectiveFile, LowerVersion: lowerVersionForFileV3(p.lowerVersion, effectiveFile), ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), AudioTrackIndex: audioIndex, Settings: p.settings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: p.attemptedKeys, AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), effectiveFile), AudioShapeRetry: p.audioShapeRetry, CueIndexedSubtitleTracks: p.renditionTracks.cueIndexedSubtitleTracks(effectiveFile, start)})
 	}
 	planned := replanPassV3{alternateCandidateV3: alternateCandidateV3{file: effectiveFile, request: start, audioIndex: audioIndex, result: result, toneMapErr: toneMapCapabilityErr}, audioDegraded: audioDegraded}
 	if start.AllowsAlternateVersions() && terminalAllowsAlternateFileV3(result.Terminal) && replanAllowsAlternateFileV3(p.operation, start.QualityPreference) {
@@ -9519,6 +9522,7 @@ func (h *PlaybackHandler) replanInputV3(r *http.Request, p replanPlanningV3, sta
 		AudioTrackIndex:      audioIndex, Settings: p.settings,
 		Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), file), Now: time.Now(),
 		AttemptedKeys: p.attemptedKeys, AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), file),
+		AudioShapeRetry: p.audioShapeRetry,
 	}
 }
 
@@ -9764,9 +9768,32 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	// virtual failure: candidate substitution is the recovery, so the delivery
 	// stays eligible until rotation exhausts.
 	virtualDecodeRotation := h.virtualCandidateRotationPendingV3(record, req)
+	// A player whose audio output failed to initialize is not evidence against
+	// the video route. Keep the delivery and spend its one audio-shape retry on
+	// a stereo recipe before the ordinary demotion path can retire the class.
+	// The failing code comes from the replan's own failure evidence, never from
+	// the asynchronous route-event telemetry.
+	audioInitFailureDetail := ""
+	audioShapeRetry := false
+	if failureRecoveryOperationV3(operation) {
+		audioInitFailureDetail = playback.AudioInitFailureDetailV3(req.Failure)
+	}
+	if audioInitFailureDetail != "" && len(unreachableNodes) == 0 && audioShapeRetryApplicableV3(record) {
+		audioShapeRetry = true
+		markAudioShapeRetryV3(&record.NormalizedRequest, record.CurrentPlan.Delivery)
+		markAudioShapeRetryV3(&start, record.CurrentPlan.Delivery)
+		slog.InfoContext(r.Context(), "playback delivery kept for a stereo audio-shape retry",
+			logComponentKey, playbackLogValueV3,
+			"session_id", record.SessionID,
+			"delivery_class", record.CurrentPlan.Delivery,
+			"audio_channels", planAudioChannelsV3(record.CurrentPlan),
+			"failure_detail", audioInitFailureDetail,
+		)
+	}
 	// A node that stopped answering indicts the node, not the delivery: keep
 	// the delivery class eligible so the same recipe can run on another node.
-	if failureRecoveryAbandonedDeliveryV3(operation, req.Failure.Classification) &&
+	if !audioShapeRetry &&
+		failureRecoveryAbandonedDeliveryV3(operation, req.Failure.Classification) &&
 		len(unreachableNodes) == 0 &&
 		(!decodeFailureClassificationV3(req.Failure.Classification) ||
 			(!h.softwareDecodeRetryPendingV3(record, req) && !virtualDecodeRotation)) {
@@ -9886,6 +9913,10 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		// route a previous failure recovery abandoned stays disabled — the
 		// client cannot advertise itself back into a route that failed.
 		reapplyDeliveryDemotionsV3(&start, record.NormalizedRequest)
+		// The audio-shape retry marker is the same kind of server-owned
+		// evidence: the overlay must not let the client's still-surround
+		// advertisement spend a second retry.
+		reapplyAudioShapeRetriesV3(&start, record.NormalizedRequest)
 		if req.ClientFeatures != nil {
 			// Feature advertisement is single-location (top-level); a replan
 			// that sends it refreshes the durable request's copy alongside the
@@ -10192,6 +10223,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		lowerVersion: lowerVersion, settings: plannerSettings, attemptedKeys: attemptedKeys,
 		keptActiveEditionForSubtitle: keptActiveEditionForSubtitle, desired: desired,
 		renditionTracks: pinnedRenditionTracksForRecordV3(record),
+		audioShapeRetry: audioShapeRetry,
 	}
 	if seekReanchor { //nolint:nestif // executeReplanV3 exceeds Vio's nestif complexity-4 limit; refactor tracked separately
 		var frozenErr error
@@ -11301,7 +11333,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				// and the viewer can repeat the change.
 				return playback.DecisionResponseV3{}, *record, nil, subtitleArtifactErrorV3("Downloaded subtitles are temporarily unavailable.", inventoryErr)
 			}
-			result, toneMapCapabilityErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: start, RequestedFile: plannerRequestedFile, EffectiveFile: effectiveFile, LowerVersion: lowerVersionForFileV3(lowerVersion, effectiveFile), ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), AudioTrackIndex: audioIndex, Settings: plannerSettings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: attemptedKeys, AdditionalSubtitles: additional, ForceSoftwareVideoDecode: forceSoftwareDecode, DecodeAttemptDetail: decodeAttemptDetail, StickyDelivery: stickyDelivery, InventoryProvenance: string(replanVirtualProvenance), PreviousSubtitleEvaluation: previousSubtitleEvaluationV3(record), CueIndexedSubtitleTracks: planning.renditionTracks.cueIndexedSubtitleTracks(effectiveFile, start)})
+			result, toneMapCapabilityErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: start, RequestedFile: plannerRequestedFile, EffectiveFile: effectiveFile, LowerVersion: lowerVersionForFileV3(lowerVersion, effectiveFile), ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), AudioTrackIndex: audioIndex, Settings: plannerSettings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: attemptedKeys, AdditionalSubtitles: additional, ForceSoftwareVideoDecode: forceSoftwareDecode, DecodeAttemptDetail: decodeAttemptDetail, StickyDelivery: stickyDelivery, InventoryProvenance: string(replanVirtualProvenance), PreviousSubtitleEvaluation: previousSubtitleEvaluationV3(record), AudioShapeRetry: audioShapeRetry, CueIndexedSubtitleTracks: planning.renditionTracks.cueIndexedSubtitleTracks(effectiveFile, start)})
 			clampPlannerTargetResolution(&result, effectiveFile)
 			reportDetourSubtitleDrop()
 		}
@@ -11321,7 +11353,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			if err != nil {
 				return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: trackUnavailableReasonV3, message: err.Error()}
 			}
-			result, toneMapCapabilityErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: start, RequestedFile: plannerRequestedFile, EffectiveFile: effectiveFile, LowerVersion: lowerVersionForFileV3(lowerVersion, effectiveFile), ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), AudioTrackIndex: audioIndex, Settings: plannerSettings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: attemptedKeys, AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), effectiveFile), ForceSoftwareVideoDecode: forceSoftwareDecode, DecodeAttemptDetail: decodeAttemptDetail, StickyDelivery: replanStickyDeliveryV3(operation, record.CurrentPlan.Delivery), CueIndexedSubtitleTracks: planning.renditionTracks.cueIndexedSubtitleTracks(effectiveFile, start)})
+			result, toneMapCapabilityErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: start, RequestedFile: plannerRequestedFile, EffectiveFile: effectiveFile, LowerVersion: lowerVersionForFileV3(lowerVersion, effectiveFile), ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), AudioTrackIndex: audioIndex, Settings: plannerSettings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: attemptedKeys, AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), effectiveFile), ForceSoftwareVideoDecode: forceSoftwareDecode, DecodeAttemptDetail: decodeAttemptDetail, StickyDelivery: replanStickyDeliveryV3(operation, record.CurrentPlan.Delivery), AudioShapeRetry: audioShapeRetry, CueIndexedSubtitleTracks: planning.renditionTracks.cueIndexedSubtitleTracks(effectiveFile, start)})
 			clampPlannerTargetResolution(&result, effectiveFile)
 
 		}
@@ -14906,6 +14938,83 @@ func demotedDeliveryClassesV3(durable playback.StartRequestV3) []string {
 		}
 	}
 	return demoted
+}
+
+// audioShapeRetryReasonV3 marks a delivery whose surround audio recipe failed
+// to initialize and was rebuilt once as stereo. The delivery stays enabled:
+// the video route was never at fault. A second audio-init failure on the
+// rebuilt plan falls through to the ordinary demotion path.
+const audioShapeRetryReasonV3 = "audio_init_failed_shape_retry"
+
+// planAudioChannelsV3 reports the channel count a plan actually delivers. A
+// copied or direct route carries no converted layout, so the source descriptor
+// names the selected track's real shape.
+func planAudioChannelsV3(plan playback.PlanV3) int {
+	if plan.EffectiveRecipe.AudioChannels != nil && *plan.EffectiveRecipe.AudioChannels > 0 {
+		return *plan.EffectiveRecipe.AudioChannels
+	}
+	return plan.Source.AudioChannels
+}
+
+// audioShapeRetriedV3 reports whether delivery already spent its one
+// audio-shape retry on this attempt.
+func audioShapeRetriedV3(request playback.StartRequestV3, delivery playback.DeliveryV3) bool {
+	capability, ok := request.ClientPlaybackContext.Deliveries[playback.DeliveryClassV3(delivery)]
+	return ok && strings.EqualFold(strings.TrimSpace(capability.FailureReason), audioShapeRetryReasonV3)
+}
+
+// audioShapeRetryApplicableV3 reports whether the current plan is a surround
+// recipe whose delivery has not spent its audio-shape retry. A plan already
+// downmixed to stereo has nothing smaller to try.
+func audioShapeRetryApplicableV3(record *playback.AttemptRecordV3) bool {
+	if record == nil || record.CurrentPlan.Delivery == "" || record.CurrentPlan.Source.VideoCodec == "" {
+		return false
+	}
+	if audioShapeRetriedV3(record.NormalizedRequest, record.CurrentPlan.Delivery) {
+		return false
+	}
+	return planAudioChannelsV3(record.CurrentPlan) > 2
+}
+
+// markAudioShapeRetryV3 stamps the one-shot audio-shape retry on a delivery
+// without disabling it. Idempotent and nil-safe.
+func markAudioShapeRetryV3(request *playback.StartRequestV3, delivery playback.DeliveryV3) {
+	if request == nil || delivery == "" {
+		return
+	}
+	class := playback.DeliveryClassV3(delivery)
+	if request.ClientPlaybackContext.Deliveries == nil {
+		return
+	}
+	capability, ok := request.ClientPlaybackContext.Deliveries[class]
+	if !ok || !capability.Enabled {
+		return
+	}
+	capability.FailureReason = audioShapeRetryReasonV3
+	request.ClientPlaybackContext.Deliveries[class] = capability
+	slog.Debug("playback delivery kept for a stereo audio-shape retry",
+		"component", "api", "delivery_class", class)
+}
+
+// reapplyAudioShapeRetriesV3 re-stamps the durable record's audio-shape retry
+// markers after the client's capability payload replaced the seeded map. A
+// delivery the client no longer enables stays disabled; only a still-enabled
+// class keeps the server-owned one-shot marker.
+func reapplyAudioShapeRetriesV3(start *playback.StartRequestV3, durable playback.StartRequestV3) {
+	if start == nil || start.ClientPlaybackContext.Deliveries == nil {
+		return
+	}
+	for class, durableCapability := range durable.ClientPlaybackContext.Deliveries {
+		if !strings.EqualFold(strings.TrimSpace(durableCapability.FailureReason), audioShapeRetryReasonV3) {
+			continue
+		}
+		capability, ok := start.ClientPlaybackContext.Deliveries[class]
+		if !ok || !capability.Enabled {
+			continue
+		}
+		capability.FailureReason = audioShapeRetryReasonV3
+		start.ClientPlaybackContext.Deliveries[class] = capability
+	}
 }
 
 // reapplyDeliveryDemotionsV3 writes the durable record's delivery demotions
