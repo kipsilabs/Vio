@@ -848,9 +848,18 @@ export function VideoPlayer({
   // element has not reached yet — including a reanchor still being replanned —
   // is the position playback is heading to, so the next skip starts there.
   const pendingSeekTimeRef = useRef<number | null>(null);
+  // The session and plan revision the pending target was requested in. A
+  // transport only serves a target from its own session: a leftover from a
+  // previous session must never aim the next one. The revision records which
+  // generation was current when the viewer asked (the seek is carried forward
+  // by the plan that replaces it).
+  const pendingSeekContextRef = useRef<{ sessionId: string; revision: number } | null>(null);
   useEffect(() => {
     pendingSeekTimeRef.current = pendingSeekTime;
-    if (pendingSeekTime === null) roomIssuedSeekRef.current = null;
+    if (pendingSeekTime === null) {
+      roomIssuedSeekRef.current = null;
+      pendingSeekContextRef.current = null;
+    }
   }, [pendingSeekTime]);
   const [duration, setDuration] = useState(propDuration ?? 0);
   const [buffered, setBuffered] = useState<TimeRanges | null>(null);
@@ -878,6 +887,10 @@ export function VideoPlayer({
   const [framedSessionId, setFramedSessionId] = useState<string | null>(null);
   const sessionIdRef = useRef(sessionId);
   sessionIdRef.current = sessionId;
+  // The plan revision the element's transport currently belongs to. Read by
+  // seek bookkeeping that runs before the transport effect's own declaration.
+  const planRevisionRef = useRef(planRevision);
+  planRevisionRef.current = planRevision;
   const [isLeaving, setIsLeaving] = useState(false);
   const leaveInProgressRef = useRef(false);
   const [notice, setNotice] = useState<PlaybackNoticeState | null>(null);
@@ -1662,6 +1675,16 @@ export function VideoPlayer({
     setPendingSeekTime(null);
   }, [planRevision]);
 
+  // A pending seek belongs to the session it was made in. A session change
+  // drops any target still in flight so it cannot aim the new session's first
+  // transport; the ref is the synchronous reader, the state clears the UI.
+  useEffect(() => {
+    pendingSeekTimeRef.current = null;
+    pendingSeekContextRef.current = null;
+    replanSeekRef.current = null;
+    setPendingSeekTime(null);
+  }, [sessionId]);
+
   // Firefox stalls on codec-copy remuxes it nominally accepts. Both fallbacks
   // report an honest classification and let the server pick the next route —
   // the client no longer names a "compatibility" rung of its own.
@@ -1760,6 +1783,7 @@ export function VideoPlayer({
     // A refused reanchor never reaches its target. Resume relative skips from
     // the surviving stream instead of extending the abandoned request.
     pendingSeekTimeRef.current = null;
+    pendingSeekContextRef.current = null;
     setPendingSeekTime(null);
     const video = videoRef.current;
     if (video) setCurrentTime(toMediaTime(video.currentTime, timelineOffsetRef.current));
@@ -1805,6 +1829,10 @@ export function VideoPlayer({
 
   const rememberPendingSeek = useCallback((seconds: number) => {
     pendingSeekTimeRef.current = seconds;
+    pendingSeekContextRef.current = {
+      sessionId: sessionIdRef.current,
+      revision: planRevisionRef.current,
+    };
     setPendingSeekTime(seconds);
   }, []);
 
@@ -1813,6 +1841,7 @@ export function VideoPlayer({
   const releasePendingSeek = useCallback((seconds: number) => {
     if (pendingSeekTimeRef.current !== seconds) return;
     pendingSeekTimeRef.current = null;
+    pendingSeekContextRef.current = null;
     setPendingSeekTime(null);
     const video = videoRef.current;
     if (video) setCurrentTime(toMediaTime(video.currentTime, timelineOffsetRef.current));
@@ -1975,8 +2004,6 @@ export function VideoPlayer({
   const planChangeInFlight = replanning || replacing;
   const planChangeInFlightRef = useRef(planChangeInFlight);
   planChangeInFlightRef.current = planChangeInFlight;
-  const planRevisionRef = useRef(planRevision);
-  planRevisionRef.current = planRevision;
   // What to do once the plan change in flight settles without replacing the
   // stream, and the plan revision it would replace.
   const afterPlanChangeRef = useRef<{ revision: number; run: () => void } | null>(null);
@@ -3199,12 +3226,10 @@ export function VideoPlayer({
     // playhead, so the plan's own start is behind them. Taken by the first
     // transport of the plan that replaced the seek's plan.
     const recordedReplanSeek = replanSeekRef.current;
-    let carriedSeek: number | null = null;
     if (recordedReplanSeek && recordedReplanSeek.revision !== planRevision) {
       replanSeekRef.current = null;
       if (recordedReplanSeek.sessionId === sessionIdRef.current) {
-        carriedSeek = pendingSeekTimeRef.current ?? recordedReplanSeek.seconds;
-        rememberPendingSeek(carriedSeek);
+        rememberPendingSeek(pendingSeekTimeRef.current ?? recordedReplanSeek.seconds);
       }
     }
 
@@ -3214,23 +3239,27 @@ export function VideoPlayer({
     // server-anchored generation lists its playlist from the plan's stream
     // origin and serves any target at or after that origin (the segment layer
     // restarts FFmpeg in place when the segment has not been produced), so a
-    // target the replan handed over starts there; anything before the origin
+    // target the replan handed over — or a newer seek made while the
+    // replacement was loading — starts there. Anything before the origin
     // belongs to another generation, and the plan's own start stands.
     const transportStartPosition = () => {
       const pendingSeconds = pendingSeekTimeRef.current;
       if (pendingSeconds === null || pendingSeconds === roomHeldSeekRef.current) {
         return effectiveInitialPosition;
       }
-      const playerSeconds = toPlayerTime(pendingSeconds, timelineOffsetRef.current);
-      if (canSeekAnywhereRef.current) return playerSeconds;
-      if (carriedSeek !== null && pendingSeconds === carriedSeek) {
-        if (playerSeconds >= 0) return playerSeconds;
-        // The replacement generation begins after the target, so it can never
-        // reach it: follow the plan's start instead of holding the timeline on
-        // a position this stream has moved past.
+      const pendingContext = pendingSeekContextRef.current;
+      if (pendingContext !== null && pendingContext.sessionId !== sessionIdRef.current) {
+        // A target left over from another session never aims this one.
         releasePendingSeek(pendingSeconds);
         return effectiveInitialPosition;
       }
+      const playerSeconds = toPlayerTime(pendingSeconds, timelineOffsetRef.current);
+      if (canSeekAnywhereRef.current) return playerSeconds;
+      if (playerSeconds >= 0) return playerSeconds;
+      // The replacement generation begins after the target, so it can never
+      // reach it: follow the plan's start instead of holding the timeline on a
+      // position this stream has moved past.
+      releasePendingSeek(pendingSeconds);
       return effectiveInitialPosition;
     };
 

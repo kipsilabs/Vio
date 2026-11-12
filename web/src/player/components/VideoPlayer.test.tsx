@@ -4207,6 +4207,40 @@ describe("VideoPlayer source timeline", () => {
       expect(video.currentTime).toBe(596);
     });
 
+    it("honors a newer seek made while the replacement transport is loading", async () => {
+      const { video, rerenderPlayer } = await seekDuringReplan();
+
+      newStream(rerenderPlayer, anchoredPlan);
+      await waitFor(() => expect(video.src).toContain("revision=2"));
+      // The viewer moves again after the replan landed but before the
+      // replacement's metadata arrives. That target is newer than the carried
+      // seek and still servable by this generation, so it wins.
+      act(() => {
+        controls.current!.onSeek(700);
+      });
+      fireEvent.loadedMetadata(video);
+
+      expect(video.currentTime).toBe(606);
+    });
+
+    it("does not let a pending seek from another session aim the next one", async () => {
+      const { video, rerenderPlayer } = await seekDuringReplan();
+
+      rerenderPlayer({
+        plan: anchoredPlan,
+        replanning: false,
+        planRevision: 2,
+        sessionId: "session-2",
+        streamUrl: "/api/v1/stream/session-2?revision=2",
+      });
+      await waitFor(() => expect(video.src).toContain("/stream/session-2"));
+      fireEvent.loadedMetadata(video);
+
+      // The seek was made against session-1; it must not start session-2 at
+      // 596 instead of the new plan's own position.
+      expect(video.currentTime).toBe(0);
+    });
+
     it("follows the replacement's start when the seek is behind its anchor", async () => {
       const { video, rerenderPlayer } = await seekDuringReplan();
 
