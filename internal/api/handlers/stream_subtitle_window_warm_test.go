@@ -1317,6 +1317,39 @@ func TestVirtualSubtitleProbeFailureFailsClosed(t *testing.T) {
 	})
 }
 
+// A client that cancels the layout probe — a replan or a navigation away aborts
+// it on the request context in milliseconds — is an abandoned request, not a
+// source failure. Production answered 503 dependency_unavailable (and logged an
+// ERROR) for a 74 ms request nobody was waiting on, which is the media proxy's
+// client-cancel bug in the subtitle probe. A genuine probe failure keeps the
+// retryable 503 (TestVirtualSubtitleProbeFailureFailsClosed).
+func TestVirtualSubtitleProbeCancelIsAbandonedNotUnavailable(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+	dir := t.TempDir()
+	handler, session, file, _ := newVirtualSubtitleWindowFixture(t, dir, "#!/bin/sh\nprintf 'PG'\n")
+	writeExecutableScript(t, filepath.Join(dir, "ffprobe"), "#!/bin/sh\nexit 1\n")
+	file.SubtitleTracks = []models.SubtitleTrack{{Index: 0, Codec: "hdmv_pgs_subtitle"}}
+	session.VirtualSubtitleTracks = file.SubtitleTracks
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/subtitle", nil).WithContext(ctx)
+	handler.streamEmbeddedSubtitle(rec, req, file, 0, session, true)
+	if rec.Code != http.StatusRequestTimeout {
+		t.Fatalf("canceled probe = %d %q, want 408 client_canceled (an abandoned request, not a dependency failure)", rec.Code, rec.Body.String())
+	}
+	var body errorResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("canceled probe body = %q: %v", rec.Body.String(), err)
+	}
+	if body.Error != virtualProxyDispositionClientCanceled {
+		t.Fatalf("canceled probe code = %q, want %q", body.Error, virtualProxyDispositionClientCanceled)
+	}
+}
+
 // A cold virtual font fetch returns a pending response within its short client
 // budget while the extraction keeps running. The detached flight, not the HTTP
 // waiter, owns the relay registration: releasing it at handler return would
@@ -1921,6 +1954,128 @@ func TestVirtualBitmapWindowPrefetchRunsWhilePlaying(t *testing.T) {
 	}
 }
 
+// A bitmap request whose start is off the page grid must be extracted as the
+// whole page that contains it. This is the production shape: the web client sent
+// the raw playhead (1944.6 and 1939.6, five seconds apart), each request
+// produced an identical 229,103-byte slice, nothing was reused, and every page
+// boundary showed a blank gap while the next slice was read. The snapped page
+// must still cover what the caller asked for and answer the next request inside
+// it from the page it stored.
+func TestVirtualBitmapUnalignedWindowSnapsToItsPage(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+	dir := t.TempDir()
+	argsLog := filepath.Join(dir, "ffmpeg.args")
+	handler, session, file, _ := newVirtualSubtitleWindowFixture(t, dir,
+		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\nprintf 'PG'\n")
+	file.FileSize = 50 << 30
+	file.SubtitleTracks = []models.SubtitleTrack{{Index: 0, Codec: "hdmv_pgs_subtitle", Language: "fr"}}
+	session.VirtualSubtitleTracks = file.SubtitleTracks
+	// A playing session: the full-track .sup warm stays paused-only, so both
+	// requests can only be answered by pages.
+	session.IsPaused = false
+	session.Position = 1944.6
+	writeSubtitleLayoutProbe(t, dir, file.SubtitleTracks...)
+
+	serve := func(position string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/subtitle?windowed=1&position="+position+"&duration=120", nil)
+		handler.streamEmbeddedSubtitle(rec, req, file, 0, session, false)
+		return rec
+	}
+
+	first := serve("1944.6")
+	if first.Code != http.StatusOK {
+		t.Fatalf("first unaligned page = %d %q", first.Code, first.Body.String())
+	}
+	// The page containing 1944.6 starts at 1920; the requested range reaches
+	// 2064.6, so the extract runs to the next page boundary and advertises
+	// exactly what it produced.
+	if got := first.Header().Get(playback.SubtitleCoverageHeader); got != "1920.000-2160.000" {
+		t.Fatalf("first coverage = %q, want the whole pages 1920.000-2160.000", got)
+	}
+	handler.waitForBackgroundSubtitleWarms()
+
+	second := serve("1939.6")
+	if second.Code != http.StatusOK {
+		t.Fatalf("second unaligned page = %d %q", second.Code, second.Body.String())
+	}
+	if got := second.Header().Get(playback.SubtitleCoverageHeader); got != "1920.000-2160.000" {
+		t.Fatalf("second coverage = %q, want the same pages 1920.000-2160.000", got)
+	}
+	if second.Body.String() != first.Body.String() {
+		t.Fatalf("second body = %q, want the stored page's bytes %q", second.Body.String(), first.Body.String())
+	}
+	// The second request inside the page never reached ffmpeg, and nothing was
+	// ever extracted at the playhead the client sent.
+	if got := countArgsMatching(t, argsLog, "-ss 1944.6"); got != 0 {
+		t.Fatalf("playhead-anchored slice [1944.6,...] was extracted %d times, want 0", got)
+	}
+	if got := countArgsMatching(t, argsLog, "-ss 1939.6"); got != 0 {
+		t.Fatalf("playhead-anchored slice [1939.6,...] was extracted %d times, want 0", got)
+	}
+	if got := countArgsMatching(t, argsLog, "-ss 1920.000", "-to 2160.000"); got != 1 {
+		t.Fatalf("page [1920,2160] was extracted %d times, want exactly 1", got)
+	}
+}
+
+// A prefetched bitmap page must be the page the client asks for next, so that
+// the request is a cache hit. Deriving the prefetch from the live playhead's
+// page (not from the triggering request's start, and not from position plus a
+// fixed lead) is what makes this hold by construction.
+func TestVirtualBitmapPagePrefetchServesTheNextPage(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+	dir := t.TempDir()
+	argsLog := filepath.Join(dir, "ffmpeg.args")
+	handler, session, file, _ := newVirtualSubtitleWindowFixture(t, dir,
+		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\nprintf 'PG'\n")
+	file.FileSize = 50 << 30
+	file.SubtitleTracks = []models.SubtitleTrack{{Index: 0, Codec: "hdmv_pgs_subtitle", Language: "fr"}}
+	session.VirtualSubtitleTracks = file.SubtitleTracks
+	session.IsPaused = false
+	session.Position = 1824.6
+	writeSubtitleLayoutProbe(t, dir, file.SubtitleTracks...)
+
+	serve := func(position string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/subtitle?windowed=1&position="+position+"&duration=120", nil)
+		handler.streamEmbeddedSubtitle(rec, req, file, 0, session, false)
+		return rec
+	}
+
+	first := serve("1800")
+	if first.Code != http.StatusOK {
+		t.Fatalf("first page = %d %q", first.Code, first.Body.String())
+	}
+	handler.waitForBackgroundSubtitleWarms()
+
+	// The detached prefetch pulled the page after the playhead's page — the page
+	// the client asks for next.
+	if got := countArgsMatching(t, argsLog, "-ss 1920.000", "-to 2040.000"); got != 1 {
+		t.Fatalf("next-page prefetch extracts = %d, want exactly 1", got)
+	}
+	if got := countArgsMatching(t, argsLog, "-ss 1824"); got != 0 {
+		t.Fatalf("live-playhead slice [1824.6,...] was extracted %d times, want 0", got)
+	}
+
+	second := serve("1920")
+	if second.Code != http.StatusOK {
+		t.Fatalf("next page = %d %q", second.Code, second.Body.String())
+	}
+	handler.waitForBackgroundSubtitleWarms()
+	// The natural next request was answered by the prefetched page: no second
+	// extraction of it.
+	if got := countArgsMatching(t, argsLog, "-ss 1920.000", "-to 2040.000"); got != 1 {
+		t.Fatalf("page [1920,2040] was extracted %d times, want the prefetch's 1", got)
+	}
+	if second.Body.String() != first.Body.String() {
+		t.Fatalf("next page body = %q, want the page bytes %q", second.Body.String(), first.Body.String())
+	}
+}
+
 // countArgsMatching counts logged ffmpeg invocations containing every want.
 func countArgsMatching(t *testing.T, argsLog string, wants ...string) int {
 	t.Helper()
@@ -2501,14 +2656,16 @@ func TestVirtualSubtitleWarmPrefetchesPlayheadWindowInsteadOfFullTrack(t *testin
 		t.Fatal("mid-file prefetch committed a whole-track artifact")
 	}
 
-	// The playhead at 300 s falls in the [240, 360) window; a client request for
-	// it is served from the prefetched slice without another ffmpeg run.
+	// The playhead at 300 s names the [270, 390) window on the text request grid
+	// (the web player's 30 s cell, pulled 2 s back), which is exactly the window
+	// its next request asks for; it is served from the prefetched slice without
+	// another ffmpeg run.
 	reqOpts := opts
-	reqOpts.SeekSeconds = 240
+	reqOpts.SeekSeconds = 270
 	reqOpts.DurationSeconds = 120
 	reqOpts.DisableBackgroundWarm = true
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/subtitle?position=240&duration=120", nil)
+	req := httptest.NewRequest(http.MethodGet, "/subtitle?position=270&duration=120", nil)
 	if _, err := handler.SubtitleCache.ServeExtractWithResult(rec, req, reqOpts, func(context.Context, playback.StreamExtractOpts) error {
 		t.Error("covering window request re-extracted a prefetched slice")
 		return nil

@@ -8,6 +8,7 @@ import {
 } from "../utils/parseVTT";
 import type { PlayerSubtitleInfo } from "../types";
 import { isASSCodec, isBitmapCodec } from "../utils/subtitleCodecs";
+import { alignSubtitleWindowStart } from "../utils/subtitleWindows";
 import { toMediaTime } from "../utils/mediaTimeline";
 import { isSubtitleSourceChanged } from "../utils/subtitleSourceChanged";
 import { isPlaybackSessionGoneResponse } from "../playback-errors";
@@ -209,11 +210,11 @@ function wholeSecondPosition(position: number): number {
 /**
  * Snap a fetch anchor to the window grid. The request starts up to one grid
  * cell behind the playhead, so the current cue stays covered while every
- * position in that cell shares one server window.
+ * position in that cell shares one server window. The math is shared with the
+ * bitmap page fetcher so the two grids cannot drift apart.
  */
 function alignWindowStart(position: number): number {
-  const anchored = Math.max(0, position - SEEK_BACKOFF);
-  return Math.floor(anchored / WINDOW_ALIGN_SECONDS) * WINDOW_ALIGN_SECONDS;
+  return alignSubtitleWindowStart(position, WINDOW_ALIGN_SECONDS, SEEK_BACKOFF);
 }
 
 /** Request the same bounded interval used by the coverage tracker. */

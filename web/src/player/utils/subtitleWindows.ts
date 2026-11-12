@@ -14,11 +14,14 @@ import { isSubtitleSourceChanged } from "./subtitleSourceChanged";
 // remote 600 s window costs ~18-24 s. Two minutes keeps the first paint short;
 // the prefetch lead below leaves time to fetch the next slice.
 export const SUBTITLE_WINDOW_SECONDS = 120;
-// Bitmap subtitles must be fully extracted before the first frame can paint.
-// A 30 s slice cuts the cold read roughly fourfold versus the old 120 s PGS
-// window; the prefetch lead still schedules the next slice before the current
-// one runs out.
-export const BITMAP_SUBTITLE_WINDOW_SECONDS = 30;
+// One bitmap page. A bitmap request asks for a whole, grid-aligned page so the
+// server stores exactly what the next request asks for and every later request
+// inside the page is served from it. This must equal the page span the server
+// aligns bitmap windows to (internal/api/handlers/stream.go,
+// virtualSubtitleBitmapImplicitWindowSeconds); the two sides floor the same
+// playhead onto the same grid, and a mismatch is exactly what left every page
+// unreusable.
+export const BITMAP_SUBTITLE_PAGE_SECONDS = 120;
 // Start fetching the next window this many seconds before the current one's
 // requested end, so the new cues are already on hand when playback crosses in.
 export const SUBTITLE_PREFETCH_LEAD_SECONDS = 30;
@@ -146,6 +149,33 @@ export function subtitleWindowUrl(
 }
 
 /**
+ * Snap a source position down onto a window grid. Every position inside one
+ * grid cell then asks for the same window start, so the server can answer it
+ * from the window it already produced instead of demuxing a range shifted by
+ * the playhead. `backoffSeconds` pulls the anchor back first so a small scrub
+ * back stays inside the window; bitmap pages pass 0, because the page already
+ * starts at or before the playhead.
+ */
+export function alignSubtitleWindowStart(
+  position: number,
+  cellSeconds: number,
+  backoffSeconds = 0,
+): number {
+  if (!(cellSeconds > 0)) return Math.max(0, position);
+  const anchored = Math.max(0, position - backoffSeconds);
+  return Math.floor(anchored / cellSeconds) * cellSeconds;
+}
+
+/**
+ * The first grid boundary at or after a source position: the page after the
+ * coverage already on hand, never the page the client already holds.
+ */
+export function subtitlePageBoundary(position: number, pageSeconds: number): number {
+  if (!(pageSeconds > 0)) return Math.max(0, position);
+  return Math.ceil(Math.max(0, position) / pageSeconds) * pageSeconds;
+}
+
+/**
  * Source time at the playhead. Until the element has media loaded, currentTime
  * reads 0 rather than where playback will start (a resume target, or a seek
  * that restarted the stream), so the intended position stands in for it.
@@ -185,6 +215,15 @@ export interface SubtitleWindowFetcherOptions {
   firstWindowSeconds?: number;
   /** Seconds before the window end to schedule the next slice. */
   prefetchLeadSeconds?: number;
+  /**
+   * Fetch whole, grid-aligned pages of this many source seconds instead of a
+   * playhead-anchored slice. A bitmap track uses the server's page span
+   * (BITMAP_SUBTITLE_PAGE_SECONDS): every request is exactly the page the
+   * server can store once and serve to every later request inside it, so the
+   * prefetched page is by construction the next one the client asks for.
+   * Unset keeps the sliding-window behavior that text uses.
+   */
+  pageSpanSeconds?: number;
   /** Current playback rate; media-time leads scale with it. */
   playbackRate?: () => number;
   /** Coverage carried over from an earlier fetcher for the same track. */
@@ -266,6 +305,7 @@ export function createSubtitleWindowFetcher(
   let sourceChangedNotified = false;
   const windowSeconds = options.windowSeconds ?? SUBTITLE_WINDOW_SECONDS;
   const firstWindowSeconds = options.firstWindowSeconds ?? windowSeconds;
+  const pageSpanSeconds = options.pageSpanSeconds ?? 0;
   const stallTimeoutMs = options.stallTimeoutMs ?? SUBTITLE_FETCH_STALL_TIMEOUT_MS;
   const maxConsecutiveFailures =
     options.maxConsecutiveFailures ?? SUBTITLE_FETCH_MAX_CONSECUTIVE_FAILURES;
@@ -290,8 +330,11 @@ export function createSubtitleWindowFetcher(
     }
     options.onWindowStart(fresh);
     // A fresh window only has to cover first paint; an extend has to reach
-    // far enough that the next one is due after the prefetch lead.
-    const duration = fresh ? firstWindowSeconds : windowSeconds;
+    // far enough that the next one is due after the prefetch lead. A page grid
+    // always asks for the whole page: a partial page is a range no later
+    // request computes a key for, so it would never be reused.
+    const duration =
+      pageSpanSeconds > 0 ? pageSpanSeconds : fresh ? firstWindowSeconds : windowSeconds;
     const requestedEnd = seekStart + duration;
     inflightEnd = requestedEnd;
 
@@ -425,7 +468,7 @@ export function createSubtitleWindowFetcher(
       retryDelay = 0;
       lastFetchFailureAt = 0;
     }
-    const action = planSubtitleWindow(
+    let action = planSubtitleWindow(
       {
         hasFetched,
         coverageStart,
@@ -444,6 +487,20 @@ export function createSubtitleWindowFetcher(
         ? undefined
         : options.prefetchLeadSeconds * Math.max(1, options.playbackRate?.() ?? 1),
     );
+    if (pageSpanSeconds > 0) {
+      // Page grid: a fresh window is the page that contains the playhead, and
+      // an extend is the page after the coverage already committed. The
+      // planner's own anchors (playhead minus a backoff, coverage minus an
+      // overlap) are deliberately off that grid, so aligning them here is what
+      // makes the request, the page the server stores, and the server's page
+      // prefetch the same window.
+      action =
+        action.kind === "fresh"
+          ? { kind: "fresh", start: alignSubtitleWindowStart(action.start, pageSpanSeconds) }
+          : action.kind === "extend"
+            ? { kind: "extend", start: subtitlePageBoundary(windowEnd, pageSpanSeconds) }
+            : action;
+    }
     if (action.kind === "fresh") void fetchWindow(action.start, true);
     else if (action.kind === "extend") void fetchWindow(action.start, false);
   }
