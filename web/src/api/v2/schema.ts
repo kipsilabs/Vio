@@ -109160,7 +109160,7 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        "X-Vio-Device-Id"?: string;
+        "X-Silo-Device-Id"?: string;
       };
       path: {
         device_id: string;
@@ -113388,7 +113388,7 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        "X-Vio-Device-Id": string;
+        "X-Silo-Device-Id": string;
       };
       path: {
         id: string;
@@ -131269,6 +131269,8 @@ export interface operations {
         "X-Silo-Client-Channel"?: string;
         /** @description Marketing version paired with X-Silo-Client */
         "X-Silo-Client-Version"?: string;
+        /** @description The client's stable device identifier; a successful start records it in the profile's device registry (first 128 characters) */
+        "X-Silo-Device-Id"?: string;
         /** @description App name first-party Vio clients send */
         "X-Vio-Client"?: string;
         /** @description Opaque build identifier paired with X-Vio-Client */
@@ -131277,8 +131279,6 @@ export interface operations {
         "X-Vio-Client-Channel"?: string;
         /** @description Marketing version paired with X-Vio-Client */
         "X-Vio-Client-Version"?: string;
-        /** @description The client's stable device identifier; a successful start records it in the profile's device registry (first 128 characters) */
-        "X-Vio-Device-Id"?: string;
       };
       path: {
         /** @description Opaque identifier */
@@ -131559,6 +131559,8 @@ export interface operations {
         "X-Silo-Client-Channel"?: string;
         /** @description Marketing version paired with X-Silo-Client */
         "X-Silo-Client-Version"?: string;
+        /** @description The client's stable device identifier; a successful start records it in the profile's device registry (first 128 characters) */
+        "X-Silo-Device-Id"?: string;
         /** @description App name first-party Vio clients send */
         "X-Vio-Client"?: string;
         /** @description Opaque build identifier paired with X-Vio-Client */
@@ -131567,8 +131569,6 @@ export interface operations {
         "X-Vio-Client-Channel"?: string;
         /** @description Marketing version paired with X-Vio-Client */
         "X-Vio-Client-Version"?: string;
-        /** @description The client's stable device identifier; a successful start records it in the profile's device registry (first 128 characters) */
-        "X-Vio-Device-Id"?: string;
       };
       path: {
         /** @description Opaque identifier */
@@ -131736,6 +131736,8 @@ export interface operations {
         "X-Silo-Client-Channel"?: string;
         /** @description Marketing version paired with X-Silo-Client */
         "X-Silo-Client-Version"?: string;
+        /** @description The client's stable device identifier; a successful start records it in the profile's device registry (first 128 characters) */
+        "X-Silo-Device-Id"?: string;
         /** @description App name first-party Vio clients send */
         "X-Vio-Client"?: string;
         /** @description Opaque build identifier paired with X-Vio-Client */
@@ -131744,8 +131746,6 @@ export interface operations {
         "X-Vio-Client-Channel"?: string;
         /** @description Marketing version paired with X-Vio-Client */
         "X-Vio-Client-Version"?: string;
-        /** @description The client's stable device identifier; a successful start records it in the profile's device registry (first 128 characters) */
-        "X-Vio-Device-Id"?: string;
       };
       path: {
         /** @description Opaque identifier */
@@ -131984,7 +131984,7 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        "X-Vio-Device-Id"?: string;
+        "X-Silo-Device-Id"?: string;
       };
       path?: never;
       cookie?: never;
@@ -132248,7 +132248,7 @@ export interface operations {
     parameters: {
       query?: never;
       header?: {
-        "X-Vio-Device-Id"?: string;
+        "X-Silo-Device-Id"?: string;
       };
       path?: never;
       cookie?: never;
@@ -132334,7 +132334,7 @@ export interface operations {
     parameters: {
       query?: never;
       header: {
-        "X-Vio-Device-Id": string;
+        "X-Silo-Device-Id": string;
       };
       path?: never;
       cookie?: never;
@@ -132439,6 +132439,8 @@ export interface operations {
         "X-Silo-Client-Channel"?: string;
         /** @description Marketing version paired with X-Silo-Client */
         "X-Silo-Client-Version"?: string;
+        /** @description The client's stable device identifier; a successful start records it in the profile's device registry (first 128 characters) */
+        "X-Silo-Device-Id"?: string;
         /** @description App name first-party Vio clients send */
         "X-Vio-Client"?: string;
         /** @description Opaque build identifier paired with X-Vio-Client */
@@ -132447,8 +132449,6 @@ export interface operations {
         "X-Vio-Client-Channel"?: string;
         /** @description Marketing version paired with X-Vio-Client */
         "X-Vio-Client-Version"?: string;
-        /** @description The client's stable device identifier; a successful start records it in the profile's device registry (first 128 characters) */
-        "X-Vio-Device-Id"?: string;
       };
       path?: never;
       cookie?: never;
@@ -132973,6 +132973,12 @@ export interface operations {
         "X-Silo-Client-Channel"?: string;
         /** @description Marketing version paired with X-Silo-Client */
         "X-Silo-Client-Version"?: string;
+        /** @description The client's stable device identifier; a successful start records it in the profile's device registry (first 128 characters) */
+        "X-Silo-Device-Id"?: string;
+        /** @description Optional display name recorded on the device registry (first 120 characters) */
+        "X-Silo-Device-Name"?: string;
+        /** @description Optional platform recorded on the device registry (first 40 characters) */
+        "X-Silo-Device-Platform"?: string;
         /** @description App name first-party Vio clients send */
         "X-Vio-Client"?: string;
         /** @description Opaque build identifier paired with X-Vio-Client */
@@ -132981,12 +132987,6 @@ export interface operations {
         "X-Vio-Client-Channel"?: string;
         /** @description Marketing version paired with X-Vio-Client */
         "X-Vio-Client-Version"?: string;
-        /** @description The client's stable device identifier; a successful start records it in the profile's device registry (first 128 characters) */
-        "X-Vio-Device-Id"?: string;
-        /** @description Optional display name recorded on the device registry (first 120 characters) */
-        "X-Vio-Device-Name"?: string;
-        /** @description Optional platform recorded on the device registry (first 40 characters) */
-        "X-Vio-Device-Platform"?: string;
       };
       path?: never;
       cookie?: never;

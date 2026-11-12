@@ -166564,7 +166564,7 @@
           },
           {
             "in": "header",
-            "name": "X-Vio-Device-Id",
+            "name": "X-Silo-Device-Id",
             "schema": {
               "maxLength": 128,
               "type": "string"
@@ -174782,7 +174782,7 @@
           },
           {
             "in": "header",
-            "name": "X-Vio-Device-Id",
+            "name": "X-Silo-Device-Id",
             "required": true,
             "schema": {
               "maxLength": 128,
@@ -200978,7 +200978,7 @@
           },
           {
             "in": "header",
-            "name": "X-Vio-Device-Id",
+            "name": "X-Silo-Device-Id",
             "schema": {
               "maxLength": 128,
               "type": "string"
@@ -201341,7 +201341,7 @@
         "parameters": [
           {
             "in": "header",
-            "name": "X-Vio-Device-Id",
+            "name": "X-Silo-Device-Id",
             "schema": {
               "maxLength": 128,
               "type": "string"
@@ -201456,7 +201456,7 @@
         "parameters": [
           {
             "in": "header",
-            "name": "X-Vio-Device-Id",
+            "name": "X-Silo-Device-Id",
             "required": true,
             "schema": {
               "maxLength": 128,
@@ -201584,7 +201584,7 @@
           {
             "description": "The client's stable device identifier; a successful start records it in the profile's device registry (first 128 characters)",
             "in": "header",
-            "name": "X-Vio-Device-Id",
+            "name": "X-Silo-Device-Id",
             "schema": {
               "description": "The client's stable device identifier; a successful start records it in the profile's device registry (first 128 characters)",
               "examples": [
@@ -202473,7 +202473,7 @@
           {
             "description": "The client's stable device identifier; a successful start records it in the profile's device registry (first 128 characters)",
             "in": "header",
-            "name": "X-Vio-Device-Id",
+            "name": "X-Silo-Device-Id",
             "schema": {
               "description": "The client's stable device identifier; a successful start records it in the profile's device registry (first 128 characters)",
               "examples": [
@@ -202634,7 +202634,7 @@
           {
             "description": "Optional display name recorded on the device registry (first 120 characters)",
             "in": "header",
-            "name": "X-Vio-Device-Name",
+            "name": "X-Silo-Device-Name",
             "schema": {
               "description": "Optional display name recorded on the device registry (first 120 characters)",
               "examples": [
@@ -202646,7 +202646,7 @@
           {
             "description": "Optional platform recorded on the device registry (first 40 characters)",
             "in": "header",
-            "name": "X-Vio-Device-Platform",
+            "name": "X-Silo-Device-Platform",
             "schema": {
               "description": "Optional platform recorded on the device registry (first 40 characters)",
               "examples": [
@@ -203431,7 +203431,7 @@
           {
             "description": "The client's stable device identifier; a successful start records it in the profile's device registry (first 128 characters)",
             "in": "header",
-            "name": "X-Vio-Device-Id",
+            "name": "X-Silo-Device-Id",
             "schema": {
               "description": "The client's stable device identifier; a successful start records it in the profile's device registry (first 128 characters)",
               "examples": [
@@ -203978,7 +203978,7 @@
           {
             "description": "The client's stable device identifier; a successful start records it in the profile's device registry (first 128 characters)",
             "in": "header",
-            "name": "X-Vio-Device-Id",
+            "name": "X-Silo-Device-Id",
             "schema": {
               "description": "The client's stable device identifier; a successful start records it in the profile's device registry (first 128 characters)",
               "examples": [
@@ -204347,7 +204347,7 @@
           {
             "description": "The client's stable device identifier; a successful start records it in the profile's device registry (first 128 characters)",
             "in": "header",
-            "name": "X-Vio-Device-Id",
+            "name": "X-Silo-Device-Id",
             "schema": {
               "description": "The client's stable device identifier; a successful start records it in the profile's device registry (first 128 characters)",
               "examples": [

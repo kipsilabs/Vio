@@ -219,7 +219,7 @@ type PlaybackDecision struct {
 }
 
 type PlaybackRequestHeaders struct {
-	SiloDeviceID string `header:"X-Vio-Device-Id" doc:"The client's stable device identifier; a successful start records it in the profile's device registry (first 128 characters)" example:"iphone-1"`
+	SiloDeviceID string `header:"X-Silo-Device-Id" doc:"The client's stable device identifier; a successful start records it in the profile's device registry (first 128 characters)" example:"iphone-1"`
 
 	UserAgent       string `header:"User-Agent"`
 	DeviceID        string `header:"X-Device-ID"`
@@ -263,8 +263,8 @@ func (h PlaybackRequestHeaders) clientInfo() playback.ClientInfo {
 // Unlike the settings operations they carry no length limits: an over-long
 // value is clamped when recorded, and must never refuse playback.
 type PlaybackDeviceHeaders struct {
-	SiloDeviceName     string `header:"X-Vio-Device-Name" doc:"Optional display name recorded on the device registry (first 120 characters)" example:"Living room"`
-	SiloDevicePlatform string `header:"X-Vio-Device-Platform" doc:"Optional platform recorded on the device registry (first 40 characters)" example:"iOS"`
+	SiloDeviceName     string `header:"X-Silo-Device-Name" doc:"Optional display name recorded on the device registry (first 120 characters)" example:"Living room"`
+	SiloDevicePlatform string `header:"X-Silo-Device-Platform" doc:"Optional platform recorded on the device registry (first 40 characters)" example:"iOS"`
 }
 
 type PlaybackStartInput struct {

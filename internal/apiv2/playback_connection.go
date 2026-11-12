@@ -15,13 +15,13 @@ type playbackConnectionService interface {
 	PlaybackConnection(context.Context, string, bool) (connectionstore.State, error)
 }
 type PlaybackConnectionInput struct {
-	DeviceID string `header:"X-Vio-Device-Id" maxLength:"128"`
+	DeviceID string `header:"X-Silo-Device-Id" maxLength:"128"`
 }
 
 // PlaybackLearnedLimitResetInput names the device whose limit is reset: a
 // reset without one would clear nothing and still report success.
 type PlaybackLearnedLimitResetInput struct {
-	DeviceID string `header:"X-Vio-Device-Id" required:"true" minLength:"1" maxLength:"128"`
+	DeviceID string `header:"X-Silo-Device-Id" required:"true" minLength:"1" maxLength:"128"`
 }
 type PlaybackLearnedLimit struct {
 	Kbps       int     `json:"kbps"`
@@ -97,7 +97,7 @@ type playbackProbeResultService interface {
 	ReportPlaybackProbe(context.Context, string, connectionstore.ProbeResult) error
 }
 type PlaybackProbeResultsInput struct {
-	DeviceID string `header:"X-Vio-Device-Id" maxLength:"128"`
+	DeviceID string `header:"X-Silo-Device-Id" maxLength:"128"`
 	Body     struct {
 		Kbps       int    `json:"kbps" minimum:"100" maximum:"1000000" doc:"The bounds of bandwidth_estimate_kbps, so a kept reading is one a start can send."`
 		Bytes      int64  `json:"bytes" minimum:"1" maximum:"1000000000"`

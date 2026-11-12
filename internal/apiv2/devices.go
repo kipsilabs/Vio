@@ -50,7 +50,7 @@ type DeviceSettingsRemoveInput struct {
 type DeviceUpdateInput struct {
 	DeviceID     string `path:"device_id" minLength:"1" maxLength:"128"`
 	ProfileID    ID     `query:"profile_id" doc:"Another profile on the account; requires household management authority"`
-	DeviceHeader string `header:"X-Vio-Device-Id" maxLength:"128"`
+	DeviceHeader string `header:"X-Silo-Device-Id" maxLength:"128"`
 	Body         DeviceUpdate
 }
 type DeviceUpdateOutput struct{ Body DeviceSettings }
