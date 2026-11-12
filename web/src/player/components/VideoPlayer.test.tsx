@@ -4115,6 +4115,141 @@ describe("VideoPlayer source timeline", () => {
     expect(video.currentTime).toBe(300);
   });
 
+  // A replan of a transcoded session anchors the replacement generation at the
+  // live position and publishes that anchor as the transport's clock zero
+  // (`stream_origin`/`timeline_offset`), with `player_start` the remainder past
+  // it. A seek the viewer makes while that replan is still being fetched is not
+  // part of the plan: the plan starts behind them. The stream that replaces the
+  // seek's plan must start at the seek, or the target is lost and playback
+  // restarts at the plan's origin.
+  describe("a seek made while a replan is fetched", () => {
+    // Source 94 at the clock zero: segment 47 of a 2 s playlist.
+    const anchoredPlan = fixturePlanV3({
+      delivery: "server_transcode_hls",
+      stream: {
+        url: "/playback/transcode/session-1/master.m3u8",
+        protocol: "hls",
+        headers: {},
+        header_refresh: "none",
+      },
+      timeline: {
+        source_start_seconds: 94,
+        player_start_seconds: 0,
+        stream_origin_seconds: 94,
+        timeline_offset_seconds: 94,
+        can_seek_anywhere: false,
+        seek_restoration: "source_position",
+      },
+    });
+
+    // A complete VOD playlist makes the whole runtime seekable even though only
+    // the produced window is buffered; the client seeks it natively and the
+    // segment layer produces (or restarts for) the target.
+    const seekableWindow = (video: HTMLVideoElement, end: number) =>
+      Object.defineProperty(video, "seekable", {
+        configurable: true,
+        value: { length: 1, start: () => 0, end: () => end },
+      });
+
+    async function seekDuringReplan(plan = anchoredPlan) {
+      const rendered = renderPlayer({ plan });
+      const video = rendered.container.querySelector("video");
+      if (!video) throw new Error("expected video element");
+      await waitFor(() =>
+        expect(video.src !== "" || hlsJS.constructed.mock.calls.length > 0).toBe(true),
+      );
+      fireEvent.loadedMetadata(video);
+      fireFrameTimeUpdate(video);
+      fireEvent.playing(video);
+      // The replan is in flight; the viewer seeks to 690 s of media while the
+      // old generation still plays.
+      rendered.rerenderPlayer({ plan, replanning: true });
+      seekableWindow(video, 6900);
+      act(() => {
+        controls.current!.onSeek(690);
+      });
+      return { ...rendered, video };
+    }
+
+    function newStream(
+      rerenderPlayer: (next: Partial<Parameters<typeof VideoPlayer>[0]>) => void,
+      plan: typeof anchoredPlan = anchoredPlan,
+    ) {
+      rerenderPlayer({
+        plan,
+        replanning: false,
+        planRevision: 2,
+        streamUrl: "/api/v1/stream/session-1?revision=2",
+      });
+    }
+
+    it("starts the hls.js stream at the seek instead of the plan's start", async () => {
+      hlsJS.supported = true;
+      const { rerenderPlayer } = await seekDuringReplan();
+      hlsJS.constructed.mockClear();
+
+      newStream(rerenderPlayer, anchoredPlan);
+
+      await waitFor(() => expect(hlsJS.constructed).toHaveBeenCalledOnce());
+      // 690 s of media is 596 s on a transport whose clock zero is source 94.
+      expect(hlsJS.constructed).toHaveBeenCalledWith(
+        expect.objectContaining({ startPosition: 596 }),
+      );
+    });
+
+    it("starts the native HLS stream at the seek", async () => {
+      const { video, rerenderPlayer } = await seekDuringReplan();
+
+      newStream(rerenderPlayer, anchoredPlan);
+      await waitFor(() => expect(video.src).toContain("revision=2"));
+      fireEvent.loadedMetadata(video);
+
+      expect(video.currentTime).toBe(596);
+    });
+
+    it("follows the replacement's start when the seek is behind its anchor", async () => {
+      const { video, rerenderPlayer } = await seekDuringReplan();
+
+      // The server anchored the replacement at 720, past the seek at 690: this
+      // generation cannot produce the target, so its own start stands.
+      newStream(rerenderPlayer, {
+        ...anchoredPlan,
+        timeline: {
+          ...anchoredPlan.timeline,
+          source_start_seconds: 720,
+          stream_origin_seconds: 720,
+          timeline_offset_seconds: 720,
+        },
+      });
+      await waitFor(() => expect(video.src).toContain("revision=2"));
+      fireEvent.loadedMetadata(video);
+
+      expect(video.currentTime).toBe(0);
+      fireFrameTimeUpdate(video);
+      // The timeline follows the media again instead of holding the abandoned
+      // seek.
+      expect(controls.current!.currentTime).toBe(720);
+    });
+
+    it("starts a track change at the plan's continuation when nothing was seeked", async () => {
+      hlsJS.supported = true;
+      const { rerenderPlayer } = renderPlayer({ plan: anchoredPlan });
+      await waitFor(() => expect(hlsJS.constructed).toHaveBeenCalled());
+      hlsJS.constructed.mockClear();
+
+      // A track change does not move the playhead: the server anchors the new
+      // generation at the live position and the plan names the remainder past
+      // the segment boundary. That is where the replacement starts.
+      newStream(rerenderPlayer, {
+        ...anchoredPlan,
+        timeline: { ...anchoredPlan.timeline, source_start_seconds: 96, player_start_seconds: 2 },
+      });
+
+      await waitFor(() => expect(hlsJS.constructed).toHaveBeenCalledOnce());
+      expect(hlsJS.constructed).toHaveBeenCalledWith(expect.objectContaining({ startPosition: 2 }));
+    });
+  });
+
   // Chrome keeps a Matroska file's container start time on its clock, so a
   // file that starts 30 s in reports currentTime 30 at its first frame.
   // Subtitle cues, the resume seek, and the reported position all have to

@@ -1287,6 +1287,23 @@ export function VideoPlayer({
   const canSeekAnywhere = plan.timeline.can_seek_anywhere;
   const canSeekAnywhereRef = useRef(canSeekAnywhere);
   canSeekAnywhereRef.current = canSeekAnywhere;
+  const replanningRef = useRef(replanning);
+  replanningRef.current = replanning;
+  // The viewer's newest seek while a replan of this session was in flight, and
+  // the plan revision it was made on. The stream that replaces that plan starts
+  // there instead of at the replan's own position: the viewer asked to be at
+  // that point while the server was already building the replacement, and a
+  // track change never moves the playhead, so the plan's start is behind them.
+  // A later seek replaces it, and a plan that settles without a new stream
+  // drops it.
+  const replanSeekRef = useRef<{ sessionId: string; revision: number; seconds: number } | null>(
+    null,
+  );
+  useEffect(() => {
+    if (!replanning && replanSeekRef.current?.revision === planRevision) {
+      replanSeekRef.current = null;
+    }
+  }, [planRevision, replanning]);
   // The menu is the plan's. The session's preference decides whether Auto is
   // lit, since `auto` names no rung; otherwise the plan names the entry it
   // delivers.
@@ -1924,6 +1941,12 @@ export function VideoPlayer({
       }
       if (canSeekAnywhere || isNativePositionInRanges(video.seekable, nativeSeconds)) {
         rememberPendingSeek(seconds);
+        // The replan now in flight may already be building the stream this
+        // seek will play on, from a position the seek has moved past. Hand the
+        // target to that transport so it starts here instead of there.
+        replanSeekRef.current = replanningRef.current
+          ? { sessionId: sessionIdRef.current, revision: planRevisionRef.current, seconds }
+          : null;
         setCurrentTime(seconds);
         if (isHlsStream) video.currentTime = nativeSeconds;
         else handleSeek(nativeSeconds);
@@ -3171,17 +3194,50 @@ export function VideoPlayer({
     video.addEventListener("loadeddata", attemptAutoplayWhenReady);
     video.addEventListener("canplay", attemptAutoplayWhenReady);
 
+    // A seek made while this plan's stream was being fetched is where the
+    // stream is heading: the server built it before the viewer moved the
+    // playhead, so the plan's own start is behind them. Taken by the first
+    // transport of the plan that replaced the seek's plan.
+    const recordedReplanSeek = replanSeekRef.current;
+    let carriedSeek: number | null = null;
+    if (recordedReplanSeek && recordedReplanSeek.revision !== planRevision) {
+      replanSeekRef.current = null;
+      if (recordedReplanSeek.sessionId === sessionIdRef.current) {
+        carriedSeek = pendingSeekTimeRef.current ?? recordedReplanSeek.seconds;
+        rememberPendingSeek(carriedSeek);
+      }
+    }
+
+    // Where the stream about to load starts. A pending seek wins: it is where
+    // playback is heading, and a room seek the room has not run yet waits for
+    // the room's command. A seek-anywhere plan takes the target directly. A
+    // server-anchored generation lists its playlist from the plan's stream
+    // origin and serves any target at or after that origin (the segment layer
+    // restarts FFmpeg in place when the segment has not been produced), so a
+    // target the replan handed over starts there; anything before the origin
+    // belongs to another generation, and the plan's own start stands.
+    const transportStartPosition = () => {
+      const pendingSeconds = pendingSeekTimeRef.current;
+      if (pendingSeconds === null || pendingSeconds === roomHeldSeekRef.current) {
+        return effectiveInitialPosition;
+      }
+      const playerSeconds = toPlayerTime(pendingSeconds, timelineOffsetRef.current);
+      if (canSeekAnywhereRef.current) return playerSeconds;
+      if (carriedSeek !== null && pendingSeconds === carriedSeek) {
+        if (playerSeconds >= 0) return playerSeconds;
+        // The replacement generation begins after the target, so it can never
+        // reach it: follow the plan's start instead of holding the timeline on
+        // a position this stream has moved past.
+        releasePendingSeek(pendingSeconds);
+        return effectiveInitialPosition;
+      }
+      return effectiveInitialPosition;
+    };
+
     const attachNativeHLS = () => {
       video.src = effectiveStreamUrl;
       nativeHLSMetadataHandler = () => {
-        // A seek the viewer made while the transport loaded wins over the
-        // start position; on a seek-anywhere plan it never replans. A room
-        // seek request the room has not run yet waits for the room's command.
-        const pendingSeconds = canSeekAnywhereRef.current ? pendingSeekTimeRef.current : null;
-        video.currentTime =
-          pendingSeconds === null || pendingSeconds === roomHeldSeekRef.current
-            ? effectiveInitialPosition
-            : toPlayerTime(pendingSeconds, timelineOffsetRef.current);
+        video.currentTime = transportStartPosition();
         attemptAutoplayWhenReady();
       };
       video.addEventListener("loadedmetadata", nativeHLSMetadataHandler, { once: true });
@@ -3228,7 +3284,8 @@ export function VideoPlayer({
               backBufferLength: Infinity,
               maxBufferLength,
               maxMaxBufferLength: maxBufferLength,
-              startPosition: effectiveInitialPosition,
+              // hls.js seeks to this once the first fragment is buffered.
+              startPosition: transportStartPosition(),
               startFragPrefetch: true,
               // Segment requests may block while FFmpeg encodes on demand.
               // Remote transcode nodes can also briefly defer the initial
@@ -3576,6 +3633,8 @@ export function VideoPlayer({
     playsOriginalFile,
     plannedBitrateKbps,
     plannedDynamicRange,
+    rememberPendingSeek,
+    releasePendingSeek,
     reportCurrentPlanFailure,
     shouldAutoPlay,
   ]);
