@@ -521,10 +521,29 @@ const restartSegmentAsyncTimeout = 2 * time.Minute
 // far-seeks serialized by the lifecycle lock would apply in whatever order they
 // happened to acquire the lock, and the older target could win.
 type pendingAsyncRestart struct {
+	// mu guards ts, segNum and adoptions.
+	mu sync.Mutex
+	// ts is the generation the worker restarts. It starts as the generation the
+	// request named and is adopted forward to a live successor when a replan
+	// replaces that generation while the restart waits for the lifecycle lock.
 	ts *TranscodeSession
-	// mu guards segNum, the latest requested segment.
-	mu     sync.Mutex
+	// segNum is the latest requested segment.
 	segNum int
+	// adoptions counts the successors this worker has followed, so a replan
+	// storm cannot keep one detached seek restart alive indefinitely.
+	adoptions int
+}
+
+// maxAsyncRestartSuccessors bounds how many replaced generations one detached
+// far-seek restart follows before it gives up. One replan superseding the seek
+// is the shape it is for; a longer chain means the session is churning and the
+// client's next playlist reload should decide the position.
+const maxAsyncRestartSuccessors = 2
+
+func (p *pendingAsyncRestart) session() *TranscodeSession {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.ts
 }
 
 // RestartSegmentAsync runs RestartSegmentLocked on its own goroutine so a
@@ -547,14 +566,19 @@ func (m *TranscodeManager) RestartSegmentAsync(sessionID string, ts *TranscodeSe
 	if m.asyncRestarts == nil {
 		m.asyncRestarts = make(map[string]*pendingAsyncRestart)
 	}
-	if pending := m.asyncRestarts[sessionID]; pending != nil && pending.ts == ts {
-		// A restart for this session is already running: record the newest
-		// target and let the worker converge on it.
+	if pending := m.asyncRestarts[sessionID]; pending != nil {
 		pending.mu.Lock()
-		pending.segNum = segNum
+		sameGeneration := pending.ts == ts
+		if sameGeneration {
+			// A restart for this generation is already running: record the
+			// newest target and let the worker converge on it.
+			pending.segNum = segNum
+		}
 		pending.mu.Unlock()
-		m.asyncRestartMu.Unlock()
-		return
+		if sameGeneration {
+			m.asyncRestartMu.Unlock()
+			return
+		}
 	}
 	pending := &pendingAsyncRestart{ts: ts, segNum: segNum}
 	m.asyncRestarts[sessionID] = pending
@@ -594,10 +618,21 @@ func (m *TranscodeManager) runAsyncRestart(sessionID string, pending *pendingAsy
 			return applied
 		}
 
+		generation := pending.session()
 		ctx, cancel := context.WithTimeout(context.Background(), restartSegmentAsyncTimeout)
-		target, ok, err := m.restartSegmentLockedWithTarget(ctx, sessionID, pending.ts, nextTarget)
+		target, ok, err := m.restartSegmentLockedWithTarget(ctx, sessionID, generation, nextTarget)
 		cancel()
-		m.recordAsyncRestartOutcome(sessionID, pending.ts, applied, target, ok, err)
+		if errors.Is(err, ErrSessionSuperseded) && m.followAsyncRestartSuccessor(sessionID, pending, generation) {
+			// The seek outlived the generation it was queued on: a replan
+			// replaced that generation while this restart waited for the
+			// lifecycle lock. The successor is a fresh generation at the old
+			// position, so dropping the restart here would abandon the
+			// player's newer seek and leave every later request on the
+			// successor anchored where the replan started. Adopt it and apply
+			// the same target.
+			continue
+		}
+		m.recordAsyncRestartOutcome(sessionID, generation, applied, target, ok, err)
 
 		// A terminal failure cannot be fixed by a different target on the same
 		// dead generation, so stop rather than loop; the latched verdict is what
@@ -638,8 +673,9 @@ func (m *TranscodeManager) tryFinishAsyncRestart(sessionID string, pending *pend
 func (m *TranscodeManager) recordAsyncRestartOutcome(sessionID string, ts *TranscodeSession, segNum int, target SegmentRecoveryTarget, ok bool, err error) {
 	switch {
 	case errors.Is(err, ErrSessionSuperseded):
-		// Routine teardown: the session was closed or replaced while the seek
-		// restart waited for the lifecycle lock, so nothing was re-spawned.
+		// Routine teardown: the session was closed while the seek restart
+		// waited for the lifecycle lock, so nothing was re-spawned. A replaced
+		// generation is followed instead (see followAsyncRestartSuccessor).
 		slog.Debug("restart transcode at missing segment skipped, session superseded (async)",
 			"component", "playback", "segment", segNum, "session", sessionID)
 	case err != nil && !errors.Is(err, ErrManifestNotReady):
@@ -653,6 +689,56 @@ func (m *TranscodeManager) recordAsyncRestartOutcome(sessionID string, ts *Trans
 			"seek_seconds", target.SeekSeconds, "stream_origin_seconds", target.StreamOriginSeconds,
 			"resolved_start_segment", target.StartSegmentNumber, "session", sessionID)
 	}
+}
+
+// followAsyncRestartSuccessor adopts the live generation that replaced the one
+// the far-seek restart was queued on, so the seek is applied to the successor
+// instead of being dropped with its predecessor.
+//
+// A replan holds the per-session lifecycle lock across "spawn → register", and
+// a detached seek restart waits on that same lock. When the replan commits, the
+// live generation has changed and restartSessionLocked answers
+// ErrSessionSuperseded. Treating that as teardown is only right when the
+// session is gone: a replacement successor is a fresh generation anchored at
+// the position the replan started from (usually the session's last reported
+// position, which trails the seek), so dropping the restart leaves every later
+// request for the seek's segment on a generation that cannot reach it.
+//
+// The successor is not rebuilt when it already starts at or past the target —
+// the seek is already its position — and one worker follows a bounded number of
+// successors so a replan storm cannot keep it alive.
+func (m *TranscodeManager) followAsyncRestartSuccessor(sessionID string, pending *pendingAsyncRestart, superseded *TranscodeSession) bool {
+	if pending == nil {
+		return false
+	}
+	successor := m.GetTranscodeSession(sessionID)
+	if successor == nil || successor == superseded {
+		return false
+	}
+	pending.mu.Lock()
+	target := pending.segNum
+	pending.mu.Unlock()
+	if target <= 0 {
+		return false
+	}
+	if start := successor.Opts().StartSegmentNumber; start > 0 && start >= target {
+		return false
+	}
+	m.asyncRestartMu.Lock()
+	defer m.asyncRestartMu.Unlock()
+	if m.asyncRestarts[sessionID] != pending {
+		// A newer request already replaced this worker's coalescing entry, so
+		// that worker owns the successor; adopting here would restart it twice.
+		return false
+	}
+	pending.mu.Lock()
+	defer pending.mu.Unlock()
+	if pending.ts == successor || pending.adoptions >= maxAsyncRestartSuccessors {
+		return false
+	}
+	pending.adoptions++
+	pending.ts = successor
+	return true
 }
 
 func (m *TranscodeManager) restartSessionLocked(sessionID string, ts *TranscodeSession, restart func() error) error {

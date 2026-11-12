@@ -191,6 +191,75 @@ func TestRestartSegmentAsyncAppliesTargetArrivingAtCompletion(t *testing.T) {
 	waitSeekLogLast(t, logPath, "40.000")
 }
 
+// TestRestartSegmentAsyncFollowsAReplanSuccessor pins the seek across a
+// generation swap. A replan holds the session lifecycle lock across its
+// spawn→register window, so a detached far-seek restart queued behind it wakes
+// to a replaced generation. Dropping the restart with the predecessor abandons
+// the player's newer seek and leaves the successor anchored where the replan
+// started; the target must be applied to the live successor instead.
+func TestRestartSegmentAsyncFollowsAReplanSuccessor(t *testing.T) {
+	const sid = "sess-async"
+	m := NewTranscodeManager()
+	predecessorLog := filepath.Join(t.TempDir(), "predecessor.log")
+	successorLog := filepath.Join(t.TempDir(), "successor.log")
+	predecessor := newAsyncRestartTestSession(t, predecessorLog)
+	successor := newAsyncRestartTestSession(t, successorLog)
+	// The replan's successor starts at the session's last position (segment
+	// 45 / 90s), behind the seek target at segment 345 (690s).
+	successor.opts.StartSegmentNumber = 45
+	successor.opts.SeekSeconds = 90
+	m.RegisterTranscodeSession(sid, predecessor)
+	t.Cleanup(func() {
+		_ = predecessor.Close()
+		_ = successor.Close()
+	})
+
+	// Hold the lock so the seek restart is queued on the predecessor, then
+	// publish the successor exactly as a replan's swap does before releasing.
+	release := m.LockSessionLifecycle(sid)
+	m.RestartSegmentAsync(sid, predecessor, 345)
+	m.SwapTranscodeSession(sid, successor)
+	release()
+
+	waitAsyncRestartsDrained(t, m, sid)
+	seeks := waitSeekLogLast(t, successorLog, "690.000")
+	if len(seeks) != 1 {
+		t.Fatalf("successor applied seeks = %v, want exactly one restart at the seek target", seeks)
+	}
+	if seeks := readSeekLog(t, predecessorLog); len(seeks) != 0 {
+		t.Fatalf("superseded generation applied seeks = %v, want none", seeks)
+	}
+}
+
+// TestRestartSegmentAsyncSkipsSuccessorAlreadyAtTheSeekTarget pins the other
+// half of adoption: when the successor already starts at or past the requested
+// segment, the seek is already its position and rebuilding it would only stall
+// playback.
+func TestRestartSegmentAsyncSkipsSuccessorAlreadyAtTheSeekTarget(t *testing.T) {
+	const sid = "sess-async"
+	m := NewTranscodeManager()
+	predecessor := newAsyncRestartTestSession(t, filepath.Join(t.TempDir(), "predecessor.log"))
+	successorLog := filepath.Join(t.TempDir(), "successor.log")
+	successor := newAsyncRestartTestSession(t, successorLog)
+	successor.opts.StartSegmentNumber = 345
+	successor.opts.SeekSeconds = 690
+	m.RegisterTranscodeSession(sid, predecessor)
+	t.Cleanup(func() {
+		_ = predecessor.Close()
+		_ = successor.Close()
+	})
+
+	release := m.LockSessionLifecycle(sid)
+	m.RestartSegmentAsync(sid, predecessor, 345)
+	m.SwapTranscodeSession(sid, successor)
+	release()
+	waitAsyncRestartsDrained(t, m, sid)
+
+	if seeks := readSeekLog(t, successorLog); len(seeks) != 0 {
+		t.Fatalf("successor applied seeks = %v, want none: it already starts at the target", seeks)
+	}
+}
+
 // TestRestartSegmentAsyncLatchesTerminalFailure pins the poison-latch: a
 // detached restart refused by a dead source records its verdict so the next
 // segment request can surface the real failure instead of a second
