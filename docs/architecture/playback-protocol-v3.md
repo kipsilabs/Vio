@@ -2257,6 +2257,16 @@ their timing correction applied before any conversion (an `original=1` SRT
 included) and `Cache-Control: private, no-cache`, since a correction changes
 the bytes behind the same URL.
 
+An explicit bitmap window is a page. When a PGS `windowed=1` request starts off
+the page grid, the server extracts the page that contains it and stops on the
+last page boundary the requested range reaches, so the slice it stores is the
+same page a later request inside that range asks for; the response advertises
+the range actually extracted, which always contains the requested one. A
+client that already asks in whole pages (the web player) is unaffected. This is
+what makes a bitmap page reusable at all: a playhead-anchored slice is a range
+no later request computes, so every request re-demuxed the container and each
+page boundary showed a gap while the next slice was read.
+
 For an embedded track on a large or unknown-size virtual/remote release the
 default is a bounded first window rather than the complete track: extracting
 every byte of a multi-GB provider stream cannot finish within a client fetch
@@ -2271,12 +2281,21 @@ The implicit window starts on a fixed grid derived from its own length, not at
 the live playhead. A page anchored a few seconds behind the playhead is never
 reused: the next request's range runs past the page the previous one produced,
 no stored page contains it, and the server demuxes the source again for every
-request. The same grid is what the window prefetch below mirrors. Text pages are
-600 s. A bitmap (PGS) page is 120 s, the page the web player already requests,
-because a bitmap page can only be produced by demuxing the container: on a
-50 GB / 2h52m release a 600 s page reads about 2.9 GB and measured 65-105 s per
-request, longer than the fetch that asked for it, so it was abandoned and never
-stored.
+request. Text pages are 600 s. A bitmap (PGS) page is 120 s, the page the web
+player already requests, because a bitmap page can only be produced by demuxing
+the container: on a 50 GB / 2h52m release a 600 s page reads about 2.9 GB and
+measured 65-105 s per request, longer than the fetch that asked for it, so it
+was abandoned and never stored.
+
+The same grid is what a windowed request and the window prefetch use, so the page
+one stores is the page the client asks for next. Per class: a bitmap client asks
+for whole 120 s pages that start on the source-zero page grid, and a text client
+slides a 120 s window on a 30 s grid pulled 2 s back from the playhead. Both
+grids are mirrored from the first-party web player
+(`web/src/player/utils/subtitleWindows.ts`) by
+`playback.SubtitleRequestGridFor`, and the client and server ship together:
+changing one side without the other re-opens the miss-every-prefetch bug this
+grid exists to close.
 
 A client that requested the whole track therefore cannot assume a complete body:
 it reads the headers and requests subsequent windows from the advertised end, or
@@ -2295,15 +2314,22 @@ extracting; repeated complete requests reuse the finished artifact. A windowed
 miss on a large virtual source starts detached fill work so later requests do
 not re-demux the source. A session still at the start warms the complete track
 (text and ASS while playing, bitmap while paused), and later requests read the
-small cached artifact. A session whose playhead has moved into the file
-prefetches at most two bounded windows on the request's window grid — the window
-covering the playhead and the one after it — and keeps them as last-good window
-slices, never as a complete-track artifact: a full-track extract always starts at
-source zero, so publishing one mid-file would claim a tail slice as the whole
-track, with offsets that do not match the source timeline and without the cues
-before the seek. That bounded prefetch also runs for a bitmap track while
-playing, because a playing bitmap track otherwise re-demuxes the source at every
-page boundary; the complete-track bitmap warm itself stays paused-only. The
+small cached artifact.
+
+A session past the start never builds a complete-track artifact, and that is a
+correctness rule rather than a capacity one: a complete extract always starts at
+source zero, so one started from a mid-file playhead would publish a tail slice
+as the whole track, with offsets that do not match the source timeline and
+without every cue before the seek. Playback there is served by bounded windows
+only. Such a session prefetches at most two bounded windows on the request grid
+above — the cell the live playhead falls in and the cell after it — and keeps
+them as last-good window slices. That bounded prefetch runs for a bitmap track
+while playing too, because a playing bitmap track otherwise re-demuxes the source
+at every page boundary; the complete-track bitmap warm itself stays paused-only. A
+warm that cannot reserve the track because a fill already owns it (typically the
+client's own whole-track request, or another warm) skips instead of queueing
+behind that fill and logs `subtitle cache warm skipped: a fill already owns this
+track`; it never duplicates a fill the request path is already doing. The
 prefetch skips while the relay is shedding client reads or
 when no detached capacity is free, and identical concurrent windows coalesce.
 While a full-track ASS warm is still filling, the server retains the script

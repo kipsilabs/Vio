@@ -32,22 +32,26 @@ start is not blamed on it.
 - `web/src/player/hooks/usePGSSubtitles.ts` fetches positioned windows
   (`windowed=1&position=&duration=`) through the shared window fetcher
   (`web/src/player/utils/subtitleWindows.ts`), so seeks far into a file do not
-  download the whole track. A fresh window after a seek or track change asks
-  for 60 seconds: 30 seconds behind the playhead and 30 seconds ahead, so a
-  slow extraction cannot be overtaken by playback. Extends ask for 120 seconds.
-  The fetcher starts the next extend 30 seconds before the current one ends,
-  leaving room for a display set that was already on screen. An extend keeps
-  the parser's epoch state; a fresh window starts a new parser.
+  download the whole track. Every request is one whole, grid-aligned 120-second
+  page: `position` is the playhead floored onto the source-zero page grid and
+  `duration` is the full page (`BITMAP_SUBTITLE_PAGE_SECONDS`), the same page
+  the server stores and prefetches. A request anchored on the raw playhead is a
+  range no other request computes, so nothing is ever reused and each page
+  boundary waits on a fresh container read. The fetcher asks for the next page
+  30 seconds before the current one ends; an extend requests the page after the
+  committed coverage, never the page already held, and keeps the parser's epoch
+  state, while a fresh window starts a new parser.
 - A screen stays up until the next display set replaces it, but never past
   what has loaded: the end of the last finished window or, beyond it, the
-  latest segment read from the window on the wire. Screens more than one window
+  latest segment read from the window on the wire. Screens more than one page
   behind the playhead are dropped.
 - A screen whose epoch began before the fetched window cannot be reconstructed
-  from that window. The 30-second seek backoff covers ordinary cases, but a
-  display set that precedes the window by more than that is not shown until
-  the next epoch or acquisition point. This is a property of the PGS stream:
-  the window must contain the palette and object definitions, not just the
-  placement.
+  from that window. While playback runs this is covered by the pages already
+  loaded: a page starts at or before the playhead, and the previous pages stay in
+  the timeline. A seek into the first seconds of a page can miss a composition
+  defined in the previous page until the next display set; that follows from the
+  stream itself, since the window must contain the palette and object
+  definitions, not just the placement.
 - Each composition is drawn on a canvas that spans the player, scaled from the
   PGS video size onto the picture rectangle (`web/src/player/utils/videoFit.ts`)
   for both contain and cover fits. The plane matches the picture along its
