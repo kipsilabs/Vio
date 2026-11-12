@@ -1,4 +1,3 @@
-import { getOrCreateDeviceId } from "@/api/client";
 import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { v2, type V2Result } from "@/api/v2/request";
@@ -96,9 +95,7 @@ export function LearnedLimitRow() {
             onClick={() => {
               setResetting(true);
               setFailed(false);
-              void v2("DELETE /api/v2/playback/connection/learned-limit", {
-                headers: { "X-Vio-Device-Id": getOrCreateDeviceId() },
-              })
+              void v2("DELETE /api/v2/playback/connection/learned-limit")
                 .then(() => connection.refetch())
                 .catch(() => setFailed(true))
                 .finally(() => setResetting(false));
