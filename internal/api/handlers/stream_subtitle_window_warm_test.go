@@ -287,9 +287,10 @@ func TestVirtualTextWindowMissStartsOneLogicalWarmWithServeIdentity(t *testing.T
 	argsLog := filepath.Join(dir, "ffmpeg.args")
 	pidLog := filepath.Join(dir, "ffmpeg.warm.pids")
 	gate := filepath.Join(dir, "warm.gate")
-	// The cache logs one "warm started" per admitted logical warm, before its
-	// first extract, so the log is the only place a duplicate fill shows up
-	// even when relay admission sheds the duplicate before ffmpeg runs.
+	// The cache logs one "warm finished" per committed logical fill, so the log
+	// is where a second fill would show up even when relay admission sheds its
+	// duplicate before ffmpeg runs. Start lines are not used: a preempted fill
+	// may be replaced by another admitted warm for the same key.
 	warmLogs := &warmLogBuffer{}
 	previousLogger := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(warmLogs, &slog.HandlerOptions{Level: slog.LevelDebug})))
@@ -316,6 +317,10 @@ func TestVirtualTextWindowMissStartsOneLogicalWarmWithServeIdentity(t *testing.T
 	// the in-flight fill before issuing the second miss. A different window
 	// avoids the exact-window last-good cache and exercises the warm path.
 	waitForWarmInvocation(t, argsLog)
+	// The second serve kills this process. Wait for its pid too: a kill between
+	// the fake ffmpeg's args and pid writes would leave only the resume's pid,
+	// and the two-process assertion below would fail on the missing first one.
+	waitForWarmProcesses(t, pidLog, 1)
 
 	if rec := serve(601); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "WEBVTT") {
 		t.Fatalf("second window: status=%d body=%q", rec.Code, rec.Body.String())
@@ -335,23 +340,28 @@ func TestVirtualTextWindowMissStartsOneLogicalWarmWithServeIdentity(t *testing.T
 	}
 	identity := virtualSubtitleCacheIdentity(file, session.VirtualSourceURI, 0)
 	waitForCommittedTextEntry(t, handler.SubtitleCache, identity, 0, "subrip")
+	// Wait for the warm goroutine to log its outcome. The commit lands before
+	// the "warm finished" line, so the cache entry alone is not a safe signal.
+	handler.waitForBackgroundSubtitleWarms()
 
 	window, warm := ffmpegLogLines(t, argsLog)
 	if window != 2 {
 		t.Fatalf("windowed extracts = %d, want 2", window)
 	}
-	// One logical warm: the cache admits one fill and logs one "warm started".
-	// Phase 1 may run its extract twice (the admitted page cancels the first,
-	// the warm resumes), so process spawns are not the warm count — but a
-	// second window miss that started its own fill would log a second start.
-	if logical := warmLogs.count("subtitle cache warm started"); logical != 1 {
-		t.Fatalf("logical full-track warms = %d, want exactly 1: the second window miss must not start a second fill\n%s",
-			logical, warmLogs.String())
+	// One logical fill commits. Which invocation owns it depends on the fill
+	// race the admitted page creates: the preempted warm may resume, or the
+	// second serve's coalescing warm may take the key after the first fill is
+	// discarded. Counting "warm started" would race that ownership; the
+	// committed fill is stable, and any second concurrent read still trips the
+	// liveness check above.
+	if finished := warmLogs.count("subtitle cache warm finished"); finished != 1 {
+		t.Fatalf("committed full-track warms = %d, want exactly 1: the second window miss must not start a second fill\n%s",
+			finished, warmLogs.String())
 	}
-	// The single logical warm spawns one process and, after the yielded page
-	// settles, one resume.
+	// The single logical fill runs the killed extract and then one replacement
+	// (the warm's resume, or the second serve's warm when it won the key).
 	if warm != 2 {
-		t.Fatalf("full-track ffmpeg runs = %d, want 2 (one logical warm: extract + phase-1 resume)", warm)
+		t.Fatalf("full-track ffmpeg runs = %d, want 2 (one logical warm: killed extract + one replacement)", warm)
 	}
 }
 
@@ -2428,10 +2438,11 @@ func (h *remapBlockingHandler) WithGroup(name string) slog.Handler {
 
 // An admitted page can restart the warm's extract after the invocation had
 // already decided to re-key. The replay re-runs the probe under the same
-// admitted identity, finds it authoritative, and commits. That re-key decision
-// belonged to the invocation that made it: a stale pointer left behind would
-// re-key the warm after it had already settled, starting a second logical warm
-// for an identity the committed fill did not use.
+// admitted identity, finds it authoritative, and commits. The cache may instead
+// hand the fill to the serve's own coalescing warm; either way, that re-key
+// decision belonged to the invocation that made it. A stale pointer left behind
+// would re-key the warm after it had already settled, starting a second logical
+// warm for an identity the committed fill did not use.
 func TestVirtualSubtitleWarmPageReplayClearsStaleRekeyDecision(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell script test helper is unix-only")
@@ -2519,12 +2530,22 @@ func TestVirtualSubtitleWarmPageReplayClearsStaleRekeyDecision(t *testing.T) {
 	if handler.SubtitleCache.HasCommittedTextEntry("unused", remappedIdentity, 1, "subrip", "") {
 		t.Fatal("warm committed under the remapped identity the replay did not establish")
 	}
-	// One logical warm: the preempted invocation and its replay are the same
-	// run. A stale re-key decision adds a second warm start.
-	if got := warmLogs.count("subtitle cache warm started"); got != 1 {
-		t.Fatalf("logical full-track warms = %d, want exactly 1: a replayed invocation is the same warm\n%s",
-			got, warmLogs.String())
+	// One logical full-track read. The preempted invocation may resume and own
+	// the fill, or the serve's own coalescing warm may take the key first; which
+	// one starts is a fill-race detail, not the invariant. A second full-track
+	// extract is what acting on the abandoned invocation's re-key decision
+	// produces.
+	window, warm := ffmpegLogLines(t, argsLog)
+	if window != 1 {
+		t.Fatalf("windowed extracts = %d, want exactly 1 (the admitted page)\n%s", window, warmLogs.String())
 	}
+	if warm != 1 {
+		t.Fatalf("full-track warm extracts = %d, want exactly 1: a replayed invocation is the same warm\n%s",
+			warm, warmLogs.String())
+	}
+	// The re-key decision belonged to the preempted invocation. The replay (or
+	// the fill that replaced it) settled under the admitted identity, so no
+	// re-key may start a second warm under the remapped identity.
 	if got := warmLogs.count("virtual subtitle warm re-keyed after its drift probe"); got != 0 {
 		t.Fatalf("redundant re-keys = %d, want 0: the replayed invocation committed under its probe's identity\n%s",
 			got, warmLogs.String())
