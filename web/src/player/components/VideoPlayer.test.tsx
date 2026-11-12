@@ -4241,6 +4241,47 @@ describe("VideoPlayer source timeline", () => {
       expect(video.currentTime).toBe(0);
     });
 
+    describe("a server_remux_progressive replacement", () => {
+      const progressivePlan = fixturePlanV3({
+        ...anchoredPlan,
+        delivery: "server_remux_progressive",
+        stream: {
+          url: "/playback/remux/session-1",
+          protocol: "http_progressive",
+          headers: {},
+          header_refresh: "none",
+        },
+      });
+
+      it("starts at the seek when this generation can serve it", async () => {
+        const { video, rerenderPlayer } = await seekDuringReplan();
+
+        newStream(rerenderPlayer, progressivePlan);
+        await waitFor(() => expect(video.src).toContain("revision=2"));
+
+        expect(video.currentTime).toBe(596);
+      });
+
+      it("starts at player_start_seconds when the seek is behind the anchor", async () => {
+        const { video, rerenderPlayer } = await seekDuringReplan();
+
+        newStream(rerenderPlayer, {
+          ...progressivePlan,
+          timeline: {
+            ...progressivePlan.timeline,
+            source_start_seconds: 720,
+            stream_origin_seconds: 720,
+            timeline_offset_seconds: 720,
+          },
+        });
+        await waitFor(() => expect(video.src).toContain("revision=2"));
+
+        expect(video.currentTime).toBe(0);
+        fireFrameTimeUpdate(video);
+        expect(controls.current!.currentTime).toBe(720);
+      });
+    });
+
     it("follows the replacement's start when the seek is behind its anchor", async () => {
       const { video, rerenderPlayer } = await seekDuringReplan();
 

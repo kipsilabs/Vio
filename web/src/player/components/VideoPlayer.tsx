@@ -3616,7 +3616,15 @@ export function VideoPlayer({
           };
           video.addEventListener("loadedmetadata", directPlayMetadataHandler, { once: true });
         } else {
-          video.currentTime = effectiveInitialPosition;
+          // A progressive remux is one forward-only response anchored at the
+          // plan's stream origin. A seek made while the replan was fetched is
+          // servable when it lies at or after that origin, so the replacement
+          // stream starts there rather than behind the viewer; a target before
+          // the origin cannot be produced by this generation, so the plan's own
+          // start stands unchanged.
+          video.currentTime = isProgressiveRemux
+            ? transportStartPosition()
+            : effectiveInitialPosition;
           attemptAutoplayWhenReady();
         }
       }
@@ -3658,6 +3666,7 @@ export function VideoPlayer({
     effectiveInitialPosition,
     isHlsStream,
     isPlayerReady,
+    isProgressiveRemux,
     planRevision,
     playsOriginalFile,
     plannedBitrateKbps,
