@@ -602,6 +602,7 @@ func maybeApplyPostgresTuning(ctx context.Context, pool *pgxpool.Pool, appMaxCon
 		"memory_source", opts.MemorySource,
 		"memory_budget_percent", opts.MemoryBudgetPercent,
 		"cpus", opts.CPUs,
+		"detected_cpus", opts.DetectedCPUs,
 		"connections", opts.Connections,
 		"storage", opts.Storage,
 		"db_size", result.DBSize,
@@ -1928,6 +1929,7 @@ func main() {
 			},
 		)
 		pluginHost = pluginhost.NewHost(pluginhost.Config{
+			IdleStopAfter:   pluginhost.IdleStopAfter,
 			EventPublisher:  eventsHub,
 			LibraryLister:   pluginhost.NewLibraryLister(libDataSource),
 			CatalogPresence: catalogPresence,

@@ -3,19 +3,11 @@ package handlers
 import (
 	"context"
 	"log/slog"
-	"net/http"
 	"slices"
-	"sort"
-	"strings"
 	"time"
 
-	"github.com/go-chi/chi/v5"
-
-	"github.com/Silo-Server/silo-server/internal/access"
-	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
 	evt "github.com/Silo-Server/silo-server/internal/events"
 	"github.com/Silo-Server/silo-server/internal/playback/connectionstore"
-	"github.com/Silo-Server/silo-server/internal/settingscontract"
 	"github.com/Silo-Server/silo-server/internal/userstore"
 )
 
@@ -35,11 +27,6 @@ type DeviceHandler struct {
 	// key a forget or clear removed. Nil (as in tests) skips publishing.
 	EventsHub *evt.Hub
 
-	// ProfileTokens enables ?scope=household for a PIN-locked household
-	// parent. Nil means that parent's whole-household read is simply
-	// unavailable — never that it is unguarded.
-	ProfileTokens *access.ProfileTokenService
-
 	// Connections, when set, deletes a device's playback connection rows
 	// with its last registration. Nil (as in tests) leaves them to retention.
 	Connections *connectionstore.Store
@@ -49,6 +36,7 @@ func NewDeviceHandler(provider userstore.UserStoreProvider) *DeviceHandler {
 	return &DeviceHandler{storeProvider: provider}
 }
 
+<<<<<<< HEAD
 type deviceResponse struct {
 	DeviceID       string `json:"device_id"`
 	DeviceName     string `json:"device_name"`
@@ -310,6 +298,8 @@ func (h *DeviceHandler) removeDevice(w http.ResponseWriter, r *http.Request, for
 	w.WriteHeader(http.StatusNoContent)
 }
 
+=======
+>>>>>>> upstream/main
 // forgetPlaybackConnections deletes the playback connection rows of each named
 // device that no profile on the account registers any more. Callers run it
 // after the deletion of a registration commits, so of two concurrent deletions
@@ -335,78 +325,4 @@ func forgetPlaybackConnections(ctx context.Context, connections *connectionstore
 	if err != nil {
 		slog.WarnContext(ctx, "playback connection cleanup failed after device removal", "component", "api", "user_id", userID, "error", err)
 	}
-}
-
-type deviceKey struct {
-	profileID string
-	deviceID  string
-}
-
-// deviceOverrideCounts counts the preferences a (profile, device) pair
-// overrides. ListAllSettingValues spans the whole account, so the caller filters
-// the result to the profile it is answering for.
-//
-// Preferences, not rows: a key the contract mirrors onto its replacement is
-// stored twice for the length of the overlap window, and a badge that read
-// "2 settings changed" because the viewer picked one intro-skip mode would be
-// counting the compatibility copy as a second choice.
-func deviceOverrideCounts(r *http.Request, store userstore.UserStore) (map[deviceKey]int, error) {
-	values, err := store.ListAllSettingValues(r.Context())
-	if err != nil {
-		return nil, err
-	}
-	logical := make(map[deviceKey]map[string]struct{})
-	for _, value := range values {
-		if value.Scope != settingscontract.ScopeProfileDevice {
-			continue
-		}
-		id := deviceKey{profileID: value.ProfileID, deviceID: value.DeviceID}
-		keys, ok := logical[id]
-		if !ok {
-			keys = make(map[string]struct{})
-			logical[id] = keys
-		}
-		keys[settingscontract.LogicalKey(value.Key)] = struct{}{}
-	}
-	counts := make(map[deviceKey]int, len(logical))
-	for id, keys := range logical {
-		counts[id] = len(keys)
-	}
-	return counts, nil
-}
-
-// deviceSettingKeys returns the canonical keys stored for one device, so a
-// clear can publish an invalidation per key that actually moved.
-func (h *DeviceHandler) deviceSettingKeys(
-	r *http.Request, store userstore.UserStore, profileID, deviceID string,
-) ([]string, error) {
-	values, err := store.ListAllSettingValues(r.Context())
-	if err != nil {
-		return nil, err
-	}
-	var keys []string
-	for _, value := range values {
-		if value.Scope != settingscontract.ScopeProfileDevice {
-			continue
-		}
-		if value.ProfileID != profileID || value.DeviceID != deviceID {
-			continue
-		}
-		keys = append(keys, value.Key)
-	}
-	return keys, nil
-}
-
-func (h *DeviceHandler) storeFor(w http.ResponseWriter, r *http.Request) (userstore.UserStore, bool) {
-	userID := apimw.GetUserID(r.Context())
-	if userID == 0 {
-		writeError(w, http.StatusUnauthorized, "unauthorized", "Authentication required")
-		return nil, false
-	}
-	store, err := h.storeProvider.ForUser(r.Context(), userID)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to access user store")
-		return nil, false
-	}
-	return store, true
 }

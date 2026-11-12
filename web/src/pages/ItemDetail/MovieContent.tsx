@@ -48,6 +48,7 @@ import { formatRuntimeMinutes } from "@/lib/mediaFormat";
 import { useQualityPreference } from "@/hooks/queries/qualityPreference";
 import { useDetailWatchTogether } from "@/pages/watchtogether/DetailWatchTogether";
 import { hasMachineTranslation } from "./components/machineTranslation";
+import { useT } from "@/i18n";
 
 export default function MovieContent({
   item,
@@ -66,6 +67,7 @@ export default function MovieContent({
    */
   onSelectedFileIdChange?: (fileId: number | null) => void;
 }) {
+  const t = useT();
   const { translating: overviewTranslating, onTranslate: onTranslateOverview } =
     useOnViewTranslation(item);
   const navigate = useNavigate();
@@ -280,11 +282,15 @@ export default function MovieContent({
     deleteSubtitlePreference.mutate(item.content_id);
   };
 
+<<<<<<< HEAD
   const isPlayable =
     (item.versions?.length ?? 0) > 0 ||
     (item.playback_variants?.length ?? 0) > 0 ||
     Boolean(item.play_content_id);
   const primaryAction = resolveLeafPrimaryAction(item, "Play");
+=======
+  const primaryAction = resolveLeafPrimaryAction(item, t("web.detail.actions.play"));
+>>>>>>> upstream/main
   const watchTogether = useDetailWatchTogether({
     item,
     target:
@@ -299,7 +305,11 @@ export default function MovieContent({
         : null,
   });
   const restartHref =
+<<<<<<< HEAD
     primaryAction.label === "Resume" && isPlayable
+=======
+    primaryAction.resuming && item.versions.length > 0
+>>>>>>> upstream/main
       ? `/watch/${item.content_id}?restart=1`
       : undefined;
   const { data: similarData, isLoading: similarLoading } = useSimilarItems(item.content_id);
@@ -333,7 +343,7 @@ export default function MovieContent({
         <DetailHero
           title={title}
           topNav={<PageBack />}
-          context="Movie"
+          context={t("web.detail.hero.typeMovie")}
           studioLabel={firstStudio}
           backdropUrl={item.backdrop_url}
           backdropThumbhash={item.backdrop_thumbhash}
@@ -417,11 +427,16 @@ export default function MovieContent({
               onSplitItem={
                 canCurateMetadata && item.versions.length > 1 ? () => setSplitOpen(true) : undefined
               }
+<<<<<<< HEAD
               onShowMediaInfo={
                 canCurateMetadata && item.versions.length > 0 ? () => openMediaInfo() : undefined
               }
               versions={versionsWithLiveness}
               hasVirtualSource={item.has_virtual_source === true}
+=======
+              onShowMediaInfo={item.versions.length > 0 ? () => openMediaInfo() : undefined}
+              versions={item.versions}
+>>>>>>> upstream/main
               playbackVariants={item.playback_variants}
               selectedVersion={selectedVersion}
               selectedVersionMissing={selectedVersionMissing}
@@ -491,25 +506,30 @@ export default function MovieContent({
             version={selectedVersion}
             title={title}
           />
-          {canCurateMetadata && (
-            <MediaInfoDialog
-              open={mediaInfoOpen}
-              onOpenChange={setMediaInfoOpen}
-              versions={item.versions}
-              title={title}
-              initialFileId={mediaInfoFileId}
-            />
-          )}
+          <MediaInfoDialog
+            open={mediaInfoOpen}
+            onOpenChange={setMediaInfoOpen}
+            versions={item.versions}
+            title={title}
+            initialFileId={mediaInfoFileId}
+          />
           {watchTogether.sheet}
         </>
       }
     >
+<<<<<<< HEAD
       {canCurateMetadata && (
         <MediaLocations
           title="Media locations"
           versions={item.versions}
           onShowMediaInfo={openMediaInfo}
         />
+=======
+      {((item.cast?.length ?? 0) > 0 || crewGroups.some((g) => g.members.length > 0)) && (
+        <DetailSection title={t("web.detail.sections.castAndCrew")}>
+          <CastCarousel cast={item.cast ?? []} crewGroups={crewGroups} limit={12} prefetchPeople />
+        </DetailSection>
+>>>>>>> upstream/main
       )}
 
       {/* Local extras play in Silo, so they lead; YouTube videos follow. */}
@@ -532,6 +552,17 @@ export default function MovieContent({
         similarData?.items &&
         similarData.items.length > 0 && <RecommendationGrid items={similarData.items} />
       )}
+<<<<<<< HEAD
+=======
+
+      {canCurateMetadata && (
+        <MediaLocations
+          title={t("web.detail.sections.mediaLocations")}
+          versions={item.versions}
+          onShowMediaInfo={openMediaInfo}
+        />
+      )}
+>>>>>>> upstream/main
     </DetailLayout>
   );
 }

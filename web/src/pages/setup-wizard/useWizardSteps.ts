@@ -1,3 +1,5 @@
+import type { MessageKey } from "@/i18n";
+
 import { useWizardContext } from "./WizardContext";
 import { SKIPPABLE_STEPS, type SkippableStep } from "./setupStorage";
 
@@ -5,7 +7,8 @@ export type WizardStepId = "account" | SkippableStep | "done";
 
 export interface StepDef {
   id: WizardStepId;
-  label: string;
+  /** Translated where it renders. */
+  label: MessageKey;
   complete: boolean;
   active: boolean;
   /** A completed skippable step the admin can jump back to. */
@@ -17,6 +20,7 @@ export interface StepDef {
 // wizard on the final screen.
 export const WIZARD_STEP_ORDER: readonly WizardStepId[] = ["account", ...SKIPPABLE_STEPS, "done"];
 
+<<<<<<< HEAD
 export const WIZARD_STEP_LABELS: Record<WizardStepId, string> = {
   account: "Account",
   server: "Server",
@@ -29,6 +33,18 @@ export const WIZARD_STEP_LABELS: Record<WizardStepId, string> = {
   connect: "Connect apps",
   features: "Features",
   done: "Done",
+=======
+export const WIZARD_STEP_LABELS: Record<WizardStepId, MessageKey> = {
+  account: "web.setup.rail.account",
+  server: "web.setup.rail.server",
+  playback: "web.setup.rail.playback",
+  storage: "web.setup.rail.storage",
+  library: "web.setup.rail.library",
+  subtitles: "web.setup.rail.subtitles",
+  connect: "web.setup.rail.connect",
+  features: "web.setup.rail.features",
+  done: "web.setup.rail.done",
+>>>>>>> upstream/main
 };
 
 export function useWizardSteps() {

@@ -2,26 +2,13 @@ package handlers
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
-	"io"
-	"net/http"
-	"strconv"
-	"strings"
-	"time"
 
-	"github.com/go-chi/chi/v5"
-
-	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
 	mediarequests "github.com/Silo-Server/silo-server/internal/requests"
 )
 
 type RequestService interface {
 	Search(ctx context.Context, viewer mediarequests.Viewer, query string, mediaType mediarequests.MediaType, page int) (*mediarequests.MediaPage, error)
-	Discover(ctx context.Context, viewer mediarequests.Viewer, section string, page int) (*mediarequests.DiscoverySection, error)
-	DiscoverAll(ctx context.Context, viewer mediarequests.Viewer) ([]mediarequests.DiscoverySection, error)
-	// DiscoverRows and DiscoverRow back the v2 Discover layout; v1 keeps
-	// Discover and DiscoverAll.
+	// DiscoverRows and DiscoverRow back the Discover layout.
 	DiscoverRows(ctx context.Context, viewer mediarequests.Viewer) (*mediarequests.DiscoverLayoutPage, error)
 	DiscoverRow(ctx context.Context, viewer mediarequests.Viewer, rowID string, page int) (*mediarequests.DiscoverySection, error)
 	GetDetail(ctx context.Context, viewer mediarequests.Viewer, mediaType mediarequests.MediaType, tmdbID int) (*mediarequests.MediaDetail, error)
@@ -70,6 +57,7 @@ func NewRequestsHandler(service RequestService) *RequestsHandler {
 // Service is the request service this handler routes to; the v2 listener
 // calls the same value so both surfaces share one store and one policy.
 func (h *RequestsHandler) Service() RequestService { return h.service }
+<<<<<<< HEAD
 
 func (h *RequestsHandler) HandleSearch(w http.ResponseWriter, r *http.Request) {
 	viewer, ok := requestViewer(w, r, true)
@@ -724,3 +712,5 @@ func writeRequestServiceError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusInternalServerError, "internal_error", "Request operation failed")
 	}
 }
+=======
+>>>>>>> upstream/main

@@ -3,11 +3,9 @@ package handlers
 import (
 	"context"
 	"fmt"
-	"net/http"
 	"strconv"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
 
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
@@ -55,6 +53,7 @@ func NewCatalogResourceHandler(items *ItemsHandler) *CatalogResourceHandler {
 	return &CatalogResourceHandler{items: items}
 }
 
+<<<<<<< HEAD
 func (h *CatalogResourceHandler) HandleGetItemDetail(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	if id == "" {
@@ -262,6 +261,8 @@ func (h *CatalogResourceHandler) HandleGetEpisodes(w http.ResponseWriter, r *htt
 	writeJSON(w, http.StatusOK, episodesListResponse{Episodes: view})
 }
 
+=======
+>>>>>>> upstream/main
 func (h *CatalogResourceHandler) syntheticSeasonDetail(ctx context.Context, v ItemViewer, seasonID string) (*catalog.ItemDetail, error) {
 	seriesID, seasonNum, ok := parseSyntheticSeasonID(seasonID)
 	if !ok {
@@ -331,6 +332,7 @@ func parseSyntheticSeasonID(contentID string) (string, int, bool) {
 }
 
 // enrichItemDetail adds the viewer's state to detail. curates is
+<<<<<<< HEAD
 // canViewFilePaths for the request; paths are stripped without it.
 // enrichSeasonDetailUserData folds the same season read the season page uses,
 // so a metadata-only or partly linked season reports progress over the listed
@@ -357,6 +359,10 @@ func (h *CatalogResourceHandler) enrichSeasonDetailUserData(ctx context.Context,
 	detail.SeasonUserData = userData
 }
 
+=======
+// CanViewFilePaths for the request; file paths and names are stripped
+// without it.
+>>>>>>> upstream/main
 func (h *CatalogResourceHandler) enrichItemDetail(ctx context.Context, v ItemViewer, detail *catalog.ItemDetail, curates bool) {
 	if detail == nil {
 		return
@@ -396,10 +402,7 @@ func (h *CatalogResourceHandler) enrichItemDetail(ctx context.Context, v ItemVie
 
 	detail.ViewerCurates = curates
 	if !detail.ViewerCurates {
-		for i := range detail.Versions {
-			detail.Versions[i].FilePath = ""
-		}
-		detail.FolderPaths = nil
+		detail.HideFileIdentity()
 	}
 
 	if batched {
@@ -551,13 +554,3 @@ func (h *CatalogResourceHandler) enrichViewerState(ctx context.Context, v ItemVi
 // seasonListArtworkParam is the series-seasons query parameter advertised by
 // the images capability; false omits all poster preparation.
 const seasonListArtworkParam = "include_artwork"
-
-// seasonListArtwork allows text-only selectors to omit all poster preparation.
-func seasonListArtwork(r *http.Request) (bool, bool) {
-	value := r.URL.Query().Get(seasonListArtworkParam)
-	if value == "" {
-		return true, true
-	}
-	include, err := strconv.ParseBool(value)
-	return include, err == nil
-}

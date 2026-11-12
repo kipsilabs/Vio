@@ -89,11 +89,34 @@ type SubtitleInventoryItemV3 struct {
 	// SyncKey names the track to the subtitle sync operations. Present on
 	// external and downloaded tracks whose timing can be corrected (SRT,
 	// WebVTT, ASS, SSA); stable across sessions and inventory reordering.
+<<<<<<< HEAD
 	SyncKey      string                           `json:"sync_key,omitempty"`
 	HLSRendition *SubtitleInventoryHLSRenditionV3 `json:"hls_rendition,omitempty"`
 	// downloadedSubtitleID is deliberately not serialized: clients address the
 	// opaque session URL, while the server uses the row ID to make that URL
 	// stable across inventory reordering and seek reanchors.
+=======
+	SyncKey string `json:"sync_key,omitempty"`
+	// StreamIndex and ContainerTrackID name an embedded track in the source
+	// itself, in the namespaces plan.subtitle.embedded uses, so a client can
+	// find the row's track in the stream it plays without counting tracks.
+	StreamIndex      *int   `json:"stream_index,omitempty" doc:"Embedded tracks only: the absolute probed stream index, the namespace of subtitle.embedded.stream_index and the sidecar URL's embedded_stream_index"`
+	ContainerTrackID string `json:"container_track_id,omitempty" doc:"Embedded tracks only: the Matroska TrackNumber or MP4 track ID, omitted when unknown"`
+	// NativeSelectable marks an embedded track the client may switch to on
+	// the stream it already plays: selecting it under this plan's
+	// capabilities, delivery and audio yields subtitle.embedded.
+	NativeSelectable bool `json:"native_selectable,omitempty" doc:"Embedded tracks only: selecting this track, with the plan's delivery and audio, yields subtitle.embedded. The client may switch to it locally and report the change with a subtitle_track_changed replan, which returns a plan for the same media; url, when the row has one, stays the fallback; a bitmap track delivered only by burn-in has none."`
+	// HLSRendition places an embedded text track among the HLS stream's
+	// subtitle renditions (hls_subtitle_renditions_all_v1).
+	HLSRendition *SubtitleInventoryHLSRenditionV3 `json:"hls_rendition,omitempty" doc:"Embedded text tracks of an HLS plan under hls_subtitle_renditions_all_v1: the track's WebVTT rendition in the stream's SUBTITLES group. The client may select it in its player and report the change with a subtitle_track_changed replan, which keeps the stream; url stays the fallback."`
+	// StoredSubtitleID identifies a stored track independently of its ordinal,
+	// delivery URL and support for timing correction.
+	StoredSubtitleID int `json:"stored_subtitle_id,omitempty" doc:"Stored subtitle row ID, matching subtitle_ready.subtitle_id. Present for downloaded, uploaded and generated tracks, including tracks without a URL or sync_key. Stable across inventory reordering; selection still uses combined_index."`
+	// downloadedSubtitleID is deliberately transient. A restored plan must
+	// resolve the current downloaded inventory before minting its URLs; the
+	// serialized StoredSubtitleID is client correlation metadata, not proof
+	// that the inventory was resolved for this response.
+>>>>>>> upstream/main
 	downloadedSubtitleID int
 	// sourceCombinedIndex is the ordinal this entry's track occupies in the
 	// un-deduplicated source ranges: externals, then embedded, then downloaded.
@@ -162,6 +185,7 @@ func BuildSubtitleInventoryV3(file *models.MediaFile, additional []SubtitleInven
 		item := subtitleInventoryItemV3(file.ID, len(items), sourceIndex, source, entry.Codec,
 			entry.Language, firstNonEmptySubtitleLabelV3(entry.Label, entry.Language),
 			entry.Forced, false, entry.HearingImpaired)
+		item.StoredSubtitleID = entry.DownloadedSubtitleID
 		item.downloadedSubtitleID = entry.DownloadedSubtitleID
 		if source == SubtitleSourceDownloadedV3 && entry.DownloadedSubtitleID > 0 && subtitles.SupportsRetime(subtitles.SubtitleFormat(entry.Codec)) {
 			item.SyncKey = subtitles.StoredSyncKey(entry.DownloadedSubtitleID)
@@ -169,6 +193,34 @@ func BuildSubtitleInventoryV3(file *models.MediaFile, additional []SubtitleInven
 		items = append(items, item)
 	}
 	return items
+}
+
+// HideSidecarFileNamesV3 relabels the external sidecars of inventory for a
+// viewer who may not see file names. A sidecar keeps its label only when that
+// label is the title of the sidecar file currently holds at its ordinal; any
+// other label, its file name or one left in a restored plan after the
+// sidecars changed, is replaced. The replacement is the sidecar's embedded
+// title, or its language numbered by models.SidecarLabels, as the catalog
+// labels the same track.
+func HideSidecarFileNamesV3(inventory []SubtitleInventoryItemV3, file *models.MediaFile) {
+	labels := models.SidecarLabels{}
+	for i, item := range inventory {
+		if item.Source != SubtitleSourceExternalV3 {
+			continue
+		}
+		var sub *models.ExternalSubtitle
+		if file != nil && item.CombinedIndex >= 0 && item.CombinedIndex < len(file.ExternalSubtitles) {
+			sub = &file.ExternalSubtitles[item.CombinedIndex]
+		}
+		switch {
+		case sub != nil && !sub.TitleIsFileName() && item.Label == sub.Title:
+			// Its own title: keep it.
+		case sub != nil && sub.TitleIsFileName() && strings.TrimSpace(sub.EmbeddedTitle) != "":
+			inventory[i].Label = sub.EmbeddedTitle
+		default:
+			inventory[i].Label = labels.Next(item.Language, item.Codec, item.Forced, item.HearingImpaired)
+		}
+	}
 }
 
 // SubtitleInventoryV3 returns the combined-ordinal inventory with
@@ -260,9 +312,9 @@ func ScopeSubtitleInventoryV3(sessionID string, file *models.MediaFile, inventor
 }
 
 // SubtitleInventoryNeedsDownloadedIdentityV3 reports whether an inventory was
-// decoded from its wire form and therefore lost the server-only row IDs needed
-// to mint stable downloaded-subtitle URLs. Freshly planned inventories retain
-// the IDs in memory; durable JSON plans are rebuilt from the repository.
+// restored from JSON and lost its transient downloaded row IDs. Restore
+// the current menu from the repository before minting its URLs; the selected
+// subtitle remains pinned separately by the executable recipe.
 func SubtitleInventoryNeedsDownloadedIdentityV3(items []SubtitleInventoryItemV3) bool {
 	for _, item := range items {
 		if item.Source == SubtitleSourceDownloadedV3 && item.downloadedSubtitleID <= 0 {

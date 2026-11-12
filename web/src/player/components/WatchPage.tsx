@@ -1,3 +1,5 @@
+import { CircleAlert } from "lucide-react";
+import "@/styles/player-hud.css";
 import { isSourceFallbackReason } from "@/api/v2/watchTogetherSourceFallback";
 import { playbackCapabilitiesV2 } from "../start-v2";
 import { playerV2Origin } from "../player-v2";
@@ -30,6 +32,7 @@ import {
   type EffectiveVersionIdentity,
 } from "../utils/resolveEffectiveVersion";
 import { VideoPlayer } from "./VideoPlayer";
+import { PlayerLoadingCover } from "./PlayerLoadingCover";
 import { fetchWatchDetail } from "@/hooks/queries/items";
 import {
   applyVersionAvailability,
@@ -45,6 +48,7 @@ import { useRealtimeEvents } from "@/components/realtimeEventsContext";
 import { useWatchPlaybackController } from "@/playback/watchPlaybackContext";
 import { useWatchTogetherRoomConnection } from "../hooks/useWatchTogetherRoomConnection";
 import { toast } from "sonner";
+import { useT } from "@/i18n";
 
 /**
  * Live inventory refresh. A session that started before the server finished
@@ -223,6 +227,7 @@ export function WatchPage(props: WatchPageProps) {
 }
 
 function WatchPartyPlaybackGate(props: WatchPageProps) {
+  const t = useT();
   const config = usePlayerConfig();
   const [status, setStatus] = useState<"checking" | "supported" | "unsupported" | "failed">(
     "checking",
@@ -251,38 +256,40 @@ function WatchPartyPlaybackGate(props: WatchPageProps) {
 
   if (status === "supported") return <WatchPagePlayer {...props} />;
   return (
-    <div className="bg-background fixed inset-0 z-50 flex items-center justify-center px-6">
-      <div className="surface-panel-subtle flex max-w-md flex-col items-center gap-4 rounded-[1.8rem] px-8 py-8 text-center">
-        <p className="text-base font-semibold text-white">
-          {status === "checking" ? "Checking Watch Party support..." : "Watch Party unavailable"}
+    <div className="hud fixed inset-0 z-50 flex items-center justify-center bg-black px-6">
+      <div className="hud-card flex w-full max-w-md flex-col items-center gap-4 px-8 py-8 text-center">
+        <p className="text-lg font-semibold">
+          {status === "checking"
+            ? t("web.player.watchTogether.checkingSupport")
+            : t("web.player.watchTogether.unavailable")}
         </p>
         {status !== "checking" && (
-          <p className="text-sm text-white/60">
+          <p className="text-sm leading-relaxed text-[var(--hud-ash)]">
             {status === "unsupported"
-              ? "This server needs an update to support Watch Party."
-              : "Unable to check Watch Party support. Please try again."}
+              ? t("web.player.watchTogether.unsupported")
+              : t("web.player.watchTogether.checkFailed")}
           </p>
         )}
         {status === "failed" && (
           <button
             type="button"
-            className="rounded-[0.95rem] bg-white/10 px-4 py-2 text-sm font-medium text-white"
+            className="hud-primary-btn"
             onClick={() => {
               setStatus("checking");
               setAttempt((value) => value + 1);
             }}
           >
-            Try Again
+            {t("web.player.watch.tryAgain")}
           </button>
         )}
         <button
           type="button"
-          className="rounded-[0.95rem] bg-white/10 px-4 py-2 text-sm font-medium text-white"
+          className="hud-secondary-btn"
           onClick={() => {
             void props.onExit();
           }}
         >
-          Go Back
+          {t("player.goBack")}
         </button>
       </div>
     </div>
@@ -309,6 +316,7 @@ function WatchPagePlayer({
   contentId,
   title,
   year,
+  backdrop,
   playbackRequestKey,
   fileId,
   libraryId,
@@ -353,6 +361,7 @@ function WatchPagePlayer({
   watchTogetherRoomId,
   watchTogetherRoomToken,
 }: WatchPageProps) {
+  const t = useT();
   const config = usePlayerConfig();
   const queryClient = useQueryClient();
   const playbackController = useWatchPlaybackController();
@@ -485,10 +494,15 @@ function WatchPagePlayer({
     const key = `${session.playbackAttemptId}:${session.initialSubtitleError}`;
     if (initialSubtitleErrorKeyRef.current === key) return;
     initialSubtitleErrorKeyRef.current = key;
-    toast.error(session.initialSubtitleErrorTitle ?? "That subtitle track can't be used", {
+    toast.error(session.initialSubtitleErrorTitle ?? t("web.player.watch.subtitleTrackUnusable"), {
       description: session.initialSubtitleError,
     });
-  }, [session.initialSubtitleError, session.initialSubtitleErrorTitle, session.playbackAttemptId]);
+  }, [
+    session.initialSubtitleError,
+    session.initialSubtitleErrorTitle,
+    session.playbackAttemptId,
+    t,
+  ]);
 
   const trackSelectionNotice = session.trackSelectionNotice;
   useEffect(() => {
@@ -1441,18 +1455,26 @@ function WatchPagePlayer({
   if (!session.plan || !session.streamUrl || !session.sessionId) {
     if (session.loading || fallingBack) {
       return (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black">
-          <div className="flex flex-col items-center gap-3">
-            <div className="h-8 w-8 animate-spin rounded-full border-2 border-white/20 border-t-white" />
-            <span className="text-sm text-white/60">
-              {fallingBack ? "Finding a compatible version for everyone..." : "Loading player..."}
+        <PlayerLoadingCover
+          backdrop={backdrop}
+          label={
+            fallingBack
+              ? t("web.player.watch.findingCompatibleVersion")
+              : t("web.player.watch.loadingPlayer")
+          }
+          className="fixed inset-0 z-50"
+        >
+          {fallingBack ? (
+            <span className="text-sm text-[var(--hud-ash)]">
+              {t("web.player.watch.findingCompatibleVersion")}
             </span>
-          </div>
-        </div>
+          ) : null}
+        </PlayerLoadingCover>
       );
     }
 
     return (
+<<<<<<< HEAD
       <div className="bg-background fixed inset-0 z-50 flex items-center justify-center px-6">
         <div className="surface-panel-subtle flex max-w-md flex-col items-center gap-4 rounded-[1.8rem] px-8 py-8 text-center">
           <div className="space-y-2">
@@ -1496,6 +1518,36 @@ function WatchPagePlayer({
               Go Back
             </button>
           </div>
+=======
+      <div className="hud fixed inset-0 z-50 flex items-center justify-center bg-black bg-[radial-gradient(ellipse_at_center,rgb(255_255_255/0.06),transparent_60%)] px-6">
+        <div
+          role="alert"
+          className="hud-card flex w-full max-w-lg flex-col items-center gap-6 px-10 py-10 text-center"
+        >
+          <span
+            aria-hidden="true"
+            className="flex size-14 items-center justify-center rounded-full bg-white/[0.08] text-[var(--hud-lamp)]"
+          >
+            <CircleAlert className="size-7" strokeWidth={1.75} />
+          </span>
+          <div className="space-y-2.5">
+            <p className="text-xl font-semibold tracking-tight">
+              {session.errorTitle ?? t("web.player.watch.playbackUnavailable")}
+            </p>
+            <p className="text-[0.9375rem] leading-relaxed text-[var(--hud-ash)]">
+              {session.error ?? t("web.player.watch.startFailed")}
+            </p>
+          </div>
+          <button
+            onClick={() => {
+              void onExit();
+            }}
+            type="button"
+            className="hud-primary-btn min-h-12 px-7"
+          >
+            {t("player.goBack")}
+          </button>
+>>>>>>> upstream/main
         </div>
       </div>
     );
@@ -1614,6 +1666,7 @@ function WatchPagePlayer({
   const activeMarkers = resolveActiveVersionMarkers(selectedVersion);
 
   return (
+<<<<<<< HEAD
     <>
       {switchingIndicator}
       {versionSwapNotice}
@@ -1730,5 +1783,109 @@ function WatchPagePlayer({
         watchTogetherConnection={watchTogetherConnection}
       />
     </>
+=======
+    <VideoPlayer
+      title={title}
+      year={year}
+      backdrop={backdrop}
+      streamUrl={session.streamUrl}
+      plan={session.plan}
+      planRevision={session.planRevision}
+      browserEngine={session.browserEngine}
+      nativeOriginalSupport={session.nativeOriginalSupport}
+      shouldAutoPlay={session.shouldAutoPlay}
+      replanning={session.replanning}
+      replacing={session.replacing}
+      replanError={fallingBack ? null : session.error}
+      replanErrorTitle={session.errorTitle}
+      sessionId={session.sessionId}
+      selectedVersion={selectedVersion}
+      versions={playbackVersions}
+      activeFileId={session.mediaFileId}
+      chapters={activeChapters}
+      trickplay={trickplay}
+      trickplayUpdatedAt={trickplayQuery.dataUpdatedAt}
+      onTrickplayError={handleTrickplayError}
+      onSwitchVersion={watchTogetherRoomId ? undefined : handleSwitchVersion}
+      subtitleUrls={playableSubtitles}
+      initialPosition={session.initialPosition}
+      onQualitySelect={session.changeQuality}
+      onSubtitleTrackChange={session.changeSubtitleTrack}
+      onPlanFailure={session.recoverFromFailure}
+      onConnectionLost={session.recoverConnection}
+      onRetryConnection={session.retryConnection}
+      connectionStatus={session.connectionStatus}
+      connectionErrorTitle={session.connectionErrorTitle}
+      connectionError={session.connectionError}
+      onPlanInvalidated={session.invalidatePlan}
+      onReanchorSeek={session.reanchorSeek}
+      onApplySubtitleTrack={session.applySubtitleTrack}
+      preferredSubtitleLanguage={preferredSubtitleLanguage}
+      preferredSubtitleTrackSignature={preferredSubtitleTrackSignature}
+      subtitleMode={session.initialSubtitleError ? "off" : subtitleMode}
+      showForcedSubtitles={session.initialSubtitleError ? false : showForcedSubtitles}
+      intro={activeMarkers.intro}
+      introSkipMode={introSkipMode}
+      showMarkerConfidence={showMarkerConfidence}
+      showMarkerSource={showMarkerSource}
+      bufferingMode={bufferingMode}
+      bandwidthCapKbps={maxBitrateKbps}
+      bufferingTitleId={contentId}
+      playbackAttemptId={session.playbackAttemptId}
+      onKeptEstimate={session.setKeptEstimate}
+      onBufferingSummary={(plan, summary, pageEnding) =>
+        session.reportEvent("plan_summary", {
+          adoptionId: plan.adoption_id,
+          diagnostics: { ...summary },
+          keepalive: pageEnding,
+        })
+      }
+      credits={activeMarkers.credits}
+      recap={activeMarkers.recap}
+      autoSkipRecap={autoSkipRecap}
+      preview={activeMarkers.preview}
+      markerSegments={selectedVersion?.marker_segments}
+      autoPlayNextPreview={autoPlayNextPreview}
+      canEditMarkers={canEditMarkers}
+      onMarkersEdited={(fileId, markers) =>
+        setPlaybackVersions((current) =>
+          patchVersionMarkers(
+            current,
+            fileId,
+            markers.intro,
+            markers.credits,
+            markers.recap,
+            markers.preview,
+          ),
+        )
+      }
+      duration={selectedDuration}
+      // The session's preference, not the caller's: the server normalizes what
+      // was requested and the menu has to light up whatever it settled on.
+      qualityPreference={session.qualityPreference}
+      seriesContext={seriesContext}
+      onNavigateEpisode={onNavigateEpisode}
+      displayMode={displayMode}
+      onPictureInPictureChange={onPictureInPictureChange}
+      autoEnterPictureInPicture={autoEnterPictureInPicture}
+      onPlaybackStateChange={handlePlaybackStateChange}
+      onPlaybackTransportReady={onPlaybackTransportReady}
+      seekIntervals={seekIntervals}
+      onFirstFrame={session.reportFirstFrame}
+      onRealtimeEvent={handleRealtimeEvent}
+      onRealtimeConnectionStateChange={setRealtimeConnectionState}
+      onExit={onExit}
+      onMinimize={onMinimize}
+      onEnded={handleEnded}
+      onRefreshSubtitles={session.refreshSubtitles}
+      audioTracks={audioTracks}
+      activeAudioIndex={session.audioTrackIndex}
+      onAudioSelect={handleSwitchAudio}
+      onSubtitleChanged={saveSubtitleChoice}
+      onReturnFromPostRoll={onReturnFromPostRoll}
+      watchTogetherRoomId={watchTogetherRoomId}
+      watchTogetherConnection={watchTogetherConnection}
+    />
+>>>>>>> upstream/main
   );
 }

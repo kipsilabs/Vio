@@ -1414,6 +1414,7 @@ func (r *LibraryCollectionRepository) ReplaceItems(ctx context.Context, collecti
 	return nil
 }
 
+<<<<<<< HEAD
 // ListItemIDsPage answers one window of a collection's stored item order:
 // the media item IDs at positions [offset, offset+limit) in the same order
 // ListItems uses, and whether stored positions follow the window. It probes
@@ -1623,6 +1624,8 @@ func cleanupUnclaimedCollectionVirtualMedia(ctx context.Context, tx pgx.Tx) erro
 	return nil
 }
 
+=======
+>>>>>>> upstream/main
 func (r *LibraryCollectionRepository) ListItems(ctx context.Context, collectionID string) ([]*models.LibraryCollectionItem, error) {
 	rows, err := r.pool.Query(ctx, `
 		SELECT collection_id, media_item_id, position, source_rank, created_at, updated_at
@@ -1716,6 +1719,7 @@ func GroupUngroupedMembershipInTx(ctx context.Context, tx pgx.Tx, collectionID s
 	return tag.RowsAffected() > 0, nil
 }
 
+<<<<<<< HEAD
 // RemoveItem deletes a single item from a collection. It locks the collection first,
 // removes membership, releases this collection's source and file claims for the item,
 // reconciles metadata ownership, and cleans up any virtual files and catalog items
@@ -1829,6 +1833,8 @@ func (r *LibraryCollectionRepository) RemoveItem(ctx context.Context, collection
 	return tx.Commit(ctx)
 }
 
+=======
+>>>>>>> upstream/main
 // ReorderItems sets each item's position to its index in the supplied list.
 // The list must be a permutation of the existing membership.
 func (r *LibraryCollectionRepository) ReorderItems(ctx context.Context, collectionID string, orderedMediaItemIDs []string) error {

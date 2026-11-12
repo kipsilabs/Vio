@@ -8,7 +8,17 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { components } from "@/api/v2/schema";
 import { installV2Recorder, v2Recorder, type RecordedCall } from "@/test/v2Recorder";
 
+<<<<<<< HEAD
 import { STARTER_PACK_BLOCKS_DELETE } from "@/lib/collections/copy";
+=======
+import {
+  ADMIN_COLLECTION_CAPABILITIES,
+  answerAdminCollections,
+  storedAdminCollection as stored,
+} from "./adminCollections.test-support";
+
+import { starterPackBlocksDelete } from "@/lib/collections/copy";
+>>>>>>> upstream/main
 
 import AdminCollections from "./AdminCollections";
 
@@ -742,7 +752,7 @@ describe("AdminCollections Select collections delete", () => {
         },
       ]),
     );
-    expect(within(dialog).getByRole("alert")).toHaveTextContent(STARTER_PACK_BLOCKS_DELETE);
+    expect(within(dialog).getByRole("alert")).toHaveTextContent(starterPackBlocksDelete());
     const confirm = within(dialog).getByRole("button", { name: "Delete 1" });
     expect(confirm).toBeDisabled();
     await user.click(confirm);

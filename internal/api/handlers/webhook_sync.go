@@ -1,46 +1,31 @@
 package handlers
 
 import (
-	"encoding/json"
+	"context"
 	"errors"
 	"log/slog"
 	"net/http"
-	"strconv"
 	"strings"
-	"time"
 
-	"github.com/go-chi/chi/v5"
-
-	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
+	"github.com/Silo-Server/silo-server/internal/clientip"
 	"github.com/Silo-Server/silo-server/internal/historyimport"
+	"github.com/Silo-Server/silo-server/internal/userstore"
 	"github.com/Silo-Server/silo-server/internal/webhooksync"
 )
 
 type WebhookSyncHandler struct {
 	service *webhooksync.Service
+	stores  userstore.UserStoreProvider
 }
 
-type legacyPlexSyncConnection struct {
-	ID                             string     `json:"id"`
-	PlexServerID                   string     `json:"plex_server_id"`
-	PlexServerName                 string     `json:"plex_server_name"`
-	WebhookURL                     string     `json:"webhook_url,omitempty"`
-	BindingsReady                  bool       `json:"bindings_ready"`
-	ActorCount                     int        `json:"actor_count"`
-	AccountDiscoveryAvailable      bool       `json:"account_discovery_available"`
-	LastWebhookReceivedAt          *time.Time `json:"last_webhook_received_at,omitempty"`
-	LastWebhookErrorAt             *time.Time `json:"last_webhook_error_at,omitempty"`
-	LastWebhookErrorMessage        string     `json:"last_webhook_error_message,omitempty"`
-	LastWritebackAt                *time.Time `json:"last_writeback_at,omitempty"`
-	LastWritebackErrorAt           *time.Time `json:"last_writeback_error_at,omitempty"`
-	LastWritebackErrorMessage      string     `json:"last_writeback_error_message,omitempty"`
-	LastBindingRefreshAt           *time.Time `json:"last_binding_refresh_at,omitempty"`
-	LastBindingRefreshErrorAt      *time.Time `json:"last_binding_refresh_error_at,omitempty"`
-	LastBindingRefreshErrorMessage string     `json:"last_binding_refresh_error_message,omitempty"`
-	CreatedAt                      time.Time  `json:"created_at"`
-	UpdatedAt                      time.Time  `json:"updated_at"`
+// NewWebhookSyncHandler takes the household stores that decide who may manage
+// connections. Without stores every management request is refused; the public
+// receiver does not need them.
+func NewWebhookSyncHandler(service *webhooksync.Service, stores userstore.UserStoreProvider) *WebhookSyncHandler {
+	return &WebhookSyncHandler{service: service, stores: stores}
 }
 
+<<<<<<< HEAD
 type legacyPlexSyncActorMapping struct {
 	ID               int       `json:"id"`
 	ConnectionID     string    `json:"connection_id"`
@@ -362,6 +347,15 @@ func (h *WebhookSyncHandler) HandleWebhook(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+=======
+// MayManageWebhookSync applies the household-manager rule to connection
+// management, reads included. A connection belongs to the account, its
+// receiver URL carries the secret that authenticates deliveries, and its
+// mappings choose which profile an external user's watch state is written to,
+// so a household member who is not the manager may neither see nor change it.
+func (h *WebhookSyncHandler) MayManageWebhookSync(ctx context.Context, userID int, profileID string, verify func(*userstore.Profile) error) (bool, error) {
+	return mayManageHouseholdOf(ctx, h.stores, userID, profileID, verify)
+>>>>>>> upstream/main
 }
 
 // ReceiveWebhook applies a v2 delivery through the shared processor and delivery log.
@@ -400,40 +394,6 @@ func (h *WebhookSyncHandler) receiveWebhook(r *http.Request, secret string, limi
 	logWebhookDelivery(result, logContext, statusCode, err)
 
 	return err
-}
-
-func (h *WebhookSyncHandler) writeError(w http.ResponseWriter, err error) {
-	statusCode := webhookErrorStatus(err)
-	if message, refused := historyimport.ServerAddressMessage(err); refused {
-		writeError(w, statusCode, "bad_request", message)
-		return
-	}
-	switch {
-	case errors.Is(err, webhooksync.ErrConnectionNotFound), errors.Is(err, historyimport.ErrProfileNotFound):
-		writeError(w, statusCode, "not_found", err.Error())
-	case errors.Is(err, webhooksync.ErrWebhookTooLarge):
-		writeError(w, statusCode, "payload_too_large", err.Error())
-	case errors.Is(err, webhooksync.ErrWebhookBody):
-		writeError(w, statusCode, "bad_request", err.Error())
-	default:
-		message := err.Error()
-		switch {
-		case message == "invalid multipart request",
-			message == "missing payload",
-			message == "invalid Plex payload",
-			message == "invalid Plex webhook payload",
-			message == "invalid Emby payload",
-			message == "invalid Emby webhook payload",
-			message == "invalid Jellyfin payload",
-			message == "invalid Jellyfin webhook payload",
-			strings.Contains(message, "are required"),
-			strings.Contains(message, "cannot be empty"),
-			strings.Contains(message, "unsupported provider"):
-			writeError(w, statusCode, "bad_request", err.Error())
-		default:
-			writeError(w, statusCode, "internal_error", err.Error())
-		}
-	}
 }
 
 func webhookErrorStatus(err error) int {
@@ -562,128 +522,10 @@ func logWebhookDelivery(result *webhooksync.ProcessWebhookResult, meta webhooksy
 	}
 }
 
+// requestBaseURL is the origin r arrived on. X-Forwarded-Proto and
+// X-Forwarded-Host count only from a trusted proxy (see clientip.RequestOrigin),
+// so a client cannot use them to change the scheme or host of the links built
+// from it.
 func requestBaseURL(r *http.Request) string {
-	scheme := "http"
-	if r.TLS != nil {
-		scheme = "https"
-	}
-	if forwarded := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")); forwarded != "" {
-		scheme = forwarded
-	}
-	host := r.Host
-	if forwarded := forwardedHost(r); forwarded != "" {
-		host = forwarded
-	}
-	return scheme + "://" + host
-}
-
-func requestWebhookURL(baseURL, secret string) string {
-	return requestWebhookURLWithPrefix(baseURL, webhookSyncPathPrefix, secret)
-}
-
-func requestWebhookURLWithPrefix(baseURL, prefix, secret string) string {
-	if secret == "" {
-		return ""
-	}
-	return strings.TrimRight(baseURL, "/") + prefix + secret
-}
-
-const (
-	webhookSyncPathPrefix    = "/api/v2/webhook-sync/webhooks/"
-	legacyPlexSyncPathPrefix = "/api/v1/plex-sync/webhooks/"
-)
-
-func toLegacyPlexConnection(connection webhooksync.Connection, webhookURL string) legacyPlexSyncConnection {
-	return legacyPlexSyncConnection{
-		ID:                        connection.ID,
-		PlexServerID:              connection.ServerID,
-		PlexServerName:            connection.ServerName,
-		WebhookURL:                webhookURL,
-		BindingsReady:             false,
-		ActorCount:                connection.UserCount,
-		AccountDiscoveryAvailable: connection.AccountDiscoveryAvailable,
-		LastWebhookReceivedAt:     connection.LastWebhookReceivedAt,
-		LastWebhookErrorAt:        connection.LastWebhookErrorAt,
-		LastWebhookErrorMessage:   connection.LastWebhookErrorMessage,
-		CreatedAt:                 connection.CreatedAt,
-		UpdatedAt:                 connection.UpdatedAt,
-	}
-}
-
-func toLegacyPlexActorsResponse(resp *webhooksync.ProfileMappingsResponse) legacyPlexSyncActorsResponse {
-	if resp == nil {
-		return legacyPlexSyncActorsResponse{}
-	}
-	return legacyPlexSyncActorsResponse{
-		Mappings:                  toLegacyPlexActorMappings(resp.Mappings),
-		DiscoveredActors:          toLegacyPlexDiscoveredActors(resp.DiscoveredUsers),
-		AccountDiscoveryAvailable: resp.AccountDiscoveryAvailable,
-	}
-}
-
-func toLegacyPlexActorMappings(mappings []webhooksync.ProfileMapping) []legacyPlexSyncActorMapping {
-	if len(mappings) == 0 {
-		return nil
-	}
-	out := make([]legacyPlexSyncActorMapping, 0, len(mappings))
-	for _, mapping := range mappings {
-		accountID, err := strconv.ParseInt(mapping.ExternalUserID, 10, 64)
-		if err != nil {
-			continue
-		}
-		out = append(out, legacyPlexSyncActorMapping{
-			ID:               mapping.ID,
-			ConnectionID:     mapping.ConnectionID,
-			PlexAccountID:    accountID,
-			PlexAccountTitle: mapping.ExternalUserName,
-			SiloProfileID:    valueOrEmpty(mapping.SiloProfileID),
-			CreatedAt:        mapping.CreatedAt,
-			UpdatedAt:        mapping.UpdatedAt,
-		})
-	}
-	return out
-}
-
-func toLegacyPlexDiscoveredActors(actors []webhooksync.DiscoveredUser) []legacyPlexSyncDiscoveredActor {
-	if len(actors) == 0 {
-		return nil
-	}
-	out := make([]legacyPlexSyncDiscoveredActor, 0, len(actors))
-	for _, actor := range actors {
-		accountID, err := strconv.ParseInt(actor.ExternalUserID, 10, 64)
-		if err != nil {
-			continue
-		}
-		out = append(out, legacyPlexSyncDiscoveredActor{
-			PlexAccountID:    accountID,
-			PlexAccountTitle: actor.ExternalUserName,
-		})
-	}
-	return out
-}
-
-func firstLegacyMappedActor(mappings []webhooksync.ProfileMapping) legacyPlexSyncActorMapping {
-	legacyMappings := toLegacyPlexActorMappings(mappings)
-	if len(legacyMappings) == 0 {
-		return legacyPlexSyncActorMapping{}
-	}
-	return legacyMappings[0]
-}
-
-func valueOrEmpty(value *string) string {
-	if value == nil {
-		return ""
-	}
-	return *value
-}
-
-func secretFromWebhookURL(raw string) string {
-	if raw == "" {
-		return ""
-	}
-	idx := strings.LastIndex(raw, "/")
-	if idx < 0 || idx == len(raw)-1 {
-		return ""
-	}
-	return raw[idx+1:]
+	return clientip.RequestOrigin(r)
 }

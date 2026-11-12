@@ -1,6 +1,15 @@
 import { useState, useCallback, useEffect, useRef, useMemo } from "react";
 import { createPortal } from "react-dom";
-import { Captions, CaptionsOff, Languages, Minus, Plus, SlidersHorizontal } from "lucide-react";
+import {
+  Captions,
+  CaptionsOff,
+  Check,
+  Languages,
+  Minus,
+  Plus,
+  SlidersHorizontal,
+} from "lucide-react";
+import { useT, type MessageKey } from "@/i18n";
 import type { PlayerAudioTrack, PlayerSubtitleInfo } from "../types";
 import type { PlayerConfig } from "../context/PlayerConfigContext";
 import { SubtitleSearchModal } from "./SubtitleSearchModal";
@@ -70,16 +79,17 @@ interface SubtitleMenuProps {
 const DELAY_STEP_MS = 100;
 const DELAY_MAX_MS = 10_000;
 
-const SOURCE_LABELS: Record<string, string> = {
-  external: "External",
-  embedded: "Embedded",
-  downloaded: "Downloaded",
+const SOURCE_LABELS: Record<string, MessageKey> = {
+  external: "web.subtitles.menu.source.external",
+  embedded: "web.subtitles.menu.source.embedded",
+  downloaded: "web.subtitles.menu.source.downloaded",
 };
 
+/** The signed delay number the "{delay} ms" message shows. */
 function formatDelay(ms: number): string {
-  if (ms === 0) return "0 ms";
+  if (ms === 0) return "0";
   const sign = ms > 0 ? "+" : "−";
-  return `${sign}${Math.abs(ms)} ms`;
+  return `${sign}${Math.abs(ms)}`;
 }
 
 export function SubtitleMenu({
@@ -103,6 +113,7 @@ export function SubtitleMenu({
   onRetryDiscovery,
   subtitleSync,
 }: SubtitleMenuProps) {
+  const t = useT();
   const [open, setOpen] = useState(false);
   // A replace or replan swaps the inventory out from under the menu. The open
   // state is kept so the menu returns once the replacement lands, but the
@@ -117,6 +128,7 @@ export function SubtitleMenu({
   const [appearanceOpen, setAppearanceOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
 
+<<<<<<< HEAD
   // Probed inventories can repeat the same subtitle stream at several container
   // indexes; the menu shows one row per distinct descriptor, keeping the first
   // ordinal for selection. Differing forced/hearing-impaired/flag rows stay.
@@ -135,6 +147,40 @@ export function SubtitleMenu({
     restartDiscovery();
     onRetryDiscovery?.();
   }, [onRetryDiscovery, restartDiscovery]);
+=======
+  const [pendingDownload, setPendingDownload] = useState<{
+    id: string;
+    generation: number;
+  } | null>(null);
+  const downloadGeneration = useRef(0);
+  const downloadSelectionGeneration = useRef(0);
+  const profileId = playerConfig?.getProfileId();
+  const profileToken = playerConfig?.getProfileToken?.();
+  const authContext = playerConfig?.getAuthContext?.();
+
+  // A completed download may precede its inventory update. Never carry that
+  // selection into another viewing or over a newer subtitle choice.
+  useEffect(() => {
+    downloadGeneration.current++;
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- a new viewing or subtitle choice drops a download still pending from the old one
+    setPendingDownload(null);
+  }, [mediaFileId, sessionId, playerConfig, profileId, profileToken, authContext, activeIndex]);
+
+  useEffect(() => {
+    if (!pendingDownload || pendingDownload.generation !== downloadGeneration.current) return;
+    const track = tracks.find((candidate) =>
+      candidate.stored_subtitle_id
+        ? String(candidate.stored_subtitle_id) === pendingDownload.id
+        : syncKeyOf(candidate) === `stored-${pendingDownload.id}`,
+    );
+    if (!track) return;
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- the download's track exists only once the inventory refresh lands
+    setPendingDownload(null);
+    onSelect(track.index);
+  }, [pendingDownload, tracks, onSelect]);
+
+  const sortedTracks = useMemo(() => sortSubtitlesBySource(tracks), [tracks]);
+>>>>>>> upstream/main
 
   // Discover whether the server has AI subtitle translation configured, so we
   // only surface the entry point when it can actually do something. This is a
@@ -165,6 +211,7 @@ export function SubtitleMenu({
   useEffect(() => {
     if (!playerConfig) return;
     // A previous server's answer must not hide search on this one.
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- a new server starts from the fail-open default until its probe answers
     setOnlineSearchEnabled(true);
     let cancelled = false;
     playerV2(playerConfig, "GET /api/v2/subtitles/providers/status", {})
@@ -203,7 +250,11 @@ export function SubtitleMenu({
 
   const handleSelect = useCallback(
     (index: number | null) => {
+<<<<<<< HEAD
       if (locked) return;
+=======
+      setPendingDownload(null);
+>>>>>>> upstream/main
       onSelect(index);
       setOpen(false);
     },
@@ -216,6 +267,7 @@ export function SubtitleMenu({
     }
   }, []);
 
+<<<<<<< HEAD
   // Close on Escape.
   useEffect(() => {
     if (!open) return;
@@ -266,57 +318,93 @@ export function SubtitleMenu({
 
   if (tracks.length === 0 && !mediaFileId && !provisional && !pending && !failed && !menuOpen)
     return null;
+=======
+  if (tracks.length === 0 && !mediaFileId) return null;
+>>>>>>> upstream/main
 
-  let menuItemIndex = 0;
+  const canAddSubtitles = Boolean(mediaFileId && playerConfig);
+  // The rail names the subtitles shown ("English", "Off") where it has room.
+  const activeTrack =
+    activeIndex !== null ? tracks.find((track) => track.index === activeIndex) : null;
+  const valueLabel = activeTrack
+    ? getLanguageName(activeTrack.language)
+    : t("web.subtitles.menu.off");
+  const canTranslate =
+    canAddSubtitles &&
+    ((aiEnabled && tracks.some(isTranslatableSource)) ||
+      (aiTranscribeEnabled && (audioTracks?.length ?? 0) > 0));
 
   return (
     <div ref={menuRef} className="relative" onBlur={handleBlur}>
       <button
         type="button"
+<<<<<<< HEAD
         className="player-utility-btn disabled:cursor-not-allowed disabled:opacity-40"
+=======
+        className="hud-icon-btn hud-rail-btn"
+>>>>>>> upstream/main
         data-active={activeIndex !== null ? "true" : "false"}
         onClick={() => {
           // Opening re-reads sync state so a job that finished meanwhile shows.
           if (!open) subtitleSync?.reload();
           setOpen((v) => !v);
         }}
+<<<<<<< HEAD
         aria-label={activeIndex !== null ? "Disable captions" : "Enable captions"}
         aria-expanded={menuOpen}
+=======
+        aria-label={t("web.subtitles.menu.triggerWithValue", { value: valueLabel })}
+        title={
+          activeIndex !== null
+            ? t("web.subtitles.menu.subtitlesShortcut")
+            : t("web.subtitles.menu.subtitlesOffShortcut")
+        }
+        aria-expanded={open}
+>>>>>>> upstream/main
         aria-haspopup="menu"
         aria-disabled={locked || undefined}
         disabled={locked}
       >
-        {activeIndex !== null ? (
-          <Captions className="h-[18px] w-[18px]" />
-        ) : (
-          <CaptionsOff className="h-[18px] w-[18px]" />
-        )}
+        {activeIndex !== null ? <Captions /> : <CaptionsOff />}
+        <span className="hud-rail-label">{valueLabel}</span>
       </button>
 
       {menuOpen && (
         <PlayerMenuSurface
+          title={t("web.subtitles.menu.heading")}
+          role="dialog"
           anchorRef={menuRef}
-          className="absolute right-0 bottom-full z-30 mb-2 flex w-max max-w-[min(420px,calc(100vw-1rem))] min-w-[220px] flex-col rounded-lg bg-black/90 shadow-lg backdrop-blur"
+          className="hud-popover w-[24rem] max-w-[calc(100vw-2rem)]"
           onClose={() => setOpen(false)}
-          onKeyDown={handleMenuKeyDown}
         >
+<<<<<<< HEAD
           <div className="flex shrink-0 items-center gap-2 py-1 pr-3">
+=======
+          <div
+            role="menu"
+            aria-label={t("web.subtitles.menu.tracksLabel")}
+            className="hud-scroll-list max-h-[min(22.5rem,calc(100cqh-23rem))] min-h-[7.5rem] shrink"
+          >
+>>>>>>> upstream/main
             <button
-              ref={(el) => {
-                menuItemsRef.current[0] = el;
-              }}
-              role="menuitem"
+              role="menuitemradio"
               type="button"
+<<<<<<< HEAD
               className={`flex flex-1 items-center gap-2 px-3 py-2 text-left text-sm hover:bg-white/10 focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:outline-none ${
                 activeIndex === null ? "bg-white/5 text-white" : "text-white/70"
               }`}
+=======
+              aria-checked={activeIndex === null}
+              className="hud-item"
+>>>>>>> upstream/main
               onClick={() => handleSelect(null)}
             >
-              <span className="w-4 shrink-0 text-center text-xs">
-                {activeIndex === null ? "✓" : ""}
+              <span aria-hidden="true" className="hud-check">
+                {activeIndex === null ? <Check /> : null}
               </span>
-              Off
+              {t("web.subtitles.menu.off")}
             </button>
+<<<<<<< HEAD
             {provisional && <ProvisionalTrackBadge />}
           </div>
           <div className="max-h-[60vh] overflow-y-auto py-1">
@@ -353,35 +441,41 @@ export function SubtitleMenu({
               <div className="px-3 py-2 text-xs text-white/40">No subtitles available</div>
             )}
             {displayedTracks.map((track) => {
+=======
+            {sortedTracks.map((track) => {
+>>>>>>> upstream/main
               const isActive = track.index === activeIndex;
               const languageName = getLanguageName(track.language);
-              const sourceLabel = SOURCE_LABELS[track.source ?? "embedded"] ?? "Embedded";
-              const formatLabel = getSubtitleFormatLabel(track.codec);
-              const hasDetail =
+              const source = track.source ?? "embedded";
+              const detail =
                 track.label &&
                 track.label !== track.language &&
                 track.label !== languageName &&
-                !isSubtitleFormatLabel(track.label, track.codec);
-              const itemIdx = ++menuItemIndex;
+                !isSubtitleFormatLabel(track.label, track.codec)
+                  ? track.label
+                  : null;
+              const badges = [
+                getSubtitleFormatLabel(track.codec),
+                t(SOURCE_LABELS[source] ?? "web.subtitles.menu.source.embedded"),
+              ]
+                .filter(Boolean)
+                .join(" · ");
               const syncEntry = syncEntryOf(track);
               const syncLabel = syncEntry ? syncStatusLabel(syncEntry.state) : null;
 
               return (
                 <button
                   key={track.index}
-                  ref={(el) => {
-                    menuItemsRef.current[itemIdx] = el;
-                  }}
-                  role="menuitem"
+                  role="menuitemradio"
                   type="button"
-                  className={`flex w-full items-start gap-2 px-3 py-2 text-left hover:bg-white/10 focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:outline-none ${
-                    isActive ? "bg-white/5 text-white" : "text-white/70"
-                  }`}
+                  aria-checked={isActive}
+                  className="hud-item"
                   onClick={() => handleSelect(track.index)}
                 >
-                  <span className="mt-0.5 w-4 shrink-0 text-center text-xs">
-                    {isActive ? "✓" : ""}
+                  <span aria-hidden="true" className="hud-check">
+                    {isActive ? <Check /> : null}
                   </span>
+<<<<<<< HEAD
                   <span className="flex min-w-0 flex-1 flex-col">
                     <span className="flex w-full items-center justify-between gap-3">
                       <span className="flex min-w-0 items-center gap-1.5">
@@ -398,18 +492,24 @@ export function SubtitleMenu({
                           {sourceLabel}
                         </span>
                       </span>
+=======
+                  <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+                    {/* The title gets its own line: it can be a long file name,
+                        and truncating it must not hide the format and source. */}
+                    <span className="flex min-w-0 items-baseline justify-between gap-3">
+                      <span className="min-w-0 truncate">{languageName}</span>
+                      <span className="hud-item-secondary shrink-0">{badges}</span>
+>>>>>>> upstream/main
                     </span>
-                    {hasDetail && (
-                      <span
-                        className="mt-0.5 block w-full truncate text-xs text-white/40"
-                        title={track.label}
-                      >
-                        {track.label}
+                    {detail && (
+                      <span className="hud-item-secondary truncate" title={detail}>
+                        {detail}
                       </span>
                     )}
                     {syncLabel && (
                       <span
-                        className="mt-0.5 block w-full truncate text-xs text-white/50"
+                        className="hud-item-secondary truncate"
+                        title={syncLabel}
                         data-testid="subtitle-sync-status"
                       >
                         {syncLabel}
@@ -420,97 +520,92 @@ export function SubtitleMenu({
               );
             })}
           </div>
-          <div className="shrink-0 border-t border-white/10 px-3 py-2">
-            <div className="flex items-center justify-between gap-3">
-              <span className="text-xs tracking-wide text-white/50 uppercase">Delay</span>
-              <div className="flex items-center gap-1">
-                <button
-                  type="button"
-                  className="flex h-7 w-7 items-center justify-center rounded text-white/80 hover:bg-white/10 focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-40"
-                  onClick={() => nudgeDelay(-DELAY_STEP_MS)}
-                  disabled={delayDisabled || delayMs <= -DELAY_MAX_MS}
-                  aria-label={`Subtitle delay ${DELAY_STEP_MS}ms earlier`}
-                >
-                  <Minus className="h-3.5 w-3.5" />
-                </button>
-                <span className="min-w-[4.5rem] text-center font-mono text-xs text-white/80 tabular-nums">
-                  {formatDelay(delayMs)}
-                </span>
-                <button
-                  type="button"
-                  className="flex h-7 w-7 items-center justify-center rounded text-white/80 hover:bg-white/10 focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-40"
-                  onClick={() => nudgeDelay(DELAY_STEP_MS)}
-                  disabled={delayDisabled || delayMs >= DELAY_MAX_MS}
-                  aria-label={`Subtitle delay ${DELAY_STEP_MS}ms later`}
-                >
-                  <Plus className="h-3.5 w-3.5" />
-                </button>
-                <button
-                  type="button"
-                  className="ml-1 rounded px-2 py-1 text-xs text-white/60 hover:bg-white/10 focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-40"
-                  onClick={resetDelay}
-                  disabled={delayDisabled || delayMs === 0}
-                  aria-label="Reset subtitle delay"
-                >
-                  Reset
-                </button>
-              </div>
+          <div className="hud-panel-divider" />
+          <div className="flex shrink-0 items-center justify-between gap-3 px-4 py-1">
+            <span className="text-sm">{t("web.subtitles.menu.delay")}</span>
+            <div className="flex items-center gap-1.5">
+              <button
+                type="button"
+                className="hud-mini-btn"
+                onClick={() => nudgeDelay(-DELAY_STEP_MS)}
+                disabled={delayDisabled || delayMs <= -DELAY_MAX_MS}
+                aria-label={t("web.subtitles.menu.delayEarlier", { step: DELAY_STEP_MS })}
+              >
+                <Minus />
+              </button>
+              <span className="min-w-[4.25rem] text-center text-sm font-semibold tabular-nums">
+                {t("web.subtitles.menu.delayValue", { delay: formatDelay(delayMs) })}
+              </span>
+              <button
+                type="button"
+                className="hud-mini-btn"
+                onClick={() => nudgeDelay(DELAY_STEP_MS)}
+                disabled={delayDisabled || delayMs >= DELAY_MAX_MS}
+                aria-label={t("web.subtitles.menu.delayLater", { step: DELAY_STEP_MS })}
+              >
+                <Plus />
+              </button>
+              <button
+                type="button"
+                className="hud-mini-btn"
+                onClick={resetDelay}
+                disabled={delayDisabled || delayMs === 0}
+                aria-label={t("web.subtitles.menu.resetDelayLabel")}
+              >
+                {t("web.subtitles.menu.resetDelay")}
+              </button>
             </div>
           </div>
           {subtitleSync && activeSyncEntry && (
             <TimingControls sync={subtitleSync} entry={activeSyncEntry} />
           )}
-          <div className="shrink-0 border-t border-white/10 py-1">
-            {mediaFileId && playerConfig && (
+          <div className="hud-panel-divider" />
+          <div role="menu" aria-label={t("web.subtitles.menu.toolsLabel")} className="shrink-0">
+            {canAddSubtitles && (
               <button
-                ref={(el) => {
-                  menuItemsRef.current[menuItemIndex + 1] = el;
-                }}
                 role="menuitem"
                 type="button"
-                className="flex w-full px-3 py-2 text-left text-sm text-white/70 hover:bg-white/10 focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:outline-none"
+                className="hud-item"
                 onClick={() => {
                   setSearchOpen(true);
                   setOpen(false);
                 }}
               >
-                Add Subtitles…
+                <span aria-hidden="true" className="hud-item-icon">
+                  <Plus />
+                </span>
+                {t("web.subtitles.menu.addSubtitles")}
               </button>
             )}
-            {mediaFileId &&
-              playerConfig &&
-              ((aiEnabled && tracks.some(isTranslatableSource)) ||
-                (aiTranscribeEnabled && (audioTracks?.length ?? 0) > 0)) && (
-                <button
-                  ref={(el) => {
-                    menuItemsRef.current[menuItemIndex + 2] = el;
-                  }}
-                  role="menuitem"
-                  type="button"
-                  className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-white/70 hover:bg-white/10 focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:outline-none"
-                  onClick={() => {
-                    setTranslateOpen(true);
-                    setOpen(false);
-                  }}
-                >
-                  <Languages className="h-3.5 w-3.5 text-white/50" />
-                  Translate with AI…
-                </button>
-              )}
+            {canTranslate && (
+              <button
+                role="menuitem"
+                type="button"
+                className="hud-item"
+                onClick={() => {
+                  setTranslateOpen(true);
+                  setOpen(false);
+                }}
+              >
+                <span aria-hidden="true" className="hud-item-icon">
+                  <Languages />
+                </span>
+                {t("web.subtitles.menu.translateWithAi")}
+              </button>
+            )}
             <button
-              ref={(el) => {
-                menuItemsRef.current[menuItemIndex + 3] = el;
-              }}
               role="menuitem"
               type="button"
-              className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-white/70 hover:bg-white/10 focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:outline-none"
+              className="hud-item"
               onClick={() => {
                 setAppearanceOpen(true);
                 setOpen(false);
               }}
             >
-              <SlidersHorizontal className="h-3.5 w-3.5 text-white/50" />
-              Appearance…
+              <span aria-hidden="true" className="hud-item-icon">
+                <SlidersHorizontal />
+              </span>
+              {t("web.subtitles.menu.appearance")}
             </button>
           </div>
         </PlayerMenuSurface>
@@ -523,14 +618,29 @@ export function SubtitleMenu({
         playerConfig &&
         createPortal(
           <SubtitleSearchModal
+            key={sessionId}
             mediaFileId={mediaFileId}
             playerConfig={playerConfig}
             isOpen={searchOpen}
             onlineSearchEnabled={onlineSearchEnabled}
             onClose={() => setSearchOpen(false)}
-            onSubtitleDownloaded={(subtitle) => {
+            onDownloadStarted={() => {
+              downloadSelectionGeneration.current = downloadGeneration.current;
+            }}
+            onSubtitleDownloaded={(subtitle, source) => {
               setSearchOpen(false);
-              if (subtitle) subtitleSync?.remember(subtitle);
+              if (subtitle) {
+                subtitleSync?.remember(subtitle);
+                if (
+                  source === "download" &&
+                  downloadSelectionGeneration.current === downloadGeneration.current
+                ) {
+                  setPendingDownload({
+                    id: subtitle.id,
+                    generation: downloadSelectionGeneration.current,
+                  });
+                }
+              }
               onRefreshSubtitles?.();
             }}
           />,
@@ -557,8 +667,7 @@ export function SubtitleMenu({
   );
 }
 
-const TIMING_BUTTON_CLASS =
-  "rounded px-2 py-1 text-xs text-white/70 hover:bg-white/10 focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-40";
+const TIMING_BUTTON_CLASS = "hud-mini-btn";
 
 /**
  * "Sync to audio" and "Reset timing" for the selected track, stored or a file
@@ -567,6 +676,7 @@ const TIMING_BUTTON_CLASS =
  * the actions with a short explanation.
  */
 function TimingControls({ sync, entry }: { sync: SubtitleSync; entry: SubtitleSyncEntry }) {
+  const t = useT();
   const key = entry.state.key;
   const job = entry.state.sync;
   const inProgress = isSyncInProgress(job?.status);
@@ -580,15 +690,19 @@ function TimingControls({ sync, entry }: { sync: SubtitleSync; entry: SubtitleSy
     switch (job?.status) {
       case "synced":
         if (!isIdentityTiming(entry.state.timing)) {
-          result = { text: `Synced to the audio: ${describeTiming(entry.state.timing)}` };
+          result = {
+            text: t("web.subtitles.menu.syncedResult", {
+              timing: describeTiming(entry.state.timing),
+            }),
+          };
         }
         break;
       case "already_synced":
-        result = { text: "Already matches the audio." };
+        result = { text: t("web.subtitles.menu.alreadyMatches") };
         break;
       case "no_match":
         result = {
-          text: "Doesn't match this video's audio; probably for another release.",
+          text: t("web.subtitles.menu.noMatch"),
           warning: true,
         };
         break;
@@ -599,9 +713,9 @@ function TimingControls({ sync, entry }: { sync: SubtitleSync; entry: SubtitleSy
   }
 
   return (
-    <div className="shrink-0 border-t border-white/10 px-3 py-2" data-testid="subtitle-timing">
+    <div className="shrink-0 px-4 py-1.5" data-testid="subtitle-timing">
       <div className="flex items-center justify-between gap-3">
-        <span className="text-xs tracking-wide text-white/50 uppercase">Timing</span>
+        <span className="text-sm">{t("web.subtitles.menu.timing")}</span>
         {!entry.forbidden && (
           <div className="flex items-center gap-1">
             {canSync && (
@@ -611,7 +725,7 @@ function TimingControls({ sync, entry }: { sync: SubtitleSync; entry: SubtitleSy
                 disabled={entry.busy || inProgress}
                 onClick={() => void sync.requestSync(key)}
               >
-                {inProgress ? "Syncing…" : "Sync to audio"}
+                {inProgress ? t("web.subtitles.menu.syncing") : t("web.subtitles.menu.syncToAudio")}
               </button>
             )}
             {canReset && (
@@ -621,7 +735,7 @@ function TimingControls({ sync, entry }: { sync: SubtitleSync; entry: SubtitleSy
                 disabled={entry.busy || inProgress}
                 onClick={() => void sync.resetTiming(key)}
               >
-                Reset timing
+                {t("web.subtitles.menu.resetTiming")}
               </button>
             )}
           </div>
@@ -631,38 +745,42 @@ function TimingControls({ sync, entry }: { sync: SubtitleSync; entry: SubtitleSy
         <div className="mt-2 flex flex-col gap-1">
           <span
             role="progressbar"
-            aria-label="Subtitle sync progress"
+            aria-label={t("web.subtitles.sync.progressLabel")}
             aria-valuemin={0}
             aria-valuemax={100}
             aria-valuenow={percent ?? 0}
-            className="h-1 overflow-hidden rounded-full bg-white/15"
+            className="h-1 overflow-hidden rounded-full bg-white/20"
           >
             <span
-              className="block h-full rounded-full bg-white/80 transition-[width] duration-500"
+              className="block h-full rounded-full bg-[var(--hud-lamp)] transition-[width] duration-500"
               style={{ width: `${percent ?? 0}%` }}
             />
           </span>
-          <span className="flex justify-between text-xs text-white/50">
+          <span className="flex justify-between text-xs text-[var(--hud-ash)]">
             <span>{syncPhaseLabel(job)}</span>
-            <span className="tabular-nums">{percent ?? 0}%</span>
+            <span className="tabular-nums">
+              {t("web.subtitles.sync.percent", { percent: percent ?? 0 })}
+            </span>
           </span>
         </div>
       )}
       {result && (
-        <p className={`mt-1 text-xs ${result.warning ? "text-amber-200/80" : "text-white/50"}`}>
+        <p
+          className={`mt-1 text-xs ${result.warning ? "text-amber-200" : "text-[var(--hud-ash)]"}`}
+        >
           {result.text}
         </p>
       )}
       {!entry.forbidden && canSync && !inProgress && !result && (
-        <p className="mt-1 text-xs text-white/40">
+        <p className="mt-1 text-xs text-[var(--hud-ash)]">
           {entry.state.source === "external"
-            ? "Matches the timing to the audio for everyone. The file itself isn't changed."
-            : "Matches the timing to the audio for everyone watching."}
+            ? t("web.subtitles.menu.syncHintExternal")
+            : t("web.subtitles.menu.syncHint")}
         </p>
       )}
       {entry.forbidden && (
-        <p className="mt-1 text-xs text-white/50">
-          This server doesn&apos;t allow changing subtitle timing.
+        <p className="mt-1 text-xs text-[var(--hud-ash)]">
+          {t("web.subtitles.menu.timingForbidden")}
         </p>
       )}
       {entry.error && (

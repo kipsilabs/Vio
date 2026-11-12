@@ -2,22 +2,13 @@ package handlers
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"io"
 	"log/slog"
-	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
-	"github.com/go-chi/chi/v5"
-
 	"github.com/Silo-Server/silo-server/internal/diagnostics"
-	"github.com/Silo-Server/silo-server/internal/httpstream"
 )
-
-const diagnosticsDownloadExpiry = 15 * time.Minute
 
 type AdminDiagnosticsService interface {
 	ListForAdmin(ctx context.Context, filters diagnostics.ListFilters) (diagnostics.ListResult, error)
@@ -27,6 +18,7 @@ type AdminDiagnosticsService interface {
 	DeleteReport(ctx context.Context, id string) (*diagnostics.Report, error)
 }
 
+<<<<<<< HEAD
 type adminDiagnosticsEffectiveTTL interface {
 	EffectiveReportDownloadTTL(requested time.Duration) time.Duration
 }
@@ -157,6 +149,8 @@ func (h *DiagnosticsHandler) HandleAdminDeleteReport(w http.ResponseWriter, r *h
 	w.WriteHeader(http.StatusNoContent)
 }
 
+=======
+>>>>>>> upstream/main
 func (h *DiagnosticsHandler) admin() (AdminDiagnosticsService, bool) {
 	if h.adminService == nil {
 		return nil, false
@@ -171,50 +165,6 @@ func (h *DiagnosticsHandler) diagnosticsLogger() *slog.Logger {
 	return h.logger
 }
 
-func (h *DiagnosticsHandler) auditDownload(r *http.Request, reportID string) {
-	h.diagnosticsLogger().InfoContext(r.Context(), "diagnostic report downloaded",
-		"component", "diagnostics",
-		"admin_user_id", currentAdminUserID(r),
-		"report_id", reportID,
-	)
-}
-
-func parseDiagnosticsReportListFilters(r *http.Request) (diagnostics.ListFilters, error) {
-	filters := diagnostics.ListFilters{
-		Platform:   strings.TrimSpace(r.URL.Query().Get("platform")),
-		ReportType: strings.TrimSpace(r.URL.Query().Get("report_type")),
-		Cursor:     strings.TrimSpace(r.URL.Query().Get("cursor")),
-		Limit:      parseLimit(r, 50),
-	}
-
-	userID, err := parseOptionalIntQuery(r, "user_id")
-	if err != nil {
-		return diagnostics.ListFilters{}, err
-	}
-	filters.UserID = userID
-
-	if from, err := parseTimeQuery(r, "from"); err != nil {
-		return diagnostics.ListFilters{}, err
-	} else {
-		filters.From = from
-	}
-	if to, err := parseTimeQuery(r, "to"); err != nil {
-		return diagnostics.ListFilters{}, err
-	} else {
-		filters.To = to
-	}
-
-	shortID := strings.TrimSpace(r.URL.Query().Get("short_id"))
-	if shortID != "" {
-		normalized, err := diagnostics.ParseShortID(shortID)
-		if err != nil {
-			return diagnostics.ListFilters{}, err
-		}
-		filters.ShortID = normalized
-	}
-	return filters, nil
-}
-
 func diagnosticsReportFilename(report *diagnostics.Report) string {
 	name := strings.TrimSpace(report.ShortID)
 	if name == "" {
@@ -224,46 +174,4 @@ func diagnosticsReportFilename(report *diagnostics.Report) string {
 		name = "report"
 	}
 	return "silo-diagnostics-" + name + ".tar.gz"
-}
-
-func diagnosticsProxyDownloadRequested(r *http.Request) bool {
-	raw := strings.TrimSpace(r.URL.Query().Get("proxy"))
-	return raw == "1" || strings.EqualFold(raw, "true") || strings.EqualFold(raw, "yes")
-}
-
-func diagnosticsEffectiveDownloadTTL(admin AdminDiagnosticsService, requested time.Duration) time.Duration {
-	ttl := requested
-	if effective, ok := admin.(adminDiagnosticsEffectiveTTL); ok {
-		ttl = effective.EffectiveReportDownloadTTL(requested)
-	}
-	if ttl <= 0 {
-		return requested
-	}
-	return ttl
-}
-
-func writeDiagnosticsAdminUnavailable(w http.ResponseWriter) {
-	writeError(w, http.StatusServiceUnavailable, "service_unavailable", "Diagnostics reports are not configured")
-}
-
-func writeDiagnosticsAdminError(w http.ResponseWriter, err error) {
-	var parseErr *requestParseError
-	switch {
-	case errors.As(err, &parseErr):
-		writeError(w, http.StatusBadRequest, "bad_request", parseErr.Error())
-	case errors.Is(err, diagnostics.ErrInvalidShortID):
-		writeError(w, http.StatusBadRequest, "bad_request", "Invalid short_id")
-	case errors.Is(err, diagnostics.ErrInvalidCursor):
-		writeError(w, http.StatusBadRequest, "bad_request", "Invalid cursor")
-	case errors.Is(err, diagnostics.ErrNotFound):
-		writeError(w, http.StatusNotFound, "not_found", "Diagnostic report not found")
-	case errors.Is(err, diagnostics.ErrReportNotReady):
-		writeError(w, http.StatusConflict, "not_ready", "Diagnostic report is not ready")
-	case errors.Is(err, diagnostics.ErrStorageUnavailable):
-		writeError(w, http.StatusServiceUnavailable, "storage_unavailable", "Diagnostics storage is not available")
-	case diagnostics.IsObjectNotFound(err):
-		writeError(w, http.StatusNotFound, "not_found", "Diagnostic report bundle not found")
-	default:
-		writeError(w, http.StatusInternalServerError, "internal_error", "Diagnostics report operation failed")
-	}
 }

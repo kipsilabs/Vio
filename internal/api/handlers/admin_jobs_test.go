@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,46 +10,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-chi/chi/v5"
-
 	"github.com/Silo-Server/silo-server/internal/adminjob"
-	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
-	"github.com/Silo-Server/silo-server/internal/auth"
-	"github.com/Silo-Server/silo-server/internal/cache"
 	evt "github.com/Silo-Server/silo-server/internal/events"
 	"github.com/Silo-Server/silo-server/internal/models"
-	"github.com/Silo-Server/silo-server/internal/notifications"
 )
 
-func TestStorageTransitionAdminJobResponsesAndSnapshotOmitPrivateDetails(t *testing.T) {
-	job := &models.AdminJob{
-		ID: "transition", JobType: adminjob.JobTypeStorageTransition, Status: adminjob.StatusFailed,
-		RequestedAt:    time.Now().UTC(),
-		RequestPayload: json.RawMessage(`{"target":"private request"}`),
-		ResultPayload:  json.RawMessage(`{"phase":"failed","verified_objects":7,"failure_category":"copy_failed","source_identity":"private source","skipped_keys":["private key"]}`),
-		Message:        "private object", ErrorMessage: "private endpoint", PublicURL: "private URL",
-	}
-	handler := NewAdminJobsHandler(&fakeAdminJobRepository{job: job}, nil)
-	response := httptest.NewRecorder()
-	handler.HandleList(response, httptest.NewRequest(http.MethodGet, "/admin/jobs", nil))
-	if response.Code != http.StatusOK {
-		t.Fatalf("list status=%d body=%s", response.Code, response.Body)
-	}
-	assertSafeStorageJobPayload(t, response.Body.String(), false)
-
-	snapshot, err := (&EventsHandler{jobs: handler}).snapshotForChannel(
-		httptest.NewRequest(http.MethodGet, "/api/v2/events/ws", nil), nil, "", evt.ChannelJobs,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	assertSafeStorageJobPayload(t, string(snapshot), true)
-	if job.ErrorMessage != "private endpoint" {
-		t.Fatal("outbound projection mutated the diagnostic job row")
-	}
-}
-
-func assertSafeStorageJobPayload(t *testing.T, payload string, snapshot bool) {
+func assertSafeStorageJobPayload(t *testing.T, payload string) {
 	t.Helper()
 	for _, private := range []string{"private request", "private source", "private key", "private object", "private endpoint", "private URL"} {
 		if strings.Contains(payload, private) {
@@ -58,15 +23,7 @@ func assertSafeStorageJobPayload(t *testing.T, payload string, snapshot bool) {
 		}
 	}
 	var jobs []adminJobResponse
-	var err error
-	if snapshot {
-		err = json.Unmarshal([]byte(payload), &jobs)
-	} else {
-		var page listAdminJobsResponse
-		err = json.Unmarshal([]byte(payload), &page)
-		jobs = page.Jobs
-	}
-	if err != nil || len(jobs) != 1 {
+	if err := json.Unmarshal([]byte(payload), &jobs); err != nil || len(jobs) != 1 {
 		t.Fatalf("storage job response=%s err=%v", payload, err)
 	}
 	job := jobs[0]
@@ -80,88 +37,30 @@ func assertSafeStorageJobPayload(t *testing.T, payload string, snapshot bool) {
 	}
 }
 
-// TestAdminJobReadFollowsActingAdmin: GET /admin/jobs/{id} sits outside the
-// admin group so item-refresh owners can poll their own jobs. An admin
-// account's profile that is not acting as the admin (a child profile) is held
-// to that owner rule; the acting admin reads any job in full.
-func TestAdminJobReadFollowsActingAdmin(t *testing.T) {
-	job := &models.AdminJob{ID: "export", JobType: adminjob.JobTypeCatalogExport, CreatedByUserID: 9,
-		RequestPayload: json.RawMessage(`{"target":"private request"}`), ErrorMessage: "private endpoint"}
-	handler := NewAdminJobsHandler(&fakeAdminJobRepository{job: job}, nil)
-	get := func(actingAdmin bool) *httptest.ResponseRecorder {
-		req := httptest.NewRequest(http.MethodGet, "/admin/jobs/export", nil)
-		rctx := chi.NewRouteContext()
-		rctx.URLParams.Add("id", "export")
-		ctx := context.WithValue(req.Context(), chi.RouteCtxKey, rctx)
-		ctx = apimw.SetClaims(ctx, &auth.Claims{UserID: 1, Role: models.RoleAdmin})
-		ctx = apimw.SetActingAdminDecider(ctx, func(context.Context, apimw.ActingAdminRequest) (bool, error) { return actingAdmin, nil })
-		rec := httptest.NewRecorder()
-		handler.HandleGet(rec, req.WithContext(ctx))
-		return rec
-	}
-	if rec := get(false); rec.Code != http.StatusForbidden {
-		t.Fatalf("child profile on an admin account: status %d, want 403: %s", rec.Code, rec.Body)
-	}
-	rec := get(true)
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "private endpoint") {
-		t.Fatalf("acting admin: status %d body %s", rec.Code, rec.Body)
-	}
-}
-
-func TestCanReadAdminJob_AdminCanReadAnyJob(t *testing.T) {
-	claims := &auth.Claims{UserID: 1, Role: "admin"}
-	job := &models.AdminJob{CreatedByUserID: 2, JobType: adminjob.JobTypeCatalogExport}
-	if !canReadAdminJob(claims, claims.Role == "admin", job) {
-		t.Fatal("admin should be allowed to read any job")
-	}
-}
-
-func TestCanReadAdminJob_CreatorCanReadOwnItemRefreshJob(t *testing.T) {
-	claims := &auth.Claims{UserID: 2, Role: "user"}
-	job := &models.AdminJob{CreatedByUserID: 2, JobType: adminjob.JobTypeItemRefresh}
-	if !canReadAdminJob(claims, claims.Role == "admin", job) {
-		t.Fatal("creator should be allowed to read own item refresh job")
-	}
-}
-
-func TestCanReadAdminJob_CreatorCannotReadOwnNonItemRefreshJob(t *testing.T) {
-	claims := &auth.Claims{UserID: 2, Role: "user"}
-	job := &models.AdminJob{CreatedByUserID: 2, JobType: adminjob.JobTypeCatalogExport}
-	if canReadAdminJob(claims, claims.Role == "admin", job) {
-		t.Fatal("non-admin should not read non-item-refresh jobs")
-	}
-}
-
-func TestCanReadAdminJob_OtherUserCannotReadItemRefreshJob(t *testing.T) {
-	claims := &auth.Claims{UserID: 3, Role: "user"}
-	job := &models.AdminJob{CreatedByUserID: 2, JobType: adminjob.JobTypeItemRefresh}
-	if canReadAdminJob(claims, claims.Role == "admin", job) {
-		t.Fatal("non-admin should not read another user's item refresh job")
-	}
-}
-
-func TestAdminJobToResponseFor_NonAdminSanitizesItemRefreshPayloads(t *testing.T) {
+// The realtime jobs snapshot projects a storage transition the way every
+// other job read does: outcome and counts, never the paths, endpoints, or
+// messages that name private storage.
+func TestStorageTransitionJobSnapshotOmitsPrivateDetails(t *testing.T) {
 	job := &models.AdminJob{
-		JobType:         adminjob.JobTypeItemRefresh,
-		CreatedByUserID: 2,
-		RequestPayload: json.RawMessage(
-			`{"requested_content_id":"item-1","scan_path":"/srv/media/private/movie"}`,
-		),
-		ResultPayload: json.RawMessage(
-			`{"requested_content_id":"item-1","detail_content_id":"item-2","scan_path":"/srv/media/private/movie","scan_result":{"New":1,"RootObservations":[{"RootPath":"/srv/media/private","SampleFilePath":"/srv/media/private/movie.mkv"}]}}`,
-		),
-		ErrorMessage: "scan scope: stat /srv/media/private/movie: permission denied",
-		PublicURL:    "https://example.test/public",
+		ID: "transition", JobType: adminjob.JobTypeStorageTransition, Status: adminjob.StatusFailed,
+		RequestedAt:    time.Now().UTC(),
+		RequestPayload: json.RawMessage(`{"target":"private request"}`),
+		ResultPayload:  json.RawMessage(`{"phase":"failed","verified_objects":7,"failure_category":"copy_failed","source_identity":"private source","skipped_keys":["private key"]}`),
+		Message:        "private object", ErrorMessage: "private endpoint", PublicURL: "private URL",
 	}
+	jobs := NewAdminJobsHandler(&fakeAdminJobRepository{job: job}, nil)
 
-	resp := adminJobToResponseFor(nil, job, nil, false)
-
-	if string(resp.RequestPayload) != `{}` {
-		t.Fatalf("RequestPayload = %s, want sanitized empty object", resp.RequestPayload)
+	snapshot, err := (&EventsHandler{jobs: jobs}).snapshotForChannel(
+		httptest.NewRequest(http.MethodGet, "/api/v2/events/ws", nil), nil, "", evt.ChannelJobs,
+	)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if resp.PublicURL != "" || resp.DownloadURL != "" || resp.DownloadExpiresAt != nil {
-		t.Fatalf("expected non-admin URLs to be stripped, got public=%q download=%q", resp.PublicURL, resp.DownloadURL)
+	assertSafeStorageJobPayload(t, string(snapshot))
+	if job.ErrorMessage != "private endpoint" {
+		t.Fatal("outbound projection mutated the diagnostic job row")
 	}
+<<<<<<< HEAD
 	if bytes.Contains(resp.ResultPayload, []byte("/srv/media")) ||
 		bytes.Contains(resp.ResultPayload, []byte("scan_path")) ||
 		bytes.Contains(resp.ResultPayload, []byte("RootObservations")) ||
@@ -294,6 +193,8 @@ func adminJobCancelRequest(id string) *http.Request {
 	routeCtx := chi.NewRouteContext()
 	routeCtx.URLParams.Add("id", id)
 	return req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, routeCtx))
+=======
+>>>>>>> upstream/main
 }
 
 type fakeAdminJobRepository struct {

@@ -213,6 +213,7 @@ func (r *WebhookRepository) InsertWithLimit(ctx context.Context, hook Webhook, m
 	return nil
 }
 
+<<<<<<< HEAD
 // Update persists the mutable fields of a webhook (name, URL, flags,
 // enabled state, secret) and bumps updated_at.
 func (r *WebhookRepository) Update(ctx context.Context, hook Webhook) error {
@@ -240,6 +241,8 @@ func (r *WebhookRepository) Update(ctx context.Context, hook Webhook) error {
 	return nil
 }
 
+=======
+>>>>>>> upstream/main
 // Delete removes an account profile's webhook; attempts cascade. Idempotent.
 func (r *WebhookRepository) Delete(ctx context.Context, userID int, profileID, id string) error {
 	_, err := r.pool.Exec(ctx,

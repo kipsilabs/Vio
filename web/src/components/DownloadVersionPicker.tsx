@@ -11,7 +11,11 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+<<<<<<< HEAD
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+=======
+import { useT } from "@/i18n";
+>>>>>>> upstream/main
 import { formatFileSize } from "@/lib/mediaFormat";
 import { StaleApiRequestContextError } from "@/api/client";
 import {
@@ -134,6 +138,7 @@ export default function DownloadVersionPicker({
   onStaleVersion,
   createTarget,
 }: DownloadVersionPickerProps) {
+  const t = useT();
   const sorted = sortByResolution(versions);
   const [downloading, setDownloading] = useState<number | null>(null);
   const [prepared, setPrepared] = useState<PreparedSelection | null>(null);
@@ -321,6 +326,7 @@ export default function DownloadVersionPicker({
       );
       if (isCurrent()) setPrepared({ version, download });
     } catch (error) {
+<<<<<<< HEAD
       // A superseded attempt (profile switch, closed dialog, replaced selection)
       // must not report into the replacement authority; every other failure
       // surfaces a concrete reason. A stale file_id also asks the caller to
@@ -333,6 +339,10 @@ export default function DownloadVersionPicker({
         }
         toast.error(message);
       }
+=======
+      if (isCurrent() && !(error instanceof StaleApiRequestContextError))
+        toast.error(t("web.downloads.versionPicker.startFailed"));
+>>>>>>> upstream/main
     } finally {
       if (isCurrent()) {
         active.current = null;
@@ -520,10 +530,12 @@ export default function DownloadVersionPicker({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-md">
         <DialogHeader>
-          <DialogTitle>Download{title ? `: ${title}` : ""}</DialogTitle>
-          <DialogDescription>
-            Choose a file to download. Make sure you have enough disk space.
-          </DialogDescription>
+          <DialogTitle>
+            {title
+              ? t("web.downloads.versionPicker.titleWithName", { title })
+              : t("web.downloads.versionPicker.title")}
+          </DialogTitle>
+          <DialogDescription>{t("web.downloads.versionPicker.description")}</DialogDescription>
         </DialogHeader>
 
         {capabilityLoading && (
@@ -602,9 +614,15 @@ export default function DownloadVersionPicker({
             <div className="flex gap-2">
               <Button
                 type="button"
+<<<<<<< HEAD
                 size="sm"
                 disabled={submitting}
                 onClick={() => void handlePrepareVirtual()}
+=======
+                onClick={() => handleDownload(version)}
+                disabled={downloading !== null}
+                className="border-border/50 bg-accent/30 hover:bg-accent/60 flex w-full items-center gap-3 rounded-xl border px-4 py-3 text-start transition-colors disabled:opacity-50"
+>>>>>>> upstream/main
               >
                 {submitting ? (
                   <Loader2 className="size-4 animate-spin" />
@@ -626,6 +644,7 @@ export default function DownloadVersionPicker({
           </div>
         )}
 
+<<<<<<< HEAD
         {preparing && (
           <div className="border-border/50 bg-accent/30 space-y-3 rounded-xl border px-4 py-3">
             <p className="text-foreground flex items-center gap-2 text-sm font-medium">
@@ -743,6 +762,12 @@ export default function DownloadVersionPicker({
 
         {offerableRows.length > 1 && (
           <p className="text-muted-foreground text-xs">Larger files require more storage space.</p>
+=======
+        {sorted.length > 1 && (
+          <p className="text-muted-foreground text-xs">
+            {t("web.downloads.versionPicker.sizeNote")}
+          </p>
+>>>>>>> upstream/main
         )}
       </DialogContent>
     </Dialog>

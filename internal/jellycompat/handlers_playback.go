@@ -389,6 +389,7 @@ type PlaybackHandler struct {
 	WatchScrobbler         PlaybackWatchScrobbler
 	StableIdentityResolver watchsync.ScrobbleIdentityResolver
 	terminalFallbackDelay  time.Duration
+	terminalRequestWait    time.Duration
 	// RecipeNodeStore hands a remote transcode's reconstruction recipe to the
 	// control-plane recipe store (Redis) so a dedicated transcode node that
 	// restarts can rebuild ffmpeg from it. The node-hop token is server-minted and
@@ -1380,8 +1381,29 @@ func NewPlaybackHandler(
 	if adder, ok := sessionMgr.(sessionExpirationHookAdder); ok {
 		adder.AddExpirationHook(h.handleExpiredSession)
 	}
+	if registrar, ok := sessionMgr.(compatAdminEndRegistrar); ok {
+		registrar.SetCompatAdminEnd(h.endUpstreamSessionAsAdmin)
+	}
 	return h
 }
+
+// compatAdminEndRegistrar and transportStopWatcher are probed for on the
+// session manager at run time, so a manager without them would switch an
+// administrator's end, or the abort of a progressive remux, off without a
+// sign. The assertions below fail the build if the production manager stops
+// providing either.
+type compatAdminEndRegistrar interface {
+	SetCompatAdminEnd(playback.CompatAdminEnd)
+}
+
+type transportStopWatcher interface {
+	WatchTransportStop(sessionID string) (<-chan struct{}, func())
+}
+
+var (
+	_ compatAdminEndRegistrar = (*playback.SessionManager)(nil)
+	_ transportStopWatcher    = (*playback.SessionManager)(nil)
+)
 
 func (h *PlaybackHandler) handleExpiredSession(session *playback.Session) {
 	if h == nil || h.tm == nil || session == nil {
@@ -1389,6 +1411,86 @@ func (h *PlaybackHandler) handleExpiredSession(session *playback.Session) {
 	}
 	sessionCopy := *session
 	go h.tm.CloseTranscodeSession(sessionCopy.ID, sessionCopy.TranscodeNodeURL)
+}
+
+// endUpstreamSessionAsAdmin ends the play attached to an upstream session an
+// administrator stopped or terminated, and reports whether it found one.
+// Stopping the native session does not end a Jellyfin play: the client's next
+// segment, manifest or progress request would rebuild the session from the
+// play's row and adopt the transcode, which runs in this handler's manager.
+// The row is retired first, so those requests answer not found on every
+// server sharing the store, and then the local transcode is closed.
+//
+// Only a play whose stream the server produces is ended this way. A
+// direct-play play keeps its row (adminEndRetiresPlay) and is not reported
+// as found.
+//
+// The native session is left to the administrator path that called this,
+// which stops it and records the play. A request already past its row lookup
+// can still rebuild what this ends, and no later request reaches what it
+// rebuilt. After the session stop, it registers the session and a transcode
+// again, and the idle sweep reaps the session and closes the transcode.
+// Between the close below and the session stop, it restarts the transcode
+// under a session that is then stopped, which no expiry hook reaches; the
+// second close, once the session has stopped, is for that transcode.
+func (h *PlaybackHandler) endUpstreamSessionAsAdmin(ctx context.Context, upstreamSessionID string) bool {
+	if h == nil || h.playbackStore == nil || upstreamSessionID == "" {
+		return false
+	}
+	retired, err := h.playbackStore.RetireUpstreamSession(upstreamSessionID)
+	if err != nil {
+		slog.WarnContext(ctx, "jellycompat could not retire a play an administrator ended; retrying", "component", "jellycompat",
+			"upstream_session_id", upstreamSessionID, "error", err)
+		h.scheduleCompatAdminEndRetry(upstreamSessionID, time.Now().Add(playback.MaxTokenTTL), 1)
+	}
+	if h.tm != nil {
+		h.tm.CloseTranscodeSession(upstreamSessionID, "")
+		if retired {
+			h.closeTranscodeOnceSessionStops(upstreamSessionID)
+		}
+	}
+	return retired
+}
+
+// compatAdminEndStopWait bounds the wait for the administrator path to stop
+// the native session of a play this handler retired. The stop follows the
+// retirement at once; the bound only ends the wait if it never comes.
+const compatAdminEndStopWait = 30 * time.Second
+
+// closeTranscodeOnceSessionStops closes the play's transcode again once its
+// native session has stopped, so a transcode a request started in between is
+// not left without a session to expire it. A session this server does not
+// hold counts as stopped, and closing an absent transcode does nothing.
+func (h *PlaybackHandler) closeTranscodeOnceSessionStops(upstreamSessionID string) {
+	watcher, ok := h.sessionMgr.(transportStopWatcher)
+	if !ok {
+		return
+	}
+	stopped, release := watcher.WatchTransportStop(upstreamSessionID)
+	go func() {
+		defer release()
+		select {
+		case <-stopped:
+		case <-time.After(compatAdminEndStopWait):
+		}
+		h.tm.CloseTranscodeSession(upstreamSessionID, "")
+	}()
+}
+
+// scheduleCompatAdminEndRetry repeats a retirement whose write failed until
+// the store accepts it, as scheduleCompatTerminalHide does for a client's
+// stop, so the other servers do not keep routing the play. It retries by
+// upstream session, not by play: a server that does not hold the play never
+// learned its id. deadline is the default lifetime of a play's row.
+func (h *PlaybackHandler) scheduleCompatAdminEndRetry(upstreamSessionID string, deadline time.Time, attempt int) {
+	time.AfterFunc(compatTerminalRetryDelay(attempt), func() {
+		if !time.Now().Before(deadline) {
+			return
+		}
+		if _, err := h.playbackStore.RetireUpstreamSession(upstreamSessionID); err != nil {
+			h.scheduleCompatAdminEndRetry(upstreamSessionID, deadline, attempt+1)
+		}
+	})
 }
 
 func (h *PlaybackHandler) segmentRetentionSeconds() int {
@@ -1508,6 +1610,9 @@ func (h *PlaybackHandler) buildProxyRedirectURL(
 		claims.RoutingExecution = string(noderouting.ExecutionProxy)
 		claims.RoutingExecutionNodeID = proxyNode.ID
 	case string(playback.PlayTranscode):
+		if targetAudioCodec == compatCopyCodec {
+			claims.CopyAudioCodec = compatSourceAudioCodec(source)
+		}
 		claims.RoutingWorkload = string(noderouting.WorkloadVideoTranscode)
 		if compatHLSCopiesVideo(source) {
 			claims.RoutingWorkload = string(noderouting.WorkloadRemux)
@@ -1894,6 +1999,7 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 	}
 	if !compatHLSTranscodesAudio(source) {
 		reqBody.TargetCodecAudio = compatCopyCodec
+		reqBody.CopyAudioCodec = compatSourceAudioCodec(source)
 	}
 	// Jellyfin-compat remote starts are not otherwise waited on. Let the node
 	// wait only when its live auto pipeline can fall back.
@@ -2055,6 +2161,17 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 		h.tm.StopRemoteTranscode(upstreamSessionID, transcodeNodeURL)
 		return fmt.Errorf("%w: %w", errRemoteTranscodeStartFailed, err)
 	}
+<<<<<<< HEAD
+=======
+	if err := transcodenode.ValidateCopyVideoMPEGTSAttestation(reqBody, nodeResponse); err != nil {
+		h.tm.StopRemoteTranscode(upstreamSessionID, transcodeNodeURL)
+		return fmt.Errorf("%w: %w", errRemoteTranscodeStartFailed, err)
+	}
+	if err := transcodenode.ValidateCopyAudioCodecAttestation(reqBody, nodeResponse); err != nil {
+		h.tm.StopRemoteTranscode(upstreamSessionID, transcodeNodeURL)
+		return fmt.Errorf("%w: %w", errRemoteTranscodeStartFailed, err)
+	}
+>>>>>>> upstream/main
 	if reqBody.ToneMapMode != "" && nodeResponse.ToneMapMode != reqBody.ToneMapMode {
 		h.tm.StopRemoteTranscode(upstreamSessionID, transcodeNodeURL)
 		err := errors.New("remote transcode node did not confirm tone-map mode")
@@ -2101,6 +2218,7 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 	// token of their own, so without a persisted recipe a node or central restart
 	// cannot rebuild ffmpeg and segment serves 404.
 	opts := playback.TranscodeOpts{
+<<<<<<< HEAD
 		SessionID:                        upstreamSessionID,
 		InputPath:                        reqBody.InputPath,
 		CanonicalInputPath:               strings.TrimSpace(source.VirtualSourceURI),
@@ -2130,6 +2248,36 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 		TargetAudioChannels:              reqBody.TargetAudioChannels,
 		TotalDuration:                    reqBody.TotalDuration,
 		ThrottleSeconds:                  reqBody.ThrottleSeconds,
+=======
+		SessionID:              upstreamSessionID,
+		InputPath:              reqBody.InputPath,
+		SourceVideoCodec:       reqBody.SourceVideoCodec,
+		SourceVideoProfile:     reqBody.SourceVideoProfile,
+		SourceVideoBitDepth:    reqBody.SourceVideoBitDepth,
+		SeekSeconds:            reqBody.SeekSeconds,
+		StreamOriginSeconds:    reqBody.StreamOriginSeconds,
+		CopySeekAnchorResolved: reqBody.CopySeekAnchorResolved,
+		StartSegmentNumber:     reqBody.StartSegmentNumber,
+		TargetCodecVideo:       reqBody.TargetCodecVideo,
+		TargetCodecAudio:       reqBody.TargetCodecAudio,
+		CopyAudioCodec:         reqBody.CopyAudioCodec,
+		TargetResolution:       reqBody.TargetResolution,
+		SubtitleBurnIn:         reqBody.SubtitleBurnIn,
+		SubtitleTrackIndex:     reqBody.SubtitleTrackIndex,
+		SubtitleCodec:          reqBody.SubtitleCodec,
+		TargetBitrateKbps:      reqBody.TargetBitrateKbps,
+		VideoSampleEntry:       reqBody.VideoSampleEntry,
+		VideoBitstreamFilter:   reqBody.VideoBitstreamFilter,
+		CopyVideoMPEGTS:        reqBody.CopyVideoMPEGTS,
+		KeyframePlaylist:       reqBody.KeyframePlaylist,
+		SegmentDuration:        reqBody.SegmentDuration,
+		AudioTrackIndex:        reqBody.AudioTrackIndex,
+		RequireAudioTrack:      reqBody.RequireAudioTrack,
+		SourceAudioChannels:    reqBody.SourceAudioChannels,
+		TargetAudioChannels:    reqBody.TargetAudioChannels,
+		TotalDuration:          reqBody.TotalDuration,
+		ThrottleSeconds:        reqBody.ThrottleSeconds,
+>>>>>>> upstream/main
 		// Record the decode path the node executed so a reconstruct keeps
 		// it; an older node omits the field.
 		SoftwareVideoDecode: reqBody.SoftwareVideoDecode || nodeResponse.SoftwareVideoDecode,
@@ -2756,7 +2904,7 @@ func (h *PlaybackHandler) HandlePlaybackInfo(w http.ResponseWriter, r *http.Requ
 		Version:  firstMediaBrowserAuthorizationValue(r, "Version"),
 		DeviceID: clientDeviceID,
 	}.Normalized()
-	h.playbackStore.PutNegotiated(PlaybackSession{
+	if err := h.playbackStore.PutNegotiated(PlaybackSession{
 		ID:                 playSessionID,
 		CompatToken:        session.Token,
 		ClientDeviceID:     clientDeviceID,
@@ -2770,7 +2918,12 @@ func (h *PlaybackHandler) HandlePlaybackInfo(w http.ResponseWriter, r *http.Requ
 		UserID:             session.PseudoUserID.String(),
 		InitialSeekSeconds: clampSeekSeconds(float64(req.StartTimeTicks)/10_000_000, sources),
 		MediaSources:       sources,
-	})
+	}); err != nil {
+		// Other replicas could not resolve this PlaySessionId; let the client
+		// retry the negotiation instead.
+		writeSessionCheckUnavailable(w)
+		return
+	}
 
 	writeJSON(w, http.StatusOK, playbackInfoResponseDTO{
 		PlaySessionID: playSessionID,
@@ -3251,7 +3404,8 @@ func buildMediaStreamsWithSelection(routeItemID, mediaSourceID string, version c
 	}
 
 	for index, track := range version.VideoTracks {
-		bitrate := track.Bitrate
+		// Silo stores bitrates in kbps; Jellyfin's BitRate is bits per second.
+		bitrate := track.Bitrate * 1000
 		if bitrate == 0 && version.Bitrate > 0 {
 			bitrate = version.Bitrate * 1000
 		}
@@ -3319,8 +3473,9 @@ func buildMediaStreamsWithSelection(routeItemID, mediaSourceID string, version c
 			SupportsExternalStream: false,
 			Profile:                track.Profile,
 			AudioSpatialFormat:     compatAudioSpatialFormat(track.Profile),
+			ChannelLayout:          compatChannelLayout(track.Layout),
 			Channels:               track.Channels,
-			BitRate:                track.Bitrate,
+			BitRate:                track.Bitrate * 1000,
 		})
 	}
 
@@ -3851,6 +4006,14 @@ func audioCodecDisplayName(codec string) string {
 	default:
 		return strings.ToUpper(strings.TrimSpace(codec))
 	}
+}
+
+// compatChannelLayout trims ffprobe's layout variant the way Jellyfin's
+// ParseChannelLayout does ("5.1(side)" becomes "5.1"); clients match their
+// channel badges against that form.
+func compatChannelLayout(layout string) string {
+	base, _, _ := strings.Cut(layout, "(")
+	return base
 }
 
 func audioChannelsDisplayName(channels int) string {

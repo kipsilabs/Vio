@@ -155,6 +155,7 @@ export const FEATURE_OUTPUT_CHANGE_V3 = "output_change_v1";
 export const FEATURE_PLAN_INVALIDATED_V3 = "plan_invalidated_v1";
 
 /**
+<<<<<<< HEAD
  * The client can answer the `default_audio_reconciliation` withdrawal without
  * failure semantics, and can name that withdrawal as the reason for a replan.
  *
@@ -196,6 +197,14 @@ export const FEATURE_INVENTORY_UPDATED_V3 = "inventory_updated_event_v1";
  * rejected, so advertising it is a promise to keep the loading state.
  */
 export const FEATURE_DEFERRED_TRACK_INVENTORY_V3 = "deferred_track_inventory_v1";
+=======
+ * `progressive` delivery feature: the client reopens a progressive remux at its
+ * current position when the stream refuses a mid-stream range. The server then
+ * answers such a range 409 instead of streaming from the origin again, which
+ * the media element would read again from byte zero.
+ */
+export const FEATURE_PROGRESSIVE_RANGE_REFUSAL_V3 = "progressive_range_refusal_v1";
+>>>>>>> upstream/main
 
 /**
  * `original_http` validated claim: the client maps `selected_tracks.audio.index`
@@ -655,6 +664,8 @@ export interface SubtitleInventoryItemV3 {
    * downloaded tracks whose timing the server can correct.
    */
   sync_key?: string;
+  /** Stored row identity, independent of timing support and delivery. */
+  stored_subtitle_id?: number;
 }
 
 export interface SubtitleDecisionV3 {

@@ -219,7 +219,7 @@ func ResolveSubtitlePolicyV3(file *models.MediaFile, request StartRequestV3, tra
 			DownloadedSubtitleID: entry.DownloadedSubtitleID,
 		}
 	}
-	return subtitleTerminalV3("subtitle_conversion_unsupported", fmt.Sprintf("Subtitle format %s cannot meet the selected fidelity policy.", codec))
+	return subtitleTerminalV3(TerminalSubtitleConversionUnsupportedV3, fmt.Sprintf("Subtitle format %s cannot meet the selected fidelity policy.", codec))
 }
 
 // subtitleEntryAtCombinedIndexV3 resolves a published combined ordinal to the

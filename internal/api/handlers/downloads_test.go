@@ -3,7 +3,6 @@ package handlers
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -14,8 +13,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/go-chi/chi/v5"
 
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
 	"github.com/Silo-Server/silo-server/internal/auth"
@@ -208,12 +205,12 @@ func (f *fakeDownloadService) ServeFile(_ context.Context, w http.ResponseWriter
 	return nil
 }
 
-func (f *fakeDownloadService) List(_ context.Context, userID int, profileID, deviceID string) ([]*downloads.Download, error) {
+func (f *fakeDownloadService) List(_ context.Context, userID int, profileID, deviceID string, _ catalog.AccessFilter) ([]*downloads.Download, error) {
 	f.gotList = identityCall{userID: userID, profileID: profileID, deviceID: deviceID}
 	return f.list, f.listErr
 }
 
-func (f *fakeDownloadService) Delete(_ context.Context, userID int, profileID, deviceID, downloadID string) error {
+func (f *fakeDownloadService) Delete(_ context.Context, userID int, profileID, deviceID, downloadID string, _ catalog.AccessFilter) error {
 	f.gotDelete = identityCall{userID, profileID, deviceID, downloadID}
 	return f.deleteErr
 }
@@ -286,6 +283,7 @@ func downloadTestRequest(method, target string, body []byte, userID int, profile
 	return r
 }
 
+<<<<<<< HEAD
 func withChiID(r *http.Request, id string) *http.Request {
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add("id", id)
@@ -499,6 +497,8 @@ func TestManagedPatchRequiresDeviceHeader(t *testing.T) {
 	}
 }
 
+=======
+>>>>>>> upstream/main
 // A transfer that fails after the file's headers and first bytes went out
 // aborts the response instead of appending a JSON 500, and logs only when the
 // failure is the server's: a client that left has canceled the request.
@@ -721,6 +721,14 @@ func (openItemAccess) EnsureAccessible(context.Context, string, catalog.AccessFi
 	return nil
 }
 
+func (openItemAccess) EnsureAccessibleIDs(_ context.Context, ids []string, _ catalog.AccessFilter) (map[string]bool, error) {
+	allowed := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		allowed[id] = true
+	}
+	return allowed, nil
+}
+
 type countingLinkIssuer struct{ calls int }
 
 func (i *countingLinkIssuer) GenerateDirectDownloadLinkToken(int, string, string, string, *int, int) (string, time.Time, error) {
@@ -888,80 +896,143 @@ func TestProxyPreflightCachesReachabilityByNodeAndPath(t *testing.T) {
 	}
 }
 
-func withChiParams(r *http.Request, params map[string]string) *http.Request {
-	rctx := chi.NewRouteContext()
-	for k, v := range params {
-		rctx.URLParams.Add(k, v)
+// TestServeDownloadFileRedirectsManagedArtifactsThroughProxies covers the
+// managed-download delegate path: an authorized artifact is redirected to a
+// healthy proxy with a token scoped to it, a node-local artifact only through
+// a proxy in the origin node's group, and the server serves the file itself
+// when the locator is incomplete or the proxy refuses the token.
+func TestServeDownloadFileRedirectsManagedArtifactsThroughProxies(t *testing.T) { //nolint:funlen // ported unchanged from the retired v1 handler test
+	const secret = "download-proxy-secret"
+	remoteTarget := &downloads.FileTarget{
+		DownloadID:                   "dl-remote",
+		ArtifactID:                   "artifact-row",
+		Path:                         "/prepared/Movie Final.mp4",
+		MediaFileID:                  42,
+		OriginNodeURL:                "http://transcode-b.internal:8096",
+		OriginNodeGroup:              "host-b",
+		OriginArtifactID:             "artifact-remote",
+		ExpectedArtifactSize:         123,
+		ExpectedExecutionFingerprint: "recipe-fingerprint",
+		ProxyEligible:                true,
 	}
-	return r.WithContext(context.WithValue(r.Context(), chi.RouteCtxKey, rctx))
-}
-
-// TestManagedAssetsDenyRestrictedProfile is the Phase 2 acceptance test: a
-// profile denied content access (the service returns ErrItemNotFound) gets a
-// 404 from manifest, artwork, and subtitle — a download id never reveals
-// out-of-scope content.
-func TestManagedAssetsDenyRestrictedProfile(t *testing.T) {
-	t.Run("manifest", func(t *testing.T) {
-		h := NewDownloadHandler(&fakeDownloadService{manifestErr: catalog.ErrItemNotFound})
-		req := withChiID(downloadTestRequest(http.MethodGet, "/downloads/dl1/manifest", nil, 7, "child", "devC"), "dl1")
-		rec := httptest.NewRecorder()
-		h.HandleManifest(rec, req)
-		if rec.Code != http.StatusNotFound {
-			t.Fatalf("manifest status = %d, want 404", rec.Code)
-		}
-	})
-	t.Run("artwork", func(t *testing.T) {
-		h := NewDownloadHandler(&fakeDownloadService{artworkErr: catalog.ErrItemNotFound})
-		req := withChiParams(downloadTestRequest(http.MethodGet, "/downloads/dl1/artwork/poster", nil, 7, "child", "devC"),
-			map[string]string{"id": "dl1", "kind": "poster"})
-		rec := httptest.NewRecorder()
-		h.HandleArtwork(rec, req)
-		if rec.Code != http.StatusNotFound {
-			t.Fatalf("artwork status = %d, want 404", rec.Code)
-		}
-	})
-	t.Run("subtitle", func(t *testing.T) {
-		h := NewDownloadHandler(&fakeDownloadService{subtitleErr: catalog.ErrItemNotFound})
-		req := withChiParams(downloadTestRequest(http.MethodGet, "/downloads/dl1/subtitles/external:0", nil, 7, "child", "devC"),
-			map[string]string{"id": "dl1", "ref": "external:0"})
-		rec := httptest.NewRecorder()
-		h.HandleSubtitle(rec, req)
-		if rec.Code != http.StatusNotFound {
-			t.Fatalf("subtitle status = %d, want 404", rec.Code)
-		}
-	})
-}
-
-func intPtr(i int) *int { return &i }
-
-// TestHandleCreateDownloadSpecialsSeason pins the Specials boundary: season 0
-// must route to CreateSeason(0), not silently broaden to a full-series
-// download, and negative seasons are rejected.
-func TestHandleCreateDownloadSpecialsSeason(t *testing.T) {
-	svc := &fakeDownloadService{
-		season:   []*downloads.Download{{ID: "dl1", ContentID: "s1", EpisodeID: "e1", Format: downloads.FormatOriginal}},
-		seasonID: "batch1",
+	cases := []struct {
+		name string
+		// target is the resolved managed file; proxies lists each proxy's group
+		// ("" for none) and the status its preflight answers.
+		target      *downloads.FileTarget
+		groups      []string
+		statuses    []int
+		wantProxy   int // index of the proxy redirected to; -1 serves locally
+		wantClaims  func(streamtoken.Claims) bool
+		wantUnusedA bool // the first proxy must never be contacted
+	}{
+		{
+			name:      "central artifact redirects to the healthy proxy",
+			target:    &downloads.FileTarget{Path: "/artifacts/movie.mp4", DownloadID: "dl1", MediaFileID: 42, ProxyEligible: true},
+			groups:    []string{""},
+			statuses:  []int{http.StatusOK},
+			wantProxy: 0,
+			wantClaims: func(c streamtoken.Claims) bool {
+				return c.PlayMethod == streamtoken.PlayMethodDownload && c.MediaPath == "/artifacts/movie.mp4" &&
+					c.UserID == 7 && c.ProfileID == "pA"
+			},
+		},
+		{
+			name:      "node-local artifact goes through the origin group's proxy",
+			target:    remoteTarget,
+			groups:    []string{"host-a", "host-b"},
+			statuses:  []int{http.StatusOK, http.StatusOK},
+			wantProxy: 1,
+			wantClaims: func(c streamtoken.Claims) bool {
+				// The proxy fetches from the origin node; it never learns a
+				// local media path.
+				return c.MediaPath == "" && c.DownloadFilename == "Movie Final.mp4" &&
+					c.TranscodeNode == "http://transcode-b.internal:8096" &&
+					c.PlayMethod == streamtoken.PlayMethodToneMapDownload &&
+					c.DownloadArtifactID == "artifact-remote" && c.DownloadArtifactRowID == "artifact-row" &&
+					c.DownloadArtifactSize == 123 && c.DownloadExecutionFingerprint == "recipe-fingerprint" &&
+					c.UserID == 7 && c.ProfileID == "pA"
+			},
+			wantUnusedA: true,
+		},
+		{
+			name:      "remote locator without an origin URL serves locally",
+			target:    &downloads.FileTarget{DownloadID: "dl-incomplete", OriginArtifactID: "artifact-without-origin", ProxyEligible: true},
+			groups:    []string{""},
+			statuses:  []int{http.StatusOK},
+			wantProxy: -1,
+		},
+		{
+			name: "proxy that rejects the token falls back to local serving",
+			target: &downloads.FileTarget{
+				DownloadID: "dl-attested", ArtifactID: "artifact-row", Path: "/prepared/movie.mp4", MediaFileID: 42,
+				OriginNodeURL: "http://transcode.internal", OriginArtifactID: "artifact-remote",
+				ExpectedArtifactSize: 123, ExpectedExecutionFingerprint: "fingerprint", ProxyEligible: true,
+			},
+			groups:    []string{""},
+			statuses:  []int{http.StatusUnauthorized},
+			wantProxy: -1,
+		},
 	}
-	h := NewDownloadHandler(svc)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			hits := make([]int, len(tc.groups))
+			urls := make([]string, len(tc.groups))
+			nodes := make([]*nodepool.Node, len(tc.groups))
+			for i := range tc.groups {
+				proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					hits[i]++
+					if r.Method != http.MethodHead {
+						t.Errorf("proxy %d preflight method = %s, want HEAD", i, r.Method)
+					}
+					w.WriteHeader(tc.statuses[i])
+				}))
+				t.Cleanup(proxy.Close)
+				urls[i] = proxy.URL
+				nodes[i] = &nodepool.Node{URL: proxy.URL, Enabled: true, Healthy: true}
+				if tc.groups[i] != "" {
+					nodes[i].Group = &tc.groups[i]
+				}
+			}
+			proxies := nodepool.NewProxyPool()
+			proxies.SetNodes(nodes)
+			svc := &proxyDownloadService{fakeDownloadService: &fakeDownloadService{}, managedTarget: tc.target}
+			h := NewDownloadHandler(svc)
+			h.SetProxyDelivery(nodepool.NewPlanner(proxies, nodepool.NewTranscodePool()), func() string { return secret })
 
-	body, _ := json.Marshal(downloadRequest{ContentID: "s1", Series: true, Season: intPtr(0)})
-	rec := httptest.NewRecorder()
-	h.HandleCreateDownload(rec, downloadTestRequest(http.MethodPost, "/downloads", body, 7, "pA", "devA"))
+			rec := httptest.NewRecorder()
+			req := downloadTestRequest(http.MethodGet, "/downloads/"+tc.target.DownloadID+"/file", nil, 7, "pA", "devA")
+			if err := h.ServeDownloadFile(rec, req, tc.target.DownloadID, true); err != nil {
+				t.Fatalf("ServeDownloadFile: %v", err)
+			}
 
-	if rec.Code != http.StatusAccepted {
-		t.Fatalf("status = %d, want 202 (body: %s)", rec.Code, rec.Body.String())
-	}
-	if !svc.seasonCalled || svc.gotSeasonNum != 0 {
-		t.Fatalf("seasonCalled=%v num=%d, want CreateSeason(0)", svc.seasonCalled, svc.gotSeasonNum)
-	}
-	if svc.gotSeriesReq.ContentID != "" {
-		t.Fatal("season 0 must not fall through to CreateSeries")
-	}
-
-	rec = httptest.NewRecorder()
-	body, _ = json.Marshal(downloadRequest{ContentID: "s1", Series: true, Season: intPtr(-1)})
-	h.HandleCreateDownload(rec, downloadTestRequest(http.MethodPost, "/downloads", body, 7, "pA", "devA"))
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("negative season status = %d, want 400", rec.Code)
+			if tc.wantProxy < 0 {
+				if rec.Code != http.StatusOK || rec.Body.String() != "served" {
+					t.Fatalf("response = %d %q, want the local serve", rec.Code, rec.Body.String())
+				}
+				return
+			}
+			if rec.Code != http.StatusTemporaryRedirect {
+				t.Fatalf("status = %d, want 307 (body: %s)", rec.Code, rec.Body.String())
+			}
+			prefix := urls[tc.wantProxy] + "/downloads/file/"
+			location := rec.Header().Get("Location")
+			if !strings.HasPrefix(location, prefix) {
+				t.Fatalf("Location = %q, want proxy %d (%s)", location, tc.wantProxy, prefix)
+			}
+			claims, err := streamtoken.Verify(strings.TrimPrefix(location, prefix), secret)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !tc.wantClaims(*claims) {
+				t.Fatalf("claims = %+v", claims)
+			}
+			if svc.gotServe != (identityCall{}) {
+				t.Fatalf("local serve was called after a redirect: %+v", svc.gotServe)
+			}
+			if tc.wantUnusedA && hits[0] != 0 {
+				t.Fatalf("wrong-group proxy contacted %d times", hits[0])
+			}
+		})
 	}
 }

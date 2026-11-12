@@ -2,17 +2,10 @@ package handlers
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
-	"strconv"
 	"time"
 
-	"github.com/go-chi/chi/v5"
-
-	"github.com/Silo-Server/silo-server/internal/access"
-	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
 	"github.com/Silo-Server/silo-server/internal/auth"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/userstore"
@@ -42,13 +35,11 @@ type APIKeyHandler struct {
 	// the server Owner's account. Minting a key for another account always
 	// applies the same rule, in the store, under the accounts' locks.
 	Owners ownerTargetChecker
-	// Stores and ProfileTokens hold personal key creation to the household
-	// manager (canManageHouseholdAs). A key skips profile PIN verification, so
-	// minting one from a child profile would hand that profile every other
-	// profile on the account. Without Stores creation fails closed;
-	// ProfileTokens verifies a PIN-locked primary on v1.
-	Stores        userstore.UserStoreProvider
-	ProfileTokens *access.ProfileTokenService
+	// Stores holds personal key creation to the household manager
+	// (canManageHouseholdAs). A key skips profile PIN verification, so minting
+	// one from a child profile would hand that profile every other profile on
+	// the account. Without Stores creation fails closed.
+	Stores userstore.UserStoreProvider
 }
 
 // MayCreatePersonalAPIKey reports whether the caller acting as
@@ -96,22 +87,6 @@ func NewAPIKeyHandler(repo APIKeyStore) *APIKeyHandler {
 
 // --- Request/Response types ---
 
-type createAPIKeyRequest struct {
-	Label  string   `json:"label"`
-	Scopes []string `json:"scopes,omitempty"`
-}
-
-type apiKeyResponse struct {
-	ID         int64      `json:"id"`
-	UserID     int        `json:"user_id"`
-	Label      string     `json:"label"`
-	Key        string     `json:"key"`
-	RateTier   string     `json:"rate_tier"`
-	Scopes     []string   `json:"scopes"`
-	CreatedAt  time.Time  `json:"created_at"`
-	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
-}
-
 // apiKeyScopesOrEmpty renders a key's scopes for JSON. An unscoped key stores
 // NULL/nil scopes; the API always reports an array so clients never have to
 // distinguish null from empty.
@@ -120,19 +95,6 @@ func apiKeyScopesOrEmpty(scopes []string) []string {
 		return []string{}
 	}
 	return scopes
-}
-
-func toAPIKeyResponse(k *models.APIKey) apiKeyResponse {
-	return apiKeyResponse{
-		ID:         k.ID,
-		UserID:     k.UserID,
-		Label:      k.Label,
-		Key:        k.Key,
-		RateTier:   k.RateTier,
-		Scopes:     apiKeyScopesOrEmpty(k.Scopes),
-		CreatedAt:  k.CreatedAt,
-		LastUsedAt: k.LastUsedAt,
-	}
 }
 
 // APIKeyConfiguration is the canonical editor representation. Usage and owner
@@ -169,6 +131,7 @@ func adminAPIKeyListItemOf(k *models.APIKeyMetadataWithUser) AdminAPIKeyListItem
 	return AdminAPIKeyListItem{APIKeyListItem: apiKeyListItemOf(&k.APIKeyMetadataWithUsage), Username: k.Username}
 }
 
+<<<<<<< HEAD
 type adminCreateAPIKeyRequest struct {
 	Label  string   `json:"label"`
 	UserID *int     `json:"user_id,omitempty"`
@@ -452,6 +415,8 @@ func (h *APIKeyHandler) HandleAdminCreateAPIKey(w http.ResponseWriter, r *http.R
 	writeJSON(w, http.StatusCreated, toAPIKeyResponse(key))
 }
 
+=======
+>>>>>>> upstream/main
 // These application methods are shared by the canonical admin editor. HTTP
 // authentication and precondition parsing stay at the transport boundary.
 var ErrInvalidAPIKeyCreation = errors.New("invalid API key creation input")

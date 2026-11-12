@@ -3,17 +3,11 @@ package handlers
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"net/http"
-	"strconv"
 	"time"
 
-	"github.com/go-chi/chi/v5"
-
 	"github.com/Silo-Server/silo-server/internal/adminjob"
-	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
 	"github.com/Silo-Server/silo-server/internal/artworkurl"
-	"github.com/Silo-Server/silo-server/internal/auth"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/notifications"
 )
@@ -70,6 +64,7 @@ type adminJobResponse struct {
 	DownloadExpiresAt *time.Time      `json:"download_expires_at,omitempty"`
 }
 
+<<<<<<< HEAD
 type listAdminJobsResponse struct {
 	Jobs []adminJobResponse `json:"jobs"`
 }
@@ -238,6 +233,8 @@ func (h *AdminJobsHandler) requestRunningCancellation(w http.ResponseWriter, r *
 	writeJSON(w, http.StatusAccepted, adminJobToResponse(r, updated, h.store))
 }
 
+=======
+>>>>>>> upstream/main
 func adminJobToResponse(r *http.Request, job *models.AdminJob, store AdminJobArtifactStore) adminJobResponse {
 	job = notifications.SafeStorageTransitionJob(job)
 	resp := adminJobResponse{
@@ -273,138 +270,9 @@ func adminJobToResponse(r *http.Request, job *models.AdminJob, store AdminJobArt
 	return resp
 }
 
-// adminJobToResponseFor renders a job for its reader. Only an acting admin
-// (apimw.ActingAdmin) sees the payloads, errors and artifact URLs; anyone
-// else, a child profile on an admin's account included, gets the sanitized
-// form.
-func adminJobToResponseFor(
-	r *http.Request,
-	job *models.AdminJob,
-	store AdminJobArtifactStore,
-	actingAdmin bool,
-) adminJobResponse {
-	response := adminJobToResponse(r, job, store)
-	sanitizeAdminJobResponse(&response, actingAdmin)
-	return response
-}
-
-func sanitizeAdminJobResponse(response *adminJobResponse, actingAdmin bool) {
-	if response == nil || actingAdmin {
-		return
-	}
-	response.RequestPayload = json.RawMessage(`{}`)
-	response.ResultPayload = sanitizeNonAdminAdminJobResultPayload(response.JobType, response.ResultPayload)
-	response.ErrorMessage = ""
-	response.PublicURL = ""
-	response.DownloadURL = ""
-	response.DownloadExpiresAt = nil
-}
-
-func sanitizeNonAdminAdminJobResultPayload(jobType string, payload json.RawMessage) json.RawMessage {
-	if jobType != adminjob.JobTypeItemRefresh {
-		return json.RawMessage(`{}`)
-	}
-
-	var raw map[string]json.RawMessage
-	if len(payload) == 0 || json.Unmarshal(payload, &raw) != nil {
-		return json.RawMessage(`{}`)
-	}
-
-	safe := make(map[string]json.RawMessage)
-	copyJSONFields(safe, raw,
-		"requested_content_id",
-		"refresh_content_id",
-		"detail_content_id",
-		"matched_files",
-	)
-	if scanPayload, ok := raw["scan_result"]; ok {
-		if scanSummary := sanitizeScanResultPayload(scanPayload); len(scanSummary) > 0 {
-			safe["scan_result"] = scanSummary
-		}
-	}
-	if len(safe) == 0 {
-		return json.RawMessage(`{}`)
-	}
-	data, err := json.Marshal(safe)
-	if err != nil {
-		return json.RawMessage(`{}`)
-	}
-	return data
-}
-
-func sanitizeScanResultPayload(payload json.RawMessage) json.RawMessage {
-	var raw map[string]json.RawMessage
-	if len(payload) == 0 || json.Unmarshal(payload, &raw) != nil {
-		return nil
-	}
-	safe := make(map[string]json.RawMessage)
-	copyJSONFields(safe, raw,
-		"New",
-		"Updated",
-		"Unchanged",
-		"Missing",
-		"FilesDeleted",
-		"MembershipsRemoved",
-		"ItemsDeleted",
-		"Errors",
-		"EmptyRootGuarded",
-	)
-	if len(safe) == 0 {
-		return nil
-	}
-	data, err := json.Marshal(safe)
-	if err != nil {
-		return nil
-	}
-	return data
-}
-
-func copyJSONFields(dst, src map[string]json.RawMessage, keys ...string) {
-	for _, key := range keys {
-		if value, ok := src[key]; ok && len(value) > 0 {
-			dst[key] = value
-		}
-	}
-}
-
-func writeAdminJobConflict(w http.ResponseWriter, message string, job *models.AdminJob, handler *AdminJobsHandler, r *http.Request) {
-	resp := adminJobConflictResponse{
-		Error:   "conflict",
-		Message: message,
-	}
-	if job != nil {
-		resp.ActiveJobID = job.ID
-		response := adminJobToResponse(r, job, handler.store)
-		resp.ActiveJob = &response
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusConflict)
-	_ = json.NewEncoder(w).Encode(resp)
-}
-
 func ensureJSONPayload(data json.RawMessage) json.RawMessage {
 	if len(data) == 0 {
 		return json.RawMessage(`{}`)
 	}
 	return data
-}
-
-func currentAdminUserID(r *http.Request) int {
-	claims := apimw.GetClaims(r.Context())
-	if claims == nil {
-		return 0
-	}
-	return claims.UserID
-}
-
-// canReadAdminJob reports whether the caller may read job: an acting admin
-// reads any job, anyone else only an item refresh their account started.
-func canReadAdminJob(claims *auth.Claims, actingAdmin bool, job *models.AdminJob) bool {
-	if claims == nil || job == nil {
-		return false
-	}
-	if actingAdmin {
-		return true
-	}
-	return job.JobType == adminjob.JobTypeItemRefresh && job.CreatedByUserID == claims.UserID
 }

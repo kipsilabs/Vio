@@ -13,6 +13,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { useAppLanguage, useT } from "@/i18n";
 import { buildDetailLine, buildQualitySummary, sortByResolution } from "./VersionFlyout";
 import { buildMediaSpecSections, type MediaSpecSection } from "./mediaSpecSections";
 import { buildVersionFallbackTitle } from "./versionFormatUtils";
@@ -27,6 +28,7 @@ interface MediaInfoDialogProps {
 }
 
 function VersionSpecSheet({ sections }: { sections: MediaSpecSection[] }) {
+  useAppLanguage();
   return (
     <div className="space-y-4">
       {sections.map((section) => (
@@ -41,7 +43,7 @@ function VersionSpecSheet({ sections }: { sections: MediaSpecSection[] }) {
                 className="flex items-baseline justify-between gap-4 px-3 py-1.5 text-sm"
               >
                 <span className="text-muted-foreground shrink-0">{row.label}</span>
-                <span className="text-foreground min-w-0 text-right break-all">{row.value}</span>
+                <span className="text-foreground min-w-0 text-end break-all">{row.value}</span>
               </div>
             ))}
           </div>
@@ -58,6 +60,7 @@ export default function MediaInfoDialog({
   title,
   initialFileId,
 }: MediaInfoDialogProps) {
+  const t = useT();
   const sorted = useMemo(() => sortByResolution(versions), [versions]);
   const initialValue = useMemo(() => {
     const target = sorted.find((version) => version.file_id === initialFileId) ?? sorted[0];
@@ -69,17 +72,24 @@ export default function MediaInfoDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="flex max-w-2xl flex-col overflow-hidden sm:max-w-2xl">
         <DialogHeader className="min-w-0">
-          <DialogTitle>Media Info</DialogTitle>
+          <DialogTitle>{t("web.detail.mediaInfo.title")}</DialogTitle>
           <DialogDescription className="truncate">{title}</DialogDescription>
         </DialogHeader>
 
-        <div className="overlay-scroll min-h-0 min-w-0 flex-1 overflow-x-hidden overflow-y-auto pr-1">
+        <div className="overlay-scroll min-h-0 min-w-0 flex-1 overflow-x-hidden overflow-y-auto pe-1">
           {onlyVersion ? (
             <VersionSpecSheet sections={buildMediaSpecSections(onlyVersion)} />
           ) : (
             // DialogContent unmounts when closed, so defaultValue re-targets on each open.
             <Accordion type="multiple" defaultValue={initialValue ? [initialValue] : []}>
               {sorted.map((version, index) => {
+<<<<<<< HEAD
+=======
+                const summary =
+                  buildQualitySummary(version) ||
+                  version.file_name ||
+                  t("web.detail.versions.numbered", { number: index + 1 });
+>>>>>>> upstream/main
                 const detail = buildDetailLine(version);
                 // The file-name fallback is deduped against the detail line:
                 // the structured size and a repeated year are shown once, on
@@ -117,7 +127,7 @@ export default function MediaInfoDialog({
           )}
           {sorted.length === 0 && (
             <div className="text-muted-foreground rounded-xl border border-dashed px-4 py-6 text-center text-sm">
-              No media files for this item.
+              {t("web.detail.mediaInfo.noFiles")}
             </div>
           )}
         </div>

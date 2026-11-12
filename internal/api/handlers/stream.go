@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -2101,6 +2100,13 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 		}
 
 	case playback.PlayRemux:
+		// A refused mid-stream range leaves the session as it is: the client
+		// reopens it at its current position. Only the /api/v2 stream route
+		// opts in to the refusal.
+		if isNativeAPIV2(r.Context()) && playback.RefusesRemuxRange(r) {
+			writeError(w, http.StatusConflict, "conflict", playback.RemuxRangeRefusedMessage)
+			return
+		}
 		if setter, ok := h.sessionMgr.(interface {
 			SetOutputFormat(string, string, string) error
 		}); ok {
@@ -2667,15 +2673,13 @@ func subtitleSidecarFormatSupported(codec, requestedFormat string, embeddedPGS b
 }
 
 // servesOriginalSubRip reports whether a sidecar request is answered with the
-// original SRT bytes: only a SubRip track requested through /api/v2 as .srt
-// with original=1, which is the URL subrip_sidecar_v1 publishes. Every other
-// request for a SubRip track, including any on the frozen /api/v1 route, keeps
-// the historical WebVTT response.
+// original SRT bytes: only a SubRip track requested as .srt with original=1,
+// which is the URL subrip_sidecar_v1 publishes. Every other request for a
+// SubRip track keeps the WebVTT response.
 func servesOriginalSubRip(r *http.Request, codec, requestedFormat string) bool {
 	return playback.IsSubRip(codec) &&
 		strings.EqualFold(strings.TrimSpace(requestedFormat), subtitleFormatSRT) &&
-		r.URL.Query().Get(playback.SubtitleOriginalParamV3) == "1" &&
-		isNativeAPIV2(r.Context())
+		r.URL.Query().Get(playback.SubtitleOriginalParamV3) == "1"
 }
 
 // serveSubtitleVTT writes a sidecar or downloaded subtitle as WebVTT. Files
@@ -2924,6 +2928,7 @@ func (h *StreamHandler) SubtitleFontsWithFallback(ctx context.Context, in Subtit
 	return items, pending, fallback, nil
 }
 
+<<<<<<< HEAD
 // cachedFontBundleForRequest serves one admitted ASS track's attached-font
 // bundle through the subtitle cache: disk hit, failure-backoff pending, or a
 // detached single-flight extraction the caller waits on up to
@@ -3446,6 +3451,8 @@ func writePendingFontBundleResponse(w http.ResponseWriter, fallback string) {
 	_, _ = w.Write(emptyFontBundle)
 }
 
+=======
+>>>>>>> upstream/main
 func (h *StreamHandler) syncSessionsNow(ctx context.Context, reason string) {
 	if h == nil || h.SessionSyncer == nil {
 		return

@@ -81,12 +81,10 @@ type PlannerInputV3 struct {
 	// established (for example, declared or verified).
 	InventoryProvenance string
 	// ProgressiveRemuxRegistry, HLSRemuxRegistry, and HLSVideoRegistry report
-	// the transformations executable by policy-eligible routes for each
-	// delivery. They are lazy because building a registry can touch pooled
-	// nodes. The planner only invokes the producer when that delivery needs a
-	// server transformation, and the transport layer re-validates the selected
-	// executor. HLSRegistry is the legacy shared fallback used when a caller
-	// does not provide workload-specific HLS registries.
+	// what policy-eligible executors of each delivery can run. They are lazy
+	// because building one can touch pooled nodes; the transport re-validates
+	// the selected executor. HLSRegistry is the shared fallback for callers
+	// without workload-specific HLS registries.
 	ProgressiveRemuxRegistry func() *TransformationRegistryV3
 	HLSRemuxRegistry         func() *TransformationRegistryV3
 	HLSVideoRegistry         func() *TransformationRegistryV3
@@ -98,31 +96,52 @@ type PlannerInputV3 struct {
 	// deployment policy to clients.
 	ToneMapCapabilities    tonemap.Capabilities
 	HLSToneMapCapabilities func() tonemap.Capabilities
-	// DVRPUStrippable reports whether this particular source survives the
-	// Dolby Vision RPU strip. The registries answer whether the executor
-	// carries the transformation; this answers whether the file does, which
-	// no capability probe can. Nil means "assume it does", preserving the
-	// pre-probe behaviour for callers that cannot run one (the shadow
-	// planner, tests). Lazy for the same reason as the HLS registries: it shells out
-	// to ffmpeg, so it is consulted only once every cheap eligibility gate
-	// has already passed and a strip route is genuinely on the table.
+	// DVRPUStrippable reports whether this source survives the Dolby Vision
+	// RPU strip, which no capability probe can answer. Nil means it does. Lazy
+	// because it runs ffmpeg.
 	DVRPUStrippable func() bool
 	// SubtitleRenditionExecutable reports whether some policy-eligible HLS
 	// video executor can emit an HLS subtitle rendition. Nil means none can.
+<<<<<<< HEAD
 	// Lazy for the same reason as the HLS registries.
 	SubtitleRenditionExecutable               func() bool
 	OnDemandSubtitleRenditionsExecutable      func() bool
 	RemuxOnDemandSubtitleRenditionsExecutable func() bool
 	CueIndexedSubtitleTracks                  func() *CueIndexedSubtitles
+=======
+	SubtitleRenditionExecutable func() bool
+>>>>>>> upstream/main
 	// RemuxSubtitleRenditionExecutable is SubtitleRenditionExecutable for an
 	// HLS copy remux, whose executors are chosen under the remux routing
 	// policy and must advertise TransportFeatureHLSRemuxSubtitleRenditionV1.
 	RemuxSubtitleRenditionExecutable func() bool
+<<<<<<< HEAD
 	Now                              time.Time
 	AttemptedKeys                    []string
 	AdditionalSubtitles              []SubtitleInventoryEntryV3
 	ForceSoftwareVideoDecode         bool
 	DecodeAttemptDetail              string
+=======
+	// OnDemandSubtitleRenditionsExecutable and its remux twin report whether
+	// some policy-eligible executor of the delivery serves on-demand
+	// renditions (TransportFeatureHLSOnDemandSubtitleRenditionsV1). Nil means
+	// none can.
+	OnDemandSubtitleRenditionsExecutable      func() bool
+	RemuxOnDemandSubtitleRenditionsExecutable func() bool
+	// CueIndexedSubtitleTracks answers which of EffectiveFile's subtitle
+	// tracks, by container track number, the source's index can read, and in
+	// which file version (CueIndexedSubtitleTracks). Nil, or a nil answer,
+	// means none: the plan keeps the single pipeline rendition. Lazy because
+	// it reads the file.
+	CueIndexedSubtitleTracks func() *CueIndexedSubtitles
+	Now                      time.Time
+	AttemptedKeys            []string
+	AdditionalSubtitles      []SubtitleInventoryEntryV3
+	// SubtitleTrackFacts answers what the server learned about embedded tracks
+	// by reading them, for the native_embedded limitations a client declares.
+	// Nil means nothing is known, which never rules a track out.
+	SubtitleTrackFacts SubtitleTrackFactsV3
+>>>>>>> upstream/main
 	// LocalNetwork reports that the request came from the server's local
 	// network (streamlocation.Local). False is treated as remote.
 	LocalNetwork bool
@@ -151,10 +170,8 @@ func (input PlannerInputV3) dvRPUStrippable() bool {
 	return input.DVRPUStrippable == nil || input.DVRPUStrippable()
 }
 
-// hlsRegistry resolves the registry HLS deliveries gate on: the widened
-// local∪node registry when provided, otherwise the local one. Callers must
-// keep it behind short-circuits so transformation-free routes never force
-// the lazy producer to run.
+// hlsRegistry is the widened local and node registry when provided,
+// otherwise the local one.
 func (input PlannerInputV3) hlsRegistry() *TransformationRegistryV3 {
 	if input.HLSRegistry != nil {
 		if widened := input.HLSRegistry(); widened != nil {
@@ -239,6 +256,7 @@ type PlannerResultV3 struct {
 	ToneMapRecipeVersion     string
 	ToneMapPreflightRequired bool
 	ToneMapSourceRevision    tonemap.SourceRevision
+<<<<<<< HEAD
 	// ToneMapVPPEnabled reports the opt-in VPP tone-map policy frozen into this
 	// plan. The transport turns it into the VPP filter only when the resolved
 	// executor is QSV; see prepareLocalTransportV3.
@@ -250,6 +268,12 @@ type PlannerResultV3 struct {
 	// serve the request. It exists so the handler can log the stickiness
 	// decision where DeliveryChange logging already lives.
 	StickyDeliveryKept bool
+=======
+	// SettingsDependentRefusal marks a Terminal that a playback setting decided
+	// (4K transcoding, tone mapping). A caller that could not load the settings
+	// planned without them, so it reports such a refusal as temporary.
+	SettingsDependentRefusal bool
+>>>>>>> upstream/main
 }
 
 // hlsToneMapCapabilities resolves the lazy pooled inventory when present and
@@ -263,6 +287,7 @@ func (input PlannerInputV3) hlsToneMapCapabilities() tonemap.Capabilities {
 	return input.ToneMapCapabilities
 }
 
+<<<<<<< HEAD
 // resolvePlanSubtitlePoliciesV3 resolves the selected subtitle for each delivery
 // class, reusing the predecessor plan's degraded outcome when this plan carries
 // the identical selection against the identical effective inventory. The reuse
@@ -978,6 +1003,22 @@ func planPlaybackOnceV3(input PlannerInputV3) (result PlannerResultV3) {
 	}
 
 	return terminalPlannerResultV3("adaptation_unavailable", "No validated playback route is available for this source and output route.", false)
+=======
+// applyServerBitrateCapV3 folds the administrator's bitrate cap into the
+// request's own cap and reports whether the source must be encoded to fit it.
+func applyServerBitrateCapV3(input *PlannerInputV3, file *models.MediaFile, source SourceDescriptorV3) bool {
+	if input.ServerBitrateCapKbps <= 0 {
+		return false
+	}
+	if requestCapKbps := optionalValueV3(input.Request.BandwidthCapKbps); requestCapKbps == 0 || input.ServerBitrateCapKbps < requestCapKbps {
+		input.Request.BandwidthCapKbps = &input.ServerBitrateCapKbps
+	}
+	// The video track rate excludes audio and container overhead. Only a
+	// known total rate can establish that a source-preserving route fits.
+	capKbps := optionalValueV3(input.Request.BandwidthCapKbps)
+	totalBitrateKbps := normalizeBitrateKbpsV3(file.Bitrate)
+	return totalBitrateKbps <= 0 || totalBitrateKbps > capKbps || source.BitrateKbps > capKbps
+>>>>>>> upstream/main
 }
 
 // Native HLS consumers use hvc1/dvh1 byte recipes. Web MediaSource clients
@@ -1197,6 +1238,7 @@ const (
 	decisionReasonClientDV8BaseLayerV3 = "client_dv8_base_layer"
 )
 
+<<<<<<< HEAD
 // planAudioOnlyV3 plans sources without a video track (audiobooks, music).
 // The route family is deliberately small: the original container over
 // progressive HTTP when the client decodes the audio codec, otherwise a
@@ -1308,6 +1350,8 @@ func planAudioOnlyV3(input PlannerInputV3, file *models.MediaFile, source Source
 	return PlannerResultV3{Plan: &plan, PlayMethod: PlayRemux, TranscodeAudio: transcodeAudio, TargetAudioCodec: plan.EffectiveRecipe.AudioCodec, SourceAudioChannels: stereoDownmixSourceChannelsV3(source.AudioChannels, targetAudioChannels, transcodeAudio), TargetAudioChannels: targetAudioChannels, TargetAudioBitrateKbps: targetAudioBitrateKbps, SubtitleTrackIndex: -1, SubtitleTransportTrackIndex: -1}
 }
 
+=======
+>>>>>>> upstream/main
 func stereoDownmixSourceChannelsV3(sourceChannels, targetChannels int, transcodeAudio bool) int {
 	if !transcodeAudio || sourceChannels <= 2 || (targetChannels != 0 && targetChannels != 2) {
 		return 0
@@ -1380,6 +1424,7 @@ func applyAudioOnlyAACConversionV3(plan *PlanV3, targetChannels, targetBitrateKb
 	}
 }
 
+<<<<<<< HEAD
 // targetVideoSelectionV3 describes the video encoder a server transcode will
 // emit: the codec exposed on the plan, and the transformation/claim identity
 // that matches it.
@@ -2009,6 +2054,8 @@ func planVideoTranscodeV3(input PlannerInputV3, base PlanV3, source SourceDescri
 	}
 }
 
+=======
+>>>>>>> upstream/main
 // h264BoundedQualityV3 fits a transcode target to the client's attested
 // H.264 decoders. An encode that no decoder takes, scaled or a same-size
 // codec conversion, steps down the ladder until its fitted size does,
@@ -2119,19 +2166,6 @@ func videoTransformationForTargetV3(codec string) TransformationV3 {
 	return TransformationV3{Name: TransformationVideoToH264V3, Executor: ExecutorServerV3, RecipeVersion: TransformationVideoToH264RecipeVersionV3, ValidatedClaims: []string{ClaimH264DecodeV3}}
 }
 
-func replaceVideoTransformationV3(plan *PlanV3, codec string) bool {
-	if plan == nil {
-		return false
-	}
-	for i, transformation := range plan.Transformations {
-		if transformation.Name == TransformationVideoToH264V3 || transformation.Name == TransformationVideoToHEVCV3 {
-			plan.Transformations[i] = videoTransformationForTargetV3(codec)
-			return true
-		}
-	}
-	return false
-}
-
 const hevcMainProfileV3 = "main"
 
 // hlsHEVCOutputSupportedV3 requires the selected HLS executor to name HEVC
@@ -2202,6 +2236,7 @@ type hlsRenditionsV3 struct {
 	source  SubtitleRenditionSource
 }
 
+<<<<<<< HEAD
 // applyHLSSubtitleRenditionsV3 gives a server_transcode_hls or (remux)
 // server_remux_hls plan its subtitle renditions. Every embedded text track
 // the source's index can read becomes an on-demand rendition when the client
@@ -2231,6 +2266,12 @@ func applyHLSSubtitleRenditionsV3(input PlannerInputV3, plan *PlanV3, subtitle S
 	}
 	return hlsRenditionsV3{carried: applyHLSSubtitleRenditionUnlessAttemptedV3(input, plan, subtitle)}
 }
+=======
+// maxOnDemandSubtitleRenditions bounds the on-demand renditions one plan
+// lists, and with them its multivariant playlist and recipe. Real files
+// rarely carry more text tracks; the rest keep their sidecar.
+const maxOnDemandSubtitleRenditions = 64
+>>>>>>> upstream/main
 
 // onDemandRenditionV3 is an inventory row an HLS plan lists as an on-demand
 // rendition: its position in the plan's inventory and the track.
@@ -2357,22 +2398,6 @@ func applyHLSOnDemandSubtitleRenditionsV3(plan *PlanV3, rs []onDemandRenditionV3
 	return tracks
 }
 
-// applyHLSSubtitleRenditionUnlessAttemptedV3 gives an HLS plan its subtitle
-// rendition and reports whether it kept it. A rendition that already failed
-// falls back to the sidecar rather than exhausting the route: the two are
-// different recipes.
-func applyHLSSubtitleRenditionUnlessAttemptedV3(input PlannerInputV3, plan *PlanV3, subtitle SubtitlePolicyResultV3) bool {
-	applyHLSSubtitleRenditionV3(plan)
-	finalizePlanIdentityV3(plan, input.Request.PlaybackAttemptID, input.Request.ClientPlaybackContext.Output.OutputContextID)
-	if !planAttemptedV3(*plan, input.Request.ClientPlaybackContext.Output.OutputContextID, input.AttemptedKeys) {
-		return true
-	}
-	applySubtitleDecisionV3(plan, subtitle.Decision)
-	plan.Claims.Subtitles = subtitle.Claims
-	finalizePlanIdentityV3(plan, input.Request.PlaybackAttemptID, input.Request.ClientPlaybackContext.Output.OutputContextID)
-	return false
-}
-
 // applyHLSSubtitleRenditionV3 moves the plan's selected subtitle into its HLS
 // presentation. The inventory keeps every sidecar URL, so a later selection
 // of another track still has one.
@@ -2408,15 +2433,6 @@ func canStripDolbyVisionToHDR10V3(source SourceDescriptorV3, request StartReques
 	// safe only when the DOVI compatibility id explicitly identifies HDR10.
 	return source.DVProfile == 7 || source.DVProfile == 8 && source.DVBLCompatID == 1
 }
-
-// dvRemuxModeV3 is the Dolby Vision recipe of one remux candidate.
-type dvRemuxModeV3 int
-
-const (
-	dvRemuxPreserveV3 dvRemuxModeV3 = iota
-	dvRemuxDV81V3
-	dvRemuxStripV3
-)
 
 // canServerConvertDV7ToDV81V3 reports whether an HLS copy can carry this
 // Profile 7 source as Profile 8.1 to a client that takes it. Only a
@@ -2909,15 +2925,6 @@ func hlsNativeAudioCodecV3(codec string) bool {
 	return false
 }
 
-// hdrTranscodeUnavailableV3 mirrors planVideoTranscodeV3's terminal
-// condition: no validated HDR-preserving or tone-map transcode recipe exists.
-func hdrTranscodeUnavailableV3(input PlannerInputV3, source SourceDescriptorV3) bool {
-	if source.DynamicRange == "" || source.DynamicRange == DynamicRangeSDRV3 {
-		return false
-	}
-	return !resolveToneMapRecipeV3(input, source, nil).ok
-}
-
 type resolvedToneMapRecipeV3 struct {
 	policy      tonemap.Policy
 	mode        tonemap.Mode
@@ -2925,13 +2932,6 @@ type resolvedToneMapRecipeV3 struct {
 	revision    tonemap.SourceRevision
 	hlsRegistry *TransformationRegistryV3
 	ok          bool
-}
-
-// toneMapRecipeV3 freezes the policy, preferred validated executor, safe source
-// resolution, and source revision required by an HDR video transcode plan.
-func toneMapRecipeV3(input PlannerInputV3, source SourceDescriptorV3) (tonemap.Policy, tonemap.Mode, tonemap.SourceResolution, tonemap.SourceRevision, bool) {
-	recipe := resolveToneMapRecipeV3(input, source, nil)
-	return recipe.policy, recipe.mode, recipe.resolution, recipe.revision, recipe.ok
 }
 
 func resolveToneMapRecipeV3(input PlannerInputV3, source SourceDescriptorV3, hlsRegistry *TransformationRegistryV3) resolvedToneMapRecipeV3 {
@@ -2980,6 +2980,7 @@ func toneMapSourceResolutionV3(file *models.MediaFile, source SourceDescriptorV3
 	return tonemap.ResolveSource(metadata)
 }
 
+<<<<<<< HEAD
 // toneMapRecipeVersionV3 includes the transformation recipe version only when
 // tone mapping is part of the executable plan.
 func toneMapRecipeVersionV3(enabled bool) string {
@@ -3032,6 +3033,8 @@ func videoTranscodeExecutableV3(input PlannerInputV3, source SourceDescriptorV3)
 	return videoOK
 }
 
+=======
+>>>>>>> upstream/main
 func recipeFromSourceV3(source SourceDescriptorV3) EffectiveRecipeV3 {
 	return EffectiveRecipeV3{VideoCodec: source.VideoCodec, AudioCodec: source.AudioCodec, Width: intPointerV3(source.Width), Height: intPointerV3(source.Height), FrameRate: floatPointerV3(source.FrameRate), BitrateKbps: intPointerV3(source.BitrateKbps), DynamicRange: source.DynamicRange, AudioChannels: intPointerV3(source.AudioChannels), AudioLayout: source.AudioLayout}
 }

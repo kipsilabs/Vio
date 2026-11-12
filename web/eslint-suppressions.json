@@ -113,11 +113,6 @@
       "count": 1
     }
   },
-  "src/pages/AdminLibraries.tsx": {
-    "react-hooks/exhaustive-deps": {
-      "count": 1
-    }
-  },
   "src/pages/AdminTasks.tsx": {
     "react-hooks/set-state-in-effect": {
       "count": 1
@@ -193,6 +188,7 @@
   },
   "src/player/components/AudioTrackMenu.tsx": {
     "react-hooks/exhaustive-deps": {
+<<<<<<< HEAD
       "count": 2
     },
     "react-hooks/preserve-manual-memoization": {
@@ -205,6 +201,12 @@
     },
     "react-hooks/preserve-manual-memoization": {
       "count": 2
+=======
+      "count": 1
+    },
+    "react-hooks/preserve-manual-memoization": {
+      "count": 1
+>>>>>>> upstream/main
     }
   },
   "src/player/components/PlayingNextScreen.tsx": {

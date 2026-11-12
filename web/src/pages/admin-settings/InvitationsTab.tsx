@@ -1,6 +1,5 @@
-import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { useRef, useState } from "react";
 import { useAuth } from "@/hooks/useAuth";
-import type { FormEvent } from "react";
 import {
   captureInvitationAuthority,
   invitationScope,
@@ -9,39 +8,15 @@ import {
   type InvitationAuthority,
   type InvitationDeliveryChoice,
 } from "@/api/v2/invitations";
-type InvitationStatus = Invitation["status"];
 import {
   useAdminInvitations,
   useInvitationCapabilities,
-  useCreateInvitation,
   useResendInvitation,
   useRevokeInvitation,
 } from "@/hooks/queries/admin/invitations";
-import { useAccessGroups } from "@/hooks/queries/admin/accessGroups";
 import { useViewerIsOwner } from "@/hooks/queries/admin/users";
-import { useAdminLibraries } from "@/hooks/queries/admin/libraries";
 import { useAdminServerSettings } from "@/hooks/queries/admin/settings";
-import { effectiveAccessGroupID } from "@/components/UserPolicyFields";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Badge } from "@/components/ui/badge";
-import { Switch } from "@/components/ui/switch";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
 import {
   Dialog,
   DialogContent,
@@ -50,124 +25,31 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog";
-import { LibraryAccessSelector } from "@/components/LibraryAccessSelector";
-import { ChoiceOption } from "@/components/ChoiceOption";
 
-import {
-  AlertTriangle,
-  ArrowRight,
-  Copy,
-  Link2,
-  Mail,
-  MailX,
-  MailPlus,
-  RotateCw,
-  Trash2,
-} from "lucide-react";
-import { Link } from "react-router";
+import { AlertTriangle, MailPlus } from "lucide-react";
 import { toast } from "sonner";
 import { copyTextToClipboard } from "@/lib/clipboard";
-import { INVALID_EMAIL_MESSAGE, isValidEmail } from "@/lib/email";
-import { formatDate } from "@/lib/datetime";
+import { cn } from "@/lib/utils";
+import { useT } from "@/i18n";
 
-// The claim-link box shown after create/resend. min-w-0 + overflow-hidden on
-// every level matters: the URL is one unbreakable token, and without them it
-// forces the dialog wider than the viewport on phones.
-function ClaimLinkBox({
-  claimUrl,
-  finePrint,
-  onCopy,
-  onDone,
-}: {
-  claimUrl: string;
-  finePrint: string;
-  onCopy: (text: string) => Promise<void>;
-  onDone: () => void;
-}) {
-  return (
-    <div className="min-w-0 space-y-4">
-      <div className="bg-muted min-w-0 overflow-hidden rounded-md p-2.5">
-        <code className="block truncate text-xs">{claimUrl}</code>
-      </div>
-      <p className="text-muted-foreground text-xs">{finePrint}</p>
-      <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
-        <Button variant="outline" onClick={() => onCopy(claimUrl)}>
-          <Copy className="mr-1.5 h-4 w-4" /> Copy link
-        </Button>
-        <Button onClick={onDone}>Done</Button>
-      </div>
-    </div>
-  );
-}
+import { CreateInvitationForm } from "./CreateInvitationForm";
+import { ClaimLinkBox } from "./InvitationDisplay";
+import { InvitationList } from "./InvitationList";
+import { deliveryMessage, isLinkInvitation, useMounted } from "./invitationRules";
+import {
+  FULL_SCREEN_DIALOG_CLASS,
+  TOUCH_DIALOG_CLOSE_CLASS,
+  TOUCH_FIELD_CLASS,
+  TOUCH_PRIMARY_ACTION_CLASS,
+} from "./touchClasses";
+import { FullScreenDialogHeader, SettingsLink } from "./TouchLayoutParts";
 
-const STATUS_BADGES: Record<InvitationStatus, { label: string; variant: "default" | "outline" }> = {
-  pending: { label: "Pending", variant: "default" },
-  accepted: { label: "Accepted", variant: "outline" },
-  expired: { label: "Expired", variant: "outline" },
-  revoked: { label: "Revoked", variant: "outline" },
-};
-
-function deliveryMessage(result: InvitationDelivery) {
-  // A replaced link for an emailed invitation stays bound to its address.
-  if (result.delivery_status === "not_requested" && result.invitation.email)
-    return `New link created for ${result.invitation.email}. Nothing was emailed; share this link with them yourself.`;
-  if (result.delivery_status === "not_requested")
-    return "Invitation link created. Share it with the person you're inviting. They'll enter their email address and choose a password.";
-  if (result.delivery_status === "sent")
-    return `Email sent to ${result.invitation.email}. Recipient delivery is not guaranteed. You can copy the link below.`;
-  if (result.delivery_status === "not_configured")
-    return "Email is not configured. The invitation was created; deliver this link yourself.";
-  return "The invitation was created, but email delivery failed or is uncertain. This link remains active; deliver it yourself.";
-}
-/** A pending link invitation has no address until someone accepts it. */
-function isLinkInvitation(invitation: Invitation) {
-  return invitation.email === "";
-}
-
-function DeliveryLabel({ delivery }: { delivery: Invitation["delivery"] }) {
-  if (delivery === "link")
-    return (
-      <span className="inline-flex items-center gap-1.5 text-sm">
-        <Link2 className="h-3.5 w-3.5" aria-hidden="true" /> Link created
-      </span>
-    );
-  if (delivery === "email_sent")
-    return (
-      <span className="inline-flex items-center gap-1.5 text-sm">
-        <Mail className="h-3.5 w-3.5" aria-hidden="true" /> Email sent
-      </span>
-    );
-  if (delivery === "email_unconfirmed")
-    return (
-      <span
-        className="inline-flex items-center gap-1.5 text-sm text-amber-500"
-        title="The email failed or its delivery is uncertain. The link still works."
-      >
-        <MailX className="h-3.5 w-3.5" aria-hidden="true" /> Email not confirmed
-      </span>
-    );
-  return (
-    <span className="text-muted-foreground text-sm" title="Created before delivery was recorded">
-      —
-    </span>
-  );
-}
-
-function useMounted() {
-  const mounted = useRef(true);
-  useEffect(() => {
-    mounted.current = true;
-    return () => {
-      mounted.current = false;
-    };
-  }, []);
-  return mounted;
-}
 export default function InvitationsTab() {
   useAuth();
   return <InvitationManager key={invitationScope()} />;
 }
 function InvitationManager() {
+  const t = useT();
   const viewerId = useAuth().user?.id;
   const viewerIsOwner = useViewerIsOwner(viewerId);
   const capabilities = useInvitationCapabilities();
@@ -200,11 +82,10 @@ function InvitationManager() {
       await copyTextToClipboard(text);
       if (mounted.current) {
         setCopyError("");
-        toast.success("Copied to clipboard");
+        toast.success(t("web.admin.settings.invitations.copied"));
       }
     } catch {
-      if (mounted.current)
-        setCopyError("Could not copy the link. Select and copy it manually, or try again.");
+      if (mounted.current) setCopyError(t("web.admin.settings.invitations.copyFailed"));
     }
   }
   async function handleResend(id: string, delivery: InvitationDeliveryChoice) {
@@ -224,9 +105,7 @@ function InvitationManager() {
     } catch (error) {
       if (mounted.current)
         setResendError(
-          error instanceof Error
-            ? error.message
-            : "Unable to resend invitation. Reload history before continuing.",
+          error instanceof Error ? error.message : t("web.admin.settings.invitations.resendFailed"),
         );
     } finally {
       resend.reset();
@@ -245,21 +124,29 @@ function InvitationManager() {
       if (mounted.current) setConfirmRevoke(null);
     } catch (error) {
       if (mounted.current)
-        setRevokeError(error instanceof Error ? error.message : "Unable to revoke invitation.");
+        setRevokeError(
+          error instanceof Error ? error.message : t("web.admin.settings.invitations.revokeFailed"),
+        );
     } finally {
       revoke.reset();
       busy.current = false;
     }
   }
-  if (capabilities.isPending) return <p>Loading invitation capabilities...</p>;
+  if (capabilities.isPending)
+    return <p>{t("web.admin.settings.invitations.loadingCapabilities")}</p>;
   if (capabilities.isError)
     return (
       <div role="alert">
-        Could not load invitation capabilities.{" "}
-        <Button onClick={() => void capabilities.refetch()}>Reload capabilities</Button>
+        {t("web.admin.settings.invitations.capabilitiesFailed", {
+          button: (chunks) => (
+            <Button className={TOUCH_FIELD_CLASS} onClick={() => void capabilities.refetch()}>
+              {chunks}
+            </Button>
+          ),
+        })}
       </div>
     );
-  if (!available) return <p>Invitations are not configured on this server.</p>;
+  if (!available) return <p>{t("web.admin.settings.invitations.notConfigured")}</p>;
   return (
     <div className="space-y-6">
       <Dialog
@@ -268,31 +155,35 @@ function InvitationManager() {
           if (!open && !busy.current) setConfirmRevoke(null);
         }}
       >
-        <DialogContent>
+        <DialogContent className={TOUCH_DIALOG_CLOSE_CLASS}>
           <DialogHeader>
-            <DialogTitle>Revoke invitation</DialogTitle>
+            <DialogTitle>{t("web.admin.settings.invitations.revoke.title")}</DialogTitle>
             <DialogDescription>
               {confirmRevoke && isLinkInvitation(confirmRevoke.row)
-                ? "Revoke this link invitation? The link will stop working."
-                : `Revoke the invitation for ${confirmRevoke?.row.email}? Their link will stop working.`}
+                ? t("web.admin.settings.invitations.revoke.linkDescription")
+                : t("web.admin.settings.invitations.revoke.emailDescription", {
+                    email: String(confirmRevoke?.row.email),
+                  })}
             </DialogDescription>
           </DialogHeader>
           {revokeError && <p role="alert">{revokeError}</p>}
           <Button
             variant="outline"
+            className={TOUCH_FIELD_CLASS}
             disabled={revoke.isPending}
             onClick={() => {
               if (!busy.current) setConfirmRevoke(null);
             }}
           >
-            Cancel
+            {t("common.cancel")}
           </Button>
           <Button
             variant="destructive"
+            className={TOUCH_FIELD_CLASS}
             disabled={revoke.isPending}
             onClick={() => void handleRevoke()}
           >
-            Revoke
+            {t("web.admin.settings.invitations.revoke.confirm")}
           </Button>
         </DialogContent>
       </Dialog>
@@ -306,21 +197,22 @@ function InvitationManager() {
           }
         }}
       >
-        <DialogContent>
+        <DialogContent className={TOUCH_DIALOG_CLOSE_CLASS}>
           <DialogHeader>
-            <DialogTitle>Fresh invitation link</DialogTitle>
-            <DialogDescription>
+            <DialogTitle>{t("web.admin.settings.invitations.resend.title")}</DialogTitle>
+            <DialogDescription className="break-words">
               {resendResult
-                ? deliveryMessage(resendResult)
-                : "A replacement invalidates the previous link."}
+                ? deliveryMessage(resendResult, t)
+                : t("web.admin.settings.invitations.resend.description")}
             </DialogDescription>
           </DialogHeader>
-          {resend.isPending && <p>Creating a fresh invitation...</p>}
+          {resend.isPending && <p>{t("web.admin.settings.invitations.resend.creating")}</p>}
           {resendError && (
             <div role="alert">
               <p>{resendError}</p>
-              <p>The outcome may be uncertain. Reload history before another deliberate resend.</p>
+              <p>{t("web.admin.settings.invitations.resend.uncertain")}</p>
               <Button
+                className={TOUCH_FIELD_CLASS}
                 onClick={async () => {
                   try {
                     await history.restart();
@@ -333,7 +225,7 @@ function InvitationManager() {
                   }
                 }}
               >
-                Reload history
+                {t("web.admin.settings.invitations.reloadHistory")}
               </Button>
             </div>
           )}
@@ -341,7 +233,7 @@ function InvitationManager() {
           {resendResult && (
             <ClaimLinkBox
               claimUrl={resendResult.claim_url}
-              finePrint="The link works once. Any previous link has stopped working."
+              finePrint={t("web.admin.settings.invitations.resend.finePrint")}
               onCopy={handleCopy}
               onDone={() => {
                 setResendOpen(false);
@@ -352,10 +244,9 @@ function InvitationManager() {
           )}
         </DialogContent>
       </Dialog>
-      <div className="flex items-start justify-between gap-4">
+      <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
         <p className="text-muted-foreground max-w-xl text-sm">
-          Invite someone by email, or create a link to share yourself. Their email address becomes
-          their username.
+          {t("web.admin.settings.invitations.intro")}
         </p>
         <Dialog
           open={createOpen}
@@ -367,18 +258,23 @@ function InvitationManager() {
           }}
         >
           <DialogTrigger asChild>
-            <Button size="sm" disabled={publicURLMissing}>
-              <MailPlus className="mr-1 h-4 w-4" />
-              Invite someone
+            <Button size="sm" className={TOUCH_PRIMARY_ACTION_CLASS} disabled={publicURLMissing}>
+              <MailPlus className="me-1 h-4 w-4" />
+              {t("web.admin.settings.invitations.invite.button")}
             </Button>
           </DialogTrigger>
-          <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-lg">
-            <DialogHeader>
-              <DialogTitle>Invite someone</DialogTitle>
-              <DialogDescription>
-                Choose their access and how they get the invitation link.
-              </DialogDescription>
-            </DialogHeader>
+          {/* Below sm the invite form fills the screen; from sm up it is a centered box. */}
+          <DialogContent
+            className={cn(
+              "max-h-[85vh] overflow-y-auto sm:max-w-lg",
+              FULL_SCREEN_DIALOG_CLASS,
+              TOUCH_DIALOG_CLOSE_CLASS,
+            )}
+          >
+            <FullScreenDialogHeader
+              title={t("web.admin.settings.invitations.invite.title")}
+              description={t("web.admin.settings.invitations.invite.description")}
+            />
             {copyError && <p role="alert">{copyError}</p>}
             <CreateInvitationForm
               defaultProfile={capabilities.data?.default_profile === true}
@@ -402,14 +298,9 @@ function InvitationManager() {
         <div className="flex items-start gap-3 rounded-xl border border-amber-500/20 bg-amber-500/5 p-3">
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" aria-hidden="true" />
           <p className="text-[13px] leading-relaxed">
-            Set the Silo public URL to create invitation links.{" "}
-            <Link
-              to="/admin/settings/general"
-              className="text-foreground inline-flex items-center gap-1 font-medium hover:underline"
-            >
-              General settings
-              <ArrowRight className="h-3 w-3" aria-hidden="true" />
-            </Link>
+            {t("web.admin.settings.invitations.publicUrlMissing", {
+              link: (chunks) => <SettingsLink to="/admin/settings/general">{chunks}</SettingsLink>,
+            })}
           </p>
         </div>
       )}
@@ -417,6 +308,7 @@ function InvitationManager() {
         <div role="alert">
           <p>{resendError}</p>
           <Button
+            className={TOUCH_FIELD_CLASS}
             onClick={async () => {
               try {
                 await history.restart();
@@ -426,68 +318,58 @@ function InvitationManager() {
               }
             }}
           >
-            Reload history
+            {t("web.admin.settings.invitations.reloadHistory")}
           </Button>
         </div>
       )}
       {history.isError && (
         <div role="alert">
-          <p>Could not load invitation history. {history.error.message}</p>
-          <Button onClick={() => void history.restart().catch(() => {})}>Reload history</Button>
+          <p className="break-words">
+            {t("web.admin.settings.invitations.historyFailed", { error: history.error.message })}
+          </p>
+          <Button
+            className={TOUCH_FIELD_CLASS}
+            onClick={() => void history.restart().catch(() => {})}
+          >
+            {t("web.admin.settings.invitations.reloadHistory")}
+          </Button>
         </div>
       )}
       {history.isPending ? (
-        <p>Loading invitations...</p>
+        <p>{t("web.admin.settings.invitations.loading")}</p>
       ) : invitations.length === 0 && !history.isError ? (
-        <p>No invitations yet. Invite someone to get started.</p>
+        <p>{t("web.admin.settings.invitations.empty")}</p>
       ) : (
         invitations.length > 0 && (
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Recipient</TableHead>
-                <TableHead>Role</TableHead>
-                <TableHead>Status</TableHead>
-                <TableHead>Delivery</TableHead>
-                <TableHead>Created</TableHead>
-                <TableHead className="w-32" />
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {invitations.map((inv) => (
-                <InvitationRow
-                  key={inv.id}
-                  invitation={inv}
-                  onResend={(delivery) => void handleResend(inv.id, delivery)}
-                  emailDelivery={emailDelivery}
-                  // Resending re-grants the role, so only the Owner resends an admin invitation.
-                  resendAllowed={inv.role !== "admin" || viewerIsOwner}
-                  onRevoke={() => {
-                    if (busy.current) return;
-                    setRevokeError("");
-                    setConfirmRevoke({ row: inv, profileContext: captureInvitationAuthority() });
-                  }}
-                  resending={resend.isPending || revoke.isPending || !!resendError}
-                  // A fresh link needs the public URL; revoking one does not.
-                  resendBlocked={publicURLMissing}
-                />
-              ))}
-            </TableBody>
-          </Table>
+          <InvitationList
+            invitations={invitations}
+            emailDelivery={emailDelivery}
+            viewerIsOwner={viewerIsOwner}
+            resending={resend.isPending || revoke.isPending || !!resendError}
+            resendBlocked={publicURLMissing}
+            onResend={(inv, delivery) => void handleResend(inv.id, delivery)}
+            onRevoke={(inv) => {
+              if (busy.current) return;
+              setRevokeError("");
+              setConfirmRevoke({ row: inv, profileContext: captureInvitationAuthority() });
+            }}
+          />
         )
       )}
       {history.hasNextPage && (
         <Button
           variant="outline"
+          className={TOUCH_PRIMARY_ACTION_CLASS}
           disabled={history.isFetchingNextPage || history.isError}
           onClick={() => void history.fetchNextPage()}
         >
-          Load more
+          {t("web.admin.settings.invitations.loadMore")}
         </Button>
       )}
     </div>
   );
 }
+<<<<<<< HEAD
 
 function InvitationRow({
   invitation,
@@ -918,3 +800,5 @@ function CreateInvitationForm({
     </form>
   );
 }
+=======
+>>>>>>> upstream/main

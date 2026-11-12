@@ -53,6 +53,16 @@ func TestRecipeCardRoundTripOpts(t *testing.T) {
 		FastStart:              true,
 		ThrottleSeconds:        180,
 	}
+<<<<<<< HEAD
+=======
+}
+
+// TestRecipeCardRoundTripOpts verifies recipe cards restore transcode options.
+func TestRecipeCardRoundTripOpts(t *testing.T) {
+	revision := tonemap.SourceRevision{MediaFileID: 77, FileSize: 100, FileModifiedUnixNano: 200, StreamSignature: "stream"}
+	opts := recipeCardFixtureOpts(revision)
+	opts.CopyAudioCodec = "aac"
+>>>>>>> upstream/main
 
 	card := NewRecipeCard(42, "profile-1", 77, "", opts)
 	if card.SessionID != "abc" || card.UserID != 42 || card.ProfileID != "profile-1" || card.MediaFileID != 77 {
@@ -136,6 +146,9 @@ func TestRecipeCardUsesCanonicalInputForReconstruction(t *testing.T) {
 	opts := decoded.TranscodeOpts("/tmp/transcode", "/usr/bin/ffmpeg", nil)
 	if opts.InputPath != card.InputPath || opts.CanonicalInputPath != card.InputPath {
 		t.Fatalf("reconstructed opts input = %q/%q, want %q", opts.InputPath, opts.CanonicalInputPath, card.InputPath)
+	}
+	if got.CopyAudioCodec != opts.CopyAudioCodec {
+		t.Errorf("CopyAudioCodec = %q, want %q", got.CopyAudioCodec, opts.CopyAudioCodec)
 	}
 }
 
@@ -387,6 +400,7 @@ func TestRecipeCardLegacyDecodeHasEmptyPlayMethod(t *testing.T) {
 // re-resolved from live config, so they are not asserted here.
 func TestRecipeCardClaimsRoundTrip(t *testing.T) {
 	revision := tonemap.SourceRevision{MediaFileID: 77, FileSize: 100, FileModifiedUnixNano: 200, StreamSignature: "stream"}
+<<<<<<< HEAD
 	card := NewRecipeCard(42, "profile-1", 77, "http://node:9000", TranscodeOpts{
 		InputPath:                "/media/movie.mkv",
 		SessionID:                "abc",
@@ -424,6 +438,17 @@ func TestRecipeCardClaimsRoundTrip(t *testing.T) {
 		TotalDuration:          7200,
 		FastStart:              true,
 	})
+=======
+	opts := recipeCardFixtureOpts(revision)
+	opts.OutputDir, opts.HWAccel, opts.HWDevice = "", "", ""
+	opts.ToneMapPolicy = tonemap.PolicySoftwareOnly
+	opts.ToneMapMode = tonemap.ModeSoftware
+	opts.ToneMapSourceKind = tonemap.SourceHLG
+	opts.ToneMapFilter = "tonemapx"
+	opts.SourceAudioChannels, opts.TargetAudioChannels, opts.TargetAudioBitrateKbps = 8, 6, 320
+	opts.CopyAudioCodec = "aac"
+	card := NewRecipeCard(42, "profile-1", 77, "http://node:9000", opts)
+>>>>>>> upstream/main
 	card.RoutingWorkload = "video_transcode"
 	card.RoutingExecution = "transcode"
 	card.RoutingEgress = "proxy"
@@ -452,6 +477,7 @@ func TestRecipeCardClaimsRoundTrip(t *testing.T) {
 		got.SeekSeconds != card.SeekSeconds || got.StreamOriginSeconds != card.StreamOriginSeconds ||
 		got.CopySeekAnchorResolved != card.CopySeekAnchorResolved || got.TargetResolution != card.TargetResolution ||
 		got.TargetCodecVideo != card.TargetCodecVideo || got.TargetCodecAudio != card.TargetCodecAudio ||
+		got.CopyAudioCodec != "aac" ||
 		got.TargetAudioChannels != card.TargetAudioChannels || got.TargetAudioBitrateKbps != card.TargetAudioBitrateKbps ||
 		got.SegmentDuration != card.SegmentDuration || got.StartSegmentNumber != card.StartSegmentNumber ||
 		got.SubtitleTrackIndex != card.SubtitleTrackIndex || got.SubtitleBurnIn != card.SubtitleBurnIn ||

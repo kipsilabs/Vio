@@ -93,6 +93,7 @@ type transcodePermissionChecker interface {
 	CheckTranscodingAllowed(ctx context.Context, userID int, requiresVideoTranscode bool) error
 }
 
+<<<<<<< HEAD
 func (h *PlaybackHandler) ensureUserTranscodingAllowed(w http.ResponseWriter, r *http.Request, userID int, requiresVideoTranscode bool) bool {
 	checker, ok := h.sessionMgr.(transcodePermissionChecker)
 	if !ok {
@@ -113,6 +114,8 @@ func (h *PlaybackHandler) ensureUserTranscodingAllowed(w http.ResponseWriter, r 
 	return true
 }
 
+=======
+>>>>>>> upstream/main
 type PlaybackItemAccessChecker interface {
 	EnsureAccessible(ctx context.Context, contentID string, filter catalog.AccessFilter) error
 }
@@ -510,6 +513,7 @@ type PlaybackHandler struct {
 	// 404 after a restart and the client starts a new attempt, as before.
 	SessionRecipeStore sessionRecipeStoreV3
 	ItemAccess         PlaybackItemAccessChecker // optional; enables file authorization checks
+<<<<<<< HEAD
 	ItemLookup         PlaybackItemLookup
 	VirtualFileLookup  VirtualFileLookup
 	EpisodeLookup      PlaybackEpisodeLookup      // optional; resolves episode files to their series
@@ -521,6 +525,14 @@ type PlaybackHandler struct {
 	virtualStickyMu    sync.Mutex
 	virtualStickyPins  map[string]virtualStickyPin
 	ExtraLookup        PlaybackExtraLookup // optional; resolves extras files to their parent item
+=======
+	// FileNamesVisible reports whether the caller may see file names
+	// (ItemsHandler.CanViewFilePaths). Optional: without it no caller does, and
+	// an untitled external subtitle is labeled by its language.
+	FileNamesVisible   func(context.Context) bool
+	EpisodeLookup      PlaybackEpisodeLookup // optional; resolves episode files to their series
+	ExtraLookup        PlaybackExtraLookup   // optional; resolves extras files to their parent item
+>>>>>>> upstream/main
 	OriginalLangLookup PlaybackOriginalLanguageLookup
 	SettingsRepo       PlaybackSettingsReader     // optional; reads server settings (e.g., allow_4k_transcode)
 	FileVersionFetcher PlaybackFileVersionFetcher // optional; queries sibling file versions for 4K guard
@@ -1127,12 +1139,6 @@ func (h *PlaybackHandler) playbackThresholds(ctx context.Context) userstore.Prog
 }
 
 // --- Request/Response types ---
-
-// progressRequest represents the JSON body for POST /playback/{session_id}/progress.
-type progressRequest struct {
-	Position float64 `json:"position"`
-	IsPaused bool    `json:"is_paused"`
-}
 
 func semanticPlayMethod(s *playback.Session) playback.PlayMethod {
 	if s == nil {
@@ -2461,20 +2467,30 @@ func (h *PlaybackHandler) recordStopHistory(ctx context.Context, session *playba
 	return result, err
 }
 
-func (h *PlaybackHandler) recordAdminStopHistory(ctx context.Context, session *playback.Session, reason PlaybackEndReason) {
-	if entry, err := h.buildAdminHistoryEntry(ctx, session); err != nil {
+// recordAdminStopHistory logs a failed write itself and also returns it, so
+// the lifecycle sweep can hold back its next attempt.
+func (h *PlaybackHandler) recordAdminStopHistory(ctx context.Context, session *playback.Session, reason PlaybackEndReason) error {
+	entry, err := h.buildAdminHistoryEntry(ctx, session)
+	if err != nil {
 		slog.ErrorContext(ctx, "failed to build admin history", "component", "api", "session", session.ID, "error", err)
-	} else if entry != nil && h.AdminStore != nil {
-		entry.EndReason = reason
-		// An end goes through the session's lifecycle, which announces it;
-		// a teardown the client can recover from records its stretch only.
-		if reason != "" && h.recordEnd(ctx, session, *entry) {
-			return
-		}
-		if err := h.AdminStore.RecordHistory(ctx, *entry); err != nil {
-			slog.ErrorContext(ctx, "failed to record admin history", "component", "api", "session", session.ID, "error", err)
+		return err
+	}
+	if entry == nil || h.AdminStore == nil {
+		return nil
+	}
+	entry.EndReason = reason
+	// An end goes through the session's lifecycle, which announces it;
+	// a teardown the client can recover from records its stretch only.
+	if reason != "" {
+		if handled, err := h.recordEnd(ctx, session, *entry); handled {
+			return err
 		}
 	}
+	if err := h.AdminStore.RecordHistory(ctx, *entry); err != nil {
+		slog.ErrorContext(ctx, "failed to record admin history", "component", "api", "session", session.ID, "error", err)
+		return err
+	}
+	return nil
 }
 
 // compatPlayHistoryNamespace derives a Jellyfin play's watch-history row ID
@@ -2930,6 +2946,7 @@ func (h *PlaybackHandler) persistAudioPreference(
 
 // --- Handler methods ---
 
+<<<<<<< HEAD
 // HandleStartPlayback starts playback. Protocol v3 is the only protocol this
 // endpoint speaks: a start that does not declare it comes from a build that
 // predates the contract and cannot interpret a plan, so it is refused with
@@ -3108,6 +3125,8 @@ func (h *PlaybackHandler) HandleStopPlayback(w http.ResponseWriter, r *http.Requ
 	w.WriteHeader(http.StatusNoContent)
 }
 
+=======
+>>>>>>> upstream/main
 func (h *PlaybackHandler) loadAuthorizedFile(r *http.Request, fileID int) (*models.MediaFile, error) {
 	if h.fileResolver == nil || h.ItemAccess == nil {
 		return nil, fmt.Errorf("playback authorization dependencies not configured")

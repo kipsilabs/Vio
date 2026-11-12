@@ -14,6 +14,7 @@ import {
   DropdownMenuLabel,
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
+<<<<<<< HEAD
 import {
   audioLanguageLabels,
   buildQualitySummary,
@@ -23,6 +24,13 @@ import {
 import { audioScore, resolutionScore } from "./versionRankingUtils";
 import { isVersionUnavailable, useVersionVisibility } from "./versionAvailability";
 import { deriveVersionHealth } from "@/lib/versionHealth";
+=======
+import { formatFileSize, mapAudioLabel } from "@/lib/mediaFormat";
+import { videoRangeLabel } from "@/lib/videoRange";
+import { useT } from "@/i18n";
+import { extractSourceHint, versionAudioAtmosEvidence } from "./versionFormatUtils";
+import { resolutionScore } from "./versionRankingUtils";
+>>>>>>> upstream/main
 
 export { buildQualitySummary };
 
@@ -52,16 +60,21 @@ interface VersionFlyoutItemsProps {
 }
 
 export default function VersionFlyoutItems({ versions, onPlayVersion }: VersionFlyoutItemsProps) {
+<<<<<<< HEAD
   const enrichProviderResults = useProviderResultEnrichment();
   const sorted = useMemo(() => sortByResolution(versions), [versions]);
   const { visibleVersions, hiddenUnavailableCount, setShowUnavailable } = useVersionVisibility(
     sorted,
     null,
   );
+=======
+  const t = useT();
+  const sorted = sortByResolution(versions);
+>>>>>>> upstream/main
 
   return (
     <>
-      <DropdownMenuLabel>Play Version</DropdownMenuLabel>
+      <DropdownMenuLabel>{t("web.detail.versions.playVersion")}</DropdownMenuLabel>
       <DropdownMenuSeparator />
       {versions.some((version) => providerResultText(version)) && (
         <DropdownMenuCheckboxItem

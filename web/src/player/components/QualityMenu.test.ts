@@ -2,6 +2,7 @@
 
 import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { createElement, type ComponentProps } from "react";
+<<<<<<< HEAD
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   buildVersionStatusLabels,
@@ -105,6 +106,13 @@ function renderVersionMenu(
   );
   fireEvent.click(screen.getByRole("button", { name: "Quality" }));
 }
+=======
+import { describe, expect, it, vi } from "vitest";
+import { qualityOptionsFromPlanV3 } from "../playback-info";
+import { fixturePlanV3 } from "../protocol-v3.fixtures";
+import { buildVersionStatusLabels } from "../playback-info";
+import { QualityMenu, type VersionInfo } from "./QualityMenu";
+>>>>>>> upstream/main
 
 function makeVersionInfo(overrides: Partial<VersionInfo> = {}): VersionInfo {
   return {
@@ -193,7 +201,7 @@ describe("QualityMenu", () => {
         versions: [makeVersionInfo(), makeVersionInfo({ fileId: 2, label: "1080p H264" })],
       }),
     );
-    fireEvent.click(screen.getByRole("button", { name: "Quality" }));
+    fireEvent.click(screen.getByRole("button", { name: /^Quality/ }));
     expect(screen.getByText(/Watch Party keeps everyone on the same version/)).toBeInTheDocument();
     expect(screen.queryByRole("menuitem", { name: /2160p HEVC HDR/ })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("menuitem", { name: /720p/ }));
@@ -222,8 +230,8 @@ describe("QualityMenu", () => {
       }),
     );
 
-    expect(screen.getByRole("button", { name: "Quality" })).toHaveTextContent("1080p Medium");
-    fireEvent.click(screen.getByRole("button", { name: "Quality" }));
+    expect(screen.getByRole("button", { name: /^Quality/ })).toHaveTextContent("1080p Medium");
+    fireEvent.click(screen.getByRole("button", { name: /^Quality/ }));
     expect(screen.getByRole("menu")).toHaveClass("z-30");
     expect(screen.getByRole("menuitem", { name: /1080p Medium.*Selected/ })).toHaveAttribute(
       "aria-current",
@@ -251,7 +259,7 @@ describe("QualityMenu", () => {
       }),
     );
 
-    const trigger = screen.getByRole("button", { name: "Quality" });
+    const trigger = screen.getByRole("button", { name: /^Quality/ });
     expect(trigger).toHaveTextContent(/^1080p$/);
     fireEvent.click(trigger);
     expect(screen.queryByText("Selected")).not.toBeInTheDocument();
@@ -267,6 +275,7 @@ describe("QualityMenu version format score", () => {
       ],
     });
 
+<<<<<<< HEAD
     expect(screen.getByText("★ 850")).toBeInTheDocument();
   });
 
@@ -712,6 +721,16 @@ describe("QualityMenu automatic version fallback", () => {
     );
     expect(screen.getByRole("menuitem", { name: /1080p H264/ })).toBeInTheDocument();
     expect(screen.getByRole("menuitem", { name: /2160p HEVC/ })).toBeInTheDocument();
+=======
+    fireEvent.click(screen.getByRole("button", { name: /^Quality/ }));
+    expect(screen.queryByRole("menuitem", { name: /Original/i })).not.toBeInTheDocument();
+    expect(screen.getAllByRole("menuitem").map((item) => item.textContent)).toEqual([
+      "Auto",
+      "1080p-medium6 MbpsSelected",
+    ]);
+    fireEvent.click(screen.getByRole("menuitem", { name: /Auto/ }));
+    expect(select).toHaveBeenCalledWith("auto");
+>>>>>>> upstream/main
   });
 });
 
@@ -778,7 +797,7 @@ describe("available playback choices", () => {
     const { rerender } = render(createElement(QualityMenu, props));
     expect(screen.getByRole("button", { name: "Version" })).toHaveTextContent("Version");
     rerender(createElement(QualityMenu, { ...props, options: [auto, rung720] }));
-    fireEvent.click(screen.getByRole("button", { name: "Quality" }));
+    fireEvent.click(screen.getByRole("button", { name: /^Quality/ }));
     expect(screen.getByRole("menuitem", { name: /Auto.*Selected/ })).toBeInTheDocument();
     expect(props.onSelect).not.toHaveBeenCalled();
   });
@@ -793,7 +812,7 @@ describe("playback speed", () => {
         menuProps({ options: [rung720], versions: undefined, onPlaybackSpeedChange }),
       ),
     );
-    const trigger = screen.getByRole("button", { name: "Playback settings" });
+    const trigger = screen.getByRole("button", { name: /^Playback settings/ });
 
     fireEvent.click(trigger);
     expect(screen.getByRole("group", { name: "Speed" })).toBeInTheDocument();
@@ -810,7 +829,7 @@ describe("playback speed", () => {
 
   it("moves between speeds with the left and right arrow keys", () => {
     render(createElement(QualityMenu, menuProps({ onPlaybackSpeedChange: vi.fn() })));
-    fireEvent.click(screen.getByRole("button", { name: "Playback settings" }));
+    fireEvent.click(screen.getByRole("button", { name: /^Playback settings/ }));
     const half = screen.getByRole("menuitemradio", { name: "0.5×" });
     half.focus();
     fireEvent.keyDown(half, { key: "ArrowRight" });
@@ -819,11 +838,11 @@ describe("playback speed", () => {
     expect(half).toHaveFocus();
   });
 
-  it("keeps focus in the menu when the track is pressed between stops", () => {
+  it("keeps focus in the menu when the row is pressed between speeds", () => {
     render(createElement(QualityMenu, menuProps({ onPlaybackSpeedChange: vi.fn() })));
-    fireEvent.click(screen.getByRole("button", { name: "Playback settings" }));
-    const track = screen.getByRole("menuitemradio", { name: "1×" }).parentElement!;
-    expect(fireEvent.pointerDown(track, { button: 0 })).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: /^Playback settings/ }));
+    const row = screen.getByRole("menuitemradio", { name: "1×" }).parentElement!;
+    expect(fireEvent.pointerDown(row, { button: 0 })).toBe(false);
     expect(
       fireEvent.pointerDown(screen.getByRole("menuitemradio", { name: "2×" }), { button: 0 }),
     ).toBe(true);

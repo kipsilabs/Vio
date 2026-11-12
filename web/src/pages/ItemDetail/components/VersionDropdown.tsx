@@ -21,6 +21,7 @@ import { useVersionSortPreference } from "@/hooks/useVersionSortPreference";
 import { sortVersionsByCriteria, versionSortableFromFile } from "@/lib/qualityRanking";
 import { deriveVersionHealth } from "@/lib/versionHealth";
 import { videoRangeLabel } from "@/lib/videoRange";
+import { useT, type Translate } from "@/i18n";
 import DetailPopover from "./DetailPopover";
 import { sortPlaybackVariantsByEditionPreference } from "./versionRankingUtils";
 import {
@@ -87,7 +88,11 @@ function VersionDropdown({
   onRefreshVersions,
   onCancelRefresh,
 }: VersionDropdownProps) {
+<<<<<<< HEAD
   const enrichProviderResults = useProviderResultEnrichment();
+=======
+  const t = useT();
+>>>>>>> upstream/main
   const [editionOpen, setEditionOpen] = useState(false);
   const [versionOpen, setVersionOpen] = useState(false);
   const {
@@ -108,8 +113,8 @@ function VersionDropdown({
 
   const sorted = useMemo(() => sortByResolution(versions), [versions]);
   const editionOptions = useMemo(
-    () => buildEditionOptions(playbackVariants, versions),
-    [playbackVariants, versions],
+    () => buildEditionOptions(t, playbackVariants, versions),
+    [t, playbackVariants, versions],
   );
 
   const hasNamedEditions = editionOptions.some((option) => option.variant.edition_key);
@@ -248,7 +253,7 @@ function VersionDropdown({
               className="h-8 max-w-full min-w-0 shrink gap-1.5 rounded-full px-3 text-xs font-medium"
             >
               <Layers3 className="size-3.5" />
-              Edition
+              {t("web.detail.versions.editionButton")}
               <span className="text-muted-foreground max-w-44 truncate text-[0.6875rem] font-normal sm:max-w-64">
                 {selectedEdition.label}
               </span>
@@ -259,7 +264,7 @@ function VersionDropdown({
           <div className="space-y-0.5">
             {editionOptions.map((option) => {
               const isSelected = option.id === selectedEdition.id;
-              const detail = buildEditionDetail(option);
+              const detail = buildEditionDetail(t, option);
 
               return (
                 <button
@@ -270,7 +275,7 @@ function VersionDropdown({
                     setEditionOpen(false);
                     setVersionOpen(false);
                   }}
-                  className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left transition-colors ${
+                  className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-start transition-colors ${
                     isSelected ? "bg-accent text-accent-foreground" : "hover:bg-accent/50"
                   }`}
                 >
@@ -297,9 +302,13 @@ function VersionDropdown({
               className="h-8 max-w-full min-w-0 shrink gap-1.5 rounded-full px-3 text-xs font-medium"
             >
               <Disc3 className="size-3.5" />
-              Version
+              {t("web.detail.versions.versionButton")}
               <span className="text-muted-foreground max-w-44 truncate text-[0.6875rem] font-normal sm:max-w-64">
+<<<<<<< HEAD
                 {triggerVersion ? buildVersionTriggerSummary(triggerVersion) : ""}
+=======
+                {activeVersion ? buildVersionTriggerSummary(t, activeVersion) : ""}
+>>>>>>> upstream/main
               </span>
               <ChevronDown className="text-muted-foreground size-3" />
             </Button>
@@ -346,11 +355,12 @@ function VersionDropdown({
                     onSelectVersion(version);
                     setVersionOpen(false);
                   }}
-                  className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left transition-colors ${
+                  className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-start transition-colors ${
                     isSelected ? "bg-accent text-accent-foreground" : "hover:bg-accent/50"
                   } ${unavailable && !isSelected ? "opacity-80" : ""}`}
                 >
                   <div className="min-w-0 flex-1">
+<<<<<<< HEAD
                     {providerText && <ProviderResultText text={providerText} />}
                     <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
                       <div className="flex items-center gap-2">
@@ -402,6 +412,21 @@ function VersionDropdown({
                           ),
                         )}
                       </div>
+=======
+                    <div className="flex items-center gap-2">
+                      <span className="truncate text-sm font-medium">
+                        {summary ||
+                          t("web.detail.versions.fileIdFallback", { id: version.file_id })}
+                      </span>
+                      {rangeLabel ? (
+                        <Badge
+                          variant="secondary"
+                          className="px-1.5 py-0 text-[0.625rem] uppercase"
+                        >
+                          {rangeLabel}
+                        </Badge>
+                      ) : null}
+>>>>>>> upstream/main
                     </div>
                     {showDetails &&
                       (detail || subtitleLanguageLabels(version.subtitle_tracks).length > 0) && (
@@ -502,16 +527,25 @@ export function VersionRefreshRow({
 
 export default memo(VersionDropdown);
 
+<<<<<<< HEAD
 function buildVersionTriggerSummary(version: FileVersion): string {
   return (
     buildReleasePresentation(version) ||
     buildQualitySummary(version) ||
     buildDetailLine(version) ||
     "Video version"
+=======
+function buildVersionTriggerSummary(t: Translate, version: FileVersion): string {
+  return (
+    buildQualitySummary(version) ||
+    buildDetailLine(version) ||
+    t("web.detail.versions.fileIdFallback", { id: version.file_id })
+>>>>>>> upstream/main
   );
 }
 
 function buildEditionOptions(
+  t: Translate,
   playbackVariants: PlaybackVariant[] | undefined,
   versions: FileVersion[],
 ): EditionOption[] {
@@ -540,7 +574,7 @@ function buildEditionOptions(
 
       return {
         id: variant.variant_id,
-        label: buildEditionLabel(variant, hasNamedEditions),
+        label: buildEditionLabel(t, variant, hasNamedEditions),
         variant,
         defaultVersion,
         versions: partVersions,
@@ -571,14 +605,20 @@ function resolveSelectedEditionOption(
   return editionOptions[0] ?? null;
 }
 
-function buildEditionLabel(variant: PlaybackVariant, hasNamedEditions: boolean): string {
+function buildEditionLabel(
+  t: Translate,
+  variant: PlaybackVariant,
+  hasNamedEditions: boolean,
+): string {
   if (variant.edition_raw?.trim()) {
     return variant.edition_raw.trim();
   }
   if (variant.edition_key?.trim()) {
     return humanizeEditionKey(variant.edition_key);
   }
-  return hasNamedEditions ? "Standard" : "Edition";
+  return hasNamedEditions
+    ? t("web.detail.versions.standardEdition")
+    : t("web.detail.versions.editionFallback");
 }
 
 function humanizeEditionKey(value: string): string {
@@ -594,10 +634,15 @@ function humanizeEditionKey(value: string): string {
     .join(" ");
 }
 
-function buildEditionDetail(option: EditionOption): string {
+function buildEditionDetail(t: Translate, option: EditionOption): string {
   const parts: string[] = [];
   if (option.versions.length > 1) {
-    parts.push(`${option.versions.length} versions`);
+    parts.push(
+      t("web.detail.versions.versionCount", {
+        count: option.versions.length,
+        count_text: option.versions.length,
+      }),
+    );
   }
 
   const defaultSummary = buildQualitySummary(option.defaultVersion);

@@ -2,15 +2,8 @@ package handlers
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
-	"io"
-	"net/http"
 	"sync"
 	"time"
-
-	"github.com/go-chi/chi/v5"
-	"github.com/google/uuid"
 
 	"github.com/Silo-Server/silo-server/internal/playback"
 )
@@ -41,18 +34,6 @@ type AdminPlaybackControlHandler struct {
 	relay *playback.ControlRelay
 }
 
-type playbackControlRequest struct {
-	Reason     string `json:"reason"`
-	Title      string `json:"title"`
-	Message    string `json:"message"`
-	DeadlineMS int    `json:"deadline_ms"`
-}
-
-type playbackControlResponse struct {
-	CommandID string `json:"command_id"`
-	Status    string `json:"status"`
-}
-
 func requiresLivePlaybackControl(name playback.CommandName) bool {
 	switch name {
 	case playback.CommandPause, playback.CommandUnpause:
@@ -66,6 +47,7 @@ func NewAdminPlaybackControlHandler(playbackHandler *PlaybackHandler) *AdminPlay
 	return &AdminPlaybackControlHandler{playback: playbackHandler}
 }
 
+<<<<<<< HEAD
 func (h *AdminPlaybackControlHandler) HandleStopSession(w http.ResponseWriter, r *http.Request) {
 	h.handleSessionCommand(w, r, playback.CommandStop)
 }
@@ -241,6 +223,8 @@ func decodeOptionalJSONBody(r *http.Request, target any) error {
 	return nil
 }
 
+=======
+>>>>>>> upstream/main
 func boundedPlaybackControlDeadline(deadlineMS int) time.Duration {
 	if deadlineMS <= 0 {
 		return defaultPlaybackControlDeadline

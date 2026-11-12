@@ -237,11 +237,37 @@ function buildInitialSubtitleTrackIndexes({
   }
 
   for (const version of item.versions) {
+<<<<<<< HEAD
     // The helper mirrors the server's BuildSubtitleInventoryV3 so `index` is the
     // published dense combined ordinal, not the track's position in the wire
     // array. Downloadless versions still resolve because the helper assigns the
     // same ordinals the server will.
     const tracks = buildPublishedSubtitleTracks(version.subtitle_tracks);
+=======
+    // Playback v3 assigns dense combined ordinals with sidecars first and
+    // embedded tracks second. Catalog stream indexes are not those ordinals.
+    const orderedTracks = [
+      ...(version.subtitle_tracks ?? []).filter((track) => track.external),
+      ...(version.subtitle_tracks ?? []).filter((track) => !track.external),
+    ];
+    const tracks: PlayerSubtitleInfo[] = orderedTracks.map((track, index) => ({
+      index,
+      language: track.language?.trim() || "unknown",
+      codec: track.codec,
+      label:
+        track.title?.trim() ||
+        track.embedded_title?.trim() ||
+        track.file_name?.trim() ||
+        track.language?.trim() ||
+        // Matched against a saved track signature, which stores this label in
+        // English, so it is data and is not translated (D44).
+        `Subtitle ${index + 1}`,
+      source: track.external ? "external" : "embedded",
+      forced: track.forced,
+      hearing_impaired: track.hearing_impaired,
+      url: "",
+    }));
+>>>>>>> upstream/main
     const selectedAudioTrackIndex =
       audioTrackIndex ??
       version.effective_audio_track_index ??
@@ -464,6 +490,7 @@ export function buildWatchPageProps({
     contentId: request.contentId,
     title: item.title,
     year: item.year,
+    backdrop: { url: item.backdrop_url, thumbhash: item.backdrop_thumbhash },
     fileId: request.fileId,
     versionPicked: request.versionPicked,
     libraryId: request.libraryId,

@@ -14,10 +14,14 @@ import (
 
 type DownloadRegistryService interface {
 	Capability(context.Context, int) (downloads.Capability, error)
+<<<<<<< HEAD
 	ListPage(context.Context, int, string, string, *downloads.RegistryPosition, int) ([]*downloads.Download, error)
 	Get(context.Context, int, string, string, string) (*downloads.Download, error)
+=======
+	ListPage(context.Context, int, string, string, *downloads.RegistryPosition, int, catalogpkg.AccessFilter) (downloads.RegistryPage, error)
+>>>>>>> upstream/main
 	ReportStatus(context.Context, int, string, string, string, downloads.StatusEvent) (*downloads.Download, error)
-	Delete(context.Context, int, string, string, string) error
+	Delete(context.Context, int, string, string, string, catalogpkg.AccessFilter) error
 }
 type DownloadEntry struct {
 	ID                ID                   `json:"id"`
@@ -241,21 +245,19 @@ func (reg *Registry) listDownloads(ctx context.Context, cursors *Cursors, in *Do
 			return nil, p
 		}
 	}
-	rows, err := reg.deps.Downloads.ListPage(ctx, user, profile, in.DeviceID, after, in.Limit+1)
+	page, err := reg.deps.Downloads.ListPage(ctx, user, profile, in.DeviceID, after, in.Limit, handlers.AccessFilterFromContext(ctx, ""))
 	if err != nil {
 		return nil, downloadProblem(err)
 	}
 	next := ""
-	if len(rows) > in.Limit {
-		rows = rows[:in.Limit]
-		last := rows[len(rows)-1]
-		next, err = cursors.Encode(scope, downloads.RegistryPosition{CreatedAt: last.CreatedAt, ID: last.ID})
+	if page.Next != nil {
+		next, err = cursors.Encode(scope, *page.Next)
 		if err != nil {
 			return nil, serviceProblem(err)
 		}
 	}
-	items := make([]DownloadEntry, 0, len(rows))
-	for _, row := range rows {
+	items := make([]DownloadEntry, 0, len(page.Items))
+	for _, row := range page.Items {
 		items = append(items, downloadEntryOf(row))
 	}
 	return &DownloadRegistryOutput{Body: Paginated(items, next)}, nil
@@ -296,7 +298,7 @@ func (reg *Registry) deleteDownload(ctx context.Context, in *DownloadDeleteInput
 	if p != nil {
 		return nil, p
 	}
-	if err := reg.deps.Downloads.Delete(ctx, user, profile, in.DeviceID, in.ID); err != nil {
+	if err := reg.deps.Downloads.Delete(ctx, user, profile, in.DeviceID, in.ID, handlers.AccessFilterFromContext(ctx, "")); err != nil {
 		return nil, downloadProblem(err)
 	}
 	return &struct{}{}, nil

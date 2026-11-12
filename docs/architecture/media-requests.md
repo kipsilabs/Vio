@@ -284,12 +284,19 @@ nothing is left to send, the remaining targets decide the status.
 
 A series request names the seasons it wants (`seasons`). Season numbers start
 at 1: a request naming season 0 (specials) or a negative number is refused with
+<<<<<<< HEAD
 `validation_failed`, never read as naming none. When the requester names none,
 the server asks for every aired regular season (the series metadata provider's
 seasons that have started airing, specials excluded) that is not complete in
 the library, preferring TVDB when available and falling back to TMDB. Request
 validation and defaults use the same season source the detail page shows.
 Requests from before season requests, and every v1 request, have no seasons:
+=======
+`validation_failed`, never read as naming none. When the requester names none, the server asks for every aired regular season (TMDB's seasons that
+have started airing, specials excluded) that is not complete in the library.
+Requests from before season requests, including every request made through
+the retired `/api/v1` routes, have no seasons:
+>>>>>>> upstream/main
 they mean the whole series and keep the old rule that any episode in the
 library fulfills them. A series with no aired season yet, and not in the
 library, is requested whole unless the requester names seasons.
@@ -336,6 +343,7 @@ episode of it is present.
 
 A season request is fulfilled, completed by the reconcile pass and notified,
 when every requested season is complete; while only some are, its state is
+<<<<<<< HEAD
 `partially_available`. Once the download server reports the request done, a
 season also counts when any episode of it is present: an episode the server
 cannot find would otherwise hold the request and its notification open for
@@ -349,6 +357,23 @@ the fulfilled-notification pass stamps each request it checks without
 notifying, so such requests rotate behind newer ones rather than starve them.
 Season numbers already stored on a request are not renumbered when this source
 changes: a request created under TMDB numbering keeps the numbers it stored.
+=======
+`partially_available`. A router plugin's report that a target is done does not
+complete a season request by itself: a plugin may answer for the whole series
+(Seerr's AVAILABLE does), so the target keeps its status, with the plugin's raw
+status recorded, until every requested season is complete. A series the
+library does not have, or a library that cannot report seasons, keeps it open.
+Once a request is completed, a season also counts when any episode of it is
+present: an episode the server cannot find would otherwise hold its
+notification open for good. A season with no episode in the library never
+counts, since it may not have aired yet. A library whose metadata provider
+numbers seasons differently from TMDB (absolute or TVDB order), or an aired
+episode the download server never finds, therefore keeps a season request in
+progress, and no other request for the title can be made while it is open. A
+completed request can still wait on its seasons for its notification; the
+fulfilled-notification pass stamps each request it checks without notifying,
+so such requests rotate behind newer ones rather than starve them.
+>>>>>>> upstream/main
 
 The series detail lists each regular season with its availability (`missing`,
 `partial`, `available`) and whether the active request covers it. A title still
@@ -578,7 +603,7 @@ state's `download`, with one targets query for an active request that is queued
 or downloading; search and discovery do not load targets per result. It
 carries no requester identity, so anyone who can see the title's request state
 sees it. `GET /api/v2/requests/status` advertises
-`download_progress_supported`. v1 does not carry progress. Release names,
+`download_progress_supported`. Release names,
 indexers, download clients, paths and queue messages never reach a client.
 Clients poll every 30 seconds while anything they show has `download`, and stop
 polling otherwise. The TMDB client keeps a title's detail for two minutes, so
@@ -609,10 +634,9 @@ written for the admin who fixes the submission: it can name a server or a
 routing rule, or pass on a plugin's own error text. A requester still sees the
 request's state and `outcome_reason`, and each target's quality, status and
 `download`. An admin sees every field, on those operations and on the
-`/api/v2/admin/requests` operations. The frozen `/api/v1` request routes still
-return them to everyone.
+`/api/v2/admin/requests` operations.
 
-On these profile routes, v1 and v2 alike, "admin" means the acting admin
+On these profile routes, "admin" means the acting admin
 (`apimw.ActingAdmin`, see [api-contract.md](api-contract.md)): an admin account
 acting through its primary profile, an admin API key, or an admin login session
 with no profile while no profile on the account has a PIN or an access limit, the
@@ -628,8 +652,7 @@ The admin queue groups requests by what an admin does next, from status and
 outcome alone so the database can filter and count them: needs approval
 (pending), in progress (approved, queued or downloading), failed, and done
 (completed, or closed by a decline or cancellation). An admin can retry a
-failed request or close it, which moves it to done (v2 only; the v1 cancel
-still refuses a failed request). A closed request stays closed: a target that
+failed request or close it, which moves it to done. A closed request stays closed: a target that
 reports later updates only itself. A request's
 history is its `media_request_events` rows. Target updates record the
 request's status or outcome only when it changes, so neither a reconcile pass

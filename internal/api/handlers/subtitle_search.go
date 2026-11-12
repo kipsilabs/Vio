@@ -2,38 +2,11 @@ package handlers
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
-	"io"
 	"net/http"
 	"path/filepath"
-	"strconv"
-	"strings"
 
-	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
 	"github.com/Silo-Server/silo-server/internal/subtitles"
-	"github.com/go-chi/chi/v5"
 )
-
-const (
-	subtitleUploadMaxSize = subtitles.MaxUploadSize
-	// Allow multipart framing and small form fields above the file size cap.
-	subtitleUploadMaxBodySize = subtitleUploadMaxSize + (256 << 10)
-)
-
-func parseSubtitleMultipartForm(w http.ResponseWriter, r *http.Request) bool {
-	r.Body = http.MaxBytesReader(w, r.Body, subtitleUploadMaxBodySize)
-	if err := r.ParseMultipartForm(subtitleUploadMaxSize); err != nil {
-		var maxBytesErr *http.MaxBytesError
-		if errors.As(err, &maxBytesErr) {
-			writeError(w, http.StatusRequestEntityTooLarge, "too_large", "Subtitle file must be under 5 MB")
-		} else {
-			writeError(w, http.StatusBadRequest, "bad_request", "Invalid multipart form")
-		}
-		return false
-	}
-	return true
-}
 
 // SubtitleMediaResolver looks up media metadata for subtitle search.
 type SubtitleMediaResolver interface {
@@ -66,6 +39,10 @@ type SubtitleSearchHandler struct {
 	FileAuthorizer *MediaFileAuthorizer
 	sync           SubtitleSyncService
 	external       ExternalTimingStore
+	ready          SubtitleReadyAnnouncer
+	// FileNamesVisible reports whether the caller may see file names
+	// (ItemsHandler.CanViewFilePaths). Optional: without it no caller does.
+	FileNamesVisible func(context.Context) bool
 }
 
 // NewSubtitleSearchHandler creates a new SubtitleSearchHandler.
@@ -79,26 +56,6 @@ func NewSubtitleSearchHandler(
 		repo:          repo,
 		mediaResolver: mediaResolver,
 	}
-}
-
-type searchSubtitlesRequest struct {
-	MediaFileID int      `json:"media_file_id"`
-	Languages   []string `json:"languages"`
-}
-
-type downloadSubtitleRequest struct {
-	MediaFileID     int     `json:"media_file_id"`
-	Provider        string  `json:"provider"`
-	SubtitleID      string  `json:"subtitle_id"`
-	Language        string  `json:"language"`
-	ReleaseName     string  `json:"release_name"`
-	Format          string  `json:"format"`
-	Score           float64 `json:"score"`
-	HearingImpaired bool    `json:"hearing_impaired"`
-}
-
-func (h *SubtitleSearchHandler) authorizeMediaFile(w http.ResponseWriter, r *http.Request, fileID int) bool {
-	return authorizeMediaFileAccess(w, r, h.FileAuthorizer, fileID)
 }
 
 // SubtitleProviderStatusView tells a client whether this deployment can
@@ -125,17 +82,6 @@ type SubtitleProviderStatusView struct {
 	Providers []string `json:"providers"`
 }
 
-// HandleProviderStatus reports whether external subtitle search is available
-// here, so the player can show or hide the entry point.
-// GET /api/v1/subtitles/providers/status
-//
-// It answers even when the subtitle subsystem is unwired, because enabled:false
-// is the answer in that case; the router registers a fallback so a client never
-// has to interpret a 404 on the probe itself.
-func (h *SubtitleSearchHandler) HandleProviderStatus(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, h.SubtitleProviderStatus())
-}
-
 // SubtitleProviderStatus returns public provider identifiers without credentials.
 // A missing subsystem is a disabled capability, not an unavailable endpoint.
 func (h *SubtitleSearchHandler) SubtitleProviderStatus() SubtitleProviderStatusView {
@@ -150,40 +96,7 @@ func (h *SubtitleSearchHandler) SubtitleProviderStatus() SubtitleProviderStatusV
 	}
 }
 
-// WriteSubtitleProvidersDisabledStatus answers the subtitle provider capability
-// probe with a 200 {"enabled": false, "providers": []} when no subtitle handler
-// is wired, so the client gets a clean negative instead of a 404 (the 2-segment
-// /providers/status path is not shadowed by the 1-segment /{media_file_id}
-// route — they never compete in chi's router).
-func WriteSubtitleProvidersDisabledStatus(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, SubtitleProviderStatusView{
-		SchemaVersion: 1,
-		Enabled:       false,
-		Providers:     []string{},
-	})
-}
-
-// HandleSearch handles POST /api/v1/subtitles/search
-func (h *SubtitleSearchHandler) HandleSearch(w http.ResponseWriter, r *http.Request) {
-	var req searchSubtitlesRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", "Invalid request body")
-		return
-	}
-
-	if !h.authorizeMediaFile(w, r, req.MediaFileID) {
-		return
-	}
-
-	resp, err := h.searchAuthorizedSubtitles(r.Context(), req.MediaFileID, req.Languages, true)
-	if err != nil {
-		writeError(w, err.Status, err.Code, err.Message)
-		return
-	}
-	writeJSON(w, http.StatusOK, resp)
-}
-
-func (h *SubtitleSearchHandler) searchAuthorizedSubtitles(ctx context.Context, fileID int, languages []string, bridge bool) (*subtitles.SearchResponse, *APIError) {
+func (h *SubtitleSearchHandler) searchAuthorizedSubtitles(ctx context.Context, fileID int, languages []string) (*subtitles.SearchResponse, *APIError) {
 	languages = subtitles.NormalizeBridgeSearchLanguages(languages)
 	meta, err := h.mediaResolver.GetMediaFileWithMetadata(ctx, fileID)
 	if err != nil {
@@ -212,12 +125,7 @@ func (h *SubtitleSearchHandler) searchAuthorizedSubtitles(ctx context.Context, f
 		},
 	}
 
-	var resp *subtitles.SearchResponse
-	if bridge {
-		resp, err = h.manager.SearchBridge(ctx, searchReq)
-	} else {
-		resp, err = h.manager.Search(ctx, searchReq)
-	}
+	resp, err := h.manager.Search(ctx, searchReq)
 	if err != nil {
 		return nil, apiError(http.StatusInternalServerError, "search_error", "Subtitle search failed")
 	}
@@ -225,6 +133,7 @@ func (h *SubtitleSearchHandler) searchAuthorizedSubtitles(ctx context.Context, f
 	return resp, nil
 }
 
+<<<<<<< HEAD
 // HandleDownload handles POST /api/v1/subtitles/download
 func (h *SubtitleSearchHandler) HandleDownload(w http.ResponseWriter, r *http.Request) {
 	var req downloadSubtitleRequest
@@ -419,6 +328,8 @@ func (h *SubtitleSearchHandler) HandleDelete(w http.ResponseWriter, r *http.Requ
 	w.WriteHeader(http.StatusNoContent)
 }
 
+=======
+>>>>>>> upstream/main
 func firstNonEmpty(values ...string) string {
 	for _, v := range values {
 		if v != "" {
@@ -426,13 +337,4 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
-}
-
-func parseBoolFormValue(value string) bool {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "1", "true", "yes", "on":
-		return true
-	default:
-		return false
-	}
 }

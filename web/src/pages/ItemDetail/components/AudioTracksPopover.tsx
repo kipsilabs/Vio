@@ -3,6 +3,7 @@ import { memo, useCallback, type ReactNode } from "react";
 
 import type { FileVersion } from "@/api/types";
 import { Badge } from "@/components/ui/badge";
+import { useT } from "@/i18n";
 import { Button } from "@/components/ui/button";
 import { getLanguageName } from "@/player/utils/languageNames";
 import { audioTrackLabel, formatChannels } from "@/lib/mediaFormat";
@@ -69,7 +70,7 @@ function AudioOptionRow({
     <button
       type="button"
       onClick={onSelect}
-      className={`flex w-full items-start gap-3 rounded-lg px-3 py-2.5 text-left transition-colors ${
+      className={`flex w-full items-start gap-3 rounded-lg px-3 py-2.5 text-start transition-colors ${
         active ? "bg-accent/50" : "hover:bg-accent/30"
       }`}
     >
@@ -87,6 +88,7 @@ function AudioTracksPopover({
   inventoryProvisional = false,
   onRetryInventory,
 }: AudioTracksPopoverProps) {
+  const t = useT();
   const tracks = version?.audio_tracks;
   const { expired: discoveryExpired, retry: restartDiscovery } =
     useProvisionalInventoryExpiry(inventoryProvisional);
@@ -116,8 +118,9 @@ function AudioTracksPopover({
           className="h-8 max-w-full min-w-0 shrink gap-1.5 rounded-full px-3 text-xs font-medium"
         >
           <Volume2 className="size-3.5" />
-          Audio
+          {t("web.detail.audio.button")}
           <span className="text-muted-foreground max-w-44 truncate text-[0.6875rem] font-normal sm:max-w-64">
+<<<<<<< HEAD
             {inventoryProvisional
               ? discoveryExpired
                 ? "Unavailable"
@@ -127,6 +130,13 @@ function AudioTracksPopover({
                   ? `Auto: ${autoSummary}`
                   : activeSummary
                 : tracks.length}
+=======
+            {isInteractive
+              ? selectionMode === "auto"
+                ? t("web.detail.tracks.autoSummary", { summary: autoSummary })
+                : activeSummary
+              : tracks.length}
+>>>>>>> upstream/main
           </span>
           <ChevronDown className="text-muted-foreground size-3" />
         </Button>
@@ -136,8 +146,13 @@ function AudioTracksPopover({
         {isInteractive && (
           <AudioOptionRow
             active={selectionMode === "auto"}
+<<<<<<< HEAD
             title="Auto"
             description={inventoryProvisional ? "Profile defaults" : autoSummary}
+=======
+            title={t("web.detail.tracks.auto")}
+            description={autoSummary}
+>>>>>>> upstream/main
             onSelect={onResetSelection}
           />
         )}
@@ -198,7 +213,7 @@ function AudioTracksPopover({
                   )}
                   {track.default && (
                     <Badge variant="outline" className="px-1.5 py-0 text-[0.625rem] uppercase">
-                      Default
+                      {t("web.detail.mediaInfo.defaultBadge")}
                     </Badge>
                   )}
                 </>

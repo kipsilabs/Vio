@@ -1,9 +1,6 @@
 package handlers
 
 import (
-	"encoding/json"
-	"net/http"
-	"net/http/httptest"
 	"slices"
 	"testing"
 
@@ -11,6 +8,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/userstore"
 )
 
+<<<<<<< HEAD
 func TestCollectionCapabilitiesAdvertiseSortSupport(t *testing.T) {
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/collections/capabilities", nil)
@@ -30,6 +28,12 @@ func TestCollectionCapabilitiesAdvertiseSortSupport(t *testing.T) {
 	// Every advertised kind must actually be accepted, or a client that trusts
 	// the capability gets a 400. This is the guard against the list drifting
 	// away from what catalog.NormalizeSortPreferenceRef allows.
+=======
+// Every advertised sort-preference kind must be accepted by the sort
+// preference writer, or a client that trusts the capability gets a 400.
+func TestCollectionCapabilitiesAdvertiseOnlyAcceptedSortKinds(t *testing.T) {
+	got := NewCollectionHandler(nil).Capabilities()
+>>>>>>> upstream/main
 	for _, kind := range got.SortPreferenceKinds {
 		if _, _, ok := catalog.NormalizeSortPreferenceRef(kind, "collection-1"); !ok {
 			t.Fatalf("advertised kind %q is rejected by normalizeCollectionRef", kind)

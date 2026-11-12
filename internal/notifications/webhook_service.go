@@ -196,6 +196,7 @@ func (s *WebhookService) Create(ctx context.Context, userID int, profileID strin
 	return &hook, signingSecret, nil
 }
 
+<<<<<<< HEAD
 // Update applies the provided fields. A URL change re-validates the
 // destination and resets the failure streak; re-enabling clears the
 // auto-disable reason.
@@ -224,38 +225,11 @@ func (s *WebhookService) Update(ctx context.Context, userID int, profileID, id s
 	return hook, nil
 }
 
+=======
+>>>>>>> upstream/main
 // Delete removes a webhook. Idempotent.
 func (s *WebhookService) Delete(ctx context.Context, userID int, profileID, id string) error {
 	return s.repo.Delete(ctx, userID, profileID, id)
-}
-
-// RotateSecret generates and stores a new signing secret for a generic
-// webhook, returning it exactly once. The previous secret is gone
-// immediately; there is no dual-acceptance window.
-func (s *WebhookService) RotateSecret(ctx context.Context, userID int, profileID, id string) (string, error) {
-	hook, err := s.repo.GetByID(ctx, userID, profileID, id)
-	if err != nil {
-		return "", err
-	}
-	if hook == nil {
-		return "", ErrWebhookNotFound
-	}
-	if hook.Type != WebhookTypeGeneric {
-		return "", fmt.Errorf("%w: only generic webhooks have signing secrets", ErrWebhookInvalid)
-	}
-	signingSecret, err := newSigningSecret()
-	if err != nil {
-		return "", err
-	}
-	ciphertext, err := s.cipher.Encrypt(signingSecret, webhookSecretAAD(hook.ID))
-	if err != nil {
-		return "", fmt.Errorf("encrypt signing secret: %w", err)
-	}
-	hook.SigningSecretCiphertext = &ciphertext
-	if err := s.repo.Update(ctx, *hook); err != nil {
-		return "", err
-	}
-	return signingSecret, nil
 }
 
 // WebhookTestResult is the synchronous outcome of a test send.

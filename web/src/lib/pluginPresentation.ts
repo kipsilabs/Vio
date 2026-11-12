@@ -1,5 +1,6 @@
 import type { PluginCapability, PluginInstallation, PluginPresentation } from "@/api/types";
-import { capabilityKind } from "@/lib/pluginCapabilities";
+import { englishText, t, type MessageKey } from "@/i18n";
+import { capabilityEnglishLabel, capabilityKind } from "@/lib/pluginCapabilities";
 
 export type PluginSourceKind = PluginInstallation["source_kind"];
 
@@ -40,16 +41,20 @@ export function pendingUpdateVersion(installation: PluginInstallation): string |
 
 /** The plugin's tier, shown on every plugin (1.0 plugin-management AC4). */
 export function sourceLabel(tier: string): string {
+  return t(sourceLabelKey(tier));
+}
+
+function sourceLabelKey(tier: string): MessageKey {
   switch (tier) {
     case "vio":
     case "silo":
-      return "Silo maintained";
+      return "web.admin.plugins.source.silo";
     case "approved_community":
-      return "Approved community";
+      return "web.admin.plugins.source.approvedCommunity";
     case "unverified":
-      return "Unverified";
+      return "web.admin.plugins.source.unverified";
     default:
-      return "External source";
+      return "web.admin.plugins.source.external";
   }
 }
 
@@ -63,11 +68,11 @@ export function tierNotice(tier: string): string | null {
     case "silo":
       return null;
     case "approved_community":
-      return "Reviewed by Silo maintainers to work as described and be safe for its documented use. Its author maintains and supports it, not the Silo project.";
+      return t("web.admin.plugins.source.approvedCommunityNotice");
     case "unverified":
-      return "It isn't linked to any of your catalogs, so Silo can't verify it or check it for updates. Only run it if you trust its source. To update it, upload the new version.";
+      return t("web.admin.plugins.source.unverifiedNotice");
     default:
-      return "Silo has not reviewed this plugin. It comes from a repository you added, so only run it if you trust its source.";
+      return t("web.admin.plugins.source.externalNotice");
   }
 }
 
@@ -76,6 +81,7 @@ export function configPanelId(key: string): string {
   return `config-${key}`;
 }
 
+<<<<<<< HEAD
 export interface CatalogGroup {
   kind: PluginSourceKind;
   title: string;
@@ -99,6 +105,13 @@ export const CATALOG_GROUPS: readonly CatalogGroup[] = [
     matches: (sourceKind: string) =>
       sourceKind !== "vio" && sourceKind !== "silo" && sourceKind !== "approved_community",
   },
+=======
+/** The catalog's groups in display order; `titleKey` is formatted where the heading renders. */
+export const CATALOG_GROUPS: { kind: PluginSourceKind; titleKey: MessageKey }[] = [
+  { kind: "silo", titleKey: "web.admin.plugins.catalog.groupSilo" },
+  { kind: "approved_community", titleKey: "web.admin.plugins.catalog.groupApprovedCommunity" },
+  { kind: "external", titleKey: "web.admin.plugins.catalog.groupExternal" },
+>>>>>>> upstream/main
 ];
 
 export function pluginDisplayName(pluginID: string, presentation?: PluginPresentation): string {
@@ -124,7 +137,7 @@ export function pluginSummary(
 
   return (
     capabilities.find((capability) => capability.description?.trim())?.description?.trim() ??
-    "No description provided."
+    t("web.admin.plugins.tile.noDescription")
   );
 }
 
@@ -144,17 +157,25 @@ export function pluginResourceLinks(
 ): { label: string; url: string }[] {
   return [
     {
-      label: "Source code",
+      label: t("web.admin.plugins.rail.sourceCode"),
       url: safeExternalURL(presentation?.source_url) ?? safeExternalURL(repoURL),
     },
-    { label: "Changelog", url: safeExternalURL(presentation?.changelog_url) },
-    { label: "Support", url: safeExternalURL(presentation?.support_url) },
+    {
+      label: t("web.admin.plugins.rail.changelog"),
+      url: safeExternalURL(presentation?.changelog_url),
+    },
+    {
+      label: t("web.admin.plugins.rail.support"),
+      url: safeExternalURL(presentation?.support_url),
+    },
   ].filter((link): link is { label: string; url: string } => Boolean(link.url));
 }
 
 export function licenseLabel(spdx?: string): string {
   const value = spdx?.trim();
-  return !value || value === "NOASSERTION" ? "Not specified" : value;
+  return !value || value === "NOASSERTION"
+    ? t("web.admin.plugins.rail.licenseNotSpecified")
+    : value;
 }
 
 export function pluginMatchesSearch({
@@ -182,12 +203,15 @@ export function pluginMatchesSearch({
     presentation?.description_markdown,
     presentation?.publisher_name,
     repositoryName,
+    // Shown labels, and their English so an English term still matches.
     sourceLabel(sourceKind),
+    englishText(sourceLabelKey(sourceKind)),
     ...capabilities.flatMap((capability) => [
       capability.display_name,
       capability.description,
       capability.type,
       capabilityKind(capability.type).label,
+      capabilityEnglishLabel(capability.type),
     ]),
   ]
     .filter(Boolean)

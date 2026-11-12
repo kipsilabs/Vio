@@ -5,7 +5,7 @@ import type { PlayerConfig } from "../context/PlayerConfigContext";
 import { startPlaybackV2 } from "../start-v2";
 import { hasSequencedProgress, stopSequencedSession } from "../session-mutations";
 import {
-  CONNECTION_LOST_ERROR,
+  connectionLostError,
   describePlanTerminal,
   describePlaybackTransportError,
   isAdaptationUnavailableReason,
@@ -34,6 +34,7 @@ import { replanV2 } from "../lifecycle-v2";
 import { takePlaybackIntent } from "../first-frame";
 import { playerV2Origin } from "../player-v2";
 import { buildPlayerStreamUrl } from "../stream-url";
+import { t } from "@/i18n";
 import { randomUUID } from "@/lib/uuid";
 import { matchSubtitleTrackAcrossVersions } from "../utils/subtitleSort";
 import {
@@ -907,6 +908,7 @@ function mapSubtitleInventory(
     hearing_impaired: item.hearing_impaired,
     default: item.default,
     sync_key: item.sync_key,
+    stored_subtitle_id: item.stored_subtitle_id,
     url: item.url ? buildPlayerStreamUrl(config.apiBaseUrl, item.url, token) : "",
     font_bundle_url: item.font_bundle_url
       ? buildPlayerStreamUrl(config.apiBaseUrl, item.font_bundle_url, token)
@@ -1450,8 +1452,8 @@ function describeDecisionWithoutPlan(decision: DecisionResponseV3): PlaybackSess
     };
   }
   return {
-    title: "Playback unavailable",
-    message: "This server is not accepting playback requests right now.",
+    title: t("web.player.watch.playbackUnavailable"),
+    message: t("web.player.error.notAcceptingRequests"),
   };
 }
 
@@ -1465,15 +1467,27 @@ function describePlaybackSessionError(
     return transportError;
   }
 
+<<<<<<< HEAD
+=======
+  // A request that timed out or could not connect: the browser's own wording
+  // ("signal timed out", "Failed to fetch") means nothing to the viewer.
+  if (isTransientPlayerRequestError(error)) {
+    return {
+      title: t("web.player.watch.playbackUnavailable"),
+      message: t("web.player.error.serverUnreachable"),
+    };
+  }
+
+>>>>>>> upstream/main
   if (error instanceof Error && error.message.trim().length > 0) {
     return {
-      title: "Playback unavailable",
+      title: t("web.player.watch.playbackUnavailable"),
       message: error.message,
     };
   }
 
   return {
-    title: "Playback unavailable",
+    title: t("web.player.watch.playbackUnavailable"),
     message: fallbackMessage,
   };
 }
@@ -1527,7 +1541,10 @@ export function usePlaybackSession(
     [probe, browserEngine.capabilities],
   );
   const clientPlaybackContext = useMemo(
-    () => buildClientPlaybackContextV3(probe, browserEngine.capabilities),
+    () =>
+      buildClientPlaybackContextV3(probe, browserEngine.capabilities, {
+        reopensProgressiveAtPosition: true,
+      }),
     [probe, browserEngine.capabilities],
   );
   const nativeOriginalSupport = useMemo<NativeOriginalSupport>(
@@ -2619,7 +2636,7 @@ export function usePlaybackSession(
       try {
         const selectedFileId = selectFileId(preferredFileId);
         if (!selectedFileId) {
-          throw new Error("No playable version found");
+          throw new Error(t("web.player.error.noPlayableVersion.title"));
         }
         // Remember what to re-issue if this start ends in a retryable terminal.
         retryTargetRef.current = {
@@ -2865,9 +2882,13 @@ export function usePlaybackSession(
       forceStartPosition: forceInitialPosition,
       allowPreserveExistingSessionOnError: false,
       replacementErrorMessage: "Failed to replace playback request",
+<<<<<<< HEAD
       initialErrorMessage: "Failed to start playback",
       fileSelection: explicitFileSelection ? "explicit" : "auto",
       forceRelink,
+=======
+      initialErrorMessage: t("web.player.error.fallback.start"),
+>>>>>>> upstream/main
       intentAt,
     });
   }, [
@@ -3013,11 +3034,16 @@ export function usePlaybackSession(
         setState((current) => ({
           ...current,
           replanning: false,
+<<<<<<< HEAD
           replanningQuality: false,
           errorTitle: "Playback failed",
           error: "Playback failed after repeated recovery attempts.",
           errorReason: null,
           errorRetryable: false,
+=======
+          errorTitle: t("web.player.error.recoveryExhausted.title"),
+          error: t("web.player.error.recoveryExhausted.message"),
+>>>>>>> upstream/main
         }));
         return false;
       }
@@ -3100,7 +3126,9 @@ export function usePlaybackSession(
         if (isFailureRecovery) {
           attemptedPlanKeysRef.current = attemptedPlanKeys;
           attemptCountRef.current = Math.min(attemptCount + 1, MAX_ATTEMPT_COUNT_V3 + 1);
-        } else {
+        } else if (!reconnect) {
+          // A reconnect changes nothing the viewer asked for, so the routes
+          // that already failed in this attempt stay excluded.
           attemptedPlanKeysRef.current = [];
           attemptCountRef.current = 1;
         }
@@ -3310,7 +3338,11 @@ export function usePlaybackSession(
           beginReconnectRef.current(options.positionSeconds, playIntent, false);
           return false;
         }
-        const nextError = describePlaybackSessionError(err, "Failed to update playback", "update");
+        const nextError = describePlaybackSessionError(
+          err,
+          t("web.player.error.fallback.update"),
+          "update",
+        );
         setState((current) => ({
           ...current,
           replanning: false,
@@ -3510,7 +3542,7 @@ export function usePlaybackSession(
         forceStartPosition: resumeFromAdoptedPlan ? true : startIntent.forceStartPosition,
         allowPreserveExistingSessionOnError: false,
         replacementErrorMessage: "Failed to refresh playback output",
-        initialErrorMessage: "Failed to refresh playback output",
+        initialErrorMessage: t("web.player.error.fallback.refresh"),
         // Before any plan was adopted, the viewer is still waiting on the
         // Play they pressed, so the replacement start keeps its clock. After
         // one, video has been shown and nobody pressed Play for this start.
@@ -3756,11 +3788,14 @@ export function usePlaybackSession(
   // the route and could push a direct-play viewer onto a transcode. Each
   // attempt first asks for the current route again with a `track_change` that
   // changes nothing (the server keeps the route eligible and answers with a
-  // fresh plan at the saved position). If the session did not survive — a
-  // server restart answers 404 — it starts a new session at the same position
-  // with the same tracks. Unreachable or overloaded answers back off; any
-  // adopted plan ends the cycle; the viewer leaving or another start cancels
-  // it.
+  // fresh plan at the saved position). A progressive remux reanchors instead:
+  // the no-op track_change replans from the top and can hand back a route that
+  // already failed in this attempt, while a reanchor reopens the remux at the
+  // saved position, as the remux range refusal promises. If the session did not
+  // survive — a server restart answers 404 — it starts a new session at the
+  // same position with the same tracks. Unreachable or overloaded answers back
+  // off; any adopted plan ends the cycle; the viewer leaving or another start
+  // cancels it.
 
   const scheduleReconnectAttempt = useCallback((delayMs: number) => {
     const reconnect = reconnectRef.current;
@@ -3800,7 +3835,7 @@ export function usePlaybackSession(
       reconnect.resume = resume;
       if (reconnect.attempts >= RECONNECT_MAX_ATTEMPTS) {
         // The stream keeps dropping right after every recovery.
-        giveUpReconnect(CONNECTION_LOST_ERROR);
+        giveUpReconnect(connectionLostError());
         return;
       }
       setState((current) => ({
@@ -3828,7 +3863,7 @@ export function usePlaybackSession(
     reconnect.attempts += 1;
     const retryLater = () => {
       if (reconnect.attempts >= RECONNECT_MAX_ATTEMPTS) {
-        giveUpReconnect(CONNECTION_LOST_ERROR);
+        giveUpReconnect(connectionLostError());
         return;
       }
       scheduleReconnectAttempt(reconnectDelayMs(reconnect.attempts));
@@ -3837,11 +3872,11 @@ export function usePlaybackSession(
 
     if (planRef.current && sessionIdRef.current) {
       try {
-        const adopted = await issueReplanRef.current(
-          { operation: "track_change", positionSeconds },
-          false,
-          true,
-        );
+        const operation =
+          planRef.current.delivery === "server_remux_progressive"
+            ? "seek_reanchor"
+            : "track_change";
+        const adopted = await issueReplanRef.current({ operation, positionSeconds }, false, true);
         // An adopted plan has already ended the cycle.
         if (adopted || !isCurrent()) return;
       } catch (error) {
@@ -3875,7 +3910,7 @@ export function usePlaybackSession(
       forceStartPosition: true,
       allowPreserveExistingSessionOnError: true,
       replacementErrorMessage: "Failed to restart playback after the connection was lost",
-      initialErrorMessage: "Failed to restart playback",
+      initialErrorMessage: t("web.player.error.fallback.restart"),
       intentAt: null,
       reconnect: true,
       // The plan's selection is the viewer's: the player replans every
@@ -3889,7 +3924,7 @@ export function usePlaybackSession(
         retryLater();
         return;
       }
-      giveUpReconnect(describePlaybackSessionError(outcome.error, CONNECTION_LOST_ERROR.message));
+      giveUpReconnect(describePlaybackSessionError(outcome.error, connectionLostError().message));
       return;
     }
     if (outcome.kind === "refused") {
@@ -5003,6 +5038,7 @@ export function usePlaybackSession(
             // old plan active on the client.
             allowPreserveExistingSessionOnError: false,
             replacementErrorMessage: "Failed to switch playback version",
+<<<<<<< HEAD
             initialErrorMessage: "Failed to switch version",
             // Carry the current audio selection across the version switch: the
             // server remaps the file-bound identity by track family onto the
@@ -5016,6 +5052,9 @@ export function usePlaybackSession(
             // A version switch is always an explicit user action: the server
             // must not silently substitute yet another version.
             fileSelection: "explicit",
+=======
+            initialErrorMessage: t("web.player.error.fallback.switchVersion"),
+>>>>>>> upstream/main
             intentAt,
           });
         } finally {

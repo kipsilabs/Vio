@@ -37,6 +37,7 @@ import { SchemaForm } from "@/components/admin/plugins/SchemaForm";
 import { buildSchemaValues, parseFieldTypes } from "@/components/admin/plugins/schemaFormUtils";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+<<<<<<< HEAD
 import {
   Dialog,
   DialogContent,
@@ -97,6 +98,12 @@ import {
 } from "@/lib/mediaRequests";
 import { applyExclusivity } from "./requestExclusivity";
 import { supportedMediaTypesForConfig } from "./admin-settings/requestIntegrationMediaTypes";
+=======
+import { useAdminRequestCapabilities } from "@/hooks/queries/admin/requests";
+import { useT } from "@/i18n";
+import { RequestQueue } from "@/pages/admin-requests/RequestQueue";
+import { EmptyPanel, RowsSkeleton } from "@/pages/admin-requests/queueParts";
+>>>>>>> upstream/main
 
 type StatusFilter = MediaRequestStatus | "all";
 type OutcomeFilter = MediaRequestOutcome | "all";
@@ -111,8 +118,34 @@ function normalizeAdminRequestTab(value: string | null): AdminRequestTab {
 }
 
 export default function AdminRequests() {
+<<<<<<< HEAD
   const [searchParams, setSearchParams] = useSearchParams();
   const activeTab = normalizeAdminRequestTab(searchParams.get("tab"));
+=======
+  const [searchParams] = useSearchParams();
+  const requestedTab = searchParams.get("tab");
+  const movedTo = requestedTab === null ? undefined : MOVED_TABS[requestedTab];
+  if (movedTo) return <MovedTab tab={requestedTab!} to={movedTo} />;
+  return <RequestQueuePage />;
+}
+
+/** Sends a link to a retired tab where its content lives now. */
+function MovedTab({ tab, to }: { tab: string; to: string }) {
+  const t = useT();
+  useEffect(() => {
+    if (tab !== "overrides") return;
+    // The fixed id keeps a double-run effect from stacking two toasts.
+    toast.info(t("web.admin.requests.page.overridesMoved.title"), {
+      id: OVERRIDES_MOVED_TOAST,
+      description: t("web.admin.requests.page.overridesMoved.description"),
+    });
+  }, [tab, t]);
+  return <Navigate to={to} replace />;
+}
+
+function RequestQueuePage() {
+  const t = useT();
+>>>>>>> upstream/main
   const capabilities = useAdminRequestCapabilities();
 
   function setActiveTab(value: string) {
@@ -135,14 +168,15 @@ export default function AdminRequests() {
   ) {
     return (
       <EmptyPanel
-        title="Request administration unavailable"
-        detail="Request administration could not be enabled on this server."
+        title={t("web.admin.requests.page.unavailable.title")}
+        detail={t("web.admin.requests.page.unavailable.detail")}
       />
     );
   }
 
   return (
     <div className="space-y-6">
+<<<<<<< HEAD
       <div className="page-header">
         <div className="space-y-2">
           <h1 className="text-3xl font-semibold tracking-normal text-balance sm:text-4xl">
@@ -153,6 +187,20 @@ export default function AdminRequests() {
           </p>
         </div>
       </div>
+=======
+      <PageHeader
+        title={t("web.admin.requests.page.title")}
+        subtitle={t("web.admin.requests.page.subtitle")}
+        actions={
+          <Button asChild variant="outline" size="sm">
+            <Link to={REQUEST_SETTINGS_HREF}>
+              <Settings2 aria-hidden="true" />
+              {t("web.admin.requests.page.settingsLink")}
+            </Link>
+          </Button>
+        }
+      />
+>>>>>>> upstream/main
 
       <Tabs value={activeTab} onValueChange={setActiveTab} className="gap-5">
         <div className="-mx-4 overflow-x-auto px-4 pb-1 [scrollbar-width:thin] sm:mx-0 sm:px-0">

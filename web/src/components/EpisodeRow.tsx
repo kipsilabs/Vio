@@ -5,11 +5,15 @@ import CardOverlays from "@/components/overlays/CardOverlays";
 import UnreadableFileBadge, { episodeFilesUnreadable } from "@/components/UnreadableFileBadge";
 import { useOverlayPrefs } from "@/hooks/useOverlayPrefs";
 import { overlayDataFromEpisodeListItem } from "@/lib/overlays";
+<<<<<<< HEAD
 import {
   formatCalendarDate,
   isUpcomingEpisode,
   useEpisodeReleaseCapability,
 } from "@/hooks/queries/episodeRelease";
+=======
+import { useT } from "@/i18n";
+>>>>>>> upstream/main
 
 interface EpisodeRowProps {
   episode: EpisodeListItem;
@@ -19,6 +23,10 @@ interface EpisodeRowProps {
 }
 
 export default function EpisodeRow({ episode, rating, watched, progress }: EpisodeRowProps) {
+  const t = useT();
+  const fallbackTitle = t("web.detail.episodes.numbered", {
+    episode: episode.episode_number,
+  });
   const { prefs: overlayPrefs } = useOverlayPrefs();
   // Capability-gated upcoming treatment: an older server without
   // release_state keeps today's plain row rendering.
@@ -63,10 +71,15 @@ export default function EpisodeRow({ episode, rating, watched, progress }: Episo
         {episode.still_url ? (
           <img
             src={episode.still_url}
+<<<<<<< HEAD
             alt={episode.title || `Episode ${episode.episode_number}`}
             className={`h-full w-full object-cover transition-transform duration-300 ${
               upcoming ? "opacity-45 saturate-50" : "group-hover:scale-[1.03]"
             }`}
+=======
+            alt={episode.title || fallbackTitle}
+            className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.03]"
+>>>>>>> upstream/main
             loading="lazy"
             decoding="async"
           />
@@ -112,7 +125,7 @@ export default function EpisodeRow({ episode, rating, watched, progress }: Episo
       <div className="min-w-0 flex-1">
         <div className="mb-0.5 flex items-center gap-2">
           <span className="text-foreground truncate text-sm font-semibold">
-            {episode.title || `Episode ${episode.episode_number}`}
+            {episode.title || fallbackTitle}
           </span>
           {watchedState && (
             <svg
@@ -129,6 +142,7 @@ export default function EpisodeRow({ episode, rating, watched, progress }: Episo
           )}
         </div>
         <div className="text-muted-foreground text-xs">
+<<<<<<< HEAD
           {upcoming ? (
             <span>Upcoming{episode.air_date && ` · ${formatCalendarDate(episode.air_date)}`}</span>
           ) : (
@@ -143,6 +157,19 @@ export default function EpisodeRow({ episode, rating, watched, progress }: Episo
                   )}
                   <UnreadableFileBadge />
                 </>
+=======
+          {episode.air_date && <span>{episode.air_date}</span>}
+          {episode.air_date && episode.runtime > 0 && (
+            <span className="mx-1.5">{t("web.detail.separator.dot")}</span>
+          )}
+          {episode.runtime > 0 && (
+            <span>{t("web.detail.episodes.runtimeMinutes", { minutes: episode.runtime })}</span>
+          )}
+          {episodeFilesUnreadable(episode) && (
+            <>
+              {(episode.air_date || episode.runtime > 0) && (
+                <span className="mx-1.5">{t("web.detail.separator.dot")}</span>
+>>>>>>> upstream/main
               )}
             </>
           )}

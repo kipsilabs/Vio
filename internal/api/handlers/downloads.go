@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -14,8 +13,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/go-chi/chi/v5"
-
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/downloads"
@@ -23,7 +20,6 @@ import (
 	"github.com/Silo-Server/silo-server/internal/logredact"
 	"github.com/Silo-Server/silo-server/internal/netaccess"
 	"github.com/Silo-Server/silo-server/internal/nodepool"
-	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/streamtoken"
 )
 
@@ -43,8 +39,8 @@ type DownloadService interface {
 	SyncSubscriptions(ctx context.Context, userID int, profileID, deviceID string, filter catalog.AccessFilter) (int, error)
 	ServeDirect(ctx context.Context, w http.ResponseWriter, r *http.Request, userID, fileID int, format string, filter catalog.AccessFilter) error
 	ServeFile(ctx context.Context, w http.ResponseWriter, r *http.Request, userID int, profileID, deviceID, downloadID string, filter catalog.AccessFilter) error
-	List(ctx context.Context, userID int, profileID, deviceID string) ([]*downloads.Download, error)
-	Delete(ctx context.Context, userID int, profileID, deviceID, downloadID string) error
+	List(ctx context.Context, userID int, profileID, deviceID string, filter catalog.AccessFilter) ([]*downloads.Download, error)
+	Delete(ctx context.Context, userID int, profileID, deviceID, downloadID string, filter catalog.AccessFilter) error
 	PatchStatus(ctx context.Context, userID int, profileID, deviceID, downloadID, status string) error
 	BuildManifest(ctx context.Context, userID int, profileID, deviceID, downloadID string, filter catalog.AccessFilter) (*downloads.OfflineManifest, error)
 	BuildBatchManifests(ctx context.Context, userID int, profileID, deviceID, batchID string, filter catalog.AccessFilter) ([]*downloads.OfflineManifest, []downloads.SkippedManifest, error)
@@ -54,13 +50,17 @@ type DownloadService interface {
 
 // DownloadHandler handles download endpoints.
 type DownloadHandler struct {
-	svc             DownloadService
-	nodePlanner     nodepool.DownloadPlanner
-	jwtSecret       func() string
-	proxyHTTPClient *http.Client
-	linkIssuer      DirectDownloadLinkIssuer
-	preflightMu     sync.Mutex
-	preflightCache  map[string]proxyPreflightResult
+	// FileNamesVisible reports whether the caller may see file names
+	// (ItemsHandler.CanViewFilePaths). Optional: without it no caller does, and
+	// every download is named by its title.
+	FileNamesVisible func(context.Context) bool
+	svc              DownloadService
+	nodePlanner      nodepool.DownloadPlanner
+	jwtSecret        func() string
+	proxyHTTPClient  *http.Client
+	linkIssuer       DirectDownloadLinkIssuer
+	preflightMu      sync.Mutex
+	preflightCache   map[string]proxyPreflightResult
 }
 
 type proxyPreflightResult struct {
@@ -133,6 +133,21 @@ func (h *DownloadHandler) CreateDirectDownloadLink(ctx context.Context, fileID i
 	return h.linkIssuer.GenerateDirectDownloadLinkToken(claims.UserID, claims.Role, claims.SessionID, profileID, claims.ImpersonatorUserID, fileID)
 }
 
+// downloadAttachmentNamer names a download's saved file for the request's
+// caller (downloads.Service.AttachmentName).
+type downloadAttachmentNamer interface {
+	AttachmentName(ctx context.Context, target *downloads.FileTarget) string
+}
+
+// withDownloadNaming marks the request when its caller may see file names, so
+// its downloads keep the file's own name instead of one built from the title.
+func (h *DownloadHandler) withDownloadNaming(r *http.Request) *http.Request {
+	if h.FileNamesVisible != nil && h.FileNamesVisible(r.Context()) {
+		return r.WithContext(downloads.WithFileNamesVisible(r.Context()))
+	}
+	return r
+}
+
 type downloadFileResolver interface {
 	ResolveDirectFile(ctx context.Context, userID, fileID int, format string, filter catalog.AccessFilter) (*downloads.FileTarget, error)
 	ResolveManagedFile(ctx context.Context, userID int, profileID, deviceID, downloadID string, filter catalog.AccessFilter) (*downloads.FileTarget, error)
@@ -143,100 +158,6 @@ const (
 	proxyPreflightCacheTTL = 5 * time.Second
 )
 
-// downloadRequest represents the JSON body for POST /downloads.
-type downloadRequest struct {
-	ContentID string `json:"content_id"`
-	EpisodeID string `json:"episode_id,omitempty"`
-	FileID    int    `json:"file_id,omitempty"`
-	Quality   string `json:"quality,omitempty"`       // original (default) | 20mbps | 10mbps | 5mbps | 2mbps | 1mbps
-	Series    bool   `json:"series,omitempty"`        // if true, downloads all episodes
-	Season    *int   `json:"season_number,omitempty"` // with series=true, downloads only this season (0 = Specials)
-	// Caps is the device decode capability (original fallback / transcode
-	// target). The playback type is decoded directly: its JSON contract is the
-	// download `caps` contract, and a mirror struct here could only drift.
-	Caps *playback.ClientCapabilities `json:"caps,omitempty"`
-}
-
-// patchDownloadRequest is the JSON body for PATCH /downloads/{id}.
-type patchDownloadRequest struct {
-	Status string `json:"status"`
-}
-
-// downloadResponse represents a download entry in API responses.
-type downloadResponse struct {
-	ID                string  `json:"id"`
-	ContentID         string  `json:"content_id"`
-	EpisodeID         string  `json:"episode_id,omitempty"`
-	BatchID           string  `json:"batch_id,omitempty"`
-	DeviceID          string  `json:"device_id,omitempty"`
-	MediaFileID       int     `json:"media_file_id"`
-	FileSize          int64   `json:"file_size"`
-	BytesSent         int64   `json:"bytes_sent"`
-	Kind              string  `json:"kind"`
-	Status            string  `json:"status"`
-	Quality           string  `json:"quality"`
-	EffectiveQuality  string  `json:"effective_quality"`
-	DeliveryFormat    string  `json:"delivery_format"`
-	TargetBitrateKbps int     `json:"target_bitrate_kbps"`
-	Revision          int     `json:"revision"`
-	CreatedAt         string  `json:"created_at"`
-	CompletedAt       *string `json:"completed_at,omitempty"`
-}
-
-// downloadsListResponse wraps the downloads list for JSON serialization.
-type downloadsListResponse struct {
-	Downloads []downloadResponse          `json:"downloads"`
-	Skipped   []downloads.SkippedDownload `json:"skipped,omitempty"`
-}
-
-type batchManifestsResponse struct {
-	Manifests []*downloads.OfflineManifest `json:"manifests"`
-	// Skipped lists batch entries whose manifest could not be built (revoked,
-	// deleted from the catalog, access-filtered); the rest of the batch is
-	// still delivered.
-	Skipped []downloads.SkippedManifest `json:"skipped,omitempty"`
-}
-
-// downloadCapabilityResponse is the GET /downloads/capability payload clients
-// use for feature detection instead of introspecting admin settings.
-type downloadCapabilityResponse struct {
-	Enabled              bool     `json:"enabled"`
-	DownloadAllowed      bool     `json:"download_allowed"`
-	QualityPresets       []string `json:"quality_presets"`
-	TranscodeEnabled     bool     `json:"transcode_enabled"`
-	TranscodeUserAllowed bool     `json:"transcode_user_allowed"`
-	SeasonDownload       bool     `json:"season_download"`
-	SeriesMonitoring     bool     `json:"series_monitoring"`
-	MonitoringModes      []string `json:"monitoring_modes,omitempty"`
-	ProxyDelivery        bool     `json:"proxy_delivery"`
-}
-
-func toDownloadResponse(d *downloads.Download) downloadResponse {
-	resp := downloadResponse{
-		ID:                d.ID,
-		ContentID:         d.ContentID,
-		EpisodeID:         d.EpisodeID,
-		BatchID:           d.BatchID,
-		DeviceID:          d.DeviceID,
-		MediaFileID:       d.MediaFileID,
-		FileSize:          d.FileSize,
-		BytesSent:         d.BytesSent,
-		Kind:              d.Kind,
-		Status:            d.Status,
-		Quality:           d.Quality,
-		EffectiveQuality:  d.EffectiveQuality,
-		DeliveryFormat:    d.Format,
-		TargetBitrateKbps: d.TargetBitrateKbps,
-		Revision:          d.Revision,
-		CreatedAt:         d.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
-	}
-	if d.CompletedAt != nil {
-		s := d.CompletedAt.Format("2006-01-02T15:04:05Z07:00")
-		resp.CompletedAt = &s
-	}
-	return resp
-}
-
 // managedIdentity returns the (profileID, deviceID) the request is acting as.
 // deviceID comes ONLY from the X-Vio-Device-Id header (never the body/query);
 // profileID is resolved by the viewer-access middleware from X-Profile-Id.
@@ -245,6 +166,7 @@ func managedIdentity(r *http.Request) (profileID, deviceID, deviceName, devicePl
 	return apimw.GetProfileID(r.Context()), device.DeviceID, device.DeviceName, device.DevicePlatform
 }
 
+<<<<<<< HEAD
 // HandleCapability handles GET /downloads/capability.
 func (h *DownloadHandler) HandleCapability(w http.ResponseWriter, r *http.Request) {
 	userID := apimw.GetUserID(r.Context())
@@ -517,6 +439,10 @@ func (h *DownloadHandler) writeDownloadFileError(w http.ResponseWriter, r *http.
 // A legacy format=original query is accepted, but direct downloads remain
 // original-only. v1 keeps its historical refusal wire answers; the distinct
 // refusal codes are exposed only by HandleDirectDownloadV2.
+=======
+// HandleDirectDownload handles GET /direct-download?file_id=N. A legacy
+// format=original query is accepted, but direct downloads remain original-only.
+>>>>>>> upstream/main
 func (h *DownloadHandler) HandleDirectDownload(w http.ResponseWriter, r *http.Request) {
 	h.handleDirectDownload(w, r, false, false)
 }
@@ -534,12 +460,17 @@ func (h *DownloadHandler) HandleDirectDownloadViaProxy(w http.ResponseWriter, r 
 	h.handleDirectDownload(w, r, true, false)
 }
 
+<<<<<<< HEAD
 // HandleDirectDownloadViaProxyV2 serves GET/HEAD /api/v2/direct-download-proxy.
 func (h *DownloadHandler) HandleDirectDownloadViaProxyV2(w http.ResponseWriter, r *http.Request) {
 	h.handleDirectDownload(w, r, true, true)
 }
 
 func (h *DownloadHandler) handleDirectDownload(w http.ResponseWriter, r *http.Request, delegate, v2 bool) {
+=======
+func (h *DownloadHandler) handleDirectDownload(w http.ResponseWriter, r *http.Request, delegate bool) {
+	r = h.withDownloadNaming(r)
+>>>>>>> upstream/main
 	userID := apimw.GetUserID(r.Context())
 	if userID == 0 {
 		writeError(w, http.StatusUnauthorized, "unauthorized", "Authentication required")
@@ -671,11 +602,13 @@ func (h *DownloadHandler) redirectToProxy(w http.ResponseWriter, r *http.Request
 	}
 	mediaPath := target.Path
 	downloadFilename := ""
+	if namer, ok := h.svc.(downloadAttachmentNamer); ok {
+		downloadFilename = namer.AttachmentName(r.Context(), target)
+	} else if target.OriginArtifactID != "" && strings.TrimSpace(target.Path) != "" {
+		downloadFilename = filepath.Base(target.Path)
+	}
 	if target.OriginArtifactID != "" {
 		mediaPath = ""
-		if strings.TrimSpace(target.Path) != "" {
-			downloadFilename = filepath.Base(target.Path)
-		}
 	}
 	playMethod := streamtoken.PlayMethodDownload
 	if target.ExpectedExecutionFingerprint != "" {
@@ -779,6 +712,7 @@ func (h *DownloadHandler) proxyCanServe(ctx context.Context, cacheKey, probeURL 
 	return reachable
 }
 
+<<<<<<< HEAD
 // requireManaged validates a managed (device-scoped) request: authentication, a
 // configured service, and the device + profile identity (device_id from the
 // X-Vio-Device-Id header only, never the body). On failure it writes the error
@@ -921,6 +855,8 @@ func (h *DownloadHandler) writeAssetError(w http.ResponseWriter, asset, id strin
 	}
 }
 
+=======
+>>>>>>> upstream/main
 func (h *DownloadHandler) writeDownloadError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, downloads.ErrFeatureDisabled):

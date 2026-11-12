@@ -1,12 +1,6 @@
 package handlers
 
 import (
-	"errors"
-	"io"
-	"net/http"
-
-	"github.com/go-chi/chi/v5"
-
 	"github.com/Silo-Server/silo-server/internal/branding"
 )
 
@@ -21,6 +15,7 @@ type BrandingHandler struct {
 func NewBrandingHandler(svc *branding.Service) *BrandingHandler {
 	return &BrandingHandler{svc: svc}
 }
+<<<<<<< HEAD
 
 // brandingResponse is returned by GET /theme/branding. It is a superset of the
 // historical {server_name, login_subtitle} shape — new fields are additive per
@@ -175,3 +170,5 @@ func (h *BrandingHandler) HandleDeleteAsset(w http.ResponseWriter, r *http.Reque
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
+=======
+>>>>>>> upstream/main

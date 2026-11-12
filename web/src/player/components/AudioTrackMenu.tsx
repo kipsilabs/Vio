@@ -1,13 +1,18 @@
-import { useState, useCallback, useEffect, useRef } from "react";
-import { AudioLines } from "lucide-react";
+import { useState, useCallback, useRef } from "react";
+import { AudioLines, Check } from "lucide-react";
 import type { PlayerAudioTrack } from "../types";
 import { audioTrackLabel, formatChannels } from "@/lib/mediaFormat";
+<<<<<<< HEAD
 import {
   audioTitle,
   compactAudioMeta,
   formatLanguageName,
 } from "@/pages/ItemDetail/components/versionFormatUtils";
 import { dedupeAudioTracks } from "../utils/trackDedupe";
+=======
+import { formatLanguageName } from "@/pages/ItemDetail/components/versionFormatUtils";
+import { useT, type Translate } from "@/i18n";
+>>>>>>> upstream/main
 import { PlayerMenuSurface } from "./PlayerMenuSurface";
 import { ProvisionalTrackBadge } from "./ProvisionalTrackBadge";
 import { DiscoveryRetryButton } from "./DiscoveryRetryButton";
@@ -50,10 +55,9 @@ interface AudioTrackMenuProps {
 }
 
 /**
- * Rich per-track descriptor used for the menu rows.
- *  - `title`   — human-readable primary label (falls back gracefully).
- *  - `meta`    — "Language · layout · bitrate · sample-rate · bit-depth".
- *  - `badges`  — codec / channel / default pills.
+ * Per-track descriptor used for the menu rows.
+ *  - `title` — human-readable primary label (falls back gracefully).
+ *  - `meta`  — "codec · layout · language".
  *
  * This mirrors what the item detail page surfaces so the audio track names
  * stay consistent across the app instead of collapsing to an opaque embedded
@@ -62,25 +66,39 @@ interface AudioTrackMenuProps {
 interface TrackDescriptor {
   title: string;
   meta: string;
-  codecLabel: string;
-  channelsLabel: string;
   isDefault: boolean;
 }
 
+<<<<<<< HEAD
 function describeTrack(track: PlayerAudioTrack, index: number): TrackDescriptor {
   const title = audioTitle(track) || `Track ${index + 1}`;
   const language = track.languages?.length
     ? track.languages.map(formatLanguageName).filter(Boolean).join("/")
     : formatLanguageName(track.language ?? "");
+=======
+/** A stream title that only restates the format ("DCA (DTS Coherent Acoustics)", "Stereo"). */
+const CODEC_TITLE =
+  /^(?:[\s()·.,-]|dca|dts(?:-hd)?|ma|coherent|acoustics|ac-?3|e-?ac-?3|truehd|atmos|aac|flac|opus|mp3|pcm|dolby|digital|plus|surround|stereo|mono|[257]\.[01])+$/i;
+
+function describeTrack(t: Translate, track: PlayerAudioTrack, index: number): TrackDescriptor {
+  const language = formatLanguageName(track.language ?? "");
+  // Only a title the stream carries: without one, the language leads rather
+  // than a run-together "en aac 5.1".
+  const streamTitle = track.title || track.embedded_title || "";
+  const title =
+    (streamTitle && !(language && CODEC_TITLE.test(streamTitle)) ? streamTitle : language) ||
+    t("web.player.audioMenu.trackFallback", { number: index + 1 });
+  // Codec and layout are what tell two tracks in the same language apart; the
+  // bitrate and sample detail stay in Playback info.
+>>>>>>> upstream/main
   const metaParts = [
+    audioTrackLabel(track),
+    formatChannels(track.channels),
     language && language.toLowerCase() !== title.toLowerCase() ? language : "",
-    compactAudioMeta(track),
   ].filter(Boolean);
   return {
     title,
     meta: metaParts.join(" \u00B7 "),
-    codecLabel: audioTrackLabel(track),
-    channelsLabel: formatChannels(track.channels),
     isDefault: Boolean(track.default),
   };
 }
@@ -99,6 +117,7 @@ export function AudioTrackMenu({
   failed = false,
   onRetryDiscovery,
 }: AudioTrackMenuProps) {
+  const t = useT();
   const [uncontrolledOpen, setUncontrolledOpen] = useState(false);
   const rawOpen = controlledOpen ?? uncontrolledOpen;
   // A replace or replan swaps the inventory out from under the menu. The raw
@@ -125,19 +144,12 @@ export function AudioTrackMenu({
     [currentPosition, locked, onSelect, setOpen],
   );
 
-  const handleBlur = useCallback((e: React.FocusEvent) => {
-    if (!menuRef.current?.contains(e.relatedTarget as Node)) {
-      setOpen(false);
-    }
-  }, []);
-
-  // Close on Escape.
-  useEffect(() => {
-    if (!open) return;
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
+  const handleBlur = useCallback(
+    (e: React.FocusEvent) => {
+      if (!menuRef.current?.contains(e.relatedTarget as Node)) {
         setOpen(false);
       }
+<<<<<<< HEAD
     };
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
@@ -178,6 +190,11 @@ export function AudioTrackMenu({
     e.preventDefault();
     items[nextIndex]?.focus();
   }, []);
+=======
+    },
+    [setOpen],
+  );
+>>>>>>> upstream/main
 
   // A spinner with no bound is an indefinite lie about progress. Once the
   // provisional window lapses, the menu offers the same retry a terminal
@@ -189,6 +206,7 @@ export function AudioTrackMenu({
     onRetryDiscovery?.();
   }, [onRetryDiscovery, restartDiscovery]);
 
+<<<<<<< HEAD
   if (tracks.length === 0 && !provisional && !pending && !failed && !open) return null;
 
   // Probed inventories can repeat the same stream at several container
@@ -201,31 +219,56 @@ export function AudioTrackMenu({
   // the list under its explicit "discovery did not complete" notice instead of
   // leaving the menu empty.
   const displayedTracks = provisional && !failed ? [] : dedupedTracks;
+=======
+  const disabled = tracks.length <= 1;
+  // The rail names the track playing ("English 5.1") where it has room.
+  const activeTrack = tracks[activeIndex];
+  const valueLabel = activeTrack
+    ? [formatLanguageName(activeTrack.language ?? ""), formatChannels(activeTrack.channels)]
+        .filter(Boolean)
+        .join(" ")
+    : "";
+>>>>>>> upstream/main
 
   return (
     <div ref={menuRef} className="relative" onBlur={handleBlur}>
       {!hideTrigger && (
         <button
           type="button"
+<<<<<<< HEAD
           className="player-utility-btn disabled:cursor-not-allowed disabled:opacity-40"
           onClick={() => setOpen((v) => !v)}
           aria-label="Audio tracks"
+=======
+          className="hud-icon-btn hud-rail-btn"
+          onClick={disabled ? undefined : () => setOpen((v) => !v)}
+          aria-label={
+            valueLabel
+              ? t("web.player.audioMenu.triggerWithTrack", { track: valueLabel })
+              : t("web.player.audioMenu.trigger")
+          }
+          title={
+            disabled ? t("web.player.audioMenu.onlyOneTrack") : t("web.player.audioMenu.trigger")
+          }
+>>>>>>> upstream/main
           aria-expanded={open}
           aria-haspopup="menu"
           aria-disabled={locked || undefined}
           disabled={locked}
         >
-          <AudioLines className="h-[18px] w-[18px]" />
+          <AudioLines />
+          {valueLabel ? <span className="hud-rail-label">{valueLabel}</span> : null}
         </button>
       )}
 
       {open && (
         <PlayerMenuSurface
+          title={t("web.player.audioMenu.heading")}
           anchorRef={menuRef}
-          className="absolute right-0 bottom-full z-30 mb-2 max-w-[min(360px,calc(100vw-1rem))] min-w-[280px] rounded-lg bg-black/90 py-1.5 shadow-xl backdrop-blur-sm"
+          className="hud-popover w-[27rem] max-w-[calc(100vw-2rem)]"
           onClose={() => setOpen(false)}
-          onKeyDown={handleMenuKeyDown}
         >
+<<<<<<< HEAD
           <div className="flex items-center justify-between gap-2 px-3 py-1.5">
             <span className="text-xs font-medium tracking-wide text-white/50 uppercase">Audio</span>
             {provisional && <ProvisionalTrackBadge />}
@@ -289,16 +332,41 @@ export function AudioTrackMenu({
                       <TrackBadge>{descriptor.channelsLabel}</TrackBadge>
                     )}
                     {descriptor.isDefault && <TrackBadge variant="outline">Default</TrackBadge>}
+=======
+          <div className="hud-scroll-list">
+            {tracks.map((track, index) => {
+              const descriptor = describeTrack(t, track, index);
+              const isActive = index === activeIndex;
+              return (
+                <button
+                  key={index}
+                  role="menuitemradio"
+                  type="button"
+                  aria-checked={isActive}
+                  className="hud-item items-start"
+                  onClick={() => handleSelect(index)}
+                >
+                  <span aria-hidden="true" className="hud-check pt-0.5">
+                    {isActive ? <Check /> : null}
+>>>>>>> upstream/main
                   </span>
-                  {descriptor.meta && (
-                    <span className="truncate text-[11px] leading-snug text-white/55">
-                      {descriptor.meta}
+                  <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+                    <span className="line-clamp-2" title={descriptor.title}>
+                      {descriptor.title}
                     </span>
-                  )}
-                </span>
-              </button>
-            );
-          })}
+                    {descriptor.meta || descriptor.isDefault ? (
+                      <span className="hud-item-secondary flex flex-wrap items-center gap-x-2 gap-y-1">
+                        {descriptor.meta ? <span>{descriptor.meta}</span> : null}
+                        {descriptor.isDefault ? (
+                          <span className="hud-chip">{t("web.player.audioMenu.defaultBadge")}</span>
+                        ) : null}
+                      </span>
+                    ) : null}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
         </PlayerMenuSurface>
       )}
     </div>

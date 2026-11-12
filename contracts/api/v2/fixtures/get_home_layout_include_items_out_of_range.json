@@ -2,8 +2,13 @@
   "type": "https://siloserver.org/docs/api/v2/problems/validation_failed",
   "title": "Validation failed",
   "status": 422,
+<<<<<<< HEAD
   "detail": "The request did not pass validation; see errors.",
   "instance": "urn:silo:request:000000000000000000000301",
+=======
+  "detail": "expected number <= 4",
+  "instance": "urn:silo:request:0000000000000000000002fd",
+>>>>>>> upstream/main
   "errors": [
     {
       "location": "query.include_items",

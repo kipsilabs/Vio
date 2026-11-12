@@ -3,27 +3,20 @@ package handlers
 import (
 	"context"
 	"encoding/json"
-	"errors"
-	"io"
 	"log/slog"
-	"net/http"
 	"strings"
 
-	"github.com/go-chi/chi/v5"
-
 	"github.com/Silo-Server/silo-server/internal/access"
-	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
 	"github.com/Silo-Server/silo-server/internal/catalog"
-	"github.com/Silo-Server/silo-server/internal/settingscontract"
 	"github.com/Silo-Server/silo-server/internal/settingskeys"
 	"github.com/Silo-Server/silo-server/internal/settingsresolve"
-	"github.com/Silo-Server/silo-server/internal/userstore"
 )
 
 // The v1 HTTP surface of the settings values API. Each handler parses the
 // request, runs the shared core in settings_values_seam.go, and renders the
 // core's decision with the same status, code and message v1 always wrote.
 
+<<<<<<< HEAD
 // identityRequestFrom reads the parts of a request that name a stored value.
 func (h *SettingValuesHandler) identityRequestFrom(r *http.Request, key string) SettingIdentityRequest {
 	query := r.URL.Query()
@@ -276,6 +269,8 @@ func (h *SettingValuesHandler) HandleGetEffective(w http.ResponseWriter, r *http
 	})
 }
 
+=======
+>>>>>>> upstream/main
 type effectiveContextRequest struct {
 	ContextID string          `json:"context_id"`
 	LibraryID json.RawMessage `json:"library_id,omitempty"`
@@ -285,45 +280,6 @@ type effectiveContextRequest struct {
 type effectiveContextResponse struct {
 	ContextID string                          `json:"context_id"`
 	Settings  []effectiveSettingValueResponse `json:"settings"`
-}
-
-// HandlePostEffective resolves several content contexts in one prepared batch.
-func (h *SettingValuesHandler) HandlePostEffective(w http.ResponseWriter, r *http.Request) {
-	store, ok := h.storeFor(w, r)
-	if !ok {
-		return
-	}
-
-	var body struct {
-		Keys     []string                  `json:"keys"`
-		Contexts []effectiveContextRequest `json:"contexts"`
-	}
-	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
-	if err := decoder.Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "Invalid request body")
-		return
-	}
-	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
-		writeError(w, http.StatusBadRequest, "bad_request", "Body must be a single JSON document")
-		return
-	}
-
-	// Preserve v1 normalization at its boundary; v2 echoes caller tokens and
-	// retains repeated keys in request order.
-	body.Keys = uniqueTrimmed(body.Keys)
-	for i := range body.Contexts {
-		body.Contexts[i].ContextID = strings.TrimSpace(body.Contexts[i].ContextID)
-	}
-
-	out, err := h.resolveEffectiveContexts(r.Context(), store, h.effectiveQueryFrom(r, body.Keys), body.Contexts)
-	if err != nil {
-		writeAPIError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"contexts":    out,
-		fieldRevision: h.contract.Revision,
-	})
 }
 
 // constraintsFor gathers the policy inputs that narrow this viewer's settings.
@@ -352,15 +308,6 @@ func (h *SettingValuesHandler) constraintsFor(ctx context.Context) settingsresol
 		return nil
 	}
 	return settingsresolve.Constraints{policyInputMaxPlaybackQuality: limit}
-}
-
-func (h *SettingValuesHandler) definitionFor(w http.ResponseWriter, key string) (*settingscontract.Definition, bool) {
-	def, err := h.definition(key)
-	if err != nil {
-		writeAPIError(w, err)
-		return nil, false
-	}
-	return def, true
 }
 
 func (h *SettingValuesHandler) effectiveResponses(

@@ -80,6 +80,7 @@ type TranscodeStartRequest struct {
 	SourceHeight               int                    `json:"source_height,omitempty"`
 	TargetCodecVideo           string                 `json:"target_codec_video"`
 	TargetCodecAudio           string                 `json:"target_codec_audio"`
+	CopyAudioCodec             string                 `json:"copy_audio_codec,omitempty"`
 	TargetAudioChannels        int                    `json:"target_audio_channels,omitempty"`
 	TargetAudioBitrateKbps     int                    `json:"target_audio_bitrate_kbps,omitempty"`
 	TargetBitrateKbps          int                    `json:"target_bitrate_kbps"`
@@ -149,6 +150,10 @@ type TranscodeStartResponse struct {
 	// remux as MPEG-TS. Older nodes omit it and are rejected before an fMP4
 	// stream is published under a plan that promises MPEG-TS.
 	CopyVideoMPEGTS bool `json:"copy_video_mpegts,omitempty"`
+	// CopyAudioCodec attests the copied audio codec the executor applies.
+	// Older nodes omit it and are rejected before they copy AAC into fMP4
+	// segments without aac_adtstoasc.
+	CopyAudioCodec string `json:"copy_audio_codec,omitempty"`
 }
 
 var ErrAudioRecipeAttestationMismatch = errors.New("transcode node audio recipe attestation mismatch")
@@ -223,6 +228,44 @@ func ValidateKeyframePlaylistAttestation(req TranscodeStartRequest, response Tra
 	return nil
 }
 
+<<<<<<< HEAD
+=======
+// ErrCopyVideoMPEGTSAttestationMismatch reports an executor that ignored
+// requested MPEG-TS copy packaging.
+var ErrCopyVideoMPEGTSAttestationMismatch = errors.New("transcode node mpeg-ts copy attestation mismatch")
+
+// ValidateCopyVideoMPEGTSAttestation rejects an executor that silently
+// packaged a requested MPEG-TS copy remux as fMP4. Requests without it stay
+// compatible with older nodes, which omit the field.
+func ValidateCopyVideoMPEGTSAttestation(req TranscodeStartRequest, response TranscodeStartResponse) error {
+	if req.CopyVideoMPEGTS && !response.CopyVideoMPEGTS {
+		return ErrCopyVideoMPEGTSAttestationMismatch
+	}
+	return nil
+}
+
+// ErrCopyAudioCodecAttestationMismatch reports an executor that ignored the
+// copied audio codec of a run that needs aac_adtstoasc.
+var ErrCopyAudioCodecAttestationMismatch = errors.New("transcode node copied audio codec attestation mismatch")
+
+// ValidateCopyAudioCodecAttestation rejects an executor that did not confirm
+// the copied codec of a run that copies AAC into fMP4 segments. Other requests
+// stay compatible with older nodes, which omit the field.
+func ValidateCopyAudioCodecAttestation(req TranscodeStartRequest, response TranscodeStartResponse) error {
+	opts := playback.TranscodeOpts{
+		SourceVideoCodec: req.SourceVideoCodec,
+		TargetCodecVideo: req.TargetCodecVideo,
+		TargetCodecAudio: req.TargetCodecAudio,
+		CopyAudioCodec:   req.CopyAudioCodec,
+		CopyVideoMPEGTS:  req.CopyVideoMPEGTS,
+	}
+	if playback.HLSCopiesAACIntoFMP4(opts) && response.CopyAudioCodec != req.CopyAudioCodec {
+		return fmt.Errorf("%w: got %q, want %q", ErrCopyAudioCodecAttestationMismatch, response.CopyAudioCodec, req.CopyAudioCodec)
+	}
+	return nil
+}
+
+>>>>>>> upstream/main
 // ErrSubtitleRenditionAttestationMismatch reports an executor that ignored a
 // requested subtitle rendition.
 var ErrSubtitleRenditionAttestationMismatch = errors.New("transcode node subtitle rendition attestation mismatch")
@@ -1987,6 +2030,7 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		SourceHeight:               req.SourceHeight,
 		TargetCodecVideo:           req.TargetCodecVideo,
 		TargetCodecAudio:           req.TargetCodecAudio,
+		CopyAudioCodec:             req.CopyAudioCodec,
 		TargetAudioChannels:        req.TargetAudioChannels,
 		TargetAudioBitrateKbps:     req.TargetAudioBitrateKbps,
 		TargetBitrateKbps:          req.TargetBitrateKbps,
@@ -2157,6 +2201,7 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	})
 
 	w.WriteHeader(http.StatusAccepted)
+<<<<<<< HEAD
 	_ = json.NewEncoder(w).Encode(TranscodeStartResponse{
 		SessionID:               req.SessionID,
 		Status:                  "started",
@@ -2177,6 +2222,28 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 
 func softwareFallbackAllowed(value string) bool {
 	return !strings.EqualFold(strings.TrimSpace(value), "gpu_only")
+=======
+	response := TranscodeStartResponse{
+		SessionID:             req.SessionID,
+		Status:                "started",
+		HWAccel:               effectiveHWAccel,
+		EncoderHWAccel:        encoderHWAccel,
+		ToneMapMode:           session.Opts().ToneMapMode,
+		AudioRecipeVersion:    req.AudioRecipeVersion,
+		RequireAudioTrack:     session.Opts().RequireAudioTrack,
+		CopyFMP4RecipeVersion: req.CopyFMP4RecipeVersion,
+		ThrottleSeconds:       req.ThrottleSeconds,
+		SoftwareVideoDecode:   session.Opts().SoftwareVideoDecode,
+		KeyframePlaylist:      session.Opts().KeyframePlaylist,
+		SubtitleRendition:     session.HasSubtitleRendition(),
+		CopyVideoMPEGTS:       session.Opts().CopyVideoMPEGTS,
+		CopyAudioCodec:        session.Opts().CopyAudioCodec,
+	}
+	response.SubtitleRenditionTracks = session.SubtitleRenditionTrackCount()
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		slog.WarnContext(r.Context(), "write transcode start response", "component", "transcodenode", "session", req.SessionID, "error", err)
+	}
+>>>>>>> upstream/main
 }
 
 func (s *Server) requireApprovedInputPath(w http.ResponseWriter, r *http.Request, path string) bool {

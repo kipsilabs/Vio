@@ -7,6 +7,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/models"
 )
 
+<<<<<<< HEAD
 func TestCompatAudioSpatialFormat(t *testing.T) {
 	cases := []struct {
 		profile string
@@ -29,14 +30,19 @@ func TestCompatAudioSpatialFormat(t *testing.T) {
 }
 
 func TestBuildMediaStreamsCarriesAudioProfile(t *testing.T) {
+=======
+func TestBuildMediaStreamsCarriesAudioFacts(t *testing.T) {
+>>>>>>> upstream/main
 	version := catalog.FileVersion{
-		VideoTracks: []models.VideoTrack{{Codec: "hevc"}},
+		VideoTracks: []models.VideoTrack{{Codec: "hevc", Bitrate: 20_000}},
 		AudioTracks: []models.AudioTrack{
 			{
 				Codec:    "eac3",
 				Profile:  "Dolby Digital Plus + Dolby Atmos",
 				Language: "eng",
+				Layout:   "5.1(side)",
 				Channels: 6,
+				Bitrate:  768,
 				Default:  true,
 			},
 			{
@@ -59,7 +65,19 @@ func TestBuildMediaStreamsCarriesAudioProfile(t *testing.T) {
 		t.Fatalf("streams length = %d, want 4", len(streams))
 	}
 
+	// Silo stores kbps; Jellyfin's BitRate is bits per second.
+	if streams[0].BitRate != 20_000_000 {
+		t.Fatalf("video BitRate = %d, want 20000000", streams[0].BitRate)
+	}
+
 	atmos := streams[1]
+	// Jellyfin trims ffprobe's layout variant: "5.1(side)" is reported as "5.1".
+	if atmos.ChannelLayout != "5.1" {
+		t.Fatalf("atmos ChannelLayout = %q, want 5.1", atmos.ChannelLayout)
+	}
+	if atmos.BitRate != 768_000 {
+		t.Fatalf("atmos BitRate = %d, want 768000", atmos.BitRate)
+	}
 	if atmos.Profile != "Dolby Digital Plus + Dolby Atmos" {
 		t.Fatalf("atmos Profile = %q", atmos.Profile)
 	}

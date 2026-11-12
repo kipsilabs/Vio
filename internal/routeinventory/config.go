@@ -73,7 +73,11 @@ func DefaultConfig(root string) Config {
 			},
 			{
 				ID:          ListenerAPI,
+<<<<<<< HEAD
 				Description: "Main Vio API listener: the /api/v1 namespace and the routes mounted beside it.",
+=======
+				Description: "Main Silo API listener: the /api/v2 handler, the retained /api/v1 probes and tombstone, and the routes mounted beside them.",
+>>>>>>> upstream/main
 				Dir:         internalAPIDir,
 				Func:        apiRouterFunc,
 				Constructor: apiRouterCtor,

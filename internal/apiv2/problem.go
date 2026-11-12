@@ -180,6 +180,10 @@ type Problem struct {
 	cause   error
 }
 
+// validationSummary is the detail of a validation failure whose reasons are
+// only in its field errors.
+const validationSummary = "The request did not pass validation; see errors."
+
 // NewProblem builds an application problem of type t.
 func NewProblem(t ProblemType, detail string) *Problem {
 	return &Problem{Type: t.URI(), Title: t.Title, Status: t.Status, Detail: detail}
@@ -196,6 +200,15 @@ func (p *Problem) withCause(err error) *Problem {
 func (p *Problem) WithErrors(errs ...ProblemError) *Problem {
 	p.Errors = append(p.Errors, errs...)
 	return p
+}
+
+// promoteSoleFieldDetail gives a validation failure that says only "see
+// errors" its one field error's reason as the detail, so a client that shows
+// the detail (as English clients do) tells the user what to fix.
+func (p *Problem) promoteSoleFieldDetail() {
+	if p.Detail == validationSummary && len(p.Errors) == 1 && p.Errors[0].Detail != "" {
+		p.Detail = p.Errors[0].Detail
+	}
 }
 
 // WithHeader adds a response header (Retry-After, Location, ...).
@@ -380,7 +393,7 @@ func humaStatusType(status int, msg string) ProblemType {
 func humaDetail(t ProblemType, msg string, bodyLimit int64) string {
 	switch t.ID {
 	case TypeValidationFailed.ID:
-		return "The request did not pass validation; see errors."
+		return validationSummary
 	case TypeMalformedRequest.ID:
 		return "The request could not be parsed."
 	case TypeNotAcceptable.ID:
@@ -541,6 +554,7 @@ func problemTransformer(ctx huma.Context, _ string, v any) (any, error) {
 	if p.Instance == "" {
 		p.Instance = requestInstance(requestIDFrom(ctx.Context()))
 	}
+	p.promoteSoleFieldDetail()
 	noteProblem(ctx.Context(), p)
 	return p, nil
 }
@@ -551,6 +565,7 @@ func writeProblem(w http.ResponseWriter, r *http.Request, p *Problem) {
 	if p.Instance == "" {
 		p.Instance = requestInstance(requestIDFrom(r.Context()))
 	}
+	p.promoteSoleFieldDetail()
 	noteProblem(r.Context(), p)
 	h := w.Header()
 	for name, values := range p.GetHeaders() {

@@ -319,10 +319,14 @@ func updateProfile(exec preferenceSettingsExecutor, id string, u UpdateProfileIn
 // DeleteProfile removes a profile and every row of its own: lists, watch
 // progress and history, preferences, settings and personal collections
 // (plus their items), matching the Postgres store.
+<<<<<<< HEAD
 func DeleteProfile(ctx context.Context, db *sql.DB, id string) error {
+=======
+func DeleteProfile(ctx context.Context, db *sql.DB, id string) ([]string, error) {
+>>>>>>> upstream/main
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("beginning transaction for profile delete: %w", err)
+		return nil, fmt.Errorf("beginning transaction for profile delete: %w", err)
 	}
 	defer tx.Rollback() //nolint:errcheck
 
@@ -334,7 +338,7 @@ func DeleteProfile(ctx context.Context, db *sql.DB, id string) error {
 		WHERE collection_kind = 'user' AND collection_id IN (
 			SELECT id FROM personal_collections WHERE creator_profile_id = ?
 		)`, id); err != nil {
-		return fmt.Errorf("deleting collection sort preferences for profile %s: %w", id, err)
+		return nil, fmt.Errorf("deleting collection sort preferences for profile %s: %w", id, err)
 	}
 
 	// Delete personal_collection_items for collections owned by this profile.
@@ -344,14 +348,21 @@ func DeleteProfile(ctx context.Context, db *sql.DB, id string) error {
 			SELECT id FROM personal_collections WHERE creator_profile_id = ?
 		)`, id)
 	if err != nil {
-		return fmt.Errorf("deleting collection items for profile %s: %w", id, err)
+		return nil, fmt.Errorf("deleting collection items for profile %s: %w", id, err)
 	}
 	if _, err := tx.ExecContext(ctx, `
 		DELETE FROM personal_collection_profiles
 		WHERE profile_id = ? OR collection_id IN (
 			SELECT id FROM personal_collections WHERE creator_profile_id = ?
 		)`, id, id); err != nil {
-		return fmt.Errorf("deleting collection visibility for profile %s: %w", id, err)
+		return nil, fmt.Errorf("deleting collection visibility for profile %s: %w", id, err)
+	}
+
+	// The profile's own collections, returned so the caller can remove their
+	// artwork once this commits.
+	collectionIDs, err := deleteProfileCollections(ctx, tx, id)
+	if err != nil {
+		return nil, err
 	}
 
 	// Cascade-delete related tables. This database declares no foreign keys, so
@@ -366,7 +377,6 @@ func DeleteProfile(ctx context.Context, db *sql.DB, id string) error {
 		"hidden_history_items",
 		"home_item_dismissals",
 		"collection_sort_preferences",
-		"personal_collections",
 		"profile_allowed_libraries",
 		sqliteAudioPreferencesTable,
 		sqliteSubtitlePreferencesTable,
@@ -379,33 +389,65 @@ func DeleteProfile(ctx context.Context, db *sql.DB, id string) error {
 		"user_setting_values",
 	}
 	for _, table := range cascadeTables {
+<<<<<<< HEAD
 		column := "profile_id"
 		if table == "personal_collections" {
 			column = "creator_profile_id"
 		}
 		if _, err := tx.ExecContext(ctx, fmt.Sprintf("DELETE FROM %s WHERE %s = ?", table, column), id); err != nil {
 			return fmt.Errorf("deleting from %s for profile %s: %w", table, id, err)
+=======
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf("DELETE FROM %s WHERE profile_id = ?", table), id); err != nil {
+			return nil, fmt.Errorf("deleting from %s for profile %s: %w", table, id, err)
+>>>>>>> upstream/main
 		}
 	}
 
 	// Jellyfin display preferences carry the profile in their key.
 	prefix := userstore.ProfileDisplayPrefsPrefix(id)
 	if _, err := tx.ExecContext(ctx, `DELETE FROM jellycompat_displayprefs WHERE substr(prefs_id, 1, length(?)) = ?`, prefix, prefix); err != nil {
+<<<<<<< HEAD
 		return fmt.Errorf("deleting display preferences for profile %s: %w", id, err)
+=======
+		return nil, fmt.Errorf("deleting display preferences for profile %s: %w", id, err)
+>>>>>>> upstream/main
 	}
 
 	// Delete the profile itself.
 	result, err := tx.ExecContext(ctx, "DELETE FROM profiles WHERE id = ?", id)
 	if err != nil {
-		return fmt.Errorf("deleting profile %s: %w", id, err)
+		return nil, fmt.Errorf("deleting profile %s: %w", id, err)
 	}
 	rows, err := result.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("checking rows affected for profile %s: %w", id, err)
+		return nil, fmt.Errorf("checking rows affected for profile %s: %w", id, err)
 	}
 	if rows == 0 {
-		return fmt.Errorf("profile %s not found", id)
+		return nil, fmt.Errorf("profile %s not found", id)
 	}
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return collectionIDs, nil
+}
+
+func deleteProfileCollections(ctx context.Context, tx *sql.Tx, profileID string) ([]string, error) {
+	rows, err := tx.QueryContext(ctx, `DELETE FROM personal_collections WHERE creator_profile_id = ? RETURNING id`, profileID)
+	if err != nil {
+		return nil, fmt.Errorf("deleting collections for profile %s: %w", profileID, err)
+	}
+	defer rows.Close() //nolint:errcheck // rows.Err reports the failure
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("deleting collections for profile %s: %w", profileID, err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("deleting collections for profile %s: %w", profileID, err)
+	}
+	return ids, nil
 }

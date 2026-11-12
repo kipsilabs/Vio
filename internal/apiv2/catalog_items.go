@@ -326,6 +326,7 @@ func itemExtrasOf(extras []catalogpkg.ItemExtraInfo) []ItemExtraInfo {
 
 // FileVersion is one playable file of an item.
 type FileVersion struct {
+<<<<<<< HEAD
 	FileID                   ID      `json:"file_id" example:"120"`
 	FileName                 string  `json:"file_name,omitempty"`
 	FilePath                 string  `json:"file_path,omitempty" doc:"Absent for viewers without file-path visibility"`
@@ -379,6 +380,38 @@ type FileVersion struct {
 type VersionSourceMismatch struct {
 	ServedBytes   int64 `json:"served_bytes" example:"7427636945"`
 	DeclaredBytes int64 `json:"declared_bytes" example:"8449999999"`
+=======
+	FileID                   ID                                `json:"file_id" example:"120"`
+	FileName                 string                            `json:"file_name,omitempty" doc:"Absent for viewers without file-path visibility, except on audiobooks and ebooks"`
+	FilePath                 string                            `json:"file_path,omitempty" doc:"Absent for viewers without file-path visibility"`
+	Resolution               string                            `json:"resolution" example:"2160p"`
+	CodecVideo               string                            `json:"codec_video" example:"hevc"`
+	CodecAudio               string                            `json:"codec_audio" example:"truehd"`
+	HDR                      bool                              `json:"hdr"`
+	Container                string                            `json:"container" example:"mkv"`
+	FileSize                 int64                             `json:"file_size" doc:"Bytes"`
+	Duration                 int                               `json:"duration" doc:"Seconds"`
+	Bitrate                  int                               `json:"bitrate" doc:"Kilobits per second"`
+	AddedAt                  Instant                           `json:"added_at"`
+	EditionRaw               string                            `json:"edition_raw,omitempty"`
+	EditionKey               string                            `json:"edition_key,omitempty"`
+	PresentationKind         string                            `json:"presentation_kind,omitempty"`
+	PresentationGroupKey     string                            `json:"presentation_group_key,omitempty"`
+	PresentationPartIndex    int                               `json:"presentation_part_index,omitempty"`
+	PresentationPartTotal    int                               `json:"presentation_part_total,omitempty"`
+	MultiEpisodeStart        int                               `json:"multi_episode_start,omitempty"`
+	MultiEpisodeEnd          int                               `json:"multi_episode_end,omitempty"`
+	EffectiveAudioTrackIndex *int                              `json:"effective_audio_track_index,omitempty"`
+	EffectiveAudioLanguage   string                            `json:"effective_audio_language,omitempty" doc:"Language of the audio track playback will pick (BCP 47, from the file), or the item's original language (normally ISO 639-1) when the preference is original; absent when unknown"`
+	VideoTracks              []models.VideoTrack               `json:"video_tracks,omitempty"`
+	AudioTracks              []models.AudioTrack               `json:"audio_tracks,omitempty"`
+	SubtitleTracks           []catalogpkg.VersionSubtitleTrack `json:"subtitle_tracks,omitempty"`
+	Chapters                 []catalogpkg.VersionChapter       `json:"chapters,omitempty"`
+	Intro                    *catalogpkg.Marker                `json:"intro,omitempty"`
+	Credits                  *catalogpkg.Marker                `json:"credits,omitempty"`
+	Recap                    *catalogpkg.Marker                `json:"recap,omitempty"`
+	Preview                  *catalogpkg.Marker                `json:"preview,omitempty"`
+>>>>>>> upstream/main
 }
 
 // FileVersionCollection is an item's versions.
@@ -978,10 +1011,7 @@ func (in *CatalogFiltersInput) catalogRequest() (catalogpkg.CatalogRequest, *Pro
 // 422 on the query parameter the message names; the source when it names
 // none, since the source decides what the rest must carry.
 func parseCatalogRequest(values url.Values) (catalogpkg.CatalogRequest, *Problem) {
-	req, err := catalogpkg.ParseCatalogRequestWithOptions(values, catalogpkg.CatalogRequestOptions{
-		SearchMediaScopes: true,
-		ExtendedRules:     true,
-	})
+	req, err := catalogpkg.ParseCatalogRequest(values)
 	if err != nil {
 		location := "query.source"
 		for _, name := range []string{"section_id", "collection_id", "person_id", "library_id", "scope", "groups"} {

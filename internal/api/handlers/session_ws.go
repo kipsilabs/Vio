@@ -5,15 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
-	"net/http"
 	"sync"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/gorilla/websocket"
 
-	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
 	"github.com/Silo-Server/silo-server/internal/playback"
-	"github.com/Silo-Server/silo-server/internal/wsconn"
 )
 
 type realtimeClientMessage struct {
@@ -45,6 +41,7 @@ func (c *sessionRealtimeConn) WritePing() error {
 	return writeWebSocketControl(c.conn, websocket.PingMessage, nil)
 }
 
+<<<<<<< HEAD
 // HandleSessionWebSocket handles GET /playback/ws/{session_id}.
 // It upgrades to a realtime control WebSocket. Sessions become control-ready
 // only after a validated hello message. Disconnects degrade command delivery
@@ -117,6 +114,9 @@ func (h *PlaybackHandler) HandleSessionWebSocket(w http.ResponseWriter, r *http.
 }
 
 func (h *PlaybackHandler) handleRealtimeClientMessage(ctx context.Context, sessionID string, data []byte) error {
+=======
+func (h *PlaybackHandler) handleRealtimeClientMessage(sessionID string, data []byte) error {
+>>>>>>> upstream/main
 	var base realtimeClientMessage
 	if err := json.Unmarshal(data, &base); err != nil {
 		return err

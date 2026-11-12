@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -9,9 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/go-chi/chi/v5"
-
-	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
 	"github.com/Silo-Server/silo-server/internal/artworkurl"
 	"github.com/Silo-Server/silo-server/internal/blobstore"
 	"github.com/Silo-Server/silo-server/internal/imageutil"
@@ -191,6 +189,7 @@ func deleteUploadedAvatarObjects(ctx context.Context, store profileAvatarStore, 
 	return err
 }
 
+<<<<<<< HEAD
 func (h *ProfileHandler) HandleUploadAvatar(w http.ResponseWriter, r *http.Request) {
 	userID := apimw.GetUserID(r.Context())
 	if userID == 0 {
@@ -241,6 +240,8 @@ func (h *ProfileHandler) HandleUploadAvatar(w http.ResponseWriter, r *http.Reque
 	writeJSON(w, http.StatusOK, view)
 }
 
+=======
+>>>>>>> upstream/main
 // ProfileAvatarUpload is an avatar upload with its multipart part already
 // extracted and its caller already reduced to an identity.
 type ProfileAvatarUpload struct {
@@ -287,6 +288,9 @@ func (h *ProfileHandler) UploadAvatar(ctx context.Context, up ProfileAvatarUploa
 	}
 
 	result, err := imageutil.GenerateSquareVariants(data, []int{256})
+	if errors.Is(err, imageutil.ErrBusy) {
+		return none, apiError(http.StatusServiceUnavailable, "unavailable", "Image processing is busy; try again shortly")
+	}
 	if err != nil {
 		return none, apiError(http.StatusBadRequest, "bad_request", "Invalid image file")
 	}
@@ -311,27 +315,6 @@ func (h *ProfileHandler) UploadAvatar(ctx context.Context, up ProfileAvatarUploa
 		return none, apiError(http.StatusInternalServerError, "internal_error", "Failed to retrieve updated profile")
 	}
 	return h.toProfileResponse(ctx, store, *updatedProfile), nil
-}
-
-func (h *ProfileHandler) HandleDeleteAvatar(w http.ResponseWriter, r *http.Request) {
-	userID := apimw.GetUserID(r.Context())
-	if userID == 0 {
-		writeError(w, http.StatusUnauthorized, "unauthorized", "Authentication required")
-		return
-	}
-
-	profileID := chi.URLParam(r, "id")
-	if profileID == "" {
-		writeError(w, http.StatusBadRequest, "bad_request", "Profile ID is required")
-		return
-	}
-
-	view, err := h.DeleteAvatar(r.Context(), userID, profileID)
-	if err != nil {
-		writeAPIError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, view)
 }
 
 // DeleteAvatar clears a profile's uploaded avatar (a preset reference is
