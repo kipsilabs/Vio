@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -12,6 +13,20 @@ import (
 	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/remotestream"
 )
+
+// A first anchor probe that times out at its per-attempt budget is retried by
+// the enclosing start, so that failure is a warning: production logged ERROR for
+// a probe that timed out at its 5 s budget and then resolved on the retry four
+// seconds later. Only a failure the retryable classification does not explain
+// stays an ERROR.
+func TestCopySeekAnchorFailureLevel(t *testing.T) {
+	if got := copySeekAnchorFailureLevel(true); got != slog.LevelWarn {
+		t.Fatalf("retryable/budget anchor failure level = %v, want WARN", got)
+	}
+	if got := copySeekAnchorFailureLevel(false); got != slog.LevelError {
+		t.Fatalf("terminal anchor failure level = %v, want ERROR", got)
+	}
+}
 
 // clearVirtualProviderLinkLatency drops one link's observation so a test starts
 // from an unmeasured link and leaves nothing behind for the next test.

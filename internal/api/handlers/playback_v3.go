@@ -4915,6 +4915,21 @@ func (h *PlaybackHandler) lookupCachedCopySeekAnchorV3(ffmpegPath, sourceIdentit
 	return playback.LookupCachedCopySeekAnchor(ffmpegPath, sourceIdentity, requestedSeekSeconds, segmentDuration)
 }
 
+// copySeekAnchorFailureLevel reports how a failed copy-video seek-anchor resolve
+// is logged. A transient provider failure or the probe's own per-attempt budget
+// expiring is not evidence against the release: the enclosing start may retry the
+// same release on another candidate and succeed (production logged ERROR for a
+// first attempt that timed out at its 5 s budget and then resolved on the retry
+// four seconds later). Those are warnings. ERROR is reserved for a failure
+// neither category explains, which is the terminal case an operator must look
+// at.
+func copySeekAnchorFailureLevel(seekFailure bool) slog.Level {
+	if seekFailure {
+		return slog.LevelWarn
+	}
+	return slog.LevelError
+}
+
 func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, session *playback.Session, file *models.MediaFile, result playback.PlannerResultV3) (preparedTimelineV3, *transportErrorV3) {
 	// The copy-video seek anchor is resolved here, before any route is selected
 	// or FFmpeg spawned. Attribute its cost to its own phase so a seek start's
@@ -5317,18 +5332,25 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 					// could retry.
 					return preparedTimelineV3{}, resolveFailure
 				}
-				slog.ErrorContext(ctx, "failed to resolve protocol v3 copy-video seek anchor",
+				// A transient relay failure or our own anchor budget expiring is
+				// not evidence against the release: the enclosing start may
+				// still retry the same release on another candidate and succeed
+				// (production: a first probe timed out at its 5 s per-attempt
+				// budget, logged ERROR, and the retry four seconds later
+				// resolved the anchor). Report it as a retryable seek error so
+				// the client retries the seek instead of the start path
+				// rotating the version or a replan tearing down the transport,
+				// and keep ERROR for a failure that is neither.
+				seekFailure := playback.IsTransientProviderError(err) ||
+					(anchorBudgetElapsed && ctx.Err() == nil)
+				slog.Log(ctx, copySeekAnchorFailureLevel(seekFailure),
+					"failed to resolve protocol v3 copy-video seek anchor",
 					"component", "api",
 					"playback_session_id", session.ID,
 					"requested_seek_seconds", requested,
+					"retryable", seekFailure,
 					"error", err,
 				)
-				// A transient relay failure or our own anchor budget expiring is
-				// not evidence against the release. Report it as a retryable seek
-				// error so the client retries the seek instead of the start path
-				// rotating the version or a replan tearing down the transport.
-				seekFailure := playback.IsTransientProviderError(err) ||
-					(anchorBudgetElapsed && ctx.Err() == nil)
 				return preparedTimelineV3{}, &transportErrorV3{reason: transcodeStartFailedReasonV3, message: remuxSeekPositionFailureMessageV3, retryable: true, cause: err, seekFailure: seekFailure}
 			}
 		}
@@ -6000,14 +6022,24 @@ func (h *PlaybackHandler) identityProxyEligibilityV3(ctx context.Context, result
 	}
 
 	capable := make(map[string]struct{})
-	for nodeURL, advertised := range h.pooledNodeTransformationsV3(ctx, enumerator.ProxyNodeURLs()) {
+	proxyURLs := enumerator.ProxyNodeURLs()
+	for nodeURL, advertised := range h.pooledNodeTransformationsV3(ctx, proxyURLs) {
 		if validateAdvertisedTransformationsV3(result.Plan, advertised) == nil {
 			capable[nodeURL] = struct{}{}
 		}
 	}
 	if len(capable) == 0 {
-		slog.WarnContext(ctx, "protocol v3 no proxy advertises the planned recipe",
-			"component", "api", "delivery", result.Plan.Delivery)
+		// No proxy is configured at all (single-node deployment, or policy that
+		// always serves locally): nothing could advertise the recipe, and the
+		// API executes it by design. Warn only when the pool exists but is
+		// behind — that is the degraded state worth an operator's attention.
+		if len(proxyURLs) == 0 {
+			slog.DebugContext(ctx, "protocol v3 no proxy configured; the API executes the planned recipe",
+				"component", "api", "delivery", result.Plan.Delivery)
+		} else {
+			slog.WarnContext(ctx, "protocol v3 no proxy advertises the planned recipe",
+				"component", "api", "delivery", result.Plan.Delivery, "proxy_count", len(proxyURLs))
+		}
 	}
 	// The predicate runs under the planner lock: a set lookup only.
 	return func(node *nodepool.Node) bool {

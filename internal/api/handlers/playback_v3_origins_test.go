@@ -1,9 +1,11 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -573,5 +575,35 @@ func assertNoPlaybackCredentialV3(t *testing.T, rawURL string) {
 	if strings.Contains(rawURL, streamTokenParam+"=") || strings.Contains(rawURL, "/stream/direct/") ||
 		strings.Contains(rawURL, "/stream/remux/") || strings.Contains(rawURL, "/stream/transcode/") {
 		t.Fatalf("URL %q carries a playback credential", rawURL)
+	}
+}
+
+// A deployment with no proxy is not a degraded pool: the planned recipe is meant
+// to run on the API there, so warning on every plan, start and replan (production
+// logged eight per session) trains operators to ignore the line. Only a pool that
+// exists but is behind deserves the warning.
+func TestIdentityProxyEligibilityWithoutProxyStaysQuiet(t *testing.T) {
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	handler := &PlaybackHandler{NodePlanner: &recordingNodePlannerV3{}}
+	plan := identityProxyPlanV3(playback.DeliveryRemuxProgressiveV3,
+		playback.TransformationV3{Name: playback.TransformationAudioToAACV3, Executor: playback.ExecutorServerV3})
+	eligible := handler.identityProxyEligibilityV3(context.Background(), playback.PlannerResultV3{Plan: plan})
+	if eligible == nil {
+		t.Fatal("a recipe plan must still return an eligibility predicate")
+	}
+	node := &nodepool.Node{ID: 1, URL: "http://proxy-1"}
+	if eligible(node) {
+		t.Fatal("no proxy advertises the recipe, so none may be eligible")
+	}
+	got := logs.String()
+	if strings.Contains(got, "no proxy advertises the planned recipe") {
+		t.Fatalf("a deployment with no proxy warned about it: %s", got)
+	}
+	if !strings.Contains(got, "no proxy configured") {
+		t.Fatalf("the expected no-proxy case was not recorded: %s", got)
 	}
 }
