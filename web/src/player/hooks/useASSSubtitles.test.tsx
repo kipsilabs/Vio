@@ -919,6 +919,150 @@ describe("useASSSubtitles windowed ASS extraction", () => {
     expect(instances).toHaveLength(3);
   });
 
+  it("keeps the 60 s prefetch lead at 1x", async () => {
+    const videoRef = makeVideoRef(1);
+
+    renderHook(() => useASSSubtitles(videoRef, [germanTrack], 6, false, 0, 0));
+    await waitFor(() => expect(constructorOpts).toHaveLength(1));
+
+    // Inside [0, 120] but more than 60 s from its end: no prefetch yet.
+    videoRef.current!.currentTime = 59;
+    videoRef.current!.dispatchEvent(new Event("timeupdate"));
+    await act(async () => {});
+    expect(fetch).toHaveBeenCalledTimes(1);
+
+    // Crossing 120 - 60 fetches the next window, exactly as before.
+    videoRef.current!.currentTime = 61;
+    videoRef.current!.dispatchEvent(new Event("timeupdate"));
+    await waitFor(() => expect(constructorOpts).toHaveLength(2));
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(String(vi.mocked(fetch).mock.calls[1]![0])).toContain("position=41&duration=120");
+  });
+
+  it.each([2, 4])(
+    "prefetches the next window earlier at %ix so the lead keeps its wall clock",
+    async (rate) => {
+      const videoRef = makeVideoRef(1);
+      videoRef.current!.playbackRate = rate;
+
+      renderHook(() => useASSSubtitles(videoRef, [germanTrack], 6, false, 0, 0));
+      await waitFor(() => expect(constructorOpts).toHaveLength(1));
+
+      // The raw scaled lead is 120 s at 2x and 240 s at 4x; both cap at 90 s,
+      // so the trigger for [0, 120] is at 30 source seconds instead of 60.
+      videoRef.current!.currentTime = 29;
+      videoRef.current!.dispatchEvent(new Event("timeupdate"));
+      await act(async () => {});
+      expect(fetch).toHaveBeenCalledTimes(1);
+
+      videoRef.current!.currentTime = 31;
+      videoRef.current!.dispatchEvent(new Event("timeupdate"));
+      await waitFor(() => expect(constructorOpts).toHaveLength(2));
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(String(vi.mocked(fetch).mock.calls[1]![0])).toContain("position=11&duration=120");
+    },
+  );
+
+  it("scales the prefetch lead linearly below the cap", async () => {
+    const videoRef = makeVideoRef(1);
+    // 60 s x 1.25 is a 75 s lead, well under the 90 s cap, so the trigger for
+    // [0, 120] is at 45 rather than the 30 a capped lead would give.
+    videoRef.current!.playbackRate = 1.25;
+
+    renderHook(() => useASSSubtitles(videoRef, [germanTrack], 6, false, 0, 0));
+    await waitFor(() => expect(constructorOpts).toHaveLength(1));
+
+    videoRef.current!.currentTime = 45;
+    videoRef.current!.dispatchEvent(new Event("timeupdate"));
+    await act(async () => {});
+    expect(fetch).toHaveBeenCalledTimes(1);
+
+    videoRef.current!.currentTime = 46;
+    videoRef.current!.dispatchEvent(new Event("timeupdate"));
+    await waitFor(() => expect(constructorOpts).toHaveLength(2));
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(String(vi.mocked(fetch).mock.calls[1]![0])).toContain("position=26&duration=120");
+  });
+
+  it("recomputes the prefetch trigger when the rate changes mid-playback", async () => {
+    const videoRef = makeVideoRef(1);
+
+    renderHook(() => useASSSubtitles(videoRef, [germanTrack], 6, false, 0, 0));
+    await waitFor(() => expect(constructorOpts).toHaveLength(1));
+
+    // At 1x, source 50 is still 70 s from the window end: outside the lead.
+    videoRef.current!.currentTime = 50;
+    videoRef.current!.dispatchEvent(new Event("timeupdate"));
+    await act(async () => {});
+    expect(fetch).toHaveBeenCalledTimes(1);
+
+    // Doubling the rate shrinks that margin to 35 s of wall clock, inside the
+    // scaled lead, so the ratechange itself starts the prefetch.
+    videoRef.current!.playbackRate = 2;
+    videoRef.current!.dispatchEvent(new Event("ratechange"));
+    await waitFor(() => expect(constructorOpts).toHaveLength(2));
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(String(vi.mocked(fetch).mock.calls[1]![0])).toContain("position=30&duration=120");
+  });
+
+  it("restores the 1x prefetch trigger when the rate returns to 1", async () => {
+    const state = vi.fn();
+    const videoRef = makeVideoRef(1);
+    videoRef.current!.playbackRate = 4;
+
+    renderHook(() => useASSSubtitles(videoRef, [germanTrack], 6, false, 0, 0, state));
+    await waitFor(() => expect(constructorOpts).toHaveLength(1));
+
+    // Past the capped 4x trigger: commit a window that starts at 11.
+    videoRef.current!.currentTime = 31;
+    videoRef.current!.dispatchEvent(new Event("timeupdate"));
+    await waitFor(() => expect(constructorOpts).toHaveLength(2));
+    await waitFor(() => expect(state).toHaveBeenLastCalledWith("ready"));
+
+    // Back at 1x the lead is 60 s, so [11, 131] must not prefetch until 71.
+    videoRef.current!.playbackRate = 1;
+    videoRef.current!.currentTime = 70;
+    videoRef.current!.dispatchEvent(new Event("ratechange"));
+    await act(async () => {});
+    expect(fetch).toHaveBeenCalledTimes(2);
+
+    videoRef.current!.currentTime = 72;
+    videoRef.current!.dispatchEvent(new Event("timeupdate"));
+    await waitFor(() => expect(constructorOpts).toHaveLength(3));
+    expect(fetch).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not fetch the next window twice for a burst of rate events", async () => {
+    const videoRef = makeVideoRef(1);
+    videoRef.current!.playbackRate = 2;
+
+    renderHook(() => useASSSubtitles(videoRef, [germanTrack], 6, false, 0, 0));
+    await waitFor(() => expect(constructorOpts).toHaveLength(1));
+
+    // Hold the prefetch on the wire so the in-flight guard is observable.
+    let refresh: ReturnType<typeof deferredResponse> | null = null;
+    vi.mocked(fetch).mockImplementationOnce((_input, init) => {
+      refresh = deferredResponse(init);
+      return refresh.promise;
+    });
+
+    videoRef.current!.currentTime = 31;
+    videoRef.current!.dispatchEvent(new Event("ratechange"));
+    videoRef.current!.dispatchEvent(new Event("timeupdate"));
+    videoRef.current!.dispatchEvent(new Event("ratechange"));
+    await act(async () => {});
+    expect(fetch).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      refresh!.settle("[Script Info]");
+    });
+    await waitFor(() => expect(constructorOpts).toHaveLength(2));
+    // The committed window covers the playhead, so a later tick is a no-op.
+    videoRef.current!.dispatchEvent(new Event("timeupdate"));
+    await act(async () => {});
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
   it("falls back to the whole-track URL after bounded windowed retries", async () => {
     vi.useFakeTimers();
     const error = vi.spyOn(console, "error").mockImplementation(() => {});

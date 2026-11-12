@@ -99,8 +99,9 @@ const (
 	VirtualLibraryCatalogDiscoveryBudgetMsSettingKey = "virtual_library.catalog_discovery_budget_ms"
 	// 20 s admits the observed 17–25 s provider-listing low band that the old
 	// one-second default (and ten-second ceiling) cut off, while keeping one
-	// detached listing bounded. Stored values are not rewritten: a deployment
-	// that pinned the old 10 s ceiling must raise it to the new maximum.
+	// detached listing bounded. A deployment that saved the Streaming settings
+	// form under the old ceiling keeps a stored 10 s, and stored values win, so
+	// migration 20261108201341 raises the old band to this maximum.
 	DefaultVirtualLibraryCatalogDiscoveryBudgetMs = 20000
 	MinVirtualLibraryCatalogDiscoveryBudgetMs     = 500
 	MaxVirtualLibraryCatalogDiscoveryBudgetMs     = 20000
@@ -145,10 +146,12 @@ const (
 )
 
 // PlaybackKeyframePlaylistSettingKey serves copy-remux HLS as one complete
-// playlist planned from the source's keyframes, instead of FFmpeg's growing
-// one (#1466). It is off while restarts in the middle of such a stream are
-// still being built; a planned stream that has to restart starts again from
-// the beginning.
+// VOD playlist planned from the source's keyframes, instead of FFmpeg's
+// growing one (#1466). A complete playlist makes seeking native: the client
+// asks for the target segment, and a session that has not produced it yet
+// restarts its copy process at that segment's planned boundary without
+// rebuilding the transport. It is on by default; disabling it falls back to
+// FFmpeg's growing playlist and server-side seek reanchors.
 const PlaybackKeyframePlaylistSettingKey = "playback.copy_keyframe_playlist"
 
 // The connection speed test's schedule, delivered to clients with the probe
@@ -682,7 +685,7 @@ var adminSettingDefaults = map[string]string{
 	"catalog.search.meilisearch.embedder":                 "vio_recommendations",
 	"catalog.search.meilisearch.binary_quantized":         "false",
 
-	PlaybackKeyframePlaylistSettingKey: "false",
+	PlaybackKeyframePlaylistSettingKey: "true",
 
 	PlaybackBandwidthProbeAutomaticSettingKey:  "true",
 	PlaybackBandwidthProbeMaxAgeDaysSettingKey: strconv.Itoa(DefaultBandwidthProbeMaxAgeDays),

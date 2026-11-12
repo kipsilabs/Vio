@@ -463,7 +463,7 @@ func ResolveCopySeekAnchorForSource(
 			return copySeekAnchor{}, context.DeadlineExceeded
 		}
 		if shortened {
-			slog.InfoContext(ctx, "copy seek anchor probe shortened to the caller's remaining budget",
+			slog.InfoContext(ctx, "copy seek anchor probe bounded below its per-probe cap by the attempt budget",
 				"component", "playback",
 				"budget", budget,
 				"cap", CopySeekProbeTimeout,
@@ -564,6 +564,11 @@ func LookupCachedCopySeekAnchor(
 // shortened reports that the caller's deadline, not the probe cap, set it. A
 // non-positive budget means the caller had no time left and the probe must not
 // run. A caller with no deadline keeps the full probe cap.
+//
+// The adaptive part lives one level up: a measured slow link gets its own probe
+// context sized from its observed latency (see copySeekProbeContext), so the
+// remaining budget this sees is already the probe's own window rather than the
+// resolve leg's leftovers.
 func copySeekProbeTimeoutFor(ctx context.Context) (time.Duration, bool) {
 	if ctx == nil {
 		return CopySeekProbeTimeout, false

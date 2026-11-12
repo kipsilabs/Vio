@@ -3701,6 +3701,14 @@ func retainedVirtualBoundFileV3(effective *models.MediaFile, previous *playback.
 // file so each alternate planner input can publish the same inventory
 // provenance the primary plan carries; a local alternate has no resolver and
 // reports empty provenance.
+//
+// The resolve reuses a fresh provider answer instead of forcing a re-list.
+// Every alternate of one title shares a provider-neutral cache key, so forcing
+// the listing per alternate turned one replan into one multi-second provider
+// round-trip per sibling for the same candidate set. A listing that is stale
+// past the TTL still fetches (a miss, a stale-grace refresh, or the failure
+// path's own rotation), so a moved or dead release is re-listed when that is
+// what the evidence says, not on every sibling.
 func (h *PlaybackHandler) prepareVirtualAlternateFileV3(r *http.Request, alternate *models.MediaFile, profileID string) (*models.MediaFile, ProbeProvenance, error) {
 	if alternate == nil {
 		return nil, "", errors.New("nil alternate file")
@@ -3708,7 +3716,7 @@ func (h *PlaybackHandler) prepareVirtualAlternateFileV3(r *http.Request, alterna
 	if !isVirtualPlaybackFile(alternate) {
 		return h.ensurePlaybackProbe(r.Context(), alternate), "", nil
 	}
-	resolved, err := h.resolveVirtualPlaybackSource(r, alternate, profileID, false, nil, "", "", 0, false, virtualResolveOptionsV3{sessionBound: false, bypassProviderFloor: true})
+	resolved, err := h.resolveVirtualPlaybackSource(r, alternate, profileID, false, nil, "", "", 0, false, virtualResolveOptionsV3{sessionBound: false})
 	if err != nil {
 		return nil, "", err
 	}
@@ -4945,6 +4953,26 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 			releaseAnchor := func() {}
 			virtualAnchor := isVirtualPlaybackFile(file) && h.RemoteStreamRelay != nil && (h.VirtualMediaResolver != nil || h.VirtualMediaDetailedResolver != nil)
 			anchorExpiresAt := time.Time{}
+			// A seek that re-anchors an active copy transport already has a
+			// live registration for these bytes: the running generation's
+			// input. Probing it skips the provider resolve a seek used to pay
+			// on top of its anchor probe. The reuse is gated on the session
+			// still being bound to this candidate and the registration still
+			// being live, so a moved binding or a dead token falls back to the
+			// normal resolve below. A retry always re-resolves (and mints a
+			// fresh token), so the same registration is never presented twice.
+			liveAnchorInput, liveAnchorReusable := "", false
+			if virtualAnchor {
+				if input, ok := h.livePinnedAnchorInputV3(session, file); ok {
+					liveAnchorInput, liveAnchorReusable = input, true
+					slog.InfoContext(ctx, "copy seek anchor probing the live pinned transport without a provider call",
+						logComponentKey, playbackLogValueV3,
+						"playback_session_id", session.ID,
+						"requested_seek_seconds", requested,
+						"virtual_uri", file.FilePath,
+					)
+				}
+			}
 			// resolveAnchorInput resolves the candidate to a pinned-IP relay URL
 			// — the same resolution the transcode transport performs — and
 			// adopts the fresh registration. It runs again before a retry so the
@@ -4972,6 +5000,16 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 			// bytes: the fresh-registration context mints a new relay entry so
 			// the same token is never presented twice.
 			resolveAnchorForAttempt := func(attemptCtx context.Context, retry bool) error {
+				if liveAnchorReusable && !retry {
+					// The running generation is already reading these bytes
+					// through a live registration. Probe that registration
+					// instead of re-listing the provider for a token the
+					// transport holds; a failed probe re-resolves on the retry,
+					// which always takes the fresh-registration path below.
+					anchorInput = liveAnchorInput
+					anchorExpiresAt = time.Time{}
+					return nil
+				}
 				// Route the anchor through the same absent-pin rotation policy as
 				// the serve layer and the replan rehydration: a provider that
 				// renumbered its result ids must not terminal a remux seek when a
@@ -5159,8 +5197,12 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 				}
 				lastProbedInput = anchorInput
 				probeStarted := time.Now()
-				origin, startSegment, err = probeAnchor(attemptCtx)
-				anchorBudgetElapsed = err != nil && attemptCtx.Err() != nil && ctx.Err() == nil
+				// The probe gets its own adaptive budget on a measured link, so
+				// a resolve that spent most of the attempt cannot truncate it.
+				probeCtx, probeCancel := copySeekProbeContext(ctx, attemptCtx, recentVirtualProviderLinkLatency(linkKey))
+				origin, startSegment, err = probeAnchor(probeCtx)
+				anchorBudgetElapsed = err != nil && probeCtx.Err() != nil && ctx.Err() == nil
+				probeCancel()
 				recordVirtualProviderLinkLatency(linkKey, time.Since(attemptStarted), time.Now())
 				if err == nil || ctx.Err() != nil || attempt == 2 {
 					break
@@ -6799,6 +6841,37 @@ func configureCopyRemuxTimelineV3(plan *playback.PlanV3, origin float64) {
 	plan.Timeline.SeekRestoration = "source_position"
 }
 
+// configureCopyVODTimelineV3 publishes a planned copy session's complete
+// playlist as a seekable source-timeline window. The player clock starts at
+// the playlist's own origin (the first copied keyframe, normally zero), and
+// both ends of the window are known, so a client seeks natively by requesting
+// the target segment. The segment layer restarts FFmpeg in place at that
+// segment's planned boundary when it has not been produced yet; the transport
+// and the playlist stay exactly as they are.
+func configureCopyVODTimelineV3(plan *playback.PlanV3, vod playback.CopyVODPlan) {
+	if plan == nil || vod.Duration <= 0 {
+		return
+	}
+	origin := max(0, vod.Origin)
+	end := origin + vod.Duration
+	requested := plan.Timeline.SourceStartSeconds
+	if requested < origin {
+		requested = origin
+	}
+	if requested > end {
+		requested = end
+	}
+	windowStart := origin
+	windowEnd := end
+	plan.Timeline.PlayerStartSeconds = max(0, requested-origin)
+	plan.Timeline.StreamOriginSeconds = origin
+	plan.Timeline.TimelineOffsetSeconds = origin
+	plan.Timeline.SeekWindowStartSeconds = &windowStart
+	plan.Timeline.SeekWindowEndSeconds = &windowEnd
+	plan.Timeline.CanSeekAnywhere = true
+	plan.Timeline.SeekRestoration = "source_position"
+}
+
 func appendPlaybackQueryV3(rawURL, key, value string) string {
 	separator := "?"
 	if strings.ContainsRune(rawURL, '?') {
@@ -7200,6 +7273,14 @@ func (h *PlaybackHandler) prepareLocalTransportV3(r *http.Request, session *play
 			reason:  candidateSourceDecodeRejectedReasonV3,
 			message: candidateSourceDecodeRejectedMessageV3,
 		}
+	}
+	// A copy session that planned the whole media as one VOD playlist is
+	// genuinely seekable: every segment boundary is known before FFmpeg starts,
+	// so the client can request any segment directly. Publish that full window
+	// instead of the copy pre-roll window, whose open end forced every seek
+	// back through a replan.
+	if vod, ok := ts.CopyVODPlan(); ok {
+		configureCopyVODTimelineV3(result.Plan, vod)
 	}
 	cardOpts := ts.Opts()
 	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(file.FilePath)), "virtual://") {
@@ -10513,7 +10594,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				// The terminal-driven alternate-file hunt below is separately
 				// gated by the negotiated fallback policy, so a failed
 				// rehydration never silently swaps in a sibling version.
-				resolved, resolveErr := h.resolveRehydratedVirtualSourceWithAttemptV3(r, &pinnedFile, record.ProfileID, excludedCandidateIDs, preferredCandidateID, start.QualityPreference, intOrZeroHandlerV3(start.BandwidthCapKbps), virtualResolveOptionsV3{allowFailedCandidate: false, rotateCandidates: virtualDecodeRotation, sessionBound: true, sessionAnchorURI: session.VirtualSourceURI, bypassProviderFloor: true}, record)
+				resolved, resolveErr := h.resolveRehydratedVirtualSourceWithAttemptV3(r, &pinnedFile, record.ProfileID, excludedCandidateIDs, preferredCandidateID, start.QualityPreference, intOrZeroHandlerV3(start.BandwidthCapKbps), virtualResolveOptionsV3{allowFailedCandidate: false, rotateCandidates: virtualDecodeRotation, sessionBound: true, sessionAnchorURI: session.VirtualSourceURI, bypassProviderFloor: virtualReplanNeedsFreshProviderListingV3(operation, req.Failure.Classification, virtualDecodeRotation)}, record)
 				if resolveErr != nil {
 					slog.WarnContext(r.Context(), "virtual playback rehydration failed", "component", "api", "session_id", record.SessionID, "file_id", currentEffectiveFile.ID, "owner_installation_id", session.VirtualSourceOwnerInstallationID, "error", logredact.SanitizeURLError(resolveErr))
 					virtualRehydrationFailed = true
@@ -11736,7 +11817,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	if seekReanchor && record.CurrentPlan.Delivery == playback.DeliveryOriginalHTTPV3 && result.Plan.Delivery == playback.DeliveryOriginalHTTPV3 {
 		transportReused = true
 	} else if ((trackChange && len(unreachableNodes) == 0) ||
-		(seekReanchor && seekReanchorWithinActiveWindowV3(record.CurrentPlan, req.PositionSeconds))) &&
+		(seekReanchor && h.seekReanchorWithinActiveWindowV3(session, record.CurrentPlan, req.PositionSeconds))) &&
 		h.hasActiveReusableTransportV3(session, record.CurrentPlan.Delivery) {
 		proxyAllowed := mode.proxyEgress || (!mode.headerAuth && h.JWTSecret != "")
 		policy := h.playbackRoutingPolicyForContextV3(r.Context())
@@ -12646,16 +12727,17 @@ func reuseEligibleDeliveryV3(delivery playback.DeliveryV3) bool {
 // seekReanchorWithinActiveWindowV3 reports whether a seek target can be served
 // in place by the active transport's window. Only a segment-addressable HLS
 // transport can: its manifest resolves an arbitrary position against the
-// growing generation, and the segment layer restarts FFmpeg in place for
-// targets past the produced head. A progressive remux response is a single
-// continuous byte stream from its original start, so reusing it for a seek
-// hands the client a URL whose bytes already (or never) cover the target; a
-// progressive reanchor must rebuild instead.
+// generation's timeline. A progressive remux response is a single continuous
+// byte stream from its original start, so reusing it for a seek hands the
+// client a URL whose bytes already (or never) cover the target; a progressive
+// reanchor must rebuild instead.
 //
 // A target before an HLS window's start needs a fresh generation (the reused
-// one cannot produce bytes before its origin); a target past the produced head
-// is deliberately allowed through. A closed window end is honored so reuse
-// never claims a range the transport no longer serves.
+// one cannot produce bytes before its origin). A closed window end is honored
+// so reuse never claims a range the transport no longer serves. A growing
+// playlist publishes no end, so this check alone cannot tell whether the target
+// has been produced; seekReanchorWithinActiveWindowV3 on the handler adds that
+// comparison against the live session's produced head.
 //
 // A can_seek_anywhere plan publishes no window start, but the reused generation
 // still begins at a known stream origin: the segment layer can only serve
@@ -12677,6 +12759,72 @@ func seekReanchorWithinActiveWindowV3(plan playback.PlanV3, position float64) bo
 		return false
 	}
 	return true
+}
+
+// seekReanchorWithinActiveWindowV3 is the live-session form of the check
+// above. A transport that has published a closed or can_seek_anywhere window
+// can serve any target inside it from its segment layer, so reuse is safe. A
+// growing manifest has no published end: a target beyond the segments the
+// session has actually produced cannot be served by the reused generation
+// without an encoder restart that leaves the client clamped to the live edge,
+// so it must rebuild the transport at the target. The produced head comes from
+// the live transcode session, not from the plan, because only the session
+// knows how far FFmpeg has actually written.
+func (h *PlaybackHandler) seekReanchorWithinActiveWindowV3(session *playback.Session, plan playback.PlanV3, position float64) bool {
+	if !seekReanchorWithinActiveWindowV3(plan, position) {
+		return false
+	}
+	if plan.Timeline.CanSeekAnywhere || plan.Timeline.SeekWindowEndSeconds != nil {
+		return true
+	}
+	headEnd, ok := h.producedHeadEndSecondsV3(session)
+	return seekReanchorWithinActiveWindowAtHeadV3(plan, position, headEnd, ok)
+}
+
+// seekReanchorWithinActiveWindowAtHeadV3 reports whether a growing HLS
+// transport, whose produced content ends at producedHeadEnd, can answer
+// position in place. Without a session that reports a head, the previous
+// permissive behavior is kept: only an in-place restart is then possible, and
+// rebuilding would lose the only stream that can serve it.
+func seekReanchorWithinActiveWindowAtHeadV3(plan playback.PlanV3, position, producedHeadEnd float64, haveHead bool) bool {
+	if !seekReanchorWithinActiveWindowV3(plan, position) {
+		return false
+	}
+	if plan.Timeline.CanSeekAnywhere || plan.Timeline.SeekWindowEndSeconds != nil {
+		return true
+	}
+	if !haveHead {
+		return true
+	}
+	return position <= producedHeadEnd
+}
+
+// producedHeadEndSecondsV3 reports the source-timeline end of the last segment
+// the live session has fully produced. The head's start comes from the
+// session's real manifest and its duration from the configured segment length;
+// a missing session or an unreadable timeline reports no head, which keeps the
+// caller on the reuse path.
+func (h *PlaybackHandler) producedHeadEndSecondsV3(session *playback.Session) (float64, bool) {
+	if h == nil || h.tm == nil || session == nil {
+		return 0, false
+	}
+	transcodeSession := h.tm.GetTranscodeSession(session.ID)
+	if transcodeSession == nil {
+		return 0, false
+	}
+	progress := transcodeSession.SegmentProgress(time.Now())
+	if progress.ProducedHead < 0 {
+		return 0, false
+	}
+	headStart, ok, err := transcodeSession.SegmentStartTime(progress.ProducedHead)
+	if err != nil || !ok {
+		return 0, false
+	}
+	segmentSeconds := float64(progress.SegmentDuration)
+	if segmentSeconds <= 0 {
+		segmentSeconds = playback.DefaultSegmentDuration
+	}
+	return headStart + segmentSeconds, true
 }
 
 // sameExecutableAVRecipeV3 reports whether two frozen A/V recipes are equivalent.
@@ -14382,6 +14530,32 @@ func failureRecoveryOperationV3(operation playback.ReplanOperationV3) bool {
 		operation == playback.ReplanOperationSeekFailureRecoveryV3
 }
 
+// virtualReplanNeedsFreshProviderListingV3 reports whether a session-bound
+// virtual replan must ask the provider for a new listing instead of reusing a
+// fresh resolved source. Only a cause that indicts the source qualifies: a
+// confirmed decode rejection, a seek failure recovery, or a failure recovery
+// that is not a track change reported as one. A user-intent replan (track,
+// quality, or output change, and a seek reanchor) re-selects within the release
+// already playing, so the resolver's fresh-serve floor and candidate TTL are the
+// right reuse: forcing a listing there paid a multi-second provider round-trip
+// per replan for an answer nothing had invalidated. A source that actually moved
+// or stopped serving still re-lists on the failure path below, so reuse never
+// keeps a dead release pinned.
+func virtualReplanNeedsFreshProviderListingV3(operation playback.ReplanOperationV3, failureClassification string, decodeRotation bool) bool {
+	if decodeRotation {
+		return true
+	}
+	switch operation {
+	case playback.ReplanOperationSeekFailureRecoveryV3:
+		return true
+	case playback.ReplanOperationFailureRecoveryV3:
+		key := failureClassificationKeyV3(failureClassification)
+		return key != failureSubtitleTrackChangedV3 && key != failureAudioTrackChangedV3
+	default:
+		return false
+	}
+}
+
 // abandonedBeforeFirstSegmentV3 reports whether the live transcode session for
 // this attempt served the playlist and never one segment request. See
 // playback.TranscodeSession.AbandonedBeforeFirstSegment: the session carries
@@ -15256,7 +15430,31 @@ func configureHLSTimelineV3(plan *playback.PlanV3, videoCodec string, segmentDur
 	startSegment := computeStartSegment(seek, segmentDuration)
 	plan.Timeline.SourceStartSeconds = requested
 	usesGrowingManifest := !playback.CanGenerateSyntheticManifest(durationSeconds, segmentDuration)
-	if usesGrowingManifest {
+	if startSegment > 0 && !usesGrowingManifest {
+		// A resume starts the generation at the segment boundary before the
+		// requested position, and the complete VOD playlist begins there (see
+		// generateSyntheticPlaylist). The transport's clock zero is therefore
+		// that seek anchor, not the source start: the client seeks to the
+		// requested position expressed on the playlist's own timeline. The
+		// previous source-zero shape advertised segments the generation never
+		// produced, so a player that prefetches the playlist's first entry
+		// requested one of them and the segment layer restarted a healthy
+		// encoder just to serve a segment the client then discarded.
+		//
+		// The playlist is complete, so the window is closed. Positions after
+		// the anchor are served in place; a target before it belongs to
+		// another generation, so the plan routes that seek back through the
+		// server rather than letting the player clamp to the anchor.
+		plan.Timeline.PlayerStartSeconds = max(0, requested-seek)
+		plan.Timeline.StreamOriginSeconds = seek
+		plan.Timeline.TimelineOffsetSeconds = seek
+		windowStart := seek
+		windowEnd := durationSeconds
+		plan.Timeline.SeekWindowStartSeconds = &windowStart
+		plan.Timeline.SeekWindowEndSeconds = &windowEnd
+		plan.Timeline.CanSeekAnywhere = false
+		plan.Timeline.SeekRestoration = "source_position"
+	} else if usesGrowingManifest {
 		// Encoded streams seek to the preceding segment boundary. Preserve the
 		// requested sub-segment offset so playback still begins at the exact
 		// requested source position. Copy remuxes are configured separately with

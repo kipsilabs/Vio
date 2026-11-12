@@ -206,29 +206,57 @@ func (g *relayDemuxGuard) acquire(ctx context.Context, input string, class relay
 		return func() {}, true
 	}
 	pools := g.pools(source)
+	label := relayDemuxClassLabel(class)
+	started := time.Now()
+	var release func()
+	var ok bool
 	switch class {
 	case relayDemuxDetached:
 		// Detached work never waits and never touches another budget: if its
 		// own budget is taken it is skipped and re-kicked later.
 		select {
 		case pools.detached <- struct{}{}:
-			return func() { <-pools.detached }, true
+			release, ok = func() { <-pools.detached }, true
 		default:
-			return nil, false
 		}
 	case relayDemuxFontDetached:
 		select {
 		case pools.font <- struct{}{}:
-			return func() { <-pools.font }, true
+			release, ok = func() { <-pools.font }, true
 		default:
-			return nil, false
 		}
 	case relayDemuxFont:
-		return g.acquireWaiting(ctx, pools.font)
+		release, ok = g.acquireWaiting(ctx, pools.font)
+		observeSubtitleRelayAdmissionWait(label, time.Since(started))
 	default:
-		return g.acquireWaiting(ctx, pools.requestPath)
+		release, ok = g.acquireWaiting(ctx, pools.requestPath)
+		observeSubtitleRelayAdmissionWait(label, time.Since(started))
+	}
+	recordSubtitleRelayAdmission(label, source, ok)
+	if !ok {
+		return nil, false
+	}
+	return release, true
+}
+
+// relayDemuxClassLabel is the bounded metric label for an admission class.
+// The two font classes share one pool and one label.
+func relayDemuxClassLabel(class relayDemuxClass) string {
+	switch class {
+	case relayDemuxDetached:
+		return relayDemuxClassDetachedLabel
+	case relayDemuxFont, relayDemuxFontDetached:
+		return relayDemuxClassFontLabel
+	default:
+		return relayDemuxClassRequestLabel
 	}
 }
+
+const (
+	relayDemuxClassRequestLabel  = "request"
+	relayDemuxClassDetachedLabel = "detached"
+	relayDemuxClassFontLabel     = "font"
+)
 
 // acquireWaiting takes one slot from pool, waiting up to the guard's short
 // bound. It reports false when the pool stays full: the caller answers its

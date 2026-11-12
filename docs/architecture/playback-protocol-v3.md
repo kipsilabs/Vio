@@ -1032,6 +1032,19 @@ Three shapes exist:
 position, `can_seek_anywhere` is true when the runtime is known, and
 `seek_restoration` is `player_position` — the client seeks locally.
 
+A transcoded *resume* starts its generation at the segment boundary before the
+requested position, and the complete VOD playlist begins at that segment. The
+plan therefore puts the transport's clock zero there: `stream_origin` and
+`timeline_offset` are that boundary, `player_start` is the sub-segment
+remainder, `seek_window_start_seconds` is the boundary and
+`seek_window_end_seconds` the runtime, and `seek_restoration` is
+`source_position`. Every position at or after the boundary is served natively by
+the segment layer, which restarts FFmpeg in place when the target segment has
+not been produced yet. A target before the boundary belongs to another
+generation: advertising it would make the playlist name segments this
+generation never produces, and a client that prefetches the playlist's first
+entry would restart a healthy encoder for one of them.
+
 Source positions count from the start of the file: the container's first
 timestamp is position 0. Most files start at timestamp zero, but MPEG-TS
 recordings and files remuxed from them can start seconds (or more) in. Plan positions, playlist time,
@@ -2178,8 +2191,10 @@ only until a complete artifact has been committed; once one exists the whole
 artifact is served and both headers are absent. A client that requested the
 whole track therefore cannot assume a complete body: it reads the headers and
 requests subsequent windows from the advertised end, or treats the response as
-that one window. Explicit `position`/`duration` (and PGS `windowed=1`) always
-override the implicit window. External and downloaded sidecars are always
+that one window. Explicit `position`/`duration` (and PGS `windowed=1` with
+bounds) always override the implicit window; a PGS `windowed=1` with no
+position or duration names no range, so it still receives the implicit first
+window. External and downloaded sidecars are always
 returned whole. First-party native clients that fetch a complete embedded
 sidecar in one request (`silo-apple`, `silo-android`) must handle the bounded
 default and are coordinated with this change.

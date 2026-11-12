@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/playback"
 )
 
 const (
@@ -71,6 +72,48 @@ func copySeekAnchorResolveBudgetFor(file *models.MediaFile) time.Duration {
 		copySeekAnchorSeekResolveTimeoutCap,
 		recentVirtualProviderLinkLatency(virtualProviderLinkLatencyKey(file)),
 	)
+}
+
+// copySeekProbeContext returns the context one copy-video seek-anchor probe runs
+// under. The probe is the second leg of an attempt whose resolve already spent
+// part of the attempt budget, so a probe bounded by the attempt context alone is
+// truncated to whatever the resolve left — the production shape where a 0.7-1.9s
+// probe died at about a second after a slow listing. A measured link therefore
+// gets its own adaptive probe budget from the request context that cannot be
+// shorter than the attempt's own window; the request deadline still bounds it. An
+// unmeasured link, or a local file with no provider link, keeps the attempt
+// context unchanged so a deliberately short bound is still honored.
+func copySeekProbeContext(ctx, attemptCtx context.Context, observed time.Duration) (context.Context, context.CancelFunc) {
+	if observed <= 0 {
+		return attemptCtx, func() {}
+	}
+	budget := playback.AdaptiveProbeBudget(playback.RemoteProbeFloor, playback.CopySeekProbeTimeout, observed, 0)
+	if budget <= 0 {
+		return attemptCtx, func() {}
+	}
+	deadline := time.Now().Add(budget)
+	if attemptDeadline, ok := attemptCtx.Deadline(); ok && attemptDeadline.After(deadline) {
+		deadline = attemptDeadline
+	}
+	return context.WithDeadline(ctx, deadline)
+}
+
+// remoteProbeBudget sizes one probe attempt against file's provider link from
+// that link's slowest recent observation and the caller's remaining budget. It
+// is the handler-side entry to playback.AdaptiveProbeBudget: a link whose
+// listing just took 4.8s gets a ~9.6s subtitle layout probe instead of the fixed
+// 5s that killed it, while an unmeasured link keeps the floor and a caller with
+// no time left gets 0. A nil or owner-less file has no provider link and keeps
+// the floor.
+func remoteProbeBudget(ctx context.Context, file *models.MediaFile, floor, maxBudget time.Duration) time.Duration {
+	var remaining time.Duration
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining = time.Until(deadline)
+		if remaining <= 0 {
+			return 0
+		}
+	}
+	return playback.AdaptiveProbeBudget(floor, maxBudget, recentVirtualProviderLinkLatency(virtualProviderLinkLatencyKey(file)), remaining)
 }
 
 // copySeekAnchorAttemptFits reports whether the caller's remaining budget can
