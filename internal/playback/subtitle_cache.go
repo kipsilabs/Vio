@@ -2243,11 +2243,23 @@ func (c *SubtitleCache) WarmTrackInBackground(opts StreamExtractOpts, extract SU
 		close(done)
 		return done
 	}
-	fill, _ := c.reserveFill(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, format, true)
+	fill, inflight := c.reserveFill(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, format, true)
 	if fill == nil {
-		// Another fill (client-driven or a previous warm) is already in
-		// flight, or the cache is unusable — either way, nothing to do.
 		<-c.warmSem
+		// A fill already owns this track's artifact key. That is the healthy
+		// case — the request path is producing the artifact this warm exists
+		// for — so the warm adds nothing and must not queue behind it. Say so
+		// instead of returning silently: an admitted-but-idle warm with no log
+		// is indistinguishable from a broken one (production: 17 kicks, zero
+		// admissions, zero skip-reason lines).
+		if inflight != nil {
+			slog.Info("subtitle cache warm skipped: a fill already owns this track",
+				"input", opts.InputPath, "track", opts.TrackIndex, "format", format,
+				"background_fill", c.fillStartedInBackground(inflight))
+		} else {
+			slog.Debug("subtitle cache warm skipped: cache unavailable for this source",
+				"input", opts.InputPath, "track", opts.TrackIndex, "format", format)
+		}
 		close(done)
 		return done
 	}
@@ -2792,6 +2804,18 @@ func (c *SubtitleCache) reserveFill(inputPath, cacheIdentity string, trackIndex 
 	}
 	fill.tmp = tmp
 	return fill, nil
+}
+
+// fillStartedInBackground reports whether an in-flight fill was admitted as a
+// background (warm) fill rather than by the request path. It is observation
+// only, for the warm's skip log.
+func (c *SubtitleCache) fillStartedInBackground(fill *SubtitleCacheFill) bool {
+	if c == nil || fill == nil {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return fill.background
 }
 
 // warmInFlight reports whether a background warm is currently filling the

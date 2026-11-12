@@ -1,10 +1,12 @@
 package playback
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1859,6 +1861,43 @@ func TestWarmInBackgroundSkipsInFlightFill(t *testing.T) {
 	default:
 	}
 	clientFill.Discard()
+}
+
+// A warm that cannot reserve the track because the request path already owns the
+// fill must say why. An admitted-but-idle warm with no skip-reason line is
+// indistinguishable from a broken one (production: 17 kicks, zero admissions,
+// zero skip reasons). The request-path fill is the artifact the warm exists for,
+// so refusing to join it is the right policy; the refusal just has to be
+// visible.
+func TestWarmTrackInBackgroundLogsTheFillItYieldsTo(t *testing.T) {
+	logs := &bytes.Buffer{}
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	c, source := newTestCache(t)
+	clientFill := c.BeginFill(source, 0)
+	if clientFill == nil {
+		t.Fatal("BeginFill returned nil")
+	}
+	defer clientFill.Discard()
+
+	var ran atomic.Bool
+	done := c.WarmTrackInBackground(supExtractOpts(source, 0), func(context.Context, StreamExtractOpts) error {
+		ran.Store(true)
+		return nil
+	}, "warm-skip")
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("warm did not settle")
+	}
+	if ran.Load() {
+		t.Fatal("warm extracted while the request path owned the track")
+	}
+	if !strings.Contains(logs.String(), "warm skipped: a fill already owns this track") {
+		t.Fatalf("warm skip reason not logged: %s", logs.String())
+	}
 }
 
 func TestServeSUPExtractDiscardsOnExtractError(t *testing.T) {
