@@ -4697,6 +4697,19 @@ func (h *StreamHandler) virtualSubtitleWarmExtractor(file *models.MediaFile, tra
 		// invocation from re-keying a warm that has already settled under its
 		// probe-established identity.
 		rekeyed = nil
+		// An external cancellation ends this invocation on someone else's terms:
+		// an admitted page preempted the fill, or the warm's own abort fired. Its
+		// re-key verdict is not ours to act on, because the cache may hand the
+		// key to another warm instead of replaying this closure. Drop the verdict
+		// on the way out too; otherwise the handler sees it after the warm
+		// returns and starts a redundant full-track warm for the remapped track.
+		// A verdict reached on an uncanceled invocation (a genuine drift remap)
+		// still survives.
+		defer func() {
+			if extractCtx.Err() != nil {
+				rekeyed = nil
+			}
+		}()
 		// The cache may re-invoke this closure after yielding the relay pipe to
 		// an admitted page (WarmTrackInBackground), or the warm loop may re-key
 		// it. Release the previous attempt's registration before resolving a
