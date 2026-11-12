@@ -24,7 +24,13 @@ import {
   upcomingRequestSeasons,
 } from "@/lib/mediaRequests";
 import { cn } from "@/lib/utils";
-import { useT, type Translate } from "@/i18n";
+
+type SeasonSource = "tvdb" | "tmdb";
+
+/** Unknown or absent provider metadata falls back to the server default. */
+function seasonSourceOf(detail?: RequestMediaDetail): SeasonSource {
+  return detail?.season_source === "tmdb" ? "tmdb" : "tvdb";
+}
 
 interface RequestSeasonsDialogProps {
   open: boolean;
@@ -50,12 +56,18 @@ export function RequestSeasonsDialog({
   title,
   detail: givenDetail,
 }: RequestSeasonsDialogProps) {
-  const t = useT();
-  const loaded = useRequestMediaDetail("series", tmdbID, { enabled: open && !givenDetail });
-  const detail = givenDetail ?? loaded.data;
+  const defaultSource = seasonSourceOf(givenDetail);
+  const [seasonSource, setSeasonSource] = useState<SeasonSource>(defaultSource);
+  const givenMatchesSource =
+    givenDetail !== undefined && seasonSourceOf(givenDetail) === seasonSource;
+  const loaded = useRequestMediaDetail("series", tmdbID, {
+    enabled: open && !givenMatchesSource,
+    seasonSource,
+  });
+  const detail = givenMatchesSource ? givenDetail : loaded.data;
   // A reopened dialog can show the detail from before a request until the
   // refetch lands; don't send from it.
-  const refreshing = !givenDetail && loaded.isFetching;
+  const refreshing = !givenMatchesSource && loaded.isFetching;
   const rowID = useId();
   const createRequest = useCreateMediaRequest();
   // null keeps the default pick, so it follows the detail as it loads.
@@ -80,17 +92,28 @@ export function RequestSeasonsDialog({
   const upcoming = upcomingRequestSeasons(choices);
 
   const close = (next: boolean) => {
-    if (!next) setPicked(null);
+    if (!next) {
+      setPicked(null);
+      setSeasonSource(defaultSource);
+    }
     onOpenChange(next);
   };
   const toggle = (season: number, on: boolean) =>
     setPicked(
       on ? [...selected, season].sort((a, b) => a - b) : selected.filter((s) => s !== season),
     );
+  const changeSource = (source: SeasonSource) => {
+    setSeasonSource(source);
+    setPicked(null);
+  };
   const submit = () => {
     if (!detail) return;
     createRequest.mutate(
-      { ...requestInputFromMediaResult(detail), ...(!serverChooses && { seasons: selected }) },
+      {
+        ...requestInputFromMediaResult(detail),
+        season_source: seasonSource,
+        ...(!serverChooses && { seasons: selected }),
+      },
       { onSuccess: () => close(false) },
     );
   };
@@ -99,29 +122,52 @@ export function RequestSeasonsDialog({
     <Dialog open={open} onOpenChange={close}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <DialogTitle>{t("web.requests.seasons.title")}</DialogTitle>
+          <DialogTitle>Request seasons</DialogTitle>
           <DialogDescription>
             {requestable || !detail
-              ? t("web.requests.seasons.choose", { title: detail?.title ?? title })
-              : unavailableReason(t, detail.request.reason)}
+              ? `Choose the seasons of ${detail?.title ?? title} to request.`
+              : unavailableReason(detail.request.reason)}
           </DialogDescription>
         </DialogHeader>
+
+        <div
+          role="group"
+          aria-label="Season numbering source"
+          className="bg-muted text-muted-foreground flex w-fit items-center gap-0.5 rounded-md p-0.5 text-xs font-medium"
+        >
+          {(["tvdb", "tmdb"] as const).map((source) => (
+            <button
+              key={source}
+              type="button"
+              aria-pressed={seasonSource === source}
+              onClick={() => changeSource(source)}
+              className={cn(
+                "rounded px-2.5 py-1 transition-colors",
+                seasonSource === source
+                  ? "bg-background text-foreground shadow-sm"
+                  : "hover:text-foreground",
+              )}
+            >
+              {source.toUpperCase()}
+            </button>
+          ))}
+        </div>
 
         {!detail ? (
           <div className="text-muted-foreground flex items-center justify-center gap-2 py-10 text-sm">
             {loaded.isError ? (
-              t("web.requests.seasons.loadFailed")
+              "Could not load the seasons of this series."
             ) : (
               <>
                 <Loader2 className="size-4 animate-spin" aria-hidden="true" />
-                {t("web.requests.seasons.loading")}
+                Loading seasons…
               </>
             )}
           </div>
         ) : seasons.length === 0 ? (
           requestable ? (
             <p className="text-muted-foreground py-6 text-center text-sm">
-              {t("web.requests.seasons.noSeasons")}
+              No seasons are listed for this series yet; the request covers the whole series.
             </p>
           ) : null
         ) : (
@@ -129,20 +175,20 @@ export function RequestSeasonsDialog({
             {picked === null && defaults.length === 0 && choices.length > 0 ? (
               <p className="text-muted-foreground text-sm">
                 {inLibrary
-                  ? t("web.requests.seasons.pickUpcoming")
-                  : t("web.requests.seasons.noneAired")}
+                  ? "Pick the upcoming seasons to request."
+                  : "No season has aired yet, so the request covers the whole series unless you pick seasons."}
               </p>
             ) : null}
             {choices.length > 1 && (latest !== null || upcoming.length > 0) ? (
               <div className="flex flex-wrap gap-2">
                 {latest !== null ? (
                   <Button variant="outline" size="sm" onClick={() => setPicked([latest])}>
-                    {t("web.requests.seasons.latest")}
+                    Latest season
                   </Button>
                 ) : null}
                 {upcoming.length > 0 ? (
                   <Button variant="outline" size="sm" onClick={() => setPicked(upcoming)}>
-                    {t("web.requests.seasons.upcoming")}
+                    Upcoming seasons
                   </Button>
                 ) : null}
               </div>
@@ -156,7 +202,7 @@ export function RequestSeasonsDialog({
                       setPicked(on ? choices.map((s) => s.season_number) : [])
                     }
                   />
-                  {t("web.requests.seasons.all")}
+                  All seasons
                 </label>
               ) : null}
               <ul className="divide-border divide-y">
@@ -178,15 +224,11 @@ export function RequestSeasonsDialog({
                           }
                           disabled={!choosable}
                           onCheckedChange={(on) => toggle(season.season_number, on)}
-                          aria-label={t("web.requests.seasons.season", {
-                            number: season.season_number,
-                          })}
+                          aria-label={`Season ${season.season_number}`}
                           aria-describedby={`${metaID} ${statusID}`}
                         />
                         <span className="min-w-0 flex-1">
-                          <span className="block truncate font-medium">
-                            {seasonName(t, season)}
-                          </span>
+                          <span className="block truncate font-medium">{seasonName(season)}</span>
                           <span id={metaID} className="text-muted-foreground block text-xs">
                             {formatRequestSeasonMeta(season)}
                           </span>
@@ -203,7 +245,7 @@ export function RequestSeasonsDialog({
 
         <DialogFooter>
           <Button variant="outline" onClick={() => close(false)}>
-            {t("common.cancel")}
+            Cancel
           </Button>
           <Button
             onClick={submit}
@@ -218,10 +260,10 @@ export function RequestSeasonsDialog({
           >
             {(createRequest.isPending || refreshing) && <Loader2 className="size-4 animate-spin" />}
             {selected.length > 0
-              ? t("web.requests.seasons.requestSeasons", { seasons: formatSeasonList(selected) })
+              ? `Request ${formatSeasonList(selected)}`
               : serverChooses
-                ? t("web.requests.seasons.requestSeries")
-                : t("web.requests.request")}
+                ? "Request series"
+                : "Request"}
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -229,24 +271,20 @@ export function RequestSeasonsDialog({
   );
 }
 
-function seasonName(t: Translate, season: RequestMediaSeason): string {
-  const numberText = String(season.season_number);
-  const number = t("web.requests.seasons.season", { number: season.season_number });
-  // TMDB's generic name is English ("Season 2"); compare with that, not the translation.
-  return season.name && season.name !== `Season ${numberText}` && season.name !== number
-    ? t("web.requests.seasons.seasonNamed", { number: season.season_number, name: season.name })
-    : number;
+function seasonName(season: RequestMediaSeason): string {
+  const number = `Season ${season.season_number}`;
+  return season.name && season.name !== number ? `${number}: ${season.name}` : number;
 }
 
 /** Why no season can be picked, for a series the viewer cannot request now. */
-function unavailableReason(t: Translate, reason?: string): string {
+function unavailableReason(reason?: string): string {
   switch (reason) {
     case "already_available":
-      return t("web.requests.seasons.allAvailable");
+      return "Every season is already in the library.";
     case "already_requested":
-      return t("web.requests.seasons.alreadyRequested");
+      return "This series already has an open request.";
     default:
-      return t("web.requests.seasons.reason", { reason: formatRequestReason(reason) });
+      return `${formatRequestReason(reason)}.`;
   }
 }
 
@@ -260,19 +298,18 @@ export function SeasonStatus({
   className?: string;
   id?: string;
 }) {
-  const t = useT();
   const label =
     season.availability === "available"
-      ? t("web.requests.seasons.inLibrary")
+      ? "In library"
       : season.requested
-        ? t("web.requests.seasons.requested")
+        ? "Requested"
         : season.availability === "partial"
-          ? t("web.requests.seasons.partlyInLibrary")
+          ? "Partly in library"
           : seasonHasAired(season)
             ? null
             : season.air_date && season.episode_count > 0
-              ? t("web.requests.seasons.notAired")
-              : t("web.requests.seasons.notAnnounced");
+              ? "Not aired yet"
+              : "Not announced";
   if (!label) return null;
   return (
     <span

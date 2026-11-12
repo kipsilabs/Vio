@@ -22,6 +22,8 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
+import { usePurgeVirtualPlaybackItems } from "@/hooks/queries/admin/collections";
+import { useAdminLibraries } from "@/hooks/queries/admin/libraries";
 import {
   useAdminServerStatus,
   useCancelStorageTransition,
@@ -36,7 +38,6 @@ import { useRestartKeys, type RestartKeyMatcher } from "@/hooks/useRestartKeys";
 import { useSettingsForm } from "@/hooks/useSettingsForm";
 import { toast } from "sonner";
 import { SaveBar } from "@/components/SaveBar";
-import { useT, type Translate } from "@/i18n";
 
 import { FieldGroup } from "./FieldGroup";
 import { SettingField } from "./SettingField";
@@ -110,9 +111,6 @@ const STORAGE_GROUP_KEYS = ["artwork.storage_backend", "artwork.local_path", CAC
 
 const KEYS = [...STORAGE_GROUP_KEYS, ...PUBLIC_S3_KEYS, ...PRIVATE_S3_KEYS];
 
-// An example absolute path, shown as the hint of the local path fields.
-const LOCAL_PATH_EXAMPLE = "/var/lib/silo/artwork";
-
 function countDirty(form: SettingsForm, keys: string[]): number {
   return keys.filter((key) => form.isDirty(key)).length;
 }
@@ -125,78 +123,75 @@ function allRestart(restartKeys: RestartKeyMatcher, keys: string[]): boolean {
   return keys.every((key) => restartKeys.has(key));
 }
 
-function transitionPhaseLabel(t: Translate, phase: StorageTransitionPhase | undefined): string {
+function transitionPhaseLabel(phase: StorageTransitionPhase | undefined): string {
   switch (phase) {
     case "queued":
-      return t("web.admin.settings.storage.phase.queued");
+      return "Waiting to start";
     case "checking_target":
-      return t("web.admin.settings.storage.phase.checkingTarget");
+      return "Checking target storage";
     case "copying":
-      return t("web.admin.settings.storage.phase.copying");
+      return "Copying storage objects";
     case "verifying":
-      return t("web.admin.settings.storage.phase.verifying");
+      return "Verifying copied objects";
     case "committing":
-      return t("web.admin.settings.storage.phase.committing");
+      return "Saving storage settings";
     case "restart_pending":
-      return t("web.admin.settings.storage.phase.restartPending");
+      return "Restart required to activate storage";
     case "completed":
-      return t("web.admin.settings.storage.phase.completed");
+      return "Storage transition completed";
     case "failed":
-      return t("web.admin.settings.storage.phase.failed");
+      return "Storage transition failed";
     case "canceled":
-      return t("web.admin.settings.storage.phase.canceled");
+      return "Storage transition canceled";
     default:
-      return t("web.admin.settings.storage.phase.preparing");
+      return "Preparing storage transition";
   }
 }
 
-function transitionFailureLabel(
-  t: Translate,
-  category: StorageTransitionFailureCategory | undefined,
-): string {
+function transitionFailureLabel(category: StorageTransitionFailureCategory | undefined): string {
   switch (category) {
     case "preparation_failed":
-      return t("web.admin.settings.storage.failure.preparation");
+      return "Storage transition preparation failed.";
     case "target_check_failed":
-      return t("web.admin.settings.storage.failure.targetCheck");
+      return "Target storage could not be verified.";
     case "copy_failed":
-      return t("web.admin.settings.storage.failure.copy");
+      return "Copying storage objects failed.";
     case "verification_failed":
-      return t("web.admin.settings.storage.failure.verification");
+      return "Storage verification failed.";
     case "commit_failed":
-      return t("web.admin.settings.storage.failure.commit");
+      return "Storage settings could not be saved.";
     default:
-      return t("web.admin.settings.storage.failure.unknown");
+      return "The storage transition did not complete.";
   }
 }
 
-function verifiedObjectsLabel(t: Translate, count: number): string {
-  return t("web.admin.settings.storage.verifiedObjects", { count, count_text: count });
+function verifiedObjectsLabel(count: number): string {
+  return `${count} ${count === 1 ? "object" : "objects"} verified`;
 }
 
-function recoveryStateTitle(t: Translate, state: string | undefined): string {
+function recoveryStateLabel(state: string | undefined): string {
   switch (state) {
     case "running":
-      return t("web.admin.settings.storage.recovery.titleRunning");
+      return "running";
     case "waiting_retry":
-      return t("web.admin.settings.storage.recovery.titleWaitingRetry");
+      return "waiting to retry";
     case "blocked":
-      return t("web.admin.settings.storage.recovery.titleBlocked");
+      return "blocked";
     default:
-      return t("web.admin.settings.storage.recovery.titlePending");
+      return "pending";
   }
 }
 
-function recoveryStateMessage(t: Translate, state: string | undefined): string {
+function recoveryStateMessage(state: string | undefined): string {
   switch (state) {
     case "running":
-      return t("web.admin.settings.storage.recovery.messageRunning");
+      return "Reconciling committed artwork storage.";
     case "waiting_retry":
-      return t("web.admin.settings.storage.recovery.messageWaitingRetry");
+      return "Reconciliation paused; waiting to retry.";
     case "blocked":
-      return t("web.admin.settings.storage.recovery.messageBlocked");
+      return "Recovery is blocked. Check administrator diagnostics for details.";
     default:
-      return t("web.admin.settings.storage.recovery.messagePending");
+      return "Artwork reconciliation is pending after restart.";
   }
 }
 
@@ -262,7 +257,6 @@ function S3Group({
   publicBackendChangePending?: boolean;
   locationFieldsDisabled?: boolean;
 }) {
-  const t = useT();
   const checkConnection = useCheckAdminSettingsConnection();
   const [connectionResult, setConnectionResult] = useState<ConnectionCheckResponse | null>(null);
   const keys = scope === "public" ? PUBLIC_S3_KEYS : PRIVATE_S3_KEYS;
@@ -289,8 +283,7 @@ function S3Group({
     } catch (error) {
       setConnectionResult({
         success: false,
-        message:
-          error instanceof Error ? error.message : t("web.admin.settings.storage.s3.checkFailed"),
+        message: error instanceof Error ? error.message : "Connection check failed.",
       });
     }
   }
@@ -298,8 +291,7 @@ function S3Group({
   return (
     <FieldGroup label={label} description={description} restartAll={allRestart(restartKeys, keys)}>
       <SettingField
-        label={t("web.admin.settings.storage.s3.endpoint")}
-        // eslint-disable-next-line formatjs/no-literal-string-in-jsx -- an example value, not text
+        label="Endpoint"
         hint="https://s3.us-east-1.amazonaws.com"
         value={form.getValue(key("endpoint"))}
         onChange={(v) => form.setValue(key("endpoint"), v)}
@@ -307,15 +299,15 @@ function S3Group({
         restartRequired={restartKeys.has(key("endpoint"))}
       />
       <SettingField
-        label={t("web.admin.settings.storage.s3.bucket")}
+        label="Bucket"
         value={form.getValue(key("bucket"))}
         onChange={(v) => form.setValue(key("bucket"), v)}
         disabled={secrets.disabled || locationFieldsDisabled}
         restartRequired={restartKeys.has(key("bucket"))}
       />
       <SettingField
-        label={t("web.admin.settings.storage.s3.keyPrefix")}
-        description={t("web.admin.settings.storage.s3.keyPrefixDescription")}
+        label="Folder inside the bucket"
+        description="Leave blank to use the bucket root."
         value={form.getValue(key("key_prefix"))}
         onChange={(v) => form.setValue(key("key_prefix"), v)}
         disabled={secrets.disabled || locationFieldsDisabled}
@@ -327,40 +319,38 @@ function S3Group({
         <div className="settings-field-note my-3 flex items-start gap-3 rounded-xl border border-amber-500/20 bg-amber-500/5 p-4">
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" />
           <div className="text-[13px] leading-relaxed">
-            <p className="font-medium text-amber-500">
-              {t("web.admin.settings.storage.s3.locationChange")}
-            </p>
+            <p className="font-medium text-amber-500">Storage location change</p>
             {publicBackendChangePending ||
             artworkLockedBackend === "s3" ||
             (scope === "private" && artworkLockedBackend !== undefined) ? (
               <p className="text-muted-foreground mt-1">
                 {publicBackendChangePending
-                  ? t("web.admin.settings.storage.s3.locationChangeFromLocal")
+                  ? "Saving this bucket opens a managed transition from local storage. Choose what to copy before switching."
                   : scope === "private" && artworkLockedBackend !== "s3"
-                    ? t("web.admin.settings.storage.s3.locationChangePrivate")
-                    : t("web.admin.settings.storage.s3.locationChangeS3")}
+                    ? "Saving this location opens a managed transition. You can start fresh or copy avatars, diagnostics, and catalog artifacts from where they are kept now; Silo verifies the old and new locations before switching."
+                    : "Saving this location opens a managed transition. You can start fresh or copy data from the current S3 storage; Silo verifies the old and new locations before switching."}
               </p>
             ) : (
               <p className="text-muted-foreground mt-1">
                 {scope === "public"
-                  ? t("web.admin.settings.storage.s3.locationUnlockedPublic")
-                  : t("web.admin.settings.storage.s3.locationUnlockedPrivate")}
+                  ? "The first artwork write records this location. Uploaded posters, collection artwork, and branding cannot be re-downloaded, so choose the bucket before scanning."
+                  : "Silo records a configured private bucket at startup. Choose it before storing avatars, diagnostics, or catalog artifacts; changing it later requires a managed transition."}
               </p>
             )}
           </div>
         </div>
       )}
       <SettingField
-        label={t("web.admin.settings.storage.s3.region")}
-        description={t("web.admin.settings.storage.s3.regionDescription")}
+        label="Region"
+        description="Leave blank unless your provider requires one."
         value={form.getValue(key("region"))}
         onChange={(v) => form.setValue(key("region"), v)}
         restartRequired={restartKeys.has(key("region"))}
       />
       <SettingField
-        label={t("web.admin.settings.storage.s3.pathStyle")}
+        label="Put the bucket name in the URL path"
         type="toggle"
-        description={t("web.admin.settings.storage.s3.pathStyleDescription")}
+        description="Needed by MinIO and some self-hosted storage."
         value={form.getValue(key("path_style"))}
         onChange={(v) => form.setValue(key("path_style"), v)}
         restartRequired={restartKeys.has(key("path_style"))}
@@ -372,7 +362,7 @@ function S3Group({
         instance-role access.
       */}
       <SecretField
-        label={t("web.admin.settings.storage.s3.accessKey")}
+        label="Access Key"
         value={form.getValue(key("access_key"))}
         configured={form.sensitiveConfigured.includes(key("access_key"))}
         onKeep={() => secrets.keepSaved(key("access_key"))}
@@ -383,7 +373,7 @@ function S3Group({
         restartRequired={restartKeys.has(key("access_key"))}
       />
       <SecretField
-        label={t("web.admin.settings.storage.s3.secretKey")}
+        label="Secret Key"
         value={form.getValue(key("secret_key"))}
         configured={form.sensitiveConfigured.includes(key("secret_key"))}
         onKeep={() => secrets.keepSaved(key("secret_key"))}
@@ -402,18 +392,15 @@ function S3Group({
       {scope === "public" && (
         <>
           <SettingField
-            label={t("web.admin.settings.storage.s3.urlAuth")}
+            label="How asset links are authorized"
             type="select"
-            description={t("web.admin.settings.storage.s3.urlAuthDescription")}
+            description="Signed links work with a private bucket and suit most installs."
             value={urlAuth}
             onChange={(v) => form.setValue("s3.public_url_auth", v)}
             options={[
-              { value: "presigned", label: t("web.admin.settings.storage.s3.urlAuthPresigned") },
-              { value: "public", label: t("web.admin.settings.storage.s3.urlAuthPublic") },
-              {
-                value: "cloudflare_token",
-                label: t("web.admin.settings.storage.s3.urlAuthCloudflare"),
-              },
+              { value: "presigned", label: "Signed links (recommended)" },
+              { value: "public", label: "Anyone with the link" },
+              { value: "cloudflare_token", label: "Cloudflare signed token" },
             ]}
             restartRequired={restartKeys.has("s3.public_url_auth")}
           />
@@ -424,8 +411,7 @@ function S3Group({
               forceOpen={advancedChanged > 0}
             >
               <SettingField
-                label={t("web.admin.settings.storage.s3.readEndpoint")}
-                // eslint-disable-next-line formatjs/no-literal-string-in-jsx -- an example value, not text
+                label="Address clients download from"
                 hint="https://cdn.example.com"
                 value={form.getValue("s3.public_read_endpoint")}
                 onChange={(v) => form.setValue("s3.public_read_endpoint", v)}
@@ -439,28 +425,28 @@ function S3Group({
                     order that works, since the field is hidden in those modes.
                   */}
                   <SecretField
-                    label={t("web.admin.settings.storage.s3.tokenSecret")}
+                    label="Token Secret"
                     value={form.getValue("s3.public_token_secret")}
                     configured={form.sensitiveConfigured.includes("s3.public_token_secret")}
                     onKeep={() => secrets.keepSaved("s3.public_token_secret")}
                     onClear={() => secrets.clearSaved("s3.public_token_secret")}
                     cleared={form.isClearStaged("s3.public_token_secret")}
                     onChange={(v) => secrets.setSecret("s3.public_token_secret", v)}
-                    hint={t("web.admin.settings.storage.s3.tokenSecretHint")}
+                    hint="Signing key configured in Cloudflare"
                     disabled={secrets.disabled}
                     restartRequired={restartKeys.has("s3.public_token_secret")}
                   />
                   <SettingField
-                    label={t("web.admin.settings.storage.s3.tokenParam")}
-                    description={t("web.admin.settings.storage.s3.tokenParamDescription")}
+                    label="Token query parameter"
+                    description="Usually verify."
                     value={form.getValue("s3.public_token_param") || "verify"}
                     onChange={(v) => form.setValue("s3.public_token_param", v)}
                     restartRequired={restartKeys.has("s3.public_token_param")}
                   />
                   <SettingField
-                    label={t("web.admin.settings.storage.s3.tokenTtl")}
+                    label="Link lifetime"
                     type="number"
-                    unit={t("web.admin.settings.storage.unitSeconds")}
+                    unit="seconds"
                     value={form.getValue("s3.public_token_ttl") || "10800"}
                     onChange={(v) => form.setValue("s3.public_token_ttl", v)}
                     restartRequired={restartKeys.has("s3.public_token_ttl")}
@@ -475,8 +461,89 @@ function S3Group({
   );
 }
 
+function VirtualLibraryGroup() {
+  const purgeVirtual = usePurgeVirtualPlaybackItems();
+  const { data: librariesData } = useAdminLibraries();
+  const [libraryID, setLibraryID] = useState("all");
+
+  const libraryOptions = useMemo(() => {
+    const opts: { value: string; label: string }[] = [{ value: "all", label: "All Libraries" }];
+    if (librariesData) {
+      for (const lib of librariesData) {
+        opts.push({ value: String(lib.id), label: `${lib.name} (ID: ${lib.id})` });
+      }
+    }
+    return opts;
+  }, [librariesData]);
+
+  const scope = () => {
+    const libraryId = Number.parseInt(libraryID, 10);
+    return {
+      libraryId: libraryId > 0 ? libraryId : undefined,
+    };
+  };
+
+  return (
+    <FieldGroup label="Virtual Library">
+      <div className="flex flex-col justify-between gap-4 py-3 sm:flex-row sm:items-center">
+        <div className="space-y-1">
+          <span className="text-sm font-medium">Purge Virtual Library</span>
+          <p className="text-muted-foreground text-xs">
+            Remove all zero-storage virtual files and their orphaned catalog items.
+          </p>
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            disabled={purgeVirtual.isPending}
+            onClick={() => purgeVirtual.mutate({ dryRun: true, ...scope() })}
+          >
+            {purgeVirtual.isPending && purgeVirtual.variables?.dryRun
+              ? "Previewing..."
+              : "Preview Purge"}
+          </Button>
+          <Button
+            type="button"
+            variant="destructive"
+            size="sm"
+            disabled={purgeVirtual.isPending}
+            onClick={() => {
+              const { libraryId } = scope();
+              const scoped = libraryId ? "the selected library" : "all virtual items";
+              if (
+                window.confirm(
+                  `Purge all zero-storage virtual library items for ${scoped}? This cannot be undone.`,
+                )
+              ) {
+                purgeVirtual.mutate({
+                  dryRun: false,
+                  libraryId,
+                });
+              }
+            }}
+          >
+            {purgeVirtual.isPending && !purgeVirtual.variables?.dryRun
+              ? "Purging..."
+              : "Purge Virtual Items"}
+          </Button>
+        </div>
+      </div>
+      <div className="grid gap-3 pt-2 pb-1">
+        <SettingField
+          label="Library Scope"
+          type="select"
+          options={libraryOptions}
+          value={libraryID}
+          onChange={setLibraryID}
+        />
+      </div>
+    </FieldGroup>
+  );
+}
+
 export default function StorageSettings() {
-  const t = useT();
   const form = useSettingsForm({ keys: useMemo(() => KEYS, []) });
   const restartKeys = useRestartKeys();
   const serverStatus = useAdminServerStatus();
@@ -636,31 +703,13 @@ export default function StorageSettings() {
   const privateBucketValue = form.getValue("s3.private_bucket").trim();
   const privateEndpointMissing =
     Boolean(privateBucketValue) && !form.getValue("s3.private_endpoint").trim();
-  const privateEndpointValue = form.getValue("s3.private_endpoint").trim();
   const privateTargetLabel = privateBucketValue
-    ? privateEndpointValue
-      ? t("web.admin.settings.storage.target.privateBucket", {
-          bucket: privateBucketValue,
-          endpoint: privateEndpointValue,
-        })
-      : t("web.admin.settings.storage.target.privateBucketNoEndpoint", {
-          bucket: privateBucketValue,
-        })
+    ? `Private bucket: ${privateBucketValue} · ${
+        form.getValue("s3.private_endpoint").trim() || "endpoint not set"
+      }`
     : transitionBackend === "local"
-      ? t("web.admin.settings.storage.target.noPrivateBucketLocal")
-      : t("web.admin.settings.storage.target.noPrivateBucketS3");
-  const publicBucketValue = form.getValue("s3.public_bucket");
-  const publicEndpointValue = form.getValue("s3.public_endpoint").trim();
-  const publicTargetLabel = publicBucketValue
-    ? publicEndpointValue
-      ? t("web.admin.settings.storage.target.publicBucket", {
-          bucket: publicBucketValue,
-          endpoint: publicEndpointValue,
-        })
-      : t("web.admin.settings.storage.target.publicBucketNoEndpoint", { bucket: publicBucketValue })
-    : publicEndpointValue
-      ? t("web.admin.settings.storage.target.publicNoBucket", { endpoint: publicEndpointValue })
-      : t("web.admin.settings.storage.target.publicNoBucketNoEndpoint");
+      ? "No private bucket: avatars, diagnostics, and catalog artifacts are kept on local disk."
+      : "No private bucket: avatars, diagnostics, and catalog artifacts become unavailable.";
   const saveInProgressRef = useRef(false);
 
   const secrets: SecretEditors = {
@@ -704,7 +753,9 @@ export default function StorageSettings() {
         : STORAGE_LOCATION_KEYS;
       const safeKeys = form.dirtyKeys.filter((key) => !held.has(key));
       if (safeKeys.length === 0) {
-        toast.error(t("web.admin.settings.storage.lockUnknownSave"));
+        toast.error(
+          "Storage lock status is unavailable. Retry the status check before saving this location.",
+        );
         return;
       }
       await saveSettings(safeKeys);
@@ -712,7 +763,7 @@ export default function StorageSettings() {
     }
     if (storageLocationChangePending) {
       if (!managedTransitionsAvailable) {
-        toast.error(t("web.admin.settings.storage.transitionsUnavailable"));
+        toast.error("Managed storage transitions are not available on this server.");
         return;
       }
       const nonTransitionKeys = form.dirtyKeys.filter((key) => !STORAGE_TRANSITION_KEYS.has(key));
@@ -732,11 +783,13 @@ export default function StorageSettings() {
 
   async function handleStorageTransition() {
     if (!storageStatusKnown) {
-      toast.error(t("web.admin.settings.storage.lockUnknownMove"));
+      toast.error(
+        "Storage lock status is unavailable. Retry the status check before moving storage.",
+      );
       return;
     }
     if (!managedTransitionsAvailable) {
-      toast.error(t("web.admin.settings.storage.transitionsUnavailable"));
+      toast.error("Managed storage transitions are not available on this server.");
       return;
     }
     const values: Record<string, string> = {
@@ -765,9 +818,9 @@ export default function StorageSettings() {
           if (form.isDirty(key)) form.resetValue(key);
         }
       }
-      toast.success(t("web.admin.settings.storage.transitionQueued", { id: accepted.job.id }));
+      toast.success(`Storage transition queued (${accepted.job.id}).`);
     } catch {
-      toast.error(t("web.admin.settings.storage.transitionQueueFailed"));
+      toast.error("Failed to queue storage transition. Check the storage settings and try again.");
     }
   }
 
@@ -777,7 +830,7 @@ export default function StorageSettings() {
     const requestedBackend = effectiveArtworkBackend(value, form.getValue("s3.public_bucket"));
     if (artworkLocked && currentBackend && requestedBackend !== currentBackend) {
       if (!managedTransitionsAvailable) {
-        toast.error(t("web.admin.settings.storage.transitionsUnavailable"));
+        toast.error("Managed storage transitions are not available on this server.");
         return;
       }
       // A move to S3 is staged, which shows Public storage so the bucket can
@@ -803,11 +856,9 @@ export default function StorageSettings() {
       >
         <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-red-500" />
         <div>
-          <p className="text-sm font-medium">
-            {t("web.admin.settings.storage.credentialStatusUnavailable")}
-          </p>
+          <p className="text-sm font-medium">Protected credential status is unavailable</p>
           <p className="text-muted-foreground mt-1 text-xs">
-            {t("web.admin.settings.storage.reloadBeforeEditing")}
+            Reload this page before editing storage settings.
           </p>
         </div>
       </div>
@@ -822,11 +873,9 @@ export default function StorageSettings() {
       >
         <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-red-500" />
         <div>
-          <p className="text-sm font-medium">
-            {t("web.admin.settings.storage.lockStatusUnavailable")}
-          </p>
+          <p className="text-sm font-medium">Storage lock status is unavailable</p>
           <p className="text-muted-foreground mt-1 text-xs">
-            {t("web.admin.settings.storage.reloadBeforeEditing")}
+            Reload this page before editing storage settings.
           </p>
         </div>
       </div>
@@ -835,7 +884,7 @@ export default function StorageSettings() {
 
   if (form.isLoading || !form.sensitiveStatusReady || !artworkStorage)
     return (
-      <div className="space-y-6" role="status" aria-label={t("web.admin.settings.storage.loading")}>
+      <div className="space-y-6" role="status" aria-label="Loading settings">
         <Skeleton className="h-8 w-48" />
         <div className="space-y-4">
           <Skeleton className="h-10 w-full" />
@@ -845,13 +894,13 @@ export default function StorageSettings() {
           <Skeleton className="h-10 w-full" />
           <Skeleton className="h-10 w-full" />
         </div>
-        <span className="sr-only">{t("web.admin.settings.storage.loading")}</span>
+        <span className="sr-only">Loading settings</span>
       </div>
     );
 
   return (
     <div className="flex h-full flex-col">
-      <SettingsPageHeader title={t("web.admin.settings.storage.title")} />
+      <SettingsPageHeader title="Storage" />
 
       <div className="flex-1 space-y-5">
         {!storageStatusKnown ? (
@@ -860,11 +909,10 @@ export default function StorageSettings() {
             role="alert"
           >
             <div>
-              <p className="text-sm font-medium">
-                {t("web.admin.settings.storage.lockStatusUnavailable")}
-              </p>
+              <p className="text-sm font-medium">Storage lock status is unavailable</p>
               <p className="text-muted-foreground mt-1 text-xs">
-                {t("web.admin.settings.storage.lockStatusRetryHint")}
+                Retry the status check before changing storage locations. Other settings remain
+                editable.
               </p>
             </div>
             <Button
@@ -873,37 +921,34 @@ export default function StorageSettings() {
               size="sm"
               onClick={() => void serverStatus.refetch()}
             >
-              {t("web.admin.settings.storage.retryStatus")}
+              Retry status
             </Button>
           </div>
         ) : null}
-        <FieldGroup
-          label={t("web.admin.settings.storage.group")}
-          restartAll={allRestart(restartKeys, STORAGE_GROUP_KEYS)}
-        >
+        <FieldGroup label="Storage" restartAll={allRestart(restartKeys, STORAGE_GROUP_KEYS)}>
           <SettingField
-            label={t("web.admin.settings.storage.backend")}
+            label="Backend"
             type="select"
             value={selectedBackend}
             onChange={handleArtworkBackendChange}
             disabled={!storageStatusKnown}
             options={[
-              { value: "auto", label: t("web.admin.settings.storage.backendAuto") },
-              { value: "local", label: t("web.admin.settings.storage.backendLocal") },
+              { value: "auto", label: "Automatic" },
+              { value: "local", label: "Local disk" },
               { value: "s3", label: "S3" },
             ]}
             description={
               artworkLocked
                 ? artworkStorage?.backend === "s3"
-                  ? t("web.admin.settings.storage.backendLockedS3")
-                  : t("web.admin.settings.storage.backendLockedLocal")
-                : t("web.admin.settings.storage.backendDescription")
+                  ? "Choose Automatic or Local disk to review a managed transition from S3."
+                  : "Edit the local path, or choose S3 and fill in Public storage. Saving opens a managed transition review."
+                : "Where Silo keeps artwork, subtitles, and other library assets."
             }
             restartRequired={restartKeys.has("artwork.storage_backend")}
           />
           <SettingField
-            label={t("web.admin.settings.storage.localPath")}
-            hint={LOCAL_PATH_EXAMPLE}
+            label="Local storage path"
+            hint="/var/lib/vio/artwork"
             value={form.getValue("artwork.local_path")}
             onChange={(value) => form.setValue("artwork.local_path", value)}
             disabled={
@@ -915,16 +960,16 @@ export default function StorageSettings() {
             description={
               artworkLocked
                 ? artworkStorage?.backend === "s3"
-                  ? t("web.admin.settings.storage.localPathLockedS3")
-                  : t("web.admin.settings.storage.localPathLockedLocal")
-                : t("web.admin.settings.storage.localPathDescription")
+                  ? "Used when Local disk is selected. Mount this path as a volume in Docker."
+                  : "Changing this path opens a managed transition. Mount the new path as a volume in Docker."
+                : "Absolute path on the server. Mount a volume here in Docker."
             }
             restartRequired={restartKeys.has("artwork.local_path")}
           />
           <SettingField
-            label={t("web.admin.settings.storage.cacheImages")}
+            label="Save provider artwork to storage"
             type="toggle"
-            description={t("web.admin.settings.storage.cacheImagesDescription")}
+            description="When off, clients load artwork straight from the providers, and artwork stored next to your media is not used. Artwork saved earlier switches back to provider images, except on titles whose artwork you chose in Edit Metadata."
             value={form.getValue(CACHE_IMAGES_KEY)}
             onChange={(value) => form.setValue(CACHE_IMAGES_KEY, value)}
             restartRequired={restartKeys.has(CACHE_IMAGES_KEY)}
@@ -934,13 +979,9 @@ export default function StorageSettings() {
           <div className="border-border/60 bg-card/40 rounded-xl border p-4">
             <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
               <div className="min-w-0 space-y-1">
-                <p className="text-sm font-medium">
-                  {activeTransition.status === "queued"
-                    ? t("web.admin.settings.storage.active.queued")
-                    : t("web.admin.settings.storage.active.running")}
-                </p>
+                <p className="text-sm font-medium">Storage transition: {activeTransition.status}</p>
                 <p className="text-muted-foreground text-xs">
-                  {transitionPhaseLabel(t, latestTransitionResult?.phase)}
+                  {transitionPhaseLabel(latestTransitionResult?.phase)}
                 </p>
               </div>
               <div className="flex shrink-0 items-center gap-2">
@@ -950,7 +991,7 @@ export default function StorageSettings() {
                   size="sm"
                   onClick={() => transitionJobs.refetch()}
                 >
-                  {t("web.admin.settings.storage.active.refresh")}
+                  Refresh
                 </Button>
                 {activeTransition ? (
                   <Button
@@ -960,16 +1001,14 @@ export default function StorageSettings() {
                     onClick={async () => {
                       try {
                         await cancelTransition.mutateAsync(activeTransition.id);
-                        toast.success(t("web.admin.settings.storage.active.cancelRequested"));
+                        toast.success("Storage transition cancellation requested.");
                       } catch {
-                        toast.error(t("web.admin.settings.storage.active.cancelFailed"));
+                        toast.error("Failed to cancel storage transition. Try again.");
                       }
                     }}
                     disabled={cancelTransition.isPending}
                   >
-                    {cancelTransition.isPending
-                      ? t("web.admin.settings.storage.active.cancelling")
-                      : t("web.admin.settings.storage.active.cancel")}
+                    {cancelTransition.isPending ? "Cancelling…" : "Cancel transition"}
                   </Button>
                 ) : null}
               </div>
@@ -977,9 +1016,9 @@ export default function StorageSettings() {
             {verifiedObjectCount !== undefined ? (
               <p
                 className="text-muted-foreground mt-3 text-xs"
-                aria-label={t("web.admin.settings.storage.active.verifiedLabel")}
+                aria-label="Storage objects verified"
               >
-                {verifiedObjectsLabel(t, verifiedObjectCount)}
+                {verifiedObjectsLabel(verifiedObjectCount)}
               </p>
             ) : null}
           </div>
@@ -988,14 +1027,14 @@ export default function StorageSettings() {
           <div className="border-border/60 bg-card/40 rounded-xl border p-4" role="status">
             <div className="space-y-1">
               <p className="text-sm font-medium">
-                {recoveryStateTitle(t, recoveryHealth.data.recovery_state)}
+                Storage recovery: {recoveryStateLabel(recoveryHealth.data.recovery_state)}
               </p>
               <p className="text-muted-foreground text-xs">
-                {recoveryStateMessage(t, recoveryHealth.data.recovery_state)}
+                {recoveryStateMessage(recoveryHealth.data.recovery_state)}
               </p>
               {recoveryHealth.data.recovery_error ? (
                 <p className="text-destructive text-xs">
-                  {t("web.admin.settings.storage.recovery.needsAttention")}
+                  Recovery needs attention. Check administrator diagnostics for details.
                 </p>
               ) : null}
             </div>
@@ -1011,22 +1050,16 @@ export default function StorageSettings() {
           <div className="rounded-xl border border-red-500/25 bg-red-500/5 p-4" role="alert">
             <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
               <div className="min-w-0 space-y-1">
-                <p className="text-sm font-medium">
-                  {failedTransition.status === "cancelled"
-                    ? t("web.admin.settings.storage.failed.titleCancelled")
-                    : t("web.admin.settings.storage.failed.titleFailed")}
-                </p>
+                <p className="text-sm font-medium">Storage transition {failedTransition.status}</p>
                 <p className="text-muted-foreground text-xs">
-                  {t("web.admin.settings.storage.failed.body", {
-                    reason:
-                      failedTransition.status === "cancelled"
-                        ? t("web.admin.settings.storage.failed.canceledReason")
-                        : transitionFailureLabel(t, latestTransitionResult?.failure_category),
-                  })}
+                  {failedTransition.status === "cancelled"
+                    ? "The storage transition was canceled."
+                    : transitionFailureLabel(latestTransitionResult?.failure_category)}{" "}
+                  Check administrator diagnostics for details.
                 </p>
                 {verifiedObjectCount !== undefined ? (
                   <p className="text-muted-foreground text-xs">
-                    {verifiedObjectsLabel(t, verifiedObjectCount)}
+                    {verifiedObjectsLabel(verifiedObjectCount)}
                   </p>
                 ) : null}
               </div>
@@ -1037,7 +1070,7 @@ export default function StorageSettings() {
                 className="shrink-0"
                 onClick={() => setDismissedTransitionId(failedTransition.id)}
               >
-                {t("web.admin.settings.storage.dismiss")}
+                Dismiss
               </Button>
             </div>
           </div>
@@ -1046,11 +1079,10 @@ export default function StorageSettings() {
           <div className="rounded-xl border border-amber-500/25 bg-amber-500/5 p-4" role="alert">
             <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
               <div className="min-w-0 space-y-1">
-                <p className="text-sm font-medium">
-                  {t("web.admin.settings.storage.manualRestart.title")}
-                </p>
+                <p className="text-sm font-medium">Manual restart required</p>
                 <p className="text-muted-foreground text-xs">
-                  {t("web.admin.settings.storage.manualRestart.body")}
+                  The storage switch is committed, but this host could not restart Silo
+                  automatically. Restart the server to activate the new storage safely.
                 </p>
               </div>
               <Button
@@ -1060,7 +1092,7 @@ export default function StorageSettings() {
                 className="shrink-0"
                 onClick={() => setDismissedTransitionId(manualRestartTransition.id)}
               >
-                {t("web.admin.settings.storage.dismiss")}
+                Dismiss
               </Button>
             </div>
           </div>
@@ -1069,12 +1101,12 @@ export default function StorageSettings() {
           <DialogContent className="sm:max-w-2xl">
             <DialogHeader>
               <DialogTitle>
-                {privateOnlyTransition
-                  ? t("web.admin.settings.storage.dialog.titlePrivate")
-                  : t("web.admin.settings.storage.dialog.titleArtwork")}
+                {privateOnlyTransition ? "Change private storage" : "Change artwork storage"}
               </DialogTitle>
               <DialogDescription>
-                {t("web.admin.settings.storage.dialog.description")}
+                Silo verifies and copies the selected data before switching. Public catalog
+                references are reconciled in the background after restart when the public location
+                changes. The old storage is never deleted automatically.
               </DialogDescription>
             </DialogHeader>
 
@@ -1084,7 +1116,7 @@ export default function StorageSettings() {
                   <div
                     className="border-border/60 bg-muted/20 space-y-2 rounded-lg border p-4"
                     role="status"
-                    aria-label={t("web.admin.settings.storage.dialog.checkingSource")}
+                    aria-label="Checking current S3 storage"
                   >
                     <Skeleton className="h-4 w-48" />
                     <Skeleton className="h-3 w-full max-w-md" />
@@ -1097,11 +1129,11 @@ export default function StorageSettings() {
                     <AlertTriangle className="text-destructive mt-0.5 h-4 w-4 shrink-0" />
                     <div className="min-w-0 flex-1">
                       <p className="text-sm font-medium">
-                        {sourceHealth.data?.message ??
-                          t("web.admin.settings.storage.dialog.sourceCheckFailed")}
+                        {sourceHealth.data?.message ?? "Current S3 storage could not be checked."}
                       </p>
                       <p className="text-muted-foreground mt-1 text-xs leading-relaxed">
-                        {t("web.admin.settings.storage.dialog.sourceUnavailableHint")}
+                        Reconnect the existing bucket to copy data, or select Start fresh to switch
+                        without reading S3. The old bucket will not be deleted.
                       </p>
                       <Button
                         type="button"
@@ -1111,9 +1143,7 @@ export default function StorageSettings() {
                         onClick={() => void sourceHealth.refetch()}
                         disabled={sourceHealth.isFetching}
                       >
-                        {sourceHealth.isFetching
-                          ? t("web.admin.settings.storage.dialog.checking")
-                          : t("web.admin.settings.storage.dialog.retryCheck")}
+                        {sourceHealth.isFetching ? "Checking…" : "Retry check"}
                       </Button>
                     </div>
                   </div>
@@ -1123,10 +1153,10 @@ export default function StorageSettings() {
                     role="status"
                   >
                     <p className="text-sm font-medium text-emerald-600 dark:text-emerald-400">
-                      {t("web.admin.settings.storage.dialog.sourceReachable")}
+                      Current S3 storage is reachable
                     </p>
                     <p className="text-muted-foreground mt-1 text-xs">
-                      {t("web.admin.settings.storage.dialog.copyOptionsAvailable")}
+                      Copy-based transition options are available.
                     </p>
                   </div>
                 ) : null
@@ -1134,7 +1164,7 @@ export default function StorageSettings() {
 
               <div className="space-y-2">
                 <p className="text-sm font-medium" id="storage-transition-target-label">
-                  {t("web.admin.settings.storage.dialog.target")}
+                  Target
                 </p>
                 <div
                   className="border-border bg-muted/20 rounded-md border px-3 py-2.5"
@@ -1143,17 +1173,19 @@ export default function StorageSettings() {
                 >
                   <p className="text-sm font-medium">
                     {privateOnlyTransition
-                      ? t("web.admin.settings.storage.dialog.targetPrivate")
+                      ? "New private storage location"
                       : transitionBackend === "local"
-                        ? t("web.admin.settings.storage.dialog.targetLocal")
-                        : t("web.admin.settings.storage.dialog.targetS3")}
+                        ? "Local disk (default Silo behavior)"
+                        : "New S3 location"}
                   </p>
                   <p className="text-muted-foreground mt-0.5 text-xs">
                     {privateOnlyTransition
                       ? privateTargetLabel
                       : transitionBackend === "local"
-                        ? t("web.admin.settings.storage.dialog.targetLocalSource")
-                        : publicTargetLabel}
+                        ? "Selected from the Backend setting."
+                        : `Public bucket: ${form.getValue("s3.public_bucket") || "not set"} · ${
+                            form.getValue("s3.public_endpoint").trim() || "endpoint not set"
+                          }`}
                   </p>
                   {transitionBackend === "s3" &&
                   privateLocationChanging &&
@@ -1165,72 +1197,71 @@ export default function StorageSettings() {
 
               {privateEndpointMissing ? (
                 <p className="text-destructive text-xs font-medium" role="alert">
-                  {t("web.admin.settings.storage.dialog.privateEndpointMissing")}
+                  Enter the private storage endpoint to use this bucket.
                 </p>
               ) : null}
 
               {privateOnlyTransition ? null : transitionBackend === "local" ? (
                 <div className="space-y-2">
                   <label className="text-sm font-medium" htmlFor="storage-transition-local-path">
-                    {t("web.admin.settings.storage.dialog.localPath")}
+                    Local artwork path
                   </label>
                   <Input
                     id="storage-transition-local-path"
                     value={transitionLocalPath}
                     onChange={(event) => setTransitionLocalPath(event.target.value)}
-                    placeholder={LOCAL_PATH_EXAMPLE}
+                    placeholder="/var/lib/vio/artwork"
                   />
                 </div>
               ) : (
                 <p className="text-muted-foreground text-xs">
-                  {t("web.admin.settings.storage.dialog.s3ValuesNote")}
+                  The public and private S3 values currently entered on this page will be used.
+                  Check both connections before starting.
                 </p>
               )}
 
               <fieldset className="space-y-2">
-                <legend className="mb-2 text-sm font-medium">
-                  {t("web.admin.settings.storage.policy.legend")}
-                </legend>
+                <legend className="mb-2 text-sm font-medium">What should move?</legend>
                 {(
                   (privateOnlyTransition
                     ? [
                         [
                           "preserve_uploads",
-                          t("web.admin.settings.storage.policy.privatePreserve"),
-                          t("web.admin.settings.storage.policy.privatePreserveDescription"),
+                          "Preserve profile avatars",
+                          "Copies profile avatars to the new location. Diagnostic bundles and catalog artifacts stay in the old location and are unavailable after the switch.",
                         ],
                         [
                           "start_fresh",
-                          t("web.admin.settings.storage.policy.startFresh"),
-                          t("web.admin.settings.storage.policy.privateStartFreshDescription"),
+                          "Start fresh",
+                          "Does not read the old location. Existing profile avatars will appear missing after the switch; their files, diagnostic bundles, and catalog artifacts stay in the old location.",
                         ],
                         [
                           "migrate_all",
-                          t("web.admin.settings.storage.policy.privateMigrateAll"),
-                          t("web.admin.settings.storage.policy.privateMigrateAllDescription"),
+                          "Migrate all private data",
+                          "Copies profile avatars, diagnostic bundles, and catalog job artifacts to the new location.",
                         ],
                       ]
                     : [
                         [
                           "preserve_uploads",
-                          t("web.admin.settings.storage.policy.preserve"),
+                          "Preserve personal uploads (recommended)",
                           privateLocationChanging
-                            ? t("web.admin.settings.storage.policy.preserveWithAvatarsDescription")
-                            : t("web.admin.settings.storage.policy.preserveDescription"),
+                            ? "Copies branding, collection and library posters, profile avatars, and downloaded subtitles. Provider artwork is rebuilt from its saved source URLs."
+                            : "Copies branding, collection and library posters, and downloaded subtitles. Provider artwork is rebuilt from its saved source URLs.",
                         ],
                         [
                           "start_fresh",
-                          t("web.admin.settings.storage.policy.startFresh"),
-                          privateLocationChanging
-                            ? t(
-                                "web.admin.settings.storage.policy.startFreshWithAvatarsDescription",
-                              )
-                            : t("web.admin.settings.storage.policy.startFreshDescription"),
+                          "Start fresh",
+                          `Does not read the old artwork store. Provider paths return to TMDB/TVDB URLs; custom images must be uploaded again. Downloaded subtitles stay in the old store and are unavailable after the switch.${
+                            privateLocationChanging
+                              ? " Profile avatars also remain in the old storage and are unavailable after the switch."
+                              : ""
+                          }`,
                         ],
                         [
                           "migrate_all",
-                          t("web.admin.settings.storage.policy.migrateAll"),
-                          t("web.admin.settings.storage.policy.migrateAllDescription"),
+                          "Migrate everything",
+                          "Copies the complete artwork tree, including downloaded subtitles. When private data changes location, avatars, diagnostic bundles, and catalog job artifacts are copied too. This can take a long time for very large caches.",
                         ],
                       ]) as readonly (readonly [StorageTransitionPolicy, string, string])[]
                 ).map(([value, title, description]) => (
@@ -1259,8 +1290,8 @@ export default function StorageSettings() {
                       {value !== "start_fresh" && copyPolicyUnavailable ? (
                         <span className="text-destructive mt-1.5 block text-xs font-medium">
                           {sourceHealthUnavailable
-                            ? t("web.admin.settings.storage.policy.unavailableSource")
-                            : t("web.admin.settings.storage.policy.unavailableNoPrivateBucket")}
+                            ? "Unavailable while the current S3 storage cannot be reached."
+                            : "Configure a private S3 bucket to preserve profile avatars."}
                         </span>
                       ) : null}
                     </span>
@@ -1269,40 +1300,51 @@ export default function StorageSettings() {
               </fieldset>
 
               <div className="rounded-lg border border-amber-500/25 bg-amber-500/5 p-4 text-xs leading-relaxed">
-                <p className="font-medium text-amber-500">
-                  {t("web.admin.settings.storage.notes.title")}
-                </p>
-                <ul className="text-muted-foreground mt-2 list-disc space-y-1 ps-4">
-                  <li>{t("web.admin.settings.storage.notes.metadataRetained")}</li>
+                <p className="font-medium text-amber-500">Before you continue</p>
+                <ul className="text-muted-foreground mt-2 list-disc space-y-1 pl-4">
+                  <li>Core metadata in PostgreSQL is retained.</li>
                   {!privateOnlyTransition ? (
                     <>
-                      <li>{t("web.admin.settings.storage.notes.backfill")}</li>
-                      <li>{t("web.admin.settings.storage.notes.sidecar")}</li>
+                      <li>
+                        Backfill Metadata Images downloads from saved provider URLs, not old S3.
+                      </li>
+                      <li>NFO/sidecar artwork that is not copied needs a metadata refresh.</li>
                     </>
                   ) : null}
                   {transitionBackend === "local" && currentSourceIsS3 ? (
                     <li>
                       {transitionPolicy === "start_fresh"
-                        ? t("web.admin.settings.storage.notes.toLocalStartFresh")
+                        ? "Start fresh copies nothing: uploads, downloaded subtitles, profile avatars, diagnostic bundles, and catalog job artifacts stay in S3 and are unavailable after the switch."
                         : transitionPolicy === "preserve_uploads"
-                          ? t("web.admin.settings.storage.notes.toLocalPreserve")
-                          : t("web.admin.settings.storage.notes.toLocalMigrateAll")}
+                          ? "Diagnostic bundles and catalog job artifacts stay in the old private bucket and are unavailable after the switch."
+                          : "Everything, including diagnostic bundles and catalog job artifacts, is copied to local disk."}
                     </li>
                   ) : privateOnlyTransition ? (
-                    <li>{t("web.admin.settings.storage.notes.privateOnly")}</li>
+                    <li>
+                      Migrate all private data copies diagnostic bundles and catalog job artifacts
+                      to the new location; Preserve profile avatars and Start fresh leave them in
+                      the old location.
+                    </li>
                   ) : privateLocationChanging ? (
-                    <li>{t("web.admin.settings.storage.notes.privateChanging")}</li>
+                    <li>
+                      Migrate everything copies diagnostic bundles and catalog job artifacts to the
+                      new location; Preserve personal uploads and Start fresh leave them in the old
+                      location.
+                    </li>
                   ) : (
-                    <li>{t("web.admin.settings.storage.notes.privateUnchanged")}</li>
+                    <li>
+                      Profile avatars, diagnostic bundles, and catalog job artifacts stay in their
+                      current storage.
+                    </li>
                   )}
-                  <li>{t("web.admin.settings.storage.notes.restartRequired")}</li>
+                  <li>A restart is required after the transition completes.</li>
                 </ul>
               </div>
             </div>
 
             <DialogFooter>
               <Button variant="outline" onClick={() => setTransitionOpen(false)}>
-                {t("common.cancel")}
+                Cancel
               </Button>
               <Button
                 onClick={handleStorageTransition}
@@ -1315,9 +1357,7 @@ export default function StorageSettings() {
                   privateEndpointMissing
                 }
               >
-                {createTransition.isPending
-                  ? t("web.admin.settings.storage.dialog.queuing")
-                  : t("web.admin.settings.storage.dialog.queue")}
+                {createTransition.isPending ? "Queuing…" : "Queue transition"}
               </Button>
             </DialogFooter>
           </DialogContent>
@@ -1328,8 +1368,8 @@ export default function StorageSettings() {
             restartKeys={restartKeys}
             secrets={secrets}
             scope="public"
-            label={t("web.admin.settings.storage.publicGroup")}
-            description={t("web.admin.settings.storage.publicGroupDescription")}
+            label="Public storage"
+            description="Files clients download directly: cached artwork, uploaded posters, and branding images. Used once Backend is S3, or Automatic with a bucket set here."
             checkKind="s3_public"
             artworkLockedBackend={artworkLocked ? artworkStorage?.backend : undefined}
             publicBackendChangePending={publicBackendChangePending}
@@ -1342,13 +1382,17 @@ export default function StorageSettings() {
             restartKeys={restartKeys}
             secrets={secrets}
             scope="private"
-            label={t("web.admin.settings.storage.privateGroup")}
-            description={t("web.admin.settings.storage.privateGroupDescription")}
+            label="Private storage"
+            description="Files only the server reads: profile avatars, diagnostics bundles, and catalog seed artifacts. S3 storage needs a bucket here for them; on local disk they stay in the local storage path unless a bucket is set."
             checkKind="s3_private"
             artworkLockedBackend={privateLocked ? artworkStorage?.backend : undefined}
             locationFieldsDisabled={!storageStatusKnown}
           />
         )}
+      </div>
+
+      <div className="flex-1 space-y-5">
+        <VirtualLibraryGroup />
       </div>
 
       <SaveBar
@@ -1357,9 +1401,7 @@ export default function StorageSettings() {
         onDiscard={handleDiscard}
         isSaving={form.isSaving || saveInProgress}
         saveLabel={
-          storageStatusKnown && storageLocationChangePending
-            ? t("web.admin.settings.storage.reviewTransition")
-            : t("common.save")
+          storageStatusKnown && storageLocationChangePending ? "Review transition" : "Save"
         }
       />
     </div>

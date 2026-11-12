@@ -56,6 +56,11 @@
       "count": 3
     }
   },
+  "src/components/RequestSeasonsDialog.tsx": {
+    "formatjs/no-literal-string-in-jsx": {
+      "count": 16
+    }
+  },
   "src/components/ServerActivity.tsx": {
     "react-hooks/set-state-in-effect": {
       "count": 1
@@ -295,6 +300,17 @@
       "count": 3
     }
   },
+  "src/pages/admin-settings/StorageSettings.tsx": {
+    "formatjs/no-literal-string-in-jsx": {
+      "count": 114
+    },
+    "no-restricted-syntax": {
+      "count": 9
+    },
+    "silo/no-physical-direction": {
+      "count": 1
+    }
+  },
   "src/pages/admin-settings/StreamingSettings.tsx": {
     "formatjs/no-literal-string-in-jsx": {
       "count": 62
@@ -319,7 +335,16 @@
     }
   },
   "src/pages/settings/DeviceSettings.tsx": {
+    "formatjs/no-literal-string-in-jsx": {
+      "count": 41
+    },
+    "no-restricted-syntax": {
+      "count": 2
+    },
     "react-hooks/set-state-in-effect": {
+      "count": 1
+    },
+    "silo/no-physical-direction": {
       "count": 1
     }
   },

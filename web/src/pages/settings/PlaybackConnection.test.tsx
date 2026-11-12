@@ -83,7 +83,12 @@ it("resets the server limit and refreshes the row", async () => {
   ).toBeInTheDocument();
   fireEvent.click(await screen.findByText("Reset"));
   await waitFor(() => expect(screen.queryByText("Reset")).not.toBeInTheDocument());
-  expect(request).toHaveBeenCalledWith("DELETE /api/v2/playback/connection/learned-limit");
+  expect(request).toHaveBeenCalledWith(
+    "DELETE /api/v2/playback/connection/learned-limit",
+    expect.objectContaining({
+      headers: expect.objectContaining({ "X-Vio-Device-Id": expect.any(String) }),
+    }),
+  );
 });
 
 it("says in the row when a reset fails and keeps the limit", async () => {

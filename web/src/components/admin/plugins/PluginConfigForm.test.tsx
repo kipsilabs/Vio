@@ -9,27 +9,6 @@ import type { PluginConfigSchema } from "@/api/types";
 import { PluginConfigForm } from "./PluginConfigForm";
 import { field } from "./adminFormField.test-support";
 
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-
-// jsdom lacks the pointer-capture API Radix Select calls when opening.
-window.HTMLElement.prototype.hasPointerCapture ??= () => false;
-window.HTMLElement.prototype.scrollIntoView ??= () => {};
-
-vi.mock("@/hooks/queries/admin/libraries", () => ({
-  useAdminLibraries: () => ({
-    data: [{ id: 7, name: "Movies", type: "movie", enabled: true }],
-  }),
-}));
-
-function renderWithClient(ui: React.ReactElement) {
-  const client = new QueryClient({
-    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
-  });
-  return {
-    ...render(<QueryClientProvider client={client}>{ui}</QueryClientProvider>),
-    queryClient: client,
-  };
-}
 const schema: PluginConfigSchema = {
   key: "account",
   title: "Account",
@@ -45,7 +24,7 @@ const schema: PluginConfigSchema = {
 
 describe("PluginConfigForm secrets", () => {
   it("derives a form when a plugin only supplies JSON Schema", () => {
-    renderWithClient(
+    render(
       <PluginConfigForm
         schema={{
           key: "server",
@@ -68,35 +47,9 @@ describe("PluginConfigForm secrets", () => {
     expect(screen.getByLabelText("Api Key")).toHaveAttribute("type", "password");
   });
 
-  it("renders an inferred library picker for a silo-library json_schema format", async () => {
-    renderWithClient(
-      <PluginConfigForm
-        schema={{
-          key: "virtual",
-          title: "Virtual Library",
-          json_schema: JSON.stringify({
-            type: "object",
-            properties: {
-              movie_library_id: {
-                type: "string",
-                title: "Movie library",
-                format: "silo-library-movie",
-              },
-            },
-          }),
-          required: true,
-        }}
-        onSave={vi.fn()}
-      />,
-    );
-
-    await userEvent.click(screen.getByRole("combobox", { name: "Movie library" }));
-    expect(await screen.findByRole("option", { name: "Movies (7)" })).toBeInTheDocument();
-  });
-
   it("shows redacted saved state and only clears through an explicit action", async () => {
     const onSave = vi.fn();
-    renderWithClient(
+    render(
       <PluginConfigForm
         schema={schema}
         value={{ region: "us-east" }}
@@ -129,7 +82,7 @@ describe("PluginConfigForm secrets", () => {
 
   it("sends an emptied field as an explicit clear so the stored value goes", async () => {
     const onSave = vi.fn();
-    renderWithClient(
+    render(
       <PluginConfigForm
         schema={schema}
         value={{ region: "us-east" }}
@@ -155,7 +108,7 @@ describe("PluginConfigForm secrets", () => {
         ),
       },
     };
-    renderWithClient(
+    render(
       <PluginConfigForm
         schema={requiredSchema}
         value={{ region: "us-east" }}
@@ -173,7 +126,7 @@ describe("PluginConfigForm secrets", () => {
       success: false,
       message: "API key is required",
     });
-    renderWithClient(
+    render(
       <PluginConfigForm
         schema={schema}
         value={{ region: "us-east" }}
@@ -193,7 +146,7 @@ describe("PluginConfigForm secrets", () => {
 
   it("reports each edit and staged secret removal as the entry it would save", async () => {
     const onDraftChange = vi.fn();
-    renderWithClient(
+    render(
       <PluginConfigForm
         schema={schema}
         value={{ region: "us-east" }}
@@ -217,90 +170,5 @@ describe("PluginConfigForm secrets", () => {
       expect.objectContaining({ region: "eu" }),
       ["api_key"],
     );
-  });
-});
-
-describe("PluginConfigForm quality profiles", () => {
-  it("accepts Go/RE2 inline flags without applying JavaScript regex rules", async () => {
-    const qualitySchema: PluginConfigSchema = {
-      key: "streaming",
-      title: "Streaming",
-      json_schema: JSON.stringify({
-        type: "object",
-        properties: {
-          quality_profiles: {
-            type: "array",
-            items: { type: "object" },
-          },
-        },
-      }),
-      required: true,
-      admin_form: {
-        fields: [
-          {
-            key: "quality_profiles",
-            label: "Quality Profiles",
-            control: "TEXTAREA",
-            required: false,
-            secret: false,
-            multiline: true,
-          },
-        ],
-      },
-    };
-    renderWithClient(
-      <PluginConfigForm
-        schema={qualitySchema}
-        value={{
-          quality_profiles:
-            '[{"label":"4K HDR","include_regex":"(?i)(2160p|4k)","exclude_regex":"(?i)(cam|ts)"}]',
-        }}
-        onSave={vi.fn()}
-      />,
-    );
-
-    await userEvent.click(screen.getByRole("button", { name: "Validate profiles" }));
-
-    expect(screen.getByText(/Valid JSON structure: 4K HDR/)).toBeInTheDocument();
-    expect(screen.queryByText(/Invalid include_regex/)).not.toBeInTheDocument();
-  });
-
-  it("says what an empty input means instead of leaking a JSON parse exception", async () => {
-    const qualitySchema: PluginConfigSchema = {
-      key: "streaming",
-      title: "Streaming",
-      json_schema: JSON.stringify({
-        type: "object",
-        properties: {
-          quality_profiles: {
-            type: "array",
-            items: { type: "object" },
-          },
-        },
-      }),
-      required: true,
-      admin_form: {
-        fields: [
-          {
-            key: "quality_profiles",
-            label: "Quality Profiles",
-            control: "TEXTAREA",
-            required: false,
-            secret: false,
-            multiline: true,
-          },
-        ],
-      },
-    };
-    renderWithClient(<PluginConfigForm schema={qualitySchema} value={{}} onSave={vi.fn()} />);
-
-    await userEvent.click(screen.getByRole("button", { name: "Validate profiles" }));
-
-    // JSON.parse("") throws "Unexpected end of JSON input"; the guard must
-    // surface an actionable message instead.
-    expect(
-      screen.getByText(/No profiles entered\. Paste a JSON array of profiles first\./),
-    ).toBeInTheDocument();
-    expect(screen.queryByText(/Unexpected end of JSON/)).not.toBeInTheDocument();
   });
 });

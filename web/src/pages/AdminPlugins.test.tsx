@@ -236,7 +236,7 @@ describe("AdminPlugins", () => {
       </MemoryRouter>,
     );
 
-    expect(markup).toContain("Silo maintained");
+    expect(markup).toContain("Made by Silo");
     expect(markup).toContain("Other sources");
     expect(markup).not.toContain("Approved community");
     // Uninstalled plugins come first within a group.
@@ -346,13 +346,13 @@ describe("AdminPlugins", () => {
       </MemoryRouter>,
     );
 
-    // Both "Silo maintained" and "Approved community" groups must render
-    expect(markup).toContain("Silo maintained");
+    // Both "Made by Silo" and "Approved community" groups must render
+    expect(markup).toContain("Made by Silo");
     expect(markup).toContain("Approved community");
 
     // Section-scoped placement: Vio plugins inside Silo maintained section, Community inside Approved community
     const vioSection = markup.slice(
-      markup.indexOf('aria-label="Silo maintained"'),
+      markup.indexOf('aria-label="Made by Silo"'),
       markup.indexOf('aria-label="Approved community"'),
     );
     expect(vioSection).toContain("TMDB Metadata");

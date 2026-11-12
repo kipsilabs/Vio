@@ -13,6 +13,7 @@ import {
 } from "@/components/ui/select";
 import { useShownRatingSources } from "@/hooks/queries/ratingsCapability";
 import { useT, type Translate } from "@/i18n";
+import { COLLECTION_MAX_ITEMS } from "@/lib/collectionTemplates";
 import { COLLECTION_SOURCE_ORDER } from "@/lib/collectionSortConfig";
 import {
   manualOrderLine,
@@ -292,7 +293,8 @@ function SyncedOrder({
   const directions = directionLabels(t, field);
 
   function commitLimit(input: HTMLInputElement) {
-    const next = parsedLimit(input.value, limit);
+    const typed = parsedLimit(input.value, limit);
+    const next = typed === undefined ? undefined : Math.min(typed, COLLECTION_MAX_ITEMS);
     input.value = next === undefined ? "" : String(next);
     if (next !== limit) onLimitChange(next);
   }
