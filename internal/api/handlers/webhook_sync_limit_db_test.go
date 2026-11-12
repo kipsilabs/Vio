@@ -8,7 +8,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -47,10 +46,9 @@ func TestLegacyWebhookReceiverRejectsOversizedBodyDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler := NewWebhookSyncHandler(webhooksync.NewService(webhooksync.NewRepository(pool, cipher), historyimport.NewRepository(pool, cipher), nil))
-	router := chi.NewRouter()
-	router.Post("/api/v1/webhook-sync/webhooks/{secret}", handler.HandleWebhook)
-
+	handler := NewWebhookSyncHandler(webhooksync.NewService(webhooksync.NewRepository(pool, cipher), historyimport.NewRepository(pool, cipher), nil), nil)
+	// The receiver is served by the v2 operation (the v1 path is tombstoned),
+	// so exercise the handler the operation delegates to.
 	const event = `{"Event":"system.unsupported","User":{"Id":"u"},"Item":{"Id":"i","Type":"Movie"}}`
 	for _, tc := range []struct {
 		name string
@@ -61,15 +59,15 @@ func TestLegacyWebhookReceiverRejectsOversizedBodyDB(t *testing.T) {
 		{"over cap", int(webhooksync.MaxWebhookDeliveryBytes) + 1, http.StatusRequestEntityTooLarge},
 	} {
 		body := event + strings.Repeat(" ", tc.size-len(event))
-		req := httptest.NewRequest(http.MethodPost, "/api/v1/webhook-sync/webhooks/"+suffix, strings.NewReader(body))
+		req := httptest.NewRequest(http.MethodPost, "/api/v2/webhook-sync/webhooks/"+suffix, strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
-		rec := httptest.NewRecorder()
-		router.ServeHTTP(rec, req)
-		if rec.Code != tc.want {
-			t.Fatalf("%s: status %d, body %s; want %d", tc.name, rec.Code, rec.Body.String(), tc.want)
+		err := handler.ReceiveWebhook(req, suffix, webhooksync.MaxWebhookDeliveryBytes)
+		got := http.StatusNoContent
+		if err != nil {
+			got = webhookErrorStatus(err)
 		}
-		if tc.want == http.StatusRequestEntityTooLarge && !strings.Contains(rec.Body.String(), `"error":"payload_too_large"`) {
-			t.Fatalf("%s: body %s; want payload_too_large error code", tc.name, rec.Body.String())
+		if got != tc.want {
+			t.Fatalf("%s: status %d (err %v); want %d", tc.name, got, err, tc.want)
 		}
 	}
 }

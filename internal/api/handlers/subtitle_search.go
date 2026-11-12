@@ -66,6 +66,7 @@ type SubtitleSearchHandler struct {
 	FileAuthorizer *MediaFileAuthorizer
 	sync           SubtitleSyncService
 	external       ExternalTimingStore
+	ready          SubtitleReadyAnnouncer
 }
 
 // NewSubtitleSearchHandler creates a new SubtitleSearchHandler.
@@ -214,7 +215,7 @@ func (h *SubtitleSearchHandler) searchAuthorizedSubtitles(ctx context.Context, f
 
 	var resp *subtitles.SearchResponse
 	if bridge {
-		resp, err = h.manager.SearchBridge(ctx, searchReq)
+		resp, err = h.manager.Search(ctx, searchReq)
 	} else {
 		resp, err = h.manager.Search(ctx, searchReq)
 	}
@@ -411,7 +412,7 @@ func (h *SubtitleSearchHandler) HandleDelete(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	if err := h.manager.DeleteSubtitle(r.Context(), id); err != nil {
+	if err := h.manager.DeleteSubtitleWithRevision(r.Context(), id, nil); err != nil {
 		writeError(w, http.StatusInternalServerError, "delete_error", "Failed to delete subtitle")
 		return
 	}

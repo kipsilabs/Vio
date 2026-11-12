@@ -533,11 +533,11 @@ func defaultJSON(raw []byte) json.RawMessage {
 }
 
 func normalizeQueryDefinitionJSON(raw []byte, allowPersonalizedSorts, allowPersonalizedFields, v1Rules bool) (json.RawMessage, error) {
-	return catalog.NormalizeQueryDefinitionJSON(raw, allowPersonalizedSorts, allowPersonalizedFields, v1Rules)
+	return catalog.NormalizeQueryDefinitionJSON(raw, allowPersonalizedSorts, allowPersonalizedFields)
 }
 
 func normalizeSmartCollectionQueryDefinitionJSON(raw []byte, allowPersonalizedSorts, allowPersonalizedFields, v1Rules bool) (json.RawMessage, error) {
-	return catalog.NormalizeSmartCollectionQueryJSON(raw, allowPersonalizedSorts, allowPersonalizedFields, v1Rules)
+	return catalog.NormalizeSmartCollectionQueryJSON(raw, allowPersonalizedSorts, allowPersonalizedFields)
 }
 
 func firstNonEmptyCollection(values ...string) string {

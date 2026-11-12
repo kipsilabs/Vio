@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 import type {
   ConnectionCheckResponse,
@@ -9,7 +9,7 @@ import type {
 import { ConnectionCheckAction } from "@/components/admin/ConnectionCheckAction";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
-import { usePluginInstallationConfigOptions } from "@/hooks/queries/admin/plugins";
+import { useT } from "@/i18n";
 
 import {
   adminFormForConfigSchema,
@@ -17,8 +17,7 @@ import {
   humanizeConfigKey,
 } from "./configSchemaAdminForm";
 import { SchemaForm } from "./SchemaForm";
-import { buildSchemaValues, parseFieldTypes } from "./schemaFormUtils";
-import type { BuildSchemaValuesOptions, SchemaOption } from "./schemaFormUtils";
+import { buildSchemaValues, type BuildSchemaValuesOptions } from "./schemaFormUtils";
 
 type PluginConfigValue = Record<string, unknown>;
 
@@ -31,8 +30,6 @@ type Props = {
   schema: PluginConfigSchema;
   value?: PluginConfigValue;
   configuredSecrets?: string[];
-  /** Installation ID used to load dynamic SELECT options from the plugin. */
-  installationId?: number;
   onSave: (key: string, value: PluginConfigValue, clearSecrets: string[]) => void;
   onTest?: (
     key: string,
@@ -63,7 +60,6 @@ export function PluginConfigForm({
   schema,
   value,
   configuredSecrets = [],
-  installationId,
   onSave,
   onTest,
   isSaving = false,
@@ -72,10 +68,10 @@ export function PluginConfigForm({
   bare = false,
   idPrefix,
 }: Props) {
+  const t = useT();
   const inferredDescriptor = useMemo(() => adminFormForConfigSchema(schema), [schema]);
   const fields = inferredDescriptor?.fields ?? EMPTY_FIELDS;
   const supported = inferredDescriptor != null;
-  const fieldTypes = useMemo(() => parseFieldTypes(schema.json_schema), [schema.json_schema]);
 
   const descriptor = useMemo<PluginAdminForm>(() => {
     const base = inferredDescriptor ?? { fields };
@@ -84,43 +80,17 @@ export function PluginConfigForm({
       ...base,
       fields: base.fields.map((field) =>
         configured.has(field.key) && (field.secret || field.control === "PASSWORD")
-          ? { ...field, placeholder: "Saved secret — leave blank to keep" }
+          ? { ...field, placeholder: t("web.admin.plugins.configForm.savedSecretPlaceholder") }
           : field,
       ),
     };
-  }, [configuredSecrets, fields, inferredDescriptor]);
+  }, [configuredSecrets, fields, inferredDescriptor, t]);
 
   const [values, setValues] = useState<PluginConfigValue>(() =>
     formValuesFromConfig(fields, value),
   );
   const [testResult, setTestResult] = useState<ConnectionCheckResponse | null>(null);
-  const [profilePreview, setProfilePreview] = useState<string | null>(null);
   const [clearSecrets, setClearSecrets] = useState<Set<string>>(new Set());
-
-  // Dynamic SELECT options: loaded once on mount (and when installationId changes)
-  // from the plugin's request_router.v1 ListConfigOptions gRPC method.
-  const [dynamicOptions, setDynamicOptions] = useState<Record<string, SchemaOption[]>>({});
-  const [optionsLoading, setOptionsLoading] = useState(false);
-  const loadOptions = usePluginInstallationConfigOptions();
-  const hasDynamicFields = useMemo(() => fields.some((f) => f.dynamic_options), [fields]);
-  const loadOptionsRef = useRef(loadOptions);
-  loadOptionsRef.current = loadOptions;
-
-  useEffect(() => {
-    if (!installationId || !hasDynamicFields) return;
-    setOptionsLoading(true);
-    loadOptionsRef.current
-      .mutateAsync({ installationId })
-      .then((loaded) => {
-        setDynamicOptions(loaded ?? ({} as Record<string, SchemaOption[]>));
-      })
-      .catch(() => {
-        // Silently swallow — fields degrade to empty dropdowns.
-      })
-      .finally(() => setOptionsLoading(false));
-    // Re-run only when the installation changes, not on every render.
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- the installation or dynamic-field set changed, not every render.
-  }, [installationId, hasDynamicFields]);
 
   useEffect(() => {
     setValues(formValuesFromConfig(fields, value));
@@ -129,7 +99,6 @@ export function PluginConfigForm({
 
   function handleChange(next: PluginConfigValue) {
     setTestResult(null);
-    setProfilePreview(null);
     setValues(next);
     const updated = new Set(clearSecrets);
     for (const key of configuredSecrets) {
@@ -141,7 +110,7 @@ export function PluginConfigForm({
     setClearSecrets(updated);
     onDraftChange?.(
       schema.key,
-      buildSchemaValues(descriptor, next, fieldTypes, SAVE_OPTIONS),
+      buildSchemaValues(descriptor, next, undefined, SAVE_OPTIONS),
       Array.from(updated),
     );
   }
@@ -153,7 +122,7 @@ export function PluginConfigForm({
     setClearSecrets(updated);
     onDraftChange?.(
       schema.key,
-      buildSchemaValues(descriptor, values, fieldTypes, SAVE_OPTIONS),
+      buildSchemaValues(descriptor, values, undefined, SAVE_OPTIONS),
       Array.from(updated),
     );
   }
@@ -167,14 +136,15 @@ export function PluginConfigForm({
       setTestResult(
         await onTest(
           schema.key,
-          buildSchemaValues(descriptor, values, fieldTypes, SAVE_OPTIONS),
+          buildSchemaValues(descriptor, values, undefined, SAVE_OPTIONS),
           Array.from(clearSecrets),
         ),
       );
     } catch (error) {
       setTestResult({
         success: false,
-        message: error instanceof Error ? error.message : "Connection check failed.",
+        message:
+          error instanceof Error ? error.message : t("web.admin.plugins.configForm.checkFailed"),
       });
     }
   }
@@ -184,7 +154,7 @@ export function PluginConfigForm({
       <div className="space-y-2 rounded-md border border-amber-500/30 bg-amber-500/5 p-3">
         <Label>{schema.title || schema.key}</Label>
         <p className="text-muted-foreground text-sm">
-          This plugin uses a configuration schema shape that the admin form does not support yet.
+          {t("web.admin.plugins.configForm.unsupportedSchema")}
         </p>
       </div>
     );
@@ -209,66 +179,7 @@ export function PluginConfigForm({
         values={values}
         onChange={handleChange}
         idPrefix={idPrefix ?? schema.key}
-        dynamicOptions={dynamicOptions}
-        optionsLoading={optionsLoading}
       />
-
-      {fields.some((field) => field.key === "quality_profiles") ? (
-        <div className="space-y-2 rounded-md border border-dashed p-2.5">
-          <Button
-            type="button"
-            size="sm"
-            variant="outline"
-            onClick={() => {
-              const raw = values.quality_profiles;
-              try {
-                // Empty input: JSON.parse("") throws the raw browser
-                // "Unexpected end of JSON input" — say what it means instead.
-                if (typeof raw === "string" && raw.trim() === "") {
-                  throw new Error("No profiles entered. Paste a JSON array of profiles first.");
-                }
-                const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
-                if (!Array.isArray(parsed)) throw new Error("Profiles must be a JSON array.");
-                const seen = new Set<string>();
-                const labels = parsed.map((profile, index) => {
-                  if (
-                    !profile ||
-                    typeof profile !== "object" ||
-                    typeof profile.label !== "string" ||
-                    !profile.label.trim()
-                  ) {
-                    throw new Error(`Profile ${index + 1} must have a label.`);
-                  }
-                  const typed = profile as Record<string, unknown>;
-                  const label = profile.label.trim();
-                  const key = label.toLowerCase();
-                  if (seen.has(key)) throw new Error(`Duplicate profile label: ${label}.`);
-                  seen.add(key);
-                  for (const regexKey of ["include_regex", "exclude_regex"]) {
-                    const regex = typed[regexKey];
-                    if (regex !== undefined && typeof regex !== "string") {
-                      throw new Error(`${regexKey} in profile ${label} must be a string.`);
-                    }
-                  }
-                  return label;
-                });
-                setProfilePreview(
-                  `Valid JSON structure: ${labels.join(", ")}. Save or test the connection to validate Go/RE2 expressions.`,
-                );
-              } catch (error) {
-                setProfilePreview(
-                  error instanceof Error ? error.message : "Invalid profiles JSON.",
-                );
-              }
-            }}
-          >
-            Validate profiles
-          </Button>
-          {profilePreview ? (
-            <p className="text-muted-foreground text-xs">{profilePreview}</p>
-          ) : null}
-        </div>
-      ) : null}
 
       {configuredSecrets.length > 0 ? (
         <div className="space-y-2 rounded-md border border-dashed p-2.5">
@@ -279,8 +190,11 @@ export function PluginConfigForm({
             return (
               <div key={key} className="flex items-center justify-between gap-3 text-xs">
                 <span className={clearing ? "text-destructive" : "text-muted-foreground"}>
-                  {field?.label || humanizeConfigKey(key)}: {clearing ? "will be cleared" : "saved"}
-                  {required ? " (required)" : ""}
+                  {t("web.admin.plugins.configForm.savedSecretStatus", {
+                    label: field?.label || humanizeConfigKey(key),
+                    state: clearing ? "cleared" : "saved",
+                    required: required ? "yes" : "no",
+                  })}
                 </span>
                 {!required ? (
                   <Button
@@ -289,7 +203,9 @@ export function PluginConfigForm({
                     variant="ghost"
                     onClick={() => toggleClearSecret(key)}
                   >
-                    {clearing ? "Keep saved secret" : "Clear saved secret"}
+                    {clearing
+                      ? t("web.admin.plugins.configForm.keepSecret")
+                      : t("web.admin.plugins.configForm.clearSecret")}
                   </Button>
                 ) : null}
               </div>
@@ -314,12 +230,12 @@ export function PluginConfigForm({
           onClick={() =>
             onSave(
               schema.key,
-              buildSchemaValues(descriptor, values, fieldTypes, SAVE_OPTIONS),
+              buildSchemaValues(descriptor, values, undefined, SAVE_OPTIONS),
               Array.from(clearSecrets),
             )
           }
         >
-          {schema.admin_form?.submit_label || "Save config"}
+          {schema.admin_form?.submit_label || t("web.admin.plugins.configForm.save")}
         </Button>
       </div>
     </fieldset>

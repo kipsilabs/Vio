@@ -6,7 +6,10 @@ export interface paths {
       path?: never;
       cookie?: never;
     };
-    /** List the external sign-in identities linked to the caller's account. */
+    /**
+     * List the external sign-in identities linked to the caller's account.
+     * @description Every profile on the account may read the list. can_unlink answers for the profile X-Profile-Id names, or for a request that names none, by deleteAccountIdentity's rule: a profile other than the account's primary one reads false.
+     */
     get: operations["listAccountIdentities"];
     put?: never;
     post?: never;
@@ -28,7 +31,7 @@ export interface paths {
     post?: never;
     /**
      * Disconnect an external sign-in identity from the caller's account.
-     * @description Allowed only while the account can still sign in another way: its local password (with local password sign-in on, or as a break-glass account) or another identity; otherwise 409 last_sign_in_method. An API key or an impersonation session is refused with 403.
+     * @description How the account signs in belongs to the whole household, so only the account's household manager may disconnect an identity. X-Profile-Id must name the account's primary profile, with X-Profile-Token when that profile is PIN-protected (without it the request is 403 profile_verification_required); naming any other profile is 403 permission_denied, including on an admin account. A request without X-Profile-Id is accepted only from an admin account's login session while no profile on the account is PIN-protected or access-restricted; otherwise it is 403 permission_denied. Allowed only while the account can still sign in another way: its local password (with local password sign-in on, or as a break-glass account) or another identity; otherwise 409 last_sign_in_method. An API key or an impersonation session is refused with 403 permission_denied.
      */
     delete: operations["deleteAccountIdentity"];
     options?: never;
@@ -8475,8 +8478,7 @@ export interface paths {
       path?: never;
       cookie?: never;
     };
-    /** Read one device-managed download, or one of the account's ephemeral downloads. */
-    get: operations["getDownload"];
+    get?: never;
     put?: never;
     post?: never;
     /** Remove a managed download or cancel an ephemeral transfer. */
@@ -9075,7 +9077,7 @@ export interface paths {
       path?: never;
       cookie?: never;
     };
-    /** The home page's sections with their cards, as the acting profile sees them. */
+    /** The home page's sections that have cards for the acting profile, with those cards. */
     get: operations["listHomeSections"];
     put?: never;
     post?: never;
@@ -9677,7 +9679,7 @@ export interface paths {
       path?: never;
       cookie?: never;
     };
-    /** The library's sections with their cards, as the acting profile sees them. */
+    /** The library's sections that have cards for the acting profile, with those cards. */
     get: operations["listLibrarySections"];
     put?: never;
     post?: never;
@@ -13443,10 +13445,16 @@ export interface paths {
       path?: never;
       cookie?: never;
     };
-    /** List the account's webhook connections. */
+    /**
+     * List the account's webhook connections.
+     * @description Webhook sync connections are account-wide: a connection's receiver URL carries its secret, and its mappings choose which profile an external user's watch state is written to. Only the account's household manager may read or change them. X-Profile-Id must name the account's primary profile, with X-Profile-Token when that profile is PIN-protected (without it the request is 403 profile_verification_required); naming any other profile is 403 permission_denied, including on an admin account. A request without X-Profile-Id is accepted only from an admin account's API key, or from an admin account's login session while no profile on the account is PIN-protected or access-restricted; otherwise it is 403 permission_denied.
+     */
     get: operations["listWebhookConnections"];
     put?: never;
-    /** Create an external webhook connection. */
+    /**
+     * Create an external webhook connection.
+     * @description Webhook sync connections are account-wide: a connection's receiver URL carries its secret, and its mappings choose which profile an external user's watch state is written to. Only the account's household manager may read or change them. X-Profile-Id must name the account's primary profile, with X-Profile-Token when that profile is PIN-protected (without it the request is 403 profile_verification_required); naming any other profile is 403 permission_denied, including on an admin account. A request without X-Profile-Id is accepted only from an admin account's API key, or from an admin account's login session while no profile on the account is PIN-protected or access-restricted; otherwise it is 403 permission_denied.
+     */
     post: operations["createWebhookConnection"];
     delete?: never;
     options?: never;
@@ -13462,10 +13470,16 @@ export interface paths {
       cookie?: never;
     };
     get?: never;
-    /** Update a webhook connection. */
+    /**
+     * Update a webhook connection.
+     * @description Webhook sync connections are account-wide: a connection's receiver URL carries its secret, and its mappings choose which profile an external user's watch state is written to. Only the account's household manager may read or change them. X-Profile-Id must name the account's primary profile, with X-Profile-Token when that profile is PIN-protected (without it the request is 403 profile_verification_required); naming any other profile is 403 permission_denied, including on an admin account. A request without X-Profile-Id is accepted only from an admin account's API key, or from an admin account's login session while no profile on the account is PIN-protected or access-restricted; otherwise it is 403 permission_denied.
+     */
     put: operations["updateWebhookConnection"];
     post?: never;
-    /** Delete a webhook connection. */
+    /**
+     * Delete a webhook connection.
+     * @description Webhook sync connections are account-wide: a connection's receiver URL carries its secret, and its mappings choose which profile an external user's watch state is written to. Only the account's household manager may read or change them. X-Profile-Id must name the account's primary profile, with X-Profile-Token when that profile is PIN-protected (without it the request is 403 profile_verification_required); naming any other profile is 403 permission_denied, including on an admin account. A request without X-Profile-Id is accepted only from an admin account's API key, or from an admin account's login session while no profile on the account is PIN-protected or access-restricted; otherwise it is 403 permission_denied.
+     */
     delete: operations["deleteWebhookConnection"];
     options?: never;
     head?: never;
@@ -13479,7 +13493,10 @@ export interface paths {
       path?: never;
       cookie?: never;
     };
-    /** List webhook events with stable pagination. */
+    /**
+     * List webhook events with stable pagination.
+     * @description Webhook sync connections are account-wide: a connection's receiver URL carries its secret, and its mappings choose which profile an external user's watch state is written to. Only the account's household manager may read or change them. X-Profile-Id must name the account's primary profile, with X-Profile-Token when that profile is PIN-protected (without it the request is 403 profile_verification_required); naming any other profile is 403 permission_denied, including on an admin account. A request without X-Profile-Id is accepted only from an admin account's API key, or from an admin account's login session while no profile on the account is PIN-protected or access-restricted; otherwise it is 403 permission_denied.
+     */
     get: operations["listWebhookEvents"];
     put?: never;
     post?: never;
@@ -13496,9 +13513,15 @@ export interface paths {
       path?: never;
       cookie?: never;
     };
-    /** Read external-user profile mappings. */
+    /**
+     * Read external-user profile mappings.
+     * @description Webhook sync connections are account-wide: a connection's receiver URL carries its secret, and its mappings choose which profile an external user's watch state is written to. Only the account's household manager may read or change them. X-Profile-Id must name the account's primary profile, with X-Profile-Token when that profile is PIN-protected (without it the request is 403 profile_verification_required); naming any other profile is 403 permission_denied, including on an admin account. A request without X-Profile-Id is accepted only from an admin account's API key, or from an admin account's login session while no profile on the account is PIN-protected or access-restricted; otherwise it is 403 permission_denied.
+     */
     get: operations["getWebhookMappings"];
-    /** Replace external-user profile mappings. */
+    /**
+     * Replace external-user profile mappings.
+     * @description Webhook sync connections are account-wide: a connection's receiver URL carries its secret, and its mappings choose which profile an external user's watch state is written to. Only the account's household manager may read or change them. X-Profile-Id must name the account's primary profile, with X-Profile-Token when that profile is PIN-protected (without it the request is 403 profile_verification_required); naming any other profile is 403 permission_denied, including on an admin account. A request without X-Profile-Id is accepted only from an admin account's API key, or from an admin account's login session while no profile on the account is PIN-protected or access-restricted; otherwise it is 403 permission_denied.
+     */
     put: operations["updateWebhookMappings"];
     post?: never;
     delete?: never;
@@ -13516,7 +13539,10 @@ export interface paths {
     };
     get?: never;
     put?: never;
-    /** Rotate the external receiver URL. */
+    /**
+     * Rotate the external receiver URL.
+     * @description Webhook sync connections are account-wide: a connection's receiver URL carries its secret, and its mappings choose which profile an external user's watch state is written to. Only the account's household manager may read or change them. X-Profile-Id must name the account's primary profile, with X-Profile-Token when that profile is PIN-protected (without it the request is 403 profile_verification_required); naming any other profile is 403 permission_denied, including on an admin account. A request without X-Profile-Id is accepted only from an admin account's API key, or from an admin account's login session while no profile on the account is PIN-protected or access-restricted; otherwise it is 403 permission_denied.
+     */
     post: operations["rotateWebhookConnection"];
     delete?: never;
     options?: never;
@@ -13647,7 +13673,7 @@ export interface components {
     };
     AccountIdentityCollection: {
       /**
-       * @description Whether deleteAccountIdentity would disconnect an identity now: the account has another identity, or its local password still signs in (the account's password sign-in is on, and local password sign-in is on for the server or the account is break-glass). False with no identity
+       * @description Whether deleteAccountIdentity would disconnect an identity now for the profile asking: that profile is the account's household manager (deleteAccountIdentity describes who is), and the account has another identity, or its local password still signs in (the account's password sign-in is on, and local password sign-in is on for the server or the account is break-glass). False with no identity
        * @example true
        */
       can_unlink: boolean;
@@ -16480,14 +16506,15 @@ export interface components {
       node_id?: string;
     };
     AdminDashboardLayout: {
+      /** @description Stored layout; null when this account has none saved, and the client keeps its local or default arrangement */
       layout: {
         [key: string]: unknown;
-      };
+      } | null;
       /**
        * Format: date-time
-       * @description RFC 3339 instant in UTC with millisecond precision
+       * @description When the stored layout was last saved; null when none is saved
        */
-      updated_at: string;
+      updated_at: string | null;
     };
     AdminDashboardLayoutSaveBody: {
       layout: {
@@ -17031,6 +17058,20 @@ export interface components {
       source?: components["schemas"]["AdminDiscoverSource"];
       /** @example Trending Movies */
       title: string;
+      /**
+       * @description Values of the title_key message's placeholders by name, such as library for a generated library row; present only with title_key, and absent when the message has none
+       * @example {
+       *       "library": "Movies"
+       *     }
+       */
+      title_args?: {
+        [key: string]: string;
+      };
+      /**
+       * @description Key of the shared translation catalog message whose English is title, present only while title is the server's own text: a built-in or generated section, recommendation row or request Discover row name, or a seasonal row's built-in in-season title. A client that has the key shows its translation, filling title_args, and otherwise shows title. Absent when an administrator or the profile typed the title, except that upgrading keyed existing titles identical to a built-in name, and a profile title equal to the administrator's keeps the key. A client acts on title_key whenever it is present
+       * @example home.section.recentlyAddedIn
+       */
+      title_key?: string;
       /**
        * @example tmdb_chart
        * @enum {string}
@@ -19312,7 +19353,7 @@ export interface components {
     };
     AdminNotificationPushTestInputBody: {
       /**
-       * @description Opaque identifier
+       * @description A profile on the authenticated account. A profile or device on another account answers 404, as a device that does not exist does.
        * @example 1
        */
       profile_id: string;
@@ -20138,6 +20179,8 @@ export interface components {
       /** @enum {string} */
       source_kind: "silo" | "vio" | "approved_community" | "external";
       task_bindings: components["schemas"]["AdminPluginTaskBinding"][];
+      /** @description The last automatic update that failed, such as a download that did not match its catalog checksum. Absent when the last check did not fail for this plugin. */
+      update_failure?: components["schemas"]["AdminPluginUpdateFailure"];
       update_policy: string;
       /**
        * Format: date-time
@@ -20281,6 +20324,17 @@ export interface components {
       trigger?: {
         [key: string]: unknown;
       };
+    };
+    AdminPluginUpdateFailure: {
+      /**
+       * Format: date-time
+       * @description RFC 3339 instant in UTC with millisecond precision
+       */
+      failed_at: string;
+      /** @description Why the update was refused, written for the administrator; it names no URL or checksum */
+      reason: string;
+      /** @description The version Silo tried and failed to install */
+      version: string;
     };
     AdminPluginUploadForm: {
       /**
@@ -21401,6 +21455,20 @@ export interface components {
       scope: "home" | "library";
       section_type: string;
       title: string;
+      /**
+       * @description Values of the title_key message's placeholders by name, such as library for a generated library row; present only with title_key, and absent when the message has none
+       * @example {
+       *       "library": "Movies"
+       *     }
+       */
+      title_args?: {
+        [key: string]: string;
+      };
+      /**
+       * @description Key of the shared translation catalog message whose English is title, present only while title is the server's own text: a built-in or generated section, recommendation row or request Discover row name, or a seasonal row's built-in in-season title. A client that has the key shows its translation, filling title_args, and otherwise shows title. Absent when an administrator or the profile typed the title, except that upgrading keyed existing titles identical to a built-in name, and a profile title equal to the administrator's keeps the key. A client acts on title_key whenever it is present
+       * @example home.section.recentlyAddedIn
+       */
+      title_key?: string;
       /**
        * Format: date-time
        * @description RFC 3339 instant in UTC with millisecond precision
@@ -26121,6 +26189,7 @@ export interface components {
        */
       user_code: string;
       /**
+       * Format: uri
        * @description Page on this server where the approver enters the user code; server.public_url when configured, otherwise the address the device used
        * @example https://silo.example.test/activate
        */
@@ -26326,6 +26395,20 @@ export interface components {
       /** @example Trending Movies */
       title: string;
       /**
+       * @description Values of the title_key message's placeholders by name, such as library for a generated library row; present only with title_key, and absent when the message has none
+       * @example {
+       *       "library": "Movies"
+       *     }
+       */
+      title_args?: {
+        [key: string]: string;
+      };
+      /**
+       * @description Key of the shared translation catalog message whose English is title, present only while title is the server's own text: a built-in or generated section, recommendation row or request Discover row name, or a seasonal row's built-in in-season title. A client that has the key shows its translation, filling title_args, and otherwise shows title. Absent when an administrator or the profile typed the title, except that upgrading keyed existing titles identical to a built-in name, and a profile title equal to the administrator's keeps the key. A client acts on title_key whenever it is present
+       * @example home.section.recentlyAddedIn
+       */
+      title_key?: string;
+      /**
        * @description What the row shows: tmdb_chart, tmdb_discover, tmdb_list or mdblist (title rows, in items), or studios, networks or genres (brand rows). More values may be added
        * @example tmdb_chart
        */
@@ -26351,6 +26434,20 @@ export interface components {
       results: components["schemas"]["RequestMediaResult"][];
       /** @example Trending Movies */
       title: string;
+      /**
+       * @description Values of the title_key message's placeholders by name, such as library for a generated library row; present only with title_key, and absent when the message has none
+       * @example {
+       *       "library": "Movies"
+       *     }
+       */
+      title_args?: {
+        [key: string]: string;
+      };
+      /**
+       * @description Key of the shared translation catalog message whose English is title, present only while title is the server's own text: a built-in or generated section, recommendation row or request Discover row name, or a seasonal row's built-in in-season title. A client that has the key shows its translation, filling title_args, and otherwise shows title. Absent when an administrator or the profile typed the title, except that upgrading keyed existing titles identical to a built-in name, and a profile title equal to the administrator's keeps the key. A client acts on title_key whenever it is present
+       * @example home.section.recentlyAddedIn
+       */
+      title_key?: string;
       /**
        * Format: int64
        * @example 500
@@ -28055,6 +28152,11 @@ export interface components {
        * @example 100
        */
       section_item_limit_max?: number;
+      /**
+       * @description Sections, profile section settings, admin section definitions and recommendation rows carry title_key, with title_args when its message has placeholders, for titles the server writes, so a client can translate them (a few, such as an editorial row's subject title, have none; a client shows title whenever the key is absent or unknown), and profile section settings carry default_title_key and default_title_args the same way for default_title. Request Discover rows carry title_key the same way, and the section recipe gallery's presets carry display_name_key, description_short_key and description_long_key for their text; those came later, so a server that reports this flag may not send them. Informational: clients act on each key whenever it is present. Absent when the home sections service is not configured, and on a server that predates section title keys
+       * @example true
+       */
+      section_title_keys?: boolean;
       /**
        * @description Support and configuration state, not health
        * @enum {string}
@@ -32376,7 +32478,10 @@ export interface components {
        * @example en
        */
       language: string;
-      /** @example false */
+      /**
+       * @description Whether the profile is limited to allowed_library_ids within its account's libraries. The primary profile is never limited: it sees every library its account can access and hides libraries through its settings instead
+       * @example false
+       */
       library_restrictions_enabled: boolean;
       /**
        * Format: int64
@@ -32450,6 +32555,12 @@ export interface components {
        * @example true
        */
       max_advisory_age_supported: boolean;
+      /**
+       * Format: int64
+       * @description How many profiles this account may have, from its effective access policy; createProfile answers 409 once the household holds this many. Omitted on a remote-playback handoff, which lists only its own profile and cannot create one, and when the server could not read the limit; in that second case a client keeps offering new profiles and createProfile stays the check
+       * @example 5
+       */
+      max_profiles?: number;
       /** @description Cursor state; absent for bounded unpaginated collections */
       page?: components["schemas"]["PageInfo"];
       /**
@@ -32460,7 +32571,7 @@ export interface components {
     };
     ProfileCreate: {
       /**
-       * @description Unique library identifiers the profile may see when restrictions are enabled
+       * @description Unique library identifiers the profile may see when restrictions are enabled. Must be empty on an account's first profile, which becomes its primary profile, even with restrictions off
        * @example [
        *       "1",
        *       "2"
@@ -32487,7 +32598,10 @@ export interface components {
        * @example en
        */
       language?: string;
-      /** @example false */
+      /**
+       * @description Limits the profile to allowed_library_ids. Must be false or omitted on an account's first profile, which becomes its primary profile
+       * @example false
+       */
       library_restrictions_enabled?: boolean;
       /**
        * Format: int64
@@ -32638,6 +32752,20 @@ export interface components {
        * @example Continue Watching
        */
       default_title: string;
+      /**
+       * @description Values of the default_title_key message's placeholders by name; present only with default_title_key, and absent when the message has none
+       * @example {
+       *       "library": "Movies"
+       *     }
+       */
+      default_title_args?: {
+        [key: string]: string;
+      };
+      /**
+       * @description Key of the shared translation catalog message whose English is default_title, under the same rules as title_key: present only while default_title is the server's own text, and absent when an administrator typed it
+       * @example home.section.continueWatching
+       */
+      default_title_key?: string;
       /** @example false */
       featured: boolean;
       /**
@@ -32672,6 +32800,20 @@ export interface components {
        * @example Continue Watching
        */
       title: string;
+      /**
+       * @description Values of the title_key message's placeholders by name, such as library for a generated library row; present only with title_key, and absent when the message has none
+       * @example {
+       *       "library": "Movies"
+       *     }
+       */
+      title_args?: {
+        [key: string]: string;
+      };
+      /**
+       * @description Key of the shared translation catalog message whose English is title, present only while title is the server's own text: a built-in or generated section, recommendation row or request Discover row name, or a seasonal row's built-in in-season title. A client that has the key shows its translation, filling title_args, and otherwise shows title. Absent when an administrator or the profile typed the title, except that upgrading keyed existing titles identical to a built-in name, and a profile title equal to the administrator's keeps the key. A client acts on title_key whenever it is present
+       * @example home.section.recentlyAddedIn
+       */
+      title_key?: string;
     };
     ProfileSectionSettingCollection: {
       /** @description The page's items; empty, never null */
@@ -32708,7 +32850,10 @@ export interface components {
        * @example en
        */
       language?: string | null;
-      /** @example false */
+      /**
+       * @description Limits the profile to allowed_library_ids. The primary profile can't be limited: true, or a non-empty allowed_library_ids, fails validation on it
+       * @example false
+       */
       library_restrictions_enabled?: boolean;
       /**
        * Format: int64
@@ -33186,10 +33331,25 @@ export interface components {
       };
       /** @description Empty when the preset has none */
       description_long: string;
+      /**
+       * @description Key of the shared translation catalog message whose English is description_long; absent when the preset has no description_long
+       * @example home.recipe.seAuto.details
+       */
+      description_long_key?: string;
       /** @example Items added in the last seven days */
       description_short: string;
+      /**
+       * @description Key of the shared translation catalog message whose English is description_short, with the same fallback
+       * @example home.recipe.mwWeek.description
+       */
+      description_short_key?: string;
       /** @example New this week */
       display_name: string;
+      /**
+       * @description Key of the shared translation catalog message whose English is display_name. A client that has the key shows its translation and otherwise display_name
+       * @example home.recipe.mwWeek.name
+       */
+      display_name_key?: string;
       /** @example sparkles */
       icon: string;
       /** @example new_this_week */
@@ -33213,6 +33373,20 @@ export interface components {
        * @example Because you enjoy Crime
        */
       title: string;
+      /**
+       * @description Values of the title_key message's placeholders by name, such as library for a generated library row; present only with title_key, and absent when the message has none
+       * @example {
+       *       "library": "Movies"
+       *     }
+       */
+      title_args?: {
+        [key: string]: string;
+      };
+      /**
+       * @description Key of the shared translation catalog message whose English is title, present only while title is the server's own text: a built-in or generated section, recommendation row or request Discover row name, or a seasonal row's built-in in-season title. A client that has the key shows its translation, filling title_args, and otherwise shows title. Absent when an administrator or the profile typed the title, except that upgrading keyed existing titles identical to a built-in name, and a profile title equal to the administrator's keeps the key. A client acts on title_key whenever it is present
+       * @example home.section.recentlyAddedIn
+       */
+      title_key?: string;
       /**
        * @description Row type: cluster, similar_users_liked, popular, recently_added, top_rated, genre_sampler
        * @example cluster
@@ -33858,6 +34032,20 @@ export interface components {
       /** @example Recently Added */
       title: string;
       /**
+       * @description Values of the title_key message's placeholders by name, such as library for a generated library row; present only with title_key, and absent when the message has none
+       * @example {
+       *       "library": "Movies"
+       *     }
+       */
+      title_args?: {
+        [key: string]: string;
+      };
+      /**
+       * @description Key of the shared translation catalog message whose English is title, present only while title is the server's own text: a built-in or generated section, recommendation row or request Discover row name, or a seasonal row's built-in in-season title. A client that has the key shows its translation, filling title_args, and otherwise shows title. Absent when an administrator or the profile typed the title, except that upgrading keyed existing titles identical to a built-in name, and a profile title equal to the administrator's keeps the key. A client acts on title_key whenever it is present
+       * @example home.section.recentlyAddedIn
+       */
+      title_key?: string;
+      /**
        * Format: int64
        * @description Items the section has in total, at least the number returned
        * @example 120
@@ -33896,6 +34084,20 @@ export interface components {
       section_type: string;
       /** @example Recently Added */
       title: string;
+      /**
+       * @description Values of the title_key message's placeholders by name, such as library for a generated library row; present only with title_key, and absent when the message has none
+       * @example {
+       *       "library": "Movies"
+       *     }
+       */
+      title_args?: {
+        [key: string]: string;
+      };
+      /**
+       * @description Key of the shared translation catalog message whose English is title, present only while title is the server's own text: a built-in or generated section, recommendation row or request Discover row name, or a seasonal row's built-in in-season title. A client that has the key shows its translation, filling title_args, and otherwise shows title. Absent when an administrator or the profile typed the title, except that upgrading keyed existing titles identical to a built-in name, and a profile title equal to the administrator's keeps the key. A client acts on title_key whenever it is present
+       * @example home.section.recentlyAddedIn
+       */
+      title_key?: string;
     };
     SectionOverride: {
       /** @description Legacy config override; absent when the profile saved none (the section's own config applies), {} when it saved an empty one */
@@ -37695,7 +37897,12 @@ export interface operations {
   listAccountIdentities: {
     parameters: {
       query?: never;
-      header?: never;
+      header?: {
+        /** @description Optional. When present, it must name a profile of the authenticated account. */
+        "X-Profile-Id"?: string;
+        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
+        "X-Profile-Token"?: string;
+      };
       path?: never;
       cookie?: never;
     };
@@ -37721,6 +37928,24 @@ export interface operations {
       };
       /** @description Unauthorized */
       401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Forbidden */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Found */
+      404: {
         headers: {
           [name: string]: unknown;
         };
@@ -37778,7 +38003,12 @@ export interface operations {
   deleteAccountIdentity: {
     parameters: {
       query?: never;
-      header?: never;
+      header?: {
+        /** @description Optional. When present, it must name a profile of the authenticated account. */
+        "X-Profile-Id"?: string;
+        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
+        "X-Profile-Token"?: string;
+      };
       path: {
         /** @description Identity id */
         id: string;
@@ -108930,7 +109160,7 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        "X-Silo-Device-Id"?: string;
+        "X-Vio-Device-Id"?: string;
       };
       path: {
         device_id: string;
@@ -111863,115 +112093,6 @@ export interface operations {
       };
     };
   };
-  getDownload: {
-    parameters: {
-      query?: never;
-      header: {
-        /** @description The household profile acting for this request; it must belong to the authenticated account. */
-        "X-Profile-Id": string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-        "X-Vio-Device-Id"?: string;
-      };
-      path: {
-        id: string;
-      };
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      /** @description OK */
-      200: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["DownloadEntry"];
-        };
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
   deleteDownload: {
     parameters: {
       query?: never;
@@ -113267,7 +113388,7 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        "X-Silo-Device-Id": string;
+        "X-Vio-Device-Id": string;
       };
       path: {
         id: string;
@@ -131148,8 +131269,6 @@ export interface operations {
         "X-Silo-Client-Channel"?: string;
         /** @description Marketing version paired with X-Silo-Client */
         "X-Silo-Client-Version"?: string;
-        /** @description The client's stable device identifier; a successful start records it in the profile's device registry (first 128 characters) */
-        "X-Silo-Device-Id"?: string;
         /** @description App name first-party Vio clients send */
         "X-Vio-Client"?: string;
         /** @description Opaque build identifier paired with X-Vio-Client */
@@ -131158,6 +131277,8 @@ export interface operations {
         "X-Vio-Client-Channel"?: string;
         /** @description Marketing version paired with X-Vio-Client */
         "X-Vio-Client-Version"?: string;
+        /** @description The client's stable device identifier; a successful start records it in the profile's device registry (first 128 characters) */
+        "X-Vio-Device-Id"?: string;
       };
       path: {
         /** @description Opaque identifier */
@@ -131438,8 +131559,6 @@ export interface operations {
         "X-Silo-Client-Channel"?: string;
         /** @description Marketing version paired with X-Silo-Client */
         "X-Silo-Client-Version"?: string;
-        /** @description The client's stable device identifier; a successful start records it in the profile's device registry (first 128 characters) */
-        "X-Silo-Device-Id"?: string;
         /** @description App name first-party Vio clients send */
         "X-Vio-Client"?: string;
         /** @description Opaque build identifier paired with X-Vio-Client */
@@ -131448,6 +131567,8 @@ export interface operations {
         "X-Vio-Client-Channel"?: string;
         /** @description Marketing version paired with X-Vio-Client */
         "X-Vio-Client-Version"?: string;
+        /** @description The client's stable device identifier; a successful start records it in the profile's device registry (first 128 characters) */
+        "X-Vio-Device-Id"?: string;
       };
       path: {
         /** @description Opaque identifier */
@@ -131615,8 +131736,6 @@ export interface operations {
         "X-Silo-Client-Channel"?: string;
         /** @description Marketing version paired with X-Silo-Client */
         "X-Silo-Client-Version"?: string;
-        /** @description The client's stable device identifier; a successful start records it in the profile's device registry (first 128 characters) */
-        "X-Silo-Device-Id"?: string;
         /** @description App name first-party Vio clients send */
         "X-Vio-Client"?: string;
         /** @description Opaque build identifier paired with X-Vio-Client */
@@ -131625,6 +131744,8 @@ export interface operations {
         "X-Vio-Client-Channel"?: string;
         /** @description Marketing version paired with X-Vio-Client */
         "X-Vio-Client-Version"?: string;
+        /** @description The client's stable device identifier; a successful start records it in the profile's device registry (first 128 characters) */
+        "X-Vio-Device-Id"?: string;
       };
       path: {
         /** @description Opaque identifier */
@@ -131863,7 +131984,7 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        "X-Silo-Device-Id"?: string;
+        "X-Vio-Device-Id"?: string;
       };
       path?: never;
       cookie?: never;
@@ -132127,7 +132248,7 @@ export interface operations {
     parameters: {
       query?: never;
       header?: {
-        "X-Silo-Device-Id"?: string;
+        "X-Vio-Device-Id"?: string;
       };
       path?: never;
       cookie?: never;
@@ -132213,7 +132334,7 @@ export interface operations {
     parameters: {
       query?: never;
       header: {
-        "X-Silo-Device-Id": string;
+        "X-Vio-Device-Id": string;
       };
       path?: never;
       cookie?: never;
@@ -132318,8 +132439,6 @@ export interface operations {
         "X-Silo-Client-Channel"?: string;
         /** @description Marketing version paired with X-Silo-Client */
         "X-Silo-Client-Version"?: string;
-        /** @description The client's stable device identifier; a successful start records it in the profile's device registry (first 128 characters) */
-        "X-Silo-Device-Id"?: string;
         /** @description App name first-party Vio clients send */
         "X-Vio-Client"?: string;
         /** @description Opaque build identifier paired with X-Vio-Client */
@@ -132328,6 +132447,8 @@ export interface operations {
         "X-Vio-Client-Channel"?: string;
         /** @description Marketing version paired with X-Vio-Client */
         "X-Vio-Client-Version"?: string;
+        /** @description The client's stable device identifier; a successful start records it in the profile's device registry (first 128 characters) */
+        "X-Vio-Device-Id"?: string;
       };
       path?: never;
       cookie?: never;
@@ -132852,12 +132973,6 @@ export interface operations {
         "X-Silo-Client-Channel"?: string;
         /** @description Marketing version paired with X-Silo-Client */
         "X-Silo-Client-Version"?: string;
-        /** @description The client's stable device identifier; a successful start records it in the profile's device registry (first 128 characters) */
-        "X-Silo-Device-Id"?: string;
-        /** @description Optional display name recorded on the device registry (first 120 characters) */
-        "X-Silo-Device-Name"?: string;
-        /** @description Optional platform recorded on the device registry (first 40 characters) */
-        "X-Silo-Device-Platform"?: string;
         /** @description App name first-party Vio clients send */
         "X-Vio-Client"?: string;
         /** @description Opaque build identifier paired with X-Vio-Client */
@@ -132866,6 +132981,12 @@ export interface operations {
         "X-Vio-Client-Channel"?: string;
         /** @description Marketing version paired with X-Vio-Client */
         "X-Vio-Client-Version"?: string;
+        /** @description The client's stable device identifier; a successful start records it in the profile's device registry (first 128 characters) */
+        "X-Vio-Device-Id"?: string;
+        /** @description Optional display name recorded on the device registry (first 120 characters) */
+        "X-Vio-Device-Name"?: string;
+        /** @description Optional platform recorded on the device registry (first 40 characters) */
+        "X-Vio-Device-Platform"?: string;
       };
       path?: never;
       cookie?: never;
@@ -144728,6 +144849,8 @@ export interface operations {
   getPlaybackMedia: {
     parameters: {
       query?: {
+        /** @description Set to refuse by the server on a server_remux_progressive URL whose attempt listed progressive_range_refusal_v1 in deliveries.progressive.features. A progressive remux streams from its seek origin and cannot resume: with it, a GET whose Range starts past byte 0 (or is a suffix range) answers 409 before the remux starts, and the client reopens the stream at its current position. Without it such a range streams from the origin with 200. */
+        remux_range?: "refuse";
         /** @description Signed stream reference the plan URL carries; it reconstructs the session after a restart. Omitted for header-authenticated media. Account and viewer authorization are always required. */
         st?: string;
         /** @description Media-element fallback for the account bearer token when an Authorization header cannot be set. Header-authenticated media requires the Authorization header and the profile selector. */
@@ -144937,6 +145060,8 @@ export interface operations {
   headPlaybackMedia: {
     parameters: {
       query?: {
+        /** @description Set to refuse by the server on a server_remux_progressive URL whose attempt listed progressive_range_refusal_v1 in deliveries.progressive.features. A progressive remux streams from its seek origin and cannot resume: with it, a GET whose Range starts past byte 0 (or is a suffix range) answers 409 before the remux starts, and the client reopens the stream at its current position. Without it such a range streams from the origin with 200. */
+        remux_range?: "refuse";
         /** @description Signed stream reference the plan URL carries; it reconstructs the session after a restart. Omitted for header-authenticated media. Account and viewer authorization are always required. */
         st?: string;
         /** @description Media-element fallback for the account bearer token when an Authorization header cannot be set. Header-authenticated media requires the Authorization header and the profile selector. */

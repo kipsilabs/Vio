@@ -13,6 +13,7 @@ import {
   useCanManageTitleAllowances,
   useTitleAllowanceProfiles,
 } from "@/hooks/queries/titleAllowances";
+import { useT } from "@/i18n";
 import ActionBar, { type ActionBarProps } from "./ActionBar";
 
 type UserActionProps =
@@ -42,6 +43,7 @@ interface MediaUserActionBarProps extends Omit<ActionBarProps, UserActionProps> 
  * pending/settled notifications from re-rendering the hero and below-fold page.
  */
 export default function MediaUserActionBar({ item, ...props }: MediaUserActionBarProps) {
+  const t = useT();
   const isFavorite = item.user_state?.is_favorite ?? false;
   const inWatchlist = item.user_state?.in_watchlist ?? false;
   const notInterested = item.user_state?.not_interested ?? false;
@@ -110,7 +112,9 @@ export default function MediaUserActionBar({ item, ...props }: MediaUserActionBa
         notInterested={notInterested}
         onAllowForProfiles={showAllowFor ? () => setAllowDialogOpen(true) : undefined}
         allowForLabel={
-          allowedNames.length > 0 ? `Allowed for ${allowedNames.join(", ")}` : "Allow for…"
+          allowedNames.length > 0
+            ? t("web.detail.actions.allowedFor", { profiles: allowedNames.join(", ") })
+            : t("web.detail.actions.allowFor")
         }
         rating={item.user_rating ?? null}
         onRatingChange={handleRatingChange}

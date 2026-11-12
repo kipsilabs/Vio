@@ -3,6 +3,8 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useState } from "react";
 import { toast } from "sonner";
 
+import { t } from "@/i18n";
+
 import {
   apiV1,
   captureProfileRequestContext,
@@ -295,7 +297,7 @@ export async function fetchPluginCatalogSettings(): Promise<PluginCatalogSetting
   ]);
   if (!isCapturedProfileAuthorityActive(profileContext)) throw new StaleApiRequestContextError();
   if (!etag || etag === "*" || etag.startsWith("W/"))
-    throw new Error("Catalog revision unavailable. Reload before editing.");
+    throw new Error(t("web.admin.errors.catalogRevisionMissing"));
   return {
     ...status,
     ...settings,
@@ -310,7 +312,7 @@ export function useUpdatePluginCatalogSettings() {
   const mutation = useMutation({
     mutationFn: ({ etag, profileContext, ...body }: PluginCatalogSettingsIntent) => {
       if (!etag || etag === "*" || etag.startsWith("W/"))
-        throw new Error("Reload plugin catalog settings before editing.");
+        throw new Error(t("web.admin.plugins.hooks.plugins.catalogSettings.reloadBeforeEditing"));
       return v2("PUT /api/v2/admin/plugins/catalog-settings", {
         body,
         profileContext,
@@ -321,16 +323,16 @@ export function useUpdatePluginCatalogSettings() {
     retry: false,
     onSuccess: (_result, intent) => {
       if (!isCapturedProfileAuthorityActive(intent.profileContext)) return;
-      toast.success("Plugin catalog settings updated");
+      toast.success(t("web.admin.plugins.hooks.plugins.catalogSettings.updated"));
       invalidatePluginQueries(queryClient);
     },
     onError: (error) => {
       toast.error(
         error instanceof V2ProblemError && error.status === 412
-          ? "Plugin catalog settings changed. Reload and review them before submitting another edit."
+          ? t("web.admin.plugins.hooks.plugins.catalogSettings.changed")
           : error instanceof Error
             ? error.message
-            : "Failed to update plugin catalog settings",
+            : t("web.admin.plugins.hooks.plugins.catalogSettings.updateFailed"),
       );
     },
   });
@@ -339,7 +341,7 @@ export function useUpdatePluginCatalogSettings() {
     mutate: (values: PluginCatalogSettingsUpdate) => {
       const profileContext = captureProfileRequestContext();
       if (!profileContext) {
-        toast.error("Select an administrator profile before editing.");
+        toast.error(t("web.admin.plugins.hooks.plugins.catalogSettings.selectProfile"));
         return;
       }
       mutation.mutate({ ...values, profileContext });
@@ -376,7 +378,7 @@ export function useCreatePluginRepository() {
     retry: false,
     onSuccess: (_result, intent) => {
       if (!isCapturedProfileAuthorityActive(intent.profileContext)) return;
-      toast.success("Repository added");
+      toast.success(t("web.admin.plugins.hooks.plugins.repository.added"));
       invalidatePluginQueries(queryClient);
     },
     onError: (error, intent) => {
@@ -384,7 +386,7 @@ export function useCreatePluginRepository() {
       toast.error(
         error instanceof V2ProblemError && error.status === 422
           ? error.message
-          : "Repository creation could not be confirmed. Refresh repositories before submitting again.",
+          : t("web.admin.plugins.hooks.plugins.repository.createUnconfirmed"),
       );
     },
   });
@@ -396,7 +398,7 @@ export function useCreatePluginRepository() {
           onSuccess: () => options?.onSuccess?.(),
         });
       } catch {
-        toast.error("Select an administrator profile before adding a repository.");
+        toast.error(t("web.admin.plugins.hooks.plugins.repository.createSelectProfile"));
       }
     },
     mutateAsync: (body: CreatePluginRepositoryRequest) =>
@@ -437,7 +439,7 @@ export function useUpdatePluginRepository() {
     retry: false,
     onSuccess: (_result, intent) => {
       if (!isCapturedProfileAuthorityActive(intent.profileContext)) return;
-      toast.success("Repository updated");
+      toast.success(t("web.admin.plugins.hooks.plugins.repository.updated"));
       invalidatePluginQueries(queryClient);
     },
     onError: (error, intent) => {
@@ -445,7 +447,7 @@ export function useUpdatePluginRepository() {
       toast.error(
         error instanceof V2ProblemError && error.status === 422
           ? error.message
-          : "Repository update could not be confirmed. Refresh repositories before submitting again.",
+          : t("web.admin.plugins.hooks.plugins.repository.updateUnconfirmed"),
       );
     },
   });
@@ -455,7 +457,7 @@ export function useUpdatePluginRepository() {
       try {
         mutation.mutate(captureRepositoryUpdate(input));
       } catch {
-        toast.error("Select an administrator profile before updating a repository.");
+        toast.error(t("web.admin.plugins.hooks.plugins.repository.updateSelectProfile"));
       }
     },
     mutateAsync: (input: { id: number; body: UpdatePluginRepositoryRequest }) =>
@@ -487,7 +489,7 @@ export function useDeletePluginRepository() {
     retry: false,
     onSuccess: (_result, intent) => {
       if (!isCapturedProfileAuthorityActive(intent.profileContext)) return;
-      toast.success("Repository removed");
+      toast.success(t("web.admin.plugins.hooks.plugins.repository.removed"));
       invalidatePluginQueries(queryClient);
     },
     onError: (error, intent) => {
@@ -495,7 +497,7 @@ export function useDeletePluginRepository() {
       toast.error(
         error instanceof V2ProblemError && error.status === 422
           ? error.message
-          : "Repository deletion could not be confirmed. Refresh repositories before submitting again.",
+          : t("web.admin.plugins.hooks.plugins.repository.deleteUnconfirmed"),
       );
     },
   });
@@ -505,7 +507,7 @@ export function useDeletePluginRepository() {
       try {
         mutation.mutate(captureRepositoryDeletion(id));
       } catch {
-        toast.error("Select an administrator profile before deleting a repository.");
+        toast.error(t("web.admin.plugins.hooks.plugins.repository.deleteSelectProfile"));
       }
     },
     mutateAsync: (id: number) => mutation.mutateAsync(captureRepositoryDeletion(id)),
@@ -565,16 +567,13 @@ export function useInstallPlugin() {
     },
     onSuccess: (_result, intent) => {
       if (!isCapturedProfileAuthorityActive(intent.profileContext)) return;
-      toast.success("Plugin installed");
+      toast.success(t("web.admin.plugins.hooks.plugins.install.done"));
       invalidatePluginQueries(queryClient);
     },
     onError: (error, intent) => {
       if (!isCapturedProfileAuthorityActive(intent.profileContext)) return;
       toast.error(
-        lifecycleFailure(
-          error,
-          "Plugin install could not be confirmed. Refresh installations before submitting again.",
-        ),
+        lifecycleFailure(error, t("web.admin.plugins.hooks.plugins.install.unconfirmed")),
       );
     },
   });
@@ -584,7 +583,7 @@ export function useInstallPlugin() {
       try {
         mutation.mutate(captureInstall(body));
       } catch {
-        toast.error("Select an administrator profile before installing a plugin.");
+        toast.error(t("web.admin.plugins.hooks.plugins.install.selectProfile"));
       }
     },
     mutateAsync: (body: InstallPluginRequest) => mutation.mutateAsync(captureInstall(body)),
@@ -607,17 +606,12 @@ export function useUploadPlugin() {
     },
     onSuccess: (_result, intent) => {
       if (!isCapturedProfileAuthorityActive(intent.profileContext)) return;
-      toast.success("Plugin uploaded");
+      toast.success(t("web.admin.plugins.hooks.plugins.upload.done"));
       invalidatePluginQueries(queryClient);
     },
     onError: (error, intent) => {
       if (!isCapturedProfileAuthorityActive(intent.profileContext)) return;
-      toast.error(
-        lifecycleFailure(
-          error,
-          "Plugin upload could not be confirmed. Refresh installations before uploading again.",
-        ),
-      );
+      toast.error(lifecycleFailure(error, t("web.admin.plugins.hooks.plugins.upload.unconfirmed")));
     },
   });
   return {
@@ -628,7 +622,7 @@ export function useUploadPlugin() {
     ) => {
       const profileContext = captureProfileRequestContext();
       if (!profileContext) {
-        toast.error("Select an administrator profile before uploading a plugin.");
+        toast.error(t("web.admin.plugins.hooks.plugins.upload.selectProfile"));
         options?.onError?.();
         return;
       }
@@ -690,12 +684,14 @@ export function useUpdatePluginInstallation() {
     },
     onSuccess: (_result, intent) => {
       if (!isCapturedProfileAuthorityActive(intent.profileContext)) return;
-      toast.success("Plugin updated");
+      toast.success(t("web.admin.plugins.hooks.plugins.installation.updated"));
       invalidatePluginQueries(queryClient);
     },
     onError: (error, intent) => {
       if (!isCapturedProfileAuthorityActive(intent.profileContext)) return;
-      toast.error(lifecycleFailure(error, "Failed to update plugin"));
+      toast.error(
+        lifecycleFailure(error, t("web.admin.plugins.hooks.plugins.installation.updateFailed")),
+      );
     },
   });
   return {
@@ -704,7 +700,7 @@ export function useUpdatePluginInstallation() {
       try {
         mutation.mutate({ ...captureInstallation(id), body: { ...body } });
       } catch {
-        toast.error("Select an administrator profile before updating a plugin.");
+        toast.error(t("web.admin.plugins.hooks.plugins.installation.updateSelectProfile"));
       }
     },
   };
@@ -728,16 +724,13 @@ export function useApplyPluginUpdate() {
     },
     onSuccess: (_result, intent) => {
       if (!isCapturedProfileAuthorityActive(intent.profileContext)) return;
-      toast.success("Plugin updated");
+      toast.success(t("web.admin.plugins.hooks.plugins.applyUpdate.done"));
       invalidatePluginQueries(queryClient);
     },
     onError: (error, intent) => {
       if (!isCapturedProfileAuthorityActive(intent.profileContext)) return;
       toast.error(
-        lifecycleFailure(
-          error,
-          "Plugin update could not be confirmed. Refresh installations before submitting again.",
-        ),
+        lifecycleFailure(error, t("web.admin.plugins.hooks.plugins.applyUpdate.unconfirmed")),
       );
     },
   });
@@ -747,7 +740,7 @@ export function useApplyPluginUpdate() {
       try {
         mutation.mutate(captureInstallation(id));
       } catch {
-        toast.error("Select an administrator profile before updating a plugin.");
+        toast.error(t("web.admin.plugins.hooks.plugins.installation.updateSelectProfile"));
       }
     },
   };
@@ -771,17 +764,14 @@ export function useRestartPluginInstallation() {
     },
     onSuccess: (_result, intent) => {
       if (!isCapturedProfileAuthorityActive(intent.profileContext)) return;
-      toast.success("Plugin restart requested");
+      toast.success(t("web.admin.plugins.hooks.plugins.restart.requested"));
       invalidatePluginQueries(queryClient);
       void queryClient.invalidateQueries({ queryKey: adminKeys.networkAccessStatusRoot() });
     },
     onError: (error, intent) => {
       if (!isCapturedProfileAuthorityActive(intent.profileContext)) return;
       toast.error(
-        lifecycleFailure(
-          error,
-          "Plugin restart could not be confirmed. Refresh installations before trying again.",
-        ),
+        lifecycleFailure(error, t("web.admin.plugins.hooks.plugins.restart.unconfirmed")),
       );
     },
   });
@@ -791,7 +781,7 @@ export function useRestartPluginInstallation() {
       try {
         mutation.mutate(captureInstallation(id));
       } catch {
-        toast.error("Select an administrator profile before restarting a plugin.");
+        toast.error(t("web.admin.plugins.hooks.plugins.restart.selectProfile"));
       }
     },
   };
@@ -814,17 +804,12 @@ export function useDeletePluginInstallation() {
     },
     onSuccess: (_result, intent) => {
       if (!isCapturedProfileAuthorityActive(intent.profileContext)) return;
-      toast.success("Plugin removed");
+      toast.success(t("web.admin.plugins.hooks.plugins.remove.done"));
       invalidatePluginQueries(queryClient);
     },
     onError: (error, intent) => {
       if (!isCapturedProfileAuthorityActive(intent.profileContext)) return;
-      toast.error(
-        lifecycleFailure(
-          error,
-          "Plugin removal could not be confirmed. Refresh installations before submitting again.",
-        ),
-      );
+      toast.error(lifecycleFailure(error, t("web.admin.plugins.hooks.plugins.remove.unconfirmed")));
     },
   });
   return {
@@ -833,7 +818,7 @@ export function useDeletePluginInstallation() {
       try {
         mutation.mutate(captureInstallation(id), { onSuccess: () => options?.onSuccess?.() });
       } catch {
-        toast.error("Select an administrator profile before removing a plugin.");
+        toast.error(t("web.admin.plugins.hooks.plugins.remove.selectProfile"));
       }
     },
   };
@@ -852,10 +837,14 @@ export function useCheckPluginUpdates() {
       queryClient.invalidateQueries({ queryKey: adminKeys.tasks() });
       queryClient.invalidateQueries({ queryKey: adminKeys.task(CHECK_PLUGIN_UPDATES_TASK_KEY) });
       invalidatePluginQueries(queryClient);
-      toast.success("Plugin update check started");
+      toast.success(t("web.admin.plugins.hooks.plugins.updateCheck.started"));
     },
     onError: (error) => {
-      toast.error(error instanceof Error ? error.message : "Failed to start plugin update check");
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : t("web.admin.plugins.hooks.plugins.updateCheck.failed"),
+      );
     },
   });
 }
@@ -877,7 +866,7 @@ function captureInstallationIntent<Body extends object>(
 }
 function mutationFailureMessage(error: unknown, fallback: string): string {
   if (error instanceof StaleApiRequestContextError)
-    return "Select an administrator profile before changing plugin settings.";
+    return t("web.admin.plugins.hooks.plugins.settings.selectProfile");
   if (error instanceof V2ProblemError && (error.status === 422 || error.status === 409))
     return error.message;
   return fallback;
@@ -905,16 +894,13 @@ export function useSavePluginConfig() {
     retry: false,
     onSuccess: async (_result, intent) => {
       if (!isCapturedProfileAuthorityActive(intent.profileContext)) return;
-      toast.success("Plugin config saved");
+      toast.success(t("web.admin.plugins.hooks.plugins.config.saved"));
       await invalidatePluginQueries(queryClient);
     },
     onError: (error, intent) => {
       if (!isCapturedProfileAuthorityActive(intent.profileContext)) return;
       toast.error(
-        mutationFailureMessage(
-          error,
-          "Plugin config could not be confirmed. Reload the plugin before saving again.",
-        ),
+        mutationFailureMessage(error, t("web.admin.plugins.hooks.plugins.config.unconfirmed")),
       );
     },
   });
@@ -924,7 +910,7 @@ export function useSavePluginConfig() {
       try {
         mutation.mutate(captureInstallationIntent(input.id, input.body));
       } catch {
-        toast.error("Select an administrator profile before saving plugin config.");
+        toast.error(t("web.admin.plugins.hooks.plugins.config.selectProfile"));
       }
     },
     mutateAsync: (input: { id: number; body: SavePluginConfigRequest }) =>
@@ -985,16 +971,13 @@ export function useSavePluginAuthBinding() {
     onSuccess: (_result, intent) => {
       if (!isCapturedProfileAuthorityActive(intent.profileContext)) return;
       // Sign-in providers rebuild on every node when a binding changes.
-      toast.success("Sign-in provider saved");
+      toast.success(t("web.admin.plugins.hooks.plugins.authBinding.saved"));
       invalidatePluginQueries(queryClient);
     },
     onError: (error, intent) => {
       if (!isCapturedProfileAuthorityActive(intent.profileContext)) return;
       toast.error(
-        mutationFailureMessage(
-          error,
-          "Auth binding could not be confirmed. Reload the plugin before saving again.",
-        ),
+        mutationFailureMessage(error, t("web.admin.plugins.hooks.plugins.authBinding.unconfirmed")),
       );
     },
   });
@@ -1004,7 +987,7 @@ export function useSavePluginAuthBinding() {
       try {
         mutation.mutate(captureInstallationIntent(input.id, input.body));
       } catch {
-        toast.error("Select an administrator profile before saving an auth binding.");
+        toast.error(t("web.admin.plugins.hooks.plugins.authBinding.selectProfile"));
       }
     },
     mutateAsync: (input: { id: number; body: SavePluginAuthBindingRequest }) =>
@@ -1052,18 +1035,15 @@ export function useSavePluginTaskBinding() {
       if (!isCapturedProfileAuthorityActive(intent.profileContext)) return;
       toast.success(
         data.restart_required
-          ? "Task binding saved — restart the server to apply it"
-          : "Task binding saved",
+          ? t("web.admin.plugins.hooks.plugins.taskBinding.savedRestart")
+          : t("web.admin.plugins.hooks.plugins.taskBinding.saved"),
       );
       invalidatePluginQueries(queryClient);
     },
     onError: (error, intent) => {
       if (!isCapturedProfileAuthorityActive(intent.profileContext)) return;
       toast.error(
-        mutationFailureMessage(
-          error,
-          "Task binding could not be confirmed. Reload the plugin before saving again.",
-        ),
+        mutationFailureMessage(error, t("web.admin.plugins.hooks.plugins.taskBinding.unconfirmed")),
       );
     },
   });
@@ -1073,7 +1053,7 @@ export function useSavePluginTaskBinding() {
       try {
         mutation.mutate(captureTaskBindingIntent(input));
       } catch {
-        toast.error("Select an administrator profile before saving a task binding.");
+        toast.error(t("web.admin.plugins.hooks.plugins.taskBinding.selectProfile"));
       }
     },
     mutateAsync: (input: {

@@ -39,7 +39,7 @@ const episodeColumns = `content_id, series_id, season_id, season_number, episode
 	imdb_id, tmdb_id, tvdb_id,
 	still_path, still_source_path, still_thumbhash,
 	metadata_s3_path, metadata_etag, metadata_source,
-	created_at, updated_at`
+	created_at, updated_at, locked_fields`
 
 // refreshSeriesAirDatesSQL maintains the denormalized media_items columns
 // last_air_date_at (newest episode aired on or before today) and
@@ -326,6 +326,7 @@ func scanEpisode(row pgx.Row) (*models.Episode, error) {
 		&ep.MetadataSource,
 		&ep.CreatedAt,
 		&ep.UpdatedAt,
+		&ep.LockedFields,
 	)
 	if seasonID != nil {
 		ep.SeasonID = *seasonID
@@ -409,6 +410,7 @@ func scanEpisodes(rows pgx.Rows) ([]*models.Episode, error) {
 			&ep.MetadataSource,
 			&ep.CreatedAt,
 			&ep.UpdatedAt,
+			&ep.LockedFields,
 		)
 		if seasonID != nil {
 			ep.SeasonID = *seasonID
@@ -535,11 +537,8 @@ func upsertEpisode(ctx context.Context, db episodeUpsertDB, ep *models.Episode, 
 		)
 		ON CONFLICT (series_id, season_number, episode_number) DO UPDATE SET
 			season_id = COALESCE(EXCLUDED.season_id, episodes.season_id),
-			title = EXCLUDED.title,
+			` + episodeLockableAssignments + `,
 			default_metadata_language = COALESCE(NULLIF(EXCLUDED.default_metadata_language, ''), episodes.default_metadata_language),
-			overview = EXCLUDED.overview,
-			air_date = EXCLUDED.air_date,
-			runtime = EXCLUDED.runtime,
 			rating_imdb = EXCLUDED.rating_imdb,
 			rating_tmdb = EXCLUDED.rating_tmdb,
 			imdb_id = COALESCE(NULLIF(EXCLUDED.imdb_id, ''), episodes.imdb_id),
@@ -764,11 +763,8 @@ func (r *EpisodeRepository) bulkUpsertOnce(ctx context.Context, seriesID string,
 	)
 	ON CONFLICT (series_id, season_number, episode_number) DO UPDATE SET
 		season_id = COALESCE(EXCLUDED.season_id, episodes.season_id),
-		title = EXCLUDED.title,
+		` + episodeLockableAssignments + `,
 		default_metadata_language = COALESCE(NULLIF(EXCLUDED.default_metadata_language, ''), episodes.default_metadata_language),
-		overview = EXCLUDED.overview,
-		air_date = EXCLUDED.air_date,
-		runtime = EXCLUDED.runtime,
 		rating_imdb = EXCLUDED.rating_imdb,
 		rating_tmdb = EXCLUDED.rating_tmdb,
 		imdb_id = COALESCE(NULLIF(EXCLUDED.imdb_id, ''), episodes.imdb_id),
@@ -1484,6 +1480,11 @@ func (r *EpisodeRepository) UpdateMetadata(ctx context.Context, contentID string
 
 	addString("title", upd.Title)
 	addString("overview", upd.Overview)
+	if upd.LockedFields != nil {
+		setClauses = append(setClauses, fmt.Sprintf("locked_fields = $%d", argIdx))
+		args = append(args, lockableFields(*upd.LockedFields, episodeLockedColumns))
+		argIdx++
+	}
 	addInt("episode_number", upd.EpisodeNumber)
 	addInt("season_number", upd.SeasonNumber)
 	addString("air_date", upd.AirDate)

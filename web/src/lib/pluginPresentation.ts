@@ -1,3 +1,4 @@
+import type { MessageKey } from "@/locales/keys";
 import type { PluginCapability, PluginInstallation, PluginPresentation } from "@/api/types";
 import { capabilityKind } from "@/lib/pluginCapabilities";
 
@@ -79,6 +80,8 @@ export function configPanelId(key: string): string {
 export interface CatalogGroup {
   kind: PluginSourceKind;
   title: string;
+  /** Catalog message for the section heading, formatted where it renders. */
+  titleKey: MessageKey;
   matches: (sourceKind: string) => boolean;
 }
 
@@ -86,16 +89,19 @@ export const CATALOG_GROUPS: readonly CatalogGroup[] = [
   {
     kind: "vio",
     title: "Silo maintained",
+    titleKey: "web.admin.plugins.catalog.groupSilo",
     matches: (sourceKind: string) => sourceKind === "vio" || sourceKind === "silo",
   },
   {
     kind: "approved_community",
     title: "Approved community",
+    titleKey: "web.admin.plugins.catalog.groupApprovedCommunity",
     matches: (sourceKind: string) => sourceKind === "approved_community",
   },
   {
     kind: "external",
     title: "Other sources",
+    titleKey: "web.admin.plugins.catalog.groupExternal",
     matches: (sourceKind: string) =>
       sourceKind !== "vio" && sourceKind !== "silo" && sourceKind !== "approved_community",
   },

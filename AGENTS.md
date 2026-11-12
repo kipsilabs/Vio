@@ -64,9 +64,8 @@ server-side (`watchstate`, `userdb`, `settingsresolve`).
 - **Session** — ambiguous; always say which: playback session (`internal/playback`) or login
   session (`internal/auth`).
 - **jellycompat vs the native API** — jellycompat is the Jellyfin-protocol surface for ecosystem
-  clients; "the API" means Silo's native surface, which spans `/api/v1` (the frozen alpha
-  contract, served through the pre-1.0 bridge window) and `/api/v2` (the stable 1.0 target and the
-  native API going forward). See "API contract rules" below.
+  clients; "the API" means Silo's native surface, `/api/v2`. The alpha `/api/v1` contract is
+  retired. See "API contract rules" below.
 
 ## Priorities
 
@@ -213,7 +212,7 @@ check, or lint would catch. Most changes need no new test, and some should delet
   (`/api/v2`, jellycompat, the plugin protocol), failure handling, and logic with real edge cases,
   and when fixing a bug in one of those.
 - Don't test small changes, UI layout or copy, pass-through wiring, constants and defaults, or
-  frozen `/api/v1` behavior beyond its own authorization checks.
+  the retired `/api/v1` tombstones beyond `internal/api/v1_tombstone_test.go`.
 - Test each behavior once, in the package that owns it. Prefer a new table row to a new test, and a
   new test to a new file. Delete tests your change makes redundant.
 - Don't write tests that match strings in source, CSS, or docs files, or that only check a fake
@@ -258,24 +257,19 @@ Run a final readability pass on other human-facing documents and status updates.
 
 ## API contract rules
 
-`/api/v2` is Silo's first stable native API and locks with Silo 1.0. `/api/v1` is a frozen alpha
-contract: it is carried unchanged through at least two published pre-1.0 bridge releases.
-Retirement requires a separate maintainer decision tracked in issue #886, after which the main
-API listener answers the `/api/v1` business routes with a
-`410 Gone` tombstone carrying the `client_upgrade_required` problem code. The decision, the
-shared wire conventions, and the release gates live in
-[docs/architecture/api-contract.md](docs/architecture/api-contract.md); that document is the
+`/api/v2` is Silo's native API and locks with Silo 1.0. The alpha `/api/v1` contract is retired:
+on the main API listener every `/api/v1` route answers a `410 Gone` tombstone carrying
+`client_upgrade_required`, except the retained `GET /api/v1/health` and `GET /api/v1/ready`
+probes. Do not add routes under `/api/v1`. The shared wire conventions and the release gates live
+in [docs/architecture/api-contract.md](docs/architecture/api-contract.md); that document is the
 authority and this section is only the summary. Program tracking: issue #135.
 
 What that means for a change today:
 
-- V1 feature development is frozen. Only critical fixes that keep the bridge usable land on
-  `/api/v1`; new contract work targets `/api/v2`.
-- A client-visible change during the bridge still needs coordination with `silo-apple` and
-  `silo-android`.
-- V1 removals taken during alpha stay recorded in the pre-lock removals table in
-  [docs/architecture/v1-scope.md](docs/architecture/v1-scope.md), which remains the historical
-  record for them.
+- New contract work targets `/api/v2`, and a client-visible change still needs coordination with
+  `silo-apple` and `silo-android`.
+- [docs/architecture/v1-scope.md](docs/architecture/v1-scope.md) stays the historical record of
+  the alpha contract and its removals.
 
 At the 1.0 lock the additive-only rules bind `/api/v2`:
 
