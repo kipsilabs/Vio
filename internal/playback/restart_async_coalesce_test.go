@@ -3,6 +3,7 @@ package playback
 import (
 	"context"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -226,6 +227,12 @@ func TestRestartSegmentAsyncFollowsAReplanSuccessor(t *testing.T) {
 	if len(seeks) != 1 {
 		t.Fatalf("successor applied seeks = %v, want exactly one restart at the seek target", seeks)
 	}
+	// The adopted restart is the seek's, not the replan's anchor: the successor
+	// now names segment 345 and would seek FFmpeg to 690s.
+	if opts := successor.Opts(); opts.StartSegmentNumber != 345 || math.Abs(opts.SeekSeconds-690) > 1e-9 {
+		t.Fatalf("successor position = segment %d at %.3fs, want segment 345 at 690s",
+			opts.StartSegmentNumber, opts.SeekSeconds)
+	}
 	if seeks := readSeekLog(t, predecessorLog); len(seeks) != 0 {
 		t.Fatalf("superseded generation applied seeks = %v, want none", seeks)
 	}
@@ -257,6 +264,162 @@ func TestRestartSegmentAsyncSkipsSuccessorAlreadyAtTheSeekTarget(t *testing.T) {
 
 	if seeks := readSeekLog(t, successorLog); len(seeks) != 0 {
 		t.Fatalf("successor applied seeks = %v, want none: it already starts at the target", seeks)
+	}
+	// Not rebuilding also means the successor keeps its own position instead of
+	// being moved back to the older request.
+	if opts := successor.Opts(); opts.StartSegmentNumber != 345 || math.Abs(opts.SeekSeconds-690) > 1e-9 {
+		t.Fatalf("successor position = segment %d at %.3fs, want its own segment 345 at 690s",
+			opts.StartSegmentNumber, opts.SeekSeconds)
+	}
+}
+
+// TestRestartSegmentAsyncStopsAtTheAdoptionBound pins the replan-storm bound: a
+// queued far-seek restart follows successor generations, but only
+// maxAsyncRestartSuccessors of them. Each successor below is replaced while the
+// restart is still inside its spawn window, so the worker never completes a
+// restart and the final generation is left to the client's next request. The
+// worker must terminate at the bound, leave the live generation unpoisoned, and
+// still let a later request apply the seek it dropped.
+func TestRestartSegmentAsyncStopsAtTheAdoptionBound(t *testing.T) {
+	const sid = "sess-async"
+	m := NewTranscodeManager()
+	newGeneration := func(name string) (*TranscodeSession, string) {
+		logPath := filepath.Join(t.TempDir(), name+".log")
+		s := newAsyncRestartTestSession(t, logPath)
+		s.opts.StartSegmentNumber = 45
+		s.opts.SeekSeconds = 90
+		return s, logPath
+	}
+	predecessor, predecessorLog := newGeneration("predecessor")
+	first, firstLog := newGeneration("successor-1")
+	second, secondLog := newGeneration("successor-2")
+	live, liveLog := newGeneration("successor-3")
+	m.RegisterTranscodeSession(sid, predecessor)
+	t.Cleanup(func() {
+		for _, s := range []*TranscodeSession{predecessor, first, second, live} {
+			_ = s.Close()
+		}
+	})
+
+	// Block each successor's restart in the input refresh, which runs while the
+	// session lifecycle lock is held. Swapping the live generation there is the
+	// replan storm: the restart wakes to a generation that is no longer live.
+	blockRestart := func(s *TranscodeSession) (entered <-chan struct{}, release chan<- struct{}) {
+		in := make(chan struct{})
+		out := make(chan struct{})
+		var once sync.Once
+		s.opts.RefreshInput = func(context.Context) (string, func(), error) {
+			once.Do(func() { close(in) })
+			<-out
+			return "/media/movie.mkv", nil, nil
+		}
+		return in, out
+	}
+	firstEntered, releaseFirst := blockRestart(first)
+	secondEntered, releaseSecond := blockRestart(second)
+	waitEntered := func(entered <-chan struct{}, which string) {
+		t.Helper()
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s restart did not reach its spawn window", which)
+		}
+	}
+
+	// Queue the seek on the predecessor, then let the first replan replace it.
+	release := m.LockSessionLifecycle(sid)
+	m.RestartSegmentAsync(sid, predecessor, 345)
+	m.asyncRestartMu.Lock()
+	pending := m.asyncRestarts[sid]
+	m.asyncRestartMu.Unlock()
+	if pending == nil {
+		t.Fatal("no coalescing entry was created for the queued seek")
+	}
+	m.SwapTranscodeSession(sid, first)
+	release()
+
+	waitEntered(firstEntered, "first successor")
+	m.SwapTranscodeSession(sid, second)
+	close(releaseFirst)
+
+	waitEntered(secondEntered, "second successor")
+	m.SwapTranscodeSession(sid, live)
+	close(releaseSecond)
+
+	// Terminating is the bound: nothing may hold the session in a restart loop.
+	waitAsyncRestartsDrained(t, m, sid)
+
+	pending.mu.Lock()
+	adoptions := pending.adoptions
+	adopted := pending.ts
+	pending.mu.Unlock()
+	if adoptions != maxAsyncRestartSuccessors {
+		t.Fatalf("worker adopted %d successors, want exactly %d", adoptions, maxAsyncRestartSuccessors)
+	}
+	if adopted != second {
+		t.Fatalf("worker stopped on %p, want the last successor it was allowed to adopt (%p)", adopted, second)
+	}
+	if got := m.GetTranscodeSession(sid); got != live {
+		t.Fatalf("live generation = %p, want the storm's final successor %p", got, live)
+	}
+	// The bound is a documented teardown, not a failure verdict: neither the
+	// generation the worker stopped on nor the live successor may be poisoned.
+	for name, s := range map[string]*TranscodeSession{
+		"predecessor": predecessor, "successor-1": first, "successor-2": second, "successor-3": live,
+	} {
+		if got := s.AsyncRestartFailure(); got != nil {
+			t.Fatalf("%s latched a failure after a superseded teardown: %v", name, got)
+		}
+	}
+	// None of the storm's restarts completed: each was superseded before its
+	// process spawned, so no generation moved.
+	for name, logPath := range map[string]string{
+		"predecessor": predecessorLog, "successor-1": firstLog, "successor-2": secondLog, "successor-3": liveLog,
+	} {
+		if seeks := readSeekLog(t, logPath); len(seeks) != 0 {
+			t.Fatalf("%s applied seeks = %v after the bound, want none", name, seeks)
+		}
+	}
+	// The dropped seek is not lost to the live generation: the next request for
+	// the same segment still starts it at the seek target.
+	if _, ok, err := m.RestartSegmentLocked(context.Background(), sid, live, 345); err != nil || !ok {
+		t.Fatalf("live generation could not apply the queued seek after the bound: ok=%v err=%v", ok, err)
+	}
+	if seeks := waitSeekLogLast(t, liveLog, "690.000"); len(seeks) != 1 {
+		t.Fatalf("live generation applied seeks = %v, want one restart at the seek target", seeks)
+	}
+}
+
+// TestFollowAsyncRestartSuccessorIgnoresAReplacedEntry pins the entry-identity
+// check: when a newer request has replaced this worker's coalescing entry, that
+// request's worker owns the successor. Adopting here would restart the same
+// generation twice and could move FFmpeg back to this worker's older target.
+func TestFollowAsyncRestartSuccessorIgnoresAReplacedEntry(t *testing.T) {
+	const sid = "sess-async"
+	m := NewTranscodeManager()
+	predecessor := newAsyncRestartTestSession(t, filepath.Join(t.TempDir(), "predecessor.log"))
+	successor := newAsyncRestartTestSession(t, filepath.Join(t.TempDir(), "successor.log"))
+	successor.opts.StartSegmentNumber = 45
+	successor.opts.SeekSeconds = 90
+	m.RegisterTranscodeSession(sid, successor)
+	t.Cleanup(func() {
+		_ = predecessor.Close()
+		_ = successor.Close()
+	})
+
+	stale := &pendingAsyncRestart{ts: predecessor, segNum: 345}
+	newer := &pendingAsyncRestart{ts: successor, segNum: 20}
+	m.asyncRestarts = map[string]*pendingAsyncRestart{sid: newer}
+
+	if m.followAsyncRestartSuccessor(sid, stale, predecessor) {
+		t.Fatal("a worker whose coalescing entry was replaced adopted the successor")
+	}
+	if stale.adoptions != 0 || stale.ts != predecessor {
+		t.Fatalf("stale worker adoptions = %d on %p, want 0 on the predecessor %p",
+			stale.adoptions, stale.ts, predecessor)
+	}
+	if m.asyncRestarts[sid] != newer {
+		t.Fatal("the stale worker changed the newer worker's coalescing entry")
 	}
 }
 
