@@ -31,7 +31,8 @@ func virtualMetadataUpdateTestPool(t *testing.T) *pgxpool.Pool {
 	if err := pool.QueryRow(ctx, "SELECT current_database()").Scan(&databaseName); err != nil {
 		t.Fatalf("identify test database: %v", err)
 	}
-	if !strings.Contains(strings.ToLower(databaseName), "test") && !strings.Contains(strings.ToLower(databaseName), "purge") {
+	lowerName := strings.ToLower(databaseName)
+	if !strings.HasPrefix(lowerName, "dbpins_") && !strings.Contains(lowerName, "test") && !strings.Contains(lowerName, "purge") {
 		t.Fatalf("refusing destructive handler fixture database %q", databaseName)
 	}
 	lockConn, err := pool.Acquire(ctx)
