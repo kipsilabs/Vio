@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -545,6 +546,56 @@ func TestCopySeekAnchorAttemptBudgetReservesTheRetry(t *testing.T) {
 	budget, reserved, remaining := copySeekAnchorAttemptBudget(context.Background(), 7*time.Second, true)
 	if budget != 7*time.Second || !reserved || remaining != 0 {
 		t.Fatalf("budget = %v reserved = %v remaining = %v, want the unbounded adaptive budget", budget, reserved, remaining)
+	}
+}
+
+// TestPrepareTransportTimelineRetryEndingOnADeadlineStaysRetryable proves a
+// retry that ends with a deadline error while its own probe context is still
+// live — the shape of a probe that inherited a spent flight — is classified as
+// our budget expiring, not as a verdict against the release. The player gets a
+// retryable seek error it can retry instead of a terminal that leaves it
+// reconnecting.
+func TestPrepareTransportTimelineRetryEndingOnADeadlineStaysRetryable(t *testing.T) {
+	previousFloor, previousMargin := copySeekAnchorSeekResolveTimeout, copySeekProbeRetryMargin
+	copySeekAnchorSeekResolveTimeout, copySeekProbeRetryMargin = 100*time.Millisecond, 100*time.Millisecond
+	defer func() {
+		copySeekAnchorSeekResolveTimeout, copySeekProbeRetryMargin = previousFloor, previousMargin
+	}()
+
+	const ownerInstallationID = 42
+	clearVirtualProviderLinkLatency(t, "42")
+	handler, file, session, plan := slowLinkAnchorFixture(t, ownerInstallationID)
+
+	callerCtx, callerCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer callerCancel()
+
+	var probes atomic.Int32
+	handler.copySeekAnchor = func(ctx context.Context, _ string, _ string, _ float64, _ int) (float64, int, error) {
+		if probes.Add(1) == 1 {
+			// The first attempt spends its own window and answers its deadline.
+			<-ctx.Done()
+			return 0, 0, ctx.Err()
+		}
+		// The retry inherits a probe that already timed out: a deadline error
+		// arrives while this attempt's own context still has time left.
+		if ctx.Err() != nil {
+			t.Errorf("retry probe context was already done")
+		}
+		return 0, 0, fmt.Errorf("resolve copy seek anchor: ffmpeg failed: resolve copy seek anchor: probe interrupted: %w", context.DeadlineExceeded)
+	}
+
+	_, transportErr := handler.prepareTransportTimelineV3(callerCtx, session, file, playback.PlannerResultV3{Plan: plan, PlayMethod: playback.PlayRemux})
+	if transportErr == nil {
+		t.Fatal("a retry that ended on a deadline produced a timeline, want the retryable seek error")
+	}
+	if !transportErr.retryable || !transportErr.seekFailure {
+		t.Fatalf("transport error = %#v, want the retryable seek error instead of a terminal", transportErr)
+	}
+	if transportErr.reason != transcodeStartFailedReasonV3 {
+		t.Fatalf("transport reason = %q, want %q", transportErr.reason, transcodeStartFailedReasonV3)
+	}
+	if got := probes.Load(); got != 2 {
+		t.Fatalf("anchor probes = %d, want the timed-out attempt and its retry", got)
 	}
 }
 

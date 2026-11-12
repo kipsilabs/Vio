@@ -5255,8 +5255,22 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 					// share on one provider open.
 					probeCtx, probeCancel = capProbeToAttempt(probeCtx, probeCancel, attemptCtx)
 				}
+				if attempt > 1 {
+					// A retry must open the provider under its own budget
+					// instead of joining the first attempt's spent flight: that
+					// flight was started for the attempt whose budget just
+					// ended, and it answers that attempt's timeout.
+					probeCtx = playback.WithCopySeekAnchorRetryFlight(probeCtx)
+				}
 				origin, startSegment, err = probeAnchor(probeCtx)
-				anchorBudgetElapsed = err != nil && probeCtx.Err() != nil && ctx.Err() == nil
+				// A deadline error with the caller still alive is this
+				// attempt's own budget expiring — or a shared probe whose
+				// budget did. It says the link is slow, not that the release
+				// failed, so it must stay a retryable seek error that does not
+				// rotate the release, even when this attempt's own probe
+				// context still has time left.
+				anchorBudgetElapsed = err != nil && ctx.Err() == nil &&
+					(probeCtx.Err() != nil || errors.Is(err, context.DeadlineExceeded))
 				probeCancel()
 				recordVirtualProviderLinkLatency(linkKey, time.Since(attemptStarted), time.Now())
 				if err == nil || ctx.Err() != nil || attempt == 2 {
