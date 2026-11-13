@@ -1,6 +1,8 @@
 package handlers
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -59,5 +61,46 @@ func TestWriteSubtitleRetryReportsCostAndCoverage(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), `"error":"`+playback.SubtitlePageTooCostlyReason+`"`) {
 		t.Fatalf("body = %q, want the page-cost problem code", rec.Body.String())
+	}
+}
+
+// An extraction that produced nothing must be told apart by cause, and never
+// answered as a plain failure when the cause is the source: the production run
+// turned a 120 s window extract timeout into a non-retryable 500, so the client
+// spent its four attempts and gave up on the track.
+func TestWriteSubtitleExtractFailureClassifiesByCause(t *testing.T) {
+	timeout := context.DeadlineExceeded
+	upstream := errors.New("ffmpeg subtitle stream failed: exit status 1 (stderr: Server returned 503 Service Unavailable)")
+	relayToken := errors.New("ffmpeg subtitle stream failed: exit status 1 (stderr: Server returned 404 Not Found) open http://127.0.0.1:9000/source/abc/stream.mkv")
+	broken := errors.New("ffmpeg subtitle stream failed: exit status 1 (stderr: Invalid data found when processing input)")
+
+	for _, tc := range []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantCode   string
+	}{
+		{name: "extract deadline", err: timeout, wantStatus: http.StatusServiceUnavailable, wantCode: "subtitle_source_unavailable"},
+		{name: "upstream 5xx", err: upstream, wantStatus: http.StatusServiceUnavailable, wantCode: "subtitle_source_unavailable"},
+		{name: "relay token lapsed", err: relayToken, wantStatus: http.StatusServiceUnavailable, wantCode: "subtitle_source_unavailable"},
+		{name: "real extraction failure", err: broken, wantStatus: http.StatusInternalServerError, wantCode: "subtitle_extract_failed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			rec.Header().Set(playback.SubtitleCoverageHeader, "600.000-720.000")
+			writeSubtitleExtractFailure(rec, tc.err, "http://127.0.0.1:9000/source/abc/stream.mkv")
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d", rec.Code, tc.wantStatus)
+			}
+			if !strings.Contains(rec.Body.String(), `"error":"`+tc.wantCode+`"`) {
+				t.Fatalf("body = %q, want %q", rec.Body.String(), tc.wantCode)
+			}
+			if got := rec.Header().Get(playback.SubtitleCoverageHeader); got != "" {
+				t.Fatalf("coverage = %q, want none on a failed extract", got)
+			}
+			if tc.wantStatus == http.StatusServiceUnavailable && rec.Header().Get("Retry-After") == "" {
+				t.Fatal("a retryable answer carries no Retry-After")
+			}
+		})
 	}
 }

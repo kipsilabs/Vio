@@ -162,3 +162,20 @@ func recordSubtitleWarmPageOverlap(format string, elapsed time.Duration) {
 func recordSubtitlePageTooCostly() {
 	subtitlePageCostRejections.WithLabelValues(subtitleFormatSUP).Inc()
 }
+
+// recordSubtitlePageCostRefused counts one windowed bitmap page refused before
+// its extract because the container prefix it would read was priced beyond the
+// page budget. It shares the rejection counter with the runtime read cap: both
+// answer the same way, and the split that matters is pages refused versus pages
+// served from the artifact.
+func recordSubtitlePageCostRefused() {
+	subtitlePageCostRejections.WithLabelValues(subtitleFormatSUP).Inc()
+}
+
+// recordSubtitlePageTimeout counts one windowed bitmap page that ran out the
+// window extract deadline before emitting a byte. It shares the rejection
+// counter with the read-budget kills: the page was not served, and the reason a
+// reader needs is that a page was refused rather than which guard fired.
+func recordSubtitlePageTimeout() {
+	subtitlePageCostRejections.WithLabelValues(subtitleFormatSUP).Inc()
+}

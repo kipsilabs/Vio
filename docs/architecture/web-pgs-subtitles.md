@@ -88,7 +88,10 @@ start is not blamed on it.
 A windowed PGS extract cannot seek a non-seekable relay, so ffmpeg reads the
 container from byte 0 and discards the prefix. A page at offset S therefore costs
 `(S + W) × bitrate`, not `W × bitrate`: a 120 s page of an 18.25 GB / 35 Mbps
-source is ~525 MB, which is also the window extraction timeout. Two rules follow.
+source is ~525 MB, which is also the window extraction timeout. What hurts is the
+prefix, and it is not only bytes: on a relay that answers the seek with range
+reads a page at 3600 s read under the byte cap and still took 88 s. Three rules
+follow.
 
 - One unbounded `.sup` demux runs per (source identity, track, format
   generation), single-flighted through the cache's warm slot and detached relay
@@ -99,15 +102,29 @@ source is ~525 MB, which is also the window extraction timeout. Two rules follow
   does not cover is answered with the retryable shape plus
   `X-Subtitle-Coverage`, never with a truncated run. A `.sup` fill flips into the
   committed whole-track entry when its extract reaches end of file.
-- A page extract that is still attempted over a remote source is capped at
-  256 MB of reads. On breach ffmpeg is killed and the page answers
-  `503 subtitle_page_too_costly` with `Retry-After`, which is the same retryable
-  shape a client already backs off from. A page refused that way also starts the
-  track's fill, since the artifact is what will serve it.
+- A bounded page that misses the cache starts that fill while the viewer is
+  playing. The fill is the page path — it produces the pages the client asks for
+  next — so it replaces the bounded window prefetch for bitmap pages. The
+  complete-track bitmap warm for any other request (a whole-track fetch, or an
+  open-ended window) stays paused-only. The fill is single-flighted, so a burst
+  of page requests starts exactly one.
+- Before a page reads its source, the server prices the prefix that read would
+  discard — `start × rate`, from the row's size and runtime or bitrate, and in
+  seconds from the rate this identity's extracts have measured. A page beyond
+  256 MB of prefix, or one whose prefix would take more than 45 s at the measured
+  rate, is refused before the extract with `503 subtitle_page_too_costly`,
+  `Retry-After` and `X-Subtitle-Coverage`, and that refusal starts the fill. An
+  opening page has no prefix and always extracts. A page extract that does run is
+  still capped at 256 MB of process reads; one killed that way, or one that runs
+  out the two-minute window extract deadline before emitting a byte, answers the
+  same retryable shape instead of a 500.
 
-Both apply only to a remote identity whose container size is known and at least
-256 MB. A text (WebVTT/SRT/ASS) window and a local file keep their existing
-paths.
+All of it applies only to a remote identity, and pricing only to one whose size
+and runtime (or bitrate) are known: an unpriceable page keeps its source extract
+rather than being refused for an assumption. A text (WebVTT/SRT/ASS) window and a
+local file keep their existing paths; a windowed text extract is held until it
+completes, so a slice cut short by the deadline or a canceled request is never
+served as a 200 with half a cue.
 
 ## Jellyfin compatibility
 

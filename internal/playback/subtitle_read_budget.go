@@ -49,16 +49,21 @@ const (
 // reads a local file, and a local source's prefix read is a disk read that
 // finishes in seconds rather than the relay read the cap exists for.
 func (o StreamExtractOpts) pageReadBudget() int64 {
-	if !IsPGS(o.SourceCodec) || o.InputIsExtractedSup || o.InputIsExtractedText != "" || o.Packets != nil {
-		return 0
-	}
-	if strings.TrimSpace(o.CacheIdentity) == "" {
-		return 0
-	}
-	if !o.windowSeekApplied() {
+	if !o.pageReadWatch() {
 		return 0
 	}
 	return subtitlePageReadBudgetBytes
+}
+
+// pageReadWatch reports whether this extract's own read count is worth watching.
+// It is the same set of extracts the cap applies to, minus the cap: the watcher
+// also measures the rate the source was read at, which prices the prefix of the
+// next page (see subtitle_page_cost.go).
+func (o StreamExtractOpts) pageReadWatch() bool {
+	if !o.bitmapPage() || !o.windowSeekApplied() {
+		return false
+	}
+	return true
 }
 
 // subtitleReadBudget watches how much an extract process has read and cancels
@@ -78,6 +83,10 @@ type subtitleReadBudget struct {
 
 	mu     sync.Mutex
 	breach int64
+	// last is the most recent read count sampled, kept so the extract's read
+	// rate can be measured once the process is reaped. It is the total bytes
+	// read so far, and the rate is that total over the elapsed time.
+	last int64
 }
 
 func newSubtitleReadBudget(pid int, limit int64) *subtitleReadBudget {
@@ -90,7 +99,8 @@ func newSubtitleReadBudget(pid int, limit int64) *subtitleReadBudget {
 }
 
 // watch samples the process until ctx ends or the cap is passed, then cancels
-// the process. Callers run it in its own goroutine.
+// the process. Callers run it in its own goroutine. A zero limit watches without
+// capping: the samples still measure the rate the source is read at.
 func (b *subtitleReadBudget) watch(ctx context.Context, cancel context.CancelFunc) {
 	ticker := time.NewTicker(b.interval)
 	defer ticker.Stop()
@@ -100,14 +110,20 @@ func (b *subtitleReadBudget) watch(ctx context.Context, cancel context.CancelFun
 			return
 		case <-ticker.C:
 			read, ok := b.read(b.pid)
-			if !ok || read <= b.limit {
+			if !ok {
 				continue
 			}
 			b.mu.Lock()
-			b.breach = read
+			b.last = read
+			breach := b.limit > 0 && read > b.limit
+			if breach {
+				b.breach = read
+			}
 			b.mu.Unlock()
-			cancel()
-			return
+			if breach {
+				cancel()
+				return
+			}
 		}
 	}
 }
@@ -121,6 +137,22 @@ func (b *subtitleReadBudget) exceeded() int64 {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.breach
+}
+
+// observedBytesPerSecond reports the rate the process read its input at, from
+// the last sampled count over the extract's elapsed time. ok is false when no
+// sample was taken or the counters never reported a read.
+func (b *subtitleReadBudget) observedBytesPerSecond(elapsed time.Duration) (float64, bool) {
+	if b == nil || elapsed <= 0 {
+		return 0, false
+	}
+	b.mu.Lock()
+	last := b.last
+	b.mu.Unlock()
+	if last <= 0 {
+		return 0, false
+	}
+	return float64(last) / elapsed.Seconds(), true
 }
 
 // readProcessReadBytes returns how many bytes the process has read, from its
@@ -148,14 +180,13 @@ func readProcessReadBytes(pid int) (int64, bool) {
 }
 
 // startPageReadBudget starts the read-budget watcher for a started extract and
-// returns the budget, or nil when no cap applies. The returned stop func must be
-// called once the process is reaped.
+// returns the budget, or nil when this extract's reads are not watched. The
+// returned stop func must be called once the process is reaped.
 func (o StreamExtractOpts) startPageReadBudget(ctx context.Context, pid int, cancel context.CancelFunc) (*subtitleReadBudget, func()) {
-	limit := o.pageReadBudget()
-	if limit <= 0 || pid <= 0 {
+	if !o.pageReadWatch() || pid <= 0 {
 		return nil, func() {}
 	}
-	budget := newSubtitleReadBudget(pid, limit)
+	budget := newSubtitleReadBudget(pid, o.pageReadBudget())
 	watchCtx, stop := context.WithCancel(ctx)
 	go budget.watch(watchCtx, cancel)
 	return budget, stop

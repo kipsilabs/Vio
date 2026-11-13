@@ -349,7 +349,12 @@ func (f *SubtitleCacheFill) serveWindow(w io.Writer, start, end float64) (writte
 // reading the source for it is exactly the cost this path exists to avoid.
 func (c *SubtitleCache) serveProgressiveSUPPage(w http.ResponseWriter, r *http.Request, opts StreamExtractOpts, extract SUPExtractFunc) (bool, error) {
 	start, end, bounded := progressiveSUPWindow(opts)
-	if !bounded || !progressiveSUPEligible(opts) {
+	// A track is answered from its artifact when a page read over its container
+	// is not worth attempting: a known-large container, or one whose page prefix
+	// is priced beyond the budget. The second half matters because a refusal
+	// starts the fill, and the pages it publishes must then be served from it
+	// even when the row never declared a size.
+	if !bounded || (!progressiveSUPEligible(opts) && !c.pagePrefixBeyondBudget(opts)) {
 		return false, nil
 	}
 	fill, covered := c.progressiveSUPArtifact(opts)

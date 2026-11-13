@@ -3848,6 +3848,12 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 		Embedded:        playback.EmbeddedSubtitleRefFor(file, embeddedIndex),
 		FFmpegPath:      h.ffmpegPath(),
 		SourceSizeBytes: file.FileSize,
+		// Size, runtime and bitrate are what price a bitmap page's discarded
+		// container prefix before it is read (see subtitle_page_cost.go). They
+		// come from the catalog row, so a relay page can be refused without
+		// opening the provider at all.
+		SourceDurationSeconds: float64(file.Duration),
+		SourceBitrateKbps:     file.Bitrate,
 	}
 	// Virtual sources are provider-neutral URIs, not FFmpeg inputs. Resolve
 	// through the relay so ffmpeg reads the real stream. Subtitle extraction
@@ -4122,18 +4128,7 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 			panic(http.ErrAbortHandler)
 		}
 		if !virtualActive || !playback.IsSubtitleStreamMapError(extractErr) {
-			if playback.IsSubtitleUpstreamError(extractErr) || isRelayTokenNotFoundError(extractErr, opts.InputPath) {
-				// The relay input 5xxed under ffmpeg, or our relay token
-				// lapsed mid-flight: the extraction command is fine and a
-				// retry (which re-resolves a fresh token) may succeed.
-				// Answer retryable rather than failed so the client keeps
-				// its backoff loop instead of spending its terminal budget.
-				clearSubtitleCoverageHeaders(w.Header())
-				writeSubtitleSourceUnavailable(w)
-				return
-			}
-			clearSubtitleCoverageHeaders(w.Header())
-			writeError(w, http.StatusInternalServerError, "subtitle_extract_failed", "Failed to extract subtitles")
+			writeSubtitleExtractFailure(w, extractErr, opts.InputPath)
 			return
 		}
 		// Post-spawn safety net: the plan ordinal named a subtitle stream the
@@ -4189,13 +4184,7 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 				writeSubtitleSourceChanged(w)
 				return
 			}
-			if playback.IsSubtitleUpstreamError(retryErr) || isRelayTokenNotFoundError(retryErr, opts.InputPath) {
-				clearSubtitleCoverageHeaders(w.Header())
-				writeSubtitleSourceUnavailable(w)
-				return
-			}
-			clearSubtitleCoverageHeaders(w.Header())
-			writeError(w, http.StatusInternalServerError, "subtitle_extract_failed", "Failed to extract subtitles")
+			writeSubtitleExtractFailure(w, retryErr, opts.InputPath)
 			return
 		}
 	}
@@ -4388,6 +4377,14 @@ func (h *StreamHandler) rememberVirtualSubtitleLayout(planKey string, opts playb
 // the start keeps the full-track shape, where that artifact is what the opening
 // playback actually reads.
 //
+// A bitmap (PGS) window is the exception: it is a page, and a page the source
+// could not serve cheaply is what the track's progressive artifact exists to
+// answer. That fill is the page path, not an opportunistic second read — it runs
+// even while the viewer is playing, and it replaces the bounded window prefetch,
+// which would re-read the source for pages the fill is publishing. A whole-track
+// bitmap request keeps the paused-only shape; only a bounded bitmap page routes
+// here (see bitmapPageWaitingForFill).
+//
 // The warm resolves and holds its own relay registration: the request's
 // registration is released when the request ends, which is exactly why the
 // cache's own detached warm is disabled for virtual inputs
@@ -4527,7 +4524,24 @@ func subtitleWarmHintMatchesPlanTrack(requested models.SubtitleTrack, planTracks
 }
 
 func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(file *models.MediaFile, track models.SubtitleTrack, session *playback.Session, opts playback.StreamExtractOpts, inherited *virtualSubtitleLayoutSeed, virtualActive bool, requestID string) {
-	h.warmVirtualSubtitle(file, track, session, opts, inherited, virtualActive, requestID, false)
+	// A bounded bitmap page is the case where the detached fill is the page
+	// path: no page extract produces the artifact the next page needs, and the
+	// client is already waiting on it. A whole-track bitmap request keeps the
+	// paused-only admission below.
+	h.warmVirtualSubtitle(file, track, session, opts, inherited, virtualActive, requestID, bitmapPageWaitingForFill(opts))
+}
+
+// bitmapPageWaitingForFill reports whether this request was a bounded bitmap
+// (PGS) page that read its source: the window the client plays next can only be
+// produced from the track's progressive artifact, so the fill is what it is
+// waiting on. A whole-track bitmap request is not a page and keeps the
+// paused-only full-track warm.
+func bitmapPageWaitingForFill(opts playback.StreamExtractOpts) bool {
+	if !playback.IsPGS(opts.SourceCodec) || !opts.AllowWindow {
+		return false
+	}
+	windowed, _, _, openEnded := opts.WindowCoverage()
+	return windowed && !openEnded
 }
 
 // warmVirtualSubtitleForWaitingPage starts the track's detached fill because a
@@ -5186,6 +5200,26 @@ func clearSubtitleCoverageHeaders(h http.Header) {
 func writeVirtualAudioSelectionInvalid(w http.ResponseWriter) {
 	writeError(w, http.StatusConflict, "audio_selection_invalid",
 		"The selected audio track is no longer available; replan and choose another")
+}
+
+// writeSubtitleExtractFailure answers an extraction that produced no response
+// bytes and is not a layout rotation.
+//
+// A source read that ran out its own extract deadline, an upstream 5xx under
+// ffmpeg, or a relay token that lapsed mid-flight are all the same shape from the
+// client's side: the extraction command is fine and a retry may succeed. They
+// answer the retryable 503 the client already backs off from, never a 500, so a
+// slow provider does not spend the client's terminal failure budget. Anything
+// else is a real extraction failure and stays loud.
+func writeSubtitleExtractFailure(w http.ResponseWriter, extractErr error, inputPath string) {
+	clearSubtitleCoverageHeaders(w.Header())
+	if errors.Is(extractErr, context.DeadlineExceeded) ||
+		playback.IsSubtitleUpstreamError(extractErr) ||
+		isRelayTokenNotFoundError(extractErr, inputPath) {
+		writeSubtitleSourceUnavailable(w)
+		return
+	}
+	writeError(w, http.StatusInternalServerError, "subtitle_extract_failed", "Failed to extract subtitles")
 }
 
 // writeSubtitleSourceChanged answers a clean retryable 4xx when a virtual
