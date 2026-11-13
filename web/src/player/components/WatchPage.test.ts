@@ -1309,6 +1309,39 @@ describe("WatchPage virtual version substitution notice", () => {
       ),
     ).toBeInTheDocument();
   });
+
+  it.each([
+    {
+      reason: "version_not_playable",
+      expected: "The chosen version could not be played, so Vio is playing 1080p H264 instead.",
+    },
+    {
+      // A reason this build does not know must keep the generic copy rather
+      // than render a cause the server never named.
+      reason: "some_future_reason",
+      expected: "The selected version wasn't available, so Vio is playing 1080p H264 instead.",
+    },
+  ])("renders the substitution notice for reason $reason", ({ reason, expected }) => {
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        plan: fixturePlanV3({
+          requested_media_file_id: 7,
+          effective_media_file_id: 8,
+          substituted_from_file_id: 7,
+          substitution_reason: reason,
+        }),
+      }),
+    );
+
+    render(
+      createElement(WatchPage, {
+        ...watchPageProps,
+        versions: [version, { ...version, file_id: 8 }],
+      }),
+    );
+
+    expect(screen.getByText(expected)).toBeInTheDocument();
+  });
 });
 
 describe("WatchPage effective virtual version", () => {
