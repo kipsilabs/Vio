@@ -375,6 +375,11 @@ func TestHandleStartPlaybackV3KeepsAnExplicitVersionPick(t *testing.T) {
 		if response.PlaybackPlan.EffectiveMediaFileID != alternate.ID {
 			t.Fatalf("effective file = %d, want the playable alternate %d", response.PlaybackPlan.EffectiveMediaFileID, alternate.ID)
 		}
+		// The auto fallback names its cause, so the client can say the picked
+		// version could not be played instead of that it disappeared.
+		if response.PlaybackPlan.SubstitutionReason != substitutionReasonVersionNotPlayableV3 {
+			t.Fatalf("substitution reason = %q, want %q", response.PlaybackPlan.SubstitutionReason, substitutionReasonVersionNotPlayableV3)
+		}
 		if response.PlaybackPlan.SubstitutedFromFileID != source.ID {
 			t.Fatalf("substituted_from_file_id = %d, want the requested row %d", response.PlaybackPlan.SubstitutedFromFileID, source.ID)
 		}

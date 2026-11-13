@@ -1535,7 +1535,9 @@ type PlanV3 struct {
 	SubstitutedFromFileID int `json:"substituted_from_file_id,omitempty"`
 	// SubstitutionReason is the machine-readable cause of a version
 	// substitution, present only with SubstitutedFromFileID: a dead release, a
-	// provider listing failure, a transport failure, or a decode rejection.
+	// provider listing failure, a transport failure, a decode rejection, or a
+	// release the planner cannot deliver to this client (an unplannable dynamic
+	// range, codec, or quality).
 	// The set is additive; clients treat an unknown value as a generic
 	// substitution rather than failing to render.
 	SubstitutionReason string `json:"substitution_reason,omitempty"`

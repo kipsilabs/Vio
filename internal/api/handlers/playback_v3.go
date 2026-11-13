@@ -152,7 +152,12 @@ const (
 	substitutionReasonListingFailedV3   = "listing_failed"
 	substitutionReasonTransportFailedV3 = "transport_failed"
 	substitutionReasonDecodeRejectedV3  = "decode_rejected"
-	substitutionReasonUnknownV3         = "unknown"
+	// substitutionReasonVersionNotPlayableV3 names a requested release the
+	// planner refused: the release exists and the provider lists it, but its
+	// dynamic range, codec, or quality cannot be delivered to this client. The
+	// auto fallback replaced it; an explicit pick refuses instead.
+	substitutionReasonVersionNotPlayableV3 = "version_not_playable"
+	substitutionReasonUnknownV3            = "unknown"
 	// Failed capability fetches are memoized briefly so an unreachable node
 	// costs one timeout per window instead of one per planning request.
 	v3NodeCapabilityErrorTTL = 15 * time.Second
@@ -2346,6 +2351,7 @@ func (h *PlaybackHandler) planStartV3(r *http.Request, req playback.StartRequest
 	}
 	huntAllowed := terminalAllowsAlternateFileV3(result.Terminal) ||
 		(subtitleDegradeUnresolved && subtitleOnlyTerminalV3(result.Terminal))
+	entryEffectiveFileID := effectiveFile.ID
 	if huntAllowed && startAllowsAlternateFileV3(req) { //nolint:nestif // existing alternate-version fallback; only its quality condition changed
 		accessFilter := requestAccessFilter(r)
 		alternateOrder := alternateOrderingForClient(req.Capabilities)
@@ -2510,7 +2516,15 @@ func (h *PlaybackHandler) planStartV3(r *http.Request, req playback.StartRequest
 			return *fallback, nil
 		}
 	}
-	return alternateCandidateV3{file: effectiveFile, request: req, audioIndex: audioIndex, result: result, toneMapErr: toneMapCapabilityErr}, warnings
+	// Name the hunt as the cause when it replaced the release this plan started
+	// with. The plan then publishes a specific substitution reason instead of the
+	// generic one, so the client's notice says the version could not be played
+	// rather than that it disappeared.
+	reason := ""
+	if effectiveFile != nil && effectiveFile.ID != entryEffectiveFileID {
+		reason = substitutionReasonVersionNotPlayableV3
+	}
+	return alternateCandidateV3{file: effectiveFile, request: req, audioIndex: audioIndex, result: result, toneMapErr: toneMapCapabilityErr, substitutionReason: reason}, warnings
 }
 
 // startAllowsAlternateFileV3 reports whether a fresh start may plan a sibling
@@ -2929,6 +2943,13 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	timings.mark("planning")
 	result := retryIncompleteToneMapPlanningV3(planned.result, planned.toneMapErr)
 	result = retryIncompletePlaybackSettingsV3(result, settingsErr)
+	// Carry the fallback's own cause onto whichever plan finally commits, so the
+	// plan can publish a specific substitution reason. publishSubstitutionFieldsV3
+	// keeps a reason already present on the plan, so this wins over the generic
+	// cause it would otherwise derive.
+	if planned.substitutionReason != "" && virtualDecision.substitutionReason == "" {
+		virtualDecision.substitutionReason = planned.substitutionReason
+	}
 	h.clarifyOriginalQuality4KTerminalV3(r.Context(), requestAccessFilter(r), result.Terminal, requestedFile, !shouldTryAlternateFileV3(req.QualityPreference))
 	hintExplicitSelectionAlternateAvailableV3(result.Terminal, req.FileSelection)
 	// The exact app identity is logged with every decision so a route or
@@ -3007,6 +3028,13 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	// byte-for-byte response they had before.
 	if deferredProbe != nil && result.Plan != nil && h.deferTrackInventoryNegotiatedV3(r, req) {
 		result.Plan.TracksPending = true
+	}
+	// Hand the substitution cause to the plan before the commit.
+	// publishSubstitutionFieldsV3 runs after the transport is prepared and only
+	// fills an empty reason, so this is what lets the wire carry the resolver's
+	// or the fallback's real cause instead of "unknown".
+	if result.Plan != nil && result.Plan.SubstitutionReason == "" {
+		result.Plan.SubstitutionReason = virtualDecision.substitutionReason
 	}
 	phasesCtx, phaseTimings := withTransportPhaseTimingsV3(r.Context())
 	response, statusErr := h.startPlannedPlaybackV3(r.WithContext(phasesCtx), userID, profileID, req, requestDigests, requestedFile, effectiveFile, audioIndex, intent, result, clientInfo)
@@ -3127,6 +3155,9 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 							// A transport failure moved the release: name the
 							// requested row and the cause on the plan.
 							alternateDecision.substitutionReason = substitutionReasonTransportFailedV3
+							if alternateResult.Plan != nil {
+								alternateResult.Plan.SubstitutionReason = alternateDecision.substitutionReason
+							}
 							// The alternate is a second commit with its own
 							// phases: install a fresh recorder and emit its
 							// phase line separately, so the walk is
@@ -13683,6 +13714,11 @@ type alternateCandidateV3 struct {
 	audioIndex int
 	result     playback.PlannerResultV3
 	toneMapErr error
+	// substitutionReason names why the returned file is not the one this plan
+	// started with, when the alternate-version hunt replaced it. Empty means the
+	// file is the entry file (or a caller-supplied substitution whose cause the
+	// caller already carries).
+	substitutionReason string
 }
 
 func replanAllowsAlternateFileV3(operation playback.ReplanOperationV3, qualityPreference string) bool {
