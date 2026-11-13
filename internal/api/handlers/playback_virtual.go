@@ -8256,7 +8256,21 @@ func mergeVirtualCandidateTracks(probed *models.MediaFile, candidate VirtualPlay
 		probed.CodecVideo = videoCodec
 	}
 	isDV, dvProfile := virtualDVMetadata(candidate.HDR)
-	isHDR := probed.HDR || candidate.HDR != ""
+	// A declared Dolby Vision label cannot apply to a measured codec that cannot
+	// carry a DV RPU (see playback.CodecCarriesDolbyVisionV3): an "H.264 DV"
+	// release is a mislabel. Trust the codec the probe measured and drop only the
+	// impossible part of the declaration, so an SDR file is not persisted as
+	// Dolby Vision and planned as a tone-mapped HDR transcode. A label that also
+	// names HDR10/HLG keeps that part; a DV-only label leaves no HDR claim.
+	declaredHDR := candidate.HDR
+	if isDV && videoCodec != "" && !playback.CodecCarriesDolbyVisionV3(videoCodec) {
+		isDV, dvProfile = false, 0
+		lower := strings.ToLower(declaredHDR)
+		if !strings.Contains(lower, "hdr10") && !strings.Contains(lower, "hlg") {
+			declaredHDR = ""
+		}
+	}
+	isHDR := probed.HDR || declaredHDR != ""
 	// The top-level HDR flag is observed evidence, not a declaration pad: it
 	// flips from the candidate's label only when the declaration describes
 	// tracks the merge will actually repaint. Flipping it while every probed
