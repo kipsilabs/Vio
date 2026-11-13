@@ -59,7 +59,6 @@ import {
   mergePlaybackInventory,
   usePlaybackInventoryMirror,
 } from "@/player/playbackInventoryMirror";
-import { isOverlayInventoryProvisional } from "@/player/utils/inventoryProvenance";
 import { cn } from "@/lib/utils";
 import AddToCollectionDialog from "@/components/AddToCollectionDialog";
 import { Button } from "@/components/ui/button";
@@ -520,26 +519,24 @@ export default function ActionBar({
       playerInventory,
     );
   }, [isCatalogProbed, isWatchProbed, playerInventory, selectedVersion, selectedWatchVersion]);
+  // Probe evidence is the only thing that makes these rows this version's own
+  // inventory. An unprobed virtual row carries a listing placeholder instead:
+  // one synthesized audio track (no language, the release's codec) and, at
+  // most, the subtitle languages parsed from the release name. Counting those
+  // rows as published showed a fabricated audio track and presented an
+  // unenumerated empty subtitle list as a verified "no subtitles", while the
+  // same version in the player offered the tracks the served file actually
+  // carries. A player inventory for this exact file is evidence too; it is
+  // only published for the row it describes (see playbackInventoryMirror).
   const audioRowsPublished =
-    Boolean(selectedWatchVersion?.probed_at) ||
-    Boolean(selectedVersion?.probed_at) ||
-    (selectedWatchVersion?.audio_tracks?.length ?? 0) > 0 ||
-    (playerInventory?.audioTracks.length ?? 0) > 0;
+    isWatchProbed || isCatalogProbed || (playerInventory?.audioTracks.length ?? 0) > 0;
   const subtitleRowsPublished =
-    Boolean(selectedWatchVersion?.probed_at) ||
-    Boolean(selectedVersion?.probed_at) ||
-    (selectedWatchVersion?.subtitle_tracks?.length ?? 0) > 0 ||
-    (playerInventory?.subtitleTracks.length ?? 0) > 0;
-  const audioInventoryProvisional = isOverlayInventoryProvisional(
-    false,
-    audioRowsPublished,
-    selectedVersionWithTracks?.audio_tracks?.length ?? 0,
-  );
-  const subtitleInventoryProvisional = isOverlayInventoryProvisional(
-    false,
-    subtitleRowsPublished,
-    selectedVersionWithTracks?.subtitle_tracks?.length ?? 0,
-  );
+    isWatchProbed || isCatalogProbed || (playerInventory?.subtitleTracks.length ?? 0) > 0;
+  // Without evidence the menu stays in discovery even when placeholder rows
+  // exist, so a fallback probe reads as unavailable rather than as an empty or
+  // one-track inventory.
+  const audioInventoryProvisional = !audioRowsPublished;
+  const subtitleInventoryProvisional = !subtitleRowsPublished;
   // The watch detail read is the page's discovery path: the server persists
   // probed tracks there. Retrying re-reads it for the selected file; Play stays
   // available throughout, so a slow probe never blocks starting playback.

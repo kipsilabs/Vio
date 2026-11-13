@@ -1,6 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { usePlayerConfig } from "../context/PlayerConfigContext";
-import { publishPlaybackInventory } from "../playbackInventoryMirror";
+import {
+  publishPlaybackInventory,
+  planInventoryDescribesRequestedFile,
+} from "../playbackInventoryMirror";
 import type { PlayerConfig } from "../context/PlayerConfigContext";
 import { startPlaybackV2 } from "../start-v2";
 import { hasSequencedProgress, stopSequencedSession } from "../session-mutations";
@@ -5273,13 +5276,20 @@ export function usePlaybackSession(
 
   // Mirror the player's authoritative menus for the item page. The page can be
   // unmounted while this hook is alive, so a module-level snapshot is the only
-  // carrier that survives the trip back from the player. Publish both the
-  // effective row and the requested row: a virtual rotation can move the
-  // effective file id while the media page still holds the viewer's selection.
+  // carrier that survives the trip back from the player. The plan's inventory
+  // is published under the effective file id it describes; the requested row
+  // gets it too only while the plan still serves that row, because a
+  // substituted (or lower-version) release's track table says nothing about the
+  // version the viewer selected.
   useEffect(() => {
-    const requestedFileId = planRef.current?.requested_media_file_id ?? null;
+    const plan = planRef.current;
+    const requestedFileId = plan?.requested_media_file_id ?? null;
     publishPlaybackInventory(state.mediaFileId, state.planAudioTracks, state.subtitleUrls);
-    if (requestedFileId && requestedFileId !== state.mediaFileId) {
+    if (
+      requestedFileId &&
+      requestedFileId !== state.mediaFileId &&
+      planInventoryDescribesRequestedFile(plan)
+    ) {
       publishPlaybackInventory(requestedFileId, state.planAudioTracks, state.subtitleUrls);
     }
   }, [state.mediaFileId, state.planAudioTracks, state.planRevision, state.subtitleUrls]);

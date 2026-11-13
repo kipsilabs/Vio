@@ -59,6 +59,7 @@ const selectedVersion: FileVersion = {
 
 const probedVersion: FileVersion = {
   ...selectedVersion,
+  probed_at: "2026-11-13T19:36:20Z",
   audio_tracks: [{ language: "eng", codec: "eac3", channels: 6, default: true }],
   subtitle_tracks: [
     { index: 0, language: "en", codec: "subrip", title: "English" },
@@ -156,7 +157,9 @@ describe("ActionBar pre-play track inventory", () => {
 
     const play = screen.getByRole("button", { name: /Play/ });
     expect(play).toBeEnabled();
-    expect(screen.getByText("Discovering…")).toBeTruthy();
+    // Both menus are still in discovery: the catalog lists are declared
+    // placeholders, not evidence for this file.
+    expect(screen.getAllByText("Discovering…").length).toBeGreaterThan(0);
 
     // The probe gates the menu rows only; starting playback never waits for it.
     fireEvent.click(play);
@@ -203,7 +206,23 @@ describe("ActionBar pre-play track inventory", () => {
     expect(screen.getByText("Discovering audio tracks…")).toBeTruthy();
   });
 
-  it("keeps the empty subtitle state for a version with no catalog rows at all", () => {
+  it("keeps the empty subtitle state for a probed version with no subtitles", () => {
+    const emptyProbedVersion: FileVersion = { ...probedVersion, subtitle_tracks: [] };
+    watchDetail.data = { versions: [emptyProbedVersion] };
+    renderActionBar({
+      versions: [emptyProbedVersion],
+      selectedVersion: emptyProbedVersion,
+    });
+
+    expect(screen.getByRole("button", { name: /Subs/ })).not.toHaveTextContent("Discovering…");
+    openPopover(/Subs/);
+    expect(screen.getByText("No subtitles available.")).toBeTruthy();
+    expect(screen.queryByText("Discovering subtitles…")).toBeNull();
+  });
+
+  it("does not report an unprobed empty inventory as no subtitles", () => {
+    // The selected version has no probe stamp, so an empty list is "not
+    // enumerated yet", not evidence the release carries no subtitles.
     watchDetail.data = { versions: [{ ...selectedVersion, subtitle_tracks: [] }] };
     const emptyVersion: FileVersion = { ...selectedVersion, subtitle_tracks: [] };
     renderActionBar({
@@ -211,9 +230,34 @@ describe("ActionBar pre-play track inventory", () => {
       selectedVersion: emptyVersion,
     });
 
-    expect(screen.getByRole("button", { name: /Subs/ })).not.toHaveTextContent("Discovering…");
+    expect(screen.getByRole("button", { name: /Subs/ })).toHaveTextContent("Discovering…");
     openPopover(/Subs/);
-    expect(screen.getByText("No subtitles available.")).toBeTruthy();
-    expect(screen.queryByText("Discovering subtitles…")).toBeNull();
+    expect(screen.getByText("Discovering subtitles…")).toBeTruthy();
+    expect(screen.queryByText("No subtitles available.")).toBeNull();
+  });
+
+  it("does not list the declared audio placeholder as a track", () => {
+    // A discovered virtual row carries one synthesized audio track from the
+    // release declaration. It is not a track the file was enumerated to carry.
+    watchDetail.data = { versions: [selectedVersion] };
+    renderActionBar();
+
+    expect(screen.getByRole("button", { name: /Audio/ })).toHaveTextContent("Discovering…");
+
+    openPopover(/Audio/);
+    expect(screen.getByText("Discovering audio tracks…")).toBeTruthy();
+    expect(screen.queryByText("Unknown")).toBeNull();
+    expect(screen.queryByText(/DTS-HD/)).toBeNull();
+  });
+
+  it("lists audio tracks once the watch detail carries a probe stamp", () => {
+    watchDetail.data = { versions: [probedVersion] };
+    renderActionBar({ versions: [probedVersion], selectedVersion: probedVersion });
+
+    expect(screen.getByRole("button", { name: /Audio/ })).toHaveTextContent("English");
+
+    openPopover(/Audio/);
+    expect(screen.getAllByText("English").length).toBeGreaterThan(0);
+    expect(screen.queryByText("Discovering audio tracks…")).toBeNull();
   });
 });
