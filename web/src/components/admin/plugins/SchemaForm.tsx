@@ -2,14 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 import { Loader2 } from "lucide-react";
 
-import { Link } from "react-router";
-
-import type {
-  Library,
-  PluginAdminForm,
-  PluginAdminFormField,
-  PluginAdminFormSection,
-} from "@/api/types";
+import type { PluginAdminForm, PluginAdminFormField, PluginAdminFormSection } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -23,9 +16,8 @@ import {
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
-import { useAdminLibraries } from "@/hooks/queries/admin/libraries";
+import { useT } from "@/i18n";
 
-import { libraryPickerOptions } from "./libraryPicker";
 import {
   effectiveValue,
   evaluateShowWhen,
@@ -63,39 +55,17 @@ type Props = {
   lockedKeys?: Readonly<Record<string, string>>;
 };
 
-const EMPTY_LIBRARIES: Library[] = [];
 const NO_HIDDEN_KEYS: readonly string[] = [];
 const NO_LOCKED_KEYS: Readonly<Record<string, string>> = {};
 
 function optionsFor(
   field: PluginAdminFormField,
   dynamicOptions: Record<string, SchemaOption[]> | undefined,
-  libraries: readonly Library[],
 ): SchemaOption[] {
-  if (field.library_picker) {
-    return libraryPickerOptions(field.library_picker, libraries);
-  }
   if (field.dynamic_options) {
     return dynamicOptions?.[field.key] ?? field.options ?? [];
   }
   return field.options ?? [];
-}
-
-// A saved library id can outlive the library it names (deleted, renamed out of
-// scope, disabled) and the library list may not have loaded yet. Keep the
-// current value as its own option so the select never renders blank and the
-// operator sees exactly what a save would submit.
-function withCurrentLibraryOption(
-  field: PluginAdminFormField,
-  options: SchemaOption[],
-  values: Record<string, unknown>,
-): SchemaOption[] {
-  if (!field.library_picker) return options;
-  const current = effectiveValue(field, values);
-  if (current === undefined || current === null) return options;
-  const value = String(current);
-  if (value.trim() === "" || options.some((option) => option.value === value)) return options;
-  return [...options, { value, label: `${value} (not found)` }];
 }
 
 // A dynamic control is "pending" only when we're probing AND have nothing to
@@ -130,53 +100,7 @@ function SelectSkeleton() {
 // label — shared so the markup can't drift between the field/switch/section
 // renderers.
 function FieldDescription({ text }: { text?: string }) {
-  if (!text) return null;
-
-  const linkRegex = /\[([^\]]+)\]\(([^)]+)\)/g;
-  const parts: React.ReactNode[] = [];
-  let lastIndex = 0;
-  let match: RegExpExecArray | null;
-
-  while ((match = linkRegex.exec(text)) !== null) {
-    if (match.index > lastIndex) {
-      parts.push(text.substring(lastIndex, match.index));
-    }
-    const label = match[1] ?? "";
-    const url = match[2] ?? "";
-    if (url.startsWith("/")) {
-      parts.push(
-        <Link
-          key={match.index}
-          to={url}
-          className="text-primary font-medium underline underline-offset-2 hover:opacity-80"
-        >
-          {label}
-        </Link>,
-      );
-    } else {
-      parts.push(
-        <a
-          key={match.index}
-          href={url}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="text-primary font-medium underline underline-offset-2 hover:opacity-80"
-        >
-          {label}
-        </a>,
-      );
-    }
-    lastIndex = match.index + match[0].length;
-  }
-  if (lastIndex < text.length) {
-    parts.push(text.substring(lastIndex));
-  }
-
-  return (
-    <p className="text-muted-foreground text-xs leading-relaxed">
-      {parts.length > 0 ? parts : text}
-    </p>
-  );
+  return text ? <p className="text-muted-foreground text-xs leading-relaxed">{text}</p> : null;
 }
 
 // Loading placeholder for a dynamic MULTI_SELECT (tags): a few shimmer chips.
@@ -207,6 +131,7 @@ function SchemaFormSection({
 }) {
   // null = operator hasn't toggled; fall back to collapsed_default. forceOpen
   // (the section has unresolved errors) always wins so setup can't be hidden.
+  const t = useT();
   const [userOpen, setUserOpen] = useState<boolean | null>(null);
 
   if (!evaluateShowWhen(section.show_when, values, fields)) {
@@ -226,7 +151,7 @@ function SchemaFormSection({
         </div>
         {collapsible ? (
           <Button type="button" size="xs" variant="ghost" onClick={() => setUserOpen(!open)}>
-            {open ? "Hide" : "Show"}
+            {open ? t("web.common.schemaForm.hideSection") : t("web.common.schemaForm.showSection")}
           </Button>
         ) : null}
       </div>
@@ -248,13 +173,7 @@ export function SchemaForm({
   expandSections = false,
   lockedKeys = NO_LOCKED_KEYS,
 }: Props) {
-  // /api/v2/libraries is admin-gated and SchemaForm renders on user-facing
-  // pages too, so only ask for the library list when a picker needs it.
-  const hasLibraryPicker = useMemo(
-    () => descriptor.fields.some((field) => field.library_picker),
-    [descriptor.fields],
-  );
-  const libraries = useAdminLibraries({ enabled: hasLibraryPicker }).data ?? EMPTY_LIBRARIES;
+  const t = useT();
   const hidden = useMemo(() => new Set(hiddenKeys), [hiddenKeys]);
   const byKey = useMemo(() => {
     const map = new Map<string, PluginAdminFormField>();
@@ -265,10 +184,10 @@ export function SchemaForm({
   }, [descriptor.fields, hidden]);
 
   const clientErrors = useMemo(() => {
-    const all = validateSchemaValues(descriptor, values);
+    const all = validateSchemaValues(descriptor, values, t);
     if (hidden.size === 0) return all;
     return Object.fromEntries(Object.entries(all).filter(([key]) => !hidden.has(key)));
-  }, [descriptor, values, hidden]);
+  }, [descriptor, values, hidden, t]);
 
   const mergedErrors = useMemo(() => {
     return { ...clientErrors, ...(errors ?? {}) };
@@ -316,11 +235,7 @@ export function SchemaForm({
     const describedBy = locked ? lockNoteId(field) : undefined;
 
     if (field.control === "SELECT") {
-      const options = withCurrentLibraryOption(
-        field,
-        optionsFor(field, dynamicOptions, libraries),
-        values,
-      );
+      const options = optionsFor(field, dynamicOptions);
       if (isPending(field, options, optionsLoading)) {
         return <SelectSkeleton />;
       }
@@ -339,7 +254,9 @@ export function SchemaForm({
           disabled={locked}
         >
           <SelectTrigger id={id} className="w-full" aria-describedby={describedBy}>
-            <SelectValue placeholder={field.placeholder || "Select"} />
+            <SelectValue
+              placeholder={field.placeholder || t("web.common.schemaForm.selectPlaceholder")}
+            />
           </SelectTrigger>
           <SelectContent>
             {options.map((option) => (
@@ -353,7 +270,7 @@ export function SchemaForm({
     }
 
     if (field.control === "MULTI_SELECT") {
-      const options = optionsFor(field, dynamicOptions, libraries);
+      const options = optionsFor(field, dynamicOptions);
       if (isPending(field, options, optionsLoading)) {
         return <ChipsSkeleton />;
       }
@@ -362,7 +279,7 @@ export function SchemaForm({
       if (options.length === 0) {
         return (
           <p className="text-muted-foreground rounded-md border border-dashed px-3 py-2 text-xs">
-            No options available.
+            {t("web.common.schemaForm.noOptions")}
           </p>
         );
       }
@@ -393,7 +310,7 @@ export function SchemaForm({
       );
     }
 
-    if (field.multiline || field.control === "TEXTAREA") {
+    if (field.control === "TEXTAREA" || field.multiline) {
       return (
         <textarea
           id={id}
@@ -401,9 +318,6 @@ export function SchemaForm({
           rows={field.rows && field.rows > 0 ? field.rows : 4}
           value={String(effectiveValue(field, values) ?? "")}
           placeholder={field.placeholder}
-          autoComplete="off"
-          data-1p-ignore="true"
-          data-bwignore="true"
           onChange={(event) => setField(field.key, event.target.value)}
           disabled={locked}
           aria-describedby={describedBy}
@@ -411,16 +325,18 @@ export function SchemaForm({
       );
     }
 
-    const isSecretOrPassword = field.control === "PASSWORD" || field.secret;
     return (
       <Input
         id={id}
         disabled={locked}
         aria-describedby={describedBy}
-        type={isSecretOrPassword ? "password" : field.control === "NUMBER" ? "number" : "text"}
-        autoComplete={isSecretOrPassword ? "new-password" : "off"}
-        data-1p-ignore="true"
-        data-bwignore="true"
+        type={
+          field.control === "PASSWORD" || field.secret
+            ? "password"
+            : field.control === "NUMBER"
+              ? "number"
+              : "text"
+        }
         value={String(effectiveValue(field, values) ?? "")}
         placeholder={field.placeholder}
         onChange={(event) => setField(field.key, event.target.value)}
@@ -438,7 +354,7 @@ export function SchemaForm({
       <div
         key={field.key}
         data-nested={nested ? "true" : undefined}
-        className={cn("space-y-2", nested && "border-border/60 ml-0.5 border-l pl-3")}
+        className={cn("space-y-2", nested && "border-border/60 ms-0.5 border-s ps-3")}
       >
         <div className="space-y-1">
           <Label htmlFor={`${idPrefix}-${field.key}`}>{field.label || field.key}</Label>
@@ -451,8 +367,8 @@ export function SchemaForm({
     );
   }
 
-  // A switch field as a single settings row: label + description on the left,
-  // the toggle on the right. No outer border — the group container owns it.
+  // A switch field as a single settings row: label + description at the start,
+  // the toggle at the end. No outer border — the group container owns it.
   function renderSwitchRow(field: PluginAdminFormField): React.ReactNode {
     const id = `${idPrefix}-${field.key}`;
     const err = mergedErrors[field.key];
@@ -475,7 +391,7 @@ export function SchemaForm({
             {renderLockNote(field)}
           </div>
         </div>
-        {err ? <p className="text-destructive mt-1.5 ml-11 text-xs">{err}</p> : null}
+        {err ? <p className="text-destructive ms-11 mt-1.5 text-xs">{err}</p> : null}
       </div>
     );
   }

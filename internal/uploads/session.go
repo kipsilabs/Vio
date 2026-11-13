@@ -159,10 +159,6 @@ func NewManager(opts ManagerOptions) *Manager {
 	}
 }
 
-func (m *Manager) MaxChunkSize() int64 {
-	return m.maxChunkSize
-}
-
 func (m *Manager) Create(req CreateRequest) (SessionInfo, error) {
 	filename := filepath.Base(strings.TrimSpace(req.Filename))
 	if filename == "." || filename == string(filepath.Separator) || filename == "" {
@@ -665,4 +661,13 @@ func newID() (string, error) {
 		return "", fmt.Errorf("generate upload session id: %w", err)
 	}
 	return hex.EncodeToString(b[:]), nil
+}
+
+// MaxChunkSize reports the largest chunk a request body may carry for one
+// upload. Plugin upload handlers bound the body with it before reading.
+func (m *Manager) MaxChunkSize() int64 {
+	if m == nil {
+		return 0
+	}
+	return m.maxChunkSize
 }

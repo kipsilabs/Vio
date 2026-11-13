@@ -86,9 +86,15 @@ func (e *UnknownAPIKeyScopeError) Error() string {
 	return fmt.Sprintf("unknown api key scope %q", e.Scope)
 }
 
+// V1APIKeyScopeCatalog is the frozen /api/v1 catalog: the alpha surface only
+// ever accepted the two scopes below. It is kept for the retained fork routes;
+// /api/v2 uses APIKeyScopeCatalog.
 func V1APIKeyScopeCatalog() []APIKeyScope {
 	return []APIKeyScope{{Name: ScopeAdminUsers, Description: "Manage user accounts: create, list, read, update, and delete users and read their profiles. Cannot create or modify admin accounts."}, {Name: ScopeAdminAccessGroupsRead, Description: "Read access groups and their policies."}}
 }
+
+// NormalizeV1APIKeyScopes validates a scope list against the frozen /api/v1
+// catalog.
 func NormalizeV1APIKeyScopes(scopes []string) ([]string, error) {
 	if len(scopes) == 0 {
 		return []string{}, nil

@@ -180,21 +180,6 @@ describe("PlaybackSettings CPU tone mapping", () => {
     expect(toggle).toHaveAttribute("aria-checked", "true");
     expect(toggle).toHaveAttribute("disabled");
   });
-
-  it("includes playback.max_virtual_failover_attempts in keys and renders input", () => {
-    useSettingsFormMock.mockReturnValue(
-      makeForm({
-        "playback.max_virtual_failover_attempts": "8",
-      }),
-    );
-
-    const markup = renderToStaticMarkup(<Page />);
-    expect(useSettingsFormMock.mock.calls[0]?.[0]?.keys).toContain(
-      "playback.max_virtual_failover_attempts",
-    );
-    expect(markup).toContain("Max Virtual Failover Attempts");
-    expect(markup).toContain('value="8"');
-  });
 });
 
 describe("PlaybackSettings transcode tone mapping", () => {

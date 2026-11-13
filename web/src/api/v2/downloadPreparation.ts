@@ -190,23 +190,13 @@ export async function getPreparedDownload(
   downloadId: string,
   signal?: AbortSignal,
 ): Promise<PreparedDownloadEntry | null> {
-  const snapshot = requireSnapshot();
-  try {
-    const entry = await v2("GET /api/v2/downloads/{id}", {
-      path: { id: downloadId },
-      profileContext: snapshot,
-      signal,
-      retryAuthentication: false,
-    });
-    requireCurrent(snapshot);
-    return entry;
-  } catch (error) {
-    // A 404 is the server saying the row is gone (deleted or out of scope);
-    // the caller stops polling and reports a terminal refusal. Any other
-    // failure is transient and the caller retries on the next tick.
-    if (error instanceof V2ProblemError && error.status === 404) return null;
-    throw error;
-  }
+  // The registry lists the entry the create request produced; the single-entry
+  // read was retired with the alpha surface. A row that is absent from the
+  // whole list is gone (deleted or out of scope), which the caller treats as a
+  // terminal refusal; any read failure keeps the caller polling.
+  const entries = await listDownloads(signal);
+  const entry = entries.find((candidate) => candidate.id === downloadId);
+  return (entry as PreparedDownloadEntry | undefined) ?? null;
 }
 
 /** Reports how the prepared bytes reached the user's disk, for a caller's status text. */

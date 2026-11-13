@@ -201,6 +201,9 @@ type PluginInstallationView struct {
 	TaskBindings       []PluginTaskBindingView  `json:"task_bindings"`
 	CreatedAt          time.Time                `json:"created_at"`
 	UpdatedAt          time.Time                `json:"updated_at"`
+	// UpdateFailure is the last refused automatic update, exposed by v2 as
+	// the reason a plugin stayed on its installed version.
+	UpdateFailure *plugins.UpdateFailure `json:"-"`
 	// Runtime is the process state the v2 contract exposes as `runtime`. The
 	// frozen v1 bridge does not carry it.
 	Runtime *PluginRuntimeView `json:"-"`
@@ -480,7 +483,7 @@ func (h *PluginHandler) HandlePutCatalogSettings(w http.ResponseWriter, r *http.
 		return
 	}
 
-	settings, err := h.repositories.SetIncludeApprovedCommunity(r.Context(), *req.IncludeApprovedCommunityPlugins)
+	settings, err := h.repositories.SetIncludeApprovedCommunityConditional(r.Context(), *req.IncludeApprovedCommunityPlugins, nil)
 	if err != nil {
 		slog.ErrorContext(r.Context(), "updating plugin catalog settings", "component", "api", "error", err)
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to update plugin catalog settings")
@@ -1632,6 +1635,7 @@ func (h *PluginHandler) buildInstallationResponseWithBindings(
 		CreatedAt:          installation.CreatedAt,
 		UpdatedAt:          installation.UpdatedAt,
 		Runtime:            runtime,
+		UpdateFailure:      installation.UpdateFailure,
 	}, nil
 }
 

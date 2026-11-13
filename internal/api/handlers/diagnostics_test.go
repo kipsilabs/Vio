@@ -148,12 +148,27 @@ func TestDiagnosticsUploadBusy(t *testing.T) {
 	}
 }
 
+// registerAdminDiagnosticsRoutes mounts the retired v1 diagnostics routes for
+// the tests that exercise their handlers. The v1 namespace itself answers the
+// retirement tombstone; the handlers remain for the v2 operations.
+func registerAdminDiagnosticsRoutes(r chi.Router, h *DiagnosticsHandler) {
+	if h == nil {
+		return
+	}
+	r.Route("/diagnostics/reports", func(r chi.Router) {
+		r.Get("/", h.HandleAdminListReports)
+		r.Get("/{id}", h.HandleAdminGetReport)
+		r.Get("/{id}/download", h.HandleAdminDownloadReport)
+		r.Delete("/{id}", h.HandleAdminDeleteReport)
+	})
+}
+
 func TestDiagnosticsAdminRoutesRejectNonActingAdmin(t *testing.T) {
 	service := newFakeDiagnosticsService()
 	handler := NewDiagnosticsHandler(service)
 	router := chi.NewRouter()
 	router.Use(apimw.RequireActingAdmin(nil, nil))
-	RegisterAdminDiagnosticsRoutes(router, handler)
+	registerAdminDiagnosticsRoutes(router, handler)
 
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, adminDiagnosticsRequest(http.MethodGet, "/diagnostics/reports", &auth.Claims{

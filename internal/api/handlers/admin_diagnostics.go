@@ -36,18 +36,6 @@ type diagnosticsDownloadURLResponse struct {
 	ExpiresAt   time.Time `json:"expires_at"`
 }
 
-func RegisterAdminDiagnosticsRoutes(r chi.Router, h *DiagnosticsHandler) {
-	if h == nil {
-		return
-	}
-	r.Route("/diagnostics/reports", func(r chi.Router) {
-		r.Get("/", h.HandleAdminListReports)
-		r.Get("/{id}", h.HandleAdminGetReport)
-		r.Get("/{id}/download", h.HandleAdminDownloadReport)
-		r.Delete("/{id}", h.HandleAdminDeleteReport)
-	})
-}
-
 func (h *DiagnosticsHandler) HandleAdminListReports(w http.ResponseWriter, r *http.Request) {
 	admin, ok := h.admin()
 	if !ok {

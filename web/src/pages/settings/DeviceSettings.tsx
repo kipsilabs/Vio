@@ -501,7 +501,7 @@ function DeviceDetail({
         <DeviceSettingGroups
           settings={settings}
           keys={supportedKeys}
-          ownerLabel={ownerLabel}
+          owner={{ self: !forSomeoneElse, name: device.profile_name ?? "" }}
           devicePlatform={device.device_platform}
           storedOnDevice={storedOnDevice}
           disabled={setValue.isPending || clearValue.isPending}

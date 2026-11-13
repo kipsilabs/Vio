@@ -229,6 +229,8 @@ export interface PlayerSubtitleInfo {
   default?: boolean;
   /** Names the track to the subtitle sync operations; absent when it can't be synced. */
   sync_key?: string;
+  /** Stored row identity, also present when the track has no URL or timing support. */
+  stored_subtitle_id?: number;
   url: string;
   /**
    * Optional endpoint returning base64-encoded container font attachments for

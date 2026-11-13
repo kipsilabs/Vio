@@ -10,8 +10,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/Silo-Server/silo-server/internal/nodemetrics"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/Silo-Server/silo-server/internal/nodemetrics"
 )
 
 const (
@@ -29,20 +30,36 @@ const (
 
 	defaultPostgresTuneMemoryBudgetPercent = 75
 
+	// postgresTuneSharedBuffersMaxBytes is the ceiling on shared_buffers
+	// when the memory budget was detected. A quarter of the memory budget
+	// suits a database that is the only tenant of its host, but a media
+	// catalog's hot set (indexes and recently read rows) is usually far
+	// smaller than a large host's quarter, and the operating system's page
+	// cache still holds whatever falls outside it. The ceiling is fixed, not
+	// sized from the database: shared_buffers changes only at a restart, and
+	// the omnibus image writes it before the database has any content. A
+	// database that outgrows it (intro detection fingerprints alone can pass
+	// 2GB) is given more with POSTGRES_TUNE_MEMORY, which is not bounded.
+	postgresTuneSharedBuffersMaxBytes = 2 * sizeGB
+
+	// maxPostgresTuneDetectedCPUs bounds a detected CPU count. A container
+	// without a CPU limit sees every core of its host, and one worker slot per
+	// core is far more than a catalog database can use: a query runs at most
+	// four parallel workers. POSTGRES_TUNE_CPUS is not bounded.
+	maxPostgresTuneDetectedCPUs = 16
+
+	// maxPostgresTuneAutovacuumWorkMemKB bounds each autovacuum worker, which
+	// would otherwise take up to maintenance_work_mem.
+	maxPostgresTuneAutovacuumWorkMemKB = 256 * sizeMB / sizeKB
+
 	sizeKB = int64(1024)
 	sizeMB = 1024 * sizeKB
 	sizeGB = 1024 * sizeMB
 	sizeTB = 1024 * sizeGB
 )
 
-// postgresSettingMaxLocksPerTransaction is the Postgres
-// max_locks_per_transaction setting name. Named because the managed-tune
-// list and the recommendation set both reference it.
-const postgresSettingMaxLocksPerTransaction = "max_locks_per_transaction"
-
 var managedPostgresTuneSettings = []string{
 	"max_connections",
-	postgresSettingMaxLocksPerTransaction,
 	"shared_buffers",
 	"effective_cache_size",
 	"maintenance_work_mem",
@@ -75,12 +92,20 @@ type PostgresTuneOptions struct {
 	DetectedMemoryBytes int64
 	MemorySource        string
 	MemoryBudgetPercent int
-	CPUs                int
-	Connections         int
-	Storage             string
-	DBSize              string
-	OSType              string
-	IOMethod            string
+	// MemoryExplicit reports that POSTGRES_TUNE_MEMORY named the budget. An
+	// explicit budget is the operator's, so shared_buffers takes its full
+	// quarter.
+	MemoryExplicit bool
+	CPUs           int
+	// DetectedCPUs is the machine's CPU count before it was bounded, or zero
+	// when CPUs was set explicitly. work_mem is sized from it, so bounding
+	// the workers does not raise work_mem.
+	DetectedCPUs int
+	Connections  int
+	Storage      string
+	DBSize       string
+	OSType       string
+	IOMethod     string
 }
 
 // PostgresTuneSetting is one recommended PostgreSQL parameter.
@@ -115,6 +140,7 @@ type postgresTuneMemoryBudget struct {
 	DetectedBytes int64
 	Source        string
 	Percent       int
+	Explicit      bool
 }
 
 // LoadPostgresTuneOptionsFromEnv reads the opt-in PostgreSQL tuning environment.
@@ -149,7 +175,7 @@ func LoadPostgresTuneOptionsFromEnv(appMaxConnections int) (PostgresTuneOptions,
 		return PostgresTuneOptions{}, err
 	}
 
-	cpus, err := loadPostgresTuneCPUs()
+	cpus, detectedCPUs, err := loadPostgresTuneCPUs()
 	if err != nil {
 		return PostgresTuneOptions{}, err
 	}
@@ -183,7 +209,9 @@ func LoadPostgresTuneOptionsFromEnv(appMaxConnections int) (PostgresTuneOptions,
 		DetectedMemoryBytes: memory.DetectedBytes,
 		MemorySource:        memory.Source,
 		MemoryBudgetPercent: memory.Percent,
+		MemoryExplicit:      memory.Explicit,
 		CPUs:                cpus,
+		DetectedCPUs:        detectedCPUs,
 		Connections:         connections,
 		Storage:             storage,
 		DBSize:              dbSize,
@@ -192,7 +220,9 @@ func LoadPostgresTuneOptionsFromEnv(appMaxConnections int) (PostgresTuneOptions,
 	}, nil
 }
 
-// RecommendPostgresOLTPSettings returns pgtune-style OLTP recommendations.
+// RecommendPostgresOLTPSettings returns pgtune-style OLTP recommendations,
+// with autovacuum_work_mem, and shared_buffers under a detected memory budget,
+// bounded for a catalog database.
 func RecommendPostgresOLTPSettings(opts PostgresTuneOptions, postgresMajorVersion int) []PostgresTuneSetting {
 	memoryBudgetKB := opts.MemoryBudgetBytes / sizeKB
 	if memoryBudgetKB <= 0 {
@@ -204,8 +234,16 @@ func RecommendPostgresOLTPSettings(opts PostgresTuneOptions, postgresMajorVersio
 		connections = 100
 	}
 
-	settings := make([]PostgresTuneSetting, 0, 25)
-	sharedBuffers := memoryBudgetKB / 4
+	settings := make([]PostgresTuneSetting, 0, 24)
+	// work_mem keeps the uncapped quarter and the unbounded CPU count as its
+	// basis, so neither bound raises it.
+	budgetQuarter := memoryBudgetKB / 4
+	sharedBuffers := budgetQuarter
+	if !opts.MemoryExplicit {
+		sharedBuffers = min(sharedBuffers, postgresTuneSharedBuffersMaxBytes/sizeKB)
+	}
+	// A planner hint, not an allocation: the page cache holds what
+	// shared_buffers does not, so it stays sized from the whole budget.
 	effectiveCacheSize := (memoryBudgetKB * 3) / 4
 	maintenanceWorkMem := memoryBudgetKB / 16
 	if maintenanceWorkMem > 8*sizeGB/sizeKB {
@@ -214,12 +252,6 @@ func RecommendPostgresOLTPSettings(opts PostgresTuneOptions, postgresMajorVersio
 
 	settings = append(settings,
 		PostgresTuneSetting{Name: "max_connections", Value: strconv.Itoa(connections)},
-		// Postmaster-scope: locks per transaction. Collection sync acceptance
-		// takes transaction-scoped advisory locks proportional to the virtual
-		// membership it touches; the default 64 is too low for large
-		// collections. Reported with RequiresRestart because pg_settings
-		// classifies it postmaster-scope.
-		PostgresTuneSetting{Name: postgresSettingMaxLocksPerTransaction, Value: "256"},
 		PostgresTuneSetting{Name: "shared_buffers", Value: formatPostgresTuneKB(sharedBuffers)},
 		PostgresTuneSetting{Name: "effective_cache_size", Value: formatPostgresTuneKB(effectiveCacheSize)},
 		PostgresTuneSetting{Name: "maintenance_work_mem", Value: formatPostgresTuneKB(maintenanceWorkMem)},
@@ -234,7 +266,7 @@ func RecommendPostgresOLTPSettings(opts PostgresTuneOptions, postgresMajorVersio
 	}
 
 	settings = append(settings,
-		PostgresTuneSetting{Name: "work_mem", Value: formatPostgresTuneKB(workMem(memoryBudgetKB, sharedBuffers, connections, opts.CPUs, opts.DBSize))},
+		PostgresTuneSetting{Name: "work_mem", Value: formatPostgresTuneKB(workMem(memoryBudgetKB, budgetQuarter, connections, max(opts.CPUs, opts.DetectedCPUs), opts.DBSize))},
 		PostgresTuneSetting{Name: "huge_pages", Value: hugePages(sharedBuffers, opts.OSType)},
 	)
 
@@ -250,9 +282,10 @@ func RecommendPostgresOLTPSettings(opts PostgresTuneOptions, postgresMajorVersio
 	if autovacuumWorkers := autovacuumMaxWorkers(opts.CPUs); autovacuumWorkers != "" {
 		settings = append(settings, PostgresTuneSetting{Name: "autovacuum_max_workers", Value: autovacuumWorkers})
 	}
-	if maintenanceWorkMem >= 2*sizeGB/sizeKB {
-		settings = append(settings, PostgresTuneSetting{Name: "autovacuum_work_mem", Value: "2GB"})
-	}
+	settings = append(settings, PostgresTuneSetting{
+		Name:  "autovacuum_work_mem",
+		Value: formatPostgresTuneKB(min(maintenanceWorkMem, maxPostgresTuneAutovacuumWorkMemKB)),
+	})
 
 	settings = append(settings,
 		PostgresTuneSetting{Name: "min_wal_size", Value: "2GB"},
@@ -399,10 +432,7 @@ func parsePostgresTuneMode(raw string) (bool, string, error) {
 		return true, postgresTuneProfileOLTP, nil
 	case postgresTuneProfileOLTP:
 		return true, postgresTuneProfileOLTP, nil
-	case "0", "false", "no", "off", "none", "disabled", "manual", "self", "custom":
-		// "manual" (and its synonyms) is a deliberate operator statement that
-		// Postgres was tuned by hand: leave it alone rather than warning about
-		// an "invalid" value. It is the same no-op as off.
+	case "0", "false", "no", jitOff, "none", "disabled":
 		return false, "", nil
 	default:
 		return false, "", fmt.Errorf("invalid POSTGRES_TUNE value %q", raw)
@@ -438,6 +468,7 @@ func loadPostgresTuneMemory() (postgresTuneMemoryBudget, error) {
 		DetectedBytes: mem,
 		Source:        "env",
 		Percent:       100,
+		Explicit:      true,
 	}, nil
 }
 
@@ -453,21 +484,25 @@ func loadPostgresTuneMemoryBudgetPercent() (int, error) {
 	return percent, nil
 }
 
-func loadPostgresTuneCPUs() (int, error) {
+// loadPostgresTuneCPUs returns the CPU count to tune for and, when it was
+// detected, the count before bounding.
+func loadPostgresTuneCPUs() (cpus, detected int, err error) {
 	raw := firstNonEmptyEnv("POSTGRES_TUNE_CPUS", "VIO_POSTGRES_TUNE_CPUS", "SILO_POSTGRES_TUNE_CPUS")
 	if raw == "" || strings.EqualFold(raw, "auto") {
-		cpus := runtime.NumCPU()
-		if cpus < 1 {
-			cpus = 1
-		}
-		return cpus, nil
+		detected = runtime.NumCPU()
+		return detectedPostgresTuneCPUs(detected), detected, nil
 	}
 
-	cpus, err := strconv.Atoi(raw)
+	cpus, err = strconv.Atoi(raw)
 	if err != nil || cpus < 1 {
-		return 0, fmt.Errorf("invalid POSTGRES_TUNE_CPUS %q", raw)
+		return 0, 0, fmt.Errorf("invalid POSTGRES_TUNE_CPUS %q", raw)
 	}
-	return cpus, nil
+	return cpus, 0, nil
+}
+
+// detectedPostgresTuneCPUs bounds a CPU count read from the machine.
+func detectedPostgresTuneCPUs(detected int) int {
+	return max(1, min(detected, maxPostgresTuneDetectedCPUs))
 }
 
 func loadPostgresTuneConnections(appMaxConnections int) (int, error) {
