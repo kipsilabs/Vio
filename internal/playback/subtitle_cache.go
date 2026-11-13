@@ -1853,6 +1853,14 @@ func (c *SubtitleCache) serveWindowedSUP(w http.ResponseWriter, r *http.Request,
 		}
 		artifactBacked = true
 	} else {
+		// A page with no committed artifact may still be answerable from the
+		// artifact a running full-track fill is writing. This must run before the
+		// backoff check: a page inside the coverage is a local read, and a page
+		// beyond it must not fall through to reading the source (see
+		// subtitle_progressive_sup.go).
+		if served, progressiveErr := c.serveProgressiveSUPPage(w, r, sourceOpts, extract); served || progressiveErr != nil {
+			return progressiveErr
+		}
 		// No last-good copy: suppress an extract that is known to be inside
 		// its backoff window before any header or provider read, so the
 		// handler can answer 503 + Retry-After.
@@ -2723,6 +2731,10 @@ type SubtitleCacheFill struct {
 	// temp file grows as the extract runs and requests can watch it. A text
 	// batch writes its files directly and only at the end.
 	progressive bool
+	// sup indexes the display sets of a bitmap fill's growing artifact, so a
+	// bounded window inside what it has parsed is served from the artifact
+	// instead of another source read. Nil for text formats.
+	sup *supCoverage
 	// background marks a fill owned by a detached background warm rather than
 	// a client request. It exists only so the serve path can count a page
 	// extract that runs alongside the warm's demux on the same relay pipe; no
@@ -2829,6 +2841,12 @@ func (c *SubtitleCache) reserveFill(inputPath, cacheIdentity string, trackIndex 
 		progressive:   progressive,
 		done:          make(chan struct{}),
 		grew:          make(chan struct{}),
+	}
+	if format == subtitleFormatSUP {
+		// A bitmap fill's artifact is a .sup stream: index it as it grows so a
+		// page inside the parsed range is a local read (see
+		// subtitle_progressive_sup.go).
+		fill.sup = &supCoverage{}
 	}
 	// Held until the temp file exists, so a request that finds the fill
 	// cannot watch it before then.
@@ -3746,6 +3764,12 @@ func (f *SubtitleCacheFill) record(p []byte) {
 			"track", f.trackIndex, "error", err)
 	} else {
 		f.written += int64(len(p))
+		// Index the bytes that are now in the artifact, in the order they were
+		// written, so the coverage watermark never describes bytes that are not
+		// there.
+		if f.sup != nil {
+			f.sup.feed(p)
+		}
 	}
 	close(f.grew)
 	f.grew = make(chan struct{})

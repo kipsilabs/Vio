@@ -41,6 +41,9 @@ const (
 	subtitleServeSourceExtract = "source_extract"
 	// subtitleServePGSSupSource is the PGS variant of subtitleServeSourceExtract.
 	subtitleServePGSSupSource = "pgs_source"
+	// subtitleServePGSProgressive is a bounded PGS window answered from the
+	// running full-track fill's artifact, behind its coverage watermark.
+	subtitleServePGSProgressive = "pgs_progressive"
 )
 
 const (

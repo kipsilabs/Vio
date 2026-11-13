@@ -30,6 +30,13 @@ type StreamExtractOpts struct {
 	// remote input. When set, subtitle caching uses a bounded generation
 	// instead of requiring os.Stat on InputPath.
 	CacheIdentity string
+	// SourceSizeBytes is the source container's size when the caller knows it
+	// (a catalog row's FileSize). It is 0 when unknown, which a virtual row's
+	// size commonly is. It decides only whether a bounded bitmap page is worth
+	// extracting directly: a container large enough that the prefix read costs
+	// a page its whole deadline is served from the track's progressive artifact
+	// instead (see subtitle_progressive_sup.go).
+	SourceSizeBytes int64
 	// TrackIndex is the subtitle stream ordinal within the container
 	// (matches ffmpeg's `0:s:N` specifier). Callers pass the same index
 	// they would to ExtractSubtitle.

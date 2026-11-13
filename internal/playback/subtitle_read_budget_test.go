@@ -115,7 +115,7 @@ func TestServeSUPExtractPageReadBudgetMapsToRetryableReason(t *testing.T) {
 	if retry.Reason != SubtitlePageTooCostlyReason {
 		t.Fatalf("reason = %q, want %q", retry.Reason, SubtitlePageTooCostlyReason)
 	}
-	if !(retry.RetryAfter > 0) {
+	if retry.RetryAfter <= 0 {
 		t.Fatalf("retry after = %s, want a positive delay", retry.RetryAfter)
 	}
 	if first.Body.Len() != 0 {

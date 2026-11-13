@@ -83,6 +83,32 @@ start is not blamed on it.
   an upstream failure can answer 503 without reopening the source. Full-track
   `.sup` caching and Range/HEAD behavior are unchanged.
 
+## Bitmap pages on a large relay source
+
+A windowed PGS extract cannot seek a non-seekable relay, so ffmpeg reads the
+container from byte 0 and discards the prefix. A page at offset S therefore costs
+`(S + W) × bitrate`, not `W × bitrate`: a 120 s page of an 18.25 GB / 35 Mbps
+source is ~525 MB, which is also the window extraction timeout. Two rules follow.
+
+- One unbounded `.sup` demux runs per (source identity, track, format
+  generation), single-flighted through the cache's warm slot and detached relay
+  budget. It writes the track's artifact and publishes how far the display sets
+  it has parsed reach (a coverage watermark), so a page inside that coverage is
+  a local read of the artifact rather than another source read. The watermark
+  advances only at a complete display set (`PCS … END`), and a page the artifact
+  does not cover is answered with the retryable shape plus
+  `X-Subtitle-Coverage`, never with a truncated run. A `.sup` fill flips into the
+  committed whole-track entry when its extract reaches end of file.
+- A page extract that is still attempted over a remote source is capped at
+  256 MB of reads. On breach ffmpeg is killed and the page answers
+  `503 subtitle_page_too_costly` with `Retry-After`, which is the same retryable
+  shape a client already backs off from. A page refused that way also starts the
+  track's fill, since the artifact is what will serve it.
+
+Both apply only to a remote identity whose container size is known and at least
+256 MB. A text (WebVTT/SRT/ASS) window and a local file keep their existing
+paths.
+
 ## Jellyfin compatibility
 
 The Jellyfin surface burns embedded PGS into the transcode and does not publish

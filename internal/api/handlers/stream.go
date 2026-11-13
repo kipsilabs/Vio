@@ -3847,6 +3847,7 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 		WindowRequested: windowRequested,
 		Embedded:        playback.EmbeddedSubtitleRefFor(file, embeddedIndex),
 		FFmpegPath:      h.ffmpegPath(),
+		SourceSizeBytes: file.FileSize,
 	}
 	// Virtual sources are provider-neutral URIs, not FFmpeg inputs. Resolve
 	// through the relay so ffmpeg reads the real stream. Subtitle extraction
@@ -4086,6 +4087,15 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 			// few-second cadence.
 			if response.Status() != 0 {
 				panic(http.ErrAbortHandler)
+			}
+			if extractionRetry.Reason == playback.SubtitlePageTooCostlyReason {
+				// The page could not be cut from the source at an affordable
+				// read cost. The track's progressive artifact is what serves it,
+				// and that fill must outlive this request's relay registration,
+				// so the handler starts it here (the cache's own detached warm is
+				// disabled for virtual inputs). It is single-flighted: a burst of
+				// pages starts one fill.
+				h.warmVirtualSubtitleForWaitingPage(file, track, session, opts, inheritedLayout, virtualActive, middleware.GetReqID(r.Context()))
 			}
 			writeSubtitleRetry(w, extractionRetry)
 			return
@@ -4517,6 +4527,20 @@ func subtitleWarmHintMatchesPlanTrack(requested models.SubtitleTrack, planTracks
 }
 
 func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(file *models.MediaFile, track models.SubtitleTrack, session *playback.Session, opts playback.StreamExtractOpts, inherited *virtualSubtitleLayoutSeed, virtualActive bool, requestID string) {
+	h.warmVirtualSubtitle(file, track, session, opts, inherited, virtualActive, requestID, false)
+}
+
+// warmVirtualSubtitleForWaitingPage starts the track's detached fill because a
+// bounded bitmap page is waiting for its progressive artifact. The page cannot
+// be cut from the source at an affordable cost, so the fill is the page path,
+// not an opportunistic extra read: it runs even while the viewer is playing and
+// even when a bounded page prefetch would otherwise take precedence, because
+// those pages are exactly what this fill publishes as it parses.
+func (h *StreamHandler) warmVirtualSubtitleForWaitingPage(file *models.MediaFile, track models.SubtitleTrack, session *playback.Session, opts playback.StreamExtractOpts, inherited *virtualSubtitleLayoutSeed, virtualActive bool, requestID string) {
+	h.warmVirtualSubtitle(file, track, session, opts, inherited, virtualActive, requestID, true)
+}
+
+func (h *StreamHandler) warmVirtualSubtitle(file *models.MediaFile, track models.SubtitleTrack, session *playback.Session, opts playback.StreamExtractOpts, inherited *virtualSubtitleLayoutSeed, virtualActive bool, requestID string, pageWaiting bool) {
 	if h == nil || h.SubtitleCache == nil || file == nil || session == nil || !virtualActive {
 		return
 	}
@@ -4586,19 +4610,25 @@ func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(file *models.MediaFil
 		// pages the viewer is about to need without ever publishing a mid-file
 		// slice as the whole track. The full-track warm below stays the
 		// from-start/idle shape, where the artifact is what the opening playback
-		// reads.
-		if windows, prefetch := virtualSubtitleWarmPrefetchWindows(opts, live.Position); prefetch {
-			extract, _, release := h.virtualSubtitleWarmExtractor(file, track, session, planTracks, seed, warmOpts, live)
-			defer release()
-			<-h.SubtitleCache.PrefetchWindowsInBackground(warmOpts, windows, extract, requestID)
-			return
+		// reads. A page waiting for the fill inverts that: the prefetch would
+		// re-read the source for pages the fill is already publishing, so the
+		// fill runs instead.
+		if !pageWaiting {
+			if windows, prefetch := virtualSubtitleWarmPrefetchWindows(opts, live.Position); prefetch {
+				extract, _, release := h.virtualSubtitleWarmExtractor(file, track, session, planTracks, seed, warmOpts, live)
+				defer release()
+				<-h.SubtitleCache.PrefetchWindowsInBackground(warmOpts, windows, extract, requestID)
+				return
+			}
 		}
 		// Past the prefetch, only a text track may warm whole while playing (the
 		// artifact is small and the next fetch reads it). A bitmap track falls
 		// through only when the viewer is paused: a whole .sup is tens of
 		// megabytes read from the entire container, and it is never the page
-		// playback needs next.
-		if !live.IsPaused && playback.NeedsBurnIn(opts.SourceCodec) {
+		// playback needs next. A page waiting for that artifact is the
+		// exception: no page extract can produce it at an affordable cost, so
+		// the fill is what the page is waiting on.
+		if !pageWaiting && !live.IsPaused && playback.NeedsBurnIn(opts.SourceCodec) {
 			slog.DebugContext(context.Background(), "virtual subtitle warm skipped: bitmap full-track warm stays paused-only",
 				"component", "api", "session", session.ID, "file_id", file.ID, "codec", opts.SourceCodec)
 			return
