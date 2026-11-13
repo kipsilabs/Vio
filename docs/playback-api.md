@@ -544,6 +544,16 @@ and `terminal.retryable: true`; mint a new attempt. Local direct and HLS media
 URLs in the plan are projected into the `/api/v2` namespace; the signed `st`
 query they carry is unchanged.
 
+A start that fails transiently answers `503` with `Retry-After`, not
+`500 internal_error`, so the client retries instead of treating the failure as
+a server defect. This covers a transport that could not start before the
+request deadline, a terminal decision the plan store could not record on that
+expired budget, and route-capacity exhaustion. Route capacity keeps the v1
+`route_capacity_unavailable` body code; v2 maps it to `503 dependency_unavailable`
+as the replan path does, and the other retryable start failures use
+`dependency_unavailable` on both surfaces. A genuine internal fault remains
+`500 internal_error`.
+
 When the profile's stored `playback.subtitle_mode` is `always`, an omitted
 `subtitle_track_id` / `subtitle_track_index` on start resolves to the stored
 preference's track before planning, so subtitles are on — and a bitmap track

@@ -179,6 +179,16 @@ const (
 	routeCapabilityUnavailableReasonV3  = "route_capability_unavailable"
 )
 
+// playbackStartRetryAfterSeconds is the Retry-After a retryable start failure
+// advertises: long enough for a saturated route or a stalled provider to
+// settle, short enough that the client retries promptly.
+const playbackStartRetryAfterSeconds = 5
+
+// playbackDependencyUnavailableCode is the v1 error code for a temporary
+// playback dependency failure; the v2 catalog maps it to the 503
+// dependency_unavailable problem.
+const playbackDependencyUnavailableCode = "dependency_unavailable"
+
 // v3NodeCapabilityRefreshInterval is both how often the background refresher
 // revisits pooled nodes and the freshness margin at which it re-probes one: a
 // quarter of the TTL keeps a healthy node warmed ahead of expiry, so a plan-time
@@ -2708,9 +2718,10 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 				}
 			}
 			req.FileID = termFileID
-			response, persistErr := h.persistTerminalStartDecisionV3(r.Context(), userID, profileID, req, requestDigests, termFileID, termFileID, virtualStartUnresolvedTerminalV3(resolveErr))
+			terminal := virtualStartUnresolvedTerminalV3(resolveErr)
+			response, persistErr := h.persistTerminalStartDecisionV3(r.Context(), userID, profileID, req, requestDigests, termFileID, termFileID, terminal)
 			if persistErr != nil {
-				return playback.DecisionResponseV3{}, playbackPersistenceOperationError(persistErr)
+				return playback.DecisionResponseV3{}, startTerminalPersistOperationErrorV3(r.Context(), persistErr, terminal.Terminal != nil && terminal.Terminal.Retryable, nil)
 			}
 			return response, nil
 		}
@@ -2916,9 +2927,10 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 			"file_id", effectiveFile.ID,
 			"quality_preference", req.QualityPreference,
 		}, clientInfo.LogAttrs()...)...)
-		response, persistErr := h.persistTerminalStartDecisionV3(r.Context(), userID, profileID, req, requestDigests, requestedFile.ID, effectiveFile.ID, playback.NewTerminalResponseFromTerminalV3(result.Terminal))
+		terminal := playback.NewTerminalResponseFromTerminalV3(result.Terminal)
+		response, persistErr := h.persistTerminalStartDecisionV3(r.Context(), userID, profileID, req, requestDigests, requestedFile.ID, effectiveFile.ID, terminal)
 		if persistErr != nil {
-			return playback.DecisionResponseV3{}, playbackPersistenceOperationError(persistErr)
+			return playback.DecisionResponseV3{}, startTerminalPersistOperationErrorV3(r.Context(), persistErr, terminal.Terminal != nil && terminal.Terminal.Retryable, nil)
 		}
 		if response.Terminal != nil {
 			h.enqueueRouteEventV3(playback.RouteEventRecordV3{RouteEventV3: playback.RouteEventV3{ProtocolVersion: playback.ProtocolV3, PlaybackAttemptID: req.PlaybackAttemptID, Event: playback.RouteEventTerminalV3, FallbackReason: response.Terminal.Reason, OutputContextID: req.ClientPlaybackContext.Output.OutputContextID}, UserID: userID, ProfileID: profileID, ClientName: clientInfo.Name, ClientVersion: clientInfo.Version, ClientBuild: clientInfo.Build, ClientChannel: clientInfo.Channel, ClientModel: req.ClientPlaybackContext.Device.Model})
@@ -2944,7 +2956,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	if escalateErr != nil {
 		persistedResponse, persistErr := h.startFailureDecisionV3(r.Context(), userID, profileID, req, requestDigests, requestedFile.ID, effectiveFile.ID, escalateErr)
 		if persistErr != nil {
-			return playback.DecisionResponseV3{}, playbackPersistenceOperationError(persistErr)
+			return playback.DecisionResponseV3{}, startTerminalPersistOperationErrorV3(r.Context(), persistErr, escalateErr.retryable, escalateErr)
 		}
 		return persistedResponse, nil
 	}
@@ -2996,9 +3008,10 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 					return rotated, nil
 				}
 			}
-			persisted, persistErr := h.persistTerminalStartDecisionV3(r.Context(), userID, profileID, req, requestDigests, requestedFile.ID, effectiveFile.ID, sourceDecodeFailedTerminalResponseV3(req.FileSelection))
+			terminal := sourceDecodeFailedTerminalResponseV3(req.FileSelection)
+			persisted, persistErr := h.persistTerminalStartDecisionV3(r.Context(), userID, profileID, req, requestDigests, requestedFile.ID, effectiveFile.ID, terminal)
 			if persistErr != nil {
-				return playback.DecisionResponseV3{}, playbackPersistenceOperationError(persistErr)
+				return playback.DecisionResponseV3{}, startTerminalPersistOperationErrorV3(r.Context(), persistErr, terminal.Terminal != nil && terminal.Terminal.Retryable, nil)
 			}
 			return persisted, nil
 		}
@@ -3148,7 +3161,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		}
 		persistedResponse, persistErr := h.startFailureDecisionV3(r.Context(), userID, profileID, req, requestDigests, requestedFile.ID, effectiveFile.ID, statusErr)
 		if persistErr != nil {
-			return playback.DecisionResponseV3{}, playbackPersistenceOperationError(persistErr)
+			return playback.DecisionResponseV3{}, startTerminalPersistOperationErrorV3(r.Context(), persistErr, statusErr.retryable, statusErr)
 		}
 		return persistedResponse, nil
 	}
@@ -15407,6 +15420,58 @@ func (h *PlaybackHandler) persistTerminalStartDecisionV3(ctx context.Context, us
 func (h *PlaybackHandler) startFailureDecisionV3(ctx context.Context, userID int, profileID string, req playback.StartRequestV3, requestDigests playbackStartRequestDigestsV3, requestedFileID, effectiveFileID int, failure *transportErrorV3) (playback.DecisionResponseV3, error) {
 	response := playback.NewTerminalResponseV3(failure.reason, failure.message, failure.retryable)
 	return h.persistTerminalStartDecisionV3(ctx, userID, profileID, req, requestDigests, requestedFileID, effectiveFileID, response)
+}
+
+// startTerminalPersistOperationErrorV3 maps a failed terminal-start save to the
+// client answer. The virtual start owns one deadline for resolve, planning and
+// transport startup, so a start that reaches it fails the following SaveAttempt
+// with context.DeadlineExceeded: the save describes the expired request budget,
+// not the playback verdict. A retryable failure (or a save cut off only by that
+// budget) must stay retryable and advertise Retry-After instead of collapsing
+// into a 500 internal_error; only a genuine store fault on a non-retryable
+// verdict keeps the 500.
+func startTerminalPersistOperationErrorV3(ctx context.Context, persistErr error, retryable bool, failure *transportErrorV3) error {
+	if e, ok := errors.AsType[*PlaybackOperationError](persistErr); ok {
+		return e
+	}
+	if errors.Is(persistErr, playback.ErrIdempotencyKeyReusedV3) {
+		return playbackPersistenceOperationError(persistErr)
+	}
+	slog.WarnContext(ctx, "playback start terminal persist failed",
+		"component", "api", "retryable", retryable, "error", persistErr)
+	if !retryable && !errors.Is(persistErr, context.DeadlineExceeded) && !errors.Is(persistErr, context.Canceled) {
+		return playbackPersistenceOperationError(persistErr)
+	}
+	return retryableStartOperationErrorV3(failure)
+}
+
+// retryableStartOperationErrorV3 classifies a transient start failure for the
+// client. Route-capacity exhaustion names its own existing code (the replan
+// path answers the same state with 503 route_capacity_unavailable); every other
+// retryable start failure is dependency_unavailable, the catalog's 503 for
+// temporary unavailability.
+func retryableStartOperationErrorV3(failure *transportErrorV3) *PlaybackOperationError {
+	if failure != nil && failure.reason == string(noderouting.OutcomeCapacityUnavailable) {
+		return &PlaybackOperationError{
+			Status:     http.StatusServiceUnavailable,
+			Code:       string(noderouting.OutcomeCapacityUnavailable),
+			Message:    "The playback route capacity is temporarily unavailable; retry shortly",
+			RetryAfter: playbackStartRetryAfterSeconds,
+		}
+	}
+	message := "Playback is temporarily unavailable; retry shortly"
+	if failure != nil && failure.retryable && strings.TrimSpace(failure.message) != "" {
+		message = failure.message
+	}
+	if failure != nil && errors.Is(failure.cause, context.DeadlineExceeded) {
+		message = "Playback start timed out; retry shortly"
+	}
+	return &PlaybackOperationError{
+		Status:     http.StatusServiceUnavailable,
+		Code:       playbackDependencyUnavailableCode,
+		Message:    message,
+		RetryAfter: playbackStartRetryAfterSeconds,
+	}
 }
 
 func writeStartAttemptPersistenceErrorV3(w http.ResponseWriter, err error) {
