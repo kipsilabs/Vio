@@ -4087,7 +4087,7 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 			if response.Status() != 0 {
 				panic(http.ErrAbortHandler)
 			}
-			writeSubtitleSourceUnavailableRetry(w, extractionRetry.RetryAfter)
+			writeSubtitleRetry(w, extractionRetry)
 			return
 		}
 		if errors.Is(extractErr, playback.ErrSubtitleReadsBusy) {
@@ -4164,7 +4164,7 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 				if response.Status() != 0 {
 					panic(http.ErrAbortHandler)
 				}
-				writeSubtitleSourceUnavailableRetry(w, retryBackoff.RetryAfter)
+				writeSubtitleRetry(w, retryBackoff)
 				return
 			}
 			playback.LogSubtitleStreamError(r.Context(), retryErr, file.ID, embeddedIndex)
@@ -5198,12 +5198,37 @@ const subtitleSourceRetryAfterSeconds = 5
 // server-chosen Retry-After. RetryAfter is rounded up to whole seconds and
 // floored at one so the header is always a positive delay.
 func writeSubtitleSourceUnavailableRetry(w http.ResponseWriter, retryAfter time.Duration) {
+	writeSubtitleRetry(w, &playback.SubtitleExtractionRetryError{RetryAfter: retryAfter})
+}
+
+// writeSubtitleRetry answers a subtitle extraction that must be retried: the
+// retryable 503 with Retry-After that clients already back off from. Two
+// additive parts carry the reason and the state:
+//
+//   - Reason replaces the default problem code when the extraction knows a more
+//     specific cause (a page whose read cost was refused);
+//   - CoveredUntil advertises how far the track's progressive bitmap artifact
+//     has parsed, so a client can tell that the page it asked for is not ready
+//     yet rather than unavailable.
+//
+// Neither changes the status, the header shape or the client's retry loop.
+func writeSubtitleRetry(w http.ResponseWriter, retry *playback.SubtitleExtractionRetryError) {
 	clearSubtitleCoverageHeaders(w.Header())
-	seconds := int(math.Ceil(retryAfter.Seconds()))
+	seconds := int(math.Ceil(retry.RetryAfter.Seconds()))
 	if seconds < 1 {
 		seconds = 1
 	}
 	w.Header().Set("Retry-After", strconv.Itoa(seconds))
+	if retry.CoveredUntil > 0 {
+		// The requested page is not ready; the artifact behind it has parsed
+		// this range and will answer once it reaches the window.
+		playback.SetSubtitleCoverageRange(w.Header(), 0, retry.CoveredUntil)
+	}
+	if retry.Reason == playback.SubtitlePageTooCostlyReason {
+		writeError(w, http.StatusServiceUnavailable, playback.SubtitlePageTooCostlyReason,
+			"The subtitle page costs more to read than the server allows; retry to be served from the prefetched track")
+		return
+	}
 	writeError(w, http.StatusServiceUnavailable, "subtitle_source_unavailable",
 		"Unable to verify the subtitle source; retry")
 }

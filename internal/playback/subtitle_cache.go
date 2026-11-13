@@ -202,6 +202,11 @@ const (
 	// "the extraction already running will land soon", not "the provider is
 	// failing".
 	subtitleFillBusyRetryAfter = 2 * time.Second
+	// subtitlePageCostlyRetryAfter is the Retry-After handed to a page whose
+	// extraction was killed for reading too much of the container prefix. It
+	// matches the fill-busy delay: the answer is "the progressive artifact is
+	// being read, come back for the page", not "the provider failed".
+	subtitlePageCostlyRetryAfter = subtitleFillBusyRetryAfter
 	// subtitleFillWaitTimeout bounds how long a duplicate request waits on an
 	// in-flight fill before answering retryable. A local demux finishes well
 	// inside it; a slow provider read that a second request is racing (the
@@ -332,6 +337,17 @@ func subtitleExtractRetryDelays() []time.Duration {
 // ServeExtractWithResult while a per-identity backoff is active.
 type SubtitleExtractionRetryError struct {
 	RetryAfter time.Duration
+	// Reason, when set, replaces the retryable response's default problem code
+	// with a more specific one (SubtitlePageTooCostlyReason). It is additive:
+	// the status, the Retry-After shape and the client's retry loop are
+	// unchanged.
+	Reason string
+	// CoveredUntil, when positive, is the source time, in seconds, that the
+	// track's progressive bitmap artifact has parsed. The retryable response
+	// advertises it as the covered range so a client can tell how far the
+	// artifact it will be served from has reached. Zero means nothing is
+	// covered and no coverage is advertised.
+	CoveredUntil float64
 }
 
 func (e *SubtitleExtractionRetryError) Error() string {
@@ -1943,7 +1959,20 @@ func (c *SubtitleCache) serveWindowedSUP(w http.ResponseWriter, r *http.Request,
 		recordSubtitleWarmPageOverlap(subtitleFormatSUP, time.Since(overlapStart))
 	}
 	if err != nil {
-		if r.Context().Err() == nil && IsSubtitleUpstreamError(err) {
+		if counter.bytes == 0 && errors.Is(err, ErrSubtitlePageTooCostly) {
+			// The page's extraction was killed for reading too much of the
+			// container prefix. Answer the retryable shape the client already
+			// backs off from, and arm the existing extraction backoff so a
+			// client retry does not pay the same read again; the track's
+			// progressive artifact is what serves the page once it has parsed
+			// that far.
+			recordSubtitlePageTooCostly()
+			c.noteExtractionFailure(sourceOpts, subtitleFormatSUP)
+			err = &SubtitleExtractionRetryError{
+				RetryAfter: subtitlePageCostlyRetryAfter,
+				Reason:     SubtitlePageTooCostlyReason,
+			}
+		} else if r.Context().Err() == nil && IsSubtitleUpstreamError(err) {
 			// Recorded against the original source identity (sourceOpts), not
 			// the rewritten cached-artifact path.
 			c.noteExtractionFailure(sourceOpts, subtitleFormatSUP)

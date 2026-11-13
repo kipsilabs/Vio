@@ -188,6 +188,12 @@ func StreamExtractSubtitle(ctx context.Context, opts StreamExtractOpts) error {
 	if err != nil {
 		return fmt.Errorf("start ffmpeg: %w", err)
 	}
+	// A windowed bitmap page that cannot seek its source reads the container
+	// from byte 0 to reach the window. Watch the child's own read count so a
+	// page that would read hundreds of megabytes to emit a few segments is
+	// killed early instead of running to the extraction timeout.
+	budget, stopBudget := opts.startPageReadBudget(extractCtx, cmd.Process.Pid, cancel)
+	defer stopBudget()
 
 	// Copy stdout → writer with per-chunk flush so the browser receives
 	// cues as they're produced rather than at ffmpeg exit. Count the bytes on
@@ -221,6 +227,11 @@ func StreamExtractSubtitle(ctx context.Context, opts StreamExtractOpts) error {
 			counter.bytes, outcome, time.Since(start),
 			"track", opts.TrackIndex, "seek", opts.SeekSeconds, "ffmpeg_err", waitErr)...)
 
+	// A killed extract reports a signal, which says nothing about why it was
+	// killed; the budget is the reason and replaces it.
+	if budgetErr := budget.pageReadBudgetError(); budgetErr != nil {
+		return budgetErr
+	}
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
@@ -500,14 +511,30 @@ func SetSubtitleCoverageHeader(h http.Header, opts StreamExtractOpts) {
 	if !windowed {
 		return
 	}
-	value := strconv.FormatFloat(start, 'f', 3, 64) + "-*"
-	if !openEnded {
-		value = strconv.FormatFloat(start, 'f', 3, 64) + "-" + strconv.FormatFloat(end, 'f', 3, 64)
+	if openEnded {
+		h.Set(SubtitleCoverageHeader, strconv.FormatFloat(start, 'f', 3, 64)+"-*")
+		h.Set(SubtitleWindowedHeader, "true")
+		// The subtitle routes already answer cross-origin; expose the two
+		// markers so a browser-based client (not just a native one) can read
+		// them.
+		h.Set("Access-Control-Expose-Headers", SubtitleCoverageHeader+", "+SubtitleWindowedHeader)
+		return
 	}
-	h.Set(SubtitleCoverageHeader, value)
+	SetSubtitleCoverageRange(h, start, end)
+}
+
+// SetSubtitleCoverageRange advertises an explicit covered source-time range,
+// `<start>-<end>` with three decimals, as the bounded-window markers. It exists
+// for responses that describe coverage rather than a produced slice: a
+// retryable answer that reports how far the track's progressive bitmap artifact
+// has parsed.
+func SetSubtitleCoverageRange(h http.Header, start, end float64) {
+	if h == nil {
+		return
+	}
+	h.Set(SubtitleCoverageHeader,
+		strconv.FormatFloat(start, 'f', 3, 64)+"-"+strconv.FormatFloat(end, 'f', 3, 64))
 	h.Set(SubtitleWindowedHeader, "true")
-	// The subtitle routes already answer cross-origin; expose the two markers
-	// so a browser-based client (not just a native one) can read them.
 	h.Set("Access-Control-Expose-Headers", SubtitleCoverageHeader+", "+SubtitleWindowedHeader)
 }
 

@@ -92,6 +92,11 @@ var subtitleWarmPageOverlapSeconds = promauto.NewHistogramVec(prometheus.Histogr
 	Buckets: []float64{0.05, 0.1, 0.25, 0.5, 1, 2, 4, 8, 15, 30, 60},
 }, []string{subtitleMetricLabelFormat})
 
+var subtitlePageCostRejections = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "vio_subtitle_page_read_budget_total",
+	Help: "Windowed bitmap page extracts killed for reading more of the source container than a page may cost, by output format. Measurement only.",
+}, []string{subtitleMetricLabelFormat})
+
 // recordSubtitleServeSource attributes one response or extraction attempt to
 // the path that produced it. Call it at the point the path is chosen, so a
 // later write error still counts the cost that was already paid.
@@ -147,4 +152,10 @@ func observeSubtitleRelayAdmissionWait(class string, waited time.Duration) {
 func recordSubtitleWarmPageOverlap(format string, elapsed time.Duration) {
 	subtitleWarmPageOverlaps.WithLabelValues(format).Inc()
 	subtitleWarmPageOverlapSeconds.WithLabelValues(format).Observe(elapsed.Seconds())
+}
+
+// recordSubtitlePageTooCostly counts one windowed bitmap page extract killed for
+// reading more of the source container than a page may cost.
+func recordSubtitlePageTooCostly() {
+	subtitlePageCostRejections.WithLabelValues(subtitleFormatSUP).Inc()
 }
