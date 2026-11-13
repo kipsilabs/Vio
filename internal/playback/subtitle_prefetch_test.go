@@ -3,6 +3,7 @@ package playback
 import (
 	"context"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -305,5 +306,58 @@ func TestPrefetchWindowsStopsWhenRequestPathFills(t *testing.T) {
 	}
 	if calls.Load() != 1 {
 		t.Fatalf("window prefetch extracts = %d, want the first window only", calls.Load())
+	}
+}
+
+// A prefetch kick must leave a line even when every window it would fetch is
+// already covered: the per-window lines are written only once a window settles,
+// so before this a kick that skipped its windows (the common case for a client
+// that keeps re-asking inside one page) and a kick that never ran looked
+// identical in the log.
+func TestPrefetchLogsStartAndSettleWhenWindowsAreCached(t *testing.T) {
+	cache, source := newTestCache(t)
+	var logs strings.Builder
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	opts := StreamExtractOpts{
+		InputPath:       source,
+		TrackIndex:      0,
+		SourceCodec:     "subrip",
+		WindowRequested: true,
+		DurationSeconds: 120,
+	}
+	// Cover both windows the prefetch would ask for, so it has nothing to fetch.
+	for _, start := range []float64{240, 360} {
+		windowOpts := opts
+		windowOpts.SeekSeconds = start
+		key, ok := cache.windowResultKey(windowOpts, SubtitleFormatVTTV3)
+		if !ok {
+			t.Fatalf("window key for start %v", start)
+		}
+		cache.storeWindowResult(key, windowOpts, []byte(prefetchWindowVTT))
+	}
+	extract := func(context.Context, StreamExtractOpts) error {
+		t.Error("prefetch extracted a window it reported as covered")
+		return nil
+	}
+	windows := []SubtitlePrefetchWindow{
+		{StartSeconds: 240, DurationSeconds: 120},
+		{StartSeconds: 360, DurationSeconds: 120},
+	}
+	select {
+	case <-cache.PrefetchWindowsInBackground(opts, windows, extract, "prefetch-log"):
+	case <-time.After(5 * time.Second):
+		t.Fatal("window prefetch did not settle")
+	}
+	output := logs.String()
+	for _, want := range []string{"subtitle window prefetch starting", "subtitle window prefetch settled"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("prefetch log is missing %q:\n%s", want, output)
+		}
+	}
+	if strings.Contains(output, "prefetched=") && !strings.Contains(output, "prefetched=0") {
+		t.Fatalf("a fully covered kick reported a prefetch:\n%s", output)
 	}
 }

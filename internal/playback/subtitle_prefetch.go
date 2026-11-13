@@ -53,6 +53,19 @@ func (c *SubtitleCache) PrefetchWindowsInBackground(opts StreamExtractOpts, wind
 	done := make(chan struct{})
 	format := subtitleCacheFormat(opts.SourceCodec, opts.TargetFormat)
 	if c == nil || extract == nil || c.dir() == "" || format == "" || len(windows) == 0 {
+		// Logged rather than returned silently: without it a kick that could
+		// not run is indistinguishable from one that is still extracting, and
+		// production had no way to tell whether this path was reached at all.
+		reason := "cache unavailable"
+		switch {
+		case len(windows) == 0:
+			reason = "no windows"
+		case extract == nil:
+			reason = "no extractor"
+		case format == "":
+			reason = "unknown format"
+		}
+		logSubtitlePrefetchSkip(reason, opts, requestID)
 		close(done)
 		return done
 	}
@@ -89,9 +102,13 @@ func (c *SubtitleCache) PrefetchWindowsInBackground(opts StreamExtractOpts, wind
 	opts.InputIsExtractedText = ""
 	windows = append([]SubtitlePrefetchWindow(nil), windows...)
 
+	logSubtitlePrefetchStart(opts, format, windows, requestID)
+
 	go func() {
 		defer close(done)
 		defer func() { <-c.warmSem }()
+		prefetched := 0
+		defer func() { logSubtitlePrefetchSettled(opts, format, len(windows), prefetched, requestID) }()
 		for _, window := range windows {
 			if window.DurationSeconds <= 0 {
 				continue
@@ -138,9 +155,40 @@ func (c *SubtitleCache) PrefetchWindowsInBackground(opts StreamExtractOpts, wind
 				"input", opts.InputPath, "track", opts.TrackIndex, "format", format,
 				"start", window.StartSeconds, "duration", window.DurationSeconds,
 				"elapsed", time.Since(start), "request_id", requestID)
+			prefetched++
 		}
 	}()
 	return done
+}
+
+// logSubtitlePrefetchStart marks a kick that is about to extract. A prefetch
+// runs for as long as its windows take (tens of seconds to the window timeout)
+// and every per-window line is written only once that window settles, so
+// without this line a running prefetch is invisible in production — which is
+// indistinguishable from a kick that never ran.
+func logSubtitlePrefetchStart(opts StreamExtractOpts, format string, windows []SubtitlePrefetchWindow, requestID string) {
+	slog.Debug("subtitle window prefetch starting",
+		"input", opts.InputPath, "track", opts.TrackIndex, "format", format,
+		"windows", len(windows),
+		"start", windows[0].StartSeconds, "duration", windows[0].DurationSeconds,
+		"request_id", requestID)
+}
+
+// logSubtitlePrefetchSettled closes a kick's story: how many windows it
+// produced and how many it skipped as already covered (the difference), so a
+// prefetch that always skips is visible as such.
+func logSubtitlePrefetchSettled(opts StreamExtractOpts, format string, windows, prefetched int, requestID string) {
+	slog.Debug("subtitle window prefetch settled",
+		"input", opts.InputPath, "track", opts.TrackIndex, "format", format,
+		"windows", windows, "prefetched", prefetched, "request_id", requestID)
+}
+
+// logSubtitlePrefetchSkip reports a kick that could not run at all. It is a
+// separate function so the kick itself stays under the package's function-length
+// limit.
+func logSubtitlePrefetchSkip(reason string, opts StreamExtractOpts, requestID string) {
+	slog.Debug("subtitle window prefetch skipped",
+		"reason", reason, "input", opts.InputPath, "track", opts.TrackIndex, "request_id", requestID)
 }
 
 // subtitlePrefetchWriter is a sink for a prefetched window. The window capture

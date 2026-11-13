@@ -4563,6 +4563,9 @@ func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(file *models.MediaFil
 	// artifact; nothing to warm. Format-aware, so a committed .sup suppresses
 	// the warm exactly as a committed VTT/ASS does.
 	if h.SubtitleCache.HasCommittedEntry(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, opts.SourceCodec, opts.TargetFormat) {
+		slog.DebugContext(context.Background(), "virtual subtitle warm skipped: committed artifact present",
+			"component", "api", "session", session.ID, "file_id", file.ID,
+			"codec", opts.SourceCodec, "track", opts.TrackIndex)
 		return
 	}
 
