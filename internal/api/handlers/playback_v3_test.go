@@ -302,6 +302,85 @@ func TestHandleStartPlaybackV3TriesAlternateAfterHDRTerminal(t *testing.T) {
 	}
 }
 
+// An explicit version pick is the viewer's decision. When the picked release
+// cannot be planned for this client, the start must refuse with the version-list
+// hint instead of quietly playing a different resolution or dynamic range; the
+// auto selection beside it keeps the deliberate best-playable-version fallback.
+func TestHandleStartPlaybackV3KeepsAnExplicitVersionPick(t *testing.T) {
+	source := v3HandlerFixtureFile(t)
+	source.CodecVideo = "hevc"
+	source.Resolution = "2160p"
+	source.Bitrate = 32_000
+	source.VideoTracks[0] = models.VideoTrack{
+		Codec: "hevc", Profile: "main 10", Level: 150, Width: 3840, Height: 2160,
+		FrameRate: "24000/1001", Bitrate: 32_000, BitDepth: 10,
+		VideoRange: "DolbyVision", VideoRangeType: "DOVIWithHDR10", DVProfile: 8, DVBLCompatID: 1,
+	}
+	alternateValue := *source
+	alternate := &alternateValue
+	alternate.ID = 84
+	alternate.CodecVideo = "h264"
+	alternate.Resolution = "1080p"
+	alternate.Bitrate = 8_000
+	alternate.VideoTracks = []models.VideoTrack{{
+		Codec: "h264", Profile: "high", Level: 41, Width: 1920, Height: 1080,
+		FrameRate: "24000/1001", Bitrate: 8_000, BitDepth: 8, VideoRange: videoRangeSDR, VideoRangeType: videoRangeSDR,
+	}}
+
+	start := func(t *testing.T, selection playback.FileSelectionV3) playback.DecisionResponseV3 {
+		t.Helper()
+		handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), testPlaybackFileResolver{file: source})
+		handler.FileVersionFetcher = testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{
+			source.ContentID: {source, alternate},
+		}}
+		handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "false"}}
+		handler.PlaybackConfig = playbackTestConfig("", "")
+		handler.ItemAccess = allowAllPlaybackItemAccess{}
+
+		request := v3HandlerStartRequest()
+		request.QualityPreference = "auto"
+		request.FileSelection = selection
+		request.ClientPlaybackContext.Deliveries[playback.DeliveryClassHLSV3] = playback.DeliveryCapabilityV3{
+			Enabled: true, SupportedOnDevice: true, Containers: []string{"hls"},
+			VideoCodecs: []string{"h264"}, AudioDecodeCodecs: []string{"aac"},
+		}
+		rr := httptest.NewRecorder()
+		startPlaybackV2IntoRecorder(t, handler, rr, request)
+
+		var response playback.DecisionResponseV3
+		if rr.Code != http.StatusCreated || json.Unmarshal(rr.Body.Bytes(), &response) != nil {
+			t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+		}
+		return response
+	}
+
+	t.Run("explicit pick refuses instead of substituting", func(t *testing.T) {
+		response := start(t, playback.FileSelectionExplicitV3)
+		if response.PlaybackPlan != nil {
+			t.Fatalf("an explicit pick was silently served as file %d: plan=%#v", response.PlaybackPlan.EffectiveMediaFileID, response.PlaybackPlan)
+		}
+		if response.Terminal == nil || response.Terminal.Reason != terminalHDRTranscodeUnsupportedV3 {
+			t.Fatalf("terminal = %#v, want the HDR cause of the picked release", response.Terminal)
+		}
+		if !strings.Contains(response.Terminal.Message, "version list") {
+			t.Fatalf("terminal message = %q, want the version-list hint", response.Terminal.Message)
+		}
+	})
+
+	t.Run("auto selection still falls back", func(t *testing.T) {
+		response := start(t, playback.FileSelectionAutoV3)
+		if response.PlaybackPlan == nil {
+			t.Fatalf("auto selection did not fall back: %#v", response.Terminal)
+		}
+		if response.PlaybackPlan.EffectiveMediaFileID != alternate.ID {
+			t.Fatalf("effective file = %d, want the playable alternate %d", response.PlaybackPlan.EffectiveMediaFileID, alternate.ID)
+		}
+		if response.PlaybackPlan.SubstitutedFromFileID != source.ID {
+			t.Fatalf("substituted_from_file_id = %d, want the requested row %d", response.PlaybackPlan.SubstitutedFromFileID, source.ID)
+		}
+	})
+}
+
 // A subtitle-only refusal at start must degrade in place on the release the
 // viewer selected, with the subtitle dropped, instead of hunting another
 // version. The alternate here carries a subtitle the refusal would not have

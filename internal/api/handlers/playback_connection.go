@@ -182,8 +182,13 @@ func (h *PlaybackHandler) lowerBufferedVersion(r *http.Request, req playback.Sta
 // lowerBufferedVersionForIntent is lowerBufferedVersion for a replan with the
 // attempt's desired tracks: a candidate gets the viewer's chosen audio and
 // subtitle, not a remap of what base happens to be playing.
+//
+// An explicit version pick keeps its own row: a bandwidth estimate may lower
+// the encode of the file the viewer chose, but moving them to a different
+// resolution is the same silent substitution the alternate-version hunt is not
+// allowed to make for a pick. Auto quality on an auto file keeps the swap.
 func (h *PlaybackHandler) lowerBufferedVersionForIntent(r *http.Request, req playback.StartRequestV3, base *models.MediaFile, audio int, settings playback.PlannerSettingsV3, desired *playback.DesiredTracksV3) (*models.MediaFile, playback.StartRequestV3, int) {
-	if req.QualityPreference != playback.QualityAutoV3 || req.BandwidthEstimateKbps == nil || !req.AllowsAlternateVersions() {
+	if req.QualityPreference != playback.QualityAutoV3 || req.BandwidthEstimateKbps == nil || !startAllowsAlternateFileV3(req) {
 		return base, req, audio
 	}
 	budget := playback.StreamBudgetKbpsV3(*req.BandwidthEstimateKbps)

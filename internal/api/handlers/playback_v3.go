@@ -2267,6 +2267,10 @@ func (h *PlaybackHandler) recordStartingDevice(ctx context.Context, userID int, 
 // reason another version can avoid and the request allows other versions, the
 // first authorized version of alternateBase that plans replaces it, with the
 // warnings that choice adds.
+//
+// An explicit version pick is never replaced here, however unplannable it is on
+// this client: see startAllowsAlternateFileV3. The refusal stands, and the
+// caller's explicit-selection hint points the viewer at the version list.
 func (h *PlaybackHandler) planStartV3(r *http.Request, req playback.StartRequestV3, requestedFile, alternateBase, effectiveFile *models.MediaFile, audioIndex int, settings playback.PlannerSettingsV3, lowerVersion *playback.LowerVersionV3, profileID string, resolutionProvenance ProbeProvenance) (alternateCandidateV3, []playback.DegradationWarningV3) { //nolint:funlen,gocyclo // planStartV3 exceeds Vio's 100-line and complexity-30 limits; refactor tracked separately
 	subtitleInventoryByFileID := map[int][]playback.SubtitleInventoryEntryV3{}
 	subtitleInventoryFor := func(file *models.MediaFile) []playback.SubtitleInventoryEntryV3 {
@@ -2342,7 +2346,7 @@ func (h *PlaybackHandler) planStartV3(r *http.Request, req playback.StartRequest
 	}
 	huntAllowed := terminalAllowsAlternateFileV3(result.Terminal) ||
 		(subtitleDegradeUnresolved && subtitleOnlyTerminalV3(result.Terminal))
-	if req.AllowsAlternateVersions() && huntAllowed { //nolint:nestif // existing alternate-version fallback; only its quality condition changed
+	if huntAllowed && startAllowsAlternateFileV3(req) { //nolint:nestif // existing alternate-version fallback; only its quality condition changed
 		accessFilter := requestAccessFilter(r)
 		alternateOrder := alternateOrderingForClient(req.Capabilities)
 		if alternates, alternateErr := h.findAlternateFilesOrdered(r.Context(), alternateBase, accessFilter, alternateOrder); alternateErr == nil {
@@ -2507,6 +2511,20 @@ func (h *PlaybackHandler) planStartV3(r *http.Request, req playback.StartRequest
 		}
 	}
 	return alternateCandidateV3{file: effectiveFile, request: req, audioIndex: audioIndex, result: result, toneMapErr: toneMapCapabilityErr}, warnings
+}
+
+// startAllowsAlternateFileV3 reports whether a fresh start may plan a sibling
+// version in place of the requested row. An explicit version pick is the
+// viewer's decision: the start must serve that row or refuse with the honest
+// reason and the version-list hint, never quietly play a different resolution
+// or dynamic range. This mirrors the replan policy (replanFallbackAllowed in
+// the replan path, which also requires FileSelection != explicit), so a pick
+// cannot be substituted at start and then kept on the replanned session.
+//
+// The auto policy keeps its fallback: a client that picked nothing still gets
+// the best playable version, and the substitution is published with its cause.
+func startAllowsAlternateFileV3(req playback.StartRequestV3) bool {
+	return req.AllowsAlternateVersions() && req.FileSelection != playback.FileSelectionExplicitV3
 }
 
 // planWithoutLowerVersionV3 is the last resort when input's lower qualities
