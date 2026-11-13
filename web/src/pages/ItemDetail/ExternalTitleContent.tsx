@@ -23,6 +23,7 @@ import MetadataBadges from "./components/MetadataBadges";
 import RequestActionBar from "./components/RequestActionBar";
 import ScoreRow from "./components/ScoreRow";
 import { SeasonRail } from "./SeasonCarousel";
+import { useT } from "@/i18n";
 
 interface ExternalTitleContentProps {
   item: RequestMediaDetail;
@@ -36,6 +37,7 @@ interface ExternalTitleContentProps {
  * page keeps the default ambient tint.
  */
 export default function ExternalTitleContent({ item, libraryHref }: ExternalTitleContentProps) {
+  const t = useT();
   const isSeries = item.media_type === "series";
   const cast = useMemo(() => castFromTMDB(item.cast ?? []), [item.cast]);
   const crew = useMemo(
@@ -52,7 +54,7 @@ export default function ExternalTitleContent({ item, libraryHref }: ExternalTitl
         <DetailHero
           title={item.title}
           topNav={<PageBack to="/requests" />}
-          context={isSeries ? "Series" : "Movie"}
+          context={isSeries ? t("web.detail.hero.typeSeries") : t("web.detail.hero.typeMovie")}
           studioLabel={pickStudioLabel(item)}
           backdropUrl={tmdbImageURL(item.backdrop_path, "original") ?? undefined}
           posterUrl={tmdbImageURL(item.poster_path, "w500") ?? undefined}
@@ -73,7 +75,7 @@ export default function ExternalTitleContent({ item, libraryHref }: ExternalTitl
             <HeroCrewLine
               crew={crew}
               genres={item.genres}
-              jobLabel={isSeries ? "Created by" : undefined}
+              jobLabel={isSeries ? t("web.detail.overview.createdBy") : undefined}
             />
           }
           actions={<RequestActionBar item={item} libraryHref={libraryHref} />}
@@ -83,7 +85,7 @@ export default function ExternalTitleContent({ item, libraryHref }: ExternalTitl
       {isSeries && (item.seasons?.length ?? 0) > 0 && <TitleSeasons seasons={item.seasons!} />}
 
       {cast.length > 0 && (
-        <DetailSection title="Cast">
+        <DetailSection title={t("web.detail.sections.cast")}>
           <CastCarousel cast={cast} />
         </DetailSection>
       )}
@@ -95,31 +97,32 @@ export default function ExternalTitleContent({ item, libraryHref }: ExternalTitl
 
 /** A series' seasons with what the library has and what is requested, like the library's season row. */
 function TitleSeasons({ seasons }: { seasons: RequestMediaSeason[] }) {
+  const t = useT();
   return (
     <SeasonRail count={seasons.length}>
       {seasons.map((season) => {
-        const label = season.name || `Season ${season.season_number}`;
-        // TVDB seasons come with an absolute poster_url; TMDB seasons come
-        // with a relative poster_path the image helper expands.
-        const poster = season.poster_url || tmdbImageURL(season.poster_path);
+        const name = t("web.detail.seasons.numbered", { season: season.season_number });
+        const poster = tmdbImageURL(season.poster_path);
         return (
           <li key={season.season_number} className="embla__slide w-[160px] shrink-0 sm:w-[170px]">
             <div className="media-card-image relative aspect-[2/3] overflow-hidden rounded-xl">
               {poster ? (
                 <img
                   src={poster}
-                  alt={label}
+                  alt={name}
                   className="h-full w-full object-cover"
                   loading="lazy"
                   decoding="async"
                 />
               ) : (
                 <div className="text-muted-foreground bg-surface flex h-full items-center justify-center p-4 text-center text-sm font-medium">
-                  {label}
+                  {name}
                 </div>
               )}
             </div>
-            <p className="truncate px-0.5 pt-2.5 text-[0.8125rem] font-semibold">{label}</p>
+            <p className="truncate px-0.5 pt-2.5 text-[0.8125rem] font-semibold">
+              {season.name || name}
+            </p>
             <p className="text-muted-foreground truncate px-0.5 text-xs">
               {formatRequestSeasonMeta(season)}
             </p>

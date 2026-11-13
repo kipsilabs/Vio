@@ -6,7 +6,7 @@ import { toast } from "sonner";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { createProfile } from "@/hooks/queries/profiles";
-import { INVALID_EMAIL_MESSAGE, isValidEmail } from "@/lib/email";
+import { invalidEmailMessage, isValidEmail } from "@/lib/email";
 
 import { StepFrame, StepSkeleton } from "../StepFrame";
 import { useWizardContext } from "../WizardContext";
@@ -127,7 +127,7 @@ export function AccountStep() {
             />
             {emailInvalid ? (
               <p id="setup-email-error" className="text-destructive text-xs">
-                {INVALID_EMAIL_MESSAGE}
+                {invalidEmailMessage()}
               </p>
             ) : null}
           </Field>

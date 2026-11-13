@@ -885,14 +885,28 @@ func (h *PlaybackHandler) HandleVideoStream(w http.ResponseWriter, r *http.Reque
 			audioTrackIndex = resolvedAudioTrackIndex
 		}
 		sourceAudioChannels := 0
+		copyAudioCodec := ""
 		if source.TranscodeAudio {
 			sourceAudioChannels = compatSourceAudioChannels(*source)
+		} else {
+			copyAudioCodec = compatSourceAudioCodec(*source)
+		}
+		// A progressive remux is one long response whose ffmpeg belongs to
+		// this request. No later request exists for a stop to refuse, so the
+		// stop has to reach the stream itself, as in the native handler.
+		var abort <-chan struct{}
+		if watcher, ok := h.sessionMgr.(transportStopWatcher); ok {
+			var release func()
+			abort, release = watcher.WatchTransportStop(playSession.UpstreamSessionID)
+			defer release()
 		}
 		_ = playback.ServeRemuxWithOptions(w, r, file.FilePath, "mp4", seekSeconds, source.TranscodeAudio, audioTrackIndex, file.PrimaryDVProfile(), playback.RemuxServeOptions{
 			ContentType:         playback.RemuxContentType(file.IsAudioOnly()),
 			AudioOnly:           file.IsAudioOnly(),
 			FFmpegPath:          h.FFmpegPath,
 			SourceAudioChannels: sourceAudioChannels,
+			CopyAudioCodec:      copyAudioCodec,
+			Abort:               abort,
 		})
 	default:
 		_ = playback.ServeDirectPlay(w, r, file.FilePath)
@@ -1422,7 +1436,7 @@ func (h *PlaybackHandler) HandleHLSSegment(w http.ResponseWriter, r *http.Reques
 				"last_produced_age_ms", lastProducedAgeMS,
 				"wait_timeout_ms", decision.WaitTimeout.Milliseconds(),
 				"reason", decision.Reason,
-				"play_session", playSessionID,
+				"play_session", playSessionFingerprint(playSessionID),
 				"session", playSession.UpstreamSessionID,
 				"playback_session_id", playSession.UpstreamSessionID,
 			)
@@ -1436,7 +1450,7 @@ func (h *PlaybackHandler) HandleHLSSegment(w http.ResponseWriter, r *http.Reques
 					"last_produced_age_ms", lastProducedAgeMS,
 					"wait_timeout_ms", decision.WaitTimeout.Milliseconds(),
 					"reason", decision.Reason,
-					"play_session", playSessionID,
+					"play_session", playSessionFingerprint(playSessionID),
 					"session", playSession.UpstreamSessionID,
 					"playback_session_id", playSession.UpstreamSessionID,
 				)
@@ -1466,7 +1480,7 @@ func (h *PlaybackHandler) HandleHLSSegment(w http.ResponseWriter, r *http.Reques
 						"last_produced_age_ms", lastProducedAgeMS,
 						"wait_timeout_ms", decision.WaitTimeout.Milliseconds(),
 						"reason", decision.Reason,
-						"play_session", playSessionID,
+						"play_session", playSessionFingerprint(playSessionID),
 						"session", playSession.UpstreamSessionID,
 						"playback_session_id", playSession.UpstreamSessionID,
 					)
@@ -1502,7 +1516,7 @@ func (h *PlaybackHandler) HandleHLSSegment(w http.ResponseWriter, r *http.Reques
 					slog.ErrorContext(r.Context(), "restart transcode at missing segment", "component", "jellycompat",
 						"error", restartErr,
 						"segment", segmentName,
-						"play_session", playSessionID,
+						"play_session", playSessionFingerprint(playSessionID),
 						"session", playSession.UpstreamSessionID,
 						"playback_session_id", playSession.UpstreamSessionID,
 					)
@@ -1533,7 +1547,7 @@ func (h *PlaybackHandler) HandleHLSSegment(w http.ResponseWriter, r *http.Reques
 						"seek_seconds", target.SeekSeconds,
 						"stream_origin_seconds", target.StreamOriginSeconds,
 						"resolved_start_segment", target.StartSegmentNumber,
-						"play_session", playSessionID,
+						"play_session", playSessionFingerprint(playSessionID),
 						"session", playSession.UpstreamSessionID,
 						"playback_session_id", playSession.UpstreamSessionID,
 					)
@@ -2174,7 +2188,7 @@ func (h *PlaybackHandler) teardownPlaySession(
 	playSession, upstreamSession, transcodeNodeURL, staged := h.stageCompatStop(ctx, playSession, fallbackSession, positionOverride, true)
 	switch {
 	case staged:
-		// stageCompatStop ran cleanup and delivered the stop.
+		// stageCompatStop ran cleanup and started delivering the stop.
 	case playSession.Terminal:
 		// A late Stopped report without PositionTicks cannot replace a staged
 		// fallback after ActiveEncodings already removed the native session. Keep
@@ -2182,13 +2196,12 @@ func (h *PlaybackHandler) teardownPlaySession(
 		// deleting the only recoverable stop position.
 		h.cleanupPlaySession(ctx, playSession, upstreamSession, transcodeNodeURL)
 		if playSession.TerminalScrobbleEvent != nil {
-			h.deliverCompatTerminal(
+			h.deliverCompatTerminalDetached(
 				ctx,
 				playSession.ID,
 				playSession.CompatToken,
 				playSession.TerminalAuthoritative,
 				playSession.ExpiresAt,
-				0,
 				true,
 			)
 		}
@@ -2299,11 +2312,34 @@ const (
 )
 
 const (
-	compatTerminalClaimLease           = 10 * time.Second
+	// compatConfirmedStopTimeout bounds one confirmed stop delivery: watch-sync's
+	// per-provider budget plus time for the reads it makes before dispatch. A
+	// provider plugin needs most of that budget, since it keeps a reserve before
+	// the host deadline and may make a cold provider write.
+	compatConfirmedStopTimeout = watchsync.ConfirmedStopDispatchTimeout + 15*time.Second
+	// compatTerminalClaimLease outlasts a delivery and its completion write, so
+	// the recovery scan or another server cannot claim a stop still in flight.
+	compatTerminalClaimLease = compatConfirmedStopTimeout + 15*time.Second
+	// compatConfirmedStopRetryWindow is how long a staged stop that keeps
+	// failing is retried, measured from when the play stopped. After it the
+	// stop is dropped with one warning, as a play that ends by expiry drops a
+	// stop the provider refuses. History export can still deliver a dropped
+	// completed play, but only when watched export is on for that connection
+	// and the play was recorded in local watch history.
+	compatConfirmedStopRetryWindow     = time.Hour
 	compatTerminalInitialRetryDelay    = 250 * time.Millisecond
 	compatTerminalMaxRetryDelay        = 30 * time.Second
 	defaultCompatTerminalFallbackDelay = 2 * time.Second
 )
+
+// compatTerminalRequestWait is how long a request that staged a stop waits
+// for its delivery before answering. Delivery carries on detached.
+func (h *PlaybackHandler) compatTerminalRequestWait() time.Duration {
+	if h != nil && h.terminalRequestWait > 0 {
+		return h.terminalRequestWait
+	}
+	return compatSessionSyncTimeout
+}
 
 func (h *PlaybackHandler) compatTerminalFallbackDelay() time.Duration {
 	if h != nil && h.terminalFallbackDelay > 0 {
@@ -2424,7 +2460,7 @@ func (h *PlaybackHandler) finishCompatTerminalStage(
 		h.cleanupPlaySession(ctx, staged, upstreamSession, transcodeNodeURL)
 	}
 	if authoritative {
-		h.deliverCompatTerminal(ctx, staged.ID, staged.CompatToken, true, staged.ExpiresAt, 0, true)
+		h.deliverCompatTerminalDetached(ctx, staged.ID, staged.CompatToken, true, staged.ExpiresAt, true)
 		return
 	}
 	h.scheduleCompatTerminalDelivery(
@@ -2544,6 +2580,20 @@ func (h *PlaybackHandler) deliverCompatTerminal(
 		*playSession.TerminalScrobbleEvent,
 		playSession.TerminalAuthoritative,
 	)
+	// A stop another dispatch is still confirming has no outcome yet, so it is
+	// kept whatever its age: that dispatch may still fail and need a retry.
+	if err != nil && !errors.Is(err, watchsync.ErrConfirmedStopInProgress) &&
+		compatTerminalRetryWindowPassed(*playSession.TerminalScrobbleEvent, time.Now()) {
+		slog.WarnContext(ctx, "dropped jellycompat watch provider stop after its retry window",
+			"component", "jellycompat",
+			"playback_session_id", playSession.TerminalScrobbleEvent.PlaybackSessionID,
+			"stopped_at", playSession.TerminalScrobbleEvent.OccurredAt,
+			"error", err,
+		)
+		// Finish the record as a delivery would, so neither this retry chain
+		// nor the recovery scan picks the stop up again.
+		err = nil
+	}
 	if err != nil {
 		h.playbackStore.ReleaseTerminalClaim(
 			playSessionID, compatToken, ownedClaimUntil, playSession.TerminalClaimVersion, false,
@@ -2573,18 +2623,60 @@ func (h *PlaybackHandler) deliverCompatTerminal(
 	)
 }
 
+// deliverCompatTerminalDetached delivers a staged stop off the caller's
+// request or recovery scan. A confirmed stop can take up to
+// compatConfirmedStopTimeout, so the caller waits only
+// compatTerminalRequestWait: a provider that answers in time still has the stop
+// before the client's next report, and a stalled one holds neither the request
+// nor the rest of a recovery batch.
+func (h *PlaybackHandler) deliverCompatTerminalDetached(
+	ctx context.Context,
+	playSessionID string,
+	compatToken string,
+	requireAuthoritative bool,
+	expiresAt time.Time,
+	retry bool,
+) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	detached := context.WithoutCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.deliverCompatTerminal(detached, playSessionID, compatToken, requireAuthoritative, expiresAt, 0, retry)
+	}()
+	timer := time.NewTimer(h.compatTerminalRequestWait())
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+	}
+}
+
+// compatTerminalRetryWindowPassed reports whether a staged stop that failed
+// has been retried for long enough. An event without a stop time is retried
+// until its play session expires.
+func compatTerminalRetryWindowPassed(event watchsync.ScrobbleEvent, now time.Time) bool {
+	return !event.OccurredAt.IsZero() && now.Sub(event.OccurredAt) >= compatConfirmedStopRetryWindow
+}
+
 // compatSessionSyncTimeout bounds the immediate session sync issued from
 // request paths, so a stalled database degrades to the periodic reconciler
 // tick instead of pinning request goroutines.
 const compatSessionSyncTimeout = 5 * time.Second
 
 func compatDetachedContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return compatDetachedContextFor(ctx, compatSessionSyncTimeout)
+}
+
+func compatDetachedContextFor(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
 	if ctx == nil {
 		ctx = context.Background()
 	} else {
 		ctx = context.WithoutCancel(ctx)
 	}
-	return context.WithTimeout(ctx, compatSessionSyncTimeout)
+	return context.WithTimeout(ctx, timeout)
 }
 
 // syncSessionsNow flushes the native-session snapshot to the shared admin
@@ -2741,7 +2833,7 @@ func (h *PlaybackHandler) handlePlaybackReport(w http.ResponseWriter, r *http.Re
 				h.syncSessionsNow(context.WithoutCancel(r.Context()), "compat_unidentified_stop")
 			} else if !errors.Is(err, playback.ErrSessionNotFound) {
 				slog.WarnContext(r.Context(), "jellycompat could not mark an unidentified stop", "component", "jellycompat",
-					"play_session_id", playSession.ID, "error", err)
+					"play_session_id", playSessionFingerprint(playSession.ID), "error", err)
 			}
 		}
 	}
@@ -2856,7 +2948,7 @@ func (h *PlaybackHandler) reviveUpstreamForReport(ctx context.Context, session *
 	revived, err := h.ensureUpstreamPlayback(ctx, session, playSession.ID, *source, playSession.UpstreamPlayMethod)
 	if err != nil {
 		slog.WarnContext(ctx, "jellycompat upstream session revive failed", "component", "jellycompat",
-			"play_session_id", playSession.ID,
+			"play_session_id", playSessionFingerprint(playSession.ID),
 			"upstream_session_id", playSession.UpstreamSessionID,
 			"error", err,
 		)
@@ -3325,6 +3417,7 @@ func (h *PlaybackHandler) ensureTranscodeSessionWithToneMapMode(
 	}
 	if !compatHLSTranscodesAudio(source) {
 		opts.TargetCodecAudio = compatCopyCodec
+		opts.CopyAudioCodec = compatSourceAudioCodec(source)
 	}
 	var toneMapCapabilities tonemap.Capabilities
 	autoVideoToolboxBitrate := 0
@@ -3911,7 +4004,7 @@ func (h *PlaybackHandler) restartCompatTranscodeForAudioSelection(
 		opts := transcodeSession.Opts()
 		if err := h.persistTranscodeRecipe(context.WithoutCancel(ctx), playSession.ID, playSession.UpstreamSessionID, opts); err != nil {
 			slog.WarnContext(ctx, "persist audio-restarted transcode recipe", "component", "jellycompat", "error", err,
-				"playback_session_id", playSession.ID)
+				"play_session_id", playSessionFingerprint(playSession.ID), "playback_session_id", playSession.UpstreamSessionID)
 		}
 		return true, nil
 	}

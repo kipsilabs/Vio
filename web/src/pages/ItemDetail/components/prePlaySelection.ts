@@ -17,6 +17,7 @@ import { resolveSubtitleAutoSelect } from "@/player/utils/subtitleSort";
 import { getSubtitleFormatLabel } from "@/player/utils/subtitleCodecs";
 import { buildPublishedSubtitleTracks } from "@/player/utils/subtitleInventory";
 import { audioTrackLabel, formatChannels } from "@/lib/mediaFormat";
+import { t } from "@/i18n";
 import {
   buildVersionSubtitleInventory,
   type VersionSubtitleInventoryRow,
@@ -34,6 +35,8 @@ export interface PrePlaySubtitleCandidateSections {
   all: PrePlaySubtitleCandidate[];
 }
 
+// These labels are part of a saved subtitle preference's track signature, which is matched
+// exactly later, so they stay the same in every interface language.
 function normalizeTrackLabel(track: VersionSubtitleTrack, fallbackIndex: number): string {
   return (
     track.title?.trim() ||
@@ -78,10 +81,12 @@ export interface SubtitlePillSummarySource {
  * stay in the open selector, where meaningful details have room to display.
  */
 export function formatSubtitlePillSummary(source: SubtitlePillSummarySource): string {
-  const name = source.languageLabel?.trim() || source.label?.trim() || "Unknown";
+  const name =
+    source.languageLabel?.trim() || source.label?.trim() || t("web.detail.subtitles.unknown");
   const parts = [name];
-  if (source.hearingImpaired && !/\b(?:sdh|cc|hi)\b/i.test(name)) parts.push("(SDH)");
-  if (source.forced && !/forced/i.test(name)) parts.push("(Forced)");
+  if (source.hearingImpaired && !/\b(?:sdh|cc|hi)\b/i.test(name))
+    parts.push(t("web.detail.subtitles.sdhMarker"));
+  if (source.forced && !/forced/i.test(name)) parts.push(t("web.detail.subtitles.forcedMarker"));
   const text = parts.join(" ");
   const codec = source.codec?.trim();
   const format = getSubtitleFormatLabel(codec) || codec?.toUpperCase();
@@ -139,10 +144,10 @@ export function resolveSelectedAudioLanguage(
 
 export function formatAudioTrackSummary(track: VersionAudioTrack | undefined): string {
   if (!track) {
-    return "Unknown";
+    return t("web.detail.audio.unknown");
   }
 
-  const language = getLanguageName(track.language ?? "") || "Unknown";
+  const language = getLanguageName(track.language ?? "") || t("web.detail.audio.unknown");
   const codec = audioTrackLabel(track);
   const channels = formatChannels(track.channels);
   return [language, codec, channels].filter(Boolean).join(" · ");

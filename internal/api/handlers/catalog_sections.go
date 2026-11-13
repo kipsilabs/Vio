@@ -31,8 +31,9 @@ func (h *SectionHandler) ResolveCatalogSection(ctx context.Context, req catalog.
 	}
 	return catalog.SectionDefinition{SectionType: string(row.section.SectionType), Title: row.section.Title,
 		ItemLimit: row.section.ItemLimit, Config: row.section.Config,
-		FetchItems: func(ctx context.Context, limit int) ([]*models.MediaItem, error) {
-			return h.fetchCatalogSectionItems(ctx, row, limit)
+		FetchItems: func(ctx context.Context, limit int) (catalog.SectionRowItems, error) {
+			items, err := h.fetchCatalogSectionItems(ctx, row, limit)
+			return catalog.SectionRowItems{Items: items}, err
 		}}, nil
 }
 

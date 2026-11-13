@@ -596,6 +596,27 @@ func containerMIME(format string) string {
 	}
 }
 
+// appendCopiedAACToMP4Args adds aac_adtstoasc when a copied audio track of
+// codec copyAudioCodec is muxed into MP4 (the progressive fMP4 remux and fMP4
+// HLS segments). AAC in MPEG-TS (and raw .aac) is ADTS-framed; MP4 needs the
+// ADTS headers stripped into a config record. FFmpeg normally inserts this
+// filter on its own, but neither under delay_moov nor inside the HLS muxer's
+// fMP4 segments: the muxer rejects the first ADTS packet ("Malformed AAC
+// bitstream") and the output ends there. The filter passes already-raw AAC
+// from MKV/MP4 through unchanged, but it refuses any other codec, so it is only
+// added for a copied AAC track. An empty codec (older tokens and recipes)
+// keeps the plain copy.
+func appendCopiedAACToMP4Args(args []string, copyAudioCodec string) []string {
+	if !copiedAudioIsAAC(copyAudioCodec) {
+		return args
+	}
+	return append(args, "-bsf:a", "aac_adtstoasc")
+}
+
+func copiedAudioIsAAC(copyAudioCodec string) bool {
+	return strings.EqualFold(strings.TrimSpace(copyAudioCodec), "aac")
+}
+
 // RemuxServeOptions carries the optional serving concerns that not every
 // caller sets, keeping the positional argument list from growing further.
 type RemuxServeOptions struct {

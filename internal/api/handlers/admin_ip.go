@@ -35,7 +35,7 @@ func (h *AdminIPHandler) HandleGetUserIPs(w http.ResponseWriter, r *http.Request
 		}
 	}
 
-	entries, err := h.repo.UserIPs(r.Context(), userID, days)
+	entries, _, err := h.repo.UserIPsPage(r.Context(), userID, days, 100, activitylog.IPPagePosition{})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to query user IPs")
 		return
@@ -59,7 +59,7 @@ func (h *AdminIPHandler) HandleGetIPUsers(w http.ResponseWriter, r *http.Request
 		}
 	}
 
-	entries, err := h.repo.IPUsers(r.Context(), ip, days)
+	entries, _, err := h.repo.IPUsersPage(r.Context(), ip, days, 100, activitylog.IPPagePosition{})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to query IP users")
 		return

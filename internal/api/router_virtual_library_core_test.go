@@ -166,13 +166,23 @@ func TestRouterStreamRouteMounted(t *testing.T) {
 		t.Fatal("NewRouter returned nil")
 	}
 
-	// Request to /api/v1/playback/start without auth returns 401 Unauthorized,
-	// proving the router mounts playback routes through authentication middleware.
-	reqStart := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil)
+	// The router mounts playback behind the API's authentication middleware:
+	// the v1 path answers the retirement tombstone, and the v2 operation is
+	// served (never 404). This harness wires no viewer access, so an anonymous
+	// v2 start reports that dependency as unavailable before it can answer 401;
+	// a fully wired server answers 401, as TestV1NamespaceIsTombstoned shows for
+	// the shared auth envelope.
+	reqStart := httptest.NewRequest(http.MethodPost, "/api/v2/playback/start", nil)
 	rrStart := httptest.NewRecorder()
 	router.ServeHTTP(rrStart, reqStart)
-	if rrStart.Code != http.StatusUnauthorized {
-		t.Fatalf("playback start status = %d, want 401; body = %s", rrStart.Code, rrStart.Body.String())
+	if rrStart.Code != http.StatusUnauthorized && rrStart.Code != http.StatusServiceUnavailable {
+		t.Fatalf("playback start status = %d, want 401 (or 503 with viewer access unwired); body = %s", rrStart.Code, rrStart.Body.String())
+	}
+	reqV1 := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil)
+	rrV1 := httptest.NewRecorder()
+	router.ServeHTTP(rrV1, reqV1)
+	if rrV1.Code != http.StatusGone {
+		t.Fatalf("retired v1 playback start status = %d, want 410; body = %s", rrV1.Code, rrV1.Body.String())
 	}
 }
 

@@ -168,7 +168,7 @@ func (h *NotificationsHandler) HandleUpdateWebhook(w http.ResponseWriter, r *htt
 		writeError(w, http.StatusBadRequest, "bad_request", "Invalid request body")
 		return
 	}
-	hook, err := service.Update(r.Context(), userID, profileID, chi.URLParam(r, "id"), req.toInput())
+	hook, err := service.UpdateGuarded(r.Context(), userID, profileID, chi.URLParam(r, "id"), req.toInput(), nil)
 	if err != nil {
 		writeWebhookError(w, err)
 		return
@@ -197,7 +197,7 @@ func (h *NotificationsHandler) HandleRotateWebhookSecret(w http.ResponseWriter, 
 		writeError(w, http.StatusServiceUnavailable, "unavailable", "Webhooks are not available")
 		return
 	}
-	signingSecret, err := service.RotateSecret(r.Context(), apimw.GetUserID(r.Context()), apimw.GetProfileID(r.Context()), chi.URLParam(r, "id"))
+	signingSecret, err := service.RotateSecretV2(r.Context(), apimw.GetUserID(r.Context()), apimw.GetProfileID(r.Context()), chi.URLParam(r, "id"))
 	if err != nil {
 		writeWebhookError(w, err)
 		return

@@ -258,6 +258,9 @@ const FeatureCodecChannelCeilingsV3 = "codec_channel_ceilings_v1"
 const (
 	TransportFeatureProgressiveRemuxExecutionV1 = "progressive_remux_execution_v1"
 	TransportFeatureProgressiveRemuxRelayV1     = "progressive_remux_relay_v1"
+	// A progressive remux URL that opts into refusing ranges past its seek
+	// origin through the remux_range query parameter.
+	TransportFeatureRemuxRangeRefusalV1 = "remux_range_refusal_v1"
 	// Theme audio markers: a proxy that serves /stream/theme, and a transcode
 	// node that approves theme files as progressive AAC inputs.
 	TransportFeatureBandwidthProbeV1      = "bandwidth_probe_v1"

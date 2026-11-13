@@ -6,7 +6,8 @@ import {
 } from "@/components/admin/ConnectionCheckAction";
 import { MobilePushPrivacyDisclosure } from "@/components/notifications/MobilePushPrivacyDisclosure";
 import { useSettingsForm } from "@/hooks/useSettingsForm";
-import { MARKER_SHARING_DISCLOSURE } from "@/lib/markers";
+import { MARKER_SHARING_DISCLOSURE_KEY } from "@/lib/markers";
+import { useT } from "@/i18n";
 import { EmbeddingProviderField } from "@/pages/admin-settings/AIProviders";
 import { ModelField } from "@/pages/admin-settings/AIModelField";
 import { SettingField } from "@/pages/admin-settings/SettingField";
@@ -40,6 +41,7 @@ const RECS_KEYS = ["recommendations.enabled", EMBEDDING_PROVIDER_KEY, EMBEDDING_
 const KEYS = [APPLE_PUSH_KEY, ANDROID_PUSH_KEY, ...MARKER_KEYS, ...DOWNLOAD_KEYS, ...RECS_KEYS];
 
 export function FeaturesStep() {
+  const t = useT();
   const form = useSettingsForm({ keys: KEYS });
   const { handleSubmit, busy } = useStepSubmit("features", form, "Failed to save");
   const recsCheck = useConnectionCheck("recommendations_embedding", form, RECS_KEYS);
@@ -166,7 +168,7 @@ export function FeaturesStep() {
         <SettingField
           label="Share markers with Silo"
           type="toggle"
-          description={MARKER_SHARING_DISCLOSURE}
+          description={t(MARKER_SHARING_DISCLOSURE_KEY)}
           value={shareMarkers ? "true" : "false"}
           onChange={(value) => form.setValue(SHARE_MARKERS_KEY, value)}
         />

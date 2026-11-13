@@ -112,7 +112,11 @@ func SetupPackage(m *testing.M, tag string) (code int) {
 
 func isDisposableBaseName(name string) bool {
 	lower := strings.ToLower(name)
-	return strings.Contains(lower, "test") || strings.Contains(lower, "purge")
+	// scripts/ci/dbpins names every copy it makes with this prefix, so a
+	// clone a test binary is handed is disposable by construction even when
+	// the template's name carries no marker.
+	return strings.HasPrefix(lower, "dbpins_") ||
+		strings.Contains(lower, "test") || strings.Contains(lower, "purge")
 }
 
 func disposableName(base, tag string) (string, error) {

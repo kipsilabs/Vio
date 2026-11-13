@@ -64,14 +64,6 @@ func Parse(raw string) (Size, error) {
 	}
 }
 
-// FromRequest reads the image size from a request's query string.
-func FromRequest(r *http.Request) (Size, error) {
-	if r == nil || r.URL == nil {
-		return Unset, nil
-	}
-	return Parse(r.URL.Query().Get(QueryParam))
-}
-
 // Variant returns the cached artwork variant for an explicitly requested size.
 //
 // Small and Large are derived from artworkkey.VariantWidths so adding or
@@ -184,4 +176,10 @@ func VariantWidthPx(variant string) (int, bool) {
 		return 0, false
 	}
 	return width, true
+}
+func FromRequest(r *http.Request) (Size, error) {
+	if r == nil || r.URL == nil {
+		return Unset, nil
+	}
+	return Parse(r.URL.Query().Get(QueryParam))
 }
