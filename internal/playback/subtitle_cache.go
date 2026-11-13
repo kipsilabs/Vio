@@ -764,9 +764,7 @@ func (c *SubtitleCache) ServeExtractWithResult(w http.ResponseWriter, r *http.Re
 		}
 	} else {
 		c.noteExtractionSuccess(opts, format)
-		if capture != nil && capture.bytes > 0 && !capture.truncated {
-			c.storeWindowResult(windowKey, opts, capture.buf.Bytes())
-		}
+		c.storeCompletedWindow(r.Context(), windowKey, opts, format, capture)
 	}
 	outcome := subtitleTraceOutcome(r.Context(), err)
 	level := slog.LevelInfo
@@ -1105,6 +1103,28 @@ func (c *SubtitleCache) dropWarmTextWindowResults(progress *subtitleWarmTextProg
 
 func (c *SubtitleCache) storeWindowResult(key string, opts StreamExtractOpts, data []byte) {
 	c.storeWindowResultFrom(key, opts, data, nil)
+}
+
+// storeCompletedWindow keeps a finished window extraction as the last-good copy
+// when, and only when, its bytes can hold a cue. A clean ffmpeg exit is not
+// enough evidence: a window whose read was cut short can still exit 0 having
+// written nothing but the format's header, and storing that makes every later
+// request inside the range answer with a document that can never carry a cue —
+// a "successful" empty subtitle for the rest of the TTL. Declining to store
+// costs a re-extract, which is the safe answer for a range whose track really
+// is empty. See subtitleWindowCacheable.
+func (c *SubtitleCache) storeCompletedWindow(ctx context.Context, key string, opts StreamExtractOpts, format string, capture *subtitleWindowCapture) {
+	if capture == nil || capture.bytes == 0 || capture.truncated || key == "" {
+		return
+	}
+	data := capture.buf.Bytes()
+	if !subtitleWindowCacheable(format, data) {
+		slog.DebugContext(ctx, "subtitle window holds no cue; not kept as last-good",
+			logKeyComponent, logValuePlayback,
+			"track", opts.TrackIndex, "format", format, "bytes", len(data))
+		return
+	}
+	c.storeWindowResult(key, opts, data)
 }
 
 // storeWindowResultFrom stores data as the last-good copy for key. A non-nil
@@ -1930,9 +1950,7 @@ func (c *SubtitleCache) serveWindowedSUP(w http.ResponseWriter, r *http.Request,
 		}
 	} else {
 		c.noteExtractionSuccess(sourceOpts, subtitleFormatSUP)
-		if capture != nil && capture.bytes > 0 && !capture.truncated {
-			c.storeWindowResult(windowKey, sourceOpts, capture.buf.Bytes())
-		}
+		c.storeCompletedWindow(r.Context(), windowKey, sourceOpts, subtitleFormatSUP, capture)
 	}
 	outcome := subtitleTraceOutcome(r.Context(), err)
 	level := slog.LevelInfo

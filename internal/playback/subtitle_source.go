@@ -3,6 +3,7 @@ package playback
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -272,6 +273,59 @@ func hasCue(format string, data []byte) bool {
 		return bytes.Contains(data, []byte("\nDialogue:")) //nolint:misspell // the ASS event keyword
 	}
 	return len(data) > 0
+}
+
+// subtitleWindowCacheable reports whether a finished window extraction is worth
+// keeping as the last-good copy. SUP needs a complete display set rather than
+// any byte (see supHasDisplaySet); the text formats reuse the cue probe above.
+func subtitleWindowCacheable(format string, data []byte) bool {
+	if len(data) == 0 {
+		return false
+	}
+	if format == subtitleFormatSUP {
+		return supHasDisplaySet(data)
+	}
+	return hasCue(format, data)
+}
+
+// PGS segment header: magic "PG", PTS, DTS, segment type, payload size.
+const supSegmentHeaderLen = 13
+
+// PGS segment types that open and close a display set.
+const (
+	supSegmentPCS = 0x16
+	supSegmentEND = 0x80
+)
+
+// supHasDisplaySet reports whether a .sup payload holds one complete display
+// set. A PGS stream is a sequence of segments, each a 13-byte header
+// (magic "PG", PTS, DTS, type, size) and a payload; a display set opens with a
+// PCS and closes with an END segment. An extraction cut at a window boundary or
+// killed mid-page ends inside a set: it has segments but no complete one, and a
+// decoder given it paints nothing. Storing such a slice as the last-good page
+// would answer every later request inside the range with bytes that never draw.
+func supHasDisplaySet(data []byte) bool {
+	open := false
+	for len(data) >= supSegmentHeaderLen {
+		if data[0] != 'P' || data[1] != 'G' {
+			return false
+		}
+		kind := data[10]
+		size := int(binary.BigEndian.Uint16(data[11:13]))
+		if len(data) < supSegmentHeaderLen+size {
+			return false
+		}
+		switch kind {
+		case supSegmentPCS:
+			open = true
+		case supSegmentEND:
+			if open {
+				return true
+			}
+		}
+		data = data[supSegmentHeaderLen+size:]
+	}
+	return false
 }
 
 // hasTimedText reports whether a WebVTT or SubRip document has a timing line
