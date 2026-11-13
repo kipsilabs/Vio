@@ -117,6 +117,24 @@ func boolFlag(set bool) int {
 	return 0
 }
 
+// supWindowPagePrintf writes one complete PGS display set through the shell: a
+// PCS segment (type 0x16, 4-byte payload) immediately followed by an END
+// segment (type 0x80, no payload), 30 bytes in all. It is the shell form of
+// pgsWindowPage in the playback tests. Only a payload holding a complete
+// display set is cacheable, so a stub that wrote the "PG" magic alone was
+// served but never stored, and every repeat re-extracted the page.
+const supWindowPagePrintf = `printf 'PG\000\000\000\000\000\000\000\000\026\000\004\000\001\002\003PG\000\000\000\000\000\000\000\000\200\000\000'`
+
+// pgsWindowStubScript is the ffmpeg stub for the bitmap window fixtures. It
+// logs its arguments to argsLog when one is given and writes a real .sup page.
+func pgsWindowStubScript(argsLog string) string {
+	script := "#!/bin/sh\n"
+	if argsLog != "" {
+		script += "printf '%s\\n' \"$*\" >> '" + argsLog + "'\n"
+	}
+	return script + supWindowPagePrintf + "\n"
+}
+
 // warmArgsLogScript logs every invocation and distinguishes the full-track
 // warm (no -ss) from the windowed extract. The warm blocks on gate so the
 // coalescing test can hold it in flight.
@@ -972,7 +990,7 @@ func TestVirtualPGSWindowWarmSkipsActivePlayback(t *testing.T) {
 	dir := t.TempDir()
 	argsLog := filepath.Join(dir, "ffmpeg.args")
 	handler, session, file, virtualURI := newVirtualSubtitleWindowFixture(t, dir,
-		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\nprintf 'PG'\n")
+		pgsWindowStubScript(argsLog))
 	session.IsPaused = false
 	identity := virtualSubtitleCacheIdentity(file, virtualURI, 0)
 
@@ -1079,7 +1097,7 @@ func TestVirtualPGSWholeTrackFetchServesCommittedWholeTrack(t *testing.T) {
 	dir := t.TempDir()
 	argsLog := filepath.Join(dir, "ffmpeg.args")
 	handler, session, file, virtualURI := newVirtualSubtitleWindowFixture(t, dir,
-		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\nprintf 'PG'\n")
+		pgsWindowStubScript(argsLog))
 	file.SubtitleTracks = []models.SubtitleTrack{{Index: 0, Codec: "hdmv_pgs_subtitle"}}
 	session.VirtualSubtitleTracks = file.SubtitleTracks
 
@@ -1338,7 +1356,7 @@ func TestVirtualSubtitleProbeCancelIsAbandonedNotUnavailable(t *testing.T) {
 		t.Skip("shell script test helper is unix-only")
 	}
 	dir := t.TempDir()
-	handler, session, file, _ := newVirtualSubtitleWindowFixture(t, dir, "#!/bin/sh\nprintf 'PG'\n")
+	handler, session, file, _ := newVirtualSubtitleWindowFixture(t, dir, pgsWindowStubScript(""))
 	writeExecutableScript(t, filepath.Join(dir, "ffprobe"), "#!/bin/sh\nexit 1\n")
 	file.SubtitleTracks = []models.SubtitleTrack{{Index: 0, Codec: "hdmv_pgs_subtitle"}}
 	session.VirtualSubtitleTracks = file.SubtitleTracks
@@ -1878,7 +1896,7 @@ func TestVirtualWholeTrackBitmapPageIsReusedWithinItsPage(t *testing.T) {
 	dir := t.TempDir()
 	argsLog := filepath.Join(dir, "ffmpeg.args")
 	handler, session, file, _ := newVirtualSubtitleWindowFixture(t, dir,
-		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\nprintf 'PG'\n")
+		pgsWindowStubScript(argsLog))
 	file.FileSize = 50 << 30
 	file.SubtitleTracks = []models.SubtitleTrack{{Index: 0, Codec: "hdmv_pgs_subtitle", Language: "fr"}}
 	session.VirtualSubtitleTracks = file.SubtitleTracks
@@ -1939,7 +1957,7 @@ func TestVirtualBitmapWindowPrefetchRunsWhilePlaying(t *testing.T) {
 	dir := t.TempDir()
 	argsLog := filepath.Join(dir, "ffmpeg.args")
 	handler, session, file, _ := newVirtualSubtitleWindowFixture(t, dir,
-		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\nprintf 'PG'\n")
+		pgsWindowStubScript(argsLog))
 	file.FileSize = 50 << 30
 	file.SubtitleTracks = []models.SubtitleTrack{{Index: 0, Codec: "hdmv_pgs_subtitle", Language: "fr"}}
 	session.VirtualSubtitleTracks = file.SubtitleTracks
@@ -1978,7 +1996,7 @@ func TestVirtualBitmapUnalignedWindowSnapsToItsPage(t *testing.T) {
 	dir := t.TempDir()
 	argsLog := filepath.Join(dir, "ffmpeg.args")
 	handler, session, file, _ := newVirtualSubtitleWindowFixture(t, dir,
-		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\nprintf 'PG'\n")
+		pgsWindowStubScript(argsLog))
 	file.FileSize = 50 << 30
 	file.SubtitleTracks = []models.SubtitleTrack{{Index: 0, Codec: "hdmv_pgs_subtitle", Language: "fr"}}
 	session.VirtualSubtitleTracks = file.SubtitleTracks
@@ -2041,7 +2059,7 @@ func TestVirtualBitmapPagePrefetchServesTheNextPage(t *testing.T) {
 	dir := t.TempDir()
 	argsLog := filepath.Join(dir, "ffmpeg.args")
 	handler, session, file, _ := newVirtualSubtitleWindowFixture(t, dir,
-		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\nprintf 'PG'\n")
+		pgsWindowStubScript(argsLog))
 	file.FileSize = 50 << 30
 	file.SubtitleTracks = []models.SubtitleTrack{{Index: 0, Codec: "hdmv_pgs_subtitle", Language: "fr"}}
 	session.VirtualSubtitleTracks = file.SubtitleTracks
