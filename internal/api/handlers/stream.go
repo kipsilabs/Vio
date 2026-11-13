@@ -1730,7 +1730,7 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 			writeErrorCause(w, http.StatusBadGateway, "virtual_stream_unavailable", "Failed to stream virtual media source", err)
 			return
 		}
-		resolved, cleanup, resolveErr := h.resolveVirtualInputURI(r.Context(), file, session.UserID, session.ProfileID, false)
+		resolved, cleanup, resolveErr := h.resolveVirtualInputForServe(r.Context(), file, session.UserID, session.ProfileID)
 		if resolveErr != nil && (errors.Is(resolveErr, virtuallibrary.ErrSessionBoundCandidateAbsent) || errors.Is(resolveErr, ErrVirtualCandidateMarkedFailed)) {
 			// The session's pinned release is absent from the provider's current
 			// list (it renumbered or dropped the result id). Mirror the transcode
@@ -1770,6 +1770,7 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 			// resolve failure keeps the v1 502 that the v2 byte-delivery
 			// adapter maps to a retryable dependency_unavailable.
 			if errors.Is(resolveErr, errVirtualProviderUnavailable) {
+				w.Header().Set("Retry-After", strconv.Itoa(virtualServeResolveRetryAfterSeconds))
 				writeErrorCause(w, http.StatusServiceUnavailable, "provider_unavailable", "The virtual source provider is temporarily unavailable", resolveErr)
 				return
 			}
