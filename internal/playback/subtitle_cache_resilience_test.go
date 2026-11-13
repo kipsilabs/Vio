@@ -71,7 +71,7 @@ func TestServeSUPExtractWindowedLeaderWriteFailureStillCommits(t *testing.T) {
 	c, source := newTestCache(t)
 	opts := windowedSupOpts(source, 0, 300, 600)
 	opts.DisableBackgroundWarm = true
-	const payload = "PGS WINDOW"
+	payload := string(pgsWindowPage)
 
 	started := make(chan struct{})
 	release := make(chan struct{})
@@ -372,7 +372,7 @@ func (w *prefixErrorWriter) Write(p []byte) (int, error) {
 func TestServeExtractWindowedCoalescesConcurrentRepeats(t *testing.T) {
 	c, source := newTestCache(t)
 	opts := windowResilienceOpts(source)
-	payload := "[Script Info]\n"
+	payload := assWindowCue
 
 	started := make(chan struct{})
 	release := make(chan struct{})

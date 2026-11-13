@@ -4308,8 +4308,8 @@
         "outcome": "playable",
         "delivery": "server_remux_progressive",
         "decision_reason": "audio_adaptation",
-        "plan_id": "plan:4f78d95e9fdd6e085ec79506894da894",
-        "plan_attempt_key": "v3:4979cff59d1f3068",
+        "plan_id": "plan:26544ac16052fa5a2206b35eefc6c49a",
+        "plan_attempt_key": "v3:5935094d303fa65b",
         "selected_tracks": {
           "audio": {
             "id": "file:42:audio:0",

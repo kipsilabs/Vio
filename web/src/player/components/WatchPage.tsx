@@ -201,6 +201,8 @@ function substitutionReasonPhrase(reason: string | undefined): string | null {
       return "The selected version wouldn't start";
     case "decode_rejected":
       return "This device can't decode the selected version";
+    case "version_not_playable":
+      return "The chosen version could not be played";
     default:
       return null;
   }

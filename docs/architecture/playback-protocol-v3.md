@@ -1470,30 +1470,99 @@ new route may be one this client cannot reach. If that recovery then cannot
 reach the server, it joins the reconnect and continues the same budget.
 
 The server applies the same distinction from its own evidence when a client
-reports the loss through `failure_recovery` anyway. A failure recovery on an
-attempt whose durable progress shows at least one accepted sample
-(`LastSequence > 0`) keeps the route that just played eligible for one reissue:
-same delivery and recipe, with a fresh plan id and stream token. The recovery
-chain's `attempt_count` bounds it, so the reissued transport's next failure
-retires the route as usual. A failure with no progress sample keeps the
-ordinary ladder, and a classification that retires the whole delivery
-(`decoder_failure`, `decode_error`, `player_failure`, `http_failure`,
-`parser_failure`) is not reissued. If that history already excluded the
-source-preserving routes and only video adaptation remains while transcoding is
-disabled, the terminal is the retryable `routes_exhausted`;
-`transcoding_disabled` stays reserved for a first plan whose source really
-needs an encode.
+reports the loss through `failure_recovery` anyway. A failure recovery whose
+classification is a connectivity loss (`transport_stall`, `network_error`,
+`network_failure`) on an attempt whose current transport already showed its
+first frame (`current_transport_rendered`) keeps the route that just played
+eligible for one reissue: same delivery and recipe, with a fresh plan id and
+stream token. The recovery chain's `attempt_count` bounds it, so the reissued
+transport's next failure retires the route as usual. A failure before the
+transport's own first frame keeps the ordinary ladder, because the new route may
+be one this client cannot reach, and any other classification is not a lost
+connection at all. If that history already excluded the source-preserving routes
+and only video adaptation remains while transcoding is disabled, the terminal is
+the retryable `routes_exhausted`; `transcoding_disabled` stays reserved for a
+first plan whose source really needs an encode.
+
+A transport failure that abandons a delivery retires the recipe, not the
+delivery class. Three cases are worth keeping apart:
+
+- **The class is unusable.** Only the client's capabilities can establish that,
+  and they do at start: a class the device does not advertise is never planned.
+  An abort cannot prove it, because the client parsed the plan and started
+  fetching it.
+- **The recipe is unusable.** `decoder_failure`, `decode_error`, and
+  `parser_failure` name a property of the recipe — a codec, a pixel format, a
+  container — that the planner can act on. They retire the delivery class,
+  subject to the software-decode and candidate-rotation deferrals, because the
+  next recipe behind the same class would use the same decoders.
+- **The abort is unrelated to delivery.** `player_failure` and `http_failure`
+  are what a viewer backing out, a player-side glitch, and a transient fetch
+  error all produce. The server cannot tell those apart from a real route
+  failure, so it deliberately treats them as recipe-scoped: the class stays
+  eligible, because one class serves several recipes (`server_remux_hls` and
+  `server_transcode_hls` are both `hls`) and a spent copy recipe must not take
+  the transcode fallback with it.
+
+The plan attempt key is what keeps a failed recipe from coming back. The
+abandoned recipe's key is excluded from the replan that answers the failure and
+is recorded on the attempt (`recovery_state.recipe_exclusions`, bounded to
+sixteen keys). Every later same-output replan adds those keys to the planner's
+loop guard, because a `track_change` or `quality_change` echoes no attempted-key
+history of its own. An `output_change` is exempt: its `OutputContextID` is part
+of every attempt key, so a recipe retired for one output is a different question
+for another. Delivery stickiness is unchanged — it keeps a same-output replan on
+the class that is playing, which is a preference, not evidence about a recipe.
+
+An audio-output initialization failure is a verdict on the audio shape the
+recipe delivered (§6.2.1); once its one stereo retry is spent, the class retires
+as it always did.
 
 The server applies one more distinction from its own evidence: whether the
 client ever read from the stream it is indicting. A `failure_recovery` that
 arrives after the server answered this attempt's playlist but before a single
 segment request is a client that stopped reading, not a verdict on the route:
 the player reached the stream, asked for no media, and then reported a failure.
-The server answers it as `playback_session_not_found` and stops the session
-instead of rotating, demoting the delivery, or persisting a failure for a recipe
-that was never exercised. A recovery that arrives before the playlist was served
-is a failure the client met inside the stream and keeps the ordinary ladder, and
-so does every session that already served a segment request.
+The server stops the session and answers it as `session_expired` instead of
+rotating, demoting the delivery, or persisting a failure for a recipe that was
+never exercised. A recovery that arrives before the playlist was served is a
+failure the client met inside the stream and keeps the ordinary ladder, and so
+does every session that already served a segment request.
+
+### 6.2.1 An audio-output failure is not a transport failure
+
+A player whose audio sink cannot initialize a track has not indicted the video
+route: the same stream can play once its audio is re-shaped for the device.
+`failure.diagnostics` therefore accepts the structured player evidence a client
+already reports on its `plan_failed` route event — `error_code`,
+`error_code_name`, and `error_cause` — and the recovery decision reads it
+directly. The asynchronous route-event stream stays diagnostics-only and is not
+authoritative for control.
+
+The failures the server treats as audio-output initialization failures are the
+Media3 audio-sink family (`5001 ERROR_CODE_AUDIO_TRACK_INIT_FAILED`,
+`5003`/`5004` offload write and init failures), the matching names in
+`failure.diagnostics` or `failure.message`, and the bare
+`failure.classification: "audio_renderer_error"` family classification.
+
+On such a failure the server does not demote the delivery. When the current
+plan delivers more than two channels, it re-plans the *same* delivery class once
+with a stereo AAC audio recipe: the video route is unchanged, and only the audio
+shape shrinks. The one retry is recorded on the attempt's delivery capability
+(`failure_reason: "audio_init_failed_shape_retry"`) and survives the client's
+capability overlay like a demotion, so a second audio-output failure on the
+already-stereo plan falls through to the ordinary demotion path instead of
+looping. A plan that already delivers stereo has nothing smaller to try and is
+handled exactly as before. A converted channel count that differs from the
+source's own layout participates in the plan identifier, so the stereo retry is
+a distinct plan from the surround recipe it replaces.
+
+When the ladder ends with no route left and the attempt's most recent failure
+was an audio-output initialization failure, the terminal is
+`audio_output_unsupported` (§7.3) rather than the generic
+`adaptation_unavailable`. A spent audio-shape retry retires the delivery class
+like a decoder failure: the failure named a property of the recipe, not the
+client's appetite.
 
 ### 6.3 `source_committed_event_v1` — the committed version is published at commit
 
@@ -1665,13 +1734,21 @@ help. Delivered inside a `201` (start) or `200` (replan), never a 4xx.
 `client_hls_unsupported`, `conversion_tool_unavailable`,
 `hdr_transcode_unsupported`, `no_alternate_version`,
 `source_metadata_incomplete`, `source_unavailable`, `source_unreadable`,
-`audio_conversion_unsupported`, `video_conversion_unsupported`,
+`audio_conversion_unsupported`, `audio_output_unsupported`,
+`video_conversion_unsupported`,
 `dv_conversion_unsupported`, `transcoding_disabled`,
 `subtitle_conversion_unsupported`, `bitrate_policy_unavailable` (no route fits
 the administrator's local or remote per-stream bitrate limit). `audio_conversion_unsupported` is not
 retryable when the selected audio track has no codec FFmpeg can name, and so
 no decoder: the planner refuses it before any route is tried, and choosing
-another track is the remedy. `source_metadata_incomplete` is retryable:
+another track is the remedy. `audio_output_unsupported` is the audio-output
+counterpart of a route refusal: the device's audio sink failed to initialize
+every recipe the server could build, and the terminal is retryable because
+choosing another audio track or changing the device's audio output setting can
+make the same source play. Its `detail` carries the client's own failing code
+(for example `media3 code 5001 ERROR_CODE_AUDIO_TRACK_INIT_FAILED`); without
+audio-output evidence the same exhaustion stays the non-retryable
+`adaptation_unavailable`. `source_metadata_incomplete` is retryable:
 the file has not been probed yet or lacks a field a route needs.
 `source_unreadable` is not: ffprobe rejected the effective file (empty,
 corrupt, truncated) and it carries no stream metadata. The scanner and the
@@ -2174,6 +2251,16 @@ their timing correction applied before any conversion (an `original=1` SRT
 included) and `Cache-Control: private, no-cache`, since a correction changes
 the bytes behind the same URL.
 
+An explicit bitmap window is a page. When a PGS `windowed=1` request starts off
+the page grid, the server extracts the page that contains it and stops on the
+last page boundary the requested range reaches, so the slice it stores is the
+same page a later request inside that range asks for; the response advertises
+the range actually extracted, which always contains the requested one. A
+client that already asks in whole pages (the web player) is unaffected. This is
+what makes a bitmap page reusable at all: a playhead-anchored slice is a range
+no later request computes, so every request re-demuxed the container and each
+page boundary showed a gap while the next slice was read.
+
 For an embedded track on a large or unknown-size virtual/remote release the
 default is a bounded first window rather than the complete track: extracting
 every byte of a multi-GB provider stream cannot finish within a client fetch
@@ -2182,13 +2269,34 @@ never converges. The server returns the playback-sized window described in §4.2
 and advertises it with `X-Subtitle-Coverage` and `X-Subtitle-Windowed`. This
 applies to converted text (WebVTT), lossless ASS/SSA, and PGS alike, and lasts
 only until a complete artifact has been committed; once one exists the whole
-artifact is served and both headers are absent. A client that requested the
-whole track therefore cannot assume a complete body: it reads the headers and
-requests subsequent windows from the advertised end, or treats the response as
-that one window. Explicit `position`/`duration` (and PGS `windowed=1` with
-bounds) always override the implicit window; a PGS `windowed=1` with no
-position or duration names no range, so it still receives the implicit first
-window. External and downloaded sidecars are always
+artifact is served and both headers are absent.
+
+The implicit window starts on a fixed grid derived from its own length, not at
+the live playhead. A page anchored a few seconds behind the playhead is never
+reused: the next request's range runs past the page the previous one produced,
+no stored page contains it, and the server demuxes the source again for every
+request. Text pages are 600 s. A bitmap (PGS) page is 120 s, the page the web
+player already requests, because a bitmap page can only be produced by demuxing
+the container: on a 50 GB / 2h52m release a 600 s page reads about 2.9 GB and
+measured 65-105 s per request, longer than the fetch that asked for it, so it
+was abandoned and never stored.
+
+The same grid is what a windowed request and the window prefetch use, so the page
+one stores is the page the client asks for next. Per class: a bitmap client asks
+for whole 120 s pages that start on the source-zero page grid, and a text client
+slides a 120 s window on a 30 s grid pulled 2 s back from the playhead. Both
+grids are mirrored from the first-party web player
+(`web/src/player/utils/subtitleWindows.ts`) by
+`playback.SubtitleRequestGridFor`, and the client and server ship together:
+changing one side without the other re-opens the miss-every-prefetch bug this
+grid exists to close.
+
+A client that requested the whole track therefore cannot assume a complete body:
+it reads the headers and requests subsequent windows from the advertised end, or
+treats the response as that one window. Explicit `position`/`duration` (and PGS
+`windowed=1` with bounds) always override the implicit window; a PGS
+`windowed=1` with no position or duration names no range, so it still receives
+the implicit first window. External and downloaded sidecars are always
 returned whole. First-party native clients that fetch a complete embedded
 sidecar in one request (`silo-apple`, `silo-android`) must handle the bounded
 default and are coordinated with this change.
@@ -2197,11 +2305,30 @@ Complete embedded text, ASS/SSA, and PGS extracts are cached by source file
 identity, modification time, size, subtitle ordinal, and output format. Partial
 or failed extracts are never published. Text and ASS cache misses stream while
 extracting; repeated complete requests reuse the finished artifact. A windowed
-miss on a large virtual source starts a detached full-track warm while the
-viewer is playing (text and ASS) or paused (bitmap), so later requests read the
-small cached artifact instead of re-demuxing the source. While an ASS warm is
-still filling, the server retains the script prefix it has produced and answers
-a window whose source range that prefix has already passed from memory. The
+miss on a large virtual source starts detached fill work so later requests do
+not re-demux the source. A session still at the start warms the complete track
+(text and ASS while playing, bitmap while paused), and later requests read the
+small cached artifact.
+
+A session past the start never builds a complete-track artifact, and that is a
+correctness rule rather than a capacity one: a complete extract always starts at
+source zero, so one started from a mid-file playhead would publish a tail slice
+as the whole track, with offsets that do not match the source timeline and
+without every cue before the seek. Playback there is served by bounded windows
+only. Such a session prefetches at most two bounded windows on the request grid
+above — the cell the live playhead falls in and the cell after it — and keeps
+them as last-good window slices. That bounded prefetch runs for a bitmap track
+while playing too, because a playing bitmap track otherwise re-demuxes the source
+at every page boundary; the complete-track bitmap warm itself stays paused-only. A
+warm that cannot reserve the track because a fill already owns it (typically the
+client's own whole-track request, or another warm) skips instead of queueing
+behind that fill and logs `subtitle cache warm skipped: a fill already owns this
+track`; it never duplicates a fill the request path is already doing. The
+prefetch skips while the relay is shedding client reads or
+when no detached capacity is free, and identical concurrent windows coalesce.
+While a full-track ASS warm is still filling, the server retains the script
+prefix it has produced and answers a window whose source range that prefix has
+already passed from memory. The
 prefix is served only once the warm's highest emitted event start has reached
 the requested end, so an event starting inside the window cannot still be
 missing; the body is the same header-plus-overlapping-events shape a windowed

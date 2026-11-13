@@ -1,10 +1,13 @@
 package playback
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -173,6 +176,53 @@ func TestVirtualSubtitleCacheArtifactSurvivesPastTenMinuteBucket(t *testing.T) {
 	}
 }
 
+// A shifted window that a cached slice already covers must be served from that
+// slice instead of re-demuxing the source. Exact repeats stay on the fast path;
+// this exercises only the covering fallback.
+func TestServeExtractTextWindowedShiftedRangeServesCoveringWindow(t *testing.T) {
+	c, source := newTestCache(t)
+	base := StreamExtractOpts{
+		InputPath:             source,
+		SourceCodec:           "subrip",
+		TrackIndex:            0,
+		SeekSeconds:           90,
+		DurationSeconds:       150,
+		DisableBackgroundWarm: true,
+	}
+	calls := 0
+	extract := func(_ context.Context, opts StreamExtractOpts) error {
+		calls++
+		_, err := io.WriteString(opts.Writer, textWindowCue)
+		return err
+	}
+	serve := func(seek, duration float64) *httptest.ResponseRecorder {
+		opts := base
+		opts.SeekSeconds = seek
+		opts.DurationSeconds = duration
+		rec := httptest.NewRecorder()
+		if err := c.ServeExtract(rec, httptest.NewRequest(http.MethodGet, "/subtitle", nil), opts, extract); err != nil {
+			t.Fatal(err)
+		}
+		return rec
+	}
+
+	if rec := serve(90, 150); rec.Body.String() != textWindowCue {
+		t.Fatalf("first body = %q", rec.Body.String())
+	}
+	// 120..240 is contained by the cached 90..240 slice.
+	if rec := serve(120, 120); rec.Body.String() != textWindowCue {
+		t.Fatalf("shifted body = %q", rec.Body.String())
+	}
+	if calls != 1 {
+		t.Fatalf("extract calls after shifted request = %d, want 1", calls)
+	}
+	// A range outside the cached slice must still extract.
+	serve(400, 120)
+	if calls != 2 {
+		t.Fatalf("extract calls after uncovered request = %d, want 2", calls)
+	}
+}
+
 func TestServeExtractTextWindowDoesNotPoisonFullTrack(t *testing.T) {
 	c, source := newTestCache(t)
 	opts := StreamExtractOpts{InputPath: source, SourceCodec: "subrip", DurationSeconds: 600}
@@ -234,7 +284,7 @@ func TestServeExtractTextWindowedUsesCachedTrackWithWarmDisabled(t *testing.T) {
 		}
 		windowCalls++
 		got = opts
-		_, err := io.WriteString(opts.Writer, "WINDOW SLICE")
+		_, err := io.WriteString(opts.Writer, textWindowCue)
 		return err
 	}); err != nil {
 		t.Fatal(err)
@@ -242,7 +292,7 @@ func TestServeExtractTextWindowedUsesCachedTrackWithWarmDisabled(t *testing.T) {
 	if windowCalls != 1 || warmCalls != 0 {
 		t.Fatalf("extract calls: window=%d warm=%d, want window=1 warm=0", windowCalls, warmCalls)
 	}
-	if rec.Body.String() != "WINDOW SLICE" {
+	if rec.Body.String() != textWindowCue {
 		t.Fatalf("windowed body = %q", rec.Body.String())
 	}
 	if got.InputPath != cachedPath {
@@ -282,7 +332,7 @@ func TestServeExtractTextWindowedMissWarmsOnce(t *testing.T) {
 		mu.Lock()
 		windowOpts = append(windowOpts, opts)
 		mu.Unlock()
-		_, err := opts.Writer.Write([]byte("WINDOW SLICE"))
+		_, err := opts.Writer.Write([]byte(textWindowCue))
 		return err
 	}
 
@@ -296,7 +346,7 @@ func TestServeExtractTextWindowedMissWarmsOnce(t *testing.T) {
 		if err := c.ServeExtract(rec, httptest.NewRequest(http.MethodGet, "/subtitle", nil), next, extract); err != nil {
 			t.Fatal(err)
 		}
-		if rec.Body.String() != "WINDOW SLICE" {
+		if rec.Body.String() != textWindowCue {
 			t.Fatalf("windowed body = %q", rec.Body.String())
 		}
 	}
@@ -363,7 +413,7 @@ func TestServeExtractTextWindowedVirtualMissSkipsCacheWarm(t *testing.T) {
 		}
 		windowCalls++
 		got = opts
-		_, err := io.WriteString(opts.Writer, "WINDOW SLICE")
+		_, err := io.WriteString(opts.Writer, textWindowCue)
 		return err
 	}); err != nil {
 		t.Fatal(err)
@@ -374,7 +424,7 @@ func TestServeExtractTextWindowedVirtualMissSkipsCacheWarm(t *testing.T) {
 	if got.InputPath != source || got.InputIsExtractedText != "" {
 		t.Fatalf("windowed extract must read the original source: %+v", got)
 	}
-	if rec.Body.String() != "WINDOW SLICE" {
+	if rec.Body.String() != textWindowCue {
 		t.Fatalf("windowed body = %q", rec.Body.String())
 	}
 	if c.HasCommittedTextEntry(source, windowed.CacheIdentity, 0, "subrip", "") {
@@ -1345,7 +1395,7 @@ func TestServeSUPExtractWindowedUsesCachedTrack(t *testing.T) {
 	err := c.ServeSUPExtract(rec, req, windowedSupOpts(source, 0, 1200, 3600), func(_ context.Context, opts StreamExtractOpts) error {
 		extractCalls++
 		got = opts
-		_, err := opts.Writer.Write([]byte("WINDOW SLICE"))
+		_, err := opts.Writer.Write(pgsWindowPage)
 		return err
 	})
 	if err != nil {
@@ -1354,7 +1404,7 @@ func TestServeSUPExtractWindowedUsesCachedTrack(t *testing.T) {
 	if extractCalls != 1 {
 		t.Fatalf("extract calls = %d", extractCalls)
 	}
-	if rec.Body.String() != "WINDOW SLICE" {
+	if !bytes.Equal(rec.Body.Bytes(), pgsWindowPage) {
 		t.Fatalf("windowed body = %q", rec.Body.String())
 	}
 	if cc := rec.Header().Get("Cache-Control"); cc != "no-store" {
@@ -1404,7 +1454,7 @@ func TestServeSUPExtractWindowedMissWarmsOnce(t *testing.T) {
 			mu.Lock()
 			windowOpts = append(windowOpts, opts)
 			mu.Unlock()
-			_, err := opts.Writer.Write([]byte("WINDOW SLICE"))
+			_, err := opts.Writer.Write(pgsWindowPage)
 			return err
 		}
 		mu.Lock()
@@ -1427,7 +1477,7 @@ func TestServeSUPExtractWindowedMissWarmsOnce(t *testing.T) {
 		if err := c.ServeSUPExtract(rec, req, windowedSupOpts(source, 0, 100+float64(i), 3600), extract); err != nil {
 			t.Fatal(err)
 		}
-		if rec.Body.String() != "WINDOW SLICE" {
+		if !bytes.Equal(rec.Body.Bytes(), pgsWindowPage) {
 			t.Fatalf("windowed body = %q", rec.Body.String())
 		}
 	}
@@ -1478,7 +1528,7 @@ func TestServeSUPExtractWindowedRemoteInputSkipsDetachedWarm(t *testing.T) {
 	err := c.ServeSUPExtract(recorder, request, opts, func(_ context.Context, extractOpts StreamExtractOpts) error {
 		if extractOpts.AllowWindow {
 			windowCalls++
-			_, writeErr := extractOpts.Writer.Write([]byte("WINDOW"))
+			_, writeErr := extractOpts.Writer.Write(pgsWindowPage)
 			return writeErr
 		}
 		warmCalls++
@@ -1490,7 +1540,7 @@ func TestServeSUPExtractWindowedRemoteInputSkipsDetachedWarm(t *testing.T) {
 	if windowCalls != 1 || warmCalls != 0 {
 		t.Fatalf("extract calls: window=%d warm=%d, want window=1 warm=0", windowCalls, warmCalls)
 	}
-	if recorder.Body.String() != "WINDOW" {
+	if !bytes.Equal(recorder.Body.Bytes(), pgsWindowPage) {
 		t.Fatalf("windowed body = %q", recorder.Body.String())
 	}
 }
@@ -1501,7 +1551,7 @@ func TestServeSUPExtractWindowedCacheKeySurvivesArtifactCommit(t *testing.T) {
 	c, source := newTestCache(t)
 	opts := windowedSupOpts(source, 0, 300, 600)
 	opts.DisableBackgroundWarm = true
-	const payload = "PGS WINDOW"
+	payload := string(pgsWindowPage)
 
 	calls := 0
 	extract := func(_ context.Context, extractOpts StreamExtractOpts) error {
@@ -1536,7 +1586,7 @@ func TestServeSUPExtractWindowedRepeatServesLastGood(t *testing.T) {
 	c, source := newTestCache(t)
 	opts := windowedSupOpts(source, 0, 300, 600)
 	opts.DisableBackgroundWarm = true
-	const payload = "PGS WINDOW"
+	payload := string(pgsWindowPage)
 
 	calls := 0
 	extract := func(_ context.Context, extractOpts StreamExtractOpts) error {
@@ -1575,7 +1625,7 @@ func TestServeSUPExtractWindowedCoalescesConcurrentRepeats(t *testing.T) {
 	c, source := newTestCache(t)
 	opts := windowedSupOpts(source, 0, 300, 600)
 	opts.DisableBackgroundWarm = true
-	const payload = "PGS WINDOW"
+	payload := string(pgsWindowPage)
 
 	started := make(chan struct{})
 	release := make(chan struct{})
@@ -1688,7 +1738,7 @@ func TestServeSUPExtractWindowedServesLastGoodDuringCooldown(t *testing.T) {
 	c, source := newTestCache(t)
 	opts := windowedSupOpts(source, 0, 300, 600)
 	opts.DisableBackgroundWarm = true
-	const payload = "PGS WINDOW"
+	payload := string(pgsWindowPage)
 
 	calls := 0
 	succeed := func(_ context.Context, extractOpts StreamExtractOpts) error {
@@ -1812,6 +1862,43 @@ func TestWarmInBackgroundSkipsInFlightFill(t *testing.T) {
 	default:
 	}
 	clientFill.Discard()
+}
+
+// A warm that cannot reserve the track because the request path already owns the
+// fill must say why. An admitted-but-idle warm with no skip-reason line is
+// indistinguishable from a broken one (production: 17 kicks, zero admissions,
+// zero skip reasons). The request-path fill is the artifact the warm exists for,
+// so refusing to join it is the right policy; the refusal just has to be
+// visible.
+func TestWarmTrackInBackgroundLogsTheFillItYieldsTo(t *testing.T) {
+	logs := &bytes.Buffer{}
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	c, source := newTestCache(t)
+	clientFill := c.BeginFill(source, 0)
+	if clientFill == nil {
+		t.Fatal("BeginFill returned nil")
+	}
+	defer clientFill.Discard()
+
+	var ran atomic.Bool
+	done := c.WarmTrackInBackground(supExtractOpts(source, 0), func(context.Context, StreamExtractOpts) error {
+		ran.Store(true)
+		return nil
+	}, "warm-skip")
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("warm did not settle")
+	}
+	if ran.Load() {
+		t.Fatal("warm extracted while the request path owned the track")
+	}
+	if !strings.Contains(logs.String(), "warm skipped: a fill already owns this track") {
+		t.Fatalf("warm skip reason not logged: %s", logs.String())
+	}
 }
 
 func TestServeSUPExtractDiscardsOnExtractError(t *testing.T) {
@@ -1989,7 +2076,7 @@ func TestPinnedTextArtifactServedWithoutReResolution(t *testing.T) {
 	rec := httptest.NewRecorder()
 	result, err := c.ServeExtractWithResult(rec, httptest.NewRequest(http.MethodGet, "/subtitle.ass", nil), opts, func(_ context.Context, o StreamExtractOpts) error {
 		got = o
-		_, err := io.WriteString(o.Writer, "WINDOW SLICE")
+		_, err := io.WriteString(o.Writer, assWindowCue)
 		return err
 	})
 	if err != nil {
@@ -2001,7 +2088,7 @@ func TestPinnedTextArtifactServedWithoutReResolution(t *testing.T) {
 	if got.InputPath != external || got.InputIsExtractedText != subtitleFormatASS {
 		t.Fatalf("serve must use the pinned artifact: %+v", got)
 	}
-	if rec.Body.String() != "WINDOW SLICE" {
+	if rec.Body.String() != assWindowCue {
 		t.Fatalf("body = %q", rec.Body.String())
 	}
 }
@@ -2069,7 +2156,7 @@ func TestServeExtractResultReportsCommittedArtifact(t *testing.T) {
 		DisableBackgroundWarm: true,
 	}
 	result, err := c.ServeExtractWithResult(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/subtitle.ass", nil), windowed, func(_ context.Context, o StreamExtractOpts) error {
-		_, err := io.WriteString(o.Writer, "SLICE")
+		_, err := io.WriteString(o.Writer, assWindowCue)
 		return err
 	})
 	if err != nil {
@@ -2094,7 +2181,7 @@ func TestServeExtractResultReportsCommittedArtifact(t *testing.T) {
 	var served StreamExtractOpts
 	result, err = c.ServeExtractWithResult(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/subtitle.ass", nil), postCommit, func(_ context.Context, o StreamExtractOpts) error {
 		served = o
-		_, err := io.WriteString(o.Writer, "SLICE")
+		_, err := io.WriteString(o.Writer, assWindowCue)
 		return err
 	})
 	if err != nil {
@@ -2439,5 +2526,121 @@ func TestWarmTrackInBackgroundLostReserveReleasesASSPrefix(t *testing.T) {
 	}
 	if c.HasCommittedTextEntry(source, opts.CacheIdentity, 0, "ass", "") {
 		t.Fatal("aborted warm committed a track")
+	}
+}
+
+// textWindowCue is a WebVTT window payload that carries a cue. Only a document
+// that can carry a cue is eligible for the last-good window cache, so window
+// fixtures use a real one.
+const textWindowCue = "WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nwindow cue\n"
+
+// assWindowCue is the ASS equivalent: a script header plus one event.
+const assWindowCue = "[Script Info]\nScriptType: v4.00+\n\n[Events]\nFormat: Layer, Start, End, Style, Text\nDialogue: 0,0:00:00.00,0:00:02.00,Default,window cue\n" //nolint:misspell // the ASS event keyword
+
+// pgsWindowPage is a .sup page holding one complete display set.
+var pgsWindowPage = append(supSegment(supSegmentPCS, []byte{0, 1, 2, 3}), supSegment(supSegmentEND, nil)...)
+
+// supSegment builds one PGS segment for a synthetic .sup payload.
+func supSegment(kind byte, payload []byte) []byte {
+	seg := make([]byte, supSegmentHeaderLen+len(payload))
+	seg[0], seg[1] = 'P', 'G'
+	seg[10] = kind
+	binary.BigEndian.PutUint16(seg[11:13], uint16(len(payload)))
+	copy(seg[supSegmentHeaderLen:], payload)
+	return seg
+}
+
+// A windowed extraction can exit 0 having written only the format header (an
+// FFmpeg that read nothing of the window, or an empty track). That payload must
+// never become the last-good copy: every later request inside the range would
+// be answered from it with a document that cannot carry a cue.
+func TestServeExtractWindowWithoutCueIsNotKeptAsLastGood(t *testing.T) {
+	c, source := newTestCache(t)
+	extractCalls := 0
+	extract := func(_ context.Context, opts StreamExtractOpts) error {
+		extractCalls++
+		_, err := io.WriteString(opts.Writer, "WEBVTT\n\n")
+		return err
+	}
+	// DisableBackgroundWarm keeps a detached full-track fill out of the
+	// extractor's call count; a virtual-source serve sets it for the same
+	// reason.
+	opts := StreamExtractOpts{
+		InputPath:             source,
+		TrackIndex:            0,
+		SourceCodec:           "subrip",
+		SeekSeconds:           0,
+		DurationSeconds:       120,
+		WindowRequested:       true,
+		DisableBackgroundWarm: true,
+	}
+	for attempt := 1; attempt <= 2; attempt++ {
+		rec := httptest.NewRecorder()
+		if err := c.ServeExtract(rec, httptest.NewRequest(http.MethodGet, "/sub.vtt", nil), opts, extract); err != nil {
+			t.Fatalf("serve %d: %v", attempt, err)
+		}
+		if got := rec.Body.String(); got != "WEBVTT\n\n" {
+			t.Fatalf("serve %d body = %q, want the cue-less document", attempt, got)
+		}
+		if extractCalls != attempt {
+			t.Fatalf("serve %d: extract calls = %d, want %d: a cue-less window was served from the last-good cache", attempt, extractCalls, attempt)
+		}
+	}
+}
+
+// A .sup page that ends inside a display set (no END after its PCS) is a slice
+// of a page, not a page: caching it answers every later request in the range
+// with bytes no decoder can paint.
+func TestServeSUPExtractWindowWithoutDisplaySetIsNotKeptAsLastGood(t *testing.T) {
+	c, source := newTestCache(t)
+	partial := append(supSegment(supSegmentPCS, []byte{0, 1, 2, 3}), supSegment(0x17, []byte{0, 0})...)
+	extractCalls := 0
+	extract := func(_ context.Context, opts StreamExtractOpts) error {
+		extractCalls++
+		_, err := opts.Writer.Write(partial)
+		return err
+	}
+	opts := windowedSupOpts(source, 0, 0, 120)
+	opts.DisableBackgroundWarm = true
+	for attempt := 1; attempt <= 2; attempt++ {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/sub.sup?windowed=1&position=0&duration=120", nil)
+		if err := c.ServeSUPExtract(rec, req, opts, extract); err != nil {
+			t.Fatalf("serve %d: %v", attempt, err)
+		}
+		if !bytes.Equal(rec.Body.Bytes(), partial) {
+			t.Fatalf("serve %d body = %d bytes, want the extracted slice", attempt, rec.Body.Len())
+		}
+		if extractCalls != attempt {
+			t.Fatalf("serve %d: extract calls = %d, want %d: a page with no display set was served from the last-good cache", attempt, extractCalls, attempt)
+		}
+	}
+}
+
+// The positive control: a page holding a complete display set is still kept, so
+// the rule above narrows what is cached without disabling the last-good cache.
+func TestServeSUPExtractWindowWithDisplaySetIsKeptAsLastGood(t *testing.T) {
+	c, source := newTestCache(t)
+	page := append(supSegment(supSegmentPCS, []byte{0, 1, 2, 3}), supSegment(supSegmentEND, nil)...)
+	extractCalls := 0
+	extract := func(_ context.Context, opts StreamExtractOpts) error {
+		extractCalls++
+		_, err := opts.Writer.Write(page)
+		return err
+	}
+	opts := windowedSupOpts(source, 0, 0, 120)
+	opts.DisableBackgroundWarm = true
+	for attempt := 1; attempt <= 2; attempt++ {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/sub.sup?windowed=1&position=0&duration=120", nil)
+		if err := c.ServeSUPExtract(rec, req, opts, extract); err != nil {
+			t.Fatalf("serve %d: %v", attempt, err)
+		}
+		if !bytes.Equal(rec.Body.Bytes(), page) {
+			t.Fatalf("serve %d body = %d bytes, want the page", attempt, rec.Body.Len())
+		}
+	}
+	if extractCalls != 1 {
+		t.Fatalf("extract calls = %d, want 1: a complete page must be kept and re-served", extractCalls)
 	}
 }

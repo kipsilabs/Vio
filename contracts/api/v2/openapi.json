@@ -35701,6 +35701,13 @@
           "decoder_name": {
             "type": "string"
           },
+          "diagnostics": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "maxProperties": 32,
+            "type": "object"
+          },
           "message": {
             "type": "string"
           }

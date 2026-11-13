@@ -123,6 +123,15 @@ type PlannerInputV3 struct {
 	AdditionalSubtitles              []SubtitleInventoryEntryV3
 	ForceSoftwareVideoDecode         bool
 	DecodeAttemptDetail              string
+	// AudioShapeRetry rebuilds the current delivery's audio as a stereo AAC
+	// recipe after the client's audio output failed to initialize on a
+	// surround one. It is set only for the single bounded retry the handler
+	// allows per delivery, and it never changes the delivery itself.
+	AudioShapeRetry bool
+	// AudioInitFailureDetail names the client's audio-output failure when the
+	// attempt's most recent failure was one. The planner uses it to report a
+	// specific terminal instead of a generic adaptation refusal.
+	AudioInitFailureDetail string
 	// LocalNetwork reports that the request came from the server's local
 	// network (streamlocation.Local). False is treated as remote.
 	LocalNetwork bool
@@ -762,6 +771,14 @@ func planPlaybackOnceV3(input PlannerInputV3) (result PlannerResultV3) {
 		progressiveTranscodeAudio := progressiveCodecTranscodeAudio || progressiveChannelLimited
 		hlsCodecTranscodeAudio := !hlsCodecAudioOK || normalizeMatroskaAAC
 		hlsTranscodeAudio := hlsCodecTranscodeAudio || hlsChannelLimited
+		if input.AudioShapeRetry && source.AudioChannels > 2 {
+			// The client's audio output failed on the surround recipe this
+			// delivery built. Rebuild the same delivery's audio as stereo AAC:
+			// keep the video route identical and force the audio conversion
+			// even when the source codec was copyable there.
+			progressiveTranscodeAudio = true
+			hlsTranscodeAudio = true
+		}
 		hlsAudioQuirk, hlsAudioQuirkOK := hlsEAC3AudioCorrectionV3(source, input.Request)
 		// The device quirk owns the conversion of a codec HLS could otherwise
 		// copy, including one that only exceeds the channel ceiling, so its
@@ -770,14 +787,14 @@ func planPlaybackOnceV3(input PlannerInputV3) (result PlannerResultV3) {
 		hlsAACChannels := 0
 		switch {
 		case hlsQuirkConvertsAudio:
-			hlsAACChannels = aacOutputChannelsV3(input.Request, DeliveryClassHLSV3, source.AudioChannels, false)
+			hlsAACChannels = aacOutputChannelsForPlanV3(input, DeliveryClassHLSV3, source.AudioChannels, false)
 		case hlsTranscodeAudio:
 			// HLS packaging cannot safely copy non-native codecs such as DTS,
 			// TrueHD, or Opus. Preserve surround when adapting those codecs,
 			// and keep as many channels as a channel ceiling allows; a native
 			// codec rejected by the scoped client claim keeps the normal
 			// compatibility downmix policy.
-			hlsAACChannels = aacOutputChannelsV3(input.Request, DeliveryClassHLSV3, source.AudioChannels, hlsChannelLimited || !hlsNativeAudioCodecV3(source.AudioCodec))
+			hlsAACChannels = aacOutputChannelsForPlanV3(input, DeliveryClassHLSV3, source.AudioChannels, hlsChannelLimited || !hlsNativeAudioCodecV3(source.AudioCodec))
 		}
 		progressiveAudioConvertOK := false
 		if progressiveTranscodeAudio && deliveryAvailableV3(input.Request, DeliveryClassProgressiveV3) {
@@ -845,7 +862,7 @@ func planPlaybackOnceV3(input PlannerInputV3) (result PlannerResultV3) {
 			progressivePlan.DecisionReason = decisionReasonContainerNormalizationV3
 			progressiveAudioChannels := 0
 			if progressiveTranscodeAudio && progressiveAudioConvertOK {
-				progressiveAudioChannels = aacOutputChannelsV3(input.Request, DeliveryClassProgressiveV3, source.AudioChannels, progressiveChannelLimited)
+				progressiveAudioChannels = aacOutputChannelsForPlanV3(input, DeliveryClassProgressiveV3, source.AudioChannels, progressiveChannelLimited)
 				progressivePlan.EffectiveRecipe.AudioCodec = audioCodecAACV3
 				progressivePlan.EffectiveRecipe.AudioChannels = intPointerV3(progressiveAudioChannels)
 				progressivePlan.EffectiveRecipe.AudioLayout = audioLayoutForChannelsV3(progressiveAudioChannels)
@@ -977,6 +994,14 @@ func planPlaybackOnceV3(input PlannerInputV3) (result PlannerResultV3) {
 		return planVideoTranscodeV3(input, base, source, quality, hlsSubtitle, "copy_routes_exhausted", false, compatibleRouteExcludedByHistory)
 	}
 
+	if input.AudioInitFailureDetail != "" {
+		// The attempt's most recent failure was the device's audio output
+		// failing to initialize, and no recipe survived the ladder. Name that
+		// cause instead of the generic route refusal, and stay retryable: a
+		// different audio track or device output setting can make the same
+		// source play. The detail carries the client's own failing code.
+		return terminalPlannerResultV3WithDetail(TerminalAudioOutputUnsupportedV3, TerminalAudioOutputUnsupportedMessageV3, input.AudioInitFailureDetail, true)
+	}
 	return terminalPlannerResultV3("adaptation_unavailable", "No validated playback route is available for this source and output route.", false)
 }
 
@@ -1340,6 +1365,16 @@ func aacOutputChannelsV3(request StartRequestV3, deliveryClass string, sourceCha
 	return 2
 }
 
+// aacOutputChannelsForPlanV3 is aacOutputChannelsV3 with the audio-shape
+// recovery applied: a delivery whose surround recipe failed to initialize is
+// re-planned as stereo, which every AAC decoder accepts.
+func aacOutputChannelsForPlanV3(input PlannerInputV3, deliveryClass string, sourceChannels int, preserveSurround bool) int {
+	if input.AudioShapeRetry {
+		preserveSurround = false
+	}
+	return aacOutputChannelsV3(input.Request, deliveryClass, sourceChannels, preserveSurround)
+}
+
 func audioLayoutForChannelsV3(channels int) string {
 	switch channels {
 	case 1:
@@ -1597,7 +1632,7 @@ func resolveTranscodeVideoTargetV3(input PlannerInputV3, source SourceDescriptor
 	}
 	// Surround sources keep 5.1 through the AAC re-encode (universal Media3
 	// decode); only stereo/mono sources — and unknown layouts — downmix to 2.0.
-	targetAudioChannels := aacOutputChannelsV3(input.Request, DeliveryClassHLSV3, source.AudioChannels, true)
+	targetAudioChannels := aacOutputChannelsForPlanV3(input, DeliveryClassHLSV3, source.AudioChannels, true)
 	// A server bitrate cap, and the estimate budget of an automatic encode,
 	// reserve the AAC and mux share before either video codec is sized, so
 	// the stream fits as a whole and the HEVC decoder check below sees the
@@ -1757,7 +1792,7 @@ func resolveTranscodeVideoTargetV3(input PlannerInputV3, source SourceDescriptor
 func applyTranscodeAudioBudgetV3(input PlannerInputV3, source SourceDescriptorV3, quality *QualityResultV3) (int, *PlannerResultV3) {
 	targetAudioBitrateKbps := 0
 	if input.ServerBitrateCapKbps > 0 {
-		channels := aacOutputChannelsV3(input.Request, DeliveryClassHLSV3, source.AudioChannels, true)
+		channels := aacOutputChannelsForPlanV3(input, DeliveryClassHLSV3, source.AudioChannels, true)
 		_, defaultAudioBitrateKbps := ResolveAACOutputV3(channels, 0)
 		budget := optionalValueV3(input.Request.BandwidthCapKbps) * 95 / 100
 		targetAudioBitrateKbps = min(defaultAudioBitrateKbps, max(64, budget/4))
@@ -1940,7 +1975,7 @@ func planVideoTranscodeV3(input PlannerInputV3, base PlanV3, source SourceDescri
 	plan.EffectiveRecipe.BitrateKbps = intPointerV3(quality.BitrateKbps)
 	targetAudioChannels := targetVideo.audioChannels
 	if targetAudioChannels <= 0 {
-		targetAudioChannels = aacOutputChannelsV3(input.Request, DeliveryClassHLSV3, source.AudioChannels, true)
+		targetAudioChannels = aacOutputChannelsForPlanV3(input, DeliveryClassHLSV3, source.AudioChannels, true)
 	}
 	audioLayout := audioLayoutForChannelsV3(targetAudioChannels)
 	plan.EffectiveRecipe.AudioChannels = intPointerV3(targetAudioChannels)

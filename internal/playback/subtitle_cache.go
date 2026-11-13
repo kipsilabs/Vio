@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -240,6 +241,12 @@ const (
 	// a page storm that never leaves a gap is better served by the next miss
 	// than by a warm that keeps demuxing from the start.
 	subtitleWarmPageYieldAttempts = 4
+	// subtitleWarmRequestShedQuietWindow keeps a new warm off a relay source
+	// whose request-path admission recently shed a client read. The warm is
+	// opportunistic: adding a full-track demux to a pipe that is already
+	// refusing the window the viewer waits on makes both slower. Once the
+	// source stops shedding for this long, the next windowed miss re-attempts.
+	subtitleWarmRequestShedQuietWindow = 15 * time.Second
 	// subtitleWindowResultTTL bounds how long a successful bounded window stays
 	// servable as the last-good copy. A hit refreshes the deadline, so a client
 	// that keeps retrying the same window through an upstream outage keeps its
@@ -332,16 +339,52 @@ func (e *SubtitleExtractionRetryError) Error() string {
 }
 
 // subtitleWindowResult is one successfully extracted bounded window kept as the
-// last-good copy for exact repeats.
+// last-good copy for exact repeats and for shifted requests inside its range.
 type subtitleWindowResult struct {
 	data     []byte
 	storedAt time.Time
+	// base is the source identity half of the window key (everything before the
+	// start/end/open-ended suffix). A covering lookup compares it so a window
+	// from another track, format, or source generation can never answer.
+	base string
+	// startSeconds, endSeconds, and openEnded are the source-time range this
+	// slice actually covers. They mirror the extract options that produced it,
+	// not the range a later request asked for.
+	startSeconds float64
+	endSeconds   float64
+	openEnded    bool
 	// warmPrefix is non-nil when data was rendered by an in-progress ASS warm's
 	// prefix rather than extracted from a source or committed artifact. Such a
 	// slice is only as complete as that layer's event-ordering guarantee, so
 	// disabling the layer evicts these entries and lets the same window fall
 	// through to the extraction path.
 	warmPrefix *subtitleWarmTextProgress
+}
+
+// covers reports whether this slice's source-time range contains the requested
+// range. An open-ended request (start to EOF) is only covered by an open-ended
+// slice; a bounded request is covered by an open-ended slice that starts at or
+// before it.
+func (e subtitleWindowResult) covers(startSeconds, endSeconds float64, openEnded bool) bool {
+	const epsilon = 1e-6
+	if e.startSeconds > startSeconds+epsilon {
+		return false
+	}
+	if openEnded {
+		return e.openEnded
+	}
+	if e.openEnded {
+		return true
+	}
+	return e.endSeconds >= endSeconds-epsilon
+}
+
+// spanSeconds is the coverage width used to prefer the tightest covering slice.
+func (e subtitleWindowResult) spanSeconds() float64 {
+	if e.openEnded {
+		return math.Inf(1)
+	}
+	return e.endSeconds - e.startSeconds
 }
 
 // subtitleWindowFlight is a per-window in-flight marker; done closes when the
@@ -721,9 +764,7 @@ func (c *SubtitleCache) ServeExtractWithResult(w http.ResponseWriter, r *http.Re
 		}
 	} else {
 		c.noteExtractionSuccess(opts, format)
-		if capture != nil && capture.bytes > 0 && !capture.truncated {
-			c.storeWindowResult(windowKey, opts, capture.buf.Bytes())
-		}
+		c.storeCompletedWindow(r.Context(), windowKey, opts, format, capture)
 	}
 	outcome := subtitleTraceOutcome(r.Context(), err)
 	level := slog.LevelInfo
@@ -909,6 +950,15 @@ func (c *SubtitleCache) windowResultKey(opts StreamExtractOpts, format string) (
 func (c *SubtitleCache) serveWindowResult(w http.ResponseWriter, r *http.Request, opts StreamExtractOpts, format, key string) (served bool, err error) {
 	data, ok := c.lookupWindowResult(key)
 	if !ok {
+		// Exact repeats are the fast path; a client that shifts its playhead by
+		// a few seconds asks for a different exact window even though a cached
+		// slice already covers the range. Fall back to the tightest covering
+		// window only when no exact entry exists. The key is authoritative for
+		// the source identity: opts.InputPath may already name a committed
+		// artifact rather than the source the window was cached under.
+		data, ok = c.lookupCoveringWindowResult(windowResultKeyBase(key), opts)
+	}
+	if !ok {
 		return false, nil
 	}
 	recordSubtitleServeSource(subtitleServeMemoryWindow)
@@ -962,6 +1012,74 @@ func (c *SubtitleCache) lookupWindowResult(key string) ([]byte, bool) {
 	return entry.data, true
 }
 
+// lookupCoveringWindowResult serves a cached slice whose source-time range
+// contains the requested window. The client's window starts move with the
+// playhead, so an exact-key lookup re-demuxes a window that is 95% already
+// cached. A covering slice is a correct answer: it is the same source
+// identity, track, and output format, and it contains every cue in the
+// requested range. The tightest match wins so an oversized slice is not served
+// when a closer one is present. Expired/prefix-disabled entries are skipped
+// exactly like the exact lookup.
+func (c *SubtitleCache) lookupCoveringWindowResult(base string, opts StreamExtractOpts) ([]byte, bool) {
+	if c == nil || base == "" {
+		return nil, false
+	}
+	windowed, start, end, openEnded := opts.WindowCoverage()
+	if !windowed {
+		return nil, false
+	}
+	now := time.Now()
+	c.windowMu.Lock()
+	defer c.windowMu.Unlock()
+	bestKey := ""
+	bestSpan := math.Inf(1)
+	for key, entry := range c.windowResults {
+		if entry.base != base {
+			continue
+		}
+		if now.Sub(entry.storedAt) >= subtitleWindowResultTTL {
+			continue
+		}
+		if entry.warmPrefix != nil && entry.warmPrefix.prefixDisabled() {
+			continue
+		}
+		if !entry.covers(start, end, openEnded) {
+			continue
+		}
+		if span := entry.spanSeconds(); span < bestSpan {
+			bestKey, bestSpan = key, span
+		}
+	}
+	if bestKey == "" {
+		return nil, false
+	}
+	entry := c.windowResults[bestKey]
+	entry.storedAt = now
+	c.windowResults[bestKey] = entry
+	return entry.data, true
+}
+
+// windowResultKeyBase strips the start/end/open-ended suffix from a window key,
+// leaving the source identity the covering lookup compares. The key format is
+// `base|%.3f|%.3f|%t`, so three separators are removed from the right; a base
+// containing `|` (a path or identity can) stays intact.
+func windowResultKeyBase(key string) string {
+	last := strings.LastIndexByte(key, '|')
+	if last < 0 {
+		return ""
+	}
+	prev := strings.LastIndexByte(key[:last], '|')
+	if prev < 0 {
+		return ""
+	}
+	base := key[:prev]
+	prev = strings.LastIndexByte(base, '|')
+	if prev < 0 {
+		return ""
+	}
+	return base[:prev]
+}
+
 // dropWarmTextWindowResults evicts the windows one warm prefix produced when
 // that layer disables. Those slices were rendered from a prefix whose
 // completeness is no longer proven, so a repeat of the same exact window must
@@ -987,6 +1105,28 @@ func (c *SubtitleCache) storeWindowResult(key string, opts StreamExtractOpts, da
 	c.storeWindowResultFrom(key, opts, data, nil)
 }
 
+// storeCompletedWindow keeps a finished window extraction as the last-good copy
+// when, and only when, its bytes can hold a cue. A clean ffmpeg exit is not
+// enough evidence: a window whose read was cut short can still exit 0 having
+// written nothing but the format's header, and storing that makes every later
+// request inside the range answer with a document that can never carry a cue —
+// a "successful" empty subtitle for the rest of the TTL. Declining to store
+// costs a re-extract, which is the safe answer for a range whose track really
+// is empty. See subtitleWindowCacheable.
+func (c *SubtitleCache) storeCompletedWindow(ctx context.Context, key string, opts StreamExtractOpts, format string, capture *subtitleWindowCapture) {
+	if capture == nil || capture.bytes == 0 || capture.truncated || key == "" {
+		return
+	}
+	data := capture.buf.Bytes()
+	if !subtitleWindowCacheable(format, data) {
+		slog.DebugContext(ctx, "subtitle window holds no cue; not kept as last-good",
+			logKeyComponent, logValuePlayback,
+			"track", opts.TrackIndex, "format", format, "bytes", len(data))
+		return
+	}
+	c.storeWindowResult(key, opts, data)
+}
+
 // storeWindowResultFrom stores data as the last-good copy for key. A non-nil
 // warmPrefix marks bytes rendered by an unfinished warm prefix, so the entry is
 // dropped if that layer disables. A store that races the disable either sees the
@@ -995,7 +1135,8 @@ func (c *SubtitleCache) storeWindowResultFrom(key string, opts StreamExtractOpts
 	if c == nil || key == "" || len(data) == 0 || len(data) > subtitleWindowResultMaxEntryBytes {
 		return
 	}
-	if windowed, _, _, _ := opts.WindowCoverage(); !windowed {
+	windowed, start, end, openEnded := opts.WindowCoverage()
+	if !windowed {
 		return
 	}
 	now := time.Now()
@@ -1013,9 +1154,13 @@ func (c *SubtitleCache) storeWindowResultFrom(key string, opts StreamExtractOpts
 	copyOfData := make([]byte, len(data))
 	copy(copyOfData, data)
 	c.windowResults[key] = subtitleWindowResult{
-		data:       copyOfData,
-		storedAt:   now,
-		warmPrefix: warmPrefix,
+		data:         copyOfData,
+		storedAt:     now,
+		base:         windowResultKeyBase(key),
+		startSeconds: start,
+		endSeconds:   end,
+		openEnded:    openEnded,
+		warmPrefix:   warmPrefix,
 	}
 	c.windowBytes += int64(len(copyOfData))
 	c.evictWindowResultsLocked(now)
@@ -1805,9 +1950,7 @@ func (c *SubtitleCache) serveWindowedSUP(w http.ResponseWriter, r *http.Request,
 		}
 	} else {
 		c.noteExtractionSuccess(sourceOpts, subtitleFormatSUP)
-		if capture != nil && capture.bytes > 0 && !capture.truncated {
-			c.storeWindowResult(windowKey, sourceOpts, capture.buf.Bytes())
-		}
+		c.storeCompletedWindow(r.Context(), windowKey, sourceOpts, subtitleFormatSUP, capture)
 	}
 	outcome := subtitleTraceOutcome(r.Context(), err)
 	level := slog.LevelInfo
@@ -1952,6 +2095,11 @@ func (c *SubtitleCache) WarmInBackground(opts StreamExtractOpts, extract SUPExtr
 	if !keyOK {
 		return
 	}
+	if relayDemuxRequestPathShedding(opts.InputPath, subtitleWarmRequestShedQuietWindow) {
+		slog.Debug("subtitle cache warm skipped: request-path admission is shedding",
+			"input", opts.InputPath, "track", opts.TrackIndex)
+		return
+	}
 	if !c.warmAdmitted(key, time.Now()) {
 		slog.Debug("subtitle cache warm skipped: failure cooldown",
 			"input", opts.InputPath, "track", opts.TrackIndex)
@@ -1993,6 +2141,15 @@ func (c *SubtitleCache) WarmInBackground(opts StreamExtractOpts, extract SUPExtr
 		start := time.Now()
 		slog.Info("subtitle cache warm started",
 			"input", opts.InputPath, "track", opts.TrackIndex)
+		// A request-path shed that started after this warm was admitted means
+		// the pipe is now serving viewers at its limit; yield the fill rather
+		// than adding a full-track demux to it.
+		if relayDemuxRequestPathShedding(opts.InputPath, subtitleWarmRequestShedQuietWindow) {
+			fill.Discard()
+			slog.DebugContext(ctx, "subtitle cache warm skipped: request-path admission is shedding",
+				"input", opts.InputPath, "track", opts.TrackIndex)
+			return
+		}
 		// A warm is opportunistic: when the relay is already at its demux
 		// ceiling it is dropped rather than queued, and the next windowed miss
 		// re-attempts it. Queueing would make it contend with the window a
@@ -2084,6 +2241,12 @@ func (c *SubtitleCache) WarmTrackInBackground(opts StreamExtractOpts, extract SU
 		close(done)
 		return done
 	}
+	if relayDemuxRequestPathShedding(opts.InputPath, subtitleWarmRequestShedQuietWindow) {
+		slog.Debug("subtitle cache warm skipped: request-path admission is shedding",
+			"input", opts.InputPath, "track", opts.TrackIndex, "format", format)
+		close(done)
+		return done
+	}
 	if !c.warmAdmitted(key, time.Now()) {
 		slog.Debug("subtitle cache warm skipped: failure cooldown",
 			"input", opts.InputPath, "track", opts.TrackIndex, "format", format)
@@ -2098,11 +2261,23 @@ func (c *SubtitleCache) WarmTrackInBackground(opts StreamExtractOpts, extract SU
 		close(done)
 		return done
 	}
-	fill, _ := c.reserveFill(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, format, true)
+	fill, inflight := c.reserveFill(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, format, true)
 	if fill == nil {
-		// Another fill (client-driven or a previous warm) is already in
-		// flight, or the cache is unusable — either way, nothing to do.
 		<-c.warmSem
+		// A fill already owns this track's artifact key. That is the healthy
+		// case — the request path is producing the artifact this warm exists
+		// for — so the warm adds nothing and must not queue behind it. Say so
+		// instead of returning silently: an admitted-but-idle warm with no log
+		// is indistinguishable from a broken one (production: 17 kicks, zero
+		// admissions, zero skip-reason lines).
+		if inflight != nil {
+			slog.Info("subtitle cache warm skipped: a fill already owns this track",
+				"input", opts.InputPath, "track", opts.TrackIndex, "format", format,
+				"background_fill", c.fillStartedInBackground(inflight))
+		} else {
+			slog.Debug("subtitle cache warm skipped: cache unavailable for this source",
+				"input", opts.InputPath, "track", opts.TrackIndex, "format", format)
+		}
 		close(done)
 		return done
 	}
@@ -2147,6 +2322,16 @@ func (c *SubtitleCache) WarmTrackInBackground(opts StreamExtractOpts, extract SU
 			"input", opts.InputPath, "track", opts.TrackIndex, "format", format)
 		yields := 0
 		for {
+			// A request-path shed while this warm was settling means viewers
+			// are already waiting at the pipe's limit. Drop the opportunistic
+			// full-track read; the next windowed miss re-attempts it once the
+			// source stops shedding.
+			if relayDemuxRequestPathShedding(opts.InputPath, subtitleWarmRequestShedQuietWindow) {
+				fill.Discard()
+				slog.Debug("subtitle cache warm skipped: request-path admission is shedding",
+					"input", opts.InputPath, "track", opts.TrackIndex, "format", format)
+				return
+			}
 			// An admitted page owns the pipe; wait for it (bounded) instead of
 			// demuxing the same source alongside it. This also covers the race
 			// where a page is admitted between our start and the first read.
@@ -2637,6 +2822,18 @@ func (c *SubtitleCache) reserveFill(inputPath, cacheIdentity string, trackIndex 
 	}
 	fill.tmp = tmp
 	return fill, nil
+}
+
+// fillStartedInBackground reports whether an in-flight fill was admitted as a
+// background (warm) fill rather than by the request path. It is observation
+// only, for the warm's skip log.
+func (c *SubtitleCache) fillStartedInBackground(fill *SubtitleCacheFill) bool {
+	if c == nil || fill == nil {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return fill.background
 }
 
 // warmInFlight reports whether a background warm is currently filling the

@@ -697,6 +697,56 @@ func TestResolveCopySeekAnchorForSourceCoalescesConcurrentIdenticalProbes(t *tes
 	}
 }
 
+// TestResolveCopySeekAnchorRetryDoesNotJoinSpentFlight pins the retry's own
+// flight. A caller returns from a timed-out attempt as soon as its budget ends,
+// but the probe flight it started keeps draining to reap the killed process. A
+// retry that lands in that window must open the provider under its own fresh
+// budget; joining the spent flight answers the first attempt's timeout a few
+// milliseconds later while the reserved budget goes unused.
+func TestResolveCopySeekAnchorRetryDoesNotJoinSpentFlight(t *testing.T) {
+	const identity = "virtual://movie/retry-flight"
+	var calls atomic.Int32
+	retryStarted := make(chan struct{})
+	resetCopySeekAnchorCache(t, nil, func(ctx context.Context, _ string, _ string, requested float64, segmentDuration int) (float64, int, error) {
+		if calls.Add(1) == 1 {
+			// The first attempt's own budget ends and the caller returns, but
+			// the flight keeps draining while the killed probe is classified
+			// and reaped. Hold it open until the retry has either started its
+			// own probe or joined this one; the deadline only releases a retry
+			// that joined, so the test cannot hang on the bug it pins.
+			<-ctx.Done()
+			select {
+			case <-retryStarted:
+			case <-time.After(2 * time.Second):
+			}
+			return 0, 0, fmt.Errorf("resolve copy seek anchor: probe interrupted: %w", ctx.Err())
+		}
+		close(retryStarted)
+		return requested - 1, int((requested - 1) / float64(segmentDuration)), nil
+	})
+	firstKey := copySeekAnchorFlightKey(context.Background(), copySeekAnchorSourceKey(ResolveFFmpegPath("ffmpeg"), identity, 2), 120)
+	t.Cleanup(func() { awaitCopySeekProbeFlight(t, firstKey) })
+
+	firstCtx, firstCancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer firstCancel()
+	if _, _, err := ResolveCopySeekAnchorForSource(firstCtx, "ffmpeg", identity, "http://relay/retry", 120, 2); err == nil {
+		t.Fatal("the first attempt resolved, want its budget to end")
+	}
+
+	retryCtx, retryCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer retryCancel()
+	anchor, segment, err := ResolveCopySeekAnchorForSource(WithCopySeekAnchorRetryFlight(retryCtx), "ffmpeg", identity, "http://relay/retry", 120, 2)
+	if err != nil {
+		t.Fatalf("retry inherited the first attempt's spent flight: %v", err)
+	}
+	if anchor != 119 || segment != 59 {
+		t.Fatalf("retry anchor = %v segment = %d, want 119, 59", anchor, segment)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("probe calls = %d, want the first attempt and the retry's own probe", got)
+	}
+}
+
 // TestResolveCopySeekAnchorProbeBudgetCappedByCallerDeadline proves the probe no
 // longer ignores the caller's deadline: with less remaining than the per-probe
 // cap, the probe context is bounded by the caller's deadline.
@@ -766,7 +816,7 @@ func TestResolveCopySeekAnchorSkipsProbeWhenCallerBudgetExpired(t *testing.T) {
 	}
 	// The caller returned on its already-done context while the singleflight
 	// closure was still starting; join it before the cleanup restores the cache.
-	awaitCopySeekProbeFlight(t, copySeekAnchorFlightKey(copySeekAnchorSourceKey(ResolveFFmpegPath("ffmpeg"), "virtual://movie/expired", 2), 120))
+	awaitCopySeekProbeFlight(t, copySeekAnchorFlightKey(context.Background(), copySeekAnchorSourceKey(ResolveFFmpegPath("ffmpeg"), "virtual://movie/expired", 2), 120))
 }
 
 // TestLookupCachedCopySeekAnchorServesProvenIntervalWithoutProbe proves the lazy

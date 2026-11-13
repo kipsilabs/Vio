@@ -16,6 +16,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/markers"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/pathscope"
+	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/scanbatch"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary/stream"
 	"github.com/jackc/pgx/v5"
@@ -2483,6 +2484,14 @@ func syntheticVideoTracks(candidate VirtualCandidate) []models.VideoTrack {
 	}
 	if !hasGenericHDR && strings.EqualFold(candidate.HDR, "hdr") {
 		hasGenericHDR = true
+	}
+	// A Dolby Vision release tag cannot be true of a codec whose bitstream has
+	// no way to carry a DV RPU (see playback.CodecCarriesDolbyVisionV3). An
+	// "H.264 DV" listing is a mislabel; writing DV onto it would make the
+	// planner tone-map an SDR file instead of serving it directly. An unknown
+	// codec keeps the declaration.
+	if hasDV && videoCodec != "" && !playback.CodecCarriesDolbyVisionV3(videoCodec) {
+		hasDV = false
 	}
 
 	videoRange := "SDR"

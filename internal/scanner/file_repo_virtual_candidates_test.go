@@ -2059,6 +2059,35 @@ func TestReplaceVirtualCandidatesDoesNotInventTracks(t *testing.T) {
 	}
 }
 
+// A "DV" release tag on a codec whose bitstream cannot carry a Dolby Vision RPU
+// writes no DV track. The listing's synthetic track is declaration-only evidence,
+// and a DV profile on an H.264 file is a mislabel: persisting it makes the
+// planner tone-map an SDR file instead of serving it directly. An unknown codec
+// keeps the declaration.
+func TestSyntheticVideoTracksDropsImpossibleDVClaim(t *testing.T) {
+	avc := syntheticVideoTracks(VirtualCandidate{
+		Resolution: "1080p", CodecVideo: "h264", HDR: "dv", Label: "Movie.2024.1080p.DV.Profile.8-GRP",
+	})
+	if len(avc) != 1 {
+		t.Fatalf("tracks = %#v, want 1", avc)
+	}
+	if avc[0].DVProfile != 0 || avc[0].DolbyVision != "" || avc[0].VideoRangeType != "SDR" {
+		t.Fatalf("impossible DV claim written onto an AVC track: %#v", avc[0])
+	}
+
+	hevc := syntheticVideoTracks(VirtualCandidate{
+		Resolution: "2160p", CodecVideo: "hevc", HDR: "dv", Label: "Movie.2024.2160p.DV.Profile.8-GRP",
+	})
+	if len(hevc) != 1 || hevc[0].DVProfile != 8 || hevc[0].VideoRangeType != "DOVI" {
+		t.Fatalf("a DV-capable codec lost its claim: %#v", hevc)
+	}
+
+	unknown := syntheticVideoTracks(VirtualCandidate{Resolution: "1080p", HDR: "dv"})
+	if len(unknown) != 1 || unknown[0].VideoRangeType != "DOVI" {
+		t.Fatalf("an unknown codec dropped the DV declaration: %#v", unknown)
+	}
+}
+
 // TestExtractDeclaredDVProfileBoundary pins token boundaries: "profile 80"
 // and "dv80" must not match profile 8.
 func TestExtractDeclaredDVProfileBoundary(t *testing.T) {

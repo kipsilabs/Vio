@@ -11,6 +11,7 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -72,6 +73,9 @@ const playbackCapabilityStateAvailable = "available"
 type PlaybackOperationError struct {
 	Status        int
 	Code, Message string
+	// RetryAfter is the delta-seconds a retryable refusal advertises in the
+	// Retry-After header; zero omits it.
+	RetryAfter int
 }
 
 func (e *PlaybackOperationError) Error() string { return e.Message }
@@ -80,6 +84,9 @@ func playbackOperationError(status int, code, message string) *PlaybackOperation
 }
 func writePlaybackOperationError(w http.ResponseWriter, err error) {
 	if e, ok := errors.AsType[*PlaybackOperationError](err); ok {
+		if e.RetryAfter > 0 {
+			w.Header().Set("Retry-After", strconv.Itoa(e.RetryAfter))
+		}
 		writeError(w, e.Status, e.Code, e.Message)
 		return
 	}

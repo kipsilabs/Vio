@@ -306,9 +306,13 @@ func (w *playbackDeliveryWriter) transport() *streamResponseWriter {
 //
 // A v1 handler may also write a 503 with a machine-readable code that deserves
 // its own v2 type: provider_unavailable distinguishes a transient provider
-// outage (keep retrying this release) from a missing server dependency. The
-// code is matched only at 503 so a mismatched handler can never mint a type
-// whose status disagrees with the response.
+// outage (keep retrying this release) from a missing server dependency, and
+// subtitle_source_unavailable distinguishes a subtitle sidecar whose live layout
+// could not be verified (retry after the advertised delay) from a broken
+// delivery route. Matching the catalog by code keeps every such type additive:
+// an operation only needs a catalog entry, not an adapter special case. The code
+// is matched only at 503 so a mismatched handler can never mint a type whose
+// status disagrees with the response.
 func playbackDeliveryProblemType(status int, code string) ProblemType {
 	switch status {
 	case http.StatusGone:
@@ -316,8 +320,10 @@ func playbackDeliveryProblemType(status int, code string) ProblemType {
 	case http.StatusBadGateway:
 		return TypeDependencyUnavailable
 	case http.StatusServiceUnavailable:
-		if code == TypeProviderUnavailable.ID {
-			return TypeProviderUnavailable
+		for _, candidate := range Catalog() {
+			if candidate.ID == code && candidate.Status == http.StatusServiceUnavailable {
+				return candidate
+			}
 		}
 	}
 	return TypeForStatus(status)

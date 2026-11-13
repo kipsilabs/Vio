@@ -12,25 +12,18 @@ import {
   type PGSPlacedObject,
 } from "../utils/pgs";
 import {
+  BITMAP_SUBTITLE_PAGE_SECONDS,
   createSubtitleWindowFetcher,
   subtitlePlayheadSeconds,
   subtitleWindowUrl,
-  SUBTITLE_WINDOW_SECONDS,
 } from "../utils/subtitleWindows";
 
-// A PGS composition stays on screen until the next one replaces it, and the
-// server's positioned extract starts at the window, so a fresh window reaches
-// back far enough to include a subtitle already showing at the playhead. A
-// display set can precede a long silent stretch, so allow a wide margin.
-const SEEK_BACKOFF = 30;
-// A fresh slice must cover the playhead for long enough that a slow extraction
-// cannot outrun it. Thirty seconds back plus thirty seconds forward keeps the
-// playhead inside the in-flight range while the request is still on the wire;
-// a 30/30 pair made the window end at the playhead and caused an abort loop.
-const FRESH_WINDOW_FORWARD_SECONDS = 30;
-const FIRST_WINDOW_SECONDS = SEEK_BACKOFF + FRESH_WINDOW_FORWARD_SECONDS;
-const WINDOW_SECONDS = SUBTITLE_WINDOW_SECONDS;
-// Schedule the next slice with enough lead that a cold remote extraction has
+// A bitmap page is fetched whole and on its own grid. The server stores one
+// page and serves every later request inside it, so the client asks for exactly
+// the page the server prefetches; a playhead-anchored slice is a range no other
+// request computes, and it is never reused.
+const PAGE_SECONDS = BITMAP_SUBTITLE_PAGE_SECONDS;
+// Schedule the next page with enough lead that a cold remote extraction has
 // time to land before playback reaches it.
 const PREFETCH_LEAD_SECONDS = 30;
 // A cold positioned extraction from remote storage can spend a while before
@@ -417,9 +410,14 @@ export function usePGSSubtitles({
       windowUrl: (start, duration) => subtitleWindowUrl(url, start, "windowed=1", duration),
       playhead: () => Math.max(0, sourceTime()),
       duration: () => durationRef.current ?? 0,
-      seekBackoffSeconds: SEEK_BACKOFF,
-      firstWindowSeconds: FIRST_WINDOW_SECONDS,
-      windowSeconds: WINDOW_SECONDS,
+      // A page already starts at or before the playhead, so it needs no
+      // backoff; the grid alignment below is what keeps the composition on
+      // screen covered across page boundaries (the previous pages stay in the
+      // timeline while playback runs on).
+      seekBackoffSeconds: 0,
+      firstWindowSeconds: PAGE_SECONDS,
+      windowSeconds: PAGE_SECONDS,
+      pageSpanSeconds: PAGE_SECONDS,
       prefetchLeadSeconds: PREFETCH_LEAD_SECONDS,
       stallTimeoutMs: STALL_TIMEOUT_MS,
       playbackRate: () => videoRef.current?.playbackRate ?? 1,
@@ -453,7 +451,7 @@ export function usePGSSubtitles({
         onLoadStateRef.current?.("ready");
         // Keep about one window behind the playhead, so a straight run
         // through a long film holds a bounded number of screens.
-        const keepFrom = sourceTime() - WINDOW_SECONDS;
+        const keepFrom = sourceTime() - PAGE_SECONDS;
         if (!fresh && keepFrom > fetcher.coverage().coverageStart) {
           timeline = prunePGSTimeline(timeline, keepFrom);
           fetcher.releaseBefore(keepFrom);

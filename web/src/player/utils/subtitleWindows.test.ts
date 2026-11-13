@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  BITMAP_SUBTITLE_WINDOW_SECONDS,
+  BITMAP_SUBTITLE_PAGE_SECONDS,
   createSubtitleWindowFetcher,
   nextSubtitleRetryDelay,
   planSubtitleWindow,
@@ -64,10 +64,10 @@ describe("planSubtitleWindow", () => {
 });
 
 describe("subtitleWindowUrl", () => {
-  it("uses the requested bitmap window length", () => {
+  it("uses the requested bitmap page length", () => {
     expect(
-      subtitleWindowUrl("https://example.test/sub", 10, "", BITMAP_SUBTITLE_WINDOW_SECONDS),
-    ).toBe("https://example.test/sub?position=10&duration=30");
+      subtitleWindowUrl("https://example.test/sub", 10, "", BITMAP_SUBTITLE_PAGE_SECONDS),
+    ).toBe("https://example.test/sub?position=10&duration=120");
   });
 });
 
@@ -264,7 +264,7 @@ describe("createSubtitleWindowFetcher", () => {
     const fetchMock = vi.fn((_url: string, _init?: RequestInit) => respond([]));
     vi.stubGlobal("fetch", fetchMock);
     const { fetcher } = makeFetcher(() => 95, {
-      firstWindowSeconds: BITMAP_SUBTITLE_WINDOW_SECONDS,
+      firstWindowSeconds: 30,
       windowSeconds: 120,
     });
     fetcher.maybeFetch();
@@ -273,6 +273,43 @@ describe("createSubtitleWindowFetcher", () => {
     fetcher.maybeFetch();
     await vi.waitFor(() => expect(fetcher.coverage().windowEnd).toBe(230));
     expect(fetchMock.mock.calls[1]?.[0]).toBe("/sub?position=110&duration=120");
+    fetcher.dispose();
+  });
+
+  it("walks whole pages on the page grid instead of playhead-anchored slices", async () => {
+    let playhead = 100;
+    const fetchMock = vi.fn((_url: string, _init?: RequestInit) => respond([]));
+    vi.stubGlobal("fetch", fetchMock);
+    const { fetcher } = makeFetcher(() => playhead, {
+      seekBackoffSeconds: 0,
+      windowSeconds: BITMAP_SUBTITLE_PAGE_SECONDS,
+      pageSpanSeconds: BITMAP_SUBTITLE_PAGE_SECONDS,
+      prefetchLeadSeconds: 30,
+    });
+
+    // The page that contains the playhead, fetched whole: a partial page is a
+    // range no later request computes a key for.
+    fetcher.maybeFetch();
+    await vi.waitFor(() => expect(fetcher.coverage().windowEnd).toBe(120));
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/sub?position=0&duration=120");
+
+    // Nearing the end of coverage the next page is the page after it, not the
+    // page containing the playhead (which the client already holds).
+    playhead = 95;
+    fetcher.maybeFetch();
+    await vi.waitFor(() => expect(fetcher.coverage().windowEnd).toBe(240));
+    expect(fetchMock.mock.calls[1]?.[0]).toBe("/sub?position=120&duration=120");
+
+    // A seek inside the loaded page keeps the same window on the wire.
+    playhead = 200;
+    fetcher.maybeFetch();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    // A seek into another page asks for that page whole.
+    playhead = 1_000;
+    fetcher.maybeFetch();
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    expect(fetchMock.mock.calls[2]?.[0]).toBe("/sub?position=960&duration=120");
     fetcher.dispose();
   });
 
@@ -336,7 +373,7 @@ describe("createSubtitleWindowFetcher", () => {
     vi.stubGlobal("fetch", fetchMock);
     const durations: string[] = [];
     const { fetcher } = makeFetcher(() => playhead, {
-      firstWindowSeconds: BITMAP_SUBTITLE_WINDOW_SECONDS,
+      firstWindowSeconds: 30,
       windowSeconds: 120,
       windowUrl: (start, duration) => {
         durations.push(`${start}/${duration}`);

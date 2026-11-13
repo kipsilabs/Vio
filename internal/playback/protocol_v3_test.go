@@ -806,6 +806,98 @@ func TestSourceDescriptorV3NormalizesLegacyHEVCMetadata(t *testing.T) {
 	}
 }
 
+// avcDVClaimFileV3 is a 1080p H.264 SDR file whose row claims Dolby Vision
+// profile 8. A "DV" release tag on an H.264 file is a mislabel: Dolby Vision
+// needs a bitstream that can carry its RPU (HEVC or AV1).
+func avcDVClaimFileV3() *models.MediaFile {
+	file := detailedFixtureFileV3()
+	file.CodecVideo = "h264"
+	file.Resolution = "1080p"
+	file.Bitrate = 8_000
+	file.VideoTracks[0] = models.VideoTrack{
+		Codec: "h264", Profile: "High", Level: 41, Width: 1920, Height: 1080,
+		FrameRate: "24000/1001", Bitrate: 8_000, BitDepth: 8,
+		VideoRange: "DolbyVision", VideoRangeType: "DOVI", DVProfile: 8,
+		DolbyVision: "Dolby Vision", DVConfigPresent: true, DVBLCompatIDPresent: true, DVBLCompatID: 1, DVBLPresent: true,
+	}
+	file.AudioTracks[0] = models.AudioTrack{Codec: "aac", Channels: 2, Layout: "stereo"}
+	return file
+}
+
+// A Dolby Vision profile on a codec that cannot carry a DV RPU is not evidence.
+// Believing it turns a playable 1080p H.264 file into an HDR source, and the
+// plan then builds a tone-mapped re-encode of the file it could have served
+// directly instead of the remux/direct play its real range allows.
+func TestSourceDescriptorV3DropsImpossibleDolbyVisionClaim(t *testing.T) {
+	source := SourceDescriptorFromFileV3(avcDVClaimFileV3(), 0)
+	if source.DynamicRange != DynamicRangeSDRV3 {
+		t.Fatalf("dynamic range = %q, want sdr", source.DynamicRange)
+	}
+	if source.DVProfile != 0 || source.DVBaseLayerProven || source.DVLevel != 0 || source.DVBLCompatID != 0 {
+		t.Fatalf("impossible DV evidence survived: %#v", source)
+	}
+	if source.Width != 1920 || source.Height != 1080 {
+		t.Fatalf("source size = %dx%d, want the file's 1920x1080", source.Width, source.Height)
+	}
+
+	// A genuinely DV-capable codec keeps every field: the guard is about the
+	// codec's ability to carry the RPU, not about distrusting the label.
+	hevc := avcDVClaimFileV3()
+	hevc.CodecVideo = "hevc"
+	hevc.VideoTracks[0].Codec = "hevc"
+	hevc.VideoTracks[0].Profile = "Main 10"
+	hevc.VideoTracks[0].BitDepth = 10
+	hevcSource := SourceDescriptorFromFileV3(hevc, 0)
+	if hevcSource.DynamicRange != DynamicRangeDolbyVisionV3 || hevcSource.DVProfile != 8 || !hevcSource.DVBaseLayerProven {
+		t.Fatalf("a real DV source lost its evidence: %#v", hevcSource)
+	}
+}
+
+// The plan for that file serves it: direct play of the SDR H.264 source, with no
+// HDR-to-SDR tone map and no 4K target. The client here decodes H.264 at 1080p
+// and offers no HDR output.
+func TestPlanPlaybackV3DoesNotToneMapAnAVCDolbyVisionMislabel(t *testing.T) {
+	file := avcDVClaimFileV3()
+	req := validStartRequestV3()
+	req.QualityPreference = "auto"
+	req.Capabilities.CodecsVideo = []string{"h264"}
+	req.Capabilities.CodecsVideoHardware = []string{"h264"}
+	req.Capabilities.HDRDetails = nil
+	req.Capabilities.VideoDecode = []VideoDecodeCapabilityV3{{
+		Codec: "h264", Profiles: []string{"high"}, Levels: []int{41}, BitDepths: []int{8},
+		MaxWidth: 1920, MaxHeight: 1080, MaxFrameRate: 60, MaxBitrateKbps: 20_000, Hardware: true,
+	}}
+	req.ClientPlaybackContext.Output.HDRDetails = nil
+	original := req.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3]
+	original.Containers = []string{"mkv"}
+	original.VideoCodecs = []string{"h264"}
+	original.AudioDecodeCodecs = []string{"aac"}
+	req.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3] = original
+
+	result := PlanPlaybackV3(PlannerInputV3{
+		Request: req, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0,
+		Settings: PlannerSettingsV3{TranscodeEnabled: true, Allow4KTranscode: true},
+		Registry: toneMapTestRegistryV3(),
+	})
+	if result.Plan == nil {
+		t.Fatalf("result = %s", ExplainPlannerResultV3(result))
+	}
+	if result.PlayMethod != PlayDirect || result.Plan.Delivery != DeliveryOriginalHTTPV3 {
+		t.Fatalf("plan = %s, want the direct play this source supports", ExplainPlannerResultV3(result))
+	}
+	if result.Plan.Source.DynamicRange != DynamicRangeSDRV3 || result.Plan.Source.DVProfile != 0 {
+		t.Fatalf("planned source = %#v, want SDR with no DV evidence", result.Plan.Source)
+	}
+	for _, transformation := range result.Plan.Transformations {
+		if transformation.Name == TransformationHDRToSDRToneMapV3 {
+			t.Fatalf("an SDR file was tone-mapped: %#v", result.Plan.Transformations)
+		}
+	}
+	if result.TargetResolution == "2160p" {
+		t.Fatalf("target resolution = %q, want the source's own size", result.TargetResolution)
+	}
+}
+
 func TestSourceDescriptorV3PreservesCanonicalColorRange(t *testing.T) {
 	for _, test := range []struct {
 		name  string

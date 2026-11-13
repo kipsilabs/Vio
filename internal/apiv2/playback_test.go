@@ -185,6 +185,27 @@ func TestPlaybackV2ProblemMapping(t *testing.T) {
 	}
 }
 
+// A retryable playback refusal carries the service's Retry-After through to
+// the problem response; the field is additive and absent on ordinary errors.
+func TestPlaybackProblemCarriesRetryAfter(t *testing.T) {
+	problem := playbackProblem(&handlers.PlaybackOperationError{
+		Status:     http.StatusServiceUnavailable,
+		Code:       "dependency_unavailable",
+		Message:    "Playback is temporarily unavailable; retry shortly",
+		RetryAfter: 5,
+	})
+	if problem.Status != http.StatusServiceUnavailable || problem.Type != TypeDependencyUnavailable.URI() {
+		t.Fatalf("problem = %+v", problem)
+	}
+	if got := problem.GetHeaders().Get("Retry-After"); got != "5" {
+		t.Fatalf("Retry-After = %q, want 5", got)
+	}
+	plain := playbackProblem(&handlers.PlaybackOperationError{Status: http.StatusInternalServerError, Code: "internal_error", Message: "failed"})
+	if got := plain.GetHeaders().Get("Retry-After"); got != "" {
+		t.Fatalf("unexpected Retry-After %q on an internal error", got)
+	}
+}
+
 // v2 drops the source entry, video or audio-only, without touching other
 // entries or the shared plan that v1 serializes.
 func TestPlaybackQualitiesDropsTheSourceEntry(t *testing.T) {

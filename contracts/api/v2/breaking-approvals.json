@@ -1,25 +1,3 @@
 {
-  "approvals": [
-    {
-      "operation_id": "getAdminDashboardLayout",
-      "change_id": "response-property-became-nullable",
-      "fingerprint": "6beb2eaf413a2efc7fdc2e0877fbda64f3c1621a813a2badd9a7815b68251e52",
-      "reason": "Upstream makes updated_at nullable for a layout that was never saved. The web client reads a missing timestamp as unsaved and offers a reset, so the field's absence is a defined state.",
-      "approved_in": "#443"
-    },
-    {
-      "operation_id": "getAdminDashboardLayout",
-      "change_id": "response-property-became-nullable",
-      "fingerprint": "9dcf9a83ab8edc5fc56485df21d0db3c45c67420733910622bd0de9511dec775",
-      "reason": "Upstream makes layout nullable until an administrator saves one. The web client seeds the default layout for a null body, so the field's absence is a defined state.",
-      "approved_in": "#443"
-    },
-    {
-      "operation_id": "getDownload",
-      "change_id": "api-removed-without-deprecation",
-      "fingerprint": "fc0c87ed8b335deabb21653f3f63ac14338306da32bef9ad9820907e69b18088",
-      "reason": "Upstream retires the single-entry download read. The web client now pages GET /api/v2/downloads and finds the row there; no shipped client calls the removed operation.",
-      "approved_in": "#443"
-    }
-  ]
+  "approvals": []
 }

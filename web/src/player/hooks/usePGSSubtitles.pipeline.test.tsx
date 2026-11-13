@@ -135,7 +135,7 @@ afterEach(() => {
 });
 
 describe("PGS pipeline", () => {
-  it("fetches a real .sup in a 30-second first window and paints it", async () => {
+  it("fetches a real .sup as a whole page and paints it", async () => {
     const fetchMock = vi.fn(
       async (_url: string, _init?: RequestInit) => new Response(fixture, { status: 200 }),
     );
@@ -146,7 +146,8 @@ describe("PGS pipeline", () => {
     const firstUrl = String(fetchMock.mock.calls[0]![0]);
     expect(firstUrl).toContain("windowed=1");
     expect(firstUrl).toContain("position=0");
-    expect(firstUrl).toContain("duration=60");
+    // One whole page, the unit the server stores and re-serves.
+    expect(firstUrl).toContain("duration=120");
 
     act(() => flushFrame());
     expect(contexts.get(hook.canvas)?.drawImage).toHaveBeenCalled();
@@ -174,7 +175,9 @@ describe("PGS pipeline", () => {
 
     await waitFor(() => expect(hook.onLoadState).toHaveBeenCalledWith("ready"));
 
-    hook.video.currentTime = 100;
+    // A seek outside the loaded page: the client asks for the page that
+    // contains the new playhead.
+    hook.video.currentTime = 300;
     act(() => {
       hook.video.dispatchEvent(new Event("seeking"));
     });

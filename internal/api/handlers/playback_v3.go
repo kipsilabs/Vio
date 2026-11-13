@@ -79,12 +79,6 @@ const (
 	videoRangeHLG   = "HLG"
 	videoRangeHDR10 = "HDR10"
 	videoRangeSDR   = "SDR"
-	// copySeekProbeRetryMargin is the slack a replan keeps beyond a second full
-	// copy-video seek-anchor probe before attempting it. Process startup, the
-	// probe-slot wait and result handling all sit outside the probe timeout, so
-	// a retry without this margin would spend the caller's last budget and fail
-	// with the caller deadline instead of the probe error.
-	copySeekProbeRetryMargin = 5 * time.Second
 	// maxHLSRouteAttemptLoopV3 bounds the transport route-selection loop. Without
 	// it, a chain of fast-failing remote candidates (e.g. HTTP 500 from a node
 	// missing a recipe) can spend 32 × (remote timeout + local spawn) inside
@@ -98,8 +92,7 @@ const (
 	// same candidate after an upstream 5xx. The provider is already failing, so
 	// an immediate second probe hammers it; the pause is short enough to still
 	// fit a resumed session's seek budget.
-	copySeekAnchorTransientBackoff = 750 * time.Millisecond
-	// maxVirtualTransientTransportAlternates bounds how many compatible
+	copySeekAnchorTransientBackoff = 750 * time.Millisecond // maxVirtualTransientTransportAlternates bounds how many compatible
 	// alternates one start may try after a transport failure whose cause is a
 	// transient provider error (upstream 5xx). A failing upstream should not be
 	// hammered once per alternate; one alternate keeps a chance to recover on a
@@ -159,7 +152,12 @@ const (
 	substitutionReasonListingFailedV3   = "listing_failed"
 	substitutionReasonTransportFailedV3 = "transport_failed"
 	substitutionReasonDecodeRejectedV3  = "decode_rejected"
-	substitutionReasonUnknownV3         = "unknown"
+	// substitutionReasonVersionNotPlayableV3 names a requested release the
+	// planner refused: the release exists and the provider lists it, but its
+	// dynamic range, codec, or quality cannot be delivered to this client. The
+	// auto fallback replaced it; an explicit pick refuses instead.
+	substitutionReasonVersionNotPlayableV3 = "version_not_playable"
+	substitutionReasonUnknownV3            = "unknown"
 	// Failed capability fetches are memoized briefly so an unreachable node
 	// costs one timeout per window instead of one per planning request.
 	v3NodeCapabilityErrorTTL = 15 * time.Second
@@ -186,6 +184,16 @@ const (
 	routeCapabilityUnavailableReasonV3  = "route_capability_unavailable"
 )
 
+// playbackStartRetryAfterSeconds is the Retry-After a retryable start failure
+// advertises: long enough for a saturated route or a stalled provider to
+// settle, short enough that the client retries promptly.
+const playbackStartRetryAfterSeconds = 5
+
+// playbackDependencyUnavailableCode is the v1 error code for a temporary
+// playback dependency failure; the v2 catalog maps it to the 503
+// dependency_unavailable problem.
+const playbackDependencyUnavailableCode = "dependency_unavailable"
+
 // v3NodeCapabilityRefreshInterval is both how often the background refresher
 // revisits pooled nodes and the freshness margin at which it re-probes one: a
 // quarter of the TTL keeps a healthy node warmed ahead of expiry, so a plan-time
@@ -205,6 +213,12 @@ const v3NodeCapabilityRefreshInterval = v3NodeCapabilityTTL / 4
 // elapses the failure is classified as a retryable seek error, not evidence
 // against the release, so the transport is not rotated or torn down over it.
 var copySeekAnchorSeekResolveTimeout = 5 * time.Second
+
+// copySeekProbeRetryMargin is the slack one anchor attempt keeps beyond its own
+// window, so process startup, the probe-slot wait, and result handling never
+// spend the caller's last budget. It is a var so tests can shorten it alongside
+// copySeekAnchorSeekResolveTimeout.
+var copySeekProbeRetryMargin = 5 * time.Second
 
 type serverBitrateCapContextKeyV3 struct{}
 
@@ -2258,6 +2272,10 @@ func (h *PlaybackHandler) recordStartingDevice(ctx context.Context, userID int, 
 // reason another version can avoid and the request allows other versions, the
 // first authorized version of alternateBase that plans replaces it, with the
 // warnings that choice adds.
+//
+// An explicit version pick is never replaced here, however unplannable it is on
+// this client: see startAllowsAlternateFileV3. The refusal stands, and the
+// caller's explicit-selection hint points the viewer at the version list.
 func (h *PlaybackHandler) planStartV3(r *http.Request, req playback.StartRequestV3, requestedFile, alternateBase, effectiveFile *models.MediaFile, audioIndex int, settings playback.PlannerSettingsV3, lowerVersion *playback.LowerVersionV3, profileID string, resolutionProvenance ProbeProvenance) (alternateCandidateV3, []playback.DegradationWarningV3) { //nolint:funlen,gocyclo // planStartV3 exceeds Vio's 100-line and complexity-30 limits; refactor tracked separately
 	subtitleInventoryByFileID := map[int][]playback.SubtitleInventoryEntryV3{}
 	subtitleInventoryFor := func(file *models.MediaFile) []playback.SubtitleInventoryEntryV3 {
@@ -2333,7 +2351,8 @@ func (h *PlaybackHandler) planStartV3(r *http.Request, req playback.StartRequest
 	}
 	huntAllowed := terminalAllowsAlternateFileV3(result.Terminal) ||
 		(subtitleDegradeUnresolved && subtitleOnlyTerminalV3(result.Terminal))
-	if req.AllowsAlternateVersions() && huntAllowed { //nolint:nestif // existing alternate-version fallback; only its quality condition changed
+	entryEffectiveFileID := effectiveFile.ID
+	if huntAllowed && startAllowsAlternateFileV3(req) { //nolint:nestif // existing alternate-version fallback; only its quality condition changed
 		accessFilter := requestAccessFilter(r)
 		alternateOrder := alternateOrderingForClient(req.Capabilities)
 		if alternates, alternateErr := h.findAlternateFilesOrdered(r.Context(), alternateBase, accessFilter, alternateOrder); alternateErr == nil {
@@ -2497,7 +2516,29 @@ func (h *PlaybackHandler) planStartV3(r *http.Request, req playback.StartRequest
 			return *fallback, nil
 		}
 	}
-	return alternateCandidateV3{file: effectiveFile, request: req, audioIndex: audioIndex, result: result, toneMapErr: toneMapCapabilityErr}, warnings
+	// Name the hunt as the cause when it replaced the release this plan started
+	// with. The plan then publishes a specific substitution reason instead of the
+	// generic one, so the client's notice says the version could not be played
+	// rather than that it disappeared.
+	reason := ""
+	if effectiveFile != nil && effectiveFile.ID != entryEffectiveFileID {
+		reason = substitutionReasonVersionNotPlayableV3
+	}
+	return alternateCandidateV3{file: effectiveFile, request: req, audioIndex: audioIndex, result: result, toneMapErr: toneMapCapabilityErr, substitutionReason: reason}, warnings
+}
+
+// startAllowsAlternateFileV3 reports whether a fresh start may plan a sibling
+// version in place of the requested row. An explicit version pick is the
+// viewer's decision: the start must serve that row or refuse with the honest
+// reason and the version-list hint, never quietly play a different resolution
+// or dynamic range. This mirrors the replan policy (replanFallbackAllowed in
+// the replan path, which also requires FileSelection != explicit), so a pick
+// cannot be substituted at start and then kept on the replanned session.
+//
+// The auto policy keeps its fallback: a client that picked nothing still gets
+// the best playable version, and the substitution is published with its cause.
+func startAllowsAlternateFileV3(req playback.StartRequestV3) bool {
+	return req.AllowsAlternateVersions() && req.FileSelection != playback.FileSelectionExplicitV3
 }
 
 // planWithoutLowerVersionV3 is the last resort when input's lower qualities
@@ -2709,9 +2750,10 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 				}
 			}
 			req.FileID = termFileID
-			response, persistErr := h.persistTerminalStartDecisionV3(r.Context(), userID, profileID, req, requestDigests, termFileID, termFileID, virtualStartUnresolvedTerminalV3(resolveErr))
+			terminal := virtualStartUnresolvedTerminalV3(resolveErr)
+			response, persistErr := h.persistTerminalStartDecisionV3(r.Context(), userID, profileID, req, requestDigests, termFileID, termFileID, terminal)
 			if persistErr != nil {
-				return playback.DecisionResponseV3{}, playbackPersistenceOperationError(persistErr)
+				return playback.DecisionResponseV3{}, startTerminalPersistOperationErrorV3(r.Context(), persistErr, terminal.Terminal != nil && terminal.Terminal.Retryable, nil)
 			}
 			return response, nil
 		}
@@ -2901,6 +2943,13 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	timings.mark("planning")
 	result := retryIncompleteToneMapPlanningV3(planned.result, planned.toneMapErr)
 	result = retryIncompletePlaybackSettingsV3(result, settingsErr)
+	// Carry the fallback's own cause onto whichever plan finally commits, so the
+	// plan can publish a specific substitution reason. publishSubstitutionFieldsV3
+	// keeps a reason already present on the plan, so this wins over the generic
+	// cause it would otherwise derive.
+	if planned.substitutionReason != "" && virtualDecision.substitutionReason == "" {
+		virtualDecision.substitutionReason = planned.substitutionReason
+	}
 	h.clarifyOriginalQuality4KTerminalV3(r.Context(), requestAccessFilter(r), result.Terminal, requestedFile, !shouldTryAlternateFileV3(req.QualityPreference))
 	hintExplicitSelectionAlternateAvailableV3(result.Terminal, req.FileSelection)
 	// The exact app identity is logged with every decision so a route or
@@ -2917,9 +2966,10 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 			"file_id", effectiveFile.ID,
 			"quality_preference", req.QualityPreference,
 		}, clientInfo.LogAttrs()...)...)
-		response, persistErr := h.persistTerminalStartDecisionV3(r.Context(), userID, profileID, req, requestDigests, requestedFile.ID, effectiveFile.ID, playback.NewTerminalResponseFromTerminalV3(result.Terminal))
+		terminal := playback.NewTerminalResponseFromTerminalV3(result.Terminal)
+		response, persistErr := h.persistTerminalStartDecisionV3(r.Context(), userID, profileID, req, requestDigests, requestedFile.ID, effectiveFile.ID, terminal)
 		if persistErr != nil {
-			return playback.DecisionResponseV3{}, playbackPersistenceOperationError(persistErr)
+			return playback.DecisionResponseV3{}, startTerminalPersistOperationErrorV3(r.Context(), persistErr, terminal.Terminal != nil && terminal.Terminal.Retryable, nil)
 		}
 		if response.Terminal != nil {
 			h.enqueueRouteEventV3(playback.RouteEventRecordV3{RouteEventV3: playback.RouteEventV3{ProtocolVersion: playback.ProtocolV3, PlaybackAttemptID: req.PlaybackAttemptID, Event: playback.RouteEventTerminalV3, FallbackReason: response.Terminal.Reason, OutputContextID: req.ClientPlaybackContext.Output.OutputContextID}, UserID: userID, ProfileID: profileID, ClientName: clientInfo.Name, ClientVersion: clientInfo.Version, ClientBuild: clientInfo.Build, ClientChannel: clientInfo.Channel, ClientModel: req.ClientPlaybackContext.Device.Model})
@@ -2945,7 +2995,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	if escalateErr != nil {
 		persistedResponse, persistErr := h.startFailureDecisionV3(r.Context(), userID, profileID, req, requestDigests, requestedFile.ID, effectiveFile.ID, escalateErr)
 		if persistErr != nil {
-			return playback.DecisionResponseV3{}, playbackPersistenceOperationError(persistErr)
+			return playback.DecisionResponseV3{}, startTerminalPersistOperationErrorV3(r.Context(), persistErr, escalateErr.retryable, escalateErr)
 		}
 		return persistedResponse, nil
 	}
@@ -2979,6 +3029,13 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	if deferredProbe != nil && result.Plan != nil && h.deferTrackInventoryNegotiatedV3(r, req) {
 		result.Plan.TracksPending = true
 	}
+	// Hand the substitution cause to the plan before the commit.
+	// publishSubstitutionFieldsV3 runs after the transport is prepared and only
+	// fills an empty reason, so this is what lets the wire carry the resolver's
+	// or the fallback's real cause instead of "unknown".
+	if result.Plan != nil && result.Plan.SubstitutionReason == "" {
+		result.Plan.SubstitutionReason = virtualDecision.substitutionReason
+	}
 	phasesCtx, phaseTimings := withTransportPhaseTimingsV3(r.Context())
 	response, statusErr := h.startPlannedPlaybackV3(r.WithContext(phasesCtx), userID, profileID, req, requestDigests, requestedFile, effectiveFile, audioIndex, intent, result, clientInfo)
 	timings.mark("session_transport_commit")
@@ -2997,9 +3054,10 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 					return rotated, nil
 				}
 			}
-			persisted, persistErr := h.persistTerminalStartDecisionV3(r.Context(), userID, profileID, req, requestDigests, requestedFile.ID, effectiveFile.ID, sourceDecodeFailedTerminalResponseV3(req.FileSelection))
+			terminal := sourceDecodeFailedTerminalResponseV3(req.FileSelection)
+			persisted, persistErr := h.persistTerminalStartDecisionV3(r.Context(), userID, profileID, req, requestDigests, requestedFile.ID, effectiveFile.ID, terminal)
 			if persistErr != nil {
-				return playback.DecisionResponseV3{}, playbackPersistenceOperationError(persistErr)
+				return playback.DecisionResponseV3{}, startTerminalPersistOperationErrorV3(r.Context(), persistErr, terminal.Terminal != nil && terminal.Terminal.Retryable, nil)
 			}
 			return persisted, nil
 		}
@@ -3097,6 +3155,9 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 							// A transport failure moved the release: name the
 							// requested row and the cause on the plan.
 							alternateDecision.substitutionReason = substitutionReasonTransportFailedV3
+							if alternateResult.Plan != nil {
+								alternateResult.Plan.SubstitutionReason = alternateDecision.substitutionReason
+							}
 							// The alternate is a second commit with its own
 							// phases: install a fresh recorder and emit its
 							// phase line separately, so the walk is
@@ -3149,7 +3210,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		}
 		persistedResponse, persistErr := h.startFailureDecisionV3(r.Context(), userID, profileID, req, requestDigests, requestedFile.ID, effectiveFile.ID, statusErr)
 		if persistErr != nil {
-			return playback.DecisionResponseV3{}, playbackPersistenceOperationError(persistErr)
+			return playback.DecisionResponseV3{}, startTerminalPersistOperationErrorV3(r.Context(), persistErr, statusErr.retryable, statusErr)
 		}
 		return persistedResponse, nil
 	}
@@ -4745,34 +4806,58 @@ func (h *PlaybackHandler) validateLocalProgressiveCapabilitiesV3(ctx context.Con
 	return nil
 }
 
-// copySeekAnchorRetryFits reports whether the caller's remaining budget can
-// accommodate a second copy-video seek-anchor probe. Without an explicit
-// deadline the probe's own per-attempt cap bounds the retry, so it is allowed.
-// With a deadline, a retry only helps when more than a full probe plus the
-// scheduling margin remains; otherwise it would spend the rest of the budget
-// and surface the caller deadline instead of the probe error.
-func copySeekAnchorRetryFits(ctx context.Context) (bool, time.Duration) {
+// copySeekAnchorAttemptBudget sizes one copy-video seek-anchor attempt against
+// the link's adaptive per-attempt budget and the caller's remaining time, and
+// reports whether a retry is reserved for it. remaining is the caller's whole
+// remaining budget, for logging.
+//
+// The budget is the adaptive attempt size clamped to what the caller has left
+// after the scheduling margin, so an attempt started here can never be
+// truncated by the caller's deadline and answer that deadline instead of the
+// anchor failure. When the caller can hold two adaptive attempts the first one
+// is capped at its adaptive size and a retry is reserved; when it cannot, the
+// first attempt keeps everything usable and no retry is planned, because
+// splitting a window that cannot hold two full attempts would truncate both of
+// them — a link whose probe needs 4.7s cut to half its window twice serves
+// neither attempt, while one honest attempt plus a clear retryable verdict
+// leaves the client's own seek retry the chance to land.
+//
+// This replaces the previous "does a full second probe still fit?" gate, which
+// compared a *freshly re-derived* adaptive attempt (sized from the observation
+// the expired attempt had just recorded, so twice a 10s stall) against the
+// remaining deadline. On a slow-but-alive provider that gate could never pass,
+// so the retry was skipped and one slow attempt ended the session.
+func copySeekAnchorAttemptBudget(ctx context.Context, adaptive time.Duration, reserveRetry bool) (budget time.Duration, retryReserved bool, remaining time.Duration) {
+	if ctx == nil {
+		return adaptive, reserveRetry, 0
+	}
 	deadline, ok := ctx.Deadline()
 	if !ok {
-		return true, 0
+		return adaptive, reserveRetry, 0
 	}
-	remaining := time.Until(deadline)
-	return remaining > playback.CopySeekProbeTimeout+copySeekProbeRetryMargin, remaining
-}
-
-// copySeekAnchorRetryReserved reports whether the caller's remaining budget can
-// hold a retry reserved from the start of the copy-video seek-anchor
-// resolution: two full probes plus the scheduling margin. A caller that fails
-// this gate never plans a retry, so the deadline cannot truncate a second probe
-// mid-flight. It is the up-front reservation the in-loop copySeekAnchorRetryFits
-// gate then narrows to the single retry probe once the first attempt has run. A
-// caller with no deadline reserves the full probe cap and keeps the retry.
-func copySeekAnchorRetryReserved(ctx context.Context) bool {
-	deadline, ok := ctx.Deadline()
-	if !ok {
-		return true
+	remaining = time.Until(deadline)
+	usable := remaining - copySeekProbeRetryMargin
+	if usable <= 0 {
+		// No room to reserve a retry. One attempt bounded by what is actually
+		// left keeps the single-probe behavior a tight caller had before: a fast
+		// provider still lands, and a slow one fails with the retryable anchor
+		// verdict instead of being handed a second attempt the deadline would
+		// truncate.
+		if remaining <= 0 {
+			return 0, false, remaining
+		}
+		if adaptive > remaining {
+			adaptive = remaining
+		}
+		return adaptive, false, remaining
 	}
-	return time.Until(deadline) > playback.CopySeekProbeRetryBudget()+copySeekProbeRetryMargin
+	if adaptive > usable {
+		adaptive = usable
+		retryReserved = false
+	} else {
+		retryReserved = reserveRetry && usable >= 2*adaptive
+	}
+	return adaptive, retryReserved, remaining
 }
 
 // virtualTransportSameReleaseRetryKey marks a start request that has already
@@ -4845,16 +4930,15 @@ func (h *PlaybackHandler) recoverVirtualTransportSameReleaseV3(
 }
 
 // waitCopySeekAnchorBackoff pauses before retrying a candidate after a
-// transient provider (upstream 5xx) failure. It returns false when the wait or
-// its result cannot fit the caller's remaining budget, so the retry is skipped
-// instead of started without time to finish. remaining is the value already
-// returned by copySeekAnchorRetryFits; 0 means the caller had no deadline.
+// transient provider (upstream 5xx) failure. It returns false when the pause
+// would leave no room for the retry it precedes, so the retry is skipped
+// instead of started without time to finish. remaining is the caller's whole
+// remaining budget as reported by copySeekAnchorAttemptBudget; 0 means the
+// caller had no deadline.
 func (h *PlaybackHandler) waitCopySeekAnchorBackoff(ctx context.Context, remaining time.Duration) bool {
 	d := copySeekAnchorTransientBackoff
-	if remaining > 0 {
-		if room := remaining - (playback.CopySeekProbeTimeout + copySeekProbeRetryMargin); room < d {
-			d = room
-		}
+	if remaining > 0 && remaining <= copySeekProbeRetryMargin+d {
+		return false
 	}
 	if d <= 0 {
 		return false
@@ -4891,6 +4975,21 @@ func (h *PlaybackHandler) lookupCachedCopySeekAnchorV3(ffmpegPath, sourceIdentit
 		return 0, 0, false
 	}
 	return playback.LookupCachedCopySeekAnchor(ffmpegPath, sourceIdentity, requestedSeekSeconds, segmentDuration)
+}
+
+// copySeekAnchorFailureLevel reports how a failed copy-video seek-anchor resolve
+// is logged. A transient provider failure or the probe's own per-attempt budget
+// expiring is not evidence against the release: the enclosing start may retry the
+// same release on another candidate and succeed (production logged ERROR for a
+// first attempt that timed out at its 5 s budget and then resolved on the retry
+// four seconds later). Those are warnings. ERROR is reserved for a failure
+// neither category explains, which is the terminal case an operator must look
+// at.
+func copySeekAnchorFailureLevel(seekFailure bool) slog.Level {
+	if seekFailure {
+		return slog.LevelWarn
+	}
+	return slog.LevelError
 }
 
 func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, session *playback.Session, file *models.MediaFile, result playback.PlannerResultV3) (preparedTimelineV3, *transportErrorV3) {
@@ -5074,10 +5173,11 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 			// failing fast on the first error is both cheaper and clearer. A
 			// caller with no deadline keeps the retry.
 			//
-			// The retry budget is reserved up front: a caller that cannot hold
-			// two full probes plus the scheduling margin never plans a retry, so
-			// a second attempt cannot be started only to be truncated by the
-			// deadline.
+			// The retry budget is reserved by the per-attempt sizing below: an
+			// attempt is never granted more than the caller has left after the
+			// scheduling margin (so it cannot be truncated by the deadline),
+			// and the first attempt only reserves a retry when the caller can
+			// hold a second attempt of the same adaptive size.
 			//
 			// An upstream 5xx and a probe signal-killed from outside (the OOM
 			// killer or an operator) are transient failures: they are retried
@@ -5091,7 +5191,8 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 			// release is retried once under a budget re-derived from the
 			// observation the attempt just recorded. A second expiry is the
 			// verdict and surfaces the retryable seek error.
-			retryReserved := copySeekAnchorRetryReserved(ctx)
+			retryReserved := false
+			var retryRemaining time.Duration
 			lastProbedInput := ""
 			anchorBudgetElapsed := false
 			var err error
@@ -5106,7 +5207,19 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 				cancelAttempt()
 				resolveFailure = nil
 				attemptStarted := time.Now()
-				attemptBudget := copySeekAnchorResolveBudgetFor(file)
+				attemptBudget, reserved, remaining := copySeekAnchorAttemptBudget(ctx, copySeekAnchorResolveBudgetFor(file), attempt == 1)
+				if attempt == 1 {
+					retryReserved = reserved
+				}
+				retryRemaining = remaining
+				if attemptBudget <= 0 {
+					// No caller time is left for an attempt at all. Report it
+					// as our own budget expiring below: a slow caller, not a
+					// verdict about the release.
+					anchorBudgetElapsed = ctx.Err() == nil
+					err = fmt.Errorf("resolve copy seek anchor: no attempt budget left: %w", context.DeadlineExceeded)
+					break
+				}
 				attemptCtx, cancel := context.WithTimeout(ctx, attemptBudget)
 				cancelAttempt = cancel
 				if virtualAnchor {
@@ -5134,7 +5247,7 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 						if !anchorBudgetElapsed {
 							break
 						}
-						if fits, remaining := copySeekAnchorAttemptFits(ctx, copySeekAnchorResolveBudgetFor(file)); !fits {
+						if !retryReserved {
 							slog.WarnContext(ctx, "virtual seek anchor resolve retry skipped: insufficient remaining budget",
 								"component", "api",
 								"playback_session_id", session.ID,
@@ -5183,16 +5296,14 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 							break
 						}
 					}
-					if attempt > 1 && !anchorBudgetElapsed {
-						if fits, remaining := copySeekAnchorRetryFits(ctx); !fits {
-							slog.WarnContext(ctx, "copy-video seek anchor retry skipped after re-resolve: insufficient remaining budget",
-								"component", "api",
-								"playback_session_id", session.ID,
-								"requested_seek_seconds", requested,
-								"remaining", remaining,
-							)
-							break
-						}
+					if attempt > 1 && !anchorBudgetElapsed && !retryReserved {
+						slog.WarnContext(ctx, "copy-video seek anchor retry skipped after re-resolve: insufficient remaining budget",
+							"component", "api",
+							"playback_session_id", session.ID,
+							"requested_seek_seconds", requested,
+							"remaining", retryRemaining,
+						)
+						break
 					}
 				}
 				lastProbedInput = anchorInput
@@ -5200,20 +5311,40 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 				// The probe gets its own adaptive budget on a measured link, so
 				// a resolve that spent most of the attempt cannot truncate it.
 				probeCtx, probeCancel := copySeekProbeContext(ctx, attemptCtx, recentVirtualProviderLinkLatency(linkKey))
+				if retryReserved {
+					// A retry is reserved: keep this probe inside the attempt
+					// window it was granted so it cannot spend the retry's
+					// share on one provider open.
+					probeCtx, probeCancel = capProbeToAttempt(probeCtx, probeCancel, attemptCtx)
+				}
+				if attempt > 1 {
+					// A retry must open the provider under its own budget
+					// instead of joining the first attempt's spent flight: that
+					// flight was started for the attempt whose budget just
+					// ended, and it answers that attempt's timeout.
+					probeCtx = playback.WithCopySeekAnchorRetryFlight(probeCtx)
+				}
 				origin, startSegment, err = probeAnchor(probeCtx)
-				anchorBudgetElapsed = err != nil && probeCtx.Err() != nil && ctx.Err() == nil
+				// A deadline error with the caller still alive is this
+				// attempt's own budget expiring — or a shared probe whose
+				// budget did. It says the link is slow, not that the release
+				// failed, so it must stay a retryable seek error that does not
+				// rotate the release, even when this attempt's own probe
+				// context still has time left.
+				anchorBudgetElapsed = err != nil && ctx.Err() == nil &&
+					(probeCtx.Err() != nil || errors.Is(err, context.DeadlineExceeded))
 				probeCancel()
 				recordVirtualProviderLinkLatency(linkKey, time.Since(attemptStarted), time.Now())
 				if err == nil || ctx.Err() != nil || attempt == 2 {
 					break
 				}
 				if anchorBudgetElapsed {
-					if fits, remaining := copySeekAnchorAttemptFits(ctx, copySeekAnchorResolveBudgetFor(file)); !fits {
+					if !retryReserved {
 						slog.WarnContext(ctx, "copy-video seek anchor probe retry skipped: insufficient remaining budget",
 							"component", "api",
 							"playback_session_id", session.ID,
 							"requested_seek_seconds", requested,
-							"remaining", remaining,
+							"remaining", retryRemaining,
 							"error", err,
 						)
 						break
@@ -5227,27 +5358,24 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 					)
 					continue
 				}
-				fits, remaining := copySeekAnchorRetryFits(ctx)
-				// A fast transient failure (relay 5xx in milliseconds, not a
-				// consumed 15s probe) leaves room for a full second probe:
-				// gate the retry on the single-probe fit rather than the
-				// up-front two-probe reservation, which a slow resolve may
-				// already have spent. Slow failures keep the conservative
+				// A fast transient failure (a relay 5xx in milliseconds, not a
+				// consumed attempt) leaves room for a real second attempt even
+				// when the first could not reserve one: the failed attempt
+				// barely spent its window. A slow failure keeps the reserved
 				// gate so a truncated second probe cannot mask the error.
 				fastTransient := playback.IsTransientProviderError(err) && time.Since(probeStarted) < playback.CopySeekProbeTimeout
-				if !fits || (!retryReserved && !fastTransient) {
+				if !retryReserved && !fastTransient {
 					slog.WarnContext(ctx, "copy-video seek anchor retry skipped: insufficient remaining budget",
 						"component", "api",
 						"playback_session_id", session.ID,
 						"requested_seek_seconds", requested,
-						"remaining", remaining,
-						"required", playback.CopySeekProbeRetryBudget()+copySeekProbeRetryMargin,
+						"remaining", retryRemaining,
 						"error", err,
 					)
 					break
 				}
 				if playback.IsTransientProviderError(err) {
-					if !h.waitCopySeekAnchorBackoff(attemptCtx, remaining) {
+					if !h.waitCopySeekAnchorBackoff(ctx, retryRemaining) {
 						slog.WarnContext(ctx, "copy-video seek anchor retry skipped: no budget for the provider backoff",
 							"component", "api",
 							"playback_session_id", session.ID,
@@ -5280,18 +5408,25 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 					// could retry.
 					return preparedTimelineV3{}, resolveFailure
 				}
-				slog.ErrorContext(ctx, "failed to resolve protocol v3 copy-video seek anchor",
+				// A transient relay failure or our own anchor budget expiring is
+				// not evidence against the release: the enclosing start may
+				// still retry the same release on another candidate and succeed
+				// (production: a first probe timed out at its 5 s per-attempt
+				// budget, logged ERROR, and the retry four seconds later
+				// resolved the anchor). Report it as a retryable seek error so
+				// the client retries the seek instead of the start path
+				// rotating the version or a replan tearing down the transport,
+				// and keep ERROR for a failure that is neither.
+				seekFailure := playback.IsTransientProviderError(err) ||
+					(anchorBudgetElapsed && ctx.Err() == nil)
+				slog.Log(ctx, copySeekAnchorFailureLevel(seekFailure),
+					"failed to resolve protocol v3 copy-video seek anchor",
 					"component", "api",
 					"playback_session_id", session.ID,
 					"requested_seek_seconds", requested,
+					"retryable", seekFailure,
 					"error", err,
 				)
-				// A transient relay failure or our own anchor budget expiring is
-				// not evidence against the release. Report it as a retryable seek
-				// error so the client retries the seek instead of the start path
-				// rotating the version or a replan tearing down the transport.
-				seekFailure := playback.IsTransientProviderError(err) ||
-					(anchorBudgetElapsed && ctx.Err() == nil)
 				return preparedTimelineV3{}, &transportErrorV3{reason: transcodeStartFailedReasonV3, message: remuxSeekPositionFailureMessageV3, retryable: true, cause: err, seekFailure: seekFailure}
 			}
 		}
@@ -5963,14 +6098,24 @@ func (h *PlaybackHandler) identityProxyEligibilityV3(ctx context.Context, result
 	}
 
 	capable := make(map[string]struct{})
-	for nodeURL, advertised := range h.pooledNodeTransformationsV3(ctx, enumerator.ProxyNodeURLs()) {
+	proxyURLs := enumerator.ProxyNodeURLs()
+	for nodeURL, advertised := range h.pooledNodeTransformationsV3(ctx, proxyURLs) {
 		if validateAdvertisedTransformationsV3(result.Plan, advertised) == nil {
 			capable[nodeURL] = struct{}{}
 		}
 	}
 	if len(capable) == 0 {
-		slog.WarnContext(ctx, "protocol v3 no proxy advertises the planned recipe",
-			"component", "api", "delivery", result.Plan.Delivery)
+		// No proxy is configured at all (single-node deployment, or policy that
+		// always serves locally): nothing could advertise the recipe, and the
+		// API executes it by design. Warn only when the pool exists but is
+		// behind — that is the degraded state worth an operator's attention.
+		if len(proxyURLs) == 0 {
+			slog.DebugContext(ctx, "protocol v3 no proxy configured; the API executes the planned recipe",
+				"component", "api", "delivery", result.Plan.Delivery)
+		} else {
+			slog.WarnContext(ctx, "protocol v3 no proxy advertises the planned recipe",
+				"component", "api", "delivery", result.Plan.Delivery, "proxy_count", len(proxyURLs))
+		}
 	}
 	// The predicate runs under the planner lock: a set lookup only.
 	return func(node *nodepool.Node) bool {
@@ -9228,6 +9373,12 @@ type replanPlanningV3 struct {
 	// so a track change plans the same renditions without reading the index
 	// again and can keep the stream. Nil reads the index.
 	renditionTracks *pinnedRenditionTracksV3
+	// audioShapeRetry rebuilds the failed delivery's audio as stereo after an
+	// audio-output initialization failure.
+	audioShapeRetry bool
+	// audioInitFailureDetail names that failure so the planner can report the
+	// specific terminal when every route is exhausted.
+	audioInitFailureDetail string
 }
 
 // pinnedRenditionTracksV3 is the set of on-demand rendition tracks the
@@ -9321,7 +9472,7 @@ func (h *PlaybackHandler) planReplanV3(r *http.Request, p replanPlanningV3, star
 		// and the viewer can repeat the change.
 		return replanPassV3{}, subtitleArtifactErrorV3("Downloaded subtitles are temporarily unavailable.", inventoryErr)
 	}
-	result, toneMapCapabilityErr := h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: start, RequestedFile: p.plannerRequestedFile, EffectiveFile: effectiveFile, LowerVersion: lowerVersionForFileV3(p.lowerVersion, effectiveFile), ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), AudioTrackIndex: audioIndex, Settings: p.settings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: p.attemptedKeys, AdditionalSubtitles: additional, CueIndexedSubtitleTracks: p.renditionTracks.cueIndexedSubtitleTracks(effectiveFile, start)})
+	result, toneMapCapabilityErr := h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: start, RequestedFile: p.plannerRequestedFile, EffectiveFile: effectiveFile, LowerVersion: lowerVersionForFileV3(p.lowerVersion, effectiveFile), ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), AudioTrackIndex: audioIndex, Settings: p.settings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: p.attemptedKeys, AdditionalSubtitles: additional, AudioShapeRetry: p.audioShapeRetry, AudioInitFailureDetail: p.audioInitFailureDetail, CueIndexedSubtitleTracks: p.renditionTracks.cueIndexedSubtitleTracks(effectiveFile, start)})
 	if p.operation == playback.ReplanOperationOutputChangeV3 && result.Terminal != nil && effectiveFile.ID != p.currentEffectiveFile.ID {
 		// Returning to the requested edition is speculative during an output
 		// refresh. Any terminal from that probe must fall back to the edition
@@ -9335,7 +9486,7 @@ func (h *PlaybackHandler) planReplanV3(r *http.Request, p replanPlanningV3, star
 		if err != nil {
 			return replanPassV3{}, &transportErrorV3{reason: trackUnavailableReasonV3, message: err.Error()}
 		}
-		result, toneMapCapabilityErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: start, RequestedFile: p.plannerRequestedFile, EffectiveFile: effectiveFile, LowerVersion: lowerVersionForFileV3(p.lowerVersion, effectiveFile), ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), AudioTrackIndex: audioIndex, Settings: p.settings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: p.attemptedKeys, AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), effectiveFile), CueIndexedSubtitleTracks: p.renditionTracks.cueIndexedSubtitleTracks(effectiveFile, start)})
+		result, toneMapCapabilityErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: start, RequestedFile: p.plannerRequestedFile, EffectiveFile: effectiveFile, LowerVersion: lowerVersionForFileV3(p.lowerVersion, effectiveFile), ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), AudioTrackIndex: audioIndex, Settings: p.settings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: p.attemptedKeys, AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), effectiveFile), AudioShapeRetry: p.audioShapeRetry, AudioInitFailureDetail: p.audioInitFailureDetail, CueIndexedSubtitleTracks: p.renditionTracks.cueIndexedSubtitleTracks(effectiveFile, start)})
 	}
 	planned := replanPassV3{alternateCandidateV3: alternateCandidateV3{file: effectiveFile, request: start, audioIndex: audioIndex, result: result, toneMapErr: toneMapCapabilityErr}, audioDegraded: audioDegraded}
 	if start.AllowsAlternateVersions() && terminalAllowsAlternateFileV3(result.Terminal) && replanAllowsAlternateFileV3(p.operation, start.QualityPreference) {
@@ -9482,6 +9633,7 @@ func (h *PlaybackHandler) replanInputV3(r *http.Request, p replanPlanningV3, sta
 		AudioTrackIndex:      audioIndex, Settings: p.settings,
 		Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), file), Now: time.Now(),
 		AttemptedKeys: p.attemptedKeys, AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), file),
+		AudioShapeRetry: p.audioShapeRetry, AudioInitFailureDetail: p.audioInitFailureDetail,
 	}
 }
 
@@ -9605,9 +9757,20 @@ func annotateAudioTrackSubstitutedV3(result *playback.PlannerResultV3, index int
 	})
 }
 
+// syncSessionsAfterReplanDetached persists the post-replan session snapshot on
+// a context that outlives the replan request. The durable commit (and its
+// afterDurableCommit callback) can run after executeReplanV3 returns, at which
+// point the request context is canceled; a sync bound to it failed with
+// context.Canceled on every replan, leaving the shared admin snapshot stale.
+// WithoutCancel keeps the request's logging/trace values while dropping that
+// cancellation, and the bound keeps a wedged syncer from holding the response.
+func (h *PlaybackHandler) syncSessionsAfterReplanDetached(ctx context.Context) {
+	syncCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	h.syncSessionsNow(syncCtx, "v3_replan")
+}
+
 func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.AttemptRecordV3, req playback.ReplanRequestV3) (playback.DecisionResponseV3, playback.AttemptRecordV3, *preparedTransportV3, *transportErrorV3) {
-	afterCtx, afterCancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
-	defer afterCancel()
 	r = r.WithContext(withPlaybackRoutingPolicySnapshotV3(r.Context(), h.playbackRoutingPolicyV3()))
 	r = r.WithContext(withServerBitrateCapV3(r.Context(), record.ServerBitrateCapKbps))
 	r = r.WithContext(withCueIndexReadsV3(r.Context()))
@@ -9692,14 +9855,37 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		(operation == playback.ReplanOperationFailureRecoveryV3 && req.Failure.Classification == failureSubtitleTrackChangedV3)
 	qualityChange := operation == playback.ReplanOperationQualityChangeV3
 	outputChange := operation == playback.ReplanOperationOutputChangeV3
-	// A failure recovery that abandoned a delivery for a transport reason
-	// demotes that delivery on the durable request, so every later replan in
-	// this attempt plans with it disabled. Without the stickiness a
-	// track_change replan re-reads the client's still-advertised claims and
-	// steers straight back to a route that just failed, thrashing the player
-	// between direct play and remux (each flip reloading the stream and
+	// A same-output replan plans again for the output context the durable plan
+	// was built for, so a recipe that already failed there is a recipe for this
+	// same question. That is what lets the durable recipe-exclusion chain below
+	// apply whatever the operation: a track_change re-reads the client's
+	// still-advertised claims and would otherwise steer straight back to a
+	// recipe the client already abandoned. An output change re-targets the plan
+	// at a different output context, which PlanAttemptKeyV3 folds into every
+	// key, so the previous recipe is a different question there. A seek reanchor
+	// replays a frozen recipe by design and never consults the ladder.
+	sameOutputReplan := !seekReanchor && !outputChange
+	// A failure recovery that abandoned a delivery for a transport reason used
+	// to demote that delivery on the durable request, so every later replan in
+	// this attempt planned with it disabled. The demotion is what kept a
+	// track_change replan from re-reading the client's still-advertised claims
+	// and steering straight back to a route that just failed, thrashing the
+	// player between direct play and remux (each flip reloading the stream and
 	// orphaning the client's subtitle track state — the field symptom where a
 	// menu shows a selection that is not actually playing).
+	//
+	// That demotion was too broad. Delivery classes pool recipes that are not
+	// interchangeable — server_remux_hls and server_transcode_hls are both
+	// DeliveryClassHLSV3 — so one aborted copy recipe retired a transcode
+	// fallback the device never tried. An abort also cannot be evidence about a
+	// class: the client parsed the plan and started fetching it, which proves
+	// the class reached the device, and a user backing out or a transient fetch
+	// error produces the same report. Only classifications that name a recipe
+	// property (decode, parser) retire the class
+	// (abandonmentDoesNotIndictDeliveryClassV3). The aborted recipe itself is
+	// retired by excluding its plan key from this replan and from same-output
+	// replans after it, which keeps the thrash guard without spending a class
+	// the ladder has not finished with.
 	//
 	// The demotion is a server-side evidence write on the durable attempt, not
 	// a client-authority change: a fresh start of the same file still negotiates
@@ -9716,20 +9902,54 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	// virtual failure: candidate substitution is the recovery, so the delivery
 	// stays eligible until rotation exhausts.
 	virtualDecodeRotation := h.virtualCandidateRotationPendingV3(record, req)
+	// A player whose audio output failed to initialize is not evidence against
+	// the video route. Keep the delivery and spend its one audio-shape retry on
+	// a stereo recipe before the ordinary demotion path can retire the class.
+	// The failing code comes from the replan's own failure evidence, never from
+	// the asynchronous route-event telemetry.
+	audioInitFailureDetail := ""
+	audioShapeRetry := false
+	if failureRecoveryOperationV3(operation) {
+		audioInitFailureDetail = playback.AudioInitFailureDetailV3(req.Failure)
+	}
+	if audioInitFailureDetail != "" && len(unreachableNodes) == 0 && audioShapeRetryApplicableV3(record) {
+		audioShapeRetry = true
+		markAudioShapeRetryV3(&record.NormalizedRequest, record.CurrentPlan.Delivery)
+		markAudioShapeRetryV3(&start, record.CurrentPlan.Delivery)
+		slog.InfoContext(r.Context(), "playback delivery kept for a stereo audio-shape retry",
+			logComponentKey, playbackLogValueV3,
+			"session_id", record.SessionID,
+			"delivery_class", record.CurrentPlan.Delivery,
+			"audio_channels", planAudioChannelsV3(record.CurrentPlan),
+			"failure_detail", audioInitFailureDetail,
+		)
+	}
 	// A node that stopped answering indicts the node, not the delivery: keep
 	// the delivery class eligible so the same recipe can run on another node.
-	if failureRecoveryAbandonedDeliveryV3(operation, req.Failure.Classification) &&
+	// An abandonment (player_failure, http_failure) indicts only the recipe the
+	// client already reached: the class stays eligible, and the abandoned
+	// recipe key is what keeps a later replan from replaying it.
+	abandonedRecipe := false
+	if !audioShapeRetry &&
+		failureRecoveryAbandonedDeliveryV3(operation, req.Failure.Classification) &&
 		len(unreachableNodes) == 0 &&
 		(!decodeFailureClassificationV3(req.Failure.Classification) ||
 			(!h.softwareDecodeRetryPendingV3(record, req) && !virtualDecodeRotation)) {
-		// Demote on both copies: the record (the durable attempt this replan
-		// may still terminal-persist) and the seeded start, whose payload the
-		// success commit writes back via updated.NormalizedRequest. Demoting
-		// only the record would be wiped by that write-back — the seed was
-		// copied before the demotion and the overlay re-enables the client's
-		// still-advertised claim.
-		demoteDeliveryCapabilityV3(&record.NormalizedRequest, record.CurrentPlan.Delivery)
-		demoteDeliveryCapabilityV3(&start, record.CurrentPlan.Delivery)
+		// An audio-output init failure is evidence about the audio shape this
+		// delivery's recipe produced, not about the client walking away: once
+		// the one stereo retry is spent, the class retires as it always did.
+		if audioInitFailureDetail != "" || !abandonmentDoesNotIndictDeliveryClassV3(req.Failure.Classification) {
+			// Demote on both copies: the record (the durable attempt this replan
+			// may still terminal-persist) and the seeded start, whose payload the
+			// success commit writes back via updated.NormalizedRequest. Demoting
+			// only the record would be wiped by that write-back — the seed was
+			// copied before the demotion and the overlay re-enables the client's
+			// still-advertised claim.
+			demoteDeliveryCapabilityV3(&record.NormalizedRequest, record.CurrentPlan.Delivery)
+			demoteDeliveryCapabilityV3(&start, record.CurrentPlan.Delivery)
+		} else {
+			abandonedRecipe = true
+		}
 	}
 	// User-intent operations replace the legacy audio PATCH and client-recipe
 	// transcode start. Nothing failed, so their previous route stays eligible:
@@ -9838,6 +10058,10 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		// route a previous failure recovery abandoned stays disabled — the
 		// client cannot advertise itself back into a route that failed.
 		reapplyDeliveryDemotionsV3(&start, record.NormalizedRequest)
+		// The audio-shape retry marker is the same kind of server-owned
+		// evidence: the overlay must not let the client's still-surround
+		// advertisement spend a second retry.
+		reapplyAudioShapeRetriesV3(&start, record.NormalizedRequest)
 		if req.ClientFeatures != nil {
 			// Feature advertisement is single-location (top-level); a replan
 			// that sends it refreshes the durable request's copy alongside the
@@ -10046,7 +10270,34 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	nodeRecovery = !userIntentOperation && len(unreachableNodes) > 0
 	currentKey := playback.PlanAttemptKeyV3(record.CurrentPlan, record.NormalizedRequest.ClientPlaybackContext.Output.OutputContextID, req.LocalMutations)
 	unmutatedKey := playback.PlanAttemptKeyV3(record.CurrentPlan, record.NormalizedRequest.ClientPlaybackContext.Output.OutputContextID, nil)
+	if abandonedRecipe {
+		// Retire the recipe durably rather than only for this replan: a later
+		// track_change or quality pick echoes no attempted-key history, so the
+		// attempt's own chain is the only thing that keeps the abandoned recipe
+		// from coming back (§6.2).
+		if err := h.appendRecipeExclusionsV3(r.Context(), record, abandonedRecipeAttemptKeysV3(record, req)); err != nil {
+			slog.WarnContext(r.Context(), "playback abandoned recipe was not recorded",
+				logComponentKey, playbackLogValueV3,
+				"session_id", record.SessionID,
+				"delivery", record.CurrentPlan.Delivery,
+				"error", err,
+			)
+		}
+	}
 	attemptedKeys := []string(nil)
+	// The durable recipe-exclusion chain carries the keys an abandonment
+	// retired. A same-output replan re-asks the question that recipe already
+	// answered badly, and it usually brings no history of its own, so the chain
+	// is what keeps an abandoned recipe from being planned again. An output
+	// change plans for a different output context, whose keys the chain cannot
+	// contain, and a seek reanchor never consults the ladder.
+	if sameOutputReplan {
+		for _, key := range record.RecoveryState.RecipeExclusions {
+			if !containsStringExactV3(attemptedKeys, key) {
+				attemptedKeys = append(attemptedKeys, key)
+			}
+		}
+	}
 	if !intentChange && !seekReanchor && !userIntentOperation {
 		failedKey := strings.TrimSpace(req.PlanAttemptKey)
 		for _, key := range req.AttemptedPlanKeys {
@@ -10143,7 +10394,9 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		currentEffectiveFile: currentEffectiveFile, currentEffectiveStart: currentEffectiveStart,
 		lowerVersion: lowerVersion, settings: plannerSettings, attemptedKeys: attemptedKeys,
 		keptActiveEditionForSubtitle: keptActiveEditionForSubtitle, desired: desired,
-		renditionTracks: pinnedRenditionTracksForRecordV3(record),
+		renditionTracks:        pinnedRenditionTracksForRecordV3(record),
+		audioShapeRetry:        audioShapeRetry,
+		audioInitFailureDetail: audioInitFailureDetail,
 	}
 	if seekReanchor { //nolint:nestif // executeReplanV3 exceeds Vio's nestif complexity-4 limit; refactor tracked separately
 		var frozenErr error
@@ -11148,6 +11401,16 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			}
 		}
 		attemptedKeys = []string(nil)
+		// The durable recipe-exclusion chain applies to this pass exactly as it
+		// does to the first one: an abandoned recipe stays retired whatever
+		// operation asks for the next plan.
+		if sameOutputReplan {
+			for _, key := range record.RecoveryState.RecipeExclusions {
+				if !containsStringExactV3(attemptedKeys, key) {
+					attemptedKeys = append(attemptedKeys, key)
+				}
+			}
+		}
 		currentKey := playback.PlanAttemptKeyV3(record.CurrentPlan, record.NormalizedRequest.ClientPlaybackContext.Output.OutputContextID, req.LocalMutations)
 		unmutatedKey := playback.PlanAttemptKeyV3(record.CurrentPlan, record.NormalizedRequest.ClientPlaybackContext.Output.OutputContextID, nil)
 		if !intentChange && !seekReanchor && !userIntentOperation {
@@ -11253,7 +11516,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				// and the viewer can repeat the change.
 				return playback.DecisionResponseV3{}, *record, nil, subtitleArtifactErrorV3("Downloaded subtitles are temporarily unavailable.", inventoryErr)
 			}
-			result, toneMapCapabilityErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: start, RequestedFile: plannerRequestedFile, EffectiveFile: effectiveFile, LowerVersion: lowerVersionForFileV3(lowerVersion, effectiveFile), ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), AudioTrackIndex: audioIndex, Settings: plannerSettings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: attemptedKeys, AdditionalSubtitles: additional, ForceSoftwareVideoDecode: forceSoftwareDecode, DecodeAttemptDetail: decodeAttemptDetail, StickyDelivery: stickyDelivery, InventoryProvenance: string(replanVirtualProvenance), PreviousSubtitleEvaluation: previousSubtitleEvaluationV3(record), CueIndexedSubtitleTracks: planning.renditionTracks.cueIndexedSubtitleTracks(effectiveFile, start)})
+			result, toneMapCapabilityErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: start, RequestedFile: plannerRequestedFile, EffectiveFile: effectiveFile, LowerVersion: lowerVersionForFileV3(lowerVersion, effectiveFile), ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), AudioTrackIndex: audioIndex, Settings: plannerSettings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: attemptedKeys, AdditionalSubtitles: additional, ForceSoftwareVideoDecode: forceSoftwareDecode, DecodeAttemptDetail: decodeAttemptDetail, StickyDelivery: stickyDelivery, InventoryProvenance: string(replanVirtualProvenance), PreviousSubtitleEvaluation: previousSubtitleEvaluationV3(record), AudioShapeRetry: audioShapeRetry, AudioInitFailureDetail: audioInitFailureDetail, CueIndexedSubtitleTracks: planning.renditionTracks.cueIndexedSubtitleTracks(effectiveFile, start)})
 			clampPlannerTargetResolution(&result, effectiveFile)
 			reportDetourSubtitleDrop()
 		}
@@ -11273,7 +11536,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			if err != nil {
 				return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: trackUnavailableReasonV3, message: err.Error()}
 			}
-			result, toneMapCapabilityErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: start, RequestedFile: plannerRequestedFile, EffectiveFile: effectiveFile, LowerVersion: lowerVersionForFileV3(lowerVersion, effectiveFile), ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), AudioTrackIndex: audioIndex, Settings: plannerSettings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: attemptedKeys, AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), effectiveFile), ForceSoftwareVideoDecode: forceSoftwareDecode, DecodeAttemptDetail: decodeAttemptDetail, StickyDelivery: replanStickyDeliveryV3(operation, record.CurrentPlan.Delivery), CueIndexedSubtitleTracks: planning.renditionTracks.cueIndexedSubtitleTracks(effectiveFile, start)})
+			result, toneMapCapabilityErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: start, RequestedFile: plannerRequestedFile, EffectiveFile: effectiveFile, LowerVersion: lowerVersionForFileV3(lowerVersion, effectiveFile), ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), AudioTrackIndex: audioIndex, Settings: plannerSettings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: attemptedKeys, AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), effectiveFile), ForceSoftwareVideoDecode: forceSoftwareDecode, DecodeAttemptDetail: decodeAttemptDetail, StickyDelivery: replanStickyDeliveryV3(operation, record.CurrentPlan.Delivery), AudioShapeRetry: audioShapeRetry, AudioInitFailureDetail: audioInitFailureDetail, CueIndexedSubtitleTracks: planning.renditionTracks.cueIndexedSubtitleTracks(effectiveFile, start)})
 			clampPlannerTargetResolution(&result, effectiveFile)
 
 		}
@@ -12000,7 +12263,13 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			// must not become a stored preference.
 			h.persistLegacyAudioPreferenceV3(r.Context(), session.ID, session.UserID, session.ProfileID, effectiveFile, plannedAudioTrackIndexV3(result, session.AudioTrackIndex))
 		}
-		h.syncSessionsNow(afterCtx, "v3_replan")
+		// afterDurableCommit runs after executeReplanV3 returns and its request
+		// context may already be canceled. A sync bound to that context always
+		// failed with context.Canceled, so the replanned session was never
+		// persisted to the shared admin snapshot. Detach it while keeping the
+		// request's logging/trace values and bound it so a wedged syncer cannot
+		// hold the response open forever.
+		h.syncSessionsAfterReplanDetached(r.Context())
 		event := playback.RouteEventPlanSelectedV3
 		clientModel := req.ClientPlaybackContext.Device.Model
 		if seekReanchor {
@@ -13445,6 +13714,11 @@ type alternateCandidateV3 struct {
 	audioIndex int
 	result     playback.PlannerResultV3
 	toneMapErr error
+	// substitutionReason names why the returned file is not the one this plan
+	// started with, when the alternate-version hunt replaced it. Empty means the
+	// file is the entry file (or a caller-supplied substitution whose cause the
+	// caller already carries).
+	substitutionReason string
 }
 
 func replanAllowsAlternateFileV3(operation playback.ReplanOperationV3, qualityPreference string) bool {
@@ -14598,6 +14872,37 @@ func planHasVideoEncodeV3(plan playback.PlanV3) bool {
 	return false
 }
 
+// abandonmentDoesNotIndictDeliveryClassV3 reports whether a failure
+// classification records a client that walked away from a delivery it had
+// already reached, rather than evidence that the delivery class itself cannot
+// serve this output.
+//
+// A player_failure or http_failure arrives after the client parsed the plan and
+// started fetching it, so it proves the class reached the device; the same
+// shape is also what a viewer backing out, a glitch on one recipe, or a
+// transient fetch error produces, and the server cannot tell those apart. None
+// of them is evidence about the class, and one class serves several recipes
+// (server_remux_hls and server_transcode_hls are both DeliveryClassHLSV3), so
+// retiring it also retires every untried recipe behind it. What a delivery
+// class can do is knowable when the attempt starts, from the client's
+// capabilities.
+//
+// Decode- and parser-shaped classifications are different evidence: they name a
+// property of the recipe (codec, pixel format, container) rather than the
+// client's appetite, so they still retire the class. Audio-output initialization
+// failures are handled earlier by the audio-shape retry (see
+// audioShapeRetryApplicableV3) and keep the ordinary demotion once that retry is
+// spent. The failing recipe itself is retired by plan-key exclusion (§6.2), not
+// by the class demotion this predicate suppresses.
+func abandonmentDoesNotIndictDeliveryClassV3(classification string) bool {
+	switch failureClassificationKeyV3(classification) {
+	case "player_failure", "http_failure":
+		return true
+	default:
+		return false
+	}
+}
+
 // decodeFailureClassificationV3 reports whether a client failure classification
 // indicts the video decoder specifically. Only these defer delivery demotion
 // for a pending software-decode variant; other transport failures demote as
@@ -14791,6 +15096,64 @@ func (h *PlaybackHandler) appendRecoveryExclusionsV3(ctx context.Context, record
 // pathological writer loop from spinning a replan.
 const recoveryAppendMaxAttempts = 8
 
+// appendRecipeExclusionsV3 durably records the plan attempt keys an abandonment
+// retired so no later same-output replan can replay them (§6.2). It uses the
+// same revision-checked union as the candidate chain and retries a losing
+// compare. Unlike a confirmed candidate rotation, a failure to persist here
+// must not fail playback: the delivery class is still eligible and the client's
+// own echoed history still applies, so the guard degrades to that history and
+// the caller only logs the error.
+func (h *PlaybackHandler) appendRecipeExclusionsV3(ctx context.Context, record *playback.AttemptRecordV3, keys []string) error {
+	if record == nil || len(keys) == 0 {
+		return nil
+	}
+	store := h.recoveryStateStoreV3()
+	if store == nil {
+		return errors.New("recovery state store unavailable")
+	}
+	revision := record.RecoveryRevision
+	var lastErr error
+	for attempt := 0; attempt < recoveryAppendMaxAttempts; attempt++ {
+		state, newRevision, err := store.AppendRecipeExclusions(ctx, record.SessionID, revision, keys)
+		if err == nil {
+			record.RecoveryState = state
+			record.RecoveryRevision = newRevision
+			return nil
+		}
+		if !errors.Is(err, playback.ErrRecoveryRevisionConflictV3) {
+			return err
+		}
+		lastErr = err
+		// The committed chain advanced after this record was read. Re-read and
+		// retry the union against the newer revision.
+		_, currentRevision, readErr := store.GetRecoveryState(ctx, record.SessionID)
+		if readErr != nil {
+			return readErr
+		}
+		revision = currentRevision
+	}
+	return lastErr
+}
+
+// abandonedRecipeAttemptKeysV3 returns the plan attempt keys an abandonment
+// indicted: the durable recipe as this output planned it, plus its unmutated
+// form when the client reports a local mutation. The server hashed that
+// variation into the plan key, so both spellings name recipes that already
+// failed for this output.
+func abandonedRecipeAttemptKeysV3(record *playback.AttemptRecordV3, req playback.ReplanRequestV3) []string {
+	if record == nil {
+		return nil
+	}
+	outputContextID := record.NormalizedRequest.ClientPlaybackContext.Output.OutputContextID
+	if len(req.LocalMutations) == 0 {
+		return []string{playback.PlanAttemptKeyV3(record.CurrentPlan, outputContextID, nil)}
+	}
+	return []string{
+		playback.PlanAttemptKeyV3(record.CurrentPlan, outputContextID, req.LocalMutations),
+		playback.PlanAttemptKeyV3(record.CurrentPlan, outputContextID, nil),
+	}
+}
+
 // virtualCandidateReleaseIdentityV3 returns the durable release identity for a
 // session-bound candidate (provider GUID or video hash), so an exclusion can
 // match a renumbered result for the same release.
@@ -14852,6 +15215,83 @@ func demotedDeliveryClassesV3(durable playback.StartRequestV3) []string {
 		}
 	}
 	return demoted
+}
+
+// audioShapeRetryReasonV3 marks a delivery whose surround audio recipe failed
+// to initialize and was rebuilt once as stereo. The delivery stays enabled:
+// the video route was never at fault. A second audio-init failure on the
+// rebuilt plan falls through to the ordinary demotion path.
+const audioShapeRetryReasonV3 = "audio_init_failed_shape_retry"
+
+// planAudioChannelsV3 reports the channel count a plan actually delivers. A
+// copied or direct route carries no converted layout, so the source descriptor
+// names the selected track's real shape.
+func planAudioChannelsV3(plan playback.PlanV3) int {
+	if plan.EffectiveRecipe.AudioChannels != nil && *plan.EffectiveRecipe.AudioChannels > 0 {
+		return *plan.EffectiveRecipe.AudioChannels
+	}
+	return plan.Source.AudioChannels
+}
+
+// audioShapeRetriedV3 reports whether delivery already spent its one
+// audio-shape retry on this attempt.
+func audioShapeRetriedV3(request playback.StartRequestV3, delivery playback.DeliveryV3) bool {
+	capability, ok := request.ClientPlaybackContext.Deliveries[playback.DeliveryClassV3(delivery)]
+	return ok && strings.EqualFold(strings.TrimSpace(capability.FailureReason), audioShapeRetryReasonV3)
+}
+
+// audioShapeRetryApplicableV3 reports whether the current plan is a surround
+// recipe whose delivery has not spent its audio-shape retry. A plan already
+// downmixed to stereo has nothing smaller to try.
+func audioShapeRetryApplicableV3(record *playback.AttemptRecordV3) bool {
+	if record == nil || record.CurrentPlan.Delivery == "" || record.CurrentPlan.Source.VideoCodec == "" {
+		return false
+	}
+	if audioShapeRetriedV3(record.NormalizedRequest, record.CurrentPlan.Delivery) {
+		return false
+	}
+	return planAudioChannelsV3(record.CurrentPlan) > 2
+}
+
+// markAudioShapeRetryV3 stamps the one-shot audio-shape retry on a delivery
+// without disabling it. Idempotent and nil-safe.
+func markAudioShapeRetryV3(request *playback.StartRequestV3, delivery playback.DeliveryV3) {
+	if request == nil || delivery == "" {
+		return
+	}
+	class := playback.DeliveryClassV3(delivery)
+	if request.ClientPlaybackContext.Deliveries == nil {
+		return
+	}
+	capability, ok := request.ClientPlaybackContext.Deliveries[class]
+	if !ok || !capability.Enabled {
+		return
+	}
+	capability.FailureReason = audioShapeRetryReasonV3
+	request.ClientPlaybackContext.Deliveries[class] = capability
+	slog.Debug("playback delivery kept for a stereo audio-shape retry",
+		"component", "api", "delivery_class", class)
+}
+
+// reapplyAudioShapeRetriesV3 re-stamps the durable record's audio-shape retry
+// markers after the client's capability payload replaced the seeded map. A
+// delivery the client no longer enables stays disabled; only a still-enabled
+// class keeps the server-owned one-shot marker.
+func reapplyAudioShapeRetriesV3(start *playback.StartRequestV3, durable playback.StartRequestV3) {
+	if start == nil || start.ClientPlaybackContext.Deliveries == nil {
+		return
+	}
+	for class, durableCapability := range durable.ClientPlaybackContext.Deliveries {
+		if !strings.EqualFold(strings.TrimSpace(durableCapability.FailureReason), audioShapeRetryReasonV3) {
+			continue
+		}
+		capability, ok := start.ClientPlaybackContext.Deliveries[class]
+		if !ok || !capability.Enabled {
+			continue
+		}
+		capability.FailureReason = audioShapeRetryReasonV3
+		start.ClientPlaybackContext.Deliveries[class] = capability
+	}
 }
 
 // reapplyDeliveryDemotionsV3 writes the durable record's delivery demotions
@@ -15034,6 +15474,58 @@ func (h *PlaybackHandler) persistTerminalStartDecisionV3(ctx context.Context, us
 func (h *PlaybackHandler) startFailureDecisionV3(ctx context.Context, userID int, profileID string, req playback.StartRequestV3, requestDigests playbackStartRequestDigestsV3, requestedFileID, effectiveFileID int, failure *transportErrorV3) (playback.DecisionResponseV3, error) {
 	response := playback.NewTerminalResponseV3(failure.reason, failure.message, failure.retryable)
 	return h.persistTerminalStartDecisionV3(ctx, userID, profileID, req, requestDigests, requestedFileID, effectiveFileID, response)
+}
+
+// startTerminalPersistOperationErrorV3 maps a failed terminal-start save to the
+// client answer. The virtual start owns one deadline for resolve, planning and
+// transport startup, so a start that reaches it fails the following SaveAttempt
+// with context.DeadlineExceeded: the save describes the expired request budget,
+// not the playback verdict. A retryable failure (or a save cut off only by that
+// budget) must stay retryable and advertise Retry-After instead of collapsing
+// into a 500 internal_error; only a genuine store fault on a non-retryable
+// verdict keeps the 500.
+func startTerminalPersistOperationErrorV3(ctx context.Context, persistErr error, retryable bool, failure *transportErrorV3) error {
+	if e, ok := errors.AsType[*PlaybackOperationError](persistErr); ok {
+		return e
+	}
+	if errors.Is(persistErr, playback.ErrIdempotencyKeyReusedV3) {
+		return playbackPersistenceOperationError(persistErr)
+	}
+	slog.WarnContext(ctx, "playback start terminal persist failed",
+		"component", "api", "retryable", retryable, "error", persistErr)
+	if !retryable && !errors.Is(persistErr, context.DeadlineExceeded) && !errors.Is(persistErr, context.Canceled) {
+		return playbackPersistenceOperationError(persistErr)
+	}
+	return retryableStartOperationErrorV3(failure)
+}
+
+// retryableStartOperationErrorV3 classifies a transient start failure for the
+// client. Route-capacity exhaustion names its own existing code (the replan
+// path answers the same state with 503 route_capacity_unavailable); every other
+// retryable start failure is dependency_unavailable, the catalog's 503 for
+// temporary unavailability.
+func retryableStartOperationErrorV3(failure *transportErrorV3) *PlaybackOperationError {
+	if failure != nil && failure.reason == string(noderouting.OutcomeCapacityUnavailable) {
+		return &PlaybackOperationError{
+			Status:     http.StatusServiceUnavailable,
+			Code:       string(noderouting.OutcomeCapacityUnavailable),
+			Message:    "The playback route capacity is temporarily unavailable; retry shortly",
+			RetryAfter: playbackStartRetryAfterSeconds,
+		}
+	}
+	message := "Playback is temporarily unavailable; retry shortly"
+	if failure != nil && failure.retryable && strings.TrimSpace(failure.message) != "" {
+		message = failure.message
+	}
+	if failure != nil && errors.Is(failure.cause, context.DeadlineExceeded) {
+		message = "Playback start timed out; retry shortly"
+	}
+	return &PlaybackOperationError{
+		Status:     http.StatusServiceUnavailable,
+		Code:       playbackDependencyUnavailableCode,
+		Message:    message,
+		RetryAfter: playbackStartRetryAfterSeconds,
+	}
 }
 
 func writeStartAttemptPersistenceErrorV3(w http.ResponseWriter, err error) {

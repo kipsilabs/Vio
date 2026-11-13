@@ -87,6 +87,11 @@ const (
 	// existing retry loop than by holding the connection inside its own fetch
 	// deadline.
 	relayDemuxRequestWait = 750 * time.Millisecond
+
+	// relayDemuxShedMemory bounds how long a shed timestamp is retained for the
+	// source-map cleanup. The warm quiet window is shorter; this only keeps the
+	// map from accumulating hosts that stopped shedding.
+	relayDemuxShedMemory = 2 * time.Minute
 )
 
 // relayDemuxClass selects how an admission request treats a saturated source.
@@ -132,6 +137,11 @@ type relayDemuxGuard struct {
 
 	mu    sync.Mutex
 	slots map[string]*relayDemuxSourceSlots
+	// lastRequestShed records the last time a client-facing read could not
+	// take a request-path slot per relay source. Detached warms consult it so
+	// they do not add a full-track demux to a pipe that is already shedding the
+	// windows viewers are waiting on.
+	lastRequestShed map[string]time.Time
 }
 
 func newRelayDemuxGuard(limit int, wait time.Duration) *relayDemuxGuard {
@@ -153,11 +163,12 @@ func newRelayDemuxGuardWithPools(limit, detachedLimit, fontLimit int, wait time.
 		fontLimit = 1
 	}
 	return &relayDemuxGuard{
-		limit:         limit,
-		detachedLimit: detachedLimit,
-		fontLimit:     fontLimit,
-		wait:          wait,
-		slots:         make(map[string]*relayDemuxSourceSlots),
+		limit:           limit,
+		detachedLimit:   detachedLimit,
+		fontLimit:       fontLimit,
+		wait:            wait,
+		slots:           make(map[string]*relayDemuxSourceSlots),
+		lastRequestShed: make(map[string]time.Time),
 	}
 }
 
@@ -234,9 +245,84 @@ func (g *relayDemuxGuard) acquire(ctx context.Context, input string, class relay
 	}
 	recordSubtitleRelayAdmission(label, source, ok)
 	if !ok {
+		if class == relayDemuxRequestPath {
+			g.noteRequestShed(source, time.Now())
+		}
 		return nil, false
 	}
 	return release, true
+}
+
+// noteRequestShed records that a client-facing read was shed for source. The
+// map is tiny (one entry per relay host), but a long-lived server that talks to
+// many hosts still prunes expired entries so it cannot grow without bound.
+func (g *relayDemuxGuard) noteRequestShed(source string, now time.Time) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.lastRequestShed == nil {
+		g.lastRequestShed = make(map[string]time.Time)
+	}
+	g.lastRequestShed[source] = now
+	if len(g.lastRequestShed) > 64 {
+		for key, at := range g.lastRequestShed {
+			if now.Sub(at) > relayDemuxShedMemory {
+				delete(g.lastRequestShed, key)
+			}
+		}
+	}
+}
+
+// requestPathSheddingRecently reports whether a client-facing read for input
+// was refused a slot within the quiet window. Detached work uses it to stay off
+// a pipe that is actively shedding.
+func (g *relayDemuxGuard) requestPathSheddingRecently(input string, within time.Duration) bool {
+	source, remote := relayDemuxSource(input)
+	if !remote {
+		return false
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	at, ok := g.lastRequestShed[source]
+	return ok && time.Since(at) < within
+}
+
+// requestPathSaturated reports whether every request-path slot for input is
+// held right now, so the next client read would have to wait for one. Detached
+// work consults it before it starts: a pipe whose request path is at capacity
+// has nothing to spare for opportunistic reads.
+//
+// The shed timestamp alone cannot answer this. A shed is recorded only after a
+// client read has already waited out its whole admission window, so a prefetch
+// kick launched against a saturated-but-not-yet-shedding source used to start,
+// take its detached slot, and add the demux the client read was waiting behind
+// — the production 503 (753ms, the full request-path wait) followed by five
+// shed-skipped kicks.
+func (g *relayDemuxGuard) requestPathSaturated(input string) bool {
+	source, remote := relayDemuxSource(input)
+	if !remote {
+		return false
+	}
+	pools := g.pools(source)
+	return len(pools.requestPath) >= cap(pools.requestPath)
+}
+
+// relayDemuxRequestPathShedding reports whether the process-wide guard shed a
+// client-facing read for input inside the quiet window.
+func relayDemuxRequestPathShedding(input string, within time.Duration) bool {
+	return activeRelayDemuxGuard().requestPathSheddingRecently(input, within)
+}
+
+// relayDemuxRequestPathSaturated reports whether the process-wide guard's
+// request-path budget for input is fully held right now.
+func relayDemuxRequestPathSaturated(input string) bool {
+	return activeRelayDemuxGuard().requestPathSaturated(input)
+}
+
+// relayDemuxDetachedBlocked reports whether an opportunistic detached read of
+// input must stay off the source: a client-facing read is waiting (or about to
+// wait) for a request-path slot, or one was shed inside the quiet window.
+func relayDemuxDetachedBlocked(input string, within time.Duration) bool {
+	return relayDemuxRequestPathSaturated(input) || relayDemuxRequestPathShedding(input, within)
 }
 
 // relayDemuxClassLabel is the bounded metric label for an admission class.

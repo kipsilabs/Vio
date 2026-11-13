@@ -40,16 +40,6 @@ const (
 	copySeekAnchorCacheMax = 256
 )
 
-// CopySeekProbeRetryBudget is the wall-clock budget a caller must reserve
-// before the first copy-video seek-anchor probe for one retry to fit: two full
-// probes. A caller with less than this plus its own scheduling margin must skip
-// the retry rather than start a second probe the deadline will truncate; the
-// caller adds the margin because process startup, probe-slot waits, and result
-// handling sit outside the probe timeout.
-func CopySeekProbeRetryBudget() time.Duration {
-	return 2 * CopySeekProbeTimeout
-}
-
 var (
 	copySeekProbeGroup singleflight.Group
 	copySeekProbeSlots = make(chan struct{}, maxConcurrentCopySeekProbes)
@@ -358,12 +348,41 @@ func copySeekAnchorGOPKey(sourceKey string, keyframe float64) string {
 	return sourceKey + "\x00kf=" + strconv.FormatFloat(keyframe, 'g', -1, 64)
 }
 
+// copySeekAnchorRetryFlightKey marks a probe launched by a caller's retry
+// attempt. It is a context key, read only when the flight key is built.
+type copySeekAnchorRetryFlightKey struct{}
+
+// WithCopySeekAnchorRetryFlight returns ctx marked as a retry attempt's probe.
+//
+// A retry must not join the flight its own first attempt may still be
+// draining. The first caller returns as soon as its attempt budget ends, but
+// the flight it started keeps running (see the WithoutCancel probe context) to
+// finish the killed probe and populate the cache. A retry that calls in during
+// that drain window used to join the spent flight and receive the first
+// attempt's timeout a few milliseconds later — with its own fresh budget
+// untouched — so the reserved retry never opened the provider and the start
+// answered a non-retryable terminal. Giving the retry its own flight makes it
+// spend the budget the caller reserved for it.
+func WithCopySeekAnchorRetryFlight(ctx context.Context) context.Context {
+	if ctx == nil {
+		return nil
+	}
+	return context.WithValue(ctx, copySeekAnchorRetryFlightKey{}, true)
+}
+
 // copySeekAnchorFlightKey identifies one in-flight probe for singleflight
 // coalescing. It keeps the exact requested position because two positions in
 // one GOP cannot be known to share a keyframe until the probe returns; only an
-// identical concurrent request joins the flight.
-func copySeekAnchorFlightKey(sourceKey string, requestedSeekSeconds float64) string {
-	return sourceKey + "\x00ss=" + strconv.FormatFloat(requestedSeekSeconds, 'g', -1, 64)
+// identical concurrent request joins the flight. Retries carry their own
+// namespace so they never coalesce onto a first attempt's draining flight.
+func copySeekAnchorFlightKey(ctx context.Context, sourceKey string, requestedSeekSeconds float64) string {
+	key := sourceKey + "\x00ss=" + strconv.FormatFloat(requestedSeekSeconds, 'g', -1, 64)
+	if ctx != nil {
+		if retry, _ := ctx.Value(copySeekAnchorRetryFlightKey{}).(bool); retry {
+			key += "\x00retry"
+		}
+	}
+	return key
 }
 
 // copySeekAnchorProbe returns the configured probe runner, falling back to the
@@ -451,7 +470,7 @@ func ResolveCopySeekAnchorForSource(
 		return anchor.seconds, anchor.segment, nil
 	}
 
-	flightKey := copySeekAnchorFlightKey(sourceKey, requestedSeekSeconds)
+	flightKey := copySeekAnchorFlightKey(ctx, sourceKey, requestedSeekSeconds)
 	resultCh := copySeekProbeGroup.DoChan(flightKey, func() (any, error) {
 		// Another caller may have populated the cache between the fast-path
 		// check and this closure starting.

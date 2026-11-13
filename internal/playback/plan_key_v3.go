@@ -39,6 +39,7 @@ func DeterministicPlanIDV3(attemptID string, requestedFileID, effectiveFileID in
 	parts = appendHLSSubtitleRenditionsIdentityV3(parts, plan.Subtitle.Inventory)
 	parts = appendVideoSampleEntryIdentityV3(parts, plan.EffectiveRecipe.VideoSampleEntry)
 	parts = appendSegmentContainerIdentityV3(parts, plan.EffectiveRecipe.SegmentContainer)
+	parts = appendAudioChannelsIdentityV3(parts, plan)
 	parts = appendQuirkIdentityV3(parts, plan)
 	if plan.EffectiveRecipe.SoftwareVideoDecode {
 		parts = append(parts, "sw_decode=true")
@@ -80,6 +81,7 @@ func PlanAttemptKeyV3(plan PlanV3, outputContextID string, localMutations []stri
 	parts = appendHLSSubtitleRenditionsIdentityV3(parts, plan.Subtitle.Inventory)
 	parts = appendVideoSampleEntryIdentityV3(parts, plan.EffectiveRecipe.VideoSampleEntry)
 	parts = appendSegmentContainerIdentityV3(parts, plan.EffectiveRecipe.SegmentContainer)
+	parts = appendAudioChannelsIdentityV3(parts, plan)
 	parts = appendQuirkIdentityV3(parts, plan)
 	if plan.EffectiveRecipe.SoftwareVideoDecode {
 		parts = append(parts, "sw_decode=true")
@@ -92,6 +94,22 @@ func PlanAttemptKeyV3(plan PlanV3, outputContextID string, localMutations []stri
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(canonical))
 	return fmt.Sprintf("v3:%016x", h.Sum64())
+}
+
+// appendAudioChannelsIdentityV3 names a converted output layout only when it
+// differs from the source's own layout. That is the one case where the channel
+// count is a recipe choice rather than a property of the source, so a stereo
+// recovery is a distinct plan from the surround recipe it replaces while
+// unchanged sources keep their historical plan identity.
+func appendAudioChannelsIdentityV3(parts []string, plan PlanV3) []string {
+	if plan.EffectiveRecipe.AudioChannels == nil {
+		return parts
+	}
+	channels := *plan.EffectiveRecipe.AudioChannels
+	if channels <= 0 || channels == plan.Source.AudioChannels {
+		return parts
+	}
+	return append(parts, "audio_channels="+strconv.Itoa(channels))
 }
 
 // appendHLSSubtitleRenditionsIdentityV3 keeps a plan that lists embedded text

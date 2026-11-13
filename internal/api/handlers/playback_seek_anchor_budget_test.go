@@ -3,6 +3,8 @@ package handlers
 import (
 	"context"
 	"errors"
+	"fmt"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -12,6 +14,20 @@ import (
 	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/remotestream"
 )
+
+// A first anchor probe that times out at its per-attempt budget is retried by
+// the enclosing start, so that failure is a warning: production logged ERROR for
+// a probe that timed out at its 5 s budget and then resolved on the retry four
+// seconds later. Only a failure the retryable classification does not explain
+// stays an ERROR.
+func TestCopySeekAnchorFailureLevel(t *testing.T) {
+	if got := copySeekAnchorFailureLevel(true); got != slog.LevelWarn {
+		t.Fatalf("retryable/budget anchor failure level = %v, want WARN", got)
+	}
+	if got := copySeekAnchorFailureLevel(false); got != slog.LevelError {
+		t.Fatalf("terminal anchor failure level = %v, want ERROR", got)
+	}
+}
 
 // clearVirtualProviderLinkLatency drops one link's observation so a test starts
 // from an unmeasured link and leaves nothing behind for the next test.
@@ -468,4 +484,186 @@ func deadlineOf(t *testing.T, ctx context.Context) time.Time {
 		t.Fatal("context has no deadline")
 	}
 	return deadline
+}
+
+// TestCopySeekAnchorAttemptBudgetReservesTheRetry proves one anchor attempt's
+// window is derived from the time actually left: an attempt always fits inside
+// the caller's budget, a retry is only reserved when the caller can hold a
+// second adaptive attempt, and a caller with no room gets no attempt at all
+// rather than one the deadline would truncate.
+func TestCopySeekAnchorAttemptBudgetReservesTheRetry(t *testing.T) {
+	previousMargin := copySeekProbeRetryMargin
+	copySeekProbeRetryMargin = time.Second
+	defer func() { copySeekProbeRetryMargin = previousMargin }()
+
+	for _, tc := range []struct {
+		name        string
+		remaining   time.Duration
+		adaptive    time.Duration
+		reserve     bool
+		wantBudget  time.Duration
+		wantReserve bool
+	}{
+		{
+			name: "two adaptive attempts fit", remaining: 30 * time.Second, adaptive: 10 * time.Second, reserve: true,
+			wantBudget: 10 * time.Second, wantReserve: true,
+		},
+		{
+			name: "one adaptive attempt fits and the retry keeps the rest", remaining: 12 * time.Second, adaptive: 10 * time.Second, reserve: true,
+			wantBudget: 10 * time.Second, wantReserve: false,
+		},
+		{
+			name: "tight caller is clamped to what is left", remaining: 4 * time.Second, adaptive: 10 * time.Second, reserve: true,
+			wantBudget: 3 * time.Second, wantReserve: false,
+		},
+		{
+			name: "retry attempt takes the whole remainder", remaining: 12 * time.Second, adaptive: 20 * time.Second, reserve: false,
+			wantBudget: 11 * time.Second, wantReserve: false,
+		},
+		{
+			name: "no room to reserve keeps one bounded attempt", remaining: 500 * time.Millisecond, adaptive: 10 * time.Second, reserve: true,
+			wantBudget: 500 * time.Millisecond, wantReserve: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), tc.remaining)
+			defer cancel()
+			budget, reserved, remaining := copySeekAnchorAttemptBudget(ctx, tc.adaptive, tc.reserve)
+			if diff := budget - tc.wantBudget; diff < -5*time.Millisecond || diff > 5*time.Millisecond {
+				t.Fatalf("budget = %v, want %v", budget, tc.wantBudget)
+			}
+			if reserved != tc.wantReserve {
+				t.Fatalf("reserved = %v, want %v", reserved, tc.wantReserve)
+			}
+			if remaining > tc.remaining || remaining <= 0 {
+				t.Fatalf("remaining = %v, want the caller's ~%v", remaining, tc.remaining)
+			}
+		})
+	}
+
+	// A caller with no deadline keeps the adaptive budget and the caller's
+	// reserve decision: the probe cap alone bounds it.
+	budget, reserved, remaining := copySeekAnchorAttemptBudget(context.Background(), 7*time.Second, true)
+	if budget != 7*time.Second || !reserved || remaining != 0 {
+		t.Fatalf("budget = %v reserved = %v remaining = %v, want the unbounded adaptive budget", budget, reserved, remaining)
+	}
+}
+
+// TestPrepareTransportTimelineRetryEndingOnADeadlineStaysRetryable proves a
+// retry that ends with a deadline error while its own probe context is still
+// live — the shape of a probe that inherited a spent flight — is classified as
+// our budget expiring, not as a verdict against the release. The player gets a
+// retryable seek error it can retry instead of a terminal that leaves it
+// reconnecting.
+func TestPrepareTransportTimelineRetryEndingOnADeadlineStaysRetryable(t *testing.T) {
+	previousFloor, previousMargin := copySeekAnchorSeekResolveTimeout, copySeekProbeRetryMargin
+	copySeekAnchorSeekResolveTimeout, copySeekProbeRetryMargin = 100*time.Millisecond, 100*time.Millisecond
+	defer func() {
+		copySeekAnchorSeekResolveTimeout, copySeekProbeRetryMargin = previousFloor, previousMargin
+	}()
+
+	const ownerInstallationID = 42
+	clearVirtualProviderLinkLatency(t, "42")
+	handler, file, session, plan := slowLinkAnchorFixture(t, ownerInstallationID)
+
+	callerCtx, callerCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer callerCancel()
+
+	var probes atomic.Int32
+	handler.copySeekAnchor = func(ctx context.Context, _ string, _ string, _ float64, _ int) (float64, int, error) {
+		if probes.Add(1) == 1 {
+			// The first attempt spends its own window and answers its deadline.
+			<-ctx.Done()
+			return 0, 0, ctx.Err()
+		}
+		// The retry inherits a probe that already timed out: a deadline error
+		// arrives while this attempt's own context still has time left.
+		if ctx.Err() != nil {
+			t.Errorf("retry probe context was already done")
+		}
+		return 0, 0, fmt.Errorf("resolve copy seek anchor: ffmpeg failed: resolve copy seek anchor: probe interrupted: %w", context.DeadlineExceeded)
+	}
+
+	_, transportErr := handler.prepareTransportTimelineV3(callerCtx, session, file, playback.PlannerResultV3{Plan: plan, PlayMethod: playback.PlayRemux})
+	if transportErr == nil {
+		t.Fatal("a retry that ended on a deadline produced a timeline, want the retryable seek error")
+	}
+	if !transportErr.retryable || !transportErr.seekFailure {
+		t.Fatalf("transport error = %#v, want the retryable seek error instead of a terminal", transportErr)
+	}
+	if transportErr.reason != transcodeStartFailedReasonV3 {
+		t.Fatalf("transport reason = %q, want %q", transportErr.reason, transcodeStartFailedReasonV3)
+	}
+	if got := probes.Load(); got != 2 {
+		t.Fatalf("anchor probes = %d, want the timed-out attempt and its retry", got)
+	}
+}
+
+// TestPrepareTransportTimelineSlowAnchorProbeLeavesBudgetForRetry proves one
+// slow-but-alive provider open no longer ends the session: the first probe is
+// capped below the caller's deadline, the retry it reserved runs with the
+// remaining window, and that retry's success serves the start. Before the
+// budget reallocation the first probe consumed the whole budget and the retry
+// gate rejected the attempt that could have served it.
+func TestPrepareTransportTimelineSlowAnchorProbeLeavesBudgetForRetry(t *testing.T) {
+	previousFloor, previousMargin := copySeekAnchorSeekResolveTimeout, copySeekProbeRetryMargin
+	copySeekAnchorSeekResolveTimeout, copySeekProbeRetryMargin = 100*time.Millisecond, 100*time.Millisecond
+	defer func() {
+		copySeekAnchorSeekResolveTimeout, copySeekProbeRetryMargin = previousFloor, previousMargin
+	}()
+
+	const ownerInstallationID = 41
+	clearVirtualProviderLinkLatency(t, "41")
+	// A link whose last provider answer took 300ms: one attempt is sized at
+	// twice that (600ms) and the caller holds enough for two of them.
+	recordVirtualProviderLinkLatency("41", 300*time.Millisecond, time.Now())
+	handler, file, session, plan := slowLinkAnchorFixture(t, ownerInstallationID)
+
+	callerCtx, callerCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer callerCancel()
+
+	var mu sync.Mutex
+	var budgets []time.Duration
+	var probes atomic.Int32
+	handler.copySeekAnchor = func(ctx context.Context, _ string, _ string, requested float64, segmentDuration int) (float64, int, error) {
+		budget, ok := ctx.Deadline()
+		mu.Lock()
+		if ok {
+			budgets = append(budgets, time.Until(budget))
+		} else {
+			budgets = append(budgets, 0)
+		}
+		mu.Unlock()
+		if probes.Add(1) == 1 {
+			// A source that is slow but alive: the open outran this attempt's
+			// own window. The retry is the attempt that can still land.
+			<-ctx.Done()
+			return 0, 0, ctx.Err()
+		}
+		return requested - 1, computeStartSegment(requested-1, segmentDuration), nil
+	}
+
+	timeline, transportErr := handler.prepareTransportTimelineV3(callerCtx, session, file, playback.PlannerResultV3{Plan: plan, PlayMethod: playback.PlayRemux})
+	if transportErr != nil {
+		t.Fatalf("prepareTransportTimelineV3 = %#v, want the retry's attempt to serve the start", transportErr)
+	}
+	if !timeline.copySeekAnchorResolved {
+		t.Fatalf("timeline = %#v, want a resolved copy anchor from the retry", timeline)
+	}
+	if got := probes.Load(); got != 2 {
+		t.Fatalf("anchor probes = %d, want the slow attempt and its reserved retry", got)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(budgets) != 2 {
+		t.Fatalf("probe budgets = %v, want one per probe", budgets)
+	}
+	// The first probe may not cross the retry's share: it is capped inside the
+	// caller's 2s budget rather than being handed the whole remainder.
+	if budgets[0] > time.Second {
+		t.Fatalf("first probe budget = %v, want it capped below half the caller's 2s budget", budgets[0])
+	}
+	if budgets[1] <= 0 {
+		t.Fatalf("retry probe budget = %v, want the remaining window", budgets[1])
+	}
 }

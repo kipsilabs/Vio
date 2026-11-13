@@ -205,6 +205,53 @@ func waitVirtualPendingHold(ctx context.Context, virtualURI string, fileID int) 
 	return held
 }
 
+// virtualServeResolveBudget bounds the one virtual candidate resolve a
+// direct-play byte serve performs before it can open the relay. Planning has
+// already spent its own, longer budget resolving and probing the candidate; a
+// byte serve is on the media element's clock and cannot deliver a single byte
+// until the resolve returns. One provider fetch is allotted
+// backgroundRefreshTimeout (15s), so this bound leaves room for a listing that
+// answers in time while refusing to hold the request through the whole outage
+// retry schedule: in production that schedule spent a minute relisting an empty
+// answer while the client waited, then aborted and recorded a fake 408. An
+// expired budget is answered as the retryable provider_unavailable 503, so the
+// player falls back or retries the route instead of hanging.
+//
+// It is a var so tests can shrink it and observe the bound.
+var virtualServeResolveBudget = 20 * time.Second
+
+// virtualServeResolveRetryAfterSeconds is the Retry-After a serve-budget
+// expiry advertises. It matches the subtitle source's retry hint: long enough
+// that a client backs off instead of re-opening the provider immediately, short
+// enough that a recovered listing is not hidden.
+const virtualServeResolveRetryAfterSeconds = 5
+
+// resolveVirtualInputForServe resolves a virtual input for the direct-play byte
+// serve under virtualServeResolveBudget. A budget expiry while the caller is
+// still waiting is a provider-listing dependency failure, not a client
+// cancellation: the caller's own context is live, so it is wrapped as
+// errVirtualProviderUnavailable (retryable 503). A parent context that is done
+// keeps the existing classification so a viewer who left is still recorded as
+// a client cancellation.
+func (h *StreamHandler) resolveVirtualInputForServe(ctx context.Context, file *models.MediaFile, userID int, profileID string) (ResolvedVirtualMedia, func(), error) {
+	serveCtx, cancel := context.WithTimeout(ctx, virtualServeResolveBudget)
+	defer cancel()
+	resolved, cleanup, err := h.resolveVirtualInputURI(serveCtx, file, userID, profileID, false)
+	if err == nil {
+		return resolved, cleanup, nil
+	}
+	if cleanup != nil {
+		cleanup()
+	}
+	if ctx.Err() != nil {
+		return ResolvedVirtualMedia{}, nil, err
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(serveCtx.Err(), context.DeadlineExceeded) {
+		return ResolvedVirtualMedia{}, nil, fmt.Errorf("%w: virtual serve resolve exceeded %s: %w", errVirtualProviderUnavailable, virtualServeResolveBudget, err)
+	}
+	return ResolvedVirtualMedia{}, nil, err
+}
+
 // retryVirtualProviderOutageResolve runs resolve, and while it fails with a
 // transient provider-listing outage for a trusted session-bound row, retries
 // with the bounded schedule. A canceled request stops immediately. Retry
