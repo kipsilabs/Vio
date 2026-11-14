@@ -1322,9 +1322,17 @@ export function VideoPlayer({
   // track change never moves the playhead, so the plan's start is behind them.
   // A later seek replaces it, and a plan that settles without a new stream
   // drops it.
-  const replanSeekRef = useRef<{ sessionId: string; revision: number; seconds: number } | null>(
-    null,
-  );
+  const replanSeekRef = useRef<{
+    sessionId: string;
+    revision: number;
+    seconds: number;
+    /**
+     * `seek` is a viewer seek made while the replacement was being fetched and
+     * always wins. `track` is the live position a track change was issued from:
+     * it only moves the replacement forward, never behind the plan's own start.
+     */
+    kind: "seek" | "track";
+  } | null>(null);
   useEffect(() => {
     if (!replanning && replanSeekRef.current?.revision === planRevision) {
       replanSeekRef.current = null;
@@ -1995,7 +2003,12 @@ export function VideoPlayer({
         // seek will play on, from a position the seek has moved past. Hand the
         // target to that transport so it starts here instead of there.
         replanSeekRef.current = replanningRef.current
-          ? { sessionId: sessionIdRef.current, revision: planRevisionRef.current, seconds }
+          ? {
+              sessionId: sessionIdRef.current,
+              revision: planRevisionRef.current,
+              seconds,
+              kind: "seek",
+            }
           : null;
         setCurrentTime(seconds);
         if (isHlsStream) video.currentTime = nativeSeconds;
@@ -3245,12 +3258,22 @@ export function VideoPlayer({
     // A seek made while this plan's stream was being fetched is where the
     // stream is heading: the server built it before the viewer moved the
     // playhead, so the plan's own start is behind them. Taken by the first
-    // transport of the plan that replaced the seek's plan.
+    // transport of the plan that replaced the seek's plan. A track change
+    // hands over the live position instead, which must not rewind a
+    // replacement the server anchored at or past it.
     const recordedReplanSeek = replanSeekRef.current;
     if (recordedReplanSeek && recordedReplanSeek.revision !== planRevision) {
       replanSeekRef.current = null;
       if (recordedReplanSeek.sessionId === sessionIdRef.current) {
-        rememberPendingSeekRef.current(pendingSeekTimeRef.current ?? recordedReplanSeek.seconds);
+        const carriedSeconds = pendingSeekTimeRef.current ?? recordedReplanSeek.seconds;
+        const carriedPlayerSeconds = toPlayerTime(carriedSeconds, timelineOffsetRef.current);
+        if (
+          recordedReplanSeek.kind === "seek" ||
+          pendingSeekTimeRef.current !== null ||
+          carriedPlayerSeconds > effectiveInitialPosition
+        ) {
+          rememberPendingSeekRef.current(carriedSeconds);
+        }
       }
     }
 
@@ -4618,6 +4641,22 @@ export function VideoPlayer({
       lastPlayedSeconds: streamPlayedRef.current ? currentTimeRef.current : null,
       fetchAnchorSeconds: subtitleFetchAnchorRef.current,
     });
+    // A subtitle switch never moves the playhead, but the plan that replaces
+    // this stream can be anchored behind it: the server builds a non-seek
+    // replan from the position the session last reported, which lags the
+    // element. Hand the position this switch was issued from to the transport
+    // that replaces this plan, so it starts where the viewer is instead of at
+    // the plan's origin. A seek already handed over by a replan names a newer
+    // target and keeps it.
+    const recordedCarry = replanSeekRef.current;
+    if (onSubtitleTrackChange && (recordedCarry === null || recordedCarry.kind === "track")) {
+      replanSeekRef.current = {
+        sessionId: sessionIdRef.current,
+        revision: planRevisionRef.current,
+        seconds: pendingSeekTimeRef.current ?? position,
+        kind: "track",
+      };
+    }
     onSubtitleTrackChange?.(
       desiredServerIndex,
       position,

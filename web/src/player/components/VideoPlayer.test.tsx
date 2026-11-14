@@ -4160,6 +4160,115 @@ describe("VideoPlayer source timeline", () => {
     });
   });
 
+  // A subtitle switch never moves the playhead, but the plan that replaces the
+  // stream may be anchored at a position the server reported earlier. The
+  // replacement transport has to start where the viewer is.
+  describe("a subtitle track change during playback", () => {
+    const englishTrack: PlayerSubtitleInfo = {
+      index: 0,
+      media_file_id: 7,
+      track_id: "file:7:subtitle:0",
+      language: "en",
+      codec: "srt",
+      label: "English",
+      source: "external",
+      url: "/stream/session-1/subtitles/0.vtt",
+    };
+    const hlsPlan = (planId = "plan:subtitle-1", playerStart = 0, sourceStart = 0) =>
+      fixturePlanV3({
+        plan_id: planId,
+        plan_attempt_key: `v3:${planId}`,
+        delivery: "server_transcode_hls",
+        stream: {
+          url: "/playback/transcode/session-1/master.m3u8",
+          protocol: "hls",
+          headers: {},
+          header_refresh: "none",
+        },
+        timeline: {
+          source_start_seconds: sourceStart,
+          player_start_seconds: playerStart,
+          stream_origin_seconds: sourceStart,
+          timeline_offset_seconds: 0,
+          can_seek_anywhere: true,
+          seek_restoration: "player_position",
+        },
+      });
+
+    it("starts the replacement transport at the live position", async () => {
+      const onSubtitleTrackChange = vi.fn();
+      const { container, rerenderPlayer } = renderPlayer({
+        plan: hlsPlan(),
+        onSubtitleTrackChange,
+      });
+      const video = container.querySelector("video");
+      if (!video) throw new Error("expected video element");
+      await waitFor(() => expect(video.src).toContain("/api/v1/stream/session-1"));
+      fireEvent.loadedMetadata(video);
+      fireEvent.playing(video);
+      video.currentTime = 40;
+      fireFrameTimeUpdate(video);
+      expect(controls.current?.currentTime).toBe(40);
+
+      // The viewer turns on the English subtitles while the movie plays.
+      rerenderPlayer({
+        subtitleUrls: [englishTrack],
+        subtitleMode: "always",
+        preferredSubtitleLanguage: "en",
+      });
+      await waitFor(() =>
+        expect(onSubtitleTrackChange).toHaveBeenCalledWith(
+          0,
+          40,
+          expect.objectContaining({ index: 0 }),
+        ),
+      );
+
+      // The replacement plan is anchored at its stream origin (0), not at the
+      // viewer. The stream that loads must still start at 40 s.
+      rerenderPlayer({
+        plan: hlsPlan("plan:subtitle-2"),
+        planRevision: 2,
+        streamUrl: "/api/v1/stream/session-1?revision=2",
+      });
+      await waitFor(() => expect(video.src).toContain("revision=2"));
+      fireEvent.loadedMetadata(video);
+
+      expect(video.currentTime).toBe(40);
+    });
+
+    it("keeps the plan's start when there is no live position to carry", async () => {
+      const onSubtitleTrackChange = vi.fn();
+      const { container, rerenderPlayer } = renderPlayer({
+        plan: hlsPlan("plan:subtitle-1", 7, 7),
+        initialPosition: 42,
+        subtitleUrls: [englishTrack],
+        subtitleMode: "always",
+        preferredSubtitleLanguage: "en",
+        onSubtitleTrackChange,
+      });
+      const video = container.querySelector("video");
+      if (!video) throw new Error("expected video element");
+      await waitFor(() =>
+        expect(onSubtitleTrackChange).toHaveBeenCalledWith(
+          0,
+          7,
+          expect.objectContaining({ index: 0 }),
+        ),
+      );
+
+      rerenderPlayer({
+        plan: hlsPlan("plan:subtitle-2", 7, 7),
+        planRevision: 2,
+        streamUrl: "/api/v1/stream/session-1?revision=2",
+      });
+      await waitFor(() => expect(video.src).toContain("revision=2"));
+      fireEvent.loadedMetadata(video);
+
+      expect(video.currentTime).toBe(7);
+    });
+  });
+
   // A replan of a transcoded session anchors the replacement generation at the
   // live position and publishes that anchor as the transport's clock zero
   // (`stream_origin`/`timeline_offset`), with `player_start` the remainder past
