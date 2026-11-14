@@ -105,6 +105,12 @@ func (o StreamExtractOpts) pagePrefixEstimate(observedBytesPerSecond float64) (p
 	if prefixBytes < 0 {
 		return 0, 0, false
 	}
+	// A prefix cannot hold more than the container itself. A seek past the end
+	// of the source, or a size and bitrate that disagree, would otherwise price
+	// the page above the whole source and refuse a page the source can serve.
+	if size := o.SourceSizeBytes; size > 0 && prefixBytes > size {
+		prefixBytes = size
+	}
 	if observedBytesPerSecond > 0 {
 		prefixSeconds = float64(prefixBytes) / observedBytesPerSecond
 	}

@@ -9,6 +9,54 @@ import (
 	"testing"
 )
 
+// A page's discarded prefix can never hold more than the whole container. A seek
+// past the end of a known-size source, or a size and bitrate that disagree, must
+// not price the page above the source and refuse a page it can serve.
+func TestBitmapPagePrefixIsClampedToTheKnownSourceSize(t *testing.T) {
+	cases := []struct {
+		name        string
+		size        int64
+		duration    float64
+		bitrateKbps int
+		seek        float64
+	}{
+		{
+			name:     "seek past the end of the source",
+			size:     200 << 20,
+			duration: 3600,
+			seek:     7200,
+		},
+		{
+			name:        "bitrate that disagrees with the declared size",
+			size:        8 << 20,
+			bitrateKbps: 28000,
+			seek:        1200,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, source := newTestCache(t)
+			opts := progressiveSUPOpts(source, tc.seek, 120)
+			opts.SourceSizeBytes = tc.size
+			opts.SourceDurationSeconds = tc.duration
+			opts.SourceBitrateKbps = tc.bitrateKbps
+
+			prefixBytes, _, priced := opts.pagePrefixEstimate(0)
+			if !priced {
+				t.Fatal("the page was not priced")
+			}
+			if prefixBytes != tc.size {
+				t.Fatalf("prefix = %d bytes, want the container's %d", prefixBytes, tc.size)
+			}
+			// Unclamped, each case prices above the budget and refuses a page
+			// the whole of this source can serve.
+			if refusal := c.pagePrefixRefusal(opts); refusal != nil {
+				t.Fatalf("page refused: %v", refusal)
+			}
+		})
+	}
+}
+
 // A page whose discarded container prefix is priced beyond the page budget must
 // be refused before the extract, not after it: the production pathology is the
 // wall clock of reading that prefix (88 s for a page at 3600 s), and a refusal
