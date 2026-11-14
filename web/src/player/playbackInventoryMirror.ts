@@ -67,6 +67,34 @@ export function usePlaybackInventoryMirror(fileId: number | null | undefined) {
   );
 }
 
+/**
+ * Whether a plan's inventory also describes the row the viewer asked for.
+ *
+ * The player publishes the plan's inventory under the effective file id, which
+ * is what the transport actually serves. Re-publishing it under the requested
+ * id as well is only valid while the plan is about that row. A virtual
+ * rotation does not move `effective_media_file_id` — the contract keeps it at
+ * the requested catalog row and moves `virtual_source_revision` instead — so
+ * the two ids differ exactly when the server served a different row: a
+ * substitution, or a lower version chosen for this device. That release's audio
+ * and subtitle tables say nothing about the requested version, and the catalog
+ * row for it keeps its own inventory (or reads as undiscovered).
+ */
+export function planInventoryDescribesRequestedFile(
+  plan:
+    | {
+        requested_media_file_id?: number | null;
+        effective_media_file_id?: number | null;
+      }
+    | null
+    | undefined,
+): boolean {
+  if (!plan) return false;
+  const requested = plan.requested_media_file_id ?? 0;
+  const effective = plan.effective_media_file_id ?? 0;
+  return requested > 0 && requested === effective;
+}
+
 /** Overlays a player inventory snapshot on a catalog/watch-detail version. */
 export function mergePlaybackInventory(
   version: FileVersion,
