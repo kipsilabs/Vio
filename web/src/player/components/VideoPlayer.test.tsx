@@ -4115,6 +4115,51 @@ describe("VideoPlayer source timeline", () => {
     expect(video.currentTime).toBe(300);
   });
 
+  // The host re-renders the player for reasons that have nothing to do with
+  // playback (progress samples, marker and inventory updates). A callback the
+  // host re-creates on such a render must not build a new transport: reloading
+  // the source resets the element to the plan's start with no user action.
+  describe("a host re-render that only changes callback identities", () => {
+    it("keeps the loaded source and the playhead", async () => {
+      const { container, rerenderPlayer } = renderPlayer();
+      const video = container.querySelector("video");
+      if (!video) throw new Error("expected video element");
+      await waitFor(() => expect(video.src).toContain("/api/v1/stream/session-1"));
+      fireEvent.loadedMetadata(video);
+      video.currentTime = 42;
+      vi.mocked(HTMLMediaElement.prototype.load).mockClear();
+
+      rerenderPlayer({
+        onPlanFailure: vi.fn(),
+        onConnectionLost: vi.fn(),
+        onSubtitleTrackChange: vi.fn(),
+        onQualitySelect: vi.fn(),
+      });
+      await act(async () => {});
+
+      expect(vi.mocked(HTMLMediaElement.prototype.load)).not.toHaveBeenCalled();
+      expect(video.getAttribute("src")).toBe("/api/v1/stream/session-1?token=token");
+      expect(video.currentTime).toBe(42);
+    });
+
+    it("reloads the source when the plan revision changes", async () => {
+      const { container, rerenderPlayer } = renderPlayer();
+      const video = container.querySelector("video");
+      if (!video) throw new Error("expected video element");
+      await waitFor(() => expect(video.src).toContain("/api/v1/stream/session-1"));
+      fireEvent.loadedMetadata(video);
+      vi.mocked(HTMLMediaElement.prototype.load).mockClear();
+
+      rerenderPlayer({
+        planRevision: 2,
+        streamUrl: "/api/v1/stream/session-1?revision=2",
+      });
+
+      await waitFor(() => expect(vi.mocked(HTMLMediaElement.prototype.load)).toHaveBeenCalled());
+      await waitFor(() => expect(video.src).toContain("revision=2"));
+    });
+  });
+
   // A replan of a transcoded session anchors the replacement generation at the
   // live position and publishes that anchor as the transport's clock zero
   // (`stream_origin`/`timeline_offset`), with `player_start` the remainder past

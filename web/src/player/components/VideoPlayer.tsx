@@ -1133,11 +1133,13 @@ export function VideoPlayer({
       reportedPlanFailureKeyRef.current = failureKey;
       transportFailedForPlanRevisionRef.current = planRevision;
       setError(null);
-      // A transport that never played, in a playing room, resumes where the
-      // room is now.
+      // A transport that never started, in a playing room, resumes where the
+      // room is now. Startup pending is the stronger signal: a frame shown
+      // while paused at the plan's start marks the element as played without
+      // this transport ever having started.
       const roomReference = roomReferenceRef.current;
       const resumeAt =
-        !streamPlayedRef.current && roomReference?.playing
+        (transportStartupPendingRef.current || !streamPlayedRef.current) && roomReference?.playing
           ? roomPositionAt(roomReference, Date.now(), serverTimeOffsetRef.current)
           : replanPosition();
       onPlanFailure(failure, resumeAt);
@@ -1145,6 +1147,13 @@ export function VideoPlayer({
     },
     [onPlanFailure, plan.plan_attempt_key, planRevision, replanPosition, sessionId],
   );
+  // The transport effect is keyed on the inputs of the transport, never on a
+  // callback identity: the host re-creates callbacks such as this one on
+  // ordinary renders (a new `onPlanFailure` from the session), and a transport
+  // rebuilt for that reason alone reloads the media at the plan's start with no
+  // user action. The effect reads the current callback through this ref.
+  const reportCurrentPlanFailureRef = useRef(reportCurrentPlanFailure);
+  reportCurrentPlanFailureRef.current = reportCurrentPlanFailure;
 
   useEffect(() => {
     transportFailedForPlanRevisionRef.current = null;
@@ -1302,6 +1311,10 @@ export function VideoPlayer({
   canSeekAnywhereRef.current = canSeekAnywhere;
   const replanningRef = useRef(replanning);
   replanningRef.current = replanning;
+  // The transport effect's autoplay decision is made once, when a transport is
+  // built. A later change to the host's intent must not rebuild it.
+  const shouldAutoPlayRef = useRef(shouldAutoPlay);
+  shouldAutoPlayRef.current = shouldAutoPlay;
   // The viewer's newest seek while a replan of this session was in flight, and
   // the plan revision it was made on. The stream that replaces that plan starts
   // there instead of at the replan's own position: the viewer asked to be at
@@ -1826,6 +1839,8 @@ export function VideoPlayer({
     if (backendDurationRef.current && mediaDuration < backendDurationRef.current) return;
     setDuration(mediaDuration);
   }, []);
+  const applyElementDurationRef = useRef(applyElementDuration);
+  applyElementDurationRef.current = applyElementDuration;
 
   const rememberPendingSeek = useCallback((seconds: number) => {
     pendingSeekTimeRef.current = seconds;
@@ -1835,6 +1850,10 @@ export function VideoPlayer({
     };
     setPendingSeekTime(seconds);
   }, []);
+  // Read by the transport effect, which must not rerun on a callback identity:
+  // see `reportCurrentPlanFailureRef`.
+  const rememberPendingSeekRef = useRef(rememberPendingSeek);
+  rememberPendingSeekRef.current = rememberPendingSeek;
 
   // A refused reanchor never reaches its target. Resume relative skips from
   // the surviving stream unless a newer seek has already replaced the target.
@@ -1846,6 +1865,8 @@ export function VideoPlayer({
     const video = videoRef.current;
     if (video) setCurrentTime(toMediaTime(video.currentTime, timelineOffsetRef.current));
   }, []);
+  const releasePendingSeekRef = useRef(releasePendingSeek);
+  releasePendingSeekRef.current = releasePendingSeek;
 
   // This viewer's newest room seek request the room has not run yet: the
   // origin of the next relative skip and the position the controls show (see
@@ -3163,7 +3184,7 @@ export function VideoPlayer({
           settlePaused();
           return;
         }
-      } else if (!shouldAutoPlay) {
+      } else if (!shouldAutoPlayRef.current) {
         settlePaused();
         return;
       }
@@ -3229,7 +3250,7 @@ export function VideoPlayer({
     if (recordedReplanSeek && recordedReplanSeek.revision !== planRevision) {
       replanSeekRef.current = null;
       if (recordedReplanSeek.sessionId === sessionIdRef.current) {
-        rememberPendingSeek(pendingSeekTimeRef.current ?? recordedReplanSeek.seconds);
+        rememberPendingSeekRef.current(pendingSeekTimeRef.current ?? recordedReplanSeek.seconds);
       }
     }
 
@@ -3250,7 +3271,7 @@ export function VideoPlayer({
       const pendingContext = pendingSeekContextRef.current;
       if (pendingContext !== null && pendingContext.sessionId !== sessionIdRef.current) {
         // A target left over from another session never aims this one.
-        releasePendingSeek(pendingSeconds);
+        releasePendingSeekRef.current(pendingSeconds);
         return effectiveInitialPosition;
       }
       const playerSeconds = toPlayerTime(pendingSeconds, timelineOffsetRef.current);
@@ -3259,7 +3280,7 @@ export function VideoPlayer({
       // The replacement generation begins after the target, so it can never
       // reach it: follow the plan's start instead of holding the timeline on a
       // position this stream has moved past.
-      releasePendingSeek(pendingSeconds);
+      releasePendingSeekRef.current(pendingSeconds);
       return effectiveInitialPosition;
     };
 
@@ -3404,7 +3425,7 @@ export function VideoPlayer({
                 } else {
                   console.error("[hls.js] Fatal media error, giving up after 3 attempts");
                   if (
-                    !reportCurrentPlanFailure({
+                    !reportCurrentPlanFailureRef.current({
                       classification: "decoder_error",
                       message: "HLS media recovery failed after three attempts.",
                     })
@@ -3418,7 +3439,7 @@ export function VideoPlayer({
               } else {
                 console.error("[hls.js] Unrecoverable error:", data);
                 if (
-                  !reportCurrentPlanFailure({
+                  !reportCurrentPlanFailureRef.current({
                     classification: "decoder_error",
                     message: `HLS reported an unrecoverable ${data.type} error.`,
                   })
@@ -3478,7 +3499,7 @@ export function VideoPlayer({
             hlsRef.current = hls;
           } else {
             if (
-              !reportCurrentPlanFailure({
+              !reportCurrentPlanFailureRef.current({
                 classification: "unsupported_transport",
                 message: "The browser rejected the planned HLS transport.",
               })
@@ -3489,7 +3510,7 @@ export function VideoPlayer({
         } catch (error) {
           if (
             !destroyed &&
-            !reportCurrentPlanFailure({
+            !reportCurrentPlanFailureRef.current({
               classification: "player_initialization_error",
               message:
                 error instanceof Error ? error.message : "Failed to initialize HLS playback.",
@@ -3515,7 +3536,7 @@ export function VideoPlayer({
               })
             : ({ kind: "native" } as const);
         if (route.kind === "unsupported") {
-          if (!reportCurrentPlanFailure(route.failure)) {
+          if (!reportCurrentPlanFailureRef.current(route.failure)) {
             setError("This browser cannot play this file.");
           }
           return;
@@ -3547,7 +3568,7 @@ export function VideoPlayer({
               onFailure: (failure) => {
                 if (destroyed) return;
                 const fail = () => {
-                  if (!reportCurrentPlanFailure(failure)) {
+                  if (!reportCurrentPlanFailureRef.current(failure)) {
                     setError(`Playback error: ${failure.message ?? failure.classification}`);
                   }
                 };
@@ -3574,7 +3595,7 @@ export function VideoPlayer({
           } catch (error) {
             if (
               !destroyed &&
-              !reportCurrentPlanFailure({
+              !reportCurrentPlanFailureRef.current({
                 classification: "player_initialization_error",
                 message:
                   error instanceof Error ? error.message : "Failed to load the browser engine.",
@@ -3611,7 +3632,7 @@ export function VideoPlayer({
               pendingSeekTimeRef.current ?? toMediaTime(effectiveInitialPosition, planOffset);
             const target = toPlayerTime(mediaTarget, timelineOffsetRef.current);
             if (Math.abs(video.currentTime - target) > 0.01) video.currentTime = target;
-            applyElementDuration(video);
+            applyElementDurationRef.current(video);
             attemptAutoplayWhenReady();
           };
           video.addEventListener("loadedmetadata", directPlayMetadataHandler, { once: true });
@@ -3660,8 +3681,11 @@ export function VideoPlayer({
     };
     // `planRevision` is the single signal that the transport changed: two plans
     // can share a stream URL and still differ in protocol, timeline, or recipe.
+    // Everything else here describes the transport itself. Callbacks and the
+    // host's autoplay intent are read through refs: a host render that only
+    // re-creates one of them must not tear the media element down and reload it
+    // at the plan's start.
   }, [
-    applyElementDuration,
     effectiveStreamUrl,
     effectiveInitialPosition,
     isHlsStream,
@@ -3671,10 +3695,6 @@ export function VideoPlayer({
     playsOriginalFile,
     plannedBitrateKbps,
     plannedDynamicRange,
-    rememberPendingSeek,
-    releasePendingSeek,
-    reportCurrentPlanFailure,
-    shouldAutoPlay,
   ]);
 
   // -- Video event listeners --
