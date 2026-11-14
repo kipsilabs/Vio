@@ -5293,6 +5293,11 @@ func writeSubtitleRetry(w http.ResponseWriter, retry *playback.SubtitleExtractio
 			"The subtitle page costs more to read than the server allows; retry to be served from the prefetched track")
 		return
 	}
+	if retry.Reason == playback.SubtitlePageNotReadyReason {
+		writeError(w, http.StatusServiceUnavailable, playback.SubtitlePageNotReadyReason,
+			"The subtitle page is not parsed yet; retry to be served from the prefetched track")
+		return
+	}
 	writeError(w, http.StatusServiceUnavailable, "subtitle_source_unavailable",
 		"Unable to verify the subtitle source; retry")
 }

@@ -38,9 +38,12 @@ start is not blamed on it.
   the server stores and prefetches. A request anchored on the raw playhead is a
   range no other request computes, so nothing is ever reused and each page
   boundary waits on a fresh container read. The fetcher asks for the next page
-  30 seconds before the current one ends; an extend requests the page after the
-  committed coverage, never the page already held, and keeps the parser's epoch
-  state, while a fresh window starts a new parser.
+  30 seconds before the current one ends; an extend requests the page that
+  contains the committed coverage, never a page already fully held, and keeps the
+  parser's epoch state, while a fresh window starts a new parser. A response's
+  `X-Subtitle-Coverage` bounds what it committed: a page the server could answer
+  only in part commits that shorter range and asks for the same page again, so
+  the tail it did not send is never skipped.
 - A screen stays up until the next display set replaces it, but never past
   what has loaded: the end of the last finished window or, beyond it, the
   latest segment read from the window on the wire. Screens more than one page
@@ -77,6 +80,9 @@ start is not blamed on it.
   least that long, then uses its normal capped backoff. Four consecutive
   non-retryable failures or twelve retryable failures end the fetch for that
   mount; a seek, track change, replay, or manual retry starts a new window.
+  `503 subtitle_page_not_ready` is the same retryable shape for a page whose
+  start the server's progressive bitmap artifact has not parsed yet: it is a
+  wait, not a failure of the source.
 - On the server, windowed `.sup` extraction uses the same last-good window
   cache, in-flight coalescing, and per-identity extraction cooldown as text
   windows. A repeated or concurrent window does not spawn a second ffmpeg, and
@@ -99,9 +105,17 @@ follow.
   it has parsed reach (a coverage watermark), so a page inside that coverage is
   a local read of the artifact rather than another source read. The watermark
   advances only at a complete display set (`PCS … END`), and a page the artifact
-  does not cover is answered with the retryable shape plus
-  `X-Subtitle-Coverage`, never with a truncated run. A `.sup` fill flips into the
-  committed whole-track entry when its extract reaches end of file.
+  has parsed is never answered with a truncated run.
+
+  A page whose start is parsed but whose end is still ahead of the watermark is
+  served from the parsed prefix: the response is a 200 and `X-Subtitle-Coverage`
+  reports the shorter range it really produced, so the client keeps only that
+  range and asks for the page again — it never treats the unparsed tail as
+  delivered. A page that starts at or past the watermark answers
+  `503 subtitle_page_not_ready` with `Retry-After` and the covered range; that
+  code is distinct from `subtitle_source_unavailable` because the source was never
+  read. A `.sup` fill flips into the committed whole-track entry when its extract
+  reaches end of file.
 - A bounded page that misses the cache starts that fill while the viewer is
   playing. The fill is the page path — it produces the pages the client asks for
   next — so it replaces the bounded window prefetch for bitmap pages. The

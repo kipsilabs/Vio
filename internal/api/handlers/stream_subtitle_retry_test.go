@@ -64,6 +64,31 @@ func TestWriteSubtitleRetryReportsCostAndCoverage(t *testing.T) {
 	}
 }
 
+// A page the track's progressive artifact has not parsed yet is retryable too,
+// and names that condition: the source is fine, the page is just not on disk
+// yet. It still advertises how far the artifact has parsed.
+func TestWriteSubtitleRetryReportsAPageNotParsedYet(t *testing.T) {
+	rec := httptest.NewRecorder()
+	writeSubtitleRetry(rec, &playback.SubtitleExtractionRetryError{
+		RetryAfter:   2 * time.Second,
+		Reason:       playback.SubtitlePageNotReadyReason,
+		CoveredUntil: 126.543,
+	})
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+	if got := rec.Header().Get("Retry-After"); got != "2" {
+		t.Fatalf("Retry-After = %q, want 2", got)
+	}
+	if got := rec.Header().Get(playback.SubtitleCoverageHeader); got != "0.000-126.543" {
+		t.Fatalf("coverage = %q, want the parsed range 0.000-126.543", got)
+	}
+	if !strings.Contains(rec.Body.String(), `"error":"`+playback.SubtitlePageNotReadyReason+`"`) {
+		t.Fatalf("body = %q, want the page-not-ready problem code", rec.Body.String())
+	}
+}
+
 // An extraction that produced nothing must be told apart by cause, and never
 // answered as a plain failure when the cause is the source: the production run
 // turned a 120 s window extract timeout into a non-retryable 500, so the client

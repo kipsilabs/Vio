@@ -37,6 +37,13 @@ import (
 // answered from a truncated run, and a fill that ends early publishes nothing.
 
 const (
+	// SubtitlePageNotReadyReason is the additive problem code for a bitmap page
+	// whose start the track's progressive artifact has not parsed yet. It keeps
+	// the retryable 503 shape subtitle_source_unavailable uses, but names the
+	// real condition: the source is fine and the artifact that serves the page is
+	// still filling, so the page will be answered without another source read.
+	SubtitlePageNotReadyReason = "subtitle_page_not_ready"
+
 	// subtitleProgressiveSUPMinSourceBytes is the source size at or above which
 	// a bounded bitmap page is answered from the progressive artifact instead
 	// of a source extract. It mirrors the API handler's implicit-window
@@ -310,7 +317,11 @@ func (f *SubtitleCacheFill) servable() (*SubtitleCacheFill, float64) {
 // artifact cannot answer the window; the caller then takes its other paths.
 //
 // The copy runs on an independent handle and outside the fill's lock, so a large
-// page never blocks the extract's writes or backpressures its stdout pipe.
+// page never blocks the extract's writes or backpressures its stdout pipe. Only
+// the page's first display set is held before the response sees a byte: the cut
+// is taken from the index, which records complete display sets only, and a cut
+// that nevertheless holds none is refused rather than answered with bytes no
+// decoder can draw (supHasDisplaySet). Everything after that set streams.
 func (f *SubtitleCacheFill) serveWindow(w io.Writer, start, end float64) (written int64, served bool, err error) {
 	f.mu.Lock()
 	if f.ended || f.failed || f.sup == nil {
@@ -335,18 +346,75 @@ func (f *SubtitleCacheFill) serveWindow(w io.Writer, start, end float64) (writte
 	if _, err := src.Seek(off, io.SeekStart); err != nil {
 		return 0, false, nil
 	}
-	written, err = io.CopyN(w, src, endOff-off)
+	first, ok := readSUPDisplaySet(src, endOff-off)
+	if !ok || !supHasDisplaySet(first) {
+		return 0, false, nil
+	}
+	n, err := w.Write(first)
+	written = int64(n)
+	if err != nil {
+		return written, true, err
+	}
+	if rest := endOff - off - int64(len(first)); rest > 0 {
+		copied, copyErr := io.CopyN(w, src, rest)
+		written += copied
+		if copyErr != nil {
+			return written, true, copyErr
+		}
+	}
 	if flusher, ok := w.(http.Flusher); ok {
 		flusher.Flush()
 	}
-	return written, true, err
+	return written, true, nil
+}
+
+// readSUPDisplaySet reads one display set — a PCS through the END that closes it,
+// with any segment that precedes the PCS — from the artifact, and reports whether
+// it read a complete one. atMost bounds the bytes it will collect, so a damaged
+// stream cannot make it hold an unbounded run, and the caller's reader is left
+// just after the set so the rest of the page streams straight out.
+func readSUPDisplaySet(r io.Reader, atMost int64) ([]byte, bool) {
+	var out []byte
+	header := make([]byte, supSegmentHeaderLen)
+	open := false
+	for int64(len(out)) < atMost {
+		if _, err := io.ReadFull(r, header); err != nil {
+			return nil, false
+		}
+		if header[0] != 'P' || header[1] != 'G' {
+			return nil, false
+		}
+		size := int(binary.BigEndian.Uint16(header[11:13]))
+		segment := make([]byte, supSegmentHeaderLen+size)
+		copy(segment, header)
+		if _, err := io.ReadFull(r, segment[supSegmentHeaderLen:]); err != nil {
+			return nil, false
+		}
+		out = append(out, segment...)
+		switch header[10] {
+		case supSegmentPCS:
+			open = true
+		case supSegmentEND:
+			if open {
+				return out, true
+			}
+		}
+	}
+	return nil, false
 }
 
 // serveProgressiveSUPPage answers a bounded bitmap window from the progressive
 // artifact before any source read. It reports served=false when the caller must
 // continue on its other paths, and returns a retryable error when a fill exists
-// but has not parsed far enough for the window: the page is not ready yet, and
-// reading the source for it is exactly the cost this path exists to avoid.
+// but has not parsed the window's start: the page is not ready yet, and reading
+// the source for it is exactly the cost this path exists to avoid.
+//
+// A window whose start is parsed but whose end is still ahead of the watermark
+// serves the parsed prefix. Every display set that shows in that prefix is
+// complete on disk, and the response advertises exactly the range it covers, so
+// a page costs no more than the bytes behind it — the alternative, refusing the
+// whole page, left every request at a playhead inside the covered range without
+// an answer.
 func (c *SubtitleCache) serveProgressiveSUPPage(w http.ResponseWriter, r *http.Request, opts StreamExtractOpts, extract SUPExtractFunc) (bool, error) {
 	start, end, bounded := progressiveSUPWindow(opts)
 	// A track is answered from its artifact when a page read over its container
@@ -371,33 +439,47 @@ func (c *SubtitleCache) serveProgressiveSUPPage(w http.ResponseWriter, r *http.R
 		// page too costly for it tells the handler which page is waiting.
 		return false, nil
 	}
-	if end <= covered {
-		// The headers go on before the copy: the first Write commits the
-		// status and headers, so setting them after a non-empty page's copy
-		// would leave every such page without them. A window is a
-		// position-dependent slice, so an intermediary must not cache it.
-		w.Header().Set("Content-Type", "application/octet-stream")
-		w.Header().Set("Cache-Control", "no-store")
-		written, served, err := fill.serveWindow(w, start, end)
-		if served {
-			recordSubtitleServeSource(subtitleServePGSProgressive)
-			slog.Log(r.Context(), slog.LevelInfo, "subtitle page served from the progressive artifact",
-				"component", "playback",
-				"track", opts.TrackIndex,
-				"window_start_seconds", start,
-				"window_end_seconds", end,
-				"covered_until_seconds", covered,
-				"bytes", written)
-			return true, err
+	// The cut stops at the watermark: a display set the artifact has not read in
+	// full must never travel with the page.
+	cutEnd := end
+	if cutEnd > covered {
+		cutEnd = covered
+	}
+	if start >= covered {
+		// The fill is running and has not parsed the page's own start yet. The
+		// page is not failing; it is not ready, and the covered range says how
+		// far it got.
+		return false, &SubtitleExtractionRetryError{
+			RetryAfter:   subtitleFillBusyRetryAfter,
+			Reason:       SubtitlePageNotReadyReason,
+			CoveredUntil: covered,
 		}
-		// The fill ended between the lookup and the copy: the committed artifact
-		// (if it landed) or a page extract answers instead.
-		return false, nil
 	}
-	// The fill is running and has not parsed this far yet. The page is not
-	// failing; it is not ready, and the covered range says how far it got.
-	return false, &SubtitleExtractionRetryError{
-		RetryAfter:   subtitleFillBusyRetryAfter,
-		CoveredUntil: covered,
+	// The headers go on before the copy: the first Write commits the status and
+	// headers, so setting them after a non-empty page's copy would leave every
+	// such page without them. A window is a position-dependent slice, so an
+	// intermediary must not cache it. The coverage header repeats what the
+	// handler already advertised for a whole page, and narrows it to the parsed
+	// prefix when the page is only partly parsed.
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Cache-Control", "no-store")
+	SetSubtitleCoverageRange(w.Header(), start, cutEnd)
+	written, served, err := fill.serveWindow(w, start, cutEnd)
+	if served {
+		recordSubtitleServeSource(subtitleServePGSProgressive)
+		slog.Log(r.Context(), slog.LevelInfo, "subtitle page served from the progressive artifact",
+			"component", "playback",
+			"track", opts.TrackIndex,
+			"window_start_seconds", start,
+			"window_end_seconds", end,
+			"served_end_seconds", cutEnd,
+			"covered_until_seconds", covered,
+			"bytes", written)
+		return true, err
 	}
+	// The fill ended between the lookup and the copy: the committed artifact (if
+	// it landed) or a page extract answers instead. Put back the range the
+	// request asked for, so a path that answers it does not advertise the cut.
+	SetSubtitleCoverageRange(w.Header(), start, end)
+	return false, nil
 }

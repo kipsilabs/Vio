@@ -2365,6 +2365,18 @@ completes, so a slice cut short by that deadline or by a canceled request is nev
 committed as a 200 carrying a header and half a cue: nothing is written and the
 client receives the retryable answer.
 
+A page whose start the artifact has parsed is served from it even while the page's
+own end is still ahead of the watermark: the display sets that show in the parsed
+prefix are complete on disk, so the response answers them as a 200 and its
+`X-Subtitle-Coverage` reports the shorter range it really produced. The watermark
+is the last display set read in full (`PCS … END`), so a run still arriving never
+travels with a page. A page that starts at or past the watermark is not ready, not
+unavailable: it answers `503 subtitle_page_not_ready` with `Retry-After` and the
+same coverage header, which is a distinct code from `subtitle_source_unavailable`
+because the source was never the problem. A client that receives less than it
+asked for keeps the covered range only and asks for the same page again, so the
+part the server had not parsed is never treated as delivered.
+
 ---
 
 ## 9. Plan identity

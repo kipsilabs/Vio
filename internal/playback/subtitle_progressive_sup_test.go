@@ -36,6 +36,15 @@ func pgsDisplaySetAt(pts float64) []byte {
 	return out
 }
 
+// supSets joins artifact parts into one payload, in order.
+func supSets(parts ...[]byte) []byte {
+	var out []byte
+	for _, part := range parts {
+		out = append(out, part...)
+	}
+	return out
+}
+
 // progressiveSUPOpts builds a bounded bitmap page for a remote identity whose
 // container is large enough that a page read is not worth attempting.
 func progressiveSUPOpts(source string, seek, duration float64) StreamExtractOpts {
@@ -180,12 +189,160 @@ func TestProgressiveSUPPageBehindWatermarkReadsNoSource(t *testing.T) {
 	if relayReads != 0 {
 		t.Fatalf("the source was read %d times for a page the artifact covers", relayReads)
 	}
-	want := append(append([]byte{}, first...), second...)
+	want := supSets(first, second)
 	if !bytes.Equal(rec.Body.Bytes(), want) {
 		t.Fatalf("page = %d bytes, want the artifact's display sets (%d bytes)", rec.Body.Len(), len(want))
 	}
 	if got := rec.Result().Header.Get("Content-Type"); got != "application/octet-stream" {
 		t.Fatalf("content type = %q", got)
+	}
+}
+
+// A page whose start the artifact has already parsed is servable the moment its
+// covered prefix reaches a complete display set, even while the page's own end is
+// still ahead of the watermark. Refusing the whole page there is what left every
+// request at a playhead inside the covered range unanswered in production: the
+// client asked for 10-130 s, the artifact had parsed 0-120 s, and the answer was
+// a 503 for a page whose first 110 s were on disk.
+func TestProgressiveSUPPageInsideWatermarkServesItsCoveredPrefix(t *testing.T) {
+	c, source := newTestCache(t)
+	opts := progressiveSUPOpts(source, 10, 120)
+	first, second, third := pgsDisplaySetAt(10), pgsDisplaySetAt(60), pgsDisplaySetAt(120)
+	// The run after the last complete set is still arriving. Its bytes must stay
+	// out of the page: the watermark is the last END that was read in full.
+	pending := pgsSegmentAt(supSegmentPCS, 126.5, []byte{0, 1, 2, 3})
+	fill := startProgressiveFill(t, c, opts, supSets(first, second, third, pending))
+	defer fill.Discard()
+
+	extract := func(context.Context, StreamExtractOpts) error {
+		t.Error("the source was read for a page the artifact has parsed")
+		return nil
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/sub.sup?windowed=1&position=10&duration=120", nil)
+	if err := c.ServeSUPExtract(rec, req, opts, extract); err != nil {
+		var retry *SubtitleExtractionRetryError
+		if errors.As(err, &retry) {
+			t.Fatalf("a page the artifact has parsed to %v was refused (covered_until=%v)", 126.5, retry.CoveredUntil)
+		}
+		t.Fatalf("serve: %v", err)
+	}
+
+	want := supSets(first, second, third)
+	if !supHasDisplaySet(want) {
+		t.Fatal("the test's own artifact holds no display set")
+	}
+	if !bytes.Equal(rec.Body.Bytes(), want) {
+		t.Fatalf("page = %d bytes, want the parsed display sets (%d bytes): the page must not include the run ahead of the watermark", rec.Body.Len(), len(want))
+	}
+	if got := rec.Result().Header.Get(SubtitleCoverageHeader); got != "10.000-120.000" {
+		t.Fatalf("coverage = %q, want the range the page really covers (10.000-120.000)", got)
+	}
+	if got := rec.Result().Header.Get(SubtitleWindowedHeader); got != "true" {
+		t.Fatalf("windowed = %q, want true", got)
+	}
+}
+
+// A page that ends exactly at the watermark is fully parsed: no byte of it is
+// ahead of what the artifact read, so it must serve whole.
+func TestProgressiveSUPPageAtTheWatermarkIsServedWhole(t *testing.T) {
+	c, source := newTestCache(t)
+	opts := progressiveSUPOpts(source, 0, 120)
+	first, second := pgsDisplaySetAt(10), pgsDisplaySetAt(120)
+	fill := startProgressiveFill(t, c, opts, first, second)
+	defer fill.Discard()
+
+	extract := func(context.Context, StreamExtractOpts) error {
+		t.Error("the source was read for a page the artifact has parsed")
+		return nil
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/sub.sup?windowed=1&position=0&duration=120", nil)
+	if err := c.ServeSUPExtract(rec, req, opts, extract); err != nil {
+		t.Fatalf("a page ending at the watermark was refused: %v", err)
+	}
+	want := supSets(first, second)
+	if !bytes.Equal(rec.Body.Bytes(), want) {
+		t.Fatalf("page = %d bytes, want the artifact's display sets (%d bytes)", rec.Body.Len(), len(want))
+	}
+	if got := rec.Result().Header.Get(SubtitleCoverageHeader); got != "0.000-120.000" {
+		t.Fatalf("coverage = %q, want 0.000-120.000", got)
+	}
+}
+
+// A page just behind the watermark is fully parsed too: the display sets that
+// show in it are all complete, so the tail of the artifact past the window is
+// not needed and the page serves whole.
+func TestProgressiveSUPPageJustBehindTheWatermarkIsServedWhole(t *testing.T) {
+	c, source := newTestCache(t)
+	opts := progressiveSUPOpts(source, 0, 119)
+	first, second := pgsDisplaySetAt(10), pgsDisplaySetAt(60)
+	fill := startProgressiveFill(t, c, opts, first, second, pgsDisplaySetAt(120))
+	defer fill.Discard()
+
+	extract := func(context.Context, StreamExtractOpts) error {
+		t.Error("the source was read for a page the artifact has parsed")
+		return nil
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/sub.sup?windowed=1&position=0&duration=119", nil)
+	if err := c.ServeSUPExtract(rec, req, opts, extract); err != nil {
+		t.Fatalf("a page just behind the watermark was refused: %v", err)
+	}
+	// The set at 120 s shows after this window, so it is not part of the page.
+	want := supSets(first, second)
+	if !bytes.Equal(rec.Body.Bytes(), want) {
+		t.Fatalf("page = %d bytes, want the display sets inside the window (%d bytes)", rec.Body.Len(), len(want))
+	}
+	if got := rec.Result().Header.Get(SubtitleCoverageHeader); got != "0.000-119.000" {
+		t.Fatalf("coverage = %q, want the window the page really covers (0.000-119.000)", got)
+	}
+}
+
+// A page served in part must not be remembered as the whole page: once the fill
+// parses further, the same request is answered with the fuller range. Otherwise
+// the unparsed tail would be treated as delivered for as long as the window
+// cache held the short copy.
+func TestProgressiveSUPPageGrowsAsTheWatermarkAdvances(t *testing.T) {
+	c, source := newTestCache(t)
+	opts := progressiveSUPOpts(source, 10, 120)
+	first, second, third := pgsDisplaySetAt(10), pgsDisplaySetAt(60), pgsDisplaySetAt(130)
+	fill := startProgressiveFill(t, c, opts, first, second)
+	defer fill.Discard()
+
+	extract := func(context.Context, StreamExtractOpts) error {
+		t.Error("the source was read for a page the artifact has parsed")
+		return nil
+	}
+	req := func() *httptest.ResponseRecorder {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		if err := c.ServeSUPExtract(rec, httptest.NewRequest(http.MethodGet, "/sub.sup?windowed=1&position=10&duration=120", nil), opts, extract); err != nil {
+			t.Fatalf("serve: %v", err)
+		}
+		return rec
+	}
+
+	short := req()
+	wantShort := supSets(first, second)
+	if !bytes.Equal(short.Body.Bytes(), wantShort) {
+		t.Fatalf("first page = %d bytes, want the parsed prefix (%d bytes)", short.Body.Len(), len(wantShort))
+	}
+	if got := short.Result().Header.Get(SubtitleCoverageHeader); got != "10.000-60.000" {
+		t.Fatalf("first coverage = %q, want 10.000-60.000", got)
+	}
+
+	// The fill parses the set at 130 s: the page's 10-130 s range is complete now.
+	if _, err := fill.Tee(io.Discard).Write(third); err != nil {
+		t.Fatalf("artifact write: %v", err)
+	}
+	grown := req()
+	wantGrown := supSets(wantShort, third)
+	if !bytes.Equal(grown.Body.Bytes(), wantGrown) {
+		t.Fatalf("second page = %d bytes, want the whole page (%d bytes)", grown.Body.Len(), len(wantGrown))
+	}
+	if got := grown.Result().Header.Get(SubtitleCoverageHeader); got != "10.000-130.000" {
+		t.Fatalf("second coverage = %q, want 10.000-130.000", got)
 	}
 }
 
@@ -245,6 +402,11 @@ func TestProgressiveSUPPageAheadOfWatermarkIsRetryable(t *testing.T) {
 		}
 		if retry.CoveredUntil != 200 {
 			t.Fatalf("serve %d covered_until = %v, want 200", attempt, retry.CoveredUntil)
+		}
+		// The source is fine and the artifact is filling: the page is not ready,
+		// and the answer must say that rather than blame the source.
+		if retry.Reason != SubtitlePageNotReadyReason {
+			t.Fatalf("serve %d reason = %q, want %q", attempt, retry.Reason, SubtitlePageNotReadyReason)
 		}
 		if rec.Body.Len() != 0 {
 			t.Fatalf("serve %d body = %d bytes, want none", attempt, rec.Body.Len())
