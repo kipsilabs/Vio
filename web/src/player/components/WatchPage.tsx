@@ -583,7 +583,9 @@ function WatchPagePlayer({
 
   const handleSelectAutoVersion = useCallback(() => {
     session.selectAutoVersion();
-  }, [session]);
+    // Auto retracts the pin: the row now playing is the server's to replace.
+    onRequestedVersionChange?.(session.plan?.requested_media_file_id ?? fileId ?? null, false);
+  }, [fileId, onRequestedVersionChange, session]);
 
   /**
    * Manually re-lists the title's video candidates for the version menu.
@@ -738,8 +740,10 @@ function WatchPagePlayer({
   useEffect(() => {
     if (lastRequestedFileIdRef.current === committedRequestedFileId) return;
     lastRequestedFileIdRef.current = committedRequestedFileId;
-    onRequestedVersionChange?.(committedRequestedFileId);
-  }, [committedRequestedFileId, onRequestedVersionChange]);
+    // A row the session committed while Auto is armed is the server's choice,
+    // not the viewer's.
+    onRequestedVersionChange?.(committedRequestedFileId, !session.autoFallback);
+  }, [committedRequestedFileId, onRequestedVersionChange, session.autoFallback]);
 
   const handleSwitchAudio = useCallback(
     (index: number, currentPosition: number) => {
