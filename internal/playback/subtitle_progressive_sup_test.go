@@ -184,8 +184,42 @@ func TestProgressiveSUPPageBehindWatermarkReadsNoSource(t *testing.T) {
 	if !bytes.Equal(rec.Body.Bytes(), want) {
 		t.Fatalf("page = %d bytes, want the artifact's display sets (%d bytes)", rec.Body.Len(), len(want))
 	}
-	if got := rec.Header().Get("Content-Type"); got != "application/octet-stream" {
+	if got := rec.Result().Header.Get("Content-Type"); got != "application/octet-stream" {
 		t.Fatalf("content type = %q", got)
+	}
+}
+
+// A page served from the progressive artifact must carry both of its headers on
+// the response an intermediary sees: they have to be set before the copy, since
+// the first Write commits the status and headers. A window slice is
+// position-dependent, so it must not be cached.
+func TestProgressiveSUPPageCommittedHeadersSurviveTheCopy(t *testing.T) {
+	c, source := newTestCache(t)
+	opts := progressiveSUPOpts(source, 120, 120)
+	fill := startProgressiveFill(t, c, opts, pgsDisplaySetAt(10), pgsDisplaySetAt(130), pgsDisplaySetAt(250))
+	defer fill.Discard()
+
+	extract := func(context.Context, StreamExtractOpts) error {
+		t.Error("the source was read for a page the artifact covers")
+		return nil
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/sub.sup?windowed=1&position=120&duration=120", nil)
+	if err := c.ServeSUPExtract(rec, req, opts, extract); err != nil {
+		t.Fatalf("serve: %v", err)
+	}
+	if rec.Body.Len() == 0 {
+		t.Fatal("the served page carried no bytes")
+	}
+	// Result() reports the headers as committed at the first Write. Header()
+	// reads the live map, so a Set after the copy would still show there and
+	// hide the bug.
+	committed := rec.Result().Header
+	if got := committed.Get("Content-Type"); got != "application/octet-stream" {
+		t.Fatalf("committed content type = %q, want application/octet-stream", got)
+	}
+	if got := committed.Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("committed cache-control = %q, want no-store: a window slice must not be cached", got)
 	}
 }
 

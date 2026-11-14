@@ -372,10 +372,14 @@ func (c *SubtitleCache) serveProgressiveSUPPage(w http.ResponseWriter, r *http.R
 		return false, nil
 	}
 	if end <= covered {
+		// The headers go on before the copy: the first Write commits the
+		// status and headers, so setting them after a non-empty page's copy
+		// would leave every such page without them. A window is a
+		// position-dependent slice, so an intermediary must not cache it.
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Cache-Control", "no-store")
 		written, served, err := fill.serveWindow(w, start, end)
 		if served {
-			w.Header().Set("Content-Type", "application/octet-stream")
-			w.Header().Set("Cache-Control", "no-store")
 			recordSubtitleServeSource(subtitleServePGSProgressive)
 			slog.Log(r.Context(), slog.LevelInfo, "subtitle page served from the progressive artifact",
 				"component", "playback",
