@@ -1149,7 +1149,8 @@ so explicitly.
 - `source_start_seconds` — where in the *media* this plan begins.
 - `stream_origin_seconds` — the source position that the *transport's* byte-zero
   corresponds to.
-- `player_start_seconds` — where the client should seek the player after load.
+- `player_start_seconds` — where the client should seek the player once its
+  media timeline exists.
 - `timeline_offset_seconds` — what to add to a player position to get a source
   position.
 
@@ -1229,18 +1230,28 @@ input seek actually uses: the last keyframe at or before
 is bounded by the GOP that contains the requested position — at most one GOP,
 not a fixed number of seconds.
 
-A progressive copy remux is one forward-only response, so the client starts at
+A progressive copy remux is one forward-only response, so the client applies
 the plan's `player_start_seconds` — the requested position minus the resolved
-origin — and advances past the copied pre-roll. A non-seek replan that rebuilds
-onto that route — an audio switch, for example — inherits the same origin: the
-switch lands at the preceding keyframe, up to one GOP behind the position that
-was playing. That offset is intended and is measured against the request-time
-position. A replan's fetch or anchor-probe latency must not move that baseline:
-the replacement starts from the plan's own start, not from the outgoing
-element's live playhead, which includes however long the replan took. A client
-must not try to correct the remaining pre-roll by seeking `video.currentTime`
-after playback: a seek on this stream restarts it at its origin (or is answered
-by a server reanchor) and cannot remove the copied pre-roll.
+origin — as its start and advances past the copied pre-roll. A client must
+apply it once the element's media timeline exists (its `loadedmetadata`, or the
+first event where the element can serve the position): a `currentTime` written
+before metadata is not a seek, because assigning `src` queues the element's load
+algorithm, which resets the default playback start position to zero. The write
+is then lost and the first frame presented is the stream's own first frame.
+
+A browser that reports the response as unseekable — Chromium keeps the element's
+seekable range empty for a chunked body with no byte ranges — cannot be moved
+off that first frame, and the copied pre-roll stands. A non-seek replan that
+rebuilds onto the route (an audio switch, for example) inherits the same origin,
+so the switch lands at the preceding keyframe: up to one GOP behind the position
+that was playing. That offset is intended and is measured against the
+request-time position. A replan's fetch or anchor-probe latency must not move
+that baseline: the replacement starts from the plan's own start, not from the
+outgoing element's live playhead, which includes however long the replan took.
+A client must not try to correct the remaining pre-roll by seeking
+`video.currentTime` after playback: a seek on this stream restarts it at its
+origin (or is answered by a server reanchor) and cannot remove the copied
+pre-roll.
 
 The one-GOP bound is the source's own keyframe interval, not a fixed number of
 seconds. A long-GOP source (a 10 s HEVC interval, for example) legitimately

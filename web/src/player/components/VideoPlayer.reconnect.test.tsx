@@ -665,6 +665,178 @@ describe("VideoPlayer with the playback session: audio switch", () => {
   });
 });
 
+describe("VideoPlayer with the playback session: a replacement's start", () => {
+  /**
+   * Records every write to the element's clock. jsdom has no media pipeline, so
+   * a seek never fires `seeking`; the write is what the player's own start
+   * leaves behind, and counting it is how the tests see a single seek.
+   */
+  function countClockWrites(video: HTMLVideoElement): number[] {
+    const writes: number[] = [];
+    let current = video.currentTime;
+    Object.defineProperty(video, "currentTime", {
+      configurable: true,
+      get: () => current,
+      set: (next: number) => {
+        current = next;
+        writes.push(next);
+      },
+    });
+    return writes;
+  }
+
+  function seekableRange(end: number): TimeRanges {
+    return { length: 1, start: () => 0, end: () => end } as unknown as TimeRanges;
+  }
+
+  /**
+   * Starts a remux session and switches audio through a replan the test
+   * releases by hand, so the outgoing transport keeps playing for as long as a
+   * slow anchor probe would take. Returns the element and the writes made to
+   * its clock once the replacement's stream has been given to it.
+   */
+  async function switchAudioAfterASlowReplan() {
+    const first = remuxPlan();
+    // The new plan starts where the viewer was when the switch was requested
+    // (source 12, anchored at keyframe 10): two seconds of copied pre-roll.
+    const switched = remuxPlan({
+      plan_id: "plan:switched",
+      plan_attempt_key: "v3:switched",
+      selected_tracks: {
+        audio: { id: "file:7:audio:1", index: 1 },
+        subtitle: { id: "file:7:subtitle:0", index: 0 },
+      },
+      timeline: {
+        ...first.timeline,
+        source_start_seconds: 12,
+        stream_origin_seconds: 10,
+        player_start_seconds: 2,
+        timeline_offset_seconds: 10,
+      },
+    });
+    let releaseReplan: (() => void) | null = null;
+    const replanGate = new Promise<void>((resolve) => {
+      releaseReplan = resolve;
+    });
+    const requests = stubServer({
+      start: () => jsonResponse(playable("session-1", first), 201),
+      replan: async () => {
+        await replanGate;
+        return jsonResponse(playable("session-1", switched));
+      },
+    });
+    renderHarness();
+    const video = await startWatching();
+    vi.mocked(video.load).mockClear();
+
+    act(() => sessionRef.current?.switchAudioTrack(1, 12));
+    await waitFor(() => expect(requests.replans[0]?.body.operation).toBe("track_change"));
+    // The probe is still running and the outgoing transport plays on, so the
+    // element's live clock is well past the plan start.
+    video.currentTime = 12.9;
+    act(() => releaseReplan?.());
+
+    await waitFor(() => expect(video.load).toHaveBeenCalled());
+    expect(sessionRef.current?.plan?.selected_tracks.audio?.index).toBe(1);
+    return video;
+  }
+
+  /**
+   * The element's load algorithm ran: emptied paused it, and the clock is back
+   * at the stream's own first frame. A browser discards the pre-metadata start
+   * position here, which is why the plan's start has to be applied after
+   * metadata.
+   */
+  function loadFirstFrame(video: HTMLVideoElement, seekableEnd: number | null) {
+    Object.defineProperty(video, "paused", { configurable: true, value: true });
+    fireEvent.emptied(video);
+    Object.defineProperty(video, "currentTime", {
+      configurable: true,
+      writable: true,
+      value: 0,
+    });
+    if (seekableEnd !== null) {
+      Object.defineProperty(video, "seekable", {
+        configurable: true,
+        value: seekableRange(seekableEnd),
+      });
+    }
+    Object.defineProperty(video, "readyState", {
+      configurable: true,
+      value: HTMLMediaElement.HAVE_METADATA,
+    });
+  }
+
+  it("lands a replacement on the plan start with one seek when the element can serve it", async () => {
+    const video = await switchAudioAfterASlowReplan();
+    // This replacement's element can seek its stream (a byte-addressable
+    // route, or a browser that reports the buffered range as seekable).
+    loadFirstFrame(video, 60);
+    const writes = countClockWrites(video);
+    fireEvent.loadedMetadata(video);
+
+    expect(video.currentTime).toBe(2);
+    expect(writes).toEqual([2]);
+
+    Object.defineProperty(video, "readyState", {
+      configurable: true,
+      value: HTMLMediaElement.HAVE_FUTURE_DATA,
+    });
+    fireEvent.loadedData(video);
+    fireEvent.canPlay(video);
+    await waitFor(() => expect(HTMLMediaElement.prototype.play).toHaveBeenCalled());
+    Object.defineProperty(video, "paused", { configurable: true, value: false });
+    fireEvent.play(video);
+
+    // The probe's delay did not move the start: the plan's own start did.
+    expect(video.currentTime).toBe(2);
+    expect(writes).toEqual([2]);
+    expect(controls.current?.playing).toBe(true);
+  });
+
+  it("clamps a plan start behind the stream's first frame instead of seeking back", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const video = await switchAudioAfterASlowReplan();
+    loadFirstFrame(video, 60);
+    // This response begins after the plan's start: its origin is already past
+    // the position the plan names, so the only frame it can show is the origin.
+    video.currentTime = 5;
+    const writes = countClockWrites(video);
+    fireEvent.loadedMetadata(video);
+
+    expect(writes).toEqual([]);
+    expect(video.currentTime).toBe(5);
+    expect(warn.mock.calls.some((call) => String(call[0]).includes("begins after"))).toBe(true);
+    warn.mockRestore();
+  });
+
+  it("keeps the stream's first frame and issues no seek on a forward-only replacement", async () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    const video = await switchAudioAfterASlowReplan();
+    // A progressive remux reports nothing seekable: its one response has no
+    // byte range that maps back to a media position, so a seek would replay
+    // it from the origin instead of landing on the plan start.
+    loadFirstFrame(video, null);
+    const writes = countClockWrites(video);
+    fireEvent.loadedMetadata(video);
+    Object.defineProperty(video, "readyState", {
+      configurable: true,
+      value: HTMLMediaElement.HAVE_FUTURE_DATA,
+    });
+    fireEvent.loadedData(video);
+    fireEvent.canPlay(video);
+    await waitFor(() => expect(HTMLMediaElement.prototype.play).toHaveBeenCalled());
+    Object.defineProperty(video, "paused", { configurable: true, value: false });
+    fireEvent.play(video);
+
+    expect(writes).toEqual([]);
+    expect(video.currentTime).toBe(0);
+    expect(controls.current?.playing).toBe(true);
+    expect(info.mock.calls.some((call) => String(call[0]).includes("not seekable"))).toBe(true);
+    info.mockRestore();
+  });
+});
+
 describe("VideoPlayer with the playback session: version projection", () => {
   it("does not reload the media element when a version check restamps the list", async () => {
     const requests = stubServer({

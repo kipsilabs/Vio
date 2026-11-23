@@ -529,6 +529,11 @@ const MAX_AUTOPLAY_ATTEMPTS = 4;
 // before the player treats it as a stream that does not contain the requested
 // position at all. Smaller gaps are hls.js's own gap handling.
 const START_HOLE_SECONDS = 0.25;
+// How close the element's clock must be to a replacement's plan start for the
+// transport to count as already there. One frame at 24 fps is ~0.042 s, so
+// this absorbs the element's own clock rounding without treating a copied
+// pre-roll of more than a frame as reached.
+const REPLACEMENT_START_TOLERANCE_SECONDS = 0.05;
 // A viewer who reports this many sustained stalls to a room within the window
 // cannot keep up at its current quality and is offered a lower one.
 const ROOM_STALLS_BEFORE_LOWER_QUALITY = 2;
@@ -3402,6 +3407,12 @@ export function VideoPlayer({
       currentTimeRef.current,
       timelineOffsetRef.current,
     );
+    // Whether this transport replaces one that already played in this same
+    // session: an audio switch, a quality change, an output refresh. It is not
+    // a seek reanchor, whose start is the seek target and keeps the existing
+    // path, and not a new session, which starts at its own plan.
+    const replacesTransport =
+      transportSessionRef.current !== null && transportSessionRef.current === sessionIdRef.current;
     transportSessionRef.current = sessionIdRef.current;
     // "Played" belongs to one transport. A replacement that has not shown a
     // frame yet may be a route this browser cannot reach, so its network
@@ -3701,6 +3712,92 @@ export function VideoPlayer({
         },
       );
     };
+
+    // A transport that replaces one already playing must start where the plan
+    // starts, and the element accepts that only once its media timeline exists.
+    // A `currentTime` written before metadata is not a seek: assigning `src`
+    // queues the element's load algorithm, which resets the default playback
+    // start position to zero, so the write is lost and the first frame
+    // presented is the stream's own first frame. On a progressive remux that
+    // first frame is the copied pre-roll, which then carries however long the
+    // replan's fetch and anchor probe took on top.
+    //
+    // The start is applied once, on the first event where the element can
+    // serve it, and never for a seek reanchor: there the start is the seek
+    // target and `transportStartPosition` owns it.
+    const replacementStart =
+      replacesTransport && !isHlsStream && !playsOriginalFile && pendingSeekTimeRef.current === null
+        ? effectiveInitialPositionRef.current
+        : null;
+    let replacementStartPending = replacementStart !== null;
+    const detachReplacementStart = () => {
+      video.removeEventListener("loadedmetadata", tryReplacementStart);
+      video.removeEventListener("loadeddata", tryReplacementStart);
+      video.removeEventListener("progress", tryReplacementStart);
+      video.removeEventListener("canplay", settleReplacementStart);
+    };
+    // `final` marks the last readiness point: past it playback is about to
+    // start, so a target the element never reported as seekable is not coming
+    // and the transport keeps its own first frame.
+    const applyReplacementStart = (final: boolean) => {
+      if (destroyed || !replacementStartPending || replacementStart === null) return;
+      // Nothing can be seeked before the media timeline exists, and a write
+      // then is the one the load algorithm discards.
+      if (video.readyState < HTMLMediaElement.HAVE_METADATA) return;
+      // A seek that arrived while the replacement loaded owns the position:
+      // its own path seeks the element or reanchors the transport, so this
+      // start must not compete with it.
+      if (pendingSeekTimeRef.current !== null) {
+        replacementStartPending = false;
+        detachReplacementStart();
+        return;
+      }
+      // The element's clock while it loads is the stream's own first frame.
+      // A plan start before it names a generation this response does not hold,
+      // so clamping to the origin is the only position it can serve.
+      const origin = Number.isFinite(video.currentTime) ? Math.max(0, video.currentTime) : 0;
+      if (replacementStart <= origin + REPLACEMENT_START_TOLERANCE_SECONDS) {
+        replacementStartPending = false;
+        detachReplacementStart();
+        if (replacementStart < origin - REPLACEMENT_START_TOLERANCE_SECONDS) {
+          console.warn("[player] the replacement stream begins after the plan's start", {
+            plan_start_seconds: replacementStart,
+            stream_origin_seconds: origin,
+          });
+        }
+        return;
+      }
+      // A forward-only response — a progressive remux — has no byte range that
+      // maps back to a media position: its element reports nothing seekable,
+      // and a seek is answered by replaying the response from its origin. Land
+      // on the plan start only where the element can serve it; otherwise the
+      // copied pre-roll stands, bounded by the source's own GOP, and no doomed
+      // range request is issued.
+      if (!isNativePositionInRanges(video.seekable, replacementStart)) {
+        if (!final) return;
+        replacementStartPending = false;
+        detachReplacementStart();
+        console.info(
+          "[player] the replacement's plan start is not seekable; keeping the stream's first frame",
+          { plan_start_seconds: replacementStart, stream_origin_seconds: origin },
+        );
+        return;
+      }
+      replacementStartPending = false;
+      detachReplacementStart();
+      video.currentTime = replacementStart;
+    };
+    const tryReplacementStart = () => applyReplacementStart(false);
+    const settleReplacementStart = () => applyReplacementStart(true);
+    if (replacementStartPending) {
+      video.addEventListener("loadedmetadata", tryReplacementStart);
+      video.addEventListener("loadeddata", tryReplacementStart);
+      video.addEventListener("progress", tryReplacementStart);
+      // Registered before the readiness gate below, so a start the element can
+      // serve is applied before that gate calls play() and the first frame is
+      // never presented at the old position.
+      video.addEventListener("canplay", settleReplacementStart);
+    }
 
     video.addEventListener("loadeddata", attemptAutoplayWhenReady);
     video.addEventListener("canplay", attemptAutoplayWhenReady);
@@ -4456,9 +4553,15 @@ export function VideoPlayer({
           // stream starts there rather than behind the viewer; a target before
           // the origin cannot be produced by this generation, so the plan's own
           // start stands unchanged.
-          video.currentTime = isProgressiveRemux
-            ? transportStartPosition()
-            : effectiveInitialPositionRef.current;
+          //
+          // A replacement without a seek of its own does not write the start
+          // here: the element discards it when its load algorithm runs. See
+          // `replacementStart`, which applies it once the media timeline exists.
+          if (replacementStart === null) {
+            video.currentTime = isProgressiveRemux
+              ? transportStartPosition()
+              : effectiveInitialPositionRef.current;
+          }
           attemptAutoplayWhenReady();
           // A seek replacement that never produces media leaves the element on
           // its old frame at the target, which reads as a seek that succeeded.
@@ -4514,6 +4617,7 @@ export function VideoPlayer({
     return () => {
       destroyed = true;
       cleanupStartupListeners();
+      detachReplacementStart();
       if (resumeReloadedTransportRef.current === resumeReloadedTransport) {
         resumeReloadedTransportRef.current = () => {};
       }
