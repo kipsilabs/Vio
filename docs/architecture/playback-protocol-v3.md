@@ -1230,13 +1230,22 @@ is bounded by the GOP that contains the requested position — at most one GOP,
 not a fixed number of seconds.
 
 A progressive copy remux is one forward-only response, so the client starts at
-`stream_origin_seconds` and plays the pre-roll before reaching the requested
-position. A non-seek replan that rebuilds onto that route — an audio switch, for
-example — inherits the same origin: the switch lands at the preceding keyframe,
-up to one GOP behind the position that was playing. That offset is intended. A
-client must not try to correct it by seeking `video.currentTime`: a seek on this
-stream restarts it at its origin (or is answered by a server reanchor) and
-cannot remove the copied pre-roll.
+the plan's `player_start_seconds` — the requested position minus the resolved
+origin — and advances past the copied pre-roll. A non-seek replan that rebuilds
+onto that route — an audio switch, for example — inherits the same origin: the
+switch lands at the preceding keyframe, up to one GOP behind the position that
+was playing. That offset is intended and is measured against the request-time
+position. A replan's fetch or anchor-probe latency must not move that baseline:
+the replacement starts from the plan's own start, not from the outgoing
+element's live playhead, which includes however long the replan took. A client
+must not try to correct the remaining pre-roll by seeking `video.currentTime`
+after playback: a seek on this stream restarts it at its origin (or is answered
+by a server reanchor) and cannot remove the copied pre-roll.
+
+The one-GOP bound is the source's own keyframe interval, not a fixed number of
+seconds. A long-GOP source (a 10 s HEVC interval, for example) legitimately
+anchors more than five seconds back; a check against a fixed 5 s bar would flag
+it as an overshoot.
 
 Segmented HLS does not carry the same offset. Its player starts at the target
 segment rather than at the transport's first frame, because the segment layer
