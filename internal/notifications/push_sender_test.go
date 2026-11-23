@@ -259,6 +259,12 @@ func TestPushSenderMapsRelayIdempotencyStatesWithStableKey(t *testing.T) {
 
 func TestPushSenderRegistersRelayOnFirstSendWithoutCredential(t *testing.T) {
 	token := strings.Repeat("a", 64)
+	// The relay's expiry is relative to a pinned clock. A fixed calendar date
+	// eventually falls inside RelayCredentialNeedsRenewal's seven-to-eight-day
+	// window, and the second send below then renews instead of reusing the
+	// stored capability.
+	now := time.Date(2026, 10, 12, 9, 0, 0, 0, time.UTC)
+	expiresAt := now.Add(30 * 24 * time.Hour)
 	var registerCalls int
 	var sendAuth []string
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -273,7 +279,7 @@ func TestPushSenderRegistersRelayOnFirstSendWithoutCredential(t *testing.T) {
 				"deployment_id": "deployment-auto",
 				"api_key":       "auto-capability",
 				"key_prefix":    "cap_v1_auto",
-				"expires_at":    "2026-12-01T00:00:00Z",
+				"expires_at":    expiresAt.Format(time.RFC3339),
 			})
 		case relayAppleSendPath:
 			sendAuth = append(sendAuth, r.Header.Get("Authorization"))
@@ -292,6 +298,7 @@ func TestPushSenderRegistersRelayOnFirstSendWithoutCredential(t *testing.T) {
 	sender := newPushSender(nil, nil, nil, NewSettings(store))
 	sender.client = server.Client()
 	sender.developmentRelayURL = server.URL
+	sender.now = func() time.Time { return now }
 	device := &PushDevice{
 		APNsEnvironment: APNsEnvironmentSandbox,
 		APNsTopic:       ApplePushTopicSilo,
