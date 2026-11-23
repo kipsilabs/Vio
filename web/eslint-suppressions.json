@@ -254,14 +254,6 @@
       "count": 6
     }
   },
-  "src/pages/ItemDetail/components/VersionFlyout.tsx": {
-    "formatjs/no-literal-string-in-jsx": {
-      "count": 10
-    },
-    "silo/no-physical-direction": {
-      "count": 2
-    }
-  },
   "src/pages/LibraryRecommended.tsx": {
     "react-hooks/set-state-in-effect": {
       "count": 2

@@ -78,10 +78,13 @@ func TestEvaluateVersionPlayabilityRefusesATerminalHDRRow(t *testing.T) {
 
 // A retryable refusal (here the incomplete-metadata terminal) is not a verdict
 // about the release. The row must stay selectable, and an anchor-budget expiry
-// at a stored resume is the same class: retry, not dead.
+// at a stored resume is the same class: retry, not dead. The file is SDR, so a
+// probe can still make it direct-playable; only a range the client can never
+// present turns the same incomplete metadata into a terminal (see
+// TestEvaluateVersionPlayabilityRefusesAnUnprobedHDRRow).
 func TestEvaluateVersionPlayabilityLeavesRetryableRefusalsUnknown(t *testing.T) {
 	handler := playabilityHandler(t)
-	file := hdrPlayabilityFile(t)
+	file := v3HandlerFixtureFile(t)
 	// Drop a field the video route requires. The planner answers the
 	// retryable source_metadata_incomplete rather than a device verdict.
 	file.VideoTracks[0].FrameRate = ""
@@ -90,6 +93,52 @@ func TestEvaluateVersionPlayabilityLeavesRetryableRefusalsUnknown(t *testing.T) 
 	got := handler.EvaluateVersionPlayability(context.Background(), []*models.MediaFile{file}, client)
 	if verdict, ok := got[file.ID]; ok {
 		t.Fatalf("retryable refusal was reported as a playability verdict: %+v", verdict)
+	}
+}
+
+// unprobedHDRDVPlayabilityFile has the shape production rows had: an HDR/DV
+// provider row with no probe stamp and no bit depth, frame rate or bitrate.
+// This handler has no HDR recipe, so the declared row plans to
+// hdr_transcode_unsupported and the evaluator must report that terminal
+// instead of leaving the row unknown.
+func unprobedHDRDVPlayabilityFile(t *testing.T) *models.MediaFile {
+	t.Helper()
+	file := v3HandlerFixtureFile(t)
+	file.Container = "virtual"
+	file.FilePath = "virtual://series/tmdb/259140/1/3?result=d69876f03ff1f128a827038c"
+	file.CodecVideo = "hevc"
+	file.CodecAudio = "eac3"
+	file.Resolution = "1080p"
+	file.Bitrate = 0
+	file.HDR = true
+	file.ProbeUpdatedAt = nil
+	file.VideoTracks = []models.VideoTrack{{
+		Codec: "hevc", Width: 1920, Height: 1080,
+		VideoRange: "DolbyVision", VideoRangeType: "DOVI",
+		DVConfigPresent: false, DVBLCompatIDPresent: false,
+	}}
+	file.AudioTracks = []models.AudioTrack{{Codec: "eac3", Default: true, Language: "DEU"}}
+	return file
+}
+
+func TestEvaluateVersionPlayabilityRefusesAnUnprobedHDRRow(t *testing.T) {
+	handler := playabilityHandler(t)
+	file := unprobedHDRDVPlayabilityFile(t)
+	client := playabilityClientFromStart(ladderTVStartRequest())
+
+	got := handler.EvaluateVersionPlayability(context.Background(), []*models.MediaFile{file}, client)
+	verdict, ok := got[file.ID]
+	if !ok {
+		t.Fatalf("no verdict for unprobed HDR row %d: %+v", file.ID, got)
+	}
+	if verdict.Playable {
+		t.Fatalf("unprobed HDR row reported playable: %+v", verdict)
+	}
+	if verdict.Reason != playback.TerminalHDRTranscodeUnsupportedV3 {
+		t.Fatalf("reason = %q, want %q", verdict.Reason, playback.TerminalHDRTranscodeUnsupportedV3)
+	}
+	if verdict.Message == "" {
+		t.Fatal("terminal verdict carried no message")
 	}
 }
 
@@ -125,5 +174,32 @@ func TestCheckVersionsWithPlayabilityReportsThePlannerVerdict(t *testing.T) {
 	}
 	if result.Playability.Playable || result.Playability.Reason != playback.TerminalHDRTranscodeUnsupportedV3 {
 		t.Fatalf("playability = %+v, want the HDR terminal", result.Playability)
+	}
+}
+
+// The same terminal must survive the versions-check projection for a row that
+// has never been probed: the detail picker and the watch-page menu key on this
+// result, so an omitted verdict leaves the refused row selectable.
+func TestCheckVersionsWithPlayabilityReportsTheUnprobedHDRVerdict(t *testing.T) {
+	file := unprobedHDRDVPlayabilityFile(t)
+	catalogHandler := NewCatalogResourceHandler(nil)
+	catalogHandler.FileResolver = testPlaybackFileResolver{file: file}
+	catalogHandler.ItemAccess = allowAllPlaybackItemAccess{}
+	catalogHandler.SetVersionPlayability(playabilityHandler(t))
+	client := playabilityClientFromStart(ladderTVStartRequest())
+
+	results := catalogHandler.CheckVersionsWithPlayability(context.Background(), []int{file.ID}, client, false)
+	if len(results) != 1 {
+		t.Fatalf("results = %+v", results)
+	}
+	result := results[0]
+	if result.Playability == nil {
+		t.Fatalf("result carried no playability verdict: %+v", result)
+	}
+	if result.Playability.Playable || result.Playability.Reason != playback.TerminalHDRTranscodeUnsupportedV3 {
+		t.Fatalf("playability = %+v, want the HDR terminal", result.Playability)
+	}
+	if result.Playability.Message == "" {
+		t.Fatal("playability verdict carried no message")
 	}
 }

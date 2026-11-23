@@ -136,6 +136,13 @@ type PlannerInputV3 struct {
 	// LocalNetwork reports that the request came from the server's local
 	// network (streamlocation.Local). False is treated as remote.
 	LocalNetwork bool
+	// DeclaredFactsOnly marks a caller that evaluates a row it will not probe
+	// (the versions check's playability pass). Such a caller cannot turn
+	// incomplete video metadata into a validated route, so a terminal the
+	// declared facts already prove is answered now instead of the retryable
+	// source_metadata_incomplete. A start path leaves it false: its probe may
+	// still complete the route, so it must keep asking for that probe.
+	DeclaredFactsOnly bool
 }
 
 // SourceExecutionMetadataV3 is the immutable source probe snapshot used to
@@ -654,6 +661,18 @@ func planPlaybackOnceV3(input PlannerInputV3) (result PlannerResultV3) {
 			Code:    "dolby_vision_strip_unsupported_by_source",
 			Message: "This source's Dolby Vision metadata cannot be removed cleanly, so the validated HDR10 route is unavailable for it.",
 		})
+	}
+	// Incomplete video metadata normally answers the retryable
+	// source_metadata_incomplete, because a probe can still validate a direct
+	// or copy route. A caller that cannot probe (DeclaredFactsOnly) has no way
+	// to complete it now, and the declared facts can already prove the HDR
+	// terminal: no source-preserving route exists for this client's output and
+	// no HDR transcode recipe is installed. That caller must report the
+	// terminal instead of unknown, or a version picker keeps offering a row
+	// the start refuses (see #469). The start path stays on the retryable
+	// refusal so its probe can still heal the row.
+	if input.DeclaredFactsOnly && !routeVideoMetadataCompleteV3(source) && declaredHDRTerminalV3(input, source, rangeOK, clientManagedRange, clientDV8BaseLayerOK, dvStripEligible, serverDV81Eligible, clientDV81Eligible, clientHDR10Eligible) {
+		return hdrTranscodeUnsupportedTerminalV3(resolveToneMapRecipeV3(input, source, nil))
 	}
 	if !routeVideoMetadataCompleteV3(source) {
 		return terminalPlannerResultV3WithDetail("source_metadata_incomplete", "The source is missing video metadata required for a validated playback route.", routeVideoMetadataGapsDetailV3(source), true)
@@ -1628,6 +1647,41 @@ func planVideoTranscodeUnavailableV3(input PlannerInputV3, subtitle SubtitlePoli
 	return nil
 }
 
+// hdrTranscodeUnsupportedTerminalV3 is the planner's terminal for an HDR/DV
+// source that needs a video encode and has no validated HDR-preserving or
+// tone-map recipe. The ordinary transcode route and the declared-metadata gate
+// share it so their reason, message and detail cannot drift.
+func hdrTranscodeUnsupportedTerminalV3(recipe resolvedToneMapRecipeV3) PlannerResultV3 {
+	return terminalPlannerResultV3WithDetail(TerminalHDRTranscodeUnsupportedV3, "This HDR source requires video encoding, but no validated HDR-preserving or tone-map recipe is installed.", describeToneMapBlockerV3(recipe), false)
+}
+
+// declaredHDRTerminalV3 reports whether the source and client facts on the row
+// already prove the hdr_transcode_unsupported terminal while the probe has not
+// filled in every video field. Video metadata completeness gates route
+// validation; it cannot create a source-preserving route for a client whose
+// output cannot carry the source range, and it cannot install an HDR recipe.
+// The verdict is about the row as it stands: a later probe may write the facts
+// that unlock a route, and the next evaluation re-reads the row.
+//
+// The client guard is deliberately narrow. A client that advertises any HDR
+// presentation route could gain one from metadata the probe has not written
+// yet (a native HDR output, a Dolby Vision base-layer claim that needs the
+// source's compatibility id, or a client-managed range claim). Only a client
+// that advertises none of them can be refused on declared facts alone.
+func declaredHDRTerminalV3(input PlannerInputV3, source SourceDescriptorV3, rangeOK, clientManagedRange, clientDV8BaseLayerOK, dvStripEligible, serverDV81Eligible, clientDV81Eligible, clientHDR10Eligible bool) bool {
+	if source.DynamicRange == "" || source.DynamicRange == DynamicRangeSDRV3 {
+		return false
+	}
+	if rangeOK || clientManagedRange || clientDV8BaseLayerOK || dvStripEligible ||
+		serverDV81Eligible || clientDV81Eligible || clientHDR10Eligible {
+		return false
+	}
+	if clientDeclaresRangePresentationV3(input.Request) {
+		return false
+	}
+	return !resolveToneMapRecipeV3(input, source, nil).ok
+}
+
 // describeToneMapBlockerV3 names the first check that left the tone-map
 // recipe unavailable, in resolveToneMapRecipeV3 order, so an
 // hdr_transcode_unsupported terminal carries the actual missing piece
@@ -1667,7 +1721,7 @@ func resolveTranscodeVideoTargetV3(input PlannerInputV3, source SourceDescriptor
 			result := terminalPlannerResultV3("subtitle_conversion_unsupported", "The selected subtitle must be burned into the video, but this HDR source cannot be re-encoded.", false)
 			return targetVideoSelectionV3{}, quality, toneMapRecipe, &result
 		}
-		result := terminalPlannerResultV3WithDetail(TerminalHDRTranscodeUnsupportedV3, "This HDR source requires video encoding, but no validated HDR-preserving or tone-map recipe is installed.", describeToneMapBlockerV3(toneMapRecipe), false)
+		result := hdrTranscodeUnsupportedTerminalV3(toneMapRecipe)
 		return targetVideoSelectionV3{}, quality, toneMapRecipe, &result
 	}
 	if is4KSourceV3(input.EffectiveFile, source) && !input.Settings.Allow4KTranscode {

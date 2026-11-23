@@ -615,6 +615,37 @@ func deliveryManagedDVBaseLayerV3(delivery DeliveryCapabilityV3, source SourceDe
 	return claim != "" && containsFoldV3(delivery.ValidatedClaims, claim)
 }
 
+// clientDeclaresRangePresentationV3 reports whether the client advertises any
+// way to present a non-SDR source itself: a native HDR output that carries at
+// least one range, a client-managed dynamic-range claim, or one of the Dolby
+// Vision base-layer claims whose usability depends on a compatibility id the
+// row may not have probed yet. Planning must not treat a row as terminally
+// HDR-unplayable for such a client while its metadata is incomplete, because
+// the probe can still reveal the fact the claim depends on.
+//
+// A detailed output record whose every range flag is false is not a route: the
+// production browser client sends exactly that shape, and it can present
+// neither HDR10, HLG, nor any Dolby Vision profile.
+func clientDeclaresRangePresentationV3(request StartRequestV3) bool {
+	if hdr := nativeOutputHDRV3(request); hdr != nil {
+		if hdr.HDR10 || hdr.HDR10Plus || hdr.HLG || len(hdr.DolbyVisionProfiles) > 0 {
+			return true
+		}
+	}
+	delivery, ok := request.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3]
+	if !ok {
+		return false
+	}
+	for _, claim := range delivery.ValidatedClaims {
+		if strings.EqualFold(claim, ClaimClientManagedDynamicRangeV3) ||
+			strings.EqualFold(claim, ClaimClientDV8BaseLayerFallbackV3) ||
+			strings.HasPrefix(strings.ToLower(claim), ClaimClientManagedDVBaseLayerV3Prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // clientSelectsOriginalAudioTrackV3 is delivery-scoped because original HTTP
 // carries every source stream unchanged. A client that makes this claim maps
 // selected_tracks.audio.index onto its probed source inventory; clients that
