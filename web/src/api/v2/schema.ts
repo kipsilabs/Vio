@@ -25191,6 +25191,8 @@ export interface components {
        * @enum {string}
        */
       inventory_provenance?: "declared" | "pending" | "verified";
+      /** @description Whether this client can play the row; absent when no client capability block was sent or the pass could not finish */
+      playability?: components["schemas"]["CatalogVersionPlayability"];
       /**
        * Format: date-time
        * @description When a probe last enumerated this row's stream table; absent means declared metadata only
@@ -25202,11 +25204,25 @@ export interface components {
       /** @description The row's video tracks; present only in the single-file inventory mode */
       video_tracks?: components["schemas"]["VideoTrack"][];
     };
+    CatalogVersionPlayability: {
+      /** @description The start path's user-facing terminal message when playable is false */
+      message?: string;
+      /** @description True when the planner can play this row for the requesting client */
+      playable: boolean;
+      /** @description The start path's terminal reason when playable is false, for example hdr_transcode_unsupported */
+      reason?: string;
+    };
     CatalogVersionsCheck: {
       /** @description One result per requested file identifier; empty, never null */
       results: components["schemas"]["CatalogVersionCheckResult"][];
     };
     CatalogVersionsCheckInputBody: {
+      /** @description The client's codec capability block from startPlayback; presence enables the playability verdict */
+      client_capabilities?: components["schemas"]["ClientCodecCapabilitiesV3"];
+      /** @description The client's negotiated playback feature tokens, exactly as startPlayback sends them */
+      client_features?: string[];
+      /** @description The client's delivery and output context from startPlayback; presence enables the playability verdict */
+      client_playback_context?: components["schemas"]["ClientPlaybackContextV3"];
       /**
        * @description File identifiers from listCatalogItemVersions, at most 40 per request
        * @example [
@@ -25215,6 +25231,8 @@ export interface components {
        *     ]
        */
       file_ids: string[];
+      /** @description Report each row's durable health and client playability without resolving provider pins; requires client_capabilities and client_playback_context */
+      playability_only?: boolean;
       /** @description Ask for the single file's track inventory, enumerated synchronously under a short bound; requires exactly one file identifier */
       preprobe?: boolean;
     };

@@ -1,10 +1,15 @@
 import { useQueries, type QueryClient } from "@tanstack/react-query";
 import { useMemo } from "react";
 
-import type { VersionLivenessResponse, VersionLivenessResult } from "@/api/types";
+import type {
+  VersionLivenessResponse,
+  VersionLivenessResult,
+  VersionPlayability,
+} from "@/api/types";
 import { v2 } from "@/api/v2/request";
 import type { components } from "@/api/v2/schema";
 import { catalogKeys } from "@/hooks/queries/keys";
+import type { ClientCodecCapabilitiesV3, ClientPlaybackContextV3 } from "@/player/protocol-v3";
 import { isVirtualFileVersion } from "@/pages/ItemDetail/components/versionFormatUtils";
 
 type CatalogVersionsCheck = components["schemas"]["CatalogVersionsCheck"];
@@ -27,6 +32,20 @@ export interface VersionLivenessCandidate {
   /** A recent probe rejected the provider's bytes as a different release than
    *  this row declares. Advisory only; never implies `failed`. */
   source_mismatch?: { served_bytes: number; declared_bytes: number };
+  /** The client-specific playability verdict from the check. Absent means
+   *  unknown (not checked, or the pass could not finish), never unplayable. */
+  playability?: VersionPlayability;
+}
+
+/**
+ * The client half of a playback start, sent with the versions check so the
+ * server can plan each row with the same capability surface the start uses.
+ * `features` is the client's negotiated feature list from startPlayback.
+ */
+export interface VersionPlayabilityClient {
+  features?: string[];
+  capabilities: ClientCodecCapabilitiesV3;
+  playbackContext: ClientPlaybackContextV3;
 }
 
 /** A source-mismatch verdict: bytes served versus bytes declared. */
@@ -100,15 +119,40 @@ function livenessResultFromV2(
           declared_bytes: result.source_mismatch.declared_bytes,
         }
       : undefined,
+    playability: result.playability
+      ? {
+          playable: result.playability.playable,
+          reason: result.playability.reason,
+          message: result.playability.message,
+        }
+      : undefined,
   };
+}
+
+export interface VersionCheckRequestOptions {
+  signal?: AbortSignal;
+  client?: VersionPlayabilityClient;
+  /** Ask for the cheap durable-health + playability answer only. */
+  playabilityOnly?: boolean;
 }
 
 export async function fetchVersionLiveness(
   fileIds: number[],
-  options?: { signal?: AbortSignal },
+  options?: VersionCheckRequestOptions,
 ): Promise<VersionLivenessResponse> {
+  const client = options?.client;
   const response = await v2("POST /api/v2/catalog/versions/check", {
-    body: { file_ids: fileIds.map(String) },
+    body: {
+      file_ids: fileIds.map(String),
+      ...(options?.playabilityOnly ? { playability_only: true } : {}),
+      ...(client
+        ? {
+            ...(client.features ? { client_features: client.features } : {}),
+            client_capabilities: client.capabilities,
+            client_playback_context: client.playbackContext,
+          }
+        : {}),
+    },
     ...(options?.signal ? { signal: options.signal } : {}),
   });
   return {
@@ -136,8 +180,20 @@ const inFlightRowSets = new Map<string, Promise<VersionLivenessResponse>>();
 /** Row sets a catalog event asked to re-check, waiting for the next request. */
 const forcedRowSets = new Set<string>();
 
-function rowSetKey(fileIds: number[]): string {
-  return [...fileIds].sort((a, b) => a - b).join(",");
+function clientRowSetKey(client: VersionPlayabilityClient | undefined): string {
+  if (!client) return "no-client";
+  return JSON.stringify([client.features ?? [], client.capabilities, client.playbackContext]);
+}
+
+function rowSetKey(fileIds: number[], options?: VersionCheckRequestOptions): string {
+  // The client block is part of the key: a display or decoder change can
+  // change a verdict for the same row set, and reusing the previous answer
+  // would keep a now-unplayable row selectable (or hide a playable one).
+  return `${options?.playabilityOnly ? "playability" : "liveness"}:${clientRowSetKey(options?.client)}:${[
+    ...fileIds,
+  ]
+    .sort((a, b) => a - b)
+    .join(",")}`;
 }
 
 /** How long this row set's answer stays authoritative. */
@@ -170,8 +226,11 @@ function reuseWindowMs(record: LivenessCheckRecord): number {
  * here polls: a re-render, a remount, a re-enable, or an unchanged list reuses
  * the answer it already has.
  */
-export function checkVersionLiveness(fileIds: number[]): Promise<VersionLivenessResponse> {
-  const key = rowSetKey(fileIds);
+export function checkVersionLiveness(
+  fileIds: number[],
+  options?: VersionCheckRequestOptions,
+): Promise<VersionLivenessResponse> {
+  const key = rowSetKey(fileIds, options);
   const running = inFlightRowSets.get(key);
   if (running) return running;
 
@@ -189,7 +248,7 @@ export function checkVersionLiveness(fileIds: number[]): Promise<VersionLiveness
   forcedRowSets.delete(key);
 
   const startedAt = now;
-  const request = fetchVersionLiveness(fileIds)
+  const request = fetchVersionLiveness(fileIds, options)
     .then((response) => {
       checkedRowSets.set(key, {
         at: Date.now(),
@@ -210,6 +269,19 @@ export function checkVersionLiveness(fileIds: number[]): Promise<VersionLiveness
     });
   inFlightRowSets.set(key, request);
   return request;
+}
+
+/**
+ * The cheap playability pass a detail page runs before the viewer opens the
+ * picker: it judges every row with the client's own capability block without
+ * resolving provider pins. It shares the liveness gate's coalescing and cache,
+ * keyed separately by mode and client.
+ */
+export function checkVersionPlayability(
+  fileIds: number[],
+  client: VersionPlayabilityClient,
+): Promise<VersionLivenessResponse> {
+  return checkVersionLiveness(fileIds, { client, playabilityOnly: true });
 }
 
 /**
@@ -271,6 +343,24 @@ export function chunkVirtualFileIds(versions: VersionLivenessCandidate[]): numbe
   const fileIds = versions
     .filter((version) => isVirtualFileVersion(version))
     .map((version) => version.file_id)
+    .sort((a, b) => a - b);
+
+  const chunks: number[][] = [];
+  for (let i = 0; i < fileIds.length; i += VERSION_LIVENESS_BATCH_SIZE) {
+    chunks.push(fileIds.slice(i, i + VERSION_LIVENESS_BATCH_SIZE));
+  }
+  return chunks;
+}
+
+/**
+ * Batches every row of a list, virtual or local. The playability verdict is
+ * about the row itself, so the cheap pass cannot skip local files the way the
+ * provider-liveness pass does.
+ */
+export function chunkFileIds(versions: VersionLivenessCandidate[]): number[][] {
+  const fileIds = versions
+    .map((version) => version.file_id)
+    .filter((fileId) => Number.isSafeInteger(fileId) && fileId > 0)
     .sort((a, b) => a - b);
 
   const chunks: number[][] = [];
@@ -364,6 +454,77 @@ export function useVersionLiveness(
       }),
     // eslint-disable-next-line react-hooks/exhaustive-deps -- depend on each query's data, not the result objects.
     [versions, ...queryResults.map((query) => query.data)],
+  );
+}
+
+/**
+ * The client-specific playability verdicts for every row of a list. It is the
+ * cheap pass the detail page runs before the viewer picks: no provider pins
+ * are resolved, and the answer is cached by mode and client block so a
+ * re-render or a picker open reuses it.
+ */
+export function useVersionPlayability(
+  versions: VersionLivenessCandidate[],
+  client: VersionPlayabilityClient | undefined,
+  enabled: boolean,
+): Map<number, VersionPlayability> {
+  const chunks = useMemo(() => chunkFileIds(versions), [versions]);
+  const clientKey = useMemo(() => (client ? clientRowSetKey(client) : ""), [client]);
+
+  const queryResults = useQueries({
+    queries: chunks.map((fileIds) => ({
+      queryKey: [...catalogKeys.versionLiveness, "playability", clientKey, fileIds],
+      queryFn: () => checkVersionPlayability(fileIds, client!),
+      enabled: enabled && !!client && fileIds.length > 0,
+      staleTime: VERSION_LIVENESS_STALE_MS,
+    })),
+  });
+
+  return useMemo(() => {
+    const verdicts = new Map<number, VersionPlayability>();
+    for (const result of queryResults.flatMap((query) => query.data?.results ?? [])) {
+      if (result.playability) {
+        verdicts.set(result.file_id, result.playability);
+      }
+    }
+    return verdicts;
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- depend on each query's data, not the result objects.
+  }, [clientKey, ...queryResults.map((query) => query.data)]);
+}
+
+/**
+ * Stamps the playability verdict onto the rows the picker renders. A row with
+ * no verdict (not checked, or the pass could not finish) is left untouched so
+ * an unfinished pass never looks like a refusal.
+ */
+export function applyVersionPlayability<T extends VersionLivenessCandidate>(
+  versions: T[],
+  verdicts: Map<number, VersionPlayability>,
+): T[] {
+  if (verdicts.size === 0) return versions;
+  let changed = false;
+  const next = versions.map((version) => {
+    const verdict = verdicts.get(version.file_id);
+    if (!verdict || samePlayability(version.playability, verdict)) {
+      return version;
+    }
+    changed = true;
+    return { ...version, playability: verdict };
+  });
+  return changed ? next : versions;
+}
+
+function samePlayability(
+  current: VersionPlayability | undefined,
+  next: VersionPlayability | undefined,
+): boolean {
+  if (current === undefined || next === undefined) {
+    return current === next;
+  }
+  return (
+    current.playable === next.playable &&
+    current.reason === next.reason &&
+    current.message === next.message
   );
 }
 

@@ -29243,6 +29243,10 @@
             ],
             "type": "string"
           },
+          "playability": {
+            "$ref": "#/components/schemas/CatalogVersionPlayability",
+            "description": "Whether this client can play the row; absent when no client capability block was sent or the pass could not finish"
+          },
           "probed_at": {
             "description": "When a probe last enumerated this row's stream table; absent means declared metadata only",
             "format": "date-time",
@@ -29274,6 +29278,27 @@
         ],
         "type": "object"
       },
+      "CatalogVersionPlayability": {
+        "additionalProperties": false,
+        "properties": {
+          "message": {
+            "description": "The start path's user-facing terminal message when playable is false",
+            "type": "string"
+          },
+          "playable": {
+            "description": "True when the planner can play this row for the requesting client",
+            "type": "boolean"
+          },
+          "reason": {
+            "description": "The start path's terminal reason when playable is false, for example hdr_transcode_unsupported",
+            "type": "string"
+          }
+        },
+        "required": [
+          "playable"
+        ],
+        "type": "object"
+      },
       "CatalogVersionsCheck": {
         "additionalProperties": false,
         "properties": {
@@ -29293,6 +29318,21 @@
       "CatalogVersionsCheckInputBody": {
         "additionalProperties": false,
         "properties": {
+          "client_capabilities": {
+            "$ref": "#/components/schemas/ClientCodecCapabilitiesV3",
+            "description": "The client's codec capability block from startPlayback; presence enables the playability verdict"
+          },
+          "client_features": {
+            "description": "The client's negotiated playback feature tokens, exactly as startPlayback sends them",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "client_playback_context": {
+            "$ref": "#/components/schemas/ClientPlaybackContextV3",
+            "description": "The client's delivery and output context from startPlayback; presence enables the playability verdict"
+          },
           "file_ids": {
             "description": "File identifiers from listCatalogItemVersions, at most 40 per request",
             "examples": [
@@ -29312,6 +29352,10 @@
             "maxItems": 40,
             "minItems": 1,
             "type": "array"
+          },
+          "playability_only": {
+            "description": "Report each row's durable health and client playability without resolving provider pins; requires client_capabilities and client_playback_context",
+            "type": "boolean"
           },
           "preprobe": {
             "description": "Ask for the single file's track inventory, enumerated synchronously under a short bound; requires exactly one file identifier",

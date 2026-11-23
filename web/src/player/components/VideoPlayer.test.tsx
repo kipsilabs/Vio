@@ -8708,4 +8708,181 @@ describe("VideoPlayer transport identity", () => {
 
     await waitFor(() => expect(hlsJS.constructed).toHaveBeenCalledTimes(2));
   });
+
+  // An audio switch on the remux route rebuilds the transport. The teardown
+  // clears the element, and the session samples that silent pause as
+  // "not playing", so the plan that actually lands can carry
+  // `shouldAutoPlay: false` even though the viewer never paused. The player's
+  // startup gate has to read the viewer's live intent, not the plan's adopted
+  // intent, or the new stream loads and sits paused under a Play control.
+  it("starts a remux audio switch whose adopted plan lost the viewer's play intent", async () => {
+    const remuxAudioPlan = (audioIndex: number, url: string) =>
+      fixturePlanV3({
+        delivery: "server_remux_progressive",
+        stream: {
+          url,
+          protocol: "http_progressive",
+          headers: {},
+          header_refresh: "none",
+        },
+        timeline: {
+          source_start_seconds: 12,
+          stream_origin_seconds: 10,
+          player_start_seconds: 2,
+          timeline_offset_seconds: 10,
+          can_seek_anywhere: false,
+          seek_restoration: "source_position",
+        },
+        selected_tracks: { audio: { id: `file:7:audio:${audioIndex}`, index: audioIndex } },
+        audio_tracks: [
+          {
+            index: 0,
+            language: "en",
+            codec: "aac",
+            default: true,
+            track_id: "file:7:audio:0",
+            selection_index: 0,
+          },
+          {
+            index: 1,
+            language: "de",
+            codec: "aac",
+            default: false,
+            track_id: "file:7:audio:1",
+            selection_index: 1,
+          },
+        ],
+      });
+    const first = remuxAudioPlan(0, "/stream/session-1?audio=0");
+    const second = remuxAudioPlan(1, "/stream/session-1?audio=1");
+    const { container, rerenderPlayer } = renderPlayer({
+      plan: first,
+      streamUrl: "/api/v1/stream/session-1?audio=0&token=token",
+      transportRevision: 1,
+    });
+    const video = container.querySelector("video");
+    if (!video) throw new Error("expected video element");
+    await waitFor(() => expect(video.getAttribute("src")).toContain("audio=0"));
+
+    Object.defineProperty(video, "paused", { configurable: true, value: false });
+    // The outgoing transport is at content 12.8 s when the switch lands: the
+    // replan's fetch/probe moved the live playhead 0.8 s past the request.
+    video.currentTime = 4.8;
+    fireEvent.play(video);
+    fireFrameTimeUpdate(video);
+    fireEvent.playing(video);
+    expect(controls.current?.playing).toBe(true);
+
+    // The switch tears the old transport down, and that silent pause reaches
+    // the session before the replacement plan does.
+    vi.mocked(HTMLMediaElement.prototype.play).mockClear();
+    Object.defineProperty(video, "paused", { configurable: true, value: true });
+    fireEvent.emptied(video);
+    rerenderPlayer({
+      plan: second,
+      streamUrl: "/api/v1/stream/session-1?audio=1&token=token",
+      planRevision: 2,
+      transportRevision: 2,
+      shouldAutoPlay: false,
+    });
+    await waitFor(() => expect(video.getAttribute("src")).toContain("audio=1"));
+
+    Object.defineProperty(video, "readyState", {
+      configurable: true,
+      value: HTMLMediaElement.HAVE_FUTURE_DATA,
+    });
+    fireEvent.loadedData(video);
+    fireEvent.canPlay(video);
+    await waitFor(() => expect(HTMLMediaElement.prototype.play).toHaveBeenCalled());
+
+    Object.defineProperty(video, "paused", { configurable: true, value: false });
+    fireEvent.play(video);
+    expect(video.paused).toBe(false);
+    // The plan's player clock starts at the request-time baseline (source 12 s
+    // on a transport whose zero is 10 s), not at the outgoing element's
+    // position plus however long the replan took.
+    expect(video.currentTime).toBe(2);
+    expect(controls.current?.playing).toBe(true);
+  });
+
+  // The load algorithm pauses the element in its own task, so the replacement
+  // can become ready while the element has not paused yet. The #465 latch is
+  // what bridges that gap: resume the transport when `emptied` reports the
+  // pause, instead of leaving the switch stopped under a Play control.
+  it("resumes a switch transport re-created after the resume was latched", async () => {
+    const remuxPlan = (audioIndex: number, url: string) =>
+      fixturePlanV3({
+        delivery: "server_remux_progressive",
+        stream: { url, protocol: "http_progressive", headers: {}, header_refresh: "none" },
+        timeline: {
+          source_start_seconds: 12,
+          stream_origin_seconds: 10,
+          player_start_seconds: 2,
+          timeline_offset_seconds: 10,
+          can_seek_anywhere: false,
+          seek_restoration: "source_position",
+        },
+        selected_tracks: { audio: { id: `file:7:audio:${audioIndex}`, index: audioIndex } },
+        audio_tracks: [
+          {
+            index: 0,
+            language: "en",
+            codec: "aac",
+            default: true,
+            track_id: "file:7:audio:0",
+            selection_index: 0,
+          },
+          {
+            index: 1,
+            language: "de",
+            codec: "aac",
+            default: false,
+            track_id: "file:7:audio:1",
+            selection_index: 1,
+          },
+        ],
+      });
+    const { container, rerenderPlayer } = renderPlayer({
+      plan: remuxPlan(0, "/stream/session-1?audio=0"),
+      streamUrl: "/api/v1/stream/session-1?audio=0&token=token",
+      transportRevision: 1,
+    });
+    const video = container.querySelector("video");
+    if (!video) throw new Error("expected video element");
+    await waitFor(() => expect(video.getAttribute("src")).toContain("audio=0"));
+    Object.defineProperty(video, "paused", { configurable: true, value: false });
+    fireEvent.play(video);
+    fireFrameTimeUpdate(video);
+    fireEvent.playing(video);
+
+    vi.mocked(HTMLMediaElement.prototype.play).mockClear();
+    rerenderPlayer({
+      plan: remuxPlan(1, "/stream/session-1?audio=1"),
+      streamUrl: "/api/v1/stream/session-1?audio=1&token=token",
+      planRevision: 2,
+      transportRevision: 2,
+      shouldAutoPlay: false,
+    });
+    await waitFor(() => expect(video.getAttribute("src")).toContain("audio=1"));
+
+    // The replacement is ready while the element still reports playing, so the
+    // resume request latches instead of starting it early.
+    Object.defineProperty(video, "readyState", {
+      configurable: true,
+      value: HTMLMediaElement.HAVE_FUTURE_DATA,
+    });
+    fireEvent.loadedData(video);
+    fireEvent.canPlay(video);
+    expect(HTMLMediaElement.prototype.play).not.toHaveBeenCalled();
+
+    // The element's load algorithm pauses it in a later task, with `emptied`
+    // rather than `pause`; the latch starts the transport there.
+    Object.defineProperty(video, "paused", { configurable: true, value: true });
+    fireEvent.emptied(video);
+    await waitFor(() => expect(HTMLMediaElement.prototype.play).toHaveBeenCalled());
+
+    Object.defineProperty(video, "paused", { configurable: true, value: false });
+    fireEvent.play(video);
+    expect(controls.current?.playing).toBe(true);
+  });
 });

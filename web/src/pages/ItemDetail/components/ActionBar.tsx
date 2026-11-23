@@ -146,14 +146,19 @@ function versionFallbackMessage(fallback: NonNullable<ItemVersionSelection["fall
       ? `The version you last played is no longer listed. Playing ${selected}.`
       : "The version you last played is no longer listed. Pick a version to play.";
   }
-  if (
-    fallback.skipped &&
-    fallback.selected &&
-    fallback.skipped.file_id === fallback.selected.file_id
-  ) {
+  const unplayable = fallback.reason === "unplayable";
+  const sameSkippedAndSelected =
+    fallback.skipped && fallback.selected && fallback.skipped.file_id === fallback.selected.file_id;
+  if (sameSkippedAndSelected) {
+    if (unplayable) {
+      return `${skipped} cannot play on this device. Pick another version.`;
+    }
     return fallback.reason === "failed"
       ? `${skipped} is marked failed. Playing it retries the link.`
       : `${skipped} is not available right now. Playing it retries the link.`;
+  }
+  if (unplayable) {
+    return `${skipped} cannot play on this device. Playing ${selected} instead.`;
   }
   return fallback.reason === "failed"
     ? `${skipped} is marked failed. Playing ${selected} instead.`

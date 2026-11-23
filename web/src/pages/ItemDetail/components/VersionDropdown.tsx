@@ -34,7 +34,12 @@ import {
   subtitleLanguageLabels,
 } from "./versionFormatUtils";
 import { buildDetailLine, buildQualitySummary, sortByResolution } from "./VersionFlyout";
-import { isVersionUnavailable, useVersionVisibility } from "./versionAvailability";
+import {
+  isVersionUnavailable,
+  isVersionUnplayable,
+  useVersionVisibility,
+  versionPlayabilityBadge,
+} from "./versionAvailability";
 
 interface VersionDropdownProps {
   versions: FileVersion[];
@@ -260,23 +265,31 @@ function VersionDropdown({
             {editionOptions.map((option) => {
               const isSelected = option.id === selectedEdition.id;
               const detail = buildEditionDetail(option);
+              const playability = versionPlayabilityBadge(option.defaultVersion);
 
               return (
                 <button
                   key={option.id}
                   type="button"
+                  disabled={!!playability}
+                  title={playability?.title}
+                  aria-disabled={playability ? true : undefined}
                   onClick={() => {
+                    if (playability) return;
                     onSelectVersion(option.defaultVersion);
                     setEditionOpen(false);
                     setVersionOpen(false);
                   }}
                   className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left transition-colors ${
                     isSelected ? "bg-accent text-accent-foreground" : "hover:bg-accent/50"
-                  }`}
+                  } ${playability ? "cursor-not-allowed opacity-60 hover:bg-transparent" : ""}`}
                 >
                   <div className="min-w-0 flex-1">
                     <div className="truncate text-sm font-medium">{option.label}</div>
                     {detail && <div className="text-muted-foreground text-xs">{detail}</div>}
+                    {playability && (
+                      <div className="text-muted-foreground text-xs">{playability.label}</div>
+                    )}
                   </div>
                   {isSelected && <Check className="text-primary size-4 shrink-0" />}
                 </button>
@@ -335,6 +348,8 @@ function VersionDropdown({
               const detail = providerText ? "" : buildDetailLine(version);
               const rangeLabel = videoRangeLabel(version);
               const unavailable = isVersionUnavailable(version);
+              const playability = versionPlayabilityBadge(version);
+              const unplayable = isVersionUnplayable(version);
               const health = deriveVersionHealth(version);
               const versionProfileLabel = profileLabelFromFilePath(version.file_path);
 
@@ -342,13 +357,23 @@ function VersionDropdown({
                 <button
                   key={version.file_id}
                   type="button"
+                  disabled={unplayable}
+                  title={playability?.title}
+                  aria-disabled={unplayable ? true : undefined}
                   onClick={() => {
+                    if (unplayable) return;
                     onSelectVersion(version);
                     setVersionOpen(false);
                   }}
                   className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left transition-colors ${
                     isSelected ? "bg-accent text-accent-foreground" : "hover:bg-accent/50"
-                  } ${unavailable && !isSelected ? "opacity-80" : ""}`}
+                  } ${
+                    unplayable
+                      ? "cursor-not-allowed opacity-60 hover:bg-transparent"
+                      : unavailable && !isSelected
+                        ? "opacity-80"
+                        : ""
+                  }`}
                 >
                   <div className="min-w-0 flex-1">
                     {providerText && <ProviderResultText text={providerText} />}
@@ -363,6 +388,15 @@ function VersionDropdown({
                             className="px-1.5 py-0 text-[0.625rem] uppercase"
                           >
                             {rangeLabel}
+                          </Badge>
+                        ) : null}
+                        {playability ? (
+                          <Badge
+                            variant="outline"
+                            title={playability.title}
+                            className="border-red-500/30 bg-red-500/15 px-1.5 py-0 text-[0.625rem] font-medium text-red-600 dark:text-red-300"
+                          >
+                            {playability.label}
                           </Badge>
                         ) : null}
                         {health ? (

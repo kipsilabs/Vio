@@ -2623,6 +2623,10 @@ func newChiRouter(deps Dependencies) chi.Router {
 		}
 		if playbackHandler != nil {
 			catalogResourceHandler.VirtualResolver = playbackHandler.VirtualMediaDetailedResolver
+			// The versions check's playability verdict runs the same planner a
+			// start does, so the picker and the start cannot disagree about
+			// whether this client can play a row.
+			catalogResourceHandler.SetVersionPlayability(playbackHandler)
 		}
 	}
 

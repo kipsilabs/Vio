@@ -1001,6 +1001,21 @@ export interface VersionSourceMismatch {
   declared_bytes: number;
 }
 
+/**
+ * Whether this client can play a version, as the server's planner decided with
+ * the client's own capability block. `playable: false` is a terminal the start
+ * would repeat, so a picker must not offer the row; an absent verdict means
+ * unknown and keeps the row selectable.
+ */
+export interface VersionPlayability {
+  playable: boolean;
+  /** The start path's terminal reason when playable is false, for example
+   *  `hdr_transcode_unsupported`. */
+  reason?: string;
+  /** The start path's user-facing terminal message when playable is false. */
+  message?: string;
+}
+
 export interface FileVersion {
   file_id: number;
   file_name?: string;
@@ -1032,6 +1047,10 @@ export interface FileVersion {
    *  this never accompanies `failed`. Populated by versions/check while the
    *  server still holds the short wrong-source verdict. */
   source_mismatch?: VersionSourceMismatch;
+  /** Whether this client can play the version. Absent means unknown (not
+   *  checked, or the pass could not finish), never unplayable. Populated by
+   *  versions/check when the request carries a client capability block. */
+  playability?: VersionPlayability;
   /** RFC 3339 instant in UTC when the file was probed. */
   probed_at?: string;
   added_at?: string;
@@ -1103,6 +1122,9 @@ export interface VersionLivenessResult {
    *  the row declares. Advisory only: it never implies failed, and the release
    *  stays available. Absent while no recent verdict is held. */
   source_mismatch?: VersionSourceMismatch;
+  /** Client-specific playability from the check. Absent when the request sent
+   *  no client capability block or the pass could not finish. */
+  playability?: VersionPlayability;
 }
 
 export interface VersionLivenessResponse {
