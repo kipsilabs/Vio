@@ -378,6 +378,25 @@ function fireFrameTimeUpdate(video: HTMLVideoElement) {
   else Reflect.deleteProperty(video, "readyState");
 }
 
+/**
+ * Records every write to the element's clock. jsdom has no media pipeline, so
+ * a seek never fires `seeking`; counting the writes is how a test sees the one
+ * seek a transport start issues.
+ */
+function countClockWrites(video: HTMLVideoElement): number[] {
+  const writes: number[] = [];
+  let current = video.currentTime;
+  Object.defineProperty(video, "currentTime", {
+    configurable: true,
+    get: () => current,
+    set: (next: number) => {
+      current = next;
+      writes.push(next);
+    },
+  });
+  return writes;
+}
+
 function setMediaError(video: HTMLVideoElement, message: string, code = 3) {
   Object.defineProperty(video, "error", {
     configurable: true,
@@ -4429,6 +4448,22 @@ describe("VideoPlayer source timeline", () => {
         expect(video.currentTime).toBe(0);
         fireFrameTimeUpdate(video);
         expect(controls.current!.currentTime).toBe(720);
+      });
+
+      it("keeps a seek replacement's start on the seek path, not the replacement start", async () => {
+        const { video, rerenderPlayer } = await seekDuringReplan();
+        const writes = countClockWrites(video);
+
+        newStream(rerenderPlayer, progressivePlan);
+        await waitFor(() => expect(video.src).toContain("revision=2"));
+
+        // The seek target, written before metadata, is the transport's start.
+        expect(writes).toEqual([596]);
+        fireEvent.loadedMetadata(video);
+        // A seek reanchor does not pick up the replacement-start path, so its
+        // start is not applied a second time once metadata arrives.
+        expect(writes).toEqual([596]);
+        expect(video.currentTime).toBe(596);
       });
     });
 
@@ -8787,6 +8822,18 @@ describe("VideoPlayer transport identity", () => {
     });
     await waitFor(() => expect(video.getAttribute("src")).toContain("audio=1"));
 
+    // The new stream's load algorithm runs, and the element's clock restarts at
+    // the stream's own first frame: the copy's anchor keyframe at source 10 s.
+    Object.defineProperty(video, "currentTime", {
+      configurable: true,
+      writable: true,
+      value: 0,
+    });
+    Object.defineProperty(video, "readyState", {
+      configurable: true,
+      value: HTMLMediaElement.HAVE_METADATA,
+    });
+    fireEvent.loadedMetadata(video);
     Object.defineProperty(video, "readyState", {
       configurable: true,
       value: HTMLMediaElement.HAVE_FUTURE_DATA,
@@ -8798,10 +8845,13 @@ describe("VideoPlayer transport identity", () => {
     Object.defineProperty(video, "paused", { configurable: true, value: false });
     fireEvent.play(video);
     expect(video.paused).toBe(false);
-    // The plan's player clock starts at the request-time baseline (source 12 s
-    // on a transport whose zero is 10 s), not at the outgoing element's
-    // position plus however long the replan took.
-    expect(video.currentTime).toBe(2);
+    // The replacement did not inherit the outgoing element's 4.8 s: a
+    // progressive remux is generated at the plan's own start, so the first
+    // frame presented is its copied pre-roll. The element cannot seek that
+    // forward-only response, so the position the plan asked for is the
+    // transport's baseline (source 10 s of pre-roll before source 12 s), not
+    // the outgoing playhead plus the replan's fetch and probe time.
+    expect(video.currentTime).toBe(0);
     expect(controls.current?.playing).toBe(true);
   });
 
