@@ -17,6 +17,7 @@ import (
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary/resolver"
 )
@@ -47,6 +48,14 @@ const (
 	// 90 s chain budget, and a client that opted in is better served by
 	// declared metadata after 5 s than by an unbounded wait.
 	versionCheckPreprobeBudget = 5 * time.Second
+	// versionCheckPlayabilityBudget bounds the client-specific playability
+	// pass over the batch. It runs after the liveness budget because the two
+	// answer different questions: liveness resolves provider pins, while
+	// playability plans the already-loaded rows against the client's own
+	// capability block. It gets its own bound so a slow provider listing
+	// cannot make every row look unplayable, and an exhausted pass leaves
+	// verdicts absent (unknown) instead of turning them into refusals.
+	versionCheckPlayabilityBudget = 2 * time.Second
 )
 
 // The single-file inventory mode reports how much of a version's track
@@ -119,6 +128,40 @@ type VersionCheckResult struct {
 	// pointer so the batched answer keeps its exact previous shape and value
 	// semantics.
 	Inventory *VersionCheckInventory `json:"inventory,omitempty"`
+	// Playability is the client-specific verdict: whether the planner would
+	// play this row for the capability block that accompanied the request.
+	// Absent means the caller sent no client capabilities or the pass could
+	// not run, which callers must read as unknown, never as unplayable.
+	Playability *VersionPlayability `json:"playability,omitempty"`
+}
+
+// VersionPlayability is one version's client-specific playability verdict. A
+// false Playable is a terminal refusal the start path would repeat: the row is
+// guaranteed to fail for this client, so a picker must not offer it. Retryable
+// refusals and capability probes that did not finish are deliberately absent
+// rather than false: those rows stay selectable and the start path retries
+// them.
+type VersionPlayability struct {
+	Playable bool   `json:"playable"`
+	Reason   string `json:"reason,omitempty"`
+	Message  string `json:"message,omitempty"`
+}
+
+// VersionPlayabilityClient is the client half of a playback start, carried on
+// the versions check so the same planner the start uses can judge each row.
+// It reuses the start's capability types rather than inventing a second notion
+// of client capability.
+type VersionPlayabilityClient struct {
+	ClientFeatures  []string
+	Capabilities    playback.ClientCodecCapabilitiesV3
+	PlaybackContext playback.ClientPlaybackContextV3
+}
+
+// VersionPlayabilityEvaluator plans already-loaded version rows against a
+// client's capabilities. *PlaybackHandler implements it with the production
+// planner, settings, transformation registry and DV probe seams.
+type VersionPlayabilityEvaluator interface {
+	EvaluateVersionPlayability(ctx context.Context, files []*models.MediaFile, client VersionPlayabilityClient) map[int]VersionPlayability
 }
 
 // VersionCheckInventory is the track inventory the versions check's single-file
@@ -256,6 +299,20 @@ func (h *CatalogResourceHandler) HandleCheckVersions(w http.ResponseWriter, r *h
 // concurrency, timeout and stamping rules and never fails the whole batch on
 // one file.
 func (h *CatalogResourceHandler) CheckVersions(ctx context.Context, fileIDs []int) []VersionCheckResult {
+	return h.checkVersions(ctx, fileIDs, nil, true)
+}
+
+// CheckVersionsWithPlayability is the versions check with a client capability
+// block. It reports the ordinary liveness verdict for every row and, when
+// resolveLiveness is false, the durable health signal only: playability is
+// planned from the loaded row, so a pass that exists to judge whether the
+// client could play it never resolves a provider pin just to answer. Callers
+// that need both pass resolveLiveness=true.
+func (h *CatalogResourceHandler) CheckVersionsWithPlayability(ctx context.Context, fileIDs []int, client VersionPlayabilityClient, resolveLiveness bool) []VersionCheckResult {
+	return h.checkVersions(ctx, fileIDs, &client, resolveLiveness)
+}
+
+func (h *CatalogResourceHandler) checkVersions(ctx context.Context, fileIDs []int, client *VersionPlayabilityClient, resolveLiveness bool) []VersionCheckResult {
 	ctx, cancel := context.WithTimeout(ctx, versionCheckOverallBudget)
 	defer cancel()
 
@@ -269,7 +326,7 @@ func (h *CatalogResourceHandler) CheckVersions(ctx context.Context, fileIDs []in
 		}
 		id := id
 		eg.Go(func() error {
-			outcome := h.checkVersion(egCtx, id)
+			outcome := h.checkVersion(egCtx, id, resolveLiveness)
 			mu.Lock()
 			outcomes = append(outcomes, outcome)
 			mu.Unlock()
@@ -293,6 +350,7 @@ func (h *CatalogResourceHandler) CheckVersions(ctx context.Context, fileIDs []in
 	for _, id := range toStamp {
 		stampByID[id] = struct{}{}
 	}
+	playability := h.versionPlayabilityFor(ctx, final, client)
 	results := make([]VersionCheckResult, 0, len(final))
 	for _, outcome := range final {
 		stamped := false
@@ -306,14 +364,42 @@ func (h *CatalogResourceHandler) CheckVersions(ctx context.Context, fileIDs []in
 				stamped = h.stampVirtualCandidateFailed(postCtx, outcome.fileID, outcome.file)
 			}
 		}
-		results = append(results, VersionCheckResult{
+		result := VersionCheckResult{
 			FileID:         outcome.fileID,
 			Available:      outcome.available,
 			Failed:         versionCheckFailed(outcome, stamped),
 			SourceMismatch: outcome.sourceMismatch,
-		})
+		}
+		if verdict, ok := playability[outcome.fileID]; ok {
+			result.Playability = &verdict
+		}
+		results = append(results, result)
 	}
 	return results
+}
+
+// versionPlayabilityFor plans the batch's authorized rows against the client
+// that asked. It runs on its own deadline because the liveness budget above is
+// spent on provider resolution; a pass that does not finish leaves verdicts
+// absent, which callers read as unknown. An unrepresentable client capability
+// block or an unwired evaluator leaves the map nil, preserving the liveness
+// answer exactly as it was.
+func (h *CatalogResourceHandler) versionPlayabilityFor(ctx context.Context, outcomes []versionCheckOutcome, client *VersionPlayabilityClient) map[int]VersionPlayability {
+	if h == nil || h.VersionPlayability == nil || client == nil {
+		return nil
+	}
+	files := make([]*models.MediaFile, 0, len(outcomes))
+	for _, outcome := range outcomes {
+		if outcome.file != nil {
+			files = append(files, outcome.file)
+		}
+	}
+	if len(files) == 0 {
+		return nil
+	}
+	playCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), versionCheckPlayabilityBudget)
+	defer cancel()
+	return h.VersionPlayability.EvaluateVersionPlayability(playCtx, files, *client)
 }
 
 // CheckVersionsWithInventory is the versions check's single-file inventory
@@ -396,7 +482,7 @@ func versionCheckInventoryProvenance(file *models.MediaFile, status VirtualPrepr
 // Ambiguous provider errors (timeout, network, resolver not configured) leave
 // the stamp unchanged and report the row's current computed availability, so
 // a provider outage cannot mass-tag versions as dead.
-func (h *CatalogResourceHandler) checkVersion(ctx context.Context, fileID int) versionCheckOutcome {
+func (h *CatalogResourceHandler) checkVersion(ctx context.Context, fileID int, resolveLiveness bool) versionCheckOutcome {
 	outcome := versionCheckOutcome{fileID: fileID}
 	if h == nil || h.FileResolver == nil {
 		return outcome
@@ -415,6 +501,18 @@ func (h *CatalogResourceHandler) checkVersion(ctx context.Context, fileID int) v
 	outcome.file = file
 	outcome.durableAlive = file.FailedAt == nil
 	outcome.sourceMismatch = versionCheckSourceMismatchFor(file)
+	if !resolveLiveness {
+		// Playability-only mode: the row's durable health is the whole
+		// liveness answer. Resolving a virtual pin proves the provider still
+		// lists it, not that this client could play it, and a provider pass
+		// would multiply the batch's cost for a verdict about the client.
+		if isVirtualPlaybackFile(file) {
+			outcome.available = outcome.durableAlive
+		} else {
+			outcome.available = file.MissingSince == nil
+		}
+		return outcome
+	}
 	if !isVirtualPlaybackFile(file) {
 		outcome.available = file.MissingSince == nil
 		return outcome

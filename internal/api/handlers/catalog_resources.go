@@ -31,7 +31,12 @@ type CatalogResourceHandler struct {
 	ItemAccess               PlaybackItemAccessChecker
 	EpisodeLookup            PlaybackEpisodeLookup
 	ExtraLookup              PlaybackExtraLookup
-	watchlistPromoter        WatchlistItemPromoter
+	// VersionPlayability judges each loaded version row against the client
+	// capability block on the versions check. Nil leaves playability absent,
+	// which clients read as unknown; *PlaybackHandler implements it with the
+	// same planner a start uses.
+	VersionPlayability VersionPlayabilityEvaluator
+	watchlistPromoter  WatchlistItemPromoter
 }
 
 // WatchlistItemPromoter moves the profile's watchlist entry for a title the
@@ -53,6 +58,15 @@ func (h *CatalogResourceHandler) SetWatchlistPromoter(p WatchlistItemPromoter) {
 // NewCatalogResourceHandler creates a new canonical catalog resource handler.
 func NewCatalogResourceHandler(items *ItemsHandler) *CatalogResourceHandler {
 	return &CatalogResourceHandler{items: items}
+}
+
+// SetVersionPlayability wires the client-specific playability pass onto the
+// versions check. Nil keeps the check's existing liveness-only answer.
+func (h *CatalogResourceHandler) SetVersionPlayability(e VersionPlayabilityEvaluator) {
+	if h == nil {
+		return
+	}
+	h.VersionPlayability = e
 }
 
 func (h *CatalogResourceHandler) HandleGetItemDetail(w http.ResponseWriter, r *http.Request) {

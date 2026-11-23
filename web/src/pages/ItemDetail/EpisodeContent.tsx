@@ -58,7 +58,19 @@ import { isEpisodeUnwatched } from "@/lib/episodeSpoilers";
 import { buildItemHref } from "@/lib/mediaNavigation";
 import { formatRuntimeMinutes } from "@/lib/mediaFormat";
 import { useQualityPreference } from "@/hooks/queries/qualityPreference";
-import { applyVersionAvailability, useVersionLiveness } from "@/hooks/queries/versionLiveness";
+import {
+  applyVersionAvailability,
+  applyVersionPlayability,
+  useVersionLiveness,
+  useVersionPlayability,
+} from "@/hooks/queries/versionLiveness";
+import { useCodecDetection } from "@/player/hooks/useCodecDetection";
+import { useBrowserEngineCapabilities } from "@/player/hooks/useBrowserEngine";
+import {
+  buildClientCapabilitiesV3,
+  buildClientPlaybackContextV3,
+} from "@/player/client-context-v3";
+import { VIDEO_CLIENT_FEATURES_V3 } from "@/player/playback-session-wire-v3";
 import { CalendarClock } from "lucide-react";
 import {
   formatCalendarDate,
@@ -98,6 +110,22 @@ export default function EpisodeContent({
   // picker writes; the profile column it falls back to is only the pre-cutover
   // choice, since that picker no longer mirrors into it.
   const qualityPreference = useQualityPreference(currentProfile?.quality_preference);
+  // The same capability surface a playback start sends, so the versions check
+  // can judge each row with the production planner before the viewer picks.
+  const capabilityProbe = useCodecDetection();
+  const browserEngine = useBrowserEngineCapabilities();
+  const playabilityClient = useMemo(
+    () => ({
+      features: VIDEO_CLIENT_FEATURES_V3,
+      // The web decode engine adds codecs and a managed HDR range to the
+      // original_http class. Include it so the verdict cannot call a row
+      // unplayable that the player would actually decode.
+      capabilities: buildClientCapabilitiesV3(capabilityProbe, browserEngine.capabilities),
+      playbackContext: buildClientPlaybackContextV3(capabilityProbe, browserEngine.capabilities),
+    }),
+    [capabilityProbe, browserEngine.capabilities],
+  );
+  const playabilityReady = capabilityProbe.settled && browserEngine.settled;
   const canCurateMetadata = canCurateMetadataForUser(user, currentProfile);
   const canEditMarkers = canEditMarkersForUser(user, currentProfile);
   const [editOpen, setEditOpen] = useState(false);
@@ -195,9 +223,22 @@ export default function EpisodeContent({
     [defaultSelectedVersion, item.versions, versionPickersOpened],
   );
   const versionLiveness = useVersionLiveness(livenessVersions, true);
-  const versionsWithLiveness = useMemo(
-    () => applyVersionAvailability(sortedVersions, versionLiveness),
-    [sortedVersions, versionLiveness],
+  // A cheap, provider-free pass over every row: the picker must know which
+  // rows this client can play before it offers them, and the default row must
+  // not be an unplayable one. It only adds the playability verdict; liveness
+  // above stays the authority for `available`/`failed`.
+  const versionPlayability = useVersionPlayability(
+    item.versions ?? [],
+    playabilityClient,
+    playabilityReady,
+  );
+  const versionsWithPlayability = useMemo(
+    () =>
+      applyVersionPlayability(
+        applyVersionAvailability(sortedVersions, versionLiveness),
+        versionPlayability,
+      ),
+    [sortedVersions, versionLiveness, versionPlayability],
   );
 
   // The device's requested row is the viewer's own pick, ahead of the server's
@@ -212,12 +253,12 @@ export default function EpisodeContent({
   const versionSelection = useMemo(
     () =>
       selectItemVersion(
-        versionsWithLiveness,
+        versionsWithPlayability,
         defaultSelectedVersion,
         persistedSelectedFileId,
         explicitPickFileId,
       ),
-    [defaultSelectedVersion, explicitPickFileId, persistedSelectedFileId, versionsWithLiveness],
+    [defaultSelectedVersion, explicitPickFileId, persistedSelectedFileId, versionsWithPlayability],
   );
   const selectedVersion = versionSelection.version;
   const versionFallback = versionSelection.fallback;
@@ -556,7 +597,7 @@ export default function EpisodeContent({
                   ? () => openMediaInfo()
                   : undefined
               }
-              versions={versionsWithLiveness}
+              versions={versionsWithPlayability}
               playbackVariants={item.playback_variants}
               selectedVersion={selectedVersion}
               versionFallback={versionFallback}
