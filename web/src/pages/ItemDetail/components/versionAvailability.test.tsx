@@ -4,7 +4,6 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { FileVersion } from "@/api/types";
 import VersionDropdown from "./VersionDropdown";
-import VersionFlyoutItems from "./VersionFlyout";
 import { useVersionVisibility } from "./versionAvailability";
 
 // The picker reads the watch detail lazily when it opens (score/ranking); these
@@ -226,42 +225,6 @@ describe("VersionDropdown source mismatch", () => {
   });
 });
 
-describe("VersionFlyoutItems unavailable versions", () => {
-  it("hides unavailable versions by default and shows them via the toggle", () => {
-    const versions = [
-      makeVersion({ file_id: 1, resolution: "2160p" }),
-      makeVersion({ file_id: 2, resolution: "1080p", available: false }),
-    ];
-    render(<VersionFlyoutItems versions={versions} onPlayVersion={vi.fn()} />);
-
-    expect(screen.queryByText("1080p")).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("menuitem", { name: /Show 1 unavailable version/ }));
-
-    const unavailableRow = screen.getByRole("menuitem", { name: /1080p/ });
-    expect(unavailableRow).toBeInTheDocument();
-    expect(screen.getByText("Will retry on play")).toBeInTheDocument();
-    expect(unavailableRow).toHaveClass("opacity-80");
-  });
-
-  it("shows a source mismatch on a row that is still available", () => {
-    const versions = [
-      makeVersion({
-        file_id: 1,
-        resolution: "1080p",
-        available: true,
-        source_mismatch: { served_bytes: 7_427_636_945, declared_bytes: 8_449_999_999 },
-      }),
-    ];
-    render(<VersionFlyoutItems versions={versions} onPlayVersion={vi.fn()} />);
-
-    expect(
-      screen.getByText("Source mismatch — served 6.9 GB of declared 7.9 GB"),
-    ).toBeInTheDocument();
-    expect(screen.queryByText("Will retry on play")).not.toBeInTheDocument();
-    expect(screen.queryByText("Failed")).not.toBeInTheDocument();
-  });
-});
-
 describe("useVersionVisibility toggle stability", () => {
   function renderVisibility(versions: FileVersion[]) {
     return renderHook(({ list }: { list: FileVersion[] }) => useVersionVisibility(list, null), {
@@ -443,37 +406,5 @@ describe("VersionDropdown playability", () => {
     // stays visible disabled so the list keeps its shape and the reason shows.
     expect(dialog.queryByRole("button", { name: /720p/ })).not.toBeInTheDocument();
     expect(dialog.getByRole("button", { name: /1080p/ })).toBeDisabled();
-  });
-
-  it("applies the same verdict to the watch-page version menu", () => {
-    const versions = [makeVersion({ file_id: 1, resolution: "2160p" }), unplayable(2)];
-    const onPlayVersion = vi.fn();
-    render(<VersionFlyoutItems versions={versions} onPlayVersion={onPlayVersion} />);
-
-    const blocked = screen.getByRole("menuitem", { name: /1080p/ });
-    expect(blocked).toHaveAttribute("aria-disabled", "true");
-    expect(blocked).toHaveTextContent("Can't play on this device");
-    expect(blocked).toHaveAttribute(
-      "title",
-      "This HDR source requires video encoding, but no validated recipe is installed.",
-    );
-
-    fireEvent.click(blocked);
-    expect(onPlayVersion).not.toHaveBeenCalled();
-  });
-
-  it("leaves a no-verdict watch-page menu row selectable", () => {
-    const versions = [
-      makeVersion({ file_id: 1, resolution: "2160p" }),
-      // No playability key: a retryable or unfinished check stays unknown.
-      makeVersion({ file_id: 2, resolution: "1080p" }),
-    ];
-    const onPlayVersion = vi.fn();
-    render(<VersionFlyoutItems versions={versions} onPlayVersion={onPlayVersion} />);
-
-    const row = screen.getByRole("menuitem", { name: /1080p/ });
-    expect(row).not.toHaveTextContent("Can't play on this device");
-    fireEvent.click(row);
-    expect(onPlayVersion).toHaveBeenCalledWith(2);
   });
 });

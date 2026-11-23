@@ -64,13 +64,7 @@ import {
   useVersionLiveness,
   useVersionPlayability,
 } from "@/hooks/queries/versionLiveness";
-import { useCodecDetection } from "@/player/hooks/useCodecDetection";
-import { useBrowserEngineCapabilities } from "@/player/hooks/useBrowserEngine";
-import {
-  buildClientCapabilitiesV3,
-  buildClientPlaybackContextV3,
-} from "@/player/client-context-v3";
-import { VIDEO_CLIENT_FEATURES_V3 } from "@/player/playback-session-wire-v3";
+import { useVersionPlayabilityClient } from "@/hooks/queries/versionPlayabilityClient";
 import { CalendarClock } from "lucide-react";
 import {
   formatCalendarDate,
@@ -112,20 +106,7 @@ export default function EpisodeContent({
   const qualityPreference = useQualityPreference(currentProfile?.quality_preference);
   // The same capability surface a playback start sends, so the versions check
   // can judge each row with the production planner before the viewer picks.
-  const capabilityProbe = useCodecDetection();
-  const browserEngine = useBrowserEngineCapabilities();
-  const playabilityClient = useMemo(
-    () => ({
-      features: VIDEO_CLIENT_FEATURES_V3,
-      // The web decode engine adds codecs and a managed HDR range to the
-      // original_http class. Include it so the verdict cannot call a row
-      // unplayable that the player would actually decode.
-      capabilities: buildClientCapabilitiesV3(capabilityProbe, browserEngine.capabilities),
-      playbackContext: buildClientPlaybackContextV3(capabilityProbe, browserEngine.capabilities),
-    }),
-    [capabilityProbe, browserEngine.capabilities],
-  );
-  const playabilityReady = capabilityProbe.settled && browserEngine.settled;
+  const { client: playabilityClient, ready: playabilityReady } = useVersionPlayabilityClient();
   const canCurateMetadata = canCurateMetadataForUser(user, currentProfile);
   const canEditMarkers = canEditMarkersForUser(user, currentProfile);
   const [editOpen, setEditOpen] = useState(false);
