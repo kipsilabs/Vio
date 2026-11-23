@@ -30,6 +30,7 @@ import {
   mergeVersionLiveness,
   resetVersionLivenessCache,
   useVersionLiveness,
+  type VersionPlayabilityClient,
 } from "./versionLiveness";
 
 function makeVersion(overrides: Partial<FileVersion> = {}): FileVersion {
@@ -104,6 +105,59 @@ describe("fetchVersionLiveness", () => {
           source_mismatch: { served_bytes: 42, declared_bytes: 64 },
         },
       ],
+    });
+  });
+
+  it("sends the client block in playability mode and maps the terminal verdict", async () => {
+    const client: VersionPlayabilityClient = {
+      features: ["playback_plan_v3"],
+      capabilities: {
+        video_evidence: "declared",
+        audio_evidence: "declared",
+        codecs_video: ["h264"],
+        codecs_video_hardware: ["h264"],
+        codecs_audio: ["aac"],
+        containers: ["mp4"],
+        hdr: false,
+      },
+      playbackContext: {
+        protocol_version: 3,
+        form_factor: "web",
+        app_version: "web",
+        device: { platform: "web" },
+        output: {},
+        deliveries: {},
+      },
+    };
+    mocks.v2.mockResolvedValue({
+      results: [
+        {
+          file_id: "40",
+          available: true,
+          playability: {
+            playable: false,
+            reason: "hdr_transcode_unsupported",
+            message: "No HDR recipe",
+          },
+        },
+      ],
+    });
+
+    const response = await fetchVersionLiveness([40], { client, playabilityOnly: true });
+
+    expect(mocks.v2).toHaveBeenCalledWith("POST /api/v2/catalog/versions/check", {
+      body: {
+        file_ids: ["40"],
+        playability_only: true,
+        client_features: ["playback_plan_v3"],
+        client_capabilities: client.capabilities,
+        client_playback_context: client.playbackContext,
+      },
+    });
+    expect(response.results[0]?.playability).toEqual({
+      playable: false,
+      reason: "hdr_transcode_unsupported",
+      message: "No HDR recipe",
     });
   });
 });

@@ -21,7 +21,12 @@ import {
   subtitleLanguageLabels,
 } from "./versionFormatUtils";
 import { audioScore, resolutionScore } from "./versionRankingUtils";
-import { isVersionUnavailable, useVersionVisibility } from "./versionAvailability";
+import {
+  isVersionUnavailable,
+  isVersionUnplayable,
+  useVersionVisibility,
+  versionPlayabilityBadge,
+} from "./versionAvailability";
 import { deriveVersionHealth } from "@/lib/versionHealth";
 
 export { buildQualitySummary };
@@ -83,13 +88,22 @@ export default function VersionFlyoutItems({ versions, onPlayVersion }: VersionF
           version.container === "virtual" ||
           Boolean(version.file_path?.toLowerCase().startsWith("virtual://"));
         const unavailable = isVersionUnavailable(version);
+        const playability = versionPlayabilityBadge(version);
+        const unplayable = isVersionUnplayable(version);
         const health = deriveVersionHealth(version);
 
         return (
           <DropdownMenuItem
             key={version.file_id}
-            className={`flex items-center gap-3 rounded-lg py-2.5 ${unavailable ? "opacity-80" : ""}`}
-            onSelect={() => onPlayVersion(version.file_id)}
+            disabled={unplayable}
+            title={playability?.title}
+            className={`flex items-center gap-3 rounded-lg py-2.5 ${
+              unplayable ? "opacity-60" : unavailable ? "opacity-80" : ""
+            }`}
+            onSelect={() => {
+              if (unplayable) return;
+              onPlayVersion(version.file_id);
+            }}
           >
             <span className="bg-accent/70 flex size-7 shrink-0 items-center justify-center rounded-full">
               {isMoreAction ? (
@@ -110,6 +124,15 @@ export default function VersionFlyoutItems({ versions, onPlayVersion }: VersionF
                       className="shrink-0 px-1.5 py-0 text-[10px] font-medium"
                     >
                       Virtual
+                    </Badge>
+                  )}
+                  {playability && (
+                    <Badge
+                      variant="outline"
+                      title={playability.title}
+                      className="shrink-0 border-red-500/30 bg-red-500/15 px-1.5 py-0 text-[10px] font-medium text-red-600 dark:text-red-300"
+                    >
+                      {playability.label}
                     </Badge>
                   )}
                   {health && (

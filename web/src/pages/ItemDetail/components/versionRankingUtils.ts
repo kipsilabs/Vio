@@ -229,7 +229,7 @@ export function selectDefaultVersion(
 }
 
 /** Why the item page could not keep the version row it preferred. */
-export type VersionFallbackReason = "unlisted" | "failed" | "unavailable";
+export type VersionFallbackReason = "unlisted" | "failed" | "unavailable" | "unplayable";
 
 /** The row Play will start, and why a different row than the preferred one. */
 export interface ItemVersionSelection {
@@ -247,10 +247,19 @@ export interface ItemVersionSelection {
 }
 
 function versionPlayable(version: FileVersion): boolean {
-  return version.failed !== true && version.available !== false;
+  // The playability verdict is a terminal the start would repeat. An absent
+  // verdict is unknown, not unplayable, so the row stays selectable.
+  return (
+    version.failed !== true &&
+    version.available !== false &&
+    version.playability?.playable !== false
+  );
 }
 
 function unplayableReason(version: FileVersion): VersionFallbackReason {
+  if (version.playability?.playable === false) {
+    return "unplayable";
+  }
   return version.failed === true ? "failed" : "unavailable";
 }
 
@@ -287,7 +296,27 @@ export function selectItemVersion(
       ? versions.find((version) => version.file_id === explicitPickId)
       : undefined;
   if (explicitPick) {
-    return { version: explicitPick, fallback: null };
+    // A failed or transiently unavailable explicit pick is kept: the existing
+    // contract is that Play re-links it. Only a capability verdict is
+    // different — retrying cannot help, so the page must not send Play into a
+    // terminal it already knows.
+    if (explicitPick.playability?.playable !== false) {
+      return { version: explicitPick, fallback: null };
+    }
+    // Say what was skipped and start a row that can play instead; the picker
+    // keeps the skipped row visible.
+    const replacement =
+      versions.find(
+        (version) => version.file_id !== explicitPick.file_id && versionPlayable(version),
+      ) ?? null;
+    return {
+      version: replacement ?? explicitPick,
+      fallback: {
+        reason: unplayableReason(explicitPick),
+        skipped: explicitPick,
+        selected: replacement ?? explicitPick,
+      },
+    };
   }
   const persisted =
     persistedFileId != null

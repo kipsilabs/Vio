@@ -25,6 +25,7 @@ function makeVersion(overrides: Partial<FileVersion> = {}): FileVersion {
     subtitle_tracks: overrides.subtitle_tracks,
     available: overrides.available,
     failed: overrides.failed,
+    playability: overrides.playability,
   };
 }
 
@@ -292,5 +293,34 @@ describe("selectItemVersion", () => {
       skipped: expect.objectContaining({ file_id: failedA.file_id }),
       selected: expect.objectContaining({ file_id: failedA.file_id }),
     });
+  });
+
+  it("moves off an explicit pick the planner refused terminally and says why", () => {
+    const blocked = makeVersion({
+      file_id: 6,
+      playability: { playable: false, reason: "hdr_transcode_unsupported" },
+    });
+    const selection = selectItemVersion(
+      [listed, blocked],
+      blocked,
+      blocked.file_id,
+      blocked.file_id,
+    );
+    expect(selection.version?.file_id).toBe(listed.file_id);
+    expect(selection.fallback).toMatchObject({
+      reason: "unplayable",
+      skipped: expect.objectContaining({ file_id: blocked.file_id }),
+      selected: expect.objectContaining({ file_id: listed.file_id }),
+    });
+  });
+
+  it("keeps a row with no playability verdict selectable", () => {
+    const unknown = makeVersion({
+      file_id: 7,
+      playability: undefined,
+    });
+    const selection = selectItemVersion([unknown, other], unknown, unknown.file_id);
+    expect(selection.version?.file_id).toBe(unknown.file_id);
+    expect(selection.fallback).toBeNull();
   });
 });

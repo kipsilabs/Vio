@@ -716,15 +716,33 @@ describe("EpisodeContent", () => {
         ),
       );
 
-      const livenessRequests = requests.filter((request) =>
+      const checkRequests = requests.filter((request) =>
         request.path.endsWith("/catalog/versions/check"),
       );
-      expect(livenessRequests).toHaveLength(1);
-      expect(livenessRequests[0]).toMatchObject({
+      // The liveness check names the row set; the detail page also runs the
+      // cheap playability pass, which carries the client block and skips the
+      // provider resolution.
+      const livenessRequest = checkRequests.find(
+        (request) =>
+          (request.body as { playability_only?: boolean } | undefined)?.playability_only !== true,
+      );
+      expect(livenessRequest).toMatchObject({
         path: "/api/v2/catalog/versions/check",
         method: "POST",
         body: { file_ids: ["11"] },
       });
+      // The playability pass waits for the capability probe to settle, so it
+      // may land after the liveness request.
+      await waitFor(() =>
+        expect(
+          requests.some(
+            (request) =>
+              request.path.endsWith("/catalog/versions/check") &&
+              (request.body as { playability_only?: boolean } | undefined)?.playability_only ===
+                true,
+          ),
+        ).toBe(true),
+      );
       expect(requests.some((request) => request.path.startsWith("/api/v1/"))).toBe(false);
     });
   });

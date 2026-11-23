@@ -13,6 +13,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/api/handlers"
 	catalogpkg "github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/playback"
 )
 
 // fakeVersionCheck records the IDs the v2 adapter forwarded to the shared
@@ -381,5 +382,87 @@ func TestCatalogVersionsReadWarmsVirtualListings(t *testing.T) {
 	}
 	if len(warm.versions) != 1 || warm.versions[0].FileID != 120 {
 		t.Fatalf("warmed versions = %+v", warm.versions)
+	}
+}
+
+// fakePlayabilityVersionCheck records the client block the adapter forwarded
+// and answers the client-aware mode with a fixed verdict.
+type fakePlayabilityVersionCheck struct {
+	fakeVersionCheck
+	client          handlers.VersionPlayabilityClient
+	resolveLiveness bool
+	playability     map[int]handlers.VersionPlayability
+}
+
+func (f *fakePlayabilityVersionCheck) CheckVersionsWithPlayability(_ context.Context, fileIDs []int, client handlers.VersionPlayabilityClient, resolveLiveness bool) []handlers.VersionCheckResult {
+	f.ids = append([]int(nil), fileIDs...)
+	f.client = client
+	f.resolveLiveness = resolveLiveness
+	results := make([]handlers.VersionCheckResult, 0, len(fileIDs))
+	for _, id := range fileIDs {
+		result := handlers.VersionCheckResult{FileID: id, Available: true}
+		if verdict, ok := f.playability[id]; ok {
+			result.Playability = &verdict
+		}
+		results = append(results, result)
+	}
+	return results
+}
+
+// TestCheckCatalogVersionsPlayabilityMode pins the additive client-aware mode:
+// the body's capability block reaches the seam, playability_only skips the
+// provider pass, and the terminal reason is projected onto the row.
+func TestCheckCatalogVersionsPlayabilityMode(t *testing.T) {
+	deps, _ := catalogDeps(t)
+	seam := &fakePlayabilityVersionCheck{
+		playability: map[int]handlers.VersionPlayability{
+			42: {Playable: false, Reason: playback.TerminalHDRTranscodeUnsupportedV3, Message: "no HDR recipe"},
+			43: {Playable: true},
+		},
+	}
+	deps.CatalogVersionsCheck = seam
+	h := newTestHandler(t, deps)
+
+	body := `{"file_ids":["42","43"],"playability_only":true,` +
+		`"client_features":["playback_plan_v3"],` +
+		`"client_capabilities":{"video_evidence":"declared","audio_evidence":"declared","codecs_video":["h264"],"codecs_video_hardware":["h264"],"codecs_audio":["aac"],"containers":["mp4"],"hdr":false},` +
+		`"client_playback_context":{"protocol_version":3,"form_factor":"tv","app_version":"test","device":{"platform":"web"},"output":{},` +
+		`"deliveries":{"original_http":{"enabled":true,"supported_on_device":true,"containers":["mp4"],"video_codecs":["h264"],"audio_decode_codecs":["aac"],"audio_passthrough_codecs":[],` +
+		`"subtitles":{"embedded_text":true,"sidecar_text":true,"ass_styling":true,"embedded_bitmap":true,"sidecar_bitmap":false,"font_attachments":true},` +
+		`"features":[],"auth_header_refresh":false,"validated_claims":[],"transformations":[]}}}}`
+	rec := do(t, h, http.MethodPost, Prefix+"/catalog/versions/check", body, viewerHeaders())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if seam.resolveLiveness {
+		t.Fatal("playability_only still resolved provider pins")
+	}
+	if seam.client.Capabilities.VideoEvidence != playback.EvidenceDeclaredV3 {
+		t.Fatalf("forwarded capabilities = %+v", seam.client.Capabilities)
+	}
+	if seam.client.PlaybackContext.FormFactor != "tv" || len(seam.client.ClientFeatures) != 1 {
+		t.Fatalf("forwarded client = %+v", seam.client)
+	}
+
+	var answer struct {
+		Results []struct {
+			FileID      string `json:"file_id"`
+			Playability *struct {
+				Playable bool   `json:"playable"`
+				Reason   string `json:"reason"`
+				Message  string `json:"message"`
+			} `json:"playability"`
+		} `json:"results"`
+	}
+	decodeJSON(t, rec.Body, &answer)
+	if len(answer.Results) != 2 {
+		t.Fatalf("results = %+v", answer.Results)
+	}
+	blocked := answer.Results[0].Playability
+	if blocked == nil || blocked.Playable || blocked.Reason != playback.TerminalHDRTranscodeUnsupportedV3 || blocked.Message != "no HDR recipe" {
+		t.Fatalf("blocked playability = %+v", blocked)
+	}
+	if playable := answer.Results[1].Playability; playable == nil || !playable.Playable {
+		t.Fatalf("playable verdict = %+v", playable)
 	}
 }

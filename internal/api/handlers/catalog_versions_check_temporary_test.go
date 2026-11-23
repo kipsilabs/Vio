@@ -153,7 +153,7 @@ func TestCheckVersionTemporaryFailureNeverStamps(t *testing.T) {
 				},
 			}
 
-			outcome := h.checkVersion(context.Background(), file.ID)
+			outcome := h.checkVersion(context.Background(), file.ID, true)
 			if outcome.stamp {
 				t.Fatalf("temporary error %v marked the pin for stamping", tc.err)
 			}
@@ -181,7 +181,7 @@ func TestCheckVersionConfirmedDeadStillStamps(t *testing.T) {
 		}),
 	}
 
-	outcome := h.checkVersion(context.Background(), file.ID)
+	outcome := h.checkVersion(context.Background(), file.ID, true)
 	if !outcome.stamp || outcome.available {
 		t.Fatalf("confirmed-dead pin outcome = %#v, want stamp=true available=false", outcome)
 	}
