@@ -273,7 +273,7 @@ func TestPushSenderRegistersRelayOnFirstSendWithoutCredential(t *testing.T) {
 				"deployment_id": "deployment-auto",
 				"api_key":       "auto-capability",
 				"key_prefix":    "cap_v1_auto",
-				"expires_at":    "2026-12-01T00:00:00Z",
+				"expires_at":    "2027-06-01T00:00:00Z",
 			})
 		case relayAppleSendPath:
 			sendAuth = append(sendAuth, r.Header.Get("Authorization"))
@@ -281,6 +281,16 @@ func TestPushSenderRegistersRelayOnFirstSendWithoutCredential(t *testing.T) {
 				RequestID: "relay-request-auto",
 				APNsID:    "apns-auto",
 				Status:    "accepted",
+			})
+		case relayRenewPath:
+			// The registration expires inside the renewal window, so the
+			// first send renews it before sending.
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"request_id":    "renew-request-auto",
+				"deployment_id": "deployment-auto",
+				"api_key":       "auto-capability-renewed",
+				"key_prefix":    "cap_v1_auto",
+				"expires_at":    "2027-06-01T00:00:00Z",
 			})
 		default:
 			t.Fatalf("unexpected relay path %q", r.URL.Path)

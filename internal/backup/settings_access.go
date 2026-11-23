@@ -34,8 +34,11 @@ const (
 var accessSettings = func() map[string]widerFunc {
 	m := map[string]widerFunc{
 		// Who may sign in, and how.
-		settingLocalPasswordLogin:             on,
-		"auth.email_auto_match":               on,
+		settingLocalPasswordLogin: on,
+		"auth.email_auto_match":   on,
+		// Lets accounts that are not admins create API keys, which is a way
+		// in that a restore must not add.
+		"auth.user_api_keys":                  on,
 		"signup.enabled":                      on,
 		"password_reset.self_service_enabled": on,
 		"jellyfin_compat.enabled":             on,
