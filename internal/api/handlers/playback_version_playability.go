@@ -22,6 +22,12 @@ import (
 // selectable and the start retries it. That split keeps an anchor-budget
 // expiry or a provider hiccup from hiding a version that may play on the next
 // attempt.
+//
+// The pass never probes, so it plans with DeclaredFactsOnly: a terminal the
+// row's declared facts already prove (an HDR/DV range this client cannot
+// present with no HDR recipe installed) is reported now, because that same row
+// would come back from the planner as an unknown retryable refusal and the
+// picker would keep offering a version the start refuses.
 func (h *PlaybackHandler) EvaluateVersionPlayability(ctx context.Context, files []*models.MediaFile, client VersionPlayabilityClient) map[int]VersionPlayability {
 	out := make(map[int]VersionPlayability, len(files))
 	if h == nil || len(files) == 0 {
@@ -78,6 +84,11 @@ func (h *PlaybackHandler) EvaluateVersionPlayability(ctx context.Context, files 
 			Registry:        registry,
 			DVRPUStrippable: h.lazyDVRPUStrippableV3(ctx, file),
 			Now:             time.Now(),
+			// This pass never probes: it plans the row the picker already
+			// holds. A terminal the declared facts prove must be reported now,
+			// because a retryable incomplete-metadata refusal would leave the
+			// row selectable and the start would refuse the pick.
+			DeclaredFactsOnly: true,
 		})
 		if capabilityErr != nil {
 			// Tone-map discovery could not complete; the same start would

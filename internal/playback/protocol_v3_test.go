@@ -1217,6 +1217,67 @@ func TestPlanPlaybackV3RejectsTrulyIncompleteVideoMetadata(t *testing.T) {
 	}
 }
 
+// An unprobed HDR/DV row whose client cannot present the source range and
+// whose server has no HDR recipe is already decided by the facts on the row.
+// The planner must answer the start's terminal instead of the retryable
+// metadata refusal, which a version picker reads as unknown (#469).
+func TestPlanPlaybackV3DecidesAnUnprobedHDRRefusalWithoutAProbe(t *testing.T) {
+	file := detailedFixtureFileV3()
+	file.Bitrate = 0
+	file.HDR = true
+	file.VideoTracks[0].BitDepth = 0
+	file.VideoTracks[0].FrameRate = ""
+	file.VideoTracks[0].Bitrate = 0
+	file.VideoTracks[0].VideoRange = "DolbyVision"
+	file.VideoTracks[0].VideoRangeType = "DOVI"
+	req := validStartRequestV3()
+	input := PlannerInputV3{
+		Request: req, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0,
+		Settings: PlannerSettingsV3{TranscodeEnabled: true, Allow4KTranscode: true},
+		Registry: testTransformationRegistryV3(),
+		// The versions check's playability pass cannot probe this row.
+		DeclaredFactsOnly: true,
+	}
+
+	result := PlanPlaybackV3(input)
+	if result.Terminal == nil || result.Terminal.Reason != TerminalHDRTranscodeUnsupportedV3 || result.Terminal.Retryable {
+		t.Fatalf("result = %s", ExplainPlannerResultV3(result))
+	}
+	if result.Terminal.Message == "" || result.Terminal.Detail == "" {
+		t.Fatalf("terminal = %#v, want the planner's message and blocker detail", result.Terminal)
+	}
+
+	// The start path cannot take that shortcut: its probe may still complete
+	// the route, so without DeclaredFactsOnly the same facts keep asking for
+	// the retryable metadata verdict.
+	input.DeclaredFactsOnly = false
+	result = PlanPlaybackV3(input)
+	if result.Terminal == nil || result.Terminal.Reason != "source_metadata_incomplete" || !result.Terminal.Retryable {
+		t.Fatalf("start-path result = %s", ExplainPlannerResultV3(result))
+	}
+
+	// A client that advertises an HDR presentation route could gain one from
+	// the metadata the probe has not written yet (here a Dolby Vision base
+	// layer whose compatibility id the row does not carry). It must stay on
+	// the retryable metadata refusal instead of being refused early.
+	input.DeclaredFactsOnly = true
+	input.Request = hdr10ClientRequestV3(true)
+	result = PlanPlaybackV3(input)
+	if result.Terminal == nil || result.Terminal.Reason != "source_metadata_incomplete" || !result.Terminal.Retryable {
+		t.Fatalf("HDR-capable client result = %s", ExplainPlannerResultV3(result))
+	}
+
+	// A detailed output record with every range flag false is the production
+	// browser shape: it can present no HDR range, so no probe can create a
+	// route and the terminal is due now.
+	input.Request = hdr10ClientRequestV3(true)
+	input.Request.ClientPlaybackContext.Output.HDRDetails = &HDRCapabilitiesV3{}
+	result = PlanPlaybackV3(input)
+	if result.Terminal == nil || result.Terminal.Reason != TerminalHDRTranscodeUnsupportedV3 || result.Terminal.Retryable {
+		t.Fatalf("no-HDR-output client result = %s", ExplainPlannerResultV3(result))
+	}
+}
+
 // A file the scanner stored without any stream metadata is either waiting for
 // its first probe or was rejected by ffprobe. Only the first is worth retrying.
 func TestPlanPlaybackV3SeparatesUnprobedFromUnreadableSources(t *testing.T) {

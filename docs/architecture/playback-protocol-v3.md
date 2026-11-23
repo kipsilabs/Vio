@@ -2008,6 +2008,13 @@ make the same source play. Its `detail` carries the client's own failing code
 audio-output evidence the same exhaustion stays the non-retryable
 `adaptation_unavailable`. `source_metadata_incomplete` is retryable:
 the file has not been probed yet or lacks a field a route needs.
+A caller that evaluates a row without probing it (the versions check's
+playability pass) answers `hdr_transcode_unsupported` instead when the declared
+facts already prove it: the client cannot present the source's HDR/DV range and
+no HDR-preserving or tone-map recipe is installed for that row, so the start
+would refuse the pick. A start keeps the retryable refusal because its own probe
+may still complete the route; a later probe can change the evaluation, and the
+next pass re-reads the row.
 `source_unreadable` is not: ffprobe rejected the effective file (empty,
 corrupt, truncated) and it carries no stream metadata. The scanner and the
 playback-time probe repair record the rejection in `media_files.probe_failed_at`

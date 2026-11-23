@@ -20,12 +20,22 @@ vi.mock("@/components/ui/dropdown-menu", () => ({
     children,
     onSelect,
     className,
+    title,
+    disabled,
   }: {
     children: ReactNode;
     onSelect?: () => void;
     className?: string;
+    title?: string;
+    disabled?: boolean;
   }) => (
-    <div role="menuitem" className={className} onClick={onSelect}>
+    <div
+      role="menuitem"
+      className={className}
+      title={title}
+      aria-disabled={disabled ? true : undefined}
+      onClick={disabled ? undefined : onSelect}
+    >
       {children}
     </div>
   ),
@@ -433,5 +443,37 @@ describe("VersionDropdown playability", () => {
     // stays visible disabled so the list keeps its shape and the reason shows.
     expect(dialog.queryByRole("button", { name: /720p/ })).not.toBeInTheDocument();
     expect(dialog.getByRole("button", { name: /1080p/ })).toBeDisabled();
+  });
+
+  it("applies the same verdict to the watch-page version menu", () => {
+    const versions = [makeVersion({ file_id: 1, resolution: "2160p" }), unplayable(2)];
+    const onPlayVersion = vi.fn();
+    render(<VersionFlyoutItems versions={versions} onPlayVersion={onPlayVersion} />);
+
+    const blocked = screen.getByRole("menuitem", { name: /1080p/ });
+    expect(blocked).toHaveAttribute("aria-disabled", "true");
+    expect(blocked).toHaveTextContent("Can't play on this device");
+    expect(blocked).toHaveAttribute(
+      "title",
+      "This HDR source requires video encoding, but no validated recipe is installed.",
+    );
+
+    fireEvent.click(blocked);
+    expect(onPlayVersion).not.toHaveBeenCalled();
+  });
+
+  it("leaves a no-verdict watch-page menu row selectable", () => {
+    const versions = [
+      makeVersion({ file_id: 1, resolution: "2160p" }),
+      // No playability key: a retryable or unfinished check stays unknown.
+      makeVersion({ file_id: 2, resolution: "1080p" }),
+    ];
+    const onPlayVersion = vi.fn();
+    render(<VersionFlyoutItems versions={versions} onPlayVersion={onPlayVersion} />);
+
+    const row = screen.getByRole("menuitem", { name: /1080p/ });
+    expect(row).not.toHaveTextContent("Can't play on this device");
+    fireEvent.click(row);
+    expect(onPlayVersion).toHaveBeenCalledWith(2);
   });
 });
