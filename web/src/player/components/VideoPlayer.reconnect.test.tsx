@@ -16,7 +16,7 @@ import { VideoPlayer } from "./VideoPlayer";
 // events in the player, requests and recovery in the hook.
 
 const controls = vi.hoisted(() => ({
-  current: null as null | { activeSubtitleIndex: number | null },
+  current: null as null | { activeSubtitleIndex: number | null; playing?: boolean },
 }));
 const hlsJS = vi.hoisted(() => ({
   latest: null as null | { emit: (event: string, data: unknown) => void },
@@ -62,7 +62,7 @@ vi.mock("../hooks/useSubtitleLayout", () => ({
 vi.mock("./PlayerControls", () => ({
   SKIP_BACK_SECONDS: 10,
   SKIP_FORWARD_SECONDS: 30,
-  PlayerControls: (props: { activeSubtitleIndex: number | null }) => {
+  PlayerControls: (props: { activeSubtitleIndex: number | null; playing?: boolean }) => {
     controls.current = props;
     return null;
   },
@@ -168,6 +168,50 @@ function directPlan(overrides: Partial<PlanV3> = {}): PlanV3 {
       headers: {},
       header_refresh: "none",
     },
+    ...overrides,
+  });
+}
+
+function remuxPlan(overrides: Partial<PlanV3> = {}): PlanV3 {
+  return fixturePlanV3({
+    delivery: "server_remux_progressive",
+    stream: {
+      url: "/stream/session-1",
+      protocol: "http_progressive",
+      mime_type: "video/mp4",
+      headers: {},
+      header_refresh: "none",
+    },
+    timeline: {
+      source_start_seconds: 10,
+      stream_origin_seconds: 8,
+      player_start_seconds: 2,
+      timeline_offset_seconds: 8,
+      can_seek_anywhere: false,
+      seek_restoration: "source_position",
+    },
+    selected_tracks: {
+      audio: { id: "file:7:audio:0", index: 0 },
+      subtitle: { id: "file:7:subtitle:0", index: 0 },
+    },
+    audio_tracks: [
+      {
+        index: 0,
+        language: "en",
+        codec: "aac",
+        default: true,
+        track_id: "file:7:audio:0",
+        selection_index: 0,
+      },
+      {
+        index: 1,
+        language: "de",
+        codec: "aac",
+        default: false,
+        track_id: "file:7:audio:1",
+        selection_index: 1,
+      },
+    ],
     ...overrides,
   });
 }
@@ -566,6 +610,58 @@ describe("VideoPlayer with the playback session: reconnect", () => {
     expect(requests.starts[1]?.start_position).toBe(321.5);
     expect(sessionRef.current?.connectionStatus).toBe("connected");
     expect(sessionRef.current?.shouldAutoPlay).toBe(true);
+  });
+});
+
+describe("VideoPlayer with the playback session: audio switch", () => {
+  it("ends an audio switch on the remux route playing", async () => {
+    const first = remuxPlan();
+    const switched = remuxPlan({
+      plan_id: "plan:switched",
+      plan_attempt_key: "v3:switched",
+      selected_tracks: {
+        audio: { id: "file:7:audio:1", index: 1 },
+        subtitle: { id: "file:7:subtitle:0", index: 0 },
+      },
+      timeline: {
+        ...first.timeline,
+        source_start_seconds: 12,
+        stream_origin_seconds: 10,
+        player_start_seconds: 2,
+        timeline_offset_seconds: 10,
+      },
+    });
+    const requests = stubServer({
+      start: () => jsonResponse(playable("session-1", first), 201),
+      replan: () => jsonResponse(playable("session-1", switched)),
+    });
+    renderHarness();
+    const video = await startWatching();
+    expect(controls.current?.playing).toBe(true);
+    vi.mocked(video.load).mockClear();
+    vi.mocked(HTMLMediaElement.prototype.play).mockClear();
+
+    act(() => sessionRef.current?.switchAudioTrack(1, 12));
+    await waitFor(() => expect(requests.replans[0]?.body.operation).toBe("track_change"));
+    await waitFor(() => expect(video.load).toHaveBeenCalled());
+    expect(sessionRef.current?.plan?.selected_tracks.audio?.index).toBe(1);
+
+    // The switch tore the old transport down; the load algorithm pauses the
+    // element, and the replacement starts from the viewer's live intent.
+    Object.defineProperty(video, "paused", { configurable: true, value: true });
+    fireEvent.emptied(video);
+    Object.defineProperty(video, "readyState", {
+      configurable: true,
+      value: HTMLMediaElement.HAVE_FUTURE_DATA,
+    });
+    fireEvent.loadedData(video);
+    fireEvent.canPlay(video);
+    await waitFor(() => expect(HTMLMediaElement.prototype.play).toHaveBeenCalled());
+
+    Object.defineProperty(video, "paused", { configurable: true, value: false });
+    fireEvent.play(video);
+    expect(video.paused).toBe(false);
+    expect(controls.current?.playing).toBe(true);
   });
 });
 

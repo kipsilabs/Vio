@@ -3629,8 +3629,17 @@ export function VideoPlayer({
           settlePaused();
           return;
         }
-      } else if (!shouldAutoPlay) {
+      } else if (!viewerPlayIntentRef.current) {
         settlePaused();
+        return;
+      } else if (!shouldAutoPlayRef.current) {
+        // The plan's intent disagrees with the viewer's live intent: a
+        // transient teardown pause was sampled as the plan's play intent, or
+        // a play click landed while the replacement was being fetched. The
+        // #465 resume path owns starting a transport the viewer still means
+        // to play; it starts the element now, or latches until the element's
+        // asynchronous re-create pauses it.
+        resumeReloadedTransport();
         return;
       }
 
@@ -3777,9 +3786,20 @@ export function VideoPlayer({
     // target the replan handed over — or a newer seek made while the
     // replacement was loading — starts there. Anything before the origin
     // belongs to another generation, and the plan's own start stands.
+    //
+    // A progressive remux that replaces another transport (an audio switch)
+    // starts at the plan's own start. Its response is generated fresh at the
+    // plan's origin, so there is no already-live generation whose produced
+    // segment a late start would have to catch up with; carrying the outgoing
+    // element's playhead instead folds the replan's whole fetch/probe delay
+    // into the seek, and the element clamps a pre-metadata seek to the stream's
+    // first frame, leaving the switch up to that delay behind the position the
+    // viewer asked for. The plan's `player_start_seconds` is the request-time
+    // baseline, up to the documented keyframe pre-roll.
     const transportStartPosition = () => {
       const pendingSeconds = pendingSeekTimeRef.current;
       if (pendingSeconds === null || pendingSeconds === roomHeldSeekRef.current) {
+        if (isProgressiveRemux) return effectiveInitialPositionRef.current;
         return reloadStartSeconds(effectiveInitialPositionRef.current, replacedPlayhead);
       }
       const pendingContext = pendingSeekContextRef.current;
@@ -4549,13 +4569,19 @@ export function VideoPlayer({
     // for any host that does not publish a revision. `planRevision` is
     // deliberately absent: it bumps on every adoption, so a track change that
     // reuses the running stream would tear the element down and refetch the
-    // manifest. The start position is read through a ref for the same reason:
-    // a reused plan rewrites it to the live playhead. Every other input here is
-    // either the plan's own transport identity or a stable callback. In
-    // particular no host callback is listed: a host that rebuilds
-    // `onPlanFailure` from its render inputs used to reload the element on its
-    // render cadence, restarting playback at the plan's origin and leaving a
-    // paused viewer with a transport that never settled.
+    // manifest. `shouldAutoPlay` is absent for the same reason: it is the
+    // adopted plan's intent, and a transient teardown pause during a switch
+    // can make it disagree with the viewer's live intent. The readiness gate
+    // reads it through `shouldAutoPlayRef` and falls back to
+    // `viewerPlayIntentRef` when they disagree, so a plan whose intent was
+    // polluted cannot tear down the replacement it just started.
+    // The start position is read through a ref for the same reason: a reused
+    // plan rewrites it to the live playhead. Every other input here is either
+    // the plan's own transport identity or a stable callback. In particular no
+    // host callback is listed: a host that rebuilds `onPlanFailure` from its
+    // render inputs used to reload the element on its render cadence,
+    // restarting playback at the plan's origin and leaving a paused viewer with
+    // a transport that never settled.
   }, [
     applyElementDuration,
     effectiveStreamUrl,
@@ -4569,7 +4595,6 @@ export function VideoPlayer({
     rememberPendingSeek,
     releasePendingSeek,
     setPlayerError,
-    shouldAutoPlay,
   ]);
 
   // A 412 on a pending seek stops hls.js so it cannot retry the fenced URL.

@@ -1181,6 +1181,43 @@ func TestResolveCopySeekAnchorProbeTimeoutIsNotTransientProvider(t *testing.T) {
 	}
 }
 
+// TestCopySeekAnchorDistanceIsBoundedByTheSourceGOP pins that the one-GOP bar
+// is the source's own keyframe interval, not a fixed number of seconds. The
+// ds-audio remux (h264, 23.976 fps) has a measured base keyframe interval of
+// 2.002 s; the long-GOP HEVC fixture in TestResolveCopySeekAnchorMatchesRealLongGOPHEVC
+// has a 10 s interval. A fixed 5 s check calls the HEVC anchor an overshoot,
+// and a check against the wrong file's interval calls a legitimate keyframe an
+// overshoot. The resolver must accept both.
+func TestCopySeekAnchorDistanceIsBoundedByTheSourceGOP(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		gop  float64
+	}{
+		{name: "ds-audio h264 base interval 2.002s", gop: 2.002},
+		{name: "long-GOP HEVC fixture 10s", gop: 10},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resetCopySeekAnchorCache(t, nil, func(_ context.Context, _ string, _ string, requested float64, _ int) (float64, int, error) {
+				anchor := math.Floor(requested/tc.gop) * tc.gop
+				return anchor, int(anchor), nil
+			})
+			for _, requested := range []float64{0.5, 1.5, 2.5, 5.1, 9.99, 10.01, 18.261} {
+				anchor, _, err := ResolveCopySeekAnchorForSource(
+					context.Background(), "ffmpeg", "virtual://test/gop/"+tc.name,
+					"http://relay/stream", requested, 2,
+				)
+				if err != nil {
+					t.Fatalf("ResolveCopySeekAnchorForSource(%v): %v", requested, err)
+				}
+				if distance := requested - anchor; distance > tc.gop+1e-9 {
+					t.Fatalf("anchor %v is %.3fs behind request %v, over the source GOP %.3fs",
+						anchor, distance, requested, tc.gop)
+				}
+			}
+		})
+	}
+}
+
 // TestResolveCopySeekAnchorDecodeFailureIsNotTransient is the negative case: a
 // real FFmpeg decode/config failure exits with a status of its own, which is a
 // verdict about the release (or the request) and must not be retried as the
