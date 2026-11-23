@@ -1,12 +1,32 @@
 // @vitest-environment jsdom
 
-import type { ComponentProps } from "react";
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import type { ComponentProps, ReactElement, ReactNode } from "react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import {
+  act,
+  fireEvent,
+  render as renderBase,
+  screen,
+  type RenderOptions,
+} from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { PlayerControls } from "./PlayerControls";
 
-// The appearance panel reads settings through react-query; the controls' own
-// rendering does not need a provider.
+// The version menu runs the item page's playability check, which reads through
+// react-query. These tests leave the version list empty, so an inert provider
+// is all the menu needs.
+const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+function QueryProvider({ children }: { children: ReactNode }) {
+  return <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>;
+}
+
+function render(ui: ReactElement, options?: Omit<RenderOptions, "wrapper">) {
+  return renderBase(ui, { ...options, wrapper: QueryProvider });
+}
+
+// The appearance panel reads settings through react-query; it is mocked out so
+// these layout tests keep their own inert provider for the version menu.
 vi.mock("./SubtitleAppearancePanel", () => ({
   SubtitleAppearancePanel: () => null,
 }));

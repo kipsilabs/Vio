@@ -1,35 +1,15 @@
-import {
-  useProviderResultEnrichment,
-  providerResultText,
-  setProviderResultEnrichment,
-} from "@/components/streaming/useProviderResultDisplay";
-import { ProviderResultText } from "@/components/streaming/ProviderResultDisplay";
-import { useMemo } from "react";
-import { ListFilter, Play } from "lucide-react";
 import type { FileVersion } from "@/api/types";
-import { Badge } from "@/components/ui/badge";
-import {
-  DropdownMenuItem,
-  DropdownMenuCheckboxItem,
-  DropdownMenuLabel,
-  DropdownMenuSeparator,
-} from "@/components/ui/dropdown-menu";
-import {
-  audioLanguageLabels,
-  buildQualitySummary,
-  buildVersionDetailLine,
-  subtitleLanguageLabels,
-} from "./versionFormatUtils";
+import { buildQualitySummary, buildVersionDetailLine } from "./versionFormatUtils";
 import { audioScore, resolutionScore } from "./versionRankingUtils";
-import {
-  isVersionUnavailable,
-  isVersionUnplayable,
-  useVersionVisibility,
-  versionPlayabilityBadge,
-} from "./versionAvailability";
-import { deriveVersionHealth } from "@/lib/versionHealth";
 
 export { buildQualitySummary };
+
+/**
+ * Shared version-display helpers for the item page's catalog rows: the version
+ * picker, the media-info dialog, and the download picker. The rows themselves
+ * live in those components; this module only derives text, so every list reads
+ * the same for one version.
+ */
 
 // The item-page picker's detail line, sharing one derivation with the player
 // menu so empty details read identically across both lists.
@@ -44,155 +24,5 @@ export function sortByResolution(versions: FileVersion[]): FileVersion[] {
       Number(b.hdr) - Number(a.hdr) ||
       audioScore(b.codec_audio) - audioScore(a.codec_audio) ||
       (b.file_size ?? 0) - (a.file_size ?? 0),
-  );
-}
-
-// ---------------------------------------------------------------------------
-// VersionFlyoutItems (default export)
-// ---------------------------------------------------------------------------
-
-interface VersionFlyoutItemsProps {
-  versions: FileVersion[];
-  onPlayVersion: (fileId: number) => void;
-}
-
-export default function VersionFlyoutItems({ versions, onPlayVersion }: VersionFlyoutItemsProps) {
-  const enrichProviderResults = useProviderResultEnrichment();
-  const sorted = useMemo(() => sortByResolution(versions), [versions]);
-  const { visibleVersions, hiddenUnavailableCount, setShowUnavailable } = useVersionVisibility(
-    sorted,
-    null,
-  );
-
-  return (
-    <>
-      <DropdownMenuLabel>Play Version</DropdownMenuLabel>
-      <DropdownMenuSeparator />
-      {versions.some((version) => providerResultText(version)) && (
-        <DropdownMenuCheckboxItem
-          checked={enrichProviderResults}
-          onCheckedChange={(checked) => setProviderResultEnrichment(checked === true)}
-          onSelect={(event) => event.preventDefault()}
-        >
-          Enrich with quality, source, and languages
-        </DropdownMenuCheckboxItem>
-      )}
-
-      {visibleVersions.map((version) => {
-        const providerText = providerResultText(version);
-        const showDetails = !providerText || enrichProviderResults;
-        const qualitySummary = buildQualitySummary(version);
-        const detailLine = providerText ? "" : buildDetailLine(version);
-        const isMoreAction = qualitySummary === "More results…";
-        const isVirtual =
-          version.container === "virtual" ||
-          Boolean(version.file_path?.toLowerCase().startsWith("virtual://"));
-        const unavailable = isVersionUnavailable(version);
-        const playability = versionPlayabilityBadge(version);
-        const unplayable = isVersionUnplayable(version);
-        const health = deriveVersionHealth(version);
-
-        return (
-          <DropdownMenuItem
-            key={version.file_id}
-            disabled={unplayable}
-            title={playability?.title}
-            className={`flex items-center gap-3 rounded-lg py-2.5 ${
-              unplayable ? "opacity-60" : unavailable ? "opacity-80" : ""
-            }`}
-            onSelect={() => {
-              if (unplayable) return;
-              onPlayVersion(version.file_id);
-            }}
-          >
-            <span className="bg-accent/70 flex size-7 shrink-0 items-center justify-center rounded-full">
-              {isMoreAction ? (
-                <ListFilter className="text-foreground size-3.5" />
-              ) : (
-                <Play className="text-foreground size-3.5 fill-current" />
-              )}
-            </span>
-
-            <span className="min-w-0 flex-1">
-              {providerText && <ProviderResultText text={providerText} />}
-              <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-                <span className="text-foreground flex items-center gap-1.5 text-sm font-semibold">
-                  {showDetails && <span>{qualitySummary}</span>}
-                  {showDetails && isVirtual && !isMoreAction && (
-                    <Badge
-                      variant="secondary"
-                      className="shrink-0 px-1.5 py-0 text-[10px] font-medium"
-                    >
-                      Virtual
-                    </Badge>
-                  )}
-                  {playability && (
-                    <Badge
-                      variant="outline"
-                      title={playability.title}
-                      className="shrink-0 border-red-500/30 bg-red-500/15 px-1.5 py-0 text-[10px] font-medium text-red-600 dark:text-red-300"
-                    >
-                      {playability.label}
-                    </Badge>
-                  )}
-                  {health && (
-                    <Badge
-                      variant="outline"
-                      title={health.title}
-                      className={
-                        health.tone === "danger"
-                          ? "shrink-0 border-red-500/30 bg-red-500/15 px-1.5 py-0 text-[10px] font-medium text-red-600 dark:text-red-300"
-                          : "shrink-0 border-amber-500/30 bg-amber-500/15 px-1.5 py-0 text-[10px] font-medium text-amber-600 dark:text-amber-300"
-                      }
-                    >
-                      {health.label}
-                    </Badge>
-                  )}
-                </span>
-                <div className="flex flex-wrap gap-1">
-                  {(showDetails ? audioLanguageLabels(version.audio_tracks) : []).map((lang) => (
-                    <Badge
-                      key={lang}
-                      variant="outline"
-                      className="border-blue-500/20 bg-blue-500/10 px-1 py-0 text-[10px] font-medium text-blue-400"
-                    >
-                      <span className="mr-0.5 opacity-70">🔊</span>
-                      {lang}
-                    </Badge>
-                  ))}
-                </div>
-              </div>
-              {showDetails &&
-                (detailLine || subtitleLanguageLabels(version.subtitle_tracks).length > 0) && (
-                  <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1">
-                    <span className="text-muted-foreground text-xs">{detailLine}</span>
-                    <div className="flex flex-wrap gap-1">
-                      {subtitleLanguageLabels(version.subtitle_tracks).map((lang) => (
-                        <Badge
-                          key={lang}
-                          variant="outline"
-                          className="border-amber-500/20 bg-amber-500/10 px-1 py-0 text-[10px] font-medium text-amber-400"
-                        >
-                          <span className="mr-0.5 opacity-70">CC</span>
-                          {lang}
-                        </Badge>
-                      ))}
-                    </div>
-                  </div>
-                )}
-            </span>
-          </DropdownMenuItem>
-        );
-      })}
-      {hiddenUnavailableCount > 0 && (
-        <DropdownMenuItem
-          className="text-muted-foreground justify-center text-xs font-medium"
-          onSelect={() => setShowUnavailable(true)}
-        >
-          Show {hiddenUnavailableCount} unavailable{" "}
-          {hiddenUnavailableCount === 1 ? "version" : "versions"}
-        </DropdownMenuItem>
-      )}
-    </>
   );
 }

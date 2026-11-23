@@ -10,6 +10,12 @@ import { QualityRankingSummary } from "@/components/streaming/QualityRankingSumm
 import { useIndexerReleaseRequests, useVirtualLibraryCapability } from "@/hooks/useIndexerReleases";
 import { useVersionListRefresh, REFRESH_VERSIONS_ERROR } from "@/hooks/useVersionListRefresh";
 import { useVersionSortPreference } from "@/hooks/useVersionSortPreference";
+import { useVersionPlayability } from "@/hooks/queries/versionLiveness";
+import { useVersionPlayabilityClient } from "@/hooks/queries/versionPlayabilityClient";
+import {
+  isVersionUnplayable,
+  versionPlayabilityBadge,
+} from "@/pages/ItemDetail/components/versionAvailability";
 import { sortVersionsByCriteria, type VersionSortable } from "@/lib/qualityRanking";
 import { plainResolutionLabel, resolveActiveQualityOptionId } from "../playback-info";
 import { deriveVersionHealth } from "@/lib/versionHealth";
@@ -181,6 +187,26 @@ export function QualityMenu({
   );
   const menuRef = useRef<HTMLDivElement>(null);
 
+  // The same cheap, provider-free playability pass the item page runs: the
+  // player's version list is a picker too, and a row the start refuses must
+  // not look selectable here. The verdicts are requested with the client block
+  // the start sends, so both lists judge a row the same way.
+  const { client: playabilityClient, ready: playabilityReady } = useVersionPlayabilityClient();
+  const playabilityRows = useMemo(
+    () => (versions ?? []).map((version) => ({ file_id: version.fileId })),
+    [versions],
+  );
+  // Only a surface that can actually switch needs verdicts; a quality-only
+  // menu, a locked Watch Party, and a single-version title have nothing to
+  // disable.
+  const canSwitchVersions =
+    !versionLocked && Boolean(onSwitchVersion) && (versions?.length ?? 0) > 1;
+  const versionPlayability = useVersionPlayability(
+    playabilityRows,
+    playabilityClient,
+    playabilityReady && canSwitchVersions,
+  );
+
   const handleSelect = useCallback(
     (id: string) => {
       onSelect(id);
@@ -217,7 +243,11 @@ export function QualityMenu({
   }, []);
 
   const handleMenuKeyDown = useCallback((e: React.KeyboardEvent) => {
-    const items = menuItemsRef.current.filter(Boolean) as HTMLButtonElement[];
+    // Refused rows stay in the list but cannot take focus; skipping them here
+    // keeps arrow navigation moving instead of parking on a disabled button.
+    const items = menuItemsRef.current.filter(
+      (item): item is HTMLButtonElement => item !== null && !item.disabled,
+    );
     if (items.length === 0) return;
     const currentIndex = items.indexOf(document.activeElement as HTMLButtonElement);
     let nextIndex: number | null = null;
@@ -420,6 +450,13 @@ export function QualityMenu({
                       const idx = versionRowStart + versionIndex;
                       const statusLabels = buildVersionStatusLabels(v);
                       const health = versionHealthOf(v);
+                      // One definition of "unplayable" for both lists: the
+                      // shared helpers read the server's verdict, and an absent
+                      // verdict (unknown, or a retryable refusal) stays
+                      // selectable.
+                      const playabilityRow = { playability: versionPlayability.get(v.fileId) };
+                      const unplayable = isVersionUnplayable(playabilityRow);
+                      const playability = versionPlayabilityBadge(playabilityRow);
                       const showDetails = !v.providerText || enrichProviderResults;
                       const hasScore = showDetails && hasFormatScore(v.formatScore);
                       // One detail derivation for both lists; `detail` carries the
@@ -430,6 +467,7 @@ export function QualityMenu({
                       const subtitleLanguages = showDetails ? (v.subtitleLanguages ?? []) : [];
                       const hasBadges =
                         hasScore ||
+                        playability !== null ||
                         statusLabels.length > 0 ||
                         audioLanguages.length > 0 ||
                         subtitleLanguages.length > 0;
@@ -441,10 +479,20 @@ export function QualityMenu({
                           }}
                           role="menuitem"
                           type="button"
-                          className={`flex w-full px-3 py-2 text-left text-sm hover:bg-white/10 focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:outline-none ${
-                            v.isCurrentSource ? "text-white" : "text-white/70"
+                          disabled={unplayable}
+                          title={playability?.title}
+                          aria-disabled={unplayable ? true : undefined}
+                          className={`flex w-full px-3 py-2 text-left text-sm focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-60 ${
+                            unplayable
+                              ? "text-white/50"
+                              : v.isCurrentSource
+                                ? "text-white"
+                                : "text-white/70 hover:bg-white/10"
                           }`}
                           onClick={() => {
+                            // A refused row must not write the selection or let
+                            // the menu close as if a version were chosen.
+                            if (unplayable) return;
                             onSwitchVersion(v.fileId);
                             setOpen(false);
                           }}
@@ -467,6 +515,14 @@ export function QualityMenu({
                                     title={formatScoreTitle(v.formatScore!, v.profileLabel)}
                                   >
                                     {formatScoreBadgeLabel(v.formatScore!)}
+                                  </span>
+                                )}
+                                {playability && (
+                                  <span
+                                    title={playability.title}
+                                    className="rounded border border-red-500/30 bg-red-500/20 px-1.5 py-0.5 text-[10px] leading-none text-red-300"
+                                  >
+                                    {playability.label}
                                   </span>
                                 )}
                                 {statusLabels.map((status) => (

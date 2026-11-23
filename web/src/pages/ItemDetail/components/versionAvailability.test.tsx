@@ -4,7 +4,6 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { FileVersion } from "@/api/types";
 import VersionDropdown from "./VersionDropdown";
-import VersionFlyoutItems from "./VersionFlyout";
 import { useVersionVisibility } from "./versionAvailability";
 
 // The picker reads the watch detail lazily when it opens (score/ranking); these
@@ -20,12 +19,22 @@ vi.mock("@/components/ui/dropdown-menu", () => ({
     children,
     onSelect,
     className,
+    title,
+    disabled,
   }: {
     children: ReactNode;
     onSelect?: () => void;
     className?: string;
+    title?: string;
+    disabled?: boolean;
   }) => (
-    <div role="menuitem" className={className} onClick={onSelect}>
+    <div
+      role="menuitem"
+      className={className}
+      title={title}
+      aria-disabled={disabled ? true : undefined}
+      onClick={disabled ? undefined : onSelect}
+    >
       {children}
     </div>
   ),
@@ -213,42 +222,6 @@ describe("VersionDropdown source mismatch", () => {
     const dialog = openVersionDropdown();
     expect(dialog.queryByText("Failed")).not.toBeInTheDocument();
     expect(dialog.getByRole("button", { name: /1080p/ })).toBeInTheDocument();
-  });
-});
-
-describe("VersionFlyoutItems unavailable versions", () => {
-  it("hides unavailable versions by default and shows them via the toggle", () => {
-    const versions = [
-      makeVersion({ file_id: 1, resolution: "2160p" }),
-      makeVersion({ file_id: 2, resolution: "1080p", available: false }),
-    ];
-    render(<VersionFlyoutItems versions={versions} onPlayVersion={vi.fn()} />);
-
-    expect(screen.queryByText("1080p")).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("menuitem", { name: /Show 1 unavailable version/ }));
-
-    const unavailableRow = screen.getByRole("menuitem", { name: /1080p/ });
-    expect(unavailableRow).toBeInTheDocument();
-    expect(screen.getByText("Will retry on play")).toBeInTheDocument();
-    expect(unavailableRow).toHaveClass("opacity-80");
-  });
-
-  it("shows a source mismatch on a row that is still available", () => {
-    const versions = [
-      makeVersion({
-        file_id: 1,
-        resolution: "1080p",
-        available: true,
-        source_mismatch: { served_bytes: 7_427_636_945, declared_bytes: 8_449_999_999 },
-      }),
-    ];
-    render(<VersionFlyoutItems versions={versions} onPlayVersion={vi.fn()} />);
-
-    expect(
-      screen.getByText("Source mismatch — served 6.9 GB of declared 7.9 GB"),
-    ).toBeInTheDocument();
-    expect(screen.queryByText("Will retry on play")).not.toBeInTheDocument();
-    expect(screen.queryByText("Failed")).not.toBeInTheDocument();
   });
 });
 
