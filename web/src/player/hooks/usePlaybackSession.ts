@@ -11,6 +11,7 @@ import {
   isAdaptationUnavailableReason,
   isDeadPlaybackSessionError,
   PLAYBACK_SESSION_GONE_ERROR,
+  SEEK_RETRY_TARGET_UNAVAILABLE,
   type PlaybackPolicyErrorDescription,
 } from "../playback-errors";
 import {
@@ -1902,7 +1903,18 @@ export function usePlaybackSession(
   // different error: on a degraded source those replans can also hold the
   // client for tens of seconds. The card's Try again starts fresh, and a new
   // seek or a real failure supersedes it.
-  const refusedSeekRetryRef = useRef<{ planId: string; positionSeconds: number } | null>(null);
+  //
+  // The refused target travels with the plan it was measured against and the
+  // source identity it named. The player restores the pre-seek position while
+  // the card is up, so the live playhead is where the viewer *was*, not where
+  // they asked to go; the retry must use this target instead. Keeping the
+  // identity lets the retry refuse rather than send that position to a source
+  // that has since moved.
+  const refusedSeekRetryRef = useRef<{
+    planId: string;
+    positionSeconds: number;
+    source: SourceIdentity;
+  } | null>(null);
   // Late-bound reanchor: declared ahead of `reanchorSeek` so the switch
   // completion above can call it without depending on render order. Bound in
   // an effect — render-time ref writes are unsafe under concurrent React.
@@ -3279,6 +3291,10 @@ export function usePlaybackSession(
             ? {
                 planId: plan.plan_id,
                 positionSeconds: options.positionSeconds,
+                // The target belongs to the source the session was serving
+                // when the seek was refused. A later rotation or a different
+                // version must not be handed the old timeline position.
+                source: { ...liveSourceIdentityRef.current },
               }
             : null;
         }
@@ -4065,9 +4081,45 @@ export function usePlaybackSession(
    */
   const restartPlayback = useCallback(() => {
     const plan = planRef.current;
+    const refusedSeek = refusedSeekRetryRef.current;
+    // The refused seek target is the viewer's newest intent, but only while
+    // the card is describing the same plan and the same source it was measured
+    // on. The player restores the pre-seek playhead while the card is up, so
+    // the remembered target is the only record of where the seek asked to go.
+    const refusedSeekTargetApplies =
+      plan !== null &&
+      refusedSeek !== null &&
+      refusedSeek.planId === plan.plan_id &&
+      Number.isFinite(refusedSeek.positionSeconds) &&
+      refusedSeek.positionSeconds >= 0 &&
+      identityNamesSameSource(refusedSeek.source, liveSourceIdentityRef.current);
+    const refusedSeekTargetStale =
+      plan !== null &&
+      refusedSeek !== null &&
+      refusedSeek.planId === plan.plan_id &&
+      !refusedSeekTargetApplies;
+    if (refusedSeekTargetStale) {
+      // The source moved or the version changed while the card was up. Sending
+      // the old target to the new source would silently start at a position
+      // the viewer never asked for on it, so say why and drop the card's retry.
+      refusedSeekRetryRef.current = null;
+      setState((current) => ({
+        ...current,
+        loading: false,
+        errorTitle: SEEK_RETRY_TARGET_UNAVAILABLE.title,
+        error: SEEK_RETRY_TARGET_UNAVAILABLE.message,
+        errorReason: SEEK_RETRY_TARGET_UNAVAILABLE.reason ?? null,
+        errorRetryable: SEEK_RETRY_TARGET_UNAVAILABLE.retryable ?? false,
+      }));
+      return;
+    }
+    const seekTarget =
+      refusedSeekTargetApplies && refusedSeek !== null ? refusedSeek.positionSeconds : null;
     const played = hasAdoptedPlanRef.current || plan !== null;
-    const position = played ? playbackPositionRef.current : startIntentRef.current.position;
-    const forceStartPosition = played ? true : startIntentRef.current.forceStartPosition;
+    const position =
+      seekTarget ?? (played ? playbackPositionRef.current : startIntentRef.current.position);
+    const forceStartPosition =
+      seekTarget !== null || (played ? true : startIntentRef.current.forceStartPosition);
     const deadSessionId = sessionIdRef.current;
     sessionGoneRef.current = false;
     sessionEndedRef.current = false;

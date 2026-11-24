@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { createElement, useEffect, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -16,7 +16,12 @@ import { VideoPlayer } from "./VideoPlayer";
 // events in the player, requests and recovery in the hook.
 
 const controls = vi.hoisted(() => ({
-  current: null as null | { activeSubtitleIndex: number | null; playing?: boolean },
+  current: null as null | {
+    activeSubtitleIndex: number | null;
+    playing?: boolean;
+    currentTime?: number;
+    onSeek?: (seconds: number) => void;
+  },
 }));
 const hlsJS = vi.hoisted(() => ({
   latest: null as null | { emit: (event: string, data: unknown) => void },
@@ -296,6 +301,8 @@ function Harness({
     replanning: playback.replanning,
     replanError: playback.error,
     replanErrorTitle: playback.errorTitle,
+    replanErrorRetryable: playback.errorRetryable,
+    replanErrorReason: playback.errorReason,
     sessionId: playback.sessionId,
     activeFileId: playback.mediaFileId,
     subtitleUrls: playback.subtitleUrls,
@@ -310,6 +317,7 @@ function Harness({
     connectionErrorTitle: playback.connectionErrorTitle,
     connectionError: playback.connectionError,
     onReanchorSeek: playback.reanchorSeek,
+    onRestartPlayback: playback.restartPlayback,
     onPlaybackStateChange: (state) =>
       playback.updatePlaybackState(state.currentTime, state.playing),
     onFirstFrame: playback.reportFirstFrame,
@@ -335,6 +343,14 @@ function showFrame(video: HTMLVideoElement) {
   Object.defineProperty(video, "readyState", { configurable: true, value: 2 });
   fireEvent.timeUpdate(video);
   Reflect.deleteProperty(video, "readyState");
+}
+
+/** Makes the element report a seekable window, as a produced playlist does. */
+function seekableWindow(video: HTMLVideoElement, end: number) {
+  Object.defineProperty(video, "seekable", {
+    configurable: true,
+    value: { length: 1, start: () => 0, end: () => end },
+  });
 }
 
 /** The viewer is watching: the element plays and shows a frame. */
@@ -965,5 +981,175 @@ describe("VideoPlayer with the playback session: transport identity", () => {
     expect(hlsJS.loadSource).toHaveBeenCalledTimes(1);
     expect(HTMLMediaElement.prototype.load).not.toHaveBeenCalled();
     expect(video.getAttribute("src")).toBe(src);
+  });
+});
+
+describe("VideoPlayer with the playback session: a refused seek retry", () => {
+  const PRE_SEEK_POSITION = 32.172995;
+  const SEEK_TARGET = 918.161458;
+
+  function seekRefusal(sessionId: string) {
+    return {
+      protocol_version: 3,
+      server_features: ["playback_plan_v3"],
+      outcome: "adaptation_unavailable",
+      session_id: sessionId,
+      terminal: {
+        reason: "seek_reanchor_evidence_unavailable",
+        message: "The frozen playback source could not be reopened; start a new playback attempt.",
+        retryable: true,
+      },
+    };
+  }
+
+  /** Answers the player's automatic non-seek replans without touching the plan. */
+  function seekReplan(url: string, body: Body) {
+    if (body.operation === "seek_reanchor") {
+      return jsonResponse(seekRefusal(/playback\/([^/]+)\/replan/.exec(url)?.[1] ?? "session-1"));
+    }
+    return jsonResponse(playable("session-1", retryablePlan()));
+  }
+
+  /** A remux plan whose window makes the far seek a server reanchor. */
+  function retryablePlan(sessionId = "session-1", overrides: Partial<PlanV3> = {}): PlanV3 {
+    return remuxPlan({
+      effective_virtual_uri: "virtual://movie/x?result=1",
+      session_id: sessionId,
+      selected_tracks: { audio: { id: "file:7:audio:0", index: 0 } },
+      ...overrides,
+      stream: {
+        ...remuxPlan().stream,
+        url: `/stream/${sessionId}`,
+      },
+    });
+  }
+
+  async function showSeekCard(requests: Requests, video: HTMLVideoElement) {
+    // The viewer was 32 s in when they asked for 918 s. The remux window only
+    // reaches 300 s, so the player asks the server for a new window.
+    Object.defineProperty(video, "currentTime", {
+      configurable: true,
+      writable: true,
+      value: PRE_SEEK_POSITION - remuxPlan().timeline.timeline_offset_seconds,
+    });
+    showFrame(video);
+    seekableWindow(video, 300);
+
+    await act(async () => {
+      controls.current?.onSeek?.(SEEK_TARGET);
+      // Let the replan settle inside act, so the card's state is the one the
+      // next render reads rather than a pending update from outside it.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    await waitFor(() =>
+      expect(requests.replans.some(({ body }) => body.operation === "seek_reanchor")).toBe(true),
+    );
+    const seekRequest = requests.replans.find(({ body }) => body.operation === "seek_reanchor");
+    expect(seekRequest?.body).toMatchObject({
+      operation: "seek_reanchor",
+      position_seconds: SEEK_TARGET,
+    });
+    await waitFor(() => expect(screen.getByText("Try again")).toBeInTheDocument());
+  }
+
+  it("restores the pre-seek position on the card and retries at the seek target", async () => {
+    const requests = stubServer({
+      start: () => jsonResponse(playable("session-1", retryablePlan()), 201),
+      replan: seekReplan,
+    });
+
+    renderHarness();
+    const video = await startWatching();
+    await showSeekCard(requests, video);
+
+    // The card shows where the viewer was, not the target that never played.
+    expect(controls.current?.currentTime).toBeCloseTo(PRE_SEEK_POSITION, 3);
+
+    fireEvent.click(screen.getByText("Try again"));
+    await waitFor(() => expect(requests.starts).toHaveLength(2));
+    expect(requests.starts[1]?.start_position).toBeCloseTo(SEEK_TARGET, 3);
+    expect(requests.starts[1]?.file_id).toBe(7);
+  });
+
+  it("plays a successful retry at the target and advances from there", async () => {
+    const requests = stubServer({
+      start: (body, count) => {
+        if (count === 1) return jsonResponse(playable("session-1", retryablePlan()), 201);
+        const target = typeof body.start_position === "number" ? body.start_position : 0;
+        return jsonResponse(
+          playable(
+            "session-2",
+            retryablePlan("session-2", {
+              plan_id: "plan:seek-retry",
+              plan_attempt_key: "v3:seek-retry",
+              timeline: {
+                ...remuxPlan().timeline,
+                source_start_seconds: target,
+                stream_origin_seconds: target,
+                player_start_seconds: target,
+                timeline_offset_seconds: 0,
+              },
+            }),
+          ),
+          201,
+        );
+      },
+      replan: seekReplan,
+    });
+
+    renderHarness();
+    const video = await startWatching();
+    await showSeekCard(requests, video);
+
+    fireEvent.click(screen.getByText("Try again"));
+    await waitFor(() => expect(sessionRef.current?.plan?.session_id).toBe("session-2"));
+    expect(requests.starts[1]?.start_position).toBeCloseTo(SEEK_TARGET, 3);
+    expect(sessionRef.current?.plan?.timeline.player_start_seconds).toBeCloseTo(SEEK_TARGET, 3);
+    expect(sessionRef.current?.shouldAutoPlay).toBe(true);
+
+    const retried = await waitFor(() => {
+      const element = document.querySelector("video");
+      expect(element?.getAttribute("src")).toContain("session-2");
+      return element as HTMLVideoElement;
+    });
+    Object.defineProperty(retried, "currentTime", {
+      configurable: true,
+      writable: true,
+      value: SEEK_TARGET + 1.5,
+    });
+    showFrame(retried);
+    expect(controls.current?.currentTime).toBeGreaterThan(SEEK_TARGET);
+  });
+
+  it("says the target cannot be honoured when the source moved with the card up", async () => {
+    const requests = stubServer({
+      start: () => jsonResponse(playable("session-1", retryablePlan()), 201),
+      replan: seekReplan,
+    });
+
+    renderHarness();
+    const video = await startWatching();
+    await showSeekCard(requests, video);
+
+    // A serve-layer rotation moves the live candidate without adopting a new
+    // plan. The target belongs to the outgoing source, so the retry must not
+    // send it to this one.
+    act(() =>
+      sessionRef.current?.applyCommittedSource(
+        {
+          effectiveMediaFileId: 7,
+          effectiveVirtualUri: "virtual://movie/x?result=2",
+        },
+        [],
+      ),
+    );
+    fireEvent.click(screen.getByText("Try again"));
+
+    await waitFor(() =>
+      expect(sessionRef.current?.errorReason).toBe("seek_retry_target_unavailable"),
+    );
+    expect(sessionRef.current?.errorRetryable).toBe(false);
+    expect(requests.starts).toHaveLength(1);
+    await waitFor(() => expect(screen.getByText(/source changed/i)).toBeInTheDocument());
   });
 });
