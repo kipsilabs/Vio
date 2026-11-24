@@ -15,17 +15,21 @@ export const GENERATION_QUERY_PARAM = "sgen";
 
 /**
  * How long the playlist gate waits before fetching a fenced playlist again.
- * The server rotates the generation before it restarts FFmpeg, so a short
- * wait is enough for the manifest route to serve the successor's URIs.
+ * The server publishes a generation only after its replacement process exists,
+ * so a playlist fetched after a fence usually names the successor already; the
+ * wait only covers a rotation that is still landing.
  */
 export const FENCED_PLAYLIST_RETRY_DELAY_MS = 500;
 
 /**
  * Playlist refetches the gate attempts while the server still names the fenced
- * generation. A restart that takes longer than this is left to the ordinary
- * path instead of holding the player forever.
+ * generation. They are bounded to the same small number as the transport
+ * recovery: holding a stale playlist for eight half-second refetches spent the
+ * first recovery attempt on waiting, and the reanchor that actually rebuilds
+ * the generation only began after the whole bound. Two refetches cover a
+ * restart that is still publishing without turning the fence into a stall.
  */
-export const FENCED_PLAYLIST_MAX_RETRIES = 8;
+export const FENCED_PLAYLIST_MAX_RETRIES = 2;
 
 /** The generation a segment URI names, or null when it carries no `sgen`. */
 export function generationTokenFromSegmentUrl(url: string | null | undefined): string | null {
