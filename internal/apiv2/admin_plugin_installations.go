@@ -183,7 +183,7 @@ type AdminPluginCatalogEntry struct {
 	PluginID           string                    `json:"plugin_id"`
 	Version            string                    `json:"version"`
 	ArchiveURL         string                    `json:"archive_url" format:"uri-reference"`
-	SourceKind         string                    `json:"source_kind" enum:"silo,approved_community,external"`
+	SourceKind         string                    `json:"source_kind" enum:"silo,vio,approved_community,external"`
 	RepositoryName     string                    `json:"repository_name"`
 	RepoURL            string                    `json:"repo_url,omitempty" doc:"Source repository the catalog lists for the plugin; not validated as a URI"`
 	Presentation       *AdminPluginPresentation  `json:"presentation,omitempty"`
