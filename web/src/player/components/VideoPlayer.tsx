@@ -317,7 +317,13 @@ interface VideoPlayerProps {
   onCancelRefresh?: () => Promise<void> | void;
   onSessionLost?: () => void;
   onSessionGone?: () => void;
-  onRestartPlayback?: () => void;
+  /**
+   * Starts a fresh session after the current one cannot continue. The argument
+   * is the viewer's live play intent at the click: the refusal card pauses the
+   * element to restore the pre-seek position, so that pause is not the intent
+   * the replacement should inherit.
+   */
+  onRestartPlayback?: (autoplayIntent?: boolean) => void;
   onExpediteReconnect?: () => void;
   profileLanguage?: string | null;
   audioInventoryProvisional?: boolean;
@@ -7963,7 +7969,7 @@ export function VideoPlayer({
             <div className="flex gap-2">
               {connectionStatus === "gone" && onRestartPlayback && (
                 <button
-                  onClick={onRestartPlayback}
+                  onClick={() => onRestartPlayback(viewerPlayIntentRef.current)}
                   disabled={isLeaving}
                   type="button"
                   className="rounded bg-white px-4 py-2 text-sm font-medium text-black hover:bg-white/90"
@@ -8008,7 +8014,7 @@ export function VideoPlayer({
               {errorRetryable && onRestartPlayback && (
                 <button
                   onClick={() => {
-                    onRestartPlayback();
+                    onRestartPlayback(viewerPlayIntentRef.current);
                   }}
                   disabled={isLeaving}
                   type="button"
