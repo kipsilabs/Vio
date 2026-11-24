@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	catalogpkg "github.com/Silo-Server/silo-server/internal/catalog"
@@ -103,30 +104,36 @@ func TestWatchDetailDiscoveryExtendedBudgetCompletesSlowListing(t *testing.T) {
 	const listingDelay = 120 * time.Millisecond
 	run := func(t *testing.T, budget time.Duration, wantFileID string, wantElapsed time.Duration) {
 		t.Helper()
-		fake, handler := watchDiscoveryFixture(t)
-		gate := make(chan struct{})
-		fake.discoveryGate = gate
-		setWatchDiscoveryBudget(t, budget)
-		time.AfterFunc(listingDelay, func() { close(gate) })
+		// The fake clock ties the listing's delay to the handler's budget: time
+		// only advances once the request is blocked on the listing, so the
+		// comparison cannot lose to scheduler latency between scheduling the timer
+		// and starting the read.
+		synctest.Test(t, func(t *testing.T) {
+			fake, handler := watchDiscoveryFixture(t)
+			gate := make(chan struct{})
+			fake.discoveryGate = gate
+			setWatchDiscoveryBudget(t, budget)
+			time.AfterFunc(listingDelay, func() { close(gate) })
 
-		begin := time.Now()
-		rec := do(t, handler, http.MethodGet, "/api/v2/watch/movie:heat-1995?library_id=2&file_id=120", "", viewerHeaders())
-		elapsed := time.Since(begin)
-		if rec.Code != http.StatusOK {
-			t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
-		}
-		var body struct {
-			Versions []struct {
-				FileID string `json:"file_id"`
-			} `json:"versions"`
-		}
-		decodeJSON(t, rec.Body, &body)
-		if len(body.Versions) != 1 || body.Versions[0].FileID != wantFileID {
-			t.Fatalf("versions = %+v, want %s", body.Versions, wantFileID)
-		}
-		if wantElapsed > 0 && elapsed < wantElapsed {
-			t.Fatalf("watch detail answered in %v, before the listing's %v completed", elapsed, listingDelay)
-		}
+			begin := time.Now()
+			rec := do(t, handler, http.MethodGet, "/api/v2/watch/movie:heat-1995?library_id=2&file_id=120", "", viewerHeaders())
+			elapsed := time.Since(begin)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+			}
+			var body struct {
+				Versions []struct {
+					FileID string `json:"file_id"`
+				} `json:"versions"`
+			}
+			decodeJSON(t, rec.Body, &body)
+			if len(body.Versions) != 1 || body.Versions[0].FileID != wantFileID {
+				t.Fatalf("versions = %+v, want %s", body.Versions, wantFileID)
+			}
+			if wantElapsed > 0 && elapsed < wantElapsed {
+				t.Fatalf("watch detail answered in %v, before the listing's %v completed", elapsed, listingDelay)
+			}
+		})
 	}
 
 	t.Run("short budget abandons the slow listing", func(t *testing.T) {
