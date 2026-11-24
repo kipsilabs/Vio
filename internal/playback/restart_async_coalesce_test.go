@@ -180,6 +180,161 @@ func TestRestartSegmentForRecoveryRefusesSupersededTarget(t *testing.T) {
 	}
 }
 
+// TestRestartSegmentAsyncNewestTargetWinsWhenOlderExpiresLast pins ownership of
+// the restart, not just of the coalesced target: the viewer's newer seek is
+// recorded first and the older request's wait expires last. The older request
+// must be refused as superseded, so exactly one restart runs and the generation
+// advances once.
+func TestRestartSegmentAsyncNewestTargetWinsWhenOlderExpiresLast(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "seeks.log")
+	m := NewTranscodeManager()
+	s := newAsyncRestartTestSession(t, logPath)
+	const sid = "sess-async"
+	m.RegisterTranscodeSession(sid, s)
+	t.Cleanup(func() { _ = s.Close() })
+
+	older := s.BeginSegmentRecovery()
+	newer := s.BeginSegmentRecovery()
+	s.MarkSegmentSeek(newer)
+
+	// Both requests were queued before either applied; the older one reaches
+	// the worker last, after the newer target is already known.
+	release := m.LockSessionLifecycle(sid)
+	m.RestartSegmentAsyncForRequest(sid, s, 20, newer)
+	m.RestartSegmentAsyncForRequest(sid, s, 10, older)
+	release()
+
+	waitAsyncRestartsDrained(t, m, sid)
+	seeks := waitSeekLogLast(t, logPath, "40.000")
+	if len(seeks) != 1 {
+		t.Fatalf("applied seeks = %v, want exactly one restart at 40.000 (the newer segment 20)", seeks)
+	}
+	s.mu.Lock()
+	restarts := s.restartCount
+	s.mu.Unlock()
+	if restarts != 1 {
+		t.Fatalf("restart count = %d, want the newest target's single restart", restarts)
+	}
+	if got := s.SegmentGeneration(); got != 1 {
+		t.Fatalf("generation = %d, want 1 after one published restart", got)
+	}
+}
+
+// TestRestartRefusesSupersededTargetAtOwnership pins the check inside the
+// restart's own critical section. RestartSegmentForRecovery reads the newest
+// seek before it resolves a target; a seek recorded between that read and the
+// restart taking ownership must still refuse instead of moving FFmpeg to the
+// position the viewer left.
+func TestRestartRefusesSupersededTargetAtOwnership(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "seeks.log")
+	s := newAsyncRestartTestSession(t, logPath)
+	older := s.BeginSegmentRecovery()
+	newer := s.BeginSegmentRecovery()
+	s.MarkSegmentSeek(newer)
+
+	err := s.restart(context.Background(), 20, 10, 0, false, older)
+	if !errors.Is(err, ErrSegmentRecoverySuperseded) {
+		t.Fatalf("restart error = %v, want ErrSegmentRecoverySuperseded", err)
+	}
+	if got := s.restartCount; got != 0 {
+		t.Fatalf("restart count = %d, want no restart for a superseded target", got)
+	}
+	if got := s.SegmentGeneration(); got != 0 {
+		t.Fatalf("generation = %d, want no rotation for a superseded target", got)
+	}
+	if seeks := readSeekLog(t, logPath); len(seeks) != 0 {
+		t.Fatalf("applied seeks = %v, want none for the superseded target", seeks)
+	}
+}
+
+// TestRestartThatNeverPublishesKeepsItsGeneration pins the fence boundary: a
+// restart that kills the live generation but fails before the replacement is
+// published must not rotate the token. A request still holding the live token
+// answers the retryable failure, never stale_generation for a successor that
+// does not exist.
+func TestRestartThatNeverPublishesKeepsItsGeneration(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "seeks.log")
+	s := newAsyncRestartTestSession(t, logPath)
+	token := s.GenerationToken()
+	// The manager's liveness predicate reports the session was unregistered
+	// while the restart was preparing: the pre-spawn check fails after the old
+	// process is reaped.
+	s.setLifecycleLiveness(func() bool { return false })
+
+	err := s.restart(context.Background(), 20, 10, 0, false, 0)
+	if !errors.Is(err, ErrSessionSuperseded) {
+		t.Fatalf("restart error = %v, want ErrSessionSuperseded", err)
+	}
+	if got := s.GenerationToken(); got != token {
+		t.Fatalf("generation token = %q after a failed publish, want the unchanged %q", got, token)
+	}
+	if got := s.SegmentGeneration(); got != 0 {
+		t.Fatalf("generation = %d after a failed publish, want 0", got)
+	}
+
+	start := time.Now()
+	_, waitErr := s.WaitForOpenSegmentGenerationContext(context.Background(), "seg_00010.ts", token, 2*time.Second)
+	if !errors.Is(waitErr, ErrManifestNotReady) {
+		t.Fatalf("wait error = %v, want the retryable ErrManifestNotReady", waitErr)
+	}
+	if errors.Is(waitErr, ErrStaleSegmentGeneration) {
+		t.Fatal("a fence was answered for a generation that was never published")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("wait took %s, want the retryable verdict without spending the budget", elapsed)
+	}
+}
+
+// TestRestartSegmentAsyncBackwardSeekAfterForwardRestartLandsAtTarget pins the
+// ds-seek shape: a forward restart is in flight and the viewer seeks backward.
+// The backward request must own the next restart instead of waiting for the
+// forward one and adopting its position ("seek to 344 reverted to 950").
+func TestRestartSegmentAsyncBackwardSeekAfterForwardRestartLandsAtTarget(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "seeks.log")
+	m := NewTranscodeManager()
+	s := newAsyncRestartTestSession(t, logPath)
+	const sid = "sess-async"
+	m.RegisterTranscodeSession(sid, s)
+	t.Cleanup(func() { _ = s.Close() })
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	s.opts.RefreshInput = func(context.Context) (string, func(), error) {
+		once.Do(func() { close(entered) })
+		<-release
+		return s.opts.InputPath, nil, nil
+	}
+
+	forward := s.BeginSegmentRecovery()
+	s.MarkSegmentSeek(forward)
+	m.RestartSegmentAsyncForRequest(sid, s, 475, forward)
+	<-entered // the forward restart is inside restart(), holding the lifecycle lock
+
+	backward := s.BeginSegmentRecovery()
+	s.MarkSegmentSeek(backward)
+	m.RestartSegmentAsyncForRequest(sid, s, 172, backward)
+	close(release)
+
+	waitAsyncRestartsDrained(t, m, sid)
+	// The forward restart's stub may be killed before its shell writes its
+	// argument, so only the final position is asserted; the newest target must
+	// be the last one applied, not the forward position it replaced.
+	seeks := waitSeekLogLast(t, logPath, "344.000")
+	if len(seeks) > 2 {
+		t.Fatalf("applied seeks = %v, want convergence in at most two restarts", seeks)
+	}
+	s.mu.Lock()
+	restarts := s.restartCount
+	s.mu.Unlock()
+	if restarts != 2 {
+		t.Fatalf("restart count = %d, want the forward and backward restarts", restarts)
+	}
+	if got := s.SegmentGeneration(); got != 2 {
+		t.Fatalf("generation = %d, want 2 after both published restarts", got)
+	}
+}
+
 // TestRestartSegmentAsyncConvergesWhenTargetArrivesMidRestart pins the second
 // half of the coalescing: a newer target that arrives while the first restart is
 // still resolving makes the worker run once more, so the final applied position

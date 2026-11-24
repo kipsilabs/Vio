@@ -1455,7 +1455,7 @@ func (h *PlaybackHandler) HandleHLSSegment(w http.ResponseWriter, r *http.Reques
 			// generation to the older position.
 			recoverySeq := transcodeSession.BeginSegmentRecovery()
 			decision := transcodeSession.SegmentRecoveryDecisionForRequest(segNum, recoverySeq, now)
-			if decision.BeyondWaitReach {
+			if decision.SeekTarget {
 				transcodeSession.MarkSegmentSeek(recoverySeq)
 			}
 			segmentStalled := false

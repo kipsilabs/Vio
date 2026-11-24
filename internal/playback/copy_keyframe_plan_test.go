@@ -344,6 +344,30 @@ func TestPlannedSegmentRecoveryDecision(t *testing.T) {
 	if !restarting.Wait || restarting.RestartOnTimeout {
 		t.Fatalf("restarting: %+v, want a wait", restarting)
 	}
+
+	// A backward request during a forward plan restart is the viewer's newer
+	// position: the plan replacement only copies forward, so waiting for it
+	// would leave playback at the forward target and revert the seek.
+	backward := s.plannedSegmentRecoveryDecision(10, SegmentRecoveryDecision{
+		RestartOnTimeout:     true,
+		RestartSuperseded:    true,
+		Progress:             SegmentProgress{Restarting: true, ProducedHead: 40, StartSegmentNumber: 40},
+		RestartTargetSegment: 40,
+	})
+	if !backward.SeekTarget || backward.Wait || !backward.RestartOnTimeout || backward.Reason != "planned_segment_seek" {
+		t.Fatalf("backward seek during a forward restart: %+v, want an immediate planned restart", backward)
+	}
+
+	// The request the plan restart itself produces still waits for it.
+	ownTarget := s.plannedSegmentRecoveryDecision(40, SegmentRecoveryDecision{
+		RestartOnTimeout:     true,
+		RestartSuperseded:    true,
+		Progress:             SegmentProgress{Restarting: true, ProducedHead: 40, StartSegmentNumber: 40},
+		RestartTargetSegment: 40,
+	})
+	if ownTarget.SeekTarget || !ownTarget.Wait || ownTarget.RestartOnTimeout {
+		t.Fatalf("the restart's own segment: %+v, want a wait", ownTarget)
+	}
 }
 
 func TestPlannedSegmentRecoveryTargetUsesThePlanBoundary(t *testing.T) {
