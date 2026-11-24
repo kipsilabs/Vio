@@ -116,13 +116,24 @@ export const STALE_GENERATION_STATUS = 412;
 
 /**
  * Cap on consecutive playlist refetches a single transport may perform for one
- * stale-generation fence. Each refetch rebuilds the segment URLs with the
- * current `sgen`. A different generation starts the bound again, because a
- * rotation during the refetch is a normal seek-burst event, not a stuck
- * transport. Once the bound is spent the player reanchors at the playhead
+ * stale-generation fence episode. Each refetch rebuilds the segment URLs with
+ * the current `sgen`. The bound is per episode, not per generation: a rebuilt
+ * generation that still does not serve the requested segment is the same
+ * failed recovery, so a rotation does not hand it two more refetches. It
+ * resets once a fragment loads, because that is the proof the recovery
+ * produced media. Once the bound is spent the player reanchors at the playhead
  * instead of treating the fence as a route failure.
  */
 export const MAX_STALE_GENERATION_RECOVERIES = 2;
+
+/**
+ * Server rebuilds a single transport may ask for when a fence outlasts its
+ * playlist refetches. The first reanchor rebuilds the generation at the
+ * playhead; if that also yields no media, the second is the last automatic
+ * attempt. After it the viewer gets the retry card with the position restored,
+ * so a generation the server cannot serve cannot park the player.
+ */
+export const MAX_FENCE_RECOVERY_ATTEMPTS = 2;
 
 /**
  * Reports whether an hls.js error is the server's stale-generation fence. The
