@@ -3542,8 +3542,10 @@ func normalizeCreateInput(input CreateRequestInput) (CreateRequestInput, error) 
 	input.Title = strings.TrimSpace(input.Title)
 	input.IMDbID = strings.TrimSpace(input.IMDbID)
 	input.Overview = strings.TrimSpace(input.Overview)
-	input.PosterPath = strings.TrimSpace(input.PosterPath)
-	input.BackdropPath = strings.TrimSpace(input.BackdropPath)
+	// Art a client sent in another shape is dropped, not refused: the TMDB
+	// detail read fills it, and a watchlist add never fails over a poster.
+	input.PosterPath = tmdbImagePathOrEmpty(input.PosterPath)
+	input.BackdropPath = tmdbImagePathOrEmpty(input.BackdropPath)
 	if input.TVDBID != nil && *input.TVDBID <= 0 {
 		input.TVDBID = nil
 	}

@@ -288,6 +288,16 @@ func TestPushSenderRegistersRelayOnFirstSendWithoutCredential(t *testing.T) {
 				APNsID:    "apns-auto",
 				Status:    "accepted",
 			})
+		case relayRenewPath:
+			// The registration expires inside the renewal window, so the
+			// first send renews it before sending.
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"request_id":    "renew-request-auto",
+				"deployment_id": "deployment-auto",
+				"api_key":       "auto-capability-renewed",
+				"key_prefix":    "cap_v1_auto",
+				"expires_at":    "2027-06-01T00:00:00Z",
+			})
 		default:
 			t.Fatalf("unexpected relay path %q", r.URL.Path)
 		}
@@ -499,5 +509,25 @@ func TestPushSenderRetriesLaterWhenAFailedIdentityLookupMismatchesTheRecordedAtt
 	sender.serverID = nil
 	if result := send(); result.HTTPStatus != http.StatusUnprocessableEntity || result.UpstreamReason != relayCodeIdempotencyKeyReuse {
 		t.Fatalf("no identity configured: result = %+v, want the relay's 422", result)
+	}
+}
+
+// A relay Retry-After lengthens the wait before the next attempt but never
+// shortens the schedule: a 429 asking for a second would otherwise use up
+// every attempt within a few sweeps. The hint stays inside the relay's
+// idempotency window.
+func TestPushRetryDelayTreatsRetryAfterAsAMinimum(t *testing.T) {
+	for _, tc := range []struct {
+		retryAfter time.Duration
+		want       time.Duration
+	}{
+		{0, 30 * time.Second},
+		{time.Second, 30 * time.Second},
+		{10 * time.Minute, 10 * time.Minute},
+		{48 * time.Hour, pushRelayMaxRetryAfter},
+	} {
+		if got, more := pushRetryDelayWithHint(1, tc.retryAfter); got != tc.want || !more {
+			t.Errorf("delay after attempt 1 with Retry-After %s = %s (more %t), want %s", tc.retryAfter, got, more, tc.want)
+		}
 	}
 }
