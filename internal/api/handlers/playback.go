@@ -3766,10 +3766,11 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 			// move the generation to its older target.
 			recoverySeq := transcodeSession.BeginSegmentRecovery()
 			decision := transcodeSession.SegmentRecoveryDecisionForRequest(segNum, recoverySeq, now)
-			if decision.BeyondWaitReach {
-				// The request names a position the produced window cannot
-				// reach: it is the viewer's newest seek target, and every
-				// older wait or restart becomes superseded.
+			if decision.SeekTarget {
+				// The request names a position the current generation cannot
+				// reach (ahead of its window, or behind a restart's own start):
+				// it is the viewer's newest seek target, and every older wait or
+				// restart becomes superseded.
 				transcodeSession.MarkSegmentSeek(recoverySeq)
 			}
 			segmentStalled := false

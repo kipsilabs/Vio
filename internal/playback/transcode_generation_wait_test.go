@@ -146,6 +146,88 @@ func TestSegmentRecoveryDecisionFarRequestDuringRestartIsSeek(t *testing.T) {
 	}
 }
 
+// A backward seek that arrives while a forward restart is in flight names the
+// viewer's newer position, not a fragment the restart will produce. It must own
+// the next restart instead of waiting out the forward target.
+func TestSegmentRecoveryDecisionBackwardSeekDuringForwardRestartIsSeek(t *testing.T) {
+	session := &TranscodeSession{
+		outputDir: t.TempDir(),
+		running:   true,
+		opts: TranscodeOpts{
+			SessionID:          "session-backward-restart",
+			SegmentDuration:    2,
+			StartSegmentNumber: 475,
+		},
+	}
+	older := session.BeginSegmentRecovery()
+	session.mu.Lock()
+	session.restarting = &restartFlight{done: make(chan struct{})}
+	session.restartRecoverySeq = older
+	session.restartTargetSegment = 475
+	session.mu.Unlock()
+	newer := session.BeginSegmentRecovery()
+
+	back := session.SegmentRecoveryDecisionForRequest(172, newer, time.Now())
+	if !back.SeekTarget {
+		t.Fatalf("decision = %+v, want a backward seek to be the newest target", back)
+	}
+	if back.Wait || !back.RestartOnTimeout || back.Reason != SegmentRecoveryFarSeekReason {
+		t.Fatalf("decision = %+v, want an immediate restart at the backward target", back)
+	}
+
+	// The segment the forward restart itself produces still waits for it.
+	atTarget := session.SegmentRecoveryDecisionForRequest(475, newer, time.Now())
+	if atTarget.SeekTarget || !atTarget.Wait || atTarget.RestartOnTimeout {
+		t.Fatalf("decision = %+v, want a wait for the restart's own segment", atTarget)
+	}
+
+	// A request issued before the restart is not a newer target even when it
+	// lies behind the restart's production.
+	stale := session.SegmentRecoveryDecisionForRequest(172, older, time.Now())
+	if stale.SeekTarget || !stale.Wait || stale.RestartOnTimeout {
+		t.Fatalf("decision = %+v, want the restart's own request to keep waiting", stale)
+	}
+}
+
+// An overlapped recovery wait ends at the generation fence once the restart it
+// raced has published a successor, so the client reloads the playlist instead of
+// spending the head budget on a token that can never be served.
+func TestWaitForOpenSegmentRecoveryOverlappedRestartEndsStale(t *testing.T) {
+	session := generationWaitSession(t)
+	token := session.GenerationToken()
+	seq := session.BeginSegmentRecovery()
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := session.WaitForOpenSegmentRecoveryContext(
+			context.Background(),
+			"seg_00004.ts",
+			token,
+			seq,
+			5*time.Second,
+			0,
+		)
+		result <- err
+	}()
+
+	//nolint:forbidigo // timing is the condition under test (a wait outlasting the restart)
+	time.Sleep(100 * time.Millisecond)
+	// The overlapped restart published its replacement: the numeric timeline
+	// advances while the incarnation and the replacement process stay live.
+	session.mu.Lock()
+	session.segmentGeneration++
+	session.mu.Unlock()
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, ErrStaleSegmentGeneration) {
+			t.Fatalf("wait error = %v, want ErrStaleSegmentGeneration", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the overlapped wait did not end at the generation fence")
+	}
+}
+
 // An unfenced wait keeps the legacy behavior: no token, no generation check.
 func TestWaitForOpenSegmentWithoutGenerationKeepsLegacyTimeout(t *testing.T) {
 	session := generationWaitSession(t)
