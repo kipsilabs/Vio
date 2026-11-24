@@ -193,6 +193,22 @@ function describeTerminalCopy(terminal: TerminalV3): { title: string; message: s
 }
 
 /**
+ * Client-only reason: the viewer's Try again on a refused seek cannot be
+ * honoured at the remembered target because the source or version it was
+ * measured on is no longer the one on screen. Retrying the same position would
+ * silently start somewhere else, so the card says why instead.
+ */
+export const SEEK_RETRY_TARGET_UNAVAILABLE_REASON = "seek_retry_target_unavailable";
+
+export const SEEK_RETRY_TARGET_UNAVAILABLE: PlaybackPolicyErrorDescription = {
+  title: "That seek can't be retried",
+  message:
+    "The playback source changed since the seek, so it can't be retried at that position. Seek again.",
+  reason: SEEK_RETRY_TARGET_UNAVAILABLE_REASON,
+  retryable: false,
+};
+
+/**
  * Terminal reasons that mean the server found no playable adaptation for this
  * source on this device. Unlike a refused track or quality pick, there is no
  * plan left to keep on screen: the route itself could not be built.

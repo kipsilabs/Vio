@@ -6047,6 +6047,7 @@ describe("usePlaybackSession seek reanchor evidence recovery", () => {
     startBodies: Array<Record<string, unknown>>,
     replan: (sessionId: string, body: Record<string, unknown>) => unknown,
     deletes: string[] = [],
+    planFor: (sessionId: string) => ReturnType<typeof fixturePlanV3> = selectedPlan,
   ) {
     return vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
@@ -6059,7 +6060,7 @@ describe("usePlaybackSession seek reanchor evidence recovery", () => {
             server_features: ["playback_plan_v3"],
             outcome: "playable",
             session_id: sessionId,
-            playback_plan: selectedPlan(sessionId),
+            playback_plan: planFor(sessionId),
           },
           { status: 201 },
         );
@@ -6126,7 +6127,7 @@ describe("usePlaybackSession seek reanchor evidence recovery", () => {
 
     let accepted = true;
     await act(async () => {
-      accepted = await result.current.reanchorSeek(1234);
+      accepted = await result.current.reanchorSeek(918.161458);
     });
 
     // A provider read failure is a retryable condition, not a verdict on the
@@ -6142,6 +6143,11 @@ describe("usePlaybackSession seek reanchor evidence recovery", () => {
     expect(startBodies).toHaveLength(1);
     expect(deletes).toEqual([]);
 
+    // The player restores the pre-seek position while the card is up. That
+    // report must not overwrite the viewer's refused target: the retry starts
+    // where they asked to go, not where the card put the controls back.
+    act(() => result.current.updatePlaybackState(32.172995, false));
+
     // The card's Try again is a fresh start; the provider has recovered, so it
     // plays at the seek target with the viewer's tracks and offered release.
     act(() => result.current.restartPlayback());
@@ -6151,7 +6157,7 @@ describe("usePlaybackSession seek reanchor evidence recovery", () => {
     expect(startBodies[1]).toMatchObject({
       file_id: 7,
       file_selection: "auto",
-      start_position: 1234,
+      start_position: 918.161458,
       carried_audio_track_id: "file:7:audio:1",
       subtitle_track_index: 2,
     });
@@ -6221,6 +6227,143 @@ describe("usePlaybackSession seek reanchor evidence recovery", () => {
     expect(result.current.errorRetryable).toBe(true);
     // Only a failed `seek_reanchor` authorizes the rebuild.
     expect(startBodies).toHaveLength(1);
+
+    unmount();
+  });
+
+  // A retryable seek refusal keeps the plan and shows the same card for every
+  // terminal the server marks retryable. The card's target is the seek the
+  // viewer asked for, whatever the server's copy says, so each of them must
+  // start the fresh session there rather than at the restored pre-seek position.
+  it.each([
+    "seek_reanchor_evidence_unavailable",
+    "seek_reanchor_recipe_unavailable",
+    "transcode_start_failed",
+    "capacity_unavailable",
+  ])("retries %s at the refused seek target", async (reason) => {
+    const startBodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal(
+      "fetch",
+      startChainMock(startBodies, (sessionId) => ({
+        protocol_version: 3,
+        server_features: ["playback_plan_v3"],
+        outcome: "adaptation_unavailable",
+        session_id: sessionId,
+        terminal: {
+          reason,
+          message: "The seek could not be started.",
+          retryable: true,
+        },
+      })),
+    );
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    await act(async () => {
+      expect(await result.current.reanchorSeek(918.161458)).toBe(false);
+    });
+    await waitFor(() => expect(result.current.errorReason).toBe(reason));
+    expect(result.current.errorRetryable).toBe(true);
+
+    // The player puts the controls back where the seek started.
+    act(() => result.current.updatePlaybackState(32.172995, false));
+
+    act(() => result.current.restartPlayback());
+    await waitFor(() => expect(result.current.plan?.session_id).toBe("session-2"));
+
+    expect(startBodies).toHaveLength(2);
+    expect(startBodies[1]?.start_position).toBe(918.161458);
+
+    unmount();
+  });
+
+  it("refuses the retry when the version changed after the seek was refused", async () => {
+    const startBodies: Array<Record<string, unknown>> = [];
+    const deletes: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      startChainMock(
+        startBodies,
+        (sessionId) => seekEvidenceTerminal(sessionId),
+        deletes,
+        (sessionId) =>
+          fixturePlanV3({
+            session_id: sessionId,
+            requested_media_file_id: 7,
+            effective_media_file_id: 7,
+          }),
+      ),
+    );
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    await act(async () => {
+      expect(await result.current.reanchorSeek(918.161458)).toBe(false);
+    });
+    await waitFor(() =>
+      expect(result.current.errorReason).toBe("seek_reanchor_evidence_unavailable"),
+    );
+
+    // The session now names a different file for the same item. The target was
+    // measured on the old version, so the retry must not carry it across.
+    act(() => result.current.applyCommittedSource({ effectiveMediaFileId: 99 }, []));
+    act(() => result.current.restartPlayback());
+
+    expect(startBodies).toHaveLength(1);
+    expect(deletes).toEqual([]);
+    expect(result.current.errorReason).toBe("seek_retry_target_unavailable");
+
+    unmount();
+  });
+
+  it("refuses the retry when the source moved after the seek was refused", async () => {
+    const startBodies: Array<Record<string, unknown>> = [];
+    const deletes: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      startChainMock(startBodies, (sessionId) => seekEvidenceTerminal(sessionId), deletes),
+    );
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    await act(async () => {
+      expect(await result.current.reanchorSeek(918.161458)).toBe(false);
+    });
+    await waitFor(() =>
+      expect(result.current.errorReason).toBe("seek_reanchor_evidence_unavailable"),
+    );
+
+    // A serve-layer rotation moves the live candidate without adopting a new
+    // plan. The target was measured on the outgoing source, so the retry must
+    // not send it to the new one.
+    act(() =>
+      result.current.applyCommittedSource(
+        {
+          effectiveMediaFileId: 99,
+          effectiveVirtualUri: "virtual://movie/x?result=9999",
+        },
+        [],
+      ),
+    );
+    act(() => result.current.restartPlayback());
+
+    expect(startBodies).toHaveLength(1);
+    expect(deletes).toEqual([]);
+    expect(result.current.errorReason).toBe("seek_retry_target_unavailable");
+    expect(result.current.errorRetryable).toBe(false);
+    expect(result.current.error).toMatch(/source changed/i);
 
     unmount();
   });

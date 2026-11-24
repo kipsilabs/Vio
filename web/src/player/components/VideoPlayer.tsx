@@ -30,6 +30,7 @@ import { NextEpisodeOverlay } from "./NextEpisodeOverlay";
 import { usePlaybackRealtime } from "../hooks/usePlaybackRealtime";
 import { useWatchProgress } from "../hooks/useWatchProgress";
 import type { PlaybackConnectionStatus } from "../hooks/usePlaybackSession";
+import { SEEK_RETRY_TARGET_UNAVAILABLE_REASON } from "../playback-errors";
 import { useKeyboardShortcuts } from "../hooks/useKeyboardShortcuts";
 import { usePlayerFullscreenRoot } from "../context/PlayerFullscreenContext";
 import { isNativeVideoFullscreen, isPlayerFullscreen, toggleFullscreen } from "../utils/fullscreen";
@@ -2074,6 +2075,10 @@ export function VideoPlayer({
       transportFailedForPlanRevisionRef.current === planRevision ||
       !isPlayerReady ||
       replanErrorReason === "replan_timeout" ||
+      // A retry the client itself refused (the seek target no longer names the
+      // source on screen) is not retryable, but it must still replace the card
+      // the viewer is looking at rather than leaving the old one behind.
+      replanErrorReason === SEEK_RETRY_TARGET_UNAVAILABLE_REASON ||
       // A replan the server itself marked retryable is a verdict the viewer
       // must be able to act on, even when the old transport is still alive and
       // nothing was torn down: that is the seek path, where a refused reanchor
