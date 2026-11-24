@@ -140,11 +140,32 @@ export function createPlaylistGenerationGate(
   };
 }
 
+/**
+ * The generation a media playlist addresses, or null when it lists no segment
+ * URI with an `sgen` token (a multivariant playlist). The gate calls this for a
+ * playlist it has accepted, so the transport can retire requests that still
+ * name an older generation.
+ */
+export function playlistGenerationToken(body: string, baseUrl: string): string | null {
+  if (!body) return null;
+  for (const uri of playlistUris(body)) {
+    try {
+      const token = new URL(uri, baseUrl).searchParams.get(GENERATION_QUERY_PARAM);
+      if (token !== null) return token;
+    } catch {
+      // A malformed URI cannot name a generation; keep looking at the rest.
+    }
+  }
+  return null;
+}
+
 export interface FencedPlaylistLoaderOptions {
   retryDelayMs?: number;
   maxRetries?: number;
   schedule?: (callback: () => void, delayMs: number) => unknown;
   cancel?: (handle: unknown) => void;
+  /** Hears the generation of every playlist the gate accepts. */
+  onGeneration?: (token: string) => void;
 }
 
 /**
@@ -268,6 +289,10 @@ export function createFencedPlaylistLoader(
             return;
           }
           this.currentContext = null;
+          if (body !== null) {
+            const generation = playlistGenerationToken(body, loadedContext.url);
+            if (generation !== null) options.onGeneration?.(generation);
+          }
           callbacks.onSuccess(
             response,
             stats,

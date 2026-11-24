@@ -4,6 +4,7 @@ import {
   createFencedPlaylistLoader,
   createPlaylistGenerationGate,
   generationTokenFromSegmentUrl,
+  playlistGenerationToken,
   playlistNamesGeneration,
 } from "./fencedPlaylist";
 
@@ -61,6 +62,17 @@ describe("generationTokenFromSegmentUrl", () => {
   });
 });
 
+describe("playlistGenerationToken", () => {
+  it("reads the first generation a media playlist addresses", () => {
+    expect(playlistGenerationToken(mediaPlaylist(NEW), "http://localhost/media.m3u8")).toBe(NEW);
+  });
+
+  it("returns null for a multivariant playlist or an empty body", () => {
+    expect(playlistGenerationToken(MASTER, "http://localhost/master.m3u8")).toBe(null);
+    expect(playlistGenerationToken("", "http://localhost/master.m3u8")).toBe(null);
+  });
+});
+
 describe("playlistNamesGeneration", () => {
   it("recognises a media playlist that still lists the fenced generation", () => {
     expect(playlistNamesGeneration(mediaPlaylist(OLD), OLD, "http://localhost/media.m3u8")).toBe(
@@ -95,7 +107,7 @@ describe("playlistNamesGeneration", () => {
 describe("createFencedPlaylistLoader", () => {
   const flush = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
-  function harness(bodies: string[], maxRetries = 3) {
+  function harness(bodies: string[], maxRetries = 3, onGeneration?: (token: string) => void) {
     const gate = createPlaylistGenerationGate();
     let loads = 0;
     class BaseLoader {
@@ -132,6 +144,7 @@ describe("createFencedPlaylistLoader", () => {
     const waits: Array<() => void> = [];
     const Loader = createFencedPlaylistLoader(BaseLoader as never, gate, {
       maxRetries,
+      onGeneration,
       schedule: (callback) => {
         waits.push(callback);
         return waits.length - 1;
@@ -189,6 +202,15 @@ describe("createFencedPlaylistLoader", () => {
     await flush();
     expect(run.onSuccess).toHaveBeenCalledOnce();
     expect(run.waits).toHaveLength(0);
+  });
+
+  it("reports the generation of an accepted playlist", async () => {
+    const onGeneration = vi.fn();
+    const run = harness([mediaPlaylist(NEW)], 3, onGeneration);
+    run.load();
+    await flush();
+    expect(run.onSuccess).toHaveBeenCalledOnce();
+    expect(onGeneration).toHaveBeenCalledWith(NEW);
   });
 
   it("does not hand hls.js a stale playlist after its bound", async () => {

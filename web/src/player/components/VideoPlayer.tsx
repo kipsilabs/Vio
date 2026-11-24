@@ -89,6 +89,7 @@ import {
   createPlaylistGenerationGate,
   generationTokenFromSegmentUrl,
 } from "../utils/fencedPlaylist";
+import { createFencedFragmentLoader, createSegmentFenceLedger } from "../utils/fencedSegments";
 import type { DecodeErrorCarrier } from "../decode-failure";
 import {
   SegmentRetryBudget,
@@ -840,6 +841,10 @@ export function VideoPlayer({
   const isMountedRef = useRef(true);
   const effectiveTransportRevision = transportRevision ?? planRevision;
   const hlsRef = useRef<HlsType | null>(null);
+  // Every exact segment URL the server answered with a 412. Kept across the
+  // transports of one session: a queued hls.js retry and a stopped instance's
+  // reload must not ask the server the same dead question twice.
+  const segmentFenceRef = useRef(createSegmentFenceLedger());
   // The hls.js instance a generation fence stopped, with the transport identity
   // it belongs to and the position its recovery resumes at. If the reanchor
   // reuses that same generation, no transport effect runs, so a planRevision
@@ -1059,6 +1064,11 @@ export function VideoPlayer({
   const [framedSessionId, setFramedSessionId] = useState<string | null>(null);
   const sessionIdRef = useRef(sessionId);
   sessionIdRef.current = sessionId;
+  // A fence belongs to the playback session whose URLs it names. A new session
+  // starts with no refused URL and no generation to retire.
+  useEffect(() => {
+    segmentFenceRef.current.reset();
+  }, [sessionId]);
   // The plan revision the element's transport currently belongs to. Read by
   // seek bookkeeping that runs before the transport effect's own declaration.
   const planRevisionRef = useRef(planRevision);
@@ -4195,8 +4205,23 @@ export function VideoPlayer({
             });
             releasePlaylistGate = () => playlistGeneration.fence(null);
             const defaultLoader = Hls.DefaultConfig?.loader;
+            const segmentFence = segmentFenceRef.current;
             const FencedPlaylistLoader = defaultLoader
-              ? createFencedPlaylistLoader(defaultLoader, playlistGeneration)
+              ? createFencedPlaylistLoader(defaultLoader, playlistGeneration, {
+                  onGeneration: (token) => segmentFence.observeGeneration(token),
+                })
+              : undefined;
+            // The fragment layer is where hls.js's own retry and a stopped
+            // instance's reload race. Both ask through this loader, and the
+            // ledger is shared by the session's transports.
+            const defaultFragmentLoader = Hls.DefaultConfig?.fLoader ?? defaultLoader;
+            const FencedFragmentLoader = defaultFragmentLoader
+              ? createFencedFragmentLoader(
+                  defaultFragmentLoader as unknown as Parameters<
+                    typeof createFencedFragmentLoader
+                  >[0],
+                  segmentFence,
+                )
               : undefined;
 
             hls = new Hls({
@@ -4216,6 +4241,7 @@ export function VideoPlayer({
                 default: retryingLoadPolicy,
               },
               ...(FencedPlaylistLoader ? { pLoader: FencedPlaylistLoader } : {}),
+              ...(FencedFragmentLoader ? { fLoader: FencedFragmentLoader } : {}),
             });
 
             // A fragment load that errors is neither aborted nor given an
@@ -4268,6 +4294,11 @@ export function VideoPlayer({
                 // same fenced URL and answers 412 again, so stop the load
                 // before it can make one. This runs for a seek and for
                 // playback alike: only a refetch (or reanchor) may resume.
+                // The URL is final from here on: the fragment loader consults
+                // the same ledger, so a retry that was already queued, or a
+                // stopped instance reloaded after the generation changed, is
+                // answered locally instead of asked again.
+                segmentFence.refuse(data.frag?.url ?? data.url);
                 hls?.stopLoad();
                 if (seekTarget !== null) {
                   // A reanchor can legitimately reuse the generation (a target
