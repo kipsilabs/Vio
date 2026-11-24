@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -902,32 +903,40 @@ func TestCopySeekAnchorProbeBudgetHintSizesFromObservedProbeCost(t *testing.T) {
 // keeps the floor), while one that exhausts its budget records that budget as the
 // need's lower bound.
 func TestResolveCopySeekAnchorRecordsMeasuredProbeCost(t *testing.T) {
-	const fastIdentity = "virtual://movie/fast-cost"
-	now := time.Now()
-	cache := resetCopySeekAnchorCache(t, func() time.Time { return now }, func(context.Context, string, string, float64, int) (float64, int, error) {
-		return 100, 50, nil
-	})
-	if _, _, err := ResolveCopySeekAnchorForSource(context.Background(), "ffmpeg", fastIdentity, "http://relay/fast", 101, 2); err != nil {
-		t.Fatalf("fast probe: %v", err)
-	}
-	if hint := CopySeekAnchorProbeBudgetHint("ffmpeg", fastIdentity, 2); hint > 10*time.Millisecond {
-		t.Fatalf("hint for an instant probe = %v, want no measurable need", hint)
-	}
+	// A synthetic clock pins both observations: the instant probe measures zero
+	// cost, and the exhausted probe's budget expires without wall-clock waiting.
+	synctest.Test(t, func(t *testing.T) {
+		const fastIdentity = "virtual://movie/fast-cost"
+		now := time.Now()
+		cache := resetCopySeekAnchorCache(t, func() time.Time { return now }, func(context.Context, string, string, float64, int) (float64, int, error) {
+			return 100, 50, nil
+		})
+		if _, _, err := ResolveCopySeekAnchorForSource(context.Background(), "ffmpeg", fastIdentity, "http://relay/fast", 101, 2); err != nil {
+			t.Fatalf("fast probe: %v", err)
+		}
+		if hint := CopySeekAnchorProbeBudgetHint("ffmpeg", fastIdentity, 2); hint > 10*time.Millisecond {
+			t.Fatalf("hint for an instant probe = %v, want no measurable need", hint)
+		}
 
-	const slowIdentity = "virtual://movie/slow-cost"
-	cache.probe = func(ctx context.Context, _ string, _ string, _ float64, _ int) (float64, int, error) {
-		<-ctx.Done()
-		return 0, 0, ctx.Err()
-	}
-	budget := 80 * time.Millisecond
-	probeCtx, cancel := context.WithTimeout(context.Background(), budget)
-	defer cancel()
-	if _, _, err := ResolveCopySeekAnchorForSource(probeCtx, "ffmpeg", slowIdentity, "http://relay/slow", 101, 2); err == nil {
-		t.Fatal("a probe that never returns resolved an anchor")
-	}
-	if hint := CopySeekAnchorProbeBudgetHint("ffmpeg", slowIdentity, 2); hint < budget || hint > CopySeekProbeTimeout {
-		t.Fatalf("hint after an exhausted %v budget = %v, want at least that budget", budget, hint)
-	}
+		const slowIdentity = "virtual://movie/slow-cost"
+		cache.probe = func(ctx context.Context, _ string, _ string, _ float64, _ int) (float64, int, error) {
+			<-ctx.Done()
+			return 0, 0, ctx.Err()
+		}
+		budget := 80 * time.Millisecond
+		probeCtx, cancel := context.WithTimeout(context.Background(), budget)
+		defer cancel()
+		if _, _, err := ResolveCopySeekAnchorForSource(probeCtx, "ffmpeg", slowIdentity, "http://relay/slow", 101, 2); err == nil {
+			t.Fatal("a probe that never returns resolved an anchor")
+		}
+		// The caller returns when its budget ends, while the singleflight probe
+		// records the cost asynchronously. Wait for the bubble to go idle so the
+		// probe has recorded before the hint is read.
+		synctest.Wait()
+		if hint := CopySeekAnchorProbeBudgetHint("ffmpeg", slowIdentity, 2); hint < budget || hint > CopySeekProbeTimeout {
+			t.Fatalf("hint after an exhausted %v budget = %v, want at least that budget", budget, hint)
+		}
+	})
 }
 
 // TestResolveCopySeekAnchorSkipsProbeWhenCallerBudgetExpired proves an already
