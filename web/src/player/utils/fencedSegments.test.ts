@@ -90,13 +90,29 @@ function callbacks() {
 }
 
 describe("createSegmentFenceLedger", () => {
-  it("forgets every fence when the session changes", () => {
+  it("forgets every fence when the playback changes", () => {
     const ledger = createSegmentFenceLedger();
-    ledger.refuse(segmentUrl("seg_00584.ts", "session-1:inc:1"));
-    expect(ledger.isFinal(segmentUrl("seg_00584.ts", "session-1:inc:1"))).toBe(true);
+    const url = segmentUrl("seg_00584.ts", "session-1:inc:1");
+    ledger.refuse(url);
+    expect(ledger.claimFence(url)).toBe(true);
+    expect(ledger.isFinal(url)).toBe(true);
 
     ledger.reset();
-    expect(ledger.isFinal(segmentUrl("seg_00584.ts", "session-1:inc:1"))).toBe(false);
+    expect(ledger.isFinal(url)).toBe(false);
+    expect(ledger.claimFence(url)).toBe(true);
+  });
+
+  it("answers one fence once, even when a replacement transport asks again", () => {
+    const ledger = createSegmentFenceLedger();
+    const refused = segmentUrl("seg_00584.ts", "session-1:inc:1");
+    const other = segmentUrl("seg_00585.ts", "session-1:inc:1");
+
+    expect(ledger.claimFence(refused)).toBe(true);
+    // hls.js's queued retry, or the session replacement's transport, names the
+    // same URL. It already spent its answer before the session changed.
+    expect(ledger.claimFence(refused)).toBe(false);
+    // A different segment is a different fence, even under the same sgen.
+    expect(ledger.claimFence(other)).toBe(true);
   });
 });
 
@@ -114,8 +130,10 @@ describe("createFencedFragmentLoader", () => {
     expect(firstCallbacks.onError).toHaveBeenCalledOnce();
     expect(run.ledger.isFinal(url)).toBe(true);
 
-    // hls.js's queued retry asks through a new loader instance, exactly as it
-    // does after a fragment error. The exact URL is dead: no request is made.
+    // hls.js's queued retry asks through a new loader instance, exactly as the
+    // replacement session's transport does after a session swap. The ledger is
+    // keyed by the media, so the new transport inherits it; the exact URL is
+    // dead and no second request crosses the boundary.
     const retry = run.loader();
     const retryCallbacks = callbacks();
     retry.load({ url, responseType: "arraybuffer" } as never, {} as never, retryCallbacks);

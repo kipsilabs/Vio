@@ -14,7 +14,8 @@ import { generationTokenFromSegmentUrl } from "./fencedPlaylist";
 import { STALE_GENERATION_STATUS } from "./startupGuard";
 
 /**
- * The exact segment URLs the server has already refused with a 412.
+ * The exact segment URLs the server has already refused with a 412, and the
+ * fence answers the player has already spent.
  *
  * A fence is final for a URL, not for the transport that happened to request
  * it. hls.js retries a failed fragment by issuing the same URL again, and a
@@ -22,12 +23,27 @@ import { STALE_GENERATION_STATUS } from "./startupGuard";
  * playlist still names the dead URL. Both layers would ask the server the same
  * question and get the same 412. Keeping the answer here, above the fragment
  * loader, makes the second request impossible instead of merely ignored.
+ *
+ * The ledger belongs to the media being played, not to one playback session.
+ * A session replacement for the same title and file inherits it, so a URL the
+ * old session answered is not requested again by the replacement's transport,
+ * and one fence cannot buy a second reanchor. A genuinely different playback
+ * (another title, another version, or a new player mount) starts a fresh
+ * ledger; see `VideoPlayer`'s media identity.
  */
 export interface SegmentFenceLedger {
-  /** The server refused this exact URL; it is dead for the session. */
+  /** The server refused this exact URL; it is dead for this playback. */
   refuse(url: string | null | undefined): void;
   /** Whether this exact URL has already been answered with a 412. */
   isFinal(url: string | null | undefined): boolean;
+  /**
+   * Record that this exact URL's fence has been answered (a playlist refetch,
+   * a bounded rebuild, or a reanchor). Returns whether this is the first
+   * answer. A queued retry, a stopped instance's reload and the replacement
+   * transport of the same media all get false, so one fence cannot spend two
+   * rebuilds across a session boundary.
+   */
+  claimFence(url: string | null | undefined): boolean;
   /**
    * Note the generation an accepted playlist addresses. A change aborts
    * in-flight fragment loads that still name an earlier generation.
@@ -40,7 +56,7 @@ export interface SegmentFenceLedger {
   track(load: ActiveFragmentLoad): () => void;
   /** The generation named by the most recent accepted playlist, if any. */
   readonly generation: string | null;
-  /** Forget every fence for a new playback session. */
+  /** Forget every fence for a genuinely different playback. */
   reset(): void;
 }
 
@@ -51,6 +67,7 @@ interface ActiveFragmentLoad {
 
 export function createSegmentFenceLedger(): SegmentFenceLedger {
   const finalUrls = new Set<string>();
+  const answeredFences = new Set<string>();
   const active = new Set<ActiveFragmentLoad>();
   let generation: string | null = null;
 
@@ -61,6 +78,12 @@ export function createSegmentFenceLedger(): SegmentFenceLedger {
     },
     isFinal(url) {
       return url !== null && url !== undefined && finalUrls.has(url);
+    },
+    claimFence(url) {
+      if (!url) return true;
+      if (answeredFences.has(url)) return false;
+      answeredFences.add(url);
+      return true;
     },
     observeGeneration(token) {
       if (!token || token === generation) return;
@@ -86,6 +109,7 @@ export function createSegmentFenceLedger(): SegmentFenceLedger {
     },
     reset() {
       finalUrls.clear();
+      answeredFences.clear();
       active.clear();
       generation = null;
     },
