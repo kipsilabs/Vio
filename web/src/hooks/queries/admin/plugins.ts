@@ -99,7 +99,7 @@ export function useAdminPluginProvisioningStatus() {
   });
 }
 
-const PLUGIN_SOURCE_KINDS = new Set(["silo", "approved_community", "external"]);
+const PLUGIN_SOURCE_KINDS = new Set(["silo", "vio", "approved_community", "external"]);
 const PLUGIN_PAGE_LIMIT = 100;
 const PLUGIN_PAGE_CAP = 100;
 
