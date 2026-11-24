@@ -3325,7 +3325,7 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 			// owns the generation's next restart.
 			recoverySeq := session.BeginSegmentRecovery()
 			decision := session.SegmentRecoveryDecisionForRequest(segNum, recoverySeq, now)
-			if decision.BeyondWaitReach {
+			if decision.SeekTarget {
 				session.MarkSegmentSeek(recoverySeq)
 			}
 			segmentStalled := false

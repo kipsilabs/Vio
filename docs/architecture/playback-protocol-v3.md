@@ -1278,13 +1278,26 @@ older waits that have not expired. Each recovery request is numbered when it
 arrives, not when its wait ends, and the newest position the produced window
 cannot reach becomes the viewer's target. A wait or restart issued before it is
 superseded: the wait ends at the fence and never restarts FFmpeg at the older
-position. A request that arrives while an in-place restart is running is
-coalesced onto that restart when it lies beyond the reach of the restart's own
-production (a seek); otherwise it waits for the segment as before. The worker
-re-reads the coalesced target after each restart, so the final position is the
-last one the viewer asked for. A request farther past the produced head than the
-throttle's forward window is a seek rather than sequential prefetch, because a
-healthy encoder is allowed to run ahead of the client by at least that window.
+position, and the supersession is checked again under the lock that owns the
+restart so a seek recorded in between cannot still move the generation. A
+request that arrives while an in-place restart is running is coalesced onto that
+restart when it lies outside the restart's own production: ahead of its target
+or behind it, because a replacement only produces forward and a backward seek
+must not wait for a forward target it will never satisfy. Otherwise it waits for
+the segment as before. The worker re-reads the coalesced target after each
+restart, so the final position is the last one the viewer asked for. A request
+farther past the produced head than the throttle's forward window is a seek
+rather than sequential prefetch, because a healthy encoder is allowed to run
+ahead of the client by at least that window.
+
+**A generation token rotates only when its replacement is published.** The
+numeric generation in `sgen` advances after the replacement FFmpeg process has
+spawned, not when the old one is killed. Until then the live token still names
+the session, so a request that outlasts the restart either waits or is served
+from the retained predecessor. A restart that fails to spawn leaves the token
+unchanged and answers a retryable `503 unavailable`; it must never answer
+`412 stale_generation` for a successor that does not exist, because the client
+would reload a playlist whose generation was never built and park.
 
 Re-encoding the leading GOP to remove the pre-roll was considered and rejected:
 it changes the delivery and play method — a CPU-cost and route decision, not a

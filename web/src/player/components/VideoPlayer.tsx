@@ -79,6 +79,7 @@ import { resolveVersionAudioLanguage } from "../utils/effectiveAudioLanguage";
 import { resolveEffectiveVersion } from "../utils/resolveEffectiveVersion";
 import {
   isStaleGenerationError,
+  MAX_FENCE_RECOVERY_ATTEMPTS,
   MAX_STALE_GENERATION_RECOVERIES,
   recoverFromStaleGeneration,
   StartupGuard,
@@ -88,6 +89,7 @@ import {
   createPlaylistGenerationGate,
   generationTokenFromSegmentUrl,
 } from "../utils/fencedPlaylist";
+import { createFencedFragmentLoader, createSegmentFenceLedger } from "../utils/fencedSegments";
 import type { DecodeErrorCarrier } from "../decode-failure";
 import {
   SegmentRetryBudget,
@@ -516,6 +518,11 @@ export const PROGRESSIVE_REMUX_SEEK_NO_BYTES_MS = 15_000;
 // arrives. The budget is small so a genuinely blocked autoplay settles into a
 // paused player with working controls instead of retrying forever.
 const AUTOPLAY_RETRY_DELAY_MS = 400;
+// How long a fence recovery may go without a media request or a frame before
+// the player treats it as stalled. A request in flight is the evidence the
+// recovery is working, so FRAG_LOADING clears this; the bound only catches the
+// state that would otherwise park with `readyState = 0` and nothing fetching.
+const FENCE_RECOVERY_STALL_MS = 4_000;
 /**
  * The tap-to-play overlay's label. It is a module constant like the room
  * messages below so the player's JSX carries no untranslated literal.
@@ -834,18 +841,48 @@ export function VideoPlayer({
   const isMountedRef = useRef(true);
   const effectiveTransportRevision = transportRevision ?? planRevision;
   const hlsRef = useRef<HlsType | null>(null);
-  // The hls.js instance a pending-seek generation fence stopped, with the
-  // transport identity it belongs to. If the reanchor reuses that same
-  // generation, no transport effect runs, so a planRevision effect refetches
-  // its playlist (see below) instead of leaving a stopped instance behind. A
-  // reanchor that builds a new generation must not restart the stopped one: its
-  // refetch would request the fenced segment a second time and then be aborted
-  // by the replacement.
-  const stoppedHlsForSeekRef = useRef<{
+  // The media a fence belongs to: the title and the version the viewer asked
+  // for, not the playback session. A seek reanchor or a dead-session recovery
+  // replaces the session for the same media, and its first requests still name
+  // the URLs the outgoing transport fenced; inheriting the ledger is what keeps
+  // those dead URLs off the wire and stops one fence from buying a second
+  // reanchor. A different title or version, or a new player mount, starts a
+  // fresh ledger.
+  const segmentFenceIdentity = `${contentId ?? ""}:${plan.requested_media_file_id}`;
+  const segmentFence = useMemo(() => {
+    // The identity is the ledger's lifetime, not an input it reads. Keying
+    // the memo on it, rather than on `sessionId`, is what lets a replacement
+    // session for the same media inherit the fences; the plan object is
+    // replaced on every adoption and must not reset them.
+    void segmentFenceIdentity;
+    return createSegmentFenceLedger();
+  }, [segmentFenceIdentity]);
+  const segmentFenceRef = useRef(segmentFence);
+  segmentFenceRef.current = segmentFence;
+  // The hls.js instance a generation fence stopped, with the transport identity
+  // it belongs to and the position its recovery resumes at. If the reanchor
+  // reuses that same generation, no transport effect runs, so a planRevision
+  // effect refetches its playlist (see below) instead of leaving a stopped
+  // instance behind. A reanchor that builds a new generation must not restart
+  // the stopped one: its refetch would request the fenced segment a second time
+  // and then be aborted by the replacement.
+  const stoppedHlsForFenceRef = useRef<{
     hls: HlsType;
     streamUrl: string;
     transportRevision: number;
+    resumePlayerSeconds: number;
   } | null>(null);
+  // A fence stopped this transport and its bounded recovery produced no media.
+  // The player then has nothing live, so a seek press must rebuild the stream
+  // at the target instead of writing a time to an empty element and reporting a
+  // seek that never happened.
+  const fenceParkedRef = useRef(false);
+  // Rebuilds a parked transport at a position the viewer chose. Assigned by the
+  // transport effect; the no-op keeps the old behavior when no transport
+  // exists to recover.
+  const recoverParkedTransportRef = useRef<(seconds: number) => boolean | Promise<boolean>>(
+    () => false,
+  );
   // The viewer's play/pause intent, kept across the transient pauses a
   // transport teardown or a seek replacement reports. A rapid sequence of
   // backward seeks must not sample one of those pauses as "the viewer paused"
@@ -2246,6 +2283,15 @@ export function VideoPlayer({
 
       resetRoomCatchupRate();
 
+      // A fence parked this transport: it has no live media, so the
+      // buffer-first and native paths below would write a time to an empty
+      // element, leaving the last frame on screen and reporting a seek that
+      // never reached the server. Rebuild at the target instead.
+      if (fenceParkedRef.current) {
+        fenceParkedRef.current = false;
+        return recoverParkedTransportRef.current(seconds);
+      }
+
       if (directPlayOriginPendingRef.current) {
         rememberPendingSeek(seconds);
         setCurrentTime(seconds);
@@ -3432,6 +3478,10 @@ export function VideoPlayer({
       return;
     }
     transportStartupPendingRef.current = true;
+    // A new transport starts unparked. Its parked-recovery callback is
+    // installed once an HLS instance exists; until then nothing can rebuild it.
+    fenceParkedRef.current = false;
+    recoverParkedTransportRef.current = () => false;
     // A source is loading, a replan's as well as the first: speed tests wait
     // for it as for a start.
     const sourceLoaded = sourceLoadStarted();
@@ -3518,21 +3568,41 @@ export function VideoPlayer({
     // surface a retry instead of a frozen playhead.
     let progressiveSeekNoBytesTimer: ReturnType<typeof setTimeout> | null = null;
     let progressiveSeekSettle: (() => void) | null = null;
-    // Bounds the stale-generation playlist refetches for this transport. A seek
-    // does not refetch the playlist; it reanchors (see the hls.js ERROR
-    // handler), so this only counts the in-place replay recovery.
+    // Bounds the stale-generation playlist refetches for this fence episode.
+    // A seek does not refetch the playlist; it reanchors (see the hls.js ERROR
+    // handler), so this only counts the in-place replay recovery. The episode
+    // resets when a fragment loads, not when the token rotates: a rebuilt
+    // generation that still does not serve the segment is the same failed
+    // recovery, and a rotation must not hand it another two refetches.
     let staleGenerationRecoveries = 0;
-    // The fenced segment the transport has already answered. hls.js queues its
-    // own retry of a failed fragment before this listener runs, and a further
-    // 412 for the same URL is that retry arriving, not a new fence.
-    let fencedSegmentKey: string | null = null;
-    // The generation the refetch budget below is counting. A different token
-    // is a rotation: it starts a new bound instead of spending the displaced
-    // generation's.
-    let fencedGeneration: string | null = null;
+    // A fence that outlasted its playlist refetches is recovered by asking the
+    // server to rebuild the generation. Once that escalation starts, further
+    // fences go straight to the bounded rebuild path instead of refetching a
+    // playlist that has already failed twice.
+    let fenceEscalated = false;
+    // Server rebuilds this transport has already asked for, against
+    // MAX_FENCE_RECOVERY_ATTEMPTS. Reset when a fragment loads (the recovery
+    // produced media) and by a new transport.
+    let fenceRecoveryAttempts = 0;
+    // A rebuild request whose answer is still outstanding. A queued 412 does
+    // not start a parallel one; its outcome decides the next attempt.
+    let fenceRecoveryInFlight = false;
+    // Identifies the outstanding attempt so a late answer from one superseded
+    // by a viewer press cannot park or un-park the wrong state.
+    let fenceRecoverySeq = 0;
+    // The playhead the episode must restore if every attempt fails. Captured
+    // before the first rebuild stops the transport.
+    let fenceRecoveryPlayhead: number | null = null;
+    // A request in flight after a recovery proves it is making progress; the
+    // stall bound only catches a transport that stopped fetching entirely.
+    let fenceRequestSeen = false;
+    let fenceWatchdog: ReturnType<typeof setTimeout> | null = null;
     // The pending seek target a stale-generation fence already sent back as a
-    // reanchor. A second fence for the same target is not re-sent: it falls
-    // through to the ordinary failure path, so one seek cannot loop on replans.
+    // reanchor. A different URL under the same target is the rebuilt
+    // generation failing to serve the seek, which spends the bounded rebuild
+    // path instead of issuing a fresh reanchor. The per-URL fence answer
+    // (including the replacement session's) lives in the shared ledger, so a
+    // retry of the same URL is ignored across the session boundary too.
     let staleSeekReanchorTarget: number | null = null;
     let playbackStarted = false;
     let autoplayInFlight = false;
@@ -3963,39 +4033,166 @@ export function VideoPlayer({
             // failing. Rebuilding at the playhead is a seek_reanchor: it keeps
             // the session, the route and the attempt history, and it never
             // reaches failure_recovery, which would retire the only recipe and
-            // terminal the session at adaptation_exhausted. Only when no
-            // reanchor handler exists does this surface the retryable card.
-            // One recovery per transport: the gate and the segment refetch
-            // bound can report the same fence, and a second reanchor would
-            // replace the plan the first one is already fetching.
-            let fenceRecoveryInFlight = false;
-            const recoverFencedTransport = (): void => {
-              if (destroyed || fenceRecoveryInFlight) return;
-              fenceRecoveryInFlight = true;
+            // terminal the session at adaptation_exhausted.
+            //
+            // A fence episode is bounded in two stages. The playlist gate and
+            // the segment refetch bound get MAX_STALE_GENERATION_RECOVERIES
+            // reloads; when those serve no media the player asks the server to
+            // rebuild the generation, at most MAX_FENCE_RECOVERY_ATTEMPTS
+            // times. After the last one the viewer gets the retry card with the
+            // position restored, never a stopped transport with readyState 0.
+            let releasePlaylistGate: () => void = () => {};
+            let recoverFencedTransport: (
+              targetSeconds?: number,
+            ) => boolean | Promise<boolean> = () => false;
+
+            const clearFenceWatchdog = () => {
+              if (fenceWatchdog === null) return;
+              clearTimeout(fenceWatchdog);
+              fenceWatchdog = null;
+            };
+
+            // The playhead every failing attempt restores. Captured before the
+            // first rebuild stops the transport, because a stopped element can
+            // report zero.
+            const fencePlayhead = (): number => {
+              if (fenceRecoveryPlayhead === null) {
+                fenceRecoveryPlayhead = toMediaTime(video.currentTime, timelineOffsetRef.current);
+              }
+              return fenceRecoveryPlayhead;
+            };
+
+            // Every attempt failed. Leave the controls and the session on the
+            // media the viewer had, stop the dead transport, and offer the
+            // ordinary retry card (which starts a fresh session at that
+            // position). A fence is not a route failure, so it never reports a
+            // plan failure here.
+            const surfaceFenceRetry = (fallbackSeconds: number) => {
+              if (destroyed) return;
+              fenceParkedRef.current = true;
+              fenceRecoveryInFlight = false;
+              clearFenceWatchdog();
               hls?.stopLoad();
-              const seconds = toMediaTime(video.currentTime, timelineOffsetRef.current);
+              const pending = pendingSeekTimeRef.current;
+              const origin = seekOriginTimeRef.current;
+              const position = pending !== null && origin !== null ? origin : fallbackSeconds;
+              if (pending !== null) releasePendingSeek(pending);
+              seekOriginTimeRef.current = null;
+              setCurrentTime(position);
+              if (!video.paused) video.pause();
+              setPlayerError("Playback failed. Please try again.", true);
+            };
+
+            // A request in flight is evidence the recovery is working. Only a
+            // recovery that produces neither a request nor a frame is treated
+            // as stalled, and it spends the next bounded attempt instead of
+            // parking.
+            const armFenceWatchdog = () => {
+              clearFenceWatchdog();
+              fenceRequestSeen = false;
+              fenceWatchdog = setTimeout(() => {
+                fenceWatchdog = null;
+                if (destroyed || fenceRequestSeen) return;
+                if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) return;
+                void recoverFencedTransport(fenceRecoveryPlayhead ?? undefined);
+              }, FENCE_RECOVERY_STALL_MS);
+            };
+
+            const issueFenceReanchor = (target: number): boolean | Promise<boolean> => {
+              fenceEscalated = true;
+              fenceRecoveryAttempts += 1;
+              fenceRecoveryInFlight = true;
+              fenceRecoverySeq += 1;
+              const seq = fenceRecoverySeq;
+              clearFenceWatchdog();
+              hls?.stopLoad();
+              // A rebuild can reuse this generation (the target is inside its
+              // window or playback simply continues). Its refetched playlist
+              // must not be held back by the displaced token.
+              releasePlaylistGate();
+              if (hls) {
+                stoppedHlsForFenceRef.current = {
+                  hls,
+                  streamUrl: effectiveStreamUrl,
+                  transportRevision: effectiveTransportRevision,
+                  resumePlayerSeconds: toPlayerTime(target, timelineOffsetRef.current),
+                };
+              }
               let accepted: boolean | Promise<boolean>;
               try {
-                accepted = reanchorAtRef.current(seconds);
+                accepted = reanchorAtRef.current(target);
               } catch {
                 accepted = false;
               }
+              // reanchorAt remembers the rebuild position as a pending target
+              // even when playback, not a seek, raised the fence. Record it so
+              // a further 412 for that target under a different URL counts as
+              // this attempt failing rather than a fresh seek.
+              if (staleSeekReanchorTarget === null && pendingSeekTimeRef.current !== null) {
+                staleSeekReanchorTarget = pendingSeekTimeRef.current;
+              }
+              const settle = (ok: boolean) => {
+                if (seq !== fenceRecoverySeq || destroyed) return;
+                fenceRecoveryInFlight = false;
+                if (!ok) {
+                  surfaceFenceRetry(target);
+                  return;
+                }
+                // A plan that reuses this transport is reloaded by the
+                // planRevision effect; one that builds a new transport starts
+                // its own episode. Either way this bounds "no request, no
+                // frame".
+                armFenceWatchdog();
+              };
               if (accepted === false) {
-                setPlayerError("Playback failed. Please try again.", true);
-                return;
+                settle(false);
+                return false;
               }
               if (accepted && typeof (accepted as Promise<boolean>).then === "function") {
-                void (accepted as Promise<boolean>).then(
+                return (accepted as Promise<boolean>).then(
                   (ok) => {
-                    if (!ok && !destroyed)
-                      setPlayerError("Playback failed. Please try again.", true);
+                    settle(ok);
+                    return ok;
                   },
-                  () => {
-                    if (!destroyed) setPlayerError("Playback failed. Please try again.", true);
+                  (error: unknown) => {
+                    settle(false);
+                    throw error;
                   },
                 );
               }
+              settle(true);
+              return accepted;
             };
+
+            recoverFencedTransport = (targetSeconds?: number): boolean | Promise<boolean> => {
+              if (destroyed) return false;
+              if (fenceRecoveryInFlight) return true;
+              const target = targetSeconds ?? fencePlayhead();
+              if (fenceRecoveryAttempts >= MAX_FENCE_RECOVERY_ATTEMPTS) {
+                surfaceFenceRetry(target);
+                return false;
+              }
+              return issueFenceReanchor(target);
+            };
+
+            // A viewer press while parked is fresh intent: it gets the whole
+            // bound again and rebuilds at the position they asked for. The
+            // "reload" half is the planRevision effect's in-place playlist
+            // refetch when the server reuses this transport.
+            recoverParkedTransportRef.current = (seconds: number): boolean | Promise<boolean> => {
+              if (destroyed) return false;
+              fenceParkedRef.current = false;
+              fenceEscalated = false;
+              fenceRecoveryAttempts = 0;
+              fenceRecoveryInFlight = false;
+              fenceRecoverySeq += 1;
+              staleGenerationRecoveries = 0;
+              staleSeekReanchorTarget = null;
+              fenceRecoveryPlayhead = seconds;
+              setPlayerError(null);
+              return recoverFencedTransport(seconds);
+            };
+
             // A 412 names a generation the server has replaced. A playlist
             // fetched before the successor is published lists the dead
             // generation again, and hls.js would request (and retry) those
@@ -4006,9 +4203,25 @@ export function VideoPlayer({
               recoverFencedTransport();
               return true;
             });
+            releasePlaylistGate = () => playlistGeneration.fence(null);
             const defaultLoader = Hls.DefaultConfig?.loader;
+            const segmentFence = segmentFenceRef.current;
             const FencedPlaylistLoader = defaultLoader
-              ? createFencedPlaylistLoader(defaultLoader, playlistGeneration)
+              ? createFencedPlaylistLoader(defaultLoader, playlistGeneration, {
+                  onGeneration: (token) => segmentFence.observeGeneration(token),
+                })
+              : undefined;
+            // The fragment layer is where hls.js's own retry and a stopped
+            // instance's reload race. Both ask through this loader, and the
+            // ledger is shared by the session's transports.
+            const defaultFragmentLoader = Hls.DefaultConfig?.fLoader ?? defaultLoader;
+            const FencedFragmentLoader = defaultFragmentLoader
+              ? createFencedFragmentLoader(
+                  defaultFragmentLoader as unknown as Parameters<
+                    typeof createFencedFragmentLoader
+                  >[0],
+                  segmentFence,
+                )
               : undefined;
 
             hls = new Hls({
@@ -4028,6 +4241,7 @@ export function VideoPlayer({
                 default: retryingLoadPolicy,
               },
               ...(FencedPlaylistLoader ? { pLoader: FencedPlaylistLoader } : {}),
+              ...(FencedFragmentLoader ? { fLoader: FencedFragmentLoader } : {}),
             });
 
             // A fragment load that errors is neither aborted nor given an
@@ -4069,12 +4283,22 @@ export function VideoPlayer({
               ) {
                 const seekTarget = pendingSeekTimeRef.current;
                 const fenceToken = generationTokenFromSegmentUrl(data.frag?.url ?? data.url);
-                const fenceKey = fenceToken ?? data.frag?.url ?? data.url ?? null;
+                // The URL, not the generation token, identifies one fence
+                // answer. A queued retry names the same URL; a different
+                // segment under the same `sgen` is the rebuilt generation
+                // failing to serve the requested window, which must buy the
+                // next bounded attempt instead of being ignored.
+                const fenceKey = data.frag?.url ?? data.url ?? fenceToken;
                 // hls.js has already queued its own retry of this fragment
                 // for the next tick. Every one of those requests names the
                 // same fenced URL and answers 412 again, so stop the load
                 // before it can make one. This runs for a seek and for
                 // playback alike: only a refetch (or reanchor) may resume.
+                // The URL is final from here on: the fragment loader consults
+                // the same ledger, so a retry that was already queued, or a
+                // stopped instance reloaded after the generation changed, is
+                // answered locally instead of asked again.
+                segmentFence.refuse(data.frag?.url ?? data.url);
                 hls?.stopLoad();
                 if (seekTarget !== null) {
                   // A reanchor can legitimately reuse the generation (a target
@@ -4082,14 +4306,30 @@ export function VideoPlayer({
                   // held back by the dead segment's token.
                   playlistGeneration.fence(null);
                   if (hls) {
-                    stoppedHlsForSeekRef.current = {
+                    stoppedHlsForFenceRef.current = {
                       hls,
                       streamUrl: effectiveStreamUrl,
                       transportRevision: effectiveTransportRevision,
+                      resumePlayerSeconds: toPlayerTime(seekTarget, timelineOffsetRef.current),
                     };
                   }
-                  if (staleSeekReanchorTarget !== seekTarget) {
-                    staleSeekReanchorTarget = seekTarget;
+                  const seekFenceKey = data.frag?.url ?? data.url ?? null;
+                  if (!segmentFence.claimFence(seekFenceKey)) {
+                    // hls.js's queued retry of the URL this seek already
+                    // answered, or the replacement transport asking the same
+                    // dead URL after the session was swapped. The recovery it
+                    // belongs to is already in flight or spent; one fence must
+                    // not buy a second reanchor.
+                    return;
+                  }
+                  const sameTarget = staleSeekReanchorTarget === seekTarget;
+                  staleSeekReanchorTarget = seekTarget;
+                  if (sameTarget) {
+                    // The rebuilt generation did not serve the target either.
+                    // Spend the bounded rebuild path instead of waiting for a
+                    // request no one will make.
+                    recoverFencedTransport(seekTarget);
+                  } else {
                     console.warn(
                       "[hls.js] stale generation for a pending seek; re-anchoring at the target",
                       { target: seekTarget },
@@ -4103,20 +4343,27 @@ export function VideoPlayer({
                   return;
                 }
                 // One fence is answered once. A later 412 for the same URL is
-                // hls.js's queued retry (or a stale playlist this transport
-                // already refetched); the URL is dead, so it must not buy
-                // another refetch or another request.
-                if (fenceKey !== null && fenceKey === fencedSegmentKey) return;
-                if (fenceKey !== null) fencedSegmentKey = fenceKey;
-                if (fenceToken !== null) playlistGeneration.fence(fenceToken);
-                // A different generation is the server rotating again, which
-                // is normal under a seek burst. Start its refetch bound again
-                // instead of spending the displaced generation's.
-                if (fenceToken !== null && fenceToken !== fencedGeneration) {
-                  fencedGeneration = fenceToken;
-                  staleGenerationRecoveries = 0;
+                // hls.js's queued retry, a stale playlist this transport
+                // already refetched, or the replacement transport asking the
+                // dead URL after a session swap; the URL is dead, so it must
+                // not buy another refetch or another reanchor. If no request
+                // follows, the stall bound spends the next attempt instead of
+                // parking, so a retry that outlives its answer still makes
+                // progress.
+                if (!segmentFence.claimFence(fenceKey)) {
+                  if (!fenceRecoveryInFlight) armFenceWatchdog();
+                  return;
                 }
-                if (!destroyed && staleGenerationRecoveries < MAX_STALE_GENERATION_RECOVERIES) {
+                if (fenceToken !== null) playlistGeneration.fence(fenceToken);
+                // The refetch bound is per fence episode, not per generation:
+                // a rotation inside an unresolved fence is the same recovery
+                // still failing, not a fresh one. It resets when a fragment
+                // loads (see FRAG_LOADED).
+                if (
+                  !destroyed &&
+                  !fenceEscalated &&
+                  staleGenerationRecoveries < MAX_STALE_GENERATION_RECOVERIES
+                ) {
                   staleGenerationRecoveries += 1;
                   // hls.js's startPosition is on the playlist's own clock, the
                   // same clock the element reports, not the media timeline.
@@ -4136,14 +4383,15 @@ export function VideoPlayer({
                     // pauses the element without a `pause` event. Playback was
                     // running (this branch is the non-seek one), so start it
                     // again instead of leaving the reload paused.
+                    armFenceWatchdog();
                     resumeReloadedTransport();
                     return;
                   }
                 }
-                // The refetch bound is spent for this generation, or there is
-                // no playlist to refetch. A fence is not a route failure, so
-                // do not report one: reanchor at the playhead, which rebuilds
-                // the generation while keeping the recipe eligible.
+                // The refetch bound is spent for this episode, or there is no
+                // playlist to refetch. A fence is not a route failure, so do
+                // not report one: reanchor at the playhead, which rebuilds the
+                // generation while keeping the recipe eligible.
                 recoverFencedTransport();
                 return;
               }
@@ -4325,6 +4573,10 @@ export function VideoPlayer({
             const meter = meterMedia(true);
             hls.on(Hls.Events.FRAG_LOADING, (_event, { frag }) => {
               if (destroyed || frag.type === "subtitle") return;
+              // A media request is the evidence a fence recovery is working;
+              // the stall bound must not spend an attempt while one is out.
+              fenceRequestSeen = true;
+              clearFenceWatchdog();
               const stats = frag.stats;
               meter.watch(stats, () => ({
                 bytes: stats.loaded,
@@ -4337,6 +4589,17 @@ export function VideoPlayer({
               // The transport delivered a fragment, so failures since the last
               // one were hiccups rather than a segment it cannot serve.
               segmentRetry.reset();
+              // Media served ends the fence episode: a later fence gets its own
+              // refetch and rebuild bound instead of inheriting a spent one.
+              fenceParkedRef.current = false;
+              fenceEscalated = false;
+              fenceRecoveryAttempts = 0;
+              fenceRecoveryInFlight = false;
+              fenceRecoveryPlayhead = null;
+              fenceRequestSeen = true;
+              staleGenerationRecoveries = 0;
+              staleSeekReanchorTarget = null;
+              clearFenceWatchdog();
               // A delivered fragment that yields no frame is invisible to the
               // load ladder; the no-frame deadline owns that case. Whether a
               // frame is expected is the player's intent to play, not the
@@ -4621,7 +4884,12 @@ export function VideoPlayer({
       if (resumeReloadedTransportRef.current === resumeReloadedTransport) {
         resumeReloadedTransportRef.current = () => {};
       }
+      recoverParkedTransportRef.current = () => false;
       resumeAfterReloadRef.current = false;
+      if (fenceWatchdog !== null) {
+        clearTimeout(fenceWatchdog);
+        fenceWatchdog = null;
+      }
       clearInterval(deliveredNoFramesTimer);
       video.removeEventListener("seeking", onDeliveredNoFramesSeek);
       if (frameProbe !== null && typeof video.cancelVideoFrameCallback === "function") {
@@ -4701,11 +4969,12 @@ export function VideoPlayer({
     setPlayerError,
   ]);
 
-  // A 412 on a pending seek stops hls.js so it cannot retry the fenced URL.
-  // When the reanchor the server answered reuses that same generation (the
-  // target is inside its window), no transport effect runs and the stopped
-  // instance would never load again. Refetch its playlist with the live token
-  // and resume at the seek target, the same recovery ordinary playback uses.
+  // A 412 stops hls.js so it cannot retry the fenced URL. When the reanchor
+  // the server answered reuses that same generation (the target is inside its
+  // window, or playback simply continues), no transport effect runs and the
+  // stopped instance would never load again. Refetch its playlist with the live
+  // token and resume at the recovery position, the same reload ordinary
+  // playback uses. This is also the "reload" half of a parked seek press.
   //
   // Only a reanchor that kept the same transport generation may do this. The
   // transport identity is checked before the new hls.js instance even exists
@@ -4713,8 +4982,8 @@ export function VideoPlayer({
   // generation cannot make the stopped one refetch a playlist and request the
   // fenced segment a second time only to be aborted by the replacement.
   useEffect(() => {
-    const stopped = stoppedHlsForSeekRef.current;
-    stoppedHlsForSeekRef.current = null;
+    const stopped = stoppedHlsForFenceRef.current;
+    stoppedHlsForFenceRef.current = null;
     if (!stopped) return;
     const video = videoRef.current;
     if (!video || hlsRef.current !== stopped.hls) return;
@@ -4726,15 +4995,17 @@ export function VideoPlayer({
     }
     const target = pendingSeekTimeRef.current;
     const resume =
-      target !== null ? toPlayerTime(target, timelineOffsetRef.current) : video.currentTime;
+      target !== null
+        ? toPlayerTime(target, timelineOffsetRef.current)
+        : stopped.resumePlayerSeconds;
     recoverFromStaleGeneration(
       stopped.hls as unknown as Parameters<typeof recoverFromStaleGeneration>[0],
       resume,
     );
     // Refetching the playlist re-creates the MediaSource, which clears
-    // `paused` silently. The viewer asked to keep playing when this seek was
-    // issued, so the transport this recovery just restarted must actually
-    // start: otherwise the seek lands on a frame under a Pause control and
+    // `paused` silently. The viewer asked to keep playing when this recovery
+    // was issued, so the transport this attempt just restarted must actually
+    // start: otherwise the recovery lands on a frame under a Pause control and
     // neither a Play click nor the no-frame deadline can tell.
     resumeReloadedTransportRef.current();
   }, [effectiveStreamUrl, effectiveTransportRevision, planRevision]);
