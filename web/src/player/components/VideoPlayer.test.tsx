@@ -81,6 +81,9 @@ const hlsJS = vi.hoisted(() => ({
   // Bodies the fenced-playlist base loader answers, one per fetch. A test that
   // drives the real gate pushes playlists that keep naming the fenced token.
   playlists: [] as string[],
+  // URLs the base loader was actually asked for. The fenced wrappers sit above
+  // it, so a URL missing here was answered from the ledger without a request.
+  requests: [] as string[],
 }));
 
 vi.mock("sonner", () => ({
@@ -203,6 +206,7 @@ vi.mock("hls.js", () => {
         ) => void;
       },
     ) {
+      hlsJS.requests.push(context.url);
       const data = hlsJS.playlists.shift() ?? "#EXTM3U\n";
       queueMicrotask(() =>
         callbacks.onSuccess({ url: context.url, data, code: 200 }, this.stats, context, null),
@@ -4514,6 +4518,149 @@ describe("VideoPlayer source timeline", () => {
       expect(onReanchorSeek).toHaveBeenCalledTimes(1);
       expect(hlsJS.loadSource).not.toHaveBeenCalled();
       expect(hlsJS.startLoad).not.toHaveBeenCalled();
+    });
+
+    // A reanchor whose frozen source cannot be reopened is a provider read
+    // failure, not a verdict on the release. It must not delete the session or
+    // leave a dead transport on screen: the retry card takes over, on the
+    // position the viewer had before the seek that never played.
+    it("surfaces the seek-evidence terminal as a retry card on the restored position", async () => {
+      hlsJS.supported = true;
+      vi.spyOn(HTMLMediaElement.prototype, "canPlayType").mockReturnValue("");
+      const onReanchorSeek = vi.fn(() => true);
+      const onPlanFailure = vi.fn();
+      const onRestartPlayback = vi.fn();
+      const { container, rerenderPlayer } = renderPlayer({
+        plan: anchoredPlan,
+        onReanchorSeek,
+        onPlanFailure,
+        onRestartPlayback,
+      });
+      const video = container.querySelector("video");
+      if (!video) throw new Error("expected video element");
+      await waitFor(() => expect(hlsJS.latest).not.toBeNull());
+      fireEvent.loadedMetadata(video);
+      fireFrameTimeUpdate(video);
+      fireEvent.playing(video);
+      Object.defineProperty(video, "currentTime", {
+        configurable: true,
+        writable: true,
+        value: 42,
+      });
+      fireFrameTimeUpdate(video);
+
+      // The target is outside the live window, so the press asks the server
+      // for a new window instead of seeking the element.
+      seekableWindow(video, 300);
+      act(() => controls.current!.onSeek(690));
+      expect(onReanchorSeek).toHaveBeenCalledWith(690, expect.any(Boolean));
+
+      rerenderPlayer({
+        plan: anchoredPlan,
+        replanError:
+          "The frozen playback source could not be reopened; start a new playback attempt.",
+        replanErrorTitle: "Playback unavailable",
+        replanErrorRetryable: true,
+        replanErrorReason: "seek_reanchor_evidence_unavailable",
+      });
+
+      // Source 42 + the plan's 94 s clock offset is where playback was before
+      // the seek, not the 690 s target that never played.
+      await waitFor(() => expect(screen.getByText("Try again")).toBeInTheDocument());
+      expect(controls.current!.currentTime).toBe(136);
+      // The card's retry is the viewer's fresh start; the failure itself did
+      // not retire anything.
+      fireEvent.click(screen.getByText("Try again"));
+      expect(onRestartPlayback).toHaveBeenCalledOnce();
+      expect(onPlanFailure).not.toHaveBeenCalled();
+    });
+
+    // The fence ledger belongs to the media, not to the playback session. The
+    // stress run replaced its session after a seek terminal; the replacement's
+    // retained playlist still named the old generation, so the exact URL the
+    // old session had already fenced was requested (and re-anchored) again.
+    it("inherits the fence ledger across a session replacement", async () => {
+      hlsJS.supported = true;
+      vi.spyOn(HTMLMediaElement.prototype, "canPlayType").mockReturnValue("");
+      const onReanchorSeek = vi.fn(() => true);
+      const { container, rerenderPlayer } = renderPlayer({
+        plan: anchoredPlan,
+        onReanchorSeek,
+        contentId: "movie-1",
+      });
+      const video = container.querySelector("video");
+      if (!video) throw new Error("expected video element");
+      await waitFor(() => expect(hlsJS.latest).not.toBeNull());
+      fireEvent.loadedMetadata(video);
+      fireFrameTimeUpdate(video);
+      fireEvent.playing(video);
+
+      seekableWindow(video, 6900);
+      act(() => controls.current!.onSeek(690));
+      const fencedUrl = "/playback/transcode/session-1/seg_00163.ts";
+      const staleSegment = {
+        fatal: true,
+        type: "networkError",
+        details: "fragLoadError",
+        response: { code: 412 },
+        frag: { sn: 163, url: fencedUrl },
+      };
+      act(() => hlsJS.latest?.emit("error", staleSegment));
+      await waitFor(() => expect(onReanchorSeek).toHaveBeenCalledOnce());
+
+      // The terminal replaces the session for the same title and version. Its
+      // stream and generation are new; the fenced URL is not.
+      const replacementPlan = {
+        ...anchoredPlan,
+        plan_id: "plan:replacement",
+        plan_attempt_key: "v3:replacement",
+        session_id: "session-2",
+        stream: { ...anchoredPlan.stream, url: "/playback/transcode/session-2/master.m3u8" },
+      };
+      hlsJS.requests = [];
+      rerenderPlayer({
+        contentId: "movie-1",
+        sessionId: "session-2",
+        streamUrl: "/api/v1/stream/session-2?token=token",
+        plan: replacementPlan,
+        planRevision: 2,
+        transportRevision: 2,
+      });
+      await waitFor(() => expect(hlsJS.constructed).toHaveBeenCalledTimes(2));
+
+      // The replacement transport's own fragment loader answers the old URL
+      // from the inherited ledger: no request crosses the session boundary.
+      const config = hlsJS.constructed.mock.calls.at(-1)?.[0] as {
+        fLoader?: new (config: unknown) => {
+          load: (
+            context: { url: string; responseType: string },
+            config: unknown,
+            callbacks: {
+              onSuccess: (...args: unknown[]) => void;
+              onError: (...args: unknown[]) => void;
+              onTimeout: (...args: unknown[]) => void;
+            },
+          ) => void;
+        };
+      };
+      expect(config.fLoader).toBeDefined();
+      const ReplacementLoader = config.fLoader!;
+      const loader = new ReplacementLoader({});
+      const onError = vi.fn();
+      await act(async () => {
+        loader.load(
+          { url: fencedUrl, responseType: "arraybuffer" },
+          {},
+          { onSuccess: vi.fn(), onError, onTimeout: vi.fn() },
+        );
+      });
+      expect(hlsJS.requests).not.toContain(fencedUrl);
+      expect(onError).toHaveBeenCalledOnce();
+
+      // And the replacement's 412 for that same URL is the same fence. One
+      // fence produces exactly one reanchor, including across a replacement.
+      act(() => hlsJS.latest?.emit("error", staleSegment));
+      expect(onReanchorSeek).toHaveBeenCalledOnce();
     });
 
     // Stopping the fenced transport must not strand the generation the server

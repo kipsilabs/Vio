@@ -841,10 +841,24 @@ export function VideoPlayer({
   const isMountedRef = useRef(true);
   const effectiveTransportRevision = transportRevision ?? planRevision;
   const hlsRef = useRef<HlsType | null>(null);
-  // Every exact segment URL the server answered with a 412. Kept across the
-  // transports of one session: a queued hls.js retry and a stopped instance's
-  // reload must not ask the server the same dead question twice.
-  const segmentFenceRef = useRef(createSegmentFenceLedger());
+  // The media a fence belongs to: the title and the version the viewer asked
+  // for, not the playback session. A seek reanchor or a dead-session recovery
+  // replaces the session for the same media, and its first requests still name
+  // the URLs the outgoing transport fenced; inheriting the ledger is what keeps
+  // those dead URLs off the wire and stops one fence from buying a second
+  // reanchor. A different title or version, or a new player mount, starts a
+  // fresh ledger.
+  const segmentFenceIdentity = `${contentId ?? ""}:${plan.requested_media_file_id}`;
+  const segmentFence = useMemo(() => {
+    // The identity is the ledger's lifetime, not an input it reads. Keying
+    // the memo on it, rather than on `sessionId`, is what lets a replacement
+    // session for the same media inherit the fences; the plan object is
+    // replaced on every adoption and must not reset them.
+    void segmentFenceIdentity;
+    return createSegmentFenceLedger();
+  }, [segmentFenceIdentity]);
+  const segmentFenceRef = useRef(segmentFence);
+  segmentFenceRef.current = segmentFence;
   // The hls.js instance a generation fence stopped, with the transport identity
   // it belongs to and the position its recovery resumes at. If the reanchor
   // reuses that same generation, no transport effect runs, so a planRevision
@@ -1064,11 +1078,6 @@ export function VideoPlayer({
   const [framedSessionId, setFramedSessionId] = useState<string | null>(null);
   const sessionIdRef = useRef(sessionId);
   sessionIdRef.current = sessionId;
-  // A fence belongs to the playback session whose URLs it names. A new session
-  // starts with no refused URL and no generation to retire.
-  useEffect(() => {
-    segmentFenceRef.current.reset();
-  }, [sessionId]);
   // The plan revision the element's transport currently belongs to. Read by
   // seek bookkeeping that runs before the transport effect's own declaration.
   const planRevisionRef = useRef(planRevision);
@@ -3566,12 +3575,6 @@ export function VideoPlayer({
     // generation that still does not serve the segment is the same failed
     // recovery, and a rotation must not hand it another two refetches.
     let staleGenerationRecoveries = 0;
-    // The fenced segment URL the transport has already answered. hls.js queues
-    // its own retry of a failed fragment before this listener runs, and a
-    // further 412 for the same URL is that retry arriving, not a new fence. A
-    // different segment under the same `sgen` is not a retry: it is evidence
-    // the rebuilt generation does not serve the requested window.
-    let fencedSegmentKey: string | null = null;
     // A fence that outlasted its playlist refetches is recovered by asking the
     // server to rebuild the generation. Once that escalation starts, further
     // fences go straight to the bounded rebuild path instead of refetching a
@@ -3595,12 +3598,12 @@ export function VideoPlayer({
     let fenceRequestSeen = false;
     let fenceWatchdog: ReturnType<typeof setTimeout> | null = null;
     // The pending seek target a stale-generation fence already sent back as a
-    // reanchor, and the URL that asked for it. A retry of the same URL is
-    // hls.js's queued request and is ignored; a different URL under the same
-    // target is the rebuilt generation failing to serve the seek, which spends
-    // the bounded rebuild path instead of parking.
+    // reanchor. A different URL under the same target is the rebuilt
+    // generation failing to serve the seek, which spends the bounded rebuild
+    // path instead of issuing a fresh reanchor. The per-URL fence answer
+    // (including the replacement session's) lives in the shared ledger, so a
+    // retry of the same URL is ignored across the session boundary too.
     let staleSeekReanchorTarget: number | null = null;
-    let staleSeekReanchorKey: string | null = null;
     let playbackStarted = false;
     let autoplayInFlight = false;
     let autoplayAttempts = 0;
@@ -4127,7 +4130,6 @@ export function VideoPlayer({
               // this attempt failing rather than a fresh seek.
               if (staleSeekReanchorTarget === null && pendingSeekTimeRef.current !== null) {
                 staleSeekReanchorTarget = pendingSeekTimeRef.current;
-                staleSeekReanchorKey = null;
               }
               const settle = (ok: boolean) => {
                 if (seq !== fenceRecoverySeq || destroyed) return;
@@ -4185,9 +4187,7 @@ export function VideoPlayer({
               fenceRecoveryInFlight = false;
               fenceRecoverySeq += 1;
               staleGenerationRecoveries = 0;
-              fencedSegmentKey = null;
               staleSeekReanchorTarget = null;
-              staleSeekReanchorKey = null;
               fenceRecoveryPlayhead = seconds;
               setPlayerError(null);
               return recoverFencedTransport(seconds);
@@ -4314,18 +4314,16 @@ export function VideoPlayer({
                     };
                   }
                   const seekFenceKey = data.frag?.url ?? data.url ?? null;
-                  if (
-                    staleSeekReanchorTarget === seekTarget &&
-                    staleSeekReanchorKey === seekFenceKey
-                  ) {
+                  if (!segmentFence.claimFence(seekFenceKey)) {
                     // hls.js's queued retry of the URL this seek already
-                    // answered. The recovery it was queued behind is still in
-                    // flight.
+                    // answered, or the replacement transport asking the same
+                    // dead URL after the session was swapped. The recovery it
+                    // belongs to is already in flight or spent; one fence must
+                    // not buy a second reanchor.
                     return;
                   }
                   const sameTarget = staleSeekReanchorTarget === seekTarget;
                   staleSeekReanchorTarget = seekTarget;
-                  staleSeekReanchorKey = seekFenceKey;
                   if (sameTarget) {
                     // The rebuilt generation did not serve the target either.
                     // Spend the bounded rebuild path instead of waiting for a
@@ -4345,16 +4343,17 @@ export function VideoPlayer({
                   return;
                 }
                 // One fence is answered once. A later 412 for the same URL is
-                // hls.js's queued retry (or a stale playlist this transport
-                // already refetched); the URL is dead, so it must not buy
-                // another refetch or another request. If no request follows,
-                // the stall bound spends the next attempt instead of parking,
-                // so a retry that outlives its answer still makes progress.
-                if (fenceKey !== null && fenceKey === fencedSegmentKey) {
+                // hls.js's queued retry, a stale playlist this transport
+                // already refetched, or the replacement transport asking the
+                // dead URL after a session swap; the URL is dead, so it must
+                // not buy another refetch or another reanchor. If no request
+                // follows, the stall bound spends the next attempt instead of
+                // parking, so a retry that outlives its answer still makes
+                // progress.
+                if (!segmentFence.claimFence(fenceKey)) {
                   if (!fenceRecoveryInFlight) armFenceWatchdog();
                   return;
                 }
-                if (fenceKey !== null) fencedSegmentKey = fenceKey;
                 if (fenceToken !== null) playlistGeneration.fence(fenceToken);
                 // The refetch bound is per fence episode, not per generation:
                 // a rotation inside an unresolved fence is the same recovery
@@ -4599,9 +4598,7 @@ export function VideoPlayer({
               fenceRecoveryPlayhead = null;
               fenceRequestSeen = true;
               staleGenerationRecoveries = 0;
-              fencedSegmentKey = null;
               staleSeekReanchorTarget = null;
-              staleSeekReanchorKey = null;
               clearFenceWatchdog();
               // A delivered fragment that yields no frame is invisible to the
               // load ladder; the no-frame deadline owns that case. Whether a
