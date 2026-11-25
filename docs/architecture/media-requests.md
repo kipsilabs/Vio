@@ -263,6 +263,14 @@ reconcile pass on every server all go through the claim, so a request is never
 submitted twice at once. The claim is a lease: if the claiming server dies
 mid-call, the reconcile pass picks the request up after the lease.
 
+An auto-approved create commits the approval and returns the approved request
+before the submission runs. The submission is scheduled after the response
+through the same claim, so a slow router or a cold metadata lookup cannot hold
+the `POST /api/v2/requests` response open. The response therefore reports
+`approved`; the later `queued` or `completed` state, or a failure's
+`last_error` and retry time, appears on the request's next read. Validation
+refusals stay synchronous with the create.
+
 A failed attempt keeps the approval. It records `last_error`, releases the lease,
 schedules the next attempt in `next_submit_at` (5 minutes, doubling to an hour),
 and answers the caller with

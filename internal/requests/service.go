@@ -107,8 +107,9 @@ type Service struct {
 	hasDefaultVirtualRouter func() bool
 	catalogChanged          func()
 	cleanupVirtual          func(context.Context, Request) error
-	// enrichAsync schedules deferred enrichment; tests replace it to control execution.
-	enrichAsync       func(func())
+	// asyncWork schedules work detached from the request that scheduled it;
+	// tests replace it to control execution.
+	asyncWork         func(func())
 	notifier          FulfillmentNotifier
 	lifecycle         LifecycleNotifier
 	watchlistPref     WatchlistPreference
@@ -149,21 +150,48 @@ func (s *Service) hasActiveDefaultVirtualRouter() bool {
 
 const enrichmentTimeout = 2 * time.Minute
 
+// runAsync runs work after the response that scheduled it. Production leaves
+// asyncWork nil so the work gets its own goroutine; tests install a scheduler
+// that runs it explicitly.
+func (s *Service) runAsync(run func()) {
+	if s.asyncWork != nil {
+		s.asyncWork(run)
+		return
+	}
+	go run()
+}
+
 func (s *Service) scheduleEnrichment(ctx context.Context, id string) {
 	if id == "" {
 		return
 	}
 	base := context.WithoutCancel(ctx)
-	run := func() {
+	s.runAsync(func() {
 		enrichCtx, cancel := context.WithTimeout(base, enrichmentTimeout)
 		defer cancel()
 		s.enrichRequest(enrichCtx, id)
-	}
-	if s.enrichAsync != nil {
-		s.enrichAsync(run)
+	})
+}
+
+// scheduleSubmission submits an auto-approved request after the create
+// response. It runs the same submitAfterCommit path as an admin approval, so
+// the claim, retry schedule and last_error handling are unchanged; only the
+// caller's wait is removed. The work is detached from the request context
+// because that context ends when the handler returns.
+func (s *Service) scheduleSubmission(ctx context.Context, req Request, actor Viewer) {
+	if req.ID == "" {
 		return
 	}
-	go run()
+	base := context.WithoutCancel(ctx)
+	s.runAsync(func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				slog.ErrorContext(base, "requests: deferred submission panicked", "component", "requests",
+					"request_id", req.ID, "panic", recovered)
+			}
+		}()
+		s.submitAfterCommit(base, req, actor)
+	})
 }
 
 func isVirtualIntegration(installationID *int, capabilityID string) bool {
@@ -973,7 +1001,11 @@ func (s *Service) CreateRequest(ctx context.Context, viewer Viewer, input Create
 		s.notifyApproval(ctx, *req, ApprovalOriginPolicy)
 		req.externalIDsResolved = true
 		req.tvdbLookupFailed = tvdbLookupFailed
-		return s.withLibraryContent(ctx, s.submitAfterCommit(ctx, *req, viewer)), nil
+		// The row is already approved and the request is reported in that
+		// state. Submitting a cold title can take longer than the client is
+		// willing to wait, and reconcile retries it anyway, so fulfillment runs
+		// after the response through the approval path's submitAfterCommit.
+		s.scheduleSubmission(ctx, *req, viewer)
 	}
 	return s.withLibraryContent(ctx, req), nil
 }

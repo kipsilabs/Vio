@@ -19,7 +19,7 @@ func TestCreateRequestDefersRoutingFactsAndKeepsClientTitle(t *testing.T) {
 	}}
 	svc := newTestServiceWithTMDB(store, tmdbClient)
 	enrichment := &deferredEnrichment{}
-	svc.enrichAsync = enrichment.schedule
+	svc.asyncWork = enrichment.schedule
 
 	req, err := svc.CreateRequest(context.Background(), testViewer(1), CreateRequestInput{
 		MediaType: MediaTypeMovie, TMDBID: 129, Title: "spirited away (client copy)",
