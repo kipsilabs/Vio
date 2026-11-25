@@ -2106,8 +2106,12 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	// spawn or validation failure must leave a healthy live session intact.
 	var session *playback.TranscodeSession
 	var err error
+	var startupErr *playback.TranscodeStartupError
 	pipeline := s.autoTranscodePipeline(r.Context(), opts)
-	if req.RequireReady || req.AutoFallbackReady && pipeline.Enabled() {
+	readyStart := req.RequireReady || req.AutoFallbackReady && pipeline.Enabled()
+	startupStartedAt := time.Now()
+	var startupSpawn time.Duration
+	if readyStart {
 		// Every attempt writes into opts.OutputDir, the replacement directory
 		// when a live session exists, and a failed attempt is closed before
 		// the next, so the live session is untouched until publication. Under
@@ -2120,11 +2124,43 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		session, err = playback.StartReadyTranscode(r.Context(), pipeline, playback.TranscodeStartup{
 			Timeout:     TranscodeStartReadinessTimeout,
 			LegacyRetry: playback.TranscodeStartupRetryAccelChange,
+			// Measure the launch separately from the manifest wait it performs
+			// inline. The worker otherwise reports only the total, which is the
+			// same misattribution the API transport had: a provider that never
+			// answers looks like slow FFmpeg startup.
+			Start: func(ctx context.Context, opts playback.TranscodeOpts) (*playback.TranscodeSession, error) {
+				spawnStart := time.Now()
+				started, startErr := playback.StartTranscode(ctx, opts)
+				startupSpawn += time.Since(spawnStart)
+				return started, startErr
+			},
 		})
 	} else {
 		session, err = playback.StartTranscode(r.Context(), opts)
 	}
-	var startupErr *playback.TranscodeStartupError
+	if readyStart {
+		startupTotal := time.Since(startupStartedAt)
+		outcome := "ready"
+		switch {
+		case err == nil:
+		case errors.As(err, &startupErr):
+			outcome = "readiness_failed"
+		case errors.Is(err, playback.ErrSourceDecodeRejected):
+			outcome = "readiness_failed"
+		default:
+			outcome = "spawn_failed"
+		}
+		slog.InfoContext(r.Context(), "playback transport startup timing",
+			"component", "transcodenode",
+			"transport", "worker",
+			"session", req.SessionID,
+			"spawn_ms", startupSpawn.Milliseconds(),
+			"manifest_wait_ms", (startupTotal - startupSpawn).Milliseconds(),
+			"readiness_budget_ms", TranscodeStartReadinessTimeout.Milliseconds(),
+			"total_ms", startupTotal.Milliseconds(),
+			"outcome", outcome,
+		)
+	}
 	if errors.As(err, &startupErr) {
 		unlock()
 		if r.Context().Err() != nil {
