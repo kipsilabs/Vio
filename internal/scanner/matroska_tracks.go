@@ -256,14 +256,31 @@ func readMatroskaTracksFile(path string) ([]mediaprobe.MatroskaTrack, os.FileInf
 // Failure is not a probe failure: the tracks keep FFprobe's values and play
 // through extraction.
 func applyMatroskaSubtitleTracks(ctx context.Context, filePath string, probe *ProbeData) {
+	applyMatroskaSubtitleTracksWithReader(ctx, filePath, probe, readMatroskaTracks)
+}
+
+// matroskaTracksReader reads the Tracks element of a local file.
+type matroskaTracksReader func(context.Context, string) ([]mediaprobe.MatroskaTrack, os.FileInfo, error)
+
+func applyMatroskaSubtitleTracksWithReader(ctx context.Context, filePath string, probe *ProbeData, readTracks matroskaTracksReader) {
 	if probe == nil || probe.Container != containerMKV || len(probe.SubtitleTracks) == 0 {
+		return
+	}
+	// A virtual source reaches the probe as its provider relay URL (or its
+	// canonical virtual:// URI). FFprobe reads it over HTTP, but this
+	// enrichment opens a local file, so the URL is not a path and there is
+	// nothing to read. The probe's own stream table is what the row keeps,
+	// and playback extraction fills in the rest.
+	if !isLocalMatroskaTrackPath(filePath) {
+		slog.DebugContext(ctx, "scanner: Matroska track enrichment skipped for a remote source",
+			"component", "scanner", "reason", "remote_source")
 		return
 	}
 	subtitles := make([]matroskaSubtitleStream, len(probe.SubtitleTracks))
 	for i, track := range probe.SubtitleTracks {
 		subtitles[i] = matroskaSubtitleStream{Index: track.Index, Codec: track.Codec}
 	}
-	tracks, _, err := readMatroskaTracks(ctx, filePath)
+	tracks, _, err := readTracks(ctx, filePath)
 	var matches []matroskaSubtitleMatch
 	if err == nil {
 		matches, err = matroskaSubtitleTrackIDs(tracks, len(probe.VideoTracks), len(probe.AudioTracks), subtitles)
@@ -286,4 +303,18 @@ func applyMatroskaSubtitleTracks(ctx context.Context, filePath string, probe *Pr
 			track.Codec, track.IndexOnly = matches[i].Codec, true
 		}
 	}
+}
+
+// isLocalMatroskaTrackPath reports whether filePath names a file the local
+// opener in readMatroskaTracksFile can read. Virtual sources are probed over
+// HTTP through a provider relay URL, and their canonical URI is virtual://,
+// so neither can be passed to that opener.
+func isLocalMatroskaTrackPath(filePath string) bool {
+	path := strings.ToLower(strings.TrimSpace(filePath))
+	for _, scheme := range []string{"http://", "https://", "virtual://", "file://"} {
+		if strings.HasPrefix(path, scheme) {
+			return false
+		}
+	}
+	return true
 }
