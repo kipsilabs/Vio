@@ -75,6 +75,16 @@ export function createSegmentFenceLedger(): SegmentFenceLedger {
     refuse(url) {
       if (!url) return;
       finalUrls.add(url);
+      // A load can pass the entry check before another request for the same
+      // URL is refused and reach the wire only after. The base loader is free
+      // to defer its send, so the entry check alone is not authoritative once
+      // the load has started. Abort those loads now: they must not ask a
+      // question the ledger has already answered.
+      for (const load of [...active]) {
+        if (load.url !== url) continue;
+        active.delete(load);
+        load.abort();
+      }
     },
     isFinal(url) {
       return url !== null && url !== undefined && finalUrls.has(url);
@@ -234,8 +244,10 @@ export function createFencedFragmentLoader(
           networkDetails: unknown,
           stats: LoaderStats,
         ) => {
-          if (isRefusedFragmentResponse(error, networkDetails)) ledger.refuse(url);
+          // Release this load before refusing the URL: the fence aborts every
+          // other in-flight load for it, and this one has already failed.
           this.release(active);
+          if (isRefusedFragmentResponse(error, networkDetails)) ledger.refuse(url);
           this.currentContext = null;
           callbacks.onError(error, errorContext as FragmentLoaderContext, networkDetails, stats);
         },
