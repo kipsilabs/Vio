@@ -795,6 +795,9 @@ func (h *PlaybackHandler) HandleVideoStream(w http.ResponseWriter, r *http.Reque
 			}
 			inputPath, releaseInput, regErr := h.registerVirtualInput(r.Context(), session, *source, false)
 			if regErr != nil {
+				slog.WarnContext(r.Context(), "jellycompat virtual remux input failed", "component", "jellycompat",
+					"item_id", routeID, "media_source_id", source.ID, "playback_session_id", playSession.ID,
+					"upstream_session_id", playSession.UpstreamSessionID, "error", logredact.SanitizeText(regErr.Error()))
 				h.teardownPlaySession(context.WithoutCancel(r.Context()), playSession, nil, nil)
 				writeError(w, http.StatusBadGateway, "PlaybackUnavailable", "Failed to resolve virtual playback source for remux")
 				return
@@ -815,6 +818,9 @@ func (h *PlaybackHandler) HandleVideoStream(w http.ResponseWriter, r *http.Reque
 				// A provider resolution or relay failure means playback cannot be
 				// constructed here; report it as a 502 PlaybackUnavailable rather
 				// than a misleading per-file 404.
+				slog.WarnContext(r.Context(), "jellycompat virtual stream failed", "component", "jellycompat",
+					"item_id", routeID, "media_source_id", source.ID, "playback_session_id", playSession.ID,
+					"upstream_session_id", playSession.UpstreamSessionID, "error", logredact.SanitizeText(streamErr.Error()))
 				h.teardownPlaySession(context.WithoutCancel(r.Context()), playSession, nil, nil)
 				writeError(w, http.StatusBadGateway, "PlaybackUnavailable", "Failed to stream virtual playback source")
 			}

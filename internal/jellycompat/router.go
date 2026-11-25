@@ -28,6 +28,11 @@ import (
 
 const sqliteUserStoreBackend = "sqlite"
 
+// newPlaybackHandler constructs the compat playback handler. It is a variable
+// so the router propagation test can capture the handler after NewRouter has
+// assigned its dependencies; production always uses NewPlaybackHandler.
+var newPlaybackHandler = NewPlaybackHandler
+
 // NewRouter builds the Jellyfin-compatibility router.
 func NewRouter(deps Dependencies) chi.Router {
 	declareJellycompatMediaRoutes()
@@ -153,7 +158,7 @@ func NewRouter(deps Dependencies) chi.Router {
 			manager.SetCompatExpiryClaimer(store.ClaimNativeSessionExpiry)
 		}
 	}
-	playbackHandler := NewPlaybackHandler(deps.Config, deps.ContentService, deps.IDCodec, deps.DeviceProfiles, deps.PlaybackStore, deps.SessionMgr, deps.FileResolver, deps.UserStoreProvider)
+	playbackHandler := newPlaybackHandler(deps.Config, deps.ContentService, deps.IDCodec, deps.DeviceProfiles, deps.PlaybackStore, deps.SessionMgr, deps.FileResolver, deps.UserStoreProvider)
 	playbackHandler.ScopeResolver = deps.PlaybackScopeResolver
 	playbackHandler.downloads = deps.Downloads
 	playbackHandler.accessFilter = deps.AccessFilterFn
@@ -198,6 +203,18 @@ func NewRouter(deps Dependencies) chi.Router {
 	playbackHandler.SessionSyncer = deps.SessionSyncer
 	playbackHandler.WatchScrobbler = deps.WatchScrobbler
 	playbackHandler.StableIdentityResolver = deps.StableIdentityResolver
+	playbackHandler.VirtualMediaResolver = deps.VirtualMediaResolver
+	playbackHandler.VirtualMediaRefreshResolver = deps.VirtualMediaRefreshResolver
+	playbackHandler.VirtualMediaDetailedResolver = deps.VirtualMediaDetailedResolver
+	playbackHandler.VirtualPlaybackStreamLister = deps.VirtualPlaybackStreamLister
+	playbackHandler.VirtualSourceProber = deps.VirtualSourceProber
+	playbackHandler.VirtualSourceProberWithHeaders = deps.VirtualSourceProberWithHeaders
+	playbackHandler.VirtualFileSaver = deps.VirtualFileSaver
+	playbackHandler.VirtualFileMetadataSaver = deps.VirtualFileMetadataSaver
+	playbackHandler.VirtualCandidateFileLookup = deps.VirtualCandidateFileLookup
+	playbackHandler.RemoteStreamRelay = deps.RemoteStreamRelay
+	playbackHandler.AllowInsecureVirtual = deps.AllowInsecureVirtual
+	playbackHandler.AllowPrivateStreams = deps.AllowPrivateStreams
 	playbackHandler.Trickplay = deps.Trickplay
 	playbackHandler.PlaySync = deps.SubtitlePlaySync
 	if deps.KeptSubtitles != nil {

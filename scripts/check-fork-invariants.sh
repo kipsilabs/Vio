@@ -164,6 +164,34 @@ else
   reject "pre-#2016 evidence policy altered (CONTRIBUTING.md / AGENTS.md / .github/PULL_REQUEST_TEMPLATE.md / docs/ai-contributions.md / .macroscope agent)"
 fi
 
+# 10. NewRouter must hand every virtual-library dependency to the compat
+# playback handler it builds. Upstream's router copy has none of these
+# assignments, so resolving a merge in its favor leaves RemoteStreamRelay nil
+# and every Jellyfin /Videos/{id}/stream answers 502 after a successful
+# PlaybackInfo. Assert each assignment, not surrounding prose.
+missing_virtual_wiring=""
+for field in \
+  VirtualMediaResolver \
+  VirtualMediaRefreshResolver \
+  VirtualMediaDetailedResolver \
+  VirtualPlaybackStreamLister \
+  VirtualSourceProber \
+  VirtualSourceProberWithHeaders \
+  VirtualFileSaver \
+  VirtualFileMetadataSaver \
+  VirtualCandidateFileLookup \
+  RemoteStreamRelay \
+  AllowInsecureVirtual \
+  AllowPrivateStreams; do
+  grep -q "playbackHandler\.${field} = deps\.${field}" internal/jellycompat/router.go \
+    || missing_virtual_wiring="${missing_virtual_wiring} ${field}"
+done
+if [ -z "$missing_virtual_wiring" ]; then
+  pass "compat playback handler receives the virtual-library dependencies"
+else
+  reject "virtual-library dependencies not wired into internal/jellycompat/router.go:${missing_virtual_wiring}"
+fi
+
 # The merge driver itself is per-clone setup (see `make install-hooks`), not
 # committed content: fresh CI checkouts never have it. Report, don't fail —
 # verification must stay read-only and green on a clean clone.
