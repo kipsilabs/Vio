@@ -338,8 +338,9 @@ interface VideoPlayerProps {
   /** Title for the replan error, used when surfacing the refusal as a toast. */
   replanErrorTitle?: string | null;
   /**
-   * Whether the session judged that refused replan retryable (the server's own
-   * verdict on the terminal). The error overlay offers Try again only then.
+   * Whether the session judged that refused replan retryable: the server's own
+   * verdict on the terminal, or the client's fresh-start recovery for a refused
+   * seek. The error overlay offers Try again only then.
    */
   replanErrorRetryable?: boolean;
   /**

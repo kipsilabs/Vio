@@ -3305,16 +3305,24 @@ export function usePlaybackSession(
         );
         if (!adopted && options.operation === "seek_reanchor" && !decision.playback_plan) {
           const refused = describeDecisionWithoutPlan(decision);
-          refusedSeekRetryRef.current = refused.retryable
-            ? {
-                planId: plan.plan_id,
-                positionSeconds: options.positionSeconds,
-                // The target belongs to the source the session was serving
-                // when the seek was refused. A later rotation or a different
-                // version must not be handed the old timeline position.
-                source: { ...liveSourceIdentityRef.current },
-              }
-            : null;
+          // A refused seek is a fence outcome: the client may already have
+          // stopped the generation the target was asked for, and the card's
+          // Try again is a fresh start, not a replay of the refused replan.
+          // So the server's retryable verdict cannot decide whether the viewer
+          // gets a retry; a non-retryable response would otherwise park the
+          // player on a dead transport with no card at all. Remember the target
+          // for that fresh start and make the card actionable.
+          refusedSeekRetryRef.current = {
+            planId: plan.plan_id,
+            positionSeconds: options.positionSeconds,
+            // The target belongs to the source the session was serving
+            // when the seek was refused. A later rotation or a different
+            // version must not be handed the old timeline position.
+            source: { ...liveSourceIdentityRef.current },
+          };
+          if (!refused.retryable) {
+            setState((current) => ({ ...current, errorRetryable: true }));
+          }
         }
         if (
           subtitlePickKey !== null &&

@@ -6286,6 +6286,61 @@ describe("usePlaybackSession seek reanchor evidence recovery", () => {
     unmount();
   });
 
+  // A seek fence can stop the transport before the server answers. Whether the
+  // server calls its refusal retryable or not, the client is left with no
+  // generation to play; the card must offer the fresh start at the seek target
+  // rather than a dead player. A fresh start is a different request from the
+  // replan the server refused, so its retryable flag does not apply to it.
+  it("retries a non-retryable seek terminal at the refused target", async () => {
+    const startBodies: Array<Record<string, unknown>> = [];
+    const deletes: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      startChainMock(
+        startBodies,
+        (sessionId) => ({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "terminal",
+          session_id: sessionId,
+          terminal: {
+            reason: "transcode_start_failed",
+            message: "The successor generation never produced a manifest.",
+            retryable: false,
+          },
+        }),
+        deletes,
+      ),
+    );
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    await act(async () => {
+      expect(await result.current.reanchorSeek(918.161458)).toBe(false);
+    });
+    await waitFor(() => expect(result.current.errorReason).toBe("transcode_start_failed"));
+    // The card is actionable even though the server said the replan itself was
+    // not worth retrying.
+    expect(result.current.errorRetryable).toBe(true);
+    expect(result.current.plan?.session_id).toBe("session-1");
+
+    // The player puts the controls back where the seek started.
+    act(() => result.current.updatePlaybackState(32.172995, false));
+
+    act(() => result.current.restartPlayback());
+    await waitFor(() => expect(result.current.plan?.session_id).toBe("session-2"));
+
+    expect(startBodies).toHaveLength(2);
+    expect(startBodies[1]?.start_position).toBe(918.161458);
+    expect(deletes).toEqual(["/api/v2/playback/session-1"]);
+
+    unmount();
+  });
+
   it("refuses the retry when the version changed after the seek was refused", async () => {
     const startBodies: Array<Record<string, unknown>> = [];
     const deletes: string[] = [];
