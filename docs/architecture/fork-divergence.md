@@ -75,15 +75,6 @@ that before it ships.
 
 ### Known gaps
 
-- `internal/requests/service.go` `getDetail` calls `seriesSeasonSource` but discards
-  the provider it reports (`seasonList, _, fromTVDB, ...`) and never assigns
-  `MediaDetail.SeasonSource`. The v2 detail response therefore always omits
-  `season_source`, even when the seasons came from TVDB or TMDB. The web dialog
-  falls back to its TVDB default, so on a server with no TVDB provider the
-  explicit `season_source: "tvdb"` request fails closed with
-  `ErrSeasonSourceUnavailable` instead of using the TMDB list the viewer saw.
-  The fix is to assign the chosen provider to `detail.SeasonSource`; it is not
-  part of the picker restoration because the server is currently untouched.
 - `internal/apiv2/requests.go` `requestMediaSeasonsOf` maps `RequestSeason` to
   the v2 `RequestMediaSeason` without a poster URL, and that schema has no
   `poster_url` field at all. `RequestSeason.PosterURL` therefore reaches no

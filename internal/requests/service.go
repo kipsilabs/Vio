@@ -746,6 +746,7 @@ func (s *Service) getDetail(ctx context.Context, viewer Viewer, mediaType MediaT
 	// until then its missing seasons can be requested.
 	available := primaryMatch.Available
 	var seasons []RequestSeason
+	var seasonSource string
 	if mediaType == MediaTypeSeries {
 		seasonList, _, fromTVDB, seasonListAvailable, err := s.seriesSeasonSource(ctx, raw, 0, preferredSeasonSource)
 		if err != nil {
@@ -760,6 +761,10 @@ func (s *Service) getDetail(ctx context.Context, viewer Viewer, mediaType MediaT
 		}
 		if !seasonListAvailable {
 			seasonList = nil
+		} else if fromTVDB {
+			seasonSource = SeasonSourceTVDB
+		} else {
+			seasonSource = SeasonSourceTMDB
 		}
 		seasons = requestSeasons(seasonList, counts, primaryRequests[raw.ID])
 		if active := primaryRequests[raw.ID]; active != nil && len(active.Seasons) > 0 && counts != nil {
@@ -815,6 +820,7 @@ func (s *Service) getDetail(ctx context.Context, viewer Viewer, mediaType MediaT
 		LibraryContentID:    primaryMatch.ContentID,
 		Request:             primaryState,
 		Seasons:             seasons,
+		SeasonSource:        seasonSource,
 	}
 	if raw.TVDBID > 0 {
 		tvdb := raw.TVDBID
