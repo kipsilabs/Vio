@@ -550,6 +550,65 @@ func (f *fakeSelectionWarm) ScheduleSelectedFileWarm(_ string, fileID int, _ cat
 	f.warms = append(f.warms, fileID)
 }
 
+// fakeIdentityRepair records the identity repair an item detail view schedules.
+type fakeIdentityRepair struct {
+	mu    sync.Mutex
+	calls [][2]string
+}
+
+func (f *fakeIdentityRepair) ScheduleVirtualIdentityRepair(_ context.Context, contentID, mediaType string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, [2]string{contentID, mediaType})
+}
+
+func (f *fakeIdentityRepair) snapshot() [][2]string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([][2]string(nil), f.calls...)
+}
+
+// TestCatalogDetailTriggersIdentityRepairOnlyOnItemDetail proves the repair is
+// scheduled from the movie and episode detail operations and from nowhere a
+// browsing read goes, so list, search, or home traffic can never turn into the
+// bulk sweep.
+func TestCatalogDetailTriggersIdentityRepairOnlyOnItemDetail(t *testing.T) {
+	deps, _ := catalogDeps(t)
+	repair := &fakeIdentityRepair{}
+	deps.VirtualIdentityRepair = repair
+	h := newTestHandler(t, deps)
+
+	rec := do(t, h, http.MethodGet, "/api/v2/catalog/items/movie:heat-1995", "", viewerHeaders())
+	if rec.Code != http.StatusOK {
+		t.Fatal(rec.Body.String())
+	}
+	if want := [][2]string{{"movie:heat-1995", "movie"}}; !reflect.DeepEqual(repair.snapshot(), want) {
+		t.Fatalf("repairs = %v, want %v", repair.snapshot(), want)
+	}
+
+	// Browsing and search read the same catalog and must schedule nothing.
+	for _, path := range []string{
+		"/api/v2/catalog?limit=2",
+		"/api/v2/catalog?q=heat",
+	} {
+		if rec := do(t, h, http.MethodGet, path, "", viewerHeaders()); rec.Code != http.StatusOK {
+			t.Fatalf("%s: %s", path, rec.Body.String())
+		}
+	}
+	if got := repair.snapshot(); len(got) != 1 {
+		t.Fatalf("repairs = %v, want no repair from a browsing read", got)
+	}
+
+	rec = do(t, h, http.MethodGet, "/api/v2/catalog/items/episode:severance-s01e01", "", viewerHeaders())
+	if rec.Code != http.StatusOK {
+		t.Fatal(rec.Body.String())
+	}
+	want := [][2]string{{"movie:heat-1995", "movie"}, {"episode:severance-s01e01", "episode"}}
+	if got := repair.snapshot(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("repairs = %v, want %v", got, want)
+	}
+}
+
 // A catalog detail read is the only server-visible signal a thin client sends
 // before it picks a version. It must warm the virtual rows it surfaces: an
 // unprobed row gets the probe and the fetch warm-up, a probed row only the

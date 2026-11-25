@@ -23,6 +23,7 @@ import { SettingField, SettingFieldStatus } from "./SettingField";
 const PROVIDER_KEYS = [
   "virtual_library.enabled",
   "virtual_library.discover_before_playback",
+  "virtual_library.identity_repair_mode",
   "virtual_library.catalog_discovery_budget_ms",
   "virtual_library.manifest_url",
   "virtual_library.tmdb_api_key",
@@ -213,6 +214,19 @@ export default function StreamingSettings() {
             value={form.getValue("virtual_library.discover_before_playback") || "false"}
             onChange={(v) => form.setValue("virtual_library.discover_before_playback", v)}
             restartRequired={restartKeys.has("virtual_library.discover_before_playback")}
+          />
+          <SettingField
+            label="Provider identity repair"
+            type="select"
+            description="Legacy virtual rows carry no provider identity and cannot re-match after a provider renumbering. Off never lists. On demand repairs one movie or episode when its page opens, rate limited. Bulk sweeps the whole library as a job; it costs a provider listing per group and can get the server rate-limited by its indexers. Restart to apply."
+            value={form.getValue("virtual_library.identity_repair_mode") || "off"}
+            onChange={(v) => form.setValue("virtual_library.identity_repair_mode", v)}
+            restartRequired={restartKeys.has("virtual_library.identity_repair_mode")}
+            options={[
+              { value: "off", label: "Off" },
+              { value: "on_demand", label: "On demand" },
+              { value: "bulk", label: "Bulk" },
+            ]}
           />
           <SettingField
             label="Discovery wait (ms)"

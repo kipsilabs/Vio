@@ -154,6 +154,49 @@ response carries the row's durable `failed`/`available` state, its `probed_at`
 stamp, and any process-local `source_mismatch` verdict so the client can choose
 from the read alone.
 
+### Legacy provider identity repair is on-demand, never a boot sweep
+
+A virtual row persisted before the provider identity columns (`provider_video_hash`,
+`provider_guid`, `provider_release_name`, `provider_release_size`) existed
+carries no hash or GUID, so it cannot prove it is the same release after the
+provider renumbers one. Repairing it means re-listing the row's candidate group
+and writing the matched candidate's identity through the same tier matcher the
+resolver uses (`MatchCandidateIdentityForBackfill`).
+
+Repair is governed by `virtual_library.identity_repair_mode`, read at boot:
+
+- `off` (default) lists nothing automatically.
+- `on_demand` repairs one movie or episode when its item detail is opened.
+- `bulk` runs the resumable whole-library sweep as one `adminjob`.
+
+The bulk sweep re-lists the provider once per candidate group across the entire
+legacy set. That volume got an operator banned from two indexers, and an
+unconditional boot enqueue accumulated eighteen overlapping jobs across
+restarts, so it is never the default and is never queued on the default path.
+Even in `bulk`, one enqueue requires: no completed or canceled pass, legacy rows
+still present, no other attempt for 24 hours, and no active job.
+
+The on-demand trigger lives only on the v2 item detail operation
+(`internal/apiv2/catalog_items.go`, `getCatalogItem`); list, home, search,
+section, and shuffle reads never reach it. A series has no version rows of its
+own and is skipped — its episodes repair when an episode page opens. The repair
+is detached from the request and guarded, because each unique item still costs
+one provider listing:
+
+- one in-flight repair per item, so concurrent opens of the same page coalesce
+  instead of double-listing;
+- rows that already carry a hash or GUID are never selected, so an already
+  repaired item lists nothing;
+- at most two candidate groups per item, and a 30 s bound per repair;
+- a process-wide budget of six listings per minute (burst two) and at most two
+  concurrent repairs; work over either bound is dropped, not queued;
+- an item whose listing succeeded but matched nothing is skipped for six hours.
+
+That last skip is in-process only: `media_files` has no "identity checked"
+column yet, so a restart forgets it. Rows that are never opened are never
+repaired; a deployment that wants the whole legacy set repaired must opt into
+`bulk` deliberately.
+
 ### Cold-start attribution (list_reason + cache_miss_cause)
 
 Every `resolveVirtualPlaybackSource` emits a `virtual resolve timing` line

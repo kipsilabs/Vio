@@ -261,7 +261,7 @@
   },
   "src/pages/admin-settings/StreamingSettings.tsx": {
     "formatjs/no-literal-string-in-jsx": {
-      "count": 62
+      "count": 64
     },
     "silo/no-physical-direction": {
       "count": 3
