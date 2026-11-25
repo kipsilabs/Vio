@@ -988,7 +988,7 @@ describe("VideoPlayer with the playback session: a refused seek retry", () => {
   const PRE_SEEK_POSITION = 32.172995;
   const SEEK_TARGET = 918.161458;
 
-  function seekRefusal(sessionId: string) {
+  function seekRefusal(sessionId: string, retryable = true) {
     return {
       protocol_version: 3,
       server_features: ["playback_plan_v3"],
@@ -997,7 +997,7 @@ describe("VideoPlayer with the playback session: a refused seek retry", () => {
       terminal: {
         reason: "seek_reanchor_evidence_unavailable",
         message: "The frozen playback source could not be reopened; start a new playback attempt.",
-        retryable: true,
+        retryable,
       },
     };
   }
@@ -1069,6 +1069,33 @@ describe("VideoPlayer with the playback session: a refused seek retry", () => {
     await waitFor(() => expect(requests.starts).toHaveLength(2));
     expect(requests.starts[1]?.start_position).toBeCloseTo(SEEK_TARGET, 3);
     expect(requests.starts[1]?.file_id).toBe(7);
+  });
+
+  it("offers a retry when the seek terminal is not retryable", async () => {
+    const requests = stubServer({
+      start: () => jsonResponse(playable("session-1", retryablePlan()), 201),
+      replan: (url, body) => {
+        if (body.operation === "seek_reanchor") {
+          return jsonResponse(
+            seekRefusal(/playback\/([^/]+)\/replan/.exec(url)?.[1] ?? "session-1", false),
+          );
+        }
+        return jsonResponse(playable("session-1", retryablePlan()));
+      },
+    });
+
+    renderHarness();
+    const video = await startWatching();
+    // The fence stopped the old generation and the server answered the
+    // reanchor with `retryable: false`. That is still a dead player unless the
+    // card offers the fresh start, so it must appear on the restored position.
+    await showSeekCard(requests, video);
+
+    expect(controls.current?.currentTime).toBeCloseTo(PRE_SEEK_POSITION, 3);
+
+    fireEvent.click(screen.getByText("Try again"));
+    await waitFor(() => expect(requests.starts).toHaveLength(2));
+    expect(requests.starts[1]?.start_position).toBeCloseTo(SEEK_TARGET, 3);
   });
 
   it("plays a successful retry at the target and advances from there", async () => {
