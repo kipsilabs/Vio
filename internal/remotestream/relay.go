@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -22,6 +23,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Silo-Server/silo-server/internal/logredact"
 )
 
 // Canonical header names reused by the relay's range cache and header
@@ -1357,10 +1360,14 @@ func (r *Relay) proxyWithClient(w http.ResponseWriter, request *http.Request, so
 	// is scoped by the registration's content key when it has one, so a token
 	// rotation for the same content still hits; otherwise the token scopes it.
 	cacheScope := relayToken
+	contentKey := ""
 	if relayToken != "" {
 		r.mu.Lock()
-		if entry, ok := r.entries[relayToken]; ok && entry.contentKey != "" {
-			cacheScope = entry.contentKey
+		if entry, ok := r.entries[relayToken]; ok {
+			contentKey = entry.contentKey
+			if entry.contentKey != "" {
+				cacheScope = entry.contentKey
+			}
 		}
 		r.mu.Unlock()
 	}
@@ -1413,6 +1420,16 @@ func (r *Relay) proxyWithClient(w http.ResponseWriter, request *http.Request, so
 			if attempt == 0 && sleepRelayUpstreamRetry(request.Context()) {
 				continue
 			}
+			// Name the upstream open separately from the first-byte wait: a
+			// provider that never answers the open request looks identical to
+			// a dead transport from the client side, and the successor's source
+			// read is exactly where a slow start hides.
+			slog.WarnContext(request.Context(), "relay upstream open failed",
+				"component", "remotestream",
+				"content_key", contentKey,
+				"range", upstream.Header.Get("Range"),
+				"open_ms", r.rangeCache.clock().Sub(requestSentAt).Milliseconds(),
+				"error", logredact.SanitizeURLError(err))
 			// The upstream could not be reached at all before any byte flowed
 			// (dial failure, connection reset, timeout). An exhausted retry of
 			// a transport error is not a verdict about the release; mark it
@@ -1491,9 +1508,31 @@ func (r *Relay) proxyWithClient(w http.ResponseWriter, request *http.Request, so
 	defer cancelPump()
 	bodyChunks := pumpRemoteBody(pumpCtx, response.Body, r.readAhead)
 	first, err := nextRemoteBodyChunk(request.Context(), bodyChunks, remoteFirstByteTimeout)
+	firstByteAt := r.rangeCache.clock()
+	openMs := responseReceivedAt.Sub(requestSentAt).Milliseconds()
 	if err != nil {
+		// The upstream accepted the open but never produced a media byte before
+		// the first-byte/idle bound. This is the "provider has not answered"
+		// shape a slow virtual start exhibits; log the wait so it is visible
+		// without inspecting the network namespace.
+		slog.WarnContext(request.Context(), "relay upstream first byte failed",
+			"component", "remotestream",
+			"content_key", contentKey,
+			"range", upstream.Header.Get("Range"),
+			"status", response.StatusCode,
+			"open_ms", openMs,
+			"first_byte_ms", firstByteAt.Sub(responseReceivedAt).Milliseconds(),
+			"error", logredact.SanitizeURLError(err))
 		return err
 	}
+	slog.InfoContext(request.Context(), "relay upstream source read",
+		"component", "remotestream",
+		"content_key", contentKey,
+		"range", upstream.Header.Get("Range"),
+		"status", response.StatusCode,
+		"open_ms", openMs,
+		"first_byte_ms", firstByteAt.Sub(responseReceivedAt).Milliseconds(),
+		"bytes", len(first.data))
 	if len(first.data) == 0 {
 		return errors.New("remote media stream returned no data")
 	}

@@ -152,6 +152,10 @@ const (
 	// transportStartupReadyV3 is the "outcome" of a transport startup whose
 	// first manifest became ready.
 	transportStartupReadyV3 = "ready"
+	// transportStartupReadinessFailedV3 is the "outcome" of a transport
+	// startup that ran but did not produce its first manifest in time. It is
+	// distinct from a spawn failure so the log can name where the time went.
+	transportStartupReadinessFailedV3 = "readiness_failed"
 	// Substitution reasons published on a plan when the effective release
 	// differs from the requested one. They are additive wire values; a client
 	// that does not recognize one renders the generic substitution notice.
@@ -7414,6 +7418,29 @@ type localTransportStartupFailureV3 struct {
 	failedDevice  string
 }
 
+// inlineManifestReadinessErrorV3 reports whether a launch error came from the
+// virtual transport's inline first-manifest wait rather than from spawning or
+// validating the process. The virtual start resolves the provider URL, spawns
+// FFmpeg, and then waits for its first manifest before returning, so a source
+// read that never answers surfaces as a launch error carrying either the
+// manifest timeout (ErrManifestNotReady) or the startup deadline itself.
+//
+// That is a readiness/timeout outcome, not a spawn failure: the process ran and
+// the provider did not deliver bytes inside the start budget. A genuine launch
+// failure (an invalid recipe, an exec error, or a process that exited with an
+// encoder/device error) carries ErrTranscodeFailed or a validation error and is
+// deliberately not matched here, so it stays terminal. A broken manifest is
+// reported as its own validation error (for example "invalid copy playback
+// manifest"), also below this predicate.
+func inlineManifestReadinessErrorV3(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, playback.ErrManifestNotReady) ||
+		errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, context.Canceled)
+}
+
 // startReadyLocalPlaybackTransportV3 returns only after the first manifest is
 // safe to serve. A session that fails readiness is closed before the failure is
 // returned so every caller gets the same startup cleanup behavior.
@@ -7430,29 +7457,45 @@ func (h *PlaybackHandler) startReadyLocalPlaybackTransportV3(ctx context.Context
 	manifestBefore := transportPhaseDurationV3(ctx, transportPhaseManifestV3)
 	ts, err := h.startLocalPlaybackTransport(ctx, opts)
 	spawnFinishedAt := time.Now()
-	addTransportPhaseDurationV3(ctx, "transport_spawn",
-		spawnFinishedAt.Sub(startedAt)-
-			(transportPhaseDurationV3(ctx, "transport_upstream")-upstreamBefore)-
-			(transportPhaseDurationV3(ctx, transportPhaseManifestV3)-manifestBefore))
+	upstreamDelta := transportPhaseDurationV3(ctx, "transport_upstream") - upstreamBefore
+	manifestDelta := transportPhaseDurationV3(ctx, transportPhaseManifestV3) - manifestBefore
+	spawnNet := spawnFinishedAt.Sub(startedAt) - upstreamDelta - manifestDelta
+	addTransportPhaseDurationV3(ctx, "transport_spawn", spawnNet)
 	if err != nil {
+		// A virtual launch that waited inline for its first manifest and ran out
+		// of start budget reports that wait under transport_manifest, not under
+		// spawn. Name the phases separately so an 11.8 s wait cannot look like
+		// 11.8 s of FFmpeg startup and 0 ms of readiness.
+		readinessBudget := virtualStartReadinessWait(ctx, virtualStartReadinessBudget)
+		outcome := "spawn_failed"
+		failure := &localTransportStartupFailureV3{cause: err, failedToStart: true}
+		switch {
+		case errors.Is(err, playback.ErrSourceDecodeRejected):
+			// A revoked generation surfaces its decode verdict through the
+			// transport start: it is a readiness outcome (the process ran and
+			// rejected the bytes), not a spawn failure, so the rotation loop
+			// must see it as such instead of a generic transcode_start_failed.
+			outcome = transportStartupReadinessFailedV3
+			failure = &localTransportStartupFailureV3{cause: err}
+		case inlineManifestReadinessErrorV3(err):
+			// The inline wait ended without source bytes inside the start
+			// budget. The process itself was not the failure, so this is a
+			// retryable readiness timeout rather than a terminal spawn failure.
+			outcome = transportStartupReadinessFailedV3
+			failure = &localTransportStartupFailureV3{cause: err, wasRunning: true}
+		}
 		slog.InfoContext(ctx, "playback transport startup timing",
 			logComponentKey, playbackLogValueV3,
 			requestIDLogKeyV3, chimw.GetReqID(ctx),
 			"transport", "local",
 			"session", opts.SessionID,
-			"spawn_ms", spawnFinishedAt.Sub(startedAt).Milliseconds(),
-			"manifest_wait_ms", int64(0),
+			"spawn_ms", spawnNet.Milliseconds(),
+			"manifest_wait_ms", manifestDelta.Milliseconds(),
+			"readiness_budget_ms", readinessBudget.Milliseconds(),
 			"total_ms", time.Since(startedAt).Milliseconds(),
-			"outcome", "spawn_failed",
+			"outcome", outcome,
 		)
-		// A revoked generation surfaces its decode verdict through the
-		// transport start: it is a readiness outcome (the process ran and
-		// rejected the bytes), not a spawn failure, so the rotation loop
-		// must see it as such instead of a generic transcode_start_failed.
-		if errors.Is(err, playback.ErrSourceDecodeRejected) {
-			return nil, &localTransportStartupFailureV3{cause: err}
-		}
-		return nil, &localTransportStartupFailureV3{cause: err, failedToStart: true}
+		return nil, failure
 	}
 	// The local first-manifest wait is this request's readiness phase. Report
 	// how many poll iterations it ran too: the duration says how long the
@@ -7468,12 +7511,12 @@ func (h *PlaybackHandler) startReadyLocalPlaybackTransportV3(ctx context.Context
 			requestIDLogKeyV3, chimw.GetReqID(ctx),
 			"transport", "local",
 			"session", opts.SessionID,
-			"spawn_ms", spawnFinishedAt.Sub(startedAt).Milliseconds(),
-			"manifest_wait_ms", time.Since(spawnFinishedAt).Milliseconds(),
+			"spawn_ms", spawnNet.Milliseconds(),
+			"manifest_wait_ms", (manifestDelta + time.Since(spawnFinishedAt)).Milliseconds(),
 			"manifest_polls", manifestPolls,
 			"readiness_budget_ms", readinessWait.Milliseconds(),
 			"total_ms", time.Since(startedAt).Milliseconds(),
-			"outcome", "readiness_failed",
+			"outcome", transportStartupReadinessFailedV3,
 		)
 		failure := &localTransportStartupFailureV3{
 			cause:        manifestErr,
@@ -7489,8 +7532,8 @@ func (h *PlaybackHandler) startReadyLocalPlaybackTransportV3(ctx context.Context
 		requestIDLogKeyV3, chimw.GetReqID(ctx),
 		"transport", "local",
 		"session", opts.SessionID,
-		"spawn_ms", spawnFinishedAt.Sub(startedAt).Milliseconds(),
-		"manifest_wait_ms", time.Since(spawnFinishedAt).Milliseconds(),
+		"spawn_ms", spawnNet.Milliseconds(),
+		"manifest_wait_ms", (manifestDelta + time.Since(spawnFinishedAt)).Milliseconds(),
 		"manifest_polls", manifestPolls,
 		"readiness_budget_ms", readinessWait.Milliseconds(),
 		"total_ms", time.Since(startedAt).Milliseconds(),
@@ -7571,17 +7614,17 @@ func (h *PlaybackHandler) startReadyAutoLocalPlaybackTransportV3(ctx context.Con
 	// first-manifest wait. Spawn is recorded net of the last two, so subtracting
 	// only spawn would count the manifest wait in both transport_manifest and
 	// transport_readiness.
-	addTransportReadinessNetOfWalkV3(ctx, time.Since(startedAt),
-		transportPhaseDurationV3(ctx, "transport_spawn")-spawnBefore,
-		transportPhaseDurationV3(ctx, "transport_upstream")-upstreamBefore,
-		transportPhaseDurationV3(ctx, transportPhaseManifestV3)-manifestBefore)
+	spawnDelta := transportPhaseDurationV3(ctx, "transport_spawn") - spawnBefore
+	upstreamDelta := transportPhaseDurationV3(ctx, "transport_upstream") - upstreamBefore
+	manifestDelta := transportPhaseDurationV3(ctx, transportPhaseManifestV3) - manifestBefore
+	addTransportReadinessNetOfWalkV3(ctx, time.Since(startedAt), spawnDelta, upstreamDelta, manifestDelta)
 	outcome := transportStartupReadyV3
 	var failure *localTransportStartupFailureV3
 	var startupErr *playback.TranscodeStartupError
 	switch {
 	case err == nil:
 	case errors.As(err, &startupErr):
-		outcome = "readiness_failed"
+		outcome = transportStartupReadinessFailedV3
 		failure = &localTransportStartupFailureV3{
 			cause:        startupErr.Err,
 			wasRunning:   startupErr.WasRunning,
@@ -7590,8 +7633,15 @@ func (h *PlaybackHandler) startReadyAutoLocalPlaybackTransportV3(ctx context.Con
 	case errors.Is(err, playback.ErrSourceDecodeRejected):
 		// Same revoked-generation verdict as the non-auto path below: a
 		// readiness outcome for rotation, never a spawn failure.
-		outcome = "readiness_failed"
+		outcome = transportStartupReadinessFailedV3
 		failure = &localTransportStartupFailureV3{cause: err}
+	case inlineManifestReadinessErrorV3(err):
+		// The walk's launch performs the virtual inline first-manifest wait
+		// before it returns, so a timeout there is a readiness outcome with a
+		// retryable cause, not a spawn failure. The phase deltas below keep
+		// that wait under manifest_wait_ms rather than spawning.
+		outcome = transportStartupReadinessFailedV3
+		failure = &localTransportStartupFailureV3{cause: err, wasRunning: true}
 	default:
 		outcome = "spawn_failed"
 		failure = &localTransportStartupFailureV3{cause: err, failedToStart: true}
@@ -7602,6 +7652,8 @@ func (h *PlaybackHandler) startReadyAutoLocalPlaybackTransportV3(ctx context.Con
 		"transport", "local",
 		"session", pipeline.Current().SessionID,
 		"attempts", attempts,
+		"spawn_ms", spawnDelta.Milliseconds(),
+		"manifest_wait_ms", manifestDelta.Milliseconds(),
 		"readiness_budget_ms", walkBudget.Milliseconds(),
 		"total_ms", time.Since(startedAt).Milliseconds(),
 		"outcome", outcome,
