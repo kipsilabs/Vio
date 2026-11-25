@@ -297,7 +297,9 @@ export function useAdminPlugins() {
     repositories: repositoriesQuery.data ?? [],
     repositoriesError: repositoriesQuery.error,
     catalog: catalogQuery.data ?? [],
+    catalogError: catalogQuery.error,
     installations: installationsQuery.data ?? [],
+    installationsError: installationsQuery.error,
     catalogSettings: catalogSettingsQuery.data,
     isLoading:
       repositoriesQuery.isLoading ||
@@ -309,6 +311,8 @@ export function useAdminPlugins() {
       catalogQuery.isFetching ||
       installationsQuery.isFetching ||
       catalogSettingsQuery.isFetching,
+    refetchCatalog: catalogQuery.refetch,
+    refetchInstallations: installationsQuery.refetch,
   };
 }
 
