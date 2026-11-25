@@ -227,8 +227,12 @@ func (r *ProviderIDIntegrityRepairer) repairDriftRow(ctx context.Context, row pr
 		return "", err
 	}
 	if len(owners) == 0 {
-		if err := r.insertProviderIDsForDriftRow(ctx, row, entries); err != nil {
+		inserted, err := r.insertProviderIDsForDriftRow(ctx, row, entries)
+		if err != nil {
 			return "", err
+		}
+		if !inserted {
+			return "unresolved", nil
 		}
 		return "clean_insert", nil
 	}
@@ -241,8 +245,12 @@ func (r *ProviderIDIntegrityRepairer) repairDriftRow(ctx context.Context, row pr
 	}
 	switch {
 	case isProvisionalOwnershipStatus(owner.Status) && isConfirmedOwnershipStatus(row.Status):
-		if err := r.moveProvisionalProviderClaim(ctx, owner.ContentID, row, entries); err != nil {
+		moved, err := r.moveProvisionalProviderClaim(ctx, owner.ContentID, row, entries)
+		if err != nil {
 			return "", err
+		}
+		if !moved {
+			return "unresolved", nil
 		}
 		return "provisional_conflict", nil
 	case isConfirmedOwnershipStatus(owner.Status) && isProvisionalOwnershipStatus(row.Status):
@@ -304,64 +312,116 @@ func (r *ProviderIDIntegrityRepairer) findProviderIDOwners(
 	return owners, nil
 }
 
-func (r *ProviderIDIntegrityRepairer) insertProviderIDsForDriftRow(ctx context.Context, row providerIDDriftRow, entries []providerIDEntry) error {
+// lockUnchangedDriftItem locks the drift row's item and reports whether its
+// type and ID columns still match what the drift batch read. A repair locks
+// the item before any provider rows, as an admin's ID edit does: one that
+// deleted the rows first would wait on the edit's item lock for its inserts
+// while the edit waits on the deleted rows, a deadlock. A repair that waited
+// for an edit skips the item rather than write back the IDs it read before
+// it; the next run judges the item again. A deleted item is skipped too.
+func lockUnchangedDriftItem(ctx context.Context, tx pgx.Tx, row providerIDDriftRow) (bool, error) {
+	var current providerIDDriftRow
+	err := tx.QueryRow(ctx, `
+		SELECT type, COALESCE(imdb_id, ''), COALESCE(tmdb_id, ''), COALESCE(tvdb_id, '')
+		FROM media_items WHERE content_id = $1 FOR NO KEY UPDATE`, row.ContentID).
+		Scan(&current.ItemType, &current.IMDbID, &current.TMDBID, &current.TVDBID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("lock item %s for provider-id repair: %w", row.ContentID, err)
+	}
+	return current.ItemType == row.ItemType && current.IMDbID == row.IMDbID &&
+		current.TMDBID == row.TMDBID && current.TVDBID == row.TVDBID, nil
+}
+
+// insertProviderIDsForDriftRow replaces the item's provider rows with entries
+// and reports whether it did; see lockUnchangedDriftItem for when it doesn't.
+func (r *ProviderIDIntegrityRepairer) insertProviderIDsForDriftRow(ctx context.Context, row providerIDDriftRow, entries []providerIDEntry) (bool, error) {
 	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return fmt.Errorf("begin clean provider-id repair: %w", err)
+		return false, fmt.Errorf("begin clean provider-id repair: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	if unchanged, err := lockUnchangedDriftItem(ctx, tx, row); err != nil || !unchanged {
+		return false, err
+	}
 	if _, err := tx.Exec(ctx, `DELETE FROM media_item_provider_ids WHERE content_id = $1`, row.ContentID); err != nil {
-		return fmt.Errorf("clear existing provider ids for %s: %w", row.ContentID, err)
+		return false, fmt.Errorf("clear existing provider ids for %s: %w", row.ContentID, err)
 	}
 	for _, entry := range entries {
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO media_item_provider_ids (content_id, item_type, provider, provider_id, created_at, updated_at)
 			VALUES ($1, $2, $3, $4, NOW(), NOW())
 		`, row.ContentID, row.ItemType, entry.Provider, entry.ProviderID); err != nil {
-			return fmt.Errorf("insert repaired provider id %s for %s: %w", entry.Provider, row.ContentID, err)
+			return false, fmt.Errorf("insert repaired provider id %s for %s: %w", entry.Provider, row.ContentID, err)
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit clean provider-id repair: %w", err)
+		return false, fmt.Errorf("commit clean provider-id repair: %w", err)
 	}
-	return nil
+	return true, nil
 }
 
-func (r *ProviderIDIntegrityRepairer) moveProvisionalProviderClaim(ctx context.Context, ownerContentID string, row providerIDDriftRow, entries []providerIDEntry) error {
+// moveProvisionalProviderClaim moves the drift row's IDs off a provisional
+// owner onto the row's item and reports whether it did. It locks the item
+// before the owner, the order an admin's ID edit takes the item and the
+// holders of the IDs it chooses.
+func (r *ProviderIDIntegrityRepairer) moveProvisionalProviderClaim(ctx context.Context, ownerContentID string, row providerIDDriftRow, entries []providerIDEntry) (bool, error) {
 	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return fmt.Errorf("begin provisional provider-id repair: %w", err)
+		return false, fmt.Errorf("begin provisional provider-id repair: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	if unchanged, err := lockUnchangedDriftItem(ctx, tx, row); err != nil || !unchanged {
+		return false, err
+	}
 	var ownerStatus string
 	err = tx.QueryRow(ctx, `SELECT status FROM media_items WHERE content_id = $1 FOR UPDATE`, ownerContentID).Scan(&ownerStatus)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil
+			return false, nil
 		}
-		return fmt.Errorf("loading status for provisional owner %s: %w", ownerContentID, err)
+		return false, fmt.Errorf("loading status for provisional owner %s: %w", ownerContentID, err)
 	}
 	if isConfirmedOwnershipStatus(ownerStatus) {
-		return fmt.Errorf("refusing to move provider IDs from %s: status is now %q", ownerContentID, ownerStatus)
+		return false, fmt.Errorf("refusing to move provider IDs from %s: status is now %q", ownerContentID, ownerStatus)
+	}
+	// The owner was found before these locks; skip it when it no longer holds
+	// any of the IDs, such as after an edit this repair waited for.
+	providers, providerIDs := make([]string, len(entries)), make([]string, len(entries))
+	for i, entry := range entries {
+		providers[i], providerIDs[i] = entry.Provider, entry.ProviderID
+	}
+	var holds bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM media_item_provider_ids pid
+		WHERE pid.content_id = $1 AND pid.item_type = $2
+		  AND (pid.provider, pid.provider_id) IN (SELECT * FROM unnest($3::text[], $4::text[])))`,
+		ownerContentID, row.ItemType, providers, providerIDs).Scan(&holds); err != nil {
+		return false, fmt.Errorf("rechecking provisional owner %s: %w", ownerContentID, err)
+	}
+	if !holds {
+		return false, nil
 	}
 	if _, err := tx.Exec(ctx, `DELETE FROM media_item_provider_ids WHERE content_id = $1`, ownerContentID); err != nil {
-		return fmt.Errorf("clear provisional provider ids for %s: %w", ownerContentID, err)
+		return false, fmt.Errorf("clear provisional provider ids for %s: %w", ownerContentID, err)
 	}
 	if _, err := tx.Exec(ctx, `DELETE FROM media_item_provider_ids WHERE content_id = $1`, row.ContentID); err != nil {
-		return fmt.Errorf("clear existing provider ids for %s: %w", row.ContentID, err)
+		return false, fmt.Errorf("clear existing provider ids for %s: %w", row.ContentID, err)
 	}
 	for _, entry := range entries {
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO media_item_provider_ids (content_id, item_type, provider, provider_id, created_at, updated_at)
 			VALUES ($1, $2, $3, $4, NOW(), NOW())
 		`, row.ContentID, row.ItemType, entry.Provider, entry.ProviderID); err != nil {
-			return fmt.Errorf("insert provider id %s for %s after provisional repair: %w", entry.Provider, row.ContentID, err)
+			return false, fmt.Errorf("insert provider id %s for %s after provisional repair: %w", entry.Provider, row.ContentID, err)
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit provisional provider-id repair: %w", err)
+		return false, fmt.Errorf("commit provisional provider-id repair: %w", err)
 	}
-	return nil
+	return true, nil
 }
 
 func (s *MetadataService) canonicalizeProviderIDDuplicate(
@@ -377,9 +437,9 @@ func (s *MetadataService) canonicalizeProviderIDDuplicate(
 	return canonicalizeProviderIDDuplicate(ctx, s.dbPool, s.recsStaler, leftContentID, rightContentID, allowMatchedSource, markIdentity)
 }
 
-// clearProvisionalProviderIDsLocked removes provider ID rows for an item only
-// after re-confirming, under a row-level lock, that the item is still in a
-// provisional ownership status. Without the lock, a parallel goroutine could
+// clearProvisionalProviderIDsLocked removes provider ID rows and work id claims
+// for an item only after re-confirming, under a row-level lock, that the item is
+// still in a provisional ownership status. Without the lock, a parallel goroutine could
 // promote the item to matched between the caller's status check and our
 // delete, silently wiping a confirmed item's provider IDs.
 func clearProvisionalProviderIDsLocked(ctx context.Context, pool *pgxpool.Pool, contentID string) error {
@@ -415,6 +475,10 @@ func clearProvisionalProviderIDsLocked(ctx context.Context, pool *pgxpool.Pool, 
 	}
 	if _, err := tx.Exec(ctx, `DELETE FROM media_item_provider_ids WHERE content_id = $1`, contentID); err != nil {
 		return fmt.Errorf("clearing provisional provider IDs from %s: %w", contentID, err)
+	}
+	// A book's work id claims came with the provider IDs and go with them.
+	if err := catalog.DeleteWorkClaimsTx(ctx, tx, contentID); err != nil {
+		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit provisional provider-id clear: %w", err)
@@ -700,6 +764,14 @@ var mediaItemMergeSteps = []mediaItemMergeStep{
 			WHERE content_id = $1
 			  AND provider NOT IN (SELECT provider FROM media_item_provider_ids WHERE content_id = $2)`},
 	{"drop source provider ids", `DELETE FROM media_item_provider_ids WHERE content_id = $1`},
+	// Work id claims are not unique across items; move those for works the
+	// canonical item claims nothing for, as with provider IDs.
+	{"merge work ids", `
+			UPDATE media_item_work_ids
+			SET content_id = $2, updated_at = NOW()
+			WHERE content_id = $1
+			  AND provider NOT IN (SELECT provider FROM media_item_work_ids WHERE content_id = $2)`},
+	{"drop source work ids", `DELETE FROM media_item_work_ids WHERE content_id = $1`},
 	{"merge legacy provider columns", `
 			UPDATE media_items dest
 			SET imdb_id = COALESCE(NULLIF(dest.imdb_id, ''), src.imdb_id),

@@ -415,6 +415,48 @@ func requireTargets(t *testing.T, label string, rec *httptest.ResponseRecorder) 
 	return req
 }
 
+// Progress with no report time is left out rather than failing the response:
+// a zero timestamp cannot be marshaled, and one bad row would take down every
+// request on the page.
+func TestRequestDownloadWithoutReportTimeIsOmitted(t *testing.T) {
+	svc := fixtureRequests()
+	svc.requests[0].Status = mediarequests.StatusDownloading
+	svc.requests[0].Targets = []mediarequests.Target{
+		{ID: 1, Quality: "1080p", Status: mediarequests.StatusDownloading, CreatedAt: fixedTime(), UpdatedAt: fixedTime(),
+			Download: &mediarequests.DownloadProgress{Phase: mediarequests.DownloadPhaseDownloading, BytesTotal: 1000, BytesLeft: 500}},
+		{ID: 2, Quality: "4k", Status: mediarequests.StatusDownloading, CreatedAt: fixedTime(), UpdatedAt: fixedTime(),
+			Download: &mediarequests.DownloadProgress{Phase: mediarequests.DownloadPhaseDownloading, BytesTotal: 1000, BytesLeft: 250, UpdatedAt: fixedTime()}},
+	}
+	h := newTestHandler(t, requestDeps(svc))
+	rec := do(t, h, http.MethodGet, "/api/v2/requests/mine", "", requestOwner)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("listMyRequests: %d %s", rec.Code, rec.Body.String())
+	}
+	var mine struct {
+		Items []map[string]any `json:"items"`
+	}
+	decodeBody(t, rec.Body, &mine)
+	var item map[string]any
+	for _, candidate := range mine.Items {
+		if candidate["id"] == svc.requests[0].ID {
+			item = candidate
+		}
+	}
+	if item == nil {
+		t.Fatalf("request %s missing from %v", svc.requests[0].ID, mine.Items)
+	}
+	if _, present := item["download"]; present {
+		t.Fatalf("request download = %v, want it omitted", item["download"])
+	}
+	targets := item["targets"].([]any)
+	if _, present := targets[0].(map[string]any)["download"]; present {
+		t.Fatalf("target without report time: download = %v, want it omitted", targets[0])
+	}
+	if targets[1].(map[string]any)["download"] == nil {
+		t.Fatalf("target with report time lost its download: %v", targets[1])
+	}
+}
+
 // The profile-scoped request operations leave the download server details
 // out for a requester and keep them for an admin.
 func TestRequestDownloadServerDetailsAreForAdmins(t *testing.T) {
@@ -426,7 +468,6 @@ func TestRequestDownloadServerDetailsAreForAdmins(t *testing.T) {
 	deps.RequestLifecycle = &fakeLifecycle{}
 	h := newTestHandler(t, deps)
 	admin := with(bearer(adminToken), "X-Profile-Id", "p-primary")
-
 	// A requester sees none of them, on any operation that answers with a
 	// request.
 	created := do(t, h, http.MethodPost, "/api/v2/requests", `{"media_type":"movie","tmdb_id":7,"title":"Heat"}`, requestOwner)
@@ -436,7 +477,6 @@ func TestRequestDownloadServerDetailsAreForAdmins(t *testing.T) {
 	var body map[string]any
 	decodeBody(t, created.Body, &body)
 	requireAdminMembers(t, "createRequest", body, nil, nil)
-
 	var mine struct {
 		Items []map[string]any `json:"items"`
 	}
@@ -456,7 +496,6 @@ func TestRequestDownloadServerDetailsAreForAdmins(t *testing.T) {
 	}
 	got = requireTargets(t, "cancelRequest", do(t, h, http.MethodPost, "/api/v2/requests/r-1/cancel", `{}`, requestOwner))
 	requireAdminMembers(t, "cancelRequest", got, nil, nil)
-
 	// An admin sees every one the request has on the same operations. The
 	// create and cancel fakes answer with a fresh fixture, which carries no
 	// errors and, once created, no targets.
@@ -500,7 +539,6 @@ func TestRequestAdminReachFollowsActingProfile(t *testing.T) {
 	deps.RequestLifecycle = lifecycle
 	h := newTestHandler(t, deps)
 	child := with(bearer(adminToken), "X-Profile-Id", "p-owner")
-
 	// r-1 belongs to another account.
 	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/requests/r-1", "", child), TypePermissionDenied)
 	if svc.lastViewer.IsAdmin {
@@ -509,7 +547,6 @@ func TestRequestAdminReachFollowsActingProfile(t *testing.T) {
 	// r-3 is the account's own, requested by its primary profile.
 	got := requireTargets(t, "getRequest", do(t, h, http.MethodGet, "/api/v2/requests/r-3", "", child))
 	requireAdminMembers(t, "getRequest", got, nil, nil)
-
 	if rec := do(t, h, http.MethodPost, "/api/v2/requests/r-1/cancel", `{}`, child); rec.Code != http.StatusOK {
 		t.Fatalf("cancelRequest: %d %s", rec.Code, rec.Body.String())
 	}
@@ -519,12 +556,10 @@ func TestRequestAdminReachFollowsActingProfile(t *testing.T) {
 	if rec := do(t, h, http.MethodGet, "/api/v2/requests/status", "", child); rec.Code != http.StatusOK || lifecycle.viewer.IsAdmin {
 		t.Fatalf("getRequestStatus: %d, admin viewer %v", rec.Code, lifecycle.viewer.IsAdmin)
 	}
-
 	// The primary profile on the same account keeps its admin reach.
 	got = requireTargets(t, "admin getRequest", do(t, h, http.MethodGet, "/api/v2/requests/r-1", "", with(bearer(adminToken), "X-Profile-Id", "p-primary")))
 	requireAdminMembers(t, "admin getRequest", got, adminRequestMembers, adminTargetMembers)
 }
-
 func TestGetRequestMediaDetail(t *testing.T) {
 	svc := fixtureRequests()
 	h := newTestHandler(t, requestDeps(svc))
@@ -559,11 +594,9 @@ func TestGetRequestMediaDetail(t *testing.T) {
 	svc.err = mediarequests.ErrSeasonSourceUnavailable
 	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/requests/detail/series/949?season_source=tvdb", "", requestOwner), TypeDependencyUnavailable)
 }
-
 func TestDiscover(t *testing.T) {
 	svc := fixtureRequests()
 	h := newTestHandler(t, requestDeps(svc))
-
 	rec := do(t, h, http.MethodGet, "/api/v2/requests/discover", "", requestOwner)
 	var sections struct {
 		Items []struct {
@@ -577,7 +610,8 @@ func TestDiscover(t *testing.T) {
 	if rec.Code != 200 || len(sections.Items) != 1 || sections.Items[0].Key != "trending_movies" || len(sections.Items[0].Results) != 1 || sections.Page != nil {
 		t.Fatalf("%d %s", rec.Code, rec.Body.String())
 	}
-	if len(sections.RowOrder) != 2 || sections.RowOrder[1] != (DiscoverRowRef{Key: "studios", Type: "studios", Title: "Studios"}) {
+	if len(sections.RowOrder) != 2 || sections.RowOrder[1].Key != "studios" || sections.RowOrder[1].Type != "studios" || sections.RowOrder[1].Title != "Studios" ||
+		sections.RowOrder[1].TitleKey != "home.section.discoverStudios" {
 		t.Fatalf("row_order = %+v, want the title row then the brand row", sections.RowOrder)
 	}
 	rec = do(t, h, http.MethodGet, "/api/v2/requests/discover/rows/r_abc?page=2", "", requestOwner)
@@ -590,7 +624,6 @@ func TestDiscover(t *testing.T) {
 		t.Fatalf("%d %s", rec.Code, rec.Body.String())
 	}
 	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/requests/discover/rows/Not-A-Key", "", requestOwner), TypeValidationFailed)
-
 	rec = do(t, h, http.MethodGet, "/api/v2/requests/discover/popular_series?page=3", "", requestOwner)
 	var section struct {
 		Key      string `json:"key"`
@@ -602,7 +635,6 @@ func TestDiscover(t *testing.T) {
 		t.Fatalf("%d %s", rec.Code, rec.Body.String())
 	}
 	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/requests/discover/weird", "", requestOwner), TypeValidationFailed)
-
 	for _, seg := range []string{"genres", "networks", "studios"} {
 		rec = do(t, h, http.MethodGet, "/api/v2/requests/discover/"+seg, "", requestOwner)
 		var brands struct {
@@ -617,7 +649,6 @@ func TestDiscover(t *testing.T) {
 			t.Fatalf("%s: %d %s (%s)", seg, rec.Code, rec.Body.String(), svc.lastCall)
 		}
 	}
-
 	rec = do(t, h, http.MethodGet, "/api/v2/requests/discover/browse/studio/marvel-studios?sort=release_date&page=2", "", requestOwner)
 	var browse struct {
 		Kind      string `json:"kind"`
@@ -646,7 +677,6 @@ func TestDiscover(t *testing.T) {
 	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/requests/discover/browse/studio/%20", "", requestOwner), TypeValidationFailed)
 	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/requests/discover/browse/studio/missing", "", requestOwner), TypeNotFound)
 }
-
 func TestRequestsDenied(t *testing.T) {
 	h := newTestHandler(t, requestDeps(fixtureRequests()))
 	ops := []struct{ method, path, body string }{
@@ -691,11 +721,9 @@ func TestRequestsDenied(t *testing.T) {
 		requireProblem(t, do(t, hu, op.method, op.path, op.body, requestOwner), TypeDependencyUnavailable)
 	}
 }
-
 func TestFollowRequestMedia(t *testing.T) {
 	svc := fixtureRequests()
 	h := newTestHandler(t, requestDeps(svc))
-
 	rec := do(t, h, http.MethodPut, "/api/v2/requests/follows/movie/949", "", requestOwner)
 	var got RequestMediaState
 	decodeBody(t, rec.Body, &got)
@@ -705,15 +733,32 @@ func TestFollowRequestMedia(t *testing.T) {
 	if svc.lastCall != "follow" || svc.lastArgs[0] != mediarequests.MediaTypeMovie || svc.lastArgs[1] != 949 || svc.lastViewer.ProfileID != "p-owner" {
 		t.Fatalf("call = %s %v viewer = %+v", svc.lastCall, svc.lastArgs, svc.lastViewer)
 	}
-
 	rec = do(t, h, http.MethodDelete, "/api/v2/requests/follows/series/1399", "", requestOwner)
 	if rec.Code != http.StatusNoContent || svc.lastCall != "unfollow" || svc.lastArgs[0] != mediarequests.MediaTypeSeries {
 		t.Fatalf("%d %s call = %s %v", rec.Code, rec.Body.String(), svc.lastCall, svc.lastArgs)
 	}
-
 	requireProblem(t, do(t, h, http.MethodPut, "/api/v2/requests/follows/tv/949", "", requestOwner), TypeValidationFailed)
 	svc.err = mediarequests.ErrNotRequested
 	requireProblem(t, do(t, h, http.MethodPut, "/api/v2/requests/follows/movie/949", "", requestOwner), TypeConflict)
 	svc.err = mediarequests.ErrAlreadyAvailable
 	requireProblem(t, do(t, h, http.MethodPut, "/api/v2/requests/follows/movie/949", "", requestOwner), TypeConflict)
+}
+func TestListMyRequestsOmitsZeroDownloadEstimate(t *testing.T) {
+	svc := fixtureRequests()
+	svc.requests = svc.requests[:1]
+	zero := time.Time{}
+	svc.requests[0].Targets[0].Download.EstimatedCompletion = &zero
+
+	rec := do(t, NewHandler(requestDeps(svc)), http.MethodGet, Prefix+"/requests/mine", "", requestOwner)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body %s", rec.Code, rec.Body.String())
+	}
+	var body MediaRequestCollection
+	decodeBody(t, rec.Body, &body)
+	if len(body.Items) != 1 || body.Items[0].Download == nil || body.Items[0].Download.EstimatedCompletionAt != nil {
+		t.Fatalf("items = %+v, want progress without estimated_completion_at", body.Items)
+	}
+	if len(body.Items[0].Targets) != 1 || body.Items[0].Targets[0].Download == nil || body.Items[0].Targets[0].Download.EstimatedCompletionAt != nil {
+		t.Fatalf("targets = %+v, want progress without estimated_completion_at", body.Items[0].Targets)
+	}
 }

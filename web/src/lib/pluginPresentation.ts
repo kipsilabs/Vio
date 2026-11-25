@@ -1,3 +1,4 @@
+import type { MessageKey } from "@/locales/keys";
 import type { PluginCapability, PluginInstallation, PluginPresentation } from "@/api/types";
 import { capabilityKind } from "@/lib/pluginCapabilities";
 
@@ -34,7 +35,12 @@ export function installationTier(installation: PluginInstallation): PluginTier {
  * can't be applied, so it is not offered.
  */
 export function pendingUpdateVersion(installation: PluginInstallation): string | null {
-  if (installationTier(installation) === "unverified" || installation.updates_paused) return null;
+  if (
+    installation.env_managed?.version_pin ||
+    installationTier(installation) === "unverified" ||
+    installation.updates_paused
+  )
+    return null;
   return installation.available_version || null;
 }
 
@@ -79,6 +85,8 @@ export function configPanelId(key: string): string {
 export interface CatalogGroup {
   kind: PluginSourceKind;
   title: string;
+  /** Catalog message for the section heading, formatted where it renders. */
+  titleKey: MessageKey;
   matches: (sourceKind: string) => boolean;
 }
 
@@ -86,16 +94,19 @@ export const CATALOG_GROUPS: readonly CatalogGroup[] = [
   {
     kind: "vio",
     title: "Silo maintained",
+    titleKey: "web.admin.plugins.catalog.groupSilo",
     matches: (sourceKind: string) => sourceKind === "vio" || sourceKind === "silo",
   },
   {
     kind: "approved_community",
     title: "Approved community",
+    titleKey: "web.admin.plugins.catalog.groupApprovedCommunity",
     matches: (sourceKind: string) => sourceKind === "approved_community",
   },
   {
     kind: "external",
     title: "Other sources",
+    titleKey: "web.admin.plugins.catalog.groupExternal",
     matches: (sourceKind: string) =>
       sourceKind !== "vio" && sourceKind !== "silo" && sourceKind !== "approved_community",
   },
@@ -126,6 +137,19 @@ export function pluginSummary(
     capabilities.find((capability) => capability.description?.trim())?.description?.trim() ??
     "No description provided."
   );
+}
+
+/**
+ * A verified signature's source repository as `owner/name`, from a URL like
+ * `https://github.com/owner/name`. Anything else is shown as sent.
+ */
+export function signatureRepositoryLabel(sourceRepo: string): string {
+  try {
+    const path = new URL(sourceRepo).pathname.replace(/^\/+|\/+$/g, "");
+    return path || sourceRepo;
+  } catch {
+    return sourceRepo;
+  }
 }
 
 export function safeExternalURL(rawURL?: string): string | undefined {

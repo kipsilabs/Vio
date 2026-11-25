@@ -170,6 +170,47 @@ func TestAcquireRelayDemuxReadAdmitsLocalWithoutSlot(t *testing.T) {
 	}
 }
 
+// A detached warm must stay off a relay source whose request-path admission
+// recently shed a client read. The warm exists to help the next window; adding
+// a full-track demux to a pipe that is already refusing the current window
+// makes both slower (the production 0-of-18 warm completions).
+func TestWarmTrackSkipsWhileRequestPathAdmissionSheds(t *testing.T) {
+	guard := newRelayDemuxGuard(1, 5*time.Millisecond)
+	swapRelayDemuxGuardForTest(t, guard)
+	const remote = "http://relay-warm-shed.test/source/tok/movie.mkv"
+
+	release, ok := guard.acquire(context.Background(), remote, relayDemuxRequestPath)
+	if !ok {
+		t.Fatal("first request-path read was not admitted")
+	}
+	if _, ok := guard.acquire(context.Background(), remote, relayDemuxRequestPath); ok {
+		t.Fatal("request-path read was admitted to a saturated source")
+	}
+	release()
+
+	c, _ := newTestCache(t)
+	calls := 0
+	opts := StreamExtractOpts{
+		InputPath:             remote,
+		SourceCodec:           "subrip",
+		TrackIndex:            0,
+		CacheIdentity:         "virtual-warm-shed",
+		DisableBackgroundWarm: true,
+	}
+	done := c.WarmTrackInBackground(opts, func(context.Context, StreamExtractOpts) error {
+		calls++
+		return nil
+	}, "warm-shed")
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("warm did not settle after skipping a shedding source")
+	}
+	if calls != 0 {
+		t.Fatalf("warm extracted %d times while request-path admission was shedding, want 0", calls)
+	}
+}
+
 // A request-path window serve that cannot get a relay slot must answer the
 // existing retryable shape instead of stacking a second demux on a saturated
 // pipe, and it must do so before any response bytes are written.

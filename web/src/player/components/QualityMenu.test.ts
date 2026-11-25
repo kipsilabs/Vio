@@ -1,8 +1,17 @@
 // @vitest-environment jsdom
 
-import { act, fireEvent, render, screen, within } from "@testing-library/react";
-import { createElement, type ComponentProps } from "react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import {
+  act,
+  fireEvent,
+  render as renderBase,
+  screen,
+  waitFor,
+  within,
+  type RenderOptions,
+} from "@testing-library/react";
+import { createElement, type ComponentProps, type ReactElement, type ReactNode } from "react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   buildVersionStatusLabels,
   QualityMenu,
@@ -12,6 +21,20 @@ import {
 } from "./QualityMenu";
 import type { PlayerIndexerRelease } from "../types";
 import { REQUEST_RELEASE_ERROR } from "@/hooks/useIndexerReleases";
+import { resetVersionLivenessCache } from "@/hooks/queries/versionLiveness";
+
+// The menu runs the item page's playability check, which reads through
+// react-query. Production mounts it under the app's provider; these tests get
+// one inert client so mounting never depends on the network.
+const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+function QueryProvider({ children }: { children: ReactNode }) {
+  return createElement(QueryClientProvider, { client: queryClient }, children);
+}
+
+function render(ui: ReactElement, options?: Omit<RenderOptions, "wrapper">) {
+  return renderBase(ui, { ...options, wrapper: QueryProvider });
+}
 
 // The sort preference reads/writes the canonical settings endpoints; the menu
 // tests only exercise the display re-order, so it is mocked inert.
@@ -50,6 +73,25 @@ beforeEach(() => {
     indexer_request: true,
   });
   requestReleaseMock.mockReset();
+  // Drop the cross-test verdict cache and stub the v2 check's network so
+  // mounting the menu never reaches out; tests that inspect the request
+  // replace the stub.
+  resetVersionLivenessCache();
+  queryClient.clear();
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(
+      async () =>
+        new Response(JSON.stringify({ results: [] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+    ),
+  );
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
 });
 
 const qualityOptions = [
@@ -913,5 +955,103 @@ describe("removeFailedVersions", () => {
       { ...base, fileId: 2 },
     ]);
     expect(rows.map((v) => v.fileId)).toEqual([1, 2]);
+  });
+});
+
+describe("QualityMenu playability verdicts", () => {
+  const plannerMessage =
+    "This HDR source requires video encoding, but no validated recipe is installed.";
+
+  function recordVersionsCheck(results: unknown[]) {
+    const requests: { path: string; method: string; body: Record<string, unknown> }[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+        requests.push({
+          path: new URL(String(url), "http://silo.test").pathname,
+          method: init?.method ?? "GET",
+          body:
+            typeof init?.body === "string"
+              ? (JSON.parse(init.body) as Record<string, unknown>)
+              : {},
+        });
+        return new Response(JSON.stringify({ results }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }),
+    );
+    return requests;
+  }
+
+  const menuVersions = [
+    makeVersionInfo({ fileId: 1, label: "2160p HEVC", isCurrentSource: true }),
+    makeVersionInfo({ fileId: 2, label: "1080p H264" }),
+  ];
+
+  it("disables a refused row with the badge and the planner's title and starts nothing", async () => {
+    const requests = recordVersionsCheck([
+      { file_id: "1", available: true, playability: { playable: true } },
+      {
+        file_id: "2",
+        available: true,
+        playability: {
+          playable: false,
+          reason: "hdr_transcode_unsupported",
+          message: plannerMessage,
+        },
+      },
+    ]);
+    const onSwitchVersion = vi.fn();
+    render(createElement(QualityMenu, menuProps({ versions: menuVersions, onSwitchVersion })));
+    fireEvent.click(screen.getByRole("button", { name: "Version" }));
+
+    const blocked = screen.getByRole("menuitem", { name: /1080p H264/ });
+    await waitFor(() => expect(blocked).toBeDisabled());
+    expect(blocked).toHaveTextContent("Can't play on this device");
+    expect(blocked).toHaveAttribute("title", plannerMessage);
+
+    fireEvent.click(blocked);
+    // The click writes no selection, posts no start, and does not close the
+    // menu as if a version had been chosen.
+    expect(onSwitchVersion).not.toHaveBeenCalled();
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+
+    // The verdict was requested through the same v2 check the item page uses,
+    // with `playability_only` and the start's client block.
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({
+      path: "/api/v2/catalog/versions/check",
+      method: "POST",
+    });
+    const body = requests[0]!.body;
+    expect(body.playability_only).toBe(true);
+    expect(body.file_ids).toEqual(expect.arrayContaining(["1", "2"]));
+    expect((body.client_features as string[]).length).toBeGreaterThan(0);
+    expect(body.client_capabilities).toMatchObject({ video_evidence: "declared" });
+    expect(body.client_playback_context).toMatchObject({ protocol_version: 3 });
+  });
+
+  it("keeps a row with no verdict selectable and starts a playable one", async () => {
+    const requests = recordVersionsCheck([
+      { file_id: "1", available: true, playability: { playable: true } },
+      // No playability key: an unfinished or retryable check is unknown, not a
+      // refusal.
+      { file_id: "2", available: true },
+    ]);
+    const onSwitchVersion = vi.fn();
+    render(createElement(QualityMenu, menuProps({ versions: menuVersions, onSwitchVersion })));
+    fireEvent.click(screen.getByRole("button", { name: "Version" }));
+    await waitFor(() => expect(requests).toHaveLength(1));
+
+    const transient = screen.getByRole("menuitem", { name: /1080p H264/ });
+    expect(transient).not.toBeDisabled();
+    expect(transient).not.toHaveTextContent("Can't play on this device");
+    fireEvent.click(transient);
+    expect(onSwitchVersion).toHaveBeenCalledWith(2);
+
+    fireEvent.click(screen.getByRole("button", { name: "Version" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: /2160p HEVC/ }));
+    expect(onSwitchVersion).toHaveBeenLastCalledWith(1);
   });
 });

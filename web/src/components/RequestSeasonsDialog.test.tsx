@@ -1,154 +1,108 @@
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+
 import type { RequestMediaDetail, RequestMediaSeason } from "@/api/types";
-
-const mocks = vi.hoisted(() => ({
-  create: vi.fn(),
-  detailCalls: [] as Array<{ mediaType: string; tmdbID: number; options?: unknown }>,
-  loaded: { data: undefined as RequestMediaDetail | undefined, isFetching: false, isError: false },
-}));
-
-vi.mock("@/hooks/queries/useRequests", () => ({
-  useCreateMediaRequest: () => ({ mutate: mocks.create, isPending: false }),
-  useRequestMediaDetail: (mediaType: string, tmdbID: number, options?: unknown) => {
-    mocks.detailCalls.push({ mediaType, tmdbID, options });
-    return mocks.loaded;
-  },
-}));
-
+import { requestInputFromMediaResult } from "@/lib/mediaRequests";
 import { RequestSeasonsDialog } from "./RequestSeasonsDialog";
 
-const season = (n: number, overrides: Partial<RequestMediaSeason> = {}): RequestMediaSeason => ({
-  season_number: n,
-  episode_count: 10,
-  air_date: "2020-01-01",
-  availability: "missing",
-  requested: false,
-  ...overrides,
+/** What the dialog reads and posts, without a server. */
+const requests = vi.hoisted(() => ({
+  fetchedSources: [] as ("tvdb" | "tmdb")[],
+  mutate: vi.fn(),
+}));
+
+vi.mock("@/hooks/queries/useRequests", () => {
+  const season = (name: string): RequestMediaSeason => ({
+    season_number: 1,
+    name,
+    air_date: "2020-01-01",
+    episode_count: 8,
+    availability: "missing",
+    requested: false,
+  });
+  const detail = (source: "tvdb" | "tmdb"): RequestMediaDetail => ({
+    media_type: "series",
+    tmdb_id: 1234,
+    title: "The Show",
+    year: 2020,
+    seasons: [season(source === "tmdb" ? "TMDB season" : "TVDB season")],
+    availability: "missing",
+    request: { requestable: true },
+  });
+  return {
+    useRequestMediaDetail: (
+      _mediaType: string,
+      _tmdbID: number,
+      options: { enabled?: boolean; seasonSource?: "tvdb" | "tmdb" } = {},
+    ) => {
+      const source = options.seasonSource ?? "tvdb";
+      requests.fetchedSources.push(source);
+      return { data: detail(source), isFetching: false, isError: false };
+    },
+    useCreateMediaRequest: () => ({ mutate: requests.mutate, isPending: false }),
+  };
 });
 
-const series = (overrides: Partial<RequestMediaDetail>): RequestMediaDetail => ({
-  media_type: "series",
-  tmdb_id: 42,
-  title: "Example",
-  availability: "missing",
-  request: { requestable: true },
-  seasons: [],
-  ...overrides,
+beforeEach(() => {
+  requests.fetchedSources.length = 0;
+  requests.mutate.mockReset();
 });
 
-function open(detail?: RequestMediaDetail) {
-  render(
-    <RequestSeasonsDialog
-      open
-      onOpenChange={() => {}}
-      tmdbID={42}
-      title="Example"
-      detail={detail}
-    />,
-  );
-  return screen.getByRole("dialog");
+function show() {
+  render(<RequestSeasonsDialog open onOpenChange={vi.fn()} tmdbID={1234} title="The Show" />);
 }
 
-describe("RequestSeasonsDialog", () => {
-  beforeEach(() => {
-    mocks.create.mockReset();
-    mocks.detailCalls.length = 0;
-    mocks.loaded = { data: undefined, isFetching: false, isError: false };
-  });
+async function submit() {
+  await userEvent.click(screen.getByRole("button", { name: /^Request/ }));
+  await waitFor(() => expect(requests.mutate).toHaveBeenCalled());
+  return requests.mutate.mock.calls[0]?.[0] as Record<string, unknown>;
+}
 
-  it("leaves an untouched pick to the server", () => {
-    const dialog = open(series({ seasons: [season(1), season(2, { availability: "available" })] }));
-    const available = within(dialog).getByRole("switch", { name: "Season 2" });
-    expect(available).toBeDisabled();
-    expect(available).toHaveAccessibleDescription(/In library/);
-    fireEvent.click(within(dialog).getByRole("button", { name: "Request Season 1" }));
-    expect(mocks.create.mock.calls[0]![0]).not.toHaveProperty("seasons");
-    expect(mocks.create.mock.calls[0]![0]).toMatchObject({ season_source: "tvdb" });
-  });
+describe("Request seasons dialog season numbering source", () => {
+  it("starts on TVDB and posts season_source tvdb by default", async () => {
+    show();
 
-  it("switches the season source and sends the chosen source", () => {
-    mocks.loaded = {
-      data: series({
-        season_source: "tmdb",
-        seasons: [season(1), season(2, { air_date: "2999-01-01" })],
-      }),
-      isFetching: false,
-      isError: false,
-    };
-    const dialog = open(series({ season_source: "tvdb", seasons: [season(1)] }));
+    expect(await screen.findByText(/TVDB season/)).toBeInTheDocument();
+    expect(requests.fetchedSources).toEqual(["tvdb"]);
 
-    fireEvent.click(within(dialog).getByRole("button", { name: "TMDB" }));
-
-    expect(mocks.detailCalls.at(-1)).toMatchObject({
-      mediaType: "series",
-      tmdbID: 42,
-      options: { enabled: true, seasonSource: "tmdb" },
-    });
-    expect(within(dialog).getByRole("switch", { name: "Season 2" })).toBeInTheDocument();
-    fireEvent.click(within(dialog).getByRole("button", { name: "Request Season 1" }));
-    expect(mocks.create.mock.calls[0]![0]).toMatchObject({ season_source: "tmdb" });
-  });
-
-  it("requests a series with nothing aired whole", () => {
-    const dialog = open(series({ seasons: [season(1, { air_date: "2999-01-01" })] }));
-    expect(within(dialog).getByText(/covers the whole series/)).toBeInTheDocument();
-    fireEvent.click(within(dialog).getByRole("button", { name: "Request series" }));
-    expect(mocks.create.mock.calls[0]![0]).not.toHaveProperty("seasons");
-  });
-
-  it("asks for the upcoming seasons of a series in the library", () => {
-    const dialog = open(
-      series({
-        availability: "available",
-        seasons: [season(1, { availability: "available" }), season(2, { air_date: "2999-01-01" })],
+    expect(await submit()).toEqual(
+      expect.objectContaining({
+        media_type: "series",
+        tmdb_id: 1234,
+        season_source: "tvdb",
       }),
     );
-    expect(within(dialog).getByText("Pick the upcoming seasons to request.")).toBeInTheDocument();
-    expect(within(dialog).getByRole("button", { name: "Request" })).toBeDisabled();
-    fireEvent.click(within(dialog).getByRole("switch", { name: "Season 2" }));
-    fireEvent.click(within(dialog).getByRole("button", { name: "Request Season 2" }));
-    expect(mocks.create.mock.calls[0]![0]).toMatchObject({ seasons: [2] });
   });
 
-  it("picks the latest season with one click", () => {
-    const dialog = open(
-      series({ seasons: [season(1), season(2), season(3, { air_date: "2999-01-01" })] }),
-    );
-    fireEvent.click(within(dialog).getByRole("button", { name: "Latest season" }));
-    fireEvent.click(within(dialog).getByRole("button", { name: "Request Season 2" }));
-    expect(mocks.create.mock.calls[0]![0]).toMatchObject({ seasons: [2] });
-  });
+  it("switches to TMDB, refetches the seasons and posts season_source tmdb", async () => {
+    show();
+    expect(await screen.findByText(/TVDB season/)).toBeInTheDocument();
 
-  it("picks the upcoming seasons with one click", () => {
-    const dialog = open(
-      series({
-        seasons: [
-          season(1, { availability: "available" }),
-          season(2),
-          season(3, { air_date: "2999-01-01" }),
-          season(4, { air_date: undefined, episode_count: 0 }),
-        ],
+    const tmdb = screen.getByRole("button", { name: "TMDB" });
+    expect(tmdb).toHaveAttribute("aria-pressed", "false");
+    await userEvent.click(tmdb);
+
+    expect(await screen.findByText(/TMDB season/)).toBeInTheDocument();
+    expect(screen.queryByText(/TVDB season/)).not.toBeInTheDocument();
+    expect(requests.fetchedSources).toContain("tmdb");
+    expect(tmdb).toHaveAttribute("aria-pressed", "true");
+
+    expect(await submit()).toEqual(expect.objectContaining({ season_source: "tmdb" }));
+  });
+});
+
+describe("requestInputFromMediaResult", () => {
+  it.each(["tvdb", "tmdb"] as const)("carries a detail's season_source %s", (source) => {
+    expect(
+      requestInputFromMediaResult({
+        media_type: "series",
+        tmdb_id: 1,
+        title: "The Show",
+        availability: "missing",
+        request: { requestable: true },
+        season_source: source,
       }),
-    );
-    fireEvent.click(within(dialog).getByRole("button", { name: "Upcoming seasons" }));
-    fireEvent.click(within(dialog).getByRole("button", { name: "Request Seasons 3–4" }));
-    expect(mocks.create.mock.calls[0]![0]).toMatchObject({ seasons: [3, 4] });
-  });
-
-  it("offers no latest-season shortcut when that season is in the library", () => {
-    const dialog = open(
-      series({
-        seasons: [season(1), season(2), season(3, { availability: "available" })],
-      }),
-    );
-    expect(within(dialog).queryByRole("button", { name: "Latest season" })).toBeNull();
-    expect(within(dialog).queryByRole("button", { name: "Upcoming seasons" })).toBeNull();
-  });
-
-  it("waits for a refetch before sending from loaded detail", () => {
-    mocks.loaded = { data: series({ seasons: [season(1)] }), isFetching: true, isError: false };
-    const dialog = open();
-    expect(within(dialog).getByRole("button", { name: /Request/ })).toBeDisabled();
+    ).toMatchObject({ season_source: source });
   });
 });

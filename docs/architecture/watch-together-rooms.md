@@ -1,5 +1,7 @@
 # Watch Together rooms: lobby, staging, and readiness
 
+For how the room anchor, presence and playback commands stay consistent across replicas, see [Watch Party synchronization](watch-party-synchronization.md).
+
 How a room moves from an empty lobby to synchronized playback, which counters
 mean what, and what "ready" means in each phase. The code is the source of
 truth; this records the invariants the code keeps.
@@ -148,12 +150,9 @@ show the leader from the list ordering (`vote_count DESC, created_at ASC`),
 which `VoteWinner` still exposes for that purpose. Direct selection remains
 refused in vote rooms; the host switches to host picks first.
 
-The frozen v1 promotion route retains its winner-only gate and rejects
-promotion before any votes are cast.
-
 A room holds at most `maxRoomSuggestions` (200) suggestions. Every create,
 vote and unvote reloads and broadcasts the whole list, so the cap bounds what
-one small request costs. Both create paths (v1 `CreateSuggestion`, v2
-`CreateSuggestionOnce`) count the room's rows after locking its
+one small request costs. Suggestion creation (`CreateSuggestionOnce`) counts
+the room's rows after locking its
 `watch_together_rooms` row `FOR UPDATE`, which keeps the cap exact when
 API servers create concurrently.

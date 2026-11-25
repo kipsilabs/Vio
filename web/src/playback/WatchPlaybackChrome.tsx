@@ -30,6 +30,7 @@ import { LocalErrorBoundary } from "@/components/LocalErrorBoundary";
 import { Button } from "@/components/ui/button";
 import { Slider } from "@/components/ui/slider";
 import { useDocumentTitle } from "@/hooks/useDocumentTitle";
+import { codeNumber, numberText, useT, type Translate } from "@/i18n";
 import { fetchCatalogItemDetail } from "@/hooks/queries/catalogRead";
 import { useContinueWatching } from "@/hooks/queries/progress";
 import {
@@ -43,12 +44,13 @@ import { useVersionLiveness } from "@/hooks/queries/versionLiveness";
 import { useStampedVersions } from "./useStampedVersions";
 import { catalogKeys } from "@/hooks/queries/keys";
 import { applyPlaybackProgressToCache } from "@/hooks/queries/playbackProgressCache";
-import { readRequestedFileId, rememberRequestedFileId } from "./requestedVersion";
+import { readRequestedVersion, rememberRequestedFileId } from "./requestedVersion";
 import { invalidatePlaybackSurfaceQueries } from "@/hooks/queries/playbackSurfaceRefresh";
 import { useAuth } from "@/hooks/useAuth";
 import { lastBufferingMode, rememberBufferingMode } from "@/player/buffering-mode-memory";
 import { useCurrentProfile } from "@/hooks/useCurrentProfile";
 import { useViewTransitionNavigate } from "@/hooks/useViewTransition";
+import { AudioTrackMenu } from "@/player/components/AudioTrackMenu";
 import { PlayerConfigProvider, type PlayerConfig } from "@/player/context/PlayerConfigContext";
 import type { BufferingMode } from "@/player/buffering-quality";
 import type {
@@ -124,6 +126,7 @@ function normalizeWatchPlaybackRequest(
 }
 
 function buildPlaybackSubtitle(
+  t: Translate,
   request: WatchRouteRequest,
   item?: {
     title: string;
@@ -138,15 +141,21 @@ function buildPlaybackSubtitle(
   }
 
   if (item.series_title && item.season_number != null && item.episode_number != null) {
-    return `S${item.season_number}:E${item.episode_number}${item.title ? ` · ${item.title}` : ""}`;
+    const code = {
+      season: codeNumber(item.season_number),
+      episode: codeNumber(item.episode_number),
+    };
+    return item.title
+      ? t("web.player.episode.codeWithTitle", { ...code, title: item.title })
+      : t("web.player.episode.code", code);
   }
 
   if (item.year) {
-    return String(item.year);
+    return numberText(item.year);
   }
 
   if (request.libraryId != null) {
-    return `Library ${request.libraryId}`;
+    return t("web.player.bar.library", { id: request.libraryId });
   }
 
   return undefined;
@@ -221,7 +230,8 @@ function buildWatchLocationState(request: WatchRouteRequest) {
     request.audioTrackIndex == null &&
     request.prePlaySubtitleMode == null &&
     request.prePlaySubtitleSelection == null &&
-    !request.versionPicked
+    !request.versionPicked &&
+    request.explicitFileSelection !== true
   ) {
     return undefined;
   }
@@ -232,10 +242,32 @@ function buildWatchLocationState(request: WatchRouteRequest) {
     prePlaySubtitleMode: request.prePlaySubtitleMode,
     prePlaySubtitleSelection: request.prePlaySubtitleSelection ?? null,
     versionPicked: request.versionPicked,
+    // The watch URL names a file, not why: without this the route rebuilds
+    // the request as an Auto start and the viewer's pick is downgraded to
+    // something the server may replace.
+    explicitFileSelection: request.explicitFileSelection === true,
   };
 }
 
-function PlaybackPreparingScreen() {
+/**
+ * How long the preparing gate may hold the screen. The watch read it waits on
+ * answers in a couple of seconds even on a cold catalog; twenty is the same
+ * order as the server's own selection-probe bound, and past it the viewer gets
+ * the unavailable screen with Try Again rather than an unbounded spinner.
+ */
+export const PREPARING_DEADLINE_MS = 20_000;
+
+function PlaybackPreparingScreen({ onDeadline }: { onDeadline?: () => void }) {
+  const t = useT();
+  useEffect(() => {
+    if (!onDeadline) return;
+    // No gate in front of the player may wait forever. Every waiting path this
+    // screen covers normally answers in seconds; a read that does not is a dead
+    // end, and its deadline hands the viewer the unavailable screen instead of
+    // a spinner.
+    const timer = setTimeout(onDeadline, PREPARING_DEADLINE_MS);
+    return () => clearTimeout(timer);
+  }, [onDeadline]);
   return (
     <div
       className="bg-background fixed inset-0 z-50 flex items-center justify-center px-6"
@@ -245,10 +277,8 @@ function PlaybackPreparingScreen() {
       <div className="surface-panel-subtle animate-in fade-in flex min-w-[260px] flex-col items-center gap-4 rounded-[1.8rem] px-8 py-7 text-center duration-300">
         <div className="h-8 w-8 animate-spin rounded-full border-2 border-white/20 border-t-white" />
         <div className="space-y-1">
-          <p className="text-sm font-medium text-white">Preparing playback</p>
-          <p className="text-xs text-white/55">
-            Loading stream details, subtitles, and resume state.
-          </p>
+          <p className="text-sm font-medium text-white">{t("web.player.watch.preparing")}</p>
+          <p className="text-xs text-white/55">{t("web.player.watch.preparingDetail")}</p>
         </div>
       </div>
     </div>
@@ -259,11 +289,11 @@ function PlaybackPreparingScreen() {
  * The server answers the same 404 for a missing title and one the profile may
  * not see, so the copy says neither, as the item page does.
  */
-function playbackUnavailableMessage(error: Error): string {
+function playbackUnavailableMessage(t: Translate, error: Error): string {
   if (isNotFoundProblem(error)) {
-    return "This title isn't available. It may have been removed, or you may not have access to it.";
+    return t("web.player.watch.titleUnavailable");
   }
-  return error.message || "Item not found";
+  return error.message || t("web.player.watch.itemNotFound");
 }
 
 /**
@@ -280,21 +310,43 @@ function RequestedVersionMissingRedirect({ href }: { href: string }) {
   return null;
 }
 
-function PlaybackUnavailableScreen({ error, onBack }: { error: Error; onBack: () => void }) {
+function PlaybackUnavailableScreen({
+  error,
+  onBack,
+  onRetry,
+}: {
+  error: Error;
+  onBack: () => void;
+  onRetry?: () => void;
+}) {
+  const t = useT();
   return (
     <div className="bg-background fixed inset-0 z-50 flex items-center justify-center px-6">
       <div className="surface-panel-subtle flex max-w-md flex-col items-center gap-4 rounded-[1.8rem] px-8 py-8 text-center">
         <div className="space-y-2">
-          <p className="text-base font-semibold text-white">Playback unavailable</p>
-          <div className="text-sm text-white/60">{playbackUnavailableMessage(error)}</div>
+          <p className="text-base font-semibold text-white">
+            {t("web.player.watch.playbackUnavailable")}
+          </p>
+          <div className="text-sm text-white/60">{playbackUnavailableMessage(t, error)}</div>
         </div>
-        <button
-          onClick={onBack}
-          type="button"
-          className="rounded-[0.95rem] bg-white/10 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-white/20"
-        >
-          Go Back
-        </button>
+        <div className="flex items-center gap-2">
+          {onRetry ? (
+            <button
+              onClick={onRetry}
+              type="button"
+              className="bg-primary text-primary-foreground rounded-[0.95rem] px-4 py-2 text-sm font-medium transition-opacity hover:opacity-90"
+            >
+              {t("web.player.watch.tryAgain")}
+            </button>
+          ) : null}
+          <button
+            onClick={onBack}
+            type="button"
+            className="rounded-[0.95rem] bg-white/10 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-white/20"
+          >
+            {t("player.goBack")}
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -600,6 +652,7 @@ function WatchPlaybackHostContent() {
   const queryClient = useQueryClient();
   const location = useLocation();
   const navigate = useViewTransitionNavigate();
+  const t = useT();
   const { profile: currentProfile } = useCurrentProfile();
   const playbackProfileId = currentProfile?.id ?? null;
   const canEditMarkers = canEditMarkersForUser(user, currentProfile);
@@ -690,7 +743,22 @@ function WatchPlaybackHostContent() {
     data: item,
     error,
     isFetching: isFetchingItem,
+    refetch: refetchItem,
   } = useWatchDetail(request?.contentId, request?.fileId, request?.libraryId);
+  // One deadline per request: a title that takes past it hands the viewer the
+  // unavailable screen with Try Again instead of an unbounded spinner, and the
+  // next request starts the gate over. Keying the verdict on the request key
+  // keeps a title that finally arrived from showing it.
+  const requestKeyForGate = request?.requestKey ?? null;
+  const [expiredRequestKey, setExpiredRequestKey] = useState<string | null>(null);
+  const preparingExpired = expiredRequestKey !== null && expiredRequestKey === requestKeyForGate;
+  const handlePreparingDeadline = useCallback(() => {
+    setExpiredRequestKey(requestKeyForGate);
+  }, [requestKeyForGate]);
+  const handlePreparingRetry = useCallback(() => {
+    setExpiredRequestKey(null);
+    void refetchItem();
+  }, [refetchItem]);
   const [renderedSession, setRenderedSession] = useState<{
     request: WatchRouteRequest;
     item: WatchDetail;
@@ -823,6 +891,8 @@ function WatchPlaybackHostContent() {
         return;
       }
 
+      // No standing here: this write only records which row played. An Auto
+      // session must not become a pin, and a pin must keep its standing.
       rememberRequestedFileId(contentId, exitState.selectedFileId, currentProfile?.id ?? null);
     },
     [activeItem, activeRequest, currentProfile?.id],
@@ -833,10 +903,10 @@ function WatchPlaybackHostContent() {
   // an exit state: post-roll close and next-episode navigation never reach
   // `handleEnded`.
   const handleRequestedVersionChange = useCallback(
-    (fileId: number | null) => {
+    (fileId: number | null, explicit: boolean) => {
       const contentId = activeItem?.content_id ?? activeRequest?.contentId;
       if (!contentId || fileId == null) return;
-      rememberRequestedFileId(contentId, fileId, currentProfile?.id ?? null);
+      rememberRequestedFileId(contentId, fileId, currentProfile?.id ?? null, { explicit });
     },
     [activeItem, activeRequest, currentProfile?.id],
   );
@@ -1214,13 +1284,26 @@ function WatchPlaybackHostContent() {
 
     // The detail read failed for this request and is not being retried, so
     // waiting on it would hold the preparing screen forever. The query is
-    // keyed by the title, file, and library, so an error from an earlier
-    // title cannot land here; a refetch of the same title waits for its answer.
+    // keyed by the title and library, so an error from an earlier title cannot
+    // land here; a refetch of the same title waits for its answer.
     if (error && !isFetchingItem) {
       return <PlaybackUnavailableScreen error={error} onBack={() => navigate(-1)} />;
     }
 
-    return <PlaybackPreparingScreen />;
+    // The read is still in flight past the gate's deadline. Hand the viewer the
+    // unavailable screen and a retry instead of a spinner that no answer will
+    // ever end.
+    if (preparingExpired) {
+      return (
+        <PlaybackUnavailableScreen
+          error={new Error(t("web.player.watch.startFailed"))}
+          onBack={() => navigate(-1)}
+          onRetry={handlePreparingRetry}
+        />
+      );
+    }
+
+    return <PlaybackPreparingScreen onDeadline={handlePreparingDeadline} />;
   }
 
   // The player has its title's detail from here on, and `error` may still be
@@ -1231,7 +1314,7 @@ function WatchPlaybackHostContent() {
 
   const { qualityPreference: canonicalQuality, maxBitrateKbps } = playbackQualitySettings(
     effectivePlaybackSettings,
-    onMeteredConnection(),
+    onMeteredConnection() ? "metered" : "unmetered",
   );
   // Stamp the server's liveness verdict on the rows before they become player
   // props (memoized above so the identity only moves with the rows or the
@@ -1249,9 +1332,10 @@ function WatchPlaybackHostContent() {
   // request is the only durable record of their choice. Read inline rather than
   // memoized: this render path is not the time-tick lane, and the read must not
   // add a hook after this component's conditional returns.
-  const requestedFileId = activeRequest
-    ? readRequestedFileId(activeRequest.contentId, currentProfile?.id ?? null)
+  const requestedVersion = activeRequest
+    ? readRequestedVersion(activeRequest.contentId, currentProfile?.id ?? null)
     : null;
+  const requestedFileId = requestedVersion?.fileId ?? null;
   // The URL names no row, the viewer picked one on this device, and the
   // catalog no longer carries it. `selectFileId` would fall through to the
   // plan's default, so return to the item page's pick-again state instead.
@@ -1275,6 +1359,7 @@ function WatchPlaybackHostContent() {
     // fallback in place rather than blocking playback on a settings fetch.
     qualityPreference: canonicalQuality,
     requestedFileId,
+    requestedVersionExplicit: requestedVersion?.explicit === true,
   });
   // The resolved answer already folds in the profile layer, so the props built
   // from the profile record are only the pre-resolution fallback.
@@ -1401,6 +1486,7 @@ function WatchPlaybackHostContent() {
 }
 
 export function WatchPlaybackBar() {
+  const t = useT();
   const barRef = usePlaybackBarHeight("watch");
   const controller = useContext(WatchPlaybackControllerContext);
   if (!controller) {
@@ -1411,6 +1497,7 @@ export function WatchPlaybackBar() {
   const request = state.request;
   const snapshot = useWatchPlaybackSnapshot(isBackgroundBarVisible ? request : null);
   const transport = state.transport;
+  const audio = transport?.audio;
   const { user } = useAuth();
   const seekPreferences = useSeekPreferences("video", { enabled: user !== null });
   const { data: item } = useWatchDetail(request?.contentId, request?.fileId, request?.libraryId);
@@ -1420,8 +1507,8 @@ export function WatchPlaybackBar() {
     return null;
   }
 
-  const title = item?.series_title ?? item?.title ?? "Preparing playback";
-  const subtitle = buildPlaybackSubtitle(request, item);
+  const title = item?.series_title ?? item?.title ?? t("web.player.watch.preparing");
+  const subtitle = buildPlaybackSubtitle(t, request, item);
   const displayedTime = scrubValue ?? snapshot?.currentTime ?? 0;
 
   return (
@@ -1434,29 +1521,35 @@ export function WatchPlaybackBar() {
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
               <div className="bg-primary/15 text-primary flex h-10 w-10 shrink-0 items-center justify-center rounded-xl">
+                {/* eslint-disable-next-line silo/no-physical-direction -- centres the play triangle, which doesn't mirror */}
                 <Play className="ml-0.5 h-4 w-4 fill-current" />
               </div>
               <div className="min-w-0">
                 <div className="truncate text-sm font-semibold text-white">{title}</div>
                 <div className="text-xs text-white/60">
-                  {subtitle ?? (snapshot ? "Background playback" : "Preparing playback")}
+                  {subtitle ??
+                    (snapshot
+                      ? t("web.player.bar.backgroundPlayback")
+                      : t("web.player.watch.preparing"))}
                 </div>
               </div>
               {state.pictureInPictureActive && (
                 <div className="hidden shrink-0 items-center gap-1 rounded-full bg-white/8 px-2.5 py-1 text-[11px] font-medium text-white/75 sm:flex">
                   <PictureInPicture2 className="h-3.5 w-3.5" />
-                  PiP
+                  {t("web.player.bar.pip")}
                 </div>
               )}
             </div>
 
-            <div className="mt-3 space-y-1.5">
+            {/* The timeline reads left to right in every language, like the player's. */}
+            <div dir="ltr" className="mt-3 space-y-1.5">
               <Slider
+                dir="ltr"
                 value={[displayedTime]}
                 min={0}
                 max={Math.max(snapshot?.duration ?? 0, 0)}
                 step={1}
-                thumbLabels={["Playback position"]}
+                thumbLabels={[t("web.player.bar.positionLabel")]}
                 onKeyDownCapture={(event) => {
                   // Unmodified arrows skip by the profile's intervals; the
                   // slider keeps its own Shift+Arrow page step and modifier
@@ -1482,19 +1575,19 @@ export function WatchPlaybackBar() {
               />
               <div className="flex items-center justify-between text-[11px] text-white/55 tabular-nums">
                 <span>{formatTime(displayedTime)}</span>
-                <span>{snapshot ? formatTime(snapshot.duration) : "0:00"}</span>
+                <span>{formatTime(snapshot ? snapshot.duration : 0)}</span>
               </div>
             </div>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div dir="ltr" className="flex items-center gap-2">
             <Button
               variant="glass"
               size="icon"
               className="h-10 w-10 rounded-full"
               onClick={() => transport?.skipBack()}
               disabled={!transport}
-              title={`Back ${seekPreferences.skipBack} seconds`}
+              title={t("web.player.bar.skipBackTitle", { count: seekPreferences.skipBack })}
             >
               <SkipBack className="h-4 w-4" />
             </Button>
@@ -1504,11 +1597,11 @@ export function WatchPlaybackBar() {
               disabled={!transport}
             >
               {snapshot?.playing ? (
-                <Pause className="mr-2 h-4 w-4" />
+                <Pause className="me-2 h-4 w-4" />
               ) : (
-                <Play className="mr-2 h-4 w-4 fill-current" />
+                <Play className="me-2 h-4 w-4 fill-current" />
               )}
-              {snapshot?.playing ? "Pause" : "Play"}
+              {snapshot?.playing ? t("web.player.bar.pause") : t("web.player.bar.play")}
             </Button>
             <Button
               variant="glass"
@@ -1516,25 +1609,42 @@ export function WatchPlaybackBar() {
               className="h-10 w-10 rounded-full"
               onClick={() => transport?.skipForward()}
               disabled={!transport}
-              title={`Forward ${seekPreferences.skipForward} seconds`}
+              title={t("web.player.bar.skipForwardTitle", { count: seekPreferences.skipForward })}
             >
               <SkipForward className="h-4 w-4" />
             </Button>
+            {audio && (
+              // The audio selector the player's own bar shows, offered while
+              // the player is minimised. It picks on the live session at the
+              // position this bar shows and never starts a new playback, so a
+              // language change here cannot jump the playhead to the stored
+              // resume position.
+              <AudioTrackMenu
+                tracks={audio.tracks}
+                activeIndex={audio.activeIndex}
+                onSelect={(index) => audio.select(index, displayedTime)}
+                currentPosition={displayedTime}
+                provisional={audio.provisional}
+                pending={audio.pending}
+                failed={audio.failed}
+                onRetryDiscovery={audio.retry}
+              />
+            )}
             <Button
               variant="glass"
               className="h-10 rounded-full px-4"
               onClick={returnToWatch}
-              title="Return to player"
+              title={t("web.player.bar.returnTitle")}
             >
-              <Tv className="mr-2 h-4 w-4" />
-              Watch
+              <Tv className="me-2 h-4 w-4" />
+              {t("web.player.bar.watch")}
             </Button>
             <Button
               variant="glass"
               size="icon"
               className="h-10 w-10 rounded-full"
               onClick={stopPlayback}
-              title="Stop playback"
+              title={t("web.player.bar.stopTitle")}
             >
               <X className="h-4 w-4" />
             </Button>

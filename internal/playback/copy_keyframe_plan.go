@@ -365,6 +365,27 @@ func (s *TranscodeSession) plannedSegmentRecoveryDecision(segNum int, decision S
 	progress := decision.Progress
 	switch {
 	case progress.Restarting:
+		// A request outside the restart in flight's own production that arrived
+		// after it is a newer seek the restart will not satisfy. It joins that
+		// restart's coalescing instead of waiting out the head budget and
+		// leaving the generation at the older target. A plan-level restart has
+		// no originating request, so its own target is the reference.
+		forwardSeek := segNum > progress.ProducedHead+plannedSegmentPrefetchSegments
+		// The plan's replacement only copies forward from its start, so a
+		// request behind it is a backward seek, not media the restart produces.
+		behindRestart := decision.RestartTargetSegment > 0 && segNum < decision.RestartTargetSegment
+		newerThanRestart := decision.RestartSuperseded ||
+			(decision.RestartPlanLevel &&
+				(behindRestart || segNum > decision.RestartTargetSegment+plannedSegmentPrefetchSegments))
+		if newerThanRestart && (forwardSeek || behindRestart) {
+			decision.BeyondWaitReach = forwardSeek
+			decision.SeekTarget = true
+			decision.Wait = false
+			decision.RestartOnTimeout = true
+			decision.Reason = "planned_segment_seek"
+			break
+		}
+		decision.SeekTarget = false
 		decision.Wait = true
 		decision.WaitTimeout = activeSegmentWait
 		decision.RestartOnTimeout = false
@@ -378,7 +399,10 @@ func (s *TranscodeSession) plannedSegmentRecoveryDecision(segNum int, decision S
 		decision.Reason = "planned_segment_ahead"
 	default:
 		// A far forward target, a pruned segment behind the player, or a
-		// stopped producer: restart at the plan's exact segment start.
+		// stopped producer: restart at the plan's exact segment start. Either
+		// direction names a viewer target, so it supersedes an older wait.
+		decision.BeyondWaitReach = segNum > progress.ProducedHead
+		decision.SeekTarget = true
 		decision.Wait = false
 		decision.RestartOnTimeout = true
 		decision.Reason = "planned_segment_seek"

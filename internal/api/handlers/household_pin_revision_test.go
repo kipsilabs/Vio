@@ -93,18 +93,6 @@ func TestHouseholdMutationRechecksPINInsideTransaction(t *testing.T) {
 	}
 }
 
-func TestHistoryImportRequestActorRechecksPINRevision(t *testing.T) {
-	ctx := access.SetScope(t.Context(), access.Scope{ProfileID: "parent", ProfileVerified: true})
-	r := httptest.NewRequest(http.MethodPost, "/history-imports/runs", nil).WithContext(ctx)
-	actor := historyImportRequestActor(r)
-	if err := actor.VerifyProfile(&userstore.Profile{ID: "parent"}); err != nil {
-		t.Fatalf("legacy revision-zero proof: %v", err)
-	}
-	if err := actor.VerifyProfile(&userstore.Profile{ID: "parent", PINRevision: 1}); !errors.Is(err, access.ErrProfileUnverified) {
-		t.Fatalf("changed PIN revision accepted: %v", err)
-	}
-}
-
 // pinChangeOnRead changes the primary PIN when the handler starts reading the
 // body, standing in for a PIN change made while a client holds its upload.
 type pinChangeOnRead struct {

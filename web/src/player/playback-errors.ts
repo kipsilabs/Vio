@@ -165,6 +165,16 @@ function describeTerminalCopy(terminal: TerminalV3): { title: string; message: s
           terminal.message?.trim() ||
           "Vio couldn't prepare the selected subtitles for this device. Try a different track.",
       };
+    case "source_mismatch":
+      return {
+        title: "This version's source is wrong",
+        // Same vocabulary the version list uses for a row whose provider served
+        // another release's bytes. The release is not dead, so the server marks
+        // the terminal retryable and the message names the version list.
+        message:
+          terminal.message?.trim() ||
+          "The provider served a different release's bytes for this version. Refresh the version list and choose again.",
+      };
     case "virtual_source_unavailable":
       return {
         title: "Playback unavailable",
@@ -181,6 +191,22 @@ function describeTerminalCopy(terminal: TerminalV3): { title: string; message: s
       };
   }
 }
+
+/**
+ * Client-only reason: the viewer's Try again on a refused seek cannot be
+ * honoured at the remembered target because the source or version it was
+ * measured on is no longer the one on screen. Retrying the same position would
+ * silently start somewhere else, so the card says why instead.
+ */
+export const SEEK_RETRY_TARGET_UNAVAILABLE_REASON = "seek_retry_target_unavailable";
+
+export const SEEK_RETRY_TARGET_UNAVAILABLE: PlaybackPolicyErrorDescription = {
+  title: "That seek can't be retried",
+  message:
+    "The playback source changed since the seek, so it can't be retried at that position. Seek again.",
+  reason: SEEK_RETRY_TARGET_UNAVAILABLE_REASON,
+  retryable: false,
+};
 
 /**
  * Terminal reasons that mean the server found no playable adaptation for this
@@ -351,12 +377,37 @@ export const CONNECTION_LOST_ERROR: PlaybackPolicyErrorDescription = {
  * `phase` says whether the request started playback or changed a stream that
  * already plays, so a server error on a replan is not reported as a failure to
  * start.
+ *
+ * `retryable` is the client's honest verdict on whether asking again can work,
+ * which is what the UI keys its Try again action on. The server's 5xx answers
+ * and a request that never completed (a timeout or a network failure) are
+ * attempts to retry: the server now names a store fault 503
+ * `dependency_unavailable` with `Retry-After` rather than a playback verdict.
+ * The definitive answers stay Go Back: a missing file or version, an auth or
+ * permission refusal, and a protocol this build cannot speak. A retryable
+ * verdict always belongs to a failure that left no plan to keep playing, so
+ * the caller may offer a fresh start.
  */
 export function describePlaybackTransportError(
   error: unknown,
   phase: "start" | "update" = "start",
 ): PlaybackPolicyErrorDescription | null {
   if (!(error instanceof PlayerFetchError)) {
+    // A fetch that never completed is a timeout (the start lane aborts with a
+    // `TimeoutError`) or a network failure. Both leave the request un-answered,
+    // so asking again is the honest advice. A deliberate abort is not a
+    // failure: the caller tore the request down and has nothing to retry.
+    if (error instanceof DOMException && error.name === "AbortError") return null;
+    if (error instanceof TypeError || error instanceof DOMException) {
+      return {
+        title: "Connection problem",
+        message:
+          phase === "start"
+            ? "Vio couldn't reach the server to start playback. Check your connection, then try again."
+            : "Vio couldn't reach the server to update playback. Check your connection, then try again.",
+        retryable: true,
+      };
+    }
     return null;
   }
 
@@ -365,6 +416,7 @@ export function describePlaybackTransportError(
       title: "Update required",
       message:
         "This server speaks a newer playback protocol than this app. Reload the page to pick up the current version.",
+      retryable: false,
     };
   }
 
@@ -372,6 +424,7 @@ export function describePlaybackTransportError(
     return {
       title: "Playback session expired",
       message: "This playback session is no longer active. Start it again to keep watching.",
+      retryable: false,
     };
   }
 
@@ -380,6 +433,7 @@ export function describePlaybackTransportError(
       title: "This item is no longer available",
       message:
         "The file needed to play this item can't be found right now. Go back and try another version if one is available.",
+      retryable: false,
     };
   }
 
@@ -387,6 +441,7 @@ export function describePlaybackTransportError(
     return {
       title: "Authentication required",
       message: "Your sign-in session has expired. Sign in again to continue playback.",
+      retryable: false,
     };
   }
 
@@ -394,6 +449,7 @@ export function describePlaybackTransportError(
     return {
       title: "Playback unavailable",
       message: "You do not have permission to play this item.",
+      retryable: false,
     };
   }
 
@@ -404,6 +460,7 @@ export function describePlaybackTransportError(
         phase === "start"
           ? "Vio could not start playback right now. Please try again."
           : "Vio could not update playback right now. Please try again.",
+      retryable: true,
     };
   }
 

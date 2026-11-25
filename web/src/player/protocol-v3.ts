@@ -135,6 +135,13 @@ export type RouteEventNameV3 =
   | "seek_reanchored";
 
 /** Feature name the client advertises when it can consume a v3 plan. */
+/**
+ * A progressive remux URL may opt into refusing a Range past its seek origin
+ * through the remux_range query parameter; the server then answers 409 instead
+ * of streaming from byte zero.
+ */
+export const FEATURE_PROGRESSIVE_RANGE_REFUSAL_V3 = "progressive_range_refusal_v1";
+
 export const FEATURE_PLAYBACK_PLAN_V3 = "playback_plan_v3";
 
 /** Server-minted attempt keys and intent replans from the neutral v3 contract. */

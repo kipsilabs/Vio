@@ -195,6 +195,64 @@ func TestMergeVirtualCandidateTracksRepairsStaleSDRRange(t *testing.T) {
 	}
 }
 
+// TestMergeVirtualCandidateTracksDropsImpossibleDVClaimOnAVCCodec covers the
+// shape the probe-gated merge produced in production: the probe corroborated
+// the codec (H.264) but left the range blank, and the release label said
+// "Dolby Vision". The declaration repainted the blank range into DV profile 8 on
+// a codec that cannot carry a DV RPU, and the planner then built a tone-mapped
+// HDR transcode of a playable SDR file. The codec is observed evidence and wins;
+// a DV-only label leaves no HDR claim behind.
+func TestMergeVirtualCandidateTracksDropsImpossibleDVClaimOnAVCCodec(t *testing.T) {
+	probed := &models.MediaFile{
+		Resolution: "1080p",
+		CodecVideo: "h264",
+		VideoTracks: []models.VideoTrack{{
+			Codec: "h264", Width: 1920, Height: 1080,
+		}},
+	}
+
+	mergeVirtualCandidateTracks(probed, VirtualPlaybackStream{
+		Resolution: "1080p", CodecVideo: "h264",
+		HDR: "Dolby Vision Profile 8",
+	})
+
+	vt := probed.VideoTracks[0]
+	if vt.DVProfile != 0 || vt.DolbyVision != "" || vt.DVConfigPresent || vt.DVBLPresent {
+		t.Fatalf("DV fields written onto an H.264 track: %#v", vt)
+	}
+	if vt.VideoRange != videoRangeSDR || vt.VideoRangeType != videoRangeSDR {
+		t.Fatalf("track range = %q/%q, want SDR/SDR", vt.VideoRange, vt.VideoRangeType)
+	}
+	if probed.HDR {
+		t.Fatal("a DV-only label on an H.264 file raised the row's HDR flag")
+	}
+}
+
+// A DV label on a codec that can carry the RPU still decorates the track, and a
+// label that also names HDR10 keeps that base signal when the DV part is
+// rejected.
+func TestMergeVirtualCandidateTracksKeepsDVClaimOnCapableCodec(t *testing.T) {
+	hevc := &models.MediaFile{Resolution: "2160p", CodecVideo: "hevc"}
+	mergeVirtualCandidateTracks(hevc, VirtualPlaybackStream{HDR: "Dolby Vision Profile 8"})
+	if len(hevc.VideoTracks) != 1 || hevc.VideoTracks[0].DVProfile != 8 {
+		t.Fatalf("DV metadata = %#v, want profile 8", hevc.VideoTracks)
+	}
+
+	avcHDR10Base := &models.MediaFile{
+		Resolution:  "1080p",
+		CodecVideo:  "h264",
+		VideoTracks: []models.VideoTrack{{Codec: "h264", Width: 1920, Height: 1080}},
+	}
+	mergeVirtualCandidateTracks(avcHDR10Base, VirtualPlaybackStream{HDR: "Dolby Vision Profile 8 HDR10"})
+	track := avcHDR10Base.VideoTracks[0]
+	if track.DVProfile != 0 {
+		t.Fatalf("DV profile survived on H.264: %#v", track)
+	}
+	if track.VideoRangeType != videoRangeHDR10 {
+		t.Fatalf("range type = %q, want the label's HDR10 base kept", track.VideoRangeType)
+	}
+}
+
 // TestMergeVirtualCandidateTracksKeepsObservedSDRRange is the #97 regression:
 // a probed SDR/8-bit track keeps its range, depth, profile, and DV fields
 // even when the release text advertises HDR and Dolby Vision. Declarations

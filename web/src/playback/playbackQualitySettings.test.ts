@@ -1,69 +1,91 @@
 import { describe, expect, it } from "vitest";
-import type { EffectiveSetting, EffectiveSettingsMap } from "@/hooks/queries/settingValues";
-import { SETTING_KEYS } from "@/lib/settingsContract";
-import { playbackQualitySettings } from "./playbackQualitySettings";
+import type { EffectiveSettingsMap } from "@/hooks/queries/settingValues";
+import { SETTING_KEYS, type SettingKey } from "@/lib/settingsContract";
+import { LOW_DATA_CAP_KBPS, playbackQualitySettings } from "./playbackQualitySettings";
 
-function setting(value: unknown): EffectiveSetting {
-  return { value, source: "default" } as EffectiveSetting;
+function effectiveEntry<K extends SettingKey>(key: K, value: unknown): EffectiveSettingsMap[K] {
+  return {
+    key,
+    value,
+    scope: "profile",
+    source: "profile",
+    constrained: false,
+  } as EffectiveSettingsMap[K];
 }
 
-const effective: EffectiveSettingsMap = {
-  [SETTING_KEYS.PLAYBACK_PREFERRED_QUALITY]: setting("auto"),
-  [SETTING_KEYS.PLAYBACK_MAX_BITRATE_KBPS]: setting(null),
-  [SETTING_KEYS.PLAYBACK_CELLULAR_PREFERRED_QUALITY]: setting("720p"),
-  [SETTING_KEYS.PLAYBACK_CELLULAR_MAX_BITRATE_KBPS]: setting(2000),
-};
-
 describe("playbackQualitySettings", () => {
-  it("uses the main pair on an unmetered link", () => {
-    expect(playbackQualitySettings(effective, false)).toEqual({
+  it("defaults metered links to Auto capped at 10 Mbps before settings resolve", () => {
+    expect(playbackQualitySettings(undefined, "metered")).toEqual({
+      qualityPreference: "auto",
+      maxBitrateKbps: 10_000,
+    });
+  });
+
+  it("caps low_data links to 2 Mbps without changing resolution", () => {
+    expect(playbackQualitySettings(undefined, "low_data")).toEqual({
+      qualityPreference: "auto",
+      maxBitrateKbps: LOW_DATA_CAP_KBPS,
+    });
+
+    const uncappedCellular: EffectiveSettingsMap = {
+      [SETTING_KEYS.PLAYBACK_CELLULAR_PREFERRED_QUALITY]: effectiveEntry(
+        SETTING_KEYS.PLAYBACK_CELLULAR_PREFERRED_QUALITY,
+        "auto",
+      ),
+      [SETTING_KEYS.PLAYBACK_CELLULAR_MAX_BITRATE_KBPS]: effectiveEntry(
+        SETTING_KEYS.PLAYBACK_CELLULAR_MAX_BITRATE_KBPS,
+        null,
+      ),
+    };
+    expect(playbackQualitySettings(uncappedCellular, "metered")).toEqual({
       qualityPreference: "auto",
       maxBitrateKbps: null,
     });
-  });
-
-  it("uses the cellular pair on a metered link", () => {
-    expect(playbackQualitySettings(effective, true)).toEqual({
-      qualityPreference: "720p",
-      maxBitrateKbps: 2000,
+    expect(playbackQualitySettings(uncappedCellular, "low_data")).toEqual({
+      qualityPreference: "auto",
+      maxBitrateKbps: LOW_DATA_CAP_KBPS,
     });
   });
 
-  it("leaves both unset until the settings read resolves on an unmetered link", () => {
-    expect(playbackQualitySettings(undefined, false)).toEqual({
-      qualityPreference: undefined,
-      maxBitrateKbps: undefined,
-    });
-  });
-
-  it("keeps a stored no-limit cellular bitrate", () => {
-    expect(
-      playbackQualitySettings(
-        { ...effective, [SETTING_KEYS.PLAYBACK_CELLULAR_MAX_BITRATE_KBPS]: setting(null) },
-        true,
+  it("never raises a stricter saved cellular override under low_data", () => {
+    const strictCellular: EffectiveSettingsMap = {
+      [SETTING_KEYS.PLAYBACK_CELLULAR_PREFERRED_QUALITY]: effectiveEntry(
+        SETTING_KEYS.PLAYBACK_CELLULAR_PREFERRED_QUALITY,
+        "480p",
       ),
-    ).toEqual({ qualityPreference: "720p", maxBitrateKbps: null });
-  });
-
-  // An older server defines no cellular pair, so the read never returns it.
-  it("uses the cellular defaults on a metered link when the server has no cellular pair", () => {
-    const {
-      [SETTING_KEYS.PLAYBACK_CELLULAR_PREFERRED_QUALITY]: _quality,
-      [SETTING_KEYS.PLAYBACK_CELLULAR_MAX_BITRATE_KBPS]: _bitrate,
-      ...withoutCellular
-    } = effective;
-    expect(playbackQualitySettings(withoutCellular, true)).toEqual({
-      qualityPreference: "720p",
-      maxBitrateKbps: 2000,
+      [SETTING_KEYS.PLAYBACK_CELLULAR_MAX_BITRATE_KBPS]: effectiveEntry(
+        SETTING_KEYS.PLAYBACK_CELLULAR_MAX_BITRATE_KBPS,
+        1_500,
+      ),
+    };
+    expect(playbackQualitySettings(strictCellular, "low_data")).toEqual({
+      qualityPreference: "480p",
+      maxBitrateKbps: 1_500,
     });
   });
 
-  // Playback can start before the read resolves and does not replan when it
-  // does, so a metered start must not go out without a limit.
-  it("uses the cellular defaults until the settings read resolves on a metered link", () => {
-    expect(playbackQualitySettings(undefined, true)).toEqual({
-      qualityPreference: "720p",
-      maxBitrateKbps: 2000,
+  it("uses the main pair on unmetered links", () => {
+    const settings: EffectiveSettingsMap = {
+      [SETTING_KEYS.PLAYBACK_PREFERRED_QUALITY]: effectiveEntry(
+        SETTING_KEYS.PLAYBACK_PREFERRED_QUALITY,
+        "2160p",
+      ),
+      [SETTING_KEYS.PLAYBACK_MAX_BITRATE_KBPS]: effectiveEntry(
+        SETTING_KEYS.PLAYBACK_MAX_BITRATE_KBPS,
+        40_000,
+      ),
+      [SETTING_KEYS.PLAYBACK_CELLULAR_PREFERRED_QUALITY]: effectiveEntry(
+        SETTING_KEYS.PLAYBACK_CELLULAR_PREFERRED_QUALITY,
+        "720p",
+      ),
+      [SETTING_KEYS.PLAYBACK_CELLULAR_MAX_BITRATE_KBPS]: effectiveEntry(
+        SETTING_KEYS.PLAYBACK_CELLULAR_MAX_BITRATE_KBPS,
+        2_000,
+      ),
+    };
+    expect(playbackQualitySettings(settings, "unmetered")).toEqual({
+      qualityPreference: "2160p",
+      maxBitrateKbps: 40_000,
     });
   });
 });

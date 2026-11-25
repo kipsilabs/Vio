@@ -94,30 +94,43 @@ type PlaybackBandwidthLimit struct {
 }
 
 type PlaybackPlan struct {
-	BandwidthLimit         *PlaybackBandwidthLimit         `json:"bandwidth_limit,omitempty"`
-	ProtocolVersion        int                             `json:"protocol_version"`
-	PlanID                 string                          `json:"plan_id"`
-	PlanAttemptKey         string                          `json:"plan_attempt_key"`
-	SessionID              string                          `json:"session_id,omitempty"`
-	ExpiresAt              string                          `json:"expires_at,omitempty"`
-	Delivery               playback.DeliveryV3             `json:"delivery"`
-	Stream                 playback.StreamV3               `json:"stream"`
-	Timeline               playback.TimelineV3             `json:"timeline"`
-	SelectedTracks         playback.SelectedTracksV3       `json:"selected_tracks"`
-	AudioTracks            []playback.AudioInventoryItemV3 `json:"audio_tracks,omitempty"`
-	EffectiveRecipe        playback.EffectiveRecipeV3      `json:"effective_recipe"`
-	Claims                 playback.ValidationClaimsV3     `json:"claims"`
-	Subtitle               playback.SubtitleDecisionV3     `json:"subtitle"`
-	Transformations        []playback.TransformationV3     `json:"transformations"`
-	AppliedQuirks          []playback.AppliedQuirkV3       `json:"applied_quirks"`
-	RuntimeCorrections     []string                        `json:"runtime_corrections"`
-	AvailableQualities     []playback.AvailableQualityV3   `json:"available_qualities" doc:"Fixed quality rungs a quality_change replan may request, in menu order. The source is not listed: quality_preference auto returns to it. Empty when no rung applies."`
-	DegradationWarnings    []playback.DegradationWarningV3 `json:"degradation_warnings"`
-	DecisionReason         string                          `json:"decision_reason"`
-	RequestedMediaFileID   ID                              `json:"requested_media_file_id"`
-	EffectiveMediaFileID   ID                              `json:"effective_media_file_id"`
-	Source                 PlaybackSource                  `json:"source"`
-	SubtitleFidelityPolicy string                          `json:"subtitle_fidelity_policy"`
+	BandwidthLimit       *PlaybackBandwidthLimit         `json:"bandwidth_limit,omitempty"`
+	ProtocolVersion      int                             `json:"protocol_version"`
+	PlanID               string                          `json:"plan_id"`
+	PlanAttemptKey       string                          `json:"plan_attempt_key"`
+	SessionID            string                          `json:"session_id,omitempty"`
+	ExpiresAt            string                          `json:"expires_at,omitempty"`
+	Delivery             playback.DeliveryV3             `json:"delivery"`
+	Stream               playback.StreamV3               `json:"stream"`
+	Timeline             playback.TimelineV3             `json:"timeline"`
+	SelectedTracks       playback.SelectedTracksV3       `json:"selected_tracks"`
+	AudioTracks          []playback.AudioInventoryItemV3 `json:"audio_tracks,omitempty"`
+	EffectiveRecipe      playback.EffectiveRecipeV3      `json:"effective_recipe"`
+	Claims               playback.ValidationClaimsV3     `json:"claims"`
+	Subtitle             playback.SubtitleDecisionV3     `json:"subtitle"`
+	Transformations      []playback.TransformationV3     `json:"transformations"`
+	AppliedQuirks        []playback.AppliedQuirkV3       `json:"applied_quirks"`
+	RuntimeCorrections   []string                        `json:"runtime_corrections"`
+	AvailableQualities   []playback.AvailableQualityV3   `json:"available_qualities" doc:"Fixed quality rungs a quality_change replan may request, in menu order. The source is not listed: quality_preference auto returns to it. Empty when no rung applies."`
+	DegradationWarnings  []playback.DegradationWarningV3 `json:"degradation_warnings"`
+	DecisionReason       string                          `json:"decision_reason"`
+	RequestedMediaFileID ID                              `json:"requested_media_file_id"`
+	EffectiveMediaFileID ID                              `json:"effective_media_file_id"`
+	// SubstitutedFromFileID names the catalog row the client asked for when the
+	// effective release differs from it, so a client can surface an honest
+	// substitution notice without diffing the two ids first. It is the
+	// requested row id and is omitted when the effective row is the requested
+	// one. UI-only, additive: it mirrors PlanV3.SubstitutedFromFileID and is
+	// deliberately excluded from plan identity hashing.
+	SubstitutedFromFileID ID `json:"substituted_from_file_id,omitempty"`
+	// SubstitutionReason is the machine-readable cause that accompanies
+	// SubstitutedFromFileID: a dead release, a provider listing failure, a
+	// transport failure, a decode rejection, or a release the planner cannot
+	// deliver to this client. The set is additive; a client treats an unknown
+	// value as a generic substitution rather than failing to render.
+	SubstitutionReason     string         `json:"substitution_reason,omitempty" doc:"Machine-readable cause of a version substitution; only present with substituted_from_file_id. A client must treat an unknown value as a generic substitution."`
+	Source                 PlaybackSource `json:"source"`
+	SubtitleFidelityPolicy string         `json:"subtitle_fidelity_policy"`
 	// EffectiveVirtualURI is the provider-neutral virtual:// candidate URI the
 	// planner selected and probed when it substituted a real candidate for a
 	// neutral catalog row, so a client can adopt the substituted candidate in
@@ -642,7 +655,11 @@ func playbackProblem(err error) *Problem {
 	if !ok {
 		return NewProblem(TypeDependencyUnavailable, "Playback is temporarily unavailable.")
 	}
-	return NewProblem(playbackProblemType(operation.Status, operation.Code), operation.Message)
+	problem := NewProblem(playbackProblemType(operation.Status, operation.Code), operation.Message)
+	if operation.RetryAfter > 0 {
+		problem = problem.WithRetryAfter(operation.RetryAfter)
+	}
+	return problem
 }
 func playbackProblemType(status int, code string) ProblemType {
 	if status == http.StatusBadRequest || status == http.StatusUpgradeRequired {
@@ -669,8 +686,33 @@ func playbackMutation(view handlers.PlaybackMutationView, err error) (*PlaybackM
 	}
 	return &PlaybackMutationOutput{Body: body}, nil
 }
+
+// domain projects the v2 body onto the planner's start request. Every declared
+// field belongs here: the frozen /api/v1 bridge unmarshals the same body
+// straight into the domain type, so a field that survives on v1 but is dropped
+// here makes one surface silently behave differently from the other. Dropping
+// file_selection alone turned every explicit version pick on /api/v2 into auto,
+// which re-arms cross-version substitution, decode rotation and the
+// known-failed-candidate retry.
 func (in PlaybackStartBody) domain(fileID int) playback.StartRequestV3 {
-	return playback.StartRequestV3{ProtocolVersion: in.ProtocolVersion, ClientFeatures: in.ClientFeatures, FileID: fileID, ProfileID: string(in.ProfileID), PlaybackAttemptID: in.PlaybackAttemptID, QualityPreference: in.QualityPreference, AllowAlternateVersions: in.AllowAlternateVersions, SubtitleFidelityPreference: in.SubtitleFidelityPreference, StartPosition: in.StartPosition, ProgressPersistence: in.ProgressPersistence, AudioTrackID: in.AudioTrackID, AudioTrackIndex: in.AudioTrackIndex, SubtitleTrackID: in.SubtitleTrackID, SubtitleTrackIndex: in.SubtitleTrackIndex, Metered: in.Metered, BandwidthEstimateKbps: in.BandwidthEstimateKbps, BandwidthEstimateSource: in.BandwidthEstimateSource, ObservedThroughputKbps: in.ObservedThroughputKbps, LearnedLimit: in.LearnedLimit, BandwidthCapKbps: in.BandwidthCapKbps, Capabilities: in.Capabilities, ClientPlaybackContext: in.ClientPlaybackContext}
+	return playback.StartRequestV3{
+		ProtocolVersion: in.ProtocolVersion, ClientFeatures: in.ClientFeatures, FileID: fileID,
+		ProfileID: string(in.ProfileID), PlaybackAttemptID: in.PlaybackAttemptID,
+		PreviousPlaybackAttemptID: in.PreviousPlaybackAttemptID,
+		QualityPreference:         in.QualityPreference, AllowAlternateVersions: in.AllowAlternateVersions,
+		SubtitleFidelityPreference: in.SubtitleFidelityPreference, StartPosition: in.StartPosition,
+		ProgressPersistence: in.ProgressPersistence,
+		AudioTrackID:        in.AudioTrackID, AudioTrackIndex: in.AudioTrackIndex,
+		CarriedAudioTrackID: in.CarriedAudioTrackID,
+		SubtitleTrackID:     in.SubtitleTrackID, SubtitleTrackIndex: in.SubtitleTrackIndex,
+		FileSelection: in.FileSelection, ForceRelink: in.ForceRelink,
+		OfferedVirtualURI:     in.OfferedVirtualURI,
+		Metered:               in.Metered,
+		BandwidthEstimateKbps: in.BandwidthEstimateKbps, BandwidthEstimateSource: in.BandwidthEstimateSource,
+		ObservedThroughputKbps: in.ObservedThroughputKbps, LearnedLimit: in.LearnedLimit,
+		BandwidthCapKbps: in.BandwidthCapKbps, Capabilities: in.Capabilities,
+		ClientPlaybackContext: in.ClientPlaybackContext,
+	}
 }
 func playbackDecision(in playback.DecisionResponseV3) PlaybackDecision {
 	out := PlaybackDecision{ProtocolVersion: in.ProtocolVersion, ServerFeatures: in.ServerFeatures, Outcome: in.Outcome, SessionID: in.SessionID, Terminal: in.Terminal}
@@ -678,7 +720,7 @@ func playbackDecision(in playback.DecisionResponseV3) PlaybackDecision {
 		p := in.PlaybackPlan
 		stream := p.Stream
 		stream.URL = playbackV2MediaURL(stream.URL)
-		out.PlaybackPlan = &PlaybackPlan{ProtocolVersion: p.ProtocolVersion, PlanID: p.PlanID, PlanAttemptKey: p.PlanAttemptKey, SessionID: p.SessionID, ExpiresAt: p.ExpiresAt, Delivery: p.Delivery, Stream: stream, Timeline: p.Timeline, SelectedTracks: p.SelectedTracks, EffectiveRecipe: p.EffectiveRecipe, BandwidthLimit: playbackBandwidthLimit(p.BandwidthLimit), Claims: p.Claims, Subtitle: playbackV2Subtitle(p.Subtitle), AudioTracks: p.AudioTracks, Transformations: p.Transformations, AppliedQuirks: p.AppliedQuirks, RuntimeCorrections: p.RuntimeCorrections, AvailableQualities: playbackQualities(p.AvailableQualities), DegradationWarnings: p.DegradationWarnings, DecisionReason: p.DecisionReason, RequestedMediaFileID: ID(strconv.Itoa(p.RequestedMediaFileID)), EffectiveMediaFileID: ID(strconv.Itoa(p.EffectiveMediaFileID)), EffectiveVirtualURI: p.EffectiveVirtualURI, DeliveryChange: playbackV2DeliveryChange(p.DeliveryChange), VirtualSourceRevision: p.VirtualSourceRevision, TracksPending: p.TracksPending, AudioSelectionPending: p.AudioSelectionPending, InventoryURL: playbackV2InventoryURL(p.InventoryURL), Source: playbackSource(p.Source), SubtitleFidelityPolicy: p.SubtitleFidelityPolicy, ActiveQuality: p.ActiveQuality}
+		out.PlaybackPlan = &PlaybackPlan{ProtocolVersion: p.ProtocolVersion, PlanID: p.PlanID, PlanAttemptKey: p.PlanAttemptKey, SessionID: p.SessionID, ExpiresAt: p.ExpiresAt, Delivery: p.Delivery, Stream: stream, Timeline: p.Timeline, SelectedTracks: p.SelectedTracks, EffectiveRecipe: p.EffectiveRecipe, BandwidthLimit: playbackBandwidthLimit(p.BandwidthLimit), Claims: p.Claims, Subtitle: playbackV2Subtitle(p.Subtitle), AudioTracks: p.AudioTracks, Transformations: p.Transformations, AppliedQuirks: p.AppliedQuirks, RuntimeCorrections: p.RuntimeCorrections, AvailableQualities: playbackQualities(p.AvailableQualities), DegradationWarnings: p.DegradationWarnings, DecisionReason: p.DecisionReason, RequestedMediaFileID: ID(strconv.Itoa(p.RequestedMediaFileID)), EffectiveMediaFileID: ID(strconv.Itoa(p.EffectiveMediaFileID)), SubstitutedFromFileID: playbackV2FileID(p.SubstitutedFromFileID), SubstitutionReason: p.SubstitutionReason, EffectiveVirtualURI: p.EffectiveVirtualURI, DeliveryChange: playbackV2DeliveryChange(p.DeliveryChange), VirtualSourceRevision: p.VirtualSourceRevision, TracksPending: p.TracksPending, AudioSelectionPending: p.AudioSelectionPending, InventoryURL: playbackV2InventoryURL(p.InventoryURL), Source: playbackSource(p.Source), SubtitleFidelityPolicy: p.SubtitleFidelityPolicy, ActiveQuality: p.ActiveQuality}
 	}
 	return out
 }
@@ -691,6 +733,16 @@ func playbackQualities(in []playback.AvailableQualityV3) []playback.AvailableQua
 	return slices.DeleteFunc(slices.Clone(in), func(quality playback.AvailableQualityV3) bool {
 		return quality.Label == playback.QualityOriginalV3
 	})
+}
+
+// playbackV2FileID renders a catalog row id as an opaque ID, or "" when there
+// is no row. The substitution fields use it so an unsubstituted plan omits them
+// entirely instead of publishing "0".
+func playbackV2FileID(id int) ID {
+	if id <= 0 {
+		return ""
+	}
+	return IDFromInt(int64(id))
 }
 
 // playbackV2DeliveryChange projects the domain route-change marker into the
@@ -769,14 +821,15 @@ func playbackBandwidthLimit(limit *playback.BandwidthLimitV3) *PlaybackBandwidth
 // client reached, as a reverse proxy forwards it, since r.Host behind a
 // TLS-terminating proxy is the internal host the proxy dialed. A client on
 // the server's own network keeps the LAN address it used. A proxy that
-// rewrites Host to a bare IP address and names no client host leaves only the
-// address it dialed, which a client elsewhere may not reach; then the URL is
-// on the configured public URL, when there is one. A network access
+// rewrites Host to a bare IP address leaves only the address it dialed, which
+// a client elsewhere may not reach, unless it is a trusted proxy that names
+// the client's host in a single X-Forwarded-Host (clientip.ForwardedHost); then
+// the URL is on the configured public URL, when there is one. A network access
 // provider's path keeps Host, which can be an overlay IP, so it always keeps
 // the origin it reached.
 func (reg *Registry) bandwidthProbeBaseURL(r *http.Request) string {
 	_, err := netip.ParseAddr((&url.URL{Host: r.Host}).Hostname())
-	hostRewritten := err == nil && r.Header.Get("X-Forwarded-Host") == "" && clientip.HasForwardingHeaders(r.Header) &&
+	hostRewritten := err == nil && clientip.ForwardedHost(r) == "" && clientip.HasForwardingHeaders(r.Header) &&
 		netaccess.PathFromContext(r.Context()).IsDefault()
 	if base := reg.publicBaseURL(); hostRewritten && base != "" {
 		return base

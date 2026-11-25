@@ -1240,6 +1240,26 @@
       "body_file": "admin_collection_template_job_accepted.json"
     },
     {
+      "name": "admin_dashboard_layout_unsaved",
+      "operation_id": "getAdminDashboardLayout",
+      "scenario": "An account with no saved layout reads null for both members and still gets a validator for its first save.",
+      "request": {
+        "method": "GET",
+        "path": "/api/v2/admin/dashboard/layout",
+        "headers": {
+          "Authorization": "Bearer tok-admin"
+        }
+      },
+      "expected_status": 200,
+      "response_headers": {
+        "Content-Type": "application/json",
+        "ETag": "\"4e70bed0e7ca91734d4c67a3.2yvhksboyyzbs\""
+      },
+      "response_media_type": "application/json",
+      "schema": "#/components/schemas/AdminDashboardLayout",
+      "body_file": "admin_dashboard_layout_unsaved.json"
+    },
+    {
       "name": "admin_device",
       "operation_id": "getAdminDevice",
       "scenario": "Device detail preserves profile identities and legacy compatibility settings; canonical overrides use the settings-values API.",
@@ -1278,6 +1298,26 @@
       "response_media_type": "application/json",
       "schema": "#/components/schemas/CollectionAdminDeviceMetadata",
       "body_file": "admin_devices.json"
+    },
+    {
+      "name": "admin_direct_connections_status_ok",
+      "operation_id": "getAdminDirectConnectionsStatus",
+      "scenario": "An acting administrator reads the API host's direct-connection readiness while the hidden toggle is off.",
+      "request": {
+        "method": "GET",
+        "path": "/api/v2/admin/direct-connections/status",
+        "headers": {
+          "Authorization": "Bearer tok-admin",
+          "X-Profile-Id": "p-primary"
+        }
+      },
+      "expected_status": 200,
+      "response_headers": {
+        "Content-Type": "application/json"
+      },
+      "response_media_type": "application/json",
+      "schema": "#/components/schemas/DirectConnectionsStatus",
+      "body_file": "admin_direct_connections_status_ok.json"
     },
     {
       "name": "admin_discord_test",
@@ -5281,7 +5321,8 @@
         "method": "DELETE",
         "path": "/api/v2/account/identities/4",
         "headers": {
-          "Authorization": "Bearer tok-member"
+          "Authorization": "Bearer tok-member",
+          "X-Profile-Id": "p-primary"
         }
       },
       "expected_status": 409,
@@ -5301,7 +5342,8 @@
         "method": "DELETE",
         "path": "/api/v2/account/identities/6",
         "headers": {
-          "Authorization": "Bearer tok-member"
+          "Authorization": "Bearer tok-member",
+          "X-Profile-Id": "p-primary"
         }
       },
       "expected_status": 204,
@@ -6689,6 +6731,26 @@
       "body_file": "get_admin_playback_history_capabilities_ok.json"
     },
     {
+      "name": "get_admin_plugin_capabilities_ok",
+      "operation_id": "getAdminPluginCapabilities",
+      "scenario": "An administrator discovers deployment-managed plugin settings.",
+      "request": {
+        "method": "GET",
+        "path": "/api/v2/admin/plugins/capabilities",
+        "headers": {
+          "Authorization": "Bearer tok-admin",
+          "X-Profile-Id": "p-primary"
+        }
+      },
+      "expected_status": 200,
+      "response_headers": {
+        "Content-Type": "application/json"
+      },
+      "response_media_type": "application/json",
+      "schema": "#/components/schemas/AdminPluginCapabilities",
+      "body_file": "get_admin_plugin_capabilities_ok.json"
+    },
+    {
       "name": "get_admin_section_ok",
       "operation_id": "getAdminSection",
       "scenario": "The canonical administrator section editor returns its recipe configuration and a strong validator.",
@@ -7521,7 +7583,7 @@
       "response_headers": {
         "Cache-Control": "private, no-cache",
         "Content-Type": "application/json",
-        "ETag": "\"d13e40a56af60133e079ed362f0b928b8fe0c6b5cff399307d25e1c791d74f6f\""
+        "ETag": "\"e524a14c4883542923d7e2be58ae12ff5a2e649615878e7fcafd8ff387f88801\""
       },
       "response_media_type": "application/json",
       "schema": "#/components/schemas/HomeCapabilities",
@@ -8477,6 +8539,27 @@
       "response_media_type": "application/json",
       "schema": "#/components/schemas/PluginSettings",
       "body_file": "get_plugin_settings_ok.json"
+    },
+    {
+      "name": "get_profile_section_baseline_ok",
+      "operation_id": "getProfileSectionBaseline",
+      "scenario": "The home page's pre-override server section baseline: opaque tokens for the server rows in libraries the profile is allowed, plus the pre-override visible server rows.",
+      "request": {
+        "method": "GET",
+        "path": "/api/v2/profile/sections/baseline",
+        "headers": {
+          "Authorization": "Bearer tok-member",
+          "X-Profile-Id": "p-owner"
+        }
+      },
+      "expected_status": 200,
+      "response_headers": {
+        "Cache-Control": "no-store",
+        "Content-Type": "application/json"
+      },
+      "response_media_type": "application/json",
+      "schema": "#/components/schemas/ProfileSectionBaseline",
+      "body_file": "get_profile_section_baseline_ok.json"
     },
     {
       "name": "get_profile_section_flags_ok",
@@ -9726,6 +9809,26 @@
       "response_media_type": "application/json",
       "schema": "#/components/schemas/AdminPlaybackHistoryCollection",
       "body_file": "list_admin_playback_history_ok.json"
+    },
+    {
+      "name": "list_admin_plugin_provisioning_status_ok",
+      "operation_id": "listAdminPluginProvisioningStatus",
+      "scenario": "The declaration is pending before the plugin is installed.",
+      "request": {
+        "method": "GET",
+        "path": "/api/v2/admin/plugins/provisioning-status",
+        "headers": {
+          "Authorization": "Bearer tok-admin",
+          "X-Profile-Id": "p-primary"
+        }
+      },
+      "expected_status": 200,
+      "response_headers": {
+        "Content-Type": "application/json"
+      },
+      "response_media_type": "application/json",
+      "schema": "#/components/schemas/CollectionAdminPluginProvisionStatus",
+      "body_file": "list_admin_plugin_provisioning_status_ok.json"
     },
     {
       "name": "list_admin_trickplay_libraries_ok",
@@ -12119,7 +12222,8 @@
         "method": "GET",
         "path": "/api/v2/webhook-sync/connections",
         "headers": {
-          "Authorization": "Bearer tok-member"
+          "Authorization": "Bearer tok-member",
+          "X-Profile-Id": "p-primary"
         }
       },
       "expected_status": 200,

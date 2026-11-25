@@ -198,6 +198,9 @@ type ProfileView struct {
 type ProfileListView struct {
 	Profiles            []ProfileView `json:"profiles"`
 	AvatarUploadEnabled bool          `json:"avatar_upload_enabled"`
+	// MaxProfiles is the household profile limit, 0 when it could not be
+	// read. Only v2 listProfiles reports it: the frozen v1 body leaves it out.
+	MaxProfiles int `json:"-"`
 }
 
 type verifyPINResponse struct {
@@ -310,9 +313,18 @@ func (h *ProfileHandler) ListProfiles(ctx context.Context, userID int) (ProfileL
 	if err != nil {
 		return ProfileListView{}, apiError(http.StatusInternalServerError, "internal_error", "Failed to list profiles")
 	}
+	maxProfiles := 0
+	if h.UserRepo != nil {
+		if user, err := h.UserRepo.GetByID(ctx, userID); err == nil && user != nil {
+			if effective, err := access.EffectivePolicyForUser(ctx, user, h.AccessGroups); err == nil {
+				maxProfiles = effective.MaxProfiles
+			}
+		}
+	}
 	return ProfileListView{
 		Profiles:            h.toProfileResponses(ctx, store, profiles),
 		AvatarUploadEnabled: h.AvatarStore != nil,
+		MaxProfiles:         maxProfiles,
 	}, nil
 }
 
@@ -934,12 +946,12 @@ func (h *ProfileHandler) DeleteProfile(ctx context.Context, cmd ProfileDeleteCom
 	var auditErr error
 	var deleteErr error
 	if deleter, ok := store.(userstore.AuditedProfileDeleter); ok && auditmutation.Recording(ctx) {
-		deleteErr = deleter.DeleteProfileAudited(ctx, profileID, func(tx pgx.Tx, deleted *userstore.Profile) error {
+		_, deleteErr = deleter.DeleteProfileAudited(ctx, profileID, func(tx pgx.Tx, deleted *userstore.Profile) error {
 			audit, auditErr = recordProfileMutation(ctx, tx, deleted, nil)
 			return auditErr
 		})
 	} else {
-		deleteErr = store.DeleteProfile(ctx, profileID)
+		_, deleteErr = store.DeleteProfile(ctx, profileID)
 	}
 	if auditErr != nil {
 		return apiError(http.StatusInternalServerError, "internal_error", "Failed to delete profile")

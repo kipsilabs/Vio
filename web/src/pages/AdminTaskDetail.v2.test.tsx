@@ -146,3 +146,114 @@ it("lets a refetch's 404 replace a task that was already cached", async () => {
   ).toBeInTheDocument();
   expect(screen.queryByText("Retired task")).not.toBeInTheDocument();
 });
+
+function renderScheduleEditor(
+  triggers: Array<{ type: "interval"; interval_ms: number; max_runtime_ms?: number }>,
+) {
+  const writes: unknown[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn<typeof fetch>(async (url, init) => {
+      const path = String(url);
+      if (path.endsWith("/triggers")) {
+        if (init?.method === "PUT") {
+          writes.push(JSON.parse(String(init.body)));
+          return jsonResponse({ task_key: "fixture", triggers: [] });
+        }
+        return new Response(JSON.stringify({ task_key: "fixture", triggers }), {
+          status: 200,
+          headers: { "Content-Type": "application/json", ETag: '"revision-1"' },
+        });
+      }
+      if (path.includes("/history")) return jsonResponse({ items: [], page: { has_more: false } });
+      return jsonResponse({
+        key: "fixture",
+        name: "Fixture task",
+        description: "Task description",
+        category: "system",
+        state: "idle",
+        progress: 0,
+        manual_only: false,
+        triggers: [],
+        execution_scope: "process",
+      });
+    }),
+  );
+  render(
+    <QueryClientProvider
+      client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
+    >
+      <MemoryRouter initialEntries={["/admin/tasks/fixture"]}>
+        <Routes>
+          <Route path="/admin/tasks/:key" element={<AdminTaskDetail />} />
+        </Routes>
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
+  return writes;
+}
+
+it("keeps a typed interval in the unit the admin picked, and an emptied box empty", async () => {
+  const writes = renderScheduleEditor([{ type: "interval", interval_ms: 120_000 }]);
+  fireEvent.click(await screen.findByRole("button", { name: "Edit Schedule" }));
+  // Each row has an interval box and a max runtime box.
+  const input = (await screen.findAllByRole("spinbutton"))[0] as HTMLInputElement;
+  const save = screen.getByRole("button", { name: "Save" }) as HTMLButtonElement;
+
+  fireEvent.change(input, { target: { value: "60" } });
+  expect(input.value).toBe("60");
+  expect(screen.getAllByRole("combobox")[1]).toHaveTextContent("Minutes");
+
+  fireEvent.change(input, { target: { value: "" } });
+  expect(input.value).toBe("");
+  expect(save.disabled).toBe(true);
+
+  fireEvent.change(input, { target: { value: "90" } });
+  fireEvent.click(save);
+  await waitFor(() => expect(writes).toHaveLength(1));
+  expect(writes[0]).toEqual({ triggers: [{ type: "interval", interval_ms: 5_400_000 }] });
+});
+
+it("keeps each row's unit when a row above it is removed", async () => {
+  renderScheduleEditor([
+    { type: "interval", interval_ms: 120_000 },
+    { type: "interval", interval_ms: 7_200_000 },
+  ]);
+  fireEvent.click(await screen.findByRole("button", { name: "Edit Schedule" }));
+  await screen.findAllByRole("spinbutton");
+  // The row's remove button is icon-only, so it has no accessible name.
+  fireEvent.click(screen.getAllByRole("button", { name: "" })[0]!);
+
+  expect((screen.getAllByRole("spinbutton")[0] as HTMLInputElement).value).toBe("2");
+  expect(screen.getAllByRole("combobox")[1]).toHaveTextContent("Hours");
+});
+
+it("keeps a typed Max runtime as typed, and shows a stored one rounded", async () => {
+  const writes = renderScheduleEditor([
+    { type: "interval", interval_ms: 120_000, max_runtime_ms: 74_075 },
+  ]);
+  fireEvent.click(await screen.findByRole("button", { name: "Edit Schedule" }));
+  const box = (await screen.findByPlaceholderText("None")) as HTMLInputElement;
+  expect(box.value).toBe("1.23458");
+
+  // A negative limit is saved as 0 (no limit), so the box shows 0.
+  fireEvent.change(box, { target: { value: "-5" } });
+  expect(box.value).toBe("0");
+
+  // So is a positive one under half a millisecond, once the admin leaves the box.
+  fireEvent.change(box, { target: { value: "0.000008" } });
+  expect(box.value).toBe("0.000008");
+  fireEvent.blur(box);
+  expect(box.value).toBe("0");
+
+  const typed = "1.23456";
+  for (let i = 1; i <= typed.length; i++) {
+    fireEvent.change(box, { target: { value: typed.slice(0, i) } });
+  }
+  expect(box.value).toBe("1.23456");
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(writes).toHaveLength(1));
+  expect(writes[0]).toEqual({
+    triggers: [{ type: "interval", interval_ms: 120_000, max_runtime_ms: 74_074 }],
+  });
+});

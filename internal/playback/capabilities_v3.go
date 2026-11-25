@@ -77,6 +77,21 @@ func SourceDescriptorFromFileV3(file *models.MediaFile, audioIndex int) SourceDe
 		default:
 			source.DVEnhancementLayer = EnhancementUnknownV3
 		}
+		// A Dolby Vision claim is only possible on a bitstream that can carry a
+		// DV RPU. AV1 and HEVC can; an H.264, VP9 or MPEG-2 row that claims a
+		// DV profile is mislabeled evidence (a "DV" release tag or an older
+		// listing write), and believing it plans a tone-mapped HDR transcode of
+		// an SDR file instead of the direct play or remux its real range
+		// allows. Keep every other range signal the track carries and drop only
+		// the impossible DV decoration.
+		if source.DynamicRange == DynamicRangeDolbyVisionV3 && !CodecCarriesDolbyVisionV3(source.VideoCodec) {
+			source.DynamicRange = rangeWithoutDolbyVisionV3(track)
+			source.DVProfile = 0
+			source.DVLevel = 0
+			source.DVBLCompatID = 0
+			source.DVBaseLayerProven = false
+			source.DVEnhancementLayer = EnhancementNoneV3
+		}
 	}
 	if !audioOnly && (source.Width == 0 || source.Height == 0) {
 		source.Width, source.Height = dimensionsFromResolutionV3(file.Resolution)
@@ -600,6 +615,37 @@ func deliveryManagedDVBaseLayerV3(delivery DeliveryCapabilityV3, source SourceDe
 	return claim != "" && containsFoldV3(delivery.ValidatedClaims, claim)
 }
 
+// clientDeclaresRangePresentationV3 reports whether the client advertises any
+// way to present a non-SDR source itself: a native HDR output that carries at
+// least one range, a client-managed dynamic-range claim, or one of the Dolby
+// Vision base-layer claims whose usability depends on a compatibility id the
+// row may not have probed yet. Planning must not treat a row as terminally
+// HDR-unplayable for such a client while its metadata is incomplete, because
+// the probe can still reveal the fact the claim depends on.
+//
+// A detailed output record whose every range flag is false is not a route: the
+// production browser client sends exactly that shape, and it can present
+// neither HDR10, HLG, nor any Dolby Vision profile.
+func clientDeclaresRangePresentationV3(request StartRequestV3) bool {
+	if hdr := nativeOutputHDRV3(request); hdr != nil {
+		if hdr.HDR10 || hdr.HDR10Plus || hdr.HLG || len(hdr.DolbyVisionProfiles) > 0 {
+			return true
+		}
+	}
+	delivery, ok := request.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3]
+	if !ok {
+		return false
+	}
+	for _, claim := range delivery.ValidatedClaims {
+		if strings.EqualFold(claim, ClaimClientManagedDynamicRangeV3) ||
+			strings.EqualFold(claim, ClaimClientDV8BaseLayerFallbackV3) ||
+			strings.HasPrefix(strings.ToLower(claim), ClaimClientManagedDVBaseLayerV3Prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // clientSelectsOriginalAudioTrackV3 is delivery-scoped because original HTTP
 // carries every source stream unchanged. A client that makes this claim maps
 // selected_tracks.audio.index onto its probed source inventory; clients that
@@ -770,6 +816,47 @@ func audioEligibilityV3(source SourceDescriptorV3, request StartRequestV3) (copy
 // normalizeDynamicRangeV3 returns the protocol dynamic-range label for a track.
 func normalizeDynamicRangeV3(track models.VideoTrack) string {
 	return tonemap.DynamicRangeForVideoTrack(track)
+}
+
+// Codecs whose bitstreams cannot carry a Dolby Vision RPU and are named in the
+// DV guard. The rest of the package compares normalized names inline.
+const (
+	codecMPEG2Video = "mpeg2video"
+	codecMPEG2      = "mpeg2"
+	codecVC1        = "vc1"
+	codecMPEG4      = "mpeg4"
+)
+
+// CodecCarriesDolbyVisionV3 reports whether a video bitstream codec can carry a
+// Dolby Vision RPU. Dolby Vision is defined on HEVC (profiles 5/7/8) and AV1
+// (profile 10); no AVC, VP9, or MPEG-2 bitstream can. A codec this function
+// does not recognize returns true: an unknown codec is not evidence against the
+// row's DV claim, so only a positive "cannot" verdict rewrites anything.
+func CodecCarriesDolbyVisionV3(codec string) bool {
+	switch normalizeCodecV3(codec) {
+	case TargetVideoCodecH264V3, codecMPEG2Video, codecMPEG2, codecVP9, codecVC1, codecMPEG4:
+		return false
+	default:
+		return true
+	}
+}
+
+// rangeWithoutDolbyVisionV3 derives the range a track really carries once its
+// impossible Dolby Vision decoration is dropped: the next-strongest signal the
+// same track observed, and SDR when DV was the only HDR claim it made.
+func rangeWithoutDolbyVisionV3(track models.VideoTrack) string {
+	if track.HDR10Plus || tonemap.VideoRangeTypeIsHDR10Plus(track.VideoRangeType) {
+		return DynamicRangeHDR10PlusV3
+	}
+	joined := strings.ToLower(strings.Join([]string{track.VideoRange, track.VideoRangeType, track.ColorTransfer}, " "))
+	switch {
+	case strings.Contains(joined, "hlg"):
+		return DynamicRangeHLGV3
+	case strings.Contains(joined, "hdr10") || strings.Contains(joined, "smpte2084") || strings.Contains(joined, "pq"):
+		return DynamicRangeHDR10V3
+	default:
+		return DynamicRangeSDRV3
+	}
 }
 
 func parseFrameRateV3(value string) float64 {

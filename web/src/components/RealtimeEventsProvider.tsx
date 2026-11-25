@@ -16,7 +16,15 @@ import type {
   ScanRun,
   TaskInfo,
 } from "@/api/types";
-import { isCapturedProfileAuthorityActive, type ProfileRequestContextSnapshot } from "@/api/client";
+import {
+  captureSessionIdentity,
+  isCapturedProfileAuthorityActive,
+  isSessionIdentityCurrent,
+  StaleApiRequestContextError,
+  type ProfileRequestContextSnapshot,
+  type SessionIdentitySnapshot,
+} from "@/api/client";
+import { isTransientV2Error, v2RetryDelayMs } from "@/api/v2/request";
 import {
   mintEventsSocketTicket,
   captureEventsAuthority,
@@ -26,22 +34,23 @@ import {
   applyNotificationCreated,
   applyNotificationRead,
   applyNotificationsSnapshot,
-  formatEpisodeCode,
+  notificationToast,
 } from "@/hooks/queries/notifications";
 import { toast } from "sonner";
 import {
-  RealtimeEventsContext,
+  RealtimeConnectionStateContext,
+  RealtimeEventsActionsContext,
   type EventChannelHandlers,
   type RealtimeConnectionState,
-  type RealtimeEventsContextValue,
+  type RealtimeEventsActionsContextValue,
 } from "@/components/realtimeEventsContext";
 import {
   createCatalogInvalidationScheduler,
   invalidateAccessDependentState,
   invalidateCatalogState,
-  scheduleProgressHomeRefresh,
   userStateChangeAffectsSectionMembership,
 } from "@/components/realtimeCatalogInvalidation";
+import { jobCancelledError, jobFailedError } from "@/lib/adminJobErrors";
 import { bumpHomeRefreshSignal } from "@/pages/homeSurfaceRefresh";
 import { createRealtimeQueryRefreshScheduler } from "@/components/realtimeQueryRefresh";
 import { adminSessionsKey } from "@/api/v2/adminSessionsCache";
@@ -58,7 +67,6 @@ import { useIsActingAdmin } from "@/hooks/useIsActingAdmin";
 import { usePageActivity } from "@/hooks/usePageActivity";
 import {
   adminKeys,
-  catalogKeys,
   historyImportKeys,
   libraryKeys,
   notInterestedKeys,
@@ -71,6 +79,7 @@ import {
   scheduleMediaSurfaceInvalidation,
   updateCatalogItemDetail,
 } from "@/hooks/queries/mediaSurfaceRefresh";
+import { scheduleVersionLivenessRefresh } from "@/hooks/queries/versionLiveness";
 import type { ReactNode } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLocation } from "react-router";
@@ -79,12 +88,15 @@ interface JobWaiter {
   timeoutId: number;
   resolve: (job: AdminJob) => void;
   reject: (error: Error) => void;
+  /** Stops waiting on a socket event and polls the job instead. */
+  poll: () => void;
 }
 
 interface UserStatePayload {
   profile_id: string;
   content_id?: string;
   series_id?: string;
+  playback_stopped?: boolean;
   change:
     | "progress"
     | "favorite"
@@ -127,6 +139,19 @@ function isRequestNotification(notification: Pick<AppNotification, "type">) {
 export const EVENTS_ACCESS_CHANGED_CLOSE_CODE = 4001;
 
 /**
+ * Close code for a login session, account or profile that is gone or
+ * disabled. Reconnecting with it cannot succeed: refresh the account (which
+ * signs out a revoked session) and wait before trying again.
+ */
+export const EVENTS_CREDENTIAL_INVALID_CLOSE_CODE = 4002;
+
+/** Close code for a server that could not recheck the credential: back off. */
+export const EVENTS_AUTHORITY_UNAVAILABLE_CLOSE_CODE = 4004;
+
+const CREDENTIAL_INVALID_RECONNECT_DELAY_MS = 30_000;
+const AUTHORITY_UNAVAILABLE_RECONNECT_DELAY_MS = 5_000;
+
+/**
  * How long the events socket stays open after the page is hidden. Its frames
  * keep the cache current meanwhile, so a quick tab switch costs no requests. A
  * longer absence closes the socket, and the return refetches active queries
@@ -159,19 +184,58 @@ function isTerminalJob(job: AdminJob) {
   return job.status === "completed" || job.status === "failed" || job.status === "cancelled";
 }
 
-async function pollAdminJobUntilTerminal(jobId: string): Promise<AdminJob> {
+function delay(ms: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+/** The longest a job wait backs off after failed reads; a longer Retry-After still holds. */
+const JOB_POLL_MAX_BACKOFF_MS = 30_000;
+/** setTimeout's limit; a longer delay would fire at once. */
+const MAX_TIMEOUT_MS = 2_147_483_647;
+
+/**
+ * Reads the job until it finishes. A read that may succeed later does not end
+ * the wait, since the job is still running on the server; it backs off while
+ * reads keep failing. Signing out or switching account or server ends it.
+ */
+async function pollAdminJobUntilTerminal(
+  jobId: string,
+  session: SessionIdentitySnapshot,
+): Promise<AdminJob> {
+  let failures = 0;
   for (;;) {
-    const job = await fetchAdminTaskJob(jobId);
+    if (!isSessionIdentityCurrent(session)) {
+      throw new StaleApiRequestContextError();
+    }
+    const read = await fetchAdminTaskJob(jobId).then(
+      (job) => ({ job }),
+      (error: unknown) => ({ error }),
+    );
+    // A read that finished after a sign-out or account switch, either way, is the old session's.
+    if (!isSessionIdentityCurrent(session)) {
+      throw new StaleApiRequestContextError();
+    }
+    if ("error" in read) {
+      if (!isTransientV2Error(read.error)) {
+        throw read.error;
+      }
+      failures += 1;
+      const backoff = Math.min(1_000 * 2 ** failures, JOB_POLL_MAX_BACKOFF_MS);
+      await delay(Math.min(v2RetryDelayMs(read.error, backoff), MAX_TIMEOUT_MS));
+      continue;
+    }
+    failures = 0;
+    const { job } = read;
     if (job.status === "completed") {
       return job;
     }
     if (job.status === "failed") {
-      throw new Error(job.error_message || job.message || "Job failed");
+      throw jobFailedError(job);
     }
     if (job.status === "cancelled") {
-      throw new Error(job.message || "Job cancelled");
+      throw jobCancelledError(job);
     }
-    await new Promise((resolve) => window.setTimeout(resolve, 1_000));
+    await delay(1_000);
   }
 }
 
@@ -202,7 +266,7 @@ function upsertJob(existing: AdminJob[] | undefined, nextJob: AdminJob, limit = 
   return sortJobs(jobs).slice(0, limit);
 }
 
-export function applyJellyfinCompatOperationUpdate(
+function applyJellyfinCompatOperationUpdate(
   queryClient: QueryClient,
   operation: JellyfinCompatOperationStatus,
   authority: ProfileRequestContextSnapshot | null,
@@ -297,8 +361,13 @@ function catalogEventLibraryID(data: unknown) {
   if (!data || typeof data !== "object" || !("library_id" in data)) {
     return undefined;
   }
+  // The server sends v2 string IDs; the query keys hold the library's number.
+  // A node still on an older build sends the number itself.
   const value = (data as { library_id?: unknown }).library_id;
-  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+  let id = NaN;
+  if (typeof value === "number") id = value;
+  else if (typeof value === "string" && /^[1-9][0-9]*$/.test(value)) id = Number(value);
+  return Number.isSafeInteger(id) && id > 0 ? id : undefined;
 }
 
 function catalogEventContentID(data: unknown) {
@@ -404,6 +473,7 @@ function handleUserStateEvent(
   payload: UserStatePayload,
   activeProfileID: string | null | undefined,
   allowDashboardRefetch: boolean,
+  scheduleHomeProgress: (playbackStopped: boolean) => void,
 ) {
   if (payload.profile_id && activeProfileID && payload.profile_id !== activeProfileID) {
     return;
@@ -471,20 +541,18 @@ function handleUserStateEvent(
           // A mark changes which titles More like this lists.
           skipSimilarItems: payload.change !== "not_interested",
           knownRelatedIds,
+          skipHomeRefresh: payload.change === "progress",
         }
-      : { skipSimilarItems: true },
+      : { skipSimilarItems: true, skipHomeRefresh: payload.change === "progress" },
   );
-  // Resetting home's load queue re-runs every section fetch. Membership
-  // changes do it immediately; progress ticks coalesce into one trailing
-  // refresh per window so an open home still catches another client's
-  // playback without a per-tick storm. Mark the home sections stale before
-  // an immediate reset because the surface invalidation above is debounced.
-  if (userStateChangeAffectsSectionMembership(payload.change)) {
+  // Bulk progress sync can emit one event per title. Keep one Home refresh
+  // for the whole burst, while finalized playback can advance its deadline.
+  if (payload.change === "progress") {
+    scheduleHomeProgress(payload.playback_stopped === true);
+  } else if (userStateChangeAffectsSectionMembership(payload.change)) {
     void queryClient
       .invalidateQueries({ queryKey: sectionKeys.home(), refetchType: "none" })
       .then(() => bumpHomeRefreshSignal(queryClient));
-  } else {
-    scheduleProgressHomeRefresh(queryClient);
   }
   void queryClient.invalidateQueries({
     queryKey: adminKeys.stats(),
@@ -504,6 +572,7 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
   const isDashboardRoute = location.pathname === "/admin" || location.pathname === "/admin/";
   const allowDashboardRealtimeUpdates = !isDashboardRoute || pageActivity.canPollDashboard;
   const [connectionState, setConnectionState] = useState<RealtimeConnectionState>("connecting");
+  const connectionStateRef = useRef<RealtimeConnectionState>(connectionState);
   const catalogInvalidation = useMemo(
     () => createCatalogInvalidationScheduler(queryClient),
     [queryClient],
@@ -526,6 +595,16 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
   // An unexpected drop on a visible page is not caught up at once, but the
   // next return from a hide catches up the frames it lost.
   const droppedSinceCatchUpRef = useRef(false);
+  const watchStateCatchUpRef = useRef<ProfileRequestContextSnapshot | null>(null);
+  const homeProgressRefreshRef = useRef<{
+    timer: number;
+    authority: ProfileRequestContextSnapshot;
+    playbackStopped: boolean;
+  } | null>(null);
+  const watchStateScopeRef = useRef<ProfileRequestContextSnapshot | null>(null);
+  // A focus read can land before a connection comes back. It cannot see a
+  // stop later in that gap, so only the subscription clears this obligation.
+  const watchStateMissedFramesRef = useRef(false);
   const [hiddenGraceExpired, setHiddenGraceExpired] = useState(false);
   // Bumping these replaces the socket, or runs a catch-up while the page is visible.
   const [socketGeneration, setSocketGeneration] = useState(0);
@@ -552,10 +631,10 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
       return;
     }
     if (job.status === "cancelled") {
-      waiter.reject(new Error(job.message || "Job cancelled"));
+      waiter.reject(jobCancelledError(job));
       return;
     }
-    waiter.reject(new Error(job.error_message || job.message || "Job failed"));
+    waiter.reject(jobFailedError(job));
   };
 
   const currentChannels = useCallback(() => {
@@ -662,6 +741,11 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
         refreshDownloadPreparations();
         refreshDownloadStorage();
         break;
+      case "downloads":
+        // A null snapshot: events may have been missed, so re-read the
+        // device copies and entries the storage views list.
+        refreshDownloadStorage();
+        break;
       case "jobs":
         if (Array.isArray(message.data)) {
           hydrateAdminJobSnapshot(queryClient, message.data as AdminJob[]);
@@ -676,7 +760,12 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
       case "tasks":
         // Reconnect must also catch up history/metrics for tasks that finished
         // while disconnected. One sweep avoids refetching each detail twice.
-        refreshQueries({ queryKey: adminKeys.tasks() });
+        // A plugin update check that finished meanwhile may have changed the
+        // installations too.
+        refreshQueries(
+          { queryKey: adminKeys.tasks() },
+          { queryKey: adminKeys.pluginInstallations() },
+        );
         break;
       case "scans":
         hydrateScans(queryClient, (message.data as ScanRun[]) ?? []);
@@ -720,38 +809,8 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
         return;
       }
       applyNotificationCreated(queryClient, notification);
-      if (notification.type === "episode.available" && notification.series_title) {
-        const episodeCode = formatEpisodeCode(notification);
-        toast(`New episode of ${notification.series_title}`, {
-          description: [episodeCode, notification.episode_title].filter(Boolean).join(" — "),
-        });
-      } else if (notification.type === "request.fulfilled") {
-        const follower = notification.reason_flags?.follower === true;
-        toast(
-          notification.series_title
-            ? `${notification.series_title} is now available`
-            : follower
-              ? "A title you followed is now available"
-              : "Your request is now available",
-          {
-            description: follower
-              ? "A title you asked to hear about has arrived in the library."
-              : "Your media request has arrived in the library.",
-          },
-        );
-      } else if (
-        notification.type === "request.approved" ||
-        notification.type === "request.declined"
-      ) {
-        const verb = notification.type === "request.approved" ? "approved" : "declined";
-        const title = notification.reason_flags?.title;
-        toast(title ? `Request ${verb}: ${title}` : `Your request was ${verb}`, {
-          description:
-            notification.type === "request.declined"
-              ? notification.reason_flags?.reason
-              : undefined,
-        });
-      }
+      const content = notificationToast(notification);
+      if (content) toast(content.title, { description: content.description });
       return;
     }
     if (message.event === "notification.read") {
@@ -783,14 +842,19 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
         }
         refreshDownloadPreparations();
         break;
+      case "downloads":
+        // A device download was registered, changed status or was removed.
+        refreshDownloadStorage();
+        break;
       case "catalog":
         {
           // The coalesced sweep below would also invalidate these checks, but
           // only once its window closes; a stamped row has to leave an open
-          // version menu at once. versions_updated is rare (a stamp or a
-          // refresh), so the checks are re-run directly here.
+          // version menu at once. A refresh announces its burst one row at a
+          // time, so the re-check is coalesced and rate-limited per row set
+          // (see scheduleVersionLivenessRefresh).
           if (isVersionsUpdatedEvent(message)) {
-            void queryClient.invalidateQueries({ queryKey: catalogKeys.versionLiveness });
+            scheduleVersionLivenessRefresh(queryClient);
           }
           const isItemChange = CATALOG_ITEM_CHANGED_EVENTS.has(message.event);
           catalogInvalidation.schedule({
@@ -833,6 +897,11 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
               { queryKey: adminKeys.taskHistory(task.key) },
               { queryKey: adminKeys.taskMetrics(task.key) },
             );
+            // A finished plugin update check may have updated plugins or
+            // recorded a refused update on them.
+            if (task.key === "check_plugin_updates") {
+              filters.push({ queryKey: adminKeys.pluginInstallations() });
+            }
           }
           refreshQueries(...filters);
         }
@@ -858,6 +927,32 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
           message.data as UserStatePayload,
           activeProfileIDRef.current,
           allowDashboardRealtimeUpdatesRef.current,
+          (playbackStopped) => {
+            if (!realtimeAuthority?.profileId) return;
+            const pending = homeProgressRefreshRef.current;
+            if (pending) {
+              if (
+                isEventsAuthorityActive(pending.authority) &&
+                (!playbackStopped || pending.playbackStopped)
+              ) {
+                return;
+              }
+              window.clearTimeout(pending.timer);
+            }
+            homeProgressRefreshRef.current = {
+              authority: realtimeAuthority,
+              playbackStopped,
+              timer: window.setTimeout(
+                () => {
+                  homeProgressRefreshRef.current = null;
+                  if (!isEventsAuthorityActive(realtimeAuthority)) return;
+                  watchStateCatchUpRef.current = realtimeAuthority;
+                  setCatchUpSignal((signal) => signal + 1);
+                },
+                playbackStopped ? 600 : 30_000,
+              ),
+            };
+          },
         );
         break;
       case "notifications":
@@ -893,6 +988,9 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
     hiddenAtRef.current = null;
     if (!authenticatedUserID) {
       shouldCatchUpOnFocusRef.current = false;
+      watchStateCatchUpRef.current = null;
+      watchStateScopeRef.current = null;
+      watchStateMissedFramesRef.current = false;
       return;
     }
     // A suspended page (a phone browser in the background) runs no timers, so
@@ -901,13 +999,18 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
     if (hiddenAt !== null && Date.now() - hiddenAt >= HIDDEN_EVENTS_SOCKET_GRACE_MS) {
       shouldCatchUpOnFocusRef.current = true;
       if (socketRef.current) {
+        watchStateMissedFramesRef.current = true;
         setSocketGeneration((generation) => generation + 1);
       }
     }
     if (hiddenAt !== null && droppedSinceCatchUpRef.current) {
       shouldCatchUpOnFocusRef.current = true;
     }
-    if (!shouldCatchUpOnFocusRef.current) {
+    const watchStateAuthority = watchStateCatchUpRef.current;
+    const catchUpWatchState =
+      watchStateAuthority !== null && isEventsAuthorityActive(watchStateAuthority);
+    const catchUpOnFocus = shouldCatchUpOnFocusRef.current;
+    if (!catchUpOnFocus && !catchUpWatchState) {
       return;
     }
     // The foreground player covers the routed app and owns everything it
@@ -920,6 +1023,35 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
       return;
     }
 
+    const homeAuthority = catchUpWatchState ? watchStateAuthority : captureEventsAuthority();
+    watchStateCatchUpRef.current = null;
+    if (homeAuthority?.profileId) {
+      if (homeProgressRefreshRef.current) {
+        window.clearTimeout(homeProgressRefreshRef.current.timer);
+        homeProgressRefreshRef.current = null;
+      }
+      watchStateScopeRef.current = homeAuthority;
+      // Home's row queries have no live observers. Mark them stale before
+      // restarting its load queue, including a first read that raced the gap.
+      const homeQueries = { queryKey: sectionKeys.home() };
+      void queryClient
+        .cancelQueries(homeQueries)
+        .then(() => {
+          if (isEventsAuthorityActive(homeAuthority)) {
+            // The focus catch-up already refetches the active layout query.
+            return queryClient.invalidateQueries({
+              ...homeQueries,
+              refetchType: catchUpOnFocus ? "none" : "active",
+            });
+          }
+        })
+        .then(() => {
+          if (isEventsAuthorityActive(homeAuthority)) bumpHomeRefreshSignal(queryClient);
+        });
+    }
+    if (!catchUpOnFocus) {
+      return;
+    }
     shouldCatchUpOnFocusRef.current = false;
     droppedSinceCatchUpRef.current = false;
     void queryClient.refetchQueries({
@@ -940,21 +1072,35 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
     refreshAccount,
   ]);
 
+  useEffect(
+    () => () => {
+      const pending = homeProgressRefreshRef.current;
+      if (pending) window.clearTimeout(pending.timer);
+    },
+    [],
+  );
+
   useEffect(() => {
+    const updateConnectionState = (next: RealtimeConnectionState) => {
+      connectionStateRef.current = next;
+      setConnectionState(next);
+    };
+
     if (!authenticatedUserID) {
-      setConnectionState("disconnected");
+      updateConnectionState("disconnected");
       return;
     }
     if (!keepSocketOpen) {
       // Frames sent from now on are missed; catch up when the page returns.
       shouldCatchUpOnFocusRef.current = true;
-      setConnectionState("disconnected");
+      watchStateMissedFramesRef.current = true;
+      updateConnectionState("disconnected");
       return;
     }
 
     const authority = captureEventsAuthority();
     if (!authority) {
-      setConnectionState("disconnected");
+      updateConnectionState("disconnected");
       return;
     }
     const authorityActive = () => isEventsAuthorityActive(authority);
@@ -1009,7 +1155,7 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
       if (closedByEffect) {
         return;
       }
-      setConnectionState("connecting");
+      updateConnectionState("connecting");
       helloReceivedRef.current = false;
 
       void mintEventsSocketTicket(authority)
@@ -1019,7 +1165,7 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
         })
         .catch(() => {
           if (closedByEffect || !authorityActive()) return;
-          setConnectionState("disconnected");
+          updateConnectionState("disconnected");
           scheduleReconnect();
         });
     };
@@ -1033,7 +1179,7 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
           `silo.ticket.${ticket}`,
         ]);
       } catch {
-        setConnectionState("disconnected");
+        updateConnectionState("disconnected");
         scheduleReconnect();
         return;
       }
@@ -1044,6 +1190,7 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
       // The server sends access_changed and then closes with
       // EVENTS_ACCESS_CHANGED_CLOSE_CODE; whichever arrives first refreshes.
       let accessChangeHandled = false;
+      let watchStateSubscribed = false;
       const handleAccessChanged = () => {
         if (accessChangeHandled) return;
         accessChangeHandled = true;
@@ -1059,7 +1206,7 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
         if (closedByEffect || socketRef.current !== socket || !authorityActive()) {
           return;
         }
-        setConnectionState("live");
+        updateConnectionState("live");
       };
 
       socket.onmessage = (event) => {
@@ -1077,6 +1224,25 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
             sendSubscribe();
             return;
           case "subscribed": {
+            if (
+              !watchStateSubscribed &&
+              authority.profileId &&
+              Array.isArray(message.channels) &&
+              message.channels.includes("user_state")
+            ) {
+              watchStateSubscribed = true;
+              const priorScope = watchStateScopeRef.current;
+              watchStateScopeRef.current = authority;
+              const firstSubscription = !priorScope || !isEventsAuthorityActive(priorScope);
+              const cachedHome = queryClient
+                .getQueriesData({ queryKey: sectionKeys.home() })
+                .some(([, data]) => data !== undefined);
+              if (watchStateMissedFramesRef.current || (firstSubscription && cachedHome)) {
+                watchStateMissedFramesRef.current = false;
+                watchStateCatchUpRef.current = authority;
+                setCatchUpSignal((signal) => signal + 1);
+              }
+            }
             // A profile_required rejection means the profile binding was lost
             // (the ticket mint failed or the ticket was not honored). Left
             // alone, this socket would stay healthy for hours while silently
@@ -1132,7 +1298,7 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
         if (closedByEffect || socketRef.current !== socket || !authorityActive()) {
           return;
         }
-        setConnectionState("disconnected");
+        updateConnectionState("disconnected");
       };
 
       socket.onclose = (event: CloseEvent) => {
@@ -1147,6 +1313,15 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
           handleAccessChanged();
         } else if (!closedByEffect) {
           droppedSinceCatchUpRef.current = true;
+          watchStateMissedFramesRef.current = true;
+        }
+        if (!closedByEffect && event.code === EVENTS_CREDENTIAL_INVALID_CLOSE_CODE) {
+          // A revoked session fails the refresh and signs out, which ends
+          // this effect; the long delay keeps a lingering one from looping.
+          void refreshAccount().catch(() => {});
+          nextReconnectDelayRef.current = CREDENTIAL_INVALID_RECONNECT_DELAY_MS;
+        } else if (!closedByEffect && event.code === EVENTS_AUTHORITY_UNAVAILABLE_CLOSE_CODE) {
+          nextReconnectDelayRef.current = AUTHORITY_UNAVAILABLE_RECONNECT_DELAY_MS;
         }
         if (
           event.code !== EVENTS_ACCESS_CHANGED_CLOSE_CODE &&
@@ -1163,7 +1338,7 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
         socketRef.current = null;
         activeSocket = null;
         helloReceivedRef.current = false;
-        setConnectionState("disconnected");
+        updateConnectionState("disconnected");
         if (!closedByEffect) {
           scheduleReconnect();
         }
@@ -1174,11 +1349,13 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
 
     return () => {
       closedByEffect = true;
+      connectionStateRef.current = "disconnected";
       adminRefresh.cancel();
       clearReconnect();
-      for (const [jobId, waiter] of waitersRef.current) {
+      // The server job outlives this socket: keep waiting on it by polling.
+      for (const waiter of waitersRef.current.values()) {
         window.clearTimeout(waiter.timeoutId);
-        waiter.reject(new Error(`Realtime events provider closed before job ${jobId} finished`));
+        waiter.poll();
       }
       waitersRef.current.clear();
       const socket = activeSocket;
@@ -1211,26 +1388,25 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
 
   const awaitAdminJob = useCallback(
     (jobId: string) => {
+      const session = captureSessionIdentity();
       const cachedJob = findCachedAdminJob(queryClient, jobId);
       if (cachedJob) {
         if (cachedJob.status === "completed") {
           return Promise.resolve(cachedJob);
         }
         if (cachedJob.status === "failed") {
-          return Promise.reject(
-            new Error(cachedJob.error_message || cachedJob.message || "Job failed"),
-          );
+          return Promise.reject(jobFailedError(cachedJob));
         }
         if (cachedJob.status === "cancelled") {
-          return Promise.reject(new Error(cachedJob.message || "Job cancelled"));
+          return Promise.reject(jobCancelledError(cachedJob));
         }
       }
 
       // Must match the gate on AdminRealtimeEventChannels: when the jobs
       // channel isn't subscribed (not acting as admin), waiting on a live
       // event would hang until the fallback timeout — poll instead.
-      if (!actingAdmin || connectionState !== "live") {
-        return pollAdminJobUntilTerminal(jobId);
+      if (!actingAdmin || connectionStateRef.current !== "live") {
+        return pollAdminJobUntilTerminal(jobId, session);
       }
 
       return new Promise<AdminJob>((resolve, reject) => {
@@ -1239,27 +1415,33 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
           window.clearTimeout(existing.timeoutId);
         }
 
+        const poll = () => void pollAdminJobUntilTerminal(jobId, session).then(resolve, reject);
         const timeoutId = window.setTimeout(() => {
           waitersRef.current.delete(jobId);
-          void pollAdminJobUntilTerminal(jobId).then(resolve).catch(reject);
+          poll();
         }, 60_000);
 
-        waitersRef.current.set(jobId, { timeoutId, resolve, reject });
+        waitersRef.current.set(jobId, { timeoutId, resolve, reject, poll });
       });
     },
-    [actingAdmin, connectionState, queryClient],
+    [actingAdmin, queryClient],
   );
 
-  const value = useMemo<RealtimeEventsContextValue>(
+  const actionsValue = useMemo<RealtimeEventsActionsContextValue>(
     () => ({
-      connectionState,
       awaitAdminJob,
       subscribeChannel,
     }),
-    [awaitAdminJob, connectionState, subscribeChannel],
+    [awaitAdminJob, subscribeChannel],
   );
 
-  return <RealtimeEventsContext.Provider value={value}>{children}</RealtimeEventsContext.Provider>;
+  return (
+    <RealtimeEventsActionsContext.Provider value={actionsValue}>
+      <RealtimeConnectionStateContext.Provider value={connectionState}>
+        {children}
+      </RealtimeConnectionStateContext.Provider>
+    </RealtimeEventsActionsContext.Provider>
+  );
 }
 
 export { buildEventsUrl };

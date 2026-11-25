@@ -398,9 +398,12 @@ func TestProtocolV3ConformanceMatrixCoversReleaseTrain(t *testing.T) {
 		}
 	}
 	for name, delivery := range map[string]DeliveryV3{
-		"evidence_exact":                    DeliveryTranscodeHLSV3,
-		"evidence_platform_attested":        DeliveryOriginalHTTPV3,
-		"evidence_declared":                 DeliveryOriginalHTTPV3,
+		"evidence_exact":             DeliveryTranscodeHLSV3,
+		"evidence_platform_attested": DeliveryOriginalHTTPV3,
+		// A declared answer is not evidence the server can lean on for a
+		// container it cannot verify: that client still gets a playable route,
+		// but through a codec-copy remux instead of direct play.
+		"evidence_declared":                 DeliveryRemuxProgressiveV3,
 		"delivery_original":                 DeliveryOriginalHTTPV3,
 		"delivery_progressive":              DeliveryRemuxProgressiveV3,
 		"delivery_hls":                      DeliveryRemuxHLSV3,
@@ -647,12 +650,19 @@ func TestPlanPlaybackV3EvidenceTiersReachTierAppropriateRoutes(t *testing.T) {
 		t.Fatalf("platform_attested tier = %s", ExplainPlannerResultV3(result))
 	}
 
-	// declared: no decode entries at all; the flat codec list carries the day.
+	// declared: no decode entries at all; the flat codec list carries a copy
+	// route. The source is Matroska and a declared container claim is not
+	// evidence the player can render those bytes, so the copy is packaged
+	// rather than sent as the original container (see
+	// directPlayContainerTrustedV3).
 	declared := base
 	declared.Capabilities.VideoEvidence = EvidenceDeclaredV3
 	result = PlanPlaybackV3(PlannerInputV3{Request: declared, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0, Settings: PlannerSettingsV3{TranscodeEnabled: true, Allow4KTranscode: true}, Registry: testTransformationRegistryV3()})
-	if result.Plan == nil || result.Plan.Delivery != DeliveryOriginalHTTPV3 {
+	if result.Plan == nil || result.Plan.Delivery != DeliveryRemuxProgressiveV3 || result.Plan.EffectiveRecipe.VideoCodec != "hevc" {
 		t.Fatalf("declared tier = %s", ExplainPlannerResultV3(result))
+	}
+	if result.RouteDowngrade != RouteDowngradeUnverifiedContainerV3 {
+		t.Fatalf("declared tier downgrade = %q, want %q", result.RouteDowngrade, RouteDowngradeUnverifiedContainerV3)
 	}
 }
 
@@ -680,14 +690,18 @@ func TestPlanPlaybackV3DeclaredDecodeEntryNarrowsFlatClaim(t *testing.T) {
 	}
 
 	file.VideoTracks[0].Profile, file.VideoTracks[0].BitDepth = "High", 8
-	if result = plan(); result.Plan == nil || result.Plan.Delivery != DeliveryOriginalHTTPV3 {
+	// The flat claim passes, so the video is copied. Matroska under a declared
+	// container claim is packaged rather than direct-played (see
+	// directPlayContainerTrustedV3), so the assertion is the copy route, not
+	// the delivery class.
+	if result = plan(); result.Plan == nil || result.Plan.Delivery != DeliveryRemuxProgressiveV3 {
 		t.Fatalf("8-bit source = %s", ExplainPlannerResultV3(result))
 	}
 
 	// An entry for another codec says nothing about H.264.
 	file.VideoTracks[0].Profile, file.VideoTracks[0].BitDepth = "High 10", 10
 	req.Capabilities.VideoDecode = []VideoDecodeCapabilityV3{{Codec: "hevc", BitDepths: []int{8}}}
-	if result = plan(); result.Plan == nil || result.Plan.Delivery != DeliveryOriginalHTTPV3 {
+	if result = plan(); result.Plan == nil || result.Plan.Delivery != DeliveryRemuxProgressiveV3 {
 		t.Fatalf("unrelated entry = %s", ExplainPlannerResultV3(result))
 	}
 }
@@ -803,6 +817,98 @@ func TestSourceDescriptorV3NormalizesLegacyHEVCMetadata(t *testing.T) {
 	}
 	if source.DVEnhancementLayer != EnhancementUnknownV3 {
 		t.Fatalf("enhancement layer = %q, want unknown", source.DVEnhancementLayer)
+	}
+}
+
+// avcDVClaimFileV3 is a 1080p H.264 SDR file whose row claims Dolby Vision
+// profile 8. A "DV" release tag on an H.264 file is a mislabel: Dolby Vision
+// needs a bitstream that can carry its RPU (HEVC or AV1).
+func avcDVClaimFileV3() *models.MediaFile {
+	file := detailedFixtureFileV3()
+	file.CodecVideo = "h264"
+	file.Resolution = "1080p"
+	file.Bitrate = 8_000
+	file.VideoTracks[0] = models.VideoTrack{
+		Codec: "h264", Profile: "High", Level: 41, Width: 1920, Height: 1080,
+		FrameRate: "24000/1001", Bitrate: 8_000, BitDepth: 8,
+		VideoRange: "DolbyVision", VideoRangeType: "DOVI", DVProfile: 8,
+		DolbyVision: "Dolby Vision", DVConfigPresent: true, DVBLCompatIDPresent: true, DVBLCompatID: 1, DVBLPresent: true,
+	}
+	file.AudioTracks[0] = models.AudioTrack{Codec: "aac", Channels: 2, Layout: "stereo"}
+	return file
+}
+
+// A Dolby Vision profile on a codec that cannot carry a DV RPU is not evidence.
+// Believing it turns a playable 1080p H.264 file into an HDR source, and the
+// plan then builds a tone-mapped re-encode of the file it could have served
+// directly instead of the remux/direct play its real range allows.
+func TestSourceDescriptorV3DropsImpossibleDolbyVisionClaim(t *testing.T) {
+	source := SourceDescriptorFromFileV3(avcDVClaimFileV3(), 0)
+	if source.DynamicRange != DynamicRangeSDRV3 {
+		t.Fatalf("dynamic range = %q, want sdr", source.DynamicRange)
+	}
+	if source.DVProfile != 0 || source.DVBaseLayerProven || source.DVLevel != 0 || source.DVBLCompatID != 0 {
+		t.Fatalf("impossible DV evidence survived: %#v", source)
+	}
+	if source.Width != 1920 || source.Height != 1080 {
+		t.Fatalf("source size = %dx%d, want the file's 1920x1080", source.Width, source.Height)
+	}
+
+	// A genuinely DV-capable codec keeps every field: the guard is about the
+	// codec's ability to carry the RPU, not about distrusting the label.
+	hevc := avcDVClaimFileV3()
+	hevc.CodecVideo = "hevc"
+	hevc.VideoTracks[0].Codec = "hevc"
+	hevc.VideoTracks[0].Profile = "Main 10"
+	hevc.VideoTracks[0].BitDepth = 10
+	hevcSource := SourceDescriptorFromFileV3(hevc, 0)
+	if hevcSource.DynamicRange != DynamicRangeDolbyVisionV3 || hevcSource.DVProfile != 8 || !hevcSource.DVBaseLayerProven {
+		t.Fatalf("a real DV source lost its evidence: %#v", hevcSource)
+	}
+}
+
+// The plan for that file serves it: direct play of the SDR H.264 source, with no
+// HDR-to-SDR tone map and no 4K target. The client here decodes H.264 at 1080p
+// and offers no HDR output.
+func TestPlanPlaybackV3DoesNotToneMapAnAVCDolbyVisionMislabel(t *testing.T) {
+	file := avcDVClaimFileV3()
+	req := validStartRequestV3()
+	req.QualityPreference = "auto"
+	req.Capabilities.CodecsVideo = []string{"h264"}
+	req.Capabilities.CodecsVideoHardware = []string{"h264"}
+	req.Capabilities.HDRDetails = nil
+	req.Capabilities.VideoDecode = []VideoDecodeCapabilityV3{{
+		Codec: "h264", Profiles: []string{"high"}, Levels: []int{41}, BitDepths: []int{8},
+		MaxWidth: 1920, MaxHeight: 1080, MaxFrameRate: 60, MaxBitrateKbps: 20_000, Hardware: true,
+	}}
+	req.ClientPlaybackContext.Output.HDRDetails = nil
+	original := req.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3]
+	original.Containers = []string{"mkv"}
+	original.VideoCodecs = []string{"h264"}
+	original.AudioDecodeCodecs = []string{"aac"}
+	req.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3] = original
+
+	result := PlanPlaybackV3(PlannerInputV3{
+		Request: req, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0,
+		Settings: PlannerSettingsV3{TranscodeEnabled: true, Allow4KTranscode: true},
+		Registry: toneMapTestRegistryV3(),
+	})
+	if result.Plan == nil {
+		t.Fatalf("result = %s", ExplainPlannerResultV3(result))
+	}
+	if result.PlayMethod != PlayDirect || result.Plan.Delivery != DeliveryOriginalHTTPV3 {
+		t.Fatalf("plan = %s, want the direct play this source supports", ExplainPlannerResultV3(result))
+	}
+	if result.Plan.Source.DynamicRange != DynamicRangeSDRV3 || result.Plan.Source.DVProfile != 0 {
+		t.Fatalf("planned source = %#v, want SDR with no DV evidence", result.Plan.Source)
+	}
+	for _, transformation := range result.Plan.Transformations {
+		if transformation.Name == TransformationHDRToSDRToneMapV3 {
+			t.Fatalf("an SDR file was tone-mapped: %#v", result.Plan.Transformations)
+		}
+	}
+	if result.TargetResolution == "2160p" {
+		t.Fatalf("target resolution = %q, want the source's own size", result.TargetResolution)
 	}
 }
 
@@ -1108,6 +1214,67 @@ func TestPlanPlaybackV3RejectsTrulyIncompleteVideoMetadata(t *testing.T) {
 	result := planFileV3(req, file)
 	if result.Terminal == nil || result.Terminal.Reason != "source_metadata_incomplete" {
 		t.Fatalf("result = %s", ExplainPlannerResultV3(result))
+	}
+}
+
+// An unprobed HDR/DV row whose client cannot present the source range and
+// whose server has no HDR recipe is already decided by the facts on the row.
+// The planner must answer the start's terminal instead of the retryable
+// metadata refusal, which a version picker reads as unknown (#469).
+func TestPlanPlaybackV3DecidesAnUnprobedHDRRefusalWithoutAProbe(t *testing.T) {
+	file := detailedFixtureFileV3()
+	file.Bitrate = 0
+	file.HDR = true
+	file.VideoTracks[0].BitDepth = 0
+	file.VideoTracks[0].FrameRate = ""
+	file.VideoTracks[0].Bitrate = 0
+	file.VideoTracks[0].VideoRange = "DolbyVision"
+	file.VideoTracks[0].VideoRangeType = "DOVI"
+	req := validStartRequestV3()
+	input := PlannerInputV3{
+		Request: req, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0,
+		Settings: PlannerSettingsV3{TranscodeEnabled: true, Allow4KTranscode: true},
+		Registry: testTransformationRegistryV3(),
+		// The versions check's playability pass cannot probe this row.
+		DeclaredFactsOnly: true,
+	}
+
+	result := PlanPlaybackV3(input)
+	if result.Terminal == nil || result.Terminal.Reason != TerminalHDRTranscodeUnsupportedV3 || result.Terminal.Retryable {
+		t.Fatalf("result = %s", ExplainPlannerResultV3(result))
+	}
+	if result.Terminal.Message == "" || result.Terminal.Detail == "" {
+		t.Fatalf("terminal = %#v, want the planner's message and blocker detail", result.Terminal)
+	}
+
+	// The start path cannot take that shortcut: its probe may still complete
+	// the route, so without DeclaredFactsOnly the same facts keep asking for
+	// the retryable metadata verdict.
+	input.DeclaredFactsOnly = false
+	result = PlanPlaybackV3(input)
+	if result.Terminal == nil || result.Terminal.Reason != "source_metadata_incomplete" || !result.Terminal.Retryable {
+		t.Fatalf("start-path result = %s", ExplainPlannerResultV3(result))
+	}
+
+	// A client that advertises an HDR presentation route could gain one from
+	// the metadata the probe has not written yet (here a Dolby Vision base
+	// layer whose compatibility id the row does not carry). It must stay on
+	// the retryable metadata refusal instead of being refused early.
+	input.DeclaredFactsOnly = true
+	input.Request = hdr10ClientRequestV3(true)
+	result = PlanPlaybackV3(input)
+	if result.Terminal == nil || result.Terminal.Reason != "source_metadata_incomplete" || !result.Terminal.Retryable {
+		t.Fatalf("HDR-capable client result = %s", ExplainPlannerResultV3(result))
+	}
+
+	// A detailed output record with every range flag false is the production
+	// browser shape: it can present no HDR range, so no probe can create a
+	// route and the terminal is due now.
+	input.Request = hdr10ClientRequestV3(true)
+	input.Request.ClientPlaybackContext.Output.HDRDetails = &HDRCapabilitiesV3{}
+	result = PlanPlaybackV3(input)
+	if result.Terminal == nil || result.Terminal.Reason != TerminalHDRTranscodeUnsupportedV3 || result.Terminal.Retryable {
+		t.Fatalf("no-HDR-output client result = %s", ExplainPlannerResultV3(result))
 	}
 }
 
@@ -4236,7 +4403,12 @@ func TestPlanPlaybackV3MatroskaAACRemuxUsesTimestampNormalizedAudio(t *testing.T
 	}
 }
 
-func TestPlanPlaybackV3NativeMatroskaAACDirectPlayRemainsUnchanged(t *testing.T) {
+// TestPlanPlaybackV3LegacyWebMKVClaimTakesPackagedRoute pins the server-side
+// fallback for a browser build that still lists mkv. The current web client no
+// longer claims it, and the declared-tier claim it used to send is exactly what
+// stalled in production, so the planner packages the file instead of sending
+// the original Matroska bytes.
+func TestPlanPlaybackV3LegacyWebMKVClaimTakesPackagedRoute(t *testing.T) {
 	file := detailedFixtureFileV3()
 	file.VideoTracks[0].VideoRange = "SDR"
 	file.VideoTracks[0].VideoRangeType = "SDR"
@@ -4255,8 +4427,14 @@ func TestPlanPlaybackV3NativeMatroskaAACDirectPlayRemainsUnchanged(t *testing.T)
 		Request: req, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0,
 		Settings: PlannerSettingsV3{TranscodeEnabled: true}, Registry: testTransformationRegistryV3(),
 	})
-	if result.Plan == nil || result.Plan.Delivery != DeliveryOriginalHTTPV3 || result.PlayMethod != PlayDirect || result.TranscodeAudio || len(result.Plan.Transformations) != 0 {
-		t.Fatalf("direct play changed = %s", ExplainPlannerResultV3(result))
+	if result.Plan == nil || result.Plan.Delivery != DeliveryRemuxProgressiveV3 {
+		t.Fatalf("legacy web mkv claim = %s", ExplainPlannerResultV3(result))
+	}
+	if result.Plan.Stream.Container != "mp4" || result.RouteDowngrade != RouteDowngradeUnverifiedContainerV3 {
+		t.Fatalf("packaged route = %#v (downgrade %q)", result.Plan.Stream, result.RouteDowngrade)
+	}
+	if result.Plan.EffectiveRecipe.VideoCodec != "hevc" {
+		t.Fatalf("packaged route re-encoded the video: %#v", result.Plan.EffectiveRecipe)
 	}
 }
 

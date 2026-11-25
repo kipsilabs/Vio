@@ -38,6 +38,7 @@ type AdminNodeUpdateBody struct {
 	// when it restarts.
 	DownloadArtifactDirOverride      *string `json:"download_artifact_dir_override,omitempty" nullable:"true" maxLength:"4096" doc:"Absolute directory for this transcode node's prepared download files. Null or empty restores the inherited directory: download.artifact_dir, or when that is blank, download-artifacts inside the node's transcode directory. Applies when the node restarts."`
 	DownloadArtifactMaxBytesOverride *int64  `json:"download_artifact_max_bytes_override,omitempty" nullable:"true" minimum:"-1" doc:"Storage budget in bytes for this node's prepared download files; 0 means no budget. Null or -1 restores download.artifact_max_bytes."`
+	SourceAccess                     *string `json:"source_access,omitempty" enum:"local,core" doc:"How a transcode node reaches its source media. A proxy is always local."`
 }
 
 func (b *AdminNodeUpdateBody) UnmarshalJSON(data []byte) error {
@@ -135,6 +136,8 @@ func registerAdminNodeConfiguration(reg *Registry) {
 		return adminNodeConfigurationOutput(ctx, node, err)
 	})
 	remove := Operation{Operation: humaOp("DELETE", Prefix+"/admin/nodes/{id}", "deleteAdminNode", "admin-nodes", "Delete the original If-Match configuration and atomically persist pool invalidation for replica reconciliation. No worker teardown, session completion or all-replica acknowledgement. A subsequent 404 is not proof of this caller's outcome."), Class: ClassActingAdmin, DemoRestricted: true, ServiceBacked: true, Guarded: true, RetrySafety: RetrySafetyDurableDispatch}
+	// A node the deployment configuration owns is not deleted here.
+	remove.Errors = []int{http.StatusConflict}
 	Register(reg, remove, func(ctx context.Context, in *AdminNodeDeleteInput) (*struct{}, error) {
 		id, err := adminNodeCommandID(&AdminNodeCommandInput{ID: in.ID})
 		if err != nil {

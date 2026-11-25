@@ -34,15 +34,12 @@ concurrent additions and removals may change later pages. A missing configured
 local seed directory returns an empty listing; a missing explicitly browsed
 directory returns not found.
 
-These are web administration utilities. The Apple and Android clients have no
-callers for them, and the Jellyfin compatibility surface has no equivalent catalog
-seed or administrator filesystem operation.
-
 ## Catalog item listing
 
 `GET /api/v2/admin/catalog/items` (`listAdminCatalogItems`) lets an administrator,
 or a tool holding an administrator's key, mirror the video catalog. Unlike the
-discovery operations above it returns no paths or storage keys.
+discovery operations above it returns no storage keys, and file paths only on
+request (see `include_file_paths` below).
 
 It lists movies, series and episodes that have a membership row in an enabled
 library. Books, podcasts and their episodes are left out, as are items that only
@@ -62,7 +59,7 @@ starts a new listing. `content_ids` is a set, so repeating or reordering ids
 keeps the cursor. Ids that are not present movies, series or episodes are left
 out without an error, which is how a caller learns an item left the catalog.
 Each page is read in one snapshot with at most two statements, whatever it
-holds, or three with `include_people`. Later pages read the live catalog, so an
+holds, or three with `include_people`; `include_file_paths` adds none. Later pages read the live catalog, so an
 item added behind the cursor appears on the next full pass, not this one.
 
 Each item carries `content_id`, `type`, `title`, `year`, the provider ids, and
@@ -70,6 +67,13 @@ Each item carries `content_id`, `type`, `title`, `year`, the provider ids, and
 filters. A movie or series also has `status`, its metadata match state. An
 episode has `series_id`, `series_title`, `season_number` and `episode_number`;
 its `year` is its air-date year.
+
+`poster_url` is the card-size poster of a movie or series, or of an episode's
+series, and is absent only when there is none. It is always a URL this server
+issued, never a metadata provider's, so a tool that cannot reach the
+providers' image hosts can load it; art not cached yet comes through a signed
+`getItemPoster` link (see "Admin poster URLs" in [images-api.md](images-api.md)).
+The URL expires: read it again from a later page rather than storing it.
 
 A movie or series also carries its stored metadata, so a tool can match rules
 across a library without reading each item as a profile: `genres`,
@@ -120,6 +124,17 @@ viewer has no language preference (the file's default track, else its first);
 a file-level value
 fills a field that track lacks. Fields the scanner has not probed are absent.
 
+`include_file_paths=true` also returns each version's `file_path`, so a tool
+can match files without reading every item. It is the path the scanning server
+stores, in that server's filesystem; a tool on another host maps it through the
+library's `paths`. Bytes of a file name that are not valid UTF-8 are stored as
+private-use code points, so a byte-exact comparison fails on those names. A
+login session, an unscoped administrator key, or a key holding
+`admin:catalog:paths` may send it; any other scoped key, such as one holding
+only `admin:monitor:read`, receives `403 permission_denied`, never a page
+without paths. Like every filter, it is bound into the cursor. A changed path
+raises `files_changed`.
+
 To keep a mirror current between full passes, subscribe to the `catalog` channel
 of the v2 events socket. An API key with the `admin:monitor:read` scope can mint
 its ticket (see [realtime-api.md](realtime-api.md#api-key-handshake)), as can an
@@ -132,11 +147,12 @@ with `content_ids`, and drop any the listing no longer returns. Fetch on
 `GET /api/v2/admin/catalog/capabilities` reports `item_listing`,
 `item_listing_max_content_ids`, `item_change_events`, true when the socket
 carries those changes, `item_match_hints`, true when
-`GET /api/v2/admin/items/{id}/match/hints` is served, and `item_metadata`, true
+`GET /api/v2/admin/items/{id}/match/hints` is served, `item_metadata`, true
 when items carry the stored metadata above and the listing accepts
-`include_people`. The listing and the events have no Apple, Android, or
-Jellyfin compatibility callers; Jellyfin clients read the catalog through their
-own item queries.
+`include_people`, `item_file_paths`, true when this caller may send
+`include_file_paths`, `item_posters`, true when items carry `poster_url` under
+that rule, and `item_metadata_reset`, true when
+`POST /api/v2/admin/items/{id}/refresh-metadata` accepts `mode: "reset"`.
 
 ## Export and import
 
@@ -149,7 +165,6 @@ own item queries.
 | `POST /api/v2/admin/catalog/export-jobs/{id}/publish` | `200` with a saved signed download URL, or `409` when storage cannot presign |
 | `GET /api/v2/admin/jobs/capabilities` | Whether artifact download and public links are supported |
 | `GET /api/v2/admin/jobs/{id}/artifact` | Streams a completed job's artifact to a signed capability |
-| `GET /api/v2/admin/catalog/search/status` | Current catalog search runtime status |
 
 Export requests use JSON `{}` for the entire catalog or `library_ids` containing
 opaque string IDs. Direct export declares `application/gzip` as its success
@@ -212,10 +227,32 @@ unreachable answers `503`.
 Read `download_url` from the job rather than constructing this URL. An S3-backed
 server returns a presigned storage URL there instead, and both forms are opaque.
 
-Search status retains the existing runtime/provider/index information, uses UTC
-millisecond instants, and represents `last_processed_event_id` as a string. Its
-task links and media-type coverage groups are finite collections. These transfer
-and status operations have no Apple, Android, or Jellyfin compatibility callers.
+## Catalog search status
+
+`GET /api/v2/admin/catalog/search/status` (`getAdminCatalogSearchStatus`)
+requires an acting administrator and reports the configured search provider, the
+provider currently answering requests, Meilisearch health, index state, semantic
+readiness, and links to the search maintenance tasks. Instants are UTC with
+millisecond precision, `last_processed_event_id` is a string, and the task links
+and media-type coverage groups are finite collections. A server without the
+status service answers `503`.
+
+`active_provider` describes the route requests actually take; it is not merely
+the configured provider. `degraded` and the optional `degraded_reason` explain
+temporary fallback or keyword-only operation. `index.rebuild_required` is true
+when the active index's document schema does not match the current search
+settings, or when Meilisearch no longer has it (for example after its data
+directory was emptied); in that case `index.document_count` is 0 and searches
+use PostgreSQL, while `meilisearch.healthy` still reports whether Meilisearch
+itself answers. A status read learns that the index is missing from the
+semantic capability probe, so it can take up to five minutes to show.
+
+Background search maintenance runs at startup and every minute: it rebuilds a
+missing or stale index, applies changed index settings to a current one in
+place (not a rebuild, so not `rebuild_required`), then resumes incremental
+event sync. When the prior index is known to have the same document and media
+scope, Meilisearch continues serving keyword search while the replacement is
+built; otherwise searches use PostgreSQL.
 
 ## Literary editions and matches
 
@@ -247,16 +284,14 @@ links editions and then records the decision in a separate write; failure of
 that write can leave the editions linked. There is no whole-operation transaction
 or durable request replay receipt. All four mutations are non-retryable: after
 an uncertain result, inspect current state before deciding whether to submit again.
-These administration routes have no existing web, Apple, Android, or Jellyfin
-compatibility callers. The viewer literary-work endpoint remains unchanged.
+The viewer literary-work endpoint is separate.
 
 ## Person curation
 
 `POST /api/v2/admin/people/{id}/refresh` waits for the existing provider refresh
 (up to its two-minute deadline) and returns the typed `Person`. It differs from
 the viewer refresh operation, which queues work. A missing person returns `404`;
-a provider without person metadata returns a `503` dependency problem. The frozen
-v1 response for that provider failure remains `502` with `provider_error`.
+a provider without person metadata returns a `503` dependency problem.
 
 `PATCH /api/v2/admin/people/{id}` accepts optional `name`, `bio`, `birth_date`,
 `death_date`, `birthplace`, `homepage`, `tmdb_id`, `imdb_id`, and `tvdb_id`.
@@ -268,14 +303,13 @@ no optimistic concurrency or durable replay guarantee.
 
 Both operations require acting-administrator authorization, remain registered
 when unavailable, and are non-retryable. Existing web editor actions disable
-mutation retries and authentication replay. Apple, Android, and Jellyfin have
-no corresponding administrator callers. Frozen v1 responses remain unchanged.
+mutation retries and authentication replay.
 
 ## Metadata translation jobs
 
 These item routes use the `metadata_curation` permission, including delegated
 curators, rather than requiring a server administrator. The item in the URL
-is checked by the same permission middleware used by the frozen v1 routes.
+is checked by the item-scoped permission middleware.
 
 | Endpoint | Result |
 | --- | --- |
@@ -305,8 +339,8 @@ to the authorized content ID before invoking the service; a mismatch returns
 promise that a running job has already stopped. Existing terminal jobs are a no-op.
 
 Enqueue and cancellation have no durable request replay receipt. The web enqueue
-mutation disables both mutation retries and authentication replay. No existing
-web cancel control, native administrator caller, or Jellyfin equivalent exists.
+mutation disables both mutation retries and authentication replay. The web has
+no cancel control.
 
 ### Library prewarm
 
@@ -341,11 +375,42 @@ library deleted while it ran can still be stopped.
 ## Item metadata edits and refresh
 
 `POST /api/v2/admin/items/{id}/refresh-metadata` accepts `mode: "quick"` (the
-default) or `mode: "complete"`. The existing resolver chooses the refresh scope,
-then a job is persisted with the requesting account ID. Success is `202` with
-the typed administrator job, a job `Location`, and `Retry-After: 5`. Delegated
-curators receive the permitted job projection and can poll their own item jobs.
-The web waits on that job; it does not equate submission with completion.
+default), `mode: "complete"` or `mode: "reset"`. The existing resolver chooses
+the refresh scope, then a job is persisted with the requesting account ID.
+Success is `202` with the typed administrator job, a job `Location`, and
+`Retry-After: 5`. Delegated curators receive the permitted job projection and
+can poll their own item jobs. The web waits on that job; it does not equate
+submission with completion.
+
+`complete` clears the file links in the refresh scope and rescans it, so the
+files are matched again. A podcast library keeps its links: the podcast scanner
+finds a show through them and rewrites the show and its episodes from their tags
+on every scan, so clearing them would replace the show and episode IDs that
+favorites and progress refer to. An audiobook or ebook runs `complete` as
+`reset`: the book scanners find a book only through its linked files, so
+clearing them would give the book a new content ID and leave its progress,
+favorites and provider IDs on the old one.
+
+`reset` is Reset to Provider: a quick refresh of the movie, series, season or
+episode that also removes its `locked_fields` and gives every lockable field,
+the credits and the rating sources the providers' values, empty when no
+provider has one. A season or episode the providers don't list is emptied too.
+A refresh keeps a stored value a provider sends empty, because it can't tell a
+value the provider lacks from one it failed to send; a reset clears it. So a
+reset fails, and the target keeps its values and locks, when a provider in the
+chain fails to answer, including a search and a fallback-language lookup. A
+not-found answer, or an enrichment provider whose key is missing or rejected, doesn't fail
+it. A reset of an item pinned unmatched fails too, since no provider describes
+it, and a reset whose write merges the item onto another existing item leaves
+that item's edits and locks alone. A reset through a library whose metadata language
+isn't the item's own writes that language's text to the localization rows, as
+any refresh does, and keeps the base row's title, overview and tagline. When
+the refresh adopts that language as the item's own, because every library
+holding the item uses it, the base row is rewritten in it instead. Clients
+that can't read the capability document, such as delegated curators, can send
+`reset` and treat a `422` as a server without it. A
+series reset leaves its seasons' and episodes' locks alone, and artwork follows
+the ordinary refresh rules.
 
 `PATCH /api/v2/admin/items/{id}/metadata` retains the existing partial metadata
 fields, including descriptions, dates, ratings, provider IDs, numbering and
@@ -360,13 +425,46 @@ dates. `null` on any other field preserves its value. Explicit empty strings,
 zeroes, and empty arrays remain edits. An air timezone must be empty or a valid
 IANA timezone. A date must be a `YYYY-MM-DD` calendar date; any other string,
 an empty one included, is `422 validation_failed` at that member and nothing is
-written. `status` is the item's match status and must be `pending`, `matched`,
-or `unmatched`; any other value fails with `422`. Frozen v1 treats `null` like
-omission, clears nothing, and does not check dates. The service tries item,
+written. `imdb_id`, `tmdb_id` and `tvdb_id` are stored trimmed, an IMDb ID in
+lowercase, and a TMDB ID without the slug of a TMDB URL (`550-fight-club` saves as
+`550`). An empty string clears the ID. Any other value that isn't an IMDb title ID
+(`tt` and 7 to 10 digits) or a positive TMDB or TVDB number is
+`422 validation_failed` at that member. On an item (not a season or episode), an
+edit that changes an ID also replaces the item's durable provider ID for that
+provider, which lookups and refreshes read, or removes it when the ID is cleared.
+An ID resent unchanged (compared trimmed and in any case) leaves the durable ID as
+it is. When another item of the
+same type already holds the new ID, only the column changes, and the next refresh
+settles which item keeps it. `status` is the item's match status and must be `pending`, `matched`,
+or `unmatched`; any other value fails with `422`. The service tries item,
 season, then episode ownership and returns canonical catalog detail after the
 update and existing invalidation events.
 A follow-up detail-read failure can occur after persistence; it does not roll
 back the metadata change.
+
+A season stores `title`, `original_title`, `overview`, `tagline`, `air_date`,
+`season_number` and the `imdb_id`, `tmdb_id` and `tvdb_id` provider IDs. An
+episode stores the same text fields and IDs, plus `sort_title`,
+`episode_number`, `runtime`, `rating_imdb` and `rating_tmdb`. A season has no
+`sort_title`, since seasons order by number, and neither stores a
+`content_rating`: the series' rating decides age limits for its episodes. No
+metadata provider writes a season's or episode's original title or tagline, an
+episode's sort title, or a season's IDs, so a refresh keeps them without a lock.
+A refresh does write an episode's IDs. Reset to Provider empties them, except
+that a reset in another language than the series' own keeps the sort title,
+original title and tagline, as it keeps the title and overview.
+
+`locked_fields` holds the `MetadataField` numbers a refresh, library scan or
+seed import must keep. A season accepts the name, overview and release-date
+locks, which cover its title, overview and air date; an episode also accepts the
+runtime lock. Any other number on those targets is dropped without an error:
+their artwork locks on the parent series, and their numbers can't lock because
+refreshes find the rows by them. Each row's locks are its own, so clearing a
+series' locks leaves its seasons' and episodes' in place. A correction that
+replaces the show, by an Identify or a corrected NFO, clears the season and
+episode locks, resets the values they held and empties the title details above;
+an Identify that confirms the same show keeps them. A locked title or overview
+shows in every language unless a manual or AI translation of the overview exists.
 
 Both operations preserve item-scoped `metadata_curation` authorization and are
 non-retryable. Web actions disable both mutation retries and authentication
@@ -401,14 +499,13 @@ effort, and movies never get local intros.
   on; when none remain, it returns a `409` conflict whose detail names the
   kinds that are off, such as `Credits detection is turned off in marker
   settings`. A movie counts as a credits request.
-- `redetect-intro` ports the v1 route and, like the v1 `refresh-markers` and
-  `redetect-intro` routes, finds episode intros only, whatever the detection
-  settings say.
+- `redetect-intro` finds episode intros only, whatever the detection settings
+  say.
 
 For local analysis the item must exist, have media files, and have at least
 one in a library with marker detection enabled: a series or mixed library for
 an episode, a movie or mixed library for a movie. An item of the wrong type
-returns a `422` validation problem (`400` on v1): anything but an episode for
+returns a `422` validation problem: anything but an episode for
 `redetect-intro` and `redetect-markers` with `intro`, and anything but an
 episode or a movie otherwise. Marker settings must allow local analysis; off
 and online-only modes return `409`. Unconfigured dependencies return `503`.
@@ -436,14 +533,12 @@ analysis, together with any work queued behind it, already covers reports
 intro-only analysis runs, reports `queued` and runs just those kinds once the
 running analysis finishes. While an online `refresh-markers` runs, every other
 request for the item reports `already_running`, and a `refresh-markers` that
-would run online reports `already_running` while local analysis runs. The
-frozen v1 routes also report `already_running` while any analysis of the item
-runs and never queue. Successful analysis retains the existing marker-update
+would run online reports `already_running` while local analysis runs. Successful analysis retains the existing marker-update
 notifications.
 
 The operations are non-retryable. The web re-detection actions disable mutation
-retries and authentication replay. No native administrator caller or matching
-Jellyfin action exists; playback marker reads remain separate.
+retries and authentication replay. Playback marker reads are separate; see
+[markers-api.md](markers-api.md).
 
 ## Seek preview administration
 
@@ -504,9 +599,7 @@ enabled, opted-in video library. All three return `503` `dependency_unavailable`
 when the service is unconfigured, and `500` `internal_error` on an unexpected service
 failure, using the common Problem response. Ordinary profiles receive `403`
 `permission_denied`; authentication failures use the common `401` problems.
-Web administration uses these operations. Apple, Android, and Jellyfin have
-no corresponding administration callers; their playback preview reads are
-separate.
+Playback preview reads are separate.
 
 ## Marker edit history
 
@@ -522,8 +615,7 @@ Audit, file, account and API-key IDs are opaque strings. Timestamps are canonica
 UTC instants. Before/after snapshots use `start_seconds` and `end_seconds`; an
 absent snapshot means no marker existed on that side of the edit. Existing admin
 attribution and request audit fields remain available. The web history views
-preserve string IDs and adapt absent snapshots for display. Native clients and
-Jellyfin have no corresponding administration callers.
+preserve string IDs and adapt absent snapshots for display.
 
 ## Marker providers
 
@@ -533,8 +625,7 @@ strings. `PUT /api/v2/admin/markers/providers/{provider}` retains partial-update
 semantics: omitted/null members preserve current values; explicit false and zero
 remain edits. Confidence must be between 0 and 1. `fetch_min_confidence`,
 default 0, leaves the provider's markers rated below it out of lookups; see
-[markers-api.md](markers-api.md#provider-modes-and-storage). It is v2-only: the
-frozen v1 provider routes neither return nor accept it. Persistence and the
+[markers-api.md](markers-api.md#provider-modes-and-storage). Persistence and the
 existing configuration event run synchronously; there is no revision
 precondition or whole-operation replay receipt.
 
@@ -543,7 +634,6 @@ contribution statistics. It returns `200` with `valid: true` and typed statistic
 or `valid: false` and a generic error without the provider's raw error text.
 Providers that cannot submit return a validation Problem. All three operations
 require acting-administrator access. Web mutations disable both retry layers.
-No native client or Jellyfin administration caller requires migration.
 
 ## Marker contributions
 
@@ -568,8 +658,7 @@ bind the operation, account/profile/access scope, file, limit and sort. This is
 live history: a row updated during traversal may move ahead of the current page;
 there is no snapshot or lossless synchronization guarantee. File IDs are strings,
 instants are canonical UTC, and the explicitly named millisecond fields retain
-their existing units. Frozen v1 keeps its original full-list transport. No
-first-party web/native or Jellyfin administration callers were found.
+their existing units.
 
 ## File grouping repair
 
@@ -592,23 +681,33 @@ account IDs and canonical watched-at instants.
 existing merge and best-effort target refresh. Neither mutation supplies a
 whole-request replay receipt; both are non-retryable. The split web action
 disables mutation retries and authentication replay, including dry runs. All
-three operations require acting-administrator access. No native or Jellyfin
-administration caller was found; frozen v1 adapters retain their original wire
-shapes and behavior.
+three operations require acting-administrator access.
 
 Explicit split/merge and match/apply re-check each existing source and destination
 against the current transaction's complete library memberships before identity or
 state movement. Delegated metadata curators must cover every library of each item;
 an existing item with no memberships is refused. A newly inserted split target
 inherits only the authorized selected-file libraries. Concurrent target creation
-is treated as an existing target. V2 split/merge retain acting-administrator access;
-the frozen v1 bridge retains delegated curation under the same library policy, but
-its split result carries `ambiguous_history` samples only for the acting
-administrator (curators still get every count).
-A policy refusal returns 403: the v1 bridge uses its legacy `forbidden` error
-envelope, and v2 match/apply a `permission_denied` problem. Each refused
+is treated as an existing target. Split and merge require acting-administrator
+access. A policy refusal returns a 403 `permission_denied` problem. Each refused
 transaction rolls back; the multi-step match pipeline has no whole-request atomicity
 guarantee. Detached split identification retains the originating curation authority.
+
+Provider IDs a delegated curator stores are held to the same policy, because work
+that runs later with no curator present acts on them: a refresh, a refresh-debt
+retry or a scheduled refresh merges the item onto the item already at the anchor
+the IDs derive or holding one of them. A metadata edit that changes `tmdb_id`,
+`imdb_id` or `tvdb_id`, and a split that creates a target from chosen provider IDs,
+lock and authorise every such existing item (other than the edited item, or the
+split source and target) and are refused with 403 when one is out of scope. Unchanged
+IDs a form resends are not re-checked. An item refresh job a delegated curator
+queues records the curator's assigned libraries in its payload (`curation_scope`)
+and runs its metadata refresh under that scope on whichever node claims it; the job
+checks that snapshot rather than a fresh policy decision. A refresh refused for
+curation scope records no refresh failure or refresh debt, since debt retries run as
+automatic work. IDs a provider adds during a later automatic refresh, and identity
+overrides a split persists for scans, are not curator choices and converge as
+automatic work does.
 
 ### Match repair
 
@@ -619,7 +718,7 @@ Library IDs are strings. Search preserves the existing provider-ID
 normalization, library selection and provider ranking. An empty `title` falls
 back to the item's title; an absent `year` searches without a year, because the
 stored year belongs to the current match, which is usually the one being
-corrected. The frozen v1 route keeps its fallback to the stored year.
+corrected.
 Search's optional `limit` defaults to 100 and accepts 1–500. The response contains
 `candidates` (never null) and `truncated`; refine the search when truncated.
 This bounds the response, not the provider fetch or normalization work, and
@@ -643,9 +742,7 @@ corrects moves to the ID its new identity derives (see
 Callers holding the old ID should switch to the returned one. Apply records the
 choice on the item: later refreshes keep it when a local `.nfo` names another
 title, instead of re-matching to the file's `<uniqueid>`. Neither web mutation automatically retries or refreshes
-and replays authentication. Frozen v1 responses and parsing order remain
-unchanged. These administration flows have web consumers; Apple, Android and
-Jellyfin have no corresponding caller in the migration inventory.
+and replays authentication.
 
 ### Unmatched files
 
@@ -654,8 +751,7 @@ an extra association. Acting administrators receive `items` and `page`; file and
 library IDs are strings. `limit` defaults to 50 and accepts 1–200. SQL applies the
 ID-ascending keyset and limit before scanning rows. Signed cursors bind the
 operation, authority and page size. This is a live collection: concurrently
-matched files may disappear. Frozen v1 retains its offset pagination and raw
-array. No current web, native or Jellyfin consumer needs migration for this route.
+matched files may disappear.
 
 ### Item image selection
 
@@ -692,7 +788,7 @@ with its local choices and reports the failure under `chain` in
 uploaded poster, backdrop or logo, or a season shows an uploaded poster, the
 list also offers that image as a `local` choice, after the sidecar choices,
 with an `upload://` `original_url` and a display URL for the stored image. An
-upload that has since been replaced is not listed. Frozen v1 lists provider choices only. See
+upload that has since been replaced is not listed. See
 [Local NFO metadata](architecture/local-nfo-metadata.md#admin-image-picker).
 
 `POST /api/v2/admin/items/{id}/images/apply` accepts `original_url`, `type`, and
@@ -715,15 +811,13 @@ discovery offers that file for that image type; anything else returns a `422`
 validation problem. A failure to read or cache an offered file returns `500`.
 An `upload://` `original_url` publishes the uploaded image the target shows
 for that type again; any other upload returns `422`, since an upload is
-stored nowhere else. Frozen v1 does not accept local files or uploads.
-It preserves target validation before remote work,
+stored nowhere else.
+The operation preserves target validation before remote work,
 episode-to-still coercion, parent/season/episode cache identity, immutable upload,
 transactional catalog publication and orphan-GC scheduling after publication
 failure. Success returns the stored path, thumbhash and available revision/display
 URL. This is synchronous and may fail after upload; it is not a persisted job
-or replay-safe operation. Both web retry layers are disabled. Frozen v1 retains
-its response shapes and error codes. No native or Jellyfin caller is present in
-the migration inventory.
+or replay-safe operation. Both web retry layers are disabled.
 
 `POST /api/v2/admin/items/{id}/images/upload` takes a multipart form with
 `type` (`poster`, `backdrop` or `logo`) and `image`, a JPEG, PNG or WebP file
@@ -739,5 +833,5 @@ image, with the same
 images lock, source record (`upload://` and the image's SHA-256), orphan
 cleanup and response. The upload replaces the current image of its type, and
 the replaced revision is collected after the usual grace period. It is
-synchronous and non-retryable, and has no v1 route. The web metadata editor is
+synchronous and non-retryable. The web metadata editor is
 its only caller.

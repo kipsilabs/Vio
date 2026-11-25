@@ -104,7 +104,7 @@ func dv8HDR10PlusRuntimeCorrectionV3(source SourceDescriptorV3, request StartReq
 // remains available when its native container claim is valid.
 func firefoxMatroskaAACTimingQuirkV3(source SourceDescriptorV3, request StartRequestV3) (*AppliedQuirkV3, bool) {
 	container := strings.ToLower(strings.TrimSpace(source.Container))
-	if !isFirefoxWebV3(request) || (container != containerMKVV3 && container != "matroska") ||
+	if !isFirefoxWebV3(request) || (container != containerMKVV3 && container != containerMatroskaV3) ||
 		!strings.EqualFold(strings.TrimSpace(source.AudioCodec), audioCodecAACV3) {
 		return nil, false
 	}
@@ -122,7 +122,9 @@ func firefoxMatroskaAACTimingQuirkV3(source SourceDescriptorV3, request StartReq
 // starts past zero. A seeked stream copy begins at the keyframe before the
 // requested position, and the RASL pictures that precede that CRA in
 // presentation order reference frames the copy never sent. macOS Firefox
-// rejects the stream at that boundary instead of skipping them.
+// rejects the stream at that boundary instead of skipping them, and it also
+// shows nothing from a stream that starts on a CRA at all, so the remux leads
+// the copy with the source's first frame (see remuxIDRPrimer).
 func firefoxMacOSHEVCResumeLeadingPictureDropV3(source SourceDescriptorV3, request StartRequestV3) bool {
 	if !isFirefoxWebV3(request) || normalizeCodecV3(source.VideoCodec) != transcodeCodecHEVC {
 		return false

@@ -1,8 +1,7 @@
 # Library diagnostics API
 
-The native v2 library administration operations are acting-admin operations. Their
+The native library administration operations are acting-admin operations. Their
 complete request and response schemas are generated in `contracts/api/v2/openapi.json`.
-The frozen v1 bridge keeps its existing responses.
 
 `GET /api/v2/libraries/roots`, `GET /api/v2/libraries/skipped-roots`,
 `GET /api/v2/libraries/stale-ids`, and `GET /api/v2/libraries/unmatched-items` return
@@ -36,11 +35,12 @@ deletion and metadata-refresh jobs return their canonical job URI in `Location`.
 ## Unmatched items
 
 `GET /api/v2/libraries/unmatched-items` (`listUnmatchedItems`) lists the items still
-`unmatched`, `pending`, or `ambiguous`, in title order. It leaves out items in no
+`unmatched`, `pending`, or `ambiguous`, in title order. Audiobooks have no such status;
+one is listed as `unmatched` when enrichment found no provider match for it or its
+providers kept failing, and leaves the list once matched. It leaves out items in no
 library, such as one whose file was renamed away and that the scanner's file removal
 grace still holds. It also leaves out items an administrator marked as intentionally
-unmatched; with `ignored=true` it lists only those, each with `ignored_at`. The cursor is bound to `q` and `ignored`. The frozen v1
-listing also leaves ignored items out; its response shape is unchanged.
+unmatched; with `ignored=true` it lists only those, each with `ignored_at`. The cursor is bound to `q` and `ignored`.
 
 `PUT /api/v2/libraries/unmatched-items/{content_id}/ignore` (`ignoreUnmatchedItem`)
 marks a movie or series as intentionally unmatched, for media no provider lists. It
@@ -67,15 +67,13 @@ path, so a renamed or moved file comes back as a new unmatched item.
 
 ## Real-time monitoring
 
-The v2 library resource carries `realtime_monitoring`, the library's real-time
+The library resource carries `realtime_monitoring`, the library's real-time
 monitoring switch: scan automatically when files in the library's folders
 change. It appears on every library read, is optional on `createLibrary`
 (omitted means `true`), and is an optional, non-nullable member of the
 `updateLibrary` body (omitted leaves it unchanged). Existing libraries have it
 on. Monitoring takes effect only while the server-wide
 `scanner.realtime_monitoring` setting is on and the library is enabled.
-The frozen `/api/v1` library routes neither return nor accept the member, and a
-v1 update leaves it unchanged.
 
 `GET /api/v2/libraries/realtime-monitoring` (`getLibraryRealtimeMonitoring`,
 administrators only) reports whether monitoring works for each library. The body

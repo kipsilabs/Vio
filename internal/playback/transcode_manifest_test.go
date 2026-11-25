@@ -293,6 +293,117 @@ func TestBuildPlaybackManifest_EncodedTranscodeUsesSyntheticVODManifest(t *testi
 	}
 }
 
+// A resume generation starts at the segment boundary before the requested
+// position. Listing the segments before it advertised media the generation
+// cannot produce; a player prefetching the playlist's first entry requested
+// one, and the segment layer restarted a healthy encoder for it.
+func TestGenerateFullManifestStartsAtSeekAnchor(t *testing.T) {
+	session := &TranscodeSession{opts: TranscodeOpts{
+		TargetCodecVideo: "h264",
+		TargetCodecAudio: "aac",
+		SegmentDuration:  2,
+		TotalDuration:    9010,
+		SeekSeconds:      1632,
+		// The v3 resume plan publishes the seek anchor as the transport origin.
+		StreamOriginSeconds: 1632,
+		StartSegmentNumber:  816,
+	}}
+
+	text := string(session.GenerateFullManifest("segment/", "token=test"))
+	for _, want := range []string{
+		"#EXT-X-PLAYLIST-TYPE:VOD",
+		"#EXT-X-MEDIA-SEQUENCE:816",
+		"segment/seg_00816.ts?token=test",
+		"segment/seg_04504.ts?token=test",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("resume manifest missing %q:\n%s", want, text)
+		}
+	}
+	for _, unwanted := range []string{"seg_00000", "seg_00815"} {
+		if strings.Contains(text, unwanted) {
+			t.Fatalf("resume manifest advertises unproducible segment %q:\n%s", unwanted, text)
+		}
+	}
+
+	timeline, err := parseManifestTimeline([]byte(text))
+	if err != nil {
+		t.Fatalf("parse manifest: %v", err)
+	}
+	if len(timeline.entries) != 4505-816 || timeline.entries[0].number != 816 {
+		t.Fatalf("manifest lists %d entries starting at %d, want %d from 816",
+			len(timeline.entries), timeline.entries[0].number, 4505-816)
+	}
+}
+
+// A session that began at the source start restarts at a later segment when the
+// player seeks; its playlist must keep the whole source timeline so those
+// positions stay addressable.
+func TestGenerateFullManifestKeepsWholeTimelineAfterSourceZeroRestart(t *testing.T) {
+	session := &TranscodeSession{opts: TranscodeOpts{
+		TargetCodecVideo:   "h264",
+		TargetCodecAudio:   "aac",
+		SegmentDuration:    2,
+		TotalDuration:      20,
+		SeekSeconds:        16,
+		StartSegmentNumber: 8,
+	}}
+
+	text := string(session.GenerateFullManifest("", ""))
+	for _, want := range []string{"#EXT-X-MEDIA-SEQUENCE:0", "seg_00000.ts", "seg_00009.ts"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("source-zero restart manifest missing %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "#EXT-X-MEDIA-SEQUENCE:8") {
+		t.Fatalf("source-zero restart manifest moved its timeline to the restart segment:\n%s", text)
+	}
+}
+
+func TestSegmentRecoveryDecisionLeavesBeforeAnchorRequestsToTheClient(t *testing.T) {
+	session := &TranscodeSession{
+		outputDir: t.TempDir(),
+		running:   true,
+		opts: TranscodeOpts{
+			TargetCodecVideo:    "h264",
+			SegmentDuration:     2,
+			TotalDuration:       9010,
+			StartSegmentNumber:  816,
+			StreamOriginSeconds: 1632,
+		},
+	}
+
+	before := session.SegmentRecoveryDecision(0, time.Now())
+	if before.Wait || before.RestartOnTimeout || before.Reason != "before_playlist_start" {
+		t.Fatalf("before-anchor decision = %#v, want no wait and no restart", before)
+	}
+
+	resume := session.SegmentRecoveryDecision(816, time.Now())
+	if !resume.Wait || resume.RestartOnTimeout || resume.Reason != "startup_manifest_not_ready" {
+		t.Fatalf("resume-segment decision = %#v, want a startup wait", resume)
+	}
+}
+
+// A whole-timeline session keeps the historical recovery: a backward request
+// restarts FFmpeg at that segment, because its playlist still lists it.
+func TestSegmentRecoveryDecisionRestartsBackwardSeekOnWholeTimeline(t *testing.T) {
+	session := &TranscodeSession{
+		outputDir: t.TempDir(),
+		running:   true,
+		opts: TranscodeOpts{
+			TargetCodecVideo:   "h264",
+			SegmentDuration:    2,
+			TotalDuration:      9010,
+			StartSegmentNumber: 600,
+		},
+	}
+
+	decision := session.SegmentRecoveryDecision(0, time.Now())
+	if !decision.RestartOnTimeout || decision.Reason != "before_start_segment" {
+		t.Fatalf("backward-seek decision = %#v, want a seek restart", decision)
+	}
+}
+
 // TestLongTitlePlaylistsCarryTheSignedQueryOnce renders each path that builds
 // or rewrites a v3 media playlist, for a client that negotiated
 // hls_variable_substitution_v1, and checks a four-hour title stays well under
@@ -1787,5 +1898,64 @@ func TestWaitForOpenSegmentWithStallAllowsGrowingPartialSegment(t *testing.T) {
 	<-done
 	if !errors.Is(err, ErrSegmentNotFound) {
 		t.Fatalf("wait with a growing partial segment = %v, want timeout, not a stall verdict", err)
+	}
+}
+
+// A client that has fetched all but at most one produced segment is waiting
+// on the encoder: its stall says nothing about the link. A running encoder
+// that is ahead of the client, or one that has finished, is not. A segment
+// counts as fetched once its download completed, so a restart's first
+// segment still in flight on a slow link is not.
+func TestTranscodeOutputBoundsClient(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		running   bool
+		start     int
+		produced  int
+		completed int
+		// stale writes the manifest before the running FFmpeg started: it is
+		// an earlier generation's, and this one has produced nothing yet.
+		stale bool
+		// restarting is a restart between FFmpeg processes: nothing runs, and
+		// the client waits on the server.
+		restarting bool
+		// failed is an FFmpeg that exited with an error: the client waits on
+		// a server fault, not the link.
+		failed bool
+		want   bool
+	}{
+		{name: "client at produced head", running: true, produced: 4, completed: 4, want: true},
+		{name: "head segment not yet fetched", running: true, produced: 5, completed: 4, want: true},
+		{name: "encoder ahead of the client", running: true, produced: 40, completed: 4, want: false},
+		{name: "encoder finished", running: false, produced: 4, completed: 4, want: false},
+		{name: "encoder failed with the client at its output", running: false, failed: true, produced: 4, completed: 4, want: true},
+		{name: "encoder failed far ahead of the client", running: false, failed: true, produced: 40, completed: 4, want: false},
+		{name: "restart with both new segments still undelivered", running: true, start: 100, produced: 101, completed: 99, want: false},
+		{name: "restart whose first segment is still being encoded", running: true, start: 100, produced: -1, completed: 99, want: true},
+		{name: "restart in flight", restarting: true, produced: 40, completed: 9, want: true},
+		{name: "restart still stopping the old encoder", running: true, restarting: true, produced: 40, completed: 9, want: true},
+		{name: "earlier generation's output far ahead of a restart", running: true, start: 10, produced: 40, completed: 9, stale: true, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			opts := TranscodeOpts{TargetCodecVideo: "h264", SegmentDuration: 2, StartSegmentNumber: tc.start}
+			if tc.produced >= 0 {
+				writeManifestRange(t, dir, 0, tc.produced, ".ts")
+				writeSegmentFile(t, dir, segmentFilename(tc.produced, opts), []byte("x"), time.Now())
+			}
+			session := &TranscodeSession{outputDir: dir, running: tc.running, lastRequestedSegment: max(tc.completed, tc.start), lastCompletedSegment: tc.completed, opts: opts}
+			if tc.stale {
+				session.generationStartedAt = time.Now().Add(time.Minute)
+			}
+			if tc.restarting {
+				session.restarting = &restartFlight{}
+			}
+			if tc.failed {
+				session.waitErr = errors.New("exit status 1")
+			}
+			if got := session.OutputBoundsClient(); got != tc.want {
+				t.Fatalf("OutputBoundsClient() = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

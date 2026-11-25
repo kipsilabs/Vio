@@ -426,6 +426,8 @@ type itemListResponse struct {
 	MangaVolumeCount       *int                        `json:"manga_volume_count,omitempty"`
 	OverlaySummary         *models.OverlaySummary      `json:"overlay_summary,omitempty"`
 	SortMetrics            *sortMetricsResponse        `json:"sort_metrics,omitempty"`
+	ProgressUpdatedAt      *string                     `json:"-"`
+	ItemSource             string                      `json:"-"`
 	UserState              *itemUserStateResponse      `json:"user_state,omitempty"`
 	WorkID                 string                      `json:"work_id,omitempty"`
 	WorkTitle              string                      `json:"work_title,omitempty"`
@@ -631,9 +633,15 @@ func (h *ItemsHandler) HandleGetWatchDetail(w http.ResponseWriter, r *http.Reque
 	writeJSON(w, http.StatusOK, detail)
 }
 
-// prefetchVirtualFileIDs warms virtual candidate listings for raw file rows,
-// shared by watch-detail, item-detail, and episode-list triggers. Dedupes,
-// caps at 2, and runs fully off the response path.
+// prefetchVirtualFileIDs warms virtual candidate listings for raw file rows
+// surfaced by the item-detail, versions, and episode-list reads. Dedupes, caps
+// at 2, and runs fully off the response path.
+//
+// The watch detail is not a trigger: a v2 watch read runs its own candidate
+// discovery (which lists, persists, and seeds the play path's listing cache —
+// see PlaybackHandler.SeedVirtualListing) and warms the rows it lists, so a
+// list-only prefetch from that read would pay provider traffic discovery
+// already paid for.
 func (h *ItemsHandler) prefetchVirtualFileIDs(ctx context.Context, fileIDs []int, profileID string) {
 	if h == nil || h.virtualPrefetcher == nil || h.virtualFileByID == nil || profileID == "" {
 		return
@@ -1832,57 +1840,121 @@ func (h *ItemsHandler) listUserSortMetrics(
 			ratio := ebookProgress.Progress
 			metrics[item.ContentID] = &sortMetricsResponse{ProgressRatio: &ratio}
 		}
-	case "date_viewed", "plays":
+	case "date_viewed":
+		h.listViewedAtSortMetrics(ctx, items, contentIDs, store, profileID, progressMap, ebookProgressMap, metrics)
+	case "plays":
 		history, err := listCompletedHistoryForItems(ctx, store, profileID, contentIDs)
 		if err != nil {
 			return
 		}
 		historyCounts := make(map[string]int, len(contentIDs))
-		historyViewedAt := make(map[string]string, len(contentIDs))
 		for _, entry := range history {
 			if entry.MediaItemID == "" {
 				continue
 			}
 			historyCounts[entry.MediaItemID]++
-			if entry.WatchedAt > historyViewedAt[entry.MediaItemID] {
-				historyViewedAt[entry.MediaItemID] = entry.WatchedAt
-			}
 		}
 		for _, item := range items {
 			if item == nil || item.ContentID == "" {
 				continue
 			}
-			resp := &sortMetricsResponse{}
-			if sortField == "date_viewed" {
-				viewedAt := historyViewedAt[item.ContentID]
-				if progress, ok := progressMap[item.ContentID]; ok && progress.Completed && progress.UpdatedAt > viewedAt {
-					viewedAt = progress.UpdatedAt
-				}
-				if progress, ok := ebookProgressMap[item.ContentID]; ok && progress.Progress >= models.EbookFinishedProgressThreshold {
-					ebookViewedAt := progress.UpdatedAt.UTC().Format(time.RFC3339)
-					if ebookViewedAt > viewedAt {
-						viewedAt = ebookViewedAt
-					}
-				}
-				if viewedAt == "" {
-					continue
-				}
-				resp.ViewedAt = viewedAt
-			} else {
-				playCount := historyCounts[item.ContentID]
-				if progress, ok := progressMap[item.ContentID]; ok && progress.Completed && playCount < 1 {
-					playCount = 1
-				}
-				if progress, ok := ebookProgressMap[item.ContentID]; ok && progress.Progress >= models.EbookFinishedProgressThreshold && playCount < 1 {
-					playCount = 1
-				}
-				if playCount <= 0 {
-					continue
-				}
-				resp.PlayCount = &playCount
+			playCount := historyCounts[item.ContentID]
+			if progress, ok := progressMap[item.ContentID]; ok && progress.Completed && playCount < 1 {
+				playCount = 1
 			}
-			metrics[item.ContentID] = resp
+			if progress, ok := ebookProgressMap[item.ContentID]; ok && progress.Progress >= models.EbookFinishedProgressThreshold && playCount < 1 {
+				playCount = 1
+			}
+			if playCount <= 0 {
+				continue
+			}
+			metrics[item.ContentID] = &sortMetricsResponse{PlayCount: &playCount}
 		}
+	}
+}
+
+// seriesItemIDs is the distinct series among items. A listing knows them
+// before it assembles its cards, so it can count their seasons alongside its
+// other card lookups instead of after them.
+func seriesItemIDs(items []*models.MediaItem) []string {
+	var ids []string
+	seen := map[string]struct{}{}
+	for _, item := range items {
+		if item == nil || item.Type != itemTypeSeries || item.ContentID == "" {
+			continue
+		}
+		if _, ok := seen[item.ContentID]; ok {
+			continue
+		}
+		seen[item.ContentID] = struct{}{}
+		ids = append(ids, item.ContentID)
+	}
+	return ids
+}
+
+// listSeriesViewedAt returns when the profile last finished an episode of
+// each series in items. Without the store's rollup, or when it fails, series
+// go undated but other titles still are.
+func listSeriesViewedAt(ctx context.Context, items []*models.MediaItem, store userstore.UserStore, profileID string) map[string]string {
+	seriesIDs := seriesItemIDs(items)
+	rollup, ok := store.(userstore.SeriesEpisodeRollupStore)
+	if len(seriesIDs) == 0 || !ok {
+		return nil
+	}
+	viewed, err := rollup.SeriesLatestViewedAt(ctx, profileID, seriesIDs)
+	if err != nil {
+		slog.Log(ctx, ctxerr.LogLevel(ctx, err, slog.LevelWarn), "listing series viewed times", "component", "api", "error", err)
+		return nil
+	}
+	return viewed
+}
+
+// listViewedAtSortMetrics sets each item's latest finished play for a date
+// viewed sort. Plays are recorded against episodes, so a series takes the
+// latest of its episodes' plays, as the sort does (#4638).
+func (h *ItemsHandler) listViewedAtSortMetrics(
+	ctx context.Context,
+	items []*models.MediaItem,
+	contentIDs []string,
+	store userstore.UserStore,
+	profileID string,
+	progressMap map[string]userstore.WatchProgress,
+	ebookProgressMap map[string]EbookReaderProgress,
+	metrics map[string]*sortMetricsResponse,
+) {
+	seriesViewedAt := listSeriesViewedAt(ctx, items, store, profileID)
+	// One grouped read gives each item's latest visible play.
+	history, err := store.ListCompletedHistoryItems(ctx, userstore.CompletedHistoryItemQuery{
+		ProfileID:    profileID,
+		MediaItemIDs: contentIDs,
+	})
+	if err != nil {
+		return
+	}
+	historyViewedAt := make(map[string]string, len(history))
+	for _, entry := range history {
+		historyViewedAt[entry.MediaItemID] = entry.WatchedAt
+	}
+	for _, item := range items {
+		if item == nil || item.ContentID == "" {
+			continue
+		}
+		latest := historyViewedAt[item.ContentID]
+		if progress, ok := progressMap[item.ContentID]; ok && progress.Completed && progress.UpdatedAt > latest {
+			latest = progress.UpdatedAt
+		}
+		if seriesLatest := seriesViewedAt[item.ContentID]; seriesLatest > latest {
+			latest = seriesLatest
+		}
+		if progress, ok := ebookProgressMap[item.ContentID]; ok && progress.Progress >= models.EbookFinishedProgressThreshold {
+			if ebookViewedAt := progress.UpdatedAt.UTC().Format(time.RFC3339); ebookViewedAt > latest {
+				latest = ebookViewedAt
+			}
+		}
+		if latest == "" {
+			continue
+		}
+		metrics[item.ContentID] = &sortMetricsResponse{ViewedAt: latest}
 	}
 }
 
@@ -3048,31 +3120,6 @@ func hasMaskedMetadataCuration(ctx context.Context, user *models.User, groups ac
 		return false
 	}
 	return slices.Contains(auth.PolicyPermissions(effective), string(auth.PermissionMetadataCuration))
-}
-
-// prefetchWatchDetailVirtual warms virtual candidate listings for the rows a
-// watch detail offers, off the playback click path. Fire-and-forget:
-// PrefetchVirtualPlayback is already bounded (2 files), deduped, and runs on
-// a detached worker pool, so this never blocks the detail response. Only the
-// first virtual version is warmed; the start path ranks per device from the
-// neutral cache entry.
-func (h *ItemsHandler) prefetchWatchDetailVirtual(ctx context.Context, detail *catalog.WatchDetail, profileID string) {
-	if detail == nil {
-		return
-	}
-	if detail.Type != itemTypeMovie && detail.Type != itemTypeEpisode {
-		return
-	}
-	fileIDs := make([]int, 0, 2)
-	for _, v := range detail.Versions {
-		if v.FileID != 0 {
-			fileIDs = append(fileIDs, v.FileID)
-		}
-		if len(fileIDs) >= 2 {
-			break
-		}
-	}
-	h.prefetchVirtualFileIDs(ctx, fileIDs, profileID)
 }
 
 // HandleDelete handles DELETE /api/v1/admin/items/{id}.

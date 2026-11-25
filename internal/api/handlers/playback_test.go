@@ -495,6 +495,7 @@ else
   printf recovered > '` + filepath.Join(outputDir, "seg_00010.ts") + `'
   printf ahead > '` + filepath.Join(outputDir, "seg_00011.ts") + `'
 fi
+printf 'frame=48\nout_time_us=4000000\nprogress=continue\n'
 exec sleep 30
 `
 	if err := os.WriteFile(ffmpegPath, []byte(ffmpeg), 0o755); err != nil {
@@ -605,6 +606,12 @@ func playbackTestBoolInt(value bool) int {
 	return 0
 }
 
+// playbackTestFFmpegProgress is the -progress stream a real video encode writes
+// to stdout while it muxes. A fake transport that stands for a playable encode
+// must report decoded frames: the frame counter is what tells a decode that
+// produced pictures from one that only muxed audio.
+const playbackTestFFmpegProgress = "printf 'frame=48\\nout_time_us=4000000\\nprogress=continue\\n';\n"
+
 func writePlaybackTestFFmpegSleep(t *testing.T, sleepSeconds string) string {
 	t.Helper()
 
@@ -621,13 +628,14 @@ func writePlaybackTestFFmpegSleep(t *testing.T, sleepSeconds string) string {
 		"case \" $* \" in *\" -bsfs \"*|*\" -encoders \"*|*\" -f null - \"*) exit 0 ;; esac\n" +
 		"case \"$playlist\" in\n" +
 		"  *.m3u8) out=\"$(dirname \"$playlist\")\"; mkdir -p \"$out\"; " +
-		"printf x > \"$out/init.mp4\"; printf x > \"$out/seg_0.m4s\"; " +
+		"printf '\\000\\000\\000\\010ftyp\\000\\000\\000\\010moov' > \"$out/init.mp4\"; printf x > \"$out/seg_0.m4s\"; " +
 		"printf x > \"$out/seg_1.m4s\"; printf x > \"$out/seg_2.m4s\"; " +
 		"printf '#EXTM3U\\n#EXT-X-VERSION:7\\n#EXT-X-TARGETDURATION:2\\n" +
 		"#EXT-X-MEDIA-SEQUENCE:0\\n#EXT-X-MAP:URI=\"init.mp4\"\\n" +
 		"#EXTINF:2.0,\\nseg_0.m4s\\n#EXTINF:2.0,\\nseg_1.m4s\\n" +
 		"#EXTINF:2.0,\\nseg_2.m4s\\n' > \"$playlist\" ;;\n" +
 		"esac\n" +
+		playbackTestFFmpegProgress +
 		"exec sleep " + sleepSeconds + "\n"
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatalf("write fake ffmpeg: %v", err)
@@ -647,12 +655,13 @@ func writePlaybackTestFFmpegFailingAfterFirstStart(t *testing.T) string {
 		"last=\"\"\n" +
 		"for arg in \"$@\"; do last=\"$arg\"; done\n" +
 		"out=\"$(dirname \"$last\")\"; mkdir -p \"$out\"\n" +
-		"printf x > \"$out/init.mp4\"; printf x > \"$out/seg_0.m4s\"; " +
+		"printf '\\000\\000\\000\\010ftyp\\000\\000\\000\\010moov' > \"$out/init.mp4\"; printf x > \"$out/seg_0.m4s\"; " +
 		"printf x > \"$out/seg_1.m4s\"; printf x > \"$out/seg_2.m4s\"\n" +
 		"printf '#EXTM3U\\n#EXT-X-VERSION:7\\n#EXT-X-TARGETDURATION:2\\n" +
 		"#EXT-X-MEDIA-SEQUENCE:0\\n#EXT-X-MAP:URI=\"init.mp4\"\\n" +
 		"#EXTINF:2.0,\\nseg_0.m4s\\n#EXTINF:2.0,\\nseg_1.m4s\\n" +
 		"#EXTINF:2.0,\\nseg_2.m4s\\n' > \"$last\"\n" +
+		playbackTestFFmpegProgress +
 		"exec sleep 30\n"
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatalf("write fail-after-first fake ffmpeg: %v", err)
@@ -910,7 +919,9 @@ func TestHandleStartPlaybackV3_PersistsSeriesPlaybackPreferenceForEpisodes(t *te
 }
 
 // A start that never produced a session played nothing, so it must not teach
-// the series what the viewer prefers.
+// the series what the viewer prefers. The session manager's opaque error is a
+// server-side fault, which is answered as retryable rather than published as a
+// playback verdict, so this failure has no decision body at all.
 func TestHandleStartPlaybackV3_DoesNotPersistSeriesPlaybackPreferenceOnFailure(t *testing.T) {
 	store := newPlaybackTestStore(t)
 	file := v3HandlerFixtureFile(t)
@@ -927,16 +938,11 @@ func TestHandleStartPlaybackV3_DoesNotPersistSeriesPlaybackPreferenceOnFailure(t
 	rr := httptest.NewRecorder()
 	handler.HandleStartPlayback(rr, req)
 
-	// v3 reports playback outcomes in the body; the request itself was fine.
-	if rr.Code != http.StatusCreated {
-		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want the retryable dependency answer, body = %s", rr.Code, rr.Body.String())
 	}
-	var response playback.DecisionResponseV3
-	if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
-		t.Fatal(err)
-	}
-	if response.Terminal == nil || response.PlaybackPlan != nil {
-		t.Fatalf("expected a terminal with no plan, got %#v", response)
+	if got := rr.Header().Get("Retry-After"); got == "" {
+		t.Fatal("a server-side start fault must advertise Retry-After")
 	}
 
 	pref, err := store.GetSeriesPlaybackPreference(context.Background(), "profile-1", "series-1")
@@ -1453,7 +1459,7 @@ func TestPersistProgressRecordsEffectiveVirtualCandidate(t *testing.T) {
 		RequestedMediaFileID: requested.ID,
 		VirtualSourceURI:     candidate.FilePath,
 		Position:             240,
-	})
+	}, playback.ProgressSampleV3{Position: 240})
 
 	progress, err := store.GetProgress(context.Background(), "profile-1", "movie-1")
 	if err != nil {
@@ -1487,7 +1493,7 @@ func TestPersistProgressFallsBackWhenVirtualCandidateMissing(t *testing.T) {
 		RequestedMediaFileID: requested.ID,
 		VirtualSourceURI:     candidate.FilePath,
 		Position:             240,
-	})
+	}, playback.ProgressSampleV3{Position: 240})
 
 	progress, err := store.GetProgress(context.Background(), "profile-1", "movie-1")
 	if err != nil {

@@ -3,6 +3,8 @@ package backup
 import (
 	"slices"
 	"strings"
+
+	"github.com/Silo-Server/silo-server/internal/plugins"
 )
 
 // SettingKind is how a restore treats one server setting. Every setting
@@ -35,8 +37,8 @@ const (
 // in "." or "_"). The AI sign-in mode and models are this server's choice
 // among what its own AI providers and ChatGPT account offer, which only
 // they can validate.
-var serverSpecificSettings = strings.Fields(`
-	server.identity_id server.public_url server.local_url
+var serverSpecificSettings = append(strings.Fields(`
+	server.identity_id server.public_url server.local_url server.web_media_url
 	database. redis. userdb. storage. artwork. s3. backup. setup.
 	auth.jwt_secret audiobooks.abs.jwt_secret
 	ratelimit.
@@ -50,8 +52,8 @@ var serverSpecificSettings = strings.Fields(`
 	jellyfin_compat.public_url jellyfin_compat.web_install_dir
 	recommendations.embedding_provider_id recommendations.embedding_lock recommendations.policy_marked_generation
 	media_images. chapter_thumbnails. ui.dashboard.hidden_attention
-	virtual_library. remuxdb.
-`)
+	virtual_library. remuxdb. direct_connections.
+`), plugins.ProvisionRestoreHoldKey)
 
 // restoredSettings are the keys and prefixes restored as the backup has
 // them.
@@ -94,6 +96,8 @@ var restoredFlagSettings = map[string]string{
 	"notifications.discord.allow_per_episode":              "message granularity on a channel its own switch gates",
 	"notifications.email.allow_per_episode":                "message granularity on a channel its own switch gates",
 	"notifications.server_channels.mention_requesters":     "message content on channels their own switch gates",
+	"notifications.fanout_enabled":                         "fanout to the destinations the backup names",
+	"notifications.release_events_enabled":                 "release announcements on the channels their own switches gate",
 	"overlays.enabled":                                     "presentation",
 	"playback.allow_hevc_encoding":                         whyCapacity,
 	"playback.bandwidth_probe_automatic":                   whyTuning,

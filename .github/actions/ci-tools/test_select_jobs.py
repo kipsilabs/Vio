@@ -112,7 +112,7 @@ class GitSelectionTests(unittest.TestCase):
             ("web/public/vendor/pdfjs/pdf.worker.mjs", False, True),
             ("web/public/vendor/pdfjs/standard_fonts_other/font.pfb", False, True),
             ("internal/catalog/history.go", True, False),
-            ("internal/scenariocatalog/testdata/fixture.json", True, False),
+            ("internal/routeinventory/testdata/fixture.json", True, False),
             ("internal/policy/vendor/README.md", True, False),
             ("internal/userdb/testdata/schema.sql", True, False),
             ("internal/ebookconvert/mobitool.wasm", True, False),
@@ -125,13 +125,11 @@ class GitSelectionTests(unittest.TestCase):
             ("cmd/silo/main.go", True, False),
             ("scripts/ci/db-pins.txt", True, False),
             ("scripts/ci/db-contracts.txt", True, False),
-            ("contracts/api/v2/migration.json", True, False),
-            ("contracts/api/v2/migration.schema.json", True, False),
-            ("contracts/api/v2/offline-routes.txt", True, False),
             ("contracts/api/v2/breaking-approvals.json", True, False),
             (".github/actions/README.md", False, False),
             (".github/evidence.yml", False, False),
             (".github/ISSUE_TEMPLATE/bug-report.yml", False, False),
+            (".github/DISCUSSION_TEMPLATE/ideas.yml", False, False),
         ]
         for number, (path, go, web) in enumerate(cases):
             with self.subTest(path=path):
@@ -179,6 +177,34 @@ class GitSelectionTests(unittest.TestCase):
         self.repo.write("internal/apiv2/registry.go")
         self.repo.commit()
         self.assertEqual(self.repo.plan().get("paths"), ["internal/apiv2/registry.go"])
+
+    def test_web_binding_checks_run_only_when_inputs_or_outputs_change(self):
+        cases = [
+            ("web/src/components/Toast.tsx", False, False),
+            ("web/src/lib/settingsContract.ts", True, False),
+            ("contracts/settings/v1/manifest.json", True, False),
+            ("cmd/settingsgen/main.go", True, False),
+            ("internal/settingscontract/contract.go", True, False),
+            ("contracts/api/v2/openapi.json", False, True),
+            ("web/src/api/v2/schema.ts", False, True),
+            ("web/src/api/v2/operations.ts", False, True),
+            ("web/scripts/generate-apiv2.mjs", False, True),
+            ("web/package.json", True, True),
+            ("web/pnpm-lock.yaml", True, True),
+            ("web/.prettierrc", True, True),
+            ("Makefile", True, True),
+        ]
+        for number, (path, want_settings, want_apiv2) in enumerate(cases):
+            with self.subTest(path=path):
+                self.repo.base = self.repo.git("rev-parse", "HEAD")
+                self.repo.write(path, "binding test %s\n" % number)
+                self.repo.commit()
+                result = self.repo.plan()
+                self.assertIs(result["web_settings_binding"], want_settings, result)
+                self.assertIs(result["web_apiv2_types"], want_apiv2, result)
+        push_result = self.repo.plan(event={}, event_name="push")
+        self.assertIs(push_result["web_settings_binding"], True, push_result)
+        self.assertIs(push_result["web_apiv2_types"], True, push_result)
 
     def test_markdown_inside_schema_inputs_is_not_skipped_as_documentation(self):
         for path in (
@@ -422,13 +448,19 @@ class GitSelectionTests(unittest.TestCase):
                              env=environment, capture_output=True, text=True)
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assert_groups(json.loads(run.stdout), False, False)
-        self.assertEqual(output_path.read_text(), "go=false\nweb=false\n")
+        self.assertEqual(
+            output_path.read_text(),
+            "go=false\nweb=false\nweb_settings_binding=false\nweb_apiv2_types=false\n",
+        )
         event_path.write_text("not JSON")
         output_path.unlink()
         run = subprocess.run([sys.executable, str(SCRIPT), "plan"], cwd=self.repo.path,
                              env=environment, capture_output=True, text=True)
         self.assertEqual(run.returncode, 0, run.stderr)
-        self.assertEqual(output_path.read_text(), "go=true\nweb=true\n")
+        self.assertEqual(
+            output_path.read_text(),
+            "go=true\nweb=true\nweb_settings_binding=true\nweb_apiv2_types=true\n",
+        )
 
 
 class AggregateResultTests(unittest.TestCase):
@@ -657,28 +689,6 @@ class WorkflowGateTests(unittest.TestCase):
             run = subprocess.run(["bash", "-c", script], cwd=directory,
                                  capture_output=True, text=True)
             self.assertNotEqual(run.returncode, 0, "A missing Git input must fail")
-
-    def test_full_tree_tool_targets_exist(self):
-        run = subprocess.run(["make", "-n", "verify-actionlint", "verify-shellcheck"],
-                             cwd=self.root, capture_output=True, text=True)
-        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
-        self.assertIn("1.7.12", run.stdout)
-        self.assertIn("0.11.0", run.stdout)
-
-    def test_workflow_and_shell_tools_reject_seeded_defects(self):
-        missing = [tool for tool in ("actionlint", "shellcheck") if not shutil.which(tool)]
-        if missing:
-            self.skipTest("required tools not on PATH: " + ", ".join(missing))
-        workflow = "name: test\non: push\njobs:\n  test:\n    runs-on: ubuntu-24.04\n    steps:\n      - run: echo ok\n"
-        for contents, expected in ((workflow, 0), (workflow.replace("echo ok", "echo ${{ unknown.value }}"), 1)):
-            run = subprocess.run(["actionlint", "-oneline", "-"], input=contents,
-                                 cwd=self.root, capture_output=True, text=True)
-            self.assertEqual(run.returncode, expected, run.stdout + run.stderr)
-        for contents, expected in (("#!/bin/bash\nprintf '%s\\n' \"$1\"\n", 0),
-                                   ("#!/bin/bash\nprintf '%s\\n' $1\n", 1)):
-            run = subprocess.run(["shellcheck", "-s", "bash", "-"], input=contents,
-                                 cwd=self.root, capture_output=True, text=True)
-            self.assertEqual(run.returncode, expected, run.stdout + run.stderr)
 
 
 if __name__ == "__main__":

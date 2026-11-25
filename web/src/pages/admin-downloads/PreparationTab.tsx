@@ -31,16 +31,17 @@ import {
   useAdminDownloadPreparations,
 } from "@/hooks/queries/admin/downloadPreparations";
 import { useOperationalLogs } from "@/hooks/queries/admin/logs";
+import { useAppLanguage, useT, type MessageKey, type Translate } from "@/i18n";
 import { formatTime } from "@/lib/datetime";
 import { formatCodecLabel, formatFileSize } from "@/lib/mediaFormat";
 import { cn } from "@/lib/utils";
 import { activityMethodMeta } from "@/pages/adminActivityPresentation";
 import { CHECKBOX } from "./controls";
+import { downloadEntryStatus } from "./downloadStoragePresentation";
 import {
-  PREPARATION_STATES,
+  cancelPreparationsPrompt,
   canPausePreparation,
   canResumePreparation,
-  cancelPreparationsPrompt,
   formatAgo,
   formatClock,
   formatPreparationAudioOutput,
@@ -53,6 +54,8 @@ import {
   formatRemaining,
   formatRetryIn,
   formatSpeed,
+  jobCount,
+  PREPARATION_STATES,
   preparationPercent,
   preparationRemainingSeconds,
   preparationRunningLabel,
@@ -67,12 +70,34 @@ import {
   summarizePreparationAction,
   type PreparationState,
 } from "@/pages/adminDownloadPreparationPresentation";
+import { formatLocale } from "@/lib/appLocale";
+
+const K = "web.admin.downloads.preparation";
+const SEPARATOR = " · ";
+// Product and stream names, not translated.
+const FFMPEG = "FFmpeg";
+const STDERR = "stderr";
+
+const ACTION_FAILED: Record<AdminDownloadPreparationAction, MessageKey> = {
+  pause: `${K}.actionFailed.pause`,
+  resume: `${K}.actionFailed.resume`,
+  cancel: `${K}.actionFailed.cancel`,
+};
+
+const COLUMNS: readonly MessageKey[] = [
+  `${K}.column.title`,
+  `${K}.column.output`,
+  `${K}.column.worker`,
+  `${K}.column.progress`,
+  `${K}.column.requestedBy`,
+];
 
 const GRID =
   "grid-cols-[16px_minmax(180px,1.6fr)_minmax(190px,1.5fr)_minmax(100px,0.8fr)_minmax(200px,1.5fr)_minmax(150px,1fr)_112px]";
 
 /** Runs one administrator action and reports its outcome in a toast. */
 function usePreparationActions() {
+  const t = useT();
   const mutation = useAdminDownloadPreparationAction();
   const run = (
     action: AdminDownloadPreparationAction,
@@ -90,7 +115,7 @@ function usePreparationActions() {
           onDone?.();
         },
         onError: () => {
-          toast.error(`Couldn't ${action}. Check the list before trying again.`);
+          toast.error(t(ACTION_FAILED[action]));
         },
       },
     );
@@ -101,6 +126,9 @@ function usePreparationActions() {
 
 /** The preparation queue: running, queued, retrying and paused jobs, and recent failures. */
 export default function PreparationTab() {
+  const t = useT();
+  // Rows show text from the presentation helpers; re-render them on a language change.
+  useAppLanguage();
   const { data: list, isLoading, isError } = useAdminDownloadPreparations();
   const [search, setSearch] = useState("");
   const [stateFilter, setStateFilter] = useState<PreparationState | null>(null);
@@ -110,7 +138,8 @@ export default function PreparationTab() {
   const actions = usePreparationActions();
   const items = useMemo(() => list?.items ?? [], [list]);
 
-  const workers = useMemo(() => {
+  // Not memoized: the labels and search text are translated, so they follow the language.
+  const workers = (() => {
     const counts = new Map<string, { key: string; label: string; name: string; count: number }>();
     for (const item of items) {
       if (item.state !== "running") continue;
@@ -120,27 +149,23 @@ export default function PreparationTab() {
       counts.set(worker.key, { ...worker, count: (current?.count ?? 0) + 1 });
     }
     return [...counts.values()].sort((a, b) => b.count - a.count);
-  }, [items]);
+  })();
 
-  const filtered = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    return items.filter(
-      (item) =>
-        (!stateFilter || item.state === stateFilter) &&
-        (!workerFilter || preparationWorker(item)?.key === workerFilter) &&
-        (!q || preparationSearchText(item).includes(q)),
-    );
-  }, [items, search, stateFilter, workerFilter]);
+  const q = search.trim().toLowerCase();
+  const filtered = items.filter(
+    (item) =>
+      (!stateFilter || item.state === stateFilter) &&
+      (!workerFilter || preparationWorker(item)?.key === workerFilter) &&
+      (!q || preparationSearchText(item).includes(q)),
+  );
 
   if (isLoading && !list) {
-    return <div className="text-muted-foreground py-8 text-sm">Loading download preparation…</div>;
+    return <div className="text-muted-foreground py-8 text-sm">{t(`${K}.loading`)}</div>;
   }
   if (!list) {
     return (
       <EmptyState icon={<AlertTriangle className="mb-3 h-8 w-8 opacity-20" />}>
-        {isError
-          ? "Download preparation is not available on this server."
-          : "No downloads being prepared"}
+        {isError ? t(`${K}.unavailable`) : t(`${K}.empty`)}
       </EmptyState>
     );
   }
@@ -184,12 +209,12 @@ export default function PreparationTab() {
       {total > 0 && (
         <div className="surface-panel rounded-2xl border-0 p-4">
           <div className="text-muted-foreground mb-2 text-[10px] font-semibold tracking-wider uppercase">
-            State
+            {t(`${K}.stateHeading`)}
           </div>
           <div
             role="img"
-            aria-label="Download preparation states"
-            className="flex h-1.5 overflow-hidden rounded-full"
+            aria-label={t(`${K}.stateBarLabel`)}
+            className="flex h-1.5 gap-0.5 overflow-hidden rounded-full"
           >
             {PREPARATION_STATES.filter((state) => counts[state] > 0).map((state) => (
               <div
@@ -216,7 +241,7 @@ export default function PreparationTab() {
                 />
                 <span className="font-medium">{preparationStateMeta(state).label}</span>
                 <span className="text-muted-foreground tabular-nums">
-                  {counts[state].toLocaleString()}
+                  {counts[state].toLocaleString(formatLocale())}
                 </span>
               </button>
             ))}
@@ -224,7 +249,7 @@ export default function PreparationTab() {
           {workers.length > 0 && (
             <div className="border-border mt-3 border-t pt-3">
               <div className="text-muted-foreground mb-2 text-[10px] font-semibold tracking-wider uppercase">
-                By Worker
+                {t(`${K}.byWorker`)}
               </div>
               <div className="flex flex-wrap gap-1.5">
                 {workers.map((worker) => (
@@ -240,11 +265,15 @@ export default function PreparationTab() {
                         : workerFilter && "opacity-30",
                     )}
                   >
-                    <span className="text-muted-foreground mr-1">{worker.label}</span>
-                    {worker.name}
-                    <span className="text-muted-foreground ml-1.5 tabular-nums">
-                      {worker.count}
-                    </span>
+                    {/* Spaces, not only margins, separate the parts, so the button's
+                        accessible name reads "Node gpu-01 2", not "Nodegpu-012". */}
+                    {/* eslint-disable-next-line formatjs/no-literal-string-in-jsx -- a space, not text */}
+                    <span className="text-muted-foreground me-0.5">{worker.label}</span>{" "}
+                    {/* Isolated, so a count after a left-to-right name doesn't join its
+                        run in a right-to-left language ("gpu-01" and "3" as "gpu-013"). */}
+                    {/* eslint-disable-next-line formatjs/no-literal-string-in-jsx -- a space, not text */}
+                    <bdi>{worker.name}</bdi>{" "}
+                    <span className="text-muted-foreground ms-1 tabular-nums">{worker.count}</span>
                   </button>
                 ))}
               </div>
@@ -255,20 +284,20 @@ export default function PreparationTab() {
 
       <div className="flex flex-wrap items-center gap-2">
         <div className="relative max-w-md min-w-[200px] flex-1">
-          <Search className="text-muted-foreground pointer-events-none absolute top-1/2 left-3 h-3.5 w-3.5 -translate-y-1/2" />
+          <Search className="text-muted-foreground pointer-events-none absolute start-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2" />
           <Input
-            placeholder="Filter by title, user, device, or worker..."
-            aria-label="Filter download preparation"
+            placeholder={t(`${K}.filter.placeholder`)}
+            aria-label={t(`${K}.filter.label`)}
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            className="h-8 pl-9 text-[13px]"
+            className="h-8 ps-9 text-[13px]"
           />
           {search && (
             <button
               type="button"
-              aria-label="Clear filter"
+              aria-label={t(`${K}.filter.clear`)}
               onClick={() => setSearch("")}
-              className="text-muted-foreground hover:text-foreground absolute top-1/2 right-2.5 -translate-y-1/2"
+              className="text-muted-foreground hover:text-foreground absolute end-2.5 top-1/2 -translate-y-1/2"
             >
               <X className="h-3.5 w-3.5" />
             </button>
@@ -284,7 +313,7 @@ export default function PreparationTab() {
             className="text-muted-foreground hover:text-foreground flex items-center gap-1 text-[11px]"
           >
             <X className="h-3 w-3" />
-            Clear filters
+            {t(`${K}.filter.clearAll`)}
           </button>
         )}
       </div>
@@ -292,13 +321,13 @@ export default function PreparationTab() {
       {selectedItems.length > 0 && (
         <div
           role="toolbar"
-          aria-label="Selected preparation jobs"
+          aria-label={t(`${K}.selection.toolbarLabel`)}
           className="bg-surface/60 border-border flex flex-wrap items-center gap-2 rounded-lg border px-3 py-2"
         >
           <span className="text-[12px] font-medium tabular-nums">
-            {selectedItems.length.toLocaleString()} selected
+            {t(`${K}.selection.count`, jobCount(selectedItems.length))}
           </span>
-          <div className="ml-auto flex flex-wrap gap-1.5">
+          <div className="ms-auto flex flex-wrap gap-1.5">
             <Button
               size="sm"
               variant="outline"
@@ -307,7 +336,9 @@ export default function PreparationTab() {
               onClick={() => actions.run("pause", pausable)}
             >
               <Pause className="h-3.5 w-3.5" />
-              Pause{pausable.length > 0 && ` ${pausable.length.toLocaleString()}`}
+              {pausable.length > 0
+                ? t(`${K}.selection.pauseCount`, jobCount(pausable.length))
+                : t(`${K}.selection.pause`)}
             </Button>
             <Button
               size="sm"
@@ -317,7 +348,9 @@ export default function PreparationTab() {
               onClick={() => actions.run("resume", resumable)}
             >
               <Play className="h-3.5 w-3.5" />
-              Resume{resumable.length > 0 && ` ${resumable.length.toLocaleString()}`}
+              {resumable.length > 0
+                ? t(`${K}.selection.resumeCount`, jobCount(resumable.length))
+                : t(`${K}.selection.resume`)}
             </Button>
             <Button
               size="sm"
@@ -327,7 +360,7 @@ export default function PreparationTab() {
               onClick={() => setCancelTargets(selectedItems)}
             >
               <X className="h-3.5 w-3.5" />
-              Cancel {selectedItems.length.toLocaleString()}
+              {t(`${K}.selection.cancelCount`, jobCount(selectedItems.length))}
             </Button>
             <Button
               size="sm"
@@ -336,7 +369,7 @@ export default function PreparationTab() {
               disabled={actions.isPending}
               onClick={clearSelection}
             >
-              Clear selection
+              {t(`${K}.selection.clear`)}
             </Button>
           </div>
         </div>
@@ -344,24 +377,31 @@ export default function PreparationTab() {
 
       {(search || activeFilters > 0) && (
         <div className="text-muted-foreground text-[11px]">
-          Showing {filtered.length} of {items.length} jobs
+          {t(`${K}.showing`, {
+            total: items.length,
+            shown: filtered.length,
+            total_text: items.length,
+          })}
         </div>
       )}
       {items.length < total && (
         <div className="text-muted-foreground text-[11px]">
-          Listing the first {items.length.toLocaleString()} of {total.toLocaleString()} jobs.
-          Running jobs are always listed first.
+          {t(`${K}.listingFirst`, {
+            total,
+            shown: items.length.toLocaleString(formatLocale()),
+            total_text: total.toLocaleString(formatLocale()),
+          })}
         </div>
       )}
 
       {filtered.length === 0 ? (
         items.length > 0 ? (
           <EmptyState icon={<Filter className="mb-3 h-8 w-8 opacity-20" />}>
-            No jobs match your filters
+            {t(`${K}.noMatches`)}
           </EmptyState>
         ) : (
           <EmptyState icon={<HardDriveDownload className="mb-3 h-8 w-8 opacity-20" />}>
-            No downloads being prepared
+            {t(`${K}.empty`)}
           </EmptyState>
         )
       ) : (
@@ -372,7 +412,9 @@ export default function PreparationTab() {
             <input
               type="checkbox"
               className={CHECKBOX}
-              aria-label={allVisibleSelected ? "Clear selection" : "Select all shown jobs"}
+              aria-label={
+                allVisibleSelected ? t(`${K}.table.clearSelection`) : t(`${K}.table.selectAll`)
+              }
               checked={allVisibleSelected}
               ref={(element) => {
                 if (element)
@@ -381,12 +423,12 @@ export default function PreparationTab() {
               disabled={actions.isPending}
               onChange={(event) => selectVisible(event.target.checked)}
             />
-            {["Title", "Output", "Worker", "Progress", "Requested by"].map((heading) => (
+            {COLUMNS.map((heading) => (
               <div
                 key={heading}
                 className="text-muted-foreground text-[10px] font-semibold tracking-wider uppercase"
               >
-                {heading}
+                {t(heading)}
               </div>
             ))}
             <div />
@@ -418,7 +460,7 @@ export default function PreparationTab() {
         title={cancelPrompt?.title ?? ""}
         description={cancelPrompt?.description ?? ""}
         confirmLabel={cancelPrompt?.confirmLabel}
-        cancelLabel="Keep"
+        cancelLabel={t(`${K}.cancelDialog.keep`)}
         variant="destructive"
         isPending={actions.isPending}
         onConfirm={() => {
@@ -457,6 +499,7 @@ function PreparationRow({
   onResume,
   onCancel,
 }: PreparationRowProps) {
+  const t = useT();
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [ffmpegOpen, setFFmpegOpen] = useState(false);
   const title = preparationTitle(prep);
@@ -471,7 +514,8 @@ function PreparationRow({
 
   const titleBlock = (
     <>
-      <div className="truncate text-[13px] font-medium">{title}</div>
+      {/* Underlines only the title when the row links to its item. */}
+      <div className="truncate text-[13px] font-medium group-hover/item:underline">{title}</div>
       <div className="text-muted-foreground truncate text-[10px]">{subtitle}</div>
       <div className="text-muted-foreground truncate text-[10px]">
         {formatPreparationSource(prep)}
@@ -483,10 +527,10 @@ function PreparationRow({
       type="button"
       onClick={toggle}
       aria-expanded={expanded}
-      aria-label={`Details for ${title}`}
+      aria-label={t(`${K}.row.detailsLabel`, { title })}
       className="text-muted-foreground hover:text-primary inline-flex items-center gap-0.5 text-[10px] font-medium transition-colors"
     >
-      Details
+      {t(`${K}.row.details`)}
       {expanded ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
     </button>
   );
@@ -495,7 +539,7 @@ function PreparationRow({
     <input
       type="checkbox"
       className={CHECKBOX}
-      aria-label={`Select ${title}`}
+      aria-label={t(`${K}.row.select`, { title })}
       checked={selected}
       disabled={actionsDisabled}
       onChange={onToggleSelected}
@@ -526,7 +570,10 @@ function PreparationRow({
         {checkbox}
         <div className="min-w-0">
           {itemHref ? (
-            <Link to={itemHref} className="hover:text-primary block min-w-0 transition-colors">
+            <Link
+              to={itemHref}
+              className="group/item hover:text-primary block min-w-0 transition-colors"
+            >
               {titleBlock}
             </Link>
           ) : (
@@ -566,7 +613,7 @@ function PreparationRow({
           <span className="truncate">{formatPreparationOutput(prep)}</span>
         </div>
         <div className="text-muted-foreground flex items-center justify-between gap-2 text-[10px]">
-          <span className="truncate">{requesterSummary(prep)}</span>
+          <span className="flex overflow-hidden whitespace-pre">{requesterSummary(t, prep)}</span>
           <div className="flex shrink-0 items-center gap-1">
             {rowActions}
             {detailsButton}
@@ -602,11 +649,15 @@ function RowActions({
   onResume: () => void;
   onCancel: () => void;
 }) {
+  const t = useT();
   const iconButton =
     "text-muted-foreground inline-flex h-6 w-6 items-center justify-center rounded transition-colors disabled:pointer-events-none disabled:opacity-40";
   if (pending) {
     return (
-      <Loader className="text-muted-foreground h-3.5 w-3.5 animate-spin" aria-label="Working" />
+      <Loader
+        className="text-muted-foreground h-3.5 w-3.5 animate-spin"
+        aria-label={t(`${K}.row.working`)}
+      />
     );
   }
   return (
@@ -615,11 +666,11 @@ function RowActions({
         <button
           type="button"
           className={cn(iconButton, "hover:bg-surface hover:text-foreground")}
-          aria-label={`Pause ${title}`}
+          aria-label={t(`${K}.row.pauseLabel`, { title })}
           title={
             prep.state === "running"
-              ? "Pause: stops the encode, which starts over when resumed"
-              : "Pause: keeps its place in the queue without starting"
+              ? t(`${K}.row.pauseRunningTitle`)
+              : t(`${K}.row.pauseWaitingTitle`)
           }
           disabled={disabled}
           onClick={onPause}
@@ -631,8 +682,8 @@ function RowActions({
         <button
           type="button"
           className={cn(iconButton, "hover:bg-surface hover:text-foreground")}
-          aria-label={`Resume ${title}`}
-          title="Resume"
+          aria-label={t(`${K}.row.resumeLabel`, { title })}
+          title={t(`${K}.row.resumeTitle`)}
           disabled={disabled}
           onClick={onResume}
         >
@@ -642,8 +693,12 @@ function RowActions({
       <button
         type="button"
         className={cn(iconButton, "hover:bg-destructive/10 hover:text-destructive")}
-        aria-label={prep.state === "failed" ? `Remove ${title}` : `Cancel ${title}`}
-        title={prep.state === "failed" ? "Remove this failed job" : "Cancel"}
+        aria-label={
+          prep.state === "failed"
+            ? t(`${K}.row.removeLabel`, { title })
+            : t(`${K}.row.cancelLabel`, { title })
+        }
+        title={prep.state === "failed" ? t(`${K}.row.removeTitle`) : t(`${K}.row.cancelTitle`)}
         disabled={disabled}
         onClick={onCancel}
       >
@@ -666,19 +721,26 @@ function FormatBadge({ format }: { format: AdminDownloadPreparation["format"] })
 }
 
 function WorkerBadge({ prep }: { prep: AdminDownloadPreparation }) {
+  const t = useT();
   const worker = preparationWorker(prep);
   if (!worker) {
-    return <span className="text-muted-foreground text-[11px]">Not assigned</span>;
+    return <span className="text-muted-foreground text-[11px]">{t(`${K}.notAssigned`)}</span>;
   }
   return (
     <span className="border-primary/20 bg-primary/10 text-primary inline-flex max-w-full items-center gap-1 rounded border px-1.5 py-0.5 text-[9px] font-semibold">
-      <span className="opacity-70">{worker.label}</span>
-      <span className="truncate">{worker.name}</span>
+      {/* Same label treatment as the playback route badges (PlaybackRouteBadges). */}
+      <span className="text-foreground/75 [html[data-high-contrast=true]_&]:text-muted-foreground font-normal">
+        {worker.label}
+      </span>
+      <span dir="auto" className="truncate">
+        {worker.name}
+      </span>
     </span>
   );
 }
 
 function ProgressCell({ prep }: { prep: AdminDownloadPreparation }) {
+  const t = useT();
   switch (prep.state) {
     case "running": {
       const percent = preparationPercent(prep);
@@ -688,13 +750,17 @@ function ProgressCell({ prep }: { prep: AdminDownloadPreparation }) {
           <div className="space-y-0.5">
             <div className="text-primary flex items-center gap-1 text-[11px] font-semibold">
               <Loader className="h-3 w-3 animate-spin" aria-hidden="true" />
-              {preparationRunningLabel(prep)}
-              {elapsed != null && ` · ${formatClock(elapsed)}`}
+              {elapsed != null
+                ? t(`${K}.progress.runningElapsed`, {
+                    label: preparationRunningLabel(prep),
+                    elapsed: formatClock(elapsed),
+                  })
+                : preparationRunningLabel(prep)}
             </div>
             <div className="text-muted-foreground text-[10px]">
               {prep.progress_unavailable
-                ? "This worker doesn't report progress"
-                : "Waiting for the first progress report"}
+                ? t(`${K}.progress.noReports`)
+                : t(`${K}.progress.waitingFirstReport`)}
             </div>
           </div>
         );
@@ -708,13 +774,15 @@ function ProgressCell({ prep }: { prep: AdminDownloadPreparation }) {
       return (
         <div className="space-y-1">
           <div className="flex items-center justify-between gap-2 text-[11px]">
-            <span className="font-semibold tabular-nums">{Math.floor(percent)}%</span>
+            <span className="font-semibold tabular-nums">
+              {t(`${K}.progress.percent`, { percent: Math.floor(percent) })}
+            </span>
             <span className="text-muted-foreground truncate tabular-nums">{detail}</span>
           </div>
           <div
             className="bg-muted h-1.5 overflow-hidden rounded-full"
             role="progressbar"
-            aria-label={`${preparationTitle(prep)} progress`}
+            aria-label={t(`${K}.progress.label`, { title: preparationTitle(prep) })}
             aria-valuemin={0}
             aria-valuemax={100}
             aria-valuenow={Math.floor(percent)}
@@ -731,12 +799,13 @@ function ProgressCell({ prep }: { prep: AdminDownloadPreparation }) {
       return (
         <div className="text-muted-foreground flex items-center gap-1.5 text-[11px]">
           <Clock className="h-3 w-3" aria-hidden="true" />
-          Queued ·{" "}
           {prep.queue_position === 1
-            ? "next in line"
+            ? t(`${K}.progress.queuedNext`)
             : prep.queue_position
-              ? `#${prep.queue_position.toLocaleString()} in line`
-              : "waiting"}
+              ? t(`${K}.progress.queuedPosition`, {
+                  position: prep.queue_position.toLocaleString(formatLocale()),
+                })
+              : t(`${K}.progress.queuedWaiting`)}
         </div>
       );
     case "retrying":
@@ -744,11 +813,15 @@ function ProgressCell({ prep }: { prep: AdminDownloadPreparation }) {
         <div className="min-w-0 space-y-0.5">
           <div className="text-warning flex items-center gap-1.5 text-[11px] font-semibold">
             <RotateCw className="h-3 w-3" aria-hidden="true" />
-            Waiting to retry
+            {t(`${K}.progress.waitingToRetry`)}
           </div>
           <div className="text-muted-foreground line-clamp-2 text-[10px]">
             {[
-              `Attempt ${prep.attempts + 1} of ${prep.max_attempts} ${formatRetryIn(prep.next_retry_at)}`,
+              t(`${K}.progress.attempt`, {
+                attempt: prep.attempts + 1,
+                max: prep.max_attempts,
+                retry_in: formatRetryIn(prep.next_retry_at),
+              }),
               prep.error,
             ]
               .filter(Boolean)
@@ -761,10 +834,10 @@ function ProgressCell({ prep }: { prep: AdminDownloadPreparation }) {
         <div className="min-w-0 space-y-0.5">
           <div className="text-muted-foreground flex items-center gap-1.5 text-[11px] font-semibold">
             <Pause className="h-3 w-3" aria-hidden="true" />
-            Paused
+            {t(`${K}.progress.paused`)}
           </div>
           <div className="text-muted-foreground text-[10px]">
-            {[formatAgo(prep.paused_at), "Won't start until resumed"].filter(Boolean).join(" · ")}
+            {[formatAgo(prep.paused_at), t(`${K}.progress.wontStart`)].filter(Boolean).join(" · ")}
           </div>
         </div>
       );
@@ -773,11 +846,11 @@ function ProgressCell({ prep }: { prep: AdminDownloadPreparation }) {
         <div className="min-w-0 space-y-0.5">
           <div className="text-destructive flex items-center gap-1.5 text-[11px] font-semibold">
             <AlertTriangle className="h-3 w-3" aria-hidden="true" />
-            Failed
+            {t(`${K}.progress.failed`)}
           </div>
           <div className="text-muted-foreground line-clamp-2 text-[10px]" title={prep.error}>
             {[
-              `After ${prep.attempts} ${prep.attempts === 1 ? "attempt" : "attempts"}`,
+              t(`${K}.progress.afterAttempts`, { count: prep.attempts }),
               formatAgo(prep.failed_at),
               prep.error,
             ]
@@ -789,37 +862,69 @@ function ProgressCell({ prep }: { prep: AdminDownloadPreparation }) {
   }
 }
 
-function requesterSummary(prep: AdminDownloadPreparation): string {
+/** The first requester's device, and how many others asked ("Alex's iPhone · +2 more"). */
+function requesterDevices(
+  t: Translate,
+  first: AdminDownloadPreparation["requesters"][number],
+  others: number,
+): ReactNode {
+  // Its own element, so a device name reads in its own direction and is cut at its own end.
+  const device = (
+    <span dir="auto" className="truncate">
+      {requesterDevice(first)}
+    </span>
+  );
+  return others > 0
+    ? t(`${K}.requesters.deviceMore`, { count: others, count_text: others, device })
+    : device;
+}
+
+/**
+ * The phone row's requester line, in a `flex whitespace-pre` box. The name and
+ * the device read in their own directions; the device is cut first, and the
+ * name only when it alone fills the line.
+ */
+function requesterSummary(t: Translate, prep: AdminDownloadPreparation): ReactNode {
   const [first, ...rest] = prep.requesters;
-  if (!first) return "No waiting downloads";
-  return [requesterName(first), requesterDevice(first), rest.length > 0 ? `+${rest.length}` : ""]
-    .filter(Boolean)
-    .join(" · ");
+  if (!first) return t(`${K}.requesters.none`);
+  return (
+    <>
+      <span dir="auto" className="max-w-full shrink-0 truncate">
+        {requesterName(first)}
+      </span>
+      {SEPARATOR}
+      {requesterDevices(t, first, rest.length)}
+    </>
+  );
 }
 
 function Requesters({ prep }: { prep: AdminDownloadPreparation }) {
+  const t = useT();
   const [first, ...rest] = prep.requesters;
   if (!first) {
-    return <span className="text-muted-foreground text-[11px]">No waiting downloads</span>;
+    return <span className="text-muted-foreground text-[11px]">{t(`${K}.requesters.none`)}</span>;
   }
   return (
     <div className="min-w-0 text-[12px]">
       <div className="flex min-w-0 items-center gap-1.5">
         <Link
           to={`/admin/users/${first.user_id}`}
-          className="hover:text-primary truncate font-medium transition-colors"
+          dir="auto"
+          className="hover:text-primary truncate font-medium transition-colors hover:underline"
         >
           {requesterName(first)}
         </Link>
         {first.profile_name && (
-          <span className="border-primary/30 bg-primary/15 text-primary max-w-[6rem] truncate rounded border px-1.5 py-0.5 text-[10px] leading-none">
+          <span
+            dir="auto"
+            className="border-primary/30 bg-primary/15 text-primary max-w-[6rem] truncate rounded border px-1.5 py-0.5 text-[10px] leading-none"
+          >
             {first.profile_name}
           </span>
         )}
       </div>
-      <div className="text-muted-foreground truncate text-[10px]">
-        {requesterDevice(first)}
-        {rest.length > 0 && ` · +${rest.length} more`}
+      <div className="text-muted-foreground flex overflow-hidden text-[10px] whitespace-pre">
+        {requesterDevices(t, first, rest.length)}
       </div>
     </div>
   );
@@ -834,6 +939,7 @@ function PreparationDetails({
   showFFmpeg: boolean;
   onToggleFFmpeg: () => void;
 }) {
+  const t = useT();
   const logsHref = `/admin/logs?playback_session_id=${encodeURIComponent(prep.log_session_id)}&component=ffmpeg`;
   const ffmpegLogs = useOperationalLogs(
     { playback_session_id: prep.log_session_id, component: "ffmpeg", limit: 12 },
@@ -852,10 +958,10 @@ function PreparationDetails({
         <div>
           <div className="flex items-center gap-2">
             <div className="rounded-full border border-[var(--terminal-border)] bg-[var(--terminal-bg)] px-2 py-0.5 text-[10px] font-semibold tracking-[0.2em] text-[var(--terminal-fg)] uppercase">
-              Preparation
+              {t(`${K}.details.chip`)}
             </div>
             <div className="text-foreground/85 text-[11px] font-medium">
-              Job details{showFFmpeg ? " and FFmpeg output" : ""}
+              {showFFmpeg ? t(`${K}.details.headingWithFfmpeg`) : t(`${K}.details.heading`)}
             </div>
           </div>
           <div className="text-muted-foreground mt-1 font-mono text-[10px]">{prep.id}</div>
@@ -869,22 +975,25 @@ function PreparationDetails({
             aria-pressed={showFFmpeg}
           >
             <Terminal className="h-3.5 w-3.5" />
-            {showFFmpeg ? "Hide FFmpeg" : "FFmpeg"}
+            {showFFmpeg ? t(`${K}.details.hideFfmpeg`) : FFMPEG}
           </Button>
           <Button variant="outline" size="sm" className="h-7 gap-1.5 px-2 text-[11px]" asChild>
             <Link to={logsHref}>
               <FileText className="h-3.5 w-3.5" />
-              View logs
+              {t(`${K}.details.viewLogs`)}
             </Link>
           </Button>
         </div>
       </div>
 
       <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
-        <DetailCard label="Source">
-          <DetailLine label="Container" value={prep.source.container?.toUpperCase() || "—"} />
+        <DetailCard label={t(`${K}.details.source`)}>
           <DetailLine
-            label="Video"
+            label={t(`${K}.details.container`)}
+            value={prep.source.container?.toUpperCase() || "—"}
+          />
+          <DetailLine
+            label={t(`${K}.details.video`)}
             value={
               [
                 prep.source.resolution,
@@ -896,9 +1005,9 @@ function PreparationDetails({
                 .join(" · ") || "—"
             }
           />
-          <DetailLine label="Audio" value={formatPreparationSourceAudio(prep)} />
+          <DetailLine label={t(`${K}.details.audio`)} value={formatPreparationSourceAudio(prep)} />
           <DetailLine
-            label="Size"
+            label={t(`${K}.details.size`)}
             value={
               [
                 formatFileSize(prep.source.file_size),
@@ -910,29 +1019,41 @@ function PreparationDetails({
             muted
           />
         </DetailCard>
-        <DetailCard label="Output" badge={<FormatBadge format={prep.format} />}>
-          <DetailLine label="Container" value={`${prep.output.container.toUpperCase()}`} />
-          <DetailLine label="Video" value={formatPreparationVideoOutput(prep)} />
-          {toneMap && <DetailLine label="Tone map" value={toneMap} />}
-          <DetailLine label="Audio" value={formatPreparationAudioOutput(prep)} />
+        <DetailCard label={t(`${K}.details.output`)} badge={<FormatBadge format={prep.format} />}>
+          <DetailLine
+            label={t(`${K}.details.container`)}
+            value={`${prep.output.container.toUpperCase()}`}
+          />
+          <DetailLine label={t(`${K}.details.video`)} value={formatPreparationVideoOutput(prep)} />
+          {toneMap && <DetailLine label={t(`${K}.details.toneMap`)} value={toneMap} />}
+          <DetailLine label={t(`${K}.details.audio`)} value={formatPreparationAudioOutput(prep)} />
         </DetailCard>
-        <DetailCard label="Job">
-          <DetailLine label="Status" value={jobStatus(prep)} />
+        <DetailCard label={t(`${K}.details.job`)}>
+          <DetailLine label={t(`${K}.details.status`)} value={jobStatus(t, prep)} />
           {prep.state === "running" && prep.progress && (
             <DetailLine
-              label="Encoded"
+              label={t(`${K}.details.encoded`)}
               value={
                 prep.progress.duration_seconds > 0
-                  ? `${formatClock(prep.progress.encoded_seconds)} of ${formatClock(prep.progress.duration_seconds)}${percent != null ? ` (${Math.floor(percent)}%)` : ""}`
+                  ? percent != null
+                    ? t(`${K}.details.encodedOfPercent`, {
+                        encoded: formatClock(prep.progress.encoded_seconds),
+                        duration: formatClock(prep.progress.duration_seconds),
+                        percent: Math.floor(percent),
+                      })
+                    : t(`${K}.details.encodedOf`, {
+                        encoded: formatClock(prep.progress.encoded_seconds),
+                        duration: formatClock(prep.progress.duration_seconds),
+                      })
                   : formatClock(prep.progress.encoded_seconds)
               }
             />
           )}
           {prep.state === "running" && prep.progress && prep.progress.speed > 0 && (
             <DetailLine
-              label="Speed"
+              label={t(`${K}.details.speed`)}
               value={[
-                `${formatSpeed(prep.progress.speed)} realtime`,
+                t(`${K}.details.speedRealtime`, { speed: formatSpeed(prep.progress.speed) }),
                 formatRemaining(preparationRemainingSeconds(prep)),
               ]
                 .filter(Boolean)
@@ -941,39 +1062,50 @@ function PreparationDetails({
           )}
           {startedAt && (
             <DetailLine
-              label={prep.state === "running" ? "Started" : "Last try"}
+              label={
+                prep.state === "running" ? t(`${K}.details.started`) : t(`${K}.details.lastTry`)
+              }
               value={
                 prep.state === "running" && elapsed != null
-                  ? `${startedAt} · ${formatClock(elapsed)} ago`
+                  ? t(`${K}.details.startedAgo`, { time: startedAt, elapsed: formatClock(elapsed) })
                   : startedAt
               }
             />
           )}
           <DetailLine
-            label="Worker"
-            value={worker ? `${worker.label} ${worker.name}` : "Not assigned yet"}
+            label={t(`${K}.details.worker`)}
+            value={
+              worker
+                ? t(`${K}.details.workerValue`, { kind: worker.label, name: worker.name })
+                : t(`${K}.details.notAssignedYet`)
+            }
             muted
           />
-          {prep.error && <DetailLine label="Error" value={prep.error} muted />}
+          {prep.error && <DetailLine label={t(`${K}.details.error`)} value={prep.error} muted />}
         </DetailCard>
-        <DetailCard label="Requested by">
+        <DetailCard label={t(`${K}.details.requestedBy`)}>
           {prep.requesters.length === 0 ? (
-            <span className="text-[var(--terminal-muted)]">No waiting downloads</span>
+            <span className="text-[var(--terminal-muted)]">{t(`${K}.details.noWaiting`)}</span>
           ) : (
             prep.requesters.map((r, i) => (
               <div
                 key={`${r.user_id}-${r.device_id ?? "web"}-${i}`}
-                className="grid min-w-0 grid-cols-[1fr_auto] gap-2"
+                className="flex min-w-0 flex-wrap items-baseline gap-x-2"
               >
-                <span className="min-w-0 truncate font-medium text-[var(--terminal-fg)]">
-                  {requesterName(r)}
-                  {r.profile_name ? ` · ${r.profile_name}` : ""}
-                  <span className="block truncate text-[10px] font-normal text-[var(--terminal-muted)]">
-                    {requesterDevice(r)}
-                  </span>
+                <span className="min-w-0 font-medium wrap-anywhere text-[var(--terminal-fg)]">
+                  {r.profile_name
+                    ? t(`${K}.details.requesterProfile`, {
+                        name: requesterName(r),
+                        profile: r.profile_name,
+                      })
+                    : requesterName(r)}
                 </span>
-                <span className="text-[10px] text-[var(--terminal-muted)] capitalize">
-                  {r.status === "preparing" ? "Waiting" : r.status}
+                {/* Moves under the name when both don't fit, rather than squeezing it. */}
+                <span className="ms-auto min-w-0 text-end text-[10px] wrap-anywhere text-[var(--terminal-muted)]">
+                  {downloadEntryStatus(r.status).label}
+                </span>
+                <span className="basis-full truncate text-[10px] text-[var(--terminal-muted)]">
+                  {requesterDevice(r)}
                 </span>
               </div>
             ))
@@ -992,19 +1124,32 @@ function PreparationDetails({
   );
 }
 
-function jobStatus(prep: AdminDownloadPreparation): string {
-  const attempt = `attempt ${Math.max(prep.attempts, 1)} of ${prep.max_attempts}`;
+function jobStatus(t: Translate, prep: AdminDownloadPreparation): string {
   switch (prep.state) {
     case "running":
-      return `${preparationRunningLabel(prep)} · ${attempt}`;
+      return t(`${K}.status.running`, {
+        label: preparationRunningLabel(prep),
+        attempt: Math.max(prep.attempts, 1),
+        max: prep.max_attempts,
+      });
     case "queued":
-      return prep.queue_position ? `Queued · #${prep.queue_position} in line` : "Queued";
+      return prep.queue_position
+        ? t(`${K}.status.queuedPosition`, { position: prep.queue_position })
+        : t(`${K}.status.queued`);
     case "retrying":
-      return `Retrying ${formatRetryIn(prep.next_retry_at)} · attempt ${prep.attempts + 1} of ${prep.max_attempts}`;
-    case "paused":
-      return `Paused ${formatAgo(prep.paused_at)}`.trim();
-    case "failed":
-      return `Failed ${formatAgo(prep.failed_at)}`.trim();
+      return t(`${K}.status.retrying`, {
+        retry_in: formatRetryIn(prep.next_retry_at),
+        attempt: prep.attempts + 1,
+        max: prep.max_attempts,
+      });
+    case "paused": {
+      const ago = formatAgo(prep.paused_at);
+      return ago ? t(`${K}.status.pausedAgo`, { ago }) : t(`${K}.status.paused`);
+    }
+    case "failed": {
+      const ago = formatAgo(prep.failed_at);
+      return ago ? t(`${K}.status.failedAgo`, { ago }) : t(`${K}.status.failed`);
+    }
   }
 }
 
@@ -1017,20 +1162,22 @@ function FFmpegConsole({
   isLoading: boolean;
   isFetching: boolean;
 }) {
+  const t = useT();
   return (
     <div className="mt-3 space-y-2">
       {isFetching && !isLoading && (
-        <div className="text-muted-foreground text-right text-[10px]">Refreshing…</div>
+        <div className="text-muted-foreground text-end text-[10px]">
+          {t(`${K}.ffmpeg.refreshing`)}
+        </div>
       )}
       <div className="overflow-hidden rounded-xl border border-[var(--terminal-border)] bg-[var(--terminal-bg)] shadow-[0_18px_60px_rgba(0,0,0,0.35)]">
         {isLoading ? (
           <div className="px-4 py-6 font-mono text-[11px] text-[var(--terminal-muted)]">
-            Loading ffmpeg output…
+            {t(`${K}.ffmpeg.loading`)}
           </div>
         ) : rows.length === 0 ? (
           <div className="px-4 py-6 font-mono text-[11px] text-[var(--terminal-muted)]">
-            No FFmpeg output for this job yet. Output appears once an attempt starts; workers
-            running an older version do not send it.
+            {t(`${K}.ffmpeg.empty`)}
           </div>
         ) : (
           <div className="max-h-64 overflow-y-auto">
@@ -1044,7 +1191,7 @@ function FFmpegConsole({
                     {formatTimeOnly(row.timestamp)}
                   </div>
                   <div className="text-[10px] tracking-[0.18em] text-[var(--terminal-muted)]/60 uppercase">
-                    {row.message.includes("stderr") ? "stderr" : "event"}
+                    {row.message.includes(STDERR) ? STDERR : t(`${K}.ffmpeg.event`)}
                   </div>
                 </div>
                 <div className="min-w-0">

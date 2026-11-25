@@ -270,7 +270,7 @@ func (h *AdminSubtitleHandler) HandleDeleteDownloadedSubtitle(w http.ResponseWri
 		return
 	}
 
-	if err := h.manager.DeleteSubtitle(r.Context(), id); err != nil {
+	if err := h.manager.DeleteSubtitleWithRevision(r.Context(), id, nil); err != nil {
 		writeError(w, http.StatusInternalServerError, "delete_error", "Failed to delete subtitle")
 		return
 	}

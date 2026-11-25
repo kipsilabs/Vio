@@ -205,6 +205,53 @@ func waitVirtualPendingHold(ctx context.Context, virtualURI string, fileID int) 
 	return held
 }
 
+// virtualServeResolveBudget bounds the one virtual candidate resolve a
+// direct-play byte serve performs before it can open the relay. Planning has
+// already spent its own, longer budget resolving and probing the candidate; a
+// byte serve is on the media element's clock and cannot deliver a single byte
+// until the resolve returns. One provider fetch is allotted
+// backgroundRefreshTimeout (15s), so this bound leaves room for a listing that
+// answers in time while refusing to hold the request through the whole outage
+// retry schedule: in production that schedule spent a minute relisting an empty
+// answer while the client waited, then aborted and recorded a fake 408. An
+// expired budget is answered as the retryable provider_unavailable 503, so the
+// player falls back or retries the route instead of hanging.
+//
+// It is a var so tests can shrink it and observe the bound.
+var virtualServeResolveBudget = 20 * time.Second
+
+// virtualServeResolveRetryAfterSeconds is the Retry-After a serve-budget
+// expiry advertises. It matches the subtitle source's retry hint: long enough
+// that a client backs off instead of re-opening the provider immediately, short
+// enough that a recovered listing is not hidden.
+const virtualServeResolveRetryAfterSeconds = 5
+
+// resolveVirtualInputForServe resolves a virtual input for the direct-play byte
+// serve under virtualServeResolveBudget. A budget expiry while the caller is
+// still waiting is a provider-listing dependency failure, not a client
+// cancellation: the caller's own context is live, so it is wrapped as
+// errVirtualProviderUnavailable (retryable 503). A parent context that is done
+// keeps the existing classification so a viewer who left is still recorded as
+// a client cancellation.
+func (h *StreamHandler) resolveVirtualInputForServe(ctx context.Context, file *models.MediaFile, userID int, profileID string) (ResolvedVirtualMedia, func(), error) {
+	serveCtx, cancel := context.WithTimeout(ctx, virtualServeResolveBudget)
+	defer cancel()
+	resolved, cleanup, err := h.resolveVirtualInputURI(serveCtx, file, userID, profileID, false)
+	if err == nil {
+		return resolved, cleanup, nil
+	}
+	if cleanup != nil {
+		cleanup()
+	}
+	if ctx.Err() != nil {
+		return ResolvedVirtualMedia{}, nil, err
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(serveCtx.Err(), context.DeadlineExceeded) {
+		return ResolvedVirtualMedia{}, nil, fmt.Errorf("%w: virtual serve resolve exceeded %s: %w", errVirtualProviderUnavailable, virtualServeResolveBudget, err)
+	}
+	return ResolvedVirtualMedia{}, nil, err
+}
+
 // retryVirtualProviderOutageResolve runs resolve, and while it fails with a
 // transient provider-listing outage for a trusted session-bound row, retries
 // with the bounded schedule. A canceled request stops immediately. Retry
@@ -285,18 +332,70 @@ func transportStartFailureV3(cause error, fallback *transportErrorV3) *transport
 	return fallback
 }
 
+// errVirtualSelectedReleaseCannotPlay marks a virtual start whose selected
+// release could not be resolved and for which every substitute the fallback
+// walk found would have contradicted the selection: a different runtime, or a
+// poorer audio/subtitle menu. It is deliberately not a provider-outage sentinel:
+// retrying does not make a track-losing substitute honest, so the terminal names
+// the version list instead of serving different bytes.
+var errVirtualSelectedReleaseCannotPlay = errors.New("the selected release cannot serve the selection")
+
+// errVirtualSelectedReleaseUnverified marks a virtual start whose selected
+// release was offered only bytes that did not establish its identity: the
+// served size contradicted the declaration and the candidate's row belonged to
+// a different release. It is retryable like an unavailable source, but it must
+// not be answered with a substitute the viewer did not select.
+var errVirtualSelectedReleaseUnverified = errors.New("the selected release was served by a different release")
+
+// virtualVersionFallbackSubstitutionRejectionV3 names why a substitute the
+// cold-start fallback walk resolved must not replace the selected release, or ""
+// when the substitute is safe. It is the same policy #448 applies to a rotation,
+// reused instead of a second one: a substitute must not contradict the item's
+// runtime (duration_contradiction) or offer fewer audio or subtitle tracks than
+// the selected row (track_loss). A substitute on the requested row itself, or a
+// row with no measured evidence, is not rejected by absence of evidence.
+func virtualVersionFallbackSubstitutionRejectionV3(expectedRuntimeMinutes int, selected, effective *models.MediaFile) string {
+	if selected == nil || effective == nil || effective.ID <= 0 || effective.ID == selected.ID {
+		return ""
+	}
+	switch {
+	case !virtualRuntimePlausible(effective.Duration, expectedRuntimeMinutes):
+		return "duration_contradiction"
+	case virtualRotationWouldDropTracks(selected, effective, effective):
+		return "track_loss"
+	}
+	return ""
+}
+
 // virtualStartUnresolvedTerminalV3 builds the honest terminal for a virtual
 // start whose listing failed on every version the fallback walk could try. A
 // provider request failure (the edge answered 5xx or the request timed out) is
 // the retryable provider_unavailable dependency condition; an empty provider
 // listing stays the retryable virtual_source_unavailable the start path already
-// used, with a message that names the empty answer; every other cause keeps the
-// generic resolve message so no verdict is fabricated from a failure the
-// classifier cannot name.
+// used, with a message that names the empty answer; a selected release whose
+// every substitute would have lost the selection names the version list; every
+// other cause keeps the generic resolve message so no verdict is fabricated from
+// a failure the classifier cannot name.
 func virtualStartUnresolvedTerminalV3(resolveErr error) playback.DecisionResponseV3 {
 	switch {
 	case errors.Is(resolveErr, errOfferedCandidateUnavailable):
 		return playback.NewTerminalResponseV3("offered_release_unavailable", "The offered release is no longer available; refresh the version list and choose again.", true)
+	case errors.Is(resolveErr, errVirtualSelectedReleaseCannotPlay):
+		return playback.NewTerminalResponseV3(virtualSourceUnavailableReasonV3, "The selected version cannot serve its audio and subtitle tracks. Refresh the version list and choose another version.", true)
+	case errors.Is(resolveErr, errVirtualSelectedReleaseUnverified):
+		// The served bytes contradict the row the viewer picked. Report the
+		// versions check's own vocabulary (source_mismatch) instead of the
+		// generic unavailable, so the client can say "the provider served a
+		// different release" rather than "this version is gone".
+		return playback.NewTerminalResponseV3(sourceMismatchReasonV3, "The provider served a different release's bytes for this version. Refresh the version list and choose again.", true)
+	case errors.Is(resolveErr, errEffectiveFileNotInVersionList):
+		return playback.NewTerminalResponseV3(virtualSourceUnavailableReasonV3, "The selected version resolved to a release that is not in this item's version list. Refresh the version list and choose another version.", true)
+	case errors.Is(resolveErr, errSelectedReleaseNotServableV3):
+		// The provider answered with another release's candidate. The selected
+		// version itself was never disproven, so this stays retryable and names
+		// that version: a fresh start can resolve it again, and the viewer is
+		// never told a different file's fate.
+		return playback.NewTerminalResponseV3(virtualSourceUnavailableReasonV3, "The selected version could not be prepared from its own release. Try again, or choose another version.", true)
 	case errors.Is(resolveErr, resolver.ErrProviderUnavailable):
 		return playback.NewTerminalResponseV3(providerUnavailableReasonV3, "The virtual source provider is temporarily unavailable.", true)
 	case strings.Contains(strings.ToLower(fmt.Sprint(resolveErr)), "no streams available"):

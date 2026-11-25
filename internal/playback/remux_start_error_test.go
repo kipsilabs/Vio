@@ -2,6 +2,7 @@ package playback
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"log/slog"
@@ -182,10 +183,16 @@ func TestServeRemuxPreBodyFailureWritesErrorWhenNotDeferred(t *testing.T) {
 
 // A relay that accepts the request but never produces a media byte must not
 // park the response until the client stops the session (a dead virtual candidate
-// hung a production media request for 38.9s). The first-output budget closes the
+// hung a production media request for 38.9s). The first-output window closes the
 // process and returns the same no-output error a fast failure produces, so the
-// caller can rotate candidates or fail fast.
+// caller can rotate candidates or fail fast. The window is the ordinary budget
+// plus one grace for a still-silent process (see remuxFirstOutputSlowSourceGrace),
+// and it stays finite, which is the invariant here.
 func TestServeRemuxFirstOutputTimeoutFailsFast(t *testing.T) {
+	prevGrace := remuxFirstOutputSlowSourceGrace
+	remuxFirstOutputSlowSourceGrace = 200 * time.Millisecond
+	t.Cleanup(func() { remuxFirstOutputSlowSourceGrace = prevGrace })
+
 	source := remuxSourceFile(t)
 	w := &failoverResponseWriter{}
 	request := httptest.NewRequest(http.MethodGet, "/api/v2/stream/session-1", nil)
@@ -204,8 +211,14 @@ func TestServeRemuxFirstOutputTimeoutFailsFast(t *testing.T) {
 	if !errors.Is(err, errRemuxNoOutput) {
 		t.Fatalf("error = %v, want it to identify the no-output failure", err)
 	}
+	if !strings.Contains(err.Error(), "first output timeout after 300ms") {
+		t.Fatalf("error = %v, want the ordinary window and its grace named", err)
+	}
+	if elapsed < 250*time.Millisecond {
+		t.Fatalf("first-output timeout took %s; the silent source was indicted before its extension was spent", elapsed)
+	}
 	if elapsed > 3*time.Second {
-		t.Fatalf("first-output timeout took %s, want a prompt failure", elapsed)
+		t.Fatalf("first-output timeout took %s, want a bounded failure", elapsed)
 	}
 	if w.status != 0 || w.rejected || w.body.Len() != 0 {
 		t.Fatalf("timeout committed status=%d rejected=%v body=%q", w.status, w.rejected, w.body.String())
@@ -261,5 +274,37 @@ func TestServeRemuxNoOutputLogsFFmpegStderr(t *testing.T) {
 		if !strings.Contains(line, want) {
 			t.Fatalf("log = %s, want it to contain %q", line, want)
 		}
+	}
+}
+
+// TestRemuxNoOutputDowngradesClientTeardown proves a remux whose read ends
+// because the client left is recorded at debug, while the same failure with the
+// request still live stays a warning. Every production instance of the warning
+// was co-timed to a client cancel after the session had already delivered
+// media, so the warn level told operators nothing about the encoder.
+func TestRemuxNoOutputDowngradesClientTeardown(t *testing.T) {
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	session := &RemuxSession{stderr: &remuxStderrTail{}}
+	_, _ = session.stderr.Write([]byte("Error opening input file"))
+
+	logRemuxNoOutput(context.Background(), "/media/movie.mkv", session)
+	if line := logs.String(); !strings.Contains(line, `"level":"WARN"`) || !strings.Contains(line, "Error opening input file") {
+		t.Fatalf("live-request log = %s, want the encoder warning with FFmpeg stderr", line)
+	}
+
+	logs.Reset()
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	logRemuxNoOutput(canceled, "/media/movie.mkv", session)
+	line := logs.String()
+	if strings.Contains(line, `"level":"WARN"`) {
+		t.Fatalf("client-cancel log = %s, want no encoder warning", line)
+	}
+	if !strings.Contains(line, `"level":"DEBUG"`) || !strings.Contains(line, `"reason":"client_canceled"`) {
+		t.Fatalf("client-cancel log = %s, want the debug teardown line", line)
 	}
 }

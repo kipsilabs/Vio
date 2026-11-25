@@ -3,6 +3,11 @@
 // differences between surfaces (empty-string vs "—" fallback, GB vs GiB
 // labels) are expressed via parameters here instead of per-surface copies.
 
+import { t, type MessageKey } from "@/i18n";
+import { formatLocale } from "@/lib/appLocale";
+import { displayLanguageName } from "@/lib/languageNames";
+import { formatDecimal } from "@/lib/numberFormat";
+
 export const CODEC_LABELS: Record<string, string> = {
   aac: "AAC",
   ac3: "AC3",
@@ -116,20 +121,105 @@ export function audioTrackLabel(track: AudioTrackFormat): string {
   return track.codec ? mapAudioLabel(track.codec, audioTrackAtmosEvidence(track)) : "";
 }
 
+/** The audio-track fields an identity label reads. */
+export interface AudioTrackIdentitySource extends AudioTrackFormat {
+  language?: string;
+  languages?: string[];
+  channels?: number;
+}
+
+export interface AudioTrackIdentity {
+  /** Primary row label: the declared language, else codec + layout, else the row's position. */
+  title: string;
+  /**
+   * True when the track declares no language. Surfaces say the language is not
+   * declared in a hint instead of printing the localized "unknown" word as the
+   * row's identity, which reads as a fact about a track nobody described.
+   */
+  languageUndeclared: boolean;
+  /** True when `title` is the codec + channel layout rather than a language. */
+  titleFromFormat: boolean;
+}
+
+/** Language values that name no language: the undetermined code and its spellings. */
+const UNDECLARED_LANGUAGE_CODES = new Set(["und", "unknown", "unk"]);
+
+/**
+ * Names for the languages a track declares, joined with "/". A tag CLDR knows
+ * becomes its name in the interface language; a release marker a provider put
+ * in the field ("MULTI") is shown as written.
+ */
+function declaredLanguageLabel(tags: ReadonlyArray<string | undefined>): string {
+  const seen = new Set<string>();
+  const labels: string[] = [];
+  for (const raw of tags) {
+    const tag = raw?.trim();
+    if (!tag || UNDECLARED_LANGUAGE_CODES.has(tag.toLowerCase())) continue;
+    const label = displayLanguageName(tag) ?? tag;
+    const identity = label.toLowerCase();
+    if (seen.has(identity)) continue;
+    seen.add(identity);
+    labels.push(label);
+  }
+  return labels.join("/");
+}
+
+/**
+ * The primary label for one audio row, shared by the item page and the player
+ * menus: the declared language when there is one, else the codec and channel
+ * layout ("EAC3 5.1"), else the row's 1-based `position` ("Track 2"). Nothing
+ * here guesses a language from a release name; the next render re-derives the
+ * label, so a probed language replaces the gap on its own.
+ */
+export function audioTrackIdentity(
+  track: AudioTrackIdentitySource,
+  position: number,
+): AudioTrackIdentity {
+  const language = declaredLanguageLabel(
+    track.languages?.length ? track.languages : [track.language],
+  );
+  if (language) return { title: language, languageUndeclared: false, titleFromFormat: false };
+
+  const format = [audioTrackLabel(track), formatChannels(track.channels)].filter(Boolean).join(" ");
+  if (format) return { title: format, languageUndeclared: true, titleFromFormat: true };
+
+  return {
+    title: t("web.player.audioMenu.trackFallback", { number: position }),
+    languageUndeclared: true,
+    titleFromFormat: false,
+  };
+}
+
+/**
+ * The honest gap for a row whose language is not declared: "Language: Unknown"
+ * in the interface language, read by assistive tech and shown as a tooltip.
+ */
+export function undeclaredLanguageHint(): string {
+  return `${t("web.detail.mediaInfo.row.language")}: ${t("web.detail.audio.unknown")}`;
+}
+
 interface FormatFileSizeOptions {
   fallback?: string;
   /** Use IEC unit labels (GiB/MiB/KiB) instead of GB/MB/KB. Math is 1024-based either way. */
   iecUnits?: boolean;
+  /** Drop a zero decimal, as a limit is said: "64 MB", not "64.0 MB". */
+  trimZeroDecimal?: boolean;
 }
 
+const SIZE_UNIT_KEYS: Record<"si" | "iec", [MessageKey, MessageKey, MessageKey]> = {
+  si: ["web.common.format.size.gb", "web.common.format.size.mb", "web.common.format.size.kb"],
+  iec: ["web.common.format.size.gib", "web.common.format.size.mib", "web.common.format.size.kib"],
+};
+
 export function formatFileSize(bytes?: number, options: FormatFileSizeOptions = {}): string {
-  const { fallback = "", iecUnits = false } = options;
+  const { fallback = "", iecUnits = false, trimZeroDecimal = false } = options;
   if (!isPositive(bytes)) return fallback;
-  const [giga, mega, kilo] = iecUnits ? ["GiB", "MiB", "KiB"] : ["GB", "MB", "KB"];
-  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} ${giga}`;
-  if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(1)} ${mega}`;
-  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} ${kilo}`;
-  return `${bytes} B`;
+  const [giga, mega, kilo] = SIZE_UNIT_KEYS[iecUnits ? "iec" : "si"];
+  const size = (value: number) => formatDecimal(value, 1, trimZeroDecimal ? 0 : 1);
+  if (bytes >= 1024 ** 3) return t(giga, { size: size(bytes / 1024 ** 3) });
+  if (bytes >= 1024 ** 2) return t(mega, { size: size(bytes / 1024 ** 2) });
+  if (bytes >= 1024) return t(kilo, { size: size(bytes / 1024) });
+  return t("web.common.format.size.bytes", { size: bytes });
 }
 
 // A size token as it appears in a release/provider label ("4.2 GB", "800 MB"),
@@ -154,25 +244,27 @@ export function stripReleaseSizeToken(releaseName: string): string {
 
 export function formatBitrate(kbps?: number, fallback = ""): string {
   if (!isPositive(kbps)) return fallback;
-  return `${Math.round(kbps).toLocaleString()} kbps`;
+  return t("web.common.format.bitrate.kbps", {
+    rate: Math.round(kbps).toLocaleString(formatLocale()),
+  });
 }
 
 export function formatMbpsFromKbps(kbps?: number, fallback = "—"): string {
   if (!isPositive(kbps)) return fallback;
-  return `${(kbps / 1000).toFixed(1)} Mbps`;
+  return t("web.common.format.bitrate.mbps", { rate: formatDecimal(kbps / 1000, 1) });
 }
 
 export function formatSampleRate(sampleRate?: number, fallback = ""): string {
   if (!isPositive(sampleRate)) return fallback;
-  return `${sampleRate.toLocaleString()} Hz`;
+  return t("web.common.format.sampleRate", { rate: sampleRate.toLocaleString(formatLocale()) });
 }
 
 export function formatChannels(channels?: number): string {
   if (!channels || channels <= 0) return "";
   if (channels === 8) return "7.1";
   if (channels === 6) return "5.1";
-  if (channels === 2) return "stereo";
-  return `${channels} ch`;
+  if (channels === 2) return t("web.common.format.channels.stereo");
+  return t("web.common.format.channels.count", { count: channels, count_text: channels });
 }
 
 /** Ensures a raw Dolby Vision label ("Profile 8.1") carries the "Dolby Vision" prefix. */
@@ -213,5 +305,7 @@ export function formatRuntimeMinutes(minutes: number): string {
   if (minutes <= 0) return "";
   const h = Math.floor(minutes / 60);
   const m = minutes % 60;
-  return h > 0 ? `${h}h ${m}m` : `${m}m`;
+  return h > 0
+    ? t("web.common.format.runtime.hoursMinutes", { hours: h, minutes: m })
+    : t("web.common.format.runtime.minutes", { count: m, count_text: m });
 }

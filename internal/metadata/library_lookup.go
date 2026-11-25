@@ -92,7 +92,7 @@ func (s *MetadataService) FetchLibraryMetadata(
 		return nil, err
 	}
 	language := s.resolveFolderLanguage(ctx, folderID)
-	providerIDs, err := s.resolveSeriesRefreshProviderIDs(ctx, item, folderID, language, true)
+	providerIDs, err := s.resolveSeriesRefreshProviderIDs(ctx, item, folderID, language, true, false)
 	if err != nil {
 		return nil, err
 	}
@@ -304,8 +304,8 @@ func libraryPartialSeriesResult(
 
 // librarySeasonFailure reports whether a season's outcome leaves the series
 // snapshot incomplete. A successful empty response is only legitimate for a
-// season that has not aired yet; a released or undated season that returns no
-// episodes is a lookup failure, not proof that the season is empty.
+// season whose episodes are not announced yet; a released season that returns
+// no episodes is a lookup failure, not proof that the season is empty.
 func librarySeasonFailure(season SeasonResult, outcome librarySeasonEpisodes) []error {
 	switch outcome.outcome {
 	case libraryEpisodesNoProvider:
@@ -313,7 +313,7 @@ func librarySeasonFailure(season SeasonResult, outcome librarySeasonEpisodes) []
 	case libraryEpisodesPartial:
 		return []error{outcome.err}
 	default:
-		if len(outcome.episodes) == 0 && !librarySeasonIsFuture(season) {
+		if len(outcome.episodes) == 0 && !librarySeasonAwaitingEpisodes(season) {
 			return []error{fmt.Errorf("season %d returned no episodes: %w", season.SeasonNumber, ErrMetadataNotFound)}
 		}
 		return nil
@@ -535,7 +535,14 @@ func validLibraryEpisodeAirDate(value string) bool {
 	return err == nil
 }
 
-func librarySeasonIsFuture(season SeasonResult) bool {
+// librarySeasonAwaitingEpisodes reports whether a season the provider lists
+// cannot be expected to hold episodes yet, so an empty episode response is
+// information rather than a failure. A season without a parseable air date is
+// one the provider has announced without scheduling it: TVDB lists Frieren's
+// "The Golden Land Arc" with no air date while its episodes do not exist. A
+// future date is the other pending case. A season with a date that has passed
+// is not covered: an empty released season stays a lookup failure.
+func librarySeasonAwaitingEpisodes(season SeasonResult) bool {
 	airDate, err := time.Parse(time.DateOnly, strings.TrimSpace(season.AirDate))
-	return err == nil && airDate.After(time.Now())
+	return err != nil || airDate.After(time.Now())
 }

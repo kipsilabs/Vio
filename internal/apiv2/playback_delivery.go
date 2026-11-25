@@ -124,6 +124,9 @@ func registerPlaybackDelivery(reg *Registry) {
 			{Name: playbackAccountToken, In: playbackParamQuery, Description: "Media-element fallback for the account bearer token when an Authorization header cannot be set. Header-authenticated media requires the Authorization header and the profile selector.", Schema: &huma.Schema{Type: huma.TypeString}},
 			{Name: "st", In: playbackParamQuery, Description: "Signed stream reference the plan URL carries; it reconstructs the session after a restart. Omitted for header-authenticated media. Account and viewer authorization are always required.", Schema: &huma.Schema{Type: huma.TypeString}},
 		}
+		if route.protocol == "media-bytes" {
+			params = append(params, &huma.Param{Name: playback.RemuxRangeQueryParam, In: playbackParamQuery, Description: "Set to refuse by the server on a server_remux_progressive URL whose attempt listed progressive_range_refusal_v1 in deliveries.progressive.features. A progressive remux streams from its seek origin and cannot resume: with it, a GET whose Range starts past byte 0 (or is a suffix range) answers 409 before the remux starts, and the client reopens the stream at its current position. Without it such a range streams from the origin with 200.", Schema: &huma.Schema{Type: huma.TypeString, Enum: []any{playback.RemuxRangeRefuse}}})
+		}
 		if route.id == playbackSegmentOperation {
 			params = append(params, &huma.Param{Name: playbackSegmentName, In: playbackParamPath, Required: true, Description: "Segment name from the media playlist. sub_NNNNN.vtt names a WebVTT subtitle rendition segment, answered from the cues already produced; one the transcode does not reach in time is an empty WebVTT document. sub_<track>_NNNNN.vtt names a segment of the on-demand rendition of container track <track> (hls_subtitle_renditions_all_v1), read from the source when it is requested.", Schema: &huma.Schema{Type: huma.TypeString, MinLength: new(1)}})
 		}
@@ -303,9 +306,13 @@ func (w *playbackDeliveryWriter) transport() *streamResponseWriter {
 //
 // A v1 handler may also write a 503 with a machine-readable code that deserves
 // its own v2 type: provider_unavailable distinguishes a transient provider
-// outage (keep retrying this release) from a missing server dependency. The
-// code is matched only at 503 so a mismatched handler can never mint a type
-// whose status disagrees with the response.
+// outage (keep retrying this release) from a missing server dependency, and
+// subtitle_source_unavailable distinguishes a subtitle sidecar whose live layout
+// could not be verified (retry after the advertised delay) from a broken
+// delivery route. Matching the catalog by code keeps every such type additive:
+// an operation only needs a catalog entry, not an adapter special case. The code
+// is matched only at 503 so a mismatched handler can never mint a type whose
+// status disagrees with the response.
 func playbackDeliveryProblemType(status int, code string) ProblemType {
 	switch status {
 	case http.StatusGone:
@@ -313,8 +320,10 @@ func playbackDeliveryProblemType(status int, code string) ProblemType {
 	case http.StatusBadGateway:
 		return TypeDependencyUnavailable
 	case http.StatusServiceUnavailable:
-		if code == TypeProviderUnavailable.ID {
-			return TypeProviderUnavailable
+		for _, candidate := range Catalog() {
+			if candidate.ID == code && candidate.Status == http.StatusServiceUnavailable {
+				return candidate
+			}
 		}
 	}
 	return TypeForStatus(status)

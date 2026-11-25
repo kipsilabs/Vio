@@ -39,6 +39,7 @@ const (
 	terminalMessageLowerVersionServesV3    = "A lower-resolution version serves this quality."
 	containerMP4V3                         = "mp4"
 	containerMKVV3                         = "mkv"
+	containerMatroskaV3                    = "matroska"
 	containerHLSV3                         = "hls"
 	mimeVideoMP4V3                         = "video/mp4"
 	mimeVideoMSVideoV3                     = "video/x-msvideo"
@@ -123,9 +124,25 @@ type PlannerInputV3 struct {
 	AdditionalSubtitles              []SubtitleInventoryEntryV3
 	ForceSoftwareVideoDecode         bool
 	DecodeAttemptDetail              string
+	// AudioShapeRetry rebuilds the current delivery's audio as a stereo AAC
+	// recipe after the client's audio output failed to initialize on a
+	// surround one. It is set only for the single bounded retry the handler
+	// allows per delivery, and it never changes the delivery itself.
+	AudioShapeRetry bool
+	// AudioInitFailureDetail names the client's audio-output failure when the
+	// attempt's most recent failure was one. The planner uses it to report a
+	// specific terminal instead of a generic adaptation refusal.
+	AudioInitFailureDetail string
 	// LocalNetwork reports that the request came from the server's local
 	// network (streamlocation.Local). False is treated as remote.
 	LocalNetwork bool
+	// DeclaredFactsOnly marks a caller that evaluates a row it will not probe
+	// (the versions check's playability pass). Such a caller cannot turn
+	// incomplete video metadata into a validated route, so a terminal the
+	// declared facts already prove is answered now instead of the retryable
+	// source_metadata_incomplete. A start path leaves it false: its probe may
+	// still complete the route, so it must keep asking for that probe.
+	DeclaredFactsOnly bool
 }
 
 // SourceExecutionMetadataV3 is the immutable source probe snapshot used to
@@ -192,6 +209,10 @@ type PlannerResultV3 struct {
 	Terminal       *TerminalV3
 	PlayMethod     PlayMethod
 	TranscodeAudio bool
+	// AdaptationReasons says why the route changes the file, in
+	// AdaptationReasons order; empty for the original file. Server-side only:
+	// sessions report it to the admin activity views, never on the plan.
+	AdaptationReasons []string
 	// RemuxResumeLeadingPictureDrop asks a progressive remux that starts past
 	// zero to drop the open-GOP leading pictures macOS Firefox rejects. It is
 	// best effort: an executor whose FFmpeg lacks the filter serves the plain
@@ -250,6 +271,11 @@ type PlannerResultV3 struct {
 	// serve the request. It exists so the handler can log the stickiness
 	// decision where DeliveryChange logging already lives.
 	StickyDeliveryKept bool
+	// RouteDowngrade names the server-side rule that kept a route the client's
+	// own claims would have allowed out of this plan (see
+	// RouteDowngradeUnverifiedContainerV3). Diagnostic only: it is logged next
+	// to decision_reason and is never serialized to a client.
+	RouteDowngrade string
 }
 
 // hlsToneMapCapabilities resolves the lazy pooled inventory when present and
@@ -296,11 +322,60 @@ func PlanPlaybackV3(input PlannerInputV3) (result PlannerResultV3) {
 			stickyInput.DeliveryAllowList = []string{stickyClass}
 			if sticky := planPlaybackOnceV3(stickyInput); sticky.Plan != nil {
 				sticky.StickyDeliveryKept = true
-				return sticky
+				result = sticky
 			}
 		}
 	}
-	return result
+	return preferPackagedOverUnverifiedContainerV3(input, result)
+}
+
+// preferPackagedOverUnverifiedContainerV3 re-plans a direct route as a packaged
+// one when the client's container evidence cannot be trusted (see
+// directPlayContainerTrustedV3).
+//
+// The re-plan is a preference, not a prohibition: when no packaged route exists
+// the direct plan is kept, because refusing it would turn a playable file into
+// a terminal. That is the case for a source only the original bytes can carry
+// (a client-managed Dolby Vision profile 7 file, for example). The direct plan
+// also carries the client's own claim, so a client that genuinely plays the
+// container loses nothing when a remux is not what its capabilities allow.
+func preferPackagedOverUnverifiedContainerV3(input PlannerInputV3, direct PlannerResultV3) PlannerResultV3 {
+	if direct.Plan == nil || direct.Plan.Delivery != DeliveryOriginalHTTPV3 {
+		return direct
+	}
+	if directPlayContainerTrustedV3(direct.Plan.Source.Container, input.Request) {
+		return direct
+	}
+	packagedInput := input
+	packagedInput.DeliveryAllowList = packagedDeliveryAllowListV3(input.DeliveryAllowList)
+	if len(packagedInput.DeliveryAllowList) == 0 {
+		// The session's policy admits only direct play, so no packaged route
+		// exists to prefer.
+		return direct
+	}
+	packaged := planPlaybackOnceV3(packagedInput)
+	if packaged.Plan == nil {
+		return direct
+	}
+	packaged.RouteDowngrade = RouteDowngradeUnverifiedContainerV3
+	return packaged
+}
+
+// packagedDeliveryAllowListV3 intersects the packaged delivery classes with the
+// session's policy allow list. An empty result means the policy admits no
+// packaged route.
+func packagedDeliveryAllowListV3(allow []string) []string {
+	packaged := []string{DeliveryClassProgressiveV3, DeliveryClassHLSV3}
+	if len(allow) == 0 {
+		return packaged
+	}
+	intersection := make([]string, 0, len(packaged))
+	for _, class := range packaged {
+		if containsFoldV3(allow, class) {
+			intersection = append(intersection, class)
+		}
+	}
+	return intersection
 }
 
 func planPlaybackOnceV3(input PlannerInputV3) (result PlannerResultV3) {
@@ -334,7 +409,19 @@ func planPlaybackOnceV3(input PlannerInputV3) (result PlannerResultV3) {
 	// a codec the probe could not name. Default selection skips such tracks,
 	// so this one was chosen explicitly or the file has no other. Retrying
 	// cannot help; choosing another track can.
-	if input.AudioTrackIndex >= 0 && input.AudioTrackIndex < len(file.AudioTracks) && !AudioTrackDecodable(file.AudioTracks, input.AudioTrackIndex, file.CodecAudio) {
+	//
+	// The refusal needs measurement behind it (AudioCodecVerdictSupported). A
+	// declared provider row names its tracks without codec ids, so this gate saw
+	// "an unnamed track was selected" and published a non-retryable codec
+	// verdict about a file nobody had probed. A replan pins the previous plan's
+	// audio index, which is what made the gate reachable at all: the first play
+	// passes index -1 (auto) and the replan passes the resolved index. When the
+	// row has no probe evidence the gate has nothing to say — the same posture
+	// the auto path takes — and a delivery that fails afterwards answers the
+	// retryable transport cause instead of a codec verdict.
+	if input.AudioTrackIndex >= 0 && input.AudioTrackIndex < len(file.AudioTracks) &&
+		AudioCodecVerdictSupported(file) &&
+		!AudioTrackDecodable(file.AudioTracks, input.AudioTrackIndex, file.CodecAudio) {
 		message := TerminalAudioTrackUndecodableMessageV3
 		if !AnyAudioTrackDecodable(file.AudioTracks, file.CodecAudio) {
 			message = TerminalNoDecodableAudioMessageV3
@@ -575,6 +662,18 @@ func planPlaybackOnceV3(input PlannerInputV3) (result PlannerResultV3) {
 			Message: "This source's Dolby Vision metadata cannot be removed cleanly, so the validated HDR10 route is unavailable for it.",
 		})
 	}
+	// Incomplete video metadata normally answers the retryable
+	// source_metadata_incomplete, because a probe can still validate a direct
+	// or copy route. A caller that cannot probe (DeclaredFactsOnly) has no way
+	// to complete it now, and the declared facts can already prove the HDR
+	// terminal: no source-preserving route exists for this client's output and
+	// no HDR transcode recipe is installed. That caller must report the
+	// terminal instead of unknown, or a version picker keeps offering a row
+	// the start refuses (see #469). The start path stays on the retryable
+	// refusal so its probe can still heal the row.
+	if input.DeclaredFactsOnly && !routeVideoMetadataCompleteV3(source) && declaredHDRTerminalV3(input, source, rangeOK, clientManagedRange, clientDV8BaseLayerOK, dvStripEligible, serverDV81Eligible, clientDV81Eligible, clientHDR10Eligible) {
+		return hdrTranscodeUnsupportedTerminalV3(resolveToneMapRecipeV3(input, source, nil))
+	}
 	if !routeVideoMetadataCompleteV3(source) {
 		return terminalPlannerResultV3WithDetail("source_metadata_incomplete", "The source is missing video metadata required for a validated playback route.", routeVideoMetadataGapsDetailV3(source), true)
 	}
@@ -762,6 +861,14 @@ func planPlaybackOnceV3(input PlannerInputV3) (result PlannerResultV3) {
 		progressiveTranscodeAudio := progressiveCodecTranscodeAudio || progressiveChannelLimited
 		hlsCodecTranscodeAudio := !hlsCodecAudioOK || normalizeMatroskaAAC
 		hlsTranscodeAudio := hlsCodecTranscodeAudio || hlsChannelLimited
+		if input.AudioShapeRetry && source.AudioChannels > 2 {
+			// The client's audio output failed on the surround recipe this
+			// delivery built. Rebuild the same delivery's audio as stereo AAC:
+			// keep the video route identical and force the audio conversion
+			// even when the source codec was copyable there.
+			progressiveTranscodeAudio = true
+			hlsTranscodeAudio = true
+		}
 		hlsAudioQuirk, hlsAudioQuirkOK := hlsEAC3AudioCorrectionV3(source, input.Request)
 		// The device quirk owns the conversion of a codec HLS could otherwise
 		// copy, including one that only exceeds the channel ceiling, so its
@@ -770,14 +877,14 @@ func planPlaybackOnceV3(input PlannerInputV3) (result PlannerResultV3) {
 		hlsAACChannels := 0
 		switch {
 		case hlsQuirkConvertsAudio:
-			hlsAACChannels = aacOutputChannelsV3(input.Request, DeliveryClassHLSV3, source.AudioChannels, false)
+			hlsAACChannels = aacOutputChannelsForPlanV3(input, DeliveryClassHLSV3, source.AudioChannels, false)
 		case hlsTranscodeAudio:
 			// HLS packaging cannot safely copy non-native codecs such as DTS,
 			// TrueHD, or Opus. Preserve surround when adapting those codecs,
 			// and keep as many channels as a channel ceiling allows; a native
 			// codec rejected by the scoped client claim keeps the normal
 			// compatibility downmix policy.
-			hlsAACChannels = aacOutputChannelsV3(input.Request, DeliveryClassHLSV3, source.AudioChannels, hlsChannelLimited || !hlsNativeAudioCodecV3(source.AudioCodec))
+			hlsAACChannels = aacOutputChannelsForPlanV3(input, DeliveryClassHLSV3, source.AudioChannels, hlsChannelLimited || !hlsNativeAudioCodecV3(source.AudioCodec))
 		}
 		progressiveAudioConvertOK := false
 		if progressiveTranscodeAudio && deliveryAvailableV3(input.Request, DeliveryClassProgressiveV3) {
@@ -845,7 +952,7 @@ func planPlaybackOnceV3(input PlannerInputV3) (result PlannerResultV3) {
 			progressivePlan.DecisionReason = decisionReasonContainerNormalizationV3
 			progressiveAudioChannels := 0
 			if progressiveTranscodeAudio && progressiveAudioConvertOK {
-				progressiveAudioChannels = aacOutputChannelsV3(input.Request, DeliveryClassProgressiveV3, source.AudioChannels, progressiveChannelLimited)
+				progressiveAudioChannels = aacOutputChannelsForPlanV3(input, DeliveryClassProgressiveV3, source.AudioChannels, progressiveChannelLimited)
 				progressivePlan.EffectiveRecipe.AudioCodec = audioCodecAACV3
 				progressivePlan.EffectiveRecipe.AudioChannels = intPointerV3(progressiveAudioChannels)
 				progressivePlan.EffectiveRecipe.AudioLayout = audioLayoutForChannelsV3(progressiveAudioChannels)
@@ -977,6 +1084,14 @@ func planPlaybackOnceV3(input PlannerInputV3) (result PlannerResultV3) {
 		return planVideoTranscodeV3(input, base, source, quality, hlsSubtitle, "copy_routes_exhausted", false, compatibleRouteExcludedByHistory)
 	}
 
+	if input.AudioInitFailureDetail != "" {
+		// The attempt's most recent failure was the device's audio output
+		// failing to initialize, and no recipe survived the ladder. Name that
+		// cause instead of the generic route refusal, and stay retryable: a
+		// different audio track or device output setting can make the same
+		// source play. The detail carries the client's own failing code.
+		return terminalPlannerResultV3WithDetail(TerminalAudioOutputUnsupportedV3, TerminalAudioOutputUnsupportedMessageV3, input.AudioInitFailureDetail, true)
+	}
 	return terminalPlannerResultV3("adaptation_unavailable", "No validated playback route is available for this source and output route.", false)
 }
 
@@ -1185,6 +1300,11 @@ const (
 	// decisionReasonBandwidthCapV3 marks a plan whose recipe was constrained by
 	// the request's bandwidth cap rather than by decode capability.
 	decisionReasonBandwidthCapV3 = "quality_bandwidth_cap"
+	// The quality reasons that name what lowered an automatic or chosen
+	// quality; adaptation reasons translate them.
+	qualityReasonFixedRungV3      = "quality_fixed_rung"
+	qualityReasonDeviceLimitV3    = "quality_device_limit"
+	qualityReasonBandwidthLimitV3 = "quality_bandwidth_limit"
 
 	// decisionReasonClientManagedDynamicRangeV3 marks an original-file plan
 	// whose executor owns source-to-output dynamic-range presentation.
@@ -1338,6 +1458,16 @@ func aacOutputChannelsV3(request StartRequestV3, deliveryClass string, sourceCha
 		return 1
 	}
 	return 2
+}
+
+// aacOutputChannelsForPlanV3 is aacOutputChannelsV3 with the audio-shape
+// recovery applied: a delivery whose surround recipe failed to initialize is
+// re-planned as stereo, which every AAC decoder accepts.
+func aacOutputChannelsForPlanV3(input PlannerInputV3, deliveryClass string, sourceChannels int, preserveSurround bool) int {
+	if input.AudioShapeRetry {
+		preserveSurround = false
+	}
+	return aacOutputChannelsV3(input.Request, deliveryClass, sourceChannels, preserveSurround)
 }
 
 func audioLayoutForChannelsV3(channels int) string {
@@ -1517,6 +1647,41 @@ func planVideoTranscodeUnavailableV3(input PlannerInputV3, subtitle SubtitlePoli
 	return nil
 }
 
+// hdrTranscodeUnsupportedTerminalV3 is the planner's terminal for an HDR/DV
+// source that needs a video encode and has no validated HDR-preserving or
+// tone-map recipe. The ordinary transcode route and the declared-metadata gate
+// share it so their reason, message and detail cannot drift.
+func hdrTranscodeUnsupportedTerminalV3(recipe resolvedToneMapRecipeV3) PlannerResultV3 {
+	return terminalPlannerResultV3WithDetail(TerminalHDRTranscodeUnsupportedV3, "This HDR source requires video encoding, but no validated HDR-preserving or tone-map recipe is installed.", describeToneMapBlockerV3(recipe), false)
+}
+
+// declaredHDRTerminalV3 reports whether the source and client facts on the row
+// already prove the hdr_transcode_unsupported terminal while the probe has not
+// filled in every video field. Video metadata completeness gates route
+// validation; it cannot create a source-preserving route for a client whose
+// output cannot carry the source range, and it cannot install an HDR recipe.
+// The verdict is about the row as it stands: a later probe may write the facts
+// that unlock a route, and the next evaluation re-reads the row.
+//
+// The client guard is deliberately narrow. A client that advertises any HDR
+// presentation route could gain one from metadata the probe has not written
+// yet (a native HDR output, a Dolby Vision base-layer claim that needs the
+// source's compatibility id, or a client-managed range claim). Only a client
+// that advertises none of them can be refused on declared facts alone.
+func declaredHDRTerminalV3(input PlannerInputV3, source SourceDescriptorV3, rangeOK, clientManagedRange, clientDV8BaseLayerOK, dvStripEligible, serverDV81Eligible, clientDV81Eligible, clientHDR10Eligible bool) bool {
+	if source.DynamicRange == "" || source.DynamicRange == DynamicRangeSDRV3 {
+		return false
+	}
+	if rangeOK || clientManagedRange || clientDV8BaseLayerOK || dvStripEligible ||
+		serverDV81Eligible || clientDV81Eligible || clientHDR10Eligible {
+		return false
+	}
+	if clientDeclaresRangePresentationV3(input.Request) {
+		return false
+	}
+	return !resolveToneMapRecipeV3(input, source, nil).ok
+}
+
 // describeToneMapBlockerV3 names the first check that left the tone-map
 // recipe unavailable, in resolveToneMapRecipeV3 order, so an
 // hdr_transcode_unsupported terminal carries the actual missing piece
@@ -1556,7 +1721,7 @@ func resolveTranscodeVideoTargetV3(input PlannerInputV3, source SourceDescriptor
 			result := terminalPlannerResultV3("subtitle_conversion_unsupported", "The selected subtitle must be burned into the video, but this HDR source cannot be re-encoded.", false)
 			return targetVideoSelectionV3{}, quality, toneMapRecipe, &result
 		}
-		result := terminalPlannerResultV3WithDetail(TerminalHDRTranscodeUnsupportedV3, "This HDR source requires video encoding, but no validated HDR-preserving or tone-map recipe is installed.", describeToneMapBlockerV3(toneMapRecipe), false)
+		result := hdrTranscodeUnsupportedTerminalV3(toneMapRecipe)
 		return targetVideoSelectionV3{}, quality, toneMapRecipe, &result
 	}
 	if is4KSourceV3(input.EffectiveFile, source) && !input.Settings.Allow4KTranscode {
@@ -1597,7 +1762,7 @@ func resolveTranscodeVideoTargetV3(input PlannerInputV3, source SourceDescriptor
 	}
 	// Surround sources keep 5.1 through the AAC re-encode (universal Media3
 	// decode); only stereo/mono sources — and unknown layouts — downmix to 2.0.
-	targetAudioChannels := aacOutputChannelsV3(input.Request, DeliveryClassHLSV3, source.AudioChannels, true)
+	targetAudioChannels := aacOutputChannelsForPlanV3(input, DeliveryClassHLSV3, source.AudioChannels, true)
 	// A server bitrate cap, and the estimate budget of an automatic encode,
 	// reserve the AAC and mux share before either video codec is sized, so
 	// the stream fits as a whole and the HEVC decoder check below sees the
@@ -1757,7 +1922,7 @@ func resolveTranscodeVideoTargetV3(input PlannerInputV3, source SourceDescriptor
 func applyTranscodeAudioBudgetV3(input PlannerInputV3, source SourceDescriptorV3, quality *QualityResultV3) (int, *PlannerResultV3) {
 	targetAudioBitrateKbps := 0
 	if input.ServerBitrateCapKbps > 0 {
-		channels := aacOutputChannelsV3(input.Request, DeliveryClassHLSV3, source.AudioChannels, true)
+		channels := aacOutputChannelsForPlanV3(input, DeliveryClassHLSV3, source.AudioChannels, true)
 		_, defaultAudioBitrateKbps := ResolveAACOutputV3(channels, 0)
 		budget := optionalValueV3(input.Request.BandwidthCapKbps) * 95 / 100
 		targetAudioBitrateKbps = min(defaultAudioBitrateKbps, max(64, budget/4))
@@ -1940,7 +2105,7 @@ func planVideoTranscodeV3(input PlannerInputV3, base PlanV3, source SourceDescri
 	plan.EffectiveRecipe.BitrateKbps = intPointerV3(quality.BitrateKbps)
 	targetAudioChannels := targetVideo.audioChannels
 	if targetAudioChannels <= 0 {
-		targetAudioChannels = aacOutputChannelsV3(input.Request, DeliveryClassHLSV3, source.AudioChannels, true)
+		targetAudioChannels = aacOutputChannelsForPlanV3(input, DeliveryClassHLSV3, source.AudioChannels, true)
 	}
 	audioLayout := audioLayoutForChannelsV3(targetAudioChannels)
 	plan.EffectiveRecipe.AudioChannels = intPointerV3(targetAudioChannels)
@@ -2575,13 +2740,13 @@ func ResolveQualityPolicyV3(request StartRequestV3, source SourceDescriptorV3) Q
 	if quality != QualityAutoV3 {
 		targetHeight, _ = strconv.Atoi(strings.TrimSuffix(quality, "p"))
 		classLimit = targetHeight
-		reason = "quality_fixed_rung"
+		reason = qualityReasonFixedRungV3
 		explicitRung = true
 	} else {
 		maxHeight := resolutionHeightV3(request.Capabilities.MaxResolution)
 		if maxHeight > 0 && (targetHeight == 0 || maxHeight < targetHeight) {
 			targetHeight = maxHeight
-			reason = "quality_device_limit"
+			reason = qualityReasonDeviceLimitV3
 		}
 		classLimit = maxHeight
 	}
@@ -2597,7 +2762,7 @@ func ResolveQualityPolicyV3(request StartRequestV3, source SourceDescriptorV3) Q
 		}
 		if overSource {
 			overEstimate = true
-			reason = "quality_bandwidth_limit"
+			reason = qualityReasonBandwidthLimitV3
 		}
 	}
 	if targetHeight <= 0 {
@@ -2720,7 +2885,7 @@ func compoundRungQualityResultV3(rung ladderRungV3, source SourceDescriptorV3, c
 	if capApplied {
 		bitrate = capKbps
 	}
-	reason := "quality_fixed_rung"
+	reason := qualityReasonFixedRungV3
 	if capApplied {
 		reason = decisionReasonBandwidthCapV3
 		warnings = append(warnings, DegradationWarningV3{Code: "bandwidth_cap_applied", Message: "Delivery quality is limited by the configured bandwidth cap."})
@@ -2973,6 +3138,7 @@ func toneMapSourceResolutionV3(file *models.MediaFile, source SourceDescriptorV3
 		metadata.DVBLPresent = track.DVBLPresent
 		metadata.DVRPUPresent = track.DVRPUPresent
 		metadata.ColorRange = track.ColorRange
+		metadata.FrameColorRange = track.FrameColorRange
 		metadata.ColorPrimaries = track.ColorPrimaries
 		metadata.ColorTransfer = track.ColorTransfer
 		metadata.ColorSpace = track.ColorSpace
@@ -3695,6 +3861,56 @@ func audioRemuxFitsServerCapV3(input PlannerInputV3, file *models.MediaFile, aac
 	}
 	_, aacKbps := ResolveAACOutputV3(aacChannels, 0)
 	return totalBitrateKbps+aacKbps <= optionalValueV3(input.Request.BandwidthCapKbps)
+}
+
+// RouteDowngradeUnverifiedContainerV3 is the planner attribution for a direct
+// route declined because the client's container claim was a boolean statement
+// the server cannot verify. See directPlayContainerTrustedV3.
+const RouteDowngradeUnverifiedContainerV3 = "unverified_container"
+
+// opaqueDirectPlayContainerV3 reports whether container carries a stream
+// arrangement a boolean capability statement cannot validate. Matroska is the
+// case that matters: one mkv file can carry H.264/HEVC/AV1 video, any audio
+// codec, and arbitrary track layouts, so "the client lists mkv" says nothing
+// about whether its player can render the particular bytes. Container types
+// with a narrow, fixed stream shape (mp4/mov/m4v) and formats a platform
+// genuinely probes (webm in browsers) are not in this set.
+func opaqueDirectPlayContainerV3(container string) bool {
+	switch strings.ToLower(strings.TrimSpace(container)) {
+	case containerMKVV3, containerMatroskaV3:
+		return true
+	default:
+		return false
+	}
+}
+
+// directPlayContainerTrustedV3 reports whether the client's evidence is strong
+// enough to ship an opaque container as original bytes.
+//
+// A declared block is a boolean statement (web MediaSource.isTypeSupported)
+// that the server cannot verify and cannot update in a client it cannot ship:
+// an older first-party build or a third-party native client still lists mkv,
+// the direct stream is what reaches the device, and the player stalls. Those
+// clients get a packaged route (codec-copy MP4 remux, or a transcode whose
+// output the server produces and can therefore guarantee) instead.
+//
+// Probed evidence keeps direct play. exact (Android MediaCodecList) and
+// platform_attested (Apple's VideoToolbox plus pinned software stack) are
+// decoder attestations, not boolean container claims, so the ExoPlayer-class
+// clients that really do play Matroska are untouched. The known Apple
+// AVPlayer mis-advertisement is corrected earlier by
+// appleAVPlayerMKVContainerFallback, which strips mkv from the effective
+// container list for that client regardless of its evidence tier.
+func directPlayContainerTrustedV3(container string, request StartRequestV3) bool {
+	if !opaqueDirectPlayContainerV3(container) {
+		return true
+	}
+	switch request.Capabilities.VideoEvidence {
+	case EvidenceExactV3, EvidencePlatformAttestedV3:
+		return true
+	default:
+		return false
+	}
 }
 
 func trySelectDeliverablePlanV3(request StartRequestV3, deliveryClass string, plan PlanV3, attempted []string, routeExcluded *bool) bool {

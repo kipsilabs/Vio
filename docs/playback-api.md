@@ -1,8 +1,8 @@
-# Playback API (v2)
+# Playback API
 
 `/api/v2/playback` is the native playback contract. Protocol version 3 decides
 the route ([playback protocol v3](architecture/playback-protocol-v3.md)); this
-document covers the v2 envelope around it: the installation check, sequenced
+document covers the envelope around it: the installation check, sequenced
 progress and stop, delivery, and revocation. Every operation requires an
 authenticated account and an active profile. Validation failures are `422`; an
 unavailable store is `503`.
@@ -180,9 +180,11 @@ server instance UUID that diagnostics also report. `protocol_versions` is
 `fixed_media_file_v1`, `marker_segments_v1`, `trickplay_v1`,
 `bandwidth_probe_v1`, `connection_speed_v1`, and `versions_check_v1`. With `connection_speed_v1` the
 response adds `bandwidth_probe_url`, the media-path probe below, on the origin
-the request arrived on. A reverse proxy that rewrites `Host` to a bare IP
-address and sends no `X-Forwarded-Host` leaves only the address it dialed;
-then the URL is on `server.public_url` when one is configured. When the origin
+the request arrived on, with `X-Forwarded-Proto` and `X-Forwarded-Host`
+counted only from a trusted proxy. A reverse proxy that rewrites `Host` to a
+bare IP address and names no single client host in `X-Forwarded-Host` as a
+trusted proxy leaves only the address it dialed; then the URL is on
+`server.public_url` when one is configured. When the origin
 is the server's local-network origin (a local route), clients send the probe with the saved server's credentials and trust,
 as they do for any request to that server. The response also adds the speed
 test schedule:
@@ -375,6 +377,16 @@ items (series, season, lists), and failed lookups leave the field out. It
 appears on `GET /api/v2/catalog/items/{id}`, `GET /api/v2/watch/{id}`, and
 the admin metadata update response, keeping v1 answers byte-identical.
 
+A detail discovery also hands the listing it just persisted to the playback
+handler before its waiters return. The start that follows — the concrete
+candidate row a detail page lists, or the provider-neutral placeholder — reads
+its candidate metadata from that entry instead of listing the provider again,
+so a first play after a detail read costs the one listing the read already paid
+for rather than a second one, and a repeat play within the entry's lifetime
+lists nothing. A forced relist, a decode-rotation exclusion, and a row the
+catalog indicted each still list, because those need the provider's current
+answer rather than the one the detail read saw.
+
 After a detail-page read persists a listing, the server schedules one detached
 pre-play probe chain for the opened item: it re-reads the item's selected
 version when the detail read supplied `file_id`, otherwise its default version.
@@ -389,9 +401,12 @@ candidate, so the play path's own probe handles it. Chains are bounded (two
 concurrent, one per item, a whole-chain deadline, and the shared probe
 gate), never block any API response, and never wait for playback: a chain may
 record evidence before a play attempt resolves the same row, in which case that
-attempt reuses it, and a play attempt that resolves first probes on its own as
-usual. Foreground probing may still be required when the chain has not
-finished, or when it prepared a version the play attempt does not resolve.
+attempt reuses it, and a play attempt that resolves first joins the chain's
+in-flight probe instead of cancelling it. One ffprobe per candidate results:
+the shared probe cache single-flights the enumeration, so the chain's work is
+never discarded and then repeated. Foreground probing may still be required
+when the chain has not finished, or when it prepared a version the play attempt
+does not resolve.
 These bounds are per process: a deployment with several replicas prepares
 independently on each one. The queued evidence write follows the existing
 persistence rules, including their stale-write protections; probing
@@ -479,11 +494,10 @@ series' backdrop, and local extras use their own still as the poster when they
 have one and otherwise inherit their parent's artwork. URLs use
 the same resolver and `image_size` query as catalog item detail. Missing
 artwork is omitted; clients can retain their catalog-detail fallback.
-The frozen v1 watch response does not gain these fields.
 
 ## Marker ranges
 
-V2 watch detail includes `marker_segments` on each file version, including
+Watch detail includes `marker_segments` on each file version, including
 versions nested in playback variants. Each entry is
 `{kind, start_seconds, end_seconds}`, with kind `intro`, `credits`, `recap`, or
 `preview`. The collection is ordered by source time and is empty when the file
@@ -513,8 +527,8 @@ validation_failed` at `header.x-profile-id`.
 
 When `playback.allow_hevc_encoding` is enabled, video adaptation may encode
 HEVC for clients that explicitly support HEVC on their HLS delivery route.
-The server advertises `video_to_hevc` through the existing transformation
-capability inventory. The effective recipe and frozen transcode target identify
+The server lists `video_to_hevc` in its validated transformation inventory
+(`getAdminHardwareAcceleration`). The effective recipe and frozen transcode target identify
 HEVC; existing H.264-only clients continue to receive H.264. Disabling the
 setting affects new planning decisions without changing active frozen recipes.
 HEVC direct play and remux remain independent of the encoding setting.
@@ -544,6 +558,16 @@ and `terminal.retryable: true`; mint a new attempt. Local direct and HLS media
 URLs in the plan are projected into the `/api/v2` namespace; the signed `st`
 query they carry is unchanged.
 
+A start that fails transiently answers `503` with `Retry-After`, not
+`500 internal_error`, so the client retries instead of treating the failure as
+a server defect. This covers a transport that could not start before the
+request deadline, a terminal decision the plan store could not record on that
+expired budget, and route-capacity exhaustion. Route capacity keeps the v1
+`route_capacity_unavailable` body code; v2 maps it to `503 dependency_unavailable`
+as the replan path does, and the other retryable start failures use
+`dependency_unavailable` on both surfaces. A genuine internal fault remains
+`500 internal_error`.
+
 When the profile's stored `playback.subtitle_mode` is `always`, an omitted
 `subtitle_track_id` / `subtitle_track_index` on start resolves to the stored
 preference's track before planning, so subtitles are on — and a bitmap track
@@ -559,8 +583,7 @@ A start that returns a playable decision registers the device the client
 declares in `X-Silo-Device-Id` (with the optional `X-Silo-Device-Name` and
 `X-Silo-Device-Platform`) for the acting profile and refreshes its
 `last_seen_at`, as described in the
-[device registry](settings-api.md#device-registry). The v1 start route reads the
-same headers. A refused start, or one that returns a terminal decision,
+[device registry](settings-api.md#device-registry). A refused start, or one that returns a terminal decision,
 registers nothing. These headers do not change the playback device that
 `X-Device-ID` names.
 
@@ -646,9 +669,7 @@ rejection only refers to that file: with alternate versions allowed, the server
 tries the item's other versions the viewer may play (library access and
 playback-quality ceiling) before answering `source_unreadable`.
 Season episode listings mark such files with `unreadable: true` (see
-[Catalog API](catalog-api.md#episode-files)). The v1 start route shares the
-planner, so v1 clients can also receive `source_unreadable`; like any unknown
-reason, they show `terminal.message`.
+[Catalog API](catalog-api.md#episode-files)).
 
 The web player retries an interrupted START with the identical body, including
 when response headers arrived but reading the body failed. Its 60-second retry
@@ -658,7 +679,6 @@ the request or backoff. A 4xx refusal ends that start, and a later user Play
 uses the newly selected file and a new attempt ID. The web client does not
 restore pending START requests across page reloads.
 
-The frozen v1 start route ignores `allow_alternate_versions`.
 Servers advertising `fixed_media_file_v1` accept the optional start field
 `allow_alternate_versions`. Setting it to `false` keeps this attempt on the
 requested file through quality, track, output, seek, and recovery replans.
@@ -706,6 +726,53 @@ Every viewer then starts a new fixed-file attempt for that room selection. Ordin
 web, Apple, Android, and Jellyfin playback keep their existing behavior; Apple
 has no active room caller and Android's room UI remains disabled.
 
+## Version substitution
+
+`startPlayback` and `replanPlayback` may commit a release other than the row the
+client asked for: the requested release is dead or its provider listing failed, a
+transport or decode failure rotated the candidate, or the planner could not
+deliver the picked version to this client. The plan reports that instead of
+leaving the client to diff ids:
+
+- `substituted_from_file_id` is the catalog row the client asked for;
+- `substitution_reason` is the machine-readable cause.
+
+Both are omitted when the effective row is the requested one. The vocabulary is
+additive — `dead_release`, `listing_failed`, `transport_failed`,
+`decode_rejected`, `version_not_playable`, `unknown` — and a client must render
+an unknown value as a generic substitution rather than failing. The fields are
+UI-only: they are set after the plan identity is finalized and never change
+`plan_id` or `plan_attempt_key`. `effective_media_file_id` still names the row
+actually served, and `effective_virtual_uri` / `virtual_source_revision` follow
+it. Every plan decision and every replan that commits another row carries them,
+so a client never has to guess from an id diff.
+
+A substitution is bounded by the viewer's selection. A substitute that would
+offer fewer audio or subtitle tracks than the selected row, or contradict the
+item's runtime, is refused. So is a substitute whose served bytes contradict the
+release it claims: a row's own candidate may still play and carry its measured
+inventory when a provider posts it short, but unverified bytes never adopt
+another release's row, plan, or inventory. When no candidate can serve the
+selection, the start answers the retryable `virtual_source_unavailable` terminal
+with a message naming the version list, so the client offers the versions
+instead of playing a poorer or different release.
+
+A start's effective row is always one the item's version list carries, so the
+row a client records as playing is a row the same client can show and reconcile.
+A resolver substitution that lands on any other row is refused like an unusable
+candidate and the next one is tried; when none qualifies the terminal names the
+version list. Two cases are exempt: the requested row itself, and a
+provider-neutral listing row, which owns no bytes and therefore binds to the row
+that owns the served candidate as ordinary auto selection. A refusal for an
+unlisted row is not a verdict about the release and never stamps it failed.
+
+The refusal that reports served bytes contradicting the row answers the
+retryable `source_mismatch` terminal reason, the same verdict the version list
+publishes as `source_mismatch` (see [Catalog API](catalog-api.md)).
+The requested release is alive; the provider served the wrong file. Like every
+terminal reason, the value is additive: a client that does not recognize it
+renders the message, which names the version list.
+
 ## Progress and stop
 
 Progress accepts `{installation_id, sequence, position, is_paused}`. `sequence`
@@ -727,7 +794,7 @@ receipt is `{outcome, accepted?}`, where `accepted` is the latest committed
 | Attempt ended by an administrator | 410 `playback_session_ended` |
 | Attempt already stopped otherwise, or unknown | 404 |
 
-An applied sample is persisted through the same writers v1 uses (resume
+An applied sample is persisted through the shared progress writers (resume
 position, scrobbles), from the live session when this replica holds it and from
 the attempt row otherwise. The writers run after the compare-and-set and the
 resume position is last-write-wins, so after writing, the server re-reads the
@@ -788,8 +855,7 @@ own receipt.
 ## Replan and route events
 
 `replanPlayback` covers failure recovery, seek re-anchor, and track, quality and
-output changes, with the v3 body plus `installation_id`. It runs the same
-application code as the frozen v1 replan route. It is idempotent on `replan_request_id`
+output changes, with the v3 body plus `installation_id`. It is idempotent on `replan_request_id`
 plus the body digest: the same request replays its committed decision; a reused
 id with different input, a superseded plan, or an identical replan still in
 progress is `409`; a session owned by another profile is `403`; a session an
@@ -813,7 +879,7 @@ reanchor, and is excluded from plan identity.
 | Operation | Method and path |
 | --- | --- |
 | Original bytes | GET/HEAD `/api/v2/stream/{session_id}` |
-| HLS manifest | GET `/api/v2/playback/transcode/{session_id}/master.m3u8` |
+| HLS manifest | GET/HEAD `/api/v2/playback/transcode/{session_id}/master.m3u8` |
 | HLS segment | GET `/api/v2/playback/transcode/{session_id}/segment/{name}`; `sub_NNNNN.vtt` names a subtitle rendition segment, `sub_<track>_NNNNN.vtt` one of an on-demand rendition (`hls_subtitle_renditions_all_v1`) |
 | Subtitle sidecar | GET/HEAD `/api/v2/stream/{session_id}/subtitles/{track}` |
 | Subtitle fonts | GET `/api/v2/stream/{session_id}/subtitles/{track}/fonts`, JSON `{items: [{name, data}]}` |
@@ -833,13 +899,34 @@ These reuse the shared byte-delivery handlers behind the v2 listener, as the raw
 playback registry allows. The plan's URLs
 carry the signed stream reference `st`; a media element that cannot set headers
 may send the account bearer as the `token` query parameter, and the viewer
-headers select the profile. Account authentication and viewer authorization are
-always required. After a restart the session is rebuilt from the token the
-client re-presents
+headers select the profile. Without an account credential, `st` on its own
+authorizes the media, sidecar and HLS requests of the one session it names, as
+its account and profile: a Google Cast receiver gets only the URL. Viewer
+authorization still runs for that profile. The reference is bound to the login
+session that started playback, and the session's playback attempt must still be
+live, so stopping the session, signing out or disabling the account ends it
+before its 24-hour expiry. A session started with an API key keeps needing the
+account credential. After a restart the session is rebuilt from the token the
+client re-presents. Plans that negotiated `header_authenticated_media_v1` carry
+no `st`; the API rebuilds those from its Redis recovery card for the
+authenticated owner, while the card exists
 ([restart-resilient playback](architecture/restart-resilient-playback.md)).
 Ranges, conditional requests and HEAD keep their HTTP semantics; an
-unsatisfiable range is `416 range_not_satisfiable`. A failure before the first
-byte is a v2 problem; a failure after it ends the stream. A stopped, expired or
+unsatisfiable range is `416 range_not_satisfiable`. A `server_remux_progressive`
+stream is the exception: it is one forward-only response from its `seek`
+origin, so it answers `200` from that origin whatever the `Range`. A client that
+lists `progressive_range_refusal_v1` in `deliveries.progressive.features` gets
+`remux_range=refuse` on that URL, and a GET whose range starts past byte 0, or
+is a suffix range such as `bytes=-500`, is then `409` before the remux starts;
+the client reopens the stream at its current position. The API answers it as a
+`conflict` problem and a proxy as plain text, so a client should act on the
+status. A proxy that does not advertise `remux_range_refusal_v1` would ignore
+the parameter, so the plan leaves it off that proxy's URL and the stream keeps
+the `200`. The web video player opts in on Chromium browsers only. The web
+audiobook player, which has no reopen at the current position, Firefox, Safari
+and native players keep the `200`; native players skip the bytes they already
+have. A failure before the first
+byte is a Problem Details response; a failure after it ends the stream. A stopped, expired or
 terminated session answers `410 playback_session_ended`. A subtitle sidecar the
 node has no room to read yet answers `503` with `Retry-After`; retry it then.
 
@@ -939,7 +1026,49 @@ behaves like a single-node seek. Clients should let that request finish; if the
 ceiling expires it answers `412` while the restart keeps producing, so refetch
 the playlist as above.
 
-Subtitle inventory URLs in v2 playback responses use the `/api/v2/stream/`
+A plan may carry `stream.parallel_range_url`: a URL the client may read the
+file's byte ranges from over several connections. The server sets it only for an
+`original_http` plan whose attempt sent client feature
+`parallel_range_origin_v1` without `header_authenticated_media_v1`, and names
+one of three:
+
+- the plan's own stream, as a reference relative to the API root like
+  `stream.url`, when the API serves the file. The server names it only for an
+  attempt a login session started;
+- the same stream on the media origin the administrator set in
+  `server.web_media_url`, in place of the first, when one is set and the client
+  did not arrive through a network access provider;
+- the proxy node's own URL, the one `stream.url` already carries, when a node
+  serves the file.
+
+The URL authorizes itself (`st`, or the token in a node URL's path). A client
+uses it exactly as given and adds no account token, header or cookie to it. A
+client reads parallel ranges only over connections that are separate: on the
+page's own origin, the web player does so only when the page loaded over
+HTTP/1.1, and it stops when the browser reports that a range came over HTTP/2
+or HTTP/3 (the stream answers carry `Timing-Allow-Origin: *` for that). A plan
+without `parallel_range_url` is read from `stream.url`.
+`stream.url` stays valid; a client may also read the warm head, overflow ranges,
+or a natively played file from it.
+
+Three kinds of response are readable from another origin. Each carries
+`Access-Control-Allow-Origin: *` and no `Access-Control-Allow-Credentials`:
+
+- The original-file stream, `GET` and `HEAD` on `/api/v2/stream/{session_id}`,
+  refusals included, with `Range` allowed and `Content-Range` exposed. The web player reads it from
+  the media origin. The `OPTIONS` preflight answers `204` before any
+  credential is read, with `GET, HEAD, OPTIONS` and the `Range` header allowed,
+  and `Access-Control-Max-Age: 600` so a browser that preflights `Range` does
+  not repeat it for every range.
+- The HLS manifest and segment answers, refusals included, with `Range` allowed
+  and the range and validator headers exposed, so a player such as a Google Cast receiver can
+  read them. The API answers no `OPTIONS` preflight there; Cast receivers
+  fetch playlists and segments with plain GETs and have not been seen to send
+  one.
+- Subtitle sidecars, from their handler. A refusal before the handler runs
+  carries no CORS header.
+
+Subtitle inventory URLs in playback responses use the `/api/v2/stream/`
 mount, including relative `/stream/` values produced by the shared inventory
 builder. The web player applies the same mapping to realtime subtitle URLs.
 Absolute delivery URLs from distributed nodes retain their origin and path;
@@ -955,13 +1084,21 @@ it mirrors the server's own sidecar de-duplication discriminator. `path_key` is
 absent on embedded tracks and on servers that predate it: a client falls back
 to `file_name` there, which cannot separate same-basename sidecars.
 
+An external subtitle whose only title is its file name is labeled by that
+name only for a viewer who may see file names (see
+[File paths and names](catalog-api.md#file-paths-and-names)). Everyone else
+gets its embedded title or language as the `label`, numbered like the catalog
+title when several share a language, format and flags. Realtime subtitle
+events never label a sidecar by its file name, for any viewer.
+
 ## Revocation
 
-Stop, session expiry or abort, and admin stop or terminate (v1 and v2) write the
+Stop, session expiry or abort, and admin stop or terminate write the
 Redis key `silo:streamauth:<session_id>` with a TTL equal to the stream token
-lifetime. The API checks it before it serves or reconstructs a session, and the
-proxy and transcode nodes check it on every token-verified serve, so a
-still-valid token cannot revive a session on any replica. Lookups are cached in
+lifetime. The API checks it before it serves or reconstructs a session, the
+proxy checks it on every token-verified serve, and every relay to a transcode
+node checks it before forwarding, as the API does before a node rebuilds a
+session, so a still-valid token cannot revive a session on any replica. Lookups are cached in
 process for two seconds. When Redis is unavailable the check fails open with a
 warning: serving never waits on Redis. A deployment without Redis keeps the
 token TTL as its bound.
@@ -1028,31 +1165,13 @@ plays every pick from the beginning, ignoring saved progress. While a shuffle
 is set, the post-roll screen shows `next` instead of the next episode, and the
 player offers no sequential next or previous episode.
 
-## v1 bridge
+## Marker preview delivery
 
-`/api/v1/playback/start`, `/{session_id}/progress`, `DELETE /{session_id}`,
-`/{session_id}/replan`, `/route-events` and `/api/v1/stream/...` keep their
-frozen handlers and bodies: progress is `{position, is_paused}` and answers
-`204`, and stop needs no body and answers `204`. They share the application
-code, the deny marker and the attempt row with v2. Apple and Android use this
-surface until they adopt v2; it is retired with the rest of `/api/v1` under the
-`410 client_upgrade_required` tombstone
-([API contract](architecture/api-contract.md)).
-
-The shared v3 decision body the bridge serves carries `playback_plan.delivery_change`
-only on `/api/v2`: the handler clears it on a v1 decision, so the frozen bridge
-grows no field. It is scoped the same way as `tracks_pending`, the other v2-only
-plan hint, and the [protocol spec](architecture/playback-protocol-v3.md#92-mid-session-delivery-change)
-records the decision.
-
-### Marker preview delivery
-
-Native v2 playback capabilities also advertise `marker_thumbnails_v1`. The web
+Native playback capabilities also advertise `marker_thumbnails_v1`. The web
 player opts into that feature at playback start to receive `marker_thumbnail_ready`
 updates; negotiation stays fixed for the attempt. Canonical watch reads return
 the same durable optional preview fields on `marker_segments`, so reconnects
 and clients without the realtime feature can refresh through the normal read.
-The frozen v1 listener does not advertise or negotiate this feature.
 
 A marker preview is captured at its start timestamp. It does not replace an
 embedded chapter, change seek boundaries, or enable timeline trickplay. Native
@@ -1061,7 +1180,7 @@ Jellyfin chapter names, ticks and image mappings continue to represent embedded
 chapters; marker images are not projected as invented Jellyfin chapters. Offline
 marker inventories do not include these remotely served preview images.
 
-## Buffering quality (native v2)
+## Buffering quality
 
 `buffering_quality_v1` adds the start and replan fields, learned limits and
 `playback_plan.bandwidth_limit` described in

@@ -1,3 +1,6 @@
+import { createElement, type ReactNode } from "react";
+import { LineTitle } from "@/components/TitleLine";
+import { codeNumber, t, type Translate } from "@/i18n";
 import { formatTime, preferredDateLocale } from "@/lib/datetime";
 
 interface UpcomingPresentationEvent {
@@ -17,15 +20,15 @@ interface UpcomingPresentationEvent {
 export function upcomingBadgeLabel(badge: string): string {
   switch (badge) {
     case "series_premiere":
-      return "Premiere";
+      return t("web.calendar.event.badge.seriesPremiere");
     case "season_premiere":
-      return "New Season";
+      return t("web.calendar.event.badge.seasonPremiere");
     case "finale":
-      return "Finale";
+      return t("web.calendar.event.badge.finale");
     case "digital":
-      return "Digital";
+      return t("web.calendar.event.badge.digital");
     case "physical":
-      return "Physical";
+      return t("web.calendar.event.badge.physical");
     default:
       return badge;
   }
@@ -35,7 +38,7 @@ export function upcomingBadgeClass(badge: string): string {
   switch (badge) {
     case "series_premiere":
     case "season_premiere":
-      return "border-primary/40 bg-primary/20 text-primary";
+      return "border-primary/40 bg-[color-mix(in_srgb,var(--primary)_12%,var(--background))] text-primary shadow-sm";
     case "finale":
       return "border-orange-800/55 bg-orange-950/90 text-orange-50 shadow-sm backdrop-blur-none";
     case "digital":
@@ -47,21 +50,34 @@ export function upcomingBadgeClass(badge: string): string {
   }
 }
 
-export function formatUpcomingSubtitle(event: UpcomingPresentationEvent): string {
+/**
+ * The episode or season line under an upcoming title. Its episode title is a
+ * `LineTitle`; render it with `TitleLineParts`. It takes a component's `useT()`,
+ * since the module's `t` returns text only.
+ */
+export function formatUpcomingSubtitle(
+  event: UpcomingPresentationEvent,
+  translate: Translate,
+): ReactNode {
   if (
     (event.type === "episode" || event.type === "season_premiere") &&
     event.season_number != null
   ) {
+    const season = event.season_number;
+    const title = event.episode_title ? createElement(LineTitle, null, event.episode_title) : null;
     if (event.episode_number != null) {
-      return `S${event.season_number} · E${event.episode_number}${
-        event.episode_title ? ` - ${event.episode_title}` : ""
-      }`;
+      const code = { season: codeNumber(season), episode: codeNumber(event.episode_number) };
+      return title
+        ? translate("web.calendar.event.episodeTitled", { ...code, title })
+        : translate("web.calendar.event.episode", code);
     }
-    return `Season ${event.season_number}${event.episode_title ? ` · ${event.episode_title}` : ""}`;
+    return title
+      ? translate("web.calendar.event.seasonTitled", { season, title })
+      : translate("web.calendar.event.season", { season });
   }
 
   if (event.type === "movie") {
-    return "Movie";
+    return translate("web.calendar.event.movie");
   }
 
   return "";

@@ -4,7 +4,6 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { FileVersion } from "@/api/types";
 import VersionDropdown from "./VersionDropdown";
-import VersionFlyoutItems from "./VersionFlyout";
 import { useVersionVisibility } from "./versionAvailability";
 
 // The picker reads the watch detail lazily when it opens (score/ranking); these
@@ -20,12 +19,22 @@ vi.mock("@/components/ui/dropdown-menu", () => ({
     children,
     onSelect,
     className,
+    title,
+    disabled,
   }: {
     children: ReactNode;
     onSelect?: () => void;
     className?: string;
+    title?: string;
+    disabled?: boolean;
   }) => (
-    <div role="menuitem" className={className} onClick={onSelect}>
+    <div
+      role="menuitem"
+      className={className}
+      title={title}
+      aria-disabled={disabled ? true : undefined}
+      onClick={disabled ? undefined : onSelect}
+    >
       {children}
     </div>
   ),
@@ -45,6 +54,7 @@ function makeVersion(overrides: Partial<FileVersion> = {}): FileVersion {
     available: overrides.available,
     failed: overrides.failed,
     source_mismatch: overrides.source_mismatch,
+    playability: overrides.playability,
   };
 }
 
@@ -215,42 +225,6 @@ describe("VersionDropdown source mismatch", () => {
   });
 });
 
-describe("VersionFlyoutItems unavailable versions", () => {
-  it("hides unavailable versions by default and shows them via the toggle", () => {
-    const versions = [
-      makeVersion({ file_id: 1, resolution: "2160p" }),
-      makeVersion({ file_id: 2, resolution: "1080p", available: false }),
-    ];
-    render(<VersionFlyoutItems versions={versions} onPlayVersion={vi.fn()} />);
-
-    expect(screen.queryByText("1080p")).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("menuitem", { name: /Show 1 unavailable version/ }));
-
-    const unavailableRow = screen.getByRole("menuitem", { name: /1080p/ });
-    expect(unavailableRow).toBeInTheDocument();
-    expect(screen.getByText("Will retry on play")).toBeInTheDocument();
-    expect(unavailableRow).toHaveClass("opacity-80");
-  });
-
-  it("shows a source mismatch on a row that is still available", () => {
-    const versions = [
-      makeVersion({
-        file_id: 1,
-        resolution: "1080p",
-        available: true,
-        source_mismatch: { served_bytes: 7_427_636_945, declared_bytes: 8_449_999_999 },
-      }),
-    ];
-    render(<VersionFlyoutItems versions={versions} onPlayVersion={vi.fn()} />);
-
-    expect(
-      screen.getByText("Source mismatch — served 6.9 GB of declared 7.9 GB"),
-    ).toBeInTheDocument();
-    expect(screen.queryByText("Will retry on play")).not.toBeInTheDocument();
-    expect(screen.queryByText("Failed")).not.toBeInTheDocument();
-  });
-});
-
 describe("useVersionVisibility toggle stability", () => {
   function renderVisibility(versions: FileVersion[]) {
     return renderHook(({ list }: { list: FileVersion[] }) => useVersionVisibility(list, null), {
@@ -332,5 +306,105 @@ describe("useVersionVisibility failed rows", () => {
   it("keeps transiently unavailable rows behind the toggle", () => {
     expect(visibleIds([live(1), stale(2)])).toEqual([1]);
     expect(hiddenCount([live(1), stale(2)])).toBe(1);
+  });
+});
+
+describe("VersionDropdown playability", () => {
+  const unplayable = (id: number): FileVersion =>
+    makeVersion({
+      file_id: id,
+      resolution: "1080p",
+      playability: {
+        playable: false,
+        reason: "hdr_transcode_unsupported",
+        message: "This HDR source requires video encoding, but no validated recipe is installed.",
+      },
+    });
+
+  it("disables a version this client cannot play and names the planner's reason", () => {
+    const versions = [makeVersion({ file_id: 1, resolution: "2160p" }), unplayable(2)];
+    const onSelectVersion = vi.fn();
+    render(
+      <VersionDropdown
+        versions={versions}
+        selectedVersion={versions[0]!}
+        onSelectVersion={onSelectVersion}
+      />,
+    );
+
+    const dialog = openVersionDropdown();
+    const blocked = dialog.getByRole("button", { name: /1080p/ });
+    expect(blocked).toBeDisabled();
+    expect(blocked).toHaveTextContent("Can't play on this device");
+    expect(blocked).toHaveAttribute(
+      "title",
+      "This HDR source requires video encoding, but no validated recipe is installed.",
+    );
+
+    fireEvent.click(blocked);
+    expect(onSelectVersion).not.toHaveBeenCalled();
+  });
+
+  it("keeps the currently playing version visible and selected even when unplayable", () => {
+    const versions = [makeVersion({ file_id: 1, resolution: "2160p" }), unplayable(2)];
+    render(
+      <VersionDropdown
+        versions={versions}
+        selectedVersion={versions[1]!}
+        onSelectVersion={vi.fn()}
+      />,
+    );
+
+    const dialog = openVersionDropdown();
+    const current = dialog.getByRole("button", { name: /1080p/ });
+    expect(current).toBeInTheDocument();
+    expect(current).toBeDisabled();
+    expect(current).toHaveTextContent("Can't play on this device");
+  });
+
+  it("leaves a row with no verdict selectable: an unfinished or transient check is not a refusal", () => {
+    const versions = [
+      makeVersion({ file_id: 1, resolution: "2160p" }),
+      makeVersion({
+        file_id: 2,
+        resolution: "1080p",
+        // The server omits playability for a retryable/anchor-budget refusal.
+      }),
+    ];
+    const onSelectVersion = vi.fn();
+    render(
+      <VersionDropdown
+        versions={versions}
+        selectedVersion={versions[0]!}
+        onSelectVersion={onSelectVersion}
+      />,
+    );
+
+    const dialog = openVersionDropdown();
+    const row = dialog.getByRole("button", { name: /1080p/ });
+    expect(row).not.toBeDisabled();
+    fireEvent.click(row);
+    expect(onSelectVersion).toHaveBeenCalledWith(versions[1]);
+  });
+
+  it("does not hide an unplayable row behind the unavailable toggle", () => {
+    const versions = [
+      makeVersion({ file_id: 1, resolution: "2160p" }),
+      makeVersion({ file_id: 2, resolution: "720p", available: false }),
+      unplayable(3),
+    ];
+    render(
+      <VersionDropdown
+        versions={versions}
+        selectedVersion={versions[0]!}
+        onSelectVersion={vi.fn()}
+      />,
+    );
+
+    const dialog = openVersionDropdown();
+    // The unavailable row is hidden behind the toggle, but the unplayable one
+    // stays visible disabled so the list keeps its shape and the reason shows.
+    expect(dialog.queryByRole("button", { name: /720p/ })).not.toBeInTheDocument();
+    expect(dialog.getByRole("button", { name: /1080p/ })).toBeDisabled();
   });
 });

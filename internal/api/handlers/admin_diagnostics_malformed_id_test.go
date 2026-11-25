@@ -59,7 +59,7 @@ func (s unusedReportStore) StaleReceiving(context.Context, time.Duration) ([]dia
 func TestAdminDiagnosticsRoutesRejectMalformedReportID(t *testing.T) {
 	service := diagnostics.NewService(unusedReportStore{t: t}, nil, nil, slog.Default())
 	router := chi.NewRouter()
-	RegisterAdminDiagnosticsRoutes(router, NewDiagnosticsHandler(service))
+	registerAdminDiagnosticsRoutes(router, NewDiagnosticsHandler(service))
 
 	cases := []struct {
 		name   string

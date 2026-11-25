@@ -16,7 +16,7 @@ import "embed"
 // The post-lock marker LOCKED is deliberately not embedded: it is read from
 // the working tree by the diff command, never by the binary.
 //
-//go:embed route-inventory.json migration.json migration.schema.json offline-routes.txt breaking-approvals.json breaking-approvals.schema.json fixtures.schema.json fixtures/*.json
+//go:embed route-inventory.json migration-inventory.json migration.json migration.schema.json offline-routes.txt breaking-approvals.json breaking-approvals.schema.json fixtures.schema.json fixtures/*.json
 var FS embed.FS
 
 // FixturesDir is the directory inside FS holding the contract fixtures and

@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary/resolver"
 )
@@ -205,5 +206,111 @@ func TestVirtualProviderOutageBackoffIsBounded(t *testing.T) {
 	}
 	if total > 5*time.Second {
 		t.Fatalf("outage backoff total %s exceeds the 5s latency bound", total)
+	}
+}
+
+// serveResolveTestFile is a session-bound-looking virtual row for the serve
+// resolve tests. The resolver seam ignores the row; only the URI matters.
+func serveResolveTestFile() *models.MediaFile {
+	return &models.MediaFile{
+		ID:                         11,
+		ContentID:                  "movie-serve-resolve",
+		FilePath:                   "virtual://movie/tt-serve-resolve?result=cand-a",
+		VirtualOwnerInstallationID: 4,
+	}
+}
+
+// TestResolveVirtualInputForServeCutsStalledListing is the fail-before of the
+// incident: a listing that never answers used to hold the direct-play byte serve
+// for the client's whole patience, which then aborted and was recorded as a 408
+// timeout. The serve budget must end it while the caller is still waiting and
+// classify it as the retryable provider_unavailable, not a client cancellation.
+func TestResolveVirtualInputForServeCutsStalledListing(t *testing.T) {
+	restore := virtualServeResolveBudget
+	virtualServeResolveBudget = 40 * time.Millisecond
+	defer func() { virtualServeResolveBudget = restore }()
+
+	h := &StreamHandler{VirtualMediaDetailedResolver: VirtualMediaDetailedResolverFunc(
+		func(ctx context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+			<-ctx.Done()
+			return ResolvedVirtualMedia{}, ctx.Err()
+		})}
+
+	started := time.Now()
+	_, cleanup, err := h.resolveVirtualInputForServe(context.Background(), serveResolveTestFile(), 1, "profile-1")
+	elapsed := time.Since(started)
+	if cleanup != nil {
+		cleanup()
+	}
+	if !errors.Is(err, errVirtualProviderUnavailable) {
+		t.Fatalf("stalled listing error = %v, want provider_unavailable", err)
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Fatalf("stalled listing was classified as a client cancellation: %v", err)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("stalled listing held the serve for %s, want the %s budget", elapsed, virtualServeResolveBudget)
+	}
+}
+
+// TestResolveVirtualInputForServeKeepsSlowButAliveResolve is the other half:
+// the budget must not cut a resolve that is slower than a fast link but answers
+// inside the window.
+func TestResolveVirtualInputForServeKeepsSlowButAliveResolve(t *testing.T) {
+	restore := virtualServeResolveBudget
+	virtualServeResolveBudget = 500 * time.Millisecond
+	defer func() { virtualServeResolveBudget = restore }()
+
+	const wantURL = "http://127.0.0.1:9/provider/alive.mp4"
+	h := &StreamHandler{VirtualMediaDetailedResolver: VirtualMediaDetailedResolverFunc(
+		func(context.Context, string, int, int, string, bool, []string, string) (ResolvedVirtualMedia, error) {
+			// A slow-but-alive provider: far inside the 500ms window, and
+			// enough delay that a zero-value budget would cut it.
+			time.Sleep(25 * time.Millisecond) //nolint:forbidigo // reasoned timing test: a slow-but-alive resolve must not be cut by the budget
+			return ResolvedVirtualMedia{URL: wantURL, URI: serveResolveTestFile().FilePath, CandidateID: "cand-a"}, nil
+		})}
+
+	resolved, cleanup, err := h.resolveVirtualInputForServe(context.Background(), serveResolveTestFile(), 1, "profile-1")
+	if cleanup != nil {
+		defer cleanup()
+	}
+	if err != nil {
+		t.Fatalf("slow-but-alive resolve failed: %v", err)
+	}
+	if resolved.URL != wantURL {
+		t.Fatalf("resolved URL = %q, want %q", resolved.URL, wantURL)
+	}
+}
+
+// TestResolveVirtualInputForServeKeepsClientCancellation proves the budget does
+// not turn a viewer who left into a provider outage: a canceled parent context
+// keeps the client-cancellation classification the 408 answer is built on.
+func TestResolveVirtualInputForServeKeepsClientCancellation(t *testing.T) {
+	restore := virtualServeResolveBudget
+	virtualServeResolveBudget = time.Minute
+	defer func() { virtualServeResolveBudget = restore }()
+
+	entered := make(chan struct{})
+	h := &StreamHandler{VirtualMediaDetailedResolver: VirtualMediaDetailedResolverFunc(
+		func(ctx context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+			close(entered)
+			<-ctx.Done()
+			return ResolvedVirtualMedia{}, ctx.Err()
+		})}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		<-entered
+		cancel()
+	}()
+	_, cleanup, err := h.resolveVirtualInputForServe(ctx, serveResolveTestFile(), 1, "profile-1")
+	if cleanup != nil {
+		cleanup()
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("client cancellation error = %v, want context.Canceled", err)
+	}
+	if errors.Is(err, errVirtualProviderUnavailable) {
+		t.Fatalf("client cancellation was classified as a provider outage: %v", err)
 	}
 }

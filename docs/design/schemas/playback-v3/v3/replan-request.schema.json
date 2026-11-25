@@ -187,6 +187,15 @@
         "decoder_name": {
           "type": "string",
           "maxLength": 128
+        },
+        "diagnostics": {
+          "type": "object",
+          "description": "Structured player failure evidence, the same keys a plan_failed route event carries (error_code, error_code_name, error_cause). Bounded like route-event diagnostics; unknown keys are ignored.",
+          "maxProperties": 32,
+          "additionalProperties": {
+            "type": "string",
+            "maxLength": 512
+          }
         }
       },
       "additionalProperties": true

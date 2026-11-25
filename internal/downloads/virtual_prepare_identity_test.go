@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Silo-Server/silo-server/internal/catalog"
+
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -205,7 +207,7 @@ func TestVirtualPrepareSharedConsumerCompletesAfterOneAbort(t *testing.T) {
 	// Profile A aborts its poll through the real DELETE path: it deletes A's
 	// row and asks the pipeline to release an abandoned job. B still links the
 	// job, so the abandonment check must leave it running.
-	if err := svc.Delete(ctx, f.userID, f.profileA, f.deviceA, rowA); err != nil {
+	if err := svc.Delete(ctx, f.userID, f.profileA, f.deviceA, rowA, catalog.AccessFilter{}); err != nil {
 		t.Fatalf("abort profile A: %v", err)
 	}
 	if _, err := arepo.GetByID(ctx, artifact.ID); err != nil {

@@ -174,10 +174,45 @@ implement and review changes through our own workflow, and pull request volume
 has outgrown what we can review carefully, so a good issue usually helps us
 more than a pull request.
 
+Feature ideas go in
+[Discussions → Ideas](https://github.com/Silo-Server/silo-server/discussions/categories/ideas),
+not issues.
+
 Pull requests are still welcome from contributors who've had one merged in a
-Silo repository, or when a maintainer asks for one. We close other pull
-requests without review. [CONTRIBUTING.md](CONTRIBUTING.md) explains what makes
-an issue useful.
+Silo repository, or when a maintainer asks for one; a feature pull request also
+needs an issue in this repository that a maintainer has labeled `accepted`.
+Other pull requests are closed automatically without review; when a maintainer
+asked for one, they reopen it. [CONTRIBUTING.md](CONTRIBUTING.md) explains what
+makes an issue useful.
+
+## Supporting Silo
+
+Silo is free and open source, and it will stay that way. It's built in spare
+time and paid for out of pocket.
+
+<p align="center">
+  <a href="https://github.com/sponsors/quick104"><img alt="Sponsor Silo on GitHub" src="https://img.shields.io/badge/sponsor-GitHub%20Sponsors-EA4AAA?style=for-the-badge&amp;logo=githubsponsors&amp;logoColor=white"></a>
+</p>
+
+Sponsorship pays for AI development tooling (Claude, Codex), the
+push-notification relay, and future project costs. You can help just as much
+without spending anything:
+
+- **Report bugs** with steps to reproduce on
+  [GitHub Issues](https://github.com/Silo-Server/silo-server/issues).
+- **Help other users** on [Discord](https://discord.gg/siloserver).
+- **Improve the docs** at [siloserver.org](https://siloserver.org/docs).
+- **Contribute code** by following [CONTRIBUTING.md](CONTRIBUTING.md).
+
+### Sponsors
+
+<p align="center">
+  <a href="https://macroscope.com">
+    <img alt="Sponsored by Macroscope" src="assets/macroscope-banner.png" width="400">
+  </a>
+  <br>
+  <sub>Code review is supported by <a href="https://macroscope.com">Macroscope</a> through its open source program.</sub>
+</p>
 
 ## License and trademarks
 

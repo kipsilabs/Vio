@@ -120,14 +120,14 @@ func (s *Postgres) SaveAttempt(ctx context.Context, record playback.AttemptRecor
 			requested_media_file_id, effective_media_file_id,
 			current_plan_id, current_replan_request_id, current_plan, frozen_recipe,
 			normalized_request, start_response, request_digest, expires_at, server_bitrate_cap_kbps,
-			desired_tracks
-		) VALUES ($1, NULLIF($2, '')::uuid, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+			desired_tracks, login_session_id
+		) VALUES ($1, NULLIF($2, '')::uuid, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
 		ON CONFLICT DO NOTHING`,
 		record.PlaybackAttemptID, record.SessionID, record.UserID, record.ProfileID,
 		record.RequestedMediaFileID, record.EffectiveMediaFileID,
 		record.CurrentPlanID, record.CurrentReplanRequestID, planJSON, recipeJSON,
 		requestJSON, responseJSON, record.RequestDigest, record.ExpiresAt, record.ServerBitrateCapKbps,
-		desiredJSON)
+		desiredJSON, record.LoginSessionID)
 	if err != nil {
 		return err
 	}
@@ -167,10 +167,11 @@ func (s *Postgres) GetAttemptIdentityByPlaybackAttemptID(ctx context.Context, at
 func (s *Postgres) getAttemptIdentity(ctx context.Context, predicate string, value any) (*playback.AttemptIdentityV3, error) {
 	var identity playback.AttemptIdentityV3
 	err := s.db.QueryRow(ctx, `
-		SELECT playback_attempt_id, COALESCE(session_id::text, ''), user_id, profile_id
+		SELECT playback_attempt_id, COALESCE(session_id::text, ''), user_id, profile_id, login_session_id
 		FROM playback_v3_attempts
 		WHERE `+predicate+` AND expires_at > NOW()`, value).Scan(
 		&identity.PlaybackAttemptID, &identity.SessionID, &identity.UserID, &identity.ProfileID,
+		&identity.LoginSessionID,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, playback.ErrSessionNotFound
@@ -191,7 +192,7 @@ func (s *Postgres) getAttempt(ctx context.Context, predicate string, value any) 
 		       normalized_request, start_response, request_digest, expires_at, server_bitrate_cap_kbps,
 		       last_sequence, last_sample, stopped_at, COALESCE(stop_receipt->>'stop_id', ''), updated_at,
 		       recovery_state, recovery_revision, audio_selection, audio_reconcile_ledger,
-		       desired_tracks, created_at
+		       desired_tracks, login_session_id, created_at
 		FROM playback_v3_attempts
 		WHERE `+predicate+` AND expires_at > NOW()`, value).Scan(
 		&record.PlaybackAttemptID, &record.SessionID, &record.UserID, &record.ProfileID,
@@ -200,7 +201,7 @@ func (s *Postgres) getAttempt(ctx context.Context, predicate string, value any) 
 		&requestJSON, &responseJSON, &record.RequestDigest, &record.ExpiresAt, &record.ServerBitrateCapKbps,
 		&record.LastSequence, &sampleJSON, &record.StoppedAt, &record.StopID, &record.LastSampleAt,
 		&recoveryJSON, &record.RecoveryRevision, &selectionJSON, &ledgerJSON,
-		&desiredJSON, &record.CreatedAt,
+		&desiredJSON, &record.LoginSessionID, &record.CreatedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, playback.ErrSessionNotFound
@@ -305,6 +306,55 @@ func (s *Postgres) AppendRecoveryExclusions(ctx context.Context, sessionID strin
 		return playback.RecoveryStateV3{}, 0, err
 	}
 	return merged, next, nil
+}
+
+func (s *Postgres) AppendRecipeExclusions(ctx context.Context, sessionID string, baseRevision int64, keys []string) (playback.RecoveryStateV3, int64, error) {
+	if len(keys) == 0 {
+		return playback.RecoveryStateV3{}, 0, nil
+	}
+	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return playback.RecoveryStateV3{}, 0, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var stateJSON []byte
+	var revision int64
+	err = tx.QueryRow(ctx, `
+		SELECT recovery_state, recovery_revision FROM playback_v3_attempts
+		WHERE session_id = $1::uuid AND expires_at > NOW()
+		FOR UPDATE`, sessionID).Scan(&stateJSON, &revision)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return playback.RecoveryStateV3{}, 0, playback.ErrSessionNotFound
+	}
+	if err != nil {
+		return playback.RecoveryStateV3{}, 0, err
+	}
+	if baseRevision >= 0 && revision != baseRevision {
+		return playback.RecoveryStateV3{}, revision, playback.ErrRecoveryRevisionConflictV3
+	}
+	var state playback.RecoveryStateV3
+	if len(stateJSON) > 0 {
+		if err := json.Unmarshal(stateJSON, &state); err != nil {
+			return playback.RecoveryStateV3{}, 0, err
+		}
+	}
+	state.RecipeExclusions = playback.UnionRecipeExclusions(state.RecipeExclusions, keys)
+	mergedJSON, err := json.Marshal(state)
+	if err != nil {
+		return playback.RecoveryStateV3{}, 0, err
+	}
+	var next int64
+	if err := tx.QueryRow(ctx, `
+		UPDATE playback_v3_attempts
+		SET recovery_state = $2, recovery_revision = recovery_revision + 1, updated_at = NOW()
+		WHERE session_id = $1::uuid AND expires_at > NOW()
+		RETURNING recovery_revision`, sessionID, mergedJSON).Scan(&next); err != nil {
+		return playback.RecoveryStateV3{}, 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return playback.RecoveryStateV3{}, 0, err
+	}
+	return state, next, nil
 }
 
 // RecordAudioReconciliation appends the settled reconciliation decision to

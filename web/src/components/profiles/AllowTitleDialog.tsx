@@ -16,6 +16,8 @@ import {
   useSetTitleAllowance,
   type TitleAllowanceProfile,
 } from "@/hooks/queries/titleAllowances";
+import { useT } from "@/i18n";
+import { getInitial } from "@/lib/text";
 
 interface AllowTitleDialogProps {
   open: boolean;
@@ -37,6 +39,7 @@ export default function AllowTitleDialog({
   itemTitle,
   profiles,
 }: AllowTitleDialogProps) {
+  const t = useT();
   const { data: household } = useProfiles();
   const setAllowance = useSetTitleAllowance();
   const idPrefix = useId();
@@ -46,15 +49,12 @@ export default function AllowTitleDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="gap-4 sm:max-w-[480px]">
         <DialogHeader>
-          <DialogTitle>Allow &ldquo;{itemTitle}&rdquo; for…</DialogTitle>
-          <DialogDescription>
-            Ticked profiles can watch this title even though it is above their limit. Other titles
-            stay hidden.
-          </DialogDescription>
+          <DialogTitle>{t("web.profiles.allow.title", { name: itemTitle })}</DialogTitle>
+          <DialogDescription>{t("web.profiles.allow.titleDescription")}</DialogDescription>
         </DialogHeader>
         {rows.length === 0 ? (
           <p className="text-muted-foreground text-sm">
-            Every profile can already watch this title.
+            {t("web.profiles.allow.everyoneCanWatch")}
           </p>
         ) : (
           <ul className="flex flex-col gap-1">
@@ -83,12 +83,18 @@ export default function AllowTitleDialog({
                     />
                     <Avatar className="size-8">
                       {avatar?.avatar_url ? <AvatarImage src={avatar.avatar_url} alt="" /> : null}
-                      <AvatarFallback>{row.name.slice(0, 1).toUpperCase()}</AvatarFallback>
+                      <AvatarFallback>{getInitial(row.name)}</AvatarFallback>
                     </Avatar>
                     <span className="flex min-w-0 flex-1 flex-col">
-                      <span className="truncate text-sm font-medium">{row.name}</span>
+                      {/* A cut name keeps its start in either script; w-fit keeps a
+                          short one on the page's start side. */}
+                      <span dir="auto" className="w-fit max-w-full truncate text-sm font-medium">
+                        {row.name}
+                      </span>
                       <span className="text-muted-foreground text-xs">
-                        {[limit && `Limit ${limit}`, note].filter(Boolean).join(" · ")}
+                        {[limit && t("web.profiles.allow.limit", { limit }), note]
+                          .filter(Boolean)
+                          .join(" · ")}
                       </span>
                     </span>
                   </label>

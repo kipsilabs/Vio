@@ -14,7 +14,7 @@ renderer follows, and the uploaded images badges can use.
 - The server-wide default is the `defaults.card_overlays` server setting, returned as `defaults`
   by the overlay-config endpoint. It has the same shape.
 - `ui.card_overlays_enabled` turns badges on or off. It does not affect the watch-status corner.
-- The web client is the only editor today. A client that parses the document must keep ids,
+- The web client is the only editor. A client that parses the document must keep ids,
   fields and values it does not render, or a later save from it erases another client's choices.
 
 ## The document
@@ -117,3 +117,7 @@ otherwise maps the edge rails back to the corner on the same side and drops the 
 Settings revision 26 added the `resolution_hdr_audio` badge. A server below revision 26 rejects a
 document that contains it, so a client offers that badge only when the server advertises revision
 26 or later.
+
+Settings revision 29 added the `availability` badge. A server below revision 29 rejects a document
+that contains it, so a client offers that badge only when the server advertises revision 29 or
+later.

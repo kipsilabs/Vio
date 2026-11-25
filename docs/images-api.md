@@ -1,9 +1,7 @@
 # Images API
 
 > **API lifecycle:** this documents the stable `/api/v2` native contract, which locks with Silo
-> 1.0. The frozen alpha `/api/v1` surface carries the same artwork ladder through the pre-1.0
-> bridge window and is then retired. See
-> [the native API contract](architecture/api-contract.md).
+> 1.0. See [the native API contract](architecture/api-contract.md).
 
 Silo caches artwork at a fixed ladder of widths and returns a URL for one of them.
 The URL is either a direct object-storage URL or a signed server route. By default the server picks the width from context — card rows get
@@ -46,17 +44,16 @@ The parameter is accepted on:
 
 The item versions list and the beta manga-file and audiobook-group lists accept
 it as well. Other JSON `/api/v2` operations reject it as an unknown query
-parameter with `422 validation_failed`. The frozen `/api/v1` recommendation
-routes ignore it.
+parameter with `422 validation_failed`.
 
 Within item detail this covers cast and crew headshots too: they follow the
 `profile` ladder, which has no wide rung, so `large` and `medium` land on the
 same 500px image. Without the parameter they are that 500px image as well.
 
 Without the parameter, an episode still standing in for a backdrop in a section
-hero or Continue Watching uses the widest still rung that fits, 1280px. On
-`/api/v2` a Continue Watching or Next Up episode card shows a still only when
-its season and series have no backdrop (see below).
+hero or Continue Watching uses the widest still rung that fits, 1280px. A
+Continue Watching or Next Up episode card shows a still only when its season
+and series have no backdrop (see below).
 
 The `/api/v2/catalog/people` operations do **not** take the parameter — their headshots are
 always the 500px variant. Browsing a person's filmography does honor it, because
@@ -218,6 +215,96 @@ so regenerated artwork becomes visible without waiting for signature expiry.
 Cold resolver caches read the same durable records and never rediscover image
 availability through network probes.
 
+## Artwork that is not cached yet
+
+A metadata provider's artwork URL stays on an item until its image-cache job
+stores a copy, and stays for good when caching fails or `metadata.cache_images`
+is off. Until then the regular catalog reads (`/api/v2/catalog/...`, home
+sections, collections, `GET /api/v2/watch/{id}`) return that URL as stored, for
+example an `https://image.tmdb.org/...` address, or the URL a metadata plugin
+resolves its path to. The width ladder above does not apply to it: the server
+passes the URL through and the client loads it from the provider's host. A
+client that cannot reach a provider shows its placeholder until the art is
+cached.
+
+### Admin poster URLs
+
+The admin reads a monitoring tool uses follow a stricter rule: `poster_url` on
+`GET /api/v2/admin/sessions` rows, on the rows embedded in
+`session.started`, `session.paused` and `session.resumed` events, and on
+`GET /api/v2/admin/catalog/items` items is always a URL this server issued, and
+absent only when the title has no poster. `GET /api/v2/profiles/household/sessions`
+reads the same session rows, so a household manager's session list follows the
+rule too. An episode carries its series'
+poster. `GET /api/v2/admin/catalog/capabilities` reports `item_posters: true`
+when the server applies this rule.
+
+- Cached art resolves to its card-size stored object, like any catalog read:
+  a signed `/api/v2/artwork/...` route or the artwork store's direct URL.
+- Art that is not cached yet resolves to a signed link to
+  `GET /api/v2/item-posters/{content_id}` (`getItemPoster`). The link signs the
+  item's content ID and an expiry, never a URL. Each request looks up the
+  item's current poster: cached art answers `302` to its stored URL; art that is
+  still remote is downloaded through the server and answered `200` with its
+  bytes, and the item's image-cache job is queued.
+
+URLs may be root-relative; resolve them against the server's base URL. The link
+needs no credentials and expires with the artwork lifetime
+(`s3.metadata_presign_expiry`), changing at most every 15 minutes, so read a
+fresh one from a later page or session row. It keeps working after the art is
+cached, answering with the redirect from then on.
+
+`getItemPoster` has its own budget per client address. The default allows
+600 requests per minute with a burst of 400 so a dashboard can load a page of
+posters. Admins can adjust `auth_endpoints.item_poster` in the rate limit
+configuration. Requests over the poster or server-wide budget receive
+`429 rate_limited` with `Retry-After`. Busy downloads or plugin lookups return
+`503` with `Retry-After`.
+
+An invalid or expired link, a missing item or poster, and a refused or failed
+download all return `404`. Every download and redirect hop must reach a public
+address, including URLs under the artwork store's direct URL prefix. The
+server serves an image of up to 4 MiB from a link and checks the bytes for
+JPEG, PNG, WebP or GIF; a larger original is refused, and that answer is kept
+for five minutes, until the image-cache job stores resized copies. See the [outbound address guard](architecture/outbound-address-guard.md#serving-catalog-artwork).
+
+Concurrent requests for one item share one download, and a
+server runs at most four at once. A server remembers a finished download for
+five minutes and a failed one for 30 seconds, so repeating a link does not
+repeat the request to the provider. An image over 4 MiB is not served from a
+link and answers `404` until the image cache has stored it. Proxied bytes carry
+`Cache-Control: private, max-age=300`; the redirect is `no-store`, since its
+target is a signed URL with its own lifetime.
+
+### Admin request posters
+
+A media request's title is usually not in the library, so its poster has no
+catalog item to cache it. Admin request reads (`GET /api/v2/admin/requests`
+and the admin approve, decline, cancel and retry responses) return
+`poster_url` on each request with a TMDB poster: the path
+`/api/v2/admin/requests/{id}/poster` (`getAdminRequestPoster`).
+`GET /api/v2/admin/requests/capabilities` reports `request_posters: true` when
+the server returns it.
+
+This URL follows a different rule from the catalog and session posters above:
+
+- It needs the credentials that read the row: an admin session, an admin API
+  key, or a key with the `admin:monitor:read` scope. Do not send those
+  credentials to the catalog and session poster URLs, which can be the artwork
+  store's own signed URLs.
+- It never expires, so a tool can store it with the request.
+
+The route downloads the request's TMDB poster (`w500`) through the server and
+answers `200` with its bytes, with the limits above: the shared download slots
+and five-minute memory, the 4 MiB cap, the image check, and the
+`auth_endpoints.item_poster` budget per client address. Each request also
+counts against the caller's account budget, as any authenticated request does.
+A missing request, a request without a TMDB poster and a failed download answer
+`404`; busy downloads answer
+`503` with `Retry-After`. The route reads the stored request only, so it keeps
+answering while requests are turned off. Silo's own request pages still load
+TMDB images directly.
+
 ## Season selectors without artwork
 
 `GET /api/v2/catalog/series/{id}/seasons?include_artwork=false` (`listSeriesSeasons`)
@@ -252,8 +339,7 @@ size they resolve at `medium`.
 
 Today the images come from local sidecar files next to the media (see
 [local NFO metadata](architecture/local-nfo-metadata.md#sidecar-artwork-copy-into-the-s3-image-cache)). No
-metadata plugin supplies them, so a library without such files has none. The
-frozen `/api/v1` detail and capability documents do not carry them.
+metadata plugin supplies them, so a library without such files has none.
 
 ## Episode still provenance
 
@@ -274,9 +360,9 @@ and season's artwork next to their own: `series_poster_url`,
 `*_thumbhash`. A client can draw an episode's hero from `series_backdrop_url`
 without fetching the episode's detail, since an episode card's `backdrop_url`
 is usually the episode still. In Continue Watching and Next Up rows,
-`/api/v2` episode cards instead carry the season backdrop as `backdrop_url`, or
+episode cards instead carry the season backdrop as `backdrop_url`, or
 the series backdrop when the season has none, and keep the still only when
-neither exists. Frozen `/api/v1` cards keep the still. The poster fields follow
+neither exists. The poster fields follow
 `poster_width` and the backdrop field follows `backdrop_width`, like
 `poster_url` and `backdrop_url` on the same card.
 
@@ -291,7 +377,6 @@ and Next Up included), catalog browse and search, Watch Tonight, and on episode
 detail (`getCatalogItem`). Each field is absent when the series or season has
 no such image. There is no season backdrop field; Continue Watching and Next Up
 rows show it as `backdrop_url`.
-The frozen `/api/v1` responses do not carry them.
 
 ## Jellyfin compatibility
 
@@ -317,18 +402,6 @@ The shared cached-artwork resolver applies the same persisted availability
 selection to Jellyfin image URL resolution. Its protocol parameters and image
 response shapes are unchanged; image fetching remains independent of catalog
 metadata responses.
-
-## Bridge note
-
-The frozen alpha surface exposes the same ladder at `/api/v1/catalog`,
-`/api/v1/home/sections`, and the other v1 reads, and its capability document at
-`GET /api/v1/images/capability` (singular, with a numeric `schema_version` instead of
-`revision`/`state`). It rejects a bad size with `400 invalid_image_size` and a bad
-`include_artwork` with `400 invalid_include_artwork`. Those paths are frozen. After the
-bridge window, and once a maintainer decides to retire it (#886), the main API listener
-answers the `/api/v1` business routes with `410 Gone` and the `client_upgrade_required`
-problem code; `/api/v1/health` and `/api/v1/ready` keep answering. Build against
-`/api/v2`.
 
 ### Marker thumbnail lifecycle
 

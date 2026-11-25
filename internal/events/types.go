@@ -26,6 +26,10 @@ const (
 	// download encode queue: download_preparation.changed and
 	// download_preparation.progress.
 	ChannelDownloadPreparations EventChannel = "download_preparations"
+	// ChannelDownloads carries admin-only download.changed events for
+	// managed device downloads: identifiers and state, never paths, so an
+	// admin:monitor:read key may subscribe.
+	ChannelDownloads EventChannel = "downloads"
 )
 
 var AllChannels = []EventChannel{
@@ -41,6 +45,7 @@ var AllChannels = []EventChannel{
 	ChannelPlugins,
 	ChannelNotifications,
 	ChannelDownloadPreparations,
+	ChannelDownloads,
 }
 
 // ClientChannels is every channel a websocket client may subscribe to: it is
@@ -60,6 +65,14 @@ var ClientChannels = []EventChannel{
 	ChannelSettings,
 	ChannelNotifications,
 	ChannelDownloadPreparations,
+	ChannelDownloads,
+}
+
+// PlaybackFileItem is the catalog item linked to a playing file. For an
+// episode, its title and type can differ from the episode's own.
+type PlaybackFileItem struct {
+	Title string
+	Type  string
 }
 
 type Envelope struct {
@@ -77,22 +90,26 @@ type Envelope struct {
 	// names no account and no profile, and is reserved for server-wide changes
 	// such as an administrator default.
 	AllViewers bool `json:"all_viewers,omitempty"`
-	// V2Only keeps the event off the frozen v1 bridge socket and away from
-	// plugins: only connections opened through the v2 handshake receive it.
+	// V2Only keeps the event away from plugins: only events socket
+	// connections receive it.
 	V2Only bool `json:"v2_only,omitempty"`
 	// TargetPluginID, when non-empty, restricts dispatch to a single installed
 	// plugin (and only if it is already a subscriber). Used by
 	// RuntimeHostServer.PublishEventTo.
 	TargetPluginID string `json:"target_plugin_id,omitempty"`
+	// EpisodeFileItem supplies the local plugin dispatcher with the file's
+	// catalog item. The socket and the cross-node relay use Data.
+	EpisodeFileItem *PlaybackFileItem `json:"-"`
 }
 
 type PublishOptions struct {
-	EventID    string
-	UserID     int
-	ProfileID  string
-	AdminOnly  bool
-	AllViewers bool
-	V2Only     bool
+	EpisodeFileItem *PlaybackFileItem
+	EventID         string
+	UserID          int
+	ProfileID       string
+	AdminOnly       bool
+	AllViewers      bool
+	V2Only          bool
 }
 
 type EventsHelloMessage struct {

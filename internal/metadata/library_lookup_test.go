@@ -155,24 +155,85 @@ func (provider *mutatingLibraryLookupProvider) GetMetadata(ctx context.Context, 
 func TestFetchLibraryMetadataEmptySeasonOutcomes(t *testing.T) {
 	var providerErr = errors.New("provider unavailable")
 	future := time.Now().AddDate(1, 0, 0).Format(time.DateOnly)
+	season := func(number int, airDate string) SeasonResult {
+		return SeasonResult{SeasonNumber: number, AirDate: airDate}
+	}
+	seasonEpisodes := func(seasonNumber, count int) []EpisodeResult {
+		episodes := make([]EpisodeResult, 0, count)
+		for number := 1; number <= count; number++ {
+			episodes = append(episodes, EpisodeResult{
+				SeasonNumber: seasonNumber, EpisodeNumber: number,
+				Title: fmt.Sprintf("S%dE%d", seasonNumber, number),
+			})
+		}
+		return episodes
+	}
 	for _, testCase := range []struct {
-		name         string
-		airDate      string
-		failure      error
-		episodeChain []Provider
-		wantErr      bool
-		wantSentinel error
-		wantMessage  string
-		wantComplete bool
-		wantEpisodes int
+		name              string
+		seasons           []SeasonResult
+		episodesBySeason  map[int][]EpisodeResult
+		failure           error
+		metadataOnlyChain bool
+		wantErr           bool
+		wantSentinel      error
+		wantMessage       string
+		wantComplete      bool
+		wantEpisodeSeason int
+		wantEpisodes      int
 	}{
-		{name: "successful empty future season", airDate: future, wantComplete: true},
-		{name: "released empty season", airDate: "2000-01-01", wantErr: true, wantSentinel: ErrMetadataNotFound},
-		{name: "undated empty season", wantErr: true, wantSentinel: ErrMetadataNotFound},
-		{name: "provider failure", airDate: future, failure: providerErr, wantErr: true, wantSentinel: providerErr},
 		{
-			name: "no eligible provider", airDate: future, wantErr: true, wantSentinel: ErrMetadataNotFound,
-			wantMessage: "no episode provider configured",
+			name:              "season with episodes",
+			seasons:           []SeasonResult{season(1, "2001-01-01")},
+			episodesBySeason:  map[int][]EpisodeResult{1: seasonEpisodes(1, 2)},
+			wantComplete:      true,
+			wantEpisodeSeason: 1,
+			wantEpisodes:      2,
+		},
+		{
+			name:         "successful empty future season",
+			seasons:      []SeasonResult{season(1, future)},
+			wantComplete: true,
+		},
+		{
+			// A provider can list a season before its episodes are scheduled:
+			// TVDB reports Frieren season 3 with no air date and no episodes.
+			// That season is skipped so the seasons that do have episodes
+			// still produce a complete snapshot.
+			name:              "undated empty season followed by a populated season",
+			seasons:           []SeasonResult{season(1, ""), season(2, "2002-01-01")},
+			episodesBySeason:  map[int][]EpisodeResult{2: seasonEpisodes(2, 1)},
+			wantComplete:      true,
+			wantEpisodeSeason: 2,
+			wantEpisodes:      1,
+		},
+		{
+			name:         "released empty season",
+			seasons:      []SeasonResult{season(1, "2000-01-01")},
+			wantErr:      true,
+			wantSentinel: ErrMetadataNotFound,
+			wantMessage:  "season 1 returned no episodes",
+		},
+		{
+			// An unparseable date cannot place the season in the past, so the
+			// same skip applies instead of a permanent lookup failure.
+			name:         "empty season with unparseable air date",
+			seasons:      []SeasonResult{season(1, "not-a-date")},
+			wantComplete: true,
+		},
+		{
+			name:         "provider failure",
+			seasons:      []SeasonResult{season(1, future)},
+			failure:      providerErr,
+			wantErr:      true,
+			wantSentinel: providerErr,
+		},
+		{
+			name:              "no eligible provider",
+			seasons:           []SeasonResult{season(1, future)},
+			metadataOnlyChain: true,
+			wantErr:           true,
+			wantSentinel:      ErrMetadataNotFound,
+			wantMessage:       "no episode provider configured",
 		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -180,18 +241,19 @@ func TestFetchLibraryMetadataEmptySeasonOutcomes(t *testing.T) {
 				metadata:    &MetadataResult{HasMetadata: true, Title: "Series", ProviderIDs: map[string]string{"tmdb": "123"}},
 				episodesErr: map[int]error{1: testCase.failure},
 				targetRefreshProvider: targetRefreshProvider{
-					seasons:          []SeasonResult{{SeasonNumber: 1, AirDate: testCase.airDate}},
-					episodesBySeason: map[int][]EpisodeResult{},
+					seasons:          testCase.seasons,
+					episodesBySeason: testCase.episodesBySeason,
 				},
 			}
-			chains := map[string][]Provider{"series": {provider}, "season": {provider}, "episode": {provider}}
-			if testCase.wantMessage != "" {
+			chains := seriesLibraryLookupChains(provider)
+			if testCase.metadataOnlyChain {
 				chains["episode"] = []Provider{libraryMetadataOnlyProvider{slug: "metadata-only"}}
 			}
 			harness := newTestHarness()
 			seedLibraryLookupChains(t, harness, 42, chains)
 			result, err := harness.service.FetchLibraryMetadata(context.Background(), 42,
-				&models.MediaItem{Type: "series", TmdbID: "123"}, LibraryMetadataLookupOptions{})
+				&models.MediaItem{Type: "series", TmdbID: "123"},
+				LibraryMetadataLookupOptions{MaxSeasons: len(testCase.seasons)})
 			if result == nil || result.Metadata == nil {
 				t.Fatalf("partial series result missing: result=%+v error=%v", result, err)
 			}
@@ -200,6 +262,17 @@ func TestFetchLibraryMetadataEmptySeasonOutcomes(t *testing.T) {
 			}
 			if len(result.Episodes) != testCase.wantEpisodes {
 				t.Fatalf("episodes = %v, want %d", result.Episodes, testCase.wantEpisodes)
+			}
+			for _, episode := range result.Episodes {
+				if episode.SeasonNumber != testCase.wantEpisodeSeason {
+					t.Fatalf("episode season = %d, want %d (episodes %v)",
+						episode.SeasonNumber, testCase.wantEpisodeSeason, result.Episodes)
+				}
+			}
+			// Skipping an announced-but-undated season must not drop the
+			// provider's season rows from the accepted snapshot.
+			if len(result.Seasons) != len(testCase.seasons) {
+				t.Fatalf("seasons = %v, want the provider's %d listed seasons", result.Seasons, len(testCase.seasons))
 			}
 			if !testCase.wantErr {
 				if err != nil {

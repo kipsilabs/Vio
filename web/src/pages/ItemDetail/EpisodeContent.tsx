@@ -5,7 +5,7 @@ import type { PlayerSubtitleTrackSignature, PrePlaySubtitleSelection } from "@/p
 import { useSeasonDetail, useSeasonEpisodes } from "@/hooks/queries/episodes";
 import { useCatalogItemDetail } from "@/hooks/queries/catalogRead";
 import { useDeleteSubtitlePreference, useSetSubtitlePreference } from "@/hooks/queries/subtitles";
-import { usePrePlayAudioSelection } from "./usePrePlayAudioSelection";
+import { usePrePlayAudioSelection } from "./usePrePlayTrackSelection";
 import { useAmbientColor } from "@/hooks/useAmbientColor";
 import { useEpisodeSpoilerPrefs } from "@/hooks/useEpisodeSpoilerPrefs";
 import { useAuth } from "@/hooks/useAuth";
@@ -37,8 +37,11 @@ import DetailBreadcrumb from "./components/DetailBreadcrumb";
 import MediaInfoDialog from "./components/MediaInfoDialog";
 import SubtitleSearchDialog from "./components/SubtitleSearchDialog";
 import { sortByResolution } from "./components/VersionFlyout";
-import { selectDefaultPlaybackVariantVersion } from "./components/versionRankingUtils";
-import { readRequestedFileId, rememberRequestedFileId } from "@/playback/requestedVersion";
+import {
+  selectDefaultPlaybackVariantVersion,
+  selectItemVersion,
+} from "./components/versionRankingUtils";
+import { readRequestedVersion, rememberRequestedFileId } from "@/playback/requestedVersion";
 import { resolveSelectedMediaSummary } from "./components/selectedMediaSummary";
 import { EpisodeCarouselSkeleton } from "./components/SectionSkeletons";
 import {
@@ -55,7 +58,13 @@ import { isEpisodeUnwatched } from "@/lib/episodeSpoilers";
 import { buildItemHref } from "@/lib/mediaNavigation";
 import { formatRuntimeMinutes } from "@/lib/mediaFormat";
 import { useQualityPreference } from "@/hooks/queries/qualityPreference";
-import { applyVersionAvailability, useVersionLiveness } from "@/hooks/queries/versionLiveness";
+import {
+  applyVersionAvailability,
+  applyVersionPlayability,
+  useVersionLiveness,
+  useVersionPlayability,
+} from "@/hooks/queries/versionLiveness";
+import { useVersionPlayabilityClient } from "@/hooks/queries/versionPlayabilityClient";
 import { CalendarClock } from "lucide-react";
 import {
   formatCalendarDate,
@@ -95,6 +104,9 @@ export default function EpisodeContent({
   // picker writes; the profile column it falls back to is only the pre-cutover
   // choice, since that picker no longer mirrors into it.
   const qualityPreference = useQualityPreference(currentProfile?.quality_preference);
+  // The same capability surface a playback start sends, so the versions check
+  // can judge each row with the production planner before the viewer picks.
+  const { client: playabilityClient, ready: playabilityReady } = useVersionPlayabilityClient();
   const canCurateMetadata = canCurateMetadataForUser(user, currentProfile);
   const canEditMarkers = canEditMarkersForUser(user, currentProfile);
   const [editOpen, setEditOpen] = useState(false);
@@ -124,10 +136,11 @@ export default function EpisodeContent({
   // store is profile-scoped, and a pre-resolution read would alias another
   // profile's pick. A pick made in place is held in state below.
   const requestedProfileId = currentProfile?.id ?? null;
-  const requestedFileId = useMemo(
-    () => (requestedProfileId ? readRequestedFileId(item.content_id, requestedProfileId) : null),
+  const requestedVersion = useMemo(
+    () => (requestedProfileId ? readRequestedVersion(item.content_id, requestedProfileId) : null),
     [item.content_id, requestedProfileId],
   );
+  const requestedFileId = requestedVersion?.fileId ?? null;
   const { hideOverviews } = useEpisodeSpoilerPrefs();
   // Keyed by episode so a reveal survives an on-view translation of the same
   // episode but not navigation to the next one.
@@ -191,41 +204,63 @@ export default function EpisodeContent({
     [defaultSelectedVersion, item.versions, versionPickersOpened],
   );
   const versionLiveness = useVersionLiveness(livenessVersions, true);
-  const versionsWithLiveness = useMemo(
-    () => applyVersionAvailability(sortedVersions, versionLiveness),
-    [sortedVersions, versionLiveness],
+  // A cheap, provider-free pass over every row: the picker must know which
+  // rows this client can play before it offers them, and the default row must
+  // not be an unplayable one. It only adds the playability verdict; liveness
+  // above stays the authority for `available`/`failed`.
+  const versionPlayability = useVersionPlayability(
+    item.versions ?? [],
+    playabilityClient,
+    playabilityReady,
+  );
+  const versionsWithPlayability = useMemo(
+    () =>
+      applyVersionPlayability(
+        applyVersionAvailability(sortedVersions, versionLiveness),
+        versionPlayability,
+      ),
+    [sortedVersions, versionLiveness, versionPlayability],
   );
 
-  // A chosen row that an enrichment refresh no longer carries is a pick-again
-  // state, not permission to silently show and play another version. The
-  // device's requested row is the viewer's own pick, ahead of the server's
-  // last-file hint.
+  // The device's requested row is the viewer's own pick, ahead of the server's
+  // last-file hint. Either may have left the list since.
   const persistedSelectedFileId =
     manualSelectedFileId ?? requestedFileId ?? userData?.last_file_id ?? null;
-  const selectedVersionMissing =
-    persistedSelectedFileId != null &&
-    !versionsWithLiveness.some((version) => version.file_id === persistedSelectedFileId);
-  const selectedVersion = useMemo(() => {
-    if (selectedVersionMissing) return null;
-    if (manualSelectedFileId != null) {
-      return (
-        versionsWithLiveness.find((version) => version.file_id === manualSelectedFileId) ?? null
-      );
-    }
-    return defaultSelectedVersion
-      ? (versionsWithLiveness.find(
-          (version) => version.file_id === defaultSelectedVersion.file_id,
-        ) ?? defaultSelectedVersion)
-      : null;
-  }, [defaultSelectedVersion, manualSelectedFileId, selectedVersionMissing, versionsWithLiveness]);
-  // A pick-again row (one the refresh dropped) must not keep naming itself to
-  // the detail read; only a row the catalog still carries is a selection.
-  const explicitSelectedFileId = selectedVersionMissing
+  // The page always resolves a playable row: a persisted row the refresh dropped,
+  // a failed default, and a currently unavailable default each fall back to the
+  // best available row with a notice instead of disabling Play for the episode.
+  const explicitPickFileId =
+    manualSelectedFileId ?? (requestedVersion?.explicit === true ? requestedFileId : null);
+  const versionSelection = useMemo(
+    () =>
+      selectItemVersion(
+        versionsWithPlayability,
+        defaultSelectedVersion,
+        persistedSelectedFileId,
+        explicitPickFileId,
+      ),
+    [defaultSelectedVersion, explicitPickFileId, persistedSelectedFileId, versionsWithPlayability],
+  );
+  const selectedVersion = versionSelection.version;
+  const versionFallback = versionSelection.fallback;
+  // A row the page did not keep must not keep naming itself to the detail read;
+  // only a row the catalog still carries and the viewer asked for is a
+  // selection.
+  const explicitSelectedFileId = versionFallback
     ? null
     : (manualSelectedFileId ?? requestedFileId ?? null);
   useEffect(() => {
     onSelectedFileIdChange?.(explicitSelectedFileId);
   }, [explicitSelectedFileId, onSelectedFileIdChange]);
+  // Play must tell the server whether this row is the viewer's or the page's.
+  // A pick made in place says so directly; a remembered one only while it is
+  // still the row the catalog gives us to play, and only if the viewer named it
+  // themselves. An Auto start's row is remembered as a hint, not a pin.
+  const explicitFileSelection =
+    versionFallback == null &&
+    (manualSelectedFileId != null ||
+      (requestedVersion?.explicit === true &&
+        requestedVersion.fileId === selectedVersion?.file_id));
   const selectedMediaSummary = useMemo(
     () => resolveSelectedMediaSummary(selectedVersion, item.playback_variants, item.runtime ?? 0),
     [item.playback_variants, item.runtime, selectedVersion],
@@ -258,8 +293,11 @@ export default function EpisodeContent({
     (version: FileVersion) => {
       setManualSelectedFileId(version.file_id);
       // Remember the pick across reloads: the server records the row that
-      // actually plays, which may be a substitute for this one.
-      rememberRequestedFileId(item.content_id, version.file_id, requestedProfileId);
+      // actually plays, which may be a substitute for this one. The standing
+      // travels with it so a later Play still pins this row after a reload.
+      rememberRequestedFileId(item.content_id, version.file_id, requestedProfileId, {
+        explicit: true,
+      });
       // Track indexes belong to a file, so another version starts from Auto.
       clearAudioSelection();
       setSubtitleSelectionMode("auto");
@@ -540,12 +578,12 @@ export default function EpisodeContent({
                   ? () => openMediaInfo()
                   : undefined
               }
-              versions={versionsWithLiveness}
+              versions={versionsWithPlayability}
               playbackVariants={item.playback_variants}
               selectedVersion={selectedVersion}
-              selectedVersionMissing={selectedVersionMissing}
+              versionFallback={versionFallback}
               onVersionPickerOpenChange={handleVersionPickerOpenChange}
-              explicitFileSelection={manualSelectedFileId != null}
+              explicitFileSelection={explicitFileSelection}
               onSelectVersion={handleSelectVersion}
               onDownload={
                 user?.download_allowed && (item.versions ?? []).length > 0

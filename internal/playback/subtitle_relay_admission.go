@@ -48,6 +48,19 @@ import (
 // is admitted whenever fewer than relayDemuxSlotsPerSource other foreground
 // reads hold the source, regardless of what background or font work is doing.
 //
+// A fourth class covers the one read that is neither opportunistic nor a
+// client's own window: the recovery extraction a refused window or a refused
+// bitmap page is explicitly waiting on (relayDemuxRecovery, marked by
+// StreamExtractOpts.WaitingRelayDemux). That work has its own reserved slot per
+// source and waits for it, because the alternative is not "shed the read" but
+// "the retry pays the same 26 s relay read again". A background fill for
+// another track of the same session routinely holds the single detached slot
+// for minutes (production: a 4K PGS fill ran 95 s while the text window's
+// covering prefetch was shed and never retried), and the request-path pool is
+// held by the reads the client has already given up on. The reserved slot is
+// one per source and its wait is bounded, so the pipe gains at most one read it
+// is about to be asked for anyway, and that read replaces a full window extract.
+//
 // Local-file reads are not admitted at all: they do not share the relay pipe
 // and are the cheap paths the guard exists to protect.
 
@@ -81,12 +94,33 @@ const (
 	// shape until the dump settles.
 	relayDemuxFontSlotsPerSource = 1
 
+	// relayDemuxRecoverySlotsPerSource caps concurrent recovery reads per remote
+	// source. A recovery read is the extraction a refused window or bitmap page
+	// is explicitly waiting on (see relayDemuxRecovery), so it gets one reserved
+	// slot that no client window, background fill or font dump can hold. One is
+	// enough: a session waits on at most one recovering track at a time, and a
+	// second recovery would only re-read the same relay pipe in parallel.
+	relayDemuxRecoverySlotsPerSource = 1
+
+	// relayDemuxRecoveryWait bounds how long a recovery read waits for its
+	// reserved slot. It is far longer than the request-path wait because nobody's
+	// fetch deadline depends on this read finishing promptly: the client is
+	// already in its Retry-After backoff, and serving the retry from the artifact
+	// is what this read exists for. It stays bounded so a wedged holder cannot
+	// keep the recovery from answering (and being logged as shed) forever.
+	relayDemuxRecoveryWait = 20 * time.Second
+
 	// relayDemuxRequestWait bounds how long a request-path read waits for a
 	// slot before answering retryable. A read that holds a slot longer than
 	// this is a multi-second remote demux; the client is better served by its
 	// existing retry loop than by holding the connection inside its own fetch
 	// deadline.
 	relayDemuxRequestWait = 750 * time.Millisecond
+
+	// relayDemuxShedMemory bounds how long a shed timestamp is retained for the
+	// source-map cleanup. The warm quiet window is shorter; this only keeps the
+	// map from accumulating hosts that stopped shedding.
+	relayDemuxShedMemory = 2 * time.Minute
 )
 
 // relayDemuxClass selects how an admission request treats a saturated source.
@@ -103,6 +137,11 @@ const (
 	// relayDemuxFontDetached is an opportunistic font read: it never waits and
 	// skips a taken font budget.
 	relayDemuxFontDetached
+	// relayDemuxRecovery is the extraction a refused window or bitmap page is
+	// waiting on. It draws from its own reserved budget and waits for it, so a
+	// background fill or a client window cannot starve the read that makes the
+	// retry cheap.
+	relayDemuxRecovery
 )
 
 // relayDemuxClassKey carries the admission class through a context whose
@@ -114,12 +153,14 @@ type relayDemuxClassKey struct{}
 type relayDemuxSlotKey struct{}
 
 // relayDemuxSourceSlots is the per-source admission budget: request-path,
-// detached, and font reads draw from separate pools, so background or font work
-// cannot hold a foreground slot.
+// detached, font and recovery reads draw from separate pools, so background or
+// font work cannot hold a foreground slot and neither can starve the recovery a
+// refused request is waiting on.
 type relayDemuxSourceSlots struct {
 	requestPath chan struct{}
 	detached    chan struct{}
 	font        chan struct{}
+	recovery    chan struct{}
 }
 
 // relayDemuxGuard bounds concurrent subtitle demuxes per remote source. It is
@@ -128,10 +169,17 @@ type relayDemuxGuard struct {
 	limit         int
 	detachedLimit int
 	fontLimit     int
+	recoveryLimit int
 	wait          time.Duration
+	recoveryWait  time.Duration
 
 	mu    sync.Mutex
 	slots map[string]*relayDemuxSourceSlots
+	// lastRequestShed records the last time a client-facing read could not
+	// take a request-path slot per relay source. Detached warms consult it so
+	// they do not add a full-track demux to a pipe that is already shedding the
+	// windows viewers are waiting on.
+	lastRequestShed map[string]time.Time
 }
 
 func newRelayDemuxGuard(limit int, wait time.Duration) *relayDemuxGuard {
@@ -153,11 +201,14 @@ func newRelayDemuxGuardWithPools(limit, detachedLimit, fontLimit int, wait time.
 		fontLimit = 1
 	}
 	return &relayDemuxGuard{
-		limit:         limit,
-		detachedLimit: detachedLimit,
-		fontLimit:     fontLimit,
-		wait:          wait,
-		slots:         make(map[string]*relayDemuxSourceSlots),
+		limit:           limit,
+		detachedLimit:   detachedLimit,
+		fontLimit:       fontLimit,
+		recoveryLimit:   relayDemuxRecoverySlotsPerSource,
+		wait:            wait,
+		recoveryWait:    relayDemuxRecoveryWait,
+		slots:           make(map[string]*relayDemuxSourceSlots),
+		lastRequestShed: make(map[string]time.Time),
 	}
 }
 
@@ -187,10 +238,15 @@ func (g *relayDemuxGuard) pools(source string) *relayDemuxSourceSlots {
 	defer g.mu.Unlock()
 	pools, ok := g.slots[source]
 	if !ok {
+		recoveryLimit := g.recoveryLimit
+		if recoveryLimit <= 0 {
+			recoveryLimit = relayDemuxRecoverySlotsPerSource
+		}
 		pools = &relayDemuxSourceSlots{
 			requestPath: make(chan struct{}, g.limit),
 			detached:    make(chan struct{}, g.detachedLimit),
 			font:        make(chan struct{}, g.fontLimit),
+			recovery:    make(chan struct{}, recoveryLimit),
 		}
 		g.slots[source] = pools
 	}
@@ -206,40 +262,161 @@ func (g *relayDemuxGuard) acquire(ctx context.Context, input string, class relay
 		return func() {}, true
 	}
 	pools := g.pools(source)
+	label := relayDemuxClassLabel(class)
+	started := time.Now()
+	var release func()
+	var ok bool
 	switch class {
 	case relayDemuxDetached:
 		// Detached work never waits and never touches another budget: if its
 		// own budget is taken it is skipped and re-kicked later.
 		select {
 		case pools.detached <- struct{}{}:
-			return func() { <-pools.detached }, true
+			release, ok = func() { <-pools.detached }, true
 		default:
-			return nil, false
 		}
 	case relayDemuxFontDetached:
 		select {
 		case pools.font <- struct{}{}:
-			return func() { <-pools.font }, true
+			release, ok = func() { <-pools.font }, true
 		default:
-			return nil, false
 		}
 	case relayDemuxFont:
-		return g.acquireWaiting(ctx, pools.font)
+		release, ok = g.acquireWaiting(ctx, pools.font)
+		observeSubtitleRelayAdmissionWait(label, time.Since(started))
+	case relayDemuxRecovery:
+		// The read a refused request is waiting on gets its own reserved budget
+		// and a long, bounded wait: shedding it is what makes the retry pay the
+		// full relay read again.
+		release, ok = g.acquireWaitingFor(ctx, pools.recovery, g.recoveryWaitDuration())
+		observeSubtitleRelayAdmissionWait(label, time.Since(started))
 	default:
-		return g.acquireWaiting(ctx, pools.requestPath)
+		release, ok = g.acquireWaiting(ctx, pools.requestPath)
+		observeSubtitleRelayAdmissionWait(label, time.Since(started))
+	}
+	recordSubtitleRelayAdmission(label, source, ok)
+	if !ok {
+		if class == relayDemuxRequestPath {
+			g.noteRequestShed(source, time.Now())
+		}
+		return nil, false
+	}
+	return release, true
+}
+
+// noteRequestShed records that a client-facing read was shed for source. The
+// map is tiny (one entry per relay host), but a long-lived server that talks to
+// many hosts still prunes expired entries so it cannot grow without bound.
+func (g *relayDemuxGuard) noteRequestShed(source string, now time.Time) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.lastRequestShed == nil {
+		g.lastRequestShed = make(map[string]time.Time)
+	}
+	g.lastRequestShed[source] = now
+	if len(g.lastRequestShed) > 64 {
+		for key, at := range g.lastRequestShed {
+			if now.Sub(at) > relayDemuxShedMemory {
+				delete(g.lastRequestShed, key)
+			}
+		}
 	}
 }
+
+// requestPathSheddingRecently reports whether a client-facing read for input
+// was refused a slot within the quiet window. Detached work uses it to stay off
+// a pipe that is actively shedding.
+func (g *relayDemuxGuard) requestPathSheddingRecently(input string, within time.Duration) bool {
+	source, remote := relayDemuxSource(input)
+	if !remote {
+		return false
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	at, ok := g.lastRequestShed[source]
+	return ok && time.Since(at) < within
+}
+
+// requestPathSaturated reports whether every request-path slot for input is
+// held right now, so the next client read would have to wait for one. Detached
+// work consults it before it starts: a pipe whose request path is at capacity
+// has nothing to spare for opportunistic reads.
+//
+// The shed timestamp alone cannot answer this. A shed is recorded only after a
+// client read has already waited out its whole admission window, so a prefetch
+// kick launched against a saturated-but-not-yet-shedding source used to start,
+// take its detached slot, and add the demux the client read was waiting behind
+// — the production 503 (753ms, the full request-path wait) followed by five
+// shed-skipped kicks.
+func (g *relayDemuxGuard) requestPathSaturated(input string) bool {
+	source, remote := relayDemuxSource(input)
+	if !remote {
+		return false
+	}
+	pools := g.pools(source)
+	return len(pools.requestPath) >= cap(pools.requestPath)
+}
+
+// relayDemuxRequestPathShedding reports whether the process-wide guard shed a
+// client-facing read for input inside the quiet window.
+func relayDemuxRequestPathShedding(input string, within time.Duration) bool {
+	return activeRelayDemuxGuard().requestPathSheddingRecently(input, within)
+}
+
+// relayDemuxRequestPathSaturated reports whether the process-wide guard's
+// request-path budget for input is fully held right now.
+func relayDemuxRequestPathSaturated(input string) bool {
+	return activeRelayDemuxGuard().requestPathSaturated(input)
+}
+
+// relayDemuxDetachedBlocked reports whether an opportunistic detached read of
+// input must stay off the source: a client-facing read is waiting (or about to
+// wait) for a request-path slot, or one was shed inside the quiet window.
+func relayDemuxDetachedBlocked(input string, within time.Duration) bool {
+	return relayDemuxRequestPathSaturated(input) || relayDemuxRequestPathShedding(input, within)
+}
+
+// relayDemuxClassLabel is the bounded metric label for an admission class.
+// The two font classes share one pool and one label.
+func relayDemuxClassLabel(class relayDemuxClass) string {
+	switch class {
+	case relayDemuxDetached:
+		return relayDemuxClassDetachedLabel
+	case relayDemuxFont, relayDemuxFontDetached:
+		return relayDemuxClassFontLabel
+	case relayDemuxRecovery:
+		return relayDemuxClassRecoveryLabel
+	default:
+		return relayDemuxClassRequestLabel
+	}
+}
+
+const (
+	relayDemuxClassRequestLabel  = "request"
+	relayDemuxClassDetachedLabel = "detached"
+	relayDemuxClassFontLabel     = "font"
+	relayDemuxClassRecoveryLabel = "recovery"
+)
 
 // acquireWaiting takes one slot from pool, waiting up to the guard's short
 // bound. It reports false when the pool stays full: the caller answers its
 // existing retryable or pending shape.
 func (g *relayDemuxGuard) acquireWaiting(ctx context.Context, pool chan struct{}) (func(), bool) {
+	return g.acquireWaitingFor(ctx, pool, g.wait)
+}
+
+// acquireWaitingFor takes one slot from pool, waiting up to wait. A zero or
+// negative wait keeps the immediate-try-then-shed behavior.
+func (g *relayDemuxGuard) acquireWaitingFor(ctx context.Context, pool chan struct{}, wait time.Duration) (func(), bool) {
 	select {
 	case pool <- struct{}{}:
 		return func() { <-pool }, true
 	default:
 	}
-	timer := time.NewTimer(g.wait)
+	if wait <= 0 {
+		return nil, false
+	}
+	timer := time.NewTimer(wait)
 	defer timer.Stop()
 	select {
 	case pool <- struct{}{}:
@@ -249,6 +426,17 @@ func (g *relayDemuxGuard) acquireWaiting(ctx context.Context, pool chan struct{}
 	case <-ctx.Done():
 		return nil, false
 	}
+}
+
+// recoveryWaitDuration is the bounded admission wait for a recovery read.
+func (g *relayDemuxGuard) recoveryWaitDuration() time.Duration {
+	if g != nil && g.recoveryWait > 0 {
+		return g.recoveryWait
+	}
+	if g != nil && g.wait > 0 {
+		return g.wait
+	}
+	return relayDemuxRecoveryWait
 }
 
 // relayDemuxSource reduces a remote input URL to the relay source the bound
@@ -285,6 +473,17 @@ func detachedRelayDemux(ctx context.Context) context.Context {
 	return context.WithValue(ctx, relayDemuxClassKey{}, relayDemuxDetached)
 }
 
+// recoveryRelayDemux marks ctx as the read a refused request is waiting on: it
+// draws from the reserved recovery budget and waits for it instead of being
+// shed, so a background fill cannot starve the extraction that makes the
+// client's retry cheap.
+func recoveryRelayDemux(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, relayDemuxClassKey{}, relayDemuxRecovery)
+}
+
 // fontRelayDemuxContext marks ctx as a font read. A font dump never draws from
 // the request-path or detached pools: request-triggered fonts wait on the font
 // budget, and font warms (which already carry the detached marker) skip a taken
@@ -308,10 +507,27 @@ func fontRelayDemuxContext(ctx context.Context) context.Context {
 // param-less whole-track fetch is client-facing and keeps the request-path
 // budget.
 func relayDemuxAdmissionContext(ctx context.Context, opts StreamExtractOpts) context.Context {
+	if opts.WaitingRelayDemux {
+		// The read a refused window or page is waiting on outranks every
+		// opportunistic class: it must not be shed because another fill or a
+		// client window holds the pipe.
+		return recoveryRelayDemux(ctx)
+	}
 	if opts.DetachedRelayDemux {
 		return detachedRelayDemux(ctx)
 	}
 	return ctx
+}
+
+// warmRelayDemuxContext is relayDemuxAdmissionContext for a fill that runs on a
+// detached goroutine: opportunistic fills draw from the detached budget, and the
+// one read a refused request is waiting on draws from the reserved recovery
+// budget instead of being shed.
+func warmRelayDemuxContext(ctx context.Context, opts StreamExtractOpts) context.Context {
+	if opts.WaitingRelayDemux {
+		return recoveryRelayDemux(ctx)
+	}
+	return detachedRelayDemux(ctx)
 }
 
 // relayDemuxClassOf reports how ctx was admitted.

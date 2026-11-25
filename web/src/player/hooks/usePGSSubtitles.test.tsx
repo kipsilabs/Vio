@@ -329,7 +329,8 @@ describe("usePGSSubtitles fetcher", () => {
     video.currentTime = 1_000;
     playListener!();
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
-    expect(fetchMock.mock.calls[1]?.[0]).toContain("position=970");
+    // The page that contains the playhead, requested whole.
+    expect(fetchMock.mock.calls[1]?.[0]).toContain("position=960&duration=120");
     // The second window committed before the next resume is evaluated.
     await vi.waitFor(() => {
       expect(onLoadState.mock.calls.length).toBeGreaterThanOrEqual(3);
@@ -356,11 +357,11 @@ describe("usePGSSubtitles fetcher", () => {
       { initialProps: { sourceGeneration: 1 } },
     );
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(fetchMock.mock.calls[0]?.[0]).toContain("position=70&duration=60");
+    expect(fetchMock.mock.calls[0]?.[0]).toContain("position=0&duration=120");
     rerender({ sourceGeneration: 2 });
     expect(fetchMock).toHaveBeenCalledTimes(2);
-    // A fresh timeline after the rebuild starts with a short fresh window.
-    expect(fetchMock.mock.calls[1]?.[0]).toContain("position=70&duration=60");
+    // A fresh timeline after the rebuild asks for the same whole page.
+    expect(fetchMock.mock.calls[1]?.[0]).toContain("position=0&duration=120");
   });
 
   it("does not rebuild the fetcher for a new callback identity alone", () => {

@@ -1,5 +1,6 @@
 import { useMutation, useQueryClient, type QueryClient } from "@tanstack/react-query";
-import { toast } from "sonner";
+
+import { t } from "@/i18n";
 
 import {
   captureProfileRequestContext,
@@ -15,6 +16,7 @@ import {
 } from "@/player/utils/trackPreferenceWrites";
 
 import { itemKeys } from "./keys";
+import { settingWriteOptions, toastSettingWriteError } from "./settingWriteOffline";
 
 // Track preferences feed the effective defaults on item details; a
 // series-keyed preference feeds every episode's detail, so invalidate broadly.
@@ -30,6 +32,11 @@ export function invalidateItemDetails(queryClient: QueryClient): Promise<unknown
  * writes for the same title and dimension, so the viewer's last choice is the
  * one that sticks. The profile is captured now: a write that waits in line
  * still goes out for the profile that made the choice.
+ *
+ * The hooks that call this refuse a choice made offline before it gets here
+ * (settingWriteOptions) rather than let it wait in line: an earlier request
+ * can stay pending until the browser reconnects, and the choice would then
+ * replace a newer one made in another browser.
  */
 export function runOrderedPreferenceWrite<T>(
   dimension: TrackPreferenceDimension,
@@ -61,6 +68,7 @@ export function useSetAudioPreference() {
   const queryClient = useQueryClient();
 
   return useMutation({
+    ...settingWriteOptions,
     mutationFn: ({ prefId, trackIndex, track }: SetAudioPreferenceInput) =>
       runOrderedPreferenceWrite("audio", prefId, (profileContext) =>
         v2("PUT /api/v2/audio-prefs/{series_id}", {
@@ -69,9 +77,13 @@ export function useSetAudioPreference() {
           profileContext,
         }),
       ),
-    onSuccess: () => invalidateItemDetails(queryClient),
+    // Not awaited: the write has landed, and a caller waiting on mutateAsync
+    // to learn that should not also wait for these refetches.
+    onSuccess: () => {
+      void invalidateItemDetails(queryClient);
+    },
     onError: (err) => {
-      toast.error(err instanceof Error ? err.message : "Failed to save audio preference");
+      toastSettingWriteError(err, t("web.player.tracks.saveAudioFailed"));
     },
   });
 }
@@ -85,6 +97,7 @@ export function useDeleteAudioPreference() {
   const queryClient = useQueryClient();
 
   return useMutation({
+    ...settingWriteOptions,
     mutationFn: (prefId: string) =>
       runOrderedPreferenceWrite("audio", prefId, (profileContext) =>
         v2("DELETE /api/v2/audio-prefs/{series_id}", {
@@ -92,9 +105,12 @@ export function useDeleteAudioPreference() {
           profileContext,
         }),
       ),
-    onSuccess: () => invalidateItemDetails(queryClient),
+    // Not awaited, as in useSetAudioPreference.
+    onSuccess: () => {
+      void invalidateItemDetails(queryClient);
+    },
     onError: (err) => {
-      toast.error(err instanceof Error ? err.message : "Failed to reset audio preference");
+      toastSettingWriteError(err, t("web.player.tracks.resetAudioFailed"));
     },
   });
 }

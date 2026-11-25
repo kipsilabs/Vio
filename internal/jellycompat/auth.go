@@ -35,6 +35,15 @@ const (
 
 var mediaBrowserTokenPattern = regexp.MustCompile(`(?i)token="?([^",\s]+)"?`)
 
+// compatAPIKeyParam is Jellyfin's current query-param token spelling. Clients,
+// Jellyfin Web and the Android TV app among them, append it to the media URLs
+// they build, and PlaybackInfo appends it to the ones it hands out.
+const compatAPIKeyParam = "ApiKey"
+
+// compatLegacyAPIKeyParam is Jellyfin's legacy query-param token spelling,
+// honored when EnableLegacyAuthorization is set on a real server.
+const compatLegacyAPIKeyParam = "api_key"
+
 const (
 	tokenRefreshBuffer  = 5 * time.Minute
 	tokenRefreshTimeout = 30 * time.Second
@@ -121,13 +130,14 @@ func ExtractToken(r *http.Request) (string, bool) {
 	if token := strings.TrimSpace(r.Header.Get("X-Mediabrowser-Token")); token != "" {
 		return token, true
 	}
-	// Query-param token. Jellyfin's current spelling is "ApiKey" (PascalCase,
-	// always enabled); "api_key" is the legacy spelling (gated behind
-	// EnableLegacyAuthorization on a real server). Clients vary the casing
-	// further (Api_Key / API_KEY), so match both keys case-insensitively.
+	// Query-param token. Jellyfin's current spelling is compatAPIKeyParam
+	// (PascalCase, always enabled); "api_key" is the legacy spelling (gated
+	// behind EnableLegacyAuthorization on a real server). Clients vary the
+	// casing further (Api_Key / API_KEY), so match both keys
+	// case-insensitively.
 	// Ref: jellyfin Jellyfin.Server.Implementations/Security/AuthorizationContext.cs.
 	query := newCaseInsensitiveQuery(r.URL.Query())
-	for _, key := range []string{"ApiKey", "api_key"} {
+	for _, key := range []string{compatAPIKeyParam, compatLegacyAPIKeyParam} {
 		if token := strings.TrimSpace(query.Get(key)); token != "" {
 			return token, true
 		}
@@ -246,7 +256,7 @@ func writeSessionCheckUnavailable(w http.ResponseWriter) {
 func writeSessionLookupFailed(w http.ResponseWriter, r *http.Request, token string, err error) {
 	if r.Context().Err() == nil {
 		slog.WarnContext(r.Context(), "jellycompat auth: session lookup failed; answering 503", "component", "jellycompat",
-			"path", r.URL.Path,
+			"path", redactHLSPlaySessionID(r.URL.Path),
 			"token_prefix", safeTokenPrefix(token),
 			"error", logredact.SanitizeText(err.Error()),
 		)
@@ -426,7 +436,7 @@ func PlaybackSessionAuth(sessions *SessionStore, playbackStore CompatPlaybackSto
 					}
 					if ok {
 						slog.InfoContext(r.Context(), "jellycompat static stream granted without credentials",
-							"play_session", grant.ID, "user_id", grant.UserID, "item_id", itemID, "media_source_id", sourceID, "client_ip", clientIP, "peer", requestPeerHost(r), "negotiated_peer", grant.ClientPeer)
+							"play_session", playSessionFingerprint(grant.ID), "user_id", grant.UserID, "item_id", itemID, "media_source_id", sourceID, "client_ip", clientIP, "peer", requestPeerHost(r), "negotiated_peer", grant.ClientPeer)
 						// This grant infers an owner from a shared address; the
 						// caller supplied no credential. Keep source/global
 						// protection without spending that owner's account budget.

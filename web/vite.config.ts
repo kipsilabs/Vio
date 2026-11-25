@@ -1,5 +1,5 @@
 import { existsSync, readdirSync, readFileSync, renameSync, rmdirSync } from "node:fs";
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, stat, writeFile } from "node:fs/promises";
 import { promisify } from "node:util";
 import { brotliCompress, constants, gzip } from "node:zlib";
 import { defineConfig, loadEnv, transformWithEsbuild, type Plugin } from "vite";
@@ -12,6 +12,25 @@ import { configDefaults } from "vitest/config";
 /// <reference types="vitest" />
 
 const PRECOMPRESS_MIN_BYTES = 1024;
+// Large lazy JS chunks (primarily the 40 precompiled locale catalogs, ~1.2-1.5 MB
+// each) dominate Brotli-11 CPU time while barely benefiting over quality 6.
+// Keep quality 11 for the launch chunks, CSS, WASM, and smaller JS chunks.
+const BROTLI_FAST_JS_MIN_BYTES = 512 * 1024;
+const BROTLI_QUALITY_MAX = 11;
+const BROTLI_QUALITY_LARGE_LAZY_JS = 6;
+const EAGER_OR_VENDOR_CHUNK = /(?:^|[\\/])(?:index|vendor-react)-[A-Za-z0-9_-]+\.js$/;
+
+// Exported for vite.config.test.ts.
+export function brotliQualityForAsset(fileName: string, byteLength: number): number {
+  if (
+    fileName.endsWith(".js") &&
+    byteLength >= BROTLI_FAST_JS_MIN_BYTES &&
+    !EAGER_OR_VENDOR_CHUNK.test(fileName)
+  ) {
+    return BROTLI_QUALITY_LARGE_LAZY_JS;
+  }
+  return BROTLI_QUALITY_MAX;
+}
 
 // These tests need globals or Node APIs unavailable or non-configurable in VM
 // contexts, so they run on the threads pool and everything else on vmThreads.
@@ -72,9 +91,10 @@ export function precompressStaticAssets(): Plugin {
           const bytes = await readFile(filePath);
           if (bytes.byteLength < PRECOMPRESS_MIN_BYTES) return;
 
+          const quality = brotliQualityForAsset(output.fileName, bytes.byteLength);
           const [br, gz] = await Promise.all([
             brotliCompressAsync(bytes, {
-              params: { [constants.BROTLI_PARAM_QUALITY]: 11 },
+              params: { [constants.BROTLI_PARAM_QUALITY]: quality },
             }),
             gzipAsync(bytes, { level: 9 }),
           ]);
@@ -151,6 +171,65 @@ function themeBootScript(): Plugin {
   };
 }
 
+/** Messages the admin area shows; src/i18n/catalog.ts loads them only when it asks. */
+const ADMIN_MESSAGE_PREFIX = "web.admin.";
+const CATALOG_PART = /[\\/]src[\\/]locales[\\/][^\\/]+\.json\?part=(app|admin)$/;
+
+/**
+ * Serves one part of a generated catalog: `locales/<tag>.json?part=admin` holds
+ * the `web.admin.*` messages and `?part=app` the rest, so admin text never
+ * rides in the launch bundle. The part is still JSON, so Vite's JSON plugin
+ * turns it into a module as it does the whole file.
+ */
+// Exported for vite.config.test.ts.
+export function catalogParts(): Plugin {
+  // Both ?part=app and ?part=admin read the same locale JSON file (~3 MB each).
+  // Cache the split strings per (file, mtimeMs) so builds and test workers parse
+  // each catalog once instead of twice per load.
+  const cache = new Map<string, Promise<{ mtimeMs: number; app: string; admin: string }>>();
+
+  function splitCatalog(file: string, mtimeMs: number) {
+    return readFile(file, "utf8").then((raw) => {
+      const messages = JSON.parse(raw) as Record<string, unknown>;
+      const app: Record<string, unknown> = {};
+      const admin: Record<string, unknown> = {};
+      for (const [key, value] of Object.entries(messages)) {
+        if (key.startsWith(ADMIN_MESSAGE_PREFIX)) {
+          admin[key] = value;
+        } else {
+          app[key] = value;
+        }
+      }
+      return { mtimeMs, app: JSON.stringify(app), admin: JSON.stringify(admin) };
+    });
+  }
+
+  return {
+    name: "silo-catalog-parts",
+    enforce: "pre",
+    async load(id) {
+      const match = CATALOG_PART.exec(id);
+      if (!match) return null;
+      const file = id.slice(0, id.indexOf("?"));
+      this.addWatchFile(file);
+      const { mtimeMs } = await stat(file);
+      const existing = cache.get(file);
+      let entry = existing ? await existing : undefined;
+      if (!entry || entry.mtimeMs !== mtimeMs) {
+        const next = splitCatalog(file, mtimeMs);
+        cache.set(file, next);
+        try {
+          entry = await next;
+        } catch (err) {
+          cache.delete(file);
+          throw err;
+        }
+      }
+      return match[1] === "admin" ? entry.admin : entry.app;
+    },
+  };
+}
+
 // The server embeds dist and serves every file in it, and nothing in the app
 // reads the Vite manifest. Only scripts/check-bundle-budget.mjs does, so the
 // manifest moves next to dist instead of shipping.
@@ -222,16 +301,30 @@ export default defineConfig(({ mode }) => {
   const webVersion = (
     JSON.parse(readFileSync(path.resolve(__dirname, "package.json"), "utf8")) as { version: string }
   ).version;
+  // Pull-request builds verify compilation and bundle budget without shipping
+  // dist/, so CI sets SILO_SKIP_PRECOMPRESS=1 to skip writing .br/.gz sidecars.
+  const skipPrecompress = env.SILO_SKIP_PRECOMPRESS === "1";
 
   return {
     plugins: [
+      catalogParts(),
       ignoreUnresolvableJassubFont(),
       react(),
       tailwindcss(),
       themeBootScript(),
-      precompressStaticAssets(),
+      ...(skipPrecompress ? [] : [precompressStaticAssets()]),
       moveManifestOutOfDist(),
     ],
+    json: {
+      // With named exports on, Vite turns every top-level key of a JSON file
+      // into JavaScript source, so each precompiled message in src/locales
+      // (about 30 MB) becomes object and array AST nodes that Rollup keeps for
+      // the whole build. That alone roughly doubles the heap `vite build`
+      // needs. Off, any file over 10 kB becomes one `JSON.parse("...")` string,
+      // which also parses faster in the browser. Nothing imports named exports
+      // from JSON.
+      namedExports: false,
+    },
     define: {
       // Reported in X-Silo-Client-Version on every v2 request (src/api/v2/request.ts).
       __SILO_WEB_VERSION__: JSON.stringify(webVersion),
@@ -240,6 +333,9 @@ export default defineConfig(({ mode }) => {
       // A font inlined into the CSS downloads for everyone, defeating the
       // unicode-range subsets in src/fonts.css, so fonts always stay files.
       assetsInlineLimit: (filePath: string) => (/\.woff2?$/.test(filePath) ? false : undefined),
+      // scripts/check-bundle-budget.mjs reports the real brotli-11 launch cost,
+      // and precompressStaticAssets writes gzip sidecars on release builds.
+      reportCompressedSize: false,
       // scripts/check-bundle-budget.mjs reads the manifest to find the chunks
       // the entry loads before the app can run. moveManifestOutOfDist keeps it
       // out of the embedded bundle.
@@ -262,10 +358,16 @@ export default defineConfig(({ mode }) => {
       include: ["jassub > throughput", "jassub > rvfc-polyfill"],
     },
     resolve: {
-      alias: {
-        "@": path.resolve(__dirname, "./src"),
-        "@pdfjs": path.resolve(__dirname, "./public/vendor/pdfjs"),
-      },
+      alias: [
+        { find: "@", replacement: path.resolve(__dirname, "./src") },
+        { find: "@pdfjs", replacement: path.resolve(__dirname, "./public/vendor/pdfjs") },
+        // Catalog messages arrive precompiled (src/locales), so the ICU parser
+        // never runs; its no-parser build keeps it out of the bundle.
+        {
+          find: /^@formatjs\/icu-messageformat-parser$/,
+          replacement: "@formatjs/icu-messageformat-parser/no-parser.js",
+        },
+      ],
     },
     server: {
       host: "0.0.0.0",
@@ -287,6 +389,12 @@ export default defineConfig(({ mode }) => {
       environment: "jsdom",
       globals: true,
       setupFiles: ["./src/test-setup.ts"],
+      // vmThreads workers are threads in one process, and vitest's default
+      // recycle limit is total RAM divided by the worker count, so together
+      // they may grow to nearly all of the machine's memory. Recycling each
+      // worker at 512MB bounds that without lowering the worker count or
+      // slowing the run; a lower limit recycles so often that it does slow.
+      vmMemoryLimit: "512MB",
       projects: [
         {
           extends: true,

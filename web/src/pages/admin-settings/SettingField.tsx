@@ -5,6 +5,7 @@ import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
 import { RestartBadge } from "@/components/settings/RestartBadge";
+import { useT } from "@/i18n";
 import { cn } from "@/lib/utils";
 import {
   Select,
@@ -40,9 +41,16 @@ export const SETTINGS_BUTTON = "bg-background border-muted-foreground/25 hover:b
 export const SETTINGS_NUMBER_WIDTH = "w-full sm:w-[var(--settings-control-w-num)]";
 
 /**
- * One-line probe result rendered under a field description, e.g.
+ * Short probe result rendered under a field description, e.g.
  * "Detected VA-API on renderD128". Pass any node to `status` instead when the
  * copy needs richer markup.
+ *
+ * The text may wrap. Items align to the top, and each direct `svg` child (a
+ * `size-3.5` icon) is offset to center on the first line. When the icon is
+ * taller than a line, as with a large browser font size, the top padding lowers
+ * the text instead, so the icon stays inside the status. A word wider than the
+ * line, such as a folder path, breaks inside the word: `wrap-anywhere`, unlike
+ * `break-words`, lets the text (a flex item) shrink below its longest word.
  */
 export function SettingFieldStatus({
   tone = "ok",
@@ -55,7 +63,7 @@ export function SettingFieldStatus({
   return (
     <span
       className={cn(
-        "inline-flex items-center gap-1.5 text-[13px] leading-snug",
+        "inline-flex items-start gap-1.5 text-[13px] leading-snug wrap-anywhere has-[>svg]:pt-[max(0px,calc((0.875rem-1lh)/2))] [&>svg]:mt-[calc((1lh-0.875rem)/2)]",
         tone === "ok" && "text-green-600 dark:text-green-400",
         tone === "warn" && "text-amber-600 dark:text-amber-400",
         tone === "muted" && "text-muted-foreground",
@@ -80,6 +88,12 @@ export interface SettingFieldRowProps {
   status?: ReactNode;
   /** Amber "Restart" chip after the label; drive it from `useRestartKeys`. */
   restartRequired?: boolean;
+  /**
+   * The environment variable that sets this setting on the server, from
+   * `form.envVar(key)`. The row says so under its description; the field
+   * components also disable their control.
+   */
+  managedByEnv?: string;
   /**
    * Trailing unit for the control, e.g. "days" or "Mbps". It renders in the
    * row's own unit slot rather than beside the control on purpose: the slot is
@@ -106,6 +120,7 @@ export function SettingFieldRow({
   descriptionId,
   status,
   restartRequired,
+  managedByEnv,
   unit,
   className,
   children,
@@ -113,6 +128,7 @@ export function SettingFieldRow({
   // A group that already says "Changes apply after a restart" does not need the
   // same fact repeated on every row inside it.
   const groupSaysRestart = useGroupRestartAll();
+  const t = useT();
 
   return (
     <div
@@ -124,29 +140,45 @@ export function SettingFieldRow({
     >
       <div className="min-w-0 flex-1 sm:max-w-[520px]">
         <div className="flex flex-wrap items-center gap-2">
-          {dirty ? (
-            <span
-              className="size-1.5 shrink-0 rounded-full bg-[var(--settings-accent)]"
-              title="Unsaved change"
-            />
-          ) : null}
-          <Label htmlFor={htmlFor} className="text-sm font-medium">
-            {label}
-          </Label>
+          {/* The dot stays beside the label's first line when a long label
+              wraps: its box is one line of the label (text-sm) tall. */}
+          <span className="flex min-w-0 items-start gap-2">
+            {dirty ? (
+              <span className="flex h-5 shrink-0 items-center">
+                <span
+                  className="size-1.5 rounded-full bg-[var(--settings-accent)]"
+                  title={t("web.admin.settings.fields.unsavedChange")}
+                />
+              </span>
+            ) : null}
+            <Label htmlFor={htmlFor} className="text-sm font-medium">
+              {label}
+            </Label>
+          </span>
           {restartRequired && !groupSaysRestart && <RestartBadge />}
         </div>
         {description ? (
-          <p id={descriptionId} className="text-muted-foreground mt-1 text-[13px] leading-relaxed">
+          <p
+            id={descriptionId}
+            className="text-muted-foreground mt-1 text-[13px] leading-relaxed text-pretty"
+          >
             {description}
           </p>
         ) : null}
         {status ? <div className="mt-1.5">{status}</div> : null}
+        {managedByEnv ? (
+          <div className="mt-1.5">
+            <SettingFieldStatus tone="muted">
+              {t("web.admin.settings.fields.managedByEnv", { env: managedByEnv })}
+            </SettingFieldStatus>
+          </div>
+        ) : null}
       </div>
-      {/* `sm:ml-auto` pins the control column to the row's right edge. The
+      {/* `sm:ms-auto` pins the control column to the row's end edge. The
           label column stops growing at its max width, so without it a row
           with a short label and a narrow control (a switch, a link button)
           would leave its control wherever the label column ended. */}
-      <div className="flex w-full items-center gap-2 sm:ml-auto sm:w-auto sm:shrink-0 sm:justify-end">
+      <div className="flex w-full items-center gap-2 sm:ms-auto sm:w-auto sm:shrink-0 sm:justify-end">
         {/* Grows to fill the row on a stacked phone layout; content-sized and
             right-aligned from `sm` up, which is what puts every control on the
             shared edge. */}
@@ -174,7 +206,8 @@ interface SettingFieldProps {
   label: string;
   /** The field has an unsaved edit; drive it from `form.isDirty(key)`. */
   dirty?: boolean;
-  type?: "text" | "number" | "password" | "toggle" | "duration" | "select";
+  /** A secret uses `SecretField`, which keeps the saved value when emptied. */
+  type?: "text" | "number" | "toggle" | "duration" | "select";
   /**
    * Placeholder for `text`, description for every other type. Prefer
    * `description` for new call sites.
@@ -189,10 +222,13 @@ interface SettingFieldProps {
   value: string;
   onChange: (value: string) => void;
   options?: SelectOption[];
-  sensitiveConfigured?: boolean;
   disabled?: boolean;
   /** Marks the field with a restart badge; drive it from `useRestartKeys`. */
   restartRequired?: boolean;
+  /** See {@link SettingFieldRowProps.managedByEnv}; disables the control. */
+  managedByEnv?: string;
+  /** Direction of a `text` input. Pass `"ltr"` for a path, URL, or network address, which reads left to right in every language. */
+  dir?: "ltr";
   className?: string;
 }
 
@@ -207,11 +243,13 @@ export function SettingField({
   value,
   onChange,
   options,
-  sensitiveConfigured,
-  disabled,
+  disabled: disabledProp,
   restartRequired,
+  managedByEnv,
+  dir,
   className,
 }: SettingFieldProps) {
+  const disabled = disabledProp || managedByEnv != null;
   const controlId = useId();
   const hintId = useId();
 
@@ -230,6 +268,7 @@ export function SettingField({
       descriptionId={hintId}
       status={status}
       restartRequired={restartRequired}
+      managedByEnv={managedByEnv}
       unit={unit}
       className={className}
     >
@@ -271,21 +310,6 @@ export function SettingField({
     );
   }
 
-  if (type === "password") {
-    return row(
-      <Input
-        id={controlId}
-        type="password"
-        placeholder={sensitiveConfigured ? "configured" : (hint ?? "Not configured")}
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        disabled={disabled}
-        className={cn("border-muted-foreground/25", SETTINGS_CONTROL_WIDTH)}
-        aria-describedby={describedBy}
-      />,
-    );
-  }
-
   if (type === "number") {
     return row(
       <Input
@@ -308,6 +332,7 @@ export function SettingField({
       autoComplete="off"
       data-1p-ignore="true"
       data-lpignore="true"
+      dir={dir}
       value={value}
       onChange={(e) => onChange(e.target.value)}
       disabled={disabled}

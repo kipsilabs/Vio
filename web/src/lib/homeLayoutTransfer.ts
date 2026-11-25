@@ -1,4 +1,7 @@
 import type { components } from "@/api/v2/schema";
+import { t, type MessageKey } from "@/i18n";
+import type { ProfileSectionBaseline } from "@/lib/homeLayoutBaseline";
+import { collectionRefsOf } from "@/lib/homeRows/collectionList";
 import { FILTER_SECTION_TYPES } from "@/lib/sectionTypes";
 
 // Home layout export and import: a profile's saved section overrides for the
@@ -36,6 +39,11 @@ export interface HomeLayoutPage {
   /** Set on a library page: the exporting server's library ID. */
   library_id?: number;
   overrides: SectionOverrideWrite[];
+  /**
+   * Opaque server-keyed tokens for every server row on this page at export
+   * time. Absent on older v1 exports; ignored on cross-server imports.
+   */
+  server_section_tokens?: string[];
 }
 
 export interface HomeLayoutFile {
@@ -53,6 +61,7 @@ export interface HomeLayoutSourcePage {
   scope: HomeLayoutScope;
   libraryId?: number;
   overrides: SectionOverrideRead[];
+  serverSectionTokens?: string[];
 }
 
 /** The write shape of a stored override, without its ID and timestamps. */
@@ -97,6 +106,7 @@ export function buildHomeLayoutFile(input: {
       scope: page.scope,
       ...(page.scope === "library" ? { library_id: page.libraryId } : {}),
       overrides: page.overrides.map(overrideToWrite),
+      ...(page.serverSectionTokens ? { server_section_tokens: page.serverSectionTokens } : {}),
     })),
   };
 }
@@ -144,29 +154,46 @@ function sanitizeOverride(raw: unknown): SectionOverrideWrite | null {
   return write;
 }
 
+// Validates the optional server baseline token list on a page. Absent means an
+// export from before tokens existed (undefined); a malformed or oversized list
+// becomes [], so the import offers no rows to hide on that page.
+function sanitizeServerSectionTokens(raw: unknown): string[] | undefined {
+  if (raw === undefined) return undefined;
+  if (!Array.isArray(raw) || raw.length > HOME_LAYOUT_MAX_PAGE_TOKENS) return [];
+  const seen = new Set<string>();
+  const tokens: string[] = [];
+  for (const item of raw) {
+    if (!boundedString(item, 128) || item === "") return [];
+    if (seen.has(item)) continue;
+    seen.add(item);
+    tokens.push(item);
+  }
+  return tokens;
+}
+
 /** Parses and validates the text of an export file. */
 export function parseHomeLayoutFile(text: string): HomeLayoutParseResult {
   if (text.length > HOME_LAYOUT_MAX_LENGTH) {
-    return { ok: false, error: "This file is too large to be a home layout export." };
+    return { ok: false, error: t("web.home.layout.tooLarge") };
   }
   let data: unknown;
   try {
     data = JSON.parse(text);
   } catch {
-    return { ok: false, error: "This isn't valid JSON." };
+    return { ok: false, error: t("web.home.layout.transfer.invalidJson") };
   }
   if (!isRecord(data) || data.format !== HOME_LAYOUT_FORMAT) {
-    return { ok: false, error: "This isn't a Silo home layout export." };
+    return { ok: false, error: t("web.home.layout.transfer.notExport") };
   }
   if (typeof data.version === "number" && data.version > HOME_LAYOUT_VERSION) {
-    return { ok: false, error: "This export comes from a newer version of Silo." };
+    return { ok: false, error: t("web.home.layout.transfer.newerVersion") };
   }
   if (
     data.version !== HOME_LAYOUT_VERSION ||
     typeof data.server_id !== "string" ||
     !Array.isArray(data.pages)
   ) {
-    return { ok: false, error: "This home layout export is incomplete or damaged." };
+    return { ok: false, error: t("web.home.layout.transfer.damaged") };
   }
 
   const libraries: HomeLayoutLibrary[] = [];
@@ -203,6 +230,8 @@ export function parseHomeLayoutFile(text: string): HomeLayoutParseResult {
     // An empty page restores the server's rows on import, so a page emptied
     // by dropping damaged entries is left out rather than read as one.
     if (raw.overrides.length > 0 && page.overrides.length === 0) continue;
+    const serverSectionTokens = sanitizeServerSectionTokens(raw.server_section_tokens);
+    if (serverSectionTokens !== undefined) page.server_section_tokens = serverSectionTokens;
     pages.push(page);
   }
 
@@ -234,7 +263,11 @@ export function fileReferences(file: HomeLayoutFile): HomeLayoutReferences {
     for (const override of page.overrides) {
       for (const config of [override.config, override.user_config]) {
         if (!config) continue;
-        if (nonEmptyString(config.user_collection_id)) refs.personalCollections = true;
+        if (
+          nonEmptyString(config.user_collection_id) ||
+          collectionRefsOf(config).some((ref) => ref.source === "user")
+        )
+          refs.personalCollections = true;
         if (nonEmptyString(config.profile_id)) refs.profiles = true;
       }
     }
@@ -249,12 +282,12 @@ export type HomeLayoutSkipReason =
   | "collection"
   | "profile";
 
-export const HOME_LAYOUT_SKIP_REASON_LABELS: Record<HomeLayoutSkipReason, string> = {
-  unknown_recipe: "This server doesn't offer this section type",
-  custom_disabled: "Only an admin can add this kind of row",
-  library: "Uses a library this profile doesn't have here",
-  collection: "Uses a collection this profile can't see here",
-  profile: "Follows a profile outside this account",
+export const HOME_LAYOUT_SKIP_REASON_LABELS: Record<HomeLayoutSkipReason, MessageKey> = {
+  unknown_recipe: "web.home.layout.transfer.skip.unknownRecipe",
+  custom_disabled: "web.home.layout.transfer.skip.customDisabled",
+  library: "web.home.layout.transfer.skip.library",
+  collection: "web.home.layout.transfer.skip.collection",
+  profile: "web.home.layout.transfer.skip.profile",
 };
 
 export interface HomeLayoutImportTarget {
@@ -276,6 +309,14 @@ export interface HomeLayoutPlannedPage {
   libraryId?: number;
   label: string;
   overrides: SectionOverrideWrite[];
+  /**
+   * False when every file override on this same-server page was skipped, so
+   * checking rows to hide merges those hides into existing destination
+   * overrides without clearing unrelated customizations.
+   */
+  replaceExisting?: boolean;
+  /** Baseline tokens from the file on a same-server import; absent on legacy or cross-server files. */
+  serverSectionTokens?: string[];
 }
 
 export interface HomeLayoutSkippedSection {
@@ -287,6 +328,12 @@ export interface HomeLayoutSkippedSection {
 export interface HomeLayoutImportPlan {
   sameServer: boolean;
   pages: HomeLayoutPlannedPage[];
+  /**
+   * Same-server pages whose library matched, where every file override was
+   * skipped. Shown in the dialog only if the user selects server rows to hide
+   * on them, preserving existing overrides there.
+   */
+  unappliedPages: HomeLayoutPlannedPage[];
   /** Library pages with no matching library here, by their exported name. */
   skippedPages: string[];
   skippedSections: HomeLayoutSkippedSection[];
@@ -393,7 +440,11 @@ function sectionSkipReason(
 
   const config = effectiveConfig(override);
   if (sameServer) return sameServerReferenceProblem(config, target, libraries);
-  if (nonEmptyString(config.library_collection_id) || nonEmptyString(config.user_collection_id)) {
+  if (
+    nonEmptyString(config.library_collection_id) ||
+    nonEmptyString(config.user_collection_id) ||
+    collectionRefsOf(config).length > 0
+  ) {
     return "collection";
   }
   if (nonEmptyString(config.profile_id)) return "profile";
@@ -418,6 +469,15 @@ function sameServerReferenceProblem(
   if (
     nonEmptyString(config.user_collection_id) &&
     !target.personalCollectionIds.has(config.user_collection_id)
+  ) {
+    return "collection";
+  }
+  // A row of collections, like a collection row, needs every personal
+  // collection it lists to be one the profile sees.
+  if (
+    collectionRefsOf(config).some(
+      (ref) => ref.source === "user" && !target.personalCollectionIds.has(ref.id),
+    )
   ) {
     return "collection";
   }
@@ -460,7 +520,7 @@ function sectionTitle(override: SectionOverrideWrite): string {
     override.title ||
     override.user_section_type ||
     override.section_type ||
-    "Untitled section"
+    t("web.home.layout.transfer.untitledSection")
   );
 }
 
@@ -481,6 +541,7 @@ export function planHomeLayoutImport(
   const plan: HomeLayoutImportPlan = {
     sameServer,
     pages: [],
+    unappliedPages: [],
     skippedPages: [],
     skippedSections: [],
     skippedServerSectionChanges: 0,
@@ -489,9 +550,11 @@ export function planHomeLayoutImport(
 
   for (const page of file.pages) {
     let planned: HomeLayoutPlannedPage;
-    let sourceLabel = "Home";
+    let sourceLabel = t("web.home.rows.pages.home");
     if (page.scope === "library") {
-      sourceLabel = exportedLibraryNames.get(page.library_id!) ?? `Library ${page.library_id}`;
+      sourceLabel =
+        exportedLibraryNames.get(page.library_id!) ??
+        t("web.home.layout.transfer.libraryFallback", { id: String(page.library_id) });
       const library = libraries.get(page.library_id!);
       if (!library) {
         plan.skippedPages.push(sourceLabel);
@@ -499,7 +562,10 @@ export function planHomeLayoutImport(
       }
       planned = { scope: "library", libraryId: library.id, label: library.name, overrides: [] };
     } else {
-      planned = { scope: "home", label: "Home", overrides: [] };
+      planned = { scope: "home", label: t("web.home.rows.pages.home"), overrides: [] };
+    }
+    if (sameServer && page.server_section_tokens !== undefined) {
+      planned.serverSectionTokens = page.server_section_tokens;
     }
 
     for (const override of page.overrides) {
@@ -537,7 +603,11 @@ export function planHomeLayoutImport(
     // server importing it restores them; another server's rows differ, so
     // there it carries nothing.
     const restoresServerRows = sameServer && page.overrides.length === 0;
-    if (planned.overrides.length > 0 || restoresServerRows) plan.pages.push(planned);
+    if (planned.overrides.length > 0 || restoresServerRows) {
+      plan.pages.push(planned);
+    } else if (sameServer) {
+      plan.unappliedPages.push({ ...planned, replaceExisting: false });
+    }
   }
 
   return plan;
@@ -588,6 +658,7 @@ export function mergeImportedPage(
   existing: SectionOverrideRead[],
   sameServer: boolean,
   newId: () => string,
+  hideSectionIds: readonly string[] = [],
 ): SectionOverrideWrite[] {
   if (!sameServer) {
     return [
@@ -601,6 +672,25 @@ export function mergeImportedPage(
   for (const override of existing) {
     if (override.section_id) existingBySection.set(override.section_id, override);
   }
+
+  if (page.replaceExisting === false) {
+    // Hiding a row keeps the profile's saved changes to it, so showing it
+    // again later brings them back. A removed row stays removed.
+    const hideSet = new Set(hideSectionIds.filter(Boolean));
+    const merged: SectionOverrideWrite[] = existing.map((override) => {
+      const kept = keepExisting(override);
+      if (!override.section_id || !hideSet.has(override.section_id) || override.removed) {
+        return kept;
+      }
+      return { ...kept, hidden: true };
+    });
+    for (const sectionId of hideSet) {
+      if (existingBySection.has(sectionId)) continue;
+      merged.push({ id: newId(), section_id: sectionId, hidden: true });
+    }
+    return merged;
+  }
+
   const imported = new Set<string>();
   const merged: SectionOverrideWrite[] = [];
   for (const override of page.overrides) {
@@ -614,8 +704,24 @@ export function mergeImportedPage(
     imported.add(sectionId);
     merged.push({ ...override, id: existingBySection.get(sectionId)?.id || newId() });
   }
+  for (const sectionId of hideSectionIds) {
+    if (!sectionId || imported.has(sectionId)) continue;
+    imported.add(sectionId);
+    merged.push({
+      id: existingBySection.get(sectionId)?.id || newId(),
+      section_id: sectionId,
+      hidden: true,
+    });
+  }
   return merged;
 }
+
+/**
+ * The most server-row tokens one page of a file may carry. A page's server
+ * rows aren't capped like its overrides, and the file's length limit still
+ * bounds the whole file.
+ */
+const HOME_LAYOUT_MAX_PAGE_TOKENS = 10_000;
 
 /** The most overrides one page's save accepts (SectionOverrideSet in the v2 contract). */
 export const HOME_LAYOUT_MAX_PAGE_OVERRIDES = 500;
@@ -624,6 +730,8 @@ export const HOME_LAYOUT_MAX_PAGE_OVERRIDES = 500;
 export interface HomeLayoutPageApi {
   listSaved(): Promise<SectionOverrideRead[]>;
   save(overrides: SectionOverrideWrite[]): Promise<unknown>;
+  /** Fresh baseline read used to keep only checked rows still present on the server. */
+  getBaseline?(): Promise<ProfileSectionBaseline>;
 }
 
 /** Saves one planned page over the profile's saved overrides. */
@@ -632,11 +740,30 @@ export async function importPage(
   sameServer: boolean,
   api: HomeLayoutPageApi,
   newId: () => string,
+  hideSectionIds: readonly string[] = [],
 ): Promise<void> {
-  const overrides = mergeImportedPage(page, await api.listSaved(), sameServer, newId);
+  let effectiveHideIds = sameServer ? hideSectionIds : [];
+  if (effectiveHideIds.length > 0 && api.getBaseline) {
+    // The fresh read only drops rows removed since the preview; when it
+    // fails, the preview's choices stand rather than failing the page.
+    const baseline = await api.getBaseline().catch(() => null);
+    if (baseline) {
+      const visibleIds = new Set(baseline.visible_sections.map((row) => row.id));
+      effectiveHideIds = effectiveHideIds.filter((id) => visibleIds.has(id));
+    }
+  }
+  // A hide-only page with nothing left to hide has nothing to save.
+  if (page.replaceExisting === false && effectiveHideIds.length === 0) return;
+  const overrides = mergeImportedPage(
+    page,
+    await api.listSaved(),
+    sameServer,
+    newId,
+    effectiveHideIds,
+  );
   if (overrides.length > HOME_LAYOUT_MAX_PAGE_OVERRIDES) {
     throw new Error(
-      `this page would have more than ${HOME_LAYOUT_MAX_PAGE_OVERRIDES} saved section changes`,
+      t("web.home.layout.transfer.pageTooLarge", { max: HOME_LAYOUT_MAX_PAGE_OVERRIDES }),
     );
   }
   await api.save(overrides);

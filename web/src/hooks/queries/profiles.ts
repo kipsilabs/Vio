@@ -2,10 +2,10 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import type { ProfileRequestContextSnapshot } from "@/api/client";
 import type { AdminSession, Profile } from "@/api/types";
 import type { components } from "@/api/v2/schema";
-import { v2, type V2Body, type V2Result } from "@/api/v2/request";
+import { v2, v2ErrorText, type V2Body, type V2Result } from "@/api/v2/request";
 import { profileKeys } from "./keys";
 import { toast } from "sonner";
-import { useOptionalAuth } from "@/hooks/useAuth";
+import { t } from "@/i18n";
 
 function replaceProfileInList(profiles: Profile[] | undefined, updatedProfile: Profile) {
   if (!profiles || profiles.length === 0) {
@@ -49,6 +49,14 @@ export interface ProfileList {
    * separately because it arrived after the limit itself.
    */
   require_advisory_age_supported: boolean;
+  /** Whether the server accepts and enforces `requests_allowed`. */
+  requests_allowed_supported: boolean;
+  /**
+   * The household profile limit createProfile enforces, or null when the
+   * server did not report one (an older server, or a limit it could not
+   * read). See canAddProfile.
+   */
+  max_profiles: number | null;
 }
 
 /**
@@ -120,6 +128,11 @@ export async function listProfiles(): Promise<ProfileList> {
     max_advisory_age_supported: list.max_advisory_age_supported === true,
     // Absent on a server that predates the require-advisory-age option.
     require_advisory_age_supported: list.require_advisory_age_supported === true,
+    // This server has no per-profile requests switch: requests follow the
+    // account's access groups.
+    requests_allowed_supported: false,
+    // Absent on a server that predates reporting the profile limit.
+    max_profiles: list.max_profiles ?? null,
   };
 }
 
@@ -168,20 +181,12 @@ export function useHouseholdSessions(enabled = true) {
   });
 }
 
-export function useProfiles(options?: { enabled?: boolean }) {
-  // The profile list needs an authenticated session, but shell-level
-  // components (sidebar, realtime provider, route gates) subscribe to it
-  // before the auth provider has finished restoring a stored session — the
-  // first fetch would fire with no access token and answer 401, then refetch
-  // after bootstrap. Wait for auth to settle instead, so the first request
-  // already carries a token. Outside an AuthProvider (unit tests, preview
-  // renders) there is nothing to wait on.
-  const auth = useOptionalAuth();
-  const authReady = auth === null || (!auth.loading && !auth.setupLoading && auth.user !== null);
+export function useProfiles(options?: { enabled?: boolean; refetchOnWindowFocus?: boolean }) {
   const query = useQuery({
     queryKey: profileKeys.list(),
     queryFn: listProfiles,
-    enabled: (options?.enabled ?? true) && authReady,
+    enabled: options?.enabled ?? true,
+    refetchOnWindowFocus: options?.refetchOnWindowFocus ?? false,
   });
 
   return {
@@ -190,19 +195,28 @@ export function useProfiles(options?: { enabled?: boolean }) {
     avatarUploadEnabled: query.data?.avatar_upload_enabled ?? false,
     maxAdvisoryAgeSupported: query.data?.max_advisory_age_supported ?? false,
     requireAdvisoryAgeSupported: query.data?.require_advisory_age_supported ?? false,
+    requestsAllowedSupported: query.data?.requests_allowed_supported ?? false,
+    maxProfiles: query.data?.max_profiles ?? null,
   };
 }
+
+/**
+ * Writes that change a field of an existing profile are sent even offline, so
+ * they fail at once with an error. Held until reconnect, one would replace
+ * whatever another browser changed that field to in the meantime.
+ */
+const PROFILE_EDIT_NETWORK_MODE = "always";
 
 export function useCreateProfile(profileContext?: ProfileRequestContextSnapshot) {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (body: ProfileCreate) => createProfile(body, profileContext),
     onSuccess: () => {
-      toast.success("Profile created");
+      toast.success(t("web.common.toast.profiles.created"));
       queryClient.invalidateQueries({ queryKey: profileKeys.list() });
     },
     onError: (err) => {
-      toast.error(err instanceof Error ? err.message : "Failed to save profile");
+      toast.error(v2ErrorText(err, t("web.common.toast.profiles.saveFailed")));
     },
   });
 }
@@ -210,6 +224,7 @@ export function useCreateProfile(profileContext?: ProfileRequestContextSnapshot)
 export function useUpdateProfile() {
   const queryClient = useQueryClient();
   return useMutation({
+    networkMode: PROFILE_EDIT_NETWORK_MODE,
     mutationFn: ({ id, body }: { id: string; body: ProfileUpdate }) =>
       v2("PATCH /api/v2/profiles/{id}", { path: { id }, body }).then(profileFromV2),
     onSuccess: (updatedProfile) => {
@@ -220,13 +235,15 @@ export function useUpdateProfile() {
           avatar_upload_enabled: current?.avatar_upload_enabled ?? false,
           max_advisory_age_supported: current?.max_advisory_age_supported ?? false,
           require_advisory_age_supported: current?.require_advisory_age_supported ?? false,
+          requests_allowed_supported: current?.requests_allowed_supported ?? false,
+          max_profiles: current?.max_profiles ?? null,
         };
       });
-      toast.success("Profile updated");
+      toast.success(t("web.common.toast.profiles.updated"));
       queryClient.invalidateQueries({ queryKey: profileKeys.list() });
     },
     onError: (err) => {
-      toast.error(err instanceof Error ? err.message : "Failed to save profile");
+      toast.error(v2ErrorText(err, t("web.common.toast.profiles.saveFailed")));
     },
   });
 }
@@ -234,6 +251,7 @@ export function useUpdateProfile() {
 export function useUploadProfileAvatar(profileContext?: ProfileRequestContextSnapshot) {
   const queryClient = useQueryClient();
   return useMutation({
+    networkMode: PROFILE_EDIT_NETWORK_MODE,
     mutationFn: ({ id, file }: { id: string; file: File }) =>
       uploadProfileAvatar(id, file, profileContext),
     onSuccess: (updatedProfile) => {
@@ -242,12 +260,14 @@ export function useUploadProfileAvatar(profileContext?: ProfileRequestContextSna
         avatar_upload_enabled: current?.avatar_upload_enabled ?? false,
         max_advisory_age_supported: current?.max_advisory_age_supported ?? false,
         require_advisory_age_supported: current?.require_advisory_age_supported ?? false,
+        requests_allowed_supported: current?.requests_allowed_supported ?? false,
+        max_profiles: current?.max_profiles ?? null,
       }));
-      toast.success("Avatar updated");
+      toast.success(t("web.common.toast.profiles.avatarUpdated"));
       queryClient.invalidateQueries({ queryKey: profileKeys.list() });
     },
     onError: (err) => {
-      toast.error(err instanceof Error ? err.message : "Failed to upload avatar");
+      toast.error(v2ErrorText(err, t("web.common.toast.profiles.avatarUploadFailed")));
     },
   });
 }
@@ -255,6 +275,7 @@ export function useUploadProfileAvatar(profileContext?: ProfileRequestContextSna
 export function useDeleteProfileAvatar() {
   const queryClient = useQueryClient();
   return useMutation({
+    networkMode: PROFILE_EDIT_NETWORK_MODE,
     // deleteProfileAvatar answers 204 and the editor wants the profile back.
     // The DELETE is the mutation result: once it succeeds the avatar is gone,
     // so a failed follow-up read must not report the mutation as failed. The
@@ -285,11 +306,11 @@ export function useDeleteProfileAvatar() {
       }
     },
     onSuccess: () => {
-      toast.success("Avatar removed");
+      toast.success(t("web.common.toast.profiles.avatarRemoved"));
       queryClient.invalidateQueries({ queryKey: profileKeys.list() });
     },
     onError: (err) => {
-      toast.error(err instanceof Error ? err.message : "Failed to remove avatar");
+      toast.error(v2ErrorText(err, t("web.common.toast.profiles.avatarRemoveFailed")));
     },
   });
 }
@@ -297,13 +318,17 @@ export function useDeleteProfileAvatar() {
 export function useDeleteProfile() {
   const queryClient = useQueryClient();
   return useMutation({
+    // Sent even offline, so it fails at once. The confirm dialog closes on
+    // click, so a delete held until reconnect would remove the profile and its
+    // watch history later, with nothing on screen saying one is pending.
+    networkMode: "always",
     mutationFn: (id: string) => v2("DELETE /api/v2/profiles/{id}", { path: { id } }),
     onSuccess: () => {
-      toast.success("Profile deleted");
+      toast.success(t("web.common.toast.profiles.deleted"));
       queryClient.invalidateQueries({ queryKey: profileKeys.list() });
     },
     onError: (err) => {
-      toast.error(err instanceof Error ? err.message : "Failed to delete");
+      toast.error(v2ErrorText(err, t("web.common.toast.profiles.deleteFailed")));
     },
   });
 }

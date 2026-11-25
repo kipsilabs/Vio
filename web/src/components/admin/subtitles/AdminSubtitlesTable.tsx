@@ -29,15 +29,23 @@ import {
   languageChipClass,
   providerBadgeClass,
   providerLabel,
-  staggerRowClass,
 } from "./subtitleAdminStyles";
 import { formatRelativeTime } from "@/lib/date";
+import { useT } from "@/i18n";
 
 interface AdminSubtitlesTableProps {
   subtitles: AdminDownloadedSubtitle[];
   authorityScope: string;
   hasActiveFilters: boolean;
   onResetFilters: () => void;
+}
+
+// Shown for a missing release name or uploader.
+const NONE = "—";
+
+/** A subtitle format as a file extension, such as .srt. */
+function formatExtension(format: string): string {
+  return `.${format}`;
 }
 
 function formatRelative(value: string): string {
@@ -50,6 +58,7 @@ export default function AdminSubtitlesTable({
   hasActiveFilters,
   onResetFilters,
 }: AdminSubtitlesTableProps) {
+  const t = useT();
   const [editTarget, setEditTarget] = useState<AdminSubtitleEditIntent | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<SubtitleDeleteTarget | null>(null);
   const [downloadingId, setDownloadingId] = useState<string | null>(null);
@@ -59,10 +68,12 @@ export default function AdminSubtitlesTable({
     try {
       await downloadAdminSubtitle(subtitle, authorityScope);
       if (adminSubtitleListScope() !== authorityScope) return;
-      toast.success("Subtitle downloaded");
+      toast.success(t("web.admin.common.subtitles.table.downloaded"));
     } catch (err) {
       if (adminSubtitleListScope() !== authorityScope) return;
-      toast.error(err instanceof Error ? err.message : "Failed to download subtitle");
+      toast.error(
+        err instanceof Error ? err.message : t("web.admin.common.subtitles.table.downloadFailed"),
+      );
     } finally {
       setDownloadingId(null);
     }
@@ -77,16 +88,18 @@ export default function AdminSubtitlesTable({
           <span />
         </div>
         <h2 className="text-lg font-semibold tracking-tight">
-          {hasActiveFilters ? "No subtitles match these filters" : "No stored subtitles yet"}
+          {hasActiveFilters
+            ? t("web.admin.common.subtitles.table.emptyFiltered")
+            : t("web.admin.common.subtitles.table.empty")}
         </h2>
         <p className="text-muted-foreground mx-auto mt-2 max-w-lg text-sm leading-relaxed">
           {hasActiveFilters
-            ? "Try widening the provider, language, or uploader filters to see more results."
-            : "User uploads and provider downloads will appear here."}
+            ? t("web.admin.common.subtitles.table.emptyFilteredHelp")
+            : t("web.admin.common.subtitles.table.emptyHelp")}
         </p>
         {hasActiveFilters && (
           <Button type="button" variant="outline" className="mt-5" onClick={onResetFilters}>
-            Reset filters
+            {t("web.admin.common.subtitles.resetFilters")}
           </Button>
         )}
       </div>
@@ -99,47 +112,64 @@ export default function AdminSubtitlesTable({
         <Table>
           <TableHeader>
             <TableRow>
-              <TableHead>Media</TableHead>
-              <TableHead>File</TableHead>
-              <TableHead>Language</TableHead>
-              <TableHead>Provider</TableHead>
-              <TableHead>Release</TableHead>
-              <TableHead>Format</TableHead>
-              <TableHead className="w-10">HI</TableHead>
-              <TableHead>Uploader</TableHead>
-              <TableHead>Added</TableHead>
-              <TableHead className="w-[120px] text-right">Actions</TableHead>
+              <TableHead>{t("web.admin.common.subtitles.table.column.media")}</TableHead>
+              <TableHead>{t("web.admin.common.subtitles.table.column.file")}</TableHead>
+              <TableHead>{t("web.admin.common.subtitles.table.column.language")}</TableHead>
+              <TableHead>{t("web.admin.common.subtitles.table.column.provider")}</TableHead>
+              <TableHead>{t("web.admin.common.subtitles.table.column.release")}</TableHead>
+              <TableHead>{t("web.admin.common.subtitles.table.column.format")}</TableHead>
+              <TableHead className="w-10">
+                {t("web.admin.common.subtitles.table.column.hearingImpaired")}
+              </TableHead>
+              <TableHead>{t("web.admin.common.subtitles.table.column.uploader")}</TableHead>
+              <TableHead>{t("web.admin.common.subtitles.table.column.added")}</TableHead>
+              <TableHead className="w-[120px] text-end">
+                {t("web.admin.common.subtitles.table.column.actions")}
+              </TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
-            {subtitles.map((subtitle, index) => (
-              <TableRow key={subtitle.id} className={cn("group", staggerRowClass(index))}>
+            {subtitles.map((subtitle) => (
+              <TableRow key={subtitle.id} className="group">
                 <TableCell className="max-w-[220px]">
+                  {/* The cell doesn't wrap, so the title is cut to one line. It takes its
+                      direction from its own text, so a cut one keeps its start and ends
+                      in "…" in a right-to-left language; the tooltip shows the rest. */}
                   <div className="space-y-1">
                     {subtitle.media_content_id ? (
                       <Link
                         to={`/item/${encodeURIComponent(subtitle.media_content_id)}`}
-                        className="hover:text-primary line-clamp-2 font-semibold transition-colors hover:underline"
+                        dir="auto"
+                        title={subtitle.media_title || subtitle.media_content_id}
+                        className="hover:text-primary bidi-text block truncate font-semibold transition-colors hover:underline"
                       >
                         {subtitle.media_title || subtitle.media_content_id}
                       </Link>
                     ) : (
-                      <div className="line-clamp-2 font-semibold">
-                        {subtitle.media_title || "Unknown media"}
+                      <div
+                        dir="auto"
+                        title={subtitle.media_title || undefined}
+                        className="bidi-text truncate font-semibold"
+                      >
+                        {subtitle.media_title || t("web.admin.common.subtitles.unknownMedia")}
                       </div>
                     )}
                     {subtitle.media_type === "episode" && (
                       <Badge variant="outline" className="text-[10px] tracking-[0.12em] uppercase">
-                        Episode
+                        {t("web.admin.common.subtitles.table.episode")}
                       </Badge>
                     )}
                   </div>
                 </TableCell>
                 <TableCell
-                  className="text-muted-foreground max-w-[180px] truncate font-mono text-xs"
+                  className="text-muted-foreground max-w-[180px] font-mono text-xs"
                   title={subtitle.file_path}
                 >
-                  {basenameFromPath(subtitle.file_path)}
+                  {/* A file name takes its direction from its own text, so a cut one
+                      keeps its start; w-fit keeps it on the column's start side. */}
+                  <span dir="auto" className="block w-fit max-w-full truncate">
+                    {basenameFromPath(subtitle.file_path)}
+                  </span>
                 </TableCell>
                 <TableCell>
                   <span
@@ -166,37 +196,46 @@ export default function AdminSubtitlesTable({
                     {providerLabel(subtitle.provider)}
                   </span>
                 </TableCell>
-                <TableCell
-                  className="max-w-[200px] truncate font-mono text-xs"
-                  title={subtitle.release_name}
-                >
-                  {subtitle.release_name || "—"}
+                <TableCell className="max-w-[200px] font-mono text-xs">
+                  {/* A release name takes its direction from its own text, and
+                      its tooltip reads the same way. */}
+                  <span
+                    dir="auto"
+                    title={subtitle.release_name || undefined}
+                    className="block w-fit max-w-full truncate"
+                  >
+                    {subtitle.release_name || NONE}
+                  </span>
                 </TableCell>
                 <TableCell>
-                  <span className={cn("inline-flex rounded px-2 py-0.5", formatChipClass())}>
-                    .{subtitle.format}
+                  {/* Left to right, so the extension's dot stays in front. */}
+                  <span
+                    dir="ltr"
+                    className={cn("inline-flex rounded px-2 py-0.5", formatChipClass())}
+                  >
+                    {formatExtension(subtitle.format)}
                   </span>
                 </TableCell>
                 <TableCell>
                   {subtitle.hearing_impaired ? (
                     <span className="inline-flex items-center gap-1 text-xs font-medium text-amber-200">
                       <Ear className="h-3.5 w-3.5" aria-hidden="true" />
-                      HI
+                      {t("web.admin.common.subtitles.table.hearingImpaired")}
                     </span>
                   ) : null}
                 </TableCell>
-                <TableCell className="text-sm">{subtitle.uploader_username || "—"}</TableCell>
+                <TableCell className="text-sm">{subtitle.uploader_username || NONE}</TableCell>
                 <TableCell className="text-muted-foreground text-sm" title={subtitle.created_at}>
                   {formatRelative(subtitle.created_at)}
                 </TableCell>
-                <TableCell className="text-right">
+                <TableCell className="text-end">
                   <div className="flex items-center justify-end gap-1 opacity-100 transition-opacity sm:opacity-0 sm:group-focus-within:opacity-100 sm:group-hover:opacity-100">
                     <Button
                       type="button"
                       variant="ghost"
                       size="icon"
                       className="h-8 w-8"
-                      aria-label={`Edit subtitle ${subtitle.id}`}
+                      aria-label={t("web.admin.common.subtitles.table.edit", { id: subtitle.id })}
                       onClick={() => {
                         try {
                           setEditTarget(captureAdminSubtitleEditIntent(subtitle, authorityScope));
@@ -204,7 +243,7 @@ export default function AdminSubtitlesTable({
                           toast.error(
                             error instanceof Error
                               ? error.message
-                              : "Reload subtitles before editing.",
+                              : t("web.admin.common.subtitles.table.reloadBeforeEdit"),
                           );
                         }
                       }}
@@ -216,7 +255,9 @@ export default function AdminSubtitlesTable({
                       variant="ghost"
                       size="icon"
                       className="h-8 w-8"
-                      aria-label={`Download subtitle ${subtitle.id}`}
+                      aria-label={t("web.admin.common.subtitles.table.download", {
+                        id: subtitle.id,
+                      })}
                       disabled={downloadingId === subtitle.id}
                       onClick={() => void handleDownload(subtitle)}
                     >
@@ -231,7 +272,7 @@ export default function AdminSubtitlesTable({
                       variant="ghost"
                       size="icon"
                       className="text-destructive hover:text-destructive h-8 w-8"
-                      aria-label={`Delete subtitle ${subtitle.id}`}
+                      aria-label={t("web.admin.common.subtitles.table.delete", { id: subtitle.id })}
                       onClick={() => setDeleteTarget({ subtitle, scope: authorityScope })}
                     >
                       <Trash2 className="h-4 w-4" />

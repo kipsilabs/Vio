@@ -15,7 +15,10 @@ import { decodeThumbhash } from "@/lib/thumbhash";
 import { HERO_BANNER_SIZE } from "@/lib/design-system";
 import { useAmbientColor } from "@/hooks/useAmbientColor";
 import { usePageActivity } from "@/hooks/usePageActivity";
+import { usePrefersReducedMotion } from "@/hooks/usePrefersReducedMotion";
 import { HeroOverviewText } from "./HeroOverviewText";
+import { LocalErrorBoundary } from "./LocalErrorBoundary";
+import { hasArabicScript } from "@/lib/direction";
 import { cn } from "@/lib/utils";
 import type { SectionItem } from "@/api/types";
 import { buildItemHref, buildMediaPlayHref } from "@/lib/mediaNavigation";
@@ -26,11 +29,30 @@ import ViewTransitionLink from "@/components/ViewTransitionLink";
 import { useEpisodeSpoilerPrefs } from "@/hooks/useEpisodeSpoilerPrefs";
 import { isEpisodeStill, isEpisodeUnwatched } from "@/lib/episodeSpoilers";
 import { RatingEntry } from "@/components/ratings/RatingEntry";
+import MachineTranslatedLabel from "@/pages/ItemDetail/components/MachineTranslatedLabel";
 import { formatHeroMetadata } from "./heroMetadata";
+import { numberText, useAppLanguage, useT, type Translate } from "@/i18n";
 
 // On-view translation for the visible slide loads after the hero itself, so
 // it stays out of the launch bundle; the plain overview shows meanwhile.
 const HeroOverview = lazy(() => import("./HeroOverview"));
+
+/** What holds the slideshow: the pointer over the hero, or focus inside it. */
+type HoldReason = "hover" | "focus";
+type Holds = Record<HoldReason, boolean>;
+
+/**
+ * Ends one hold. The pointer leaving also ends a focus hold whose focus is no
+ * longer inside. It never sets a hold, so holds Play cleared stay off, and it
+ * returns `holds` itself when nothing changes.
+ */
+function releaseHold(holds: Holds, reason: HoldReason, focusInside: boolean): Holds {
+  const next =
+    reason === "hover"
+      ? { hover: false, focus: holds.focus && focusInside }
+      : { ...holds, focus: false };
+  return next.hover === holds.hover && next.focus === holds.focus ? holds : next;
+}
 
 interface HeroBannerProps {
   items: SectionItem[];
@@ -63,55 +85,14 @@ interface HeroBannerProps {
   onRefreshItems?: () => void;
 }
 
-/**
- * Alternating slow pans for consecutive hero slides.
- *
- * These must be written out literally. Tailwind only keeps a theme variable
- * whose name it can find in the scanned source, and assembling the name from a
- * template literal hid both from it — so the real values were tree-shaken out
- * of the bundle and `var(--animate-ken-burns-a)` resolved to nothing at
- * runtime. app.css still overrides both to `none` under
- * `prefers-reduced-motion`, which is what keeps this accessible.
- */
-const KEN_BURNS_ANIMATIONS = ["var(--animate-ken-burns-a)", "var(--animate-ken-burns-b)"] as const;
-const HERO_BACKDROP_FADE_MS = 1000;
-
-/** A slide still fading out. `id` tells two fades of the same slide apart. */
-interface OutgoingBackdrop {
-  index: number;
-  id: number;
-}
-
-let nextOutgoingBackdropId = 0;
-
-/**
- * The fading slides after switching from `from` to `to`. Every slide keeps its
- * motion until its own fade ends: dropping the animation of a slide that is
- * still visible (say, after two quick clicks) would snap it back to its
- * unscaled, unpanned frame.
- */
-function withOutgoingBackdrop(
-  outgoing: OutgoingBackdrop[],
-  from: number,
-  to: number,
-): OutgoingBackdrop[] {
-  const rest = outgoing.filter((entry) => entry.index !== from && entry.index !== to);
-  if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return rest;
-  return [...rest, { index: from, id: nextOutgoingBackdropId++ }];
-}
-
 const HeroBackdropSlide = memo(function HeroBackdropSlide({
   slide,
-  index,
   isActive,
-  keepsMotion,
   shouldLoad,
   hideImage,
 }: {
   slide: SectionItem;
-  index: number;
   isActive: boolean;
-  keepsMotion: boolean;
   shouldLoad: boolean;
   hideImage: boolean;
 }) {
@@ -143,13 +124,9 @@ const HeroBackdropSlide = memo(function HeroBackdropSlide({
           fetchPriority={isActive ? "high" : "low"}
           className={cn(
             "h-full w-full object-cover object-[center_20%] transition-opacity duration-(--duration-slow)",
-            isActive && "will-change-transform",
             loadedUrl ? "opacity-100" : "opacity-0",
           )}
           style={{
-            animation: keepsMotion
-              ? KEN_BURNS_ANIMATIONS[index % KEN_BURNS_ANIMATIONS.length]
-              : "none",
             filter: `brightness(var(--hero-backdrop-brightness, 0.78)) saturate(var(--hero-backdrop-saturate, 0.95))${hideImage ? " blur(24px)" : ""}`,
           }}
           onLoad={() => setLoadedUrl(imageUrl)}
@@ -159,28 +136,32 @@ const HeroBackdropSlide = memo(function HeroBackdropSlide({
   );
 });
 
-function heroPlayLabel(item: SectionItem, activeAudiobookPlaying?: boolean | null): string {
+function heroPlayLabel(
+  t: Translate,
+  item: SectionItem,
+  activeAudiobookPlaying?: boolean | null,
+): string {
   if (item.type === "ebook") {
-    return "Read";
+    return t("web.home.hero.read");
   }
   if (item.type !== "audiobook") {
-    return "Play";
+    return t("web.home.hero.play");
   }
   if (activeAudiobookPlaying === true) {
-    return "Pause";
+    return t("web.home.hero.pause");
   }
   if (activeAudiobookPlaying === false) {
-    return "Resume";
+    return t("web.home.hero.resume");
   }
   const position = item.position_seconds ?? 0;
   const duration = item.duration_seconds ?? 0;
   if (position > 0 && (duration <= 0 || position < duration)) {
-    return "Resume";
+    return t("web.home.hero.resume");
   }
   if (item.user_state?.played) {
-    return "Listen Again";
+    return t("web.home.hero.listenAgain");
   }
-  return "Listen";
+  return t("web.home.hero.listen");
 }
 
 export default function HeroBanner({
@@ -192,6 +173,9 @@ export default function HeroBanner({
   libraryId,
   onRefreshItems,
 }: HeroBannerProps) {
+  const t = useT();
+  // The details line comes from a plain helper; follow language changes.
+  useAppLanguage();
   const spoilerPrefs = useEpisodeSpoilerPrefs();
   const slides = useMemo(() => items.slice(0, maxSlides), [items, maxSlides]);
   const pendingSlideIds = useMemo(
@@ -203,11 +187,7 @@ export default function HeroBanner({
       ),
     [slides],
   );
-  const [{ activeIndex, outgoing }, setBackdropState] = useState({
-    activeIndex: 0,
-    outgoing: [] as OutgoingBackdrop[],
-  });
-  const [paused, setPaused] = useState(false);
+  const [activeIndex, setActiveIndex] = useState(0);
   const { isVisible: pageVisible } = usePageActivity();
   const sectionRef = useRef<HTMLElement>(null);
   // Unknown until the observer first reports, so a hero mounted below the
@@ -226,77 +206,94 @@ export default function HeroBanner({
   const [playCycle, setPlayCycle] = useState(0);
 
   const next = useCallback(() => {
-    setBackdropState(({ activeIndex: current, outgoing }) => {
-      const target = (current + 1) % slides.length;
-      return { activeIndex: target, outgoing: withOutgoingBackdrop(outgoing, current, target) };
-    });
+    setActiveIndex((current) => (current + 1) % slides.length);
   }, [slides.length]);
 
   const prev = useCallback(() => {
-    setBackdropState(({ activeIndex: current, outgoing }) => {
-      const target = (current - 1 + slides.length) % slides.length;
-      return { activeIndex: target, outgoing: withOutgoingBackdrop(outgoing, current, target) };
-    });
+    setActiveIndex((current) => (current - 1 + slides.length) % slides.length);
   }, [slides.length]);
 
-  // Release each fading slide's motion when its own fade ends. Each fade gets
-  // one timer; a fade cut short (its slide became active again) drops its own.
-  const fadeTimers = useRef(new Map<number, number>());
-  useEffect(() => {
-    const timers = fadeTimers.current;
-    const live = new Set(outgoing.map((entry) => entry.id));
-    for (const [id, timer] of timers) {
-      if (live.has(id)) continue;
-      window.clearTimeout(timer);
-      timers.delete(id);
-    }
-    for (const { id } of outgoing) {
-      if (timers.has(id)) continue;
-      const timer = window.setTimeout(() => {
-        timers.delete(id);
-        setBackdropState((current) => ({
-          ...current,
-          outgoing: current.outgoing.filter((entry) => entry.id !== id),
-        }));
-      }, HERO_BACKDROP_FADE_MS);
-      timers.set(id, timer);
-    }
-  }, [outgoing]);
-  useEffect(() => {
-    const timers = fadeTimers.current;
-    return () => {
-      for (const timer of timers.values()) window.clearTimeout(timer);
-      timers.clear();
-    };
+  // Two separate reasons stop the slideshow. The pointer over the hero or
+  // focus inside it holds it, and the hold ends only once both have left.
+  // The Pause/Play button records the user's choice, which hover and focus
+  // never change. Under reduced motion the slideshow starts stopped and runs
+  // only after the user presses Play.
+  const reduceMotion = usePrefersReducedMotion();
+  const [holds, setHolds] = useState<Holds>({ hover: false, focus: false });
+  const held = holds.hover || holds.focus;
+  const [choice, setChoice] = useState<"play" | "pause" | null>(null);
+  const wantsPlay = choice === "play" || (choice === null && !reduceMotion);
+  // What actually happens: drives the timer and the progress rail.
+  const autoplaying = wantsPlay && !held;
+  // Each time the slideshow starts running (a hold ends, or Play is pressed),
+  // playCycle bumps so the rail animation restarts at scaleX(0) in sync with
+  // the fresh 8s interval the effect below starts.
+  const [railRunning, setRailRunning] = useState(autoplaying);
+  if (railRunning !== autoplaying) {
+    setRailRunning(autoplaying);
+    if (autoplaying) setPlayCycle((c) => c + 1);
+  }
+  // A mouse press while the pointer is over the hero turns a focus hold into
+  // a hover hold, and the focus that press moves onto a button holds as hover
+  // too, so the slideshow stays held under the pointer and still resumes when
+  // the pointer leaves, as it did before hover and focus were split.
+  // `pressing` lasts from that press to the focus it causes, its release, its
+  // context menu, the end of a drag it starts, or the pointer leaving.
+  const pressing = useRef(false);
+  // Whether the pointer is over the hero. Unlike the hover hold, Play does
+  // not clear it.
+  const pointerInside = useRef(false);
+  const hold = useCallback((reason: HoldReason) => {
+    setHolds((h) => (h[reason] ? h : { ...h, [reason]: true }));
   }, []);
-
-  // Pause/play helpers. Unpausing bumps playCycle so the rail animation
-  // restarts at scaleX(0) in sync with the fresh 8s interval started below.
-  const pause = useCallback(() => setPaused(true), []);
-  const resume = useCallback(() => {
-    setPaused((prev) => {
-      if (prev) setPlayCycle((c) => c + 1);
-      return false;
-    });
+  const pressHold = useCallback(() => {
+    setHolds((h) => (h.focus ? { hover: true, focus: false } : h));
+  }, []);
+  const release = useCallback((reason: HoldReason) => {
+    // A focused control can go without a blur (see the effect below), so
+    // the pointer leaving rechecks where focus is.
+    const focusInside = !!sectionRef.current?.contains(document.activeElement);
+    setHolds((h) => releaseHold(h, reason, focusInside));
+  }, []);
+  const endPress = useCallback(() => {
+    pressing.current = false;
   }, []);
   const togglePause = useCallback(() => {
-    setPaused((prev) => {
-      if (prev) setPlayCycle((c) => c + 1);
-      return !prev;
-    });
-  }, []);
+    if (wantsPlay) {
+      setChoice("pause");
+      return;
+    }
+    // Pressing Play starts the slideshow now, even under the pointer.
+    setChoice("play");
+    setHolds({ hover: false, focus: false });
+  }, [wantsPlay]);
+
+  // A browser removes a focused control (Translate, once pressed) without a
+  // blur, leaving focus on the page body. While a focus hold is on, the next
+  // focus or press anywhere ends it once focus is no longer inside.
+  useEffect(() => {
+    if (!holds.focus) return;
+    const releaseIfOutside = () => {
+      if (!sectionRef.current?.contains(document.activeElement)) release("focus");
+    };
+    // Capture, so a control elsewhere that stops its press still counts.
+    document.addEventListener("focusin", releaseIfOutside, true);
+    document.addEventListener("pointerdown", releaseIfOutside, true);
+    return () => {
+      document.removeEventListener("focusin", releaseIfOutside, true);
+      document.removeEventListener("pointerdown", releaseIfOutside, true);
+    };
+  }, [holds.focus, release]);
 
   // `activeIndex` is in the dep list so that manual navigation (prev/next
   // chevrons) also resets the 8s countdown — otherwise after clicking next at
   // t=5s the auto-advance would still fire at t=8 instead of t=13, desyncing
   // with the progress rail that restarts on slide change.
   useEffect(() => {
-    if (slides.length <= 1 || paused || !shown) return;
-    const prefersReducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    if (prefersReducedMotion) return;
+    if (slides.length <= 1 || !autoplaying || !shown) return;
     const timer = setInterval(next, 8000);
     return () => clearInterval(timer);
-  }, [next, slides.length, paused, shown, activeIndex]);
+  }, [next, slides.length, autoplaying, shown, activeIndex]);
 
   useEffect(() => {
     const section = sectionRef.current;
@@ -322,21 +319,36 @@ export default function HeroBanner({
         position_seconds: current.position_seconds,
       })
     );
+  const overviewFallback = overviewShown ? (
+    <div className="mb-7 max-w-2xl">
+      <HeroOverviewText overview={current.overview} />
+      {current.machine_translated_fields?.includes("overview") && (
+        <MachineTranslatedLabel className="mt-1.5" />
+      )}
+    </div>
+  ) : null;
 
   const metadata = formatHeroMetadata(current);
 
   const slideCount = slides.length;
-  const padded = (n: number) => String(n).padStart(2, "0");
+  const padded = (n: number) => numberText(String(n).padStart(2, "0"));
   const activeAudiobookPlaying =
     current.type === "audiobook" && audiobookPlayback?.active?.contentId === current.content_id
       ? audiobookPlayback.active.playing
       : null;
-  const playLabel = heroPlayLabel(current, activeAudiobookPlaying);
+  const playLabel = heroPlayLabel(t, current, activeAudiobookPlaying);
   const playHref = buildMediaPlayHref({
     contentId: current.content_id,
     type: current.type,
     libraryId,
   });
+
+  // Previous, play/pause and next share one dark pill, in the order media
+  // players use. Each button is 44px wide and its hit area 44px tall. Below
+  // lg, the scroll margin brings a focused button out from under the sticky
+  // header.
+  const slideButtonClass =
+    "relative flex h-8 w-11 scroll-mt-24 items-center justify-center rounded-full text-white/85 transition-colors after:absolute after:inset-x-0 after:-inset-y-1.5 after:content-[''] hover:text-white lg:scroll-mt-0";
 
   const handlePlayClick = (event: MouseEvent<HTMLAnchorElement>) => {
     if (activeAudiobookPlaying == null) {
@@ -357,17 +369,42 @@ export default function HeroBanner({
     <section
       ref={sectionRef}
       className={cn(
-        "home-hero group relative w-full overflow-hidden",
+        "home-hero relative flex w-full flex-col overflow-hidden",
         heightClassName,
         bleed ? "-mt-[96px] mb-0 sm:-mt-[104px]" : "border-border/60 mb-10 border-b",
       )}
       aria-roledescription="carousel"
-      aria-label="Featured content"
-      onMouseEnter={pause}
-      onMouseLeave={resume}
-      onFocus={pause}
+      aria-label={t("web.home.hero.carouselLabel")}
+      // A touch has no hover, and its emulated mouse entry would hold the
+      // slideshow until the next tap elsewhere.
+      onPointerEnter={(e) => {
+        if (e.pointerType === "touch") return;
+        pointerInside.current = true;
+        hold("hover");
+      }}
+      onPointerLeave={(e) => {
+        if (e.pointerType === "touch") return;
+        pointerInside.current = false;
+        pressing.current = false;
+        release("hover");
+      }}
+      onMouseDown={(e) => {
+        // A screen reader's simulated click has no pointer over the hero.
+        if (!pointerInside.current) return;
+        pressing.current = true;
+        // A right or middle click leaves a keyboard user's focus in place.
+        if (e.button === 0) pressHold();
+      }}
+      onMouseUp={endPress}
+      onContextMenu={endPress}
+      // A drag swallows the press's mouseup.
+      onDragEnd={endPress}
+      onFocus={() => {
+        hold(pressing.current ? "hover" : "focus");
+        pressing.current = false;
+      }}
       onBlur={(e) => {
-        if (!e.currentTarget.contains(e.relatedTarget)) resume();
+        if (!e.currentTarget.contains(e.relatedTarget)) release("focus");
       }}
     >
       {/* Preload the slide that comes next while the hero is shown; retain
@@ -386,14 +423,8 @@ export default function HeroBanner({
               position_seconds: slide.position_seconds,
             })
           }
-          index={i}
           isActive={i === activeIndex}
-          keepsMotion={i === activeIndex || outgoing.some((entry) => entry.index === i)}
-          shouldLoad={
-            i === activeIndex ||
-            i === outgoing.at(-1)?.index ||
-            (shown && i === (activeIndex + 1) % slideCount)
-          }
+          shouldLoad={i === activeIndex || (shown && i === (activeIndex + 1) % slideCount)}
         />
       ))}
 
@@ -407,20 +438,21 @@ export default function HeroBanner({
       {/* Content */}
       <div
         className={cn(
-          "relative z-10 flex h-full min-h-0 items-end px-4 pb-10 sm:px-6 sm:pb-12 lg:px-10 lg:pb-16 xl:px-12",
-          reserveHeaderSpace && "pt-24 sm:pt-28 lg:pt-32",
+          "relative z-10 flex flex-1 items-end px-4 pb-10 sm:px-6 sm:pb-12 lg:px-10 lg:pb-16 xl:px-12",
+          // A tall title block grows the hero rather than overflowing it;
+          // the top padding keeps the title off the top edge (and, below
+          // sm, clear of the slide controls) when that happens.
+          reserveHeaderSpace
+            ? cn(slides.length > 1 ? "pt-36" : "pt-24", "sm:pt-28 lg:pt-32")
+            : "pt-16",
         )}
       >
         <div className="w-full max-w-[1380px]">
           <div className="max-w-3xl">
-            <p className="hero-eyebrow mb-4 hidden sm:block">
-              <span className="hero-eyebrow-strong">Featured</span>
-              <span className="hero-eyebrow-divider">—</span>
-              <span>No. {padded(activeIndex + 1)}</span>
-            </p>
             <h1
               key={current.content_id}
-              className="font-display mb-4 max-w-4xl text-4xl font-extrabold tracking-[-0.04em] text-balance sm:text-5xl lg:text-6xl xl:text-7xl"
+              className="bidi-text font-display mb-4 max-w-4xl text-4xl font-extrabold tracking-[-0.04em] text-balance sm:text-5xl lg:text-6xl xl:text-7xl"
+              data-cursive={hasArabicScript(current.title) || undefined}
               style={{ textShadow: "var(--hero-text-shadow, none)" }}
             >
               {current.title}
@@ -436,21 +468,17 @@ export default function HeroBanner({
                 )}
               </div>
             )}
-            <Suspense
-              fallback={
-                overviewShown ? (
-                  <div className="mb-7 max-w-2xl">
-                    <HeroOverviewText overview={current.overview} />
-                  </div>
-                ) : null
-              }
-            >
-              <HeroOverview
-                item={overviewShown ? current : undefined}
-                pendingContentIds={pendingSlideIds}
-                onRefreshItems={onRefreshItems}
-              />
-            </Suspense>
+            {/* The plain overview stands in while the chunk loads, and for good
+              if it fails to load. */}
+            <LocalErrorBoundary fallback={overviewFallback}>
+              <Suspense fallback={overviewFallback}>
+                <HeroOverview
+                  item={overviewShown ? current : undefined}
+                  pendingContentIds={pendingSlideIds}
+                  onRefreshItems={onRefreshItems}
+                />
+              </Suspense>
+            </LocalErrorBoundary>
             <div className="flex flex-wrap items-center gap-3">
               <Link
                 to={playHref}
@@ -471,7 +499,7 @@ export default function HeroBanner({
                 className="pill pill-glass transition-colors duration-(--duration-fast)"
               >
                 <Info className="h-4 w-4" />
-                More Info
+                {t("web.home.hero.moreInfo")}
               </ViewTransitionLink>
             </div>
           </div>
@@ -483,84 +511,75 @@ export default function HeroBanner({
         {slides[activeIndex]?.title}
       </div>
 
-      {/* Navigation arrows. Visible on every breakpoint so users can always
-          advance slides manually — important when `prefers-reduced-motion`
-          disables autoplay, and for accessibility generally. On mobile they
-          render smaller and slightly more transparent so they don't crowd
-          narrow viewports. On lg+ they fade in on hover. */}
+      {/* Slide controls. They sit in a band the content's padding keeps
+          empty, so the title, details and buttons never run under them:
+          below sm in the top corner, inside the top padding (lower when
+          `reserveHeaderSpace` leaves room for the marquee header); on sm+
+          in the bottom corner, inside the bottom padding. One set of
+          buttons serves every width, so focus survives a resize. */}
       {slides.length > 1 && (
-        <>
-          <button
-            type="button"
-            onClick={prev}
-            className="glass-subtle absolute top-1/2 left-3 z-20 -translate-y-1/2 rounded-full p-1.5 opacity-60 transition-opacity duration-(--duration-fast) hover:opacity-100 sm:left-5 sm:p-2 sm:opacity-80 lg:opacity-0 lg:group-hover:opacity-90"
-            aria-label="Previous slide"
-          >
-            <ChevronLeft className="size-4 sm:size-5" />
-          </button>
-          <button
-            type="button"
-            onClick={next}
-            className="glass-subtle absolute top-1/2 right-3 z-20 -translate-y-1/2 rounded-full p-1.5 opacity-60 transition-opacity duration-(--duration-fast) hover:opacity-100 sm:right-5 sm:p-2 sm:opacity-80 lg:opacity-0 lg:group-hover:opacity-90"
-            aria-label="Next slide"
-          >
-            <ChevronRight className="size-4 sm:size-5" />
-          </button>
-
-          {/* Editorial slide counter. On mobile we render a compact counter +
-              pause toggle in the top-right corner so it never fights the CTA
-              buttons at the bottom, while still letting users pause autoplay.
-              On sm+ the full rail + pause control sits bottom-right.
-              When `reserveHeaderSpace` is set, the hero bleeds under a sticky
-              marquee header on top, so the counter matches the same `pt-24`
-              offset the content uses to clear that header. */}
+        <div
+          className={cn(
+            "absolute end-4 z-20 flex items-center gap-3 sm:end-6 sm:top-auto sm:bottom-2 lg:end-10 lg:bottom-6 xl:end-12",
+            reserveHeaderSpace ? "top-24" : "top-4",
+          )}
+        >
+          <div className="hero-slide-counter hidden sm:inline-flex" aria-hidden="true">
+            <span className="num">{padded(activeIndex + 1)}</span>
+            <span className="sep" />
+            <span>{padded(slideCount)}</span>
+          </div>
           <div
-            className={cn(
-              "absolute right-4 z-20 flex items-center gap-2 sm:hidden",
-              reserveHeaderSpace ? "top-24" : "top-4",
-            )}
+            className="hero-progress-rail hidden w-20 sm:block md:w-36"
+            data-paused={autoplaying ? "false" : "true"}
+            aria-hidden="true"
           >
-            <div className="hero-slide-counter" aria-hidden="true">
+            {/* The key restarts the animation in lockstep with the
+                  setInterval timer: on slide change, and on unpause (which
+                  starts a fresh 8s cycle). Pausing mid-cycle freezes the bar
+                  via `animation-play-state: paused` without remounting. */}
+            <span key={`${activeIndex}-${playCycle}`} />
+          </div>
+          {/* On phones the counter rides in the pill, which backs it over
+                bright artwork. */}
+          <div className="flex items-center rounded-full border border-white/10 bg-black/60 backdrop-blur-md">
+            <div
+              className="hero-slide-counter ps-3.5 pe-1 text-white/85 sm:hidden"
+              aria-hidden="true"
+            >
               <span className="num">{padded(activeIndex + 1)}</span>
+              {/* eslint-disable-next-line formatjs/no-literal-string-in-jsx -- a separator glyph, not text */}
               <span>/</span>
               <span>{padded(slideCount)}</span>
             </div>
             <button
               type="button"
-              onClick={togglePause}
-              aria-label={paused ? "Play slideshow" : "Pause slideshow"}
-              className="glass-subtle flex h-7 w-7 items-center justify-center rounded-full text-white/80 transition-colors hover:text-white"
+              onClick={prev}
+              aria-label={t("web.home.hero.previousSlide")}
+              className={slideButtonClass}
             >
-              {paused ? <Play className="size-3" /> : <Pause className="size-3" />}
+              <ChevronLeft className="size-4" />
             </button>
-          </div>
-          <div className="absolute right-6 bottom-6 z-20 hidden items-center gap-3 sm:flex lg:right-10 lg:bottom-8 xl:right-12">
-            <div className="hero-slide-counter" aria-hidden="true">
-              <span className="num">{padded(activeIndex + 1)}</span>
-              <span className="sep" />
-              <span>{padded(slideCount)}</span>
-            </div>
-            <div
-              className="hero-progress-rail"
-              data-paused={paused ? "true" : "false"}
-              aria-hidden="true"
-            >
-              {/* The key restarts the animation in lockstep with the
-                  setInterval timer: on slide change, and on unpause (which
-                  starts a fresh 8s cycle). Pausing mid-cycle freezes the bar
-                  via `animation-play-state: paused` without remounting. */}
-              <span key={`${activeIndex}-${playCycle}`} />
-            </div>
             <button
               type="button"
               onClick={togglePause}
-              aria-label={paused ? "Play slideshow" : "Pause slideshow"}
-              className="flex h-7 w-7 items-center justify-center rounded-full text-white/70 transition-colors hover:text-white"
+              aria-label={
+                wantsPlay ? t("web.home.hero.pauseSlideshow") : t("web.home.hero.playSlideshow")
+              }
+              className={slideButtonClass}
             >
-              {paused ? <Play className="size-3.5" /> : <Pause className="size-3.5" />}
+              {wantsPlay ? <Pause className="size-3.5" /> : <Play className="size-3.5" />}
+            </button>
+            <button
+              type="button"
+              onClick={next}
+              aria-label={t("web.home.hero.nextSlide")}
+              className={slideButtonClass}
+            >
+              <ChevronRight className="size-4" />
             </button>
           </div>
-        </>
+        </div>
       )}
     </section>
   );

@@ -332,6 +332,15 @@ func (g *gatingInventoryPush) count() int {
 	return len(g.payloads)
 }
 
+// recorded returns every payload this connection has received, including one
+// whose write is still held by the gate. Tests use it to assert that no later
+// delivery regressed the inventory status.
+func (g *gatingInventoryPush) recorded() []playback.InventoryUpdatedPayload {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]playback.InventoryUpdatedPayload(nil), g.payloads...)
+}
+
 // holdDetachedGate saturates the shared detached gate so a publish parks and a
 // worker blocks until the test releases slots. The returned closure restores
 // every slot it held. A test-side release does NOT wake the terminal-notification

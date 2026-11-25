@@ -16,11 +16,11 @@ import (
 	"time"
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
-	"github.com/go-chi/chi/v5"
 	"google.golang.org/protobuf/types/known/structpb"
 
 	"github.com/Silo-Server/silo-server/internal/clientip"
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/plugins"
 )
 
 // OAuthClient is the host-side gRPC client surface the OAuth handler needs.
@@ -35,9 +35,13 @@ type OAuthClient interface {
 // answers the identity it came through, without opening a session;
 // OpenOAuthSession opens the session when the completion code is redeemed;
 // LinkOAuthIdentity links the identity to the signed-in account a linking
-// flow started from, without opening a session. Defined as an interface so
-// tests can avoid spinning up the full auth.Service.
+// flow started from, without opening a session. ProviderAnswerFence is taken
+// before ExchangeCode and passed back in OAuthLoginInput.AnswerFence, so a
+// sign-in whose answer a provider re-check has since superseded is refused.
+// Defined as an interface so tests can avoid spinning up the full
+// auth.Service.
 type OAuthLoginCompleter interface {
+	ProviderAnswerFence(ctx context.Context) (int64, error)
 	ResolveOAuthLogin(ctx context.Context, in OAuthLoginInput) (*models.User, int64, error)
 	OpenOAuthSession(ctx context.Context, db OAuthSessionDB, c OAuthCompletion) (*TokenPair, error)
 	LinkOAuthIdentity(ctx context.Context, in OAuthLoginInput) (*models.User, error)
@@ -53,6 +57,9 @@ type OAuthLoginInput struct {
 	LinkingUserID  int // 0 = not linking
 	DeviceName     string
 	IP             string
+	// AnswerFence is ProviderAnswerFence's value from before ExchangeCode; 0
+	// for a linking flow.
+	AnswerFence int64
 }
 
 // OAuthUserReader loads the account a link ticket is issued to.
@@ -74,7 +81,7 @@ type OAuthHandlerDeps struct {
 	// the public URL while the browser moves to the public origin.
 	NativeStarts   OAuthNativeStartStore
 	StateSecret    []byte
-	ResolveClient  func(ctx context.Context, installationID int) (OAuthClient, string, error) // returns (client, capabilityID, err)
+	ResolveClient  func(ctx context.Context, installationID int) (OAuthClient, string, string, error) // returns (client, capabilityID, callbackMode, err)
 	LoginCompleter OAuthLoginCompleter
 	HostBaseURL    string
 	StateTTL       time.Duration
@@ -220,11 +227,11 @@ func writeHandshakeError(w http.ResponseWriter, err error) {
 	http.Error(w, "internal error", http.StatusInternalServerError)
 }
 
-// CallbackURL is the absolute redirect URI of the callback under one API
-// prefix ("/api/v1" or "/api/v2"). The provider must have the URI it is
-// handed registered, so the init and callback of one flow share a prefix.
-func (h *OAuthHandler) CallbackURL(prefix string, installID int) string {
-	return h.currentHostBaseURL() + prefix + "/auth/oauth/" + strconv.Itoa(installID) + "/callback"
+// CallbackURL is the absolute redirect URI of the callback under an API
+// prefix. The provider must have the URI it is handed registered, so the init
+// and callback of one flow share a prefix.
+func (h *OAuthHandler) CallbackURL(prefix string, installID int, mode string) string {
+	return plugins.OAuthCallbackURL(h.currentHostBaseURL(), prefix, installID, mode)
 }
 
 // Init opens an OAuth session with the plugin and returns the provider's
@@ -236,7 +243,7 @@ func (h *OAuthHandler) Init(ctx context.Context, installID int, next, redirectUR
 	}
 	next = normalizeOAuthNext(next)
 
-	client, _, err := h.deps.ResolveClient(ctx, installID)
+	client, _, _, err := h.deps.ResolveClient(ctx, installID)
 	if err != nil {
 		return "", &OAuthHandshakeError{Status: http.StatusBadGateway, Message: "auth plugin unavailable"}
 	}
@@ -325,8 +332,7 @@ func (h *OAuthHandler) OnPublicOrigin(r *http.Request) bool {
 // OAuthStartRequest is one flow start as a transport received it.
 type OAuthStartRequest struct {
 	InstallID int
-	// Prefix is the API prefix of the flow's callback ("/api/v1" or
-	// "/api/v2").
+	// Prefix is the API prefix of the flow's callback.
 	Prefix string
 	Next   string
 	// LinkTicket makes a native flow a linking flow for the account that
@@ -502,16 +508,15 @@ func (h *OAuthHandler) resumeNativeStart(w http.ResponseWriter, r *http.Request,
 }
 
 // writeStartFailure answers a start that cannot open its flow. Malformed
-// parameters stay plain-text 400s. A v2 start that failed on the provider
-// or the server (no public URL, plugin unavailable, InitAuthorize failed)
-// sends the browser somewhere it can recover from instead of a raw text
-// page: a web start to the login page with provider_unavailable (which
-// does not redirect to the provider again while it shows an error), a
-// native start with a valid code_challenge and app_state to the app
-// redirect. The frozen v1 init keeps its plain-text answers.
+// parameters stay plain-text 400s. A start that failed on the provider or
+// the server (no public URL, plugin unavailable, InitAuthorize failed) sends
+// the browser somewhere it can recover from instead of a raw text page: a web
+// start to the login page with provider_unavailable (which does not redirect
+// to the provider again while it shows an error), a native start with a
+// valid code_challenge and app_state to the app redirect.
 func (h *OAuthHandler) writeStartFailure(w http.ResponseWriter, r *http.Request, req OAuthStartRequest, err error) {
 	var he *OAuthHandshakeError
-	if req.Prefix == oauthV1Prefix || !errors.As(err, &he) || he.Status == http.StatusBadRequest {
+	if !errors.As(err, &he) || he.Status == http.StatusBadRequest {
 		writeHandshakeError(w, err)
 		return
 	}
@@ -529,10 +534,6 @@ func (h *OAuthHandler) writeStartFailure(w http.ResponseWriter, r *http.Request,
 	}
 	http.Redirect(w, r, webFailureLocation(reason), http.StatusFound)
 }
-
-// oauthV1Prefix is the frozen v1 API prefix, whose init answers stay as
-// they were.
-const oauthV1Prefix = "/api/v1"
 
 // oauthV2Prefix is the v2 API prefix.
 const oauthV2Prefix = "/api/v2"
@@ -576,7 +577,7 @@ func (h *OAuthHandler) checkStart(ctx context.Context, req OAuthStartRequest) er
 			return &OAuthHandshakeError{Status: http.StatusBadRequest, Message: "app_state must be 1 to 512 unreserved characters"}
 		}
 	}
-	if _, _, err := h.deps.ResolveClient(ctx, req.InstallID); err != nil {
+	if _, _, _, err := h.deps.ResolveClient(ctx, req.InstallID); err != nil {
 		return &OAuthHandshakeError{Status: http.StatusBadGateway, Message: "auth plugin unavailable"}
 	}
 	return nil
@@ -593,7 +594,7 @@ func (h *OAuthHandler) startFlow(ctx context.Context, req OAuthStartRequest, lin
 	if req.Native {
 		kind = OAuthFlowNative
 	}
-	client, _, err := h.deps.ResolveClient(ctx, req.InstallID)
+	client, capabilityID, callbackMode, err := h.deps.ResolveClient(ctx, req.InstallID)
 	if err != nil {
 		return OAuthStartResult{}, &OAuthHandshakeError{Status: http.StatusBadGateway, Message: "auth plugin unavailable"}
 	}
@@ -609,11 +610,16 @@ func (h *OAuthHandler) startFlow(ctx context.Context, req OAuthStartRequest, lin
 
 	now := time.Now().UTC()
 	state := SignState(h.deps.StateSecret, StatePayload{
-		Nonce:     nonce,
-		InstallID: strconv.Itoa(req.InstallID),
-		ExpiresAt: now.Add(h.deps.StateTTL),
+		Nonce:        nonce,
+		InstallID:    strconv.Itoa(req.InstallID),
+		ExpiresAt:    now.Add(h.deps.StateTTL),
+		CapabilityID: capabilityID,
+		CallbackMode: callbackMode,
 	})
-	redirectURI := h.CallbackURL(req.Prefix, req.InstallID)
+	redirectURI := h.CallbackURL(req.Prefix, req.InstallID, callbackMode)
+	if redirectURI == "" {
+		return OAuthStartResult{}, &OAuthHandshakeError{Status: http.StatusConflict, Message: "public URL required"}
+	}
 
 	initReq := &pluginv1.InitAuthorizeRequest{
 		RedirectUri: redirectURI,
@@ -669,8 +675,11 @@ func (h *OAuthHandler) startFlow(ctx context.Context, req OAuthStartRequest, lin
 // OAuthCallbackInput is the provider redirect as the transport received it.
 type OAuthCallbackInput struct {
 	InstallID int
+	Prefix    string
 	State     string
 	Code      string
+	// ClearBinder clears the flow cookie at its stored redirect URI.
+	ClearBinder func(redirectURI string)
 	// ProviderError is the OAuth error the provider redirected back with
 	// instead of a code.
 	ProviderError string
@@ -686,39 +695,11 @@ type OAuthCallbackInput struct {
 	IP               string
 }
 
-// HandleInit serves POST /api/v1/auth/oauth/{install_id}/init. A browser on
-// another origin than the public URL is sent there first (307 keeps the
-// POST), so the binding cookie lands where the callback will read it.
-func (h *OAuthHandler) HandleInit(w http.ResponseWriter, r *http.Request) {
-	installID, err := strconv.Atoi(chi.URLParam(r, "install_id"))
-	if err != nil || installID <= 0 {
-		http.Error(w, "invalid install_id", http.StatusBadRequest)
-		return
-	}
-	query := url.Values{}
-	if next := r.URL.Query().Get("next"); next != "" {
-		query.Set("next", next)
-	}
-	query.Set(OAuthBounceParameter, "1")
-	bounce := h.PublicURL("/api/v1/auth/oauth/"+strconv.Itoa(installID)+"/init", query)
-	h.ServeStart(w, r, OAuthStartRequest{InstallID: installID, Prefix: "/api/v1", Next: r.URL.Query().Get("next")}, bounce, http.StatusTemporaryRedirect)
-}
-
-// HandleCallback serves GET /api/v1/auth/oauth/{install_id}/callback.
-func (h *OAuthHandler) HandleCallback(w http.ResponseWriter, r *http.Request) {
-	installID, err := strconv.Atoi(chi.URLParam(r, "install_id"))
-	if err != nil || installID <= 0 {
-		http.Error(w, "invalid install_id", http.StatusBadRequest)
-		return
-	}
-	h.ServeCallback(w, r, "/api/v1", installID)
-}
-
 // ServeCallback answers the provider's redirect back under one API prefix:
 // it reads the flow's binding cookie, finishes the flow, clears the cookie
 // and redirects the browser on. A flow that ends in a web completion code
-// also gets the completion cookie, on the complete path of each API
-// version, so only this browser can redeem the code.
+// also gets the completion cookie, on the complete path, so only this
+// browser can redeem the code.
 func (h *OAuthHandler) ServeCallback(w http.ResponseWriter, r *http.Request, prefix string, installID int) {
 	query := r.URL.Query()
 	state, code, providerError := query.Get("state"), query.Get("code"), query.Get("error")
@@ -729,7 +710,6 @@ func (h *OAuthHandler) ServeCallback(w http.ResponseWriter, r *http.Request, pre
 	binder := ""
 	if cookie, err := r.Cookie(OAuthBinderCookieName(state)); err == nil {
 		binder = cookie.Value
-		http.SetCookie(w, oauthBinderCookie(state, "", h.CallbackURL(prefix, installID), -1))
 	}
 	completionBinder, _, err := newOAuthBinder()
 	if err != nil {
@@ -737,13 +717,16 @@ func (h *OAuthHandler) ServeCallback(w http.ResponseWriter, r *http.Request, pre
 		return
 	}
 	location := h.Callback(r.Context(), OAuthCallbackInput{
-		InstallID: installID, State: state, Code: code, ProviderError: providerError,
+		InstallID: installID, Prefix: prefix, State: state, Code: code, ProviderError: providerError,
+		ClearBinder: func(redirectURI string) {
+			if binder != "" {
+				http.SetCookie(w, oauthBinderCookie(state, "", redirectURI, -1))
+			}
+		},
 		Binder: binder, CompletionBinder: completionBinder, UserAgent: r.UserAgent(), IP: clientIP(r),
 	})
 	if strings.HasPrefix(location, h.webCompletionURL()+"?") {
-		for _, apiPrefix := range []string{oauthV1Prefix, oauthV2Prefix} {
-			http.SetCookie(w, oauthCompletionCookie(completionBinder, h.PublicURL(apiPrefix+oauthCompletePath, nil)))
-		}
+		http.SetCookie(w, oauthCompletionCookie(completionBinder, h.PublicURL(oauthV2Prefix+oauthCompletePath, nil)))
 	}
 	http.Redirect(w, r, location, http.StatusFound)
 }
@@ -873,20 +856,36 @@ func (h *OAuthHandler) addServerID(ctx context.Context, q url.Values) {
 // confirms with CompleteLink. Linking never opens a session. Failures carry
 // a reason code.
 func (h *OAuthHandler) Callback(ctx context.Context, in OAuthCallbackInput) string {
-	installID, state := in.InstallID, in.State
+	state := in.State
 	payload, err := VerifyState(h.deps.StateSecret, state)
 	// An authentic state past its expiry (a slow provider sign-in: MFA
 	// enrolment, a password reset) still loads its flow, so the browser that
 	// started it is sent to its own client's session_expired failure: the
 	// app redirect or the linking page, not the web login.
 	expired := errors.Is(err, ErrStateExpired)
-	if (err != nil && !expired) || payload.InstallID != strconv.Itoa(installID) {
+	if err != nil && !expired {
+		return webFailureLocation(OAuthReasonStateInvalid)
+	}
+	installID, parseErr := strconv.Atoi(payload.InstallID)
+	stable := payload.CallbackMode == plugins.AuthCallbackStable
+	if parseErr != nil || installID <= 0 || stable != (in.InstallID == 0) ||
+		(!stable && installID != in.InstallID) {
 		return webFailureLocation(OAuthReasonStateInvalid)
 	}
 
 	sess, err := h.deps.Store.GetAndDelete(ctx, state)
 	if err != nil {
 		return webFailureLocation(OAuthReasonSessionExpired)
+	}
+	// The proxy may strip the path prefix from the incoming request. The
+	// persisted URI records the public path the browser used for this flow.
+	redirect, err := url.Parse(sess.RedirectURI)
+	if err != nil || sess.InstallID != payload.InstallID ||
+		!strings.HasSuffix(redirect.Path, plugins.OAuthCallbackPath(in.Prefix, installID, payload.CallbackMode)) {
+		return webFailureLocation(OAuthReasonStateInvalid)
+	}
+	if in.ClearBinder != nil {
+		in.ClearBinder(sess.RedirectURI)
 	}
 	// The app redirect names where the native start first arrived.
 	issuer := sess.StartOrigin
@@ -908,8 +907,8 @@ func (h *OAuthHandler) Callback(ctx context.Context, in OAuthCallbackInput) stri
 		return fail(OAuthReasonStateInvalid)
 	}
 
-	client, capabilityID, err := h.deps.ResolveClient(ctx, installID)
-	if err != nil {
+	client, capabilityID, _, err := h.deps.ResolveClient(ctx, installID)
+	if err != nil || (payload.CapabilityID != "" && capabilityID != payload.CapabilityID) {
 		return fail(OAuthReasonProviderUnavailable)
 	}
 
@@ -917,6 +916,13 @@ func (h *OAuthHandler) Callback(ctx context.Context, in OAuthCallbackInput) stri
 	_ = json.Unmarshal(sess.ProviderState, &ps)
 	psStruct, _ := structpb.NewStruct(ps)
 
+	var answerFence int64
+	if sess.LinkingUserID == "" {
+		if answerFence, err = h.deps.LoginCompleter.ProviderAnswerFence(ctx); err != nil {
+			slog.WarnContext(ctx, "oauth answer fence unavailable", "component", "auth", "installation_id", installID, "error", err)
+			return fail(OAuthReasonProviderUnavailable)
+		}
+	}
 	resp, err := client.ExchangeCode(ctx, &pluginv1.ExchangeCodeRequest{
 		Code:          in.Code,
 		State:         state,
@@ -937,6 +943,7 @@ func (h *OAuthHandler) Callback(ctx context.Context, in OAuthCallbackInput) stri
 		Response:       resp,
 		DeviceName:     in.UserAgent,
 		IP:             in.IP,
+		AnswerFence:    answerFence,
 	}
 	if sess.LinkingUserID != "" {
 		uid, err := strconv.Atoi(sess.LinkingUserID)
@@ -1084,52 +1091,6 @@ type OAuthCompleteResponse struct {
 	NextURL      string `json:"next"`
 }
 
-// maxOAuthCompleteBodyBytes bounds the public v1 POST /auth/oauth/complete
-// body, which is decoded before the completion code is checked. It matches
-// the v2 default structured-body cap.
-const maxOAuthCompleteBodyBytes = 1 << 20
-
-// HandleComplete serves v1 POST /auth/oauth/complete. v1 takes no
-// code_verifier, so it redeems web codes only, with the browser's
-// completion cookie.
-func (h *OAuthHandler) HandleComplete(w http.ResponseWriter, r *http.Request) {
-	if h.deps.CompletionStore == nil {
-		http.Error(w, "oauth completion unavailable", http.StatusServiceUnavailable)
-		return
-	}
-	var req OAuthCompleteRequest
-	r.Body = http.MaxBytesReader(w, r.Body, maxOAuthCompleteBodyBytes)
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		var maxBytesErr *http.MaxBytesError
-		if errors.As(err, &maxBytesErr) {
-			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
-			return
-		}
-		http.Error(w, "invalid request body", http.StatusBadRequest)
-		return
-	}
-	browser := ""
-	if cookie, err := r.Cookie(OAuthCompletionCookieName); err == nil {
-		browser = cookie.Value
-	}
-	completion, err := h.Complete(WithClientDevice(r.Context(), r.Header), req.Code, "", browser)
-	if err != nil {
-		if errors.Is(err, ErrOAuthCodeRequired) {
-			http.Error(w, "code required", http.StatusBadRequest)
-			return
-		}
-		http.Error(w, "invalid or expired completion code", http.StatusUnauthorized)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(OAuthCompleteResponse{
-		AccessToken:  completion.AccessToken,
-		RefreshToken: completion.RefreshToken,
-		ExpiresIn:    completion.ExpiresIn,
-		NextURL:      completion.NextURL,
-	})
-}
-
 // Errors Complete reports; each transport renders them in its own shape.
 var (
 	ErrOAuthCompletionUnavailable = errors.New("oauth completion unavailable")
@@ -1194,7 +1155,7 @@ func (h *OAuthHandler) IssueLinkTicket(ctx context.Context, userID, installation
 	if !h.LinkingAvailable() {
 		return OAuthLinkTicket{}, ErrLinkTicketUnavailable
 	}
-	if _, _, err := h.deps.ResolveClient(ctx, installationID); err != nil {
+	if _, _, _, err := h.deps.ResolveClient(ctx, installationID); err != nil {
 		if errors.Is(err, ErrUnknownAuthInstallation) {
 			return OAuthLinkTicket{}, err
 		}
@@ -1250,7 +1211,7 @@ func (h *OAuthHandler) StartLink(ctx context.Context, userID int, prefix, ticket
 			"installation_id", ticket.InstallationID, auditUserID, userID)
 		return OAuthStartResult{}, ErrOAuthLinkTicketInvalid
 	}
-	if _, _, err := h.deps.ResolveClient(ctx, ticket.InstallationID); err != nil {
+	if _, _, _, err := h.deps.ResolveClient(ctx, ticket.InstallationID); err != nil {
 		if errors.Is(err, ErrUnknownAuthInstallation) {
 			return OAuthStartResult{}, err
 		}

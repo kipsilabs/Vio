@@ -169,3 +169,81 @@ func TestAdmitSearchMatchRejectsConflictingExistingProviderID(t *testing.T) {
 		t.Fatalf("admission = %+v, want provider-ID conflict with no admitted IDs", got)
 	}
 }
+
+// An item with no author has only its title to vouch for a candidate (#3161).
+// The untagged books from the issue, and the same partial match the other way
+// round, stay unmatched. Folder titles with an author or series prefix, and
+// every calibrated production pair, are decided as they are with an author.
+func TestAdmitSearchMatchWithoutAnAuthorNeedsTheTitleToIdentifyTheBook(t *testing.T) {
+	type admissionCase struct {
+		name      string
+		want      string
+		candidate string
+		ids       map[string]string
+		existing  map[string]string
+		accept    bool
+	}
+	cases := []admissionCase{
+		{name: "a one-word prefix", want: "Raw Stream", candidate: "Raw"},
+		{name: "two shared words", want: "Unknown Author Book", candidate: "The Book of Unknown Americans"},
+		{name: "a contained shorter title", want: "Dune Messiah", candidate: "Dune"},
+		{name: "a short title inside a longer one", want: "Dune", candidate: "Dune Messiah"},
+		{name: "a title inside a longer word", want: "The Green Mile", candidate: "The Green Milestone"},
+		{name: "a repeated word", want: "New York, New York", candidate: "New York"},
+		{name: "the same title", want: "Raw Stream", candidate: "Raw Stream", accept: true},
+		{name: "an author-prefixed folder", want: "Andy Weir - Project Hail Mary", candidate: "Project Hail Mary", accept: true},
+		{name: "an ampersand", want: "Pride & Prejudice", candidate: "Pride and Prejudice", accept: true},
+		{name: "a dropped leading article", want: "The Hobbit", candidate: "Hobbit", accept: true},
+		{name: "a partial match carrying the item's ID", want: "Raw Stream", candidate: "Raw",
+			ids: map[string]string{"audible": "B0SAME"}, existing: map[string]string{"audible": "B0SAME"}, accept: true},
+		{name: "a partial match beside another provider's ID", want: "Raw Stream", candidate: "Raw",
+			existing: map[string]string{"asin": "B0OTHER"}},
+	}
+	for _, pair := range productionPairs {
+		cases = append(cases, admissionCase{name: "production: " + pair.name, want: pair.want, candidate: pair.got, accept: pair.accept})
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ids := tc.ids
+			if ids == nil {
+				ids = map[string]string{"apple_books": "1417703839"}
+			}
+			got, err := AdmitSearchMatch(context.Background(), SearchMatchAdmissionRequest{
+				WantTitle:           tc.want,
+				Results:             []SearchResult{{Name: tc.candidate, ProviderIDs: ids}},
+				ExistingProviderIDs: tc.existing,
+				NoAuthor:            true,
+			})
+			if err != nil {
+				t.Fatalf("AdmitSearchMatch: %v", err)
+			}
+			if accepted := got.Status == SearchMatchAccepted; accepted != tc.accept {
+				t.Fatalf("%q for %q: status %s, want accepted = %v", tc.candidate, tc.want, got.Status, tc.accept)
+			}
+		})
+	}
+}
+
+func TestAdmitProviderIDsComparesISBNsAsISBN13(t *testing.T) {
+	admit := func(candidate string) ProviderIDAdmission {
+		t.Helper()
+		got, err := AdmitProviderIDs(context.Background(), ProviderIDAdmissionRequest{
+			CandidateProviderIDs: map[string]string{"isbn": candidate},
+			// Stored by the scanner or an old plugin before ISBNs were
+			// stored as ISBN-13.
+			ExistingProviderIDs: map[string]string{"isbn": "0-306-40615-2"},
+			ItemType:            "ebook",
+			ContentID:           "this-book",
+		})
+		if err != nil {
+			t.Fatalf("AdmitProviderIDs: %v", err)
+		}
+		return got
+	}
+	if got := admit("9780306406157"); got.ContradictsExisting || !got.HasUsableIdentity {
+		t.Fatalf("the same book's ISBN-13: admission = %+v, want admitted", got)
+	}
+	if got := admit("9781861972712"); !got.ContradictsExisting {
+		t.Fatalf("another book's ISBN: admission = %+v, want a contradiction", got)
+	}
+}

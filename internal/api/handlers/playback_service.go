@@ -11,6 +11,7 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -72,6 +73,9 @@ const playbackCapabilityStateAvailable = "available"
 type PlaybackOperationError struct {
 	Status        int
 	Code, Message string
+	// RetryAfter is the delta-seconds a retryable refusal advertises in the
+	// Retry-After header; zero omits it.
+	RetryAfter int
 }
 
 func (e *PlaybackOperationError) Error() string { return e.Message }
@@ -80,6 +84,9 @@ func playbackOperationError(status int, code, message string) *PlaybackOperation
 }
 func writePlaybackOperationError(w http.ResponseWriter, err error) {
 	if e, ok := errors.AsType[*PlaybackOperationError](err); ok {
+		if e.RetryAfter > 0 {
+			w.Header().Set("Retry-After", strconv.Itoa(e.RetryAfter))
+		}
 		writeError(w, e.Status, e.Code, e.Message)
 		return
 	}
@@ -589,12 +596,12 @@ func (h *PlaybackHandler) writeProgressSideEffectsV2(ctx context.Context, record
 			// session sync is not replayed by that path: it heals only on the
 			// periodic reconcile tick or the next pause/resume transition.
 			h.scrobblePauseTransitionV2(ctx, current, wasPaused)
-			h.persistProgress(ctx, current)
+			h.persistProgress(ctx, current, sample)
 			h.syncSessionsOnPauseChange(ctx, wasPaused, current.IsPaused)
 			return
 		}
 	}
-	h.persistProgress(ctx, h.attemptSessionV2(ctx, record, sample.Position, sample.IsPaused))
+	h.persistProgress(ctx, h.attemptSessionV2(ctx, record, sample.Position, sample.IsPaused), sample)
 }
 
 // sessionSideEffectLockEntry is one session's side-effect lock plus a reference
@@ -941,14 +948,9 @@ func (h *PlaybackHandler) finishStop(ctx context.Context, record *playback.Attem
 		position, paused = accepted.Position, accepted.IsPaused
 	}
 	if session, err := h.sessionMgr.GetSession(sessionID); err == nil && session != nil {
-		if accepted != nil {
-			if err := h.sessionMgr.UpdateProgress(sessionID, position, paused); err != nil && !errors.Is(err, playback.ErrSessionNotFound) {
-				slog.WarnContext(ctx, "failed to apply final playback position", "component", "api", "session", sessionID, "playback_session_id", sessionID, "error", err)
-			}
-		}
-		result, err := h.stopPlaybackSessionWithResult(ctx, session, reason)
+		result, err := h.stopPlaybackSessionWithResult(ctx, session, reason, accepted)
 		if err == nil {
-			return result.HistoryID, nil
+			return result.HistoryID, result.WatchStateErr
 		}
 		if !errors.Is(err, playback.ErrSessionNotFound) {
 			// The local stop did not finish: its durable writes (the history row

@@ -1,5 +1,7 @@
 # Watch Party synchronization
 
+For how a room moves from lobby to staging to playback, see [Watch Together rooms](watch-together-rooms.md).
+
 Postgres owns the room anchor and its `runtime` JSONB value: connection identities,
 leased presence, attached playback sessions, readiness, and the latest room
 transport command. Each room operation locks its room row and commits the anchor
@@ -205,9 +207,7 @@ miss the scene.
   and whenever the host has drifted by 10 seconds or less, the host is corrected
   like any viewer instead of moving the room anchor. Every client sends its
   seeks as requests, so passive drift is the host falling behind, not a
-  decision. A larger jump or a pause mismatch still moves the room. The frozen
-  v1 room socket keeps its 2 second band, since its clients may report a host's
-  scrub instead of requesting it. A stalled host's position bounds where the
+  decision. A larger jump or a pause mismatch still moves the room. A stalled host's position bounds where the
   room pauses, measured from where the room is when the stall is reported.
 
 Stall times and the last buffering pause live in the room runtime, so every API

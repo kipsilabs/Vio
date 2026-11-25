@@ -178,8 +178,7 @@ Only S3 can mint a URL that authorizes itself off this server. `BucketAPI`
 answers `ErrNoPresign`, and `SupportsPresign` lets a caller ask before offering
 a feature that would always fail. Three consequences:
 
-- **Diagnostic bundles** already streamed through the API host on `/api/v2`, and
-  the `/api/v1` handler falls through to streaming when presigning fails. No
+- **Diagnostic bundles** already streamed through the API host on `/api/v2`. No
   change was needed.
 - **Job artifacts** gained `GET /api/v2/admin/jobs/{id}/artifact`. It is
   authorized by a signed capability, not a session: the presigned URL it
@@ -188,9 +187,7 @@ a feature that would always fail. Three consequences:
   `artworkurl.NewJobArtifactSigner` under its own domain, so an artwork URL
   cannot be replayed against it and a capability for one job does not open
   another's artifact. Every rejection answers 404, so the route never reveals
-  whether a job exists. The frozen `/api/v1` job response only presigns, so
-  `POST /api/v1/admin/catalog/export-jobs` keeps answering 503 on a store that
-  cannot presign rather than queueing an export v1 cannot retrieve.
+  whether a job exists.
 - **Seven-day public links** cannot exist without presigning. The API answers
   `409` and the job projection carries `public_link_supported` so the UI hides
   the action instead of offering one that always fails.
@@ -280,10 +277,14 @@ root that is itself a link, so a recorded root replaced by a link to another
 directory is a different location and still needs the managed transition.
 The reconcile task certifies the same row after a manual sweep, and the storage
 sweep scopes its cursor to it. Once recorded, the admin settings API rejects
-any write that would resolve to a different identity with `409` (problem type
-`conflict` in `/api/v2`, error code `artwork_storage_locked` in frozen
-`/api/v1`): a different backend, `artwork.local_path` for a
-local store, or the public endpoint, bucket, or key prefix for an S3 store. When
+any write that would resolve to a different identity with `409 conflict`: a
+different backend, `artwork.local_path` for a
+local store, or the public endpoint, bucket, or key prefix for an S3 store. The
+saved settings can already name another location than the recorded one, when a
+location was saved without a restart and the running store then made the first
+write. A write that leaves those settings as they are still saves, and a write
+that changes them is accepted only when it names the recorded location, so the
+pending change can be put back before a restart. When
 only `storage.operational_identity` is recorded, the private location locks and
 the assets location stays free until the first write through Assets. The
 private bucket is locked on either backend, because it owns the operational

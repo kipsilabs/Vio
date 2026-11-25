@@ -1,20 +1,23 @@
 # Diagnostics upload API
 
-The native v2 diagnostics ingress uses the existing diagnostics validator and
-storage service. The bridge endpoints retain their wire contract.
+The native diagnostics ingress uses the existing diagnostics validator and
+storage service.
 
 `GET /api/v2/diagnostics/capabilities` requires a signed-in account access token;
 API keys are refused. The capability document returns the account-specific status,
 server instance identity, accepted manifest schema versions, bundle and manifest
 limits, retention days and consent notice version. Capability state is `available`,
-`disabled`, or `not_configured` according to diagnostics availability. A missing
-service returns a dependency-unavailable problem. Treat `revision` as an opaque
+`disabled`, or `not_configured` according to diagnostics availability. A server
+with no diagnostics ingress service still answers `200`, with state
+`not_configured`, `status` `storage_unavailable` and empty accepted schema-version
+and crash-source lists; `POST /api/v2/diagnostics/reports` then returns
+`409 capability_not_configured`. Treat `revision` as an opaque
 string; cache the document privately with its ETag and revalidate with
 `If-None-Match`. A bodyless `304` reuses the matching account-scoped document.
 
-`upload_chunk_bytes` advertises the fixed chunk size when the v2 chunk service
-is configured; zero means unsupported. Clients must use the capability from the
-same API namespace as their upload transport.
+`upload_chunk_bytes` advertises the fixed chunk size when the chunk service is
+configured; zero means unsupported, and the chunk routes then answer
+`503 dependency_unavailable`.
 
 `accepted_crash_sources` lists the `crash.source` values the manifest validator
 accepts. Servers that predate the field accept only `ueh`, `exit_info`,
@@ -37,7 +40,7 @@ archive metadata and quota before accepting a report.
 Ingress streams the gzip part through the existing validator without buffering
 the complete multipart body in Huma. It applies the live bundle limit plus the
 existing 128 KiB framing allowance, finite ten-minute upload deadlines and the
-same process-local admission limiter used by bridge uploads and chunk completion.
+process-local admission limiter that chunk completion also uses.
 The OpenAPI multipart schema is attached after Huma input registration so Huma's
 compiled decoder does not pre-read the stream; the media gate still enforces the
 declared request content type.
@@ -52,12 +55,12 @@ Explicit quota and busy rejections include `Retry-After`. Uploads are
 must not replay automatically. `Retry-After` does not make an uncertain upload
 safe to repeat.
 
-The bridge and v2 chunk routes share sessions in process memory and temporary spool files,
-with a fifteen-minute idle timeout that each chunk renews, a sixteen-session cap and one
-session per account.
+Chunk sessions live in process memory and temporary spool files,
+with a fifteen-minute idle timeout that each chunk renews, a sixteen-session cap
+and one session per account.
 They require affinity to the creating process. Another replica or a process
 restart may return `404`, requiring a fresh session; this is not durable
-cross-replica resumability. Both transports retain those constraints.
+cross-replica resumability.
 
 ## Chunk transport
 
@@ -86,6 +89,4 @@ completion. That absence does not prove that an earlier uncertain completion
 failed to create a report. Clients must not automatically repeat an uncertain
 completion or start a replacement report based on that `404`.
 
-Apple and Android upload transports and the web diagnostics-status consumer must
-adopt the v2 discovery and ingress together before migration ratification. The
-Jellyfin compatibility surface has no corresponding diagnostics upload contract.
+The Jellyfin compatibility surface has no corresponding diagnostics upload contract.

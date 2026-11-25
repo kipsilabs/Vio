@@ -205,14 +205,20 @@ func TestCreateRequestAutoApprovalDefersOnKeylessConnection(t *testing.T) {
 	service := newTestService(store)
 	router := &fakeRouterProvider{}
 	service.SetRouterProvider(router)
+	work := &deferredEnrichment{}
+	service.asyncWork = work.schedule
 
 	req, err := service.CreateRequest(context.Background(), testViewer(1), fightClubInput)
 	if err != nil {
 		t.Fatalf("CreateRequest returned error: %v", err)
 	}
-	if req.Status != StatusApproved || req.Outcome != OutcomeActive ||
-		req.LastError != msgRouterNoKey {
-		t.Fatalf("request = %+v, want approved with the missing-key reason recorded", req)
+	if req.Status != StatusApproved || req.Outcome != OutcomeActive || req.LastError != "" {
+		t.Fatalf("request = %+v, want approved before the deferred submission", req)
+	}
+	work.drain()
+	if got := store.requests[req.ID]; got.Status != StatusApproved || got.Outcome != OutcomeActive ||
+		got.LastError != msgRouterNoKey || got.NextSubmitAt == nil {
+		t.Fatalf("stored request = %+v, want approved with the missing-key reason and retry recorded", got)
 	}
 	if router.fulfillCalls != 0 {
 		t.Fatalf("fulfill calls = %d, want 0 (must not submit to a keyless connection)", router.fulfillCalls)
@@ -252,13 +258,23 @@ func TestCreateRequestAutoApprovalSubmitsMovie(t *testing.T) {
 	// key here (no host-side secret resolution).
 	store.integrations = []Integration{autoApproveRouterInst("router-1", "radarr-key")}
 	service, router := newRoutedService(store)
+	work := &deferredEnrichment{}
+	service.asyncWork = work.schedule
 
 	req, err := service.CreateRequest(context.Background(), testViewer(1), fightClubInput)
 	if err != nil {
 		t.Fatalf("CreateRequest returned error: %v", err)
 	}
-	if req.Status != StatusQueued || req.ExternalID != "ext-1080p" {
-		t.Fatalf("request = %+v, want queued with router external id", req)
+	if req.Status != StatusApproved || req.LastError != "" {
+		t.Fatalf("request = %+v, want approved before the deferred submission", req)
+	}
+	if router.fulfillCalls != 0 {
+		t.Fatalf("fulfill calls = %d, want none before the deferred submission", router.fulfillCalls)
+	}
+	work.drain()
+	got := store.requests[req.ID]
+	if got.Status != StatusQueued || got.ExternalID != "ext-1080p" {
+		t.Fatalf("stored request = %+v, want queued with router external id", got)
 	}
 	if router.fulfillCalls != 1 {
 		t.Fatalf("fulfill calls = %d, want 1", router.fulfillCalls)
@@ -278,13 +294,19 @@ func TestCreateRequestSubmissionFailureMarksFailed(t *testing.T) {
 	// message; the host marks the request failed with it.
 	service := newTestService(store)
 	service.SetRouterProvider(&fakeRouterProvider{noTargets: true, fulfillMsg: "radarr unavailable"})
+	work := &deferredEnrichment{}
+	service.asyncWork = work.schedule
 
 	req, err := service.CreateRequest(context.Background(), testViewer(1), fightClubInput)
 	if err != nil {
 		t.Fatalf("CreateRequest returned error: %v", err)
 	}
-	if req.Outcome != OutcomeFailed || req.LastError != "radarr unavailable" {
-		t.Fatalf("request = %+v, want failed outcome with provider message", req)
+	if req.Status != StatusApproved || req.Outcome != OutcomeActive || req.LastError != "" {
+		t.Fatalf("request = %+v, want approved before the deferred submission", req)
+	}
+	work.drain()
+	if got := store.requests[req.ID]; got.Outcome != OutcomeFailed || got.LastError != "radarr unavailable" {
+		t.Fatalf("stored request = %+v, want failed outcome with provider message", got)
 	}
 }
 
@@ -666,12 +688,12 @@ func TestDisabledRequestsBlockUserSurfaces(t *testing.T) {
 			_, err := service.Search(context.Background(), viewer, "fight", MediaTypeMovie, 1)
 			return err
 		}},
-		{"discover all", func() error {
-			_, err := service.DiscoverAll(context.Background(), viewer)
+		{"discover rows", func() error {
+			_, err := service.DiscoverRows(context.Background(), viewer)
 			return err
 		}},
-		{"discover section", func() error {
-			_, err := service.Discover(context.Background(), viewer, "popular_movies", 1)
+		{"discover row", func() error {
+			_, err := service.DiscoverRow(context.Background(), viewer, "popular_movies", 1)
 			return err
 		}},
 		{"detail", func() error {
@@ -1302,7 +1324,7 @@ func newTestServiceWithTMDB(store *fakeStore, tmdbClient *fakeTMDBClient) *Servi
 	// A create defers its TMDB enrichment past the 201. Tests that need the
 	// result run it explicitly through a deferredEnrichment; the default drops
 	// it so no goroutine races a test.
-	service.enrichAsync = func(func()) {}
+	service.asyncWork = func(func()) {}
 	return service
 }
 
@@ -1490,6 +1512,18 @@ func (f *fakeStore) ListActiveByTMDB(_ context.Context, mediaType MediaType, ids
 	for _, id := range ids {
 		if req := f.active[mediaType][id]; req != nil {
 			out[id] = req
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeStore) ListRequestedTMDB(_ context.Context, _ Viewer, mediaType MediaType, tmdbIDs []int) (map[int]bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := map[int]bool{}
+	for _, id := range tmdbIDs {
+		if f.active[mediaType][id] != nil {
+			out[id] = true
 		}
 	}
 	return out, nil
@@ -1706,10 +1740,16 @@ func (f *fakeStore) MarkFulfilledNotified(_ context.Context, id string) (bool, e
 	return true, nil
 }
 
-func (f *fakeStore) ListMine(context.Context, int, ListFilter) ([]*Request, error) {
+func (f *fakeStore) ListMine(_ context.Context, _ int, filter ListFilter) ([]*Request, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return append([]*Request(nil), f.mine...), nil
+	var out []*Request
+	for _, req := range f.mine {
+		if filter.RequestedByProfileID == "" || req.RequestedByProfileID == filter.RequestedByProfileID {
+			out = append(out, req)
+		}
+	}
+	return out, nil
 }
 
 func (f *fakeStore) ListAdmin(_ context.Context, filter ListFilter) ([]*Request, error) {
@@ -1962,7 +2002,7 @@ func (f *fakeStore) MarkReconciled(_ context.Context, id string) error {
 	return nil
 }
 
-func (f *fakeStore) RecomputeStatus(_ context.Context, id string, _ Viewer) (*Request, error) {
+func (f *fakeStore) RecomputeStatus(_ context.Context, id string, _ time.Time, _ Viewer) (*Request, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	req := f.lookupLocked(id)
@@ -2275,15 +2315,17 @@ func (f *fakeStore) CreateTarget(_ context.Context, t Target) (Target, error) {
 	return t, nil
 }
 
-func (f *fakeStore) DeleteTarget(_ context.Context, id int64) error {
+func (f *fakeStore) DeleteTarget(_ context.Context, requestID string, id int64, _ time.Time) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	for rid, ts := range f.targets {
-		for i := range ts {
-			if ts[i].ID == id {
-				f.targets[rid] = append(ts[:i], ts[i+1:]...)
-				return nil
-			}
+	ts, ok := f.targets[requestID]
+	if !ok {
+		return ErrNotFound
+	}
+	for i := range ts {
+		if ts[i].ID == id {
+			f.targets[requestID] = append(ts[:i], ts[i+1:]...)
+			return nil
 		}
 	}
 	return ErrNotFound
@@ -2502,7 +2544,9 @@ type fakePresence struct {
 	byTVDB    map[MediaType]map[int]int
 	got       []PresenceCandidate
 	// seasons holds per-season counts by series content ID.
-	seasons       map[string]map[int]SeasonCounts
+	seasons map[string]map[int]SeasonCounts
+	// seasonErr fails SeasonAvailability.
+	seasonErr     error
 	seasonLookups int
 }
 
@@ -2510,6 +2554,9 @@ func (f *fakePresence) SeasonAvailability(_ context.Context, seriesContentIDs []
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.seasonLookups++
+	if f.seasonErr != nil {
+		return nil, f.seasonErr
+	}
 	out := map[string]map[int]SeasonCounts{}
 	for _, id := range seriesContentIDs {
 		if counts, ok := f.seasons[id]; ok {

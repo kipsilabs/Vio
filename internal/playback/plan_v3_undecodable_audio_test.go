@@ -2,15 +2,21 @@ package playback
 
 import (
 	"testing"
+	"time"
 
 	"github.com/Silo-Server/silo-server/internal/models"
 )
 
 // undecodableAudioFixtureFileV3 mirrors the #2274 file: the first audio track
 // is AVS3, which ffprobe's JSON leaves without a codec name, so the scanner
-// took the file-level audio codec from the next track.
+// took the file-level audio codec from the next track. It carries a probe stamp
+// because that is where the codec names came from: a codec verdict needs
+// measurement behind it (see AudioCodecVerdictSupported), and a row no probe has
+// measured is not refused this way.
 func undecodableAudioFixtureFileV3() *models.MediaFile {
 	file := detailedFixtureFileV3()
+	probedAt := time.Now().Add(-time.Hour)
+	file.ProbeUpdatedAt = &probedAt
 	file.CodecAudio = "eac3"
 	file.AudioTracks = []models.AudioTrack{
 		{Codec: "", Channels: 6, Language: "zh", Default: true},
@@ -59,29 +65,14 @@ func TestPlanPlaybackV3RefusesFileWithoutDecodableAudio(t *testing.T) {
 
 func TestPlanPlaybackV3RefusesUndecodableAudioOnlyTrack(t *testing.T) {
 	file := audioOnlyFixtureFileV3()
+	probedAt := time.Now().Add(-time.Hour)
+	file.ProbeUpdatedAt = &probedAt
 	file.AudioTracks[0].Codec = "unknown"
 	req := validStartRequestV3()
 	req.FileID = file.ID
 	result := PlanPlaybackV3(PlannerInputV3{Request: req, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0, Settings: PlannerSettingsV3{TranscodeEnabled: true}, Registry: testTransformationRegistryV3()})
 	if result.Terminal == nil || result.Terminal.Reason != TerminalAudioConversionUnsupportedV3 || result.Terminal.Retryable {
 		t.Fatalf("result = %s", ExplainPlannerResultV3(result))
-	}
-}
-
-// Older rows recorded only the file-level audio codec. Their codec-less tracks
-// are missing metadata, not streams FFmpeg cannot decode.
-func TestPlanPlaybackV3KeepsTracksWithoutRecordedCodecs(t *testing.T) {
-	file := detailedFixtureFileV3()
-	file.AudioTracks[0].Codec = ""
-	req := validStartRequestV3()
-	req.Capabilities.VideoDecode = []VideoDecodeCapabilityV3{{Codec: "hevc", Profiles: []string{"main 10"}, Levels: []int{153}, BitDepths: []int{10}, MaxWidth: 3840, MaxHeight: 2160, MaxFrameRate: 60, MaxBitrateKbps: 80_000, Hardware: true}}
-	req.Capabilities.HDRDetails = &HDRCapabilitiesV3{HDR10: true}
-	result := PlanPlaybackV3(PlannerInputV3{Request: req, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0, Settings: PlannerSettingsV3{TranscodeEnabled: true, Allow4KTranscode: true}, Registry: testTransformationRegistryV3()})
-	if result.Terminal != nil || result.Plan == nil {
-		t.Fatalf("result = %s", ExplainPlannerResultV3(result))
-	}
-	if plan := PlanPreparedTracks(file, "aac", -1); len(plan.Audio) != 1 || !plan.Audio[0].Default {
-		t.Fatalf("prepared audio = %+v, want the track kept", plan.Audio)
 	}
 }
 

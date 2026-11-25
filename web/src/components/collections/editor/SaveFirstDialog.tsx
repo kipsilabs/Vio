@@ -10,7 +10,8 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
-import { SAVE_FIRST_TITLE } from "@/lib/collections/copy";
+import { saveFirstTitle } from "@/lib/collections/copy";
+import { useT } from "@/i18n";
 
 /**
  * Asks before leaving the editor for Home rows with unsaved changes: save
@@ -38,6 +39,7 @@ export function SaveFirstDialog({
   onDiscard: () => void;
   onSave: () => void;
 }) {
+  const t = useT();
   const reasonId = useId();
   const saveReasonId = useId();
   return (
@@ -49,7 +51,7 @@ export function SaveFirstDialog({
     >
       <AlertDialogContent>
         <AlertDialogHeader>
-          <AlertDialogTitle>{SAVE_FIRST_TITLE}</AlertDialogTitle>
+          <AlertDialogTitle>{saveFirstTitle()}</AlertDialogTitle>
           <AlertDialogDescription>{description}</AlertDialogDescription>
           {discardBlockedReason ? (
             <p id={reasonId} className="text-muted-foreground text-sm">
@@ -64,16 +66,18 @@ export function SaveFirstDialog({
         </AlertDialogHeader>
         <AlertDialogFooter className="sm:justify-between">
           <AlertDialogCancel variant="ghost" disabled={isSaving}>
-            Cancel
+            {t("common.cancel")}
           </AlertDialogCancel>
-          <div className="flex flex-col-reverse gap-2 sm:flex-row">
+          {/* From sm up the two actions wrap when they don't fit one line, and
+              stay at the end when they move below Cancel. */}
+          <div className="flex flex-col-reverse gap-2 sm:ms-auto sm:flex-row sm:flex-wrap sm:justify-end">
             <Button
               variant="outline"
               disabled={isSaving || Boolean(discardBlockedReason)}
               aria-describedby={discardBlockedReason ? reasonId : undefined}
               onClick={onDiscard}
             >
-              Discard changes
+              {t("web.collections.saveFirst.discardChanges")}
             </Button>
             <Button
               disabled={isSaving || Boolean(saveBlockedReason)}
@@ -83,10 +87,10 @@ export function SaveFirstDialog({
               {isSaving ? (
                 <span
                   aria-hidden
-                  className="mr-2 inline-block h-3 w-3 animate-spin rounded-full border-2 border-current border-t-transparent"
+                  className="me-2 inline-block h-3 w-3 shrink-0 animate-spin rounded-full border-2 border-current border-t-transparent"
                 />
               ) : null}
-              Save and continue
+              {t("web.collections.saveFirst.saveAndContinue")}
             </Button>
           </div>
         </AlertDialogFooter>

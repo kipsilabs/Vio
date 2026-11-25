@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { Direction } from "radix-ui";
+import { motionScrollBehavior } from "@/hooks/usePrefersReducedMotion";
 
-/** Which sides of a strip have more past them. */
+/** Which physical sides of a strip have more past them, in either direction. */
 export interface ScrollEdges {
   left: boolean;
   right: boolean;
@@ -29,7 +31,8 @@ export function edgeMask({ left, right }: ScrollEdges): string | undefined {
  * keeps the active item (`activeSelector`, inside the strip) in view, at least
  * `inset` px from a faded edge, whenever `activeKey` changes or the strip or
  * its first child changes size. Put the items in one child of the scroller so
- * their size can be observed.
+ * their size can be observed. `reveal` brings the active item back into view
+ * on demand, such as when focus returns to it after a hand scroll.
  */
 export function useScrollStrip<T extends HTMLElement>(
   activeSelector: string,
@@ -38,13 +41,19 @@ export function useScrollStrip<T extends HTMLElement>(
 ) {
   const ref = useRef<T>(null);
   const [edges, setEdges] = useState<ScrollEdges>({ left: false, right: false });
+  // A direction change re-measures (and re-reveals) through the callbacks below.
+  const rtl = Direction.useDirection() === "rtl";
   const measure = useCallback(() => {
     const el = ref.current;
     if (!el) return;
-    const left = el.scrollLeft > 1;
-    const right = el.scrollLeft + el.clientWidth < el.scrollWidth - 1;
+    // Right to left, scrollLeft runs from 0 at the right edge down to a negative
+    // value; measure from the left edge either way, since the edges are physical.
+    const overflow = el.scrollWidth - el.clientWidth;
+    const x = rtl ? el.scrollLeft + overflow : el.scrollLeft;
+    const left = x > 1;
+    const right = x < overflow - 1;
     setEdges((prev) => (prev.left === left && prev.right === right ? prev : { left, right }));
-  }, []);
+  }, [rtl]);
 
   // Scrolls only the strip, never the page.
   const reveal = useCallback(() => {
@@ -82,12 +91,11 @@ export function useScrollStrip<T extends HTMLElement>(
   const page = useCallback((side: "left" | "right") => {
     const el = ref.current;
     if (!el) return;
-    const reduce = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
     el.scrollBy?.({
       left: (side === "left" ? -1 : 1) * el.clientWidth * 0.75,
-      behavior: reduce ? "auto" : "smooth",
+      behavior: motionScrollBehavior(),
     });
   }, []);
 
-  return { ref, edges, measure, page };
+  return { ref, edges, measure, page, reveal };
 }

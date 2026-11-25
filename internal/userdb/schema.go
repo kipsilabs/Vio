@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS profiles (
     max_content_rating TEXT,
     max_advisory_age INTEGER CHECK (max_advisory_age BETWEEN 1 AND 21),
     require_advisory_age BOOLEAN NOT NULL DEFAULT false,
+    requests_blocked BOOLEAN NOT NULL DEFAULT false,
     quality_preference TEXT DEFAULT '1080p',
     language TEXT DEFAULT 'en',
     subtitle_language TEXT,
@@ -99,6 +100,17 @@ CREATE TABLE IF NOT EXISTS watch_history (
 
 CREATE INDEX IF NOT EXISTS idx_watch_history_item_witness
     ON watch_history (profile_id, media_item_id, watched_at DESC, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_watch_history_profile_watched
+    ON watch_history (profile_id, watched_at, id);
+
+CREATE TABLE IF NOT EXISTS playback_stop_commits (
+    id TEXT PRIMARY KEY,
+    profile_id TEXT NOT NULL,
+    expires_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_playback_stop_commits_expiry ON playback_stop_commits (expires_at);
 
 CREATE TABLE IF NOT EXISTS hidden_history_items (
     profile_id TEXT NOT NULL,

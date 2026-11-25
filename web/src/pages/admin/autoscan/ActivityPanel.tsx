@@ -1,7 +1,6 @@
-import { useMemo, useState, type ReactNode } from "react";
+import { useMemo, useRef, useState, type MouseEvent, type ReactNode } from "react";
 import {
-  AlertTriangle,
-  CheckCircle2,
+  ChevronRight,
   Clock,
   History,
   ListChecks,
@@ -12,14 +11,10 @@ import {
   X,
 } from "lucide-react";
 import type {
-  AutoscanChangeOutcome,
   AutoscanEvent,
-  AutoscanEventChange,
-  AutoscanEventScanRun,
   AutoscanEventStatus,
   AutoscanRunningPoll,
   AutoscanScan,
-  AutoscanScanResult,
   AutoscanScanStatus,
   Library,
   ScanRun,
@@ -46,6 +41,7 @@ import {
 } from "@/components/ui/table";
 import { useEventChannel } from "@/components/realtimeEventsContext";
 import { useDebounce } from "@/hooks/useDebounce";
+import { useT } from "@/i18n";
 import {
   useAutoscanConnections,
   useAutoscanEvents,
@@ -61,159 +57,39 @@ import {
   compareActiveScans,
   formatActiveScanMode,
   formatActiveScanProgress,
-  formatActiveScanTime,
+  formatActiveScanStarted,
   formatActiveScanTrigger,
 } from "@/lib/scanRuns";
 import { cn } from "@/lib/utils";
-import { formatTime as formatTimePreferred, preferredDateLocale } from "@/lib/datetime";
 
-import { eventSourceName } from "./sourceDisplay";
+import {
+  NO_VALUE,
+  SEPARATOR,
+  eventDetailsSummary,
+  formatDuration,
+  formatTime,
+  formatTimestamp,
+  libraryName,
+  pollEventDuration,
+  pollEventTimestamp,
+  pollSourceName,
+  rawCountValues,
+  scanSourceName,
+} from "./pollEventDisplay";
+import {
+  DeliveryBadge,
+  PollMetricStrip,
+  PollStatusBadge,
+  ScanResultText,
+  ScanStatusBadge,
+} from "./PollActivityBadges";
+import { PollEventInspectorSheet } from "./PollEventInspectorSheet";
 
 const HISTORY_PAGE_SIZE_OPTIONS = [25, 50, 100];
 const DEFAULT_HISTORY_PAGE_SIZE = 25;
 const QUEUE_PAGE_SIZE = 8;
 
 type HistoryView = "scans" | "polls";
-
-function formatTime(value: string | undefined): string {
-  if (!value) return "-";
-  return formatTimePreferred(value, { hour: "2-digit" });
-}
-
-function formatTimestamp(value: string | undefined): string {
-  if (!value) return "-";
-  const day = new Date(value).toLocaleDateString(preferredDateLocale(), {
-    month: "short",
-    day: "numeric",
-  });
-  return `${day}, ${formatTimePreferred(value, { hour: "2-digit" })}`;
-}
-
-function formatDuration(ms: number): string {
-  if (ms < 1000) return `${ms}ms`;
-  if (ms < 60_000) return `${Math.round(ms / 100) / 10}s`;
-  const minutes = Math.floor(ms / 60_000);
-  const seconds = Math.round((ms % 60_000) / 1000);
-  return `${minutes}m ${seconds}s`;
-}
-
-function pollEventDuration(event: AutoscanEvent): string {
-  if (event.status !== "running") {
-    return formatDuration(event.duration_ms);
-  }
-  const elapsed = Math.max(0, Date.now() - new Date(event.started_at).getTime());
-  return formatDuration(elapsed);
-}
-
-function pollEventTimestamp(event: AutoscanEvent): string {
-  return formatTimestamp(event.status === "running" ? event.started_at : event.completed_at);
-}
-
-function eventStatusTone(status: AutoscanEventStatus): {
-  label: string;
-  icon: typeof CheckCircle2;
-  className: string;
-} {
-  switch (status) {
-    case "success":
-      return {
-        label: "Success",
-        icon: CheckCircle2,
-        className: "border-emerald-500/30 bg-emerald-500/10 text-emerald-500",
-      };
-    case "running":
-      return {
-        label: "Running",
-        icon: RefreshCw,
-        className: "border-primary/30 bg-primary/10 text-primary",
-      };
-    case "unresolved":
-      return {
-        label: "Unresolved",
-        icon: AlertTriangle,
-        className: "border-amber-500/30 bg-amber-500/10 text-amber-500",
-      };
-    case "error":
-      return {
-        label: "Error",
-        icon: AlertTriangle,
-        className: "border-destructive/30 bg-destructive/10 text-destructive",
-      };
-  }
-}
-
-function scanStatusClass(status: AutoscanEventScanRun["status"] | ScanRun["status"]): string {
-  switch (status) {
-    case "completed":
-      return "border-emerald-500/30 bg-emerald-500/10 text-emerald-500";
-    case "failed":
-      return "border-destructive/30 bg-destructive/10 text-destructive";
-    case "running":
-      return "border-sky-500/30 bg-sky-500/10 text-sky-500";
-    case "accepted":
-      return "border-muted-foreground/25 bg-muted/60 text-muted-foreground";
-    case "canceled":
-      return "border-amber-500/30 bg-amber-500/10 text-amber-500";
-  }
-}
-
-function scanStatusLabel(status: AutoscanScanStatus | ScanRun["status"]) {
-  return status === "accepted" ? "queued" : status;
-}
-
-// Name every Activity row the way the Sources list titles the source, so the
-// two tabs agree on what a source is called.
-type PollSourceRef = {
-  source_id?: string | null;
-  plugin_id?: string | null;
-  capability_id?: string;
-};
-
-function pollSourceName(event: PollSourceRef, lookups: SourceLabelLookups): string {
-  return eventSourceName(event, lookups) || event.plugin_id || event.capability_id || "Autoscan";
-}
-
-function scanSourceName(scan: AutoscanScan, lookups: SourceLabelLookups): string {
-  return eventSourceName(scan, lookups) || "Autoscan";
-}
-
-function libraryName(librariesByID: Map<number, Library>, libraryID: number): string {
-  return librariesByID.get(libraryID)?.name ?? `Library #${libraryID}`;
-}
-
-function PollStatusBadge({ status }: { status: AutoscanEventStatus }) {
-  const tone = eventStatusTone(status);
-  const Icon = tone.icon;
-  return (
-    <Badge variant="outline" className={tone.className}>
-      <Icon className={cn("h-3.5 w-3.5", status === "running" && "animate-spin")} />
-      {tone.label}
-    </Badge>
-  );
-}
-
-function ScanStatusBadge({ status }: { status: AutoscanScanStatus | ScanRun["status"] }) {
-  return (
-    <Badge variant="outline" className={cn("capitalize tabular-nums", scanStatusClass(status))}>
-      {scanStatusLabel(status)}
-    </Badge>
-  );
-}
-
-/**
- * Marks webhook-delivered events (with the arr event type when known) so they
- * read distinctly from poll cycles. Poll events render nothing — poll is the
- * default and labeling every row would be noise.
- */
-function DeliveryBadge({ event }: { event: AutoscanEvent }) {
-  if (event.delivery_mode !== "webhook") return null;
-  return (
-    <Badge variant="secondary" className="text-xs">
-      Webhook
-      {event.provider_event_type ? ` · ${event.provider_event_type}` : ""}
-    </Badge>
-  );
-}
 
 // Shared desktop table chrome so the queue, scan history, and poll log read as
 // one family: clipped rounded border, muted sticky-feeling header band.
@@ -230,335 +106,6 @@ function DataTable({ head, children }: { head: ReactNode; children: ReactNode })
   );
 }
 
-type ScanResultSummary = { text: string; tone: "skipped" | "errors" | "changes" | "none" };
-
-function plural(count: number, noun: string): string {
-  return `${count.toLocaleString()} ${noun}${count === 1 ? "" : "s"}`;
-}
-
-/**
- * Summarizes a completed run's counters. A skipped run did no work because an
- * overlapping scan of the same scope was already running, which must not read
- * like a run that found nothing.
- */
-function summarizeScanResult(result: AutoscanScanResult | undefined): ScanResultSummary | null {
-  if (!result) return null;
-  if (result.skipped > 0) {
-    return { text: "Skipped — overlapping scan in progress", tone: "skipped" };
-  }
-  const parts: string[] = [];
-  if (result.new > 0) parts.push(`${result.new.toLocaleString()} new`);
-  if (result.updated > 0) parts.push(`${result.updated.toLocaleString()} updated`);
-  if (result.missing > 0) parts.push(`${result.missing.toLocaleString()} missing`);
-  if (result.files_deleted > 0) parts.push(`${plural(result.files_deleted, "file")} removed`);
-  // A scan can drop catalog items whose files were already gone.
-  if (result.items_deleted > 0) parts.push(`${plural(result.items_deleted, "item")} removed`);
-  // A scoped scan can drop a title from this library without deleting it.
-  if (result.memberships_removed > 0)
-    parts.push(`${plural(result.memberships_removed, "title")} removed from library`);
-  if (result.missing_skipped_protected > 0)
-    parts.push(`${result.missing_skipped_protected.toLocaleString()} kept (storage offline)`);
-  if (result.errors > 0) parts.push(plural(result.errors, "error"));
-  if (parts.length === 0) {
-    return {
-      text:
-        result.unchanged > 0
-          ? `No changes · ${result.unchanged.toLocaleString()} unchanged`
-          : "No changes",
-      tone: "none",
-    };
-  }
-  return { text: parts.join(" · "), tone: result.errors > 0 ? "errors" : "changes" };
-}
-
-function ScanResultText({
-  result,
-  className,
-}: {
-  result: AutoscanScanResult | undefined;
-  className?: string;
-}) {
-  const summary = summarizeScanResult(result);
-  if (!summary) return null;
-  return (
-    <span
-      className={cn(
-        "text-xs tabular-nums",
-        summary.tone === "skipped" && "text-amber-500",
-        summary.tone === "errors" && "text-destructive",
-        summary.tone === "changes" && "text-foreground",
-        summary.tone === "none" && "text-muted-foreground",
-        className,
-      )}
-    >
-      {summary.text}
-    </span>
-  );
-}
-
-function RunList({ runs, joinedRuns }: { runs: AutoscanEventScanRun[]; joinedRuns: number }) {
-  if (runs.length === 0) {
-    return (
-      <span className="text-muted-foreground text-xs">
-        {joinedRuns > 0
-          ? "No new scan rows were created. The changes joined scans that were already queued or running."
-          : "No new scan rows were created."}
-      </span>
-    );
-  }
-  return (
-    <div className="space-y-2">
-      {runs.map((run) => (
-        <div
-          key={run.id}
-          className="border-border/70 bg-background/40 grid gap-1 rounded-md border px-3 py-2 text-xs sm:grid-cols-[auto_1fr_auto] sm:items-center"
-        >
-          <ScanStatusBadge status={run.status} />
-          <div className="min-w-0">
-            <div className="font-medium">{run.mode}</div>
-            <div className="text-muted-foreground [overflow-wrap:anywhere]">
-              {run.path || "Entire library"}
-            </div>
-            <ScanResultText result={run.result} className="mt-0.5 block" />
-          </div>
-          <div className="text-muted-foreground whitespace-nowrap tabular-nums">
-            {formatTime(run.completed_at ?? run.started_at ?? run.requested_at)}
-          </div>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-const CHANGE_OUTCOME_TONES: Record<AutoscanChangeOutcome, { label: string; className: string }> = {
-  queued: {
-    label: "Queued",
-    className: "border-emerald-500/30 bg-emerald-500/10 text-emerald-500",
-  },
-  joined: { label: "Joined scan", className: "border-sky-500/30 bg-sky-500/10 text-sky-500" },
-  suppressed: {
-    label: "Suppressed",
-    className: "border-muted-foreground/25 bg-muted/60 text-muted-foreground",
-  },
-  unresolved: {
-    label: "Unresolved",
-    className: "border-amber-500/30 bg-amber-500/10 text-amber-500",
-  },
-  ignored: {
-    label: "Ignored",
-    className: "border-muted-foreground/25 bg-muted/60 text-muted-foreground",
-  },
-  error: { label: "Error", className: "border-destructive/30 bg-destructive/10 text-destructive" },
-};
-
-function isKnownChangeOutcome(outcome: string): outcome is AutoscanChangeOutcome {
-  return Object.prototype.hasOwnProperty.call(CHANGE_OUTCOME_TONES, outcome);
-}
-
-// An outcome added by a newer server shows its raw value in a neutral badge.
-function ChangeOutcomeBadge({ outcome }: { outcome: AutoscanEventChange["outcome"] }) {
-  const tone = isKnownChangeOutcome(outcome)
-    ? CHANGE_OUTCOME_TONES[outcome]
-    : { label: outcome, className: "border-muted-foreground/25 bg-muted/60 text-muted-foreground" };
-  return (
-    <Badge variant="outline" className={cn("whitespace-nowrap", tone.className)}>
-      {tone.label}
-    </Badge>
-  );
-}
-
-// Plain-language explanations for the resolver's reason codes. Unknown codes
-// fall back to the server's detail text so a new reason still reads sensibly.
-const CHANGE_REASON_TEXT: Record<string, string> = {
-  no_library_match:
-    "No Silo library folder contains this path. Add a path mapping for this source or check the library folders.",
-  subtree_outside_library: "This path is not below a library root.",
-  path_outside_library: "This path is outside the matched library.",
-  path_ambiguous: "This path matches more than one library.",
-  library_disabled: "The matching library is disabled.",
-  library_root_offline: "The library's storage root is not available.",
-  unsupported_extension: "This file type is not supported for the library.",
-  path_permission_denied: "Silo is not allowed to read this path.",
-  path_not_inspectable: "Silo could not inspect this path.",
-  path_not_file_or_dir: "This path is not a file or directory.",
-  path_required: "The source sent an empty path.",
-  resolves_to_library: "The file change resolved to a whole library, so it was not scanned.",
-  enqueue_failed: "The scan could not be queued.",
-};
-
-function changeScopeLabel(change: AutoscanEventChange): string {
-  const mode = change.target_mode
-    ? formatActiveScanMode({ mode: change.target_mode as ScanRun["mode"] })
-    : "Scan";
-  return `${mode} · ${change.target_path || "Entire library"}`;
-}
-
-function ChangeExplanation({
-  change,
-  librariesByID,
-}: {
-  change: AutoscanEventChange;
-  librariesByID: Map<number, Library>;
-}) {
-  const library = change.library_id ? libraryName(librariesByID, change.library_id) : null;
-  switch (change.outcome) {
-    case "queued":
-    case "joined":
-      return (
-        <>
-          <div className="text-muted-foreground [overflow-wrap:anywhere]">
-            {change.outcome === "queued"
-              ? "New scan: "
-              : change.reason === "follow_up_scan"
-                ? "A scan of this scope was already running, so it is scanned again when that scan finishes: "
-                : "Added to a scan that was already queued: "}
-            {changeScopeLabel(change)}
-            {library ? ` in ${library}` : ""}
-          </div>
-          {change.scan_run_id ? (
-            <div className="text-muted-foreground font-mono text-[11px] [overflow-wrap:anywhere]">
-              {change.scan_run_id}
-            </div>
-          ) : null}
-        </>
-      );
-    case "suppressed":
-      return (
-        <div className="text-muted-foreground [overflow-wrap:anywhere]">
-          Already requested within the debounce window, so no new scan was requested
-          {change.target_path ? ` (${change.target_path})` : ""}.
-        </div>
-      );
-    case "error":
-      return (
-        <div className="text-destructive [overflow-wrap:anywhere]">
-          {change.reason === "resolve_failed"
-            ? `Resolving the path failed${change.detail ? `: ${change.detail}` : ""}.`
-            : (CHANGE_REASON_TEXT[change.reason ?? ""] ?? change.detail ?? "Processing failed.")}
-        </div>
-      );
-    default: {
-      const text =
-        CHANGE_REASON_TEXT[change.reason ?? ""] ??
-        change.detail ??
-        change.reason ??
-        "This path was not scanned.";
-      return (
-        <div
-          className={cn(
-            "[overflow-wrap:anywhere]",
-            change.outcome === "unresolved" ? "text-amber-500" : "text-muted-foreground",
-          )}
-        >
-          {text}
-          {library ? ` (${library})` : ""}
-        </div>
-      );
-    }
-  }
-}
-
-function ChangeList({
-  event,
-  librariesByID,
-}: {
-  event: AutoscanEvent;
-  librariesByID: Map<number, Library>;
-}) {
-  if (event.changes.length === 0) {
-    return (
-      <span className="text-muted-foreground text-xs">
-        {event.changes_returned > 0
-          ? "Paths were not recorded for this event."
-          : "The source reported no changes."}
-      </span>
-    );
-  }
-  return (
-    <div className="space-y-2">
-      {event.changes.map((change, index) => (
-        <div
-          key={`${index}:${change.source_path}`}
-          className="border-border/70 bg-background/40 grid gap-1.5 rounded-md border px-3 py-2 text-xs sm:grid-cols-[auto_1fr] sm:items-start"
-        >
-          <ChangeOutcomeBadge outcome={change.outcome} />
-          <div className="min-w-0 space-y-0.5">
-            <div className="font-mono [overflow-wrap:anywhere]">{change.source_path}</div>
-            {change.rewritten_path && change.rewritten_path !== change.source_path ? (
-              <div className="text-muted-foreground font-mono [overflow-wrap:anywhere]">
-                <span className="font-sans">Rewritten to </span>
-                {change.rewritten_path}
-              </div>
-            ) : null}
-            <ChangeExplanation change={change} librariesByID={librariesByID} />
-          </div>
-        </div>
-      ))}
-      {event.changes_truncated ? (
-        <p className="text-muted-foreground text-xs">
-          Showing the first {event.changes.length.toLocaleString()} of{" "}
-          {plural(event.changes_returned, "change")}.
-        </p>
-      ) : null}
-    </div>
-  );
-}
-
-function EventDetails({
-  event,
-  librariesByID,
-}: {
-  event: AutoscanEvent;
-  librariesByID: Map<number, Library>;
-}) {
-  return (
-    <div className="space-y-3">
-      <div className="space-y-1.5">
-        <div className="text-muted-foreground text-[11px] font-medium tracking-wide uppercase">
-          Paths
-        </div>
-        <ChangeList event={event} librariesByID={librariesByID} />
-      </div>
-      <div className="space-y-1.5">
-        <div className="text-muted-foreground text-[11px] font-medium tracking-wide uppercase">
-          Scans created
-        </div>
-        <RunList runs={event.scan_runs} joinedRuns={joinedRunCount(event)} />
-      </div>
-    </div>
-  );
-}
-
-/** Runs the event's changes joined that another event created. */
-function joinedRunCount(event: AutoscanEvent): number {
-  const created = new Set(event.scan_runs.map((run) => run.id));
-  const joined = new Set<string>();
-  for (const change of event.changes) {
-    if (change.outcome === "joined" && change.scan_run_id && !created.has(change.scan_run_id))
-      joined.add(change.scan_run_id);
-  }
-  return joined.size;
-}
-
-function eventDetailsSummary(event: AutoscanEvent): string {
-  const linked = event.scan_runs.length + joinedRunCount(event);
-  // Joined runs are only known from recorded changes, so a truncated log can
-  // omit some; the count is then a lower bound.
-  return `${plural(event.changes_returned, "path")} · ${linked}${event.changes_truncated ? "+" : ""} linked`;
-}
-
-function PollMetricStrip({ event }: { event: AutoscanEvent }) {
-  return (
-    <div className="text-muted-foreground flex flex-wrap gap-x-4 gap-y-1 text-xs tabular-nums">
-      <span>{event.changes_returned} changes</span>
-      <span>{event.targets_claimed} targets</span>
-      <span>{event.scans_created} created</span>
-      <span>{event.scans_reused} reused</span>
-      <span>{event.scans_suppressed} suppressed</span>
-    </div>
-  );
-}
-
 function QueueCard({
   scan,
   librariesByID,
@@ -570,6 +117,7 @@ function QueueCard({
   cancellingLibraryID: number | null;
   onCancel: (libraryID: number) => void;
 }) {
+  const t = useT();
   const progress = formatActiveScanProgress(scan);
   return (
     <div className="border-border rounded-lg border p-4">
@@ -577,15 +125,15 @@ function QueueCard({
         <div className="min-w-0 space-y-1">
           <div className="flex flex-wrap items-center gap-2">
             <ScanStatusBadge status={scan.status} />
-            <span className="font-medium">{libraryName(librariesByID, scan.library_id)}</span>
+            <span className="font-medium">{libraryName(t, librariesByID, scan.library_id)}</span>
           </div>
           <div className="text-muted-foreground flex flex-wrap gap-x-3 gap-y-1 text-xs">
             <span>{formatActiveScanMode(scan)}</span>
             <span>{formatActiveScanTrigger(scan.trigger)}</span>
             <span>
               {scan.status === "running"
-                ? formatActiveScanTime(scan.started_at, "Started")
-                : "Waiting for capacity"}
+                ? formatActiveScanStarted(scan.started_at)
+                : t("web.admin.autoscan.activity.queue.waiting")}
             </span>
           </div>
         </div>
@@ -595,13 +143,13 @@ function QueueCard({
           className="text-destructive h-8 w-8"
           disabled={cancellingLibraryID === scan.library_id}
           onClick={() => onCancel(scan.library_id)}
-          aria-label="Cancel scans for this library"
+          aria-label={t("web.admin.autoscan.activity.queue.cancelLabel")}
         >
           <Square className="h-3.5 w-3.5" />
         </Button>
       </div>
       <div className="text-muted-foreground mt-3 font-mono text-xs [overflow-wrap:anywhere]">
-        {scan.path || "Entire library"}
+        {scan.path || t("web.admin.autoscan.activity.entireLibrary")}
       </div>
       {progress ? (
         <div className="text-muted-foreground mt-2 text-xs [overflow-wrap:anywhere]">
@@ -625,6 +173,7 @@ function AutoscanQueue({
   cancellingLibraryID: number | null;
   onCancel: (libraryID: number) => void;
 }) {
+  const t = useT();
   const [page, setPage] = useState(0);
   const pageCount = Math.max(1, Math.ceil(scans.length / QUEUE_PAGE_SIZE));
   // Live scans complete out from under us; the active set length is known
@@ -638,12 +187,12 @@ function AutoscanQueue({
       <div className="border-border rounded-lg border border-dashed p-6">
         <div className="flex items-center gap-2 text-sm font-medium">
           <ScanLine className="text-muted-foreground h-4 w-4" />
-          Autoscan queue
+          {t("web.admin.autoscan.activity.queue.title")}
         </div>
         <p className="text-muted-foreground mt-2 text-sm">
           {statusActiveCount > 0
-            ? "Queue counts are active, but live scan details have not arrived yet."
-            : "No autoscan scans are queued or running."}
+            ? t("web.admin.autoscan.activity.queue.pendingDetails")
+            : t("web.admin.autoscan.activity.queue.empty")}
         </p>
       </div>
     );
@@ -655,14 +204,14 @@ function AutoscanQueue({
         <div>
           <div className="flex items-center gap-2 text-sm font-semibold">
             <ScanLine className="text-primary h-4 w-4" />
-            Autoscan queue
+            {t("web.admin.autoscan.activity.queue.title")}
           </div>
           <p className="text-muted-foreground mt-1 text-xs">
-            Live scans created by autoscan sources.
+            {t("web.admin.autoscan.activity.queue.description")}
           </p>
         </div>
         <Badge variant="secondary" className="tabular-nums">
-          {scans.length} active
+          {t("web.admin.autoscan.activity.activeCount", rawCountValues(scans.length))}
         </Badge>
       </div>
 
@@ -681,11 +230,13 @@ function AutoscanQueue({
       <DataTable
         head={
           <>
-            <TableHead>Status</TableHead>
-            <TableHead>Library</TableHead>
-            <TableHead>Scope</TableHead>
-            <TableHead>Progress</TableHead>
-            <TableHead className="w-20 text-right">Action</TableHead>
+            <TableHead>{t("web.admin.autoscan.activity.column.status")}</TableHead>
+            <TableHead>{t("web.admin.autoscan.activity.column.library")}</TableHead>
+            <TableHead>{t("web.admin.autoscan.activity.column.scope")}</TableHead>
+            <TableHead>{t("web.admin.autoscan.activity.column.progress")}</TableHead>
+            <TableHead className="w-20 text-end">
+              {t("web.admin.autoscan.activity.column.action")}
+            </TableHead>
           </>
         }
       >
@@ -697,30 +248,30 @@ function AutoscanQueue({
                 <ScanStatusBadge status={scan.status} />
               </TableCell>
               <TableCell className="font-medium">
-                {libraryName(librariesByID, scan.library_id)}
+                {libraryName(t, librariesByID, scan.library_id)}
                 <div className="text-muted-foreground mt-1 text-xs">
                   {scan.status === "running"
-                    ? formatActiveScanTime(scan.started_at, "Started")
-                    : "Waiting for capacity"}
+                    ? formatActiveScanStarted(scan.started_at)
+                    : t("web.admin.autoscan.activity.queue.waiting")}
                 </div>
               </TableCell>
               <TableCell>
                 <div className="text-sm">{formatActiveScanMode(scan)}</div>
                 <div className="text-muted-foreground mt-1 max-w-xl font-mono text-xs [overflow-wrap:anywhere] whitespace-normal">
-                  {scan.path || "Entire library"}
+                  {scan.path || t("web.admin.autoscan.activity.entireLibrary")}
                 </div>
               </TableCell>
               <TableCell className="text-muted-foreground text-xs [overflow-wrap:anywhere]">
                 {progress || formatActiveScanTrigger(scan.trigger)}
               </TableCell>
-              <TableCell className="text-right">
+              <TableCell className="text-end">
                 <Button
                   variant="ghost"
                   size="icon"
                   className="text-destructive h-8 w-8"
                   disabled={cancellingLibraryID === scan.library_id}
                   onClick={() => onCancel(scan.library_id)}
-                  aria-label="Cancel scans for this library"
+                  aria-label={t("web.admin.autoscan.activity.queue.cancelLabel")}
                 >
                   <Square className="h-3.5 w-3.5" />
                 </Button>
@@ -736,7 +287,7 @@ function AutoscanQueue({
           pageSize={QUEUE_PAGE_SIZE}
           total={scans.length}
           onPageChange={setPage}
-          itemNoun="scan"
+          summaryKey="web.admin.common.pagination.scans"
         />
       ) : null}
     </section>
@@ -750,6 +301,7 @@ function RunningPolls({
   polls: AutoscanRunningPoll[];
   lookups: SourceLabelLookups;
 }) {
+  const t = useT();
   if (polls.length === 0) return null;
 
   return (
@@ -758,14 +310,14 @@ function RunningPolls({
         <div>
           <div className="flex items-center gap-2 text-sm font-semibold">
             <RefreshCw className="text-primary h-4 w-4 animate-spin" />
-            Polling now
+            {t("web.admin.autoscan.activity.polls.title")}
           </div>
           <p className="text-muted-foreground mt-1 text-xs">
-            Scan-source plugin calls currently in progress.
+            {t("web.admin.autoscan.activity.polls.description")}
           </p>
         </div>
         <Badge variant="secondary" className="tabular-nums">
-          {polls.length} active
+          {t("web.admin.autoscan.activity.activeCount", rawCountValues(polls.length))}
         </Badge>
       </div>
 
@@ -774,16 +326,24 @@ function RunningPolls({
           <div key={poll.id} className="border-border rounded-lg border p-4">
             <div className="flex flex-wrap items-start justify-between gap-3">
               <div className="min-w-0">
-                <div className="font-medium">{pollSourceName(poll, lookups)}</div>
+                <div className="font-medium">{pollSourceName(t, poll, lookups)}</div>
                 <div className="text-muted-foreground mt-1 text-xs [overflow-wrap:anywhere]">
-                  {poll.plugin_id} · {poll.capability_id}
+                  {[poll.plugin_id, poll.capability_id].join(SEPARATOR)}
                 </div>
               </div>
               <PollStatusBadge status="running" />
             </div>
             <div className="text-muted-foreground mt-3 flex flex-wrap gap-x-4 gap-y-1 text-xs tabular-nums">
-              <span>Started {formatTimestamp(poll.started_at)}</span>
-              <span>{formatDuration(poll.elapsed_ms)} elapsed</span>
+              <span>
+                {t("web.admin.autoscan.activity.polls.started", {
+                  time: formatTimestamp(poll.started_at),
+                })}
+              </span>
+              <span>
+                {t("web.admin.autoscan.activity.polls.elapsed", {
+                  duration: formatDuration(t, poll.elapsed_ms),
+                })}
+              </span>
             </div>
           </div>
         ))}
@@ -801,17 +361,18 @@ function ScanHistoryCard({
   librariesByID: Map<number, Library>;
   lookups: SourceLabelLookups;
 }) {
+  const t = useT();
   return (
     <div className="border-border rounded-lg border p-4">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0 space-y-1">
           <div className="flex flex-wrap items-center gap-2">
             <ScanStatusBadge status={scan.status} />
-            <span className="font-medium">{libraryName(librariesByID, scan.library_id)}</span>
+            <span className="font-medium">{libraryName(t, librariesByID, scan.library_id)}</span>
           </div>
           <div className="text-muted-foreground flex flex-wrap gap-x-3 gap-y-1 text-xs">
             <span>{formatActiveScanMode(scan)}</span>
-            <span>{scanSourceName(scan, lookups)}</span>
+            <span>{scanSourceName(t, scan, lookups)}</span>
             <span>
               {formatTimestamp(scan.completed_at ?? scan.started_at ?? scan.requested_at)}
             </span>
@@ -820,7 +381,7 @@ function ScanHistoryCard({
         {scan.event_status ? <PollStatusBadge status={scan.event_status} /> : null}
       </div>
       <div className="text-muted-foreground mt-3 font-mono text-xs [overflow-wrap:anywhere]">
-        {scan.path || "Entire library"}
+        {scan.path || t("web.admin.autoscan.activity.entireLibrary")}
       </div>
       <ScanResultText result={scan.result} className="mt-2 block" />
       {scan.error_message ? (
@@ -844,6 +405,7 @@ export function ScanHistoryTable({
   librariesByID: Map<number, Library>;
   lookups: SourceLabelLookups;
 }) {
+  const t = useT();
   return (
     <>
       <div className="space-y-3 lg:hidden">
@@ -859,13 +421,13 @@ export function ScanHistoryTable({
       <DataTable
         head={
           <>
-            <TableHead>Status</TableHead>
-            <TableHead>Library</TableHead>
-            <TableHead>Source</TableHead>
-            <TableHead>Scope</TableHead>
-            <TableHead>Result</TableHead>
-            <TableHead>Time</TableHead>
-            <TableHead>Poll</TableHead>
+            <TableHead>{t("web.admin.autoscan.activity.column.status")}</TableHead>
+            <TableHead>{t("web.admin.autoscan.activity.column.library")}</TableHead>
+            <TableHead>{t("web.admin.autoscan.activity.column.source")}</TableHead>
+            <TableHead>{t("web.admin.autoscan.activity.column.scope")}</TableHead>
+            <TableHead>{t("web.admin.autoscan.activity.column.result")}</TableHead>
+            <TableHead>{t("web.admin.autoscan.activity.column.time")}</TableHead>
+            <TableHead>{t("web.admin.autoscan.activity.column.poll")}</TableHead>
           </>
         }
       >
@@ -875,17 +437,17 @@ export function ScanHistoryTable({
               <ScanStatusBadge status={scan.status} />
             </TableCell>
             <TableCell className="font-medium">
-              {libraryName(librariesByID, scan.library_id)}
+              {libraryName(t, librariesByID, scan.library_id)}
               <div className="text-muted-foreground mt-1 font-mono text-[11px]">{scan.id}</div>
             </TableCell>
-            <TableCell className="whitespace-nowrap">{scanSourceName(scan, lookups)}</TableCell>
+            <TableCell className="whitespace-nowrap">{scanSourceName(t, scan, lookups)}</TableCell>
             {/* Table cells default to nowrap. The path and error set their own
                 width bounds so the text wraps within them, and the error keeps a
                 minimum so a failed scan's column does not collapse to a sliver. */}
             <TableCell>
               <div className="text-sm">{formatActiveScanMode(scan)}</div>
               <div className="text-muted-foreground mt-1 max-w-xl font-mono text-xs [overflow-wrap:anywhere] whitespace-normal">
-                {scan.path || "Entire library"}
+                {scan.path || t("web.admin.autoscan.activity.entireLibrary")}
               </div>
               {scan.error_message ? (
                 <div className="text-destructive mt-1 max-w-xl min-w-[16rem] text-xs [overflow-wrap:anywhere] whitespace-normal">
@@ -897,14 +459,14 @@ export function ScanHistoryTable({
               {scan.result ? (
                 <ScanResultText result={scan.result} />
               ) : (
-                <span className="text-muted-foreground">-</span>
+                <span className="text-muted-foreground">{NO_VALUE}</span>
               )}
             </TableCell>
             <TableCell className="text-muted-foreground whitespace-nowrap tabular-nums">
               {formatTimestamp(scan.completed_at ?? scan.started_at ?? scan.requested_at)}
             </TableCell>
             <TableCell>
-              {scan.event_status ? <PollStatusBadge status={scan.event_status} /> : "-"}
+              {scan.event_status ? <PollStatusBadge status={scan.event_status} /> : NO_VALUE}
             </TableCell>
           </TableRow>
         ))}
@@ -916,41 +478,57 @@ export function ScanHistoryTable({
 function PollEventCard({
   event,
   lookups,
-  librariesByID,
+  selected,
+  onInspect,
 }: {
   event: AutoscanEvent;
   lookups: SourceLabelLookups;
-  librariesByID: Map<number, Library>;
+  selected: boolean;
+  onInspect: (event: AutoscanEvent, trigger?: HTMLElement | null) => void;
 }) {
+  const t = useT();
+  const hasActivity = event.changes_returned > 0 || event.scan_runs.length > 0;
   return (
-    <div className="border-border rounded-lg border p-4">
+    <div
+      className={cn(
+        "border-border rounded-lg border p-4 transition-colors",
+        selected && "border-foreground/25 bg-muted/40",
+      )}
+    >
       <div className="flex flex-wrap items-start justify-between gap-3">
-        <div className="min-w-0 space-y-1">
+        <div className="min-w-0 space-y-1.5">
           <div className="flex flex-wrap items-center gap-2">
             <PollStatusBadge status={event.status} />
-            <span className="font-medium">{pollSourceName(event, lookups)}</span>
+            <span className="font-medium">{pollSourceName(t, event, lookups)}</span>
             <DeliveryBadge event={event} />
           </div>
           <PollMetricStrip event={event} />
         </div>
-        <div className="text-muted-foreground text-right text-xs tabular-nums">
+        <div className="text-muted-foreground text-end text-xs tabular-nums">
           <div>{pollEventTimestamp(event)}</div>
-          <div>{pollEventDuration(event)}</div>
+          <div>{pollEventDuration(t, event)}</div>
         </div>
       </div>
       {event.error_message ? (
-        <p className="text-destructive mt-3 text-xs [overflow-wrap:anywhere]">
+        <p className="text-destructive mt-3 line-clamp-2 text-xs [overflow-wrap:anywhere]">
           {event.error_message}
         </p>
       ) : null}
-      <details className="mt-3">
-        <summary className="text-muted-foreground cursor-pointer text-xs">
-          {eventDetailsSummary(event)}
-        </summary>
-        <div className="mt-2">
-          <EventDetails event={event} librariesByID={librariesByID} />
-        </div>
-      </details>
+      <button
+        type="button"
+        onClick={(mouseEvent) => onInspect(event, mouseEvent.currentTarget)}
+        aria-haspopup="dialog"
+        className={cn(
+          "border-border/70 bg-muted/25 hover:bg-surface-hover focus-visible:ring-ring mt-3 flex w-full items-center justify-between gap-2 rounded-md border px-3 py-2 text-xs transition-colors focus-visible:ring-2 focus-visible:outline-none",
+          hasActivity ? "text-foreground font-medium" : "text-muted-foreground",
+        )}
+      >
+        <span className="truncate tabular-nums">{eventDetailsSummary(t, event)}</span>
+        <ChevronRight
+          className="text-muted-foreground h-3.5 w-3.5 shrink-0 rtl:-scale-x-100"
+          aria-hidden="true"
+        />
+      </button>
     </div>
   );
 }
@@ -964,6 +542,34 @@ export function PollEventTable({
   lookups: SourceLabelLookups;
   librariesByID: Map<number, Library>;
 }) {
+  const t = useT();
+  const [inspected, setInspected] = useState<{ id: number; snapshot: AutoscanEvent } | null>(null);
+  const returnFocusRef = useRef<HTMLElement | null>(null);
+
+  // Prefer the live event from the current page and keep the fallback snapshot
+  // up to date so scan statuses and results do not revert if pagination or a
+  // later refresh moves the inspected poll off-page.
+  const liveEvent = inspected ? events.find((event) => event.id === inspected.id) : undefined;
+  if (inspected && liveEvent && liveEvent !== inspected.snapshot) {
+    setInspected({ id: inspected.id, snapshot: liveEvent });
+  }
+  const selectedEvent = inspected ? (liveEvent ?? inspected.snapshot) : null;
+
+  function openInspector(event: AutoscanEvent, trigger?: HTMLElement | null) {
+    returnFocusRef.current =
+      trigger ?? (document.activeElement instanceof HTMLElement ? document.activeElement : null);
+    setInspected({ id: event.id, snapshot: event });
+  }
+
+  function handleRowClick(mouseEvent: MouseEvent<HTMLTableRowElement>, event: AutoscanEvent) {
+    if (window.getSelection()?.toString()) return;
+    if ((mouseEvent.target as HTMLElement).closest("button, a, input, select, textarea")) return;
+    const trigger = mouseEvent.currentTarget.querySelector<HTMLElement>(
+      "[data-poll-details-trigger]",
+    );
+    openInspector(event, trigger);
+  }
+
   return (
     <>
       <div className="space-y-3 lg:hidden">
@@ -972,62 +578,95 @@ export function PollEventTable({
             key={event.id}
             event={event}
             lookups={lookups}
-            librariesByID={librariesByID}
+            selected={selectedEvent?.id === event.id}
+            onInspect={openInspector}
           />
         ))}
       </div>
       <DataTable
         head={
           <>
-            <TableHead>Status</TableHead>
-            <TableHead>Source</TableHead>
-            <TableHead>Counts</TableHead>
-            <TableHead>Details</TableHead>
-            <TableHead>Duration</TableHead>
-            <TableHead>Time</TableHead>
+            <TableHead>{t("web.admin.autoscan.activity.column.status")}</TableHead>
+            <TableHead>{t("web.admin.autoscan.activity.column.source")}</TableHead>
+            <TableHead>{t("web.admin.autoscan.activity.column.counts")}</TableHead>
+            <TableHead>{t("web.admin.autoscan.activity.column.details")}</TableHead>
+            <TableHead>{t("web.admin.autoscan.activity.column.duration")}</TableHead>
+            <TableHead>{t("web.admin.autoscan.activity.column.time")}</TableHead>
           </>
         }
       >
-        {events.map((event) => (
-          <TableRow key={event.id}>
-            <TableCell>
-              <PollStatusBadge status={event.status} />
-            </TableCell>
-            <TableCell className="font-medium">
-              <div className="flex flex-wrap items-center gap-1.5">
-                {pollSourceName(event, lookups)}
-                <DeliveryBadge event={event} />
-              </div>
-            </TableCell>
-            <TableCell>
-              <PollMetricStrip event={event} />
-              {/* Table cells default to nowrap; the error must wrap within its cap. */}
-              {event.error_message ? (
-                <div className="text-destructive mt-1 max-w-md text-xs [overflow-wrap:anywhere] whitespace-normal">
-                  {event.error_message}
+        {events.map((event) => {
+          const isSelected = selectedEvent?.id === event.id;
+          const hasActivity = event.changes_returned > 0 || event.scan_runs.length > 0;
+          return (
+            <TableRow
+              key={event.id}
+              data-state={isSelected ? "selected" : undefined}
+              onClick={(mouseEvent) => handleRowClick(mouseEvent, event)}
+              className="group hover:bg-surface-hover cursor-pointer"
+            >
+              <TableCell>
+                <PollStatusBadge status={event.status} />
+              </TableCell>
+              <TableCell className="font-medium">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {pollSourceName(t, event, lookups)}
+                  <DeliveryBadge event={event} />
                 </div>
-              ) : null}
-            </TableCell>
-            <TableCell>
-              <details>
-                <summary className="text-muted-foreground cursor-pointer text-xs whitespace-nowrap">
-                  {eventDetailsSummary(event)}
-                </summary>
-                {/* Table cells default to nowrap; paths and explanations must wrap. */}
-                <div className="mt-2 max-w-[32rem] min-w-[16rem] whitespace-normal">
-                  <EventDetails event={event} librariesByID={librariesByID} />
-                </div>
-              </details>
-            </TableCell>
-            <TableCell className="whitespace-nowrap tabular-nums">
-              {pollEventDuration(event)}
-            </TableCell>
-            <TableCell className="text-muted-foreground whitespace-nowrap tabular-nums">
-              {pollEventTimestamp(event)}
-            </TableCell>
-          </TableRow>
-        ))}
+              </TableCell>
+              <TableCell>
+                <PollMetricStrip event={event} />
+                {event.error_message ? (
+                  <div className="text-destructive mt-1 max-w-md truncate text-xs">
+                    {event.error_message}
+                  </div>
+                ) : null}
+              </TableCell>
+              <TableCell>
+                <button
+                  type="button"
+                  data-poll-details-trigger
+                  onClick={(mouseEvent) => openInspector(event, mouseEvent.currentTarget)}
+                  aria-haspopup="dialog"
+                  className={cn(
+                    "focus-visible:ring-ring -ms-2 inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-xs whitespace-nowrap tabular-nums transition-colors focus-visible:ring-2 focus-visible:outline-none",
+                    hasActivity
+                      ? "text-foreground font-medium"
+                      : "text-muted-foreground group-hover:text-foreground",
+                  )}
+                >
+                  <span>{eventDetailsSummary(t, event)}</span>
+                  <ChevronRight
+                    className="text-muted-foreground/70 group-hover:text-foreground h-3.5 w-3.5 shrink-0 transition-colors rtl:-scale-x-100"
+                    aria-hidden="true"
+                  />
+                </button>
+              </TableCell>
+              <TableCell className="whitespace-nowrap tabular-nums">
+                {pollEventDuration(t, event)}
+              </TableCell>
+              <TableCell className="text-muted-foreground whitespace-nowrap tabular-nums">
+                {pollEventTimestamp(event)}
+              </TableCell>
+            </TableRow>
+          );
+        })}
       </DataTable>
+
+      <PollEventInspectorSheet
+        event={selectedEvent}
+        lookups={lookups}
+        librariesByID={librariesByID}
+        onClose={() => setInspected(null)}
+        onCloseAutoFocus={(closeEvent) => {
+          const target = returnFocusRef.current;
+          returnFocusRef.current = null;
+          if (target?.isConnected) {
+            closeEvent.preventDefault();
+            target.focus();
+          }
+        }}
+      />
     </>
   );
 }
@@ -1063,6 +702,7 @@ function StatTile({
 }
 
 export default function ActivityPanel() {
+  const t = useT();
   useEventChannel("scans");
   const [historyView, setHistoryView] = useState<HistoryView>("scans");
   const [historyQuery, setHistoryQuery] = useState("");
@@ -1122,7 +762,10 @@ export default function ActivityPanel() {
   const activeStatus = historyView === "scans" ? scanStatus : pollStatus;
   const hasHistoryFilters = debouncedHistoryQuery !== "" || activeStatus !== "all";
   const isRefreshing = status.isFetching || activeQuery.isFetching;
-  const itemNoun = historyView === "scans" ? "scan" : "poll";
+  const summaryKey =
+    historyView === "scans"
+      ? "web.admin.common.pagination.scans"
+      : "web.admin.common.pagination.polls";
 
   // If a background refresh shrinks the result set below the current page,
   // pull the viewer back to the last page that still has rows. Adjusting state
@@ -1153,19 +796,37 @@ export default function ActivityPanel() {
   return (
     <div className="space-y-6">
       <div className="border-border grid gap-4 rounded-lg border p-4 sm:grid-cols-5">
-        <StatTile label="Active" value={queue?.active_scans ?? 0} icon={ScanLine} />
-        <StatTile label="Queued" value={queue?.accepted_scans ?? 0} />
-        <StatTile label="Running scans" value={queue?.running_scans ?? 0} />
-        <StatTile label="Polling" value={queue?.running_polls?.length ?? 0} icon={RefreshCw} />
+        <StatTile
+          label={t("web.admin.autoscan.activity.stats.active")}
+          value={queue?.active_scans ?? 0}
+          icon={ScanLine}
+        />
+        <StatTile
+          label={t("web.admin.autoscan.activity.stats.queued")}
+          value={queue?.accepted_scans ?? 0}
+        />
+        <StatTile
+          label={t("web.admin.autoscan.activity.stats.runningScans")}
+          value={queue?.running_scans ?? 0}
+        />
+        <StatTile
+          label={t("web.admin.autoscan.activity.stats.polling")}
+          value={queue?.running_polls?.length ?? 0}
+          icon={RefreshCw}
+        />
         <div className="flex items-start justify-between gap-3 sm:block">
-          <StatTile label="Latest poll" value={formatTime(queue?.latest_event_at)} icon={Clock} />
+          <StatTile
+            label={t("web.admin.autoscan.activity.stats.latestPoll")}
+            value={formatTime(queue?.latest_event_at)}
+            icon={Clock}
+          />
           <Button
             variant="outline"
             size="icon"
             className="sm:mt-2"
             onClick={refresh}
             disabled={isRefreshing}
-            aria-label="Refresh autoscan activity"
+            aria-label={t("web.admin.autoscan.activity.refreshLabel")}
           >
             <RefreshCw className={cn(isRefreshing && "animate-spin")} />
           </Button>
@@ -1191,12 +852,14 @@ export default function ActivityPanel() {
               ) : (
                 <History className="text-primary h-4 w-4" />
               )}
-              {historyView === "scans" ? "Scan history" : "Poll log"}
+              {historyView === "scans"
+                ? t("web.admin.autoscan.activity.history.scansTitle")
+                : t("web.admin.autoscan.activity.history.pollsTitle")}
             </div>
             <p className="text-muted-foreground mt-1 text-xs">
               {historyView === "scans"
-                ? "Real scan rows created by autoscan, searchable by path, library, source, status, or scan id."
-                : "Diagnostic poll records from scan-source plugins."}
+                ? t("web.admin.autoscan.activity.history.scansDescription")
+                : t("web.admin.autoscan.activity.history.pollsDescription")}
             </p>
           </div>
           <div className="grid gap-2 sm:grid-cols-[auto_minmax(0,1fr)_10rem_auto] lg:w-[50rem]">
@@ -1208,7 +871,7 @@ export default function ActivityPanel() {
                 className="h-7"
                 onClick={() => switchHistoryView("scans")}
               >
-                Scans
+                {t("web.admin.autoscan.activity.history.scans")}
               </Button>
               <Button
                 type="button"
@@ -1217,26 +880,30 @@ export default function ActivityPanel() {
                 className="h-7"
                 onClick={() => switchHistoryView("polls")}
               >
-                Polls
+                {t("web.admin.autoscan.activity.history.polls")}
               </Button>
             </div>
             <div className="relative min-w-0">
-              <Search className="text-muted-foreground pointer-events-none absolute top-1/2 left-3 h-4 w-4 -translate-y-1/2" />
+              <Search className="text-muted-foreground pointer-events-none absolute start-3 top-1/2 h-4 w-4 -translate-y-1/2" />
               <Input
                 value={historyQuery}
                 onChange={(event) => {
                   setHistoryQuery(event.target.value);
                   setPage(0);
                 }}
-                placeholder={historyView === "scans" ? "Search scan history" : "Search poll log"}
-                className="pr-9 pl-9"
+                placeholder={
+                  historyView === "scans"
+                    ? t("web.admin.autoscan.activity.history.searchScans")
+                    : t("web.admin.autoscan.activity.history.searchPolls")
+                }
+                className="ps-9 pe-9"
               />
               {historyQuery ? (
                 <button
                   type="button"
-                  className="text-muted-foreground hover:text-foreground absolute top-1/2 right-2 rounded p-1 transition-colors"
+                  className="text-muted-foreground hover:text-foreground absolute end-2 top-1/2 rounded p-1 transition-colors"
                   onClick={() => setHistoryQuery("")}
-                  aria-label="Clear history search"
+                  aria-label={t("web.admin.autoscan.activity.history.clearSearch")}
                 >
                   <X className="h-3.5 w-3.5" />
                 </button>
@@ -1254,12 +921,24 @@ export default function ActivityPanel() {
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="all">All statuses</SelectItem>
-                  <SelectItem value="accepted">Queued</SelectItem>
-                  <SelectItem value="running">Running</SelectItem>
-                  <SelectItem value="completed">Completed</SelectItem>
-                  <SelectItem value="failed">Failed</SelectItem>
-                  <SelectItem value="canceled">Cancelled</SelectItem>
+                  <SelectItem value="all">
+                    {t("web.admin.autoscan.activity.filter.allStatuses")}
+                  </SelectItem>
+                  <SelectItem value="accepted">
+                    {t("web.admin.autoscan.activity.scanFilter.queued")}
+                  </SelectItem>
+                  <SelectItem value="running">
+                    {t("web.admin.autoscan.activity.scanFilter.running")}
+                  </SelectItem>
+                  <SelectItem value="completed">
+                    {t("web.admin.autoscan.activity.scanFilter.completed")}
+                  </SelectItem>
+                  <SelectItem value="failed">
+                    {t("web.admin.autoscan.activity.scanFilter.failed")}
+                  </SelectItem>
+                  <SelectItem value="cancelled">
+                    {t("web.admin.autoscan.activity.scanFilter.cancelled")}
+                  </SelectItem>
                 </SelectContent>
               </Select>
             ) : (
@@ -1274,16 +953,26 @@ export default function ActivityPanel() {
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="all">All statuses</SelectItem>
-                  <SelectItem value="running">Running</SelectItem>
-                  <SelectItem value="success">Success</SelectItem>
-                  <SelectItem value="unresolved">Unresolved</SelectItem>
-                  <SelectItem value="error">Error</SelectItem>
+                  <SelectItem value="all">
+                    {t("web.admin.autoscan.activity.filter.allStatuses")}
+                  </SelectItem>
+                  <SelectItem value="running">
+                    {t("web.admin.autoscan.activity.pollStatus.running")}
+                  </SelectItem>
+                  <SelectItem value="success">
+                    {t("web.admin.autoscan.activity.pollStatus.success")}
+                  </SelectItem>
+                  <SelectItem value="unresolved">
+                    {t("web.admin.autoscan.activity.pollStatus.unresolved")}
+                  </SelectItem>
+                  <SelectItem value="error">
+                    {t("web.admin.autoscan.activity.pollStatus.error")}
+                  </SelectItem>
                 </SelectContent>
               </Select>
             )}
             <Button variant="outline" onClick={resetHistoryFilters} disabled={!hasHistoryFilters}>
-              Reset
+              {t("web.admin.autoscan.activity.history.reset")}
             </Button>
           </div>
         </div>
@@ -1292,19 +981,21 @@ export default function ActivityPanel() {
           <HistorySkeleton />
         ) : activeQuery.isError ? (
           <div className="border-destructive/30 bg-destructive/5 rounded-lg border p-8 text-center">
-            <p className="text-destructive text-sm">Failed to load autoscan activity.</p>
+            <p className="text-destructive text-sm">
+              {t("web.admin.autoscan.activity.history.loadFailed")}
+            </p>
             <Button variant="outline" size="sm" className="mt-3" onClick={refresh}>
-              Try again
+              {t("common.tryAgain")}
             </Button>
           </div>
         ) : activeRows.length === 0 ? (
           <div className="rounded-lg border border-dashed p-8 text-center">
             <p className="text-muted-foreground text-sm">
               {hasHistoryFilters
-                ? "No autoscan activity matches those filters."
+                ? t("web.admin.autoscan.activity.history.emptyFiltered")
                 : historyView === "scans"
-                  ? "No autoscan scans have been created yet."
-                  : "No autoscan polls have been recorded yet."}
+                  ? t("web.admin.autoscan.activity.history.emptyScans")
+                  : t("web.admin.autoscan.activity.history.emptyPolls")}
             </p>
           </div>
         ) : (
@@ -1333,7 +1024,7 @@ export default function ActivityPanel() {
                 setPage(0);
               }}
               pageSizeOptions={HISTORY_PAGE_SIZE_OPTIONS}
-              itemNoun={itemNoun}
+              summaryKey={summaryKey}
               isFetching={activeQuery.isFetching}
             />
           </div>

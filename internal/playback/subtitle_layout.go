@@ -1,16 +1,17 @@
 package playback
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/Silo-Server/silo-server/internal/fspath"
 	"github.com/Silo-Server/silo-server/internal/lang"
 	"github.com/Silo-Server/silo-server/internal/mediaprobe"
 	"github.com/Silo-Server/silo-server/internal/models"
@@ -23,11 +24,18 @@ import (
 // path verify the live layout cheaply and re-map the plan ordinal onto a
 // same-class live track instead of letting ffmpeg fail on `0:s:N`.
 
-// subtitleProbeTimeout bounds the live-layout ffprobe. Subtitle streams are
-// described near the container head, so a healthy probe finishes in well under
-// a second; anything slower is a stuck upstream and should not hold the
-// request.
-const subtitleProbeTimeout = 5 * time.Second
+// subtitleProbeTimeout is the floor for the live-layout ffprobe. Subtitle
+// streams are described near the container head, so a healthy probe finishes in
+// well under a second. The floor is not a wall: a provider link that just took
+// seconds to answer a listing gets a proportionally longer probe (see
+// AdaptiveProbeBudget), because the same upstream first-byte spike that slowed
+// the listing also delays the header this probe reads.
+const subtitleProbeTimeout = RemoteProbeFloor
+
+// SubtitleProbeMax caps an adaptive layout-probe budget. A slow link gets room
+// to answer, but a stuck upstream must not hold the subtitle request: past this
+// bound the caller fails closed and the client falls back to subtitles off.
+const SubtitleProbeMax = 15 * time.Second
 
 // SubtitleLayoutsEqual reports whether two embedded subtitle layouts are
 // track-for-track identical on every attribute the extraction path depends on:
@@ -160,9 +168,19 @@ func stringSlicesEqualFold(a, b []string) bool {
 //
 // ffprobePathOrFFmpeg may be either an ffprobe path or the configured ffmpeg
 // path (ffprobe ships next to ffmpeg in every distribution Silo supports).
-// The probe is bounded to subtitleProbeTimeout; a failure returns an error so
-// the caller can decide whether a spawn can proceed unverified.
+// The probe runs under the floor budget (subtitleProbeTimeout); callers that
+// observed a slower link use ProbeSubtitleLayoutWithin. A failure returns an
+// error so the caller can decide whether a spawn can proceed unverified.
 func ProbeSubtitleLayout(ctx context.Context, ffprobePathOrFFmpeg, inputURL string) ([]models.SubtitleTrack, error) {
+	return ProbeSubtitleLayoutWithin(ctx, ffprobePathOrFFmpeg, inputURL, subtitleProbeTimeout)
+}
+
+// ProbeSubtitleLayoutWithin is ProbeSubtitleLayout with an explicit budget,
+// normally playback.AdaptiveProbeBudget sized from the link's recent provider
+// latency. A non-positive budget means no probe time is left and is reported
+// without spawning ffprobe, so a caller that cannot afford a normal probe fails
+// fast instead of being killed by its own deadline mid-read.
+func ProbeSubtitleLayoutWithin(ctx context.Context, ffprobePathOrFFmpeg, inputURL string, budget time.Duration) ([]models.SubtitleTrack, error) {
 	// A layout probe against a relay URL is a remote read like any other
 	// subtitle demux, so it is admitted on the same per-source budget; a
 	// probe that is skipped this way is a "can't validate right now" answer
@@ -172,24 +190,39 @@ func ProbeSubtitleLayout(ctx context.Context, ffprobePathOrFFmpeg, inputURL stri
 		return nil, fmt.Errorf("probe subtitle layout skipped: %w", demuxErr)
 	}
 	defer releaseRelayDemux()
+	if budget <= 0 {
+		return nil, fmt.Errorf("probe subtitle layout skipped for %s: no remaining probe budget", inputURL)
+	}
 
-	probeCtx, cancel := context.WithTimeout(ctx, subtitleProbeTimeout)
+	probeCtx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 
-	cmd := exec.CommandContext(probeCtx, probeSubtitleBin(ffprobePathOrFFmpeg),
+	var stdout bytes.Buffer
+	// The guarded launcher admits a relayed input only for the relay's own
+	// protocols and demuxers; this probe reads a relay URL like any other
+	// subtitle demux.
+	cmd := fspath.CommandContext(probeCtx, probeSubtitleBin(ffprobePathOrFFmpeg),
 		"-v", "error",
 		"-print_format", "json",
 		"-show_streams",
 		"-select_streams", "s",
 		inputURL,
 	)
-	output, err := cmd.Output()
-	if err != nil {
+	cmd.Stdout = &stdout
+	if err := cmd.Start(); err != nil {
+		// No process: a missing or unexecutable ffprobe is not a probe run.
+		return nil, fmt.Errorf("probe subtitle layout failed for %s: %w", inputURL, err)
+	}
+	// The child exists, so this is a real probe even if it later times out or
+	// reports a bad layout.
+	recordSubtitleLayoutProbeRan()
+	if err := cmd.Wait(); err != nil {
 		if probeCtx.Err() != nil {
 			return nil, fmt.Errorf("probe subtitle layout timed out for %s: %w", inputURL, probeCtx.Err())
 		}
 		return nil, fmt.Errorf("probe subtitle layout failed for %s: %w", inputURL, err)
 	}
+	output := stdout.Bytes()
 
 	var probed struct {
 		Streams []mediaprobe.Stream `json:"streams"`
@@ -620,6 +653,43 @@ func subtitleLayoutClass(codec string) string {
 	default:
 		return ""
 	}
+}
+
+// SubtitleLayoutClass is the deliverable class a codec extracts as ("sup",
+// "ass", "webvtt"), or "" for a codec with no sidecar representation. It is the
+// same narrowing MatchEmbeddedSubtitleTrack applies, exposed so a diagnosis can
+// name the class it was looking for.
+func SubtitleLayoutClass(codec string) string {
+	return subtitleLayoutClass(codec)
+}
+
+// SubtitleLayoutClassInventory counts the live tracks that share codec's
+// extraction class and lists the languages they declare (deduplicated, in live
+// order, "und" for an undeclared one). A probe that found no match uses it to
+// say whether the class is missing entirely or present in other languages —
+// answers that look identical otherwise.
+func SubtitleLayoutClassInventory(codec string, live []models.SubtitleTrack) (count int, languages []string) {
+	class := subtitleLayoutClass(codec)
+	if class == "" {
+		return 0, nil
+	}
+	seen := make(map[string]struct{}, len(live))
+	for _, track := range live {
+		if subtitleLayoutClass(track.Codec) != class {
+			continue
+		}
+		count++
+		language := strings.TrimSpace(track.Language)
+		if language == "" {
+			language = "und"
+		}
+		if _, ok := seen[language]; ok {
+			continue
+		}
+		seen[language] = struct{}{}
+		languages = append(languages, language)
+	}
+	return count, languages
 }
 
 // canonicalSubtitleContainerTrackID mirrors the catalog scanner's container

@@ -9,7 +9,10 @@ import { useMediaQuery } from "@/hooks/useMediaQuery";
 import {
   activityMethodMeta,
   classifyActivityMethod,
+  formatPlaybackPosition,
+  getPlaybackSessionSubtitle,
   getSessionClientLabel,
+  isEpisodeSession,
 } from "@/pages/adminActivityPresentation";
 import type { AdminSession } from "@/api/types";
 import { formatRelativeTime } from "@/lib/date";
@@ -17,6 +20,8 @@ import { cn } from "@/lib/utils";
 import { SectionError } from "../feedback";
 import { useReportCollapsed } from "../widgetChrome";
 import { SessionProfilePill } from "./SessionProfilePill";
+import { useT } from "@/i18n";
+import { getInitial } from "@/lib/text";
 
 /**
  * Most cards the widget mounts at once. The widget shows only what fits, and a
@@ -25,16 +30,15 @@ import { SessionProfilePill } from "./SessionProfilePill";
 const MAX_RENDERED_STREAMS = 40;
 
 /**
- * Cards shown below lg, where dashboard rows size to their content and there is
- * no widget height to fit against (matches the lg rule in app.css).
+ * Cards shown below the dashboard's 12-column layout, where rows size to their
+ * content and there is no widget height to fit against. FIXED_ROWS_QUERY is
+ * that layout's media query on .admin-widget-grid in app.css.
  */
 const STACKED_STREAM_LIMIT = 4;
-const FIXED_ROWS_QUERY = "(min-width: 1024px)";
-
-/** Height kept free under the last visible row for the "+N more" link. */
-const MORE_LINK_HEIGHT_PX = 24;
+const FIXED_ROWS_QUERY = "(min-width: 64rem) and (min-width: 1024px)";
 
 export function NowPlayingWidget() {
+  const t = useT();
   const sessionsQuery = useAdminSessions();
   const sessions = sessionsQuery.data ?? [];
   const fixedRows = useMediaQuery(FIXED_ROWS_QUERY, true);
@@ -50,15 +54,17 @@ export function NowPlayingWidget() {
   if (isIdle) {
     return (
       <div className="flex h-full min-w-0 items-center gap-3">
-        <div className="shrink-0 text-base font-bold">Now Playing</div>
+        <div className="shrink-0 text-base font-bold">
+          {t("web.admin.dashboard.widgets.nowPlaying.title")}
+        </div>
         <div className="text-muted-foreground min-w-0 flex-1 truncate text-sm">
-          Nothing playing right now
+          {t("web.admin.dashboard.widgets.nowPlaying.idle")}
         </div>
         <Link
           to="/admin/activity"
           className="text-muted-foreground hover:text-primary shrink-0 text-[11px] transition-colors"
         >
-          View activity ›
+          {t("web.admin.dashboard.widgets.nowPlaying.viewActivity")}
         </Link>
       </div>
     );
@@ -67,27 +73,37 @@ export function NowPlayingWidget() {
   return (
     <div className="flex h-full flex-col">
       <div className="mb-3 flex shrink-0 items-center justify-between">
-        <div className="text-base font-bold">Now Playing</div>
+        <div className="text-base font-bold">
+          {t("web.admin.dashboard.widgets.nowPlaying.title")}
+        </div>
         {sessions.length > 0 && (
           <Link
             to="/admin/activity"
             className="text-muted-foreground hover:text-primary text-[11px] transition-colors"
           >
-            View all {sessions.length} streams ›
+            {t("web.admin.dashboard.widgets.nowPlaying.viewAll", {
+              count: sessions.length,
+              count_text: sessions.length,
+            })}
           </Link>
         )}
       </div>
-      {/* The widget shows as many whole cards as its height allows; the rest
-          are counted in the "+N more" link instead of half-drawn at the edge. */}
-      <div ref={setViewport} className="relative min-h-0 flex-1 overflow-hidden">
+      {/* The widget shows as many whole cards as its height allows instead of
+          half-drawing one at the edge; the header's "View all" link counts
+          every stream.
+          Cards pair up only when the widget itself is wide enough for two, so a
+          half-width widget shows one full-width card per row. The viewport
+          stays positioned so it is the cards' offsetParent: the fit compares
+          their offsetTop with its height. */}
+      <div ref={setViewport} className="@container relative min-h-0 flex-1 overflow-hidden">
         {sessionsQuery.isLoading ? (
-          <div className="grid grid-cols-1 gap-3.5 lg:grid-cols-2">
+          <div className="grid grid-cols-1 gap-3.5 @2xl:grid-cols-2">
             {Array.from({ length: 2 }).map((_, i) => (
               <Skeleton key={i} className="h-[120px] rounded-2xl" />
             ))}
           </div>
         ) : sessionsQuery.error ? (
-          <SectionError message="Failed to load streams." />
+          <SectionError message={t("web.admin.dashboard.widgets.nowPlaying.loadFailed")} />
         ) : (
           /* The empty case never reaches here — it returned the collapsed strip
              above — so this branch always has at least one stream to show. */
@@ -96,7 +112,7 @@ export function NowPlayingWidget() {
                 height. Rows stay sized to their own cards: auto-rows-fr would
                 size every row to the tallest card, hidden ones included, and
                 one wrapped hidden card would push rows out of the fit. */}
-            <div ref={setGrid} className="grid grid-cols-1 gap-3.5 lg:grid-cols-2">
+            <div ref={setGrid} className="grid grid-cols-1 gap-3.5 @2xl:grid-cols-2">
               {rendered.map((session, index) => {
                 // Cards past the fit stay laid out, so a taller widget can
                 // measure them, but are hidden from sight, focus, and readers.
@@ -113,19 +129,6 @@ export function NowPlayingWidget() {
                 );
               })}
             </div>
-            {sessions.length > visibleCount && (
-              <Link
-                to="/admin/activity"
-                className={cn(
-                  "text-muted-foreground hover:text-primary block text-center text-[12px] leading-6 transition-colors",
-                  // In a fixed-height widget the link sits in the strip the
-                  // fit leaves free; a content-sized one just flows after.
-                  fixedRows ? "absolute inset-x-0 bottom-0" : "mt-1",
-                )}
-              >
-                +{sessions.length - visibleCount} more active streams
-              </Link>
-            )}
           </>
         )}
       </div>
@@ -137,7 +140,7 @@ export function NowPlayingWidget() {
  * How many grid cards fit whole inside the viewport.
  *
  * Card height depends on how its tags wrap and the column count on the
- * breakpoint, so the fit is measured from the laid-out cards rather than
+ * widget's width, so the fit is measured from the laid-out cards rather than
  * derived. Every card stays laid out (hidden ones are only invisible), so the
  * count can grow again when the widget is resized taller.
  *
@@ -163,13 +166,11 @@ function useFittedCardCount(cardCount: number) {
     let next = Number.POSITIVE_INFINITY;
     const last = cards[cards.length - 1];
     if (last && bottomOf(last) > height) {
-      // Not everything fits, so the "+N more" link needs its strip too.
-      const limit = height - MORE_LINK_HEIGHT_PX;
-      // Keep one card even in a widget too short for it: a lone link reads as
-      // an error, and the card clips cleanly at the edge.
+      // Keep one card even in a widget too short for it: an empty widget reads
+      // as an error, and the card clips cleanly at the edge.
       next = Math.max(
         1,
-        cards.findIndex((card) => bottomOf(card) > limit),
+        cards.findIndex((card) => bottomOf(card) > height),
       );
     }
     setVisibleCount(next);
@@ -224,22 +225,30 @@ function useFittedCardCount(cardCount: number) {
 // poster box has a fixed aspect ratio, so the card keeps the height the fit
 // measures either way.
 function StreamCard({ session, showPoster }: { session: AdminSession; showPoster: boolean }) {
-  const isEpisode =
-    session.series_name && session.season_number != null && session.episode_number != null;
+  const t = useT();
+  const isEpisode = isEpisodeSession(session);
+  // The show leads for an episode; the episode line follows it.
   const title = isEpisode
-    ? session.episode_name || `S${session.season_number}E${session.episode_number}`
-    : session.media_title || `File #${session.media_file_id}`;
-  const username = session.username || `User #${session.user_id}`;
+    ? session.series_title
+    : session.media_title ||
+      t("web.admin.dashboard.widgets.nowPlaying.fileFallback", {
+        id: session.media_file_id,
+      });
+  const subtitle = getPlaybackSessionSubtitle(session);
+  const username =
+    session.username ||
+    t("web.admin.dashboard.widgets.nowPlaying.userFallback", { id: session.user_id });
   const elapsed = formatRelativeTime(session.started_at, {
     rounding: "floor",
-    justNowLabel: "Just now",
+    justNowLabel: t("web.admin.dashboard.widgets.nowPlaying.justNow"),
   });
+  const position = formatPlaybackPosition(session);
   const clientLabel = getSessionClientLabel(session);
   const method = classifyActivityMethod(session);
   const methodMeta = activityMethodMeta(method);
 
   return (
-    <div className="surface-panel flex flex-1 gap-3.5 rounded-2xl border-0 p-3.5 transition-colors duration-150">
+    <div className="surface-panel flex min-w-0 flex-1 gap-3.5 rounded-2xl border-0 p-3.5 transition-colors duration-150">
       {/* Poster */}
       <div
         className="bg-surface border-border relative flex w-[60px] flex-shrink-0 items-center justify-center self-start overflow-hidden rounded-lg border"
@@ -254,11 +263,13 @@ function StreamCard({ session, showPoster }: { session: AdminSession; showPoster
         ) : (
           <Play className={`text-primary/40 h-5 w-5 ${session.is_paused ? "opacity-45" : ""}`} />
         )}
+        {/* Icon only: the poster is 58px inside, narrower than the word in
+            most languages, so the word is left to screen readers. */}
         {session.is_paused ? (
           <div className="absolute inset-0 flex items-center justify-center bg-black/35">
-            <div className="border-border/40 bg-background/90 text-foreground inline-flex items-center gap-1 rounded-full border px-2 py-1 text-[10px] font-semibold shadow-sm backdrop-blur">
-              <Pause className="h-3 w-3" />
-              Paused
+            <div className="border-border/40 bg-background/90 text-foreground flex h-6 w-6 items-center justify-center rounded-full border shadow-sm backdrop-blur">
+              <Pause className="h-3 w-3 fill-current" aria-hidden="true" />
+              <span className="sr-only">{t("web.admin.dashboard.widgets.nowPlaying.paused")}</span>
             </div>
           </div>
         ) : null}
@@ -266,45 +277,32 @@ function StreamCard({ session, showPoster }: { session: AdminSession; showPoster
 
       {/* Info */}
       <div className="flex min-w-0 flex-1 flex-col">
-        {isEpisode ? (
-          <>
-            {session.content_id ? (
-              <Link
-                to={`/item/${session.content_id}`}
-                className="hover:text-primary truncate text-sm font-bold transition-colors"
-              >
-                {title}
-              </Link>
-            ) : (
-              <div className="truncate text-sm font-bold">{title}</div>
-            )}
-            <div className="text-muted-foreground mb-1.5 truncate text-xs">
-              S{session.season_number} · E{session.episode_number}
-              {session.series_name ? ` — ${session.series_name}` : ""}
+        <div className="mb-1.5 flex min-w-0 flex-col">
+          {session.media_item_id ? (
+            <Link
+              to={`/item/${session.media_item_id}`}
+              dir="auto"
+              className="bidi-text hover:text-primary truncate text-sm font-bold transition-colors hover:underline"
+            >
+              {title}
+            </Link>
+          ) : (
+            <div dir="auto" className="bidi-text truncate text-sm font-bold">
+              {title}
             </div>
-          </>
-        ) : (
-          <>
-            {session.content_id ? (
-              <Link
-                to={`/item/${session.content_id}`}
-                className="hover:text-primary truncate text-sm font-bold transition-colors"
-              >
-                {title}
-              </Link>
-            ) : (
-              <div className="truncate text-sm font-bold">{title}</div>
-            )}
-            {session.media_type && (
-              <div className="text-muted-foreground mb-1.5 truncate text-xs">
-                {session.media_type === "movie" ? "Movie" : "Series"}
-              </div>
-            )}
-          </>
-        )}
+          )}
+          {subtitle ? (
+            <div className="text-muted-foreground truncate text-xs">{subtitle}</div>
+          ) : null}
+        </div>
 
-        {/* Tags */}
-        <div className="mb-1.5 flex flex-wrap gap-1">
+        {/* Tags. Capped at one line so every card has the same height and
+            the widget's rows stay even: tags that would wrap are clipped
+            whole. The cap is the pills' height: the 0.75rem line height
+            each pill is given here (overriding its own), their 0.25rem of
+            padding, and 2px of border. Keep it in rem so it grows with
+            Text Size. */}
+        <div className="mb-1.5 flex max-h-[calc(1rem+2px)] flex-wrap gap-1 overflow-hidden leading-3 [&>*]:leading-3">
           <span
             className={`inline-flex rounded border px-1.5 py-0.5 text-[9px] font-semibold ${methodMeta.badgeClass}`}
           >
@@ -316,7 +314,9 @@ function StreamCard({ session, showPoster }: { session: AdminSession; showPoster
               title={session.client_user_agent || clientLabel}
               className="border-border/60 bg-muted/30 text-muted-foreground inline-flex max-w-[9rem] rounded border px-1.5 py-0.5 text-[9px] font-semibold"
             >
-              <span className="truncate">{clientLabel}</span>
+              <span dir="auto" className="truncate">
+                {clientLabel}
+              </span>
             </span>
           ) : null}
           <PlaybackRouteBadges session={session} />
@@ -325,16 +325,23 @@ function StreamCard({ session, showPoster }: { session: AdminSession; showPoster
           )}
         </div>
 
-        {/* User */}
+        {/* User. One line at every width, so the card never grows taller:
+            the name truncates and the times keep their full width. */}
         <div className="mt-auto flex items-center gap-1.5">
           <div
             className="text-primary-foreground flex h-[22px] w-[22px] shrink-0 items-center justify-center rounded-full text-[9px] font-bold"
             style={{ background: `var(--primary)` }}
           >
-            {username.charAt(0).toUpperCase()}
+            {getInitial(username)}
           </div>
-          <span className="min-w-0 truncate text-xs font-medium">{username}</span>
-          <span className="text-muted-foreground ml-auto shrink-0 text-[10px]">{elapsed}</span>
+          <span dir="auto" className="min-w-0 truncate text-xs font-medium">
+            {username}
+          </span>
+          <span className="text-muted-foreground ms-auto shrink-0 text-[10px] whitespace-nowrap">
+            <span className="tabular-nums">{position}</span>
+            {/* eslint-disable-next-line formatjs/no-literal-string-in-jsx -- punctuation separating two already-formatted times */}
+            <span> · {elapsed}</span>
+          </span>
         </div>
       </div>
     </div>

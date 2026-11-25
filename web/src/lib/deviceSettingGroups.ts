@@ -1,3 +1,4 @@
+import { t, type MessageKey } from "@/i18n";
 import { SETTING_DEFINITIONS, type SettingKey } from "@/lib/settingsContract";
 import { ALL_DEVICE_SETTING_KEYS } from "@/lib/settingsDisplay";
 
@@ -24,12 +25,27 @@ export interface DeviceSettingGroup {
   keys: SettingKey[];
 }
 
-const GROUP_META: Record<DeviceSettingGroupId, { title: string; description: string }> = {
-  picture: { title: "Picture", description: "How video looks on this device" },
-  sound: { title: "Sound", description: "Audio on this device" },
-  subtitles: { title: "Subtitles", description: "On this device" },
-  episodes: { title: "Episodes", description: "What happens between episodes" },
-  appearance: { title: "Appearance", description: "How titles look on this device" },
+const GROUP_META: Record<DeviceSettingGroupId, { title: MessageKey; description: MessageKey }> = {
+  picture: {
+    title: "web.settings.deviceGroups.picture.title",
+    description: "web.settings.deviceGroups.picture.description",
+  },
+  sound: {
+    title: "web.settings.deviceGroups.sound.title",
+    description: "web.settings.deviceGroups.sound.description",
+  },
+  subtitles: {
+    title: "web.settings.deviceGroups.subtitles.title",
+    description: "web.settings.deviceGroups.subtitles.description",
+  },
+  episodes: {
+    title: "web.settings.deviceGroups.episodes.title",
+    description: "web.settings.deviceGroups.episodes.description",
+  },
+  appearance: {
+    title: "web.settings.deviceGroups.appearance.title",
+    description: "web.settings.deviceGroups.appearance.description",
+  },
 };
 
 const GROUP_ORDER: DeviceSettingGroupId[] = [
@@ -58,7 +74,6 @@ const EXPLICIT_GROUPS: Partial<Record<string, DeviceSettingGroupId>> = {
   "playback.auto_skip_credits": "episodes",
   "playback.auto_skip_recap": "episodes",
   "playback.auto_play_next": "episodes",
-  "playback.auto_play_next_preview": "episodes",
   "playback.next_up_prompt_seconds": "episodes",
   "player.hdr_enabled": "picture",
   "player.dolby_vision_enabled": "picture",
@@ -81,8 +96,12 @@ const EXPLICIT_GROUPS: Partial<Record<string, DeviceSettingGroupId>> = {
  * and Navigation & Cards screens, which already edit them at profile scope; showing them here would
  * give one setting two homes. `ui.library_page_state` is remembered browse
  * state rather than a preference — it has no control in the manifest at all.
+ * `playback.auto_play_next_preview` has no effect in any player, so a control
+ * here would save a choice that changes nothing.
  */
 const HIDDEN_KEYS = new Set<string>([
+  "playback.auto_play_next_preview",
+  "ui.app_language",
   "ui.theme",
   "ui.text_scale",
   "ui.text_weight",
@@ -228,8 +247,8 @@ export function groupDeviceSettings(
 
   return GROUP_ORDER.filter((id) => (byGroup.get(id)?.length ?? 0) > 0).map((id) => ({
     id,
-    title: GROUP_META[id].title,
-    description: GROUP_META[id].description,
+    title: t(GROUP_META[id].title),
+    description: t(GROUP_META[id].description),
     keys: byGroup.get(id) ?? [],
   }));
 }

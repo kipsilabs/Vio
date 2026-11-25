@@ -19,6 +19,7 @@ import type {
   UpdateLibraryCollectionRequest,
 } from "@/api/types";
 import { requiredETag } from "@/api/v2/etag";
+import { t } from "@/i18n";
 import { adminJobFromV2 } from "@/api/v2/libraries";
 import { v2, V2ProblemError } from "@/api/v2/request";
 import { useAdminTaskJobs } from "@/hooks/queries/admin/taskJobs";
@@ -280,10 +281,12 @@ export function useQueueCollectionTemplateBundleApply() {
     },
     onError: (error) => {
       if (error instanceof V2ProblemError && error.status === 409) {
-        toast.error("A starter pack is already being added. Try again when it finishes.");
+        toast.error(t("web.admin.collections.starterPack.alreadyAdding"));
         return;
       }
-      toast.error(error instanceof Error ? error.message : "Couldn't add the starter pack");
+      toast.error(
+        error instanceof Error ? error.message : t("web.admin.collections.starterPack.addFailed"),
+      );
     },
   });
 }
@@ -340,7 +343,9 @@ export function useSetAdminCollectionVisibility() {
     mutationFn: ({ id, visible }: { id: string; visible: boolean }) =>
       patchAdminCollectionField(id, { visibility: visible ? "visible" : "hidden" }),
     onError: (error) => {
-      toast.error(SERVER_SCOPE.errorMessage(error, "Couldn't change it"));
+      toast.error(
+        SERVER_SCOPE.errorMessage(error, t("web.admin.collections.visibility.changeFailed")),
+      );
     },
     onSettled: () => SERVER_SCOPE.invalidate(queryClient),
   });
@@ -355,7 +360,12 @@ export function useSetAdminCollectionPin() {
       patchAdminCollectionField(id, { featured: pinned }),
     onError: (error, { pinned }) => {
       toast.error(
-        SERVER_SCOPE.errorMessage(error, pinned ? "Couldn't pin it" : "Couldn't unpin it"),
+        SERVER_SCOPE.errorMessage(
+          error,
+          pinned
+            ? t("web.admin.collections.pin.pinFailed")
+            : t("web.admin.collections.pin.unpinFailed"),
+        ),
       );
     },
     onSettled: () => SERVER_SCOPE.invalidate(queryClient),
@@ -379,7 +389,9 @@ export function useDeleteAdminCollections() {
             headers: { "If-Match": requiredETag(snapshots.find((entry) => entry.id === id)?.etag) },
           }).catch((error) => {
             if (error instanceof V2ProblemError && error.status === 412)
-              throw new Error(adminMutationMessage(error, "Failed to delete"));
+              throw new Error(
+                adminMutationMessage(error, t("web.admin.collections.bulkDelete.failedFallback")),
+              );
             throw error;
           }),
         (error) => {
@@ -395,22 +407,38 @@ export function useDeleteAdminCollections() {
         setProgress,
       ),
     onSuccess: async ({ requested, deleted, kept, failed, firstError }) => {
-      const keptDescription = `Kept ${kept} collection${kept === 1 ? "" : "s"} in use by home or library sections`;
+      const keptDescription = t("web.admin.collections.bulkDelete.kept", {
+        count: kept,
+        count_text: kept,
+      });
+      const deletedTitle = t("web.admin.collections.bulkDelete.deleted", {
+        count: deleted,
+        count_text: deleted,
+      });
 
       if (failed === 0 && kept === 0) {
-        toast.success(`Deleted ${deleted} collection${deleted === 1 ? "" : "s"}`);
+        toast.success(deletedTitle);
       } else if (failed === 0) {
-        toast.warning(`Deleted ${deleted} collection${deleted === 1 ? "" : "s"}`, {
-          description: keptDescription,
-        });
+        toast.warning(deletedTitle, { description: keptDescription });
       } else if (deleted > 0 || kept > 0) {
-        toast.warning(`Deleted ${deleted} of ${requested} collections`, {
-          description: [kept > 0 ? keptDescription : "", firstError].filter(Boolean).join(". "),
-        });
+        toast.warning(
+          t("web.admin.collections.bulkDelete.partial", {
+            count: requested,
+            done_text: deleted,
+            count_text: requested,
+          }),
+          {
+            description: [kept > 0 ? keptDescription : "", firstError].filter(Boolean).join(". "),
+          },
+        );
       } else {
-        toast.error(`Failed to delete ${failed} collection${failed === 1 ? "" : "s"}`, {
-          description: firstError,
-        });
+        toast.error(
+          t("web.admin.collections.bulkDelete.failed", {
+            count: failed,
+            count_text: failed,
+          }),
+          { description: firstError },
+        );
       }
       await invalidateAdminCollectionQueries(queryClient);
     },

@@ -214,7 +214,7 @@ func (h *AdminServerChannelsHandler) HandleRotateSecret(w http.ResponseWriter, r
 		writeError(w, http.StatusServiceUnavailable, "unavailable", "Server channels are not available")
 		return
 	}
-	signingSecret, err := service.RotateSecret(r.Context(), chi.URLParam(r, "id"))
+	signingSecret, err := service.RotateSecretV2(r.Context(), chi.URLParam(r, "id"))
 	if err != nil {
 		writeServerChannelError(w, err)
 		return

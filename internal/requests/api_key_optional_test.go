@@ -27,16 +27,25 @@ func TestCreateRequestAutoApprovalSendsToKeyOptionalRouter(t *testing.T) {
 	service := newTestService(store)
 	router := &fakeRouterProvider{keyOptional: map[int]bool{1: true}}
 	service.SetRouterProvider(router)
+	work := &deferredEnrichment{}
+	service.asyncWork = work.schedule
 
 	req, err := service.CreateRequest(context.Background(), testViewer(1), fightClubInput)
 	if err != nil {
 		t.Fatalf("CreateRequest returned error: %v", err)
 	}
+	if req.Status != StatusApproved || req.LastError != "" {
+		t.Fatalf("request = %+v, want it approved before the deferred submission", req)
+	}
+	if router.fulfillCalls != 0 {
+		t.Fatalf("fulfill calls = %d, want none before the deferred submission", router.fulfillCalls)
+	}
+	work.drain()
 	if router.fulfillCalls != 1 || len(router.gotConns) != 1 || router.gotConns[0].ID != "router-1" || router.gotConns[0].APIKey != "" {
 		t.Fatalf("fulfill calls = %d, connections = %+v; want one call to router-1 without a key", router.fulfillCalls, router.gotConns)
 	}
-	if req.Status == StatusApproved || req.LastError != "" {
-		t.Fatalf("request = %+v, want it sent to the router", req)
+	if got := store.requests[req.ID]; got.Status == StatusApproved || got.LastError != "" {
+		t.Fatalf("stored request = %+v, want it sent to the router", got)
 	}
 }
 
@@ -155,57 +164,6 @@ func TestUpdateIntegrationAddressChangeNeedsKeyOnlyWhenOneIsSaved(t *testing.T) 
 			}
 			if err != nil || router.validateCalls != 1 {
 				t.Fatalf("err = %v, validate calls = %d; want the change validated by the plugin", err, router.validateCalls)
-			}
-		})
-	}
-}
-
-// A blank URL in a connection test of a saved server is tested as blank when
-// its router declares base_url_optional. For any other router it still stands
-// for the saved address, and so does a URL a connection test leaves out. A
-// save validates the blank URL it stores, whatever the router declares, so the
-// plugin can refuse an address it can't use.
-func TestClearedURLIsTestedAndValidatedAsBlankForURLOptionalRouter(t *testing.T) {
-	for _, tc := range []struct {
-		name        string
-		urlOptional bool
-		want        string
-	}{
-		{"router needs no URL", true, ""},
-		{"router needs a URL", false, "http://router-1.local"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			store := newFakeStore()
-			store.integrations = []Integration{keylessRouterInst("router-1")}
-			router := &fakeRouterProvider{keyOptional: map[int]bool{1: true}, urlOptional: map[int]bool{1: tc.urlOptional}}
-			service := newTestService(store)
-			service.SetRouterProvider(router)
-			admin := Viewer{UserID: 1, IsAdmin: true}
-
-			if _, err := service.LoadIntegrationOptions(context.Background(), admin, Integration{ID: "router-1"}); err != nil {
-				t.Fatalf("LoadIntegrationOptions without a URL: %v", err)
-			}
-			if router.gotOptionsConn.BaseURL != "http://router-1.local" {
-				t.Fatalf("probed address without a URL = %q, want the saved one", router.gotOptionsConn.BaseURL)
-			}
-			if _, err := service.LoadIntegrationOptions(context.Background(), admin, Integration{ID: "router-1", BaseURLCleared: true}); err != nil {
-				t.Fatalf("LoadIntegrationOptions with a cleared URL: %v", err)
-			}
-			if router.gotOptionsConn.BaseURL != tc.want {
-				t.Fatalf("probed address with a cleared URL = %q, want %q", router.gotOptionsConn.BaseURL, tc.want)
-			}
-			install := 1
-			if _, err := service.UpdateIntegration(context.Background(), admin, Integration{
-				ID: "router-1", Name: "router-1", Enabled: true, CapabilityID: "arr", InstallationID: &install,
-			}); err != nil {
-				t.Fatalf("UpdateIntegration: %v", err)
-			}
-			stored, err := store.GetIntegration(context.Background(), "router-1")
-			if err != nil {
-				t.Fatalf("GetIntegration: %v", err)
-			}
-			if router.gotValidateConn.BaseURL != "" || stored.BaseURL != "" {
-				t.Fatalf("validated address = %q, stored address = %q; want the blank address validated and stored", router.gotValidateConn.BaseURL, stored.BaseURL)
 			}
 		})
 	}

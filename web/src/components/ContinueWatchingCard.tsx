@@ -1,8 +1,9 @@
 import ViewTransitionLink from "@/components/ViewTransitionLink";
 import { BookOpen, Play } from "lucide-react";
-import { memo, useCallback, useRef } from "react";
+import { Children, memo, useCallback, useRef } from "react";
 import { useLocation } from "react-router";
 import type { ItemDetail, SectionItem } from "@/api/types";
+import { homeDismissalForCard } from "@/hooks/queries/homeDismissals";
 import type { ProgressListEntry } from "@/hooks/queries/progress";
 import MediaItemMenu from "@/components/MediaItemMenu";
 import CardOverlays from "@/components/overlays/CardOverlays";
@@ -19,6 +20,7 @@ import CardPlayOverlay from "@/components/CardPlayOverlay";
 import type { CardQuickActionMode } from "@/lib/cardQuickActions";
 import { isEpisodeStill, isEpisodeUnwatched, SPOILER_IMAGE_CLASS } from "@/lib/episodeSpoilers";
 import { cn } from "@/lib/utils";
+import { useAppLanguage, useT } from "@/i18n";
 
 type ContinueWatchingCardProps = (
   | {
@@ -63,6 +65,9 @@ export const ContinueWatchingRowCard = memo(function ContinueWatchingRowCard(
 });
 
 function ContinueWatchingCardView({ spoilerPrefs, ...props }: ContinueWatchingCardViewProps) {
+  const t = useT();
+  // The audiobook time left and the badge come from plain helpers; follow language changes.
+  useAppLanguage();
   const location = useLocation();
   const playbackController = useWatchPlaybackController();
   const { cardPresentation } = useUICustomization();
@@ -121,23 +126,7 @@ function ContinueWatchingCardView({ spoilerPrefs, ...props }: ContinueWatchingCa
   const isNextUp = "sectionItem" in props && props.sectionItem?.item_source === "next_up";
   const dismissAction =
     "sectionItem" in props && props.sectionItem
-      ? props.sectionItem.item_source === "next_up"
-        ? props.sectionItem.series_id
-          ? {
-              itemId: props.sectionItem.content_id,
-              surface: "next_up" as const,
-              mediaType: props.sectionItem.type,
-              seriesId: props.sectionItem.series_id,
-            }
-          : undefined
-        : props.sectionItem.progress_updated_at
-          ? {
-              itemId: props.sectionItem.content_id,
-              surface: "continue_watching" as const,
-              mediaType: props.sectionItem.type,
-              progressUpdatedAt: props.sectionItem.progress_updated_at,
-            }
-          : undefined
+      ? homeDismissalForCard(props.sectionItem)
       : {
           itemId: props.detail.content_id,
           surface: "continue_watching" as const,
@@ -156,7 +145,7 @@ function ContinueWatchingCardView({ spoilerPrefs, ...props }: ContinueWatchingCa
   const isMangaChapter = card.type === "ebook" && !!card.seriesId && !!card.seriesTitle;
   const headingIsSeries = (hasEpisodeMeta && !!card.seriesTitle) || isMangaChapter;
   const heading = headingIsSeries ? card.seriesTitle : card.title;
-  const playTitle = heading ?? card.title ?? "item";
+  const playTitle = heading ?? card.title ?? t("web.home.continueWatching.fallbackTitle");
   // The heading shows the series title for episodes, so it should navigate to
   // the series page; everything else heads to the item's own page.
   const headingHref =
@@ -166,15 +155,23 @@ function ContinueWatchingCardView({ spoilerPrefs, ...props }: ContinueWatchingCa
   // Detail-page link target for the card's image and meta lines: manga
   // chapters head to the series page like the heading does.
   const detailHref = isMangaChapter ? headingHref : card.itemHref;
-  const episodeLabel = hasEpisodeMeta
-    ? `Season ${card.seasonNumber} Episode ${card.episodeNumber}`
-    : null;
+  const episodeNumbers = { season: card.seasonNumber, episode: card.episodeNumber };
+  // The episode or chapter title is cut in its own box, in its own direction,
+  // so an English title after Arabic words keeps its start.
+  const episodeTitle = card.title ? (
+    <span dir="auto" className="bidi-text max-w-max grow basis-[2.5em] truncate">
+      {card.title}
+    </span>
+  ) : null;
   const episodeMeta = hasEpisodeMeta
     ? card.seriesTitle && card.title
-      ? `${episodeLabel} • ${card.title}`
-      : episodeLabel
+      ? t("web.home.continueWatching.episodeLabelWithTitle", {
+          ...episodeNumbers,
+          title: episodeTitle,
+        })
+      : t("web.home.continueWatching.episodeLabel", episodeNumbers)
     : isMangaChapter
-      ? card.title
+      ? episodeTitle
       : null;
   const premiereBadge =
     "sectionItem" in props && props.sectionItem
@@ -183,13 +180,17 @@ function ContinueWatchingCardView({ spoilerPrefs, ...props }: ContinueWatchingCa
   const timeLeftLabel = isNextUp
     ? premiereBadge
       ? null
-      : "Next Episode"
+      : t("web.home.continueWatching.nextEpisode")
     : card.type === "ebook"
-      ? `${Math.round(Math.min(Math.max(progressPercent, 0), 100))}% read`
+      ? t("web.home.continueWatching.percentRead", {
+          percent: Math.round(Math.min(Math.max(progressPercent, 0), 100)),
+        })
       : card.durationSeconds > 0
         ? card.type === "audiobook"
           ? formatListeningTimeLeft(card.positionSeconds, card.durationSeconds)
-          : `${Math.round((card.durationSeconds - card.positionSeconds) / 60)} min left`
+          : t("web.home.continueWatching.minutesLeft", {
+              minutes: Math.round((card.durationSeconds - card.positionSeconds) / 60),
+            })
         : "\u00A0";
   const handleWatchClick = useCallback(
     (event: React.MouseEvent<HTMLAnchorElement>) => {
@@ -277,7 +278,7 @@ function ContinueWatchingCardView({ spoilerPrefs, ...props }: ContinueWatchingCa
               />
             ) : (
               <div className="text-muted-foreground bg-surface flex h-full w-full items-center justify-center text-sm">
-                No Image
+                {t("web.home.continueWatching.noImage")}
               </div>
             )}
 
@@ -319,12 +320,18 @@ function ContinueWatchingCardView({ spoilerPrefs, ...props }: ContinueWatchingCa
           <ViewTransitionLink
             to={card.watchHref}
             onClick={handleWatchClick}
-            aria-label={`${card.type === "ebook" ? "Read" : "Play"} ${heading}`}
+            aria-label={t(
+              card.type === "ebook"
+                ? "web.home.continueWatching.readTitle"
+                : "web.home.continueWatching.playTitle",
+              { title: String(heading) },
+            )}
             className="media-card-play-trigger bg-primary text-primary-foreground absolute top-1/2 left-1/2 flex h-11 w-11 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full shadow-lg transition-all duration-200 hover:scale-110 hover:shadow-xl hover:brightness-110 active:scale-95"
           >
             {card.type === "ebook" ? (
               <BookOpen className="h-5 w-5" />
             ) : (
+              // eslint-disable-next-line silo/no-physical-direction -- centres the play triangle, which doesn't mirror
               <Play className="ml-0.5 h-5 w-5" fill="currentColor" />
             )}
           </ViewTransitionLink>
@@ -360,16 +367,29 @@ function ContinueWatchingCardView({ spoilerPrefs, ...props }: ContinueWatchingCa
       <div className="px-0.5 pt-2.5">
         <ViewTransitionLink
           to={headingHref}
-          className="block truncate text-[0.8125rem] font-semibold hover:underline"
+          dir="auto"
+          className="bidi-text block truncate text-[0.8125rem] font-semibold hover:underline"
         >
           {heading}
         </ViewTransitionLink>
         {episodeMeta && (
           <ViewTransitionLink
             to={isMangaChapter ? card.watchHref : card.itemHref}
-            className="text-muted-foreground block truncate text-xs hover:underline"
+            className="text-muted-foreground flex flex-wrap overflow-hidden text-xs hover:underline"
           >
-            {episodeMeta}
+            {/* The words around the title keep their width and are cut only
+                when they alone fill the line. The title takes what's left, up
+                to its own width, and moves to a second line when not even its
+                first letter and "…" fit. pre keeps the space before it. */}
+            {Children.map(episodeMeta, (part) =>
+              typeof part === "string" ? (
+                <span className="max-w-full shrink-0 overflow-hidden text-ellipsis whitespace-pre">
+                  {part}
+                </span>
+              ) : (
+                part
+              ),
+            )}
           </ViewTransitionLink>
         )}
         {(timeLeftLabel || premiereBadge) && (

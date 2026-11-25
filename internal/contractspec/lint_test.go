@@ -265,6 +265,46 @@ func TestLintSeededFailures(t *testing.T) {
 			},
 			want: "components.schemas.AdminItemMetadataUpdate.release_date: declares its shape; delete its shapePending entry",
 		},
+		"nullable enum without null": {
+			seed: func(doc map[string]any) {
+				props := schemas(doc)["SystemInfo"].(map[string]any)["properties"].(map[string]any)
+				props["mode"] = map[string]any{"type": []any{"string", "null"}, "enum": []any{"a", "b"}}
+			},
+			want: "components.schemas.SystemInfo.mode: nullable enum does not list null",
+		},
+		"nullable enum without null in a oneOf branch": {
+			seed: func(doc map[string]any) {
+				props := schemas(doc)["SystemInfo"].(map[string]any)["properties"].(map[string]any)
+				props["mode"] = map[string]any{"oneOf": []any{map[string]any{"type": "integer"}, map[string]any{"type": []any{"string", "null"}, "enum": []any{"a"}}}}
+			},
+			want: "components.schemas.SystemInfo.mode.oneOf[1]: nullable enum does not list null",
+		},
+		"nullable enum without null in a typed map value": {
+			seed: func(doc map[string]any) {
+				props := schemas(doc)["SystemInfo"].(map[string]any)["properties"].(map[string]any)
+				props["modes"] = map[string]any{"type": "object", "additionalProperties": map[string]any{"type": []any{"string", "null"}, "enum": []any{"a"}}}
+			},
+			want: "components.schemas.SystemInfo.modes.additionalProperties: nullable enum does not list null",
+		},
+		"oneOf variants that share a tag value": {
+			seed: func(doc map[string]any) {
+				// state is disjoint but optional, so it can't tell the variants apart.
+				variant := func(state string, kinds ...any) map[string]any {
+					return map[string]any{"type": "object", "required": []any{"kind"}, "properties": map[string]any{
+						"kind":  map[string]any{"type": "string", "enum": kinds},
+						"state": map[string]any{"type": "string", "enum": []any{state}},
+					}}
+				}
+				schemas(doc)["PathDefault"] = variant("idle", "default", "provider")
+				schemas(doc)["PathProvider"] = variant("connected", "provider")
+				props := schemas(doc)["SystemInfo"].(map[string]any)["properties"].(map[string]any)
+				props["path"] = map[string]any{"oneOf": []any{
+					map[string]any{"$ref": "#/components/schemas/PathDefault"},
+					map[string]any{"$ref": "#/components/schemas/PathProvider"},
+				}}
+			},
+			want: "components.schemas.SystemInfo.path: oneOf variants share values of every tag (kind), so a response can match more than one",
+		},
 		"missing security scheme": {
 			seed: func(doc map[string]any) { delete(doc["components"].(map[string]any), "securitySchemes") },
 			want: "components.securitySchemes.bearerAuth is missing",

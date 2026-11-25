@@ -14,9 +14,11 @@ import type { BrowseItem } from "@/api/types";
 import ItemCard from "./ItemCard";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useGridLayout } from "@/hooks/useGridLayout";
+import { useT } from "@/i18n";
 import { useMediaQuery } from "@/hooks/useMediaQuery";
 import { useOverlayPrefs } from "@/hooks/useOverlayPrefs";
 import { useUICustomization } from "@/hooks/useUICustomization";
+import { cn } from "@/lib/utils";
 import { CARD_TEXT_AREA_HEIGHT, cardGridClasses } from "@/lib/uiCustomization";
 import {
   awaitingGridRestore,
@@ -41,6 +43,11 @@ interface SharedItemGridProps {
   gridRef?: Ref<ItemGridHandle>;
   /** The first and last item index of the top row the viewer can see. */
   onTopRowChange?: (firstIndex: number, lastIndex: number) => void;
+  /**
+   * The poster shape the grid's items use. Rows are sized for it, so a grid of
+   * square audiobook covers doesn't reserve 2:3 poster height under each row.
+   */
+  posterAspect?: "portrait" | "square";
 }
 
 export interface ItemGridHandle {
@@ -50,9 +57,10 @@ export interface ItemGridHandle {
 
 /**
  * How much of the top of the viewport sticky page headers cover once stuck:
- * the mobile top bar, or the library header on wide screens. Headers opt in
- * with `data-sticky-header`; one that is hidden or scrolls with the page at
- * the current width covers nothing.
+ * the mobile top bar, or the library header on wide screens, and the
+ * impersonation banner above them. Headers opt in with `data-sticky-header`;
+ * one that is hidden or scrolls with the page at the current width covers
+ * nothing.
  */
 function stickyHeaderInset(): number {
   let inset = 0;
@@ -135,6 +143,7 @@ function hasStaticItems(props: ItemGridProps): props is StaticItemGridProps {
 }
 
 export default function ItemGrid(props: ItemGridProps) {
+  const t = useT();
   const {
     loading,
     sortField,
@@ -146,11 +155,13 @@ export default function ItemGrid(props: ItemGridProps) {
     emptyState,
     gridRef,
     onTopRowChange,
+    posterAspect = "portrait",
   } = props;
   const { prefs: overlayPrefs, quickActionMode } = useOverlayPrefs();
   const { cardPresentation } = useUICustomization();
   const gridGap = cardPresentation.poster_size === "large" ? 16 : 12;
   const gridClasses = cardGridClasses(cardPresentation.poster_size);
+  const skeletonAspect = posterAspect === "square" ? "aspect-square" : "aspect-[2/3]";
   const totalItems = hasStaticItems(props) ? props.items.length : props.totalItems;
   const pages = hasStaticItems(props)
     ? new Map<number, BrowseItem[]>([[0, props.items]])
@@ -160,6 +171,7 @@ export default function ItemGrid(props: ItemGridProps) {
   const { containerRef, layout } = useGridLayout({
     gap: gridGap,
     textAreaHeight: CARD_TEXT_AREA_HEIGHT,
+    posterRatio: posterAspect === "square" ? 1 : 1.5,
     layoutKey: cardPresentation.poster_size,
   });
   const [anchorEl, setAnchorEl] = useState<HTMLDivElement | null>(null);
@@ -222,6 +234,7 @@ export default function ItemGrid(props: ItemGridProps) {
     windowed: boolean;
   } | null>(null);
 
+  const attachedRef = useRef(false);
   const virtualizer = useWindowVirtualizer({
     count: windowRows,
     estimateSize: () => rowHeight,
@@ -231,6 +244,15 @@ export default function ItemGrid(props: ItemGridProps) {
     // next scroll event, a frame later; a moved row window has to draw the
     // rows it scrolled to in the same frame (see the window scroll below).
     scrollToFn: (offset, options, instance) => {
+      // On attach the virtualizer scrolls back to the offset it read while
+      // rendering, which is still the previous page's. By then the window is
+      // where the route left it (the top of a new page, or a Back restore),
+      // so take that instead.
+      if (!attachedRef.current) {
+        attachedRef.current = true;
+        instance.scrollOffset = window.scrollY;
+        return;
+      }
       windowScroll(offset, options, instance);
       instance.scrollOffset = window.scrollY;
     },
@@ -630,14 +652,16 @@ export default function ItemGrid(props: ItemGridProps) {
         <div ref={containerRef} role="list" className={gridClasses}>
           {Array.from({ length: 24 }).map((_, i) => (
             <div key={i} role="listitem">
-              <Skeleton className="aspect-[2/3] rounded-lg" />
+              <Skeleton className={cn(skeletonAspect, "rounded-lg")} />
               <Skeleton className="mt-2 h-4 w-3/4" />
             </div>
           ))}
         </div>
       ) : totalItems === 0 ? (
         (emptyState ?? (
-          <div className="text-muted-foreground py-12 text-center">No items found.</div>
+          <div className="text-muted-foreground py-12 text-center">
+            {t("web.catalog.grid.noItems")}
+          </div>
         ))
       ) : (
         <div
@@ -679,7 +703,7 @@ export default function ItemGrid(props: ItemGridProps) {
                 if (!item) {
                   cells.push(
                     <div key={`skeleton-${globalIndex}`} role="listitem">
-                      <Skeleton className="aspect-[2/3] rounded-lg" />
+                      <Skeleton className={cn(skeletonAspect, "rounded-lg")} />
                       <Skeleton className="mt-2 h-4 w-3/4" />
                     </div>,
                   );

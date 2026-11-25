@@ -160,6 +160,56 @@ func TestPlaybackV2ProgressAndStop(t *testing.T) {
 	requireProblem(t, do(t, h, http.MethodDelete, Prefix+"/playback/session-1", playbackJSON(t, stopBody), viewerHeaders()), TypeValidationFailed)
 }
 
+// The v2 start body declares five fields the frozen /api/v1 bridge unmarshals
+// straight into the planner, and domain() dropped all of them. file_selection is
+// the sharpest: an explicit version pick silently became auto on /api/v2, which
+// re-armed cross-version substitution, decode rotation and the retry of a
+// candidate the catalog had marked failed. This pins the projection at the wire,
+// where the field can be lost, not just the DTO.
+func TestPlaybackStartV2CarriesEveryDeclaredBodyField(t *testing.T) {
+	deps, _ := catalogDeps(t)
+	fake := &fakePlaybackService{}
+	deps.Playback = fake
+	h := newTestHandler(t, deps)
+
+	body := playbackStartFixture(t)
+	body["file_selection"] = string(playback.FileSelectionExplicitV3)
+	body["force_relink"] = true
+	body["offered_virtual_uri"] = "virtual://movie/tt-w1?result=cand-a"
+	body["previous_playback_attempt_id"] = "previous-attempt-0001"
+	body["carried_audio_track_id"] = "42:audio:1"
+	response := do(t, h, http.MethodPost, Prefix+"/playback/start", playbackJSON(t, body), viewerHeaders())
+	if response.Code != http.StatusCreated {
+		t.Fatalf("start: %d %s", response.Code, response.Body.String())
+	}
+	got := fake.request
+	if got.FileSelection != playback.FileSelectionExplicitV3 {
+		t.Fatalf("file_selection = %q, want explicit: an explicit pick must reach the planner", got.FileSelection)
+	}
+	if !got.ForceRelink {
+		t.Fatal("force_relink did not reach the planner")
+	}
+	if got.OfferedVirtualURI != "virtual://movie/tt-w1?result=cand-a" {
+		t.Fatalf("offered_virtual_uri = %q, want the offered candidate", got.OfferedVirtualURI)
+	}
+	if got.PreviousPlaybackAttemptID != "previous-attempt-0001" {
+		t.Fatalf("previous_playback_attempt_id = %q, want the durable predecessor", got.PreviousPlaybackAttemptID)
+	}
+	if got.CarriedAudioTrackID != "42:audio:1" {
+		t.Fatalf("carried_audio_track_id = %q, want the carried track", got.CarriedAudioTrackID)
+	}
+
+	// A body that names no pick keeps the auto default: the projection must not
+	// manufacture an explicit selection out of an absent field.
+	response = do(t, h, http.MethodPost, Prefix+"/playback/start", playbackJSON(t, playbackStartFixture(t)), viewerHeaders())
+	if response.Code != http.StatusCreated {
+		t.Fatalf("start without a pick: %d %s", response.Code, response.Body.String())
+	}
+	if sel := fake.request.FileSelection; sel == playback.FileSelectionExplicitV3 {
+		t.Fatalf("file_selection = %q for a body without one, want the auto default", sel)
+	}
+}
+
 func TestPlaybackV2ProblemMapping(t *testing.T) {
 	for _, tc := range []struct {
 		err  *handlers.PlaybackOperationError
@@ -182,6 +232,27 @@ func TestPlaybackV2ProblemMapping(t *testing.T) {
 	}
 	if problem := playbackProblem(errors.New("opaque")); problem.Type != TypeDependencyUnavailable.URI() {
 		t.Fatalf("opaque error: %+v", problem)
+	}
+}
+
+// A retryable playback refusal carries the service's Retry-After through to
+// the problem response; the field is additive and absent on ordinary errors.
+func TestPlaybackProblemCarriesRetryAfter(t *testing.T) {
+	problem := playbackProblem(&handlers.PlaybackOperationError{
+		Status:     http.StatusServiceUnavailable,
+		Code:       "dependency_unavailable",
+		Message:    "Playback is temporarily unavailable; retry shortly",
+		RetryAfter: 5,
+	})
+	if problem.Status != http.StatusServiceUnavailable || problem.Type != TypeDependencyUnavailable.URI() {
+		t.Fatalf("problem = %+v", problem)
+	}
+	if got := problem.GetHeaders().Get("Retry-After"); got != "5" {
+		t.Fatalf("Retry-After = %q, want 5", got)
+	}
+	plain := playbackProblem(&handlers.PlaybackOperationError{Status: http.StatusInternalServerError, Code: "internal_error", Message: "failed"})
+	if got := plain.GetHeaders().Get("Retry-After"); got != "" {
+		t.Fatalf("unexpected Retry-After %q on an internal error", got)
 	}
 }
 
@@ -228,6 +299,10 @@ func TestPlaybackV2ProbeURLOrigin(t *testing.T) {
 		{"lan client on its address", "192.168.1.20:8090", "https://public.example.test", nil, netaccess.Path{}, "http://192.168.1.20:8090"},
 		{"proxy rewrote host to an IP", "203.0.113.5:8090", "https://public.example.test/silo/",
 			map[string]string{"X-Forwarded-For": "198.51.100.7"}, netaccess.Path{}, "https://public.example.test/silo"},
+		{"proxy rewrote host, ambiguous forwarded host", "203.0.113.5:8090", "https://public.example.test",
+			map[string]string{"X-Forwarded-Host": "media.example.test, edge.example.test", "X-Forwarded-For": "198.51.100.7"}, netaccess.Path{}, "https://public.example.test"},
+		{"proxy named the IP host it kept", "192.168.1.20:8090", "https://public.example.test",
+			map[string]string{"X-Forwarded-Host": "192.168.1.20:8090", "X-Forwarded-For": "192.168.1.30"}, netaccess.Path{}, "http://192.168.1.20:8090"},
 		{"proxy rewrote host, no public URL", "203.0.113.5:8090", "",
 			map[string]string{"X-Forwarded-For": "198.51.100.7"}, netaccess.Path{}, "http://203.0.113.5:8090"},
 		{"proxy kept a named host", "media.example.test", "https://public.example.test",
@@ -249,7 +324,7 @@ func TestPlaybackV2ProbeURLOrigin(t *testing.T) {
 				r.Header.Set(k, v)
 			}
 			response := httptest.NewRecorder()
-			newTestHandler(t, deps).ServeHTTP(response, r)
+			behindTrustedProxy(t, newTestHandler(t, deps)).ServeHTTP(response, r)
 			var body PlaybackCapabilities
 			if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &body) != nil {
 				t.Fatalf("capabilities: %d %s", response.Code, response.Body.String())

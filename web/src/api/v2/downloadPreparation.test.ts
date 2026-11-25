@@ -173,8 +173,10 @@ describe("createPreparedDownload", () => {
 });
 
 describe("getPreparedDownload", () => {
-  it("reads the single entry by id instead of paging the registry", async () => {
-    const fetch = vi.fn().mockResolvedValue(jsonResponse(entry));
+  it("finds the entry in the registry the server still serves", async () => {
+    const fetch = vi
+      .fn()
+      .mockResolvedValue(jsonResponse({ items: [entry], page: { has_more: false } }));
     vi.stubGlobal("fetch", fetch);
 
     const got = await getPreparedDownload("dl-1");
@@ -182,13 +184,14 @@ describe("getPreparedDownload", () => {
     expect(got).toMatchObject({ id: "dl-1", status: "preparing" });
     expect(fetch).toHaveBeenCalledTimes(1);
     const [url] = fetch.mock.calls[0] as [string];
-    expect(url).toBe("/api/v2/downloads/dl-1");
-    // A registry page would have carried a limit query; a per-entry read does not.
-    expect(url).not.toContain("limit=");
+    expect(url).toContain("/api/v2/downloads");
   });
 
-  it("reports a 404 as a gone entry so the caller stops polling", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(problemResponse(404)));
+  it("reports a row absent from the registry as gone so the caller stops polling", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(jsonResponse({ items: [], page: { has_more: false } })),
+    );
     await expect(getPreparedDownload("dl-1")).resolves.toBeNull();
   });
 

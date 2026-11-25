@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -39,6 +40,9 @@ const (
 	typeString = "string"
 )
 
+// componentSchemas prefixes the location of a component schema in findings.
+const componentSchemas = "components.schemas."
+
 // Lint checks the generated document against the contract's shape rules and
 // returns every violation, sorted, so a report names them all at once. The
 // rules: every operation names a unique lowerCamelCase operationId; every
@@ -47,7 +51,9 @@ const (
 // each status its class implies; non-public operations require the bearer
 // scheme and public ones carry no security; no schema is a free-form object
 // unless it is marked as an extension bag; date, URL, and language or
-// country members declare their shape (lintValueShape).
+// country members declare their shape (lintValueShape); a nullable enum
+// lists null (lintNullableEnum); a oneOf of named variants keeps a tag's
+// values disjoint (lintVariantTags).
 func Lint(doc []byte) []string {
 	var d document
 	if err := json.Unmarshal(doc, &d); err != nil {
@@ -94,8 +100,12 @@ func Lint(doc []byte) []string {
 		if !isPascal(name) {
 			fail("components.schemas.%s: schema name is not PascalCase", name)
 		}
-		lintFreeForm(fail, "components.schemas."+name, d.Components.Schemas[name])
-		lintMemberShapes(fail, "components.schemas."+name, d.Components.Schemas[name])
+		lintFreeForm(fail, componentSchemas+name, d.Components.Schemas[name])
+		lintMemberShapes(fail, componentSchemas+name, d.Components.Schemas[name])
+		walkSchema(componentSchemas+name, d.Components.Schemas[name], func(where string, s *schema) {
+			lintNullableEnum(fail, where, s)
+			lintVariantTags(fail, where, s, d.Components.Schemas)
+		})
 	}
 	if _, ok := d.Components.SecuritySchemes[securityScheme]; !ok {
 		fail("components.securitySchemes.%s is missing", securityScheme)
@@ -334,7 +344,6 @@ var shapePending = map[string]string{
 	"components.schemas.AdminItemMetadataUpdate.first_air_date": pendingItemDates,
 	"components.schemas.AdminItemMetadataUpdate.last_air_date":  pendingItemDates,
 	"components.schemas.AdminItemMetadataUpdate.air_date":       pendingItemDates,
-	"components.schemas.DeviceLoginStart.verification_uri":      "#2917: built from any client's X-Forwarded-Proto when no public URL is set",
 }
 
 const pendingItemDates = "#2810 validates the item metadata dates in the handler"
@@ -357,6 +366,99 @@ func lintMemberShapes(fail func(string, ...any), where string, s *schema) {
 		lintMemberShapes(fail, where+"."+name, member)
 	}
 	lintMemberShapes(fail, where+".items", s.Items)
+}
+
+// walkSchema visits a schema tree through its members, array items, typed
+// map values, and oneOf, anyOf and allOf branches (every place the generator
+// adds null); a $ref is visited as its own component.
+func walkSchema(where string, s *schema, visit func(where string, s *schema)) {
+	if s == nil || s.Ref != "" {
+		return
+	}
+	visit(where, s)
+	for _, name := range sortedKeys(s.Properties) {
+		walkSchema(where+"."+name, s.Properties[name], visit)
+	}
+	walkSchema(where+".items", s.Items, visit)
+	if ap, ok := s.AdditionalProperties.(map[string]any); ok {
+		var value schema
+		if raw, err := json.Marshal(ap); err == nil && json.Unmarshal(raw, &value) == nil {
+			walkSchema(where+".additionalProperties", &value, visit)
+		}
+	}
+	for keyword, branches := range map[string][]*schema{"oneOf": s.OneOf, "anyOf": s.AnyOf, "allOf": s.AllOf} {
+		for i, branch := range branches {
+			walkSchema(fmt.Sprintf("%s.%s[%d]", where, keyword, i), branch, visit)
+		}
+	}
+}
+
+// lintVariantTags requires a oneOf of named variants that share a required
+// enum member (a tag such as kind or status) to keep at least one such tag's
+// values disjoint across the variants. Response variants are additive, so a
+// tag value may be added, but one that another variant already uses makes a
+// response match two variants, and a client dispatching on the tag picks the
+// wrong one.
+func lintVariantTags(fail func(string, ...any), where string, s *schema, components map[string]*schema) {
+	if len(s.OneOf) < 2 {
+		return
+	}
+	var variants []*schema
+	for _, branch := range s.OneOf {
+		v := components[strings.TrimPrefix(branch.Ref, "#/components/schemas/")]
+		if branch.Ref == "" || v == nil {
+			return
+		}
+		variants = append(variants, v)
+	}
+	var tags []string
+	for _, name := range sortedKeys(variants[0].Properties) {
+		shared := true
+		for _, v := range variants {
+			if p := v.Properties[name]; p == nil || len(p.Enum) == 0 || !slices.Contains(v.Required, name) {
+				shared = false
+				break
+			}
+		}
+		if !shared {
+			continue
+		}
+		tags = append(tags, name)
+		seen := map[any]bool{}
+		disjoint := true
+		for _, v := range variants {
+			for _, value := range v.Properties[name].Enum {
+				if value != nil && seen[value] {
+					disjoint = false
+				}
+				seen[value] = true
+			}
+		}
+		if disjoint {
+			return
+		}
+	}
+	if len(tags) > 0 {
+		fail("%s: oneOf variants share values of every tag (%s), so a response can match more than one", where, strings.Join(tags, ", "))
+	}
+}
+
+// lintNullableEnum requires a nullable schema with an enum to list null in
+// it: JSON Schema applies type and enum separately, so a validator holding
+// ["string", "null"] and an enum of strings alone refuses null. A member in
+// apiv2.NullEnumWithheld must still be such an enum, so its entry goes with
+// the member it was written for.
+func lintNullableEnum(fail func(string, ...any), where string, s *schema) {
+	refused := s.Nullable && len(s.Enum) > 0 && !slices.Contains(s.Enum, nil)
+	if reason, withheld := apiv2.NullEnumWithheld[strings.TrimPrefix(where, componentSchemas)]; withheld {
+		if !refused {
+			fail("%s: no longer a nullable enum without null; delete its apiv2.NullEnumWithheld entry (%s)", where, reason)
+		}
+		return
+	}
+	if refused {
+		fail("%s: nullable enum does not list null", where)
+	}
 }
 
 // lintValueShape requires a string member (or a string array's items) whose
@@ -477,7 +579,15 @@ type schema struct {
 	Properties           map[string]*schema `json:"properties"`
 	Items                *schema            `json:"items"`
 	AdditionalProperties any                `json:"additionalProperties"`
-	Extensions           map[string]any     `json:"-"`
+	Enum                 []any              `json:"enum"`
+	Required             []string           `json:"required"`
+	OneOf                []*schema          `json:"oneOf"`
+	AnyOf                []*schema          `json:"anyOf"`
+	AllOf                []*schema          `json:"allOf"`
+	// Nullable is set when the type list names "null"; Type keeps the
+	// other name.
+	Nullable   bool           `json:"-"`
+	Extensions map[string]any `json:"-"`
 }
 
 // schemaType is the JSON Schema `type` member: a single name, or in OpenAPI
@@ -513,6 +623,12 @@ func (s *schema) UnmarshalJSON(b []byte) error {
 	}
 	*s = schema(p)
 	s.Extensions = extensions(b)
+	var typed struct {
+		Type []string `json:"type"`
+	}
+	if json.Unmarshal(b, &typed) == nil {
+		s.Nullable = slices.Contains(typed.Type, "null")
+	}
 	return nil
 }
 

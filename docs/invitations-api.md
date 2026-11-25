@@ -1,6 +1,6 @@
 # Invitation API
 
-These v2 operations manage bearer-token invitations: emailed invitations bound
+These operations manage bearer-token invitations: emailed invitations bound
 to one address, and link invitations whose invitee enters an address at accept. Ordinary signup
 invite codes use the separate auth/signup contract. Administrator operations
 require an acting administrator. Public capability, lookup and acceptance requests spend the
@@ -10,14 +10,30 @@ and claim links. No raw claim token is retained for response replay.
 | Method | Path under `/api/v2` | Behavior |
 | --- | --- | --- |
 | GET | `/invitations/capabilities` | Public support and profile-store capability |
-| GET | `/invitations/{token}` | Claim-screen details for an eligible token |
-| POST | `/invitations/{token}/accept` | Atomically create the account; report login separately |
+| POST | `/invitations/lookup` | Claim-screen details for an eligible token, sent in the body |
+| POST | `/invitations/accept` | Atomically create the account; report login separately |
+| GET | `/invitations/{token}` | Deprecated path form of the lookup |
+| POST | `/invitations/{token}/accept` | Deprecated path form of acceptance |
 | GET | `/admin/invitations/capabilities` | Administrator support and profile-store capability |
 | GET | `/admin/invitations` | Bounded administrator history page |
 | GET | `/admin/invitations/{id}` | Administrator metadata, without a claim token or digest |
 | POST | `/admin/invitations` | Create and attempt delivery of a fresh invitation |
 | POST | `/admin/invitations/{id}/resend` | Replace the exact pending/expired source with a new invitation |
 | DELETE | `/admin/invitations/{id}` | Idempotently revoke that link; never delete an account |
+
+A claim link is `/invite#{token}`: the token is the URL fragment, which a browser
+never sends to the server or in a `Referer` header, so reverse proxies in front of
+Silo do not log it. `lookupInvitationLink` and `acceptInvitationLink` take it as
+`token` in the JSON body for the same reason. The path forms, `lookupInvitation`
+and `acceptInvitation`, behave identically but put the token in the request line.
+They are deprecated and send the `Deprecation` and `Link` headers; no `Sunset` is
+declared. A link issued in
+the old `/invite/{token}` form still opens.
+
+The capability's `token_in_body` is true on a server that has the body forms. A
+server that predates them omits the field, so a client reads an absent value as
+false and uses the path forms there. It must not take a `404` from a body
+operation to mean an older server: `404` is the answer for a dead link.
 
 Capabilities use the shared `revision` and `state` head, plus `default_profile`
 and `profileless`. `default_profile` reflects the actual selected provider's
@@ -48,7 +64,7 @@ already has an account returns `409 conflict`. Neither consumes the invitation;
 the invitee can correct the address and accept again.
 Its body is `{status: "accepted", login_status, username, tokens?}`:
 
-- `signed_in` includes the ordinary v2 token pair and typed account.
+- `signed_in` includes the ordinary token pair and typed account.
 - `sign_in_required` means acceptance committed but session issuance failed.
   Tokens are absent. Offer ordinary sign-in using the selected password; do not
   submit acceptance again or report that account creation failed.
@@ -132,11 +148,10 @@ edit must add a transactional configuration precondition.
 All three POST operations are **non-retryable**, including authentication-refresh
 replay. Revoke is naturally idempotent. See
 [the storage invariants](architecture/invitations-onboarding.md) for transaction,
-SQLite, expiry, login, and delivery boundaries. Legacy invitation routes remain
-available; consumer migration is reviewed separately.
+SQLite, expiry, login, and delivery boundaries.
 
 
-## V2 signup invite codes
+## Signup invite codes
 
 Signup invite codes are distinct from emailed invitations. Their administrator
 operations are under `/api/v2/admin/invite-codes`:
@@ -169,6 +184,6 @@ is non-retryable. After an uncertain response, inspect the current maximum befor
 trying again. The web disables automatic retries and authentication replay for
 these mutations and exposes explicit continuation for additional list pages.
 
-The signup redemption contract and frozen v1 administrator routes are unchanged.
+The signup redemption contract is unchanged.
 There are no Apple, Android, or Jellyfin administrator invite-code consumers to
 migrate.

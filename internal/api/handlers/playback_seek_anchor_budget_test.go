@@ -3,6 +3,8 @@ package handlers
 import (
 	"context"
 	"errors"
+	"fmt"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -12,6 +14,20 @@ import (
 	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/remotestream"
 )
+
+// A first anchor probe that times out at its per-attempt budget is retried by
+// the enclosing start, so that failure is a warning: production logged ERROR for
+// a probe that timed out at its 5 s budget and then resolved on the retry four
+// seconds later. Only a failure the retryable classification does not explain
+// stays an ERROR.
+func TestCopySeekAnchorFailureLevel(t *testing.T) {
+	if got := copySeekAnchorFailureLevel(true); got != slog.LevelWarn {
+		t.Fatalf("retryable/budget anchor failure level = %v, want WARN", got)
+	}
+	if got := copySeekAnchorFailureLevel(false); got != slog.LevelError {
+		t.Fatalf("terminal anchor failure level = %v, want ERROR", got)
+	}
+}
 
 // clearVirtualProviderLinkLatency drops one link's observation so a test starts
 // from an unmeasured link and leaves nothing behind for the next test.
@@ -81,7 +97,10 @@ func TestVirtualProviderLinkLatencyKeepsSlowestRecentObservation(t *testing.T) {
 
 // slowLinkAnchorFixture builds the virtual seek-anchor path for a pinned
 // release owned by one provider link, with the probe seam installed so a test
-// observes the budget each attempt grants instead of reading bytes.
+// observes the budget each attempt grants instead of reading bytes. It uses the
+// segmented delivery: an unresolved anchor degrades to the requested position
+// there, while a progressive remux refuses the start that would produce no
+// bytes (see TestPrepareTransportTimelineSlowAnchorIndexRefusesAProgressiveRemuxStart).
 func slowLinkAnchorFixture(t *testing.T, ownerInstallationID int) (*PlaybackHandler, *models.MediaFile, *playback.Session, *playback.PlanV3) {
 	t.Helper()
 	const (
@@ -105,7 +124,7 @@ func slowLinkAnchorFixture(t *testing.T, ownerInstallationID int) (*PlaybackHand
 	session := &playback.Session{ID: "session-slow-link", UserID: 1, ProfileID: "profile-1"}
 	plan := &playback.PlanV3{
 		PlanID:   "plan:slow-link",
-		Delivery: playback.DeliveryRemuxProgressiveV3,
+		Delivery: playback.DeliveryRemuxHLSV3,
 		Timeline: playback.TimelineV3{SourceStartSeconds: 30, PlayerStartSeconds: 30},
 	}
 	return handler, file, session, plan
@@ -373,5 +392,399 @@ func TestPrepareTransportTimelineDoubleResolveTimeoutStaysSeekError(t *testing.T
 	}
 	if got := resolves.Load(); got != 2 {
 		t.Fatalf("provider resolves = %d, want exactly 2 (one per attempt)", got)
+	}
+}
+
+// TestRemoteProbeBudgetScalesFromLinkLatency proves the subtitle layout probe
+// budget follows the same observation the anchor budgets use: a link whose
+// recent listing took 4.8s gets twice that instead of the fixed 5s that killed a
+// real probe at exactly 5.0s, a healthy link keeps the floor, and the caller's
+// deadline still wins.
+func TestRemoteProbeBudgetScalesFromLinkLatency(t *testing.T) {
+	const (
+		key       = "12"
+		floor     = 5 * time.Second
+		maxBudget = 15 * time.Second
+	)
+	clearVirtualProviderLinkLatency(t, key)
+	file := &models.MediaFile{ID: 71, FilePath: "virtual://movie/tt-probe-budget?result=a", VirtualOwnerInstallationID: 12}
+
+	recordVirtualProviderLinkLatency(key, 4800*time.Millisecond, time.Now())
+	if got := remoteProbeBudget(context.Background(), file, floor, maxBudget); got != 9600*time.Millisecond {
+		t.Fatalf("budget for a 4.8s link = %v, want 9.6s", got)
+	}
+
+	clearVirtualProviderLinkLatency(t, key)
+	recordVirtualProviderLinkLatency(key, 1900*time.Millisecond, time.Now())
+	if got := remoteProbeBudget(context.Background(), file, floor, maxBudget); got != floor {
+		t.Fatalf("budget for a 1.9s link = %v, want the floor %v", got, floor)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	clearVirtualProviderLinkLatency(t, key)
+	recordVirtualProviderLinkLatency(key, 6*time.Second, time.Now())
+	if got := remoteProbeBudget(ctx, file, floor, maxBudget); got > 6*time.Second || got <= 0 {
+		t.Fatalf("budget under a 6s caller deadline = %v, want it bounded by the caller", got)
+	}
+
+	expired, expiredCancel := context.WithTimeout(context.Background(), 0)
+	defer expiredCancel()
+	if got := remoteProbeBudget(expired, file, floor, maxBudget); got != 0 {
+		t.Fatalf("budget with an expired caller = %v, want 0 so the probe is skipped", got)
+	}
+
+	// A local row has no provider link, so it never inherits another link's
+	// measurement.
+	if got := remoteProbeBudget(context.Background(), &models.MediaFile{ID: 72, FilePath: "/media/movie.mkv"}, floor, maxBudget); got != floor {
+		t.Fatalf("budget for a local row = %v, want the floor %v", got, floor)
+	}
+}
+
+// TestCopySeekProbeContextOutlivesTheResolveLeg proves a probe on a measured
+// link is not handed the resolve leg's leftovers: the probe gets its own
+// adaptive window even when the attempt context is far shorter, while an
+// unmeasured link keeps the attempt bound and the request deadline still caps
+// everything.
+func TestCopySeekProbeContextOutlivesTheResolveLeg(t *testing.T) {
+	attemptCtx, attemptCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer attemptCancel()
+	requestCtx, requestCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer requestCancel()
+
+	probeCtx, probeCancel := copySeekProbeContext(requestCtx, attemptCtx, 4800*time.Millisecond)
+	defer probeCancel()
+	deadline, ok := probeCtx.Deadline()
+	if !ok {
+		t.Fatal("measured-link probe context has no deadline")
+	}
+	if got := time.Until(deadline); got < 9*time.Second {
+		t.Fatalf("probe budget = %v, want the link's ~9.6s observation rather than the resolve's 2s leftover", got)
+	}
+
+	// An unmeasured link (and every local file) keeps the attempt context
+	// exactly, so a deliberately short bound is still honored.
+	unmeasured, unmeasuredCancel := copySeekProbeContext(requestCtx, attemptCtx, 0)
+	defer unmeasuredCancel()
+	if got, want := deadlineOf(t, unmeasured), deadlineOf(t, attemptCtx); !got.Equal(want) {
+		t.Fatalf("unmeasured probe deadline = %v, want the attempt deadline %v", got, want)
+	}
+
+	// The request deadline is the outer bound even when the link is slower.
+	shortCtx, shortCancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer shortCancel()
+	capped, cappedCancel := copySeekProbeContext(shortCtx, attemptCtx, 6*time.Second)
+	defer cappedCancel()
+	if got, want := deadlineOf(t, capped), deadlineOf(t, shortCtx); !got.Equal(want) {
+		t.Fatalf("probe deadline = %v, want the caller's %v", got, want)
+	}
+}
+
+func deadlineOf(t *testing.T, ctx context.Context) time.Time {
+	t.Helper()
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		t.Fatal("context has no deadline")
+	}
+	return deadline
+}
+
+// TestCopySeekAnchorAttemptBudgetReservesTheRetry proves one anchor attempt's
+// window is derived from the time actually left: an attempt always fits inside
+// the caller's budget, a retry is only reserved when the caller can hold a
+// second adaptive attempt, and a caller with no room gets no attempt at all
+// rather than one the deadline would truncate.
+func TestCopySeekAnchorAttemptBudgetReservesTheRetry(t *testing.T) {
+	previousMargin := copySeekProbeRetryMargin
+	copySeekProbeRetryMargin = time.Second
+	defer func() { copySeekProbeRetryMargin = previousMargin }()
+
+	for _, tc := range []struct {
+		name        string
+		remaining   time.Duration
+		adaptive    time.Duration
+		reserve     bool
+		wantBudget  time.Duration
+		wantReserve bool
+	}{
+		{
+			name: "two adaptive attempts fit", remaining: 30 * time.Second, adaptive: 10 * time.Second, reserve: true,
+			wantBudget: 10 * time.Second, wantReserve: true,
+		},
+		{
+			name: "one adaptive attempt fits and the retry keeps the rest", remaining: 12 * time.Second, adaptive: 10 * time.Second, reserve: true,
+			wantBudget: 10 * time.Second, wantReserve: false,
+		},
+		{
+			name: "tight caller is clamped to what is left", remaining: 4 * time.Second, adaptive: 10 * time.Second, reserve: true,
+			wantBudget: 3 * time.Second, wantReserve: false,
+		},
+		{
+			name: "retry attempt takes the whole remainder", remaining: 12 * time.Second, adaptive: 20 * time.Second, reserve: false,
+			wantBudget: 11 * time.Second, wantReserve: false,
+		},
+		{
+			name: "no room to reserve keeps one bounded attempt", remaining: 500 * time.Millisecond, adaptive: 10 * time.Second, reserve: true,
+			wantBudget: 500 * time.Millisecond, wantReserve: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), tc.remaining)
+			defer cancel()
+			budget, reserved, remaining := copySeekAnchorAttemptBudget(ctx, tc.adaptive, tc.reserve)
+			if diff := budget - tc.wantBudget; diff < -5*time.Millisecond || diff > 5*time.Millisecond {
+				t.Fatalf("budget = %v, want %v", budget, tc.wantBudget)
+			}
+			if reserved != tc.wantReserve {
+				t.Fatalf("reserved = %v, want %v", reserved, tc.wantReserve)
+			}
+			if remaining > tc.remaining || remaining <= 0 {
+				t.Fatalf("remaining = %v, want the caller's ~%v", remaining, tc.remaining)
+			}
+		})
+	}
+
+	// A caller with no deadline keeps the adaptive budget and the caller's
+	// reserve decision: the probe cap alone bounds it.
+	budget, reserved, remaining := copySeekAnchorAttemptBudget(context.Background(), 7*time.Second, true)
+	if budget != 7*time.Second || !reserved || remaining != 0 {
+		t.Fatalf("budget = %v reserved = %v remaining = %v, want the unbounded adaptive budget", budget, reserved, remaining)
+	}
+}
+
+// TestPrepareTransportTimelineSizesAnchorProbeFromObservedProbeCost proves the
+// first attempt is sized from what this source's anchor probe recently cost, not
+// from the provider link's listing latency. A probe byte-seeks into the release
+// and reads a frame on top of the open, so a link that lists in 3.6s can need
+// 11.6s to anchor a deep position; before this the first attempt always got the
+// floor, expired, and the retry re-discovered the real cost — the 5-19s start. A
+// probe that still cannot finish inside the measured budget stays a slow link:
+// the start degrades to the requested position instead of answering a retryable
+// provider verdict.
+func TestPrepareTransportTimelineSizesAnchorProbeFromObservedProbeCost(t *testing.T) {
+	previousFloor, previousCap, previousMargin := copySeekAnchorSeekResolveTimeout, copySeekAnchorSeekResolveTimeoutCap, copySeekProbeRetryMargin
+	copySeekAnchorSeekResolveTimeout, copySeekAnchorSeekResolveTimeoutCap, copySeekProbeRetryMargin = 100*time.Millisecond, 2*time.Second, 100*time.Millisecond
+	previousHint := copySeekAnchorProbeBudgetHint
+	// A source whose own probe needed 150ms: twice that is the attempt size.
+	copySeekAnchorProbeBudgetHint = func(string, string, int) time.Duration { return 300 * time.Millisecond }
+	defer func() {
+		copySeekAnchorSeekResolveTimeout, copySeekAnchorSeekResolveTimeoutCap, copySeekProbeRetryMargin = previousFloor, previousCap, previousMargin
+		copySeekAnchorProbeBudgetHint = previousHint
+	}()
+
+	const ownerInstallationID = 43
+	clearVirtualProviderLinkLatency(t, "43")
+	handler, file, session, plan := slowLinkAnchorFixture(t, ownerInstallationID)
+
+	callerCtx, callerCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer callerCancel()
+
+	var mu sync.Mutex
+	var budgets []time.Duration
+	handler.copySeekAnchor = func(ctx context.Context, _ string, _ string, _ float64, _ int) (float64, int, error) {
+		mu.Lock()
+		if deadline, ok := ctx.Deadline(); ok {
+			budgets = append(budgets, time.Until(deadline))
+		}
+		mu.Unlock()
+		// A link that is slow rather than broken: the probe cannot finish inside
+		// the budget it was given.
+		<-ctx.Done()
+		return 0, 0, ctx.Err()
+	}
+
+	started := time.Now()
+	timeline, transportErr := handler.prepareTransportTimelineV3(callerCtx, session, file, playback.PlannerResultV3{Plan: plan, PlayMethod: playback.PlayRemux})
+	if transportErr != nil {
+		t.Fatalf("transport error = %#v, want the anchor-less start, not a retryable failure", transportErr)
+	}
+	if timeline.copySeekAnchorResolved {
+		t.Fatalf("timeline = %#v, want the unanchored shape", timeline)
+	}
+	if timeline.seekSeconds != plan.Timeline.SourceStartSeconds || timeline.streamOriginSeconds != plan.Timeline.SourceStartSeconds {
+		t.Fatalf("timeline = %#v, want seek and origin at the requested %v s", timeline, plan.Timeline.SourceStartSeconds)
+	}
+	if elapsed := time.Since(started); elapsed > 3*time.Second {
+		t.Fatalf("anchor phase took %v, want it bounded by the caller's 2s budget", elapsed)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(budgets) == 0 {
+		t.Fatal("the anchor probe never ran")
+	}
+	// The first attempt is the measurement's, not the 100ms floor: at least twice
+	// the floor and never below it.
+	if budgets[0] < 250*time.Millisecond {
+		t.Fatalf("first probe budget = %v, want the ~300ms the measured probe cost implies, not the %v floor", budgets[0], copySeekAnchorSeekResolveTimeout)
+	}
+	for _, budget := range budgets {
+		if budget > copySeekAnchorSeekResolveTimeoutCap {
+			t.Fatalf("probe budgets = %v, want every attempt inside the %v cap", budgets, copySeekAnchorSeekResolveTimeoutCap)
+		}
+	}
+}
+
+// TestCopySeekAnchorNoticesSpeakOncePerSession proves the anchor-less notice is
+// recorded once per session and source: the first degraded start can WARN, a
+// repeat inside the window is a plain notice, another source or session is new
+// again, and a lapsed record is new again. Without it a degraded session left one
+// WARN per seek and no way to tell an anchor-less session from a resolved one.
+func TestCopySeekAnchorNoticesSpeakOncePerSession(t *testing.T) {
+	now := time.Now()
+	previous := copySeekAnchorNotices
+	copySeekAnchorNotices = &copySeekAnchorNoticeTracker{seen: make(map[string]time.Time), now: func() time.Time { return now }}
+	defer func() { copySeekAnchorNotices = previous }()
+
+	key := copySeekAnchorNoticeKey("session-1", "virtual://movie/tt")
+	if !copySeekAnchorNotices.first(key) {
+		t.Fatal("the first degraded start for a session was not a warning-worthy notice")
+	}
+	if copySeekAnchorNotices.first(key) {
+		t.Fatal("the second degraded start for the same session repeated the warning")
+	}
+	if !copySeekAnchorNotices.first(copySeekAnchorNoticeKey("session-1", "virtual://movie/other")) {
+		t.Fatal("a different source in the same session was not noticed")
+	}
+	if !copySeekAnchorNotices.first(copySeekAnchorNoticeKey("session-2", "virtual://movie/tt")) {
+		t.Fatal("a different session was not noticed")
+	}
+	if copySeekAnchorNoticeKey("", "virtual://movie/tt") != "" {
+		t.Fatal("a session-less start must not be keyed")
+	}
+
+	now = now.Add(copySeekAnchorNoticeWindow + time.Second)
+	if !copySeekAnchorNotices.first(key) {
+		t.Fatal("a lapsed notice was not repeated")
+	}
+}
+
+// TestPrepareTransportTimelineRetryEndingOnADeadlineStartsWithoutTheAnchor
+// proves a retry that ends with a deadline error while its own probe context is
+// still live — the shape of a probe that inherited a spent flight — is treated
+// as the keyframe index timing out, not as a verdict against the release. The
+// start degrades to the requested position instead of leaving the player
+// reconnecting on a retryable seek error.
+func TestPrepareTransportTimelineRetryEndingOnADeadlineStartsWithoutTheAnchor(t *testing.T) {
+	previousFloor, previousMargin := copySeekAnchorSeekResolveTimeout, copySeekProbeRetryMargin
+	copySeekAnchorSeekResolveTimeout, copySeekProbeRetryMargin = 100*time.Millisecond, 100*time.Millisecond
+	defer func() {
+		copySeekAnchorSeekResolveTimeout, copySeekProbeRetryMargin = previousFloor, previousMargin
+	}()
+
+	const ownerInstallationID = 42
+	clearVirtualProviderLinkLatency(t, "42")
+	handler, file, session, plan := slowLinkAnchorFixture(t, ownerInstallationID)
+	previousNotices := copySeekAnchorNotices
+	copySeekAnchorNotices = &copySeekAnchorNoticeTracker{seen: make(map[string]time.Time)}
+	defer func() { copySeekAnchorNotices = previousNotices }()
+
+	callerCtx, callerCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer callerCancel()
+
+	var probes atomic.Int32
+	handler.copySeekAnchor = func(ctx context.Context, _ string, _ string, _ float64, _ int) (float64, int, error) {
+		if probes.Add(1) == 1 {
+			// The first attempt spends its own window and answers its deadline.
+			<-ctx.Done()
+			return 0, 0, ctx.Err()
+		}
+		// The retry inherits a probe that already timed out: a deadline error
+		// arrives while this attempt's own context still has time left.
+		if ctx.Err() != nil {
+			t.Errorf("retry probe context was already done")
+		}
+		return 0, 0, fmt.Errorf("resolve copy seek anchor: ffmpeg failed: resolve copy seek anchor: probe interrupted: %w", context.DeadlineExceeded)
+	}
+
+	timeline, transportErr := handler.prepareTransportTimelineV3(callerCtx, session, file, playback.PlannerResultV3{Plan: plan, PlayMethod: playback.PlayRemux})
+	if transportErr != nil {
+		t.Fatalf("transport error = %#v, want a start from the requested position without the anchor", transportErr)
+	}
+	if timeline.copySeekAnchorResolved {
+		t.Fatalf("timeline = %#v, want the unanchored shape", timeline)
+	}
+	if timeline.seekSeconds != plan.Timeline.SourceStartSeconds || timeline.streamOriginSeconds != plan.Timeline.SourceStartSeconds {
+		t.Fatalf("timeline = %#v, want seek and origin at the requested %v s", timeline, plan.Timeline.SourceStartSeconds)
+	}
+	if got := probes.Load(); got != 2 {
+		t.Fatalf("anchor probes = %d, want the timed-out attempt and its retry", got)
+	}
+	// The degrade is recorded for the session, so the next seek is explained
+	// rather than rediscovered.
+	noticeKey := copySeekAnchorNoticeKey(session.ID, file.FilePath)
+	copySeekAnchorNotices.mu.Lock()
+	_, noticed := copySeekAnchorNotices.seen[noticeKey]
+	copySeekAnchorNotices.mu.Unlock()
+	if !noticed {
+		t.Fatalf("anchor-less start for %q left no session record", session.ID)
+	}
+}
+
+// TestPrepareTransportTimelineSlowAnchorProbeLeavesBudgetForRetry proves one
+// slow-but-alive provider open no longer ends the session: the first probe is
+// capped below the caller's deadline, the retry it reserved runs with the
+// remaining window, and that retry's success serves the start. Before the
+// budget reallocation the first probe consumed the whole budget and the retry
+// gate rejected the attempt that could have served it.
+func TestPrepareTransportTimelineSlowAnchorProbeLeavesBudgetForRetry(t *testing.T) {
+	previousFloor, previousMargin := copySeekAnchorSeekResolveTimeout, copySeekProbeRetryMargin
+	copySeekAnchorSeekResolveTimeout, copySeekProbeRetryMargin = 100*time.Millisecond, 100*time.Millisecond
+	defer func() {
+		copySeekAnchorSeekResolveTimeout, copySeekProbeRetryMargin = previousFloor, previousMargin
+	}()
+
+	const ownerInstallationID = 41
+	clearVirtualProviderLinkLatency(t, "41")
+	// A link whose last provider answer took 300ms: one attempt is sized at
+	// twice that (600ms) and the caller holds enough for two of them.
+	recordVirtualProviderLinkLatency("41", 300*time.Millisecond, time.Now())
+	handler, file, session, plan := slowLinkAnchorFixture(t, ownerInstallationID)
+
+	callerCtx, callerCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer callerCancel()
+
+	var mu sync.Mutex
+	var budgets []time.Duration
+	var probes atomic.Int32
+	handler.copySeekAnchor = func(ctx context.Context, _ string, _ string, requested float64, segmentDuration int) (float64, int, error) {
+		budget, ok := ctx.Deadline()
+		mu.Lock()
+		if ok {
+			budgets = append(budgets, time.Until(budget))
+		} else {
+			budgets = append(budgets, 0)
+		}
+		mu.Unlock()
+		if probes.Add(1) == 1 {
+			// A source that is slow but alive: the open outran this attempt's
+			// own window. The retry is the attempt that can still land.
+			<-ctx.Done()
+			return 0, 0, ctx.Err()
+		}
+		return requested - 1, computeStartSegment(requested-1, segmentDuration), nil
+	}
+
+	timeline, transportErr := handler.prepareTransportTimelineV3(callerCtx, session, file, playback.PlannerResultV3{Plan: plan, PlayMethod: playback.PlayRemux})
+	if transportErr != nil {
+		t.Fatalf("prepareTransportTimelineV3 = %#v, want the retry's attempt to serve the start", transportErr)
+	}
+	if !timeline.copySeekAnchorResolved {
+		t.Fatalf("timeline = %#v, want a resolved copy anchor from the retry", timeline)
+	}
+	if got := probes.Load(); got != 2 {
+		t.Fatalf("anchor probes = %d, want the slow attempt and its reserved retry", got)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(budgets) != 2 {
+		t.Fatalf("probe budgets = %v, want one per probe", budgets)
+	}
+	// The first probe may not cross the retry's share: it is capped inside the
+	// caller's 2s budget rather than being handed the whole remainder.
+	if budgets[0] > time.Second {
+		t.Fatalf("first probe budget = %v, want it capped below half the caller's 2s budget", budgets[0])
+	}
+	if budgets[1] <= 0 {
+		t.Fatalf("retry probe budget = %v, want the remaining window", budgets[1])
 	}
 }

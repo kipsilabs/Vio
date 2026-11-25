@@ -3,6 +3,7 @@
  * Zero imports from app-specific code.
  */
 
+import type { PlaybackNetworkTier } from "./bandwidth-probe";
 import type { BufferingMode } from "./buffering-quality";
 
 /** Subtitle display mode. */
@@ -55,7 +56,7 @@ export interface PlayerFileVersion {
   failed?: boolean;
   /**
    * The catalog's liveness verdict for this version, stamped from the server's
-   * `POST /catalog/versions/check` result before the rows reach the player.
+   * `POST /api/v2/catalog/versions/check` result before the rows reach the player.
    * Absent means unknown (no result yet); `false` means the server's last check
    * could not resolve the row, which the version menu warns about. It is never
    * derived from the client's own playback failures.
@@ -229,6 +230,8 @@ export interface PlayerSubtitleInfo {
   default?: boolean;
   /** Names the track to the subtitle sync operations; absent when it can't be synced. */
   sync_key?: string;
+  /** Stored row identity, also present when the track has no URL or timing support. */
+  stored_subtitle_id?: number;
   url: string;
   /**
    * Optional endpoint returning base64-encoded container font attachments for
@@ -378,6 +381,29 @@ export interface PlayerPlaybackTransport {
   skipForward: () => void;
   seekTo: (seconds: number) => void;
   togglePictureInPicture: () => void | Promise<void>;
+  /**
+   * The plan's audio inventory and the live selection, for a host surface that
+   * is not the player itself: the minimised (background) bar offers the same
+   * audio selector the player does, so a viewer can change language without
+   * leaving the page. Absent while the player has no selectable inventory (a
+   * plan still probing, or a source with one track and no menu).
+   */
+  audio?: PlayerAudioTransport;
+}
+
+/**
+ * The audio picker the minimised bar renders. `select` applies the pick to the
+ * playing session at the position the bar shows, exactly as the in-player menu
+ * does; it never starts a new playback.
+ */
+export interface PlayerAudioTransport {
+  tracks: PlayerAudioTrack[];
+  activeIndex: number | null;
+  provisional: boolean;
+  pending: boolean;
+  failed: boolean;
+  select: (index: number, currentPosition: number) => void;
+  retry: () => void;
 }
 
 /**
@@ -389,11 +415,19 @@ export interface PlayerPlaybackTransport {
  */
 export type PlaybackStartTrigger = "viewer" | "automatic";
 
+/** A title's backdrop, as the watch detail sends it. */
+export interface PlayerBackdrop {
+  url?: string;
+  thumbhash?: string;
+}
+
 /** Props for the top-level WatchPage component. */
 export interface WatchPageProps {
   contentId: string;
   title: string;
   year?: number;
+  /** Shown dimmed behind the loading spinner. */
+  backdrop?: PlayerBackdrop;
   fileId?: number;
   /** The viewer chose fileId, so Auto must not swap in another version. */
   versionPicked?: boolean;
@@ -401,7 +435,7 @@ export interface WatchPageProps {
   versions: PlayerFileVersion[];
   /**
    * The liveness verdicts the parent already stamped onto `versions`, from
-   * `POST /catalog/versions/check`. The watch detail does not carry them, so a
+   * `POST /api/v2/catalog/versions/check`. The watch detail does not carry them, so a
    * fresh detail read (the realtime reconnect reconcile) has to re-apply the
    * same map to keep the `available: false` / failed badges on the rows it
    * replaces.
@@ -432,6 +466,8 @@ export interface WatchPageProps {
   qualityPreference?: string | null;
   /** Bandwidth cap in kbps from playback.max_bitrate_kbps; null/undefined is uncapped. */
   maxBitrateKbps?: number | null;
+  /** Current network tier (`unmetered`, `metered`, `low_data`) for mid-session cap replans. */
+  networkTier?: PlaybackNetworkTier;
   explicitAudioTrackIndex?: number | null;
   /** True when the initial `fileId` was explicitly chosen by the viewer; the
    * server must not silently substitute another version. */
@@ -478,7 +514,12 @@ export interface WatchPageProps {
    * viewer's request, because completion paths such as post-roll close and
    * next-episode navigation do not pass through `onEnded`.
    */
-  onRequestedVersionChange?: (fileId: number | null) => void;
+  /**
+   * `explicit` says whether the viewer named the row, so the host can keep the
+   * device's remembered pick a pin rather than a hint. The player's own Auto
+   * entry reports the row it is playing as no longer pinned.
+   */
+  onRequestedVersionChange?: (fileId: number | null, explicit: boolean) => void;
   onExit: (state?: PlaybackExitState) => void | Promise<void>;
   onMinimize?: (state?: PlaybackExitState) => void | Promise<void>;
   resumeHints?: ResumeHints;

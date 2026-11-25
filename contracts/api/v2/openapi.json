@@ -4,6 +4,13 @@
       "APIKeyScope": {
         "additionalProperties": false,
         "properties": {
+          "audience": {
+            "enum": [
+              "admin",
+              "user"
+            ],
+            "type": "string"
+          },
           "description": {
             "type": "string"
           },
@@ -13,7 +20,8 @@
         },
         "required": [
           "name",
-          "description"
+          "description",
+          "audience"
         ],
         "type": "object"
       },
@@ -208,7 +216,7 @@
         "additionalProperties": false,
         "properties": {
           "can_unlink": {
-            "description": "Whether deleteAccountIdentity would disconnect an identity now: the account has another identity, or its local password still signs in (the account's password sign-in is on, and local password sign-in is on for the server or the account is break-glass). False with no identity",
+            "description": "Whether deleteAccountIdentity would disconnect an identity now for the profile asking: that profile is the account's household manager (deleteAccountIdentity describes who is), and the account has another identity, or its local password still signs in (the account's password sign-in is on, and local password sign-in is on for the server or the account is break-glass). False with no identity",
             "examples": [
               true
             ],
@@ -584,6 +592,10 @@
             "type": "boolean"
           },
           "id": {
+            "type": "string"
+          },
+          "managed_by_env_var": {
+            "description": "The variable in the server's environment that declares this provider, such as SILO_CONFIG_FILE, when the deployment declares it. Updating or deleting such a provider is 422 validation_failed with code managed_by_environment.",
             "type": "string"
           },
           "name": {
@@ -4011,6 +4023,7 @@
             "type": "string"
           },
           "local_username": {
+            "description": "The matched account's username, or its email when it has none",
             "type": "string"
           },
           "match": {
@@ -4100,8 +4113,21 @@
             "type": "string"
           },
           "changes": {
-            "description": "A template collection's fields the admin changed from the template's defaults that a restore writes here: title, description, visibility, featured, sort order, item sort, source, sync schedule, poster, backdrop",
+            "description": "What a restore writes to a template collection here: the fields the admin changed from the template's defaults, and libraries when it adds the collection to more of them",
             "items": {
+              "enum": [
+                "title",
+                "description",
+                "visibility",
+                "featured",
+                "sort_order",
+                "item_sort",
+                "source",
+                "sync_schedule",
+                "poster",
+                "backdrop",
+                "libraries"
+              ],
               "type": "string"
             },
             "type": "array"
@@ -4212,8 +4238,21 @@
         "additionalProperties": false,
         "properties": {
           "changes": {
-            "description": "What a restore replaces in the section here: title, position, featured, item limit, enabled, web only, configuration, and N collection items",
+            "description": "What a restore replaces in the section here",
             "items": {
+              "enum": [
+                "type",
+                "title",
+                "title_translation",
+                "position",
+                "featured",
+                "item_limit",
+                "enabled",
+                "web_only",
+                "collection_replaced",
+                "configuration",
+                "collection_items"
+              ],
               "type": "string"
             },
             "type": "array"
@@ -4229,6 +4268,11 @@
           "local_id": {
             "description": "The matching section here: the same id on the server that took the backup, else the one section of the page with the same type and title",
             "type": "string"
+          },
+          "missing_collection_items": {
+            "description": "With the collection_items change: the items of the backup's collection, in this server's catalog, that the section's collection here lacks and a restore adds",
+            "format": "int64",
+            "type": "integer"
           },
           "scope": {
             "enum": [
@@ -4331,7 +4375,8 @@
               "kept_stricter",
               "unverified_backup",
               "over_restore_budget",
-              "needs_primary_profile"
+              "needs_primary_profile",
+              "managed_by_environment"
             ],
             "type": "string"
           },
@@ -4851,7 +4896,8 @@
               "kept_stricter",
               "unverified_backup",
               "over_restore_budget",
-              "needs_primary_profile"
+              "needs_primary_profile",
+              "managed_by_environment"
             ],
             "type": "string"
           },
@@ -5181,14 +5227,15 @@
             "type": "boolean"
           },
           "status": {
-            "description": "on_this_server: same value here; needs_another_key: encrypted with another SECRET_KEY and never written; kept_stricter: the backup's value would widen access (who can sign in, how long sessions last, what a rating-capped profile sees, mail transport security), so this server keeps its stricter value and a restore never writes it; cleared: the restore changes where a service connects and the backup has no secret this server can read for it, so restoring clears the secret here and turns the service off; unverified_backup: it connects to an outside service, which a backup this server cannot verify never restores",
+            "description": "on_this_server: same value here; needs_another_key: encrypted with another SECRET_KEY and never written; kept_stricter: the backup's value would widen access (who can sign in, how long sessions last, what a rating-capped profile sees, mail transport security), so this server keeps its stricter value and a restore never writes it; cleared: the restore changes where a service connects and the backup has no secret this server can read for it, so restoring clears the secret here and turns the service off; unverified_backup: it connects to an outside service, which a backup this server cannot verify never restores; managed_by_environment: this server's environment sets it, or sets another setting of the outside-service connection it belongs to (mail's SMTP settings, for example), so a restore never writes it and this server keeps its value",
             "enum": [
               "on_this_server",
               "differs",
               "needs_another_key",
               "kept_stricter",
               "cleared",
-              "unverified_backup"
+              "unverified_backup",
+              "managed_by_environment"
             ],
             "type": "string"
           }
@@ -7650,15 +7697,22 @@
         "properties": {
           "layout": {
             "additionalProperties": true,
-            "type": "object",
+            "description": "Stored layout; null when this account has none saved, and the client keeps its local or default arrangement",
+            "type": [
+              "object",
+              "null"
+            ],
             "x-silo-extension-bag": "admin-dashboard-layout"
           },
           "updated_at": {
-            "description": "RFC 3339 instant in UTC with millisecond precision",
+            "description": "When the stored layout was last saved; null when none is saved",
             "format": "date-time",
             "pattern": "^(?:[1-9][0-9]{3}|0[1-9][0-9]{2}|00[1-9][0-9]|000[2-9])-",
             "patternDescription": "a non-zero RFC 3339 instant",
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -9033,6 +9087,25 @@
               "Trending Movies"
             ],
             "maxLength": 80,
+            "type": "string"
+          },
+          "title_args": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Values of the title_key message's placeholders by name, such as library for a generated library row; present only with title_key, and absent when the message has none",
+            "examples": [
+              {
+                "library": "Movies"
+              }
+            ],
+            "type": "object"
+          },
+          "title_key": {
+            "description": "Key of the shared translation catalog message whose English is title, present only while title is the server's own text: a built-in or generated section, recommendation row or request Discover row name, or a seasonal row's built-in in-season title. A client that has the key shows its translation, filling title_args, and otherwise shows title. Absent when an administrator or the profile typed the title, except that upgrading keyed existing titles identical to a built-in name, and a profile title equal to the administrator's keeps the key. A client acts on title_key whenever it is present",
+            "examples": [
+              "home.section.recentlyAddedIn"
+            ],
             "type": "string"
           },
           "type": {
@@ -12440,9 +12513,11 @@
         "properties": {
           "mode": {
             "default": "quick",
+            "description": "quick rescans the item's folder and refreshes its metadata; complete rebuilds the item from its files first; reset is a quick refresh that also clears the item's field locks and every value its providers lack (Reset to Provider in Edit Metadata)",
             "enum": [
               "quick",
-              "complete"
+              "complete",
+              "reset"
             ],
             "type": "string"
           }
@@ -12620,7 +12695,8 @@
             "enum": [
               "pending",
               "matched",
-              "unmatched"
+              "unmatched",
+              null
             ],
             "type": [
               "string",
@@ -14825,6 +14901,14 @@
               "null"
             ]
           },
+          "source_access": {
+            "description": "How a transcode node reaches its source media. A proxy is always local.",
+            "enum": [
+              "local",
+              "core"
+            ],
+            "type": "string"
+          },
           "url": {
             "format": "uri-reference",
             "maxLength": 8192,
@@ -14860,7 +14944,7 @@
         "additionalProperties": false,
         "properties": {
           "profile_id": {
-            "description": "Opaque identifier",
+            "description": "A profile on the authenticated account. A profile or device on another account answers 404, as a device that does not exist does.",
             "examples": [
               "1"
             ],
@@ -16369,6 +16453,18 @@
           "auto_provision": {
             "type": "boolean"
           },
+          "callback_mode": {
+            "description": "Redirect URI mode for OAuth sign-in",
+            "enum": [
+              "installation",
+              "stable"
+            ],
+            "type": "string"
+          },
+          "callback_pending": {
+            "description": "True when an enabled OAuth binding is waiting for the public URL",
+            "type": "boolean"
+          },
           "callback_url": {
             "description": "Redirect URI to register at the OAuth (OIDC) provider for this installation: the v2 callback on the public URL (server.public_url). Empty for a password (LDAP) provider and while no public URL is configured",
             "examples": [
@@ -16396,6 +16492,13 @@
           },
           "enabled": {
             "type": "boolean"
+          },
+          "env_managed": {
+            "description": "Binding fields owned by the deployment.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           },
           "post_logout_redirect_url": {
             "description": "Post-logout redirect URI to register at the OAuth (OIDC) provider when provider logout is on: the login page on the public URL. Empty for a password (LDAP) provider and while no public URL is configured",
@@ -16452,6 +16555,14 @@
             "description": "Create an account for a person who passes the provider's rules on first sign-in; omitted means true",
             "type": "boolean"
           },
+          "callback_mode": {
+            "description": "OAuth only. Omit to preserve the stored mode or to use installation for a new binding",
+            "enum": [
+              "installation",
+              "stable"
+            ],
+            "type": "string"
+          },
           "capability_id": {
             "maxLength": 256,
             "minLength": 1,
@@ -16478,6 +16589,40 @@
         ],
         "type": "object"
       },
+      "AdminPluginCapabilities": {
+        "additionalProperties": false,
+        "properties": {
+          "allowed": {
+            "description": "Whether the current principal may use the capability",
+            "type": "boolean"
+          },
+          "env_declarations": {
+            "description": "Installation and binding reads can report env_managed ownership, mutations refuse changes to owned fields, and provisioning status is available.",
+            "type": "boolean"
+          },
+          "revision": {
+            "description": "Opaque revision of this document",
+            "type": "string"
+          },
+          "state": {
+            "description": "Support and configuration state, not health",
+            "enum": [
+              "available",
+              "disabled",
+              "not_configured",
+              "unsupported"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "env_declarations",
+          "revision",
+          "state",
+          "allowed"
+        ],
+        "type": "object"
+      },
       "AdminPluginCapability": {
         "additionalProperties": false,
         "properties": {
@@ -16500,6 +16645,13 @@
           },
           "display_name": {
             "type": "string"
+          },
+          "env_managed": {
+            "description": "On an installed sign-in capability: the binding fields owned by the deployment. May appear before a binding exists.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           },
           "id": {
             "type": "string"
@@ -16614,6 +16766,7 @@
           "source_kind": {
             "enum": [
               "silo",
+              "vio",
               "approved_community",
               "external"
             ],
@@ -17045,6 +17198,10 @@
             },
             "type": "array"
           },
+          "connection_check_supported": {
+            "description": "True when POST config/test contacts the provider for this plugin: a plugin declaring configuration_check, a metadata provider that serves movies, or a marker provider. Offer that check only when this is true. For other plugins it either answers that connection checks are not supported or succeeds without contacting anything. A marker provider that does not implement account statistics, or a plugin declaring configuration_check without serving it, can still answer that checks are not supported.",
+            "type": "boolean"
+          },
           "created_at": {
             "description": "RFC 3339 instant in UTC with millisecond precision",
             "format": "date-time",
@@ -17054,6 +17211,10 @@
           },
           "enabled": {
             "type": "boolean"
+          },
+          "env_managed": {
+            "$ref": "#/components/schemas/AdminPluginProvisionOwnership",
+            "description": "Present when the deployment owns this installation and its package source."
           },
           "global_config_schema": {
             "items": {
@@ -17116,6 +17277,10 @@
           "runtime": {
             "$ref": "#/components/schemas/AdminPluginRuntime"
           },
+          "signature": {
+            "$ref": "#/components/schemas/AdminPluginSignature",
+            "description": "The release signature check of the installed package."
+          },
           "source_kind": {
             "enum": [
               "silo",
@@ -17130,6 +17295,10 @@
               "$ref": "#/components/schemas/AdminPluginTaskBinding"
             },
             "type": "array"
+          },
+          "update_failure": {
+            "$ref": "#/components/schemas/AdminPluginUpdateFailure",
+            "description": "The last automatic update that failed, such as a download that did not match its catalog checksum. Absent when the last check did not fail for this plugin."
           },
           "update_policy": {
             "type": "string"
@@ -17165,6 +17334,7 @@
           "update_policy",
           "source_kind",
           "updates_paused",
+          "signature",
           "capabilities",
           "global_config_schema",
           "user_config_schema",
@@ -17176,7 +17346,8 @@
           "task_bindings",
           "runtime",
           "created_at",
-          "updated_at"
+          "updated_at",
+          "connection_check_supported"
         ],
         "type": "object"
       },
@@ -17252,6 +17423,68 @@
           "publisher_name",
           "publisher_url",
           "license_spdx"
+        ],
+        "type": "object"
+      },
+      "AdminPluginProvisionOwnership": {
+        "additionalProperties": false,
+        "properties": {
+          "binding_fields": {
+            "additionalProperties": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "description": "Binding fields owned by the deployment, keyed by capability ID.",
+            "type": "object"
+          },
+          "config_fields": {
+            "additionalProperties": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "description": "Top-level fields owned by the deployment, keyed by global configuration entry.",
+            "type": "object"
+          },
+          "version_pin": {
+            "description": "Exact package version the deployment pins, if any.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "config_fields",
+          "binding_fields"
+        ],
+        "type": "object"
+      },
+      "AdminPluginProvisionStatus": {
+        "additionalProperties": false,
+        "properties": {
+          "detail": {
+            "description": "Redacted reason or status detail, empty when there is none.",
+            "type": "string"
+          },
+          "plugin_id": {
+            "description": "The declared manifest plugin ID. An installation need not exist.",
+            "type": "string"
+          },
+          "state": {
+            "description": "The latest recorded provisioning outcome for the declaration.",
+            "type": "string"
+          },
+          "version": {
+            "description": "Installed version when applied. Otherwise the requested version, if any.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "plugin_id",
+          "version",
+          "state",
+          "detail"
         ],
         "type": "object"
       },
@@ -17420,6 +17653,37 @@
         ],
         "type": "object"
       },
+      "AdminPluginSignature": {
+        "additionalProperties": false,
+        "properties": {
+          "source_repo": {
+            "description": "The repository the verified signature names. Present only when state is verified.",
+            "format": "uri",
+            "type": "string"
+          },
+          "state": {
+            "description": "verified: the release's Sigstore bundle proved it was built from source_repo at the version's tag. unsigned: there was nothing to check, as for an upload, an archive install, or a catalog entry without a signature. invalid: a signature was checked and did not prove that. unknown: not checked, as for an installation from before Silo checked signatures or an install whose check could not run.",
+            "enum": [
+              "unknown",
+              "verified",
+              "unsigned",
+              "invalid"
+            ],
+            "type": "string"
+          },
+          "verified_at": {
+            "description": "When Silo verified the signature. Present only when state is verified.",
+            "format": "date-time",
+            "pattern": "^(?:[1-9][0-9]{3}|0[1-9][0-9]{2}|00[1-9][0-9]|000[2-9])-",
+            "patternDescription": "a non-zero RFC 3339 instant",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "type": "object"
+      },
       "AdminPluginTaskBinding": {
         "additionalProperties": false,
         "properties": {
@@ -17486,6 +17750,32 @@
         },
         "required": [
           "enabled"
+        ],
+        "type": "object"
+      },
+      "AdminPluginUpdateFailure": {
+        "additionalProperties": false,
+        "properties": {
+          "failed_at": {
+            "description": "RFC 3339 instant in UTC with millisecond precision",
+            "format": "date-time",
+            "pattern": "^(?:[1-9][0-9]{3}|0[1-9][0-9]{2}|00[1-9][0-9]|000[2-9])-",
+            "patternDescription": "a non-zero RFC 3339 instant",
+            "type": "string"
+          },
+          "reason": {
+            "description": "Why the update was refused, written for the administrator; it names no URL or checksum",
+            "type": "string"
+          },
+          "version": {
+            "description": "The version Silo tried and failed to install",
+            "type": "string"
+          }
+        },
+        "required": [
+          "version",
+          "reason",
+          "failed_at"
         ],
         "type": "object"
       },
@@ -18700,6 +18990,10 @@
           "guarded_configuration": {
             "type": "boolean"
           },
+          "request_posters": {
+            "description": "Whether admin request reads return poster_url, a path on this server that serves the request's TMDB poster (getAdminRequestPoster)",
+            "type": "boolean"
+          },
           "revision": {
             "description": "Opaque revision of this document",
             "type": "string"
@@ -18730,6 +19024,7 @@
           "routing_series_status",
           "discover_layout",
           "discover_list_order",
+          "request_posters",
           "revision",
           "state",
           "allowed"
@@ -18770,9 +19065,17 @@
             ],
             "format": "int64",
             "type": "integer"
+          },
+          "requests_enabled": {
+            "description": "Whether the server-wide requests switch is on; the queue still answers while it is off",
+            "examples": [
+              true
+            ],
+            "type": "boolean"
           }
         },
         "required": [
+          "requests_enabled",
           "needs_approval",
           "in_progress",
           "failed",
@@ -18814,7 +19117,7 @@
             "type": "string"
           },
           "message": {
-            "description": "A reason or error that came with the event",
+            "description": "A reason or error that came with the event. Withheld from API keys with scopes",
             "examples": [
               "auto approved"
             ],
@@ -20462,6 +20765,25 @@
           "title": {
             "type": "string"
           },
+          "title_args": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Values of the title_key message's placeholders by name, such as library for a generated library row; present only with title_key, and absent when the message has none",
+            "examples": [
+              {
+                "library": "Movies"
+              }
+            ],
+            "type": "object"
+          },
+          "title_key": {
+            "description": "Key of the shared translation catalog message whose English is title, present only while title is the server's own text: a built-in or generated section, recommendation row or request Discover row name, or a seasonal row's built-in in-season title. A client that has the key shows its translation, filling title_args, and otherwise shows title. Absent when an administrator or the profile typed the title, except that upgrading keyed existing titles identical to a built-in name, and a profile title equal to the administrator's keeps the key. A client acts on title_key whenever it is present",
+            "examples": [
+              "home.section.recentlyAddedIn"
+            ],
+            "type": "string"
+          },
           "updated_at": {
             "description": "RFC 3339 instant in UTC with millisecond precision",
             "format": "date-time",
@@ -20873,11 +21195,19 @@
               "type": "string"
             },
             "type": "array"
+          },
+          "managed_by_env_vars": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "The environment variable that sets each key in managed_by_env, keyed by setting key.",
+            "type": "object"
           }
         },
         "required": [
           "configured",
-          "managed_by_env"
+          "managed_by_env",
+          "managed_by_env_vars"
         ],
         "type": "object"
       },
@@ -22295,6 +22625,11 @@
             "minLength": 1,
             "type": "string"
           },
+          "episode_number": {
+            "description": "Episode number for an episode that still exists; absent otherwise",
+            "format": "int64",
+            "type": "integer"
+          },
           "last_attempt_at": {
             "description": "RFC 3339 instant in UTC with millisecond precision",
             "format": "date-time",
@@ -22316,10 +22651,20 @@
             "format": "int64",
             "type": "integer"
           },
+          "season_number": {
+            "description": "Season number for a season or episode that still exists; absent otherwise",
+            "format": "int64",
+            "type": "integer"
+          },
+          "series_title": {
+            "description": "Series title for a season or episode that still exists; absent otherwise",
+            "type": "string"
+          },
           "target_type": {
             "type": "string"
           },
           "title": {
+            "description": "The target's own title as stored: the item's, the season's or the episode's, without its series. Empty when the target has no title or no longer exists",
             "type": "string"
           },
           "type": {
@@ -26128,7 +26473,7 @@
         "additionalProperties": false,
         "properties": {
           "callback_url": {
-            "description": "Redirect URI to register at an OAuth (OIDC) provider for this installation, on the public URL; empty when no public URL is configured. Password (LDAP) providers do not use it",
+            "description": "Redirect URI to register at the OAuth provider. Empty for password providers, when the public URL is unset, or when the binding mode is unavailable.",
             "examples": [
               "https://silo.example.test/api/v2/auth/oauth/3/callback"
             ],
@@ -28899,6 +29244,10 @@
             ],
             "type": "string"
           },
+          "playability": {
+            "$ref": "#/components/schemas/CatalogVersionPlayability",
+            "description": "Whether this client can play the row; absent when no client capability block was sent or the pass could not finish"
+          },
           "probed_at": {
             "description": "When a probe last enumerated this row's stream table; absent means declared metadata only",
             "format": "date-time",
@@ -28930,6 +29279,27 @@
         ],
         "type": "object"
       },
+      "CatalogVersionPlayability": {
+        "additionalProperties": false,
+        "properties": {
+          "message": {
+            "description": "The start path's user-facing terminal message when playable is false",
+            "type": "string"
+          },
+          "playable": {
+            "description": "True when the planner can play this row for the requesting client",
+            "type": "boolean"
+          },
+          "reason": {
+            "description": "The start path's terminal reason when playable is false, for example hdr_transcode_unsupported",
+            "type": "string"
+          }
+        },
+        "required": [
+          "playable"
+        ],
+        "type": "object"
+      },
       "CatalogVersionsCheck": {
         "additionalProperties": false,
         "properties": {
@@ -28949,6 +29319,21 @@
       "CatalogVersionsCheckInputBody": {
         "additionalProperties": false,
         "properties": {
+          "client_capabilities": {
+            "$ref": "#/components/schemas/ClientCodecCapabilitiesV3",
+            "description": "The client's codec capability block from startPlayback; presence enables the playability verdict"
+          },
+          "client_features": {
+            "description": "The client's negotiated playback feature tokens, exactly as startPlayback sends them",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "client_playback_context": {
+            "$ref": "#/components/schemas/ClientPlaybackContextV3",
+            "description": "The client's delivery and output context from startPlayback; presence enables the playability verdict"
+          },
           "file_ids": {
             "description": "File identifiers from listCatalogItemVersions, at most 40 per request",
             "examples": [
@@ -28968,6 +29353,10 @@
             "maxItems": 40,
             "minItems": 1,
             "type": "array"
+          },
+          "playability_only": {
+            "description": "Report each row's durable health and client playability without resolving provider pins; requires client_capabilities and client_playback_context",
+            "type": "boolean"
           },
           "preprobe": {
             "description": "Ask for the single file's track inventory, enumerated synchronously under a short bound; requires exactly one file identifier",
@@ -29984,6 +30373,26 @@
             "description": "The page's items; empty, never null",
             "items": {
               "$ref": "#/components/schemas/AdminPluginInstallation"
+            },
+            "type": "array"
+          },
+          "page": {
+            "$ref": "#/components/schemas/PageInfo",
+            "description": "Cursor state; absent for bounded unpaginated collections"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "type": "object"
+      },
+      "CollectionAdminPluginProvisionStatus": {
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "description": "The page's items; empty, never null",
+            "items": {
+              "$ref": "#/components/schemas/AdminPluginProvisionStatus"
             },
             "type": "array"
           },
@@ -32452,6 +32861,7 @@
             "examples": [
               "https://silo.example.test/activate"
             ],
+            "format": "uri",
             "type": "string"
           },
           "verification_uri_complete": {
@@ -32754,6 +33164,279 @@
         ],
         "type": "object"
       },
+      "DirectConnectionsCapabilities": {
+        "additionalProperties": false,
+        "properties": {
+          "allowed": {
+            "description": "Whether the current principal may use the capability",
+            "type": "boolean"
+          },
+          "refresh": {
+            "type": "boolean"
+          },
+          "revision": {
+            "description": "Opaque revision of this document",
+            "type": "string"
+          },
+          "state": {
+            "description": "Support and configuration state, not health",
+            "enum": [
+              "available",
+              "disabled",
+              "not_configured",
+              "unsupported"
+            ],
+            "type": "string"
+          },
+          "status": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "status",
+          "refresh",
+          "revision",
+          "state",
+          "allowed"
+        ],
+        "type": "object"
+      },
+      "DirectConnectionsFeature": {
+        "additionalProperties": false,
+        "properties": {
+          "detail": {
+            "type": "string"
+          },
+          "feature": {
+            "enum": [
+              "direct",
+              "nat_mapping",
+              "nat_hairpin",
+              "ipv4",
+              "ipv6",
+              "port_mapping",
+              "reachability",
+              "socket_receive_buffer",
+              "socket_send_buffer",
+              "gso",
+              "gro",
+              "pmtu_fallback",
+              "cap_net_admin"
+            ],
+            "type": "string"
+          },
+          "granted": {
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "local",
+              "network"
+            ],
+            "type": "string"
+          },
+          "reason": {
+            "enum": [
+              "disabled",
+              "admin_off",
+              "kernel_unsupported",
+              "limit",
+              "force_failed",
+              "no_cap_net_admin",
+              "net_admin_dropped",
+              "unsupported_platform",
+              "probe_failed",
+              "not_available",
+              "no_gateway",
+              "gateway_unsupported",
+              "mapping_varies",
+              "not_measured"
+            ],
+            "type": "string"
+          },
+          "requested": {
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "on",
+              "off",
+              "capped",
+              "fallback",
+              "degraded",
+              "unknown"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "feature",
+          "kind",
+          "state"
+        ],
+        "type": "object"
+      },
+      "DirectConnectionsHostStatus": {
+        "additionalProperties": false,
+        "properties": {
+          "checked_at": {
+            "description": "RFC 3339 instant in UTC with millisecond precision",
+            "format": "date-time",
+            "pattern": "^(?:[1-9][0-9]{3}|0[1-9][0-9]{2}|00[1-9][0-9]|000[2-9])-",
+            "patternDescription": "a non-zero RFC 3339 instant",
+            "type": "string"
+          },
+          "features": {
+            "items": {
+              "$ref": "#/components/schemas/DirectConnectionsFeature"
+            },
+            "type": "array"
+          },
+          "host": {
+            "$ref": "#/components/schemas/NetworkAccessHostRef"
+          },
+          "knobs": {
+            "items": {
+              "$ref": "#/components/schemas/DirectConnectionsKnob"
+            },
+            "type": "array"
+          },
+          "listeners": {
+            "items": {
+              "$ref": "#/components/schemas/DirectConnectionsListener"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "host",
+          "checked_at",
+          "features",
+          "knobs"
+        ],
+        "type": "object"
+      },
+      "DirectConnectionsKnob": {
+        "additionalProperties": false,
+        "properties": {
+          "allowed": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "default": {
+            "type": "string"
+          },
+          "effective": {
+            "type": "string"
+          },
+          "env": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "requested": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "env",
+          "default",
+          "effective"
+        ],
+        "type": "object"
+      },
+      "DirectConnectionsListener": {
+        "additionalProperties": false,
+        "properties": {
+          "errno": {
+            "type": "string"
+          },
+          "granted": {
+            "type": "string"
+          },
+          "listener": {
+            "enum": [
+              "api",
+              "jellyfin",
+              "abs",
+              "proxy"
+            ],
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "requested": {
+            "type": "string"
+          },
+          "send_buffer": {
+            "$ref": "#/components/schemas/DirectConnectionsSendBuffer"
+          },
+          "state": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "listener",
+          "requested",
+          "granted",
+          "state",
+          "reason",
+          "send_buffer"
+        ],
+        "type": "object"
+      },
+      "DirectConnectionsSendBuffer": {
+        "additionalProperties": false,
+        "properties": {
+          "errno": {
+            "type": "string"
+          },
+          "granted": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "requested": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "state": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "requested",
+          "granted",
+          "state",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "DirectConnectionsStatus": {
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "hosts": {
+            "items": {
+              "$ref": "#/components/schemas/DirectConnectionsHostStatus"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "enabled",
+          "hosts"
+        ],
+        "type": "object"
+      },
       "DirectDownloadLink": {
         "additionalProperties": false,
         "properties": {
@@ -32964,6 +33647,25 @@
             ],
             "type": "string"
           },
+          "title_args": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Values of the title_key message's placeholders by name, such as library for a generated library row; present only with title_key, and absent when the message has none",
+            "examples": [
+              {
+                "library": "Movies"
+              }
+            ],
+            "type": "object"
+          },
+          "title_key": {
+            "description": "Key of the shared translation catalog message whose English is title, present only while title is the server's own text: a built-in or generated section, recommendation row or request Discover row name, or a seasonal row's built-in in-season title. A client that has the key shows its translation, filling title_args, and otherwise shows title. Absent when an administrator or the profile typed the title, except that upgrading keyed existing titles identical to a built-in name, and a profile title equal to the administrator's keeps the key. A client acts on title_key whenever it is present",
+            "examples": [
+              "home.section.recentlyAddedIn"
+            ],
+            "type": "string"
+          },
           "type": {
             "description": "What the row shows: tmdb_chart, tmdb_discover, tmdb_list or mdblist (title rows, in items), or studios, networks or genres (brand rows). More values may be added",
             "examples": [
@@ -33011,6 +33713,25 @@
           "title": {
             "examples": [
               "Trending Movies"
+            ],
+            "type": "string"
+          },
+          "title_args": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Values of the title_key message's placeholders by name, such as library for a generated library row; present only with title_key, and absent when the message has none",
+            "examples": [
+              {
+                "library": "Movies"
+              }
+            ],
+            "type": "object"
+          },
+          "title_key": {
+            "description": "Key of the shared translation catalog message whose English is title, present only while title is the server's own text: a built-in or generated section, recommendation row or request Discover row name, or a seasonal row's built-in in-season title. A client that has the key shows its translation, filling title_args, and otherwise shows title. Absent when an administrator or the profile typed the title, except that upgrading keyed existing titles identical to a built-in name, and a profile title equal to the administrator's keeps the key. A client acts on title_key whenever it is present",
+            "examples": [
+              "home.section.recentlyAddedIn"
             ],
             "type": "string"
           },
@@ -35586,6 +36307,13 @@
           "decoder_name": {
             "type": "string"
           },
+          "diagnostics": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "maxProperties": 32,
+            "type": "object"
+          },
           "message": {
             "type": "string"
           }
@@ -37049,6 +37777,13 @@
             ],
             "format": "int64",
             "type": "integer"
+          },
+          "section_title_keys": {
+            "description": "Sections, profile section settings, admin section definitions and recommendation rows carry title_key, with title_args when its message has placeholders, for titles the server writes, so a client can translate them (a few, such as an editorial row's subject title, have none; a client shows title whenever the key is absent or unknown), and profile section settings carry default_title_key and default_title_args the same way for default_title. Request Discover rows carry title_key the same way, and the section recipe gallery's presets carry display_name_key, description_short_key and description_long_key for their text; those came later, so a server that reports this flag may not send them. Informational: clients act on each key whenever it is present. Absent when the home sections service is not configured, and on a server that predates section title keys",
+            "examples": [
+              true
+            ],
+            "type": "boolean"
           },
           "state": {
             "description": "Support and configuration state, not health",
@@ -40336,6 +41071,14 @@
             "description": "TMDB image path",
             "type": "string"
           },
+          "poster_url": {
+            "description": "Admin request reads only (listAdminRequests and the admin request actions): the poster as a root-relative path on this server, getAdminRequestPoster, which serves the TMDB poster through the server. Fetch it with the credentials that read the row. It does not expire. Absent when the request has no TMDB poster, and on a server that cannot fetch posters (the admin request capabilities then report request_posters false)",
+            "examples": [
+              "/api/v2/admin/requests/1834729/poster"
+            ],
+            "format": "uri-reference",
+            "type": "string"
+          },
           "provider": {
             "examples": [
               "tmdb"
@@ -41924,16 +42667,7 @@
           "enabled": {
             "type": "boolean"
           },
-          "notify_continue_watching": {
-            "type": "boolean"
-          },
-          "notify_favorites": {
-            "type": "boolean"
-          },
           "notify_next_up": {
-            "type": "boolean"
-          },
-          "notify_watchlist": {
             "type": "boolean"
           },
           "profile_id": {
@@ -41948,9 +42682,6 @@
         "required": [
           "profile_id",
           "enabled",
-          "notify_favorites",
-          "notify_watchlist",
-          "notify_continue_watching",
           "notify_next_up"
         ],
         "type": "object"
@@ -42186,27 +42917,12 @@
       "NotificationSeriesReasons": {
         "additionalProperties": false,
         "properties": {
-          "continue_watching": {
-            "description": "The profile is partway through the series",
-            "type": "boolean"
-          },
-          "favorite": {
-            "description": "The series is one of the profile's favorites",
-            "type": "boolean"
-          },
           "next_up": {
             "description": "The profile finished an episode and waits for the next",
-            "type": "boolean"
-          },
-          "watchlist": {
-            "description": "The series is on the profile's watchlist",
             "type": "boolean"
           }
         },
         "required": [
-          "favorite",
-          "watchlist",
-          "continue_watching",
           "next_up"
         ],
         "type": "object"
@@ -42607,12 +43323,6 @@
             "minLength": 1,
             "type": "string"
           },
-          "notify_continue_watching": {
-            "type": "boolean"
-          },
-          "notify_favorites": {
-            "type": "boolean"
-          },
           "notify_next_up": {
             "type": "boolean"
           },
@@ -42620,9 +43330,6 @@
             "type": "boolean"
           },
           "notify_requests": {
-            "type": "boolean"
-          },
-          "notify_watchlist": {
             "type": "boolean"
           },
           "type": {
@@ -42708,12 +43415,6 @@
           "name": {
             "type": "string"
           },
-          "notify_continue_watching": {
-            "type": "boolean"
-          },
-          "notify_favorites": {
-            "type": "boolean"
-          },
           "notify_next_up": {
             "type": "boolean"
           },
@@ -42721,9 +43422,6 @@
             "type": "boolean"
           },
           "notify_requests": {
-            "type": "boolean"
-          },
-          "notify_watchlist": {
             "type": "boolean"
           },
           "type": {
@@ -42744,9 +43442,6 @@
           "type",
           "url_host",
           "enabled",
-          "notify_favorites",
-          "notify_watchlist",
-          "notify_continue_watching",
           "notify_next_up",
           "notify_requests",
           "notify_ratings",
@@ -42780,12 +43475,6 @@
           "name": {
             "type": "string"
           },
-          "notify_continue_watching": {
-            "type": "boolean"
-          },
-          "notify_favorites": {
-            "type": "boolean"
-          },
           "notify_next_up": {
             "type": "boolean"
           },
@@ -42793,9 +43482,6 @@
             "type": "boolean"
           },
           "notify_requests": {
-            "type": "boolean"
-          },
-          "notify_watchlist": {
             "type": "boolean"
           },
           "url": {
@@ -42881,6 +43567,10 @@
             "description": "Whether startOAuthLogin, initOAuthLogin and startNativeOAuthLogin accept prompt=select_account, which asks the provider to let the person choose another provider account (a Switch account sign-in)",
             "type": "boolean"
           },
+          "stable_callback": {
+            "description": "Whether finishStableOAuthCallback accepts provider redirects for bindings using the stable callback mode",
+            "type": "boolean"
+          },
           "state": {
             "description": "Support and configuration state, not health",
             "enum": [
@@ -42897,6 +43587,7 @@
           "native",
           "linking",
           "provider_logout",
+          "stable_callback",
           "select_account",
           "revision",
           "state"
@@ -44984,6 +45675,18 @@
           },
           "stream": {
             "$ref": "#/components/schemas/StreamV3"
+          },
+          "substituted_from_file_id": {
+            "description": "Opaque identifier",
+            "examples": [
+              "1"
+            ],
+            "minLength": 1,
+            "type": "string"
+          },
+          "substitution_reason": {
+            "description": "Machine-readable cause of a version substitution; only present with substituted_from_file_id. A client must treat an unknown value as a generic substitution.",
+            "type": "string"
           },
           "subtitle": {
             "$ref": "#/components/schemas/SubtitleDecisionV3"
@@ -47296,6 +47999,7 @@
             "type": "string"
           },
           "library_restrictions_enabled": {
+            "description": "Whether the profile is limited to allowed_library_ids within its account's libraries. The primary profile is never limited: it sees every library its account can access and hides libraries through its settings instead",
             "examples": [
               false
             ],
@@ -47457,6 +48161,15 @@
             ],
             "type": "boolean"
           },
+          "max_profiles": {
+            "description": "How many profiles this account may have, from its effective access policy; createProfile answers 409 once the household holds this many. Omitted on a remote-playback handoff, which lists only its own profile and cannot create one, and when the server could not read the limit; in that second case a client keeps offering new profiles and createProfile stays the check",
+            "examples": [
+              5
+            ],
+            "format": "int64",
+            "minimum": 1,
+            "type": "integer"
+          },
           "page": {
             "$ref": "#/components/schemas/PageInfo",
             "description": "Cursor state; absent for bounded unpaginated collections"
@@ -47481,7 +48194,7 @@
         "additionalProperties": false,
         "properties": {
           "allowed_library_ids": {
-            "description": "Unique library identifiers the profile may see when restrictions are enabled",
+            "description": "Unique library identifiers the profile may see when restrictions are enabled. Must be empty on an account's first profile, which becomes its primary profile, even with restrictions off",
             "examples": [
               [
                 "1",
@@ -47544,6 +48257,7 @@
             "type": "string"
           },
           "library_restrictions_enabled": {
+            "description": "Limits the profile to allowed_library_ids. Must be false or omitted on an account's first profile, which becomes its primary profile",
             "examples": [
               false
             ],
@@ -47810,6 +48524,88 @@
         ],
         "type": "object"
       },
+      "ProfileSectionBaseline": {
+        "additionalProperties": false,
+        "properties": {
+          "section_tokens": {
+            "description": "Opaque server-keyed tokens, bound to the acting profile, for every server section on this page in a library the profile is allowed (enabled, disabled, or fallback defaults when no stored row is enabled), sorted deterministically. Rows tied to libraries the profile isn't allowed are left out.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "visible_sections": {
+            "description": "Pre-override active server sections the acting profile's access policy permits, in display order",
+            "items": {
+              "$ref": "#/components/schemas/ProfileSectionBaselineRow"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "section_tokens",
+          "visible_sections"
+        ],
+        "type": "object"
+      },
+      "ProfileSectionBaselineRow": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "examples": [
+              "s-continue-watching"
+            ],
+            "type": "string"
+          },
+          "section_type": {
+            "description": "The recipe; the set is extensible",
+            "examples": [
+              "continue_watching"
+            ],
+            "type": "string"
+          },
+          "title": {
+            "description": "The server's title for this row before any profile overrides",
+            "examples": [
+              "Continue Watching"
+            ],
+            "type": "string"
+          },
+          "title_args": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Values of the title_key message's placeholders by name, such as library for a generated library row; present only with title_key, and absent when the message has none",
+            "examples": [
+              {
+                "library": "Movies"
+              }
+            ],
+            "type": "object"
+          },
+          "title_key": {
+            "description": "Key of the shared translation catalog message whose English is title, present only while title is the server's own text: a built-in or generated section, recommendation row or request Discover row name, or a seasonal row's built-in in-season title. A client that has the key shows its translation, filling title_args, and otherwise shows title. Absent when an administrator or the profile typed the title, except that upgrading keyed existing titles identical to a built-in name, and a profile title equal to the administrator's keeps the key. A client acts on title_key whenever it is present",
+            "examples": [
+              "home.section.recentlyAddedIn"
+            ],
+            "type": "string"
+          },
+          "token": {
+            "description": "Opaque server-keyed token identifying this server section on this page for the acting profile, for layout export and import comparisons",
+            "examples": [
+              "m3s9R1pQv8fK2nL7wX4yZA"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "section_type",
+          "title",
+          "token"
+        ],
+        "type": "object"
+      },
       "ProfileSectionFlags": {
         "additionalProperties": false,
         "properties": {
@@ -47820,10 +48616,18 @@
               true
             ],
             "type": "boolean"
+          },
+          "home_layout_baseline": {
+            "description": "True when this server serves getProfileSectionBaseline, so a home layout export can record the server's rows and an import on this server can offer to hide rows added since.",
+            "examples": [
+              true
+            ],
+            "type": "boolean"
           }
         },
         "required": [
-          "allow_profile_custom_sections"
+          "allow_profile_custom_sections",
+          "home_layout_baseline"
         ],
         "type": "object"
       },
@@ -47847,6 +48651,25 @@
             "description": "The administrator's title for this row; title shows it unless the profile saved a title override. Empty for a section the profile built",
             "examples": [
               "Continue Watching"
+            ],
+            "type": "string"
+          },
+          "default_title_args": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Values of the default_title_key message's placeholders by name; present only with default_title_key, and absent when the message has none",
+            "examples": [
+              {
+                "library": "Movies"
+              }
+            ],
+            "type": "object"
+          },
+          "default_title_key": {
+            "description": "Key of the shared translation catalog message whose English is default_title, under the same rules as title_key: present only while default_title is the server's own text, and absent when an administrator typed it",
+            "examples": [
+              "home.section.continueWatching"
             ],
             "type": "string"
           },
@@ -47901,6 +48724,25 @@
             "description": "The title this profile sees: its own title override, or the administrator's title",
             "examples": [
               "Continue Watching"
+            ],
+            "type": "string"
+          },
+          "title_args": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Values of the title_key message's placeholders by name, such as library for a generated library row; present only with title_key, and absent when the message has none",
+            "examples": [
+              {
+                "library": "Movies"
+              }
+            ],
+            "type": "object"
+          },
+          "title_key": {
+            "description": "Key of the shared translation catalog message whose English is title, present only while title is the server's own text: a built-in or generated section, recommendation row or request Discover row name, or a seasonal row's built-in in-season title. A client that has the key shows its translation, filling title_args, and otherwise shows title. Absent when an administrator or the profile typed the title, except that upgrading keyed existing titles identical to a built-in name, and a profile title equal to the administrator's keeps the key. A client acts on title_key whenever it is present",
+            "examples": [
+              "home.section.recentlyAddedIn"
             ],
             "type": "string"
           }
@@ -48012,6 +48854,7 @@
             ]
           },
           "library_restrictions_enabled": {
+            "description": "Limits the profile to allowed_library_ids. The primary profile can't be limited: true, or a non-empty allowed_library_ids, fails validation on it",
             "examples": [
               false
             ],
@@ -48044,7 +48887,8 @@
             "description": "Playback ceiling; null removes it",
             "enum": [
               "1080p",
-              "2160p"
+              "2160p",
+              null
             ],
             "examples": [
               "1080p"
@@ -49190,15 +50034,36 @@
             "description": "Empty when the preset has none",
             "type": "string"
           },
+          "description_long_key": {
+            "description": "Key of the shared translation catalog message whose English is description_long; absent when the preset has no description_long",
+            "examples": [
+              "home.recipe.seAuto.details"
+            ],
+            "type": "string"
+          },
           "description_short": {
             "examples": [
               "Items added in the last seven days"
             ],
             "type": "string"
           },
+          "description_short_key": {
+            "description": "Key of the shared translation catalog message whose English is description_short, with the same fallback",
+            "examples": [
+              "home.recipe.mwWeek.description"
+            ],
+            "type": "string"
+          },
           "display_name": {
             "examples": [
               "New this week"
+            ],
+            "type": "string"
+          },
+          "display_name_key": {
+            "description": "Key of the shared translation catalog message whose English is display_name. A client that has the key shows its translation and otherwise display_name",
+            "examples": [
+              "home.recipe.mwWeek.name"
             ],
             "type": "string"
           },
@@ -49253,6 +50118,25 @@
             "description": "Display label",
             "examples": [
               "Because you enjoy Crime"
+            ],
+            "type": "string"
+          },
+          "title_args": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Values of the title_key message's placeholders by name, such as library for a generated library row; present only with title_key, and absent when the message has none",
+            "examples": [
+              {
+                "library": "Movies"
+              }
+            ],
+            "type": "object"
+          },
+          "title_key": {
+            "description": "Key of the shared translation catalog message whose English is title, present only while title is the server's own text: a built-in or generated section, recommendation row or request Discover row name, or a seasonal row's built-in in-season title. A client that has the key shows its translation, filling title_args, and otherwise shows title. Absent when an administrator or the profile typed the title, except that upgrading keyed existing titles identical to a built-in name, and a profile title equal to the administrator's keeps the key. A client acts on title_key whenever it is present",
+            "examples": [
+              "home.section.recentlyAddedIn"
             ],
             "type": "string"
           },
@@ -50647,6 +51531,25 @@
             ],
             "type": "string"
           },
+          "title_args": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Values of the title_key message's placeholders by name, such as library for a generated library row; present only with title_key, and absent when the message has none",
+            "examples": [
+              {
+                "library": "Movies"
+              }
+            ],
+            "type": "object"
+          },
+          "title_key": {
+            "description": "Key of the shared translation catalog message whose English is title, present only while title is the server's own text: a built-in or generated section, recommendation row or request Discover row name, or a seasonal row's built-in in-season title. A client that has the key shows its translation, filling title_args, and otherwise shows title. Absent when an administrator or the profile typed the title, except that upgrading keyed existing titles identical to a built-in name, and a profile title equal to the administrator's keeps the key. A client acts on title_key whenever it is present",
+            "examples": [
+              "home.section.recentlyAddedIn"
+            ],
+            "type": "string"
+          },
           "total_count": {
             "description": "Items the section has in total, at least the number returned",
             "examples": [
@@ -50746,6 +51649,25 @@
           "title": {
             "examples": [
               "Recently Added"
+            ],
+            "type": "string"
+          },
+          "title_args": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Values of the title_key message's placeholders by name, such as library for a generated library row; present only with title_key, and absent when the message has none",
+            "examples": [
+              {
+                "library": "Movies"
+              }
+            ],
+            "type": "object"
+          },
+          "title_key": {
+            "description": "Key of the shared translation catalog message whose English is title, present only while title is the server's own text: a built-in or generated section, recommendation row or request Discover row name, or a seasonal row's built-in in-season title. A client that has the key shows its translation, filling title_args, and otherwise shows title. Absent when an administrator or the profile typed the title, except that upgrading keyed existing titles identical to a built-in name, and a profile title equal to the administrator's keeps the key. A client acts on title_key whenever it is present",
+            "examples": [
+              "home.section.recentlyAddedIn"
             ],
             "type": "string"
           }
@@ -55526,6 +56448,10 @@
           "dv_rpu_present": {
             "type": "boolean"
           },
+          "frame_color_range": {
+            "description": "Color range FFmpeg reported on the first decoded frame of a PQ track (tv, pc, or unknown when the frame carried none); absent when the frame was not read. Can differ from color_range, the container's tag",
+            "type": "string"
+          },
           "frame_rate": {
             "type": "string"
           },
@@ -59801,7 +60727,32 @@
   "paths": {
     "/api/v2/account/identities": {
       "get": {
+        "description": "Every profile on the account may read the list. can_unlink answers for the profile X-Profile-Id names, or for a request that names none, by deleteAccountIdentity's rule: a profile other than the account's primary one reads false.",
         "operationId": "listAccountIdentities",
+        "parameters": [
+          {
+            "description": "Optional. When present, it must name a profile of the authenticated account.",
+            "in": "header",
+            "name": "X-Profile-Id",
+            "schema": {
+              "examples": [
+                "1"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked",
+            "in": "header",
+            "name": "X-Profile-Token",
+            "schema": {
+              "examples": [
+                "pvt_5f3a9c1e7b2d4e8fa0c6"
+              ],
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -59832,6 +60783,26 @@
               }
             },
             "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
           },
           "406": {
             "content": {
@@ -59893,7 +60864,7 @@
         "tags": [
           "account"
         ],
-        "x-silo-class": "authenticated",
+        "x-silo-class": "profile_scoped",
         "x-silo-service-backed": true
       }
     },
@@ -60754,9 +61725,31 @@
     },
     "/api/v2/account/identities/{id}": {
       "delete": {
-        "description": "Allowed only while the account can still sign in another way: its local password (with local password sign-in on, or as a break-glass account) or another identity; otherwise 409 last_sign_in_method. An API key or an impersonation session is refused with 403.",
+        "description": "How the account signs in belongs to the whole household, so only the account's household manager may disconnect an identity. X-Profile-Id must name the account's primary profile, with X-Profile-Token when that profile is PIN-protected (without it the request is 403 profile_verification_required); naming any other profile is 403 permission_denied, including on an admin account. A request without X-Profile-Id is accepted only from an admin account's login session while no profile on the account is PIN-protected or access-restricted; otherwise it is 403 permission_denied. Allowed only while the account can still sign in another way: its local password (with local password sign-in on, or as a break-glass account) or another identity; otherwise 409 last_sign_in_method. An API key or an impersonation session is refused with 403 permission_denied.",
         "operationId": "deleteAccountIdentity",
         "parameters": [
+          {
+            "description": "Optional. When present, it must name a profile of the authenticated account.",
+            "in": "header",
+            "name": "X-Profile-Id",
+            "schema": {
+              "examples": [
+                "1"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked",
+            "in": "header",
+            "name": "X-Profile-Token",
+            "schema": {
+              "examples": [
+                "pvt_5f3a9c1e7b2d4e8fa0c6"
+              ],
+              "type": "string"
+            }
+          },
           {
             "description": "Identity id",
             "in": "path",
@@ -60886,7 +61879,7 @@
         "tags": [
           "account"
         ],
-        "x-silo-class": "authenticated",
+        "x-silo-class": "profile_scoped",
         "x-silo-retry-safety": "natural_idempotent",
         "x-silo-service-backed": true
       }
@@ -64291,7 +65284,7 @@
             "bearerAuth": []
           }
         ],
-        "summary": "Disconnect a provider and discard its key. A provider a job uses cannot be deleted.",
+        "summary": "Disconnect a provider and discard its key. A provider a job uses cannot be deleted, and one the deployment declares (managed_by_env_var) is 422 validation_failed with code managed_by_environment.",
         "tags": [
           "admin-ai"
         ],
@@ -64483,7 +65476,7 @@
             "bearerAuth": []
           }
         ],
-        "summary": "Edit a provider. Every job using it switches to the new values at once. Its type is fixed, and a new host needs its key in the same request.",
+        "summary": "Edit a provider. Every job using it switches to the new values at once. Its type is fixed, and a new host needs its key in the same request. A provider the deployment declares (managed_by_env_var) is 422 validation_failed with code managed_by_environment.",
         "tags": [
           "admin-ai"
         ],
@@ -82708,6 +83701,359 @@
         "x-silo-class": "acting_admin",
         "x-silo-raw-protocol": "diagnostic-bundle",
         "x-silo-raw-reason": "The existing administrator consumer downloads a gzip archive; bytes must not pass through JSON encoding or response buffering.",
+        "x-silo-service-backed": true
+      }
+    },
+    "/api/v2/admin/direct-connections/capabilities": {
+      "get": {
+        "operationId": "getAdminDirectConnectionsCapabilities",
+        "parameters": [
+          {
+            "description": "Optional first precondition, evaluated before If-None-Match: a tag that does not match the current representation is 412 precondition_failed.",
+            "in": "header",
+            "name": "If-Match",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted.",
+            "in": "header",
+            "name": "X-Profile-Id",
+            "schema": {
+              "examples": [
+                "1"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked",
+            "in": "header",
+            "name": "X-Profile-Token",
+            "schema": {
+              "examples": [
+                "pvt_5f3a9c1e7b2d4e8fa0c6"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "If-None-Match",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DirectConnectionsCapabilities"
+                }
+              }
+            },
+            "description": "OK",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "ETag": {
+                "description": "The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "304": {
+            "description": "The representation named by If-None-Match is current; no body.",
+            "headers": {
+              "ETag": {
+                "description": "The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "406": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Acceptable"
+          },
+          "412": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Precondition Failed",
+            "headers": {
+              "ETag": {
+                "description": "The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Discover direct-connection readiness operations and service configuration, independently of probe health and the hidden setting.",
+        "tags": [
+          "direct-connections"
+        ],
+        "x-silo-class": "acting_admin",
+        "x-silo-conditional": true,
+        "x-silo-service-backed": true
+      }
+    },
+    "/api/v2/admin/direct-connections/status": {
+      "get": {
+        "operationId": "getAdminDirectConnectionsStatus",
+        "parameters": [
+          {
+            "description": "Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted.",
+            "in": "header",
+            "name": "X-Profile-Id",
+            "schema": {
+              "examples": [
+                "1"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked",
+            "in": "header",
+            "name": "X-Profile-Token",
+            "schema": {
+              "examples": [
+                "pvt_5f3a9c1e7b2d4e8fa0c6"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Run a new check, or wait for the in-flight check. The settings read and the check have separate fifteen-second bounds, so a request can take about thirty seconds",
+            "explode": false,
+            "in": "query",
+            "name": "refresh",
+            "schema": {
+              "default": false,
+              "description": "Run a new check, or wait for the in-flight check. The settings read and the check have separate fifteen-second bounds, so a request can take about thirty seconds",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DirectConnectionsStatus"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "406": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Acceptable"
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Read the API host's direct-connection readiness. Network probes run only when the hidden setting is enabled. Refresh joins an in-flight check or starts a new one. The settings read and the check have separate fifteen-second bounds, so a request can take about thirty seconds.",
+        "tags": [
+          "direct-connections"
+        ],
+        "x-silo-class": "acting_admin",
         "x-silo-service-backed": true
       }
     },
@@ -103963,6 +105309,16 @@
             },
             "description": "Not Acceptable"
           },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
           "412": {
             "content": {
               "application/problem+json": {
@@ -108286,6 +109642,205 @@
         "x-silo-conditional": true
       }
     },
+    "/api/v2/admin/plugins/capabilities": {
+      "get": {
+        "operationId": "getAdminPluginCapabilities",
+        "parameters": [
+          {
+            "description": "Optional first precondition, evaluated before If-None-Match: a tag that does not match the current representation is 412 precondition_failed.",
+            "in": "header",
+            "name": "If-Match",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted.",
+            "in": "header",
+            "name": "X-Profile-Id",
+            "schema": {
+              "examples": [
+                "1"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked",
+            "in": "header",
+            "name": "X-Profile-Token",
+            "schema": {
+              "examples": [
+                "pvt_5f3a9c1e7b2d4e8fa0c6"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "If-None-Match",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminPluginCapabilities"
+                }
+              }
+            },
+            "description": "OK",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "ETag": {
+                "description": "The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "304": {
+            "description": "The representation named by If-None-Match is current; no body.",
+            "headers": {
+              "ETag": {
+                "description": "The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "406": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Acceptable"
+          },
+          "412": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Precondition Failed",
+            "headers": {
+              "ETag": {
+                "description": "The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Discover plugin administration features.",
+        "tags": [
+          "admin-plugins"
+        ],
+        "x-silo-class": "acting_admin",
+        "x-silo-conditional": true
+      }
+    },
     "/api/v2/admin/plugins/catalog": {
       "get": {
         "operationId": "listAdminPluginCatalog",
@@ -111131,6 +112686,148 @@
         "x-silo-class": "acting_admin",
         "x-silo-demo-restricted": true,
         "x-silo-retry-safety": "non_retryable",
+        "x-silo-service-backed": true
+      }
+    },
+    "/api/v2/admin/plugins/provisioning-status": {
+      "get": {
+        "operationId": "listAdminPluginProvisioningStatus",
+        "parameters": [
+          {
+            "description": "Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted.",
+            "in": "header",
+            "name": "X-Profile-Id",
+            "schema": {
+              "examples": [
+                "1"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked",
+            "in": "header",
+            "name": "X-Profile-Token",
+            "schema": {
+              "examples": [
+                "pvt_5f3a9c1e7b2d4e8fa0c6"
+              ],
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CollectionAdminPluginProvisionStatus"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "406": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Acceptable"
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Read recorded environment provisioning status, including declarations with no installation.",
+        "tags": [
+          "admin-plugins"
+        ],
+        "x-silo-class": "acting_admin",
         "x-silo-service-backed": true
       }
     },
@@ -124032,6 +125729,141 @@
           "admin"
         ],
         "x-silo-class": "acting_admin",
+        "x-silo-service-backed": true
+      }
+    },
+    "/api/v2/admin/requests/{id}/poster": {
+      "get": {
+        "operationId": "getAdminRequestPoster",
+        "parameters": [
+          {
+            "description": "The request",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted.",
+            "in": "header",
+            "name": "X-Profile-Id",
+            "schema": {
+              "examples": [
+                "1"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked",
+            "in": "header",
+            "name": "X-Profile-Token",
+            "schema": {
+              "examples": [
+                "pvt_5f3a9c1e7b2d4e8fa0c6"
+              ],
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "image/*": {
+                "schema": {
+                  "contentMediaType": "application/octet-stream",
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Poster bytes"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No such request, the request has no TMDB poster, or TMDB refused or failed"
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Poster fetches are busy or not configured; retry after Retry-After"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Read a media request's poster through the server, from the path admin request reads return in poster_url.",
+        "tags": [
+          "admin"
+        ],
+        "x-silo-class": "acting_admin",
+        "x-silo-raw-protocol": "artwork-image",
+        "x-silo-raw-reason": "Poster bytes bypass JSON encoding.",
         "x-silo-service-backed": true
       }
     },
@@ -146209,6 +148041,78 @@
         ],
         "x-silo-class": "public",
         "x-silo-retry-safety": "non_retryable",
+        "x-silo-service-backed": true
+      }
+    },
+    "/api/v2/auth/oauth/callback": {
+      "get": {
+        "description": "Accepts only the browser holding the flow's binding cookie. A web sign-in continues to /login/oauth-complete?code=; a failure to /login?error=oauth_failed\u0026reason=\u003creason\u003e (not_permitted, account_required, email_in_use, identity_linked_elsewhere, account_disabled, provider_unavailable, state_invalid, session_expired, already_linked, login_failed). A web linking flow returns to its next path with linked=1 or error=oauth_link_failed\u0026reason=\u003creason\u003e; a native flow to the app redirect, which carries iss (see startNativeOAuthLogin).",
+        "operationId": "finishStableOAuthCallback",
+        "parameters": [
+          {
+            "description": "Provider redirect value; validated by the owning handshake.",
+            "in": "query",
+            "name": "state",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Provider redirect value; validated by the owning handshake.",
+            "in": "query",
+            "name": "code",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Provider redirect value; validated by the owning handshake.",
+            "in": "query",
+            "name": "error",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "302": {
+            "description": "Redirect: to the provider, to the same start on the public origin, or to the flow's completion or failure location.",
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Plain-text handshake failure."
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "summary": "Continue the OAuth handshake at the provider's redirect back.",
+        "tags": [
+          "auth"
+        ],
+        "x-silo-class": "public",
+        "x-silo-raw-protocol": "oauth-redirect",
+        "x-silo-raw-reason": "Browser form submission and provider callback require HTTP redirects, without JSON negotiation.",
         "x-silo-service-backed": true
       }
     },
@@ -171890,164 +173794,6 @@
         "x-silo-retry-safety": "natural_idempotent",
         "x-silo-service-backed": true
       },
-      "get": {
-        "operationId": "getDownload",
-        "parameters": [
-          {
-            "description": "The household profile acting for this request; it must belong to the authenticated account.",
-            "in": "header",
-            "name": "X-Profile-Id",
-            "required": true,
-            "schema": {
-              "examples": [
-                "1"
-              ],
-              "type": "string"
-            }
-          },
-          {
-            "description": "Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked",
-            "in": "header",
-            "name": "X-Profile-Token",
-            "schema": {
-              "examples": [
-                "pvt_5f3a9c1e7b2d4e8fa0c6"
-              ],
-              "type": "string"
-            }
-          },
-          {
-            "in": "path",
-            "name": "id",
-            "required": true,
-            "schema": {
-              "minLength": 1,
-              "type": "string"
-            }
-          },
-          {
-            "in": "header",
-            "name": "X-Vio-Device-Id",
-            "schema": {
-              "maxLength": 128,
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DownloadEntry"
-                }
-              }
-            },
-            "description": "OK"
-          },
-          "400": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Bad Request"
-          },
-          "401": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Unauthorized"
-          },
-          "403": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Forbidden"
-          },
-          "404": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Not Found"
-          },
-          "406": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Not Acceptable"
-          },
-          "422": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Unprocessable Entity"
-          },
-          "429": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Too Many Requests"
-          },
-          "500": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Internal Server Error"
-          },
-          "503": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Service Unavailable"
-          }
-        },
-        "security": [
-          {
-            "bearerAuth": []
-          }
-        ],
-        "summary": "Read one device-managed download, or one of the account's ephemeral downloads.",
-        "tags": [
-          "downloads"
-        ],
-        "x-silo-class": "profile_scoped",
-        "x-silo-service-backed": true
-      },
       "patch": {
         "operationId": "reportDownloadStatus",
         "parameters": [
@@ -181931,7 +183677,7 @@
             "bearerAuth": []
           }
         ],
-        "summary": "The home page's sections with their cards, as the acting profile sees them.",
+        "summary": "The home page's sections that have cards for the acting profile, with those cards.",
         "tags": [
           "home"
         ],
@@ -182907,6 +184653,96 @@
         ],
         "x-silo-class": "public",
         "x-silo-retry-safety": "non_retryable",
+        "x-silo-service-backed": true
+      }
+    },
+    "/api/v2/item-posters/{content_id}": {
+      "get": {
+        "operationId": "getItemPoster",
+        "parameters": [
+          {
+            "description": "Content ID of the movie or series whose poster the link names.",
+            "in": "path",
+            "name": "content_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "exp",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "sig",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "image/*": {
+                "schema": {
+                  "contentMediaType": "application/octet-stream",
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Poster bytes of art not cached yet"
+          },
+          "302": {
+            "description": "Redirect to the cached poster's signed URL",
+            "headers": {
+              "Location": {
+                "schema": {
+                  "format": "uri-reference",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Link invalid or expired, item gone, no poster, or the provider refused or failed"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Poster request rate limit exceeded",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Poster fetches are busy or not configured; retry after Retry-After"
+          }
+        },
+        "summary": "Read a catalog item's current poster from a signed link that admin reads return in poster_url. Cached art redirects to its stored object; art not cached yet is fetched from its provider through the server and queued for caching.",
+        "tags": [
+          "artwork"
+        ],
+        "x-silo-class": "public",
+        "x-silo-raw-protocol": "artwork-image",
+        "x-silo-raw-reason": "Poster bytes and redirects bypass JSON encoding.",
         "x-silo-service-backed": true
       }
     },
@@ -189482,7 +191318,7 @@
             "bearerAuth": []
           }
         ],
-        "summary": "The library's sections with their cards, as the acting profile sees them.",
+        "summary": "The library's sections that have cards for the acting profile, with those cards.",
         "tags": [
           "libraries"
         ],
@@ -194305,7 +196141,7 @@
         "operationId": "unsubscribeNotificationEmail",
         "parameters": [
           {
-            "description": "Email capability token. Missing, expired or consumed proof returns an HTML error page.",
+            "description": "Email capability token. Missing proof returns an HTML error page; validity is checked only when the confirmation is submitted with POST.",
             "in": "query",
             "name": "token",
             "schema": {
@@ -194409,7 +196245,7 @@
             "description": "Service Unavailable"
           }
         },
-        "summary": "Process a tokenized notification email link and render its standalone result.",
+        "summary": "Render an unsubscribe confirmation page without changing email preferences.",
         "tags": [
           "notifications"
         ],
@@ -194422,7 +196258,7 @@
         "operationId": "unsubscribeNotificationEmailOneClick",
         "parameters": [
           {
-            "description": "Email capability token. Missing, expired or consumed proof returns an HTML error page.",
+            "description": "Email capability token. Missing or unknown proof returns an HTML error page. The token stays valid after use.",
             "in": "query",
             "name": "token",
             "schema": {
@@ -205756,6 +207592,181 @@
         "x-silo-class": "profile_scoped",
         "x-silo-demo-restricted": true,
         "x-silo-retry-safety": "non_retryable",
+        "x-silo-service-backed": true
+      }
+    },
+    "/api/v2/profile/sections/baseline": {
+      "get": {
+        "operationId": "getProfileSectionBaseline",
+        "parameters": [
+          {
+            "description": "The household profile acting for this request; it must belong to the authenticated account.",
+            "in": "header",
+            "name": "X-Profile-Id",
+            "required": true,
+            "schema": {
+              "examples": [
+                "1"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked",
+            "in": "header",
+            "name": "X-Profile-Token",
+            "schema": {
+              "examples": [
+                "pvt_5f3a9c1e7b2d4e8fa0c6"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "The page the overrides apply to",
+            "explode": false,
+            "in": "query",
+            "name": "scope",
+            "schema": {
+              "default": "home",
+              "description": "The page the overrides apply to",
+              "enum": [
+                "home",
+                "library"
+              ],
+              "examples": [
+                "home"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "The library; required when scope is library and refused otherwise",
+            "explode": false,
+            "in": "query",
+            "name": "library_id",
+            "schema": {
+              "description": "The library; required when scope is library and refused otherwise",
+              "examples": [
+                "1"
+              ],
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProfileSectionBaseline"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "406": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Acceptable"
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Get one page's pre-override server section baseline for home layout export and import.",
+        "tags": [
+          "profile_sections"
+        ],
+        "x-silo-class": "profile_scoped",
         "x-silo-service-backed": true
       }
     },
@@ -223198,6 +225209,17 @@
             }
           },
           {
+            "description": "Set to refuse by the server on a server_remux_progressive URL whose attempt listed progressive_range_refusal_v1 in deliveries.progressive.features. A progressive remux streams from its seek origin and cannot resume: with it, a GET whose Range starts past byte 0 (or is a suffix range) answers 409 before the remux starts, and the client reopens the stream at its current position. Without it such a range streams from the origin with 200.",
+            "in": "query",
+            "name": "remux_range",
+            "schema": {
+              "enum": [
+                "refuse"
+              ],
+              "type": "string"
+            }
+          },
+          {
             "in": "header",
             "name": "If-Match",
             "schema": {
@@ -223771,6 +225793,17 @@
             "in": "query",
             "name": "st",
             "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Set to refuse by the server on a server_remux_progressive URL whose attempt listed progressive_range_refusal_v1 in deliveries.progressive.features. A progressive remux streams from its seek origin and cannot resume: with it, a GET whose Range starts past byte 0 (or is a suffix range) answers 409 before the remux starts, and the client reopens the stream at its current position. Without it such a range streams from the origin with 200.",
+            "in": "query",
+            "name": "remux_range",
+            "schema": {
+              "enum": [
+                "refuse"
+              ],
               "type": "string"
             }
           },
@@ -239259,6 +241292,7 @@
     },
     "/api/v2/webhook-sync/connections": {
       "get": {
+        "description": "Webhook sync connections are account-wide: a connection's receiver URL carries its secret, and its mappings choose which profile an external user's watch state is written to. Only the account's household manager may read or change them. X-Profile-Id must name the account's primary profile, with X-Profile-Token when that profile is PIN-protected (without it the request is 403 profile_verification_required); naming any other profile is 403 permission_denied, including on an admin account. A request without X-Profile-Id is accepted only from an admin account's API key, or from an admin account's login session while no profile on the account is PIN-protected or access-restricted; otherwise it is 403 permission_denied.",
         "operationId": "listWebhookConnections",
         "parameters": [
           {
@@ -239434,6 +241468,7 @@
         "x-silo-service-backed": true
       },
       "post": {
+        "description": "Webhook sync connections are account-wide: a connection's receiver URL carries its secret, and its mappings choose which profile an external user's watch state is written to. Only the account's household manager may read or change them. X-Profile-Id must name the account's primary profile, with X-Profile-Token when that profile is PIN-protected (without it the request is 403 profile_verification_required); naming any other profile is 403 permission_denied, including on an admin account. A request without X-Profile-Id is accepted only from an admin account's API key, or from an admin account's login session while no profile on the account is PIN-protected or access-restricted; otherwise it is 403 permission_denied.",
         "operationId": "createWebhookConnection",
         "parameters": [
           {
@@ -239628,6 +241663,7 @@
     },
     "/api/v2/webhook-sync/connections/{id}": {
       "delete": {
+        "description": "Webhook sync connections are account-wide: a connection's receiver URL carries its secret, and its mappings choose which profile an external user's watch state is written to. Only the account's household manager may read or change them. X-Profile-Id must name the account's primary profile, with X-Profile-Token when that profile is PIN-protected (without it the request is 403 profile_verification_required); naming any other profile is 403 permission_denied, including on an admin account. A request without X-Profile-Id is accepted only from an admin account's API key, or from an admin account's login session while no profile on the account is PIN-protected or access-restricted; otherwise it is 403 permission_denied.",
         "operationId": "deleteWebhookConnection",
         "parameters": [
           {
@@ -239782,6 +241818,7 @@
         "x-silo-service-backed": true
       },
       "put": {
+        "description": "Webhook sync connections are account-wide: a connection's receiver URL carries its secret, and its mappings choose which profile an external user's watch state is written to. Only the account's household manager may read or change them. X-Profile-Id must name the account's primary profile, with X-Profile-Token when that profile is PIN-protected (without it the request is 403 profile_verification_required); naming any other profile is 403 permission_denied, including on an admin account. A request without X-Profile-Id is accepted only from an admin account's API key, or from an admin account's login session while no profile on the account is PIN-protected or access-restricted; otherwise it is 403 permission_denied.",
         "operationId": "updateWebhookConnection",
         "parameters": [
           {
@@ -239985,6 +242022,7 @@
     },
     "/api/v2/webhook-sync/connections/{id}/events": {
       "get": {
+        "description": "Webhook sync connections are account-wide: a connection's receiver URL carries its secret, and its mappings choose which profile an external user's watch state is written to. Only the account's household manager may read or change them. X-Profile-Id must name the account's primary profile, with X-Profile-Token when that profile is PIN-protected (without it the request is 403 profile_verification_required); naming any other profile is 403 permission_denied, including on an admin account. A request without X-Profile-Id is accepted only from an admin account's API key, or from an admin account's login session while no profile on the account is PIN-protected or access-restricted; otherwise it is 403 permission_denied.",
         "operationId": "listWebhookEvents",
         "parameters": [
           {
@@ -240171,6 +242209,7 @@
     },
     "/api/v2/webhook-sync/connections/{id}/profile-mappings": {
       "get": {
+        "description": "Webhook sync connections are account-wide: a connection's receiver URL carries its secret, and its mappings choose which profile an external user's watch state is written to. Only the account's household manager may read or change them. X-Profile-Id must name the account's primary profile, with X-Profile-Token when that profile is PIN-protected (without it the request is 403 profile_verification_required); naming any other profile is 403 permission_denied, including on an admin account. A request without X-Profile-Id is accepted only from an admin account's API key, or from an admin account's login session while no profile on the account is PIN-protected or access-restricted; otherwise it is 403 permission_denied.",
         "operationId": "getWebhookMappings",
         "parameters": [
           {
@@ -240330,6 +242369,7 @@
         "x-silo-service-backed": true
       },
       "put": {
+        "description": "Webhook sync connections are account-wide: a connection's receiver URL carries its secret, and its mappings choose which profile an external user's watch state is written to. Only the account's household manager may read or change them. X-Profile-Id must name the account's primary profile, with X-Profile-Token when that profile is PIN-protected (without it the request is 403 profile_verification_required); naming any other profile is 403 permission_denied, including on an admin account. A request without X-Profile-Id is accepted only from an admin account's API key, or from an admin account's login session while no profile on the account is PIN-protected or access-restricted; otherwise it is 403 permission_denied.",
         "operationId": "updateWebhookMappings",
         "parameters": [
           {
@@ -240533,6 +242573,7 @@
     },
     "/api/v2/webhook-sync/connections/{id}/webhook/rotate": {
       "post": {
+        "description": "Webhook sync connections are account-wide: a connection's receiver URL carries its secret, and its mappings choose which profile an external user's watch state is written to. Only the account's household manager may read or change them. X-Profile-Id must name the account's primary profile, with X-Profile-Token when that profile is PIN-protected (without it the request is 403 profile_verification_required); naming any other profile is 403 permission_denied, including on an admin account. A request without X-Profile-Id is accepted only from an admin account's API key, or from an admin account's login session while no profile on the account is PIN-protected or access-restricted; otherwise it is 403 permission_denied.",
         "operationId": "rotateWebhookConnection",
         "parameters": [
           {
@@ -241028,6 +243069,57 @@
         }
       },
       {
+        "parameters": [
+          {
+            "description": "Transport identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "description": "Say whether the client of a transport this node runs is waiting on the encoder: output_bound is true while a restart replaces FFmpeg, or while FFmpeg runs (or has failed) and the client has fetched every produced segment but at most the newest. A progressive remux answers false. A transport the node does not run is 404; the read reconstructs nothing and does not count as client activity. The core calls it before it learns a bandwidth limit from a reported stall.",
+        "listener": "transcode_node",
+        "method": "GET",
+        "path": "/transcode/{session_id}/output-bound",
+        "handler": "(*internal/transcodenode.Server).handleOutputBound",
+        "auth_class": "node_bearer",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/x-silo-worker-protocols/schemas/transcodenode_OutputBoundResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "404": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Not Found"
+          }
+        }
+      },
+      {
         "description": "Reload configuration; active remux work is not torn down.",
         "retry_safety": "non_retryable",
         "listener": "proxy",
@@ -241147,7 +243239,7 @@
         }
       },
       {
-        "description": "Reload configuration and tear down active sessions and delivery authority. Failure can follow partial effects.",
+        "description": "Reread configuration from the core, ask the core to revoke this node's recipes (POST /api/internal/nodes/self/revoke-recipes), and tear down active sessions. A failed revocation fails the command after the teardown. Failure can follow partial effects.",
         "retry_safety": "non_retryable",
         "listener": "transcode_node",
         "method": "POST",
@@ -241177,21 +243269,11 @@
               }
             },
             "description": "Internal Server Error"
-          },
-          "503": {
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            },
-            "description": "Service Unavailable"
           }
         }
       },
       {
-        "description": "Reload configuration without tearing down active sessions. No durable replay receipt.",
+        "description": "Reread configuration from the core without tearing down active sessions; the core calls it after an admin change to this node. No durable replay receipt.",
         "retry_safety": "non_retryable",
         "listener": "transcode_node",
         "method": "POST",
@@ -241221,16 +243303,6 @@
               }
             },
             "description": "Internal Server Error"
-          },
-          "503": {
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            },
-            "description": "Service Unavailable"
           }
         }
       },
@@ -242535,7 +244607,7 @@
           },
           "required": true
         },
-        "description": "Synchronously prepare or reuse a node-local MP4 under an artifact lifecycle lock. The JSON decoder reads at most 64 KiB, ignores unknown keys and uses zero values for omitted options. Input path authority and GPU admission apply. Ordinary nonempty artifacts can be reused by ID alone; requested execution attestations require a matching receipt. Missing/mismatched receipts may cause replacement. Request cancellation is not proof that no artifact was published; there is no durable job admission or automatic replay guarantee.",
+        "description": "Synchronously prepare or reuse a node-local MP4 under an artifact lifecycle lock. The JSON decoder reads at most 64 KiB, ignores unknown keys and uses zero values for omitted options. Source grant and GPU admission apply. Ordinary nonempty artifacts can be reused by ID alone; requested execution attestations require a matching receipt. Missing/mismatched receipts may cause replacement. Request cancellation is not proof that no artifact was published; there is no durable job admission or automatic replay guarantee. source_grant is required: the node exchanges it at the core (POST /api/internal/nodes/self/sources/open) and reads only the path the core approves, never the input path the request names, for the job's life; a source the core withdraws ends the job. A missing or refused grant returns 400, a node mount that does not show the approved revision 409, a core the node cannot reach 503. The execution fingerprint excludes source_grant. A node that declares a job cap refuses new work once it runs that many jobs (the jobs health reports as active_jobs, admitted and not yet counted included) with 503, X-Silo-Node-Refusal: at_capacity and Retry-After; a request for an artifact the node is preparing or has prepared continues a job the node holds and is never refused at the cap. A node that declares a prepared-download budget refuses a new preparation once its last measurement of the directory reaches it, with 503 and X-Silo-Node-Refusal: storage_full.",
         "retry_safety": "non_retryable",
         "listener": "transcode_node",
         "method": "POST",
@@ -242572,6 +244644,16 @@
               }
             },
             "description": "Unauthorized"
+          },
+          "409": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Conflict"
           },
           "422": {
             "content": {
@@ -242611,6 +244693,22 @@
             },
             "description": "Service Unavailable",
             "headers": {
+              "Retry-After": {
+                "description": "Seconds, with the refusal header.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Silo-Node-Refusal": {
+                "description": "Why the node refused new work: at_capacity at the job cap it declares (SILO_NODE_MAX_TRANSCODES), storage_full at the prepared-download budget it declares. Absent on every other 503, a draining refusal included; a caller that does not know it treats the 503 as a draining refusal.",
+                "schema": {
+                  "enum": [
+                    "at_capacity",
+                    "storage_full"
+                  ],
+                  "type": "string"
+                }
+              },
               "X-Vio-Tone-Map-Execution-Error": {
                 "description": "Bounded tone-map refusal code when available; not present on all failures.",
                 "schema": {
@@ -243856,9 +245954,17 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "On a release (fence=0), the start_id of the start being released; a job another start published under the ID is left running. Ignored on a fenced stop.",
+            "in": "query",
+            "name": "start_id",
+            "schema": {
+              "type": "string"
+            }
           }
         ],
-        "description": "Stop a transport under its lifecycle lock. Every stop installs a process-local token-lifetime fence that refuses token reconstruction (410) until a fresh start reuses the ID, unless fence=0 marks it a release of a transport moving to another node; stored recipe deletion is required when configured. Local teardown may precede a 503 authority-deletion or shutdown failure. A missing session/recipe returns 404 after cleanup attempts. This ID-addressed command has no durable replay identity and must not be automatically repeated against a possible successor.",
+        "description": "Stop a transport under its lifecycle lock. Every stop installs a process-local token-lifetime fence that refuses token reconstruction (410) until a fresh start reuses the ID, unless fence=0 marks it a release of a transport moving to another node; a fenced stop also fences a progressive remux under the ID. A release ends only the job it was sent for and answers 404 for another: with start_id, the HLS job that start published; without it, the HLS job running when the release arrived or a rebuild published while it waited for the lock, not a job a start published then. A fenced stop ends any job. The core deletes the stored recipe itself before it calls; the node closes the session's source. Local teardown may precede a 503 progressive-remux shutdown failure. A transport that runs nothing here returns 404 after cleanup attempts. This ID-addressed command has no durable replay identity and must not be automatically repeated against a possible successor.",
         "retry_safety": "non_retryable",
         "listener": "transcode_node",
         "method": "DELETE",
@@ -243867,7 +245973,7 @@
         "auth_class": "node_bearer",
         "responses": {
           "204": {
-            "description": "Legacy teardown and configured authority deletion completed; no body. Local file/session close errors are logged rather than changing this status."
+            "description": "Teardown completed; no body. Local file/session close errors are logged rather than changing this status."
           },
           "401": {
             "content": {
@@ -243912,7 +246018,7 @@
           },
           "required": true
         },
-        "description": "Start a process-local HLS session after input, recipe, GPU and configuration guards. Ordinary JSON decoding ignores unknown keys and defaults omitted fields; there is no decoder body limit. A same-ID start can tear down and replace an earlier session before failing, and RequireReady may move an early hardware startup failure to a safer path: under hw_accel=auto CPU decode with GPU encode, then software; otherwise the VideoToolbox software retry. Monitoring runs asynchronously. No durable admission/replay receipt or automatic caller retry is implied.",
+        "description": "Start a process-local HLS session after input, recipe, GPU and configuration guards. Ordinary JSON decoding ignores unknown keys and defaults omitted fields; there is no decoder body limit. A same-ID start can tear down and replace an earlier session before failing, and RequireReady may move an early hardware startup failure to a safer path: under hw_accel=auto CPU decode with GPU encode, then software; otherwise the VideoToolbox software retry. No durable admission/replay receipt or automatic caller retry is implied. source_grant is required: the node exchanges it at the core (POST /api/internal/nodes/self/sources/open), runs FFmpeg on the path the core approves, never on input_path, and keeps the source open for the session's life; a source the core withdraws ends the session. With core source access the input is a loopback relay URL. A missing or refused grant returns 400, a node mount that does not show the approved revision 409, a text subtitle burn-in that cannot be staged on a node reading its source through the core 409 (libass would read the whole file through the core), a core the node cannot reach 503. playback_session_id, user_id, profile_id and media_file_id name the playback session the node files its session record and stream telemetry under. A node that declares a job cap refuses new work once it runs that many jobs (the jobs health reports as active_jobs, admitted and not yet counted included) with 503, X-Silo-Node-Refusal: at_capacity and Retry-After; a same-id replacement, or a start for a playback_session_id the node already runs a session or progressive remux for continues a job the node holds and is never refused at the cap.",
         "retry_safety": "non_retryable",
         "listener": "transcode_node",
         "method": "POST",
@@ -243954,6 +246060,16 @@
             },
             "description": "Unauthorized"
           },
+          "409": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
           "422": {
             "content": {
               "text/plain": {
@@ -243992,6 +246108,22 @@
             },
             "description": "Service Unavailable",
             "headers": {
+              "Retry-After": {
+                "description": "Seconds, with the refusal header.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Silo-Node-Refusal": {
+                "description": "Why the node refused new work: at_capacity at the job cap it declares (SILO_NODE_MAX_TRANSCODES), storage_full at the prepared-download budget it declares. Absent on every other 503, a draining refusal included; a caller that does not know it treats the 503 as a draining refusal.",
+                "schema": {
+                  "enum": [
+                    "at_capacity",
+                    "storage_full"
+                  ],
+                  "type": "string"
+                }
+              },
               "X-Vio-Tone-Map-Execution-Error": {
                 "description": "Existing tone-map refusal code when available.",
                 "schema": {
@@ -244919,9 +247051,28 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Set by the server beside seek when the plan asked for the macOS Firefox HEVC resume workaround: the plan's stream origin in seconds, the keyframe the copy starts on. Without it the remux serves the plain seeked copy.",
+            "in": "query",
+            "name": "origin",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Set by the server when the attempt negotiated progressive_range_refusal_v1: a GET whose Range starts past byte 0, or is a suffix range, answers 409 instead of streaming from the origin.",
+            "in": "query",
+            "name": "remux_range",
+            "schema": {
+              "enum": [
+                "refuse"
+              ],
+              "type": "string"
+            }
           }
         ],
-        "description": "Outer public middleware does not authorize content. Signed expiring playback token must select the committed proxy egress and the endpoint recipe family; partial routes fail409 and wrong egress/family fails503. Empty legacy routing retains only original method authority. Progressive remux streams MP4/audio MP4 locally or relays to the selected transcode transport. Local seek parse failure defaults to zero; local Range/conditional headers are not a resumable-file contract. Local proxy HEAD answers with the stream headers without starting remux work; remote-node HEAD validates authority without starting an encoder. Failures after200 can truncate output. Audio-downmix-v2 recipes are refused404 here and require the versioned audio route. The final origin response status and headers are forwarded except the private generation header; this relay is not restricted to a finite status/media list. Request construction failure500, missing origin400 and transport failure502 remain local. Read interruption can truncate committed bytes. No durable transfer, generic retry promise or websocket tunnel is advertised.",
+        "description": "Outer public middleware does not authorize content. Signed expiring playback token must select the committed proxy egress and the endpoint recipe family; partial routes fail409 and wrong egress/family fails503. Empty legacy routing retains only original method authority. Progressive remux streams MP4/audio MP4 locally or relays to the selected transcode transport. Local seek parse failure defaults to zero; local Range/conditional headers are not a resumable-file contract. A URL carrying remux_range=refuse (progressive_range_refusal_v1) answers a GET whose Range starts past byte 0, or is a suffix range, with 409 before any work starts or is relayed; without it that range streams from the origin. Local proxy HEAD answers with the stream headers without starting remux work; remote-node HEAD validates authority without starting an encoder. Failures after200 can truncate output. Audio-downmix-v2 recipes are refused404 here and require the versioned audio route. The final origin response status and headers are forwarded except the private generation header; this relay is not restricted to a finite status/media list. Request construction failure500, missing origin400 and transport failure502 remain local. Read interruption can truncate committed bytes. No durable transfer, generic retry promise or websocket tunnel is advertised.",
         "listener": "proxy",
         "method": "GET",
         "path": "/stream/remux/{token}",
@@ -245055,9 +247206,28 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Set by the server beside seek when the plan asked for the macOS Firefox HEVC resume workaround: the plan's stream origin in seconds, the keyframe the copy starts on. Without it the remux serves the plain seeked copy.",
+            "in": "query",
+            "name": "origin",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Set by the server when the attempt negotiated progressive_range_refusal_v1: a GET whose Range starts past byte 0, or is a suffix range, answers 409 instead of streaming from the origin.",
+            "in": "query",
+            "name": "remux_range",
+            "schema": {
+              "enum": [
+                "refuse"
+              ],
+              "type": "string"
+            }
           }
         ],
-        "description": "Outer public middleware does not authorize content. Signed expiring playback token must select the committed proxy egress and the endpoint recipe family; partial routes fail409 and wrong egress/family fails503. Empty legacy routing retains only original method authority. Progressive remux streams MP4/audio MP4 locally or relays to the selected transcode transport. Local seek parse failure defaults to zero; local Range/conditional headers are not a resumable-file contract. Local proxy HEAD answers with the stream headers without starting remux work; remote-node HEAD validates authority without starting an encoder. Failures after200 can truncate output. Audio-downmix-v2 recipes are refused404 here and require the versioned audio route. The final origin response status and headers are forwarded except the private generation header; this relay is not restricted to a finite status/media list. Request construction failure500, missing origin400 and transport failure502 remain local. Read interruption can truncate committed bytes. No durable transfer, generic retry promise or websocket tunnel is advertised. The HTTP server suppresses all HEAD response bytes.",
+        "description": "Outer public middleware does not authorize content. Signed expiring playback token must select the committed proxy egress and the endpoint recipe family; partial routes fail409 and wrong egress/family fails503. Empty legacy routing retains only original method authority. Progressive remux streams MP4/audio MP4 locally or relays to the selected transcode transport. Local seek parse failure defaults to zero; local Range/conditional headers are not a resumable-file contract. A URL carrying remux_range=refuse (progressive_range_refusal_v1) answers a GET whose Range starts past byte 0, or is a suffix range, with 409 before any work starts or is relayed; without it that range streams from the origin. Local proxy HEAD answers with the stream headers without starting remux work; remote-node HEAD validates authority without starting an encoder. Failures after200 can truncate output. Audio-downmix-v2 recipes are refused404 here and require the versioned audio route. The final origin response status and headers are forwarded except the private generation header; this relay is not restricted to a finite status/media list. Request construction failure500, missing origin400 and transport failure502 remain local. Read interruption can truncate committed bytes. No durable transfer, generic retry promise or websocket tunnel is advertised. The HTTP server suppresses all HEAD response bytes.",
         "listener": "proxy",
         "method": "HEAD",
         "path": "/stream/remux/{token}",
@@ -245110,9 +247280,28 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Set by the server beside seek when the plan asked for the macOS Firefox HEVC resume workaround: the plan's stream origin in seconds, the keyframe the copy starts on. Without it the remux serves the plain seeked copy.",
+            "in": "query",
+            "name": "origin",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Set by the server when the attempt negotiated progressive_range_refusal_v1: a GET whose Range starts past byte 0, or is a suffix range, answers 409 instead of streaming from the origin.",
+            "in": "query",
+            "name": "remux_range",
+            "schema": {
+              "enum": [
+                "refuse"
+              ],
+              "type": "string"
+            }
           }
         ],
-        "description": "Outer public middleware does not authorize content. Signed expiring playback token must select the committed proxy egress and the endpoint recipe family; partial routes fail409 and wrong egress/family fails503. Empty legacy routing retains only original method authority. Progressive remux streams MP4/audio MP4 locally or relays to the selected transcode transport. Local seek parse failure defaults to zero; local Range/conditional headers are not a resumable-file contract. Local proxy HEAD answers with the stream headers without starting remux work; remote-node HEAD validates authority without starting an encoder. Failures after200 can truncate output. Only the exact versioned stereo AAC downmix shape is accepted; ordinary/partial recipes return404. The final origin response status and headers are forwarded except the private generation header; this relay is not restricted to a finite status/media list. Request construction failure500, missing origin400 and transport failure502 remain local. Read interruption can truncate committed bytes. No durable transfer, generic retry promise or websocket tunnel is advertised.",
+        "description": "Outer public middleware does not authorize content. Signed expiring playback token must select the committed proxy egress and the endpoint recipe family; partial routes fail409 and wrong egress/family fails503. Empty legacy routing retains only original method authority. Progressive remux streams MP4/audio MP4 locally or relays to the selected transcode transport. Local seek parse failure defaults to zero; local Range/conditional headers are not a resumable-file contract. A URL carrying remux_range=refuse (progressive_range_refusal_v1) answers a GET whose Range starts past byte 0, or is a suffix range, with 409 before any work starts or is relayed; without it that range streams from the origin. Local proxy HEAD answers with the stream headers without starting remux work; remote-node HEAD validates authority without starting an encoder. Failures after200 can truncate output. Only the exact versioned stereo AAC downmix shape is accepted; ordinary/partial recipes return404. The final origin response status and headers are forwarded except the private generation header; this relay is not restricted to a finite status/media list. Request construction failure500, missing origin400 and transport failure502 remain local. Read interruption can truncate committed bytes. No durable transfer, generic retry promise or websocket tunnel is advertised.",
         "listener": "proxy",
         "method": "GET",
         "path": "/stream/remux/audio-v2/{token}",
@@ -245246,9 +247435,28 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Set by the server beside seek when the plan asked for the macOS Firefox HEVC resume workaround: the plan's stream origin in seconds, the keyframe the copy starts on. Without it the remux serves the plain seeked copy.",
+            "in": "query",
+            "name": "origin",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Set by the server when the attempt negotiated progressive_range_refusal_v1: a GET whose Range starts past byte 0, or is a suffix range, answers 409 instead of streaming from the origin.",
+            "in": "query",
+            "name": "remux_range",
+            "schema": {
+              "enum": [
+                "refuse"
+              ],
+              "type": "string"
+            }
           }
         ],
-        "description": "Outer public middleware does not authorize content. Signed expiring playback token must select the committed proxy egress and the endpoint recipe family; partial routes fail409 and wrong egress/family fails503. Empty legacy routing retains only original method authority. Progressive remux streams MP4/audio MP4 locally or relays to the selected transcode transport. Local seek parse failure defaults to zero; local Range/conditional headers are not a resumable-file contract. Local proxy HEAD answers with the stream headers without starting remux work; remote-node HEAD validates authority without starting an encoder. Failures after200 can truncate output. Only the exact versioned stereo AAC downmix shape is accepted; ordinary/partial recipes return404. The final origin response status and headers are forwarded except the private generation header; this relay is not restricted to a finite status/media list. Request construction failure500, missing origin400 and transport failure502 remain local. Read interruption can truncate committed bytes. No durable transfer, generic retry promise or websocket tunnel is advertised. The HTTP server suppresses all HEAD response bytes.",
+        "description": "Outer public middleware does not authorize content. Signed expiring playback token must select the committed proxy egress and the endpoint recipe family; partial routes fail409 and wrong egress/family fails503. Empty legacy routing retains only original method authority. Progressive remux streams MP4/audio MP4 locally or relays to the selected transcode transport. Local seek parse failure defaults to zero; local Range/conditional headers are not a resumable-file contract. A URL carrying remux_range=refuse (progressive_range_refusal_v1) answers a GET whose Range starts past byte 0, or is a suffix range, with 409 before any work starts or is relayed; without it that range streams from the origin. Local proxy HEAD answers with the stream headers without starting remux work; remote-node HEAD validates authority without starting an encoder. Failures after200 can truncate output. Only the exact versioned stereo AAC downmix shape is accepted; ordinary/partial recipes return404. The final origin response status and headers are forwarded except the private generation header; this relay is not restricted to a finite status/media list. Request construction failure500, missing origin400 and transport failure502 remain local. Read interruption can truncate committed bytes. No durable transfer, generic retry promise or websocket tunnel is advertised. The HTTP server suppresses all HEAD response bytes.",
         "listener": "proxy",
         "method": "HEAD",
         "path": "/stream/remux/audio-v2/{token}",
@@ -245663,9 +247871,28 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Set by the server beside seek when the plan asked for the macOS Firefox HEVC resume workaround: the plan's stream origin in seconds, the keyframe the copy starts on. Without it the remux serves the plain seeked copy.",
+            "in": "query",
+            "name": "origin",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Set by the server when the attempt negotiated progressive_range_refusal_v1: a GET whose Range starts past byte 0, or is a suffix range, answers 409 instead of streaming from the origin.",
+            "in": "query",
+            "name": "remux_range",
+            "schema": {
+              "enum": [
+                "refuse"
+              ],
+              "type": "string"
+            }
           }
         ],
-        "description": "Header-only bearer access JWT, current login-session validity and a stored grant owned by the same account are required on every request. No API key, cookie or query-token fallback. Missing grant404; wrong account403; unavailable dependencies503. Committed proxy egress and recipe family remain enforced. Local authorization errors are application/json objects with error and message; downstream/local media failures retain their existing media. This does not add a profile/PIN check or native v2 alias. Progressive remux streams MP4/audio MP4 locally or relays to the selected transcode transport. Local seek parse failure defaults to zero; local Range/conditional headers are not a resumable-file contract. Local proxy HEAD answers with the stream headers without starting remux work; remote-node HEAD validates authority without starting an encoder. Failures after200 can truncate output. Identity dispatch selects remux only for the literal remux play method; after the endpoint family gate other accepted non-transcode methods fall through to direct-file serving. Boosted-remux grant compatibility is not established by this description. Direct files retain strongETag/ranges. The final origin response status and headers are forwarded except the private generation header; this relay is not restricted to a finite status/media list. Request construction failure500, missing origin400 and transport failure502 remain local. Read interruption can truncate committed bytes. No durable transfer, generic retry promise or websocket tunnel is advertised.",
+        "description": "Header-only bearer access JWT, current login-session validity and a stored grant owned by the same account are required on every request. No API key, cookie or query-token fallback. Missing grant404; wrong account403; unavailable dependencies503. Committed proxy egress and recipe family remain enforced. Local authorization errors are application/json objects with error and message; downstream/local media failures retain their existing media. This does not add a profile/PIN check or native v2 alias. Progressive remux streams MP4/audio MP4 locally or relays to the selected transcode transport. Local seek parse failure defaults to zero; local Range/conditional headers are not a resumable-file contract. A URL carrying remux_range=refuse (progressive_range_refusal_v1) answers a GET whose Range starts past byte 0, or is a suffix range, with 409 before any work starts or is relayed; without it that range streams from the origin. Local proxy HEAD answers with the stream headers without starting remux work; remote-node HEAD validates authority without starting an encoder. Failures after200 can truncate output. Identity dispatch selects remux only for the literal remux play method; after the endpoint family gate other accepted non-transcode methods fall through to direct-file serving. Boosted-remux grant compatibility is not established by this description. Direct files retain strongETag/ranges. The final origin response status and headers are forwarded except the private generation header; this relay is not restricted to a finite status/media list. Request construction failure500, missing origin400 and transport failure502 remain local. Read interruption can truncate committed bytes. No durable transfer, generic retry promise or websocket tunnel is advertised.",
         "listener": "proxy",
         "method": "GET",
         "path": "/stream/v3/{session_id}",
@@ -245820,9 +248047,28 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Set by the server beside seek when the plan asked for the macOS Firefox HEVC resume workaround: the plan's stream origin in seconds, the keyframe the copy starts on. Without it the remux serves the plain seeked copy.",
+            "in": "query",
+            "name": "origin",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Set by the server when the attempt negotiated progressive_range_refusal_v1: a GET whose Range starts past byte 0, or is a suffix range, answers 409 instead of streaming from the origin.",
+            "in": "query",
+            "name": "remux_range",
+            "schema": {
+              "enum": [
+                "refuse"
+              ],
+              "type": "string"
+            }
           }
         ],
-        "description": "Header-only bearer access JWT, current login-session validity and a stored grant owned by the same account are required on every request. No API key, cookie or query-token fallback. Missing grant404; wrong account403; unavailable dependencies503. Committed proxy egress and recipe family remain enforced. Local authorization errors are application/json objects with error and message; downstream/local media failures retain their existing media. This does not add a profile/PIN check or native v2 alias. Progressive remux streams MP4/audio MP4 locally or relays to the selected transcode transport. Local seek parse failure defaults to zero; local Range/conditional headers are not a resumable-file contract. Local proxy HEAD answers with the stream headers without starting remux work; remote-node HEAD validates authority without starting an encoder. Failures after200 can truncate output. Identity dispatch selects remux only for the literal remux play method; after the endpoint family gate other accepted non-transcode methods fall through to direct-file serving. Boosted-remux grant compatibility is not established by this description. Direct files retain strongETag/ranges. The final origin response status and headers are forwarded except the private generation header; this relay is not restricted to a finite status/media list. Request construction failure500, missing origin400 and transport failure502 remain local. Read interruption can truncate committed bytes. No durable transfer, generic retry promise or websocket tunnel is advertised. The HTTP server suppresses all HEAD response bytes.",
+        "description": "Header-only bearer access JWT, current login-session validity and a stored grant owned by the same account are required on every request. No API key, cookie or query-token fallback. Missing grant404; wrong account403; unavailable dependencies503. Committed proxy egress and recipe family remain enforced. Local authorization errors are application/json objects with error and message; downstream/local media failures retain their existing media. This does not add a profile/PIN check or native v2 alias. Progressive remux streams MP4/audio MP4 locally or relays to the selected transcode transport. Local seek parse failure defaults to zero; local Range/conditional headers are not a resumable-file contract. A URL carrying remux_range=refuse (progressive_range_refusal_v1) answers a GET whose Range starts past byte 0, or is a suffix range, with 409 before any work starts or is relayed; without it that range streams from the origin. Local proxy HEAD answers with the stream headers without starting remux work; remote-node HEAD validates authority without starting an encoder. Failures after200 can truncate output. Identity dispatch selects remux only for the literal remux play method; after the endpoint family gate other accepted non-transcode methods fall through to direct-file serving. Boosted-remux grant compatibility is not established by this description. Direct files retain strongETag/ranges. The final origin response status and headers are forwarded except the private generation header; this relay is not restricted to a finite status/media list. Request construction failure500, missing origin400 and transport failure502 remain local. Read interruption can truncate committed bytes. No durable transfer, generic retry promise or websocket tunnel is advertised. The HTTP server suppresses all HEAD response bytes.",
         "listener": "proxy",
         "method": "HEAD",
         "path": "/stream/v3/{session_id}",
@@ -246279,7 +248525,7 @@
             }
           },
           {
-            "description": "Signed recipe reference for node-side validation and deny-marker lookup; not a native user access token.",
+            "description": "Stream token a relay forwards; the node passes it unread to the core's resolve, which verifies it. Not a native user access token.",
             "in": "header",
             "name": "X-Vio-Stream-Token",
             "required": true,
@@ -246288,7 +248534,7 @@
             }
           },
           {
-            "description": "Parsed float; parse errors and negative values return400. No byte-range resume contract.",
+            "description": "Parsed float; parse errors and negative values return 400. No byte-range resume contract.",
             "in": "query",
             "name": "seek",
             "schema": {
@@ -246296,7 +248542,7 @@
             }
           }
         ],
-        "description": "Node bearer plus independently verified playback recipe token must bind exact transport and this node's remux-execution/proxy-egress route. Audio-downmix recipes require the exact stereo shape. A theme_aac_v1 recipe converts one detail-page theme to AAC; the theme authority approves its id, path, size and modification time in place of the media-file catalog. Input authority and current configuration are checked. A session carrying the deny marker, or revoked/stopped authority, returns410 and a concurrent GET returns409. GET starts request-scoped MP4 remux with cancellation/stop/reload tracking; committed200 can truncate on encoder/read failure. HEAD validates authority but does not check actual file existence or start an encoder. Process-local fences are not durable across node replacement.",
+        "description": "Every GET and HEAD resolves the transport at the core (POST /api/internal/nodes/self/resolve, purpose remux), passing the stream token unread; a transport this process stopped is refused with 410 first, and a GET for a transport that already has a request running (409) or on a node that has reported itself drained (503) is refused before the core is asked. The core's refusals map to the node's answers: invalid_token 401, wrong_route 503, denied and stopped 410, source_changed 400, not_found 404, anything else (the core unavailable, or its per-node budget answering 429) 503. The token must bind the exact transport and this node's remux-execution/proxy-egress route; audio-downmix recipes require the exact stereo shape; a theme_aac_v1 recipe converts one detail-page theme to AAC. A GET opens the source the resolution grants (a refused grant 400, a mount that does not show the approved revision 409, the core unreachable 503) and reads only that path; a concurrent GET returns 409. GET starts request-scoped MP4 remux with cancellation/stop/reload tracking; a committed 200 can truncate on encoder/read failure, and a source the core withdraws ends it. HEAD validates authority but opens no source and starts no encoder. Process-local fences are not durable across node replacement. A node that declares a job cap refuses new work once it runs that many jobs (the jobs health reports as active_jobs, admitted and not yet counted included) with 503, X-Silo-Node-Refusal: at_capacity and Retry-After; a GET for a playback session the node runs a session or progressive remux for, or served a progressive remux for within the last ten minutes (a seek or a reconnect) continues a job the node holds and is never refused at the cap.",
         "listener": "transcode_node",
         "method": "GET",
         "path": "/remux/{session_id}",
@@ -246390,7 +248636,25 @@
                 }
               }
             },
-            "description": "Service Unavailable"
+            "description": "Service Unavailable",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds, with the refusal header.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Silo-Node-Refusal": {
+                "description": "Why the node refused new work: at_capacity at the job cap it declares (SILO_NODE_MAX_TRANSCODES), storage_full at the prepared-download budget it declares. Absent on every other 503, a draining refusal included; a caller that does not know it treats the 503 as a draining refusal.",
+                "schema": {
+                  "enum": [
+                    "at_capacity",
+                    "storage_full"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       },
@@ -246405,7 +248669,7 @@
             }
           },
           {
-            "description": "Signed recipe reference for node-side validation and deny-marker lookup; not a native user access token.",
+            "description": "Stream token a relay forwards; the node passes it unread to the core's resolve, which verifies it. Not a native user access token.",
             "in": "header",
             "name": "X-Vio-Stream-Token",
             "required": true,
@@ -246414,7 +248678,7 @@
             }
           },
           {
-            "description": "Parsed float; parse errors and negative values return400. No byte-range resume contract.",
+            "description": "Parsed float; parse errors and negative values return 400. No byte-range resume contract.",
             "in": "query",
             "name": "seek",
             "schema": {
@@ -246422,7 +248686,7 @@
             }
           }
         ],
-        "description": "Node bearer plus independently verified playback recipe token must bind exact transport and this node's remux-execution/proxy-egress route. Audio-downmix recipes require the exact stereo shape. A theme_aac_v1 recipe converts one detail-page theme to AAC; the theme authority approves its id, path, size and modification time in place of the media-file catalog. Input authority and current configuration are checked. A session carrying the deny marker, or revoked/stopped authority, returns410 and a concurrent GET returns409. GET starts request-scoped MP4 remux with cancellation/stop/reload tracking; committed200 can truncate on encoder/read failure. HEAD validates authority but does not check actual file existence or start an encoder. Process-local fences are not durable across node replacement.",
+        "description": "Every GET and HEAD resolves the transport at the core (POST /api/internal/nodes/self/resolve, purpose remux), passing the stream token unread; a transport this process stopped is refused with 410 first, and a GET for a transport that already has a request running (409) or on a node that has reported itself drained (503) is refused before the core is asked. The core's refusals map to the node's answers: invalid_token 401, wrong_route 503, denied and stopped 410, source_changed 400, not_found 404, anything else (the core unavailable, or its per-node budget answering 429) 503. The token must bind the exact transport and this node's remux-execution/proxy-egress route; audio-downmix recipes require the exact stereo shape; a theme_aac_v1 recipe converts one detail-page theme to AAC. A GET opens the source the resolution grants (a refused grant 400, a mount that does not show the approved revision 409, the core unreachable 503) and reads only that path; a concurrent GET returns 409. GET starts request-scoped MP4 remux with cancellation/stop/reload tracking; a committed 200 can truncate on encoder/read failure, and a source the core withdraws ends it. HEAD validates authority but opens no source and starts no encoder. Process-local fences are not durable across node replacement.",
         "listener": "transcode_node",
         "method": "HEAD",
         "path": "/remux/{session_id}",
@@ -246466,7 +248730,7 @@
             }
           },
           {
-            "description": "Signed recipe reference for node-side validation and deny-marker lookup; not a native user access token.",
+            "description": "Stream token a relay forwards; the node passes it unread to the core's resolve, which verifies it. Not a native user access token.",
             "in": "header",
             "name": "X-Vio-Stream-Token",
             "schema": {
@@ -246474,7 +248738,7 @@
             }
           },
           {
-            "description": "Value1 requests source-aligned manifest; raw query is preserved in segment links.",
+            "description": "Value 1 requests a source-aligned manifest; raw query is preserved in segment links.",
             "in": "query",
             "name": "source_timeline",
             "schema": {
@@ -246482,7 +248746,7 @@
             }
           }
         ],
-        "description": "Node bearer protects the worker listener. A session carrying the deny marker returns410 and is neither served nor reconstructed. Missing process-local sessions may reconstruct through existing signed-token/stored-recipe, input and execution authority guards; a missing/refused reconstruction can return404. Reads refresh liveness; no durable session availability, unscoped reconstruction or native route is promised. Build the playback manifest; unavailable manifest returns503. No-store response contains relative segment links.",
+        "description": "Node bearer protects the worker listener. A live process-local session is served without asking the core; the relays check the deny marker before forwarding. A missing session is rebuilt from the recipe the core resolves (POST /api/internal/nodes/self/resolve, purpose hls, the stream token passed unread) and the source it grants, unless this process stopped the transport, which returns 410 before the core is asked. The core denying the session returns 410, any other refusal 404, a core the node cannot reach 503. Reads refresh liveness; no durable session availability, unscoped reconstruction or native route is promised. Build the playback manifest; an unavailable manifest returns 503. No-store response contains relative segment links.",
         "listener": "transcode_node",
         "method": "GET",
         "path": "/transcode/{session_id}/master.m3u8",
@@ -246578,7 +248842,7 @@
             }
           },
           {
-            "description": "Signed recipe reference for node-side validation and deny-marker lookup; not a native user access token.",
+            "description": "Stream token a relay forwards; the node passes it unread to the core's resolve, which verifies it. Not a native user access token.",
             "in": "header",
             "name": "X-Vio-Stream-Token",
             "schema": {
@@ -246594,7 +248858,7 @@
             }
           },
           {
-            "description": "Value1 defers completion accounting to downstream acknowledgment and returns private generation metadata.",
+            "description": "Value 1 defers completion accounting to downstream acknowledgment and returns private generation metadata.",
             "in": "header",
             "name": "X-Vio-Transcode-Proxy",
             "schema": {
@@ -246644,7 +248908,7 @@
             }
           }
         ],
-        "description": "Node bearer protects the worker listener. A session carrying the deny marker returns410 and is neither served nor reconstructed. Missing process-local sessions may reconstruct through existing signed-token/stored-recipe, input and execution authority guards; a missing/refused reconstruction can return404. Reads refresh liveness; no durable session availability, unscoped reconstruction or native route is promised. Open an exact segment lease; missing media can wait or trigger guarded seek/restart recovery. Non-numbered init data can also wait. ServeContent supplies extension/sniffed media, conditions and ranges. Private generation is emitted only on a marked proxy hop. Direct complete GET reports generation-bound completion; proxied reads await separate acknowledgment. Partial/failed responses do not advance completion and may truncate after headers.",
+        "description": "Node bearer protects the worker listener. A live process-local session is served without asking the core; the relays check the deny marker before forwarding. A missing session is rebuilt from the recipe the core resolves (POST /api/internal/nodes/self/resolve, purpose hls, the stream token passed unread) and the source it grants, unless this process stopped the transport, which returns 410 before the core is asked. The core denying the session returns 410, any other refusal 404, a core the node cannot reach 503. Reads refresh liveness; no durable session availability, unscoped reconstruction or native route is promised. Open an exact segment lease; missing media can wait or trigger guarded seek/restart recovery. Non-numbered init data can also wait. ServeContent supplies extension/sniffed media, conditions and ranges. Private generation is emitted only on a marked proxy hop. Direct complete GET reports generation-bound completion; proxied reads await separate acknowledgment. Partial/failed responses do not advance completion and may truncate after headers.",
         "listener": "transcode_node",
         "method": "GET",
         "path": "/transcode/{session_id}/segment/{name}",
@@ -247080,6 +249344,9 @@
             "format": "double",
             "type": "number"
           },
+          "source_grant": {
+            "type": "string"
+          },
           "tone_map": {
             "type": "boolean"
           }
@@ -247140,9 +249407,6 @@
             "format": "int64",
             "type": "integer"
           },
-          "canonical_input_path": {
-            "type": "string"
-          },
           "input_path": {
             "type": "string"
           },
@@ -247158,6 +249422,13 @@
           "source_audio_channels": {
             "format": "int64",
             "type": "integer"
+          },
+          "source_frame_rate": {
+            "format": "double",
+            "type": "number"
+          },
+          "source_grant": {
+            "type": "string"
           },
           "source_video_bit_depth": {
             "format": "int64",
@@ -247230,7 +249501,7 @@
         },
         "required": [
           "artifact_id",
-          "input_path"
+          "source_grant"
         ],
         "type": "object"
       },
@@ -247573,6 +249844,9 @@
           "sheets": {
             "$ref": "#/x-silo-worker-protocols/schemas/mediasample_SheetsOutput"
           },
+          "source_grant": {
+            "type": "string"
+          },
           "stats": {
             "$ref": "#/x-silo-worker-protocols/schemas/mediasample_StatsOutput"
           },
@@ -247589,7 +249863,8 @@
           }
         },
         "required": [
-          "input"
+          "input",
+          "source_grant"
         ],
         "type": "object"
       },
@@ -248804,6 +251079,18 @@
         ],
         "type": "object"
       },
+      "transcodenode_OutputBoundResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "output_bound": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "output_bound"
+        ],
+        "type": "object"
+      },
       "transcodenode_ReprobeCapabilitiesResponse": {
         "additionalProperties": false,
         "properties": {
@@ -249037,7 +251324,7 @@
         },
         "required": [
           "session_id",
-          "input_path"
+          "source_grant"
         ],
         "type": "object"
       },

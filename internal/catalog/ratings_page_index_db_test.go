@@ -14,8 +14,10 @@ import (
 
 // Verify the migration can satisfy both initial and continuation ordering
 // without a Sort node, for an unrestricted viewer and a library-restricted
-// one. Sequential scans are disabled only in this transaction because the
-// isolated test table may be too small to favor an index naturally.
+// one. Sequential scans and sorts are disabled only in this transaction
+// because the isolated test table and shared database statistics may not
+// favor an index naturally; a sort still appears when no index can supply
+// the order.
 func TestRatingsPageIndexDB(t *testing.T) {
 	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
 	if dsn == "" {
@@ -32,7 +34,7 @@ func TestRatingsPageIndexDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	if _, err := tx.Exec(ctx, "SET LOCAL enable_seqscan = off"); err != nil {
+	if _, err := tx.Exec(ctx, "SET LOCAL enable_seqscan = off; SET LOCAL enable_sort = off"); err != nil {
 		t.Fatal(err)
 	}
 	for _, filter := range []AccessFilter{{}, {AllowedLibraryIDs: []int{1, 2}}} {
@@ -88,7 +90,7 @@ func TestRatingsPageFollowsAccessDB(t *testing.T) {
 	})
 	now := time.Now().UTC().Truncate(time.Second)
 	for i, id := range []string{m1, s1, gone, m2} {
-		batchEquivExec(t, pool, `INSERT INTO user_ratings (user_id, profile_id, media_item_id, rating, rated_at) VALUES ($1, 'p1', $2, 3, $3)`, userID, id, now.Add(-time.Duration(i)*time.Hour))
+		batchEquivExec(t, pool, `INSERT INTO user_ratings (user_id, profile_id, media_item_id, rating, rated_at) VALUES ($1, 'p1', $2, 6, $3)`, userID, id, now.Add(-time.Duration(i)*time.Hour))
 	}
 
 	repo := NewRatingsRepo(pool)

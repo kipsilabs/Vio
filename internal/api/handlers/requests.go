@@ -18,8 +18,6 @@ import (
 
 type RequestService interface {
 	Search(ctx context.Context, viewer mediarequests.Viewer, query string, mediaType mediarequests.MediaType, page int) (*mediarequests.MediaPage, error)
-	Discover(ctx context.Context, viewer mediarequests.Viewer, section string, page int) (*mediarequests.DiscoverySection, error)
-	DiscoverAll(ctx context.Context, viewer mediarequests.Viewer) ([]mediarequests.DiscoverySection, error)
 	// DiscoverRows and DiscoverRow back the v2 Discover layout; v1 keeps
 	// Discover and DiscoverAll.
 	DiscoverRows(ctx context.Context, viewer mediarequests.Viewer) (*mediarequests.DiscoverLayoutPage, error)
@@ -99,14 +97,14 @@ func (h *RequestsHandler) HandleDiscover(w http.ResponseWriter, r *http.Request)
 	if !ok {
 		return
 	}
-	sections, err := h.service.DiscoverAll(r.Context(), viewer)
+	layout, err := h.service.DiscoverRows(r.Context(), viewer)
 	if err != nil {
 		writeRequestServiceError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, struct {
 		Sections []mediarequests.DiscoverySection `json:"sections"`
-	}{Sections: sections})
+	}{Sections: layout.Sections})
 }
 
 func (h *RequestsHandler) HandleDiscoverSection(w http.ResponseWriter, r *http.Request) {
@@ -118,7 +116,7 @@ func (h *RequestsHandler) HandleDiscoverSection(w http.ResponseWriter, r *http.R
 	if !ok {
 		return
 	}
-	section, err := h.service.Discover(r.Context(), viewer, chi.URLParam(r, "section"), page)
+	section, err := h.service.DiscoverRow(r.Context(), viewer, chi.URLParam(r, "section"), page)
 	if err != nil {
 		writeRequestServiceError(w, err)
 		return

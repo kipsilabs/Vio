@@ -20,6 +20,7 @@ import {
 import { useAdminBackupUploads } from "@/hooks/queries/admin/backupUploads";
 import { useTask } from "@/hooks/queries/admin/tasks";
 import { adminKeys } from "@/hooks/queries/keys";
+import { useT } from "@/i18n";
 import { formatTime } from "@/lib/datetime";
 import { cn } from "@/lib/utils";
 import { useSettingsForm } from "@/hooks/useSettingsForm";
@@ -39,10 +40,12 @@ import {
   BACKUP_KEEP_KEY,
   BACKUP_ROWS_SHOWN,
   BACKUP_SETTING_KEYS,
+  BACKUP_TIME_KEY,
   backupRowId,
   backUpNowBlocker,
   backupErrorMessage,
   backupSchedulePhrases,
+  backupsPaused,
   defaultBackupLocation,
   isBucketLocation,
   isFinished,
@@ -63,6 +66,13 @@ import { SettingFieldStatus } from "@/pages/admin-settings/SettingField";
 // The settings layout loads these field styles for its pages; this page is not one of them.
 import "@/styles/admin-settings.css";
 
+/**
+ * A header action on a phone: its own full-width row, with a label too long
+ * for the row wrapping onto a second line instead of running off the screen.
+ */
+const PHONE_HEADER_ACTION =
+  "max-sm:h-auto max-sm:basis-full max-sm:whitespace-normal max-sm:text-center";
+
 /** The current time, refreshed each minute so "today" and "tomorrow" stay right. */
 function useMinuteClock() {
   const [now, setNow] = useState(() => new Date());
@@ -73,36 +83,75 @@ function useMinuteClock() {
   return now;
 }
 
+/**
+ * Whether the backup task's daily trigger (`scheduledTime`) is still catching
+ * up with a Start time saved in the last 30 s. Each server moves the trigger a
+ * moment after the save, and until the server answering has, the task's next
+ * run belongs to the old schedule. Meanwhile the task is read again every 2 s,
+ * since a realtime update can come late or not at all. After 30 s the task's
+ * next run is shown anyway: a server that still hasn't moved the trigger runs
+ * the old schedule.
+ */
+function useScheduleSettling(scheduledTime: string | undefined) {
+  const queryClient = useQueryClient();
+  // A new object for each save, so saving again restarts the 30 s.
+  const [saved, setSaved] = useState<{ time: string } | null>(null);
+  const settling = saved !== null && saved.time !== scheduledTime;
+  useEffect(() => {
+    if (saved === null) return;
+    const expire = window.setTimeout(() => setSaved(null), 30_000);
+    return () => window.clearTimeout(expire);
+  }, [saved]);
+  useEffect(() => {
+    if (!settling) return;
+    const poll = window.setInterval(
+      () =>
+        // A read slower than the interval finishes instead of restarting.
+        void queryClient.invalidateQueries(
+          { queryKey: adminKeys.task("backup") },
+          { cancelRefetch: false },
+        ),
+      2_000,
+    );
+    return () => window.clearInterval(poll);
+  }, [queryClient, settling]);
+  return { settling, timeSaved: (time: string) => setSaved({ time }) };
+}
+
 function asDestination(value: string): AdminBackupDestination {
   return value === "s3" ? "s3" : "default";
 }
 
 /** What the operation holding the backup lock is doing. */
 function ActiveOperation({ active }: { active: AdminBackupActive }) {
+  const t = useT();
   switch (active.operation) {
     case "backup":
-      return `Backing up, started at ${formatTime(active.started_at)}.`;
+      return t("web.admin.backups.active.backingUp", { time: formatTime(active.started_at) });
     case "restore": {
       const path = activeRestorePath(active);
       return (
         <>
-          A restore is running.{" "}
+          {t("web.admin.backups.active.restoreRunning")}{" "}
           {path ? (
             <Link to={path} className="underline underline-offset-2">
-              See its progress
+              {t("web.admin.backups.active.restoreProgressLink")}
             </Link>
           ) : null}
         </>
       );
     }
     case "upload":
-      return "Checking an uploaded backup.";
+      return t("web.admin.backups.active.checkingUpload");
     default:
-      return active.upload_id ? "Deleting an uploaded backup." : "Deleting a backup.";
+      return active.upload_id
+        ? t("web.admin.backups.active.deletingUpload")
+        : t("web.admin.backups.active.deleting");
   }
 }
 
 export default function AdminBackups() {
+  const t = useT();
   const now = useMinuteClock();
   const queryClient = useQueryClient();
   const capabilities = useAdminBackupCapabilities();
@@ -164,7 +213,12 @@ export default function AdminBackups() {
   const keep = list?.keep ?? (Number(form.getPersistedValue(BACKUP_KEEP_KEY)) || 7);
   const enabled = list?.enabled ?? form.getPersistedValue(BACKUP_ENABLED_KEY) !== "false";
   const taskNextRunAt = backupTask.data?.next_run_at;
-  const next = enabled ? nextBackupRun(now, taskNextRunAt) : null;
+  const schedule = useScheduleSettling(
+    backupTask.data?.triggers.find((trigger) => trigger.type === "daily")?.time_of_day,
+  );
+  const paused = backupsPaused(configured, warnings);
+  // A paused server's next run fails, so neither line names it.
+  const next = enabled && !paused && !schedule.settling ? nextBackupRun(now, taskNextRunAt) : null;
   // Once the scheduled time passes, read the schedule again instead of
   // showing the next run as unknown until something else refreshes it.
   useEffect(() => {
@@ -175,6 +229,7 @@ export default function AdminBackups() {
   const phrases = backupSchedulePhrases({
     lastSuccessAt: list?.last_success_at,
     enabled,
+    paused,
     busy,
     next,
     now,
@@ -197,15 +252,16 @@ export default function AdminBackups() {
   let commandSource: FullRestoreSource = "download";
   if (commandBackup) commandSource = isBucketLocation(commandBackup.location) ? "bucket" : "folder";
 
+  const destinationAvailable = list?.destination_available ?? true;
+  // The server lists nothing when it can't read the destination, which says
+  // nothing about what the destination holds. The status area's warning says
+  // why no backups are listed.
+  const destinationUnread = configured && !destinationAvailable;
+
   const lock = lockBlocker(list?.busy ?? false, active);
   const blocker = startBackup.isPending
     ? null
-    : backUpNowBlocker({
-        configured,
-        lock,
-        warnings,
-        destinationAvailable: list?.destination_available ?? true,
-      });
+    : backUpNowBlocker({ configured, lock, warnings, destinationAvailable });
 
   // Report how the backup this page started ended, once a list read after the
   // start shows its run. A run that ends some other way (another server's
@@ -217,36 +273,39 @@ export default function AdminBackups() {
     if (!pending || listUpdatedAt <= pending.at || busy) return;
     started.current = null;
     if (lastRun?.id !== pending.id) return;
-    if (lastRun.status === "complete") toast.success("Backup finished");
+    if (lastRun.status === "complete") toast.success(t("web.admin.backups.toast.finished"));
     else if (lastRun.status === "complete_with_warnings")
-      toast.success("Backup finished with warnings", {
-        description: "Some files were missing. The table lists them.",
+      toast.success(t("web.admin.backups.toast.finishedWithWarnings"), {
+        description: t("web.admin.backups.toast.finishedWithWarningsDescription"),
       });
-    else toast.error("The backup didn't finish", { description: lastRun.error });
-  }, [busy, lastRun, listUpdatedAt]);
+    else toast.error(t("web.admin.backups.toast.didntFinish"), { description: lastRun.error });
+  }, [busy, lastRun, listUpdatedAt, t]);
 
   const backUpNow = () =>
     startBackup.mutate(undefined, {
       onSuccess: (result) => {
         started.current = { id: result.id, at: Date.now() };
-        toast.success("Backup started", {
-          description: "It keeps running if you leave this page.",
+        toast.success(t("web.admin.backups.toast.started"), {
+          description: t("web.admin.backups.toast.startedDescription"),
         });
       },
       onError: (error) =>
-        toast.error("Couldn't start a backup", {
+        toast.error(t("web.admin.backups.toast.startFailed"), {
           description: backupErrorMessage(error),
         }),
     });
 
   const save = async () => {
+    const time = form.isDirty(BACKUP_TIME_KEY) ? form.getValue(BACKUP_TIME_KEY) : null;
     await form.save();
+    if (time !== null) schedule.timeSaved(time);
     void queryClient.invalidateQueries({ queryKey: adminKeys.backups() });
     void queryClient.invalidateQueries({ queryKey: adminKeys.task("backup") });
   };
 
-  const backUpNowButton = (
+  const backUpNowButton = (className?: string) => (
     <Button
+      className={className}
       onClick={backUpNow}
       disabled={blocker !== null || startBackup.isPending || !list}
       aria-describedby={blocker ? blockerId : undefined}
@@ -256,7 +315,7 @@ export default function AdminBackups() {
       ) : (
         <DatabaseBackup data-icon="inline-start" aria-hidden="true" />
       )}
-      Back up now
+      {t("web.admin.backups.backUpNow.button")}
     </Button>
   );
 
@@ -265,22 +324,32 @@ export default function AdminBackups() {
       <UnsavedChangesGuard />
       <div>
         <PageHeader
-          title="Backups"
-          subtitle="Every night Silo saves its database and the files people uploaded."
+          title={t("web.admin.backups.header.title")}
+          subtitle={t("web.admin.backups.header.subtitle")}
           className="mb-4"
           actions={
-            <div className="flex flex-col items-end gap-1">
+            // On a phone the page header lines its actions up at the start, so
+            // each one gets its own full-width row there, and the reason "Back up
+            // now" can't run sits right under that button.
+            <div className="flex flex-col items-end gap-1 max-sm:w-full max-sm:items-stretch">
               <div className="flex flex-wrap justify-end gap-2">
                 {uploadAvailable ? (
-                  <Button variant="outline" onClick={() => setUploading(true)}>
+                  <Button
+                    variant="outline"
+                    className={PHONE_HEADER_ACTION}
+                    onClick={() => setUploading(true)}
+                  >
                     <Upload data-icon="inline-start" aria-hidden="true" />
-                    Upload a backup
+                    {t("web.admin.backups.header.upload")}
                   </Button>
                 ) : null}
-                {backUpNowButton}
+                {backUpNowButton(PHONE_HEADER_ACTION)}
               </div>
               {blocker ? (
-                <p id={blockerId} className="text-muted-foreground max-w-72 text-right text-xs">
+                <p
+                  id={blockerId}
+                  className="text-muted-foreground max-w-72 text-end text-xs max-sm:max-w-none max-sm:text-start"
+                >
                   {blocker}
                 </p>
               ) : null}
@@ -313,12 +382,17 @@ export default function AdminBackups() {
                   </span>
                   {active.operation === "backup" ? (
                     <span className="text-muted-foreground tabular-nums">
-                      {Math.round(active.progress)}%
+                      {t("web.admin.backups.active.percent", {
+                        percent: Math.round(active.progress),
+                      })}
                     </span>
                   ) : null}
                 </div>
                 {active.operation === "backup" ? (
-                  <Progress value={active.progress} aria-label="Backup progress" />
+                  <Progress
+                    value={active.progress}
+                    aria-label={t("web.admin.backups.active.progressLabel")}
+                  />
                 ) : null}
                 {active.message ? (
                   <p className="text-muted-foreground text-xs">{active.message}</p>
@@ -337,7 +411,7 @@ export default function AdminBackups() {
                 </SettingFieldStatus>
                 {warning.code === "key_not_confirmed" && needsKey ? (
                   <Button variant="outline" size="sm" onClick={() => setConfirmingKey(true)}>
-                    Confirm the key
+                    {t("web.admin.backups.confirmKey.button")}
                   </Button>
                 ) : null}
               </div>
@@ -347,45 +421,60 @@ export default function AdminBackups() {
       </div>
 
       {backups.isPending ? (
-        <div className="space-y-4" role="status" aria-label="Loading backups">
+        <div className="space-y-4" role="status" aria-label={t("web.admin.backups.list.loading")}>
           <Skeleton className="h-28 w-full rounded-xl" />
           <Skeleton className="h-48 w-full rounded-2xl" />
         </div>
       ) : backups.isError ? (
         <div role="alert" className="surface-panel space-y-3 rounded-2xl p-6">
-          <p>Couldn&apos;t read the backups. {backupErrorMessage(backups.error)}</p>
+          <p>
+            {t("web.admin.backups.list.loadFailed", {
+              reason: backupErrorMessage(backups.error),
+            })}
+          </p>
           <Button variant="outline" size="sm" onClick={() => void backups.refetch()}>
-            Try again
+            {t("common.tryAgain")}
           </Button>
         </div>
-      ) : items.length === 0 && running ? (
+      ) : destinationUnread ? null : items.length === 0 && running ? (
         <div className="surface-panel rounded-2xl p-6" role="status">
-          <p className="font-medium">Taking the first backup.</p>
-          <p className="text-muted-foreground text-sm">It shows here when it finishes.</p>
+          <p className="font-medium">{t("web.admin.backups.list.firstRunning")}</p>
+          <p className="text-muted-foreground text-sm">
+            {t("web.admin.backups.list.firstRunningDetail")}
+          </p>
         </div>
       ) : items.length === 0 ? (
         <div className="surface-panel space-y-3 rounded-2xl p-6">
-          <p className="font-medium">No backups yet.</p>
-          <p className="text-muted-foreground text-sm">
-            {configured
-              ? "Take the first one now instead of waiting for the schedule."
-              : "This server has nowhere to keep them yet. Where backups are kept, below, says what to set up."}
-          </p>
-          {configured ? backUpNowButton : null}
+          <p className="font-medium">{t("web.admin.backups.list.empty")}</p>
+          {configured ? null : (
+            <p className="text-muted-foreground text-sm">
+              {t("web.admin.backups.list.emptyUnconfigured")}
+            </p>
+          )}
+          {/* While "Back up now" can't run, don't offer it here: the reason
+              shows under the header's button. */}
+          {configured && !blocker ? (
+            <>
+              <p className="text-muted-foreground text-sm">
+                {t("web.admin.backups.list.emptyConfigured")}
+              </p>
+              {backUpNowButton()}
+            </>
+          ) : null}
         </div>
       ) : (
         <section aria-labelledby="saved-backups-heading" className="space-y-6">
           <div className="space-y-3">
             <div className="space-y-1">
               <h2 id="saved-backups-heading" className="text-[15px] font-semibold tracking-tight">
-                Saved backups
+                {t("web.admin.backups.list.heading")}
               </h2>
               <p className="text-muted-foreground text-[13px]">
-                {retentionNote({ keep, plan, next, running, now })}
+                {retentionNote({ keep, plan, next, running, now, t })}
               </p>
               {list?.encrypted ? (
                 <p className="text-muted-foreground text-[13px]">
-                  Backups in this bucket are encrypted with this server&apos;s SECRET_KEY.
+                  {t("web.admin.backups.list.encrypted")}
                 </p>
               ) : null}
             </div>
@@ -408,15 +497,19 @@ export default function AdminBackups() {
       {uploads.data ? <UploadedBackups uploads={uploads.data} /> : null}
 
       {form.isLoading ? (
-        <div className="space-y-4" role="status" aria-label="Loading settings">
+        <div
+          className="space-y-4"
+          role="status"
+          aria-label={t("web.admin.backups.settings.loading")}
+        >
           <Skeleton className="h-10 w-full" />
           <Skeleton className="h-10 w-full" />
         </div>
       ) : form.loadError ? (
         <div role="alert" className="surface-panel space-y-3 rounded-2xl p-6">
-          <p>Couldn&apos;t read the backup settings. Check that Silo is running, then try again.</p>
+          <p>{t("web.admin.backups.settings.loadFailed")}</p>
           <Button variant="outline" size="sm" onClick={() => void form.retryLoad()}>
-            Try again
+            {t("common.tryAgain")}
           </Button>
         </div>
       ) : (
@@ -436,6 +529,7 @@ export default function AdminBackups() {
             }
             onSetUpS3={() => setSettingUpS3(true)}
             onConfirmKey={needsKey ? () => setConfirmingKey(true) : undefined}
+            listShown={!destinationUnread}
           />
           {configured ? (
             <RestoreCommandGroup

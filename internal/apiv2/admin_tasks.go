@@ -19,7 +19,7 @@ type AdminTaskService interface {
 	ListRelevantTasks(context.Context) []taskmanager.TaskInfo
 	GetTaskInfo(string) taskmanager.TaskInfo
 	StartTask(string) (taskmanager.TaskInfo, error)
-	CancelTask(string) error
+	CancelTask(string) (taskmanager.TaskInfo, error)
 	GetSchedule(context.Context, string) (taskmanager.Schedule, error)
 	UpdateSchedule(context.Context, string, int64, []taskmanager.TriggerConfig) (taskmanager.Schedule, error)
 }
@@ -141,8 +141,13 @@ func taskExecutionOf(e taskmanager.ExecutionResult) AdminTaskExecution {
 			out.Steps = result.Steps
 		}
 	}
-	if e.Status == adminjob.StatusFailed {
+	switch e.Status {
+	case adminjob.StatusFailed:
 		out.ErrorMessage = "Task failed. Inspect administrator diagnostics for details."
+	case adminjob.StatusCancelled:
+		// The task runner writes the message of a run it stopped itself (a
+		// max runtime stop), so unlike failure text it is safe to show.
+		out.ErrorMessage = e.ErrorMessage
 	}
 	return out
 }
@@ -242,7 +247,7 @@ func (reg *Registry) cancelAdminTask(_ context.Context, in *AdminTaskInput) (*Ad
 	if _, err := reg.taskInfo(in.Key); err != nil {
 		return nil, err
 	}
-	if err := reg.deps.AdminTasks.CancelTask(in.Key); err != nil {
+	if _, err := reg.deps.AdminTasks.CancelTask(in.Key); err != nil {
 		return nil, taskProblem(err)
 	}
 	return &AdminTaskOutput{Body: taskOf(reg.deps.AdminTasks.GetTaskInfo(in.Key))}, nil

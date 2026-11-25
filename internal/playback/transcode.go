@@ -27,7 +27,6 @@ import (
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback/dovirpu"
 	"github.com/Silo-Server/silo-server/internal/processmetrics"
-	"github.com/Silo-Server/silo-server/internal/procgroup"
 	"github.com/Silo-Server/silo-server/internal/tonemap"
 )
 
@@ -97,6 +96,11 @@ type TranscodeOpts struct {
 	// CopyVideoMPEGTS packages copied video in MPEG-TS instead of fMP4. It is
 	// durable because the segment extension and bytes must survive restarts.
 	CopyVideoMPEGTS bool
+	// CopyAudioCodec is the codec of the source audio track a "copy"
+	// TargetCodecAudio keeps. fMP4 segments add aac_adtstoasc for a copied AAC
+	// track; empty (older recipes and tokens) keeps the plain copy. It is
+	// durable because reconstruction must write the same segment bytes.
+	CopyAudioCodec string
 	// KeyframePlaylist serves a copy-video stream that starts at the
 	// beginning as one complete VOD playlist planned from the source's
 	// keyframe index, instead of FFmpeg's growing playlist (#1466). It is
@@ -324,19 +328,27 @@ type TranscodeSession struct {
 	stdinPipe            io.WriteCloser
 	lastRequestedSegment int
 	lastCompletedSegment int
-	lastPruneFloor       int
-	lastPruneHighWater   int
-	segmentPruneRunning  bool
-	pruneBeforeStart     bool
-	copyDurationMu       sync.Mutex
-	copyDurationIndex    copyManifestDurationIndex
-	copyTimelineMu       sync.Mutex
-	copyTimeline         observedCopyTimeline
-	segmentGeneration    uint64
-	segmentIncarnation   string
-	dv81Mu               sync.Mutex
-	dv81Converted        map[string]uint64
-	dv81Track            dovirpu.Track
+	// segmentRecoverySeq numbers segment-recovery requests in arrival order, so
+	// a wait that ends after a newer request can still be recognized as older.
+	// newestSeekSeq is the arrival number of the newest request that named a
+	// seek target beyond the produced window. A wait or restart issued before it
+	// is superseded: the viewer moved, and that target must not restart FFmpeg.
+	// Both are guarded by mu.
+	segmentRecoverySeq  uint64
+	newestSeekSeq       uint64
+	lastPruneFloor      int
+	lastPruneHighWater  int
+	segmentPruneRunning bool
+	pruneBeforeStart    bool
+	copyDurationMu      sync.Mutex
+	copyDurationIndex   copyManifestDurationIndex
+	copyTimelineMu      sync.Mutex
+	copyTimeline        observedCopyTimeline
+	segmentGeneration   uint64
+	segmentIncarnation  string
+	dv81Mu              sync.Mutex
+	dv81Converted       map[string]uint64
+	dv81Track           dovirpu.Track
 	// restartStartSegment is the absolute HLS segment number the most recent
 	// in-place restart began producing at. Zero means no restart has happened
 	// (or the restart cut from zero, as a planned copy stream does), so segment
@@ -345,6 +357,16 @@ type TranscodeSession struct {
 	// live generation only when that generation provably owns the same absolute
 	// timeline position (see TranscodeSession.RestartContinuationSegment).
 	restartStartSegment int
+	// restartRecoverySeq is the arrival number of the segment request that
+	// triggered the restart in flight, or zero for a plan-level restart (a
+	// reanchor, an audio switch). A request numbered after it names a newer
+	// viewer target and may supersede the restart's position. Guarded by mu.
+	restartRecoverySeq uint64
+	// restartTargetSegment is the absolute segment the restart in flight starts
+	// producing at. It lets a plan-level restart (which has no originating
+	// request number) still recognize a request that lies beyond its own
+	// forward production as a newer seek. Guarded by mu.
+	restartTargetSegment int
 	// restartPredecessorToken is the exact generation token displaced by the
 	// most recent in-place restart. Only this immediate predecessor may be
 	// served from the live generation: an older token from generation A is not
@@ -389,6 +411,13 @@ type TranscodeSession struct {
 	// budget before the ordinary failure path. The next segment request surfaces
 	// this verdict instead; the next successful restart clears it. Guarded by mu.
 	asyncRestartErr error
+	// restartPublishFailed reports that a restart killed the live generation but
+	// never published its replacement (a spawn or liveness failure after the
+	// old process was reaped). The generation token still names the dead
+	// generation, so a segment wait must answer a retryable failure instead of
+	// fencing a URL whose successor never existed. Cleared when the next
+	// replacement publishes. Guarded by mu.
+	restartPublishFailed bool
 	// lifecycleAlive, when non-nil, reports whether this session is still the
 	// live mapped session. The manager installs it around a restart so the
 	// restart cannot re-spawn ffmpeg for a session a concurrent stop already
@@ -425,7 +454,7 @@ type TranscodeSession struct {
 	// generation-scoped progress probe. Production leaves both nil, using
 	// time.Now and the output-directory scan.
 	decodeNow   func() time.Time
-	decodeProbe func(outputDir string, cutoff time.Time) bool
+	decodeProbe func(outputDir string, cutoff time.Time, videoFrames int64) bool
 	// decodeReapTimeout is the per-session teardown bound for a confirmed
 	// generation. Zero uses decodeReapTimeout. Tests shrink it without
 	// mutating a package global.
@@ -440,7 +469,29 @@ type TranscodeSession struct {
 	// written by a previous generation (or a previous session sharing the
 	// directory) and describes media this process has not produced yet.
 	generationStartedAt time.Time
-	inputCleanupOnce    sync.Once
+	// videoFrames is how many video frames the current generation's FFmpeg
+	// -progress stream has reported, and videoOutTimeUS is the newest
+	// out_time_us reading (microseconds of muxed output). lastVideoFrameAt is
+	// when the count last advanced. A video encode writes a frame only after
+	// decoding it, so these are the only server-side evidence that a muxed
+	// segment carries decodable video at all; segment existence is not.
+	// Copy/remux plans pass no -progress, so they report zero. Resetting them
+	// with the generation keeps a replacement from inheriting a predecessor's
+	// frames, and progressGeneration fences the reader goroutine of a
+	// generation that has been replaced. All guarded by mu.
+	videoFrames        int64
+	videoOutTimeUS     int64
+	lastVideoFrameAt   time.Time
+	progressGeneration uint64
+	// observedStartupLatency is the time from the owning generation's spawn to
+	// its first produced segment, latched once per generation. It is reset
+	// whenever a generation starts so a restarted generation is never judged by
+	// what an earlier one cost, and it is latched on the first measurement so a
+	// later scan whose earliest surviving segment the pruner already deleted
+	// cannot inflate it. Zero means the current generation has no measurement
+	// yet, which keeps the restart hold. Guarded by mu.
+	observedStartupLatency time.Duration
+	inputCleanupOnce       sync.Once
 	// inheritedManifest is the stream.m3u8 an earlier generation left in the
 	// output directory before this process spawned, or nil. FFmpeg replaces the
 	// playlist through a temp file and rename on every write, so a manifest that
@@ -506,7 +557,12 @@ type SegmentProgress struct {
 	// started a process. Output stamped before it belongs to an earlier
 	// generation and must not be read as this process's progress.
 	GenerationStartedAt time.Time
-	HasManifest         bool
+	// StartupLatency is how long the current generation needed from spawn to its
+	// first produced segment: the encoder's observed cost of opening the source
+	// at the position that generation starts at. Zero until the generation has
+	// produced a segment, and for sessions that never started a process.
+	StartupLatency time.Duration
+	HasManifest    bool
 	// ProducedHeadCurrentGeneration is ProducedHead restricted to segments this
 	// generation's process actually wrote, judged by file mtime at or after
 	// GenerationStartedAt. On a restart that keeps a prior generation's segments
@@ -515,11 +571,22 @@ type SegmentProgress struct {
 	// window ahead cannot pause a process that has produced nothing. Equal to
 	// ProducedHead when GenerationStartedAt is zero.
 	ProducedHeadCurrentGeneration int
-	Running                       bool
-	Restarting                    bool
-	StartSegmentNumber            int
-	SegmentDuration               int
-	LastRequestedSegment          int
+	// LastCompletedSegment is the highest segment the client finished
+	// downloading in the current generation, read with the rest.
+	LastCompletedSegment int
+	// Failed is a stopped FFmpeg that exited with an error, read with the
+	// rest so a restart cannot clear it between reads.
+	Failed               bool
+	Running              bool
+	Restarting           bool
+	StartSegmentNumber   int
+	SegmentDuration      int
+	LastRequestedSegment int
+	// VideoFrames is how many video frames the current generation has reported
+	// on its FFmpeg -progress stream. ProducedCount only counts muxed bytes, so
+	// a generation that is writing audio-only segments has a growing
+	// ProducedCount with VideoFrames still zero. Copy/remux plans report zero.
+	VideoFrames int64
 }
 
 // SegmentRecoveryDecision tells the segment handler whether to briefly wait
@@ -529,7 +596,51 @@ type SegmentRecoveryDecision struct {
 	WaitTimeout      time.Duration
 	RestartOnTimeout bool
 	Reason           string
-	Progress         SegmentProgress
+	// BeyondWaitReach reports that the request lies farther past the produced
+	// head than the player's sequential prefetch can cover. Such a request is a
+	// seek target: it becomes the newest viewer position, and it must not burn
+	// the head budget waiting for an encoder that is not producing it.
+	BeyondWaitReach bool
+	// SeekTarget reports that the request names the viewer's newest position and
+	// must become the session's newest seek target. It includes a forward seek
+	// beyond the wait reach and, while a restart is in flight, a request behind
+	// that restart's own production (a backward seek the restart will never
+	// satisfy). Handlers mark the request with MarkSegmentSeek so older waits
+	// and restarts are superseded by it.
+	SeekTarget bool
+	// RestartSuperseded reports that this request arrived after the restart in
+	// flight and so names a newer target than the one that restart is
+	// producing. It is only meaningful while Progress.Restarting is true.
+	RestartSuperseded bool
+	// RestartTargetSegment is the absolute segment the restart in flight
+	// produces from, and RestartPlanLevel reports that the restart has no
+	// originating request (a reanchor or an audio switch). A request beyond the
+	// target's reach is a newer seek even for such a restart.
+	RestartTargetSegment int
+	RestartPlanLevel     bool
+	Progress             SegmentProgress
+}
+
+// beyondWaitReach reports whether a request is farther past the produced head
+// than a running encoder can plausibly serve as continuous playback. The
+// produced head is allowed to run the throttle's minimum window (or more) ahead
+// of the client, so a request beyond that window is the player asking for a
+// position production has not reached: a seek.
+func beyondWaitReach(segNum int, progress SegmentProgress) bool {
+	return segNum > progress.ProducedHead+sequentialReach(progress.SegmentDuration)
+}
+
+// sequentialReach is how many segments past a produced head or restart target
+// the player's forward prefetch can cover.
+func sequentialReach(segmentDuration int) int {
+	if segmentDuration <= 0 {
+		segmentDuration = defaultSegmentDuration
+	}
+	reach := maxSequentialPrefetchSeconds / segmentDuration
+	if reach < maxSequentialMissingSegments {
+		reach = maxSequentialMissingSegments
+	}
+	return reach
 }
 
 // SegmentRecoveryFarSeekReason is the decision reason for a request whose
@@ -602,6 +713,23 @@ const (
 // is a safety margin sized to the segment cadence, not an operator preference.
 const decodeObservationWindow = time.Second
 
+// noVideoFramesGrace is how long a video encode may mux segments without
+// reporting a single decoded frame before its start is declared unplayable. A
+// healthy encode reports its first frames through FFmpeg's -progress stream
+// before it can write the first segment, so the grace only elapses for a
+// generation that is muxing audio without decoding video. It is deliberately a
+// code constant, not a user setting: it trades a few seconds of start latency
+// on a broken plan against the client's much longer startup guard.
+const noVideoFramesGrace = 8 * time.Second
+
+// reportsVideoFrames reports whether this plan's FFmpeg process is asked for a
+// -progress stream whose frame counter can be read. Only a video encode decodes
+// frames; a copy/remux passes no -progress, so its frame count is always zero
+// and must never be read as evidence about the source.
+func reportsVideoFrames(opts TranscodeOpts) bool {
+	return !strings.EqualFold(opts.TargetCodecVideo, "copy")
+}
+
 // decodeVerdictStage is the internal decoder-verdict lifecycle for one ffmpeg
 // generation: observing (no verdict), suspected (threshold crossed, awaiting a
 // progress check or expiry), and confirmed (terminal for the generation).
@@ -639,6 +767,12 @@ func ManifestStartupTimeoutFor(opts TranscodeOpts) time.Duration {
 
 const (
 	maxSequentialMissingSegments = 2
+	// maxSequentialPrefetchSeconds bounds how far past the produced head a
+	// request may lie and still count as the player prefetching the encoder's
+	// own forward production. It is wider than the throttle's 60 s minimum
+	// forward window, so ordinary read-ahead stays inside it, while a request
+	// beyond it names a position production cannot reach by continuing.
+	maxSequentialPrefetchSeconds = 120
 	activeSegmentWait            = 12 * time.Second
 	// SegmentStallTimeout is how long the produced head may remain unchanged
 	// before a segment wait is treated as stalled. A slow encoder that keeps
@@ -807,7 +941,7 @@ func StartTranscode(ctx context.Context, opts TranscodeOpts) (*TranscodeSession,
 	log.Printf("playback: ffmpeg cmd: %s %s", bin, strings.Join(args, " "))
 	s.logFFmpegEvent(ctx, "ffmpeg process starting", "")
 
-	cmd := procgroup.CommandContext(ctx, fspath.Decode(bin), fspath.DecodeAll(args)...)
+	cmd := fspath.CommandContext(ctx, bin, args...)
 	stdinPipe, err := cmd.StdinPipe()
 	if err != nil {
 		cancel()
@@ -817,6 +951,12 @@ func StartTranscode(ctx context.Context, opts TranscodeOpts) (*TranscodeSession,
 	cmd.Dir = opts.OutputDir
 	cmd.Stderr = s.newStderrWriter(ctx)
 	cmd.WaitDelay = 3 * time.Second
+	progressPipe, err := attachProgressPipe(cmd, opts)
+	if err != nil {
+		cancel()
+		releaseHWDevice()
+		return nil, fmt.Errorf("create progress pipe: %w", err)
+	}
 
 	// Stamp the generation before the process can write anything, so every file
 	// this ffmpeg produces is strictly newer than the stamp.
@@ -831,11 +971,15 @@ func StartTranscode(ctx context.Context, opts TranscodeOpts) (*TranscodeSession,
 	}
 	s.cmd = cmd
 	s.stdinPipe = stdinPipe
-	s.generationStartedAt = startedAt
+	s.beginGeneration(startedAt)
+	progressGeneration := s.progressGeneration
 	s.inheritedManifest = inheritedManifest
 	s.startSubtitleSpanLocked(opts)
 	s.saveSubtitleSpans()
 	s.logFFmpegEvent(ctx, "ffmpeg process started", "")
+	if progressPipe != nil {
+		go s.consumeProgress(progressPipe, progressGeneration)
+	}
 
 	// Monitor ffmpeg in background. The process-specific reservation is released
 	// before done closes, so waiters can safely launch a replacement process.
@@ -1111,7 +1255,7 @@ func validateToneMapSource(ctx context.Context, opts TranscodeOpts) error {
 	if isVirtualOrHTTP {
 		return nil
 	}
-	if err := opts.ToneMapSourceRevision.ValidatePath(opts.InputPath); err != nil {
+	if err := opts.ToneMapSourceRevision.ValidatePath(ctx, opts.InputPath); err != nil {
 		if errors.Is(err, tonemap.ErrSourceRevisionChanged) {
 			return err
 		}
@@ -1189,6 +1333,13 @@ func buildFFmpegArgs(opts TranscodeOpts) []string {
 		"-hide_banner",
 		"-loglevel", "error",
 	}
+	// A video encode reports machine-readable progress on stdout: the frame
+	// counter is the only way to tell a muxing encode from one whose decoder
+	// produced nothing. Copy/remux plans are unchanged: they decode nothing, so
+	// a frame count would say nothing about them and their stdout stays unused.
+	if reportsVideoFrames(opts) {
+		args = append(args, "-progress", "pipe:1", "-nostats")
+	}
 
 	// Hardware acceleration — skip when copying video (no encoding needed).
 	if !isVideoCopy {
@@ -1197,11 +1348,22 @@ func buildFFmpegArgs(opts TranscodeOpts) []string {
 
 	lowerInput := strings.ToLower(strings.TrimSpace(opts.InputPath))
 	isRemote := strings.HasPrefix(lowerInput, "http://") || strings.HasPrefix(lowerInput, "https://")
-	fflags := "+genpts+fastseek"
+	// A video *encode* decodes what it writes, so its seek must be the one a
+	// decoder needs. +fastseek seeks the demuxer without clamping to the
+	// preceding keyframe, which on open-GOP content (HEVC in particular) starts
+	// the decoder mid-GOP with reference frames it never saw: FFmpeg then muxes
+	// segments that carry no decodable picture. Without +fastseek the ordinary
+	// accurate seek lands on the keyframe and discards the leading pictures.
+	// A copy/remux keeps +fastseek: it copies packets and never decodes, and
+	// its own keyframe clamp lives in copy_seek_anchor.go.
+	fflags := "+genpts"
+	if isVideoCopy {
+		fflags = "+genpts+fastseek"
+	}
 	analyzeDuration := "3000000" // 3 seconds (default 5s)
 	probeSize := "5000000"       // 5 MB (default 5MB, explicit for clarity)
 	if isRemote {
-		fflags = "+genpts+fastseek+nobuffer"
+		fflags += "+nobuffer"
 		analyzeDuration = "1000000" // 1 second for remote streams to avoid WAN stalling
 		probeSize = "1000000"       // 1 MB
 	}
@@ -1277,6 +1439,9 @@ func buildFFmpegArgs(opts TranscodeOpts) []string {
 
 	// Audio codec.
 	args = appendAudioArgs(args, opts)
+	if HLSCopiesAACIntoFMP4(opts) {
+		args = appendCopiedAACToMP4Args(args, opts.CopyAudioCodec)
+	}
 
 	// Subtitle burn-in and resolution scaling — only when encoding video.
 	if !isVideoCopy {
@@ -1472,6 +1637,14 @@ func HLSOutputContainer(opts TranscodeOpts) string {
 		return OutputContainerFMP4
 	}
 	return OutputContainerMPEGTS
+}
+
+// HLSCopiesAACIntoFMP4 reports whether this plan copies an AAC audio track
+// into fMP4 segments, which need aac_adtstoasc.
+func HLSCopiesAACIntoFMP4(opts TranscodeOpts) bool {
+	return !TranscodesAudio(opts.TargetCodecAudio) &&
+		HLSOutputContainer(opts) == OutputContainerFMP4 &&
+		copiedAudioIsAAC(opts.CopyAudioCodec)
 }
 
 // copyVideoUsesFMP4 reports whether copied video is packaged as fragmented MP4
@@ -2756,6 +2929,12 @@ func (s *TranscodeSession) getManifest(currentGeneration bool) ([]byte, error) {
 				if s.restarting != nil {
 					return nil, ErrManifestNotReady
 				}
+				if s.restartPublishFailed {
+					// The restart never published a replacement process, so the
+					// playlist can only appear after a retry. Retryable, not a
+					// transcode verdict and never a generation fence.
+					return nil, ErrManifestNotReady
+				}
 				if s.processCanceled {
 					// This generation was stopped by the session itself, so its
 					// playlist will never become ready. Retryable, not a
@@ -2804,6 +2983,9 @@ func (s *TranscodeSession) getManifest(currentGeneration bool) ([]byte, error) {
 		if s.running || s.restarting != nil {
 			return nil, ErrManifestNotReady
 		}
+		if s.restartPublishFailed {
+			return nil, ErrManifestNotReady
+		}
 		if s.processCanceled {
 			// Same self-teardown verdict as above: the missing startup media
 			// belongs to a generation nobody is producing any more.
@@ -2826,8 +3008,58 @@ func (s *TranscodeSession) getManifest(currentGeneration bool) ([]byte, error) {
 			return nil, fmt.Errorf("invalid copy playback manifest: %w", err)
 		}
 	}
+	// Only readiness reads are gated on decoded video (see
+	// videoFramesVerdictLocked): a manifest re-read for a session that already
+	// served one must keep its prompt answer while a replacement warms up.
+	if currentGeneration || !s.manifestServed {
+		if err := s.videoFramesVerdictLocked(data, time.Now()); err != nil {
+			return nil, err
+		}
+	}
 
 	return data, nil
+}
+
+// videoFramesVerdictLocked decides whether a video encode generation has
+// produced decodable video or whether its start must be held back. A video
+// encode proves it can play only by decoding frames: segments on disk prove
+// the muxer wrote bytes, and an encode whose decoder produced nothing still
+// writes a non-empty segment for every audio packet, which is how a start once
+// committed a plan that never showed a frame and left the client to burn its
+// own startup guard. So the start is held until the generation's frame counter
+// moves, and a generation that keeps muxing past the grace without one is a
+// typed verdict the caller acts on instead of waiting out its budget.
+//
+// It reports nil for every plan that cannot answer the question: a copy/remux
+// plan (which passes no -progress), a finished generation (whose exit is judged
+// by the process outcome), and a session with no spawned generation (the
+// historical in-test fixtures). A completed playlist is also tolerated without
+// frames: a very short clip, or a seek that lands in the last fragment, can
+// legitimately finish with an audio-only tail, exactly as startupFilesReady
+// already tolerates an end-listed window below the live runway.
+//
+// Callers must hold mu.
+func (s *TranscodeSession) videoFramesVerdictLocked(manifest []byte, now time.Time) error {
+	if !s.running || s.generationStartedAt.IsZero() || !reportsVideoFrames(s.opts) {
+		return nil
+	}
+	if s.videoFrames > 0 {
+		return nil
+	}
+	// A completed playlist needs no further frames: the generation has already
+	// reached the end of what it can produce.
+	if bytes.Contains(manifest, []byte("#EXT-X-ENDLIST")) {
+		return nil
+	}
+	elapsed := now.Sub(s.generationStartedAt)
+	if elapsed < noVideoFramesGrace {
+		// Still inside the grace: hold the start rather than call it sick. A
+		// healthy encoder reports its first frames before it can write its
+		// first segment, so this normally lasts one poll.
+		return ErrManifestNotReady
+	}
+	return fmt.Errorf("%w: 0 frames decoded after %s while muxing (out_time_us=%d)",
+		ErrTranscodeNoVideoFrames, elapsed.Round(time.Millisecond), s.videoOutTimeUS)
 }
 
 // statManifest returns the output directory's current stream.m3u8, or nil.
@@ -3690,7 +3922,10 @@ func (s *TranscodeSession) SegmentProgress(time.Time) SegmentProgress {
 		StartSegmentNumber:            opts.StartSegmentNumber,
 		SegmentDuration:               opts.SegmentDuration,
 		LastRequestedSegment:          s.lastRequestedSegment,
+		LastCompletedSegment:          s.lastCompletedSegment,
+		Failed:                        !s.running && s.waitErr != nil,
 		GenerationStartedAt:           s.generationStartedAt,
+		VideoFrames:                   s.videoFrames,
 	}
 	s.mu.Unlock()
 
@@ -3699,6 +3934,10 @@ func (s *TranscodeSession) SegmentProgress(time.Time) SegmentProgress {
 	}
 
 	manifestPath := filepath.Join(s.outputDir, "stream.m3u8")
+	// The earliest segment this generation wrote is its first output; the gap
+	// from the spawn stamp to it is how long the encoder needed to open the
+	// source at this generation's start position.
+	var firstGenerationSegmentAt time.Time
 	manifestInfo, statErr := os.Stat(manifestPath)
 	var timeline manifestTimeline
 	var parseOK bool
@@ -3731,6 +3970,9 @@ func (s *TranscodeSession) SegmentProgress(time.Time) SegmentProgress {
 				if entry.number > progress.ProducedHeadCurrentGeneration {
 					progress.ProducedHeadCurrentGeneration = entry.number
 				}
+				if firstGenerationSegmentAt.IsZero() || info.ModTime().Before(firstGenerationSegmentAt) {
+					firstGenerationSegmentAt = info.ModTime()
+				}
 			}
 		}
 	} else if s.outputDir != "" {
@@ -3761,6 +4003,9 @@ func (s *TranscodeSession) SegmentProgress(time.Time) SegmentProgress {
 					if segNum > progress.ProducedHeadCurrentGeneration {
 						progress.ProducedHeadCurrentGeneration = segNum
 					}
+					if firstGenerationSegmentAt.IsZero() || info.ModTime().Before(firstGenerationSegmentAt) {
+						firstGenerationSegmentAt = info.ModTime()
+					}
 				}
 			}
 			if statErr == nil && progress.ProducedCount > 0 {
@@ -3769,8 +4014,63 @@ func (s *TranscodeSession) SegmentProgress(time.Time) SegmentProgress {
 			}
 		}
 	}
+	if latency := startupLatencyOf(progress.GenerationStartedAt, firstGenerationSegmentAt); latency > 0 {
+		progress.StartupLatency = latency
+		s.mu.Lock()
+		// Latch the first measurement for the generation this scan measured.
+		// A generation that started while the scan was running owns a different
+		// spawn stamp, so its (unmeasured) slot is left alone; a later scan of
+		// this same generation cannot replace the first value, which is the one
+		// a pruning floor cannot reach.
+		if s.generationStartedAt.Equal(progress.GenerationStartedAt) && s.observedStartupLatency == 0 {
+			s.observedStartupLatency = latency
+		}
+		s.mu.Unlock()
+	}
 	scanActiveTempProgress(s.outputDir, &progress)
 	return progress
+}
+
+// beginGeneration records that a new owning ffmpeg generation spawned at
+// startedAt. Callers hold mu, except StartTranscode before it publishes the
+// session. Startup latency is measured per generation, so a replacement starts
+// unmeasured instead of inheriting what an earlier generation cost. The frame
+// counters belong to the same generation: a replacement that has not decoded a
+// frame yet must not look like one that has, and progressGeneration fences the
+// reader of the process that was just replaced.
+func (s *TranscodeSession) beginGeneration(startedAt time.Time) {
+	s.generationStartedAt = startedAt
+	s.observedStartupLatency = 0
+	s.videoFrames = 0
+	s.videoOutTimeUS = 0
+	s.lastVideoFrameAt = time.Time{}
+	s.progressGeneration++
+}
+
+// startupLatencyOf reports how long a generation needed from its spawn stamp to
+// its first produced segment, or zero when either stamp is missing.
+func startupLatencyOf(generationStartedAt, firstSegmentAt time.Time) time.Duration {
+	if generationStartedAt.IsZero() || firstSegmentAt.IsZero() {
+		return 0
+	}
+	if latency := firstSegmentAt.Sub(generationStartedAt); latency > 0 {
+		return latency
+	}
+	return 0
+}
+
+// StartupLatency reports the owning generation's measured startup: the time
+// between its spawn and its first produced segment. The measurement belongs to
+// one generation and is latched on its first scan, so it is zero until the
+// current generation has produced output and never describes an earlier
+// generation. Zero keeps the restart hold.
+func (s *TranscodeSession) StartupLatency() time.Duration {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.observedStartupLatency
 }
 
 func scanActiveTempProgress(outputDir string, progress *SegmentProgress) {
@@ -3800,26 +4100,108 @@ func scanActiveTempProgress(outputDir string, progress *SegmentProgress) {
 	}
 }
 
-// SegmentRecoveryDecision determines whether a missing segment should briefly
-// wait for ffmpeg or immediately use the seek-restart path.
-func (s *TranscodeSession) SegmentRecoveryDecision(segNum int, now time.Time) SegmentRecoveryDecision {
-	progress := s.SegmentProgress(now)
-	decision := SegmentRecoveryDecision{
-		WaitTimeout:      segmentWaitTimeout(progress.SegmentDuration),
-		RestartOnTimeout: true,
-		Progress:         progress,
+// restartState reports the request number and absolute segment of the restart
+// in flight. A zero request number marks a plan-level restart.
+func (s *TranscodeSession) restartState() (recoverySeq uint64, targetSegment int) {
+	if s == nil {
+		return 0, 0
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.restartRecoverySeq, s.restartTargetSegment
+}
+
+// OutputBoundsClient reports whether the running encoder has no lead over the
+// client: the client has completed downloading every produced segment but at
+// most the newest. Playback is then paced by how fast the server produces
+// segments, not by the link, so a stall the client reports now is the
+// server's. An encoder that keeps up runs ahead of the client up to the
+// throttle window; one that is slower than real time, such as a heavy
+// subtitle burn-in, never gets ahead. Output left by an earlier FFmpeg
+// generation is not this encoder's lead: until the running one writes its
+// own, and while a restart replaces it, the client is waiting on it. An
+// encoder that failed counts like one that runs: a client that caught up
+// with its output waits on a server fault.
+func (s *TranscodeSession) OutputBoundsClient() bool {
+	progress := s.SegmentProgress(time.Now())
+	if progress.Restarting {
+		return true
+	}
+	if !progress.Running && !progress.Failed {
+		// A finished encoder left every segment for the client to fetch.
+		return false
+	}
+	// A running encoder, or one that failed, paces a client that has caught
+	// up with its output.
+	if progressPredatesGeneration(progress) {
+		return true
+	}
+	return progress.ProducedHead-progress.LastCompletedSegment <= 1
+}
+
+// SegmentRecoveryDecision determines whether a missing segment should briefly
+// wait for ffmpeg or immediately use the seek-restart path. It is the
+// unnumbered form; handlers use SegmentRecoveryDecisionForRequest so a newer
+// seek can supersede the restart in flight.
+func (s *TranscodeSession) SegmentRecoveryDecision(segNum int, now time.Time) SegmentRecoveryDecision {
+	return s.SegmentRecoveryDecisionForRequest(segNum, 0, now)
+}
+
+// SegmentRecoveryDecisionForRequest is SegmentRecoveryDecision for a request
+// numbered by BeginSegmentRecovery. The sequence lets a request that arrived
+// after the restart in flight be recognized as the viewer's newer target
+// instead of being made to wait out a head budget the older restart will spend
+// on the wrong position.
+func (s *TranscodeSession) SegmentRecoveryDecisionForRequest(segNum int, seq uint64, now time.Time) SegmentRecoveryDecision {
+	progress := s.SegmentProgress(now)
+	restartSeq, restartTarget := s.restartState()
+	decision := SegmentRecoveryDecision{
+		WaitTimeout:          segmentWaitTimeout(progress.SegmentDuration),
+		BeyondWaitReach:      beyondWaitReach(segNum, progress),
+		RestartSuperseded:    seq != 0 && restartSeq != 0 && seq > restartSeq,
+		RestartTargetSegment: restartTarget,
+		RestartPlanLevel:     restartSeq == 0,
+		Progress:             progress,
+	}
+	decision.SeekTarget = decision.BeyondWaitReach
+	decision.RestartOnTimeout = true
 	if s.copyPlan != nil {
 		return s.plannedSegmentRecoveryDecision(segNum, decision)
 	}
 
 	switch {
 	// Restarting must be checked before Running: the restart window runs
-	// with running=false, and a concurrent segment request must wait out
+	// with running=false, and a concurrent sequential request must wait out
 	// the in-flight restart rather than trigger another one. Dueling
 	// restarts keep preempting the segment the player is blocked on,
 	// which surfaces as a seek/intro-skip freeze (issue #243).
+	//
+	// A request that arrived after the restart in flight, and lies beyond the
+	// head reach, is not the segment that restart is producing: it names a
+	// newer viewer target. Waiting would hold the seek for the full head budget
+	// and then abandon it, leaving the generation where the older target put
+	// it. Record it as the seek it is and coalesce it onto the running restart
+	// instead. A request issued before the restart waits for it as before.
 	case progress.Restarting:
+		// A request behind the restart's own target is not media that restart
+		// will produce either: the replacement only produces forward from its
+		// start, so a backward seek during a forward restart names the viewer's
+		// newer position. Waiting for it would adopt the older forward position
+		// (the "seek to 344 reverted to 950" shape). A request the restart does
+		// produce waits as before.
+		behindRestart := decision.RestartTargetSegment > 0 && segNum < decision.RestartTargetSegment
+		newerThanRestart := decision.RestartSuperseded ||
+			(decision.RestartPlanLevel &&
+				(behindRestart || segNum > decision.RestartTargetSegment+sequentialReach(progress.SegmentDuration)))
+		if (decision.BeyondWaitReach || behindRestart) && newerThanRestart {
+			decision.SeekTarget = true
+			decision.Reason = SegmentRecoveryFarSeekReason
+			break
+		}
+		// This request does not own a new target: it either arrived before the
+		// restart or names media the restart produces. It must not supersede the
+		// restart in flight.
+		decision.SeekTarget = false
 		decision.Wait = true
 		decision.WaitTimeout = activeSegmentWait
 		decision.RestartOnTimeout = false
@@ -3827,8 +4209,26 @@ func (s *TranscodeSession) SegmentRecoveryDecision(segNum int, now time.Time) Se
 	case !progress.Running:
 		decision.Reason = "transcode_not_running"
 	case segNum < progress.StartSegmentNumber:
+		if anchor := s.playlistStartSegment(); anchor > 0 && segNum < anchor {
+			// A seek-anchored playlist begins at this segment. A request below
+			// it cannot name a segment this transport publishes, so it is a
+			// stale playlist (or one the server never served) rather than a
+			// seek this generation can satisfy. Restarting for it would kill a
+			// healthy encoder and still leave the segment unlisted; let the
+			// request fail so the client reloads the playlist it has.
+			decision.Wait = false
+			decision.RestartOnTimeout = false
+			decision.Reason = "before_playlist_start"
+			break
+		}
+		// Behind this generation's own start, the encoder will never write it:
+		// the request is a backward seek and becomes the newest target.
+		decision.SeekTarget = true
 		decision.Reason = "before_start_segment"
 	case segNum <= progress.ProducedHead:
+		// At or below the produced head but absent (pruned or never written):
+		// satisfying it restarts the encoder backward, so it is a seek too.
+		decision.SeekTarget = true
 		decision.Reason = "segment_missing_behind_produced_head"
 	case !progress.HasManifest:
 		if segNum <= progress.StartSegmentNumber+1 {
@@ -3844,7 +4244,13 @@ func (s *TranscodeSession) SegmentRecoveryDecision(segNum int, now time.Time) Se
 		// (e.g. normal continuous playback) and the encoder is actively running,
 		// this is continuous streaming, not an arbitrary seek jump. Wait for FFmpeg
 		// instead of killing the process.
-		if progress.Running && segNum == progress.LastRequestedSegment+1 &&
+		// "Next after the last requested segment" only describes continuous
+		// playback while the encoder's own production reaches it. A request
+		// farther than that reach is a seek that happens to land on the
+		// sequence's next number (a stale prefetch chain from before the seek),
+		// and waiting for it would spend the head budget on an impossible
+		// position.
+		if progress.Running && segNum == progress.LastRequestedSegment+1 && !decision.BeyondWaitReach &&
 			(progress.LastProducedAt.IsZero() || now.Sub(progress.LastProducedAt) <= staleProducedWindow(progress.SegmentDuration)) {
 			decision.Wait = true
 			decision.WaitTimeout = activeSegmentWait
@@ -3877,6 +4283,13 @@ func (s *TranscodeSession) GenerateFullManifest(segPrefix, rawQuery string) []by
 	return s.generateSyntheticPlaylist(segPrefix, rawQuery, "seg_", segExt, segExt == ".m4s")
 }
 
+// playlistStartSegment is the first segment this session's complete VOD
+// playlist lists, or zero for the historical whole-timeline playlist.
+func (s *TranscodeSession) playlistStartSegment() int {
+	opts := s.Opts()
+	return syntheticPlaylistStartSegment(opts, syntheticSegmentCount(opts.TotalDuration, opts.SegmentDuration))
+}
+
 // syntheticSegmentCount is the number of fixed-duration segments the
 // synthetic playlist lists for the media.
 func syntheticSegmentCount(totalDuration float64, segmentDuration int) int {
@@ -3889,9 +4302,13 @@ func syntheticSegmentCount(totalDuration float64, segmentDuration int) int {
 	return max(1, int(math.Ceil(totalDuration/float64(segmentDuration))))
 }
 
-// generateSyntheticPlaylist lists every fixed-duration segment of the media
+// generateSyntheticPlaylist lists the fixed-duration segments of the media
 // under namePrefix%05d+ext. The video playlist and the subtitle rendition
 // playlist share it, so both carry exactly the same segment timeline.
+//
+// A session whose transport begins at a seek anchor lists from that anchor
+// (see syntheticPlaylistStartSegment) and publishes it as the media sequence,
+// so the playlist describes only what the generation produces.
 func (s *TranscodeSession) generateSyntheticPlaylist(segPrefix, rawQuery, namePrefix, segExt string, initMap bool) []byte {
 	opts := s.Opts()
 	totalDur := opts.TotalDuration
@@ -3903,8 +4320,9 @@ func (s *TranscodeSession) generateSyntheticPlaylist(segPrefix, rawQuery, namePr
 		totalDur = float64(segDur) // fallback: single segment
 	}
 	segCount := syntheticSegmentCount(totalDur, segDur)
+	start := syntheticPlaylistStartSegment(opts, segCount)
 
-	queryDefinition, suffix, queryVersion := syntheticManifestQuery(segCount, rawQuery)
+	queryDefinition, suffix, queryVersion := syntheticManifestQuery(segCount-start, rawQuery)
 
 	hlsVersion := 3
 	if initMap {
@@ -3924,14 +4342,14 @@ func (s *TranscodeSession) generateSyntheticPlaylist(segPrefix, rawQuery, namePr
 	// SegDuration+1. EXTINF keeps the nominal duration and segment indexing is
 	// unchanged.
 	fmt.Fprintf(&buf, "#EXT-X-TARGETDURATION:%d\n", segDur+1)
-	buf.WriteString("#EXT-X-MEDIA-SEQUENCE:0\n")
+	fmt.Fprintf(&buf, "#EXT-X-MEDIA-SEQUENCE:%d\n", start)
 	buf.WriteString("#EXT-X-PLAYLIST-TYPE:VOD\n")
 
 	if initMap {
 		fmt.Fprintf(&buf, "#EXT-X-MAP:URI=\"%sinit.mp4%s\"\n", segPrefix, suffix)
 	}
 
-	for i := range segCount {
+	for i := start; i < segCount; i++ {
 		dur := float64(segDur)
 		if i == segCount-1 {
 			// Last segment covers the remainder.
@@ -3946,6 +4364,38 @@ func (s *TranscodeSession) generateSyntheticPlaylist(segPrefix, rawQuery, namePr
 
 	buf.WriteString("#EXT-X-ENDLIST\n")
 	return buf.Bytes()
+}
+
+// syntheticPlaylistStartSegment is the first segment of a complete VOD
+// playlist. An encoded generation that begins at a seek anchor produces
+// segment files from that anchor; listing the earlier ones advertises media
+// this generation cannot produce, and a player that prefetches the playlist's
+// first entry would request one of them, making the segment layer restart a
+// healthy encoder for bytes the player never plays. v3 plans anchored on a
+// seek publish the same position as their timeline origin (see
+// configureHLSTimelineV3), so the playlist's own clock and the client's agree.
+//
+// Every other caller keeps the historical whole-timeline playlist from segment
+// zero: v1, Jellyfin compatibility, and seek restarts of a session that began
+// at the source start all publish source-zero playlists.
+func syntheticPlaylistStartSegment(opts TranscodeOpts, segCount int) int {
+	if opts.StreamOriginSeconds <= 0 || strings.EqualFold(opts.TargetCodecVideo, "copy") {
+		return 0
+	}
+	segDur := opts.SegmentDuration
+	if segDur <= 0 {
+		segDur = defaultSegmentDuration
+	}
+	start := int(math.Round(opts.StreamOriginSeconds / float64(segDur)))
+	if start <= 0 {
+		return 0
+	}
+	if segCount <= 0 {
+		return 0
+	}
+	// A duration that rounds short of the anchor still lists its last segment
+	// rather than an empty playlist.
+	return min(start, segCount-1)
 }
 
 // GetSegment returns the file path of a named segment if it exists.
@@ -4054,6 +4504,19 @@ func (s *TranscodeSession) openSegment(name string) (lease *SegmentLease, dv81 b
 	if !info.Mode().IsRegular() || info.Size() <= 0 {
 		_ = segment.Close()
 		return nil, false, "", ErrSegmentNotFound
+	}
+	// Bytes on disk are not the same as a whole segment. The HLS muxer still
+	// holds "<name>.tmp" while it produces a media segment, and it truncates
+	// and rewrites init.mp4 in place, so a request that races either can read a
+	// prefix. Refuse that and let the caller wait or retry (ErrSegmentIncomplete)
+	// instead of answering 200 with bytes the client cannot decode.
+	if segmentTempInProgress(root, name) {
+		_ = segment.Close()
+		return nil, false, "", ErrSegmentIncomplete
+	}
+	if err := initSegmentComplete(name, segment, info.Size()); err != nil {
+		_ = segment.Close()
+		return nil, false, "", err
 	}
 	if s.segmentIncarnation == "" {
 		s.segmentIncarnation = uuid.NewString()
@@ -4199,7 +4662,14 @@ func (s *TranscodeSession) CloseProcess() error {
 // it: every other stop advances the generation so a stopped session's stale
 // timeline is fenced out.
 func (s *TranscodeSession) CloseProcessRetained() error {
-	return s.shutdownProcess(false, false)
+	err := s.shutdownProcess(false, false)
+	// The stopped process may have died between opening a segment's temp file
+	// and renaming it, and this directory keeps being served for the overlap: a
+	// leftover would make that name look like a live writer for its duration.
+	// CloseProcess deliberately does not do this, because its output directory
+	// can belong to a live winning session that is still writing temp files.
+	s.removeStaleSegmentTemps()
+	return err
 }
 
 // shutdown kills the ffmpeg process and, when removeOutput is true, removes the
@@ -4501,7 +4971,7 @@ func (s *TranscodeSession) cleanStaleOutputForRestart(first interface{}, rest ..
 // recipe-changing restarts clean the manifest and the segments at or after the
 // restart point (see cleanStaleOutputForRestart).
 func (s *TranscodeSession) Restart(ctx context.Context, seekSeconds float64, startSegment int) error {
-	return s.restart(ctx, seekSeconds, startSegment, 0, false)
+	return s.restart(ctx, seekSeconds, startSegment, 0, false, 0)
 }
 
 // RestartWithCopySeekAnchor restarts a copy-video stream with the keyframe
@@ -4513,7 +4983,7 @@ func (s *TranscodeSession) RestartWithCopySeekAnchor(
 	startSegment int,
 	streamOriginSeconds float64,
 ) error {
-	return s.restart(ctx, seekSeconds, startSegment, streamOriginSeconds, true)
+	return s.restart(ctx, seekSeconds, startSegment, streamOriginSeconds, true, 0)
 }
 
 // RestartSegment resolves and applies one missing-segment recovery as a single
@@ -4521,6 +4991,16 @@ func (s *TranscodeSession) RestartWithCopySeekAnchor(
 // the manifest used for copy-anchor mapping cannot be replaced by another
 // restart before the resolved numbering is applied.
 func (s *TranscodeSession) RestartSegment(ctx context.Context, segNum int) (SegmentRecoveryTarget, bool, error) {
+	return s.RestartSegmentForRecovery(ctx, segNum, 0)
+}
+
+// RestartSegmentForRecovery is RestartSegment for a request numbered by
+// BeginSegmentRecovery. The request can wait on the lifecycle lock behind a
+// newer seek, and the check runs inside that critical section: a superseded
+// request answers ErrSegmentRecoverySuperseded instead of moving FFmpeg to a
+// position the viewer already left. A zero sequence keeps the historical
+// behavior.
+func (s *TranscodeSession) RestartSegmentForRecovery(ctx context.Context, segNum int, seq uint64) (SegmentRecoveryTarget, bool, error) {
 	// A request can wait on the lifecycle lock behind another restart, and a
 	// player that seeks again abandons it. Restarting for it would move FFmpeg
 	// to a position nobody wants and delay the restart the player now waits
@@ -4528,20 +5008,25 @@ func (s *TranscodeSession) RestartSegment(ctx context.Context, segNum int) (Segm
 	if err := ctx.Err(); err != nil {
 		return SegmentRecoveryTarget{}, false, err
 	}
+	if s.SegmentRecoverySuperseded(seq) {
+		return SegmentRecoveryTarget{}, false, ErrSegmentRecoverySuperseded
+	}
 	target, ok, err := s.ResolveSegmentRecoveryTarget(ctx, segNum)
 	if err != nil || !ok {
 		return SegmentRecoveryTarget{}, ok, err
 	}
 
 	if target.CopySeekAnchorResolved {
-		err = s.RestartWithCopySeekAnchor(
+		err = s.restart(
 			ctx,
 			target.SeekSeconds,
 			target.StartSegmentNumber,
 			target.StreamOriginSeconds,
+			true,
+			seq,
 		)
 	} else {
-		err = s.Restart(ctx, target.SeekSeconds, target.StartSegmentNumber)
+		err = s.restart(ctx, target.SeekSeconds, target.StartSegmentNumber, 0, false, seq)
 	}
 	if err != nil {
 		return SegmentRecoveryTarget{}, false, err
@@ -4568,50 +5053,87 @@ func (s *TranscodeSession) restart(
 	startSegment int,
 	streamOriginSeconds float64,
 	copySeekAnchorResolved bool,
+	recoverySeq uint64,
 ) error {
 	// Drive the shared evaluator before taking the lock: a suspected
 	// generation whose observation deadline has passed confirms here exactly as
 	// it would for serving or a waiter, so restart refuses the same way every
 	// other verdict path does.
 	s.evaluateDecodeVerdict()
-	s.mu.Lock()
-	// A source candidate already stamped known-bad must not be rebuilt: the
-	// caller rotates on the next failure recovery instead of looping on the
-	// same bad transport.
-	if s.demuxStamped {
+	// The restart this call owns, resolved under the session lock. A numbered
+	// request that arrives while an older restart is in flight is the viewer's
+	// newer target: it waits for the older restart (which may already have
+	// killed its process), then owns the next one instead of returning the
+	// older restart's result and leaving the generation at the position the
+	// viewer left.
+	var flight *restartFlight
+	var opts TranscodeOpts
+	var previousRecipe emittedStreamRecipe
+	var refreshInput func(context.Context) (string, func(), error)
+	var cancelCurrent context.CancelFunc
+	var done chan struct{}
+	for {
+		s.mu.Lock()
+		// A source candidate already stamped known-bad must not be rebuilt: the
+		// caller rotates on the next failure recovery instead of looping on the
+		// same bad transport.
+		if s.demuxStamped {
+			s.mu.Unlock()
+			return ErrVirtualSourceDemuxFailed
+		}
+		// A decoder-rejected generation must not be rebuilt either: the bytes are
+		// undecodable, so a restart would only re-encode the same failure. The
+		// gated verdict keeps healthy mid-stream sessions restartable; only a
+		// storm with no output since this generation started refuses.
+		if s.sourceRejectedLocked() {
+			s.mu.Unlock()
+			return ErrSourceDecodeRejected
+		}
+		// The last check before ownership: a seek recorded after
+		// RestartSegmentForRecovery's earlier read must still refuse here, or
+		// a superseded request moves FFmpeg to the position the viewer already
+		// replaced and becomes the live generation.
+		if recoverySeq != 0 && s.newestSeekSeq > recoverySeq {
+			s.mu.Unlock()
+			return ErrSegmentRecoverySuperseded
+		}
+		// Single-flight: a second caller arriving while a restart is in
+		// progress must not kill the process the first restart just started.
+		if s.restarting != nil {
+			flight = s.restarting
+			inflightSeq := s.restartRecoverySeq
+			s.mu.Unlock()
+			<-flight.done
+			// An unnumbered caller (a plan-level restart) is not a viewer seek and
+			// keeps the historical behavior: it takes the in-flight outcome. A
+			// numbered caller is newer than the in-flight restart when that
+			// restart was plan-level (no arrival number) or arrived earlier.
+			if recoverySeq == 0 || (inflightSeq != 0 && recoverySeq <= inflightSeq) {
+				return flight.err
+			}
+			s.evaluateDecodeVerdict()
+			continue
+		}
+		flight = &restartFlight{done: make(chan struct{})}
+		s.restarting = flight
+		// Requests numbered after this one name newer viewer targets than the
+		// position this restart is about to produce. A plan-level restart (recovery
+		// seq zero) has no such number, so its own target segment is what a newer
+		// seek is measured against.
+		s.restartRecoverySeq = recoverySeq
+		s.restartTargetSegment = startSegment
+		opts = s.opts
+		// The running process's recipe, not the possibly-mutated opts: a caller
+		// that changed the audio selection before Restart leaves s.opts describing
+		// the replacement, and only the frozen recipe proves the retained segments
+		// came from the same emitted bytes.
+		previousRecipe = s.runningRecipe
+		refreshInput = s.opts.RefreshInput
+		cancelCurrent = s.cancel
+		done = s.done
 		s.mu.Unlock()
-		return ErrVirtualSourceDemuxFailed
+		break
 	}
-	// A decoder-rejected generation must not be rebuilt either: the bytes are
-	// undecodable, so a restart would only re-encode the same failure. The
-	// gated verdict keeps healthy mid-stream sessions restartable; only a
-	// storm with no output since this generation started refuses.
-	if s.sourceRejectedLocked() {
-		s.mu.Unlock()
-		return ErrSourceDecodeRejected
-	}
-	// Single-flight: a second caller arriving while a restart is in
-	// progress must not kill the process the first restart just started.
-	// It waits for the in-flight restart's outcome and returns it, so a
-	// failed validation is never reported as a successful restart.
-	if s.restarting != nil {
-		flight := s.restarting
-		s.mu.Unlock()
-		<-flight.done
-		return flight.err
-	}
-	flight := &restartFlight{done: make(chan struct{})}
-	s.restarting = flight
-	opts := s.opts
-	// The running process's recipe, not the possibly-mutated opts: a caller
-	// that changed the audio selection before Restart leaves s.opts describing
-	// the replacement, and only the frozen recipe proves the retained segments
-	// came from the same emitted bytes.
-	previousRecipe := s.runningRecipe
-	refreshInput := s.opts.RefreshInput
-	cancelCurrent := s.cancel
-	done := s.done
-	s.mu.Unlock()
 	// A tone-map recipe is valid only for the frozen source revision. Recheck it
 	// while the current process is still serving so replacement bytes can never
 	// displace a valid generation or inherit its cached preflight verdict. The
@@ -4653,6 +5175,9 @@ func (s *TranscodeSession) restart(
 	if done != nil {
 		<-done
 	}
+	// The reaped process may have died between opening a segment's temp file and
+	// renaming it; a leftover would look like a live writer for that name.
+	s.removeStaleSegmentTemps()
 	s.closeSubtitleSpan()
 
 	// A planned stream's complete VOD playlist keeps the same segment numbers
@@ -4684,9 +5209,18 @@ func (s *TranscodeSession) restart(
 	s.mu.Lock()
 	s.running = false
 	s.waitErr = nil
+	// The reap above belongs to the generation this restart just killed, not to
+	// the replacement attempt that follows. A replacement that never publishes
+	// must answer a retryable failure rather than the dead generation's
+	// self-teardown verdict (which would fence a URL with no successor).
+	s.processCanceled = false
+	s.restartPublishFailed = false
 	if s.stderr != nil {
 		s.stderr.Reset()
 	}
+	// The copy plan may have moved the target above; requests are measured
+	// against the position the replacement really produces from.
+	s.restartTargetSegment = startSegment
 	// Open the decoder-verdict generation as soon as the old process is dead
 	// and before the replacement's stderr writer is created: this fences the
 	// dead process's late stderr and any in-flight evaluator away from the
@@ -4722,22 +5256,19 @@ func (s *TranscodeSession) restart(
 	}
 	nextRecipe := emittedRecipeOf(opts)
 	recipeUnchanged := previousRecipe == nextRecipe
-	// Record the exact generation this restart displaces. Continuation serving
+	// Identify the exact generation this restart displaces. Continuation serving
 	// is fenced on this relationship rather than on the segment number alone:
 	// only the immediate predecessor can be the same timeline, and only a
 	// restart that kept the emitted recipe can reuse its init/track identity.
+	// The rotation itself is published only once the replacement process is
+	// running (see below): rotating here would fence the live token while the
+	// successor may still fail to spawn, leaving every later request stale with
+	// no generation to reload.
 	if s.segmentIncarnation == "" {
 		s.segmentIncarnation = uuid.NewString()
 	}
 	predecessorToken := s.segmentGenerationTokenLocked()
-	s.segmentGeneration++
-	s.restartPredecessorToken = predecessorToken
-	// Record the absolute segment the replacement generation starts producing
-	// at. A client still holding the displaced generation's playlist can then be
-	// served from this generation for segments at or after this number, because
-	// absolute segment numbering makes them the same timeline position.
-	s.restartStartSegment = startSegment
-	s.restartRecipeStable = recipeUnchanged
+	nextGeneration := s.segmentGeneration + 1
 	s.segmentPruneRunning = false
 	preStartRangePrunable := opts.SegmentRetentionSeconds > 0 && s.lastPruneFloor < startSegment
 	s.lastRequestedSegment = startSegment
@@ -4767,9 +5298,9 @@ func (s *TranscodeSession) restart(
 	}
 	opts.FastStart = false // seek-restarts use veryfast for better quality
 	if subtitleRenditionActive(opts) {
-		s.mu.Lock()
-		opts.subtitleCueFile = subtitleCueFileName(s.subtitleCueBase + s.segmentGeneration)
-		s.mu.Unlock()
+		// Name the cue file for the generation this attempt will publish. A
+		// failed attempt publishes nothing, so the next one reuses the number.
+		opts.subtitleCueFile = subtitleCueFileName(s.subtitleCueBase + nextGeneration)
 	}
 
 	// Old segments are only reusable when this generation emits the same recipe
@@ -4816,7 +5347,7 @@ func (s *TranscodeSession) restart(
 	// As on initial start, the caller bounds synchronous validation; the new
 	// FFmpeg process keeps running after the segment request completes.
 	ctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
-	cmd := procgroup.CommandContext(ctx, fspath.Decode(bin), fspath.DecodeAll(args)...)
+	cmd := fspath.CommandContext(ctx, bin, args...)
 	stdinPipe, err := cmd.StdinPipe()
 	if err != nil {
 		cancel()
@@ -4824,6 +5355,7 @@ func (s *TranscodeSession) restart(
 		flight.err = err
 		s.restarting = nil
 		s.waitErr = err
+		s.restartPublishFailed = true
 		s.mu.Unlock()
 		close(flight.done)
 		return fmt.Errorf("create stdin pipe: %w", err)
@@ -4831,6 +5363,18 @@ func (s *TranscodeSession) restart(
 	cmd.Dir = opts.OutputDir
 	cmd.Stderr = s.newStderrWriter(ctx)
 	cmd.WaitDelay = 3 * time.Second
+	progressPipe, progressErr := attachProgressPipe(cmd, opts)
+	if progressErr != nil {
+		cancel()
+		s.mu.Lock()
+		flight.err = progressErr
+		s.restarting = nil
+		s.waitErr = progressErr
+		s.restartPublishFailed = true
+		s.mu.Unlock()
+		close(flight.done)
+		return fmt.Errorf("create progress pipe: %w", progressErr)
+	}
 
 	// The previous process released its reservation before closing done. Keep
 	// this session on the same concrete GPU while accounting for the replacement
@@ -4849,10 +5393,14 @@ func (s *TranscodeSession) restart(
 	if !s.lifecycleAliveNow() {
 		cancel()
 		releaseHWDevice()
+		if progressPipe != nil {
+			_ = progressPipe.Close()
+		}
 		s.mu.Lock()
 		flight.err = ErrSessionSuperseded
 		s.restarting = nil
 		s.waitErr = ErrSessionSuperseded
+		s.restartPublishFailed = true
 		s.mu.Unlock()
 		close(flight.done)
 		return ErrSessionSuperseded
@@ -4865,6 +5413,7 @@ func (s *TranscodeSession) restart(
 		flight.err = err
 		s.restarting = nil
 		s.waitErr = err
+		s.restartPublishFailed = true
 		s.mu.Unlock()
 		close(flight.done)
 		s.logFFmpegEvent(ctx, "ffmpeg process exit error", err.Error())
@@ -4881,6 +5430,18 @@ func (s *TranscodeSession) restart(
 	s.runningRecipe = nextRecipe
 	s.running = true
 	s.restarting = nil
+	// Publish the generation rotation now that a replacement process exists:
+	// every fence answered from here on has a live successor behind it, and a
+	// restart that failed above never invalidated the displaced token.
+	s.segmentGeneration = nextGeneration
+	s.restartPredecessorToken = predecessorToken
+	// Record the absolute segment the replacement generation starts producing
+	// at. A client still holding the displaced generation's playlist can then be
+	// served from this generation for segments at or after this number, because
+	// absolute segment numbering makes them the same timeline position.
+	s.restartStartSegment = startSegment
+	s.restartRecipeStable = recipeUnchanged
+	s.restartPublishFailed = false
 	// A successful replacement generation supersedes any latched failure from a
 	// prior detached restart: the segment request path must not keep answering
 	// the old verdict for a session that is producing again.
@@ -4888,7 +5449,8 @@ func (s *TranscodeSession) restart(
 	s.stdinPipe = stdinPipe
 	s.lastRequestedSegment = requestedSegment
 	s.lastCompletedSegment = startSegment - 1
-	s.generationStartedAt = startedAt
+	s.beginGeneration(startedAt)
+	progressGeneration := s.progressGeneration
 	// The verdict generation was already opened when the old process died,
 	// before this replacement's stderr writer was created; do not bump it
 	// again here or that writer would be fenced as stale.
@@ -4901,6 +5463,9 @@ func (s *TranscodeSession) restart(
 	close(flight.done)
 
 	go s.monitorFFmpeg(ctx, cmd, s.done, releaseHWDevice)
+	if progressPipe != nil {
+		go s.consumeProgress(progressPipe, progressGeneration)
+	}
 
 	// Re-check after spawning: a stop that unregistered the session while this
 	// process was starting already closed the previous one, so it would not have
@@ -4944,6 +5509,7 @@ func (s *TranscodeSession) WaitForSegment(name string, timeout time.Duration) (s
 		restarting := s.restarting != nil
 		waitErr := s.waitErr
 		canceled := s.processCanceled
+		publishFailed := s.restartPublishFailed
 		virtualInput := isVirtualInputPath(s.opts.CanonicalInputPath)
 		s.mu.Unlock()
 
@@ -4967,6 +5533,12 @@ func (s *TranscodeSession) WaitForSegment(name string, timeout time.Duration) (s
 		}
 
 		if !running && waitErr != nil {
+			if publishFailed {
+				// Same unpublished-rebuild verdict as the open-segment wait: the
+				// token still names the dead generation, so this is a retry, not
+				// a fence.
+				return "", fmt.Errorf("%w: %w", ErrManifestNotReady, waitErr)
+			}
 			if canceled {
 				// Our own teardown killed this generation. Its bytes are gone
 				// with it, so answer the stale timeline (the client reloads the
@@ -5006,7 +5578,37 @@ func (s *TranscodeSession) WaitForOpenSegment(name string, timeout time.Duration
 
 // WaitForOpenSegmentContext stops polling when the request context ends.
 func (s *TranscodeSession) WaitForOpenSegmentContext(ctx context.Context, name string, timeout time.Duration) (*SegmentLease, error) {
-	return s.waitForOpenSegmentContext(ctx, name, timeout, 0)
+	return s.waitForOpenSegmentContext(ctx, name, timeout, 0, "", 0)
+}
+
+// WaitForOpenSegmentRecoveryContext is WaitForOpenSegmentContext for a request
+// that was numbered by BeginSegmentRecovery. A newer seek replaces the target
+// this request is waiting for, so the wait ends at that seek instead of
+// spending its whole head budget and then restarting FFmpeg at a position the
+// viewer has already left. A stall watchdog runs when stall is positive. A zero
+// sequence keeps the historical wait.
+func (s *TranscodeSession) WaitForOpenSegmentRecoveryContext(ctx context.Context, name, generationToken string, seq uint64, timeout, stall time.Duration) (*SegmentLease, error) {
+	return s.waitForOpenSegmentContext(ctx, name, timeout, stall, generationToken, seq)
+}
+
+// WaitForOpenSegmentGenerationContext is WaitForOpenSegmentContext for a
+// request that named a segment generation. A wait can outlast the generation
+// it belongs to (an in-place restart rotates it while the request is still
+// ahead of the produced head). The old token cannot be served from that
+// generation's files, so the wait answers the stale-generation verdict at the
+// rotation instead of spending its whole head budget on bytes the fence will
+// refuse. An empty token keeps the unfenced behavior.
+func (s *TranscodeSession) WaitForOpenSegmentGenerationContext(ctx context.Context, name, generationToken string, timeout time.Duration) (*SegmentLease, error) {
+	return s.waitForOpenSegmentContext(ctx, name, timeout, 0, generationToken, 0)
+}
+
+// SegmentCompletionBudget is how long a request may wait for a name this
+// session has opened but not finished writing. It is the same budget a missing
+// segment gets, so a request that races a writer's last bytes is served the
+// whole segment instead of a retry, and a writer that never completes answers
+// ErrSegmentIncomplete inside the client's own read allowance.
+func (s *TranscodeSession) SegmentCompletionBudget() time.Duration {
+	return segmentWaitTimeout(s.Opts().SegmentDuration)
 }
 
 // WaitForOpenSegmentWithStall is WaitForOpenSegment with a produced-head
@@ -5016,6 +5618,12 @@ func (s *TranscodeSession) WaitForOpenSegmentContext(ctx context.Context, name s
 // as a dead segment.
 func (s *TranscodeSession) WaitForOpenSegmentWithStall(name string, timeout, stall time.Duration) (*SegmentLease, error) {
 	return s.waitForOpenSegment(name, timeout, stall)
+}
+
+// WaitForOpenSegmentWithStallGeneration is WaitForOpenSegmentWithStall for a
+// generation-scoped request; see WaitForOpenSegmentGenerationContext.
+func (s *TranscodeSession) WaitForOpenSegmentWithStallGeneration(name, generationToken string, timeout, stall time.Duration) (*SegmentLease, error) {
+	return s.waitForOpenSegmentContext(context.Background(), name, timeout, stall, generationToken, 0)
 }
 
 // checkSegmentStall samples produced-head progress at most twice a second and
@@ -5048,10 +5656,10 @@ func (s *TranscodeSession) checkSegmentStall(now time.Time, stall time.Duration,
 }
 
 func (s *TranscodeSession) waitForOpenSegment(name string, timeout, stall time.Duration) (*SegmentLease, error) {
-	return s.waitForOpenSegmentContext(context.Background(), name, timeout, stall)
+	return s.waitForOpenSegmentContext(context.Background(), name, timeout, stall, "", 0)
 }
 
-func (s *TranscodeSession) waitForOpenSegmentContext(ctx context.Context, name string, timeout, stall time.Duration) (*SegmentLease, error) {
+func (s *TranscodeSession) waitForOpenSegmentContext(ctx context.Context, name string, timeout, stall time.Duration, expectedGeneration string, recoverySeq uint64) (*SegmentLease, error) {
 	deadline := time.After(timeout)
 	numbered := false
 	if stall > 0 {
@@ -5063,12 +5671,41 @@ func (s *TranscodeSession) waitForOpenSegmentContext(ctx context.Context, name s
 	lastStallCheck := time.Time{}
 	lastTempAt := time.Time{}
 	var lastTempSize int64
+	// incomplete records that this wait saw the name present but not whole. The
+	// deadline answer then names that condition instead of a missing segment, so
+	// the handler can answer a retry rather than a restart or a 404.
+	incomplete := false
+	deadlineErr := func() error {
+		if incomplete {
+			return ErrSegmentIncomplete
+		}
+		return ErrSegmentNotFound
+	}
 	for {
+		// A newer seek replaced this request's target while it waited. The
+		// viewer has moved, so neither the wait nor the restart after it may
+		// move the generation to the old position.
+		if s.SegmentRecoverySuperseded(recoverySeq) {
+			return nil, ErrSegmentRecoverySuperseded
+		}
+		// A request minted against a replaced generation cannot be served from
+		// its successor's files at the same name. Answer the fence now rather
+		// than waiting out a head budget the successor will never spend on the
+		// old token.
+		if expectedGeneration != "" && !s.MatchesGenerationToken(expectedGeneration) {
+			return nil, ErrStaleSegmentGeneration
+		}
 		segment, err := s.OpenSegment(name)
 		if err == nil {
+			if expectedGeneration != "" && !s.MatchesGenerationToken(expectedGeneration) {
+				_ = segment.Close()
+				return nil, ErrStaleSegmentGeneration
+			}
 			return segment, nil
 		}
-		if !errors.Is(err, ErrSegmentNotFound) {
+		if errors.Is(err, ErrSegmentIncomplete) {
+			incomplete = true
+		} else if !errors.Is(err, ErrSegmentNotFound) {
 			return nil, err
 		}
 
@@ -5077,6 +5714,7 @@ func (s *TranscodeSession) waitForOpenSegmentContext(ctx context.Context, name s
 		restarting := s.restarting != nil
 		waitErr := s.waitErr
 		canceled := s.processCanceled
+		publishFailed := s.restartPublishFailed
 		virtualInput := isVirtualInputPath(s.opts.CanonicalInputPath)
 		s.mu.Unlock()
 
@@ -5097,12 +5735,19 @@ func (s *TranscodeSession) waitForOpenSegmentContext(ctx context.Context, name s
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			case <-deadline:
-				return nil, ErrSegmentNotFound
+				return nil, deadlineErr()
 			case <-time.After(100 * time.Millisecond):
 				continue
 			}
 		}
 		if !running && waitErr != nil {
+			if publishFailed {
+				// The restart killed the live generation but never published its
+				// replacement. The token still names the dead generation, so the
+				// answer is a retry the client can act on, not a fence against a
+				// successor that does not exist.
+				return nil, fmt.Errorf("%w: %w", ErrManifestNotReady, waitErr)
+			}
 			if canceled {
 				// Same self-teardown verdict as WaitForSegment.
 				return nil, ErrStaleSegmentGeneration
@@ -5110,7 +5755,10 @@ func (s *TranscodeSession) waitForOpenSegmentContext(ctx context.Context, name s
 			return nil, fmt.Errorf("%w: %w", ErrTranscodeFailed, waitErr)
 		}
 		if !running {
-			return nil, ErrSegmentNotFound
+			// A stopped generation can still hold a prefix of a name (a writer
+			// killed mid-segment); report it as the retryable condition it is
+			// rather than as a segment that never existed.
+			return nil, deadlineErr()
 		}
 
 		if numbered && stall > 0 {
@@ -5123,7 +5771,7 @@ func (s *TranscodeSession) waitForOpenSegmentContext(ctx context.Context, name s
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-deadline:
-			return nil, ErrSegmentNotFound
+			return nil, deadlineErr()
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
@@ -5799,7 +6447,30 @@ func (s *TranscodeSession) WaitForRestartContinuation(name string) (*SegmentLeas
 // SeekRestartServeTimeout. A spent budget answers the stale-generation verdict
 // without waiting; the detached restart still produces the segment for the
 // client's playlist reload.
+//
+// The hold is also skipped when the current generation's own startup is known
+// to need longer than the stall window to produce its first segment. A virtual
+// provider that opens in 4.7-10s cannot reach the stall window, so holding the
+// request spends the client's read budget on a wait that is already lost — the
+// production 3.5s-then-412 for a 2062s seek. Answering the stale-generation
+// verdict immediately is the same outcome the client gets after the hold, minus
+// the wait; the restart keeps producing for the playlist reload it triggers. A
+// session whose restarts start inside the stall window keeps the hold, so a
+// seek that the encoder serves in a few hundred milliseconds is still served.
+// The measurement describes one generation, and a generation that has not
+// produced a segment yet has none, so its hold is never skipped unmeasured.
 func (s *TranscodeSession) WaitForRestartContinuationWithin(name string, budget time.Duration) (*SegmentLease, error) {
+	return s.WaitForRestartContinuationForRecovery(name, budget, 0)
+}
+
+// WaitForRestartContinuationForRecovery is WaitForRestartContinuationWithin for
+// a request numbered by BeginSegmentRecovery. The hold ends as superseded as
+// soon as a newer seek arrives, so a stale target's continuation does not keep
+// the request (or the worker behind it) pointed at the old position.
+func (s *TranscodeSession) WaitForRestartContinuationForRecovery(name string, budget time.Duration, seq uint64) (*SegmentLease, error) {
+	if s.SegmentRecoverySuperseded(seq) {
+		return nil, ErrSegmentRecoverySuperseded
+	}
 	if budget <= 0 {
 		if restartErr := s.AsyncRestartFailure(); restartErr != nil {
 			return nil, restartErr
@@ -5810,9 +6481,26 @@ func (s *TranscodeSession) WaitForRestartContinuationWithin(name string, budget 
 	if budget < stall {
 		stall = budget
 	}
-	lease, err := s.WaitForOpenSegmentWithStall(name, budget, stall)
+	if startup := s.StartupLatency(); startup > 0 && startup > stall {
+		if restartErr := s.AsyncRestartFailure(); restartErr != nil {
+			return nil, restartErr
+		}
+		slog.Debug("transcode restart continuation answered without a hold: this session's restarts start slower than the stall window",
+			"component", "playback",
+			"segment", name,
+			"startup_latency_ms", startup.Milliseconds(),
+			"stall_ms", stall.Milliseconds(),
+			"budget_ms", budget.Milliseconds(),
+			"session", s.Opts().SessionID,
+		)
+		return nil, ErrStaleSegmentGeneration
+	}
+	lease, err := s.waitForOpenSegmentContext(context.Background(), name, budget, stall, "", seq)
 	if err == nil {
 		return lease, nil
+	}
+	if errors.Is(err, ErrSegmentRecoverySuperseded) {
+		return nil, err
 	}
 	if restartErr := s.AsyncRestartFailure(); restartErr != nil {
 		return nil, restartErr
@@ -5835,6 +6523,48 @@ func (s *TranscodeSession) reportSegmentDownloadedLocked(segNum int) {
 		s.lastCompletedSegment = segNum
 	}
 	s.scheduleSegmentPruneLocked()
+}
+
+// BeginSegmentRecovery assigns the next arrival number to a segment request
+// that may wait for or restart the generation. The number is taken when the
+// request reaches its recovery path, not when a wait ends, so two overlapping
+// requests are ordered by the viewer's intent rather than by whichever timeout
+// expires last.
+func (s *TranscodeSession) BeginSegmentRecovery() uint64 {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.segmentRecoverySeq++
+	return s.segmentRecoverySeq
+}
+
+// MarkSegmentSeek records that the request numbered seq names a seek target the
+// produced window cannot reach. It becomes the newest viewer target: any wait
+// or restart issued before it is superseded and must not restart the
+// generation. A zero number (an unfenced legacy caller) records nothing.
+func (s *TranscodeSession) MarkSegmentSeek(seq uint64) {
+	if s == nil || seq == 0 {
+		return
+	}
+	s.mu.Lock()
+	if seq > s.newestSeekSeq {
+		s.newestSeekSeq = seq
+	}
+	s.mu.Unlock()
+}
+
+// SegmentRecoverySuperseded reports that a newer seek target arrived after the
+// request numbered seq. A zero number is never superseded, so callers that do
+// not order their requests keep the historical behavior.
+func (s *TranscodeSession) SegmentRecoverySuperseded(seq uint64) bool {
+	if s == nil || seq == 0 {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.newestSeekSeq > seq
 }
 
 // LastRequestedSegment returns the highest segment number downloaded by the client.
@@ -6394,9 +7124,10 @@ func (s *TranscodeSession) evaluateDecodeVerdict() {
 	outputDir := s.outputDir
 	suspectAt := s.decodeSuspectAt
 	probe := s.decodeProbe
+	videoFrames := s.videoFrames
 	s.mu.Unlock()
 
-	recovered, ok := s.runDecodeProbe(generation, outputDir, suspectAt, probe)
+	recovered, ok := s.runDecodeProbe(generation, outputDir, suspectAt, videoFrames, probe)
 	if !ok {
 		// Another probe owns the sampling path; a later tick applies its own
 		// result. Never block a verdict read behind slow I/O.
@@ -6409,8 +7140,9 @@ func (s *TranscodeSession) evaluateDecodeVerdict() {
 // coalescing concurrent probes: while one probe is in flight, other callers
 // return ok=false rather than launching a scan or serializing behind the first.
 // A session with no output directory (unit fixtures) reports no recovery so the
-// suspicion can still confirm on expiry.
-func (s *TranscodeSession) runDecodeProbe(generation uint64, outputDir string, cutoff time.Time, probe func(string, time.Time) bool) (recovered bool, ok bool) {
+// suspicion can still confirm on expiry. videoFrames is the generation's frame
+// count snapshot: muxed output never counts as recovery without it.
+func (s *TranscodeSession) runDecodeProbe(generation uint64, outputDir string, cutoff time.Time, videoFrames int64, probe func(string, time.Time, int64) bool) (recovered bool, ok bool) {
 	if outputDir == "" {
 		return false, true
 	}
@@ -6425,7 +7157,7 @@ func (s *TranscodeSession) runDecodeProbe(generation uint64, outputDir string, c
 	if probe == nil {
 		probe = videoProgressAfter
 	}
-	recovered = probe(outputDir, cutoff)
+	recovered = probe(outputDir, cutoff, videoFrames)
 
 	s.decodeProbeMu.Lock()
 	s.decodeProbeRunning = false
@@ -6555,12 +7287,17 @@ func (s *TranscodeSession) reapRejectedGeneration(generation uint64) {
 	}
 }
 
-// videoProgressAfter reports whether ffmpeg muxed non-empty segment output
-// newer than cutoff. Segment existence (not content) is the signal: any muxed
-// segment proves the decoder is extracting usable video, which contradicts a
-// source-undecodable verdict. Manifests, empty files, and unparseable names
-// never count. It runs outside the session mutex.
-func videoProgressAfter(outputDir string, cutoff time.Time) bool {
+// videoProgressAfter reports whether the generation both decoded video and
+// muxed non-empty segment output newer than cutoff. A segment alone says
+// nothing about the decoder: an encode that decoded no frame still writes a
+// non-empty segment for every audio packet, so segment existence must never
+// cancel a decode suspicion. Manifests, empty files, unparseable names, and a
+// generation that has not advanced its frame counter never count. It runs
+// outside the session mutex.
+func videoProgressAfter(outputDir string, cutoff time.Time, videoFrames int64) bool {
+	if videoFrames <= 0 {
+		return false
+	}
 	entries, err := os.ReadDir(outputDir)
 	if err != nil {
 		return false

@@ -25,6 +25,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/config"
 	evt "github.com/Silo-Server/silo-server/internal/events"
 	"github.com/Silo-Server/silo-server/internal/httpstream"
+	"github.com/Silo-Server/silo-server/internal/lang"
 	"github.com/Silo-Server/silo-server/internal/logredact"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
@@ -123,9 +124,21 @@ type StreamHandler struct {
 	// zero value (nil map) is usable.
 	virtualSubtitleLayoutMu sync.Mutex
 	virtualSubtitleLayouts  map[string]virtualSubtitleLayoutVerdict
-	SubtitleRepo            subtitles.Repository // optional; enables S3-sourced subtitles
-	S3Client                subtitles.S3Client   // optional; needed for fetching S3 subtitles
-	S3Bucket                string               // bucket for subtitle storage
+	// virtualSubtitleLayoutMisses records the opposite verdict: a probe that
+	// completed and found no live track this plan ordinal could carry. Only the
+	// warm establishes it (it probes its own relay registration), and a serve
+	// that never probes again would otherwise start the same fill forever: every
+	// page is refused, the fill abandons on the same positive mismatch, and the
+	// loop has no answer. The serve consults it and answers
+	// `subtitle_source_changed` so the client replans onto the rotated
+	// inventory. Keyed like virtualSubtitleLayouts and kept much shorter: a
+	// rotated release is a fact about the bytes, and the client needs to re-select
+	// soon. A probe error never records one — only a completed probe that found
+	// no match. The zero value (nil map) is usable.
+	virtualSubtitleLayoutMisses map[string]time.Time
+	SubtitleRepo                subtitles.Repository // optional; enables S3-sourced subtitles
+	S3Client                    subtitles.S3Client   // optional; needed for fetching S3 subtitles
+	S3Bucket                    string               // bucket for subtitle storage
 	// VirtualMediaResolver resolves virtual:// URIs to a real provider URL.
 	// Required for embedded subtitle extraction from virtual sources.
 	VirtualMediaResolver         VirtualMediaResolver
@@ -1237,6 +1250,9 @@ const (
 	virtualProxyDispositionRelayTemporary = "relay_temporary"
 	virtualProxyDispositionCommitted      = "committed"
 	virtualProxyDispositionFailedOpen     = "failed_open"
+
+	virtualStreamUnavailableCode    = "virtual_stream_unavailable"
+	virtualStreamUnavailableMessage = "Failed to stream virtual media source"
 )
 
 // Attribute keys for the proxy verdict line. The verdict is the single site
@@ -1247,6 +1263,21 @@ const (
 	virtualVerdictLogKeySession         = "session"
 	virtualVerdictLogKeyPlaybackSession = "playback_session_id"
 )
+
+// virtualProxyFailureStatus maps the first-attempt proxy failure to the
+// response written when nothing has been committed. A client cancellation is an
+// abandoned request, not a dependency failure: the upstream fetch runs on the
+// request context, so the viewer navigating away already aborted it. Answering
+// 502 there records a server-error and logs a virtual_stream_unavailable ERROR
+// for a request whose client never saw it. A 4xx request-timeout keeps the
+// response honest for a half-closed client and keeps the outcome in the client
+// error class instead of counting a server error.
+func virtualProxyFailureStatus(ctx context.Context, proxyErr error) (status int, code, message string) {
+	if isClientCancellation(ctx, proxyErr) {
+		return http.StatusRequestTimeout, virtualProxyDispositionClientCanceled, "Client closed the request"
+	}
+	return http.StatusBadGateway, virtualStreamUnavailableCode, virtualStreamUnavailableMessage
+}
 
 // virtualProxyDisposition names how a failed direct-play proxy attempt ended
 // before any heal or rotation runs: the first-attempt verdict the verdict log
@@ -1712,7 +1743,7 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 			writeErrorCause(w, http.StatusBadGateway, "virtual_stream_unavailable", "Failed to stream virtual media source", err)
 			return
 		}
-		resolved, cleanup, resolveErr := h.resolveVirtualInputURI(r.Context(), file, session.UserID, session.ProfileID, false)
+		resolved, cleanup, resolveErr := h.resolveVirtualInputForServe(r.Context(), file, session.UserID, session.ProfileID)
 		if resolveErr != nil && (errors.Is(resolveErr, virtuallibrary.ErrSessionBoundCandidateAbsent) || errors.Is(resolveErr, ErrVirtualCandidateMarkedFailed)) {
 			// The session's pinned release is absent from the provider's current
 			// list (it renumbered or dropped the result id). Mirror the transcode
@@ -1752,6 +1783,7 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 			// resolve failure keeps the v1 502 that the v2 byte-delivery
 			// adapter maps to a retryable dependency_unavailable.
 			if errors.Is(resolveErr, errVirtualProviderUnavailable) {
+				w.Header().Set("Retry-After", strconv.Itoa(virtualServeResolveRetryAfterSeconds))
 				writeErrorCause(w, http.StatusServiceUnavailable, "provider_unavailable", "The virtual source provider is temporarily unavailable", resolveErr)
 				return
 			}
@@ -2086,7 +2118,8 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 					h.handleTransportStartFailure(r.Context(), session, file, lastProxyErr)
 					if streamWriter.StatusCode() == 0 {
 						logVirtualStreamFailure(r.Context(), sessionID, file, lastProxyErr, deliveredPath)
-						writeErrorCause(streamWriter, http.StatusBadGateway, "virtual_stream_unavailable", "Failed to stream virtual media source", lastProxyErr)
+						status, code, message := virtualProxyFailureStatus(r.Context(), lastProxyErr)
+						writeErrorCause(streamWriter, status, code, message, lastProxyErr)
 					}
 				}
 			}
@@ -2160,8 +2193,10 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 				SourceAudioChannels:       session.SourceAudioChannels,
 				TargetAudioChannels:       session.TargetAudioChannels,
 				TargetAudioBitrateKbps:    session.TargetAudioBitrateKbps,
-				// For a copied track the planned codec is the source's.
-				CopyAudioCodec: session.TargetAudioCodec,
+				// For a copied track the planned codec is the source's, but the
+				// ADTS filter applies only when the container frames that track as
+				// ADTS (see playback.CopiedAudioADTSCodec).
+				CopyAudioCodec: playback.CopiedAudioADTSCodec(session.TargetAudioCodec, fileContainerV3(file)),
 				Abort:          remuxAbort,
 				// A pre-body start failure must leave the response
 				// uncommitted so the handler can fail over to a sibling
@@ -2187,7 +2222,11 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 			// once with it excluded so the next-ranked release is tried. A
 			// client that disconnected is not a candidate failure: the remux
 			// (and its provider fetch) already aborted on the request context.
-			if !isClientCancellation(r.Context(), remuxErr) && !stoppedServerSide() && isVirtualPlaybackFile(file) && hasVirtualMediaResolver(h) {
+			// A fault in the recipe this server built (a bitstream filter that
+			// refuses the mapped stream) is not evidence about the release. Do
+			// not mark the candidate failed or rotate: that indicts healthy bytes
+			// and hands the client a verdict about a file it never faulted.
+			if !isClientCancellation(r.Context(), remuxErr) && !errors.Is(remuxErr, playback.ErrRemuxRecipeFault) && !stoppedServerSide() && isVirtualPlaybackFile(file) && hasVirtualMediaResolver(h) {
 				if releaseInput != nil {
 					releaseInput()
 					releaseInput = nil
@@ -2288,7 +2327,14 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 				// unlocked; a mid-stream failure returns nil instead. Commit one
 				// coherent error here. A client that disconnected needs no body.
 				if !isClientCancellation(r.Context(), remuxErr) && !stoppedServerSide() {
-					http.Error(w, "failed to start remux", http.StatusBadGateway)
+					// The remux produced nothing: a provider release, a relay, or
+					// this server's own spawn. That is a dependency failure the
+					// client may retry, not a verdict about the file, so keep the
+					// v1 502 the byte-delivery adapter maps to dependency_unavailable
+					// and carry the same Retry-After the resolve failure above sends.
+					// Without it a 503 delivery answer reaches the client with no
+					// delay to back off by.
+					writeRemuxStartFailure(w)
 				}
 			}
 		}
@@ -2301,6 +2347,24 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal_error",
 			"Unknown play method")
 	}
+}
+
+// writeRemuxStartFailure answers a remux that produced no media byte. It keeps
+// the v1 502 a byte-delivery adapter maps to a retryable dependency_unavailable
+// — the failure says nothing about the file — and carries the same Retry-After
+// the virtual resolve refusal sends, so a client that retries the stream has a
+// delay to back off by. A 503 delivery answer used to arrive without one.
+//
+// The body is the standard v1 error envelope with a machine-readable code. A
+// plain-text body left the byte-delivery adapter with nothing to name the
+// failure by, so its request log recorded code=internal_error for a provider or
+// relay refusal and made a dependency outage look like a server defect. The code
+// is additive: the 502 and its dependency_unavailable problem type are
+// unchanged.
+func writeRemuxStartFailure(w http.ResponseWriter) {
+	w.Header().Set("Retry-After", strconv.Itoa(virtualServeResolveRetryAfterSeconds))
+	writeError(w, http.StatusBadGateway, "remux_start_failed",
+		"Failed to start the remux; the stream produced no media. Retry after the advertised delay.")
 }
 
 // loadSidecarSession resolves the session a subtitle or font request names.
@@ -2410,6 +2474,11 @@ func (h *StreamHandler) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 	// ordinal must be re-mapped onto the effective inventory rather than
 	// interpreted against a version no longer playing. Virtual sources bind to
 	// the session's planned candidate at the same time.
+	//
+	// The named row is captured first because the resolver returns a nil file on
+	// failure, and the refusal has to name the release the request was minted
+	// for, not the row it failed to resolve.
+	namedForRefusal := file
 	file, trackIndex, err = h.resolveSubtitleSourceRequest(r.Context(), file, session, trackIndex, r.URL.Query())
 	if err != nil {
 		if errors.Is(err, errSubtitleSourceChangedAfterRotation) {
@@ -2421,9 +2490,19 @@ func (h *StreamHandler) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, errSubtitleIdentityInvalid) {
 			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
-		} else {
-			writeError(w, http.StatusNotFound, "not_found", err.Error())
+			return
 		}
+		// A track identity that names no track on either inventory is a 404 for
+		// a stable file, and a rotation verdict when the URL was minted for a
+		// release the session no longer serves (a substituted sibling or an
+		// edition switch). Answering 404 there strands the client on a URL it
+		// can never repair; the 409 is the retryable answer that sends it back
+		// to replan and re-select from the effective row's inventory.
+		if subtitleRequestNamesAnotherRelease(session, namedForRefusal) {
+			writeSubtitleSourceChanged(w)
+			return
+		}
+		writeError(w, http.StatusNotFound, "not_found", err.Error())
 		return
 	}
 
@@ -2584,7 +2663,38 @@ func (h *StreamHandler) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// An ordinal past every segment of the bound row's inventory is the same
+	// rotation verdict as an unresolvable identity pin: the URL was minted for
+	// another release's layout, so the client must replan rather than treat the
+	// track as gone.
+	if subtitleRequestNamesAnotherRelease(session, file) {
+		writeSubtitleSourceChanged(w)
+		return
+	}
 	writeError(w, http.StatusNotFound, "not_found", "Subtitle track not found")
+}
+
+// subtitleRequestNamesAnotherRelease reports whether this request's subtitle
+// ordinal or identity pin was minted against a release the session no longer
+// serves: a substituted virtual candidate (the plan rotated 41255/41257 to a
+// live sibling) or an edition switch.
+//
+// Such a request cannot be repaired against the bound row — the ordinal is an
+// index into another inventory, and the pin names another container's stream —
+// so a miss is a rotation verdict, not a missing track. The answer is the
+// existing retryable 409 that makes the client replan and re-select from the
+// effective inventory, which is exactly what a 404 never does.
+func subtitleRequestNamesAnotherRelease(session *playback.Session, file *models.MediaFile) bool {
+	if session == nil || file == nil {
+		return false
+	}
+	if session.RequestedMediaFileID > 0 && session.MediaFileID > 0 &&
+		session.MediaFileID != session.RequestedMediaFileID {
+		return true
+	}
+	return session.VirtualSubtitleEvidenceSet &&
+		session.VirtualSubtitleEvidenceFileID > 0 &&
+		file.ID != session.VirtualSubtitleEvidenceFileID
 }
 
 func (h *StreamHandler) serveDownloadedSubtitle(w http.ResponseWriter, r *http.Request, subtitle subtitles.DownloadedSubtitle, requestedFormat string) {
@@ -3450,7 +3560,9 @@ func (h *StreamHandler) syncSessionsNow(ctx context.Context, reason string) {
 	if h == nil || h.SessionSyncer == nil {
 		return
 	}
-	logSyncSessionsFailure(ctx, reason, h.SessionSyncer.SyncNow(ctx))
+	if err := h.SessionSyncer.SyncNow(ctx); err != nil {
+		slog.ErrorContext(ctx, "failed to sync sessions", "component", "api", "reason", reason, "error", err)
+	}
 }
 
 func (h *StreamHandler) finalizeSessionAbort(ctx context.Context, session *playback.Session, syncNow bool, syncReason string) {
@@ -3825,6 +3937,19 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 		WindowRequested: windowRequested,
 		Embedded:        playback.EmbeddedSubtitleRefFor(file, embeddedIndex),
 		FFmpegPath:      h.ffmpegPath(),
+		SourceSizeBytes: file.FileSize,
+		// Size, runtime and bitrate are what price a bitmap page's discarded
+		// container prefix before it is read (see subtitle_page_cost.go). They
+		// come from the catalog row, so a relay page can be refused without
+		// opening the provider at all.
+		SourceDurationSeconds: float64(file.Duration),
+		SourceBitrateKbps:     file.Bitrate,
+	}
+	// The page wait ledger is per track so a re-anchoring retry cannot restart
+	// it, but it belongs to the playback session that opened it: a new session
+	// must pay its own measured wait instead of inheriting a spent one.
+	if session != nil {
+		opts.PageWaitScope = session.ID
 	}
 	// Virtual sources are provider-neutral URIs, not FFmpeg inputs. Resolve
 	// through the relay so ffmpeg reads the real stream. Subtitle extraction
@@ -3835,6 +3960,12 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 	if isVirtualPlaybackFile(file) && hasVirtualMediaResolver(h) && h.RemoteStreamRelay != nil && session != nil {
 		resolved, cleanup, resolveErr := h.resolveVirtualInputURI(r.Context(), file, session.UserID, session.ProfileID, false)
 		if resolveErr != nil {
+			// The pinned source could not be resolved for this extract. Nothing
+			// about it is a verdict on the file — the provider or the relay may
+			// answer on the next attempt — so the refusal carries the same
+			// Retry-After the remux start failure does. Without it a client
+			// retries a 502 on its own few-second cadence.
+			w.Header().Set("Retry-After", strconv.Itoa(virtualServeResolveRetryAfterSeconds))
 			writeError(w, http.StatusBadGateway, subtitleSourceUnavailableErrorCode,
 				"Failed to resolve the virtual source for subtitle extraction; the video source is unchanged.")
 			return
@@ -3945,12 +4076,26 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 				"file_id", file.ID,
 				"plan_ordinal", planOrdinal,
 				"track", opts.TrackIndex)
+		} else if playback.IsPGS(opts.SourceCodec) && h.SubtitleCache.HasCommittedEntry(
+			opts.InputPath, opts.CacheIdentity, opts.TrackIndex, opts.SourceCodec, opts.TargetFormat,
+		) {
+			// A committed .sup artifact pins the release the same way a
+			// committed text artifact does: it was extracted from this exact
+			// identity (source candidate, ordinal, inventory token, generation
+			// bucket). Probing the live layout first cannot improve bytes the
+			// server already holds, and on a slow provider it can fail closed
+			// with a retryable 503 even though the seek's re-request could be
+			// answered from disk in milliseconds. A seek must not invalidate a
+			// completed artifact.
+			slog.DebugContext(r.Context(), "virtual subtitle layout probe skipped: committed bitmap artifact", "component", "api",
+				"file_id", file.ID,
+				"track", opts.TrackIndex)
 		} else {
 			// The key is captured before the probe: a drift remap changes
 			// opts.TrackIndex, but later requests still arrive with the plan
 			// ordinal.
 			planLayoutKey := virtualSubtitleLayoutKey(opts.CacheIdentity, opts.TrackIndex)
-			proceed, probeErr := h.verifyVirtualSubtitleLayout(r.Context(), track, file.SubtitleTracks, &opts)
+			proceed, probeErr := h.verifyVirtualSubtitleLayout(r.Context(), file, track, file.SubtitleTracks, &opts)
 			if !proceed {
 				writeSubtitleSourceChanged(w)
 				return
@@ -3966,8 +4111,15 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 				// error that a same-ordinal different-language rotation would
 				// never raise. A retryable error lets the client fall back to
 				// subtitles-off, which the server already treats as legitimate.
-				clearSubtitleCoverageHeaders(w.Header())
-				writeSubtitleSourceUnavailable(w)
+				//
+				// Start the detached fill before answering: the retry's only
+				// path to success is a committed artifact (it skips the probe),
+				// and leaving the client to repeat the probe against the same
+				// slow provider produced the measured run of 503s.
+				if r.Method != http.MethodHead && !isClientCancellation(r.Context(), probeErr) {
+					h.warmVirtualSubtitleAfterProbeFailure(file, track, session, opts, nil, virtualActive, middleware.GetReqID(r.Context()))
+				}
+				writeSubtitleProbeFailure(w, r.Context(), probeErr)
 				return
 			}
 			h.rememberVirtualSubtitleLayout(planLayoutKey, opts, time.Now())
@@ -3984,12 +4136,54 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 		}
 	}
 
+	// A detached warm probes its own relay registration. When that probe
+	// completed and found no carryable track for this plan ordinal, it recorded
+	// the verdict; without this answer every later page is refused again, starts
+	// the same warm, and abandons the same way — a loop with no failure and no
+	// progress. A committed artifact still pins the release it was extracted
+	// from, so it is served rather than reported as rotated.
+	//
+	// The answer is retryable, not the 409 the serve's own probe produces. A 409
+	// `subtitle_source_changed` tells the client its plan is stale and must be
+	// rebuilt; that verdict belongs to the request that probed this release while
+	// serving it. A background fill's opinion is ours, not the client's — and
+	// production showed the cost of confusing them: one successful page at 2160,
+	// then seven 409s, subtitles off, and no way back, because the replan kept
+	// re-deriving the same plan. A retry re-reads the cached window or the
+	// committed artifact, and the miss expires (virtualSubtitleLayoutMissTTL), so
+	// the next serve probes the release again.
+	if virtualActive &&
+		h.virtualSubtitleLayoutUnmatchable(&opts, time.Now()) &&
+		!h.SubtitleCache.HasCommittedEntry(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, opts.SourceCodec, opts.TargetFormat) {
+		slog.WarnContext(r.Context(), "virtual subtitle page answered retryably from the warm's layout verdict",
+			"component", "api",
+			"file_id", file.ID,
+			"track", opts.TrackIndex,
+			"codec", opts.SourceCodec,
+			"language", track.Language)
+		writeSubtitleSourceUnavailableRetry(w, subtitleSourceRetryAfterSeconds*time.Second)
+		return
+	}
+
 	// A HEAD probe (.sup is the only embedded format that does not early-return)
 	// exists to read representation headers, not to extract: keep its previous
 	// whole-track/committed behavior and never synthesize a window or warm from
 	// it.
 	if r.Method != http.MethodHead {
 		h.applyImplicitVirtualWindow(&opts, file, session, virtualActive)
+		// An explicit bitmap window is a page. Snap it onto the same page grid
+		// an implicit window and the client's request path use, so the page this
+		// request produces answers every later request inside it instead of
+		// being a playhead-anchored slice nothing computes a key for.
+		if snapped, pageStart, pageEnd := snapBitmapWindowToPage(&opts); snapped {
+			slog.InfoContext(r.Context(), "bitmap subtitle window snapped to its page", "component", "api",
+				"file_id", file.ID,
+				"track", opts.TrackIndex,
+				"requested_seek_seconds", seek,
+				"requested_duration_seconds", duration,
+				"page_start_seconds", pageStart,
+				"page_end_seconds", pageEnd)
+		}
 	}
 	// Advertise the bounded range before any header commits. A whole-track
 	// serve (committed artifact, small/local source, or a codec that cannot be
@@ -4004,7 +4198,7 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 		// pin, validate the live layout, and retry rather than stream an
 		// unvalidated source extract.
 		opts.PinnedTextArtifact = nil
-		proceed, probeErr := h.verifyVirtualSubtitleLayout(r.Context(), track, file.SubtitleTracks, &opts)
+		proceed, probeErr := h.verifyVirtualSubtitleLayout(r.Context(), file, track, file.SubtitleTracks, &opts)
 		if !proceed {
 			writeSubtitleSourceChanged(w)
 			return
@@ -4013,8 +4207,7 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 			// The committed artifact is gone and the live layout cannot be
 			// established: fail closed rather than stream an unverified
 			// extraction. This is the same retryable response PGS uses.
-			clearSubtitleCoverageHeaders(w.Header())
-			writeSubtitleSourceUnavailable(w)
+			writeSubtitleProbeFailure(w, r.Context(), probeErr)
 			return
 		}
 		opts.CacheIdentity = virtualSubtitleCacheIdentity(file, session.VirtualSourceURI, opts.TrackIndex)
@@ -4043,6 +4236,20 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 		)
 	}
 	if extractErr != nil {
+		var pageUnavailable *playback.SubtitleExtractionUnavailableError
+		if errors.As(extractErr, &pageUnavailable) {
+			// The page's track artifact could not reach it inside its recovery
+			// budget (or stopped advancing toward it). Repeating the same page
+			// pays the same container prefix again, so this is the one answer the
+			// client must stop on: no Retry-After, no further recovery warm.
+			if response.Status() != 0 {
+				panic(http.ErrAbortHandler)
+			}
+			playback.SetSubtitleCoverageRange(w.Header(), 0, pageUnavailable.CoveredUntil)
+			writeError(w, http.StatusServiceUnavailable, playback.SubtitlePageUnavailableReason,
+				"This subtitle page could not be prepared in time. Choose another subtitle track.")
+			return
+		}
 		var extractionRetry *playback.SubtitleExtractionRetryError
 		if errors.As(extractErr, &extractionRetry) {
 			// The per-identity backoff after an upstream failure is still
@@ -4051,10 +4258,33 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 			// warning on every client retry. Answer with the remaining delay
 			// so the client waits instead of retrying in its default
 			// few-second cadence.
+			if extractionRetry.Reason == playback.SubtitlePageTooCostlyReason && extractionRetry.PageRecoveryDue {
+				// The page could not be cut from the source at an affordable
+				// read cost. The track's progressive artifact is what serves it,
+				// and that fill must outlive this request's relay registration,
+				// so the handler starts it here (the cache's own detached warm is
+				// disabled for virtual inputs). It is single-flighted: a burst of
+				// pages starts one fill.
+				h.warmVirtualSubtitleForWaitingPage(file, track, session, opts, inheritedLayout, virtualActive, middleware.GetReqID(r.Context()))
+			}
+			if extractionRetry.WindowBudgetExceeded {
+				// The window read its source for its whole budget instead of
+				// failing, so the source is reachable and only this page is
+				// too costly for one request. Start the detached recovery warm
+				// here: it extracts the breached window plus one client cell,
+				// so the retry this 503 asks for is covered rather than
+				// repeating the read that just timed out.
+				h.warmVirtualSubtitleAfterBudgetBreach(file, track, session, opts, inheritedLayout, virtualActive, middleware.GetReqID(r.Context()))
+			}
 			if response.Status() != 0 {
+				// The slice spilled past its hold and part of a 200 is on the
+				// wire. Nothing can retract it, so the response is aborted
+				// rather than completed as a window that looks whole. The
+				// recovery warm above still runs, so the client's retry reads
+				// the covering slice instead of repeating the read.
 				panic(http.ErrAbortHandler)
 			}
-			writeSubtitleSourceUnavailableRetry(w, extractionRetry.RetryAfter)
+			writeSubtitleRetry(w, extractionRetry)
 			return
 		}
 		if errors.Is(extractErr, playback.ErrSubtitleReadsBusy) {
@@ -4079,18 +4309,7 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 			panic(http.ErrAbortHandler)
 		}
 		if !virtualActive || !playback.IsSubtitleStreamMapError(extractErr) {
-			if playback.IsSubtitleUpstreamError(extractErr) || isRelayTokenNotFoundError(extractErr, opts.InputPath) {
-				// The relay input 5xxed under ffmpeg, or our relay token
-				// lapsed mid-flight: the extraction command is fine and a
-				// retry (which re-resolves a fresh token) may succeed.
-				// Answer retryable rather than failed so the client keeps
-				// its backoff loop instead of spending its terminal budget.
-				clearSubtitleCoverageHeaders(w.Header())
-				writeSubtitleSourceUnavailable(w)
-				return
-			}
-			clearSubtitleCoverageHeaders(w.Header())
-			writeError(w, http.StatusInternalServerError, "subtitle_extract_failed", "Failed to extract subtitles")
+			writeSubtitleExtractFailure(w, extractErr, opts.InputPath)
 			return
 		}
 		// Post-spawn safety net: the plan ordinal named a subtitle stream the
@@ -4100,7 +4319,7 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 		// relay URL once — no second resolve — and re-map; a source that still
 		// cannot satisfy the requested representation gets a clean retryable 4xx
 		// instead of a 500.
-		proceed, probeErr := h.verifyVirtualSubtitleLayout(r.Context(), track, file.SubtitleTracks, &opts)
+		proceed, probeErr := h.verifyVirtualSubtitleLayout(r.Context(), file, track, file.SubtitleTracks, &opts)
 		if !proceed {
 			writeSubtitleSourceChanged(w)
 			return
@@ -4109,9 +4328,12 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 			// A map error already proved the plan ordinal names no live stream;
 			// if the re-probe then cannot establish the layout either, there is
 			// no verified ordinal to retry with. Fail closed rather than re-spawn
-			// the same unverified extraction.
-			clearSubtitleCoverageHeaders(w.Header())
-			writeSubtitleSourceUnavailable(w)
+			// the same unverified extraction, and start the detached fill so the
+			// next retry can read a committed artifact instead of re-probing.
+			if r.Method != http.MethodHead && !isClientCancellation(r.Context(), probeErr) {
+				h.warmVirtualSubtitleAfterProbeFailure(file, track, session, opts, inheritedLayout, virtualActive, middleware.GetReqID(r.Context()))
+			}
+			writeSubtitleProbeFailure(w, r.Context(), probeErr)
 			return
 		}
 		// The retry may have remapped to a different live ordinal; the cache
@@ -4132,7 +4354,7 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 				if response.Status() != 0 {
 					panic(http.ErrAbortHandler)
 				}
-				writeSubtitleSourceUnavailableRetry(w, retryBackoff.RetryAfter)
+				writeSubtitleRetry(w, retryBackoff)
 				return
 			}
 			playback.LogSubtitleStreamError(r.Context(), retryErr, file.ID, embeddedIndex)
@@ -4147,13 +4369,7 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 				writeSubtitleSourceChanged(w)
 				return
 			}
-			if playback.IsSubtitleUpstreamError(retryErr) || isRelayTokenNotFoundError(retryErr, opts.InputPath) {
-				clearSubtitleCoverageHeaders(w.Header())
-				writeSubtitleSourceUnavailable(w)
-				return
-			}
-			clearSubtitleCoverageHeaders(w.Header())
-			writeError(w, http.StatusInternalServerError, "subtitle_extract_failed", "Failed to extract subtitles")
+			writeSubtitleExtractFailure(w, retryErr, opts.InputPath)
 			return
 		}
 	}
@@ -4216,14 +4432,30 @@ const (
 	virtualSubtitleWarmSeekRate       = 2.0
 )
 
+// virtualSubtitleWarmRekeyAttempts bounds how many times a detached warm
+// re-keys itself when its own drift probe settles on an identity other than the
+// one its fill was admitted under. A serve that skipped its drift probe (plan
+// evidence, or a committed artifact) hands the warm a plan-ordinal identity,
+// but the warm's probe is the authority on the bytes it reads: if that probe
+// remaps onto a different live ordinal, committing under the plan key would
+// publish that track under an identity no serve computes, while a concurrent
+// page that probed the same release would use the post-remap key and demux a
+// second time. The warm therefore discards the fill and re-runs under the
+// probe's identity. A release that keeps moving under the probe gives up
+// without committing; the next windowed miss retries.
+const virtualSubtitleWarmRekeyAttempts = 3
+
 // virtualSubtitleLayoutCacheTTL bounds how long a successful drift-probe
 // verdict is reused for the same (CacheIdentity, plan ordinal). A windowed
-// player asks for the same track roughly every window, and a re-probe costs
-// seconds before extraction starts. Two minutes covers a burst of adjacent
-// window fetches and a client retry cycle; a release rotation changes the
-// pinned result and therefore the identity, so the TTL only hides residual
-// same-candidate change.
-const virtualSubtitleLayoutCacheTTL = 2 * time.Minute
+// player asks for the same track once per window — 120 s with a 60 s prefetch
+// — and a re-probe costs seconds before extraction starts. The TTL must
+// comfortably cover several consecutive pages or every fourth request pays
+// the probe again even though nothing about the pinned release changed; eight
+// minutes covers a 120 s page cadence with room for retries and prefetch
+// bursts while still re-probing a long playback periodically. A release
+// rotation changes the pinned result and therefore the identity, so the TTL
+// only hides residual same-candidate change, which stays bounded by the TTL.
+const virtualSubtitleLayoutCacheTTL = 8 * time.Minute
 
 // virtualSubtitleLayoutCacheMaxEntries caps the probe memo. Live entries are
 // identities probed inside the TTL; a long-lived server would otherwise
@@ -4280,6 +4512,7 @@ func (h *StreamHandler) reuseVirtualSubtitleLayout(opts *playback.StreamExtractO
 		delete(h.virtualSubtitleLayouts, key)
 		return virtualSubtitleLayoutVerdict{}, false
 	}
+	playback.ObserveSubtitleLayoutProbeReused()
 	return verdict, true
 }
 
@@ -4313,12 +4546,92 @@ func (h *StreamHandler) rememberVirtualSubtitleLayout(planKey string, opts playb
 		sourceCodec: opts.SourceCodec,
 		verifiedAt:  now,
 	}
+	// A match recorded now is newer evidence than an earlier rotation verdict
+	// for the same ordinal.
+	delete(h.virtualSubtitleLayoutMisses, planKey)
 }
 
-// warmVirtualSubtitleAfterWindowMiss starts a detached full-track warm for a
+// virtualSubtitleLayoutMissTTL bounds how long a positive "the live release has
+// no track this ordinal can carry" verdict answers page requests. It is much
+// shorter than the match memo: the verdict exists to end a loop that produces
+// nothing, not to hide a release that might be re-listed under it. Every page a
+// client asks for inside the window is answered with the same rotation verdict,
+// so the client stops retrying and replans. A re-listed release changes the
+// pinned result and therefore the identity, which is a different key.
+const virtualSubtitleLayoutMissTTL = 60 * time.Second
+
+// rememberVirtualSubtitleLayoutMiss records that a completed probe found no live
+// track for this plan ordinal. Only a completed probe that positively found no
+// match may call it: a probe error (timeout, provider failure, cancellation) is
+// not evidence about the bytes and must leave the next request free to try.
+func (h *StreamHandler) rememberVirtualSubtitleLayoutMiss(planKey string, now time.Time) {
+	if h == nil || planKey == "" {
+		return
+	}
+	h.virtualSubtitleLayoutMu.Lock()
+	defer h.virtualSubtitleLayoutMu.Unlock()
+	if h.virtualSubtitleLayoutMisses == nil {
+		h.virtualSubtitleLayoutMisses = make(map[string]time.Time)
+	}
+	if len(h.virtualSubtitleLayoutMisses) >= virtualSubtitleLayoutCacheMaxEntries {
+		for key, at := range h.virtualSubtitleLayoutMisses {
+			if now.Sub(at) > virtualSubtitleLayoutMissTTL {
+				delete(h.virtualSubtitleLayoutMisses, key)
+			}
+		}
+		if len(h.virtualSubtitleLayoutMisses) >= virtualSubtitleLayoutCacheMaxEntries {
+			clear(h.virtualSubtitleLayoutMisses)
+		}
+	}
+	h.virtualSubtitleLayoutMisses[planKey] = now
+	// A rotation verdict supersedes a mapping recorded against the same ordinal
+	// before the release moved.
+	delete(h.virtualSubtitleLayouts, planKey)
+}
+
+// virtualSubtitleLayoutUnmatchable reports whether a completed probe already
+// found no live track for this plan ordinal inside the miss TTL. The serve path
+// answers it like an immediate positive mismatch, without starting another fill
+// that can only abandon the same way.
+func (h *StreamHandler) virtualSubtitleLayoutUnmatchable(opts *playback.StreamExtractOpts, now time.Time) bool {
+	if h == nil || opts == nil || opts.CacheIdentity == "" {
+		return false
+	}
+	key := virtualSubtitleLayoutKey(opts.CacheIdentity, opts.TrackIndex)
+	h.virtualSubtitleLayoutMu.Lock()
+	defer h.virtualSubtitleLayoutMu.Unlock()
+	at, ok := h.virtualSubtitleLayoutMisses[key]
+	if !ok {
+		return false
+	}
+	if now.Sub(at) > virtualSubtitleLayoutMissTTL {
+		delete(h.virtualSubtitleLayoutMisses, key)
+		return false
+	}
+	return true
+}
+
+// warmVirtualSubtitleAfterWindowMiss starts detached cache fill work for a
 // windowed virtual subtitle request (text, ASS/SSA, or PGS) that could not be
 // served from the cache. It is called after the window itself has streamed, so
 // the warm cannot contend with the triggering request's own read.
+//
+// When the live playhead has moved into the file, the fill is a bounded window
+// prefetch around that playhead (PrefetchWindowsInBackground): the client's next
+// page or two are extracted and kept as last-good windows. A full-track warm
+// always extracts from source zero and commits under the whole-track artifact
+// key, so starting one here would publish a tail slice as the complete track —
+// wrong offsets and every cue before the seek missing. Only a session still at
+// the start keeps the full-track shape, where that artifact is what the opening
+// playback actually reads.
+//
+// A bitmap (PGS) window is the exception: it is a page, and a page the source
+// could not serve cheaply is what the track's progressive artifact exists to
+// answer. That fill is the page path, not an opportunistic second read — it runs
+// even while the viewer is playing, and it replaces the bounded window prefetch,
+// which would re-read the source for pages the fill is publishing. A whole-track
+// bitmap request keeps the paused-only shape; only a bounded bitmap page routes
+// here (see bitmapPageWaitingForFill).
 //
 // The warm resolves and holds its own relay registration: the request's
 // registration is released when the request ends, which is exactly why the
@@ -4336,7 +4649,10 @@ func (h *StreamHandler) rememberVirtualSubtitleLayout(planKey string, opts playb
 // re-keys the identity to the effective ordinal) or abandons the warm. The
 // serving request may pass the ordinal it established as a hint (see
 // virtualSubtitleLayoutSeed), but the warm always probes its own registration;
-// it never commits on a verdict it did not establish itself.
+// it never commits on a verdict it did not establish itself. When that probe
+// settles on an identity other than the one the fill was admitted under, the
+// warm discards the fill and re-runs under the probe's identity, so the artifact
+// always commits under the same key a serve computes for the track it contains.
 
 // virtualSubtitleWarmSession returns the freshest session copy the warm gate
 // should read. The session copy on the serve request predates the latest
@@ -4355,27 +4671,6 @@ func (h *StreamHandler) virtualSubtitleWarmSession(session *playback.Session) (*
 		return nil, false
 	}
 	return current, true
-}
-
-// virtualSubtitleWarmAllowed returns the live session when a full-track
-// virtual subtitle warm may run now, or nil when it may not. A paused session
-// warms every sidecar class. A playing session warms text (WebVTT/ASS) only:
-// the warm exists to stop every window from re-demuxing a multi-GB relay
-// source, and a text artifact is a few megabytes. Bitmap (PGS) warms stay
-// paused-only — a full-track .sup is tens of megabytes and is never the next
-// thing playback needs.
-func (h *StreamHandler) virtualSubtitleWarmAllowed(session *playback.Session, sourceCodec string) *playback.Session {
-	live, ok := h.virtualSubtitleWarmSession(session)
-	if !ok {
-		return nil
-	}
-	if live.IsPaused {
-		return live
-	}
-	if playback.NeedsBurnIn(sourceCodec) {
-		return nil
-	}
-	return live
 }
 
 // virtualSubtitleWarmCancelReason reports why a detached warm must stop now,
@@ -4424,13 +4719,23 @@ func (h *StreamHandler) resolveWarmExtractLayout(warmCtx context.Context, file *
 		extractOpts.TrackIndex = inherited.trackIndex
 		extractOpts.SourceCodec = inherited.sourceCodec
 	}
-	proceed, validateErr := h.verifyVirtualSubtitleLayout(warmCtx, track, planTracks, extractOpts)
+	proceed, validateErr := h.verifyVirtualSubtitleLayout(warmCtx, file, track, planTracks, extractOpts)
 	if !proceed {
 		// The live layout no longer carries a same-class track for this
 		// plan track. Nothing was committed (the fill is discarded on
 		// this path), and this is a deliberate abandonment rather than a
 		// source failure, so it must not arm the warm failure cooldown:
 		// the next windowed miss re-evaluates the layout itself.
+		//
+		// The verdict is recorded, though. This warm probed the live release
+		// and found nothing for the plan ordinal: leaving it unrecorded is a
+		// loop, because the page path never probes (it trusts the row's
+		// evidence) and every page it refuses starts the same warm, which
+		// abandons the same way. The next page request is answered with the
+		// rotation verdict so the client replans onto the rotated inventory.
+		// Only this positive result is recorded; a probe error returns below
+		// and records nothing.
+		h.rememberVirtualSubtitleLayoutMiss(virtualSubtitleLayoutKey(extractOpts.CacheIdentity, extractOpts.TrackIndex), time.Now())
 		slog.WarnContext(context.Background(), "virtual subtitle warm abandoned: live layout has no match for the planned track",
 			"component", "api", "file_id", file.ID,
 			"plan_codec", track.Codec, "plan_language", track.Language)
@@ -4448,12 +4753,11 @@ func (h *StreamHandler) resolveWarmExtractLayout(warmCtx context.Context, file *
 		// ordinal.
 		return fmt.Errorf("validate virtual subtitle warm layout: %w", validateErr)
 	}
-	// The probe may have remapped the ordinal onto the live layout.
-	// Extract the mapped stream and keep the extraction's own identity
-	// aligned with it. The fill was reserved before the probe under the
-	// pre-probe identity, so the artifact still commits under the key
-	// the serve lookup computes for this row and ordinal; only the
-	// stream that is demuxed moves.
+	// The warm's own probe may remap the ordinal onto a different live
+	// track. Keep the extraction aligned with what the probe established; the
+	// caller compares this identity with the fill's admitted key and re-keys
+	// the warm when they differ, so the artifact can never commit another
+	// track's bytes under the plan-ordinal identity.
 	extractOpts.CacheIdentity = virtualSubtitleCacheIdentity(file, session.VirtualSourceURI, extractOpts.TrackIndex)
 	return nil
 }
@@ -4478,6 +4782,63 @@ func subtitleWarmHintMatchesPlanTrack(requested models.SubtitleTrack, planTracks
 }
 
 func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(file *models.MediaFile, track models.SubtitleTrack, session *playback.Session, opts playback.StreamExtractOpts, inherited *virtualSubtitleLayoutSeed, virtualActive bool, requestID string) {
+	// A bounded bitmap page is the case where the detached fill is the page
+	// path: no page extract produces the artifact the next page needs, and the
+	// client is already waiting on it. A whole-track bitmap request keeps the
+	// paused-only admission below.
+	h.warmVirtualSubtitle(file, track, session, opts, inherited, virtualActive, requestID, bitmapPageWaitingForFill(opts), false, false)
+}
+
+// warmVirtualSubtitleAfterBudgetBreach starts the detached recovery warm for a
+// request-path text window that was answered retryably at its elapsed budget.
+// The retry a 503 asks for usually re-anchors a few seconds forward, so the
+// warm extracts the breached window plus one client grid cell and stores it as
+// the last-good window. That range covers both an exact repeat and the shifted
+// window the retry asks for; the ordinary mid-file prefetch derives its windows
+// from the playhead grid and misses both, which is why a breach used to repeat
+// at full price until the client gave up.
+func (h *StreamHandler) warmVirtualSubtitleAfterBudgetBreach(file *models.MediaFile, track models.SubtitleTrack, session *playback.Session, opts playback.StreamExtractOpts, inherited *virtualSubtitleLayoutSeed, virtualActive bool, requestID string) {
+	h.warmVirtualSubtitle(file, track, session, opts, inherited, virtualActive, requestID, false, false, true)
+}
+
+// warmVirtualSubtitleAfterProbeFailure starts the detached fill when the
+// request's live-layout probe could not establish the source. The handler has
+// already decided to answer retryably; without a fill, every retry repeats the
+// same probe against the same slow provider and fails again (production showed
+// 18 probe-timeout 503s before one request finally succeeded). The warm opens
+// its own relay registration, probes with the warm budget, and commits the
+// artifact under the serve identity, so the next retry is a cache hit instead
+// of another probe. force lets it run for a whole-track request (no explicit
+// window, which normally fills inline) and for a bitmap track while playback
+// runs, because those are exactly the cases no inline fill produced.
+func (h *StreamHandler) warmVirtualSubtitleAfterProbeFailure(file *models.MediaFile, track models.SubtitleTrack, session *playback.Session, opts playback.StreamExtractOpts, inherited *virtualSubtitleLayoutSeed, virtualActive bool, requestID string) {
+	h.warmVirtualSubtitle(file, track, session, opts, inherited, virtualActive, requestID, bitmapPageWaitingForFill(opts), true, false)
+}
+
+// bitmapPageWaitingForFill reports whether this request was a bounded bitmap
+// (PGS) page that read its source: the window the client plays next can only be
+// produced from the track's progressive artifact, so the fill is what it is
+// waiting on. A whole-track bitmap request is not a page and keeps the
+// paused-only full-track warm.
+func bitmapPageWaitingForFill(opts playback.StreamExtractOpts) bool {
+	if !playback.IsPGS(opts.SourceCodec) || !opts.AllowWindow {
+		return false
+	}
+	windowed, _, _, openEnded := opts.WindowCoverage()
+	return windowed && !openEnded
+}
+
+// warmVirtualSubtitleForWaitingPage starts the track's detached fill because a
+// bounded bitmap page is waiting for its progressive artifact. The page cannot
+// be cut from the source at an affordable cost, so the fill is the page path,
+// not an opportunistic extra read: it runs even while the viewer is playing and
+// even when a bounded page prefetch would otherwise take precedence, because
+// those pages are exactly what this fill publishes as it parses.
+func (h *StreamHandler) warmVirtualSubtitleForWaitingPage(file *models.MediaFile, track models.SubtitleTrack, session *playback.Session, opts playback.StreamExtractOpts, inherited *virtualSubtitleLayoutSeed, virtualActive bool, requestID string) {
+	h.warmVirtualSubtitle(file, track, session, opts, inherited, virtualActive, requestID, true, false, false)
+}
+
+func (h *StreamHandler) warmVirtualSubtitle(file *models.MediaFile, track models.SubtitleTrack, session *playback.Session, opts playback.StreamExtractOpts, inherited *virtualSubtitleLayoutSeed, virtualActive bool, requestID string, pageWaiting, force, breach bool) {
 	if h == nil || h.SubtitleCache == nil || file == nil || session == nil || !virtualActive {
 		return
 	}
@@ -4490,12 +4851,15 @@ func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(file *models.MediaFil
 	// worth that read even while the viewer is playing: without one, every
 	// 120 s window on a large virtual source re-demuxes the relay input and the
 	// small artifact never appears, so rendering stops once the client's
-	// lookahead runs out. Bitmap (PGS) warms remain paused-only. The warm stays
-	// single-flighted through WarmTrackInBackground (warmSem + beginFill), so a
-	// burst of windows still demuxes once.
-	live := h.virtualSubtitleWarmAllowed(session, opts.SourceCodec)
-	if live == nil {
-		slog.DebugContext(context.Background(), "virtual subtitle warm skipped: session ended or bitmap track while playing",
+	// lookahead runs out. The same continuation argument holds for a bitmap
+	// (PGS) track, but only for the bounded page prefetch below: a full .sup is
+	// tens of megabytes demuxed from the whole container, so the full-track
+	// shape stays paused-only. The warm stays single-flighted through
+	// WarmTrackInBackground / PrefetchWindowsInBackground (warmSem + beginFill),
+	// so a burst of windows still demuxes once.
+	live, liveOK := h.virtualSubtitleWarmSession(session)
+	if !liveOK || live == nil {
+		slog.DebugContext(context.Background(), "virtual subtitle warm skipped: session ended",
 			"component", "api", "session", session.ID, "file_id", file.ID, "codec", opts.SourceCodec)
 		return
 	}
@@ -4513,102 +4877,383 @@ func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(file *models.MediaFil
 	// repeat is a fresh full remote demux. The warm's mandatory drift probe and
 	// progressive .sup handling are unchanged — only the populate step is new.
 	// Full-track requests already fill the cache inline through ServeExtract's
-	// tee; only explicit windows need a detached warm.
-	if opts.SeekSeconds == 0 && opts.DurationSeconds == 0 {
+	// tee; only explicit windows need a detached warm. force is the exception:
+	// a failed live-layout probe produced no inline fill at all, so the retry
+	// needs the artifact even for a param-less whole-track request.
+	if !force && opts.SeekSeconds == 0 && opts.DurationSeconds == 0 {
 		return
 	}
 	// A committed entry means this request served its window from the cached
 	// artifact; nothing to warm. Format-aware, so a committed .sup suppresses
 	// the warm exactly as a committed VTT/ASS does.
 	if h.SubtitleCache.HasCommittedEntry(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, opts.SourceCodec, opts.TargetFormat) {
+		slog.DebugContext(context.Background(), "virtual subtitle warm skipped: committed artifact present",
+			"component", "api", "session", session.ID, "file_id", file.ID,
+			"codec", opts.SourceCodec, "track", opts.TrackIndex)
 		return
 	}
 
 	h.subtitleWarmWG.Add(1)
 	go func() {
 		defer h.subtitleWarmWG.Done()
-		var cleanup func()
-		defer func() {
-			if cleanup != nil {
-				cleanup()
-			}
-		}()
-		extract := func(extractCtx context.Context, extractOpts playback.StreamExtractOpts) error {
-			// Resolve on a child of the extraction context, never the detached
-			// request context: a resolver that hangs is canceled when the warm
-			// budget is exhausted, releasing the warm slot and fill instead of
-			// holding them forever.
-			warmCtx, cancelWarm := context.WithCancel(extractCtx)
-			defer cancelWarm()
-			if h.sessionMgr != nil {
-				anchorPosition := live.Position
-				anchorAt := time.Now()
-				go func() {
-					ticker := time.NewTicker(time.Second)
-					defer ticker.Stop()
-					for {
-						select {
-						case <-warmCtx.Done():
-							return
-						case now := <-ticker.C:
-							if reason := h.virtualSubtitleWarmCancelReason(session, anchorPosition, anchorAt, now); reason != "" {
-								slog.DebugContext(context.Background(), "virtual subtitle warm canceled",
-									"component", "api", "session", session.ID, "file_id", file.ID, "reason", reason)
-								cancelWarm()
-								return
-							}
-						}
-					}
-				}()
-			}
-			resolveCtx, cancel := context.WithTimeout(warmCtx, virtualSubtitleWarmResolveTimeout)
-			defer cancel()
-			resolved, resolvedCleanup, err := h.resolveVirtualInputURI(resolveCtx, file, session.UserID, session.ProfileID, false)
-			if err != nil {
-				if warmCtx.Err() != nil {
-					// The abort ticker canceled an in-flight resolve: an
-					// intentional abandonment, not a source failure, and it must
-					// not arm the failure cooldown.
-					return playback.ErrSubtitleWarmCanceled
-				}
-				logVirtualStreamFailure(resolveCtx, session.ID, file, err)
-				return fmt.Errorf("resolve virtual input for subtitle warm: %w", err)
-			}
-			cleanup = resolvedCleanup
-			extractOpts.InputPath = resolved.URL
-			// Validate the warm's own relay registration against the live
-			// layout. The serve's ordinal is at most a hint; this probe is the
-			// only authority for the bytes the warm is about to commit.
-			if err := h.resolveWarmExtractLayout(warmCtx, file, session, track, planTracks, inherited, &extractOpts); err != nil {
-				return err
-			}
-			err = playback.StreamExtractSubtitle(warmCtx, extractOpts)
-			if warmCtx.Err() != nil {
-				return playback.ErrSubtitleWarmCanceled
-			}
-			return err
-		}
 		// The serve request may have pinned a committed artifact to skip its own
 		// drift probe. That pin is a claim about one validated serve, and this
-		// warm opens its own registration and validates it above, so it must not
+		// warm opens its own registration and validates it below, so it must not
 		// be carried: inheriting it would let a serve-path eviction race fail the
 		// warm and arm the per-identity failure cooldown for bytes the warm never
 		// read.
-		opts.PinnedTextArtifact = nil
-		<-h.SubtitleCache.WarmTrackInBackground(opts, extract, requestID)
+		warmOpts := opts
+		warmOpts.PinnedTextArtifact = nil
+		// A recovery read is not opportunistic background work: the covering
+		// extraction after a budget breach and the fill a refused bitmap page is
+		// waiting for are both reads the viewer's next request depends on, so
+		// they draw from the reserved recovery budget instead of being shed
+		// behind a fill or a window that already holds the relay pipe.
+		warmOpts.WaitingRelayDemux = breach || pageWaiting
+		// The request that joins this read while it runs answers with the reason
+		// that started it, not a generic source failure: the client keeps the
+		// page/window state and honors the same Retry-After (see
+		// StreamExtractOpts.WaitingRefusalReason).
+		if breach {
+			warmOpts.WaitingRefusalReason = playback.SubtitleWindowBudgetExceededReason
+		} else if pageWaiting {
+			warmOpts.WaitingRefusalReason = playback.SubtitlePageNotReadyReason
+		}
+		seed := inherited
+
+		// A budget breach is recovered by warming the range the retry will ask
+		// for, not by the playhead-grid prefetch below. The client re-anchors on
+		// the live playhead, so by its retry its window starts later and ends
+		// later than the breached one; the recovery warm covers the breached
+		// range plus one full client window so the retries the 503 promises
+		// actually land inside it (see virtualSubtitleBreachRecoveryWindows). A
+		// grid prefetch of the same page length starts earlier and ends before
+		// the retry's range does, so the covering lookup rejects it and the
+		// retry pays the same read again.
+		if breach {
+			if windows, ok := virtualSubtitleBreachRecoveryWindows(opts); ok {
+				extract, _, release := h.virtualSubtitleWarmExtractor(file, track, session, planTracks, seed, warmOpts, live)
+				defer release()
+				<-h.SubtitleCache.PrefetchWindowsInBackground(warmOpts, windows, extract, requestID)
+				return
+			}
+		}
+
+		// A known playhead prefers the bounded window prefetch. It covers the
+		// pages the viewer is about to need without ever publishing a mid-file
+		// slice as the whole track. The full-track warm below stays the
+		// from-start/idle shape, where the artifact is what the opening playback
+		// reads. A page waiting for the fill inverts that: the prefetch would
+		// re-read the source for pages the fill is already publishing, so the
+		// fill runs instead.
+		if !pageWaiting {
+			if windows, prefetch := virtualSubtitleWarmPrefetchWindows(opts, live.Position); prefetch {
+				extract, _, release := h.virtualSubtitleWarmExtractor(file, track, session, planTracks, seed, warmOpts, live)
+				defer release()
+				<-h.SubtitleCache.PrefetchWindowsInBackground(warmOpts, windows, extract, requestID)
+				return
+			}
+		}
+		// Past the prefetch, only a text track may warm whole while playing (the
+		// artifact is small and the next fetch reads it). A bitmap track falls
+		// through only when the viewer is paused: a whole .sup is tens of
+		// megabytes read from the entire container, and it is never the page
+		// playback needs next. Two exceptions keep that admission from starving
+		// a retry: a probe failure produced no page extract at all, so the
+		// artifact is the retry's only path, and a page waiting for the fill
+		// cannot be cut from the source at an affordable cost, so the fill is
+		// what the page is waiting on.
+		if !force && !pageWaiting && !live.IsPaused && playback.NeedsBurnIn(opts.SourceCodec) {
+			slog.DebugContext(context.Background(), "virtual subtitle warm skipped: bitmap full-track warm stays paused-only",
+				"component", "api", "session", session.ID, "file_id", file.ID, "codec", opts.SourceCodec)
+			return
+		}
+
+		for attempt := 0; attempt < virtualSubtitleWarmRekeyAttempts; attempt++ {
+			attemptOpts := warmOpts
+			extract, rekeyed, release := h.virtualSubtitleWarmExtractor(file, track, session, planTracks, seed, attemptOpts, live)
+			if pageWaiting {
+				// A page refused for its read cost must be served by this fill, and
+				// it is the page's own ledger that allows exactly one. A previous
+				// failed warm's cooldown must not suppress it.
+				//
+				// The fill is deliberately *not* bounded by the page's wait (the
+				// budget stays 0, i.e. the cache's warm timeout). A page wait is
+				// ~90 s; a fill for a page deep into a large container parses from
+				// byte zero and needs minutes. Bounding it by the wait made it end
+				// exactly when the page gave up, so the retry restarted the same
+				// read from zero and no page ever arrived — production logged
+				// `page_wait_budget_spent` at 1m35s with 2 MB of artifact to show
+				// for it. The fill's extent is now the session that is waiting on
+				// it: the abort ticker above stops it on a seek or when that session
+				// ends, and subtitleCacheWarmTimeout is the outer bound. A page
+				// answered without the fill does not stop it either (see
+				// pageRecoveryRefusal): its progress is what the next request needs.
+				h.SubtitleCache.AllowWarmAfterPageRefusal(attemptOpts)
+			}
+			<-h.SubtitleCache.WarmTrackInBackgroundWithin(attemptOpts, extract, requestID, 0)
+			next := rekeyed()
+			release()
+			if next == nil {
+				return
+			}
+			slog.InfoContext(context.Background(), "virtual subtitle warm re-keyed after its drift probe",
+				"component", "api", "session", session.ID, "file_id", file.ID,
+				"from_track", attemptOpts.TrackIndex, "to_track", next.TrackIndex)
+			// Start the re-keyed attempt from the identity the probe just
+			// established, so its own probe confirms rather than re-derives a
+			// different mapping.
+			seed = &virtualSubtitleLayoutSeed{
+				cacheIdentity: next.CacheIdentity,
+				trackIndex:    next.TrackIndex,
+				sourceCodec:   next.SourceCodec,
+				verifiedAt:    time.Now(),
+			}
+			warmOpts = *next
+		}
+		slog.InfoContext(context.Background(), "virtual subtitle warm abandoned: identity kept moving under its drift probe",
+			"component", "api", "session", session.ID, "file_id", file.ID,
+			"attempts", virtualSubtitleWarmRekeyAttempts)
 	}()
+}
+
+// virtualSubtitleWarmAtStartPositionSeconds is the playhead below which a
+// window-miss warm keeps the full-track shape. A session at the start consumes
+// the artifact from source zero, so the artifact is the work playback needs;
+// prefetching windows there would only duplicate the slice the client already
+// asked for and would never produce the artifact the opening fetch reads.
+const virtualSubtitleWarmAtStartPositionSeconds = 1.0
+
+// virtualSubtitleWarmPrefetchWindows returns the bounded windows a mid-file
+// warm should prefetch, derived from the request grid the client walks: the
+// grid cell the live playhead falls in and the cell after it. ok is false while
+// the playhead is still at the start, where the full-track warm is the right
+// shape.
+//
+// Deriving the windows from the playhead's grid cell — not from the triggering
+// request's own start, and not from `position + lead` — is what makes a
+// prefetched page the page the client asks for next. A playhead-anchored grid
+// is offset from the client's by construction: production prefetched
+// 1716.6-1836.6 while the next request was 1824.6-1944.6, and 1350-1470 while
+// the next request was 1320-1440, so the covering lookup rejected every one of
+// seven prefetches. A bitmap client asks for exactly the page containing the
+// playhead (playback.SubtitleBitmapPageSeconds), so that page and the one after
+// it are its next two requests.
+func virtualSubtitleWarmPrefetchWindows(opts playback.StreamExtractOpts, position float64) ([]playback.SubtitlePrefetchWindow, bool) {
+	if position <= virtualSubtitleWarmAtStartPositionSeconds {
+		return nil, false
+	}
+	// Only a request that actually windowed establishes the grid the prefetch
+	// mirrors. A duration-only ASS request or a PGS request without the windowed
+	// opt-in is served as a whole slice, so mirroring it would cache slices no
+	// later request computes a key for.
+	if windowed, _, _, _ := opts.WindowCoverage(); !windowed {
+		return nil, false
+	}
+	grid := playback.SubtitleRequestGridFor(opts.SourceCodec)
+	start := grid.Start(position)
+	windows := make([]playback.SubtitlePrefetchWindow, 0, 2)
+	for i := 0; i < 2; i++ {
+		windows = append(windows, playback.SubtitlePrefetchWindow{
+			StartSeconds:    start + float64(i)*grid.CellSeconds,
+			DurationSeconds: grid.PageSeconds,
+		})
+	}
+	return windows, true
+}
+
+// virtualSubtitleBreachRecoveryWindows returns the bounded range a detached
+// warm should extract after a request-path text window is killed at its budget.
+//
+// The retry a 503 asks for is not the request that breached: both subtitle
+// clients re-anchor on the live playhead, which has moved on by the time the
+// client retries, so its window starts later and ends later than the breached
+// one. Extracting the breached start with a lead on the end therefore covers
+// both an exact repeat and the shifted retries, while the ordinary
+// playhead-grid prefetch — same page length, earlier start — ends before the
+// retry's end and is rejected by the covering lookup.
+//
+// The lead is one full client window, not one grid cell. The warm's own build
+// time is the reason: on the 4K source that produced the measurement a 150 s
+// window extracted from the relay took 64.5 s, so by the time it landed the
+// client had walked from 1680 s to 1740 s and asked for 1740–1860 — 30 s past
+// a one-cell lead (1680–1830). It re-extracted at full price, twice. Since the
+// client requests `[grid(playhead), +window)` and playback advances while the
+// warm builds, the warm must reach at least one full window past the breached
+// end for the retries it exists to serve to be inside it. That doubles the
+// warm's span and therefore its read; it is detached, bounded by the cache's
+// warm timeout and the two-warm budget, and it replaces repeated 26 s breaches
+// with hits on the same bytes.
+//
+// Only a bounded text/ASS window can be recovered this way. A bitmap page has
+// its own progressive artifact path, and an open-ended request has no end to
+// extend, so both keep their existing admission.
+func virtualSubtitleBreachRecoveryWindows(opts playback.StreamExtractOpts) ([]playback.SubtitlePrefetchWindow, bool) {
+	if playback.IsPGS(opts.SourceCodec) {
+		return nil, false
+	}
+	windowed, start, end, openEnded := opts.WindowCoverage()
+	if !windowed || openEnded || end <= start {
+		return nil, false
+	}
+	lead := playback.SubtitleRequestGridFor(opts.SourceCodec).PageSeconds
+	return []playback.SubtitlePrefetchWindow{{
+		StartSeconds:    start,
+		DurationSeconds: (end - start) + lead,
+	}}, true
+}
+
+// virtualSubtitleWarmExtractor builds the extract closure shared by the
+// detached full-track warm and the bounded window prefetch. The cache supplies
+// the options to extract with, so the full-track warm's zeroed bounds and the
+// prefetch's window bounds are both honored, and the closure owns the relay
+// registration for exactly the length of one extraction.
+//
+// admitted is the identity and ordinal the caller's fill was admitted under.
+// The closure always probes its own relay registration, and when that probe
+// settles on a different identity it reports the effective options through
+// rekeyed and returns ErrSubtitleWarmCanceled without extracting. Bytes are
+// therefore never published under a stale key. release releases the last
+// resolved registration; the caller invokes it once the extraction settles.
+func (h *StreamHandler) virtualSubtitleWarmExtractor(file *models.MediaFile, track models.SubtitleTrack, session *playback.Session, planTracks []models.SubtitleTrack, seed *virtualSubtitleLayoutSeed, admitted playback.StreamExtractOpts, live *playback.Session) (playback.SUPExtractFunc, func() *playback.StreamExtractOpts, func()) {
+	var cleanup func()
+	var rekeyed *playback.StreamExtractOpts
+	extract := func(extractCtx context.Context, extractOpts playback.StreamExtractOpts) error {
+		// A re-key decision belongs to the invocation that made it. The cache may
+		// re-invoke this closure after a page yield (WarmTrackInBackground), and
+		// that replay can establish the admitted identity and commit normally.
+		// Clearing the decision here keeps a stale pointer from a yielded
+		// invocation from re-keying a warm that has already settled under its
+		// probe-established identity.
+		rekeyed = nil
+		// An external cancellation ends this invocation on someone else's terms:
+		// an admitted page preempted the fill, or the warm's own abort fired. Its
+		// re-key verdict is not ours to act on, because the cache may hand the
+		// key to another warm instead of replaying this closure. Drop the verdict
+		// on the way out too; otherwise the handler sees it after the warm
+		// returns and starts a redundant full-track warm for the remapped track.
+		// A verdict reached on an uncanceled invocation (a genuine drift remap)
+		// still survives.
+		defer func() {
+			if extractCtx.Err() != nil {
+				rekeyed = nil
+			}
+		}()
+		// The cache may re-invoke this closure after yielding the relay pipe to
+		// an admitted page (WarmTrackInBackground), or the warm loop may re-key
+		// it. Release the previous attempt's registration before resolving a
+		// fresh one so a restart cannot strand it.
+		if cleanup != nil {
+			cleanup()
+			cleanup = nil
+		}
+		// Resolve on a child of the extraction context, never the detached
+		// request context: a resolver that hangs is canceled when the warm budget
+		// is exhausted, releasing the warm slot and fill instead of holding them
+		// forever.
+		warmCtx, cancelWarm := context.WithCancel(extractCtx)
+		defer cancelWarm()
+		if h.sessionMgr != nil {
+			anchorPosition := live.Position
+			anchorAt := time.Now()
+			go func() {
+				ticker := time.NewTicker(time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-warmCtx.Done():
+						return
+					case now := <-ticker.C:
+						if reason := h.virtualSubtitleWarmCancelReason(session, anchorPosition, anchorAt, now); reason != "" {
+							slog.DebugContext(warmCtx, "virtual subtitle warm canceled",
+								"component", "api", "session", session.ID, "file_id", file.ID, "reason", reason)
+							cancelWarm()
+							return
+						}
+					}
+				}
+			}()
+		}
+		resolveCtx, cancel := context.WithTimeout(warmCtx, virtualSubtitleWarmResolveTimeout)
+		defer cancel()
+		resolved, resolvedCleanup, err := h.resolveVirtualInputURI(resolveCtx, file, session.UserID, session.ProfileID, false)
+		if err != nil {
+			if warmCtx.Err() != nil {
+				// The abort ticker canceled an in-flight resolve: an
+				// intentional abandonment, not a source failure, and it must
+				// not arm the failure cooldown.
+				return playback.ErrSubtitleWarmCanceled
+			}
+			logVirtualStreamFailure(resolveCtx, session.ID, file, err)
+			return fmt.Errorf("resolve virtual input for subtitle warm: %w", err)
+		}
+		cleanup = resolvedCleanup
+		extractOpts.InputPath = resolved.URL
+		// Validate the warm's own relay registration against the live layout.
+		// The serve's ordinal is at most a hint; this probe is the only authority
+		// for the bytes this fill will hold.
+		if err := h.resolveWarmExtractLayout(warmCtx, file, session, track, planTracks, seed, &extractOpts); err != nil {
+			return err
+		}
+		if extractOpts.CacheIdentity != admitted.CacheIdentity ||
+			extractOpts.TrackIndex != admitted.TrackIndex {
+			// The probe settled on a different effective identity than the one
+			// this fill was admitted under. Do not publish these bytes under the
+			// stale key: abandon the fill (ErrSubtitleWarmCanceled is an
+			// intentional yield, so it arms no cooldown) and report the identity
+			// the probe established so the full-track warm can re-key onto it. A
+			// prefetch simply drops the kick; the next window miss re-attempts it.
+			next := admitted
+			next.InputPath = extractOpts.InputPath
+			next.CacheIdentity = extractOpts.CacheIdentity
+			next.TrackIndex = extractOpts.TrackIndex
+			next.SourceCodec = extractOpts.SourceCodec
+			next.PinnedTextArtifact = nil
+			rekeyed = &next
+			return playback.ErrSubtitleWarmCanceled
+		}
+		err = playback.StreamExtractSubtitle(warmCtx, extractOpts)
+		if warmCtx.Err() != nil {
+			return playback.ErrSubtitleWarmCanceled
+		}
+		return err
+	}
+	release := func() {
+		if cleanup != nil {
+			cleanup()
+			cleanup = nil
+		}
+	}
+	return extract, func() *playback.StreamExtractOpts { return rekeyed }, release
 }
 
 // Defaults for the implicit first window served to a cold whole-track subtitle
 // request against a large/unknown virtual/remote source. The web player asks
-// for its own 120 s windows; this legacy implicit bound stays at 600 s for
-// clients that request a whole track and have no windowing contract, so a
-// native client that does not refetch cannot lose subtitles after two minutes.
-// The backoff pulls the window start behind the session position so a small
-// scrub back stays covered, mirroring the player's SEEK_BACKOFF.
+// for its own 120 s windows; this implicit bound is the same page for text
+// clients that request a whole track and have no windowing contract. A 600 s
+// text page measured 41-63 s per extract on a virtual source because ffmpeg
+// demuxes the container up to the window end and discards it: the output is a
+// few kilobytes, but the read is hundreds of megabytes. 120 s matches the
+// window length the web player already requests, so the implicit range is one
+// the client can adopt without learning a new cadence. The window starts on a
+// span-aligned page that contains the session position, so a retry from the
+// same page asks for the window the previous request produced instead of a
+// range shifted a few seconds later (see implicitVirtualWindowStart).
 const (
-	virtualSubtitleImplicitWindowSeconds        = 600.0
-	virtualSubtitleImplicitWindowBackoffSeconds = 2.0
+	virtualSubtitleImplicitWindowSeconds = 120.0
+	// virtualSubtitleBitmapImplicitWindowSeconds is the implicit page for a
+	// bitmap (PGS) track. A bitmap page can only be produced by demuxing the
+	// container, so its cost scales with the page length: on a 50 GB / 2h52m
+	// remux a 600 s page reads ~2.9 GB, which measured 65-105 s per request
+	// against a client fetch deadline of the same order. Those pages were
+	// abandoned before they completed, and an abandoned page is never stored,
+	// so every retry repeated the whole read. 120 s is the page the web player
+	// requests, and it completes in ~13 s on the same source: fast enough to
+	// finish inside a fetch, and therefore able to answer the next request
+	// from the covering-window cache. The span is shared with the request grid
+	// (playback.SubtitleBitmapPageSeconds) so an explicit window, an implicit
+	// window, and a prefetch all land on the same page.
+	virtualSubtitleBitmapImplicitWindowSeconds = playback.SubtitleBitmapPageSeconds
 	// virtualSubtitleImplicitWindowMinSourceBytes is the source size above
 	// which a whole-track virtual read is considered untenable and is bounded
 	// to the implicit window. A small known source is read whole (cheap and
@@ -4669,8 +5314,10 @@ const (
 //
 // A position without a duration is window intent but open-ended: its missing
 // cap is filled with the implicit window (the caller's position is kept) so it
-// cannot demux to EOF and advertise `start-*`. A codec that cannot window
-// (PGS without the ?windowed=1 opt-in) is left untouched.
+// cannot demux to EOF and advertise `start-*`. A PGS request is granted
+// AllowWindow for this server-authored window even without the client's
+// ?windowed=1 opt-in; the response coverage headers are what tell such a
+// client to re-fetch at the window boundary.
 func (h *StreamHandler) applyImplicitVirtualWindow(opts *playback.StreamExtractOpts, file *models.MediaFile, session *playback.Session, virtualActive bool) {
 	if h == nil || opts == nil || !virtualActive {
 		return
@@ -4692,10 +5339,16 @@ func (h *StreamHandler) applyImplicitVirtualWindow(opts *playback.StreamExtractO
 	if h.SubtitleCache.HasCommittedEntry(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, opts.SourceCodec, opts.TargetFormat) {
 		return
 	}
+	// The page length is a per-class decision: a text page is cheap to slice
+	// 600 s at a time, a bitmap page is not (its cost is the container read).
+	spanSeconds := virtualSubtitleImplicitWindowSeconds
+	if playback.IsPGS(opts.SourceCodec) {
+		spanSeconds = virtualSubtitleBitmapImplicitWindowSeconds
+	}
 	// A position without a duration is window intent but open-ended: fill in the
 	// implicit window so it cannot extract to EOF (advertised as `start-*`). The
 	// caller's position is kept; only the missing cap is supplied.
-	if opts.ClampOpenEndedWindow(virtualSubtitleImplicitWindowSeconds) {
+	if opts.ClampOpenEndedWindow(spanSeconds) {
 		slog.Info("virtual subtitle open window clamped to implicit window",
 			"component", "api",
 			"codec", opts.SourceCodec,
@@ -4704,19 +5357,23 @@ func (h *StreamHandler) applyImplicitVirtualWindow(opts *playback.StreamExtractO
 			"track", opts.TrackIndex)
 		return
 	}
-	// Any other explicit intent is authoritative: a position-only codec that
-	// cannot window, or the PGS ?windowed=1 opt-in with no position/duration.
-	if opts.WindowRequested || opts.SeekSeconds > 0 || opts.AllowWindow {
+	// Any other explicit intent is authoritative. A PGS `?windowed=1` opt-in
+	// with no position or duration is not: it only selects the windowed serve
+	// path, and PGSWindowRequest parses bounds only alongside that flag, so a
+	// bare flag would otherwise demux the whole container to EOF. Fall through
+	// and give it the same implicit window a cold whole-track fetch gets; the
+	// coverage headers tell the client to re-fetch.
+	if opts.WindowRequested || opts.SeekSeconds > 0 {
 		return
 	}
 
 	opts.WindowRequested = true
-	opts.SeekSeconds = implicitVirtualWindowStart(session)
-	opts.DurationSeconds = virtualSubtitleImplicitWindowSeconds
+	opts.SeekSeconds = implicitVirtualWindowStart(session, spanSeconds)
+	opts.DurationSeconds = spanSeconds
 	if playback.IsPGS(opts.SourceCodec) {
 		// PGS routes through ServeSUPExtract, which windows only when
-		// AllowWindow is set (the explicit ?windowed=1 opt-in). This window is
-		// server-authored, so grant it here.
+		// AllowWindow is set (the client's ?windowed=1 opt-in or a server-
+		// authored window like this one), so grant it here.
 		opts.AllowWindow = true
 	}
 	slog.Info("virtual subtitle served as an implicit window",
@@ -4728,14 +5385,75 @@ func (h *StreamHandler) applyImplicitVirtualWindow(opts *playback.StreamExtractO
 }
 
 // implicitVirtualWindowStart returns the source-time start of the implicit
-// window: the session position pulled back slightly, or zero when the session
-// has no meaningful position yet (a fresh start, so the window covers the
-// opening of the track).
-func implicitVirtualWindowStart(session *playback.Session) float64 {
-	if session == nil || session.Position <= virtualSubtitleImplicitWindowBackoffSeconds {
+// window: the span-aligned page that contains the session position, or zero
+// when the session has no meaningful position yet (a fresh start, so the page
+// covers the opening of the track).
+//
+// Alignment is what makes a repeated whole-track fetch cheap. The covering
+// window cache only answers a request whose range a stored page fully
+// contains, so a page anchored to the live playhead (position minus a small
+// backoff) is never reused: the client's next fetch is a few seconds later, its
+// range extends past the page it just received, and the server pays the whole
+// extraction again. Snapping to the page grid makes every request inside one
+// page name the same window, so the first completed page serves the rest of
+// them — and so the prefetch grid derived from the request mirrors real pages.
+func implicitVirtualWindowStart(session *playback.Session, spanSeconds float64) float64 {
+	if session == nil || spanSeconds <= 0 || session.Position <= 0 {
 		return 0
 	}
-	return session.Position - virtualSubtitleImplicitWindowBackoffSeconds
+	start := math.Floor(session.Position/spanSeconds) * spanSeconds
+	if start < 0 {
+		return 0
+	}
+	return start
+}
+
+// snapBitmapWindowToPage moves an explicit bitmap window request onto the page
+// grid the client's request path walks, so the page this request produces is
+// the page every later request inside it asks for.
+//
+// A playhead-anchored bitmap request is never reusable: the next request starts
+// a few seconds later, its range runs past the slice the previous one produced,
+// and the covering-window lookup correctly rejects it. Production showed the
+// cost of leaving it anchored: two identical 229,103-byte extracts 5 s apart
+// (zero reuse) and a blank gap at every page boundary while the new page was
+// read.
+//
+// The snap keeps the caller's range covered. Extraction starts on the page
+// containing the requested start and ends on the last page boundary the
+// requested range reaches, so an aligned client (the web player asks for
+// exactly one page) is unchanged, and an older client that still anchors on the
+// playhead gets whole pages instead of a slice nothing can reuse.
+// X-Subtitle-Coverage then advertises exactly the range ffmpeg produced, and the
+// slice is stored under that range only — a page is never published under the
+// whole-track artifact key.
+//
+// It is a no-op for every non-bitmap codec, for a whole-track request, and for
+// an open-ended (start-only) window, which has no page end to snap to.
+func snapBitmapWindowToPage(opts *playback.StreamExtractOpts) (bool, float64, float64) {
+	if opts == nil || !playback.IsPGS(opts.SourceCodec) {
+		return false, 0, 0
+	}
+	windowed, start, end, openEnded := opts.WindowCoverage()
+	if !windowed || openEnded {
+		return false, 0, 0
+	}
+	grid := playback.SubtitleRequestGridFor(opts.SourceCodec)
+	pageStart := grid.Start(start)
+	pageEnd := pageStart + grid.PageSeconds
+	if end > pageEnd {
+		// The request reaches into a later page: cover it, and stop on a page
+		// boundary so what is stored is whole pages a later request can still
+		// be measured against.
+		pageEnd = math.Ceil(end/grid.PageSeconds) * grid.PageSeconds
+	}
+	if pageStart == start && pageEnd == end {
+		return false, 0, 0
+	}
+	opts.SeekSeconds = pageStart
+	opts.DurationSeconds = pageEnd - pageStart
+	opts.WindowRequested = true
+	return true, pageStart, pageEnd
 }
 
 // verifyVirtualSubtitleLayout probes the live relay input once and, when its
@@ -4752,11 +5470,19 @@ func implicitVirtualWindowStart(session *playback.Session) float64 {
 // same-ordinal rotation never trips the post-spawn map net. Virtual inputs are
 // request-local probe state; the session's published evidence is never
 // rewritten.
-func (h *StreamHandler) verifyVirtualSubtitleLayout(ctx context.Context, requestedTrack models.SubtitleTrack, expected []models.SubtitleTrack, opts *playback.StreamExtractOpts) (bool, error) {
+func (h *StreamHandler) verifyVirtualSubtitleLayout(ctx context.Context, file *models.MediaFile, requestedTrack models.SubtitleTrack, expected []models.SubtitleTrack, opts *playback.StreamExtractOpts) (bool, error) {
 	if opts == nil || strings.TrimSpace(opts.InputPath) == "" {
 		return true, nil
 	}
-	liveTracks, err := playback.ProbeSubtitleLayout(ctx, h.ffmpegPath(), opts.InputPath)
+	budget := remoteProbeBudget(ctx, file, playback.RemoteProbeFloor, playback.SubtitleProbeMax)
+	if budget > playback.RemoteProbeFloor {
+		slog.InfoContext(ctx, "virtual subtitle layout probe extended for a slow provider link",
+			"component", "api",
+			"track_codec", requestedTrack.Codec,
+			"budget", budget,
+			"observed_link_latency", recentVirtualProviderLinkLatency(virtualProviderLinkLatencyKey(file)))
+	}
+	liveTracks, err := playback.ProbeSubtitleLayoutWithin(ctx, h.ffmpegPath(), opts.InputPath, budget)
 	if err != nil {
 		// A probe failure (context canceled, relay timeout, transient upstream
 		// error) is not evidence that the pinned source rotated, but without
@@ -4765,6 +5491,16 @@ func (h *StreamHandler) verifyVirtualSubtitleLayout(ctx context.Context, request
 		// falls back to subtitles-off, which the server already treats as
 		// legitimate. The error is returned so the caller can distinguish it
 		// from a positive mismatch.
+		//
+		// A cancellation is the viewer leaving (a replan or a navigation away
+		// aborts the probe on its request context), so it is debug detail, not
+		// a source warning.
+		if isClientCancellation(ctx, err) {
+			slog.DebugContext(ctx, "virtual subtitle layout probe abandoned by the client", "component", "api",
+				"track_codec", requestedTrack.Codec,
+				"error", err)
+			return true, err
+		}
 		slog.WarnContext(ctx, "virtual subtitle layout probe failed", "component", "api",
 			"track_codec", requestedTrack.Codec,
 			"error", err)
@@ -4777,10 +5513,37 @@ func (h *StreamHandler) verifyVirtualSubtitleLayout(ctx context.Context, request
 	}
 	liveOrdinal, liveTrack, matched := playback.MatchEmbeddedSubtitleTrack(requestedTrack, liveTracks)
 	if !matched {
+		// A requested language that no live track declares is not by itself a
+		// rotation: the plan's language came from the provider's metadata, and a
+		// container tag can say `und`, or the plan inventory can carry a
+		// downloaded sidecar the live probe cannot see. Extraction addresses the
+		// ordinal, so if the plan ordinal still names a live track of the same
+		// extraction class, the bytes this track produces are the bytes it
+		// produced before. Refusing here discarded a successful extract: the page
+		// at position=2160 answered 200, the next page's warm probe found "no
+		// match for the planned track", and every later page was answered
+		// `subtitle_source_changed` — the viewer's only recovery was to replan,
+		// and the replan kept producing the same metadata.
+		if liveTrack, ok := planOrdinalStillCarries(requestedTrack, liveTracks, opts.TrackIndex, opts.TargetFormat); ok {
+			slog.InfoContext(ctx, "virtual subtitle layout differs only in metadata; keeping the plan ordinal", "component", "api",
+				"plan_ordinal", opts.TrackIndex,
+				"plan_codec", requestedTrack.Codec,
+				"plan_language", requestedTrack.Language,
+				"live_codec", liveTrack.Codec,
+				"live_language", liveTrack.Language)
+			return true, nil
+		}
+		// "No track in this class" and "the class is there in other languages"
+		// are different problems — one is a rotated layout, the other is a
+		// selection that no longer exists — and they used to log identically.
+		classCount, classLanguages := playback.SubtitleLayoutClassInventory(requestedTrack.Codec, liveTracks)
 		slog.WarnContext(ctx, "virtual subtitle layout rotated without a usable match", "component", "api",
 			"requested_codec", requestedTrack.Codec,
 			"requested_language", requestedTrack.Language,
-			"live_subtitle_count", len(liveTracks))
+			"requested_muxer_class", playback.SubtitleLayoutClass(requestedTrack.Codec),
+			"live_subtitle_count", len(liveTracks),
+			"live_class_track_count", classCount,
+			"live_class_languages", strings.Join(classLanguages, ","))
 		return false, nil
 	}
 	// Class preservation is the hard rule: the URL extension was minted at
@@ -4801,6 +5564,50 @@ func (h *StreamHandler) verifyVirtualSubtitleLayout(ctx context.Context, request
 		"codec", liveTrack.Codec,
 		"language", liveTrack.Language)
 	return true, nil
+}
+
+// planOrdinalStillCarries reports whether the plan ordinal still names a live
+// track whose extraction produces the same output class as the requested plan
+// track, with no language that contradicts the plan. It is the fallback for a
+// live layout that differs from the plan only in metadata: the provider listing
+// says `fre` while the container tag says `und` or nothing, or the plan
+// inventory carries a sidecar the embedded probe cannot see. `MatchEmbeddedSubtitleTrack`
+// applies language as a hard constraint, so it finds no candidate there and the
+// rotation verdict called a metadata gap a release rotation.
+//
+// The ordinal is what ffmpeg is told to map (`0:s:N`), so a same-class track at
+// that ordinal yields the subtitles the plan promised. A live track that
+// *contradicts* the plan's language is a rotation, not drift, and is not
+// carried: serving English where French was selected is a real mis-serve. Nor
+// is a class or muxer difference, which would change the response's format
+// under a URL minted at plan time.
+func planOrdinalStillCarries(requested models.SubtitleTrack, live []models.SubtitleTrack, ordinal int, targetFormat string) (models.SubtitleTrack, bool) {
+	class := playback.SubtitleLayoutClass(requested.Codec)
+	if class == "" || ordinal < 0 || ordinal >= len(live) {
+		return models.SubtitleTrack{}, false
+	}
+	liveTrack := live[ordinal]
+	if playback.SubtitleLayoutClass(liveTrack.Codec) != class {
+		return models.SubtitleTrack{}, false
+	}
+	if playback.SubtitleExtractMuxer(requested.Codec, targetFormat) != playback.SubtitleExtractMuxer(liveTrack.Codec, targetFormat) {
+		return models.SubtitleTrack{}, false
+	}
+	requestedLanguage := lang.Canonical(requested.Language)
+	liveLanguage := lang.Canonical(liveTrack.Language)
+	// `und` is the container saying "no language tagged", not a language that
+	// contradicts the plan. Only a *named* language that differs is a rotation.
+	if subtitleLanguageDiffers(requestedLanguage, liveLanguage) {
+		return models.SubtitleTrack{}, false
+	}
+	return liveTrack, true
+}
+
+// subtitleLanguageDiffers reports whether two canonical language tags name
+// different languages. An absent or `und`-tagged side is unknown, not different.
+func subtitleLanguageDiffers(a, b string) bool {
+	known := func(tag string) bool { return tag != "" && tag != audioLanguageUndetermined }
+	return known(a) && known(b) && a != b
 }
 
 // isRelayTokenNotFoundError reports whether an ffmpeg extraction failure is
@@ -4850,6 +5657,26 @@ func writeVirtualAudioSelectionInvalid(w http.ResponseWriter) {
 		"The selected audio track is no longer available; replan and choose another")
 }
 
+// writeSubtitleExtractFailure answers an extraction that produced no response
+// bytes and is not a layout rotation.
+//
+// A source read that ran out its own extract deadline, an upstream 5xx under
+// ffmpeg, or a relay token that lapsed mid-flight are all the same shape from the
+// client's side: the extraction command is fine and a retry may succeed. They
+// answer the retryable 503 the client already backs off from, never a 500, so a
+// slow provider does not spend the client's terminal failure budget. Anything
+// else is a real extraction failure and stays loud.
+func writeSubtitleExtractFailure(w http.ResponseWriter, extractErr error, inputPath string) {
+	clearSubtitleCoverageHeaders(w.Header())
+	if errors.Is(extractErr, context.DeadlineExceeded) ||
+		playback.IsSubtitleUpstreamError(extractErr) ||
+		isRelayTokenNotFoundError(extractErr, inputPath) {
+		writeSubtitleSourceUnavailable(w)
+		return
+	}
+	writeError(w, http.StatusInternalServerError, "subtitle_extract_failed", "Failed to extract subtitles")
+}
+
 // writeSubtitleSourceChanged answers a clean retryable 4xx when a virtual
 // release rotated so the requested subtitle representation can no longer be
 // produced from the live source. Clients already retry through the
@@ -4890,14 +5717,76 @@ const subtitleSourceRetryAfterSeconds = 5
 // server-chosen Retry-After. RetryAfter is rounded up to whole seconds and
 // floored at one so the header is always a positive delay.
 func writeSubtitleSourceUnavailableRetry(w http.ResponseWriter, retryAfter time.Duration) {
+	writeSubtitleRetry(w, &playback.SubtitleExtractionRetryError{RetryAfter: retryAfter})
+}
+
+// writeSubtitleRetry answers a subtitle extraction that must be retried: the
+// retryable 503 with Retry-After that clients already back off from. Two
+// additive parts carry the reason and the state:
+//
+//   - Reason replaces the default problem code when the extraction knows a more
+//     specific cause (a page whose read cost was refused);
+//   - CoveredUntil advertises how far the track's progressive bitmap artifact
+//     has parsed, so a client can tell that the page it asked for is not ready
+//     yet rather than unavailable.
+//
+// Neither changes the status, the header shape or the client's retry loop.
+func writeSubtitleRetry(w http.ResponseWriter, retry *playback.SubtitleExtractionRetryError) {
 	clearSubtitleCoverageHeaders(w.Header())
-	seconds := int(math.Ceil(retryAfter.Seconds()))
+	seconds := int(math.Ceil(retry.RetryAfter.Seconds()))
 	if seconds < 1 {
 		seconds = 1
 	}
 	w.Header().Set("Retry-After", strconv.Itoa(seconds))
+	if retry.CoveredUntil > 0 || isSubtitlePageReason(retry.Reason) {
+		// The requested page is not ready; the artifact behind it has parsed
+		// this range and will answer once it reaches the window. A page reason
+		// with nothing parsed yet advertises 0 so the header reflects what is
+		// actually covered instead of disappearing and reading as unknown.
+		playback.SetSubtitleCoverageRange(w.Header(), 0, retry.CoveredUntil)
+	}
+	if retry.Reason == playback.SubtitlePageTooCostlyReason {
+		writeError(w, http.StatusServiceUnavailable, playback.SubtitlePageTooCostlyReason,
+			"The subtitle page costs more to read than the server allows; retry to be served from the prefetched track")
+		return
+	}
+	if retry.Reason == playback.SubtitlePageNotReadyReason {
+		writeError(w, http.StatusServiceUnavailable, playback.SubtitlePageNotReadyReason,
+			"The subtitle page is not parsed yet; retry to be served from the prefetched track")
+		return
+	}
+	if retry.Reason == playback.SubtitleWindowBudgetExceededReason {
+		writeError(w, http.StatusServiceUnavailable, playback.SubtitleWindowBudgetExceededReason,
+			"The subtitle window read past its time budget; retry to be served from the recovery extraction")
+		return
+	}
 	writeError(w, http.StatusServiceUnavailable, "subtitle_source_unavailable",
 		"Unable to verify the subtitle source; retry")
+}
+
+// isSubtitlePageReason reports whether the reason names a bitmap page whose
+// progressive artifact is what answers it. Those refusals always advertise the
+// covered range, even when the artifact has parsed nothing yet.
+func isSubtitlePageReason(reason string) bool {
+	return reason == playback.SubtitlePageTooCostlyReason || reason == playback.SubtitlePageNotReadyReason
+}
+
+// writeSubtitleProbeFailure answers a live-layout probe that could not
+// establish the source's subtitle layout. A probe the client canceled is the
+// viewer leaving, not a source failure: the probe runs on the request context
+// and a player that replanned or navigated away aborts it within milliseconds.
+// Answering 503 there recorded a dependency failure (and an ERROR) for a 74 ms
+// request nobody was waiting on, so a cancellation is classified as an abandoned
+// request exactly like the media proxy's (see virtualProxyFailureStatus).
+// Everything else keeps the retryable 503 the client backs off from.
+func writeSubtitleProbeFailure(w http.ResponseWriter, ctx context.Context, probeErr error) {
+	if isClientCancellation(ctx, probeErr) {
+		clearSubtitleCoverageHeaders(w.Header())
+		writeErrorCause(w, http.StatusRequestTimeout, virtualProxyDispositionClientCanceled,
+			"Client closed the request", probeErr)
+		return
+	}
+	writeSubtitleSourceUnavailable(w)
 }
 
 // subtitleExtractWindow resolves the extraction window for an embedded

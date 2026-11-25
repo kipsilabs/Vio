@@ -1,9 +1,10 @@
 import { useState } from "react";
 import { toast } from "sonner";
 import { captureProfileRequestContext } from "@/api/client";
-import { v2, V2ProblemError } from "@/api/v2/request";
+import { problemDisplayText, v2, V2ProblemError } from "@/api/v2/request";
 import { useUserLibraries } from "@/hooks/queries/libraries";
 import { useEffectiveSettings } from "@/hooks/queries/settingValues";
+import { t } from "@/i18n";
 import {
   HOME_LAYOUT_MAX_LENGTH,
   buildHomeLayoutFile,
@@ -12,10 +13,10 @@ import {
 import { SETTING_KEYS } from "@/lib/settingsContract";
 
 const HOME_PREFERENCE_KEYS = [SETTING_KEYS.HOME_HIDE_WATCHED_ITEMS] as const;
-// Page reads during export run this many at a time.
+// Page reads during export and import run this many at a time.
 const READ_BATCH = 4;
 
-async function readInBatches<T, R>(items: readonly T[], read: (item: T) => Promise<R>) {
+export async function readInBatches<T, R>(items: readonly T[], read: (item: T) => Promise<R>) {
   const results: R[] = [];
   for (let start = 0; start < items.length; start += READ_BATCH) {
     results.push(...(await Promise.all(items.slice(start, start + READ_BATCH).map(read))));
@@ -30,9 +31,14 @@ export function layoutPageQuery(scope: HomeLayoutScope, libraryId?: number) {
 
 export function layoutProblemMessage(error: unknown): string {
   if (error instanceof V2ProblemError) {
-    return error.problem.detail?.trim() || error.problem.title || "request failed";
+    return problemDisplayText(
+      error.problem,
+      error.problem.detail?.trim() ||
+        error.problem.title ||
+        t("web.home.layout.transfer.requestFailed"),
+    );
   }
-  return error instanceof Error ? error.message : "request failed";
+  return error instanceof Error ? error.message : t("web.home.layout.transfer.requestFailed");
 }
 
 function downloadJson(fileName: string, blob: Blob) {
@@ -77,21 +83,17 @@ export function useHomeLayoutExport(): HomeLayoutExport {
   async function run() {
     if (!libraries) return;
     if (homePreferences.isError) {
-      toast.error(
-        "Couldn't read this profile's Home preferences, so the export would be incomplete. Reload the page and try again.",
-      );
+      toast.error(t("web.home.layout.transfer.preferencesFailed"));
       return;
     }
     if (librariesQuery.error) {
-      toast.error(
-        "Couldn't read which libraries this profile shows, so the export would fail. Reload the page and try again.",
-      );
+      toast.error(t("web.home.layout.transfer.librariesFailed"));
       return;
     }
     // Every read goes to the profile active now, even if it changes mid-export.
     const profileContext = captureProfileRequestContext();
     if (!profileContext) {
-      toast.error("Choose a profile before exporting its home layout.");
+      toast.error(t("web.home.layout.transfer.noProfile"));
       return;
     }
     setRunning(true);
@@ -102,11 +104,18 @@ export function useHomeLayoutExport(): HomeLayoutExport {
         ...libraries.map((library) => ({ scope: "library" as const, libraryId: library.id })),
       ];
       const pages = await readInBatches(sources, async (source) => {
-        const result = await v2("GET /api/v2/profile/sections", {
-          query: layoutPageQuery(source.scope, source.libraryId),
-          profileContext,
-        });
-        return { ...source, overrides: result.items };
+        const query = layoutPageQuery(source.scope, source.libraryId);
+        // The tokens are optional: without them the page still exports, and
+        // an import of it offers no rows to hide.
+        const [result, baseline] = await Promise.all([
+          v2("GET /api/v2/profile/sections", { query, profileContext }),
+          v2("GET /api/v2/profile/sections/baseline", { query, profileContext }).catch(() => null),
+        ]);
+        return {
+          ...source,
+          overrides: result.items,
+          serverSectionTokens: baseline?.section_tokens,
+        };
       });
       const exportedAt = new Date();
       const file = buildHomeLayoutFile({
@@ -118,15 +127,15 @@ export function useHomeLayoutExport(): HomeLayoutExport {
       });
       const blob = new Blob([`${JSON.stringify(file, null, 2)}\n`], { type: "application/json" });
       if (blob.size > HOME_LAYOUT_MAX_LENGTH) {
-        toast.error(
-          "This home layout is too large to export. Remove some custom sections and try again.",
-        );
+        toast.error(t("web.home.layout.transfer.tooLargeToExport"));
         return;
       }
       downloadJson(`silo-home-layout-${exportedAt.toISOString().slice(0, 10)}.json`, blob);
-      toast.success("Home layout exported");
+      toast.success(t("web.home.layout.transfer.exported"));
     } catch (error) {
-      toast.error(`Failed to export the home layout: ${layoutProblemMessage(error)}`);
+      toast.error(
+        t("web.home.layout.transfer.exportFailed", { reason: layoutProblemMessage(error) }),
+      );
     } finally {
       setRunning(false);
     }

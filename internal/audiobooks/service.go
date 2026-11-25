@@ -12,13 +12,14 @@ import (
 	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/recommendations"
 	"github.com/Silo-Server/silo-server/internal/scanner"
+	"github.com/Silo-Server/silo-server/internal/serversettings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // SettingsReader is the minimal slice of the server-settings store that
 // the audiobooks service needs. The production implementation is
-// internal/catalog.ServerSettingsRepo (or whatever silo names that helper at
+// internal/serversettings.ServerSettingsRepo (or whatever silo names that helper at
 // wiring time); tests pass a fake.
 type SettingsReader interface {
 	GetString(ctx context.Context, key string) (string, error)
@@ -45,7 +46,7 @@ type ABSHandlerDeps struct {
 	Pool     *pgxpool.Pool
 	Items    *catalog.ItemRepository
 	Files    *scanner.FileRepository
-	Settings catalog.SettingsStore // encrypting decorator in production
+	Settings serversettings.SettingsStore // encrypting decorator in production
 	// Auth signs ABS clients in and rechecks each token's profile. Nil
 	// leaves standalone login unavailable.
 	Auth           *SiloCredValidator
@@ -200,13 +201,24 @@ func (s *Service) BuildABSHandler(deps ABSHandlerDeps) *abs.Handler {
 		go func() {
 			ctx := context.Background()
 			time.Sleep(30 * time.Second) // let startup settle before the first refresh
-			if err := mediaStore.RefreshAuthorCounts(ctx); err != nil {
+			// Each node ticks, but RefreshAuthorCounts skips when any node
+			// refreshed within the last interval (less a minute of slack for
+			// ticker drift), so the cluster refreshes about once per interval.
+			const interval = 15 * time.Minute
+			// A refresh that outlives its interval is stuck; give up so the
+			// lock and its connection return to the pool.
+			refresh := func() error {
+				refreshCtx, cancel := context.WithTimeout(ctx, interval)
+				defer cancel()
+				return mediaStore.RefreshAuthorCounts(refreshCtx, interval-time.Minute)
+			}
+			if err := refresh(); err != nil {
 				slog.Warn("abs: initial author-count refresh failed", "err", err)
 			}
-			ticker := time.NewTicker(15 * time.Minute)
+			ticker := time.NewTicker(interval)
 			defer ticker.Stop()
 			for range ticker.C {
-				if err := mediaStore.RefreshAuthorCounts(ctx); err != nil {
+				if err := refresh(); err != nil {
 					slog.Warn("abs: author-count refresh failed", "err", err)
 				}
 			}

@@ -8,6 +8,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/api/handlers"
 	catalogpkg "github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/playback"
 )
 
 const opCheckCatalogVersions = "checkCatalogVersions"
@@ -25,6 +26,18 @@ type CatalogVersionsCheckInput struct {
 		// short bound, and reports what it established per file. Absent keeps
 		// the batched liveness answer exactly as it was.
 		Preprobe bool `json:"preprobe,omitempty" doc:"Ask for the single file's track inventory, enumerated synchronously under a short bound; requires exactly one file identifier"`
+		// PlayabilityOnly asks for the client-specific playability verdict
+		// without resolving provider pins. It is the cheap pass a detail page
+		// runs for every row before the viewer opens the picker; the ordinary
+		// liveness answer still reports the durable failed/missing signal.
+		PlayabilityOnly bool `json:"playability_only,omitempty" doc:"Report each row's durable health and client playability without resolving provider pins; requires client_capabilities and client_playback_context"`
+		// The client block is the same one a playback start carries, so the
+		// check plans each row with the production planner instead of a second
+		// notion of what the client can decode. Absent keeps the liveness-only
+		// answer and omits playability.
+		ClientFeatures        []string                            `json:"client_features,omitempty" doc:"The client's negotiated playback feature tokens, exactly as startPlayback sends them"`
+		ClientCapabilities    *playback.ClientCodecCapabilitiesV3 `json:"client_capabilities,omitempty" doc:"The client's codec capability block from startPlayback; presence enables the playability verdict"`
+		ClientPlaybackContext *playback.ClientPlaybackContextV3   `json:"client_playback_context,omitempty" doc:"The client's delivery and output context from startPlayback; presence enables the playability verdict"`
 	}
 }
 
@@ -56,6 +69,20 @@ type CatalogVersionCheckResult struct {
 	VideoTracks    []models.VideoTrack               `json:"video_tracks,omitempty" doc:"The row's video tracks; present only in the single-file inventory mode"`
 	AudioTracks    []models.AudioTrack               `json:"audio_tracks,omitempty" doc:"The row's audio tracks; present only in the single-file inventory mode"`
 	SubtitleTracks []catalogpkg.VersionSubtitleTrack `json:"subtitle_tracks,omitempty" doc:"The row's embedded and external subtitle tracks; present only in the single-file inventory mode"`
+	// Playability is the client-specific verdict when the request carried a
+	// client capability block. A false playable is a terminal the start would
+	// repeat; absent means unknown (no client block or an unfinished pass), so
+	// a client must keep the row selectable.
+	Playability *CatalogVersionPlayability `json:"playability,omitempty" doc:"Whether this client can play the row; absent when no client capability block was sent or the pass could not finish"`
+}
+
+// CatalogVersionPlayability is one version's client-specific playability
+// verdict. A false playable carries the terminal reason the start path would
+// answer, so a picker can disable the row and explain why.
+type CatalogVersionPlayability struct {
+	Playable bool   `json:"playable" doc:"True when the planner can play this row for the requesting client"`
+	Reason   string `json:"reason,omitempty" doc:"The start path's terminal reason when playable is false, for example hdr_transcode_unsupported"`
+	Message  string `json:"message,omitempty" doc:"The start path's user-facing terminal message when playable is false"`
 }
 
 // CatalogVersionsCheck is the checkCatalogVersions response body.
@@ -76,6 +103,14 @@ type catalogVersionsInventory interface {
 	CheckVersionsWithInventory(ctx context.Context, fileIDs []int) []handlers.VersionCheckResult
 }
 
+// catalogVersionsPlayability is the optional client-aware mode of the check
+// seam. *handlers.CatalogResourceHandler implements it; a seam that does not
+// keeps the liveness-only answer, and a request that needs the client verdict
+// is refused rather than answered without one.
+type catalogVersionsPlayability interface {
+	CheckVersionsWithPlayability(ctx context.Context, fileIDs []int, client handlers.VersionPlayabilityClient, resolveLiveness bool) []handlers.VersionCheckResult
+}
+
 // checkCatalogVersions adapts the shared CatalogResourceHandler liveness seam
 // to the v2 wire types. The operation has no required ordering against
 // playback: a client that never calls it starts and replans exactly as before.
@@ -93,8 +128,26 @@ func (reg *Registry) checkCatalogVersions(ctx context.Context, in *CatalogVersio
 		fileIDs = append(fileIDs, int(n))
 	}
 
-	check := svc.CheckVersions
-	if in.Body.Preprobe {
+	var playabilityClient *handlers.VersionPlayabilityClient
+	if in.Body.ClientCapabilities != nil && in.Body.ClientPlaybackContext != nil {
+		playabilityClient = &handlers.VersionPlayabilityClient{
+			ClientFeatures:  append([]string(nil), in.Body.ClientFeatures...),
+			Capabilities:    *in.Body.ClientCapabilities,
+			PlaybackContext: *in.Body.ClientPlaybackContext,
+		}
+	}
+	if in.Body.PlayabilityOnly && playabilityClient == nil {
+		return nil, NewProblem(TypeValidationFailed, "The request did not pass validation; see errors.").
+			WithErrors(ProblemError{Location: "body.playability_only", Code: codeInvalid, Detail: "playability_only requires client_capabilities and client_playback_context"})
+	}
+	if in.Body.Preprobe && playabilityClient != nil {
+		return nil, NewProblem(TypeValidationFailed, "The request did not pass validation; see errors.").
+			WithErrors(ProblemError{Location: "body.preprobe", Code: codeInvalid, Detail: "preprobe cannot be combined with a client capability block"})
+	}
+
+	var results []handlers.VersionCheckResult
+	switch {
+	case in.Body.Preprobe:
 		// The inventory mode enumerates one file's bytes under a short bound;
 		// a batch would multiply that wait, so it is a single-file mode.
 		if len(fileIDs) != 1 {
@@ -105,10 +158,19 @@ func (reg *Registry) checkCatalogVersions(ctx context.Context, in *CatalogVersio
 		if !ok {
 			return nil, unavailable("catalog")
 		}
-		check = inventory.CheckVersionsWithInventory
+		results = inventory.CheckVersionsWithInventory(ctx, fileIDs)
+	case playabilityClient != nil:
+		playability, ok := svc.(catalogVersionsPlayability)
+		if !ok {
+			return nil, unavailable("catalog")
+		}
+		// The detail page's cheap pass only needs the row and the client; a
+		// provider resolution proves the pin is listed, not that this client
+		// could play it.
+		results = playability.CheckVersionsWithPlayability(ctx, fileIDs, *playabilityClient, !in.Body.PlayabilityOnly)
+	default:
+		results = svc.CheckVersions(ctx, fileIDs)
 	}
-
-	results := check(ctx, fileIDs)
 	out := make([]CatalogVersionCheckResult, 0, len(results))
 	for _, result := range results {
 		item := CatalogVersionCheckResult{
@@ -128,6 +190,13 @@ func (reg *Registry) checkCatalogVersions(ctx context.Context, in *CatalogVersio
 			item.VideoTracks = result.Inventory.VideoTracks
 			item.AudioTracks = result.Inventory.AudioTracks
 			item.SubtitleTracks = result.Inventory.SubtitleTracks
+		}
+		if result.Playability != nil {
+			item.Playability = &CatalogVersionPlayability{
+				Playable: result.Playability.Playable,
+				Reason:   result.Playability.Reason,
+				Message:  result.Playability.Message,
+			}
 		}
 		out = append(out, item)
 	}

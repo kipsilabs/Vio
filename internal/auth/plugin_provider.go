@@ -31,6 +31,7 @@ type PluginProviderConfig struct {
 	CapabilityID   string
 	DisplayName    string
 	AutoProvision  bool
+	CallbackMode   string
 }
 
 type PluginProvider struct {
@@ -90,6 +91,10 @@ func (p *PluginProvider) authenticateCredentials(ctx context.Context, creds Cred
 	if err != nil {
 		return nil, 0, pluginCallError(ctx, p.config.InstallationID, "load", err)
 	}
+	fence, err := p.signInFence(ctx, linkingUserID)
+	if err != nil {
+		return nil, 0, err
+	}
 
 	response, err := client.Authenticate(ctx, &pluginv1.AuthenticateRequest{
 		Username: creds.Username,
@@ -98,21 +103,33 @@ func (p *PluginProvider) authenticateCredentials(ctx context.Context, creds Cred
 	if err != nil {
 		return nil, 0, pluginCallError(ctx, p.config.InstallationID, "authenticate", err)
 	}
-	return p.resolve(ctx, response, linkingUserID, false)
+	return p.resolve(ctx, response, linkingUserID, false, fence)
+}
+
+// signInFence takes the answer fence (takeAnswerFence) of a sign-in, before
+// the plugin is asked. A linking flow (linkingUserID > 0) takes none: it
+// never applies an answer to an identity that is already linked.
+func (p *PluginProvider) signInFence(ctx context.Context, linkingUserID int) (int64, error) {
+	if linkingUserID != 0 || p.resolver == nil || p.resolver.pool == nil {
+		return 0, nil
+	}
+	return takeAnswerFence(ctx, p.resolver.pool)
 }
 
 // CompleteOAuth runs the post-RPC half of plugin authentication for an
 // OAuth flow: the handler called the plugin's ExchangeCode itself and passes
 // the response in. linkingUserID is the signed-in account a linking flow
-// links to, 0 for an ordinary sign-in. It answers the account and the
-// identity the sign-in went through.
-func (p *PluginProvider) CompleteOAuth(ctx context.Context, response *pluginv1.AuthenticateResponse, linkingUserID int) (*models.User, int64, error) {
-	return p.resolve(ctx, response, linkingUserID, false)
+// links to, 0 for an ordinary sign-in. answerFence is the fence the handler
+// took before ExchangeCode (ResolveInput.AnswerFence). It answers the account
+// and the identity the sign-in went through.
+func (p *PluginProvider) CompleteOAuth(ctx context.Context, response *pluginv1.AuthenticateResponse, linkingUserID int, answerFence int64) (*models.User, int64, error) {
+	return p.resolve(ctx, response, linkingUserID, false, answerFence)
 }
 
 // resolve runs the plugin's answer through account resolution. network says
-// the answer is a network provider's (authenticatePeer).
-func (p *PluginProvider) resolve(ctx context.Context, response *pluginv1.AuthenticateResponse, linkingUserID int, network bool) (*models.User, int64, error) {
+// the answer is a network provider's (authenticatePeer); answerFence was
+// taken before the plugin was asked.
+func (p *PluginProvider) resolve(ctx context.Context, response *pluginv1.AuthenticateResponse, linkingUserID int, network bool, answerFence int64) (*models.User, int64, error) {
 	identity, err := externalIdentityFromResponse(ctx, p.config.InstallationID, response)
 	if err != nil {
 		return nil, 0, err
@@ -123,6 +140,7 @@ func (p *PluginProvider) resolve(ctx context.Context, response *pluginv1.Authent
 		Network:        network,
 		Identity:       identity,
 		LinkingUserID:  linkingUserID,
+		AnswerFence:    answerFence,
 	})
 }
 
@@ -132,6 +150,9 @@ func (p *PluginProvider) InstallationID() int { return p.config.InstallationID }
 
 // CapabilityID exposes the bound capability slug (e.g. "whmcs").
 func (p *PluginProvider) CapabilityID() string { return p.config.CapabilityID }
+
+// CallbackMode is the OAuth redirect mode for new flows.
+func (p *PluginProvider) CallbackMode() string { return p.config.CallbackMode }
 
 // OAuthClient returns a host-side gRPC client wrapping the plugin's
 // AuthProvider service. Used by the OAuth handler to call InitAuthorize

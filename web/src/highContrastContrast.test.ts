@@ -20,6 +20,8 @@ const THEMES = ["midnight-cinema"] as const;
 
 /** WCAG 2.1 AA for normal-size body text. */
 const AA_TEXT = 4.5;
+/** WCAG 2.1 AA for user-interface component boundaries (1.4.11). */
+const AA_NON_TEXT = 3;
 
 function themeBlock(theme: string): string {
   const match = new RegExp(String.raw`\[data-theme="${theme}"\] \{([\s\S]*?)\n {2}\}`).exec(css);
@@ -98,6 +100,25 @@ describe.each(THEMES)("high contrast on %s", (theme) => {
     const boosted = contrast(highContrastColor(body, "muted-foreground"), background);
     expect(boosted).toBeGreaterThanOrEqual(normal);
     expect(boosted).toBeGreaterThanOrEqual(AA_TEXT);
+  });
+
+  // --input is the only edge a text field, select, or unchecked switch has.
+  it.each(["background", "popover", "card"])(
+    "keeps form-control boundaries at 3:1 on --%s, with and without high contrast",
+    (surface) => {
+      const behind = token(body, surface);
+      expect(contrast(token(body, "input-base"), behind)).toBeGreaterThanOrEqual(AA_NON_TEXT);
+      expect(contrast(highContrastColor(body, "input"), behind)).toBeGreaterThanOrEqual(
+        AA_NON_TEXT,
+      );
+    },
+  );
+
+  // Red text sits on panels high contrast lightens; --surface-raised is the lightest.
+  it("keeps red text readable on the lightest surface", () => {
+    expect(
+      contrast(highContrastColor(body, "destructive"), highContrastColor(body, "surface-raised")),
+    ).toBeGreaterThanOrEqual(AA_TEXT);
   });
 
   it("does not make borders less visible than they already were", () => {

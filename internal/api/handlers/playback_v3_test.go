@@ -302,6 +302,90 @@ func TestHandleStartPlaybackV3TriesAlternateAfterHDRTerminal(t *testing.T) {
 	}
 }
 
+// An explicit version pick is the viewer's decision. When the picked release
+// cannot be planned for this client, the start must refuse with the version-list
+// hint instead of quietly playing a different resolution or dynamic range; the
+// auto selection beside it keeps the deliberate best-playable-version fallback.
+func TestHandleStartPlaybackV3KeepsAnExplicitVersionPick(t *testing.T) {
+	source := v3HandlerFixtureFile(t)
+	source.CodecVideo = "hevc"
+	source.Resolution = "2160p"
+	source.Bitrate = 32_000
+	source.VideoTracks[0] = models.VideoTrack{
+		Codec: "hevc", Profile: "main 10", Level: 150, Width: 3840, Height: 2160,
+		FrameRate: "24000/1001", Bitrate: 32_000, BitDepth: 10,
+		VideoRange: "DolbyVision", VideoRangeType: "DOVIWithHDR10", DVProfile: 8, DVBLCompatID: 1,
+	}
+	alternateValue := *source
+	alternate := &alternateValue
+	alternate.ID = 84
+	alternate.CodecVideo = "h264"
+	alternate.Resolution = "1080p"
+	alternate.Bitrate = 8_000
+	alternate.VideoTracks = []models.VideoTrack{{
+		Codec: "h264", Profile: "high", Level: 41, Width: 1920, Height: 1080,
+		FrameRate: "24000/1001", Bitrate: 8_000, BitDepth: 8, VideoRange: videoRangeSDR, VideoRangeType: videoRangeSDR,
+	}}
+
+	start := func(t *testing.T, selection playback.FileSelectionV3) playback.DecisionResponseV3 {
+		t.Helper()
+		handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), testPlaybackFileResolver{file: source})
+		handler.FileVersionFetcher = testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{
+			source.ContentID: {source, alternate},
+		}}
+		handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "false"}}
+		handler.PlaybackConfig = playbackTestConfig("", "")
+		handler.ItemAccess = allowAllPlaybackItemAccess{}
+
+		request := v3HandlerStartRequest()
+		request.QualityPreference = "auto"
+		request.FileSelection = selection
+		request.ClientPlaybackContext.Deliveries[playback.DeliveryClassHLSV3] = playback.DeliveryCapabilityV3{
+			Enabled: true, SupportedOnDevice: true, Containers: []string{"hls"},
+			VideoCodecs: []string{"h264"}, AudioDecodeCodecs: []string{"aac"},
+		}
+		rr := httptest.NewRecorder()
+		startPlaybackV2IntoRecorder(t, handler, rr, request)
+
+		var response playback.DecisionResponseV3
+		if rr.Code != http.StatusCreated || json.Unmarshal(rr.Body.Bytes(), &response) != nil {
+			t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+		}
+		return response
+	}
+
+	t.Run("explicit pick refuses instead of substituting", func(t *testing.T) {
+		response := start(t, playback.FileSelectionExplicitV3)
+		if response.PlaybackPlan != nil {
+			t.Fatalf("an explicit pick was silently served as file %d: plan=%#v", response.PlaybackPlan.EffectiveMediaFileID, response.PlaybackPlan)
+		}
+		if response.Terminal == nil || response.Terminal.Reason != terminalHDRTranscodeUnsupportedV3 {
+			t.Fatalf("terminal = %#v, want the HDR cause of the picked release", response.Terminal)
+		}
+		if !strings.Contains(response.Terminal.Message, "version list") {
+			t.Fatalf("terminal message = %q, want the version-list hint", response.Terminal.Message)
+		}
+	})
+
+	t.Run("auto selection still falls back", func(t *testing.T) {
+		response := start(t, playback.FileSelectionAutoV3)
+		if response.PlaybackPlan == nil {
+			t.Fatalf("auto selection did not fall back: %#v", response.Terminal)
+		}
+		if response.PlaybackPlan.EffectiveMediaFileID != alternate.ID {
+			t.Fatalf("effective file = %d, want the playable alternate %d", response.PlaybackPlan.EffectiveMediaFileID, alternate.ID)
+		}
+		// The auto fallback names its cause, so the client can say the picked
+		// version could not be played instead of that it disappeared.
+		if response.PlaybackPlan.SubstitutionReason != substitutionReasonVersionNotPlayableV3 {
+			t.Fatalf("substitution reason = %q, want %q", response.PlaybackPlan.SubstitutionReason, substitutionReasonVersionNotPlayableV3)
+		}
+		if response.PlaybackPlan.SubstitutedFromFileID != source.ID {
+			t.Fatalf("substituted_from_file_id = %d, want the requested row %d", response.PlaybackPlan.SubstitutedFromFileID, source.ID)
+		}
+	})
+}
+
 // A subtitle-only refusal at start must degrade in place on the release the
 // viewer selected, with the subtitle dropped, instead of hunting another
 // version. The alternate here carries a subtitle the refusal would not have
@@ -578,6 +662,16 @@ func TestHandleReplanPlaybackV3TriesLater4KAlternateAfterNon4KTerminal(t *testin
 			}
 			if replanned.PlaybackPlan.EffectiveMediaFileID != playable.ID {
 				t.Fatalf("effective file = %d, want later directly playable 4K alternate %d", replanned.PlaybackPlan.EffectiveMediaFileID, playable.ID)
+			}
+			// A replan that commits a release other than the row the viewer
+			// picked must report it on that replan's plan too, not only on the
+			// start plan: the client renders the notice from the plan it is
+			// about to play.
+			if replanned.PlaybackPlan.SubstitutedFromFileID != source.ID {
+				t.Fatalf("replan substituted_from_file_id = %d, want the requested row %d", replanned.PlaybackPlan.SubstitutedFromFileID, source.ID)
+			}
+			if replanned.PlaybackPlan.SubstitutionReason == "" {
+				t.Fatal("replan substitution_reason is empty; a substituted replan must name its cause")
 			}
 
 		})
@@ -3706,6 +3800,14 @@ func TestPrepareTransportTimelineV3StartsTranscodeAtResumePosition(t *testing.T)
 	if timeline.seekSeconds != 870 || timeline.startSegmentNumber != 435 {
 		t.Fatalf("resume timeline = %#v, want seek 870s at segment 435", timeline)
 	}
+	// The complete playlist begins at the same anchor, so the transport origin
+	// and the client's clock zero are that segment's source position.
+	if timeline.streamOriginSeconds != 870 || plan.Timeline.StreamOriginSeconds != 870 || plan.Timeline.TimelineOffsetSeconds != 870 {
+		t.Fatalf("resume origin = %v (plan %#v), want 870s", timeline.streamOriginSeconds, plan.Timeline)
+	}
+	if math.Abs(plan.Timeline.PlayerStartSeconds-0.6) > 0.0001 || plan.Timeline.SeekWindowStartSeconds == nil || *plan.Timeline.SeekWindowStartSeconds != 870 {
+		t.Fatalf("resume player timeline = %#v, want 0.6s inside an 870s-anchored window", plan.Timeline)
+	}
 }
 
 func TestConfigureHLSTimelineV3MatchesTransportSeekSemantics(t *testing.T) {
@@ -3723,12 +3825,28 @@ func TestConfigureHLSTimelineV3MatchesTransportSeekSemantics(t *testing.T) {
 		t.Fatalf("copy timeline=%#v", copyPlan.Timeline)
 	}
 
+	// A resume starts the generation at the seek anchor, so the complete VOD
+	// playlist begins there and the plan's clock zero is that anchor rather
+	// than the source start. A prefetch of the playlist's first entry then
+	// requests a segment this generation produces instead of one it never
+	// would.
 	encodePlan := &playback.PlanV3{Timeline: playback.TimelineV3{SourceStartSeconds: 17.3}}
 	encodeSeek, encodeSegment := configureHLSTimelineV3(encodePlan, "h264", 2, 600)
-	if encodeSeek != 16 || encodeSegment != 8 || encodePlan.Timeline.StreamOriginSeconds != 0 || encodePlan.Timeline.TimelineOffsetSeconds != 0 || encodePlan.Timeline.PlayerStartSeconds != 17.3 || !encodePlan.Timeline.CanSeekAnywhere ||
-		encodePlan.Timeline.SeekWindowStartSeconds != nil || encodePlan.Timeline.SeekWindowEndSeconds != nil ||
-		encodePlan.Timeline.SeekRestoration != "player_position" {
+	if encodeSeek != 16 || encodeSegment != 8 || encodePlan.Timeline.StreamOriginSeconds != 16 || encodePlan.Timeline.TimelineOffsetSeconds != 16 || math.Abs(encodePlan.Timeline.PlayerStartSeconds-1.3) > 0.0001 || encodePlan.Timeline.CanSeekAnywhere ||
+		encodePlan.Timeline.SeekWindowStartSeconds == nil || *encodePlan.Timeline.SeekWindowStartSeconds != 16 ||
+		encodePlan.Timeline.SeekWindowEndSeconds == nil || *encodePlan.Timeline.SeekWindowEndSeconds != 600 ||
+		encodePlan.Timeline.SeekRestoration != "source_position" {
 		t.Fatalf("encode timeline=%#v seek=%v segment=%d", encodePlan.Timeline, encodeSeek, encodeSegment)
+	}
+
+	// The source-start shape is unchanged: a position of zero keeps the
+	// historical whole-timeline playlist and its source-zero plan.
+	sourceStartPlan := &playback.PlanV3{Timeline: playback.TimelineV3{SourceStartSeconds: 0}}
+	sourceStartSeek, sourceStartSegment := configureHLSTimelineV3(sourceStartPlan, "h264", 2, 600)
+	if sourceStartSeek != 0 || sourceStartSegment != 0 || sourceStartPlan.Timeline.StreamOriginSeconds != 0 || sourceStartPlan.Timeline.TimelineOffsetSeconds != 0 || sourceStartPlan.Timeline.PlayerStartSeconds != 0 || !sourceStartPlan.Timeline.CanSeekAnywhere ||
+		sourceStartPlan.Timeline.SeekWindowStartSeconds != nil || sourceStartPlan.Timeline.SeekWindowEndSeconds != nil ||
+		sourceStartPlan.Timeline.SeekRestoration != "player_position" {
+		t.Fatalf("source-start timeline=%#v seek=%v segment=%d", sourceStartPlan.Timeline, sourceStartSeek, sourceStartSegment)
 	}
 
 	longEncodePlan := &playback.PlanV3{Timeline: playback.TimelineV3{SourceStartSeconds: 17.3}}
@@ -5876,6 +5994,98 @@ func TestHandleReplanPlaybackV3SeekReanchorReusesCopyHLSTransport(t *testing.T) 
 	}
 }
 
+// TestHandleReplanPlaybackV3SeekReanchorRebuildsBeforeTheRestartedWindow pins
+// the fix for a seek that restarts the generation in place: the restarted
+// generation begins at the forward target, so a later backward seek names a
+// position its playlist cannot produce. The plan still carries the window from
+// before the restart. Reusing that generation would hand the client a playlist
+// whose first segment is past the requested position, which is what clamped a
+// production playhead from 328 s forward to 931 s. The backward target is a new
+// window, so the transport must be rebuilt at it.
+func TestHandleReplanPlaybackV3SeekReanchorRebuildsBeforeTheRestartedWindow(t *testing.T) {
+	file := v3HandlerFixtureFile(t)
+	file.Container = "mkv"
+	file.FilePath = writePlaybackTestMediaFile(t, "movie.mkv")
+	file.ExternalSubtitles = []models.ExternalSubtitle{
+		{Path: writePlaybackTestMediaFile(t, "movie.de.srt"), Language: "de", Format: "srt"},
+	}
+	manager := playback.NewSessionManager(0, 0)
+	handler := NewPlaybackHandler(manager, testPlaybackFileResolver{file: file})
+	handler.PlaybackConfig = playbackTestConfig(writePlaybackTestFFmpeg(t), t.TempDir())
+	presetLocalRegistryV3(handler, playback.NewTransformationRegistryV3(nil))
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "true"}}
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	stubCopySeekAnchorV3(handler)
+
+	startRequest := v3HandlerStartRequest()
+	startRequest.Capabilities.Containers = []string{"m3u8"}
+	startRequest.ClientPlaybackContext.Deliveries = map[string]playback.DeliveryCapabilityV3{
+		playback.DeliveryClassHLSV3: {
+			Enabled: true, SupportedOnDevice: true,
+			Subtitles: playback.DeliverySubtitleCapabilitiesV3{SidecarText: true},
+		},
+	}
+	german := 0
+	startRequest.SubtitleTrackID = playback.TrackIDV3(file.ID, "subtitle", german)
+	startRequest.SubtitleTrackIndex = &german
+	startRR := httptest.NewRecorder()
+	handler.HandleStartPlayback(startRR, httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", strings.NewReader(marshalV3StartRequest(t, startRequest))).WithContext(newAuthorizedPlaybackContext()))
+	var started playback.DecisionResponseV3
+	if startRR.Code != http.StatusCreated || json.Unmarshal(startRR.Body.Bytes(), &started) != nil || started.PlaybackPlan == nil {
+		t.Fatalf("start status=%d body=%s", startRR.Code, startRR.Body.String())
+	}
+	if started.PlaybackPlan.Delivery != playback.DeliveryRemuxHLSV3 {
+		t.Fatalf("start plan = %#v, want copy HLS", started.PlaybackPlan)
+	}
+	before := handler.tm.GetTranscodeSession(started.SessionID)
+	if before == nil {
+		t.Fatal("start created no local HLS transport")
+	}
+	t.Cleanup(func() { handler.tm.CloseTranscodeSession(started.SessionID, "") })
+
+	// The forward seek the segment handler served: restart in place at segment
+	// 459 (source 918 s). The plan the client still holds keeps its old window.
+	if err := before.RestartWithCopySeekAnchor(context.Background(), 918, 459, 918); err != nil {
+		t.Fatalf("restart at the forward target: %v", err)
+	}
+	if got := before.SegmentProgress(time.Now()).StartSegmentNumber; got != 459 {
+		t.Fatalf("restarted generation starts at segment %d, want 459", got)
+	}
+
+	replanned := postPlaybackReplanV3(t, handler, started.SessionID, playback.ReplanRequestV3{
+		ProtocolVersion:       playback.ProtocolV3,
+		Operation:             playback.ReplanOperationSeekReanchorV3,
+		PlaybackAttemptID:     startRequest.PlaybackAttemptID,
+		ReplanRequestID:       "seek-reanchor-before-restart-0001",
+		FailedPlanID:          started.PlaybackPlan.PlanID,
+		PlanAttemptID:         "seek-reanchor-before-restart-attempt-0001",
+		PlanAttemptKey:        started.PlaybackPlan.PlanAttemptKey,
+		AttemptCount:          1,
+		QualityPreference:     startRequest.QualityPreference,
+		PositionSeconds:       328.1,
+		SelectedTracks:        started.PlaybackPlan.SelectedTracks,
+		Capabilities:          startRequest.Capabilities,
+		ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	})
+	if replanned.PlaybackPlan == nil {
+		t.Fatalf("seek reanchor returned no plan: outcome=%s terminal=%+v", replanned.Outcome, replanned.Terminal)
+	}
+	after := handler.tm.GetTranscodeSession(started.SessionID)
+	if after == before {
+		t.Fatal("seek reanchor reused the generation restarted at 918 s for a 328 s target")
+	}
+	if got := after.SegmentProgress(time.Now()).StartSegmentNumber; got != 164 {
+		t.Fatalf("rebuilt generation starts at segment %d, want 164 for 328.1 s", got)
+	}
+	timeline := replanned.PlaybackPlan.Timeline
+	if timeline.SeekWindowStartSeconds == nil {
+		t.Fatalf("rebuilt plan timeline = %#v, want a seek window at the target", timeline)
+	}
+	if got := *timeline.SeekWindowStartSeconds; got < 327 || got > 329 {
+		t.Fatalf("rebuilt plan seek window starts at %v, want the requested ~328.1 s", got)
+	}
+}
+
 // TestHandleReplanPlaybackV3SeekReanchorRebuildsProgressiveTransport pins the
 // fix for the in-place-seek regression: a server_remux_progressive response is
 // one continuous byte stream, not a segment-addressable manifest, so a
@@ -6326,6 +6536,7 @@ printf '%b' '` + manifest + `' > '` + filepath.Join(outputDir, "stream.m3u8") + 
 printf a > '` + filepath.Join(outputDir, "seg_00000.m4s") + `'
 printf b > '` + filepath.Join(outputDir, "seg_00001.m4s") + `'
 printf c > '` + filepath.Join(outputDir, "seg_00002.m4s") + `'
+printf 'frame=48\nout_time_us=4000000\nprogress=continue\n'
 exec sleep 30
 `
 	if err := os.WriteFile(ffmpegPath, []byte(script), 0o755); err != nil {
@@ -8903,7 +9114,7 @@ func writePlaybackTestFFmpegFailingForInputPattern(t *testing.T, failPattern str
 		"for arg in \"$@\"; do\n" +
 		"  case \"$arg\" in\n" +
 		"    *.m3u8) out=\"$(dirname \"$arg\")\"; mkdir -p \"$out\"; " +
-		"printf x > \"$out/init.mp4\"; printf x > \"$out/seg_0.m4s\"; " +
+		"printf '\\000\\000\\000\\010ftyp\\000\\000\\000\\010moov' > \"$out/init.mp4\"; printf x > \"$out/seg_0.m4s\"; " +
 		"printf x > \"$out/seg_1.m4s\"; printf x > \"$out/seg_2.m4s\"; " +
 		"printf '#EXTM3U\\n#EXT-X-VERSION:7\\n#EXT-X-TARGETDURATION:2\\n" +
 		"#EXT-X-MEDIA-SEQUENCE:0\\n#EXT-X-MAP:URI=\"init.mp4\"\\n" +
@@ -8911,6 +9122,7 @@ func writePlaybackTestFFmpegFailingForInputPattern(t *testing.T, failPattern str
 		"#EXTINF:2.0,\\nseg_2.m4s\\n' > \"$arg\" ;;\n" +
 		"  esac\n" +
 		"done\n" +
+		playbackTestFFmpegProgress +
 		"exec sleep 30\n"
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatalf("write conditional fake ffmpeg: %v", err)
@@ -9616,7 +9828,7 @@ func TestPrepareVirtualAlternateFileV3BindsOwnerInstallationAndResolvedURI(t *te
 	}
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil).WithContext(newAuthorizedPlaybackContext())
-	prepared, _, err := handler.prepareVirtualAlternateFileV3(req, virtualFile, "profile-test-1")
+	prepared, _, err := handler.prepareVirtualAlternateFileV3(req, virtualFile, "profile-test-1", true)
 	if err != nil {
 		t.Fatalf("prepareVirtualAlternateFileV3 failed: %v", err)
 	}
@@ -10322,13 +10534,14 @@ func writePlaybackTestFFmpegFailingOn(t *testing.T, failPattern string) (ffmpegP
 		"case \"$*\" in *'" + failPattern + "'*) echo 'intentional hardware failure' >&2; exit 1 ;; esac\n" +
 		"case \"$last\" in\n" +
 		"  *.m3u8) out=\"$(dirname \"$last\")\"; mkdir -p \"$out\"; " +
-		"printf x > \"$out/init.mp4\"; printf x > \"$out/seg_0.m4s\"; " +
+		"printf '\\000\\000\\000\\010ftyp\\000\\000\\000\\010moov' > \"$out/init.mp4\"; printf x > \"$out/seg_0.m4s\"; " +
 		"printf x > \"$out/seg_1.m4s\"; printf x > \"$out/seg_2.m4s\"; " +
 		"printf '#EXTM3U\\n#EXT-X-VERSION:7\\n#EXT-X-TARGETDURATION:2\\n" +
 		"#EXT-X-MEDIA-SEQUENCE:0\\n#EXT-X-MAP:URI=\"init.mp4\"\\n" +
 		"#EXTINF:2.0,\\nseg_0.m4s\\n#EXTINF:2.0,\\nseg_1.m4s\\n" +
 		"#EXTINF:2.0,\\nseg_2.m4s\\n' > \"$last\" ;;\n" +
 		"esac\n" +
+		playbackTestFFmpegProgress +
 		"exec sleep 30\n"
 	if err := os.WriteFile(ffmpegPath, []byte(script), 0o755); err != nil {
 		t.Fatalf("write fake ffmpeg: %v", err)
@@ -10359,6 +10572,14 @@ func autoNVENCPipelineSeamV3(t *testing.T) func(context.Context, playback.Transc
 
 func prepareAutoLocalTransportV3(t *testing.T, ffmpegPath, sessionID string) (*PlaybackHandler, preparedTransportV3, *transportErrorV3) {
 	t.Helper()
+	return prepareAutoLocalTransportV3InContext(t, context.Background(), ffmpegPath, sessionID)
+}
+
+// prepareAutoLocalTransportV3InContext is prepareAutoLocalTransportV3 under a
+// caller's deadline, so a test can run the hw_accel=auto walk inside the window
+// a virtual start reserves for it.
+func prepareAutoLocalTransportV3InContext(t *testing.T, ctx context.Context, ffmpegPath, sessionID string) (*PlaybackHandler, preparedTransportV3, *transportErrorV3) {
+	t.Helper()
 	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
 	transcodeDir := t.TempDir()
 	handler.PlaybackConfig = func() config.PlaybackConfig {
@@ -10371,7 +10592,7 @@ func prepareAutoLocalTransportV3(t *testing.T, ffmpegPath, sessionID string) (*P
 		PlayMethod: playback.PlayTranscode, TargetVideoCodec: "h264", TargetAudioCodec: "aac", TargetResolution: "720p",
 		SubtitleTrackIndex: -1, SubtitleTransportTrackIndex: -1,
 	}
-	request := httptest.NewRequest(http.MethodPost, "/", nil)
+	request := httptest.NewRequest(http.MethodPost, "/", nil).WithContext(ctx)
 	timeline, timelineErr := handler.prepareTransportTimelineV3(request.Context(), &playback.Session{ID: sessionID}, file, result)
 	if timelineErr != nil {
 		t.Fatalf("prepare timeline: %v", timelineErr)
@@ -10527,5 +10748,364 @@ func TestAttachSubtitleArtifactV3UsesFrozenDownloadedIdentityWithoutOrdinalLooku
 	}
 	if plan.Subtitle.Artifact == nil || !strings.Contains(plan.Subtitle.Artifact.URL, "downloaded_subtitle_id=71") {
 		t.Fatalf("artifact = %#v, want frozen downloaded subtitle 71", plan.Subtitle.Artifact)
+	}
+}
+
+// pausedVersionSwitchFixtureV3 is one movie with a 4K version and a 1080p
+// alternate, wired for HLS so the same paused playhead can be switched by the
+// manual quality menu or by an automatic bandwidth fallback. The alternate is
+// a real catalog row with its own file, so the switch moves the effective
+// media file rather than re-encoding the same bytes.
+type pausedVersionSwitchFixtureV3 struct {
+	handler   *PlaybackHandler
+	source    *models.MediaFile
+	alternate *models.MediaFile
+	start     playback.StartRequestV3
+}
+
+func newPausedVersionSwitchFixtureV3(t *testing.T) *pausedVersionSwitchFixtureV3 {
+	t.Helper()
+	source := uhdSourceFileV3(t)
+	source.Container = "mkv"
+	source.FilePath = writePlaybackTestMediaFile(t, "movie-uhd.mkv")
+	source.AudioTracks = []models.AudioTrack{
+		{Language: "en", Codec: "aac", Channels: 2, Layout: "stereo", Default: true},
+		{Language: "ja", Codec: "aac", Channels: 2, Layout: "stereo"},
+	}
+	alternate := lowerAlternateFileV3(source)
+	alternate.Container = "mkv"
+	alternate.FilePath = writePlaybackTestMediaFile(t, "movie-1080.mkv")
+	alternate.AudioTracks = source.AudioTracks
+
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), mapPlaybackFileResolver{files: map[int]*models.MediaFile{
+		source.ID: source, alternate.ID: alternate,
+	}})
+	handler.FileVersionFetcher = testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{
+		source.ContentID: {source, alternate},
+	}}
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{
+		"allow_4k_transcode": "false", "transcode_enabled": "true",
+	}}
+	handler.PlaybackConfig = playbackTestConfig(writePlaybackTestFFmpeg(t), t.TempDir())
+	presetLocalRegistryV3(handler, playback.NewTransformationRegistryV3([]playback.TransformationSpecV3{
+		{Name: playback.TransformationAudioToAACV3, RecipeVersion: playback.TransformationAudioToAACRecipeVersionV3, Available: true},
+		{Name: playback.TransformationVideoToH264V3, RecipeVersion: playback.TransformationVideoToH264RecipeVersionV3, Available: true},
+	}))
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	stubCopySeekAnchorV3(handler)
+
+	start := v3HandlerStartRequest()
+	start.FileID = source.ID
+	start.QualityPreference = playback.QualityAutoV3
+	start.Capabilities.MaxResolution = "2160p"
+	start.Capabilities.VideoDecode[0].Levels = []int{51}
+	start.Capabilities.VideoDecode[0].MaxWidth = 3840
+	start.Capabilities.VideoDecode[0].MaxHeight = 2160
+	start.Capabilities.VideoDecode[0].MaxBitrateKbps = 50_000
+	start.Capabilities.Containers = []string{"m3u8", "hls"}
+	start.ClientPlaybackContext.Deliveries = map[string]playback.DeliveryCapabilityV3{
+		playback.DeliveryClassHLSV3: {
+			Enabled: true, SupportedOnDevice: true, Containers: []string{"hls"},
+			VideoCodecs: []string{"h264"}, AudioDecodeCodecs: []string{"aac"},
+		},
+	}
+	return &pausedVersionSwitchFixtureV3{handler: handler, source: source, alternate: alternate, start: start}
+}
+
+// pausePlaybackAtV3 pauses a live session through the wire progress route, so
+// the pause is the same state a player reports rather than a manager shortcut.
+func pausePlaybackAtV3(t *testing.T, handler *PlaybackHandler, sessionID string, position float64) {
+	t.Helper()
+	body, err := json.Marshal(progressRequest{Position: position, IsPaused: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	handler.HandleUpdateProgress(rec, playbackTestRequest(
+		http.MethodPost, "/api/v1/playback/"+sessionID+"/progress", body,
+		map[string]string{"session_id": sessionID}))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("progress status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	live, err := handler.sessionMgr.GetSession(sessionID)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if !live.IsPaused || live.Position != position {
+		t.Fatalf("session pause/position = %v/%v, want paused at %v", live.IsPaused, live.Position, position)
+	}
+}
+
+// assertPausedPlayheadV3 pins the two invariants a version switch must not
+// break: the viewer's position and their paused state.
+func assertPausedPlayheadV3(t *testing.T, handler *PlaybackHandler, sessionID string, want float64) {
+	t.Helper()
+	live, err := handler.sessionMgr.GetSession(sessionID)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if !live.IsPaused {
+		t.Fatal("version switch resumed playback; the paused state was lost")
+	}
+	if live.Position != want {
+		t.Fatalf("position after switch = %v, want %v", live.Position, want)
+	}
+}
+
+func pausedVersionSwitchRequestV3(f *pausedVersionSwitchFixtureV3, started playback.DecisionResponseV3, id string, quality string, position float64) playback.ReplanRequestV3 {
+	return playback.ReplanRequestV3{
+		ProtocolVersion: playback.ProtocolV3, ClientFeatures: f.start.ClientFeatures,
+		Operation:         playback.ReplanOperationQualityChangeV3,
+		PlaybackAttemptID: f.start.PlaybackAttemptID, ReplanRequestID: id,
+		FailedPlanID: started.PlaybackPlan.PlanID, PlanAttemptID: id + "-attempt",
+		PlanAttemptKey: playback.PlanAttemptKeyV3(*started.PlaybackPlan, f.start.ClientPlaybackContext.Output.OutputContextID, nil),
+		AttemptCount:   1, QualityPreference: quality,
+		PositionSeconds: position, SelectedTracks: started.PlaybackPlan.SelectedTracks,
+		Capabilities:          f.start.Capabilities,
+		ClientPlaybackContext: f.start.ClientPlaybackContext,
+	}
+}
+
+// TestHandleReplanPlaybackV3VersionSwitchWhilePausedKeepsPlayheadAndPause covers
+// the highest-risk untested playback cell from the acceptance matrix: changing
+// the version while paused must keep the source position and the paused state,
+// must not tear down a healthy HLS generation merely because the viewer paused,
+// must reuse the session's HLS transport identity while rebuilding exactly one
+// generation for the new version, must resume a pinned progressive start at the
+// paused position, and must refuse a queued duplicate of the switch while that
+// switch owns the replan lease.
+func TestHandleReplanPlaybackV3VersionSwitchWhilePausedKeepsPlayheadAndPause(t *testing.T) { //nolint:funlen,gocyclo // the manual switch, pinned progressive start, automatic fallback, and queued-duplicate race share one paused fixture; splitting duplicates its setup.
+	const pausedAt = 100.0
+
+	t.Run("hls manual quality pick", func(t *testing.T) {
+		f := newPausedVersionSwitchFixtureV3(t)
+		started := startV3PlaybackForHandlerTest(t, f.handler, f.start)
+		t.Cleanup(func() { f.handler.tm.CloseTranscodeSession(started.SessionID, "") })
+		if started.PlaybackPlan == nil || started.PlaybackPlan.EffectiveMediaFileID != f.source.ID {
+			t.Fatalf("start plan = %#v terminal = %+v", started.PlaybackPlan, started.Terminal)
+		}
+		before := f.handler.tm.GetTranscodeSession(started.SessionID)
+		if before == nil {
+			t.Fatal("HLS start registered no transcode generation")
+		}
+		beforeToken := before.GenerationToken()
+
+		pausePlaybackAtV3(t, f.handler, started.SessionID, pausedAt)
+		if live := f.handler.tm.GetTranscodeSession(started.SessionID); live != before || live.GenerationToken() != beforeToken {
+			t.Fatal("pausing tore down or rebuilt the HLS generation")
+		}
+
+		next := postPlaybackReplanV3(t, f.handler, started.SessionID,
+			pausedVersionSwitchRequestV3(f, started, "paused-hls-version-0001", "1080p", 12))
+		if next.Terminal != nil {
+			t.Fatalf("switch terminal = %#v", next.Terminal)
+		}
+		plan := next.PlaybackPlan
+		if plan == nil || plan.EffectiveMediaFileID != f.alternate.ID {
+			t.Fatalf("switch plan = %#v, want the pinned 1080p version %d", plan, f.alternate.ID)
+		}
+		if plan.SessionID != started.SessionID || plan.Stream.URL != started.PlaybackPlan.Stream.URL {
+			t.Fatalf("switch changed session/url: %q/%q -> %q/%q",
+				started.SessionID, started.PlaybackPlan.Stream.URL, plan.SessionID, plan.Stream.URL)
+		}
+		if plan.Timeline.SourceStartSeconds != pausedAt {
+			t.Fatalf("switch source position = %v, want the live paused position %v (client echoed 12)", plan.Timeline.SourceStartSeconds, pausedAt)
+		}
+		assertPausedPlayheadV3(t, f.handler, started.SessionID, pausedAt)
+
+		after := f.handler.tm.GetTranscodeSession(started.SessionID)
+		if after == nil || after == before {
+			t.Fatal("version switch did not publish a replacement HLS generation")
+		}
+		if after.GenerationToken() == beforeToken || after.Opts().OutputDir == before.Opts().OutputDir {
+			t.Fatal("replacement generation reused the old bytes")
+		}
+		if after.Opts().StreamOriginSeconds != pausedAt {
+			t.Fatalf("replacement generation origin = %v, want %v", after.Opts().StreamOriginSeconds, pausedAt)
+		}
+		if want := computeStartSegment(pausedAt, after.Opts().SegmentDuration); after.Opts().StartSegmentNumber != want {
+			t.Fatalf("replacement generation start segment = %d, want %d", after.Opts().StartSegmentNumber, want)
+		}
+		if before.IsRunning() {
+			t.Fatal("the displaced generation is still running")
+		}
+		if retained := f.handler.tm.GetRetainedTranscodeSession(started.SessionID); retained != before {
+			t.Fatal("the displaced generation was not retired exactly once")
+		}
+	})
+
+	t.Run("pinned file start on the progressive route", func(t *testing.T) {
+		f := newPausedVersionSwitchFixtureV3(t)
+		f.start.ClientPlaybackContext.Deliveries = map[string]playback.DeliveryCapabilityV3{
+			playback.DeliveryClassOriginalHTTPV3: {
+				Enabled: true, SupportedOnDevice: true,
+				Subtitles: playback.DeliverySubtitleCapabilitiesV3{EmbeddedText: true, SidecarText: true},
+			},
+		}
+		f.start.Capabilities.Containers = []string{"mkv", "matroska"}
+		started := startV3PlaybackForHandlerTest(t, f.handler, f.start)
+		if started.PlaybackPlan == nil || started.PlaybackPlan.Delivery != playback.DeliveryOriginalHTTPV3 {
+			t.Fatalf("start plan = %#v terminal = %+v, want direct play", started.PlaybackPlan, started.Terminal)
+		}
+		pausePlaybackAtV3(t, f.handler, started.SessionID, pausedAt)
+
+		// The client's version switch is a fresh start pinned to the other
+		// file. It must resume at the paused position and stay on that exact
+		// file; an explicit pin is never substituted.
+		pinned := f.start
+		pinned.FileID = f.alternate.ID
+		pinned.PlaybackAttemptID = "paused-pinned-version-attempt-0002"
+		pinned.FileSelection = playback.FileSelectionExplicitV3
+		pinned.AllowAlternateVersions = new(false)
+		pinned.StartPosition = new(pausedAt)
+		pinned.CarriedAudioTrackID = started.PlaybackPlan.SelectedTracks.Audio.ID
+		switched := startV3PlaybackForHandlerTest(t, f.handler, pinned)
+		if switched.PlaybackPlan == nil {
+			t.Fatalf("pinned start terminal = %+v", switched.Terminal)
+		}
+		if switched.SessionID == started.SessionID {
+			t.Fatal("pinned version switch reused the old playback session")
+		}
+		if switched.PlaybackPlan.EffectiveMediaFileID != f.alternate.ID {
+			t.Fatalf("pinned switch file = %d, want %d", switched.PlaybackPlan.EffectiveMediaFileID, f.alternate.ID)
+		}
+		if switched.PlaybackPlan.Timeline.SourceStartSeconds != pausedAt {
+			t.Fatalf("pinned switch position = %v, want %v", switched.PlaybackPlan.Timeline.SourceStartSeconds, pausedAt)
+		}
+		if !strings.HasPrefix(switched.PlaybackPlan.Stream.URL, "/stream/"+switched.SessionID) {
+			t.Fatalf("pinned switch stream = %q, want the new session's direct stream", switched.PlaybackPlan.Stream.URL)
+		}
+	})
+
+	t.Run("hls automatic bandwidth fallback", func(t *testing.T) {
+		f := newPausedVersionSwitchFixtureV3(t)
+		f.start.ClientFeatures = append(f.start.ClientFeatures, playback.FeatureBufferingQualityV1)
+		started := startV3PlaybackForHandlerTest(t, f.handler, f.start)
+		t.Cleanup(func() { f.handler.tm.CloseTranscodeSession(started.SessionID, "") })
+		if started.PlaybackPlan == nil || started.PlaybackPlan.EffectiveMediaFileID != f.source.ID {
+			t.Fatalf("start plan = %#v terminal = %+v", started.PlaybackPlan, started.Terminal)
+		}
+		before := f.handler.tm.GetTranscodeSession(started.SessionID)
+		if before == nil {
+			t.Fatal("HLS start registered no transcode generation")
+		}
+		pausePlaybackAtV3(t, f.handler, started.SessionID, pausedAt)
+
+		request := pausedVersionSwitchRequestV3(f, started, "paused-auto-version-0001", playback.QualityAutoV3, 12)
+		capKbps := 4000
+		request.BandwidthCapKbps = &capKbps
+		request.BandwidthEstimateKbps = &capKbps
+		request.BandwidthEstimateSource = playback.BandwidthEstimateProbeV3
+		next := postPlaybackReplanV3(t, f.handler, started.SessionID, request)
+		if next.Terminal != nil {
+			t.Fatalf("automatic fallback terminal = %#v", next.Terminal)
+		}
+		plan := next.PlaybackPlan
+		if plan == nil || plan.EffectiveMediaFileID != f.alternate.ID {
+			t.Fatalf("automatic fallback plan = %#v, want the lower version %d", plan, f.alternate.ID)
+		}
+		if plan.Timeline.SourceStartSeconds != pausedAt {
+			t.Fatalf("automatic fallback source position = %v, want %v", plan.Timeline.SourceStartSeconds, pausedAt)
+		}
+		after := f.handler.tm.GetTranscodeSession(started.SessionID)
+		if after == nil || after == before || after.GenerationToken() == before.GenerationToken() {
+			t.Fatal("automatic fallback did not publish a replacement generation")
+		}
+		assertPausedPlayheadV3(t, f.handler, started.SessionID, pausedAt)
+	})
+
+	t.Run("queued duplicate is refused while the switch owns the lease", func(t *testing.T) {
+		f := newPausedVersionSwitchFixtureV3(t)
+		started := startV3PlaybackForHandlerTest(t, f.handler, f.start)
+		t.Cleanup(func() { f.handler.tm.CloseTranscodeSession(started.SessionID, "") })
+		if started.PlaybackPlan == nil {
+			t.Fatalf("start terminal = %+v", started.Terminal)
+		}
+		before := f.handler.tm.GetTranscodeSession(started.SessionID)
+		if before == nil {
+			t.Fatal("HLS start registered no generation")
+		}
+		beforeToken := before.GenerationToken()
+		pausePlaybackAtV3(t, f.handler, started.SessionID, pausedAt)
+
+		request := pausedVersionSwitchRequestV3(f, started, "paused-queued-version-0001", "1080p", 12)
+		raw, err := json.Marshal(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		store, ok := f.handler.PlanStoreV3.(*playback.MemoryPlanStoreV3)
+		if !ok {
+			t.Fatal("handler does not own the memory plan store")
+		}
+		record, err := store.GetAttempt(t.Context(), started.SessionID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The switch's own execution reserves this lease before planning; a
+		// request that arrives while it is held is the queued duplicate.
+		lease, err := store.BeginReplan(t.Context(), started.SessionID, request.ReplanRequestID,
+			ReplanDigestV3(raw), record.CurrentReplanRequestID, time.Now().Add(time.Minute))
+		if err != nil || lease.State != playback.ReplanLeaseOwnedV3 {
+			t.Fatalf("reserve switch lease: %#v %v", lease, err)
+		}
+		refused := servePlaybackReplanV3(f.handler, started.SessionID, raw)
+		if refused.Code != http.StatusConflict || !strings.Contains(refused.Body.String(), "replan_in_progress") {
+			t.Fatalf("queued duplicate = %d %s, want 409 replan_in_progress", refused.Code, refused.Body.String())
+		}
+		if live := f.handler.tm.GetTranscodeSession(started.SessionID); live != before || live.GenerationToken() != beforeToken {
+			t.Fatal("the refused duplicate rebuilt the transport")
+		}
+		assertPausedPlayheadV3(t, f.handler, started.SessionID, pausedAt)
+
+		if err := store.ReleaseReplan(t.Context(), started.SessionID, request.ReplanRequestID, lease.LeaseToken); err != nil {
+			t.Fatal(err)
+		}
+		next := postPlaybackReplanV3(t, f.handler, started.SessionID, request)
+		if next.Terminal != nil || next.PlaybackPlan == nil {
+			t.Fatalf("settled switch = %#v", next)
+		}
+		if next.PlaybackPlan.EffectiveMediaFileID != f.alternate.ID {
+			t.Fatalf("settled switch file = %d, want %d", next.PlaybackPlan.EffectiveMediaFileID, f.alternate.ID)
+		}
+		assertPausedPlayheadV3(t, f.handler, started.SessionID, pausedAt)
+	})
+}
+
+func TestNonSeekReplanPositionV3KeepsTheClientPlayheadFreshV3(t *testing.T) {
+	sessionMgr := playback.NewSessionManager(0, 0)
+	session, err := sessionMgr.StartSession(1, "profile-1", 7, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	// Progress posts arrive about every 10s. The viewer switches audio at
+	// 67.45s just after a report at 59.57s; the session position is the older
+	// sample, and preferring it rewound the replacement by ~10s.
+	if err := sessionMgr.UpdateProgress(session.ID, 59.56841, false); err != nil {
+		t.Fatalf("UpdateProgress: %v", err)
+	}
+	h := NewPlaybackHandler(sessionMgr)
+
+	cases := []struct {
+		name      string
+		requested float64
+		want      float64
+	}{
+		{name: "fresh client playhead wins over the last progress sample", requested: 67.449944, want: 67.449944},
+		{name: "a value behind the session is treated as stale", requested: 45, want: 59.56841},
+		{name: "a zero snapshot falls back to the session", requested: 0, want: 59.56841},
+		{name: "a rebuilt element at the route start falls back to the session", requested: 10, want: 59.56841},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := h.nonSeekReplanPositionV3(session.ID, tc.requested)
+			if got == nil || math.Abs(*got-tc.want) > 1e-6 {
+				t.Fatalf("position = %v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	// A session the client no longer names leaves the reported position intact.
+	if got := h.nonSeekReplanPositionV3("missing-session", 42.5); got == nil || *got != 42.5 {
+		t.Fatalf("missing session position = %v, want 42.5", got)
 	}
 }

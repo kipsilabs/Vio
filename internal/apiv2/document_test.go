@@ -267,6 +267,11 @@ func TestGeneratedDocumentStatuses(t *testing.T) {
 	for _, id := range []string{"listAdminDevices", "getAdminDevice", "getAdminDeviceCapabilities", "listAdminPlaybackSessions", "getAdminPlaybackSessionCapabilities", "listAdminNodeSessions", "getAdminPlaybackCommandCapabilities", "pauseAdminPlaybackSession", "resumeAdminPlaybackSession", "stopAdminPlaybackSession", "messageAdminPlaybackSession", "terminateAdminPlaybackSession"} {
 		profileToken[id] = true
 	}
+	// Disconnecting a sign-in is held to the household manager (#3967): both
+	// identity operations are profile scoped, so the optional X-Profile-Token
+	// is documented.
+	profileToken["listAccountIdentities"] = true
+	profileToken["deleteAccountIdentity"] = true
 	profileToken["getUserLibraryCapabilities"] = true
 	for _, id := range []string{"getOnboardingFlow", "getOnboardingState", "updateOnboardingProgress", "getOnboardingCapabilities"} {
 		profileToken[id] = true
@@ -426,6 +431,9 @@ func TestGeneratedDocumentStatuses(t *testing.T) {
 		"reportPlaybackBandwidthProbe", "resetAdminDeviceLearnedLimit", "resetApplePushInstallation",
 		"resetRequestDiscoverLayout", "searchCatalogBoxSets", "updateAdminAIProvider",
 		"updateRequestDiscoverLayout", "uploadAdminItemImage", "uploadAdminOverlayImage",
+		"getAdminPluginCapabilities", "listAdminPluginProvisioningStatus",
+		"getAdminDirectConnectionsCapabilities", "getAdminDirectConnectionsStatus",
+		"getAdminRequestPoster", "getProfileSectionBaseline",
 	} {
 		profileToken[id] = true
 	}

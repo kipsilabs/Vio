@@ -204,6 +204,7 @@ func TestEnsureTranscodeSessionDoesNotHoldLifecycleLockWhileWaitingForManifest(t
 		"eval \"last=\\\"\\${$#}\\\"\"\n" +
 		"if [ \"$last\" = '-' ]; then exit 0; fi\n" +
 		"touch " + startedMarker + "\n" +
+		compatTestFFmpegProgress +
 		"exec sleep 30\n"
 	if err := os.WriteFile(ffmpegPath, []byte(ffmpegScript), 0o755); err != nil {
 		t.Fatal(err)
@@ -315,6 +316,7 @@ func TestEnsureTranscodeSessionGivesSoftwareFallbackFreshManifestBudget(t *testi
 		"mkdir -p \"$out\"\n" +
 		"for name in seg_00000.m4s seg_00001.m4s seg_00002.m4s; do printf segment > \"$out/$name\"; done\n" +
 		"printf '#EXTM3U\\n#EXT-X-TARGETDURATION:2\\n#EXT-X-MEDIA-SEQUENCE:0\\n#EXTINF:2,\\nseg_00000.m4s\\n#EXTINF:2,\\nseg_00001.m4s\\n#EXTINF:2,\\nseg_00002.m4s\\n' > \"$out/stream.m3u8\"\n" +
+		compatTestFFmpegProgress +
 		"exec sleep 30\n"
 	if err := os.WriteFile(ffmpegPath, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
@@ -567,22 +569,29 @@ func TestBuildProxyRedirectURLCarriesMPEGTSForRemoteCopyRecipe(t *testing.T) {
 	}
 }
 
-// The proxy remux adds aac_adtstoasc for a copied AAC track, and that filter
-// rejects every other codec, so the token names the copied track's codec.
+// The proxy remux and fMP4 HLS copy add aac_adtstoasc for a copied AAC track,
+// and that filter rejects every other codec, so the token names the copied
+// track's codec.
 func TestBuildProxyRedirectURLCarriesCopiedRemuxAudioCodec(t *testing.T) {
 	h := &PlaybackHandler{JWTSecret: "test-secret"}
 	for _, test := range []struct {
 		name           string
+		method         playback.PlayMethod
+		hlsRemux       bool
 		codec          string
 		transcodeAudio bool
 		want           string
 	}{
-		{name: "copied ac3", codec: "ac3", want: "ac3"},
-		{name: "copied aac", codec: "aac", want: "aac"},
-		{name: "ac3 encoded to aac", codec: "ac3", transcodeAudio: true, want: ""},
+		{name: "copied ac3", method: playback.PlayRemux, codec: "ac3", want: "ac3"},
+		{name: "copied aac", method: playback.PlayRemux, codec: "aac", want: "aac"},
+		{name: "ac3 encoded to aac", method: playback.PlayRemux, codec: "ac3", transcodeAudio: true, want: ""},
+		{name: "hls copy keeps aac", method: playback.PlayTranscode, hlsRemux: true, codec: "aac", want: "aac"},
+		{name: "hls copy encodes ac3 to aac", method: playback.PlayTranscode, hlsRemux: true, codec: "ac3", transcodeAudio: true, want: ""},
+		{name: "hls video transcode encodes aac", method: playback.PlayTranscode, codec: "aac", want: ""},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			source := PlaybackMediaSource{
+				HLSRemux:       test.hlsRemux,
 				TranscodeAudio: test.transcodeAudio,
 				Version: catalog.FileVersion{
 					VideoTracks: []models.VideoTrack{{Codec: "h264"}},
@@ -590,19 +599,19 @@ func TestBuildProxyRedirectURLCarriesCopiedRemuxAudioCodec(t *testing.T) {
 				},
 			}
 			redirectURL, err := h.buildProxyRedirectURL(
-				"play-1", "upstream-1", string(playback.PlayRemux),
+				"play-1", "upstream-1", string(test.method),
 				&models.MediaFile{FilePath: "/media/movie.ts"}, source, nil, time.Time{},
 				"", 0, &nodepool.Node{URL: "http://proxy-1"}, netaccess.Path{},
 			)
 			if err != nil {
 				t.Fatal(err)
 			}
-			claims, err := streamtoken.Verify(proxyTokenFromRedirect(t, redirectURL, string(playback.PlayRemux)), h.JWTSecret)
+			claims, err := streamtoken.Verify(proxyTokenFromRedirect(t, redirectURL, string(test.method)), h.JWTSecret)
 			if err != nil {
 				t.Fatal(err)
 			}
 			if claims.CopyAudioCodec != test.want {
-				t.Fatalf("remux proxy token copied audio codec = %q, want %q", claims.CopyAudioCodec, test.want)
+				t.Fatalf("proxy token copied audio codec = %q, want %q", claims.CopyAudioCodec, test.want)
 			}
 		})
 	}

@@ -3,6 +3,7 @@ package playback
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -77,6 +78,27 @@ type EmbeddedSubtitleSource interface {
 	// demux began. It may move the copy's file; the caller removes the file
 	// if it is still there.
 	KeepDemuxed(ctx context.Context, path string, ref EmbeddedSubtitleRef, demuxCopy DemuxCopy, srcSize int64, srcModTime time.Time) error
+}
+
+// The node admits at most subtitleDemuxSlots whole-track demuxes at once,
+// beside the streams reading beside them. A run past the bound is refused
+// with ErrSubtitleReadsBusy, not queued, even when the response has already
+// started (a fill's viewer finishing on its own, a WebVTT header sent ahead):
+// that response ends as a failed demux would. Warms run in their warm slots
+// instead, and AI translation in its job slots.
+const subtitleDemuxSlots = 4
+
+var subtitleDemuxes = make(chan struct{}, subtitleDemuxSlots)
+
+// admitDemux takes one of the process's demux slots, or refuses with
+// ErrSubtitleReadsBusy when none is free. release gives it back.
+func admitDemux() (release func(), err error) {
+	select {
+	case subtitleDemuxes <- struct{}{}:
+		return func() { <-subtitleDemuxes }, nil
+	default:
+		return nil, ErrSubtitleReadsBusy
+	}
 }
 
 // ErrSubtitleReadsBusy means the node already admits as many whole-track
@@ -235,6 +257,7 @@ func (c *SubtitleCache) serveWindowFromSource(ctx context.Context, w io.Writer, 
 			"file_id", opts.Embedded.MediaFileID, "stream_index", opts.Embedded.StreamIndex, "error", err)
 		return false, nil
 	}
+	recordSubtitleServeSourceFor(subtitleServeSourceExtract, IsPGS(opts.SourceCodec))
 	return true, err
 }
 
@@ -271,6 +294,59 @@ func hasCue(format string, data []byte) bool {
 		return bytes.Contains(data, []byte("\nDialogue:")) //nolint:misspell // the ASS event keyword
 	}
 	return len(data) > 0
+}
+
+// subtitleWindowCacheable reports whether a finished window extraction is worth
+// keeping as the last-good copy. SUP needs a complete display set rather than
+// any byte (see supHasDisplaySet); the text formats reuse the cue probe above.
+func subtitleWindowCacheable(format string, data []byte) bool {
+	if len(data) == 0 {
+		return false
+	}
+	if format == subtitleFormatSUP {
+		return supHasDisplaySet(data)
+	}
+	return hasCue(format, data)
+}
+
+// PGS segment header: magic "PG", PTS, DTS, segment type, payload size.
+const supSegmentHeaderLen = 13
+
+// PGS segment types that open and close a display set.
+const (
+	supSegmentPCS = 0x16
+	supSegmentEND = 0x80
+)
+
+// supHasDisplaySet reports whether a .sup payload holds one complete display
+// set. A PGS stream is a sequence of segments, each a 13-byte header
+// (magic "PG", PTS, DTS, type, size) and a payload; a display set opens with a
+// PCS and closes with an END segment. An extraction cut at a window boundary or
+// killed mid-page ends inside a set: it has segments but no complete one, and a
+// decoder given it paints nothing. Storing such a slice as the last-good page
+// would answer every later request inside the range with bytes that never draw.
+func supHasDisplaySet(data []byte) bool {
+	open := false
+	for len(data) >= supSegmentHeaderLen {
+		if data[0] != 'P' || data[1] != 'G' {
+			return false
+		}
+		kind := data[10]
+		size := int(binary.BigEndian.Uint16(data[11:13]))
+		if len(data) < supSegmentHeaderLen+size {
+			return false
+		}
+		switch kind {
+		case supSegmentPCS:
+			open = true
+		case supSegmentEND:
+			if open {
+				return true
+			}
+		}
+		data = data[supSegmentHeaderLen+size:]
+	}
+	return false
 }
 
 // hasTimedText reports whether a WebVTT or SubRip document has a timing line
@@ -333,6 +409,92 @@ func (s *spillWriter) finish() error {
 		f.Flush()
 	}
 	return nil
+}
+
+// subtitleResponseHold holds a windowed response until its extract finishes, so a
+// slice that was cut short (the extract deadline, a canceled request) can be
+// dropped instead of committed. Once the held bytes pass the limit the response
+// streams and the hold stops protecting it, which bounds the memory one slice can
+// pin and keeps a pathologically large window from stalling behind a full buffer.
+//
+// It forwards Flush only after the response is committed, and it never writes a
+// header of its own: the caller sets the content type before the extract runs, and
+// the first real write commits the status.
+type subtitleResponseHold struct {
+	w         http.ResponseWriter
+	limit     int
+	buf       bytes.Buffer
+	committed bool
+}
+
+func newSubtitleResponseHold(w http.ResponseWriter, limit int) *subtitleResponseHold {
+	if limit < 0 {
+		limit = 0
+	}
+	return &subtitleResponseHold{w: w, limit: limit}
+}
+
+func (h *subtitleResponseHold) Write(p []byte) (int, error) {
+	if !h.committed && h.buf.Len()+len(p) <= h.limit {
+		return h.buf.Write(p)
+	}
+	if err := h.commit(); err != nil {
+		return 0, err
+	}
+	return h.w.Write(p)
+}
+
+// commit writes the held bytes, which commits the response status.
+func (h *subtitleResponseHold) commit() error {
+	if h.committed {
+		return nil
+	}
+	h.committed = true
+	if h.buf.Len() == 0 {
+		return nil
+	}
+	held := h.buf.Bytes()
+	h.buf = bytes.Buffer{}
+	_, err := h.w.Write(held)
+	return err
+}
+
+// finish commits what is held and flushes it.
+func (h *subtitleResponseHold) finish() error {
+	if err := h.commit(); err != nil {
+		return err
+	}
+	if f, ok := h.w.(http.Flusher); ok {
+		f.Flush()
+	}
+	return nil
+}
+
+// discard drops the held bytes without writing them. It is a no-op once the
+// response is committed, where nothing can be taken back.
+func (h *subtitleResponseHold) discard() {
+	if h.committed {
+		return
+	}
+	h.buf = bytes.Buffer{}
+}
+
+// delivered reports whether any byte reached the response, i.e. whether the
+// slice spilled past the hold and the status is already committed. A held slice
+// that never spilled was never delivered and can still be answered with an
+// error.
+func (h *subtitleResponseHold) delivered() bool {
+	return h != nil && h.committed
+}
+
+// Flush passes a flush on only once the response streams.
+func (h *subtitleResponseHold) Flush() {
+	if !h.committed {
+		return
+	}
+	if f, ok := h.w.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 // demuxAndKeep runs today's demux of the whole source. When the source can

@@ -1,13 +1,12 @@
-import type { ReactNode } from "react";
+import { useId, type ReactNode } from "react";
 import { useImageLoaded } from "@/hooks/useImageLoaded";
 import { Pin, PinOff, User } from "lucide-react";
 import type { LibraryTabCollection } from "@/api/types";
 import ViewTransitionLink from "@/components/ViewTransitionLink";
 import { useToggleSidebarPin } from "@/hooks/queries/sidebarPins";
-import {
-  buildLibraryCollectionCatalogHref,
-  buildUserCollectionCatalogHref,
-} from "@/pages/catalogSearchParams";
+import { useT } from "@/i18n";
+import { formatLocale } from "@/lib/appLocale";
+import { buildCollectionCatalogHref } from "@/pages/catalogSearchParams";
 
 // Shared poster card for the per-library Collections tab and every section of
 // the Collections page. Library (admin) collections get a sidebar-pin
@@ -21,6 +20,7 @@ export function CollectionPosterCard({
   tag,
   menu,
   handle,
+  pinnable = true,
 }: {
   collection: LibraryTabCollection;
   kind: "regular" | "user_collections";
@@ -36,24 +36,40 @@ export function CollectionPosterCard({
   menu?: ReactNode;
   /** A drag handle over the poster's top-left corner. */
   handle?: ReactNode;
+  /** A server collection's card offers to pin it to the sidebar. */
+  pinnable?: boolean;
 }) {
+  const t = useT();
   const { loaded, onLoad, onError } = useImageLoaded(collection.poster_url);
 
   const isUserCollection = kind === "user_collections";
-  const href = isUserCollection
-    ? buildUserCollectionCatalogHref(collection.id, collection.title)
-    : buildLibraryCollectionCatalogHref(collection.id, collection.title, libraryId);
+  const showPin = pinnable && !isUserCollection && libraryId !== undefined;
+  const href = buildCollectionCatalogHref(collection, isUserCollection, libraryId);
   // A card with its own meta line draws it below the link instead.
   let subline: ReactNode = null;
   if (ownerName) {
-    subline = <div className="text-muted-foreground truncate text-xs">by {ownerName}</div>;
+    subline = (
+      <div className="text-muted-foreground flex overflow-hidden text-xs whitespace-pre">
+        {t("web.collections.posterCard.byOwner", {
+          owner: (
+            <span dir="auto" className="truncate">
+              {ownerName}
+            </span>
+          ),
+        })}
+      </div>
+    );
   } else if (meta === undefined && isUserCollection) {
-    subline = <div className="text-muted-foreground text-xs">User collection</div>;
+    subline = (
+      <div className="text-muted-foreground text-xs">
+        {t("web.collections.posterCard.userCollection")}
+      </div>
+    );
   }
 
   return (
-    <div className="group/card relative w-full text-left">
-      <ViewTransitionLink to={href} className="block w-full text-left">
+    <div className={`group/card relative w-full text-start ${handle ? "@container/poster" : ""}`}>
+      <ViewTransitionLink to={href} className="block w-full text-start">
         <div className="media-card-image relative aspect-[2/3] overflow-hidden rounded-xl">
           {collection.poster_url ? (
             <img
@@ -73,27 +89,50 @@ export function CollectionPosterCard({
               className="text-muted-foreground flex h-full w-full flex-col items-center justify-center gap-1 p-3 text-center text-sm"
             >
               {isUserCollection && <User className="h-5 w-5 opacity-60" />}
-              <span className="line-clamp-3 font-medium">{collection.title}</span>
+              {/* The spacers keep the title below the pin (top-2 plus a 36 px chip)
+                  and above the count. With them the title never shrinks, so on a
+                  card too short for all of it the spacers give way first. */}
+              {showPin ? <div className="h-7 shrink" /> : null}
+              <span
+                dir="auto"
+                className={`bidi-text line-clamp-3 font-medium ${showPin ? "shrink-0" : ""}`}
+              >
+                {collection.title}
+              </span>
+              {showPin && meta === undefined ? <div className="h-3 shrink" /> : null}
             </div>
           )}
           {meta === undefined ? (
-            <span className="bg-background/60 text-foreground absolute right-2 bottom-2 rounded-md px-2 py-0.5 text-[0.6875rem] font-bold backdrop-blur-sm">
-              {collection.item_count}
+            <span className="bg-background/60 text-foreground absolute end-2 bottom-2 rounded-md px-2 py-0.5 text-[0.6875rem] font-bold backdrop-blur-sm">
+              {collection.item_count.toLocaleString(formatLocale())}
             </span>
           ) : null}
         </div>
         <div className="px-0.5 pt-2.5">
-          <div className="truncate text-[0.8125rem] font-semibold">{collection.title}</div>
+          <div dir="auto" className="bidi-text truncate text-[0.8125rem] font-semibold">
+            {collection.title}
+          </div>
           {subline}
         </div>
       </ViewTransitionLink>
       {meta !== undefined ? <div className="px-0.5">{meta}</div> : null}
       {tag ? <div className="px-0.5 pt-1.5">{tag}</div> : null}
-      {menu ? <div className="absolute top-2 right-2 z-10">{menu}</div> : null}
-      {handle ? <div className="absolute top-2 left-2 z-10">{handle}</div> : null}
-      {!isUserCollection && libraryId !== undefined ? (
-        <SidebarPinButton collection={collection} libraryId={libraryId} />
+      {/* With a handle, the two corner chips share the top edge; on the
+          narrowest cards (about 88 px on a 320 px phone, or wider ones under
+          a larger text size, since the chips scale with it) a tighter inset
+          keeps a gap between them. Only a card with a handle is the poster
+          container, so the menu keeps its inset everywhere else. */}
+      {menu ? (
+        <div className="absolute end-2 top-2 z-10 @max-[6rem]/poster:end-1.5 @max-[6rem]/poster:top-1.5">
+          {menu}
+        </div>
       ) : null}
+      {handle ? (
+        <div className="absolute start-2 top-2 z-10 @max-[6rem]/poster:start-1.5 @max-[6rem]/poster:top-1.5">
+          {handle}
+        </div>
+      ) : null}
+      {showPin ? <SidebarPinButton collection={collection} libraryId={libraryId} /> : null}
     </div>
   );
 }
@@ -106,28 +145,41 @@ function SidebarPinButton({
   collection: LibraryTabCollection;
   libraryId: number;
 }) {
+  const t = useT();
   const { togglePin, isPinned, canToggle } = useToggleSidebarPin();
+  const titleId = useId();
   if (!canToggle) return null;
   const pinned = isPinned(libraryId, "collection", collection.id);
+  const pinLabel = pinned
+    ? t("web.collections.posterCard.unpinFromSidebar")
+    : t("web.collections.posterCard.pinToSidebar");
   return (
-    <button
-      type="button"
-      onClick={(e) => {
-        e.stopPropagation();
-        togglePin(libraryId, {
-          type: "collection",
-          id: collection.id,
-          label: collection.title,
-        });
-      }}
-      className={`absolute top-2 left-2 rounded-lg p-1.5 backdrop-blur-sm transition-all ${
-        pinned
-          ? "bg-primary/90 text-primary-foreground"
-          : "bg-background/50 text-foreground opacity-0 group-hover/card:opacity-100"
-      }`}
-      title={pinned ? "Unpin from sidebar" : "Pin to sidebar"}
-    >
-      {pinned ? <PinOff className="h-3.5 w-3.5" /> : <Pin className="h-3.5 w-3.5" />}
-    </button>
+    <>
+      <span id={titleId} hidden>
+        {collection.title}
+      </span>
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation();
+          togglePin(libraryId, {
+            type: "collection",
+            id: collection.id,
+            label: collection.title,
+          });
+        }}
+        // The dark poster chip of the collection actions menu, at the same size.
+        className={`absolute start-2 top-2 flex size-8 items-center justify-center rounded-[10px] backdrop-blur-sm transition-all max-lg:size-9 ${
+          pinned
+            ? "bg-primary/90 text-primary-foreground"
+            : "pointer-reveal bg-black/55 text-white group-hover/card:opacity-100 hover:bg-black/70"
+        }`}
+        title={pinLabel}
+        aria-label={pinLabel}
+        aria-describedby={titleId}
+      >
+        {pinned ? <PinOff className="size-4" /> : <Pin className="size-4" />}
+      </button>
+    </>
   );
 }

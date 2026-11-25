@@ -5,13 +5,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
-	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/Silo-Server/silo-server/internal/catalog"
+
+	"github.com/Silo-Server/silo-server/internal/secret"
 )
 
 var ErrInstallationNotFound = errors.New("plugin installation not found")
@@ -23,6 +27,15 @@ var ErrArchiveNotFound = errors.New("plugin archive not found")
 var ErrArchiveUnreadable = errors.New("stored plugin archive is unreadable")
 
 var ErrInstallationDisabled = errors.New("plugin installation is disabled")
+
+// ErrInstallationChanged refuses a write guarded on the installation's state
+// (UpdateInstallationInput.IfVersion or IfInstallPath) after another install
+// or update changed that state.
+var ErrInstallationChanged = errors.New("plugin installation changed since it was read")
+
+// ErrPluginAlreadyInstalled refuses a new installation of a plugin that
+// another install created first; a plugin has at most one installation.
+var ErrPluginAlreadyInstalled = errors.New("plugin is already installed")
 
 // ErrBuiltinInstallationImmutable is returned when a caller tries to mutate
 // the reserved builtin-host installation row (delete, update, config, ...).
@@ -51,6 +64,21 @@ type Installation struct {
 	CreatedAt         time.Time
 	UpdatedAt         time.Time
 	RuntimeGeneration int64 `json:"-"`
+	// UpdateFailure is the last automatic update Silo refused to apply, or
+	// nil. A changed installed version or a later pass that does not fail
+	// clears it.
+	UpdateFailure *UpdateFailure `json:"-"`
+	// Signature is the release signature check of the installed package,
+	// recorded when it was installed and never re-run.
+	Signature Signature `json:"-"`
+}
+
+// UpdateFailure records an automatic update that was refused. Reason is
+// written for the admin and carries no URL, checksum or credential.
+type UpdateFailure struct {
+	Version  string
+	Reason   string
+	FailedAt time.Time
 }
 
 // IsBuiltin reports whether this is the reserved builtin-host installation.
@@ -77,6 +105,8 @@ type InstallationArchive struct {
 }
 
 type CreateInstallationInput struct {
+	// Automatic changes require authority that full restore can withhold.
+	automatic    bool
 	RepositoryID int
 	PluginID     string
 	Version      string
@@ -84,15 +114,23 @@ type CreateInstallationInput struct {
 	Enabled      bool
 	UpdatePolicy string
 	Capabilities []Capability
+	// Signature is the package's release signature check. A zero value
+	// records unknown.
+	Signature Signature
+	// Archive is the package stored in plugin_archives, written with the row.
+	Archive ArchiveInput
 }
 
 type UpdateInstallationInput struct {
-	Version            *string
-	InstallPath        *string
-	Enabled            *bool
-	UpdatePolicy       *string
-	AvailableVersion   *string
-	Capabilities       []Capability
+	// Automatic changes require authority that full restore can withhold.
+	automatic        bool
+	Version          *string
+	InstallPath      *string
+	Enabled          *bool
+	UpdatePolicy     *string
+	AvailableVersion *string
+	Capabilities     []Capability
+	// RemoveVirtualMedia drops the virtual media rows an installation provided.
 	RemoveVirtualMedia bool
 	// Restart durably requests a new process on every resident host.
 	Restart bool
@@ -100,10 +138,40 @@ type UpdateInstallationInput struct {
 	// comes from. A nil RepositoryID clears it, as for an uploaded package.
 	SetRepository bool
 	RepositoryID  *int
+	// UpdateFailure records a refused automatic update; ClearUpdateFailure
+	// removes the record. Setting Version also removes it, since the record
+	// is about updating from the version that was installed.
+	UpdateFailure      *UpdateFailure
+	ClearUpdateFailure bool
+	// Signature, when set, replaces the recorded release signature check, as
+	// when a new package replaces the installed one.
+	Signature *Signature
+	// Archive, when set, replaces the stored package in the same transaction
+	// as the row, so the two never name different releases.
+	Archive *ArchiveInput
+	// IfVersion and IfInstallPath, when set, apply the update only while the
+	// row still holds that version and install path; otherwise nothing is
+	// written and Update returns ErrInstallationChanged. A replacement guards
+	// on the install path it was prepared against, so one that finishes after
+	// another install can't overwrite it, and an update check guards its
+	// refusal record so it can't land on a newer version.
+	IfVersion     *string
+	IfInstallPath *string
+	// Clearing an update notice guards the notice read from this release.
+	ifAvailableVersion *string
+}
+
+// ArchiveInput is a package for the installation's plugin_archives row.
+type ArchiveInput struct {
+	ManifestJSON []byte
+	Checksum     string
+	Bytes        []byte
 }
 
 type InstallationStore struct {
-	pool installationDB
+	archiveCache *ArchiveCache
+	pool         installationDB
+	cipher       *secret.Cipher
 }
 
 // installationDB is a pool or a caller's transaction: Begin on a
@@ -116,26 +184,33 @@ type installationDB interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
-func NewInstallationStore(pool *pgxpool.Pool) *InstallationStore {
+func NewInstallationStore(pool *pgxpool.Pool, ciphers ...*secret.Cipher) *InstallationStore {
 	if pool == nil {
 		return &InstallationStore{}
 	}
-	return &InstallationStore{pool: pool}
+	store := &InstallationStore{pool: pool}
+	if len(ciphers) > 0 {
+		store.cipher = ciphers[0]
+	}
+	return store
 }
 
 // WithTx returns a store whose reads and writes run in tx, so an
 // installation commits or rolls back with the caller's other writes.
 func (s *InstallationStore) WithTx(tx pgx.Tx) *InstallationStore {
-	return &InstallationStore{pool: tx}
+	return &InstallationStore{pool: tx, cipher: s.cipher}
 }
 
-const installationColumns = `id, repository_id, plugin_id, version, install_path, enabled, kind, update_policy, available_version, created_at, updated_at, runtime_generation`
+const installationColumns = `id, repository_id, plugin_id, version, install_path, enabled, kind, update_policy, available_version, created_at, updated_at, runtime_generation, update_failed_version, update_failure_reason, update_failed_at, signature_state, signature_source_repo, signature_verified_at`
 const capabilityColumns = `plugin_installation_id, capability_type, capability_id, metadata, created_at, updated_at`
 const archiveColumns = `plugin_installation_id, manifest_json, checksum, archive_bytes, created_at, updated_at`
 
 func scanInstallation(row pgx.Row) (*Installation, error) {
 	var installation Installation
 	var repositoryID *int
+	var failedVersion, failureReason *string
+	var failedAt *time.Time
+	var signatureState string
 	if err := row.Scan(
 		&installation.ID,
 		&repositoryID,
@@ -149,6 +224,12 @@ func scanInstallation(row pgx.Row) (*Installation, error) {
 		&installation.CreatedAt,
 		&installation.UpdatedAt,
 		&installation.RuntimeGeneration,
+		&failedVersion,
+		&failureReason,
+		&failedAt,
+		&signatureState,
+		&installation.Signature.SourceRepo,
+		&installation.Signature.VerifiedAt,
 	); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrInstallationNotFound
@@ -156,6 +237,10 @@ func scanInstallation(row pgx.Row) (*Installation, error) {
 		return nil, fmt.Errorf("scanning plugin installation: %w", err)
 	}
 	installation.RepositoryID = repositoryID
+	installation.Signature.State = SignatureState(signatureState)
+	if failedVersion != nil && failureReason != nil && failedAt != nil {
+		installation.UpdateFailure = &UpdateFailure{Version: *failedVersion, Reason: *failureReason, FailedAt: *failedAt}
+	}
 	return &installation, nil
 }
 
@@ -206,19 +291,30 @@ func scanArchive(row pgx.Row) (*InstallationArchive, error) {
 	return &archive, nil
 }
 
+// Create writes a new installation with its capabilities and stored package
+// in one transaction. A plugin that already has an installation is
+// ErrPluginAlreadyInstalled.
 func (s *InstallationStore) Create(ctx context.Context, input CreateInstallationInput) (*Installation, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("begin create installation transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	if err := admitPluginInstallationChange(ctx, tx, input.automatic); err != nil {
+		return nil, err
+	}
 
 	updatePolicy := input.UpdatePolicy
 	if updatePolicy == "" {
 		updatePolicy = "auto"
 	}
-	query := `INSERT INTO plugin_installations (repository_id, plugin_id, version, install_path, enabled, update_policy)
-		VALUES ($1, $2, $3, $4, $5, $6)
+	signatureState := input.Signature.State
+	if signatureState == "" {
+		signatureState = SignatureStateUnknown
+	}
+	query := `INSERT INTO plugin_installations (repository_id, plugin_id, version, install_path, enabled, update_policy,
+			signature_state, signature_source_repo, signature_verified_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		RETURNING ` + installationColumns
 	installation, err := scanInstallation(tx.QueryRow(
 		ctx,
@@ -229,12 +325,22 @@ func (s *InstallationStore) Create(ctx context.Context, input CreateInstallation
 		input.InstallPath,
 		input.Enabled,
 		updatePolicy,
+		string(signatureState),
+		input.Signature.SourceRepo,
+		input.Signature.VerifiedAt,
 	))
 	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "idx_plugin_installations_plugin_id" {
+			return nil, ErrPluginAlreadyInstalled
+		}
 		return nil, fmt.Errorf("creating plugin installation: %w", err)
 	}
 
 	if err := s.replaceCapabilities(ctx, tx, installation.ID, input.Capabilities); err != nil {
+		return nil, err
+	}
+	if err := saveArchive(ctx, tx, installation.ID, input.Archive.ManifestJSON, input.Archive.Checksum, input.Archive.Bytes); err != nil {
 		return nil, err
 	}
 
@@ -317,29 +423,102 @@ func (s *InstallationStore) ListByPluginID(ctx context.Context, pluginID string)
 }
 
 func (s *InstallationStore) Update(ctx context.Context, id int, input UpdateInstallationInput) error {
-	// Guard at the store, not only the HTTP handler: the reserved builtin row
-	// carries no archive/binary and must never have its version, path, enabled
-	// flag, or capabilities rewritten, or its chain participation breaks.
-	installation, err := s.GetByID(ctx, id)
+	return s.update(ctx, id, input, false)
+}
+
+// updateProvisioned is reserved for the declaration writer, which checks
+// package and binding eligibility for the entire declaration in its transaction.
+func (s *InstallationStore) updateProvisioned(ctx context.Context, id int, input UpdateInstallationInput) error {
+	return s.update(ctx, id, input, true)
+}
+
+func (s *InstallationStore) update(ctx context.Context, id int, input UpdateInstallationInput, provisioning bool) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin update installation transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := admitPluginInstallationChange(ctx, tx, input.automatic); err != nil {
+		return err
+	}
+
+	touchesBindings := input.Enabled != nil || input.Capabilities != nil
+	if touchesBindings && !provisioning {
+		if err := lockAuthBindings(ctx, tx); err != nil {
+			return err
+		}
+	}
+	if err := lockPluginInstallation(ctx, tx, id); err != nil {
+		return err
+	}
+	installation, err := s.WithTx(tx).GetByID(ctx, id)
 	if err != nil {
 		return err
 	}
 	if installation.IsBuiltin() {
 		return ErrBuiltinInstallationImmutable
 	}
+	if !input.matches(installation) {
+		return ErrInstallationChanged
+	}
 
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("begin update installation transaction: %w", err)
+	if !provisioning {
+		if err := s.guardInstallationUpdate(ctx, tx, installation, input); err != nil {
+			return err
+		}
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	if input.RemoveVirtualMedia {
-		if _, err := catalog.RemoveVirtualMediaInstallation(ctx, tx, id); err != nil {
-			return fmt.Errorf("removing replaced virtual media: %w", err)
+	if err := removeVirtualMediaIfReplaced(ctx, tx, id, input.RemoveVirtualMedia); err != nil {
+		return err
+	}
+
+	// Peers can miss both sides of a disable/enable cycle. Advance the runtime
+	// even if the final enabled value matches what their last poll read.
+	if input.Enabled != nil && *input.Enabled != installation.Enabled {
+		input.Restart = true
+	}
+	setClauses, args := installationUpdateClauses(input)
+
+	// A guarded write always runs the row update, so the guard also holds
+	// for an Archive or Capabilities write that changes no column.
+	if len(setClauses) > 0 || input.IfVersion != nil || input.IfInstallPath != nil {
+		if err := updateInstallationRow(ctx, tx, id, input, setClauses, args); err != nil {
+			return err
 		}
 	}
 
+	if a := input.Archive; a != nil {
+		if err := saveArchive(ctx, tx, id, a.ManifestJSON, a.Checksum, a.Bytes); err != nil {
+			return err
+		}
+	}
+
+	if input.Capabilities != nil {
+		if err := s.replaceCapabilities(ctx, tx, id, input.Capabilities); err != nil {
+			return err
+		}
+	}
+
+	if !provisioning && (input.Capabilities != nil || (input.Enabled != nil && *input.Enabled)) {
+		if err := validateInstallationAuthBindings(ctx, tx, id); err != nil {
+			return err
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit update installation transaction: %w", err)
+	}
+	return nil
+}
+
+func (input UpdateInstallationInput) matches(installation *Installation) bool {
+	return (input.IfVersion == nil || *input.IfVersion == installation.Version) &&
+		(input.IfInstallPath == nil || *input.IfInstallPath == installation.InstallPath) &&
+		(input.ifAvailableVersion == nil || (installation.AvailableVersion != nil && *input.ifAvailableVersion == *installation.AvailableVersion))
+}
+
+func installationUpdateClauses(input UpdateInstallationInput) ([]string, []any) {
 	var setClauses []string
 	var args []any
 	argIndex := 1
@@ -377,32 +556,55 @@ func (s *InstallationStore) Update(ctx context.Context, id int, input UpdateInst
 		args = append(args, input.RepositoryID)
 		argIndex++
 	}
-
-	if len(setClauses) > 0 {
-		setClauses = append(setClauses, "updated_at = NOW()")
-		args = append(args, id)
-		query := fmt.Sprintf(
-			"UPDATE plugin_installations SET %s WHERE id = $%d",
-			strings.Join(setClauses, ", "),
-			argIndex,
-		)
-		tag, err := tx.Exec(ctx, query, args...)
-		if err != nil {
-			return fmt.Errorf("updating plugin installation: %w", err)
+	if sig := input.Signature; sig != nil {
+		state := sig.State
+		if state == "" {
+			state = SignatureStateUnknown
 		}
-		if tag.RowsAffected() == 0 {
-			return ErrInstallationNotFound
-		}
+		setClauses = append(setClauses, fmt.Sprintf("signature_state = $%d, signature_source_repo = $%d, signature_verified_at = $%d", argIndex, argIndex+1, argIndex+2))
+		args = append(args, string(state), sig.SourceRepo, sig.VerifiedAt)
+		argIndex += 3
+	}
+	switch {
+	case input.UpdateFailure != nil:
+		setClauses = append(setClauses, fmt.Sprintf("update_failed_version = $%d, update_failure_reason = $%d, update_failed_at = $%d", argIndex, argIndex+1, argIndex+2))
+		args = append(args, input.UpdateFailure.Version, input.UpdateFailure.Reason, input.UpdateFailure.FailedAt)
+		argIndex += 3
+	case input.ClearUpdateFailure || input.Version != nil:
+		setClauses = append(setClauses, "update_failed_version = NULL, update_failure_reason = NULL, update_failed_at = NULL")
 	}
 
-	if input.Capabilities != nil {
-		if err := s.replaceCapabilities(ctx, tx, id, input.Capabilities); err != nil {
-			return err
-		}
-	}
+	return setClauses, args
+}
 
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit update installation transaction: %w", err)
+// updateInstallationRow runs one installation row update with setClauses,
+// whose placeholders take args, under input's IfVersion and IfInstallPath
+// guards.
+func updateInstallationRow(ctx context.Context, tx pgx.Tx, id int, input UpdateInstallationInput, setClauses []string, args []any) error {
+	setClauses = append(setClauses, "updated_at = NOW()")
+	args = append(args, id)
+	where := fmt.Sprintf("id = $%d", len(args))
+	guarded := false
+	if input.IfVersion != nil {
+		args = append(args, *input.IfVersion)
+		where += fmt.Sprintf(" AND version = $%d", len(args))
+		guarded = true
+	}
+	if input.IfInstallPath != nil {
+		args = append(args, *input.IfInstallPath)
+		where += fmt.Sprintf(" AND install_path = $%d", len(args))
+		guarded = true
+	}
+	query := fmt.Sprintf("UPDATE plugin_installations SET %s WHERE %s", strings.Join(setClauses, ", "), where)
+	tag, err := tx.Exec(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("updating plugin installation: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		if guarded {
+			return ErrInstallationChanged
+		}
+		return ErrInstallationNotFound
 	}
 	return nil
 }
@@ -481,6 +683,10 @@ func (s *InstallationStore) SaveArchive(
 	checksum string,
 	archiveBytes []byte,
 ) error {
+	return saveArchive(ctx, s.pool, installationID, manifestJSON, checksum, archiveBytes)
+}
+
+func saveArchive(ctx context.Context, db installationDB, installationID int, manifestJSON []byte, checksum string, archiveBytes []byte) error {
 	if len(manifestJSON) == 0 {
 		return fmt.Errorf("saving plugin archive: manifest JSON is required")
 	}
@@ -497,7 +703,7 @@ func (s *InstallationStore) SaveArchive(
 			checksum = EXCLUDED.checksum,
 			archive_bytes = EXCLUDED.archive_bytes,
 			updated_at = NOW()`
-	tag, err := s.pool.Exec(ctx, query, installationID, manifestJSON, checksum, archiveBytes)
+	tag, err := db.Exec(ctx, query, installationID, manifestJSON, checksum, archiveBytes)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23503" {
@@ -516,41 +722,73 @@ func (s *InstallationStore) GetArchive(ctx context.Context, installationID int) 
 	return scanArchive(s.pool.QueryRow(ctx, query, installationID))
 }
 
+// archiveForRelease pairs the archive with the installation snapshot even
+// when a concurrent replacement uses the same manifest version.
+func (s *InstallationStore) archiveForRelease(ctx context.Context, installation *Installation) (*InstallationArchive, error) {
+	query := `SELECT ` + archiveColumns + ` FROM plugin_archives WHERE plugin_installation_id = $1
+		AND EXISTS (SELECT 1 FROM plugin_installations WHERE id = $1 AND version = $2 AND install_path = $3)`
+	archive, err := scanArchive(s.pool.QueryRow(ctx, query, installation.ID, installation.Version, installation.InstallPath))
+	if errors.Is(err, ErrArchiveNotFound) {
+		current, readErr := s.GetByID(ctx, installation.ID)
+		if errors.Is(readErr, ErrInstallationNotFound) || readErr == nil &&
+			(current.Version != installation.Version || current.InstallPath != installation.InstallPath) {
+			return nil, ErrInstallationChanged
+		}
+	}
+	return archive, err
+}
+
+// repairArchive persists a reconstructed legacy zip only while its original
+// archive still exists. It may race a replacement or an uninstall.
+func (s *InstallationStore) repairArchive(ctx context.Context, original *InstallationArchive, archive []byte) error {
+	_, err := s.pool.Exec(ctx, `UPDATE plugin_archives SET archive_bytes = $2, updated_at = NOW()
+		WHERE plugin_installation_id = $1 AND updated_at = $3 AND archive_bytes = $4`,
+		original.InstallationID, archive, original.UpdatedAt, original.Bytes)
+	return err
+}
+
 func (s *InstallationStore) Delete(ctx context.Context, id int) error {
-	installation, err := s.GetByID(ctx, id)
+	var installation *Installation
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := lockAuthBindings(ctx, tx); err != nil {
+			return err
+		}
+		if err := lockPluginInstallation(ctx, tx, id); err != nil {
+			return err
+		}
+		var err error
+		installation, err = s.WithTx(tx).GetByID(ctx, id)
+		if err != nil {
+			return err
+		}
+		if installation.IsBuiltin() {
+			return ErrBuiltinInstallationImmutable
+		}
+		ownership, err := LoadProvisionOwnership(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		if ownership.Managed {
+			return &ManagedByEnvironmentError{Field: managedInstallationField}
+		}
+		// Vio keeps virtual media core-owned: deleting an installation drops the
+		// rows it provided, in the same transaction.
+		if err := removeVirtualMediaForInstallation(ctx, tx, id); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM plugin_installations WHERE id = $1`, id); err != nil {
+			return fmt.Errorf("deleting plugin installation: %w", err)
+		}
+		return nil
+	})
 	if err != nil {
 		return err
 	}
-	// Guard at the store, not only the HTTP handler: deleting the reserved
-	// builtin row would cascade through every builtin chain row and RemoveAll
-	// the (sentinel) install dir.
-	if installation.IsBuiltin() {
-		return ErrBuiltinInstallationImmutable
-	}
 
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("begin delete plugin installation transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
-	if _, err := catalog.RemoveVirtualMediaInstallation(ctx, tx, id); err != nil {
-		return fmt.Errorf("removing virtual media for plugin installation: %w", err)
-	}
-
-	tag, err := tx.Exec(ctx, `DELETE FROM plugin_installations WHERE id = $1`, id)
-	if err != nil {
-		return fmt.Errorf("deleting plugin installation: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		return ErrInstallationNotFound
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit delete plugin installation transaction: %w", err)
-	}
-
-	if err := removeInstallationFiles(ctx, installation); err != nil {
-		return fmt.Errorf("removing plugin installation files: %w", err)
+	if _, inTx := s.pool.(pgx.Tx); !inTx {
+		if err := s.archiveCache.retire(installation, nil); err != nil {
+			slog.WarnContext(ctx, "remove uninstalled plugin files", "component", "plugins", "installation_id", id, "error", err)
+		}
 	}
 
 	return nil
@@ -597,4 +835,23 @@ func nilIfZero(value int) *int {
 		return nil
 	}
 	return &value
+}
+
+// removeVirtualMediaIfReplaced drops the virtual media rows a replaced
+// installation provided, when the caller asked for it.
+func removeVirtualMediaIfReplaced(ctx context.Context, tx pgx.Tx, id int, replaced bool) error {
+	if !replaced {
+		return nil
+	}
+	return removeVirtualMediaForInstallation(ctx, tx, id)
+}
+
+// removeVirtualMediaForInstallation drops the virtual media rows an
+// installation provided. Vio keeps virtual media core-owned, so the rows go in
+// the same transaction as the installation write.
+func removeVirtualMediaForInstallation(ctx context.Context, tx pgx.Tx, id int) error {
+	if _, err := catalog.RemoveVirtualMediaInstallation(ctx, tx, id); err != nil {
+		return fmt.Errorf("removing virtual media for plugin installation: %w", err)
+	}
+	return nil
 }

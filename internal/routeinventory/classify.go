@@ -42,10 +42,14 @@ const (
 
 // Auth classes, from least to most privileged.
 const (
-	authPublic          = "public"
-	authOptional        = "optional_auth"
-	authAuthenticated   = "authenticated"
-	authNodeBearer      = "node_bearer"
+	authPublic        = "public"
+	authOptional      = "optional_auth"
+	authAuthenticated = "authenticated"
+	authNodeBearer    = "node_bearer"
+	// authNodeSigned admits only a transcode node signing with its own key
+	// (nodecontrol.RequireNode). node_bearer is the other direction: a node's
+	// listener admitting API servers and proxies.
+	authNodeSigned      = "node_signed"
 	authProfileScoped   = "profile_scoped"
 	authPermissionGated = "permission_gated"
 	authActingAdmin     = "acting_admin"
@@ -521,6 +525,12 @@ func (c *classifier) evidenceForBody(body *ast.BlockStmt, pkg *pkgSource, origin
 			evidence.responseRedirect = true
 		case (qualified == "net/http.ServeContent" || qualified == "net/http.ServeFile" || qualified == "io.Copy" || qualified == "io.CopyN" || qualified == "io.CopyBuffer") && first&outgoingWriter != 0:
 			evidence.responseBinary = true
+		case qualified == c.set.modulePath+"/internal/playback.ServeSegmentLease" && first&outgoingWriter != 0:
+			// The segment handlers hand their writer to this helper, which
+			// serves the file through http.ServeContent after wrapping it. The
+			// wrapper hides the writer origin from the descent below, so the
+			// helper is named here as the binary answer it is.
+			evidence.responseBinary = true
 		case name == methodServeHTTP && args&outgoingWriter != 0:
 			evidence.responseBinary = true
 		case (name == "Upgrade" || name == "Accept") && args&outgoingWriter != 0 && args&incomingRequest != 0:
@@ -788,6 +798,7 @@ var authRules = []authRule{
 	{marker: markerDisplayMiddlewares, class: authProfileScoped, trait: traitProfileReq, rank: 40},
 	{marker: "RequireAuth", class: authAuthenticated, trait: traitAuthenticated, rank: 30},
 	{marker: "requireBearer", class: authNodeBearer, trait: "node_bearer", rank: 30},
+	{marker: "RequireNode", class: authNodeSigned, trait: "node_signed", rank: 30},
 	{marker: "OptionalAuth", class: authOptional, trait: "optional_auth", rank: 20},
 }
 
@@ -796,6 +807,9 @@ var authRules = []authRule{
 var traitOnlyRules = []authRule{
 	{marker: "RateLimitMW", trait: traitRateLimited},
 	{marker: "AuthEndpointHandler", trait: traitRateLimited},
+	// The per-node budgets on the node control routes (LimitNode and
+	// LimitNodePlayback, which the marker matches too).
+	{marker: "LimitNode", trait: traitRateLimited},
 	{marker: "demoGuard", trait: "demo_guarded"},
 	{marker: "meterEgress", trait: "egress_metered"},
 	{marker: "cors.Handler", trait: "cors"},
@@ -840,6 +854,9 @@ var infrastructureMiddleware = []string{
 	// apimw.ProvideActingAdmin only makes the acting-admin decision available
 	// to handlers (apimw.ActingAdmin); it admits and refuses nothing itself.
 	"apimw.ProvideActingAdmin",
+	// httpstream.NoSniff sets one response header on every response; it
+	// admits and refuses nothing.
+	"httpstream.NoSniff",
 }
 
 func classifyAuth(middleware []string) (string, []string) {

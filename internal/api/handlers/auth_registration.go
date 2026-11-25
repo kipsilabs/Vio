@@ -115,7 +115,7 @@ func (h *AuthHandler) Refresh(ctx context.Context, refreshToken string) (Refresh
 // ListSessions lists every retained login session of the caller, active,
 // revoked and expired alike. v1 GET /auth/sessions calls it.
 func (h *AuthHandler) ListSessions(ctx context.Context, userID int) ([]*models.AuthSession, error) {
-	sessions, err := h.service.GetSessions(ctx, userID)
+	sessions, err := h.service.GetSessionsPage(ctx, userID, nil, 500)
 	if err != nil {
 		return nil, apiError(http.StatusInternalServerError, "internal_error", "An unexpected error occurred")
 	}

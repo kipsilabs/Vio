@@ -43,7 +43,9 @@ func (f *fakeAdminTasks) StartTask(key string) (taskmanager.TaskInfo, error) {
 	info.State = taskmanager.TaskStateRunning
 	return info, nil
 }
-func (f *fakeAdminTasks) CancelTask(string) error { return nil }
+func (f *fakeAdminTasks) CancelTask(string) (taskmanager.TaskInfo, error) {
+	return taskmanager.TaskInfo{}, nil
+}
 func (f *fakeAdminTasks) GetSchedule(context.Context, string) (taskmanager.Schedule, error) {
 	f.reads++
 	return f.schedule, nil
@@ -547,5 +549,25 @@ func TestTaskExecutionExposesMaintenanceStepsWithoutErrors(t *testing.T) {
 	other := taskExecutionOf(taskmanager.ExecutionResult{TaskKey: "match_media", ResultData: result.ResultData})
 	if other.Steps != nil {
 		t.Fatalf("Steps for another task = %+v, want none", other.Steps)
+	}
+}
+
+func TestTaskExecutionErrorMessage(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		status  string
+		message string
+		want    string
+	}{
+		{name: "failure text stays private", status: "failed", message: "dial tcp 10.0.0.5:5432: refused", want: "Task failed. Inspect administrator diagnostics for details."},
+		{name: "max runtime stop explains itself", status: "cancelled", message: "Stopped after reaching the max runtime of 4h0m0s", want: "Stopped after reaching the max runtime of 4h0m0s"}, //nolint:misspell // Existing task state vocabulary.
+		{name: "admin cancel has none", status: "cancelled", want: ""}, //nolint:misspell // Existing task state vocabulary.
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := taskExecutionOf(taskmanager.ExecutionResult{TaskKey: "detect_intro_markers", Status: tc.status, ErrorMessage: tc.message})
+			if got.ErrorMessage != tc.want {
+				t.Fatalf("ErrorMessage = %q, want %q", got.ErrorMessage, tc.want)
+			}
+		})
 	}
 }

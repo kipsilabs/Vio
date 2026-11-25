@@ -7,8 +7,10 @@ import { useHasUnsavedChanges } from "./useUnsavedChanges";
 import { useSettingsForm } from "./useSettingsForm";
 import { useStepSubmit } from "@/pages/setup-wizard/useStep";
 
-const { mutateAsync, markDone, snapshot, authority } = vi.hoisted(() => ({
+const { mutateAsync, markDone, snapshot, authority, saveBaseline } = vi.hoisted(() => ({
   mutateAsync: vi.fn(),
+  // The snapshot the next save is guarded against.
+  saveBaseline: { current: undefined as Record<string, string> | undefined },
   markDone: vi.fn(),
   snapshot: { loaded: true, values: undefined as Record<string, string> | undefined },
   authority: { profileId: "profile-a" },
@@ -29,7 +31,7 @@ vi.mock("@/api/client", () => ({
 // would loop forever.
 const KEYS = ["branding.server_name", "database.max_connections"];
 const settingsData = { "branding.server_name": "Silo", "database.max_connections": "20" };
-const sensitiveData = { configured: [], managed_by_env: [] };
+const sensitiveData = { configured: [] as string[], managed_by_env: [] };
 
 vi.mock("@/hooks/queries/admin/settings", () => ({
   useAdminServerSettings: () => ({
@@ -37,7 +39,10 @@ vi.mock("@/hooks/queries/admin/settings", () => ({
     isLoading: false,
   }),
   useAdminSensitiveStatus: () => ({ data: sensitiveData }),
-  useUpdateServerSettings: () => ({ mutateAsync, isPending: false }),
+  useUpdateServerSettings: (baseline: Record<string, string> | undefined) => {
+    saveBaseline.current = baseline;
+    return { mutateAsync, isPending: false };
+  },
 }));
 
 afterEach(() => {
@@ -47,6 +52,7 @@ afterEach(() => {
   snapshot.loaded = true;
   snapshot.values = undefined;
   authority.profileId = "profile-a";
+  sensitiveData.configured = [];
 });
 
 describe("useSettingsForm save()", () => {
@@ -217,6 +223,54 @@ describe("useSettingsForm save()", () => {
     expect(result.current.dirtyCount).toBe(1);
   });
 
+  it("keeps a change back to the old value staged while that save is in flight", async () => {
+    let resolveMutation:
+      | ((value: { values: Record<string, string>; restart_required: boolean }) => void)
+      | undefined;
+    mutateAsync.mockReturnValue(
+      new Promise((resolve) => {
+        resolveMutation = resolve;
+      }),
+    );
+    const { result } = renderHook(() => useSettingsForm({ keys: KEYS }));
+
+    act(() => result.current.setValue("branding.server_name", "Casa"));
+    let savePromise: Promise<void> | undefined;
+    act(() => {
+      savePromise = result.current.save();
+    });
+    act(() => result.current.setValue("branding.server_name", "Silo"));
+    await act(async () => {
+      resolveMutation?.({ values: { "branding.server_name": "Casa" }, restart_required: false });
+      await savePromise;
+    });
+
+    expect(result.current.getValue("branding.server_name")).toBe("Silo");
+    expect(result.current.dirtyKeys).toEqual(["branding.server_name"]);
+  });
+
+  it("compares with the saved value only once the snapshot after a save arrives", async () => {
+    mutateAsync.mockResolvedValue({
+      values: { "branding.server_name": "Casa" },
+      restart_required: false,
+    });
+    const { result, rerender } = renderHook(() => useSettingsForm({ keys: KEYS }));
+
+    act(() => result.current.setValue("branding.server_name", "Casa"));
+    await act(async () => {
+      await result.current.save();
+    });
+    // The snapshot still says "Silo", but the server now holds "Casa".
+    act(() => result.current.setValue("branding.server_name", "Silo"));
+    expect(result.current.dirtyKeys).toEqual(["branding.server_name"]);
+
+    snapshot.values = { ...settingsData, "branding.server_name": "Casa" };
+    rerender();
+    act(() => result.current.setValue("branding.server_name", "Villa"));
+    act(() => result.current.setValue("branding.server_name", "Casa"));
+    expect(result.current.dirtyCount).toBe(0);
+  });
+
   it("flags a restart when any saved key requires one, and keeps it flagged", async () => {
     mutateAsync.mockImplementation((values: Record<string, string>) =>
       Promise.resolve({
@@ -289,5 +343,73 @@ describe("useSettingsForm unsaved-changes guard", () => {
       form.result.current.discard();
     });
     expect(registry.result.current).toBe(false);
+  });
+
+  it("guards the next save with the current snapshot after an edit is undone in place", () => {
+    const before = { "branding.server_name": "Silo" };
+    snapshot.values = before;
+    const form = renderHook(() =>
+      useSettingsForm({ keys: ["branding.server_name", "branding.accent_color"] }),
+    );
+
+    // The Default accent with none saved: nothing to stage.
+    act(() => {
+      form.result.current.setValue("branding.accent_color", "");
+    });
+    expect(form.result.current.dirtyCount).toBe(0);
+
+    // Another write (a branding upload) moves the settings on.
+    const after = { "branding.server_name": "Silo", "branding.logo_ref": "logo" };
+    snapshot.values = after;
+    form.rerender();
+    act(() => {
+      form.result.current.setValue("branding.server_name", "Casa");
+    });
+
+    expect(saveBaseline.current).toBe(after);
+  });
+
+  it("releases an edit changed back to its saved value, but not a staged secret clear", () => {
+    sensitiveData.configured = ["email.smtp_password"];
+    const registry = renderHook(() => useHasUnsavedChanges());
+    const form = renderHook(() =>
+      useSettingsForm({
+        keys: [
+          "branding.server_name",
+          "email.smtp_password",
+          "s3.public_read_endpoint",
+          "s3.public_token_secret",
+        ],
+      }),
+    );
+
+    act(() => {
+      form.result.current.setValue("branding.server_name", "Casa");
+    });
+    act(() => {
+      form.result.current.setValue("branding.server_name", "Silo");
+    });
+    expect(form.result.current.dirtyCount).toBe(0);
+    expect(registry.result.current).toBe(false);
+
+    // The snapshot leaves out a setting with nothing saved, secret or not, so
+    // emptying what was typed into one gets it back to its saved state.
+    for (const key of ["s3.public_read_endpoint", "s3.public_token_secret"]) {
+      act(() => {
+        form.result.current.setValue(key, "typed");
+      });
+      act(() => {
+        form.result.current.setValue(key, "");
+      });
+    }
+    expect(form.result.current.dirtyCount).toBe(0);
+    expect(registry.result.current).toBe(false);
+
+    // It leaves out a set secret too, and emptying that is a clear to save.
+    act(() => {
+      form.result.current.setValue("email.smtp_password", "");
+    });
+    expect(form.result.current.isClearStaged("email.smtp_password")).toBe(true);
+    expect(registry.result.current).toBe(true);
   });
 });

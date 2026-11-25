@@ -9,27 +9,6 @@ import type { PluginConfigSchema } from "@/api/types";
 import { PluginConfigForm } from "./PluginConfigForm";
 import { field } from "./adminFormField.test-support";
 
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-
-// jsdom lacks the pointer-capture API Radix Select calls when opening.
-window.HTMLElement.prototype.hasPointerCapture ??= () => false;
-window.HTMLElement.prototype.scrollIntoView ??= () => {};
-
-vi.mock("@/hooks/queries/admin/libraries", () => ({
-  useAdminLibraries: () => ({
-    data: [{ id: 7, name: "Movies", type: "movie", enabled: true }],
-  }),
-}));
-
-function renderWithClient(ui: React.ReactElement) {
-  const client = new QueryClient({
-    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
-  });
-  return {
-    ...render(<QueryClientProvider client={client}>{ui}</QueryClientProvider>),
-    queryClient: client,
-  };
-}
 const schema: PluginConfigSchema = {
   key: "account",
   title: "Account",
@@ -45,7 +24,7 @@ const schema: PluginConfigSchema = {
 
 describe("PluginConfigForm secrets", () => {
   it("derives a form when a plugin only supplies JSON Schema", () => {
-    renderWithClient(
+    render(
       <PluginConfigForm
         schema={{
           key: "server",
@@ -68,35 +47,21 @@ describe("PluginConfigForm secrets", () => {
     expect(screen.getByLabelText("Api Key")).toHaveAttribute("type", "password");
   });
 
-  it("renders an inferred library picker for a silo-library json_schema format", async () => {
-    renderWithClient(
-      <PluginConfigForm
-        schema={{
-          key: "virtual",
-          title: "Virtual Library",
-          json_schema: JSON.stringify({
-            type: "object",
-            properties: {
-              movie_library_id: {
-                type: "string",
-                title: "Movie library",
-                format: "silo-library-movie",
-              },
-            },
-          }),
-          required: true,
-        }}
-        onSave={vi.fn()}
-      />,
+  it.each([
+    ["a secret textarea", field("token", "Token", "TEXTAREA", { secret: true })],
+    ["a multiline password", field("token", "Token", "PASSWORD", { multiline: true, rows: 6 })],
+  ])("masks %s in a single-line input", (_name, token) => {
+    render(
+      <PluginConfigForm schema={{ ...schema, admin_form: { fields: [token] } }} onSave={vi.fn()} />,
     );
 
-    await userEvent.click(screen.getByRole("combobox", { name: "Movie library" }));
-    expect(await screen.findByRole("option", { name: "Movies (7)" })).toBeInTheDocument();
+    expect(screen.getByLabelText("Token")).toHaveAttribute("type", "password");
+    expect(screen.queryByRole("textbox", { name: "Token" })).toBeNull();
   });
 
   it("shows redacted saved state and only clears through an explicit action", async () => {
     const onSave = vi.fn();
-    renderWithClient(
+    render(
       <PluginConfigForm
         schema={schema}
         value={{ region: "us-east" }}
@@ -127,9 +92,57 @@ describe("PluginConfigForm secrets", () => {
     );
   });
 
+  it("locks a managed secret and saves edits to the rest of its config entry", async () => {
+    const onSave = vi.fn();
+    const user = userEvent.setup();
+    render(
+      <PluginConfigForm
+        schema={schema}
+        value={{ region: "us-east" }}
+        configuredSecrets={["api_key"]}
+        managedFields={["api_key"]}
+        onSave={onSave}
+      />,
+    );
+
+    const secret = screen.getByLabelText("API Key");
+    expect(secret).toBeDisabled();
+    expect(secret).toHaveValue("");
+    expect(secret).toHaveAccessibleDescription("Managed by the environment");
+    expect(screen.queryByRole("button", { name: "Clear saved secret" })).toBeNull();
+
+    const region = screen.getByLabelText("Region");
+    await user.clear(region);
+    await user.type(region, "eu");
+    await user.click(screen.getByRole("button", { name: "Save config" }));
+    expect(onSave).toHaveBeenCalledWith("account", { region: "eu" }, []);
+  });
+
+  it("drops drafts and secret clears for newly managed fields and keeps neighboring edits", async () => {
+    const onSave = vi.fn();
+    const props = { schema, value: { region: "saved" }, configuredSecrets: ["api_key"], onSave };
+    const form = (managedFields: string[]) => (
+      <PluginConfigForm {...props} managedFields={managedFields} />
+    );
+    const { rerender } = render(form([]));
+    const region = screen.getByLabelText("Region");
+    await userEvent.clear(region);
+    await userEvent.type(region, "draft");
+    await userEvent.click(screen.getByRole("button", { name: "Clear saved secret" }));
+    rerender(form(["api_key"]));
+    rerender(form([]));
+    await userEvent.click(screen.getByRole("button", { name: "Save config" }));
+    expect(onSave).toHaveBeenLastCalledWith("account", { region: "draft" }, []);
+    rerender(form(["region"]));
+    expect(region).toHaveValue("saved");
+    rerender(form([]));
+    await userEvent.click(screen.getByRole("button", { name: "Save config" }));
+    expect(onSave).toHaveBeenLastCalledWith("account", { region: "saved" }, []);
+  });
+
   it("sends an emptied field as an explicit clear so the stored value goes", async () => {
     const onSave = vi.fn();
-    renderWithClient(
+    render(
       <PluginConfigForm
         schema={schema}
         value={{ region: "us-east" }}
@@ -155,7 +168,7 @@ describe("PluginConfigForm secrets", () => {
         ),
       },
     };
-    renderWithClient(
+    render(
       <PluginConfigForm
         schema={requiredSchema}
         value={{ region: "us-east" }}
@@ -173,7 +186,7 @@ describe("PluginConfigForm secrets", () => {
       success: false,
       message: "API key is required",
     });
-    renderWithClient(
+    render(
       <PluginConfigForm
         schema={schema}
         value={{ region: "us-east" }}
@@ -193,7 +206,7 @@ describe("PluginConfigForm secrets", () => {
 
   it("reports each edit and staged secret removal as the entry it would save", async () => {
     const onDraftChange = vi.fn();
-    renderWithClient(
+    render(
       <PluginConfigForm
         schema={schema}
         value={{ region: "us-east" }}
@@ -218,89 +231,37 @@ describe("PluginConfigForm secrets", () => {
       ["api_key"],
     );
   });
-});
 
-describe("PluginConfigForm quality profiles", () => {
-  it("accepts Go/RE2 inline flags without applying JavaScript regex rules", async () => {
-    const qualitySchema: PluginConfigSchema = {
-      key: "streaming",
-      title: "Streaming",
-      json_schema: JSON.stringify({
-        type: "object",
-        properties: {
-          quality_profiles: {
-            type: "array",
-            items: { type: "object" },
-          },
-        },
-      }),
-      required: true,
-      admin_form: {
-        fields: [
-          {
-            key: "quality_profiles",
-            label: "Quality Profiles",
-            control: "TEXTAREA",
-            required: false,
-            secret: false,
-            multiline: true,
-          },
-        ],
-      },
-    };
-    renderWithClient(
+  it("keeps numeric-looking string selections as strings when the schema says so", async () => {
+    const onSave = vi.fn();
+    render(
       <PluginConfigForm
-        schema={qualitySchema}
-        value={{
-          quality_profiles:
-            '[{"label":"4K HDR","include_regex":"(?i)(2160p|4k)","exclude_regex":"(?i)(cam|ts)"}]',
+        schema={{
+          key: "routing",
+          title: "Routing",
+          json_schema: JSON.stringify({
+            type: "object",
+            properties: { tags: { type: "array", items: { type: "string" } } },
+          }),
+          required: false,
+          admin_form: {
+            fields: [
+              field("tags", "Tags", "MULTI_SELECT", {
+                options: [
+                  { value: "001", label: "Tag 001" },
+                  { value: "123", label: "Tag 123" },
+                ],
+              }),
+            ],
+          },
         }}
-        onSave={vi.fn()}
+        onSave={onSave}
       />,
     );
 
-    await userEvent.click(screen.getByRole("button", { name: "Validate profiles" }));
-
-    expect(screen.getByText(/Valid JSON structure: 4K HDR/)).toBeInTheDocument();
-    expect(screen.queryByText(/Invalid include_regex/)).not.toBeInTheDocument();
-  });
-
-  it("says what an empty input means instead of leaking a JSON parse exception", async () => {
-    const qualitySchema: PluginConfigSchema = {
-      key: "streaming",
-      title: "Streaming",
-      json_schema: JSON.stringify({
-        type: "object",
-        properties: {
-          quality_profiles: {
-            type: "array",
-            items: { type: "object" },
-          },
-        },
-      }),
-      required: true,
-      admin_form: {
-        fields: [
-          {
-            key: "quality_profiles",
-            label: "Quality Profiles",
-            control: "TEXTAREA",
-            required: false,
-            secret: false,
-            multiline: true,
-          },
-        ],
-      },
-    };
-    renderWithClient(<PluginConfigForm schema={qualitySchema} value={{}} onSave={vi.fn()} />);
-
-    await userEvent.click(screen.getByRole("button", { name: "Validate profiles" }));
-
-    // JSON.parse("") throws "Unexpected end of JSON input"; the guard must
-    // surface an actionable message instead.
-    expect(
-      screen.getByText(/No profiles entered\. Paste a JSON array of profiles first\./),
-    ).toBeInTheDocument();
-    expect(screen.queryByText(/Unexpected end of JSON/)).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Tag 001" }));
+    await userEvent.click(screen.getByRole("button", { name: "Tag 123" }));
+    await userEvent.click(screen.getByRole("button", { name: "Save config" }));
+    expect(onSave).toHaveBeenLastCalledWith("routing", { tags: ["001", "123"] }, []);
   });
 });

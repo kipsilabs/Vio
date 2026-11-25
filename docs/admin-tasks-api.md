@@ -1,9 +1,6 @@
 # Administrator tasks and jobs
 
-The v2 administrator task surface uses generated web bindings. Apple and Android
-have no task or administrator-job HTTP calls in their checked source trees; the
-migration inventory also records only web consumers. Jellyfin compatibility has
-no equivalent management surface. Legacy routes remain available during migration.
+Scheduled tasks, their schedules and history, and retained administrator jobs.
 
 ## Execution and schedules
 
@@ -12,8 +9,7 @@ By default it omits hidden tasks: queue workers, pollers, and repairs that run
 without an administrator, such as `match_media` or `cache_metadata_images`. It
 also omits tasks that serve one library kind, such as `sync_ebook_metadata`,
 while no library of that kind exists. `include_hidden=true` returns every
-registered task. The frozen v1 list applies the hidden flags only, not library
-scoping. `GET /api/v2/admin/tasks/{key}` reads runtime state on the
+registered task. `GET /api/v2/admin/tasks/{key}` reads runtime state on the
 responding process for any registered task, hidden or not. Both require
 acting-administrator access, as do task mutations and history.
 
@@ -23,6 +19,10 @@ but does not create a durable job or promise execution after a process failure.
 Concurrent local starts conflict. Another server has its own worker state.
 `POST /api/v2/admin/tasks/{key}/cancel` requests cancellation of the current local
 execution; completed effects remain. Neither operation automatically retries.
+While a task is `running` or `cancelling` on the responding process, its
+`started_at` reports when that run started; `last_execution` still describes
+the previous finished run. The realtime `task.updated` event and the events
+WebSocket's task snapshot do not carry it; refetch the task to read it.
 
 The `refresh_all_library_metadata` task runs a `full` library metadata refresh
 (see [libraries-api.md](libraries-api.md)) for each enabled library in turn,
@@ -73,19 +73,41 @@ ignored at startup. The web page lists them in a separate "On demand" group.
 `GET /api/v2/admin/tasks/{key}/triggers` reads persisted schedule configuration
 and a strong caller-bound ETag. `PUT` on that resource requires `If-Match` and a
 `triggers` array, including an empty array to disable scheduling. The database
-compares the original revision under the schedule parent lock. Legacy writers
-use that same lock and advance the revision. A mismatch returns 412 with the
-observed validator, without rereading or retrying the write. An empty schedule
-remains configured across restarts rather than restoring task defaults.
+compares the original revision under the schedule parent lock, and every
+schedule writer advances the revision. A mismatch returns 412 with the current
+validator in `ETag` and does not retry the write. When the conflicting schedule
+is unsaved (revision zero), its validator also covers the default triggers, so
+the server reads the schedule again to build it; if that read fails, the 412
+carries no `ETag` and the client reads the schedule itself. An empty schedule
+remains configured across restarts rather than restoring task defaults. A plugin
+task without a persisted schedule reports the default it runs (binding trigger,
+else manifest default, else startup) at revision zero, under a validator that
+also changes when that default changes; the first `PUT` saves a schedule that
+then outranks the default. Only an administrator's edit saves one now, but a
+plugin task can still hold a schedule an earlier release saved from a binding
+trigger, which `GET` reports with its nonzero revision
+([plugin-scheduled-tasks.md](architecture/plugin-scheduled-tasks.md)).
 
-Successful edits apply to the responding process. Other running processes load
-the persisted configuration when they restart. Runtime state and persisted
+Successful edits apply to the responding process. If the task is running, its
+replacement timers arm after the current execution finishes. Other processes
+load the persisted configuration when they restart, except for plugin tasks: every
+API server installs a plugin task's saved schedule at its next successful plugin
+task sync. A task-page edit announces nothing, so other servers pick it up at
+the periodic sync, which runs every minute
+([plugin-scheduled-tasks.md](architecture/plugin-scheduled-tasks.md)). Runtime state and persisted
 schedule state are separate reads. The web editor captures the persisted schedule
 when editing begins, keeps the draft and original validator after conflicts, and
 requires explicit review and revision adoption before another submission. It
-disables both mutation retries and authentication-refresh replay. The inherited
-`max_runtime_ms` setting is stored but is not enforced by the task runner; the
-editor labels that limitation rather than promising a timeout.
+disables both mutation retries and authentication-refresh replay.
+
+A trigger's `max_runtime_ms` bounds each run that trigger starts. When it
+elapses, the task runner cancels the run's context, the same signal a cancel
+request sends, so a task stops wherever it stops on cancel and keeps the
+progress it saved. Unlike a cancel request, the task stays `running` until it
+returns. The run is then recorded as `cancelled` with an `error_message` naming
+the limit, including when an administrator cancelled it after the limit passed.
+Runs that no trigger started, such as manual runs, are not bounded, and a value
+too large to represent as a duration counts as no limit.
 
 A task can spread its scheduled starts so servers sharing a remote service do
 not start together. Each daily or weekly run of such a task starts at a random
@@ -104,9 +126,22 @@ New completions appear after restarting history; loaded pages do not silently
 expand into a whole-history read. Live last-execution summaries have no saved ID;
 persisted history entries have opaque string IDs.
 
+History holds finished runs only. While a run is in progress its server holds
+a lease on it in `task_execution_leases` and renews it every 30 seconds. When a
+lease goes three minutes without renewal by the database clock (the server
+crashed or was killed), any API server records the run as `failed` with the
+message `Interrupted: the server stopped before the task finished`, ending at
+its last renewal. A graceful shutdown cancels runs in progress, records them
+the same way, and waits up to five seconds for those writes. The admin API
+reports these as ordinary failures. A task's interval counts from its last run
+that wasn't interrupted, so a run cut off by a restart runs again once due.
+
 `GET /api/v2/admin/tasks/refresh_metadata/metrics` returns typed queue counters
-and at most ten entries per sample list. Other tasks return 404. Raw diagnostic
-errors are replaced with safe failure summaries. Task history does not expose
+and at most ten entries per sample list. Other tasks return 404. A sample's
+`title` is its target's own title as stored; a season or episode that still
+exists also carries `series_title`, `season_number` and, for an episode,
+`episode_number`, so a client names it in its own language. Raw diagnostic errors are replaced with
+safe failure summaries. Task history does not expose
 arbitrary internal result JSON; marker contribution counts have a typed result.
 Detailed operational diagnostics remain available through their existing surface.
 
@@ -136,7 +171,7 @@ objects whose destination content was checked in the current copy pass, and
 bucket names, object keys, or local paths. The count can restart when an
 interrupted pass resumes. A completed copy reports `restart_pending` until the
 new storage is active after restart. The job's raw message and error remain
-available only to internal diagnostics. Legacy administrator-job responses and
+available only to internal diagnostics. Administrator-job responses and
 the jobs realtime channel use the same safe storage-transition receipt,
 including the websocket snapshot; they omit the raw request and result
 documents for this job type.
@@ -169,6 +204,4 @@ images already deleted stay deleted and any not yet deleted remain in storage.
 The canceled job reports the totals it reached in `library_result`:
 `deleted_prefixes` counts fully deleted prefixes and `deleted_s3_objects` counts
 every deleted object, including any from the prefix the cancel interrupted. A
-cleanup canceled before it deleted anything reports zeros. The administrator
-task section does not add a generic durable scheduler or change
-the retention and dispatch guarantees of existing job owners.
+cleanup canceled before it deleted anything reports zeros.

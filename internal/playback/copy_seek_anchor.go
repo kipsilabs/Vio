@@ -38,17 +38,12 @@ const (
 	// copySeekAnchorCacheMax bounds the cache. Entries are tiny and the live
 	// working set is the distinct (source, GOP) observations being resumed.
 	copySeekAnchorCacheMax = 256
+	// copySeekAnchorProbeLatencyScale multiplies the slowest recent cost this
+	// source's own anchor probe paid into the next attempt's budget. A probe
+	// pays the provider open plus the byte seek plus the frame read, so twice
+	// the observed cost covers the same work on a link that is no slower.
+	copySeekAnchorProbeLatencyScale = 2
 )
-
-// CopySeekProbeRetryBudget is the wall-clock budget a caller must reserve
-// before the first copy-video seek-anchor probe for one retry to fit: two full
-// probes. A caller with less than this plus its own scheduling margin must skip
-// the retry rather than start a second probe the deadline will truncate; the
-// caller adds the margin because process startup, probe-slot waits, and result
-// handling sit outside the probe timeout.
-func CopySeekProbeRetryBudget() time.Duration {
-	return 2 * CopySeekProbeTimeout
-}
 
 var (
 	copySeekProbeGroup singleflight.Group
@@ -168,7 +163,14 @@ func copySeekProbeKill(err error) (syscall.Signal, bool) {
 // decoder rejection or a 4xx configuration refusal, stays an ordinary failure.
 func classifyCopySeekProbeFailure(ctx context.Context, err error, stderr string) error {
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		slog.WarnContext(ctx, "copy seek anchor probe stopped by its own context; not a provider verdict",
+		// Our own budget ended, so the caller that wanted this anchor has already
+		// answered its own attempt deadline (the probe runs detached from it and
+		// only reaches this point when the killed process is reaped). This is a
+		// DEBUG record of that reap, not a second warning: the attempt that owned
+		// the budget logs the operator-facing verdict (retry or degrade) itself,
+		// and logging it here too made a draining first attempt read as if the
+		// retry had died on arrival.
+		slog.DebugContext(ctx, "copy seek anchor probe ended at its attempt budget; not a provider verdict",
 			"component", "playback",
 			"cause", ctxErr,
 			"error", err,
@@ -358,12 +360,150 @@ func copySeekAnchorGOPKey(sourceKey string, keyframe float64) string {
 	return sourceKey + "\x00kf=" + strconv.FormatFloat(keyframe, 'g', -1, 64)
 }
 
+// copySeekAnchorProbeNeedMark is the slowest cost one source's anchor probe
+// recently proved it needs, stamped when it was observed.
+type copySeekAnchorProbeNeedMark struct {
+	need       time.Duration
+	observedAt time.Time
+}
+
+// copySeekAnchorProbeNeedTracker remembers, per source, how long the anchor
+// probe itself needed. The link's provider-listing latency is not that number: a
+// probe pays a byte seek into the release and a frame read on top of the open,
+// so a link that lists in 3.6s can need 11.6s to anchor a deep position. Sizing
+// the first attempt from the link's listing therefore keeps handing a slow probe
+// a budget it already proved too small. The mark is keyed like the anchor cache
+// (source identity, segment duration, FFmpeg build) so one release's cost never
+// sizes another's, and it lives as long as an anchor so the next seek in the
+// same session starts from evidence rather than from the floor.
+type copySeekAnchorProbeNeedTracker struct {
+	mu    sync.Mutex
+	marks map[string]copySeekAnchorProbeNeedMark
+	now   func() time.Time
+}
+
+func (t *copySeekAnchorProbeNeedTracker) clock() time.Time {
+	if t != nil && t.now != nil {
+		return t.now()
+	}
+	return time.Now()
+}
+
+// record keeps the slowest need observed for sourceKey inside the window. A
+// budget that expired records that budget as a lower bound: the probe needed at
+// least that much. An observation only replaces the mark when it is slower, and
+// the mark's timestamp stays with the measurement that set it, so a fast probe
+// after a slow one cannot retract the room the slow one proved necessary.
+func (t *copySeekAnchorProbeNeedTracker) record(sourceKey string, need time.Duration) {
+	if t == nil || sourceKey == "" || need <= 0 {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.marks == nil {
+		t.marks = make(map[string]copySeekAnchorProbeNeedMark)
+	}
+	now := t.clock()
+	mark, ok := t.marks[sourceKey]
+	if ok && now.Sub(mark.observedAt) < copySeekAnchorCacheTTL && mark.need >= need {
+		return
+	}
+	if !ok && len(t.marks) >= copySeekAnchorCacheMax {
+		for key, entry := range t.marks {
+			if now.Sub(entry.observedAt) >= copySeekAnchorCacheTTL {
+				delete(t.marks, key)
+			}
+		}
+	}
+	t.marks[sourceKey] = copySeekAnchorProbeNeedMark{need: need, observedAt: now}
+}
+
+// lookup returns the slowest recent need for sourceKey, or 0 when nothing was
+// measured inside the window. A lapsed mark is dropped on read so the map stays
+// bounded.
+func (t *copySeekAnchorProbeNeedTracker) lookup(sourceKey string) time.Duration {
+	if t == nil || sourceKey == "" {
+		return 0
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	mark, ok := t.marks[sourceKey]
+	if !ok {
+		return 0
+	}
+	if t.clock().Sub(mark.observedAt) >= copySeekAnchorCacheTTL {
+		delete(t.marks, sourceKey)
+		return 0
+	}
+	return mark.need
+}
+
+// copySeekAnchorProbeNeeds is the process-wide probe-cost tracker. Tests replace
+// it to inject a clock.
+var copySeekAnchorProbeNeeds = &copySeekAnchorProbeNeedTracker{marks: make(map[string]copySeekAnchorProbeNeedMark)}
+
+// CopySeekAnchorProbeBudgetHint returns the per-attempt budget this source's
+// recent anchor probes imply, or 0 when the source is unmeasured. It is twice
+// the slowest cost a probe paid (or the smallest budget a probe already
+// exhausted), bounded by the per-probe cap: a budget larger than the probe can
+// ever use would only hold the attempt window open on paper. Callers take the
+// larger of this and their link-derived budget, so a fast source keeps exactly
+// the budget it had.
+func CopySeekAnchorProbeBudgetHint(ffmpegPath, sourceIdentity string, segmentDuration int) time.Duration {
+	identity := strings.TrimSpace(sourceIdentity)
+	if identity == "" {
+		return 0
+	}
+	if segmentDuration <= 0 {
+		segmentDuration = DefaultSegmentDuration
+	}
+	sourceKey := copySeekAnchorSourceKey(ResolveFFmpegPath(ffmpegPath), identity, segmentDuration)
+	need := copySeekAnchorProbeNeeds.lookup(sourceKey)
+	if need <= 0 {
+		return 0
+	}
+	budget := copySeekAnchorProbeLatencyScale * need
+	if budget > CopySeekProbeTimeout {
+		budget = CopySeekProbeTimeout
+	}
+	return budget
+}
+
+// copySeekAnchorRetryFlightKey marks a probe launched by a caller's retry
+// attempt. It is a context key, read only when the flight key is built.
+type copySeekAnchorRetryFlightKey struct{}
+
+// WithCopySeekAnchorRetryFlight returns ctx marked as a retry attempt's probe.
+//
+// A retry must not join the flight its own first attempt may still be
+// draining. The first caller returns as soon as its attempt budget ends, but
+// the flight it started keeps running (see the WithoutCancel probe context) to
+// finish the killed probe and populate the cache. A retry that calls in during
+// that drain window used to join the spent flight and receive the first
+// attempt's timeout a few milliseconds later — with its own fresh budget
+// untouched — so the reserved retry never opened the provider and the start
+// answered a non-retryable terminal. Giving the retry its own flight makes it
+// spend the budget the caller reserved for it.
+func WithCopySeekAnchorRetryFlight(ctx context.Context) context.Context {
+	if ctx == nil {
+		return nil
+	}
+	return context.WithValue(ctx, copySeekAnchorRetryFlightKey{}, true)
+}
+
 // copySeekAnchorFlightKey identifies one in-flight probe for singleflight
 // coalescing. It keeps the exact requested position because two positions in
 // one GOP cannot be known to share a keyframe until the probe returns; only an
-// identical concurrent request joins the flight.
-func copySeekAnchorFlightKey(sourceKey string, requestedSeekSeconds float64) string {
-	return sourceKey + "\x00ss=" + strconv.FormatFloat(requestedSeekSeconds, 'g', -1, 64)
+// identical concurrent request joins the flight. Retries carry their own
+// namespace so they never coalesce onto a first attempt's draining flight.
+func copySeekAnchorFlightKey(ctx context.Context, sourceKey string, requestedSeekSeconds float64) string {
+	key := sourceKey + "\x00ss=" + strconv.FormatFloat(requestedSeekSeconds, 'g', -1, 64)
+	if ctx != nil {
+		if retry, _ := ctx.Value(copySeekAnchorRetryFlightKey{}).(bool); retry {
+			key += "\x00retry"
+		}
+	}
+	return key
 }
 
 // copySeekAnchorProbe returns the configured probe runner, falling back to the
@@ -380,6 +520,11 @@ func (c *copySeekAnchorCache) probeRunner() anchorProbeRunner {
 // between that keyframe and requestedSeekSeconds while preserving -c:v copy,
 // so callers need both timestamps: requestedSeekSeconds remains the -ss input,
 // while the returned anchor defines the stream's real timeline origin.
+//
+// The gap between the requested position and this anchor is a transport
+// invariant, not an unresolved bug. Callers start the copy stream at the anchor
+// and clients must not seek it away. See
+// docs/architecture/playback-protocol-v3.md#copy-video-seek-anchor.
 //
 // The one-packet framecrc output is intentional. ffprobe read intervals discard
 // Matroska pre-roll at an exact keyframe boundary, while FFmpeg stream copy
@@ -451,7 +596,7 @@ func ResolveCopySeekAnchorForSource(
 		return anchor.seconds, anchor.segment, nil
 	}
 
-	flightKey := copySeekAnchorFlightKey(sourceKey, requestedSeekSeconds)
+	flightKey := copySeekAnchorFlightKey(ctx, sourceKey, requestedSeekSeconds)
 	resultCh := copySeekProbeGroup.DoChan(flightKey, func() (any, error) {
 		// Another caller may have populated the cache between the fast-path
 		// check and this closure starting.
@@ -463,7 +608,7 @@ func ResolveCopySeekAnchorForSource(
 			return copySeekAnchor{}, context.DeadlineExceeded
 		}
 		if shortened {
-			slog.InfoContext(ctx, "copy seek anchor probe shortened to the caller's remaining budget",
+			slog.InfoContext(ctx, "copy seek anchor probe bounded below its per-probe cap by the attempt budget",
 				"component", "playback",
 				"budget", budget,
 				"cap", CopySeekProbeTimeout,
@@ -485,14 +630,35 @@ func ResolveCopySeekAnchorForSource(
 			)
 			return copySeekAnchor{}, probeCtx.Err()
 		}
+		probeStarted := time.Now()
 		seconds, segment, err := copySeekAnchors.probeRunner()(probeCtx, resolvedFFmpegPath, inputPath, requestedSeekSeconds, segmentDuration)
 		if err != nil {
+			// Our own budget ending is evidence about the link: this probe needed
+			// at least that long. Recording it (as a lower bound) is what lets the
+			// next start size its first attempt so a slow link is not rediscovered
+			// from the floor on every seek. Other failures say nothing about cost
+			// and are not recorded.
+			if probeCtx.Err() != nil || errors.Is(err, context.DeadlineExceeded) {
+				copySeekAnchorProbeNeeds.record(sourceKey, budget)
+			}
 			// Probe failures are not cached: a transient upstream timeout must
 			// be retried by the next caller rather than pinned for the TTL.
 			return copySeekAnchor{}, err
 		}
+		copySeekAnchorProbeNeeds.record(sourceKey, time.Since(probeStarted))
 		anchor := copySeekAnchor{seconds: seconds, segment: segment}
 		copySeekAnchors.store(sourceKey, requestedSeekSeconds, anchor)
+		// A resolved anchor is the one line that makes a slow link's progress
+		// visible: without it every probe in a log is a budget failure and the
+		// release never reads as known good.
+		slog.InfoContext(ctx, "copy seek anchor resolved",
+			"component", "playback",
+			"requested_seek_seconds", requestedSeekSeconds,
+			"anchor_seconds", seconds,
+			"start_segment_number", segment,
+			"probe_ms", time.Since(probeStarted).Milliseconds(),
+			"budget", budget,
+		)
 		return anchor, nil
 	})
 
@@ -564,6 +730,11 @@ func LookupCachedCopySeekAnchor(
 // shortened reports that the caller's deadline, not the probe cap, set it. A
 // non-positive budget means the caller had no time left and the probe must not
 // run. A caller with no deadline keeps the full probe cap.
+//
+// The adaptive part lives one level up: a measured slow link gets its own probe
+// context sized from its observed latency (see copySeekProbeContext), so the
+// remaining budget this sees is already the probe's own window rather than the
+// resolve leg's leftovers.
 func copySeekProbeTimeoutFor(ctx context.Context) (time.Duration, bool) {
 	if ctx == nil {
 		return CopySeekProbeTimeout, false

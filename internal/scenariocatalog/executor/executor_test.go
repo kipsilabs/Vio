@@ -11,6 +11,11 @@ import (
 // SILO_SCENARIO_DATABASE_URL points at an empty database the executor owns
 // (never SILO_TEST_DATABASE_URL: the executor truncates) and skip otherwise.
 func TestScenarioCatalogs(t *testing.T) {
+	// The catalogs describe the alpha /api/v1 surface, which now answers the
+	// retirement tombstone, so their expectations no longer run against the
+	// live router. TestCatalogsPassGate still checks every catalog against the
+	// frozen pre-retirement inventory (contracts/api/v2/migration-inventory.json).
+	t.Skip("scenario catalogs describe the retired /api/v1 surface")
 	catalogs, err := scenariocatalog.Load()
 	if err != nil {
 		t.Fatal(err)

@@ -42,7 +42,7 @@ vi.mock("@/api/v2/request", async () => {
 });
 
 vi.mock("@/components/realtimeEventsContext", () => ({
-  useRealtimeEvents: () => ({ awaitAdminJob: vi.fn() }),
+  useRealtimeEventsActions: () => ({ awaitAdminJob: vi.fn() }),
 }));
 
 vi.mock("@/pages/ItemDetail/watchedState", async () => {
@@ -99,9 +99,10 @@ type WatchedMutationOptions = {
 type RefreshMetadataVariables = {
   item: { content_id: string; type: string };
   mode: "quick" | "complete";
+  onReplaced?: (contentID: string) => void;
 };
 
-type RefreshMetadataContext = { toastID: string | number };
+type RefreshMetadataContext = { toastID: string | number; startURL: string };
 
 type RefreshMetadataMutationOptions = {
   onMutate?: (variables: RefreshMetadataVariables) => RefreshMetadataContext;
@@ -117,7 +118,10 @@ type RefreshMetadataMutationOptions = {
   ) => void;
 };
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.unstubAllGlobals();
+  window.history.replaceState(null, "", "/");
+});
 
 describe("item query helpers", () => {
   beforeEach(() => {
@@ -212,6 +216,53 @@ describe("item query helpers", () => {
     );
     // The refresh still committed, so the caches must be invalidated anyway.
     expect(invalidateQueries).toHaveBeenCalled();
+  });
+
+  // A Complete Refresh can finish minutes later, after the admin has moved on.
+  // The page that started it may also have unmounted because the old ID now
+  // 404s, so following depends on the URL, not on that page still being mounted.
+  it.each([
+    { label: "still on the page that started it", laterURL: undefined, follows: true },
+    {
+      label: "after a skip link changed only the hash",
+      laterURL: "/item/movie-1?libraryId=5#main-content",
+      follows: true,
+    },
+    { label: "on another item", laterURL: "/item/movie-2?libraryId=5", follows: false },
+    { label: "on another library's page", laterURL: "/item/movie-1?libraryId=6", follows: false },
+    { label: "on another page", laterURL: "/search", follows: false },
+  ])("follows a replaced item only while $label", async ({ laterURL, follows }) => {
+    mocks.useQueryClient.mockReturnValue({
+      invalidateQueries: vi.fn().mockResolvedValue(undefined),
+    });
+    window.history.pushState(null, "", "/item/movie-1?libraryId=5");
+    const onReplaced = vi.fn();
+
+    useRefreshItemMetadata();
+    const options = mocks.useMutation.mock.calls[
+      mocks.useMutation.mock.calls.length - 1
+    ]?.[0] as RefreshMetadataMutationOptions;
+    const variables: RefreshMetadataVariables = {
+      item: { content_id: "movie-1", type: "movie" },
+      mode: "complete",
+      onReplaced,
+    };
+
+    const context = options.onMutate?.(variables);
+    if (laterURL) window.history.pushState(null, "", laterURL);
+    await options.onSuccess?.(
+      {
+        job: { result_payload: { refresh_content_id: "movie-1b", detail_content_id: "movie-1b" } },
+      },
+      variables,
+      context,
+    );
+
+    if (follows) {
+      expect(onReplaced).toHaveBeenCalledWith("movie-1b");
+    } else {
+      expect(onReplaced).not.toHaveBeenCalled();
+    }
   });
 
   it("optimistically flips played state and reverts only that field on failure", async () => {
@@ -374,7 +425,7 @@ describe("useWatchDetail caching", () => {
     // The same options WatchPage's fetchQuery call sites and useWatchDetail
     // build: one query key means react-query coalesces the in-flight fetch.
     const options = {
-      queryKey: itemKeys.watchDetail("movie-1", 7, 1),
+      queryKey: itemKeys.watchDetail("movie-1", 1),
       queryFn: () => fetchWatchDetail("movie-1", 7, 1),
       staleTime: 30_000,
     };
@@ -384,6 +435,23 @@ describe("useWatchDetail caching", () => {
     await vi.waitFor(() => expect(mocks.v2).toHaveBeenCalledTimes(1));
     resolveApi({ content_id: "movie-1", versions: [], subtitles: [] });
     await Promise.all([first, second]);
+
+    expect(mocks.v2).toHaveBeenCalledTimes(1);
+  });
+
+  it("reads one watch detail per item when the preferred file changes", async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    mocks.v2.mockResolvedValue({ content_id: "movie-1", versions: [], subtitles: [] });
+    const wrapper = wrapperFor(client);
+
+    // The player and the page name the same title with different preferred
+    // files as the session resolves one. `file_id` is a server-side preference,
+    // not a different payload, so both reads share one cache entry.
+    const first = renderHook(() => useWatchDetail("movie-1", 7, 1), { wrapper });
+    await waitFor(() => expect(first.result.current.isSuccess).toBe(true));
+
+    const second = renderHook(() => useWatchDetail("movie-1", 9, 1), { wrapper });
+    await waitFor(() => expect(second.result.current.isSuccess).toBe(true));
 
     expect(mocks.v2).toHaveBeenCalledTimes(1);
   });

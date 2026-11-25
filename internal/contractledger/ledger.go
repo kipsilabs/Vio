@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	inventoryPath = "route-inventory.json"
+	inventoryPath = "migration-inventory.json"
 	ledgerPath    = "migration.json"
 	schemaPath    = "migration.schema.json"
 

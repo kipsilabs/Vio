@@ -16,6 +16,12 @@ import (
 type secretHandling int
 
 const (
+	tablePluginProvisionOwnership = "plugin_provision_ownership"
+	tablePluginAuthBindings       = "plugin_auth_bindings"
+	tablePluginAuthIdentities     = "plugin_auth_identities"
+)
+
+const (
 	// secretLeftOut tables hold short-lived secrets (sessions, sign-in flows,
 	// reset and verification tokens): the dump leaves their rows out, so a
 	// restore brings none back and every client signs in again.
@@ -94,6 +100,24 @@ type carrySpec struct {
 	// limit, when set, turns a switch off on a carried row instead of
 	// dropping it.
 	limit *carryLimit
+	// staged, when set, is a text column under a unique constraint besides
+	// the key, such as a destination's per-profile name. Before the upsert
+	// the restored rows it will update move to a value no live row can
+	// hold, so values swapped since the backup don't collide part way
+	// through the upsert on any schema the backup has (stageCarried).
+	staged string
+	// binding, when set, is a nullable column that narrows what a row's
+	// credential may do. A live row holding a value there is carried only
+	// when the restored schema has the column and what the value names is in
+	// the restored data: carried without it, the credential would be wider
+	// than it is live.
+	binding *carryBinding
+}
+
+// carryBinding names a carrySpec.binding column and the SQL condition, over
+// the live row r, that what it names is in the restored data.
+type carryBinding struct {
+	column, exists string
 }
 
 // carryLimit carries a row with column false where keep, over the live row
@@ -137,11 +161,18 @@ func grantCarried(table string) string {
 
 // pluginInstalled is the SQL condition, over the live row r, that its
 // plugin installation is in the restored data.
-const pluginInstalled = `EXISTS (SELECT 1 FROM plugin_installations i WHERE i.id = r.plugin_installation_id)`
+const pluginInstalled = `EXISTS (SELECT 1 FROM carried_plugins i WHERE i.id = r.plugin_installation_id)`
+
+// profileOf is the SQL condition that the account in the account column has
+// the profile in the profile column in the restored data. A profile id is
+// unique only within an account.
+func profileOf(account, profile string) string {
+	return `EXISTS (SELECT 1 FROM user_profiles p WHERE p.user_id = ` + account + ` AND p.id = ` + profile + `)`
+}
 
 // profileExists is the SQL condition, over the live row r, that its
-// profile is in the restored data.
-const profileExists = `EXISTS (SELECT 1 FROM user_profiles p WHERE p.id = r.profile_id)`
+// account has its profile in the restored data.
+var profileExists = profileOf("r.user_id", "r.profile_id")
 
 // Reasons shared by several secretTables entries.
 const (
@@ -187,6 +218,10 @@ var secretTables = []secretTable{
 		key: "id", same: []string{"id", columnUserID, "key_hash", "key_prefix"}, credential: everyRow,
 		owned: ownerCarried(columnUserID), owners: []string{columnUserID},
 		describe: `format('API key %s %L (account %s)', r.id, r.label, r.user_id)`,
+		// A key bound to a profile acts only as that profile. Carried into
+		// a backup taken before keys could be bound, it would become an
+		// account key that names any profile.
+		binding: &carryBinding{column: columnProfileID, exists: profileOf("r."+columnUserID, "r."+columnProfileID)},
 	}},
 	{name: "invitations", handling: secretCarried, why: "pending invitations", carry: &carrySpec{
 		key: "id", same: []string{"id", "token_hash"}, credential: `t.accepted_at IS NULL AND t.revoked_at IS NULL`,
@@ -211,26 +246,26 @@ var secretTables = []secretTable{
 		owners: []string{columnUserID},
 		owned: ownerCarried(columnUserID) + `
 			AND EXISTS (SELECT 1 FROM media_items m WHERE m.content_id = r.library_item_id)
-			AND (r.profile_id IS NULL OR EXISTS (SELECT 1 FROM user_profiles p WHERE p.id = r.profile_id::text))`,
+			AND (r.profile_id IS NULL OR ` + profileOf("r.user_id", "r.profile_id::text") + `)`,
 		describe: `format('RSS feed %s (account %s)', r.id, r.user_id)`,
 	}},
 	{name: "webhook_sync_connections", handling: secretCarried, why: "Plex and Jellyfin webhook sync secrets", carry: &carrySpec{
 		key: "id", same: []string{"id", columnUserID, "webhook_secret"}, credential: everyRow,
 		owners: []string{columnUserID},
 		owned: ownerCarried(columnUserID) + `
-			AND (r.default_profile_id = '' OR EXISTS (SELECT 1 FROM user_profiles p WHERE p.id = r.default_profile_id))`,
+			AND (r.default_profile_id = '' OR ` + profileOf("r.user_id", "r.default_profile_id") + `)`,
 		describe: `format('webhook sync connection %s %L (account %s)', r.id, r.server_name, r.user_id)`,
 	}},
 	{name: "webhook_sync_profile_mappings", handling: secretCarried, why: "the profile mappings of those connections", carry: &carrySpec{
 		key: "id", same: []string{"id", "connection_id", "external_user_id"}, credential: everyRow,
-		owned: `EXISTS (SELECT 1 FROM webhook_sync_connections c WHERE c.id = r.connection_id)
-			AND (r.silo_profile_id IS NULL OR EXISTS (SELECT 1 FROM user_profiles p WHERE p.id = r.silo_profile_id))`,
+		owned: `EXISTS (SELECT 1 FROM webhook_sync_connections c WHERE c.id = r.connection_id
+				AND (r.silo_profile_id IS NULL OR ` + profileOf("c.user_id", "r.silo_profile_id") + `))`,
 		describe: `format('webhook sync mapping %s of connection %s', r.id, r.connection_id)`,
 	}},
 
 	// Links and providers that sign people in: one removed since the backup
 	// would let its external account sign in again.
-	{name: "plugin_auth_identities", handling: secretCarried, why: "external sign-in links (OIDC, LDAP) of accounts", carry: &carrySpec{
+	{name: tablePluginAuthIdentities, handling: secretCarried, why: "external sign-in links (OIDC, LDAP) of accounts", carry: &carrySpec{
 		key: "id", same: []string{"id", columnInstallation, "external_subject", columnUserID}, credential: everyRow,
 		owners: []string{columnUserID}, owned: ownerCarried(columnUserID) + ` AND ` + pluginInstalled,
 		describe: `format('sign-in link %s %L (account %s)', r.id, r.username, r.user_id)`,
@@ -240,10 +275,10 @@ var secretTables = []secretTable{
 	// would create gets no wider a policy under the restored data than live
 	// (carried_grants). Otherwise it is carried with account creation off,
 	// so the people already linked still sign in.
-	{name: "plugin_auth_bindings", handling: secretCarried, why: "sign-in providers", carry: &carrySpec{
+	{name: tablePluginAuthBindings, handling: secretCarried, why: "sign-in providers", carry: &carrySpec{
 		key: "id", same: []string{"id", columnInstallation, "capability_id"}, credential: everyRow, owned: pluginInstalled,
 		describe: `format('sign-in provider %s (%s)', r.id, r.capability_id)`,
-		limit: &carryLimit{column: columnAutoProvision, keep: grantCarried("plugin_auth_bindings"),
+		limit: &carryLimit{column: columnAutoProvision, keep: grantCarried(tablePluginAuthBindings),
 			why: "account creation turned off: a new account would get more access under the backup's access groups than here"},
 	}},
 
@@ -275,9 +310,16 @@ var secretTables = []secretTable{
 		key: "id", same: []string{"id", columnUserID}, credential: everyRow,
 		owners: []string{columnUserID}, owned: ownerCarried(columnUserID) + ` AND ` + profileExists,
 		describe: `format('notification webhook %s %L (account %s)', r.id, r.name, r.user_id)`,
+		staged:   "name",
+	}},
+	{name: "notification_plugin_destinations", handling: secretCarried, why: "plugin notification destinations", carry: &carrySpec{
+		key: "id", same: []string{"id", columnUserID}, credential: everyRow,
+		owners: []string{columnUserID}, owned: ownerCarried(columnUserID) + ` AND ` + profileExists,
+		describe: `format('plugin notification destination %s %L (account %s)', r.id, r.name, r.user_id)`,
+		staged:   "name",
 	}},
 	{name: "notification_email_prefs", handling: secretCarried, why: "notification email addresses", carry: &carrySpec{
-		key: columnProfileID, same: []string{columnProfileID, columnUserID}, credential: everyRow,
+		key: columnUserID + ", " + columnProfileID, same: []string{columnUserID, columnProfileID}, credential: everyRow,
 		owners: []string{columnUserID}, owned: ownerCarried(columnUserID) + ` AND ` + profileExists,
 		describe: `format('notification email of profile %s (account %s)', r.profile_id, r.user_id)`,
 	}},
@@ -311,6 +353,10 @@ var secretTables = []secretTable{
 	{name: "plugin_runtime_configs", handling: secretCarried, why: "plugin configuration, with the keys and tokens plugins present to outside services", carry: &carrySpec{
 		key: "id", same: []string{"id", columnInstallation, "config_key"}, credential: everyRow, owned: pluginInstalled,
 		describe: `format('configuration %L of plugin installation %s', r.config_key, r.plugin_installation_id)`,
+	}},
+	{name: tablePluginProvisionOwnership, handling: secretCarried, why: "deployment plugin ownership", carry: &carrySpec{
+		key: columnInstallation, same: []string{columnInstallation}, credential: everyRow, owned: pluginInstalled,
+		describe: `format('deployment ownership of plugin installation %s', r.plugin_installation_id)`,
 	}},
 	{name: "plugin_instance_state", handling: secretCarried, why: "plugin state, which may hold an outside account's tokens", carry: &carrySpec{
 		key: "plugin_installation_id, host_scope, state_key", same: []string{columnInstallation, "host_scope", "state_key"}, credential: everyRow, owned: pluginInstalled,
@@ -361,6 +407,7 @@ var secretTables = []secretTable{
 	{name: "idgen_machine_leases", handling: secretRestored, why: workerLease},
 	{name: "web_push_delivery_attempts", handling: secretRestored, why: deliveryHistory},
 	{name: "webhook_delivery_attempts", handling: secretRestored, why: deliveryHistory},
+	{name: "plugin_destination_delivery_attempts", handling: secretRestored, why: deliveryHistory},
 	{name: "download_subscription_exclusions", handling: secretRestored, why: "a download subscription's rules, not a destination"},
 }
 
@@ -387,11 +434,15 @@ func leftOutTables() []string {
 // carriedKinds is what the restore output calls the carried tables.
 const carriedKinds = "API keys, pending invitations, invite codes, autoscan webhook tokens, audiobook RSS feed links, " +
 	"Plex and Jellyfin webhook sync secrets, external sign-in links and providers, watch-provider connections, " +
-	"plugin configuration and state, and notification destinations " +
-	"(push registrations, webhooks, email addresses, Discord links, server channels)"
+	"plugin configuration, state and deployment ownership, and notification destinations " +
+	"(push registrations, webhooks, plugin destinations, email addresses, Discord links, server channels)"
 
 // CarriedCredentials is what DatabaseLoader.CarryCredentials did.
 type CarriedCredentials struct {
+	// pluginProvisionRestricted records a release or sign-in restriction
+	// that a declaration must not override.
+	pluginProvisionRestricted bool
+
 	// Kept counts the live rows kept, by table.
 	Kept map[string]int
 	// Dropped names the live credentials left out because their owner is
@@ -417,14 +468,14 @@ type CarriedCredentials struct {
 // carryCredentials replaces the restored database's credentials with the
 // live server's (liveURL), or with none when liveURL is "", and prints
 // what it kept and dropped.
-func carryCredentials(ctx context.Context, loader DatabaseLoader, dbURL, liveURL string, out io.Writer) error {
+func carryCredentials(ctx context.Context, loader DatabaseLoader, dbURL, liveURL string, out io.Writer) (bool, error) {
 	carriedRows, err := loader.CarryCredentials(ctx, dbURL, liveURL)
 	if err != nil {
-		return fmt.Errorf("replacing the restored %s: %w", carriedKinds, err)
+		return false, fmt.Errorf("replacing the restored %s: %w", carriedKinds, err)
 	}
 	if liveURL == "" {
 		_, _ = fmt.Fprintf(out, "Left out the backup's %s; create new ones after Silo starts.\n", carriedKinds)
-		return nil
+		return carriedRows.pluginProvisionRestricted, nil
 	}
 	if len(carriedRows.Absent) > 0 {
 		_, _ = fmt.Fprintf(out, "The backup's schema predates %s; this server's rows of them are not carried.\n", strings.Join(carriedRows.Absent, ", "))
@@ -440,7 +491,7 @@ func carryCredentials(ctx context.Context, loader DatabaseLoader, dbURL, liveURL
 	}
 	_, _ = fmt.Fprintf(out, "Kept this server's %s in place of the backup's: %s.\n", carriedKinds, strings.Join(kept, ", "))
 	if len(carriedRows.Dropped) > 0 {
-		_, _ = fmt.Fprintf(out, "Dropped %d whose owner is not in the backup or has more authority there than here: %s\n",
+		_, _ = fmt.Fprintf(out, "Dropped %d whose owner is not in the backup or has more authority there than here, or that the backup's older schema cannot hold beside another account's: %s\n",
 			len(carriedRows.Dropped), strings.Join(carriedRows.Dropped, ", "))
 	}
 	if len(carriedRows.Cleared) > 0 {
@@ -454,7 +505,7 @@ func carryCredentials(ctx context.Context, loader DatabaseLoader, dbURL, liveURL
 		kept := counted(len(carriedRows.Stricter), "security switch as this server has it", "security switches as this server has them")
 		_, _ = fmt.Fprintf(out, "Kept %s, stricter than the backup: %s\n", kept, strings.Join(carriedRows.Stricter, ", "))
 	}
-	return nil
+	return carriedRows.pluginProvisionRestricted, nil
 }
 
 // CarryCredentials replaces the carried secretTables rows of dbURL with
@@ -467,7 +518,7 @@ func (l PGLoader) CarryCredentials(ctx context.Context, dbURL, liveURL string) (
 	for i := range live {
 		live[i] = "[]"
 	}
-	liveState := liveCredentials{scrubbed: slices.Repeat([]string{"[]"}, len(scrubbed))}
+	liveState := liveCredentials{plugins: "[]", scrubbed: slices.Repeat([]string{"[]"}, len(scrubbed))}
 	if liveURL != "" {
 		var err error
 		if liveState, err = readLiveCredentials(ctx, liveURL, tables, live); err != nil {
@@ -481,6 +532,9 @@ func (l PGLoader) CarryCredentials(ctx context.Context, dbURL, liveURL string) (
 	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
 	result := CarriedCredentials{Kept: map[string]int{}}
 	err = pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
+		if err := preparePluginCredentialCarry(ctx, tx, liveState); err != nil {
+			return err
+		}
 		// A backup of an older schema may predate a table.
 		present, presentErr := tablesPresent(ctx, tx, append(slices.Clone(tables), scrubbed...))
 		if presentErr != nil {
@@ -499,8 +553,7 @@ func (l PGLoader) CarryCredentials(ctx context.Context, dbURL, liveURL string) (
 		// is the restored server's as it will start: an account kept
 		// disabled, a library deleted since restored disabled.
 		if liveURL != "" {
-			var err error
-			if result.Stricter, err = keepStricterFlags(ctx, tx, liveState.stricter); err != nil {
+			if err := keepStricterFlags(ctx, tx, liveState.stricter, &result); err != nil {
 				return err
 			}
 		}
@@ -597,6 +650,10 @@ func carriedGrants(ctx context.Context, tx pgx.Tx, tables []secretTable, live []
 // authority of the accounts they belong to, and the policy each row that
 // grants an account would give it.
 type liveCredentials struct {
+	plugins            string
+	pluginOwnership    bool
+	pluginCallbackMode bool
+
 	authority map[int]accountAuthority
 	grants    map[grantKey]grantPolicy
 	// stricter is each stricterFlags entry's live rows.
@@ -615,7 +672,13 @@ func readLiveCredentials(ctx context.Context, liveURL string, tables []secretTab
 	}
 	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
 	err = pgx.BeginTxFunc(ctx, conn, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly}, func(tx pgx.Tx) error {
+		if err := readPluginCredentialState(ctx, tx, &state); err != nil {
+			return err
+		}
 		for i, table := range tables {
+			if table.name == tablePluginProvisionOwnership && !state.pluginOwnership {
+				continue
+			}
 			sql := fmt.Sprintf(`SELECT coalesce(json_agg(t), '[]')::text FROM %s t WHERE %s`, table.name, table.carry.credential)
 			if err := tx.QueryRow(ctx, sql).Scan(&into[i]); err != nil {
 				return fmt.Errorf("%s: %w", table.name, err)
@@ -710,26 +773,68 @@ func tableColumns(ctx context.Context, tx pgx.Tx, table string) ([]string, error
 // that are not the same as a carried live one, upserts the live ones whose
 // owner exists, and moves an identity sequence past the ids it wrote. Only
 // the columns the restored schema has are written, so a backup taken
-// before a column was added still restores.
+// before a column was added still restores. A backup taken before a table's
+// key widened (notification_email_prefs gained user_id) is upserted on the
+// key it has, and carried live rows that would share one of its keys are
+// dropped: it cannot hold them all, and keeping one would hand it the others'.
 func (t secretTable) carryInto(ctx context.Context, tx pgx.Tx, live string, result *CarriedCredentials) error {
 	c := t.carry
 	rows := fmt.Sprintf(`json_populate_recordset(NULL::%s, $1::json) r`, t.name)
-	dropped, err := collectStrings(ctx, tx, fmt.Sprintf(`SELECT %s FROM %s WHERE NOT (%s)`, c.describe, rows, c.owned), live)
-	if err != nil {
-		return err
-	}
-	result.Dropped = append(result.Dropped, dropped...)
 	columns, err := tableColumns(ctx, tx, t.name)
 	if err != nil {
 		return err
 	}
-	same := slices.DeleteFunc(slices.Clone(c.same), func(col string) bool { return !slices.Contains(columns, col) })
-	if _, err := tx.Exec(ctx, fmt.Sprintf(`DELETE FROM %s t WHERE %s AND NOT EXISTS (
-		SELECT 1 FROM %s WHERE (%s) AND (%s) = (%s))`,
-		t.name, c.credential, rows, c.owned, prefixed("r.", same), prefixed("t.", same)), live); err != nil {
+	keyColumns := strings.Split(c.key, ", ")
+	owned := c.owned
+	if b := c.binding; b != nil {
+		if slices.Contains(columns, b.column) {
+			owned = fmt.Sprintf(`(%s) AND (r.%s IS NULL OR %s)`, owned, b.column, b.exists)
+		} else {
+			// r has only the restored schema's columns, so the binding is
+			// read from the live rows themselves.
+			owned = fmt.Sprintf(`(%s) AND NOT EXISTS (SELECT 1 FROM json_array_elements($1::json) j
+				WHERE j->>'%s' = r.%s::text AND j->>'%s' IS NOT NULL)`, owned, c.key, c.key, b.column)
+		}
+	}
+	restoredKey, err := primaryKeyColumns(ctx, tx, t.name)
+	if err != nil {
 		return err
 	}
-	keyColumns := strings.Split(c.key, ", ")
+	if len(restoredKey) > 0 && !sameColumns(restoredKey, keyColumns) {
+		owned = fmt.Sprintf(`(%s) AND NOT EXISTS (SELECT 1 FROM (SELECT r.* FROM %s WHERE %s) o
+			WHERE ROW(%s) = ROW(%s) AND ROW(%s) IS DISTINCT FROM ROW(%s))`,
+			c.owned, rows, c.owned, prefixed("o.", restoredKey), prefixed("r.", restoredKey),
+			prefixed("o.", keyColumns), prefixed("r.", keyColumns))
+		keyColumns = restoredKey
+	}
+	key := strings.Join(keyColumns, ", ")
+	dropped, err := collectStrings(ctx, tx, fmt.Sprintf(`SELECT %s FROM %s WHERE NOT (%s)`, c.describe, rows, owned), live)
+	if err != nil {
+		return err
+	}
+	result.Dropped = append(result.Dropped, dropped...)
+	same := slices.DeleteFunc(slices.Clone(c.same), func(col string) bool { return !slices.Contains(columns, col) })
+	deleted, err := tx.Exec(ctx, fmt.Sprintf(`DELETE FROM %s t WHERE %s AND NOT EXISTS (
+		SELECT 1 FROM %s WHERE (%s) AND (%s) = (%s))`,
+		t.name, c.credential, rows, owned, prefixed("r.", same), prefixed("t.", same)), live)
+	if err != nil {
+		return err
+	}
+	signIn := t.name == tablePluginAuthBindings || t.name == tablePluginAuthIdentities
+	if signIn && (len(dropped) > 0 || deleted.RowsAffected() > 0) {
+		result.pluginProvisionRestricted = true
+	}
+	if t.name == tablePluginAuthBindings && !result.pluginProvisionRestricted {
+		sql := fmt.Sprintf(`SELECT EXISTS (
+			SELECT 1 FROM %s JOIN plugin_auth_bindings t USING (id)
+			WHERE (%s) AND t.plugin_installation_id = r.plugin_installation_id
+				AND t.capability_id = r.capability_id
+				AND ((t.enabled AND NOT r.enabled) OR (t.auto_provision AND NOT r.auto_provision))
+		)`, rows, owned)
+		if err := tx.QueryRow(ctx, sql, live).Scan(&result.pluginProvisionRestricted); err != nil {
+			return err
+		}
+	}
 	var set []string
 	for _, col := range columns {
 		if !slices.Contains(keyColumns, col) {
@@ -741,36 +846,80 @@ func (t secretTable) carryInto(ctx context.Context, tx pgx.Tx, live string, resu
 		values[i] = "r." + col
 		if l := c.limit; l != nil && col == l.column {
 			values[i] = fmt.Sprintf("(r.%s AND (%s))", col, l.keep)
-			limited, err := collectStrings(ctx, tx, fmt.Sprintf(`SELECT %s FROM %s WHERE (%s) AND r.%s AND NOT (%s)`, c.describe, rows, c.owned, col, l.keep), live)
+			limited, err := collectStrings(ctx, tx, fmt.Sprintf(`SELECT %s FROM %s WHERE (%s) AND r.%s AND NOT (%s)`, c.describe, rows, owned, col, l.keep), live)
 			if err != nil {
 				return err
+			}
+			if signIn && len(limited) > 0 {
+				result.pluginProvisionRestricted = true
 			}
 			for _, row := range limited {
 				result.Limited = append(result.Limited, row+": "+l.why)
 			}
 		}
 	}
+	if err := c.stageCarried(ctx, tx, t.name, columns, keyColumns, rows, owned, live); err != nil {
+		return err
+	}
 	tag, err := tx.Exec(ctx, fmt.Sprintf(`INSERT INTO %s (%s) OVERRIDING SYSTEM VALUE
 		SELECT %s FROM %s WHERE %s
 		ON CONFLICT (%s) DO UPDATE SET %s`,
-		t.name, strings.Join(columns, ", "), strings.Join(values, ", "), rows, c.owned, c.key, strings.Join(set, ", ")), live)
+		t.name, strings.Join(columns, ", "), strings.Join(values, ", "), rows, owned, key, strings.Join(set, ", ")), live)
 	if err != nil {
 		return err
 	}
 	result.Kept[t.name] += int(tag.RowsAffected())
-	// An identity sequence restored from the backup can be behind the live
-	// ids just written; the next credential must not collide with them. A
-	// table keyed by several columns has none.
-	if len(keyColumns) > 1 {
+	// A sequence restored from the backup can be behind the live values just
+	// written. The next credential must not collide with a carried id, and a
+	// carried sign-in link's answer_seq must stay behind every value taken
+	// from now on, or its sign-ins would be refused as stale.
+	for _, col := range columns {
+		var seq *string
+		if err := tx.QueryRow(ctx, `SELECT pg_get_serial_sequence($1, $2)`, t.name, col).Scan(&seq); err != nil {
+			return err
+		}
+		if seq == nil {
+			continue
+		}
+		if _, err := tx.Exec(ctx, fmt.Sprintf(`SELECT setval($1::regclass, GREATEST(
+			coalesce(pg_sequence_last_value($1::regclass), 0), (SELECT coalesce(max(%s), 0) FROM %s), 1))`, col, t.name), *seq); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// stageCarried moves the staged column of every restored row the upsert
+// will update to a space followed by its key, which no live row holds:
+// names are trimmed before they are stored. Each upserted row then writes
+// its live value over a staged one, so live rows that swapped values since
+// the backup land without a unique violation, whichever schema the backup
+// has.
+func (c *carrySpec) stageCarried(ctx context.Context, tx pgx.Tx, table string, columns, keyColumns []string, rows, owned, live string) error {
+	if c.staged == "" || !slices.Contains(columns, c.staged) || len(keyColumns) != 1 {
 		return nil
 	}
-	var seq *string
-	if err := tx.QueryRow(ctx, `SELECT pg_get_serial_sequence($1, $2)`, t.name, c.key).Scan(&seq); err != nil || seq == nil {
-		return err
-	}
-	_, err = tx.Exec(ctx, fmt.Sprintf(`SELECT setval($1::regclass, GREATEST(
-		coalesce(pg_sequence_last_value($1::regclass), 0), (SELECT coalesce(max(%s), 0) FROM %s), 1))`, c.key, t.name), *seq)
+	key := keyColumns[0]
+	_, err := tx.Exec(ctx, fmt.Sprintf(`UPDATE %s t SET %s = ' ' || t.%s::text
+		WHERE EXISTS (SELECT 1 FROM %s WHERE (%s) AND r.%s = t.%s)`,
+		table, c.staged, key, rows, owned, key, key), live)
 	return err
+}
+
+// primaryKeyColumns lists the columns of table's primary key, in key order;
+// none when it has no primary key.
+func primaryKeyColumns(ctx context.Context, tx pgx.Tx, table string) ([]string, error) {
+	return collectStrings(ctx, tx, `
+		SELECT a.attname::text
+		FROM pg_index i
+		JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY (i.indkey)
+		WHERE i.indrelid = $1::regclass AND i.indisprimary
+		ORDER BY array_position(i.indkey::int2[], a.attnum)`, table)
+}
+
+// sameColumns reports whether a and b name the same columns in any order.
+func sameColumns(a, b []string) bool {
+	return len(a) == len(b) && !slices.ContainsFunc(a, func(col string) bool { return !slices.Contains(b, col) })
 }
 
 func prefixed(prefix string, columns []string) string {

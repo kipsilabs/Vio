@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { usePlayerConfig } from "../context/PlayerConfigContext";
-import { publishPlaybackInventory } from "../playbackInventoryMirror";
+import { inventoryPublicationTargets, publishPlaybackInventory } from "../playbackInventoryMirror";
 import type { PlayerConfig } from "../context/PlayerConfigContext";
 import { startPlaybackV2 } from "../start-v2";
 import { hasSequencedProgress, stopSequencedSession } from "../session-mutations";
@@ -11,6 +11,7 @@ import {
   isAdaptationUnavailableReason,
   isDeadPlaybackSessionError,
   PLAYBACK_SESSION_GONE_ERROR,
+  SEEK_RETRY_TARGET_UNAVAILABLE,
   type PlaybackPolicyErrorDescription,
 } from "../playback-errors";
 import {
@@ -42,7 +43,7 @@ import {
   resolvePlanAudioIdentity,
 } from "../utils/audioTrackMatch";
 import { buildPublishedSubtitleTracks, subtitleLanguageBase } from "../utils/subtitleInventory";
-import { isBitmapCodec } from "../utils/subtitleCodecs";
+import { isBitmapCodec, subtitleDeliveryClass } from "../utils/subtitleCodecs";
 import {
   isInventoryProvisional,
   isPlanSubtitleInventoryProvisional,
@@ -104,17 +105,6 @@ function isBitmapSubtitleRefusal(decision: DecisionResponseV3): boolean {
   const reason = decision.terminal?.reason?.trim() ?? "";
   return reason !== "" && BITMAP_SUBTITLE_REFUSAL_REASONS.has(reason);
 }
-
-/**
- * The retryable terminal a seek reanchor returns when the session's frozen
- * source can no longer be reopened from evidence that belongs to it.
- *
- * The session is not dead and the file is not unplayable: replaying the frozen
- * recipe would pair the running plan with foreign bytes, so the server fails
- * the reanchor closed. A fresh start at the requested position resolves the
- * source again from scratch, which is why the terminal is retryable.
- */
-const SEEK_REANCHOR_EVIDENCE_UNAVAILABLE_REASON = "seek_reanchor_evidence_unavailable";
 
 interface PlaybackSessionState {
   /**
@@ -266,6 +256,17 @@ export const RECONNECT_BASE_DELAY_MS = 1_000;
 export const RECONNECT_MAX_DELAY_MS = 15_000;
 export const RECONNECT_MAX_ATTEMPTS = 12;
 const RECONNECT_STABLE_MS = 30_000;
+
+/**
+ * How long a replan may stay on the wire before the player names it as a
+ * failure. A replan that has not adopted a new plan yet armed no transport
+ * startup guard (the guard is armed per adopted plan), so a server that holds
+ * the request left a bare spinner with only Exit. This deadline sits inside the
+ * player's own per-attempt replan budget, so a slow but working replan still
+ * lands; the value is deliberately separate from the 60 s transport startup
+ * guard, which covers a plan that did arrive.
+ */
+export const REPLAN_DEADLINE_MS = 45_000;
 
 /** Delay before reconnect attempt `attempt` (0-based). */
 export function reconnectDelayMs(attempt: number): number {
@@ -741,8 +742,13 @@ export interface UsePlaybackSessionResult extends PlaybackSessionState {
    * Starts a fresh playback session at the current position after the old one
    * was answered gone. This is a new start (the server re-plans from scratch),
    * never a replan against the dead session.
+   *
+   * `autoplayIntent` carries the viewer's live play intent when they asked for
+   * the restart. The refusal card pauses the element to put the controls back
+   * on the pre-seek position, so reading the report it made at adoption time
+   * would start the retry paused. Without it, the last reported state stands.
    */
-  restartPlayback: () => void;
+  restartPlayback: (autoplayIntent?: boolean) => void;
   /**
    * `failure_recovery` replan for a plan the *server* invalidated over the
    * realtime `plan_invalidated` command. Resolves to whether a replacement plan
@@ -752,8 +758,12 @@ export interface UsePlaybackSessionResult extends PlaybackSessionState {
   /**
    * `seek_reanchor` replan when the target lies outside the seekable window.
    * Resolves with whether a plan at the new position was adopted.
+   *
+   * `autoplayIntent` carries the viewer's play/pause intent sampled when the
+   * seek was issued; a seek replacement keeps playing through the pause the
+   * outgoing transport's teardown reports.
    */
-  reanchorSeek: (positionSeconds: number) => Promise<boolean>;
+  reanchorSeek: (positionSeconds: number, autoplayIntent?: boolean) => Promise<boolean>;
   /**
    * Re-reads the subtitle inventory by replanning with the selection unchanged.
    * Resolves to whether a fresh plan carrying the inventory was adopted, so a
@@ -912,6 +922,55 @@ function mapSubtitleInventory(
       ? buildPlayerStreamUrl(config.apiBaseUrl, item.font_bundle_url, token)
       : undefined,
   }));
+}
+
+/**
+ * Whether a rotated plan's subtitle selection still names the track the viewer
+ * was watching on the inventory the 409 was earned against.
+ *
+ * `index` is that plan's selected ordinal. A plan whose selection moved is the
+ * server's own carry, which is authoritative. A plan that kept the ordinal is
+ * only usable when the inventory entry at it is still the same track: after a
+ * release rotation the same ordinal commonly names another language, and a
+ * missing entry names nothing at all.
+ */
+function planSubtitleSelectionSurvivedRotation(
+  plan: PlanV3,
+  index: number,
+  watched: SubtitleInventoryItemV3,
+): boolean {
+  const selected = plan.selected_tracks.subtitle;
+  if (selected?.index != null && selected.index !== index) return true;
+  const candidate = plan.subtitle.inventory.find((item) => item.combined_index === index);
+  if (!candidate) return false;
+  return (
+    (candidate.language ?? "").trim().toLowerCase() ===
+      (watched.language ?? "").trim().toLowerCase() &&
+    subtitleDeliveryClass(candidate.codec) === subtitleDeliveryClass(watched.codec) &&
+    Boolean(candidate.forced) === Boolean(watched.forced) &&
+    Boolean(candidate.hearing_impaired) === Boolean(watched.hearing_impaired)
+  );
+}
+
+/**
+ * The track to re-select on a rotated inventory: the same track by identity
+ * (language, flags and codec) first, then any track the release offers in the
+ * same delivery class. Null means the class itself is gone, which is the one
+ * case the player reports as a failure instead of re-selecting.
+ */
+function subtitleReplacementAfterRotation(
+  inventory: SubtitleInventoryItemV3[],
+  watched: SubtitleInventoryItemV3,
+): SubtitleInventoryItemV3 | null {
+  const deliveryClass = subtitleDeliveryClass(watched.codec);
+  // The class is the URL family the server promised to produce. The identity
+  // matcher breaks ties inside a class but does not require one, so an English
+  // SRT would otherwise stand in for an English PGS and the server would refuse
+  // the muxer change.
+  if (deliveryClass === null) return null;
+  const sameClass = inventory.filter((item) => subtitleDeliveryClass(item.codec) === deliveryClass);
+  if (sameClass.length === 0) return null;
+  return matchSubtitleTrackAcrossVersions(sameClass, watched) ?? sameClass[0] ?? null;
 }
 
 /**
@@ -1587,6 +1646,29 @@ export function usePlaybackSession(
 
   const sessionIdRef = useRef<string | null>(null);
   const planRef = useRef<PlanV3 | null>(null);
+  // The version list moves on every catalog projection of the title: the
+  // inventory poll's merged rows, a restamp, the version-liveness check's
+  // verdicts. Every callback below reads it through this ref so a new list
+  // never changes their identity — the player's transport effect depends on
+  // `onPlanFailure`, which is built from them, and a versions-only change must
+  // not tear the media element down mid-play.
+  const versionsRef = useRef(versions);
+  versionsRef.current = versions;
+  // The same goes for the other two file-selection inputs. A caller that
+  // rebuilds them per render (WatchPage falls back to fresh arrays) would
+  // otherwise churn `selectFileId`, and with it every start and replan path.
+  const playbackVariantsRef = useRef(playbackVariants);
+  playbackVariantsRef.current = playbackVariants;
+  const resumeHintsRef = useRef(resumeHints);
+  resumeHintsRef.current = resumeHints;
+  // The pre-play subtitle picks are read the same way. The watch route builds
+  // them fresh on every host render, and as direct `loadSession` dependencies
+  // they ran through `replan` -> `onPlanFailure` into the player's transport
+  // effect, reloading the media element while it was already playing.
+  const initialSubtitleTrackIndexRef = useRef(initialSubtitleTrackIndexByFileId);
+  initialSubtitleTrackIndexRef.current = initialSubtitleTrackIndexByFileId;
+  const initialBitmapSubtitleTrackIndexRef = useRef(initialBitmapSubtitleTrackIndexByFileId);
+  initialBitmapSubtitleTrackIndexRef.current = initialBitmapSubtitleTrackIndexByFileId;
   const planRevisionRef = useRef(0);
   const transportRevisionRef = useRef(0);
   const replayRevisionRef = useRef(0);
@@ -1738,19 +1820,6 @@ export function usePlaybackSession(
   // allowed, while a replan still refused for the session already rebuilt
   // surfaces the error instead of starting again.
   const recoveredDeadSessionRef = useRef<string | null>(null);
-  // The seek-reanchor refusal that forced a fresh start, tracked as a chain:
-  // the session whose frozen source failed and the replacement its rebuild
-  // adopted. A second `seek_reanchor_evidence_unavailable` naming either of
-  // them surfaces the retryable error instead of starting yet another session,
-  // so one original attempt can never restart in a loop. `replacementSessionId`
-  // stays null until the rebuild's start actually adopts a plan, and a rebuild
-  // that is refused or fails outright leaves it null — the error is already on
-  // screen there.
-  const seekRebuildChainRef = useRef<{
-    originSessionId: string;
-    replacementSessionId: string | null;
-  } | null>(null);
-
   // v3 identity. `playback_attempt_id` spans one whole attempt chain (a start
   // and every replan that follows it); `plan_attempt_id` identifies the single
   // plan currently on screen. Both are minted by the client — the server mints
@@ -1760,6 +1829,10 @@ export function usePlaybackSession(
   const attemptedPlanKeysRef = useRef<string[]>([]);
   const attemptCountRef = useRef(1);
   const replanInFlightRef = useRef(false);
+  // The deadline armed for the replan on the wire, cleared when it answers or
+  // fails. It is what turns a replan that never returns into the same retryable
+  // failure overlay a failed start already offers.
+  const replanDeadlineRef = useRef<number | null>(null);
   // The attempt whose first frame is still to be reported. `intentAt` is the
   // `performance.now()` of the viewer's request that started it, or null when
   // nothing timed it; the event is still sent, just without a duration.
@@ -1829,10 +1902,30 @@ export function usePlaybackSession(
     positionSeconds: number;
     playbackAttemptId: string | null;
   } | null>(null);
+  // A refused seek's retryable card is a verdict the viewer must act on. While
+  // it is up, automatic track/quality replans (a held pick flush, a default
+  // audio reconcile, a subtitle refresh) must not replace it with a plan or a
+  // different error: on a degraded source those replans can also hold the
+  // client for tens of seconds. The card's Try again starts fresh, and a new
+  // seek or a real failure supersedes it.
+  //
+  // The refused target travels with the plan it was measured against and the
+  // source identity it named. The player restores the pre-seek position while
+  // the card is up, so the live playhead is where the viewer *was*, not where
+  // they asked to go; the retry must use this target instead. Keeping the
+  // identity lets the retry refuse rather than send that position to a source
+  // that has since moved.
+  const refusedSeekRetryRef = useRef<{
+    planId: string;
+    positionSeconds: number;
+    source: SourceIdentity;
+  } | null>(null);
   // Late-bound reanchor: declared ahead of `reanchorSeek` so the switch
   // completion above can call it without depending on render order. Bound in
   // an effect — render-time ref writes are unsafe under concurrent React.
-  const reanchorSeekRef = useRef<(positionSeconds: number) => Promise<boolean>>(async () => false);
+  const reanchorSeekRef = useRef<
+    (positionSeconds: number, autoplayIntent?: boolean) => Promise<boolean>
+  >(async () => false);
   const qualityRef = useRef(qualityPreference?.trim() || QUALITY_ORIGINAL_V3);
   // The running mid-stream reconnect, if any. `generation` invalidates the
   // timer and any request of a cycle that has ended, so nothing it started can
@@ -2038,6 +2131,13 @@ export function usePlaybackSession(
       decision: DecisionResponseV3,
       initialSubtitleFailure?: PlaybackSessionErrorState | null,
       forceTransportBump?: boolean,
+      /**
+       * The viewer's play intent sampled when the replan was sent. A transport
+       * that is torn down before its replacement is adopted reports a pause
+       * that is not the viewer's, so reading the element at adoption time can
+       * hand a seek's replacement `shouldAutoPlay=false` and leave it frozen.
+       */
+      autoplayIntent?: boolean,
     ): boolean => {
       serverFeaturesRef.current = decision.server_features;
       const plan = decision.playback_plan;
@@ -2064,13 +2164,17 @@ export function usePlaybackSession(
         return false;
       }
 
+      // A plan on screen supersedes any refused-seek card: the viewer is no
+      // longer looking at a retry, and an automatic replan is allowed again.
+      refusedSeekRetryRef.current = null;
       const prevPlan = planRef.current;
       // Any adopted plan proves the server is reachable and replaces the
       // transport, so it also ends a reconnect in progress. The new transport
       // plays only if the viewer was playing when the connection dropped; the
       // element has been paused since, so its reported state says nothing.
       if (reconnectRef.current.active) playbackPlayingRef.current = reconnectRef.current.resume;
-      planAutoPlayRef.current = playbackPlayingRef.current;
+      const playIntent = autoplayIntent ?? playbackPlayingRef.current;
+      planAutoPlayRef.current = playIntent;
       planTransportShownRef.current = false;
       const attemptId = playbackAttemptIdRef.current;
       if (prevPlan !== null && planWasReplaced(prevPlan, plan) && attemptId) {
@@ -2167,7 +2271,7 @@ export function usePlaybackSession(
           transportRevisionRef.current,
           replayRevisionRef.current,
           qualityRef.current,
-          playbackPlayingRef.current,
+          playIntent,
           current.autoFallback,
           config,
         );
@@ -2395,6 +2499,9 @@ export function usePlaybackSession(
       // resolves it and the choice is not ours to second-guess.
       if (preferredFileId) return preferredFileId;
 
+      const versions = versionsRef.current;
+      const playbackVariants = playbackVariantsRef.current;
+      const resumeHints = resumeHintsRef.current;
       const mode = normalizeSubtitleMode(subtitleMode);
       const lastFileId = resumeHints?.lastFileId;
       const lastVersion =
@@ -2450,7 +2557,7 @@ export function usePlaybackSession(
       if (subtitleCandidate) return subtitleCandidate.file_id;
       return variantFileId ?? versions[0]?.file_id ?? null;
     },
-    [playbackVariants, resumeHints, subtitleMode, versions],
+    [subtitleMode],
   );
 
   const loadSession = useCallback(
@@ -2467,6 +2574,7 @@ export function usePlaybackSession(
       offeredVirtualURI,
       forceRelink,
       intentAt,
+      autoplayIntent,
       reconnect = false,
       tracks,
     }: {
@@ -2495,6 +2603,13 @@ export function usePlaybackSession(
       forceRelink?: boolean;
       /** When the viewer asked for this start, for its first_frame_ms. */
       intentAt: number | null;
+      /**
+       * The viewer's play intent when they asked for this start. A restart
+       * follows a refusal card that paused the element to restore the
+       * pre-seek position, so the last report is a teardown pause rather than
+       * the viewer's intent; this starts the replacement playing.
+       */
+      autoplayIntent?: boolean;
       /** The start is a reconnect attempt, which must not cancel itself. */
       reconnect?: boolean;
       /**
@@ -2512,6 +2627,9 @@ export function usePlaybackSession(
         subtitleBurnIn?: boolean;
       };
     }): Promise<LoadSessionOutcome> => {
+      // A fresh start (including the retry card's Try again) is the viewer
+      // acting on the refusal, so its card no longer holds automatic replans.
+      refusedSeekRetryRef.current = null;
       // Any other start supersedes a running reconnect: it owns the session now.
       if (!reconnect) endReconnect(false);
       const previousState = stateRef.current;
@@ -2634,7 +2752,7 @@ export function usePlaybackSession(
         const targetSubtitleIndex =
           carriedSubtitleTrackIndex !== undefined
             ? (carriedSubtitleTrackIndex ?? undefined)
-            : initialSubtitleTrackIndexByFileId?.[selectedFileId];
+            : initialSubtitleTrackIndexRef.current?.[selectedFileId];
 
         const startAudioTrackIndex = tracks ? tracks.audioIndex : explicitAudioTrackIndex;
         const decision = await requestStart(
@@ -2663,7 +2781,9 @@ export function usePlaybackSession(
 
         let decisionToAdopt = decision;
         let initialSubtitleFailure: PlaybackSessionErrorState | null = null;
-        const targetVersion = versions.find((v) => v.file_id === selectedFileId);
+        // The list as it stands when the answer lands, not when the start was
+        // requested: a projection that arrived meanwhile names the rows better.
+        const targetVersion = versionsRef.current.find((v) => v.file_id === selectedFileId);
         // Shared ordinal derivation; `targetSubtitleIndex` is the server's
         // published index, so look it up on the same mapping. See
         // subtitleInventory.ts.
@@ -2681,12 +2801,12 @@ export function usePlaybackSession(
           ? tracks.subtitleBurnIn
             ? tracks.subtitleIndex
             : undefined
-          : initialBitmapSubtitleTrackIndexByFileId?.[selectedFileId];
+          : initialBitmapSubtitleTrackIndexRef.current?.[selectedFileId];
         const hasBitmapSubtitle =
           requestedIsBitmap ||
           bitmapSubtitleTrackIndex !== undefined ||
           (carriedSubtitleTrackIndex === undefined &&
-            initialBitmapSubtitleTrackIndexByFileId?.[selectedFileId] !== undefined);
+            initialBitmapSubtitleTrackIndexRef.current?.[selectedFileId] !== undefined);
         if (!decision.playback_plan && hasBitmapSubtitle && isBitmapSubtitleRefusal(decision)) {
           initialSubtitleFailure = describeDecisionWithoutPlan(decision);
           if (decision.session_id) {
@@ -2733,7 +2853,12 @@ export function usePlaybackSession(
           return { kind: "superseded" };
         }
 
-        const adopted = adoptDecision(decisionToAdopt, initialSubtitleFailure);
+        const adopted = adoptDecision(
+          decisionToAdopt,
+          initialSubtitleFailure,
+          undefined,
+          autoplayIntent,
+        );
         if (adopted) {
           // A start opens a new attempt. Its first frame is still to come:
           // whatever the player shows until the new transport loads belongs to
@@ -2802,13 +2927,10 @@ export function usePlaybackSession(
       endAdoption,
       endReconnect,
       explicitAudioTrackIndex,
-      initialBitmapSubtitleTrackIndexByFileId,
-      initialSubtitleTrackIndexByFileId,
       requestStart,
       selectFileId,
       stopSession,
       transitionSourceIdentity,
-      versions,
     ],
   );
   const loadSessionRef = useRef(loadSession);
@@ -2893,6 +3015,10 @@ export function usePlaybackSession(
       // instead of adopting it into an abandoned player.
       loadSequenceRef.current += 1;
       pendingSeekRef.current = null;
+      if (replanDeadlineRef.current !== null) {
+        window.clearTimeout(replanDeadlineRef.current);
+        replanDeadlineRef.current = null;
+      }
       // A held pick dies with the player: nothing will fold its plan.
       pendingTrackPicksRef.current = [];
       // A viewer who leaves while the player reconnects stops the retries.
@@ -2935,6 +3061,25 @@ export function usePlaybackSession(
       // A session answered gone cannot be replanned; every retry earns the same
       // answer. The restart action starts a new session instead.
       if (sessionGoneRef.current) return false;
+      if (
+        options.operation === "seek_reanchor" ||
+        options.operation === "failure_recovery" ||
+        options.operation === "seek_failure_recovery"
+      ) {
+        // A new seek or a real failure is the viewer's newest intent and
+        // replaces the refused-seek card.
+        refusedSeekRetryRef.current = null;
+      } else if (
+        !reconnect &&
+        refusedSeekRetryRef.current &&
+        (options.operation === "track_change" ||
+          options.operation === "quality_change" ||
+          options.operation === "output_change")
+      ) {
+        // Keep the card. These operations are not failures and none of them
+        // justifies throwing away the viewer's only retry affordance.
+        return false;
+      }
       // A switch is replacing the whole session and about to retire the plan
       // below. A replan built from that outgoing plan would be stamped with the
       // switch's sequence once the switch lands, so it could clobber the
@@ -3076,6 +3221,12 @@ export function usePlaybackSession(
       const playIntent = planTransportShownRef.current
         ? playbackPlayingRef.current
         : planAutoPlayRef.current;
+      // A seek replacement is measured against the viewer's intent at the
+      // moment the seek was issued, not the element's state now: the outgoing
+      // transport may already have been paused by a teardown or a previous
+      // seek replacement. The player passes that intent with the seek; other
+      // callers fall back to the live element.
+      const seekAutoplayIntent = options.autoplayIntent ?? playbackPlayingRef.current;
       replanInFlightRef.current = true;
       beginAdoption(loadSequence);
       const isQualityReplan =
@@ -3089,6 +3240,30 @@ export function usePlaybackSession(
         errorReason: null,
         errorRetryable: false,
       }));
+      // No plan has been adopted yet, so no transport startup guard is armed
+      // (that guard is armed per adopted plan). A replan that never answers
+      // would otherwise leave the player on a bare spinner with no failure and
+      // no retry; name it once the deadline passes. The request stays on the
+      // wire: a late decision still adopts and replaces the error.
+      if (replanDeadlineRef.current !== null) window.clearTimeout(replanDeadlineRef.current);
+      replanDeadlineRef.current = window.setTimeout(() => {
+        replanDeadlineRef.current = null;
+        if (loadSequence !== loadSequenceRef.current) return;
+        if (!replanInFlightRef.current) return;
+        setState((current) =>
+          current.replanning || current.replanningQuality
+            ? {
+                ...current,
+                replanning: false,
+                replanningQuality: false,
+                errorTitle: "Playback update timed out",
+                error: "The server didn't answer the playback update in time. Please try again.",
+                errorReason: "replan_timeout",
+                errorRetryable: true,
+              }
+            : current,
+        );
+      }, REPLAN_DEADLINE_MS);
 
       try {
         const decision = await replanV2(config, sessionId, body);
@@ -3110,11 +3285,37 @@ export function usePlaybackSession(
         // Keep a refused-start subtitle pinned off across unrelated replans.
         // A successful explicit subtitle choice is the one action that clears
         // the marker and lets the new server-selected track take ownership.
+        //
+        // A reconnect replaces a transport that is already dead, so it must
+        // reload even when the fresh plan reuses the same session-scoped URL,
+        // route and track selection: the shape heuristic cannot see that the
+        // generation behind that URL stopped answering.
         const adopted = adoptDecision(
           decision,
           options.operation === "track_change" && options.subtitle !== undefined ? null : undefined,
-          isFailureRecovery,
+          isFailureRecovery || reconnect,
+          // The transport a seek replaces can be torn down (a generation
+          // fence, a playlist reload, the element's own load) before this
+          // adoption runs. Its pause is not the viewer's intent, so a seek
+          // replacement keeps the intent sampled when the seek was sent
+          // instead of reading the element now. Other replans keep their own
+          // semantics: an output or track change reports the live pause, and
+          // a reconnect carries its own resume flag.
+          options.operation === "seek_reanchor" ? seekAutoplayIntent : undefined,
         );
+        if (!adopted && options.operation === "seek_reanchor" && !decision.playback_plan) {
+          const refused = describeDecisionWithoutPlan(decision);
+          refusedSeekRetryRef.current = refused.retryable
+            ? {
+                planId: plan.plan_id,
+                positionSeconds: options.positionSeconds,
+                // The target belongs to the source the session was serving
+                // when the seek was refused. A later rotation or a different
+                // version must not be handed the old timeline position.
+                source: { ...liveSourceIdentityRef.current },
+              }
+            : null;
+        }
         if (
           subtitlePickKey !== null &&
           decision.playback_plan &&
@@ -3144,70 +3345,6 @@ export function usePlaybackSession(
           // its Retry re-issues a fresh start.
           retireActiveSession(sessionId);
           return false;
-        }
-        if (
-          !adopted &&
-          options.operation === "seek_reanchor" &&
-          decision.terminal?.reason?.trim() === SEEK_REANCHOR_EVIDENCE_UNAVAILABLE_REASON
-        ) {
-          const chain = seekRebuildChainRef.current;
-          const alreadyRebuilt =
-            chain !== null &&
-            (chain.originSessionId === sessionId || chain.replacementSessionId === sessionId);
-          if (!alreadyRebuilt) {
-            // The session's frozen source cannot be reopened, but the file
-            // itself is fine: a fresh start re-resolves it at the seek target.
-            // Retire the session the same way a reaped one is retired and
-            // reuse `loadSession` for the transport, carrying the viewer's
-            // tracks, the offered candidate and their version intent so the
-            // rebuild lands on what they were watching.
-            const restartPosition =
-              typeof options.positionSeconds === "number" &&
-              Number.isFinite(options.positionSeconds)
-                ? options.positionSeconds
-                : playbackPositionRef.current;
-            // Read the offered candidate before retiring: the retirement
-            // clears the display-only offer along with the outgoing source.
-            const offeredVirtualURI =
-              retryTargetRef.current?.offeredVirtualURI ??
-              offeredVirtualUriRef.current ??
-              undefined;
-            const rebuildSelection: "auto" | "explicit" = autoFallbackRef.current
-              ? "auto"
-              : (retryTargetRef.current?.fileSelection ??
-                (explicitFileSelection ? "explicit" : "auto"));
-            seekRebuildChainRef.current = {
-              originSessionId: sessionId,
-              replacementSessionId: null,
-            };
-            retireActiveSession(sessionId);
-            const outcome = await loadSession({
-              preferredFileId: plan.requested_media_file_id,
-              position: restartPosition,
-              // The seek target is the viewer's intent; do not fall back to
-              // the server's stored resume point for this file.
-              forceStartPosition: true,
-              allowPreserveExistingSessionOnError: false,
-              replacementErrorMessage: "Failed to restart playback",
-              initialErrorMessage: "Failed to restart playback",
-              carriedAudioTrackId: plan.selected_tracks.audio?.id ?? null,
-              carriedSubtitleTrackIndex: plan.selected_tracks.subtitle?.index ?? null,
-              offeredVirtualURI,
-              fileSelection: rebuildSelection,
-              intentAt: null,
-            });
-            // The replacement belongs to the same recovery chain: a second
-            // identical refusal on its session surfaces the error instead of
-            // starting a third. Read the adopted session only when this start
-            // actually won, so a superseded or refused rebuild records nothing.
-            if (outcome.kind === "adopted" && sessionIdRef.current) {
-              seekRebuildChainRef.current = {
-                originSessionId: sessionId,
-                replacementSessionId: sessionIdRef.current,
-              };
-            }
-            return outcome.kind === "adopted";
-          }
         }
         if (!adopted && retireSessionOnRefusal) {
           const pending = pendingReplanRef.current;
@@ -3322,6 +3459,10 @@ export function usePlaybackSession(
         }));
         return false;
       } finally {
+        if (replanDeadlineRef.current !== null) {
+          window.clearTimeout(replanDeadlineRef.current);
+          replanDeadlineRef.current = null;
+        }
         replanInFlightRef.current = false;
         setState((current) =>
           current.replanning || current.replanningQuality
@@ -3955,51 +4096,99 @@ export function usePlaybackSession(
    * Starts a fresh session at the position the viewer reached after the old
    * session was answered gone. A new start re-plans server-side from scratch;
    * a replan against the dead session could only answer the same way again.
+   *
+   * `autoplayIntent` is the viewer's live intent at the moment they asked.
+   * The refusal card pauses the element so the controls show the position
+   * playback was restored to, and the pause it reports must not travel into
+   * the replacement: a viewer who clicked Try again asked for playback.
    */
-  const restartPlayback = useCallback(() => {
-    const plan = planRef.current;
-    const played = hasAdoptedPlanRef.current || plan !== null;
-    const position = played ? playbackPositionRef.current : startIntentRef.current.position;
-    const forceStartPosition = played ? true : startIntentRef.current.forceStartPosition;
-    const deadSessionId = sessionIdRef.current;
-    sessionGoneRef.current = false;
-    sessionEndedRef.current = false;
-    endReconnect(false);
-    if (deadSessionId) {
-      // The stop is best effort: a reaped session answers 404, which is exactly
-      // the verdict that brought the viewer here.
-      retireActiveSession(deadSessionId);
-    }
-    setState((current) => ({
-      ...current,
-      loading: true,
-      errorTitle: null,
-      error: null,
-      errorReason: null,
-      errorRetryable: false,
-      connectionStatus: "connected",
-      connectionErrorTitle: null,
-      connectionError: null,
-    }));
-    void loadSession({
-      preferredFileId: plan?.requested_media_file_id ?? stateRef.current.mediaFileId ?? undefined,
-      position,
-      forceStartPosition,
-      allowPreserveExistingSessionOnError: false,
-      replacementErrorMessage: "Failed to restart playback",
-      initialErrorMessage: "Failed to restart playback",
-      carriedAudioTrackId: plan?.selected_tracks.audio?.id ?? null,
-      carriedSubtitleTrackIndex: plan?.selected_tracks.subtitle?.index ?? null,
-      offeredVirtualURI:
-        retryTargetRef.current?.offeredVirtualURI ?? offeredVirtualUriRef.current ?? undefined,
-      // Preserve the viewer's version choice: a restart is not a licence for
-      // the server to substitute another edition behind the dead session.
-      fileSelection: autoFallbackRef.current
-        ? "auto"
-        : (retryTargetRef.current?.fileSelection ?? (explicitFileSelection ? "explicit" : "auto")),
-      intentAt: null,
-    });
-  }, [endReconnect, explicitFileSelection, loadSession, retireActiveSession]);
+  const restartPlayback = useCallback(
+    (autoplayIntent?: boolean) => {
+      const plan = planRef.current;
+      const refusedSeek = refusedSeekRetryRef.current;
+      // The refused seek target is the viewer's newest intent, but only while
+      // the card is describing the same plan and the same source it was measured
+      // on. The player restores the pre-seek playhead while the card is up, so
+      // the remembered target is the only record of where the seek asked to go.
+      const refusedSeekTargetApplies =
+        plan !== null &&
+        refusedSeek !== null &&
+        refusedSeek.planId === plan.plan_id &&
+        Number.isFinite(refusedSeek.positionSeconds) &&
+        refusedSeek.positionSeconds >= 0 &&
+        identityNamesSameSource(refusedSeek.source, liveSourceIdentityRef.current);
+      const refusedSeekTargetStale =
+        plan !== null &&
+        refusedSeek !== null &&
+        refusedSeek.planId === plan.plan_id &&
+        !refusedSeekTargetApplies;
+      if (refusedSeekTargetStale) {
+        // The source moved or the version changed while the card was up. Sending
+        // the old target to the new source would silently start at a position
+        // the viewer never asked for on it, so say why and drop the card's retry.
+        refusedSeekRetryRef.current = null;
+        setState((current) => ({
+          ...current,
+          loading: false,
+          errorTitle: SEEK_RETRY_TARGET_UNAVAILABLE.title,
+          error: SEEK_RETRY_TARGET_UNAVAILABLE.message,
+          errorReason: SEEK_RETRY_TARGET_UNAVAILABLE.reason ?? null,
+          errorRetryable: SEEK_RETRY_TARGET_UNAVAILABLE.retryable ?? false,
+        }));
+        return;
+      }
+      const seekTarget =
+        refusedSeekTargetApplies && refusedSeek !== null ? refusedSeek.positionSeconds : null;
+      const played = hasAdoptedPlanRef.current || plan !== null;
+      const position =
+        seekTarget ?? (played ? playbackPositionRef.current : startIntentRef.current.position);
+      const forceStartPosition =
+        seekTarget !== null || (played ? true : startIntentRef.current.forceStartPosition);
+      const deadSessionId = sessionIdRef.current;
+      sessionGoneRef.current = false;
+      sessionEndedRef.current = false;
+      endReconnect(false);
+      if (deadSessionId) {
+        // The stop is best effort: a reaped session answers 404, which is exactly
+        // the verdict that brought the viewer here.
+        retireActiveSession(deadSessionId);
+      }
+      setState((current) => ({
+        ...current,
+        loading: true,
+        errorTitle: null,
+        error: null,
+        errorReason: null,
+        errorRetryable: false,
+        connectionStatus: "connected",
+        connectionErrorTitle: null,
+        connectionError: null,
+      }));
+      void loadSession({
+        preferredFileId: plan?.requested_media_file_id ?? stateRef.current.mediaFileId ?? undefined,
+        position,
+        forceStartPosition,
+        allowPreserveExistingSessionOnError: false,
+        replacementErrorMessage: "Failed to restart playback",
+        initialErrorMessage: "Failed to restart playback",
+        carriedAudioTrackId: plan?.selected_tracks.audio?.id ?? null,
+        carriedSubtitleTrackIndex: plan?.selected_tracks.subtitle?.index ?? null,
+        offeredVirtualURI:
+          retryTargetRef.current?.offeredVirtualURI ?? offeredVirtualUriRef.current ?? undefined,
+        // Preserve the viewer's version choice: a restart is not a licence for
+        // the server to substitute another edition behind the dead session.
+        fileSelection: autoFallbackRef.current
+          ? "auto"
+          : (retryTargetRef.current?.fileSelection ??
+            (explicitFileSelection ? "explicit" : "auto")),
+        intentAt: null,
+        // A caller that names the intent owns it; otherwise the last reported
+        // state stands, as it did before the retry card.
+        autoplayIntent: autoplayIntent ?? playbackPlayingRef.current,
+      });
+    },
+    [endReconnect, explicitFileSelection, loadSession, retireActiveSession],
+  );
 
   // Coming back online is the best moment to try again.
   const reconnecting = state.connectionStatus === "reconnecting";
@@ -4069,6 +4258,10 @@ export function usePlaybackSession(
       // reconciliation reason if the server sent something longer, which is a
       // different reason and must keep failure semantics.
       if (reason.trim() === PLAN_INVALIDATED_DEFAULT_AUDIO_RECONCILIATION) {
+        // A refused seek is showing the viewer's only retry. A default-audio
+        // reconcile is not a failure and can wait for the fresh start that
+        // retry begins; issuing its no-op replan now would replace the card.
+        if (refusedSeekRetryRef.current) return true;
         // The reason goes back on the wire verbatim, not trimmed to the
         // classification: it is how the server tells that this replan *is* the
         // answer to the decision it persisted, instead of falling back to a
@@ -4089,11 +4282,11 @@ export function usePlaybackSession(
   );
 
   const reanchorSeek = useCallback(
-    (positionSeconds: number): Promise<boolean> => {
+    (positionSeconds: number, autoplayIntent?: boolean): Promise<boolean> => {
       playbackPositionRef.current = positionSeconds;
       awaitingInitialPlayerPositionRef.current = false;
       reportEvent("seek_reanchor_requested");
-      return replan({ operation: "seek_reanchor", positionSeconds });
+      return replan({ operation: "seek_reanchor", positionSeconds, autoplayIntent });
     },
     [replan, reportEvent],
   );
@@ -4102,16 +4295,52 @@ export function usePlaybackSession(
   }, [reanchorSeek]);
 
   /**
-   * Re-reads the subtitle inventory.
+   * Re-reads the subtitle inventory, and re-selects when the rotation moved the
+   * track under the selection.
    *
    * There is no "refresh" operation in v3, and there does not need to be: a
    * `track_change` that changes nothing returns a fresh plan — inventory
-   * included — without excluding the route already playing.
+   * included — without excluding the route already playing. That fresh plan is
+   * what a `subtitle_source_changed` 409 asks for.
+   *
+   * The replan alone is not enough. A rotated release answers the plan-time
+   * ordinal with another 409 because that ordinal named a layout the release no
+   * longer has, and the player then re-selects the same ordinal against the new
+   * inventory. The ordinal is only meaningful inside one inventory, so when the
+   * track the viewer was watching is not what the new plan's ordinal now names,
+   * this re-selects the equivalent track from the new inventory: the same
+   * language and class first, then any track of the same class. Only when the
+   * class itself is gone does it stop, leaving the player's own failure on
+   * screen instead of replaying an ordinal that can never resolve.
    */
   const refreshSubtitles = useCallback(
     async (currentPosition: number): Promise<boolean> => {
-      if (!planRef.current) return false;
-      return replan({ operation: "track_change", positionSeconds: currentPosition });
+      const outgoing = planRef.current;
+      if (!outgoing) return false;
+      const watchedIndex = outgoing.selected_tracks.subtitle?.index ?? null;
+      const watched =
+        watchedIndex !== null
+          ? (outgoing.subtitle.inventory.find((item) => item.combined_index === watchedIndex) ??
+            null)
+          : null;
+
+      const refreshed = await replan({
+        operation: "track_change",
+        positionSeconds: currentPosition,
+      });
+      if (!refreshed || !watched || watchedIndex === null) return refreshed;
+
+      const next = planRef.current;
+      if (!next) return refreshed;
+      if (planSubtitleSelectionSurvivedRotation(next, watchedIndex, watched)) return refreshed;
+
+      const replacement = subtitleReplacementAfterRotation(next.subtitle.inventory, watched);
+      if (!replacement) return false;
+      return replan({
+        operation: "track_change",
+        positionSeconds: currentPosition,
+        subtitle: { id: replacement.track_id ?? "", index: replacement.combined_index },
+      });
     },
     [replan],
   );
@@ -5011,7 +5240,7 @@ export function usePlaybackSession(
             carriedSubtitleTrackIndex: resolveCarriedSubtitleIndexAcrossVersions(
               planRef.current,
               newFileId,
-              versions,
+              versionsRef.current,
             ),
             // A version switch is always an explicit user action: the server
             // must not silently substitute yet another version.
@@ -5058,7 +5287,7 @@ export function usePlaybackSession(
         }
       })();
     },
-    [allowAlternateVersions, loadSession, setAutoFallback, versions],
+    [allowAlternateVersions, loadSession, setAutoFallback],
   );
 
   /**
@@ -5273,16 +5502,30 @@ export function usePlaybackSession(
 
   // Mirror the player's authoritative menus for the item page. The page can be
   // unmounted while this hook is alive, so a module-level snapshot is the only
-  // carrier that survives the trip back from the player. Publish both the
-  // effective row and the requested row: a virtual rotation can move the
-  // effective file id while the media page still holds the viewer's selection.
+  // carrier that survives the trip back from the player. The plan's inventory
+  // is published under the effective file id it describes; the requested row
+  // gets it too only while the plan still serves that row, because a
+  // substituted (or lower-version) release's track table says nothing about the
+  // version the viewer selected.
   useEffect(() => {
-    const requestedFileId = planRef.current?.requested_media_file_id ?? null;
-    publishPlaybackInventory(state.mediaFileId, state.planAudioTracks, state.subtitleUrls);
-    if (requestedFileId && requestedFileId !== state.mediaFileId) {
-      publishPlaybackInventory(requestedFileId, state.planAudioTracks, state.subtitleUrls);
+    // Declared rows are the plan's release listing, not probe evidence. They
+    // are published as such so the item page can show them immediately and
+    // still let verified rows win without ever regressing back.
+    const provenance = {
+      audioVerified: !state.audioInventoryProvisional,
+      subtitleVerified: !state.subtitleInventoryProvisional,
+    };
+    for (const fileId of inventoryPublicationTargets(planRef.current, state.mediaFileId)) {
+      publishPlaybackInventory(fileId, state.planAudioTracks, state.subtitleUrls, provenance);
     }
-  }, [state.mediaFileId, state.planAudioTracks, state.planRevision, state.subtitleUrls]);
+  }, [
+    state.audioInventoryProvisional,
+    state.mediaFileId,
+    state.planAudioTracks,
+    state.planRevision,
+    state.subtitleInventoryProvisional,
+    state.subtitleUrls,
+  ]);
 
   return {
     ...state,

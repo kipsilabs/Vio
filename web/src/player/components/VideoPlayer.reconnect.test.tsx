@@ -1,11 +1,11 @@
-import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { createElement, useEffect, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { PlayerConfigProvider, type PlayerConfig } from "../context/PlayerConfigContext";
 import { fixturePlanV3, fixtureSubtitleInventoryItemV3 } from "../protocol-v3.fixtures";
 import type { PlanV3 } from "../protocol-v3";
-import type { SubtitleMode } from "../types";
+import type { PlayerFileVersion, SubtitleMode } from "../types";
 import { resetCodecDetectionForTests } from "../hooks/useCodecDetection";
 import { usePlaybackSession, type UsePlaybackSessionResult } from "../hooks/usePlaybackSession";
 import { resetSessionMutations } from "../session-mutations";
@@ -16,10 +16,17 @@ import { VideoPlayer } from "./VideoPlayer";
 // events in the player, requests and recovery in the hook.
 
 const controls = vi.hoisted(() => ({
-  current: null as null | { activeSubtitleIndex: number | null },
+  current: null as null | {
+    activeSubtitleIndex: number | null;
+    playing?: boolean;
+    currentTime?: number;
+    onSeek?: (seconds: number) => void;
+  },
 }));
 const hlsJS = vi.hoisted(() => ({
   latest: null as null | { emit: (event: string, data: unknown) => void },
+  loadSource: vi.fn(),
+  startLoad: vi.fn(),
 }));
 // Captures the progress sampler's gone-session callback so a test can drive a
 // mid-stream eviction the way the real sampler reports one.
@@ -60,7 +67,7 @@ vi.mock("../hooks/useSubtitleLayout", () => ({
 vi.mock("./PlayerControls", () => ({
   SKIP_BACK_SECONDS: 10,
   SKIP_FORWARD_SECONDS: 30,
-  PlayerControls: (props: { activeSubtitleIndex: number | null }) => {
+  PlayerControls: (props: { activeSubtitleIndex: number | null; playing?: boolean }) => {
     controls.current = props;
     return null;
   },
@@ -93,9 +100,13 @@ vi.mock("hls.js", () => ({
     emit(event: string, data: unknown) {
       this.handlers.get(event)?.(event, data);
     }
-    startLoad() {}
+    startLoad() {
+      hlsJS.startLoad();
+    }
     stopLoad() {}
-    loadSource() {}
+    loadSource() {
+      hlsJS.loadSource();
+    }
     attachMedia() {}
     destroy() {}
   },
@@ -166,6 +177,50 @@ function directPlan(overrides: Partial<PlanV3> = {}): PlanV3 {
   });
 }
 
+function remuxPlan(overrides: Partial<PlanV3> = {}): PlanV3 {
+  return fixturePlanV3({
+    delivery: "server_remux_progressive",
+    stream: {
+      url: "/stream/session-1",
+      protocol: "http_progressive",
+      mime_type: "video/mp4",
+      headers: {},
+      header_refresh: "none",
+    },
+    timeline: {
+      source_start_seconds: 10,
+      stream_origin_seconds: 8,
+      player_start_seconds: 2,
+      timeline_offset_seconds: 8,
+      can_seek_anywhere: false,
+      seek_restoration: "source_position",
+    },
+    selected_tracks: {
+      audio: { id: "file:7:audio:0", index: 0 },
+      subtitle: { id: "file:7:subtitle:0", index: 0 },
+    },
+    audio_tracks: [
+      {
+        index: 0,
+        language: "en",
+        codec: "aac",
+        default: true,
+        track_id: "file:7:audio:0",
+        selection_index: 0,
+      },
+      {
+        index: 1,
+        language: "de",
+        codec: "aac",
+        default: false,
+        track_id: "file:7:audio:1",
+        selection_index: 1,
+      },
+    ],
+    ...overrides,
+  });
+}
+
 interface Requests {
   starts: Body[];
   replans: Array<{ url: string; body: Body }>;
@@ -204,14 +259,32 @@ function stubServer(handlers: {
 
 const sessionRef: { current: UsePlaybackSessionResult | null } = { current: null };
 
+const NO_VERSIONS: PlayerFileVersion[] = [];
+
 function Harness({
   subtitleMode = "auto",
   preferredSubtitleLanguage = null,
+  versions = NO_VERSIONS,
+  initialSubtitleTrackIndexByFileId,
 }: {
   subtitleMode?: SubtitleMode;
   preferredSubtitleLanguage?: string | null;
+  versions?: PlayerFileVersion[];
+  initialSubtitleTrackIndexByFileId?: Record<number, number>;
 }) {
-  const playback = usePlaybackSession("request-1", [], [], 7, 0, false, "auto");
+  const playback = usePlaybackSession(
+    "request-1",
+    versions,
+    [],
+    7,
+    0,
+    false,
+    "auto",
+    null,
+    undefined,
+    null,
+    initialSubtitleTrackIndexByFileId,
+  );
   // Published after commit, so the test reads the session the player rendered.
   useEffect(() => {
     sessionRef.current = playback;
@@ -222,10 +295,14 @@ function Harness({
     streamUrl: playback.streamUrl,
     plan: playback.plan,
     planRevision: playback.planRevision,
+    transportRevision: playback.transportRevision,
+    replayRevision: playback.replayRevision,
     shouldAutoPlay: playback.shouldAutoPlay,
     replanning: playback.replanning,
     replanError: playback.error,
     replanErrorTitle: playback.errorTitle,
+    replanErrorRetryable: playback.errorRetryable,
+    replanErrorReason: playback.errorReason,
     sessionId: playback.sessionId,
     activeFileId: playback.mediaFileId,
     subtitleUrls: playback.subtitleUrls,
@@ -240,6 +317,7 @@ function Harness({
     connectionErrorTitle: playback.connectionErrorTitle,
     connectionError: playback.connectionError,
     onReanchorSeek: playback.reanchorSeek,
+    onRestartPlayback: playback.restartPlayback,
     onPlaybackStateChange: (state) =>
       playback.updatePlaybackState(state.currentTime, state.playing),
     onFirstFrame: playback.reportFirstFrame,
@@ -267,6 +345,14 @@ function showFrame(video: HTMLVideoElement) {
   Reflect.deleteProperty(video, "readyState");
 }
 
+/** Makes the element report a seekable window, as a produced playlist does. */
+function seekableWindow(video: HTMLVideoElement, end: number) {
+  Object.defineProperty(video, "seekable", {
+    configurable: true,
+    value: { length: 1, start: () => 0, end: () => end },
+  });
+}
+
 /** The viewer is watching: the element plays and shows a frame. */
 async function startWatching(): Promise<HTMLVideoElement> {
   let video: HTMLVideoElement | null = null;
@@ -286,6 +372,8 @@ beforeEach(() => {
   sessionRef.current = null;
   controls.current = null;
   hlsJS.latest = null;
+  hlsJS.loadSource.mockClear();
+  hlsJS.startLoad.mockClear();
   progressOptions.current = null;
   vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
   vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
@@ -372,10 +460,12 @@ describe("VideoPlayer with the playback session: reconnect", () => {
     await waitFor(() => expect(hlsJS.latest).not.toBeNull());
 
     // The new transport never starts: hls.js gives up twice on the network,
-    // and the startup guard reports the route as failed.
+    // and the startup guard reports the route as failed. The recovery is
+    // delayed with backoff, so the second failure is the reload's.
     const fatal = { fatal: true, type: "networkError", details: "manifestLoadError" };
     const now = vi.spyOn(Date, "now").mockReturnValue(10_000);
     act(() => hlsJS.latest?.emit("error", fatal));
+    await waitFor(() => expect(hlsJS.loadSource).toHaveBeenCalledTimes(2), { timeout: 3_000 });
     now.mockReturnValue(20_000);
     act(() => hlsJS.latest?.emit("error", fatal));
     now.mockRestore();
@@ -536,5 +626,550 @@ describe("VideoPlayer with the playback session: reconnect", () => {
     expect(requests.starts[1]?.start_position).toBe(321.5);
     expect(sessionRef.current?.connectionStatus).toBe("connected");
     expect(sessionRef.current?.shouldAutoPlay).toBe(true);
+  });
+});
+
+describe("VideoPlayer with the playback session: audio switch", () => {
+  it("ends an audio switch on the remux route playing", async () => {
+    const first = remuxPlan();
+    const switched = remuxPlan({
+      plan_id: "plan:switched",
+      plan_attempt_key: "v3:switched",
+      selected_tracks: {
+        audio: { id: "file:7:audio:1", index: 1 },
+        subtitle: { id: "file:7:subtitle:0", index: 0 },
+      },
+      timeline: {
+        ...first.timeline,
+        source_start_seconds: 12,
+        stream_origin_seconds: 10,
+        player_start_seconds: 2,
+        timeline_offset_seconds: 10,
+      },
+    });
+    const requests = stubServer({
+      start: () => jsonResponse(playable("session-1", first), 201),
+      replan: () => jsonResponse(playable("session-1", switched)),
+    });
+    renderHarness();
+    const video = await startWatching();
+    expect(controls.current?.playing).toBe(true);
+    vi.mocked(video.load).mockClear();
+    vi.mocked(HTMLMediaElement.prototype.play).mockClear();
+
+    act(() => sessionRef.current?.switchAudioTrack(1, 12));
+    await waitFor(() => expect(requests.replans[0]?.body.operation).toBe("track_change"));
+    await waitFor(() => expect(video.load).toHaveBeenCalled());
+    expect(sessionRef.current?.plan?.selected_tracks.audio?.index).toBe(1);
+
+    // The switch tore the old transport down; the load algorithm pauses the
+    // element, and the replacement starts from the viewer's live intent.
+    Object.defineProperty(video, "paused", { configurable: true, value: true });
+    fireEvent.emptied(video);
+    Object.defineProperty(video, "readyState", {
+      configurable: true,
+      value: HTMLMediaElement.HAVE_FUTURE_DATA,
+    });
+    fireEvent.loadedData(video);
+    fireEvent.canPlay(video);
+    await waitFor(() => expect(HTMLMediaElement.prototype.play).toHaveBeenCalled());
+
+    Object.defineProperty(video, "paused", { configurable: true, value: false });
+    fireEvent.play(video);
+    expect(video.paused).toBe(false);
+    expect(controls.current?.playing).toBe(true);
+  });
+});
+
+describe("VideoPlayer with the playback session: a replacement's start", () => {
+  /**
+   * Records every write to the element's clock. jsdom has no media pipeline, so
+   * a seek never fires `seeking`; the write is what the player's own start
+   * leaves behind, and counting it is how the tests see a single seek.
+   */
+  function countClockWrites(video: HTMLVideoElement): number[] {
+    const writes: number[] = [];
+    let current = video.currentTime;
+    Object.defineProperty(video, "currentTime", {
+      configurable: true,
+      get: () => current,
+      set: (next: number) => {
+        current = next;
+        writes.push(next);
+      },
+    });
+    return writes;
+  }
+
+  function seekableRange(end: number): TimeRanges {
+    return { length: 1, start: () => 0, end: () => end } as unknown as TimeRanges;
+  }
+
+  /**
+   * Starts a remux session and switches audio through a replan the test
+   * releases by hand, so the outgoing transport keeps playing for as long as a
+   * slow anchor probe would take. Returns the element and the writes made to
+   * its clock once the replacement's stream has been given to it.
+   */
+  async function switchAudioAfterASlowReplan() {
+    const first = remuxPlan();
+    // The new plan starts where the viewer was when the switch was requested
+    // (source 12, anchored at keyframe 10): two seconds of copied pre-roll.
+    const switched = remuxPlan({
+      plan_id: "plan:switched",
+      plan_attempt_key: "v3:switched",
+      selected_tracks: {
+        audio: { id: "file:7:audio:1", index: 1 },
+        subtitle: { id: "file:7:subtitle:0", index: 0 },
+      },
+      timeline: {
+        ...first.timeline,
+        source_start_seconds: 12,
+        stream_origin_seconds: 10,
+        player_start_seconds: 2,
+        timeline_offset_seconds: 10,
+      },
+    });
+    let releaseReplan: (() => void) | null = null;
+    const replanGate = new Promise<void>((resolve) => {
+      releaseReplan = resolve;
+    });
+    const requests = stubServer({
+      start: () => jsonResponse(playable("session-1", first), 201),
+      replan: async () => {
+        await replanGate;
+        return jsonResponse(playable("session-1", switched));
+      },
+    });
+    renderHarness();
+    const video = await startWatching();
+    vi.mocked(video.load).mockClear();
+
+    act(() => sessionRef.current?.switchAudioTrack(1, 12));
+    await waitFor(() => expect(requests.replans[0]?.body.operation).toBe("track_change"));
+    // The probe is still running and the outgoing transport plays on, so the
+    // element's live clock is well past the plan start.
+    video.currentTime = 12.9;
+    act(() => releaseReplan?.());
+
+    await waitFor(() => expect(video.load).toHaveBeenCalled());
+    expect(sessionRef.current?.plan?.selected_tracks.audio?.index).toBe(1);
+    return video;
+  }
+
+  /**
+   * The element's load algorithm ran: emptied paused it, and the clock is back
+   * at the stream's own first frame. A browser discards the pre-metadata start
+   * position here, which is why the plan's start has to be applied after
+   * metadata.
+   */
+  function loadFirstFrame(video: HTMLVideoElement, seekableEnd: number | null) {
+    Object.defineProperty(video, "paused", { configurable: true, value: true });
+    fireEvent.emptied(video);
+    Object.defineProperty(video, "currentTime", {
+      configurable: true,
+      writable: true,
+      value: 0,
+    });
+    if (seekableEnd !== null) {
+      Object.defineProperty(video, "seekable", {
+        configurable: true,
+        value: seekableRange(seekableEnd),
+      });
+    }
+    Object.defineProperty(video, "readyState", {
+      configurable: true,
+      value: HTMLMediaElement.HAVE_METADATA,
+    });
+  }
+
+  it("lands a replacement on the plan start with one seek when the element can serve it", async () => {
+    const video = await switchAudioAfterASlowReplan();
+    // This replacement's element can seek its stream (a byte-addressable
+    // route, or a browser that reports the buffered range as seekable).
+    loadFirstFrame(video, 60);
+    const writes = countClockWrites(video);
+    fireEvent.loadedMetadata(video);
+
+    expect(video.currentTime).toBe(2);
+    expect(writes).toEqual([2]);
+
+    Object.defineProperty(video, "readyState", {
+      configurable: true,
+      value: HTMLMediaElement.HAVE_FUTURE_DATA,
+    });
+    fireEvent.loadedData(video);
+    fireEvent.canPlay(video);
+    await waitFor(() => expect(HTMLMediaElement.prototype.play).toHaveBeenCalled());
+    Object.defineProperty(video, "paused", { configurable: true, value: false });
+    fireEvent.play(video);
+
+    // The probe's delay did not move the start: the plan's own start did.
+    expect(video.currentTime).toBe(2);
+    expect(writes).toEqual([2]);
+    expect(controls.current?.playing).toBe(true);
+  });
+
+  it("clamps a plan start behind the stream's first frame instead of seeking back", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const video = await switchAudioAfterASlowReplan();
+    loadFirstFrame(video, 60);
+    // This response begins after the plan's start: its origin is already past
+    // the position the plan names, so the only frame it can show is the origin.
+    video.currentTime = 5;
+    const writes = countClockWrites(video);
+    fireEvent.loadedMetadata(video);
+
+    expect(writes).toEqual([]);
+    expect(video.currentTime).toBe(5);
+    expect(warn.mock.calls.some((call) => String(call[0]).includes("begins after"))).toBe(true);
+    warn.mockRestore();
+  });
+
+  it("keeps the stream's first frame and issues no seek on a forward-only replacement", async () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    const video = await switchAudioAfterASlowReplan();
+    // A progressive remux reports nothing seekable: its one response has no
+    // byte range that maps back to a media position, so a seek would replay
+    // it from the origin instead of landing on the plan start.
+    loadFirstFrame(video, null);
+    const writes = countClockWrites(video);
+    fireEvent.loadedMetadata(video);
+    Object.defineProperty(video, "readyState", {
+      configurable: true,
+      value: HTMLMediaElement.HAVE_FUTURE_DATA,
+    });
+    fireEvent.loadedData(video);
+    fireEvent.canPlay(video);
+    await waitFor(() => expect(HTMLMediaElement.prototype.play).toHaveBeenCalled());
+    Object.defineProperty(video, "paused", { configurable: true, value: false });
+    fireEvent.play(video);
+
+    expect(writes).toEqual([]);
+    expect(video.currentTime).toBe(0);
+    expect(controls.current?.playing).toBe(true);
+    expect(info.mock.calls.some((call) => String(call[0]).includes("not seekable"))).toBe(true);
+    info.mockRestore();
+  });
+});
+
+describe("VideoPlayer with the playback session: version projection", () => {
+  it("does not reload the media element when a version check restamps the list", async () => {
+    const requests = stubServer({
+      start: () => jsonResponse(playable("session-1", directPlan()), 201),
+      replan: () => jsonResponse(playable("session-1", directPlan()), 200),
+    });
+    const versions: PlayerFileVersion[] = [
+      {
+        file_id: 7,
+        file_path: "/release-a.mkv",
+        resolution: "1080p",
+        codec_video: "h264",
+        codec_audio: "aac",
+        hdr: false,
+        container: "mkv",
+        file_size: 1,
+        duration: 3600,
+        bitrate: 1,
+      },
+    ];
+    const view = renderHarness({ versions });
+    const video = await startWatching();
+    const src = video.getAttribute("src");
+    const loadCalls = vi.mocked(HTMLMediaElement.prototype.load).mock.calls.length;
+
+    // The catalog's version-liveness check answered: the same rows, now
+    // carrying the verdict it stamped on them. That is a new list identity
+    // arriving while the transport plays.
+    view.rerender(
+      createElement(Harness, {
+        versions: [{ ...versions[0]!, available: true }],
+      }),
+    );
+    await act(async () => {});
+
+    expect(video.getAttribute("src")).toBe(src);
+    expect(document.querySelector("video")).toBe(video);
+    expect(vi.mocked(HTMLMediaElement.prototype.load).mock.calls.length).toBe(loadCalls);
+    expect(requests.starts).toHaveLength(1);
+    expect(requests.replans).toHaveLength(0);
+    expect(sessionRef.current?.planRevision).toBe(1);
+  });
+});
+
+describe("VideoPlayer with the playback session: transport identity", () => {
+  it("initialises one transport per plan when the host re-renders", async () => {
+    const requests = stubServer({
+      start: () => jsonResponse(playable("session-1", directPlan()), 201),
+      replan: () => jsonResponse(playable("session-1", directPlan()), 200),
+    });
+    const view = renderHarness();
+    const video = await startWatching();
+    const src = video.getAttribute("src");
+    const loadCalls = vi.mocked(HTMLMediaElement.prototype.load).mock.calls.length;
+
+    // WatchPlaybackChrome rebuilds the pre-play subtitle index maps on every
+    // host render. As `loadSession` dependencies they re-keyed `onPlanFailure`,
+    // which the transport effect lists, so each render tore the media element
+    // down and reloaded the stream from the plan's origin.
+    view.rerender(createElement(Harness, { initialSubtitleTrackIndexByFileId: { 7: 0 } }));
+    await act(async () => {});
+    view.rerender(createElement(Harness, { initialSubtitleTrackIndexByFileId: { 7: 1 } }));
+    await act(async () => {});
+
+    expect(video.getAttribute("src")).toBe(src);
+    expect(document.querySelector("video")).toBe(video);
+    expect(vi.mocked(HTMLMediaElement.prototype.load).mock.calls.length).toBe(loadCalls);
+    expect(sessionRef.current?.planRevision).toBe(1);
+    expect(requests.starts).toHaveLength(1);
+    expect(requests.replans).toHaveLength(0);
+  });
+});
+
+describe("VideoPlayer with the playback session: transport identity", () => {
+  it("keeps the HLS transport for a track_change the server answers on the same stream", async () => {
+    vi.spyOn(HTMLMediaElement.prototype, "canPlayType").mockReturnValue("");
+    const hlsPlan = fixturePlanV3({
+      plan_id: "plan:hls",
+      plan_attempt_key: "v3:hls",
+      stream: {
+        url: "/playback/transcode/session-1/master.m3u8",
+        protocol: "hls",
+        mime_type: "application/vnd.apple.mpegurl",
+        headers: {},
+        header_refresh: "none",
+      },
+    });
+    // The server kept the running generation: same stream, same route, same
+    // audio selection, only the plan's own start follows the live playhead.
+    const sameStreamPlan = fixturePlanV3({
+      plan_id: "plan:hls-track",
+      plan_attempt_key: "v3:hls-track",
+      stream: hlsPlan.stream,
+      timeline: { ...hlsPlan.timeline, player_start_seconds: 150 },
+    });
+    const requests = stubServer({
+      start: () => jsonResponse(playable("session-1", directPlan()), 201),
+      replan: (_url, body) =>
+        jsonResponse(
+          playable("session-1", body.operation === "quality_change" ? hlsPlan : sameStreamPlan),
+        ),
+    });
+
+    renderHarness();
+    const video = await startWatching();
+    act(() => sessionRef.current?.changeQuality("720p", 100));
+    await waitFor(() => expect(hlsJS.latest).not.toBeNull());
+    expect(hlsJS.loadSource).toHaveBeenCalledTimes(1);
+    vi.mocked(HTMLMediaElement.prototype.load).mockClear();
+    const src = video.getAttribute("src");
+
+    // Subtitles off on a plan that shows none is a track change that changes
+    // nothing: the A/V transport is reused, so the element must not reload and
+    // the manifest must not be fetched again.
+    act(() => sessionRef.current?.changeSubtitleTrack(null, 150));
+    await waitFor(() =>
+      expect(requests.replans.map(({ body }) => body.operation)).toEqual([
+        "quality_change",
+        "track_change",
+      ]),
+    );
+    await waitFor(() => expect(sessionRef.current?.planRevision).toBe(3));
+    await act(async () => Promise.resolve());
+
+    expect(sessionRef.current?.transportRevision).toBe(2);
+    expect(hlsJS.loadSource).toHaveBeenCalledTimes(1);
+    expect(HTMLMediaElement.prototype.load).not.toHaveBeenCalled();
+    expect(video.getAttribute("src")).toBe(src);
+  });
+});
+
+describe("VideoPlayer with the playback session: a refused seek retry", () => {
+  const PRE_SEEK_POSITION = 32.172995;
+  const SEEK_TARGET = 918.161458;
+
+  function seekRefusal(sessionId: string) {
+    return {
+      protocol_version: 3,
+      server_features: ["playback_plan_v3"],
+      outcome: "adaptation_unavailable",
+      session_id: sessionId,
+      terminal: {
+        reason: "seek_reanchor_evidence_unavailable",
+        message: "The frozen playback source could not be reopened; start a new playback attempt.",
+        retryable: true,
+      },
+    };
+  }
+
+  /** Answers the player's automatic non-seek replans without touching the plan. */
+  function seekReplan(url: string, body: Body) {
+    if (body.operation === "seek_reanchor") {
+      return jsonResponse(seekRefusal(/playback\/([^/]+)\/replan/.exec(url)?.[1] ?? "session-1"));
+    }
+    return jsonResponse(playable("session-1", retryablePlan()));
+  }
+
+  /** A remux plan whose window makes the far seek a server reanchor. */
+  function retryablePlan(sessionId = "session-1", overrides: Partial<PlanV3> = {}): PlanV3 {
+    return remuxPlan({
+      effective_virtual_uri: "virtual://movie/x?result=1",
+      session_id: sessionId,
+      selected_tracks: { audio: { id: "file:7:audio:0", index: 0 } },
+      ...overrides,
+      stream: {
+        ...remuxPlan().stream,
+        url: `/stream/${sessionId}`,
+      },
+    });
+  }
+
+  async function showSeekCard(requests: Requests, video: HTMLVideoElement) {
+    // The viewer was 32 s in when they asked for 918 s. The remux window only
+    // reaches 300 s, so the player asks the server for a new window.
+    Object.defineProperty(video, "currentTime", {
+      configurable: true,
+      writable: true,
+      value: PRE_SEEK_POSITION - remuxPlan().timeline.timeline_offset_seconds,
+    });
+    showFrame(video);
+    seekableWindow(video, 300);
+
+    await act(async () => {
+      controls.current?.onSeek?.(SEEK_TARGET);
+      // Let the replan settle inside act, so the card's state is the one the
+      // next render reads rather than a pending update from outside it.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    await waitFor(() =>
+      expect(requests.replans.some(({ body }) => body.operation === "seek_reanchor")).toBe(true),
+    );
+    const seekRequest = requests.replans.find(({ body }) => body.operation === "seek_reanchor");
+    expect(seekRequest?.body).toMatchObject({
+      operation: "seek_reanchor",
+      position_seconds: SEEK_TARGET,
+    });
+    await waitFor(() => expect(screen.getByText("Try again")).toBeInTheDocument());
+  }
+
+  it("restores the pre-seek position on the card and retries at the seek target", async () => {
+    const requests = stubServer({
+      start: () => jsonResponse(playable("session-1", retryablePlan()), 201),
+      replan: seekReplan,
+    });
+
+    renderHarness();
+    const video = await startWatching();
+    await showSeekCard(requests, video);
+
+    // The card shows where the viewer was, not the target that never played.
+    expect(controls.current?.currentTime).toBeCloseTo(PRE_SEEK_POSITION, 3);
+
+    fireEvent.click(screen.getByText("Try again"));
+    await waitFor(() => expect(requests.starts).toHaveLength(2));
+    expect(requests.starts[1]?.start_position).toBeCloseTo(SEEK_TARGET, 3);
+    expect(requests.starts[1]?.file_id).toBe(7);
+  });
+
+  it("plays a successful retry at the target and advances from there", async () => {
+    const requests = stubServer({
+      start: (body, count) => {
+        if (count === 1) return jsonResponse(playable("session-1", retryablePlan()), 201);
+        const target = typeof body.start_position === "number" ? body.start_position : 0;
+        return jsonResponse(
+          playable(
+            "session-2",
+            retryablePlan("session-2", {
+              plan_id: "plan:seek-retry",
+              plan_attempt_key: "v3:seek-retry",
+              timeline: {
+                ...remuxPlan().timeline,
+                source_start_seconds: target,
+                stream_origin_seconds: target,
+                player_start_seconds: target,
+                timeline_offset_seconds: 0,
+              },
+            }),
+          ),
+          201,
+        );
+      },
+      replan: seekReplan,
+    });
+
+    renderHarness();
+    const video = await startWatching();
+    await showSeekCard(requests, video);
+
+    // The card paused the element to put the controls back on the pre-seek
+    // position. The player reported that pause, as the live element does. The
+    // retry must not inherit it: the viewer clicked Try again.
+    act(() => sessionRef.current?.updatePlaybackState(PRE_SEEK_POSITION, false));
+    fireEvent.click(screen.getByText("Try again"));
+    await waitFor(() => expect(sessionRef.current?.plan?.session_id).toBe("session-2"));
+    // The target survives the card's restored position (PR #477).
+    expect(requests.starts[1]?.start_position).toBeCloseTo(SEEK_TARGET, 3);
+    expect(sessionRef.current?.plan?.timeline.player_start_seconds).toBeCloseTo(SEEK_TARGET, 3);
+    expect(sessionRef.current?.shouldAutoPlay).toBe(true);
+
+    const retried = await waitFor(() => {
+      const element = document.querySelector("video");
+      expect(element?.getAttribute("src")).toContain("session-2");
+      return element as HTMLVideoElement;
+    });
+    // The replacement generation is loaded but has not started yet: the
+    // element is paused as the load algorithm leaves it, with data to play.
+    Object.defineProperty(retried, "paused", { configurable: true, value: true });
+    Object.defineProperty(retried, "readyState", {
+      configurable: true,
+      value: HTMLMediaElement.HAVE_FUTURE_DATA,
+    });
+    fireEvent.loadedData(retried);
+    fireEvent.canPlay(retried);
+    await waitFor(() => expect(HTMLMediaElement.prototype.play).toHaveBeenCalled());
+
+    // The element started, and the playhead advances from the retry target.
+    Object.defineProperty(retried, "paused", { configurable: true, value: false });
+    fireEvent.play(retried);
+    Object.defineProperty(retried, "currentTime", {
+      configurable: true,
+      writable: true,
+      value: SEEK_TARGET + 1.5,
+    });
+    showFrame(retried);
+    expect(controls.current?.playing).toBe(true);
+    expect(controls.current?.currentTime).toBeGreaterThan(SEEK_TARGET);
+  });
+
+  it("says the target cannot be honoured when the source moved with the card up", async () => {
+    const requests = stubServer({
+      start: () => jsonResponse(playable("session-1", retryablePlan()), 201),
+      replan: seekReplan,
+    });
+
+    renderHarness();
+    const video = await startWatching();
+    await showSeekCard(requests, video);
+
+    // A serve-layer rotation moves the live candidate without adopting a new
+    // plan. The target belongs to the outgoing source, so the retry must not
+    // send it to this one.
+    act(() =>
+      sessionRef.current?.applyCommittedSource(
+        {
+          effectiveMediaFileId: 7,
+          effectiveVirtualUri: "virtual://movie/x?result=2",
+        },
+        [],
+      ),
+    );
+    fireEvent.click(screen.getByText("Try again"));
+
+    await waitFor(() =>
+      expect(sessionRef.current?.errorReason).toBe("seek_retry_target_unavailable"),
+    );
+    expect(sessionRef.current?.errorRetryable).toBe(false);
+    expect(requests.starts).toHaveLength(1);
+    await waitFor(() => expect(screen.getByText(/source changed/i)).toBeInTheDocument());
   });
 });

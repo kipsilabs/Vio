@@ -13,6 +13,7 @@ import (
 
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
 	mediarequests "github.com/Silo-Server/silo-server/internal/requests"
+	"github.com/Silo-Server/silo-server/internal/requests/discoverrows"
 )
 
 // The requests domain: a profile's media requests and the TMDB-backed
@@ -143,8 +144,9 @@ type RequestMediaPage struct {
 
 // DiscoverSection is one discovery row.
 type DiscoverSection struct {
-	Key          string               `json:"key" doc:"The row's stable ID. The six built-in rows keep trending_movies, trending_series, popular_movies, popular_series, upcoming_movies and on_air_series; a row an admin adds has an opaque ID" example:"trending_movies"`
-	Title        string               `json:"title" example:"Trending Movies"`
+	Key   string `json:"key" doc:"The row's stable ID. The six built-in rows keep trending_movies, trending_series, popular_movies, popular_series, upcoming_movies and on_air_series; a row an admin adds has an opaque ID" example:"trending_movies"`
+	Title string `json:"title" example:"Trending Movies"`
+	SectionTitleKey
 	Page         int                  `json:"page" example:"1"`
 	TotalPages   int                  `json:"total_pages" example:"500"`
 	TotalResults int                  `json:"total_results" example:"10000"`
@@ -222,6 +224,7 @@ type MediaRequest struct {
 	Overview             string                  `json:"overview,omitempty"`
 	PosterPath           string                  `json:"poster_path,omitempty" doc:"TMDB image path"`
 	BackdropPath         string                  `json:"backdrop_path,omitempty" doc:"TMDB image path"`
+	PosterURL            string                  `json:"poster_url,omitempty" format:"uri-reference" doc:"Admin request reads only (listAdminRequests and the admin request actions): the poster as a root-relative path on this server, getAdminRequestPoster, which serves the TMDB poster through the server. Fetch it with the credentials that read the row. It does not expire. Absent when the request has no TMDB poster, and on a server that cannot fetch posters (the admin request capabilities then report request_posters false)" example:"/api/v2/admin/requests/1834729/poster"`
 	Status               string                  `json:"status" doc:"pending, approved, queued, downloading, completed" example:"pending"`
 	Outcome              string                  `json:"outcome" doc:"active, declined, cancelled, failed" example:"active"`                                                                                                                                                    //nolint:misspell // the store's spelling
 	State                string                  `json:"state" doc:"The one state to show a user: pending, approved, processing, partially_available (some requested seasons are in the library), available (in the library), declined, cancelled or failed" example:"pending"` //nolint:misspell // the store's spelling
@@ -699,7 +702,7 @@ func (reg *Registry) listDiscoverSections(ctx context.Context, _ *struct{}) (*Di
 	reg.markInWatchlist(ctx, marks)
 	order := make([]DiscoverRowRef, 0, len(page.Order))
 	for _, r := range page.Order {
-		order = append(order, DiscoverRowRef{Key: r.Key, Type: string(r.Type), Title: r.Title})
+		order = append(order, DiscoverRowRef{Key: r.Key, Type: string(r.Type), Title: r.Title, SectionTitleKey: sectionTitleKeyOf(discoverrows.TitleKey(r.Key, r.Title), nil)})
 	}
 	return &DiscoverSectionCollectionOutput{Body: DiscoverSectionCollection{Collection: NewCollection(items), RowOrder: order}}, nil
 }
@@ -816,6 +819,15 @@ func canceledRequestProblem(ctx context.Context) *Problem {
 // conflicts are 409, an unreachable integration is 503
 // dependency_unavailable, an abandoned request is 408 request_timeout, and
 // anything else is an internal error.
+// withholdRequestDeployment removes the deployment details a scoped API key
+// must not see: the transport error and the target's server and routing names.
+func withholdRequestDeployment(r *MediaRequest) {
+	r.LastError = ""
+	for i := range r.Targets {
+		r.Targets[i].LastError, r.Targets[i].InstanceName, r.Targets[i].RouteName = "", "", ""
+	}
+}
+
 func requestProblem(ctx context.Context, err error) *Problem {
 	if verr, ok := errors.AsType[*mediarequests.ValidationError](err); ok {
 		p := NewProblem(TypeValidationFailed, "The request did not pass validation; see errors.")
@@ -944,16 +956,22 @@ func mediaRequestOf(r *mediarequests.Request, viewer mediarequests.Viewer) Media
 }
 
 // requestDownloadOf maps download progress. The byte counts and percent are
-// left out while the size is unknown (a total of 0).
+// left out while the size is unknown (a total of 0). Progress with no report
+// time, which only an out-of-band database edit can leave behind, is left out
+// whole: a zero Instant cannot be marshaled and would fail the entire response.
+// A zero estimate is left out for the same reason. Both stay on the domain value
+// so the download refresh pass can still clear them.
 func requestDownloadOf(d *mediarequests.DownloadProgress) *RequestDownload {
-	if d == nil {
+	if d == nil || d.UpdatedAt.IsZero() {
 		return nil
 	}
 	out := &RequestDownload{
-		Phase:                 string(d.Phase),
-		EstimatedCompletionAt: instantPtr(d.EstimatedCompletion),
-		Downloads:             max(d.Downloads, 0),
-		UpdatedAt:             NewInstant(d.UpdatedAt),
+		Phase:     string(d.Phase),
+		Downloads: max(d.Downloads, 0),
+		UpdatedAt: NewInstant(d.UpdatedAt),
+	}
+	if d.EstimatedCompletion != nil && !d.EstimatedCompletion.IsZero() {
+		out.EstimatedCompletionAt = instantPtr(d.EstimatedCompletion)
 	}
 	if d.BytesTotal > 0 {
 		total, left := d.BytesTotal, min(max(d.BytesLeft, 0), d.BytesTotal)
@@ -1033,7 +1051,7 @@ func requestMediaSeasonsOf(seasons []mediarequests.RequestSeason) []RequestMedia
 
 func discoverSectionOf(s *mediarequests.DiscoverySection) DiscoverSection {
 	return DiscoverSection{
-		Key: s.Key, Title: s.Title, Page: s.Page, TotalPages: s.TotalPages, TotalResults: s.TotalResults,
+		Key: s.Key, Title: s.Title, SectionTitleKey: sectionTitleKeyOf(discoverrows.TitleKey(s.Key, s.Title), nil), Page: s.Page, TotalPages: s.TotalPages, TotalResults: s.TotalResults,
 		Results: requestMediaResultsOf(s.Results), NextPage: s.NextPage,
 	}
 }

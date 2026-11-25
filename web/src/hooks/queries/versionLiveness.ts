@@ -1,10 +1,19 @@
-import { useQueries } from "@tanstack/react-query";
+import { useQueries, type QueryClient } from "@tanstack/react-query";
 import { useMemo } from "react";
 
-import { apiV1 } from "@/api/client";
-import type { VersionLivenessResponse } from "@/api/types";
+import type {
+  VersionLivenessResponse,
+  VersionLivenessResult,
+  VersionPlayability,
+} from "@/api/types";
+import { v2 } from "@/api/v2/request";
+import type { components } from "@/api/v2/schema";
 import { catalogKeys } from "@/hooks/queries/keys";
+import type { ClientCodecCapabilitiesV3, ClientPlaybackContextV3 } from "@/player/protocol-v3";
 import { isVirtualFileVersion } from "@/pages/ItemDetail/components/versionFormatUtils";
+
+type CatalogVersionsCheck = components["schemas"]["CatalogVersionsCheck"];
+type CatalogVersionCheckResult = CatalogVersionsCheck["results"][number];
 
 /**
  * The minimal server-shaped fields the liveness check reads from a row. Both
@@ -23,6 +32,20 @@ export interface VersionLivenessCandidate {
   /** A recent probe rejected the provider's bytes as a different release than
    *  this row declares. Advisory only; never implies `failed`. */
   source_mismatch?: { served_bytes: number; declared_bytes: number };
+  /** The client-specific playability verdict from the check. Absent means
+   *  unknown (not checked, or the pass could not finish), never unplayable. */
+  playability?: VersionPlayability;
+}
+
+/**
+ * The client half of a playback start, sent with the versions check so the
+ * server can plan each row with the same capability surface the start uses.
+ * `features` is the client's negotiated feature list from startPlayback.
+ */
+export interface VersionPlayabilityClient {
+  features?: string[];
+  capabilities: ClientCodecCapabilitiesV3;
+  playbackContext: ClientPlaybackContextV3;
 }
 
 /** A source-mismatch verdict: bytes served versus bytes declared. */
@@ -50,16 +73,265 @@ export const VERSION_LIVENESS_BATCH_SIZE = 40;
 /** How long a liveness result is trusted before it is re-checked. */
 export const VERSION_LIVENESS_STALE_MS = 5 * 60 * 1000;
 
+/**
+ * A check slower than this is a slow provider resolution, not a hiccup. Its
+ * answer is held for longer so a slow server is asked less, not more: the check
+ * is advisory menu health, and re-probing a struggling provider only adds load.
+ */
+export const VERSION_LIVENESS_SLOW_MS = 1_000;
+
+/** Ceiling on the window a slow check earns (10x its own latency). */
+export const VERSION_LIVENESS_MAX_WINDOW_MS = 15 * 60 * 1000;
+
+/**
+ * Floor between two checks of one row set when a catalog `versions_updated`
+ * event asks for one. The event says a row was stamped or rewritten, not which
+ * rows, and a refresh announces its burst one row at a time.
+ */
+export const VERSION_LIVENESS_FORCED_MIN_INTERVAL_MS = 30 * 1000;
+
+/** Coalescing window for a burst of `versions_updated` events. */
+export const VERSION_LIVENESS_REFRESH_DELAY_MS = 750;
+
+/** Upper bound on how long coalescing may postpone a refresh. */
+export const VERSION_LIVENESS_REFRESH_MAX_WAIT_MS = 3 * 1000;
+
+/**
+ * Reads one v2 check result into the numeric file ids the item page and player
+ * menus key on. The v2 contract renders ids as opaque strings; a value that is
+ * not a positive safe integer names no catalog row, so it is dropped rather
+ * than keyed under NaN.
+ */
+function livenessResultFromV2(
+  result: CatalogVersionCheckResult,
+): VersionLivenessResult | undefined {
+  const fileId = Number(result.file_id);
+  if (!Number.isSafeInteger(fileId) || fileId <= 0) {
+    return undefined;
+  }
+  return {
+    file_id: fileId,
+    available: result.available,
+    failed: result.failed,
+    source_mismatch: result.source_mismatch
+      ? {
+          served_bytes: result.source_mismatch.served_bytes,
+          declared_bytes: result.source_mismatch.declared_bytes,
+        }
+      : undefined,
+    playability: result.playability
+      ? {
+          playable: result.playability.playable,
+          reason: result.playability.reason,
+          message: result.playability.message,
+        }
+      : undefined,
+  };
+}
+
+export interface VersionCheckRequestOptions {
+  signal?: AbortSignal;
+  client?: VersionPlayabilityClient;
+  /** Ask for the cheap durable-health + playability answer only. */
+  playabilityOnly?: boolean;
+}
+
 export async function fetchVersionLiveness(
   fileIds: number[],
-  options?: RequestInit,
+  options?: VersionCheckRequestOptions,
 ): Promise<VersionLivenessResponse> {
-  return apiV1<VersionLivenessResponse>("/catalog/versions/check", {
-    ...options,
-    method: "POST",
-    headers: { "Content-Type": "application/json", ...(options?.headers ?? {}) },
-    body: JSON.stringify({ file_ids: fileIds }),
+  const client = options?.client;
+  const response = await v2("POST /api/v2/catalog/versions/check", {
+    body: {
+      file_ids: fileIds.map(String),
+      ...(options?.playabilityOnly ? { playability_only: true } : {}),
+      ...(client
+        ? {
+            ...(client.features ? { client_features: client.features } : {}),
+            client_capabilities: client.capabilities,
+            client_playback_context: client.playbackContext,
+          }
+        : {}),
+    },
+    ...(options?.signal ? { signal: options.signal } : {}),
   });
+  return {
+    results: response.results.flatMap((result) => {
+      const mapped = livenessResultFromV2(result);
+      return mapped ? [mapped] : [];
+    }),
+  };
+}
+
+/**
+ * The checks one server has already answered, one entry per row set, and the
+ * one in flight for it. A row set is the batch a single request names, so the
+ * key is the sorted id list: two callers asking about the same rows share an
+ * answer, and a caller asking about different rows gets its own.
+ */
+interface LivenessCheckRecord {
+  at: number;
+  durationMs: number;
+  response: VersionLivenessResponse;
+}
+
+const checkedRowSets = new Map<string, LivenessCheckRecord>();
+const inFlightRowSets = new Map<string, Promise<VersionLivenessResponse>>();
+/** Row sets a catalog event asked to re-check, waiting for the next request. */
+const forcedRowSets = new Set<string>();
+
+function clientRowSetKey(client: VersionPlayabilityClient | undefined): string {
+  if (!client) return "no-client";
+  return JSON.stringify([client.features ?? [], client.capabilities, client.playbackContext]);
+}
+
+function rowSetKey(fileIds: number[], options?: VersionCheckRequestOptions): string {
+  // The client block is part of the key: a display or decoder change can
+  // change a verdict for the same row set, and reusing the previous answer
+  // would keep a now-unplayable row selectable (or hide a playable one).
+  return `${options?.playabilityOnly ? "playability" : "liveness"}:${clientRowSetKey(options?.client)}:${[
+    ...fileIds,
+  ]
+    .sort((a, b) => a - b)
+    .join(",")}`;
+}
+
+/** How long this row set's answer stays authoritative. */
+function reuseWindowMs(record: LivenessCheckRecord): number {
+  if (record.durationMs < VERSION_LIVENESS_SLOW_MS) {
+    return VERSION_LIVENESS_STALE_MS;
+  }
+  return Math.min(
+    VERSION_LIVENESS_MAX_WINDOW_MS,
+    Math.max(VERSION_LIVENESS_STALE_MS, record.durationMs * 10),
+  );
+}
+
+/**
+ * Checks a row set at most as often as its own cost justifies.
+ *
+ * A liveness check resolves the provider per row, so a re-check is not free:
+ * it is the most expensive read a version list makes. Three rules keep one row
+ * set from being asked about more than it can answer:
+ *
+ * - One request in flight per row set; a second caller waits on the first.
+ * - An answer stands for VERSION_LIVENESS_STALE_MS, and longer when the check
+ *   was slow (10x its own latency, capped at VERSION_LIVENESS_MAX_WINDOW_MS).
+ * - A catalog `versions_updated` event may force an earlier check, but not
+ *   more often than VERSION_LIVENESS_FORCED_MIN_INTERVAL_MS. The event names no
+ *   rows, so every known row set is marked; the floor is what stops a refresh
+ *   that announces hundreds of stamped rows from re-probing them per event.
+ *
+ * A row set that actually changed is a new key and is checked at once. Nothing
+ * here polls: a re-render, a remount, a re-enable, or an unchanged list reuses
+ * the answer it already has.
+ */
+export function checkVersionLiveness(
+  fileIds: number[],
+  options?: VersionCheckRequestOptions,
+): Promise<VersionLivenessResponse> {
+  const key = rowSetKey(fileIds, options);
+  const running = inFlightRowSets.get(key);
+  if (running) return running;
+
+  const record = checkedRowSets.get(key);
+  const now = Date.now();
+  if (record) {
+    const age = now - record.at;
+    const forced = forcedRowSets.has(key);
+    const window = forced ? VERSION_LIVENESS_FORCED_MIN_INTERVAL_MS : reuseWindowMs(record);
+    if (age < window) {
+      forcedRowSets.delete(key);
+      return Promise.resolve(record.response);
+    }
+  }
+  forcedRowSets.delete(key);
+
+  const startedAt = now;
+  const request = fetchVersionLiveness(fileIds, options)
+    .then((response) => {
+      checkedRowSets.set(key, {
+        at: Date.now(),
+        durationMs: Date.now() - startedAt,
+        response,
+      });
+      return response;
+    })
+    .catch((error: unknown) => {
+      // A failed check teaches nothing about the rows. Drop the record so the
+      // next caller retries instead of reusing a stale verdict as if it were
+      // an answer.
+      checkedRowSets.delete(key);
+      throw error;
+    })
+    .finally(() => {
+      inFlightRowSets.delete(key);
+    });
+  inFlightRowSets.set(key, request);
+  return request;
+}
+
+/**
+ * The cheap playability pass a detail page runs before the viewer opens the
+ * picker: it judges every row with the client's own capability block without
+ * resolving provider pins. It shares the liveness gate's coalescing and cache,
+ * keyed separately by mode and client.
+ */
+export function checkVersionPlayability(
+  fileIds: number[],
+  client: VersionPlayabilityClient,
+): Promise<VersionLivenessResponse> {
+  return checkVersionLiveness(fileIds, { client, playabilityOnly: true });
+}
+
+/**
+ * Marks every known row set for one re-check: a catalog event said a row was
+ * stamped or its versions rewritten, and the event names no rows. The floor in
+ * `checkVersionLiveness` turns any number of these into one check per row set.
+ */
+export function markVersionLivenessStale() {
+  for (const key of checkedRowSets.keys()) {
+    forcedRowSets.add(key);
+  }
+}
+
+/** Drops every cached answer. Tests only; production never needs a reset. */
+export function resetVersionLivenessCache() {
+  checkedRowSets.clear();
+  inFlightRowSets.clear();
+  forcedRowSets.clear();
+}
+
+const pendingRefreshes = new WeakMap<
+  QueryClient,
+  { timer: ReturnType<typeof setTimeout>; deadline: number }
+>();
+
+/**
+ * Re-checks the mounted version lists after a catalog `versions_updated` event.
+ *
+ * A refresh stamping rows emits one event per row, and each used to invalidate
+ * every mounted check at once. The invalidation is therefore coalesced: one
+ * lands per refresh burst, and the check itself is rate-limited per row set by
+ * `markVersionLivenessStale`.
+ */
+export function scheduleVersionLivenessRefresh(queryClient: QueryClient) {
+  const existing = pendingRefreshes.get(queryClient);
+  if (existing) clearTimeout(existing.timer);
+  const now = Date.now();
+  const deadline = existing?.deadline ?? now + VERSION_LIVENESS_REFRESH_MAX_WAIT_MS;
+  const timer = setTimeout(
+    () => {
+      pendingRefreshes.delete(queryClient);
+      markVersionLivenessStale();
+      void queryClient.invalidateQueries(
+        { queryKey: catalogKeys.versionLiveness },
+        { cancelRefetch: false },
+      );
+    },
+    Math.max(0, Math.min(VERSION_LIVENESS_REFRESH_DELAY_MS, deadline - now)),
+  );
+  pendingRefreshes.set(queryClient, { timer, deadline });
 }
 
 /**
@@ -71,6 +343,24 @@ export function chunkVirtualFileIds(versions: VersionLivenessCandidate[]): numbe
   const fileIds = versions
     .filter((version) => isVirtualFileVersion(version))
     .map((version) => version.file_id)
+    .sort((a, b) => a - b);
+
+  const chunks: number[][] = [];
+  for (let i = 0; i < fileIds.length; i += VERSION_LIVENESS_BATCH_SIZE) {
+    chunks.push(fileIds.slice(i, i + VERSION_LIVENESS_BATCH_SIZE));
+  }
+  return chunks;
+}
+
+/**
+ * Batches every row of a list, virtual or local. The playability verdict is
+ * about the row itself, so the cheap pass cannot skip local files the way the
+ * provider-liveness pass does.
+ */
+export function chunkFileIds(versions: VersionLivenessCandidate[]): number[][] {
+  const fileIds = versions
+    .map((version) => version.file_id)
+    .filter((fileId) => Number.isSafeInteger(fileId) && fileId > 0)
     .sort((a, b) => a - b);
 
   const chunks: number[][] = [];
@@ -145,7 +435,10 @@ export function useVersionLiveness(
   const queryResults = useQueries({
     queries: chunks.map((fileIds) => ({
       queryKey: [...catalogKeys.versionLiveness, fileIds],
-      queryFn: () => fetchVersionLiveness(fileIds),
+      // Through the gate, not straight to the network: re-renders, remounts and
+      // event-driven invalidations of an unchanged row set reuse its answer
+      // instead of resolving the provider again.
+      queryFn: () => checkVersionLiveness(fileIds),
       enabled: enabled && fileIds.length > 0,
       staleTime: VERSION_LIVENESS_STALE_MS,
     })),
@@ -161,6 +454,77 @@ export function useVersionLiveness(
       }),
     // eslint-disable-next-line react-hooks/exhaustive-deps -- depend on each query's data, not the result objects.
     [versions, ...queryResults.map((query) => query.data)],
+  );
+}
+
+/**
+ * The client-specific playability verdicts for every row of a list. It is the
+ * cheap pass the detail page runs before the viewer picks: no provider pins
+ * are resolved, and the answer is cached by mode and client block so a
+ * re-render or a picker open reuses it.
+ */
+export function useVersionPlayability(
+  versions: VersionLivenessCandidate[],
+  client: VersionPlayabilityClient | undefined,
+  enabled: boolean,
+): Map<number, VersionPlayability> {
+  const chunks = useMemo(() => chunkFileIds(versions), [versions]);
+  const clientKey = useMemo(() => (client ? clientRowSetKey(client) : ""), [client]);
+
+  const queryResults = useQueries({
+    queries: chunks.map((fileIds) => ({
+      queryKey: [...catalogKeys.versionLiveness, "playability", clientKey, fileIds],
+      queryFn: () => checkVersionPlayability(fileIds, client!),
+      enabled: enabled && !!client && fileIds.length > 0,
+      staleTime: VERSION_LIVENESS_STALE_MS,
+    })),
+  });
+
+  return useMemo(() => {
+    const verdicts = new Map<number, VersionPlayability>();
+    for (const result of queryResults.flatMap((query) => query.data?.results ?? [])) {
+      if (result.playability) {
+        verdicts.set(result.file_id, result.playability);
+      }
+    }
+    return verdicts;
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- depend on each query's data, not the result objects.
+  }, [clientKey, ...queryResults.map((query) => query.data)]);
+}
+
+/**
+ * Stamps the playability verdict onto the rows the picker renders. A row with
+ * no verdict (not checked, or the pass could not finish) is left untouched so
+ * an unfinished pass never looks like a refusal.
+ */
+export function applyVersionPlayability<T extends VersionLivenessCandidate>(
+  versions: T[],
+  verdicts: Map<number, VersionPlayability>,
+): T[] {
+  if (verdicts.size === 0) return versions;
+  let changed = false;
+  const next = versions.map((version) => {
+    const verdict = verdicts.get(version.file_id);
+    if (!verdict || samePlayability(version.playability, verdict)) {
+      return version;
+    }
+    changed = true;
+    return { ...version, playability: verdict };
+  });
+  return changed ? next : versions;
+}
+
+function samePlayability(
+  current: VersionPlayability | undefined,
+  next: VersionPlayability | undefined,
+): boolean {
+  if (current === undefined || next === undefined) {
+    return current === next;
+  }
+  return (
+    current.playable === next.playable &&
+    current.reason === next.reason &&
+    current.message === next.message
   );
 }
 

@@ -67,7 +67,7 @@ func (l *profileCapturingIdentityLookup) LookupIdentity(
 	_ context.Context, _ int, profileID string,
 ) (UserIdentity, error) {
 	l.profileID = profileID
-	return UserIdentity{Username: "alice", ProfileName: "Living Room"}, nil
+	return UserIdentity{Username: "alice", ProfileName: "Living Room", ProfileIsPrimary: true}, nil
 }
 
 func TestHTTPProxyUsesLaunchProfileWithoutRequestHeader(t *testing.T) {
@@ -78,10 +78,10 @@ func TestHTTPProxyUsesLaunchProfileWithoutRequestHeader(t *testing.T) {
 		profileTestProxyService{client: client}, profileTestInstallationStore{},
 	).WithUserThemeLookup(themes).WithUserIdentityLookup(identities)
 
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/plugins/1/page", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v2/plugin-content/plugins/1/page", nil)
 	req = req.WithContext(WithPluginAccessUser(req.Context(), true, false, 7, "profile-1"))
 	rec := httptest.NewRecorder()
-	proxy.ServeRoute(rec, req, 1, true, false)
+	proxy.serveRoute(rec, req, 1, true, false)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
@@ -96,6 +96,90 @@ func TestHTTPProxyUsesLaunchProfileWithoutRequestHeader(t *testing.T) {
 	}
 }
 
+// The host sends every injected plugin identity, display and theme header
+// under the documented X-Silo-* name as well as the fork's X-Vio-* name.
+// Third-party http_routes.v1 plugins read the documented names by exact key
+// (HeaderUserID/HeaderUserRole in the plugin SDK), so a request that carries
+// only X-Vio-* is refused: a logged-in admin gets 403 "Administrator access
+// required" from the plugin.
+func TestHTTPProxyEmitsDocumentedAndForkPluginHeaders(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		admin bool
+		role  string
+	}{
+		{name: "admin", admin: true, role: "admin"},
+		{name: "non-admin", admin: false, role: "user"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &profileTestRouteClient{}
+			themes := &profileCapturingThemeLookup{}
+			identities := &profileCapturingIdentityLookup{}
+			proxy := NewHTTPProxy(
+				profileTestProxyService{client: client}, profileTestInstallationStore{},
+			).WithUserThemeLookup(themes).WithUserIdentityLookup(identities)
+
+			req := httptest.NewRequest(http.MethodGet, "/api/v2/plugin-content/plugins/1/page", nil)
+			req = req.WithContext(WithPluginAccessUser(req.Context(), true, tc.admin, 7, "profile-1"))
+			rec := httptest.NewRecorder()
+			proxy.serveRoute(rec, req, 1, true, tc.admin)
+
+			if rec.Code != http.StatusOK || client.request == nil {
+				t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+			}
+			for _, want := range []struct{ name, value string }{
+				{httpheader.LegacyPluginUserID, "7"},
+				{httpheader.LegacyPluginUserRole, tc.role},
+				{httpheader.LegacyPluginTheme, "dark"},
+				{httpheader.LegacyPluginUserName, "alice"},
+				{httpheader.LegacyPluginProfName, "Living Room"},
+				{httpheader.LegacyPluginProfPrim, "true"},
+				{httpheader.PluginUserID, "7"},
+				{httpheader.PluginUserRole, tc.role},
+				{httpheader.PluginTheme, "dark"},
+				{httpheader.PluginUserName, "alice"},
+				{httpheader.PluginProfileName, "Living Room"},
+				{httpheader.PluginProfilePrime, "true"},
+			} {
+				if got := client.request.Headers[want.name]; got != want.value {
+					t.Errorf("%s = %q, want %q", want.name, got, want.value)
+				}
+			}
+		})
+	}
+}
+
+// The header allowlist drops client-supplied plugin identity headers, so a
+// viewer cannot claim admin by sending one; the verified session wins in both
+// spellings.
+func TestHTTPProxyStripsClientSuppliedPluginIdentityHeaders(t *testing.T) {
+	client := &profileTestRouteClient{}
+	proxy := NewHTTPProxy(profileTestProxyService{client: client}, profileTestInstallationStore{})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v2/plugin-content/plugins/1/page", nil)
+	req.Header.Set(httpheader.LegacyPluginUserID, "1")
+	req.Header.Set(httpheader.PluginUserID, "1")
+	req.Header.Set(httpheader.LegacyPluginUserRole, "admin")
+	req.Header.Set(httpheader.PluginUserRole, "admin")
+	req = req.WithContext(WithPluginAccessUser(req.Context(), true, false, 7, ""))
+	rec := httptest.NewRecorder()
+	proxy.serveRoute(rec, req, 1, true, false)
+
+	if rec.Code != http.StatusOK || client.request == nil {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	for _, want := range []struct{ name, value string }{
+		{httpheader.LegacyPluginUserID, "7"},
+		{httpheader.LegacyPluginUserRole, "user"},
+		{httpheader.PluginUserID, "7"},
+		{httpheader.PluginUserRole, "user"},
+	} {
+		if got := client.request.Headers[want.name]; got != want.value {
+			t.Errorf("%s = %q, want %q", want.name, got, want.value)
+		}
+	}
+}
+
 // Only the profile the access resolver verified reaches the plugin. A raw
 // X-Profile-Id names a profile without its PIN proof, so it must not pick
 // the profile the plugin sees.
@@ -107,11 +191,11 @@ func TestHTTPProxyIgnoresUnverifiedProfileHeader(t *testing.T) {
 		profileTestProxyService{client: client}, profileTestInstallationStore{},
 	).WithUserThemeLookup(themes).WithUserIdentityLookup(identities)
 
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/plugins/1/page", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v2/plugin-content/plugins/1/page", nil)
 	req.Header.Set("X-Profile-Id", "locked-profile")
 	req = req.WithContext(WithPluginAccessUser(req.Context(), true, false, 7, ""))
 	rec := httptest.NewRecorder()
-	proxy.ServeRoute(rec, req, 1, true, false)
+	proxy.serveRoute(rec, req, 1, true, false)
 
 	if rec.Code != http.StatusOK || client.request == nil {
 		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
@@ -130,14 +214,14 @@ func TestHTTPProxyKeepsRenewedCookiesOutOfSharedCaches(t *testing.T) {
 	for _, renewed := range []bool{true, false} {
 		client := &profileTestRouteClient{responseHeaders: map[string]string{"Cache-Control": "public, max-age=600"}}
 		proxy := NewHTTPProxy(profileTestProxyService{client: client}, profileTestInstallationStore{})
-		req := httptest.NewRequest(http.MethodGet, "/api/v1/plugins/1/page", nil)
+		req := httptest.NewRequest(http.MethodGet, "/api/v2/plugin-content/plugins/1/page", nil)
 		req = req.WithContext(WithPluginAccessUser(req.Context(), true, false, 7, "profile-1"))
 		rec := httptest.NewRecorder()
 		var cookie *http.Cookie
 		if renewed {
 			cookie = &http.Cookie{Name: "silo_plugin_access", Value: "renewed"}
 		}
-		proxy.ServeRoute(WithRenewedCookie(rec, cookie), req, 1, true, false)
+		proxy.serveRoute(WithRenewedCookie(rec, cookie), req, 1, true, false)
 		want := "public, max-age=600"
 		if renewed {
 			want = "private, no-store"

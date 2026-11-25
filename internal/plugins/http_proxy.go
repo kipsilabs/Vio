@@ -110,17 +110,18 @@ func NewHTTPProxy(service httpProxyService, installations taskInstallationStore)
 }
 
 // WithUserThemeLookup attaches a theme resolver. When set, ServeRoute injects
-// X-Vio-Theme on the upstream plugin request for authenticated users.
-// Pass nil to disable.
+// the theme under X-Vio-Theme and the documented X-Silo-Theme on the upstream
+// plugin request for authenticated users. Pass nil to disable.
 func (p *HTTPProxy) WithUserThemeLookup(t UserThemeLookup) *HTTPProxy {
 	p.themes = t
 	return p
 }
 
 // WithUserIdentityLookup attaches a username/profile-name resolver. When set,
-// ServeRoute injects X-Vio-User-Name, X-Vio-Profile-Name, and
-// X-Vio-Profile-Primary headers so plugins can render "user#profile"
-// strings without reaching back into browser localStorage.
+// ServeRoute injects the username, profile name, and primary-profile flag
+// under both X-Vio-* and the documented X-Silo-* spellings so plugins can
+// render "user#profile" strings without reaching back into browser
+// localStorage.
 func (p *HTTPProxy) WithUserIdentityLookup(l UserIdentityLookup) *HTTPProxy {
 	p.identity = l
 	return p
@@ -157,17 +158,11 @@ func (p *HTTPProxy) PublicGETRoute(ctx context.Context, installationID int, rout
 	return descriptor != nil && descriptor.GetAccess() == publicAccess, nil
 }
 
-// ServeRoute serves a dynamic plugin route on the frozen /api/v1 mount and
-// relays the plugin's status and Location unchanged.
-func (p *HTTPProxy) ServeRoute(w http.ResponseWriter, r *http.Request, installationID int, authenticated bool, admin bool) {
-	p.serveRoute(w, r, installationID, authenticated, admin, false)
-}
-
-// serveRoute serves a dynamic plugin route. With sameOriginRedirects, a
-// plugin redirect to another origin than the one the request arrived on is
-// answered with 502 instead: a client following it would carry the
-// credentials it attached for this server to that origin.
-func (p *HTTPProxy) serveRoute(w http.ResponseWriter, r *http.Request, installationID int, authenticated bool, admin bool, sameOriginRedirects bool) {
+// serveRoute serves a dynamic plugin route. A plugin redirect to another
+// origin than the one the request arrived on is answered with 502 instead: a
+// client following it would carry the credentials it attached for this server
+// to that origin.
+func (p *HTTPProxy) serveRoute(w http.ResponseWriter, r *http.Request, installationID int, authenticated bool, admin bool) {
 	descriptors, err := p.service.RouteDescriptors(r.Context(), installationID)
 	if err != nil {
 		if errors.Is(err, ErrInstallationDisabled) || errors.Is(err, ErrInstallationNotFound) {
@@ -213,11 +208,11 @@ func (p *HTTPProxy) serveRoute(w http.ResponseWriter, r *http.Request, installat
 	}
 	headers := forwardedRequestHeaders(r.Header)
 	if _, _, userID, contextProfileID := pluginAccessUserFromContext(r.Context()); userID > 0 {
-		headers[httpheader.PluginUserID] = strconv.Itoa(userID)
+		setPluginHeader(headers, httpheader.PluginUserID, httpheader.LegacyPluginUserID, strconv.Itoa(userID))
 		if admin {
-			headers[httpheader.PluginUserRole] = "admin"
+			setPluginHeader(headers, httpheader.PluginUserRole, httpheader.LegacyPluginUserRole, "admin")
 		} else {
-			headers[httpheader.PluginUserRole] = "user"
+			setPluginHeader(headers, httpheader.PluginUserRole, httpheader.LegacyPluginUserRole, "user")
 		}
 		// The access resolver verified this profile: the launch cookie's, or
 		// a declared X-Profile-Id that passed the viewer gate's PIN check.
@@ -229,19 +224,19 @@ func (p *HTTPProxy) serveRoute(w http.ResponseWriter, r *http.Request, installat
 		}
 		if p.themes != nil {
 			if theme, err := p.themes.LookupUITheme(r.Context(), userID, profileID); err == nil && theme != "" {
-				headers[httpheader.PluginTheme] = theme
+				setPluginHeader(headers, httpheader.PluginTheme, httpheader.LegacyPluginTheme, theme)
 			}
 		}
 		if p.identity != nil {
 			if ident, err := p.identity.LookupIdentity(r.Context(), userID, profileID); err == nil {
 				if ident.Username != "" {
-					headers[httpheader.PluginUserName] = ident.Username
+					setPluginHeader(headers, httpheader.PluginUserName, httpheader.LegacyPluginUserName, ident.Username)
 				}
 				if ident.ProfileName != "" {
-					headers[httpheader.PluginProfileName] = ident.ProfileName
+					setPluginHeader(headers, httpheader.PluginProfileName, httpheader.LegacyPluginProfName, ident.ProfileName)
 				}
 				if ident.ProfileIsPrimary {
-					headers[httpheader.PluginProfilePrime] = "true"
+					setPluginHeader(headers, httpheader.PluginProfilePrime, httpheader.LegacyPluginProfPrim, "true")
 				}
 			}
 		}
@@ -257,20 +252,19 @@ func (p *HTTPProxy) serveRoute(w http.ResponseWriter, r *http.Request, installat
 		http.Error(w, "plugin route failed", http.StatusBadGateway)
 		return
 	}
-	writePluginRouteResponse(w, r, installationID, response, sameOriginRedirects)
+	writePluginRouteResponse(w, r, installationID, response)
 }
 
 // writePluginRouteResponse relays a plugin route's answer: its allowed
-// headers, status and body. With sameOriginRedirects, a redirect that leaves
-// the request's origin, or whose Location is ambiguous, is a 502 instead (see
-// serveRoute).
-func writePluginRouteResponse(w http.ResponseWriter, r *http.Request, installationID int, response *pluginv1.HandleHTTPResponse, sameOriginRedirects bool) {
+// headers, status and body. A redirect that leaves the request's origin, or
+// whose Location is ambiguous, is a 502 instead (see serveRoute).
+func writePluginRouteResponse(w http.ResponseWriter, r *http.Request, installationID int, response *pluginv1.HandleHTTPResponse) {
 	status := int(response.GetStatusCode())
 	if status == 0 {
 		status = http.StatusOK
 	}
 	headers, ambiguousLocation := filteredResponseHeaders(response.GetHeaders())
-	if sameOriginRedirects && isRedirectStatus(status) && (ambiguousLocation || redirectLeavesOrigin(r, headers[locationHeader])) {
+	if isRedirectStatus(status) && (ambiguousLocation || redirectLeavesOrigin(r, headers[locationHeader])) {
 		slog.WarnContext(r.Context(), "plugin route redirected to another origin or sent several Location headers; not relayed", "component", "plugins", "installation_id", installationID, "status", status)
 		http.Error(w, "plugin route redirected to another origin", http.StatusBadGateway)
 		return
@@ -436,6 +430,19 @@ func routeAccessStatus(access string, authenticated bool, admin bool) int {
 		}
 		return http.StatusUnauthorized
 	}
+}
+
+// setPluginHeader writes value under both spellings of an injected plugin
+// header. The X-Silo-* name is the documented plugin contract
+// (docs/architecture/plugin-content.md, and HeaderUserID/HeaderUserRole in
+// silo-plugin-sdk/pkg/pluginsdk/httproute/viewer.go); third-party plugins read
+// it by exact key, so omitting it makes them refuse an authorized request. The
+// X-Vio-* name is the fork's own, kept for Vio readers. Values always come
+// from the verified session, never from the client: forwardedRequestHeaders
+// allows only the small set below.
+func setPluginHeader(headers map[string]string, name, legacy, value string) {
+	headers[name] = value
+	headers[legacy] = value
 }
 
 func forwardedRequestHeaders(headers http.Header) map[string]string {

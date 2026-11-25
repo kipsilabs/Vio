@@ -211,14 +211,22 @@ func Analyze(cfg Config) (*Inventory, error) {
 			}
 		}
 	}
+	set, err := loadSources(cfg.Root, cfg.analyzedDirs())
+	if err != nil {
+		return nil, err
+	}
+	return analyzeSources(cfg, set)
+}
+
+func (cfg Config) analyzedDirs() []string {
 	dirs := append([]string{}, cfg.AuditDirs...)
 	for _, listener := range cfg.Listeners {
 		dirs = append(dirs, listener.Dir)
 	}
-	set, err := loadSources(cfg.Root, dirs)
-	if err != nil {
-		return nil, err
-	}
+	return dirs
+}
+
+func analyzeSources(cfg Config, set *sourceSet) (*Inventory, error) {
 	a := &Analyzer{
 		cfg:          cfg,
 		set:          set,
@@ -292,7 +300,7 @@ func (a *Analyzer) build() (*Inventory, error) {
 			"request_kind: inferred from decode/parse calls in the handler body, matched by callee name and by the " +
 				"substring \"body\" in the decoded argument",
 			"response_media_kind: inferred from Content-Type string literals and from writer-call names " +
-				"(json.NewEncoder, writeJSON, respondJSON, writeError, ServeContent, ServeFile)",
+				"(json.NewEncoder, writeJSON, respondJSON, writeError, ServeContent, ServeFile, ServeSegmentLease)",
 			"upgrades_websocket: inferred from an Upgrade/Accept call whose callee names a websocket package or " +
 				"contains the substring \"grade\"",
 		},

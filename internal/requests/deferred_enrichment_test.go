@@ -17,7 +17,7 @@ func TestCreateRequestDuplicateRefusedBeforeTMDBRead(t *testing.T) {
 	tmdbClient := &fakeTMDBClient{}
 	svc := newTestServiceWithTMDB(store, tmdbClient)
 	enrichment := &deferredEnrichment{}
-	svc.enrichAsync = enrichment.schedule
+	svc.asyncWork = enrichment.schedule
 	store.active[MediaTypeMovie][550] = &Request{
 		ID: "existing", MediaType: MediaTypeMovie, TMDBID: 550, Status: StatusQueued, Outcome: OutcomeActive,
 	}
@@ -44,7 +44,7 @@ func TestCreateRequestReturns201WithoutExternalCalls(t *testing.T) {
 		detail: &tmdb.MediaDetail{MediaType: "movie", ID: 550, Title: "Fight Club", Year: 1999}}
 	svc := newTestServiceWithTMDB(store, tmdbClient)
 	enrichment := &deferredEnrichment{}
-	svc.enrichAsync = enrichment.schedule
+	svc.asyncWork = enrichment.schedule
 
 	req, err := svc.CreateRequest(context.Background(), testViewer(1), CreateRequestInput{
 		MediaType: MediaTypeMovie, TMDBID: 550, Title: "Fight Club",
@@ -76,7 +76,7 @@ func TestDeferredEnrichmentWritesRoutingFacts(t *testing.T) {
 	}
 	svc := newTestServiceWithTMDB(store, tmdbClient)
 	enrichment := &deferredEnrichment{}
-	svc.enrichAsync = enrichment.schedule
+	svc.asyncWork = enrichment.schedule
 
 	req, err := svc.CreateRequest(context.Background(), testViewer(1), CreateRequestInput{
 		MediaType: MediaTypeMovie, TMDBID: 550, Title: "Fight Club",
@@ -104,7 +104,7 @@ func TestCreateRequestRetryAfterTimeoutReturnsConflictWithoutExternalCalls(t *te
 	tmdbClient := &fakeTMDBClient{detail: &tmdb.MediaDetail{MediaType: "movie", ID: 550, Title: "Fight Club"}}
 	svc := newTestServiceWithTMDB(store, tmdbClient)
 	enrichment := &deferredEnrichment{}
-	svc.enrichAsync = enrichment.schedule
+	svc.asyncWork = enrichment.schedule
 	input := CreateRequestInput{MediaType: MediaTypeMovie, TMDBID: 550, Title: "Fight Club"}
 
 	if _, err := svc.CreateRequest(context.Background(), testViewer(1), input); err != nil {
@@ -133,7 +133,7 @@ func TestCreateRequestUsesClientDisplayFields(t *testing.T) {
 	}}
 	svc := newTestServiceWithTMDB(store, tmdbClient)
 	enrichment := &deferredEnrichment{}
-	svc.enrichAsync = enrichment.schedule
+	svc.asyncWork = enrichment.schedule
 	year := 1999
 
 	req, err := svc.CreateRequest(context.Background(), testViewer(1), CreateRequestInput{
@@ -173,7 +173,7 @@ func TestDeferredEnrichmentFailureLeavesRequestRetryable(t *testing.T) {
 	}
 	svc := newTestServiceWithTMDB(store, tmdbClient)
 	enrichment := &deferredEnrichment{}
-	svc.enrichAsync = enrichment.schedule
+	svc.asyncWork = enrichment.schedule
 
 	req, err := svc.CreateRequest(context.Background(), testViewer(1), CreateRequestInput{
 		MediaType: MediaTypeMovie, TMDBID: 550, Title: "Fight Club",

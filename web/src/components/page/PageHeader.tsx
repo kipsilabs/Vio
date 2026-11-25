@@ -28,7 +28,7 @@ export function PageHeader({ title, subtitle, actions, eyebrow, className }: Pag
     >
       <div className="min-w-0 space-y-2">
         {eyebrow}
-        <h1 className="text-[1.75rem] leading-[1.15] font-bold tracking-[-0.035em] text-balance sm:text-[2rem]">
+        <h1 className="text-[1.75rem] leading-[1.15] font-bold tracking-[-0.035em] text-balance break-words sm:text-[2rem]">
           {title}
         </h1>
         {subtitle ? (
@@ -36,8 +36,8 @@ export function PageHeader({ title, subtitle, actions, eyebrow, className }: Pag
         ) : null}
       </div>
       {actions ? (
-        // Stays at the right when the header wraps, so a menu opens over the content.
-        <div className="ml-auto flex flex-wrap items-center gap-2">{actions}</div>
+        // Stays at the end when the header wraps, so a menu opens over the content.
+        <div className="ms-auto flex flex-wrap items-center gap-2">{actions}</div>
       ) : null}
     </header>
   );

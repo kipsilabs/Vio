@@ -20,18 +20,13 @@ import MetadataBadges from "./components/MetadataBadges";
 import WatchedActionBar from "./components/WatchedActionBar";
 import DetailBreadcrumb from "./components/DetailBreadcrumb";
 import SeasonEpisodeGrid from "./components/SeasonEpisodeGrid";
-import type { EpisodeNavigationState } from "./itemDetailLayout";
+import { seasonDisplayName, type EpisodeNavigationState } from "./itemDetailLayout";
 import { canCurateMetadata as canCurateMetadataForUser } from "@/lib/permissions";
 import { buildItemHref } from "@/lib/mediaNavigation";
 import { hasMachineTranslation } from "./components/machineTranslation";
 import EpisodesTranslationAction from "./components/EpisodesTranslationAction";
 import { useEpisodePlaybackList } from "./useEpisodePlaybackList";
-
-function seasonLabel(seasonNumber: number, title?: string) {
-  if (title) return title;
-  if (seasonNumber === 0) return "Specials";
-  return `Season ${seasonNumber}`;
-}
+import { useT } from "@/i18n";
 
 export default function SeasonContent({
   item,
@@ -41,6 +36,7 @@ export default function SeasonContent({
   /** The page's ?libraryId= scope; series and episode links keep it. */
   libraryId?: number;
 }) {
+  const t = useT();
   const { translating: overviewTranslating, onTranslate: onTranslateOverview } =
     useOnViewTranslation(item);
   const navigate = useNavigate();
@@ -68,8 +64,10 @@ export default function SeasonContent({
   const translationWithEpisodes = !item.overview || episodesPending;
   const translationInHero = !translationWithEpisodes && !episodesLoading;
   const seasonNumber = item.season_number ?? 0;
-  const label = item.is_specials ? "Specials" : seasonLabel(seasonNumber, item.title);
-  const seriesTitle = item.series_title ?? "Series";
+  const label = item.is_specials
+    ? t("web.detail.seasons.specials")
+    : seasonDisplayName(seasonNumber, item.title);
+  const seriesTitle = item.series_title ?? t("web.detail.hero.typeSeries");
   const seriesId = item.series_id;
   const seriesHref = seriesId ? buildItemHref({ contentId: seriesId, libraryId }) : "/";
   const firstEpisode = episodes[0];
@@ -108,7 +106,9 @@ export default function SeasonContent({
   };
 
   const seasonIndicator =
-    item.is_specials || seasonNumber === 0 ? "Specials" : `Season ${seasonNumber}`;
+    item.is_specials || seasonNumber === 0
+      ? t("web.detail.seasons.specials")
+      : t("web.detail.seasons.numbered", { season: seasonNumber });
 
   const breadcrumb = (
     <DetailBreadcrumb
@@ -126,10 +126,12 @@ export default function SeasonContent({
           up
           className="text-muted-foreground hover:text-foreground text-sm"
         >
-          &larr; Back to {seriesTitle}
+          {t("web.detail.seasons.backToSeries", { title: seriesTitle })}
         </ViewTransitionLink>
         <p className="text-muted-foreground mt-6 text-sm">
-          {episodesError instanceof Error ? episodesError.message : "Season not found"}
+          {episodesError instanceof Error
+            ? episodesError.message
+            : t("web.detail.seasons.notFound")}
         </p>
       </div>
     );
@@ -168,7 +170,7 @@ export default function SeasonContent({
               canAddToCollection={false}
               watchTogether={watchTogether.menu}
               playHref={firstEpisode ? `/watch/${firstEpisode.content_id}` : undefined}
-              playLabel="Play First Episode"
+              playLabel={t("web.detail.actions.playFirstEpisode")}
               onRefresh={
                 canCurateMetadata
                   ? (mode) =>
@@ -196,20 +198,24 @@ export default function SeasonContent({
         <div
           className="page-shell series-detail-navigation"
           role="region"
-          aria-label="Season episodes"
+          aria-label={t("web.detail.seasons.episodesRegion")}
         >
           <section>
             <div className="mb-5 flex items-center justify-between gap-3">
-              <h2 className="text-xl font-semibold tracking-tight">Episodes</h2>
+              <h2 className="text-xl font-semibold tracking-tight">
+                {t("web.detail.episodes.heading")}
+              </h2>
               <div className="flex items-center gap-3">
-                {translationWithEpisodes && (
-                  <EpisodesTranslationAction
-                    translating={overviewTranslating}
-                    onTranslate={onTranslateOverview}
-                  />
-                )}
+                {/* Mounted while the episodes load too, so a translation that
+                  starts before the list arrives is still announced here. */}
+                <EpisodesTranslationAction
+                  translating={translationWithEpisodes && overviewTranslating}
+                  onTranslate={translationWithEpisodes ? onTranslateOverview : undefined}
+                />
                 <span className="text-muted-foreground text-sm">
-                  {item.episode_count ?? episodes.length} total
+                  {t("web.detail.seasons.totalCount", {
+                    count: item.episode_count ?? episodes.length,
+                  })}
                 </span>
               </div>
             </div>
@@ -227,7 +233,9 @@ export default function SeasonContent({
       <div className="page-shell detail-supporting-content space-y-10 py-8 sm:py-10">
         {item.cast && item.cast.length > 0 && (
           <div>
-            <h2 className="mb-4 text-xl font-semibold tracking-tight">Cast</h2>
+            <h2 className="mb-4 text-xl font-semibold tracking-tight">
+              {t("web.detail.sections.cast")}
+            </h2>
             <CastCarousel cast={item.cast} prefetchPeople />
           </div>
         )}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -103,6 +104,24 @@ func TestPlaybackDeliveryMapsUpstreamFailureToDependencyUnavailable(t *testing.T
 	}
 }
 
+// A remux start failure is a 502 plus the resolve route's Retry-After. The
+// adapter must keep that delay on the 503 dependency_unavailable it maps to:
+// production saw the delivery 503 with no Retry-After while the manifest and
+// segment routes sent one.
+func TestPlaybackDeliveryKeepsRetryAfterOnMappedDependencyFailure(t *testing.T) {
+	deps, _ := catalogDeps(t)
+	deps.PlaybackMedia = &PlaybackMediaHandlers{Original: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "5")
+		http.Error(w, "failed to start remux", http.StatusBadGateway)
+	})}
+	h := newTestHandler(t, deps)
+	rec := do(t, h, http.MethodGet, Prefix+"/stream/"+deliveryTestSession+"?st=opaque", "", viewerHeaders())
+	requireProblem(t, rec, TypeDependencyUnavailable)
+	if got := rec.Header().Get("Retry-After"); got != "5" {
+		t.Fatalf("Retry-After = %q, want the handler's 5", got)
+	}
+}
+
 // TestPlaybackDeliveryProviderUnavailableProblem proves the code-carrying
 // adapter: a v1 media handler that answers 503 with the provider_unavailable
 // code surfaces the distinct v2 provider_unavailable problem (retry this
@@ -125,6 +144,42 @@ func TestPlaybackDeliveryProviderUnavailableProblem(t *testing.T) {
 	requireProblem(t, rec, TypeProviderUnavailable)
 	if rec.Code != http.StatusServiceUnavailable || strings.Contains(rec.Body.String(), "PRIVATE_PROVIDER_DETAIL") {
 		t.Fatalf("provider outage problem: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// A subtitle sidecar whose live layout could not be verified answers 503 with
+// its own machine-readable code, and that code must survive the byte-delivery
+// adapter: production logged status=503 error_code=dependency_unavailable for
+// it, and the client saw the generic dependency problem instead of the
+// retryable subtitle one plus its Retry-After. The v1 body is still not
+// forwarded (the problem envelope replaces it), but it is now debug detail
+// rather than an ERROR, because the code reached the client and the request log.
+func TestPlaybackDeliverySubtitleSourceUnavailableProblem(t *testing.T) {
+	logs := captureLogsAt(t, slog.LevelDebug)
+	deps, _ := catalogDeps(t)
+	deps.PlaybackMedia = &PlaybackMediaHandlers{Original: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if recorder, ok := w.(interface{ SetPlaybackProblemCode(string) }); ok {
+			recorder.SetPlaybackProblemCode("subtitle_source_unavailable")
+		}
+		w.Header().Set("Retry-After", "5")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":"subtitle_source_unavailable","message":"Unable to verify the subtitle source; retry"}`))
+	})}
+	h := newTestHandler(t, deps)
+	rec := do(t, h, http.MethodGet, Prefix+"/stream/"+deliveryTestSession+"?st=opaque", "", viewerHeaders())
+	requireProblem(t, rec, TypeSubtitleSourceUnavailable)
+	if got := rec.Header().Get("Retry-After"); got != "5" {
+		t.Fatalf("Retry-After = %q, want the handler's 5", got)
+	}
+	// The v1 body is still not forwarded, but with a semantic problem type it is
+	// debug detail: the request log already carries the code, and an expected
+	// retryable 503 must not add an ERROR line for a discarded body.
+	got := logs.String()
+	if !strings.Contains(got, `"level":"DEBUG","msg":"apiv2 raw stream error body discarded"`) {
+		t.Fatalf("subtitle 503 discard is not debug detail: %s", got)
+	}
+	if strings.Contains(got, `"level":"ERROR","msg":"apiv2 raw stream error body discarded"`) {
+		t.Fatalf("an expected retryable subtitle 503 logged the discard at ERROR: %s", got)
 	}
 }
 

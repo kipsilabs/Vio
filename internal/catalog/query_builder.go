@@ -1095,10 +1095,10 @@ func (qb *QueryBuilder) buildLastWatchedClause(rule QueryRule) (string, error) {
 }
 
 // buildReleaseDateClause compares the item's release date: release_date when
-// set, else a well-formed first_air_date. The comparison is emitted once per
-// source column, ((release_date IS NOT NULL AND cmp) OR (release_date IS NULL
-// AND first_air_date cmp)), rather than over their COALESCE, so the
-// release_date indexes can serve it. Both forms agree for every NULL
+// set, else first_air_date when it is a real calendar date. The comparison is
+// emitted once per source column, ((release_date IS NOT NULL AND cmp) OR
+// (release_date IS NULL AND first_air_date cmp)), rather than over their
+// COALESCE, so the release_date indexes can serve it. Both forms agree for every NULL
 // combination, including under NOT.
 func (qb *QueryBuilder) buildReleaseDateClause(rule QueryRule) (string, error) {
 	// Build the comparison once around a marker so both arms reuse the same
@@ -1112,13 +1112,26 @@ func (qb *QueryBuilder) buildReleaseDateClause(rule QueryRule) (string, error) {
 		return strings.ReplaceAll(clause, column, qb.alias+".episode_air_date"), nil
 	}
 	releaseDate := qb.alias + ".release_date"
-	trimmedAirDate := fmt.Sprintf("NULLIF(BTRIM(%s.first_air_date), '')", qb.alias)
-	firstAirDate := fmt.Sprintf("(CASE WHEN %[1]s ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' THEN %[1]s::date ELSE NULL END)", trimmedAirDate)
+	firstAirDate := textDateSQL(fmt.Sprintf("NULLIF(BTRIM(%s.first_air_date), '')", qb.alias))
 	return fmt.Sprintf("((%[1]s IS NOT NULL AND %[2]s) OR (%[1]s IS NULL AND %[3]s))",
 		releaseDate,
 		strings.ReplaceAll(clause, column, releaseDate),
 		strings.ReplaceAll(clause, column, firstAirDate),
 	), nil
+}
+
+// textDateSQL reads a free-text YYYY-MM-DD expression as a date, or NULL when
+// it is not a real calendar date. A bare ::date raises SQLSTATE 22008 on a
+// well-shaped impossible value such as 2020-13-45 or 0000-00-00 and fails the
+// whole query. The outer WHEN admits years 0001-9999, months 01-12 and days
+// 01-31, which keeps make_date in range; the inner WHEN rejects a day past the
+// end of its month. CASE evaluates WHEN before THEN, so the cast only sees
+// real dates. pg_input_is_valid would do this in one call, but it needs
+// PostgreSQL 16.
+func textDateSQL(expr string) string {
+	return fmt.Sprintf("(CASE WHEN %[1]s ~ '^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$' AND %[1]s !~ '^0000' "+
+		"THEN (CASE WHEN SUBSTR(%[1]s, 9, 2)::int <= EXTRACT(DAY FROM make_date(LEFT(%[1]s, 4)::int, SUBSTR(%[1]s, 6, 2)::int, 1) + INTERVAL '1 month - 1 day') "+
+		"THEN %[1]s::date END) END)", expr)
 }
 
 var comparisonSQL = map[string]string{"gt": ">", "gte": ">=", "lt": "<", "lte": "<="}
@@ -1496,7 +1509,7 @@ func (qb *QueryBuilder) releaseDateSortExpr() string {
 	if isEpisodeCatalogScope(qb.mediaScope) {
 		return fmt.Sprintf("%s.episode_air_date", qb.alias)
 	}
-	return queryColumnSQL(qb.alias, querySortDefs["release_date"].columnSQL)
+	return ReleaseDateSortSQL(qb.alias)
 }
 
 func (qb *QueryBuilder) addedAtFilterExpr() string {
@@ -1703,6 +1716,10 @@ func (qb *QueryBuilder) ebookProgressSortPlan() (string, []string, []any) {
 	return "sort_progress.progress_ratio", []string{joinSQL}, []any{qb.userID, qb.profileID}
 }
 
+// dateViewedSortPlan dates each title by its most recent finished play.
+// Watch history is recorded against episodes, so an episode's plays also date
+// its series, as user_last_watched does for the last_watched rule (#4638). The
+// hidden-item check runs on the episode, the item a history removal names.
 func (qb *QueryBuilder) dateViewedSortPlan() (string, []string, []any) {
 	if qb.mediaScope == "ebook" {
 		return qb.ebookDateViewedSortPlan()
@@ -1750,11 +1767,57 @@ func (qb *QueryBuilder) dateViewedSortPlan() (string, []string, []any) {
 		qb.argIdx+1,
 		qb.alias,
 	)
-	expr := `GREATEST(
-		COALESCE(sort_history_viewed.viewed_at, '-infinity'::timestamptz),
-		COALESCE(sort_progress_viewed.viewed_at, '-infinity'::timestamptz)
-	)`
-	return expr, []string{historyJoin, progressJoin}, []any{qb.userID, qb.profileID}
+	joins := []string{historyJoin, progressJoin}
+	// GREATEST skips NULLs, so a never-watched title stays NULL and the
+	// sort's NULLS LAST puts it after the watched ones in both directions.
+	expr := `GREATEST(sort_history_viewed.viewed_at, sort_progress_viewed.viewed_at)`
+	// Crediting series looks up every watched item in episodes, so a scope
+	// that can't hold a series (a movie library) leaves it out.
+	if MediaScopeMatchesItemType(qb.mediaScope, "series") {
+		joins = append(joins, qb.seriesDateViewedJoin())
+		expr = `GREATEST(sort_history_viewed.viewed_at, sort_progress_viewed.viewed_at, sort_series_viewed.viewed_at)`
+	}
+	return expr, joins, []any{qb.userID, qb.profileID}
+}
+
+// seriesDateViewedJoin dates each series by its episodes' latest visible
+// finished play, from history or a completed progress row, for
+// dateViewedSortPlan. It groups on episodes.series_id, whose statistics give
+// the planner a fair row count; grouping on a key built from item and series
+// IDs together left it expecting a few rows and joining the page by nested
+// loop, seconds for a profile with a long history.
+func (qb *QueryBuilder) seriesDateViewedJoin() string {
+	return fmt.Sprintf(
+		`LEFT JOIN (
+			SELECT ep.series_id AS content_id, MAX(played.viewed_at) AS viewed_at
+			FROM (
+				SELECT uwh.media_item_id, uwh.watched_at AS viewed_at
+				FROM user_watch_history uwh
+				LEFT JOIN user_history_hidden_items hhi
+					ON hhi.user_id = $%[1]d
+				   AND hhi.profile_id = $%[2]d
+				   AND hhi.media_item_id = uwh.media_item_id
+				WHERE uwh.user_id = $%[1]d
+				  AND uwh.profile_id = $%[2]d
+				  AND uwh.completed = TRUE
+				  AND (hhi.media_item_id IS NULL OR uwh.watched_at > hhi.hidden_before)
+				UNION ALL
+				SELECT uwp.media_item_id, uwp.updated_at
+				FROM user_watch_progress uwp
+				LEFT JOIN user_history_hidden_items hhi
+					ON hhi.user_id = $%[1]d
+				   AND hhi.profile_id = $%[2]d
+				   AND hhi.media_item_id = uwp.media_item_id
+				WHERE uwp.user_id = $%[1]d
+				  AND uwp.profile_id = $%[2]d
+				  AND uwp.completed = TRUE
+				  AND (hhi.media_item_id IS NULL OR uwp.updated_at > hhi.hidden_before)
+			) played
+			JOIN episodes ep ON ep.content_id = played.media_item_id
+			GROUP BY ep.series_id
+		) sort_series_viewed ON sort_series_viewed.content_id = %[3]s.content_id`,
+		qb.argIdx, qb.argIdx+1, qb.alias,
+	)
 }
 
 func (qb *QueryBuilder) ebookDateViewedSortPlan() (string, []string, []any) {

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -551,6 +552,7 @@ func registerAll(reg *Registry) {
 	registerEmailVerification(reg)
 	registerEventsCapability(reg)
 	registerNetworkAccess(reg)
+	registerDirectConnections(reg)
 	registerEventsSocket(reg)
 	registerAdminLogsSocket(reg)
 	registerPlaybackControlSocket(reg)
@@ -616,6 +618,7 @@ func registerAll(reg *Registry) {
 	registerAdminPluginRepositoryUpdate(reg)
 	registerAdminPluginRepositoryDelete(reg)
 	registerAdminPluginInventory(reg)
+	registerAdminPluginProvisioning(reg)
 	registerAdminPluginConfiguration(reg)
 	registerAdminPluginLifecycle(reg)
 	registerAdminPluginUploads(reg)
@@ -757,6 +760,8 @@ func registerAll(reg *Registry) {
 	registerUserLibraries(reg)
 	registerPolicyCapability(reg)
 	registerArtwork(reg)
+	registerItemPosters(reg)
+	registerAdminRequestPoster(reg)
 	registerBranding(reg)
 	registerAdminInviteCodes(reg)
 	registerInvitations(reg)
@@ -782,9 +787,7 @@ func registerAll(reg *Registry) {
 // documents. The migration ledger's reconcile test reads the Guarded set
 // from it.
 func DeclaredOperations() []Declared {
-	reg := &Registry{api: huma.NewAPI(humaConfig(), noopAdapter{})}
-	registerAll(reg)
-	return reg.Declared()
+	return slices.Clone(sharedRuntimeSchemas().declared)
 }
 
 // GenerateOpenAPI renders the contract document from the registries alone:
@@ -798,6 +801,7 @@ func GenerateOpenAPI() ([]byte, error) {
 	reg := &Registry{api: api}
 	registerAll(reg)
 	api.OpenAPI().Extensions = map[string]any{workerProtocolsExtension: describeWorkerProtocols(), pluginContentExtension: describePluginContent()}
+	admitNullInNullableEnums(api.OpenAPI().Components.Schemas.Map())
 	raw, err := api.OpenAPI().MarshalJSON()
 	if err != nil {
 		return nil, err
@@ -808,6 +812,48 @@ func GenerateOpenAPI() ([]byte, error) {
 	}
 	buf.WriteByte('\n')
 	return buf.Bytes(), nil
+}
+
+// NullEnumWithheld lists the nullable members whose enum keeps null out,
+// keyed Schema.member, each with its reason. Such a member is nullable in
+// the document only because Patch documents every member that way, while
+// its handler refuses null; leaving null out of the enum is the part of its
+// schema that says so. The spec lint (internal/contractspec) reads the same
+// table and fails an entry that no longer names a nullable enum.
+var NullEnumWithheld = map[string]string{
+	"DownloadSubscriptionPatchBody.quality": "updateDownloadSubscription answers 400 for a null monitor field",
+}
+
+// admitNullInNullableEnums adds null to the enum of every nullable schema in
+// the components, except the members NullEnumWithheld lists. JSON Schema
+// applies type and enum separately, so ["string", "null"] with an enum of
+// strings alone still refuses null. The pass runs on the document only:
+// Huma's request validator accepts null on a nullable schema before it
+// checks the enum, and leaving the registered enum alone keeps null out of
+// its 422 message.
+func admitNullInNullableEnums(components map[string]*huma.Schema) {
+	var walk func(where string, s *huma.Schema)
+	walk = func(where string, s *huma.Schema) {
+		if s == nil {
+			return
+		}
+		if _, withheld := NullEnumWithheld[where]; s.Nullable && len(s.Enum) > 0 && !slices.Contains(s.Enum, nil) && !withheld {
+			s.Enum = append(slices.Clip(s.Enum), nil)
+		}
+		for name, property := range s.Properties {
+			walk(where+"."+name, property)
+		}
+		walk(where+".items", s.Items)
+		if value, ok := s.AdditionalProperties.(*huma.Schema); ok {
+			walk(where+".additionalProperties", value)
+		}
+		for _, sub := range slices.Concat(s.OneOf, s.AnyOf, s.AllOf) {
+			walk(where, sub)
+		}
+	}
+	for name, s := range components {
+		walk(name, s)
+	}
 }
 
 // noopAdapter lets the generator register operations without a router: the
