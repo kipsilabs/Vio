@@ -14,6 +14,7 @@ that before it ships.
 | Virtual routing | All virtual-library traffic resolves through core (`internal/virtuallibrary`); no virtual→plugin dispatch anywhere | `internal/api/router.go`, `cmd/silo/main.go`, `internal/catalog/item_repo.go`, `internal/catalog/library_collection_repo.go` | catalog integration tests, `router_virtual_library_core_test.go`, invariant script |
 | Virtual network permissions | `virtual_library.allow_insecure_http` covers HTTP manifests on private/local hosts only; `virtual_library.allow_private_streams` separately gates private stream destinations (SSRF bypass on resolved URLs, relay transport, redirects, probes). Both default false; enabling the former does not imply the latter | `internal/virtuallibrary/service.go`, `internal/virtuallibrary/resolve.go`, `internal/api/router.go`, `internal/plugins/virtual_provenance.go`, `cmd/silo/main.go`, `web/src/pages/admin-settings/StreamingSettings.tsx` | `resolve_test.go` boundary cases, `split_allow_private_streams_migration_test.go` |
 | Request integrations | `installation_id` 0 (core virtual router) validates; virtual-dormant saves answer 422, not 500 | `internal/apiv2/admin_requests.go`, `internal/requests/service.go` | `service_test.go` |
+| Request season source | The request dialog lets the viewer pick TVDB or TMDB season numbering. The server accepts `season_source` on `POST /api/v2/requests`, takes it as a query parameter on the detail read, persists it on `media_requests.season_source`, and prefers TVDB only when a TVDB id resolves and the provider answers. The dialog must fetch the detail with the chosen source, default to TVDB unless the detail reports `tmdb`, and send the selection. The label uses the fork-only `web.requests.seasons.seasonSource` message id, currently added only to the English catalog; a translations sync must carry it or the typecheck fails in the dialog. | `web/src/components/RequestSeasonsDialog.tsx`, `web/src/lib/mediaRequests.ts`, `internal/apiv2/requests.go`, `internal/requests/seasons.go`, `web/src/locales/keys.ts`, `web/src/locales/en.json` | `RequestSeasonsDialog.test.tsx`, requests suites |
 | Collection sync | Missing virtual provider answers 503, not 500 | `internal/apiv2/admin_collections.go` | `admin_collections_test.go` |
 | Onboarding | Requests step, TMDB/TVDB auto-install section, format scoring card | `web/src/pages/setup-wizard/` | step tests |
 | Collections | `virtual_playback` defaults on when omitted at the collection-creation API boundary (`resolveVirtualPlayback`, nil means on); add and template forms default on | `internal/api/handlers/library_collections.go`, `internal/api/handlers/admin_collections_service.go`, `internal/adminjob/template_bundle_apply.go`, `web/src/pages/AdminRequests.tsx` | `internal/api/handlers/library_collections_test.go`, `internal/adminjob/template_bundle_apply_test.go`, `scripts/check-fork-invariants.sh`, step tests |
@@ -71,6 +72,24 @@ that before it ships.
   `prepare_progress.go`) and its tests are the ones to keep on a merge:
   upstream's rework there changes when a transcode is declared ready and how a
   hardware start falls back, and the fork's tests pin the older contract.
+
+### Known gaps
+
+- `internal/requests/service.go` `getDetail` calls `seriesSeasonSource` but discards
+  the provider it reports (`seasonList, _, fromTVDB, ...`) and never assigns
+  `MediaDetail.SeasonSource`. The v2 detail response therefore always omits
+  `season_source`, even when the seasons came from TVDB or TMDB. The web dialog
+  falls back to its TVDB default, so on a server with no TVDB provider the
+  explicit `season_source: "tvdb"` request fails closed with
+  `ErrSeasonSourceUnavailable` instead of using the TMDB list the viewer saw.
+  The fix is to assign the chosen provider to `detail.SeasonSource`; it is not
+  part of the picker restoration because the server is currently untouched.
+- `internal/apiv2/requests.go` `requestMediaSeasonsOf` maps `RequestSeason` to
+  the v2 `RequestMediaSeason` without a poster URL, and that schema has no
+  `poster_url` field at all. `RequestSeason.PosterURL` therefore reaches no
+  client, so seasons whose artwork is an absolute provider URL render without
+  it. Carrying the field through needs a contract addition, not a local mapper
+  edit.
 
 ## Merge procedure
 

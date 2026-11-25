@@ -13319,6 +13319,7 @@ export type MessageKey =
   | "web.requests.seasons.requested"
   | "web.requests.seasons.season"
   | "web.requests.seasons.seasonNamed"
+  | "web.requests.seasons.seasonSource"
   | "web.requests.seasons.title"
   | "web.requests.seasons.upcoming"
   | "web.requests.status.active"
