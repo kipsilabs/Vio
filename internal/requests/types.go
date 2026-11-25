@@ -515,7 +515,7 @@ type MediaDetail struct {
 	// availability and whether the active request covers them.
 	Seasons []RequestSeason `json:"-"`
 	// SeasonSource is the metadata provider that supplied Seasons: "tvdb",
-	// "tmdb", or empty for the server default. v2 only.
+	// "tmdb", or empty when the detail carries no season list. v2 only.
 	SeasonSource string `json:"-"`
 }
 

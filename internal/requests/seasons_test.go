@@ -90,3 +90,79 @@ func TestReconcileCompletesASeasonRequestOnlyWhenItsSeasonsAre(t *testing.T) {
 		t.Fatalf("request = %+v, want completed once season 2 is", got)
 	}
 }
+
+type fakeSeriesSeasonProvider struct {
+	seasons     []SeriesSeason
+	err         error
+	gotTVDBID   int
+	gotLanguage string
+	calls       int
+}
+
+func (f *fakeSeriesSeasonProvider) FetchSeriesTVDBSeasons(_ context.Context, tvdbID int, language string) ([]SeriesSeason, error) {
+	f.calls++
+	f.gotTVDBID = tvdbID
+	f.gotLanguage = language
+	return f.seasons, f.err
+}
+
+func TestGetDetailReportsTheSeasonSourceItUsed(t *testing.T) {
+	store := newFakeStore()
+	store.settings.RequestsEnabled = true
+	svc := seasonService(store, &fakePresence{})
+	svc.SetTVDBIDResolver(&fakeTVDBResolver{tvdbID: 424242})
+
+	t.Run("tvdb answers", func(t *testing.T) {
+		provider := &fakeSeriesSeasonProvider{seasons: []SeriesSeason{
+			{Number: 1, Name: "TVDB Season 1", EpisodeCount: 9},
+			{Number: 2, Name: "TVDB Season 2", EpisodeCount: 10},
+		}}
+		svc.SetSeriesSeasonProvider(provider)
+
+		detail, err := svc.GetDetail(context.Background(), testViewer(1), MediaTypeSeries, 95396)
+		if err != nil {
+			t.Fatalf("GetDetail: %v", err)
+		}
+		if detail.SeasonSource != SeasonSourceTVDB {
+			t.Fatalf("season source = %q, want %q", detail.SeasonSource, SeasonSourceTVDB)
+		}
+		if provider.gotTVDBID != 424242 || provider.gotLanguage != "en" {
+			t.Fatalf("provider got tvdb=%d language=%q, want 424242 and en", provider.gotTVDBID, provider.gotLanguage)
+		}
+		if len(detail.Seasons) == 0 || detail.Seasons[0].Name != "TVDB Season 1" {
+			t.Fatalf("seasons = %+v, want the TVDB list", detail.Seasons)
+		}
+	})
+
+	t.Run("tvdb cannot answer", func(t *testing.T) {
+		provider := &fakeSeriesSeasonProvider{err: errors.New("tvdb: HTTP 503")}
+		svc.SetSeriesSeasonProvider(provider)
+
+		detail, err := svc.GetDetail(context.Background(), testViewer(1), MediaTypeSeries, 95396)
+		if err != nil {
+			t.Fatalf("GetDetail: %v", err)
+		}
+		if detail.SeasonSource != SeasonSourceTMDB {
+			t.Fatalf("season source = %q, want %q", detail.SeasonSource, SeasonSourceTMDB)
+		}
+		if len(detail.Seasons) == 0 || detail.Seasons[0].Name != "Season 1" {
+			t.Fatalf("seasons = %+v, want the TMDB list", detail.Seasons)
+		}
+	})
+
+	t.Run("explicit tmdb wins over an answering tvdb provider", func(t *testing.T) {
+		provider := &fakeSeriesSeasonProvider{seasons: []SeriesSeason{{Number: 1, Name: "TVDB Season 1"}}}
+		svc.SetSeriesSeasonProvider(provider)
+
+		detail, err := svc.GetDetailWithSeasonSource(context.Background(), testViewer(1), MediaTypeSeries, 95396, SeasonSourceTMDB)
+		if err != nil {
+			t.Fatalf("GetDetailWithSeasonSource: %v", err)
+		}
+		if detail.SeasonSource != SeasonSourceTMDB {
+			t.Fatalf("season source = %q, want %q", detail.SeasonSource, SeasonSourceTMDB)
+		}
+		if provider.calls != 0 {
+			t.Fatalf("TVDB provider calls = %d, want none for an explicit tmdb request", provider.calls)
+		}
+	})
+}
