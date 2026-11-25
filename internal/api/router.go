@@ -387,6 +387,10 @@ type Dependencies struct {
 	// successful migrate -> validate -> activate. Nil means the core
 	// service is dormant/unavailable and the plugin path stays.
 	VirtualLibraryVariants func(ctx context.Context, virtualURI, mediaType string) ([]catalog.VirtualPlaybackVariant, error)
+	// VirtualIdentityRepair schedules the bounded, detached provider identity
+	// repair a movie or episode detail view may start. Nil disables the trigger,
+	// which is what the default identity_repair_mode=off wiring leaves.
+	VirtualIdentityRepair  *handlers.VirtualIdentityRepairer
 	ChapterThumbnailQueuer catalog.ChapterThumbnailQueuer
 	PlaybackRealtimeHub    *playback.RealtimeHub
 	OnUserSessionsRevoked  func(ctx context.Context, userID int)
@@ -4174,6 +4178,9 @@ func newChiRouter(deps Dependencies) chi.Router {
 		v2deps.CatalogItems = catalogResourceHandler
 		v2deps.CatalogVersionsCheck = catalogResourceHandler
 		v2deps.CatalogVersionsWarm = catalogResourceHandler
+	}
+	if deps.VirtualIdentityRepair != nil {
+		v2deps.VirtualIdentityRepair = deps.VirtualIdentityRepair
 	}
 	if shuffleService != nil {
 		v2deps.Shuffles = shuffleService

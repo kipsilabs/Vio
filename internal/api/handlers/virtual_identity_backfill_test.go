@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/Silo-Server/silo-server/internal/adminjob"
+	"github.com/Silo-Server/silo-server/internal/config"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/scanner"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary"
@@ -93,13 +95,16 @@ func (f *fakeBackfillLister) list(_ context.Context, path string) ([]virtuallibr
 	return f.byPath[path], nil
 }
 
-// fakeBackfillJobs records the one-shot gate's decision without a database.
+// fakeBackfillJobs records the bulk gate's decision without a database.
 type fakeBackfillJobs struct {
 	completed    bool
 	completedErr error
 	requeue      bool
 	requeueErr   error
 	requeued     int
+	latest       time.Time
+	latestOK     bool
+	latestErr    error
 	createErr    error
 	created      []adminjob.CreateJobInput
 }
@@ -111,6 +116,10 @@ func (f *fakeBackfillJobs) HasFinishedJobOfType(context.Context, string) (bool, 
 func (f *fakeBackfillJobs) RequeueLatestFailedOfType(context.Context, string) (bool, error) {
 	f.requeued++
 	return f.requeue, f.requeueErr
+}
+
+func (f *fakeBackfillJobs) LatestJobRequestedAt(context.Context, string) (time.Time, bool, error) {
+	return f.latest, f.latestOK, f.latestErr
 }
 
 func (f *fakeBackfillJobs) Create(_ context.Context, in adminjob.CreateJobInput) (*models.AdminJob, error) {
@@ -348,11 +357,13 @@ func TestVirtualIdentityBackfillResumesFromCursor(t *testing.T) {
 	}
 }
 
-// TestEnsureBackfillJobGates proves the one-shot gate: it queues only when
-// legacy rows exist, no backfill has completed, and a job owner is available.
-func TestEnsureBackfillJobGates(t *testing.T) {
+// TestEnsureBulkBackfillJobGates proves the bulk gate: it queues only when
+// legacy rows exist, no backfill has completed, a job owner is available, and
+// the previous attempt is past its cooldown.
+func TestEnsureBulkBackfillJobGates(t *testing.T) {
+	now := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
 	newExecutor := func(store *fakeBackfillStore, jobs *fakeBackfillJobs) *VirtualIdentityBackfillExecutor {
-		return &VirtualIdentityBackfillExecutor{Store: store, Jobs: jobs}
+		return &VirtualIdentityBackfillExecutor{Store: store, Jobs: jobs, nowFunc: func() time.Time { return now }}
 	}
 
 	baseStore := func() *fakeBackfillStore {
@@ -363,7 +374,7 @@ func TestEnsureBackfillJobGates(t *testing.T) {
 
 	// No admin owner: the FK would reject the job, so the gate is a no-op.
 	jobs := &fakeBackfillJobs{}
-	if err := newExecutor(baseStore(), jobs).EnsureBackfillJob(context.Background(), 0); err != nil {
+	if err := newExecutor(baseStore(), jobs).EnsureBulkBackfillJob(context.Background(), 0); err != nil {
 		t.Fatalf("owner 0: %v", err)
 	}
 	if len(jobs.created) != 0 {
@@ -372,35 +383,46 @@ func TestEnsureBackfillJobGates(t *testing.T) {
 
 	// Already completed: the one-shot marker suppresses a re-run.
 	jobs = &fakeBackfillJobs{completed: true}
-	if err := newExecutor(baseStore(), jobs).EnsureBackfillJob(context.Background(), 7); err != nil {
+	if err := newExecutor(baseStore(), jobs).EnsureBulkBackfillJob(context.Background(), 7); err != nil {
 		t.Fatalf("completed: %v", err)
 	}
 	if len(jobs.created) != 0 {
 		t.Fatal("queued a second one-shot backfill")
 	}
 
-	// A failed partial run is retriable: the failed job is requeued with its
-	// watermark instead of a fresh job starting from zero.
-	jobs = &fakeBackfillJobs{requeue: true}
-	if err := newExecutor(baseStore(), jobs).EnsureBackfillJob(context.Background(), 7); err != nil {
+	// A failed partial run is retriable past the cooldown: the failed job is
+	// requeued with its watermark instead of a fresh job starting from zero.
+	jobs = &fakeBackfillJobs{requeue: true, latest: now.Add(-2 * virtualIdentityBulkBackfillCooldown), latestOK: true}
+	if err := newExecutor(baseStore(), jobs).EnsureBulkBackfillJob(context.Background(), 7); err != nil {
 		t.Fatalf("requeue: %v", err)
 	}
 	if jobs.requeued != 1 || len(jobs.created) != 0 {
 		t.Fatalf("requeued=%d created=%d, want the failed job revived, not a duplicate", jobs.requeued, len(jobs.created))
 	}
 
+	// A recent attempt is still cooling down, so a restart queues nothing even
+	// though no job has finished. This is the restart storm's second gate.
+	jobs = &fakeBackfillJobs{requeue: true, latest: now.Add(-time.Hour), latestOK: true}
+	if err := newExecutor(baseStore(), jobs).EnsureBulkBackfillJob(context.Background(), 7); err != nil {
+		t.Fatalf("cooldown: %v", err)
+	}
+	if jobs.requeued != 0 || len(jobs.created) != 0 {
+		t.Fatalf("requeued=%d created=%d, want the cooldown to suppress a run", jobs.requeued, len(jobs.created))
+	}
+
 	// No legacy rows: nothing to do.
 	jobs = &fakeBackfillJobs{}
-	if err := newExecutor(&fakeBackfillStore{}, jobs).EnsureBackfillJob(context.Background(), 7); err != nil {
+	if err := newExecutor(&fakeBackfillStore{}, jobs).EnsureBulkBackfillJob(context.Background(), 7); err != nil {
 		t.Fatalf("no rows: %v", err)
 	}
 	if len(jobs.created) != 0 {
 		t.Fatal("queued a job with no legacy rows")
 	}
 
-	// Rows exist, never completed, owner present: queue exactly one.
+	// Rows exist, never completed, owner present, no previous attempt: queue
+	// exactly one.
 	jobs = &fakeBackfillJobs{}
-	if err := newExecutor(baseStore(), jobs).EnsureBackfillJob(context.Background(), 7); err != nil {
+	if err := newExecutor(baseStore(), jobs).EnsureBulkBackfillJob(context.Background(), 7); err != nil {
 		t.Fatalf("queue: %v", err)
 	}
 	if len(jobs.created) != 1 || jobs.created[0].JobType != adminjob.JobTypeVirtualIdentityBackfill {
@@ -409,6 +431,39 @@ func TestEnsureBackfillJobGates(t *testing.T) {
 	if jobs.created[0].CreatedByUserID != 7 {
 		t.Fatalf("owner = %d, want 7", jobs.created[0].CreatedByUserID)
 	}
+}
+
+// TestQueueBulkIdentityBackfillAtBootIsOffByDefault proves the boot path never
+// reaches the bulk gate unless the operator selected bulk: off and on_demand
+// create no job, so no restart can start a sweep.
+func TestQueueBulkIdentityBackfillAtBootIsOffByDefault(t *testing.T) {
+	now := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+	newExecutor := func(jobs *fakeBackfillJobs) *VirtualIdentityBackfillExecutor {
+		return &VirtualIdentityBackfillExecutor{
+			Store: &fakeBackfillStore{rows: []*models.MediaFile{
+				legacyBackfillRow(1, "virtual://movie/tt1?result=stale", "Movie.2024.1080p", 8_000_000_000),
+			}},
+			Jobs:    jobs,
+			nowFunc: func() time.Time { return now },
+		}
+	}
+
+	for _, mode := range []string{"", config.VirtualIdentityRepairOff, config.VirtualIdentityRepairOnDemand, "nonsense"} {
+		jobs := &fakeBackfillJobs{}
+		QueueBulkIdentityBackfillAtBoot(context.Background(), mode, newExecutor(jobs), 7, nil)
+		if len(jobs.created) != 0 {
+			t.Fatalf("mode %q created a job at boot", mode)
+		}
+	}
+
+	jobs := &fakeBackfillJobs{}
+	QueueBulkIdentityBackfillAtBoot(context.Background(), config.VirtualIdentityRepairBulk, newExecutor(jobs), 7, nil)
+	if len(jobs.created) != 1 {
+		t.Fatalf("created = %d, want exactly one bulk job when the operator selected bulk", len(jobs.created))
+	}
+
+	// A nil executor is the virtual library being inactive, not an error.
+	QueueBulkIdentityBackfillAtBoot(context.Background(), config.VirtualIdentityRepairBulk, nil, 7, nil)
 }
 
 var (

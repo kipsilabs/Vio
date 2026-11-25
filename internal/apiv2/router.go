@@ -527,6 +527,11 @@ type Dependencies struct {
 	// CatalogVersionsWarm warms the virtual listings a versions read
 	// surfaced (*handlers.CatalogResourceHandler). Nil disables warming.
 	CatalogVersionsWarm CatalogVersionWarmService
+	// VirtualIdentityRepair schedules the bounded, detached provider identity
+	// repair a movie or episode detail view may start
+	// (*handlers.VirtualIdentityRepairer). Nil leaves the detail read free of
+	// it, which is the default mode=off wiring.
+	VirtualIdentityRepair VirtualIdentityRepairService
 	// CatalogTrailers answers the trailer capability and refresh action
 	// (*handlers.ItemsHandler).
 	CatalogTrailers CatalogTrailerService
@@ -1252,6 +1257,14 @@ type CatalogVersionCheckService interface {
 // implements it; nil leaves the read free of warming.
 type CatalogVersionWarmService interface {
 	PrefetchItemVersionsVirtual(ctx context.Context, versions []mediacatalog.FileVersion, profileID string)
+}
+
+// VirtualIdentityRepairService schedules the bounded, detached provider
+// identity repair a movie or episode detail view may start.
+// *handlers.VirtualIdentityRepairer implements it. It must return immediately;
+// the page never waits on the repair.
+type VirtualIdentityRepairService interface {
+	ScheduleVirtualIdentityRepair(ctx context.Context, contentID, mediaType string)
 }
 
 // CatalogTrailerService is the slice of *handlers.ItemsHandler the trailer

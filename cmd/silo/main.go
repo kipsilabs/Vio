@@ -4147,6 +4147,21 @@ func main() {
 		virtualRefreshExecutor = executor
 	}
 
+	// Provider identity repair for legacy virtual rows. The default mode is
+	// off: repairing the whole legacy set at once re-lists the provider per
+	// candidate group and is the load that got an operator banned from two
+	// indexers. on_demand repairs one movie or episode when its detail page
+	// opens, and is read once at boot.
+	identityRepairMode := config.VirtualIdentityRepairMode(settings[config.VirtualIdentityRepairModeSettingKey])
+	if deps.VirtualLibraryService != nil && deps.FileRepo != nil {
+		deps.VirtualIdentityRepair = handlers.NewVirtualIdentityRepairer(
+			deps.VirtualLibraryService.ListStreams,
+			deps.FileRepo,
+			identityRepairMode == config.VirtualIdentityRepairOnDemand,
+			slog.Default(),
+		)
+	}
+
 	router := api.NewRouter(deps)
 
 	// Step 8: Build the handler the primary port serves — the API router and
@@ -4256,17 +4271,17 @@ func main() {
 		adminJobRunner.Start()
 		defer adminJobRunner.Stop()
 
-		// Queue the one-shot backfill after the runner is live. A job that has
-		// already finished (completed or canceled) is the one-shot gate; rows
-		// it could not match stay legacy and are not re-listed on every
-		// restart. A server with no admin account has no job owner and is
-		// skipped.
+		// Queue the bulk sweep only when the operator explicitly selected
+		// virtual_library.identity_repair_mode=bulk, and only past the gates in
+		// EnsureBulkBackfillJob: a finished job, a recent attempt, and an
+		// already-active job all suppress a new one. A server with no admin
+		// account has no job owner and is skipped.
 		if virtualIdentityBackfill != nil {
 			var ownerUserID int
 			if err := deps.DB.QueryRow(appCtx, `SELECT COALESCE((SELECT id FROM users WHERE role = 'admin' AND enabled IS TRUE ORDER BY id ASC LIMIT 1), 0)`).Scan(&ownerUserID); err != nil {
 				slog.Warn("virtual identity backfill: resolve job owner failed", "error", err)
-			} else if err := virtualIdentityBackfill.EnsureBackfillJob(appCtx, ownerUserID); err != nil {
-				slog.Warn("virtual identity backfill: queue failed", "error", err)
+			} else {
+				handlers.QueueBulkIdentityBackfillAtBoot(appCtx, identityRepairMode, virtualIdentityBackfill, ownerUserID, slog.Default())
 			}
 		}
 

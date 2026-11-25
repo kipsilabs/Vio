@@ -96,6 +96,9 @@ var restartRequiredKeys = map[string]bool{
 	"subtitle_ai.max_concurrent_jobs": true,
 	// The virtual probe evidence cache is built once per server boot.
 	"virtual_library.playback_probe_cache_minutes": true,
+	// The identity repair trigger's enabled flag and the bulk enqueue are read
+	// once at boot.
+	VirtualIdentityRepairModeSettingKey: true,
 
 	// Catalog search provider construction is intentionally startup-bound in v1.
 	"catalog.search.provider":                      true,

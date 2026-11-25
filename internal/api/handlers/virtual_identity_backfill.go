@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"time"
 
 	"github.com/Silo-Server/silo-server/internal/adminjob"
+	"github.com/Silo-Server/silo-server/internal/config"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/scanner"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary"
@@ -33,12 +35,13 @@ type VirtualIdentityBackfillStore interface {
 	FillVirtualProviderIdentity(ctx context.Context, fileID int, expectedFilePath string, identity scanner.VirtualProviderIdentity) (bool, error)
 }
 
-// VirtualIdentityBackfillJobs is the admin-job slice the one-shot gate needs.
+// VirtualIdentityBackfillJobs is the admin-job slice the bulk gate needs.
 // It is a narrow interface so the gate is unit-testable without a database;
 // *adminjob.Repository implements it.
 type VirtualIdentityBackfillJobs interface {
 	HasFinishedJobOfType(ctx context.Context, jobType string) (bool, error)
 	RequeueLatestFailedOfType(ctx context.Context, jobType string) (bool, error)
+	LatestJobRequestedAt(ctx context.Context, jobType string) (time.Time, bool, error)
 	Create(ctx context.Context, input adminjob.CreateJobInput) (*models.AdminJob, error)
 }
 
@@ -56,13 +59,22 @@ type VirtualIdentityBackfillExecutor struct {
 	Lister VirtualIdentityBackfillLister
 	// Store reads the legacy rows and writes the matched identity.
 	Store VirtualIdentityBackfillStore
-	// Jobs queues the one-shot job at boot. It is only needed by
-	// EnsureBackfillJob; Execute does not use it.
+	// Jobs queues the bulk job. It is only needed by EnsureBulkBackfillJob;
+	// Execute does not use it.
 	Jobs   VirtualIdentityBackfillJobs
 	Logger *slog.Logger
 
 	batchSize int
+	nowFunc   func() time.Time
 }
+
+// virtualIdentityBulkBackfillCooldown is the minimum gap between two bulk
+// enqueues. The finished-job gate already stops a completed or canceled pass
+// from running again; the cooldown additionally stops a failing pass from
+// being revived on every restart, which is how one deployment accumulated
+// eighteen concurrent sweeps. It is visible in the job's own history: the
+// operator sees the previous attempt's requested_at.
+const virtualIdentityBulkBackfillCooldown = 24 * time.Hour
 
 // Execute runs the backfill page loop, resuming from resume.Cursor. A provider
 // that cannot be listed for one candidate group is counted and skipped. The
@@ -201,13 +213,7 @@ func (e *VirtualIdentityBackfillExecutor) processPage(ctx context.Context, rows 
 				result.RowsUnmatched++
 				continue
 			}
-			identity := scanner.VirtualProviderIdentity{
-				VideoHash:   candidate.ProviderVideoHash,
-				GUID:        candidate.ProviderGUID,
-				ReleaseName: candidate.ProviderReleaseName,
-				ReleaseSize: candidate.FileSize,
-			}
-			wrote, err := e.Store.FillVirtualProviderIdentity(ctx, row.ID, row.FilePath, identity)
+			wrote, err := e.Store.FillVirtualProviderIdentity(ctx, row.ID, row.FilePath, virtualProviderIdentityOf(candidate))
 			if err != nil {
 				return false, fmt.Errorf("fill virtual provider identity: %w", err)
 			}
@@ -262,17 +268,28 @@ func matchBackfillCandidate(row *models.MediaFile, streams []virtuallibrary.Play
 	return virtuallibrary.PlaybackStream{}, "", false
 }
 
-// EnsureBackfillJob queues the one-shot backfill at boot when legacy rows exist
-// and no backfill has finished. A completed (or explicitly canceled) job is the
-// one-shot marker: rows that could not be matched against a reachable provider
-// stay legacy on purpose, and re-listing every provider on every restart would
-// be a permanent tax. A partially failed run is not a finished job: its durable
-// watermark makes the remaining rows retriable, so the newest failed job is
-// requeued instead of starting a fresh pass from zero. An already-active job is
-// a no-op, so a restart during a run resumes the existing job instead of
-// queueing a duplicate. A server with no admin account cannot own a job and is
-// skipped.
-func (e *VirtualIdentityBackfillExecutor) EnsureBackfillJob(ctx context.Context, ownerUserID int) error {
+// EnsureBulkBackfillJob queues the one-shot bulk sweep. It is only called when
+// the operator explicitly selected virtual_library.identity_repair_mode=bulk;
+// the default mode never reaches here.
+//
+// Every gate must pass before a job is created or revived:
+//
+//   - a completed (or explicitly canceled) job is the one-shot marker: rows that
+//     could not be matched against a reachable provider stay legacy on purpose,
+//     and re-listing every provider again would be a permanent tax;
+//   - legacy rows must still exist, so an up-to-date catalog queues nothing;
+//   - the newest job of this type must be at least
+//     virtualIdentityBulkBackfillCooldown old, so a pass that keeps failing is
+//     retried once a day instead of on every restart;
+//   - an already-active job is a no-op (the insert's unique active-job index
+//     rejects a duplicate and the conflict is swallowed), so a restart during a
+//     run never queues a second one.
+//
+// A partially failed run is not a finished job: its durable watermark makes the
+// remaining rows retriable, so the newest failed job is requeued instead of
+// starting a fresh pass from zero. A server with no admin account cannot own a
+// job and is skipped.
+func (e *VirtualIdentityBackfillExecutor) EnsureBulkBackfillJob(ctx context.Context, ownerUserID int) error {
 	if e == nil || e.Store == nil || e.Jobs == nil || ownerUserID <= 0 {
 		return nil
 	}
@@ -288,6 +305,15 @@ func (e *VirtualIdentityBackfillExecutor) EnsureBackfillJob(ctx context.Context,
 		return err
 	}
 	if len(rows) == 0 {
+		return nil
+	}
+	latest, ok, err := e.Jobs.LatestJobRequestedAt(ctx, adminjob.JobTypeVirtualIdentityBackfill)
+	if err != nil {
+		return err
+	}
+	if ok && e.now().Sub(latest) < virtualIdentityBulkBackfillCooldown {
+		e.logger().InfoContext(ctx, "virtual identity backfill: bulk run cooling down",
+			"component", "api", "last_requested_at", latest, "cooldown", virtualIdentityBulkBackfillCooldown)
 		return nil
 	}
 	requeued, err := e.Jobs.RequeueLatestFailedOfType(ctx, adminjob.JobTypeVirtualIdentityBackfill)
@@ -312,11 +338,35 @@ func (e *VirtualIdentityBackfillExecutor) EnsureBackfillJob(ctx context.Context,
 	return nil
 }
 
+// QueueBulkIdentityBackfillAtBoot is the whole boot-time decision for the bulk
+// sweep, so the default-off rule lives in one testable place instead of an
+// `if` buried in the server startup path. The default mode is off and
+// on_demand never runs here: browsing cannot reproduce the bulk listing load.
+func QueueBulkIdentityBackfillAtBoot(ctx context.Context, mode string, executor *VirtualIdentityBackfillExecutor, ownerUserID int, logger *slog.Logger) {
+	if executor == nil || config.VirtualIdentityRepairMode(mode) != config.VirtualIdentityRepairBulk {
+		return
+	}
+	if err := executor.EnsureBulkBackfillJob(ctx, ownerUserID); err != nil {
+		if logger == nil {
+			logger = slog.Default()
+		}
+		logger.WarnContext(ctx, "virtual identity backfill: queue failed", "component", "api", "error", err)
+	}
+}
+
 func (e *VirtualIdentityBackfillExecutor) batch() int {
 	if e != nil && e.batchSize > 0 {
 		return e.batchSize
 	}
 	return virtualIdentityBackfillBatch
+}
+
+// now is the clock the bulk cooldown compares against; tests pin it.
+func (e *VirtualIdentityBackfillExecutor) now() time.Time {
+	if e != nil && e.nowFunc != nil {
+		return e.nowFunc()
+	}
+	return time.Now()
 }
 
 func (e *VirtualIdentityBackfillExecutor) logger() *slog.Logger {

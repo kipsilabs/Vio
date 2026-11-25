@@ -325,6 +325,27 @@ func (r *Repository) GetActiveByType(ctx context.Context, jobType string) (*mode
 	))
 }
 
+// LatestJobRequestedAt reports when the newest job of the type was requested,
+// whatever its status. It is the bulk pass's cooldown clock: the operator sees
+// the same timestamp in the job list.
+func (r *Repository) LatestJobRequestedAt(ctx context.Context, jobType string) (time.Time, bool, error) {
+	var requestedAt time.Time
+	err := r.pool.QueryRow(ctx, `
+		SELECT requested_at FROM admin_jobs
+		WHERE job_type = $1
+		ORDER BY requested_at DESC, id DESC
+		LIMIT 1`,
+		jobType,
+	).Scan(&requestedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return time.Time{}, false, nil
+	}
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("latest admin job of type: %w", err)
+	}
+	return requestedAt, true, nil
+}
+
 // HasFinishedJobOfType reports whether a job of this kind has reached a
 // terminal state the operator did not ask to retry: completed, or canceled.
 // It is the one-shot gate for work that must not be re-queued on every process

@@ -1275,6 +1275,15 @@ func (reg *Registry) getCatalogItem(ctx context.Context, in *CatalogItemDeviceIn
 			virtualSource = &source
 		}
 	}
+	// A movie or episode page may also repair the item's legacy provider
+	// identity. The trigger is fire-and-forget by contract: it is single-flight
+	// per item, rate-limited process-wide, and it lists nothing when the item
+	// already carries identity. It is deliberately here, on the item detail
+	// operation, and nowhere on list, home, search, or section reads, so
+	// browsing can never turn into the bulk sweep.
+	if detail != nil && reg.deps.VirtualIdentityRepair != nil {
+		reg.deps.VirtualIdentityRepair.ScheduleVirtualIdentityRepair(ctx, detail.ContentID, detail.Type)
+	}
 	out := catalogItemDetailOf(detail, reg.ratingSelection(ctx))
 	out.HasVirtualSource = virtualSource
 	reg.warmDetailVirtualVersions(ctx, detail, viewer.Access)

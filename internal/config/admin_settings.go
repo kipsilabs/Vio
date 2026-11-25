@@ -114,6 +114,42 @@ const (
 	MaxVirtualLibraryCatalogDiscoveryBudgetMs     = 20000
 )
 
+// VirtualIdentityRepairModeSettingKey selects how durable provider identity is
+// repaired on legacy virtual rows: rows persisted before the provider identity
+// columns existed carry no video hash or GUID, so they cannot re-match a
+// release after a provider renumbering.
+//
+//	off       (default) repair nothing automatically.
+//	on_demand           repair one movie or episode when its detail page opens,
+//	                    through the bounded trigger in internal/api/handlers.
+//	bulk                run the one-shot resumable sweep as one admin job.
+//
+// Bulk is never the default: it re-lists the provider per candidate group over
+// the whole legacy set, which is enough provider and indexer traffic to get an
+// operator rate-limited or banned. Restart-required: the mode is read once at
+// boot by the trigger wiring and the bulk enqueue.
+const (
+	VirtualIdentityRepairModeSettingKey = "virtual_library.identity_repair_mode"
+	VirtualIdentityRepairOff            = "off"
+	VirtualIdentityRepairOnDemand       = "on_demand"
+	VirtualIdentityRepairBulk           = "bulk"
+)
+
+// VirtualIdentityRepairMode reads a stored
+// VirtualIdentityRepairModeSettingKey value defensively: an empty, unknown or
+// differently cased value means off, so a malformed setting can never opt a
+// deployment into provider traffic it did not ask for.
+func VirtualIdentityRepairMode(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case VirtualIdentityRepairOnDemand:
+		return VirtualIdentityRepairOnDemand
+	case VirtualIdentityRepairBulk:
+		return VirtualIdentityRepairBulk
+	default:
+		return VirtualIdentityRepairOff
+	}
+}
+
 // VirtualLibraryPlaybackProbeCacheMinutes reads a stored
 // VirtualLibraryPlaybackProbeCacheMinutesSettingKey value. An unset or invalid
 // value is the default; any other integer is brought within bounds.
@@ -492,6 +528,7 @@ var adminSettingDefaults = map[string]string{
 	"virtual_library.cache_ttl_minutes":               "10",
 	VirtualLibraryPlaybackProbeCacheMinutesSettingKey: strconv.Itoa(DefaultVirtualLibraryPlaybackProbeCacheMinutes),
 	VirtualLibraryCatalogDiscoveryBudgetMsSettingKey:  strconv.Itoa(DefaultVirtualLibraryCatalogDiscoveryBudgetMs),
+	VirtualIdentityRepairModeSettingKey:               VirtualIdentityRepairOff,
 	"virtual_library.candidate_store_hours":           "720",
 	"virtual_library.schedule_refresh_minutes":        "360",
 	"virtual_library.monitor_file":                    ".vio-virtual-library-monitored.json",
@@ -999,6 +1036,11 @@ func NormalizeAdminSetting(key, raw string) (string, error) {
 		return normalizeAdminInt(key, value, MinVirtualLibraryPlaybackProbeCacheMinutes, MaxVirtualLibraryPlaybackProbeCacheMinutes)
 	case VirtualLibraryCatalogDiscoveryBudgetMsSettingKey:
 		return normalizeAdminInt(key, value, MinVirtualLibraryCatalogDiscoveryBudgetMs, MaxVirtualLibraryCatalogDiscoveryBudgetMs)
+	case VirtualIdentityRepairModeSettingKey:
+		if value == "" {
+			return VirtualIdentityRepairOff, nil
+		}
+		return normalizeAdminEnum(key, value, VirtualIdentityRepairOff, VirtualIdentityRepairOnDemand, VirtualIdentityRepairBulk)
 	case "virtual_library.indexer_search_timeout_seconds":
 		return normalizeAdminInt(key, value, 5, 900)
 	case "virtual_library.candidate_store_hours":
