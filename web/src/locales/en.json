@@ -128565,6 +128565,12 @@
       "value": "name"
     }
   ],
+  "web.requests.seasons.seasonSource": [
+    {
+      "type": 0,
+      "value": "Season numbering source"
+    }
+  ],
   "web.requests.seasons.title": [
     {
       "type": 0,

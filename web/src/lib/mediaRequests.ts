@@ -420,7 +420,9 @@ export function tmdbImageURL(path?: string, size = "w342"): string | null {
   return `https://image.tmdb.org/t/p/${size}${path}`;
 }
 
-export function requestInputFromMediaResult(item: RequestMediaResult): CreateMediaRequestInput {
+export function requestInputFromMediaResult(
+  item: RequestMediaResult & { season_source?: "tvdb" | "tmdb" },
+): CreateMediaRequestInput {
   return {
     media_type: item.media_type,
     tmdb_id: item.tmdb_id,
@@ -429,5 +431,6 @@ export function requestInputFromMediaResult(item: RequestMediaResult): CreateMed
     overview: item.overview || undefined,
     poster_path: item.poster_path || undefined,
     backdrop_path: item.backdrop_path || undefined,
+    ...(item.season_source && { season_source: item.season_source }),
   };
 }
