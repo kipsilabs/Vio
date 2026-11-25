@@ -1101,8 +1101,13 @@ describe("VideoPlayer with the playback session: a refused seek retry", () => {
     const video = await startWatching();
     await showSeekCard(requests, video);
 
+    // The card paused the element to put the controls back on the pre-seek
+    // position. The player reported that pause, as the live element does. The
+    // retry must not inherit it: the viewer clicked Try again.
+    act(() => sessionRef.current?.updatePlaybackState(PRE_SEEK_POSITION, false));
     fireEvent.click(screen.getByText("Try again"));
     await waitFor(() => expect(sessionRef.current?.plan?.session_id).toBe("session-2"));
+    // The target survives the card's restored position (PR #477).
     expect(requests.starts[1]?.start_position).toBeCloseTo(SEEK_TARGET, 3);
     expect(sessionRef.current?.plan?.timeline.player_start_seconds).toBeCloseTo(SEEK_TARGET, 3);
     expect(sessionRef.current?.shouldAutoPlay).toBe(true);
@@ -1112,12 +1117,27 @@ describe("VideoPlayer with the playback session: a refused seek retry", () => {
       expect(element?.getAttribute("src")).toContain("session-2");
       return element as HTMLVideoElement;
     });
+    // The replacement generation is loaded but has not started yet: the
+    // element is paused as the load algorithm leaves it, with data to play.
+    Object.defineProperty(retried, "paused", { configurable: true, value: true });
+    Object.defineProperty(retried, "readyState", {
+      configurable: true,
+      value: HTMLMediaElement.HAVE_FUTURE_DATA,
+    });
+    fireEvent.loadedData(retried);
+    fireEvent.canPlay(retried);
+    await waitFor(() => expect(HTMLMediaElement.prototype.play).toHaveBeenCalled());
+
+    // The element started, and the playhead advances from the retry target.
+    Object.defineProperty(retried, "paused", { configurable: true, value: false });
+    fireEvent.play(retried);
     Object.defineProperty(retried, "currentTime", {
       configurable: true,
       writable: true,
       value: SEEK_TARGET + 1.5,
     });
     showFrame(retried);
+    expect(controls.current?.playing).toBe(true);
     expect(controls.current?.currentTime).toBeGreaterThan(SEEK_TARGET);
   });
 

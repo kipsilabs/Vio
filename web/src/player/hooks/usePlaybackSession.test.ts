@@ -6150,7 +6150,8 @@ describe("usePlaybackSession seek reanchor evidence recovery", () => {
 
     // The card's Try again is a fresh start; the provider has recovered, so it
     // plays at the seek target with the viewer's tracks and offered release.
-    act(() => result.current.restartPlayback());
+    // The pause the card reported above is not the viewer's intent.
+    act(() => result.current.restartPlayback(true));
     await waitFor(() => expect(result.current.plan?.session_id).toBe("session-2"));
 
     expect(startBodies).toHaveLength(2);
@@ -6164,7 +6165,11 @@ describe("usePlaybackSession seek reanchor evidence recovery", () => {
     // A fresh start re-resolves the source; it is not a relink retry.
     expect(startBodies[1]?.force_relink).toBeUndefined();
     expect(result.current.error).toBeNull();
-    // Only the viewer's retry replaces the session.
+    // The replacement plays: the retry card's pause does not carry over.
+    expect(result.current.shouldAutoPlay).toBe(true);
+    // Only the viewer's retry replaces the session, and the retry does not
+    // issue another reanchor: the refused target was consumed by the start.
+    expect(replanBodies).toHaveLength(1);
     expect(deletes).toEqual(["/api/v2/playback/session-1"]);
 
     unmount();

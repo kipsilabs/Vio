@@ -742,8 +742,13 @@ export interface UsePlaybackSessionResult extends PlaybackSessionState {
    * Starts a fresh playback session at the current position after the old one
    * was answered gone. This is a new start (the server re-plans from scratch),
    * never a replan against the dead session.
+   *
+   * `autoplayIntent` carries the viewer's live play intent when they asked for
+   * the restart. The refusal card pauses the element to put the controls back
+   * on the pre-seek position, so reading the report it made at adoption time
+   * would start the retry paused. Without it, the last reported state stands.
    */
-  restartPlayback: () => void;
+  restartPlayback: (autoplayIntent?: boolean) => void;
   /**
    * `failure_recovery` replan for a plan the *server* invalidated over the
    * realtime `plan_invalidated` command. Resolves to whether a replacement plan
@@ -2569,6 +2574,7 @@ export function usePlaybackSession(
       offeredVirtualURI,
       forceRelink,
       intentAt,
+      autoplayIntent,
       reconnect = false,
       tracks,
     }: {
@@ -2597,6 +2603,13 @@ export function usePlaybackSession(
       forceRelink?: boolean;
       /** When the viewer asked for this start, for its first_frame_ms. */
       intentAt: number | null;
+      /**
+       * The viewer's play intent when they asked for this start. A restart
+       * follows a refusal card that paused the element to restore the
+       * pre-seek position, so the last report is a teardown pause rather than
+       * the viewer's intent; this starts the replacement playing.
+       */
+      autoplayIntent?: boolean;
       /** The start is a reconnect attempt, which must not cancel itself. */
       reconnect?: boolean;
       /**
@@ -2840,7 +2853,12 @@ export function usePlaybackSession(
           return { kind: "superseded" };
         }
 
-        const adopted = adoptDecision(decisionToAdopt, initialSubtitleFailure);
+        const adopted = adoptDecision(
+          decisionToAdopt,
+          initialSubtitleFailure,
+          undefined,
+          autoplayIntent,
+        );
         if (adopted) {
           // A start opens a new attempt. Its first frame is still to come:
           // whatever the player shows until the new transport loads belongs to
@@ -4078,87 +4096,99 @@ export function usePlaybackSession(
    * Starts a fresh session at the position the viewer reached after the old
    * session was answered gone. A new start re-plans server-side from scratch;
    * a replan against the dead session could only answer the same way again.
+   *
+   * `autoplayIntent` is the viewer's live intent at the moment they asked.
+   * The refusal card pauses the element so the controls show the position
+   * playback was restored to, and the pause it reports must not travel into
+   * the replacement: a viewer who clicked Try again asked for playback.
    */
-  const restartPlayback = useCallback(() => {
-    const plan = planRef.current;
-    const refusedSeek = refusedSeekRetryRef.current;
-    // The refused seek target is the viewer's newest intent, but only while
-    // the card is describing the same plan and the same source it was measured
-    // on. The player restores the pre-seek playhead while the card is up, so
-    // the remembered target is the only record of where the seek asked to go.
-    const refusedSeekTargetApplies =
-      plan !== null &&
-      refusedSeek !== null &&
-      refusedSeek.planId === plan.plan_id &&
-      Number.isFinite(refusedSeek.positionSeconds) &&
-      refusedSeek.positionSeconds >= 0 &&
-      identityNamesSameSource(refusedSeek.source, liveSourceIdentityRef.current);
-    const refusedSeekTargetStale =
-      plan !== null &&
-      refusedSeek !== null &&
-      refusedSeek.planId === plan.plan_id &&
-      !refusedSeekTargetApplies;
-    if (refusedSeekTargetStale) {
-      // The source moved or the version changed while the card was up. Sending
-      // the old target to the new source would silently start at a position
-      // the viewer never asked for on it, so say why and drop the card's retry.
-      refusedSeekRetryRef.current = null;
+  const restartPlayback = useCallback(
+    (autoplayIntent?: boolean) => {
+      const plan = planRef.current;
+      const refusedSeek = refusedSeekRetryRef.current;
+      // The refused seek target is the viewer's newest intent, but only while
+      // the card is describing the same plan and the same source it was measured
+      // on. The player restores the pre-seek playhead while the card is up, so
+      // the remembered target is the only record of where the seek asked to go.
+      const refusedSeekTargetApplies =
+        plan !== null &&
+        refusedSeek !== null &&
+        refusedSeek.planId === plan.plan_id &&
+        Number.isFinite(refusedSeek.positionSeconds) &&
+        refusedSeek.positionSeconds >= 0 &&
+        identityNamesSameSource(refusedSeek.source, liveSourceIdentityRef.current);
+      const refusedSeekTargetStale =
+        plan !== null &&
+        refusedSeek !== null &&
+        refusedSeek.planId === plan.plan_id &&
+        !refusedSeekTargetApplies;
+      if (refusedSeekTargetStale) {
+        // The source moved or the version changed while the card was up. Sending
+        // the old target to the new source would silently start at a position
+        // the viewer never asked for on it, so say why and drop the card's retry.
+        refusedSeekRetryRef.current = null;
+        setState((current) => ({
+          ...current,
+          loading: false,
+          errorTitle: SEEK_RETRY_TARGET_UNAVAILABLE.title,
+          error: SEEK_RETRY_TARGET_UNAVAILABLE.message,
+          errorReason: SEEK_RETRY_TARGET_UNAVAILABLE.reason ?? null,
+          errorRetryable: SEEK_RETRY_TARGET_UNAVAILABLE.retryable ?? false,
+        }));
+        return;
+      }
+      const seekTarget =
+        refusedSeekTargetApplies && refusedSeek !== null ? refusedSeek.positionSeconds : null;
+      const played = hasAdoptedPlanRef.current || plan !== null;
+      const position =
+        seekTarget ?? (played ? playbackPositionRef.current : startIntentRef.current.position);
+      const forceStartPosition =
+        seekTarget !== null || (played ? true : startIntentRef.current.forceStartPosition);
+      const deadSessionId = sessionIdRef.current;
+      sessionGoneRef.current = false;
+      sessionEndedRef.current = false;
+      endReconnect(false);
+      if (deadSessionId) {
+        // The stop is best effort: a reaped session answers 404, which is exactly
+        // the verdict that brought the viewer here.
+        retireActiveSession(deadSessionId);
+      }
       setState((current) => ({
         ...current,
-        loading: false,
-        errorTitle: SEEK_RETRY_TARGET_UNAVAILABLE.title,
-        error: SEEK_RETRY_TARGET_UNAVAILABLE.message,
-        errorReason: SEEK_RETRY_TARGET_UNAVAILABLE.reason ?? null,
-        errorRetryable: SEEK_RETRY_TARGET_UNAVAILABLE.retryable ?? false,
+        loading: true,
+        errorTitle: null,
+        error: null,
+        errorReason: null,
+        errorRetryable: false,
+        connectionStatus: "connected",
+        connectionErrorTitle: null,
+        connectionError: null,
       }));
-      return;
-    }
-    const seekTarget =
-      refusedSeekTargetApplies && refusedSeek !== null ? refusedSeek.positionSeconds : null;
-    const played = hasAdoptedPlanRef.current || plan !== null;
-    const position =
-      seekTarget ?? (played ? playbackPositionRef.current : startIntentRef.current.position);
-    const forceStartPosition =
-      seekTarget !== null || (played ? true : startIntentRef.current.forceStartPosition);
-    const deadSessionId = sessionIdRef.current;
-    sessionGoneRef.current = false;
-    sessionEndedRef.current = false;
-    endReconnect(false);
-    if (deadSessionId) {
-      // The stop is best effort: a reaped session answers 404, which is exactly
-      // the verdict that brought the viewer here.
-      retireActiveSession(deadSessionId);
-    }
-    setState((current) => ({
-      ...current,
-      loading: true,
-      errorTitle: null,
-      error: null,
-      errorReason: null,
-      errorRetryable: false,
-      connectionStatus: "connected",
-      connectionErrorTitle: null,
-      connectionError: null,
-    }));
-    void loadSession({
-      preferredFileId: plan?.requested_media_file_id ?? stateRef.current.mediaFileId ?? undefined,
-      position,
-      forceStartPosition,
-      allowPreserveExistingSessionOnError: false,
-      replacementErrorMessage: "Failed to restart playback",
-      initialErrorMessage: "Failed to restart playback",
-      carriedAudioTrackId: plan?.selected_tracks.audio?.id ?? null,
-      carriedSubtitleTrackIndex: plan?.selected_tracks.subtitle?.index ?? null,
-      offeredVirtualURI:
-        retryTargetRef.current?.offeredVirtualURI ?? offeredVirtualUriRef.current ?? undefined,
-      // Preserve the viewer's version choice: a restart is not a licence for
-      // the server to substitute another edition behind the dead session.
-      fileSelection: autoFallbackRef.current
-        ? "auto"
-        : (retryTargetRef.current?.fileSelection ?? (explicitFileSelection ? "explicit" : "auto")),
-      intentAt: null,
-    });
-  }, [endReconnect, explicitFileSelection, loadSession, retireActiveSession]);
+      void loadSession({
+        preferredFileId: plan?.requested_media_file_id ?? stateRef.current.mediaFileId ?? undefined,
+        position,
+        forceStartPosition,
+        allowPreserveExistingSessionOnError: false,
+        replacementErrorMessage: "Failed to restart playback",
+        initialErrorMessage: "Failed to restart playback",
+        carriedAudioTrackId: plan?.selected_tracks.audio?.id ?? null,
+        carriedSubtitleTrackIndex: plan?.selected_tracks.subtitle?.index ?? null,
+        offeredVirtualURI:
+          retryTargetRef.current?.offeredVirtualURI ?? offeredVirtualUriRef.current ?? undefined,
+        // Preserve the viewer's version choice: a restart is not a licence for
+        // the server to substitute another edition behind the dead session.
+        fileSelection: autoFallbackRef.current
+          ? "auto"
+          : (retryTargetRef.current?.fileSelection ??
+            (explicitFileSelection ? "explicit" : "auto")),
+        intentAt: null,
+        // A caller that names the intent owns it; otherwise the last reported
+        // state stands, as it did before the retry card.
+        autoplayIntent: autoplayIntent ?? playbackPlayingRef.current,
+      });
+    },
+    [endReconnect, explicitFileSelection, loadSession, retireActiveSession],
+  );
 
   // Coming back online is the best moment to try again.
   const reconnecting = state.connectionStatus === "reconnecting";
