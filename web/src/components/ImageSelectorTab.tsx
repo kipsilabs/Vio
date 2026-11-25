@@ -360,6 +360,7 @@ export default function ImageSelectorTab({ item, enabled, onImageApplied }: Imag
                       src={img.url}
                       alt=""
                       loading="lazy"
+                      referrerPolicy="no-referrer"
                       className="absolute inset-0 h-full w-full object-cover"
                       onError={(e) => {
                         e.currentTarget.style.display = "none";
