@@ -205,14 +205,20 @@ func TestCreateRequestAutoApprovalDefersOnKeylessConnection(t *testing.T) {
 	service := newTestService(store)
 	router := &fakeRouterProvider{}
 	service.SetRouterProvider(router)
+	work := &deferredEnrichment{}
+	service.asyncWork = work.schedule
 
 	req, err := service.CreateRequest(context.Background(), testViewer(1), fightClubInput)
 	if err != nil {
 		t.Fatalf("CreateRequest returned error: %v", err)
 	}
-	if req.Status != StatusApproved || req.Outcome != OutcomeActive ||
-		req.LastError != msgRouterNoKey {
-		t.Fatalf("request = %+v, want approved with the missing-key reason recorded", req)
+	if req.Status != StatusApproved || req.Outcome != OutcomeActive || req.LastError != "" {
+		t.Fatalf("request = %+v, want approved before the deferred submission", req)
+	}
+	work.drain()
+	if got := store.requests[req.ID]; got.Status != StatusApproved || got.Outcome != OutcomeActive ||
+		got.LastError != msgRouterNoKey || got.NextSubmitAt == nil {
+		t.Fatalf("stored request = %+v, want approved with the missing-key reason and retry recorded", got)
 	}
 	if router.fulfillCalls != 0 {
 		t.Fatalf("fulfill calls = %d, want 0 (must not submit to a keyless connection)", router.fulfillCalls)
@@ -252,13 +258,23 @@ func TestCreateRequestAutoApprovalSubmitsMovie(t *testing.T) {
 	// key here (no host-side secret resolution).
 	store.integrations = []Integration{autoApproveRouterInst("router-1", "radarr-key")}
 	service, router := newRoutedService(store)
+	work := &deferredEnrichment{}
+	service.asyncWork = work.schedule
 
 	req, err := service.CreateRequest(context.Background(), testViewer(1), fightClubInput)
 	if err != nil {
 		t.Fatalf("CreateRequest returned error: %v", err)
 	}
-	if req.Status != StatusQueued || req.ExternalID != "ext-1080p" {
-		t.Fatalf("request = %+v, want queued with router external id", req)
+	if req.Status != StatusApproved || req.LastError != "" {
+		t.Fatalf("request = %+v, want approved before the deferred submission", req)
+	}
+	if router.fulfillCalls != 0 {
+		t.Fatalf("fulfill calls = %d, want none before the deferred submission", router.fulfillCalls)
+	}
+	work.drain()
+	got := store.requests[req.ID]
+	if got.Status != StatusQueued || got.ExternalID != "ext-1080p" {
+		t.Fatalf("stored request = %+v, want queued with router external id", got)
 	}
 	if router.fulfillCalls != 1 {
 		t.Fatalf("fulfill calls = %d, want 1", router.fulfillCalls)
@@ -278,13 +294,19 @@ func TestCreateRequestSubmissionFailureMarksFailed(t *testing.T) {
 	// message; the host marks the request failed with it.
 	service := newTestService(store)
 	service.SetRouterProvider(&fakeRouterProvider{noTargets: true, fulfillMsg: "radarr unavailable"})
+	work := &deferredEnrichment{}
+	service.asyncWork = work.schedule
 
 	req, err := service.CreateRequest(context.Background(), testViewer(1), fightClubInput)
 	if err != nil {
 		t.Fatalf("CreateRequest returned error: %v", err)
 	}
-	if req.Outcome != OutcomeFailed || req.LastError != "radarr unavailable" {
-		t.Fatalf("request = %+v, want failed outcome with provider message", req)
+	if req.Status != StatusApproved || req.Outcome != OutcomeActive || req.LastError != "" {
+		t.Fatalf("request = %+v, want approved before the deferred submission", req)
+	}
+	work.drain()
+	if got := store.requests[req.ID]; got.Outcome != OutcomeFailed || got.LastError != "radarr unavailable" {
+		t.Fatalf("stored request = %+v, want failed outcome with provider message", got)
 	}
 }
 
@@ -1302,7 +1324,7 @@ func newTestServiceWithTMDB(store *fakeStore, tmdbClient *fakeTMDBClient) *Servi
 	// A create defers its TMDB enrichment past the 201. Tests that need the
 	// result run it explicitly through a deferredEnrichment; the default drops
 	// it so no goroutine races a test.
-	service.enrichAsync = func(func()) {}
+	service.asyncWork = func(func()) {}
 	return service
 }
 

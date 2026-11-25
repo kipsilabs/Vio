@@ -27,16 +27,25 @@ func TestCreateRequestAutoApprovalSendsToKeyOptionalRouter(t *testing.T) {
 	service := newTestService(store)
 	router := &fakeRouterProvider{keyOptional: map[int]bool{1: true}}
 	service.SetRouterProvider(router)
+	work := &deferredEnrichment{}
+	service.asyncWork = work.schedule
 
 	req, err := service.CreateRequest(context.Background(), testViewer(1), fightClubInput)
 	if err != nil {
 		t.Fatalf("CreateRequest returned error: %v", err)
 	}
+	if req.Status != StatusApproved || req.LastError != "" {
+		t.Fatalf("request = %+v, want it approved before the deferred submission", req)
+	}
+	if router.fulfillCalls != 0 {
+		t.Fatalf("fulfill calls = %d, want none before the deferred submission", router.fulfillCalls)
+	}
+	work.drain()
 	if router.fulfillCalls != 1 || len(router.gotConns) != 1 || router.gotConns[0].ID != "router-1" || router.gotConns[0].APIKey != "" {
 		t.Fatalf("fulfill calls = %d, connections = %+v; want one call to router-1 without a key", router.fulfillCalls, router.gotConns)
 	}
-	if req.Status == StatusApproved || req.LastError != "" {
-		t.Fatalf("request = %+v, want it sent to the router", req)
+	if got := store.requests[req.ID]; got.Status == StatusApproved || got.LastError != "" {
+		t.Fatalf("stored request = %+v, want it sent to the router", got)
 	}
 }
 
