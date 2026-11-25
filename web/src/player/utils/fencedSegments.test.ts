@@ -144,6 +144,98 @@ describe("createFencedFragmentLoader", () => {
     expect(retryCallbacks.onError.mock.calls[0]?.[0]).toMatchObject({ code: 412 });
   });
 
+  it("stops a load that entered before the fence from reaching the wire after it", async () => {
+    const refused = segmentUrl("seg_00453.ts", "session-1:inc:1");
+    const rebuilt = segmentUrl("seg_00453.ts", "session-1:inc:2");
+    const requests: string[] = [];
+    const aborted: string[] = [];
+    const waiting: Array<{
+      context: { url: string };
+      callbacks: Callbacks;
+      send: () => void;
+    }> = [];
+
+    class DeferredLoader {
+      stats = stats();
+      context = null;
+      private current: { url: string } | null = null;
+      load(context: { url: string }, _config: unknown, callbacks: Callbacks) {
+        const current = { url: context.url };
+        this.current = current;
+        // hls.js's XHR loader can defer send() past the call to load(), so
+        // the ledger is the only authority between the entry check and the
+        // request itself.
+        waiting.push({
+          context,
+          callbacks,
+          send: () => {
+            if (this.current !== current) return;
+            requests.push(context.url);
+            if (context.url === rebuilt) {
+              callbacks.onSuccess({ data: new ArrayBuffer(0) }, stats(), context, null);
+            } else {
+              callbacks.onError(
+                { code: 412, text: "Precondition Failed" },
+                context,
+                { status: 412 },
+                stats(),
+              );
+            }
+          },
+        });
+      }
+      abort() {
+        const current = this.current;
+        if (!current) return;
+        this.current = null;
+        aborted.push(current.url);
+        const entry = waiting.find((candidate) => candidate.context.url === current.url);
+        entry?.callbacks.onAbort?.(stats(), entry.context, null);
+      }
+      destroy() {}
+      getCacheAge() {
+        return null;
+      }
+      getResponseHeader() {
+        return null;
+      }
+    }
+
+    const ledger = createSegmentFenceLedger();
+    const Loader = createFencedFragmentLoader(DeferredLoader as never, ledger);
+    const firstCallbacks = callbacks();
+    new Loader({} as never).load(
+      { url: refused, responseType: "arraybuffer" } as never,
+      {} as never,
+      firstCallbacks,
+    );
+
+    // The load has passed the ledger check but has not been sent. Another
+    // attempt for the same URL already answered 412 and recorded the fence.
+    expect(requests).toEqual([]);
+    ledger.refuse(refused);
+    waiting[0]?.send();
+    await flush();
+
+    expect(requests).toEqual([]);
+    expect(aborted).toEqual([refused]);
+    expect(firstCallbacks.onAbort).toHaveBeenCalledOnce();
+    expect(firstCallbacks.onError).not.toHaveBeenCalled();
+
+    // The rebuilt generation is a different URL and must still load.
+    const rebuiltCallbacks = callbacks();
+    new Loader({} as never).load(
+      { url: rebuilt, responseType: "arraybuffer" } as never,
+      {} as never,
+      rebuiltCallbacks,
+    );
+    waiting[1]?.send();
+    await flush();
+
+    expect(requests).toEqual([rebuilt]);
+    expect(rebuiltCallbacks.onSuccess).toHaveBeenCalledOnce();
+  });
+
   it("still requests a different segment under the same generation", async () => {
     const run = harness();
     const refused = segmentUrl("seg_00584.ts", "session-1:inc:1");
