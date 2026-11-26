@@ -3790,6 +3790,29 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				}
 			}
 		}
+		// The selected candidate earns a synchronous provider probe; every
+		// sibling or substitute the start is still evaluating is planned from the
+		// provider listing's declared metadata. Probing each one hit the
+		// provider's mutating play endpoint, which mints a release and can fetch
+		// an NZB, so one start walked six releases with dozens of side effects
+		// just to discover that only the last one planned. The first candidate is
+		// the selected row (the persisted candidate for an explicit pick, the
+		// ranked pick for an auto start); a start-path walk is choosing among
+		// substitutes, so its first candidate is not the selection.
+		//
+		// Sibling planning stays unprobed, but the substitute the walk is about
+		// to commit gets one probe before it is served. The listing's declared
+		// metadata says a release exists, not that it is playable; an absent or
+		// dead substitute committed on that claim held the transport until its
+		// startup budget elapsed before rotating. A release the provider already
+		// reports completed is already local, so the declaration is enough.
+		probeAllowed := h.virtualCandidateProbeAffordable(attemptCtx, cand.URI, oid, i == 0 && !options.startPathProbe)
+		substituteNeedsVerification := false
+		if !probeAllowed && (options.startPathProbe || !sameVirtualReleaseIdentity(file.FilePath, cand.URI)) &&
+			h.virtualSubstituteVerificationRequired(attemptCtx, cand.URI, oid) {
+			substituteNeedsVerification = true
+			probeAllowed = true
+		}
 		hasCompleteVideoEvidence := completeVirtualVideoEvidenceV3(&transient)
 		hasCompleteAudioEvidence := completeVirtualAudioEvidenceV3(&transient)
 		hasCompleteContainerEvidence := completeVirtualContainerEvidenceV3(&transient)
@@ -3801,10 +3824,12 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		// Capture this before the candidate merge so a candidate-declared
 		// inventory never counts as stored evidence.
 		storedProbeMissing := transient.ProbeUpdatedAt == nil
-		if substituted {
+		if substituted || substituteNeedsVerification {
 			// A substituted candidate has no trustworthy declared metadata left;
 			// force the probe so the served file reflects the resolved bytes
 			// rather than the probed candidate's resolution, codecs or tracks.
+			// A substitute under verification likewise must not reuse the
+			// requested row's stored evidence as proof of different bytes.
 			skipProbe = false
 			storedProbeMissing = true
 		}
@@ -3874,16 +3899,9 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			}
 			return withResolvedCandidate(source, resolvedIdentity, resolvedRematched), nil
 		}
-		// The selected candidate earns a synchronous provider probe; every
-		// sibling or substitute the start is still evaluating is planned from the
-		// provider listing's declared metadata. Probing each one hit the
-		// provider's mutating play endpoint, which mints a release and can fetch
-		// an NZB, so one start walked six releases with dozens of side effects
-		// just to discover that only the last one planned. The first candidate is
-		// the selected row (the persisted candidate for an explicit pick, the
-		// ranked pick for an auto start); a start-path walk is choosing among
-		// substitutes, so its first candidate is not the selection.
-		probeAllowed := h.virtualCandidateProbeAffordable(attemptCtx, cand.URI, oid, i == 0 && !options.startPathProbe)
+		// The probe policy and substitute verification were decided while the
+		// transient was still being prepared; nothing below may plan an
+		// unverified substitute.
 		if !probeAllowed {
 			return mergeDeclaredFallback(ProbeProvenanceDeclared)
 		}
@@ -3899,10 +3917,12 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			}, resolvedIdentity, resolvedRematched), nil
 		}
 		allowDefer := allowDeferredProbe(deferProbe)
-		if substituted {
-			// The probed candidate's declared metadata is gone, so the deferred
-			// declared-metadata path cannot be trusted; probe the resolved URL
-			// synchronously and serve the bytes' real metadata.
+		if substituted || substituteNeedsVerification {
+			// A substituted candidate has no trustworthy declared metadata left,
+			// so the deferred declared-metadata path cannot be trusted; probe the
+			// resolved URL synchronously and serve the bytes' real metadata.
+			// A substitute under verification must likewise be proven playable
+			// before this start commits to it.
 			allowDefer = false
 		}
 		if p0Suspect && (h.VirtualPlaybackSourceProber != nil || h.VirtualPlaybackSourceProberWithHeaders != nil) {
@@ -4091,6 +4111,14 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			}, resolvedIdentity, resolvedRematched), nil
 		}
 		if virtualProbeBackedOff(probeKey) {
+			if substituteNeedsVerification {
+				// A recent probe failure already consumed this substitute's
+				// budget. The candidate is not proven playable, so it must not
+				// be committed on its declaration: let the walk try the next
+				// release instead of serving bytes the provider just failed to
+				// produce.
+				return nil, fmt.Errorf("virtual substitute %s is unverified: probe failure damper is armed", cand.URI)
+			}
 			// A recent probe failure already consumed the probe budget. A
 			// completed inner probe may still be cached; recover it before
 			// settling for the candidate-declared metadata.
@@ -4186,6 +4214,19 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			// empty declared inventory that nothing repairs.
 			if !virtualProbeVerdictUnknown(probeErr) {
 				virtualProbeFailures.mark(probeKey)
+			}
+			if substituteNeedsVerification {
+				// The substitute the start was about to commit could not be
+				// read. Returning the failure lets the candidate loop try the
+				// next release (or surface its terminal) now, instead of
+				// planning bytes that are not there and waiting out the
+				// transport's startup budget before rotating.
+				if probeErr == nil {
+					probeErr = errors.New("probe returned no file")
+				}
+				slog.WarnContext(r.Context(), "virtual substitute failed verification; trying the next release",
+					"component", "api", "candidate_uri", cand.URI, "file_id", file.ID, "error", probeErr)
+				return nil, fmt.Errorf("virtual substitute %s failed verification: %w", cand.URI, probeErr)
 			}
 			slog.DebugContext(r.Context(), "virtual stream probe timed out or failed; using candidate metadata", "component", "api", "candidate_uri", cand.URI, "error", probeErr)
 			return declaredFallback()
@@ -7912,6 +7953,23 @@ func (h *PlaybackHandler) virtualCandidateProbeAffordable(ctx context.Context, v
 	return !known
 }
 
+// virtualSubstituteVerificationRequired reports whether a candidate that would
+// replace the requested release still needs a probe before a start can commit to
+// it. A release the provider reports as completed is already held locally, so the
+// listing's declared metadata is enough proof that it can be served. Any other
+// substitute is only a claim until its bytes are read: a release that vanished
+// after the listing would otherwise be planned, committed, and only discovered
+// dead inside the transport, after the start's first-byte window had been spent.
+// This is consulted only where a substitute is about to be committed, never for
+// sibling planning, so a canonical start still pays one probe.
+func (h *PlaybackHandler) virtualSubstituteVerificationRequired(ctx context.Context, virtualURI string, ownerInstallationID int) bool {
+	if h == nil || h.VirtualReleaseCacheStatus == nil {
+		return true
+	}
+	cached, known := h.VirtualReleaseCacheStatus(ctx, virtualURI, ownerInstallationID)
+	return !known || !cached
+}
+
 // virtualReleaseCompletedAndVerified reports whether the pinned row is a release
 // the provider already holds and whose measured duration proves the item. Such a
 // release is playable; a transport hiccup on it is a transport problem, not
@@ -8564,19 +8622,25 @@ func (h *PlaybackHandler) resolveVirtualCandidateSource(
 		IdentityRematched: identityRematched,
 		RequestHeaders:    cloneHeaderMap(candidate.RequestHeaders),
 	}
+	// Every successful return from this fallback must tell the client which
+	// release was replaced, including the verified and cache-hit paths. The
+	// declared-only path used to stamp this itself; verification must not lose
+	// the substitution identity the plan reports.
+	if !sameVirtualReleaseIdentity(file.FilePath, candidate.URI) && virtualRequestedRowIsSelection(file) {
+		resolved.SubstitutedFromFileID = file.ID
+		resolved.SubstitutionReason = substitutionReasonVersionNotPlayableV3
+	}
 	if h.VirtualPlaybackSourceProber == nil && h.VirtualPlaybackSourceProberWithHeaders == nil {
 		return &resolved, nil
 	}
-	if !h.virtualCandidateProbeAffordable(ctx, candidate.URI, ownerID, sameVirtualReleaseIdentity(file.FilePath, candidate.URI)) {
-		// The substitute is not the selected release and the provider has not
-		// cached it: probing it would mint the release and could fetch an NZB
-		// just to test a fallback. Plan it from the listing and let the chosen
-		// candidate's normal post-commit probe supply the inventory.
+	selected := sameVirtualReleaseIdentity(file.FilePath, candidate.URI)
+	if !h.virtualCandidateProbeAffordable(ctx, candidate.URI, ownerID, selected) &&
+		!h.virtualSubstituteVerificationRequired(ctx, candidate.URI, ownerID) {
+		// The substitute is not the selected release and the provider reports
+		// it already completed: its bytes are local, so plan it from the
+		// listing. Any other substitute falls through to the probe below; a
+		// dead release must not be committed on a declaration alone.
 		mergeVirtualCandidateTracks(resolved.File, candidate)
-		if !sameVirtualReleaseIdentity(file.FilePath, candidate.URI) && virtualRequestedRowIsSelection(file) {
-			resolved.SubstitutedFromFileID = file.ID
-			resolved.SubstitutionReason = substitutionReasonVersionNotPlayableV3
-		}
 		return &resolved, nil
 	}
 	expectedRuntimeMinutes := h.virtualExpectedRuntimeMinutes(ctx, file)
