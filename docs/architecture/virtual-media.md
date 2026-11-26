@@ -143,11 +143,15 @@ track inventory arrives when the viewer explicitly plays one candidate.
 
 Thin clients open the item page through `GET /api/v2/catalog/items/{id}` and
 pick a version client-side; they never call a select or versions-check
-endpoint. The detail read therefore warms at most two virtual versions it
-surfaces: an unprobed row is scheduled for the pre-play inventory probe, and
-every selected virtual row is scheduled for the provider fetch warm-up. Work
-is coalesced per content id and file id for 30 seconds and the handler refuses
-a duplicate live chain, so a page refresh or inventory poll does not start a
+endpoint. The detail read warms at most two virtual versions it surfaces for
+the provider fetch, but it schedules the pre-play inventory probe for one row
+only: the viewer's selected version when the read names one, otherwise the
+default row. Every other listed version is only being evaluated, so it stays
+on the provider listing's declared metadata until it is selected or the play
+path reaches it. Probing every warmed row opened the provider's mutating play
+endpoint once per version for releases the page never played. Work is
+coalesced per content id and file id for 30 seconds and the handler refuses a
+duplicate live chain, so a page refresh or inventory poll does not start a
 second probe or fetch. Warming never writes catalog state: it does not stamp
 `probe_updated_at` by itself and never marks a row `failed_at`. The detail
 response carries the row's durable `failed`/`available` state, its `probed_at`

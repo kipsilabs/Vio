@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
 )
@@ -298,4 +299,41 @@ func virtualProbeBoundStartRequest(t *testing.T, requested *models.MediaFile) pl
 		VideoCodecs: []string{"h264"}, AudioDecodeCodecs: []string{"aac"},
 	}
 	return start
+}
+
+// A detail read may pre-probe exactly one virtual version: the row the page
+// will play. That is the selected row when the read names one, otherwise the
+// first playable virtual row. Every other listed version is only being
+// evaluated, so it stays on the listing's declared metadata and the play path
+// probes it if it is chosen later.
+func TestVirtualDetailProbeFileID(t *testing.T) {
+	unavailable := false
+	local := catalog.FileVersion{FileID: 1, FilePath: "/media/movie/heat.mkv", Container: "mkv"}
+	virtualA := catalog.FileVersion{FileID: 2, FilePath: "virtual://movie/heat?result=a", Container: "virtual"}
+	virtualB := catalog.FileVersion{FileID: 3, FilePath: "virtual://movie/heat?result=b", Container: "virtual"}
+	failed := catalog.FileVersion{FileID: 4, FilePath: "virtual://movie/heat?result=dead", Container: "virtual", Failed: true}
+	down := catalog.FileVersion{FileID: 5, FilePath: "virtual://movie/heat?result=down", Container: "mkv", Available: &unavailable}
+
+	cases := []struct {
+		name     string
+		versions []catalog.FileVersion
+		selected int
+		want     int
+	}{
+		{name: "default skips local and failed", versions: []catalog.FileVersion{local, failed, virtualA, virtualB}, want: virtualA.FileID},
+		{name: "default skips unavailable", versions: []catalog.FileVersion{down, virtualB}, want: virtualB.FileID},
+		{name: "selected row wins", versions: []catalog.FileVersion{local, virtualA, virtualB}, selected: virtualB.FileID, want: virtualB.FileID},
+		{name: "selected local has no virtual probe", versions: []catalog.FileVersion{local, virtualA}, selected: local.FileID, want: 0},
+		{name: "selected failed has no probe", versions: []catalog.FileVersion{virtualA, failed}, selected: failed.FileID, want: 0},
+		{name: "selection the list dropped has no probe", versions: []catalog.FileVersion{virtualA}, selected: 99, want: 0},
+		{name: "no playable virtual row", versions: []catalog.FileVersion{local, failed, down}, want: 0},
+		{name: "no versions", selected: 1, want: 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := VirtualDetailProbeFileID(tc.versions, tc.selected); got != tc.want {
+				t.Fatalf("VirtualDetailProbeFileID = %d, want %d", got, tc.want)
+			}
+		})
+	}
 }

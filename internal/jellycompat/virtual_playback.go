@@ -268,7 +268,15 @@ type resolvedCompatVirtualSource struct {
 	ownerID int
 }
 
-func (h *PlaybackHandler) prepareVirtualPlaybackVersion(ctx context.Context, session *Session, version catalog.FileVersion) (catalog.FileVersion, string, int, error) {
+// prepareVirtualPlaybackVersion prepares one version for a PlaybackInfo response.
+// probe controls whether an unprobed row's provider bytes are enumerated now.
+// Only the version the client is about to play needs the probe: the other
+// listed versions are being evaluated, so they are resolved for the listing
+// (and dropped when the provider no longer lists them) but not bound or probed.
+// The stream path prepares and probes whichever one is chosen later. The
+// variadic form keeps the default (probe) for existing callers that prepare the
+// source they are about to serve.
+func (h *PlaybackHandler) prepareVirtualPlaybackVersion(ctx context.Context, session *Session, version catalog.FileVersion, probe ...bool) (catalog.FileVersion, string, int, error) {
 	if !isCompatVirtualPath(version.FilePath) && !strings.EqualFold(strings.TrimSpace(version.Container), "virtual") {
 		return version, "", 0, nil
 	}
@@ -279,59 +287,106 @@ func (h *PlaybackHandler) prepareVirtualPlaybackVersion(ctx context.Context, ses
 	if err != nil || file == nil {
 		return version, "", 0, errors.New("virtual media file is unavailable")
 	}
-	resolved, err := h.resolveAndProbeVirtualSource(ctx, file, session.StreamAppUserID, session.ProfileID)
+	shouldProbe := len(probe) == 0 || probe[0]
+	resolved, err := h.resolveAndProbeVirtualSource(ctx, file, session.StreamAppUserID, session.ProfileID, shouldProbe)
 	if err != nil {
 		return version, "", 0, err
+	}
+	if !shouldProbe {
+		// An evaluated version keeps its listing metadata and is not bound: the
+		// stream request that plays it resolves and probes it then.
+		return applyVirtualProbeToVersion(version, resolved.file), "", 0, nil
 	}
 	return applyVirtualProbeToVersion(version, resolved.file), resolved.uri, resolved.ownerID, nil
 }
 
-func (h *PlaybackHandler) resolveAndProbeVirtualSource(ctx context.Context, file *models.MediaFile, userID int, profileID string) (resolvedCompatVirtualSource, error) {
-	if !isCompatVirtualFile(file) {
-		return resolvedCompatVirtualSource{file: file}, nil
+// compatPlaybackTargetFileID names the one version a PlaybackInfo negotiation
+// will serve by default: the explicitly requested media source when the request
+// names one, otherwise the first offered (live and readable) version. A client
+// that later picks another listed source sends that MediaSourceId on its stream
+// request, where the stream path prepares and probes it. 0 means the caller
+// cannot name a target, so no virtual version is probed speculatively.
+func compatPlaybackTargetFileID(versions []catalog.FileVersion, mediaSourceID string, hasLiveVersion bool, codec *ResourceIDCodec) int {
+	if mediaSourceID != "" {
+		for _, version := range versions {
+			if codec != nil && mediaSourceIDsEqual(codec.EncodeIntID(EncodedIDMediaSource, int64(version.FileID)), mediaSourceID) {
+				return version.FileID
+			}
+		}
+		return 0
 	}
+	for _, version := range versions {
+		if hasLiveVersion && version.Failed {
+			continue
+		}
+		if version.Unreadable {
+			continue
+		}
+		return version.FileID
+	}
+	return 0
+}
 
+// compatVirtualCandidates returns the provider candidates one virtual version
+// may resolve to: the pinned result when the row names one, otherwise the
+// provider listing, capped at the probe attempt budget. An empty list means the
+// listing carried no usable candidate.
+func (h *PlaybackHandler) compatVirtualCandidates(ctx context.Context, file *models.MediaFile, userID int, profileID string) ([]VirtualPlaybackStream, error) {
 	parsed, _ := url.Parse(file.FilePath)
 	hasResult := parsed != nil && strings.TrimSpace(parsed.Query().Get("result")) != ""
-
-	candidates := []VirtualPlaybackStream(nil)
-	if hasResult {
-		candidates = []VirtualPlaybackStream{{
-			URI:                 file.FilePath,
-			Resolution:          file.Resolution,
-			CodecVideo:          file.CodecVideo,
-			CodecAudio:          file.CodecAudio,
-			Container:           file.Container,
-			HDR:                 mediaFileHDRString(file),
-			FileSize:            file.FileSize,
-			Bitrate:             file.Bitrate,
-			OwnerInstallationID: file.VirtualOwnerInstallationID,
-		}}
-	} else if h.VirtualPlaybackStreamLister != nil {
+	declared := VirtualPlaybackStream{
+		URI:                 file.FilePath,
+		Resolution:          file.Resolution,
+		CodecVideo:          file.CodecVideo,
+		CodecAudio:          file.CodecAudio,
+		Container:           file.Container,
+		HDR:                 mediaFileHDRString(file),
+		FileSize:            file.FileSize,
+		Bitrate:             file.Bitrate,
+		OwnerInstallationID: file.VirtualOwnerInstallationID,
+	}
+	var candidates []VirtualPlaybackStream
+	switch {
+	case hasResult:
+		candidates = []VirtualPlaybackStream{declared}
+	case h.VirtualPlaybackStreamLister != nil:
 		listCtx, cancel := context.WithTimeout(ctx, compatVirtualListTimeout)
 		streams, err := h.VirtualPlaybackStreamLister.ListVirtualPlaybackStreams(listCtx, file.FilePath, userID, profileID, file.VirtualOwnerInstallationID)
 		cancel()
 		if err != nil {
-			return resolvedCompatVirtualSource{}, fmt.Errorf("list virtual playback streams: %w", err)
+			return nil, fmt.Errorf("list virtual playback streams: %w", err)
 		}
-		if filtered := filterCompatVirtualCandidates(file.FilePath, streams); len(filtered) > 0 {
-			candidates = filtered
-		}
-	} else {
-		candidates = []VirtualPlaybackStream{{
-			URI:                 file.FilePath,
-			Resolution:          file.Resolution,
-			CodecVideo:          file.CodecVideo,
-			CodecAudio:          file.CodecAudio,
-			Container:           file.Container,
-			HDR:                 mediaFileHDRString(file),
-			FileSize:            file.FileSize,
-			Bitrate:             file.Bitrate,
-			OwnerInstallationID: file.VirtualOwnerInstallationID,
-		}}
+		candidates = filterCompatVirtualCandidates(file.FilePath, streams)
+	default:
+		candidates = []VirtualPlaybackStream{declared}
 	}
 	if len(candidates) > compatVirtualMaxProbeAttempts {
 		candidates = candidates[:compatVirtualMaxProbeAttempts]
+	}
+	return candidates, nil
+}
+
+// compatProbeWanted reports whether this resolution opens the provider's
+// mutating play endpoint: only for a version that will be served, only when its
+// row has no probe evidence yet, and only with a prober wired.
+func (h *PlaybackHandler) compatProbeWanted(file *models.MediaFile, probe bool) bool {
+	return probe && file.ProbeUpdatedAt == nil && (h.VirtualSourceProber != nil || h.VirtualSourceProberWithHeaders != nil)
+}
+
+// resolveAndProbeVirtualSource resolves one virtual version's candidate. probe
+// false keeps the listing/declared metadata without opening the provider's
+// mutating play endpoint; the caller uses it for versions that are only being
+// evaluated. The default (no argument) probes, so a substitute that will be
+// served is still verified.
+func (h *PlaybackHandler) resolveAndProbeVirtualSource(ctx context.Context, file *models.MediaFile, userID int, profileID string, probe ...bool) (resolvedCompatVirtualSource, error) {
+	shouldProbe := len(probe) == 0 || probe[0]
+	if !isCompatVirtualFile(file) {
+		return resolvedCompatVirtualSource{file: file}, nil
+	}
+
+	candidates, err := h.compatVirtualCandidates(ctx, file, userID, profileID)
+	if err != nil {
+		return resolvedCompatVirtualSource{}, err
 	}
 
 	for _, candidate := range candidates {
@@ -374,37 +429,45 @@ func (h *PlaybackHandler) resolveAndProbeVirtualSource(ctx context.Context, file
 		// probe_updated_at so later plays can take the fast candidate-merge
 		// path. Already-probed rows skip this entirely (no probe-per-play),
 		// matching the native probe gate.
-		if file.ProbeUpdatedAt == nil && (h.VirtualSourceProber != nil || h.VirtualSourceProberWithHeaders != nil) {
-			probed, probeFailure := h.probeCompatVirtualSource(ctx, &transient, uri, ownerID, userID, profileID)
-			if probeFailure == nil {
-				if transient.ID > 0 {
-					probed.ID = transient.ID
-					probed.MediaFolderID = transient.MediaFolderID
-				}
-				if transient.Duration > 0 && probed.Duration <= 0 {
-					probed.Duration = transient.Duration
-				}
-				mergeCompatCandidateTracks(probed, candidate)
-				h.persistCompatVirtualMetadata(ctx, probed, file, uri)
+		if h.compatProbeWanted(file, shouldProbe) {
+			if probed := h.compatProbeCandidate(ctx, file, &transient, candidate, uri, ownerID, userID, profileID); probed != nil {
 				return resolvedCompatVirtualSource{file: probed, uri: uri, ownerID: ownerID}, nil
 			}
-			// Resolution or probe failed. Fall back to the candidate-declared
-			// metadata exactly like the native path: a probe must never fail the
-			// request or block playback. It says so, though: the fallback serves
-			// declared values in place of a probe, which is why two clients can
-			// see different track counts for the same title while one of them
-			// reported the failure and the other did not.
-			slog.WarnContext(ctx, "jellycompat virtual source probe failed; serving declared candidate metadata",
-				"component", "jellycompat",
-				"file_id", file.ID,
-				"candidate_uri", uri,
-				"reason", probeFailure.Error())
 		}
 
 		mergeCompatCandidateTracks(&transient, candidate)
 		return resolvedCompatVirtualSource{file: &transient, uri: uri, ownerID: ownerID}, nil
 	}
 	return resolvedCompatVirtualSource{}, errors.New("virtual playback provider returned no usable stream")
+}
+
+// compatProbeCandidate probes one resolved candidate and returns the probed row
+// when the probe succeeded. A nil result means it could not run or failed; the
+// caller then serves the candidate-declared metadata exactly like the native
+// path, because a probe must never fail the request or block playback.
+func (h *PlaybackHandler) compatProbeCandidate(ctx context.Context, file, transient *models.MediaFile, candidate VirtualPlaybackStream, uri string, ownerID, userID int, profileID string) *models.MediaFile {
+	probed, probeFailure := h.probeCompatVirtualSource(ctx, transient, uri, ownerID, userID, profileID)
+	if probeFailure != nil {
+		// The fallback serves declared values in place of a probe, which is why
+		// two clients can see different track counts for the same title while
+		// one of them reported the failure and the other did not.
+		slog.WarnContext(ctx, "jellycompat virtual source probe failed; serving declared candidate metadata",
+			"component", "jellycompat",
+			"file_id", file.ID,
+			"candidate_uri", uri,
+			"reason", probeFailure.Error())
+		return nil
+	}
+	if transient.ID > 0 {
+		probed.ID = transient.ID
+		probed.MediaFolderID = transient.MediaFolderID
+	}
+	if transient.Duration > 0 && probed.Duration <= 0 {
+		probed.Duration = transient.Duration
+	}
+	mergeCompatCandidateTracks(probed, candidate)
+	h.persistCompatVirtualMetadata(ctx, probed, file, uri)
+	return probed
 }
 
 // probeCompatVirtualSource resolves the candidate to a temporary provider URL

@@ -213,6 +213,51 @@ func (f VirtualDefaultProbeTargetFunc) DefaultVirtualProbeTarget(ctx context.Con
 	return f(ctx, contentID, filter)
 }
 
+// VirtualDetailProbeFileID picks the one virtual version a detail read may
+// pre-probe: the viewer's explicit selection when the read names one and that
+// row is still playable, otherwise the first playable virtual row (the default
+// the page would start). Every other version is only being evaluated, so it
+// stays on the provider listing's declared metadata until the viewer selects
+// it or the play path reaches it.
+//
+// A page that warmed one version per listed row used to open the provider's
+// mutating play endpoint once per version; the page is about to play exactly
+// one of them. Returning 0 means this read has no candidate worth probing
+// (local, failed, unavailable, or a selection the list no longer carries), and
+// the play path owns the probe.
+func VirtualDetailProbeFileID(versions []catalog.FileVersion, selectedFileID int) int {
+	if selectedFileID > 0 {
+		for _, version := range versions {
+			if version.FileID != selectedFileID {
+				continue
+			}
+			if !virtualDetailVersionPlayable(version) {
+				return 0
+			}
+			return version.FileID
+		}
+		return 0
+	}
+	for _, version := range versions {
+		if version.FileID <= 0 || !virtualDetailVersionPlayable(version) {
+			continue
+		}
+		return version.FileID
+	}
+	return 0
+}
+
+// virtualDetailVersionPlayable reports whether a projected version row can be
+// the probe target: provider-backed, not durably failed, and not currently
+// reported unavailable.
+func virtualDetailVersionPlayable(version catalog.FileVersion) bool {
+	if version.FileID <= 0 || version.Failed || (version.Available != nil && !*version.Available) {
+		return false
+	}
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(version.FilePath)), "virtual://") ||
+		strings.EqualFold(strings.TrimSpace(version.Container), "virtual")
+}
+
 // VirtualProbeVersionLister is the catalog version read behind the production
 // default-probe target: the same top-sorted, access-filtered version list the
 // browse picker uses. *catalog.DetailService implements it.
