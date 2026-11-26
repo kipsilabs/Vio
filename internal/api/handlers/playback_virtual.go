@@ -3838,6 +3838,55 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			// committed session and keeps tracks_pending until it does.
 			skipProbe = false
 		}
+		// mergeDeclaredFallback backfills the candidate's declared metadata onto
+		// the transient plan file and returns the resolved source under the given
+		// provenance. Resolution precedence: stored evidence wins; otherwise
+		// adopt the candidate's declared label; only when both are absent is the
+		// 1080p baseline assumed. Only the last case marks ResolutionAssumed, so a
+		// declared 2160p is never clobbered.
+		//
+		// A partial enumeration reuses it with pending provenance: the candidate's
+		// bytes are not condemned, it keeps playing on its provisional plan, and no
+		// probe evidence is published.
+		mergeDeclaredFallback := func(provenance ProbeProvenance) (*resolvedVirtualPlaybackSource, error) {
+			if transient.Resolution == "" {
+				transient.Resolution = cand.Resolution
+			}
+			resolutionAssumed := transient.Resolution == ""
+			if resolutionAssumed {
+				transient.Resolution = transcodeResolution1080p
+			}
+			mergeVirtualCandidateTracks(&transient, cand)
+			if !transient.HDR && cand.HDR != "" {
+				transient.HDR = true
+			}
+			h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
+			source := &resolvedVirtualPlaybackSource{
+				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: provenance, ResolutionAssumed: resolutionAssumed,
+			}
+			// A candidate reached without a probe can still be a substitution:
+			// the selected row's probe failed and the loop moved to this release
+			// from the listing. Publish the same substitution the verified path
+			// does so the client learns the requested version was replaced.
+			if !sameVirtualReleaseIdentity(file.FilePath, cand.URI) && virtualRequestedRowIsSelection(file) {
+				source.SubstitutedFromFileID = file.ID
+				source.SubstitutionReason = substitutionReasonVersionNotPlayableV3
+			}
+			return withResolvedCandidate(source, resolvedIdentity, resolvedRematched), nil
+		}
+		// The selected candidate earns a synchronous provider probe; every
+		// sibling or substitute the start is still evaluating is planned from the
+		// provider listing's declared metadata. Probing each one hit the
+		// provider's mutating play endpoint, which mints a release and can fetch
+		// an NZB, so one start walked six releases with dozens of side effects
+		// just to discover that only the last one planned. The first candidate is
+		// the selected row (the persisted candidate for an explicit pick, the
+		// ranked pick for an auto start); a start-path walk is choosing among
+		// substitutes, so its first candidate is not the selection.
+		probeAllowed := h.virtualCandidateProbeAffordable(attemptCtx, cand.URI, oid, i == 0 && !options.startPathProbe)
+		if !probeAllowed {
+			return mergeDeclaredFallback(ProbeProvenanceDeclared)
+		}
 		if skipProbe && !storedProbeMissing {
 			h.pinVirtualStickyAt(stickyKey, cand.URI, generation)
 			mergeVirtualCandidateTracks(&transient, cand)
@@ -4001,33 +4050,6 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			}, resolvedIdentity, resolvedRematched), nil
 		}
 		probeKey := virtualProbeFailureKey(cand.URI, oid)
-		// mergeDeclaredFallback backfills the candidate's declared metadata onto
-		// the transient plan file and returns the resolved source under the given
-		// provenance. Resolution precedence: stored evidence wins; otherwise
-		// adopt the candidate's declared label; only when both are absent is the
-		// 1080p baseline assumed. Only the last case marks ResolutionAssumed, so a
-		// declared 2160p is never clobbered.
-		//
-		// A partial enumeration reuses it with pending provenance: the candidate's
-		// bytes are not condemned, it keeps playing on its provisional plan, and no
-		// probe evidence is published.
-		mergeDeclaredFallback := func(provenance ProbeProvenance) (*resolvedVirtualPlaybackSource, error) {
-			if transient.Resolution == "" {
-				transient.Resolution = cand.Resolution
-			}
-			resolutionAssumed := transient.Resolution == ""
-			if resolutionAssumed {
-				transient.Resolution = transcodeResolution1080p
-			}
-			mergeVirtualCandidateTracks(&transient, cand)
-			if !transient.HDR && cand.HDR != "" {
-				transient.HDR = true
-			}
-			h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
-			return withResolvedCandidate(&resolvedVirtualPlaybackSource{
-				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: provenance, ResolutionAssumed: resolutionAssumed,
-			}, resolvedIdentity, resolvedRematched), nil
-		}
 		declaredFallback := func() (*resolvedVirtualPlaybackSource, error) {
 			return mergeDeclaredFallback(ProbeProvenanceFailed)
 		}
@@ -4752,6 +4774,9 @@ func (h *PlaybackHandler) matchSameReleaseSiblingProbe(ctx context.Context, anch
 		cand.ProviderReleaseName = row.ProviderReleaseName
 		if cand.FileSize <= 0 {
 			cand.FileSize = row.ProviderReleaseSize
+		}
+		if !h.virtualCandidateProbeAffordable(ctx, cand.URI, cand.OwnerInstallationID, sameVirtualReleaseIdentity(anchor.FilePath, cand.URI)) {
+			continue
 		}
 		probeURL, probeHeaders, ok := h.siblingProbeURL(ctx, row)
 		if !ok {
@@ -7864,6 +7889,29 @@ func virtualRotationWouldDropTracks(selected, target, probed *models.MediaFile) 
 // more, but a dead release cannot hold the start indefinitely.
 const virtualCompletedReleaseRetryBudget = 20 * time.Second
 
+// virtualCandidateProbeAffordable reports whether a start may spend a provider
+// probe on this candidate. The selected candidate always may: it is the release
+// the viewer asked to play, and a genuinely unplayable pick must be detected so
+// it can be substituted. A sibling or substitute is planned from the provider
+// listing's declared metadata whenever the provider's completion signal is
+// available, cached or not: probing an uncached one opens the provider's mutating
+// play endpoint, which mints a release and can fetch an NZB for a version the
+// start is still only evaluating, and probing a cached one still pays the same
+// endpoint for inventory the post-commit probe will collect on the candidate
+// actually chosen. When no completion signal is wired (known=false), the old
+// behavior is kept so non-AltMount providers and direct resolve callers are
+// unchanged.
+func (h *PlaybackHandler) virtualCandidateProbeAffordable(ctx context.Context, virtualURI string, ownerInstallationID int, selected bool) bool {
+	if selected {
+		return true
+	}
+	if h == nil || h.VirtualReleaseCacheStatus == nil {
+		return true
+	}
+	_, known := h.VirtualReleaseCacheStatus(ctx, virtualURI, ownerInstallationID)
+	return !known
+}
+
 // virtualReleaseCompletedAndVerified reports whether the pinned row is a release
 // the provider already holds and whose measured duration proves the item. Such a
 // release is playable; a transport hiccup on it is a transport problem, not
@@ -8517,6 +8565,18 @@ func (h *PlaybackHandler) resolveVirtualCandidateSource(
 		RequestHeaders:    cloneHeaderMap(candidate.RequestHeaders),
 	}
 	if h.VirtualPlaybackSourceProber == nil && h.VirtualPlaybackSourceProberWithHeaders == nil {
+		return &resolved, nil
+	}
+	if !h.virtualCandidateProbeAffordable(ctx, candidate.URI, ownerID, sameVirtualReleaseIdentity(file.FilePath, candidate.URI)) {
+		// The substitute is not the selected release and the provider has not
+		// cached it: probing it would mint the release and could fetch an NZB
+		// just to test a fallback. Plan it from the listing and let the chosen
+		// candidate's normal post-commit probe supply the inventory.
+		mergeVirtualCandidateTracks(resolved.File, candidate)
+		if !sameVirtualReleaseIdentity(file.FilePath, candidate.URI) && virtualRequestedRowIsSelection(file) {
+			resolved.SubstitutedFromFileID = file.ID
+			resolved.SubstitutionReason = substitutionReasonVersionNotPlayableV3
+		}
 		return &resolved, nil
 	}
 	expectedRuntimeMinutes := h.virtualExpectedRuntimeMinutes(ctx, file)
