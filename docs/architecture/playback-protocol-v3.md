@@ -1268,6 +1268,16 @@ seconds. A long-GOP source (a 10 s HEVC interval, for example) legitimately
 anchors more than five seconds back; a check against a fixed 5 s bar would flag
 it as an overshoot.
 
+A progressive remux seek that cannot resolve its anchor inside the first-output
+window is refused with the retryable `transcode_start_failed` seek verdict. The
+viewer's next start at that refused target (`force_relink`) gets one extended
+probe window, still bounded by the probe's own timeout and the start deadline. If
+that retry still cannot anchor, the start answers the non-retryable
+`seek_anchor_unavailable` terminal instead of showing the same retry card again.
+The extension is keyed to the requested file and target and is consumed by that
+retry, so a later track change, a different position, or a second retry keeps the
+first-attempt budget.
+
 Segmented HLS does not carry the same offset. Its player starts at the target
 segment rather than at the transport's first frame, because the segment layer
 waits for, or restarts FFmpeg at, that segment.
@@ -2065,7 +2075,7 @@ HDR, 4K, or transcode-policy reason — deselecting the subtitle restores playba
 `transcode_start_failed`, `transcode_node_unavailable`,
 `transcode_node_capability_unavailable`, `track_unavailable`,
 `invalid_seek_position`, `invalid_replan`, `seek_reanchor_route_changed`,
-`seek_reanchor_recipe_unavailable`,
+`seek_reanchor_recipe_unavailable`, `seek_anchor_unavailable`,
 `seek_reanchor_intent_mismatch`, `seek_failure_recovery_intent_mismatch`,
 `policy_denied`, `routing_policy_unsatisfied`, `route_capacity_unavailable`,
 `route_capability_unavailable`, `route_preparation_failed`.
@@ -2075,6 +2085,10 @@ capacity, which is `capacity_unavailable`. Both are retryable: a new attempt wit
 a fresh `playback_attempt_id` succeeds once another of the account's sessions
 ends, while the same id replays the stored terminal. Their `message` tells the
 viewer what to do.
+`seek_anchor_unavailable` is the non-retryable end of a progressive copy-video
+seek retry: the viewer's retry already spent its one extended anchor probe, so
+the same target would only repeat the failure. Its `message` asks for a
+different position or version.
 `routing_policy_unsatisfied` and `route_capacity_unavailable` come from the node-routing resolver:
 `routing_policy_unsatisfied` means no route shape is legal under the configured
 execution and egress policy and is never retryable, while
