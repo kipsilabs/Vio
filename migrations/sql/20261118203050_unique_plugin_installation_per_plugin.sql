@@ -198,9 +198,9 @@ END
 $$;
 -- +goose StatementEnd
 
--- IF NOT EXISTS: the fork's earlier migration
--- (20260916003925_unique_plugin_installation_per_plugin_id.sql) already built
--- the same index on fork deployments.
+-- The fork's 20260916003925 migration already built this index on a database
+-- that ran it, so the statement is idempotent: the cleanup above only needs the
+-- index to exist, whichever migration created it.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_plugin_installations_plugin_id
     ON plugin_installations (plugin_id)
     WHERE kind = 'plugin';
