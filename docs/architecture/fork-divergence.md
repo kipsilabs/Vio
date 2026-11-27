@@ -167,3 +167,19 @@ What a future adoption implies:
   fixtures, and the Insights breakdowns move together.
 - Re-run the fork's virtual-library playback suites and the compat router
   wiring test; both pin behaviour the rework changes.
+
+### Fork fixes carried inside the deferred surface
+
+These fixes sit on the fork engine/API and are preserved with it. Each is part
+of why the surface is deferred rather than merged hunk by hunk.
+
+| Fix | What it keeps |
+| --- | --- |
+| #482 | Undated empty seasons render and page correctly (catalog season reads). |
+| #483 | The request dialog's TVDB/TMDB season-source picker (`season_source` on requests, detail read, `media_requests.season_source`). |
+| #485 | Plugin identity headers under both `X-Vio-*` and the documented `X-Silo-*`. |
+| #487 | Provider preview requests use `no-referrer` (web image preview). |
+| #490 | Jellyfin virtual playback wiring: every virtual-library dependency reaches `NewRouter`'s `PlaybackHandler`; without it `/Videos/{id}/stream` answers 502. |
+| #492 | On-demand virtual identity repair, off by default. |
+| #493 | Virtual probe bounds for detail reads and liveness checks. |
+| #495 | Copy-seek retry escalation between segment restarts. |
