@@ -120,7 +120,6 @@ func (s *DetailService) GetItemCardsByIDs(ctx context.Context, contentIDs []stri
 			LastAirDate:       localized.LastAirDate,
 			ReleaseDate:       localized.ReleaseDate,
 			ShowStatus:        localized.ShowStatus,
-			EpisodeLabels:     localized.EpisodeLabels,
 			SeasonCount:       localized.SeasonCount,
 			PosterThumbhash:   localized.PosterThumbhash,
 			BackdropThumbhash: localized.BackdropThumbhash,

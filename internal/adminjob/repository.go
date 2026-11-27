@@ -980,3 +980,63 @@ func (r *Repository) CreateLibraryDeletion(ctx context.Context, userID int, req 
 	}
 	return job, nil
 }
+
+// CreateVirtualCandidatesRefresh persists one Refresh List job for a title.
+// A unique index (job_type, request_payload->>'content_id') enforces one active
+// job per title; a duplicate returns ActiveJobConflictError carrying the
+// already-active job so the caller can answer it like a coalesced command.
+func (r *Repository) CreateVirtualCandidatesRefresh(ctx context.Context, createdByUserID int, req VirtualCandidatesRefreshRequest, message string) (*models.AdminJob, error) {
+	payload, err := marshalPayload(req)
+	if err != nil {
+		return nil, fmt.Errorf("marshaling virtual candidates refresh payload: %w", err)
+	}
+
+	id, err := idgen.NextID()
+	if err != nil {
+		return nil, fmt.Errorf("generate job id: %w", err)
+	}
+	job, err := scanAdminJob(r.pool.QueryRow(ctx, `
+		INSERT INTO admin_jobs (
+			id, job_type, status, created_by_user_id, request_payload, message
+		) VALUES ($1, $2, $3, $4, $5, $6)
+		RETURNING `+adminJobColumns,
+		id,
+		JobTypeVirtualCandidatesRefresh,
+		StatusQueued,
+		createdByUserID,
+		payload,
+		message,
+	))
+	if err == nil {
+		return job, nil
+	}
+
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+		activeJob, lookupErr := r.GetActiveVirtualRefreshByContentID(ctx, req.ContentID)
+		if lookupErr != nil && !errors.Is(lookupErr, ErrJobNotFound) {
+			return nil, lookupErr
+		}
+		return nil, &ActiveJobConflictError{Job: activeJob}
+	}
+
+	return nil, fmt.Errorf("creating virtual candidates refresh job: %w", err)
+}
+
+// GetActiveVirtualRefreshByContentID returns the queued or running Refresh
+// List job for a title, so a duplicate request coalesces onto it.
+func (r *Repository) GetActiveVirtualRefreshByContentID(ctx context.Context, contentID string) (*models.AdminJob, error) {
+	return scanAdminJob(r.pool.QueryRow(ctx, `
+		SELECT `+adminJobColumns+`
+		FROM admin_jobs
+		WHERE job_type = $1
+		  AND status IN ($2, $3)
+		  AND request_payload->>'content_id' = $4
+		ORDER BY requested_at ASC
+		LIMIT 1`,
+		JobTypeVirtualCandidatesRefresh,
+		StatusQueued,
+		StatusRunning,
+		contentID,
+	))
+}

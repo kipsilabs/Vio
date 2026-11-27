@@ -20,33 +20,18 @@ func TestHistoryImportDurableAdmissionErrorsDoNotExposeCauses(t *testing.T) {
 	}
 }
 
-// The v2 mapping explains these failures from their cause, so the service
-// error must keep it reachable.
-func TestHistoryImportAPIErrorKeepsTheCauseForV2(t *testing.T) {
+// v1 is frozen: failures the v2 adapter explains still answer 500 here, and
+// the cause stays reachable for the v2 mapping.
+func TestHistoryImportAPIErrorKeepsV1DecisionForV2Causes(t *testing.T) {
 	dial := &url.Error{Op: "Post", URL: "http://emby.example.test/Users/AuthenticateByName", Err: &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connect: connection refused")}}
 	for _, err := range []error{
 		fmt.Errorf("%w: %w", historyimport.ErrSourceUnreachable, dial),
 		fmt.Errorf("%w: choose a server and enter the Emby username", historyimport.ErrInvalidInput),
-		fmt.Errorf("authenticating against Emby server: %w", historyimport.ErrUnexpectedSourceResponse),
 	} {
 		out := historyImportAPIError(err)
-		if !errors.Is(out, err) {
-			t.Fatalf("historyImportAPIError(%v) = %+v, want it to wrap its cause", err, out)
+		if out.Status != http.StatusInternalServerError || out.Code != policyErrorInternal || !errors.Is(out, err) {
+			t.Fatalf("historyImportAPIError(%v) = %+v, want the unchanged v1 500 wrapping its cause", err, out)
 		}
-	}
-}
-
-func TestHistoryImportAPIErrorMapsValidationAndUnexpectedResponse(t *testing.T) {
-	invalid := fmt.Errorf("%w: emby_base_url must be an HTTP or HTTPS URL without credentials, query parameters, or fragments", historyimport.ErrInvalidInput)
-	out := historyImportAPIError(invalid)
-	if out.Status != http.StatusBadRequest || out.Code != policyErrorBadRequest || !errors.Is(out, historyimport.ErrInvalidInput) {
-		t.Fatalf("ErrInvalidInput mapping = %+v", out)
-	}
-
-	unexpected := fmt.Errorf("authenticating against Emby server: %w", historyimport.ErrUnexpectedSourceResponse)
-	out = historyImportAPIError(unexpected)
-	if out.Status != http.StatusServiceUnavailable || out.Code != "dependency_unavailable" || out.Message != historyimport.UnexpectedSourceResponseMessage || !errors.Is(out, historyimport.ErrUnexpectedSourceResponse) {
-		t.Fatalf("ErrUnexpectedSourceResponse mapping = %+v", out)
 	}
 }
 

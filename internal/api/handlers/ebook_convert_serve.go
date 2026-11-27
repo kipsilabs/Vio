@@ -19,7 +19,7 @@ import (
 // "converted" => body is EPUB; "failed" => body is the raw original and the
 // client should fall back to opening it externally. Absent => no conversion
 // was attempted (feature off or non-kindle format), serve/behave as before.
-const ConversionHeader = "X-Silo-Ebook-Conversion"
+const ConversionHeader = "X-Vio-Ebook-Conversion"
 
 // EbookConverter produces (and caches) a converted EPUB for a source file.
 // Implemented by *ebookconvert.Cache; an interface here for testability. Both
@@ -81,7 +81,7 @@ func (h *EbookReaderHandler) serveEbook(w http.ResponseWriter, r *http.Request, 
 			}
 			return nil
 		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
-			// Caller went away / request cancelled — not a conversion verdict.
+			// Caller went away / request canceled — not a conversion verdict.
 			return err
 		default:
 			// DRM, corrupt, oversize, timed out, unavailable: fall back to the raw
@@ -148,7 +148,7 @@ func setConvertedEpubHeaders(w http.ResponseWriter, file *models.MediaFile, key 
 // setConvertedEpubHeaders) and closes it. For a HEAD, ServeContent emits the
 // headers and Content-Length without a body.
 func serveConvertedEpub(w http.ResponseWriter, r *http.Request, file *models.MediaFile, f *os.File, key ebookconvert.SourceKey) error {
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	stat, err := f.Stat()
 	if err != nil {
 		return fmt.Errorf("stat converted epub: %w", err)
@@ -158,4 +158,27 @@ func serveConvertedEpub(w http.ResponseWriter, r *http.Request, file *models.Med
 	setConvertedEpubHeaders(w, file, key)
 	http.ServeContent(httpstream.NewRollingDeadlineWriter(w), r, name, stat.ModTime(), f)
 	return nil
+}
+
+// ebookConversionCapability is the client-facing advertisement for the
+// Kindle->EPUB feature. Clients flip mobi/azw/azw3 to in-app reading only when
+// Enabled is true; otherwise they keep the external-open path.
+type ebookConversionCapability struct {
+	Enabled        bool     `json:"enabled"`
+	SourceFormats  []string `json:"source_formats"`
+	ServedFormat   string   `json:"served_format"`
+	Header         string   `json:"header"`
+	HeaderOnFailed string   `json:"header_failed_value"`
+}
+
+// HandleConversionCapability reports whether Kindle->EPUB conversion is active
+// (admin flag on AND the converter initialized). GET /api/v1/ebooks/capability.
+func (h *EbookReaderHandler) HandleConversionCapability(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, ebookConversionCapability{
+		Enabled:        h.Conversion.active(r.Context()),
+		SourceFormats:  []string{"mobi", "azw", "azw3"},
+		ServedFormat:   "epub",
+		Header:         ConversionHeader,
+		HeaderOnFailed: "failed",
+	})
 }

@@ -8,13 +8,7 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/metadata/translation"
-	"github.com/Silo-Server/silo-server/internal/models"
 )
-
-// metadataAILibraryLookup resolves the library a prewarm targets.
-type metadataAILibraryLookup interface {
-	GetByID(ctx context.Context, id int) (*models.MediaFolder, error)
-}
 
 func (h *MetadataAIHandler) libraryNotConfigured() error {
 	return apiError(http.StatusServiceUnavailable, "not_configured", "Metadata AI translation is not configured on this server")

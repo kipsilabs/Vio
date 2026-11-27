@@ -116,7 +116,6 @@ type watchTogetherRoomConn struct {
 	outgoing       chan watchTogetherFrame
 	done           chan struct{}
 	replaced       chan struct{}
-	stopOnce       sync.Once
 	closeOnce      sync.Once
 	replaceOnce    sync.Once
 	pingSentAtNano atomic.Int64
@@ -153,14 +152,10 @@ func (c *watchTogetherRoomConn) enqueue(frame watchTogetherFrame) error {
 	}
 }
 func (c *watchTogetherRoomConn) Close() error {
-	c.stop()
 	var err error
-	c.closeOnce.Do(func() { err = c.conn.Close() })
+	c.closeOnce.Do(func() { close(c.done); err = c.conn.Close() })
 	return err
 }
-
-// stop ends the writer and refuses further frames, leaving the transport open.
-func (c *watchTogetherRoomConn) stop() { c.stopOnce.Do(func() { close(c.done) }) }
 
 // CloseReplaced uses the socket's single writer and waits for the terminal
 // frame to be written before closing. A blocked peer can delay takeover by at
@@ -179,17 +174,7 @@ func (c *watchTogetherRoomConn) CloseReplaced() error {
 
 func (c *watchTogetherRoomConn) WritePing() error { return c.enqueue(watchTogetherFrame{ping: true}) }
 func (c *watchTogetherRoomConn) writeLoop() {
-	var err error
-	defer func() {
-		// A close frame already went out, from the v2 closer or as the reply
-		// to the peer's: whoever sent it owns the transport while it waits
-		// for the other side, so the writer only stops.
-		if errors.Is(err, websocket.ErrCloseSent) {
-			c.stop()
-			return
-		}
-		_ = c.Close()
-	}()
+	defer func() { _ = c.Close() }()
 	for {
 		var frame watchTogetherFrame
 		select {
@@ -208,6 +193,7 @@ func (c *watchTogetherRoomConn) writeLoop() {
 			frame = watchTogetherFrame{data: []byte(`{"type":"connection_replaced","reason":"This profile joined the Watch Party on another device."}`)}
 		default:
 		}
+		var err error
 		if frame.ping {
 			c.pingSentAtNano.Store(time.Now().UnixNano())
 			err = c.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(writeTimeout))
@@ -277,15 +263,9 @@ func (h *WatchTogetherHandler) buildRoomResponse(
 }
 
 // serveRoomConnection preserves the existing room message and disconnect loop.
-// closeTransport ends the connection on the way out, before the room's own
-// writer is torn down, so a close frame the caller owes the peer is sent
-// while the transport is still open.
-func (h *WatchTogetherHandler) serveRoomConnection(parent context.Context, conn *websocket.Conn, roomID string, userID int, profileID string, closeTransport func()) {
+func (h *WatchTogetherHandler) serveRoomConnection(parent context.Context, conn *websocket.Conn, roomID string, userID int, profileID string) {
 	realtimeConn := newWatchTogetherRoomConn(conn)
-	defer func() {
-		closeTransport()
-		_ = realtimeConn.Close()
-	}()
+	defer func() { _ = realtimeConn.Close() }()
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 
@@ -323,11 +303,6 @@ func (h *WatchTogetherHandler) serveRoomConnection(parent context.Context, conn 
 		_, data, err := wsconn.ReadMessage(conn, wsMaxClientMessageBytes)
 		if err != nil {
 			return
-		}
-		if ctx.Err() != nil {
-			// The connection is ending: keep reading for the peer's close
-			// reply, but act on nothing more it sends.
-			continue
 		}
 
 		if err := h.handleRoomClientMessage(ctx, realtimeConn, reg, userID, profileID, data); err != nil {

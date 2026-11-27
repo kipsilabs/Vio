@@ -6,7 +6,14 @@ import (
 )
 
 func normalizePredicateSQL(s string) string {
-	return strings.Join(strings.Fields(s), " ")
+	// Collapse whitespace runs, then strip the padding inside parentheses so a
+	// predicate written across lines still matches the same predicate written
+	// on one line. Without this, a line-wrapped `NOT EXISTS (\n SELECT ...)`
+	// normalizes to `( SELECT ... )` and the shape checks miss it even though
+	// the clause is present.
+	joined := strings.Join(strings.Fields(s), " ")
+	joined = strings.ReplaceAll(joined, "( ", "(")
+	return strings.ReplaceAll(joined, " )", ")")
 }
 
 func TestOrphanedProvisionalPredicatePreservesDurableMediaItemReferences(t *testing.T) {

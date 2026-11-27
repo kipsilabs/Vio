@@ -189,7 +189,15 @@ func (r *RatingsRepo) ListPage(ctx context.Context, userID int, profileID string
 	}
 	defer rows.Close()
 
-	return collectUserRatings(rows)
+	var ratings []UserRating
+	for rows.Next() {
+		var ur UserRating
+		if err := rows.Scan(&ur.UserID, &ur.ProfileID, &ur.MediaItemID, &ur.Score, &ur.RatedAt); err != nil {
+			return nil, fmt.Errorf("scan rating: %w", err)
+		}
+		ratings = append(ratings, ur)
+	}
+	return ratings, rows.Err()
 }
 
 func ratingsPageSQL(userID int, profileID string, filter AccessFilter, after *RatingKey, limit int) (string, []any) {
@@ -227,7 +235,15 @@ func (r *RatingsRepo) List(ctx context.Context, userID int, profileID string, li
 	}
 	defer rows.Close()
 
-	return collectUserRatings(rows)
+	var ratings []UserRating
+	for rows.Next() {
+		var ur UserRating
+		if err := rows.Scan(&ur.UserID, &ur.ProfileID, &ur.MediaItemID, &ur.Score, &ur.RatedAt); err != nil {
+			return nil, fmt.Errorf("scan rating: %w", err)
+		}
+		ratings = append(ratings, ur)
+	}
+	return ratings, rows.Err()
 }
 
 // ListAll returns every rating of a profile in one query, so the caller reads a
@@ -245,34 +261,6 @@ func (r *RatingsRepo) ListAll(ctx context.Context, userID int, profileID string)
 	}
 	defer rows.Close()
 
-	return collectUserRatings(rows)
-}
-
-// ListRatedAtLeast returns at most limit of the profile's ratings scored
-// minScore or more of items whose media type is one of mediaTypes, most
-// recently rated first. Both filters apply before the limit, so newer low
-// ratings, or ratings of other types such as episodes, cannot push an older
-// high rating out of the window.
-func (r *RatingsRepo) ListRatedAtLeast(ctx context.Context, userID int, profileID string, minScore int, mediaTypes []string, limit int) ([]UserRating, error) {
-	rows, err := r.pool.Query(ctx, `
-		SELECT ur.user_id, ur.profile_id, ur.media_item_id, ur.rating, ur.rated_at
-		FROM user_ratings ur
-		JOIN media_items mi ON mi.content_id = ur.media_item_id
-		WHERE ur.user_id = $1 AND ur.profile_id = $2 AND ur.rating >= $3 AND mi.type = ANY($4)
-		ORDER BY ur.rated_at DESC, ur.media_item_id DESC
-		LIMIT $5`,
-		userID, profileID, minScore, mediaTypes, limit,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("list ratings at least %d: %w", minScore, err)
-	}
-	defer rows.Close()
-	return collectUserRatings(rows)
-}
-
-// collectUserRatings reads every user_ratings row of rows, which select
-// user_id, profile_id, media_item_id, rating and rated_at in that order.
-func collectUserRatings(rows pgx.Rows) ([]UserRating, error) {
 	var ratings []UserRating
 	for rows.Next() {
 		var ur UserRating
@@ -307,4 +295,35 @@ func (r *RatingsRepo) ListForItems(ctx context.Context, userID int, profileID st
 		result[itemID] = rating
 	}
 	return result, rows.Err()
+}
+
+// ListRatedAtLeast returns at most limit of the profile's ratings scored
+// minScore or more of items whose media type is one of mediaTypes, most
+// recently rated first. Both filters apply before the limit, so newer low
+// ratings, or ratings of other types such as episodes, cannot push an older
+// high rating out of the window.
+func (r *RatingsRepo) ListRatedAtLeast(ctx context.Context, userID int, profileID string, minScore int, mediaTypes []string, limit int) ([]UserRating, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT ur.user_id, ur.profile_id, ur.media_item_id, ur.rating, ur.rated_at
+		FROM user_ratings ur
+		JOIN media_items mi ON mi.content_id = ur.media_item_id
+		WHERE ur.user_id = $1 AND ur.profile_id = $2 AND ur.rating >= $3 AND mi.type = ANY($4)
+		ORDER BY ur.rated_at DESC, ur.media_item_id DESC
+		LIMIT $5`,
+		userID, profileID, minScore, mediaTypes, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list ratings at least %d: %w", minScore, err)
+	}
+	defer rows.Close()
+
+	var ratings []UserRating
+	for rows.Next() {
+		var ur UserRating
+		if err := rows.Scan(&ur.UserID, &ur.ProfileID, &ur.MediaItemID, &ur.Score, &ur.RatedAt); err != nil {
+			return nil, fmt.Errorf("scan rating: %w", err)
+		}
+		ratings = append(ratings, ur)
+	}
+	return ratings, rows.Err()
 }

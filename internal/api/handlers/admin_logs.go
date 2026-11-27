@@ -32,6 +32,41 @@ func NewAdminLogsHandler(opsRepo *opslog.Repo, auditRepo *activitylog.Repo, stre
 	return &AdminLogsHandler{opsRepo: opsRepo, auditRepo: auditRepo, streamHub: streamHub}
 }
 
+func (h *AdminLogsHandler) HandleListOperationalLogs(w http.ResponseWriter, r *http.Request) {
+	opts, err := parseOperationalLogOptionsFromRequest(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+
+	result, err := h.opsRepo.List(r.Context(), opts)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to query operational logs")
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (h *AdminLogsHandler) HandleListAuditLogs(w http.ResponseWriter, r *http.Request) {
+	opts, err := parseAuditLogOptionsFromRequest(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+
+	result, err := h.auditRepo.List(r.Context(), opts)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to query audit logs")
+		return
+	}
+	if !strings.HasPrefix(r.URL.Path, "/api/v2/") {
+		for i := range result.Entries {
+			result.Entries[i] = activitylog.WithoutDetails(result.Entries[i])
+		}
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
 func parseOperationalLogOptionsFromRequest(r *http.Request) (opslog.ListOptions, error) {
 	opts := opslog.ListOptions{
 		// `level` accepts a comma-separated list so a single request can ask
@@ -102,14 +137,6 @@ func parseAuditLogOptionsFromRequest(r *http.Request) (activitylog.ListOptions, 
 		PlaybackSessionID: strings.TrimSpace(r.URL.Query().Get("playback_session_id")),
 		Cursor:            strings.TrimSpace(r.URL.Query().Get("cursor")),
 		Limit:             parseLimit(r, 100),
-	}
-
-	if opts.ClientIP != "" {
-		normalized, ok := activitylog.NormalizeClientIPFilter(opts.ClientIP)
-		if !ok {
-			return activitylog.ListOptions{}, invalidQueryError("client_ip")
-		}
-		opts.ClientIP = normalized
 	}
 
 	statusCode, err := parseOptionalIntQuery(r, "status_code")
@@ -189,6 +216,22 @@ func parseOptionalIntQuery(r *http.Request, key string) (*int, error) {
 	return &value, nil
 }
 
+// parseClampedIntQuery reads an optional integer query parameter and clamps it
+// into [minValue, maxValue]. An absent or empty parameter yields the clamped
+// fallback; a non-numeric one is a bad request rather than a silent default,
+// so a client typo surfaces instead of quietly returning the wrong window.
+func parseClampedIntQuery(r *http.Request, key string, fallback, minValue, maxValue int) (int, error) {
+	raw := strings.TrimSpace(r.URL.Query().Get(key))
+	if raw == "" {
+		return clampQueryInt(fallback, minValue, maxValue), nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, invalidQueryError(key)
+	}
+	return clampQueryInt(value, minValue, maxValue), nil
+}
+
 func clampQueryInt(value, minValue, maxValue int) int {
 	if value < minValue {
 		return minValue
@@ -246,6 +289,23 @@ func (h *AdminLogsHandler) parseStreamRequest(r *http.Request) (logstream.Stream
 	return stream, appOpts, auditOpts, err
 }
 
+func (h *AdminLogsHandler) HandleLogStreamWebSocket(w http.ResponseWriter, r *http.Request) {
+	if h.streamHub == nil {
+		http.Error(w, "log stream unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	stream, _, _, err := h.parseStreamRequest(r)
+	if err != nil {
+		if stream != logstream.StreamApp && stream != logstream.StreamAudit {
+			writeError(w, http.StatusBadRequest, "bad_request", "Invalid stream")
+			return
+		}
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	h.serveLogStream(w, r, wsUpgrader)
+}
+
 // serveLogStream upgrades with the given upgrader and runs the shared stream
 // loop: snapshot, buffered appends newer than the snapshot, then live appends
 // filtered like the list routes and deduplicated by id, with ping/pong
@@ -260,11 +320,8 @@ func (h *AdminLogsHandler) serveLogStream(w http.ResponseWriter, r *http.Request
 	if err != nil {
 		return
 	}
-	// The v2 handshake's recheck and lifetime end the request context with a
-	// cause the closer turns into a close frame; the bridge's has none.
-	closer := newSocketCloser(conn)
-	defer func() { closer.close(context.Cause(r.Context())) }()
-	stopClose := closer.closeWhenDone(r.Context())
+	defer conn.Close()
+	stopClose := context.AfterFunc(r.Context(), func() { _ = conn.Close() })
 	defer stopClose()
 
 	events, unsubscribe := h.streamHub.Subscribe(func(msg logstream.Message) bool {
@@ -273,7 +330,7 @@ func (h *AdminLogsHandler) serveLogStream(w http.ResponseWriter, r *http.Request
 	defer unsubscribe()
 
 	conn.SetReadLimit(wsMaxClientMessageBytes)
-	conn.SetReadDeadline(time.Now().Add(wsPingInterval + wsPongTimeout))
+	_ = conn.SetReadDeadline(time.Now().Add(wsPingInterval + wsPongTimeout))
 	conn.SetPongHandler(func(string) error {
 		return conn.SetReadDeadline(time.Now().Add(wsPingInterval + wsPongTimeout))
 	})

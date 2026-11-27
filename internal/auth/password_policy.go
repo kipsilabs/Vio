@@ -141,3 +141,17 @@ func CheckNewPassword(ctx context.Context, settings SettingsGetter, password str
 	}
 	return policy.Check(password)
 }
+
+// ValidateNewPassword applies the shared local credential policy before a new
+// account or password is persisted. The minimum counts characters; bcrypt
+// limits the UTF-8 encoding to 72 bytes. The policy settings are enforced by
+// CheckNewPassword; this is the credential floor every password meets.
+func ValidateNewPassword(password string) error {
+	if utf8.RuneCountInString(password) < MinimumPasswordLength {
+		return ErrPasswordTooShort
+	}
+	if len(password) > MaximumPasswordBytes {
+		return ErrPasswordTooLong
+	}
+	return nil
+}

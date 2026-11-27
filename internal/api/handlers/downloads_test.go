@@ -3,6 +3,7 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -14,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Silo-Server/silo-server/internal/nodepool/nodepooltest"
+	"github.com/go-chi/chi/v5"
 
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
 	"github.com/Silo-Server/silo-server/internal/auth"
@@ -285,6 +286,219 @@ func downloadTestRequest(method, target string, body []byte, userID int, profile
 	return r
 }
 
+func withChiID(r *http.Request, id string) *http.Request {
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", id)
+	return r.WithContext(context.WithValue(r.Context(), chi.RouteCtxKey, rctx))
+}
+
+// TestManagedCreateUsesHeaderDeviceNotBody verifies invariant 2's "device_id
+// authority is the header only": a device_id placed in the JSON body is ignored,
+// and the service receives the X-Silo-Device-Id header value + the profile.
+func TestManagedCreateUsesHeaderDeviceNotBody(t *testing.T) {
+	svc := &fakeDownloadService{created: &downloads.Download{ID: "dl1", ContentID: "c1", DeviceID: "devA"}}
+	h := NewDownloadHandler(svc)
+
+	// Body smuggles a device_id; it is not a field of downloadRequest, so it is
+	// structurally dropped and must never reach the service.
+	body := []byte(`{"content_id":"c1","device_id":"EVIL","profile_id":"EVIL"}`)
+	rec := httptest.NewRecorder()
+	h.HandleCreateDownload(rec, downloadTestRequest(http.MethodPost, "/downloads", body, 7, "pA", "devA"))
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if svc.gotCreateReq.DeviceID != "devA" {
+		t.Fatalf("service device id = %q, want header value devA", svc.gotCreateReq.DeviceID)
+	}
+	if svc.gotCreateReq.ProfileID != "pA" {
+		t.Fatalf("service profile id = %q, want context value pA", svc.gotCreateReq.ProfileID)
+	}
+}
+
+func TestManagedFileDoesNotAppendJSONAfterRelayResponseCommitted(t *testing.T) {
+	svc := &fakeDownloadService{
+		serveBody: "partial",
+		serveErr:  fmt.Errorf("remote relay failed: %w", downloads.ErrResponseCommitted),
+	}
+	h := NewDownloadHandler(svc)
+	req := withChiID(downloadTestRequest(http.MethodGet, "/downloads/dl1/file", nil, 7, "pA", "devA"), "dl1")
+	rec := httptest.NewRecorder()
+	func() {
+		defer func() {
+			if got := recover(); got != http.ErrAbortHandler { //nolint:errorlint // sentinel compared by identity, as net/http does
+				t.Fatalf("panic = %v, want http.ErrAbortHandler", got)
+			}
+		}()
+		h.HandleDownloadFile(rec, req)
+	}()
+
+	if rec.Body.String() != "partial" {
+		t.Fatalf("body=%q, want the partial file only", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "internal_error") {
+		t.Fatal("a JSON error document was appended after the abort point")
+	}
+}
+
+func TestManagedFileRedirectsAuthorizedArtifactToProxy(t *testing.T) {
+	const secret = "download-proxy-secret"
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			t.Errorf("preflight method = %s", r.Method)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer proxy.Close()
+	svc := &proxyDownloadService{
+		fakeDownloadService: &fakeDownloadService{},
+		managedTarget:       &downloads.FileTarget{Path: "/artifacts/movie.mp4", DownloadID: "dl1", MediaFileID: 42, ProxyEligible: true},
+	}
+	proxies := nodepool.NewProxyPool()
+	proxies.SetNodes([]*nodepool.Node{{URL: proxy.URL, Enabled: true, Healthy: true}})
+	h := NewDownloadHandler(svc)
+	h.SetProxyDelivery(nodepool.NewPlanner(proxies, nodepool.NewTranscodePool()), func() string { return secret })
+	req := withChiID(downloadTestRequest(http.MethodGet, "/downloads/dl1/file-proxy", nil, 7, "pA", "devA"), "dl1")
+	rec := httptest.NewRecorder()
+	h.HandleDownloadFileViaProxy(rec, req)
+
+	if rec.Code != http.StatusTemporaryRedirect {
+		t.Fatalf("status = %d, want 307 (body: %s)", rec.Code, rec.Body.String())
+	}
+	location := rec.Header().Get("Location")
+	prefix := proxy.URL + "/downloads/file/"
+	if !strings.HasPrefix(location, prefix) {
+		t.Fatalf("Location = %q", location)
+	}
+	claims, err := streamtoken.Verify(strings.TrimPrefix(location, prefix), secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claims.PlayMethod != streamtoken.PlayMethodDownload || claims.MediaPath != "/artifacts/movie.mp4" || claims.UserID != 7 || claims.ProfileID != "pA" {
+		t.Fatalf("claims = %+v", claims)
+	}
+	if svc.gotServe != (identityCall{}) {
+		t.Fatalf("local ServeFile was called: %+v", svc.gotServe)
+	}
+}
+
+func TestManagedFileRedirectsNodeLocalArtifactThroughSameGroupProxy(t *testing.T) {
+	const secret = "download-proxy-secret"
+	proxyA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("wrong-group proxy was selected")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer proxyA.Close()
+	proxyB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			t.Errorf("preflight method = %s", r.Method)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer proxyB.Close()
+	svc := &proxyDownloadService{
+		fakeDownloadService: &fakeDownloadService{},
+		managedTarget: &downloads.FileTarget{
+			DownloadID:                   "dl-remote",
+			ArtifactID:                   "artifact-row",
+			Path:                         "/prepared/Movie Final.mp4",
+			MediaFileID:                  42,
+			OriginNodeURL:                "http://transcode-b.internal:8096",
+			OriginNodeGroup:              "host-b",
+			OriginArtifactID:             "artifact-remote",
+			ExpectedArtifactSize:         123,
+			ExpectedExecutionFingerprint: "recipe-fingerprint",
+			ProxyEligible:                true,
+		},
+	}
+	groupA, groupB := "host-a", "host-b"
+	proxies := nodepool.NewProxyPool()
+	proxies.SetNodes([]*nodepool.Node{
+		{URL: proxyA.URL, Group: &groupA, Enabled: true, Healthy: true},
+		{URL: proxyB.URL, Group: &groupB, Enabled: true, Healthy: true},
+	})
+	h := NewDownloadHandler(svc)
+	h.SetProxyDelivery(nodepool.NewPlanner(proxies, nodepool.NewTranscodePool()), func() string { return secret })
+	req := withChiID(downloadTestRequest(http.MethodGet, "/downloads/dl-remote/file-proxy", nil, 7, "pA", "devA"), "dl-remote")
+	rec := httptest.NewRecorder()
+	h.HandleDownloadFileViaProxy(rec, req)
+	if rec.Code != http.StatusTemporaryRedirect {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	location := rec.Header().Get("Location")
+	prefix := proxyB.URL + "/downloads/file/"
+	if !strings.HasPrefix(location, prefix) {
+		t.Fatalf("Location = %q, want proxy-b", location)
+	}
+	claims, err := streamtoken.Verify(strings.TrimPrefix(location, prefix), secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claims.MediaPath != "" || claims.DownloadFilename != "Movie Final.mp4" || claims.TranscodeNode != "http://transcode-b.internal:8096" ||
+		claims.PlayMethod != streamtoken.PlayMethodToneMapDownload ||
+		claims.DownloadArtifactID != "artifact-remote" || claims.DownloadArtifactRowID != "artifact-row" ||
+		claims.DownloadArtifactSize != 123 || claims.DownloadExecutionFingerprint != "recipe-fingerprint" {
+		t.Fatalf("claims = %+v", claims)
+	}
+}
+
+func TestManagedFileFallsBackWhenRemoteLocatorHasNoOriginURL(t *testing.T) {
+	svc := &proxyDownloadService{
+		fakeDownloadService: &fakeDownloadService{},
+		managedTarget: &downloads.FileTarget{
+			DownloadID:       "dl-incomplete",
+			OriginArtifactID: "artifact-without-origin",
+			ProxyEligible:    true,
+		},
+	}
+	proxies := nodepool.NewProxyPool()
+	proxies.SetNodes([]*nodepool.Node{{URL: "http://proxy.invalid", Enabled: true, Healthy: true}})
+	h := NewDownloadHandler(svc)
+	h.SetProxyDelivery(nodepool.NewPlanner(proxies, nodepool.NewTranscodePool()), func() string { return "secret" })
+	req := withChiID(downloadTestRequest(http.MethodGet, "/downloads/dl-incomplete/file-proxy", nil, 7, "pA", "devA"), "dl-incomplete")
+	rec := httptest.NewRecorder()
+	h.HandleDownloadFileViaProxy(rec, req)
+	if rec.Code != http.StatusOK || rec.Body.String() != "served" {
+		t.Fatalf("status=%d body=%q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestManagedToneMapFileFallsBackWhenLegacyProxyRejectsToken(t *testing.T) {
+	legacyProxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	}))
+	defer legacyProxy.Close()
+	svc := &proxyDownloadService{
+		fakeDownloadService: &fakeDownloadService{},
+		managedTarget: &downloads.FileTarget{
+			DownloadID: "dl-attested", ArtifactID: "artifact-row", Path: "/prepared/movie.mp4", MediaFileID: 42,
+			OriginNodeURL: "http://transcode.internal", OriginArtifactID: "artifact-remote",
+			ExpectedArtifactSize: 123, ExpectedExecutionFingerprint: "fingerprint", ProxyEligible: true,
+		},
+	}
+	proxies := nodepool.NewProxyPool()
+	proxies.SetNodes([]*nodepool.Node{{URL: legacyProxy.URL, Enabled: true, Healthy: true}})
+	h := NewDownloadHandler(svc)
+	h.SetProxyDelivery(nodepool.NewPlanner(proxies, nodepool.NewTranscodePool()), func() string { return "secret" })
+	req := withChiID(downloadTestRequest(http.MethodGet, "/downloads/dl-attested/file-proxy", nil, 7, "pA", "devA"), "dl-attested")
+	rec := httptest.NewRecorder()
+	h.HandleDownloadFileViaProxy(rec, req)
+	if rec.Code != http.StatusOK || rec.Body.String() != "served" {
+		t.Fatalf("fallback response = %d %q, want central serve", rec.Code, rec.Body.String())
+	}
+}
+
+func TestManagedPatchRequiresDeviceHeader(t *testing.T) {
+	h := NewDownloadHandler(&fakeDownloadService{})
+	// No device header → 400 device_id_required, even with a profile present.
+	req := withChiID(downloadTestRequest(http.MethodPatch, "/downloads/dl1", []byte(`{"status":"completed"}`), 7, "pA", ""), "dl1")
+	rec := httptest.NewRecorder()
+	h.HandlePatchDownload(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 device_id_required (body: %s)", rec.Code, rec.Body.String())
+	}
+}
+
 // A transfer that fails after the file's headers and first bytes went out
 // aborts the response instead of appending a JSON 500, and logs only when the
 // failure is the server's: a client that left has canceled the request.
@@ -346,7 +560,7 @@ func TestHandleDirectDownloadViaProxyRedirectsToProxy(t *testing.T) {
 	}
 	proxies := nodepool.NewProxyPool()
 	proxies.SetNodes([]*nodepool.Node{{URL: proxy.URL + "/", Enabled: true, Healthy: true, MaxJobs: &maxJobs}})
-	planner := nodepool.NewPlanner(proxies, nodepooltest.NewTranscodePool())
+	planner := nodepool.NewPlanner(proxies, nodepool.NewTranscodePool())
 	h := NewDownloadHandler(svc)
 	h.SetProxyDelivery(planner, func() string { return secret })
 	rec := httptest.NewRecorder()
@@ -382,7 +596,7 @@ func TestHandleDirectDownloadFallsBackWithoutHealthyProxy(t *testing.T) {
 	proxies := nodepool.NewProxyPool()
 	proxies.SetNodes([]*nodepool.Node{{URL: "https://proxy.example", Enabled: true, Healthy: false}})
 	h := NewDownloadHandler(svc)
-	h.SetProxyDelivery(nodepool.NewPlanner(proxies, nodepooltest.NewTranscodePool()), func() string { return "secret" })
+	h.SetProxyDelivery(nodepool.NewPlanner(proxies, nodepool.NewTranscodePool()), func() string { return "secret" })
 	rec := httptest.NewRecorder()
 	h.HandleDirectDownloadViaProxy(rec, downloadTestRequest(http.MethodGet, "/direct-download-proxy?file_id=42", nil, 7, "", ""))
 
@@ -401,7 +615,7 @@ func TestHandleDirectDownloadFallsBackWhenProxyCannotServePath(t *testing.T) {
 	proxies := nodepool.NewProxyPool()
 	proxies.SetNodes([]*nodepool.Node{{URL: proxy.URL, Enabled: true, Healthy: true}})
 	h := NewDownloadHandler(svc)
-	h.SetProxyDelivery(nodepool.NewPlanner(proxies, nodepooltest.NewTranscodePool()), func() string { return "secret" })
+	h.SetProxyDelivery(nodepool.NewPlanner(proxies, nodepool.NewTranscodePool()), func() string { return "secret" })
 	rec := httptest.NewRecorder()
 	h.HandleDirectDownloadViaProxy(rec, downloadTestRequest(http.MethodGet, "/direct-download-proxy?file_id=42", nil, 7, "", ""))
 
@@ -424,7 +638,7 @@ func TestHandleDirectDownloadEstablishedRouteKeepsLocalSuccessStatus(t *testing.
 	proxies := nodepool.NewProxyPool()
 	proxies.SetNodes([]*nodepool.Node{{URL: proxy.URL, Enabled: true, Healthy: true}})
 	h := NewDownloadHandler(svc)
-	h.SetProxyDelivery(nodepool.NewPlanner(proxies, nodepooltest.NewTranscodePool()), func() string { return "secret" })
+	h.SetProxyDelivery(nodepool.NewPlanner(proxies, nodepool.NewTranscodePool()), func() string { return "secret" })
 	rec := httptest.NewRecorder()
 	h.HandleDirectDownload(rec, downloadTestRequest(http.MethodGet, "/direct-download?file_id=42", nil, 7, "", ""))
 
@@ -447,7 +661,7 @@ func TestHandleDirectDownloadViaProxyStaysLocalWhenTargetIneligible(t *testing.T
 	proxies := nodepool.NewProxyPool()
 	proxies.SetNodes([]*nodepool.Node{{URL: proxy.URL, Enabled: true, Healthy: true}})
 	h := NewDownloadHandler(svc)
-	h.SetProxyDelivery(nodepool.NewPlanner(proxies, nodepooltest.NewTranscodePool()), func() string { return "secret" })
+	h.SetProxyDelivery(nodepool.NewPlanner(proxies, nodepool.NewTranscodePool()), func() string { return "secret" })
 	rec := httptest.NewRecorder()
 	h.HandleDirectDownloadViaProxy(rec, downloadTestRequest(http.MethodGet, "/direct-download-proxy?file_id=42", nil, 7, "", ""))
 
@@ -472,7 +686,7 @@ func TestHandleDirectDownloadUnknownFileIsNotFound(t *testing.T) {
 		t.Run("proxy_"+method, func(t *testing.T) {
 			svc := &proxyDownloadService{fakeDownloadService: &fakeDownloadService{}, resolveErr: catalog.ErrItemNotFound}
 			h := NewDownloadHandler(svc)
-			h.SetProxyDelivery(nodepool.NewPlanner(nodepool.NewProxyPool(), nodepooltest.NewTranscodePool()), func() string { return "secret" })
+			h.SetProxyDelivery(nodepool.NewPlanner(nodepool.NewProxyPool(), nodepool.NewTranscodePool()), func() string { return "secret" })
 			rec := httptest.NewRecorder()
 			h.HandleDirectDownloadViaProxy(rec, downloadTestRequest(method, "/direct-download-proxy?file_id=4242", nil, 7, "", ""))
 			if rec.Code != http.StatusNotFound {
@@ -563,7 +777,7 @@ func TestDirectDownloadRefusesOriginalAboveOverrideCeiling(t *testing.T) {
 			proxies := nodepool.NewProxyPool()
 			proxies.SetNodes([]*nodepool.Node{{URL: proxy.URL, Enabled: true, Healthy: true}})
 			h := NewDownloadHandler(svc)
-			h.SetProxyDelivery(nodepool.NewPlanner(proxies, nodepooltest.NewTranscodePool()), func() string { return "secret" })
+			h.SetProxyDelivery(nodepool.NewPlanner(proxies, nodepool.NewTranscodePool()), func() string { return "secret" })
 			rec := httptest.NewRecorder()
 			h.HandleDirectDownloadViaProxy(rec, downloadTestRequest(method, "/direct-download-proxy?file_id=42", nil, 7, "", ""))
 			if rec.Code != http.StatusForbidden || rec.Header().Get("Location") != "" || proxyRequests != 0 {
@@ -591,6 +805,77 @@ func TestDirectDownloadRefusesOriginalAboveOverrideCeiling(t *testing.T) {
 	}
 }
 
+// The frozen v1 direct-download routes keep their historical wire answers: a
+// stale/unknown file_id, an access-filter refusal, and a virtual row all
+// collapse to the same 404/not_found v1 has always returned. Only a
+// non-original format query, which never wrapped catalog.ErrItemNotFound, keeps
+// its pre-existing 501.
+func TestHandleDirectDownloadV1KeepsLegacyRefusalResponses(t *testing.T) {
+	cases := []struct {
+		name   string
+		err    error
+		status int
+		code   string
+	}{
+		{"unknown", fmt.Errorf("%w: %w", downloads.ErrFileUnavailable, catalog.ErrItemNotFound), http.StatusNotFound, "not_found"},
+		{"denied", fmt.Errorf("%w: %w", downloads.ErrFileAccessDenied, catalog.ErrItemNotFound), http.StatusNotFound, "not_found"},
+		{"virtual", fmt.Errorf("%w: %w", downloads.ErrFormatUnavailable, catalog.ErrItemNotFound), http.StatusNotFound, "not_found"},
+		{"format", downloads.ErrFormatUnavailable, http.StatusNotImplemented, "format_unavailable"},
+	}
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		for _, tc := range cases {
+			t.Run(tc.name+"_"+method, func(t *testing.T) {
+				h := NewDownloadHandler(&fakeDownloadService{directErr: tc.err})
+				rec := httptest.NewRecorder()
+				h.HandleDirectDownload(rec, downloadTestRequest(method, "/direct-download?file_id=42", nil, 7, "", ""))
+				assertDirectErrorCode(t, rec, tc.status, tc.code)
+			})
+		}
+	}
+}
+
+// The distinct refusal codes are additive on the v2 handler, where the byte
+// adapter maps them onto problem types. A stale file_id, an access refusal, and
+// a virtual row each stay distinguishable so the picker can refresh versions
+// for the first instead of showing a dead end.
+func TestHandleDirectDownloadV2ExposesDistinctRefusalCodes(t *testing.T) {
+	cases := []struct {
+		name   string
+		err    error
+		status int
+		code   string
+	}{
+		{"unknown", fmt.Errorf("%w: %w", downloads.ErrFileUnavailable, catalog.ErrItemNotFound), http.StatusNotFound, "file_unavailable"},
+		{"denied", fmt.Errorf("%w: %w", downloads.ErrFileAccessDenied, catalog.ErrItemNotFound), http.StatusForbidden, "file_access_denied"},
+		{"virtual", fmt.Errorf("%w: %w", downloads.ErrFormatUnavailable, catalog.ErrItemNotFound), http.StatusNotImplemented, "format_unavailable"},
+		{"format", downloads.ErrFormatUnavailable, http.StatusNotImplemented, "format_unavailable"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := NewDownloadHandler(&fakeDownloadService{directErr: tc.err})
+			rec := httptest.NewRecorder()
+			h.HandleDirectDownloadV2(rec, downloadTestRequest(http.MethodGet, "/direct-download?file_id=42", nil, 7, "", ""))
+			assertDirectErrorCode(t, rec, tc.status, tc.code)
+		})
+	}
+}
+
+func assertDirectErrorCode(t *testing.T, rec *httptest.ResponseRecorder, status int, code string) {
+	t.Helper()
+	if rec.Code != status {
+		t.Fatalf("status = %d, want %d (body: %s)", rec.Code, status, rec.Body.String())
+	}
+	var body struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode body: %v (body: %s)", err, rec.Body.String())
+	}
+	if body.Error != code {
+		t.Fatalf("code = %q, want %q", body.Error, code)
+	}
+}
+
 func TestProxyPreflightCachesReachabilityByNodeAndPath(t *testing.T) {
 	requests := 0
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -611,143 +896,80 @@ func TestProxyPreflightCachesReachabilityByNodeAndPath(t *testing.T) {
 	}
 }
 
-// TestServeDownloadFileRedirectsManagedArtifactsThroughProxies covers the
-// managed-download delegate path: an authorized artifact is redirected to a
-// healthy proxy with a token scoped to it, a node-local artifact only through
-// a proxy in the origin node's group, and the server serves the file itself
-// when the locator is incomplete or the proxy refuses the token.
-func TestServeDownloadFileRedirectsManagedArtifactsThroughProxies(t *testing.T) { //nolint:funlen // ported unchanged from the retired v1 handler test
-	const secret = "download-proxy-secret"
-	remoteTarget := &downloads.FileTarget{
-		DownloadID:                   "dl-remote",
-		ArtifactID:                   "artifact-row",
-		Path:                         "/prepared/Movie Final.mp4",
-		MediaFileID:                  42,
-		OriginNodeURL:                "http://transcode-b.internal:8096",
-		OriginNodeGroup:              "host-b",
-		OriginArtifactID:             "artifact-remote",
-		ExpectedArtifactSize:         123,
-		ExpectedExecutionFingerprint: "recipe-fingerprint",
-		ProxyEligible:                true,
+func withChiParams(r *http.Request, params map[string]string) *http.Request {
+	rctx := chi.NewRouteContext()
+	for k, v := range params {
+		rctx.URLParams.Add(k, v)
 	}
-	cases := []struct {
-		name string
-		// target is the resolved managed file; proxies lists each proxy's group
-		// ("" for none) and the status its preflight answers.
-		target      *downloads.FileTarget
-		groups      []string
-		statuses    []int
-		wantProxy   int // index of the proxy redirected to; -1 serves locally
-		wantClaims  func(streamtoken.Claims) bool
-		wantUnusedA bool // the first proxy must never be contacted
-	}{
-		{
-			name:      "central artifact redirects to the healthy proxy",
-			target:    &downloads.FileTarget{Path: "/artifacts/movie.mp4", DownloadID: "dl1", MediaFileID: 42, ProxyEligible: true},
-			groups:    []string{""},
-			statuses:  []int{http.StatusOK},
-			wantProxy: 0,
-			wantClaims: func(c streamtoken.Claims) bool {
-				return c.PlayMethod == streamtoken.PlayMethodDownload && c.MediaPath == "/artifacts/movie.mp4" &&
-					c.UserID == 7 && c.ProfileID == "pA"
-			},
-		},
-		{
-			name:      "node-local artifact goes through the origin group's proxy",
-			target:    remoteTarget,
-			groups:    []string{"host-a", "host-b"},
-			statuses:  []int{http.StatusOK, http.StatusOK},
-			wantProxy: 1,
-			wantClaims: func(c streamtoken.Claims) bool {
-				// The proxy fetches from the origin node; it never learns a
-				// local media path.
-				return c.MediaPath == "" && c.DownloadFilename == "Movie Final.mp4" &&
-					c.TranscodeNode == "http://transcode-b.internal:8096" &&
-					c.PlayMethod == streamtoken.PlayMethodToneMapDownload &&
-					c.DownloadArtifactID == "artifact-remote" && c.DownloadArtifactRowID == "artifact-row" &&
-					c.DownloadArtifactSize == 123 && c.DownloadExecutionFingerprint == "recipe-fingerprint" &&
-					c.UserID == 7 && c.ProfileID == "pA"
-			},
-			wantUnusedA: true,
-		},
-		{
-			name:      "remote locator without an origin URL serves locally",
-			target:    &downloads.FileTarget{DownloadID: "dl-incomplete", OriginArtifactID: "artifact-without-origin", ProxyEligible: true},
-			groups:    []string{""},
-			statuses:  []int{http.StatusOK},
-			wantProxy: -1,
-		},
-		{
-			name: "proxy that rejects the token falls back to local serving",
-			target: &downloads.FileTarget{
-				DownloadID: "dl-attested", ArtifactID: "artifact-row", Path: "/prepared/movie.mp4", MediaFileID: 42,
-				OriginNodeURL: "http://transcode.internal", OriginArtifactID: "artifact-remote",
-				ExpectedArtifactSize: 123, ExpectedExecutionFingerprint: "fingerprint", ProxyEligible: true,
-			},
-			groups:    []string{""},
-			statuses:  []int{http.StatusUnauthorized},
-			wantProxy: -1,
-		},
+	return r.WithContext(context.WithValue(r.Context(), chi.RouteCtxKey, rctx))
+}
+
+// TestManagedAssetsDenyRestrictedProfile is the Phase 2 acceptance test: a
+// profile denied content access (the service returns ErrItemNotFound) gets a
+// 404 from manifest, artwork, and subtitle — a download id never reveals
+// out-of-scope content.
+func TestManagedAssetsDenyRestrictedProfile(t *testing.T) {
+	t.Run("manifest", func(t *testing.T) {
+		h := NewDownloadHandler(&fakeDownloadService{manifestErr: catalog.ErrItemNotFound})
+		req := withChiID(downloadTestRequest(http.MethodGet, "/downloads/dl1/manifest", nil, 7, "child", "devC"), "dl1")
+		rec := httptest.NewRecorder()
+		h.HandleManifest(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("manifest status = %d, want 404", rec.Code)
+		}
+	})
+	t.Run("artwork", func(t *testing.T) {
+		h := NewDownloadHandler(&fakeDownloadService{artworkErr: catalog.ErrItemNotFound})
+		req := withChiParams(downloadTestRequest(http.MethodGet, "/downloads/dl1/artwork/poster", nil, 7, "child", "devC"),
+			map[string]string{"id": "dl1", "kind": "poster"})
+		rec := httptest.NewRecorder()
+		h.HandleArtwork(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("artwork status = %d, want 404", rec.Code)
+		}
+	})
+	t.Run("subtitle", func(t *testing.T) {
+		h := NewDownloadHandler(&fakeDownloadService{subtitleErr: catalog.ErrItemNotFound})
+		req := withChiParams(downloadTestRequest(http.MethodGet, "/downloads/dl1/subtitles/external:0", nil, 7, "child", "devC"),
+			map[string]string{"id": "dl1", "ref": "external:0"})
+		rec := httptest.NewRecorder()
+		h.HandleSubtitle(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("subtitle status = %d, want 404", rec.Code)
+		}
+	})
+}
+
+func intPtr(i int) *int { return &i }
+
+// TestHandleCreateDownloadSpecialsSeason pins the Specials boundary: season 0
+// must route to CreateSeason(0), not silently broaden to a full-series
+// download, and negative seasons are rejected.
+func TestHandleCreateDownloadSpecialsSeason(t *testing.T) {
+	svc := &fakeDownloadService{
+		season:   []*downloads.Download{{ID: "dl1", ContentID: "s1", EpisodeID: "e1", Format: downloads.FormatOriginal}},
+		seasonID: "batch1",
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			hits := make([]int, len(tc.groups))
-			urls := make([]string, len(tc.groups))
-			nodes := make([]*nodepool.Node, len(tc.groups))
-			for i := range tc.groups {
-				proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					hits[i]++
-					if r.Method != http.MethodHead {
-						t.Errorf("proxy %d preflight method = %s, want HEAD", i, r.Method)
-					}
-					w.WriteHeader(tc.statuses[i])
-				}))
-				t.Cleanup(proxy.Close)
-				urls[i] = proxy.URL
-				nodes[i] = &nodepool.Node{URL: proxy.URL, Enabled: true, Healthy: true}
-				if tc.groups[i] != "" {
-					nodes[i].Group = &tc.groups[i]
-				}
-			}
-			proxies := nodepool.NewProxyPool()
-			proxies.SetNodes(nodes)
-			svc := &proxyDownloadService{fakeDownloadService: &fakeDownloadService{}, managedTarget: tc.target}
-			h := NewDownloadHandler(svc)
-			h.SetProxyDelivery(nodepool.NewPlanner(proxies, nodepooltest.NewTranscodePool()), func() string { return secret })
+	h := NewDownloadHandler(svc)
 
-			rec := httptest.NewRecorder()
-			req := downloadTestRequest(http.MethodGet, "/downloads/"+tc.target.DownloadID+"/file", nil, 7, "pA", "devA")
-			if err := h.ServeDownloadFile(rec, req, tc.target.DownloadID, true); err != nil {
-				t.Fatalf("ServeDownloadFile: %v", err)
-			}
+	body, _ := json.Marshal(downloadRequest{ContentID: "s1", Series: true, Season: intPtr(0)})
+	rec := httptest.NewRecorder()
+	h.HandleCreateDownload(rec, downloadTestRequest(http.MethodPost, "/downloads", body, 7, "pA", "devA"))
 
-			if tc.wantProxy < 0 {
-				if rec.Code != http.StatusOK || rec.Body.String() != "served" {
-					t.Fatalf("response = %d %q, want the local serve", rec.Code, rec.Body.String())
-				}
-				return
-			}
-			if rec.Code != http.StatusTemporaryRedirect {
-				t.Fatalf("status = %d, want 307 (body: %s)", rec.Code, rec.Body.String())
-			}
-			prefix := urls[tc.wantProxy] + "/downloads/file/"
-			location := rec.Header().Get("Location")
-			if !strings.HasPrefix(location, prefix) {
-				t.Fatalf("Location = %q, want proxy %d (%s)", location, tc.wantProxy, prefix)
-			}
-			claims, err := streamtoken.Verify(strings.TrimPrefix(location, prefix), secret)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !tc.wantClaims(*claims) {
-				t.Fatalf("claims = %+v", claims)
-			}
-			if svc.gotServe != (identityCall{}) {
-				t.Fatalf("local serve was called after a redirect: %+v", svc.gotServe)
-			}
-			if tc.wantUnusedA && hits[0] != 0 {
-				t.Fatalf("wrong-group proxy contacted %d times", hits[0])
-			}
-		})
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if !svc.seasonCalled || svc.gotSeasonNum != 0 {
+		t.Fatalf("seasonCalled=%v num=%d, want CreateSeason(0)", svc.seasonCalled, svc.gotSeasonNum)
+	}
+	if svc.gotSeriesReq.ContentID != "" {
+		t.Fatal("season 0 must not fall through to CreateSeries")
+	}
+
+	rec = httptest.NewRecorder()
+	body, _ = json.Marshal(downloadRequest{ContentID: "s1", Series: true, Season: intPtr(-1)})
+	h.HandleCreateDownload(rec, downloadTestRequest(http.MethodPost, "/downloads", body, 7, "pA", "devA"))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("negative season status = %d, want 400", rec.Code)
 	}
 }

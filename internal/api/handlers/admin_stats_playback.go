@@ -2,8 +2,10 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
+	"net/http"
 	"strconv"
 	"time"
 
@@ -187,6 +189,32 @@ func (p *AdminPlaybackActivityProvider) Close() {
 		return
 	}
 	p.cache.Close()
+}
+
+// HandleGetPlaybackActivity handles GET /admin/stats/playback-activity.
+func (h *AdminHandler) HandleGetPlaybackActivity(w http.ResponseWriter, r *http.Request) {
+	hours, err := parseClampedIntQuery(
+		r, "hours",
+		adminPlaybackActivityDefaultHours,
+		adminPlaybackActivityMinHours,
+		adminPlaybackActivityMaxHours,
+	)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+
+	activity, err := h.ReadAdminPlaybackActivity(r.Context(), hours, isTruthyQuery(r.URL.Query().Get("refresh")))
+	if errors.Is(err, ErrAdminDashboardUnavailable) {
+		writeError(w, http.StatusInternalServerError, "internal_error", "Database not configured")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to get playback activity")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, activity)
 }
 
 // playbackActivityRow is one (bucket, play_method) group from the union of

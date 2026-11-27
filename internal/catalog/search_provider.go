@@ -36,7 +36,7 @@ const (
 	SearchSettingMeilisearchEmbedder         = "catalog.search.meilisearch.embedder"
 	SearchSettingMeilisearchBinaryQuantized  = "catalog.search.meilisearch.binary_quantized"
 
-	DefaultMeilisearchIndex            = "silo_media_items"
+	DefaultMeilisearchIndex            = "vio_media_items"
 	DefaultMeilisearchTimeoutMS        = 800
 	DefaultMeilisearchMatchingStrategy = "last"
 	// SearchMeilisearchSchemaVersion is the generation of the indexed
@@ -67,7 +67,7 @@ const (
 	DefaultMeilisearchRebuildQueueDepth = 16
 	DefaultMeilisearchSemanticEnabled   = false
 	DefaultMeilisearchSemanticRatio     = 0.50
-	DefaultMeilisearchEmbedder          = "silo_recommendations"
+	DefaultMeilisearchEmbedder          = "vio_recommendations"
 	DefaultMeilisearchBinaryQuantized   = false
 
 	MaxMeilisearchSyncBatchSize     = 10000

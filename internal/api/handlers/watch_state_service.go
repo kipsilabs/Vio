@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/catalog"
@@ -41,18 +42,66 @@ func (h *ItemsHandler) WatchDetail(ctx context.Context, userID int, profileID, c
 		}
 	}
 
-	if !h.CanViewFilePaths(ctx) {
-		detail.HideFileIdentity()
-	}
 	if detail.Type == itemTypeMovie || detail.Type == itemTypeEpisode {
 		h.populateWatchMarkers(ctx, detail, filter.SelectedFileID)
 	}
 	if detail.Type == itemTypeMovie || detail.Type == itemTypeEpisode || detail.Type == itemTypeEbook || detail.Type == itemTypeAudiobook {
 		detail.UserData = h.leafUserData(ctx, userID, profileID, detail.ContentID, detail.Type)
 		applyEffectiveEditionPreference(detail.UserData, &detail.EffectiveVersionEditionKey)
-		projectEditionPreference(detail.EditionAliases, detail.UserData, &detail.EffectiveVersionEditionKey)
 	}
+	h.scheduleSelectedVirtualProbe(detail.ContentID, detail.Type, detail.Versions, filter)
 	return detail, nil
+}
+
+// scheduleSelectedVirtualProbe schedules the pre-play work for an explicitly
+// selected virtual version: the probe chain when its track inventory has not
+// been enumerated yet, and the provider fetch warm-up in every case. The
+// versions are the access-filtered rows the caller is about to answer with; the
+// selection is filter.SelectedFileID.
+//
+// Probe-on-select exists because selecting a non-default row previously left
+// its audio/subtitle menus unknown until the row played. Warm-on-select exists
+// because probe evidence does not mean the provider has fetched the bytes: a
+// cold release (AltMount's NZB download, for example) still blocks the first
+// play even when the row was probed long ago, so the explicit pick starts the
+// same fill a play would. The warm-up is fire-and-forget and re-reads the row
+// under the same access filter, so a bare listing or polling read (no explicit
+// selection) schedules neither.
+func (h *ItemsHandler) scheduleSelectedVirtualProbe(contentID, itemType string, versions []catalog.FileVersion, filter catalog.AccessFilter) {
+	if h == nil || h.virtualSelectionProber == nil || contentID == "" || filter.SelectedFileID <= 0 {
+		return
+	}
+	if itemType != itemTypeMovie && itemType != itemTypeEpisode {
+		return
+	}
+	for i := range versions {
+		version := &versions[i]
+		if version.FileID != filter.SelectedFileID {
+			continue
+		}
+		// Only a virtual row has provider bytes to enumerate and warm. A local
+		// row leaves both entry points nothing to do.
+		if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(version.FilePath)), virtualPlaybackPrefix) {
+			return
+		}
+		// Only an unstamped row still needs the inventory probe; a probed row
+		// skips it but still warms, because the probe says nothing about whether
+		// the provider's copy is fetched. Scheduling the probe first lets a live
+		// chain for an unprobed row cover the warm-up (it opens the same URL and
+		// starts the same fetch), while a refused probe leaves the warm-up to
+		// start the fetch on its own.
+		//
+		// A stamp is not an inventory: an evidence write that landed no tracks
+		// (or whose tracks were invalidated afterwards) leaves a row stamped and
+		// empty, and that row is exactly the one whose menu stays blank forever.
+		// The probe chain already calls this "stamp_without_inventory" and
+		// re-probes it, but this gate kept a selection from ever reaching it.
+		if version.ProbedAt == nil || !versionCarriesProbeInventory(*version) {
+			h.virtualSelectionProber.ScheduleSelectedFileProbe(contentID, version.FileID, filter)
+		}
+		h.virtualSelectionProber.ScheduleSelectedFileWarm(contentID, version.FileID, filter)
+		return
+	}
 }
 
 func (h *ItemsHandler) populateWatchMarkers(ctx context.Context, detail *catalog.WatchDetail, selectedFileID int) {
@@ -119,13 +168,30 @@ func (h *ItemsHandler) SetWatchedState(ctx context.Context, userID int, profileI
 		return WatchedStateView{}, apiError(http.StatusInternalServerError, "internal_error", "Failed to update watched state")
 	}
 	if !played && h.watchState != nil && (targetType == watchstate.ParentSeries || targetType == watchstate.ParentSeason) {
-		ids, err := h.watchState.ParentUnwatchTargets(ctx, userID, profileID, h.episodeRepo, targetType, contentID)
+		var ids []string
+		if targetType == watchstate.ParentSeason {
+			// Expand by the season's durable identity, not its mutable row:
+			// synthetic seasons have no row and partly linked/unlinked seasons
+			// can carry watched file-less episodes outside the season_id group.
+			seasonTarget, lookupErr := h.lookupWatchedTarget(ctx, contentID, filter)
+			if lookupErr != nil || seasonTarget.Season == nil {
+				return WatchedStateView{}, apiError(http.StatusInternalServerError, "internal_error", "Failed to update watched state")
+			}
+			ids, err = h.watchState.ParentUnwatchTargetsForSeason(ctx, userID, profileID, h.episodeRepo, seasonTarget.Season.SeriesID, seasonTarget.Season.SeasonNumber)
+		} else {
+			ids, err = h.watchState.ParentUnwatchTargets(ctx, userID, profileID, h.episodeRepo, targetType, contentID)
+		}
 		if err != nil {
 			return WatchedStateView{}, apiError(http.StatusInternalServerError, "internal_error", "Failed to update watched state")
 		}
 		for _, id := range ids {
 			targets = append(targets, watchedLeafTarget{ContentID: id})
 		}
+		// A partly linked season can return the same available episode from
+		// both the resolved leaf set and the parent expansion. PostgreSQL
+		// de-duplicates history deletes, but AffectedCount must count distinct
+		// episodes too.
+		targets = dedupeWatchedLeafTargets(targets)
 	}
 
 	switch {
@@ -232,4 +298,11 @@ func (h *ItemsHandler) markLeafTargetsUnwatched(ctx context.Context, userID int,
 		targetIDs = append(targetIDs, target.ContentID)
 	}
 	return h.watchState.RecordManualMarkUnwatched(ctx, userID, profileID, targetIDs)
+}
+
+// versionCarriesProbeInventory reports whether a version row has any track
+// evidence to show. A row can be stamped without it (see the selection probe
+// gate): the stamp says a probe ran, not that its evidence was adopted.
+func versionCarriesProbeInventory(version catalog.FileVersion) bool {
+	return len(version.VideoTracks) > 0 || len(version.AudioTracks) > 0 || len(version.SubtitleTracks) > 0
 }

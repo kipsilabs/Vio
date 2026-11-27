@@ -81,7 +81,7 @@ func orderedTitleKeys(t *testing.T, resolver *CatalogResolver, req CatalogReques
 // a linguistic collation sorts "Élite" among the E titles and "'Allo 'Allo!"
 // among the A titles, C sorts both apart. Set SILO_TEST_DATABASE_URL to a
 // migrated disposable database; every inserted row is removed on completion.
-func TestLetterIndexMatchesCursorPagesPostgres(t *testing.T) {
+func TestLetterIndexMatchesCursorPagesPostgres(t *testing.T) { //nolint:funlen // upstream test exceeds Vio's 100-line limit; refactor tracked separately
 	pool := collectionSortTestPool(t)
 	ctx := t.Context()
 	prefix := fmt.Sprintf("letter-index-%d", time.Now().UnixNano())

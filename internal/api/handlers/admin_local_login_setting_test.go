@@ -3,19 +3,22 @@ package handlers
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
+	"github.com/Silo-Server/silo-server/internal/auth"
 	"github.com/Silo-Server/silo-server/internal/config"
 )
 
-// Turning local password sign-in off needs a break-glass admin and an
-// OIDC or LDAP sign-in provider that can sign people in, through the batch
-// and the single-key settings writes alike. Without the provider check the
-// server accepted the change with nobody else able to sign in.
+// Turning local password sign-in off needs a break-glass admin, through the
+// batch and the single-key settings writes alike.
 func TestLocalLoginSettingRequiresBreakGlassDB(t *testing.T) {
 	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
 	if dsn == "" {
@@ -35,17 +38,31 @@ func TestLocalLoginSettingRequiresBreakGlassDB(t *testing.T) {
 	}
 
 	key := config.AuthLocalPasswordLoginSettingKey
+	put := func(h *AdminHandler) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		h.HandleUpdateSettings(rec, httptest.NewRequest(http.MethodPut, "/admin/settings", strings.NewReader(`{"values":{"`+key+`":"false"}}`)))
+		return rec
+	}
+	putOne := func(h *AdminHandler) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPut, "/admin/settings/"+key, strings.NewReader(`{"value":"false"}`))
+		h.HandleUpdateSetting(rec, withURLParam(req, "key", key))
+		return rec
+	}
+
 	store := &fakeServerSettingsStore{values: map[string]string{}}
 	h := &AdminHandler{SettingsRepo: store, pool: pool}
-	for _, single := range []bool{false, true} {
-		requireAdminError(t, saveAdminSetting(t, h, key, "false", single), 409, "break_glass_required")
+	for name, rec := range map[string]*httptest.ResponseRecorder{"batch": put(h), "single": putOne(h)} {
+		if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "break_glass_required") {
+			t.Fatalf("%s without break-glass: %d %s", name, rec.Code, rec.Body.String())
+		}
 	}
 	if _, stored := store.values[key]; stored {
 		t.Fatalf("refused write stored %q", store.values[key])
 	}
 	// Without account storage the change cannot be checked, so it is refused.
-	if err := saveAdminSetting(t, &AdminHandler{SettingsRepo: store}, key, "false", true); err == nil {
-		t.Fatal("unchecked write accepted")
+	if rec := putOne(&AdminHandler{SettingsRepo: store}); rec.Code == http.StatusOK {
+		t.Fatalf("unchecked write accepted: %s", rec.Body.String())
 	}
 
 	suffix := fmt.Sprint(time.Now().UnixNano())
@@ -55,80 +72,101 @@ func TestLocalLoginSettingRequiresBreakGlassDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DELETE FROM users WHERE id = $1`, id) })
+	if rec := putOne(h); rec.Code != http.StatusOK || store.values[key] != "false" {
+		t.Fatalf("with break-glass: %d %s %v", rec.Code, rec.Body.String(), store.values)
+	}
+}
 
-	var providers int
-	if err := pool.QueryRow(t.Context(), `SELECT COUNT(*) FROM plugin_auth_bindings WHERE enabled`).Scan(&providers); err != nil {
+// The frozen v1 admin user routes keep the break-glass rule v2 enforces: with
+// local password sign-in off, the last usable break-glass admin cannot be
+// demoted, disabled or deleted. An administrator's password write turns the
+// account's local password sign-in back on.
+func TestV1AdminUserChangesKeepBreakGlassDB(t *testing.T) {
+	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("SILO_TEST_DATABASE_URL is not set")
+	}
+	ctx := t.Context()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if providers > 0 {
-		t.Skipf("%d enabled sign-in bindings already in the database", providers)
-	}
-	for _, single := range []bool{false, true} {
-		requireAdminError(t, saveAdminSetting(t, h, key, "false", single), 409, "sign_in_provider_required")
-	}
-	if _, stored := store.values[key]; stored {
-		t.Fatalf("refused write stored %q", store.values[key])
-	}
-
-	var installation int
-	if err := pool.QueryRow(t.Context(), `INSERT INTO plugin_installations (plugin_id, version, install_path, enabled, update_policy, kind)
-		VALUES ($1, '0', '/nonexistent/local-login-setting-test', true, 'manual', 'plugin') RETURNING id`, "local-login-"+suffix).Scan(&installation); err != nil {
+	t.Cleanup(pool.Close)
+	var existing int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM users WHERE break_glass`).Scan(&existing); err != nil {
 		t.Fatal(err)
+	}
+	if existing > 0 {
+		t.Skipf("%d break-glass accounts already in the database", existing)
+	}
+	suffix := fmt.Sprint(time.Now().UnixNano())
+	insert := func(label, role string, owner, glass, localLogin bool) int {
+		var id int
+		if err := pool.QueryRow(ctx, `INSERT INTO users (username, email, password_hash, role, enabled, is_owner, break_glass, local_password_login_enabled)
+			VALUES ($1, $2, 'x', $3, true, $4, $5, $6) RETURNING id`, label+"-"+suffix, label+"-"+suffix+"@example.invalid", role, owner, glass, localLogin).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DELETE FROM users WHERE id = $1`, id) })
+		return id
+	}
+	var ownerID int
+	if err := pool.QueryRow(ctx, `SELECT id FROM users WHERE is_owner`).Scan(&ownerID); err != nil {
+		ownerID = insert("owner", "admin", true, false, true)
+	}
+	glassID := insert("glass", "admin", false, true, true)
+	linkedID := insert("linked", "user", false, false, false)
+
+	key := config.AuthLocalPasswordLoginSettingKey
+	var saved *string
+	var value string
+	if err := pool.QueryRow(ctx, `SELECT value FROM server_settings WHERE key = $1`, key).Scan(&value); err == nil {
+		saved = &value
 	}
 	t.Cleanup(func() {
-		_, _ = pool.Exec(context.Background(), `DELETE FROM plugin_installations WHERE id = $1`, installation)
+		if saved == nil {
+			_, _ = pool.Exec(context.Background(), `DELETE FROM server_settings WHERE key = $1`, key)
+			return
+		}
+		_, _ = pool.Exec(context.Background(), `UPDATE server_settings SET value = $2 WHERE key = $1`, key, *saved)
 	})
-	if _, err := pool.Exec(t.Context(), `INSERT INTO plugin_capabilities (plugin_installation_id, capability_type, capability_id, metadata)
-		VALUES ($1, 'auth_provider.v1', 'oidc', '{"auth_modes":["oauth2"]}'),
-		       ($1, 'auth_provider.v1', 'ldap', '{"auth_modes":["password"]}')`, installation); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := pool.Exec(t.Context(), `INSERT INTO plugin_auth_bindings (plugin_installation_id, capability_id, enabled)
-		VALUES ($1, 'oidc', false), ($1, 'ldap', false)`, installation); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO server_settings (key, value) VALUES ($1, 'false')
+		ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, key); err != nil {
 		t.Fatal(err)
 	}
 
-	// An OpenID Connect provider signs nobody in without a public URL, so it
-	// does not count until one is set; a directory provider needs none.
-	for _, tc := range []struct {
-		name, binding, publicURL string
-		accepted                 bool
-	}{
-		{"oauth without a public URL", "oidc", "", false},
-		{"oauth with a public URL", "oidc", "https://silo.example.test", true},
-		{"directory without a public URL", "ldap", "", true},
+	h := &AdminHandler{userRepo: auth.NewUserRepository(pool)}
+	send := func(method string, id int, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, "/api/v1/admin/users/"+fmt.Sprint(id), strings.NewReader(body))
+		req = withURLParam(req, "id", fmt.Sprint(id))
+		req = req.WithContext(apimw.SetClaims(req.Context(), &auth.Claims{UserID: ownerID, Role: "admin", TokenType: auth.TokenTypeAccess, SessionID: "s1"}))
+		rec := httptest.NewRecorder()
+		if method == http.MethodDelete {
+			h.HandleDeleteUser(rec, req)
+		} else {
+			h.HandleUpdateUser(rec, req)
+		}
+		return rec
+	}
+	for name, rec := range map[string]*httptest.ResponseRecorder{
+		"demote":  send(http.MethodPut, glassID, `{"role":"user"}`),
+		"disable": send(http.MethodPut, glassID, `{"enabled":false}`),
+		"delete":  send(http.MethodDelete, glassID, ""),
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if _, err := pool.Exec(t.Context(), `UPDATE plugin_auth_bindings SET enabled = (capability_id = $2) WHERE plugin_installation_id = $1`,
-				installation, tc.binding); err != nil {
-				t.Fatal(err)
-			}
-			delete(store.values, key)
-			store.values[config.ServerPublicURLSettingKey] = tc.publicURL
-			err := saveAdminSetting(t, h, key, "false", true)
-			if !tc.accepted {
-				requireAdminError(t, err, 409, "sign_in_provider_required")
-				if _, stored := store.values[key]; stored {
-					t.Fatalf("refused write stored %q", store.values[key])
-				}
-				return
-			}
-			if err != nil || store.values[key] != "false" {
-				t.Fatalf("accepted write: %v, stored %v", err, store.values)
-			}
-		})
+		if rec.Code != http.StatusConflict || decodeErrorCode(t, rec) != "break_glass_required" {
+			t.Errorf("%s: %d %s", name, rec.Code, rec.Body.String())
+		}
+	}
+	var role string
+	var enabled bool
+	if err := pool.QueryRow(ctx, `SELECT role, enabled FROM users WHERE id = $1`, glassID).Scan(&role, &enabled); err != nil || role != "admin" || !enabled {
+		t.Fatalf("break-glass admin changed: %s %v %v", role, enabled, err)
 	}
 
-	// With password sign-in off and only the OpenID Connect provider on,
-	// clearing the public URL would leave nobody but break-glass admins able
-	// to sign in.
-	if _, err := pool.Exec(t.Context(), `UPDATE plugin_auth_bindings SET enabled = (capability_id = 'oidc') WHERE plugin_installation_id = $1`, installation); err != nil {
-		t.Fatal(err)
+	if rec := send(http.MethodPut, linkedID, `{"password":"a-new-password-1"}`); rec.Code != http.StatusOK {
+		t.Fatalf("password write: %d %s", rec.Code, rec.Body.String())
 	}
-	store.values[key] = "false"
-	store.values[config.ServerPublicURLSettingKey] = "https://silo.example.test"
-	requireAdminError(t, saveAdminSetting(t, h, config.ServerPublicURLSettingKey, "", true), 409, "sign_in_provider_required")
-	if store.values[config.ServerPublicURLSettingKey] == "" {
-		t.Fatal("refused write cleared the public URL")
+	var localLogin bool
+	if err := pool.QueryRow(ctx, `SELECT local_password_login_enabled FROM users WHERE id = $1`, linkedID).Scan(&localLogin); err != nil || !localLogin {
+		t.Fatalf("local password sign-in after a password write = %v, %v", localLogin, err)
 	}
 }

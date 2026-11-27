@@ -1392,7 +1392,6 @@ func browseItemColumns(alias string) string {
 		"metadata_s3_path", "metadata_etag", "season_count",
 		"studios", "networks", "countries", "keywords", "original_language", "release_date::text", "first_air_date", "last_air_date",
 		"show_status",
-		episodeLabelsColumn,
 		"matched_at", "episode_metadata_incomplete", "episode_metadata_last_checked_at", "status", "created_at", "updated_at",
 		advisoryAgeColumn, advisorySourceColumn,
 	}
@@ -1485,7 +1484,6 @@ func browseGroupByColumns(alias string) string {
 		"metadata_s3_path", "metadata_etag", "season_count",
 		"studios", "networks", "countries", "keywords", "original_language", "release_date::text", "first_air_date", "last_air_date",
 		"show_status",
-		episodeLabelsColumn,
 		"matched_at", "episode_metadata_incomplete", "episode_metadata_last_checked_at", "status", "created_at", "updated_at",
 		advisoryAgeColumn, advisorySourceColumn,
 	}
@@ -1558,7 +1556,6 @@ func scanBrowseItems(rows pgx.Rows) ([]*models.MediaItem, error) {
 			&item.FirstAirDate,
 			&item.LastAirDate,
 			&item.ShowStatus,
-			&item.EpisodeLabels,
 			&item.MatchedAt,
 			&item.EpisodeMetadataIncomplete,
 			&item.EpisodeMetadataLastCheckedAt,

@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 
@@ -90,19 +91,11 @@ func adminAccountTransactionGroup(ctx context.Context, tx pgx.Tx, user *models.U
 	}
 	return new(group.Policy()), group.Revision, nil
 }
-
-// validateAdminPassword applies the server's password policy to a password
-// an administrator sets.
-func (h *AdminHandler) validateAdminPassword(ctx context.Context, password string) error {
-	var settings auth.SettingsGetter
-	if h.SettingsRepo != nil {
-		settings = h.SettingsRepo
+func validateAdminPassword(password string) error {
+	if utf8.RuneCountInString(password) < 8 || len(password) > 72 {
+		return fieldError("password", "Use at least 8 characters and at most 72 UTF-8 bytes")
 	}
-	err := auth.CheckNewPassword(ctx, settings, password)
-	if message, ok := auth.PasswordRuleMessage(err); ok {
-		return fieldError("password", message).WithCause(err)
-	}
-	return err
+	return nil
 }
 
 func validateAdminIdentity(username, email, role string) error {
@@ -139,7 +132,7 @@ func (h *AdminHandler) CreateAdminAccount(ctx context.Context, input auth.Create
 	if err := validateAdminIdentity(input.User.Username, input.User.Email, input.User.Role); err != nil {
 		return 0, err
 	}
-	if err := h.validateAdminPassword(ctx, input.User.Password); err != nil {
+	if err := validateAdminPassword(input.User.Password); err != nil {
 		return 0, err
 	}
 	if apimw.IsScopedAPIKey(ctx) && input.User.Role == roleAdmin {
@@ -205,7 +198,7 @@ func (h *AdminHandler) UpdateAdminAccount(ctx context.Context, id int, revision,
 		return 0, apiError(501, "capability_unsupported", "Guarded account management is unavailable")
 	}
 	if input.Password != nil {
-		if err := h.validateAdminPassword(ctx, *input.Password); err != nil {
+		if err := validateAdminPassword(*input.Password); err != nil {
 			return 0, err
 		}
 	}
@@ -305,7 +298,6 @@ func (h *AdminHandler) DeleteAdminAccount(ctx context.Context, id int, revision,
 	if err != nil {
 		return err
 	}
-	var collections []string
 	_, err = repo.MutateAdminAccount(ctx, id, revision, nil, func(current *models.User, tx pgx.Tx) (bool, error) {
 		if revision != -1 {
 			_, actual, err := adminAccountTransactionGroup(ctx, tx, current)
@@ -322,9 +314,7 @@ func (h *AdminHandler) DeleteAdminAccount(ctx context.Context, id int, revision,
 		if err := auth.EnsureBreakGlassAfterAdminChange(ctx, tx, current, nil); err != nil {
 			return false, breakGlassError(err)
 		}
-		ids, err := h.deletedAccountCollections(ctx, tx, id)
-		collections = ids
-		return true, err
+		return true, nil
 	})
 	if err != nil {
 		return err
@@ -332,7 +322,6 @@ func (h *AdminHandler) DeleteAdminAccount(ctx context.Context, id int, revision,
 	if h.OnUserSessionsRevoked != nil {
 		h.OnUserSessionsRevoked(ctx, id)
 	}
-	removeDeletedCollectionArtwork(ctx, h.ArtworkStore, userCollectionImagePrefix, collections...)
 	h.sweepWatchlistTitles(ctx, id)
 	h.invalidateStats(ctx, cache.ChannelAdmin, cache.EventAdminStatsInvalidated, strconv.Itoa(id))
 	return nil

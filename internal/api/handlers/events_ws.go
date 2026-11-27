@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -11,10 +12,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gorilla/websocket"
-	"github.com/oklog/ulid/v2"
-
+	"github.com/Silo-Server/silo-server/internal/access"
 	"github.com/Silo-Server/silo-server/internal/adminjob"
+	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
 	"github.com/Silo-Server/silo-server/internal/auth"
 	evt "github.com/Silo-Server/silo-server/internal/events"
 	"github.com/Silo-Server/silo-server/internal/historyimport"
@@ -22,6 +22,8 @@ import (
 	"github.com/Silo-Server/silo-server/internal/notifications"
 	"github.com/Silo-Server/silo-server/internal/scanqueue"
 	"github.com/Silo-Server/silo-server/internal/taskmanager"
+	"github.com/gorilla/websocket"
+	"github.com/oklog/ulid/v2"
 
 	"github.com/Silo-Server/silo-server/internal/wsconn"
 )
@@ -79,11 +81,46 @@ type activeScanLister interface {
 type EventsHandler struct {
 	hub            *evt.Hub
 	jobs           *AdminJobsHandler
+	admin          *AdminHandler
 	tasks          taskInfoLister
 	scans          *evt.ScanRegistry
 	persistedScans activeScanLister
 	historyImports historyImportActiveLister
 	notifications  *notifications.System
+	// sessionRoles and sessionCheckInterval drive the v1 connection's
+	// periodic login-session check; see SetSessionRoles.
+	sessionRoles         sessionRoleChecker
+	sessionCheckInterval time.Duration
+	// profiles re-verifies the PIN proof of the profile a connection holding
+	// the admin channels acts as; see SetProfileVerifier.
+	profiles apimw.ViewerResolver
+}
+
+// sessionRoleChecker reports whether a login session is still active and its
+// authority, including the current role of its account;
+// auth.SessionRepository implements it.
+type sessionRoleChecker interface {
+	ActiveSession(ctx context.Context, sessionID string, userID int) (authority auth.SessionAuthority, active bool, err error)
+}
+
+// SetSessionRoles makes the v1 events socket recheck its login session. The
+// connection picks its channels from the access token's role once, at the
+// handshake, so it closes when the session ends or the account's role
+// changes; the client reconnects with a refreshed token.
+func (h *EventsHandler) SetSessionRoles(sessions sessionRoleChecker) {
+	if h != nil {
+		h.sessionRoles = sessions
+	}
+}
+
+// SetProfileVerifier makes the v1 events socket re-verify, at the handshake
+// and on every session check, the PIN proof of the profile a connection on an
+// admin account acts as, so changing that profile's PIN takes the admin
+// channels away as it does on the v2 socket.
+func (h *EventsHandler) SetProfileVerifier(profiles apimw.ViewerResolver) {
+	if h != nil {
+		h.profiles = profiles
+	}
 }
 
 // SetNotificationsSystem wires the user-notification system: websocket
@@ -97,6 +134,7 @@ func (h *EventsHandler) SetNotificationsSystem(system *notifications.System) {
 func NewEventsHandler(
 	hub *evt.Hub,
 	jobs *AdminJobsHandler,
+	admin *AdminHandler,
 	tasks taskInfoLister,
 	scans *evt.ScanRegistry,
 	persistedScans *scanqueue.Service,
@@ -105,6 +143,7 @@ func NewEventsHandler(
 	return &EventsHandler{
 		hub:            hub,
 		jobs:           jobs,
+		admin:          admin,
 		tasks:          tasks,
 		scans:          scans,
 		persistedScans: persistedScans,
@@ -112,11 +151,163 @@ func NewEventsHandler(
 	}
 }
 
+func (h *EventsHandler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
+	if h == nil || h.hub == nil {
+		http.Error(w, "events unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	claims := apimw.GetClaims(r.Context())
+	if claims == nil {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// Browsers cannot set custom headers on websocket handshakes, so profile
+	// identity arrives as a short-lived single-use ticket minted via
+	// POST /events/ws-ticket. An unbound connection cannot subscribe to
+	// notifications or receive profile-addressed state and settings events.
+	var bound notifications.Ticket
+	if ticket := r.URL.Query().Get("ticket"); ticket != "" && h.notifications != nil {
+		binding, ok := h.notifications.Tickets.Consume(r.Context(), ticket)
+		if ok && binding.UserID == claims.UserID {
+			bound = binding
+		} else {
+			// Expired, reused, consumed on a different node, or minted for
+			// another user: degrade to an unbound connection instead of
+			// failing the handshake, which would take down every realtime
+			// channel. An unbound connection cannot subscribe to
+			// notifications, and on an admin account it is judged as acting
+			// with no profile below, so a household that requires a profile
+			// gets the user channels. Both fail closed: the client gets the
+			// binding back by reconnecting with a fresh ticket, which it does
+			// when its notifications subscription is rejected.
+			slog.WarnContext(r.Context(), "events: websocket ticket rejected; connection unbound", "component", "api",
+				"user_id", claims.UserID)
+		}
+	}
+
+	// Admin channels follow the acting profile, as
+	// on the v2 socket: another profile on an admin's account connects with
+	// the user role. A handshake that declares no profile acts as the profile
+	// its ticket was minted for, which the viewer gate verified then. Either
+	// way the profile's PIN proof is re-verified here and on every session
+	// check. The session check below still compares the account's real role.
+	boundProfileID := bound.ProfileID
+	effective := claims
+	var stillActingAdmin func(context.Context) (bool, error)
+	if claims.Role == models.RoleAdmin {
+		stillActingAdmin = apimw.ActingAdmin
+		actingProfileID, profileToken := apimw.GetProfileID(r.Context()), r.Header.Get("X-Profile-Token")
+		if actingProfileID == "" && boundProfileID != "" {
+			actingProfileID, profileToken = boundProfileID, bound.ProfileToken
+			stillActingAdmin = func(ctx context.Context) (bool, error) { return apimw.ActingAdminAs(ctx, boundProfileID) }
+		}
+		stillActingAdmin = h.withProfileProof(stillActingAdmin, claims, actingProfileID, profileToken)
+		actingAdmin, err := stillActingAdmin(r.Context())
+		if err != nil {
+			http.Error(w, "failed to verify active profile", http.StatusInternalServerError)
+			return
+		}
+		if !actingAdmin {
+			demoted := *claims
+			demoted.Role = models.RoleUser
+			effective = &demoted
+			stillActingAdmin = nil
+		}
+	}
+
+	if h.sessionRoles != nil && claims.SessionID != "" {
+		ctx, cancel := context.WithCancel(r.Context())
+		defer cancel()
+		go h.closeOnSessionChange(ctx, cancel, claims, stillActingAdmin)
+		r = r.WithContext(ctx)
+	}
+	h.serveWebSocket(w, r, effective, boundProfileID, wsUpgrader, nil)
+}
+
+// withProfileProof narrows decide to while profileID's PIN proof still
+// verifies for the connection's login session. The proof is bound to the
+// profile's PIN revision, so a PIN change, or a PIN newly set on the profile,
+// ends it. With no verifier wired, or no profile, decide is returned as is.
+func (h *EventsHandler) withProfileProof(decide func(context.Context) (bool, error), claims *auth.Claims, profileID, profileToken string) func(context.Context) (bool, error) {
+	if h.profiles == nil || profileID == "" {
+		return decide
+	}
+	input := access.ResolveInput{
+		UserID:       claims.UserID,
+		SessionID:    claims.SessionID,
+		ProfileID:    profileID,
+		ProfileToken: profileToken,
+		// API keys carry no PIN proof by design, as at the viewer gate.
+		SkipPINVerification: claims.TokenType == auth.TokenTypeAPIKey,
+	}
+	return func(ctx context.Context) (bool, error) {
+		scope, err := h.profiles.Resolve(ctx, input)
+		if errors.Is(err, access.ErrProfileUnverified) || errors.Is(err, access.ErrProfileNotFound) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if !scope.ProfileVerified {
+			return false, nil
+		}
+		return decide(ctx)
+	}
+}
+
+// closeOnSessionChange cancels a v1 connection once its login session is no
+// longer active or the account's role differs from the access token's, and,
+// for a connection holding the admin channels, once stillActingAdmin stops
+// holding (say the household gained a PIN, or the acting profile's PIN
+// changed). A failed check is skipped; the next one decides.
+func (h *EventsHandler) closeOnSessionChange(ctx context.Context, cancel context.CancelFunc, claims *auth.Claims, stillActingAdmin func(context.Context) (bool, error)) {
+	interval := h.sessionCheckInterval
+	if interval <= 0 {
+		interval = eventsSessionCheckInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			checkCtx, stop := context.WithTimeout(ctx, 2*time.Second)
+			changed := h.sessionChanged(checkCtx, claims, stillActingAdmin)
+			stop()
+			if changed {
+				cancel()
+				return
+			}
+		}
+	}
+}
+
+// sessionChanged reports whether one recheck found the connection's access
+// gone: the session ended, the account's role changed, or stillActingAdmin
+// (when set) no longer holds. A failed session lookup reports no change; a
+// failed acting-admin decision counts as lost, so a connection holding the
+// administrator channels fails closed like the HTTP routes and reconnects.
+func (h *EventsHandler) sessionChanged(ctx context.Context, claims *auth.Claims, stillActingAdmin func(context.Context) (bool, error)) bool {
+	authority, active, err := h.sessionRoles.ActiveSession(ctx, claims.SessionID, claims.UserID)
+	// A remote-playback handoff never holds a v1 socket.
+	if err == nil && (!active || authority.Role != claims.Role || authority.IsRemotePlayback()) {
+		return true
+	}
+	if stillActingAdmin == nil {
+		return false
+	}
+	acting, err := stillActingAdmin(ctx)
+	return err != nil || !acting
+}
+
 // serveWebSocket runs one events connection. When accessChanged closes, the
 // loop tells the client its access changed and closes the connection with
-// SocketCloseAccessChanged; a nil channel never fires. When the request
-// context ends with a cause socketCloseFrame names (a v2 recheck or the
-// lifetime deadline), the connection ends with that close frame.
+// EventsCloseAccessChanged; a nil channel never fires. Only the v2 handshake
+// passes one: the bridge socket never sends access_changed, and never
+// receives V2Only events either.
 func (h *EventsHandler) serveWebSocket(w http.ResponseWriter, r *http.Request, claims *auth.Claims, boundProfileID string, upgrader websocket.Upgrader, accessChanged <-chan struct{}) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -137,9 +328,8 @@ func (h *EventsHandler) serveWebSocket(w http.ResponseWriter, r *http.Request, c
 		)
 		return
 	}
-	closer := newSocketCloser(conn)
-	defer func() { closer.close(context.Cause(r.Context())) }()
-	stopClose := closer.closeWhenDone(r.Context())
+	defer conn.Close()
+	stopClose := context.AfterFunc(r.Context(), func() { _ = conn.Close() })
 	defer stopClose()
 	configureWebSocket(conn)
 	conn.SetReadLimit(maxEventsFrameBytes)
@@ -259,10 +449,7 @@ func (h *EventsHandler) serveWebSocket(w http.ResponseWriter, r *http.Request, c
 		case <-readDone:
 			return
 		case <-accessChanged:
-			// The frame goes first, so a client that reads frames but not
-			// close codes still learns why.
-			_ = writeWebSocketJSON(conn, evt.EventsAccessChangedMessage{Type: eventsAccessChanged})
-			closer.close(errSocketAccessChanged)
+			closeEventsAccessChanged(conn, readDone)
 			return
 		case <-deadlineC:
 			writeWebSocketError(conn, "bad_request", "subscribe is required within "+subscribeGracePeriod.String())
@@ -289,7 +476,7 @@ func (h *EventsHandler) serveWebSocket(w http.ResponseWriter, r *http.Request, c
 			if !ok {
 				return
 			}
-			if _, subscribed := subscriptions[env.Channel]; !subscribed {
+			if _, subscribed := subscriptions[env.Channel]; !subscribed || (env.V2Only && accessChanged == nil) {
 				continue
 			}
 			if !allowsEventForClaims(claims, boundProfileID, env) {
@@ -299,6 +486,28 @@ func (h *EventsHandler) serveWebSocket(w http.ResponseWriter, r *http.Request, c
 				return
 			}
 		}
+	}
+}
+
+// closeEventsAccessChanged sends the access_changed frame and close code, then
+// waits briefly for the client's close reply so both frames arrive before the
+// connection is torn down.
+func closeEventsAccessChanged(conn *websocket.Conn, readDone <-chan struct{}) {
+	if err := writeWebSocketJSON(conn, evt.EventsAccessChangedMessage{Type: eventsAccessChanged}); err != nil {
+		return
+	}
+	if err := writeWebSocketControl(
+		conn,
+		websocket.CloseMessage,
+		websocket.FormatCloseMessage(EventsCloseAccessChanged, eventsAccessChanged),
+	); err != nil {
+		return
+	}
+	reply := time.NewTimer(time.Second)
+	defer reply.Stop()
+	select {
+	case <-readDone:
+	case <-reply.C:
 	}
 }
 
@@ -493,30 +702,15 @@ func allowedChannelsForClaims(claims *auth.Claims) []evt.EventChannel {
 		if claims.Role == models.RoleAdmin && slices.Contains(claims.APIKeyScopes, auth.ScopeAdminMonitorRead) {
 			return slices.Clone(monitorKeyChannels)
 		}
-		// A user key gets the channel of each event scope it holds. The
-		// rest stay closed: settings and history imports have no user
-		// scope.
-		var channels []evt.EventChannel
-		if slices.Contains(claims.APIKeyScopes, auth.ScopeCatalogRead) {
-			channels = append(channels, evt.ChannelCatalog)
-		}
-		if slices.Contains(claims.APIKeyScopes, auth.ScopeWatchRead) {
-			channels = append(channels, evt.ChannelUserState)
-		}
-		if slices.Contains(claims.APIKeyScopes, auth.ScopeNotifications) {
-			channels = append(channels, evt.ChannelNotifications)
-		}
-		return channels
+		return nil
 	}
 	return allowedChannelsForRole(claims.Role)
 }
 
 // monitorKeyChannels are what an admin:monitor:read key may subscribe to:
-// live sessions, catalog changes and download changes. Jobs carry artifact
-// URLs and request payloads and scans carry library paths, which monitoring
-// never reads; download_preparations stays closed so a future preparation
-// event is not handed to scoped keys unreviewed.
-var monitorKeyChannels = []evt.EventChannel{evt.ChannelCatalog, evt.ChannelSessions, evt.ChannelDownloads}
+// live sessions and catalog changes. Jobs carry artifact URLs and request
+// payloads and scans carry library paths, which monitoring never reads.
+var monitorKeyChannels = []evt.EventChannel{evt.ChannelCatalog, evt.ChannelSessions}
 
 func allowedChannelsForRole(role string) []evt.EventChannel {
 	channels := []evt.EventChannel{
@@ -603,10 +797,9 @@ func (h *EventsHandler) snapshotForChannel(
 	channel evt.EventChannel,
 ) (json.RawMessage, error) {
 	switch channel {
-	case evt.ChannelCatalog, evt.ChannelUserState, evt.ChannelSessions:
-		// Session frames are cues: clients re-read GET /api/v2/admin/sessions.
+	case evt.ChannelCatalog, evt.ChannelUserState:
 		return json.RawMessage("null"), nil
-	case evt.ChannelDownloadPreparations, evt.ChannelDownloads:
+	case evt.ChannelDownloadPreparations:
 		// Events only say what changed; clients re-read the admin list, and a
 		// null snapshot tells a reconnecting client to do so.
 		return json.RawMessage("null"), nil
@@ -635,6 +828,15 @@ func (h *EventsHandler) snapshotForChannel(
 			response = append(response, adminJobToResponse(r, job, h.jobs.store))
 		}
 		return marshalJSON(response), nil
+	case evt.ChannelSessions:
+		if h == nil || h.admin == nil {
+			return json.RawMessage("[]"), nil
+		}
+		sessions, err := h.admin.loadPlaybackSessions(r.Context(), r)
+		if err != nil {
+			return nil, err
+		}
+		return marshalJSON(sessions), nil
 	case evt.ChannelTasks:
 		if h == nil || h.tasks == nil {
 			return json.RawMessage("[]"), nil
@@ -722,7 +924,7 @@ func (h *EventsHandler) writeEventFrame(
 	env evt.Envelope,
 ) error {
 	data := env.Data
-	if len(data) == 0 {
+	if len(data) == 0 || (env.Channel == evt.ChannelSessions && env.Event == "sessions.replaced") {
 		snapshot, err := h.snapshotForChannel(r, claims, boundProfileID, env.Channel)
 		if err != nil {
 			// Drop the frame but keep the stream open (same contract as

@@ -2,9 +2,12 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -64,8 +67,8 @@ func newProfileLimitDBFixture(t *testing.T, maxProfiles int) *profileLimitDBFixt
 	handler.UserRepo = auth.NewUserRepository(pool)
 
 	f := &profileLimitDBFixture{pool: pool, handler: handler, store: store, userID: userID}
-	if err := f.create("Parent"); err != nil {
-		t.Fatalf("bootstrap primary profile: %v", err)
+	if code, body := f.create("Parent"); code != http.StatusCreated {
+		t.Fatalf("bootstrap primary profile: status = %d, body = %s", code, body)
 	}
 	profiles, err := store.ListProfiles(ctx)
 	if err != nil || len(profiles) != 1 || !profiles[0].IsPrimary {
@@ -75,20 +78,19 @@ func newProfileLimitDBFixture(t *testing.T, maxProfiles int) *profileLimitDBFixt
 	return f
 }
 
-// create creates one profile through the shared seam, acting as the primary
-// profile once it exists.
-func (f *profileLimitDBFixture) create(name string) error {
+// create posts one profile through the v1 HTTP handler, acting as the
+// primary profile once it exists.
+func (f *profileLimitDBFixture) create(name string) (int, string) {
+	req := httptest.NewRequest(http.MethodPost, "/profiles", strings.NewReader(fmt.Sprintf(`{"name":%q}`, name)))
 	ctx := apimw.SetClaims(context.Background(), &auth.Claims{
 		UserID: f.userID, Role: "user", TokenType: auth.TokenTypeAccess,
 	})
 	if f.primary != "" {
 		ctx = apimw.SetProfileID(ctx, f.primary)
 	}
-	_, err := f.handler.CreateProfile(ctx, ProfileCreateCommand{
-		UserID: f.userID, ActiveProfileID: f.primary, Request: ProfileCreateRequest{Name: name},
-		VerifyProfile: noProfileVerification,
-	})
-	return err
+	rr := httptest.NewRecorder()
+	f.handler.HandleCreateProfile(rr, req.WithContext(ctx))
+	return rr.Code, rr.Body.String()
 }
 
 func (f *profileLimitDBFixture) profileCount(t *testing.T) int {
@@ -100,6 +102,20 @@ func (f *profileLimitDBFixture) profileCount(t *testing.T) int {
 	return len(profiles)
 }
 
+func assertProfileLimitReached(t *testing.T, code int, body string) {
+	t.Helper()
+	if code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body = %s", code, body)
+	}
+	var resp errorResponse
+	if err := json.Unmarshal([]byte(body), &resp); err != nil {
+		t.Fatalf("decode %q: %v", body, err)
+	}
+	if resp.Error != "profile_limit_reached" {
+		t.Fatalf("error = %q, want profile_limit_reached", resp.Error)
+	}
+}
+
 // TestCreateProfileLimitConcurrentDB is issue #2423: concurrent creates on an
 // account one below its limit must not all pass a count taken before the
 // write. Exactly one commits; every other request gets the documented 409.
@@ -108,31 +124,34 @@ func (f *profileLimitDBFixture) profileCount(t *testing.T) int {
 func TestCreateProfileLimitConcurrentDB(t *testing.T) {
 	const limit, attempts = 3, 12
 	f := newProfileLimitDBFixture(t, limit)
-	if err := f.create("Kid One"); err != nil {
-		t.Fatalf("create to limit-1: %v", err)
+	if code, body := f.create("Kid One"); code != http.StatusCreated {
+		t.Fatalf("create to limit-1: status = %d, body = %s", code, body)
 	}
 
-	results := make([]error, attempts)
+	type result struct {
+		code int
+		body string
+	}
+	results := make([]result, attempts)
 	start := make(chan struct{})
 	var wg sync.WaitGroup
 	for i := range attempts {
 		wg.Go(func() {
 			<-start
-			results[i] = f.create(fmt.Sprintf("Racer %d", i))
+			code, body := f.create(fmt.Sprintf("Racer %d", i))
+			results[i] = result{code, body}
 		})
 	}
 	close(start)
 	wg.Wait()
 
 	created := 0
-	for _, err := range results {
-		if err == nil {
+	for _, r := range results {
+		if r.code == http.StatusCreated {
 			created++
 			continue
 		}
-		if apiErr := requireAPIStatus(t, err, http.StatusConflict); apiErr.Code != "profile_limit_reached" {
-			t.Fatalf("error = %+v, want profile_limit_reached", apiErr)
-		}
+		assertProfileLimitReached(t, r.code, r.body)
 	}
 	if created != 1 {
 		t.Fatalf("created = %d of %d concurrent requests, want exactly 1", created, attempts)

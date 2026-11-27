@@ -1253,6 +1253,10 @@ func collectOrphanIDs(ctx context.Context, tx pgx.Tx, contentIDs []string) ([]st
 // the given content IDs (items, their seasons, episodes and local extras), without
 // filtering out dirs still used by other content.
 func collectRawImageDirs(ctx context.Context, q rowQuerier, contentIDs []string) ([]string, error) {
+	// The outer COALESCE covers every artwork surface: episodes.still_path is
+	// still nullable, and a NULL there surfaces under the union's first column
+	// name (poster_path), so scanning the union raw fails when a series has an
+	// unstilled episode.
 	imgRows, err := q.Query(ctx, `
 		SELECT poster_path, backdrop_path, logo_path FROM media_items WHERE content_id = ANY($1)
 		UNION ALL
@@ -1274,11 +1278,19 @@ func collectRawImageDirs(ctx context.Context, q rowQuerier, contentIDs []string)
 	defer imgRows.Close()
 	dirSet := make(map[string]struct{})
 	for imgRows.Next() {
-		var p1, p2, p3 string
+		// still_path (episodes, extras) and some item slots are nullable; a
+		// NULL is no path, so scan it as such instead of failing the union.
+		var p1, p2, p3 *string
 		if err := imgRows.Scan(&p1, &p2, &p3); err != nil {
 			return nil, fmt.Errorf("scanning image path: %w", err)
 		}
-		for _, p := range []string{p1, p2, p3} {
+		values := []string{}
+		for _, p := range []*string{p1, p2, p3} {
+			if p != nil {
+				values = append(values, *p)
+			}
+		}
+		for _, p := range values {
 			if p != "" && !strings.Contains(p, "://") {
 				if dir := imageDeletePrefix(p); dir != "" {
 					dirSet[dir] = struct{}{}

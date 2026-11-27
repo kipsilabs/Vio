@@ -37,8 +37,6 @@ type AdminSectionPreviewResult struct {
 	Items      []*models.MediaItem
 	TotalCount int
 	PosterURLs map[string]string
-	// Collections are a row of collections' cards.
-	Collections []sections.CollectionCard
 }
 type adminSectionRevisionKey struct{}
 
@@ -89,7 +87,7 @@ func (h *SectionHandler) CreateAdminSection(ctx context.Context, req AdminSectio
 		return none, apiError(http.StatusBadRequest, "bad_request", msg)
 	}
 
-	if msg, ok := validateSectionConfig(sections.SectionType(req.SectionType), req.Config); !ok {
+	if msg, ok := validateSectionConfig(sections.SectionType(req.SectionType), req.Config, false); !ok {
 		return none, apiError(http.StatusBadRequest, "bad_request", msg)
 	}
 	if req.ValidateRecipe {
@@ -104,12 +102,12 @@ func (h *SectionHandler) CreateAdminSection(ctx context.Context, req AdminSectio
 		Position:    req.Position,
 		SectionType: sections.SectionType(req.SectionType),
 		Title:       req.Title,
-		Featured:    req.Featured && sections.CanBeHero(sections.SectionType(req.SectionType)),
+		Featured:    req.Featured,
 		ItemLimit:   req.ItemLimit,
 		Config:      req.Config,
 		Enabled:     req.Enabled,
+		WebOnly:     req.Featured && req.WebOnly,
 	}
-	sec.WebOnly = sec.Featured && req.WebOnly
 	if sec.Scope == "" {
 		sec.Scope = adminSectionScopeHome
 	}
@@ -217,10 +215,6 @@ func (h *SectionBulkHandler) BulkCreateAdminSections(ctx context.Context, req Ad
 	if err := rec.Validate(req.Config); err != nil {
 		return none, apiError(http.StatusBadRequest, "bad_request", err.Error())
 	}
-	if err := sections.ValidateAdminCollectionPosters(sections.SectionType(req.SectionType), req.Config); err != nil {
-		return none, apiError(http.StatusBadRequest, "bad_request", err.Error())
-	}
-	req.Featured = req.Featured && sections.CanBeHero(sections.SectionType(req.SectionType))
 
 	itemLimit := req.ItemLimit
 	if itemLimit <= 0 {
@@ -270,7 +264,7 @@ func (h *SectionHandler) PreviewAdminSection(ctx context.Context, req AdminSecti
 	if err != nil {
 		return AdminSectionPreviewResult{}, err
 	}
-	return AdminSectionPreviewResult{Items: preview.Items, TotalCount: preview.TotalCount, PosterURLs: h.previewPosterURLs(ctx, preview.Items), Collections: preview.collections}, nil
+	return AdminSectionPreviewResult{Items: preview.Items, TotalCount: preview.TotalCount, PosterURLs: h.previewPosterURLs(ctx, preview.Items)}, nil
 }
 
 // previewPosterURLs presigns each item's poster at the variant a live row
@@ -348,7 +342,7 @@ func (h *SectionHandler) previewAdminSection(ctx context.Context, req AdminSecti
 	if items == nil {
 		items = []*models.MediaItem{}
 	}
-	return previewResponse{Items: items, TotalCount: result.TotalCount, collections: result.Collections}, nil
+	return previewResponse{Items: items, TotalCount: result.TotalCount}, nil
 }
 
 func (h *SectionHandler) BulkCreateAdminSections(ctx context.Context, req AdminSectionBulkCreate) (AdminSectionBulkResult, error) {
@@ -456,7 +450,6 @@ func (h *SectionHandler) UpdateAdminSection(ctx context.Context, id string, req 
 		if req.Featured != nil {
 			existing.Featured = *req.Featured
 		}
-		existing.Featured = existing.Featured && sections.CanBeHero(existing.SectionType)
 		if req.ItemLimit != nil {
 			existing.ItemLimit = *req.ItemLimit
 		}
@@ -486,7 +479,10 @@ func (h *SectionHandler) UpdateAdminSection(ctx context.Context, id string, req 
 			return none, apiError(400, "bad_request", msg)
 		}
 		definitionChanged := existing.SectionType != originalType || !jsonConfigEqual(originalConfig, existing.Config)
-		if msg, ok := validateSectionConfig(existing.SectionType, existing.Config); !ok {
+		// Like the recipe check below, the v1 rule vocabulary applies only to a
+		// changed definition, so v1 can still rename, move or disable a row
+		// whose rules were saved through v2.
+		if msg, ok := validateSectionConfig(existing.SectionType, existing.Config, false); !ok {
 			return none, apiError(400, "bad_request", msg)
 		}
 		// Only a changed type or config runs the recipe check, so a row saved
@@ -548,4 +544,14 @@ func (h *SectionHandler) ReorderAdminSections(ctx context.Context, scope string,
 		expected = *v
 	}
 	return h.repo.ReorderScopeIfRevision(ctx, scope, library, ids, expected)
+}
+func (h *SectionHandler) reorderLegacySections(ctx context.Context, entries []sections.ReorderEntry) error {
+	return h.repo.ReorderLegacy(ctx, entries)
+}
+
+func adminSectionServiceError(err error) error {
+	if errors.Is(err, sections.ErrSectionNotFound) {
+		return apiError(404, "not_found", "Section not found")
+	}
+	return err
 }

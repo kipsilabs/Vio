@@ -338,8 +338,6 @@ type ItemDetail struct {
 
 	// Series-specific.
 	SeasonCount *int `json:"season_count,omitempty"`
-	// EpisodeLabels is the series' models.EpisodeLabelsAirDate choice.
-	EpisodeLabels string `json:"-"`
 	// EpisodeMetadataIncomplete is the series row's flag that some episodes
 	// still lack metadata, so item detail can request a refresh without
 	// reading the row again. Not part of any JSON contract.
@@ -428,8 +426,7 @@ type ItemDetail struct {
 	Ebook *EbookDetailExtension `json:"ebook,omitempty"`
 
 	// Manga-specific detail. Present only when Type == "manga".
-	Manga          *MangaDetailExtension `json:"manga,omitempty"`
-	EditionAliases EditionAliases        `json:"-"`
+	Manga *MangaDetailExtension `json:"manga,omitempty"`
 }
 
 // ItemVideoInfo is the API shape of a remote provider video. It exposes the
@@ -879,31 +876,28 @@ type SeasonUserData struct {
 
 // WatchDetail is the playback-oriented payload for /watch/{id}.
 type WatchDetail struct {
-	ContentID                       string            `json:"content_id"`
-	Type                            string            `json:"type"`
-	Title                           string            `json:"title"`
-	Year                            int               `json:"year,omitempty"`
-	Overview                        string            `json:"overview,omitempty"`
-	EffectiveSubtitleLanguage       string            `json:"-"`
-	HasEffectiveSubtitleLang        bool              `json:"-"`
-	EffectiveSubtitleMode           string            `json:"-"`
-	HasEffectiveSubtitleMode        bool              `json:"-"`
-	EffectiveShowForcedSubtitles    bool              `json:"-"`
-	HasEffectiveShowForcedSubtitles bool              `json:"-"`
-	Versions                        []FileVersion     `json:"versions"`
-	PlaybackVariants                []PlaybackVariant `json:"playback_variants,omitempty"`
-	VirtualRanking                  *VirtualRanking   `json:"virtual_ranking,omitempty"`
-	Subtitles                       []SubtitleInfo    `json:"subtitles"`
-	Intro                           *Marker           `json:"intro,omitempty"`
-	Credits                         *Marker           `json:"credits,omitempty"`
-	Recap                           *Marker           `json:"recap,omitempty"`
-	Preview                         *Marker           `json:"preview,omitempty"`
-	UserData                        *SeasonUserData   `json:"user_data,omitempty"`
-	SeriesID                        string            `json:"series_id,omitempty"`
-	SeriesTitle                     string            `json:"series_title,omitempty"`
-	// EpisodeLabels and AirDate label an episode of a date-labeled series.
-	EpisodeLabels                   string                            `json:"-"`
-	AirDate                         string                            `json:"-"`
+	ContentID                       string                            `json:"content_id"`
+	Type                            string                            `json:"type"`
+	Title                           string                            `json:"title"`
+	Year                            int                               `json:"year,omitempty"`
+	Overview                        string                            `json:"overview,omitempty"`
+	EffectiveSubtitleLanguage       string                            `json:"-"`
+	HasEffectiveSubtitleLang        bool                              `json:"-"`
+	EffectiveSubtitleMode           string                            `json:"-"`
+	HasEffectiveSubtitleMode        bool                              `json:"-"`
+	EffectiveShowForcedSubtitles    bool                              `json:"-"`
+	HasEffectiveShowForcedSubtitles bool                              `json:"-"`
+	Versions                        []FileVersion                     `json:"versions"`
+	PlaybackVariants                []PlaybackVariant                 `json:"playback_variants,omitempty"`
+	VirtualRanking                  *VirtualRanking                   `json:"virtual_ranking,omitempty"`
+	Subtitles                       []SubtitleInfo                    `json:"subtitles"`
+	Intro                           *Marker                           `json:"intro,omitempty"`
+	Credits                         *Marker                           `json:"credits,omitempty"`
+	Recap                           *Marker                           `json:"recap,omitempty"`
+	Preview                         *Marker                           `json:"preview,omitempty"`
+	UserData                        *SeasonUserData                   `json:"user_data,omitempty"`
+	SeriesID                        string                            `json:"series_id,omitempty"`
+	SeriesTitle                     string                            `json:"series_title,omitempty"`
 	SeasonNumber                    int                               `json:"season_number,omitempty"`
 	EpisodeNumber                   int                               `json:"episode_number,omitempty"`
 	EffectiveSubtitleTrackSignature *userstore.SubtitleTrackSignature `json:"effective_subtitle_track_signature,omitempty"`
@@ -6420,33 +6414,4 @@ func appendLibraryAudiobookAccessConditions(
 	}
 	ApplySectionAccessFilter(alias, AccessFilter{MaturityLimits: filter.MaturityLimits}, conditions, args, argIdx)
 	return true
-}
-
-type ItemVersionsOptions struct {
-	// HideFileIdentity strips file identity for a viewer who may not see it
-	// (see HideFileIdentity).
-	HideFileIdentity bool
-}
-
-// GetItemVersionsWithOptions is GetItemVersions with the caller's
-// file-identity choice. The fork's version list is built by GetItemVersions;
-// identity is stripped afterwards for a viewer who may not see it.
-func (s *DetailService) GetItemVersionsWithOptions(ctx context.Context, contentID string, filter AccessFilter, opts ItemVersionsOptions) ([]FileVersion, error) {
-	versions, err := s.GetItemVersions(ctx, contentID, filter)
-	if err != nil || !opts.HideFileIdentity {
-		return versions, err
-	}
-	itemType := ""
-	if target, terr := s.resolveDetailTarget(ctx, contentID, filter); terr == nil {
-		switch {
-		case target.item != nil:
-			itemType = target.item.Type
-		case target.episode != nil:
-			itemType = "episode"
-		case target.season != nil:
-			itemType = "season"
-		}
-	}
-	HideFileIdentity(versions, itemType)
-	return versions, nil
 }

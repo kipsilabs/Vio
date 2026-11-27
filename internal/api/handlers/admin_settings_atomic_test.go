@@ -2,6 +2,9 @@ package handlers
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -106,49 +109,48 @@ func cloneSettings(values map[string]string) map[string]string {
 	return cloned
 }
 
-// raceSaves runs two saves at once and reports how many were accepted and how
-// many refused as invalid.
-func raceSaves(t *testing.T, saves ...func() error) (accepted, refused int) {
-	t.Helper()
-	start := make(chan struct{})
-	results := make(chan error, len(saves))
-	for _, save := range saves {
-		go func() {
-			<-start
-			results <- save()
-		}()
-	}
-	close(start)
-	for range saves {
-		switch err := <-results; adminErrorStatus(err) {
-		case 200:
-			accepted++
-		case 400:
-			refused++
-		default:
-			t.Fatalf("unexpected result: %v", err)
-		}
-	}
-	return accepted, refused
-}
-
-// Two saves that are each valid but invalid together run one at a time, so
-// the second sees the first and is refused.
 func TestAdminSettingsAtomicUpdateSerializesCrossFieldValidation(t *testing.T) {
 	store := newSerializedSettingsStore(map[string]string{
 		"auth.access_token_expiry":  "8h",
 		"auth.refresh_token_expiry": "30d",
 	})
 	handler := &AdminHandler{SettingsRepo: store}
+	start := make(chan struct{})
+	responses := make(chan *httptest.ResponseRecorder, 2)
 
-	accepted, refused := raceSaves(t,
-		func() error { return saveAdminSetting(t, handler, "auth.access_token_expiry", "48h", false) },
-		func() error { return saveAdminSetting(t, handler, "auth.refresh_token_expiry", "24h", false) },
-	)
-	if accepted != 1 || refused != 1 {
-		t.Fatalf("accepted %d refused %d, want one of each", accepted, refused)
+	run := func(body string) {
+		<-start
+		req := httptest.NewRequest(http.MethodPut, "/admin/settings", strings.NewReader(body))
+		rec := httptest.NewRecorder()
+		handler.HandleUpdateSettings(rec, req)
+		responses <- rec
 	}
-	current, _ := store.GetAll(t.Context())
+	go run(`{"values":{"auth.access_token_expiry":"48h"}}`)
+	go run(`{"values":{"auth.refresh_token_expiry":"24h"}}`)
+	close(start)
+
+	first := <-responses
+	second := <-responses
+	okCount := 0
+	badRequestCount := 0
+	for _, response := range []*httptest.ResponseRecorder{first, second} {
+		switch response.Code {
+		case http.StatusOK:
+			okCount++
+		case http.StatusBadRequest:
+			badRequestCount++
+		default:
+			t.Fatalf("unexpected status = %d body=%s", response.Code, response.Body.String())
+		}
+	}
+	if okCount != 1 || badRequestCount != 1 {
+		t.Fatalf("statuses = [%d, %d], want one 200 and one 400", first.Code, second.Code)
+	}
+
+	current, err := store.GetAll(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := validateProspectiveAdminSettings(current, false); err != nil {
 		t.Fatalf("serialized final settings are invalid: %v; values=%#v", err, current)
 	}
@@ -163,25 +165,61 @@ func TestAdminSingleRoutingUpdatesSerializeCrossFieldValidation(t *testing.T) {
 		executionKey string
 		egressKey    string
 	}{
-		{"remux", config.PlaybackRoutingRemuxExecutionSettingKey, config.PlaybackRoutingRemuxEgressSettingKey},
-		{"video transcode", config.PlaybackRoutingVideoTranscodeExecutionSettingKey, config.PlaybackRoutingVideoTranscodeEgressSettingKey},
+		{
+			name:         "remux",
+			executionKey: config.PlaybackRoutingRemuxExecutionSettingKey,
+			egressKey:    config.PlaybackRoutingRemuxEgressSettingKey,
+		},
+		{
+			name:         "video transcode",
+			executionKey: config.PlaybackRoutingVideoTranscodeExecutionSettingKey,
+			egressKey:    config.PlaybackRoutingVideoTranscodeEgressSettingKey,
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			store := newSerializedSettingsStore(map[string]string{})
 			handler := &AdminHandler{SettingsRepo: store}
+			start := make(chan struct{})
+			responses := make(chan *httptest.ResponseRecorder, 2)
 
-			accepted, refused := raceSaves(t,
-				func() error {
-					return saveAdminSetting(t, handler, test.executionKey, string(config.PlaybackExecutionAPIOnly), true)
-				},
-				func() error {
-					return saveAdminSetting(t, handler, test.egressKey, string(config.PlaybackEgressProxyOnly), true)
-				},
-			)
-			if accepted != 1 || refused != 1 {
-				t.Fatalf("accepted %d refused %d, want one of each", accepted, refused)
+			run := func(key, value string) {
+				<-start
+				request := httptest.NewRequest(
+					http.MethodPut,
+					"/admin/settings/"+key,
+					strings.NewReader(`{"value":"`+value+`"}`),
+				)
+				request = withChiParam(request, "key", key)
+				recorder := httptest.NewRecorder()
+				handler.HandleUpdateSetting(recorder, request)
+				responses <- recorder
 			}
-			current, _ := store.GetAll(t.Context())
+			go run(test.executionKey, string(config.PlaybackExecutionAPIOnly))
+			go run(test.egressKey, string(config.PlaybackEgressProxyOnly))
+			close(start)
+
+			first := <-responses
+			second := <-responses
+			okCount := 0
+			badRequestCount := 0
+			for _, response := range []*httptest.ResponseRecorder{first, second} {
+				switch response.Code {
+				case http.StatusOK:
+					okCount++
+				case http.StatusBadRequest:
+					badRequestCount++
+				default:
+					t.Fatalf("unexpected status = %d body=%s", response.Code, response.Body.String())
+				}
+			}
+			if okCount != 1 || badRequestCount != 1 {
+				t.Fatalf("statuses = [%d, %d], want one 200 and one 400", first.Code, second.Code)
+			}
+
+			current, err := store.GetAll(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
 			if _, err := config.LoadFromDB(current); err != nil {
 				t.Fatalf("serialized routing settings are restart-invalid: %v; values=%#v", err, current)
 			}
@@ -192,18 +230,42 @@ func TestAdminSingleRoutingUpdatesSerializeCrossFieldValidation(t *testing.T) {
 	}
 }
 
-// The batch and single-key writes share one atomic boundary and never write
-// around it.
-func TestAdminSettingsWritesShareAtomicBoundary(t *testing.T) {
+func TestAdminLegacySingleUpdateUsesAtomicSettingsBoundary(t *testing.T) {
 	store := newSerializedSettingsStore(map[string]string{})
 	handler := &AdminHandler{SettingsRepo: store}
+	start := make(chan struct{})
+	responses := make(chan *httptest.ResponseRecorder, 2)
 
-	accepted, _ := raceSaves(t,
-		func() error { return saveAdminSetting(t, handler, "branding.server_name", "Casa", false) },
-		func() error { return saveAdminSetting(t, handler, "server.log_level", "debug", true) },
-	)
-	if accepted != 2 {
-		t.Fatalf("accepted %d, want both", accepted)
+	go func() {
+		<-start
+		req := httptest.NewRequest(
+			http.MethodPut,
+			"/admin/settings",
+			strings.NewReader(`{"values":{"branding.server_name":"Casa"}}`),
+		)
+		rec := httptest.NewRecorder()
+		handler.HandleUpdateSettings(rec, req)
+		responses <- rec
+	}()
+	go func() {
+		<-start
+		req := httptest.NewRequest(
+			http.MethodPut,
+			"/admin/settings/server.log_level",
+			strings.NewReader(`{"value":"debug"}`),
+		)
+		req = withChiParam(req, "key", "server.log_level")
+		rec := httptest.NewRecorder()
+		handler.HandleUpdateSetting(rec, req)
+		responses <- rec
+	}()
+	close(start)
+
+	for range 2 {
+		response := <-responses
+		if response.Code != http.StatusOK {
+			t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+		}
 	}
 	if store.atomicCalls != 2 || store.maxActive != 1 {
 		t.Fatalf("atomic calls=%d max active=%d, want 2 and 1", store.atomicCalls, store.maxActive)
@@ -213,8 +275,6 @@ func TestAdminSettingsWritesShareAtomicBoundary(t *testing.T) {
 	}
 }
 
-// Clearing redis.url and moving rate limiting onto Redis are each valid
-// alone; the rate-limit write shares the settings boundary, so one is refused.
 func TestRateLimitAndAdminRedisUpdatesShareAtomicBoundary(t *testing.T) {
 	store := newSerializedSettingsStore(map[string]string{
 		"ratelimit.backend": "memory",
@@ -222,18 +282,55 @@ func TestRateLimitAndAdminRedisUpdatesShareAtomicBoundary(t *testing.T) {
 	})
 	adminHandler := &AdminHandler{SettingsRepo: store}
 	rateLimitHandler := NewRateLimitHandler(store, nil, nil, NewServerRestartStatusTracker())
+	start := make(chan struct{})
+	responses := make(chan *httptest.ResponseRecorder, 2)
 
-	accepted, refused := raceSaves(t,
-		func() error { return saveAdminSetting(t, adminHandler, "redis.url", "", false) },
-		func() error {
-			_, err := rateLimitHandler.UpdateAdminRateLimitConfig(t.Context(), AdminRateLimitUpdate{Backend: "redis"}, nil)
-			return err
-		},
-	)
-	if accepted != 1 || refused != 1 {
-		t.Fatalf("accepted %d refused %d, want one of each", accepted, refused)
+	go func() {
+		<-start
+		req := httptest.NewRequest(
+			http.MethodPut,
+			"/admin/settings",
+			strings.NewReader(`{"values":{"redis.url":""}}`),
+		)
+		rec := httptest.NewRecorder()
+		adminHandler.HandleUpdateSettings(rec, req)
+		responses <- rec
+	}()
+	go func() {
+		<-start
+		req := httptest.NewRequest(
+			http.MethodPut,
+			"/admin/rate-limits/config",
+			strings.NewReader(`{"backend":"redis"}`),
+		)
+		rec := httptest.NewRecorder()
+		rateLimitHandler.HandleUpdateConfig(rec, req)
+		responses <- rec
+	}()
+	close(start)
+
+	first := <-responses
+	second := <-responses
+	okCount := 0
+	badRequestCount := 0
+	for _, response := range []*httptest.ResponseRecorder{first, second} {
+		switch response.Code {
+		case http.StatusOK:
+			okCount++
+		case http.StatusBadRequest:
+			badRequestCount++
+		default:
+			t.Fatalf("unexpected status = %d body=%s", response.Code, response.Body.String())
+		}
 	}
-	current, _ := store.GetAll(t.Context())
+	if okCount != 1 || badRequestCount != 1 {
+		t.Fatalf("statuses = [%d, %d], want one 200 and one 400", first.Code, second.Code)
+	}
+
+	current, err := store.GetAll(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := config.ValidateRedisRateLimitTransport(current, false); err != nil {
 		t.Fatalf("serialized final Redis transport is invalid: %v; values=%#v", err, current)
 	}
@@ -242,12 +339,28 @@ func TestRateLimitAndAdminRedisUpdatesShareAtomicBoundary(t *testing.T) {
 func TestAdminSettingsWritesFailClosedWithoutAtomicCapability(t *testing.T) {
 	store := &nonAtomicSettingsStore{values: map[string]string{}}
 
-	if err := saveAdminSetting(t, &AdminHandler{SettingsRepo: store}, "branding.server_name", "Casa", false); adminErrorStatus(err) != 500 {
-		t.Fatalf("settings save on a non-atomic store: %v, want 500", err)
+	adminHandler := &AdminHandler{SettingsRepo: store}
+	adminReq := httptest.NewRequest(
+		http.MethodPut,
+		"/admin/settings",
+		strings.NewReader(`{"values":{"branding.server_name":"Casa"}}`),
+	)
+	adminRec := httptest.NewRecorder()
+	adminHandler.HandleUpdateSettings(adminRec, adminReq)
+	if adminRec.Code != http.StatusInternalServerError {
+		t.Fatalf("Admin status = %d, want 500; body=%s", adminRec.Code, adminRec.Body.String())
 	}
+
 	rateLimitHandler := NewRateLimitHandler(store, nil, nil, NewServerRestartStatusTracker())
-	if _, err := rateLimitHandler.UpdateAdminRateLimitConfig(t.Context(), AdminRateLimitUpdate{Enabled: new(false)}, nil); adminErrorStatus(err) != 500 {
-		t.Fatalf("rate-limit save on a non-atomic store: %v, want 500", err)
+	rateReq := httptest.NewRequest(
+		http.MethodPut,
+		"/admin/rate-limits/config",
+		strings.NewReader(`{"enabled":false}`),
+	)
+	rateRec := httptest.NewRecorder()
+	rateLimitHandler.HandleUpdateConfig(rateRec, rateReq)
+	if rateRec.Code != http.StatusInternalServerError {
+		t.Fatalf("rate-limit status = %d, want 500; body=%s", rateRec.Code, rateRec.Body.String())
 	}
 	if len(store.values) != 0 {
 		t.Fatalf("non-atomic store was mutated: %#v", store.values)

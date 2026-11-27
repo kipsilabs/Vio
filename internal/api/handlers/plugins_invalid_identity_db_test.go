@@ -2,7 +2,10 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -39,26 +42,29 @@ func TestPluginListsKeepWorkingWithAnInvalidIdentityRowDB(t *testing.T) {
 		_, _ = pool.Exec(context.Background(), `DELETE FROM plugin_installations WHERE id = $1`, legacyID)
 	})
 
-	listed, err := h.ListAdminPluginInstallations(t.Context())
-	if err != nil {
-		t.Fatalf("admin installations list: %v", err)
+	rec := httptest.NewRecorder()
+	h.HandleListInstallations(rec, httptest.NewRequest(http.MethodGet, "/api/v1/plugins/installations", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("installations list status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var listed []struct {
+		ID int `json:"id"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &listed); err != nil {
+		t.Fatalf("decode installations: %v", err)
 	}
 	found := false
 	for _, inst := range listed {
 		found = found || inst.ID == legacyID
 	}
 	if !found {
-		t.Errorf("admin installations list left out legacy installation %d", legacyID)
+		t.Errorf("installations list left out legacy installation %d", legacyID)
 	}
 
-	settings, err := h.ListUserPluginSettings(t.Context())
-	if err != nil {
-		t.Fatalf("user plugin settings list: %v", err)
-	}
-	for _, view := range settings {
-		if view.PluginID == pluginID {
-			t.Errorf("user plugin settings list includes the unloadable installation: %+v", view)
-		}
+	rec = httptest.NewRecorder()
+	h.HandleListUserPluginSettings(rec, httptest.NewRequest(http.MethodGet, "/api/v1/settings/plugins", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("user settings list status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
 }
 

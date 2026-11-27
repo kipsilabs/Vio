@@ -48,7 +48,7 @@ func (s *DetailService) LocalizeSectionItems(ctx context.Context, items []*model
 		}
 	}
 
-	if len(episodeIDs) > 0 && s.episodeRepo != nil && s.episodeLocRepo != nil {
+	if len(episodeIDs) > 0 && s.episodeRepo != nil && s.episodeLocRepo != nil { //nolint:nestif // upstream LocalizeSectionItems in section_localization.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
 		episodes, err := s.episodeRepo.GetByIDs(ctx, episodeIDs)
 		if err != nil {
 			return localized, pending, err

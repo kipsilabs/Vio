@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -62,7 +63,7 @@ func letterBucketSQL(initial string) string {
 // straight to one.
 func (e *QueryExecutor) LetterIndex(ctx context.Context, def QueryDefinition, access AccessFilter) (LetterIndex, error) {
 	if e == nil || e.Pool == nil {
-		return LetterIndex{}, fmt.Errorf("query executor requires a database pool")
+		return LetterIndex{}, errors.New("query executor requires a database pool")
 	}
 	if e.GroupByWork {
 		return LetterIndex{}, fmt.Errorf("%w: the letter index does not group by work", ErrInvalidCatalogRequest)
@@ -188,7 +189,7 @@ func (p previewPagePlan) letterIndexSQL() (string, []any) {
 // jump to, so they are refused.
 func (r *CatalogResolver) LetterIndex(ctx context.Context, req CatalogRequest, access AccessFilter) (LetterIndex, error) {
 	if r == nil || r.itemRepo == nil {
-		return LetterIndex{}, fmt.Errorf("catalog resolver requires an item repository")
+		return LetterIndex{}, errors.New("catalog resolver requires an item repository")
 	}
 	if req.Source != CatalogSourceQuery {
 		return LetterIndex{}, fmt.Errorf("%w: the letter index covers source=query only", ErrInvalidCatalogRequest)

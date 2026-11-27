@@ -9,11 +9,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/gorilla/websocket"
-
 	"github.com/Silo-Server/silo-server/internal/access"
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
 	evt "github.com/Silo-Server/silo-server/internal/events"
+	"github.com/gorilla/websocket"
 )
 
 // Administrator log stream, v2 handshake.
@@ -123,7 +122,7 @@ func (h *AdminLogsSocketV2) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	validated, claims, err := h.Validate(r.Context(), identity)
 	if err != nil {
-		refuseSocketHandshake(w, err, "log stream authority expired")
+		http.Error(w, "log stream authority expired", http.StatusUnauthorized)
 		return
 	}
 	if claims.Role != eventsAdminRole {
@@ -134,15 +133,30 @@ func (h *AdminLogsSocketV2) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if identity.AccessExpiresAt.Before(deadline) {
 		deadline = identity.AccessExpiresAt
 	}
-	ctx, cancel := socketLifetime(validated, deadline)
-	defer cancel(nil)
-	go recheckSocketAuthority(ctx, cancel, h.checkInterval, func(checkCtx context.Context) error {
-		_, current, err := h.Validate(checkCtx, identity)
-		if err == nil && current.Role != eventsAdminRole {
-			err = errSocketAccessChanged
+	ctx, cancel := context.WithDeadline(validated, deadline)
+	defer cancel()
+	go func() {
+		interval := h.checkInterval
+		if interval <= 0 {
+			interval = eventsSessionCheckInterval
 		}
-		return err
-	})
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				checkCtx, stop := context.WithTimeout(ctx, 2*time.Second)
+				_, current, err := h.Validate(checkCtx, identity)
+				stop()
+				if err != nil || current.Role != eventsAdminRole {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
 	h.Logs.serveLogStream(w, r.WithContext(ctx), websocket.Upgrader{Subprotocols: []string{AdminLogsSocketProtocol}, EnableCompression: true, CheckOrigin: func(r *http.Request) bool {
 		return socketOriginAllowed(r, h.currentPublicOrigin(), overlayOriginsFrom(h.overlayOrigins.Load()))
 	}})

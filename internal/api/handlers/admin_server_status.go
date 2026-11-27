@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"math"
+	"net/http"
 	"slices"
 	"time"
 
@@ -82,6 +83,11 @@ type adminHealthComponent struct {
 // than a struct so it satisfies cache.TTLCache's comparable constraint without
 // a pointer indirection.
 type adminLogLevelCounts [2]int64
+
+// HandleGetServerStatus handles GET /admin/server/status.
+func (h *AdminHandler) HandleGetServerStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, h.ReadAdminServerStatus(r.Context()))
+}
 
 // collectHealth probes the backing services and reads the recent log tallies.
 // Every failure here is reported in the body, never as a status code: an

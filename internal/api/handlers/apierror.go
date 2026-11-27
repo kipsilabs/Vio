@@ -28,13 +28,24 @@ type APIError struct {
 // Unwrap exposes the cause to errors.Is.
 func (e *APIError) Unwrap() error { return e.cause }
 
-func (e *APIError) Error() string { return e.Code + ": " + e.Message }
-
-// WithCause records err as the error's cause, so a caller can branch on it
-// with errors.Is while the status, code and message stay as they are.
+// WithCause attaches the underlying error for the request log. The v1 and v2
+// renderers use only Status/Code/Message, so the cause never reaches the
+// response body.
 func (e *APIError) WithCause(err error) *APIError {
-	e.cause = err
+	if e != nil && err != nil && e.cause == nil {
+		e.cause = err
+	}
 	return e
+}
+
+func (e *APIError) Error() string {
+	if e == nil {
+		return "unknown error"
+	}
+	if e.cause != nil {
+		return e.Code + ": " + e.Message + ": " + e.cause.Error()
+	}
+	return e.Code + ": " + e.Message
 }
 
 func apiError(status int, code, message string) *APIError {

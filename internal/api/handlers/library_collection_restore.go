@@ -25,7 +25,7 @@ func (h *LibraryCollectionHandler) TemplateCollectionDefaults(bundleID, template
 	if !found || !templateEligibleForLibrary(tmpl, &models.MediaFolder{Type: libraryType}) {
 		return "", catalog.CreateLibraryCollectionInput{}, false, false, nil
 	}
-	input, err = templateCollectionInput(bundleID, tmpl, libraryID, templateBundleManagementKey(bundleID, templateID, libraryID))
+	input, err = templateCollectionInput(bundleID, tmpl, libraryID, templateBundleManagementKey(bundleID, templateID, libraryID), true)
 	if err != nil {
 		return "", catalog.CreateLibraryCollectionInput{}, false, false, err
 	}
@@ -117,7 +117,7 @@ func (h *SectionHandler) CheckRestoredSection(sectionType, scope string, library
 	if msg, ok := validateSectionScope(scope, libraryID); !ok {
 		return errors.New(msg)
 	}
-	if msg, ok := validateSectionConfig(sections.SectionType(sectionType), config); !ok {
+	if msg, ok := validateSectionConfig(sections.SectionType(sectionType), config, false); !ok {
 		return errors.New(msg)
 	}
 	if msg, ok := validateRecipeConfig(sections.SectionType(sectionType), config); !ok {

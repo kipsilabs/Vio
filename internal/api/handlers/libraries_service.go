@@ -19,7 +19,6 @@ import (
 	"github.com/Silo-Server/silo-server/internal/ctxerr"
 	"github.com/Silo-Server/silo-server/internal/metadata"
 	"github.com/Silo-Server/silo-server/internal/models"
-	"github.com/Silo-Server/silo-server/internal/notifications"
 	"github.com/Silo-Server/silo-server/internal/scantrigger"
 	"github.com/Silo-Server/silo-server/internal/sections"
 )
@@ -319,7 +318,7 @@ func (h *LibraryHandler) UpdateLibrary(ctx context.Context, id, userID int, req 
 		return LibraryView{}, err
 	}
 
-	enabledChanged, err := h.folderRepo.Update(ctx, id, catalog.UpdateFolderInput{
+	_, err = h.folderRepo.Update(ctx, id, catalog.UpdateFolderInput{
 		Paths:                    req.Paths,
 		Type:                     req.Type,
 		Name:                     req.Name,
@@ -344,11 +343,6 @@ func (h *LibraryHandler) UpdateLibrary(ctx context.Context, id, userID int, req 
 		}
 		slog.ErrorContext(ctx, "updating library", "component", "api", "error", err)
 		return LibraryView{}, apiError(http.StatusInternalServerError, "internal_error", "Failed to update library")
-	}
-	// Publish before the read below: a failed read still answers 500, and a
-	// retry would find nothing left to change.
-	if enabledChanged {
-		h.publishLibraryEnabledChanged(ctx, id, *req.Enabled)
 	}
 	h.pokeRealtimeMonitor()
 	if req.affectsTrickplay() {
@@ -413,26 +407,6 @@ func (h *LibraryHandler) UpdateLibrary(ctx context.Context, id, userID int, req 
 	}
 
 	return h.toLibraryResponseWithPoster(ctx, folder), nil
-}
-
-// publishLibraryEnabledChanged tells administrator catalog subscribers that turning the
-// library on or off changed which items the admin listing returns.
-func (h *LibraryHandler) publishLibraryEnabledChanged(ctx context.Context, libraryID int, enabled bool) {
-	if h.RealtimeHub == nil {
-		return
-	}
-	reason := "library_disabled"
-	if enabled {
-		reason = "library_enabled"
-	}
-	if err := h.RealtimeHub.PublishCatalogLibraryChanged(ctx, notifications.LibraryChangeEvent{
-		LibraryID: libraryID,
-		Reason:    reason,
-		// The listing this tells mirrors to re-read is administrator-only.
-		AdminOnly: true,
-	}); err != nil {
-		slog.WarnContext(ctx, "publish library enabled change", "component", "api", "library_id", libraryID, "error", err)
-	}
 }
 
 // DeleteLibrary disables the library, queues its deletion job and cancels
@@ -1004,10 +978,6 @@ func (h *LibraryHandler) ListUnmatchedItems(ctx context.Context, search string, 
 		return nil, 0, apiError(http.StatusInternalServerError, "internal_error", "Database not configured")
 	}
 	search = strings.TrimSpace(search)
-	// Audiobooks keep media_items.status empty; one with no provider match
-	// after enrichment lists as unmatched.
-	unmatchedWhere := `(mi.status IN ('unmatched', 'pending', 'ambiguous') OR (` + catalog.AudiobookUnmatchedWhere("mi") + `))`
-	const unmatchedStatusSQL = `CASE WHEN mi.status IN ('unmatched', 'pending', 'ambiguous') THEN mi.status ELSE 'unmatched' END`
 	filter := ""
 	filterArgs := []any{}
 	if search != "" {
@@ -1015,7 +985,7 @@ func (h *LibraryHandler) ListUnmatchedItems(ctx context.Context, search string, 
 		filter = ` AND (
 			mi.title ILIKE $1
 			OR mi.type ILIKE $1
-			OR ` + unmatchedStatusSQL + ` ILIKE $1
+			OR mi.status ILIKE $1
 			OR EXISTS (
 				SELECT 1
 				FROM media_item_libraries search_mil
@@ -1037,7 +1007,7 @@ func (h *LibraryHandler) ListUnmatchedItems(ctx context.Context, search string, 
 	countSQL := `
 		SELECT COUNT(*)
 		FROM media_items mi
-		WHERE ` + unmatchedWhere + guards
+		WHERE mi.status IN ('unmatched', 'pending', 'ambiguous')` + guards
 	countSQL += filter
 
 	var total int
@@ -1048,7 +1018,7 @@ func (h *LibraryHandler) ListUnmatchedItems(ctx context.Context, search string, 
 
 	listArgs := append(append([]any{}, filterArgs...), limit, offset)
 	listSQL := fmt.Sprintf(`
-		SELECT mi.content_id, mi.title, mi.year, mi.type, %s,
+		SELECT mi.content_id, mi.title, mi.year, mi.type, mi.status,
 		       COALESCE(lib.folder_id, 0),
 		       COALESCE(lib.folder_name, ''),
 		       mi.match_ignored_at
@@ -1060,10 +1030,10 @@ func (h *LibraryHandler) ListUnmatchedItems(ctx context.Context, search string, 
 			WHERE mil.content_id = mi.content_id
 			LIMIT 1
 		) lib ON true
-		WHERE %s%s%s
+		WHERE mi.status IN ('unmatched', 'pending', 'ambiguous')%s%s
 		ORDER BY mi.title ASC, mi.content_id ASC
 		LIMIT $%d OFFSET $%d
-	`, unmatchedStatusSQL, unmatchedWhere, guards, filter, len(filterArgs)+1, len(filterArgs)+2)
+	`, guards, filter, len(filterArgs)+1, len(filterArgs)+2)
 
 	rows, err := h.pool.Query(ctx, listSQL, listArgs...)
 	if err != nil {
@@ -1203,7 +1173,7 @@ func (h *LibraryHandler) requeueItemMatchWork(ctx context.Context, contentID str
 			}
 		}
 	}
-	if h.SeriesMatchQueueRepo != nil {
+	if h.SeriesMatchQueueRepo != nil { //nolint:nestif // requeueItemMatchWork exceeds Vio's nestif complexity-4 limit; refactor tracked separately
 		for _, root := range roots {
 			if err := h.SeriesMatchQueueRepo.EnqueueSeriesRoot(ctx, root.folderID, root.path); err != nil {
 				slog.WarnContext(ctx, "requeueing series match work", "component", "api", "content_id", contentID, "library_id", root.folderID, "error", err)
@@ -1663,6 +1633,13 @@ func normalizeLibraryPaths(paths []string) ([]string, error) {
 		path = strings.TrimSpace(path)
 		if path == "" {
 			return nil, fieldError("paths", "Library paths must not be blank")
+		}
+		// filepath.Clean collapses "//" in a scheme, but virtual roots are
+		// opaque provider URIs: the scanner and rootcheck match on the
+		// "virtual://" prefix, so trimming is the only normalization allowed.
+		if strings.HasPrefix(strings.ToLower(path), "virtual://") {
+			normalized[i] = path
+			continue
 		}
 		normalized[i] = filepath.Clean(path)
 	}

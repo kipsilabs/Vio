@@ -92,7 +92,7 @@ func (f *ContinueWatchingProgressFilter) SupersededEpisodeProgressIDsCached(ctx 
 	// done_progress.updated_at > ip_progress.updated_at). So the only completed
 	// rows that can matter are those updated after the oldest in-progress entry;
 	// anything older can supersede nothing. Bounding the completed walk at that
-	// timestamp keeps import-heavy profiles — whose entire back-catalogue is
+	// timestamp keeps import-heavy profiles — whose entire back-catalog is
 	// completed=TRUE with old timestamps — from re-paging hundreds of thousands
 	// of irrelevant rows on every Resume/Continue Watching load (the 60–116s
 	// tail in the 2026-07-06 slow-query comparison). Only episodes can be

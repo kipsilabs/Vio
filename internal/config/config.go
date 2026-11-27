@@ -242,11 +242,14 @@ func (c MatcherConfig) TVSeriesRootQueueEnabled() bool {
 type PlaybackConfig struct {
 	// SoftwareFallback is the fork's flag that lets a hardware transcode start
 	// fall back to software when the hardware encoder fails.
-	SoftwareFallback        string `yaml:"software_fallback"`
-	FFmpegPath              string `yaml:"ffmpeg_path"`
-	TranscodeDir            string `yaml:"transcode_dir"`
-	SegmentRetentionSeconds int    `yaml:"segment_retention_seconds"`
-	HWAccel                 string `yaml:"hw_accel"`
+	SoftwareFallback string `yaml:"software_fallback"`
+	// MaxVirtualFailoverAttempts bounds how many alternate virtual sources a
+	// start may rotate through before it fails.
+	MaxVirtualFailoverAttempts int    `yaml:"max_virtual_failover_attempts"`
+	FFmpegPath                 string `yaml:"ffmpeg_path"`
+	TranscodeDir               string `yaml:"transcode_dir"`
+	SegmentRetentionSeconds    int    `yaml:"segment_retention_seconds"`
+	HWAccel                    string `yaml:"hw_accel"`
 	// HWDevice is the GPU render device for hardware transcodes. A single
 	// path pins every GPU workload to that device; a comma-separated list
 	// (e.g. "/dev/dri/renderD128,/dev/dri/renderD129") balances workloads
@@ -702,6 +705,7 @@ func setDefaults() *configRaw {
 			SegmentRetentionSeconds:      600,
 			HWAccel:                      "auto",
 			SoftwareFallback:             "allow",
+			MaxVirtualFailoverAttempts:   5,
 			ChapterThumbnailWorkers:      1,
 			ChapterThumbnailExecution:    "local",
 			ChapterThumbnailNodeCapacity: 1,

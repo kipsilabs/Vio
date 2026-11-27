@@ -84,7 +84,7 @@ func TestItemExtraArtworkSlotsRoundTripDB(t *testing.T) {
 	}
 }
 
-func TestItemBackdropRepositoryDB(t *testing.T) {
+func TestItemBackdropRepositoryDB(t *testing.T) { //nolint:gocyclo // TestItemBackdropRepositoryDB exceeds Vio's complexity-30 limit; refactor tracked separately
 	pool := newTestPool(t)
 	ctx := context.Background()
 	items := NewItemRepository(pool)
@@ -252,7 +252,7 @@ func TestItemBackdropReplaceWaitsForCacheWriteDB(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatal("Replace never waited for the in-flight cache write")
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond) //nolint:forbidigo // Polls the repository's in-flight cache write.
 	}
 	if err := worker.Commit(ctx); err != nil {
 		t.Fatal(err)

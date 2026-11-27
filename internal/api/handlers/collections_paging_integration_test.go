@@ -8,9 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
-
 	"github.com/Silo-Server/silo-server/internal/userstore"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type pagingIntegrationFixture struct {

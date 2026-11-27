@@ -662,3 +662,6 @@ func newID() (string, error) {
 	}
 	return hex.EncodeToString(b[:]), nil
 }
+
+// MaxChunkSize is the largest upload chunk a client may send.
+func (m *Manager) MaxChunkSize() int64 { return m.maxChunkSize }

@@ -14,7 +14,7 @@ import (
 // order, and follow the season/episode order in the requested direction. The
 // titles sort alphabetically in neither episode order, and the series IDs sort
 // opposite to the series titles, so neither fallback can pass by accident.
-func TestQueryEpisodeAirDateTiesPostgres(t *testing.T) {
+func TestQueryEpisodeAirDateTiesPostgres(t *testing.T) { //nolint:funlen // upstream TestQueryEpisodeAirDateTiesPostgres exceeds Vio's 100-line limit; refactor tracked separately
 	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("SILO_TEST_DATABASE_URL is not set")

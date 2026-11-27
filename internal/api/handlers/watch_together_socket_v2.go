@@ -3,19 +3,17 @@ package handlers
 import (
 	"context"
 	"encoding/base64"
-	"errors"
 	"net/http"
 	"strings"
 	"sync/atomic"
 	"time"
 
-	"github.com/go-chi/chi/v5"
-	"github.com/gorilla/websocket"
-
 	"github.com/Silo-Server/silo-server/internal/access"
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
 	evt "github.com/Silo-Server/silo-server/internal/events"
 	"github.com/Silo-Server/silo-server/internal/watchtogether"
+	"github.com/go-chi/chi/v5"
+	"github.com/gorilla/websocket"
 )
 
 type roomSocketTickets interface {
@@ -47,9 +45,6 @@ func (h *WatchTogetherSocketV2) MintRoomSocket(ctx context.Context, roomID, proo
 		return "", time.Time{}, apiError(403, "forbidden", "Room proof is required")
 	}
 	validated, effective, err := h.Validate(ctx, identity)
-	if errors.Is(err, evt.ErrSocketAuthorityUnavailable) {
-		return "", time.Time{}, err
-	}
 	if err != nil {
 		return "", time.Time{}, apiError(403, "forbidden", "Current room authority is required")
 	}
@@ -117,7 +112,7 @@ func (h *WatchTogetherSocketV2) ServeHTTP(w http.ResponseWriter, r *http.Request
 	}
 	validated, claims, err := h.Validate(r.Context(), credential.Session)
 	if err != nil {
-		refuseSocketHandshake(w, err, "room authority expired")
+		http.Error(w, "room authority expired", http.StatusUnauthorized)
 		return
 	}
 	if _, err = h.Room.Service.GetRoom(validated, roomID); err != nil {
@@ -130,8 +125,8 @@ func (h *WatchTogetherSocketV2) ServeHTTP(w http.ResponseWriter, r *http.Request
 			deadline = limit
 		}
 	}
-	ctx, cancel := socketLifetime(validated, deadline)
-	defer cancel(nil)
+	ctx, cancel := context.WithDeadline(validated, deadline)
+	defer cancel()
 	upgrader := websocket.Upgrader{Subprotocols: []string{watchtogether.RoomSocketProtocol}, EnableCompression: true, CheckOrigin: func(r *http.Request) bool {
 		return socketOriginAllowed(r, h.currentPublicOrigin(), overlayOriginsFrom(h.overlayOrigins.Load()))
 	}}
@@ -139,20 +134,35 @@ func (h *WatchTogetherSocketV2) ServeHTTP(w http.ResponseWriter, r *http.Request
 	if err != nil {
 		return
 	}
-	closer := newSocketCloser(conn)
-	defer func() { closer.close(context.Cause(ctx)) }()
-	stopClose := closer.closeWhenDone(ctx)
+	defer func() { _ = conn.Close() }()
+	stopClose := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stopClose()
-	// A failed room read names no close code, so it ends the connection
-	// without a close frame.
-	go recheckSocketAuthority(ctx, cancel, h.checkInterval, func(checkCtx context.Context) error {
-		if _, _, err := h.Validate(checkCtx, credential.Session); err != nil {
-			return err
+	go func() {
+		interval := h.checkInterval
+		if interval <= 0 {
+			interval = eventsSessionCheckInterval
 		}
-		_, err := h.Room.Service.GetRoom(checkCtx, roomID)
-		return err
-	})
-	h.Room.serveRoomConnection(ctx, conn, roomID, claims.UserID, credential.Session.ProfileID, func() { closer.close(context.Cause(ctx)) })
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				checkCtx, stop := context.WithTimeout(ctx, 2*time.Second)
+				_, _, err := h.Validate(checkCtx, credential.Session)
+				if err == nil {
+					_, err = h.Room.Service.GetRoom(checkCtx, roomID)
+				}
+				stop()
+				if err != nil {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	h.Room.serveRoomConnection(ctx, conn, roomID, claims.UserID, credential.Session.ProfileID)
 }
 
 func (h *WatchTogetherSocketV2) currentPublicOrigin() string {

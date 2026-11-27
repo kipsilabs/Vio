@@ -26,6 +26,7 @@ const (
 	discordLinkExchangeFailed  = "exchange_failed"
 )
 
+const notificationDiscordCallbackV1 = "/api/v1/notifications/discord/link/callback"
 const notificationDiscordCallbackV2 = "/api/v2/notifications/discord/link/callback"
 
 type NotificationDiscordLinkBackend interface {
@@ -60,13 +61,21 @@ func (h *DiscordLinkHandler) SetPublicURL(publicURL string) {
 	normalized := strings.TrimRight(strings.TrimSpace(publicURL), "/")
 	h.publicOrigin.Store(&normalized)
 }
+func (h *DiscordNotificationsHandler) linkHandler() *DiscordLinkHandler {
+	var settings *notifications.Settings
+	if h.system != nil {
+		settings = h.system.Settings
+	}
+	return NewDiscordLinkHandler(h.system, settings, h.currentPublicURL())
+}
+
 func (h *DiscordLinkHandler) beginLink(ctx context.Context, userID int, callbackPath string) (string, error) {
 	if h.backend == nil || !h.backend.DiscordAvailable(ctx) {
 		return "", apiError(409, "not_configured", "Discord integration is not enabled by the administrator")
 	}
 	publicURL := h.currentPublicURL()
 	if publicURL == "" {
-		return "", apiError(409, "no_public_url", "Linking requires the Silo public URL to be configured")
+		return "", apiError(409, "no_public_url", "Linking requires the Vio public URL to be configured")
 	}
 	stateBytes := make([]byte, 32)
 	if _, err := rand.Read(stateBytes); err != nil {

@@ -61,7 +61,7 @@ func CheckDeploymentSettings(stored map[string]string, env config.EnvSettings, d
 	maps.Copy(prospective, normalized)
 
 	if artworkStorageLocked(stored) {
-		if err := rejectArtworkIdentityChange(stored[blobstore.IdentitySettingKey], "",
+		if err := rejectArtworkIdentityChange(stored[blobstore.IdentitySettingKey],
 			config.EffectiveAdminSettings(stored), config.EffectiveAdminSettings(prospective)); err != nil {
 			return nil, fmt.Errorf("%s would move storage that already holds data; set them to the recorded location or unset them, and move storage with a managed storage transition in Admin settings",
 				strings.Join(checked.VarsFor(storageLocationKeys), ", "))
