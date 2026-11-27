@@ -43761,7 +43761,7 @@ export interface operations {
         cursor?: string;
         limit?: number;
         q?: string;
-        status?: "" | "accepted" | "running" | "completed" | "failed" | "cancelled" | "cancelled";
+        status?: "" | "accepted" | "running" | "completed" | "failed" | "cancelled" | "canceled";
       };
       header?: {
         /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
@@ -98924,6 +98924,8 @@ export interface operations {
       cookie?: {
         /** @description Completion cookie the callback set in the browser it sent to the web completion page (HttpOnly, path-scoped to this operation, two minutes). The browser sends it by itself; a web code redeemed without it, or with another browser's, is 400 invalid_grant and stays redeemable. Native codes ignore it */
         silo_oauth_complete?: string;
+        /** @description Deprecated completion cookie name; accepted during the transition */
+        vio_oauth_complete?: string;
       };
     };
     requestBody: {

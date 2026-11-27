@@ -90,10 +90,12 @@ jobs:
             image_version="build-${build_number}"
           fi
 
-          echo "build_number=${build_number}" >> "$GITHUB_OUTPUT"
-          echo "built_at=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
-          echo "image_version=${image_version}" >> "$GITHUB_OUTPUT"
-          echo "is_stable=${is_stable}" >> "$GITHUB_OUTPUT"
+          {
+            echo "build_number=${build_number}"
+            echo "built_at=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "image_version=${image_version}"
+            echo "is_stable=${is_stable}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Checkout for manual frontend build
         if: github.event_name == 'workflow_dispatch' || github.event_name == 'release'

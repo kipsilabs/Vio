@@ -26,9 +26,10 @@ const (
 	StatusCompleted = "completed"
 	StatusFailed    = "failed"
 	StatusCancelled = "cancelled"
-	// StatusCancelledLegacy is the spelling older builds (and the fork's v2
-	// admin surface) use for the same terminal state.
-	StatusCancelledLegacy = StatusCancelled //nolint:misspell // legacy spelling
+	// StatusCancelledLegacy is the durable single-L spelling older builds
+	// wrote for a canceled run. The v2 admin surface keeps enumerating it so a
+	// client filtering by the old value still finds pre-change rows.
+	StatusCancelledLegacy = "canceled" //nolint:misspell // legacy column spelling
 
 	TriggerAdminItemRefresh    = "admin_item_refresh"
 	TriggerAdminLibraryRefresh = "admin_library_refresh"

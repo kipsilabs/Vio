@@ -68275,7 +68275,7 @@
                 "completed",
                 "failed",
                 "cancelled",
-                "cancelled"
+                "canceled"
               ],
               "type": "string"
             }
@@ -148418,6 +148418,15 @@
             "name": "silo_oauth_complete",
             "schema": {
               "description": "Completion cookie the callback set in the browser it sent to the web completion page (HttpOnly, path-scoped to this operation, two minutes). The browser sends it by itself; a web code redeemed without it, or with another browser's, is 400 invalid_grant and stays redeemable. Native codes ignore it",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Deprecated completion cookie name; accepted during the transition",
+            "in": "cookie",
+            "name": "vio_oauth_complete",
+            "schema": {
+              "description": "Deprecated completion cookie name; accepted during the transition",
               "type": "string"
             }
           }

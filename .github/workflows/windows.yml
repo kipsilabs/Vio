@@ -68,7 +68,11 @@ jobs:
             echo "::error::vips-cpp is not visible to pkg-config; the cgo build against libvips will fail."
             pkg-config --list-all 2>&1 | grep -i vips || echo "no vips entry in pkg-config --list-all"
             echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH"
-            ls /c/vips/lib 2>/dev/null || ls '/c/Program Files' | grep -i vips || true
+            ls /c/vips/lib 2>/dev/null || {
+              for d in '/c/Program Files'/*[Vv][Ii][Pp][Ss]*; do
+                [ -d "$d" ] && echo "$d"
+              done
+            } || true
             exit 1
           }
           vips --version || echo "vips binary not in PATH (library-only install is fine)"

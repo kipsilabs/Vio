@@ -56,6 +56,10 @@ type CompleteOAuthLoginInput struct {
 		CodeVerifier string `json:"code_verifier,omitempty" maxLength:"128" doc:"PKCE code verifier of the challenge a native start sent (RFC 7636: 43 to 128 unreserved characters). Required for a code from startNativeOAuthLogin, refused for a web code; either mismatch is 400 invalid_grant and leaves the code redeemable" example:"dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"`
 	}
 	Browser string `cookie:"silo_oauth_complete" doc:"Completion cookie the callback set in the browser it sent to the web completion page (HttpOnly, path-scoped to this operation, two minutes). The browser sends it by itself; a web code redeemed without it, or with another browser's, is 400 invalid_grant and stays redeemable. Native codes ignore it"`
+	// BrowserLegacy is the fork's earlier cookie name. It stays on the wire
+	// (additive-only contract) and is accepted while clients and servers roll
+	// forward together.
+	BrowserLegacy string `cookie:"vio_oauth_complete" doc:"Deprecated completion cookie name; accepted during the transition"`
 }
 
 // OAuthCompletion is the credential the code redeemed, plus where the
@@ -213,7 +217,11 @@ func (reg *Registry) completeOAuthLogin(ctx context.Context, in *CompleteOAuthLo
 	if reg.deps.OAuth == nil || reg.deps.Accounts == nil {
 		return nil, unavailable("oauth login")
 	}
-	c, err := reg.deps.OAuth.Complete(withClientDevice(ctx), in.Body.Code, in.Body.CodeVerifier, in.Browser)
+	browser := in.Browser
+	if browser == "" {
+		browser = in.BrowserLegacy
+	}
+	c, err := reg.deps.OAuth.Complete(withClientDevice(ctx), in.Body.Code, in.Body.CodeVerifier, browser)
 	if err != nil {
 		switch {
 		case errors.Is(err, auth.ErrOAuthCompletionUnavailable):
