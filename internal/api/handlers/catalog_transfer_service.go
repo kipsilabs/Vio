@@ -56,27 +56,29 @@ func (h *CatalogSeedHandler) ImportCatalog(ctx context.Context, source CatalogIm
 	if err := validateCatalogImportSelection(source); err != nil {
 		return nil, err
 	}
-	var data []byte
+	var data io.ReadCloser
 	var err error
 	switch {
 	case source.LocalPath != "":
-		data, err = readLocalImportFile(source.LocalPath)
+		data, err = openLocalImportFile(source.LocalPath)
 	case source.RemoteURL != "":
-		var bundle io.ReadCloser
-		bundle, err = catalogseed.DownloadRemoteBundle(ctx, source.RemoteURL)
-		if err == nil {
-			defer func() { _ = bundle.Close() }()
-			data, err = io.ReadAll(bundle)
-		}
+		data, err = catalogseed.DownloadRemoteBundle(ctx, source.RemoteURL)
 	case source.ArtifactKey != "":
-		data, err = h.readImportDataFromArtifactKey(ctx, source.ArtifactKey)
+		data, err = h.openImportDataFromArtifactKey(ctx, source.ArtifactKey)
 	default:
-		data, err = h.readImportDataFromExportJob(ctx, source.ExportJobID)
+		data, err = h.openImportDataFromExportJob(ctx, source.ExportJobID)
 	}
 	if err != nil {
 		return nil, catalogImportSourceProblem(err)
 	}
-	return h.service.Import(ctx, data, opts)
+	defer func() { _ = data.Close() }()
+	result, err := h.service.ImportReader(ctx, data, opts, nil)
+	if errors.Is(err, catalogseed.ErrReadingSource) {
+		// The source is read while the bundle decodes, so a source that
+		// fails partway is reported here rather than when it was opened.
+		return nil, catalogImportSourceProblem(err)
+	}
+	return result, err
 }
 
 func (h *CatalogSeedHandler) CreateCatalogImportJob(ctx context.Context, userID int, source CatalogImportSourceSelection, opts catalogseed.ImportOptions) (*models.AdminJob, error) {
@@ -99,9 +101,11 @@ func (h *CatalogSeedHandler) CreateCatalogImportJob(ctx context.Context, userID 
 		}
 		req.LocalPath, req.SourceLabel = path, filepath.Base(path)
 	case source.RemoteURL != "":
-		if _, err := catalogseed.DownloadRemoteBundle(ctx, source.RemoteURL); err != nil {
+		download, err := catalogseed.DownloadRemoteBundle(ctx, source.RemoteURL)
+		if err != nil {
 			return nil, catalogImportSourceProblem(err)
 		}
+		_ = download.Close()
 		req.RemoteURL, req.SourceLabel = source.RemoteURL, source.RemoteURL
 	case source.ArtifactKey != "":
 		if h.store == nil {
@@ -114,6 +118,7 @@ func (h *CatalogSeedHandler) CreateCatalogImportJob(ctx context.Context, userID 
 			return nil, catalogImportSourceProblem(err)
 		}
 		req.SourceBucket, req.SourceKey, req.SourceLabel = bucket, key, "Export job "+source.ExportJobID
+		req.SourceExportJobID = source.ExportJobID
 	}
 	job, err := h.jobRepo.Create(ctx, adminjob.CreateJobInput{JobType: adminjob.JobTypeCatalogImport, CreatedByUserID: userID, RequestPayload: req, Message: "Queued catalog import"})
 	if err == nil && h.RealtimeHub != nil {

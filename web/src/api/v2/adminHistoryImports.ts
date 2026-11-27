@@ -61,7 +61,7 @@ function mappingOf(m: MappingWire, etag: string): HistoryImportUserMapping {
     ...m,
     id: Number(m.id),
     source_id: Number(m.source_id),
-    vio_user_id: Number(m.vio_user_id),
+    silo_user_id: Number(m.silo_user_id),
     etag,
     created_at: "",
     updated_at: "",
@@ -196,7 +196,7 @@ export async function createAdminImportMapping(input: CreateHistoryImportMapping
   const body = {
     ...input,
     source_id: String(input.source_id),
-    vio_user_id: String(input.vio_user_id),
+    silo_user_id: String(input.silo_user_id),
   };
   const result = await v2("POST /api/v2/admin/history-imports/mappings", {
     body,
@@ -213,7 +213,7 @@ export async function updateAdminImportMapping(
   const h = headers();
   const body = {
     ...input,
-    vio_user_id: input.vio_user_id == null ? undefined : String(input.vio_user_id),
+    silo_user_id: input.silo_user_id == null ? undefined : String(input.silo_user_id),
   };
   const result = await v2("PUT /api/v2/admin/history-imports/mappings/{id}", {
     path: { id: String(id) },

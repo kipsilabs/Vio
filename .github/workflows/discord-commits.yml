@@ -7,7 +7,6 @@ on:
 
 jobs:
   notify:
-    if: github.repository == 'Silo-Server/silo-server'
     permissions:
       contents: read
     uses: ./.github/workflows/reusable-discord-commits.yml

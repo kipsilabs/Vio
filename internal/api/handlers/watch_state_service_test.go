@@ -3,13 +3,32 @@ package handlers
 import (
 	"context"
 	"testing"
-	"time"
 
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/userstore"
 	"github.com/Silo-Server/silo-server/internal/watchstate"
 	"github.com/Silo-Server/silo-server/internal/watchsync"
 )
+
+func TestRestoredVersionChoiceProjectsEditionWithoutOverwritingLocalFile(t *testing.T) {
+	choice := &userstore.SeriesPlaybackPreference{EditionKey: "extended_edition"}
+	aliases := catalog.EditionAliases{"extended_edition": "extended"}
+	data := applyVersionChoice(nil, choice)
+	var effective *string
+	applyEffectiveEditionPreference(data, &effective)
+	projectEditionPreference(aliases, data, &effective)
+	if data.LastFileID != nil || data.LastEditionKey == nil || *data.LastEditionKey != "extended" ||
+		effective == nil || *effective != "extended" || choice.EditionKey != "extended_edition" {
+		t.Fatalf("restored choice did not project to the current alias: data=%+v, effective=%v", data, effective)
+	}
+
+	local := &catalog.SeasonUserData{LastFileID: new(42), LastEditionKey: new("unrated")}
+	data = applyVersionChoice(local, choice)
+	if data.LastFileID == nil || *data.LastFileID != 42 || data.LastEditionKey == nil || *data.LastEditionKey != "unrated" {
+		t.Fatalf("remote choice displaced a local file: %+v", data)
+	}
+}
 
 type recordingWatchDispatcher struct {
 	events []watchsync.LocalWatchEvent
@@ -86,62 +105,4 @@ func (manualMarkIdentityFixture) GetByContentID(_ context.Context, id string) ([
 }
 func (manualMarkIdentityFixture) FindContentIDByProviderIDs(context.Context, map[string]string, string, string) (string, error) {
 	return "movie-1", nil
-}
-
-// selectionWarmRecorder records the pre-play work a detail read schedules.
-type selectionWarmRecorder struct {
-	probes []int
-	warms  []int
-}
-
-func (r *selectionWarmRecorder) ScheduleSelectedFileProbe(_ string, fileID int, _ catalog.AccessFilter) {
-	r.probes = append(r.probes, fileID)
-}
-
-func (r *selectionWarmRecorder) ScheduleSelectedFileWarm(_ string, fileID int, _ catalog.AccessFilter) {
-	r.warms = append(r.warms, fileID)
-}
-
-// TestScheduleSelectedVirtualProbeRepairsAStampedEmptyRow pins the selection
-// gate's repair shape: a row stamped with no tracks still needs its inventory
-// enumerated, because the stamp only says a probe ran — not that its evidence
-// was adopted. Production's four stamped-empty rows were never re-probed here,
-// so their menus stayed blank through every visit.
-func TestScheduleSelectedVirtualProbeRepairsAStampedEmptyRow(t *testing.T) {
-	probedAt := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
-	for _, tc := range []struct {
-		name      string
-		version   catalog.FileVersion
-		wantProbe bool
-	}{
-		{
-			name:      "stamped empty",
-			version:   catalog.FileVersion{FileID: 7, FilePath: "virtual://movie/tt0113277?result=a", ProbedAt: &probedAt},
-			wantProbe: true,
-		},
-		{
-			name: "stamped with tracks",
-			version: catalog.FileVersion{FileID: 8, FilePath: "virtual://movie/tt0113277?result=b", ProbedAt: &probedAt,
-				AudioTracks: []models.AudioTrack{{Index: 1, Codec: "ac3"}}},
-			wantProbe: false,
-		},
-		{
-			name:      "unstamped",
-			version:   catalog.FileVersion{FileID: 9, FilePath: "virtual://movie/tt0113277?result=c"},
-			wantProbe: true,
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			recorder := &selectionWarmRecorder{}
-			h := &ItemsHandler{virtualSelectionProber: recorder}
-			h.scheduleSelectedVirtualProbe("movie:tt0113277", itemTypeMovie, []catalog.FileVersion{tc.version},
-				catalog.AccessFilter{SelectedFileID: tc.version.FileID})
-			if got := len(recorder.probes) == 1; got != tc.wantProbe {
-				t.Fatalf("probe scheduled = %v, want %v (probes %v)", got, tc.wantProbe, recorder.probes)
-			}
-			if len(recorder.warms) != 1 {
-				t.Fatalf("warm scheduled %v times, want 1", len(recorder.warms))
-			}
-		})
-	}
 }

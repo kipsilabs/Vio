@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"reflect"
 	"regexp"
 	"strconv"
@@ -20,7 +21,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Silo-Server/silo-server/internal/catalog"
-	"github.com/Silo-Server/silo-server/internal/envutil"
 	"github.com/Silo-Server/silo-server/internal/metadata"
 	"github.com/Silo-Server/silo-server/internal/models"
 )
@@ -62,7 +62,7 @@ func mangaContentType() string {
 
 func mangaEnrichWorkers() int {
 	n := defaultEnrichWorkers
-	if v := envutil.GetenvFirst("VIO_MANGA_ENRICH_WORKERS", "SILO_MANGA_ENRICH_WORKERS"); v != "" {
+	if v := os.Getenv("SILO_MANGA_ENRICH_WORKERS"); v != "" {
 		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
 			n = parsed
 		}
@@ -74,7 +74,7 @@ func mangaEnrichWorkers() int {
 }
 
 func mangaEnrichBatchSize() int {
-	if v := envutil.GetenvFirst("VIO_MANGA_ENRICH_BATCH", "SILO_MANGA_ENRICH_BATCH"); v != "" {
+	if v := os.Getenv("SILO_MANGA_ENRICH_BATCH"); v != "" {
 		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
 			return parsed
 		}
@@ -236,7 +236,7 @@ func (e *Enricher) runBatch(
 						"title", item.Title,
 						"error", err,
 					)
-					// A canceled sweep says nothing about the item itself,
+					// A cancelled sweep says nothing about the item itself,
 					// so it does not count against the failure cap.
 					if recordFailure != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 						recordFailure(ctx, item, err)
@@ -413,7 +413,7 @@ func (e *Enricher) enrichWithProviders(ctx context.Context, item enrichmentItemR
 
 	if !accumulator.HasMetadata && accumulator.PosterPath == "" && accumulator.Overview == "" {
 		if err := ctx.Err(); err != nil {
-			// A canceled sweep says nothing about the item or the providers.
+			// A cancelled sweep says nothing about the item or the providers.
 			return err
 		}
 		if len(providerErrs) > 0 {
@@ -687,8 +687,6 @@ func collectMangaMetadata(ctx context.Context, item enrichmentItemRow, providers
 // cacheRemoteImages localizes the remote poster and backdrop URLs on a full
 // enrichment result, replacing each with the cached path + thumbhash when
 // caching succeeds (the provider URL is kept as a fallback otherwise).
-//
-//nolint:unused // Retained for compatibility with dormant integration paths.
 func (e *Enricher) cacheRemoteImages(ctx context.Context, contentID string, result *metadata.MetadataResult) {
 	if e == nil || result == nil {
 		return
@@ -710,8 +708,6 @@ func (e *Enricher) cacheRemoteImages(ctx context.Context, contentID string, resu
 // cacheRemoteImage downloads and caches one remote image, returning the
 // stored path and thumbhash. On any failure it returns the original URL (a
 // remote URL in the column still renders; the cache is an optimization).
-//
-//nolint:unused // Retained for compatibility with dormant integration paths.
 func (e *Enricher) cacheRemoteImage(ctx context.Context, contentID, url string, imageType metadata.ImageType) (string, string) {
 	if e == nil || url == "" {
 		return url, ""
@@ -753,14 +749,13 @@ func (e *Enricher) cacheRemoteImage(ctx context.Context, contentID, url string, 
 	return storedPath, cached.Thumbhash
 }
 
-//nolint:unused // Retained for compatibility with dormant integration paths.
 func isNilImageCacher(cacher metadata.ImageCacher) bool {
 	if cacher == nil {
 		return true
 	}
 	value := reflect.ValueOf(cacher)
 	switch value.Kind() {
-	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Ptr, reflect.Slice:
 		return value.IsNil()
 	default:
 		return false
@@ -1001,7 +996,7 @@ func (e *Enricher) persistPeople(ctx context.Context, contentID string, people [
 			continue
 		}
 		ip := people[i]
-		ip.ID = personIDs[i]
+		ip.Person.ID = personIDs[i]
 		linked = append(linked, ip)
 	}
 
@@ -1110,7 +1105,7 @@ func filterMangaProviderIDs(providerIDs map[string]string) map[string]string {
 
 // normalizeMangaStatus maps the varied publication-status strings returned by
 // manga metadata providers (AniList: RELEASING/FINISHED/NOT_YET_RELEASED/
-// CANCELED/HIATUS, MangaDex: ongoing/completed/hiatus/canceled, and the SDK's
+// CANCELLED/HIATUS, MangaDex: ongoing/completed/hiatus/cancelled, and the SDK's
 // Continuing/Ended) onto the stable label set the clients render, so the shared
 // show_status field carries one consistent manga value-domain instead of raw
 // provider casing. Unknown values pass through trimmed so nothing is lost.
@@ -1126,8 +1121,8 @@ func normalizeMangaStatus(raw string) string {
 		return "Completed"
 	case "hiatus", "on_hiatus", "paused":
 		return "Hiatus"
-	case "canceled", "cancel" + "led", "discontinued":
-		return "Canceled"
+	case "cancelled", "canceled", "discontinued":
+		return "Cancelled"
 	case "upcoming", "not_yet_released", "unreleased", "announced":
 		return "Upcoming"
 	default:

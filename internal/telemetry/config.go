@@ -95,7 +95,7 @@ type Config struct {
 // attribute.
 func LoadConfig(nodeID string) Config {
 	endpoint := strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"))
-	enabled := envutil.BoolNames("VIO_OTEL_ENABLED", "SILO_OTEL_ENABLED") || endpoint != ""
+	enabled := envutil.Bool("SILO_OTEL_ENABLED") || endpoint != ""
 
 	serviceName := strings.TrimSpace(os.Getenv("OTEL_SERVICE_NAME"))
 	if serviceName == "" {
@@ -156,15 +156,5 @@ func parseProtocol(raw string, fallback Protocol) Protocol {
 		return ProtocolGRPC
 	default:
 		return fallback
-	}
-}
-
-// truthy reports whether an env value should be treated as a boolean true.
-func truthy(v string) bool {
-	switch strings.ToLower(strings.TrimSpace(v)) {
-	case "1", "true", "yes", "on":
-		return true
-	default:
-		return false
 	}
 }

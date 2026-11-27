@@ -36,9 +36,9 @@ type DownloadCreateBody struct {
 	ExpectedEntries    map[string]DownloadEntryExpectation `json:"expected_entries,omitempty" doc:"At most 100 episode ID to exact registry ID/revision guards. Existing rows without a guard retain current bytes, status and batch."`
 }
 type DownloadCreateInput struct {
-	DeviceID       string `header:"X-Vio-Device-Id" maxLength:"128"`
-	DeviceName     string `header:"X-Vio-Device-Name" maxLength:"120"`
-	DevicePlatform string `header:"X-Vio-Device-Platform" maxLength:"40"`
+	DeviceID       string `header:"X-Silo-Device-Id" maxLength:"128"`
+	DeviceName     string `header:"X-Silo-Device-Name" maxLength:"120"`
+	DevicePlatform string `header:"X-Silo-Device-Platform" maxLength:"40"`
 	Limit          int    `query:"limit" default:"50" minimum:"1" maximum:"100"`
 	Cursor         string `query:"cursor"`
 	Body           DownloadCreateBody
@@ -56,7 +56,7 @@ func registerDownloadCreation(reg *Registry) {
 	op := Operation{Operation: humaOp(http.MethodPost, Prefix+"/downloads", "createDownloads", "downloads", "Create one download or one bounded series/season page using shared preparation and registration. Do not automatically replay uncertain creation; reconcile the registry first."), Class: ClassProfileScoped, ServiceBacked: true, DemoRestricted: true, RetrySafety: RetrySafetyNonRetryable}
 	op.DefaultStatus = http.StatusAccepted
 	op.MaxBodyBytes = 256 << 10
-	op.Errors = []int{409, 422, 429, 501}
+	op.Errors = []int{409, 429, 501}
 	Register(reg, op, func(ctx context.Context, in *DownloadCreateInput) (*DownloadCreateOutput, error) {
 		return reg.createDownloads(ctx, cursors, in)
 	})
@@ -75,8 +75,10 @@ func downloadCreationProblem(err error) *Problem {
 		return NewProblem(TypeCapabilityUnsupported, err.Error())
 	case errors.Is(err, downloads.ErrCapacityUnavailable), errors.Is(err, downloads.ErrCapabilityUnavailable):
 		return NewProblem(TypeDependencyUnavailable, err.Error())
-	case errors.Is(err, downloads.ErrInvalidQuality), errors.Is(err, downloads.ErrNotSeries):
+	case errors.Is(err, downloads.ErrInvalidQuality):
 		return NewProblem(TypeMalformedRequest, err.Error())
+	case errors.Is(err, downloads.ErrNotSeries):
+		return validationProblem(locationBody+".content_id", codeInvalid, err.Error())
 	case errors.Is(err, downloads.ErrNoDownloadableEpisodes):
 		return NewProblem(TypeNotFound, err.Error())
 	default:
@@ -103,7 +105,7 @@ func (reg *Registry) createDownloads(ctx context.Context, cursors *Cursors, in *
 	if body.Caps != nil {
 		req.Caps = *body.Caps
 		if err := req.Caps.NormalizeAndValidateVideoDecode(); err != nil {
-			return nil, NewProblem(TypeValidationFailed, err.Error())
+			return nil, NewProblem(TypeMalformedRequest, err.Error())
 		}
 	}
 	if len(body.ExpectedEntries) > 100 {

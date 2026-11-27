@@ -25,7 +25,6 @@ import { t } from "@/i18n";
 import { putCollectionItem, useScopeDelete } from "./collectionScope";
 import { invalidateAdminCollectionQueries } from "./collectionSurfaceRefresh";
 import { catalogKeys, collectionKeys } from "./keys";
-import { isTerminalItemDetailNotFound } from "./mediaSurfaceRefresh";
 
 const collectionMutationMessage = PERSONAL_SCOPE.errorMessage;
 
@@ -345,10 +344,7 @@ export function useSetCollectionSortPreference() {
           // viewer has since switched profiles: those pages belong to someone
           // else, and refetching them would cancel their in-flight first load.
           if (!isCapturedProfileAuthorityActive(profileAuth)) return;
-          queryClient.invalidateQueries({
-            queryKey: catalogKeys.all,
-            predicate: (query) => !isTerminalItemDetailNotFound(query),
-          });
+          queryClient.invalidateQueries({ queryKey: catalogKeys.all });
         });
       return queue.tail as Promise<void>;
     },

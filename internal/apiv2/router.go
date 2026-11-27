@@ -6,12 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
 	"maps"
 	"net/http"
 	"net/textproto"
 	"net/url"
-	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -816,11 +814,7 @@ func bufferResponse(next http.Handler) http.Handler {
 				if rec == http.ErrAbortHandler { //nolint:errorlint // sentinel compared by identity, as net/http does
 					panic(rec)
 				}
-				slog.ErrorContext(r.Context(), "apiv2 handler panic",
-					"component", "apiv2",
-					"request_id", requestIDFrom(r.Context()),
-					"panic", fmt.Sprint(rec),
-					"stack", string(debug.Stack()))
+				logHandlerPanic(r, rec)
 				bw.discard()
 				writeProblem(bw, r, NewProblem(TypeInternalError, "An unexpected error occurred."))
 			}
@@ -1350,6 +1344,7 @@ var externalSignInProblemTypes = map[string]ProblemType{
 	TypeIdentityLinkedElsewhere.ID: TypeIdentityLinkedElsewhere,
 	TypeProviderAlreadyEnabled.ID:  TypeProviderAlreadyEnabled,
 	TypeBreakGlassRequired.ID:      TypeBreakGlassRequired,
+	TypeSignInProviderRequired.ID:  TypeSignInProviderRequired,
 	TypeLastSignInMethod.ID:        TypeLastSignInMethod,
 	TypeProviderUnavailable.ID:     TypeProviderUnavailable,
 	TypeAlreadyLinked.ID:           TypeAlreadyLinked,
@@ -1392,13 +1387,26 @@ type SessionService interface {
 	// CurrentLoginSession returns nil, not an error, when the session is no
 	// longer live.
 	CurrentLoginSession(ctx context.Context, userID int, sessionID string) (*models.AuthSession, error)
+	// ListSessionsPageByID and SessionLimitedToItself serve a session that
+	// may see and end only itself (auth.LimitedToItself).
+	ListSessionsPageByID(ctx context.Context, userID int, afterID string, limit int) ([]*models.AuthSession, bool, error)
+	SessionLimitedToItself(ctx context.Context, sessionID string) (bool, error)
 	RevokeSession(ctx context.Context, sessionID string, userID int) error
+	// RevokeSessionChecked runs check on the session after confirming it is
+	// userID's, in the same transaction; check's error leaves it live.
+	RevokeSessionChecked(ctx context.Context, sessionID string, userID int, check func(*models.AuthSession) error) error
 	SetupInitialUser(ctx context.Context, in handlers.RegistrationInput) (handlers.TokenPairView, error)
 	SignupEnabled(ctx context.Context) (bool, error)
 	Signup(ctx context.Context, in handlers.RegistrationInput) (handlers.TokenPairView, error)
+	// PasswordPolicy is the rule set a new password must meet.
+	PasswordPolicy(ctx context.Context) (auth.PasswordPolicy, error)
 	// NetworkSignIn signs in the overlay peer of the request through a
 	// network identity provider.
 	NetworkSignIn(ctx context.Context, in handlers.NetworkSignInInput) (handlers.TokenPairView, error)
+	// DemoLogin signs a visitor in to the public demo account. It returns
+	// auth.ErrDemoLoginDisabled or auth.ErrDemoLoginNotConfigured when demo
+	// sign-in is not available.
+	DemoLogin(ctx context.Context, in handlers.DemoLoginInput) (handlers.TokenPairView, error)
 }
 
 // DeviceLoginService is the slice of *handlers.AuthHandler the device-pairing

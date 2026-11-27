@@ -2,7 +2,6 @@ package policy
 
 import (
 	"context"
-	"errors"
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/playback"
@@ -37,9 +36,6 @@ func NewPlaybackAdmissionDecider(checker ActionChecker) playback.AdmissionDecide
 			RequestTime:             time.Now().UTC().Format(time.RFC3339),
 		})
 		if err != nil {
-			if errors.Is(err, ErrPolicyEvalTimeout) {
-				return playback.AdmissionDecision{}, playback.ErrAdmissionDeciderTimeout
-			}
 			return playback.AdmissionDecision{}, err
 		}
 		return playback.AdmissionDecision{

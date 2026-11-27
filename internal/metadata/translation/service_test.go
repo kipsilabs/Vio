@@ -3,7 +3,6 @@ package translation
 import (
 	"context"
 	"encoding/json"
-	"errors"
 
 	"fmt"
 	"strings"
@@ -408,7 +407,7 @@ func TestLibraryPrewarmStopsOnProviderFailure(t *testing.T) {
 	var calls atomic.Int32
 	failing := func(context.Context, string, string) (string, error) {
 		calls.Add(1)
-		return "", errors.New("quota exceeded")
+		return "", fmt.Errorf("quota exceeded")
 	}
 	svc := newService(t, repo, content, locs, failing, jobrunner.NewSemaphore(1))
 

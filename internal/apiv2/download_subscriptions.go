@@ -40,13 +40,13 @@ type DownloadSubscriptionsOutput struct {
 	Body         Collection[DownloadSubscription]
 }
 type DownloadSubscriptionsInput struct {
-	DeviceID string `header:"X-Vio-Device-Id" required:"true" minLength:"1" maxLength:"128"`
+	DeviceID string `header:"X-Silo-Device-Id" required:"true" minLength:"1" maxLength:"128"`
 	Limit    int    `query:"limit" default:"50" minimum:"1" maximum:"100"`
 	Cursor   string `query:"cursor"`
 }
 type DownloadSubscriptionInput struct {
 	ID       string `path:"id" minLength:"1"`
-	DeviceID string `header:"X-Vio-Device-Id" required:"true" minLength:"1" maxLength:"128"`
+	DeviceID string `header:"X-Silo-Device-Id" required:"true" minLength:"1" maxLength:"128"`
 }
 
 func downloadSubscriptionOf(row *downloads.Subscription) DownloadSubscription {

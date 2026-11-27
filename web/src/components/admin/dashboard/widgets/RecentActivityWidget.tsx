@@ -21,8 +21,8 @@ export function RecentActivityWidget() {
           {t("web.admin.dashboard.widgets.recentActivity.title")}
         </CardTitle>
         <Link
-          to="/admin/activity"
-          className="text-muted-foreground hover:text-primary text-[11px] transition-colors"
+          to="/admin/insights"
+          className="text-muted-foreground hover:text-primary text-[0.6875rem] transition-colors"
         >
           {t("web.admin.dashboard.widgets.recentActivity.viewAll")}
         </Link>
@@ -99,7 +99,7 @@ export function RecentActivityWidget() {
                         },
                       )}
                     </div>
-                    <div className="text-muted-foreground mt-0.5 text-[10px]">{meta}</div>
+                    <div className="text-muted-foreground mt-0.5 text-[0.625rem]">{meta}</div>
                   </div>
                   <div className="flex-shrink-0">
                     <AdminSessionActions session={s} compact />

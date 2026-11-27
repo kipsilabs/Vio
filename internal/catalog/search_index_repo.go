@@ -18,7 +18,7 @@ const (
 	SearchIndexEventRename = "rename"
 
 	searchIndexMaintenanceLockID int64 = 0x53494c4f5345531
-	searchIndexEventMaxAttempts  int64 = 10
+	searchIndexEventMaxAttempts        = 10
 )
 
 type SearchIndexEvent struct {

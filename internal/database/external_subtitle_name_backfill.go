@@ -180,14 +180,15 @@ func repairExternalSubtitleNames(videoPath string, stored []byte) ([]byte, bool,
 		if !ok || (tags.Language == current.Language && tags.HearingImpaired == current.HearingImpaired) {
 			continue
 		}
-		language, _ := json.Marshal(tags.Language)
-		fields["language"] = language
-		fields["hearing_impaired"] = json.RawMessage(strconv.FormatBool(tags.HearingImpaired))
-		encoded, err := json.Marshal(fields)
+		language, err := json.Marshal(tags.Language)
 		if err != nil {
 			return nil, false, err
 		}
-		elems[i] = encoded
+		fields["language"] = language
+		fields["hearing_impaired"] = json.RawMessage(strconv.FormatBool(tags.HearingImpaired))
+		if elems[i], err = json.Marshal(fields); err != nil {
+			return nil, false, err
+		}
 		changed = true
 	}
 	if !changed {

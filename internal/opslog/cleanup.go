@@ -436,16 +436,12 @@ func scopeFilterArgs(component, level string) (string, []any, int) {
 
 func parseInt(s string) int {
 	var v int
-	if _, err := fmt.Sscanf(s, "%d", &v); err != nil {
-		return 0
-	}
+	fmt.Sscanf(s, "%d", &v)
 	return v
 }
 
 func parseInt64(s string) int64 {
 	var v int64
-	if _, err := fmt.Sscanf(s, "%d", &v); err != nil {
-		return 0
-	}
+	fmt.Sscanf(s, "%d", &v)
 	return v
 }

@@ -79,7 +79,6 @@ type NotificationWebhookDestination struct {
 	Enabled             bool            `json:"enabled"`
 	NotifyNextUp        bool            `json:"notify_next_up"`
 	NotifyRequests      bool            `json:"notify_requests"`
-	NotifyRatings       bool            `json:"notify_ratings"`
 	ConsecutiveFailures int             `json:"consecutive_failures"`
 	DisabledReason      *string         `json:"disabled_reason"`
 	LastSuccessAt       NullableInstant `json:"last_success_at"`
@@ -98,7 +97,6 @@ func notificationWebhookDestinationOf(row notifications.Webhook) NotificationWeb
 		Enabled:             row.Enabled,
 		NotifyNextUp:        row.NotifyNextUp,
 		NotifyRequests:      row.NotifyRequests,
-		NotifyRatings:       row.NotifyRatings,
 		ConsecutiveFailures: row.ConsecutiveFailures,
 		DisabledReason:      row.DisabledReason,
 		LastSuccessAt:       destinationInstant(row.LastSuccessAt),

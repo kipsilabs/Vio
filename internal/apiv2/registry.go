@@ -9,7 +9,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 	"unicode"
 
 	"github.com/danielgtaylor/huma/v2"
@@ -254,29 +253,6 @@ type Registry struct {
 	ops                     []Declared
 	routes                  map[routeKey]struct{}
 	publicCapabilitySchemas map[string]bool
-
-	// preplayDiscoverySeen coalesces repeated detail reads for the same
-	// viewer/item/selected version. The player inventory poll deliberately
-	// bypasses the client cache and re-reads watch detail every few seconds;
-	// without this memo each poll re-lists and re-persists every provider
-	// candidate, advancing media_files.updated_at while a probe is writing its
-	// evidence. The map is bounded and entries are only a short-lived hint.
-	preplayDiscoveryMu   sync.Mutex
-	preplayDiscoverySeen map[string]time.Time
-	// preplayDiscoveryRunning marks the same keys while a detached listing for
-	// them is still running. A catalog detail read never waits for discovery,
-	// so without it a page refresh during a cold provider scrape would start a
-	// second listing for work that is already in flight.
-	preplayDiscoveryRunning map[string]struct{}
-
-	// virtualWarmSeen coalesces repeated detail reads that would schedule the
-	// same version's probe/warm chain. The playback handler already refuses a
-	// duplicate live chain; this memo also keeps a burst of reads (the client
-	// opens the page, the player polls inventory) from re-entering admission
-	// after a chain finishes. Entries are a short-lived hint, bounded like the
-	// discovery memo.
-	virtualWarmMu   sync.Mutex
-	virtualWarmSeen map[string]time.Time
 }
 
 // Declared is what the registry recorded for one operation; the runtime
@@ -317,12 +293,6 @@ func Register[I, O any](reg *Registry, op Operation, handler func(context.Contex
 		handler = func(ctx context.Context, in *I) (*O, error) {
 			return audited(auditmutation.WithDomainAudit(ctx), in)
 		}
-	}
-	wrapped := handler
-	handler = func(ctx context.Context, in *I) (*O, error) {
-		out, err := wrapped(ctx, in)
-		noteOperationError(ctx, err)
-		return out, err
 	}
 	var in I
 	var out O

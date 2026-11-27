@@ -17,7 +17,7 @@ import {
 } from "@/components/admin/libraries/DiagnosticsListParts";
 import {
   pathLeaf,
-  useWideDiagnosticsTableLayout,
+  useWideTableLayout,
   usePagination,
   useSort,
 } from "@/components/admin/libraries/diagnosticsListState";
@@ -53,7 +53,7 @@ export function SkippedRootsSection({
   onStatusChange?: (status: { count: number | undefined; isError?: boolean }) => void;
 } = {}) {
   const t = useT();
-  const showTable = useWideDiagnosticsTableLayout();
+  const showTable = useWideTableLayout();
   const [open, setOpen] = useState(false);
   const isOpen = embedded || open;
   const [search, setSearch] = useState("");
@@ -172,7 +172,7 @@ export function SkippedRootsSection({
                               isExpanded && "rotate-90 rtl:-rotate-90",
                             )}
                           />
-                          <span className="truncate text-sm font-medium">
+                          <span dir="auto" className="bidi-text truncate text-sm font-medium">
                             {pathLeaf(root.root_path)}
                           </span>
                         </div>
@@ -231,7 +231,9 @@ export function SkippedRootsSection({
             {pag.rows.map((root) => (
               <DiagnosticsCard key={skippedRootKey(root)}>
                 <div className="space-y-1.5">
-                  <h3 className="font-medium break-words">{pathLeaf(root.root_path)}</h3>
+                  <h3 dir="auto" className="bidi-text font-medium break-words">
+                    {pathLeaf(root.root_path)}
+                  </h3>
                   <Badge
                     variant="outline"
                     className={cn(REASON_BADGE_CLASS, "max-w-full whitespace-normal")}

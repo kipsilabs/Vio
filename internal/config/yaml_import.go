@@ -77,10 +77,6 @@ func YAMLToSettingsMap(path string) (map[string]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parsing YAML config: %w", err)
 	}
-	artworkLocalPathConfigured, err := yamlHasPath(data, "artwork", "local_path")
-	if err != nil {
-		return nil, fmt.Errorf("parsing YAML config: %w", err)
-	}
 
 	m := make(map[string]string)
 
@@ -204,13 +200,7 @@ func YAMLToSettingsMap(path string) (map[string]string, error) {
 
 	// Artwork
 	setIfNonEmpty(m, "artwork.storage_backend", raw.Artwork.StorageBackend)
-	// Writing the default path here would pin a new install's root onto an
-	// upgraded installation that already records a storage identity. Leave the
-	// row unwritten unless the file sets it; LoadFromDB then preserves the root
-	// the installation has been serving.
-	if artworkLocalPathConfigured {
-		setIfNonEmpty(m, "artwork.local_path", raw.Artwork.LocalPath)
-	}
+	setIfNonEmpty(m, "artwork.local_path", raw.Artwork.LocalPath)
 
 	// Matcher
 	if raw.Matcher.Workers != 0 {
@@ -226,7 +216,6 @@ func YAMLToSettingsMap(path string) (map[string]string, error) {
 	setIfNonEmpty(m, playbackTranscodeDirSettingKey, raw.Playback.TranscodeDir)
 	m[playbackSegmentRetentionSettingKey] = strconv.Itoa(raw.Playback.SegmentRetentionSeconds)
 	setIfNonEmpty(m, "playback.hw_accel", raw.Playback.HWAccel)
-	setIfNonEmpty(m, "playback.software_fallback", raw.Playback.SoftwareFallback)
 	if raw.Playback.ChapterThumbnailWorkers != 0 {
 		m["playback.chapter_thumbnail_workers"] = strconv.Itoa(raw.Playback.ChapterThumbnailWorkers)
 	}

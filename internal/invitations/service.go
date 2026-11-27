@@ -20,8 +20,8 @@ const DefaultTTL = 7 * 24 * time.Hour
 
 // Account roles an invitation may grant.
 const (
-	roleUser  = "user"
-	roleAdmin = "admin"
+	roleUser  = models.RoleUser
+	roleAdmin = models.RoleAdmin
 )
 
 // Errors surfaced to the API layer.
@@ -442,6 +442,10 @@ func (s *Service) Accept(ctx context.Context, token, email, password, deviceName
 	} else if !allowed {
 		return nil, nil, auth.ErrLocalLoginDisabled
 	}
+	// Checked before the claim, so a refused password leaves it unspent.
+	if err := auth.CheckNewPassword(ctx, s.settings, password); err != nil {
+		return nil, nil, err
+	}
 	linkInvitation := false
 	var entered string
 	linkAddress := func() (string, error) {
@@ -506,7 +510,7 @@ func (s *Service) linkBase(ctx context.Context) string {
 }
 
 // serverName reads the branded server name for email copy and the claim
-// screen, defaulting to "Vio".
+// screen, defaulting to "Silo".
 func (s *Service) serverName(ctx context.Context) string {
 	return mail.ServerName(ctx, s.settings)
 }

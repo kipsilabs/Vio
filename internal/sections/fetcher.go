@@ -13,7 +13,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -187,17 +186,9 @@ func (f *Fetcher) ResolvePlayableTargets(ctx context.Context, query catalog.Play
 
 type editorialCandidateLoader func(context.Context, string, *int, []int, catalog.AccessFilter) ([]string, error)
 
-// editorialCandidateCacheEpoch is the process-global purge epoch for
-// editorial candidate caches. A destructive purge bumps it; caches keyed
-// under the old epoch are never read again. Package-global so every Fetcher
-// instance (native API, recommendations, jellycompat) observes the same
-// epoch without a registry.
-var editorialCandidateCacheEpoch atomic.Uint64
-
 type editorialCandidateCache struct {
 	mu      sync.RWMutex
 	entries map[string]editorialCandidateCacheEntry
-	epoch   uint64 // purge epoch of the last write; used to drop stale entries
 }
 
 type editorialCandidateCacheEntry struct {
@@ -229,12 +220,6 @@ func (c *editorialCandidateCache) set(key string, candidates []string, expiresAt
 	}
 
 	c.mu.Lock()
-	// Drop entries from a prior purge epoch: the key embeds the epoch, so
-	// they can never be hit again, but clearing keeps the map bounded.
-	if c.epoch < editorialCandidateCacheEpoch.Load() {
-		c.entries = make(map[string]editorialCandidateCacheEntry)
-		c.epoch = editorialCandidateCacheEpoch.Load()
-	}
 	c.entries[key] = editorialCandidateCacheEntry{
 		candidates: append([]string(nil), candidates...),
 		expiresAt:  expiresAt,
@@ -320,12 +305,7 @@ func (f *Fetcher) cachedEditorialCandidates(ctx context.Context, subjectType str
 
 func editorialCandidateCacheKey(subjectType string, libraryID *int, libraryIDs []int, filter catalog.AccessFilter) string {
 	var b strings.Builder
-	// The purge epoch scopes the key: a destructive purge bumps it, so a load
-	// that starts after the purge computes a fresh key and can never be
-	// served a pre-purge candidate list.
-	b.WriteString("purge=")
-	b.WriteString(strconv.FormatUint(editorialCandidateCacheEpoch.Load(), 10))
-	b.WriteString("|subject=")
+	b.WriteString("subject=")
 	b.WriteString(strings.ToLower(strings.TrimSpace(subjectType)))
 
 	b.WriteString("|library=")
@@ -609,7 +589,7 @@ func (f *Fetcher) fetchContinueWatchingSection(ctx context.Context, resolved Res
 	// With new releases first, a series finished before all of them still
 	// leads the row when its next episode was just released, so the lookup is
 	// not bounded.
-	if combined { //nolint:nestif // upstream fetchContinueWatchingSection in fetcher.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
+	if combined {
 		newReleasesFirst := NextUpNewReleasesFirst(ctx, store, f.AdminDefaults, profileID)
 		var since *time.Time
 		if !newReleasesFirst {
@@ -1435,7 +1415,7 @@ func (f *Fetcher) fetchCollection(ctx context.Context, s ResolvedSection, librar
 		return f.fetchUserCollection(ctx, s, libraryID, libraryIDs, userID, profileID, filter, userCollID)
 	}
 
-	// Library collection path (existing behavior).
+	// Library collection path (existing behaviour).
 	if f.CollectionRepo == nil {
 		return nil, 0, fmt.Errorf("collection sections require a collection repository")
 	}
@@ -2849,8 +2829,6 @@ func buildRecentlyReleasedQuery(s ResolvedSection, libraryID *int, libraryIDs []
 	catalog.ApplySectionAccessFilter("mi", filter, &conditions, &args, &argIdx)
 
 	conditions = append(conditions, catalog.MangaChapterExclusionWhere("mi"))
-	conditions = append(conditions, "(mi.release_date IS NULL OR mi.release_date <= CURRENT_DATE)")
-	conditions = append(conditions, "(mi.year IS NULL OR mi.year <= EXTRACT(YEAR FROM CURRENT_DATE))")
 
 	whereClause := ""
 	if len(conditions) > 0 {
@@ -3216,8 +3194,8 @@ func (f *Fetcher) fetchEpisodeTargetsByContentIDs(ctx context.Context, contentID
 			e.content_id,
 			e.series_id,
 			e.title,
-			COALESCE(e.overview, ''),
-			COALESCE(e.runtime, 0),
+			e.overview,
+			e.runtime,
 			e.rating_imdb,
 			e.rating_tmdb,
 			COALESCE(NULLIF(s.poster_path, ''), NULLIF(si.poster_path, ''), NULLIF(e.still_path, ''), '') AS poster_path,
@@ -3227,11 +3205,12 @@ func (f *Fetcher) fetchEpisodeTargetsByContentIDs(ctx context.Context, contentID
 			e.air_date,
 			si.title,
 			si.genres,
-			COALESCE(si.content_rating, ''),
+			si.content_rating,
 			COALESCE(NULLIF(e.still_path, ''), NULLIF(si.backdrop_path, ''), '') AS backdrop_path,
 			COALESCE(NULLIF(e.still_thumbhash, ''), NULLIF(si.backdrop_thumbhash, ''), '') AS backdrop_thumbhash,
 			si.logo_path,
 			si.status,
+			COALESCE(si.episode_labels, ''),
 			COALESCE(e.still_path, ''),
 			COALESCE(si.poster_path, ''),
 			COALESCE(si.poster_thumbhash, ''),
@@ -3286,6 +3265,7 @@ func (f *Fetcher) fetchEpisodeTargetsByContentIDs(ctx context.Context, contentID
 			&item.BackdropThumbhash,
 			&item.LogoPath,
 			&item.Status,
+			&item.EpisodeLabels,
 			&stillPath,
 			&parent.SeriesPosterPath,
 			&parent.SeriesPosterThumbhash,
@@ -3364,14 +3344,6 @@ func applyEpisodeTargetLibraryAccess(
 		return false
 	}
 	catalog.ApplyLibraryAccessFilter("si.content_id", scoped, conditions, args, argIdx)
-	if scoped.AllowedLibraryIDs == nil && len(scoped.DisabledLibraryIDs) == 0 {
-		// Unrestricted episode-target scope: require series library
-		// membership, mirroring buildLibraryScope, so purged or stale
-		// episode rows with no membership cannot surface on Home rails.
-		*conditions = append(*conditions,
-			"EXISTS (SELECT 1 FROM media_item_libraries mil_scope_any WHERE mil_scope_any.content_id = si.content_id)",
-		)
-	}
 	return true
 }
 
@@ -3428,7 +3400,7 @@ func itemColumnsList(alias string) []string {
 		"poster_path", "poster_thumbhash", "backdrop_path", "backdrop_thumbhash", "logo_path",
 		"metadata_s3_path", "metadata_etag", "season_count",
 		"studios", "networks", "countries", "release_date::text", "first_air_date", "last_air_date",
-		"show_status",
+		"show_status", "episode_labels",
 		"matched_at", "status", "created_at", "updated_at",
 		"advisory_age", "advisory_source",
 		// Jellyfin-compatible lists advertise these images from the paths.
@@ -3508,7 +3480,7 @@ func scanMediaItems(rows pgx.Rows) ([]*models.MediaItem, error) {
 			&item.PosterPath, &item.PosterThumbhash, &item.BackdropPath, &item.BackdropThumbhash, &item.LogoPath,
 			&item.MetadataS3Path, &item.MetadataEtag, &item.SeasonCount,
 			&item.Studios, &item.Networks, &item.Countries, &item.ReleaseDate, &item.FirstAirDate, &item.LastAirDate,
-			&item.ShowStatus,
+			&item.ShowStatus, &item.EpisodeLabels,
 			&item.MatchedAt, &item.Status, &item.CreatedAt, &item.UpdatedAt,
 			&item.AdvisoryAge, &item.AdvisorySource,
 			&item.BannerPath, &item.ThumbPath, &item.ClearArtPath, &item.DiscPath,
@@ -3945,7 +3917,6 @@ func buildLibraryScope(libraryID *int, libraryIDs []int, configLibraryIDs []int,
 	return fromClause, conditions, args, argIdx
 }
 
-//nolint:unused // Retained for compatibility with dormant integration paths.
 func fetchSortClause(sort, order string) string {
 	dir := "DESC"
 	if order == "asc" {
@@ -4275,14 +4246,11 @@ func (f *Fetcher) fetchReturningShows(ctx context.Context, s ResolvedSection, li
 		argIdx++
 	}
 
-	fileConditions := "mf.missing_since IS NULL" + fileScopeCond
-
 	conditions = append(conditions,
 		"mi.type = 'series'",
 		// A season newer than any the profile has watched (joined from
 		// `watched` below) arrived recently with at least one playable file
-		// in an in-scope library. Layout alias rows are not seasons of their
-		// own, and a canonical episode's file can live on its alias row.
+		// in an in-scope library.
 		fmt.Sprintf(`EXISTS (
 			SELECT 1
 			FROM episodes ne
@@ -4290,9 +4258,12 @@ func (f *Fetcher) fetchReturningShows(ctx context.Context, s ResolvedSection, li
 			  AND ne.season_number > 0
 			  AND ne.created_at > NOW() - make_interval(days => $3)
 			  AND ne.season_number > COALESCE(w.max_season, 0)
-			  AND %s
-			  AND %s
-		)`, catalog.EpisodeAliasExclusionSQL("ne.content_id"), catalog.CanonicalEpisodeFileExistsSQL("ne.content_id", fileConditions)),
+			  AND EXISTS (
+				SELECT 1 FROM media_files mf
+				WHERE mf.episode_id = ne.content_id
+				  AND mf.missing_since IS NULL%s
+			  )
+		)`, fileScopeCond),
 	)
 
 	fromClause, libConditions, libArgs, newArgIdx := buildLibraryScope(libraryID, libraryIDs, nil, filter.DisabledLibraryIDs, argIdx)
@@ -4327,11 +4298,9 @@ func (f *Fetcher) fetchReturningShows(ctx context.Context, s ResolvedSection, li
 			FROM episodes ord
 			WHERE ord.series_id = mi.content_id
 			  AND ord.created_at > NOW() - make_interval(days => $3)
-			  AND %s
 		) DESC NULLS LAST, mi.content_id ASC
 		LIMIT $%d`,
-		itemColumns("mi"), fromClause, strings.Join(conditions, " AND "),
-		catalog.EpisodeAliasExclusionSQL("ord.content_id"), argIdx,
+		itemColumns("mi"), fromClause, strings.Join(conditions, " AND "), argIdx,
 	)
 	args = append(args, limit)
 

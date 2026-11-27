@@ -6,7 +6,7 @@ import (
 )
 
 var routingDecisions = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "vio_playback_routing_decisions_total",
+	Name: "silo_playback_routing_decisions_total",
 	Help: "Playback route decisions by workload, selected topology, and outcome.",
 }, []string{"workload", "execution", "egress", "outcome", "reason"})
 

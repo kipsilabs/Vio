@@ -236,10 +236,10 @@ func TestGetCertificationCallerStopsWaitingOnCancel(t *testing.T) {
 	select {
 	case err := <-errCh:
 		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("canceled caller error = %v, want context.Canceled", err)
+			t.Fatalf("cancelled caller error = %v, want context.Canceled", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("canceled caller still blocked on the shared fetch")
+		t.Fatal("cancelled caller still blocked on the shared fetch")
 	}
 
 	// The detached fetch is still completable for a fresh caller.
@@ -285,7 +285,7 @@ func TestGetCertificationSurvivesFirstCallerCancellation(t *testing.T) {
 	close(release)
 
 	if err := <-secondErr; err != nil {
-		t.Fatalf("second caller failed after first caller canceled: %v", err)
+		t.Fatalf("second caller failed after first caller cancelled: %v", err)
 	}
 	if cert := <-secondCert; cert != "TV-PG" {
 		t.Fatalf("second caller cert = %q, want TV-PG", cert)

@@ -3,8 +3,11 @@ package trickplay
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"runtime"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -292,6 +295,27 @@ func TestProcessReleasesOnShutdown(t *testing.T) {
 	}
 }
 
+// TestProcessRecordsADamagedVerdict covers #5088: a run that blames the
+// file's data, here or on a node, ends Damaged, which the queue backs off
+// before it gives up on the file.
+func TestProcessRecordsADamagedVerdict(t *testing.T) {
+	local := &mediasample.Error{Reason: mediasample.ReasonExit, Attempts: []mediasample.AttemptError{{
+		Reason: mediasample.ReasonExit, Err: errors.New("exit status 183"),
+		StderrTail: "Error opening input files: Invalid data found when processing input",
+	}}}
+	fromNode := &ExtractError{Reason: string(mediasample.ReasonInvalidData), Permanent: true, Message: "moov atom not found"}
+	for name, err := range map[string]error{"local": local, "node": fromNode} {
+		t.Run(name, func(t *testing.T) {
+			q := newFakeQueue()
+			s := testService(q, &fakeStore{}, &fakeExtractor{err: err}, fakeSettings{})
+			s.process(t.Context(), testJob(9, 600))
+			if got, ok := q.finished[9]; !ok || got.outcome != Damaged {
+				t.Fatalf("finished %+v %v, want Damaged", got, ok)
+			}
+		})
+	}
+}
+
 // TestHeartbeatLossCancelsWork refuses the lease renewal while a run is in
 // progress: the run must stop, and the service must not record an outcome
 // on a row another server now holds.
@@ -439,5 +463,49 @@ func TestSheetsToneMapNamesTheSourceSignal(t *testing.T) {
 		if (got == nil) != (tt.want == nil) || (got != nil && *got != *tt.want) {
 			t.Errorf("%s: tone map %+v, want %+v", name, got, tt.want)
 		}
+	}
+}
+
+// A full artwork store is not the file's fault: the file waits an hour and
+// keeps its failure count, so previews resume soon after space is freed.
+func TestClassifyReleasesFileWhenStorageIsFull(t *testing.T) {
+	err := fmt.Errorf("store trickplay/1/1/0.jpg: %w", syscall.ENOSPC)
+	if outcome, delay := (&Service{}).classify(t.Context(), err); outcome != Released || delay != releaseDelay {
+		t.Fatalf("a full store classifies as %v after %v, want Released after %v", outcome, delay, releaseDelay)
+	}
+}
+
+// After a sheet write finds the store full, the service claims no more files
+// for a while: each would be decoded only for its first write to be refused.
+func TestDispatchPausesAfterStorageIsFull(t *testing.T) {
+	q := newFakeQueue(testJob(1, 600), testJob(2, 600))
+	extractor := &fakeExtractor{}
+	s := testService(q, &fakeStore{err: fmt.Errorf("blobstore: %w", syscall.ENOSPC)}, extractor, fakeSettings{})
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.dispatch(ctx)
+	}()
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		q.mu.Lock()
+		_, finished := q.finished[1]
+		q.mu.Unlock()
+		if finished {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the first file was never released")
+		}
+		runtime.Gosched()
+	}
+	// A negative check: no second claim may come within the window.
+	time.Sleep(100 * time.Millisecond) //nolint:forbidigo // waits out a window in which nothing may happen
+	cancel()
+	<-done
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.claims != 1 || q.finished[1] != (finishCall{Released, releaseDelay}) {
+		t.Fatalf("claims = %d, file 1 %+v; want one claim, released for %v", q.claims, q.finished[1], releaseDelay)
 	}
 }

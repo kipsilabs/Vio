@@ -51,7 +51,7 @@ type DownloadPreparation struct {
 type DownloadEntryOutput struct{ Body DownloadEntry }
 type DownloadRegistryOutput struct{ Body Collection[DownloadEntry] }
 type DownloadRegistryInput struct {
-	DeviceID string `header:"X-Vio-Device-Id" maxLength:"128"`
+	DeviceID string `header:"X-Silo-Device-Id" maxLength:"128"`
 	Limit    int    `query:"limit" default:"50" minimum:"1" maximum:"100"`
 	Cursor   string `query:"cursor"`
 }
@@ -62,12 +62,12 @@ type DownloadStatusBody struct {
 }
 type DownloadStatusInput struct {
 	ID       string `path:"id" minLength:"1"`
-	DeviceID string `header:"X-Vio-Device-Id" required:"true" minLength:"1" maxLength:"128"`
+	DeviceID string `header:"X-Silo-Device-Id" required:"true" minLength:"1" maxLength:"128"`
 	Body     DownloadStatusBody
 }
 type DownloadDeleteInput struct {
 	ID       string `path:"id" minLength:"1"`
-	DeviceID string `header:"X-Vio-Device-Id" maxLength:"128"`
+	DeviceID string `header:"X-Silo-Device-Id" maxLength:"128"`
 }
 type DownloadCapability struct {
 	Capability
@@ -318,7 +318,7 @@ func (reg *Registry) getDownloadCapability(ctx context.Context, _ *CapabilityInp
 		// mutations to non-admins, so the effective answer is no even when
 		// the account itself is permitted. Discovered the same way as every
 		// other demo-restricted capability (notification email verification).
-		out.Allowed = new(view.DownloadAllowed && !demoRestricted(ctx, reg.deps.DemoSettings))
+		out.Allowed = new(view.DownloadAllowed && demoAllows(ctx, reg.deps.DemoSettings))
 	}
 	return &DownloadCapabilityOutput{CacheControl: "private, no-cache", Body: out}, nil
 }

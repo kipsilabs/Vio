@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"strings"
 
 	"github.com/Silo-Server/silo-server/internal/mediasample"
 )
@@ -26,7 +25,7 @@ func (r *SilenceBoundaryRefiner) RefineChapterEnd(ctx context.Context, candidate
 	if !cfg.SilenceRefinementEnabled {
 		return segment, false, nil
 	}
-	if candidate.FilePath == "" || strings.HasPrefix(strings.ToLower(candidate.FilePath), "virtual://") || segment.End <= segment.Start {
+	if candidate.FilePath == "" || segment.End <= segment.Start {
 		return segment, false, nil
 	}
 

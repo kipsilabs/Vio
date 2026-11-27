@@ -47,6 +47,9 @@ type MaterializeResult struct {
 	EpisodesMaterialized int    `json:"episodes_materialized"`
 }
 
+// episodeLabelsColumn is the series' episode-label choice, shared by the item
+// and browse select lists.
+
 // ItemRepository provides CRUD operations for the media_items table.
 type ItemRepository struct {
 	pool              *pgxpool.Pool
@@ -1268,6 +1271,10 @@ const (
 	advisoryAgeColumn    = "advisory_age"
 	advisorySourceColumn = "advisory_source"
 )
+
+// episodeLabelsColumn is the series' episode-label choice, shared by the item
+// and browse select lists.
+const episodeLabelsColumn = "episode_labels"
 
 // Served-path columns of the banner, thumb, clear art and disc slots, shared
 // by the item select lists in this package.

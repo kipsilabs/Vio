@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"slices"
 	"sort"
-	"strconv"
 	"strings"
 	"testing"
 
@@ -36,9 +35,11 @@ type fakeEmbeddingStore struct {
 	// candidates lists, sorted by ID, the rows the Pass 2 SQL flags.
 	candidates []EmbeddingTextCandidate
 	// pages records the afterID of each Pass 2 page request.
-	pages     []string
-	stored    map[string]storedTestEmbedding
-	upsertErr error
+	pages  []string
+	stored map[string]storedTestEmbedding
+	// failItem names an item whose row fails to store, and with it any
+	// write that includes it.
+	failItem string
 	// marked records each MarkProfilesStaleForItems call's items.
 	marked [][]string
 	// markedAll counts MarkAllProfilesStale calls.
@@ -107,11 +108,19 @@ func (f *fakeEmbeddingStore) ListEmbeddingTextCandidates(_ context.Context, afte
 	return page, nil
 }
 
-func (f *fakeEmbeddingStore) UpsertEmbedding(_ context.Context, itemID string, embedding []float32, model, canonicalText string) error {
-	if f.upsertErr != nil {
-		return f.upsertErr
+func (f *fakeEmbeddingStore) UpsertEmbedding(ctx context.Context, itemID string, embedding []float32, model, canonicalText string) error {
+	return f.UpsertEmbeddings(ctx, model, []EmbeddingWrite{{ItemID: itemID, Embedding: embedding, CanonicalText: canonicalText}})
+}
+
+func (f *fakeEmbeddingStore) UpsertEmbeddings(_ context.Context, model string, writes []EmbeddingWrite) error {
+	for _, w := range writes {
+		if w.ItemID == f.failItem {
+			return fmt.Errorf("store %s failed", w.ItemID)
+		}
 	}
-	f.stored[itemID] = storedTestEmbedding{model: model, text: canonicalText, dims: len(embedding)}
+	for _, w := range writes {
+		f.stored[w.ItemID] = storedTestEmbedding{model: model, text: w.CanonicalText, dims: len(w.Embedding)}
+	}
 	return nil
 }
 
@@ -174,7 +183,7 @@ func testIDs(prefix string, n int) []string {
 // model: the run fails and writes neither the lock nor any row.
 func TestBackfillUnstorableVectorWritesNoLock(t *testing.T) {
 	for _, dims := range []int{0, CanonicalEmbeddingDimensions + 1} {
-		t.Run(strconv.Itoa(dims), func(t *testing.T) {
+		t.Run(fmt.Sprint(dims), func(t *testing.T) {
 			calls := 0
 			store := newFakeEmbeddingStore(testIDs("item-", 3)...)
 			b := newTestBackfill(store, quotaTestEmbedder(func(_ context.Context, texts []string) ([][]float32, error) {
@@ -208,6 +217,27 @@ func TestBackfillWritesTheLockFromTheFirstStorableVector(t *testing.T) {
 	}
 }
 
+// When storing a chunk fails, its items are stored one at a time: only the
+// item whose row fails is lost, counted as failed for the next run, and only
+// the stored items mark their profiles stale.
+func TestBackfillStoresItemsOneAtATimeWhenAChunkWriteFails(t *testing.T) {
+	calls := 0
+	ids := testIDs("item-", 4)
+	store := newFakeEmbeddingStore(ids...)
+	store.failItem = ids[1]
+	b := newTestBackfill(store, vectorsOf(768, &calls), nil)
+	if err := b.run(context.Background(), false); err != nil {
+		t.Fatal(err)
+	}
+	stored := []string{ids[0], ids[2], ids[3]}
+	if b.counts.Embedded != 3 || b.counts.Failed != 1 || len(store.stored) != 3 {
+		t.Fatalf("counts = %+v with %d stored; want the three good items stored and one failure", b.counts, len(store.stored))
+	}
+	if len(store.marked) != 1 || !slices.Equal(store.marked[0], stored) {
+		t.Fatalf("profiles marked stale for %v; want %v", store.marked, stored)
+	}
+}
+
 // Vectors a catalog import stored carry no lock, and with every item embedded
 // no run stores one to write it from. A run that finds them and no lock embeds
 // the probe text once and writes the lock; without them it writes none.
@@ -234,16 +264,16 @@ func TestBackfillLocksImportedEmbeddings(t *testing.T) {
 	}
 }
 
-var errTestRefusal = &embeddings.StatusError{API: "embedding", StatusCode: 400, Body: "invalid input"}
+var testRefusal = &embeddings.StatusError{API: "embedding", StatusCode: 400, Body: "invalid input"}
 
-// refusingEmbedder answers a call with errTestRefusal when bad reports one of
+// refusingEmbedder answers a call with testRefusal when bad reports one of
 // its texts, and counts its calls.
 func refusingEmbedder(bad func(text string) bool, calls *int) quotaTestEmbedder {
 	return func(_ context.Context, texts []string) ([][]float32, error) {
 		*calls++
 		for _, text := range texts {
 			if bad(text) {
-				return nil, errTestRefusal
+				return nil, testRefusal
 			}
 		}
 		out := make([][]float32, len(texts))

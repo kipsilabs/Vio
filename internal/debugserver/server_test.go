@@ -143,7 +143,7 @@ func TestCaptureBusyAndShutdownCancellation(t *testing.T) {
 	}
 	select {
 	case response := <-done:
-		if response.Trailer.Get("X-Vio-Capture-Interrupted") != "true" {
+		if response.Trailer.Get("X-Silo-Capture-Interrupted") != "true" {
 			t.Fatalf("missing interrupted metadata: %v", response.Trailer)
 		}
 	case err := <-errs:
@@ -227,7 +227,7 @@ func TestProfilesParseWithGoTools(t *testing.T) {
 			if err != nil || resp.StatusCode != 200 {
 				t.Fatalf("capture: %d, %v, %s", resp.StatusCode, err, body)
 			}
-			if resp.Trailer.Get("X-Vio-Capture-Interrupted") != "false" {
+			if resp.Trailer.Get("X-Silo-Capture-Interrupted") != "false" {
 				t.Fatalf("capture metadata: %v", resp.Trailer)
 			}
 			file := filepath.Join(t.TempDir(), "capture")

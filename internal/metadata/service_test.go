@@ -157,29 +157,6 @@ func (r *fakeItemRepo) UpdateProvisionalArtwork(_ context.Context, read *models.
 	return true, nil
 }
 
-func (r *fakeItemRepo) UpdateStatus(_ context.Context, contentID, status string) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	item, ok := r.items[contentID]
-	if !ok {
-		return catalog.ErrItemNotFound
-	}
-	item.Status = status
-	return nil
-}
-
-func (r *fakeItemRepo) UpdateEpisodeMetadataState(_ context.Context, seriesID string, incomplete bool, lastCheckedAt *time.Time) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	item, ok := r.items[seriesID]
-	if !ok {
-		return catalog.ErrItemNotFound
-	}
-	item.EpisodeMetadataIncomplete = incomplete
-	item.EpisodeMetadataLastCheckedAt = lastCheckedAt
-	return nil
-}
-
 func (r *fakeItemRepo) SetStatusUnlessMatched(_ context.Context, contentID, status string) (bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -1047,6 +1024,20 @@ func (r *fakeMetadataFolderRepo) GetByID(_ context.Context, id int) (*models.Med
 		return &cp, nil
 	}
 	return nil, catalog.ErrFolderNotFound
+}
+
+func (r *fakeMetadataFolderRepo) ListByIDs(_ context.Context, ids []int) ([]*models.MediaFolder, error) {
+	var out []*models.MediaFolder
+	for _, id := range ids {
+		if err, ok := r.lookupErrs[id]; ok {
+			return nil, err
+		}
+		if folder, ok := r.folders[id]; ok && folder.Enabled {
+			cp := *folder
+			out = append(out, &cp)
+		}
+	}
+	return out, nil
 }
 
 // fakeRootClaimRepo implements metadataRootClaimRepo.

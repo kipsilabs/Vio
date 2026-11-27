@@ -24,7 +24,7 @@ type WeeklyTrigger struct {
 
 func NewWeeklyTrigger(cfg taskmanager.TriggerConfig) *WeeklyTrigger {
 	var h, m int
-	_, _ = fmt.Sscanf(cfg.TimeOfDay, "%d:%d", &h, &m)
+	fmt.Sscanf(cfg.TimeOfDay, "%d:%d", &h, &m)
 	return &WeeklyTrigger{
 		cfg:       cfg,
 		dayOfWeek: time.Weekday(cfg.DayOfWeek),

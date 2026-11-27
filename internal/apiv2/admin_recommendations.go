@@ -17,7 +17,7 @@ type AdminRecommendationsService interface {
 	StatusCounts(context.Context) (int, int, int, int, int, error)
 	IsRunning(recommendations.JobName) bool
 	LastRuns(context.Context) (map[recommendations.JobName]recommendations.JobRuns, error)
-	EmbeddingLockConflict(context.Context) (string, string, map[string]string, error)
+	EmbeddingLockConflict(context.Context) (text, key string, args map[string]string, err error)
 	CacheRefreshedAt(context.Context) (*time.Time, error)
 	StaleSweep(context.Context) (recommendations.StaleSweepStatus, error)
 	TriggerEmbeddings() error
@@ -48,11 +48,13 @@ type AdminRecommendationsStatus struct {
 	Cowatch          AdminRecommendationJobStatus  `json:"cowatch"`
 	Recommendations  AdminRecommendationJobStatus  `json:"recommendations"`
 	LockConflict     string                        `json:"lock_conflict" doc:"Why the stored embedding lock rejects the embedding settings this server runs with; empty when it does not."`
+	LockConflictKey  string                        `json:"lock_conflict_key,omitempty" doc:"Translation catalog key of lock_conflict, which clients show in a non-English interface. Absent when lock_conflict is empty."`
+	LockConflictArgs map[string]string             `json:"lock_conflict_args,omitempty" doc:"Values for lock_conflict_key's placeholders, by name. Absent when lock_conflict is empty."`
 	StaleSweep       AdminRecommendationStaleSweep `json:"stale_sweep" doc:"The stale profile sweep, which rebuilds profiles after their signals or access change."`
 	CacheRefreshedAt *Instant                      `json:"cache_refreshed_at,omitempty" doc:"When the newest cached recommendation row was written, by the cache job or a profile refresh. It is not job health: profile refreshes keep it recent while the cache job fails; read recommendations.last_run for that. Absent when nothing is cached."`
 }
 type AdminRecommendationStaleSweep struct {
-	Pending int                        `json:"pending" doc:"Profiles whose recommendations wait for a rebuild. The sweep rebuilds up to 50 every 5 minutes; a profile whose rebuild fails stays pending."`
+	Pending int                        `json:"pending" doc:"Profiles whose recommendations wait for a rebuild. Each server tries a sweep 2 minutes after its last try ended, one server at a time; a sweep starts rebuilds, oldest first, for up to a minute, and a rebuild it started finishes even past that minute. A profile whose rebuild fails stays pending."`
 	LastRun *AdminRecommendationJobRun `json:"last_run,omitempty" doc:"The newest sweep on any server that rebuilt or failed at least one profile. Absent until one does."`
 }
 type AdminRecommendationsStatusOutput struct{ Body AdminRecommendationsStatus }
@@ -153,7 +155,7 @@ func (reg *Registry) getAdminRecommendationsStatus(ctx context.Context, _ *struc
 	if err != nil {
 		return nil, serviceProblem(err)
 	}
-	conflict, _, _, err := w.EmbeddingLockConflict(ctx)
+	conflict, conflictKey, conflictArgs, err := w.EmbeddingLockConflict(ctx)
 	if err != nil {
 		return nil, serviceProblem(err)
 	}
@@ -182,6 +184,8 @@ func (reg *Registry) getAdminRecommendationsStatus(ctx context.Context, _ *struc
 		Cowatch:          jobStatus(recommendations.JobCowatch, cowatch),
 		Recommendations:  jobStatus(recommendations.JobRecommendations, cache),
 		LockConflict:     conflict,
+		LockConflictKey:  conflictKey,
+		LockConflictArgs: conflictArgs,
 		StaleSweep:       AdminRecommendationStaleSweep{Pending: sweep.Pending},
 		CacheRefreshedAt: instantPtr(refreshedAt),
 	}}

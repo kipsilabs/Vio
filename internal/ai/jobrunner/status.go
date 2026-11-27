@@ -8,7 +8,7 @@ const (
 	StatusRunning   Status = "running"
 	StatusCompleted Status = "completed"
 	StatusFailed    Status = "failed"
-	StatusCancelled Status = "canceled"
+	StatusCancelled Status = "cancelled"
 )
 
 // Terminal reports whether a status is final.

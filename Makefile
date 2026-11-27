@@ -1,4 +1,4 @@
-.PHONY: frontend build dev-frontend dev-backend dev-proxy dev-transcode lint lint-changed test test-go test-db-pins test-web embed-stub clean jellyfin-web migrate-continuum-check verify-local-paths verify-case-collisions verify-fork-invariants install-hooks migrate-create migrate-validate migrate-status migrate-up migrate-down-to settings-bindings verify-settings-bindings verify-settings-bindings-web verify-settings-bindings-all playback-fixtures verify-playback-fixtures route-inventory verify-route-inventory lint-router-recovery verify-migration-ledger verify-scenario-catalogs offline-routes verify-offline-routes apiv2-openapi verify-apiv2-openapi verify-apiv2-contract apiv2-fixtures verify-apiv2-fixtures apiv2-fixtures-sync verify-apiv2-fixtures-siblings apiv2-web-types verify-apiv2-web-types
+.PHONY: frontend build dev-frontend dev-backend dev-proxy dev-transcode lint lint-changed test test-go test-db-pins test-web embed-stub clean jellyfin-web verify-local-paths verify-case-collisions install-hooks migrate-create migrate-validate migrate-status migrate-up migrate-down-to settings-bindings verify-settings-bindings verify-settings-bindings-web verify-settings-bindings-all playback-fixtures verify-playback-fixtures route-inventory verify-route-inventory lint-router-recovery apiv2-openapi verify-apiv2-openapi verify-apiv2-contract apiv2-fixtures verify-apiv2-fixtures apiv2-fixtures-sync verify-apiv2-fixtures-siblings apiv2-web-types verify-apiv2-web-types
 
 GIT_COMMON_DIR := $(strip $(shell git rev-parse --git-common-dir 2>/dev/null))
 MAIN_CHECKOUT_ROOT := $(if $(GIT_COMMON_DIR),$(abspath $(GIT_COMMON_DIR)/..))
@@ -35,7 +35,7 @@ frontend:
 
 # Build the Go binary (depends on frontend)
 build: frontend
-	go build -ldflags "$(GO_LDFLAGS)" -o vio ./cmd/silo/
+	go build -ldflags "$(GO_LDFLAGS)" -o silo ./cmd/silo/
 
 # Cross-build the macOS transcode node as the image's node_darwin stage does.
 # Without cgo, a new cgo import or an imageutil function missing from its node
@@ -321,10 +321,12 @@ ifneq ($(CONTRACT_GO_TESTS),0)
 		|| { echo "::error::$(APIV2_OPENAPI) fails the spec lint or the diff tool no longer detects the seeded breaking fixture"; exit 1; }
 endif
 	@tmp=$$(mktemp -d) && trap 'rm -rf "$$tmp"' EXIT && \
-		base=$$(scripts/apiv2-contract-base.sh $(BASE_REF) HEAD) && \
-		{ git show "$$base:$(APIV2_OPENAPI)" > "$$tmp/base.json" 2>/dev/null || : ; } && \
-		go run ./cmd/apiv2-contract-diff -base "$$tmp/base.json" -revision $(APIV2_OPENAPI) -contracts contracts/api/v2 \
-		|| { echo "::error::$(APIV2_OPENAPI) has an unapproved breaking change against $$base; see contracts/api/v2/breaking-approvals.schema.json"; exit 1; }
+		base=$$(git merge-base $(BASE_REF) HEAD) && \
+		base_entry=$$(git ls-tree --name-only "$$base" -- "$(APIV2_OPENAPI)") && \
+		{ [ -z "$$base_entry" ] || git show "$$base:$(APIV2_OPENAPI)" > "$$tmp/base.json" \
+			|| { echo "::error::failed to read $(APIV2_OPENAPI) at $$base"; exit 1; }; } && \
+		{ go run ./cmd/apiv2-contract-diff -base "$$tmp/base.json" -revision $(APIV2_OPENAPI) -contracts contracts/api/v2 \
+			|| { echo "::error::$(APIV2_OPENAPI) has an unapproved breaking change against $$base; see contracts/api/v2/breaking-approvals.schema.json"; exit 1; }; }
 
 # Regenerate the native API v2 contract fixtures through the real v2 router.
 # The bodies are what the server answers, byte for byte, for synthetic
@@ -394,10 +396,6 @@ verify-local-paths:
 verify-case-collisions:
 	go run ./scripts/ci/casecollisions
 
-# Check deliberate fork divergences against regressions and upstream merges.
-verify-fork-invariants:
-	scripts/check-fork-invariants.sh
-
 # Create a timestamped Goose SQL migration. Usage: make migrate-create NAME=add_thing
 migrate-create:
 	@if [ -z "$(NAME)" ]; then echo "usage: make migrate-create NAME=add_thing"; exit 1; fi
@@ -449,19 +447,14 @@ install-hooks:
 		echo "warning: overwriting existing local core.hooksPath ($$existing) with .githooks"; \
 	fi
 	git config core.hooksPath .githooks
-	git config merge.ours.driver true
 
 # Fetch and build the pinned Jellyfin Web component into a gitignored local cache.
 jellyfin-web:
 	go run ./cmd/silo/ compat-web install --dir "$(JELLYFIN_WEB_INSTALL_DIR)" --version "$(JELLYFIN_WEB_VERSION)"
 
-# Read-only preflight for Continuum Docker installs moving to Silo.
-migrate-continuum-check:
-	scripts/migrate-continuum-docker.sh check
-
 # Clean build artifacts
 clean:
-	rm -rf web/dist web/node_modules vio
+	rm -rf web/dist web/node_modules silo
 
 # Include developer-specific targets (gitignored, optional).
 # In Git worktrees, fall back to the main checkout's Makefile.local so custom
@@ -471,30 +464,3 @@ include Makefile.local
 else ifneq ($(wildcard $(SHARED_MAKEFILE_LOCAL)),)
 include $(SHARED_MAKEFILE_LOCAL)
 endif
-
-# Fork QA gates (v1 contract, scenario catalogs, offline route set).
-MIGRATION_LEDGER := contracts/api/v2/migration.json
-
-SCENARIO_CATALOG_DIR := contracts/api/v2/scenarios
-
-OFFLINE_ROUTES := contracts/api/v2/offline-routes.txt
-
-verify-migration-ledger:
-	@python3 scripts/apiv2-ledger/test_extract_consumers.py
-	@python3 scripts/apiv2-ledger/assign_sections.py --check $(MIGRATION_LEDGER) \
-		|| { echo "::error::$(MIGRATION_LEDGER) section assignments are stale; run scripts/apiv2-ledger/assign_sections.py"; exit 1; }
-ifneq ($(CONTRACT_GO_TESTS),0)
-	@go test -count=1 ./internal/contractledger/ \
-		|| { echo "::error::$(MIGRATION_LEDGER) violates contracts/api/v2/migration.schema.json or disagrees with $(ROUTE_INVENTORY); see docs/architecture/api-contract.md (Migration ledger)"; exit 1; }
-endif
-
-verify-scenario-catalogs:
-	@go test -count=1 -run '^TestCatalogsPassGate$$' ./internal/scenariocatalog/ \
-		|| { echo "::error::$(SCENARIO_CATALOG_DIR) violates scenario-catalog.schema.json or leaves a tier-1 row uncovered"; exit 1; }
-
-offline-routes:
-	go test -count=1 -run '^TestOfflineRouteSet$$' ./internal/api/ -update-offline-routes
-
-verify-offline-routes:
-	@go test -count=1 -run '^TestOfflineRouteSet$$' ./internal/api/ \
-		|| { echo "::error::$(OFFLINE_ROUTES) disagrees with the offline API router; run make offline-routes"; exit 1; }

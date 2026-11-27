@@ -16,7 +16,6 @@ import {
 import { useAppLanguage, useT } from "@/i18n";
 import { buildDetailLine, buildQualitySummary, sortByResolution } from "./VersionFlyout";
 import { buildMediaSpecSections, type MediaSpecSection } from "./mediaSpecSections";
-import { buildVersionFallbackTitle } from "./versionFormatUtils";
 
 interface MediaInfoDialogProps {
   open: boolean;
@@ -33,7 +32,7 @@ function VersionSpecSheet({ sections }: { sections: MediaSpecSection[] }) {
     <div className="space-y-4">
       {sections.map((section) => (
         <div key={section.title}>
-          <div className="text-muted-foreground/70 mb-1.5 text-[11px] font-semibold tracking-wide uppercase">
+          <div className="text-muted-foreground/70 mb-1.5 text-[0.6875rem] font-semibold tracking-wide uppercase">
             {section.title}
           </div>
           <div className="divide-border/40 bg-background/40 divide-y rounded-lg border">
@@ -85,18 +84,11 @@ export default function MediaInfoDialog({
             // DialogContent unmounts when closed, so defaultValue re-targets on each open.
             <Accordion type="multiple" defaultValue={initialValue ? [initialValue] : []}>
               {sorted.map((version, index) => {
-                const detail = buildDetailLine(version);
-                // The file-name fallback is deduped against the detail line:
-                // the structured size and a repeated year are shown once, on
-                // the detail line, which is the release/title line the version
-                // row and the release label already carry.
                 const summary =
                   buildQualitySummary(version) ||
-                  buildVersionFallbackTitle(version.file_name, {
-                    fileSize: version.file_size,
-                    detailLine: detail,
-                  }) ||
-                  `Version ${index + 1}`;
+                  version.file_name ||
+                  t("web.detail.versions.numbered", { number: index + 1 });
+                const detail = buildDetailLine(version);
 
                 return (
                   <AccordionItem key={version.file_id} value={String(version.file_id)}>

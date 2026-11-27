@@ -63,6 +63,9 @@ var (
 	// TypeInvalidGrant is an OAuth completion code redeemed with a PKCE
 	// verifier that does not fit it (RFC 6749 invalid_grant).
 	TypeInvalidGrant = ProblemType{"invalid_grant", http.StatusBadRequest, "Invalid grant"}
+	// TypeSignInProviderRequired: local password sign-in cannot be turned off
+	// while no external sign-in provider can serve the account.
+	TypeSignInProviderRequired = ProblemType{"sign_in_provider_required", http.StatusConflict, "Sign-in provider required"}
 )
 
 // TypePreparedFileExpired: a finished download's prepared file was cleaned up
@@ -149,7 +152,7 @@ var (
 	TypeFileUnavailable                               = ProblemType{"file_unavailable", http.StatusNotFound, "File unavailable"}
 	TypeFileAccessDenied                              = ProblemType{"file_access_denied", http.StatusForbidden, "File access denied"}
 	TypeFormatUnavailable                             = ProblemType{"format_unavailable", http.StatusNotAcceptable, "Format unavailable"}
-	catalog                                           = []ProblemType{TypeRangeNotSatisfiable, TypeDeviceLoginExpired, TypeUnsupportedSource, TypeMalformedRequest, TypeInvalidCursor, TypeAuthenticationRequired, TypeInvalidToken, TypeSessionExpired, TypePermissionDenied, TypeProfileVerificationRequired, TypePushInstallationKeyMismatch, TypeNotFound, TypeMethodNotAllowed, TypeNotAcceptable, TypeRequestTimeout, TypeConflict, TypeIdempotencyConflict, TypeJobNotCancelable, TypeCapabilityDisabled, TypeCapabilityNotConfigured, TypePreconditionFailed, TypePayloadTooLarge, TypeUnsupportedMediaType, TypeValidationFailed, TypePreconditionRequired, TypeRateLimited, TypeInternalError, TypeCapabilityUnsupported, TypeDependencyUnavailable, TypeClientUpgradeRequired, TypeSyncResetRequired, TypeSnapshotRequestConflict, TypeProgressSnapshotTooLarge, TypePlaybackInstallationChanged, TypePlaybackSessionEnded, TypePlaybackProgressConflict, TypePasswordChangeRequired, TypeNotPermitted, TypeAccountRequired, TypeLocalLoginDisabled, TypeProviderPasswordExpired, TypeEmailInUse, TypeIdentityLinkedElsewhere, TypeProviderAlreadyEnabled, TypeBreakGlassRequired, TypeLastSignInMethod, TypeProviderUnavailable, TypeSubtitleSourceUnavailable, TypeSubtitlePageUnavailable, TypeInvalidGrant, TypeAccountDisabled, TypeLocalPasswordRequired, TypeAlreadyLinked, TypeTokenRefreshRequired, TypeNetworkIdentityRequired, TypePreparedFileExpired, TypeDeviceBindingMismatch, TypeRestoreSetChanged, TypeBackupUnauthenticated, TypeNodeDeploymentManaged, TypeUploadLimitReached}
+	catalog                                           = []ProblemType{TypeRangeNotSatisfiable, TypeDeviceLoginExpired, TypeUnsupportedSource, TypeMalformedRequest, TypeInvalidCursor, TypeAuthenticationRequired, TypeInvalidToken, TypeSessionExpired, TypePermissionDenied, TypeProfileVerificationRequired, TypePushInstallationKeyMismatch, TypeNotFound, TypeMethodNotAllowed, TypeNotAcceptable, TypeRequestTimeout, TypeConflict, TypeIdempotencyConflict, TypeJobNotCancelable, TypeCapabilityDisabled, TypeCapabilityNotConfigured, TypePreconditionFailed, TypePayloadTooLarge, TypeUnsupportedMediaType, TypeValidationFailed, TypePreconditionRequired, TypeRateLimited, TypeInternalError, TypeCapabilityUnsupported, TypeDependencyUnavailable, TypeClientUpgradeRequired, TypeSyncResetRequired, TypeSnapshotRequestConflict, TypeProgressSnapshotTooLarge, TypePlaybackInstallationChanged, TypePlaybackSessionEnded, TypePlaybackProgressConflict, TypePasswordChangeRequired, TypeNotPermitted, TypeAccountRequired, TypeLocalLoginDisabled, TypeProviderPasswordExpired, TypeEmailInUse, TypeIdentityLinkedElsewhere, TypeProviderAlreadyEnabled, TypeBreakGlassRequired, TypeLastSignInMethod, TypeProviderUnavailable, TypeSubtitleSourceUnavailable, TypeSubtitlePageUnavailable, TypeInvalidGrant, TypeAccountDisabled, TypeLocalPasswordRequired, TypeAlreadyLinked, TypeTokenRefreshRequired, TypeNetworkIdentityRequired, TypePreparedFileExpired, TypeDeviceBindingMismatch, TypeRestoreSetChanged, TypeBackupUnauthenticated, TypeNodeDeploymentManaged, TypeUploadLimitReached, TypeSignInProviderRequired}
 	defaultTypeByStatus                               = map[int]ProblemType{}
 	problemContentType                                = "application/problem+json"
 	_                               error             = (*Problem)(nil)
@@ -424,15 +427,19 @@ func humaDetail(t ProblemType, msg string, bodyLimit int64) string {
 // Error codes carried in Problem.errors[].code. They are contract values
 // (docs/architecture/api-contract.md, "Problem Details"); add, never rename.
 const (
-	codeInvalid          = "invalid"
-	codeInvalidType      = "invalid_type"
-	codeInvalidEnum      = "invalid_enum"
-	codeRequired         = "required"
-	codeOutOfRange       = "out_of_range"
-	codeUnknownField     = "unknown_field"
-	codeUnknownParameter = "unknown_parameter"
-	codeMalformedJSON    = "malformed_json"
-	codeMalformedForm    = "malformed_form"
+	codePasswordTooShort       = "password_too_short"
+	codePasswordTooLong        = "password_too_long"
+	codePasswordNeedsUppercase = "password_needs_uppercase"
+	codePasswordNeedsSpecial   = "password_needs_special"
+	codeInvalid                = "invalid"
+	codeInvalidType            = "invalid_type"
+	codeInvalidEnum            = "invalid_enum"
+	codeRequired               = "required"
+	codeOutOfRange             = "out_of_range"
+	codeUnknownField           = "unknown_field"
+	codeUnknownParameter       = "unknown_parameter"
+	codeMalformedJSON          = "malformed_json"
+	codeMalformedForm          = "malformed_form"
 	// codeManagedByEnvironment refuses a change owned by an environment declaration.
 	codeManagedByEnvironment = "managed_by_environment"
 

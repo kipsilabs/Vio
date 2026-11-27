@@ -10,21 +10,6 @@ import { V2ProblemError } from "@/api/v2/request";
 import { t } from "@/i18n";
 import { v2 } from "@/api/v2/request";
 import {
-  getAdminRequestSettingsV2,
-  putAdminRequestSettingsV2,
-  getAdminRequestUserLimitV2,
-  putAdminRequestUserLimitV2,
-  listAdminRequestIntegrationsV2,
-  saveAdminRequestIntegrationV2,
-  deleteAdminRequestIntegrationV2,
-  listAdminMediaRequestsV2,
-  approveAdminRequestV2,
-  declineAdminRequestV2,
-  retryAdminRequestV2,
-  loadAdminRequestIntegrationOptionsV2,
-} from "@/api/v2/adminRequests";
-
-import {
   browseDiscoverV2,
   cancelMediaRequestV2,
   removeFailedMediaRequestV2,
@@ -46,15 +31,12 @@ import type {
   CreateMediaRequestInput,
   DiscoverBrowseKind,
   DiscoverBrowseResponse,
-  LoadRequestIntegrationOptionsRequest,
   MediaRequest,
   RequestDiscoverySection,
-  RequestIntegration,
   RequestListParams,
   RequestMediaPage,
   RequestSearchMediaType,
   RequestMediaType,
-  RequestUserLimit,
 } from "@/api/types";
 import { tmdbPageCount } from "@/lib/mediaRequests";
 import { adminKeys, requestKeys, watchlistKeys } from "./keys";
@@ -227,11 +209,11 @@ function nextBrowsePage(
 export function useRequestMediaDetail(
   mediaType: RequestMediaType,
   tmdbID: number,
-  options: { enabled?: boolean; seasonSource?: "tvdb" | "tmdb" } = {},
+  options: { enabled?: boolean } = {},
 ) {
   return useQuery({
-    queryKey: requestKeys.detail(mediaType, tmdbID, options.seasonSource ?? ""),
-    queryFn: () => getRequestMediaDetailV2(mediaType, tmdbID, options.seasonSource),
+    queryKey: requestKeys.detail(mediaType, tmdbID),
+    queryFn: () => getRequestMediaDetailV2(mediaType, tmdbID),
     enabled: tmdbID > 0 && (options.enabled ?? true),
     staleTime: REQUESTS_STALE_TIME,
     refetchInterval: (query) =>
@@ -405,186 +387,5 @@ export function useMyMediaRequests(
     staleTime: REQUESTS_STALE_TIME,
     refetchInterval: (query) =>
       pollDownloads ? requestDownloadRefetchInterval(query.state.data) : false,
-  });
-}
-export function useAdminMediaRequests(params: RequestListParams = {}) {
-  const key = listParamsKey(params);
-  return useQuery({
-    queryKey: adminKeys.requestQueue(key),
-    queryFn: () => listAdminMediaRequestsV2(params),
-    staleTime: 10_000,
-  });
-}
-
-export function useApproveMediaRequest() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    retry: false,
-    mutationFn: (id: string) => approveAdminRequestV2(id),
-    onSuccess: () => {
-      toast.success("Request approved");
-      invalidateRequestSurfaces(queryClient);
-    },
-    onError: (err) => {
-      toast.error(err instanceof Error ? err.message : "Failed to approve request");
-    },
-  });
-}
-
-export function useDeclineMediaRequest() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    retry: false,
-    mutationFn: ({ id, reason }: { id: string; reason?: string }) =>
-      declineAdminRequestV2(id, reason),
-    onSuccess: () => {
-      toast.success("Request declined");
-      invalidateRequestSurfaces(queryClient);
-    },
-    onError: (err) => {
-      toast.error(err instanceof Error ? err.message : "Failed to decline request");
-    },
-  });
-}
-
-export function useRetryMediaRequest() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    retry: false,
-    mutationFn: (id: string) => retryAdminRequestV2(id),
-    onSuccess: () => {
-      toast.success("Request queued for retry");
-      invalidateRequestSurfaces(queryClient);
-    },
-    onError: (err) => {
-      toast.error(err instanceof Error ? err.message : "Failed to retry request");
-    },
-  });
-}
-
-export function useRequestSettings() {
-  return useQuery({
-    queryKey: adminKeys.requestSettings(),
-    queryFn: getAdminRequestSettingsV2,
-    staleTime: REQUESTS_STALE_TIME,
-  });
-}
-
-export function useUpdateRequestSettings() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    retry: false,
-    mutationFn: putAdminRequestSettingsV2,
-    onSuccess: () => {
-      toast.success("Request settings saved");
-      queryClient.invalidateQueries({ queryKey: adminKeys.requestSettings() });
-      queryClient.invalidateQueries({ queryKey: requestKeys.status() });
-      invalidateRequestSurfaces(queryClient);
-    },
-    onError: (err) => {
-      toast.error(err instanceof Error ? err.message : "Failed to save request settings");
-    },
-  });
-}
-
-export function useRequestIntegrations() {
-  return useQuery({
-    queryKey: adminKeys.requestIntegrations(),
-    queryFn: listAdminRequestIntegrationsV2,
-    staleTime: REQUESTS_STALE_TIME,
-  });
-}
-
-export function useCreateRequestIntegration() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    retry: false,
-    mutationFn: (integration: RequestIntegration) =>
-      saveAdminRequestIntegrationV2(integration, true),
-    onSuccess: () => {
-      toast.success("Integration created");
-      queryClient.invalidateQueries({ queryKey: adminKeys.requestIntegrations() });
-      invalidateRequestSurfaces(queryClient);
-    },
-    onError: (err) => {
-      if (isValidationFailure(err)) return;
-      toast.error(err instanceof Error ? err.message : "Failed to create integration");
-    },
-  });
-}
-
-export function useUpdateRequestIntegration() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    retry: false,
-    mutationFn: (integration: RequestIntegration) => saveAdminRequestIntegrationV2(integration),
-    onSuccess: () => {
-      toast.success("Integration saved");
-      queryClient.invalidateQueries({ queryKey: adminKeys.requestIntegrations() });
-      invalidateRequestSurfaces(queryClient);
-    },
-    onError: (err) => {
-      if (isValidationFailure(err)) return;
-      toast.error(err instanceof Error ? err.message : "Failed to save integration");
-    },
-  });
-}
-
-export function useDeleteRequestIntegration() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    retry: false,
-    mutationFn: deleteAdminRequestIntegrationV2,
-    onSuccess: () => {
-      toast.success("Integration deleted");
-      queryClient.invalidateQueries({ queryKey: adminKeys.requestIntegrations() });
-      invalidateRequestSurfaces(queryClient);
-    },
-    onError: (err) => {
-      toast.error(err instanceof Error ? err.message : "Failed to delete integration");
-    },
-  });
-}
-
-export function useLoadRequestIntegrationOptions() {
-  return useMutation({
-    retry: false,
-    mutationFn: ({ id, body }: { id: string; body: LoadRequestIntegrationOptionsRequest }) =>
-      loadAdminRequestIntegrationOptionsV2(id, body),
-    // Silent background probe: callers surface load failures inline (no toast).
-  });
-}
-
-export function useRequestUserLimit(userId?: number) {
-  return useQuery({
-    queryKey: adminKeys.requestUserLimit(userId ?? 0),
-    queryFn: () => getAdminRequestUserLimitV2(userId!),
-    enabled: Boolean(userId && userId > 0),
-    staleTime: REQUESTS_STALE_TIME,
-  });
-}
-
-export function useUpdateRequestUserLimit() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    retry: false,
-    mutationFn: ({ userId, body }: { userId: number; body: RequestUserLimit }) =>
-      putAdminRequestUserLimitV2(userId, body),
-    onSuccess: (_data, variables) => {
-      toast.success("User request limit saved");
-      queryClient.invalidateQueries({ queryKey: adminKeys.requestUserLimit(variables.userId) });
-      invalidateRequestSurfaces(queryClient);
-    },
-    onError: (err) => {
-      toast.error(err instanceof Error ? err.message : "Failed to save user limit");
-    },
-  });
-}
-
-export function useAdminRequestCapabilities() {
-  return useQuery({
-    queryKey: [...adminKeys.requestsRoot(), "capabilities"],
-    queryFn: () => v2("GET /api/v2/admin/requests/capabilities"),
-    staleTime: REQUESTS_STALE_TIME,
   });
 }

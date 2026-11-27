@@ -8,8 +8,6 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/Silo-Server/silo-server/internal/settingskeys"
-
 	"github.com/Silo-Server/silo-server/internal/ai/chatgpt"
 	"github.com/Silo-Server/silo-server/internal/config"
 	"github.com/Silo-Server/silo-server/internal/secret"
@@ -76,13 +74,9 @@ var SensitiveSettingKeys = map[string]bool{
 	"redis.sentinel_password": true,
 
 	// Metadata / list-provider API keys.
-	"tmdb.api_key":    true, //nolint:goconst // Keep the audited allowlist readable as a contract.
+	"tmdb.api_key":    true,
 	"mdblist.api_key": true,
 	"introdb.api_key": true,
-	// Removed RemuxDB integration (rev 17): the key is deprecated and ignored
-	// at runtime, but stays encrypted/redacted so an old client write of a
-	// credential can never land in plaintext.
-	settingskeys.RemuxdbToken: true,
 
 	// AI provider registry, API keys included. The endpoint keys it replaced
 	// are no longer read, but rows written by older builds stay encrypted
@@ -126,10 +120,6 @@ var SensitiveSettingKeys = map[string]bool{
 
 	// Silo push relay bearer credential for APNs/FCM delivery.
 	"notifications.push_relay_api_key": true,
-
-	// Virtual library (Stremio streaming) secrets.
-	"virtual_library.indexer_api_key":  true,
-	"virtual_library.altmount_api_key": true,
 }
 
 // EncryptedSettingsRepo decorates a raw settings store, transparently
@@ -228,7 +218,7 @@ func (r *EncryptedSettingsRepo) UpdateValueAtomic(ctx context.Context, key strin
 		UpdateValueAtomic(context.Context, string, func(string) (string, error)) error
 	})
 	if !ok {
-		return errors.New("settings store does not support atomic value updates")
+		return fmt.Errorf("settings store does not support atomic value updates")
 	}
 	return inner.UpdateValueAtomic(ctx, key, func(raw string) (string, error) {
 		plain, err := r.cipher.DecryptIfEncrypted(raw, secret.SettingsAAD(key))

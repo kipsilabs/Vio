@@ -28,7 +28,7 @@ func (s *RepositoryStore) ReconcileManaged(ctx context.Context) (ManagedReposito
 	if err != nil {
 		return ManagedRepositoryReconcileResult{}, fmt.Errorf("begin managed plugin repository reconciliation: %w", err)
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
+	defer tx.Rollback(ctx)
 
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO server_settings (key, value)
@@ -183,7 +183,7 @@ func reconcileManagedRepositories(ctx context.Context, executor catalogSettingsE
 			return 0, fmt.Errorf("check managed plugin repository %q: %w", definition.Key, err)
 		}
 
-		enabled := definition.SourceKind == RepositorySourceSilo || includeCommunity
+		enabled := definition.Key == OfficialRepositoryManagedKey || includeCommunity
 		if _, err := executor.Exec(ctx, `
 			INSERT INTO plugin_repositories (url, display_name, enabled, managed_key, source_kind)
 			VALUES ($1, $2, $3, $4, $5)

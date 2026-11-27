@@ -5,7 +5,6 @@
 
 import { t, type MessageKey } from "@/i18n";
 import { formatLocale } from "@/lib/appLocale";
-import { displayLanguageName } from "@/lib/languageNames";
 import { formatDecimal } from "@/lib/numberFormat";
 
 export const CODEC_LABELS: Record<string, string> = {
@@ -121,81 +120,41 @@ export function audioTrackLabel(track: AudioTrackFormat): string {
   return track.codec ? mapAudioLabel(track.codec, audioTrackAtmosEvidence(track)) : "";
 }
 
-/** The audio-track fields an identity label reads. */
-export interface AudioTrackIdentitySource extends AudioTrackFormat {
-  language?: string;
-  languages?: string[];
-  channels?: number;
-}
-
-export interface AudioTrackIdentity {
-  /** Primary row label: the declared language, else codec + layout, else the row's position. */
-  title: string;
-  /**
-   * True when the track declares no language. Surfaces say the language is not
-   * declared in a hint instead of printing the localized "unknown" word as the
-   * row's identity, which reads as a fact about a track nobody described.
-   */
-  languageUndeclared: boolean;
-  /** True when `title` is the codec + channel layout rather than a language. */
-  titleFromFormat: boolean;
-}
-
-/** Language values that name no language: the undetermined code and its spellings. */
-const UNDECLARED_LANGUAGE_CODES = new Set(["und", "unknown", "unk"]);
+// Words that only restate an audio format: codec short names, the long names
+// FFprobe reports ("ATSC A/52B (AC-3, E-AC-3)", "AAC (Advanced Audio
+// Coding)"), and layouts. The scanner stores FFprobe's long name as a track's
+// title when the stream has no title tag (#4568).
+const FORMAT_WORDS = new Set([
+  ..."atsc a/52 a/52a a/52b dca dts dts-hd ma coherent acoustics truehd atmos".split(" "),
+  ..."ac3 ac-3 eac3 e-ac3 eac-3 e-ac-3 aac advanced audio coding codec interactive".split(" "),
+  ..."flac free lossless alac apple opus vorbis mp2 mp3 mpeg layer pcm signed unsigned".split(" "),
+  ..."floating point little-endian big-endian dolby digital plus surround stereo mono".split(" "),
+  ..."1.0 2.0 2.1 5.0 5.1 7.0 7.1".split(" "),
+]);
+// Numbers a format name can carry ("MPEG audio layer 3", "PCM signed 16-bit"),
+// which name a format only next to a format word.
+const FORMAT_NUMBER = /^\d{1,3}(?:-bit)?$/;
+const TITLE_SEPARATORS = /[\s()·,]+/;
 
 /**
- * Names for the languages a track declares, joined with "/". A tag CLDR knows
- * becomes its name in the interface language; a release marker a provider put
- * in the field ("MULTI") is shown as written.
+ * Whether a track title only names its audio format, as a title FFprobe's
+ * codec name filled in does. A display shows the language instead. A title of
+ * numbers alone ("1", "2") is a real title. Each word is looked up on its own,
+ * so the check is linear in the title's length.
  */
-function declaredLanguageLabel(tags: ReadonlyArray<string | undefined>): string {
-  const seen = new Set<string>();
-  const labels: string[] = [];
-  for (const raw of tags) {
-    const tag = raw?.trim();
-    if (!tag || UNDECLARED_LANGUAGE_CODES.has(tag.toLowerCase())) continue;
-    const label = displayLanguageName(tag) ?? tag;
-    const identity = label.toLowerCase();
-    if (seen.has(identity)) continue;
-    seen.add(identity);
-    labels.push(label);
+export function titleOnlyNamesAudioFormat(title?: string): boolean {
+  let namesFormat = false;
+  for (const word of (title ?? "").toLowerCase().split(TITLE_SEPARATORS)) {
+    if (word === "") {
+      continue;
+    }
+    if (FORMAT_WORDS.has(word)) {
+      namesFormat = true;
+    } else if (!FORMAT_NUMBER.test(word)) {
+      return false;
+    }
   }
-  return labels.join("/");
-}
-
-/**
- * The primary label for one audio row, shared by the item page and the player
- * menus: the declared language when there is one, else the codec and channel
- * layout ("EAC3 5.1"), else the row's 1-based `position` ("Track 2"). Nothing
- * here guesses a language from a release name; the next render re-derives the
- * label, so a probed language replaces the gap on its own.
- */
-export function audioTrackIdentity(
-  track: AudioTrackIdentitySource,
-  position: number,
-): AudioTrackIdentity {
-  const language = declaredLanguageLabel(
-    track.languages?.length ? track.languages : [track.language],
-  );
-  if (language) return { title: language, languageUndeclared: false, titleFromFormat: false };
-
-  const format = [audioTrackLabel(track), formatChannels(track.channels)].filter(Boolean).join(" ");
-  if (format) return { title: format, languageUndeclared: true, titleFromFormat: true };
-
-  return {
-    title: t("web.player.audioMenu.trackFallback", { number: position }),
-    languageUndeclared: true,
-    titleFromFormat: false,
-  };
-}
-
-/**
- * The honest gap for a row whose language is not declared: "Language: Unknown"
- * in the interface language, read by assistive tech and shown as a tooltip.
- */
-export function undeclaredLanguageHint(): string {
-  return `${t("web.detail.mediaInfo.row.language")}: ${t("web.detail.audio.unknown")}`;
+  return namesFormat;
 }
 
 interface FormatFileSizeOptions {
@@ -220,26 +179,6 @@ export function formatFileSize(bytes?: number, options: FormatFileSizeOptions = 
   if (bytes >= 1024 ** 2) return t(mega, { size: size(bytes / 1024 ** 2) });
   if (bytes >= 1024) return t(kilo, { size: size(bytes / 1024) });
   return t("web.common.format.size.bytes", { size: bytes });
-}
-
-// A size token as it appears in a release/provider label ("4.2 GB", "800 MB"),
-// with an optional leading separator. Provider display labels can carry one
-// because the server appends the size it parsed from the release text.
-export const RELEASE_SIZE_TOKEN = /(?:\s*[·•|]\s*)?\b\d+(?:\.\d+)?\s*(?:TB|GB|MB)\b/gi;
-
-/**
- * Removes a size that a provider/release label already embeds, so a row does
- * not show the same attribute twice. The structured file size is the canonical
- * value (it is what filtering and sorting use), so it is the one kept; the
- * label keeps its resolution, codec and group identity.
- */
-export function stripReleaseSizeToken(releaseName: string): string {
-  if (!releaseName) return "";
-  return releaseName
-    .replace(RELEASE_SIZE_TOKEN, " ")
-    .replace(/\s*[·•|]\s*$/, "")
-    .replace(/\s+/g, " ")
-    .trim();
 }
 
 export function formatBitrate(kbps?: number, fallback = ""): string {

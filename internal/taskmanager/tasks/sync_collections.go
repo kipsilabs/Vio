@@ -5,14 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/taskmanager"
 )
 
 // CollectionSyncRunner runs a single pass of the collection sync scheduler.
-// onProgress may be nil.
 type CollectionSyncRunner interface {
-	RunOnce(ctx context.Context, onProgress func(catalog.CollectionSyncProgress)) (json.RawMessage, error)
+	RunOnce(ctx context.Context) (json.RawMessage, error)
 }
 
 // SyncCollectionsTask finds collections with a sync schedule that are due
@@ -45,17 +43,7 @@ func (t *SyncCollectionsTask) DefaultTriggers() []taskmanager.TriggerConfig {
 func (t *SyncCollectionsTask) Execute(ctx context.Context, progress taskmanager.ProgressReporter) error {
 	progress.Report(0, "Checking for due collections")
 
-	resultData, err := t.scheduler.RunOnce(ctx, func(update catalog.CollectionSyncProgress) {
-		if update.Due <= 0 {
-			return
-		}
-		percent := float64(update.Completed) / float64(update.Due) * 100
-		message := fmt.Sprintf("Synced %d of %d collections", update.Completed, update.Due)
-		if update.CurrentTitle != "" {
-			message = fmt.Sprintf("Synced %d of %d: %s", update.Completed, update.Due, update.CurrentTitle)
-		}
-		progress.Report(percent, message)
-	})
+	resultData, err := t.scheduler.RunOnce(ctx)
 	if err != nil {
 		return fmt.Errorf("collection sync scheduler: %w", err)
 	}

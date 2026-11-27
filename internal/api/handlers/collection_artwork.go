@@ -3,12 +3,14 @@ package handlers
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -20,14 +22,14 @@ import (
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/collage"
 	"github.com/Silo-Server/silo-server/internal/imageutil"
+	"github.com/Silo-Server/silo-server/internal/logredact"
 	"github.com/Silo-Server/silo-server/internal/netguard"
+	"github.com/Silo-Server/silo-server/internal/usercollections"
 )
 
 // Shared artwork helpers used by both the admin library_collections handler
 // and the user collections handler. The S3 prefix differs so the two
 // namespaces don't collide.
-var errCollageArtworkSignerNotConfigured = errors.New("collage artwork signer is not configured")
-
 const (
 	adminCollectionImagePrefix = "collection-images"
 	userCollectionImagePrefix  = "user-collection-images"
@@ -42,11 +44,7 @@ const (
 // errCollectionImageSourceNotAllowed is the one answer for an image URL on
 // the server's own network or in a blocked range. Every refused address gets
 // it unchanged, so the answer says nothing about what listens there.
-var errCollectionImageSourceNotAllowed = &APIError{
-	Status:  http.StatusBadRequest,
-	Code:    "bad_request", //nolint:goconst // HTTP error code shared by APIError values; the package keeps error codes inline.
-	Message: "the image URL must be a public internet address",
-}
+var errCollectionImageSourceNotAllowed = errors.New("the image URL must be a public internet address")
 
 // newCollectionImageClient returns the client collection artwork downloads
 // use. Its netguard transport checks every address it dials, redirect hops
@@ -95,29 +93,25 @@ func storeBundledCollectionPosterIfS3Configured(
 	return storedPath, thumbhashStr, true, nil
 }
 
-// readCollectionImageMultipart reads a single image file from a multipart
-// request, validating MIME type and size.
-func readCollectionImageMultipart(r *http.Request, fieldName string) ([]byte, error) {
-	file, header, err := r.FormFile(fieldName)
-	if err != nil {
-		return nil, err
+// personalCollectionPosterURL resolves a personal collection's stored poster,
+// or its collage, to a URL at card size. An image URL or a root-relative path
+// such as a bundled template poster is returned as stored. A storage key is
+// signed only when it is in the collection's own image directory
+// (usercollections.OwnsPosterKey), where its uploaded poster and collages are
+// written. Any other key reads as no poster, so a row that names one cannot
+// make the server sign an object the collection does not own.
+func personalCollectionPosterURL(ctx context.Context, resolver artworkurl.Resolver, collectionID, path string) string {
+	if path == "" {
+		return ""
 	}
-	defer func() { _ = file.Close() }()
-
-	switch header.Header.Get("Content-Type") {
-	case "image/jpeg", "image/png", "image/webp":
-	default:
-		return nil, fmt.Errorf("unsupported image type: %s", header.Header.Get("Content-Type"))
+	if strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://") || strings.HasPrefix(path, "/") {
+		return catalog.ImageURLOrEmpty(path)
 	}
-	if header.Size > collectionImageMaxBytes {
-		return nil, fmt.Errorf("file exceeds 10 MB limit")
+	if resolver == nil || !usercollections.OwnsPosterKey(collectionID, path) {
+		return ""
 	}
-
-	data := make([]byte, header.Size)
-	if _, err := io.ReadFull(file, data); err != nil {
-		return nil, fmt.Errorf("reading file: %w", err)
-	}
-	return data, nil
+	key := cardThumbnailPath(path)
+	return resolver.ResolveURLs(ctx, []string{key})[key].URL
 }
 
 // invalidCollectionImage reports artwork the caller supplied that Silo cannot
@@ -126,20 +120,107 @@ func invalidCollectionImage(message string, cause error) *APIError {
 	return &APIError{Status: http.StatusBadRequest, Code: policyErrorBadRequest, Message: message, cause: cause}
 }
 
-// collectionArtworkError keeps a client-facing artwork error and hides any
-// other failure behind a 500 with the given message.
+// collectionImageBusyRetryAfter is the Retry-After, in seconds, on a busy
+// answer: the wait imageutil gives a source before it reports ErrBusy.
+const collectionImageBusyRetryAfter = 30
+
+// busyCollectionImage reports that image processing had no room for the
+// artwork. The image may be fine, so the caller is told to try again and is
+// not told the file is unsupported.
+func busyCollectionImage(cause error) *APIError {
+	return &APIError{
+		Status:     http.StatusServiceUnavailable,
+		Code:       policyErrorUnavailable,
+		Message:    "Image processing is busy; try again shortly.",
+		RetryAfter: collectionImageBusyRetryAfter,
+		cause:      cause,
+	}
+}
+
+// collectionArtworkError keeps a client-facing artwork error, including a
+// busy answer, and hides any other failure behind a 500 with the given
+// message.
 func collectionArtworkError(err error, message string) error {
-	if apiErr, ok := errors.AsType[*APIError](err); ok && apiErr.Status < http.StatusInternalServerError {
+	if apiErr, ok := errors.AsType[*APIError](err); ok &&
+		(apiErr.Status < http.StatusInternalServerError || apiErr.Status == http.StatusServiceUnavailable) {
 		return apiErr
 	}
 	return apiError(http.StatusInternalServerError, "internal_error", message)
+}
+
+// personalCollectionPosterError answers a failed personal collection poster
+// by its cause. A client-facing error, including a busy answer, passes
+// through unchanged, and a source address the server will not fetch keeps its
+// one fixed answer. Any other failure goes to the log, and the client gets a
+// 500 that says nothing about the store or the source behind it. It takes no
+// message, so no caller can put error text in the answer. collectionID is
+// empty when the collection does not exist yet.
+func personalCollectionPosterError(ctx context.Context, collectionID string, err error) error {
+	if apiErr, ok := errors.AsType[*APIError](err); ok &&
+		(apiErr.Status < http.StatusInternalServerError || apiErr.Status == http.StatusServiceUnavailable) {
+		return apiErr
+	}
+	if errors.Is(err, errCollectionImageSourceNotAllowed) {
+		return apiError(http.StatusInternalServerError, "internal_error", "poster source: "+errCollectionImageSourceNotAllowed.Error())
+	}
+	if download, ok := errors.AsType[*collectionImageDownloadError](err); ok {
+		// The caller named the source, and any profile can name one that
+		// fails, so this is a warning. The line carries the source's host and
+		// the kind of failure, and nothing else of the URL.
+		slog.WarnContext(ctx, "collection artwork: downloading a poster source failed", "component", "api",
+			"collection_id", collectionID, "host", download.host, "error", download.failure)
+	} else if !errors.Is(err, context.Canceled) {
+		// The server's own failure; a request the client ended is not one. An
+		// artwork store reached over HTTP reports a failed request with the
+		// object's URL, which is logged without its userinfo, query and
+		// fragment.
+		slog.ErrorContext(ctx, "collection artwork: saving a poster failed", "component", "api",
+			"collection_id", collectionID, "error", logredact.SanitizeText(logredact.SanitizeURLError(err).Error()))
+	}
+	return apiError(http.StatusInternalServerError, "internal_error", "Failed to store collection artwork")
+}
+
+// collectionImageDownloadError is an image source the server could not
+// download. It keeps the host the request named and the kind of failure, and
+// none of the transport error's text: that text quotes the requested URL and,
+// after a redirect the client could not follow, the response's Location
+// header, and a credential can sit anywhere in either.
+type collectionImageDownloadError struct {
+	host    string
+	failure string
+}
+
+func (e *collectionImageDownloadError) Error() string {
+	return "downloading image from " + e.host + ": " + e.failure
+}
+
+// collectionImageDownloadFailure reduces err, a failed download from host, to
+// an error that is safe to log. A request the client ended stays
+// context.Canceled.
+func collectionImageDownloadFailure(host string, err error) error {
+	if errors.Is(err, context.Canceled) {
+		return fmt.Errorf("downloading image: %w", context.Canceled)
+	}
+	failure := "request failed"
+	if timeout, ok := errors.AsType[net.Error](err); ok && timeout.Timeout() {
+		failure = "timed out"
+	} else if _, ok := errors.AsType[*net.DNSError](err); ok {
+		failure = "DNS lookup failed"
+	} else if _, ok := errors.AsType[*tls.CertificateVerificationError](err); ok {
+		failure = "TLS certificate not accepted"
+	} else if _, ok := errors.AsType[*net.OpError](err); ok {
+		failure = "connection failed"
+	}
+	return &collectionImageDownloadError{host: host, failure: failure}
 }
 
 // downloadCollectionImageURL fetches an image from an http(s) URL with size
 // limits. The address policy lives in client's netguard transport
 // (newCollectionImageClient), and ctx decides whether the local network is
 // allowed. An address the policy refuses fails with
-// errCollectionImageSourceNotAllowed.
+// errCollectionImageSourceNotAllowed. A request or a body read that fails any
+// other way fails with a collectionImageDownloadError, which keeps the host
+// and drops the transport's own text.
 func downloadCollectionImageURL(ctx context.Context, client *http.Client, rawURL string) ([]byte, error) {
 	if client == nil {
 		return nil, errors.New("collection image downloads have no HTTP client")
@@ -154,24 +235,18 @@ func downloadCollectionImageURL(ctx context.Context, client *http.Client, rawURL
 	if parsed.Hostname() == "" {
 		return nil, invalidCollectionImage("The image source URL is not valid.", nil)
 	}
-	if err := netguard.CheckURL(ctx, parsed.String(), netguard.PrivateAccess(ctx)); err != nil {
-		if errors.Is(err, netguard.ErrPrivateDestination) || errors.Is(err, netguard.ErrBlockedDestination) {
-			return nil, errCollectionImageSourceNotAllowed
-		}
-		return nil, err
-	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
 	if err != nil {
-		return nil, fmt.Errorf("building request: %w", err)
+		return nil, invalidCollectionImage("The image source URL is not valid.", nil)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
 		if errors.Is(err, netguard.ErrPrivateDestination) || errors.Is(err, netguard.ErrBlockedDestination) {
 			return nil, errCollectionImageSourceNotAllowed
 		}
-		return nil, fmt.Errorf("downloading image: %w", err)
+		return nil, collectionImageDownloadFailure(parsed.Host, err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		// The client message omits the upstream status so the route does not
@@ -186,7 +261,7 @@ func downloadCollectionImageURL(ctx context.Context, client *http.Client, rawURL
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, collectionImageMaxBytes+1))
 	if err != nil {
-		return nil, fmt.Errorf("reading image response: %w", err)
+		return nil, collectionImageDownloadFailure(parsed.Host, err)
 	}
 	if len(data) > collectionImageMaxBytes {
 		return nil, invalidCollectionImage("The image exceeds the 10 MB limit.", nil)
@@ -194,6 +269,12 @@ func downloadCollectionImageURL(ctx context.Context, client *http.Client, rawURL
 	return data, nil
 }
 
+// uploadCollectionImageVariants generates resized variants for the given
+// image bytes, uploads them as revisioned artwork keys under
+// "{prefix}/{collectionID}/{imageType}/" (e.g. "original.{revision}.webp"), and
+// returns the S3 path of the original variant plus a thumbhash computed from
+// the w300 variant. The content revision gives replacement artwork a new URL
+// (issue #1258).
 func uploadCollectionImageVariants(
 	ctx context.Context,
 	store blobstore.Store,
@@ -205,7 +286,7 @@ func uploadCollectionImageVariants(
 	case "poster":
 		widths = collectionPosterWidths
 	case "backdrop":
-		widths = []int{1280, 300}
+		widths = collectionBackdropWidths
 	default:
 		return "", "", fmt.Errorf("invalid image type: %s", imageType)
 	}
@@ -223,6 +304,10 @@ func uploadCollectionImageVariants(
 // collection poster.
 var collectionPosterWidths = catalog.CollectionPosterWidths
 
+// collectionBackdropWidths are the resized variants stored beside an original
+// collection backdrop, widest first. A collection page shows the widest.
+var collectionBackdropWidths = []int{1280, 300}
+
 // putCollectionImageVariants generates the given resized variants of fileData
 // and uploads them, with the original, as basePath/{variant}.{revision}.{ext}.
 // It returns the original's key and a thumbhash of the w300 variant.
@@ -236,38 +321,75 @@ func putCollectionImageVariants(
 	if store == nil {
 		return "", "", fmt.Errorf("image upload requires configured S3 storage")
 	}
+	variants, err := generateCollectionImageVariants(fileData, widths)
+	if err != nil {
+		return "", "", err
+	}
+	s3Path, err = storeCollectionImageVariants(ctx, store, basePath, revision, variants)
+	if err != nil {
+		return "", "", err
+	}
+	return s3Path, variants.thumbhash, nil
+}
+
+// collectionImageVariants is collection artwork decoded into the variants to
+// store, with a thumbhash of the w300 variant.
+type collectionImageVariants struct {
+	result    *imageutil.VariantResult
+	thumbhash string
+}
+
+// generateCollectionImageVariants decodes fileData into the original and the
+// given resized variants and computes the thumbhash. Every decode happens
+// here and nothing is stored, so a caller can refuse an image before it
+// writes anything.
+func generateCollectionImageVariants(fileData []byte, widths []int) (*collectionImageVariants, error) {
 	// Bytes libvips cannot read, and JPEG or PNG pixel data that does not
 	// decode, are the caller's artwork problem; any other failure stays a
 	// server error.
 	result, err := imageutil.GenerateVariants(fileData, widths)
-	if err != nil && (errors.Is(err, imageutil.ErrInvalidImage) || imageutil.PixelDataUndecodable(fileData)) {
-		return "", "", invalidCollectionImage("The file is not a supported image.", err)
+	if err != nil && imageutil.SourceUnusable(err, fileData) {
+		return nil, invalidCollectionImage("The file is not a supported image.", err)
+	}
+	if errors.Is(err, imageutil.ErrBusy) {
+		return nil, busyCollectionImage(err)
 	}
 	if err != nil {
-		return "", "", fmt.Errorf("generating image variants: %w", err)
+		return nil, fmt.Errorf("generating image variants: %w", err)
 	}
-
-	var w300Data []byte
+	variants := &collectionImageVariants{result: result}
 	for _, v := range result.Variants {
-		key := artworkkey.Build(basePath, v.Key, revision, result.Ext)
+		if v.Key == "w300" && len(v.Data) > 0 {
+			variants.thumbhash, err = imageutil.Thumbhash(v.Data)
+			if errors.Is(err, imageutil.ErrBusy) {
+				return nil, busyCollectionImage(err)
+			}
+			if err != nil {
+				return nil, fmt.Errorf("computing thumbhash: %w", err)
+			}
+		}
+	}
+	return variants, nil
+}
+
+// storeCollectionImageVariants uploads generated variants as
+// basePath/{variant}.{revision}.{ext} and returns the original's key.
+func storeCollectionImageVariants(
+	ctx context.Context,
+	store blobstore.Store,
+	basePath, revision string,
+	variants *collectionImageVariants,
+) (s3Path string, err error) {
+	for _, v := range variants.result.Variants {
+		key := artworkkey.Build(basePath, v.Key, revision, variants.result.Ext)
 		if err := store.Put(ctx, key, v.Data); err != nil {
-			return "", "", fmt.Errorf("uploading %s: %w", v.Key, err)
+			return "", fmt.Errorf("uploading %s: %w", v.Key, err)
 		}
-		if v.Key == "w300" {
-			w300Data = v.Data
-		}
-		if v.Key == "original" {
+		if v.Key == artworkkey.OriginalVariant {
 			s3Path = key
 		}
 	}
-
-	if len(w300Data) > 0 {
-		thumbhashStr, err = imageutil.Thumbhash(w300Data)
-		if err != nil {
-			return "", "", fmt.Errorf("computing thumbhash: %w", err)
-		}
-	}
-	return s3Path, thumbhashStr, nil
+	return s3Path, nil
 }
 
 // collectionImageRevision derives a short content revision for artwork keys.
@@ -366,18 +488,20 @@ func cleanUpReplacedCollectionImage(
 	}
 }
 
-// removeDeletedCollectionArtwork deletes a deleted collection's whole artwork
-// directory: every image revision and collage. The row delete has committed,
-// so the cleanup outlives a canceled request, bounded by
+// removeDeletedCollectionArtwork deletes deleted collections' whole artwork
+// directories: every image revision and collage. The row deletes have
+// committed, so the cleanup outlives a canceled request, bounded as a whole by
 // collectionImageCleanupTimeout, and a failure only logs.
-func removeDeletedCollectionArtwork(ctx context.Context, store blobstore.Store, prefix, collectionID string) {
-	if store == nil {
+func removeDeletedCollectionArtwork(ctx context.Context, store blobstore.Store, prefix string, collectionIDs ...string) {
+	if store == nil || len(collectionIDs) == 0 {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), collectionImageCleanupTimeout)
 	defer cancel()
-	if _, err := store.DeletePrefix(ctx, fmt.Sprintf("%s/%s/", prefix, collectionID)); err != nil {
-		slog.WarnContext(ctx, "collection delete: removing artwork failed", "component", "api", "collection_id", collectionID, "prefix", prefix, "error", err)
+	for _, collectionID := range collectionIDs {
+		if _, err := store.DeletePrefix(ctx, fmt.Sprintf("%s/%s/", prefix, collectionID)); err != nil {
+			slog.WarnContext(ctx, "collection delete: removing artwork failed", "component", "api", "collection_id", collectionID, "prefix", prefix, "error", err)
+		}
 	}
 }
 
@@ -398,7 +522,6 @@ type collectionCollageComposer struct {
 	store      blobstore.Store
 	posters    itemPosterSigner
 	signer     *artworkurl.Signer
-	repair     ArtworkRepairEnqueuer
 	httpClient *http.Client
 }
 
@@ -408,14 +531,14 @@ type collectionCollageComposer struct {
 // personal collections without collages. signer is the artwork URL signer
 // that local storage resolves posters with; nil when storage serves its own
 // URLs. A nil httpClient uses newCollectionImageClient.
-func NewPersonalCollectionCollageGenerator(store blobstore.Store, posters itemPosterSigner, signer *artworkurl.Signer, repair ArtworkRepairEnqueuer, httpClient *http.Client) catalog.CollageGenerator {
+func NewPersonalCollectionCollageGenerator(store blobstore.Store, posters itemPosterSigner, signer *artworkurl.Signer, httpClient *http.Client) catalog.CollageGenerator {
 	if store == nil || posters == nil {
 		return nil
 	}
 	if httpClient == nil {
 		httpClient = newCollectionImageClient()
 	}
-	return collectionCollageComposer{prefix: userCollectionImagePrefix, store: store, posters: posters, signer: signer, repair: repair, httpClient: httpClient}
+	return collectionCollageComposer{prefix: userCollectionImagePrefix, store: store, posters: posters, signer: signer, httpClient: httpClient}
 }
 
 // ComposeCollectionCollage fetches the source posters, composes them and
@@ -481,25 +604,20 @@ func (c collectionCollageComposer) CollectionCollagePath(collectionID, key strin
 // artworkurl.FetchContext tells those apart, and netguard refuses blocked
 // addresses either way.
 func (c collectionCollageComposer) fetchImage(ctx context.Context, imageURL string) ([]byte, error) {
-	if isRootRelativeURL(imageURL) {
-		key, ok := c.storedArtworkKey(imageURL, time.Now())
-		if !ok {
-			return nil, c.localSourceError(imageURL)
+	if c.store != nil && c.signer != nil {
+		if key, ok := c.signer.SignedKey(imageURL, time.Now()); ok {
+			body, _, err := c.store.Get(ctx, key)
+			if err != nil {
+				return nil, fmt.Errorf("reading stored poster: %w", err)
+			}
+			defer func() { _ = body.Close() }()
+			return io.ReadAll(io.LimitReader(body, collectionImageMaxBytes))
 		}
-		data, err := c.readStoredImage(ctx, key)
-		if err != nil {
-			return nil, fmt.Errorf("reading stored poster: %w", err)
-		}
-		return data, nil
 	}
 	if c.httpClient == nil {
 		return nil, errors.New("collage downloads have no HTTP client")
 	}
-	fetchCtx := artworkurl.FetchContext(ctx, c.store, imageURL)
-	// Collage sources are catalog posters the server resolves, often to
-	// artwork storage on its own network, so they may reach the local network.
-	fetchCtx = netguard.WithPrivateAccess(fetchCtx)
-	req, err := http.NewRequestWithContext(fetchCtx, http.MethodGet, imageURL, nil)
+	req, err := http.NewRequestWithContext(artworkurl.FetchContext(ctx, c.store, imageURL), http.MethodGet, imageURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -512,66 +630,4 @@ func (c collectionCollageComposer) fetchImage(ctx context.Context, imageURL stri
 		return nil, fmt.Errorf("image fetch returned status %d", resp.StatusCode)
 	}
 	return io.ReadAll(io.LimitReader(resp.Body, collectionImageMaxBytes))
-}
-
-// isRootRelativeURL reports whether rawURL names this server's own origin -- no
-// scheme and no host -- as the local artwork backend issues. Such a URL can only
-// be read from the store, never fetched over HTTP.
-func isRootRelativeURL(rawURL string) bool {
-	u, err := url.Parse(strings.TrimSpace(rawURL))
-	if err != nil {
-		return false
-	}
-	return u.Scheme == "" && u.Host == ""
-}
-
-// localSourceError explains a root-relative source URL that was not read from
-// the store. The URL can only name a store key through the signer, so a missing
-// signer is a configuration error. Otherwise the resolver signed the URL before
-// handing it over, so one that no longer verifies has expired or carries a bad
-// signature; that is a data problem, not a fetchable address. The message names
-// the path only, never the URL or the query string that carries the signature.
-func (c collectionCollageComposer) localSourceError(imageURL string) error {
-	if c.signer == nil {
-		return errCollageArtworkSignerNotConfigured
-	}
-	path := imageURL
-	if u, err := url.Parse(strings.TrimSpace(imageURL)); err == nil {
-		path = u.Path
-	}
-	return fmt.Errorf("collage source path %q is not a valid signed artwork URL (expired or bad signature)", path)
-}
-
-// storedArtworkKey maps a resolved URL to the artwork store key it names when
-// the signer minted it, so a local-storage source can be read without a
-// request. An absolute URL, such as a presigned or public S3 URL, does not
-// match and falls through to the HTTP fetch. now is the instant the URL's
-// expiry is verified against.
-func (c collectionCollageComposer) storedArtworkKey(imageURL string, now time.Time) (string, bool) {
-	if c.signer == nil {
-		return "", false
-	}
-	return c.signer.SignedKey(imageURL, now)
-}
-
-// readStoredImage reads a source image's bytes from the artwork store.
-func (c collectionCollageComposer) readStoredImage(ctx context.Context, key string) ([]byte, error) {
-	if c.store == nil {
-		return nil, errors.New("collage artwork storage is not configured")
-	}
-	body, info, err := c.store.Get(ctx, key)
-	if err != nil {
-		// A missing revisioned source is queued for regeneration, as the
-		// signed artwork route does: the build fails now, and a later read
-		// retries it once the object is rebuilt.
-		if errors.Is(err, blobstore.ErrNotFound) && c.repair != nil && artworkkey.Revision(key) != "" {
-			_, _ = c.repair.EnqueueArtworkRepair(ctx, []string{artworkkey.OriginalOf(key)}, 1)
-		}
-		return nil, err
-	}
-	defer func() { _ = body.Close() }()
-	if info.Size > collectionImageMaxBytes {
-		return nil, fmt.Errorf("stored image is %d bytes, over the %d byte limit", info.Size, collectionImageMaxBytes)
-	}
-	return io.ReadAll(io.LimitReader(body, collectionImageMaxBytes))
 }

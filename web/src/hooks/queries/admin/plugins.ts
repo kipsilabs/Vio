@@ -6,7 +6,6 @@ import { toast } from "sonner";
 import { t } from "@/i18n";
 
 import {
-  apiV1,
   captureProfileRequestContext,
   isCapturedProfileAuthorityActive,
   StaleApiRequestContextError,
@@ -99,7 +98,7 @@ export function useAdminPluginProvisioningStatus() {
   });
 }
 
-const PLUGIN_SOURCE_KINDS = new Set(["silo", "vio", "approved_community", "external"]);
+const PLUGIN_SOURCE_KINDS = new Set(["silo", "approved_community", "external"]);
 const PLUGIN_PAGE_LIMIT = 100;
 const PLUGIN_PAGE_CAP = 100;
 
@@ -246,7 +245,6 @@ export function useAdminPluginRepositories() {
             throw new Error("Invalid repository identifier in response.");
           if (
             row.source_kind !== "silo" &&
-            row.source_kind !== "vio" &&
             row.source_kind !== "approved_community" &&
             row.source_kind !== "external"
           )
@@ -297,9 +295,7 @@ export function useAdminPlugins() {
     repositories: repositoriesQuery.data ?? [],
     repositoriesError: repositoriesQuery.error,
     catalog: catalogQuery.data ?? [],
-    catalogError: catalogQuery.error,
     installations: installationsQuery.data ?? [],
-    installationsError: installationsQuery.error,
     catalogSettings: catalogSettingsQuery.data,
     isLoading:
       repositoriesQuery.isLoading ||
@@ -311,8 +307,6 @@ export function useAdminPlugins() {
       catalogQuery.isFetching ||
       installationsQuery.isFetching ||
       catalogSettingsQuery.isFetching,
-    refetchCatalog: catalogQuery.refetch,
-    refetchInstallations: installationsQuery.refetch,
   };
 }
 
@@ -1112,17 +1106,4 @@ export function useSavePluginTaskBinding() {
       body: SavePluginTaskBindingRequest;
     }) => mutation.mutateAsync(captureTaskBindingIntent(input)),
   };
-}
-
-// usePluginInstallationConfigOptions loads dynamic SELECT options from a plugin's
-// request_router.v1 ListConfigOptions gRPC method. Used by PluginConfigForm to
-// populate dropdown fields for self-contained plugins (no external base_url required).
-export function usePluginInstallationConfigOptions() {
-  return useMutation({
-    mutationFn: ({ installationId }: { installationId: number }) =>
-      apiV1<Record<string, Array<{ value: string; label: string }>>>(
-        `/admin/plugins/installations/${installationId}/config-options`,
-        { method: "POST" },
-      ),
-  });
 }

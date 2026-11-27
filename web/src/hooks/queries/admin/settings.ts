@@ -26,6 +26,7 @@ import type {
   JellyfinCompatStatus,
   JellyfinCompatWebInstallRequest,
 } from "@/api/types";
+import { serverText } from "@/i18n";
 import { adminKeys, compatKeys, settingsKeys, themeKeys } from "../keys";
 import { invalidateAdminDefaultQueries } from "../settingValues";
 import { adminDefaultSettingFor } from "@/lib/settingsAdminDefaults";
@@ -497,8 +498,7 @@ export function useCheckAdminSettingsConnection() {
       });
       return {
         ...result,
-        // The server sends the check's sentence; there is no keyed copy for it.
-        message: result.message,
+        message: serverText(result.message_key, result.message_args, result.message),
       };
     },
     retry: false,

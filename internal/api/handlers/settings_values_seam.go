@@ -180,7 +180,7 @@ func (h *SettingValuesHandler) sessionIdentity(
 		family := settingscontract.ClientFamily(strings.TrimSpace(req.ClientFamily))
 		if !family.Valid() {
 			return userstore.SettingIdentity{}, fieldError(settingFieldClientFamily,
-				"X-Vio-Client-Family header must be one of tv, mobile, tablet, desktop or web")
+				"X-Silo-Client-Family header must be one of tv, mobile, tablet, desktop or web")
 		}
 		identity.ClientFamily = family
 	}
@@ -197,7 +197,7 @@ func (h *SettingValuesHandler) sessionIdentity(
 		}
 		if identity.DeviceID == "" {
 			return userstore.SettingIdentity{}, fieldError(settingFieldDeviceHeader,
-				"X-Vio-Device-Id header is required for a device override")
+				"X-Silo-Device-Id header is required for a device override")
 		}
 		if named != "" {
 			if err := h.deviceBelongs(ctx, store, identity.ProfileID, named); err != nil {
@@ -334,7 +334,7 @@ func (h *SettingValuesHandler) libraryExists(ctx context.Context, libraryID int)
 // An absent header deliberately drops the profile_client layer so pre-revision
 // 5 callers keep resolving broader fallbacks; explicit profile_client reads and
 // writes still require the header in sessionIdentity. The server never
-// guesses this identity from X-Vio-Device-Platform: that header is free-form
+// guesses this identity from X-Silo-Device-Platform: that header is free-form
 // display metadata, while client_family is a closed storage key shared by like
 // clients.
 func (h *SettingValuesHandler) clientFamilyFor(
@@ -355,7 +355,7 @@ func (h *SettingValuesHandler) clientFamilyFor(
 	family := settingscontract.ClientFamily(value)
 	if !family.Valid() {
 		return "", false, fieldError(settingFieldClientFamily,
-			"X-Vio-Client-Family header must be one of tv, mobile, tablet, desktop or web")
+			"X-Silo-Client-Family header must be one of tv, mobile, tablet, desktop or web")
 	}
 	return family, eligible, nil
 }
@@ -628,18 +628,6 @@ func (h *SettingValuesHandler) clearSettingValue(
 			publishUserSettingsEvent(ctx, h.EventsHub,
 				eventUserID, identity.ProfileID, mirrorKey, string(identity.Scope))
 		}
-		if subtitlePreferenceClearsIdempotently(identity.Key) {
-			// Clearing a subtitle preference is "inherit the profile default
-			// again", and the end state it names is exactly what an absent row
-			// already is. Clients reset these per series when the viewer picks
-			// Auto, so the common case is a series with no override at all; the
-			// 404 that used to come back made an ordinary reset look like a
-			// failed request on every item the viewer never overrode.
-			slog.DebugContext(ctx, "clearing a subtitle preference that was already unset",
-				"component", "api", "key", identity.Key,
-				"scope", string(identity.Scope))
-			return nil
-		}
 		return apiError(http.StatusNotFound, policyErrorNotFound, "No value is set at this scope")
 	}
 	auditSettingsForOther(ctx, settingsAuditRecord{
@@ -656,23 +644,6 @@ func (h *SettingValuesHandler) clearSettingValue(
 		eventUserID, identity.ProfileID, identity.Key, string(identity.Scope))
 	notifyScopeSettingChanged(ctx, h.RecWorker, eventUserID, identity.ProfileID, identity.Key)
 	return nil
-}
-
-// subtitlePreferenceClearsIdempotently reports whether a DELETE of this key at
-// a scope with no stored row is the state the caller asked for rather than a
-// missing resource. These are the canonical series subtitle preferences the
-// player and the item page's "Auto" reset clear (SERIES_SUBTITLE_SETTING_KEYS
-// on the client): an absent row already means "inherit the profile default",
-// so answering 204 makes the reset idempotent for every series the viewer never
-// overrode. Every other key keeps the 404 that tells a caller its unset was
-// aimed at nothing.
-func subtitlePreferenceClearsIdempotently(key string) bool {
-	switch key {
-	case settingskeys.PlaybackSubtitleLanguage, settingskeys.PlaybackSubtitleMode:
-		return true
-	default:
-		return false
-	}
 }
 
 // setNavigationShortcut applies one desired-state edit to the shared profile
@@ -774,32 +745,10 @@ func (h *SettingValuesHandler) setNavigationShortcut(
 // Batched deliberately: a client opening a settings screen needs every key at
 // once, and a season view needs several keys across many series. One store read
 // serves all of it.
-// normalizeEffectiveKeys drops empty and whitespace-only key entries. A client
-// that serializes an empty key list as `?keys=` sends one empty element; that
-// means "no keys named", not an unknown setting, and must resolve like an
-// omitted list rather than fail with "No setting named  exists". v1's
-// parseSettingKeys filtered the same way. A non-empty key is left untouched so
-// an unknown one is still rejected by its exact name.
-func normalizeEffectiveKeys(raw []string) []string {
-	if len(raw) == 0 {
-		return nil
-	}
-	keys := make([]string, 0, len(raw))
-	for _, key := range raw {
-		if strings.TrimSpace(key) != "" {
-			keys = append(keys, key)
-		}
-	}
-	if len(keys) == 0 {
-		return nil
-	}
-	return keys
-}
-
 func (h *SettingValuesHandler) resolveEffective(
 	ctx context.Context, store userstore.UserStore, q EffectiveSettingsQuery,
 ) ([]effectiveSettingValueResponse, *APIError) {
-	keys := normalizeEffectiveKeys(q.Keys)
+	keys := q.Keys
 	if len(keys) == 0 {
 		// No keys named means every remote definition, which is what a settings
 		// screen wants and saves clients enumerating the manifest themselves.
@@ -861,14 +810,19 @@ func (h *SettingValuesHandler) resolveEffective(
 			"Too many library_ids/series_ids in one request; resolve in smaller batches")
 	}
 
-	// A read names the profile (and optionally a device). An absent device
-	// identity is not an error: the resolver skips profile_device candidates
-	// and answers the profile/account/default layer, and the response's
-	// `source` field says which layer won. Failing the read closed left a
-	// viewer that cannot send a device header — a playback client reading the
-	// owner's audio-language default — with no effective values at all, so the
-	// client silently fell back to its own default. A client that wants device
-	// resolution still sends X-Vio-Device-Id and gets it.
+	// A device-aware key resolved without a device identity would silently
+	// skip every stored device override and pass the profile fallback off as
+	// the effective value — a plausible wrong answer. Fail closed instead:
+	// the write path already requires the header for device overrides.
+	if rc.DeviceID == "" {
+		for _, key := range keys {
+			if def, ok := h.contract.Lookup(key); ok &&
+				def.AllowsScope(settingscontract.ScopeProfileDevice) {
+				return nil, fieldError(settingFieldDeviceHeader,
+					"X-Silo-Device-Id header is required to resolve "+key)
+			}
+		}
+	}
 
 	resolved, err := h.resolver.Resolve(ctx, store, rc, keys, h.constraintsFor(ctx))
 	if err != nil {
@@ -891,7 +845,7 @@ func (h *SettingValuesHandler) resolveEffective(
 func (h *SettingValuesHandler) resolveEffectiveContexts(
 	ctx context.Context, store userstore.UserStore, q EffectiveSettingsQuery, requested []effectiveContextRequest,
 ) ([]effectiveContextResponse, *APIError) {
-	keys := normalizeEffectiveKeys(q.Keys)
+	keys := q.Keys
 	if len(keys) == 0 {
 		return nil, fieldError(settingFieldKeys, "keys must contain at least one setting")
 	}
@@ -914,9 +868,13 @@ func (h *SettingValuesHandler) resolveEffectiveContexts(
 	if apiErr != nil {
 		return nil, apiErr
 	}
-	// An absent device identity resolves the profile/account/default layers;
-	// see resolveEffective. The response's `source` names the winning layer,
-	// so a client can tell that no device override applied.
+	if deviceID == "" {
+		for _, key := range keys {
+			if def, exists := h.contract.Lookup(key); exists && def.AllowsScope(settingscontract.ScopeProfileDevice) {
+				return nil, fieldError(settingFieldDeviceHeader, "X-Silo-Device-Id header is required to resolve "+key)
+			}
+		}
+	}
 
 	seen := make(map[string]struct{}, len(requested))
 	contexts := make([]settingsresolve.Context, 0, len(requested))

@@ -18,6 +18,8 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/Silo-Server/silo-server/internal/access"
 	"github.com/Silo-Server/silo-server/internal/cache"
 	"github.com/Silo-Server/silo-server/internal/catalog"
@@ -206,6 +208,7 @@ type itemRefreshTestRefresher struct {
 	contentID  string
 	folderID   int
 	reset      bool
+	rebuilt    bool
 	err        error
 	// authorize, when set, stands in for a merge onto these libraries.
 	authorize []int
@@ -298,6 +301,11 @@ func TestItemRefreshHoldsCuratorJobsToTheirLibraries(t *testing.T) {
 func (r *itemRefreshTestRefresher) ResetTargetForLibrary(ctx context.Context, targetType, contentID string, folderID int) error {
 	r.reset = true
 	return r.RefreshTargetForLibrary(ctx, targetType, contentID, folderID)
+}
+
+func (r *itemRefreshTestRefresher) RebuildItemForLibrary(ctx context.Context, contentID string, folderID int) error {
+	r.rebuilt = true
+	return r.RefreshTargetForLibrary(ctx, "item", contentID, folderID)
 }
 
 // newItemRefreshTestExecutor builds an executor over enabled folder 3 with
@@ -502,6 +510,54 @@ func TestItemRefreshExecutorFailsScanRunWhenIngestFails(t *testing.T) {
 	}
 }
 
+type itemRefreshTestAudiobooks struct {
+	calls []string
+	err   error
+}
+
+func (a *itemRefreshTestAudiobooks) ClaimRefresh(_ context.Context, contentID string) (string, error) {
+	a.calls = append(a.calls, "claim "+contentID)
+	return "token", nil
+}
+
+func (a *itemRefreshTestAudiobooks) ResetMatchTx(_ context.Context, _ pgx.Tx, contentID, _ string) error {
+	a.calls = append(a.calls, "reset "+contentID)
+	return nil
+}
+
+func (a *itemRefreshTestAudiobooks) Refresh(_ context.Context, contentID, _ string) error {
+	a.calls = append(a.calls, "refresh "+contentID)
+	return a.err
+}
+
+func (a *itemRefreshTestAudiobooks) ReleaseRefresh(_ context.Context, contentID, _ string) {
+	a.calls = append(a.calls, "release "+contentID)
+}
+
+// itemRefreshTestItemStatuses reports no item for its first goneReads reads,
+// every item as pending for its first pendingReads reads, then as matched.
+type itemRefreshTestItemStatuses struct {
+	goneReads    int
+	pendingReads int
+	reads        int
+}
+
+func (r *itemRefreshTestItemStatuses) GetStatusByIDs(_ context.Context, ids []string) (map[string]string, error) {
+	r.reads++
+	if r.reads <= r.goneReads {
+		return map[string]string{}, nil
+	}
+	status := "matched"
+	if r.reads <= r.pendingReads {
+		status = "pending"
+	}
+	out := make(map[string]string, len(ids))
+	for _, id := range ids {
+		out[id] = status
+	}
+	return out, nil
+}
+
 // A complete refresh waits for the whole scope: while a file in it is still
 // unlinked, or the requested episode row isn't there yet, it checks again. A
 // file that never links doesn't fail the refresh once the wait passes.
@@ -619,6 +675,9 @@ func TestItemRefreshExecutorCompleteRefreshRebuildsAndMapsEpisodeTarget(t *testi
 	}
 	if got, want := refresher.targetType, "episode"; got != want {
 		t.Fatalf("RefreshTargetForLibrary() target_type = %q, want %q", got, want)
+	}
+	if refresher.rebuilt {
+		t.Fatal("complete refresh of an episode rebuilt the series, want a refresh of the episode")
 	}
 	if got, want := refresher.contentID, "new-episode-id"; got != want {
 		t.Fatalf("RefreshItem() content_id = %q, want %q", got, want)

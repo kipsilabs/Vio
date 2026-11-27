@@ -289,10 +289,6 @@ func (w *statusWriter) Write(b []byte) (int, error) {
 	return w.ResponseWriter.Write(b)
 }
 
-// ReadFrom forwards to the wrapped writer so io.Copy keeps the zero-copy
-// sendfile path for media bodies served below this middleware. io.Copy finds
-// io.ReaderFrom by direct type assertion and never through Unwrap(), so a
-// wrapper that omits this silently disables it.
 func (w *statusWriter) ReadFrom(src io.Reader) (int64, error) {
 	if !w.wroteHeader {
 		w.status, w.wroteHeader = http.StatusOK, true

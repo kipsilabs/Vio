@@ -13,7 +13,6 @@ import {
 } from "@/components/ui/select";
 import { useShownRatingSources } from "@/hooks/queries/ratingsCapability";
 import { useT, type Translate } from "@/i18n";
-import { COLLECTION_MAX_ITEMS } from "@/lib/collectionTemplates";
 import { COLLECTION_SOURCE_ORDER } from "@/lib/collectionSortConfig";
 import {
   manualOrderLine,
@@ -128,8 +127,8 @@ export function OrderBlock(props: OrderBlockProps) {
   if (props.mode !== "smart") {
     return (
       <div className="border-border/70 flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1 border-t pt-4">
-        <h3 className="text-[14.5px] font-semibold">{t("web.collections.fields.order")}</h3>
-        <p className="text-muted-foreground text-[13.5px]">{manualOrderLine()}</p>
+        <h3 className="text-[0.90625rem] font-semibold">{t("web.collections.fields.order")}</h3>
+        <p className="text-muted-foreground text-[0.84375rem]">{manualOrderLine()}</p>
       </div>
     );
   }
@@ -172,7 +171,7 @@ function SmartOrder({
       aria-labelledby={`${id}-heading`}
       className="border-border/70 grid gap-3 border-t pt-4"
     >
-      <h3 id={`${id}-heading`} className="text-[14.5px] font-semibold">
+      <h3 id={`${id}-heading`} className="text-[0.90625rem] font-semibold">
         {t("web.collections.fields.order")}
       </h3>
       <div className="grid gap-2.5 sm:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)_minmax(0,1fr)]">
@@ -216,7 +215,7 @@ function SmartOrder({
         <MaxTitlesInput limit={rules.limit} placeholder={noLimit()} onCommit={commitLimit} />
       </div>
       {stored ? (
-        <div className="bg-muted/50 flex flex-wrap items-center gap-x-3 gap-y-2 rounded-xl px-3 py-2.5 text-[13px]">
+        <div className="bg-muted/50 flex flex-wrap items-center gap-x-3 gap-y-2 rounded-xl px-3 py-2.5 text-[0.8125rem]">
           <Info aria-hidden className="text-muted-foreground size-4 shrink-0" />
           <p className="min-w-0 flex-1">{storedSortLine(stored)}</p>
           <Button
@@ -230,7 +229,7 @@ function SmartOrder({
           </Button>
         </div>
       ) : null}
-      <p className="text-muted-foreground text-[13px]">{orderHelp()}</p>
+      <p className="text-muted-foreground text-[0.8125rem]">{orderHelp()}</p>
     </section>
   );
 }
@@ -294,8 +293,7 @@ function SyncedOrder({
   const directions = directionLabels(t, field);
 
   function commitLimit(input: HTMLInputElement) {
-    const typed = parsedLimit(input.value, limit);
-    const next = typed === undefined ? undefined : Math.min(typed, COLLECTION_MAX_ITEMS);
+    const next = parsedLimit(input.value, limit);
     input.value = next === undefined ? "" : String(next);
     if (next !== limit) onLimitChange(next);
   }
@@ -305,7 +303,7 @@ function SyncedOrder({
       aria-labelledby={`${id}-heading`}
       className="border-border/70 grid gap-3 border-t pt-4"
     >
-      <h3 id={`${id}-heading`} className="text-[14.5px] font-semibold">
+      <h3 id={`${id}-heading`} className="text-[0.90625rem] font-semibold">
         {t("web.collections.fields.order")}
       </h3>
       <div className="grid gap-2.5 sm:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)_minmax(0,1fr)]">
@@ -367,7 +365,7 @@ function SyncedOrder({
           onCommit={commitLimit}
         />
       </div>
-      <p className="text-muted-foreground text-[13px]">
+      <p className="text-muted-foreground text-[0.8125rem]">
         {syncedOrderHelp()} {orderHelp()}
       </p>
     </section>

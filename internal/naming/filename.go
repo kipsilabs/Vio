@@ -357,7 +357,7 @@ func collapseWhitespace(value string) string {
 
 // deriveSeriesRoot finds the show folder above filePath. fileTitle is the
 // series title parsed from the file name, if any.
-func deriveSeriesRoot(filePath, fileTitle string, hasEpisodePattern bool, forceParent bool, libraryRoot string) (*SeriesRoot, bool) { //nolint:gocyclo // upstream deriveSeriesRoot exceeds Vio's complexity-30 limit; refactor tracked separately
+func deriveSeriesRoot(filePath, fileTitle string, hasEpisodePattern bool, forceParent bool, libraryRoot string) (*SeriesRoot, bool) {
 	parentDir := path.Dir(filePath)
 	fileStem := strings.TrimSuffix(path.Base(filePath), path.Ext(filePath))
 	bareSeason := ""
@@ -369,7 +369,9 @@ func deriveSeriesRoot(filePath, fileTitle string, hasEpisodePattern bool, forceP
 		inLibraryFolder := libraryRoot != "" && filepath.Clean(path.Dir(current)) == libraryRoot
 		allowNumeric := (hasEpisodePattern || forceParent) && !inLibraryFolder
 		topLevel := inLibraryFolder && mayBeShowFolder(segment, fileStem)
-		_, isSeason := seasonDirectoryNumber(segment, path.Base(path.Dir(current)), allowNumeric, topLevel)
+		// A library folder's provider IDs do not make every titled release
+		// folder in it a season; a matching title still does.
+		_, isSeason := seasonDirectoryNumberUnder(segment, path.Base(path.Dir(current)), allowNumeric, topLevel, !inLibraryFolder)
 		// A bare "Season" folder only marks the season level when it holds the
 		// file directly. Higher up it is more likely a category folder or a
 		// show that happens to be named Season. A file whose own title is the

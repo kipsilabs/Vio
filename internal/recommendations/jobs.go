@@ -343,7 +343,7 @@ func (w *Worker) claimJobs(names ...JobName) (held clusterLock, release func(), 
 			release()
 			return nil, nil, fmt.Errorf("%s %w", jobLabel(name), ErrJobRunning)
 		}
-		releases = append(releases, func() { w.setRunning(name, false) })
+		releases = append(releases, func() { w.finishJob(name) })
 		var unlock func()
 		var acquired bool
 		if held == nil {
@@ -371,8 +371,7 @@ func (w *Worker) executeJob(j job, held clusterLock) {
 	ctx, cancel := context.WithTimeout(context.Background(), j.timeout)
 	defer cancel()
 	ctx, observation := workmetrics.Start(ctx, "recommendations", time.Time{})
-	profileDone := workmetrics.Profile(ctx)
-	defer profileDone()
+	defer workmetrics.Profile(ctx)()
 
 	startLevel := slog.LevelInfo
 	if j.quietWhenIdle {

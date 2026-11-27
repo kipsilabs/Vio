@@ -15,8 +15,7 @@ import { getLanguageName } from "@/player/utils/languageNames";
 import { normalizeSubtitleMode } from "@/player/utils/subtitleMode";
 import { resolveSubtitleAutoSelect } from "@/player/utils/subtitleSort";
 import { getSubtitleFormatLabel } from "@/player/utils/subtitleCodecs";
-import { buildPublishedSubtitleTracks } from "@/player/utils/subtitleInventory";
-import { audioTrackIdentity, audioTrackLabel, formatChannels } from "@/lib/mediaFormat";
+import { audioTrackLabel, formatChannels } from "@/lib/mediaFormat";
 import { t } from "@/i18n";
 import {
   buildVersionSubtitleInventory,
@@ -147,15 +146,10 @@ export function formatAudioTrackSummary(track: VersionAudioTrack | undefined): s
     return t("web.detail.audio.unknown");
   }
 
-  const identity = audioTrackIdentity(track, 1);
+  const language = getLanguageName(track.language ?? "") || t("web.detail.audio.unknown");
   const codec = audioTrackLabel(track);
   const channels = formatChannels(track.channels);
-  // A row with no declared language leads with its format instead of naming a
-  // language it never had; the summary still lists the format details once.
-  if (identity.languageUndeclared) {
-    return [codec, channels].filter(Boolean).join(" · ") || t("web.detail.audio.unknown");
-  }
-  return [identity.title, codec, channels].filter(Boolean).join(" · ");
+  return [language, codec, channels].filter(Boolean).join(" · ");
 }
 
 export function toSubtitleTrackSignature(
@@ -172,32 +166,14 @@ export function toSubtitleTrackSignature(
   };
 }
 
-/**
- * Whether two pre-play subtitle selections name the same row.
- *
- * The dense combined ordinal (`track_index`) is the row's identity wherever the
- * inventory published one. Descriptor fields alone cannot separate two streams
- * in the same language with the same codec and label — the case a release with
- * two German SRT tracks produces — so comparing only those would light both
- * rows. Rows the derivation could not place (a duplicate the server collapsed)
- * keep the descriptor comparison, which is all they have.
- */
 export function subtitleSelectionEquals(
   left: PrePlaySubtitleSelection | null | undefined,
   right: PrePlaySubtitleSelection | null | undefined,
 ): boolean {
   if (!left || !right) return false;
-  if (left.source !== right.source) return false;
-  if (left.source === "downloaded") {
-    return (
-      (left.downloaded_subtitle_id ?? null) === (right.downloaded_subtitle_id ?? null) &&
-      (left.track_index ?? null) === (right.track_index ?? null)
-    );
-  }
-  if (left.track_index != null || right.track_index != null) {
-    return left.track_index === right.track_index;
-  }
   return (
+    left.source === right.source &&
+    (left.downloaded_subtitle_id ?? null) === (right.downloaded_subtitle_id ?? null) &&
     (left.external_subtitle_path ?? null) === (right.external_subtitle_path ?? null) &&
     (left.language ?? "") === (right.language ?? "") &&
     (left.codec ?? "") === (right.codec ?? "") &&
@@ -213,34 +189,6 @@ export function buildPrePlaySubtitleCandidates(
 ): PrePlaySubtitleCandidateSections {
   const inventory = buildVersionSubtitleInventory(tracks, downloaded);
   const all: PrePlaySubtitleCandidate[] = [];
-
-  // The same single ordinal derivation the watch route and the player use:
-  // external → embedded → downloaded, de-duplicated and dense. Keys mirror
-  // VersionSubtitleInventoryRow identity (`source:index` / downloaded row id)
-  // with the catalog enumeration index as the no-explicit-index fallback, so
-  // lookups always hit the row the published ordinal was assigned to.
-  const trackList = tracks ?? [];
-  const denseOrdinalByKey = new Map<string, number>();
-  for (const track of buildPublishedSubtitleTracks(trackList, downloaded)) {
-    if (track.source === "downloaded") {
-      if (track.downloadedSubtitleId != null) {
-        denseOrdinalByKey.set(`downloaded:${track.downloadedSubtitleId}`, track.index);
-      }
-      continue;
-    }
-    if (track.containerIndex != null) {
-      denseOrdinalByKey.set(`${track.source}:${track.containerIndex}`, track.index);
-    }
-  }
-
-  const denseOrdinalFor = (row: VersionSubtitleInventoryRow): number | undefined => {
-    if (row.source === "downloaded") {
-      return row.downloadedSubtitleId == null
-        ? undefined
-        : denseOrdinalByKey.get(`downloaded:${row.downloadedSubtitleId}`);
-    }
-    return denseOrdinalByKey.get(`${row.source}:${row.index}`);
-  };
 
   const mapBuiltIn = (rows: VersionSubtitleInventoryRow[], source: "embedded" | "external") =>
     rows.map((row, index) => {
@@ -259,11 +207,7 @@ export function buildPrePlaySubtitleCandidates(
           label,
           forced: row.forced,
           hearing_impaired: row.hearingImpaired,
-          // Dense combined ordinal in the server's inventory order
-          // (external → embedded → downloaded) — NOT the container stream
-          // index, which is non-dense (2,3,4 after video 0 + audio 1) and
-          // would offset track resolution if ever sent as an ordinal.
-          track_index: denseOrdinalFor(row),
+          track_index: row.index,
         },
         summary: row.languageLabel,
       };
@@ -273,7 +217,6 @@ export function buildPrePlaySubtitleCandidates(
 
   const embedded = mapBuiltIn(inventory.embedded, "embedded");
   const external = mapBuiltIn(inventory.external, "external");
-
   const downloadedRows = inventory.downloaded.map((row) => {
     const match = (downloaded ?? []).find((subtitle) => subtitle.id === row.downloadedSubtitleId);
     const label = match ? normalizeDownloadedLabel(match) : row.releaseName || row.languageLabel;
@@ -287,8 +230,6 @@ export function buildPrePlaySubtitleCandidates(
         forced: row.forced,
         hearing_impaired: row.hearingImpaired,
         downloaded_subtitle_id: row.downloadedSubtitleId,
-        // Dense combined ordinal — see the built-in comment above.
-        track_index: denseOrdinalFor(row),
       },
       summary: row.languageLabel,
     };

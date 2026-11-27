@@ -10,10 +10,8 @@ import type {
   SubtitleMode,
   WatchPageProps,
 } from "@/player";
-import type { PlayerPlaybackVariant } from "@/player/types";
 import { resolveVersionAudioLanguage } from "@/player/utils/effectiveAudioLanguage";
 import { subtitleNeedsBurnIn } from "@/player/utils/subtitleCodecs";
-import { buildPublishedSubtitleTracks } from "@/player/utils/subtitleInventory";
 import { resolveSubtitleAutoSelect } from "@/player/utils/subtitleSort";
 
 export interface WatchRouteRequest {
@@ -32,12 +30,6 @@ export interface WatchRouteRequest {
   versionPicked?: boolean;
   returnHref?: string;
   requestKey: string;
-  /** True when `fileId` was explicitly chosen by the viewer on the media page. */
-  explicitFileSelection?: boolean;
-  /** When true, the server should force a re-link/re-query of the virtual file
-   *  on this start attempt. Only set when the viewer explicitly picks an
-   *  unavailable version. */
-  forceRelink?: boolean;
 }
 
 export interface WatchPlaybackStartInput {
@@ -53,11 +45,6 @@ export interface WatchPlaybackStartInput {
   prePlaySubtitleSelection?: PrePlaySubtitleSelection | null;
   versionPicked?: boolean;
   returnHref?: string;
-  explicitFileSelection?: boolean;
-  /** When true, the server should force a re-link/re-query of the virtual file
-   *  on this start attempt. Only set when the viewer explicitly picks an
-   *  unavailable version. */
-  forceRelink?: boolean;
 }
 
 function parseOptionalInt(value: string | null): number | undefined {
@@ -79,7 +66,6 @@ function buildWatchRouteRequestKey(
   prePlaySubtitleMode: "auto" | "off" | "explicit" | undefined,
   prePlaySubtitleSelection: PrePlaySubtitleSelection | null | undefined,
   versionPicked: boolean,
-  explicitFileSelection: boolean,
 ): string {
   return JSON.stringify([
     contentId,
@@ -93,10 +79,6 @@ function buildWatchRouteRequestKey(
     prePlaySubtitleMode ?? null,
     prePlaySubtitleSelection ?? null,
     versionPicked,
-    // Two starts that differ only here are different requests: one lets the
-    // server pick the file, the other pins it. A route sync must not fold the
-    // second into the first.
-    explicitFileSelection,
   ]);
 }
 
@@ -113,8 +95,6 @@ export function createWatchRouteRequest({
   prePlaySubtitleSelection,
   versionPicked = false,
   returnHref,
-  explicitFileSelection,
-  forceRelink,
 }: WatchPlaybackStartInput): WatchRouteRequest {
   return {
     contentId,
@@ -129,8 +109,6 @@ export function createWatchRouteRequest({
     prePlaySubtitleSelection,
     versionPicked,
     returnHref,
-    explicitFileSelection,
-    forceRelink,
     requestKey: buildWatchRouteRequestKey(
       contentId,
       fileId,
@@ -143,7 +121,6 @@ export function createWatchRouteRequest({
       prePlaySubtitleMode,
       prePlaySubtitleSelection,
       versionPicked,
-      explicitFileSelection === true,
     ),
   };
 }
@@ -243,11 +220,29 @@ function buildInitialSubtitleTrackIndexes({
   }
 
   for (const version of item.versions) {
-    // The helper mirrors the server's BuildSubtitleInventoryV3 so `index` is the
-    // published dense combined ordinal, not the track's position in the wire
-    // array. Downloadless versions still resolve because the helper assigns the
-    // same ordinals the server will.
-    const tracks = buildPublishedSubtitleTracks(version.subtitle_tracks);
+    // Playback v3 assigns dense combined ordinals with sidecars first and
+    // embedded tracks second. Catalog stream indexes are not those ordinals.
+    const orderedTracks = [
+      ...(version.subtitle_tracks ?? []).filter((track) => track.external),
+      ...(version.subtitle_tracks ?? []).filter((track) => !track.external),
+    ];
+    const tracks: PlayerSubtitleInfo[] = orderedTracks.map((track, index) => ({
+      index,
+      language: track.language?.trim() || "unknown",
+      codec: track.codec,
+      label:
+        track.title?.trim() ||
+        track.embedded_title?.trim() ||
+        track.file_name?.trim() ||
+        track.language?.trim() ||
+        // Matched against a saved track signature, which stores this label in
+        // English, so it is data and is not translated (D44).
+        `Subtitle ${index + 1}`,
+      source: track.external ? "external" : "embedded",
+      forced: track.forced,
+      hearing_impaired: track.hearing_impaired,
+      url: "",
+    }));
     const selectedAudioTrackIndex =
       audioTrackIndex ??
       version.effective_audio_track_index ??
@@ -278,19 +273,12 @@ function buildInitialSubtitleTrackIndexes({
   return { start, bitmap };
 }
 
-// Stable empty reference: the array identity reaches the player's session hook
-// and its legacy catalog poll, so a fresh `[]` on every render would restart the
-// poll's attempt budget and clear its terminal failure badge.
-const EMPTY_PLAYBACK_VARIANTS: PlayerPlaybackVariant[] = [];
-
 export function buildWatchPageProps({
   request,
   item,
   currentProfile,
   seriesEpisodes,
   qualityPreference = currentProfileQualityFallback(currentProfile),
-  requestedFileId = null,
-  requestedVersionExplicit = false,
 }: {
   request: WatchRouteRequest;
   item: WatchDetail;
@@ -303,54 +291,27 @@ export function buildWatchPageProps({
    * it falls back to is no longer updated by that picker.
    */
   qualityPreference?: string | null;
-  /**
-   * The row the viewer last requested for this item, from the client's
-   * durable selection store. The server's `last_file_id` names the row that
-   * actually served the bytes, which can be a substitute; resuming must ask
-   * for the viewer's own pick. Passed in for the same purity reason as the
-   * quality cap.
-   */
-  requestedFileId?: number | null;
-  /**
-   * Whether that remembered row is one the viewer named themselves. A reload
-   * keeps the row but loses the navigation that carried `explicitFileSelection`,
-   * so the store's standing is the only thing that can still tell a pick from
-   * an Auto start.
-   */
-  requestedVersionExplicit?: boolean;
 }): DerivedWatchPageProps {
   const basePreferredSubtitleLanguage =
     item.effective_subtitle_language !== undefined
       ? item.effective_subtitle_language
       : currentProfile?.subtitle_language || null;
-  const baseSubtitleMode = (item.effective_subtitle_mode ||
-    currentProfile?.subtitle_mode ||
-    "off") as SubtitleMode;
+  const baseSubtitleMode = (item.effective_subtitle_mode ??
+    currentProfile?.subtitle_mode ??
+    "auto") as SubtitleMode;
   const showForcedSubtitles =
     item.effective_show_forced_subtitles ?? currentProfile?.show_forced_subtitles ?? true;
 
-  const requestedVersion =
-    (request.fileId ? item.versions.find((v) => v.file_id === request.fileId) : undefined) ??
-    item.versions[0];
-  // One shared derivation for every ordinal the client computes; see
-  // subtitleInventory.ts. Watch detail carries the file's own tracks, so the
-  // published ordinals match the server's for the same inventory. An older
-  // detail that omits `subtitle_tracks` only has the item's subtitle rows;
-  // they go through the same rule so their menu ordinals stay dense and
-  // gap-free instead of trusting the array position.
-  const subtitles: PlayerSubtitleInfo[] =
-    requestedVersion?.subtitle_tracks !== undefined
-      ? buildPublishedSubtitleTracks(requestedVersion.subtitle_tracks)
-      : buildPublishedSubtitleTracks(
-          item.subtitles.map((subtitle) => ({
-            language: subtitle.language,
-            codec: subtitle.codec,
-            title: subtitle.title || subtitle.language,
-            forced: subtitle.forced,
-            hearing_impaired: subtitle.hearing_impaired,
-            external: subtitle.source === "external",
-          })),
-        );
+  const subtitles: PlayerSubtitleInfo[] = item.subtitles.map((subtitle, index) => ({
+    index,
+    language: subtitle.language,
+    codec: subtitle.codec,
+    label: subtitle.title || subtitle.language,
+    source: subtitle.source === "external" ? "external" : "embedded",
+    forced: subtitle.forced,
+    hearing_impaired: subtitle.hearing_impaired,
+    url: "",
+  }));
   const preferredSubtitleTrackSignature: PlayerSubtitleTrackSignature | null =
     item.effective_subtitle_track_signature
       ? {
@@ -403,32 +364,6 @@ export function buildWatchPageProps({
     preferredSubtitleTrackSignature: effectivePreferredSubtitleTrackSignature,
     showForcedSubtitles,
   });
-  // A pre-play pick names its row by the dense combined ordinal the popover
-  // rendered, not just by descriptors. Resolving it through the signature again
-  // would hand playback the first track whose language and codec match, so two
-  // same-language streams (two German SRT tracks in one release) both start the
-  // first one. The viewer's ordinal is authoritative for the version they chose;
-  // other versions still fall back to the signature for server-side adaptation.
-  const explicitRequestedTrackIndex =
-    request.prePlaySubtitleMode === "explicit" &&
-    requestSubtitleSelection != null &&
-    requestSubtitleSelection.source !== "downloaded" &&
-    requestSubtitleSelection.track_index != null &&
-    requestedVersion != null &&
-    subtitles.some((track) => track.index === requestSubtitleSelection.track_index)
-      ? requestSubtitleSelection.track_index
-      : null;
-  if (explicitRequestedTrackIndex !== null && requestedVersion) {
-    const fileId = requestedVersion.file_id;
-    initialSubtitleTrackIndexes.start[fileId] = explicitRequestedTrackIndex;
-    const requestedTrack =
-      subtitles.find((track) => track.index === explicitRequestedTrackIndex) ?? null;
-    if (requestedTrack && subtitleNeedsBurnIn(requestedTrack)) {
-      initialSubtitleTrackIndexes.bitmap[fileId] = explicitRequestedTrackIndex;
-    } else {
-      delete initialSubtitleTrackIndexes.bitmap[fileId];
-    }
-  }
 
   const intro: PlayerTimeRange | null = item.intro ?? null;
   const credits: PlayerTimeRange | null = item.credits ?? null;
@@ -443,23 +378,18 @@ export function buildWatchPageProps({
   // point — including a rewatch in flight (played stays true).
   const initialPosition = request.restart ? 0 : (item.user_data?.position_seconds ?? 0);
 
-  // Recognition of the release to ask for: the viewer's requested row when the
-  // client remembers one, else the row the server says actually played. A
-  // substitution must not replace the release they picked.
-  const userData = item.user_data;
-  const resumeFileId = requestedFileId ?? userData?.last_file_id;
   const resumeHints: ResumeHints | undefined =
-    resumeFileId != null ||
-    userData?.last_resolution != null ||
-    userData?.last_hdr != null ||
-    userData?.last_codec_video != null ||
-    userData?.last_edition_key != null
+    item.user_data?.last_file_id != null ||
+    item.user_data?.last_resolution != null ||
+    item.user_data?.last_hdr != null ||
+    item.user_data?.last_codec_video != null ||
+    item.user_data?.last_edition_key != null
       ? {
-          lastFileId: resumeFileId ?? undefined,
-          lastResolution: userData?.last_resolution,
-          lastHDR: userData?.last_hdr,
-          lastCodecVideo: userData?.last_codec_video,
-          lastEditionKey: userData?.last_edition_key,
+          lastFileId: item.user_data.last_file_id,
+          lastResolution: item.user_data.last_resolution,
+          lastHDR: item.user_data.last_hdr,
+          lastCodecVideo: item.user_data.last_codec_video,
+          lastEditionKey: item.user_data.last_edition_key,
         }
       : item.effective_version_resolution !== undefined ||
           item.effective_version_hdr !== undefined ||
@@ -482,24 +412,12 @@ export function buildWatchPageProps({
     versionPicked: request.versionPicked,
     libraryId: request.libraryId,
     versions: item.versions,
-    playbackVariants: item.playback_variants ?? EMPTY_PLAYBACK_VARIANTS,
-    // Omitted (rather than a fresh `[]`) when the detail carries none: a new
-    // array identity on every render would loop the player's sync effect.
-    ...(item.indexer_releases?.length ? { indexerReleases: item.indexer_releases } : {}),
-    virtualRanking: item.virtual_ranking,
+    playbackVariants: item.playback_variants ?? [],
     subtitles,
     initialPosition,
     forceInitialPosition: request.restart,
     qualityPreference,
     explicitAudioTrackIndex: request.audioTrackIndex ?? null,
-    // The navigation that carried the pick says so directly. A reload or a
-    // directly opened watch URL has only the store's standing to go on, and it
-    // counts only while it still names the row this request asks for: a row
-    // the viewer merely let the server choose must stay substitutable.
-    explicitFileSelection:
-      request.explicitFileSelection === true ||
-      (request.fileId != null && request.fileId === requestedFileId && requestedVersionExplicit),
-    forceRelink: request.forceRelink,
     initialSubtitleTrackIndexByFileId: initialSubtitleTrackIndexes.start,
     initialBitmapSubtitleTrackIndexByFileId: initialSubtitleTrackIndexes.bitmap,
     preferredSubtitleLanguage,
@@ -519,6 +437,8 @@ export function buildWatchPageProps({
           currentSeason: item.season_number ?? 0,
           currentEpisode: item.episode_number ?? 0,
           episodes: seriesEpisodes ?? [],
+          episodeLabels: item.episode_labels,
+          currentAirDate: item.air_date,
         }
       : undefined,
     resumeHints,

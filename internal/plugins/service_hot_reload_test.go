@@ -442,7 +442,7 @@ func writePluginArchive(t *testing.T, path string, manifest *pluginv1.PluginMani
 	if err != nil {
 		t.Fatalf("Create(%q) returned error: %v", path, err)
 	}
-	defer func() { _ = file.Close() }()
+	defer file.Close()
 
 	writer := zip.NewWriter(file)
 	manifestEntry, err := writer.Create("manifest.json")

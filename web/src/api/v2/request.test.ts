@@ -92,12 +92,10 @@ describe("v2 request boundary", () => {
       Accept: "application/json",
       Authorization: "Bearer tok-user",
       "X-Profile-Id": "p-owner",
-      "X-Vio-Client": "Vio Web",
-      "X-Silo-Client": "Vio Web",
-      "X-Vio-Client-Family": "web",
+      "X-Silo-Client": "Silo Web",
       "X-Silo-Client-Family": "web",
     });
-    expect(progressRequest.init.headers["X-Vio-Client-Version"]).toMatch(/\S/);
+    expect(progressRequest.init.headers["X-Silo-Client-Version"]).toMatch(/\S/);
     expect(progressRequest.init.body).toBeUndefined();
 
     const profile = await v2("PATCH /api/v2/profiles/{id}", {

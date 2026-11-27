@@ -9,19 +9,11 @@ import (
 	"errors"
 	"io"
 	"os"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/fspath"
 )
-
-// IsVirtualRootPath reports whether path names a provider-backed virtual root.
-// Virtual roots are not filesystem paths and are considered reachable for probes.
-func IsVirtualRootPath(path string) bool {
-	path = strings.TrimSpace(path)
-	return strings.EqualFold(path, "virtual") || strings.HasPrefix(strings.ToLower(path), "virtual:/")
-}
 
 // Error codes reported by Probe. They are part of the admin mount-check API
 // response contract.
@@ -60,9 +52,6 @@ type Result struct {
 // Probe checks that path exists, is a directory, and can be listed. path is
 // fspath-encoded.
 func Probe(path string) Result {
-	if IsVirtualRootPath(path) {
-		return Result{Reachable: true, Empty: true}
-	}
 	res := Result{Reachable: true}
 	info, err := fspath.Stat(path)
 	switch {

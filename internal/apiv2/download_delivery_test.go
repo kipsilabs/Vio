@@ -85,7 +85,7 @@ func TestDownloadRawDelivery(t *testing.T) {
 	deps := pilotDeps(nil, nil)
 	deps.DownloadDelivery = handlers.NewDownloadHandler(domain)
 	h := newTestHandler(t, deps)
-	viewer := with(with(bearer(memberToken), "X-Profile-Id", "p-owner"), "X-Vio-Device-Id", "device-one")
+	viewer := with(with(bearer(memberToken), "X-Profile-Id", "p-owner"), "X-Silo-Device-Id", "device-one")
 	path := Prefix + "/downloads/entry/file"
 	rec := do(t, h, "GET", path, "", with(viewer, "Range", "bytes=2-4"))
 	if rec.Code != 206 || rec.Body.String() != "234" || rec.Header().Get("Content-Range") != "bytes 2-4/10" {
@@ -146,7 +146,7 @@ func TestDownloadRawAssetFailureBoundaries(t *testing.T) {
 	deps := pilotDeps(nil, nil)
 	deps.DownloadDelivery = handlers.NewDownloadHandler(domain)
 	h := newTestHandler(t, deps)
-	viewer := with(with(bearer(memberToken), "X-Profile-Id", "p-owner"), "X-Vio-Device-Id", "device")
+	viewer := with(with(bearer(memberToken), "X-Profile-Id", "p-owner"), "X-Silo-Device-Id", "device")
 	path := Prefix + "/downloads/entry/artwork/poster"
 	rec := do(t, h, "GET", path, "", viewer)
 	if rec.Code != 500 || rec.Header().Get("Content-Length") != "" || rec.Header().Get("Content-Type") != problemContentType || strings.Contains(rec.Body.String(), "synthetic upstream") {

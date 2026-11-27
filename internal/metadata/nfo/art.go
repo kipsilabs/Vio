@@ -198,8 +198,8 @@ func (r artResolver) contains(path string) bool {
 		return false
 	}
 	return slices.ContainsFunc(r.folders, func(folder string) bool {
-		resolvedFolder, ok := r.finder.realDir(folder)
-		return ok && pathWithin(resolved, resolvedFolder)
+		real, ok := r.finder.realDir(folder)
+		return ok && pathWithin(resolved, real)
 	})
 }
 
@@ -207,17 +207,17 @@ func (r artResolver) contains(path string) bool {
 // request: every episode's resolver checks against the same series roots.
 // ok is false when dir cannot be resolved.
 func (f *sidecarFinder) realDir(dir string) (string, bool) {
-	resolved, seen := f.realDirs[dir]
+	real, seen := f.realDirs[dir]
 	if !seen {
-		if evaluated, err := fspath.EvalSymlinks(dir); err == nil {
-			resolved = evaluated
+		if resolved, err := fspath.EvalSymlinks(dir); err == nil {
+			real = resolved
 		}
 		if f.realDirs == nil {
 			f.realDirs = make(map[string]string)
 		}
-		f.realDirs[dir] = resolved
+		f.realDirs[dir] = real
 	}
-	return resolved, resolved != ""
+	return real, real != ""
 }
 
 // maxArtURLBytes caps a remote artwork URL an NFO names.

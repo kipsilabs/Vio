@@ -8,13 +8,12 @@
   ],
   "heuristic_fields": [
     "request_kind: inferred from decode/parse calls in the handler body, matched by callee name and by the substring \"body\" in the decoded argument",
-    "response_media_kind: inferred from Content-Type string literals and from writer-call names (json.NewEncoder, writeJSON, respondJSON, writeError, ServeContent, ServeFile, ServeSegmentLease)",
+    "response_media_kind: inferred from Content-Type string literals and from writer-call names (json.NewEncoder, writeJSON, respondJSON, writeError, ServeContent, ServeFile)",
     "upgrades_websocket: inferred from an Upgrade/Accept call whose callee names a websocket package or contains the substring \"grade\""
   ],
   "excluded_listeners": [
     "cmd/silo/abs_listener.go#newAudiobookshelfListener: Audiobookshelf-protocol compatibility listener; an external wire contract, out of scope for the native v2 migration",
-    "internal/jellycompat/router.go#NewRouter: Jellyfin-protocol compatibility listener; an external wire contract, out of scope for the native v2 migration",
-    "internal/remotestream/relay.go#Relay.start: Streaming relay mux; internal media relay, not part of the native API surface"
+    "internal/jellycompat/router.go#NewRouter: Jellyfin-protocol compatibility listener; an external wire contract, out of scope for the native v2 migration"
   ],
   "listeners": [
     {
@@ -39,7 +38,7 @@
       "id": "api",
       "entrypoint": "internal/api.NewRouter",
       "description": "Main Silo API listener: the /api/v2 handler, the retained /api/v1 probes and tombstone, and the routes mounted beside them.",
-      "route_count": 85
+      "route_count": 92
     },
     {
       "id": "api_v2",
@@ -61,8 +60,8 @@
     }
   ],
   "totals": {
-    "routes": 271,
-    "conditional_routes": 3,
+    "routes": 278,
+    "conditional_routes": 10,
     "streaming_routes": 27,
     "websocket_routes": 0
   },
@@ -109,11 +108,83 @@
         "apimw.Metrics",
         "httpstream.CompressWithExclusions(skipNativeMediaCompression, apiv2.IdentityEncoded)",
         "activitylog.NewMiddleware(deps.ActivityLogWriter, deps.NodeID, deps.LogStreamHub) [when deps.ActivityLogWriter != nil]",
+        "apimw.Recoverer",
         "apimw.ProvideActingAdmin(actingAdmin)"
       ]
     },
     {
       "id": 5,
+      "middleware": [
+        "httpstream.NoSniff",
+        "apimw.RequestID",
+        "clientip.Middleware(deps.ClientIPResolver) [when deps.ClientIPResolver != nil]",
+        "netaccess.Middleware(deps.NetworkAccess.Registry) [when deps.NetworkAccess != nil]",
+        "apimw.RequestLogger(deps.NodeID)",
+        "middleware.Recoverer",
+        "apimw.Metrics",
+        "httpstream.CompressWithExclusions(skipNativeMediaCompression, apiv2.IdentityEncoded)",
+        "activitylog.NewMiddleware(deps.ActivityLogWriter, deps.NodeID, deps.LogStreamHub) [when deps.ActivityLogWriter != nil]",
+        "apimw.Recoverer",
+        "apimw.ProvideActingAdmin(actingAdmin)",
+        "nodecontrol.RequireNode(deps.NodeKeyRegistry)"
+      ]
+    },
+    {
+      "id": 6,
+      "middleware": [
+        "httpstream.NoSniff",
+        "apimw.RequestID",
+        "clientip.Middleware(deps.ClientIPResolver) [when deps.ClientIPResolver != nil]",
+        "netaccess.Middleware(deps.NetworkAccess.Registry) [when deps.NetworkAccess != nil]",
+        "apimw.RequestLogger(deps.NodeID)",
+        "middleware.Recoverer",
+        "apimw.Metrics",
+        "httpstream.CompressWithExclusions(skipNativeMediaCompression, apiv2.IdentityEncoded)",
+        "activitylog.NewMiddleware(deps.ActivityLogWriter, deps.NodeID, deps.LogStreamHub) [when deps.ActivityLogWriter != nil]",
+        "apimw.Recoverer",
+        "apimw.ProvideActingAdmin(actingAdmin)",
+        "nodecontrol.RequireNode(deps.NodeKeyRegistry)",
+        "nodeControl.LimitNode"
+      ]
+    },
+    {
+      "id": 7,
+      "middleware": [
+        "httpstream.NoSniff",
+        "apimw.RequestID",
+        "clientip.Middleware(deps.ClientIPResolver) [when deps.ClientIPResolver != nil]",
+        "netaccess.Middleware(deps.NetworkAccess.Registry) [when deps.NetworkAccess != nil]",
+        "apimw.RequestLogger(deps.NodeID)",
+        "middleware.Recoverer",
+        "apimw.Metrics",
+        "httpstream.CompressWithExclusions(skipNativeMediaCompression, apiv2.IdentityEncoded)",
+        "activitylog.NewMiddleware(deps.ActivityLogWriter, deps.NodeID, deps.LogStreamHub) [when deps.ActivityLogWriter != nil]",
+        "apimw.Recoverer",
+        "apimw.ProvideActingAdmin(actingAdmin)",
+        "nodecontrol.RequireNode(deps.NodeKeyRegistry)",
+        "nodeControl.LimitNodePlayback"
+      ]
+    },
+    {
+      "id": 8,
+      "middleware": [
+        "httpstream.NoSniff",
+        "apimw.RequestID",
+        "clientip.Middleware(deps.ClientIPResolver) [when deps.ClientIPResolver != nil]",
+        "netaccess.Middleware(deps.NetworkAccess.Registry) [when deps.NetworkAccess != nil]",
+        "apimw.RequestLogger(deps.NodeID)",
+        "middleware.Recoverer",
+        "apimw.Metrics",
+        "httpstream.CompressWithExclusions(skipNativeMediaCompression, apiv2.IdentityEncoded)",
+        "activitylog.NewMiddleware(deps.ActivityLogWriter, deps.NodeID, deps.LogStreamHub) [when deps.ActivityLogWriter != nil]",
+        "apimw.Recoverer",
+        "apimw.ProvideActingAdmin(actingAdmin)",
+        "nodecontrol.RequireNode(deps.NodeKeyRegistry)",
+        "nodeControl.LimitNodeRegistration"
+      ]
+    },
+    {
+      "id": 9,
       "middleware": [
         "s.requireBearer"
       ]
@@ -3392,6 +3463,304 @@
     },
     {
       "listener": "api",
+      "namespace": "legacy_unversioned",
+      "method": "GET",
+      "path": "/api/internal/nodes/self/config",
+      "route_group": "/api/internal/nodes/self",
+      "handler": "(*internal/nodecontrol.Server).HandleConfig",
+      "handler_expr": "nodeControl.HandleConfig",
+      "handler_kind": "method",
+      "handler_resolved": true,
+      "middleware_chain": 6,
+      "auth_class": "node_signed",
+      "auth_traits": [
+        "node_signed",
+        "rate_limited"
+      ],
+      "conditions": [
+        "deps.NodeKeyRegistry != nil && deps.NodeRepo != nil && settingsRepo != nil"
+      ],
+      "conditional": true,
+      "request_kind": "unknown",
+      "response_media_kind": "unknown",
+      "delegates_to": "",
+      "streams": false,
+      "upgrades_websocket": false,
+      "method_origin": "explicit",
+      "success_statuses": null,
+      "error_codes": null,
+      "source_file": "internal/api/router.go"
+    },
+    {
+      "listener": "api",
+      "namespace": "legacy_unversioned",
+      "method": "POST",
+      "path": "/api/internal/nodes/self/health-changed",
+      "route_group": "/api/internal/nodes/self",
+      "handler": "(*internal/nodecontrol.Server).HandleHealthChanged",
+      "handler_expr": "nodeControl.HandleHealthChanged",
+      "handler_kind": "method",
+      "handler_resolved": true,
+      "middleware_chain": 6,
+      "auth_class": "node_signed",
+      "auth_traits": [
+        "node_signed",
+        "rate_limited"
+      ],
+      "conditions": [
+        "deps.NodeKeyRegistry != nil && deps.NodeRepo != nil && settingsRepo != nil"
+      ],
+      "conditional": true,
+      "request_kind": "unknown",
+      "response_media_kind": "unknown",
+      "delegates_to": "",
+      "streams": false,
+      "upgrades_websocket": false,
+      "method_origin": "explicit",
+      "success_statuses": null,
+      "error_codes": null,
+      "source_file": "internal/api/router.go"
+    },
+    {
+      "listener": "api",
+      "namespace": "legacy_unversioned",
+      "method": "POST",
+      "path": "/api/internal/nodes/self/logs",
+      "route_group": "/api/internal/nodes/self",
+      "handler": "(*internal/nodecontrol.Server).HandleLogs",
+      "handler_expr": "nodeControl.HandleLogs",
+      "handler_kind": "method",
+      "handler_resolved": true,
+      "middleware_chain": 6,
+      "auth_class": "node_signed",
+      "auth_traits": [
+        "node_signed",
+        "rate_limited"
+      ],
+      "conditions": [
+        "deps.NodeKeyRegistry != nil && deps.NodeRepo != nil && settingsRepo != nil"
+      ],
+      "conditional": true,
+      "request_kind": "unknown",
+      "response_media_kind": "unknown",
+      "delegates_to": "",
+      "streams": false,
+      "upgrades_websocket": false,
+      "method_origin": "explicit",
+      "success_statuses": null,
+      "error_codes": null,
+      "source_file": "internal/api/router.go"
+    },
+    {
+      "listener": "api",
+      "namespace": "legacy_unversioned",
+      "method": "PUT",
+      "path": "/api/internal/nodes/self/registration",
+      "route_group": "/api/internal/nodes/self",
+      "handler": "(*internal/nodecontrol.Server).HandleRegistration",
+      "handler_expr": "nodeControl.HandleRegistration",
+      "handler_kind": "method",
+      "handler_resolved": true,
+      "middleware_chain": 8,
+      "auth_class": "node_signed",
+      "auth_traits": [
+        "node_signed",
+        "rate_limited"
+      ],
+      "conditions": [
+        "deps.NodeKeyRegistry != nil && deps.NodeRepo != nil && settingsRepo != nil"
+      ],
+      "conditional": true,
+      "request_kind": "unknown",
+      "response_media_kind": "unknown",
+      "delegates_to": "",
+      "streams": false,
+      "upgrades_websocket": false,
+      "method_origin": "explicit",
+      "success_statuses": null,
+      "error_codes": null,
+      "source_file": "internal/api/router.go"
+    },
+    {
+      "listener": "api",
+      "namespace": "legacy_unversioned",
+      "method": "POST",
+      "path": "/api/internal/nodes/self/report",
+      "route_group": "/api/internal/nodes/self",
+      "handler": "(*internal/nodecontrol.Server).HandleReport",
+      "handler_expr": "nodeControl.HandleReport",
+      "handler_kind": "method",
+      "handler_resolved": true,
+      "middleware_chain": 6,
+      "auth_class": "node_signed",
+      "auth_traits": [
+        "node_signed",
+        "rate_limited"
+      ],
+      "conditions": [
+        "deps.NodeKeyRegistry != nil && deps.NodeRepo != nil && settingsRepo != nil"
+      ],
+      "conditional": true,
+      "request_kind": "unknown",
+      "response_media_kind": "unknown",
+      "delegates_to": "",
+      "streams": false,
+      "upgrades_websocket": false,
+      "method_origin": "explicit",
+      "success_statuses": null,
+      "error_codes": null,
+      "source_file": "internal/api/router.go"
+    },
+    {
+      "listener": "api",
+      "namespace": "legacy_unversioned",
+      "method": "POST",
+      "path": "/api/internal/nodes/self/resolve",
+      "route_group": "/api/internal/nodes/self",
+      "handler": "(*internal/nodecontrol.Server).HandleResolve",
+      "handler_expr": "nodeControl.HandleResolve",
+      "handler_kind": "method",
+      "handler_resolved": true,
+      "middleware_chain": 7,
+      "auth_class": "node_signed",
+      "auth_traits": [
+        "node_signed",
+        "rate_limited"
+      ],
+      "conditions": [
+        "deps.NodeKeyRegistry != nil && deps.NodeRepo != nil && settingsRepo != nil"
+      ],
+      "conditional": true,
+      "request_kind": "unknown",
+      "response_media_kind": "unknown",
+      "delegates_to": "",
+      "streams": false,
+      "upgrades_websocket": false,
+      "method_origin": "explicit",
+      "success_statuses": null,
+      "error_codes": null,
+      "source_file": "internal/api/router.go"
+    },
+    {
+      "listener": "api",
+      "namespace": "legacy_unversioned",
+      "method": "POST",
+      "path": "/api/internal/nodes/self/revoke-recipes",
+      "route_group": "/api/internal/nodes/self",
+      "handler": "(*internal/nodecontrol.Server).HandleRevokeRecipes",
+      "handler_expr": "nodeControl.HandleRevokeRecipes",
+      "handler_kind": "method",
+      "handler_resolved": true,
+      "middleware_chain": 6,
+      "auth_class": "node_signed",
+      "auth_traits": [
+        "node_signed",
+        "rate_limited"
+      ],
+      "conditions": [
+        "deps.NodeKeyRegistry != nil && deps.NodeRepo != nil && settingsRepo != nil"
+      ],
+      "conditional": true,
+      "request_kind": "unknown",
+      "response_media_kind": "unknown",
+      "delegates_to": "",
+      "streams": false,
+      "upgrades_websocket": false,
+      "method_origin": "explicit",
+      "success_statuses": null,
+      "error_codes": null,
+      "source_file": "internal/api/router.go"
+    },
+    {
+      "listener": "api",
+      "namespace": "legacy_unversioned",
+      "method": "POST",
+      "path": "/api/internal/nodes/self/sources/open",
+      "route_group": "/api/internal/nodes/self",
+      "handler": "(*internal/nodecontrol.Server).HandleSourceOpen",
+      "handler_expr": "nodeControl.HandleSourceOpen",
+      "handler_kind": "method",
+      "handler_resolved": true,
+      "middleware_chain": 7,
+      "auth_class": "node_signed",
+      "auth_traits": [
+        "node_signed",
+        "rate_limited"
+      ],
+      "conditions": [
+        "deps.NodeKeyRegistry != nil && deps.NodeRepo != nil && settingsRepo != nil"
+      ],
+      "conditional": true,
+      "request_kind": "unknown",
+      "response_media_kind": "unknown",
+      "delegates_to": "",
+      "streams": false,
+      "upgrades_websocket": false,
+      "method_origin": "explicit",
+      "success_statuses": null,
+      "error_codes": null,
+      "source_file": "internal/api/router.go"
+    },
+    {
+      "listener": "api",
+      "namespace": "legacy_unversioned",
+      "method": "GET",
+      "path": "/api/internal/nodes/sources",
+      "route_group": "/",
+      "handler": "(*internal/nodecontrol.Server).HandleSource",
+      "handler_expr": "nodeControl.HandleSource",
+      "handler_kind": "method",
+      "handler_resolved": true,
+      "middleware_chain": 5,
+      "auth_class": "node_signed",
+      "auth_traits": [
+        "node_signed"
+      ],
+      "conditions": [
+        "deps.NodeKeyRegistry != nil && deps.NodeRepo != nil && settingsRepo != nil"
+      ],
+      "conditional": true,
+      "request_kind": "unknown",
+      "response_media_kind": "unknown",
+      "delegates_to": "",
+      "streams": false,
+      "upgrades_websocket": false,
+      "method_origin": "explicit",
+      "success_statuses": null,
+      "error_codes": null,
+      "source_file": "internal/api/router.go"
+    },
+    {
+      "listener": "api",
+      "namespace": "legacy_unversioned",
+      "method": "HEAD",
+      "path": "/api/internal/nodes/sources",
+      "route_group": "/",
+      "handler": "(*internal/nodecontrol.Server).HandleSource",
+      "handler_expr": "nodeControl.HandleSource",
+      "handler_kind": "method",
+      "handler_resolved": true,
+      "middleware_chain": 5,
+      "auth_class": "node_signed",
+      "auth_traits": [
+        "node_signed"
+      ],
+      "conditions": [
+        "deps.NodeKeyRegistry != nil && deps.NodeRepo != nil && settingsRepo != nil"
+      ],
+      "conditional": true,
+      "request_kind": "unknown",
+      "response_media_kind": "unknown",
+      "delegates_to": "",
+      "streams": false,
+      "upgrades_websocket": false,
+      "method_origin": "explicit",
+      "success_statuses": null,
+      "error_codes": null,
+      "source_file": "internal/api/router.go"
+    },
+    {
+      "listener": "api",
       "namespace": "api_v1",
       "method": "CONNECT",
       "path": "/api/v1",
@@ -3886,87 +4255,6 @@
       "streams": false,
       "upgrades_websocket": false,
       "method_origin": "handle_all",
-      "success_statuses": null,
-      "error_codes": null,
-      "source_file": "internal/api/router.go"
-    },
-    {
-      "listener": "api",
-      "namespace": "api_v1",
-      "method": "POST",
-      "path": "/api/v1/admin/collections/purge-virtual",
-      "route_group": "/",
-      "handler": "(*internal/api/handlers.LibraryCollectionHandler).PurgeVirtualPlaybackItems",
-      "handler_expr": "libraryCollectionHandler.PurgeVirtualPlaybackItems",
-      "handler_kind": "method",
-      "handler_resolved": true,
-      "middleware_chain": 4,
-      "auth_class": "public",
-      "auth_traits": [],
-      "conditions": [
-        "libraryCollectionHandler != nil"
-      ],
-      "conditional": true,
-      "request_kind": "unknown",
-      "response_media_kind": "json",
-      "delegates_to": "",
-      "streams": false,
-      "upgrades_websocket": false,
-      "method_origin": "explicit",
-      "success_statuses": null,
-      "error_codes": null,
-      "source_file": "internal/api/router.go"
-    },
-    {
-      "listener": "api",
-      "namespace": "api_v1",
-      "method": "DELETE",
-      "path": "/api/v1/admin/items/{id}",
-      "route_group": "/",
-      "handler": "(*internal/api/handlers.ItemsHandler).HandleDelete",
-      "handler_expr": "itemsHandler.HandleDelete",
-      "handler_kind": "method",
-      "handler_resolved": true,
-      "middleware_chain": 4,
-      "auth_class": "public",
-      "auth_traits": [],
-      "conditions": [
-        "itemsHandler != nil"
-      ],
-      "conditional": true,
-      "request_kind": "unknown",
-      "response_media_kind": "json",
-      "delegates_to": "",
-      "streams": false,
-      "upgrades_websocket": false,
-      "method_origin": "explicit",
-      "success_statuses": null,
-      "error_codes": null,
-      "source_file": "internal/api/router.go"
-    },
-    {
-      "listener": "api",
-      "namespace": "api_v1",
-      "method": "POST",
-      "path": "/api/v1/admin/plugins/installations/{id}/config-options",
-      "route_group": "/",
-      "handler": "(*internal/api/handlers.PluginHandler).HandleListInstallationConfigOptions",
-      "handler_expr": "externalSignInPlugins.HandleListInstallationConfigOptions",
-      "handler_kind": "method",
-      "handler_resolved": true,
-      "middleware_chain": 4,
-      "auth_class": "public",
-      "auth_traits": [],
-      "conditions": [
-        "externalSignInPlugins != nil"
-      ],
-      "conditional": true,
-      "request_kind": "unknown",
-      "response_media_kind": "json",
-      "delegates_to": "",
-      "streams": false,
-      "upgrades_websocket": false,
-      "method_origin": "explicit",
       "success_statuses": null,
       "error_codes": null,
       "source_file": "internal/api/router.go"
@@ -6445,7 +6733,7 @@
       "handler_expr": "s.handleForceReload",
       "handler_kind": "method",
       "handler_resolved": true,
-      "middleware_chain": 5,
+      "middleware_chain": 9,
       "auth_class": "node_bearer",
       "auth_traits": [
         "node_bearer"
@@ -6472,7 +6760,7 @@
       "handler_expr": "s.handleReloadConfig",
       "handler_kind": "method",
       "handler_resolved": true,
-      "middleware_chain": 5,
+      "middleware_chain": 9,
       "auth_class": "node_bearer",
       "auth_traits": [
         "node_bearer"
@@ -6499,7 +6787,7 @@
       "handler_expr": "s.handleReprobeCapabilities",
       "handler_kind": "method",
       "handler_resolved": true,
-      "middleware_chain": 5,
+      "middleware_chain": 9,
       "auth_class": "node_bearer",
       "auth_traits": [
         "node_bearer"
@@ -6551,7 +6839,7 @@
       "handler_expr": "s.handleChapterThumbnailExtract",
       "handler_kind": "method",
       "handler_resolved": true,
-      "middleware_chain": 5,
+      "middleware_chain": 9,
       "auth_class": "node_bearer",
       "auth_traits": [
         "node_bearer"
@@ -6578,7 +6866,7 @@
       "handler_expr": "s.handleListDownloadArtifacts",
       "handler_kind": "method",
       "handler_resolved": true,
-      "middleware_chain": 5,
+      "middleware_chain": 9,
       "auth_class": "node_bearer",
       "auth_traits": [
         "node_bearer"
@@ -6605,7 +6893,7 @@
       "handler_expr": "s.handleDeleteDownloadArtifact",
       "handler_kind": "method",
       "handler_resolved": true,
-      "middleware_chain": 5,
+      "middleware_chain": 9,
       "auth_class": "node_bearer",
       "auth_traits": [
         "node_bearer"
@@ -6632,7 +6920,7 @@
       "handler_expr": "observeNode(s.telemetry, http.MethodGet, \"/downloads/artifacts/{artifact_id}\", s.handleDownloadArtifact)",
       "handler_kind": "method",
       "handler_resolved": true,
-      "middleware_chain": 5,
+      "middleware_chain": 9,
       "auth_class": "node_bearer",
       "auth_traits": [
         "node_bearer"
@@ -6659,7 +6947,7 @@
       "handler_expr": "observeNode(s.telemetry, http.MethodHead, \"/downloads/artifacts/{artifact_id}\", s.handleDownloadArtifact)",
       "handler_kind": "method",
       "handler_resolved": true,
-      "middleware_chain": 5,
+      "middleware_chain": 9,
       "auth_class": "node_bearer",
       "auth_traits": [
         "node_bearer"
@@ -6686,7 +6974,7 @@
       "handler_expr": "s.handleDownloadPrepare",
       "handler_kind": "method",
       "handler_resolved": true,
-      "middleware_chain": 5,
+      "middleware_chain": 9,
       "auth_class": "node_bearer",
       "auth_traits": [
         "node_bearer"
@@ -6713,7 +7001,7 @@
       "handler_expr": "s.handleDownloadPrepareProgress",
       "handler_kind": "method",
       "handler_resolved": true,
-      "middleware_chain": 5,
+      "middleware_chain": 9,
       "auth_class": "node_bearer",
       "auth_traits": [
         "node_bearer"
@@ -6740,7 +7028,7 @@
       "handler_expr": "s.handleHWCapabilities",
       "handler_kind": "method",
       "handler_resolved": true,
-      "middleware_chain": 5,
+      "middleware_chain": 9,
       "auth_class": "node_bearer",
       "auth_traits": [
         "node_bearer"
@@ -6767,7 +7055,7 @@
       "handler_expr": "s.handleMediaSample",
       "handler_kind": "method",
       "handler_resolved": true,
-      "middleware_chain": 5,
+      "middleware_chain": 9,
       "auth_class": "node_bearer",
       "auth_traits": [
         "node_bearer"
@@ -6819,7 +7107,7 @@
       "handler_expr": "observeNode(s.telemetry, http.MethodGet, \"/remux/{session_id}\", s.handleRemux)",
       "handler_kind": "method",
       "handler_resolved": true,
-      "middleware_chain": 5,
+      "middleware_chain": 9,
       "auth_class": "node_bearer",
       "auth_traits": [
         "node_bearer"
@@ -6846,7 +7134,7 @@
       "handler_expr": "observeNode(s.telemetry, http.MethodHead, \"/remux/{session_id}\", s.handleRemux)",
       "handler_kind": "method",
       "handler_resolved": true,
-      "middleware_chain": 5,
+      "middleware_chain": 9,
       "auth_class": "node_bearer",
       "auth_traits": [
         "node_bearer"
@@ -6873,7 +7161,7 @@
       "handler_expr": "s.handleStatus",
       "handler_kind": "method",
       "handler_resolved": true,
-      "middleware_chain": 5,
+      "middleware_chain": 9,
       "auth_class": "node_bearer",
       "auth_traits": [
         "node_bearer"
@@ -6900,7 +7188,7 @@
       "handler_expr": "s.handleStart",
       "handler_kind": "method",
       "handler_resolved": true,
-      "middleware_chain": 5,
+      "middleware_chain": 9,
       "auth_class": "node_bearer",
       "auth_traits": [
         "node_bearer"
@@ -6927,7 +7215,7 @@
       "handler_expr": "s.handleStop",
       "handler_kind": "method",
       "handler_resolved": true,
-      "middleware_chain": 5,
+      "middleware_chain": 9,
       "auth_class": "node_bearer",
       "auth_traits": [
         "node_bearer"
@@ -6954,7 +7242,7 @@
       "handler_expr": "observeNode(s.telemetry, http.MethodGet, \"/transcode/{session_id}/master.m3u8\", s.handleManifest)",
       "handler_kind": "method",
       "handler_resolved": true,
-      "middleware_chain": 5,
+      "middleware_chain": 9,
       "auth_class": "node_bearer",
       "auth_traits": [
         "node_bearer"
@@ -6981,7 +7269,7 @@
       "handler_expr": "s.handleOutputBound",
       "handler_kind": "method",
       "handler_resolved": true,
-      "middleware_chain": 5,
+      "middleware_chain": 9,
       "auth_class": "node_bearer",
       "auth_traits": [
         "node_bearer"
@@ -7008,7 +7296,7 @@
       "handler_expr": "observeNode(s.telemetry, http.MethodGet, \"/transcode/{session_id}/segment/{name}\", s.handleSegment)",
       "handler_kind": "method",
       "handler_resolved": true,
-      "middleware_chain": 5,
+      "middleware_chain": 9,
       "auth_class": "node_bearer",
       "auth_traits": [
         "node_bearer"
@@ -7035,7 +7323,7 @@
       "handler_expr": "s.handleSegmentDownloaded",
       "handler_kind": "method",
       "handler_resolved": true,
-      "middleware_chain": 5,
+      "middleware_chain": 9,
       "auth_class": "node_bearer",
       "auth_traits": [
         "node_bearer"
@@ -7062,7 +7350,7 @@
       "handler_expr": "s.handleTrickplayExtract",
       "handler_kind": "method",
       "handler_resolved": true,
-      "middleware_chain": 5,
+      "middleware_chain": 9,
       "auth_class": "node_bearer",
       "auth_traits": [
         "node_bearer"

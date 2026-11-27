@@ -331,10 +331,10 @@ transport.
 | Measurement | Population and limits |
 | --- | --- |
 | Go heap/runtime | This Go runtime; excludes FFmpeg, plugins and native allocations such as libvips. |
-| Process CPU/RSS/FDs/threads | This process. RSS and Go memory cannot be subtracted to measure native allocation exactly. |
+| Process CPU/RSS/FDs/threads | This process. RSS and Go memory cannot be subtracted to measure native allocation exactly. `cpu_pct` is CPU over the sample window against the same capacity as `system.cpu_pct`. |
 | Linux process I/O | Kernel process counters can include I/O of children already waited for. These overlap child lifecycle/cgroup accounting. |
 | Cgroup CPU/memory | All members of the reported leaf or visible ancestor. Memory includes cache and native/child allocations; ancestor limits outside the namespace are unavailable. |
-| Live owned children | Bounded FFmpeg sampling, validated by PID/start time. CPU is a changing sum of live lifetime totals, not a counter. RSS can count shared pages repeatedly. |
+| Live owned children | Bounded FFmpeg sampling, validated by PID/start time. CPU seconds are a changing sum of live lifetime totals, not a counter. `cpu_pct` sums per-child growth over the window on the `system.cpu_pct` scale, crediting a newly seen child's lifetime only when it started inside the window; it misses an exiting child's last partial window, a child that starts and exits between two samples, the first window of a child that starts while children are being listed, and a window in which a child could not be read. Only processes whose name contains `ffmpeg` count, not `ffprobe`. RSS can count shared pages repeatedly. |
 | Completed children | Existing process owner's Wait/ProcessState CPU and peak RSS. Peaks are distributions, not concurrent usage. Short-lived processes are counted here. |
 | Host/network/GPU | Scope and source accompany samples. Whole-device/host readings include unrelated tenants and must not be summed per container. |
 | Filesystem | Sampled capacity and inode use per bounded role. Check availability and freshness before using a value. |
@@ -451,6 +451,19 @@ recorded the way a returned request would be. An HTTP/1.1 body sent through
 context when that write fails, so a client that stalls there is recorded as
 aborted. The activity log still records only requests that return, so an
 aborted request has no activity row.
+
+Any other panic in a `/api/v2` handler is caught inside the v2 recorder, so it
+never reaches the listener-wide recoverer. A Huma operation's panic is caught
+where its response is buffered; a raw registration's or a v2 middleware's is
+caught by `recoverRaw` (`internal/apiv2/observe.go`). Either way the panic is
+logged once as `apiv2 handler panic`, with its value masked by
+`logredact.SanitizeText`. If nothing was written yet, the client gets the
+`internal_error` problem, recorded as a 5xx; a raw handler's representation
+headers are dropped and the listener's and route's headers (CORS, `nosniff`)
+kept. A raw response that already sent its status is broken with
+`http.ErrAbortHandler` instead and recorded as aborted. A hijacked connection
+is recorded as aborted too, but net/http leaves it open: the handler that
+hijacked it must close it.
 
 ## Jellyfin-compatible listener
 

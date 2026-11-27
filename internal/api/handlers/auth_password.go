@@ -2,68 +2,13 @@ package handlers
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
 
-	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
 	"github.com/Silo-Server/silo-server/internal/auth"
 	"github.com/Silo-Server/silo-server/internal/models"
 )
-
-type accountPasswordCapabilityResponse struct {
-	SchemaVersion           int  `json:"schema_version"`
-	ChangePassword          bool `json:"change_password"`
-	RequiresCurrentPassword bool `json:"requires_current_password"`
-	MinimumPasswordLength   int  `json:"minimum_password_length"`
-	MaximumPasswordBytes    int  `json:"maximum_password_bytes"`
-}
-
-type changePasswordRequest struct {
-	CurrentPassword string `json:"current_password"`
-	NewPassword     string `json:"new_password"`
-}
-
-// HandleAccountPasswordCapability reports whether this authenticated account
-// and active profile may use local self-service password changes.
-func (h *AuthHandler) HandleAccountPasswordCapability(w http.ResponseWriter, r *http.Request) {
-	view, err := h.AccountPasswordCapability(r.Context(), apimw.GetClaims(r.Context()), requestProfileID(r))
-	if err != nil {
-		writeAPIError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, accountPasswordCapabilityResponse{
-		SchemaVersion:           1,
-		ChangePassword:          view.ChangePassword,
-		RequiresCurrentPassword: view.RequiresCurrentPassword,
-		MinimumPasswordLength:   view.MinimumPasswordLength,
-		MaximumPasswordBytes:    view.MaximumPasswordBytes,
-	})
-}
-
-// HandleChangePassword handles POST /auth/account/password. The password is
-// account-wide, so only the active primary profile may replace it. An admin
-// without a selected profile is also allowed, matching the app's acting-admin
-// policy, but selecting a secondary profile removes that authority.
-func (h *AuthHandler) HandleChangePassword(w http.ResponseWriter, r *http.Request) {
-	claims := apimw.GetClaims(r.Context())
-	if err := h.AuthorizePasswordChange(r.Context(), claims, requestProfileID(r)); err != nil {
-		writeAPIError(w, err)
-		return
-	}
-
-	var req changePasswordRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "Invalid request body")
-		return
-	}
-	if err := h.ChangePassword(r.Context(), claims, req.CurrentPassword, req.NewPassword, false); err != nil {
-		writeAPIError(w, err)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
 
 // AccountPasswordCapabilityView is the self-service password capability of
 // one account and active profile.
@@ -96,11 +41,15 @@ func (h *AuthHandler) AccountPasswordCapability(ctx context.Context, claims *aut
 	} else {
 		allowed = false
 	}
+	policy, err := h.PasswordPolicy(ctx)
+	if err != nil {
+		return AccountPasswordCapabilityView{}, apiError(http.StatusInternalServerError, "internal_error", "Failed to load the password policy")
+	}
 	return AccountPasswordCapabilityView{
 		Configured:              h.passwords != nil,
 		ChangePassword:          allowed,
 		RequiresCurrentPassword: true,
-		MinimumPasswordLength:   auth.MinimumPasswordLength,
+		MinimumPasswordLength:   policy.MinimumLength,
 		MaximumPasswordBytes:    auth.MaximumPasswordBytes,
 		SignOutOtherSessions:    h.passwords != nil,
 	}, nil
@@ -134,15 +83,14 @@ func (h *AuthHandler) ChangePassword(ctx context.Context, claims *auth.Claims, c
 		return apiError(http.StatusBadRequest, "bad_request", "Current password and new password are required")
 	}
 	err := h.passwords.ChangePassword(ctx, claims.UserID, claims.SessionID, currentPassword, newPassword, signOutOtherSessions)
+	if apiErr := passwordPolicyError(err, "new_password"); apiErr != nil {
+		return apiErr
+	}
 	switch {
 	case err == nil:
 		return nil
 	case errors.Is(err, auth.ErrCurrentPasswordInvalid):
 		return &APIError{Status: http.StatusBadRequest, Code: "invalid_current_password", Message: "Current password is incorrect", Field: "current_password"}
-	case errors.Is(err, auth.ErrPasswordTooShort):
-		return &APIError{Status: http.StatusBadRequest, Code: codeWeakPassword, Message: "Password must be at least 8 characters", Field: "new_password"}
-	case errors.Is(err, auth.ErrPasswordTooLong):
-		return &APIError{Status: http.StatusBadRequest, Code: codePasswordTooLong, Message: "Password must be at most 72 bytes", Field: "new_password"}
 	case errors.Is(err, auth.ErrPasswordUnchanged):
 		return &APIError{Status: http.StatusBadRequest, Code: codeWeakPassword, Message: "Choose a password different from the temporary one", Field: "new_password"}
 	case errors.Is(err, auth.ErrPasswordLoginDisabled):

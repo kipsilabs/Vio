@@ -16,8 +16,8 @@ import (
 )
 
 func TestKeyNamespacing(t *testing.T) {
-	if got := NewStore(nil, 0).key("abc"); got != "vio:noderecipe:abc" {
-		t.Fatalf("key(abc) = %q, want vio:noderecipe:abc", got)
+	if got := NewStore(nil, 0).key("abc"); got != "silo:noderecipe:abc" {
+		t.Fatalf("key(abc) = %q, want silo:noderecipe:abc", got)
 	}
 }
 
@@ -56,8 +56,8 @@ func TestNodeAuthorityRecordSidecarKeysAreSeparate(t *testing.T) {
 // transcode node's reconstruct lookup must never resolve a grant.
 func TestProxyGrantStoreIsolatesItsKeySpace(t *testing.T) {
 	grants := NewProxyGrantStore(nil, 0)
-	if got := grants.key("abc"); got != "vio:proxygrant:abc" {
-		t.Fatalf("proxy grant key(abc) = %q, want vio:proxygrant:abc", got)
+	if got := grants.key("abc"); got != "silo:proxygrant:abc" {
+		t.Fatalf("proxy grant key(abc) = %q, want silo:proxygrant:abc", got)
 	}
 	if grants.key("abc") == NewStore(nil, 0).key("abc") {
 		t.Fatal("proxy grants and node recipes share a key")

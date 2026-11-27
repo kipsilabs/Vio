@@ -15,7 +15,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/sync/singleflight"
 
 	"github.com/Silo-Server/silo-server/internal/access"
@@ -67,24 +66,12 @@ const (
 	// Keys without it (every non-recently-added section) are generation
 	// independent and must never be swept by an invalidation.
 	resolvedListGenerationPrefix = "generation="
-	// resolvedListPurgeEpochPrefix heads EVERY cache key with the current
-	// purge epoch. A destructive purge bumps the epoch, so entries built
-	// before the purge are never read again — even if an in-flight refresh
-	// repopulates the map, it writes under the old epoch's key.
-	resolvedListPurgeEpochPrefix = "purge="
 )
 
 // resolvedListGenerationKeyPrefix returns the key prefix carried by entries
 // built under generation.
 func resolvedListGenerationKeyPrefix(generation uint64) string {
 	return resolvedListGenerationPrefix + strconv.FormatUint(generation, 10) + "|"
-}
-
-// resolvedListPurgeEpochKeyPrefix returns the key prefix carrying the current
-// purge epoch. Read at key-computation time so a load that starts after a
-// purge can never be served a pre-purge entry.
-func resolvedListPurgeEpochKeyPrefix(epoch uint64) string {
-	return resolvedListPurgeEpochPrefix + strconv.FormatUint(epoch, 10) + "|"
 }
 
 // resolvedListLoader builds the shared item list for a cache key. It takes a
@@ -118,9 +105,6 @@ var (
 	resolvedListRefreshMu  sync.Mutex
 	resolvedListRefreshing = make(map[string]struct{})
 	resolvedListGeneration atomic.Uint64
-	resolvedListPurgeEpoch atomic.Uint64
-	purgeReconcileMu       sync.Mutex
-	lastSeenPurgeRevision  atomic.Int64
 	// resolvedListEvictionEpoch advances on every item eviction. A rebuild
 	// records it before loading and installs its result only if no eviction
 	// ran meanwhile, so a load that read an item before an admin edit cannot
@@ -138,46 +122,6 @@ var (
 		return func() { timer.Stop() }
 	}
 )
-
-// InvalidateAllResolvedListCachesForPurge is the hard invalidation for
-// destructive catalog changes (virtual-item purge). Unlike
-// InvalidateResolvedListCache it drops every cached rail immediately — no
-// debounce, no stale-while-refresh promotion — because there is no prior
-// membership worth serving: the rows are gone.
-//
-// The purge epoch is bumped alongside the generation. Every cache key embeds
-// the epoch, so a load that starts after the purge computes a new key and is
-// guaranteed a cold miss; in-flight refreshes captured under the old epoch
-// write to keys that are never read again. The map is cleared wholesale; the
-// refresh tracker and singleflight are intentionally left alone because their
-// in-flight work is isolated under old-epoch keys. Callers must invoke it only
-// after the purge transaction commits (never on dry-run or rollback).
-// Cross-instance propagation rides on the caller's event-bus publish and the
-// background revision poller; this clears the local process.
-func InvalidateAllResolvedListCachesForPurge() {
-	resolvedListInvalidationMu.Lock()
-	if resolvedListInvalidationCancel != nil {
-		resolvedListInvalidationSequence++
-		resolvedListInvalidationCancel()
-		resolvedListInvalidationCancel = nil
-	}
-	resolvedListInvalidationPending = false
-	resolvedListLastInvalidation = resolvedListNow()
-	// Advance both namespaces: the generation (recently_added scan grace) and
-	// the purge epoch (every rail).
-	resolvedListGeneration.Add(1)
-	resolvedListPurgeEpoch.Add(1)
-	resolvedListInvalidationMu.Unlock()
-
-	resolvedListCacheMu.Lock()
-	resolvedListCache = make(map[string]resolvedListEntry)
-	resolvedListLastPrune = time.Time{}
-	resolvedListCacheMu.Unlock()
-
-	// Bump the editorial candidate epoch so Spotlight/GenreRoulette caches
-	// keyed under the prior epoch are never read again.
-	editorialCandidateCacheEpoch.Add(1)
-}
 
 // InvalidateResolvedListCache advances the cache namespace and requests an
 // immediate refresh, allowing a bounded grace period for existing membership. In-flight refreshes remain under the old
@@ -242,20 +186,16 @@ func dropSupersededResolvedListEntries(generation uint64) {
 
 	resolvedListCacheMu.Lock()
 	for key, entry := range resolvedListCache {
-		// Keys are "purge=N|generation=M|…" (recently_added) or "purge=N|…"
-		// (everything else). Match the generation segment anywhere in the key;
-		// the purge epoch is preserved by only replacing the generation part.
-		if !strings.Contains(key, previous) || strings.Contains(key, current) {
+		if !strings.HasPrefix(key, resolvedListGenerationPrefix) || strings.HasPrefix(key, current) {
 			continue
 		}
-		if now.Before(entry.expiresAt) {
+		if suffix, ok := strings.CutPrefix(key, previous); ok && now.Before(entry.expiresAt) {
 			entry.refreshAfter = now
 			entry.refreshPending = true
 			// The generation was published before taking the cache lock. A
 			// request may already have completed a fresh load in that namespace.
-			newKey := strings.Replace(key, previous, current, 1)
-			if _, loaded := resolvedListCache[newKey]; !loaded {
-				resolvedListCache[newKey] = entry
+			if _, loaded := resolvedListCache[current+suffix]; !loaded {
+				resolvedListCache[current+suffix] = entry
 			}
 		}
 		if _, inflight := refreshing[key]; inflight {
@@ -570,10 +510,6 @@ func cloneMediaItems(items []*models.MediaItem) []*models.MediaItem {
 // cached entry never leaks one profile's state to another.
 func resolvedListCacheKey(resolved ResolvedSection, libraryID *int, libraryIDs []int, filter catalog.AccessFilter) string {
 	var b strings.Builder
-	// The purge epoch scopes every rail: a destructive purge bumps it, so a
-	// load that starts after the purge computes a fresh key and can never be
-	// served a pre-purge entry.
-	b.WriteString(resolvedListPurgeEpochKeyPrefix(resolvedListPurgeEpoch.Load()))
 	if resolved.SectionType == SectionRecentlyAdded {
 		b.WriteString(resolvedListGenerationKeyPrefix(resolvedListGeneration.Load()))
 	}
@@ -719,36 +655,14 @@ func (f *Fetcher) isCacheableSectionType(resolved ResolvedSection) bool {
 	}
 }
 
-// ResolvedListPurgeEpochForTest returns the current purge epoch. Test-only;
-// lets handler-package tests observe that a hub event triggered invalidation.
-func ResolvedListPurgeEpochForTest() uint64 {
-	return resolvedListPurgeEpoch.Load()
-}
-
-// LastSeenPurgeRevisionForTest returns the last reconciled database purge
-// revision. Test-only.
-func LastSeenPurgeRevisionForTest() int64 {
-	return lastSeenPurgeRevision.Load()
-}
-
-// ResetResolvedListCacheForTestForPurge clears all process-global cache state
-// including the purge epoch. Test-only.
-func ResetResolvedListCacheForTestForPurge() {
-	resetResolvedListCacheForTest()
-}
-
-// resetResolvedListCacheForTest clears all process-global cache state including
-// both epochs. Tests call it between cases so entries and in-flight refreshes
-// never leak across.
+// resetResolvedListCacheForTest clears all process-global cache state. Tests
+// call it between cases so entries and in-flight refreshes never leak across.
 func resetResolvedListCacheForTest() {
 	resolvedListInvalidationMu.Lock()
 	if resolvedListInvalidationCancel != nil {
 		resolvedListInvalidationCancel()
 	}
 	resolvedListGeneration.Store(0)
-	resolvedListPurgeEpoch.Store(0)
-	editorialCandidateCacheEpoch.Store(0)
-	lastSeenPurgeRevision.Store(-1)
 	resolvedListLastInvalidation = time.Time{}
 	resolvedListInvalidationPending = false
 	resolvedListInvalidationCancel = nil
@@ -767,56 +681,4 @@ func resetResolvedListCacheForTest() {
 	resolvedListRefreshMu.Lock()
 	resolvedListRefreshing = make(map[string]struct{})
 	resolvedListRefreshMu.Unlock()
-}
-
-// ReconcilePurgeRevision records the newest observed database purge revision.
-// Any observed revision newer than the last reconciled one — including the
-// first positive revision after startup, when caches may already be warm —
-// performs exactly one hard invalidation and then records the observed
-// revision. The comparison, invalidation, and record are serialized so
-// concurrent poll and event paths cannot interleave. Event-driven callers
-// pass the revision carried by the event when available; a negative revision
-// forces reconciliation without advancing the watermark (used when an event
-// carries no revision).
-func ReconcilePurgeRevision(observedRevision int64) (reconciled bool) {
-	purgeReconcileMu.Lock()
-	defer purgeReconcileMu.Unlock()
-	last := lastSeenPurgeRevision.Load()
-	if observedRevision < 0 {
-		InvalidateAllResolvedListCachesForPurge()
-		return true
-	}
-	if observedRevision <= last {
-		return false
-	}
-	InvalidateAllResolvedListCachesForPurge()
-	lastSeenPurgeRevision.Store(observedRevision)
-	return true
-}
-
-// StartPurgeRevisionPoller runs a background goroutine that reconciles the
-// local caches with the shared database revision. The pub/sub event is
-// the fast path; this poller is the recovery path for missed events (buffer
-// overflow, crash between commit and publish, network partition). It polls
-// every interval until ctx is canceled. Reconciliation records the observed
-// database revision directly, so a revision jump of any size is handled in
-// a single poll.
-func StartPurgeRevisionPoller(ctx context.Context, pool *pgxpool.Pool, interval time.Duration) {
-	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				var revision int64
-				if err := pool.QueryRow(ctx, `SELECT revision FROM catalog_purge_revision WHERE id = 1`).Scan(&revision); err != nil {
-					slog.WarnContext(ctx, "purge revision poll failed", "error", err)
-					continue
-				}
-				ReconcilePurgeRevision(revision)
-			}
-		}
-	}()
 }

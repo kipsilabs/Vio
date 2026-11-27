@@ -52,7 +52,7 @@ var serverSpecificSettings = append(strings.Fields(`
 	jellyfin_compat.public_url jellyfin_compat.web_install_dir
 	recommendations.embedding_provider_id recommendations.embedding_lock recommendations.policy_marked_generation
 	media_images. chapter_thumbnails. ui.dashboard.hidden_attention
-	virtual_library. remuxdb. direct_connections.
+	direct_connections.
 `), plugins.ProvisionRestoreHoldKey)
 
 // restoredSettings are the keys and prefixes restored as the backup has
@@ -96,8 +96,6 @@ var restoredFlagSettings = map[string]string{
 	"notifications.discord.allow_per_episode":              "message granularity on a channel its own switch gates",
 	"notifications.email.allow_per_episode":                "message granularity on a channel its own switch gates",
 	"notifications.server_channels.mention_requesters":     "message content on channels their own switch gates",
-	"notifications.fanout_enabled":                         "fanout to the destinations the backup names",
-	"notifications.release_events_enabled":                 "release announcements on the channels their own switches gate",
 	"overlays.enabled":                                     "presentation",
 	"playback.allow_hevc_encoding":                         whyCapacity,
 	"playback.bandwidth_probe_automatic":                   whyTuning,
@@ -106,7 +104,6 @@ var restoredFlagSettings = map[string]string{
 	"playback.prefer_lower_version_transcode":              whyTuning,
 	"playback.transcode_enabled":                           "transcoding capacity: it changes how a permitted stream plays, not who may play",
 	"playback.transcode_hardware_tone_map_enabled":         whyLocal,
-	"playback.transcode_vpp_tone_map_enabled":              whyLocal,
 	"playback.transcode_software_tone_map_enabled":         whyLocal,
 	"policy.editor_enabled":                                "the admin policy editor; admins only",
 	"scanner.empty_trash_after_scan":                       "catalog upkeep",

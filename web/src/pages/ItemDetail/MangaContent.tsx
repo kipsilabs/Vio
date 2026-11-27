@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   BookOpen,
   Check,
@@ -126,13 +126,6 @@ function MangaRow({
   const [loadingVersions, setLoadingVersions] = useState(false);
   const canDownload = Boolean(user?.download_allowed);
 
-  // A stale file_id from the picker re-fetches this chapter's versions.
-  const refreshChapterVersions = useCallback(() => {
-    void fetchCatalogItemVersions(chapter.content_id)
-      .then((versions) => setDownloadVersions(versions))
-      .catch(() => undefined);
-  }, [chapter.content_id]);
-
   const handleDownload = async () => {
     if (loadingVersions) return;
     if (downloadVersions && downloadVersions.length > 0) {
@@ -179,7 +172,7 @@ function MangaRow({
         )}
         <span
           className={cn(
-            "truncate text-[15px] font-medium",
+            "truncate text-[0.9375rem] font-medium",
             markedRead ? "text-muted-foreground" : "text-foreground/90",
           )}
         >
@@ -202,7 +195,7 @@ function MangaRow({
                 style={{ width: `${progressPct}%` }}
               />
             </span>
-            <span className="text-muted-foreground text-[11px] tabular-nums">
+            <span className="text-muted-foreground text-[0.6875rem] tabular-nums">
               {t("web.detail.manga.percent", { percent: progressPct })}
             </span>
           </span>
@@ -256,8 +249,6 @@ function MangaRow({
           versions={downloadVersions}
           title={label}
           summaryBuilder={chapterVersionSummary}
-          onStaleVersion={refreshChapterVersions}
-          createTarget={{ contentId: chapter.content_id }}
         />
       )}
     </div>
@@ -355,7 +346,7 @@ export default function MangaContent({
             {cta && (
               <Button
                 asChild
-                className="h-11 gap-2.5 rounded-full px-6 text-[15px] font-bold tracking-wide shadow-md"
+                className="h-11 gap-2.5 rounded-full px-6 text-[0.9375rem] font-bold tracking-wide shadow-md"
               >
                 <ViewTransitionLink
                   to={chapterReaderHref(cta.chapter.content_id, item.content_id, libraryId)}

@@ -59,7 +59,7 @@ func registerNotificationDiscordLinks(reg *Registry) {
 		{Name: discordLinkCode, In: discordLinkQuery, Schema: &huma.Schema{Type: huma.TypeString}},
 		{Name: discordLinkError, In: discordLinkQuery, Schema: &huma.Schema{Type: huma.TypeString}},
 	}, Responses: map[string]*huma.Response{"302": {Description: "Consent outcome redirect to notification settings", Headers: map[string]*huma.Header{discordLinkLocation: {Schema: &huma.Schema{Type: huma.TypeString}}}, Content: map[string]*huma.MediaType{discordLinkTextHtml: {Schema: &huma.Schema{Type: huma.TypeString}}}}}}, Class: ClassPublic, ServiceBacked: true}
-	RegisterRaw(reg, RawOperation{Operation: callback, Protocol: discordLinkRedirect, Reason: "Discord redirects browsers without Vio login headers; the stored one-time state authenticates the account-link callback."}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	RegisterRaw(reg, RawOperation{Operation: callback, Protocol: discordLinkRedirect, Reason: "Discord redirects browsers without Silo login headers; the stored one-time state authenticates the account-link callback."}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(discordLinkCacheControl, discordLinkNoStore)
 		w.Header().Set(discordLinkReferrerPolicy, discordLinkNoReferrer)
 		svc := reg.deps.NotificationDiscordLinks

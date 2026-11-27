@@ -23,7 +23,7 @@ type DailyTrigger struct {
 
 func NewDailyTrigger(cfg taskmanager.TriggerConfig) *DailyTrigger {
 	var h, m int
-	_, _ = fmt.Sscanf(cfg.TimeOfDay, "%d:%d", &h, &m)
+	fmt.Sscanf(cfg.TimeOfDay, "%d:%d", &h, &m)
 	return &DailyTrigger{
 		cfg:    cfg,
 		hour:   h,

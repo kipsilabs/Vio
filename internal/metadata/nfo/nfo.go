@@ -3,7 +3,6 @@ package nfo
 import (
 	"bytes"
 	"encoding/xml"
-	"errors"
 	"fmt"
 	"regexp"
 	"slices"
@@ -234,7 +233,7 @@ func parseNFOData(data []byte) (*parsedNFO, error) {
 	data = normalizeNFOText(data)
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) == 0 {
-		return nil, errors.New("nfo: empty file")
+		return nil, fmt.Errorf("nfo: empty file")
 	}
 	if trimmed[0] != '<' {
 		return parseLinkOnlyNFO(string(trimmed))
@@ -263,12 +262,12 @@ func parseNFOData(data []byte) (*parsedNFO, error) {
 func parseLinkOnlyNFO(text string) (*parsedNFO, error) {
 	links := scanProviderLinks(text)
 	if links.empty() {
-		return nil, errors.New("nfo: no XML root element or provider link")
+		return nil, fmt.Errorf("nfo: no XML root element or provider link")
 	}
 	p := &parsedNFO{Type: linkOnlyNFOType(links), LinkOnly: true}
 	applyProviderLinks(p, links, p.Type)
 	if len(p.providerIDs()) == 0 {
-		return nil, errors.New("nfo: provider links name no usable id")
+		return nil, fmt.Errorf("nfo: provider links name no usable id")
 	}
 	return p, nil
 }

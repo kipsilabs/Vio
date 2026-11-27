@@ -33,8 +33,8 @@ func (h *AdminHandler) InspectAdminSettings(ctx context.Context, effective bool)
 type AdminSensitiveSettingsStatus struct {
 	Configured   []string
 	ManagedByEnv []string
-	// ManagedByEnvVars names, for each key in ManagedByEnv, the environment
-	// variable that sets it on the server that answered.
+	// ManagedByEnvVars names the environment variable that sets each key in
+	// ManagedByEnv.
 	ManagedByEnvVars map[string]string
 }
 

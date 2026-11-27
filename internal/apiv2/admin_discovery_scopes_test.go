@@ -72,7 +72,8 @@ func (s fixedResourceSampler) Snapshot() nodemetrics.Snapshot { return nodemetri
 // aggregate refreshes.
 func TestMonitorScopeWithholdsDeploymentDetails(t *testing.T) {
 	deps := pilotDeps(nil, nil)
-	deps.AdminResourceSampler = fixedResourceSampler{Available: true, System: &nodemetrics.SystemStats{Cores: 4, Disks: []nodemetrics.DiskStats{{Path: "/srv/secret-media", Role: "library-0", TotalGB: 10}}}}
+	deps.AdminResourceSampler = fixedResourceSampler{Available: true, System: &nodemetrics.SystemStats{Cores: 4, Disks: []nodemetrics.DiskStats{{Path: "/srv/secret-media", Role: "library-0", TotalGB: 10}}},
+		Attribution: &nodemetrics.ResourceAttribution{Process: &nodemetrics.ProcessStats{CPUPct: new(12.5)}, Children: &nodemetrics.ChildStats{Workload: "ffmpeg", CPUPct: new(0.0)}}}
 	deps.AdminDownloadPreparations = new(fakeAdminDownloadPreparations)
 	insights := new(dashboardInsightsStub)
 	deps.AdminDashboardInsights = insights
@@ -97,6 +98,13 @@ func TestMonitorScopeWithholdsDeploymentDetails(t *testing.T) {
 			t.Fatal(path, rec.Code, rec.Body.String())
 		}
 		requireProblem(t, do(t, h, "GET", Prefix+path, "", bearer("sa_member_monitor")), TypePermissionDenied)
+	}
+	// A monitor charts Silo's own CPU beside the host's from these two reads.
+	if body := do(t, h, "GET", Prefix+"/admin/system/resources", "", bearer("sa_monitor")).Body.String(); !strings.Contains(body, `"process":{"cpu_pct":12.5}`) || !strings.Contains(body, `"cpu_pct":0}`) {
+		t.Fatal("monitor resources lost the CPU shares", body)
+	}
+	if rec := do(t, h, "GET", Prefix+"/admin/system/resources/capabilities", "", bearer("sa_monitor")); rec.Code != 200 || !strings.Contains(rec.Body.String(), `"process_cpu_percent":true`) {
+		t.Fatal("monitor capabilities", rec.Code, rec.Body.String())
 	}
 	rec := do(t, h, "GET", Prefix+"/admin/nodes/summary", "", bearer("sa_monitor"))
 	if !strings.Contains(rec.Body.String(), `"cores":8`) || !strings.Contains(rec.Body.String(), `"role":"scratch"`) {
@@ -136,6 +144,48 @@ func TestMonitorScopeWithholdsDeploymentDetails(t *testing.T) {
 // admin:catalog:paths scope. The monitoring scope, which promises no paths,
 // is refused rather than answered without them, so a mirror never mistakes
 // the gap for missing files.
+func TestCatalogPathsScopeGatesListingFilePaths(t *testing.T) {
+	deps := pilotDeps(nil, nil)
+	listing := new(fakeAdminCatalogItems)
+	deps.AdminCatalogItems = listing
+	users := map[int]*models.User{1: {ID: 1, Role: "user", Enabled: true}, 2: {ID: 2, Role: "admin", Enabled: true}}
+	deps.Auth = apimw.NewAuthMiddleware(fakeTokens{}, fakeSessions{}, fakeAPIKeys{keys: map[string]*models.APIKey{
+		"sa_monitor":      {ID: 1, UserID: 2, Scopes: []string{auth.ScopeAdminMonitorRead}},
+		"sa_paths":        {ID: 2, UserID: 2, Scopes: []string{auth.ScopeAdminCatalogPaths}},
+		"sa_both":         {ID: 3, UserID: 2, Scopes: []string{auth.ScopeAdminMonitorRead, auth.ScopeAdminCatalogPaths}},
+		"sa_admin":        {ID: 4, UserID: 2},
+		"sa_member_paths": {ID: 5, UserID: 1, Scopes: []string{auth.ScopeAdminCatalogPaths}},
+	}}, fakeUsers{users: users})
+	h := NewHandler(deps)
+	const items, withPaths, path = Prefix + "/admin/catalog/items", Prefix + "/admin/catalog/items?include_file_paths=true", "/media/tv/Breaking Bad/Season 01/S01E02.mkv"
+
+	for key, allowed := range map[string]bool{"sa_monitor": false, "sa_paths": true, "sa_both": true, "sa_admin": true} {
+		rec := do(t, h, "GET", Prefix+"/admin/catalog/capabilities", "", bearer(key))
+		var caps AdminCatalogCapabilities
+		if err := json.Unmarshal(rec.Body.Bytes(), &caps); err != nil || rec.Code != 200 || caps.ItemFilePaths != allowed {
+			t.Fatal(key, rec.Code, rec.Body.String(), err)
+		}
+		if rec := do(t, h, "GET", items, "", bearer(key)); rec.Code != 200 || strings.Contains(rec.Body.String(), "file_path") {
+			t.Fatal(key, "listing without the flag", rec.Code, rec.Body.String())
+		}
+		if !allowed {
+			calls := listing.calls
+			requireProblem(t, do(t, h, "GET", withPaths, "", bearer(key)), TypePermissionDenied)
+			if listing.calls != calls {
+				t.Fatal(key, "denied request reached the listing")
+			}
+			continue
+		}
+		if rec := do(t, h, "GET", withPaths, "", bearer(key)); rec.Code != 200 || !strings.Contains(rec.Body.String(), path) {
+			t.Fatal(key, "listing with the flag", rec.Code, rec.Body.String())
+		}
+	}
+	requireProblem(t, do(t, h, "GET", withPaths, "", bearer("sa_member_paths")), TypePermissionDenied)
+	requireProblem(t, do(t, h, "GET", Prefix+"/admin/sessions", "", bearer("sa_paths")), TypePermissionDenied)
+}
+
+// monitoredRequestQueue adds the admin queue reads to the request fixture.
+// Its one event carries the kind of text a failed submission leaves.
 type monitoredRequestQueue struct{ *fakeAdminRequests }
 
 func (monitoredRequestQueue) CountAdminViews(context.Context, mediarequests.Viewer) (mediarequests.AdminViewCounts, error) {

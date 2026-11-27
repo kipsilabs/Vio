@@ -28,7 +28,7 @@ func BuiltinArrWebhookSource() DiscoveredSource {
 		PluginID:     BuiltinArrWebhookPluginID,
 		CapabilityID: BuiltinArrWebhookCapabilityID,
 		DisplayName:  builtinArrWebhookDisplayName,
-		Description:  "Sonarr or Radarr posts to Vio the moment an import finishes.",
+		Description:  "Sonarr or Radarr posts to Silo the moment an import finishes.",
 		// Webhook-only and credential-free: the provider pushes to a Silo
 		// endpoint, so the flow skips both the delivery-mode question and the
 		// connection step. This descriptor is what the admin UI used to infer

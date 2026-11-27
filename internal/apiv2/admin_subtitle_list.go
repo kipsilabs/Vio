@@ -3,7 +3,6 @@ package apiv2
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -96,14 +95,13 @@ func registerAdminSubtitleList(reg *Registry) {
 		}
 		result, err := reg.deps.AdminSubtitleList.ListAdminSubtitlesPage(ctx, filter, after, in.Limit)
 		if err != nil {
-			return nil, NewProblem(TypeInternalError, "Unable to list stored subtitles.").withCause(err)
+			return nil, NewProblem(TypeInternalError, "Unable to list stored subtitles.")
 		}
 		items := make([]AdminStoredSubtitle, 0, len(result.Items))
 		for _, row := range result.Items {
 			language, ok := subtitles.CanonicalProviderLanguage(row.Provider, row.Language)
 			if !ok {
-				return nil, NewProblem(TypeInternalError, "Stored subtitle has an invalid language value.").
-					withCause(fmt.Errorf("stored subtitle %d has provider %q and language %q", row.ID, row.Provider, row.Language))
+				return nil, NewProblem(TypeInternalError, "Stored subtitle has an invalid language value.")
 			}
 			item := AdminStoredSubtitle{ID: IDFromInt(int64(row.ID)), MediaFileID: IDFromInt(int64(row.MediaFileID)), MediaContentID: row.MediaContentID, Provider: row.Provider, Language: language, Format: row.Format, ReleaseName: row.ReleaseName, Score: row.Score, HearingImpaired: row.HearingImpaired, CreatedAt: NewInstant(row.CreatedAt), UploaderUsername: row.UploaderUsername, MediaTitle: row.MediaTitle, MediaType: row.MediaType, FilePath: row.FilePath}
 			if row.DownloadedBy != nil {
@@ -119,7 +117,7 @@ func registerAdminSubtitleList(reg *Registry) {
 			last := result.Items[len(result.Items)-1]
 			next, err = cursors.Encode(scope, handlers.AdminSubtitlePageKey{ID: last.ID, CreatedAt: last.CreatedAt})
 			if err != nil {
-				return nil, NewProblem(TypeInternalError, "Unable to encode subtitle cursor.").withCause(err)
+				return nil, NewProblem(TypeInternalError, "Unable to encode subtitle cursor.")
 			}
 		}
 		return &AdminStoredSubtitleCollectionOutput{Body: AdminStoredSubtitleCollection{Collection: Paginated(items, next), Total: result.Total, Uploads: result.Uploads, ProviderDownloads: result.ProviderDownloads}}, nil

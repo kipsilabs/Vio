@@ -16,19 +16,16 @@ import (
 	"github.com/Silo-Server/silo-server/internal/imageutil"
 )
 
-// Email branding follows the web sidebar (web/src/components/SiloBrand.tsx
-// renders web/public/vio-wordmark-sidebar.png): the header shows the
-// server's uploaded wordmark, else the fork's Vio wordmark, with the
+// Email branding follows the web sidebar (web/src/components/SiloBrand.tsx):
+// the header shows the server's uploaded wordmark, else Silo's own, with the
 // server name as alt text; the accent color, when set, colors the primary
 // action. The logo travels inside the message as an inline PNG rather than a
 // link: many clients block remote images, the recipient may not be able to
 // reach the server, and uploaded logos are stored as WebP, which Outlook does
 // not render.
 
-// defaultWordmarkPNG is the fork's Vio wordmark (a copy of
-// web/public/vio-wordmark-sidebar.png); keep the two in step when it
-// changes. The filename stays silo-wordmark.png so the embedded-asset path
-// is unchanged.
+// defaultWordmarkPNG is a copy of web/public/silo-wordmark-sidebar.png; keep
+// the two in step when the Silo wordmark changes.
 //
 //go:embed assets/silo-wordmark.png
 var defaultWordmarkPNG []byte

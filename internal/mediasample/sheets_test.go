@@ -147,21 +147,21 @@ func (f *fakeSheets) exec(_ context.Context, _ string, args []string, stdin io.R
 		log = append(log, "[metadata@sheets @ 0x55d0] sample="+sample)
 	}
 	if i := slices.Index(args, "framecrc"); i >= 0 {
-		var timing strings.Builder
+		var timing string
 		if f.packetEnd > 0 {
 			end := int64(math.Round(f.packetEnd * 1000))
-			timing.WriteString("#tb 0: 1/1000\n")
+			timing = "#tb 0: 1/1000\n"
 			for _, key := range f.keyPackets {
 				if math.IsNaN(key) {
-					_, _ = fmt.Fprintf(&timing, "0, %d, %d, 1, 1, 0x00000000\n", int64(math.MinInt64), int64(math.MinInt64))
+					timing += fmt.Sprintf("0, %d, %d, 1, 1, 0x00000000\n", int64(math.MinInt64), int64(math.MinInt64))
 					continue
 				}
 				at := int64(math.Round(key * 1000))
-				_, _ = fmt.Fprintf(&timing, "0, %d, %d, 1, 1, 0x00000000\n0, %d, %d, 1, 1, 0x00000000, F=0x0\n", at, at, at+1, at+1)
+				timing += fmt.Sprintf("0, %d, %d, 1, 1, 0x00000000\n0, %d, %d, 1, 1, 0x00000000, F=0x0\n", at, at, at+1, at+1)
 			}
-			_, _ = fmt.Fprintf(&timing, "0, %d, %d, 1, 1, 0x00000000\n", end-1, end-1)
+			timing += fmt.Sprintf("0, %d, %d, 1, 1, 0x00000000\n", end-1, end-1)
 		}
-		if err := os.WriteFile(args[i+1], []byte(timing.String()), 0o600); err != nil {
+		if err := os.WriteFile(args[i+1], []byte(timing), 0o600); err != nil {
 			return err
 		}
 	}

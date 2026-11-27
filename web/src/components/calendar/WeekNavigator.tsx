@@ -49,7 +49,7 @@ export default function WeekNavigator({
           >
             <ChevronLeft className="h-4 w-4" />
           </Button>
-          <p className="text-foreground/90 truncate px-1 text-[12px] font-semibold tracking-wide tabular-nums sm:text-sm">
+          <p className="text-foreground/90 truncate px-1 text-[0.75rem] font-semibold tracking-wide tabular-nums sm:text-sm">
             {rangeLabel}
           </p>
           <Button
@@ -65,7 +65,7 @@ export default function WeekNavigator({
         <Button
           variant="outline"
           size="sm"
-          className="h-8 shrink-0 rounded-full px-3 text-[11px] font-semibold sm:text-[12px]"
+          className="h-8 shrink-0 rounded-full px-3 text-[0.6875rem] font-semibold sm:text-[0.75rem]"
           onClick={onToday}
         >
           {t("web.calendar.todayButton")}
@@ -74,7 +74,7 @@ export default function WeekNavigator({
 
       <div className="grid grid-cols-7 gap-1 sm:gap-1.5">
         {weekDays.map((dateStr) => {
-          const { label, day } = formatShortDay(dateStr);
+          const { label, compactLabel, day } = formatShortDay(dateStr);
           const today = isToday(dateStr);
           const hasEvents = datesWithEvents.has(dateStr);
           const isSelected = selectedDay === dateStr;
@@ -98,11 +98,14 @@ export default function WeekNavigator({
               onClick={() => onSelectDay(dateStr)}
               className={`group/day focus-visible:ring-primary/50 flex min-h-[3.25rem] flex-col items-center justify-center gap-0.5 rounded-xl px-0.5 py-2 transition-all duration-150 outline-none focus-visible:ring-2 active:scale-[0.97] sm:min-h-[3.5rem] sm:gap-1 sm:px-2 sm:py-2.5 ${variant}`}
             >
-              <span className="text-[10px] font-medium tracking-wide uppercase sm:text-[11px]">
-                {label}
+              <span className="text-[0.625rem] font-medium tracking-wide uppercase sm:text-[0.6875rem]">
+                {/* Phone-width buttons are too narrow for long short names
+                    (pt-PT "segunda"); the button's name keeps the short one. */}
+                <span className="md:hidden">{compactLabel}</span>
+                <span className="hidden md:inline">{label}</span>
               </span>
               <span
-                className={`text-[14px] font-bold tabular-nums sm:text-base ${
+                className={`text-[0.875rem] font-bold tabular-nums sm:text-base ${
                   isSelected
                     ? "text-primary-foreground"
                     : today

@@ -305,7 +305,7 @@ func TestGetItemVersionsKeepsChapterImagesAndEmptyFiles(t *testing.T) {
 		t.Fatal("versions must still resolve the returned chapter thumbnail")
 	}
 	// thumbnail_path names the served object and is signed as stored.
-	if got, want := versions[0].Chapters[0].ThumbnailURL, "https://images.invalid/chapter-images/7/0/w300.webp"; got != want {
+	if got, want := fileVersion(t, versions, file.ID).Chapters[0].ThumbnailURL, "https://images.invalid/chapter-images/7/0/w300.webp"; got != want {
 		t.Fatalf("chapter thumbnail_url = %q, want %q", got, want)
 	}
 	f.files.files[f.ids["movie"]] = nil
@@ -325,58 +325,6 @@ func TestGetItemVersionsKeepsChapterImagesAndEmptyFiles(t *testing.T) {
 	f.svc.seasonRepo = nil
 	if _, err := f.svc.GetItemVersions(t.Context(), f.ids["episode"], AccessFilter{}); !errors.Is(err, ErrItemNotFound) {
 		t.Fatalf("missing season repository: %v", err)
-	}
-}
-
-func TestGetItemVersionsAvailableSignal(t *testing.T) {
-	f := newVersionsFixture(t)
-	// Local files: available when missing_since is nil, unavailable when set.
-	local := f.files.files[f.ids["movie"]][0]
-	local.MissingSince = nil
-	local.FailedAt = nil
-	missing := f.files.files[f.ids["movie"]][1]
-	missing.MissingSince = new(time.Now())
-	missing.FailedAt = nil
-	// Virtual candidates: available when failed_at is nil, unavailable when
-	// stamped; missing_since never applies to them.
-	virtualLive := f.files.files[f.ids["episode"]][0]
-	virtualLive.FilePath = "virtual://movie/tt1?result=live"
-	virtualLive.FailedAt = nil
-	virtualLive.MissingSince = new(time.Now())
-	virtualDead := f.files.files[f.ids["episode"]][1]
-	virtualDead.FilePath = "virtual://movie/tt1?result=dead"
-	virtualDead.FailedAt = new(time.Now())
-	virtualDead.MissingSince = nil
-
-	versions, err := f.svc.GetItemVersions(t.Context(), f.ids["movie"], AccessFilter{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(versions) != 2 {
-		t.Fatalf("want 2 movie versions, got %d", len(versions))
-	}
-	if versions[0].Available != nil {
-		t.Fatalf("present local file must omit available (available/unknown): %+v", versions[0])
-	}
-	if versions[1].Available == nil || *versions[1].Available {
-		t.Fatalf("missing local file must report available=false: %+v", versions[1])
-	}
-
-	epVersions, err := f.svc.GetItemVersions(t.Context(), f.ids["episode"], AccessFilter{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(epVersions) != 2 {
-		t.Fatalf("want 2 episode versions, got %d", len(epVersions))
-	}
-	if epVersions[0].Available != nil {
-		t.Fatalf("live virtual candidate must omit available (available/unknown): %+v", epVersions[0])
-	}
-	if epVersions[1].Available == nil || *epVersions[1].Available {
-		t.Fatalf("dead virtual candidate must report available=false: %+v", epVersions[1])
-	}
-	if epVersions[0].Failed || !epVersions[1].Failed {
-		t.Fatalf("virtual failed flag mismatch: %+v / %+v", epVersions[0], epVersions[1])
 	}
 }
 
@@ -400,10 +348,10 @@ func TestGetItemVersionsBatchesChapterImages(t *testing.T) {
 			if calls := f.images.calls.Load(); calls != 1 {
 				t.Fatalf("%d chapter images made %d resolver calls; want one batch", count, calls)
 			}
-			if len(versions) != 2 || len(versions[0].Chapters) != count {
+			if len(versions) != 2 || len(fileVersion(t, versions, file.ID).Chapters) != count {
 				t.Fatalf("chapter metadata missing: %+v", versions)
 			}
-			for i, chapter := range versions[0].Chapters {
+			for i, chapter := range fileVersion(t, versions, file.ID).Chapters {
 				input := file.Chapters[i]
 				if chapter.Index != input.Index || chapter.Title != input.Title || chapter.StartSeconds != input.StartSeconds || chapter.EndSeconds != input.EndSeconds || chapter.Source != input.Source || chapter.ThumbnailThumbhash != input.ThumbnailThumbhash || chapter.ThumbnailURL != "https://images.invalid/"+input.ThumbnailPath {
 					t.Fatalf("chapter %d metadata changed: %+v", i, chapter)
@@ -411,6 +359,17 @@ func TestGetItemVersionsBatchesChapterImages(t *testing.T) {
 			}
 		})
 	}
+}
+
+// fileVersion finds a version by file ID; versions come best first, not in
+// fixture order.
+func fileVersion(t *testing.T, versions []FileVersion, fileID int) FileVersion {
+	t.Helper()
+	i := slices.IndexFunc(versions, func(v FileVersion) bool { return v.FileID == fileID })
+	if i < 0 {
+		t.Fatalf("file %d missing from versions", fileID)
+	}
+	return versions[i]
 }
 
 type countingUserStores struct {
@@ -542,5 +501,51 @@ func TestGetEpisodeDetailsForSeriesChecksLibraryMembershipOnce(t *testing.T) {
 		if got := slices.Sorted(maps.Keys(details)); !slices.Equal(got, c.want) {
 			t.Errorf("presentation library %t: details for %v, want %v", c.filter.PresentationLibraryID != nil, got, c.want)
 		}
+	}
+}
+
+// The picker and flat file list must agree even when the request displays
+// only one of the libraries containing the movie.
+func TestPlaybackEditionAliasProjection(t *testing.T) {
+	probedAt := time.Now()
+	original := &models.MediaFile{ID: 1, ContentID: "movie", MediaFolderID: 1, CodecVideo: "hevc", Resolution: "2160p", ProbeUpdatedAt: &probedAt, Duration: 7200, EditionKey: "extended_cut", EditionRaw: "Extended Cut"}
+	hd := &models.MediaFile{ID: 2, ContentID: "movie", MediaFolderID: 2, CodecVideo: "h264", Resolution: "1080p", ProbeUpdatedAt: &probedAt, Duration: 7204, EditionKey: "extended_version", EditionRaw: "Extended Version"}
+	files := []*models.MediaFile{original, hd}
+	filter := AccessFilter{ScopeFilesToLibrary: true, PresentationLibraryID: new(hd.MediaFolderID)}
+	aliases := ResolveEditionAliases(files, filter)
+	service := &DetailService{}
+	versions, variants, _, _, _, _, _ := service.buildPlaybackInfo(t.Context(), FilterMediaFilesByAccess(files, filter), filter, "movie", aliases)
+	if !aliases.AllowsSubstitution(original, hd) || len(versions) != 1 || len(variants) != 1 ||
+		versions[0].EditionKey != "extended" || versions[0].EditionRaw != "Extended Version" ||
+		variants[0].EditionKey != "extended" || variants[0].EditionRaw != "Extended" || variants[0].VariantID != "extended||" ||
+		hd.EditionKey != "extended_version" {
+		t.Fatalf("alias projection = %v, %v; stored key = %q", versions, variants, hd.EditionKey)
+	}
+
+	for _, tt := range []struct {
+		name   string
+		change func(*models.MediaFile)
+		merges bool
+	}{
+		{"outside authorized libraries", func(f *models.MediaFile) { f.MediaFolderID, f.Duration = 3, 7500 }, true},
+		{"definitively unreadable", func(f *models.MediaFile) {
+			f.ProbeUpdatedAt, f.ProbeFailedAt, f.CodecVideo, f.Duration = nil, &probedAt, "", 0
+		}, false},
+		{"unprobed third file", func(f *models.MediaFile) { f.ProbeUpdatedAt = nil }, false},
+		{"implausible duration", func(f *models.MediaFile) { f.Duration, f.FileSize = 61, 100<<30 }, false},
+		{"different parts", func(f *models.MediaFile) { f.PresentationKind, f.PresentationPartIndex = "multipart_movie", 2 }, false},
+		{"different episode range", func(f *models.MediaFile) { f.MultiEpisodeStart, f.MultiEpisodeEnd = 1, 2 }, false},
+		{"adjacent pairs fit but whole group does not", func(f *models.MediaFile) { f.Duration = 7208 }, false},
+		{"qualified edition", func(f *models.MediaFile) { f.EditionKey, f.Duration = "extended_open_matte", 7500 }, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := *hd
+			f.ID, f.EditionKey = 3, "extended"
+			tt.change(&f)
+			a := ResolveEditionAliases([]*models.MediaFile{&f, hd, original}, AccessFilter{AllowedLibraryIDs: []int{1, 2}})
+			if a.AllowsSubstitution(original, hd) != tt.merges {
+				t.Fatalf("aliases = %v, want merge = %t", a, tt.merges)
+			}
+		})
 	}
 }

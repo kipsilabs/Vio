@@ -135,7 +135,7 @@ func openKeyframeSource(ctx context.Context, path string) (fspath.Reader, error)
 
 // contextReaderAt stops reading once ctx ends.
 type contextReaderAt struct {
-	ctx context.Context //nolint:containedctx // io.ReaderAt has no context parameter; the adapter stops reads when the request ends.
+	ctx context.Context
 	r   io.ReaderAt
 }
 

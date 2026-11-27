@@ -57,7 +57,6 @@ tags that identify the same multi-platform image:
 
 | Tag | Meaning |
 | --- | --- |
-| `dev` | Mutable pointer updated by successful default-branch publications. |
 | `build-N` | Ordered build identifier. A larger number is a newer published build; gaps from unsuccessful or non-publishing workflow runs are expected. |
 | `latest` | Mutable pointer updated by successful default-branch publications. |
 | Full commit SHA | Exact source identity for the build. |

@@ -74,7 +74,8 @@ type AdminTaskJob struct {
 	LibraryResult *AdminTaskJobLibraryResult `json:"library_result,omitempty"`
 	AdminJob
 	LibraryIDs              []ID                                 `json:"library_ids"`
-	SourceLabel             string                               `json:"source_label,omitempty"`
+	SourceLabel             string                               `json:"source_label,omitempty" doc:"An import's source as English text: the remote URL, the file name, or \"Export job <id>\". Prefer source_export_job_id when present."`
+	SourceExportJobID       string                               `json:"source_export_job_id,omitempty" doc:"The export job a catalog_import job reads from, when it was queued with export_job_id. Clients format their own label from it."`
 	CatalogResult           *AdminTaskJobCatalogResult           `json:"catalog_result,omitempty"`
 	ItemResult              *AdminTaskJobItemResult              `json:"item_result,omitempty"`
 	StorageTransitionResult *AdminTaskJobStorageTransitionResult `json:"storage_transition_result,omitempty"`
@@ -85,10 +86,6 @@ type AdminTaskJob struct {
 	DownloadExpiresAt       *Instant                             `json:"download_expires_at,omitempty"`
 	PublicURL               string                               `json:"public_url,omitempty" format:"uri-reference"`
 	PublicLinkSupported     bool                                 `json:"public_link_supported" doc:"Whether this server can mint a shareable seven-day link. False when exports are stored locally, because only storage-side presigning produces a URL usable off this server."`
-	// IndexerReleases is the retained indexer-release list a virtual candidates
-	// refresh produced, in the same wire shape the watch detail carries. Absent
-	// for every other job kind.
-	IndexerReleases []WatchIndexerRelease `json:"indexer_releases,omitempty"`
 }
 type AdminTaskJobsInput struct {
 	Kind   string `query:"kind"`
@@ -181,32 +178,6 @@ func (reg *Registry) adminTaskJobOf(ctx context.Context, job *models.AdminJob, a
 			out.ItemResult = &safe
 		}
 	}
-	// A completed virtual candidates refresh carries the retained release list
-	// in the same watch-detail shape, so the owner (an ordinary viewer who
-	// triggered the refresh) sees what the next detail read will return.
-	if job.JobType == adminjob.JobTypeVirtualCandidatesRefresh && job.Status == adminjob.StatusCompleted {
-		var result adminjob.VirtualCandidatesRefreshResult
-		if json.Unmarshal(job.ResultPayload, &result) == nil && len(result.Releases) > 0 {
-			releases := make([]WatchIndexerRelease, 0, len(result.Releases))
-			for _, release := range result.Releases {
-				releases = append(releases, WatchIndexerRelease{
-					ReleaseID:     release.ReleaseID,
-					Title:         release.Title,
-					Resolution:    release.Resolution,
-					CodecVideo:    release.CodecVideo,
-					CodecAudio:    release.CodecAudio,
-					HDR:           release.HDR,
-					SizeBytes:     release.SizeBytes,
-					Indexer:       release.Indexer,
-					PublishedAt:   instantPtr(release.PublishedAt),
-					FormatScore:   release.FormatScore,
-					Protocol:      release.Protocol,
-					DownloadState: release.DownloadState,
-				})
-			}
-			out.IndexerReleases = releases
-		}
-	}
 	if !admin {
 		return out
 	}
@@ -244,14 +215,16 @@ func (reg *Registry) adminTaskJobOf(ctx context.Context, job *models.AdminJob, a
 	}
 	if job.JobType == adminjob.JobTypeCatalogExport || job.JobType == adminjob.JobTypeCatalogImport {
 		var request struct {
-			LibraryIDs  []int64 `json:"library_ids"`
-			SourceLabel string  `json:"source_label"`
+			LibraryIDs        []int64 `json:"library_ids"`
+			SourceLabel       string  `json:"source_label"`
+			SourceExportJobID string  `json:"source_export_job_id"`
 		}
 		if json.Unmarshal(job.RequestPayload, &request) == nil {
 			for _, id := range request.LibraryIDs {
 				out.LibraryIDs = append(out.LibraryIDs, IDFromInt(id))
 			}
 			out.SourceLabel = request.SourceLabel
+			out.SourceExportJobID = request.SourceExportJobID
 		}
 		if job.Status == adminjob.StatusCompleted {
 			var result AdminTaskJobCatalogResult
@@ -291,11 +264,7 @@ func (reg *Registry) getAdminTaskJob(ctx context.Context, in *AdminTaskJobInput)
 	if err != nil {
 		return nil, serviceProblem(err)
 	}
-	// An item refresh and a virtual candidates refresh are owner-readable: the
-	// viewer who triggered the work may poll its status without administrator
-	// authority. Every other job kind is administrator-only.
-	ownerReadable := job.JobType == adminjob.JobTypeItemRefresh || job.JobType == adminjob.JobTypeVirtualCandidatesRefresh
-	if !admin && (claims == nil || !ownerReadable || job.CreatedByUserID != claims.UserID) {
+	if !admin && (claims == nil || job.JobType != adminjob.JobTypeItemRefresh || job.CreatedByUserID != claims.UserID) {
 		return nil, NewProblem(TypeNotFound, "Job not found")
 	}
 	out := &AdminTaskJobOutput{Body: reg.adminTaskJobOf(ctx, job, admin)}

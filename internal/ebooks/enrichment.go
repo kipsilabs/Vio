@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"reflect"
 	"regexp"
 	"strconv"
@@ -22,7 +23,6 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/bookid"
 	"github.com/Silo-Server/silo-server/internal/catalog"
-	"github.com/Silo-Server/silo-server/internal/envutil"
 	"github.com/Silo-Server/silo-server/internal/metadata"
 	"github.com/Silo-Server/silo-server/internal/models"
 )
@@ -59,7 +59,7 @@ func ebookContentType() string {
 
 func ebookEnrichWorkers() int {
 	n := defaultEnrichWorkers
-	if v := envutil.GetenvFirst("VIO_EBOOK_ENRICH_WORKERS", "SILO_EBOOK_ENRICH_WORKERS"); v != "" {
+	if v := os.Getenv("SILO_EBOOK_ENRICH_WORKERS"); v != "" {
 		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
 			n = parsed
 		}
@@ -437,12 +437,11 @@ func (e *Enricher) runQueueBatch(
 					recordTransitionError(item.ContentID, transitionErr)
 					continue
 				}
-				switch outcome {
-				case EnrichmentOutcomeSuccess:
+				if outcome == EnrichmentOutcomeSuccess {
 					atomic.AddInt64(&enriched, 1)
-				case EnrichmentOutcomeNoMatch:
+				} else if outcome == EnrichmentOutcomeNoMatch {
 					atomic.AddInt64(&noMatch, 1)
-				default:
+				} else {
 					atomic.AddInt64(&deferred, 1)
 				}
 			}
@@ -716,7 +715,7 @@ func (e *Enricher) enrichWithProvidersOutcome(
 
 	if !accumulator.HasMetadata && accumulator.PosterPath == "" && accumulator.Overview == "" {
 		if err := ctx.Err(); err != nil {
-			// A canceled sweep says nothing about the item or the providers.
+			// A cancelled sweep says nothing about the item or the providers.
 			return "", err
 		}
 		if len(providerErrs) > 0 {
@@ -1121,7 +1120,7 @@ func isNilImageCacher(cacher metadata.ImageCacher) bool {
 	}
 	value := reflect.ValueOf(cacher)
 	switch value.Kind() {
-	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Ptr, reflect.Slice:
 		return value.IsNil()
 	default:
 		return false
@@ -1286,7 +1285,7 @@ func (e *Enricher) persistPeople(ctx context.Context, contentID string, people [
 			continue
 		}
 		ip := people[i]
-		ip.ID = personIDs[i]
+		ip.Person.ID = personIDs[i]
 		linked = append(linked, ip)
 	}
 

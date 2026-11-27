@@ -1,8 +1,12 @@
 // @vitest-environment jsdom
+import type { ReactNode } from "react";
 import { cleanup, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { DirectConnectionsHostStatus } from "@/hooks/queries/admin/directConnections";
+import { AppIntlProvider, createAppIntl } from "@/i18n";
+// CI's web tests check out only the English and pseudo-English catalogs.
+import pseudo from "@/locales/en-XA.json";
 
 import { DirectConnectionsSection } from "./DirectConnectionsSection";
 
@@ -39,7 +43,10 @@ vi.mock("@/hooks/queries/admin/directConnections", () => ({
   useRefreshDirectConnections: () => ({ isPending: false, isError: false, mutate: vi.fn() }),
 }));
 
-function show(overrides: Partial<DirectConnectionsHostStatus>) {
+function show(
+  overrides: Partial<DirectConnectionsHostStatus>,
+  wrapper?: ({ children }: { children: ReactNode }) => ReactNode,
+) {
   state.host = {
     host: { id: "api", name: "API", role: "api" },
     checked_at: "2026-11-01T10:00:00.000Z",
@@ -47,7 +54,7 @@ function show(overrides: Partial<DirectConnectionsHostStatus>) {
     knobs: [],
     ...overrides,
   } satisfies DirectConnectionsHostStatus;
-  render(<DirectConnectionsSection />);
+  render(<DirectConnectionsSection />, wrapper ? { wrapper } : undefined);
 }
 
 /** The row (term, value, and notes) that holds a label. */
@@ -95,12 +102,12 @@ describe("host tuning values", () => {
     show({ knobs: [congestion, sendBuffer] });
 
     const algorithm = row("TCP congestion control");
-    expect(algorithm.getByText("Effective: BBR")).toBeInTheDocument();
+    expect(algorithm.getByText("Active: BBR")).toBeInTheDocument();
     expect(algorithm.getByText("Default: BBR")).toBeInTheDocument();
     expect(algorithm.getByText("Allowed: BBR, Off")).toBeInTheDocument();
 
     const buffer = row("TCP send buffer");
-    expect(buffer.getByText("Effective: 32.0 MB")).toBeInTheDocument();
+    expect(buffer.getByText("Active: 32.0 MB")).toBeInTheDocument();
     expect(buffer.getByText("Default: 32.0 MB")).toBeInTheDocument();
     expect(screen.queryByText(/33554432/)).not.toBeInTheDocument();
   });
@@ -114,10 +121,10 @@ describe("host tuning values", () => {
     });
 
     const algorithm = row("TCP congestion control");
-    expect(algorithm.getByText("Effective: Off")).toBeInTheDocument();
+    expect(algorithm.getByText("Active: Off")).toBeInTheDocument();
     expect(algorithm.getByText("Requested: bbrr")).toBeInTheDocument();
     const buffer = row("TCP send buffer");
-    expect(buffer.getByText("Effective: Off")).toBeInTheDocument();
+    expect(buffer.getByText("Active: Off")).toBeInTheDocument();
     expect(buffer.getByText("Requested: lots")).toBeInTheDocument();
   });
 });
@@ -197,6 +204,115 @@ describe("states that need no action", () => {
     expect(capability.queryByText("NET_ADMIN capability missing")).not.toBeInTheDocument();
     // The reason shows once, on the listener's send buffer.
     expect(screen.getAllByText("NET_ADMIN capability missing")).toHaveLength(1);
+  });
+});
+
+describe("direct connection tuning rows", () => {
+  const udpPort: Knob = {
+    env: "SILO_NET_DIRECT_UDP_PORT",
+    default: "8094",
+    effective: "8094",
+    min: "1",
+    max: "65535",
+  };
+  const gso: Knob = {
+    env: "SILO_NET_DIRECT_GSO",
+    default: "on",
+    effective: "on",
+    allowed: ["on", "off"],
+  };
+  const bbrLoss: Knob = {
+    env: "SILO_NET_DIRECT_BBR_LOSS",
+    default: "both",
+    effective: "off",
+    requested: "none",
+    reason: "invalid",
+    allowed: ["both", "no_lower", "loss_thresh", "off"],
+  };
+  const receiveWindow: Knob = {
+    env: "SILO_NET_DIRECT_RECEIVE_WINDOW",
+    default: "128",
+    effective: "64",
+    min: "4",
+    max: "128",
+  };
+  const ackDecimation: Knob = {
+    env: "SILO_NET_DIRECT_ACK_DECIMATION",
+    default: "on",
+    effective: "off",
+    allowed: ["on", "off"],
+  };
+
+  it("names each direct variable and shows on and off as states", () => {
+    show({ knobs: [udpPort, gso, bbrLoss, receiveWindow, ackDecimation] });
+
+    expect(row("Direct connection UDP port").getByText("Active: 8094")).toBeInTheDocument();
+    const offload = row("UDP segmentation offload");
+    expect(offload.getByText("Active: On")).toBeInTheDocument();
+    expect(offload.getByText("Default: On")).toBeInTheDocument();
+    expect(offload.getByText("Allowed: On, Off")).toBeInTheDocument();
+    const decimation = row("ACK decimation");
+    expect(decimation.getByText("Active: Off")).toBeInTheDocument();
+    expect(decimation.getByText("Default: On")).toBeInTheDocument();
+    const loss = row("BBR loss policy");
+    expect(loss.getByText("Active: Off")).toBeInTheDocument();
+    expect(loss.getByText("Requested: none")).toBeInTheDocument();
+  });
+
+  it("shows the receive window with its unit", () => {
+    show({ knobs: [receiveWindow] });
+
+    const window = row("Client receive window");
+    expect(window.getByText("Active: 64.0 MB")).toBeInTheDocument();
+    expect(window.getByText("Default: 128.0 MB")).toBeInTheDocument();
+    expect(screen.queryByText(/Active: 64$/)).not.toBeInTheDocument();
+  });
+
+  it("shows the allowed range under each numeric row, formatted like its value", () => {
+    show({
+      knobs: [udpPort, receiveWindow, { ...sendBuffer, min: "1", max: "1073741823" }, gso],
+    });
+
+    expect(row("Direct connection UDP port").getByText("Range: 1 to 65535")).toBeInTheDocument();
+    expect(row("Client receive window").getByText("Range: 4.0 MB to 128.0 MB")).toBeInTheDocument();
+    expect(row("TCP send buffer").getByText("Range: 1 B to 1024.0 MB")).toBeInTheDocument();
+    expect(row("UDP segmentation offload").queryByText(/Range:/)).not.toBeInTheDocument();
+  });
+
+  it("says a malformed receive window kept its default", () => {
+    show({
+      knobs: [{ ...receiveWindow, effective: "128", requested: "x", reason: "invalid_default" }],
+    });
+
+    const window = row("Client receive window");
+    expect(window.getByText("Requested: x")).toBeInTheDocument();
+    expect(window.getByText("Invalid value; using the default")).toBeInTheDocument();
+  });
+
+  it("says turning the setting on starts the engine", () => {
+    show({});
+
+    expect(
+      screen.getByText(/^Turning this on opens a UDP port for direct connections/),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/do not start direct playback/)).not.toBeInTheDocument();
+  });
+
+  it("leaves no plain English in the new lines under the pseudo-locale", () => {
+    const intl = createAppIntl("en-XA", pseudo);
+    show(
+      {
+        knobs: [{ ...receiveWindow, effective: "128", requested: "x", reason: "invalid_default" }],
+      },
+      ({ children }) => <AppIntlProvider intl={intl}>{children}</AppIntlProvider>,
+    );
+
+    expect(screen.getByText(/^⟦Ŕåñĝé: /)).toBeInTheDocument();
+    expect(screen.getByText(/^⟦Îñṽåļîđ ṽåļûé; ûšîñĝ ţĥé đéƒåûļţ/)).toBeInTheDocument();
+    expect(screen.getByText(/^⟦Ţûŕñîñĝ ţĥîš öñ öþéñš/)).toBeInTheDocument();
+    expect(
+      screen.queryByText(/Range:|Invalid value|Turning this on opens/),
+    ).not.toBeInTheDocument();
   });
 });
 

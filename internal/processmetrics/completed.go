@@ -53,9 +53,9 @@ func (w Workload) label() string {
 const workloadLabel = "workload"
 
 var (
-	exits   = promauto.NewCounterVec(prometheus.CounterOpts{Name: "vio_subprocess_exits_total", Help: "Observed child process completions or failures to start, by workload and bounded outcome."}, []string{workloadLabel, "outcome"})
-	cpu     = promauto.NewCounterVec(prometheus.CounterOpts{Name: "vio_subprocess_cpu_seconds_total", Help: "CPU seconds reported by completed child processes at their owner's Wait boundary; excludes currently running processes."}, []string{workloadLabel, "mode"})
-	peakRSS = promauto.NewHistogramVec(prometheus.HistogramOpts{Name: "vio_subprocess_peak_rss_bytes", Help: "Distribution of maximum resident bytes reported by individual completed child processes. Peaks are not current memory and must not be summed as concurrent usage.", Buckets: prometheus.ExponentialBuckets(1<<20, 4, 8)}, []string{workloadLabel})
+	exits   = promauto.NewCounterVec(prometheus.CounterOpts{Name: "silo_subprocess_exits_total", Help: "Observed child process completions or failures to start, by workload and bounded outcome."}, []string{workloadLabel, "outcome"})
+	cpu     = promauto.NewCounterVec(prometheus.CounterOpts{Name: "silo_subprocess_cpu_seconds_total", Help: "CPU seconds reported by completed child processes at their owner's Wait boundary; excludes currently running processes."}, []string{workloadLabel, "mode"})
+	peakRSS = promauto.NewHistogramVec(prometheus.HistogramOpts{Name: "silo_subprocess_peak_rss_bytes", Help: "Distribution of maximum resident bytes reported by individual completed child processes. Peaks are not current memory and must not be summed as concurrent usage.", Buckets: prometheus.ExponentialBuckets(1<<20, 4, 8)}, []string{workloadLabel})
 )
 
 // Record consumes a completed process state exactly once, after the existing

@@ -37,6 +37,9 @@ type RouteRequest struct {
 	NeedsProxy           bool
 	TranscodeEligible    func(*Node) bool
 	ProxyEligible        func(*Node) bool
+	// JobKind carries the work class callers built against upstream's per-kind
+	// balancing pass; this planner balances total job counts.
+	JobKind JobKind
 	// Unreachable holds the URLs of nodes the caller found not answering
 	// during this request. They count as unhealthy, so they are never selected
 	// and they degrade their co-location group just as a failed health check
@@ -69,7 +72,7 @@ type DownloadPlanner interface {
 // prepared download. The returned release function must be called after the
 // remote operation ends or falls back locally.
 type TranscodeWorkPlanner interface {
-	ReserveTranscodeWork(workID string) (*Node, func())
+	ReserveTranscodeWork(workID string, kind ...JobKind) (*Node, func())
 	TranscodeNode(nodeID int) (*Node, bool)
 }
 
@@ -558,14 +561,18 @@ func (p *Planner) ReleaseSessionProxy(sessionID string) {
 // sharing the same health-bridging reservation accounting as playback. Unlike
 // a playback session it does not require a proxy partner: the completed file
 // is written to the configured shared artifact store and served later.
-func (p *Planner) ReserveTranscodeWork(workID string) (*Node, func()) {
-	return p.ReserveTranscodeWorkWith(workID, nil)
+func (p *Planner) ReserveTranscodeWork(workID string, kinds ...JobKind) (*Node, func()) {
+	kind := JobKind("")
+	if len(kinds) > 0 {
+		kind = kinds[0]
+	}
+	return p.ReserveTranscodeWorkWith(workID, kind, nil)
 }
 
 // ReserveTranscodeWorkWith is ReserveTranscodeWork with an optional
 // capability predicate. The predicate runs under the planner lock and must not
 // perform I/O.
-func (p *Planner) ReserveTranscodeWorkWith(workID string, eligible func(*Node) bool) (*Node, func()) {
+func (p *Planner) ReserveTranscodeWorkWith(workID string, _ JobKind, eligible func(*Node) bool) (*Node, func()) {
 	if p == nil || p.transcodes == nil || workID == "" {
 		return nil, func() {}
 	}

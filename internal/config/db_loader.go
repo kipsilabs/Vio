@@ -323,7 +323,7 @@ func LoadFromDB(m map[string]string) (*Config, error) {
 
 	// Artwork
 	cfg.Artwork.StorageBackend = stringOr(m, "artwork.storage_backend", "auto")
-	cfg.Artwork.LocalPath = artworkLocalPath(m)
+	cfg.Artwork.LocalPath = stringOr(m, "artwork.local_path", "/var/lib/silo/artwork")
 
 	// Metadata
 	cacheImages, err := boolOr(m, "metadata.cache_images", true)
@@ -362,7 +362,7 @@ func LoadFromDB(m map[string]string) (*Config, error) {
 		return nil, fmt.Errorf("%s must be 0 or between 120 and 86400", playbackSegmentRetentionSettingKey)
 	}
 	cfg.Playback.SegmentRetentionSeconds = segmentRetentionSeconds
-	keyframePlaylist, err := boolOr(m, PlaybackKeyframePlaylistSettingKey, true)
+	keyframePlaylist, err := boolOr(m, PlaybackKeyframePlaylistSettingKey, false)
 	if err != nil {
 		return nil, err
 	}
@@ -381,7 +381,6 @@ func LoadFromDB(m map[string]string) (*Config, error) {
 	}
 	cfg.Playback.BandwidthProbeMaxAgeDays = bandwidthProbeMaxAgeDays
 	cfg.Playback.HWAccel = stringOr(m, "playback.hw_accel", "auto")
-	cfg.Playback.SoftwareFallback = stringOr(m, "playback.software_fallback", "allow")
 	cfg.Playback.HWDevice = stringOr(m, "playback.hw_device", "")
 	chapterThumbnailWorkers, err := intOr(m, "playback.chapter_thumbnail_workers", 1)
 	if err != nil {
@@ -409,15 +408,11 @@ func LoadFromDB(m map[string]string) (*Config, error) {
 		return nil, err
 	}
 	cfg.Playback.TranscodeEnabled = transcodeEnabled
-	maxVirtualFailoverAttempts, err := intOr(m, "playback.max_virtual_failover_attempts", 5)
-	if err != nil {
-		return nil, err
-	}
-	cfg.Playback.MaxVirtualFailoverAttempts = maxVirtualFailoverAttempts
 	cfg.Playback.Routing = playbackRoutingPolicyFromSettings(m)
 	if err := validatePlaybackRoutingPolicy(cfg.Playback.Routing); err != nil {
 		return nil, err
 	}
+
 	// Redis
 	cfg.Redis.URL = stringOr(m, "redis.url", "")
 	cfg.Redis.DB = stringOr(m, RedisDBSettingKey, "")
@@ -464,7 +459,7 @@ func LoadFromDB(m map[string]string) (*Config, error) {
 	cfg.JellyfinCompat.PublicURL = stringOr(m, "jellyfin_compat.public_url", "http://127.0.0.1:8096")
 	cfg.JellyfinCompat.EmulatedServerVersion = stringOr(m, "jellyfin_compat.emulated_server_version", DefaultJellyfinCompatEmulatedServerVersion)
 	cfg.JellyfinCompat.ServerID = stringOr(m, "jellyfin_compat.server_id", defaultJellyfinCompatServerIDFromDB)
-	cfg.JellyfinCompat.ServerName = stringOr(m, "jellyfin_compat.server_name", "Vio")
+	cfg.JellyfinCompat.ServerName = stringOr(m, "jellyfin_compat.server_name", "Silo")
 	webEnabled, err := boolOr(m, "jellyfin_compat.web_enabled", true)
 	if err != nil {
 		return nil, err

@@ -249,7 +249,7 @@ func (s *Service) reconcileContinueWatching(ctx context.Context, userID int, pro
 			stats.listed++
 			continue
 		}
-		if !show.inProgress && (!row.IncludesNextUp || !show.unfinished) {
+		if !show.inProgress && !(row.IncludesNextUp && show.unfinished) {
 			stats.settled++
 			continue
 		}
@@ -358,7 +358,7 @@ func (s *Service) reconcileContinueWatching(ctx context.Context, userID int, pro
 // once the primary one matches.
 func (s *Service) seriesIDsByProviderIDs(ctx context.Context, series Record) ([]string, error) {
 	candidates := []struct{ column, value string }{
-		{columnTVDBID, series.TVDBID}, {columnTMDBID, series.TMDBID}, {columnImdbID, series.IMDbID},
+		{"tvdb_id", series.TVDBID}, {"tmdb_id", series.TMDBID}, {"imdb_id", series.IMDbID},
 	}
 	if series.PreferTMDB {
 		candidates[0], candidates[1] = candidates[1], candidates[0]

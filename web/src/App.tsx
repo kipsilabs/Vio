@@ -60,6 +60,7 @@ import {
   buildQueryCatalogHref,
   buildUserCollectionCatalogHref,
 } from "@/pages/catalogSearchParams";
+import LegacyAdminActivityRedirect from "@/pages/LegacyAdminActivityRedirect";
 import LegacyAdminHomeRowsRedirect from "@/pages/LegacyAdminHomeRowsRedirect";
 import LegacyRequestDetailRedirect from "@/pages/LegacyRequestDetailRedirect";
 import { buildLegacyWebhookSyncRedirectTarget } from "@/lib/webhookSync";
@@ -107,7 +108,6 @@ const RequestBrowse = lazy(() => import("@/pages/RequestBrowse"));
 const RequestDiscoverSection = lazy(() => import("@/pages/RequestDiscoverSection"));
 const TitleDetail = lazy(() => import("@/pages/TitleDetail"));
 const AdminDashboard = lazy(() => import("@/pages/AdminDashboard"));
-const AdminActivity = lazy(() => import("@/pages/AdminActivity"));
 const AdminLogs = lazy(() => import("@/pages/AdminLogs"));
 const AdminDiagnostics = lazy(() => import("@/pages/AdminDiagnostics"));
 const AdminAccessGroups = lazy(() => import("@/pages/AdminAccessGroups"));
@@ -115,7 +115,6 @@ const AdminUsers = lazy(() => import("@/pages/AdminUsers"));
 const AdminRequests = lazy(() => import("@/pages/AdminRequests"));
 const AdminDevices = lazy(() => import("@/pages/AdminDevices"));
 const AdminLibraries = lazy(() => import("@/pages/AdminLibraries"));
-const AdminVirtualLibrary = lazy(() => import("@/pages/AdminVirtualLibrary"));
 const AdminAutoscan = lazy(() => import("@/pages/AdminAutoscan"));
 const AdminAutoscanActivity = lazy(() => import("@/pages/AdminAutoscanActivity"));
 const AdminSettingsLayout = lazy(() => import("@/pages/admin-settings/AdminSettingsLayout"));
@@ -125,6 +124,7 @@ const AdminHomeRows = lazy(() => import("@/pages/AdminHomeRows"));
 const AdminRequestDiscover = lazy(() => import("@/pages/AdminRequestDiscover"));
 const AdminCollections = lazy(() => import("@/pages/AdminCollections"));
 const AdminPlaybackHistory = lazy(() => import("@/pages/AdminPlaybackHistory"));
+const AdminInsights = lazy(() => import("@/pages/admin-insights/AdminInsights"));
 const AdminMarkerHistory = lazy(() => import("@/pages/AdminMarkerHistory"));
 const AdminMaintenance = lazy(() => import("@/pages/AdminMaintenance"));
 const AdminBackups = lazy(() => import("@/pages/AdminBackups"));
@@ -163,6 +163,7 @@ const HomeScreenSettings = lazy(() => import("@/pages/settings/HomeScreenSetting
 const TitlePagesSettings = lazy(() => import("@/pages/settings/TitlePagesSettings"));
 const PersonalizeSettings = lazy(() => import("@/pages/settings/PersonalizeSettings"));
 const ConnectAppsSettings = lazy(() => import("@/pages/settings/ConnectAppsSettings"));
+const ApiKeysSettings = lazy(() => import("@/pages/settings/ApiKeysSettings"));
 const InterfaceSettings = lazy(() => import("@/pages/settings/InterfaceSettings"));
 const AccountSettings = lazy(() => import("@/pages/settings/AccountSettings"));
 const WatchPartyHub = lazy(() => import("@/pages/watchtogether/WatchPartyHub"));
@@ -553,11 +554,10 @@ function AppRoutes() {
                   }
                 >
                   <Route index element={<AdminDashboard />} />
-                  <Route path="activity" element={<AdminActivity />} />
+                  <Route path="activity" element={<LegacyAdminActivityRedirect />} />
                   <Route path="logs" element={<AdminLogs />} />
                   <Route path="diagnostics" element={<AdminDiagnostics />} />
                   <Route path="libraries" element={<AdminLibraries />} />
-                  <Route path="virtual-library" element={<AdminVirtualLibrary />} />
                   <Route path="maintenance" element={<AdminMaintenance />} />
                   <Route path="backups" element={<AdminBackups />} />
                   <Route path="backups/:id/restore" element={<AdminBackupRestore />} />
@@ -576,6 +576,7 @@ function AppRoutes() {
                   <Route path="autoscan" element={<AdminAutoscan />} />
                   <Route path="autoscan/activity" element={<AdminAutoscanActivity />} />
                   <Route path="history" element={<AdminPlaybackHistory />} />
+                  <Route path="insights" element={<AdminInsights />} />
                   <Route path="marker-history" element={<AdminMarkerHistory />} />
                   <Route path="history-import" element={<AdminHistoryImport />} />
                   <Route path="users" element={<AdminUsers />} />
@@ -684,6 +685,7 @@ function AppRoutes() {
                   <Route path="notifications" element={<NotificationsSettings />} />
                   <Route path="your-data" element={<YourDataSettings />} />
                   <Route path="connect-apps" element={<ConnectAppsSettings />} />
+                  <Route path="api-keys" element={<ApiKeysSettings />} />
                   <Route path="*" element={<Navigate to="/settings/playback" replace />} />
                 </Route>
                 <Route

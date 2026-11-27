@@ -50,6 +50,7 @@ func Stat(name string) (os.FileInfo, error) {
 // osStat is os.Stat; tests swap it to simulate a stat that never returns.
 var osStat = os.Stat
 
+// statCall is one in-flight stat that StatContext callers for a path share.
 type statCall struct {
 	done chan struct{}
 	info os.FileInfo
@@ -61,8 +62,11 @@ var (
 	statCalls   = map[string]*statCall{}
 )
 
-// StatContext returns when ctx is canceled even if the underlying stat is
-// blocked. Calls for the same path share the in-flight system call.
+// StatContext is Stat that returns ctx.Err() once ctx ends, even while the
+// stat system call is still blocked, as it can be on a stalled network or
+// FUSE mount. The call keeps running until the kernel returns; concurrent
+// callers for the same path share it, so a wedged path holds one goroutine
+// however many requests give up on it.
 func StatContext(ctx context.Context, name string) (os.FileInfo, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err

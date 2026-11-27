@@ -198,7 +198,7 @@ func (s *Service) ReconcileMissingAssets(ctx context.Context) (checked, cleared 
 				return checked, cleared, setErr
 			}
 			cleared++
-			slog.WarnContext(ctx, "branding: cleared asset whose stored object is missing", "kind", kind, "key", key)
+			slog.Warn("branding: cleared asset whose stored object is missing", "kind", kind, "key", key)
 		default:
 			return checked, cleared, getErr
 		}

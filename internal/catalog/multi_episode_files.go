@@ -40,16 +40,7 @@ var ServedEpisodeFilesSQL = `
 	UNION
 	SELECT covered.content_id, mf.id
 	FROM episodes covered` + spannedEpisodeJoinSQL + `
-	WHERE covered.content_id = ANY($1::text[])
-	UNION
-	-- A file kept on an alias row still serves the canonical episode the
-	-- catalog displays; the alias exists only to carry a second layout.
-	SELECT ea.canonical_episode_id, mf.id
-	FROM episode_aliases ea
-	JOIN media_files mf ON mf.episode_id = ea.alias_episode_id
-	WHERE ea.canonical_episode_id = ANY($1::text[])
-	  AND ea.alias_episode_id IS NOT NULL
-	  AND mf.missing_since IS NULL`
+	WHERE covered.content_id = ANY($1::text[])`
 
 // NoServingEpisodeFileSQL holds for a membership el whose episode has no
 // present file in its folder, linked or spanning it.
@@ -88,17 +79,6 @@ func SpanningEpisodeFileExistsSQL(episodeExpr, fileCondition string) string {
 		WHERE covered.content_id = ` + episodeExpr + `
 		  AND ` + fileCondition + `
 	)`
-}
-
-// episodeServingFileExistsSQL holds when the episode whose content ID is
-// episodeExpr has a present file a read must treat as its own: a file linked
-// to it, a present file owned by one of its alias rows, or a multi-episode
-// file spanning it from an earlier episode. fileCondition is an SQL condition
-// on media_files mf and already includes the missing-file condition.
-// episodeExpr is built from package-owned aliases, never caller input.
-func episodeServingFileExistsSQL(episodeExpr, fileCondition string) string {
-	return "(" + canonicalEpisodeFileExistsSQL(episodeExpr, fileCondition) +
-		" OR " + SpanningEpisodeFileExistsSQL(episodeExpr, fileCondition) + ")"
 }
 
 // SpannedEpisodesSQL selects (content_id, season_number, episode_number) of

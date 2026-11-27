@@ -15,9 +15,9 @@ import (
 )
 
 var (
-	available    = promauto.NewGauge(prometheus.GaugeOpts{Name: "vio_debug_listener_available", Help: "Whether this process currently serves the local profiling listener."})
-	failures     = promauto.NewCounter(prometheus.CounterOpts{Name: "vio_debug_listener_failures_total", Help: "Failures binding or serving the local profiling listener."})
-	busyCaptures = promauto.NewCounter(prometheus.CounterOpts{Name: "vio_debug_captures_busy_total", Help: "Profiling requests refused because a capture was already running."})
+	available    = promauto.NewGauge(prometheus.GaugeOpts{Name: "silo_debug_listener_available", Help: "Whether this process currently serves the local profiling listener."})
+	failures     = promauto.NewCounter(prometheus.CounterOpts{Name: "silo_debug_listener_failures_total", Help: "Failures binding or serving the local profiling listener."})
+	busyCaptures = promauto.NewCounter(prometheus.CounterOpts{Name: "silo_debug_captures_busy_total", Help: "Profiling requests refused because a capture was already running."})
 )
 
 // Server has one lifecycle owner in bootstrap, across all serving roles.

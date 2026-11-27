@@ -98,7 +98,7 @@ type WebhookMapping struct {
 	ConnectionID     ID      `json:"connection_id"`
 	ExternalUserID   string  `json:"external_user_id"`
 	ExternalUserName string  `json:"external_user_name"`
-	SiloProfileID    *ID     `json:"vio_profile_id,omitempty"`
+	SiloProfileID    *ID     `json:"silo_profile_id,omitempty"`
 	LastSeenAt       Instant `json:"last_seen_at"`
 	CreatedAt        Instant `json:"created_at"`
 	UpdatedAt        Instant `json:"updated_at"`
@@ -126,7 +126,7 @@ type WebhookMappingsOutput struct {
 type WebhookMappingUpdate struct {
 	ExternalUserID   string  `json:"external_user_id" minLength:"1" maxLength:"1024"`
 	ExternalUserName string  `json:"external_user_name" maxLength:"1024"`
-	SiloProfileID    *string `json:"vio_profile_id"`
+	SiloProfileID    *string `json:"silo_profile_id"`
 }
 type WebhookMappingsInput struct {
 	WebhookConnectionID

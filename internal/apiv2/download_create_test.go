@@ -3,7 +3,6 @@ package apiv2
 import (
 	"context"
 	"encoding/json"
-	"strings"
 	"testing"
 	"time"
 
@@ -42,7 +41,7 @@ func TestDownloadCreateTransport(t *testing.T) {
 	deps.DownloadCreation = svc
 	h := newTestHandler(t, deps)
 	viewer := with(bearer(memberToken), "X-Profile-Id", "p-owner")
-	device := with(viewer, "X-Vio-Device-Id", "device-one")
+	device := with(viewer, "X-Silo-Device-Id", "device-one")
 	path := Prefix + "/downloads"
 	rec := do(t, h, "POST", path, `{"content_id":"movie","media_file_id":"42","expected_revision":0}`, device)
 	if rec.Code != 202 || svc.user != 1 || svc.req.ProfileID != "p-owner" || svc.req.DeviceID != "device-one" || svc.req.FileID != 42 || svc.req.ExpectedRevision == nil || *svc.req.ExpectedRevision != 0 || !svc.req.StrictIdentity {
@@ -91,20 +90,12 @@ func TestDownloadCreateTransport(t *testing.T) {
 	if rec.Code != 400 {
 		t.Fatalf("scope %d", rec.Code)
 	}
-	for _, body := range []string{`{"content_id":"movie","expected_revision":1}`, `{"content_id":"movie","expected_revision":0,"expected_download_id":"old"}`, `{"content_id":"series","series":true,"batch_id":"intent","expected_entries":{"episode":{"revision":1}}}`, `{"content_id":"movie"}`, `{"content_id":"movie","media_file_id":"042","expected_revision":0}`, `{"content_id":"movie","expected_revision":0,"season_number":0}`, `{"content_id":"series","series":true}`} {
+	for _, body := range []string{`{"content_id":"movie","expected_revision":1}`, `{"content_id":"movie","expected_revision":0,"expected_download_id":"old"}`, `{"content_id":"series","series":true,"batch_id":"intent","expected_entries":{"episode":{"revision":1}}}`, `{"content_id":"movie"}`, `{"content_id":"movie","media_file_id":"042","expected_revision":0}`, `{"content_id":"movie","expected_revision":0,"season_number":0}`, `{"content_id":"series","series":true}`, `{"content_id":"movie","expected_revision":0,"caps":{"video_evidence":"typo","codecs_video":[],"codecs_audio":[],"containers":[],"max_resolution":"1080p","hdr":false}}`} {
 		before := svc.calls
 		rec = do(t, h, "POST", path, body, device)
 		if rec.Code != 400 || svc.calls != before {
 			t.Fatalf("invalid %s: %d %s", body, rec.Code, rec.Body.String())
 		}
-	}
-	// A caps object carrying an unrecognized video_evidence tier is a domain
-	// violation the handler refuses with 422 validation_failed (the field is in
-	// the contract; the handler validates its value), unlike the 400s above.
-	beforeSchema := svc.calls
-	rec = do(t, h, "POST", path, `{"content_id":"movie","expected_revision":0,"caps":{"video_evidence":"typo","codecs_video":[],"codecs_audio":[],"containers":[],"max_resolution":"1080p","hdr":false}}`, device)
-	if rec.Code != 422 || svc.calls != beforeSchema || !strings.Contains(rec.Body.String(), "validation_failed") {
-		t.Fatalf("caps invalid tier: %d %s", rec.Code, rec.Body.String())
 	}
 	rec = do(t, h, "POST", path, `{"content_id":"movie"}`, viewer)
 	if rec.Code != 202 || svc.req.DeviceID != "" {
@@ -120,6 +111,13 @@ func TestDownloadCreateTransport(t *testing.T) {
 	if rec.Code != 429 {
 		t.Fatalf("quota %d", rec.Code)
 	}
+	// A series request for an item that is not a series is a validation
+	// failure at content_id.
+	svc.err = downloads.ErrNotSeries
+	p := requireProblem(t, do(t, h, "POST", path, `{"content_id":"movie","series":true,"batch_id":"intent"}`, device), TypeValidationFailed)
+	if len(p.Errors) != 1 || p.Errors[0].Location != "body.content_id" || p.Errors[0].Code != "invalid" {
+		t.Fatalf("not a series: errors = %+v", p.Errors)
+	}
 }
 
 func TestDownloadCreateRejectsEmptyBatchGuardsOnSingle(t *testing.T) {
@@ -128,7 +126,7 @@ func TestDownloadCreateRejectsEmptyBatchGuardsOnSingle(t *testing.T) {
 	deps.DownloadCreation = svc
 	h := newTestHandler(t, deps)
 	viewer := with(bearer(memberToken), "X-Profile-Id", "p-owner")
-	device := with(viewer, "X-Vio-Device-Id", "device-one")
+	device := with(viewer, "X-Silo-Device-Id", "device-one")
 	for _, tc := range []struct {
 		name, body string
 		managed    bool

@@ -519,7 +519,7 @@ func (c *meilisearchClient) do(ctx context.Context, method, endpoint string, bod
 	if err != nil {
 		return err
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		httpErr := &meilisearchHTTPError{StatusCode: resp.StatusCode}

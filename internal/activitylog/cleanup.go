@@ -41,7 +41,7 @@ func SeedDefaults(ctx context.Context, store SettingsStore) error {
 }
 
 // RunCleanup starts a background goroutine that runs batched deletes daily.
-// Blocks until ctx is canceled.
+// Blocks until ctx is cancelled.
 func RunCleanup(ctx context.Context, pool *pgxpool.Pool, store SettingsStore, pm PartitionManager) {
 	// Run once at startup, then every 24 hours
 	CleanupOnce(ctx, pool, store, pm)
@@ -148,6 +148,6 @@ func deleteExpiredRowsBefore(ctx context.Context, pool *pgxpool.Pool, cutoff tim
 
 func parseInt(s string) int {
 	var v int
-	_, _ = fmt.Sscanf(s, "%d", &v)
+	fmt.Sscanf(s, "%d", &v)
 	return v
 }

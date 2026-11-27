@@ -359,9 +359,14 @@ Content-Type: application/json
 ### Device override and plugin writes answer `200` with the document
 
 `PUT /api/v2/settings/device/subtitle-appearance` takes a `{value}` body (the appearance as a
-JSON document in a string; only JSON validity is checked) and answers `200` with the resolved
+JSON document in a string, which must satisfy the contract's `subtitle-appearance.json` schema;
+anything else is `422` at `body.value`) and answers `200` with the resolved
 `EffectiveSubtitleAppearance`, the same document
 `GET /api/v2/settings/subtitle-appearance/effective` serves.
+That document reads the canonical `playback.subtitle_appearance` setting: `global_value` is the
+profile-scope value, `device_value` the `profile_device` override for the declared device, and
+`effective_value` the override when there is one, otherwise the profile value (empty when neither
+is stored).
 `X-Silo-Device-Id` is a required declared header on both device-override mutations (a missing id
 is `422` at `header.X-Silo-Device-Id`); `DELETE` answers `204`, including when no override
 existed. The device headers declare length bounds (128/120/40), so an over-long value is a `422`.
@@ -907,13 +912,10 @@ another validated document.
 - `resolveEffectiveSettings` resolves a bounded list of content contexts in one
   store read (see [Batch effective resolution](#batch-effective-resolution)).
 
-An effective read resolves the layers the request names. The device header is
-optional: absence skips the exact-device layer and the response's `source` and
-`source_context` name the profile, account or default row that won, so a client
-can tell that no device override applied. Send `X-Vio-Device-Id` when the
-device's own override should participate. The family header is also optional for
-backward compatibility: absence skips the `profile_client` layer, while a
-non-empty invalid family is rejected. First-party clients should send their
+An effective request must include the device header when any requested
+definition permits an exact-device override. The family header is optional:
+absence skips the `profile_client` layer, while a non-empty invalid family is
+rejected. First-party clients should send their
 family so like-device preferences participate in resolution. Each response
 includes its source scope and source context; `client_family` is included for a
 family-scoped winner.
@@ -976,11 +978,8 @@ The five accepted `client_family` values are also returned by
 
 The server admin settings include `artwork.storage_backend` (`auto`, `local`, or
 `s3`) and `artwork.local_path` (an absolute filesystem path, defaulting to
-`/var/lib/vio/artwork`). An installation that already recorded a local storage
-identity keeps the exact root that identity names instead, normally
-`/var/lib/silo/artwork`, until a managed storage transition moves it; an install
-with no recorded identity adopts the default. Artwork storage settings take
-effect after a server restart.
+`/var/lib/silo/artwork`). Artwork storage settings take effect after a server
+restart.
 
 A write of `artwork.local_path` is refused with a `422` validation problem when
 a local store could not open that folder: the path names an existing file or

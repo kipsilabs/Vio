@@ -44,7 +44,7 @@ func TestJWT_ValidateAccessToken(t *testing.T) {
 	if claims.ExpiresAt == nil {
 		t.Fatal("ExpiresAt should be set")
 	}
-	if !claims.ExpiresAt.After(time.Now()) {
+	if !claims.ExpiresAt.Time.After(time.Now()) {
 		t.Error("ExpiresAt should be in the future")
 	}
 
@@ -52,7 +52,7 @@ func TestJWT_ValidateAccessToken(t *testing.T) {
 	if claims.IssuedAt == nil {
 		t.Fatal("IssuedAt should be set")
 	}
-	if claims.IssuedAt.After(time.Now().Add(1 * time.Second)) {
+	if claims.IssuedAt.Time.After(time.Now().Add(1 * time.Second)) {
 		t.Error("IssuedAt should not be in the future")
 	}
 }

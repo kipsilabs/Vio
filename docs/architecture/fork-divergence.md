@@ -132,3 +132,38 @@ that before it ships.
    `internal/catalog` virtual suites against a disposable DB, `internal/api`
    router tests, web typecheck plus touched step tests).
 5. Push. The image pipeline builds from the merge.
+
+## Deferred upstream adoption
+
+The 2026-11-27 sync merges upstream's non-playback work and keeps the fork's
+playback engine. Upstream's playback/session rework is **not adopted at this
+base**; it is deferred as a project, not dropped by accident.
+
+Deferred upstream projects:
+
+- Playback engine and session handling: #5269, #5293, #5412, #5438, #4641,
+  #4604, #4639, #5117, #4476, #4572, #5180, #4621, #4478, #4620, #5144, #5133.
+- Transcode-node job admission and thin-node work: #5446, #4504, and the
+  signed node-source/thin-node runtime (already listed under "Upstream work
+  deliberately not adopted").
+- Admin Insights and the Playback History rework: #5279, #5321, #5301, which
+  are built on the #5269 session/history schema.
+
+Reason: the fork's playback engine is a deliberate divergence
+(`internal/playback`, the virtual-library playback paths, the compat wiring,
+and #482–#495). The upstream projects above rewrite the same session, copy,
+stream-end, and history machinery those divergences sit on, and their
+generated contracts and admin views follow it. Adopting them is a separate
+project with its own validation, not a merge-time conflict resolution.
+
+What a future adoption implies:
+
+- Take upstream's `internal/playback` and `internal/transcodenode` wholesale,
+  replace the fork planner (`plan_v3.go`, `transcode.go`) and the virtual
+  playback dispatch (`playback_virtual*.go`, `internal/jellycompat` virtual
+  wiring), and keep the #482–#495 fixes by re-deriving them on the new engine.
+- Rebuild the apiv2 session/history/insights surfaces and their generated
+  contracts in the same change; the admin sessions payload, playback history
+  fixtures, and the Insights breakdowns move together.
+- Re-run the fork's virtual-library playback suites and the compat router
+  wiring test; both pin behaviour the rework changes.

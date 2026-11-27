@@ -258,21 +258,7 @@ export function coerceFieldValue(
       case "array:bool":
       case "array:int":
       case "array:num": {
-        let arr: unknown[];
-        if (Array.isArray(raw)) {
-          arr = raw;
-        } else if (typeof raw === "string" && raw.trim() !== "") {
-          try {
-            const parsed = JSON.parse(raw);
-            arr = Array.isArray(parsed) ? parsed : [];
-          } catch {
-            // Leave malformed JSON in the form so schema validation can show
-            // the error instead of silently replacing it with an empty list.
-            return raw;
-          }
-        } else {
-          arr = [];
-        }
+        const arr = Array.isArray(raw) ? raw : [];
         if (fieldType === "array") return arr;
         // A saved list loads as is, so keep a null item a nullable type allows.
         if (fieldType === "array:bool") return arr.map((v) => (v === null ? v : coerceBoolean(v)));

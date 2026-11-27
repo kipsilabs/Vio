@@ -1,16 +1,18 @@
 <p align="center">
-  <img src="assets/icon.png" alt="Vio logo" width="112" height="112">
+  <img src="assets/icon.png" alt="Silo logo" width="112" height="112">
 </p>
+
+<h1 align="center">Silo</h1>
 
 <p align="center">
   A self-hosted media server for films, series, audiobooks, ebooks, podcasts, and manga.
 </p>
 
 <p align="center">
-  <a href="https://github.com/kipsilabs/Vio/releases"><img alt="Latest GitHub release" src="https://img.shields.io/github/v/release/kipsilabs/Vio?include_prereleases&amp;sort=semver&amp;display_name=tag&amp;style=flat-square&amp;label=release"></a>
-  <a href="https://github.com/kipsilabs/Vio/pkgs/container/vio"><img alt="Container image on GHCR" src="https://img.shields.io/badge/container-GHCR-2496ED?style=flat-square&amp;logo=docker&amp;logoColor=white"></a>
-  <a href="https://github.com/kipsilabs/Vio/actions/workflows/ci.yml"><img alt="Continuous integration" src="https://img.shields.io/github/actions/workflow/status/kipsilabs/Vio/ci.yml?branch=main&amp;style=flat-square&amp;label=CI"></a>
-  <img alt="Go 1.26" src="https://img.shields.io/badge/Go-1.26-00ADD8?style=flat-square&amp;logo=go&amp;logoColor=white">
+  <a href="https://github.com/Silo-Server/silo-server/releases"><img alt="Latest GitHub release" src="https://img.shields.io/github/v/release/Silo-Server/silo-server?include_prereleases&amp;sort=semver&amp;display_name=tag&amp;style=flat-square&amp;label=release"></a>
+  <a href="https://github.com/orgs/Silo-Server/packages/container/package/silo-server"><img alt="Container image on GHCR" src="https://img.shields.io/badge/container-GHCR-2496ED?style=flat-square&amp;logo=docker&amp;logoColor=white"></a>
+  <a href="https://github.com/Silo-Server/silo-server/actions/workflows/ci.yml"><img alt="Continuous integration" src="https://img.shields.io/github/actions/workflow/status/Silo-Server/silo-server/ci.yml?branch=main&amp;style=flat-square&amp;label=CI"></a>
+  <img alt="Go 1.27" src="https://img.shields.io/badge/Go-1.27-00ADD8?style=flat-square&amp;logo=go&amp;logoColor=white">
   <img alt="React 19" src="https://img.shields.io/badge/React-19-149ECA?style=flat-square&amp;logo=react&amp;logoColor=white">
   <a href="LICENSE"><img alt="AGPL-3.0-or-later license" src="https://img.shields.io/badge/license-AGPL--3.0--or--later-555555?style=flat-square"></a>
 </p>
@@ -19,14 +21,15 @@
   <a href="#quick-start">Quick start</a>
   · <a href="https://siloserver.org/docs">Documentation</a>
   · <a href="docs/release-versioning.md">Builds &amp; releases</a>
-  · <a href="docs/silo-to-vio-migration.md">Migrating from Silo</a>
+  · <a href="https://discord.gg/siloserver">Discord</a>
+  · <a href="#supporting-silo">Support Silo</a>
   · <a href="CONTRIBUTING.md">Contributing</a>
 </p>
 
 ---
 
 > [!WARNING]
-> Vio is pre-release. APIs, configuration, and database migrations may change
+> Silo is pre-release. APIs, configuration, and database migrations may change
 > before the first stable release. Back up your deployment before updating.
 
 ## 1.0 release scope
@@ -39,7 +42,7 @@ release date. The broader capabilities below include those beta
 implementations, not a promise that every media type is supported in 1.0.
 Existing library data is preserved when upgrading.
 
-## What Vio does
+## What Silo does
 
 <table>
   <tr>
@@ -74,30 +77,12 @@ Existing library data is preserved when upgrading.
     </td>
     <td width="33%" valign="top">
       <strong>Scale</strong><br><br>
-      Start with one integrated server; split proxy and transcode roles across
-      shared PostgreSQL and Redis when you need to.
+      Start with one integrated server; add transcode nodes that need only its
+      URL and a key, or proxy nodes that share its PostgreSQL and Redis, when
+      you need to.
     </td>
   </tr>
 </table>
-
-### Stremio, requests, and collections
-
-- **Stremio & Virtual Library (core streaming)** — paste a Stremio addon
-  manifest URL (for example Torrentio with Real-Debrid, AllDebrid,
-  Premiumize, or Torbox) in **Admin › Settings › Streaming** and Vio resolves
-  direct debrid HTTP streams into native playback — no local files needed.
-  See the [Stremio integration guide](docs/wiki/admin/stremio-integration.md).
-- **Built-in media requests** — household members request missing movies and
-  series from Discover or the title page; approved requests fulfill through
-  the built-in Virtual Library router or external Sonarr/Radarr servers.
-  See [Media requests](docs/wiki/admin/media-requests.md), including the
-  [automatic Virtual Library fallback](docs/wiki/admin/media-requests.md#automatic-virtual-library-fallback)
-  and [requesting an indexer release](docs/wiki/admin/stremio-integration.md#request-a-title-versus-request-an-indexer-release).
-- **Dynamic collections** — smart queries, per-profile personal collections
-  with household sharing, and scheduled syncs from TMDB, Trakt, or MDBList,
-  plus a one-click template gallery and bundles. See
-  [Collections](docs/wiki/admin/collections-guide.md) and the existing
-  [Collection templates](docs/wiki/admin/collection-templates.md) reference.
 
 ## Quick start
 
@@ -106,8 +91,8 @@ omnibus image: Silo with a bundled PostgreSQL (with pgvector) and Redis, plus
 Meilisearch when you turn it on.
 
 ```sh
-git clone https://github.com/kipsilabs/Vio.git
-cd Vio
+git clone https://github.com/Silo-Server/silo-server.git
+cd silo-server
 cp .env.example .env
 chmod 600 .env
 key="$(openssl rand -base64 48)" && printf '\nSECRET_KEY=%s\n' "$key" >> .env
@@ -121,9 +106,9 @@ docker compose up -d
 
 Open <http://localhost:8090> and complete onboarding.
 
-Hardware transcoding (VA-API or NVIDIA) and access for proxy or transcode
-nodes on other hosts are commented out in `docker-compose.yml`; uncomment the
-lines you need.
+Hardware transcoding (VA-API or NVIDIA) and PostgreSQL and Redis access for
+proxy nodes on other hosts are commented out in `docker-compose.yml`; uncomment
+the lines you need. Transcode nodes reach the server on its web port.
 
 ### Updating an install from before the omnibus image
 
@@ -152,22 +137,21 @@ defines each tag and the SemVer contract.
 
 ## Documentation
 
-- [Documentation index](docs/wiki/index.md) — user and operator guides
-  (also published to the [manual](https://siloserver.org/docs)):
-  - [Deploy with Docker](docs/wiki/deployment/docker.md)
-  - [Stremio integration](docs/wiki/admin/stremio-integration.md)
-  - [Media requests](docs/wiki/admin/media-requests.md)
-  - [Collections](docs/wiki/admin/collections-guide.md)
-  - [Collection templates](docs/wiki/admin/collection-templates.md)
-- [Silo to Vio migration](docs/silo-to-vio-migration.md) — Phase 1 cutover for Silo installs
+- [User manual](https://siloserver.org/docs) — installing, configuring, and running Silo
 - [Development guide](DEVELOPMENT.md) — source setup, builds, tests, migrations
 - [Settings API](docs/settings-api.md), [Downloads API](docs/downloads-api.md), and [Apple Push Display Token](docs/notifications-push-api.md) — client contracts
 
 ## Community and contributions
 
-Vio is an independent fork with its own builds. Please file issues and pull
-requests against this repository (`kipsilabs/Vio`); upstream Silo
-does not take Vio patches.
+Questions and discussion: [Discord](https://discord.gg/siloserver).
+Bugs, install problems, and performance issues: the
+[GitHub issue forms](https://github.com/Silo-Server/silo-server/issues/new/choose),
+which ask for reproduction steps and raw logs.
+
+Native clients are developed in
+[`silo-apple`](https://github.com/Silo-Server/silo-apple) and
+[`silo-android`](https://github.com/Silo-Server/silo-android). Client-visible
+API, authentication, playback, or metadata changes should consider both.
 
 Right now, the most helpful way to contribute is a clear, accurate issue. We
 implement and review changes through our own workflow, and pull request volume
@@ -221,10 +205,9 @@ Silo's source code is licensed under the
 an additional permission to combine it with platform SDKs such as the Windows
 App SDK. See [LICENSE](LICENSE) and [PLATFORM-EXCEPTION.md](PLATFORM-EXCEPTION.md).
 
-Vio is based on Silo (© Silo Media L.L.C., AGPL-3.0-or-later). Silo is a trademark of Silo Media L.L.C.; Vio is an unofficial fork, not affiliated with or endorsed by Silo Media.
-
-The **Vio name, logo, and wordmark belong to this fork** and are not covered
-by the AGPL. Forks and redistributions may use the code but must not use the
-Vio brand as their identity and must remove or replace the brand assets. The
-Silo marks remain the property of Silo Media L.L.C. and are used here only
-referentially. See [TRADEMARK.md](TRADEMARK.md).
+The **Silo name, logo, and wordmark are trademarks of Silo Media L.L.C.** and
+are not covered by the AGPL. Forks and redistributions may use the code but must
+not use the Silo brand as their identity and must remove or replace the brand
+assets. Publishing a Silo-branded app to an app store requires written
+permission. See [TRADEMARK.md](TRADEMARK.md) for permitted referential use,
+including phrases such as "compatible with Silo."

@@ -10,10 +10,10 @@ import (
 )
 
 var exportRecords = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "vio_otel_export_records_total", Help: "Records handed to the OTLP exporter by signal and final export outcome. Failed batches are lost after exporter retries.",
+	Name: "silo_otel_export_records_total", Help: "Records handed to the OTLP exporter by signal and final export outcome. Failed batches are lost after exporter retries.",
 }, []string{"signal", "outcome"})
 var finishedSpans = promauto.NewCounter(prometheus.CounterOpts{
-	Name: "vio_otel_finished_spans_total", Help: "Sampled spans ended in the SDK. Difference from exported trace records includes queued, exporting and dropped spans; inspect after a drain to assess loss.",
+	Name: "silo_otel_finished_spans_total", Help: "Sampled spans ended in the SDK. Difference from exported trace records includes queued, exporting and dropped spans; inspect after a drain to assess loss.",
 })
 
 // The SDK's queue is bounded and nonblocking but exposes no Prometheus drop

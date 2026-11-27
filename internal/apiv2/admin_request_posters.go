@@ -70,7 +70,7 @@ func (reg *Registry) serveAdminRequestPoster(w http.ResponseWriter, r *http.Requ
 	id := chi.URLParam(r, "id")
 	target, err := s.AdminRequestPosterURL(r.Context(), adminRequestViewer(r.Context()), id)
 	if err != nil {
-		writeProblem(w, r, requestProblem(r.Context(), err))
+		writeProblem(w, r, requestProblem(err))
 		return
 	}
 	if target == "" {

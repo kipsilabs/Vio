@@ -4,7 +4,6 @@ import (
 	"cmp"
 	"context"
 	"errors"
-	"log/slog"
 	"math/bits"
 	"net/http"
 	"slices"
@@ -52,7 +51,7 @@ type RequestDownload struct {
 // RequestMediaResult is one discovery or search card.
 type RequestMediaResult struct {
 	MediaType        string            `json:"media_type" doc:"movie or series" example:"movie"`
-	TMDBID           int               `json:"tmdb_id" doc:"TMDB identifier (external, not a Vio ID)" example:"949"`
+	TMDBID           int               `json:"tmdb_id" doc:"TMDB identifier (external, not a Silo ID)" example:"949"`
 	Title            string            `json:"title" example:"Heat"`
 	Year             int               `json:"year,omitempty" example:"1995"`
 	Overview         string            `json:"overview,omitempty"`
@@ -78,9 +77,9 @@ type RequestMediaCastMember struct {
 // RequestMediaDetail is the full detail document of one piece of media.
 type RequestMediaDetail struct {
 	MediaType           string                   `json:"media_type" doc:"movie or series" example:"movie"`
-	TMDBID              int                      `json:"tmdb_id" doc:"TMDB identifier (external, not a Vio ID)" example:"949"`
+	TMDBID              int                      `json:"tmdb_id" doc:"TMDB identifier (external, not a Silo ID)" example:"949"`
 	IMDbID              string                   `json:"imdb_id,omitempty" example:"tt0113277"`
-	TVDBID              *int                     `json:"tvdb_id,omitempty" doc:"TVDB identifier (external, not a Vio ID)"`
+	TVDBID              *int                     `json:"tvdb_id,omitempty" doc:"TVDB identifier (external, not a Silo ID)"`
 	Title               string                   `json:"title" example:"Heat"`
 	OriginalTitle       string                   `json:"original_title,omitempty"`
 	Tagline             string                   `json:"tagline,omitempty"`
@@ -110,8 +109,7 @@ type RequestMediaDetail struct {
 	LibraryContentID    string                   `json:"library_content_id,omitempty" doc:"The catalog item when the media is available"`
 	Request             RequestMediaState        `json:"request"`
 	InWatchlist         bool                     `json:"in_watchlist" doc:"Whether the title is on the viewing profile's watchlist, as a watchlist title or through its catalog item" example:"false"`
-	Seasons             []RequestMediaSeason     `json:"seasons" doc:"Series: the regular seasons (specials excluded) from the series metadata provider, with library availability and request coverage; empty for movies"`
-	SeasonSource        string                   `json:"season_source,omitempty" doc:"Series: the metadata provider that supplied the season list: tvdb or tmdb" example:"tvdb"`
+	Seasons             []RequestMediaSeason     `json:"seasons" doc:"Series: the regular seasons (specials excluded) with library availability and request coverage; empty for movies"`
 }
 
 // RequestMediaSeason is one season of a series on its detail document.
@@ -162,7 +160,7 @@ type DiscoverSectionCollection struct {
 
 // DiscoverBrand is a studio, network, or genre card.
 type DiscoverBrand struct {
-	TMDBID          int     `json:"tmdb_id,omitempty" doc:"TMDB identifier (external, not a Vio ID)" example:"420"`
+	TMDBID          int     `json:"tmdb_id,omitempty" doc:"TMDB identifier (external, not a Silo ID)" example:"420"`
 	Slug            string  `json:"slug" example:"marvel-studios"`
 	DisplayName     string  `json:"display_name" example:"Marvel Studios"`
 	LogoURL         *string `json:"logo_url,omitempty" format:"uri" nullable:"true"`
@@ -197,14 +195,14 @@ type RequestTarget struct {
 	RequestID       ID      `json:"request_id" example:"1834729"`
 	IntegrationID   string  `json:"integration_id,omitempty" doc:"Admins only: the download server holding this target"`
 	IntegrationKind string  `json:"integration_kind,omitempty" doc:"Admins only: the download server's kind" example:"radarr"`
-	InstanceName    string  `json:"instance_name,omitempty" doc:"Admins only: the download server's name"`
+	InstanceName    string  `json:"instance_name,omitempty" doc:"Admins only, and left out of the admin request list for API keys with scopes: the download server's name"`
 	Quality         string  `json:"quality" example:"1080p"`
 	IsAnime         bool    `json:"is_anime"`
 	ExternalID      string  `json:"external_id,omitempty" doc:"Admins only: the integration's own identifier"`
 	ExternalStatus  string  `json:"external_status,omitempty" doc:"Admins only: the status as the download server reports it"`
 	Status          string  `json:"status" example:"queued"`
-	LastError       string  `json:"last_error,omitempty" doc:"Admins only: why the download server failed this target"`
-	RouteName       string  `json:"route_name,omitempty" doc:"Admins only: the routing rule that sent this target to its server, as named when it was sent"`
+	LastError       string  `json:"last_error,omitempty" doc:"Admins only, and left out of the admin request list for API keys with scopes: why the download server failed this target"`
+	RouteName       string  `json:"route_name,omitempty" doc:"Admins only, and left out of the admin request list for API keys with scopes: the routing rule that sent this target to its server, as named when it was sent"`
 	CreatedAt       Instant `json:"created_at" example:"2026-01-02T03:04:05.000Z"`
 	UpdatedAt       Instant `json:"updated_at" example:"2026-01-02T03:04:05.000Z"`
 	// Download is set while the target's router plugin reports progress.
@@ -216,8 +214,8 @@ type MediaRequest struct {
 	ID                   ID                      `json:"id" example:"1834729"`
 	Provider             string                  `json:"provider" example:"tmdb"`
 	MediaType            string                  `json:"media_type" doc:"movie or series" example:"movie"`
-	TMDBID               int                     `json:"tmdb_id" doc:"TMDB identifier (external, not a Vio ID)" example:"949"`
-	TVDBID               *int                    `json:"tvdb_id,omitempty" doc:"TVDB identifier (external, not a Vio ID)"`
+	TMDBID               int                     `json:"tmdb_id" doc:"TMDB identifier (external, not a Silo ID)" example:"949"`
+	TVDBID               *int                    `json:"tvdb_id,omitempty" doc:"TVDB identifier (external, not a Silo ID)"`
 	IMDbID               string                  `json:"imdb_id,omitempty" example:"tt0113277"`
 	Title                string                  `json:"title" example:"Heat"`
 	Year                 *int                    `json:"year,omitempty" example:"1995"`
@@ -240,7 +238,7 @@ type MediaRequest struct {
 	ExternalID           string                  `json:"external_id,omitempty" doc:"Admins only: the integration's own identifier"`
 	ExternalStatus       string                  `json:"external_status,omitempty" doc:"Admins only: the status as the download server reports it"`
 	LibraryContentID     string                  `json:"library_content_id,omitempty" doc:"The catalog item once the media is in the library"`
-	LastError            string                  `json:"last_error,omitempty" doc:"Admins only: why the last submission to a download server failed. It can name servers and routing rules"`
+	LastError            string                  `json:"last_error,omitempty" doc:"Admins only, and left out of the admin request list for API keys with scopes: why the last submission to a download server failed. It can name servers and routing rules"`
 	CreatedAt            Instant                 `json:"created_at" example:"2026-01-02T03:04:05.000Z"`
 	UpdatedAt            Instant                 `json:"updated_at" example:"2026-01-02T03:04:05.000Z"`
 	ApprovedAt           *Instant                `json:"approved_at,omitempty"`
@@ -262,8 +260,8 @@ type MediaRequestCollection struct {
 // it on a discovery or search card.
 type MediaRequestCreate struct {
 	MediaType    string `json:"media_type" enum:"movie,series" example:"movie"`
-	TMDBID       int    `json:"tmdb_id" minimum:"1" doc:"TMDB identifier (external, not a Vio ID)" example:"949"`
-	TVDBID       *int   `json:"tvdb_id,omitempty" minimum:"1" doc:"TVDB identifier (external, not a Vio ID)"`
+	TMDBID       int    `json:"tmdb_id" minimum:"1" doc:"TMDB identifier (external, not a Silo ID)" example:"949"`
+	TVDBID       *int   `json:"tvdb_id,omitempty" minimum:"1" doc:"TVDB identifier (external, not a Silo ID)"`
 	IMDbID       string `json:"imdb_id,omitempty" example:"tt0113277"`
 	Title        string `json:"title" minLength:"1" example:"Heat"`
 	Year         *int   `json:"year,omitempty" example:"1995"`
@@ -271,7 +269,6 @@ type MediaRequestCreate struct {
 	PosterPath   string `json:"poster_path,omitempty" doc:"TMDB image path"`
 	BackdropPath string `json:"backdrop_path,omitempty" doc:"TMDB image path"`
 	Seasons      []int  `json:"seasons,omitempty" maxItems:"200" doc:"Series only: the season numbers to request, starting at 1 (a season below 1 is refused). Omitted: every aired season not yet complete in the library" example:"[2,3]"`
-	SeasonSource string `json:"season_source,omitempty" enum:"tvdb,tmdb" doc:"Series only: use TVDB or TMDB season numbering. Omitted: the server prefers TVDB" example:"tvdb"`
 }
 
 // MediaRequestCreateInput is the createRequest request.
@@ -310,20 +307,10 @@ type RequestMediaPageOutput struct {
 	Body RequestMediaPage
 }
 
-// RequestMediaDetailInput names one piece of media. Follow and unfollow share
-// the identity but have no season source, so the detail read uses its own
-// input rather than publishing an unused query parameter on both.
+// RequestMediaDetailInput names one piece of media.
 type RequestMediaDetailInput struct {
 	MediaType string `path:"media_type" enum:"movie,series" doc:"The media type" example:"movie"`
-	TMDBID    int    `path:"tmdb_id" minimum:"1" doc:"TMDB identifier (external, not a Vio ID)" example:"949"`
-}
-
-// RequestMediaDetailWithSourceInput is the detail read, which also accepts an
-// explicit season numbering source.
-type RequestMediaDetailWithSourceInput struct {
-	MediaType    string `path:"media_type" enum:"movie,series" doc:"The media type" example:"movie"`
-	TMDBID       int    `path:"tmdb_id" minimum:"1" doc:"TMDB identifier (external, not a Vio ID)" example:"949"`
-	SeasonSource string `query:"season_source" enum:"tvdb,tmdb" doc:"Series only: return TVDB or TMDB season numbering. Omitted: the server prefers TVDB" example:"tvdb"`
+	TMDBID    int    `path:"tmdb_id" minimum:"1" doc:"TMDB identifier (external, not a Silo ID)" example:"949"`
 }
 
 // RequestMediaDetailOutput is the getRequestMediaDetail response.
@@ -407,10 +394,12 @@ func registerRequests(reg *Registry) {
 	create.Errors = []int{http.StatusConflict, http.StatusTooManyRequests}
 	Register(reg, Operation{Operation: create, Class: ClassProfileScoped, DemoRestricted: isMutatingMethod(create.Method), ServiceBacked: true, RetrySafety: RetrySafetyNonRetryable}, reg.createRequest)
 
+	listMine := humaOp(http.MethodGet, Prefix+"/requests/mine", opListMyRequests, requestsTag,
+		"List the account's media requests, newest first.")
+	listMine.Description = "Lists the requests every profile on the account made. A profile the household manager blocked from requests sees only the requests it made itself."
 	Register(reg, Operation{
-		Operation: humaOp(http.MethodGet, Prefix+"/requests/mine", opListMyRequests, requestsTag,
-			"List the account's media requests, newest first."),
-		Class: ClassProfileScoped, ServiceBacked: true,
+		Operation: listMine,
+		Class:     ClassProfileScoped, ServiceBacked: true,
 	}, func(ctx context.Context, in *MediaRequestListInput) (*MediaRequestCollectionOutput, error) {
 		return reg.listMyRequests(ctx, cursors, in)
 	})
@@ -494,6 +483,7 @@ func registerRequests(reg *Registry) {
 
 	get := humaOp(http.MethodGet, Prefix+"/requests/{id}", opGetRequest, requestsTag,
 		"Get one of the account's media requests.")
+	get.Description = "A profile the household manager blocked from requests gets 403 for a request another profile made, unless it acts as an admin."
 	get.Errors = []int{http.StatusConflict}
 	Register(reg, Operation{Operation: get, Class: ClassProfileScoped, ServiceBacked: true}, reg.getRequest)
 }
@@ -539,10 +529,9 @@ func (reg *Registry) createRequest(ctx context.Context, in *MediaRequestCreateIn
 		PosterPath:   in.Body.PosterPath,
 		BackdropPath: in.Body.BackdropPath,
 		Seasons:      in.Body.Seasons,
-		SeasonSource: in.Body.SeasonSource,
 	})
 	if err != nil {
-		return nil, requestProblem(ctx, err)
+		return nil, requestProblem(err)
 	}
 	return &MediaRequestOutput{Body: mediaRequestOf(req, viewer)}, nil
 }
@@ -577,7 +566,7 @@ func (reg *Registry) listMyRequests(ctx context.Context, cursors *Cursors, in *M
 		Before:  before,
 	})
 	if err != nil {
-		return nil, requestProblem(ctx, err)
+		return nil, requestProblem(err)
 	}
 	next := ""
 	if len(rows) > in.Limit {
@@ -603,7 +592,7 @@ func (reg *Registry) getRequest(ctx context.Context, in *MediaRequestGetInput) (
 	}
 	req, err := svc.GetRequest(ctx, viewer, string(in.ID))
 	if err != nil {
-		return nil, requestProblem(ctx, err)
+		return nil, requestProblem(err)
 	}
 	return &MediaRequestOutput{Body: mediaRequestOf(req, viewer)}, nil
 }
@@ -620,16 +609,7 @@ func (reg *Registry) searchRequestMedia(ctx context.Context, in *RequestMediaSea
 	}
 	page, err := svc.Search(ctx, viewer, in.Query, mediarequests.MediaType(in.MediaType), in.Page)
 	if err != nil {
-		if requestAbandoned(ctx) {
-			// The caller is gone or out of time: the lookup failure is not a
-			// server error. Keep the cause out of the error signal and leave
-			// it at debug for diagnosis.
-			slog.DebugContext(ctx, "apiv2: request search abandoned",
-				"component", "apiv2",
-				"operation", opSearchRequestMedia,
-				"error", err)
-		}
-		return nil, requestProblem(ctx, err)
+		return nil, requestProblem(err)
 	}
 	out := requestMediaPageOf(page)
 	reg.markInWatchlist(ctx, watchlistMarksOf(out.Results))
@@ -637,14 +617,14 @@ func (reg *Registry) searchRequestMedia(ctx context.Context, in *RequestMediaSea
 }
 
 // getRequestMediaDetail is v1 GET /requests/detail/{media_type}/{tmdb_id}.
-func (reg *Registry) getRequestMediaDetail(ctx context.Context, in *RequestMediaDetailWithSourceInput) (*RequestMediaDetailOutput, error) {
+func (reg *Registry) getRequestMediaDetail(ctx context.Context, in *RequestMediaDetailInput) (*RequestMediaDetailOutput, error) {
 	svc, viewer, p := reg.requestViewer(ctx)
 	if p != nil {
 		return nil, p
 	}
-	detail, err := svc.GetDetailWithSeasonSource(ctx, viewer, mediarequests.MediaType(in.MediaType), in.TMDBID, in.SeasonSource)
+	detail, err := svc.GetDetail(ctx, viewer, mediarequests.MediaType(in.MediaType), in.TMDBID)
 	if err != nil {
-		return nil, requestProblem(ctx, err)
+		return nil, requestProblem(err)
 	}
 	out := requestMediaDetailOf(detail)
 	marks := append(watchlistMarksOf(out.Recommendations), watchlistMark{mediaType: out.MediaType, tmdbID: out.TMDBID, itemID: out.LibraryContentID, in: &out.InWatchlist})
@@ -664,7 +644,7 @@ func (reg *Registry) followRequestMedia(ctx context.Context, in *RequestMediaDet
 	}
 	state, err := svc.Follow(ctx, viewer, mediarequests.MediaType(in.MediaType), in.TMDBID)
 	if err != nil {
-		return nil, requestProblem(ctx, err)
+		return nil, requestProblem(err)
 	}
 	return &RequestMediaStateOutput{Body: requestMediaStateOf(state)}, nil
 }
@@ -675,7 +655,7 @@ func (reg *Registry) unfollowRequestMedia(ctx context.Context, in *RequestMediaD
 		return nil, p
 	}
 	if err := svc.Unfollow(ctx, viewer, mediarequests.MediaType(in.MediaType), in.TMDBID); err != nil {
-		return nil, requestProblem(ctx, err)
+		return nil, requestProblem(err)
 	}
 	return nil, nil
 }
@@ -689,7 +669,7 @@ func (reg *Registry) listDiscoverSections(ctx context.Context, _ *struct{}) (*Di
 	}
 	page, err := svc.DiscoverRows(ctx, viewer)
 	if err != nil {
-		return nil, requestProblem(ctx, err)
+		return nil, requestProblem(err)
 	}
 	items := make([]DiscoverSection, 0, len(page.Sections))
 	var marks []watchlistMark
@@ -724,7 +704,7 @@ func (reg *Registry) listDiscoverBrands(ctx context.Context, opID string) (*Disc
 		cards, err = svc.ListStudios(ctx, viewer)
 	}
 	if err != nil {
-		return nil, requestProblem(ctx, err)
+		return nil, requestProblem(err)
 	}
 	items := make([]DiscoverBrand, 0, len(cards))
 	for _, c := range cards {
@@ -747,7 +727,7 @@ func (reg *Registry) browseDiscoverBrand(ctx context.Context, in *DiscoverBrowse
 	}
 	resp, err := browse(svc, viewer)
 	if err != nil {
-		return nil, requestProblem(ctx, err)
+		return nil, requestProblem(err)
 	}
 	out := discoverBrowsePageOf(resp)
 	reg.markInWatchlist(ctx, watchlistMarksOf(out.Results))
@@ -765,7 +745,7 @@ func (reg *Registry) browseDiscoverGenre(ctx context.Context, in *DiscoverGenreB
 	}
 	resp, err := svc.BrowseGenre(ctx, viewer, in.Slug, mediarequests.MediaType(in.MediaType), in.Sort, in.Page)
 	if err != nil {
-		return nil, requestProblem(ctx, err)
+		return nil, requestProblem(err)
 	}
 	out := discoverBrowsePageOf(resp)
 	reg.markInWatchlist(ctx, watchlistMarksOf(out.Results))
@@ -782,53 +762,13 @@ func requireSlug(slug string) *Problem {
 	return nil
 }
 
-// requestAbandoned reports whether the incoming request itself ended before
-// the service could answer. Only the caller's own context decides this: a
-// dependency that reports its canceled or expired context while the caller is
-// still waiting has failed, and is not a client timeout.
-func requestAbandoned(ctx context.Context) bool {
-	return ctx != nil && ctx.Err() != nil
-}
-
-// requestCanceledByCaller reports whether a cancellation failure belongs to
-// the caller: the incoming request context must itself be done, and the error
-// must be that cancellation. A dependency deadline or cancellation with a
-// live incoming context is the dependency failing, not the caller leaving.
-func requestCanceledByCaller(ctx context.Context, err error) bool {
-	if !requestAbandoned(ctx) {
-		return false
-	}
-	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
-}
-
-// canceledRequestProblem is the answer for an abandoned request. It is a
-// client-side outcome, not an internal failure, so it uses the standard
-// request-timeout status instead of a 500. The detail stays generic because
-// nobody is guaranteed to read it, and the cause never travels on the body.
-func canceledRequestProblem(ctx context.Context) *Problem {
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		return NewProblem(TypeRequestTimeout, "The request timed out.")
-	}
-	return NewProblem(TypeRequestTimeout, "The request was canceled.")
-}
-
 // requestProblem renders a request-service failure with the decisions v1's
 // writeRequestServiceError makes, as v2 problems: invalid input and
 // provider validation are 422, a disabled feature is 409
 // capability_disabled, an exhausted quota is 429, duplicates and state
 // conflicts are 409, an unreachable integration is 503
-// dependency_unavailable, an abandoned request is 408 request_timeout, and
-// anything else is an internal error.
-// withholdRequestDeployment removes the deployment details a scoped API key
-// must not see: the transport error and the target's server and routing names.
-func withholdRequestDeployment(r *MediaRequest) {
-	r.LastError = ""
-	for i := range r.Targets {
-		r.Targets[i].LastError, r.Targets[i].InstanceName, r.Targets[i].RouteName = "", "", ""
-	}
-}
-
-func requestProblem(ctx context.Context, err error) *Problem {
+// dependency_unavailable, and anything else is an internal error.
+func requestProblem(err error) *Problem {
 	if verr, ok := errors.AsType[*mediarequests.ValidationError](err); ok {
 		p := NewProblem(TypeValidationFailed, "The request did not pass validation; see errors.")
 		if verr.FormError != "" {
@@ -842,14 +782,7 @@ func requestProblem(ctx context.Context, err error) *Problem {
 		return p.WithErrors(errs...)
 	}
 	var quota mediarequests.QuotaError
-	// A cancellation is the caller's own outcome only when the incoming
-	// request context is done. A dependency that reports its deadline while
-	// the caller is still waiting has failed: its cause unwraps through
-	// IntegrationUnreachableError, so checking the error alone would answer
-	// 408 for an upstream timeout.
 	switch {
-	case requestCanceledByCaller(ctx, err):
-		return canceledRequestProblem(ctx)
 	case errors.As(err, &quota):
 		return NewProblem(TypeRateLimited, "Request quota exceeded: "+strconv.Itoa(quota.Used)+" of "+strconv.Itoa(quota.Limit)+" requests used in the last "+strconv.Itoa(quota.WindowDays)+" days.")
 	case errors.Is(err, mediarequests.ErrInvalidMediaType):
@@ -857,8 +790,6 @@ func requestProblem(ctx context.Context, err error) *Problem {
 			WithErrors(ProblemError{Location: "query.media_type", Code: codeInvalid, Detail: "expected movie or series"})
 	case errors.Is(err, mediarequests.ErrInvalidInput):
 		return NewProblem(TypeValidationFailed, "The request did not pass validation.")
-	case errors.Is(err, mediarequests.ErrSeasonSourceUnavailable):
-		return NewProblem(TypeDependencyUnavailable, "The selected season source is unavailable.")
 	case errors.Is(err, mediarequests.ErrRequestsDisabled):
 		return CapabilityProblem(StateDisabled, "requests")
 	case errors.Is(err, mediarequests.ErrUserBlocked):
@@ -881,13 +812,8 @@ func requestProblem(ctx context.Context, err error) *Problem {
 			return NewProblem(TypeDependencyUnavailable, unreachable.Detail)
 		}
 		return NewProblem(TypeDependencyUnavailable, "The request integration could not be reached.")
-	case errors.Is(err, context.DeadlineExceeded):
-		// A dependency deadline while the caller is still waiting: the
-		// integration did not answer in time, so it is temporarily
-		// unavailable rather than a client timeout or an internal failure.
-		return NewProblem(TypeDependencyUnavailable, "The request integration could not be reached.")
 	}
-	return NewProblem(TypeInternalError, "An unexpected error occurred.").withCause(err)
+	return NewProblem(TypeInternalError, "An unexpected error occurred.")
 }
 
 // requestSourceOf reads an unset source (a request built outside the store)
@@ -953,6 +879,19 @@ func mediaRequestOf(r *mediarequests.Request, viewer mediarequests.Viewer) Media
 		out.Targets = append(out.Targets, target)
 	}
 	return out
+}
+
+// withholdRequestDeployment drops what names the admin's download setup from
+// a request and its targets for a scoped key: the free-text failures, which
+// can name download servers, their addresses and routing rules, and each
+// target's server name and routing-rule name. The monitoring scope never
+// reads that configuration; integration_kind still says what kind of server
+// took the target.
+func withholdRequestDeployment(r *MediaRequest) {
+	r.LastError = ""
+	for i := range r.Targets {
+		r.Targets[i].LastError, r.Targets[i].InstanceName, r.Targets[i].RouteName = "", "", ""
+	}
 }
 
 // requestDownloadOf maps download progress. The byte counts and percent are
@@ -1034,7 +973,7 @@ func requestMediaDetailOf(d *mediarequests.MediaDetail) RequestMediaDetail {
 		Networks: NonNil(d.Networks), Cast: cast, Director: d.Director, Creators: NonNil(d.Creators),
 		Recommendations: requestMediaResultsOf(d.Recommendations), Availability: string(d.Availability),
 		LibraryContentID: d.LibraryContentID, Request: requestMediaStateOf(d.Request),
-		Seasons: requestMediaSeasonsOf(d.Seasons), SeasonSource: d.SeasonSource,
+		Seasons: requestMediaSeasonsOf(d.Seasons),
 	}
 }
 
@@ -1061,13 +1000,4 @@ func discoverBrowsePageOf(r *mediarequests.DiscoverBrowseResponse) DiscoverBrows
 		Kind: r.Kind, Slug: r.Slug, DisplayName: r.DisplayName, LogoURL: r.LogoURL, MediaType: string(r.MediaType),
 		Sort: r.Sort, Page: r.Page, TotalPages: r.TotalPages, Results: requestMediaResultsOf(r.Results),
 	}
-}
-
-// requestOperationIDs lists the profile-scoped request operations; tests
-// check each documents the viewer-access headers.
-var requestOperationIDs = []string{
-	opCreateRequest, opListMyRequests, opGetRequest, opSearchRequestMedia, opGetRequestMediaDetail,
-	opListDiscoverSections, opGetDiscoverSection, opListDiscoverGenres, opListDiscoverNetworks, opListDiscoverStudios,
-	opBrowseDiscoverGenre, opBrowseDiscoverNetwork, opBrowseDiscoverStudio,
-	opFollowRequestMedia, opUnfollowRequestMedia,
 }

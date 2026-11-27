@@ -3,7 +3,7 @@
 #
 # Vite serves the UI at http://localhost:${PORT:-8090} and proxies API
 # requests to the Air-reloaded Go backend on the compose network.
-name: vio-dev
+name: silo-dev
 
 services:
   postgres:
@@ -31,14 +31,14 @@ services:
     ports:
       - "127.0.0.1:${REDIS_PORT:-6379}:6379"
     volumes:
-      - vio-dev-redis:/data
+      - silo-dev-redis:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 5
 
-  vio:
+  silo:
     build:
       context: ..
       dockerfile_inline: |
@@ -84,8 +84,8 @@ services:
         tmp_dir = "tmp"
 
         [build]
-          cmd = "go build -o ./tmp/vio ./cmd/silo/"
-          bin = "./tmp/vio"
+          cmd = "go build -o ./tmp/silo ./cmd/silo/"
+          bin = "./tmp/silo"
           args_bin = []
           include_ext = ["go", "sql", "json"]
           include_dir = ["cmd", "internal", "migrations"]
@@ -113,8 +113,7 @@ services:
       ABS_PORT: "13378"
       DATABASE_URL: postgres://${POSTGRES_USER:-silo}:${POSTGRES_PASSWORD:-silo}@postgres:5432/${POSTGRES_DB:-silo}?sslmode=disable
       REDIS_URL: redis://redis:6379
-      VIO_PLUGIN_CACHE_DIR: /var/lib/vio/plugins
-      SILO_PLUGIN_CACHE_DIR: /var/lib/vio/plugins
+      SILO_PLUGIN_CACHE_DIR: /var/lib/silo/plugins
       POSTGRES_TUNE: "off"
       # air restarts on every rebuild and kills the process 500 ms after
       # interrupting it; a single dev server has no traffic to route away.
@@ -162,7 +161,7 @@ services:
     working_dir: /app/web
     command: sh -c "pnpm install --frozen-lockfile --store-dir /pnpm/store && pnpm run dev -- --host 0.0.0.0"
     environment:
-      VITE_API_PROXY_TARGET: http://vio:8080
+      VITE_API_PROXY_TARGET: http://silo:8080
       VITE_HMR_CLIENT_PORT: "${PORT:-8090}"
       PNPM_STORE_DIR: /pnpm/store
       CI: "true"
@@ -173,19 +172,19 @@ services:
       - silo-dev-web-node-modules:/app/web/node_modules
       - silo-dev-pnpm-store:/pnpm/store
     depends_on:
-      vio:
+      silo:
         condition: service_healthy
 
 volumes:
-  vio-dev-air-tmp:
-  vio-dev-artwork:
-  vio-dev-compat:
-  vio-dev-download-artifacts:
-  vio-dev-go-build:
-  vio-dev-go-mod:
-  vio-dev-plugins:
-  vio-dev-pnpm-store:
-  vio-dev-postgres:
-  vio-dev-redis:
-  vio-dev-transcode:
-  vio-dev-web-node-modules:
+  silo-dev-air-tmp:
+  silo-dev-compat:
+  silo-dev-download-artifacts:
+  silo-dev-go-build:
+  silo-dev-go-mod:
+  silo-dev-plugins:
+  silo-dev-artwork:
+  silo-dev-pnpm-store:
+  silo-dev-postgres:
+  silo-dev-redis:
+  silo-dev-transcode:
+  silo-dev-web-node-modules:

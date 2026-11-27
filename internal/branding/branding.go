@@ -50,7 +50,7 @@ const (
 // mirror the frontend's hardcoded fallbacks so behavior is unchanged out of the
 // box.
 const (
-	DefaultServerName    = "Vio"
+	DefaultServerName    = "Silo"
 	DefaultLoginSubtitle = "Sign in with an existing account."
 	// DefaultThemeColor is used for the PWA manifest theme/background color when
 	// no accent color is configured.

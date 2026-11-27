@@ -84,6 +84,7 @@ import { useOptionalAuth } from "@/hooks/useAuth";
 import { useCurrentProfile } from "@/hooks/useCurrentProfile";
 import { formatRelativeTime } from "@/lib/date";
 import { useT, type MessageKey, type Translate } from "@/i18n";
+import { PluginDestinationsSection } from "./PluginDestinationsSection";
 import {
   DESTINATION_NOTIFY_FIELDS as WEBHOOK_NOTIFY_FIELDS,
   REASON_FIELDS,
@@ -1253,6 +1254,8 @@ export default function NotificationsSettings() {
       <DiscordSection key={notificationScope()} />
 
       <WebhooksSection />
+
+      <PluginDestinationsSection />
     </div>
   );
 }

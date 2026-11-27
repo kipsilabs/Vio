@@ -25,7 +25,6 @@ import {
   RotateCcw,
   ThumbsDown,
   X,
-  Trash2,
 } from "lucide-react";
 import { useLocation } from "react-router";
 import { captureProfileRequestContext, isCapturedProfileAuthorityActive } from "@/api/client";
@@ -34,12 +33,8 @@ import { useFinePointer } from "@/hooks/useFinePointer";
 import type { ItemDetail, MediaItemUserState } from "@/api/types";
 import { useOptionalAuth } from "@/hooks/useAuth";
 import { useCurrentProfile } from "@/hooks/useCurrentProfile";
-import { useCatalogItemDetail } from "@/hooks/queries/catalogRead";
-import {
-  useDeleteMediaItem,
-  useRefreshItemMetadata,
-  useWatchedStateMutation,
-} from "@/hooks/queries/items";
+import { useFreshCatalogItemDetail } from "@/hooks/queries/catalogRead";
+import { useRefreshItemMetadata, useWatchedStateMutation } from "@/hooks/queries/items";
 import { type DismissHomeItemVariables, useDismissHomeItem } from "@/hooks/queries/homeDismissals";
 import { useToggleFavorite } from "@/hooks/queries/favorites";
 import { useToggleWatchlist } from "@/hooks/queries/watchlist";
@@ -138,8 +133,7 @@ type MediaItemMenuEntry =
         | "viewPlayHistory"
         | "refreshMetadata"
         | "editMetadata"
-        | "matchItem"
-        | "deleteItem";
+        | "matchItem";
       label: string;
     }
   | { kind: "separator" };
@@ -200,7 +194,7 @@ function isInProgressVideo(mediaType: MediaItemType, hasResumePosition: boolean)
   return (mediaType === "movie" || mediaType === "episode") && hasResumePosition;
 }
 
-export function buildMediaItemMenuModel({
+function buildMediaItemMenuModel({
   mediaType,
   userState,
   hasPartialProgress = false,
@@ -310,7 +304,7 @@ export function buildMediaItemMenuModel({
         label: t("web.item.menu.refreshMetadata"),
       });
 
-      if (mediaType === "movie" || mediaType === "series") {
+      if (mediaType === "movie" || mediaType === "series" || mediaType === "audiobook") {
         entries.push(
           {
             kind: "action",
@@ -324,12 +318,6 @@ export function buildMediaItemMenuModel({
           },
         );
       }
-
-      entries.push({
-        kind: "action",
-        key: "deleteItem",
-        label: "Delete Item",
-      });
     }
   }
 
@@ -406,8 +394,6 @@ function MediaItemMenuActionIcon({
       return <MediaActionIcon action="editMetadata" />;
     case "matchItem":
       return <MediaActionIcon action="matchItem" />;
-    case "deleteItem":
-      return <Trash2 aria-hidden="true" className="size-4 text-red-500" />;
   }
 }
 
@@ -811,13 +797,9 @@ export function MetadataActionDialogHost({
   onClose: () => void;
 }) {
   const t = useT();
-  const {
-    data: item,
-    error,
-    isFetching,
-    isLoading,
-    refetch,
-  } = useCatalogItemDetail(contentId, libraryId);
+  // Edit Metadata saves the whole lock list it opens with, so neither dialog
+  // opens on a cached item that could predate a write.
+  const { item, error, retry } = useFreshCatalogItemDetail(contentId, libraryId);
 
   if (item) {
     return (
@@ -865,9 +847,9 @@ export function MetadataActionDialogHost({
     <MetadataActionStatusDialog
       action={action}
       pending="details"
-      loading={isLoading || isFetching}
+      loading={!error}
       error={error}
-      onRetry={() => void refetch()}
+      onRetry={retry}
       onClose={onClose}
     />
   );
@@ -1059,7 +1041,6 @@ function MediaItemMenuEngine({
   const watchlistMutation = useToggleWatchlist(contentId);
   const notInterestedMutation = useToggleNotInterested(contentId);
   const refreshMetadataMutation = useRefreshItemMetadata();
-  const deleteMediaItem = useDeleteMediaItem();
   const dismissHomeItemMutation = useDismissHomeItem();
   const currentHref = `${location.pathname}${location.search}`;
 
@@ -1069,8 +1050,7 @@ function MediaItemMenuEngine({
     watchlistMutation.isPending ||
     notInterestedMutation.isPending ||
     refreshMetadataMutation.isPending ||
-    dismissHomeItemMutation.isPending ||
-    deleteMediaItem.isPending;
+    dismissHomeItemMutation.isPending;
   const watchedPending = watchedMutation.isPending;
   const favoritePending = favoriteMutation.isPending;
   const refreshPending = refreshMetadataMutation.isPending;
@@ -1217,16 +1197,6 @@ function MediaItemMenuEngine({
       }
       case "editMetadata": {
         setMetadataAction("edit");
-        return;
-      }
-      case "deleteItem": {
-        if (
-          window.confirm(
-            "Delete this show/movie from library? Home and sections will update immediately.",
-          )
-        ) {
-          deleteMediaItem.mutate(contentId);
-        }
         return;
       }
       case "matchItem": {

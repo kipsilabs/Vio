@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
+
 	"github.com/Silo-Server/silo-server/internal/access"
 	"github.com/Silo-Server/silo-server/internal/activitylog"
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
@@ -18,7 +20,6 @@ import (
 	evt "github.com/Silo-Server/silo-server/internal/events"
 	"github.com/Silo-Server/silo-server/internal/logstream"
 	"github.com/Silo-Server/silo-server/internal/models"
-	"github.com/gorilla/websocket"
 )
 
 func adminLogsSocketFixture(t *testing.T) (*AdminLogsSocketV2, *logstream.Hub, *atomic.Bool, *atomic.Bool) {
@@ -99,6 +100,7 @@ func TestAdminLogsSocketV2HandshakeAndReplay(t *testing.T) {
 	refuse(t, base+"?stream=app", nil, websocket.Dialer{}, 400)
 	refuse(t, base+"?stream=nope", nil, dialer, 400)
 	refuse(t, base+"?stream=app&user_id=abc", nil, dialer, 400)
+	refuse(t, base+"?stream=audit&client_ip=not-an-address", nil, dialer, 400)
 	// Still unspent: the good handshake succeeds.
 	conn, resp, err := dialer.DialContext(t.Context(), base+"?stream=app", http.Header{"Origin": []string{server.URL}})
 	if err != nil {
@@ -161,35 +163,6 @@ func TestAdminLogsSocketV2ClosesOnAuthorityLoss(t *testing.T) {
 			}
 		})
 	}
-}
-
-// The bridge route keeps its answers: 503 without a hub, 400 bad_request for a
-// bad stream, and it still upgrades with the shared origin check.
-func TestHandleLogStreamWebSocketKeepsBridgeStatuses(t *testing.T) {
-	rec := httptest.NewRecorder()
-	NewAdminLogsHandler(nil, nil, nil).HandleLogStreamWebSocket(rec, httptest.NewRequest(http.MethodGet, "/api/v1/admin/logs/ws?stream=app", nil))
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("no hub: %d", rec.Code)
-	}
-	h := NewAdminLogsHandler(nil, nil, logstream.NewHub("bridge-fixture", nil))
-	rec = httptest.NewRecorder()
-	h.HandleLogStreamWebSocket(rec, httptest.NewRequest(http.MethodGet, "/api/v1/admin/logs/ws?stream=nope", nil))
-	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), `"bad_request"`) || !strings.Contains(rec.Body.String(), "Invalid stream") {
-		t.Fatalf("bad stream: %d %s", rec.Code, rec.Body.String())
-	}
-	rec = httptest.NewRecorder()
-	h.HandleLogStreamWebSocket(rec, httptest.NewRequest(http.MethodGet, "/api/v1/admin/logs/ws?stream=app&user_id=abc", nil))
-	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "user_id") {
-		t.Fatalf("bad filter: %d %s", rec.Code, rec.Body.String())
-	}
-	server := httptest.NewServer(http.HandlerFunc(h.HandleLogStreamWebSocket))
-	defer server.Close()
-	conn, resp, err := websocket.DefaultDialer.DialContext(t.Context(), "ws"+strings.TrimPrefix(server.URL, "http")+"?stream=app&token=legacy", nil)
-	if err != nil {
-		t.Fatalf("bridge upgrade with URL token: %v", err)
-	}
-	defer func() { _ = conn.Close() }()
-	_ = resp.Body.Close()
 }
 
 func TestAuditSocketDomainFilterValidationMatchesHistory(t *testing.T) {
@@ -270,5 +243,18 @@ func TestAuditSocketClientIPFilterMatchesLikeHistory(t *testing.T) {
 		if !matchesAuditLog(opts, activitylog.AuditEntry{ClientIP: tc.entry}) {
 			t.Errorf("filter %q does not match a live event from %q", tc.filter, tc.entry)
 		}
+	}
+}
+
+// The socket normalizes client_ip like history: a value history refuses (here
+// a zero-padded mask PostgreSQL would accept but the live matcher would not
+// match) is refused, and the snapshot and live matching share one form.
+func TestAuditSocketClientIPFilterValidationMatchesHistory(t *testing.T) {
+	if _, err := parseAuditLogOptionsFromRequest(httptest.NewRequest("GET", "/api/v2/admin/logs/ws?client_ip=192.0.2.10/032", nil)); err == nil {
+		t.Error("zero-padded client_ip mask accepted")
+	}
+	opts, err := parseAuditLogOptionsFromRequest(httptest.NewRequest("GET", "/api/v2/admin/logs/ws?client_ip=2001:DB8::7348", nil))
+	if err != nil || opts.ClientIP != "2001:db8::7348" {
+		t.Fatalf("valid client_ip: %q, %v", opts.ClientIP, err)
 	}
 }

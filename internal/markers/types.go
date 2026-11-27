@@ -121,30 +121,6 @@ const (
 	ExternalIDKeyTVDB = "tvdb"
 )
 
-// Marker providers index episodes by a bounded season/episode coordinate.
-// TheIntroDB rejects seasons outside its accepted window (its error text is
-// "Invalid season. Must be between -9223372036854775808 and 1000"), and
-// filename parsing can overrun that for long-running or oddly named shows
-// (One Piece's absolute numbering, yearly "Season 2009" folders). Clamp to
-// what providers accept instead of sending a value they will reject.
-const (
-	MaxProviderSeason  = 1000
-	MaxProviderEpisode = 10000
-)
-
-// clampProviderCoordinate bounds a non-negative season/episode number to the
-// range providers index. A negative value (unknown/specials handling that
-// should never reach here already filtered) clamps to zero.
-func clampProviderCoordinate(value, limit int) int {
-	if value < 0 {
-		return 0
-	}
-	if value > limit {
-		return limit
-	}
-	return value
-}
-
 type Request struct {
 	Kind          ItemKind
 	ExternalIDs   map[string]string

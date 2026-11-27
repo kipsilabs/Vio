@@ -54,109 +54,6 @@ operation:
 - Capability documents carry the common `state`, `allowed`, and `revision` members
   and support `If-None-Match`.
 
-## Verified release dates and release metadata
-
-`GET /api/v1/requests/status` advertises `release_date_overrides` and
-`needs_release_metadata` when host storage is wired. These capabilities do not
-grant access: the following routes require a server administrator account.
-
-| Route | Result |
-|---|---|
-| `GET /api/v1/admin/release-overrides` | `200 {"entries": [...]}`; latest revision by default, or descending audit history. |
-| `PUT /api/v1/admin/release-overrides` | Set or change a verified release instant; `200` with the recorded entry. |
-| `DELETE /api/v1/admin/release-overrides` | Append a clear revision; `200` with the recorded entry. |
-| `GET /api/v1/admin/needs-release-metadata` | `200 {"entries": [...]}`; observed blocked identities. |
-| `POST /api/v1/admin/needs-release-metadata/retry` | `202 {"catalog_items_queued": N}`. |
-
-An identity consists of `media_type` (`movie` or `episode`), `provider`,
-`provider_id`, `season_number`, and `episode_number`. Movies support `tmdb` and
-`imdb`, with both ordinals zero. Episodes additionally support `tvdb`; their
-provider ID identifies the **series**, and both ordinals must be 1–100000.
-Specials are not supported by these virtual release gates. Numeric provider IDs
-are canonical positive decimal strings of at most 20 digits; IMDb IDs are `tt`
-followed by 1–16 digits. Overrides are global, not library- or profile-scoped,
-and need no existing catalog item.
-
-GET takes identity fields as query parameters, optional `before_revision`
-(exclusive, zero means latest), and `limit` (1–100, default 1). No history returns
-an empty array and means revision zero. Each entry contains the identity plus
-`revision` (integer), `action` (`set`, `change`, or `clear`), `release_at`
-(UTC RFC3339 or null), `evidence_note`, `actor_account_id`, and `recorded_at`.
-History is append-only and survives account deletion.
-
-PUT and DELETE take a JSON body with the identity, `expected_revision`, and a
-nonblank `evidence_note` of at most 4096 UTF-8 bytes. PUT also requires
-`release_at`, either `YYYY-MM-DD` (midnight UTC) or RFC3339 with an offset.
-Instants are normalized to UTC microseconds. DELETE must omit `release_at` or
-send an empty string. The actor comes from authentication, never the body.
-Unknown fields and extra JSON values are rejected; bodies are capped at 16 KiB.
-
-Use revision zero for the first write. A stale revision, or clearing an identity
-without an active override, returns `409 revision_conflict`; reload before
-retrying. Invalid input returns `400 bad_request`, non-admin access returns
-`403 forbidden`, and unavailable storage returns `503 unavailable`. The
-repository rechecks that the actor is an enabled administrator during reads and
-writes, including after a role change.
-
-A verified future instant blocks virtual materialization even when provider
-metadata says released. A past instant permits it. Clear restores provider
-policy without replacing provider dates. If known aliases have conflicting
-active overrides, the latest release instant wins. With no active override,
-local possession (local metadata or physical files) also permits, since
-legacy rows often lack provider dates. Movie preparation captures
-revisions and checks them again under database locks before accepting virtual
-files; concurrent edits require preparation to retry. Network provider lookups
-run before write transactions. Physical files are not removed by release gates.
-This is a materialization policy, not immediate revocation of existing playback.
-See `docs/architecture/release-gating.md` for the full eligibility and lock protocol.
-
-The metadata queue lists identity fields plus `reason`, `observed_at`, and
-nullable `retry_requested_at`, ordered by observation time then identity. GET
-accepts `limit` (1–100, default 50) and nonnegative `offset`. Reasons are
-`missing_date`, `future_date`, `provider_unavailable`, and `no_home_release`;
-not every producer currently emits every reason. Retry accepts only an identity
-in a JSON body (maximum 4096 bytes), marks its retry request, and schedules
-metadata refresh debt for matching catalog items. A missing queue entry returns
-`400 bad_request`. Zero queued items is valid before catalog creation; this
-endpoint does not yet dispatch plugin-owned retries. Override writes also
-schedule matching catalog metadata refresh debt. Successful registrar release
-checks remove queue entries; retries do not imply release approval.
-
-### Read-only plugin contract
-
-The host registers `/silo.plugin.v1.ReleaseOverrides/Lookup` on the installation's
-runtime broker, not the public HTTP API. The process connection uses automatic
-mutual TLS. The installation identity is host-bound; requests cannot select an
-actor or installation. No write RPC exists, and audit notes/account IDs are not
-returned.
-
-Both RPC messages use `google.protobuf.Struct`. Request:
-
-```json
-{"identities":[{"media_type":"episode","provider":"tmdb","provider_id":"42","season_number":1,"episode_number":2}]}
-```
-
-Response entries correspond to request order, including duplicates and misses:
-
-```json
-{"entries":[{"release_at":null,"revision":"0"}]}
-```
-
-`revision` is a decimal string to preserve int64 precision. A null date with
-revision zero means no history; a null date with a positive revision means
-cleared. Active dates are UTC RFC3339 strings. Lookup accepts 1–100 identities
-and at most 64 KiB of serialized JSON. Errors are `InvalidArgument` for invalid
-input, `PermissionDenied` for an unbound installation, and `Unavailable` for
-missing storage or lookup failure. Older hosts return `Unimplemented`.
-The SDK exposes `runtimehost.Client.LookupReleaseOverrides(ctx, ids)` with typed
-identities and results. Plugins must distinguish lookup failure from absence,
-and must not use a failed lookup to bypass host release policy.
-
-The additive broker RPC avoids requiring regenerated protobuf symbols in the
-host's currently pinned SDK. The SDK helper still needs a published release
-before downstream plugins can pin it. Plugin adoption and queue retry dispatch,
-web UI, Apple and Android client controls remain follow-up work. Jellyfin has no
-admin override endpoint; it sees the shared catalog materialization results.
 ## Task schedules
 
 `PUT /api/v2/admin/tasks/{key}/triggers` replaces the complete schedule using
@@ -413,7 +310,8 @@ usable client address: the resolved address is then the forwarder's own. The web
 Activity panel shows this separately from the access-network badge.
 `GET /api/v2/admin/sessions/capabilities` advertises `stream_location` for client
 feature detection. The displayed location is fixed at playback negotiation,
-even if a later media request arrives over another network path.
+even if a later media request arrives over another network path. A session's
+[egress](#session-egress) counts under this location.
 
 The web activity views show that network alongside the named execution and egress
 nodes. API egress is labeled "API server"; its reporting identity remains in the
@@ -795,6 +693,52 @@ most every five minutes, so this can be older than `last_health_check`. Omitted 
 node predating storage reporting. `GET /api/v2/admin/downloads/storage` presents it
 with the server's own measurement.
 
+`last_stats.active_jobs_by_kind` breaks the transcode node's `active_jobs` down
+by kind, as an object naming every kind with its count, idle kinds as `0`:
+
+| Kind | Job |
+|---|---|
+| `video_transcode` | Re-encodes the video stream (tone mapping and subtitle burn-in included), whatever happens to the audio. |
+| `audio_transcode` | Copies the video stream, or has none, and re-encodes the audio: a remux with audio conversion, or a theme conversion. |
+| `remux` | Copies every stream into a new container. |
+| `trickplay` | Extracts trickplay thumbnails. |
+
+A prepared download is classed by the same work: one that re-encodes video is a
+`video_transcode`, because it competes with playback encodes for the same GPU.
+
+It comes from the same health response as `active_jobs`. Both count new work
+that holds a job-cap slot from the moment the node accepts it, so a start still
+waiting for its first segment counts against the node. Their sums can differ
+briefly while a job starts or stops. Node selection reads it: see "Job kind
+balancing" below. Omitted on a node predating job kinds.
+
+### Job kind balancing
+
+The kinds cost very different amounts: a video encode holds a GPU encoder for
+the length of a stream, while a remux that copies every stream costs a little
+disk and network. Balancing the job total alone can leave one node's GPU
+saturated with encodes while another runs only remuxes, so transcode selection
+balances each kind on its own. Playback, trickplay and prepared-download
+placements name the kind of job they start, and among eligible transcode nodes
+the one with the fewest effective jobs **of that kind** wins. Effective means
+the node's last reported count plus jobs this API server placed there since that
+report. Nodes level on the kind are separated by their effective job total.
+Playback placements then apply the shared-GPU tie-breaker; trickplay and
+prepared-download reservations have none. The soft affinity that keeps a
+playback session on its current node compares the kind's count: a session moves
+only to a node with at least two fewer jobs of its kind.
+
+The job total still decides `max_jobs`. Kind balancing changes which node
+takes work, never how much work a node may take.
+
+When any eligible candidate has no stored `active_jobs_by_kind`, that placement
+uses the job total for every candidate. A node that cannot say must not look
+idle next to nodes that can. That happens during a rolling upgrade from a build
+that predates the field. A sample over the 32 KiB limit (the "node resource
+sample too large to store" warning) is dropped except for
+`active_jobs_by_kind`, so `last_stats` holds only that field until the sample
+fits again, and balancing continues.
+
 ### Scratch admission
 
 A transcode writes HLS segments to its node's scratch volume for the whole life
@@ -807,7 +751,7 @@ jobs.
 The exclusion is soft in two directions:
 
 - If it would leave no eligible candidate at all, it is ignored and the ordinary
-  least-jobs selection stands. Degraded service beats no service, and 95% was
+  selection stands. Degraded service beats no service, and 95% was
   not chosen to be a kill switch for a whole cluster.
 - A node whose fill cannot be read is never excluded: no sample, no `scratch`
   entry (a node predating the flag), an unmeasurable path, or numbers the node
@@ -817,7 +761,8 @@ The exclusion is soft in two directions:
 Each transition into pressure is logged once per node (`component=nodepool`,
 "scratch volume nearly full"), not once per session start.
 
-Nothing else routes on `last_stats`, and the guard applies to playback and
+Apart from `active_jobs_by_kind` (see "Job kind balancing" above), nothing else
+routes on `last_stats`, and the guard applies to playback and
 local-egress transcode selection only — not to proxy selection, and not to the
 non-streaming transcode reservations used by prepared downloads.
 
@@ -966,7 +911,8 @@ Caveats on what a key can prove:
   the server, and stays a matter for how the host is partitioned.
 
 Node selection uses the same keys as a tie-breaker: among transcode nodes that
-are otherwise level on effective job count, the one whose physical GPU group —
+are otherwise level on effective job counts (see "Job kind balancing" above),
+the one whose physical GPU group —
 itself plus every pooled transcode node sharing a key with it — carries the
 fewest jobs wins. It never overrides the job count itself or the soft affinity
 that keeps a session on its current node, and it does not apply to proxy
@@ -1358,9 +1304,9 @@ paths themselves appear only here, behind admin auth. A scoped API key receives
 the same document without disk `path` values.
 
 `GET /api/v2/admin/system/resources/capabilities` advertises
-`instance_attribution`, `process_resources`, `cgroup_resources`, and
-`sample_freshness`, with the common capability `state`, `allowed`, `revision`,
-ETag and conditional request conventions. `state` is `not_configured` without a
+`instance_attribution`, `process_resources`, `cgroup_resources`,
+`sample_freshness`, and `process_cpu_percent`, with the common capability
+`state`, `allowed`, `revision`, ETag and conditional request conventions. `state` is `not_configured` without a
 sampler and `unsupported` on a non-Linux host. Support does not guarantee each
 operating system source is readable.
 
@@ -1371,12 +1317,32 @@ The `attribution` object contains:
 | `instance_id` | Random identifier for this sampler lifetime; identifies which process answered through a load balancer without exposing a hostname. |
 | `sample_interval_seconds`, `sample_duration_seconds` | Sampling cadence and duration of the last completed pass. |
 | `cpu`, `memory`, `load`, `network` | Scope, source and availability of each corresponding `system` reading. Scopes include `host`, `virtualized_host`, `cgroup`, and `network_namespace`. |
-| `process` | Silo process RSS, virtual memory, CPU seconds, threads, open FD count/limit, last-GC live Go heap, runtime memory reservation and goroutine count. Linux storage I/O byte counters include waited-for children. Unreadable values are omitted. |
+| `process` | Silo process RSS, virtual memory, CPU seconds, CPU percent (`cpu_pct`, below), threads, open FD count/limit, last-GC live Go heap, runtime memory reservation and goroutine count. Linux storage I/O byte counters include waited-for children. Unreadable values are omitted. |
 | `cgroup_cpu` | Usage, capacity in cores, throttling, bandwidth periods and CPU pressure at the selected visible cgroup level. A tighter cpuset can set the reported capacity. |
 | `cgroup_memory` | Raw charge, concrete limit, working set, swap, limit/OOM events and memory pressure. Usage and limit are read from the same visible level. |
-| `children` | Bounded snapshot of live owned FFmpeg children. Reports partial/unavailable and truncated sampling explicitly. CPU totals can decrease when children exit; RSS can count shared pages more than once. |
+| `children` | Bounded snapshot of live owned FFmpeg children. Reports partial/unavailable and truncated sampling explicitly. `cpu_seconds` can decrease when children exit; RSS can count shared pages more than once. `cpu_pct` is described below. |
 | `disks` | Inode counts keyed by the disk role, with the matching disk's freshness. Omitted when there are none. |
 | `dropped_disk_roots` | Number of configured roots beyond the bounded disk sampling set. |
+
+`process.cpu_pct` and `children.cpu_pct` are the CPU the Silo process and its
+live FFmpeg children used over the last sample window, on the same 0–100 scale
+and against the same capacity as `system.cpu_pct`, so a monitor can chart them
+beside it: the host's CPUs when nothing caps Silo, or the cgroup quota in
+`cgroup_cpu` when one binds. Children are the processes whose name contains `ffmpeg` that Silo
+started directly (transcodes, remuxes, media analysis, trickplay and chapter
+thumbnails), not only playback; `ffprobe` runs are not counted. Each value is
+rounded to 0.01. Omitted means the window was not
+measured: the first two passes after start, a pass where `system.cpu_pct` or the
+process's own counters were unavailable, a change in what `system.cpu_pct` is
+measured against, the pass after any of those, and for children a truncated
+pass and the one after it. A measured idle process reports `0`. `children.cpu_pct`
+is a lower bound: a child's last partial window before it exits, a child that
+starts and exits between two samples, the first window of a child that starts
+while children are being listed, and the window in which a child could not be
+read are not counted. The cumulative `silo_subprocess_cpu_seconds_total`
+Prometheus counter, per workload, covers completed children. Proxy and transcode nodes
+on a build with this field report it in their attribution in
+`GET /api/v2/admin/nodes/summary`; a node on an older build leaves it out.
 
 Cgroup `scope` is `leaf` or `ancestor`; an ancestor's counters include sibling
 workloads. Limits outside the process's cgroup namespace cannot be observed.
@@ -2026,7 +1992,8 @@ for 5 minutes — a seven-day ranking barely moves within minutes — with the s
 
 `plays` on both lists counts completed `user_watch_history` rows with source
 `playback` or `legacy` (the default for rows written without a source). Every
-playback stop writes a row, completed only past the watched threshold, so a
+playback stop writes a row, completed only past the watched threshold or inside
+the played file's end credits, so a
 title watched in several sittings is one play and a title abandoned partway is
 none; the time spent in those sittings still counts toward `total_seconds`.
 Playback from Silo and Jellyfin clients both writes `playback` rows. Marking something watched is
@@ -2347,8 +2314,8 @@ first finalization that knows one records it and later ones never change it, eve
 that did not get further. `end_reason` is why the attempt ended: `stopped` (the viewer's
 client stopped it), `terminated` (an administrator stopped or terminated it), `expired`
 (the liveness reaper ended it after the client went quiet), `aborted` (the server
-abandoned it) or `replaced` (a Jellyfin client switched play method, and the play
-continues under a new session with its own row). Every end records a row, including a
+abandoned it) or `replaced` (a Jellyfin client switched play method or version, and
+the play continues under a new session with its own row). Every end records a row, including a
 stop, close or abort handled by a server that did not hold the session's live copy;
 that row takes the start time, client and device from the shared live row when one is
 left. The one exception is a Jellyfin session copy that never reported progress: it may
@@ -2358,20 +2325,164 @@ was recorded still gets its row, without the item and duration only the file gav
 an attempt is finalized more than once (copies on several servers, a retried stop), the
 end that stopped the session's lifecycle first sets the reason, and `lifecycle_seq` is
 that end's sequence number on the sessions channel (null on rows recorded before
-lifecycle numbers existed). Every one of these fields is
+lifecycle numbers existed). `subtitle` is the subtitle the play's plan delivered when it
+ended, in the live session rows' shape, or null when it showed none. Of several
+finalizations, the one that ended latest decides it, even one that did not get further
+into the play, and a subtitle change on its own never moves `ended_at`. When the lifecycle
+sweep ends a play whose attempt is gone, it only knows the subtitle the play's live or
+start row last synced, and counts it from that sync, so a subtitle a later finalization
+recorded is kept. Every one of these fields is
 null when unknown, which includes every attempt recorded before it existed; `end_reason`
-is also null for a server teardown the client never recovered from (an encoder exit, a
-withdrawn plan).
+is also null for a server teardown the client never recovered from (an encoder exit).
 
 `GET /api/v2/admin/playback-history/capabilities` reports `available`, `ended_before`,
 `watch_measurement`, `client_ip`, `device_identity`, `client_identity`,
-`stream_decisions`, `end_reason`, `end_reason_values` and `lifecycle_seq`, for feature
-detection.
+`stream_decisions`, `end_reason`, `end_reason_values`, `lifecycle_seq`, `route_facts`,
+`rich_filters`, `session_detail` and `series_filter`, for feature detection.
+
+Additional optional query parameters filter `GET /api/v2/admin/playback-history` (and are
+bound into the cursor alongside the original filters): `search`, `play_method`
+(`all`, `direct`, `remux`, `transcode`), `device_platform`, `client_name`,
+`source_video_codec`, `subtitle_burn_in` (`all`, `true`, `false`), `stream_location`
+(`all`, `local`, `remote`), `adaptation_reason`, `library_id`, `series_id` (attempts of any
+episode of the series), `started_after` and `started_before`. Each entry also carries delivered route facts captured on finalization
+(`route_facts_recorded`, `target_video_codec`, `target_resolution`, `target_audio_codec`,
+`target_audio_channels`, `output_container`, `output_protocol`, `target_bitrate_kbps`,
+`transcode_hw_accel`, `tone_map_mode`, `adaptation_reasons`, `reporting_node`,
+`stream_location`, `compat_origin`, `is_jellyfin_client`, `routing_execution`,
+`routing_execution_node_id`, `routing_execution_node_name`, `routing_egress`,
+`routing_egress_node_id`, `routing_egress_node_name`) plus joined source file metadata
+(`source_video_codec`, `source_resolution`, `source_audio_codec`, `source_audio_channels`,
+`source_container`, `source_bitrate_kbps`, `source_hdr`, `source_video_range_type`,
+`library_id`, `library_name`). Pre-upgrade rows report `route_facts_recorded: false` and
+null for unrecorded route columns.
+
+`GET /api/v2/admin/playback-history/{session_id}` (`getAdminPlaybackHistoryEntry`) reads
+one finalized entry in the same shape, returning `404 not_found` when no row exists.
 
 The administrator history page and the user detail watch-history tab read this route
 under the authority captured when the query was created, keyed by an opaque authority
 generation, and refuse a page whose account, server, profile or PIN authority changed while
-it was in flight. Both views keep their single-page reading at the 200-entry page ceiling.
+it was in flight. The history page pages through results with `cursor` (25, 50 or 100
+entries a page); a view that sets no `limit` asks for the 200-entry page ceiling.
+History pages share the Insights read limit described under [Insights](#insights).
+
+## Insights
+
+The Monitor -> Insights endpoints sit under `admin:monitor:read` for acting administrators.
+Each tab shares the time-window parameters `range` (`7d`, `30d`, `90d`, `1y`, `all`,
+`custom`; default `30d`), optional local-date bounds `from_date` and `to_date`
+(`YYYY-MM-DD`, required when `range=custom`), IANA `tz` (default `UTC`), and `refresh`
+(ignored for scoped API keys). Out-of-range dates or unknown timezones answer
+`422 validation_failed`. Where a read accepts `profile_id`, it also requires `user_id`:
+profile ids such as `default` repeat across accounts, so `profile_id` alone answers `422`.
+Insights reads and Playback History pages share one limit: each node runs at most three at a
+time, further reads wait for a slot, and a read stops two minutes after it asks for one.
+
+**Plays and sessions.** Every playback history row is one session. Insights groups a
+profile's sessions of one item (a movie or an episode) into viewings: a session continues the
+viewing in progress unless it is the first, starts more than 24 hours after every earlier
+session ended, or starts after an earlier session completed (a completed session that a
+Jellyfin method switch replaced hands its play to a session starting within five minutes). A
+viewing is a **play** when it completed or adds up to at least 30 seconds of watch time. A play
+takes its start time and library from its first session and its play method from its longest
+session; watch time sums every session that started in the window. A session belongs to its
+file's library, or, when the file is gone, to its title's library only if the title belongs to
+exactly one; the `library_id` filter and the library leaderboard both use that rule. Fields
+named `plays` count
+plays; fields named `sessions` count history rows (coverage, Devices, and Bandwidth location
+share are per session, because route facts and measurement are recorded per session). Counts
+are computed from the rows as they stand, so a late or recovered finalization can change a past
+window. The implementation and its edge cases are documented in
+`internal/api/handlers/admin_insights_plays.go`.
+
+- `GET /api/v2/admin/insights/capabilities` (`getAdminInsightsCapabilities`) advertises
+  whether Insights and its long-term per-node egress archive are configured (`available`,
+  `node_egress_daily`), the Titles reads (`titles`), the `profile_id` filter
+  (`profile_filter`), the Library read (`library`), and the breakdown fields listed below
+  (`breakdowns`).
+- `GET /api/v2/admin/insights/activity` (`getAdminInsightsActivity`) accepts optional
+  `library_id`, `user_id` and `profile_id` filters and returns window totals (`plays`,
+  `sessions`, completion and play-method counts over plays), auto-bucketed local-timezone
+  series (`day`, `week`, or `month`), a 7×24 local-timezone viewing heatmap
+  (`day_of_week` `0=Monday..6=Sunday`, `hour` `0..23`), server-wide peak concurrent streams
+  unioned from `dashboard_metric_daily` and unarchived `dashboard_metric_samples`, and
+  data-coverage boundaries (`oldest_history_at`, `oldest_measured_at`,
+  `oldest_route_facts_at`, `oldest_metric_at`, `total_sessions`, `measured_sessions`,
+  `route_facts_sessions`). Each bucket also counts `active_accounts` and `active_profiles`,
+  the distinct accounts and profiles with a session that started in it, and `end_reasons`
+  counts the window's sessions by end reason (`stopped`, `terminated`, `expired`, `aborted`,
+  `replaced`; `unknown` for rows recorded before end reasons were).
+- `GET /api/v2/admin/insights/people` (`getAdminInsightsPeople`) accepts optional
+  `library_id`, `search`, `sort` (`watch_time`, `plays`, `direct_pct`, `completion_pct`,
+  `last_seen`), `dir` (`asc`, `desc`), `limit` (1..100), and `offset`, returning account
+  rollups with `total_watch_seconds`, nested household profiles, and live session indicators.
+  An account or profile appears when it has any session in the window. `top_profiles` ranks
+  up to 10 profiles across all accounts by plays, whatever the sort, search or page.
+- `GET /api/v2/admin/insights/titles` (`getAdminInsightsTitles`) accepts optional
+  `library_id`, `user_id`, `profile_id`, `sort` (`plays`, `watch_time`, `viewers`) and `limit`
+  (1..50, default 10), and ranks movies, series (episodes roll up to their series) and
+  libraries with at least one play; titles no longer in the catalog do not rank. `viewers`
+  counts distinct profiles with a play. A library row counts plays by the library of each
+  play's first session. `least_finished` lists up to `limit` movies and series with at least
+  3 plays and at least one left unfinished, lowest completion rate first.
+- `GET /api/v2/admin/insights/titles/{content_id}` (`getAdminInsightsTitle`) reads one movie or
+  series with the same window and filters: totals, plays per bucket, the profiles with a play
+  (most recent first, capped at 100, `viewers_truncated`), and a series' episodes with a play
+  (capped at 500, `episodes_truncated`). An episode id answers `422`; an unknown id `404`.
+  Title detail is not cached.
+- `GET /api/v2/admin/insights/devices` (`getAdminInsightsDevices`) accepts optional
+  `library_id`, `user_id`, `profile_id`, and `min_sessions` (default 5), returning, per
+  session, the normalized `(client_name, device_platform)` × source video codec direct-play
+  matrix (at most 200 client and platform pairs, the ones with the most sessions, since clients
+  report their own names), canonical `adaptation_reasons` counts, hardware acceleration and HDR tone-mapping
+  breakdowns, burn-in subtitle codecs, source vs delivered resolution classes
+  (`source_resolutions`, `delivered_resolutions`, `resolution_changes`), and
+  `top_transcoders`, up to 10 clients ranked by transcoded sessions whatever `min_sessions` is
+  (the threshold applies to the matrix only). Resolution classes
+  use the scanner's width-and-height buckets (`480p`, `720p`, `1080p`, `2160p`, `4320p`,
+  `unknown`); a transcode target, stored as its exact output height, is classified with the
+  source's aspect ratio, and transcodes recorded before route facts are `unknown`.
+  `client_versions` lists up to 50 reported client versions with the most sessions (sessions
+  without a version are left out). `protocol_buckets` splits each `bucket_unit` bucket's
+  sessions between Silo's own clients and Jellyfin-protocol clients (the compatibility layer,
+  or a client name carrying a known Jellyfin client token). `subtitles` and `audio` cover only
+  sessions with route facts, since older rows cannot tell "none" from "not recorded":
+  subtitled sessions with their languages, delivery (`embedded`, `sidecar`, `hls_rendition`,
+  `burn_in`), forced and hearing-impaired counts; and the played audio track's language,
+  audio handling (`direct`, `remux`, `transcode`) and delivered channel layout (`mono`,
+  `stereo`, `surround`; the target's channels when the audio was converted, else the
+  track's). Languages fold onto one code per language (`eng` and `en` are `en`).
+- `GET /api/v2/admin/insights/bandwidth` (`getAdminInsightsBandwidth`) unions
+  `dashboard_metric_daily` and `dashboard_node_egress_daily` with unarchived live minute
+  samples across the requested UTC calendar date span (exact 7/30/90/365 UTC days for presets;
+  without double-counting archived UTC days, so minute-sample pruning does not change
+  historical totals or peaks) to report multi-year egress volume, API vs. node totals, peak
+  throughput, per-node daily breakdown, and remote vs. local session share. Activity's
+  `peak_streams` series uses the same UTC-day daily rollup union.
+- `GET /api/v2/admin/insights/library` (`getAdminInsightsLibrary`) accepts optional
+  `library_id`, `user_id` and `profile_id` and reads the catalog against the window's plays.
+  Titles are movies and series; a series is played when any of its episodes has a play.
+  Coverage is per title: `libraries` (libraries with movies or series, most titles first) and
+  `summary` count titles, titles played in the window, titles never started (no playback
+  session at all, up to now, so a false start counts as started), and titles added in the
+  window (`media_item_libraries.first_seen_at`; across libraries the earliest, so `summary`
+  counts titles new to the server, while a library's own row counts titles first seen in that
+  library, including one that reached it from another library during the window). A title in
+  two libraries counts once in `summary` and is played in both when either file played; the
+  account and profile filters narrow "played" and "started" to that person. `genres` (up to
+  20; a title counts in each of its genres), `decades` (key is the decade's first year,
+  oldest first) and `content_ratings` (up to 15) count plays, narrowed by the library of each
+  play like the other reads. `time_to_first_play` buckets the titles added in the window by how
+  long they waited for a first play (`day`, `week`, `month`, `later`, `not_yet`; `sessions`
+  holds the title count), `summary.median_days_to_first_play` is the median wait over those
+  with a play, and `recently_added_unplayed` lists up to 20 of the newest still waiting. The
+  first play is looked up to now, so a window that ended in the past still reports a title
+  first played after it as played, with its full wait, though it is not "played in the window".
+
+The dashboard's Top Titles and Most active profiles widgets read `getAdminInsightsTitles` and
+`top_profiles`, so they count plays the same way as the Titles and People tabs. The older
+`getAdminDashboardTopActivity` read still counts completed watch history rows.
 
 ## History imports
 
@@ -2490,7 +2601,7 @@ summary. Run credentials and private dispatch metadata never appear in these res
 
 A server address the user supplied must be on the public internet unless the
 account is an admin or an admin turned on `media_servers.allow_private_destinations`.
-That covers a typed Jellyfin or Plex URL and the server addresses Emby Connect or
+That covers a typed Emby, Jellyfin, or Plex URL and the server addresses Emby Connect or
 plex.tv list for the account; servers an admin configured as import sources are
 exempt. A refused address returns `422 validation_failed` whose detail says the
 address is on the server's local network. Cloud metadata, link-local, and other blocked addresses are refused
@@ -2507,9 +2618,16 @@ because each probe carries the Plex token. Addresses the account may not reach u
 the policy above are skipped, and the run is refused only when none remain; the eight
 raced are the first that remain. The Plex token is removed from any redirect that
 leaves the host it was sent to or downgrades from HTTPS to HTTP.
-`GET /api/v2/history-imports/capability` reports `plex_connection_fallback` and
-`max_plex_connections`. A server without it rejects `plex_base_urls` as an unknown
-member, so check the capability before sending the field.
+`GET /api/v2/history-imports/capability` reports `plex_connection_fallback`,
+`max_plex_connections`, and `emby_custom_server`. A server without those capabilities
+rejects `plex_base_urls` or `emby_base_url` as unknown members, so check the capability
+before sending them.
+
+Direct Emby imports accept `emby_base_url` with `username` and an optional `password`
+on `POST /api/v2/history-imports/runs`, mutually exclusive with `connect_session_id`
+and `source_id`, and run with `connection_mode` set to `"custom"`. Non-JSON or
+incomplete `2xx` sign-in responses from an Emby or Jellyfin server return
+`503 dependency_unavailable` with `Retry-After: 30` rather than an internal error.
 
 New queued personal imports survive server restart. Source changes invalidate captured
 configuration without retargeting the import; stale running executions fail without replay.
@@ -2634,6 +2752,73 @@ administrator stop capability. The administrator commands below authorize the
 administrator separately and bind the exact target session; the caller-bound
 user stop cannot be reused by forging the target account/profile context.
 
+### Session egress
+
+With `egress: true` in the capabilities, the detailed list accepts
+`include_egress=true`, and each row it returns may then carry `egress`, the bytes
+Silo has sent to the viewer for that playback session so far. Send
+`include_egress` only after the capabilities report `egress`: v2 rejects query
+parameters a server does not declare. During a rolling upgrade an older server
+answers `include_egress` with a 422 validation failure. Behind a load balancer
+the capabilities can come from an upgraded server and the list from one that is
+not, so after a 422 leave the parameter off for a few minutes before trying it
+again rather than following the capabilities straight back into the same
+failure. `egress: true` means stream telemetry is enabled on the server; the web
+Activity views do not request it.
+
+- `bytes` sums what every API server and proxy node reporting stream telemetry
+  sent the viewer. A hop between Silo's own nodes, such as a transcode node
+  feeding the API server, is not counted, so a transcoded session counts once. A
+  proxy node with stream telemetry turned off contributes nothing, so its
+  sessions count only what an API server sent them, such as playlists.
+- `measured_at` is when the newest of the servers counting the session took its
+  count, on that server's clock. Every API server answers the same instant for
+  the same reports. Servers report about once a second and their clocks can
+  differ slightly, so rates over short intervals can jitter.
+- `series` is an opaque token naming the set of servers behind `bytes`. It changes
+  when one of them starts or stops counting the session, stops reporting, or
+  restarts.
+
+A row omits `egress` when the count is unknown: stream telemetry is off, its
+merged view is not built yet, the last refresh of that view failed, the session
+used more routes than telemetry tracks per session, a server counting it reports
+a capture time further ahead of the answering API server's clock than telemetry
+tolerates, or telemetry has no record of the session. Omission is not zero. A server that stops reporting leaves the count
+of each session it served, which changes that session's `series`; other sessions
+keep theirs. When a server records more observations than its telemetry cap
+allows, the excess is not attributed to a session, and `bytes` undercounts without
+being omitted. The `session` row in `session.*` events never carries `egress`.
+
+When stream telemetry is not shared between servers (no Redis, or
+`SILO_STREAM_TELEMETRY_DISTRIBUTED` off), `egress` counts only what the API server
+answering the list sent itself, and rows whose media a proxy node delivered
+(`routing_egress_node_id` present) omit it.
+
+To chart bandwidth, poll the list and keep, per session, the last observation you
+accepted as its baseline:
+
+1. Ignore an observation whose `measured_at` is not newer than the baseline's. A
+   load balancer can send a poll to an API server whose view is older, even one
+   from before the last `series` change; that observation is neither counted nor
+   a new baseline.
+2. When `series` differs from the baseline's, or `bytes` fell, make the
+   observation the new baseline and count nothing for that interval. `bytes` can
+   restart within a series after the session is idle long enough for telemetry
+   to forget it (five minutes by default). A client that polls less often than
+   that can miss the restart and undercount the interval.
+3. Otherwise the session sent `Δbytes` over `Δmeasured_at`; the observation
+   becomes the baseline.
+
+Sum the rates by `stream_location` for local and remote, by `user_id` for accounts
+(or `profile_id` for profiles), and by `user_id` with `device_id` for devices,
+taking device names from `GET /api/v2/admin/devices` by both fields, not
+`device_id` alone. Each session counts under its row's `stream_location`, as
+[playback node routing](#playback-node-routing) describes it. The figure is best
+effort: a play shorter than two observations, and the part after the last
+observation, are not counted. Only playback sessions are counted. Offline
+download transfers remain in the `download_egress_kbps` series of
+`GET /api/v2/admin/stats/timeseries`.
+
 ## Sequenced administrator playback commands
 
 `POST /api/v2/admin/sessions/{session_id}/pause`, `/resume`, `/stop` and
@@ -2677,6 +2862,18 @@ by any other route. It answers deterministically:
 - Pause, resume and message require a live realtime lane (`409 conflict`
   otherwise). Stop without a lane answers `delivery: "fallback_scheduled"` and
   the server ends the session after the deadline.
+- `delivery: "dispatched"` means the command was written to the session's
+  realtime connection. The receipt does not say whether the player confirmed
+  it: a pause, resume or stop the player confirms later still reads
+  `dispatched`, and a connection whose player went away without closing it
+  still takes the write until the server's ping times out (about 30 seconds).
+- A message waits up to 3 seconds for the player's result before answering.
+  `delivery: "acknowledged"` means the player answered that it received the
+  message; Android answers before it shows the notice. With no answer in time,
+  or a rejection, the receipt stays `dispatched`, so the message may not have
+  been shown. A replay reports the same delivery as the first request; one
+  that arrives during the wait waits for the same answer. Other commands do
+  not wait.
 - A pause, resume or stop the player does not confirm before its deadline ends
   the session. The session's playback attempt is then
   recorded as ended by an administrator, so the player is told to leave
@@ -3129,105 +3326,7 @@ replay, rejects stale decoded results and replacement-editor completion, and doe
 not save merely by displaying a preview. Applying selected suggestions remains a
 separate source write; a preview from replaced authority cannot be applied.
 
-### Canonical dashboard-layout read in v2
-
-`GET /api/v2/admin/dashboard/layout` reads the acting administrator account's saved
-layout, shared across that account's profiles. No row returns `layout: null` and
-`updated_at: null`, preserving the local/default arrangement behavior. Stored
-layouts remain client-owned JSON objects; consumers must sanitize widget names and
-spans. The extension object preserves future fields and JSON number precision.
-Timestamps use UTC milliseconds.
-
-The strong conditional-read ETag binds the account, acting profile/access scope,
-stored layout generation, canonical layout object and full stored timestamp. It
-supports If-Match and If-None-Match/304, and a save needs it in If-Match; see
-[Save the administrator dashboard layout (v2)](#save-the-administrator-dashboard-layout-v2)
-and [Reset the administrator dashboard layout (v2)](#reset-the-administrator-dashboard-layout-v2).
-`server_layouts` stays false, so a read alone does not advertise that lifecycle.
-
-The web reader keys its cache by captured service/account authentication context,
-profile and setter-owned non-secret PIN generation, and rejects responses decoded
-after authority changes. Save/reset success invalidates layout query
-variants so active readers fetch the canonical document; it does not seed a local
-timestamp as a server acknowledgement.
-
-### Hardware-acceleration inventory in v2
-
-`GET /api/v2/admin/system/hw-accel` requires an acting administrator and walks
-the hardware inventory synchronously. Enabled healthy
-nodes are queried concurrently within their advertised/configured budgets. The
-first successful node supplies the primary report; no nodes, or all failed nodes,
-falls back to the local host with current playback settings. Failed nodes remain
-visible with a generic error. Node URL userinfo, query and fragment are removed.
-This is a live inventory, not a cluster capability union, snapshot or durable job.
-`resolved` may name an explicitly configured backend whose probe did not verify;
-`detected_backends` carries verification/skipped results. Missing service returns
-503, distinct from an inventory reporting unavailable hardware. Arrays of render
-devices/details are non-null. Existing worker transport and probe cache behavior
-are unchanged; local detection retains its own budget rather than promising
-request cancellation stops every subprocess.
-
-The actual web settings/overview reader captures service/account/profile/PIN
-authority, rejects late decoded responses and partitions cached success by the
-setter-owned PIN generation. Automatic query retries and authentication replay
-are disabled. This contract does not advertise a new hardware support flag.
-
-### Stored plugin repositories in v2
-
-`GET /api/v2/admin/plugins/repositories` reads stored configuration under the
-acting-admin gate. It does not fetch repository
-indexes or require a running plugin. A missing database-backed store returns503;
-private store errors are masked. String IDs, managed status, source kind, configured
-URL and UTC-millisecond timestamps preserve the existing repository meanings.
-
-The collection uses ascending numeric ID and signed continuation bound to account,
-profile/access scope and page limit. Each page enumerates the full stored list;
-this is live pagination, not a snapshot or bounded database query. The web reader
-drains at most100pages and fails visibly on invalid/duplicate identity, unsupported
-source kind or bad continuation rather than publishing a partial list. It captures
-authority and keys cached success by non-secret PIN generation. Repository writes
-invalidate the shared key prefix.
-Plugin installation/runtime compatibility remains a separate gate.
-
-### Stream telemetry parity in v2
-
-`GET /api/v2/admin/stream-telemetry/parity` compares the cached global telemetry
-view with bounded PostgreSQL and Redis legacy session reads. It
-requires an acting
-administrator. A missing comparison service returns503; disabled telemetry returns
-200 with enabled:false and a reason. An unbuilt view and unavailable legacy source
-remain distinct from an empty successful comparison. No publisher, session storage,
-worker protocol or cutover behavior changes.
-
-The view retains availability, staleness, completeness, missing publishers, clock
-skew and refresh counters; built_at uses UTC milliseconds. Source/cache errors are
-masked. Existing differences retain their explicit truncation counts and absent
-field counts. Each source exposes the existing60000record legacy_scan_limit and
-legacy_may_be_truncated: PostgreSQL reaching the cap is conservatively uncertain;
-Redis uses its actual scan truncation signal. Undecodable Redis records remain
-noted. Reads are not a cross-store snapshot and may race session updates. A report's
-agrees flag ignores fields absent on one side and does not establish completeness
-or authorize retirement/cutover. No first-party web, Swift or Kotlin caller exists
-in the inspected source inventory.
-
-### Creating a plugin repository in v2
-
-`POST /api/v2/admin/plugins/repositories` creates one stored configuration and
-returns201 with the same typed repository projection as the list. URL and display
-name are required; omitted enabled defaults to true. Built-in repository URLs
-remain managed through catalog settings and are rejected here with422. The route
-requires an acting administrator, restricts demo access and reports missing store503.
-It performs the existing single INSERT, not a remote catalog fetch or installation.
-
-Creation has no replay identity or deduplication guarantee and is nonretryable. A
-store/transport failure may leave completion uncertain; it is not proof that no row
-exists. The Add Repository hook copies the submitted body and captures authority
-before queueing, disables mutation retries and authentication replay, and rejects
-stale completion. Successful active-authority creation retains existing plugin
-query invalidations. Failure requires explicit reconciliation before another
-submission; no automatic retry, replacement or legacy fallback occurs.
-
-### Autoscan connection checks in v2
+### Autoscan connection checks
 
 `POST /api/v2/admin/autoscan/connections/test` performs one advisory status check
 without saving a connection. A nonblank connection_id takes precedence over draft

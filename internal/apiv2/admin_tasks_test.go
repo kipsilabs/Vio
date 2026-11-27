@@ -43,8 +43,8 @@ func (f *fakeAdminTasks) StartTask(key string) (taskmanager.TaskInfo, error) {
 	info.State = taskmanager.TaskStateRunning
 	return info, nil
 }
-func (f *fakeAdminTasks) CancelTask(string) (taskmanager.TaskInfo, error) {
-	return taskmanager.TaskInfo{}, nil
+func (f *fakeAdminTasks) CancelTask(key string) (taskmanager.TaskInfo, error) {
+	return f.GetTaskInfo(key), nil
 }
 func (f *fakeAdminTasks) GetSchedule(context.Context, string) (taskmanager.Schedule, error) {
 	f.reads++
@@ -93,13 +93,6 @@ func (f *fakeAdminTasks) ListAdminTaskJobs(_ context.Context, _ string, _ time.T
 func (f *fakeAdminTasks) GetAdminTaskJob(_ context.Context, id string) (*models.AdminJob, error) {
 	if id == "missing" {
 		return nil, adminjob.ErrJobNotFound
-	}
-	if id == "virtual" {
-		return &models.AdminJob{ID: id, JobType: adminjob.JobTypeVirtualCandidatesRefresh, CreatedByUserID: 1, Status: adminjob.StatusCompleted, RequestedAt: fixedTime(),
-			ResultPayload: []byte(`{"content_id":"movie:heat-1995","indexer_releases":1,"releases":[{"release_id":"17","title":"Heat 1995 2160p WEB-DL x265-GRP","resolution":"2160p","codec_video":"hevc","size_bytes":8000000000,"indexer":"idx","protocol":"usenet","download_state":"not_downloaded"}]}`)}, nil
-	}
-	if id == "virtual-foreign" {
-		return &models.AdminJob{ID: id, JobType: adminjob.JobTypeVirtualCandidatesRefresh, CreatedByUserID: 2, Status: adminjob.StatusQueued, RequestedAt: fixedTime()}, nil
 	}
 	return &models.AdminJob{ID: id, JobType: adminjob.JobTypeItemRefresh, CreatedByUserID: 1, Status: adminjob.StatusCompleted, RequestedAt: fixedTime(), RequestPayload: []byte(`{"scan_path":"private"}`), ResultPayload: []byte(`{"requested_content_id":"item","refresh_content_id":"item","detail_content_id":"detail","scan_path":"private","scan_result":{"New":3},"artwork_cache_warning":"private cache failure"}`)}, nil
 }
@@ -385,6 +378,29 @@ func TestAdminTaskGuardAndLocalAcknowledgment(t *testing.T) {
 		t.Fatalf("false job acceptance: %d %s", started.Code, started.Body)
 	}
 }
+
+// An unsaved schedule reports the task's defaults at revision zero; when those
+// defaults change, an editor's earlier tag must stop matching.
+func TestAdminTaskUnsavedScheduleTagFollowsDefaults(t *testing.T) {
+	f := newFakeAdminTasks()
+	f.schedule = taskmanager.Schedule{Triggers: []taskmanager.TriggerConfig{{Type: taskmanager.TriggerTypeStartup}}}
+	h := adminTasksTestHandler(t, f)
+	base := Prefix + "/admin/tasks/fixture/triggers"
+	tag := do(t, h, "GET", base, "", bearer(adminToken)).Header().Get("ETag")
+	f.schedule.Triggers = []taskmanager.TriggerConfig{{Type: taskmanager.TriggerTypeDaily, TimeOfDay: "03:00"}}
+	stale := do(t, h, "PUT", base, `{"triggers":[{"type":"startup"}]}`, with(bearer(adminToken), "If-Match", tag))
+	requireProblem(t, stale, TypePreconditionFailed)
+	if f.writes != 0 {
+		t.Fatalf("stale tag saved over changed defaults: %+v", f)
+	}
+	current := do(t, h, "GET", base, "", bearer(adminToken)).Header().Get("ETag")
+	if current == tag || stale.Header().Get("ETag") != current {
+		t.Fatalf("tags: old %s, current %s, 412 %s", tag, current, stale.Header().Get("ETag"))
+	}
+	if saved := do(t, h, "PUT", base, `{"triggers":[]}`, with(bearer(adminToken), "If-Match", current)); saved.Code != 200 || f.expected != 0 {
+		t.Fatalf("first save: %d %s expected=%d", saved.Code, saved.Body, f.expected)
+	}
+}
 func TestAdminTaskAuthorizationAndValidation(t *testing.T) {
 	f := newFakeAdminTasks()
 	h := adminTasksTestHandler(t, f)
@@ -462,29 +478,6 @@ func TestAdminJobOwnerReadIsSafe(t *testing.T) {
 		t.Fatalf("owner projection: %d %s", response.Code, response.Body)
 	}
 	requireProblem(t, do(t, h, "GET", Prefix+"/admin/jobs/missing", "", bearer(memberToken)), TypeNotFound)
-}
-
-// TestVirtualRefreshJobOwnerReadableAndResult proves a viewer who triggered a
-// virtual candidates refresh may read their own job, sees the retained
-// indexer-release list, and cannot read another account's job.
-func TestVirtualRefreshJobOwnerReadableAndResult(t *testing.T) {
-	f := newFakeAdminTasks()
-	h := adminTasksTestHandler(t, f)
-
-	response := do(t, h, "GET", Prefix+"/admin/jobs/virtual", "", bearer(memberToken))
-	if response.Code != 200 {
-		t.Fatalf("owner read: %d %s", response.Code, response.Body)
-	}
-	if !strings.Contains(response.Body.String(), `"indexer_releases"`) || !strings.Contains(response.Body.String(), `"release_id":"17"`) {
-		t.Fatalf("indexer releases missing: %s", response.Body)
-	}
-	// The stored download URL is never projected.
-	if strings.Contains(response.Body.String(), "indexer.example") {
-		t.Fatalf("release URL leaked: %s", response.Body)
-	}
-
-	// Another account cannot read the job: the owner rule is identity-bound.
-	requireProblem(t, do(t, h, "GET", Prefix+"/admin/jobs/virtual-foreign", "", bearer(memberToken)), TypeNotFound)
 }
 
 func TestAdminTaskScheduleRejectsNestedNullWithoutWrites(t *testing.T) {
@@ -569,5 +562,25 @@ func TestTaskExecutionErrorMessage(t *testing.T) {
 				t.Fatalf("ErrorMessage = %q, want %q", got.ErrorMessage, tc.want)
 			}
 		})
+	}
+}
+
+// An import queued from an export job reports that job's ID, so a client can
+// name the source in its own language instead of showing source_label.
+func TestCatalogImportJobReportsSourceExportJob(t *testing.T) {
+	payload, err := json.Marshal(adminjob.CatalogImportRequest{SourceBucket: "b", SourceKey: "k", SourceLabel: "Export job 42", SourceExportJobID: "42"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := &models.AdminJob{ID: "import", JobType: adminjob.JobTypeCatalogImport, Status: adminjob.StatusCompleted, RequestedAt: fixedTime(), RequestPayload: payload}
+	deps, _ := libraryDeps(t)
+	deps.AdminTaskJobs = &fakeStorageTransitionJobs{job: job}
+	h := newTestHandler(t, deps)
+
+	var body AdminTaskJob
+	response := do(t, h, http.MethodGet, Prefix+"/admin/jobs/import", "", bearer(adminToken))
+	decodeJSON(t, response.Body, &body)
+	if response.Code != http.StatusOK || body.SourceExportJobID != "42" || body.SourceLabel != "Export job 42" {
+		t.Fatalf("import from export job: %d %s", response.Code, response.Body)
 	}
 }

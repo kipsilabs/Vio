@@ -206,7 +206,7 @@ func (s *Service) CancelByLibrary(ctx context.Context, libraryID int) (int, erro
 		return 0, nil
 	}
 
-	canceled, err := s.CancelAcceptedByLibrary(ctx, libraryID)
+	cancelled, err := s.CancelAcceptedByLibrary(ctx, libraryID)
 	if err != nil {
 		return 0, err
 	}
@@ -222,7 +222,7 @@ func (s *Service) CancelByLibrary(ctx context.Context, libraryID int) (int, erro
 
 	activeRuns, err := s.repo.ListActive(ctx)
 	if err != nil {
-		return canceled, err
+		return cancelled, err
 	}
 	for _, run := range activeRuns {
 		if run == nil || run.MediaFolderID != libraryID {
@@ -230,16 +230,16 @@ func (s *Service) CancelByLibrary(ctx context.Context, libraryID int) (int, erro
 		}
 		_, changed, err := s.repo.MarkCancelled(ctx, run.ID)
 		if err != nil {
-			return canceled, err
+			return cancelled, err
 		}
 		if changed {
-			canceled++
+			cancelled++
 			if cancelledRun, err := s.repo.GetByID(ctx, run.ID); err == nil {
 				s.publish(ctx, "scan.cancelled", cancelledRun)
 			}
 		}
 	}
-	return canceled, nil
+	return cancelled, nil
 }
 
 func (s *Service) ListActive(ctx context.Context) ([]evt.ScanRun, error) {

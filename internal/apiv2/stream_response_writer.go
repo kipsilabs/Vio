@@ -2,7 +2,6 @@ package apiv2
 
 import (
 	"io"
-	"log/slog"
 	"net/http"
 
 	"github.com/Silo-Server/silo-server/internal/httpstream"
@@ -18,19 +17,6 @@ type streamResponseWriter struct {
 	redactHeaders []string
 	status        int
 	rejected      bool
-	// cause is the underlying stream failure the v1 handler handed to the
-	// adapter through SetPlaybackProblemCause. The handler's own body stays
-	// generic, so without it the discard log names only the generic code.
-	cause error
-	// semanticProblem is true when the problem type came from the v1 handler's
-	// machine-readable code rather than from the bare status. The response and
-	// the request log already carry that code, so the discarded v1 body added
-	// nothing and is not worth an ERROR line.
-	semanticProblem bool
-	// discardLogged guards the single log line for the legacy error body the
-	// adapter replaces with a problem envelope, so a handler that writes it in
-	// pieces does not log it repeatedly.
-	discardLogged bool
 }
 
 func (w *streamResponseWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
@@ -56,10 +42,6 @@ func (w *streamResponseWriter) WriteHeader(status int) {
 		w.Header().Del(header)
 	}
 	kind := w.problemType(status)
-	// A type that only the handler's code could name is a semantic answer, not
-	// a generic status collapse: the code reaches the client and the request
-	// log, so the discarded v1 body is redundant.
-	w.semanticProblem = kind.ID != TypeForStatus(status).ID
 	writeProblem(w.ResponseWriter, w.request, NewProblem(kind, kind.Title))
 }
 
@@ -68,40 +50,9 @@ func (w *streamResponseWriter) Write(data []byte) (int, error) {
 		w.WriteHeader(http.StatusOK)
 	}
 	if w.rejected {
-		w.logDiscardedBody(data)
 		return len(data), nil
 	}
 	return w.ResponseWriter.Write(data)
-}
-
-// logDiscardedBody records the legacy v1 error body the adapter refuses to
-// forward in favor of a problem envelope. A raw 5xx otherwise reaches the
-// request log as only the generic problem code: the machine-readable code and
-// human-readable message the v1 handler wrote are lost. It logs once per
-// response, under the request ID, and the body never reaches the client.
-func (w *streamResponseWriter) logDiscardedBody(data []byte) {
-	if w.discardLogged || w.status < http.StatusInternalServerError {
-		return
-	}
-	w.discardLogged = true
-	attrs := []any{
-		"component", "apiv2",
-		"request_id", requestIDFrom(w.request.Context()),
-		"status", w.status,
-		"discarded", string(data),
-	}
-	if w.cause != nil {
-		attrs = append(attrs, "cause", w.cause.Error())
-	}
-	// A generic status collapse loses whatever the handler wrote, so it stays an
-	// ERROR. A semantic problem (the code named its own catalog type) is already
-	// on the wire and in the request log; the discarded body is only debug
-	// detail, and an expected retryable 503 must not page anyone.
-	level := slog.LevelError
-	if w.semanticProblem {
-		level = slog.LevelDebug
-	}
-	slog.Log(w.request.Context(), level, "apiv2 raw stream error body discarded", attrs...)
 }
 
 // ReadFrom keeps the sendfile path for file bodies. io.Copy finds

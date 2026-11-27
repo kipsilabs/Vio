@@ -5,209 +5,6 @@
 
 ## Recommendation limits
 
-`FileVersion.available` reports the durable per-version health signal on the
-item detail and item-versions responses: a virtual candidate is available when
-it has not been stamped failed (`failed_at` is NULL), a local file when it is
-not marked missing (`missing_since` is NULL). The field is omitted when the
-version is available, so an absent `available` means available/unknown; `false`
-means the version is currently unavailable. `FileVersion.failed` remains the
-virtual-only "produced no bytes at stream-open" flag.
-
-Detail rows also carry `probed_at`, the instant ffprobe last enumerated the
-version's real stream table; absent means the row still carries declared
-metadata only. A detail row may also carry `source_mismatch` while the API
-process still holds a recent playback probe's wrong-source verdict for that
-row, with the same meaning and lifecycle as the check result below.
-
-On the playback side, the `/api/v2` playback plan projection carries
-`effective_virtual_uri` alongside `virtual_source_revision`, so a client can
-detect a substituted virtual candidate and adopt it in its version menu.
-
-`POST /api/v1/catalog/versions/check` batch-tests a set of media file IDs and
-stamps the durable signal. The request is:
-
-```json
-{
-  "file_ids": [123, 456]
-}
-```
-
-`POST /api/v2/catalog/versions/check` (`checkCatalogVersions`) is the same
-probe on the stable surface, returning the same verdict shape with the opaque
-string identifiers v2 uses everywhere. The request is:
-
-```json
-{
-  "file_ids": ["123", "456"]
-}
-```
-
-The v2 contract reports an empty list and more than 40 IDs as `422`
-validation failures at `body.file_ids` (the frozen v1 route answers `400` and
-`413` instead). The operation is optional: playback start and replan never
-require a check, and a client that never calls it keeps the behavior it had
-before the operation existed. `getPlaybackCapabilities.features` advertises
-`versions_check_v1` when the server serves it.
-
-At most 40 IDs are accepted per request (413 `too_large` beyond that; 400
-`bad_request` when the body is missing or the list is empty). Each file is
-tested cheaply, with bounded concurrency and a per-file timeout. Local rows are
-read from `missing_since`. A batched page check answers a virtual row from the
-durable state its last provider listing recorded and resolves no unprobed row,
-so opening a page cannot open the provider's play endpoint once per listed
-version. A single-file check resolves the row it names, and a batch resolves at
-most one durably failed row so a recovered pin can clear its verdict. A
-confirmed dead pin stamps `failed_at`; a successful resolution clears it.
-Ambiguous provider errors (provider down, timeout) leave the stamp unchanged and
-report the row's current computed availability, so a provider outage cannot
-mass-tag versions.
-
-**Response** (200 OK):
-
-```json
-{
-  "results": [
-    { "file_id": 123, "available": true },
-    { "file_id": 456, "available": false }
-  ]
-}
-```
-
-A result also carries `"failed": true` when the row holds a durable failed
-verdict (confirmed unservable, either from before the check or stamped by it).
-Clients remove failed rows from version pickers instead of offering them,
-with two recovery exceptions: the currently active selection stays visible so
-a mid-stream verdict does not yank the playing row, and if every version has
-failed, the list stays visible so the viewer sees the unservable state and can
-trigger a refresh or relink instead of facing an empty menu. Rows that are merely
-`available: false` without `failed` may recover and stay listed behind the
-unavailable toggle. Unknown or deleted file IDs are reported as `available: false`.
-
-A result optionally carries `source_mismatch` while the API process still holds
-a recent playback probe's wrong-source verdict for that row:
-
-```json
-{
-  "file_id": 789,
-  "available": true,
-  "source_mismatch": { "served_bytes": 7427636945, "declared_bytes": 8449999999 }
-}
-```
-
-It means a probe read a different release's bytes than the row declares, or a
-playback start refused the row's pin for that reason. It is advisory, not a
-liveness verdict: the release remains `available`, is never `failed`, and
-clients should show it as a distinct "source mismatch — served X of declared Y"
-state rather than the generic unavailable/retry copy. Playback answers the same
-verdict with the retryable `source_mismatch` terminal reason, so a refused play
-and the version list use one vocabulary. The signal is process-local and
-transient (the short wrong-source backoff window); it is absent after a restart,
-on a node that did not run the probe, and once a later probe accepts the served
-bytes. A row without the field keeps the generic unprobed presentation.
-
-### Single-file inventory mode
-
-A version row carries provider-declared track lists until something enumerates
-its bytes, and selecting a version only schedules that enumeration in the
-background. `checkCatalogVersions` can answer both in one round trip: with
-`"preprobe": true` and exactly one file identifier, the server runs the same
-inventory probe a version selection schedules, waits for it under a 5 s bound,
-and returns the row's tracks with the liveness verdict.
-
-```json
-{
-  "file_ids": ["123"],
-  "preprobe": true
-}
-```
-
-```json
-{
-  "results": [
-    {
-      "file_id": "123",
-      "available": true,
-      "inventory_provenance": "verified",
-      "probed_at": "2026-01-02T03:04:05.000Z",
-      "video_tracks": [{ "codec": "hevc", "width": 3840, "height": 2160 }],
-      "audio_tracks": [{ "index": 1, "codec": "truehd", "language": "eng", "channels": 8 }],
-      "subtitle_tracks": [{ "index": 2, "language": "eng", "codec": "subrip" }]
-    }
-  ]
-}
-```
-
-`inventory_provenance` says how much of that inventory is evidence:
-
-- `verified`: a probe enumerated the row and its stamp is on it, so
-  `probed_at` and the tracks are real container metadata.
-- `pending`: the probe ran (or is still running for another read of the same
-  row) but no committed evidence reached the row yet, so the tracks are still
-  the declared placeholders. A later probe — the detail read's warm-up or a
-  playback start — is what stamps the row and publishes `versions_updated`.
-- `declared`: nothing enumerated the row. The tracks are registration metadata.
-
-Notes for clients:
-
-- The mode is additive and never fails the read: an inaccessible or unknown ID
-  answers exactly like the liveness check, a timeout answers declared or
-  pending metadata with the row's current tracks, and a seam the server does
-  not serve answers `503 dependency_unavailable` instead of answering without
-  inventory.
-- `preprobe` requires exactly one identifier (`422` validation failure at
-  `body.file_ids` otherwise): the wait is per file, so a batch would multiply it.
-- `inventory_provenance`, `probed_at`, and the three track lists are absent from
-  every other request, so the batched answer is unchanged. The frozen v1 route
-  is liveness-only and ignores `preprobe`.
-- Playback still schedules its own probe; this mode is a read optimization, not
-  a prerequisite. Never gate a start or a plan on it.
-
-Two further node-local in-memory caches affect virtual titles without durable or
-shared state. The empty-title suppression tracker marks a title as currently
-unservable after enough consecutive empty provider listings: a resolve on the
-node holding the mark fails fast with a retryable dependency condition
-(`ErrTitleWithoutStreams`, never a release verdict), while another node, or the
-same node after a restart, re-lists the title normally. The detail warm memo
-coalesces repeated detail reads that would schedule the same version's
-probe/warm chain; it suppresses duplicate scheduling only and never changes the
-response body. Neither has shared admission across nodes: like `source_mismatch`
-they are absent after a restart and on nodes that did not observe the underlying
-reads, and they exist only to bound per-process work, not to record catalog
-state.
-
-## Multi-audio language support and release metadata
-
-MULTi/DUAL releases — a single audio stream tagged `und`/`mul`/empty whose
-languages live in the track title (e.g. "English / French / Spanish") — now
-carry real language identity instead of being collapsed to a single code.
-
-- **`FileVersion.audio_tracks[].languages`** — the full advertised language
-  list for a MULTi/DUAL track, parsed from the track title at probe time when
-  the container language tag is absent, undetermined, or multiple. `language`
-  keeps the primary code (the first concrete one when the tag was
-  undetermined). Rows probed before this support are backfilled at read time
-  from the embedded title until the probe-version re-probe catches up.
-- **`FileVersion.audio_tracks[].index`** — the **absolute container stream
-  index** as ffprobe reported it (video is typically stream 0, the first
-  audio stream 1, subtitles interleaved between them). It is NOT the
-  audio-only FFmpeg ordinal used by `0:a:N` map specifiers, and NOT the
-  track's position in the `audio_tracks` array. Track list order can differ
-  from container order on MULTi releases; clients that need to select a
-  track for ffmpeg must convert this index to the audio-only ordinal
-  (the rank of the selected track among tracks ordered by absolute index —
-  see `playback.AudioStreamOrdinal` server-side) rather than sending this
-  value directly.
-- **`FileVersion.release_name`** / **`FileVersion.release_group`** — the file
-  stem (basename without extension) and the trailing group tag on
-  release-style names (`Movie.2023.2160p.AltMount` → group `AltMount`), so
-  clients can show which release a version is. `release_group` is empty when no
-  group tag is present.
-
-`GET /api/v1/catalog/filters` reports the language facets on
-`audio_languages` and `subtitle_languages` (alongside `resolutions`) when
-`include_technical` is true (the default). A MULTi track satisfies the
-audio-language browse filter for any of its `languages[]` codes, not just its
-primary `language`.
 `GET /api/v2/recommendations/because-watched/{item_id}` accepts `limit` from
 1 to 50 (default 20). The shared service caps the limit before the engine expands its candidate queries.
 
@@ -539,23 +336,13 @@ or not it was a finished watch.
 `collection_kind` values this server accepts:
 
 ```json
-{
-  "sort_preference_kinds": ["library", "user", "watchlist", "favorites"]
-}
+{ "sort_preference_kinds": ["library", "user", "watchlist", "favorites"] }
 ```
 
 Check it before saving a Watchlist or Favorites preference. The
 `collection_sort_preferences` boolean reports only that saved preferences exist at
-all, so it cannot be used to detect the personal-list kinds. When
-`sort_preference_kinds` is absent, assume `library` and `user` only. The
-document supports `If-None-Match` and returns `304` when the caller's copy is
-current.
-
-Virtual-item materialization is a bridge-era admin repair path, not part of the
-v2 collections contract. It is advertised by `admin_item_materialize` on
-`GET /api/v1/collections/capabilities` and served by
-`POST /api/v1/admin/collections/{id}/materialize/{item_id}`. See
-[Admin item materialization](#admin-item-materialization).
+all, so it cannot be used to detect the personal-list kinds. The document supports
+`If-None-Match` and returns `304` when the caller's copy is current.
 
 `login_sharing: true` reports that a personal collection is either private to its
 creator or shared with every profile on the login, that `listCollections` includes other
@@ -781,20 +568,6 @@ header they resolve the profile's preferences alone. Clients that set
 device overrides should send the header so the detail page matches what playback
 picks.
 
-## Selected-version reads
-
-`getCatalogItem` accepts the optional `file_id` query parameter, the version the
-viewer picked. It applies the same selection the watch detail applies: the
-effective playback answer is resolved for that row, `playback_variants` names it
-as the default, and the server schedules that row's inventory probe and provider
-warm-up exactly as an explicit selection on a watch-detail read does. Without it
-the read answers the server's own default and schedules nothing for a row the
-page did not name, so a client that never passes it keeps the behavior it had.
-
-Sending it on every pick is what makes the probe start when the viewer chooses a
-version rather than when the picker or the player next reads the row. A caller
-that wants the enumerated tracks in the same answer can additionally use the
-[versions check's single-file inventory mode](#single-file-inventory-mode).
 `effective_audio_track_index` does not know the playing device's capabilities.
 A playback start that names no audio track can play another track in the same
 language when the plan for this one converts its audio and the plan for that
@@ -842,6 +615,38 @@ page's `ratings` uses: a 0-100 `score`, the source's own `display`, and the
 source's `name`. They are built from the episode's stored rating columns by the
 same rules as a title page, so a stored 0 (unrated) or a value off the 0-10
 scale is left out, and an episode with no rating omits the field.
+
+## Episodes labeled by air date
+
+Some series number their episodes only so they sort: Sportarr gives a league's
+games `S2026E296`. Such a series carries `episode_labels: "air_date"`, and a
+client shows the episode's `air_date` (a calendar date, no time zone) where it
+would show the season and episode numbers. Sorting, next up and playback still
+use the numbers. An undated episode keeps its numbers, and an absent
+`episode_labels` means numbers, so a client needs no capability check. Later
+releases may add values; a client treats a value it doesn't know as absent and
+shows the numbers.
+
+The value comes from the series' metadata provider: a plugin's series
+`MetadataItem.metadata` sets `episode_labels` (`air_date` is the only value; any
+other is ignored). It is stored on the series. Identify, Reset to Provider and
+a Complete Refresh take it from the new answer, so matching a Sportarr league
+to a numbered show brings the numbers back. Other refreshes, "Replace all
+metadata" included, keep it when the providers send none, as they keep any
+other value the providers leave out. A refresh fills only empty episode dates, so
+an episode date a provider has since corrected takes "Replace all metadata".
+
+`episode_labels` appears on:
+
+- item detail of the series, and of its seasons and episodes (the series' value)
+- series and episode cards of home and library sections, Watch Tonight and
+  recommendation rows, catalog browse and search, library and personal
+  collections, favorites, the watchlist, watch history, Watch Together pickers
+  and the shuffle `next` card; their episode cards also carry `air_date`.
+  Season cards don't carry it.
+- watch detail (`getWatchDetail`) of an episode, with its `air_date`
+
+`/api/v1` and the Jellyfin-compatible API are unchanged.
 
 ## External IDs on cards
 
@@ -1171,7 +976,9 @@ show's newest episode with a file in a library, so movies never match them. An
 episode the metadata provider lists but no library has a file for does not count,
 even after its air date. The `last_air_date` sort follows the same rule. A show's
 `last_air_date` response field still reports its newest aired episode, with or
-without a file, so it can be later than the date the rule and sort use. An episode row never matches
+without a file, and skips specials (season 0) unless no regular episode has aired,
+so a special that aired after the finale does not extend the show's run. The rule and sort still count a special with
+a file, so the field can differ from the date they use. An episode row never matches
 `latest_episode_added`, and in the `episode` scope `last_air_date` is the
 episode's own air date. Rules on `rating_rt_critic` and `rating_rt_audience`
 still apply when an administrator hides that rating source, so a saved collection
@@ -1262,50 +1069,6 @@ immutable. Fallback may select PostgreSQL before the first page, but a continuat
 never switches providers. Expiry or eviction returns `invalid_cursor`; a
 configured Redis failure returns `dependency_unavailable`. Restarting performs a
 new search.
-
-## Admin item materialization
-
-`POST /api/v1/admin/collections/{id}/materialize/{item_id}`
-
-This is a bridge-era admin repair path with no v2 port. Requires administrator
-authentication. Idempotently establishes or repairs virtual playback files,
-profile variants, and released episodes for a collection item.
-
-`files_created` and `files_existing` count distinct virtual file identities
-across the base item and released episode variants for this operation. A file
-identity is the `(owner installation, target library, virtual URI)` tuple.
-`episodes_materialized` counts distinct released episodes represented by the
-result, not the number of provider/profile files. Repeating the request reports
-the same episode count and moves files from `files_created` to
-`files_existing`.
-
-**Response** (200 OK):
-
-```json
-{
-  "success": true,
-  "content_id": "movie-tmdb-12345",
-  "media_type": "movie",
-  "files_created": 1,
-  "files_existing": 0,
-  "episodes_materialized": 0,
-  "message": "Materialized 1 virtual files (0 existing) for movie-tmdb-12345 (movie)"
-}
-```
-
-**Status Codes**:
-
-- `200 OK`: Item was successfully materialized or verified (idempotent).
-- `400 Bad Request`: Ineligible media type, incompatible target library, or virtual playback is disabled on the collection.
-- `401 Unauthorized`: Missing or invalid authentication token.
-- `403 Forbidden`: Authenticated user is not an administrator.
-- `404 Not Found`: Collection or item not found, or item is not a member of the collection.
-- `503 Service Unavailable`: Upstream virtual provider plugin is unavailable or misconfigured.
-
-**Sync staging**: during collection sync, newly prepared files stay hidden
-until membership acceptance commits. Removing a collection member only deletes
-catalog rows proven to be collection-created virtual state; ordinary
-metadata-only entries survive as catalog rows.
 
 ### Letter index
 
@@ -1461,29 +1224,6 @@ completed watch. `order=asc` puts the oldest latest watch first, and `desc`
 puts the newest first. Library/media-scope/search overlays retain this order
 before pagination. History does not currently support saved sort preferences.
 
-## Metadata-only seasons
-
-`listSeriesSeasons` lists every season row the metadata provider knows, not
-only seasons with library files. A season whose candidates were never
-materialized still appears, and its `episode_count` is the number of episodes
-the provider lists for it (aired or not). Its episode rows are returned
-without a `files` key, so clients render them as non-playable; a non-empty
-`files` array is the playability signal. Seasons with materialized episodes
-keep `episode_count` as the number of library-available episodes. The rule is
-the same for virtual and non-virtual libraries.
-
-Season watch state follows the same displayed set. A season with available
-episodes folds those episodes, including available episodes whose season link
-is missing; a metadata-only season folds its metadata episodes. Marking a
-season watched or unwatched updates that set, including a synthetic season ID
-of the form `<series>-S<number>` when no season row exists. A series can have
-persisted and metadata-only seasons together; the season list keeps persisted
-rows and synthesizes the missing season numbers from episode metadata.
-
-The frozen `/api/v1` catalog season routes share these handlers. A season with
-metadata now answers with its metadata rows instead of being omitted or
-answering `404` when it has no materialized files.
-
 ## Series and season completion
 
 A catalog item and a season can carry `availability`, with `have` and
@@ -1544,63 +1284,6 @@ while preserving metadata, viewer rollups, play targets and the `items` envelope
 Invalid booleans return `422 validation_failed`. The parameter does not apply
 to single-season or episode operations. Clients can use the capability to
 select text-only season lists; callers that omit it keep their existing behavior.
-
-## Episode release timing
-
-Episode rows (`listCatalogItemEpisodes`, `listSeasonEpisodes`) and episode
-details (`getCatalogItem` on an episode id) carry `release_state`:
-`upcoming` when the calendar `air_date` is after today (UTC), `released`
-otherwise, absent when the air date is unknown. The decision is one shared
-server-side classification (`catalog.ReleaseStateForAirDate`): no timezone
-conversion beyond the stored calendar date, and unknown or malformed dates
-fail open (absent) so missing metadata never bans playback.
-
-`GET /api/v2/capabilities/episode-release` is the feature-detection
-document for the member. Clients read it before branching on
-`release_state` and keep today's plain rendering when the capability is
-unavailable or the field is absent — an older server that omits the field
-must not gain the upcoming treatment. The release state is presentation
-timing only — it never gates playback. A future date with a playable file
-still plays; the badge says when it aired, not whether it is available.
-
-The bundled web client dims upcoming artwork, shows an `Upcoming · <date>`
-label in season lists, grids, the episode carousel, and the episode detail
-hero, and keeps detail navigation, Play eligibility, menus, and
-watched/progress state intact. Frozen v1 episode responses do not expose
-this field.
-
-Third-party Jellyfin clients need no change: `PremiereDate` already carries
-the air date, fileless episodes already map `LocationType: Virtual` with no
-`MediaSources` (so they show as unavailable), and no DTO field was added.
-First-party mobile clients need the same badge-or-plain rule when they adopt
-`release_state`: branch on the capability, never on client-side date
-inference; Play eligibility stays unchanged; unknown/absent states render
-as today.
-
-## Episode title cards
-
-An episode's title card is its still. Episode rows (`listCatalogItemEpisodes`,
-`listSeasonEpisodes`) carry it as `still_url` and `still_thumbhash`, falling
-back to the series' backdrop or poster when the episode has no still of its own
-(`episodeResponseShell`). Episode details (`getCatalogItem` on an episode id)
-are a different shape: the episode's still is served as `poster_url` with
-`poster_thumbhash`, and the series backdrop is served separately as
-`backdrop_url` with `backdrop_thumbhash`. Neither detail member falls back to
-the other; when the episode has no still, `poster_url` is absent and the series
-backdrop remains in `backdrop_url`. The bundled web client picks the hero
-artwork in its own order — `poster_url` (the still), then `backdrop_url`, then
-the season row's `still_url` — and pairs the chosen URL with that same source's
-thumbhash even when it has none. An administrator sets a title card through
-`POST /api/v2/admin/items/{episode_id}/images/apply` with `type: "titlecard"`
-(or `"still"`); see
-[Admin catalog API](admin-catalog-api.md#item-image-selection). The two names
-are the same artwork. A title card applied to a movie, series, or season is
-refused with `unsupported_image_type`, because only an episode has one. That
-refusal is an allowed bridge correctness fix: before `titlecard` aliased the
-still, the shared apply resolver fell through to `poster` and silently stored
-the image as that scope's poster. A silent wrong-type store was a bug, not a
-contract, so refusing it on the frozen bridge is a fix rather than a contract
-change; every request that was valid before keeps its image type and result.
 
 ## Extended item artwork
 
@@ -1678,24 +1361,6 @@ none of them changed titles. Restoring a restore set of format version 4 or olde
 those servers wrote, does the same for the collections it creates. Rules that named only libraries
 outside the collection's own matched nothing on those servers; they now draw from the libraries
 they name, as the admin preview always showed.
-
-## Collection virtual playback default
-
-Collection creation requests accept a `virtual_playback` boolean: the TMDB,
-Trakt, and MDBList import endpoints and the template-bundle apply endpoint. It
-controls whether items matched outside the selected libraries are kept as
-zero-storage virtual entries that Silo Virtual Library resolves at playback.
-
-The `/api/v2` import and template-apply request bodies expose the same optional
-`virtual_playback` boolean; omitting it defaults to on, and `false` opts out.
-
-`virtual_playback` defaults to on when the field is omitted, so third-party
-clients and creates-from-template get the same behavior as the first-party
-admin UI. An explicit `false` disables it and limits the collection to items
-present in the selected libraries; an explicit `true` keeps the default
-behavior. The default does not change the stored field's semantics: an enabled
-collection stores `virtual_playback: true`, and a disabled one omits the key,
-which every reader treats as false.
 
 ## Admin template list
 
@@ -2016,11 +1681,11 @@ An empty set retains the requested item's ID and an empty array.
 Seasons derived from episode groups use the same ownership and inheritance rules.
 If the optional theme lookup fails, item detail still succeeds and omits `themes`.
 
-| Method and path                                                          | Result                                                                                                           |
-| ------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------- |
-| `GET /api/v2/catalog/themes/capabilities`                                | Shared capability document with `delivery: routed`, `transcode`, `cluster_routing`, and `grant_lifetime_seconds` |
-| `POST /api/v2/catalog/items/{id}/themes/{theme_id}/playback`             | `url`, `expires_at`, `delivery`, and `content_type` for an authenticated login session and verified profile      |
-| `GET\|HEAD /api/v2/catalog/items/{id}/themes/{theme_id}/audio?token=...` | Theme audio this API node serves, authorized by the playback grant                                               |
+| Method and path | Result |
+| --- | --- |
+| `GET /api/v2/catalog/themes/capabilities` | Shared capability document with `delivery: routed`, `transcode`, `cluster_routing`, and `grant_lifetime_seconds` |
+| `POST /api/v2/catalog/items/{id}/themes/{theme_id}/playback` | `url`, `expires_at`, `delivery`, and `content_type` for an authenticated login session and verified profile |
+| `GET\|HEAD /api/v2/catalog/items/{id}/themes/{theme_id}/audio?token=...` | Theme audio this API node serves, authorized by the playback grant |
 
 The optional playback request body lists what the client decodes as
 `accepted_formats`, pairs of `container` and `audio_codec` (for example

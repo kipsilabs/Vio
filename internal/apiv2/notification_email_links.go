@@ -58,7 +58,7 @@ func registerNotificationEmailLinks(reg *Registry) {
 		if route.method == http.MethodPost {
 			op.RetrySafety = RetrySafetyNonRetryable
 		}
-		RegisterRaw(reg, RawOperation{Operation: op, Protocol: notificationEmailLinkProtocol, Reason: "Mail clients follow tokenized links without a Vio session; RFC 8058 clients POST form data and consume HTML."}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		RegisterRaw(reg, RawOperation{Operation: op, Protocol: notificationEmailLinkProtocol, Reason: "Mail clients follow tokenized links without a Silo session; RFC 8058 clients POST form data and consume HTML."}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set(notificationEmailLinkCacheHeader, notificationEmailLinkCachePolicy)
 			w.Header().Set("Referrer-Policy", "no-referrer")
 			svc := reg.deps.NotificationEmailLinks

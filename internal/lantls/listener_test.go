@@ -44,7 +44,7 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 		if time.Now().After(deadline) {
 			t.Fatalf("timed out waiting for %s", what)
 		}
-		time.Sleep(5 * time.Millisecond) //nolint:forbidigo // Polls the listener condition; the test harness has no ready channel.
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
@@ -56,7 +56,7 @@ func pinnedClient(pin string) *http.Client {
 		Timeout: 5 * time.Second,
 		Transport: &http.Transport{TLSClientConfig: &tls.Config{
 			NextProtos:         []string{"h2", alpnHTTP1},
-			InsecureSkipVerify: true,
+			InsecureSkipVerify: true, //nolint:gosec // VerifyPeerCertificate pins the key instead.
 			VerifyPeerCertificate: func(raw [][]byte, _ [][]*x509.Certificate) error {
 				if len(raw) == 0 {
 					return errors.New("no certificate")

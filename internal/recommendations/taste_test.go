@@ -71,7 +71,7 @@ func countRows(t *testing.T, pool *pgxpool.Pool, query string, args ...any) int 
 // vector, and drops its clusters and cached rows, leaving global rows and
 // other profiles alone. The row can still be marked stale, and similar-user
 // search neither finds the cleared profile nor runs for it.
-func TestClearTasteProfileKeepsTheRowAndDropsPersonalStatePostgres(t *testing.T) { //nolint:funlen,gocyclo // upstream TestClearTasteProfileKeepsTheRowAndDropsPersonalStatePostgres exceeds Vio's 100-line and complexity-30 limits; refactor tracked separately
+func TestClearTasteProfileKeepsTheRowAndDropsPersonalStatePostgres(t *testing.T) {
 	pool := newEngineTestPool(t)
 	ctx := t.Context()
 	repo := NewRepo(pool)
@@ -488,7 +488,7 @@ func newTasteTestEngine(pool *pgxpool.Pool) *Engine {
 // single long series is level 1, and a profile of watchlist adds, or of
 // titles with no embedding yet, is level 0. The taste-profile summary leaves
 // the count out.
-func TestRefreshCountsPositiveTitlesForTheLevelPostgres(t *testing.T) { //nolint:funlen // upstream TestRefreshCountsPositiveTitlesForTheLevelPostgres exceeds Vio's 100-line limit; refactor tracked separately
+func TestRefreshCountsPositiveTitlesForTheLevelPostgres(t *testing.T) {
 	pool := newEngineTestPool(t)
 	ctx := t.Context()
 	const prefix = "ttaste-level-"
@@ -680,5 +680,60 @@ func TestTasteProfileSummaryGenresComeFromTheClustersPostgres(t *testing.T) {
 	}
 	if want := []string{"Romance", "Horror", "Comedy", "Thriller"}; !slices.Equal(summary.TopGenres, want) {
 		t.Fatalf("top genres = %v, want %v", summary.TopGenres, want)
+	}
+}
+
+// A long history builds the taste profile from a bounded set of titles:
+// Not interested and non-positive titles never count, titles the profile
+// rated, favorited or watched come before watchlist-only ones, and within each
+// the heaviest come first.
+func TestRankedPositiveTitlesPutsRealHistoryFirst(t *testing.T) {
+	five := 5
+	signals := map[string]*canonicalWeightComponents{
+		"watched-light": {ImplicitWeight: 0.2},
+		"rated":         {Rating: &five, ExplicitWeight: 2},
+		"tie-b":         {ImplicitWeight: 1},
+		"tie-a":         {ImplicitWeight: 1},
+		"watchlist":     {IntentWeight: 9},
+		"marked":        {ImplicitWeight: 9, NotInterested: true},
+		"disliked":      {ImplicitWeight: -1},
+	}
+	want := []string{"rated", "tie-a", "tie-b", "watched-light", "watchlist"}
+	if got := rankedPositiveTitles(signals); !slices.Equal(got, want) {
+		t.Errorf("rankedPositiveTitles = %v, want %v", got, want)
+	}
+}
+
+// The cap counts titles with an embedding: titles without one are passed
+// over, and reading continues until the cap is filled or the titles run out.
+func TestFirstEmbeddedTitlesSkipsTitlesWithoutAnEmbedding(t *testing.T) {
+	stored := map[string][]float32{"b": {1}, "d": {1}, "e": {1}, "f": {1}}
+	fetch := func(ids []string) (map[string][]float32, error) {
+		out := map[string][]float32{}
+		for _, id := range ids {
+			if v, ok := stored[id]; ok {
+				out[id] = v
+			}
+		}
+		return out, nil
+	}
+	ranked := []string{"a", "b", "c", "d", "e", "f"}
+	tests := []struct {
+		limit int
+		want  []string
+	}{
+		{limit: 2, want: []string{"b", "d"}},
+		{limit: 3, want: []string{"b", "d", "e"}},
+		{limit: 10, want: []string{"b", "d", "e", "f"}},
+		{limit: 0, want: []string{}},
+	}
+	for _, tt := range tests {
+		got, err := firstEmbeddedTitles(ranked, tt.limit, fetch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ids := slices.Sorted(maps.Keys(got)); !slices.Equal(ids, tt.want) {
+			t.Errorf("firstEmbeddedTitles(limit %d) = %v, want %v", tt.limit, ids, tt.want)
+		}
 	}
 }

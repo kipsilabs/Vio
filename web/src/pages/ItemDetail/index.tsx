@@ -161,25 +161,13 @@ export default function ItemDetail() {
   const { id } = useParams<{ id: string }>();
   const [searchParams] = useSearchParams();
   const libraryId = parseOptionalLibraryId(searchParams.get("libraryId"));
-  // The version the viewer explicitly picked on this page (or their remembered
-  // pick on another visit). The leaf content components report it up; it is
-  // sent with the detail read so the server applies the same selection and
-  // schedules that row's inventory probe on pick rather than on player open.
-  const [selectedFileId, setSelectedFileId] = useState<number | null>(null);
-  // Navigating to another item reuses this component; the previous item's file
-  // id must not narrow the new item's read.
-  const [selectionContentID, setSelectionContentID] = useState(id);
-  if (selectionContentID !== id) {
-    setSelectionContentID(id);
-    setSelectedFileId(null);
-  }
   const {
     data: cachedItem,
     isLoading: loading,
     isFetching,
     error: itemError,
     refetch,
-  } = useCatalogItemDetail(id, libraryId, selectedFileId ?? undefined);
+  } = useCatalogItemDetail(id, libraryId);
   const itemNotFound = isNotFoundProblem(itemError);
   // A 404 outranks cached detail. A refetch that finds the item gone, or out
   // of the viewer's reach, leaves the old item in the cache, and that page
@@ -275,9 +263,8 @@ export default function ItemDetail() {
       return (
         <MovieContent
           item={item as ItemDetail & { type: "movie" }}
+          libraryId={libraryId}
           showAdvisoryAge={showAdvisoryAge}
-          onStaleVersion={() => void refetch()}
-          onSelectedFileIdChange={setSelectedFileId}
         />
       );
     case "series":
@@ -292,12 +279,7 @@ export default function ItemDetail() {
       return <SeasonContent item={item as ItemDetail & { type: "season" }} libraryId={libraryId} />;
     case "episode":
       return (
-        <EpisodeContent
-          item={item as ItemDetail & { type: "episode" }}
-          libraryId={libraryId}
-          onStaleVersion={() => void refetch()}
-          onSelectedFileIdChange={setSelectedFileId}
-        />
+        <EpisodeContent item={item as ItemDetail & { type: "episode" }} libraryId={libraryId} />
       );
     case "audiobook":
       return (

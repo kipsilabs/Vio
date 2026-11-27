@@ -1,4 +1,4 @@
-// Package middleware provides HTTP middleware for the Vio API,
+// Package middleware provides HTTP middleware for the Silo API,
 // including authentication and authorization.
 package middleware
 
@@ -311,14 +311,6 @@ type HouseholdProfileRequirement func(ctx context.Context, userID int) (bool, er
 // boundary for well-behaved clients, not a defense against the account
 // holder themselves. The viewer gate that runs before it on the admin route
 // groups verifies a PIN-locked declared profile's X-Profile-Token.
-// RequireActingAdmin enforces the admin role plus the household policy that
-// the acting profile be the account's primary profile. The fork's retained
-// administrator routes use it; v2 groups build RequireActingAdminWith from
-// live config.
-func RequireActingAdmin(checkPrimary PrimaryProfileChecker, requiresProfile HouseholdProfileRequirement) func(http.Handler) http.Handler {
-	return RequireActingAdminWith(NewActingAdminDecider(checkPrimary, requiresProfile))
-}
-
 func RequireActingAdminWith(decide ActingAdminDecider) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

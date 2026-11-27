@@ -48,7 +48,7 @@ func directDownloadTestHandler(t *testing.T, f *directDownloadFixture) http.Hand
 	t.Helper()
 	deps, _ := catalogDeps(t)
 	h := handlers.NewDownloadHandler(f)
-	deps.DirectDownloads = &DirectDownloadHandlers{Original: http.HandlerFunc(h.HandleDirectDownloadV2), Proxy: http.HandlerFunc(h.HandleDirectDownloadViaProxyV2)}
+	deps.DirectDownloads = &DirectDownloadHandlers{Original: http.HandlerFunc(h.HandleDirectDownload), Proxy: http.HandlerFunc(h.HandleDirectDownloadViaProxy)}
 	return newTestHandler(t, deps)
 }
 func TestDirectDownloadDelivery(t *testing.T) {

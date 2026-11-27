@@ -23,11 +23,12 @@ func ClientLabel(name string) string {
 	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "":
 		return clientNone
-	case "silo web":
+	case "silo web", "vio web":
 		return clientWeb
-	case "silo apple", "silo apple tv", "silo ios", "silo tvos", "silo macos", "silo ipados":
+	case "silo apple", "silo apple tv", "silo ios", "silo tvos", "silo macos", "silo ipados",
+		"vio apple", "vio apple tv", "vio ios", "vio tvos", "vio macos", "vio ipados":
 		return clientApple
-	case "silo android", "silo android tv":
+	case "silo android", "silo android tv", "vio android", "vio android tv":
 		return clientAndroid
 	default:
 		return clientOther

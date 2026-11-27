@@ -281,7 +281,7 @@ func normalizeImageCacheJobInput(in EnqueueImageCacheJobInput) (EnqueueImageCach
 	return in, true
 }
 
-func (r *ImageCacheJobRepository) enqueueBatchChunk(ctx context.Context, inputs []EnqueueImageCacheJobInput, requeueSucceeded bool, hold time.Duration, queued *[]EnqueueImageCacheJobInput) (int, error) { //nolint:funlen // upstream enqueueBatchChunk exceeds Vio's 100-line limit; refactor tracked separately
+func (r *ImageCacheJobRepository) enqueueBatchChunk(ctx context.Context, inputs []EnqueueImageCacheJobInput, requeueSucceeded bool, hold time.Duration, queued *[]EnqueueImageCacheJobInput) (int, error) {
 	var sql strings.Builder
 	args := make([]any, 0, len(inputs)*11+2)
 	// Arg 1 is the hold. Rows re-queued by the conflict branch below take the
@@ -539,26 +539,26 @@ func (r *ImageCacheJobRepository) retryTargetNow(ctx context.Context, targetCont
 	// immediate retry, it does not reset the retry budget a background worker
 	// already spent on artwork that keeps failing. Failed rows are requeued
 	// regardless of their timer; queued rows are only pulled forward while
-	// they are still deferred, or carry a missing-storage deferral to start
-	// over, so the reset stays a small, one-off write. CacheTargetArtwork runs
-	// this once per refresh, not once per poll.
+	// they are still deferred, or carry a missing-storage or full-store
+	// deferral to start over, so the reset stays a small, one-off write.
+	// CacheTargetArtwork runs this once per refresh, not once per poll.
 	query := `
 		UPDATE metadata_image_cache_jobs
 		SET status = 'queued',
 			next_attempt_at = NOW(),
 			locked_at = NULL,
 			locked_by = '',
-			-- A deferral for missing storage starts over, so a refresh on a
-			-- server without the mount does not push it to the long repeat
+			-- A deferral for missing storage, or for a full artwork store,
+			-- starts over, so a refresh does not push it to the long repeat
 			-- delay.
-			last_error = CASE WHEN starts_with(last_error, $2) THEN '' ELSE last_error END,
+			last_error = CASE WHEN starts_with(last_error, $2) OR last_error = $3 THEN '' ELSE last_error END,
 			completed_at = NULL,
 			updated_at = NOW()
 		WHERE ` + imageCacheTargetScope("$1") + `
 		  AND status IN ('queued', 'failed')
-		  AND (status = 'failed' OR next_attempt_at > NOW() OR starts_with(last_error, $2))
+		  AND (status = 'failed' OR next_attempt_at > NOW() OR starts_with(last_error, $2) OR last_error = $3)
 		  AND NOT ` + heldLocalDiscoverySQL
-	_, err := r.pool.Exec(ctx, query, targetContentID, localImageStorageUnavailable)
+	_, err := r.pool.Exec(ctx, query, targetContentID, localImageStorageUnavailable, imageCacheStorageFullError)
 	if err != nil {
 		return fmt.Errorf("retrying target metadata image cache jobs: %w", err)
 	}
@@ -723,7 +723,7 @@ func (r *ImageCacheJobRepository) MarkFailed(ctx context.Context, id int64, atte
 }
 
 // RequeueClaimed returns claimed-but-unprocessed jobs to the queue without
-// burning a retry attempt. Used when a run is canceled before its workers
+// burning a retry attempt. Used when a run is cancelled before its workers
 // start, so the jobs do not sit locked until the lease expires.
 func (r *ImageCacheJobRepository) RequeueClaimed(ctx context.Context, ids []int64, workerID string) error {
 	if r == nil || r.pool == nil || len(ids) == 0 {

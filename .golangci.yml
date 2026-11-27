@@ -205,11 +205,6 @@ linters:
     gomoddirectives:
       # Allow local replace directives.
       replace-local: true
-      # Upstream's networking stack is vendored through these two forks; the
-      # module graph resolves them for every build.
-      replace-allow-list:
-        - github.com/quic-go/quic-go
-        - tailscale.com
 
     # tagliatelle: 1046 findings; inactive.
     # tagliatelle:
@@ -349,6 +344,10 @@ linters:
       errorf: true
       asserts: true
       comparison: true
+
+    goconst:
+      min-len: 3
+      min-occurrences: 3
 
     misspell:
       locale: US

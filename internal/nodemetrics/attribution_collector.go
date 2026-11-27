@@ -7,17 +7,17 @@ import (
 )
 
 var (
-	descResourceAvailable         = prometheus.NewDesc("vio_resource_sample_available", "Whether the sampler has published a supported resource sample.", nil, nil)
-	descResourceTimestamp         = prometheus.NewDesc("vio_resource_sample_timestamp_seconds", "Unix timestamp at the start of the last completed resource sample.", nil, nil)
-	descResourceStale             = prometheus.NewDesc("vio_resource_sample_stale", "Whether the last completed resource sample is older than three sampling intervals or absent.", nil, nil)
-	descResourceDuration          = prometheus.NewDesc("vio_resource_sample_duration_seconds", "Duration of the last completed resource sampling pass.", nil, nil)
-	descResourceSource            = prometheus.NewDesc("vio_resource_source_available", "Whether a current reading exists for the named resource and measurement scope.", []string{"resource", "scope", "source"}, nil)
-	descResourceDroppedDisks      = prometheus.NewDesc("vio_resource_disk_roots_dropped", "Configured disk roots omitted by the bounded sampler.", nil, nil)
-	descDiskAvailable             = prometheus.NewDesc("vio_resource_disk_available", "Whether a mount has ever been measured successfully; consult streamapp_node_disk_stale for freshness.", []string{diskMountLabel}, nil)
-	descDiskInodesUsed            = prometheus.NewDesc("vio_resource_disk_inodes_used", "Inodes in use on a sampled mount; consult streamapp_node_disk_stale for freshness.", []string{diskMountLabel}, nil)
-	descDiskInodesTotal           = prometheus.NewDesc("vio_resource_disk_inodes_total", "Inodes on a sampled mount; consult streamapp_node_disk_stale for freshness.", []string{diskMountLabel}, nil)
-	descProcessRead               = prometheus.NewDesc("vio_process_io_read_bytes_total", "Bytes fetched from storage according to Linux procfs for Vio and its waited-for children.", nil, nil)
-	descProcessWrite              = prometheus.NewDesc("vio_process_io_write_bytes_total", "Bytes submitted to storage according to Linux procfs for Vio and its waited-for children.", nil, nil)
+	descResourceAvailable         = prometheus.NewDesc("silo_resource_sample_available", "Whether the sampler has published a supported resource sample.", nil, nil)
+	descResourceTimestamp         = prometheus.NewDesc("silo_resource_sample_timestamp_seconds", "Unix timestamp at the start of the last completed resource sample.", nil, nil)
+	descResourceStale             = prometheus.NewDesc("silo_resource_sample_stale", "Whether the last completed resource sample is older than three sampling intervals or absent.", nil, nil)
+	descResourceDuration          = prometheus.NewDesc("silo_resource_sample_duration_seconds", "Duration of the last completed resource sampling pass.", nil, nil)
+	descResourceSource            = prometheus.NewDesc("silo_resource_source_available", "Whether a current reading exists for the named resource and measurement scope.", []string{"resource", "scope", "source"}, nil)
+	descResourceDroppedDisks      = prometheus.NewDesc("silo_resource_disk_roots_dropped", "Configured disk roots omitted by the bounded sampler.", nil, nil)
+	descDiskAvailable             = prometheus.NewDesc("silo_resource_disk_available", "Whether a mount has ever been measured successfully; consult streamapp_node_disk_stale for freshness.", []string{diskMountLabel}, nil)
+	descDiskInodesUsed            = prometheus.NewDesc("silo_resource_disk_inodes_used", "Inodes in use on a sampled mount; consult streamapp_node_disk_stale for freshness.", []string{diskMountLabel}, nil)
+	descDiskInodesTotal           = prometheus.NewDesc("silo_resource_disk_inodes_total", "Inodes on a sampled mount; consult streamapp_node_disk_stale for freshness.", []string{diskMountLabel}, nil)
+	descProcessRead               = prometheus.NewDesc("silo_process_io_read_bytes_total", "Bytes fetched from storage according to Linux procfs for Silo and its waited-for children.", nil, nil)
+	descProcessWrite              = prometheus.NewDesc("silo_process_io_write_bytes_total", "Bytes submitted to storage according to Linux procfs for Silo and its waited-for children.", nil, nil)
 	descCgroupCPUUsage            = cgroupDesc("cpu_usage_seconds_total", "CPU time consumed by the sampled cgroup.")
 	descCgroupCPUQuota            = cgroupDesc("cpu_quota_cores", "Effective visible CPU capacity of the sampled cgroup, including a tighter cpuset.")
 	descCgroupCPUThrottle         = cgroupDesc("cpu_throttled_seconds_total", "Time the sampled cgroup has been CPU throttled.")
@@ -42,10 +42,10 @@ var (
 )
 
 func cgroupDesc(name, help string) *prometheus.Desc {
-	return prometheus.NewDesc("vio_cgroup_"+name, help, []string{"version", "scope"}, nil)
+	return prometheus.NewDesc("silo_cgroup_"+name, help, []string{"version", "scope"}, nil)
 }
 func childDesc(name, help string) *prometheus.Desc {
-	return prometheus.NewDesc("vio_resource_children_"+name, help, []string{"workload"}, nil)
+	return prometheus.NewDesc("silo_resource_children_"+name, help, []string{"workload"}, nil)
 }
 func boolMetric(value bool) float64 {
 	if value {

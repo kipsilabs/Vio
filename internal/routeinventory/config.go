@@ -128,12 +128,6 @@ func DefaultConfig(root string) Config {
 				Reason: "Audiobookshelf-protocol compatibility listener; an external wire contract, " +
 					"out of scope for the native v2 migration",
 			},
-			{
-				File: "internal/remotestream/relay.go",
-				Func: "Relay.start",
-				Reason: "Streaming relay mux; internal media relay, " +
-					"not part of the native API surface",
-			},
 		},
 	}
 }

@@ -25,15 +25,7 @@ const (
 	StatusRunning   = "running"
 	StatusCompleted = "completed"
 	StatusFailed    = "failed"
-	// StatusCancelled is the durable status written for a canceled run. The
-	// DB CHECK accepts this spelling and the legacy spelling (see
-	// StatusCancelledLegacy) so a row written by an older build stays
-	// readable; see migration 20260924140423_allow_canceled_scan_runs.
-	StatusCancelled = "canceled"
-	// StatusCancelledLegacy is the upstream/legacy single-L spelling the DB
-	// still accepts. It is enumerated on the v2 wire during the transition so
-	// a client filtering by the old value can still find pre-change rows.
-	StatusCancelledLegacy = "cancelled" //nolint:misspell // legacy column spelling
+	StatusCancelled = "cancelled"
 
 	TriggerAdminItemRefresh    = "admin_item_refresh"
 	TriggerAdminLibraryRefresh = "admin_library_refresh"

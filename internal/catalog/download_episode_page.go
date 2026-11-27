@@ -37,8 +37,7 @@ func (r *EpisodeRepository) ListDownloadEpisodesPage(ctx context.Context, series
 		return nil, false, fmt.Errorf("invalid episode page position")
 	}
 	args := []any{seriesID}
-	query := `SELECT ` + episodeColumns + ` FROM episodes WHERE series_id=$1 AND ` + episodeAvailabilityPredicate +
-		` AND ` + EpisodeAliasExclusionSQL("episodes.content_id")
+	query := `SELECT ` + episodeColumns + ` FROM episodes WHERE series_id=$1 AND ` + episodeAvailabilityPredicate
 	if seasonNumber != nil {
 		args = append(args, *seasonNumber)
 		query += fmt.Sprintf(" AND season_number=$%d", len(args))

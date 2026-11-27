@@ -15,37 +15,16 @@ type Config struct {
 	MutexFraction int
 }
 
-// debugListenEnv is the loopback profiler bind address. Vio renamed the knob
-// to VIO_DEBUG_LISTEN; the legacy SILO_DEBUG_LISTEN name still works.
-const debugListenEnv = "VIO_DEBUG_LISTEN"
-const debugListenEnvLegacy = "SILO_DEBUG_LISTEN"
-
-// debugBlockRateEnv and debugMutexFractionEnv tune contention sampling; same
-// VIO-first, SILO-fallback rule as debugListenEnv.
-const debugBlockRateEnv = "VIO_DEBUG_BLOCK_RATE"
-const debugBlockRateEnvLegacy = "SILO_DEBUG_BLOCK_RATE"
-const debugMutexFractionEnv = "VIO_DEBUG_MUTEX_FRACTION"
-const debugMutexFractionEnvLegacy = "SILO_DEBUG_MUTEX_FRACTION"
-
-// debugGetenv reads a VIO_* knob with SILO_* fallback through the getenv
-// indirection (tests pass map lookups).
-func debugGetenv(getenv func(string) string, name, legacy string) string {
-	if v := getenv(name); v != "" {
-		return v
-	}
-	return getenv(legacy)
-}
-
 // LoadConfig validates literal loopback addresses without resolving DNS. Zero
 // ports are reserved for tests that call startListener directly.
 func LoadConfig(getenv func(string) string) (Config, error) {
-	c := Config{Listen: debugGetenv(getenv, debugListenEnv, debugListenEnvLegacy)}
+	c := Config{Listen: getenv("SILO_DEBUG_LISTEN")}
 	var err error
-	c.BlockRate, err = samplingSetting(debugGetenv(getenv, debugBlockRateEnv, debugBlockRateEnvLegacy), debugBlockRateEnv, 1_000_000, 1_000_000_000)
+	c.BlockRate, err = samplingSetting(getenv("SILO_DEBUG_BLOCK_RATE"), "SILO_DEBUG_BLOCK_RATE", 1_000_000, 1_000_000_000)
 	if err != nil {
 		return Config{}, err
 	}
-	c.MutexFraction, err = samplingSetting(debugGetenv(getenv, debugMutexFractionEnv, debugMutexFractionEnvLegacy), debugMutexFractionEnv, 100, 1_000_000)
+	c.MutexFraction, err = samplingSetting(getenv("SILO_DEBUG_MUTEX_FRACTION"), "SILO_DEBUG_MUTEX_FRACTION", 100, 1_000_000)
 	if err != nil {
 		return Config{}, err
 	}
@@ -69,12 +48,12 @@ func samplingSetting(raw, name string, min, max int) (int, error) {
 func (c Config) validate() error {
 	if c.Listen == "" {
 		if c.BlockRate != 0 || c.MutexFraction != 0 {
-			return fmt.Errorf("contention sampling requires %s", debugListenEnv)
+			return fmt.Errorf("contention sampling requires SILO_DEBUG_LISTEN")
 		}
 		return nil
 	}
 	if !loopbackAuthority(c.Listen) {
-		return fmt.Errorf("%s must be a literal loopback IP and port from 1 to 65535", debugListenEnv)
+		return fmt.Errorf("SILO_DEBUG_LISTEN must be a literal loopback IP and port from 1 to 65535")
 	}
 	if c.BlockRate != 0 && (c.BlockRate < 1_000_000 || c.BlockRate > 1_000_000_000) {
 		return fmt.Errorf("invalid block sampling rate")

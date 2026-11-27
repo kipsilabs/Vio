@@ -69,8 +69,8 @@ docs/superpowers/
 /.claude/
 # Skills may carry per-developer state next to their instructions (the global
 # *.local.md rule above covers notes; these cover tokens and run state).
-**/.secrets/
-**/.state/
+**/.secrets
+**/.state
 .cursor/
 .superpowers/
 .codex/
@@ -81,7 +81,6 @@ logs/
 demo/
 docker-compose.dev.yml
 docker-compose.local.yml
-.slim/deepwork/
 # Local-only deployment override (unpublishes bundled redis/postgres host
 # ports via `ports: !override []`). Kept out of git so a rebase from main
 # never disturbs it and it never lands in a PR; its absence once exposed
@@ -93,4 +92,3 @@ docker-compose.local.yml
 output/
 /settingsgen
 /playbackfixtures
-.opencode/

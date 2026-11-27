@@ -17,6 +17,7 @@ import type {
   Person,
   PlaybackVariant,
   ResolvedSection,
+  SectionCollectionCard,
   Season,
   SeasonUserData,
   SectionItem,
@@ -66,6 +67,8 @@ export function catalogItemFromV2(item: CatalogItemV2): CatalogCardItem {
     advisory_source: item.advisory_source ?? "",
     status: item.status as CatalogCardItem["status"],
     show_status: item.show_status,
+    episode_labels: item.episode_labels,
+    air_date: item.air_date,
     rating_imdb: item.rating_imdb ?? null,
     rating_tmdb: item.rating_tmdb,
     rating_rt_critic: item.rating_rt_critic,
@@ -87,9 +90,11 @@ export function catalogItemFromV2(item: CatalogItemV2): CatalogCardItem {
     release_date: item.release_date,
     last_air_date: item.last_air_date,
     overlay_summary: item.overlay_summary,
+    availability: item.availability,
     sort_metrics: item.sort_metrics,
     badges: item.badges,
     user_state: item.user_state,
+    authors: item.authors,
     upcoming_event: item.upcoming_event
       ? {
           ...item.upcoming_event,
@@ -100,6 +105,23 @@ export function catalogItemFromV2(item: CatalogItemV2): CatalogCardItem {
     manga_volume_count: item.manga_volume_count,
     pending_translation_language: item.pending_translation_language,
     machine_translated_fields: item.machine_translated_fields,
+  };
+}
+
+/** A v2 collection card, as rows of collections and a title's "Also in" row carry it. */
+export function sectionCollectionCardFromV2(
+  card: components["schemas"]["SectionCollectionCard"],
+): SectionCollectionCard {
+  return {
+    id: card.id,
+    source: card.source,
+    title: card.title,
+    poster_url: card.poster_url,
+    poster_thumbhash: card.poster_thumbhash,
+    poster_is_collage: card.poster_is_collage,
+    item_count: card.item_count,
+    ...(card.library_id !== undefined && { library_id: Number(card.library_id) }),
+    ...(card.creator_profile_id && { creator_profile_id: card.creator_profile_id }),
   };
 }
 
@@ -114,6 +136,10 @@ export function sectionFromV2(section: SectionV2): ResolvedSection {
     is_custom: section.is_custom,
     customized: section.customized,
     items: section.items.map(catalogItemFromV2),
+    ...(section.collections?.length && {
+      collections: section.collections.map(sectionCollectionCardFromV2),
+    }),
+    ...(section.has_more && { has_more: true }),
     ...sectionTitleKey(section),
   };
 }
@@ -266,7 +292,6 @@ export function catalogItemDetailFromV2(item: CatalogItemDetailV2): ItemDetail {
   return {
     themes: item.themes,
     content_id: item.content_id,
-    has_virtual_source: item.has_virtual_source,
     play_content_id: item.play_content_id,
     play_season_number: item.play_season_number,
     type: item.type as ItemDetail["type"],
@@ -301,6 +326,7 @@ export function catalogItemDetailFromV2(item: CatalogItemDetailV2): ItemDetail {
     release_date: item.release_date ?? null,
     first_air_date: item.first_air_date ?? null,
     show_status: item.show_status,
+    episode_labels: item.episode_labels,
     last_air_date: item.last_air_date ?? null,
     air_time: item.air_time ?? null,
     air_timezone: item.air_timezone ?? null,
@@ -318,10 +344,6 @@ export function catalogItemDetailFromV2(item: CatalogItemDetailV2): ItemDetail {
     episode_number: item.episode_number ?? null,
     episode_count: item.episode_count ?? null,
     air_date: item.air_date ?? null,
-    release_state:
-      item.release_state === "upcoming" || item.release_state === "released"
-        ? item.release_state
-        : undefined,
     is_specials: item.is_specials,
     user_data: item.user_data ? watchRollupFromV2(item.user_data) : undefined,
     user_state: item.user_state,
@@ -347,7 +369,6 @@ export function catalogItemDetailFromV2(item: CatalogItemDetailV2): ItemDetail {
     audiobook: item.audiobook,
     ebook: item.ebook,
     manga: item.manga,
-    collections: item.collections,
   };
 }
 
@@ -372,7 +393,6 @@ export function episodeFromV2(episode: EpisodeV2): EpisodeListItem {
     title: episode.title,
     overview: episode.overview ?? "",
     air_date: episode.air_date ?? null,
-    release_state: episode.release_state ?? undefined,
     runtime: episode.runtime,
     imdb_id: episode.imdb_id,
     tmdb_id: episode.tmdb_id,
@@ -401,6 +421,7 @@ export function seasonFromV2(season: SeasonV2): Season {
     poster_url: season.poster_url ?? "",
     poster_thumbhash: season.poster_thumbhash ?? "",
     user_data: season.user_data ? watchRollupFromV2(season.user_data) : undefined,
+    availability: season.availability,
     machine_translated_fields: season.machine_translated_fields,
   };
 }

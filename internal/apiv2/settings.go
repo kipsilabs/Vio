@@ -21,14 +21,8 @@ import (
 // deviceIDHeader is the device header the v1 settings routes read
 // (handlers.DeviceMetadataFromHeaders reads it and the name/platform pair);
 // a device is not an identity the gates resolve, so the three stay declared
-// parameters rather than context values. Vio emits X-Vio-Device-Id; the
-// legacy X-Silo-Device-Id spelling is accepted on ingest (see
-// rejectMalformedDeviceHeader).
-const deviceIDHeader = "X-Vio-Device-Id"
-
-// legacyDeviceIDHeader is the pre-rebrand device header spelling, accepted on
-// ingest only and never emitted.
-const legacyDeviceIDHeader = "X-Silo-Device-Id"
+// parameters rather than context values.
+const deviceIDHeader = "X-Silo-Device-Id"
 
 // fieldDeviceID is the seam's name for a rejected device id; it is rendered
 // at the header the framework declared, not as a body member.
@@ -123,9 +117,9 @@ type EffectiveSubtitleAppearanceOutput struct {
 // mutation; the id is required because an override has no meaning without a
 // device.
 type DeviceHeaders struct {
-	DeviceID       string `header:"X-Vio-Device-Id" required:"true" maxLength:"128" doc:"The client's stable device identifier" example:"iphone-1"`
-	DeviceName     string `header:"X-Vio-Device-Name" maxLength:"120" doc:"Optional display name recorded on the device registry" example:"Living room"`
-	DevicePlatform string `header:"X-Vio-Device-Platform" maxLength:"40" doc:"Optional platform recorded on the device registry" example:"iOS"`
+	DeviceID       string `header:"X-Silo-Device-Id" required:"true" maxLength:"128" doc:"The client's stable device identifier" example:"iphone-1"`
+	DeviceName     string `header:"X-Silo-Device-Name" maxLength:"120" doc:"Optional display name recorded on the device registry" example:"Living room"`
+	DevicePlatform string `header:"X-Silo-Device-Platform" maxLength:"40" doc:"Optional platform recorded on the device registry" example:"iOS"`
 }
 
 func (d DeviceHeaders) metadata() handlers.DeviceMetadata {
@@ -136,14 +130,14 @@ func (d DeviceHeaders) metadata() handlers.DeviceMetadata {
 // request. The device headers are optional here: without a device only the
 // profile-wide value can apply.
 type EffectiveSubtitleAppearanceInput struct {
-	DeviceID       string `header:"X-Vio-Device-Id" maxLength:"128" doc:"The client's stable device identifier; absent resolves the profile-wide value" example:"iphone-1"`
-	DeviceName     string `header:"X-Vio-Device-Name" maxLength:"120" doc:"Optional display name recorded on the device registry" example:"Living room"`
-	DevicePlatform string `header:"X-Vio-Device-Platform" maxLength:"40" doc:"Optional platform recorded on the device registry" example:"iOS"`
+	DeviceID       string `header:"X-Silo-Device-Id" maxLength:"128" doc:"The client's stable device identifier; absent resolves the profile-wide value" example:"iphone-1"`
+	DeviceName     string `header:"X-Silo-Device-Name" maxLength:"120" doc:"Optional display name recorded on the device registry" example:"Living room"`
+	DevicePlatform string `header:"X-Silo-Device-Platform" maxLength:"40" doc:"Optional platform recorded on the device registry" example:"iOS"`
 }
 
 // SubtitleAppearanceDeviceOverride is the value a device stores.
 type SubtitleAppearanceDeviceOverride struct {
-	Value string `json:"value" required:"true" doc:"The subtitle appearance as a JSON document; the server validates only that it is JSON" example:"{\"fontSize\":\"xxlarge\"}"`
+	Value string `json:"value" required:"true" doc:"The subtitle appearance as a JSON document; it must satisfy the settings contract's subtitle-appearance schema" example:"{\"fontSize\":\"xxlarge\"}"`
 }
 
 // SubtitleAppearanceDeviceOverrideInput is the
@@ -488,8 +482,7 @@ func (reg *Registry) getEffectiveSubtitleAppearance(ctx context.Context, in *Eff
 	return &EffectiveSubtitleAppearanceOutput{Body: body}, nil
 }
 
-// updateSubtitleAppearanceDeviceOverride stores the override through the
-// same path as v1 PUT /settings/device/subtitle_appearance and answers with
+// updateSubtitleAppearanceDeviceOverride stores the override and answers with
 // the resolved appearance, the canonical representation after the write.
 func (reg *Registry) updateSubtitleAppearanceDeviceOverride(ctx context.Context, in *SubtitleAppearanceDeviceOverrideInput) (*EffectiveSubtitleAppearanceOutput, error) {
 	if reg.deps.Settings == nil {
@@ -656,12 +649,8 @@ func pluginSettingsInstallationFromView(v handlers.PluginUserSettingsView) Plugi
 // --- Setting values: the explicit and effective values of the contract ------
 
 // clientFamilyHeader is the header v1 reads a profile_client scope's family
-// from; the same header names it here. Vio emits X-Vio-Client-Family; the
-// legacy X-Silo-Client-Family spelling is accepted on ingest.
-const clientFamilyHeader = "X-Vio-Client-Family"
-
-// legacyClientFamilyHeader is the pre-rebrand spelling, ingest only.
-const legacyClientFamilyHeader = "X-Silo-Client-Family"
+// from; the same header names it here.
+const clientFamilyHeader = "X-Silo-Client-Family"
 
 // JSONValue is a setting value on the wire: any JSON document. The settings
 // contract's value_schema for the key fixes its shape, so this document does
@@ -722,10 +711,10 @@ type SettingScopeQuery struct {
 	DeviceID       string `query:"device_id" maxLength:"128" doc:"Another registered device of the profile whose profile_device value to address; absent means the declared device" example:"tv-1"`
 	LibraryID      ID     `query:"library_id" doc:"The library a profile_library value belongs to" example:"3"`
 	SeriesID       string `query:"series_id" maxLength:"128" doc:"The series a profile_series value belongs to" example:"tv:12345"`
-	ClientFamily   string `header:"X-Vio-Client-Family" enum:"tv,mobile,tablet,desktop,web" doc:"The client family a profile_client value belongs to" example:"tv"`
-	DeviceHeader   string `header:"X-Vio-Device-Id" maxLength:"128" doc:"The client's stable device identifier; the profile_device scope stores against it when device_id is absent" example:"iphone-1"`
-	DeviceName     string `header:"X-Vio-Device-Name" maxLength:"120" doc:"Optional display name recorded on the device registry" example:"Living room"`
-	DevicePlatform string `header:"X-Vio-Device-Platform" maxLength:"40" doc:"Optional platform recorded on the device registry" example:"iOS"`
+	ClientFamily   string `header:"X-Silo-Client-Family" enum:"tv,mobile,tablet,desktop,web" doc:"The client family a profile_client value belongs to" example:"tv"`
+	DeviceHeader   string `header:"X-Silo-Device-Id" maxLength:"128" doc:"The client's stable device identifier; the profile_device scope stores against it when device_id is absent" example:"iphone-1"`
+	DeviceName     string `header:"X-Silo-Device-Name" maxLength:"120" doc:"Optional display name recorded on the device registry" example:"Living room"`
+	DevicePlatform string `header:"X-Silo-Device-Platform" maxLength:"40" doc:"Optional platform recorded on the device registry" example:"iOS"`
 }
 
 func (q SettingScopeQuery) identity(ctx context.Context, key string) handlers.SettingIdentityRequest {
@@ -869,10 +858,10 @@ type EffectiveSettingsQuery struct {
 	DeviceID       string   `query:"device_id" maxLength:"128" doc:"Another registered device of the profile to resolve for; absent means the declared device" example:"tv-1"`
 	LibraryIDs     []ID     `query:"library_ids,explode" maxItems:"200" doc:"Libraries whose profile_library values take part, one library_ids parameter per id" example:"[\"3\"]"`
 	SeriesIDs      []string `query:"series_ids,explode" maxItems:"200" doc:"Series whose profile_series values take part, one series_ids parameter per id" example:"[\"tv:12345\"]"`
-	ClientFamily   string   `header:"X-Vio-Client-Family" enum:"tv,mobile,tablet,desktop,web" doc:"The client family whose profile_client values take part; optional, and absence skips the profile_client layer" example:"tv"`
-	DeviceHeader   string   `header:"X-Vio-Device-Id" maxLength:"128" doc:"The client's stable device identifier; its profile_device values take part" example:"iphone-1"`
-	DeviceName     string   `header:"X-Vio-Device-Name" maxLength:"120" doc:"Optional display name recorded on the device registry" example:"Living room"`
-	DevicePlatform string   `header:"X-Vio-Device-Platform" maxLength:"40" doc:"Optional platform recorded on the device registry" example:"iOS"`
+	ClientFamily   string   `header:"X-Silo-Client-Family" enum:"tv,mobile,tablet,desktop,web" doc:"The client family whose profile_client values take part; optional, and absence skips the profile_client layer" example:"tv"`
+	DeviceHeader   string   `header:"X-Silo-Device-Id" maxLength:"128" doc:"The client's stable device identifier; its profile_device values take part" example:"iphone-1"`
+	DeviceName     string   `header:"X-Silo-Device-Name" maxLength:"120" doc:"Optional display name recorded on the device registry" example:"Living room"`
+	DevicePlatform string   `header:"X-Silo-Device-Platform" maxLength:"40" doc:"Optional platform recorded on the device registry" example:"iOS"`
 }
 
 func (q EffectiveSettingsQuery) query(ctx context.Context, keys []string) (handlers.EffectiveSettingsQuery, *Problem) {
@@ -940,10 +929,10 @@ type EffectiveSettingsBatch struct {
 // profile_id, device_id, library_ids or series_ids parameters of
 // listEffectiveSettings; v1 read those on the batch route and ignored them.
 type EffectiveSettingsBatchTarget struct {
-	ClientFamily   string `header:"X-Vio-Client-Family" enum:"tv,mobile,tablet,desktop,web" doc:"The client family whose profile_client values take part; optional, and absence skips the profile_client layer" example:"tv"`
-	DeviceHeader   string `header:"X-Vio-Device-Id" maxLength:"128" doc:"The client's stable device identifier; its profile_device values take part" example:"iphone-1"`
-	DeviceName     string `header:"X-Vio-Device-Name" maxLength:"120" doc:"Optional display name recorded on the device registry" example:"Living room"`
-	DevicePlatform string `header:"X-Vio-Device-Platform" maxLength:"40" doc:"Optional platform recorded on the device registry" example:"iOS"`
+	ClientFamily   string `header:"X-Silo-Client-Family" enum:"tv,mobile,tablet,desktop,web" doc:"The client family whose profile_client values take part; optional, and absence skips the profile_client layer" example:"tv"`
+	DeviceHeader   string `header:"X-Silo-Device-Id" maxLength:"128" doc:"The client's stable device identifier; its profile_device values take part" example:"iphone-1"`
+	DeviceName     string `header:"X-Silo-Device-Name" maxLength:"120" doc:"Optional display name recorded on the device registry" example:"Living room"`
+	DevicePlatform string `header:"X-Silo-Device-Platform" maxLength:"40" doc:"Optional platform recorded on the device registry" example:"iOS"`
 }
 
 func (t EffectiveSettingsBatchTarget) query(ctx context.Context, keys []string) handlers.EffectiveSettingsQuery {

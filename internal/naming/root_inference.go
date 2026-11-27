@@ -138,7 +138,6 @@ func extractPathEvidence(filePath string, libraryType string, libraryRoots ...st
 		parentTitle, parentYear, parentTrusted = "", 0, false
 	}
 	fileStem := parseInferMovieStem(nameNoExt, parentTitle, parentYear)
-
 	hasMovieEvidence := parentDir != libraryRoot && detectInferMovieFolderEvidence(parentBase, nameNoExt, hasSeasonStructure)
 	strongMovieContradiction := false
 	// A title inferred from an undated release is weaker evidence than a

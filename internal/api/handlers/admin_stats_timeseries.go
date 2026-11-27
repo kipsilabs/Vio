@@ -3,9 +3,7 @@ package handlers
 import (
 	"cmp"
 	"context"
-	"errors"
 	"fmt"
-	"net/http"
 	"slices"
 	"strconv"
 	"strings"
@@ -15,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Silo-Server/silo-server/internal/cache"
+	"github.com/Silo-Server/silo-server/internal/dashmetrics"
 )
 
 const (
@@ -39,9 +38,9 @@ const (
 	// minutes would spend megabytes drawing sub-pixel detail nobody can see.
 	adminTimeseriesMaxPoints = 750
 
-	// bytesPerKbpsMinute converts one sampled minute at 1 kbps into bytes:
-	// 1000 bits/s × 60 s ÷ 8 bits per byte.
-	bytesPerKbpsMinute = 1000 * adminTimeseriesResolutionSeconds / 8
+	// bytesPerKbpsMinute reuses dashmetrics.BytesPerKbpsMinute so the sampler
+	// and read queries never drift on the kbps-minute to byte conversion.
+	bytesPerKbpsMinute = dashmetrics.BytesPerKbpsMinute
 )
 
 // timeseriesBucketSeconds picks the display bucket for a window, keeping every
@@ -97,6 +96,20 @@ type AdminTimeseriesPoint struct {
 	// sampled before per-node rows existed, is the remainder. /api/v1 is frozen,
 	// so only v2 emits it.
 	EgressBySource map[string]int64 `json:"-"`
+	// StreamsByMethod splits Streams by play method, read from the bucket's
+	// peak-streams minute so the parts belong to the same minute as the total.
+	// Direct, Remux and Transcode above are each column's own peak and can come
+	// from different minutes, so they cannot be stacked. Sessions with any
+	// other play method are the remainder. /api/v1 is frozen, so only v2 emits
+	// it.
+	StreamsByMethod StreamsByMethod `json:"-"`
+}
+
+// StreamsByMethod is one minute's concurrent sessions by play method.
+type StreamsByMethod struct {
+	Direct    int64
+	Remux     int64
+	Transcode int64
 }
 
 // AdminTimeseriesEgressSource names one key of AdminTimeseriesPoint.EgressBySource:
@@ -241,32 +254,6 @@ func (p *AdminTimeseriesProvider) Close() {
 	p.cache.Close()
 }
 
-// HandleGetTimeseries handles GET /admin/stats/timeseries.
-func (h *AdminHandler) HandleGetTimeseries(w http.ResponseWriter, r *http.Request) {
-	hours, err := parseClampedIntQuery(
-		r, "hours",
-		adminTimeseriesDefaultHours,
-		adminTimeseriesMinHours,
-		adminTimeseriesMaxHours,
-	)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
-		return
-	}
-
-	series, err := h.ReadAdminTimeseries(r.Context(), hours, isTruthyQuery(r.URL.Query().Get("refresh")))
-	if errors.Is(err, ErrAdminDashboardUnavailable) {
-		writeError(w, http.StatusInternalServerError, "internal_error", "Database not configured")
-		return
-	}
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to get dashboard timeseries")
-		return
-	}
-
-	writeJSON(w, http.StatusOK, series)
-}
-
 // timeseriesRow is one grouped display bucket as it comes back from Postgres.
 // The stream counts are nullable: a bucket can hold process egress rows without
 // a shared row when a replica sampled egress but every attempt at the shared
@@ -279,6 +266,11 @@ type timeseriesRow struct {
 	Transcode          *int64
 	EgressKbps         int64
 	DownloadEgressKbps int64
+	// The Peak columns are the play-method split of the bucket's peak-streams
+	// minute; nil when the bucket has no shared sample.
+	PeakDirect    *int64
+	PeakRemux     *int64
+	PeakTranscode *int64
 	// The Sum columns add up every sampled minute's rate in the bucket, which
 	// the transfer totals integrate; the Kbps columns above are the peak.
 	EgressKbpsSum         int64
@@ -309,6 +301,11 @@ func assembleTimeseries(rows []timeseriesRow) []AdminTimeseriesPoint {
 			Transcode:          nullableCount(row.Transcode),
 			EgressKbps:         row.EgressKbps,
 			DownloadEgressKbps: row.DownloadEgressKbps,
+			StreamsByMethod: StreamsByMethod{
+				Direct:    nullableCount(row.PeakDirect),
+				Remux:     nullableCount(row.PeakRemux),
+				Transcode: nullableCount(row.PeakTranscode),
+			},
 		})
 	}
 	return points
@@ -347,7 +344,10 @@ func queryAdminTimeseries(ctx context.Context, pool *pgxpool.Pool, hours int) (*
 	// charts exist to show; a bucket therefore answers "the worst minute in
 	// here", and its columns may come from different minutes. The trailing
 	// SUM columns are the exception: they feed the window's transfer totals,
-	// which need every minute's rate, not the peak.
+	// which need every minute's rate, not the peak. The peak_* columns are the
+	// other exception: the play-method split of the single minute whose stream
+	// count peaked, earliest first on a tie, so a stacked chart's parts add up
+	// to the point's total.
 	rows, err := tx.Query(ctx, `
 		WITH minutes AS (
 			SELECT bucket,
@@ -360,8 +360,20 @@ func queryAdminTimeseries(ctx context.Context, pool *pgxpool.Pool, hours int) (*
 			FROM dashboard_metric_samples
 			WHERE bucket >= now() - make_interval(hours => $1)
 			GROUP BY bucket
+		), binned AS (
+			SELECT date_bin(make_interval(secs => $2), bucket, 'epoch') AS display_bucket, *
+			FROM minutes
+		), peaks AS (
+			SELECT DISTINCT ON (display_bucket)
+			       display_bucket,
+			       streams_direct    AS peak_direct,
+			       streams_remux     AS peak_remux,
+			       streams_transcode AS peak_transcode
+			FROM binned
+			WHERE streams_total IS NOT NULL
+			ORDER BY display_bucket, streams_total DESC, bucket
 		)
-		SELECT date_bin(make_interval(secs => $2), bucket, 'epoch') AS display_bucket,
+		SELECT binned.display_bucket,
 		       MAX(streams_total),
 		       MAX(streams_direct),
 		       MAX(streams_remux),
@@ -369,10 +381,14 @@ func queryAdminTimeseries(ctx context.Context, pool *pgxpool.Pool, hours int) (*
 		       MAX(egress_kbps)::bigint,
 		       MAX(download_egress_kbps)::bigint,
 		       SUM(egress_kbps)::bigint,
-		       SUM(download_egress_kbps)::bigint
-		FROM minutes
-		GROUP BY display_bucket
-		ORDER BY display_bucket
+		       SUM(download_egress_kbps)::bigint,
+		       peaks.peak_direct,
+		       peaks.peak_remux,
+		       peaks.peak_transcode
+		FROM binned
+		LEFT JOIN peaks ON peaks.display_bucket = binned.display_bucket
+		GROUP BY binned.display_bucket, peaks.peak_direct, peaks.peak_remux, peaks.peak_transcode
+		ORDER BY binned.display_bucket
 	`, hours, float64(bucketSeconds))
 	if err != nil {
 		return nil, fmt.Errorf("querying dashboard metric samples: %w", err)
@@ -392,6 +408,9 @@ func queryAdminTimeseries(ctx context.Context, pool *pgxpool.Pool, hours int) (*
 			&row.DownloadEgressKbps,
 			&row.EgressKbpsSum,
 			&row.DownloadEgressKbpsSum,
+			&row.PeakDirect,
+			&row.PeakRemux,
+			&row.PeakTranscode,
 		); err != nil {
 			return nil, fmt.Errorf("scanning dashboard metric sample: %w", err)
 		}

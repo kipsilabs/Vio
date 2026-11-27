@@ -22,6 +22,11 @@ export interface BarListProps {
   formatValue?: (value: number) => string;
   emptyLabel?: string;
   className?: string;
+  /**
+   * Value of a full-width bar, for a fixed scale such as 100 for
+   * percentages. Without it the largest value in the list fills the track.
+   */
+  max?: number;
 }
 
 function defaultFormatValue(value: number): string {
@@ -41,6 +46,7 @@ export function BarList({
   formatValue = defaultFormatValue,
   emptyLabel,
   className,
+  max: fixedMax,
 }: BarListProps) {
   const t = useT();
   if (items.length === 0) {
@@ -52,16 +58,18 @@ export function BarList({
   }
 
   const color = chartSeriesColor(seriesIndex);
-  const max = items.reduce(
-    (peak, item) => (Number.isFinite(item.value) ? Math.max(peak, item.value) : peak),
-    0,
-  );
+  const max =
+    fixedMax ??
+    items.reduce(
+      (peak, item) => (Number.isFinite(item.value) ? Math.max(peak, item.value) : peak),
+      0,
+    );
 
   return (
     <ol className={cn("space-y-1", className)}>
       {items.map((item, index) => {
         const value = Number.isFinite(item.value) ? Math.max(item.value, 0) : 0;
-        const ratio = max > 0 ? value / max : 0;
+        const ratio = max > 0 ? Math.min(value / max, 1) : 0;
         return (
           <li
             key={item.id}
@@ -77,7 +85,7 @@ export function BarList({
                 opacity: 0.18,
               }}
             />
-            <span className="text-muted-foreground relative w-4 shrink-0 text-[11px] tabular-nums">
+            <span className="text-muted-foreground relative w-4 shrink-0 text-[0.6875rem] tabular-nums">
               {index + 1}
             </span>
             <span className="relative min-w-0 flex-1 truncate" title={item.label}>
@@ -89,11 +97,11 @@ export function BarList({
                 item.label
               )}
             </span>
-            <span className="relative shrink-0 text-[13px] font-semibold tabular-nums">
+            <span className="relative shrink-0 text-[0.8125rem] font-semibold tabular-nums">
               {formatValue(value)}
             </span>
             {item.secondary ? (
-              <span className="text-muted-foreground relative shrink-0 text-[11px] tabular-nums">
+              <span className="text-muted-foreground relative shrink-0 text-[0.6875rem] tabular-nums">
                 {item.secondary}
               </span>
             ) : null}

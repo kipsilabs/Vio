@@ -94,11 +94,11 @@ type DownloadManifest struct {
 type DownloadManifestOutput struct{ Body DownloadManifest }
 type DownloadManifestInput struct {
 	ID       string `path:"id" minLength:"1"`
-	DeviceID string `header:"X-Vio-Device-Id" required:"true" minLength:"1" maxLength:"128"`
+	DeviceID string `header:"X-Silo-Device-Id" required:"true" minLength:"1" maxLength:"128"`
 }
 type DownloadManifestPageInput struct {
 	BatchID  string `path:"batch_id" minLength:"1"`
-	DeviceID string `header:"X-Vio-Device-Id" required:"true" minLength:"1" maxLength:"128"`
+	DeviceID string `header:"X-Silo-Device-Id" required:"true" minLength:"1" maxLength:"128"`
 	Limit    int    `query:"limit" default:"3" minimum:"1" maximum:"10"`
 	Cursor   string `query:"cursor"`
 }

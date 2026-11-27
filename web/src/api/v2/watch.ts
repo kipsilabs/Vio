@@ -7,7 +7,6 @@ import type {
   WatchDetail,
 } from "@/api/types";
 import type { components } from "@/api/v2/schema";
-import { indexerReleasesFromWire } from "./indexerReleases";
 
 /**
  * The watch detail as the player still models it. v2 renders file ids as
@@ -18,7 +17,7 @@ import { indexerReleasesFromWire } from "./indexerReleases";
  */
 
 type WatchDetailV2 = components["schemas"]["WatchDetail"];
-export type WatchFileVersionV2 = components["schemas"]["WatchFileVersion"];
+type WatchFileVersionV2 = components["schemas"]["WatchFileVersion"];
 type WatchMarkerV2 = components["schemas"]["WatchMarker"];
 type WatchPlaybackVariantV2 = components["schemas"]["WatchPlaybackVariant"];
 type WatchPlaybackVariantPartV2 = components["schemas"]["WatchPlaybackVariantPart"];
@@ -63,7 +62,7 @@ function optionalMarkerFromV2(marker: WatchMarkerV2 | undefined): TimeRange | un
     : undefined;
 }
 
-export function watchFileVersionFromV2(version: WatchFileVersionV2): FileVersion {
+function fileVersionFromV2(version: WatchFileVersionV2): FileVersion {
   const {
     file_id,
     duration_seconds,
@@ -92,28 +91,22 @@ export function watchFileVersionFromV2(version: WatchFileVersionV2): FileVersion
   };
 }
 
-/** Converts a v2 version list at the boundary, in order. */
-export function watchFileVersionsFromV2(versions: WatchFileVersionV2[]): FileVersion[] {
-  return versions.map(watchFileVersionFromV2);
-}
-
 function variantPartFromV2(part: WatchPlaybackVariantPartV2): PlaybackVariantPart {
   return {
     part_index: part.part_index,
     default_file_id: numericId(part.default_file_id),
     total_duration: part.total_duration_seconds,
-    versions: watchFileVersionsFromV2(part.versions),
+    versions: part.versions.map(fileVersionFromV2),
   };
 }
 
 function variantFromV2(variant: WatchPlaybackVariantV2): PlaybackVariant {
-  const { default_file_id, total_duration_seconds, parts, virtual_ranking, ...rest } = variant;
+  const { default_file_id, total_duration_seconds, parts, ...rest } = variant;
   return {
     ...rest,
     default_file_id: numericId(default_file_id),
     total_duration: total_duration_seconds,
     parts: parts.map(variantPartFromV2),
-    virtual_ranking,
   };
 }
 
@@ -139,14 +132,8 @@ export function watchDetailFromV2(detail: WatchDetailV2): WatchDetail {
     title: detail.title,
     year: detail.year,
     overview: detail.overview ?? "",
-    versions: watchFileVersionsFromV2(detail.versions),
+    versions: detail.versions.map(fileVersionFromV2),
     playback_variants: detail.playback_variants?.map(variantFromV2),
-    virtual_ranking: detail.virtual_ranking,
-    // Additive: absent from the committed contract until the backend lands, so
-    // it is read structurally and normalized at this boundary.
-    indexer_releases: indexerReleasesFromWire(
-      (detail as { indexer_releases?: unknown }).indexer_releases,
-    ),
     subtitles: detail.subtitles.map((s) => ({
       source: s.source,
       language: s.language,
@@ -162,6 +149,8 @@ export function watchDetailFromV2(detail: WatchDetailV2): WatchDetail {
     user_data: userDataFromV2(detail.user_data),
     series_id: detail.series_id,
     series_title: detail.series_title,
+    episode_labels: detail.episode_labels,
+    air_date: detail.air_date,
     season_number: detail.season_number,
     episode_number: detail.episode_number,
     effective_subtitle_language: detail.effective_subtitle_language,

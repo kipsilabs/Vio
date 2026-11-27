@@ -2,24 +2,16 @@ package tasks
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 
 	"github.com/Silo-Server/silo-server/internal/taskmanager"
 )
 
-// UserCollectionSyncRunner runs a single pass of the user collection
-// scheduler. Kept separate from CollectionSyncRunner so the user collection
-// scheduler retains its own signature.
-type UserCollectionSyncRunner interface {
-	RunOnce(ctx context.Context) (json.RawMessage, error)
-}
-
 type SyncUserCollectionsTask struct {
-	scheduler UserCollectionSyncRunner
+	scheduler CollectionSyncRunner
 }
 
-func NewSyncUserCollectionsTask(scheduler UserCollectionSyncRunner) *SyncUserCollectionsTask {
+func NewSyncUserCollectionsTask(scheduler CollectionSyncRunner) *SyncUserCollectionsTask {
 	return &SyncUserCollectionsTask{scheduler: scheduler}
 }
 

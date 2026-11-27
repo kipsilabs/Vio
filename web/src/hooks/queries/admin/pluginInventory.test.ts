@@ -3,11 +3,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { setAccessToken, setRefreshToken, setProfileId, setProfileToken } from "@/api/client";
-import {
-  fetchPluginCatalog,
-  fetchPluginInstallations,
-  useAdminPluginInstallations,
-} from "./plugins";
+import { fetchPluginCatalog, useAdminPluginInstallations } from "./plugins";
 
 function fixture() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -36,7 +32,7 @@ const manifestSurface = {
   assets: [],
   metadata: {},
 };
-function installation(id: string, next?: string, sourceKind = "silo") {
+function installation(id: string, next?: string) {
   return {
     items: [
       {
@@ -48,7 +44,7 @@ function installation(id: string, next?: string, sourceKind = "silo") {
         enabled: true,
         kind: "plugin",
         update_policy: "manual",
-        source_kind: sourceKind,
+        source_kind: "silo",
         updates_paused: false,
         ...manifestSurface,
         global_configs: [
@@ -63,7 +59,7 @@ function installation(id: string, next?: string, sourceKind = "silo") {
     page: { has_more: !!next, next_cursor: next },
   };
 }
-function catalogEntry(pluginId: string, next?: string, sourceKind = "external") {
+function catalogEntry(pluginId: string, next?: string) {
   return {
     items: [
       {
@@ -71,7 +67,7 @@ function catalogEntry(pluginId: string, next?: string, sourceKind = "external") 
         plugin_id: pluginId,
         version: "1.0.0",
         archive_url: "https://example.invalid/a.zip",
-        source_kind: sourceKind,
+        source_kind: "external",
         repository_name: "Synthetic",
         ...manifestSurface,
       },
@@ -154,26 +150,6 @@ it.each([null, "pin-b", "pin-a"])(
     ).not.toMatch(/pin-a|pin-b/);
   },
 );
-it.each(["silo", "vio", "approved_community", "external"] as const)(
-  "accepts the %s plugin source kind in both inventories",
-  async (sourceKind) => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (input: RequestInfo | URL) => {
-        const url = String(input);
-        if (url.includes("/admin/plugins/installations"))
-          return response(installation("3", undefined, sourceKind));
-        if (url.includes("/admin/plugins/catalog"))
-          return response(catalogEntry("org.example.a", undefined, sourceKind));
-        throw new Error(`unexpected request ${url}`);
-      }),
-    );
-    const catalog = await fetchPluginCatalog();
-    expect(catalog.map((r) => r.source_kind)).toEqual([sourceKind]);
-    const installations = await fetchPluginInstallations();
-    expect(installations.map((r) => r.source_kind)).toEqual([sourceKind]);
-  },
-);
 it("reads the catalog through v2 and rejects an unknown source kind", async () => {
   const fetchMock = vi
     .fn()
@@ -188,8 +164,4 @@ it("reads the catalog through v2 and rejects an unknown source kind", async () =
   bad.items[0]!.source_kind = "mystery";
   vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response(bad)));
   await expect(fetchPluginCatalog()).rejects.toThrow("Unrecognized plugin source kind.");
-  const badInstallation = installation("3");
-  badInstallation.items[0]!.source_kind = "mystery";
-  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response(badInstallation)));
-  await expect(fetchPluginInstallations()).rejects.toThrow("Unrecognized plugin source kind.");
 });

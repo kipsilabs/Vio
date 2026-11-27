@@ -25,6 +25,7 @@ import {
   listNotifications,
   listNotificationSeries,
   setNotificationSeriesMuted,
+  setManyNotificationSeriesMuted,
   type NotifiedSeriesOptions,
   type NotifiedSeriesStatus,
   unreadNotificationCount,
@@ -164,29 +165,16 @@ export function useSetManyNotificationSeriesMuted() {
   const queryClient = useQueryClient();
   const context = captureNotificationAuthority();
   const mutation = useMutation({
-    // This server has the per-series mute only, so a bulk action is one call
-    // per series. A failure leaves the others applied and reports itself.
-    mutationFn: async ({ seriesIds, muted }: { seriesIds: string[]; muted: boolean }) => {
-      const results: { series_id: string; outcome: "applied" | "failed" }[] = [];
-      for (const seriesId of seriesIds) {
-        try {
-          await setNotificationSeriesMuted(seriesId, muted, context);
-          results.push({ series_id: seriesId, outcome: "applied" });
-        } catch (error) {
-          if (error instanceof StaleApiRequestContextError) throw error;
-          results.push({ series_id: seriesId, outcome: "failed" });
-        }
-      }
-      return results;
-    },
+    mutationFn: ({ seriesIds, muted }: { seriesIds: string[]; muted: boolean }) =>
+      setManyNotificationSeriesMuted(seriesIds, muted, context),
     retry: false,
     onSettled: () => invalidateSeries(queryClient),
     onSuccess: (results, variables) => {
       const changed = results
         .filter((result) => result.outcome === "applied")
         .map((result) => result.series_id);
-      // Only the series whose mute actually landed count as done.
-      const done = results.filter((result) => result.outcome === "applied").length;
+      // Series the viewer may not see, or that no longer exist, changed nothing.
+      const done = results.filter((result) => result.outcome !== "not_found").length;
       const count = { count: done, count_text: String(done) };
       if (!variables.muted) {
         toast.success(t("web.notifications.queries.unmutedMany", count));

@@ -256,13 +256,11 @@ func newTestStore(t *testing.T, ffmpeg string) (*Store, *memRepo, *memBlobs) {
 // convert runs today's WebVTT conversion on in.
 func convert(t *testing.T, ffmpeg string, in *playback.SubtitlePacketInput) string {
 	t.Helper()
-	// A kept track is fed to FFmpeg as packets on stdin, the same way the
-	// HLS rendition path converts one.
-	out, err := playback.ExtractSubtitlePacketsWebVTT(t.Context(), in, ffmpeg)
-	if err != nil {
+	var out bytes.Buffer
+	if err := playback.StreamExtractSubtitle(t.Context(), playback.StreamExtractOpts{Packets: in, SourceCodec: "subrip", FFmpegPath: ffmpeg, Writer: &out}); err != nil {
 		t.Fatal(err)
 	}
-	return string(out)
+	return out.String()
 }
 
 // demux runs today's WebVTT extraction from the source, optionally a window.

@@ -75,7 +75,7 @@ export async function readAdminAutoscanEvents(
           runIDs.add(run.id);
           if (
             !["library", "subtree", "file"].includes(run.mode) ||
-            !["accepted", "running", "completed", "failed", "canceled"].includes(run.status)
+            !["accepted", "running", "completed", "failed", "cancelled"].includes(run.status)
           )
             throw new Error("Unsupported event scan state.");
           return {

@@ -5,7 +5,7 @@ package templates
 // stable strings so they can be referenced across the API and UI without
 // drifting when descriptions are tweaked.
 //
-// Sync cadences favor conservative defaults — a heavy library does not need
+// Sync cadences favour conservative defaults — a heavy library does not need
 // "Trending" to refresh more than every six hours, and TMDB rate-limits make
 // hourly refreshes wasteful for shared servers.
 //
@@ -62,7 +62,7 @@ var builtinTemplates = []Template{
 	{
 		ID:                  "tmdb_popular_movies",
 		Title:               "Popular Movies",
-		Description:         "Perennial favorites ranked by TMDB's popularity score.",
+		Description:         "Perennial favourites ranked by TMDB's popularity score.",
 		Icon:                "⭐",
 		Category:            CategoryPopular,
 		Source:              SourceTMDB,
@@ -74,7 +74,7 @@ var builtinTemplates = []Template{
 	{
 		ID:                  "tmdb_popular_tv",
 		Title:               "Popular TV Shows",
-		Description:         "Perennial favorites ranked by TMDB's popularity score.",
+		Description:         "Perennial favourites ranked by TMDB's popularity score.",
 		Icon:                "⭐",
 		Category:            CategoryPopular,
 		Source:              SourceTMDB,
@@ -1045,7 +1045,7 @@ var builtinTemplates = []Template{
 	{
 		ID:                  "tmdb_discover_popular_science_fiction",
 		Title:               "Popular Science Fiction",
-		Description:         "Sci-fi blockbusters and cult favorites sorted by TMDB heat.",
+		Description:         "Sci-fi blockbusters and cult favourites sorted by TMDB heat.",
 		Icon:                "🚀",
 		Category:            CategoryPopular,
 		Source:              SourceTMDBDiscover,
@@ -1490,7 +1490,7 @@ var builtinTemplates = []Template{
 	{
 		ID:                  "tmdb_franchise_star_wars",
 		Title:               "Star Wars Saga",
-		Description:         "The Skywalker-era Star Wars feature films as cataloged by TMDB.",
+		Description:         "The Skywalker-era Star Wars feature films as catalogued by TMDB.",
 		Icon:                "⚔️",
 		Category:            CategoryEditorial,
 		Source:              SourceTMDBCollection,

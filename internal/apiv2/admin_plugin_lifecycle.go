@@ -81,8 +81,9 @@ func registerAdminPluginLifecycle(reg *Registry) {
 		o.MaxBodyBytes = 64 << 10
 		return o
 	}
-	create := op(http.MethodPost, "", "createAdminPluginInstallation", "Install a plugin from a catalog repository (repository_id, plugin_id, version) or a direct archive URL, fetching over the network. An installation with the same plugin_id is stopped and replaced rather than duplicated. There is no replay identity: a lost response may follow a committed install; reconcile from the installation list and never automatically retry.", RetrySafetyNonRetryable)
+	create := op(http.MethodPost, "", "createAdminPluginInstallation", "Install a plugin from a catalog repository (repository_id, plugin_id, version) or a direct archive URL, fetching over the network. An installation with the same plugin_id is stopped and replaced rather than duplicated; an install that finds none but loses the race to create it is 409. There is no replay identity: a lost response may follow a committed install; reconcile from the installation list and never automatically retry.", RetrySafetyNonRetryable)
 	create.DefaultStatus = http.StatusCreated
+	create.Errors = append(create.Errors, http.StatusConflict)
 	Register(reg, create, func(ctx context.Context, in *AdminPluginInstallCreateInput) (*AdminPluginInstallationOutput, error) {
 		if reg.deps.AdminPluginLifecycle == nil {
 			return nil, unavailable("plugin lifecycle")
@@ -104,7 +105,7 @@ func registerAdminPluginLifecycle(reg *Registry) {
 		}
 		return reg.adminPluginInstallationOutput(reg.deps.AdminPluginLifecycle.CreateAdminPluginInstallation(ctx, input))
 	})
-	update := op(http.MethodPut, "/{id}", "updateAdminPluginInstallation", "Assign enabled and/or update_policy on one installation. Disabling stops the running plugin first. Repeating the same assignment converges on one stored row.", RetrySafetyNaturalIdempotent)
+	update := op(http.MethodPut, "/{id}", "updateAdminPluginInstallation", "Assign enabled and/or update_policy on one installation. Disabling stops the running plugin once the change is saved. Disabling the installation of the last OIDC or LDAP provider people can sign in with while auth.local_password_login is off is 409 sign_in_provider_required, and the plugin keeps running. Repeating the same assignment converges on one stored row.", RetrySafetyNaturalIdempotent)
 	update.Errors = append(update.Errors, http.StatusNotFound, http.StatusConflict)
 	Register(reg, update, func(ctx context.Context, in *AdminPluginInstallationUpdateInput) (*AdminPluginInstallationOutput, error) {
 		if reg.deps.AdminPluginLifecycle == nil {
@@ -122,7 +123,7 @@ func registerAdminPluginLifecycle(reg *Registry) {
 		}
 		return reg.adminPluginInstallationOutput(reg.deps.AdminPluginLifecycle.UpdateAdminPluginInstallation(ctx, id, handlers.PluginInstallationUpdateInput{Enabled: in.Body.Enabled, UpdatePolicy: in.Body.UpdatePolicy}))
 	})
-	apply := op(http.MethodPost, "/{id}/update", "applyAdminPluginUpdate", "Install the recorded available version from the installation's repository, fetching over the network, and clear the marker. No applicable update is 409. There is no replay identity: a lost response may follow a committed update; reconcile from the installation and never automatically retry.", RetrySafetyNonRetryable)
+	apply := op(http.MethodPost, "/{id}/update", "applyAdminPluginUpdate", "Install the recorded available version from the installation's repository, fetching over the network, and clear the marker. No applicable update is 409, as is an update that another install of the plugin replaced while its package downloaded. There is no replay identity: a lost response may follow a committed update; reconcile from the installation and never automatically retry.", RetrySafetyNonRetryable)
 	apply.Errors = append(apply.Errors, http.StatusNotFound, http.StatusConflict)
 	Register(reg, apply, func(ctx context.Context, in *AdminPluginInstallationIDInput) (*AdminPluginInstallationOutput, error) {
 		if reg.deps.AdminPluginLifecycle == nil {
@@ -146,9 +147,9 @@ func registerAdminPluginLifecycle(reg *Registry) {
 		}
 		return reg.adminPluginInstallationOutput(reg.deps.AdminPluginLifecycle.RestartAdminPluginInstallation(ctx, id))
 	})
-	remove := op(http.MethodDelete, "/{id}", "deleteAdminPluginInstallation", "Stop the plugin, delete the installation row (configuration, bindings and archives cascade) and remove its files. Row delete and file removal are not one transaction and a repeat finds no row: a later 404 is not this caller's receipt; never automatically retry.", RetrySafetyNonRetryable)
+	remove := op(http.MethodDelete, "/{id}", "deleteAdminPluginInstallation", "Delete the installation row (configuration, bindings and archives cascade), then stop the plugin and remove its files. Row delete and file removal are not one transaction and a repeat finds no row: a later 404 is not this caller's receipt; never automatically retry. Uninstalling the last OIDC or LDAP provider people can sign in with while auth.local_password_login is off is 409 sign_in_provider_required, and the plugin keeps running. While another request is changing the sign-in accounts of this plugin, the uninstall changes nothing and answers 503 dependency_unavailable with Retry-After; repeat it then.", RetrySafetyNonRetryable)
 	remove.DefaultStatus = http.StatusNoContent
-	remove.Errors = append(remove.Errors, http.StatusNotFound, http.StatusConflict)
+	remove.Errors = append(remove.Errors, http.StatusNotFound, http.StatusConflict, http.StatusServiceUnavailable)
 	Register(reg, remove, func(ctx context.Context, in *AdminPluginInstallationIDInput) (*struct{}, error) {
 		if reg.deps.AdminPluginLifecycle == nil {
 			return nil, unavailable("plugin lifecycle")

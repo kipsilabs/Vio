@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import { Captions, Check, ChevronDown, Loader2, Search } from "lucide-react";
 
@@ -6,6 +6,7 @@ import type { FileVersion } from "@/api/types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { useDownloadedSubtitles } from "@/hooks/queries/subtitles";
+import { useT, type Translate } from "@/i18n";
 import type {
   PlayerSubtitleTrackSignature,
   PrePlaySubtitleSelection,
@@ -22,7 +23,6 @@ import {
   subtitleSelectionEquals,
   type PrePlaySubtitleCandidate,
 } from "./prePlaySelection";
-import { useProvisionalInventoryExpiry } from "@/player/hooks/useProvisionalInventoryExpiry";
 import DetailPopover from "./DetailPopover";
 
 interface SubtitlesPopoverProps {
@@ -39,19 +39,6 @@ interface SubtitlesPopoverProps {
   onResetSelection?: () => void;
   /** Opens the subtitle provider search for this version. */
   onSearchSubtitles?: () => void;
-  /**
-   * True while the selected row has no subtitle rows at all and no probe
-   * evidence has landed. The menu says it is still discovering rather than
-   * presenting an unenumerated empty list as "no subtitles".
-   */
-  inventoryProvisional?: boolean;
-  /**
-   * True while the rows are the selected row's release listing rather than
-   * probe evidence. They are shown immediately and labelled as unverified.
-   */
-  inventoryDeclared?: boolean;
-  /** Re-runs inventory discovery; shown once the provisional window lapses. */
-  onRetryInventory?: () => void;
 }
 
 function SubtitleFlagBadges({
@@ -63,21 +50,22 @@ function SubtitleFlagBadges({
   hearingImpaired?: boolean;
   isDefault?: boolean;
 }) {
+  const t = useT();
   return (
     <>
       {forced && (
         <Badge variant="outline" className="px-1.5 py-0 text-[0.625rem] uppercase">
-          Forced
+          {t("web.detail.mediaInfo.forced")}
         </Badge>
       )}
       {hearingImpaired && (
         <Badge variant="outline" className="px-1.5 py-0 text-[0.625rem] uppercase">
-          HI
+          {t("web.detail.mediaInfo.hearingImpairedShort")}
         </Badge>
       )}
       {isDefault && (
         <Badge variant="outline" className="px-1.5 py-0 text-[0.625rem] uppercase">
-          Default
+          {t("web.detail.mediaInfo.defaultBadge")}
         </Badge>
       )}
     </>
@@ -120,7 +108,7 @@ function SelectionRow({
     <button
       type="button"
       onClick={onSelect}
-      className={`flex w-full items-start gap-3 rounded-lg px-3 py-2 text-left transition-colors ${
+      className={`flex w-full items-start gap-3 rounded-lg px-3 py-2 text-start transition-colors ${
         active ? "bg-accent/50" : "hover:bg-accent/30"
       }`}
     >
@@ -183,12 +171,16 @@ function SubtitleSection({
 }
 
 function formatExplicitSelectionSummary(
+  t: Translate,
   selection: PrePlaySubtitleSelection | null | undefined,
 ): string {
-  if (!selection) return "Off";
+  if (!selection) return t("web.detail.subtitles.off");
   return formatSubtitlePillSummary({
     label: selection.label,
-    languageLabel: getLanguageName(selection.language ?? "") || selection.language || "Unknown",
+    languageLabel:
+      getLanguageName(selection.language ?? "") ||
+      selection.language ||
+      t("web.detail.subtitles.unknown"),
     codec: selection.codec,
     forced: selection.forced,
     hearingImpaired: selection.hearing_impaired,
@@ -218,11 +210,8 @@ export default function SubtitlesPopover({
   onSelectSubtitleOff,
   onResetSelection,
   onSearchSubtitles,
-  inventoryProvisional = false,
-  inventoryDeclared = false,
-  onRetryInventory,
 }: SubtitlesPopoverProps) {
-  const declared = inventoryDeclared && !inventoryProvisional;
+  const t = useT();
   const [open, setOpen] = useState(false);
   // Downloaded subtitles normally load lazily on open, but when the saved
   // preference points at one, the closed trigger's Auto summary needs them
@@ -230,15 +219,6 @@ export default function SubtitlesPopover({
   const needsDownloaded = open || preferredSubtitleTrackSignature?.source === "downloaded";
   const downloadedQuery = useDownloadedSubtitles(needsDownloaded ? version?.file_id : undefined);
   const isInteractive = Boolean(onSelectSubtitle || onSelectSubtitleOff || onResetSelection);
-  const {
-    expired: discoveryExpired,
-    slow: discoverySlow,
-    retry: restartDiscovery,
-  } = useProvisionalInventoryExpiry(inventoryProvisional);
-  const handleRetryInventory = useCallback(() => {
-    restartDiscovery();
-    onRetryInventory?.();
-  }, [onRetryInventory, restartDiscovery]);
 
   const candidates = useMemo(
     () => buildPrePlaySubtitleCandidates(version?.subtitle_tracks, downloadedQuery.data ?? []),
@@ -279,10 +259,14 @@ export default function SubtitlesPopover({
     selectionMode === "auto"
       ? overrideCandidate
         ? formatCandidatePillSummary(overrideCandidate)
-        : `Auto: ${autoCandidate ? formatCandidatePillSummary(autoCandidate) : "Off"}`
+        : t("web.detail.tracks.autoSummary", {
+            summary: autoCandidate
+              ? formatCandidatePillSummary(autoCandidate)
+              : t("web.detail.subtitles.off"),
+          })
       : selectionMode === "off"
-        ? "Off"
-        : formatExplicitSelectionSummary(explicitSelection);
+        ? t("web.detail.subtitles.off")
+        : formatExplicitSelectionSummary(t, explicitSelection);
 
   const activeListSelection =
     !isInteractive || selectionMode === "off"
@@ -295,7 +279,7 @@ export default function SubtitlesPopover({
     <DetailPopover
       open={open}
       onOpenChange={setOpen}
-      positionKey={`${downloadedQuery.isLoading}:${candidates.all.length}:${inventoryProvisional}:${discoveryExpired}:${discoverySlow}`}
+      positionKey={`${downloadedQuery.isLoading}:${candidates.all.length}`}
       contentClassName="max-h-80 w-80 overflow-y-auto p-1.5"
       trigger={
         <Button
@@ -303,17 +287,9 @@ export default function SubtitlesPopover({
           className="h-8 max-w-full min-w-0 shrink gap-1.5 rounded-full px-3 text-xs font-medium"
         >
           <Captions className="size-3.5" />
-          Subs
+          {t("web.detail.subtitles.button")}
           <span className="text-muted-foreground max-w-44 truncate text-[0.6875rem] font-normal sm:max-w-64">
-            {inventoryProvisional
-              ? discoveryExpired
-                ? "Not verified"
-                : discoverySlow
-                  ? "Still checking…"
-                  : "Discovering…"
-              : isInteractive
-                ? activeSummary
-                : candidates.all.length}
+            {isInteractive ? activeSummary : candidates.all.length}
           </span>
           <ChevronDown className="text-muted-foreground size-3" />
         </Button>
@@ -324,75 +300,50 @@ export default function SubtitlesPopover({
           <>
             <SelectionRow
               active={selectionMode === "auto" && !overrideCandidate}
-              title="Auto"
+              title={t("web.detail.tracks.auto")}
               description={
-                inventoryProvisional
-                  ? "Profile defaults"
-                  : overrideCandidate
-                    ? "Reset to profile defaults"
-                    : (autoCandidate?.summary ?? "Off")
+                overrideCandidate
+                  ? t("web.detail.subtitles.resetToDefaults")
+                  : (autoCandidate?.summary ?? t("web.detail.subtitles.off"))
               }
               onSelect={onResetSelection}
             />
             <SelectionRow
               active={selectionMode === "off"}
-              title="Off"
+              title={t("web.detail.subtitles.off")}
               onSelect={onSelectSubtitleOff}
             />
           </>
         )}
-        {inventoryProvisional && !discoveryExpired && (
+        <SubtitleSection
+          title={t("web.detail.mediaInfo.embedded")}
+          rows={candidates.embedded}
+          activeSelection={activeListSelection}
+          onSelectSubtitle={onSelectSubtitle}
+        />
+        <SubtitleSection
+          title={t("web.detail.mediaInfo.external")}
+          rows={candidates.external}
+          activeSelection={activeListSelection}
+          onSelectSubtitle={onSelectSubtitle}
+        />
+        {downloadedQuery.isLoading ? (
           <div className="text-muted-foreground flex items-center gap-2 px-3 py-2 text-xs">
             <Loader2 className="size-3 animate-spin" />
-            {discoverySlow ? "Still checking for subtitles…" : "Discovering subtitles…"}
+            {t("web.detail.subtitles.loadingDownloaded")}
           </div>
+        ) : (
+          <SubtitleSection
+            title={t("web.detail.subtitles.downloaded")}
+            rows={candidates.downloaded}
+            activeSelection={activeListSelection}
+            onSelectSubtitle={onSelectSubtitle}
+          />
         )}
-        {inventoryProvisional && discoveryExpired && (
-          <div className="text-muted-foreground flex items-center justify-between gap-2 px-3 py-2 text-xs">
-            <span>Tracks not verified. The release listing names none.</span>
-            <button
-              type="button"
-              onClick={handleRetryInventory}
-              className="text-primary shrink-0 rounded px-1.5 py-0.5 font-medium hover:underline focus-visible:ring-2 focus-visible:outline-none"
-            >
-              Retry
-            </button>
+        {candidates.all.length === 0 && !downloadedQuery.isLoading && (
+          <div className="text-muted-foreground px-3 py-2 text-sm">
+            {t("web.detail.subtitles.noneAvailable")}
           </div>
-        )}
-        {declared && (
-          <div className="text-muted-foreground px-3 text-[0.6875rem]">From release listing</div>
-        )}
-        {!inventoryProvisional && (
-          <>
-            <SubtitleSection
-              title="Embedded"
-              rows={candidates.embedded}
-              activeSelection={activeListSelection}
-              onSelectSubtitle={onSelectSubtitle}
-            />
-            <SubtitleSection
-              title="External"
-              rows={candidates.external}
-              activeSelection={activeListSelection}
-              onSelectSubtitle={onSelectSubtitle}
-            />
-            {downloadedQuery.isLoading ? (
-              <div className="text-muted-foreground flex items-center gap-2 px-3 py-2 text-xs">
-                <Loader2 className="size-3 animate-spin" />
-                Loading downloaded...
-              </div>
-            ) : (
-              <SubtitleSection
-                title="Downloaded"
-                rows={candidates.downloaded}
-                activeSelection={activeListSelection}
-                onSelectSubtitle={onSelectSubtitle}
-              />
-            )}
-            {candidates.all.length === 0 && !downloadedQuery.isLoading && (
-              <div className="text-muted-foreground px-3 py-2 text-sm">No subtitles available.</div>
-            )}
-          </>
         )}
         {onSearchSubtitles && (
           <div className="border-border bg-popover sticky -bottom-1.5 -mx-1.5 border-t px-1.5 pt-1.5 pb-1.5">
@@ -402,10 +353,10 @@ export default function SubtitlesPopover({
                 setOpen(false);
                 onSearchSubtitles();
               }}
-              className="hover:bg-accent/30 flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm font-medium transition-colors"
+              className="hover:bg-accent/30 flex w-full items-center gap-2 rounded-lg px-3 py-2 text-start text-sm font-medium transition-colors"
             >
               <Search className="text-muted-foreground size-4" />
-              Search for Subtitles…
+              {t("web.detail.subtitles.search")}
             </button>
           </div>
         )}

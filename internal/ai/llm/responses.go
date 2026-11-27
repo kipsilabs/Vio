@@ -92,7 +92,10 @@ func (c *Client) chatGPT(ctx context.Context, cfg Config, messages []Message, js
 	if jsonObject {
 		req.Text = &responseTextFormat{Format: chatResponseFormat{Type: chatJSONFormat}}
 	}
-	body, _ := json.Marshal(req)
+	body, err := json.Marshal(req)
+	if err != nil {
+		return "", err
+	}
 	var content string
 	httpClient := *c.chatHTTP
 	httpClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }

@@ -271,11 +271,9 @@ func (p previewPagePlan) cursorSQL(after *QueryCursor) (string, []any, error) {
 		return "", nil, err
 	}
 	columns := qualifiedListItemColumns("mi") + ", " + mangaCountColumns("mi")
-	var columnsSb257 strings.Builder
 	for _, term := range p.cursorTerms {
-		columnsSb257.WriteString(", (" + term.expression + ")::text")
+		columns += ", (" + term.expression + ")::text"
 	}
-	columns += columnsSb257.String()
 	queryLimit := p.limit + 1
 	if p.maxResults > 0 {
 		queryLimit = min(queryLimit, p.maxResults)

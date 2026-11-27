@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/Silo-Server/silo-server/internal/api/handlers"
+	"github.com/Silo-Server/silo-server/internal/auth"
 	"github.com/Silo-Server/silo-server/internal/plugins"
 )
 
@@ -18,7 +19,7 @@ type AdminPluginConfigurationService interface {
 	SetAdminPluginConfig(context.Context, int, handlers.PluginConfigInput) error
 	TestAdminPluginConfig(context.Context, int, handlers.PluginConfigInput) (handlers.PluginConnectionCheckResult, error)
 	SetAdminPluginAuthBinding(context.Context, int, handlers.PluginAuthBindingInput) error
-	SetAdminPluginTaskBinding(context.Context, int, string, handlers.PluginTaskBindingInput) error
+	SetAdminPluginTaskBinding(context.Context, int, string, handlers.PluginTaskBindingInput) (restartRequired bool, err error)
 }
 
 // AdminPluginConfigWrite is one global configuration entry as the operator
@@ -26,10 +27,12 @@ type AdminPluginConfigurationService interface {
 // value. A declared non-secret top-level field sent as null or a blank string
 // is removed, so the plugin's default applies; undeclared fields are never
 // cleared that way. Manifest-declared secret fields left blank keep their
-// stored value; a secret is removed only when named in clear_secrets.
+// stored value; a secret is removed only when named in clear_secrets. A
+// connection test keeps a stored secret only while the rest of the entry is
+// unchanged and no secret in it is entered.
 type AdminPluginConfigWrite struct {
 	Key          string          `json:"key" minLength:"1" maxLength:"256" doc:"The manifest global_config_schema key"`
-	Value        PluginJSONValue `json:"value" doc:"The entry's fields, merged over the stored entry. A declared non-secret top-level field sent as null or a blank string is removed so the plugin default applies; blank secret fields preserve the stored secret"`
+	Value        PluginJSONValue `json:"value" doc:"The entry's fields, merged over the stored entry. A declared non-secret top-level field sent as null or a blank string is removed so the plugin default applies; blank secret fields preserve the stored secret. A connection test reuses a stored secret only while the rest of the entry is unchanged and no secret in it is entered (a secret object or list sent in it counts as entered); otherwise it also leaves out stored top-level fields the schema does not declare"`
 	ClearSecrets []string        `json:"clear_secrets,omitempty" maxItems:"64" doc:"Secret fields to remove; each must be a manifest-declared secret of this key"`
 }
 type AdminPluginConfigInput struct {
@@ -58,13 +61,13 @@ type AdminPluginAuthBindingInput struct {
 	Body    AdminPluginAuthBindingWrite
 }
 type AdminPluginAuthBindingOutput struct {
-	RestartRequired string `header:"X-Vio-Restart-Required" doc:"Always false: sign-in providers rebuild on every node when a binding changes"`
+	RestartRequired string `header:"X-Silo-Restart-Required" doc:"Always false: sign-in providers rebuild on every node when a binding changes"`
 }
 
 // AdminPluginTaskBindingWrite is the whole-row task binding assignment.
 type AdminPluginTaskBindingWrite struct {
 	Enabled bool            `json:"enabled"`
-	Trigger PluginJSONValue `json:"trigger,omitempty" doc:"Plugin-defined trigger document; omitted stores an empty object"`
+	Trigger PluginJSONValue `json:"trigger,omitempty" doc:"The task's schedule as a task trigger (type interval, daily, weekly or startup with that type's fields). The task runs it unless the task has a saved schedule (a task-page edit, or a schedule an earlier server release saved from the binding trigger); an empty or unrunnable trigger leaves the manifest default_trigger, else one run at server start. Omitted stores an empty object"`
 }
 type AdminPluginTaskBindingInput struct {
 	ID           ID     `path:"id" pattern:"^[1-9][0-9]*$"`
@@ -73,11 +76,11 @@ type AdminPluginTaskBindingInput struct {
 	Body         AdminPluginTaskBindingWrite
 }
 type AdminPluginTaskBindingResult struct {
-	RestartRequired bool `json:"restart_required" doc:"Always true: bindings load at server start"`
+	RestartRequired bool `json:"restart_required" doc:"False when the binding applies without a restart: this server attempts a plugin task sync before answering and retries a failed one, and every other API server applies it at its next successful sync. True only on a server with no task scheduler, where it applies at the next start"`
 }
 type AdminPluginTaskBindingOutput struct{ Body AdminPluginTaskBindingResult }
 
-// authBindingRestartRequired is the fixed X-Vio-Restart-Required value of an
+// authBindingRestartRequired is the fixed X-Silo-Restart-Required value of an
 // auth binding write: the sign-in provider registry rebuilds on every node,
 // so no restart is needed. The header stays in the contract.
 const authBindingRestartRequired = "false"
@@ -114,10 +117,18 @@ func adminPluginMutationProblem(err error) error {
 	switch {
 	case errors.Is(err, plugins.ErrInstallationNotFound):
 		return NewProblem(TypeNotFound, "Plugin installation not found.")
+	case errors.Is(err, plugins.ErrInstallationChanged):
+		return NewProblem(TypeConflict, "Another install or update replaced this plugin while its package downloaded, so Silo didn't install it. Check the installed version and try again.")
+	case errors.Is(err, plugins.ErrPluginAlreadyInstalled):
+		return NewProblem(TypeConflict, "Another install of this plugin finished first, so Silo didn't install it again. Check the installed version and try again.")
 	case errors.Is(err, handlers.ErrPluginBuiltinInstallation):
 		return NewProblem(TypeConflict, "Built-in host providers cannot be modified.")
 	case errors.Is(err, plugins.ErrAuthBindingIneligible):
 		return NewProblem(TypeConflict, "An enabled sign-in binding is incompatible with this plugin release. Disable or update the binding before enabling the plugin or replacing the release.")
+	case errors.Is(err, plugins.ErrInstallationBusy):
+		return NewProblem(TypeDependencyUnavailable, "This plugin's sign-in accounts are being changed right now, so it was not uninstalled. Try again in a moment.").WithRetryAfter(1)
+	case errors.Is(err, auth.ErrSignInProviderRequired):
+		return NewProblem(TypeSignInProviderRequired, "Password sign-in is off, and this is the last sign-in provider people can use. Turn password sign-in back on first. Break-glass administrators can sign in with a password either way.")
 	case errors.Is(err, plugins.ErrAuthProviderAlreadyEnabled):
 		return NewProblem(TypeProviderAlreadyEnabled, "Another sign-in provider is already enabled. Turn it off first: a server has one external sign-in provider.")
 	case errors.As(err, &validation):
@@ -174,7 +185,7 @@ func registerAdminPluginConfiguration(reg *Registry) {
 		}
 		return &AdminPluginConnectionCheckOutput{Body: AdminPluginConnectionCheck{Success: result.Success, Message: result.Message}}, nil
 	})
-	auth := op("PUT", "auth-binding", "updateAdminPluginAuthBinding", "Replace the auth provider binding for one capability. Sign-in providers rebuild on every node without a restart. Enabling a binding while another one is enabled is 409 provider_already_enabled. The whole row is assigned, so repeating the request converges on one stored binding.", RetrySafetyNaturalIdempotent)
+	auth := op("PUT", "auth-binding", "updateAdminPluginAuthBinding", "Replace the auth provider binding for one capability. Sign-in providers rebuild on every node without a restart. Enabling a binding while another one is enabled is 409 provider_already_enabled. Turning off the last OIDC or LDAP binding people can sign in with while auth.local_password_login is off is 409 sign_in_provider_required. The whole row is assigned, so repeating the request converges on one stored binding.", RetrySafetyNaturalIdempotent)
 	auth.DefaultStatus = http.StatusNoContent
 	Register(reg, auth, func(ctx context.Context, in *AdminPluginAuthBindingInput) (*AdminPluginAuthBindingOutput, error) {
 		if reg.deps.AdminPluginConfiguration == nil {
@@ -197,7 +208,7 @@ func registerAdminPluginConfiguration(reg *Registry) {
 		}
 		return &AdminPluginAuthBindingOutput{RestartRequired: authBindingRestartRequired}, nil
 	})
-	task := op("PUT", "task-bindings/{capability_id}", "updateAdminPluginTaskBinding", "Replace the scheduled task binding for one capability and mark a server restart required. The whole row is assigned, so repeating the request converges on one stored binding.", RetrySafetyNaturalIdempotent)
+	task := op("PUT", "task-bindings/{capability_id}", "updateAdminPluginTaskBinding", "Replace the scheduled task binding for one capability and apply it on every API server: a disabled binding removes the task and cancels a run in progress, an enabled one registers it while its installation is enabled, and a changed trigger becomes its default schedule. The whole row is assigned, so repeating the request converges on one stored binding.", RetrySafetyNaturalIdempotent)
 	Register(reg, task, func(ctx context.Context, in *AdminPluginTaskBindingInput) (*AdminPluginTaskBindingOutput, error) {
 		if reg.deps.AdminPluginConfiguration == nil {
 			return nil, unavailable("plugin configuration")
@@ -212,9 +223,10 @@ func registerAdminPluginConfiguration(reg *Registry) {
 		if strings.TrimSpace(in.CapabilityID) == "" {
 			return nil, validationProblem("path.capability_id", codeInvalid, "A capability ID is required.")
 		}
-		if err := reg.deps.AdminPluginConfiguration.SetAdminPluginTaskBinding(ctx, id, in.CapabilityID, handlers.PluginTaskBindingInput{Enabled: in.Body.Enabled, Trigger: map[string]any(in.Body.Trigger)}); err != nil {
+		restartRequired, err := reg.deps.AdminPluginConfiguration.SetAdminPluginTaskBinding(ctx, id, in.CapabilityID, handlers.PluginTaskBindingInput{Enabled: in.Body.Enabled, Trigger: map[string]any(in.Body.Trigger)})
+		if err != nil {
 			return nil, adminPluginMutationProblem(err)
 		}
-		return &AdminPluginTaskBindingOutput{Body: AdminPluginTaskBindingResult{RestartRequired: true}}, nil
+		return &AdminPluginTaskBindingOutput{Body: AdminPluginTaskBindingResult{RestartRequired: restartRequired}}, nil
 	})
 }

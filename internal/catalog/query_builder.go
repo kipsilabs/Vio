@@ -1401,8 +1401,7 @@ func (qb *QueryBuilder) ebookLeafCompletionSQL(contentExpr string, base int) str
 // (ListBySeriesIDs / ListBySeasonIDs) so this verdict agrees with item
 // user-data. That set is "episodes with at least one library link", expressed by
 // episodeAvailabilityPredicate (internal/catalog/episode_repo.go) — embedded
-// verbatim here — with alias layout rows excluded, matching the canonical
-// episode lists. If either predicate changes, this rollup must change with it.
+// verbatim here. If that predicate changes, this rollup must change with it.
 //
 // A row is complete only when at least one available child exists and no
 // available child is incomplete, matching allEpisodesCompleted's false-on-empty
@@ -1415,17 +1414,15 @@ func (qb *QueryBuilder) episodeRollupCompletionSQL(linkColumn, alias string, bas
 			FROM episodes
 			WHERE episodes.%[1]s = %[2]s.content_id
 			  AND %[3]s
-			  AND %[4]s
 		)
 		AND NOT EXISTS (
 			SELECT 1
 			FROM episodes
 			WHERE episodes.%[1]s = %[2]s.content_id
 			  AND %[3]s
-			  AND %[4]s
-			  AND NOT %[5]s
+			  AND NOT %[4]s
 		)
-	)`, linkColumn, alias, episodeAliasExclusionPredicate, episodeAvailabilityPredicate, leaf)
+	)`, linkColumn, alias, episodeAvailabilityPredicate, leaf)
 }
 
 // lastWatchedExpr returns the SQL expression the executor binds to the

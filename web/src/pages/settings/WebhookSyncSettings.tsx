@@ -272,7 +272,10 @@ function EventMatrix({ sections }: { sections: EventMatrixSection[] }) {
           </p>
           <ul className="space-y-1">
             {section.items.map((item) => (
-              <li key={item.event} className="text-muted-foreground text-[13px] leading-relaxed">
+              <li
+                key={item.event}
+                className="text-muted-foreground text-[0.8125rem] leading-relaxed"
+              >
                 {t("web.settings.webhooks.setup.eventLine", {
                   event: t(item.event),
                   note: t(item.note),
@@ -371,7 +374,7 @@ export default function WebhookSyncSettings() {
       .map(({ user, mapping }) => ({
         external_user_id: user.external_user_id,
         external_user_name: user.external_user_name,
-        vio_profile_id: mapping?.vio_profile_id ?? "",
+        silo_profile_id: mapping?.silo_profile_id ?? "",
       }))
       .sort((a, b) => a.external_user_name.localeCompare(b.external_user_name));
   }, [mappingsQuery.data]);
@@ -563,11 +566,11 @@ export default function WebhookSyncSettings() {
       connectionId: currentConnectionId,
       body: {
         mappings: mappingRows.map((row) => {
-          const value = currentMappingDrafts[row.external_user_id] ?? row.vio_profile_id;
+          const value = currentMappingDrafts[row.external_user_id] ?? row.silo_profile_id;
           return {
             external_user_id: row.external_user_id,
             external_user_name: row.external_user_name,
-            vio_profile_id: !value || value === UNMAPPED_VALUE ? null : value,
+            silo_profile_id: !value || value === UNMAPPED_VALUE ? null : value,
           };
         }),
       },
@@ -640,7 +643,7 @@ export default function WebhookSyncSettings() {
                 <Label className="text-sm font-medium">
                   {t("web.settings.webhooks.add.plexAccount")}
                 </Label>
-                <p className="text-muted-foreground text-[13px] leading-relaxed">
+                <p className="text-muted-foreground text-[0.8125rem] leading-relaxed">
                   {hasSignedInToPlex
                     ? t("web.settings.webhooks.add.plexServers", {
                         count: plexServers.length,
@@ -675,7 +678,7 @@ export default function WebhookSyncSettings() {
                   <Label className="text-sm font-medium">
                     {t("web.settings.webhooks.add.server")}
                   </Label>
-                  <p className="text-muted-foreground text-[13px] leading-relaxed">
+                  <p className="text-muted-foreground text-[0.8125rem] leading-relaxed">
                     {t("web.settings.webhooks.add.serverHint")}
                   </p>
                 </div>
@@ -721,7 +724,7 @@ export default function WebhookSyncSettings() {
             <Label className="text-sm font-medium">
               {t("web.settings.webhooks.defaultProfile")}
             </Label>
-            <p className="text-muted-foreground text-[13px] leading-relaxed">
+            <p className="text-muted-foreground text-[0.8125rem] leading-relaxed">
               {t("web.settings.webhooks.add.defaultProfileHint")}
             </p>
           </div>
@@ -863,13 +866,13 @@ export default function WebhookSyncSettings() {
                             time: formatTimestamp(t, selectedConnection.last_webhook_error_at),
                           })}
                         </p>
-                        <p className="text-[13px] leading-relaxed text-red-300/80">
+                        <p className="text-[0.8125rem] leading-relaxed text-red-300/80">
                           {selectedConnection.last_webhook_error_message}
                         </p>
                       </div>
                     </div>
                   ) : (
-                    <div className="flex items-center gap-2 text-[13px]">
+                    <div className="flex items-center gap-2 text-[0.8125rem]">
                       <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" />
                       <span className="text-muted-foreground">
                         {t("web.settings.webhooks.detail.ready")}
@@ -1007,7 +1010,7 @@ export default function WebhookSyncSettings() {
                       <Label className="text-sm font-medium">
                         {t("web.settings.webhooks.mapping.title")}
                       </Label>
-                      <p className="text-muted-foreground text-[13px] leading-relaxed">
+                      <p className="text-muted-foreground text-[0.8125rem] leading-relaxed">
                         {t("web.settings.webhooks.mapping.description")}
                       </p>
                     </div>
@@ -1043,7 +1046,7 @@ export default function WebhookSyncSettings() {
                             <Select
                               value={
                                 currentMappingDrafts[row.external_user_id] ??
-                                row.vio_profile_id ??
+                                row.silo_profile_id ??
                                 UNMAPPED_VALUE
                               }
                               onValueChange={(value) =>

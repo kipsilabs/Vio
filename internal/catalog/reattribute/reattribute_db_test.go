@@ -8,13 +8,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-
-	"github.com/Silo-Server/silo-server/internal/testdb"
 )
-
-func TestMain(m *testing.M) {
-	os.Exit(testdb.SetupPackage(m, "reattribute"))
-}
 
 type testEnv struct {
 	pool      *pgxpool.Pool

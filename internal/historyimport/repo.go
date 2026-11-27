@@ -214,7 +214,7 @@ func (r *Repository) CreateSource(ctx context.Context, input CreateSourceInput) 
 	if err != nil {
 		return nil, fmt.Errorf("begin creating history import source: %w", err)
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
+	defer tx.Rollback(ctx)
 
 	row := tx.QueryRow(ctx, `
 		INSERT INTO history_import_sources (name, source_type, base_url, system_id, enabled, sort_order)
@@ -1284,8 +1284,6 @@ func (r *Repository) scanConnectSession(scanner interface{ Scan(dest ...any) err
 // scanRun is the legacy scanner for queries that do NOT include mapping_id.
 // Kept for backward compatibility with UpdateRunProgress/CompleteRun/FailRun paths
 // that use Exec and do not scan rows.
-//
-//nolint:unused // Retained for compatibility with dormant integration paths.
 func scanRun(scanner interface{ Scan(dest ...any) error }) (*Run, error) {
 	var run Run
 	var warningsJSON []byte
@@ -1337,7 +1335,6 @@ func finalizeRunScan(run *Run, warningsJSON, unmatchedJSON []byte) (*Run, error)
 	return run, nil
 }
 
-//nolint:unused // Retained for compatibility with dormant integration paths.
 func scanRuns(rows pgx.Rows) ([]Run, error) {
 	var runs []Run
 	for rows.Next() {

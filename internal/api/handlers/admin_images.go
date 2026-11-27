@@ -2,15 +2,12 @@ package handlers
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"slices"
 	"time"
-
-	"github.com/go-chi/chi/v5"
 
 	"github.com/Silo-Server/silo-server/internal/cache"
 	"github.com/Silo-Server/silo-server/internal/catalog"
@@ -130,9 +127,6 @@ type currentImages struct {
 	PosterURL   string `json:"poster_url,omitempty"`
 	BackdropURL string `json:"backdrop_url,omitempty"`
 	LogoURL     string `json:"logo_url,omitempty"`
-	// StillURL is the episode's current title card. v1 is frozen, so it is
-	// kept out of the shared JSON body and emitted by apiv2 as still_url.
-	StillURL string `json:"-"`
 }
 
 type applyItemImageRequest struct {
@@ -213,24 +207,6 @@ func (h *AdminImageHandler) resolveContentID(ctx context.Context, contentID stri
 	return nil, catalog.ErrItemNotFound
 }
 
-// HandleGetItemImages handles GET /admin/items/{id}/images.
-// It fetches available images from all enabled metadata providers.
-func (h *AdminImageHandler) HandleGetItemImages(w http.ResponseWriter, r *http.Request) {
-	contentID := chi.URLParam(r, "id")
-	if contentID == "" {
-		writeError(w, http.StatusBadRequest, "bad_request", "Item ID is required")
-		return
-	}
-
-	// Frozen v1 keeps its provider-only choices.
-	out, err := h.listItemImages(r.Context(), contentID, false)
-	if err != nil {
-		writeAPIError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, out)
-}
-
 type AdminItemImagesView = getItemImagesResponse
 
 // GetAdminItemImages lists provider choices plus, for a movie or series, the
@@ -243,7 +219,7 @@ func (h *AdminImageHandler) GetAdminItemImages(ctx context.Context, contentID st
 // episode, with display URLs resolved. A season list marks show artwork as a
 // fallback. includeLocal adds sidecar artwork for a movie or series and the
 // uploaded images the item shows.
-func (h *AdminImageHandler) listItemImages(ctx context.Context, contentID string, includeLocal bool) (AdminItemImagesView, error) { //nolint:funlen // upstream listItemImages exceeds Vio's 100-line limit; refactor tracked separately
+func (h *AdminImageHandler) listItemImages(ctx context.Context, contentID string, includeLocal bool) (AdminItemImagesView, error) {
 	resolved, err := h.resolveContentID(ctx, contentID)
 	if err != nil {
 		if errors.Is(err, catalog.ErrItemNotFound) {
@@ -326,7 +302,7 @@ func (h *AdminImageHandler) listItemImages(ctx context.Context, contentID string
 	for _, img := range images {
 		displayURL := img.URL
 		providerID := img.ProviderID
-		if withLocal && metadata.IsLocalImageSource(img.URL) { //nolint:nestif // upstream listItemImages in admin_images.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
+		if withLocal && metadata.IsLocalImageSource(img.URL) {
 			// A file the picker cannot preview could not be applied either:
 			// both read it under the same confinement and size checks. Report
 			// the failure so the admin can tell why the choice is missing.
@@ -377,41 +353,12 @@ func (h *AdminImageHandler) listItemImages(ctx context.Context, contentID string
 		current.PosterURL = resolved.season.PosterPath
 		current.BackdropURL = resolved.season.BackdropPath
 	}
-	// An episode owns its title card (still) independently of the parent
-	// series. Emit it additively as still_url; poster_url keeps its existing
-	// meaning so the frozen v1 body is unchanged.
-	if resolved.episode != nil {
-		current.StillURL = resolved.episode.StillPath
-	}
 
 	return AdminItemImagesView{
 		Images:         entries,
 		Current:        current,
 		ProviderErrors: providerErrors,
 	}, nil
-}
-
-// HandleApplyItemImage handles POST /admin/items/{id}/images/apply.
-// It downloads the selected image, caches it to S3, and updates the item.
-func (h *AdminImageHandler) HandleApplyItemImage(w http.ResponseWriter, r *http.Request) {
-	contentID := chi.URLParam(r, "id")
-	if contentID == "" {
-		writeError(w, http.StatusBadRequest, "bad_request", "Item ID is required")
-		return
-	}
-
-	var req applyItemImageRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "Invalid request body")
-		return
-	}
-	// Frozen v1 keeps applying provider images only.
-	out, err := h.applyItemImage(r.Context(), contentID, req, false)
-	if err != nil {
-		writeAPIError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, out)
 }
 
 type AdminItemImageResult = applyItemImageResponse
@@ -438,12 +385,8 @@ func (h *AdminImageHandler) applyItemImage(ctx context.Context, contentID string
 	}
 
 	imageType := metadata.ImageTypeFromString(req.Type)
-	// Episodes only have stills, and a still is the episode's title card. The
-	// "titlecard" alias resolves to ImageStill above, so a title card (or an
-	// explicit still) requested on a movie, series, or season is rejected by
-	// the target validation below before any download. Clients historically
-	// sent "poster" for an episode (the old flow silently dropped it), so
-	// coerce rather than reject.
+	// Episodes only have stills. Clients historically sent "poster" here (the
+	// old flow silently dropped it), so coerce rather than reject.
 	if resolved.contentType == "episode" {
 		imageType = metadata.ImageStill
 	}
@@ -452,13 +395,6 @@ func (h *AdminImageHandler) applyItemImage(ctx context.Context, contentID string
 	if err := catalog.ValidateArtworkSelectionTarget(resolved.contentType, metadata.ImageTypeToString(imageType)); err != nil {
 		return AdminItemImageResult{}, apiError(http.StatusBadRequest, "unsupported_image_type",
 			fmt.Sprintf("%s items do not accept %s images", resolved.contentType, metadata.ImageTypeToString(imageType)))
-	}
-	// The apply ruling narrows a season to its poster: a season's backdrop is
-	// owned by the provider sync (the series carries the user-facing backdrop),
-	// so selecting one here would be stored where no client reads it.
-	if resolved.contentType == "season" && imageType != metadata.ImagePoster {
-		return AdminItemImageResult{}, apiError(http.StatusBadRequest, "unsupported_image_type",
-			"season items accept poster images only")
 	}
 	var result *metadata.ApplyItemImageResult
 	switch {

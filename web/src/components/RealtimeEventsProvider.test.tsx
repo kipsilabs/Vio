@@ -1,5 +1,4 @@
 import { adminSessionsKey } from "@/api/v2/adminSessionsCache";
-import { v2Problem } from "@/api/v2/problems.test-support";
 import { adminDownloadPreparationsKey } from "@/api/v2/adminDownloadPreparations";
 import { makePreparation, makePreparationList } from "@/test/downloadPreparations";
 import {
@@ -583,7 +582,7 @@ describe("RealtimeEventsProvider", () => {
   it("patches preparation progress in place and re-reads the list on other changes", async () => {
     setProfileId("primary");
     mockState.profile = { id: "primary", has_pin: false };
-    mockState.pathname = "/admin/activity";
+    mockState.pathname = "/admin/downloads";
     const queryClient = new QueryClient();
     const key = adminDownloadPreparationsKey(captureProfileRequestContext());
     const initial = makePreparationList([makePreparation()]);
@@ -886,70 +885,6 @@ describe("RealtimeEventsProvider", () => {
       type: "active",
       predicate: expect.any(Function),
     });
-  });
-
-  it("excludes terminal 404 item details from the broad catch-up refetch", async () => {
-    const queryClient = new QueryClient({
-      defaultOptions: {
-        queries: { retry: false },
-        mutations: { retry: false },
-      },
-    });
-    const refetchQueries = vi.spyOn(queryClient, "refetchQueries").mockResolvedValue(undefined);
-    mockState.pathname = "/item/movie-1";
-    const provider = () => (
-      <QueryClientProvider client={queryClient}>
-        <RealtimeEventsProvider>
-          <div />
-        </RealtimeEventsProvider>
-      </QueryClientProvider>
-    );
-
-    const view = render(provider());
-
-    await act(async () => {
-      mockState.pageActivity = {
-        ...mockState.pageActivity,
-        isVisible: false,
-        canApplyRealtimeUpdates: false,
-      };
-      view.rerender(provider());
-    });
-    // A return inside the socket grace period keeps the cache current; stay
-    // hidden past it so this return has a catch-up to inspect.
-    await act(async () => {
-      vi.advanceTimersByTime(HIDDEN_EVENTS_SOCKET_GRACE_MS);
-    });
-
-    await act(async () => {
-      mockState.pageActivity = {
-        ...mockState.pageActivity,
-        isVisible: true,
-        canApplyRealtimeUpdates: true,
-      };
-      view.rerender(provider());
-    });
-
-    const predicate = refetchQueries.mock.calls[0]?.[0]?.predicate as
-      | ((query: {
-          queryKey: readonly unknown[];
-          state?: { status?: string; error?: unknown };
-        }) => boolean)
-      | undefined;
-    expect(predicate).toBeDefined();
-
-    expect(
-      predicate?.({
-        queryKey: catalogKeys.itemDetail("movie-tmdb-1083381"),
-        state: { status: "error", error: v2Problem(404, "not_found", "Not Found") },
-      }),
-    ).toBe(false);
-    expect(
-      predicate?.({
-        queryKey: catalogKeys.itemDetail("movie-1"),
-        state: { status: "success" },
-      }),
-    ).toBe(true);
   });
 
   it("preserves cached watched state when a favorite-only event arrives", async () => {

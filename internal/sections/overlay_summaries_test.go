@@ -47,7 +47,7 @@ func overlayTestPool(t testing.TB) (*pgxpool.Pool, *overlayQueryTrace) {
 		_, err := conn.Exec(ctx, `CREATE TEMP TABLE media_files (
    id integer PRIMARY KEY, content_id text, episode_id text, media_folder_id integer NOT NULL DEFAULT 1,
    file_path text NOT NULL DEFAULT '', resolution text, codec_audio text,
-   audio_tracks jsonb, hdr boolean, video_tracks jsonb,
+   audio_tracks jsonb, hdr boolean NOT NULL DEFAULT false, video_tracks jsonb,
    codec_video text, audio_channels integer, container text,
    subtitle_tracks jsonb, external_subtitles jsonb, edition_key text, missing_since timestamptz,
    multi_episode_start integer, multi_episode_end integer
@@ -137,6 +137,7 @@ func TestOverlaySummariesRankingMatchesGo(t *testing.T) {
 		{Resolution: "1080p", VideoTracks: []models.VideoTrack{{VideoRangeType: "SomethingWithHLG"}}},
 		{Resolution: "1080p", VideoTracks: []models.VideoTrack{{ColorTransfer: "SMPTE2084"}}},
 		{Resolution: "1080p", VideoTracks: []models.VideoTrack{{ColorTransfer: "ARIB-STD-B67"}}},
+		{Resolution: "1080p", VideoTracks: []models.VideoTrack{{VideoRangeType: "SDR", ColorTransfer: "smpte2084"}}},
 		{Resolution: "1080p", HDR: true, VideoTracks: []models.VideoTrack{{VideoRangeType: "SDR"}}},
 		{Resolution: "1080p", VideoTracks: []models.VideoTrack{{VideoRangeType: "SDR"}, {VideoRangeType: "HDR10"}}},
 		{Resolution: "1080p", SubtitleTracks: []models.SubtitleTrack{}, ExternalSubtitles: []models.ExternalSubtitle{}},

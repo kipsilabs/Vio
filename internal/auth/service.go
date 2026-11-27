@@ -10,11 +10,11 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/Silo-Server/silo-server/internal/auditmutation"
 	"github.com/Silo-Server/silo-server/internal/auth/passwordhash"
 	"github.com/Silo-Server/silo-server/internal/config"
+	"github.com/Silo-Server/silo-server/internal/demomode"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/userstore"
 	"github.com/google/uuid"
@@ -46,6 +46,12 @@ var (
 	// ErrSignupSessionStart reports a signup whose account was created but
 	// whose sign-in failed: repeating the signup cannot succeed.
 	ErrSignupSessionStart = errors.New("account created but login failed")
+	// ErrDemoLoginDisabled reports a demo sign-in while demo mode is off: the
+	// server is not a public demo.
+	ErrDemoLoginDisabled = errors.New("demo login is not enabled")
+	// ErrDemoLoginNotConfigured reports a demo sign-in on a public demo whose
+	// demo.username names no account that a visitor may be signed in to.
+	ErrDemoLoginNotConfigured = errors.New("demo login is not configured")
 )
 
 // SessionCheckRetryAfterSeconds is the Retry-After of every answer to a
@@ -62,7 +68,7 @@ func sessionCheckUnavailable(op string, err error) error {
 }
 
 const (
-	MinimumPasswordLength = 8
+	MinimumPasswordLength = config.PasswordMinLengthFloor
 	MaximumPasswordBytes  = 72
 )
 
@@ -123,6 +129,8 @@ type Service struct {
 	// signInAttempts bounds password attempts per sign-in name; nil allows
 	// every attempt (SetSignInAttempts).
 	signInAttempts SignInAttemptLimiter
+	// signInFolds remembers how the database folded sign-in names.
+	signInFolds signInFoldCache
 	// sessionsRevoked runs after a password change signed the account out
 	// of its other sessions; see OnSessionsRevoked.
 	sessionsRevoked      func(ctx context.Context, userID int)
@@ -194,8 +202,83 @@ func NewService(
 
 // Login authenticates the user with the given credentials and creates a new
 // session. Returns a TokenPair containing the access and refresh tokens.
+//
+// It spends no sign-in attempt budget: its callers (signup, invitation
+// acceptance, a completed password reset) sign in with a password they have
+// just set. A success still makes the request's address one the account is
+// known to sign in from (SignInAttemptLimiter.Trust).
 func (s *Service) Login(ctx context.Context, username, password, deviceName, ip string) (*TokenPair, *models.User, error) {
-	return s.loginWithProvider(ctx, LocalProviderID, username, password, deviceName, ip, false)
+	pair, user, err := s.loginWithProvider(ctx, LocalProviderID, username, password, deviceName, ip, false)
+	if err == nil {
+		s.trustSignInSource(ctx, user)
+	}
+	return pair, user, err
+}
+
+// DemoLogin signs a visitor in to the public demo account: the account
+// demo.username names while demo.enabled is on. The session is an ordinary
+// login session, the one a visitor who typed the account's password gets, so
+// demo mode restricts it as it restricts them. It returns ErrDemoLoginDisabled
+// while demo mode is off, and ErrDemoLoginNotConfigured when demo.username is
+// empty or names an account that is missing, disabled, an administrator, or
+// holding a temporary password.
+func (s *Service) DemoLogin(ctx context.Context, deviceName, ip string) (*TokenPair, *models.User, error) {
+	if s.settings == nil || s.users == nil || s.sessions == nil {
+		return nil, nil, ErrDemoLoginDisabled
+	}
+	username, on, err := demomode.DemoAccount(ctx, s.settings)
+	if err != nil {
+		return nil, nil, fmt.Errorf("reading demo login settings: %w", err)
+	}
+	if !on {
+		return nil, nil, ErrDemoLoginDisabled
+	}
+	if username == "" {
+		return nil, nil, ErrDemoLoginNotConfigured
+	}
+	candidate, err := s.users.GetByUsername(ctx, username)
+	if IsNotFound(err) {
+		return nil, nil, ErrDemoLoginNotConfigured
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("looking up demo account: %w", err)
+	}
+	sessionID := uuid.New().String()
+	var user *models.User
+	// Account changes hold this row lock, so a promotion, disable or rename
+	// that commits first refuses the sign-in instead of missing its session.
+	err = pgx.BeginFunc(ctx, s.users.pool, func(tx pgx.Tx) error {
+		current, err := lockUser(ctx, tx, candidate.ID)
+		if IsNotFound(err) {
+			return ErrDemoLoginNotConfigured
+		}
+		if err != nil {
+			return err
+		}
+		if !current.Enabled || current.Role == models.RoleAdmin || current.PasswordChangeRequired ||
+			!strings.EqualFold(current.Username, username) {
+			return ErrDemoLoginNotConfigured
+		}
+		user = current
+		return s.sessions.createWithQuerier(ctx, tx, models.AuthSession{
+			ID:         sessionID,
+			UserID:     current.ID,
+			DeviceName: deviceName,
+			IPAddress:  ip,
+			ExpiresAt:  time.Now().Add(s.jwt.RefreshExpiry()),
+		})
+	})
+	if errors.Is(err, ErrDemoLoginNotConfigured) {
+		return nil, nil, err
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("creating demo session: %w", err)
+	}
+	pair, err := s.generateTokenPair(Claims{UserID: user.ID, Role: user.Role, SessionID: sessionID})
+	if err != nil {
+		return nil, nil, err
+	}
+	return pair, user, nil
 }
 
 // CompatLogin is Login for sign-in surfaces that cannot run the forced
@@ -225,21 +308,23 @@ func (s *Service) CompatLogin(ctx context.Context, username, password, deviceNam
 // username when budgetName is empty: a caller that resolved username from
 // what was typed by looking accounts up passes a name that depends only on
 // the typed text, so the budget cannot tell a stranger what the lookup
-// found. A success clears the same budget.
+// found. A success clears the same budget, unless budgetName names another
+// account than the one that signed in.
 func (s *Service) CompatLoginWithLocalFallback(ctx context.Context, username, password, fallback, deviceName, ip, budgetName string) (pair *TokenPair, user *models.User, usedFallback bool, err error) {
 	if budgetName == "" {
 		budgetName = username
 	}
-	if err = s.reserveSignIn(ctx, budgetName); err != nil {
+	spend := s.newSignInSpend(ctx, budgetName, username)
+	if err = s.reserveSignIn(ctx, spend); err != nil {
 		return nil, nil, false, err
 	}
-	defer func() { s.finishSignIn(ctx, budgetName, err) }()
+	defer func() { s.finishSignIn(ctx, spend, user, err) }()
 	if fallback != "" {
 		// A fallback is a second password that may be checked, so it spends a
 		// second attempt up front, for every name: charging it only where the
 		// fallback runs (local accounts) would tell names apart by how soon
 		// they lock.
-		if err = s.reserveSignIn(ctx, budgetName); err != nil {
+		if err = s.reserveSignIn(ctx, spend); err != nil {
 			return nil, nil, false, err
 		}
 	}
@@ -284,10 +369,11 @@ func (s *Service) LoginWithProvider(
 	deviceName string,
 	ip string,
 ) (pair *TokenPair, user *models.User, err error) {
-	if err = s.reserveSignIn(ctx, username); err != nil {
+	spend := s.newSignInSpend(ctx, username, "")
+	if err = s.reserveSignIn(ctx, spend); err != nil {
 		return nil, nil, err
 	}
-	defer func() { s.finishSignIn(ctx, username, err) }()
+	defer func() { s.finishSignIn(ctx, spend, user, err) }()
 	if providerID == "" {
 		routed, err := s.routePasswordLogin(ctx, username)
 		if err != nil {
@@ -377,7 +463,7 @@ func (s *Service) PasswordSignInFor(ctx context.Context, userID int) (PasswordSi
 	if hasDirectory {
 		directoryID = directory.Info.ID
 	}
-	if passwordRoute(user, directoryID) == LocalProviderID && user.LocalPasswordLoginEnabled && user.PasswordHash != "" {
+	if passwordRoute(user, directoryID) == LocalProviderID && user.HasLocalPassword() {
 		err = localPasswordPolicy(ctx, s.users.pool, user)
 		if err == nil {
 			return PasswordSignIn{Local: true}, nil
@@ -883,7 +969,9 @@ func (s *Service) loginWithProvider(
 		return nil, nil, err
 	}
 	if refusePasswordChange && user.PasswordChangeRequired {
-		return nil, nil, ErrPasswordChangeRequired
+		// The account lets the caller's sign-in budget tell whose password
+		// matched (finishSignIn); callers check the error first.
+		return nil, user, ErrPasswordChangeRequired
 	}
 
 	// Create a new session with a pre-generated ID to avoid the race condition
@@ -992,7 +1080,7 @@ func (s *Service) SetupInitialUser(
 	defaultProfileName string,
 	deviceName, ip string,
 ) (*TokenPair, *models.User, error) {
-	if err := ValidateNewPassword(password); err != nil {
+	if err := CheckNewPassword(ctx, s.settings, password); err != nil {
 		return nil, nil, err
 	}
 
@@ -1057,7 +1145,7 @@ func (s *Service) Signup(
 	defaultProfileName string,
 	deviceName, ip string,
 ) (*TokenPair, *models.User, error) {
-	if err := ValidateNewPassword(password); err != nil {
+	if err := CheckNewPassword(ctx, s.settings, password); err != nil {
 		return nil, nil, err
 	}
 	// Check global signup toggle.
@@ -1326,7 +1414,16 @@ func (s *Service) Refresh(ctx context.Context, refreshToken string) (*TokenPair,
 	if session.IsRemotePlayback() {
 		refreshed = remotePlaybackClaims(refreshed, session)
 	}
-	return s.generateTokenPair(refreshed)
+	pair, err := s.generateTokenPair(refreshed)
+	if err == nil && session.ImpersonatorUserID == nil && !session.IsRemotePlayback() {
+		// A device that keeps its session refreshed shows where the account
+		// signs in from, so a new device there is not locked out with
+		// strangers while someone else spends the name's attempt budget. An
+		// impersonating administrator and a device handed one playback
+		// session are elsewhere.
+		s.trustSignInSource(ctx, user)
+	}
+	return pair, err
 }
 
 // sessionStanding is what checkSessionStanding establishes about a login
@@ -1496,7 +1593,7 @@ func (s *Service) PasswordChangeAvailable(ctx context.Context, userID int) (bool
 	if err != nil {
 		return false, fmt.Errorf("getting user: %w", err)
 	}
-	return user.LocalPasswordLoginEnabled && user.PasswordHash != "", nil
+	return user.HasLocalPassword(), nil
 }
 
 // ChangePassword verifies the existing local credential before replacing it.
@@ -1511,7 +1608,11 @@ func (s *Service) ChangePassword(ctx context.Context, userID int, sessionID, cur
 	if err != nil {
 		return fmt.Errorf("getting user: %w", err)
 	}
-	if err := validatePasswordChange(ctx, user, currentPassword, newPassword); err != nil {
+	policy, err := s.PasswordPolicy(ctx)
+	if err != nil {
+		return err
+	}
+	if err := validatePasswordChange(ctx, user, policy, currentPassword, newPassword); err != nil {
 		return err
 	}
 
@@ -1534,8 +1635,8 @@ func (s *Service) ChangePassword(ctx context.Context, userID int, sessionID, cur
 	return nil
 }
 
-func validatePasswordChange(ctx context.Context, user *models.User, currentPassword, newPassword string) error {
-	if !user.LocalPasswordLoginEnabled || user.PasswordHash == "" {
+func validatePasswordChange(ctx context.Context, user *models.User, policy PasswordPolicy, currentPassword, newPassword string) error {
+	if !user.HasLocalPassword() {
 		return ErrPasswordLoginDisabled
 	}
 	ok, err := CheckPassword(ctx, user, currentPassword)
@@ -1545,7 +1646,7 @@ func validatePasswordChange(ctx context.Context, user *models.User, currentPassw
 	if !ok {
 		return ErrCurrentPasswordInvalid
 	}
-	if err := ValidateNewPassword(newPassword); err != nil {
+	if err := policy.Check(newPassword); err != nil {
 		return err
 	}
 	if user.PasswordChangeRequired && newPassword == currentPassword {
@@ -1554,17 +1655,9 @@ func validatePasswordChange(ctx context.Context, user *models.User, currentPassw
 	return nil
 }
 
-// ValidateNewPassword applies the shared local credential policy before a new
-// account or password is persisted. The minimum counts characters; bcrypt
-// limits the UTF-8 encoding to 72 bytes.
-func ValidateNewPassword(password string) error {
-	if utf8.RuneCountInString(password) < MinimumPasswordLength {
-		return ErrPasswordTooShort
-	}
-	if len(password) > MaximumPasswordBytes {
-		return ErrPasswordTooLong
-	}
-	return nil
+// PasswordPolicy reads the server's current password policy.
+func (s *Service) PasswordPolicy(ctx context.Context) (PasswordPolicy, error) {
+	return LoadPasswordPolicy(ctx, s.settings)
 }
 
 // GetSessionsPage returns one keyset page of the user's live sessions; see
@@ -1595,11 +1688,37 @@ func (s *Service) LoginSessionActive(ctx context.Context, sessionID string) (boo
 // RevokeSession revokes a specific session. It verifies the session belongs
 // to the given user before revoking.
 func (s *Service) RevokeSession(ctx context.Context, sessionID string, userID int) error {
+	return s.revokeSession(ctx, sessionID, userID, func(*models.AuthSession) error { return nil })
+}
+
+// RevokeSessionChecked is RevokeSessionFrom with a further check on the
+// loaded session, run after the ownership and reach checks in the same
+// transaction. An error from check leaves the session live and is returned
+// unchanged.
+func (s *Service) RevokeSessionChecked(ctx context.Context, callerSessionID, sessionID string, userID int, check func(*models.AuthSession) error) error {
+	limited, err := s.SessionLimitedToItself(ctx, callerSessionID)
+	if err != nil {
+		return err
+	}
+	return s.revokeSession(ctx, sessionID, userID, func(session *models.AuthSession) error {
+		if limited && session.ID != callerSessionID {
+			return ErrSessionOutOfReach
+		}
+		if check != nil {
+			return check(session)
+		}
+		return nil
+	})
+}
+
+// revokeSession revokes one of userID's sessions; a session of another
+// account is ErrSessionNotFound before reach judges the locked session.
+func (s *Service) revokeSession(ctx context.Context, sessionID string, userID int, reach func(*models.AuthSession) error) error {
 	return s.sessions.revokeChecked(ctx, sessionID, func(session *models.AuthSession) error {
 		if session.UserID != userID {
 			return ErrSessionNotFound
 		}
-		return nil
+		return reach(session)
 	}, func(tx pgx.Tx, session *models.AuthSession) (*auditmutation.Entry, error) {
 		return auditmutation.RecordMutation(ctx, tx, auditmutation.ActionLoginSessionRevoked, auditmutation.TargetUser,
 			strconv.Itoa(session.UserID), http.StatusNoContent, auditmutation.Removed(auditFieldLoginSession, session.ID))

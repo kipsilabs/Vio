@@ -1,42 +1,30 @@
-# Vio Trademark & Fork Notice
+# Silo Trademark & Brand Policy
 
-Vio is an unofficial fork of **Silo**. Vio's source code is free and open
-source under the **GNU Affero General Public License v3.0 or later**
-(`AGPL-3.0-or-later`). You are welcome to use, study, modify, and
-redistribute it under those terms.
+Silo's source code is free and open source under the **GNU Affero General Public
+License v3.0 or later** (`AGPL-3.0-or-later`). You are welcome to use, study,
+modify, and redistribute it under those terms.
 
-**That freedom applies to the code — not to anyone's brand.** This notice
-explains who owns which marks and how they may be used.
-
-## What Vio is
-
-Vio is based on Silo (© Silo Media L.L.C., AGPL-3.0-or-later). Silo is a
-trademark of Silo Media L.L.C.; Vio is an unofficial fork, not affiliated
-with or endorsed by Silo Media.
+**That freedom applies to the code — not to the Silo name and brand.** The Silo
+trademarks identify the official project and its official builds. This policy
+explains how they may and may not be used. It exists for a simple reason:
+anyone should be free to fork the software, while users can still trust that
+something called "Silo" actually comes from us.
 
 ## Marks covered
 
-- The names **Vio** and **Vio Server**, the **Vio logo** and **wordmark**,
-  Vio **product and component names**, and confusingly similar variations
-  belong to this fork. They identify Vio builds from this repository and
-  its maintainers.
-- The names **Silo** and **Silo Server**, the **Silo logo** and
-  **wordmark**, Silo **product and component names** (including
-  **SiloRemote**, **SiloMac**, and other "Silo…" names), and confusingly
-  similar variations remain trademarks of **Silo Media L.L.C.**, whether or
-  not registered.
+The following are trademarks of **Silo Media L.L.C.** ("Silo Media"), whether or
+not registered:
 
-The AGPL license over the source code **does not grant any license to any
-of these marks** — Vio's or Silo Media's. This reservation is expressly
-permitted by AGPL-3.0 §7(e).
+- the names **Silo** and **Silo Server**
+- the **Silo logo** and **wordmark**
+- Silo **product and component names**, including **SiloRemote**, **SiloMac**,
+  and other "Silo…" names
+- confusingly similar variations of the above
 
-## How Vio uses the Silo marks
+The AGPL license over the source code **does not grant any license to these
+marks.** This reservation is expressly permitted by AGPL-3.0 §7(e).
 
-This fork uses the Silo marks **only referentially**: to state factually
-that Vio "is based on Silo," "is a fork of Silo," or "is compatible with
-Silo." That is nominative, truthful use — it describes where the code came
-from, not who endorses Vio. Vio does not present itself as Silo, as
-official, or as endorsed by Silo Media.
+## Uses that are always fine — no permission needed
 
 - **Referring to Silo truthfully** — "compatible with Silo," "a plugin for
   Silo," "built on Silo," "a fork of Silo." Use the word to refer to *our*
@@ -52,13 +40,73 @@ official, or as endorsed by Silo Media.
   organization.
 - **Editorial and educational** use — articles, tutorials, talks, reviews.
 
-You may fork Vio — that is your right under the AGPL. But a
-**distributed** fork must not use the Vio name or logo as its identity.
-Pick your own name and logo, remove the Vio brand assets (below), and you
-may state factually that your project "is based on Vio" or "is a fork of
-Vio." The same applies one level up: do not use the Silo name or logo as
-your identity either. This is the same model used by Mozilla, Rust, and
-many other open-source projects: **open code, protected identity.**
+## Uses that require our written permission
+
+- Distributing a **modified version under the Silo name** (see *Forks* below).
+- **Publishing an app to any app store** — Apple App Store, Google Play,
+  F-Droid, or similar — under the Silo name, logo, or a confusingly similar
+  identity.
+- Using the marks in a **company, product, domain, or app name** in a way that
+  reads as official (see *Naming your project*; wordplay is exempt), or in any
+  way that implies Silo Media operates or endorses your offering.
+- **Merchandise**, or using the logo or wordmark to sell your own product
+  beyond a referential "works with Silo" placement.
+
+Never use the marks to promote piracy or to impersonate the project.
+
+## Naming your project
+
+Give your client, plugin, or fork its own name, then mention Silo in the
+tagline or description: "Bramble — a Silo client for Android TV," "Simkl sync
+plugin for Silo." That is referential use and needs no permission.
+
+Official products use "Silo" alone, **Silo Server**, or "Silo" joined to a
+product word (**SiloRemote**, **SiloMac**). Those patterns are reserved and
+need written permission:
+
+- "Silo" on its own, or as the first word of a product name, including
+  generic descriptors used as the name such as "Silo Client" or "Silo Player"
+- "Silo[word]" names such as SiloTV or SiloPlay, which read as official apps
+- "[word]Silo" names such as OpenSilo or MySilo, which read as the project
+- misspellings and look-alikes such as Sylo or Si1o
+
+Repository and package names such as `silo-plugin-simkl` are fine when "silo"
+only describes what the code plugs into.
+
+**Wordplay is fine, and is the exception to the rules above.** A name such as
+"Siloette" or "Silodeon" contains the mark but reads as its own word, not as an
+official product, so it needs no permission, wherever you publish it, including
+app stores and commercial offerings. The test is whether a reasonable user would
+think the Silo team made it. Keep a description that says what the project is
+("Siloette, a Silo client"), use your own logo, and do not describe the project
+as official. Describing your project as "a Silo client" is fine; naming it
+"Silo Client" is not.
+
+## Writing the name
+
+- Prose and UI text: **Silo**, capital S, one word. The server product is
+  **Silo Server**.
+- Repositories, packages, and command-line binaries: lowercase `silo`
+  (`silo-server`). App bundles and product names keep the display form
+  (`Silo`, `SiloTV`).
+- Paths and config directories: follow the platform convention
+  (`/var/lib/silo`, `~/Library/Application Support/Silo`).
+- Never SILO, SiLo, or a typeset "Silo" in place of the supplied wordmark.
+
+## Colors and motif
+
+You may use the Silo colors, and the three-bar motif from the website, in your
+own interface. The logo, wordmark, and icons are what we reserve, so keep your
+own logo a different shape and do not build the Silo mark into it.
+
+## Forks must rebrand
+
+You may fork Silo — that is your right under the AGPL. But a **distributed** fork
+must not use the Silo name or logo as its identity. Pick your own name and logo,
+remove the Silo brand assets (below), and you may state factually that your
+project "is based on Silo" or "is a fork of Silo." This is the same model used by
+Mozilla, Rust, and many other open-source projects: **open code, protected
+identity.**
 
 ## Brand assets are not under the AGPL
 
@@ -71,19 +119,32 @@ files to refer to Silo, as described under *Uses that are always fine*. See the
 
 ## Official sources
 
-The only official Vio software comes from this repository and the builds it
-publishes:
+The only official Silo software comes from:
 
-- the **Vio** repository — <https://github.com/kipsilabs/Vio>
-- container images at `ghcr.io/kipsilabs/vio`
+- the **Silo-Server** organization on GitHub — <https://github.com/Silo-Server>
+- the official website — <https://siloserver.org>
+- official app-store listings published by **Silo Media L.L.C.**
 
-Any "Vio" build that does not originate from the above is **not** official
-and is **not** authorized to present itself as Vio.
+Any app-store listing, download, or "Silo" app that does not originate from the
+above is **not** official and is **not** authorized to present itself as Silo.
+Third-party projects that follow *Naming your project*, including wordplay
+names, are unaffected.
 
-The AGPL itself is unchanged by this notice.
+## Requesting permission / reporting misuse
+
+Not sure whether your use is fine? Ask in Discord (<https://discord.gg/siloserver>)
+or email **trademark@siloserver.org**. We answer quickly and usually say yes.
+The goal of this policy is only to prevent user confusion and unauthorized
+"official-looking" releases.
+
+The canonical copy of this policy is the one in the siloserver.org repository:
+<https://github.com/Silo-Server/siloserver.org/blob/main/TRADEMARK.md>. Other
+Silo repositories carry synchronized copies. The brand page at
+<https://siloserver.org/brand> is the practical guide and asset library, and
+follows the canonical file.
 
 ---
 
-*Vio is an unofficial fork of Silo. Silo and the Silo logo are trademarks
-of Silo Media L.L.C. Vio is not affiliated with or endorsed by Silo
-Media.*
+*Silo and the Silo logo are trademarks of Silo Media L.L.C. The **™** symbol is
+used with the Silo wordmark until federal registration issues, after which **®**
+applies.*

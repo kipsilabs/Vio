@@ -83,7 +83,7 @@ func RenderIndexHTML(index []byte, snap Snapshot) []byte {
 	out := string(index)
 
 	out = strings.Replace(out,
-		"<title>Vio</title>",
+		"<title>Silo</title>",
 		"<title>"+html.EscapeString(snap.ServerName)+"</title>",
 		1,
 	)

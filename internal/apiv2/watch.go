@@ -3,10 +3,8 @@ package apiv2
 import (
 	"context"
 	"errors"
-	"log/slog"
 	"net/http"
 	"strconv"
-	"time"
 
 	"github.com/Silo-Server/silo-server/internal/api/handlers"
 	catalogpkg "github.com/Silo-Server/silo-server/internal/catalog"
@@ -19,7 +17,7 @@ import (
 
 // WatchDetailInput is the getWatchState request.
 type WatchDetailInput struct {
-	DeviceID  string `header:"X-Vio-Device-Id" maxLength:"128" doc:"The stable device identifier used to resolve playback preferences" example:"tv-1"`
+	DeviceID  string `header:"X-Silo-Device-Id" maxLength:"128" doc:"The stable device identifier used to resolve playback preferences" example:"tv-1"`
 	ID        ID     `path:"id" doc:"A movie, episode, audiobook or ebook; a series is not directly playable" example:"movie:heat-1995"`
 	FileID    ID     `query:"file_id" doc:"Prefer this file when the item has several versions" example:"42"`
 	LibraryID ID     `query:"library_id" doc:"Present the item as a member of this library" example:"1"`
@@ -41,8 +39,6 @@ type WatchDetail struct {
 	Overview                        string                  `json:"overview,omitempty"`
 	Versions                        []WatchFileVersion      `json:"versions" doc:"Every playable file of the item; empty, never null"`
 	PlaybackVariants                []WatchPlaybackVariant  `json:"playback_variants,omitempty" doc:"Logical watch choices, each spanning one or more ordered parts"`
-	VirtualRanking                  *WatchVirtualRanking    `json:"virtual_ranking,omitempty" doc:"The ranking that produced the virtual versions' order; absent for local content"`
-	IndexerReleases                 []WatchIndexerRelease   `json:"indexer_releases" doc:"Releases that exist on the indexers but are not downloaded on the provider; empty, never null"`
 	Subtitles                       []WatchSubtitle         `json:"subtitles" doc:"Empty, never null"`
 	Intro                           *WatchMarker            `json:"intro,omitempty"`
 	Credits                         *WatchMarker            `json:"credits,omitempty"`
@@ -51,6 +47,8 @@ type WatchDetail struct {
 	UserData                        *WatchUserData          `json:"user_data,omitempty" doc:"The acting profile's progress; absent without a profile or progress"`
 	SeriesID                        string                  `json:"series_id,omitempty" doc:"Owning series of an episode"`
 	SeriesTitle                     string                  `json:"series_title,omitempty"`
+	EpisodeLabels                   string                  `json:"episode_labels,omitempty" enum:"air_date" doc:"The series' episode labels, as on CatalogItem: air_date means show air_date where the season and episode numbers would go; absent or unknown means show the numbers" example:"air_date"`
+	AirDate                         *string                 `json:"air_date,omitempty" format:"date" doc:"An episode's air date, YYYY-MM-DD; sent when episode_labels is air_date"`
 	SeasonNumber                    int                     `json:"season_number,omitempty"`
 	EpisodeNumber                   int                     `json:"episode_number,omitempty"`
 	EffectiveSubtitleLanguage       *string                 `json:"effective_subtitle_language,omitempty" pattern:"^(?:[a-z]{2,3}(?:-[0-9A-Za-z]{1,8})*|x(?:-[0-9A-Za-z]{1,8})+)?$" doc:"The subtitle language the profile's preferences resolve to: BCP 47 tag; empty when the preference is None"`
@@ -65,14 +63,13 @@ type WatchDetail struct {
 	PosterThumbhash                 string                  `json:"poster_thumbhash,omitempty"`
 	BackdropURL                     string                  `json:"backdrop_url,omitempty" format:"uri-reference" doc:"The item's backdrop, an episode's series backdrop, or an extra's parent backdrop, sized by image_size"`
 	BackdropThumbhash               string                  `json:"backdrop_thumbhash,omitempty"`
-	HasVirtualSource                *bool                   `json:"has_virtual_source,omitempty"`
 }
 
 // WatchFileVersion is one playable file of the item.
 type WatchFileVersion struct {
 	FileID                   ID                   `json:"file_id" example:"42"`
-	FileName                 string               `json:"file_name,omitempty"`
-	FilePath                 string               `json:"file_path,omitempty" doc:"Only for accounts allowed to see paths"`
+	FileName                 string               `json:"file_name,omitempty" doc:"Absent for viewers without file-path visibility, except on audiobooks and ebooks"`
+	FilePath                 string               `json:"file_path,omitempty" doc:"Absent for viewers without file-path visibility"`
 	Resolution               string               `json:"resolution" example:"1080p"`
 	CodecVideo               string               `json:"codec_video" example:"h264"`
 	CodecAudio               string               `json:"codec_audio" example:"eac3"`
@@ -102,17 +99,6 @@ type WatchFileVersion struct {
 	Preview                  *WatchMarker         `json:"preview,omitempty"`
 	MarkerSegments           []MarkerOccurrence   `json:"marker_segments" doc:"All effective marker occurrences for this file in source-time order; empty, never null"`
 	TrickplayAvailable       bool                 `json:"trickplay_available" doc:"Whether seek-bar previews are published for this file; read them with getWatchTrickplay"`
-	FormatScore              *int                 `json:"format_score,omitempty"`
-	MatchedFormats           []string             `json:"matched_formats,omitempty"`
-	Failed                   bool                 `json:"failed,omitempty"`
-	Available                *bool                `json:"available,omitempty"`
-	SourceMismatch           *WatchSourceMismatch `json:"source_mismatch,omitempty"`
-	ProbedAt                 *Instant             `json:"probed_at,omitempty"`
-}
-
-type WatchSourceMismatch struct {
-	ServedBytes   int64 `json:"served_bytes"`
-	DeclaredBytes int64 `json:"declared_bytes"`
 }
 
 // WatchVideoTrack is one video stream of a file as the scanner probed it.
@@ -177,12 +163,7 @@ type WatchSubtitleTrack struct {
 	Default         bool   `json:"default"`
 	HearingImpaired bool   `json:"hearing_impaired"`
 	External        bool   `json:"external"`
-	FileName        string `json:"file_name,omitempty"`
-	// PathKey is an opaque, stable hash of an external sidecar's full path.
-	// Two sidecars with the same basename in different directories keep
-	// distinct identities without exposing the server filesystem path. Empty
-	// for embedded tracks and for older servers that do not compute it.
-	PathKey string `json:"path_key,omitempty"`
+	FileName        string `json:"file_name,omitempty" doc:"An external track's file name; absent for viewers without file-path visibility, except on audiobooks and ebooks"`
 }
 
 // WatchChapter is one chapter of a version.
@@ -226,47 +207,6 @@ type WatchPlaybackVariant struct {
 	TotalDurationSeconds int                        `json:"total_duration_seconds,omitempty"`
 	DefaultFileID        ID                         `json:"default_file_id,omitempty"`
 	Parts                []WatchPlaybackVariantPart `json:"parts" doc:"Ordered; empty, never null"`
-	VirtualRanking       *WatchVirtualRanking       `json:"virtual_ranking,omitempty" doc:"The ranking that produced this variant's version order; absent for local content"`
-}
-
-// WatchIndexerRelease is one release that exists on the indexers but is not
-// downloaded on the provider yet. It is additive below the playable versions;
-// an empty list means there is nothing to request. release_id is an opaque
-// server row id, never the release GUID or download URL.
-type WatchIndexerRelease struct {
-	ReleaseID     string   `json:"release_id" doc:"Opaque server id used to request this release"`
-	Title         string   `json:"title"`
-	Resolution    string   `json:"resolution,omitempty"`
-	CodecVideo    string   `json:"codec_video,omitempty"`
-	CodecAudio    string   `json:"codec_audio,omitempty"`
-	HDR           bool     `json:"hdr,omitempty"`
-	SizeBytes     int64    `json:"size_bytes,omitempty" doc:"Bytes"`
-	Indexer       string   `json:"indexer,omitempty"`
-	PublishedAt   *Instant `json:"published_at,omitempty" doc:"When the indexer published the release"`
-	FormatScore   *int     `json:"format_score,omitempty" doc:"Custom-format score the ranking assigned; absent when unscored"`
-	Protocol      string   `json:"protocol,omitempty" doc:"usenet or torrent"`
-	DownloadState string   `json:"download_state" enum:"not_downloaded,queued,failed" doc:"Whether the release has been requested on the provider"`
-}
-
-// IndexerReleaseProvider supplies the persisted indexer releases for a watch
-// detail read. It is an optional dependency seam: a nil provider (or one
-// without this method) leaves the list empty and changes nothing else.
-type IndexerReleaseProvider interface {
-	IndexerReleasesForWatch(ctx context.Context, contentID string) ([]handlers.IndexerReleaseView, error)
-}
-
-// WatchVirtualRanking describes the ranking that produced a virtual item's
-// version order, so any viewer can see which profile and keys ordered it.
-type WatchVirtualRanking struct {
-	ProfileLabel string               `json:"profile_label,omitempty" doc:"The quality profile label that produced the ranking; absent for the built-in default order" example:"4K HDR"`
-	Source       string               `json:"source" enum:"profile,default" doc:"profile when a configured profile's selector drove the order, default for the built-in order"`
-	Criteria     []WatchSortCriterion `json:"criteria" doc:"Ordered ranking keys, top-down; empty, never null"`
-}
-
-// WatchSortCriterion is one ordered ranking key behind a virtual version list.
-type WatchSortCriterion struct {
-	Attribute string `json:"attribute" doc:"The candidate attribute the key orders" example:"score"`
-	Direction string `json:"direction" enum:"asc,desc" doc:"desc for a largest-first numeric key, asc for a best-first ordinal key" example:"desc"`
 }
 
 // WatchPlaybackVariantPart holds the interchangeable versions of one part.
@@ -388,76 +328,13 @@ func (reg *Registry) getWatchState(ctx context.Context, in *WatchDetailInput) (*
 	opts.ImageSize, opts.ImageWidths = art.Size, art.Widths
 	filter, err := reg.deps.Watch.ContextAccessFilter(ctx, opts)
 	if err != nil {
-		return nil, NewProblem(TypeInternalError, "An unexpected error occurred.").withCause(err)
+		return nil, NewProblem(TypeInternalError, "An unexpected error occurred.")
 	}
 	detail, err := reg.deps.Watch.WatchDetail(ctx, claims.UserID, profileFrom(ctx), string(in.ID), filter)
 	if err != nil {
 		return nil, watchDetailProblem(err)
 	}
-	// The eligibility read that discovery performs also feeds
-	// has_virtual_source, independent of whether discovery is enabled or its
-	// budget expired: a leaf answer names whether the item carries persisted
-	// virtual candidates even when nothing new is discovered this read.
-	var virtualSource *bool
-	if detail != nil {
-		discovered, hasVirtualSource := reg.discoverDetailVersions(ctx, detail.ContentID, detail.Type, filter, "watch_detail", preplayDiscoveryWatchBudget)
-		if hasVirtualSource {
-			source := hasVirtualSource
-			virtualSource = &source
-		}
-		if discovered {
-			refreshed, refreshErr := reg.deps.Watch.WatchDetail(ctx, claims.UserID, profileFrom(ctx), string(in.ID), filter)
-			if refreshErr == nil && refreshed != nil {
-				detail = refreshed
-			} else {
-				slog.WarnContext(ctx, "pre-play version discovery detail reload failed", "component", "apiv2", "item_id", in.ID, "trigger", "watch_detail")
-			}
-		}
-	}
-	// Native clients never declare a file_id on this read, so the
-	// selected-file hook warmed nothing. Warm the rows the answer lists,
-	// exactly as the catalog leaf detail read does.
-	reg.warmWatchDetailVirtualVersions(ctx, detail, filter)
-	body := watchDetailOf(detail)
-	body.HasVirtualSource = virtualSource
-	body.IndexerReleases = reg.indexerReleasesFor(ctx, string(in.ID))
-	return &WatchDetailOutput{Body: body}, nil
-}
-
-// indexerReleasesFor reads the persisted indexer releases for the item through
-// the optional seam. A nil or failing provider yields an empty (never null)
-// list so the watch detail is unaffected when the feature is unwired.
-func (reg *Registry) indexerReleasesFor(ctx context.Context, contentID string) []WatchIndexerRelease {
-	provider := reg.deps.IndexerReleases
-	if provider == nil {
-		return []WatchIndexerRelease{}
-	}
-	views, err := provider.IndexerReleasesForWatch(ctx, contentID)
-	if err != nil {
-		return []WatchIndexerRelease{}
-	}
-	return watchIndexerReleasesOf(views)
-}
-
-func watchIndexerReleasesOf(views []handlers.IndexerReleaseView) []WatchIndexerRelease {
-	out := make([]WatchIndexerRelease, 0, len(views))
-	for _, view := range views {
-		out = append(out, WatchIndexerRelease{
-			ReleaseID:     view.ReleaseID,
-			Title:         view.Title,
-			Resolution:    view.Resolution,
-			CodecVideo:    view.CodecVideo,
-			CodecAudio:    view.CodecAudio,
-			HDR:           view.HDR,
-			SizeBytes:     view.SizeBytes,
-			Indexer:       view.Indexer,
-			PublishedAt:   instantPtr(view.PublishedAt),
-			FormatScore:   view.FormatScore,
-			Protocol:      view.Protocol,
-			DownloadState: view.DownloadState,
-		})
-	}
-	return out
+	return &WatchDetailOutput{Body: watchDetailOf(detail)}, nil
 }
 
 // watchDetailProblem maps a watch detail error to its problem: a target that
@@ -489,7 +366,7 @@ func (reg *Registry) setWatched(ctx context.Context, in *WatchedInput, played bo
 	}
 	filter, err := reg.deps.Watch.ContextAccessFilter(ctx, handlers.AccessFilterOptions{})
 	if err != nil {
-		return nil, NewProblem(TypeInternalError, "An unexpected error occurred.").withCause(err)
+		return nil, NewProblem(TypeInternalError, "An unexpected error occurred.")
 	}
 	if _, err := reg.deps.Watch.SetWatchedState(ctx, userID, profileID, string(in.ID), played, played, filter); err != nil {
 		return nil, serviceProblem(err)
@@ -506,7 +383,6 @@ func watchDetailOf(d *catalogpkg.WatchDetail) WatchDetail {
 		Overview:                   d.Overview,
 		Versions:                   watchVersionsOf(d.Versions),
 		PlaybackVariants:           watchVariantsOf(d.PlaybackVariants),
-		VirtualRanking:             watchVirtualRankingOf(d.VirtualRanking),
 		Subtitles:                  make([]WatchSubtitle, 0, len(d.Subtitles)),
 		Intro:                      watchMarkerOf(d.Intro),
 		Credits:                    watchMarkerOf(d.Credits),
@@ -515,6 +391,8 @@ func watchDetailOf(d *catalogpkg.WatchDetail) WatchDetail {
 		UserData:                   watchUserDataOf(d.UserData),
 		SeriesID:                   d.SeriesID,
 		SeriesTitle:                d.SeriesTitle,
+		EpisodeLabels:              d.EpisodeLabels,
+		AirDate:                    watchAirDate(d),
 		SeasonNumber:               d.SeasonNumber,
 		EpisodeNumber:              d.EpisodeNumber,
 		EffectiveVersionResolution: d.EffectiveVersionResolution,
@@ -556,20 +434,6 @@ func watchVersionsOf(vs []catalogpkg.FileVersion) []WatchFileVersion {
 	return out
 }
 
-func watchInstantPtr(t *time.Time) *Instant {
-	if t == nil {
-		return nil
-	}
-	i := NewInstant(*t)
-	return &i
-}
-func watchSourceMismatchOf(v *catalogpkg.VersionSourceMismatch) *WatchSourceMismatch {
-	if v == nil {
-		return nil
-	}
-	return &WatchSourceMismatch{ServedBytes: v.ServedBytes, DeclaredBytes: v.DeclaredBytes}
-}
-
 func watchVersionOf(v catalogpkg.FileVersion) WatchFileVersion {
 	out := WatchFileVersion{
 		FileID:                   idOfInt(v.FileID),
@@ -583,8 +447,6 @@ func watchVersionOf(v catalogpkg.FileVersion) WatchFileVersion {
 		FileSize:                 v.FileSize,
 		DurationSeconds:          v.Duration,
 		Bitrate:                  v.Bitrate,
-		FormatScore:              v.FormatScore,
-		MatchedFormats:           v.MatchedFormats,
 		AddedAt:                  NewInstant(v.AddedAt),
 		EditionRaw:               v.EditionRaw,
 		EditionKey:               v.EditionKey,
@@ -596,10 +458,6 @@ func watchVersionOf(v catalogpkg.FileVersion) WatchFileVersion {
 		MultiEpisodeEnd:          v.MultiEpisodeEnd,
 		EffectiveAudioTrackIndex: v.EffectiveAudioTrackIndex,
 		EffectiveAudioLanguage:   v.EffectiveAudioLanguage,
-		Failed:                   v.Failed,
-		Available:                v.Available,
-		SourceMismatch:           watchSourceMismatchOf(v.SourceMismatch),
-		ProbedAt:                 watchInstantPtr(v.ProbedAt),
 		Intro:                    watchMarkerOf(v.Intro),
 		Credits:                  watchMarkerOf(v.Credits),
 		Recap:                    watchMarkerOf(v.Recap),
@@ -614,7 +472,7 @@ func watchVersionOf(v catalogpkg.FileVersion) WatchFileVersion {
 		out.AudioTracks = append(out.AudioTracks, WatchAudioTrack{Title: t.Title, EmbeddedTitle: t.EmbeddedTitle, Language: t.Language, Codec: t.Codec, Profile: t.Profile, Layout: t.Layout, Channels: t.Channels, Bitrate: t.Bitrate, SampleRate: t.SampleRate, BitDepth: t.BitDepth, Default: t.Default})
 	}
 	for _, t := range v.SubtitleTracks {
-		out.SubtitleTracks = append(out.SubtitleTracks, WatchSubtitleTrack{Index: t.Index, Language: t.Language, Codec: t.Codec, Title: t.Title, EmbeddedTitle: t.EmbeddedTitle, Resolution: t.Resolution, Forced: t.Forced, Default: t.Default, HearingImpaired: t.HearingImpaired, External: t.External, FileName: t.FileName, PathKey: t.PathKey})
+		out.SubtitleTracks = append(out.SubtitleTracks, WatchSubtitleTrack{Index: t.Index, Language: t.Language, Codec: t.Codec, Title: t.Title, EmbeddedTitle: t.EmbeddedTitle, Resolution: t.Resolution, Forced: t.Forced, Default: t.Default, HearingImpaired: t.HearingImpaired, External: t.External, FileName: t.FileName})
 	}
 	for _, c := range v.Chapters {
 		out.Chapters = append(out.Chapters, WatchChapter{Index: c.Index, Title: c.Title, StartSeconds: c.StartSeconds, EndSeconds: c.EndSeconds, Source: c.Source, ThumbnailURL: c.ThumbnailURL, ThumbnailThumbhash: c.ThumbnailThumbhash})
@@ -648,28 +506,6 @@ func watchVariantsOf(vs []catalogpkg.PlaybackVariant) []WatchPlaybackVariant {
 			VariantID: v.VariantID, EditionRaw: v.EditionRaw, EditionKey: v.EditionKey, PresentationKind: v.PresentationKind,
 			PresentationGroupKey: v.PresentationGroupKey, PartCount: v.PartCount, TotalDurationSeconds: v.TotalDuration,
 			DefaultFileID: optionalIDOfInt(v.DefaultFileID), Parts: parts,
-			VirtualRanking: watchVirtualRankingOf(v.VirtualRanking),
-		})
-	}
-	return out
-}
-
-// watchVirtualRankingOf maps the catalog ranking projection onto the wire type.
-// A nil projection (local content, no ranking source) stays nil so the
-// virtual_ranking member is omitted.
-func watchVirtualRankingOf(r *catalogpkg.VirtualRanking) *WatchVirtualRanking {
-	if r == nil {
-		return nil
-	}
-	out := &WatchVirtualRanking{
-		ProfileLabel: r.ProfileLabel,
-		Source:       r.Source,
-		Criteria:     make([]WatchSortCriterion, 0, len(r.Criteria)),
-	}
-	for _, criterion := range r.Criteria {
-		out.Criteria = append(out.Criteria, WatchSortCriterion{
-			Attribute: criterion.Attribute,
-			Direction: criterion.Direction,
 		})
 	}
 	return out
@@ -724,4 +560,13 @@ type WatchService interface {
 	WatchDetail(ctx context.Context, userID int, profileID, contentID string, filter catalogpkg.AccessFilter) (*catalogpkg.WatchDetail, error)
 	SetWatchedState(ctx context.Context, userID int, profileID, contentID string, played, recordRewatch bool, filter catalogpkg.AccessFilter) (handlers.WatchedStateView, error)
 	ClearResumePosition(ctx context.Context, userID int, profileID, contentID string, filter catalogpkg.AccessFilter) error
+}
+
+// watchAirDate is the episode's air date, sent only for a date-labeled series:
+// a numbered episode's player shows its numbers.
+func watchAirDate(d *catalogpkg.WatchDetail) *string {
+	if d.EpisodeLabels == "" {
+		return nil
+	}
+	return datePtr(d.AirDate)
 }

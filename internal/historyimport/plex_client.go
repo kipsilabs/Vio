@@ -17,7 +17,7 @@ import (
 
 const (
 	plexClientIdentifier = "silo-history-import"
-	plexProduct          = "Vio"
+	plexProduct          = "Silo"
 	plexVersion          = "1.0.0"
 	plexTVBaseURL        = "https://plex.tv"
 	// plexDiscoverBaseURL hosts account-level metadata (the user's
@@ -602,7 +602,7 @@ func (c *PlexClient) doJSONWithBudget(req *http.Request, out any, budget *listin
 	if err != nil {
 		return err
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body := readUpstreamErrorBody(resp.Body)
 		return &plexHTTPError{StatusCode: resp.StatusCode, Body: strings.TrimSpace(string(body))}
