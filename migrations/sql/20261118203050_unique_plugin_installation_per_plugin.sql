@@ -198,7 +198,10 @@ END
 $$;
 -- +goose StatementEnd
 
-CREATE UNIQUE INDEX idx_plugin_installations_plugin_id
+-- IF NOT EXISTS: the fork's earlier migration
+-- (20260916003925_unique_plugin_installation_per_plugin_id.sql) already built
+-- the same index on fork deployments.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_plugin_installations_plugin_id
     ON plugin_installations (plugin_id)
     WHERE kind = 'plugin';
 

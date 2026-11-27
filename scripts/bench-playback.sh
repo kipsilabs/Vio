@@ -114,6 +114,7 @@ CTX_PLAYABLE='{
   }
 }'
 
+# shellcheck disable=SC2034 # consumed by the terminal-bench subcommand
 CTX_TERMINAL='{
   "protocol_version": 3,
   "form_factor": "desktop",
@@ -344,7 +345,7 @@ for i in "${!FILES[@]}"; do
     -d "$prime_body" >/dev/null 2>&1 || true
 
   vals_file="$TMPDIR/warm-vals-${fid}.txt"
-  > "$vals_file"
+  : > "$vals_file"
 
   for r in $(seq 1 "$WARM_REPS"); do
     attempt="bench-warm-${fid}-${r}-$(date +%s%N)"
@@ -407,7 +408,6 @@ echo "  │ FILE                                 │ TYPE     │COLD ms │W mi
 echo "  ├──────────────────────────────────────┼──────────┼────────┼────────┼────────┼────────┼────────┼────────────────┤"
 
 ALL_COLD=""
-ALL_WARM=""
 
 for i in "${!FILES[@]}"; do
   title="${TITLES[$i]}"
@@ -418,7 +418,8 @@ for i in "${!FILES[@]}"; do
 
   warm_min="--"; warm_p50="--"; warm_p95="--"; warm_p99="--"
   if [[ -f "$vals_file" ]]; then
-    read -r warm_min warm_p50 warm_p95 warm_p99 <<< $(cat "$vals_file" | xargs python3 -c "
+    # shellcheck disable=SC2046 # the values are individual argv entries
+  read -r warm_min warm_p50 warm_p95 warm_p99 <<< $(cat "$vals_file" | xargs python3 -c "
 import sys
 vals = sorted(float(x) for x in sys.argv[1:] if x.strip())
 n = len(vals)

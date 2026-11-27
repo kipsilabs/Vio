@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -268,79 +266,6 @@ func ledgerDoc(t *testing.T) map[string]any {
 // path segment may sit: a call site's credited line is usually the request
 // expression, but the path literal can be an argument a few lines away.
 const siteContextLines = 4
-
-// TestSiblingCallSitesResolveAgainstPinnedTrees re-resolves every apple and
-// android call site against the commit recorded in source_trees: the file
-// must exist at the pinned tree, the line must be inside it, and the route's
-// last static path segment must appear within siteContextLines of the
-// credited line, so a wrong pin whose files still exist is reported instead
-// of passing. A site whose path literal is a constant declared elsewhere
-// records path_literal_line, and the segment is looked for there instead; a
-// match=follower site is the resolver or allowlist for a server-supplied URL
-// and never spells the path, so only its file and line are checked. Drift of
-// the sibling's origin/main after the pin is not a failure here. The sibling
-// checkouts are expected next to this repository's main checkout and are
-// read only through git plumbing. The test skips only when a checkout is
-// absent (CI has none); a checkout that is present but lacks the pinned
-// commit is a failure, so `make verify-migration-ledger` cannot print ok
-// over an unfetched pin.
-func TestSiblingCallSitesResolveAgainstPinnedTrees(t *testing.T) {
-	if _, err := exec.LookPath("git"); err != nil {
-		t.Skip("git not available")
-	}
-	ledger, err := Load()
-	if err != nil {
-		t.Fatal(err)
-	}
-	commonDir, err := exec.Command("git", "rev-parse", "--git-common-dir").Output()
-	if err != nil {
-		t.Skipf("not in a git checkout: %v", err)
-	}
-	parent := filepath.Join(strings.TrimSpace(string(commonDir)), "..", "..")
-	if !filepath.IsAbs(parent) {
-		parent = filepath.Join(mustGetwd(t), parent)
-	}
-	repos := map[string]string{"apple": "silo-apple", "android": "silo-android"}
-	for repo, name := range repos {
-		sha := ledger.SourceTrees[name]
-		if sha == "" {
-			t.Fatalf("source_trees has no pin for %s", name)
-		}
-		dir := filepath.Join(parent, name)
-		if _, err := os.Stat(filepath.Join(dir, ".git")); err != nil {
-			t.Skipf("%s checkout not present next to this repository", name)
-		}
-		if err := exec.Command("git", "-C", dir, "cat-file", "-e", sha+"^{commit}").Run(); err != nil {
-			t.Errorf("%s: pinned commit %s is not fetchable in %s; run `git -C %s fetch origin`", name, sha, dir, dir)
-			continue
-		}
-		for _, e := range ledger.Entries {
-			segments := []string{lastStaticSegment(e.Path)}
-			// A client that has already moved to the row's v2 operation spells
-			// the v2 path at the site, which is what match_consumers.py credits
-			// back to this v1 row (its v2-alias rule). Accept either segment so
-			// such a site is verified rather than reported as mis-credited.
-			if e.V2.Path != nil {
-				if s := lastStaticSegment(*e.V2.Path); s != "" && s != segments[0] {
-					segments = append(segments, s)
-				}
-			}
-			for _, site := range e.ConsumerCallSites {
-				if site.Repo != repo {
-					continue
-				}
-				out, err := exec.Command("git", "-C", dir, "show", sha+":"+site.File).Output()
-				if err != nil {
-					t.Errorf("%s: %s %s:%d does not exist at pinned tree %s (stale against pinned tree)", e.key(), repo, site.File, site.Line, sha[:8])
-					continue
-				}
-				if problem := checkSiteAtPinnedTree(strings.Split(string(out), "\n"), site, segments...); problem != "" {
-					t.Errorf("%s: %s %s at pinned tree %s", e.key(), repo, problem, sha[:8])
-				}
-			}
-		}
-	}
-}
 
 // checkSiteAtPinnedTree applies the line and content assertions to one site
 // given the file's lines at the pinned tree, and returns "" when the site

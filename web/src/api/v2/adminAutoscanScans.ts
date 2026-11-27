@@ -61,7 +61,9 @@ export async function readAdminAutoscanScans(
         ids.add(row.id);
         if (
           !["library", "subtree", "file"].includes(row.mode) ||
-          !["accepted", "running", "completed", "failed", "cancelled", "canceled"].includes(row.status)
+          !["accepted", "running", "completed", "failed", "cancelled", "canceled"].includes(
+            row.status,
+          )
         )
           throw new Error("Unsupported scan history state.");
         if (

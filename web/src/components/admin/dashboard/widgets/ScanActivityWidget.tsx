@@ -153,6 +153,7 @@ function scanStatusTone(t: Translate, status: AutoscanScanStatus) {
         icon: Loader2,
         className: "text-sky-500",
       };
+    case "canceled":
     case "cancelled":
       return {
         label: t("web.admin.dashboard.widgets.scanActivity.cancelled"),

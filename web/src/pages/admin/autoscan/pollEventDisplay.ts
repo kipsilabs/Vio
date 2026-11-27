@@ -121,6 +121,7 @@ export const SCAN_STATUS_LABELS: Record<AutoscanScanStatus | ScanRun["status"], 
   completed: "web.admin.autoscan.activity.scanStatus.completed",
   failed: "web.admin.autoscan.activity.scanStatus.failed",
   cancelled: "web.admin.autoscan.activity.scanStatus.cancelled",
+  canceled: "web.admin.autoscan.activity.scanStatus.cancelled",
 };
 
 export const SCAN_STATUS_FILTER_LABELS: Record<AutoscanScanStatus, MessageKey> = {
@@ -129,6 +130,7 @@ export const SCAN_STATUS_FILTER_LABELS: Record<AutoscanScanStatus, MessageKey> =
   completed: "web.admin.autoscan.activity.scanFilter.completed",
   failed: "web.admin.autoscan.activity.scanFilter.failed",
   cancelled: "web.admin.autoscan.activity.scanFilter.cancelled",
+  canceled: "web.admin.autoscan.activity.scanFilter.cancelled",
 };
 
 export const SCAN_STATUS_ORDER: readonly AutoscanScanStatus[] = [
