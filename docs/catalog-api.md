@@ -51,12 +51,16 @@ before the operation existed. `getPlaybackCapabilities.features` advertises
 
 At most 40 IDs are accepted per request (413 `too_large` beyond that; 400
 `bad_request` when the body is missing or the list is empty). Each file is
-tested cheaply — virtual rows resolve their pinned `?result=` candidate through
-the provider (no media transfer), local rows are read from `missing_since` with
-no probe — with bounded concurrency and a per-file timeout. A confirmed dead
-pin stamps `failed_at`; a successful resolution clears it. Ambiguous provider
-errors (provider down, timeout) leave the stamp unchanged and report the row's
-current computed availability, so a provider outage cannot mass-tag versions.
+tested cheaply, with bounded concurrency and a per-file timeout. Local rows are
+read from `missing_since`. A batched page check answers a virtual row from the
+durable state its last provider listing recorded and resolves no unprobed row,
+so opening a page cannot open the provider's play endpoint once per listed
+version. A single-file check resolves the row it names, and a batch resolves at
+most one durably failed row so a recovered pin can clear its verdict. A
+confirmed dead pin stamps `failed_at`; a successful resolution clears it.
+Ambiguous provider errors (provider down, timeout) leave the stamp unchanged and
+report the row's current computed availability, so a provider outage cannot
+mass-tag versions.
 
 **Response** (200 OK):
 

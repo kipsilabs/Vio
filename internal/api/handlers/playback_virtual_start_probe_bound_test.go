@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -335,5 +336,187 @@ func TestVirtualDetailProbeFileID(t *testing.T) {
 				t.Fatalf("VirtualDetailProbeFileID = %d, want %d", got, tc.want)
 			}
 		})
+	}
+}
+
+// versionCheckBoundStore serves the rows a versions liveness check reads and
+// models the fenced recovery clear for one of them.
+type versionCheckBoundStore struct {
+	mu   sync.Mutex
+	rows map[int]*models.MediaFile
+}
+
+func (s *versionCheckBoundStore) GetByID(_ context.Context, id int) (*models.MediaFile, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	row, ok := s.rows[id]
+	if !ok {
+		return nil, errors.New("file not found")
+	}
+	clone := *row
+	return &clone, nil
+}
+
+func (s *versionCheckBoundStore) clearFailed(_ context.Context, id int, _ string, _ *time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	row, ok := s.rows[id]
+	if !ok {
+		return nil
+	}
+	clone := *row
+	clone.FailedAt = nil
+	s.rows[id] = &clone
+	return nil
+}
+
+func versionCheckBoundVirtualRow(id int) *models.MediaFile {
+	return &models.MediaFile{
+		ID:                         id,
+		ContentID:                  "movie:seek-probe-bound",
+		FilePath:                   "virtual://movie/tt0113277?result=cand-" + strconv.Itoa(id),
+		Container:                  "virtual",
+		VirtualOwnerInstallationID: 7,
+	}
+}
+
+func versionCheckBoundResultByID(results []VersionCheckResult) map[int]VersionCheckResult {
+	byID := make(map[int]VersionCheckResult, len(results))
+	for _, result := range results {
+		byID[result.FileID] = result
+	}
+	return byID
+}
+
+// A batched page liveness pass is not a probe trigger. The web client checks
+// every virtual version of an item (73 ids in two batches on ds-seek), and
+// resolving each unprobed row opened the provider's mutating play endpoint once
+// per version. The batch answers from the durable state the listing already
+// recorded and resolves nothing; the play path verifies the row that starts.
+func TestVersionCheckBatchDoesNotProbeUnprobedVirtualRows(t *testing.T) {
+	probedAt := time.Now().Add(-time.Minute)
+	store := &versionCheckBoundStore{rows: make(map[int]*models.MediaFile)}
+	ids := make([]int, 0, 11)
+	for i := 1; i <= 8; i++ {
+		row := versionCheckBoundVirtualRow(i)
+		store.rows[i] = row
+		ids = append(ids, i)
+	}
+	probed := versionCheckBoundVirtualRow(9)
+	probed.ProbeUpdatedAt = &probedAt
+	store.rows[9] = probed
+	ids = append(ids, 9)
+	localPresent := &models.MediaFile{ID: 10, ContentID: "movie:seek-probe-bound", FilePath: "/media/present.mkv"}
+	localMissing := &models.MediaFile{ID: 11, ContentID: "movie:seek-probe-bound", FilePath: "/media/missing.mkv", MissingSince: &probedAt}
+	store.rows[10] = localPresent
+	store.rows[11] = localMissing
+	ids = append(ids, 10, 11, 999)
+
+	var calls atomic.Int32
+	h := &CatalogResourceHandler{
+		FileResolver: store,
+		ItemAccess:   permissiveItemAccess{},
+		VirtualResolver: VirtualMediaDetailedResolverFunc(func(context.Context, string, int, int, string, bool, []string, string) (ResolvedVirtualMedia, error) {
+			calls.Add(1)
+			return ResolvedVirtualMedia{URL: "http://provider.test/live.mp4"}, nil
+		}),
+	}
+
+	results := h.CheckVersions(t.Context(), ids)
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("provider play calls = %d, want 0 for a batch of unprobed rows", got)
+	}
+	byID := versionCheckBoundResultByID(results)
+	for i := 1; i <= 9; i++ {
+		if result, ok := byID[i]; !ok || !result.Available || result.Failed {
+			t.Fatalf("virtual row %d verdict = %+v, want available and not failed", i, result)
+		}
+	}
+	if result := byID[10]; !result.Available || result.Failed {
+		t.Fatalf("present local verdict = %+v, want available", result)
+	}
+	if result := byID[11]; result.Available || result.Failed {
+		t.Fatalf("missing local verdict = %+v, want unavailable without a failed verdict", result)
+	}
+	if result := byID[999]; result.Available || result.Failed {
+		t.Fatalf("unknown row verdict = %+v, want unavailable without a failed verdict", result)
+	}
+}
+
+// A batch still resolves one row it can act on: a durably failed pin, so a
+// recovered release can clear its verdict. It must not resolve every failed
+// row, and it never resolves the unprobed rows beside it.
+func TestVersionCheckBatchResolvesAtMostOneFailedRow(t *testing.T) {
+	store := &versionCheckBoundStore{rows: make(map[int]*models.MediaFile)}
+	ids := make([]int, 0, 10)
+	for i := 1; i <= 8; i++ {
+		store.rows[i] = versionCheckBoundVirtualRow(i)
+		ids = append(ids, i)
+	}
+	past := time.Now().Add(-time.Hour)
+	for i := 9; i <= 10; i++ {
+		row := versionCheckBoundVirtualRow(i)
+		row.FailedAt = &past
+		store.rows[i] = row
+		ids = append(ids, i)
+	}
+
+	var calls atomic.Int32
+	h := &CatalogResourceHandler{
+		FileResolver: store,
+		ItemAccess:   permissiveItemAccess{},
+		VirtualResolver: VirtualMediaDetailedResolverFunc(func(_ context.Context, uri string, _ int, _ int, _ string, _ bool, _ []string, requested string) (ResolvedVirtualMedia, error) {
+			calls.Add(1)
+			return ResolvedVirtualMedia{URL: "http://provider.test/live.mp4", URI: uri, CandidateID: requested}, nil
+		}),
+		ClearVirtualFailed: store.clearFailed,
+	}
+
+	results := h.CheckVersions(t.Context(), ids)
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("provider play calls = %d, want 1 (one failed row, none of the unprobed rows)", got)
+	}
+	byID := versionCheckBoundResultByID(results)
+	for i := 1; i <= 8; i++ {
+		if result := byID[i]; !result.Available || result.Failed {
+			t.Fatalf("unprobed row %d was resolved or changed: %+v", i, result)
+		}
+	}
+	recovered, failed := 0, 0
+	for i := 9; i <= 10; i++ {
+		result := byID[i]
+		switch {
+		case result.Failed:
+			failed++
+		case result.Available:
+			recovered++
+		}
+	}
+	if recovered != 1 || failed != 1 {
+		t.Fatalf("failed-row verdicts recovered=%d failed=%d, want exactly one of each", recovered, failed)
+	}
+}
+
+// A single-file check names the one row the caller asked about, so it is the
+// one row the check may resolve. The batched page pass is the bounded one.
+func TestVersionCheckSingleFileStillResolvesItsRow(t *testing.T) {
+	row := versionCheckBoundVirtualRow(1)
+	store := &versionCheckBoundStore{rows: map[int]*models.MediaFile{row.ID: row}}
+	var calls atomic.Int32
+	h := &CatalogResourceHandler{
+		FileResolver: store,
+		ItemAccess:   permissiveItemAccess{},
+		VirtualResolver: VirtualMediaDetailedResolverFunc(func(_ context.Context, uri string, _ int, _ int, _ string, _ bool, _ []string, requested string) (ResolvedVirtualMedia, error) {
+			calls.Add(1)
+			return ResolvedVirtualMedia{URL: "http://provider.test/live.mp4", URI: uri, CandidateID: requested}, nil
+		}),
+	}
+
+	results := h.CheckVersions(t.Context(), []int{row.ID})
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("provider play calls = %d, want 1 for a single-file check", got)
+	}
+	if len(results) != 1 || !results[0].Available || results[0].Failed {
+		t.Fatalf("single-file verdict = %+v, want available", results)
 	}
 }

@@ -158,6 +158,13 @@ response carries the row's durable `failed`/`available` state, its `probed_at`
 stamp, and any process-local `source_mismatch` verdict so the client can choose
 from the read alone.
 
+The versions liveness check (`POST /api/v2/catalog/versions/check`) follows the
+same bound. A batched page pass answers an unprobed row from the durable state
+the last provider listing recorded and resolves at most one durably failed row
+for recovery, so it cannot open the provider's mutating play endpoint once per
+listed version. Only a single-file check resolves the row it names; the play
+path verifies whichever row actually starts.
+
 ### Legacy provider identity repair is on-demand, never a boot sweep
 
 A virtual row persisted before the provider identity columns (`provider_video_hash`,
