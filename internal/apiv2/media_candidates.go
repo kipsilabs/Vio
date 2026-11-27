@@ -390,13 +390,23 @@ func (reg *Registry) warmWatchDetailVirtualVersions(ctx context.Context, detail 
 // schedule the same work.
 //
 // The work is bounded to movies and individual episodes (a series or season
-// page carries no playable row), to maxDetailVirtualWarmVersions per read, and
-// to one schedule per version inside detailVirtualWarmRepeatWindow. Scheduling
-// is non-blocking: ScheduleSelectedFileProbe/Warm only take an admission slot
-// and spawn detached work under their own budgets, and both refuse a duplicate
-// live chain. A failed or durably unavailable row is skipped. This path only
-// warms: it never writes a failure verdict, never stamps failed_at, and never
-// fails the detail request.
+// page carries no playable row), to maxDetailVirtualWarmVersions listing
+// warm-ups per read, and to one schedule per version inside
+// detailVirtualWarmRepeatWindow. Scheduling is non-blocking:
+// ScheduleSelectedFileProbe/Warm only take an admission slot and spawn
+// detached work under their own budgets, and both refuse a duplicate live
+// chain. A failed or durably unavailable row is skipped. This path only warms:
+// it never writes a failure verdict, never stamps failed_at, and never fails
+// the detail request.
+//
+// Only the one version the read will actually play is probed: the viewer's
+// selection when the read names one, otherwise the default row (see
+// handlers.VirtualDetailProbeFileID). Every other listed version is still
+// being evaluated, so it stays on the listing's declared metadata; probing
+// each one opened the provider's mutating play endpoint once per version for
+// rows the page never played. Discovery already probes the same target row,
+// and the production prober's single-flight cache makes those two schedules
+// one provider call.
 func (reg *Registry) warmVirtualVersions(ctx context.Context, contentID, itemType string, versions []catalogpkg.FileVersion, filter catalogpkg.AccessFilter) {
 	if reg == nil || reg.deps.VirtualSelectionWarm == nil {
 		return
@@ -405,6 +415,8 @@ func (reg *Registry) warmVirtualVersions(ctx context.Context, contentID, itemTyp
 		return
 	}
 	scheduler := reg.deps.VirtualSelectionWarm
+	probeFileID := handlers.VirtualDetailProbeFileID(versions, filter.SelectedFileID)
+	targetInWarmWindow := false
 	warmed := 0
 	for _, version := range versions {
 		if warmed >= maxDetailVirtualWarmVersions {
@@ -420,16 +432,34 @@ func (reg *Registry) warmVirtualVersions(ctx context.Context, contentID, itemTyp
 		// read resolves to the same two rows instead of drifting to the next
 		// pair once the first pair is memoized.
 		warmed++
-		if !reg.rememberDetailVirtualWarm(contentID, version.FileID) {
-			continue
+		// The probe memo is separate from the warm memo: a row that an earlier
+		// read only warmed as a sibling is still owed its inventory probe when
+		// the viewer selects it inside the same window.
+		if version.FileID == probeFileID {
+			targetInWarmWindow = true
+			if version.ProbedAt == nil && reg.rememberDetailVirtualProbe(contentID, version.FileID) {
+				scheduler.ScheduleSelectedFileProbe(contentID, version.FileID, filter)
+			}
 		}
-		// An unprobed row needs the inventory probe for its track menus; a
-		// probed row still needs the warm because probe evidence says nothing
+		// A probed row still needs the warm because probe evidence says nothing
 		// about whether the provider has fetched the bytes.
-		if version.ProbedAt == nil {
-			scheduler.ScheduleSelectedFileProbe(contentID, version.FileID, filter)
+		if reg.rememberDetailVirtualWarm(contentID, version.FileID) {
+			scheduler.ScheduleSelectedFileWarm(contentID, version.FileID, filter)
 		}
-		scheduler.ScheduleSelectedFileWarm(contentID, version.FileID, filter)
+	}
+	// A selection can point at a row beyond the listing-warm cap. The probe is
+	// still owed to the row the viewer will play, but the other rows stay on
+	// declared metadata and are not warmed a third time.
+	if !targetInWarmWindow && probeFileID > 0 {
+		for _, version := range versions {
+			if version.FileID != probeFileID || version.ProbedAt != nil {
+				continue
+			}
+			if reg.rememberDetailVirtualProbe(contentID, probeFileID) {
+				scheduler.ScheduleSelectedFileProbe(contentID, probeFileID, filter)
+			}
+			break
+		}
 	}
 }
 
@@ -441,15 +471,27 @@ func isVirtualVersion(version catalogpkg.FileVersion) bool {
 		strings.EqualFold(strings.TrimSpace(version.Container), "virtual")
 }
 
-// rememberDetailVirtualWarm records a scheduled version and reports whether it
-// was new. A repeat inside detailVirtualWarmRepeatWindow returns false so the
-// caller skips scheduling. The memo is node-local in-process state with no
-// shared admission; it only suppresses duplicate scheduling.
+// rememberDetailVirtualWarm records a scheduled fetch warm-up and reports
+// whether it was new. A repeat inside detailVirtualWarmRepeatWindow returns
+// false so the caller skips scheduling. The memo is node-local in-process
+// state with no shared admission; it only suppresses duplicate scheduling.
 func (reg *Registry) rememberDetailVirtualWarm(contentID string, fileID int) bool {
+	return reg.rememberDetailVirtualSchedule("warm", contentID, fileID)
+}
+
+// rememberDetailVirtualProbe records a scheduled inventory probe. Probes and
+// warm-ups keep separate namespaces because the read's target can change: a row
+// that only got a warm-up as a sibling must still be probed when the viewer
+// selects it before the warm memo expires.
+func (reg *Registry) rememberDetailVirtualProbe(contentID string, fileID int) bool {
+	return reg.rememberDetailVirtualSchedule("probe", contentID, fileID)
+}
+
+func (reg *Registry) rememberDetailVirtualSchedule(kind, contentID string, fileID int) bool {
 	if reg == nil || contentID == "" || fileID <= 0 {
 		return false
 	}
-	key := contentID + "\x00" + strconv.Itoa(fileID)
+	key := kind + "\x00" + contentID + "\x00" + strconv.Itoa(fileID)
 	now := time.Now()
 	reg.virtualWarmMu.Lock()
 	defer reg.virtualWarmMu.Unlock()

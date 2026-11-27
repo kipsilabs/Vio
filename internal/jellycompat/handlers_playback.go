@@ -2474,6 +2474,14 @@ func (h *PlaybackHandler) HandlePlaybackInfo(w http.ResponseWriter, r *http.Requ
 			req.MediaSourceID = pathMediaSourceID
 		}
 	}
+	// Only the version this negotiation will serve is probed: the source the
+	// request names, or the first source the loop will offer. The other listed
+	// versions are evaluated for the picker from their declared listing
+	// metadata; the stream path probes whichever one the viewer picks. Probing
+	// every version here opened the provider's mutating play endpoint once per
+	// version for releases the page never played. This is resolved after the
+	// stale-source fallback above so a recovered path source is still probed.
+	playTargetFileID := compatPlaybackTargetFileID(detail.Versions, req.MediaSourceID, hasLiveVersion, h.codec)
 	hadVirtualPrepErr := false
 	unreadableSkipped := false
 	// The bitrate-cap check below finishes each version again without the cap,
@@ -2496,7 +2504,7 @@ func (h *PlaybackHandler) HandlePlaybackInfo(w http.ResponseWriter, r *http.Requ
 		virtualOwnerID := 0
 		if isCompatVirtualPath(version.FilePath) || strings.EqualFold(strings.TrimSpace(version.Container), "virtual") {
 			var prepErr error
-			prepared, virtualURI, virtualOwnerID, prepErr = h.prepareVirtualPlaybackVersion(r.Context(), session, version)
+			prepared, virtualURI, virtualOwnerID, prepErr = h.prepareVirtualPlaybackVersion(r.Context(), session, version, version.FileID == playTargetFileID)
 			if prepErr != nil {
 				hadVirtualPrepErr = true
 				if req.MediaSourceID != "" {

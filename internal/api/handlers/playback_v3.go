@@ -4024,11 +4024,13 @@ func retainedVirtualBoundFileV3(effective *models.MediaFile, previous *playback.
 // what the evidence says, not on every sibling.
 //
 // startPath marks the walk as start-path work: the alternate hunt inside a
-// start and the start's transport-failure walk both set it, so their synchronous
-// probe is bounded by virtualStartProbeBudget like the primary start probe. The
-// walk still probes synchronously (a substitute's inventory must be verified
-// before the planner remaps a version's tracks), and a replan rehydration
-// leaves it false and keeps virtualProbeBudget.
+// start and the start's transport-failure walk both set it. Those walks are
+// choosing among speculative candidates, so when the provider's completion
+// signal is available they resolve from the listing's declared metadata without
+// opening the provider's mutating play endpoint. The candidate actually chosen
+// is probed by the normal post-commit path. A replan rehydration leaves startPath
+// false and keeps the synchronous probe under virtualProbeBudget, because its
+// substitute's inventory is what the planner remaps a version's tracks from.
 func (h *PlaybackHandler) prepareVirtualAlternateFileV3(r *http.Request, alternate *models.MediaFile, profileID string, startPath bool) (*models.MediaFile, ProbeProvenance, error) {
 	if alternate == nil {
 		return nil, "", errors.New("nil alternate file")

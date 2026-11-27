@@ -4246,6 +4246,16 @@ func (h *PlaybackHandler) createStaticPlaySession(ctx context.Context, session *
 		return nil, nil, errServerBitrateScopeUnavailable
 	}
 	allow4KTranscode := h.allow4KVideoTranscode(ctx)
+	// Static direct play skips PlaybackInfo, so this loop is the page's only
+	// version walk. A source the request names is the one it serves, so bind and
+	// probe that one. With no selection the loop offers every row and
+	// playbackRouteSource picks one only after the loop, so let the stream
+	// binding below probe the row that is actually served instead of probing a
+	// guess here.
+	playTargetFileID := 0
+	if mediaSourceID != "" {
+		playTargetFileID = compatPlaybackTargetFileID(detail.Versions, mediaSourceID, false, h.codec)
+	}
 	hadVirtualPrepErr := false
 	for _, version := range detail.Versions {
 		// Reused requests and reports may omit MediaSourceId. Keep their
@@ -4258,7 +4268,7 @@ func (h *PlaybackHandler) createStaticPlaySession(ctx context.Context, session *
 		virtualOwnerID := 0
 		if isCompatVirtualPath(version.FilePath) || strings.EqualFold(strings.TrimSpace(version.Container), "virtual") {
 			var prepErr error
-			prepared, virtualURI, virtualOwnerID, prepErr = h.prepareVirtualPlaybackVersion(ctx, session, version)
+			prepared, virtualURI, virtualOwnerID, prepErr = h.prepareVirtualPlaybackVersion(ctx, session, version, version.FileID == playTargetFileID)
 			if prepErr != nil {
 				hadVirtualPrepErr = true
 				slog.WarnContext(ctx, "jellycompat static virtual source resolution failed", "component", "jellycompat",

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -1715,5 +1717,109 @@ func TestResolveAndProbeVirtualSourceLogsTheDeclaredFallback(t *testing.T) {
 				t.Fatalf("fallback log does not name the reason %q: %s", tc.reason, logs.String())
 			}
 		})
+	}
+}
+
+// PlaybackInfo walks every version to advertise the item, but only the source
+// the client will play by default is probed. The other versions stay on their
+// declared listing metadata; the stream path probes whichever one the client
+// actually picks. Probing the whole list opened the provider's mutating play
+// endpoint once per version for releases the page never played.
+func TestHandlePlaybackInfoProbesOnlyThePlayedVirtualVersion(t *testing.T) {
+	codec := NewResourceIDCodec()
+	const (
+		contentID = "item-probe-bound"
+		owner     = 5
+	)
+	makeVersion := func(id int) catalog.FileVersion {
+		return catalog.FileVersion{
+			FileID: id, FilePath: fmt.Sprintf("virtual://movie/%s?result=%d", contentID, id),
+			Container: "virtual", Duration: 3600,
+		}
+	}
+	versions := []catalog.FileVersion{makeVersion(1), makeVersion(2), makeVersion(3), makeVersion(4)}
+	files := make(mapCompatFileResolver, len(versions))
+	for _, version := range versions {
+		files[version.FileID] = &models.MediaFile{
+			ID: version.FileID, FilePath: version.FilePath, Container: "virtual",
+			VirtualOwnerInstallationID: owner,
+		}
+	}
+
+	var probes []int
+	handler := &PlaybackHandler{
+		codec:          codec,
+		content:        &stubContentService{detail: &upstreamItemDetail{ContentID: contentID, Type: "movie", Versions: versions}},
+		fileResolver:   files,
+		playbackStore:  NewPlaybackSessionStore(time.Hour, time.Now),
+		deviceProfiles: NewDeviceProfileStore(time.Hour, nil),
+		sessionMgr:     &virtualBindingSessionManager{testCompatSessionManager: &testCompatSessionManager{sessions: make(map[string]*playback.Session)}},
+		VirtualMediaDetailedResolver: VirtualMediaDetailedResolverFunc(func(_ context.Context, uri string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+			return ResolvedVirtualMedia{URL: "https://provider.example/play", URI: uri}, nil
+		}),
+		VirtualSourceProber: func(_ context.Context, _ string, file *models.MediaFile) (*models.MediaFile, error) {
+			probes = append(probes, file.ID)
+			probed := *file
+			probed.Duration = 3600
+			probed.Container = "mkv"
+			probed.Resolution = "1080p"
+			probed.CodecVideo = "h264"
+			probed.CodecAudio = "eac3"
+			probed.VideoTracks = []models.VideoTrack{{Codec: "h264", Width: 1920, Height: 1080}}
+			probed.AudioTracks = []models.AudioTrack{{Codec: "eac3", Channels: 6}}
+			return &probed, nil
+		},
+	}
+	encodedID := codec.EncodeStringID(EncodedIDItem, contentID)
+	serveInfo := func(mediaSourceID string) *httptest.ResponseRecorder {
+		target := "/Items/" + encodedID + "/PlaybackInfo"
+		if mediaSourceID != "" {
+			target += "?MediaSourceId=" + mediaSourceID
+		}
+		req := httptest.NewRequest(http.MethodPost, target, strings.NewReader("{}"))
+		routeCtx := chi.NewRouteContext()
+		routeCtx.URLParams.Add("id", encodedID)
+		ctx := context.WithValue(req.Context(), chi.RouteCtxKey, routeCtx)
+		ctx = context.WithValue(ctx, compatSessionKey, &Session{Token: "token-1", StreamAppUserID: 1, ProfileID: "profile-1"})
+		req = req.WithContext(ctx)
+		rec := httptest.NewRecorder()
+		handler.HandlePlaybackInfo(rec, req)
+		return rec
+	}
+
+	// No MediaSourceId: the first offered version is the default the client
+	// will play, so it is the only one probed.
+	rec := serveInfo("")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PlaybackInfo status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if want := []int{1}; !reflect.DeepEqual(probes, want) {
+		t.Fatalf("probes = %v, want %v (only the default source)", probes, want)
+	}
+	sess, _, ok := handler.playbackStore.FindByRoute("token-1", encodedID)
+	if !ok {
+		t.Fatal("negotiated session not found")
+	}
+	if len(sess.MediaSources) != len(versions) {
+		t.Fatalf("media sources = %d, want all %d listed versions", len(sess.MediaSources), len(versions))
+	}
+	if sess.MediaSources[0].VirtualSourceURI != versions[0].FilePath {
+		t.Fatalf("default source URI = %q, want %q", sess.MediaSources[0].VirtualSourceURI, versions[0].FilePath)
+	}
+	for _, source := range sess.MediaSources[1:] {
+		if source.VirtualSourceURI != "" {
+			t.Fatalf("unplayed source %d was prepared: URI %q", source.FileID, source.VirtualSourceURI)
+		}
+	}
+
+	// Naming another source is a new choice: that row is probed then, still
+	// exactly once.
+	probes = nil
+	rec = serveInfo(codec.EncodeIntID(EncodedIDMediaSource, 3))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("selected PlaybackInfo status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if want := []int{3}; !reflect.DeepEqual(probes, want) {
+		t.Fatalf("selected probes = %v, want %v", probes, want)
 	}
 }
