@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -192,6 +193,28 @@ type versionCheckResponse struct {
 	Results []VersionCheckResult `json:"results"`
 }
 
+// versionCheckProbePermit bounds the provider resolutions one check may start.
+// A single-file check may resolve the row it names: that is the one row the
+// caller asked about. A batch resolves at most one durably failed row, so a
+// recovered pin can still clear its verdict; every other row, including every
+// unprobed healthy row, is answered from the durable state the provider listing
+// already recorded. Opening the mutating play endpoint once per listed version
+// is the fan-out this bound removes.
+type versionCheckProbePermit struct {
+	single bool
+	used   atomic.Bool
+}
+
+func (p *versionCheckProbePermit) mayResolve(file *models.MediaFile) bool {
+	if p == nil {
+		return true
+	}
+	if !p.single && (file == nil || file.FailedAt == nil) {
+		return false
+	}
+	return p.used.CompareAndSwap(false, true)
+}
+
 // versionCheckOutcome is one file's liveness verdict before stamps are
 // applied. Resolution and classification run concurrently per file, but
 // stamps apply only after the whole batch is judged (see
@@ -271,11 +294,13 @@ func gateVersionCheckStamps(outcomes []versionCheckOutcome) ([]versionCheckOutco
 }
 
 // HandleCheckVersions implements POST /catalog/versions/check: a batched
-// liveness probe for the media page's version list. Each file is tested
-// cheaply — virtual rows resolve their pinned ?result= candidate through the
-// provider (no media transfer), local rows are read from missing_since — and
-// the durable failed_at signal is stamped accordingly. Unknown or deleted
-// file IDs are reported as available=false.
+// liveness verdict for the media page's version list. Local rows are read from
+// missing_since. A batch reports unprobed virtual rows from the durable state
+// their provider listing recorded and resolves at most one durably failed row
+// for recovery; it never opens the play endpoint per listed version. A
+// single-file check resolves that one row, and the durable failed_at signal is
+// stamped accordingly. Unknown or deleted file IDs are reported as
+// available=false.
 func (h *CatalogResourceHandler) HandleCheckVersions(w http.ResponseWriter, r *http.Request) {
 	var req versionCheckRequest
 	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
@@ -293,13 +318,15 @@ func (h *CatalogResourceHandler) HandleCheckVersions(w http.ResponseWriter, r *h
 	writeJSON(w, http.StatusOK, versionCheckResponse{Results: h.CheckVersions(r.Context(), req.FileIDs)})
 }
 
-// CheckVersions is the liveness probe behind the v1 route and the v2
+// CheckVersions is the liveness verdict behind the v1 route and the v2
 // checkCatalogVersions operation. Callers validate the batch (one to
 // maxVersionCheckFiles IDs) before calling; the seam applies the per-file
 // concurrency, timeout and stamping rules and never fails the whole batch on
-// one file.
+// one file. A batch answers unprobed rows from their durable state and resolves
+// at most one durably failed row for recovery; a single-file check resolves the
+// row it names (see versionCheckProbePermit).
 func (h *CatalogResourceHandler) CheckVersions(ctx context.Context, fileIDs []int) []VersionCheckResult {
-	return h.checkVersions(ctx, fileIDs, nil, true)
+	return h.checkVersions(ctx, fileIDs, nil, true, len(fileIDs) <= 1)
 }
 
 // CheckVersionsWithPlayability is the versions check with a client capability
@@ -309,14 +336,15 @@ func (h *CatalogResourceHandler) CheckVersions(ctx context.Context, fileIDs []in
 // client could play it never resolves a provider pin just to answer. Callers
 // that need both pass resolveLiveness=true.
 func (h *CatalogResourceHandler) CheckVersionsWithPlayability(ctx context.Context, fileIDs []int, client VersionPlayabilityClient, resolveLiveness bool) []VersionCheckResult {
-	return h.checkVersions(ctx, fileIDs, &client, resolveLiveness)
+	return h.checkVersions(ctx, fileIDs, &client, resolveLiveness, len(fileIDs) <= 1)
 }
 
-func (h *CatalogResourceHandler) checkVersions(ctx context.Context, fileIDs []int, client *VersionPlayabilityClient, resolveLiveness bool) []VersionCheckResult {
+func (h *CatalogResourceHandler) checkVersions(ctx context.Context, fileIDs []int, client *VersionPlayabilityClient, resolveLiveness, single bool) []VersionCheckResult {
 	ctx, cancel := context.WithTimeout(ctx, versionCheckOverallBudget)
 	defer cancel()
 
 	outcomes := make([]versionCheckOutcome, 0, len(fileIDs))
+	permit := &versionCheckProbePermit{single: single}
 	var mu sync.Mutex
 	eg, egCtx := errgroup.WithContext(ctx)
 	eg.SetLimit(versionCheckConcurrency)
@@ -326,7 +354,7 @@ func (h *CatalogResourceHandler) checkVersions(ctx context.Context, fileIDs []in
 		}
 		id := id
 		eg.Go(func() error {
-			outcome := h.checkVersion(egCtx, id, resolveLiveness)
+			outcome := h.checkVersionWithPermit(egCtx, id, resolveLiveness, permit)
 			mu.Lock()
 			outcomes = append(outcomes, outcome)
 			mu.Unlock()
@@ -403,9 +431,10 @@ func (h *CatalogResourceHandler) versionPlayabilityFor(ctx context.Context, outc
 }
 
 // CheckVersionsWithInventory is the versions check's single-file inventory
-// mode. It answers the ordinary liveness verdict first — the budgets, stamping
-// and authorization above are unchanged — and then, for the one requested row,
-// enumerates its track inventory synchronously under
+// mode. It answers the durable liveness verdict first — the budgets and
+// authorization above are unchanged, and no liveness resolve runs so the
+// inventory probe below is the row's one provider read — then, for the one
+// requested row, enumerates its track inventory synchronously under
 // versionCheckPreprobeBudget so the answer can carry probe evidence instead of
 // the registration placeholders a version row starts with.
 //
@@ -415,7 +444,10 @@ func (h *CatalogResourceHandler) versionPlayabilityFor(ctx context.Context, outc
 // current tracks, and the batch form keeps its liveness-only shape. Callers pass
 // one validated file ID (the v2 adapter enforces that).
 func (h *CatalogResourceHandler) CheckVersionsWithInventory(ctx context.Context, fileIDs []int) []VersionCheckResult {
-	results := h.CheckVersions(ctx, fileIDs)
+	// The liveness half reports durable state only: the inventory mode already
+	// asks for one row's provider work below, and a liveness resolve first would
+	// open the play endpoint twice for that row.
+	results := h.checkVersions(ctx, fileIDs, nil, false, false)
 	if len(results) != 1 {
 		return results
 	}
@@ -476,13 +508,18 @@ func versionCheckInventoryProvenance(file *models.MediaFile, status VirtualPrepr
 // available. The file is authorized for the requesting profile BEFORE any
 // resolution: inaccessible IDs are indistinguishable from unknown IDs
 // (available=false, no distinguishing error), so a restricted profile cannot
-// probe arbitrary files or trigger provider work for them. Virtual rows
-// resolve the pinned candidate through the provider and stamp failed_at on a
-// confirmed dead pin; local rows are read from missing_since with no probe.
-// Ambiguous provider errors (timeout, network, resolver not configured) leave
-// the stamp unchanged and report the row's current computed availability, so
-// a provider outage cannot mass-tag versions as dead.
+// probe arbitrary files or trigger provider work for them. The probe permit
+// decides whether a virtual row may resolve at all; only the row a single-file
+// check names, or one durably failed row in a batch, reaches the provider.
+// Local rows are read from missing_since with no probe. Ambiguous provider
+// errors (timeout, network, resolver not configured) leave the stamp unchanged
+// and report the row's current computed availability, so a provider outage
+// cannot mass-tag versions as dead.
 func (h *CatalogResourceHandler) checkVersion(ctx context.Context, fileID int, resolveLiveness bool) versionCheckOutcome {
+	return h.checkVersionWithPermit(ctx, fileID, resolveLiveness, nil)
+}
+
+func (h *CatalogResourceHandler) checkVersionWithPermit(ctx context.Context, fileID int, resolveLiveness bool, permit *versionCheckProbePermit) versionCheckOutcome {
 	outcome := versionCheckOutcome{fileID: fileID}
 	if h == nil || h.FileResolver == nil {
 		return outcome
@@ -520,10 +557,18 @@ func (h *CatalogResourceHandler) checkVersion(ctx context.Context, fileID int, r
 	// A probed row already carries real evidence for its pinned bytes. Version
 	// liveness is a navigation surface, not a second probe: resolving every
 	// warm row here fan-outs one provider call per version and used to take
-	// whole seconds for a season page. Durable failed_at rows still resolve so
-	// a recovered pin can clear its verdict.
+	// whole seconds for a season page.
 	if file.ProbeUpdatedAt != nil && file.FailedAt == nil {
 		outcome.available = true
+		return outcome
+	}
+	// The batch bound: an unprobed healthy row is answered from the durable
+	// state the listing already recorded, and a batch resolves at most one
+	// durably failed row (the one row the check can act on). A single-file
+	// check resolves the row it names, which is the row the caller asked about.
+	// The play path verifies the version actually started.
+	if !permit.mayResolve(file) {
+		outcome.available = outcome.durableAlive
 		return outcome
 	}
 	if h.VirtualResolver == nil {

@@ -849,6 +849,15 @@ func (h *PlaybackHandler) probeVirtualFallbackSource(ctx context.Context, resolv
 	if strings.TrimSpace(resolved.URL) == "" {
 		return nil
 	}
+	ownerID := 0
+	selected := false
+	if file != nil {
+		ownerID = file.VirtualOwnerInstallationID
+		selected = sameVirtualReleaseIdentity(file.FilePath, resolved.URI)
+	}
+	if !h.virtualCandidateProbeAffordable(ctx, resolved.URI, ownerID, selected) {
+		return nil
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}

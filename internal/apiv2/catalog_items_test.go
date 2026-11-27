@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -642,6 +643,86 @@ func TestCatalogDetailWarmsVirtualVersions(t *testing.T) {
 	}
 	if want := []int{1, 2}; !reflect.DeepEqual(warm.warms, want) {
 		t.Fatalf("warms = %v, want %v (two-version cap, then deduped)", warm.warms, want)
+	}
+}
+
+// A multi-version item must not be probed one version at a time by the page.
+// Only the row the read will actually play is probed: the default (first
+// playable) when no selection is named, or the selected row when one is. The
+// remaining versions are planned from the listing's declared metadata; probing
+// each opened the provider's mutating play endpoint for releases the page never
+// played.
+func TestCatalogDetailWarmProbesOnlyThePlayableTarget(t *testing.T) {
+	probedAt := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
+	versions := make([]catalogpkg.FileVersion, 0, 6)
+	for i := 1; i <= 6; i++ {
+		versions = append(versions, catalogpkg.FileVersion{
+			FileID:   i,
+			FilePath: "virtual://movie/tt0113277?result=" + strconv.Itoa(i),
+			AddedAt:  fixedTime(),
+		})
+	}
+	deps, base := catalogDeps(t)
+	deps.CatalogItems = &fakePreplayCatalog{fakeCatalog: base,
+		detail: catalogpkg.ItemDetail{ContentID: "movie:heat-1995", Type: "movie", Versions: versions}}
+	warm := &fakeSelectionWarm{}
+	deps.VirtualSelectionWarm = warm
+	h := newTestHandler(t, deps)
+
+	rec := do(t, h, http.MethodGet, "/api/v2/catalog/items/movie:heat-1995", "", viewerHeaders())
+	if rec.Code != http.StatusOK {
+		t.Fatal(rec.Body.String())
+	}
+	if want := []int{1}; !reflect.DeepEqual(warm.probes, want) {
+		t.Fatalf("probes = %v, want %v (only the default row, not every version)", warm.probes, want)
+	}
+	if want := []int{1, 2}; !reflect.DeepEqual(warm.warms, want) {
+		t.Fatalf("warms = %v, want %v (listing warm cap is unchanged)", warm.warms, want)
+	}
+
+	// The next read selects a row the first read only warmed as a sibling. The
+	// probe is still owed: the warm memo must not suppress it.
+	rec = do(t, h, http.MethodGet, "/api/v2/catalog/items/movie:heat-1995?file_id=2", "", viewerHeaders())
+	if rec.Code != http.StatusOK {
+		t.Fatal(rec.Body.String())
+	}
+	if want := []int{1, 2}; !reflect.DeepEqual(warm.probes, want) {
+		t.Fatalf("probes after selecting a warmed row = %v, want %v", warm.probes, want)
+	}
+	if want := []int{1, 2}; !reflect.DeepEqual(warm.warms, want) {
+		t.Fatalf("warms after selecting a warmed row = %v, want %v (memo suppresses the repeat)", warm.warms, want)
+	}
+
+	// A selection beyond the listing-warm cap is still the row the viewer will
+	// play, so it is probed even though it is not one of the two warmed rows.
+	warm = &fakeSelectionWarm{}
+	deps.VirtualSelectionWarm = warm
+	h = newTestHandler(t, deps)
+	rec = do(t, h, http.MethodGet, "/api/v2/catalog/items/movie:heat-1995?file_id=5", "", viewerHeaders())
+	if rec.Code != http.StatusOK {
+		t.Fatal(rec.Body.String())
+	}
+	if want := []int{5}; !reflect.DeepEqual(warm.probes, want) {
+		t.Fatalf("selected probes = %v, want %v", warm.probes, want)
+	}
+	if want := []int{1, 2}; !reflect.DeepEqual(warm.warms, want) {
+		t.Fatalf("selected warms = %v, want %v", warm.warms, want)
+	}
+
+	// A selected row that already carries probe evidence costs no provider call.
+	probedVersions := append([]catalogpkg.FileVersion(nil), versions...)
+	probedVersions[4].ProbedAt = &probedAt
+	deps.CatalogItems = &fakePreplayCatalog{fakeCatalog: base,
+		detail: catalogpkg.ItemDetail{ContentID: "movie:heat-1995", Type: "movie", Versions: probedVersions}}
+	warm = &fakeSelectionWarm{}
+	deps.VirtualSelectionWarm = warm
+	h = newTestHandler(t, deps)
+	rec = do(t, h, http.MethodGet, "/api/v2/catalog/items/movie:heat-1995?file_id=5", "", viewerHeaders())
+	if rec.Code != http.StatusOK {
+		t.Fatal(rec.Body.String())
+	}
+	if len(warm.probes) != 0 {
+		t.Fatalf("probed selection scheduled another probe: %v", warm.probes)
 	}
 }
 
