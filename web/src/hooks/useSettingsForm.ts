@@ -311,12 +311,26 @@ export function useSettingsForm({ keys }: UseSettingsFormOptions) {
   }, [settings, keys]);
 
   const sensitiveConfigured = sensitiveData?.configured ?? [];
-  const sensitiveManagedByEnv = sensitiveData?.managed_by_env ?? [];
+  const sensitiveManagedByEnv = useMemo(
+    () => sensitiveData?.managed_by_env ?? [],
+    [sensitiveData?.managed_by_env],
+  );
   /**
    * The environment variable that sets `key` on the server, or undefined when
    * an admin can save it. Pass it to a field's `managedByEnv`.
+   *
+   * The sensitive-status answer names the keys the environment sets, not the
+   * variables they came from, so the row names the setting itself.
    */
-  const envVar = useCallback((key: string) => envVars?.[key], [envVars]);
+  const sensitiveManagedByEnvVars = useMemo(
+    () => sensitiveData?.managed_by_env_vars ?? {},
+    [sensitiveData?.managed_by_env_vars],
+  );
+  // The variable that sets the key, so the field can name it.
+  const envVar = useCallback(
+    (key: string) => sensitiveManagedByEnvVars[key],
+    [sensitiveManagedByEnvVars],
+  );
 
   // Until the status is known a field cannot tell whether the environment
   // sets it, so the form stays in its loading state rather than offer an edit

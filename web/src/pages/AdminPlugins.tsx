@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef } from "react";
 import { Navigate, useSearchParams } from "react-router";
-import { Blocks, Download, Package } from "lucide-react";
+import { Blocks, CircleAlert, Download, Package } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 
 import type { PluginCatalogEntry, PluginInstallation } from "@/api/types";
@@ -76,6 +76,41 @@ function EmptyState({
   );
 }
 
+function errorDescription(error: unknown): string | undefined {
+  return error instanceof Error ? error.message : undefined;
+}
+
+function LoadFailure({
+  title,
+  description,
+  retrying,
+  onRetry,
+}: {
+  title: string;
+  description?: string;
+  retrying: boolean;
+  onRetry: () => void;
+}) {
+  const t = useT();
+  return (
+    <div
+      role="alert"
+      className="surface-panel-subtle flex flex-col items-center gap-3 rounded-xl py-14"
+    >
+      <CircleAlert className="text-muted-foreground h-10 w-10" aria-hidden />
+      <div className="text-center">
+        <p className="text-sm font-medium">{title}</p>
+        {description ? (
+          <p className="text-muted-foreground text-xs [overflow-wrap:anywhere]">{description}</p>
+        ) : null}
+      </div>
+      <Button variant="outline" size="sm" disabled={retrying} onClick={onRetry}>
+        {t("common.retry")}
+      </Button>
+    </div>
+  );
+}
+
 function NoMatches({ label, onClear }: { label: string; onClear: () => void }) {
   const t = useT();
   return (
@@ -109,8 +144,19 @@ function ResultCount({ shown, total }: { shown: number; total: number }) {
 
 function PluginsBoard() {
   const t = useT();
-  const { installations, catalog, catalogSettings, repositories, repositoriesError, isLoading } =
-    useAdminPlugins();
+  const {
+    installations,
+    installationsError,
+    refetchInstallations,
+    catalog,
+    catalogError,
+    refetchCatalog,
+    catalogSettings,
+    repositories,
+    repositoriesError,
+    isLoading,
+    isFetching,
+  } = useAdminPlugins();
   const provisioning = useAdminPluginProvisioningStatus();
   const [searchParams, setSearchParams] = useSearchParams();
   const queryClient = useQueryClient();
@@ -219,7 +265,7 @@ function PluginsBoard() {
           <TabsTrigger value="installed">
             {t("web.admin.plugins.page.installedTab")}
             {installations.length > 0 && (
-              <Badge variant="secondary" className="ms-1.5 text-[0.625rem]">
+              <Badge variant="secondary" className="ms-1.5 text-[10px]">
                 {installations.length}
               </Badge>
             )}
@@ -227,7 +273,7 @@ function PluginsBoard() {
           <TabsTrigger value="catalog">
             {t("web.admin.plugins.page.catalogTab")}
             {catalog.length > 0 && (
-              <Badge variant="secondary" className="ms-1.5 text-[0.625rem]">
+              <Badge variant="secondary" className="ms-1.5 text-[10px]">
                 {catalog.length}
               </Badge>
             )}
@@ -238,6 +284,9 @@ function PluginsBoard() {
           <InstalledTab
             installations={installations}
             catalog={catalog}
+            error={installationsError}
+            retrying={isFetching}
+            onRetry={() => void refetchInstallations()}
             query={searchParams.get("installed_q") ?? ""}
             filter={parseInstalledFilter(searchParams.get("installed_filter"))}
             onChange={(updates) => updatePluginView(updates)}
@@ -249,6 +298,9 @@ function PluginsBoard() {
           <CatalogTab
             installations={installations}
             catalog={catalog}
+            error={catalogError}
+            retrying={isFetching}
+            onRetry={() => void refetchCatalog()}
             query={searchParams.get("catalog_q") ?? ""}
             job={searchParams.get("catalog_job") ?? ""}
             onChange={(updates) => updatePluginView(updates)}
@@ -271,12 +323,18 @@ type ViewUpdate = (updates: Record<string, string | undefined>) => void;
 function InstalledTab({
   installations,
   catalog,
+  error,
+  retrying,
+  onRetry,
   query,
   filter,
   onChange,
 }: {
   installations: PluginInstallation[];
   catalog: PluginCatalogEntry[];
+  error: unknown;
+  retrying: boolean;
+  onRetry: () => void;
   query: string;
   filter: InstalledFilter;
   onChange: ViewUpdate;
@@ -311,6 +369,19 @@ function InstalledTab({
       ),
     [catalogByPluginID, filter, searched],
   );
+
+  if (error) {
+    return (
+      <LoadFailure
+        title={t("web.admin.plugins.detail.installationsErrorTitle")}
+        description={
+          errorDescription(error) ?? t("web.admin.plugins.detail.installationsErrorDescription")
+        }
+        retrying={retrying}
+        onRetry={onRetry}
+      />
+    );
+  }
 
   if (installations.length === 0) {
     return (
@@ -381,12 +452,18 @@ function InstalledTab({
 function CatalogTab({
   installations,
   catalog,
+  error,
+  retrying,
+  onRetry,
   query,
   job,
   onChange,
 }: {
   installations: PluginInstallation[];
   catalog: PluginCatalogEntry[];
+  error: unknown;
+  retrying: boolean;
+  onRetry: () => void;
   query: string;
   job: string;
   onChange: ViewUpdate;
@@ -424,6 +501,17 @@ function CatalogTab({
     ? searched.filter((entry) => hasCapabilityJob(entry.capabilities ?? [], activeJob))
     : searched;
 
+  if (error) {
+    return (
+      <LoadFailure
+        title={t("web.admin.plugins.detail.catalogErrorTitle")}
+        description={errorDescription(error)}
+        retrying={retrying}
+        onRetry={onRetry}
+      />
+    );
+  }
+
   if (catalog.length === 0) {
     return (
       <EmptyState
@@ -437,7 +525,7 @@ function CatalogTab({
   const groups = CATALOG_GROUPS.map((group) => ({
     ...group,
     entries: visible
-      .filter((entry) => entry.source_kind === group.kind)
+      .filter((entry) => group.matches(entry.source_kind))
       .sort(
         (a, b) =>
           Number(installedIds.has(a.plugin_id)) - Number(installedIds.has(b.plugin_id)) ||
@@ -478,9 +566,9 @@ function CatalogTab({
       ) : (
         groups.map((group) => (
           <section key={group.kind} className="space-y-2.5" aria-label={t(group.titleKey)}>
-            <h2 className="flex items-baseline gap-2 text-[0.9375rem] font-semibold">
+            <h2 className="flex items-baseline gap-2 text-[15px] font-semibold">
               {t(group.titleKey)}
-              <span className="text-muted-foreground text-[0.84375rem] font-medium tabular-nums">
+              <span className="text-muted-foreground text-[13.5px] font-medium tabular-nums">
                 {group.entries.length}
               </span>
             </h2>

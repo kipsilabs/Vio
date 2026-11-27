@@ -1,5 +1,5 @@
 {
-  "revision": "72b97f9f308e640e5c580c89edd7df6d9a75aac8263cb28b0f5a7b47c9f87889",
+  "revision": "59540cefb7cf9a2b1af5d0f0075a3ec5979a0f84741d5fbb1a1e3fffd0a572c0",
   "state": "available",
   "allowed": true,
   "guarded_annotations": false,
@@ -13,6 +13,6 @@
     "azw3"
   ],
   "served_format": "epub",
-  "header": "X-Silo-Ebook-Conversion",
+  "header": "X-Vio-Ebook-Conversion",
   "header_failed_value": "failed"
 }

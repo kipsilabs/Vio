@@ -7,8 +7,12 @@ import {
   useRemoveCollectionItem,
   useReorderCollectionItems,
 } from "../collections";
+import {
+  usePurgeVirtualPlaybackItems,
+  useQueueCollectionTemplateBundleApply,
+  useTemplateBundleApplyJobs,
+} from "./collections";
 import { useAdminCollectionsBoard } from "./collectionGroups";
-import { useQueueCollectionTemplateBundleApply, useTemplateBundleApplyJobs } from "./collections";
 const mocks = vi.hoisted(() => ({
   request: vi.fn(),
   api: vi.fn(),
@@ -22,6 +26,7 @@ vi.mock("@/api/v2/request", async () => ({
 vi.mock("@/api/client", async () => ({
   ...(await vi.importActual<typeof import("@/api/client")>("@/api/client")),
   api: mocks.api,
+  apiV1: mocks.api,
 }));
 vi.mock("../collectionSurfaceRefresh", () => ({
   invalidateAdminCollectionQueries: mocks.invalidate,
@@ -157,5 +162,47 @@ describe("guarded admin lifecycle", () => {
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
     expect(result.current.data?.groups.map((group) => group.id)).toEqual(["A", "z"]);
     expect(result.current.data?.ungrouped.map((item) => item.id)).toEqual(["A", "z"]);
+  });
+
+  describe("usePurgeVirtualPlaybackItems", () => {
+    async function renderPurgeHook() {
+      mocks.api.mockResolvedValue({
+        success: true,
+        files_deleted: 1,
+        items_deleted: 1,
+        message: "Purged",
+      });
+      const hook = renderHook(() => usePurgeVirtualPlaybackItems(), { wrapper });
+      await waitFor(() => expect(hook.result.current).toBeDefined());
+      return hook;
+    }
+
+    it("sends only the library scope and never an installation id", async () => {
+      const { result } = await renderPurgeHook();
+
+      await act(async () => {
+        await result.current.mutateAsync({ dryRun: true, libraryId: 7 });
+      });
+
+      expect(mocks.api).toHaveBeenCalledTimes(1);
+      const [path, options] = mocks.api.mock.calls[0] as [string, { method: string }];
+      expect(path).toBe("/admin/collections/purge-virtual?dry_run=true&library_id=7");
+      expect(options).toMatchObject({ method: "POST" });
+      expect(path).not.toContain("installation_id");
+    });
+
+    it("omits every query parameter when no scope is selected", async () => {
+      const { result } = await renderPurgeHook();
+
+      await act(async () => {
+        await result.current.mutateAsync({ dryRun: false });
+      });
+
+      expect(mocks.api).toHaveBeenCalledTimes(1);
+      const [path] = mocks.api.mock.calls[0] as [string, { method: string }];
+      expect(path).toBe("/admin/collections/purge-virtual?");
+      expect(path).not.toContain("installation_id");
+      expect(path).not.toContain("library_id");
+    });
   });
 });

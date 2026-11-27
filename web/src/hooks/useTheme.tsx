@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useReducer, useState, useCallback } from "react";
+import { createContext, useContext, useEffect, useState, useCallback } from "react";
 import type { ReactNode } from "react";
 import { useEffectiveSettings } from "@/hooks/queries/settingValues";
 import { useProfileDefaultWriter } from "@/hooks/queries/profileDefaults";
@@ -114,11 +114,10 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   // that must stay distinguishable from an explicit choice so the local warm
   // start keeps its layering, so those values are dropped here rather than
   // treated as the profile's preference.
-  const settingsRead = useEffectiveSettings({
+  const { data: effectiveSettings } = useEffectiveSettings({
     keys: APPEARANCE_KEYS,
     enabled: loadApi,
   });
-  const { data: effectiveSettings } = settingsRead;
   const storedValue = (key: (typeof APPEARANCE_KEYS)[number]): unknown => {
     const setting = effectiveSettings?.[key];
     return setting !== undefined && setting.source !== "default" ? setting.value : undefined;
@@ -144,12 +143,6 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   const highContrast = loadApi
     ? (apiHighContrast ?? highContrastPreference)
     : highContrastPreference;
-
-  // A setter shows its value before saving it. When the save fails in a way
-  // that may have stored it, the settings re-read can come back unchanged, so
-  // the effects below would leave that value shown and cached; bumping this
-  // re-runs them on what the server holds.
-  const [reconciles, reconcile] = useReducer((count: number) => count + 1, 0);
 
   // Mirror the server's values into this identity's namespace so the next cold
   // start paints them before the settings request resolves. Without this the
@@ -202,27 +195,19 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     if (cleared.textScale) setTextScalePreference(parseTextScale(undefined));
     if (cleared.textWeight) setTextWeightPreference(parseTextWeight(undefined));
     if (cleared.highContrast) setHighContrastPreference(parseHighContrast(undefined));
-  }, [
-    loadApi,
-    effectiveSettings,
-    apiTextScale,
-    apiTextWeight,
-    apiHighContrast,
-    cacheOwner,
-    reconciles,
-  ]);
+  }, [loadApi, effectiveSettings, apiTextScale, apiTextWeight, apiHighContrast, cacheOwner]);
 
   useEffect(() => {
     applyTextScaleToDOM(textScale);
-  }, [textScale, reconciles]);
+  }, [textScale]);
 
   useEffect(() => {
     applyTextWeightToDOM(textWeight);
-  }, [textWeight, reconciles]);
+  }, [textWeight]);
 
   useEffect(() => {
     applyHighContrastToDOM(highContrast);
-  }, [highContrast, reconciles]);
+  }, [highContrast]);
 
   // With no stored choice, high contrast follows the system setting, so follow
   // it while the app is open too. Re-parsing the cache keeps a stored choice
@@ -243,7 +228,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     return () => query.removeEventListener("change", onChange);
   }, [cacheOwner]);
 
-  const showThenSave = useShowThenSave(cacheOwner, settingsRead);
+  const showThenSave = useShowThenSave(cacheOwner);
 
   const setTextScale = useCallback(
     (value: TextScale) =>
@@ -257,9 +242,8 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
           applyTextScaleToDOM(v);
         },
         save: (v) => saveProfileDefault(SETTING_KEYS.UI_TEXT_SCALE, v),
-        reconcile,
       }),
-    [reconcile, saveProfileDefault, showThenSave, textScale],
+    [saveProfileDefault, showThenSave, textScale],
   );
 
   const setTextWeight = useCallback(
@@ -274,9 +258,8 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
           applyTextWeightToDOM(v);
         },
         save: (v) => saveProfileDefault(SETTING_KEYS.UI_TEXT_WEIGHT, v),
-        reconcile,
       }),
-    [reconcile, saveProfileDefault, showThenSave, textWeight],
+    [saveProfileDefault, showThenSave, textWeight],
   );
 
   const setHighContrast = useCallback(
@@ -291,9 +274,8 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
           applyHighContrastToDOM(v);
         },
         save: (v) => saveProfileDefault(SETTING_KEYS.UI_HIGH_CONTRAST, v),
-        reconcile,
       }),
-    [reconcile, saveProfileDefault, showThenSave, highContrast],
+    [saveProfileDefault, showThenSave, highContrast],
   );
 
   return (

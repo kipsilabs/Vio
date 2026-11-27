@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/oklog/ulid/v2"
 	"log/slog"
 	"strconv"
 	"strings"
@@ -261,6 +262,31 @@ func (d *EventDispatcher) Stop() {
 func (d *EventDispatcher) mayHaveSubscribers(eventName string) bool {
 	index, ok := d.currentIndex()
 	return !ok || len(index[eventName]) > 0
+}
+
+// ObservePublish takes an event this server published on the bus. It is a
+// cache.PublishObserver and never blocks the publisher.
+func (d *EventDispatcher) ObservePublish(channel string, event cache.Event) {
+	switch channel {
+	case cache.ChannelCatalog, cache.ChannelAdmin, cache.ChannelPlayback:
+	default:
+		return
+	}
+	if !d.mayHaveSubscribers(event.Type) {
+		return
+	}
+	d.offer(busEvent(event))
+}
+
+// busEvent is a bus event in the dispatcher's produced shape.
+func busEvent(event cache.Event) producedEvent {
+	return producedEvent{
+		id:   ulid.Make().String(),
+		name: event.Type,
+		payload: func() (*structpb.Struct, error) {
+			return decodeRawJSON(json.RawMessage(event.Payload)), nil
+		},
+	}
 }
 
 // offer queues an event without waiting, and logs it when the intake is full.

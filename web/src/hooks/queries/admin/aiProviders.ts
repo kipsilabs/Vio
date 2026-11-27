@@ -1,4 +1,4 @@
-import { useIsMutating, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { v2 } from "@/api/v2/request";
 import type { components } from "@/api/v2/schema";
 import { adminKeys } from "../keys";
@@ -10,15 +10,6 @@ export type AIProviderCheck = components["schemas"]["AdminAIProviderCheck"];
 export type AICapability = AIProvider["capabilities"][number];
 
 const providersKey = ["admin", "ai", "providers"] as const;
-const createProviderKey = [...providersKey, "create"] as const;
-
-/**
- * How long an add waits for the server. Writes get no deadline by default, but
- * the add dialog stays shut while a create is pending, so one the server never
- * answers must give up. A create that lands late is not selected for the
- * caller; it shows up in the provider list the next time that loads.
- */
-const PROVIDER_CREATE_TIMEOUT_MS = 30_000;
 
 export function useAIProviders() {
   return useQuery({
@@ -55,30 +46,19 @@ export function useAIProviderModels(id: string) {
  */
 function useProviderWrite<TInput, TResult>(
   request: (input: TInput) => Promise<TResult>,
-  {
-    changesSettings = false,
-    mutationKey,
-  }: { changesSettings?: boolean; mutationKey?: readonly string[] } = {},
+  { changesSettings = false } = {},
 ) {
   const qc = useQueryClient();
   return useMutation({
-    mutationKey,
     mutationFn: request,
-    // Offline, fail at once rather than pause: the add dialog stays open
-    // while a create is pending, and a paused one would hold it shut.
-    networkMode: "always",
     retry: false,
-    onSettled: (_data, error) => {
-      const refreshed = Promise.all([
+    onSettled: async () => {
+      await Promise.all([
         qc.invalidateQueries({ queryKey: providersKey }),
         changesSettings
           ? qc.invalidateQueries({ queryKey: adminKeys.serverSettings() })
           : Promise.resolve(),
       ]);
-      // A failed write refreshes in the background. Waiting would keep the
-      // write pending, and the add dialog shut, for the list read's own
-      // deadline after a create had already given up.
-      return error ? undefined : refreshed;
     },
   });
 }
@@ -93,25 +73,17 @@ export interface AIProviderDraft {
 }
 
 export function useCreateAIProvider() {
-  return useProviderWrite(
-    (draft: AIProviderDraft) =>
-      v2("POST /api/v2/admin/ai/providers", {
-        body: {
-          type: draft.type,
-          name: draft.name,
-          base_url: draft.base_url,
-          api_key: draft.api_key || undefined,
-          capabilities: draft.capabilities,
-        },
-        timeoutMs: PROVIDER_CREATE_TIMEOUT_MS,
-      }),
-    { mutationKey: createProviderKey },
+  return useProviderWrite((draft: AIProviderDraft) =>
+    v2("POST /api/v2/admin/ai/providers", {
+      body: {
+        type: draft.type,
+        name: draft.name,
+        base_url: draft.base_url,
+        api_key: draft.api_key || undefined,
+        capabilities: draft.capabilities,
+      },
+    }),
   );
-}
-
-/** Whether a provider create is still waiting for the server. */
-export function useAIProviderCreatePending() {
-  return useIsMutating({ mutationKey: createProviderKey }) > 0;
 }
 
 export function useUpdateAIProvider() {

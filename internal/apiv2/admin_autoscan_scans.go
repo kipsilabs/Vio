@@ -19,7 +19,7 @@ type AdminAutoscanScansService interface {
 type AdminAutoscanScanStatus string
 
 func (AdminAutoscanScanStatus) Schema(huma.Registry) *huma.Schema {
-	return &huma.Schema{Type: huma.TypeString, Enum: []any{"", scanqueue.StatusAccepted, scanqueue.StatusRunning, scanqueue.StatusCompleted, scanqueue.StatusFailed, scanqueue.StatusCancelled}}
+	return &huma.Schema{Type: huma.TypeString, Enum: []any{"", scanqueue.StatusAccepted, scanqueue.StatusRunning, scanqueue.StatusCompleted, scanqueue.StatusFailed, scanqueue.StatusCancelled, scanqueue.StatusCancelledLegacy}}
 }
 
 const autoscanScanIDDescending = "id_desc"

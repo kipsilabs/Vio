@@ -14,6 +14,10 @@ export interface DownloadQualityOption {
 
 export interface DownloadCapability {
   enabled: boolean;
+  /** Effective answer for the calling principal: download_allowed and not refused by demo mode. */
+  allowed: boolean;
+  /** Support and configuration state, not health. */
+  state: "available" | "disabled" | "not_configured" | "unsupported";
   download_allowed: boolean;
   quality_presets: DownloadQuality[];
   quality_options: DownloadQualityOption[];

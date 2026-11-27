@@ -29,7 +29,6 @@ type AdminAPIKey struct {
 	KeyPrefix string   `json:"key_prefix"`
 	RateTier  string   `json:"rate_tier" enum:"standard,elevated"`
 	Scopes    []string `json:"scopes"`
-	ProfileID string   `json:"profile_id,omitempty" doc:"The household profile the key is bound to and always acts as. Absent on an account key, which may name any profile on its account"`
 	CreatedAt Instant  `json:"created_at"`
 }
 type AdminAPIKeyListItem struct {
@@ -73,7 +72,6 @@ type AdminAPIKeyCreated struct {
 	Key       string   `json:"key" doc:"Credential disclosed only in this creation response. Store it securely."`
 	RateTier  string   `json:"rate_tier"`
 	Scopes    []string `json:"scopes"`
-	ProfileID string   `json:"profile_id,omitempty" doc:"The household profile the key is bound to. Absent on an account key"`
 	CreatedAt Instant  `json:"created_at"`
 }
 type AdminAPIKeyCreatedOutput struct {
@@ -105,7 +103,7 @@ func adminAPIKeyOf(k *handlers.APIKeyConfiguration) AdminAPIKey {
 	if scopes == nil {
 		scopes = []string{}
 	}
-	return AdminAPIKey{ID: ID(strconv.FormatInt(k.ID, 10)), UserID: ID(strconv.Itoa(k.UserID)), Label: k.Label, KeyPrefix: k.KeyPrefix, RateTier: k.RateTier, Scopes: scopes, ProfileID: k.ProfileID, CreatedAt: NewInstant(k.CreatedAt)}
+	return AdminAPIKey{ID: ID(strconv.FormatInt(k.ID, 10)), UserID: ID(strconv.Itoa(k.UserID)), Label: k.Label, KeyPrefix: k.KeyPrefix, RateTier: k.RateTier, Scopes: scopes, CreatedAt: NewInstant(k.CreatedAt)}
 }
 func adminAPIKeyTag(ctx context.Context, id, revision int64) EntityTag {
 	return RenderETag("admin-api-keys/"+strconv.Itoa(claimsFrom(ctx).UserID)+"/"+profileFrom(ctx), strconv.FormatInt(id, 10), revision)
@@ -124,8 +122,6 @@ func adminAPIKeyProblem(ctx context.Context, err error) *Problem {
 	switch {
 	case errors.Is(err, auth.ErrAPIKeyNotFound):
 		return NewProblem(TypeNotFound, "API key not found.")
-	case errors.Is(err, auth.ErrSessionRevoked):
-		return NewProblem(TypeAuthenticationRequired, "The session or API key this request used was revoked. Sign in again.")
 	case errors.Is(err, auth.ErrInvalidAPIKeyTier), errors.Is(err, handlers.ErrInvalidAPIKeyCreation):
 		return NewProblem(TypeValidationFailed, "Invalid API key configuration.")
 	default:

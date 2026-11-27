@@ -83,9 +83,6 @@ export function remakeDescription(
 
 export const WATCH_KEYS = ["playback.watched_threshold", "playback.min_resume_threshold"];
 
-export const PAUSED_SESSION_TIMEOUT_KEY = "playback.paused_session_timeout_minutes";
-export const PAUSED_PLAYBACK_KEYS = [PAUSED_SESSION_TIMEOUT_KEY];
-
 export const SPEED_TEST_KEYS = [
   "playback.bandwidth_probe_automatic",
   "playback.bandwidth_probe_max_age_days",
@@ -108,7 +105,6 @@ export const MARKER_KEYS = [
 // loaded or saved here.
 export const KEYS = [
   ...WATCH_KEYS,
-  ...PAUSED_PLAYBACK_KEYS,
   ...SPEED_TEST_KEYS,
   ...TRANSCODING_ESSENTIAL_KEYS,
   ...TRANSCODING_ADVANCED_KEYS,

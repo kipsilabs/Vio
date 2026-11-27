@@ -51,8 +51,8 @@ export const itemKeys = {
     ["items", "detail", id, libraryId ?? "default"] as const,
   matchHints: (id: string, libraryId?: number) =>
     ["items", "matchHints", id, libraryId ?? "default"] as const,
-  watchDetail: (id: string, fileId?: number, libraryId?: number) =>
-    ["items", "watchDetail", id, fileId ?? "default", libraryId ?? "default"] as const,
+  watchDetail: (id: string, libraryId?: number) =>
+    ["items", "watchDetail", id, libraryId ?? "default"] as const,
   watchTrickplay: (id: string, fileId: number) => ["items", "watchTrickplay", id, fileId] as const,
   markers: (id: string) => ["items", "markers", id] as const,
   browse: (params: BrowseParams) => ["items", "browse", params] as const,
@@ -70,9 +70,18 @@ export const catalogKeys = {
   allCounts: ["catalog", "count"] as const,
   count: (params: Pick<CatalogParams, "library_id" | "type" | "query_fingerprint">) =>
     ["catalog", "count", params] as const,
-  itemDetail: (id: string, libraryId?: number) =>
-    ["catalog", "items", id, "detail", libraryId ?? "default"] as const,
+  // The detail key carries the viewer's selected file only when one is passed:
+  // the selection changes the effective playback answer, so it is its own
+  // cache entry. Callers that pass no file keep the original key, and every
+  // prefix-based invalidation of the item's detail still reaches both.
+  itemDetail: (id: string, libraryId?: number, fileId?: number) =>
+    fileId != null
+      ? (["catalog", "items", id, "detail", libraryId ?? "default", fileId] as const)
+      : (["catalog", "items", id, "detail", libraryId ?? "default"] as const),
   itemVersions: (id: string) => ["catalog", "items", id, "versions"] as const,
+  // Batched liveness verdicts for a set of file_ids (see versionLiveness.ts).
+  // Prefix-matched to invalidate every mounted batch at once.
+  versionLiveness: ["catalog", "versions", "check"] as const,
   audiobookGroups: (libraryId: number, groupBy: string, sort: string, search: string) =>
     ["catalog", "audiobookGroups", libraryId, groupBy, sort, search] as const,
   itemEpisodes: (id: string, libraryId?: number) =>
@@ -138,11 +147,6 @@ export const collectionKeys = {
   items: (collectionId: string) => ["collections", "items", collectionId] as const,
   /** The list, each own manual collection marked with whether it holds the title. */
   containing: (contentId: string) => ["collections", "containing", contentId] as const,
-  /** Every title page's collections row. */
-  onTitles: () => ["collections", "on-title"] as const,
-  /** The collections row on one title's page. */
-  onTitle: (contentId: string, libraryId: number | undefined) =>
-    ["collections", "on-title", contentId, libraryId ?? ""] as const,
   preview: (scope: "user" | "admin", fingerprint: string) =>
     ["collections", "preview", scope, fingerprint] as const,
   templates: () => ["collections", "templates"] as const,
@@ -165,7 +169,8 @@ export const requestKeys = {
   ) => ["requests", "discover", "browse", kind, slug, mediaType ?? "", sort] as const,
   search: (mediaType: string, query: string, page: number, viewerKey: string) =>
     ["requests", "search", viewerKey, mediaType, query, page] as const,
-  detail: (mediaType: string, tmdbID: number) => ["requests", "detail", mediaType, tmdbID] as const,
+  detail: (mediaType: string, tmdbID: number, seasonSource = "") =>
+    ["requests", "detail", mediaType, tmdbID, seasonSource] as const,
   mine: (params: Record<string, unknown>) => ["requests", "mine", params] as const,
   one: (id: string) => ["requests", "one", id] as const,
   // Prefixes for refreshing every params variant at once.
@@ -277,8 +282,6 @@ export const notificationKeys = {
   discordPreferences: () => ["notifications", "discord-preferences"] as const,
   capability: () => ["notifications", "capability"] as const,
   webhooks: () => ["notifications", "webhooks"] as const,
-  pluginChannels: () => ["notifications", "plugin-channels"] as const,
-  pluginDestinations: () => ["notifications", "plugin-destinations"] as const,
   webPushSubscriptions: () => ["notifications", "web-push-subscriptions"] as const,
 };
 
@@ -445,6 +448,8 @@ export const adminKeys = {
   dashboardTimeseries: (hours: number) => ["admin", "dashboard", "timeseries", hours] as const,
   playbackActivityRoot: () => ["admin", "dashboard", "playback-activity"] as const,
   playbackActivity: (hours: number) => ["admin", "dashboard", "playback-activity", hours] as const,
+  topActivityRoot: () => ["admin", "dashboard", "top-activity"] as const,
+  topActivity: (days: number) => ["admin", "dashboard", "top-activity", days] as const,
   downloadsStatsRoot: () => ["admin", "dashboard", "downloads-stats"] as const,
   downloadsStats: (limit: number) => ["admin", "dashboard", "downloads-stats", limit] as const,
   apiClientsRoot: () => ["admin", "dashboard", "api-clients"] as const,
@@ -503,26 +508,13 @@ export const adminKeys = {
   invitations: () => ["admin", "invitations"] as const,
   apiKeys: () => ["admin", "apiKeys"] as const,
   rateLimitConfig: () => ["admin", "rateLimitConfig"] as const,
-  playbackHistory: (params: Record<string, unknown>) =>
-    ["admin", "playbackHistory", params] as const,
-  playbackHistoryDetail: (sessionId: string) =>
-    ["admin", "playbackHistory", "detail", sessionId] as const,
-  insightsRoot: () => ["admin", "insights"] as const,
-  insightsCapabilities: () => ["admin", "insights", "capabilities"] as const,
-  insightsActivity: (params: Record<string, unknown>) =>
-    ["admin", "insights", "activity", params] as const,
-  insightsPeople: (params: Record<string, unknown>) =>
-    ["admin", "insights", "people", params] as const,
-  insightsDevices: (params: Record<string, unknown>) =>
-    ["admin", "insights", "devices", params] as const,
-  insightsBandwidth: (params: Record<string, unknown>) =>
-    ["admin", "insights", "bandwidth", params] as const,
-  insightsTitles: (params: Record<string, unknown>) =>
-    ["admin", "insights", "titles", params] as const,
-  insightsLibrary: (params: Record<string, unknown>) =>
-    ["admin", "insights", "library", params] as const,
-  insightsTitle: (contentId: string, params: Record<string, unknown>) =>
-    ["admin", "insights", "title", contentId, params] as const,
+  playbackHistory: (params: {
+    userId?: number;
+    profileId?: string;
+    mediaItemId?: string;
+    completed?: string;
+    limit?: number;
+  }) => ["admin", "playbackHistory", params] as const,
   userIPs: (userId: number, days?: number) => ["admin", "users", userId, "ips", days] as const,
   ipUsers: (ip: string, days?: number) => ["admin", "ips", ip, days] as const,
   operationalLogsRoot: () => ["admin", "logs", "app"] as const,
@@ -595,6 +587,7 @@ export const adminKeys = {
           ignored ? "ignored" : "unmatched",
           search,
         ] as const),
+  virtualItems: (limit: number) => ["admin", "virtualItems", limit] as const,
   itemImages: (id: string) => ["admin", "items", id, "images"] as const,
   buildInfo: () => ["admin", "system", "buildInfo"] as const,
   hwAccel: () => ["admin", "system", "hwAccel"] as const,

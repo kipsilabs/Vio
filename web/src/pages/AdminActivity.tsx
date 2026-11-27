@@ -1,8 +1,9 @@
-import type { MouseEvent as ReactMouseEvent, ReactNode, RefObject } from "react";
+import type { MouseEvent as ReactMouseEvent, ReactNode } from "react";
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
-import { Link } from "react-router";
+import { Link, Navigate, useSearchParams } from "react-router";
 import { AdminSessionActions } from "@/components/AdminSessionActions";
 import { JellyfinSessionPill } from "@/components/JellyfinSessionPill";
+import { PageHeader } from "@/components/page/PageHeader";
 import { PlaybackRouteBadges } from "@/components/PlaybackRouteBadges";
 import { useRealtimeEvents } from "@/components/realtimeEventsContext";
 import { useOperationalLogs } from "@/hooks/queries/admin/logs";
@@ -19,13 +20,6 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import {
-  Sheet,
-  SheetContent,
-  SheetDescription,
-  SheetHeader,
-  SheetTitle,
-} from "@/components/ui/sheet";
 import type { AdminSession, OperationalLogEntry, IPUserEntry } from "@/api/types";
 import { useIPUsers } from "@/hooks/queries/admin/ips";
 import { useAdminSessions } from "@/hooks/queries/admin/stats";
@@ -79,12 +73,10 @@ import {
   FileText,
   Film,
   Filter,
-  Gauge,
   Globe,
-  LayoutGrid,
   Pause,
   Play,
-  Rows3,
+  RefreshCw,
   Search,
   Terminal,
   X,
@@ -93,13 +85,11 @@ import { formatDateTime, formatTime } from "@/lib/datetime";
 import { formatLocale, joinList } from "@/lib/appLocale";
 import { englishText, numberText, type TextValues, type Translate, useT } from "@/i18n";
 import type { MessageKey } from "@/locales/keys";
-import { InsightSectionError } from "./insightsShared";
 
 type SortField = "username" | "media" | "method" | "bitrate" | "node" | "started";
 type SortDir = "asc" | "desc";
-type ActivityView = "table" | "cards";
 
-const NO_SESSIONS: AdminSession[] = [];
+const REFRESH_SPINNER_MIN_VISIBLE_MS = 1_000;
 
 const MIDDLE_DOT = "·";
 const SORT_ASC_MARK = "▲";
@@ -201,33 +191,6 @@ const STACKED_SORT_FIELDS: [SortField, MessageKey][] = [
   ["started", "web.admin.activity.column.time"],
 ];
 
-/** The admin's last chosen layout, kept per browser. */
-const VIEW_STORAGE_KEY = "silo.admin.activity.view";
-/**
- * Until the admin picks a layout, a handful of streams opens as cards, which
- * read at a glance, and more opens as the table, which scans faster. The
- * choice is made from the first loaded list each time the tab opens, so the
- * layout doesn't flip as streams start and stop while it's open.
- */
-const AUTO_CARDS_MAX_STREAMS = 8;
-
-function readStoredView(): ActivityView | null {
-  try {
-    const value = localStorage.getItem(VIEW_STORAGE_KEY);
-    return value === "table" || value === "cards" ? value : null;
-  } catch {
-    return null;
-  }
-}
-
-function storeView(view: ActivityView) {
-  try {
-    localStorage.setItem(VIEW_STORAGE_KEY, view);
-  } catch {
-    // Storage is unavailable; the choice lasts until the page closes.
-  }
-}
-
 // Filter controls: a segmented group per filter, so one choice per group reads
 // as one control instead of a run of loose chips. The 1px gap shows the group's
 // border color between segments, which keeps the dividers right when a narrow
@@ -236,16 +199,12 @@ const SEGMENTED_GROUP_CLASS =
   "border-border bg-border inline-flex max-w-full flex-wrap gap-px overflow-hidden rounded-md border";
 
 function segmentClass(active: boolean): string {
-  return `focus-visible:ring-ring inline-flex h-7.5 grow items-center justify-center gap-1.5 px-2.5 text-[0.75rem] font-medium whitespace-nowrap transition-colors focus-visible:ring-2 focus-visible:outline-none focus-visible:ring-inset ${
+  return `focus-visible:ring-ring inline-flex h-[30px] grow items-center justify-center gap-1.5 px-2.5 text-[12px] font-medium whitespace-nowrap transition-colors focus-visible:ring-2 focus-visible:outline-none focus-visible:ring-inset ${
     active
       ? "bg-primary/10 text-foreground"
       : "bg-surface text-muted-foreground hover:bg-secondary hover:text-foreground"
   }`;
 }
-
-/** The chevron button that shows a row's or card's details. */
-const DETAILS_BUTTON_CLASS =
-  "text-muted-foreground hover:text-foreground hover:bg-surface-raised flex h-7 w-7 shrink-0 items-center justify-center rounded-md transition-colors";
 
 const NODE_KIND_ORDER: ActivityRouteNode["kind"][] = ["proxy", "transcode", "server", "legacy"];
 
@@ -271,7 +230,7 @@ function NodeFilterMenu({
   return (
     <DropdownMenu>
       <DropdownMenuTrigger
-        className={`focus-visible:ring-ring inline-flex h-8 max-w-full items-center gap-1.5 rounded-md border px-2.5 text-[0.75rem] font-medium whitespace-nowrap transition-colors focus-visible:ring-2 focus-visible:outline-none ${
+        className={`focus-visible:ring-ring inline-flex h-8 max-w-full items-center gap-1.5 rounded-md border px-2.5 text-[12px] font-medium whitespace-nowrap transition-colors focus-visible:ring-2 focus-visible:outline-none ${
           selectedNode
             ? "border-primary/40 bg-primary/10 text-foreground"
             : "border-border bg-surface text-muted-foreground hover:text-foreground"
@@ -300,7 +259,7 @@ function NodeFilterMenu({
         {groups.map((group, index) => (
           <div key={group[0]!.kind} role="group" aria-label={group[0]!.label}>
             {index > 0 && <DropdownMenuSeparator />}
-            <DropdownMenuLabel className="text-muted-foreground text-[0.6875rem] font-medium">
+            <DropdownMenuLabel className="text-muted-foreground text-[11px] font-medium">
               {group[0]!.label}
             </DropdownMenuLabel>
             {group.map((node) => (
@@ -308,7 +267,7 @@ function NodeFilterMenu({
                 key={node.key}
                 checked={node.key === selected}
                 onCheckedChange={(checked) => onSelect(checked ? node.key : null)}
-                className="text-[0.8125rem]"
+                className="text-[13px]"
               >
                 <span dir="auto" className="truncate">
                   {node.name}
@@ -333,37 +292,15 @@ function routeSortValue(session: AdminSession): string {
     .join(" ");
 }
 
-/**
- * The Insights page's live tab: every playback session streaming now. The page
- * header's Refresh button re-reads the sessions on this tab.
- */
-export function LiveActivityTab() {
+export default function AdminActivity() {
   const t = useT();
-  const {
-    data: loadedSessions,
-    isLoading,
-    error: sessionsError,
-    refetch: refresh,
-  } = useAdminSessions();
-  const sessions = loadedSessions ?? NO_SESSIONS;
+  const { data: sessions = [], isLoading, refetch: refresh } = useAdminSessions();
+  const [searchParams] = useSearchParams();
   const { connectionState } = useRealtimeEvents();
   const pageActivity = usePageActivity();
+  const manualRefreshStartedAtRef = useRef<number | null>(null);
   const wasRealtimePausedRef = useRef(!pageActivity.canApplyRealtimeUpdates);
-  const [storedView, setStoredView] = useState<ActivityView | null>(readStoredView);
-  const [autoView, setAutoView] = useState<ActivityView | null>(null);
-  // Only a loaded list counts: a failed or not-yet-started load has no streams
-  // to count, and deciding from it would fix the layout before any arrive.
-  if (autoView === null && loadedSessions !== undefined) {
-    setAutoView(sessions.length > AUTO_CARDS_MAX_STREAMS ? "table" : "cards");
-  }
-  const view: ActivityView = storedView ?? autoView ?? "table";
-  const chooseView = useCallback((next: ActivityView) => {
-    storeView(next);
-    setStoredView(next);
-  }, []);
-  const [detailsSessionId, setDetailsSessionId] = useState<string | null>(null);
-  // The control that opened a card's details, which takes focus back when they close.
-  const detailsReturnFocusRef = useRef<HTMLElement | null>(null);
+  const [isManualRefreshPending, setIsManualRefreshPending] = useState(false);
   const [search, setSearch] = useState("");
   const [methodFilter, setMethodFilter] = useState<string | null>(null);
   const [nodeFilter, setNodeFilter] = useState<string | null>(null);
@@ -373,19 +310,44 @@ export function LiveActivityTab() {
   const [ipLookupOpen, setIPLookupOpen] = useState(false);
   const [ipLookupSeed, setIPLookupSeed] = useState("");
 
-  // Realtime updates pause while the page is hidden; catch up when it returns.
+  const refreshActivity = useCallback(
+    async ({ manual }: { manual: boolean }) => {
+      if (manual) {
+        manualRefreshStartedAtRef.current = Date.now();
+        setIsManualRefreshPending(true);
+      }
+      try {
+        await refresh();
+      } finally {
+        if (manual) {
+          const startedAt = manualRefreshStartedAtRef.current;
+          if (startedAt !== null) {
+            const elapsed = Date.now() - startedAt;
+            const remaining = REFRESH_SPINNER_MIN_VISIBLE_MS - elapsed;
+            if (remaining > 0) {
+              await delay(remaining);
+            }
+          }
+          manualRefreshStartedAtRef.current = null;
+          setIsManualRefreshPending(false);
+        }
+      }
+    },
+    [refresh],
+  );
+
   useEffect(() => {
     if (!pageActivity.canApplyRealtimeUpdates) {
       wasRealtimePausedRef.current = true;
       return;
     }
-    if (!wasRealtimePausedRef.current) {
+    if (!wasRealtimePausedRef.current || isManualRefreshPending) {
       return;
     }
 
     wasRealtimePausedRef.current = false;
-    void refresh();
-  }, [pageActivity.canApplyRealtimeUpdates, refresh]);
+    void refreshActivity({ manual: true });
+  }, [isManualRefreshPending, pageActivity.canApplyRealtimeUpdates, refreshActivity]);
 
   // Aggregate counts
   const methods = useMemo(() => {
@@ -507,20 +469,12 @@ export function LiveActivityTab() {
     setIPLookupOpen(true);
   }, []);
 
-  // Sessions that end while their details are open close the panel, and
-  // forget it, so the same session showing up again doesn't reopen it.
-  const detailsSession = detailsSessionId
-    ? sessions.find((session) => session.session_id === detailsSessionId)
-    : undefined;
-  if (detailsSessionId !== null && loadedSessions !== undefined && !detailsSession) {
-    setDetailsSessionId(null);
+  // Download preparation moved to the Downloads page; keep old links working.
+  if (searchParams.get("view") === "preparations") {
+    return <Navigate to="/admin/downloads?tab=preparation" replace />;
   }
-
   if (isLoading)
     return <div className="text-muted-foreground pb-8">{t("web.admin.activity.page.loading")}</div>;
-  // A failed load has no list to show; an empty one would read as "nothing is playing".
-  // The toolbar stays, since IP lookup doesn't need the list.
-  const loadFailed = loadedSessions === undefined && sessionsError !== null;
 
   const summary =
     sessions.length === 0
@@ -551,8 +505,43 @@ export function LiveActivityTab() {
 
   return (
     <div className="space-y-4">
-      {/* Search, filters, and layout, where the other tabs keep their date and filter bar */}
-      <div className="surface-panel flex flex-wrap items-center gap-2.5 rounded-2xl border-0 p-3">
+      <PageHeader
+        title={t("web.admin.activity.page.title")}
+        subtitle={summary}
+        actions={
+          <>
+            <RealtimeStatus state={connectionState} />
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                setIPLookupSeed("");
+                setIPLookupOpen(true);
+              }}
+            >
+              <Globe className="h-3.5 w-3.5" />
+              {t("web.admin.activity.ipLookup.heading")}
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => void refreshActivity({ manual: true })}
+              disabled={isManualRefreshPending}
+              aria-busy={isManualRefreshPending}
+            >
+              <RefreshCw
+                className={`h-3.5 w-3.5 ${isManualRefreshPending ? "animate-spin" : ""}`}
+              />
+              {isManualRefreshPending
+                ? t("web.admin.activity.page.refreshing")
+                : t("web.admin.activity.page.refresh")}
+            </Button>
+          </>
+        }
+      />
+
+      {/* Search + filters */}
+      <div className="flex flex-wrap items-center gap-2">
         <div className="relative w-full sm:w-80">
           <Search className="text-muted-foreground pointer-events-none absolute start-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2" />
           <Input
@@ -560,7 +549,7 @@ export function LiveActivityTab() {
             aria-label={t("web.admin.activity.filter.placeholder")}
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            className="h-8 ps-9 pe-8 text-[0.8125rem]"
+            className="h-8 ps-9 pe-8 text-[13px]"
           />
           {search && (
             <button
@@ -633,87 +622,53 @@ export function LiveActivityTab() {
               setNodeFilter(null);
               setTypeFilter(null);
             }}
-            className="text-muted-foreground hover:text-foreground flex items-center gap-1 text-[0.75rem]"
+            className="text-muted-foreground hover:text-foreground flex items-center gap-1 text-[12px]"
           >
             <X className="h-3 w-3" />
             {t("web.admin.activity.filter.clear")}
           </button>
         )}
-        <div className="ms-auto flex flex-wrap items-center gap-2">
-          <RealtimeStatus state={connectionState} />
-          <ViewToggle view={view} onChange={chooseView} />
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => {
-              setIPLookupSeed("");
-              setIPLookupOpen(true);
-            }}
-          >
-            <Globe className="h-3.5 w-3.5" />
-            {t("web.admin.activity.ipLookup.heading")}
-          </Button>
-        </div>
       </div>
 
-      {loadFailed ? null : (
-        <div className="text-muted-foreground space-y-1 text-[0.8125rem]">
-          <p>{summary}</p>
-          {(search || activeFilters > 0) && (
-            <p className="text-[0.75rem]">
-              {t("web.admin.activity.filter.showing", {
-                total: sessions.length,
-                shown: filtered.length,
-                total_text: sessions.length,
-              })}
-            </p>
-          )}
+      {/* Filter status */}
+      {(search || activeFilters > 0) && (
+        <div className="text-muted-foreground text-[12px]">
+          {t("web.admin.activity.filter.showing", {
+            total: sessions.length,
+            shown: filtered.length,
+            total_text: sessions.length,
+          })}
         </div>
       )}
 
-      {loadFailed ? (
-        <InsightSectionError
-          error={sessionsError}
-          onRetry={() => {
-            void refresh();
-          }}
-        />
-      ) : filtered.length === 0 ? (
+      {/* Stream table */}
+      {filtered.length === 0 ? (
         <EmptyState hasData={sessions.length > 0} />
-      ) : view === "cards" ? (
-        <div className="space-y-3">
-          <SortBar
-            showRoute={showRoute}
-            current={sortField}
-            dir={sortDir}
-            onSort={toggleSort}
-            className="px-1"
-          />
-          <div className="grid grid-cols-[repeat(auto-fill,minmax(min(100%,21rem),1fr))] gap-3">
-            {filtered.map((session) => (
-              <StreamCard
-                key={session.session_id}
-                session={session}
-                showRoute={showRoute}
-                onIPLookup={runIPLookup}
-                onOpenDetails={(returnFocusTo) => {
-                  detailsReturnFocusRef.current = returnFocusTo;
-                  setDetailsSessionId(session.session_id);
-                }}
-              />
-            ))}
-          </div>
-        </div>
       ) : (
         <div className="bg-card border-border @container overflow-clip rounded-lg border">
           {/* Sort controls for the stacked rows, which have no column headers */}
-          <SortBar
-            showRoute={showRoute}
-            current={sortField}
-            dir={sortDir}
-            onSort={toggleSort}
-            className={`border-border bg-surface/50 border-b px-4 py-2.5 ${layout.stacked}`}
-          />
+          <div
+            role="group"
+            aria-label={t("web.admin.activity.sort.group")}
+            className={`border-border bg-surface/50 flex flex-wrap items-center gap-x-4 gap-y-1.5 border-b px-4 py-2.5 ${layout.stacked}`}
+          >
+            <span className="text-muted-foreground text-[12px]">
+              {t("web.admin.activity.sort.heading")}
+            </span>
+            {STACKED_SORT_FIELDS.filter(([field]) => showRoute || field !== "node").map(
+              ([field, label]) => (
+                <SortHeader
+                  key={field}
+                  field={field}
+                  current={sortField}
+                  dir={sortDir}
+                  onClick={toggleSort}
+                >
+                  {t(label)}
+                </SortHeader>
+              ),
+            )}
+          </div>
 
           {/* Table header, which stays in view while the page scrolls, below any
               impersonation banner */}
@@ -765,12 +720,6 @@ export function LiveActivityTab() {
         </div>
       )}
 
-      <StreamDetailsSheet
-        session={detailsSession}
-        onClose={() => setDetailsSessionId(null)}
-        returnFocusRef={detailsReturnFocusRef}
-        onIPLookup={runIPLookup}
-      />
       <IPLookupDialog open={ipLookupOpen} onOpenChange={setIPLookupOpen} seed={ipLookupSeed} />
     </div>
   );
@@ -785,7 +734,7 @@ function RealtimeStatus({ state }: { state: "connecting" | "live" | "disconnecte
     <span
       role="status"
       title={t("web.admin.activity.realtime.heading")}
-      className={`inline-flex items-center gap-1.5 px-1 text-[0.75rem] ${
+      className={`inline-flex items-center gap-1.5 px-1 text-[12px] ${
         state === "live" ? "text-muted-foreground" : "text-warning font-medium"
       }`}
     >
@@ -817,7 +766,8 @@ function StreamRow({
     session.username || t("web.admin.activity.userFallback", { id: session.user_id });
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [ffmpegOpen, setFFmpegOpen] = useState(false);
-  const ffmpegLogsHref = sessionFFmpegLogsHref(session);
+  const logsHref = `/admin/logs?playback_session_id=${encodeURIComponent(session.session_id)}&focus=playback`;
+  const ffmpegLogsHref = `${logsHref}&component=ffmpeg`;
   const ffmpegLogs = useOperationalLogs(
     {
       playback_session_id: session.session_id,
@@ -843,8 +793,15 @@ function StreamRow({
   const openDetails = () => setDetailsOpen(true);
   // A click anywhere on the row toggles its details, as a mouse shortcut for
   // the expand button (which stays the keyboard and screen-reader control).
-  const onRowClick = (event: ReactMouseEvent<HTMLElement>) => {
-    if (isPlainSurfaceClick(event)) toggleDetails();
+  // Clicks on the row's own links and buttons keep their meaning, as do
+  // clicks that end a text selection and clicks inside portaled menus and
+  // dialogs, which React bubbles here though they sit outside the row.
+  const onRowClick = (event: ReactMouseEvent<HTMLDivElement>) => {
+    const target = event.target as Element;
+    if (!event.currentTarget.contains(target)) return;
+    if (target.closest("a, button, input, select, textarea, label, [role='button']")) return;
+    if (window.getSelection()?.type === "Range") return;
+    toggleDetails();
   };
   const toggleFFmpeg = () => {
     setFFmpegOpen((open) => {
@@ -856,7 +813,29 @@ function StreamRow({
     });
   };
 
-  const actions = <SessionActions session={session} />;
+  const actions = (
+    <AdminSessionActions
+      session={session}
+      compact
+      layout="inline"
+      extraMenuItems={
+        <>
+          <DropdownMenuItem asChild>
+            <Link to={logsHref}>
+              <FileText className="h-4 w-4" />
+              {t("web.admin.activity.row.viewLogs")}
+            </Link>
+          </DropdownMenuItem>
+          <DropdownMenuItem asChild>
+            <Link to={ffmpegLogsHref}>
+              <Terminal className="h-4 w-4" />
+              {t("web.admin.activity.row.ffmpegLogs")}
+            </Link>
+          </DropdownMenuItem>
+        </>
+      }
+    />
+  );
   const expandButton = (
     <button
       type="button"
@@ -866,7 +845,7 @@ function StreamRow({
       aria-controls={expandedOpen ? panelId : undefined}
       aria-label={t("web.admin.activity.row.details")}
       title={t("web.admin.activity.row.details")}
-      className={DETAILS_BUTTON_CLASS}
+      className="text-muted-foreground hover:text-foreground hover:bg-surface-raised flex h-7 w-7 shrink-0 items-center justify-center rounded-md transition-colors"
     >
       <ChevronRight
         aria-hidden="true"
@@ -939,11 +918,11 @@ function StreamRow({
               <TitleLink session={session} />
               {isEpisodeSession(session) ? (
                 // The episode code and title, under the show's title.
-                <div className="text-muted-foreground truncate text-[0.75rem]">
+                <div className="text-muted-foreground truncate text-[12px]">
                   {getPlaybackSessionSubtitle(session)}
                 </div>
               ) : null}
-              <div className="text-muted-foreground flex min-w-0 items-center gap-1.5 text-[0.75rem]">
+              <div className="text-muted-foreground flex min-w-0 items-center gap-1.5 text-[12px]">
                 <Link
                   to={`/admin/users/${session.user_id}`}
                   title={username}
@@ -1004,359 +983,8 @@ function StreamRow({
   );
 }
 
-/**
- * Whether a click landed on a row or card itself, not on one of its own links
- * or buttons. Clicks that end a text selection don't count, nor do clicks
- * inside portaled menus and dialogs, which React bubbles here though they sit
- * outside the row.
- */
-function isPlainSurfaceClick(event: ReactMouseEvent<HTMLElement>): boolean {
-  const target = event.target as Element;
-  if (!event.currentTarget.contains(target)) return false;
-  if (target.closest("a, button, input, select, textarea, label, [role='button']")) return false;
-  return window.getSelection()?.type !== "Range";
-}
-
-function sessionLogsHref(session: AdminSession): string {
-  return `/admin/logs?playback_session_id=${encodeURIComponent(session.session_id)}&focus=playback`;
-}
-
-function sessionFFmpegLogsHref(session: AdminSession): string {
-  return `${sessionLogsHref(session)}&component=ffmpeg`;
-}
-
-/** A session's control buttons and menu, with links to its logs. */
-function SessionActions({ session }: { session: AdminSession }) {
-  const t = useT();
-  return (
-    <AdminSessionActions
-      session={session}
-      compact
-      layout="inline"
-      extraMenuItems={
-        <>
-          <DropdownMenuItem asChild>
-            <Link to={sessionLogsHref(session)}>
-              <FileText className="h-4 w-4" />
-              {t("web.admin.activity.row.viewLogs")}
-            </Link>
-          </DropdownMenuItem>
-          <DropdownMenuItem asChild>
-            <Link to={sessionFFmpegLogsHref(session)}>
-              <Terminal className="h-4 w-4" />
-              {t("web.admin.activity.row.ffmpegLogs")}
-            </Link>
-          </DropdownMenuItem>
-        </>
-      }
-    />
-  );
-}
-
-/** Table or cards, remembered per browser. */
-function ViewToggle({
-  view,
-  onChange,
-}: {
-  view: ActivityView;
-  onChange: (view: ActivityView) => void;
-}) {
-  const t = useT();
-  const options: [ActivityView, MessageKey, typeof Rows3][] = [
-    ["table", "web.admin.activity.view.table", Rows3],
-    ["cards", "web.admin.activity.view.cards", LayoutGrid],
-  ];
-  return (
-    <div
-      role="group"
-      aria-label={t("web.admin.activity.view.label")}
-      className={SEGMENTED_GROUP_CLASS}
-    >
-      {options.map(([value, label, Icon]) => (
-        <button
-          key={value}
-          type="button"
-          aria-pressed={view === value}
-          onClick={() => onChange(value)}
-          className={segmentClass(view === value)}
-        >
-          <Icon aria-hidden="true" className="h-3.5 w-3.5" />
-          {t(label)}
-        </button>
-      ))}
-    </div>
-  );
-}
-
-/** Sort buttons for the layouts without column headers: stacked rows and cards. */
-function SortBar({
-  showRoute,
-  current,
-  dir,
-  onSort,
-  className,
-}: {
-  showRoute: boolean;
-  current: SortField;
-  dir: SortDir;
-  onSort: (field: SortField) => void;
-  className: string;
-}) {
-  const t = useT();
-  return (
-    <div
-      role="group"
-      aria-label={t("web.admin.activity.sort.group")}
-      className={`flex flex-wrap items-center gap-x-4 gap-y-1.5 ${className}`}
-    >
-      <span className="text-muted-foreground text-[0.75rem]">
-        {t("web.admin.activity.sort.heading")}
-      </span>
-      {STACKED_SORT_FIELDS.filter(([field]) => showRoute || field !== "node").map(
-        ([field, label]) => (
-          <SortHeader key={field} field={field} current={current} dir={dir} onClick={onSort}>
-            {t(label)}
-          </SortHeader>
-        ),
-      )}
-    </div>
-  );
-}
-
-/**
- * One stream as a card: what is playing and who is watching, over the
- * poster's colors, then how the server delivers it, then where playback is.
- * A click on the card outside its links and buttons opens the details panel.
- * Closing the panel returns focus to the button that opened it, or to the
- * card's details button after a click on the card itself.
- */
-function StreamCard({
-  session,
-  showRoute,
-  onIPLookup,
-  onOpenDetails,
-}: {
-  session: AdminSession;
-  showRoute: boolean;
-  onIPLookup: (ip: string) => void;
-  onOpenDetails: (returnFocusTo: HTMLElement | null) => void;
-}) {
-  const t = useT();
-  const cardRef = useRef<HTMLElement>(null);
-  const detailsButtonRef = useRef<HTMLButtonElement>(null);
-  const reasons = getAdaptationReasons(session);
-  const subtitle = getPlaybackSessionSubtitle(session);
-  const progress = getPlaybackProgress(session);
-  const openDetails = () => {
-    // A button in the card that opened the panel is focused; a click on the
-    // card itself focuses nothing in it.
-    const active = document.activeElement;
-    const opener =
-      active instanceof HTMLElement && cardRef.current?.contains(active) ? active : null;
-    onOpenDetails(opener ?? detailsButtonRef.current);
-  };
-  return (
-    <article
-      ref={cardRef}
-      onClick={(event) => {
-        if (isPlainSurfaceClick(event)) openDetails();
-      }}
-      className="bg-card border-border hover:border-foreground/25 flex min-w-0 cursor-pointer flex-col overflow-hidden rounded-xl border transition-colors"
-    >
-      <div className="relative flex gap-3 overflow-hidden p-3">
-        {session.poster_url ? (
-          <img
-            src={session.poster_url}
-            alt=""
-            aria-hidden="true"
-            loading="lazy"
-            decoding="async"
-            className="pointer-events-none absolute inset-0 h-full w-full scale-125 object-cover opacity-25 blur-2xl"
-          />
-        ) : null}
-        <div className="relative shrink-0">
-          <Poster session={session} size="card" />
-        </div>
-        <div className="relative min-w-0 flex-1 space-y-1">
-          <div className="min-w-0">
-            <TitleLink session={session} />
-            {subtitle ? (
-              <div className="text-muted-foreground truncate text-[0.75rem]">{subtitle}</div>
-            ) : null}
-          </div>
-          <ViewerCell session={session} onIPLookup={onIPLookup} />
-        </div>
-        <div className="relative -me-1 -mt-1 shrink-0">
-          <SessionActions session={session} />
-        </div>
-        {progress !== null ? (
-          <span aria-hidden="true" className="bg-border/70 absolute inset-x-0 bottom-0 h-0.5">
-            <span
-              className={`block h-full ${session.is_paused ? "bg-warning" : "bg-primary"}`}
-              style={{ width: `${progress * 100}%` }}
-            />
-          </span>
-        ) : null}
-      </div>
-      <div className="border-border/60 min-w-0 space-y-1 border-t px-3 py-2.5">
-        <MethodLine
-          method={classifyActivityMethod(session)}
-          reasons={reasons}
-          onMore={openDetails}
-        />
-        <ConversionLine kind="video" session={session} />
-        <ConversionLine kind="audio" session={session} />
-        <BitrateLine session={session} />
-        {showRoute ? (
-          <div className="flex min-w-0 flex-wrap gap-1 pt-0.5">
-            <PlaybackRouteBadges session={session} showLocation={false} />
-          </div>
-        ) : null}
-      </div>
-      <div className="border-border/60 mt-auto flex items-center gap-2 border-t py-1.5 ps-3 pe-1.5">
-        <div className="min-w-0 flex-1">
-          <ProgressLine session={session} bar={false} />
-        </div>
-        <SessionCell session={session} />
-        <button
-          ref={detailsButtonRef}
-          type="button"
-          onClick={openDetails}
-          aria-haspopup="dialog"
-          aria-label={t("web.admin.activity.row.details")}
-          title={t("web.admin.activity.row.details")}
-          className={DETAILS_BUTTON_CLASS}
-        >
-          <ChevronRight aria-hidden="true" className="h-4 w-4 rtl:-scale-x-100" />
-        </button>
-      </div>
-    </article>
-  );
-}
-
-/** The delivered rate on one line, for a card, with what it is measured against. */
-function BitrateLine({ session }: { session: AdminSession }) {
-  const t = useT();
-  const { live, source, limit } = getSessionBitrate(session);
-  const reference = bitrateReference(t, limit, source);
-  if (!live && !reference) return null;
-  return (
-    <div className="flex min-w-0 items-center gap-1.5 text-[0.75rem] tabular-nums">
-      <Gauge aria-hidden="true" className="text-muted-foreground h-3 w-3 shrink-0" />
-      <span className="sr-only">{t("web.admin.activity.column.bitrate")}</span>
-      {live ? <span className="shrink-0">{live}</span> : null}
-      {reference ? (
-        <span className="text-muted-foreground min-w-0 truncate">{reference}</span>
-      ) : null}
-    </div>
-  );
-}
-
-/**
- * A card's details, in a side panel: the same facts, ffmpeg console, and
- * actions the table shows when a row expands.
- */
-function StreamDetailsSheet({
-  session,
-  onClose,
-  onIPLookup,
-  returnFocusRef,
-}: {
-  session: AdminSession | undefined;
-  onClose: () => void;
-  onIPLookup: (ip: string) => void;
-  /** Focused when the panel closes; the panel opens from no Radix trigger. */
-  returnFocusRef: RefObject<HTMLElement | null>;
-}) {
-  const t = useT();
-  const panelId = useId();
-  const sessionId = session?.session_id ?? null;
-  // The last session shown, which the panel keeps while it slides closed.
-  const [shown, setShown] = useState(session);
-  if (session !== undefined && session !== shown) {
-    setShown(session);
-  }
-  // Closed again once the panel has finished closing (onCloseAutoFocus), so the
-  // next details start with it closed and it doesn't collapse mid-slide.
-  const [ffmpegOpen, setFFmpegOpen] = useState(false);
-  const ffmpegLogs = useOperationalLogs(
-    { playback_session_id: shown?.session_id ?? "", component: "ffmpeg", limit: 12 },
-    ffmpegOpen && sessionId !== null,
-  );
-
-  return (
-    <Sheet
-      open={session !== undefined}
-      onOpenChange={(open) => {
-        if (!open) onClose();
-      }}
-    >
-      <SheetContent
-        side="right"
-        className="flex w-full flex-col gap-0 overflow-hidden p-0 sm:max-w-xl"
-        onCloseAutoFocus={(event) => {
-          setFFmpegOpen(false);
-          // A card that left the list (its stream ended) can't take focus back.
-          const target = returnFocusRef.current;
-          if (target?.isConnected) {
-            event.preventDefault();
-            target.focus();
-          }
-        }}
-      >
-        {shown ? (
-          <>
-            <SheetHeader className="border-border/70 flex-row items-start gap-3 border-b px-5 py-4">
-              <Poster session={shown} size="stacked" />
-              <div className="min-w-0 flex-1 space-y-1 pe-8">
-                <SheetTitle dir="auto" className="bidi-text truncate text-base font-bold">
-                  {getDisplayTitle(shown, t)}
-                </SheetTitle>
-                <SheetDescription dir="auto" className="truncate text-xs">
-                  {[
-                    getPlaybackSessionSubtitle(shown),
-                    shown.username || t("web.admin.activity.userFallback", { id: shown.user_id }),
-                  ]
-                    .filter(Boolean)
-                    .join(` ${MIDDLE_DOT} `)}
-                </SheetDescription>
-                <ProgressLine session={shown} />
-              </div>
-            </SheetHeader>
-            <div className="@container min-h-0 flex-1 overflow-y-auto">
-              <PlaybackExpandedPanel
-                id={panelId}
-                session={shown}
-                reasons={getAdaptationReasons(shown)}
-                layout={TABLE_LAYOUT}
-                showRoute={false}
-                onIPLookup={onIPLookup}
-                ffmpegOpen={ffmpegOpen}
-                onToggleFFmpeg={() => setFFmpegOpen((open) => !open)}
-                rows={ffmpegLogs.data?.entries ?? []}
-                isLoading={ffmpegLogs.isLoading}
-                isFetching={ffmpegLogs.isFetching}
-                logsHref={sessionFFmpegLogsHref(shown)}
-              />
-            </div>
-            <div className="border-border/70 flex justify-end border-t px-4 py-2.5">
-              <SessionActions session={shown} />
-            </div>
-          </>
-        ) : null}
-      </SheetContent>
-    </Sheet>
-  );
-}
-
-const POSTER_BOX = {
-  table: "h-12 w-8",
-  stacked: "h-[60px] w-10",
-  card: "h-24 w-16",
-} as const;
-
-function Poster({ session, size }: { session: AdminSession; size: keyof typeof POSTER_BOX }) {
-  const box = POSTER_BOX[size];
+function Poster({ session, size }: { session: AdminSession; size: "table" | "stacked" }) {
+  const box = size === "table" ? "h-12 w-8" : "h-[60px] w-10";
   return session.poster_url ? (
     <img
       src={session.poster_url}
@@ -1379,12 +1007,12 @@ function TitleLink({ session }: { session: AdminSession }) {
       to={itemHref}
       title={title}
       dir="auto"
-      className={`${ROW_LINK_CLASS} flow-root w-fit max-w-full text-[0.8125rem] font-medium`}
+      className={`${ROW_LINK_CLASS} flow-root w-fit max-w-full text-[13px] font-medium`}
     >
       <RowLinkText className="bidi-text">{title}</RowLinkText>
     </Link>
   ) : (
-    <div title={title} dir="auto" className="bidi-text truncate text-[0.8125rem] font-medium">
+    <div title={title} dir="auto" className="bidi-text truncate text-[13px] font-medium">
       {title}
     </div>
   );
@@ -1398,7 +1026,7 @@ function MediaCell({ session }: { session: AdminSession }) {
       <div className="min-w-0 flex-1">
         <TitleLink session={session} />
         {subtitle ? (
-          <div className="text-muted-foreground truncate text-[0.75rem]">{subtitle}</div>
+          <div className="text-muted-foreground truncate text-[12px]">{subtitle}</div>
         ) : null}
         <ProgressLine session={session} />
       </div>
@@ -1412,15 +1040,14 @@ function MediaCell({ session }: { session: AdminSession }) {
  * (usually the pause label) never paints over the next column. When the
  * position alone is wider than the column (a large minimum font size), it
  * wraps at the " / ", and a one-word pause label drops below its icon rather
- * than breaking mid-word. A card draws its bar along its own edge, so it
- * leaves this one out.
+ * than breaking mid-word.
  */
-function ProgressLine({ session, bar = true }: { session: AdminSession; bar?: boolean }) {
+function ProgressLine({ session }: { session: AdminSession }) {
   const t = useT();
   const progress = getPlaybackProgress(session);
   return (
-    <div className="text-muted-foreground flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 text-[0.6875rem]">
-      {bar && progress !== null ? (
+    <div className="text-muted-foreground flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px]">
+      {progress !== null ? (
         <span
           aria-hidden="true"
           className="bg-border h-1 max-w-14 min-w-9 flex-1 overflow-hidden rounded-full"
@@ -1454,7 +1081,7 @@ function ProfilePill({ session }: { session: AdminSession }) {
     <span
       title={profile}
       dir="auto"
-      className="border-primary/30 bg-primary/10 text-primary max-w-[7rem] shrink-0 truncate rounded border px-1.5 py-0.5 text-[0.625rem] leading-none"
+      className="border-primary/30 bg-primary/10 text-primary max-w-[7rem] shrink-0 truncate rounded border px-1.5 py-0.5 text-[10px] leading-none"
     >
       {profile}
     </span>
@@ -1495,13 +1122,13 @@ function ViewerCell({
           to={`/admin/users/${session.user_id}`}
           title={username}
           dir="auto"
-          className={`${ROW_LINK_CLASS} min-w-0 text-[0.8125rem] font-medium`}
+          className={`${ROW_LINK_CLASS} min-w-0 text-[13px] font-medium`}
         >
           <RowLinkText>{username}</RowLinkText>
         </Link>
         <ProfilePill session={session} />
       </div>
-      <div className="text-muted-foreground flex min-w-0 items-center gap-1.5 text-[0.75rem]">
+      <div className="text-muted-foreground flex min-w-0 items-center gap-1.5 text-[12px]">
         <JellyfinSessionPill session={session} />
         {clientLabel ? (
           <span title={clientTitle} dir="auto" className="truncate">
@@ -1510,7 +1137,7 @@ function ViewerCell({
         ) : null}
       </div>
       {(location || clientIP) && (
-        <div className="text-muted-foreground flex min-w-0 items-center gap-1.5 text-[0.6875rem]">
+        <div className="text-muted-foreground flex min-w-0 items-center gap-1.5 text-[11px]">
           {location ? <span className="shrink-0">{location}</span> : null}
           {location && clientIP ? (
             <span aria-hidden="true" className="shrink-0">
@@ -1535,9 +1162,7 @@ function ViewerCell({
 
 /**
  * The whole-session method, the first reason it isn't direct play, and a
- * button for the rest, which the details list with explanations. A table row
- * expands its details in place and passes `expanded` and `panelId`; a card
- * opens them in a side panel and passes neither.
+ * button for the rest, which the expanded details list with explanations.
  */
 function MethodLine({
   method,
@@ -1548,8 +1173,8 @@ function MethodLine({
 }: {
   method: string;
   reasons: AdaptationReason[];
-  expanded?: boolean;
-  panelId?: string;
+  expanded: boolean;
+  panelId: string;
   onMore: () => void;
 }) {
   const t = useT();
@@ -1558,7 +1183,7 @@ function MethodLine({
     <div className="flex min-w-0 items-center gap-2">
       <ActivityMethodBadge method={method} />
       {first ? (
-        <span title={first.description} className="min-w-0 truncate text-[0.75rem]">
+        <span title={first.description} className="min-w-0 truncate text-[12px]">
           {first.label}
         </span>
       ) : null}
@@ -1569,13 +1194,12 @@ function MethodLine({
           onClick={onMore}
           aria-expanded={expanded}
           aria-controls={expanded ? panelId : undefined}
-          aria-haspopup={expanded === undefined ? "dialog" : undefined}
           aria-label={t("web.admin.activity.row.moreReasonsLabel", {
             count: rest.length,
             count_text: rest.length,
           })}
           title={joinList(rest.map((reason) => reason.label))}
-          className="text-muted-foreground hover:text-foreground border-border shrink-0 rounded border px-1 text-[0.6875rem] leading-4 tabular-nums transition-colors"
+          className="text-muted-foreground hover:text-foreground border-border shrink-0 rounded border px-1 text-[11px] leading-4 tabular-nums transition-colors"
         >
           {t("web.admin.activity.row.moreReasons", { count_text: rest.length })}
         </button>
@@ -1597,7 +1221,7 @@ function ConversionLine({ kind, session }: { kind: "video" | "audio"; session: A
   const mode =
     kind === "video" && conversion.delivered ? formatTranscodeModeSummary(session) : null;
   return (
-    <div className="flex min-w-0 items-center gap-1.5 text-[0.75rem]">
+    <div className="flex min-w-0 items-center gap-1.5 text-[12px]">
       <Icon aria-hidden="true" className="text-muted-foreground h-3 w-3 shrink-0" />
       <span className="sr-only">
         {kind === "video" ? t("web.admin.activity.row.video") : t("web.admin.activity.row.audio")}
@@ -1611,7 +1235,7 @@ function ConversionLine({ kind, session }: { kind: "video" | "audio"; session: A
           : conversion.source}
       </span>
       {mode ? (
-        <span className="border-border text-muted-foreground shrink-0 rounded border px-1 text-[0.625rem] leading-4">
+        <span className="border-border text-muted-foreground shrink-0 rounded border px-1 text-[10px] leading-4">
           {mode}
         </span>
       ) : null}
@@ -1626,7 +1250,7 @@ function SessionCell({ session }: { session: AdminSession }) {
     <div className="min-w-0 text-end">
       <div
         title={t("web.admin.activity.row.sessionActive", { elapsed })}
-        className="inline-flex items-center gap-1 text-[0.75rem] tabular-nums"
+        className="inline-flex items-center gap-1 text-[12px] tabular-nums"
       >
         <Clock aria-hidden="true" className="text-muted-foreground h-3 w-3" />
         <span className="sr-only">{t("web.admin.activity.row.sessionActive", { elapsed })}</span>
@@ -1647,9 +1271,9 @@ function BitrateCell({ session }: { session: AdminSession }) {
   const reference = bitrateReference(t, limit, source);
   return (
     <div className="min-w-0 tabular-nums">
-      {live ? <div className="truncate text-[0.75rem]">{live}</div> : null}
+      {live ? <div className="truncate text-[12px]">{live}</div> : null}
       {reference ? (
-        <div className="text-muted-foreground text-[0.6875rem] leading-snug">{reference}</div>
+        <div className="text-muted-foreground text-[11px] leading-snug">{reference}</div>
       ) : null}
       {share !== null ? (
         <div
@@ -1681,7 +1305,7 @@ function ActivityMethodBadge({ method }: { method: string }) {
     <span
       aria-label={t("web.admin.activity.row.methodBadge", { method: meta.label })}
       title={meta.description}
-      className={`inline-flex shrink-0 rounded border px-1.5 py-0.5 text-[0.625rem] leading-none font-semibold ${meta.badgeClass}`}
+      className={`inline-flex shrink-0 rounded border px-1.5 py-0.5 text-[10px] leading-none font-semibold ${meta.badgeClass}`}
     >
       {meta.label}
     </span>
@@ -1733,7 +1357,7 @@ function PlaybackExpandedPanel({
 
   return (
     <div id={id} className="border-border/40 bg-surface/30 space-y-4 border-t px-4 py-3">
-      <div className={`grid gap-x-5 gap-y-4 text-[0.75rem] ${layout.panel}`}>
+      <div className={`grid gap-x-5 gap-y-4 text-[12px] ${layout.panel}`}>
         <div className="min-w-0 space-y-4">
           <dl className={FACT_LIST_CLASS}>
             <dt className="text-muted-foreground">{t("web.admin.activity.panel.decision")}</dt>
@@ -1830,7 +1454,7 @@ function PlaybackExpandedPanel({
                 <dd className="min-w-0">
                   {devicePlatform ? <div className="break-words">{devicePlatform}</div> : null}
                   {deviceID ? (
-                    <div className="text-muted-foreground font-mono text-[0.6875rem] break-all">
+                    <div className="text-muted-foreground font-mono text-[11px] break-all">
                       {deviceID}
                     </div>
                   ) : null}
@@ -1840,7 +1464,7 @@ function PlaybackExpandedPanel({
             {userAgent ? (
               <>
                 <dt className="text-muted-foreground">{t("web.admin.activity.client.agent")}</dt>
-                <dd className="text-muted-foreground min-w-0 text-[0.6875rem] break-words">
+                <dd className="text-muted-foreground min-w-0 text-[11px] break-words">
                   {userAgent}
                 </dd>
               </>
@@ -1892,7 +1516,7 @@ function PlaybackExpandedPanel({
                 : t("web.admin.activity.session.remoteControlUnavailable")}
             </dd>
             <dt className="text-muted-foreground">{t("web.admin.activity.session.id")}</dt>
-            <dd className="text-muted-foreground min-w-0 font-mono text-[0.6875rem] break-all">
+            <dd className="text-muted-foreground min-w-0 font-mono text-[11px] break-all">
               {session.session_id}
             </dd>
           </dl>
@@ -1923,7 +1547,7 @@ function PlaybackExpandedPanel({
 const FACT_LIST_CLASS = "grid grid-cols-[6rem_1fr] gap-y-1 sm:grid-cols-[9rem_1fr] [&>dt]:pe-3";
 const SIDE_FACT_LIST_CLASS =
   "grid grid-cols-[6rem_1fr] gap-y-1 sm:grid-cols-[7rem_1fr] [&>dt]:pe-3";
-const PANEL_HEADING_CLASS = "text-muted-foreground mb-1.5 text-[0.6875rem] font-medium";
+const PANEL_HEADING_CLASS = "text-muted-foreground mb-1.5 text-[11px] font-medium";
 
 function StreamDetailRow({
   label,
@@ -1946,7 +1570,7 @@ function StreamDetailRow({
           <span>{label}</span>
           {decision ? (
             <span
-              className={`inline-flex rounded border px-1 py-0.5 text-[0.625rem] leading-none font-semibold ${decisionBadgeClass(decision)}`}
+              className={`inline-flex rounded border px-1 py-0.5 text-[10px] leading-none font-semibold ${decisionBadgeClass(decision)}`}
             >
               {formatDecisionLabel(decision)}
             </span>
@@ -1959,7 +1583,7 @@ function StreamDetailRow({
         {tags.filter(Boolean).map((tag) => (
           <span
             key={tag}
-            className="border-border text-muted-foreground ms-1.5 inline-block rounded border px-1 text-[0.625rem] leading-4"
+            className="border-border text-muted-foreground ms-1.5 inline-block rounded border px-1 text-[10px] leading-4"
           >
             {tag}
           </span>
@@ -1984,23 +1608,23 @@ function FFmpegConsole({
   return (
     <div className="terminal-surface space-y-2">
       <div className="flex items-center justify-between gap-3">
-        <span className="text-muted-foreground text-[0.6875rem]">
+        <span className="text-muted-foreground text-[11px]">
           {isFetching ? t("web.admin.activity.panel.refreshing") : null}
         </span>
         <Link
           to={logsHref}
-          className="text-[0.6875rem] font-medium text-[var(--terminal-fg)] hover:text-[var(--terminal-fg)]/80"
+          className="text-[11px] font-medium text-[var(--terminal-fg)] hover:text-[var(--terminal-fg)]/80"
         >
           {t("web.admin.activity.panel.openFfmpegLogs")}
         </Link>
       </div>
       <div className="overflow-hidden rounded-xl border border-[var(--terminal-border)] bg-[var(--terminal-bg)]">
         {isLoading ? (
-          <div className="px-4 py-6 font-mono text-[0.6875rem] text-[var(--terminal-muted)]">
+          <div className="px-4 py-6 font-mono text-[11px] text-[var(--terminal-muted)]">
             {t("web.admin.activity.panel.loadingFfmpeg")}
           </div>
         ) : rows.length === 0 ? (
-          <div className="px-4 py-6 font-mono text-[0.6875rem] text-[var(--terminal-muted)]">
+          <div className="px-4 py-6 font-mono text-[11px] text-[var(--terminal-muted)]">
             {t("web.admin.activity.panel.noFfmpegRows")}
           </div>
         ) : (
@@ -2011,20 +1635,20 @@ function FFmpegConsole({
                 className="grid grid-cols-[120px_1fr] gap-3 border-b border-[var(--terminal-border)]/30 px-4 py-2.5 last:border-b-0"
               >
                 <div className="space-y-1">
-                  <div className="font-mono text-[0.625rem] text-[var(--terminal-muted)]">
+                  <div className="font-mono text-[10px] text-[var(--terminal-muted)]">
                     {formatTimeOnly(row.timestamp)}
                   </div>
-                  <div className="text-[0.625rem] text-[var(--terminal-muted)]/60">
+                  <div className="text-[10px] text-[var(--terminal-muted)]/60">
                     {row.message.includes("stderr")
                       ? t("web.admin.activity.panel.stderr")
                       : t("web.admin.activity.panel.event")}
                   </div>
                 </div>
                 <div className="min-w-0">
-                  <div className="font-mono text-[0.6875rem] leading-5 break-words text-[var(--terminal-fg)]">
+                  <div className="font-mono text-[11px] leading-5 break-words text-[var(--terminal-fg)]">
                     {ffmpegRowText(row)}
                   </div>
-                  <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-[0.625rem] text-[var(--terminal-muted)]/60">
+                  <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-[10px] text-[var(--terminal-muted)]/60">
                     {row.node_id && <span>{row.node_id}</span>}
                     {stringAttr(row, "target_resolution") !== "-" && (
                       <span>{stringAttr(row, "target_resolution")}</span>
@@ -2198,13 +1822,13 @@ function SortHeader({
     <button
       type="button"
       onClick={() => onClick(field)}
-      className={`text-muted-foreground flex items-center gap-1 text-[0.75rem] font-medium transition-colors ${
+      className={`text-muted-foreground flex items-center gap-1 text-[12px] font-medium transition-colors ${
         active ? "text-foreground" : "hover:text-foreground"
       } ${className}`}
     >
       {children}
       {active && (
-        <span aria-hidden="true" className="text-[0.5625rem]">
+        <span aria-hidden="true" className="text-[9px]">
           {dir === "asc" ? SORT_ASC_MARK : SORT_DESC_MARK}
         </span>
       )}
@@ -2221,6 +1845,12 @@ function formatConnectionState(state: "connecting" | "live" | "disconnected", t:
     default:
       return t("web.admin.activity.realtime.disconnected");
   }
+}
+
+function delay(ms: number) {
+  return new Promise<void>((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
 }
 
 function ffmpegRowText(entry: OperationalLogEntry) {

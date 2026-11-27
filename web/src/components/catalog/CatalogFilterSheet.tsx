@@ -1,5 +1,5 @@
 import type { PersonalizedSorts } from "@/lib/querySortOptions";
-import { useState, type RefObject } from "react";
+import { useState } from "react";
 
 import { createEmptyQueryDefinition, type QueryDefinition } from "@/api/types";
 import type { GuidedFormState } from "@/components/collections/CollectionGuidedRulesEditor";
@@ -55,11 +55,6 @@ const EMPTY_SECONDARY_FILTERS: Partial<GuidedFormState> = {
 interface CatalogFilterSheetProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  /**
-   * The control that opened the sheet. It sits outside the sheet's root, so
-   * Radix has no trigger to give focus back to; the sheet does it on close.
-   */
-  returnFocusRef?: RefObject<HTMLElement | null>;
   state: GuidedFormState;
   onUpdate: (patch: Partial<GuidedFormState>) => void;
   libraries: Array<{ id: number; name: string }>;
@@ -91,7 +86,6 @@ interface CatalogFilterSheetProps {
 export default function CatalogFilterSheet({
   open,
   onOpenChange,
-  returnFocusRef,
   onUpdate,
   libraries,
   allowLibrarySelection,
@@ -118,17 +112,7 @@ export default function CatalogFilterSheet({
 
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
-      <SheetContent
-        side="right"
-        className="flex flex-col sm:max-w-md"
-        showCloseButton={false}
-        onCloseAutoFocus={(event) => {
-          const opener = returnFocusRef?.current;
-          if (!opener) return;
-          event.preventDefault();
-          opener.focus();
-        }}
-      >
+      <SheetContent side="right" className="flex flex-col sm:max-w-md" showCloseButton={false}>
         {/* Invisible portal mount point — must be inside SheetContent so that
             react-remove-scroll considers popover scroll events as "inside" the
             dialog and does not cancel them. */}

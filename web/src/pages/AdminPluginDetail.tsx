@@ -9,7 +9,6 @@ import {
   ExternalLink,
   Info,
   RotateCw,
-  ShieldAlert,
   Trash2,
 } from "lucide-react";
 
@@ -257,7 +256,7 @@ function PluginPageHeader({
         <h1 className="text-[1.75rem] leading-[1.15] font-bold tracking-[-0.035em] text-balance break-words sm:text-[2rem]">
           {name}
         </h1>
-        <div className="text-muted-foreground mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-[0.84375rem]">
+        <div className="text-muted-foreground mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-[13.5px]">
           {meta}
         </div>
       </div>
@@ -308,7 +307,7 @@ function TierNotice({ tier }: { tier: string }) {
 /** Stands in for the Updates menu when no update policy can apply. */
 function UpdatesState({ children }: { children: ReactNode }) {
   return (
-    <span className="text-muted-foreground inline-flex h-8 items-center text-[0.8125rem]">
+    <span className="text-muted-foreground inline-flex h-8 items-center text-[13px]">
       {children}
     </span>
   );
@@ -425,7 +424,7 @@ function InstalledPluginPage({
                 <SelectTrigger
                   size="sm"
                   aria-label={t("web.admin.plugins.detail.updatesLabel")}
-                  className="h-8 text-[0.8125rem]"
+                  className="h-8 text-[13px]"
                 >
                   <SelectValue />
                 </SelectTrigger>
@@ -438,7 +437,7 @@ function InstalledPluginPage({
                 </SelectContent>
               </Select>
             )}
-            <label className="text-foreground/85 flex items-center gap-2 text-[0.84375rem]">
+            <label className="text-foreground/85 flex items-center gap-2 text-[13.5px]">
               <Switch
                 checked={installation.enabled}
                 aria-label={t("web.admin.plugins.detail.enabledLabel")}
@@ -578,15 +577,6 @@ function InstalledPluginPage({
               date: formatDateTime(installation.update_failure.failed_at),
             })}
           </p>
-        </Banner>
-      ) : null}
-
-      {installation.signature.state === "invalid" ? (
-        <Banner
-          tone="warning"
-          icon={<ShieldAlert aria-hidden="true" className="text-warning mt-0.5 size-4 shrink-0" />}
-        >
-          <p>{t("web.admin.plugins.signature.invalidBanner", { name, b: bold })}</p>
         </Banner>
       ) : null}
 

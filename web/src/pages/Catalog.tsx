@@ -12,6 +12,7 @@ import PageUnavailable from "@/components/PageUnavailable";
 import ViewTransitionLink from "@/components/ViewTransitionLink";
 import { Button } from "@/components/ui/button";
 import CatalogFiltersPanel from "@/components/catalog/CatalogFiltersPanel";
+import SaveFiltersAsSmartCollection from "@/components/catalog/SaveFiltersAsSmartCollection";
 import SearchScopeChips from "@/components/catalog/SearchScopeChips";
 import { useCatalogWindow } from "@/hooks/queries/catalog";
 import { useSetCollectionSortPreference } from "@/hooks/queries/collections";
@@ -75,12 +76,7 @@ function defaultCatalogSubtitle(t: Translate, source: string): string {
 export default function Catalog() {
   const [searchParams, setSearchParams] = useSearchParams();
   const state = useMemo(() => parseCatalogSearchParams(searchParams), [searchParams]);
-  // A query with filters (a studio, a genre) lists its matches without search text.
-  const isEmptySearch =
-    state.source === "query" &&
-    !state.q &&
-    !state.library_id &&
-    state.query_definition.groups.length === 0;
+  const isEmptySearch = state.source === "query" && !state.q && !state.library_id;
 
   // Each view owns its tab title. A title set here too would run after the
   // results' own on mount and replace it whenever the results were cached.
@@ -457,6 +453,11 @@ function CatalogResults({
                   : allowPersonalizedOverlayControls
             }
           />
+
+          {/* Only a query source's filters are a portable query definition;
+              favorites, watchlist, history, and collection membership are not
+              expressible as smart-collection rules. */}
+          {state.source === "query" ? <SaveFiltersAsSmartCollection state={sortedState} /> : null}
 
           {isHistorySource && (
             <section className="surface-panel flex flex-col gap-3 rounded-2xl border-0 p-4 sm:flex-row sm:items-center sm:justify-between">

@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { Play, ChevronLeft, ChevronRight } from "lucide-react";
+import { CalendarClock, Play, ChevronLeft, ChevronRight } from "lucide-react";
 import type { EpisodeListItem } from "@/api/types";
 import { WatchedCheckIndicator } from "@/components/CardWatchedBadge";
 import { toEpisodeUserState } from "@/components/episodeUserState";
@@ -12,11 +12,11 @@ import { episodeLinkLibraryId, type EpisodeNavigationState } from "../itemDetail
 import { useCarouselEmbla } from "@/hooks/useCarouselEmbla";
 import { useEpisodeSpoilerPrefs } from "@/hooks/useEpisodeSpoilerPrefs";
 import { useOverlayPrefs } from "@/hooks/useOverlayPrefs";
+import { isUpcomingEpisode, useEpisodeReleaseCapability } from "@/hooks/queries/episodeRelease";
 import type { CardQuickActionMode } from "@/lib/cardQuickActions";
 import type { ScrollPreservingState } from "@/hooks/useScrollRestoration";
 import { buildItemHref } from "@/lib/mediaNavigation";
 import { useT } from "@/i18n";
-import { episodeAirDateLabel } from "@/lib/episodeCardLabels";
 import EpisodeCardCaption from "./EpisodeCardCaption";
 import WatchProgressBar from "@/components/WatchProgressBar";
 
@@ -26,8 +26,6 @@ interface EpisodeCarouselProps {
   episodeLinkState?: EpisodeNavigationState;
   /** The page's library scope, kept on each episode link. */
   libraryId?: number;
-  /** The series' episode labels; "air_date" leads each caption with its title, not its code. */
-  episodeLabels?: string;
 }
 
 export default function EpisodeCarousel({
@@ -35,13 +33,16 @@ export default function EpisodeCarousel({
   currentEpisodeNumber,
   episodeLinkState,
   libraryId,
-  episodeLabels,
 }: EpisodeCarouselProps) {
   const t = useT();
   const currentEpisodeIndex = episodes.findIndex(
     (episode) => episode.episode_number === currentEpisodeNumber,
   );
   const { quickActionMode } = useOverlayPrefs();
+  // Capability-gated upcoming treatment: older servers without release_state
+  // keep today's plain carousel rendering.
+  const { data: releaseCapability } = useEpisodeReleaseCapability();
+  const releaseSupported = releaseCapability?.available ?? false;
   const { hideImages, hideOverviews } = useEpisodeSpoilerPrefs();
   // Moving between siblings keeps the viewer where they scrolled to: the page
   // keeps its layout, and the carousel re-centres on the new episode.
@@ -85,8 +86,8 @@ export default function EpisodeCarousel({
                 isCurrent={ep.episode_number === currentEpisodeNumber}
                 episodeLinkState={linkState}
                 libraryId={libraryId}
-                episodeLabels={episodeLabels}
                 quickActionMode={quickActionMode}
+                upcoming={isUpcomingEpisode(ep, releaseSupported)}
                 hideImageIfUnwatched={hideImages}
                 hideOverviewIfUnwatched={hideOverviews}
               />
@@ -114,8 +115,8 @@ function EpisodeCarouselCard({
   isCurrent,
   episodeLinkState,
   libraryId,
-  episodeLabels,
   quickActionMode,
+  upcoming,
   hideImageIfUnwatched,
   hideOverviewIfUnwatched,
 }: {
@@ -123,8 +124,8 @@ function EpisodeCarouselCard({
   isCurrent: boolean;
   episodeLinkState?: EpisodeNavigationState;
   libraryId?: number;
-  episodeLabels?: string;
   quickActionMode: CardQuickActionMode;
+  upcoming: boolean;
   hideImageIfUnwatched: boolean;
   hideOverviewIfUnwatched: boolean;
 }) {
@@ -132,9 +133,7 @@ function EpisodeCarouselCard({
   const cardRef = useRef<HTMLDivElement>(null);
   const thumbhashUrl = ep.still_thumbhash ? decodeThumbhash(ep.still_thumbhash) : "";
   const episodeTitle =
-    ep.title ||
-    episodeAirDateLabel(episodeLabels, ep.air_date) ||
-    t("web.detail.episodes.numbered", { episode: ep.episode_number });
+    ep.title || t("web.detail.episodes.numbered", { episode: ep.episode_number });
   const episodeHref = buildItemHref({
     contentId: ep.content_id,
     libraryId: episodeLinkLibraryId(ep, libraryId),
@@ -184,13 +183,33 @@ function EpisodeCarouselCard({
                 <img
                   src={ep.still_url}
                   alt={episodeTitle}
-                  className={cn("h-full w-full object-cover", hideImage && SPOILER_IMAGE_CLASS)}
+                  className={cn(
+                    "h-full w-full object-cover",
+                    upcoming && "opacity-45 saturate-50",
+                    hideImage && SPOILER_IMAGE_CLASS,
+                  )}
                   loading="lazy"
                   decoding="async"
                 />
+              ) : upcoming ? (
+                <div className="bg-accent/30 flex h-full w-full items-center justify-center">
+                  <CalendarClock
+                    size={28}
+                    className="text-muted-foreground/50"
+                    aria-label="Upcoming"
+                  />
+                </div>
               ) : (
                 <div className="bg-accent/30 flex h-full w-full items-center justify-center">
                   <Play size={28} className="text-muted-foreground/30" />
+                </div>
+              )}
+              {upcoming && ep.still_url && (
+                <div className="absolute inset-0 flex items-center justify-center bg-black/35">
+                  <span className="metadata-badge gap-1">
+                    <CalendarClock className="size-3" aria-hidden="true" />
+                    Upcoming
+                  </span>
                 </div>
               )}
               {isCurrent && (
@@ -227,10 +246,10 @@ function EpisodeCarouselCard({
         >
           <EpisodeCardCaption
             episode={ep}
-            episodeLabels={episodeLabels}
             hideOverview={hideOverviewIfUnwatched && isEpisodeUnwatched(ep.user_data)}
             isCurrent={isCurrent}
             badges={ep.user_data?.played && <WatchedCheckIndicator />}
+            notice={upcoming ? "Upcoming" : undefined}
           />
         </ViewTransitionLink>
       </div>

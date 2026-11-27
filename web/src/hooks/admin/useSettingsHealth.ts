@@ -29,6 +29,7 @@ export const ADMIN_SETTINGS_PAGE_IDS = [
   "autoscan",
   "playback",
   "downloads",
+  "streaming",
   "requests",
   "providers",
   "ai",

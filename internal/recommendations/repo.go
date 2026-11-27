@@ -3047,3 +3047,33 @@ func (r *Repo) GetSimilarSource(ctx context.Context, itemID string) ([]float32, 
 	}
 	return v.Slice(), &m, nil
 }
+
+// ExistingItemIDs returns the subset of itemIDs that currently exist in
+// media_items. It is an existence check only: no viewer, library, or content
+// rating filtering is applied, so a derived source cannot resurrect an item
+// the catalog no longer has.
+func (r *Repo) ExistingItemIDs(ctx context.Context, itemIDs []string) (map[string]struct{}, error) {
+	if len(itemIDs) == 0 {
+		return map[string]struct{}{}, nil
+	}
+	rows, err := r.pool.Query(ctx, `
+		SELECT content_id
+		FROM   media_items
+		WHERE  content_id = ANY($1)`, itemIDs)
+	if err != nil {
+		return nil, fmt.Errorf("query existing item ids: %w", err)
+	}
+	defer rows.Close()
+	existing := make(map[string]struct{}, len(itemIDs))
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan existing item id: %w", err)
+		}
+		existing[id] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate existing item ids: %w", err)
+	}
+	return existing, nil
+}

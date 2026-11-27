@@ -23,7 +23,7 @@ type PluginLaunch struct {
 // PluginLaunchOutput carries the receipt and the plugin access cookie. The
 // cookie is scoped to the v2 plugin-content parent path, never to /.
 type PluginLaunchOutput struct {
-	SetCookie http.Cookie `header:"Set-Cookie" doc:"silo_plugin_access on the v2 plugin-content parent path: five minutes, HttpOnly, SameSite=Lax, Secure on HTTPS"`
+	SetCookie http.Cookie `header:"Set-Cookie" doc:"vio_plugin_access on the v2 plugin-content parent path: five minutes, HttpOnly, SameSite=Lax, Secure on HTTPS"`
 	Body      PluginLaunch
 }
 

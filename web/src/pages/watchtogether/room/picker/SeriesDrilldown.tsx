@@ -1,5 +1,4 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { airDateWithTitle, episodeAirDateLabel } from "@/lib/episodeCardLabels";
 import { Play, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -165,10 +164,6 @@ export function SeriesDrilldown({
   const t = useT();
   const detail = useCatalogItemDetail(series.content_id, series.library_id);
   const item = detail.data;
-  // The series' episode labels: from the card, else from the fetched detail.
-  const episodeLabels = series.episode_labels ?? item?.episode_labels;
-  // A date-labeled series (sports) names the picked game by its air date.
-  const pickedAirDate = picked ? episodeAirDateLabel(episodeLabels, picked.episode.air_date) : null;
   const seasons = useSeasons(series.content_id);
   const spoilerPrefs = useEpisodeSpoilerPrefs();
   const seasonList = useMemo(() => seasons.data?.seasons ?? [], [seasons.data?.seasons]);
@@ -280,7 +275,7 @@ export function SeriesDrilldown({
             ) : null}
           </div>
           <div className="min-w-0 flex-1 pb-0.5">
-            <p className="text-muted-foreground text-[0.6875rem] font-semibold tracking-[0.18em] uppercase">
+            <p className="text-muted-foreground text-[11px] font-semibold tracking-[0.18em] uppercase">
               {t("web.watchTogether.series.eyebrow")}
             </p>
             <h3 className="line-clamp-2 text-base leading-tight font-semibold">{series.title}</h3>
@@ -332,7 +327,7 @@ export function SeriesDrilldown({
               >
                 <span className="text-xs font-semibold whitespace-nowrap">{seasonName(s, t)}</span>
                 {progress ? (
-                  <span className={`text-[0.625rem] ${active ? "text-background/70" : ""}`}>
+                  <span className={`text-[10px] ${active ? "text-background/70" : ""}`}>
                     {t("web.watchTogether.series.youProgress", { progress })}
                   </span>
                 ) : null}
@@ -343,7 +338,7 @@ export function SeriesDrilldown({
 
         <div className="flex min-h-0 min-w-0 flex-1 flex-col">
           <div className="border-border/60 flex shrink-0 items-center justify-between gap-3 border-b px-4 py-2">
-            <span className="text-muted-foreground text-[0.6875rem] font-semibold tracking-[0.18em] uppercase">
+            <span className="text-muted-foreground text-[11px] font-semibold tracking-[0.18em] uppercase">
               {!loadingEpisodes && episodes.length > 0
                 ? t("web.watchTogether.series.seasonEpisodes", {
                     season: seasonHeading,
@@ -370,15 +365,8 @@ export function SeriesDrilldown({
                   const isNext = nextUp?.episode.content_id === episode.content_id;
                   const isPicked = picked?.episode.content_id === episode.content_id;
                   const unwatched = isEpisodeUnwatched(episode.user_data);
-                  // The fetched detail carries the series' episode labels when
-                  // the card it was opened from does not, so the staged pick
-                  // keeps naming a date-labeled game by its date.
                   const pick = () =>
-                    onPick({
-                      episode,
-                      series: { ...series, episode_labels: episodeLabels },
-                      seasonNumber: season ?? episode.season_number,
-                    });
+                    onPick({ episode, series, seasonNumber: season ?? episode.season_number });
                   return (
                     <li
                       key={episode.content_id}
@@ -407,7 +395,7 @@ export function SeriesDrilldown({
                         />
                         <span className="min-w-0 flex-1">
                           {isNext && nextUp ? (
-                            <span className="block text-[0.625rem] font-semibold tracking-[0.16em] text-emerald-300/90 uppercase">
+                            <span className="block text-[10px] font-semibold tracking-[0.16em] text-emerald-300/90 uppercase">
                               {t("web.watchTogether.series.nextUp", {
                                 count: nextUp.count,
                                 count_text: nextUp.count,
@@ -416,11 +404,9 @@ export function SeriesDrilldown({
                           ) : null}
                           <span className="flex items-baseline gap-2">
                             <span className="text-muted-foreground shrink-0 text-xs font-semibold tabular-nums">
-                              {/* A date-labeled series (sports) names the game by its date. */}
-                              {episodeAirDateLabel(episodeLabels, episode.air_date) ??
-                                t("web.watchTogether.common.episodeNumber", {
-                                  number: codeNumber(episode.episode_number),
-                                })}
+                              {t("web.watchTogether.common.episodeNumber", {
+                                number: codeNumber(episode.episode_number),
+                              })}
                             </span>
                             <span className="truncate text-sm font-medium">{episode.title}</span>
                             <span className="text-muted-foreground shrink-0 text-xs">
@@ -475,17 +461,15 @@ export function SeriesDrilldown({
       {picked && onConfirm ? (
         <div className="border-border/60 flex shrink-0 flex-wrap items-center gap-x-3 gap-y-2 border-t px-4 py-3">
           <div className="min-w-0 flex-1">
-            <p className="text-muted-foreground text-[0.6875rem] font-semibold tracking-[0.18em] uppercase">
+            <p className="text-muted-foreground text-[11px] font-semibold tracking-[0.18em] uppercase">
               {t("web.watchTogether.series.yourPick")}
             </p>
             <p className="truncate text-sm font-semibold">
-              {pickedAirDate
-                ? airDateWithTitle(pickedAirDate, picked.episode.title)
-                : t("web.watchTogether.series.pickedEpisode", {
-                    season: picked.seasonNumber,
-                    episode: picked.episode.episode_number,
-                    title: picked.episode.title,
-                  })}
+              {t("web.watchTogether.series.pickedEpisode", {
+                season: picked.seasonNumber,
+                episode: picked.episode.episode_number,
+                title: picked.episode.title,
+              })}
             </p>
             {risk ? (
               <p className="text-xs text-amber-300">

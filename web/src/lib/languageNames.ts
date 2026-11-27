@@ -130,6 +130,11 @@ function cldrLanguageName(names: NameSet, value: string): string | null {
   return language;
 }
 
+/** Deterministic English CLDR name, or null for an unassigned or invalid tag. */
+export function englishLanguageName(value: string): string | null {
+  return cldrLanguageName(englishNames, value);
+}
+
 /** The name in the interface language, or null for an unassigned or invalid tag. */
 export function displayLanguageName(value: string): string | null {
   return cldrLanguageName(interfaceNames(), value);

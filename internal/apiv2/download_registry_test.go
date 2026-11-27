@@ -39,6 +39,16 @@ func (f *fakeDownloadRegistry) ListPage(_ context.Context, user int, profile, de
 	f.limit = limit
 	return f.page, f.err
 }
+func (f *fakeDownloadRegistry) Get(_ context.Context, user int, profile, device, id string) (*downloads.Download, error) {
+	f.user = user
+	f.profile = profile
+	f.device = device
+	f.id = id
+	if f.err != nil {
+		return nil, f.err
+	}
+	return &downloads.Download{ID: id, UserID: user, ProfileID: profile, DeviceID: device, ContentID: "movie", MediaFileID: 42, Status: downloads.StatusPreparing, Kind: downloads.KindQueued, CreatedAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}, nil
+}
 func (f *fakeDownloadRegistry) ReportStatus(_ context.Context, user int, profile, device, id string, event downloads.StatusEvent) (*downloads.Download, error) {
 	f.user = user
 	f.profile = profile
@@ -64,7 +74,7 @@ func TestDownloadRegistryCursorBoundary(t *testing.T) {
 	deps := pilotDeps(nil, nil)
 	deps.Downloads = service
 	h := newTestHandler(t, deps)
-	viewer := with(with(bearer(memberToken), "X-Profile-Id", "p-owner"), "X-Silo-Device-Id", "device-one")
+	viewer := with(with(bearer(memberToken), "X-Profile-Id", "p-owner"), "X-Vio-Device-Id", "device-one")
 	path := Prefix + "/downloads"
 	rec := do(t, h, "GET", path+"?limit=1", "", viewer)
 	var page Collection[DownloadEntry]
@@ -76,7 +86,7 @@ func TestDownloadRegistryCursorBoundary(t *testing.T) {
 	if rec.Code != 200 || service.after == nil || service.after.ID != "b" || service.limit != 50 {
 		t.Fatalf("%d %+v", rec.Code, service)
 	}
-	rec = do(t, h, "GET", path+"?cursor="+page.Page.NextCursor, "", with(viewer, "X-Silo-Device-Id", "other-device"))
+	rec = do(t, h, "GET", path+"?cursor="+page.Page.NextCursor, "", with(viewer, "X-Vio-Device-Id", "other-device"))
 	if rec.Code != 400 {
 		t.Fatalf("cursor crossed device: %d", rec.Code)
 	}

@@ -244,7 +244,6 @@ function TextModelTile({
   reasoningLevels,
   reasoningAttention,
   serviceTier,
-  savedServiceTier,
   serviceTiers,
   serviceTierDirty,
   chatGPTSupported,
@@ -275,8 +274,6 @@ function TextModelTile({
    */
   reasoningAttention: boolean;
   serviceTier: string;
-  /** The saved tier, which a kept row always offers so the edit can be undone. */
-  savedServiceTier: string;
   serviceTiers: string[];
   serviceTierDirty: boolean;
   chatGPTSupported: boolean;
@@ -309,22 +306,6 @@ function TextModelTile({
   const provider = providers.find((candidate) => candidate.id === providerID);
   const selected = chatGPT ? CHATGPT_PROVIDER : providerID;
   const supportsServiceTier = !chatGPT && provider?.type === "openai" && serviceTiers.length > 0;
-  // A tier picked before switching to a provider or plan without tiers stays
-  // in view, marked as changed, so Save never writes a value the admin can't
-  // see.
-  const serviceTierKept = !supportsServiceTier && serviceTierDirty;
-  const showServiceTier = supportsServiceTier || serviceTierKept;
-  // A kept tier may not be one the current model lists, and the list is empty
-  // while capabilities load or after they fail; Default and the saved tier are
-  // always offered so the kept edit can still be set back.
-  const tierOptions = [
-    ...new Set([
-      "default",
-      ...serviceTiers,
-      savedServiceTier || "default",
-      serviceTier || "default",
-    ]),
-  ];
 
   return (
     <ProviderTile
@@ -397,8 +378,8 @@ function TextModelTile({
       )}
       <AdvancedSection
         id="ai.text-model"
-        count={showServiceTier ? 2 : 1}
-        forceOpen={reasoningAttention || serviceTierDirty}
+        count={supportsServiceTier ? 2 : 1}
+        forceOpen={reasoningAttention || (supportsServiceTier && serviceTierDirty)}
       >
         <SettingField
           label={t("web.admin.settings.ai.text.reasoningLevel")}
@@ -429,15 +410,14 @@ function TextModelTile({
               : []),
           ]}
         />
-        {showServiceTier && (
+        {supportsServiceTier && (
           <SettingField
             label={t("web.admin.settings.ai.text.serviceTier")}
-            dirty={serviceTierKept}
             type="select"
             value={serviceTier || "default"}
             description={t("web.admin.settings.ai.text.serviceTierDescription")}
             onChange={(next) => onChange("ai.service_tier", next === "default" ? "" : next)}
-            options={tierOptions.map((tier) => ({
+            options={serviceTiers.map((tier) => ({
               value: tier,
               label: t("web.admin.settings.ai.text.serviceTierOption", { tier }),
             }))}
@@ -742,13 +722,11 @@ export default function AISettings() {
   }
 
   // The ChatGPT plan is chosen by authentication mode; any other choice is an
-  // API-key provider. The saved provider id is kept while the plan serves
-  // text, so switching back restores it; a staged one is taken back, since the
-  // provider select no longer shows it.
+  // API-key provider. The provider id is kept while the plan serves text, so
+  // switching back restores it.
   function selectTextProvider(next: string) {
     if (next === CHATGPT_PROVIDER) {
       setValue("ai.auth_mode", "chatgpt");
-      form.resetValue("ai.text_provider_id");
       return;
     }
     setValue("ai.auth_mode", "api_key");
@@ -923,7 +901,6 @@ export default function AISettings() {
               reasoningLevels={capabilities.data?.reasoning_levels ?? []}
               reasoningAttention={form.isDirty("ai.reasoning_effort") || reasoningUnsupported}
               serviceTier={value("ai.service_tier")}
-              savedServiceTier={form.getPersistedValue("ai.service_tier")}
               serviceTiers={capabilities.data?.openai_service_tiers ?? []}
               serviceTierDirty={form.isDirty("ai.service_tier")}
               chatGPTSupported={chatGPTSupported}

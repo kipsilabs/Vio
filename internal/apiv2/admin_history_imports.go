@@ -53,8 +53,8 @@ type AdminHistoryImportMapping struct {
 	SourceID         ID     `json:"source_id"`
 	ExternalUserID   string `json:"external_user_id"`
 	ExternalUserName string `json:"external_user_name"`
-	SiloUserID       ID     `json:"silo_user_id"`
-	SiloProfileID    ID     `json:"silo_profile_id"`
+	SiloUserID       ID     `json:"vio_user_id"`
+	SiloProfileID    ID     `json:"vio_profile_id"`
 }
 type AdminHistoryImportIDInput struct {
 	ID ID `path:"id" pattern:"^[1-9][0-9]*$"`

@@ -110,7 +110,7 @@ func TestWebhookManagementAccountCursorAndSecrets(t *testing.T) {
 
 func TestWebhookMappingsRejectDuplicateUsersBeforeWrite(t *testing.T) {
 	h := newTestHandler(t, webhookDeps(new(fakeWebhookManagement)))
-	for _, body := range []string{`{"mappings":[{"external_user_id":" ","external_user_name":"x","silo_profile_id":null}]}`, `{"mappings":[{"external_user_id":"same","external_user_name":"x","silo_profile_id":null},{"external_user_id":"same","external_user_name":"y","silo_profile_id":null}]}`} {
+	for _, body := range []string{`{"mappings":[{"external_user_id":" ","external_user_name":"x","vio_profile_id":null}]}`, `{"mappings":[{"external_user_id":"same","external_user_name":"x","vio_profile_id":null},{"external_user_id":"same","external_user_name":"y","vio_profile_id":null}]}`} {
 		requireProblem(t, do(t, h, http.MethodPut, Prefix+"/webhook-sync/connections/"+webhookFixtureID+"/profile-mappings", body, webhookManager()), TypeValidationFailed)
 	}
 }
@@ -153,7 +153,7 @@ func TestWebhookSyncV2HouseholdAdmission(t *testing.T) {
 				{http.MethodDelete, connection, "", 204},
 				{http.MethodPost, connection + "/webhook/rotate", "", 200},
 				{http.MethodGet, connection + "/profile-mappings", "", 200},
-				{http.MethodPut, connection + "/profile-mappings", `{"mappings":[{"external_user_id":"7","external_user_name":"x","silo_profile_id":"p-primary"}]}`, 200},
+				{http.MethodPut, connection + "/profile-mappings", `{"mappings":[{"external_user_id":"7","external_user_name":"x","vio_profile_id":"p-primary"}]}`, 200},
 				{http.MethodGet, connection + "/events", "", 200},
 			} {
 				*f = fakeWebhookManagement{}

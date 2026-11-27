@@ -1,5 +1,7 @@
 import type { PluginAdminForm, PluginAdminFormField, PluginConfigSchema } from "@/api/types";
 
+import { libraryPickerForFormat } from "./libraryPicker";
+
 export function humanizeConfigKey(value: string) {
   return value
     .split("_")
@@ -36,9 +38,16 @@ export function adminFormForConfigSchema(schema: PluginConfigSchema): PluginAdmi
         if (!propertyType || !["string", "number", "integer", "boolean"].includes(propertyType)) {
           return null;
         }
-        const secret = property.writeOnly === true || property.format === "password";
-        const control =
-          propertyType === "boolean"
+        const libraryPicker = libraryPickerForFormat(property.format);
+        const isUrl =
+          property.format === "uri" || property.format === "url" || key.endsWith("_url");
+        const secret =
+          !isUrl &&
+          !libraryPicker &&
+          (property.writeOnly === true || property.format === "password");
+        const control = libraryPicker
+          ? "SELECT"
+          : propertyType === "boolean"
             ? "SWITCH"
             : propertyType === "number" || propertyType === "integer"
               ? "NUMBER"
@@ -50,6 +59,7 @@ export function adminFormForConfigSchema(schema: PluginConfigSchema): PluginAdmi
           label: property.title || humanizeConfigKey(key),
           description: property.description,
           control,
+          library_picker: libraryPicker ?? undefined,
           placeholder: "",
           required: parsed.required?.includes(key) ?? false,
           secret,

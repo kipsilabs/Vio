@@ -1,6 +1,6 @@
+import type { MessageKey } from "@/locales/keys";
 import type { PluginCapability, PluginInstallation, PluginPresentation } from "@/api/types";
-import { englishText, t, type MessageKey } from "@/i18n";
-import { capabilityEnglishLabel, capabilityKind } from "@/lib/pluginCapabilities";
+import { capabilityKind } from "@/lib/pluginCapabilities";
 
 export type PluginSourceKind = PluginInstallation["source_kind"];
 
@@ -46,19 +46,16 @@ export function pendingUpdateVersion(installation: PluginInstallation): string |
 
 /** The plugin's tier, shown on every plugin (1.0 plugin-management AC4). */
 export function sourceLabel(tier: string): string {
-  return t(sourceLabelKey(tier));
-}
-
-function sourceLabelKey(tier: string): MessageKey {
   switch (tier) {
+    case "vio":
     case "silo":
-      return "web.admin.plugins.source.silo";
+      return "Silo maintained";
     case "approved_community":
-      return "web.admin.plugins.source.approvedCommunity";
+      return "Approved community";
     case "unverified":
-      return "web.admin.plugins.source.unverified";
+      return "Unverified";
     default:
-      return "web.admin.plugins.source.external";
+      return "External source";
   }
 }
 
@@ -68,14 +65,15 @@ function sourceLabelKey(tier: string): MessageKey {
  */
 export function tierNotice(tier: string): string | null {
   switch (tier) {
+    case "vio":
     case "silo":
       return null;
     case "approved_community":
-      return t("web.admin.plugins.source.approvedCommunityNotice");
+      return "Reviewed by Silo maintainers to work as described and be safe for its documented use. Its author maintains and supports it, not the Silo project.";
     case "unverified":
-      return t("web.admin.plugins.source.unverifiedNotice");
+      return "It isn't linked to any of your catalogs, so Silo can't verify it or check it for updates. Only run it if you trust its source. To update it, upload the new version.";
     default:
-      return t("web.admin.plugins.source.externalNotice");
+      return "Silo has not reviewed this plugin. It comes from a repository you added, so only run it if you trust its source.";
   }
 }
 
@@ -84,11 +82,34 @@ export function configPanelId(key: string): string {
   return `config-${key}`;
 }
 
-/** The catalog's groups in display order; `titleKey` is formatted where the heading renders. */
-export const CATALOG_GROUPS: { kind: PluginSourceKind; titleKey: MessageKey }[] = [
-  { kind: "silo", titleKey: "web.admin.plugins.catalog.groupSilo" },
-  { kind: "approved_community", titleKey: "web.admin.plugins.catalog.groupApprovedCommunity" },
-  { kind: "external", titleKey: "web.admin.plugins.catalog.groupExternal" },
+export interface CatalogGroup {
+  kind: PluginSourceKind;
+  title: string;
+  /** Catalog message for the section heading, formatted where it renders. */
+  titleKey: MessageKey;
+  matches: (sourceKind: string) => boolean;
+}
+
+export const CATALOG_GROUPS: readonly CatalogGroup[] = [
+  {
+    kind: "vio",
+    title: "Silo maintained",
+    titleKey: "web.admin.plugins.catalog.groupSilo",
+    matches: (sourceKind: string) => sourceKind === "vio" || sourceKind === "silo",
+  },
+  {
+    kind: "approved_community",
+    title: "Approved community",
+    titleKey: "web.admin.plugins.catalog.groupApprovedCommunity",
+    matches: (sourceKind: string) => sourceKind === "approved_community",
+  },
+  {
+    kind: "external",
+    title: "Other sources",
+    titleKey: "web.admin.plugins.catalog.groupExternal",
+    matches: (sourceKind: string) =>
+      sourceKind !== "vio" && sourceKind !== "silo" && sourceKind !== "approved_community",
+  },
 ];
 
 export function pluginDisplayName(pluginID: string, presentation?: PluginPresentation): string {
@@ -96,7 +117,7 @@ export function pluginDisplayName(pluginID: string, presentation?: PluginPresent
   if (displayName) return displayName;
 
   const derived = pluginID
-    .replace(/^silo[._-]?/, "")
+    .replace(/^(silo|vio)[._-]?/, "")
     .split(/[._-]+/)
     .filter(Boolean)
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
@@ -114,7 +135,7 @@ export function pluginSummary(
 
   return (
     capabilities.find((capability) => capability.description?.trim())?.description?.trim() ??
-    t("web.admin.plugins.tile.noDescription")
+    "No description provided."
   );
 }
 
@@ -147,25 +168,17 @@ export function pluginResourceLinks(
 ): { label: string; url: string }[] {
   return [
     {
-      label: t("web.admin.plugins.rail.sourceCode"),
+      label: "Source code",
       url: safeExternalURL(presentation?.source_url) ?? safeExternalURL(repoURL),
     },
-    {
-      label: t("web.admin.plugins.rail.changelog"),
-      url: safeExternalURL(presentation?.changelog_url),
-    },
-    {
-      label: t("web.admin.plugins.rail.support"),
-      url: safeExternalURL(presentation?.support_url),
-    },
+    { label: "Changelog", url: safeExternalURL(presentation?.changelog_url) },
+    { label: "Support", url: safeExternalURL(presentation?.support_url) },
   ].filter((link): link is { label: string; url: string } => Boolean(link.url));
 }
 
 export function licenseLabel(spdx?: string): string {
   const value = spdx?.trim();
-  return !value || value === "NOASSERTION"
-    ? t("web.admin.plugins.rail.licenseNotSpecified")
-    : value;
+  return !value || value === "NOASSERTION" ? "Not specified" : value;
 }
 
 export function pluginMatchesSearch({
@@ -193,15 +206,12 @@ export function pluginMatchesSearch({
     presentation?.description_markdown,
     presentation?.publisher_name,
     repositoryName,
-    // Shown labels, and their English so an English term still matches.
     sourceLabel(sourceKind),
-    englishText(sourceLabelKey(sourceKind)),
     ...capabilities.flatMap((capability) => [
       capability.display_name,
       capability.description,
       capability.type,
       capabilityKind(capability.type).label,
-      capabilityEnglishLabel(capability.type),
     ]),
   ]
     .filter(Boolean)

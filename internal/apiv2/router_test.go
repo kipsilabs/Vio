@@ -2,6 +2,7 @@ package apiv2
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -421,6 +422,18 @@ func TestSliceQueryUsesRepeatedKeys(t *testing.T) {
 	}
 }
 
+func TestNoBuiltInDocsRoutes(t *testing.T) {
+	h := sharedTransportHandler()
+	for _, path := range []string{"/api/v2/openapi.yaml", "/api/v2/schemas/Problem.json", "/docs", "/openapi.json"} {
+		rec := do(t, h, http.MethodGet, path, "", nil)
+		if rec.Code != 404 {
+			t.Errorf("%s served %d", path, rec.Code)
+		}
+	}
+	// /api/v2/openapi.json is Silo's own operation (getOpenAPIDocument), not
+	// Huma's built-in route: TestOpenAPIDocumentIsTheEmbeddedArtifact.
+}
+
 // TestOpenAPIDocumentIsTheEmbeddedArtifact: the served bytes are the committed
 // artifact exactly, and the digest the discovery document reports is the
 // digest of those bytes.
@@ -490,6 +503,9 @@ func TestBodyCapIsEnforcedBeforeDecoding(t *testing.T) {
 // an injected deadline, so the test does not wait for BodyReadTimeout.
 func TestBodyReadTimeout(t *testing.T) {
 	t.Parallel()
+	if BodyReadTimeout != 30*time.Second {
+		t.Fatalf("BodyReadTimeout = %v; #135 ratified the 30 s server baseline on 2026-09-02", BodyReadTimeout)
+	}
 	h := newTestHandler(t, Dependencies{bodyReadTimeout: 150 * time.Millisecond})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
@@ -544,7 +560,8 @@ func TestFrameworkFailuresMapToCatalog(t *testing.T) {
 		location     string
 		code         string
 	}{
-		{"malformed json", http.MethodPost, "/api/v2/probe/public", `{"name":`, nil, TypeMalformedRequest, "body", "malformed_json"},
+		{"malformed json: truncated", http.MethodPost, "/api/v2/probe/public", `{"name":`, nil, TypeMalformedRequest, "body", "malformed_json"},
+		{"malformed json: invalid character", http.MethodPost, "/api/v2/probe/public", `{"name":"x",}`, nil, TypeMalformedRequest, "body", "malformed_json"},
 		{"unknown field", http.MethodPost, "/api/v2/probe/public", `{"name":"x","cleared":null,"zzz":1}`, nil, TypeValidationFailed, "body.zzz", "unknown_field"},
 		{"missing required", http.MethodPost, "/api/v2/probe/public", `{"cleared":null}`, nil, TypeValidationFailed, "body.name", "required"},
 		{"closed enum", http.MethodPost, "/api/v2/probe/public", `{"name":"x","cleared":null,"kind":"Movie"}`, nil, TypeValidationFailed, "body.kind", "invalid_enum"},
@@ -553,6 +570,7 @@ func TestFrameworkFailuresMapToCatalog(t *testing.T) {
 		{"limit above max", http.MethodGet, "/api/v2/probe/list?limit=201", "", nil, TypeValidationFailed, "query.limit", "out_of_range"},
 		{"bad sort", http.MethodGet, "/api/v2/probe/list?sort=name,-nope", "", nil, TypeValidationFailed, "query.sort", "invalid_sort_field"},
 		{"bool literal", http.MethodPost, "/api/v2/probe/public?flag=TRUE", `{"name":"x","cleared":null}`, nil, TypeValidationFailed, "query.flag", "invalid_type"},
+		{"bool 1", http.MethodPost, "/api/v2/probe/public?flag=1", `{"name":"x","cleared":null}`, nil, TypeValidationFailed, "query.flag", "invalid_type"},
 		{"406", http.MethodGet, "/api/v2/system/info", "", map[string]string{"Accept": "image/png"}, TypeNotAcceptable, "", ""},
 		{"405", http.MethodDelete, "/api/v2/system/info", "", nil, TypeMethodNotAllowed, "", ""},
 		{"404", http.MethodGet, "/api/v2/nothing", "", nil, TypeNotFound, "", ""},
@@ -768,7 +786,7 @@ func TestRequestIDNeverAdoptsClientValue(t *testing.T) {
 func TestCompressedRequestBodyIsRejected(t *testing.T) {
 	h := sharedTransportHandler()
 	body := `{"name":"x","cleared":null}`
-	for _, enc := range []string{"gzip", "gzip, identity"} {
+	for _, enc := range []string{"gzip", "br", "deflate", "GZIP", "gzip, identity"} {
 		rec := do(t, h, http.MethodPost, "/api/v2/probe/public", body, map[string]string{"Content-Encoding": enc})
 		if rec.Code != http.StatusUnsupportedMediaType {
 			t.Errorf("Content-Encoding %q: status %d, want 415: %s", enc, rec.Code, rec.Body.String())
@@ -776,6 +794,17 @@ func TestCompressedRequestBodyIsRejected(t *testing.T) {
 		}
 		requireProblem(t, rec, TypeUnsupportedMediaType)
 	}
+	// A real gzip body is refused for the same reason, before decoding.
+	var gz bytes.Buffer
+	zw := gzip.NewWriter(&gz)
+	_, _ = zw.Write([]byte(body))
+	_ = zw.Close()
+	r := httptest.NewRequest(http.MethodPost, "/api/v2/probe/public", bytes.NewReader(gz.Bytes()))
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("Content-Encoding", "gzip")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, r)
+	requireProblem(t, rec, TypeUnsupportedMediaType)
 	// identity is the one encoding an unencoded body may declare.
 	if rec := do(t, h, http.MethodPost, "/api/v2/probe/public", body, map[string]string{"Content-Encoding": "identity"}); rec.Code != 200 {
 		t.Fatalf("identity: %d %s", rec.Code, rec.Body.String())
@@ -876,5 +905,14 @@ func TestTamperedCursorThroughRouter(t *testing.T) {
 	if rec := do(t, h, http.MethodGet, "/api/v2/probe/list?cursor="+good, "", nil); rec.Code != 200 {
 		t.Fatalf("valid cursor: %d %s", rec.Code, rec.Body.String())
 	}
-	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/probe/list?cursor=x"+good[1:], "", nil), TypeInvalidCursor)
+	for name, cursor := range map[string]string{
+		"tampered": "x" + good[1:],
+		"garbage":  "not-a-cursor",
+		"foreign":  func() string { c, _ := NewCursors([]byte("other")).Encode(probeCursorScope, probeCursor{}); return c }(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			rec := do(t, h, http.MethodGet, "/api/v2/probe/list?cursor="+cursor, "", nil)
+			requireProblem(t, rec, TypeInvalidCursor)
+		})
+	}
 }

@@ -3,6 +3,6 @@
   "source_id": "1",
   "external_user_id": "external",
   "external_user_name": "Example",
-  "silo_user_id": "3",
-  "silo_profile_id": "profile"
+  "vio_user_id": "3",
+  "vio_profile_id": "profile"
 }

@@ -123,6 +123,12 @@ func DefaultConfig(root string) Config {
 					"out of scope for the native v2 migration",
 			},
 			{
+				File: "internal/remotestream/relay.go",
+				Func: "Relay.start",
+				Reason: "Fork virtual-library relay listener: it streams pre-resolved virtual " +
+					"sources to clients and registers no native route surface",
+			},
+			{
 				File: absListenerFile,
 				Func: absListenerFunc,
 				Reason: "Audiobookshelf-protocol compatibility listener; an external wire contract, " +

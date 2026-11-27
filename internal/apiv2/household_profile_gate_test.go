@@ -90,6 +90,16 @@ func TestHouseholdProfileGateFailsClosed(t *testing.T) {
 	if rec := do(t, h, http.MethodPost, "/api/v2/probe/account", body, bearer(memberToken)); rec.Code != http.StatusOK {
 		t.Fatalf("ungated operation: %d %s", rec.Code, rec.Body.String())
 	}
+
+	// parityDeps wires no generic limiter: auth, viewer access, household.
+	chain, missing := gateChain(parityDeps(false), ClassProfileScoped, "", false, true, true, "")
+	if missing != "" || len(chain) != 3 {
+		t.Fatalf("household chain = %d gates, missing %q; want auth, viewer access, household", len(chain), missing)
+	}
+	chain, missing = gateChain(parityDeps(false), ClassPermissionGated, "marker_edit", false, false, true, "")
+	if missing != "" || len(chain) != 4 {
+		t.Fatalf("household permission chain = %d gates, missing %q; want auth, viewer access, household, permission", len(chain), missing)
+	}
 }
 
 // TestHouseholdProfileGateDeclaration: the gate narrows an absent header, so
@@ -139,11 +149,9 @@ var householdGatedOperations = []string{
 	"getWatchTrickplay",
 	"headDirectDownload",
 	"headDirectDownloadProxy",
-	"listPersonalAPIKeys",
 	"listStoredSubtitles",
 	"listSubtitleAIJobs",
 	"listSubtitleSync",
-	"revokePersonalAPIKey",
 	"searchSubtitles",
 	"setFileMarkers",
 	"setItemMarkers",
@@ -319,7 +327,6 @@ var householdGateExemptOperations = map[string]string{
 	"getPlaybackSegment":       exemptPlaybackSession,
 	"getPlaybackSubtitle":      exemptPlaybackSession,
 	"getPlaybackSubtitleFonts": exemptPlaybackSession,
-	"headPlaybackManifest":     exemptPlaybackSession,
 	"headPlaybackMedia":        exemptPlaybackSession,
 	"headPlaybackSubtitle":     exemptPlaybackSession,
 
@@ -330,10 +337,17 @@ var householdGateExemptOperations = map[string]string{
 	"getLibraryJob": "job poll; admin reach follows the acting-admin decision",
 
 	"detectSubtitleLanguage":          "file-less language detection",
+	"getVirtualLibraryCapabilities":   "capability probe, callable before a profile is chosen",
 	"getNotificationApplePushDisplay": "a display token binds the profile from its claims",
 	"listSectionRecipeCandidates":     "section recipe gallery metadata",
 	"listSectionRecipes":              "section recipe gallery metadata",
-	"listSeasonalThemes":              "static seasonal holiday and vibe catalog",
+	// Virtual candidate jobs are owner/installation-scoped and run under the
+	// caller's access filter, so they stay usable without a picked profile.
+	"refreshVirtualCandidates":       "owner-scoped async re-list job",
+	"discoverVirtualCandidates":      "access-checked provider discovery without a playback session",
+	"cancelVirtualCandidatesRefresh": "owner-scoped async re-list job",
+	"requestVirtualRelease":          "owner-scoped provider release request",
+	"listSeasonalThemes":             "static seasonal holiday and vibe catalog",
 }
 
 // TestHouseholdProfileGateCoversProfileOptionalOperations: every operation

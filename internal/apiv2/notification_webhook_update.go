@@ -18,6 +18,7 @@ type NotificationWebhookUpdateInput struct {
 		Enabled        *bool   `json:"enabled,omitempty"`
 		NotifyNextUp   *bool   `json:"notify_next_up,omitempty"`
 		NotifyRequests *bool   `json:"notify_requests,omitempty"`
+		NotifyRatings  *bool   `json:"notify_ratings,omitempty"`
 	}
 }
 
@@ -42,7 +43,7 @@ func registerNotificationWebhookUpdate(reg *Registry) {
 		}
 		row, err := reg.deps.NotificationDestinations.UpdateNotificationWebhook(ctx, user, profile, in.ID, notifications.WebhookInput{
 			Name: in.Body.Name, URL: in.Body.URL, Enabled: in.Body.Enabled,
-			NotifyNextUp: in.Body.NotifyNextUp, NotifyRequests: in.Body.NotifyRequests,
+			NotifyNextUp: in.Body.NotifyNextUp, NotifyRequests: in.Body.NotifyRequests, NotifyRatings: in.Body.NotifyRatings,
 		}, func(revision int64) error {
 			if p := EvaluateGuardedPreconditions(in.IfMatch, in.IfNoneMatch, notificationWebhookTag(profile, in.ID, revision)); p != nil {
 				return p

@@ -243,11 +243,7 @@ describe("AdminUserSignIn linking by subject", () => {
 
   it.each([
     ["identity_linked_elsewhere", 409, "already connected to another Silo account"],
-    [
-      "permission_denied",
-      403,
-      "Only the server owner can change another admin’s sign-in settings.",
-    ],
+    ["permission_denied", 403, "Only the server owner can change another admin's sign-in."],
     ["validation_failed", 422, "raw validation_failed"],
   ])("explains a %s refusal", async (type, status, text) => {
     const user = userEvent.setup();

@@ -9,9 +9,9 @@ export const PAGE_SIZE = 10;
 const DESKTOP_QUERY = "(min-width: 64rem)";
 
 // Tailwind's xl breakpoint. Below it, with the admin sidebar open, the wide
-// admin tables (the Ambiguous Roots, Troubleshooting and Stale External IDs
-// diagnostics, and the Users list) are wider than their section and would hide
-// their last columns behind a sideways scroll.
+// diagnostics tables (Ambiguous Roots, Troubleshooting, Stale External IDs)
+// are wider than their section and would hide their last columns behind a
+// sideways scroll.
 const WIDE_TABLE_QUERY = "(min-width: 80rem)";
 
 /**
@@ -24,10 +24,10 @@ export function useLibrariesTableLayout(): boolean {
 }
 
 /**
- * Whether an admin page with a wide table shows it, from `xl` up, or shows
- * cards. Tests have no matchMedia and get the tables.
+ * Whether a diagnostics section with a wide table shows it, from `xl` up, or
+ * shows cards. Tests have no matchMedia and get the tables.
  */
-export function useWideTableLayout(): boolean {
+export function useWideDiagnosticsTableLayout(): boolean {
   return useMediaQuery(WIDE_TABLE_QUERY, true);
 }
 

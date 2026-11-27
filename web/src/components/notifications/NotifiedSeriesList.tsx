@@ -131,7 +131,7 @@ function NotifiedSeriesRow({
       </ViewTransitionLink>
       <span
         className={cn(
-          "hidden truncate text-[0.8125rem] sm:block",
+          "hidden truncate text-[13px] sm:block",
           dim ? "text-muted-foreground/80" : "text-muted-foreground",
         )}
       >
@@ -221,7 +221,7 @@ function useSeriesOptions(canFilterMuted: boolean) {
     setFilter: (value: SeriesFilter) => set("filter", value, "all"),
     setSort: (value: SortOption) => set("sort", value, "title"),
     setQ: (value: string) => set("q", value, ""),
-    status: filter === "muted" ? ("muted" as const) : ("all" as const),
+    status: filter === "muted" ? ("inactive" as const) : ("all" as const),
     options: { q: q.trim(), sort } satisfies NotifiedSeriesOptions,
   };
 }

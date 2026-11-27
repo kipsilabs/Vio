@@ -1,4 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createElement, type ReactNode } from "react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { renderHook, waitFor } from "@testing-library/react";
+import { itemKeys } from "./keys";
 
 const mocks = vi.hoisted(() => ({
   api: vi.fn(),
@@ -76,7 +80,13 @@ vi.mock("sonner", () => ({
 }));
 
 import { V2ProblemError } from "@/api/v2/request";
-import { useRefreshItemMetadata, useUploadItemImage, useWatchedStateMutation } from "./items";
+import {
+  fetchWatchDetail,
+  useRefreshItemMetadata,
+  useUploadItemImage,
+  useWatchDetail,
+  useWatchedStateMutation,
+} from "./items";
 
 type WatchedMutationOptions = {
   mutationFn: (nextPlayed: boolean) => Promise<unknown>;
@@ -169,18 +179,7 @@ describe("item query helpers", () => {
     expect(mocks.toastError).toHaveBeenCalledWith("The file is not a JPEG, PNG or WebP image");
   });
 
-  it.each([
-    // A job read through the API: the flag, with admin text that has not loaded formatting as "".
-    {
-      payload: { artwork_cache_incomplete: true, artwork_cache_warning: "" },
-      description: undefined,
-    },
-    // A job that arrived as a live event: only the server's own warning text.
-    {
-      payload: { artwork_cache_warning: "2 refreshed artwork image(s) failed to cache" },
-      description: "2 refreshed artwork image(s) failed to cache",
-    },
-  ])("warns when the refresh succeeded but artwork caching did not finish", async (shape) => {
+  it("warns when the refresh succeeded but artwork caching did not finish", async () => {
     const invalidateQueries = vi.fn().mockResolvedValue(undefined);
     mocks.useQueryClient.mockReturnValue({ invalidateQueries });
 
@@ -199,7 +198,7 @@ describe("item query helpers", () => {
         job: {
           result_payload: {
             refresh_content_id: "series-1",
-            ...shape.payload,
+            artwork_cache_warning: "2 refreshed artwork image(s) failed to cache",
           },
         },
       },
@@ -210,7 +209,10 @@ describe("item query helpers", () => {
     expect(mocks.toastSuccess).not.toHaveBeenCalled();
     expect(mocks.toastWarning).toHaveBeenCalledWith(
       "Metadata refreshed, but artwork caching did not finish",
-      { id: "refresh-toast", description: shape.description },
+      {
+        id: "refresh-toast",
+        description: "2 refreshed artwork image(s) failed to cache",
+      },
     );
     // The refresh still committed, so the caches must be invalidated anyway.
     expect(invalidateQueries).toHaveBeenCalled();
@@ -378,5 +380,79 @@ describe("item query helpers", () => {
       watchedKeys: [],
       skipSimilarItems: true,
     });
+  });
+});
+
+describe("useWatchDetail caching", () => {
+  beforeEach(() => {
+    mocks.v2.mockReset();
+    mocks.v2.mockResolvedValue({ content_id: "movie-1", versions: [], subtitles: [] });
+  });
+
+  function wrapperFor(client: QueryClient) {
+    return ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client }, children);
+  }
+
+  it("reuses cached watch detail when remounting within the stale window", async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    mocks.v2.mockResolvedValue({ content_id: "movie-1", versions: [], subtitles: [] });
+    const wrapper = wrapperFor(client);
+
+    const first = renderHook(() => useWatchDetail("movie-1", 7, 1), { wrapper });
+    await waitFor(() => expect(first.result.current.isSuccess).toBe(true));
+    expect(mocks.v2).toHaveBeenCalledTimes(1);
+
+    // Navigating detail -> player -> back remounts the query. A cache entry
+    // inside the 30s stale window must be reused instead of refetched.
+    first.unmount();
+    const second = renderHook(() => useWatchDetail("movie-1", 7, 1), { wrapper });
+    await waitFor(() => expect(second.result.current.isSuccess).toBe(true));
+
+    expect(mocks.v2).toHaveBeenCalledTimes(1);
+  });
+
+  it("dedupes concurrent watch detail fetches onto one network request", async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    let resolveApi: (value: unknown) => void = () => {};
+    mocks.v2.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveApi = resolve;
+        }),
+    );
+
+    // The same options WatchPage's fetchQuery call sites and useWatchDetail
+    // build: one query key means react-query coalesces the in-flight fetch.
+    const options = {
+      queryKey: itemKeys.watchDetail("movie-1", 1),
+      queryFn: () => fetchWatchDetail("movie-1", 7, 1),
+      staleTime: 30_000,
+    };
+    const first = client.fetchQuery(options);
+    const second = client.fetchQuery(options);
+
+    await vi.waitFor(() => expect(mocks.v2).toHaveBeenCalledTimes(1));
+    resolveApi({ content_id: "movie-1", versions: [], subtitles: [] });
+    await Promise.all([first, second]);
+
+    expect(mocks.v2).toHaveBeenCalledTimes(1);
+  });
+
+  it("reads one watch detail per item when the preferred file changes", async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    mocks.v2.mockResolvedValue({ content_id: "movie-1", versions: [], subtitles: [] });
+    const wrapper = wrapperFor(client);
+
+    // The player and the page name the same title with different preferred
+    // files as the session resolves one. `file_id` is a server-side preference,
+    // not a different payload, so both reads share one cache entry.
+    const first = renderHook(() => useWatchDetail("movie-1", 7, 1), { wrapper });
+    await waitFor(() => expect(first.result.current.isSuccess).toBe(true));
+
+    const second = renderHook(() => useWatchDetail("movie-1", 9, 1), { wrapper });
+    await waitFor(() => expect(second.result.current.isSuccess).toBe(true));
+
+    expect(mocks.v2).toHaveBeenCalledTimes(1);
   });
 });

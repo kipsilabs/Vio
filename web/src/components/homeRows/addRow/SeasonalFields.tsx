@@ -65,7 +65,7 @@ const mutedWord = (chunks: ReactNode[]) => <span className="text-muted-foregroun
 function CatalogStatus({ isError }: { isError: boolean }) {
   const t = useT();
   return (
-    <p role="status" className="text-muted-foreground text-[0.8125rem]">
+    <p role="status" className="text-muted-foreground text-[13px]">
       {isError ? t("web.home.addRow.seasonal.failed") : t("web.home.addRow.seasonal.loading")}
     </p>
   );
@@ -86,7 +86,7 @@ function VibeSelect({
       <Select value={value.key} onValueChange={onChange}>
         <SelectTrigger
           aria-label={t("web.home.addRow.seasonal.vibeFor", { holiday: theme.name })}
-          className="h-8 w-full text-[0.8125rem]"
+          className="h-8 w-full text-[13px]"
         >
           <SelectValue />
         </SelectTrigger>
@@ -120,7 +120,7 @@ function MonthDayInput({
       placeholder={placeholder}
       inputMode="numeric"
       maxLength={5}
-      className="h-8 w-24 text-[0.8125rem]"
+      className="h-8 w-24 text-[13px]"
       value={value}
       onChange={(event) => onChange(event.target.value)}
     />
@@ -147,7 +147,7 @@ function HolidayDatesFields({
   return (
     <div className="grid gap-1">
       {/* On the narrowest phones the dates wrap under "In season", kept together. */}
-      <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5 text-[0.8125rem]">
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5 text-[13px]">
         {t("web.home.addRow.seasonal.inSeason", {
           w: mutedWord,
           dates: (chunks) => <span className="flex items-center gap-2">{chunks}</span>,
@@ -220,7 +220,7 @@ function SourceField({ config, onChange }: FieldProps) {
           ))}
         </SelectContent>
       </Select>
-      <p className="text-muted-foreground text-[0.8125rem]">{t(hint)}</p>
+      <p className="text-muted-foreground text-[13px]">{t(hint)}</p>
     </div>
   );
 }
@@ -238,7 +238,7 @@ function CustomHolidays({ config, onChange, max }: FieldProps & { max: number })
       <legend className="mb-1 text-sm font-medium">
         {t("web.home.addRow.seasonal.yourHolidays")}
       </legend>
-      <p className="text-muted-foreground text-[0.8125rem]">
+      <p className="text-muted-foreground text-[13px]">
         {t("web.home.addRow.seasonal.yourHolidaysIntro")}
       </p>
       {holidays.map((holiday, index) => {
@@ -253,7 +253,7 @@ function CustomHolidays({ config, onChange, max }: FieldProps & { max: number })
                   number: index + 1,
                 })}
                 placeholder={t("web.home.addRow.seasonal.holidayNamePlaceholder")}
-                className="h-8 text-[0.8125rem]"
+                className="h-8 text-[13px]"
                 value={holiday.name}
                 onChange={(event) => update(index, { name: event.target.value })}
               />
@@ -267,7 +267,7 @@ function CustomHolidays({ config, onChange, max }: FieldProps & { max: number })
                 <Trash2 className="size-4" />
               </Button>
             </div>
-            <div className="flex items-center gap-2 text-[0.8125rem]">
+            <div className="flex items-center gap-2 text-[13px]">
               {t("web.home.addRow.seasonal.dateRange", {
                 w: mutedWord,
                 start: () => (
@@ -293,7 +293,7 @@ function CustomHolidays({ config, onChange, max }: FieldProps & { max: number })
               aria-label={t("web.home.addRow.seasonal.listLabel", { holiday: label })}
               // eslint-disable-next-line formatjs/no-literal-string-in-jsx -- a URL, not text
               placeholder="https://mdblist.com/lists/…"
-              className="h-8 text-[0.8125rem]"
+              className="h-8 text-[13px]"
               value={holiday.list_url}
               onChange={(event) => update(index, { list_url: event.target.value })}
             />
@@ -407,7 +407,7 @@ export function HolidayFields({ config, onChange }: FieldProps) {
                       placeholder={t("web.home.addRow.seasonal.nameInSeason", {
                         title: vibe.title,
                       })}
-                      className="h-8 text-[0.8125rem]"
+                      className="h-8 text-[13px]"
                       value={typed?.key === theme.key ? typed.text : (titles[theme.key] ?? "")}
                       onChange={(event) => {
                         setTyped({ key: theme.key, text: event.target.value });
@@ -437,11 +437,11 @@ export function HolidayFields({ config, onChange }: FieldProps) {
           })}
         </div>
         {themes.some((theme) => enabled.has(theme.key)) || hasCustom ? (
-          <p className="text-muted-foreground text-[0.8125rem]">
+          <p className="text-muted-foreground text-[13px]">
             {t("web.home.addRow.seasonal.inSeasonNote")}
           </p>
         ) : (
-          <p role="status" className="text-destructive text-[0.8125rem]">
+          <p role="status" className="text-destructive text-[13px]">
             {t("web.home.addRow.seasonal.pickOne")}
           </p>
         )}

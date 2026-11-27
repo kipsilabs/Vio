@@ -286,12 +286,12 @@ function AddAllowedTitle({
         />
       </div>
       {status ? (
-        <p role="status" className="text-muted-foreground text-[0.8125rem]">
+        <p role="status" className="text-muted-foreground text-[13px]">
           {status}
         </p>
       ) : null}
       {staleResults ? (
-        <p role="status" className="text-muted-foreground flex items-center gap-2 text-[0.8125rem]">
+        <p role="status" className="text-muted-foreground flex items-center gap-2 text-[13px]">
           {t("web.profiles.allowedTitles.resultsStale")}
           <Button type="button" variant="link" size="sm" onClick={() => void results.refetch()}>
             {t("common.retry")}

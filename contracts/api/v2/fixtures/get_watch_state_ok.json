@@ -70,9 +70,38 @@
           "default_file_id": "42",
           "versions": []
         }
-      ]
+      ],
+      "virtual_ranking": {
+        "profile_label": "4K HDR",
+        "source": "profile",
+        "criteria": [
+          {
+            "attribute": "score",
+            "direction": "desc"
+          },
+          {
+            "attribute": "resolution",
+            "direction": "desc"
+          }
+        ]
+      }
     }
   ],
+  "virtual_ranking": {
+    "profile_label": "4K HDR",
+    "source": "profile",
+    "criteria": [
+      {
+        "attribute": "score",
+        "direction": "desc"
+      },
+      {
+        "attribute": "resolution",
+        "direction": "desc"
+      }
+    ]
+  },
+  "indexer_releases": [],
   "subtitles": [
     {
       "source": "embedded",

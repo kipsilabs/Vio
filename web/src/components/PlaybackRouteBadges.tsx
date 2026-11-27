@@ -36,7 +36,7 @@ function NetworkBadge({ name, title }: { name: string; title: string }) {
     <span
       title={title}
       aria-label={t("web.player.routeBadge.networkAria", { name })}
-      className="border-primary/20 bg-primary/10 text-primary inline-flex max-w-full items-center gap-1 rounded border px-1.5 py-0.5 text-[0.5625rem] font-semibold"
+      className="border-primary/20 bg-primary/10 text-primary inline-flex max-w-full items-center gap-1 rounded border px-1.5 py-0.5 text-[9px] font-semibold"
     >
       <span className={LABEL_CLASS}>{t("web.player.routeBadge.network")}</span>
       <span aria-hidden="true">{SEPARATOR}</span>
@@ -49,17 +49,13 @@ function NetworkBadge({ name, title }: { name: string; title: string }) {
  * The selected access network and serving nodes, shared by all activity views.
  * showLocation={false} leaves out the Local/Remote badge for a view that shows
  * the location next to the client address instead.
- * showNetwork={false} leaves out the access-network provider badge when the
- * record does not carry a network provider (such as playback history).
  */
 export function PlaybackRouteBadges({
   session,
   showLocation = true,
-  showNetwork = true,
 }: {
   session: AdminSession;
   showLocation?: boolean;
-  showNetwork?: boolean;
 }) {
   const t = useT();
   const provider = session.routing_network_provider;
@@ -71,31 +67,29 @@ export function PlaybackRouteBadges({
           aria-label={t("web.player.routeBadge.locationAria", {
             location: session.stream_location,
           })}
-          className="border-primary/20 bg-primary/10 text-primary inline-flex items-center rounded border px-1.5 py-0.5 text-[0.5625rem] font-semibold"
+          className="border-primary/20 bg-primary/10 text-primary inline-flex items-center rounded border px-1.5 py-0.5 text-[9px] font-semibold"
         >
           {session.stream_location === "local"
             ? t("web.player.routeBadge.local")
             : t("web.player.routeBadge.remote")}
         </span>
       )}
-      {showNetwork ? (
-        provider ? (
-          <OverlayNetworkBadge provider={provider} />
-        ) : (
-          <NetworkBadge
-            name={
-              provider === ""
-                ? t("web.player.routeBadge.defaultNetwork")
-                : t("web.player.routeBadge.unknownNetwork")
-            }
-            title={
-              provider === ""
-                ? t("web.player.routeBadge.defaultNetworkTitle")
-                : t("web.player.routeBadge.unknownNetworkTitle")
-            }
-          />
-        )
-      ) : null}
+      {provider ? (
+        <OverlayNetworkBadge provider={provider} />
+      ) : (
+        <NetworkBadge
+          name={
+            provider === ""
+              ? t("web.player.routeBadge.defaultNetwork")
+              : t("web.player.routeBadge.unknownNetwork")
+          }
+          title={
+            provider === ""
+              ? t("web.player.routeBadge.defaultNetworkTitle")
+              : t("web.player.routeBadge.unknownNetworkTitle")
+          }
+        />
+      )}
       {getSessionRouteNodes(session).map((node) => {
         const serves = session.routing_egress === "api" ? "yes" : "no";
         const title =
@@ -112,7 +106,7 @@ export function PlaybackRouteBadges({
             key={node.key}
             title={title}
             aria-label={title}
-            className={`inline-flex max-w-full items-center gap-1 rounded border px-1.5 py-0.5 text-[0.5625rem] font-semibold ${BADGE_COLORS[node.kind]}`}
+            className={`inline-flex max-w-full items-center gap-1 rounded border px-1.5 py-0.5 text-[9px] font-semibold ${BADGE_COLORS[node.kind]}`}
           >
             {node.kind === "transcode" || node.kind === "proxy" ? (
               <>

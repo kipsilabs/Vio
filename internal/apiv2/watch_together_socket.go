@@ -34,9 +34,6 @@ func registerWatchTogetherSocket(reg *Registry) {
 		}
 
 		ticket, expiry, err := reg.deps.WatchTogetherSocket.MintRoomSocket(ctx, in.RoomID, in.RoomToken, identity)
-		if p := socketAuthorityUnavailable(err); p != nil {
-			return nil, p
-		}
 		if err != nil {
 			return nil, suggestionProblem(err)
 		}

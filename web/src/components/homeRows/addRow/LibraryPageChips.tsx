@@ -94,11 +94,11 @@ export function LibraryPageChips({
           );
         })}
       </div>
-      <p id={`${id}-help`} className="text-muted-foreground mt-2 text-[0.8125rem]">
+      <p id={`${id}-help`} className="text-muted-foreground mt-2 text-[13px]">
         {help}
       </p>
       {showLimit ? (
-        <p id={`${id}-limit`} className="text-muted-foreground mt-1 text-[0.8125rem]">
+        <p id={`${id}-limit`} className="text-muted-foreground mt-1 text-[13px]">
           {t("web.home.addRow.pages.limit", { count: BULK_LIBRARY_LIMIT })}
         </p>
       ) : null}

@@ -220,7 +220,7 @@ export default function PreparedFilesTab({
           aria-label={t("web.admin.downloads.preparedFiles.selectionToolbar")}
           className="bg-surface/60 border-border flex flex-wrap items-center gap-2 rounded-lg border px-3 py-2"
         >
-          <span className="text-[0.75rem] font-medium tabular-nums">
+          <span className="text-[12px] font-medium tabular-nums">
             {[
               t(
                 "web.admin.downloads.preparedFiles.selectedCount",
@@ -240,7 +240,7 @@ export default function PreparedFilesTab({
             <Button
               size="sm"
               variant="ghost"
-              className="h-7 px-2 text-[0.6875rem]"
+              className="h-7 px-2 text-[11px]"
               onClick={() => setSelected(new Set())}
             >
               {t("web.admin.downloads.preparedFiles.clear")}
@@ -248,7 +248,7 @@ export default function PreparedFilesTab({
             <Button
               size="sm"
               variant="outline"
-              className="text-destructive hover:text-destructive h-7 gap-1.5 px-2 text-[0.6875rem]"
+              className="text-destructive hover:text-destructive h-7 gap-1.5 px-2 text-[11px]"
               onClick={() => setConfirming(selectedRows)}
             >
               <Trash2 className="size-3.5" aria-hidden="true" />

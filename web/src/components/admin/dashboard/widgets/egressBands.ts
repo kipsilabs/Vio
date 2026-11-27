@@ -1,4 +1,4 @@
-import type { AdminTimeseries } from "@/api/types";
+import type { AdminTimeseries, AdminTimeseriesEgressSource } from "@/api/types";
 import { chartSeriesColor } from "../charts";
 import type { LineChartPoint } from "../charts";
 import { buildTimeseriesPoints } from "./timeseriesSeries";
@@ -16,24 +16,17 @@ export interface EgressBand {
  * How many sources get a band of their own. The rest share "Other", so the
  * card's legend stays one line and its height stays fixed at any node count.
  */
-export const MAX_NAMED_BANDS = 4;
+const MAX_NAMED_BANDS = 4;
 
 /**
  * `chartSeriesColor` indexes for named bands. Index 1 (`--chart-2`, teal) is
  * skipped because the total view already uses it for Downloads, and the same
  * color must not mean two things on one widget.
  */
-export const BAND_COLOR_SLOTS = [0, 2, 3, 4] as const;
+const BAND_COLOR_SLOTS = [0, 2, 3, 4] as const;
 
 const OTHER_KEY = "other";
-export const OTHER_COLOR = "var(--muted-foreground)";
-
-export interface EgressSourceIdentity {
-  key: string;
-  kind: string;
-  name: string;
-  node_id?: string | number;
-}
+const OTHER_COLOR = "var(--muted-foreground)";
 
 /**
  * Splits the egress series into stacked bands, bottom of the stack first, or
@@ -76,8 +69,8 @@ export function buildEgressBands(series: AdminTimeseries | undefined): EgressBan
   );
 
   const keptSources = sources.filter((source) => kept.has(source.key));
-  const colors = assignEgressSourceColors(keptSources);
-  const labels = dedupeEgressSourceLabels(keptSources);
+  const colors = assignColors(keptSources);
+  const labels = bandLabels(keptSources);
   const named = keptSources.map((source) => ({
     key: source.key,
     label: labels.get(source.key) ?? source.name,
@@ -113,33 +106,26 @@ export function buildEgressBands(series: AdminTimeseries | undefined): EgressBan
  * Legend labels for the kept sources. Node names need not be unique, so a
  * name two kept nodes share gets each node's id appended.
  */
-export function dedupeEgressSourceLabels(
-  sources: readonly EgressSourceIdentity[],
-  apiLabel?: string,
-): Map<string, string> {
-  const resolved = sources.map((source) => ({
-    source,
-    name: source.kind === "api" && apiLabel ? apiLabel : source.name,
-  }));
+function bandLabels(sources: readonly AdminTimeseriesEgressSource[]): Map<string, string> {
   const uses = new Map<string, number>();
-  for (const { name } of resolved) {
-    uses.set(name, (uses.get(name) ?? 0) + 1);
+  for (const source of sources) {
+    uses.set(source.name, (uses.get(source.name) ?? 0) + 1);
   }
   return new Map(
-    resolved.map(({ source, name }) => [
+    sources.map((source) => [
       source.key,
-      (uses.get(name) ?? 0) > 1 && source.node_id !== undefined && String(source.node_id) !== "0"
+      (uses.get(source.name) ?? 0) > 1 && source.node_id !== undefined
         ? t("web.admin.dashboard.widgets.egress.duplicateNodeName", {
-            name,
+            name: source.name,
             id: String(source.node_id),
           })
-        : name,
+        : source.name,
     ]),
   );
 }
 
 /** The color slot index a source asks for: the API first, a node by its id. */
-function preferredSlot(source: EgressSourceIdentity): number {
+function preferredSlot(source: AdminTimeseriesEgressSource): number {
   if (source.kind === "api") {
     return 0;
   }
@@ -148,38 +134,27 @@ function preferredSlot(source: EgressSourceIdentity): number {
 }
 
 /**
- * Color slot indexes for the kept sources, claimed in identity order (the API,
- * then nodes by ascending id) so a collision always resolves the same way
- * across both Dashboard widgets and Insights charts.
+ * Colors for the kept sources, claimed in identity order (the API, then nodes
+ * by ascending id) so a collision always resolves the same way.
  */
-export function assignEgressSourceSlots(
-  sources: readonly EgressSourceIdentity[],
-): Map<string, number> {
+function assignColors(sources: readonly AdminTimeseriesEgressSource[]): Map<string, string> {
   const byIdentity = [...sources].sort(
     (a, b) =>
       Number(b.kind === "api") - Number(a.kind === "api") ||
       Number(a.node_id ?? 0) - Number(b.node_id ?? 0),
   );
   const taken = new Set<number>();
-  const slots = new Map<string, number>();
+  const colors = new Map<string, string>();
   for (const source of byIdentity) {
     const preferred = preferredSlot(source);
     for (let offset = 0; offset < BAND_COLOR_SLOTS.length; offset += 1) {
       const index = (preferred + offset) % BAND_COLOR_SLOTS.length;
       if (!taken.has(index)) {
         taken.add(index);
-        slots.set(source.key, BAND_COLOR_SLOTS[index] ?? 0);
+        colors.set(source.key, chartSeriesColor(BAND_COLOR_SLOTS[index] ?? 0));
         break;
       }
     }
   }
-  return slots;
-}
-
-/** CSS colors matching `assignEgressSourceSlots`. */
-export function assignEgressSourceColors(
-  sources: readonly EgressSourceIdentity[],
-): Map<string, string> {
-  const slots = assignEgressSourceSlots(sources);
-  return new Map(Array.from(slots.entries()).map(([key, slot]) => [key, chartSeriesColor(slot)]));
+  return colors;
 }

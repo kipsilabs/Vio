@@ -376,7 +376,7 @@ func fixtureProfilelessSession() handlers.PlaybackSessionView {
 	duration := 8520
 	return handlers.PlaybackSessionView{
 		SessionID: "ps-9c1d", UserID: 1, Username: "laura",
-		MediaFileID: 7, RequestedMediaFileID: 7, MediaItemID: "tt0111161", MediaTitle: "The Shawshank Redemption", MediaType: "movie",
+		MediaFileID: 7, RequestedMediaFileID: 7, ContentID: "tt0111161", MediaTitle: "The Shawshank Redemption", MediaType: "movie",
 		PosterURL: "https://media.example/poster-7.jpg", PlayMethod: "direct", ReportingNode: "api", EffectivePlayMethod: "direct",
 		FileDuration: &duration, StartedAt: fixedTime(), UpdatedAt: fixedTime().Add(2 * time.Minute),
 		PositionSeconds: 120, IsPaused: true, HasPlaybackControl: false,
@@ -392,8 +392,8 @@ func fixtureSession() handlers.PlaybackSessionView {
 	season, episode, duration, kbps, channels, node := 1, 3, 2640, 12000, 6, 3
 	return handlers.PlaybackSessionView{
 		SessionID: "ps-7f3a", UserID: 1, Username: "laura", ProfileID: "p-owner", ProfileName: "Laura",
-		MediaFileID: 42, RequestedMediaFileID: 42, MediaItemID: "ep-123", MediaTitle: "Pilot", MediaType: "episode",
-		SeriesTitle: "Example Show", SeasonNumber: &season, EpisodeNumber: &episode,
+		MediaFileID: 42, RequestedMediaFileID: 42, ContentID: "ep-123", MediaTitle: "Pilot", MediaType: "episode",
+		SeriesName: "Example Show", EpisodeName: "Pilot", SeasonNumber: &season, EpisodeNumber: &episode,
 		PosterURL: "https://media.example/poster-42.jpg", PlayMethod: "transcode", ReportingNode: "node-3", NodeDisplayName: "Basement",
 		FileDuration: &duration, StartedAt: fixedTime(), UpdatedAt: fixedTime().Add(time.Minute),
 		PositionSeconds: 61.5, IsPaused: false, HasPlaybackControl: true,
@@ -1245,9 +1245,8 @@ type fakeSessionService struct {
 	// 5), as for a request that came through that provider's overlay.
 	// NetworkSignIn signs laura in at installation 5 and answers installation
 	// 7 as a request from off the overlay; lastNetwork is its last input.
-	networkPeer  bool
-	lastNetwork  handlers.NetworkSignInInput
-	demoLoginErr error
+	networkPeer bool
+	lastNetwork handlers.NetworkSignInInput
 }
 
 func (f *fakeSessionService) CurrentLoginSession(context.Context, int, string) (*models.AuthSession, error) {
@@ -1329,14 +1328,6 @@ func (f *fakeSessionService) NetworkSignIn(_ context.Context, in handlers.Networ
 		User: handlers.UserView{ID: 1, Username: "laura", Email: "laura@example.test", Role: "user", PolicyPermissions: []string{"marker_edit"}, DownloadAllowed: true}}, nil
 }
 
-func (f *fakeSessionService) DemoLogin(_ context.Context, _ handlers.DemoLoginInput) (handlers.TokenPairView, error) {
-	if f.demoLoginErr != nil {
-		return handlers.TokenPairView{}, f.demoLoginErr
-	}
-	return handlers.TokenPairView{AccessToken: "demo-acc", RefreshToken: "demo-ref", ExpiresIn: 3600,
-		User: handlers.UserView{ID: 9, Username: "demo", Email: "demo@example.test", Role: "user"}}, nil
-}
-
 func (f *fakeSessionService) Refresh(_ context.Context, token string) (handlers.RefreshedTokensView, error) {
 	switch token {
 	case "ref":
@@ -1399,37 +1390,12 @@ func (f *fakeSessionService) ListSessionsPage(_ context.Context, userID int, aft
 	return page, false, nil
 }
 
-// ListSessionsPageByID and SessionLimitedToItself: the fake's caller is never
-// limited to itself; the Postgres tests cover that listing.
-func (f *fakeSessionService) ListSessionsPageByID(context.Context, int, string, int) ([]*models.AuthSession, bool, error) {
-	return nil, false, f.err
-}
-
-func (f *fakeSessionService) SessionLimitedToItself(context.Context, string) (bool, error) {
-	return false, f.err
-}
-
-func (f *fakeSessionService) RevokeSession(ctx context.Context, sessionID string, userID int) error {
-	return f.RevokeSessionChecked(ctx, sessionID, userID, nil)
-}
-
-// fakeSessionOwners are the sessions RevokeSessionChecked knows: s1 and s9
-// are account 1's (memberToken is s1), s2 is account 2's.
-var fakeSessionOwners = map[string]int{"s1": 1, "s9": 1, "s2": 2}
-
-// RevokeSessionChecked answers like the real seam: an unknown session or
-// another account's is not found, before check runs.
-func (f *fakeSessionService) RevokeSessionChecked(_ context.Context, sessionID string, userID int, check func(*models.AuthSession) error) error {
+func (f *fakeSessionService) RevokeSession(_ context.Context, sessionID string, _ int) error {
 	if f.err != nil {
 		return f.err
 	}
-	if owner, ok := fakeSessionOwners[sessionID]; !ok || owner != userID {
+	if sessionID != "s1" && sessionID != "s9" {
 		return &handlers.APIError{Status: 404, Code: "not_found", Message: "Session not found"}
-	}
-	if check != nil {
-		if err := check(&models.AuthSession{ID: sessionID, UserID: userID}); err != nil {
-			return &handlers.APIError{Status: 500, Code: "internal_error", Message: "An unexpected error occurred"}
-		}
 	}
 	f.revoked = append(f.revoked, sessionID)
 	return nil
@@ -1447,10 +1413,6 @@ func (f *fakeSessionService) SetupInitialUser(_ context.Context, in handlers.Reg
 }
 
 func (f *fakeSessionService) SignupEnabled(context.Context) (bool, error) { return f.signupOn, f.err }
-
-func (f *fakeSessionService) PasswordPolicy(context.Context) (auth.PasswordPolicy, error) {
-	return auth.DefaultPasswordPolicy(), f.err
-}
 
 func (f *fakeSessionService) Signup(_ context.Context, in handlers.RegistrationInput) (handlers.TokenPairView, error) {
 	if f.err != nil {

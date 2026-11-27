@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"strings"
 
+	"github.com/Silo-Server/silo-server/internal/httpheader"
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/go-chi/chi/v5"
 	chimw "github.com/go-chi/chi/v5/middleware"
@@ -49,7 +50,7 @@ func registerDownloadDelivery(reg *Registry) {
 			}
 			op.Parameters = append(op.Parameters, &huma.Param{Name: name, In: "path", Required: true, Schema: &huma.Schema{Type: huma.TypeString, MinLength: new(1)}})
 		}
-		op.Parameters = append(op.Parameters, &huma.Param{Name: "X-Silo-Device-Id", In: paramInHeader, Required: route.kind != downloadAssetFile, Schema: &huma.Schema{Type: huma.TypeString, MaxLength: new(128)}})
+		op.Parameters = append(op.Parameters, &huma.Param{Name: "X-Vio-Device-Id", In: "header", Required: route.kind != "file", Schema: &huma.Schema{Type: huma.TypeString, MaxLength: new(128)}})
 		headers := map[string]*huma.Param{}
 		for _, name := range []string{"Content-Length", "Content-Disposition", "Cache-Control", "Content-Range", "Accept-Ranges", "Last-Modified", "ETag", "Location"} {
 			headers[name] = &huma.Param{Schema: &huma.Schema{Type: huma.TypeString}}
@@ -114,8 +115,8 @@ func (reg *Registry) serveDownloadDelivery(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	id := chi.URLParam(r, "id")
-	device := strings.TrimSpace(r.Header.Get("X-Silo-Device-Id"))
-	if id == "" || len(device) > 128 || (kind != downloadAssetFile && device == "") {
+	device := strings.TrimSpace(httpheader.GetDeviceID(r.Header))
+	if id == "" || len(device) > 128 || (kind != "file" && device == "") {
 		writeProblem(w, r, NewProblem(TypeValidationFailed, "A download identity and valid device scope are required."))
 		return
 	}

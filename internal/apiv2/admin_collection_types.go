@@ -105,6 +105,7 @@ type AdminMDBListImport struct {
 	Description      string          `json:"description,omitempty"`
 	URL              string          `json:"url" format:"uri"`
 	Limit            *int            `json:"limit,omitempty" nullable:"false"`
+	VirtualPlayback  *bool           `json:"virtual_playback,omitempty" nullable:"false" doc:"Keep items matched outside the selected libraries as zero-storage virtual entries. Defaults to on when omitted; send false to disable."`
 	Featured         bool            `json:"featured,omitempty"`
 	SortOrder        int             `json:"sort_order,omitempty"`
 	PosterURL        string          `json:"poster_url,omitempty" format:"uri-reference"`
@@ -124,6 +125,7 @@ type AdminTMDBImport struct {
 	TimeWindow       string          `json:"time_window,omitempty"`
 	MediaType        string          `json:"media_type,omitempty"`
 	Limit            *int            `json:"limit,omitempty" nullable:"false"`
+	VirtualPlayback  *bool           `json:"virtual_playback,omitempty" nullable:"false" doc:"Keep items matched outside the selected libraries as zero-storage virtual entries. Defaults to on when omitted; send false to disable."`
 	Featured         bool            `json:"featured,omitempty"`
 	SortOrder        int             `json:"sort_order,omitempty"`
 	PosterURL        string          `json:"poster_url,omitempty" format:"uri-reference"`
@@ -151,10 +153,11 @@ type AdminTMDBListImport struct {
 }
 
 type AdminTemplateApply struct {
-	LibraryIDs     []ID                   `json:"library_ids" minItems:"1" maxItems:"1000"`
-	DryRun         bool                   `json:"dry_run,omitempty"`
-	DeleteExisting bool                   `json:"delete_existing,omitempty"`
-	Featured       *AdminTemplateFeatured `json:"featured,omitempty" nullable:"false"`
+	LibraryIDs      []ID                   `json:"library_ids" minItems:"1" maxItems:"1000"`
+	DryRun          bool                   `json:"dry_run,omitempty"`
+	DeleteExisting  bool                   `json:"delete_existing,omitempty"`
+	VirtualPlayback *bool                  `json:"virtual_playback,omitempty" nullable:"false" doc:"Keep items matched outside the selected libraries as zero-storage virtual entries. Defaults to on when omitted; send false to disable."`
+	Featured        *AdminTemplateFeatured `json:"featured,omitempty" nullable:"false"`
 }
 
 type AdminTemplateFeatured struct {
@@ -303,6 +306,7 @@ func (v AdminMDBListImport) command() (handlers.AdminCollectionImportMDBList, *P
 	c.LibraryID, c.LibraryIDs, c.Title, c.Description, c.URL = libraryID, ids, v.Title, v.Description, v.URL
 	c.SortConfig, c.Limit, c.Featured, c.SortOrder, c.PosterURL, c.SyncSchedule = v.SortConfig, v.Limit, v.Featured, v.SortOrder, v.PosterURL, v.SyncSchedule
 	c.ManagementMode, c.ManagementSource, c.ManagementKey = v.ManagementMode, v.ManagementSource, v.ManagementKey
+	c.VirtualPlayback = v.VirtualPlayback
 	return c, nil
 }
 func (v AdminTMDBImport) command() (handlers.AdminCollectionImportTMDB, *Problem) {
@@ -323,6 +327,7 @@ func (v AdminTMDBImport) command() (handlers.AdminCollectionImportTMDB, *Problem
 	c.Preset, c.TimeWindow, c.MediaType, c.Limit = v.Preset, v.TimeWindow, v.MediaType, v.Limit
 	c.SortConfig, c.Featured, c.SortOrder, c.PosterURL, c.SyncSchedule = v.SortConfig, v.Featured, v.SortOrder, v.PosterURL, v.SyncSchedule
 	c.ManagementMode, c.ManagementSource, c.ManagementKey = v.ManagementMode, v.ManagementSource, v.ManagementKey
+	c.VirtualPlayback = v.VirtualPlayback
 	return c, nil
 }
 func (v AdminTMDBListImport) command() (handlers.AdminCollectionImportTMDBList, *Problem) {
@@ -381,11 +386,12 @@ func (v AdminTemplateApply) command() (handlers.AdminCollectionTemplateApply, *P
 		}
 	}
 	data, err := json.Marshal(struct {
-		LibraryIDs     []int     `json:"library_ids" maxItems:"1000"`
-		DryRun         bool      `json:"dry_run"`
-		DeleteExisting bool      `json:"delete_existing"`
-		Featured       *featured `json:"featured,omitempty" nullable:"false"`
-	}{ids, v.DryRun, v.DeleteExisting, lowered})
+		LibraryIDs      []int     `json:"library_ids" maxItems:"1000"`
+		DryRun          bool      `json:"dry_run"`
+		DeleteExisting  bool      `json:"delete_existing"`
+		VirtualPlayback *bool     `json:"virtual_playback,omitempty" nullable:"false"`
+		Featured        *featured `json:"featured,omitempty" nullable:"false"`
+	}{ids, v.DryRun, v.DeleteExisting, v.VirtualPlayback, lowered})
 	if err != nil {
 		return c, NewProblem(TypeValidationFailed, "Invalid template application.")
 	}

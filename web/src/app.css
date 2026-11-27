@@ -1,6 +1,4 @@
 @import "tailwindcss";
-/* The lint rules' test strings are class names, not UI; scanning them ships their CSS. */
-@source not "../eslint-rules";
 /* animate-in/animate-out and their fade-/zoom-/slide- modifiers, used by the
    radix overlay primitives in components/ui. Radix keeps a closing overlay
    mounted until its exit animation ends. The enter/exit keyframes are
@@ -824,27 +822,23 @@ html[data-navigation-direction]::view-transition-new(main-content) {
   }
   html[data-text-scale="large"] {
     font-size: 112.5%;
-    --ui-text-scale-factor: 1.125;
+    --ui-text-scale-factor: 1.12;
   }
   html[data-text-scale="x-large"] {
     font-size: 125%;
-    --ui-text-scale-factor: 1.25;
+    --ui-text-scale-factor: 1.24;
   }
-  /* Bolder moves every weight up a step. Tailwind's weight utilities read its
-     --font-weight-* theme variables, so redefining them here reaches every
-     form of the class: `font-medium`, `focus:font-medium`, `md:font-semibold`,
-     `file:font-medium`. Component CSS (here, player-hud.css,
-     setup-wizard.css) sets weights through the same variables rather than
-     fixed numbers. 800 is the UI font's heaviest weight and stays put. */
   html[data-text-weight="strong"] {
     --font-weight-ui: 520;
-    --font-weight-normal: 520;
-    --font-weight-medium: 600;
-    --font-weight-semibold: 700;
-    --font-weight-bold: 800;
+    --font-weight-medium-ui: 600;
+    --font-weight-semibold-ui: 700;
+    --font-weight-bold-ui: 800;
   }
   html[data-text-weight="default"] {
     --font-weight-ui: 400;
+    --font-weight-medium-ui: 500;
+    --font-weight-semibold-ui: 600;
+    --font-weight-bold-ui: 700;
   }
   /* Every token here pushes toward --contrast-boost, never toward white
      directly. Hard-coded white raises contrast on a dark page and destroys it
@@ -913,6 +907,70 @@ html[data-navigation-direction]::view-transition-new(main-content) {
   html[data-high-contrast="true"] .border-border\/80 {
     border-color: var(--border) !important;
   }
+  html[data-text-weight="strong"] .font-normal {
+    font-weight: var(--font-weight-ui, 520) !important;
+  }
+  html[data-text-weight="strong"] .font-medium {
+    font-weight: var(--font-weight-medium-ui, 600) !important;
+  }
+  html[data-text-weight="strong"] .font-semibold {
+    font-weight: var(--font-weight-semibold-ui, 700) !important;
+  }
+  html[data-text-weight="strong"] .font-bold {
+    font-weight: var(--font-weight-bold-ui, 800) !important;
+  }
+  html[data-text-scale="large"] .text-\[8px\],
+  html[data-text-scale="x-large"] .text-\[8px\] {
+    font-size: calc(8px * var(--ui-text-scale-factor)) !important;
+  }
+  html[data-text-scale="large"] .text-\[9px\],
+  html[data-text-scale="x-large"] .text-\[9px\] {
+    font-size: calc(9px * var(--ui-text-scale-factor)) !important;
+  }
+  html[data-text-scale="large"] .text-\[10px\],
+  html[data-text-scale="x-large"] .text-\[10px\] {
+    font-size: calc(10px * var(--ui-text-scale-factor)) !important;
+  }
+  html[data-text-scale="large"] .text-\[11px\],
+  html[data-text-scale="x-large"] .text-\[11px\] {
+    font-size: calc(11px * var(--ui-text-scale-factor)) !important;
+  }
+  html[data-text-scale="large"] .text-\[12px\],
+  html[data-text-scale="x-large"] .text-\[12px\] {
+    font-size: calc(12px * var(--ui-text-scale-factor)) !important;
+  }
+  html[data-text-scale="large"] .text-\[13px\],
+  html[data-text-scale="x-large"] .text-\[13px\] {
+    font-size: calc(13px * var(--ui-text-scale-factor)) !important;
+  }
+  html[data-text-scale="large"] .text-\[14px\],
+  html[data-text-scale="x-large"] .text-\[14px\] {
+    font-size: calc(14px * var(--ui-text-scale-factor)) !important;
+  }
+  html[data-text-scale="large"] .text-\[15px\],
+  html[data-text-scale="x-large"] .text-\[15px\] {
+    font-size: calc(15px * var(--ui-text-scale-factor)) !important;
+  }
+  html[data-text-scale="large"] .text-\[17px\],
+  html[data-text-scale="x-large"] .text-\[17px\] {
+    font-size: calc(17px * var(--ui-text-scale-factor)) !important;
+  }
+  html[data-text-scale="large"] .text-\[20px\],
+  html[data-text-scale="x-large"] .text-\[20px\] {
+    font-size: calc(20px * var(--ui-text-scale-factor)) !important;
+  }
+  html[data-text-scale="large"] .text-\[28px\],
+  html[data-text-scale="x-large"] .text-\[28px\] {
+    font-size: calc(28px * var(--ui-text-scale-factor)) !important;
+  }
+  html[data-text-scale="large"] .text-\[32px\],
+  html[data-text-scale="x-large"] .text-\[32px\] {
+    font-size: calc(32px * var(--ui-text-scale-factor)) !important;
+  }
+  html[data-text-scale="large"] .text-\[38px\],
+  html[data-text-scale="x-large"] .text-\[38px\] {
+    font-size: calc(38px * var(--ui-text-scale-factor)) !important;
+  }
   /* Buttons are activatable, so they get the activatable cursor. Declared in
      `base` rather than as a utility, so an explicit `cursor-*` class — a
      disabled player control, a non-interactive tooltip target — still wins. */
@@ -941,24 +999,6 @@ html[data-navigation-direction]::view-transition-new(main-content) {
         var(--background)
       );
     min-height: 100dvh;
-  }
-  /* A browser minimum font size raises a button label's line height but not
-     rem, so Button's fixed heights stop fitting it. This floor (one line, plus
-     the borders on bordered variants) grows a text button only when its label
-     no longer fits: at normal settings it is shorter than every size. It lives
-     in the base layer so a caller's min-h-* still wins over it. The 44px touch
-     targets (TOUCH_TARGETS, the admin page header, the item detail stream
-     buttons) win too, so they fold the floor in with max(2.75rem, 1lh + 2px).
-     Icon sizes are left alone. Only Button carries both data-variant and
-     data-size; data-slot is not used because a Radix trigger rendered asChild
-     replaces it. */
-  [data-variant][data-size]:not([data-size^="icon"]) {
-    min-height: 1lh;
-  }
-  [data-variant][data-size]:is([data-variant="outline"], [data-variant="glass"]):not(
-      [data-size^="icon"]
-    ) {
-    min-height: calc(1lh + 2px);
   }
 }
 
@@ -1799,7 +1839,7 @@ html[data-navigation-direction]::view-transition-new(main-content) {
     padding: 0.25rem 0.6rem;
     border-radius: 9999px;
     font-size: 0.7rem;
-    font-weight: var(--font-weight-semibold, 600);
+    font-weight: 600;
     line-height: 1rem;
     letter-spacing: 0.04em;
     text-transform: uppercase;
@@ -1821,7 +1861,7 @@ html[data-navigation-direction]::view-transition-new(main-content) {
     padding: 0.78rem 1.4rem;
     border-radius: 9999px;
     font-size: 0.84rem;
-    font-weight: var(--font-weight-bold, 700);
+    font-weight: 700;
     letter-spacing: 0.01em;
     transition: all var(--duration-fast) var(--ease-default);
   }
@@ -1892,7 +1932,7 @@ html[data-navigation-direction]::view-transition-new(main-content) {
     padding: 0.375rem 1rem;
     border-radius: var(--radius-md);
     font-size: 0.875rem;
-    font-weight: var(--font-weight-medium, 500);
+    font-weight: 500;
     color: var(--muted-foreground);
     transition: all var(--duration-fast) var(--ease-default);
     cursor: pointer;
@@ -2006,7 +2046,7 @@ html[data-navigation-direction]::view-transition-new(main-content) {
   .hero-eyebrow {
     font-family: var(--font-body);
     font-size: 0.72rem;
-    font-weight: var(--font-weight-semibold, 600);
+    font-weight: 600;
     line-height: 1;
     letter-spacing: 0.22em;
     text-transform: uppercase;
@@ -2038,7 +2078,7 @@ html[data-navigation-direction]::view-transition-new(main-content) {
     gap: 0 0.1rem;
     font-family: var(--font-body);
     font-size: 0.82rem;
-    font-weight: var(--font-weight-medium, 500);
+    font-weight: 500;
     letter-spacing: 0.02em;
     color: color-mix(in srgb, var(--foreground) 78%, transparent);
   }
@@ -2060,7 +2100,7 @@ html[data-navigation-direction]::view-transition-new(main-content) {
     gap: 0.75rem;
     font-family: var(--font-mono);
     font-size: 0.7rem;
-    font-weight: var(--font-weight-medium, 500);
+    font-weight: 500;
     letter-spacing: 0.12em;
     color: color-mix(in srgb, #fff 68%, transparent);
     text-shadow: 0 2px 10px rgb(0 0 0 / 0.45);
@@ -2136,7 +2176,7 @@ html[data-navigation-direction]::view-transition-new(main-content) {
     padding: 0.5rem 1rem;
     border-radius: 9999px;
     font-size: 0.78rem;
-    font-weight: var(--font-weight-semibold, 600);
+    font-weight: 600;
     letter-spacing: 0.01em;
     color: color-mix(in srgb, var(--foreground) 62%, transparent);
     background: transparent;
@@ -2335,47 +2375,6 @@ html[data-navigation-direction]::view-transition-new(main-content) {
     }
   }
 
-  /* ── Insights refresh ───────────────────────────────────── */
-  /* A region of an Insights tab that still shows the previous result while a
-     new sort, search, or filter loads. The content stays opaque, so its
-     contrast never changes; a sweep along the top edge shows the load, and
-     fades in after 150 ms so a quick response never flickers. */
-  .insight-refreshing {
-    position: relative;
-  }
-  /* Its links mix the new filters with the old result's window, so they wait
-     for the new result. insightRefreshProps blocks Enter on them too. */
-  .insight-refreshing a {
-    pointer-events: none;
-  }
-  .insight-refreshing::before {
-    content: "";
-    position: absolute;
-    inset-inline: 0;
-    top: -0.625rem;
-    height: 2px;
-    border-radius: 9999px;
-    pointer-events: none;
-    background: linear-gradient(
-      90deg,
-      transparent 0%,
-      color-mix(in srgb, var(--primary) 50%, transparent) 40%,
-      var(--primary) 50%,
-      color-mix(in srgb, var(--primary) 50%, transparent) 60%,
-      transparent 100%
-    );
-    background-size: 200% 100%;
-    animation:
-      fade-in 200ms ease-out 150ms both,
-      scan-accent-sweep 1.6s linear infinite;
-  }
-  @media (prefers-reduced-motion: reduce) {
-    .insight-refreshing::before {
-      background: var(--primary);
-      animation: fade-in 200ms ease-out 150ms both;
-    }
-  }
-
   .auth-shell {
     min-height: 100dvh;
     position: relative;
@@ -2556,10 +2555,6 @@ html[data-navigation-direction]::view-transition-new(main-content) {
     .admin-shell .page-header [data-slot="button"] {
       min-height: 2.75rem;
     }
-
-    .admin-shell .page-header [data-slot="button"]:not([data-size^="icon"]) {
-      min-height: max(2.75rem, calc(1lh + 2px));
-    }
   }
 
   /* ── Section Header ──────────────────────────────────────── */
@@ -2572,7 +2567,7 @@ html[data-navigation-direction]::view-transition-new(main-content) {
     align-items: center;
     gap: 0.5rem;
     font-size: 1.25rem;
-    font-weight: var(--font-weight-semibold, 600);
+    font-weight: 600;
     color: var(--foreground);
     padding-bottom: 0.75rem;
   }
@@ -2587,7 +2582,7 @@ html[data-navigation-direction]::view-transition-new(main-content) {
     padding: 2px 8px;
     border-radius: 6px;
     font-size: 0.625rem;
-    font-weight: var(--font-weight-bold, 700);
+    font-weight: 700;
     background: rgba(255, 60, 60, 0.12);
     color: #fca5a5;
     border: 1px solid rgba(255, 60, 60, 0.2);
@@ -2687,20 +2682,6 @@ html[data-navigation-direction]::view-transition-new(main-content) {
     :root[data-admin-shell] {
       --app-sidebar-offset: 240px;
     }
-  }
-
-  /* Admin pages scroll the document, so moving between a short page and a
-     long one (Insights tabs, for one) added or dropped the scrollbar and
-     shifted the whole layout sideways. Reserve its space while the admin
-     shell is mounted. Radix's scroll lock measures the scrollbar as the
-     window width minus the document width, which the reserved gutter now
-     always is, and would add that much body margin when a dialog or sheet
-     opens; the gutter already holds the page in place, so drop the margin. */
-  :root[data-admin-shell] {
-    scrollbar-gutter: stable;
-  }
-  :root[data-admin-shell] body[data-scroll-locked] {
-    margin-right: 0 !important;
   }
 
   .impersonation-banner {

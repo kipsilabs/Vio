@@ -17,7 +17,6 @@ import { joinList } from "@/lib/appLocale";
 import { formatFileSize } from "@/lib/mediaFormat";
 import { RelatedRail } from "@/pages/audiobooks/components/RelatedRail";
 import { isReaderSupportedFile, readerFileFormat } from "@/reader/FoliateBookReader";
-import { buildFieldFilterHref } from "@/pages/catalogSearchParams";
 import DetailOverview from "./components/DetailOverview";
 import { hasMachineTranslation } from "./components/machineTranslation";
 import MetadataBadges from "./components/MetadataBadges";
@@ -80,8 +79,15 @@ function clampInProgressPercent(ratio: number): number {
 }
 
 function libraryFilterHref(field: "genre" | "series", value: string, libraryId: number): string {
-  if (field === "series") return buildFieldFilterHref("series", value, { libraryId });
-  const params = new URLSearchParams({ tab: "library", genre: value });
+  const params = new URLSearchParams();
+  params.set("tab", "library");
+  if (field === "genre") {
+    params.set("genre", value);
+  } else {
+    params.set("groups[0][rules][0][field]", "series");
+    params.set("groups[0][rules][0][op]", "is");
+    params.set("groups[0][rules][0][value]", value);
+  }
   return `/library/${libraryId}?${params.toString()}`;
 }
 
@@ -123,10 +129,12 @@ export default function EbookContent({
   item,
   libraryId,
   showAdvisoryAge,
+  onStaleVersion,
 }: {
   item: ItemDetail & { type: "ebook" };
   libraryId?: number;
   showAdvisoryAge?: boolean;
+  onStaleVersion?: (fileId: number) => void;
 }) {
   const t = useT();
   useAmbientColor(item.poster_thumbhash);
@@ -437,6 +445,9 @@ export default function EbookContent({
         versions={item.versions}
         title={item.title}
         summaryBuilder={ebookVersionSummary}
+        selectedFileId={readVersion?.file_id}
+        onStaleVersion={onStaleVersion}
+        createTarget={{ contentId: item.content_id }}
       />
     </div>
   );

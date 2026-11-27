@@ -2,16 +2,21 @@ package tasks
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	"github.com/Silo-Server/silo-server/internal/taskmanager"
 )
 
 type SyncUserCollectionsTask struct {
-	scheduler CollectionSyncRunner
+	scheduler interface {
+		RunOnce(ctx context.Context) (json.RawMessage, error)
+	}
 }
 
-func NewSyncUserCollectionsTask(scheduler CollectionSyncRunner) *SyncUserCollectionsTask {
+func NewSyncUserCollectionsTask(scheduler interface {
+	RunOnce(ctx context.Context) (json.RawMessage, error)
+}) *SyncUserCollectionsTask {
 	return &SyncUserCollectionsTask{scheduler: scheduler}
 }
 

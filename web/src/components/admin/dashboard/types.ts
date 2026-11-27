@@ -30,13 +30,7 @@ export type WidgetId =
   | "scan-activity"
   | "recent-errors"
   | "recent-activity"
-  | "api-clients"
-  | "insights-plays"
-  | "insights-viewing-hours"
-  | "insights-weekday"
-  | "insights-hour-of-day"
-  | "insights-active-people"
-  | "insights-library-coverage";
+  | "api-clients";
 
 /**
  * The window a metric widget covers.
@@ -44,11 +38,8 @@ export type WidgetId =
  * Named by period rather than by number so one stored value can mean 1 hour on
  * a sampled chart and 1 day on a leaderboard — the endpoints take different
  * units, and the admin is choosing "how far back", not "how many hours".
- *
- * `quarter`, `year` and `all` reach past the sampler's 31-day retention, so
- * only widgets backed by the Insights reads offer them.
  */
-export type WidgetRange = "hour" | "day" | "week" | "month" | "quarter" | "year" | "all";
+export type WidgetRange = "hour" | "day" | "week" | "month";
 
 /** The ranges a widget offers, and the one it starts on. */
 export interface WidgetRangeOptions {

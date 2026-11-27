@@ -20,15 +20,12 @@ import { useRestartKeys } from "@/hooks/useRestartKeys";
 import { useSettingsForm } from "@/hooks/useSettingsForm";
 import {
   activeSignInInstallation,
-  authCapabilityOf,
-  authProviderLabel,
   breakGlassRequiredText,
   primarySignInInstallations,
 } from "@/lib/externalSignInAdmin";
 import { SaveBar } from "@/components/SaveBar";
 
 import { FieldGroup } from "./FieldGroup";
-import { LocalPasswordOffDialog, type LocalPasswordOffContext } from "./LocalPasswordOffDialog";
 import { SettingField, SettingFieldStatus } from "./SettingField";
 import { NetworkSignInSection } from "./NetworkSignInSection";
 import { SignInProviderSlot } from "./SignInProviderSlot";
@@ -40,11 +37,6 @@ export const USER_API_KEYS_KEY = "auth.user_api_keys";
 // Both only work for Silo-password accounts: the server refuses a signup while
 // password sign-in is off, and a reset needs a local password to replace.
 const PASSWORD_ACCOUNT_KEYS = ["signup.enabled", "password_reset.self_service_enabled"];
-// What a new Silo password must contain (auth.PasswordPolicy on the server).
-const PASSWORD_MIN_LENGTH_KEY = "auth.password_min_length";
-const PASSWORD_UPPERCASE_KEY = "auth.password_require_uppercase";
-const PASSWORD_SPECIAL_KEY = "auth.password_require_special";
-const PASSWORD_RULE_KEYS = [PASSWORD_MIN_LENGTH_KEY, PASSWORD_UPPERCASE_KEY, PASSWORD_SPECIAL_KEY];
 // Hidden tier: still saved and readable through the settings API, deliberately
 // without a control here because the defaults suit every deployment we
 // support — auth.access_token_expiry, auth.refresh_token_expiry,
@@ -53,7 +45,6 @@ const PASSWORD_RULE_KEYS = [PASSWORD_MIN_LENGTH_KEY, PASSWORD_UPPERCASE_KEY, PAS
 const KEYS = [
   LOCAL_LOGIN_KEY,
   ...PASSWORD_ACCOUNT_KEYS,
-  ...PASSWORD_RULE_KEYS,
   EMAIL_MATCH_KEY,
   USER_API_KEYS_KEY,
   "server.public_url",
@@ -72,9 +63,6 @@ const KEYS = [
 const LOCAL_LOGIN_PATH = "/login?local=1";
 const LOCAL_LOGIN_COMMAND = "silo auth local-login enable";
 
-/** What turning passwords off was confirmed with, and for which provider. */
-type ConfirmedOff = LocalPasswordOffContext & { providerId: number | null };
-
 export default function SignInSettings() {
   const t = useT();
   const form = useSettingsForm({ keys: useMemo(() => KEYS, []) });
@@ -88,13 +76,6 @@ export default function SignInSettings() {
   const [localError, setLocalError] = useState<string | null>(null);
   const localErrorRef = useRef<HTMLParagraphElement>(null);
   const [providerFeedback, setProviderFeedback] = useState<Feedback>(null);
-  const [confirmLocalOff, setConfirmLocalOff] = useState(false);
-  // What the owner confirmed turning passwords off with. A save that would
-  // write other values (email matching, account creation, the provider)
-  // asks again first, then carries on.
-  const confirmedOff = useRef<ConfirmedOff | null>(null);
-  const saveAfterConfirm = useRef(false);
-  const localLoginFieldRef = useRef<HTMLDivElement>(null);
   const providerFeedbackRef = useRef<HTMLParagraphElement>(null);
 
   const breakGlass = useMemo(
@@ -106,40 +87,16 @@ export default function SignInSettings() {
   );
   const breakGlassKnown = users.data !== undefined;
   // With passwords off, the provider that is on is how everyone else signs in.
-  const activeProvider = useMemo(
-    () => activeSignInInstallation(installations.data),
-    [installations.data],
-  );
-  const providerOn = activeProvider?.enabled === true;
+  const providerOn = useMemo(() => {
+    const active = activeSignInInstallation(installations.data);
+    return active?.enabled === true;
+  }, [installations.data]);
   const providerKnown = installations.data !== undefined;
   // Email matching only acts on accounts OIDC or LDAP signs in (a network
   // sign-in never matches by email). Without one installed it is noise, but it
   // stays while the installations are unknown or while it is on, saved or
   // staged, so nothing set is ever out of reach.
   const primaryInstalled = primarySignInInstallations(installations.data).length > 0;
-
-  // What turning passwords off would be saved with: staged values win.
-  function localOffContext(): LocalPasswordOffContext {
-    return {
-      provider: activeProvider ? authProviderLabel(activeProvider) : "",
-      autoProvision: activeProvider ? drafts.autoProvisionOf(activeProvider) : false,
-      emailMatch: form.getValue(EMAIL_MATCH_KEY) === "true",
-    };
-  }
-
-  function confirmedNow(): ConfirmedOff {
-    return { ...localOffContext(), providerId: activeProvider?.id ?? null };
-  }
-
-  function sameAsConfirmed(now: ConfirmedOff) {
-    const then = confirmedOff.current;
-    return (
-      then !== null &&
-      then.providerId === now.providerId &&
-      then.autoProvision === now.autoProvision &&
-      then.emailMatch === now.emailMatch
-    );
-  }
 
   function showLocalError(text: string) {
     setLocalError(text);
@@ -155,39 +112,13 @@ export default function SignInSettings() {
       showLocalError(t("web.admin.settings.signIn.page.noProviderError"));
       return;
     }
-    // An OpenID Connect provider signs nobody in without the public URL.
-    if (
-      value === "false" &&
-      activeProvider &&
-      authCapabilityOf(activeProvider)?.sign_in_mode === "oauth" &&
-      form.getPersistedValue("server.public_url").trim() === ""
-    ) {
-      showLocalError(
-        t("web.admin.settings.signIn.page.noPublicUrlError", {
-          name: authProviderLabel(activeProvider),
-        }),
-      );
-      return;
-    }
     setLocalError(null);
-    // Turning passwords off first shows who loses their way in; turning
-    // them back on needs no confirmation.
-    if (value === "false") {
-      setConfirmLocalOff(true);
-      return;
-    }
     form.setValue(LOCAL_LOGIN_KEY, value);
   }
 
   async function handleSave() {
     setLocalError(null);
     setProviderFeedback(null);
-    const turningOff = form.isDirty(LOCAL_LOGIN_KEY) && form.getValue(LOCAL_LOGIN_KEY) === "false";
-    if (turningOff && !sameAsConfirmed(confirmedNow())) {
-      saveAfterConfirm.current = true;
-      setConfirmLocalOff(true);
-      return;
-    }
     // The provider first: turning password sign-in off may rely on it.
     const provider = await drafts.save();
     if (!provider.ok) {
@@ -201,9 +132,6 @@ export default function SignInSettings() {
     } catch (error) {
       if (error instanceof V2ProblemError && error.problemType === "break_glass_required") {
         showLocalError(breakGlassRequiredText());
-      }
-      if (error instanceof V2ProblemError && error.problemType === "sign_in_provider_required") {
-        showLocalError(error.message);
       }
       // Every other failure is already reported by the save's own toast.
     }
@@ -248,9 +176,7 @@ export default function SignInSettings() {
 
         <FieldGroup
           label={t("web.admin.settings.signIn.page.passwordsGroup")}
-          dirty={[LOCAL_LOGIN_KEY, ...PASSWORD_ACCOUNT_KEYS, ...PASSWORD_RULE_KEYS].some((key) =>
-            form.isDirty(key),
-          )}
+          dirty={[LOCAL_LOGIN_KEY, ...PASSWORD_ACCOUNT_KEYS].some((key) => form.isDirty(key))}
           actions={
             <Link
               to="/admin/users?tab=invite-codes"
@@ -261,58 +187,35 @@ export default function SignInSettings() {
             </Link>
           }
         >
-          {/* Holds the switch focus returns to when the confirmation closes. */}
-          <div ref={localLoginFieldRef} className="contents">
-            <SettingField
-              label={t("web.admin.settings.signIn.page.allowPasswordLabel")}
-              dirty={form.isDirty(LOCAL_LOGIN_KEY)}
-              type="toggle"
-              description={t("web.admin.settings.signIn.page.allowPasswordDescription")}
-              value={localLoginOn ? "true" : "false"}
-              onChange={changeLocalLogin}
-              status={
-                !breakGlassKnown ? null : breakGlass.length > 0 ? (
-                  <SettingFieldStatus tone="muted">
-                    {t("web.admin.settings.signIn.page.breakGlassAdmins", {
-                      count: breakGlass.length,
-                      names: joinList(breakGlass.map((user) => user.username)),
+          <SettingField
+            label={t("web.admin.settings.signIn.page.allowPasswordLabel")}
+            dirty={form.isDirty(LOCAL_LOGIN_KEY)}
+            type="toggle"
+            description={t("web.admin.settings.signIn.page.allowPasswordDescription")}
+            value={localLoginOn ? "true" : "false"}
+            onChange={changeLocalLogin}
+            status={
+              !breakGlassKnown ? null : breakGlass.length > 0 ? (
+                <SettingFieldStatus tone="muted">
+                  {t("web.admin.settings.signIn.page.breakGlassAdmins", {
+                    count: breakGlass.length,
+                    names: joinList(breakGlass.map((user) => user.username)),
+                  })}
+                </SettingFieldStatus>
+              ) : (
+                <SettingFieldStatus tone="warn">
+                  <span>
+                    {t("web.admin.settings.signIn.page.noBreakGlassStatus", {
+                      link: (chunks) => (
+                        <Link to="/admin/users" className="underline underline-offset-4">
+                          {chunks}
+                        </Link>
+                      ),
                     })}
-                  </SettingFieldStatus>
-                ) : (
-                  <SettingFieldStatus tone="warn">
-                    <span>
-                      {t("web.admin.settings.signIn.page.noBreakGlassStatus", {
-                        link: (chunks) => (
-                          <Link to="/admin/users" className="underline underline-offset-4">
-                            {chunks}
-                          </Link>
-                        ),
-                      })}
-                    </span>
-                  </SettingFieldStatus>
-                )
-              }
-            />
-          </div>
-          <LocalPasswordOffDialog
-            open={confirmLocalOff}
-            onOpenChange={(open) => {
-              setConfirmLocalOff(open);
-              if (!open) saveAfterConfirm.current = false;
-            }}
-            onConfirm={() => {
-              const save = saveAfterConfirm.current;
-              confirmedOff.current = confirmedNow();
-              saveAfterConfirm.current = false;
-              setConfirmLocalOff(false);
-              form.setValue(LOCAL_LOGIN_KEY, "false");
-              if (save) void handleSave();
-            }}
-            onCloseAutoFocus={(event) => {
-              event.preventDefault();
-              localLoginFieldRef.current?.querySelector<HTMLElement>('[role="switch"]')?.focus();
-            }}
-            {...localOffContext()}
+                  </span>
+                </SettingFieldStatus>
+              )
+            }
           />
           {localError ? (
             <p
@@ -342,29 +245,6 @@ export default function SignInSettings() {
             value={form.getValue("password_reset.self_service_enabled")}
             onChange={(v) => form.setValue("password_reset.self_service_enabled", v)}
             restartRequired={restartKeys.has("password_reset.self_service_enabled")}
-          />
-          <SettingField
-            label={t("web.admin.settings.signIn.page.passwordMinLengthLabel")}
-            dirty={form.isDirty(PASSWORD_MIN_LENGTH_KEY)}
-            type="number"
-            description={t("web.admin.settings.signIn.page.passwordMinLengthDescription")}
-            value={form.getValue(PASSWORD_MIN_LENGTH_KEY)}
-            onChange={(v) => form.setValue(PASSWORD_MIN_LENGTH_KEY, v)}
-          />
-          <SettingField
-            label={t("web.admin.settings.signIn.page.passwordRequireUppercaseLabel")}
-            dirty={form.isDirty(PASSWORD_UPPERCASE_KEY)}
-            type="toggle"
-            value={form.getValue(PASSWORD_UPPERCASE_KEY) === "true" ? "true" : "false"}
-            onChange={(v) => form.setValue(PASSWORD_UPPERCASE_KEY, v)}
-          />
-          <SettingField
-            label={t("web.admin.settings.signIn.page.passwordRequireSpecialLabel")}
-            dirty={form.isDirty(PASSWORD_SPECIAL_KEY)}
-            type="toggle"
-            description={t("web.admin.settings.signIn.page.passwordRequireSpecialDescription")}
-            value={form.getValue(PASSWORD_SPECIAL_KEY) === "true" ? "true" : "false"}
-            onChange={(v) => form.setValue(PASSWORD_SPECIAL_KEY, v)}
           />
           <AdvancedSection
             id="sign-in.locked-out"

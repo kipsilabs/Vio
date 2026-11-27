@@ -33,7 +33,7 @@ import { cn } from "@/lib/utils";
  * card chrome below it.
  */
 
-/** Controls at least 44px tall below `lg`, where the layout is sized for touch. */
+/** Controls at least 44px tall below `lg`, where every section shows cards. */
 export const TOUCH_CONTROL_CLASS = "max-lg:h-11!";
 
 /** A full-width labeled action at the bottom of a card. */
@@ -162,9 +162,7 @@ export function SortableHead<K extends string>({
 
 /**
  * The card layout's stand-in for sortable table headers: a field picker and a
- * direction toggle bound to the same `useSort` state as the headers. 44px below
- * `lg` like the other controls, so it lines up with them where the cards show
- * from `lg` to `xl`.
+ * direction toggle bound to the same `useSort` state as the headers.
  */
 export function SortControl<K extends string>({
   options,
@@ -190,7 +188,7 @@ export function SortControl<K extends string>({
           if (option) onFieldChange(option.value);
         }}
       >
-        <SelectTrigger className={cn("min-w-0 flex-1 text-sm", TOUCH_CONTROL_CLASS)}>
+        <SelectTrigger className="h-11! min-w-0 flex-1 text-sm">
           <span className="text-muted-foreground shrink-0">{t("web.catalog.sort.sortBy")}</span>
           <SelectValue />
         </SelectTrigger>
@@ -205,7 +203,7 @@ export function SortControl<K extends string>({
       <Button
         type="button"
         variant="outline"
-        className="shrink-0 max-lg:h-11"
+        className="h-11 shrink-0"
         onClick={() => onDirChange(ascending ? "desc" : "asc")}
       >
         {ascending ? <ArrowUp aria-hidden="true" /> : <ArrowDown aria-hidden="true" />}

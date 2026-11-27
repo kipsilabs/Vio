@@ -7,6 +7,7 @@ import {
 import type {
   LoadRequestIntegrationOptionsRequest,
   MediaRequest,
+  RequestListParams,
   RequestIntegration,
   RequestMediaType,
   RequestSettings,
@@ -354,6 +355,62 @@ export interface AdminRequestQueuePage {
   items: MediaRequest[];
   /** Where the next page starts; absent on the last page. */
   nextCursor?: string;
+}
+
+/** Compatibility list for Vio's status/outcome-filtered admin queue.
+ * Fans out over the queue views that can hold a match, then filters by the
+ * requested status/outcome client-side (the queue endpoint only takes a
+ * view). Preserves the pre-#1632 `listAdminMediaRequestsV2` contract. */
+export async function listAdminMediaRequestsV2(
+  params: RequestListParams = {},
+): Promise<MediaRequest[]> {
+  const status = params.status && params.status !== "all" ? params.status : undefined;
+  const outcome = params.outcome && params.outcome !== "all" ? params.outcome : undefined;
+  const views: AdminRequestQueueView[] =
+    outcome === "failed"
+      ? ["failed"]
+      : outcome === "declined" || outcome === "cancelled"
+        ? ["done"]
+        : status === "pending"
+          ? ["needs_approval"]
+          : status === "approved" || status === "queued" || status === "downloading"
+            ? ["in_progress"]
+            : status === "completed"
+              ? ["done"]
+              : ["needs_approval", "in_progress", "failed", "done"];
+  const wanted = Math.min(100, Math.max(1, params.limit ?? 50));
+  const out: MediaRequest[] = [];
+  const seen = new Set<string>();
+  for (const view of views) {
+    // Collect up to wanted matches per view (not just until the global
+    // total fills): the pre-#1632 contract returns global newest-first,
+    // which needs every view's head before the final sort below.
+    let collected = 0;
+    let cursor: string | undefined;
+    const seenCursors = new Set<string>();
+    while (collected < wanted) {
+      const page = await listAdminRequestQueuePageV2(
+        { view },
+        { limit: Math.min(50, wanted - collected), cursor },
+      );
+      for (const item of page.items) {
+        if (collected >= wanted) break;
+        if (status !== undefined && item.status !== status) continue;
+        if (outcome !== undefined && item.outcome !== outcome) continue;
+        if (seen.has(item.id)) continue;
+        seen.add(item.id);
+        out.push(item);
+        collected += 1;
+      }
+      if (!page.nextCursor) break;
+      if (seenCursors.has(page.nextCursor))
+        throw new Error("Incomplete request page. Reload to try again.");
+      seenCursors.add(page.nextCursor);
+      cursor = page.nextCursor;
+    }
+  }
+  out.sort((a, b) => (b.created_at > a.created_at ? 1 : b.created_at < a.created_at ? -1 : 0));
+  return out.slice(0, wanted);
 }
 
 /** One page of the admin queue, newest request first. */

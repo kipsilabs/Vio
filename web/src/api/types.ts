@@ -368,7 +368,7 @@ export interface WebhookSyncProfileMapping {
   connection_id?: string;
   external_user_id: string;
   external_user_name: string;
-  silo_profile_id?: string | null;
+  vio_profile_id?: string | null;
   last_seen_at?: string;
   created_at?: string;
   updated_at?: string;
@@ -418,7 +418,7 @@ export interface UpdateWebhookSyncProfileMappingsRequest {
   mappings: Array<{
     external_user_id: string;
     external_user_name: string;
-    silo_profile_id: string | null;
+    vio_profile_id: string | null;
   }>;
 }
 
@@ -480,7 +480,7 @@ export interface ScanRun {
   mode: "library" | "subtree" | "file";
   path?: string;
   trigger: string;
-  status: "accepted" | "running" | "completed" | "failed" | "cancelled";
+  status: AutoscanScanStatus;
   started_at?: string;
   completed_at?: string;
   error_message?: string;
@@ -493,7 +493,6 @@ export interface CreateHistoryImportRunRequest {
   connect_session_id?: string;
   server_id?: string;
   source_id?: number;
-  emby_base_url?: string;
   username?: string;
   password?: string;
   jellyfin_base_url?: string;
@@ -541,8 +540,8 @@ export interface HistoryImportUserMapping {
   source_id: number;
   external_user_id: string;
   external_user_name: string;
-  silo_user_id: number;
-  silo_profile_id: string;
+  vio_user_id: number;
+  vio_profile_id: string;
   silo_username?: string;
   silo_profile_name?: string;
   last_imported_at?: string;
@@ -554,13 +553,13 @@ export interface CreateHistoryImportMappingRequest {
   source_id: number;
   external_user_id: string;
   external_user_name: string;
-  silo_user_id: number;
-  silo_profile_id: string;
+  vio_user_id: number;
+  vio_profile_id: string;
 }
 
 export interface UpdateHistoryImportMappingRequest {
-  silo_user_id?: number;
-  silo_profile_id?: string;
+  vio_user_id?: number;
+  vio_profile_id?: string;
 }
 
 export interface AdminHistoryImportBulkRunResult {
@@ -881,10 +880,6 @@ export interface BrowseItem {
   advisory_source?: string;
   status: "pending" | "matched" | "unmatched" | "ambiguous";
   show_status?: string;
-  /** "air_date" when the series labels episodes by date; see formatEpisodeLabel. */
-  episode_labels?: string;
-  /** An episode card's air date, sent when episode_labels is air_date. */
-  air_date?: string | null;
   rating_imdb: number | null;
   rating_tmdb?: number | null;
   rating_rt_critic?: number | null;
@@ -982,6 +977,45 @@ export interface AudiobookGroup {
 }
 
 // Item Detail
+/**
+ * The ranking the server applied to a virtual item's version order. The v2
+ * watch payload carries it on the watch detail (and on each playback variant),
+ * not on individual file versions.
+ */
+export interface VirtualRanking {
+  /** The quality-profile label that produced the order; absent for the built-in default. */
+  profile_label?: string;
+  /** "profile" when a configured profile drove the order, "default" otherwise. */
+  source?: "profile" | "default";
+  /** Ordered ranking keys, top-down. */
+  criteria?: { attribute: string; direction: "asc" | "desc" }[];
+}
+
+/**
+ * A recent playback probe's byte verdict for a virtual version: the bytes the
+ * provider actually served versus the size the catalog row declares. The
+ * server reports it only while its short wrong-source marker lives.
+ */
+export interface VersionSourceMismatch {
+  served_bytes: number;
+  declared_bytes: number;
+}
+
+/**
+ * Whether this client can play a version, as the server's planner decided with
+ * the client's own capability block. `playable: false` is a terminal the start
+ * would repeat, so a picker must not offer the row; an absent verdict means
+ * unknown and keeps the row selectable.
+ */
+export interface VersionPlayability {
+  playable: boolean;
+  /** The start path's terminal reason when playable is false, for example
+   *  `hdr_transcode_unsupported`. */
+  reason?: string;
+  /** The start path's user-facing terminal message when playable is false. */
+  message?: string;
+}
+
 export interface FileVersion {
   file_id: number;
   file_name?: string;
@@ -994,9 +1028,36 @@ export interface FileVersion {
   file_size: number;
   duration: number;
   bitrate: number;
+  /** Custom-format score the server's virtual ranking assigned this candidate.
+   *  Absent for local files and elsewhere unscored rows. */
+  format_score?: number;
+  /** Names of the enabled, non-rejecting custom formats the ranking matched
+   *  on this candidate, best score first. Absent when the row is unscored. */
+  matched_formats?: string[];
+  /** Liveness for virtual versions. Absent means available/unknown; false
+   *  means the version is currently unavailable (e.g. the provider no longer
+   *  serves it). Populated by the catalog versions/check endpoint. */
+  available?: boolean;
+  /** True when the server confirmed this row dead (durable failed verdict):
+   *  menus remove the row instead of offering it. Absent means not failed;
+   *  an unavailable row without this flag may recover and stays listed. */
+  failed?: boolean;
+  /** A recent probe rejected the provider's bytes as a different release than
+   *  this row declares. Transient and advisory: the release is not dead, so
+   *  this never accompanies `failed`. Populated by versions/check while the
+   *  server still holds the short wrong-source verdict. */
+  source_mismatch?: VersionSourceMismatch;
+  /** Whether this client can play the version. Absent means unknown (not
+   *  checked, or the pass could not finish), never unplayable. Populated by
+   *  versions/check when the request carries a client capability block. */
+  playability?: VersionPlayability;
+  /** RFC 3339 instant in UTC when the file was probed. */
+  probed_at?: string;
   added_at?: string;
   edition_raw?: string;
   edition_key?: string;
+  release_name?: string;
+  release_group?: string;
   presentation_kind?: string;
   presentation_group_key?: string;
   presentation_part_index?: number;
@@ -1018,6 +1079,58 @@ export interface FileVersion {
   trickplay_available?: boolean;
 }
 
+/**
+ * Whether an indexer release has been requested on the provider yet.
+ *
+ * `not_downloaded` means it exists on the indexers but not on the provider.
+ * `queued` means a request was accepted and the provider is fetching it.
+ * `failed` means the last request did not succeed and may be retried.
+ */
+export type IndexerReleaseDownloadState = "not_downloaded" | "queued" | "failed";
+
+/**
+ * One release that exists on the indexers but is not downloaded on the
+ * provider. Carried additively on the watch detail below the playable
+ * versions; absent or empty means there is nothing to request.
+ */
+export interface WatchIndexerRelease {
+  release_id: string;
+  title: string;
+  resolution?: string;
+  codec_video?: string;
+  codec_audio?: string;
+  hdr?: boolean;
+  size_bytes?: number;
+  indexer?: string;
+  /** RFC 3339 instant the indexer published the release. */
+  published_at?: string;
+  format_score?: number;
+  protocol?: string;
+  download_state: IndexerReleaseDownloadState;
+}
+
+// Batched liveness check for virtual versions (POST /api/v2/catalog/versions/check).
+export interface VersionLivenessResult {
+  file_id: number;
+  available: boolean;
+  /** True when the row carries a durable failed verdict (confirmed
+   * unservable), as opposed to a merely unavailable row that may recover.
+   * Menus remove failed rows instead of offering them. Absent means not
+   * failed. */
+  failed?: boolean;
+  /** A recent probe rejected the provider's bytes as a different release than
+   *  the row declares. Advisory only: it never implies failed, and the release
+   *  stays available. Absent while no recent verdict is held. */
+  source_mismatch?: VersionSourceMismatch;
+  /** Client-specific playability from the check. Absent when the request sent
+   *  no client capability block or the pass could not finish. */
+  playability?: VersionPlayability;
+}
+
+export interface VersionLivenessResponse {
+  results: VersionLivenessResult[];
+}
+
 export interface PlaybackVariantPart {
   part_index: number;
   default_file_id?: number;
@@ -1035,6 +1148,8 @@ export interface PlaybackVariant {
   total_duration?: number;
   default_file_id?: number;
   parts: PlaybackVariantPart[];
+  /** The ranking that produced this variant's version order; absent for local content. */
+  virtual_ranking?: VirtualRanking;
 }
 
 export interface VersionChapter {
@@ -1078,6 +1193,7 @@ export interface VersionAudioTrack {
   title?: string;
   embedded_title?: string;
   language?: string;
+  languages?: string[];
   codec?: string;
   profile?: string;
   layout?: string;
@@ -1217,6 +1333,19 @@ export interface ItemVideo {
   is_official: boolean;
 }
 
+/**
+ * One collection a title page lists under its Collections row: the visible
+ * collections this item belongs to, as the v2 item detail reports them.
+ */
+export interface ItemCollection {
+  id: string;
+  title: string;
+  /** Presigned, short-lived; empty when the collection has no poster. */
+  poster_url: string;
+  poster_thumbhash?: string;
+  item_count: number;
+}
+
 /** Local extras file attached to an item; content_id is a watchable target. */
 export interface ItemExtra {
   content_id: string;
@@ -1242,6 +1371,8 @@ export interface ItemDetail {
     items: { id: string; title: string; duration_seconds: number; container: string }[];
   };
   content_id: string;
+  /** The item has a virtual source even when discovery has not produced a playable version. */
+  has_virtual_source?: boolean;
   play_content_id?: string;
   /** The season of `play_content_id` when it is an episode. */
   play_season_number?: number;
@@ -1297,8 +1428,6 @@ export interface ItemDetail {
   first_air_date: string | null;
   // Publication/airing status ("Ongoing", "Completed", "Continuing", "Ended").
   show_status?: string;
-  /** "air_date" when the series (or the series of this season or episode) labels episodes by date. */
-  episode_labels?: string;
   last_air_date: string | null;
   air_time?: string | null;
   air_timezone?: string | null;
@@ -1322,6 +1451,13 @@ export interface ItemDetail {
   episode_number?: number | null;
   episode_count?: number | null;
   air_date?: string | null;
+  /**
+   * Episode release timing derived from air_date: "upcoming" when the
+   * calendar date is after today (UTC), "released" otherwise. Absent when
+   * the air date is unknown or the item is not an episode. Read
+   * `GET /api/v2/capabilities/episode-release` before branching on it.
+   */
+  release_state?: "upcoming" | "released";
   is_specials?: boolean;
   user_data?: ItemUserData;
   user_state?: MediaItemUserState;
@@ -1355,20 +1491,26 @@ export interface ItemDetail {
   audiobook?: AudiobookDetailExtension;
   ebook?: EbookDetailExtension;
   manga?: MangaDetailExtension;
+  /**
+   * The visible collections this title belongs to. Present on every v2 item
+   * detail as an empty array when the item is in none; optional here so
+   * hand-built fixtures that predate the field still typecheck.
+   */
+  collections?: ItemCollection[];
 }
 
 export interface WatchDetail {
   content_id: string;
-  /** "air_date" when the episode's series labels episodes by date. */
-  episode_labels?: string;
-  /** The episode's air date, sent when episode_labels is air_date. */
-  air_date?: string | null;
   type: string;
   title: string;
   year?: number;
   overview: string;
   versions: FileVersion[];
   playback_variants?: PlaybackVariant[];
+  /** The ranking that produced the virtual versions' order; absent for local content. */
+  virtual_ranking?: VirtualRanking;
+  /** Indexer releases not yet downloaded on the provider; absent or empty, never null. */
+  indexer_releases?: WatchIndexerRelease[];
   subtitles: SubtitleInfo[];
   intro: TimeRange | null;
   credits: TimeRange | null;
@@ -1423,6 +1565,13 @@ export interface EpisodeListItem {
   title: string;
   overview: string;
   air_date: string | null;
+  /**
+   * Release timing derived from air_date: "upcoming" when the calendar date
+   * is after today (UTC), "released" otherwise; absent when the air date is
+   * unknown. Read `GET /api/v2/capabilities/episode-release` before
+   * branching on this field.
+   */
+  release_state?: "upcoming" | "released";
   runtime: number;
   imdb_id?: string;
   tmdb_id?: string;
@@ -1808,6 +1957,7 @@ export interface ImportMDBListCollectionRequest {
   description?: string;
   url: string;
   limit?: number;
+  virtual_playback?: boolean;
   featured?: boolean;
   poster_url?: string;
   poster_source_url?: string;
@@ -1848,6 +1998,7 @@ export interface ImportTMDBCollectionRequest {
   time_window?: "day" | "week";
   media_type: "movie" | "tv" | "all";
   limit?: number;
+  virtual_playback?: boolean;
   featured?: boolean;
   poster_url?: string;
   poster_source_url?: string;
@@ -2041,6 +2192,8 @@ export interface RequestMediaDetail {
   director?: string;
   creators?: string[];
   recommendations?: RequestMediaResult[];
+  /** Series: the metadata provider that supplied the season list. */
+  season_source?: "tvdb" | "tmdb";
   /** Series: the regular seasons with library availability and request coverage. */
   seasons?: RequestMediaSeason[];
   availability: RequestAvailability;
@@ -2054,11 +2207,13 @@ export interface RequestMediaDetail {
 export interface RequestMediaSeason {
   season_number: number;
   name?: string;
-  /** YYYY-MM-DD; absent until TMDB dates the season. */
+  /** YYYY-MM-DD; absent until the series metadata provider dates the season. */
   air_date?: string;
-  /** Episodes TMDB lists for the season, aired or not. */
+  /** Episodes the series metadata provider lists for the season, aired or not. */
   episode_count: number;
   poster_path?: string;
+  /** Absolute artwork URL when the provider supplies one instead of a TMDB path. */
+  poster_url?: string;
   /** Whether every aired episode is in the library. */
   availability: "missing" | "partial" | "available";
   /** The title's active request covers this season. */
@@ -2147,6 +2302,8 @@ export interface CreateMediaRequestInput {
   overview?: string;
   poster_path?: string;
   backdrop_path?: string;
+  /** Series only: the season numbering source to use. Omitted: the server prefers TVDB. */
+  season_source?: "tvdb" | "tmdb";
   /** Series only: the seasons to request. Omitted: every aired season not yet in the library. */
   seasons?: number[];
 }
@@ -2529,7 +2686,7 @@ export interface AutoscanEventScanRun {
   mode: "library" | "subtree" | "file";
   path?: string;
   trigger: string;
-  status: "accepted" | "running" | "completed" | "failed" | "cancelled";
+  status: AutoscanScanStatus;
   requested_at?: string;
   started_at?: string;
   completed_at?: string;
@@ -2837,8 +2994,6 @@ export interface AdminSession {
   updated_at: string;
   position_seconds: number;
   is_paused: boolean;
-  /** Number of the session's last lifecycle transition; absent before lifecycle numbers existed. */
-  lifecycle_seq?: number | null;
   has_playback_control?: boolean;
   client_ip?: string;
   /** Server classification used to select the local or remote stream bitrate policy. */
@@ -2860,9 +3015,6 @@ export interface AdminSession {
   target_resolution?: string;
   target_video_codec?: string;
   target_audio_codec?: string;
-  /** Channel count the transcode actually encodes. Absent when the reporting
-   * node did not know it — render the target codec with no channel layout
-   * rather than falling back to `source_audio_channels`. */
   target_audio_channels?: number | null;
   target_bitrate_kbps: number | null;
   transcode_hw_accel?: string;
@@ -3190,6 +3342,7 @@ export interface NotificationWebhook {
   enabled: boolean;
   notify_next_up: boolean;
   notify_requests: boolean;
+  notify_ratings: boolean;
   consecutive_failures: number;
   disabled_reason: string | null;
   last_success_at: string | null;
@@ -3207,6 +3360,7 @@ export interface NotificationWebhookInput {
   enabled?: boolean;
   notify_next_up?: boolean;
   notify_requests?: boolean;
+  notify_ratings?: boolean;
 }
 
 export interface NotificationWebhookTestResult {
@@ -3403,17 +3557,6 @@ export type AdminLogStreamMessage =
   | AdminLogAppendMessage
   | AdminLogErrorMessage;
 
-export interface AdminPlaybackHistorySubtitle {
-  track_id: string;
-  language: string | null;
-  codec: string | null;
-  format: string | null;
-  source: "embedded" | "external" | "downloaded";
-  delivery: "burn_in" | "embedded" | "hls_rendition" | "sidecar";
-  forced: boolean;
-  hearing_impaired: boolean;
-}
-
 export interface AdminPlaybackHistoryItem {
   session_id: string;
   user_id: number;
@@ -3428,59 +3571,14 @@ export interface AdminPlaybackHistoryItem {
   started_at: string;
   ended_at: string;
   /** Where the play ended, not how long it was watched. */
-  end_position_seconds: number;
+  watched_seconds: number;
   duration_seconds: number | null;
   completed: boolean;
   /** Measured watch time; null for a play recorded before it was measured. */
   played_seconds: number | null;
-  measured?: boolean;
-  start_position_seconds?: number | null;
-  paused_seconds?: number | null;
-  measured_since?: string | null;
-  measured_until?: string | null;
-  client_ip?: string | null;
-  device_id?: string | null;
-  device_platform?: string | null;
-  client_name?: string | null;
-  client_version?: string | null;
-  video_decision?: "direct" | "remux" | "transcode" | null;
-  audio_decision?: "direct" | "remux" | "transcode" | null;
-  end_reason?: "stopped" | "terminated" | "expired" | "aborted" | "replaced" | null;
   series_title: string;
   season_number: number | null;
   episode_number: number | null;
-  subtitle?: AdminPlaybackHistorySubtitle | null;
-  target_video_codec?: string | null;
-  target_resolution?: string | null;
-  target_audio_codec?: string | null;
-  target_audio_channels?: number | null;
-  output_container?: string | null;
-  output_protocol?: string | null;
-  target_bitrate_kbps?: number | null;
-  transcode_hw_accel?: string | null;
-  tone_map_mode?: string | null;
-  adaptation_reasons?: string[];
-  reporting_node?: string | null;
-  stream_location?: "local" | "remote" | null;
-  compat_origin?: boolean | null;
-  is_jellyfin_client?: boolean;
-  routing_execution?: string | null;
-  routing_execution_node_id?: number | null;
-  routing_execution_node_name?: string | null;
-  routing_egress?: string | null;
-  routing_egress_node_id?: number | null;
-  routing_egress_node_name?: string | null;
-  route_facts_recorded?: boolean;
-  source_video_codec?: string | null;
-  source_resolution?: string | null;
-  source_audio_codec?: string | null;
-  source_audio_channels?: number | null;
-  source_container?: string | null;
-  source_bitrate_kbps?: number | null;
-  source_hdr?: boolean | null;
-  source_video_range_type?: string | null;
-  library_id?: number | null;
-  library_name?: string | null;
 }
 
 export interface AdminUserProfile {
@@ -3515,6 +3613,10 @@ export interface UserDevice {
   is_current_device: boolean;
   /** How many settings this (profile, device) pair overrides. */
   changed_count: number;
+  /** Present when this device has reported (or been seeded with) a capability profile. */
+  capability_fingerprint?: string;
+  /** client | admin | seed — how the capability profile was recorded. */
+  capability_source?: string;
 }
 
 export interface UserDeviceListResponse {
@@ -4045,6 +4147,14 @@ export interface PluginAdminFormField {
    * values render no action.
    */
   fill_from?: string;
+  /**
+   * Marks a field as a library picker. Set from the host-known JSON Schema
+   * `format` values `silo-library`, `silo-library-movie`, and `silo-library-tv`
+   * on a plugin config property; the admin chooses from Silo's enabled
+   * libraries by name. The value written to the field is the library's numeric
+   * id as a string. Only fields inferred from `json_schema` carry this marker.
+   */
+  library_picker?: "any" | "movie" | "tv";
 }
 
 export interface PluginCapability {
@@ -4122,7 +4232,7 @@ export interface PluginRepository {
   url: string;
   display_name: string;
   enabled: boolean;
-  source_kind: "silo" | "approved_community" | "external";
+  source_kind: "silo" | "vio" | "approved_community" | "external";
   managed: boolean;
   last_fetched_at?: string | null;
   created_at?: string;
@@ -4148,7 +4258,7 @@ export interface PluginCatalogEntry {
   plugin_id: string;
   version: string;
   archive_url: string;
-  source_kind: "silo" | "approved_community" | "external";
+  source_kind: "silo" | "vio" | "approved_community" | "external";
   repository_name: string;
   repo_url?: string;
   presentation?: PluginPresentation;
@@ -4189,6 +4299,8 @@ export type PluginProvisionOwnership = V2Components["schemas"]["AdminPluginProvi
 
 export interface PluginInstallation {
   env_managed?: PluginProvisionOwnership;
+  signature: PluginSignature;
+  connection_check_supported: boolean;
   id: number;
   repository_id?: number | null;
   plugin_id: string;
@@ -4207,17 +4319,13 @@ export interface PluginInstallation {
   task_bindings: PluginTaskBinding[];
   update_policy: string;
   available_version?: string | null;
-  source_kind: "silo" | "approved_community" | "external";
+  source_kind: "silo" | "vio" | "approved_community" | "external";
   repository_name?: string;
   repo_url?: string;
   presentation?: PluginPresentation;
   updates_paused: boolean;
   /** The last automatic update that failed; absent when the last check did not fail. */
   update_failure?: PluginUpdateFailure | null;
-  /** The release signature check of the installed package. */
-  signature: PluginSignature;
-  /** Whether the config test endpoint has a connection check to run for this plugin. */
-  connection_check_supported: boolean;
   legacy_metadata_import_types?: string[];
   created_at?: string;
   updated_at?: string;
@@ -4696,10 +4804,6 @@ export interface SectionItem {
   advisory_source?: string;
   status: "pending" | "matched" | "unmatched" | "ambiguous";
   show_status?: string;
-  /** "air_date" when the series labels episodes by date; see formatEpisodeLabel. */
-  episode_labels?: string;
-  /** An episode card's air date, sent when episode_labels is air_date. */
-  air_date?: string | null;
   rating_imdb: number | null;
   rating_tmdb?: number | null;
   rating_rt_critic?: number | null;
@@ -5277,6 +5381,32 @@ export interface AdminPlaybackActivity {
   buckets: AdminPlaybackActivityBucket[];
   reliability: AdminPlaybackReliability;
   profiles_active_24h: number;
+}
+
+// GET /admin/stats/top-activity. Episodes are rolled up to their series, so a
+// title's media_item_id is a series content id for TV.
+export interface AdminTopTitle {
+  media_item_id: string;
+  title: string;
+  media_type: string;
+  plays: number;
+  total_seconds: number;
+}
+
+export interface AdminTopProfile {
+  user_id: string | number; // v2 IDs are opaque strings; bridge fixtures retain numbers.
+  username: string;
+  profile_id: string;
+  profile_name: string;
+  plays: number;
+  total_seconds: number;
+}
+
+export interface AdminTopActivity {
+  days: number;
+  limit: number;
+  titles: AdminTopTitle[];
+  profiles: AdminTopProfile[];
 }
 
 // GET /admin/stats/timeseries. One point per sampled minute; minutes the

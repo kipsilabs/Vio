@@ -466,17 +466,14 @@ export default function AdminBackups() {
         <section aria-labelledby="saved-backups-heading" className="space-y-6">
           <div className="space-y-3">
             <div className="space-y-1">
-              <h2
-                id="saved-backups-heading"
-                className="text-[0.9375rem] font-semibold tracking-tight"
-              >
+              <h2 id="saved-backups-heading" className="text-[15px] font-semibold tracking-tight">
                 {t("web.admin.backups.list.heading")}
               </h2>
-              <p className="text-muted-foreground text-[0.8125rem]">
+              <p className="text-muted-foreground text-[13px]">
                 {retentionNote({ keep, plan, next, running, now, t })}
               </p>
               {list?.encrypted ? (
-                <p className="text-muted-foreground text-[0.8125rem]">
+                <p className="text-muted-foreground text-[13px]">
                   {t("web.admin.backups.list.encrypted")}
                 </p>
               ) : null}

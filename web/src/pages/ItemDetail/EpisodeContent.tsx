@@ -1,11 +1,11 @@
-import { useCallback, useMemo, useState } from "react";
-import { episodeAirDateLabel, episodeSubtitle } from "@/lib/episodeCardLabels";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useLocation, useNavigate } from "react-router";
 import { leafUserData, type FileVersion, type ItemDetail } from "@/api/types";
-import type { PlayerSubtitleTrackSignature } from "@/player/types";
+import type { PlayerSubtitleTrackSignature, PrePlaySubtitleSelection } from "@/player/types";
 import { useSeasonDetail, useSeasonEpisodes } from "@/hooks/queries/episodes";
 import { useCatalogItemDetail } from "@/hooks/queries/catalogRead";
-import { usePrePlayAudioSelection, usePrePlaySubtitleSelection } from "./usePrePlayTrackSelection";
+import { useDeleteSubtitlePreference, useSetSubtitlePreference } from "@/hooks/queries/subtitles";
+import { usePrePlayAudioSelection } from "./usePrePlayTrackSelection";
 import { useAmbientColor } from "@/hooks/useAmbientColor";
 import { useEpisodeSpoilerPrefs } from "@/hooks/useEpisodeSpoilerPrefs";
 import { useAuth } from "@/hooks/useAuth";
@@ -36,11 +36,12 @@ import WatchedActionBar from "./components/WatchedActionBar";
 import DetailBreadcrumb from "./components/DetailBreadcrumb";
 import MediaInfoDialog from "./components/MediaInfoDialog";
 import SubtitleSearchDialog from "./components/SubtitleSearchDialog";
+import { sortByResolution } from "./components/VersionFlyout";
 import {
   selectDefaultPlaybackVariantVersion,
-  selectedDownloadVersions,
-  selectedStartVersion,
+  selectItemVersion,
 } from "./components/versionRankingUtils";
+import { readRequestedVersion, rememberRequestedFileId } from "@/playback/requestedVersion";
 import { resolveSelectedMediaSummary } from "./components/selectedMediaSummary";
 import { EpisodeCarouselSkeleton } from "./components/SectionSkeletons";
 import {
@@ -55,15 +56,28 @@ import {
 } from "@/lib/permissions";
 import { isEpisodeUnwatched } from "@/lib/episodeSpoilers";
 import { buildItemHref } from "@/lib/mediaNavigation";
-import { formatDate } from "@/lib/datetime";
 import { formatRuntimeMinutes } from "@/lib/mediaFormat";
-import { useQualityPreferenceState } from "@/hooks/queries/qualityPreference";
+import { useQualityPreference } from "@/hooks/queries/qualityPreference";
+import {
+  applyVersionAvailability,
+  applyVersionPlayability,
+  useVersionLiveness,
+  useVersionPlayability,
+} from "@/hooks/queries/versionLiveness";
+import { useVersionPlayabilityClient } from "@/hooks/queries/versionPlayabilityClient";
+import { CalendarClock } from "lucide-react";
+import {
+  formatCalendarDate,
+  isUpcomingEpisode,
+  useEpisodeReleaseCapability,
+} from "@/hooks/queries/episodeRelease";
 import { hasMachineTranslation } from "./components/machineTranslation";
-import { useT } from "@/i18n";
 
 export default function EpisodeContent({
   item,
   libraryId,
+  onStaleVersion,
+  onSelectedFileIdChange,
 }: {
   item: ItemDetail & { type: "episode" };
   /**
@@ -72,20 +86,27 @@ export default function EpisodeContent({
    * overview fallback resolves its language in it.
    */
   libraryId?: number;
+  onStaleVersion?: (fileId: number) => void;
+  /**
+   * Reports the viewer's explicit version pick (the in-place choice or the
+   * remembered one on this device) so the page's detail read can carry it. The
+   * server-derived default is not reported: it would only duplicate the read
+   * the page already made.
+   */
+  onSelectedFileIdChange?: (fileId: number | null) => void;
 }) {
-  const t = useT();
   const navigate = useNavigate();
   const location = useLocation();
-  useAmbientColor(item.backdrop_thumbhash);
   const { user } = useAuth();
   const isAdmin = useIsActingAdmin();
   const { profile: currentProfile } = useCurrentProfile();
   // The resolution cap comes from the settings contract, where the quality
   // picker writes; the profile column it falls back to is only the pre-cutover
   // choice, since that picker no longer mirrors into it.
-  const { preference: qualityPreference, settled: qualitySettled } = useQualityPreferenceState(
-    currentProfile?.quality_preference,
-  );
+  const qualityPreference = useQualityPreference(currentProfile?.quality_preference);
+  // The same capability surface a playback start sends, so the versions check
+  // can judge each row with the production planner before the viewer picks.
+  const { client: playabilityClient, ready: playabilityReady } = useVersionPlayabilityClient();
   const canCurateMetadata = canCurateMetadataForUser(user, currentProfile);
   const canEditMarkers = canEditMarkersForUser(user, currentProfile);
   const [editOpen, setEditOpen] = useState(false);
@@ -103,9 +124,23 @@ export default function EpisodeContent({
   const canManageTrickplay =
     capabilities?.trickplay === true && capabilities.trickplay_supported === true;
   const canRedetectMarkers = markerCapabilities.data?.redetect_markers === true;
+  const deleteSubtitlePreference = useDeleteSubtitlePreference();
+  const setSubtitlePreference = useSetSubtitlePreference();
 
   // Version selection state — drives the Play button and inline stream popovers.
+  const sortedVersions = useMemo(() => sortByResolution(item.versions ?? []), [item.versions]);
   const userData = leafUserData(item.user_data);
+  // The viewer's own pick, remembered on this device. It outlives the server's
+  // `last_file_id`, which names whichever row actually served the bytes after
+  // a substitution. Read on mount, but only once the profile has resolved: the
+  // store is profile-scoped, and a pre-resolution read would alias another
+  // profile's pick. A pick made in place is held in state below.
+  const requestedProfileId = currentProfile?.id ?? null;
+  const requestedVersion = useMemo(
+    () => (requestedProfileId ? readRequestedVersion(item.content_id, requestedProfileId) : null),
+    [item.content_id, requestedProfileId],
+  );
+  const requestedFileId = requestedVersion?.fileId ?? null;
   const { hideOverviews } = useEpisodeSpoilerPrefs();
   // Keyed by episode so a reveal survives an on-view translation of the same
   // episode but not navigation to the next one.
@@ -127,27 +162,105 @@ export default function EpisodeContent({
     hideOverviews &&
     isEpisodeUnwatched(item.user_data) &&
     revealedOverviewId !== item.content_id;
-  const [selectedEditionKey, setSelectedEditionKey] = useState<string | undefined>(undefined);
   const defaultSelectedVersion = useMemo(
     () =>
       selectDefaultPlaybackVariantVersion(
-        item.versions ?? [],
+        sortedVersions,
         item.playback_variants,
         userData,
         qualityPreference,
-        selectedEditionKey,
+        item.effective_version_edition_key,
+        requestedFileId,
       ),
-    [qualityPreference, selectedEditionKey, item.playback_variants, item.versions, userData],
+    [
+      qualityPreference,
+      item.effective_version_edition_key,
+      item.playback_variants,
+      requestedFileId,
+      sortedVersions,
+      userData,
+    ],
   );
   const [manualSelectedFileId, setManualSelectedFileId] = useState<number | null>(null);
-  const pickedVersion = useMemo(
+  // Tracks whether a version picker has been opened; the picker-open path
+  // widens the liveness probe from the default version to the whole list.
+  const [versionPickersOpened, setVersionPickersOpened] = useState(false);
+  const handleVersionPickerOpenChange = useCallback((open: boolean) => {
+    if (open) {
+      setVersionPickersOpened(true);
+    }
+  }, []);
+
+  // Check the default-selected version as soon as the page mounts so it can't
+  // sit as an unavailable row before any liveness result exists. Only that one
+  // version is probed until a picker opens, at which point the full chunked
+  // check takes over (results are cached for 5 minutes, so re-opening does not
+  // re-fetch). The stamped rows are what the ActionBar derives its
+  // force-relink decision from: reading a stale `available` flag would replay
+  // a provider pin the server already knows is gone.
+  const livenessVersions = useMemo(
     () =>
-      manualSelectedFileId != null
-        ? (item.versions?.find((version) => version.file_id === manualSelectedFileId) ?? null)
-        : null,
-    [manualSelectedFileId, item.versions],
+      versionPickersOpened ? item.versions : defaultSelectedVersion ? [defaultSelectedVersion] : [],
+    [defaultSelectedVersion, item.versions, versionPickersOpened],
   );
-  const selectedVersion = pickedVersion ?? defaultSelectedVersion;
+  const versionLiveness = useVersionLiveness(livenessVersions, true);
+  // A cheap, provider-free pass over every row: the picker must know which
+  // rows this client can play before it offers them, and the default row must
+  // not be an unplayable one. It only adds the playability verdict; liveness
+  // above stays the authority for `available`/`failed`.
+  const versionPlayability = useVersionPlayability(
+    item.versions ?? [],
+    playabilityClient,
+    playabilityReady,
+  );
+  const versionsWithPlayability = useMemo(
+    () =>
+      applyVersionPlayability(
+        applyVersionAvailability(sortedVersions, versionLiveness),
+        versionPlayability,
+      ),
+    [sortedVersions, versionLiveness, versionPlayability],
+  );
+
+  // The device's requested row is the viewer's own pick, ahead of the server's
+  // last-file hint. Either may have left the list since.
+  const persistedSelectedFileId =
+    manualSelectedFileId ?? requestedFileId ?? userData?.last_file_id ?? null;
+  // The page always resolves a playable row: a persisted row the refresh dropped,
+  // a failed default, and a currently unavailable default each fall back to the
+  // best available row with a notice instead of disabling Play for the episode.
+  const explicitPickFileId =
+    manualSelectedFileId ?? (requestedVersion?.explicit === true ? requestedFileId : null);
+  const versionSelection = useMemo(
+    () =>
+      selectItemVersion(
+        versionsWithPlayability,
+        defaultSelectedVersion,
+        persistedSelectedFileId,
+        explicitPickFileId,
+      ),
+    [defaultSelectedVersion, explicitPickFileId, persistedSelectedFileId, versionsWithPlayability],
+  );
+  const selectedVersion = versionSelection.version;
+  const versionFallback = versionSelection.fallback;
+  // A row the page did not keep must not keep naming itself to the detail read;
+  // only a row the catalog still carries and the viewer asked for is a
+  // selection.
+  const explicitSelectedFileId = versionFallback
+    ? null
+    : (manualSelectedFileId ?? requestedFileId ?? null);
+  useEffect(() => {
+    onSelectedFileIdChange?.(explicitSelectedFileId);
+  }, [explicitSelectedFileId, onSelectedFileIdChange]);
+  // Play must tell the server whether this row is the viewer's or the page's.
+  // A pick made in place says so directly; a remembered one only while it is
+  // still the row the catalog gives us to play, and only if the viewer named it
+  // themselves. An Auto start's row is remembered as a hint, not a pin.
+  const explicitFileSelection =
+    versionFallback == null &&
+    (manualSelectedFileId != null ||
+      (requestedVersion?.explicit === true &&
+        requestedVersion.fileId === selectedVersion?.file_id));
   const selectedMediaSummary = useMemo(
     () => resolveSelectedMediaSummary(selectedVersion, item.playback_variants, item.runtime ?? 0),
     [item.playback_variants, item.runtime, selectedVersion],
@@ -161,50 +274,73 @@ export default function EpisodeContent({
   );
   const audioSelection = usePrePlayAudioSelection(item.content_id, item.series_id, selectedVersion);
   const clearAudioSelection = audioSelection.clear;
-  const subtitleSelection = usePrePlaySubtitleSelection(
-    item.content_id,
-    item.series_id,
-    selectedVersion?.file_id,
+  const [subtitleSelectionMode, setSubtitleSelectionMode] = useState<"auto" | "off" | "explicit">(
+    "auto",
   );
-  const clearSubtitleSelection = subtitleSelection.clear;
+  const [explicitSubtitleSelection, setExplicitSubtitleSelection] =
+    useState<PrePlaySubtitleSelection | null>(null);
 
   // Reset selection when navigating to a different episode (adjust state during render).
   const [prevContentId, setPrevContentId] = useState(item.content_id);
   if (prevContentId !== item.content_id) {
     setPrevContentId(item.content_id);
     setManualSelectedFileId(null);
-    setSelectedEditionKey(undefined);
-  } else if (selectedEditionKey === undefined && qualitySettled && defaultSelectedVersion) {
-    setSelectedEditionKey(defaultSelectedVersion.edition_key ?? "");
+    setSubtitleSelectionMode("auto");
+    setExplicitSubtitleSelection(null);
   }
 
   const handleSelectVersion = useCallback(
-    (version: FileVersion | null) => {
-      setManualSelectedFileId(version?.file_id ?? null);
-      if (version) setSelectedEditionKey(version.edition_key ?? "");
+    (version: FileVersion) => {
+      setManualSelectedFileId(version.file_id);
+      // Remember the pick across reloads: the server records the row that
+      // actually plays, which may be a substitute for this one. The standing
+      // travels with it so a later Play still pins this row after a reload.
+      rememberRequestedFileId(item.content_id, version.file_id, requestedProfileId, {
+        explicit: true,
+      });
       // Track indexes belong to a file, so another version starts from Auto.
       clearAudioSelection();
-      clearSubtitleSelection();
+      setSubtitleSelectionMode("auto");
+      setExplicitSubtitleSelection(null);
     },
-    [clearAudioSelection, clearSubtitleSelection],
+    [item.content_id, requestedProfileId, clearAudioSelection],
   );
 
-  const handleSelectEdition = useCallback(
-    (key: string) => {
-      setSelectedEditionKey(key);
-      handleSelectVersion(null);
-    },
-    [handleSelectVersion],
-  );
-  const downloadVersions = useMemo(
-    () => selectedDownloadVersions(selectedVersion, item.playback_variants, qualityPreference),
-    [selectedVersion, item.playback_variants, qualityPreference],
-  );
-  const restartVersion = useMemo(
-    () => selectedStartVersion(selectedVersion, item.playback_variants, qualityPreference),
-    [selectedVersion, item.playback_variants, qualityPreference],
-  );
+  const handleSelectSubtitle = (selection: PrePlaySubtitleSelection) => {
+    setSubtitleSelectionMode("explicit");
+    setExplicitSubtitleSelection(selection);
+    // Persist as the series' override so the choice sticks across visits,
+    // exactly like a manual in-player selection (preferences are
+    // series-scoped).
+    if (item.series_id) {
+      setSubtitlePreference.mutate({
+        prefId: item.series_id,
+        selection,
+      });
+    }
+  };
 
+  const handleResetSubtitleSelection = () => {
+    setSubtitleSelectionMode("auto");
+    setExplicitSubtitleSelection(null);
+    // "Auto" also clears the persisted override saved by a manual in-player
+    // selection. Subtitle preferences are series-scoped, so this restores
+    // profile-level auto selection for the whole series.
+    if (item.series_id) {
+      deleteSubtitlePreference.mutate(item.series_id);
+    }
+  };
+
+  const handleSelectSubtitleOff = () => {
+    setSubtitleSelectionMode("off");
+    setExplicitSubtitleSelection(null);
+    if (item.series_id) {
+      setSubtitlePreference.mutate({
+        prefId: item.series_id,
+        selection: null,
+      });
+    }
+  };
   const preferredSubtitleTrackSignature: PlayerSubtitleTrackSignature | null =
     item.effective_subtitle_track_signature
       ? {
@@ -224,7 +360,19 @@ export default function EpisodeContent({
         }
       : null;
   const navigationState = location.state as EpisodeNavigationState | null;
-  const primaryAction = resolveLeafPrimaryAction(item, t("web.detail.actions.playEpisode"));
+  // Release timing is presentation only: it never gates playback. A
+  // future-dated episode with a playable file still plays (the server's
+  // release gate remains the sole enforcer), so Play eligibility is
+  // unchanged; upcoming episodes only get a hero badge. The badge itself is
+  // capability-gated so older servers render as before. Unknown dates fail
+  // open (no badge, playable as before).
+  const { data: releaseCapability } = useEpisodeReleaseCapability();
+  const upcoming = isUpcomingEpisode(item, releaseCapability?.available ?? false);
+  const isPlayable =
+    (item.versions?.length ?? 0) > 0 ||
+    (item.playback_variants?.length ?? 0) > 0 ||
+    Boolean(item.play_content_id);
+  const primaryAction = resolveLeafPrimaryAction(item, "Play Episode");
   const watchTogether = useDetailWatchTogether({
     item,
     target:
@@ -234,13 +382,8 @@ export default function EpisodeContent({
             title: item.title,
             subtitle:
               item.season_number != null && item.episode_number != null
-                ? episodeSubtitle(
-                    item.episode_labels,
-                    item.air_date,
-                    item.season_number,
-                    item.episode_number,
-                  )
-                : (episodeAirDateLabel(item.episode_labels, item.air_date) ?? undefined),
+                ? `S${item.season_number} E${item.episode_number}`
+                : undefined,
             poster_url: item.poster_url,
             poster_thumbhash: item.poster_thumbhash,
           }
@@ -249,12 +392,12 @@ export default function EpisodeContent({
     initialSeasonNumber: item.season_number ?? undefined,
   });
   const restartHref =
-    primaryAction.resuming && (item.versions?.length ?? 0) > 0
+    primaryAction.label === "Resume" && isPlayable
       ? `/watch/${item.content_id}?restart=1`
       : undefined;
 
   const title = item.title ?? "";
-  const seriesTitle = item.series_title ?? t("web.detail.hero.typeSeries");
+  const seriesTitle = item.series_title ?? "Series";
   const seriesId = item.series_id;
   const seasonNum = item.season_number;
   const episodeNum = item.episode_number;
@@ -272,15 +415,38 @@ export default function EpisodeContent({
     libraryId,
   );
   const siblingEpisodes = episodesData?.episodes ?? [];
+  // The hero backdrop prefers this episode's own title card: the detail
+  // presigns an episode's still as `poster_url`, and episode rows name the same
+  // artwork `still_url`, consulted last for a series that has a poster but no
+  // backdrop. The series backdrop keeps its place in between, so an episode with
+  // no title card of its own renders as it did before.
+  //
+  // The URL picks the source; the thumbhash is that same source's, even when it
+  // has none. Pairing the two independently could show one image behind another
+  // image's generated thumbnail, so the placeholder would not belong to the
+  // artwork it stands in for.
+  const currentEpisode = siblingEpisodes.find((episode) => episode.content_id === item.content_id);
+  const heroArtwork = item.poster_url
+    ? { url: item.poster_url, thumbhash: item.poster_thumbhash }
+    : item.backdrop_url
+      ? { url: item.backdrop_url, thumbhash: item.backdrop_thumbhash }
+      : currentEpisode?.still_url
+        ? { url: currentEpisode.still_url, thumbhash: currentEpisode.still_thumbhash }
+        : undefined;
+  const heroBackdropUrl = heroArtwork?.url;
+  const heroBackdropThumbhash = heroArtwork?.thumbhash;
+  // The page glow follows the artwork the hero actually shows, the way the ebook
+  // and manga pages key it to their poster.
+  useAmbientColor(heroBackdropThumbhash);
   const seasonLabel =
     navigationState?.parentSeasonLabel ??
     (currentSeason
       ? getSeasonDisplayTitle(currentSeason)
       : seasonNum === 0
-        ? t("web.detail.seasons.specials")
+        ? "Specials"
         : seasonNum != null
-          ? t("web.detail.seasons.numbered", { season: seasonNum })
-          : t("web.detail.seasons.seasonFallback"));
+          ? `Season ${seasonNum}`
+          : "Season");
   const seasonHref =
     navigationState?.parentSeasonHref ??
     (currentSeason ? buildItemHref({ contentId: currentSeason.content_id, libraryId }) : undefined);
@@ -303,11 +469,7 @@ export default function EpisodeContent({
     breadcrumbSegments.push({ label: seasonLabel, href: seasonHref });
   }
   if (episodeNum != null) {
-    breadcrumbSegments.push({
-      label:
-        episodeAirDateLabel(item.episode_labels, item.air_date) ??
-        t("web.detail.episodes.numbered", { episode: episodeNum }),
-    });
+    breadcrumbSegments.push({ label: `Episode ${episodeNum}` });
   }
 
   return (
@@ -318,8 +480,8 @@ export default function EpisodeContent({
           title={title}
           topNav={<PageBack />}
           context={<DetailBreadcrumb segments={breadcrumbSegments} />}
-          backdropUrl={item.backdrop_url}
-          backdropThumbhash={item.backdrop_thumbhash}
+          backdropUrl={heroBackdropUrl}
+          backdropThumbhash={heroBackdropThumbhash}
           hidePoster
           logoUrl={item.logo_url}
           metadata={
@@ -327,10 +489,14 @@ export default function EpisodeContent({
               <MetadataBadges
                 duration={formatRuntimeMinutes(selectedMediaSummary.durationMinutes) || undefined}
               />
-              {item.air_date && (
-                <span className="metadata-badge">
-                  {formatDate(item.air_date, "medium") || item.air_date}
+              {upcoming && (
+                <span className="metadata-badge gap-1">
+                  <CalendarClock className="size-3" aria-hidden="true" />
+                  Upcoming{item.air_date && ` · ${formatCalendarDate(item.air_date)}`}
                 </span>
+              )}
+              {!upcoming && item.air_date && (
+                <span className="metadata-badge">{formatCalendarDate(item.air_date)}</span>
               )}
               <QualityBadges summary={selectedMediaSummary} />
             </div>
@@ -350,11 +516,10 @@ export default function EpisodeContent({
               compactMobile
               item={item}
               contentId={item.content_id}
+              hasVirtualSource={item.has_virtual_source === true}
               canAddToCollection={false}
               watchTogether={watchTogether.menu}
-              playHref={
-                item.versions && item.versions.length > 0 ? `/watch/${item.content_id}` : undefined
-              }
+              playHref={isPlayable ? `/watch/${item.content_id}` : undefined}
               playLabel={primaryAction.label}
               playProgress={primaryAction.progress}
               restartHref={restartHref}
@@ -408,14 +573,18 @@ export default function EpisodeContent({
               canEditMarkers={canEditMarkers}
               canManageTrickplay={canManageTrickplay}
               onEditMetadata={canCurateMetadata ? () => setEditOpen(true) : undefined}
-              onShowMediaInfo={(item.versions?.length ?? 0) > 0 ? () => openMediaInfo() : undefined}
-              versions={item.versions ?? []}
+              onShowMediaInfo={
+                canCurateMetadata && (item.versions?.length ?? 0) > 0
+                  ? () => openMediaInfo()
+                  : undefined
+              }
+              versions={versionsWithPlayability}
               playbackVariants={item.playback_variants}
               selectedVersion={selectedVersion}
-              restartVersion={restartVersion}
-              versionPicked={pickedVersion != null}
+              versionFallback={versionFallback}
+              onVersionPickerOpenChange={handleVersionPickerOpenChange}
+              explicitFileSelection={explicitFileSelection}
               onSelectVersion={handleSelectVersion}
-              onSelectEdition={handleSelectEdition}
               onDownload={
                 user?.download_allowed && (item.versions ?? []).length > 0
                   ? () => setDownloadOpen(true)
@@ -429,11 +598,11 @@ export default function EpisodeContent({
               explicitAudioTrackIndex={audioSelection.explicitIndex}
               onSelectAudioTrack={audioSelection.select}
               onResetAudioSelection={audioSelection.reset}
-              prePlaySubtitleMode={subtitleSelection.mode}
-              explicitSubtitleSelection={subtitleSelection.explicitSelection}
-              onSelectSubtitle={subtitleSelection.select}
-              onSelectSubtitleOff={subtitleSelection.selectOff}
-              onResetSubtitleSelection={subtitleSelection.reset}
+              prePlaySubtitleMode={subtitleSelectionMode}
+              explicitSubtitleSelection={explicitSubtitleSelection}
+              onSelectSubtitle={handleSelectSubtitle}
+              onSelectSubtitleOff={handleSelectSubtitleOff}
+              onResetSubtitleSelection={handleResetSubtitleSelection}
               preferredSubtitleLanguage={item.effective_subtitle_language}
               preferredSubtitleTrackSignature={preferredSubtitleTrackSignature}
               subtitleMode={item.effective_subtitle_mode as "off" | "auto" | "always" | undefined}
@@ -443,24 +612,18 @@ export default function EpisodeContent({
         />
 
         {(siblingsLoading || siblingEpisodes.length > 1) && (
-          <section
-            className="page-shell episode-detail-navigation"
-            aria-label={t("web.detail.episodes.moreEpisodesRegion")}
-          >
+          <section className="page-shell episode-detail-navigation" aria-label="More episodes">
             {/* More Episodes carousel — most useful, so show first */}
             {siblingsLoading ? (
               <EpisodeCarouselSkeleton />
             ) : (
               <div>
-                <h2 className="mb-5 text-xl font-semibold tracking-tight">
-                  {t("web.detail.episodes.moreEpisodes")}
-                </h2>
+                <h2 className="mb-5 text-xl font-semibold tracking-tight">More Episodes</h2>
                 <EpisodeCarousel
                   episodes={siblingEpisodes}
                   currentEpisodeNumber={episodeNum ?? -1}
                   episodeLinkState={episodeLinkState}
                   libraryId={libraryId}
-                  episodeLabels={item.episode_labels}
                 />
               </div>
             )}
@@ -471,7 +634,7 @@ export default function EpisodeContent({
       <div className="page-shell detail-supporting-content space-y-12 py-10 sm:space-y-14">
         {canCurateMetadata && (
           <MediaLocations
-            title={t("web.detail.sections.mediaLocations")}
+            title="Media locations"
             versions={item.versions}
             onShowMediaInfo={openMediaInfo}
           />
@@ -479,9 +642,7 @@ export default function EpisodeContent({
 
         {item.cast && item.cast.length > 0 && (
           <div>
-            <h2 className="mb-5 text-xl font-semibold tracking-tight">
-              {t("web.detail.sections.cast")}
-            </h2>
+            <h2 className="mb-5 text-xl font-semibold tracking-tight">Cast</h2>
             <CastCarousel cast={item.cast} prefetchPeople />
           </div>
         )}
@@ -494,9 +655,14 @@ export default function EpisodeContent({
       <DownloadVersionPicker
         open={downloadOpen}
         onOpenChange={setDownloadOpen}
-        versions={downloadVersions}
-        partsInOrder
+        versions={item.versions ?? []}
         title={title}
+        selectedFileId={selectedVersion?.file_id}
+        onStaleVersion={onStaleVersion}
+        createTarget={{
+          contentId: item.series_id ?? item.content_id,
+          episodeId: item.content_id,
+        }}
       />
       <SubtitleSearchDialog
         open={subtitleSearchOpen}
@@ -504,13 +670,15 @@ export default function EpisodeContent({
         version={selectedVersion}
         title={title}
       />
-      <MediaInfoDialog
-        open={mediaInfoOpen}
-        onOpenChange={setMediaInfoOpen}
-        versions={item.versions ?? []}
-        title={title}
-        initialFileId={mediaInfoFileId}
-      />
+      {canCurateMetadata && (
+        <MediaInfoDialog
+          open={mediaInfoOpen}
+          onOpenChange={setMediaInfoOpen}
+          versions={item.versions ?? []}
+          title={title}
+          initialFileId={mediaInfoFileId}
+        />
+      )}
       {watchTogether.sheet}
     </div>
   );

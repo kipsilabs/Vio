@@ -23,6 +23,7 @@ type NotificationWebhookCreateInput struct {
 		Type           *string `json:"type,omitempty" enum:"discord,generic"`
 		NotifyNextUp   *bool   `json:"notify_next_up,omitempty"`
 		NotifyRequests *bool   `json:"notify_requests,omitempty"`
+		NotifyRatings  *bool   `json:"notify_ratings,omitempty"`
 	}
 }
 type NotificationServerChannelCreateInput struct {
@@ -79,7 +80,7 @@ func registerNotificationDestinationCreate(reg *Registry) {
 			return nil, unavailable("notification destinations")
 		}
 		b := in.Body
-		row, secret, err := svc.CreateNotificationWebhook(ctx, claimsFrom(ctx).UserID, profileFrom(ctx), notifications.WebhookInput{Name: &b.Name, URL: &b.URL, Type: b.Type, NotifyNextUp: b.NotifyNextUp, NotifyRequests: b.NotifyRequests})
+		row, secret, err := svc.CreateNotificationWebhook(ctx, claimsFrom(ctx).UserID, profileFrom(ctx), notifications.WebhookInput{Name: &b.Name, URL: &b.URL, Type: b.Type, NotifyNextUp: b.NotifyNextUp, NotifyRequests: b.NotifyRequests, NotifyRatings: b.NotifyRatings})
 		if err != nil {
 			return nil, notificationDestinationCreateProblem(err)
 		}

@@ -100,9 +100,7 @@ function KindPicker({
   return (
     <div className="grid content-start gap-6 overflow-y-auto px-5 pt-[18px] pb-6 sm:px-7">
       <section className="grid gap-3">
-        <h3 className="text-[0.8125rem] font-semibold">
-          {t("web.admin.requests.rowDialog.newRow")}
-        </h3>
+        <h3 className="text-[13px] font-semibold">{t("web.admin.requests.rowDialog.newRow")}</h3>
         <div className={grid}>
           {NEW_ROW_TYPES.map((type) => (
             <KindCard
@@ -116,7 +114,7 @@ function KindPicker({
       </section>
       {missing.length > 0 ? (
         <section className="grid gap-3">
-          <h3 className="flex items-baseline gap-2.5 text-[0.8125rem] font-semibold">
+          <h3 className="flex items-baseline gap-2.5 text-[13px] font-semibold">
             {t("web.admin.requests.rowDialog.bringBack")}
             <span className="text-muted-foreground font-normal">
               {t("web.admin.requests.rowDialog.bringBackHelp")}
@@ -194,7 +192,7 @@ function SourceControl({
     return (
       <div className="grid gap-2">
         <SourceCard title={kindLabel} detail={chartSummary(toTMDBChart(row.chart))} />
-        <p className="text-muted-foreground text-[0.8125rem]">
+        <p className="text-muted-foreground text-[13px]">
           {t("web.admin.requests.rowDialog.builtInKeepsChart")}
         </p>
       </div>
@@ -381,13 +379,13 @@ function RowFields({
         <Label htmlFor={nameId}>{t("web.admin.requests.rowDialog.rowName")}</Label>
         <Input
           id={nameId}
-          className="h-10 text-[0.9375rem]"
+          className="h-10 text-[15px]"
           maxLength={80}
           value={row.title}
           placeholder={defaultTitle(row) || t("web.admin.requests.rowDialog.rowNamePlaceholder")}
           onChange={(event) => onChange({ ...row, title: event.target.value }, true)}
         />
-        {nameHelp ? <p className="text-muted-foreground text-[0.8125rem]">{nameHelp}</p> : null}
+        {nameHelp ? <p className="text-muted-foreground text-[13px]">{nameHelp}</p> : null}
       </div>
       {brand ? null : (
         <MoreOptions
@@ -405,7 +403,7 @@ function RowFields({
           <div className="flex items-center justify-between gap-4">
             <div>
               <Label htmlFor={hideId}>{t("web.admin.requests.rowDialog.hideAvailable")}</Label>
-              <p className="text-muted-foreground mt-1 text-[0.8125rem]">
+              <p className="text-muted-foreground mt-1 text-[13px]">
                 {t("web.admin.requests.rowDialog.hideAvailableHelp")}
               </p>
             </div>

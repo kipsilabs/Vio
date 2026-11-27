@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -116,6 +117,388 @@ func generatedDocument(t *testing.T) map[string]any {
 	return doc
 }
 
+// TestGeneratedDocumentStatuses walks the generated artifact: updateProfile
+// documents the 409 v1 answers a taken name with; every operation with a
+// request body documents the 408 the body-read deadline produces; the
+// service-backed public getSetupStatus documents the 503 its handler answers
+// when the account service is not wired, while the discovery operations do
+// not; and every profile-resolving operation documents the 404 viewer access
+// answers for an unknown X-Profile-Id and the X-Profile-Token header a
+// PIN-locked profile needs.
+func TestGeneratedDocumentStatuses(t *testing.T) {
+	doc := generatedDocument(t)
+	bodies := 0
+	expect := map[string]map[int]bool{
+		"getEventsCapabilities":          {http.StatusOK: true, http.StatusServiceUnavailable: true},
+		"getNetworkAccessCapabilities":   {http.StatusOK: true, http.StatusServiceUnavailable: true},
+		"getAdminNetworkAccessStatus":    {http.StatusOK: true, http.StatusNotFound: true},
+		"connectNetworkAccess":           {http.StatusAccepted: true, http.StatusOK: false, http.StatusNotFound: true, http.StatusRequestTimeout: true},
+		"disconnectNetworkAccess":        {http.StatusAccepted: true, http.StatusOK: false, http.StatusNotFound: true, http.StatusRequestTimeout: true},
+		"getSetupStatus":                 {http.StatusServiceUnavailable: true},
+		"getSystemInfo":                  {http.StatusServiceUnavailable: false},
+		"getServerIdentity":              {http.StatusOK: true, http.StatusServiceUnavailable: true},
+		"getServerConnections":           {http.StatusOK: true, http.StatusServiceUnavailable: true},
+		"getOpenAPIDocument":             {http.StatusServiceUnavailable: false},
+		"getCurrentUser":                 {http.StatusNotFound: false},
+		"listProgress":                   {http.StatusNotFound: true},
+		"listAdminUsers":                 {http.StatusNotFound: true},
+		"updateProfile":                  {http.StatusNotFound: true, http.StatusConflict: true},
+		"listProfiles":                   {http.StatusNotFound: true, http.StatusConflict: false},
+		"createProfile":                  {http.StatusNotFound: true, http.StatusConflict: true, http.StatusCreated: true, http.StatusOK: false},
+		"replaceProfileSectionOverrides": {http.StatusNoContent: true, http.StatusForbidden: true},
+		"resetProfileSectionOverrides":   {http.StatusNoContent: true},
+		"deleteProfile":                  {http.StatusNoContent: true, http.StatusConflict: true, http.StatusNotFound: true},
+		"deleteProfileAvatar":            {http.StatusNoContent: true, http.StatusNotFound: true},
+		"uploadProfileAvatar":            {http.StatusOK: true, http.StatusRequestEntityTooLarge: true, http.StatusUnsupportedMediaType: true},
+		"verifyProfilePIN":               {http.StatusOK: true, http.StatusNotFound: true},
+		"listHouseholdSessions":          {http.StatusOK: true, http.StatusForbidden: true},
+		"createLibrary":                  {http.StatusNotFound: true, http.StatusConflict: true, http.StatusCreated: true},
+		"updateLibrary":                  {http.StatusNotFound: true, http.StatusConflict: true},
+		"deleteLibrary":                  {http.StatusNotFound: true, http.StatusConflict: true, http.StatusAccepted: true},
+		"setRootOverride":                {http.StatusNotFound: true, http.StatusConflict: true, http.StatusNoContent: true},
+		"listLibraries":                  {http.StatusNotFound: true, http.StatusConflict: false},
+		// The settings section: every operation resolves a profile (404 for
+		// an unknown one); the contract itself is served from the build and
+		// so is not service-backed.
+		"getSettingsContract":                    {http.StatusNotFound: true, http.StatusServiceUnavailable: true},
+		"getPluginSettings":                      {http.StatusNotFound: true},
+		"updateSubtitleAppearanceDeviceOverride": {http.StatusNotFound: true, http.StatusRequestTimeout: true},
+		// The shortcut mutation documents the 409 the seam answers when its
+		// compare-and-set retries are exhausted; the single-key writes do not.
+		"updateNavigationShortcut": {http.StatusConflict: true, http.StatusNotFound: true},
+		"updateSettingValue":       {http.StatusConflict: false},
+	}
+	// Every operation the viewer-access gate fronts documents the header;
+	// the acting-admin class resolves the declared profile the same way.
+	profileToken := map[string]bool{
+		"updateAdminSectionSettings":           true,
+		"getAdminDashboardStats":               true,
+		"getScanCapabilities":                  true,
+		"startLibraryScan":                     true,
+		"cancelLibraryScans":                   true,
+		"listAdminAutoscanConnections":         true,
+		"getAdminAutoscanSettings":             true,
+		"getAdminAutoscanStatus":               true,
+		"listAdminAutoscanSources":             true,
+		"createEventsSocketTicket":             true,
+		"createAdminLogsSocketTicket":          true,
+		"getAdminLogsSocketCapabilities":       true,
+		"createPlaybackControlSocketTicket":    true,
+		"getPlaybackControlSocketCapabilities": true,
+		"contributeAdminFileMarkers":           true,
+		"listAdminFileMarkerContributions":     true,
+		"listAdminMarkerProviders":             true,
+		"updateAdminMarkerProvider":            true,
+		"validateAdminMarkerProvider":          true,
+		"createPluginLaunch":                   true,
+
+		"listAdminMarkerHistory":     true,
+		"listAdminFileMarkerHistory": true,
+		"listAdminItemMarkerHistory": true,
+
+		"refreshAdminEpisodeMarkers": true,
+		"redetectAdminEpisodeIntro":  true,
+		"redetectAdminItemMarkers":   true,
+
+		"getAdminItemTrickplay":        true,
+		"regenerateAdminItemTrickplay": true,
+		"listAdminTrickplayLibraries":  true,
+		"getAdminMarkerCapabilities":   true,
+		"createDownloads":              true,
+		"createDownloadSubscription":   true,
+		"updateDownloadSubscription":   true,
+		"deleteDownloadSubscription":   true,
+		"syncDownloadSubscription":     true,
+		"listDownloadSubscriptions":    true,
+		"getDownloadSubscription":      true,
+		"getDownloadManifest":          true,
+		"listDownloadBatchManifests":   true,
+		"downloadFile":                 true,
+		"headDownloadFile":             true,
+		"downloadFileViaProxy":         true,
+		"headDownloadFileViaProxy":     true,
+		"getDownloadArtwork":           true,
+		"getDownloadSubtitle":          true,
+
+		"listDownloads":                  true,
+		"getDownload":                    true,
+		"reportDownloadStatus":           true,
+		"deleteDownload":                 true,
+		"getDownloadCapability":          true,
+		"listSubtitleAIJobs":             true,
+		"getSubtitleAIJob":               true,
+		"getSubtitleAIQuota":             true,
+		"getAdminInviteCodeCapabilities": true, "listAdminInviteCodes": true, "createAdminInviteCode": true, "updateAdminInviteCode": true, "topUpAdminInviteCode": true, "deleteAdminInviteCode": true,
+		"listProgress": true, "listAdminUsers": true, "updateProfile": true, "listProfiles": true, "createProfile": true,
+		"getEbookCapability":          true,
+		"getEbookProgress":            true,
+		"saveEbookProgress":           true,
+		"getEbookReaderConfig":        true,
+		"saveEbookReaderConfig":       true,
+		"readEbookFile":               true,
+		"headEbookFile":               true,
+		"listEbookAnnotations":        true,
+		"createEbookAnnotation":       true,
+		"updateEbookAnnotation":       true,
+		"deleteEbookAnnotation":       true,
+		"listProfileSectionOverrides": true, "replaceProfileSectionOverrides": true, "resetProfileSectionOverrides": true,
+		"getProfileSectionSettings": true, "getProfileSectionFlags": true,
+		"deleteProfile": true, "deleteProfileAvatar": true, "uploadProfileAvatar": true, "verifyProfilePIN": true, "listHouseholdSessions": true,
+		"getSettingsContract": true, "getSettingsContractCapabilities": true, "getOverlayConfig": true,
+		"getEffectiveSubtitleAppearance": true, "updateSubtitleAppearanceDeviceOverride": true, "deleteSubtitleAppearanceDeviceOverride": true,
+		"listPluginSettings": true, "getPluginSettings": true, "updatePluginSettings": true,
+		"listSettingValues": true, "listEffectiveSettings": true, "resolveEffectiveSettings": true, "updateNavigationShortcut": true,
+		"getSettingValue": true, "updateSettingValue": true, "deleteSettingValue": true,
+		"getAudioPreference": true, "updateAudioPreference": true, "deleteAudioPreference": true,
+		"listLibraryPlaybackPreferences": true, "deleteLibraryPlaybackPreference": true, "updateLibraryPlaybackPreference": true,
+		"getSubtitlePreference": true, "updateSubtitlePreference": true, "deleteSubtitlePreference": true,
+		"listHistory": true, "removeHistoryEntries": true,
+		"syncProgress":  true,
+		"getWatchState": true, "getWatchTrickplay": true, "markWatched": true, "unmarkWatched": true, "refreshVirtualCandidates": true,
+		"cancelVirtualCandidatesRefresh": true,
+		"requestVirtualRelease":          true, "getVirtualLibraryCapabilities": true,
+		"cancelLibraryJob": true,
+		opListDevices:      true, opForgetDevice: true, opClearDeviceSettings: true,
+	}
+	// Shared policy discovery verifies an optional selected profile.
+	profileToken["getPolicyCapability"] = true
+	profileToken["getImageCapabilities"] = true
+	profileToken["listUserLibraries"] = true
+	for _, id := range []string{"listAdminDevices", "getAdminDevice", "getAdminDeviceCapabilities", "listAdminPlaybackSessions", "getAdminPlaybackSessionCapabilities", "listAdminNodeSessions", "getAdminPlaybackCommandCapabilities", "pauseAdminPlaybackSession", "resumeAdminPlaybackSession", "stopAdminPlaybackSession", "messageAdminPlaybackSession", "terminateAdminPlaybackSession"} {
+		profileToken[id] = true
+	}
+	// Disconnecting a sign-in is held to the household manager (#3967): both
+	// identity operations are profile scoped, so the optional X-Profile-Token
+	// is documented.
+	profileToken["listAccountIdentities"] = true
+	profileToken["deleteAccountIdentity"] = true
+	profileToken["getUserLibraryCapabilities"] = true
+	for _, id := range []string{"getOnboardingFlow", "getOnboardingState", "updateOnboardingProgress", "getOnboardingCapabilities"} {
+		profileToken[id] = true
+	}
+	for _, id := range historyImportOperationIDs {
+		profileToken[id] = true
+	}
+	expect["createHistoryImportRun"] = map[int]bool{http.StatusAccepted: true, http.StatusConflict: true, http.StatusNotFound: true}
+	expect["getHistoryImportRun"] = map[int]bool{http.StatusNotFound: true, http.StatusConflict: false}
+	for _, id := range libraryOperationIDs {
+		profileToken[id] = true
+	}
+	for _, id := range libraryViewOperationIDs {
+		profileToken[id] = true
+	}
+	// The episode release-timing capability rides the same viewer-access
+	// gate as every other profile-scoped read: a locked profile needs its
+	// proof token alongside the declared profile.
+	profileToken["getEpisodeReleaseCapability"] = true
+	for _, id := range homeOperationIDs {
+		profileToken[id] = true
+	}
+	for _, id := range []string{"listFavorites", "getFavorite", "addFavorite", "deleteFavorite", "listRatings", "getRating", "setRating", "deleteRating", "listWatchlist", "getWatchlistEntry", "addToWatchlist", "deleteWatchlistEntry"} {
+		profileToken[id] = true
+	}
+	for _, id := range watchlistTitleOperationIDs {
+		profileToken[id] = true
+	}
+	for _, id := range recommendationOperationIDs {
+		profileToken[id] = true
+	}
+	for _, id := range append(requestOperationIDs, requestLifecycleOperationIDs...) {
+		profileToken[id] = true
+	}
+	for _, id := range slices.Concat(adminRequestOperationIDs, adminRequestRouteOperationIDs, adminRequestQueueOperationIDs, adminRequestGroupOperationIDs) {
+		profileToken[id] = true
+	}
+	expect[opCreateRequest] = map[int]bool{http.StatusCreated: true, http.StatusConflict: true, http.StatusTooManyRequests: true, http.StatusNotFound: true}
+	expect[opListMyRequests] = map[int]bool{http.StatusNotFound: true, http.StatusConflict: false}
+	expect[opGetRequestMediaDetail] = map[int]bool{http.StatusNotFound: true, http.StatusConflict: true}
+	for _, id := range personalCollectionOperationIDs {
+		profileToken[id] = true
+	}
+	// The title-allowance surface resolves the acting profile: the household
+	// manager proving a PIN for the profile they act as, whichever profile the
+	// path names as the allowance's subject.
+	for _, id := range []string{
+		"getTitleAllowanceCapability", "listAllowedTitles", "allowTitle", "disallowTitle",
+		"listTitleAllowanceProfiles", "listAllowedCollections", "allowCollection",
+		"disallowCollection", "allowCollectionTitles",
+	} {
+		profileToken[id] = true
+	}
+	for _, id := range []string{"addAdminCollectionItem", "applyAdminCollectionTemplateBundle", "createAdminCollection", "createAdminCollectionGroup", "deleteAdminCollection", "deleteAdminCollectionGroup", "deleteAdminCollectionImage", "getAdminCollection", "getAdminCollectionCapabilities", "getAdminCollectionGroup", "getAdminCollectionGroupOrder", "getAdminCollectionItems", "getAdminCollectionItemsOrder", "getAdminCollectionJob", "getAdminCollectionOrder", "getAdminGroupCollectionOrder", "importAdminMDBList", "importAdminTMDB", "importAdminTMDBList", "importAdminTrakt", "listAdminCollectionGroups", "listAdminCollectionTemplateBundles", "listAdminCollectionTemplates", "listAdminCollections", "listAdminVirtualItems", "moveAndReorderAdminGroupCollections", "previewAdminCollection", "removeAdminCollectionItem", "reorderAdminCollectionGroups", "reorderAdminCollectionItems", "reorderAdminCollections", "startAdminCollectionTemplateBundleJob", "syncAdminCollection", "updateAdminCollection", "updateAdminCollectionGroup", "uploadAdminCollectionBackdrop", "uploadAdminCollectionPoster"} {
+		profileToken[id] = true
+	}
+	expect["createCollection"] = map[int]bool{http.StatusCreated: true, http.StatusOK: false}
+	expect["createCollectionGroup"] = map[int]bool{http.StatusCreated: true, http.StatusOK: false}
+	expect["importMDBListCollection"] = map[int]bool{http.StatusCreated: true, http.StatusOK: false}
+	expect["reorderCollections"] = map[int]bool{http.StatusOK: true, http.StatusPreconditionRequired: true, http.StatusPreconditionFailed: true}
+	expect["deleteCollectionGroup"] = map[int]bool{http.StatusNoContent: true}
+	expect["cancelLibraryJob"] = map[int]bool{http.StatusOK: true, http.StatusAccepted: true, http.StatusConflict: true, http.StatusNotFound: true}
+	expect["refreshLibraryMetadata"] = map[int]bool{http.StatusNotFound: true, http.StatusConflict: true, http.StatusAccepted: true}
+	expect["uploadLibraryPoster"] = map[int]bool{http.StatusNotFound: true, http.StatusRequestEntityTooLarge: true, http.StatusUnsupportedMediaType: true}
+	expect["getLibraryLayout"] = map[int]bool{http.StatusNotFound: true, http.StatusConflict: false}
+	for _, id := range []string{"listWebhookConnections", "createWebhookConnection", "updateWebhookConnection", "deleteWebhookConnection", "rotateWebhookConnection", "getWebhookMappings", "updateWebhookMappings", "listWebhookEvents"} {
+		profileToken[id] = true
+	}
+	for _, id := range []string{"getFileMarkers", "getItemMarkers", "setFileMarkers", "setItemMarkers", "clearFileMarkerSegment", "getSubtitleProviderStatus", "getSubtitleAIStatus", "listStoredSubtitles", "searchSubtitles", "downloadSubtitle", "uploadSubtitle", "detectSubtitleLanguage"} {
+		profileToken[id] = true
+	}
+	expect["refreshCatalogItemTrailers"] = map[int]bool{http.StatusOK: true, http.StatusAccepted: true, http.StatusConflict: true, http.StatusTooManyRequests: true}
+	expect["translateCatalogItemDescription"] = map[int]bool{http.StatusAccepted: true, http.StatusConflict: true}
+	expect["refreshPerson"] = map[int]bool{http.StatusAccepted: true, http.StatusTooManyRequests: true}
+	for _, id := range []string{"listAdminHistoryImportSources", "createAdminHistoryImportSource", "deleteAdminHistoryImportSource", "getAdminHistoryImportSource", "updateAdminHistoryImportSource", "getAdminHistoryImportCapabilities", "listAdminHistoryImportMappings", "createAdminHistoryImportMapping", "deleteAdminHistoryImportMapping", "getAdminHistoryImportMapping", "updateAdminHistoryImportMapping", "createAdminHistoryImportRun", "loginAdminHistoryImportPlex", "listAdminHistoryImportRuns", "getAdminHistoryImportRun", "cancelAdminHistoryImportRun", "bulkCreateAdminHistoryImportRuns", "clearAdminHistoryImportToken", "setAdminHistoryImportToken", "listAdminHistoryImportExternalUsers"} {
+		profileToken[id] = true
+	}
+
+	for _, id := range []string{opProgressBootstrapCapabilities, opCreateProgressSnapshot, opGetProgressSnapshot} {
+		profileToken[id] = true
+	}
+	expect[opCreateProgressSnapshot] = map[int]bool{http.StatusCreated: true, http.StatusConflict: true, http.StatusRequestEntityTooLarge: true, http.StatusTooManyRequests: true}
+	expect[opGetProgressSnapshot] = map[int]bool{http.StatusOK: true, http.StatusConflict: true, http.StatusNotFound: true}
+	profileToken["createAdminStorageTransition"] = true
+	profileToken["getAdminStorageTransitionCapabilities"] = true
+	profileToken["getAdminStorageTransitionSourceHealth"] = true
+	profileToken["cancelAdminJob"] = true
+	for _, id := range []string{"listAdminPluginCatalog", "listAdminPluginInstallations", "createAdminPluginInstallation", "updateAdminPluginInstallation", "applyAdminPluginUpdate", "restartAdminPluginInstallation", "deleteAdminPluginInstallation", "uploadAdminPluginInstallation", "createAdminPluginUpload", "putAdminPluginUploadChunk", "completeAdminPluginUpload", "cancelAdminPluginUpload", "updateAdminPluginInstallationConfig", "testAdminPluginInstallationConfig", "updateAdminPluginAuthBinding", "testAdminPluginAuthBinding", "updateAdminPluginTaskBinding", "forceReloadAdminNodes", "forceReloadAdminNode", "checkAdminNode", "reprobeAdminNode", "triggerAdminAutoscan", "createAdminAutoscanSourceWebhook", "rotateAdminAutoscanSourceWebhook", "deleteAdminAutoscanSourceWebhook", "createAdminAutoscanSource", "updateAdminAutoscanSource", "saveAdminDashboardLayout", "deleteAdminAutoscanSource", "resetAdminDashboardLayout", "updateAdminAutoscanSettings", "listAdminAutoscanEvents", "listAdminAutoscanScans", "deleteAdminPluginRepository", "updateAdminPluginRepository", "deleteAdminAutoscanConnection", "updateAdminAutoscanConnection", "createAdminAutoscanConnection", "testAdminAutoscanConnection", "createAdminPluginRepository", "getAdminStreamTelemetryParity", "listAdminPluginRepositories", "getAdminHardwareAcceleration", "getAdminDashboardLayout", "getAdminAutoscanRewriteSuggestions", "listAdminAutoscanAvailableSources", "listAdminAuditLogs", "listAdminOperationalLogs", "getAdminDashboardCapabilities", "updateAdminJellyfinCompatSettings", "getAdminJellyfinCompatStatus", "getAdminSetting", "getAdminSectionSettings", "getAdminPlaybackRoutingCapabilities", "updateAdminRateLimitConfig", "getAdminRateLimitConfig", "getAdminRateLimitStatus", "sendAdminTestEmail", "getAdminServerStatus", "listAdminNodes", "getAdminDashboardTimeseries", "getAdminDashboardPlaybackActivity", "getAdminDashboardTopActivity", "getAdminDashboardDownloadsStats", "deleteAdminDiagnosticReport", "listAdminDiagnosticReports", "getAdminDiagnosticReport", "downloadAdminDiagnosticReport", "getAdminBuildInfo", "getAdminSystemResources", "getAdminResourceCapabilities", "getAdminStoredSettings", "updateAdminSettings", "updateAdminSetting", "getAdminEffectiveSettings", "getAdminRestartKeys", "getAdminSensitiveSettingsStatus", "checkAdminSettingsConnection", "getAdminPluginCatalogSettings", "getAdminPluginCatalogStatus", "updateAdminPluginCatalogSettings", "createAdminNode", "updateAdminNode", "deleteAdminNode", "uploadAdminBrandingAsset", "deleteAdminBrandingAsset", "installAdminJellyfinCompatWeb", "removeAdminJellyfinCompatWeb", "requestAdminServerRestart", "getAdminNetworkAccessStatus", "connectNetworkAccess", "disconnectNetworkAccess"} {
+		profileToken[id] = true
+	}
+	for _, id := range []string{"listAdminItemImages", "applyAdminItemImage", "listAdminUnmatchedFiles", "getAdminItemMatchHints", "searchAdminItemMatches", "applyAdminItemMatch", "listAdminItemFiles", "splitAdminItem", "mergeAdminItem", "refreshAdminItemMetadata", "updateAdminItemMetadata", "translateAdminItemMetadata", "listAdminMetadataTranslationJobs", "cancelAdminMetadataTranslation", "refreshAdminPerson", "updateAdminPerson", "getAdminRecommendationsStatus", "triggerAdminRecommendationEmbeddings", "triggerAdminRecommendationTasteProfiles", "triggerAdminRecommendationCowatch", "triggerAdminRecommendationRefresh", "listAdminRatingSources", "getAdminRatingSourceCapabilities", "listAdminLiteraryCandidates", "linkAdminLiteraryItems", "confirmAdminLiteraryMatch", "ignoreAdminLiteraryMatch", "unlinkAdminLiteraryItem", opExportAdminCatalog, "createCatalogExportJob", "createCatalogImportJob", "importAdminCatalog", "publishCatalogExportJob", "getAdminCatalogSearchStatus", "listCatalogImportSources", "listLocalCatalogImportSources", "browseAdminFilesystem", "listAdminTasks", "getAdminTask", "runAdminTask", "cancelAdminTask", "getAdminTaskSchedule", "updateAdminTaskSchedule", "listAdminTaskHistory", "getAdminTaskMetrics", "listAdminJobs", "getAdminJobCapabilities"} {
+		profileToken[id] = true
+	}
+
+	for _, id := range []string{"listAdminSections", "createAdminSection", "getAdminSection", "updateAdminSection", "deleteAdminSection", "getAdminSectionOrder", "reorderAdminSections", "restoreAdminSections", "bulkCreateAdminSections", "previewAdminSection", "getAdminSectionCapabilities", "listAdminPolicyVendor", "listAdminPolicyDocuments", "createAdminPolicyDocument", "getAdminPolicyDocument", "deleteAdminPolicyDocument", "setAdminPolicyEnabled", "listAdminPolicyVersions", "createAdminPolicyVersion", "getAdminPolicyVersion", "activateAdminPolicyVersion", "validateAdminPolicy", "simulateAdminPolicy", "listAdminPolicyDecisions", "getAdminPolicyDecision"} {
+		profileToken[id] = true
+	}
+
+	for _, id := range []string{"getDirectDownload", "headDirectDownload", "getDirectDownloadProxy", "headDirectDownloadProxy", "getAdminSubtitleProviderConfiguration", "updateAdminSubtitleProviderConfiguration", "deleteAdminStoredSubtitle", "downloadAdminStoredSubtitle", "getAdminSubtitleMetadata", "getViewerSubtitleMetadata", "deleteStoredSubtitle", "syncStoredSubtitle", "getStoredSubtitleSync", "setStoredSubtitleTiming", "getSubtitleSyncStatus", "updateAdminSubtitleMetadata", "cancelSubtitleAIJob", "createSubtitleAIJob", "listAdminSubtitleProviders", "listAdminStoredSubtitles", "listAdminPlaybackHistory", "testAdminSubtitleProvider", "getPlaybackMedia", "headPlaybackMedia", "getPlaybackManifest", "getPlaybackSegment", "getPlaybackSubtitle", "headPlaybackSubtitle", "getPlaybackSubtitleFonts"} {
+		profileToken[id] = true
+	}
+	for _, id := range []string{"getAccountPasswordCapability", "changePassword", "approveDeviceHandoff"} {
+		profileToken[id] = true
+	}
+	for _, id := range []string{"getAdminAPIKeyCapabilities", "listAdminAPIKeys", "getAdminAPIKey", "createAdminAPIKey", "updateAdminAPIKeyTier", "deleteAdminAPIKey"} {
+		profileToken[id] = true
+	}
+
+	for _, id := range []string{"getAdminInvitationCapabilities", "listAdminInvitations", "getAdminInvitation", "createAdminInvitation", "resendAdminInvitation", "revokeAdminInvitation"} {
+		profileToken[id] = true
+	}
+	for _, id := range []string{"createAdminInvitation", "resendAdminInvitation", "acceptInvitation"} {
+		expect[id] = map[int]bool{http.StatusCreated: true, http.StatusConflict: true, http.StatusNotImplemented: true, http.StatusTooManyRequests: true}
+	}
+	expect["revokeAdminInvitation"] = map[int]bool{http.StatusNoContent: true}
+	expect["lookupInvitation"] = map[int]bool{http.StatusNotFound: true, http.StatusTooManyRequests: true, http.StatusInternalServerError: true}
+
+	for _, id := range []string{"listAdminAccessGroups", "createAdminAccessGroup", "deleteAdminAccessGroup", "getAdminAccessGroup", "updateAdminAccessGroup", "listAdminIPUsers", "createAdminUser", "getAdminAccountCapabilities", "deleteAdminUser", "getAdminUser", "updateAdminUser", "listAdminUserAPIKeys", "impersonateAdminUser", "transferAdminUserOwnership", "createAdminUserPasswordReset", "listAdminUserIPs", "listAdminUserProfiles", "listAdminUserSettingValues", "deleteAdminUserSettingValue", "setAdminUserSettingValue", "listAdminUserIdentities", "createAdminUserIdentity", "deleteAdminUserIdentity", "listAdminUserDevices", "getAdminUserWatchSummary", "listAdminUserDownloads", "getAdminUserDownloadSummary", "listAdminUserDownloadSubscriptions", "getAdminRequestUserUsage"} {
+		profileToken[id] = true
+	}
+	for _, id := range []string{createNotificationWebhookOperation, createNotificationServerChannelOperation, beginNotificationDiscordLinkOperation, testNotificationWebhookOperation, testNotificationServerChannelOperation, testAdminDiscordNotificationOperation, listNotificationWebPushOperation, listNotificationWebhooksOperation, listNotificationServerChannelsOperation, "getNotificationEmailPreferences", "updateNotificationEmailPreferences", "getNotificationDiscordPreferences", "updateNotificationDiscordPreferences", "registerAdminNotificationRelay", "clearAdminNotificationRelay", testAdminApplePushOperation, testAdminAndroidPushOperation, "getNotificationApplePushDisplay", "listNotifications", "getNotificationCapabilities", "getNotificationPreferences", "updateNotificationPreferences", "markNotificationsRead", "syncNotifications", "getNotificationUnreadCount", "getNotification", "markNotificationRead"} {
+		profileToken[id] = true
+	}
+	for _, id := range []string{"getNotificationEmailVerificationCapabilities", "requestNotificationEmailVerification", "getApplePushRegistrationCapabilities", "registerApplePushDevice", "createWatchTogetherSocketTicket", "createWatchTogetherRoom", "promoteWatchTogetherSuggestion", "createWatchTogetherSuggestion", "selectWatchTogetherRoomItem", "stageWatchTogetherRoomItem", "startWatchTogetherRoomPlayback", "stopWatchTogetherRoomPlayback", "updateWatchTogetherRoomSelectionMode", "queryWatchTogetherMemberState", "getWatchTogetherRoomPicker", "joinWatchTogetherRoom", "updateWatchTogetherRoomPolicy", "getWatchTogetherRoom", "closeWatchTogetherRoom", "updateAdminNotificationServerChannel", "rotateAdminNotificationServerChannelSecret", "updateNotificationWebhook", "rotateNotificationWebhookSecret", "deleteAdminNotificationServerChannel", "deleteNotificationWebhook", "clearNotificationEmailAddress", "unlinkNotificationDiscord", "getPushRegistrationCapabilities", "registerPushDevice", "unregisterPushDevice", "subscribeNotificationWebPush", "unsubscribeNotificationWebPush", "deleteNotificationWebPushSubscription", "listWatchTogetherSuggestions", "voteWatchTogetherSuggestion", "unvoteWatchTogetherSuggestion", "deleteWatchTogetherSuggestion"} {
+		profileToken[id] = true
+	}
+	profileToken[opFallbackWatchTogetherSource] = true
+	profileToken[opDiscoverVirtualCandidates] = true
+	expect[opFallbackWatchTogetherSource] = map[int]bool{200: true, 409: true}
+	expect["deleteWatchTogetherSuggestion"] = map[int]bool{204: true, 409: true}
+	expect["voteWatchTogetherSuggestion"] = map[int]bool{204: true, 409: true}
+	expect["unvoteWatchTogetherSuggestion"] = map[int]bool{204: true, 409: true}
+
+	for _, id := range []string{"getPlaybackCapabilities", "startPlayback", "updatePlaybackProgress", "stopPlayback", "reportPlaybackRouteEvent", "replanPlayback", "getPlaybackInventory"} {
+		profileToken[id] = true
+	}
+	for _, id := range []string{"pauseAdminDownloadPreparations", "resumeAdminDownloadPreparations", "cancelAdminDownloadPreparations", "listAdminDownloadPreparations", "getAdminDownloadPreparationCapabilities", "getAdminDownloadStorageCapabilities", "getAdminDownloadStorage", "listAdminDownloadStorageFiles", "listAdminDownloadStorageEvents", "deleteAdminDownloadStorageFiles", "deleteAdminDownloadStorageUntrackedFiles", "cleanUpAdminDownloadStorageLocation", "listAdminDownloadDevices", "listAdminDownloadEntries", "revokeAdminDownloads", "prepareDownloadAgain", "createPersonalAPIKey", "createDirectDownloadLink", "listAdminUserProfileSectionOverrides", "replaceAdminUserProfileSectionOverrides", "resetAdminUserProfileSectionOverrides", "getAdminUserProfileSectionSettings", "getAdminUserPolicyDefaults", "listAdminUserLoginSessions", "deleteAdminUserLoginSession", "deleteAdminUserLoginSessions", "setSubtitleTiming", "getSubtitleSync", "startSubtitleSync", "listSubtitleSync", "skipShuffleItem", "advanceShuffle", "getShuffleCapability", "createShuffle", "getShuffle", "deleteShuffle", "listAdminCollectionSections"} {
+		profileToken[id] = true
+	}
+	expect["startPlayback"] = map[int]bool{http.StatusCreated: true, http.StatusAccepted: false, http.StatusConflict: true, http.StatusNotImplemented: false}
+	expect["stopPlayback"] = map[int]bool{http.StatusOK: true, http.StatusAccepted: false, http.StatusConflict: true, http.StatusNotImplemented: false}
+	expect["updatePlaybackProgress"] = map[int]bool{http.StatusOK: true, http.StatusConflict: true, http.StatusNotImplemented: false}
+	expect["replanPlayback"] = map[int]bool{http.StatusOK: true, http.StatusNotFound: true, http.StatusConflict: true, http.StatusNotImplemented: false}
+	expect["reportPlaybackRouteEvent"] = map[int]bool{http.StatusAccepted: true, http.StatusForbidden: true, http.StatusTooManyRequests: true, http.StatusConflict: false}
+	profileToken["getAdminPlaybackSummary"] = true
+	profileToken["getThemeSongsCapability"] = true
+	profileToken["createThemeSongPlayback"] = true
+	// Fork surfaces whose registration carries the profile header.
+	for _, id := range []string{
+		"checkAdminAIProvider", "createAdminAIProvider", "deleteAdminAIProvider",
+		"deleteAdminOverlayImage", "getAdminCatalogCapabilities", "getAdminDashboardAPIClientEndpoints",
+		"getAdminDashboardAPIClients", "getAdminPlaybackHistoryCapabilities", "getCatalogBoxSet",
+		"getCatalogItemBoxSet", "getDiscoverRow", "getFavoriteMembership", "getPersonalListCapability",
+		"getRequestDiscoverLayout", "getWatchlistMembership", "listAdminAIProviderModels",
+		"listAdminAIProviders", "listAdminCatalogItems", "listAdminNodeSummaries",
+		"listRequestWatchProviders", "previewRequestDiscoverRow", "removeFailedRequest",
+		"reportPlaybackBandwidthProbe", "resetAdminDeviceLearnedLimit", "resetApplePushInstallation",
+		"resetRequestDiscoverLayout", "searchCatalogBoxSets", "updateAdminAIProvider",
+		"updateRequestDiscoverLayout", "uploadAdminItemImage", "uploadAdminOverlayImage",
+		"getAdminPluginCapabilities", "listAdminPluginProvisioningStatus",
+		"getAdminDirectConnectionsCapabilities", "getAdminDirectConnectionsStatus",
+		"getAdminRequestPoster", "getProfileSectionBaseline",
+	} {
+		profileToken[id] = true
+	}
+	for _, id := range []string{
+		"cancelLibraryMetadataTranslation", "clearResumePosition", "completeAdminChatGPTLogin", "disconnectAdminChatGPTAccount",
+		"drainAdminNode", "getAdminAICapabilities", "getAdminChatGPTConnection", "getAdminJob",
+		"getAdminNodeCapabilities", "getHomeCapabilities", "getLibraryJob", "getNotInterested",
+		"getNotInterestedCapability", "getProgressCapabilities", "ignoreUnmatchedItem", "listAdminChatGPTModels",
+		"listLibraryMetadataTranslationJobs", "listNotInterested", "listNotificationSeries", "listSeasonalThemes",
+		"markNotInterested", "muteNotificationSeries", "queryCatalogLetters", "resetAdminRecommendationEmbeddings",
+		"resumeAdminNode", "selectAdminChatGPTAccount", "startAdminChatGPTLogin", "translateLibraryMetadata",
+		"unignoreUnmatchedItem", "unmarkNotInterested", "unmuteNotificationSeries", "updateDevice",
+	} {
+		profileToken[id] = true
+	}
+	seen := map[string]bool{}
+	for path, item := range doc["paths"].(map[string]any) {
+		for method, raw := range item.(map[string]any) {
+			op := raw.(map[string]any)
+			responses := op["responses"].(map[string]any)
+			id, _ := op["operationId"].(string)
+			seen[id] = true
+			for status, want := range expect[id] {
+				if _, ok := responses[strconv.Itoa(status)]; ok != want {
+					t.Errorf("%s documents %d = %v, want %v", id, status, ok, want)
+				}
+			}
+			if got := documentsHeaderParam(op, profileTokenHeader); got != profileToken[id] {
+				t.Errorf("%s documents %s = %v, want %v", id, profileTokenHeader, got, profileToken[id])
+			}
+			if op["requestBody"] == nil {
+				continue
+			}
+			bodies++
+			if _, ok := responses[strconv.Itoa(http.StatusRequestTimeout)]; !ok {
+				t.Errorf("%s %s has a body but does not document 408", method, path)
+			}
+		}
+	}
+	if bodies == 0 {
+		t.Fatal("no operation with a request body; the 408 rule is untested")
+	}
+	for id := range expect {
+		if !seen[id] {
+			t.Errorf("operation %s is not in the generated document", id)
+		}
+	}
+}
+
+// documentsHeaderParam reports whether the decoded operation documents the header
+// parameter, and requires it to be optional with a description: the token
+// is proof for a locked profile, never a requirement of its own.
+func documentsHeaderParam(op map[string]any, name string) bool {
+	params, _ := op["parameters"].([]any)
+	for _, raw := range params {
+		p, _ := raw.(map[string]any)
+		if p["in"] == "header" && p["name"] == name {
+			required, _ := p["required"].(bool)
+			desc, _ := p["description"].(string)
+			return !required && desc != ""
+		}
+	}
+	return false
+}
+
 // TestGeneratedDocumentRequestMediaTypes: no operation documents a request
 // media type mediaTypeGuard would answer with 415. Huma documents a RawBody
 // as application/octet-stream; updateProfile carries one only for its
@@ -149,6 +532,105 @@ func TestGeneratedDocumentRequestMediaTypes(t *testing.T) {
 	}
 	if bodies == 0 {
 		t.Fatal("no operation with a request body; the media-type rule is untested")
+	}
+}
+
+var historyImportOperationIDs = []string{
+	"listHistoryImportSources", "listHistoryImportRuns", "createHistoryImportRun", "getHistoryImportRun", "createPlexPin", "checkPlexPin", "loginEmbyConnect",
+}
+
+// personalCollectionOperationIDs is every profile-scoped operation the
+// personal-collections section registers (stage A).
+var personalCollectionOperationIDs = []string{
+	"addCollectionItem",
+	"clearCollectionSortPreference",
+	"createCollection",
+	"createCollectionGroup",
+	"deleteCollection",
+	"deleteCollectionGroup",
+	"deleteCollectionImage",
+	"getCollection",
+	"getCollectionCapabilities",
+	"getCollectionGroup",
+	"getCollectionGroupsOrder",
+	"getCollectionItems",
+	"getCollectionItemsOrder",
+	"getCollectionOrder",
+	"getLibraryCollectionItems",
+	"importMDBListCollection",
+	"importTMDBCollection",
+	"importTMDBListCollection",
+	"importTraktCollection",
+	"listCollectionTemplates",
+	"listCollections",
+	"listServerCollections",
+	"listTopMDBListLists",
+	"previewCollection",
+	"removeCollectionItem",
+	"reorderCollectionGroups",
+	"reorderCollectionItems",
+	"reorderCollections",
+	"searchMDBListLists",
+	"setCollectionSortPreference",
+	"syncCollection",
+	"updateCollection",
+	"updateCollectionGroup",
+	"uploadCollectionPoster",
+}
+
+// libraryOperationIDs is every acting-admin library operation the
+// catalog-libraries section registers.
+var libraryOperationIDs = []string{
+	"listLibraries", "createLibrary", "updateLibrary", "deleteLibrary", "checkLibraryMount",
+	"listMetadataMatchQueues", "getLibraryProviderDefaults", "reorderLibraries", "listLibraryRoots",
+	"setRootOverride", "deleteRootOverride", "listSkippedRoots", "listStaleIds", "rematchStaleId", "listUnmatchedItems",
+	"confirmEmptyRootCleanup", "getMetadataMatchQueue", "retryMetadataMatchQueue", "cancelMetadataMatchQueue", "refreshLibraryMetadata",
+	"getLibraryProviders", "setLibraryProviders", "uploadLibraryPoster", "deleteLibraryPoster",
+	"getLibraryRealtimeMonitoring", "getLibraryCapabilities",
+}
+
+// libraryViewOperationIDs is every profile-scoped library read the
+// catalog-libraries section registers.
+var libraryViewOperationIDs = []string{
+	"getCatalogSearchCapabilities", "listCatalogItems", "listAudiobookGroups", "getCatalogFilters", "searchCatalogFacet", "queryCatalogItems", "getCatalogItem",
+	"listCatalogItemEpisodes", "listCatalogItemMangaFiles", "listCatalogItemVersions", "checkCatalogVersions", "listSeriesSeasons", "getSeriesSeason", "listSeasonEpisodes",
+	"getTrailersCapability", "refreshCatalogItemTrailers", "getMetadataAICapability", "translateCatalogItemDescription", "getRatingsCapability",
+	"getItemCollectionsCapability",
+	"listPeople", "getPerson", "refreshPerson", "getLiteraryWork",
+	"getLibraryLayout", "listLibrarySections", "getLibrarySectionItems", "getLibraryCollections", "listLibraryUserCollections",
+}
+
+// recommendationOperationIDs is every profile-scoped recommendation read the
+// catalog-recommendations section registers.
+var recommendationOperationIDs = []string{
+	"listBecauseWatched", "getDiscover", "getForYouMain", "listForYouRows", "listPopular", "listRecentlyAdded", "getRecommendationSection",
+	"listSimilar", "listSimilarUsersLiked", "getTasteProfile", opListTasteSeedItems, "createTasteSeed", "getWatchTonight", "listWatchTonightCards",
+}
+
+func TestImpliedStatusesForConcurrency(t *testing.T) {
+	has := func(s []int, v int) bool {
+		for _, x := range s {
+			if x == v {
+				return true
+			}
+		}
+		return false
+	}
+	plain := ImpliedStatuses(ClassPublic, false, false, false, true, false, false, false, false)
+	if has(plain, http.StatusPreconditionFailed) || has(plain, http.StatusPreconditionRequired) || has(plain, http.StatusNotModified) {
+		t.Fatalf("plain operation implies concurrency statuses: %v", plain)
+	}
+	guarded := ImpliedStatuses(ClassPublic, false, false, true, true, true, false, false, false)
+	if !has(guarded, http.StatusPreconditionFailed) || !has(guarded, http.StatusPreconditionRequired) || has(guarded, http.StatusNotModified) {
+		t.Fatalf("guarded = %v", guarded)
+	}
+	conditional := ImpliedStatuses(ClassPublic, false, false, false, true, false, true, false, false)
+	if !has(conditional, http.StatusNotModified) || !has(conditional, http.StatusPreconditionFailed) || has(conditional, http.StatusPreconditionRequired) {
+		t.Fatalf("conditional = %v", conditional)
+	}
+	createOnly := ImpliedStatuses(ClassPublic, false, false, true, true, false, false, true, false)
+	if !has(createOnly, http.StatusPreconditionFailed) || has(createOnly, http.StatusPreconditionRequired) || has(createOnly, http.StatusNotModified) {
+		t.Fatalf("createOnly = %v", createOnly)
 	}
 }
 

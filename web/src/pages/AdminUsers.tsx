@@ -60,12 +60,11 @@ import {
   SortControl,
   TOUCH_CONTROL_CLASS,
 } from "@/components/admin/libraries/DiagnosticsListParts";
-import { useWideTableLayout } from "@/components/admin/libraries/diagnosticsListState";
+import { useLibrariesTableLayout } from "@/components/admin/libraries/diagnosticsListState";
 import { AdminUserCompactList } from "@/components/admin/users/AdminUserCompactList";
 import {
   AdminUserRoleBadge,
   AdminUserStatusBadge,
-  BreakableEmail,
 } from "@/components/admin/users/AdminUserRowParts";
 import {
   USER_SORT_FIELDS,
@@ -79,7 +78,6 @@ import {
 import { CreateUserDialogContent } from "@/components/admin/users/CreateUserForm";
 import { useAdminUserRows } from "@/components/admin/users/useAdminUserRows";
 import { useT } from "@/i18n";
-import { emailDir } from "@/lib/direction";
 import { cn } from "@/lib/utils";
 
 const PAGE_SIZE_OPTIONS = ["25", "50", "100"] as const;
@@ -129,9 +127,8 @@ function AdminUsersPage() {
   const [pageSize, setPageSize] = useState(25);
   const [sortField, setSortField] = useState<UserSortField>("username");
   const [sortDir, setSortDir] = useState<SortDirection>("asc");
-  // The table from xl up, compact rows below: at lg the admin sidebar leaves the
-  // table too little room. Tests have no matchMedia and get the table.
-  const showTable = useWideTableLayout();
+  // Tables from lg up, compact rows below; tests have no matchMedia and get the table.
+  const isDesktop = useLibrariesTableLayout();
 
   const filteredUsers = useMemo(() => {
     const q = search.toLowerCase();
@@ -165,7 +162,7 @@ function AdminUsersPage() {
     setSortDir(defaultSortDirection(field));
   }
 
-  // The Sort control below xl: picking a field acts like clicking its header.
+  // The Sort control below lg: picking a field acts like clicking its header.
   function handleSortFieldChange(field: UserSortField) {
     if (field !== sortField) handleSort(field);
   }
@@ -323,9 +320,8 @@ function AdminUsersPage() {
           </TabsTrigger>
         </TabsList>
         <TabsContent value="users" className="pt-4">
-          {/* With the compact rows (below xl): search on its own row, then the group filter
-              and Sort (stacked below sm). */}
-          <div className="mb-4 flex flex-col gap-2 xl:flex-row">
+          {/* Below lg: search on its own row, then the group filter and Sort (stacked below sm). */}
+          <div className="mb-4 flex flex-col gap-2 lg:flex-row">
             <div className="relative flex-1">
               <Search className="text-muted-foreground absolute start-3 top-1/2 h-4 w-4 -translate-y-1/2" />
               <Input
@@ -376,7 +372,7 @@ function AdminUsersPage() {
                   <SelectItem value="none">{t("web.admin.users.list.noGroup")}</SelectItem>
                 </SelectContent>
               </Select>
-              {showTable ? null : (
+              {isDesktop ? null : (
                 // SortControl carries its own bottom margin for the cards; the row's gap spaces it here.
                 <div className="min-w-0 flex-1 *:mb-0!">
                   <SortControl
@@ -407,7 +403,7 @@ function AdminUsersPage() {
             </div>
           )}
           <div className="surface-panel overflow-x-auto rounded-2xl border-0">
-            {showTable ? (
+            {isDesktop ? (
               <Table>
                 <TableHeader>
                   <TableRow>
@@ -470,33 +466,16 @@ function AdminUsersPage() {
                     const u = row.user;
                     return (
                       <TableRow key={u.id}>
-                        {/* Usernames, emails and group names wrap, so a long one
-                            can't push the last columns out of view. */}
-                        <TableCell className="whitespace-normal">
-                          <Link
-                            to={row.detailPath}
-                            dir="auto"
-                            className="align-with-page block w-fit max-w-full font-medium wrap-anywhere hover:underline"
-                          >
+                        <TableCell>
+                          <Link to={row.detailPath} className="font-medium hover:underline">
                             {u.username}
                           </Link>
                         </TableCell>
-                        <TableCell className="whitespace-normal">
-                          {/* Left to right unless it starts in a right-to-left script,
-                              as in the compact rows; w-fit keeps it on the page's start side. */}
-                          <span
-                            dir={emailDir(u.email)}
-                            className="align-with-page block w-fit max-w-full wrap-anywhere"
-                          >
-                            <BreakableEmail email={u.email} />
-                          </span>
-                        </TableCell>
+                        <TableCell>{u.email}</TableCell>
                         <TableCell>
                           <AdminUserRoleBadge user={u} />
                         </TableCell>
-                        {/* At least 6rem, so a squeezed table keeps a group name's
-                            ordinary words whole and gives way in the username and email. */}
-                        <TableCell className="min-w-24 whitespace-normal">
+                        <TableCell>
                           {row.group.kind === "admin" ? (
                             <span className="text-muted-foreground">
                               {t("web.admin.users.list.adminGroupNone")}
@@ -508,8 +487,7 @@ function AdminUsersPage() {
                           ) : (
                             <Link
                               to={`/admin/access-groups/${row.group.id}`}
-                              dir="auto"
-                              className="align-with-page block w-fit max-w-full wrap-anywhere hover:underline"
+                              className="hover:underline"
                             >
                               {row.group.name}
                             </Link>

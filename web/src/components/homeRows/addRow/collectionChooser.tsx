@@ -1,4 +1,3 @@
-import type { ReactNode } from "react";
 import { Search } from "lucide-react";
 import { PosterArt } from "@/components/calm/PosterTile";
 import { Input } from "@/components/ui/input";
@@ -83,7 +82,7 @@ export function CollectionSearchBar({
             type="button"
             aria-pressed={filter === name}
             onClick={() => onFilterChange(name)}
-            className="text-muted-foreground hover:text-foreground focus-visible:ring-ring/50 aria-pressed:bg-background aria-pressed:text-foreground h-8 rounded-lg px-2.5 text-[0.8125rem] font-medium outline-none focus-visible:ring-[3px] aria-pressed:shadow-sm"
+            className="text-muted-foreground hover:text-foreground focus-visible:ring-ring/50 aria-pressed:bg-background aria-pressed:text-foreground h-8 rounded-lg px-2.5 text-[13px] font-medium outline-none focus-visible:ring-[3px] aria-pressed:shadow-sm"
           >
             {t(label)}
           </button>
@@ -97,7 +96,7 @@ export function CollectionSearchBar({
           <SelectTrigger
             size="sm"
             aria-label={t("web.home.addRow.collection.library")}
-            className="max-w-48 text-[0.8125rem]"
+            className="max-w-48 text-[13px]"
           >
             <SelectValue />
           </SelectTrigger>
@@ -127,7 +126,7 @@ export function CollectionOptionBody({
   title: string;
   posterUrl?: string;
   thumbhash?: string;
-  meta: ReactNode;
+  meta: string;
   /** The id of the meta line screen readers hear, for the item's aria-describedby. */
   metaId: string;
   /** What screen readers hear in place of `meta`; `meta` when absent. */
@@ -146,20 +145,12 @@ export function CollectionOptionBody({
         <span dir="auto" className="block w-fit max-w-full truncate text-sm font-semibold">
           {title}
         </span>
-        {srMeta === undefined ? (
-          <span id={metaId} className="text-muted-foreground block truncate text-[0.8125rem]">
-            {meta}
-          </span>
-        ) : (
-          <>
-            <span aria-hidden className="text-muted-foreground block truncate text-[0.8125rem]">
-              {meta}
-            </span>
-            <span id={metaId} className="sr-only">
-              {srMeta}
-            </span>
-          </>
-        )}
+        <span aria-hidden className="text-muted-foreground block truncate text-[13px]">
+          {meta}
+        </span>
+        <span id={metaId} className="sr-only">
+          {srMeta ?? meta}
+        </span>
       </span>
     </>
   );

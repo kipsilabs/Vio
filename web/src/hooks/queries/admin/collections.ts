@@ -1,10 +1,23 @@
 import {
+  adminCreateBody,
+  adminImportBody,
   adminMutationMessage,
   fetchAdminCollections,
   fetchAdminCollectionSnapshot,
+  fetchAdminGroups,
+  saveAdminArtwork,
   templateApplyBody,
   templateResultFromV2,
+  adminUpdateBody,
 } from "@/api/adminCollections";
+import { ApiClientError, apiV1 } from "@/api/client";
+import type {
+  CreateLibraryCollectionRequest,
+  ImportMDBListCollectionRequest,
+  ImportTMDBCollectionRequest,
+  ImportTMDBListCollectionRequest,
+  UpdateLibraryCollectionRequest,
+} from "@/api/types";
 import { requiredETag } from "@/api/v2/etag";
 import { t } from "@/i18n";
 import { adminJobFromV2 } from "@/api/v2/libraries";
@@ -18,11 +31,43 @@ import { SERVER_SCOPE } from "@/lib/collections/scope";
 import { queryOptions, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { toast } from "sonner";
+import { isTerminalItemDetailNotFound } from "../mediaSurfaceRefresh";
 import { runBulkDelete, type BulkDeleteProgress } from "../bulkDelete";
 import { invalidateAdminCollectionQueries } from "../collectionSurfaceRefresh";
-import { adminKeys } from "../keys";
+import { adminKeys, catalogKeys, sectionKeys } from "../keys";
 
 const ADMIN_STALE_TIME = 30_000;
+
+function isLikelyRequestTimeout(error: unknown): boolean {
+  if (error instanceof ApiClientError) {
+    return (
+      error.status === 408 || error.status === 502 || error.status === 503 || error.status === 504
+    );
+  }
+  return error instanceof TypeError;
+}
+
+function applyTemplateBundleErrorMessage(error: unknown): string {
+  if (isLikelyRequestTimeout(error)) {
+    return "The apply request timed out. Silo may still be creating collections; refresh in a minute.";
+  }
+  return error instanceof Error ? error.message : "Failed to apply defaults";
+}
+
+export function useAdminCollectionSnapshot(id?: string) {
+  return useQuery({
+    queryKey: ["admin", "collections", "edit", id],
+    queryFn: () => fetchAdminCollectionSnapshot(id!),
+    enabled: !!id,
+  });
+}
+
+function showArtworkErrors(result: { artworkErrors: string[] }) {
+  if (result.artworkErrors.length)
+    toast.warning("Collection saved, but artwork could not be saved", {
+      description: result.artworkErrors.join(". "),
+    });
+}
 
 export function useAdminCollectionCapabilities(enabled = true) {
   return useQuery({
@@ -47,6 +92,146 @@ export function useAdminCollections(libraryId?: number) {
  * create, keep and leave out. It never deletes existing collections, and
  * carries `featured` only when the admin asked for hero banners.
  */
+export function useAdminCollectionGroups(libraryId?: number) {
+  return useQuery({
+    queryKey: adminKeys.collectionGroups(libraryId),
+    queryFn: () => fetchAdminGroups(libraryId!).then((data) => data.groups),
+    staleTime: ADMIN_STALE_TIME,
+    enabled: libraryId !== undefined,
+  });
+}
+
+export function useCreateAdminCollection() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    retry: false,
+    mutationFn: ({
+      body,
+      poster,
+      backdrop,
+    }: {
+      body: CreateLibraryCollectionRequest;
+      poster?: File | null;
+      backdrop?: File | null;
+    }) => {
+      return v2("POST /api/v2/admin/collections", { body: adminCreateBody(body) }).then((value) =>
+        saveAdminArtwork(value, body, poster, backdrop),
+      );
+    },
+    onSuccess: (result) => {
+      showArtworkErrors(result);
+      toast.success("Collection created");
+      void invalidateAdminCollectionQueries(queryClient);
+    },
+    onError: (error) => {
+      toast.error(error instanceof Error ? error.message : "Failed to save");
+    },
+  });
+}
+
+export function useApplyCollectionTemplateBundle() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    retry: false,
+    mutationFn: ({
+      bundleId,
+      body,
+    }: {
+      bundleId: string;
+      body: ApplyCollectionTemplateBundleRequest;
+    }) =>
+      v2("POST /api/v2/admin/collections/template-bundles/{bundle_id}/apply", {
+        path: { bundle_id: bundleId },
+        body: templateApplyBody(body),
+      }).then(templateResultFromV2),
+    onSuccess: (result) => {
+      if (!result.dry_run) {
+        const created = result.created.length;
+        const deleted = result.deleted?.length ?? 0;
+        const syncQueued = result.sync_queued?.length ?? 0;
+        const failed = result.failed.length;
+        const deleteFailed = result.delete_failed?.length ?? 0;
+        const failureCount = failed + deleteFailed;
+        if (created > 0 || deleted > 0 || syncQueued > 0) {
+          const message = [
+            deleted > 0 ? `Deleted ${deleted}` : "",
+            created > 0 ? `created ${created}` : "",
+            syncQueued > 0 ? `queued ${syncQueued} syncs` : "",
+            failureCount > 0 ? `${failureCount} failed` : "",
+          ]
+            .filter(Boolean)
+            .join("; ");
+          toast.success(message);
+        }
+        void invalidateAdminCollectionQueries(queryClient);
+        void queryClient.invalidateQueries({ queryKey: sectionKeys.all });
+      }
+    },
+    onError: (error) => {
+      toast.error(applyTemplateBundleErrorMessage(error));
+    },
+  });
+}
+
+export function useUpdateAdminCollection() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    retry: false,
+    mutationFn: ({
+      id,
+      etag,
+      body,
+      poster,
+      backdrop,
+      removeArtwork,
+    }: {
+      id: string;
+      etag: string;
+      body: UpdateLibraryCollectionRequest;
+      poster?: File | null;
+      backdrop?: File | null;
+      removeArtwork?: ("poster" | "backdrop")[];
+    }) =>
+      v2("PATCH /api/v2/admin/collections/{id}", {
+        path: { id },
+        headers: { "If-Match": requiredETag(etag) },
+        body: adminUpdateBody(body),
+      }).then((value) => saveAdminArtwork(value, body, poster, backdrop, removeArtwork)),
+    onSuccess: (result) => {
+      showArtworkErrors(result);
+      toast.success("Collection saved");
+      void invalidateAdminCollectionQueries(queryClient);
+    },
+    onError: (error) => {
+      toast.error(adminMutationMessage(error, "Failed to save"));
+      void invalidateAdminCollectionQueries(queryClient);
+    },
+  });
+}
+
+export function useDeleteAdminCollection() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    retry: false,
+    mutationFn: ({ id, libraryId, etag }: { id: string; libraryId: number; etag: string }) =>
+      v2("DELETE /api/v2/admin/collections/{id}", {
+        path: { id },
+        headers: { "If-Match": requiredETag(etag) },
+      }).then(() => libraryId),
+    onSuccess: (_libraryId) => {
+      toast.success("Collection deleted");
+      void invalidateAdminCollectionQueries(queryClient);
+    },
+    onError: (error) => {
+      toast.error(adminMutationMessage(error, "Failed to delete"));
+      void invalidateAdminCollectionQueries(queryClient);
+    },
+  });
+}
+
 export function starterPackDryRunQuery(
   packId: string,
   body: Pick<ApplyCollectionTemplateBundleRequest, "library_ids" | "featured">,
@@ -263,4 +448,161 @@ export function useDeleteAdminCollections() {
   });
 
   return { ...mutation, progress };
+}
+
+export function useSyncAdminCollection() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    retry: false,
+    mutationFn: ({ id, libraryId }: { id: string; libraryId: number }) =>
+      v2("POST /api/v2/admin/collections/{id}/sync", { path: { id } }).then((data) => ({
+        data,
+        libraryId,
+      })),
+    onSuccess: ({ data, libraryId: _libraryId }) => {
+      toast.success(
+        data.status === "warning" ? "Collection synced with warnings" : "Collection synced",
+      );
+      void invalidateAdminCollectionQueries(queryClient);
+    },
+    onError: (error) => {
+      toast.error(error instanceof Error ? error.message : "Sync failed");
+    },
+  });
+}
+
+export function useImportMDBListCollection() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    retry: false,
+    mutationFn: ({
+      body,
+      poster,
+      backdrop,
+    }: {
+      body: ImportMDBListCollectionRequest;
+      poster?: File | null;
+      backdrop?: File | null;
+    }) => {
+      return v2("POST /api/v2/admin/collections/import/mdblist", {
+        body: adminImportBody(body),
+      }).then(async (result) => ({
+        ...result,
+        ...(await saveAdminArtwork(result.collection, body, poster, backdrop)),
+      }));
+    },
+    onSuccess: (result) => {
+      showArtworkErrors(result);
+      toast.success(
+        result.sync_run?.status === "warning"
+          ? "MDBList imported with warnings"
+          : "MDBList imported",
+      );
+      void invalidateAdminCollectionQueries(queryClient);
+    },
+    onError: (error) => {
+      toast.error(error instanceof Error ? error.message : "Import failed");
+    },
+  });
+}
+
+export function useImportTMDBCollection() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    retry: false,
+    mutationFn: ({
+      body,
+      poster,
+      backdrop,
+    }: {
+      body: ImportTMDBCollectionRequest;
+      poster?: File | null;
+      backdrop?: File | null;
+    }) => {
+      return v2("POST /api/v2/admin/collections/import/tmdb", { body: adminImportBody(body) }).then(
+        async (result) => ({
+          ...result,
+          ...(await saveAdminArtwork(result.collection, body, poster, backdrop)),
+        }),
+      );
+    },
+    onSuccess: (result) => {
+      showArtworkErrors(result);
+      toast.success(
+        result.sync_run?.status === "warning"
+          ? "TMDB collection imported with warnings"
+          : "TMDB collection imported",
+      );
+      void invalidateAdminCollectionQueries(queryClient);
+    },
+    onError: (error) => {
+      toast.error(error instanceof Error ? error.message : "Import failed");
+    },
+  });
+}
+
+export function useImportTMDBListCollection() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    retry: false,
+    mutationFn: ({
+      body,
+      poster,
+      backdrop,
+    }: {
+      body: ImportTMDBListCollectionRequest;
+      poster?: File | null;
+      backdrop?: File | null;
+    }) => {
+      return v2("POST /api/v2/admin/collections/import/tmdb-list", {
+        body: adminImportBody(body),
+      }).then(async (result) => ({
+        ...result,
+        ...(await saveAdminArtwork(result.collection, body, poster, backdrop)),
+      }));
+    },
+    onSuccess: (result) => {
+      showArtworkErrors(result);
+      toast.success(
+        result.sync_run?.status === "warning"
+          ? "TMDB list imported with warnings"
+          : "TMDB list imported",
+      );
+      void invalidateAdminCollectionQueries(queryClient);
+    },
+    onError: (error) => {
+      toast.error(error instanceof Error ? error.message : "Import failed");
+    },
+  });
+}
+
+export function usePurgeVirtualPlaybackItems() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (options?: { dryRun?: boolean; libraryId?: number }) =>
+      apiV1<{ success: boolean; files_deleted: number; items_deleted: number; message: string }>(
+        `/admin/collections/purge-virtual?${new URLSearchParams({
+          ...(options?.dryRun ? { dry_run: "true" } : {}),
+          ...(options?.libraryId ? { library_id: String(options.libraryId) } : {}),
+        })}`,
+        { method: "POST" },
+      ),
+    onSuccess: (result) => {
+      toast.success(result.message);
+      void invalidateAdminCollectionQueries(queryClient);
+      void queryClient.invalidateQueries({ queryKey: sectionKeys.all });
+      void queryClient.invalidateQueries({
+        queryKey: catalogKeys.all,
+        predicate: (query) => !isTerminalItemDetailNotFound(query),
+      });
+    },
+    onError: (error) => {
+      toast.error(error instanceof Error ? error.message : "Virtual library purge failed");
+    },
+  });
 }

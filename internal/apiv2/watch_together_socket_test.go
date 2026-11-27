@@ -43,7 +43,7 @@ func TestRoomSocketTicketAndRawRoute(t *testing.T) {
 	headers := profileOwner()
 	headers["X-Room-Token"] = "original-room-proof"
 	r := do(t, h, "POST", path, "", headers)
-	if r.Code != 200 || f.room != "room" || f.proof != "original-room-proof" || f.identity.SessionID != "session" || f.identity.ProfileID != "p-owner" || !strings.Contains(r.Body.String(), `"protocol":"silo.room.v2"`) || !strings.Contains(r.Body.String(), `"max_connection_seconds":300`) {
+	if r.Code != 200 || f.room != "room" || f.proof != "original-room-proof" || f.identity.SessionID != "session" || f.identity.ProfileID != "p-owner" || !strings.Contains(r.Body.String(), `"protocol":"vio.room.v2"`) || !strings.Contains(r.Body.String(), `"max_connection_seconds":300`) {
 		t.Fatalf("%d %s %+v", r.Code, r.Body.String(), f)
 	}
 	if r.Header().Get("Cache-Control") != "no-store" {

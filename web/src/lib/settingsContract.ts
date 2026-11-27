@@ -255,6 +255,8 @@ export const SETTING_KEYS = {
   PLAYBACK_SUBTITLE_LANGUAGE: "playback.subtitle_language",
   /** Subtitles */
   PLAYBACK_SUBTITLE_MODE: "playback.subtitle_mode",
+  /** Version order */
+  PLAYBACK_VERSION_SORT: "playback.version_sort",
   /** Audio sync offset */
   PLAYER_AUDIO_SYNC_MS: "player.audio_sync_ms",
   /** Audiobook rewind interval */
@@ -956,6 +958,21 @@ export const SETTING_DEFINITIONS: Record<SettingKey, SettingDefinition> = {
       { value: "always", label: "Always on", introducedIn: 1 },
       { value: "off", label: "Off", introducedIn: 1 },
     ],
+  },
+  "playback.version_sort": {
+    key: "playback.version_sort",
+    type: "object",
+    nullable: true,
+    persistence: "remote",
+    introducedIn: 10,
+    scopes: ["profile"],
+    scopeIntroducedIn: [10],
+    resolutionOrder: ["profile", "default"],
+    defaultValue: null,
+    label: "Version order",
+    description: "Choose how the versions of an item are ordered for you.",
+    category: "playback",
+    control: "panel",
   },
   "player.audio_sync_ms": {
     key: "player.audio_sync_ms",

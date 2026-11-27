@@ -15,12 +15,11 @@ import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { V2ProblemError } from "@/api/v2/request";
 import { useUpdateAdminUserSignIn } from "@/hooks/queries/admin/externalSignIn";
-import { usePasswordPolicy } from "@/hooks/queries/account";
 import { useT } from "@/i18n";
 import { TOUCH_TARGETS } from "@/lib/touchTargets";
 import { cn } from "@/lib/utils";
 import { adminSignInErrorText } from "@/lib/externalSignInAdmin";
-import { newPasswordHint, newPasswordProblem, passwordErrorMessage } from "@/lib/newPassword";
+import { newPasswordProblem, passwordErrorMessage } from "@/lib/newPassword";
 
 /**
  * Sets a Silo password on an account that has no password sign-in, such as
@@ -46,7 +45,6 @@ export function AdminUserSetPasswordDialog({
   onDone?: (message: string) => void;
 }) {
   const t = useT();
-  const passwordPolicy = usePasswordPolicy();
   const update = useUpdateAdminUserSignIn();
   const [password, setPassword] = useState("");
   const [temporary, setTemporary] = useState(true);
@@ -60,7 +58,7 @@ export function AdminUserSetPasswordDialog({
 
   function submit(event: FormEvent) {
     event.preventDefault();
-    const problem = newPasswordProblem(password, password, passwordPolicy);
+    const problem = newPasswordProblem(password, password);
     if (problem) {
       setError(problem);
       return;
@@ -134,8 +132,7 @@ export function AdminUserSetPasswordDialog({
               onChange={(event) => setPassword(event.target.value)}
             />
             <p id={hintId} className="text-muted-foreground text-xs">
-              {newPasswordHint(passwordPolicy)}
-              <> {t("web.admin.users.setPasswordDialog.shareHint", { username: user.username })}</>
+              {t("web.admin.users.setPasswordDialog.hint", { username: user.username })}
             </p>
           </div>
           <div className="flex items-center gap-2">

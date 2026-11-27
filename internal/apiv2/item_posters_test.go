@@ -2,7 +2,6 @@ package apiv2
 
 import (
 	"context"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -12,7 +11,6 @@ import (
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/artworkurl"
-	"github.com/Silo-Server/silo-server/internal/blobstore"
 	"github.com/Silo-Server/silo-server/internal/blobstore/blobstoretest"
 	"github.com/Silo-Server/silo-server/internal/imagecache"
 	"github.com/Silo-Server/silo-server/internal/metadata"
@@ -56,16 +54,8 @@ func (f *posterFetcherFake) Fetch(_ context.Context, _, rawURL string) (imagecac
 }
 
 func newPosterHandler(source ItemPosterSource, fetcher RemotePosterFetcher) (http.Handler, *artworkurl.ItemPosters) {
-	return newPosterHandlerWithStore(source, fetcher, nil)
-}
-
-func newPosterHandlerWithStore(source ItemPosterSource, fetcher RemotePosterFetcher, store blobstore.Store) (http.Handler, *artworkurl.ItemPosters) {
-	posters := newTestItemPosters(&posterPresignFake{})
-	return NewHandler(Dependencies{ItemPosters: posters, ItemPosterSource: source, RemotePosters: fetcher, ArtworkStore: store}), posters
-}
-
-func newTestItemPosters(presign artworkurl.PosterPresigner) *artworkurl.ItemPosters {
-	return artworkurl.NewItemPosters("test-secret", time.Hour, presign, artworkurl.NewSigner("test-secret", time.Hour))
+	posters := artworkurl.NewItemPosters("test-secret", time.Hour, &posterPresignFake{})
+	return NewHandler(Dependencies{ItemPosters: posters, ItemPosterSource: source, RemotePosters: fetcher}), posters
 }
 
 // A poster link authorizes one item until it expires; nothing else about the
@@ -84,7 +74,7 @@ func TestItemPosterRejectsLinksItDidNotIssue(t *testing.T) {
 		"bad signature":     valid + "x",
 		"expired":           posters.Link("movie-a", time.Now().Add(-3*time.Hour)),
 		"other item":        forOther,
-		"other secret":      artworkurl.NewItemPosters("other-secret", time.Hour, nil, nil).Link("movie-a", time.Now()),
+		"other secret":      artworkurl.NewItemPosters("other-secret", time.Hour, nil).Link("movie-a", time.Now()),
 		"artwork signature": Prefix + "/item-posters/movie-a?" + strings.SplitN(artworkSignature(t, "movie-a"), "?", 2)[1],
 		"nested path":       Prefix + "/item-posters/movie-a/x?" + query,
 	} {
@@ -126,7 +116,7 @@ func TestItemPosterRefusesLocalNetworkPosterPaths(t *testing.T) {
 		"file":      "file:///etc/passwd",
 	}
 	source := &posterSourceFake{paths: paths}
-	posters := newTestItemPosters(&posterPresignFake{})
+	posters := artworkurl.NewItemPosters("test-secret", time.Hour, &posterPresignFake{})
 	h := NewHandler(Dependencies{
 		ItemPosters: posters, ItemPosterSource: source, RemotePosters: imagecache.NewRemoteFetcher(),
 		ArtworkStore: blobstoretest.NewDirect(local.URL + "/artwork"),
@@ -147,30 +137,18 @@ func TestItemPosterRefusesLocalNetworkPosterPaths(t *testing.T) {
 }
 
 func TestItemPosterServesCurrentPoster(t *testing.T) {
-	store := blobstoretest.New()
-	cachedBytes1 := []byte("\x89PNG\r\n\x1a\ncached-1")
-	cachedBytes2 := []byte("\x89PNG\r\n\x1a\ncached-2")
-	if err := store.Put(t.Context(), "tmdb/movies/1/poster/w300.r1.webp", cachedBytes1); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Put(t.Context(), "tmdb/movies/2/poster/w300.r2.webp", cachedBytes2); err != nil {
-		t.Fatal(err)
-	}
 	source := &posterSourceFake{paths: map[string]string{
 		"movie-cached": "tmdb/movies/1/poster/original.r1.webp",
 		"movie-remote": "https://image.example/remote.jpg",
 		"movie-none":   "",
 	}}
 	fetcher := &posterFetcherFake{}
-	h, posters := newPosterHandlerWithStore(source, fetcher, store)
+	h, posters := newPosterHandler(source, fetcher)
 
 	cached := do(t, h, http.MethodGet, posters.Link("movie-cached", time.Now()), "", nil)
-	if cached.Code != http.StatusOK || cached.Header().Get("Content-Type") != "image/webp" ||
-		cached.Header().Get("Cache-Control") != itemPosterProxyCache ||
-		cached.Header().Get("X-Content-Type-Options") != "nosniff" ||
-		cached.Header().Get("Content-Security-Policy") != "default-src 'none'; sandbox" ||
-		cached.Body.String() != string(cachedBytes1) {
-		t.Fatalf("cached: %d %v %q", cached.Code, cached.Header(), cached.Body.String())
+	if cached.Code != http.StatusFound || cached.Header().Get("Location") != "/api/v2/artwork/tmdb/movies/1/poster/w300.r1.webp?exp=1&sig=x" ||
+		cached.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("cached: %d %v", cached.Code, cached.Header())
 	}
 
 	link := posters.Link("movie-remote", time.Now())
@@ -189,87 +167,33 @@ func TestItemPosterServesCurrentPoster(t *testing.T) {
 		t.Fatalf("cache jobs queued %d times, want 1", n)
 	}
 
-	// Once cached, the same link serves the stored object through this
-	// server instead of redirecting to it.
+	// Once cached, the same link redirects.
 	source.paths["movie-remote"] = "tmdb/movies/2/poster/original.r2.webp"
-	again := do(t, h, http.MethodGet, link, "", nil)
-	if again.Code != http.StatusOK || again.Header().Get("Content-Type") != "image/webp" ||
-		again.Body.String() != string(cachedBytes2) {
-		t.Fatalf("after caching: %d %v %q", again.Code, again.Header(), again.Body.String())
+	if again := do(t, h, http.MethodGet, link, "", nil); again.Code != http.StatusFound {
+		t.Fatalf("after caching: %d", again.Code)
 	}
 	requireProblem(t, do(t, h, http.MethodGet, posters.Link("movie-none", time.Now()), "", nil), TypeNotFound)
 	requireProblem(t, do(t, h, http.MethodGet, posters.Link("movie-gone", time.Now()), "", nil), TypeNotFound)
 }
 
-type staticPresignFake struct{ url string }
-
-func (p staticPresignFake) PresignURL(context.Context, string, string) string { return p.url }
-
-// The admin poster rule: cached art is a signed same-server artwork path on
-// every backend, even when the catalog presigns object storage URLs; art not
-// cached yet gets a signed item-posters link; only no poster at all is empty.
+// The admin poster rule: cached art keeps its stored URL, anything else is a
+// poster link, and only no poster at all is empty.
 func TestItemPostersURLRule(t *testing.T) {
+	posters := artworkurl.NewItemPosters("test-secret", time.Hour, &posterPresignFake{})
 	ctx := t.Context()
-	cachedPath := "tmdb/movies/1/poster/original.r1.webp"
-	// The catalog presigns an object storage URL; the admin rule ignores it.
-	posters := newTestItemPosters(staticPresignFake{url: "https://s3.example/bucket/tmdb/movies/1/poster/w300.r1.webp?X-Amz-Signature=abc"})
-	got := posters.URL(ctx, "movie-a", cachedPath)
-	key, ok := artworkurl.NewSigner("test-secret", time.Hour).SignedKey(got, time.Now())
-	if !ok || key != "tmdb/movies/1/poster/w300.r1.webp" {
-		t.Fatalf("cached = %q (key %q, %v), want a signed artwork path to the card rung", got, key, ok)
+	if got := posters.URL(ctx, "movie-a", "tmdb/movies/1/poster/original.r1.webp"); !strings.HasPrefix(got, "/api/v2/artwork/tmdb/movies/1/poster/w300.r1.webp") {
+		t.Fatalf("cached = %q", got)
 	}
-	for _, path := range []string{"https://image.tmdb.org/t/p/original/a.jpg", "metadb://images/a/original.jpg", "backups/server/db.dump", "tmdb/../movies/1/poster/original.r1.webp"} {
+	for _, path := range []string{"https://image.tmdb.org/t/p/original/a.jpg", "metadb://images/a/original.jpg"} {
 		if got := posters.URL(ctx, "movie-a", path); !strings.HasPrefix(got, artworkurl.ItemPosterRoute+"movie-a?exp=") {
-			t.Fatalf("%s = %q, want item-posters link", path, got)
+			t.Fatalf("%s = %q", path, got)
 		}
-	}
-	// Without an artwork store there is no artwork route to name.
-	noStore := artworkurl.NewItemPosters("test-secret", time.Hour, &posterPresignFake{}, nil)
-	if got := noStore.URL(ctx, "movie-a", cachedPath); !strings.HasPrefix(got, artworkurl.ItemPosterRoute+"movie-a?exp=") {
-		t.Fatalf("cached without artwork signer = %q, want item-posters link", got)
 	}
 	for _, path := range []string{"", "-"} {
 		if got := posters.URL(ctx, "movie-a", path); got != "" {
 			t.Fatalf("%q = %q", path, got)
 		}
 	}
-}
-
-type countingGetStore struct {
-	blobstore.Store
-	gets atomic.Int32
-}
-
-func (s *countingGetStore) Get(ctx context.Context, key string) (io.ReadCloser, blobstore.ObjectInfo, error) {
-	s.gets.Add(1)
-	return s.Store.Get(ctx, key)
-}
-
-// A link issued before caching reads the stored object the way the artwork
-// route does, with the route's repair service, and never reads a key the
-// artwork route refuses or a malformed stored path.
-func TestItemPosterStoredArtFailures(t *testing.T) {
-	store := &countingGetStore{Store: blobstoretest.New()}
-	source := &posterSourceFake{paths: map[string]string{
-		"missing":  "tmdb/movies/4/poster/original.r1.webp",
-		"unserved": "backups/server/db.dump",
-		"invalid":  "tmdb/../movies/1/poster/original.r1.webp",
-	}}
-	repair := &artworkRepairRecorder{}
-	posters := newTestItemPosters(&posterPresignFake{})
-	h := NewHandler(Dependencies{ItemPosters: posters, ItemPosterSource: source, ArtworkStore: store, ArtworkRepair: repair})
-	for _, id := range []string{"missing", "unserved", "invalid"} {
-		requireProblem(t, do(t, h, http.MethodGet, posters.Link(id, time.Now()), "", nil), TypeNotFound)
-	}
-	if gets := store.gets.Load(); gets != 1 {
-		t.Fatalf("store reads = %d, want 1 (unserved and invalid keys are never read)", gets)
-	}
-	if got := repair.paths; len(got) != 1 || got[0] != "tmdb/movies/4/poster/original.r1.webp" {
-		t.Fatalf("repairs = %v", got)
-	}
-
-	noStore := NewHandler(Dependencies{ItemPosters: posters, ItemPosterSource: source})
-	requireProblem(t, do(t, noStore, http.MethodGet, posters.Link("missing", time.Now()), "", nil), TypeDependencyUnavailable)
 }
 
 // A link needs no credentials, so a plugin's answer for a poster path must be
@@ -302,7 +226,7 @@ func TestPosterResolveMemoBoundsPluginCalls(t *testing.T) {
 
 func TestItemPosterReusesPluginAnswerAfterDisconnect(t *testing.T) {
 	presigner := &posterPresignFake{}
-	posters := newTestItemPosters(presigner)
+	posters := artworkurl.NewItemPosters("test-secret", time.Hour, presigner)
 	source := &posterSourceFake{paths: map[string]string{"movie-plugin": "tmdb://poster/1"}}
 	h := NewHandler(Dependencies{ItemPosters: posters, ItemPosterSource: source})
 	link := posters.Link("movie-plugin", time.Now())
@@ -328,7 +252,7 @@ func (schemeRelativePresignFake) PresignURL(context.Context, string, string) str
 // A plugin answer of "//host/..." names another host, not a path on this
 // server, so the route must not redirect a tool that cannot reach it there.
 func TestItemPosterDoesNotRedirectToSchemeRelativeAnswer(t *testing.T) {
-	posters := newTestItemPosters(schemeRelativePresignFake{})
+	posters := artworkurl.NewItemPosters("test-secret", time.Hour, schemeRelativePresignFake{})
 	source := &posterSourceFake{paths: map[string]string{"movie-plugin": "tmdb://poster/1"}}
 	h := NewHandler(Dependencies{ItemPosters: posters, ItemPosterSource: source, RemotePosters: &posterFetcherFake{}})
 	requireProblem(t, do(t, h, http.MethodGet, posters.Link("movie-plugin", time.Now()), "", nil), TypeNotFound)

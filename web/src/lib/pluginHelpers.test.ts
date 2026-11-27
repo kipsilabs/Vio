@@ -1,10 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import type { PluginInstallation, TriggerConfig } from "@/api/types";
+import type { PluginInstallation } from "@/api/types";
 
 import { capabilityListLabel, catalogJobs } from "./pluginCapabilities";
 import { parsePluginMarkdown } from "./pluginMarkdown";
 import {
+  CATALOG_GROUPS,
   installationTier,
   pendingUpdateVersion,
   pluginPagePath,
@@ -29,11 +30,12 @@ function installation(overrides: Partial<PluginInstallation> = {}): PluginInstal
     plugin_id: "silo.test",
     version: "1.0.0",
     install_path: "/plugins/test",
+    signature: { state: "unsigned" },
+    connection_check_supported: false,
     enabled: true,
     runtime: { resident: false, state: "stopped", restart_count: 0 },
     source_kind: "silo",
     updates_paused: false,
-    connection_check_supported: false,
     capabilities: [],
     global_config_schema: [],
     user_config_schema: [],
@@ -43,7 +45,6 @@ function installation(overrides: Partial<PluginInstallation> = {}): PluginInstal
     auth_bindings: [],
     task_bindings: [],
     update_policy: "auto",
-    signature: { state: "unknown" },
     ...overrides,
   };
 }
@@ -75,9 +76,11 @@ describe("pluginPresentation", () => {
 
   it("labels every tier and gives community and external plugins a notice", () => {
     expect(sourceLabel("silo")).toBe("Silo maintained");
+    expect(sourceLabel("vio")).toBe("Silo maintained");
     expect(sourceLabel("approved_community")).toBe("Approved community");
     expect(sourceLabel("external")).toBe("External source");
     expect(tierNotice("silo")).toBeNull();
+    expect(tierNotice("vio")).toBeNull();
     expect(tierNotice("approved_community")).toMatch(/Reviewed by Silo maintainers/);
     expect(tierNotice("external")).toMatch(/Silo has not reviewed this plugin/);
     expect(sourceLabel("unverified")).toBe("Unverified");
@@ -102,6 +105,23 @@ describe("pluginPresentation", () => {
     expect(pendingUpdateVersion({ ...base, updates_paused: true })).toBeNull();
     expect(pendingUpdateVersion({ ...base, repository_id: null })).toBeNull();
     expect(pendingUpdateVersion({ ...base, available_version: null })).toBeNull();
+  });
+
+  it("matches catalog groups correctly, falling back unknown kinds to external", () => {
+    const vioGroup = CATALOG_GROUPS.find((g) => g.kind === "vio")!;
+    const communityGroup = CATALOG_GROUPS.find((g) => g.kind === "approved_community")!;
+    const externalGroup = CATALOG_GROUPS.find((g) => g.kind === "external")!;
+
+    expect(vioGroup.matches("vio")).toBe(true);
+    expect(vioGroup.matches("silo")).toBe(true);
+    expect(vioGroup.matches("approved_community")).toBe(false);
+
+    expect(communityGroup.matches("approved_community")).toBe(true);
+    expect(communityGroup.matches("vio")).toBe(false);
+
+    expect(externalGroup.matches("external")).toBe(true);
+    expect(externalGroup.matches("unknown_kind")).toBe(true);
+    expect(externalGroup.matches("vio")).toBe(false);
   });
 
   it("only allows http and https links", () => {
@@ -175,11 +195,6 @@ describe("pluginStatus", () => {
     });
     expect(pluginStatus(refused)).toMatchObject({ label: "Active", attention: true, rank: 2 });
     expect(matchesInstalledFilter(refused, "attention")).toBe(true);
-    const badSignature = installation({ signature: { state: "invalid" } });
-    expect(pluginStatus(badSignature)).toMatchObject({ attention: true, rank: 2 });
-    expect(pluginStatus(installation({ signature: { state: "unsigned" } }))).toMatchObject({
-      attention: false,
-    });
     expect(pluginStatus(installation())).toMatchObject({ label: "Active", attention: false });
   });
 
@@ -281,23 +296,22 @@ describe("taskTrigger", () => {
     expect(describeTrigger({ type: "interval", interval_ms: 90_000 }, "short")).toBe("Every 90s");
   });
 
-  it("picks a plugin task's schedule like the server", () => {
-    const manifest: TriggerConfig = { type: "interval", interval_ms: 300_000 };
+  it("defaults a missing or unreadable plugin trigger to startup, like the server", () => {
     expect(pluginTaskTrigger(undefined)).toEqual({ type: "startup" });
-    expect(pluginTaskTrigger(undefined, manifest)).toEqual(manifest);
-    expect(pluginTaskTrigger({ type: "" }, manifest)).toEqual(manifest);
-    // A trigger the server cannot run falls through to the manifest default.
-    expect(pluginTaskTrigger({ type: "sometimes" }, manifest)).toEqual(manifest);
+    expect(pluginTaskTrigger({ type: "" })).toEqual({ type: "startup" });
+    // An unknown type is not a live trigger, so it reads as startup.
+    expect(pluginTaskTrigger({ type: "sometimes" })).toEqual({ type: "startup" });
     expect(pluginTaskTrigger({ type: "interval", interval_ms: "60000" })).toEqual({
       type: "startup",
     });
-    expect(pluginTaskTrigger({ type: "daily", time_of_day: "02:00" }, manifest)).toEqual({
-      type: "daily",
-      time_of_day: "02:00",
-    });
+    expect(describeTrigger(pluginTaskTrigger({ type: "sometimes" }))).toBe("On server startup");
     expect(describeTrigger({ type: "weekly", day_of_week: 7, time_of_day: "02:00" })).toBe(
       "Day 7 at 02:00",
     );
+    expect(pluginTaskTrigger({ type: "daily", time_of_day: "02:00" })).toEqual({
+      type: "daily",
+      time_of_day: "02:00",
+    });
     expect(pluginTaskPath(7, "refresh")).toBe("/admin/tasks/plugin%3A7%3Arefresh");
   });
 });

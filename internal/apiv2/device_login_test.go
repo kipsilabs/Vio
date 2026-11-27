@@ -176,7 +176,7 @@ func TestGetDeviceLogin(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatal(rec.Body.String())
 	}
-	want := `{"status":"pending","user_code":"4821-7730","match_code":"warm pony","device_name":"Living room TV","device_platform":"tvos","ip_address_hint":"192.168.1.x","expires_at":"2026-01-02T03:14:05.678Z","requested_at":"2026-01-02T03:04:05.678Z","client_purpose":"device_login","temporary":false,"server_name":"Silo"}` + "\n"
+	want := `{"status":"pending","user_code":"4821-7730","match_code":"warm pony","device_name":"Living room TV","device_platform":"tvos","ip_address_hint":"192.168.1.x","expires_at":"2026-01-02T03:14:05.678Z","requested_at":"2026-01-02T03:04:05.678Z","client_purpose":"device_login","temporary":false,"server_name":"Vio"}` + "\n"
 	if rec.Body.String() != want {
 		t.Fatalf("body = %s", rec.Body.String())
 	}

@@ -38,7 +38,7 @@ type DeviceSettingsListInput struct {
 	LimitParam
 	Cursor       string `query:"cursor"`
 	Scope        string `query:"scope" enum:"profile,household" default:"profile"`
-	DeviceHeader string `header:"X-Silo-Device-Id" maxLength:"128"`
+	DeviceHeader string `header:"X-Vio-Device-Id" maxLength:"128"`
 }
 
 type DeviceSettingsCollection struct{ Collection[DeviceSettings] }

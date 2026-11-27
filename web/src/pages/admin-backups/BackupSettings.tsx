@@ -186,10 +186,7 @@ function DestinationOption({
           <Label htmlFor={id} className="text-sm font-medium">
             {label}
           </Label>
-          <p
-            id={descriptionId}
-            className="text-muted-foreground mt-1 text-[0.8125rem] leading-relaxed"
-          >
+          <p id={descriptionId} className="text-muted-foreground mt-1 text-[13px] leading-relaxed">
             {description}
           </p>
         </div>
@@ -307,7 +304,7 @@ export function BackupLocationGroup({
         </RadioGroup>
       </FieldGroup>
       {listShown ? (
-        <p className="text-muted-foreground px-1 text-[0.8125rem] leading-relaxed">
+        <p className="text-muted-foreground px-1 text-[13px] leading-relaxed">
           {t("web.admin.backups.location.previousStays")}
         </p>
       ) : null}
@@ -371,7 +368,7 @@ export function RestoreCommandGroup({
             <Copy aria-hidden="true" />
           </Button>
         </div>
-        <p className="text-muted-foreground text-[0.8125rem] leading-relaxed">
+        <p className="text-muted-foreground text-[13px] leading-relaxed">
           {t("web.admin.backups.command.runHelp", {
             hint: t(commandHint(source, encrypted)),
             code: (chunks) => <code className="font-mono text-xs">{chunks}</code>,

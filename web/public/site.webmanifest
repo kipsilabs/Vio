@@ -1,7 +1,6 @@
 {
-  "id": "/",
-  "name": "Silo",
-  "short_name": "Silo",
+  "name": "Vio",
+  "short_name": "Vio",
   "icons": [
     {
       "src": "/web-app-icon-192.png",
@@ -22,7 +21,5 @@
   ],
   "theme_color": "#1718c9",
   "background_color": "#1718c9",
-  "display": "standalone",
-  "start_url": "/",
-  "scope": "/"
+  "display": "standalone"
 }

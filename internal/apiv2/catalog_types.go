@@ -5,7 +5,6 @@ import (
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/api/handlers"
-	catalogpkg "github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/ratingsources"
 )
@@ -26,8 +25,6 @@ type CatalogItem struct {
 	SeriesTitle            string                    `json:"series_title,omitempty"`
 	SeasonNumber           *int                      `json:"season_number,omitempty"`
 	EpisodeNumber          *int                      `json:"episode_number,omitempty"`
-	AirDate                *string                   `json:"air_date,omitempty" format:"date" doc:"An episode's air date, YYYY-MM-DD. An episode card carries it when episode_labels is air_date"`
-	EpisodeLabels          string                    `json:"episode_labels,omitempty" enum:"air_date" doc:"How to label the episodes of this series, or of the series an episode belongs to; a season's detail carries its series' value, a season card does not. air_date: the numbers are synthetic (a sports league numbered S2026E296), so show the episode's air date where the season and episode numbers would go; the numbers still order episodes. Absent, or a value the client does not know: show the numbers" example:"air_date"`
 	Year                   int                       `json:"year,omitempty" example:"1995"`
 	Runtime                int                       `json:"runtime,omitempty" doc:"Minutes" example:"170"`
 	Genres                 []string                  `json:"genres" doc:"Empty, never null"`
@@ -51,8 +48,8 @@ type CatalogItem struct {
 	ReleaseDate            *string                   `json:"release_date,omitempty" format:"date" doc:"Calendar date, YYYY-MM-DD" example:"1995-12-15"`
 	LastAirDate            *string                   `json:"last_air_date,omitempty" format:"date" doc:"Calendar date, YYYY-MM-DD"`
 	AddedAt                *Instant                  `json:"added_at,omitempty"`
-	PositionSeconds        *float64                  `json:"position_seconds,omitempty" doc:"The profile's resume position, in seconds. On a Continue Watching card, and on a catalog browse or box set card for a title the profile has started and not finished (absent while user_state.played is true); other listings leave it absent. Series, seasons, and ebooks never carry it on a browse card"`
-	DurationSeconds        *float64                  `json:"duration_seconds,omitempty" doc:"The length position_seconds is measured against, in seconds, as the progress record holds it. Present with position_seconds; a card draws its progress bar and time left from the pair"`
+	PositionSeconds        *float64                  `json:"position_seconds,omitempty" doc:"Resume position on a continue-watching card"`
+	DurationSeconds        *float64                  `json:"duration_seconds,omitempty"`
 	ProgressUpdatedAt      *Instant                  `json:"progress_updated_at,omitempty"`
 	PosterIsEpisodeStill   *bool                     `json:"poster_is_episode_still,omitempty" doc:"Whether poster_url is an episode still. False for series or season artwork; absent when provenance is unavailable."`
 	BackdropIsEpisodeStill *bool                     `json:"backdrop_is_episode_still,omitempty" doc:"Whether backdrop_url is an episode still. False for series artwork; absent when provenance is unavailable."`
@@ -64,7 +61,6 @@ type CatalogItem struct {
 	MangaChapterCount      *int                      `json:"manga_chapter_count,omitempty"`
 	MangaVolumeCount       *int                      `json:"manga_volume_count,omitempty"`
 	OverlaySummary         *CatalogItemOverlay       `json:"overlay_summary,omitempty" doc:"Technical badges of the best file"`
-	Availability           *CatalogAvailability      `json:"availability,omitempty" doc:"On a series, complete seasons out of seasons that have aired. On a season, episodes in the library out of the episodes the season lists. Sent only while the acting profile's poster badges are on and include the availability badge. Absent for other types, for specials, and when episode metadata is incomplete."`
 	Badges                 []string                  `json:"badges,omitempty" doc:"Section-specific badges (new, returning, …)"`
 	ItemSource             string                    `json:"item_source,omitempty" doc:"On a continue-watching card: in_progress or next_up"`
 	SortMetrics            *CatalogItemSortMetrics   `json:"sort_metrics,omitempty" doc:"The values the listing was sorted by"`
@@ -78,7 +74,6 @@ type CatalogItem struct {
 	WorkID                     string              `json:"work_id,omitempty" doc:"The work (book) an audiobook or ebook edition belongs to"`
 	WorkTitle                  string              `json:"work_title,omitempty"`
 	WorkFormats                []CatalogWorkFormat `json:"work_formats,omitempty" doc:"Sibling editions of the same work"`
-	Authors                    []string            `json:"authors,omitempty" maxItems:"3" doc:"On an audiobook or ebook card in a catalog browse listing: up to three author names in credit order, the names the book's detail page lists under authors. Absent for other types, on other listings, and when the book credits no author" example:"[\"Frank Herbert\"]"`
 	// An episode card's parent artwork, so a client can draw a hero from the
 	// series backdrop without fetching the episode's detail. There is no
 	// season backdrop member; Continue Watching and Next Up rows carry it as
@@ -89,12 +84,6 @@ type CatalogItem struct {
 	SeriesBackdropThumbhash string `json:"series_backdrop_thumbhash,omitempty" doc:"On an episode card: the series backdrop's ThumbHash"`
 	SeasonPosterURL         string `json:"season_poster_url,omitempty" format:"uri-reference" doc:"On an episode card: the season poster, at poster_url's size. Presigned, short-lived; absent when the season has none or the surface does not load it"`
 	SeasonPosterThumbhash   string `json:"season_poster_thumbhash,omitempty" doc:"On an episode card: the season poster's ThumbHash"`
-}
-
-// CatalogAvailability is the poster fraction for a series or season.
-type CatalogAvailability struct {
-	Have  int `json:"have" doc:"Complete seasons, or episodes in the library" example:"2"`
-	Total int `json:"total" doc:"Seasons that have aired, or known episodes" example:"3"`
 }
 
 // CatalogItemOverlay is the technical summary a card overlays.
@@ -152,13 +141,6 @@ type CatalogWorkFormat struct {
 	Type      string `json:"type" example:"audiobook"`
 	ContentID string `json:"content_id" example:"audiobook:dune"`
 	LibraryID ID     `json:"library_id,omitempty" doc:"Absent when the edition is not in a library"`
-}
-
-func catalogAvailabilityOf(a *catalogpkg.Availability) *CatalogAvailability {
-	if a == nil || a.Total <= 0 {
-		return nil
-	}
-	return &CatalogAvailability{Have: a.Have, Total: a.Total}
 }
 
 func catalogOverlayOf(o *models.OverlaySummary) *CatalogItemOverlay {
@@ -220,7 +202,7 @@ func catalogItemOfSection(v handlers.SectionItemView, sel ratingsources.Selectio
 		SeriesID: v.SeriesID, SeriesTitle: v.SeriesTitle, SeasonNumber: v.SeasonNumber, EpisodeNumber: v.EpisodeNumber,
 		Year: v.Year, Runtime: v.Runtime, Genres: NonNil(v.Genres), Keywords: NonNil(v.Keywords), Studios: v.Studios, Networks: v.Networks,
 		ContentRating: v.ContentRating, AdvisoryAge: v.AdvisoryAge, AdvisorySource: v.AdvisorySource,
-		Status: v.Status, ShowStatus: v.ShowStatus, EpisodeLabels: v.EpisodeLabels, AirDate: datePtr(calendarDate(v.AirDate)),
+		Status: v.Status, ShowStatus: v.ShowStatus,
 		RatingIMDB: v.RatingIMDB, RatingTMDB: v.RatingTMDB, RatingRTCritic: v.RatingRTCritic, RatingRTAudience: v.RatingRTAudience,
 		OriginalLanguage: v.OriginalLanguage, Overview: v.Overview, ReleaseDate: calendarDatePtr(v.ReleaseDate), LastAirDate: calendarDatePtr(v.LastAirDate),
 		PositionSeconds: v.PositionSeconds, DurationSeconds: v.DurationSeconds, ProgressUpdatedAt: instantOfRFC3339(v.ProgressUpdatedAt),
@@ -229,7 +211,7 @@ func catalogItemOfSection(v handlers.SectionItemView, sel ratingsources.Selectio
 		SeriesPosterURL: v.ParentArtwork.SeriesPosterURL, SeriesPosterThumbhash: v.ParentArtwork.SeriesPosterThumbhash,
 		SeriesBackdropURL: v.ParentArtwork.SeriesBackdropURL, SeriesBackdropThumbhash: v.ParentArtwork.SeriesBackdropThumbhash,
 		SeasonPosterURL: v.ParentArtwork.SeasonPosterURL, SeasonPosterThumbhash: v.ParentArtwork.SeasonPosterThumbhash,
-		OverlaySummary: catalogOverlayOf(v.OverlaySummary), Availability: catalogAvailabilityOf(v.Availability), Badges: v.Badges, ItemSource: v.ItemSource, UserState: catalogUserStateOf(v.UserState),
+		OverlaySummary: catalogOverlayOf(v.OverlaySummary), Badges: v.Badges, ItemSource: v.ItemSource, UserState: catalogUserStateOf(v.UserState),
 		PendingTranslationLanguage: v.PendingTranslationLanguage, MachineTranslatedFields: v.MachineTranslatedFields,
 	}
 	if e := v.UpcomingEvent; e != nil {
@@ -269,7 +251,7 @@ func catalogItemOfListing(v handlers.CollectionItemView, sel ratingsources.Selec
 		SeriesID: v.SeriesID, SeriesTitle: v.SeriesTitle, SeasonNumber: v.SeasonNumber, EpisodeNumber: v.EpisodeNumber,
 		Year: v.Year, Runtime: v.Runtime, Genres: NonNil(v.Genres), Keywords: NonNil(v.Keywords), Studios: v.Studios, Networks: v.Networks,
 		ContentRating: v.ContentRating, AdvisoryAge: v.AdvisoryAge, AdvisorySource: v.AdvisorySource,
-		Status: v.Status, ShowStatus: v.ShowStatus, EpisodeLabels: v.EpisodeLabels, AirDate: datePtr(calendarDate(v.AirDate)),
+		Status: v.Status, ShowStatus: v.ShowStatus,
 		RatingIMDB: v.RatingIMDB, RatingTMDB: v.RatingTMDB, RatingRTCritic: v.RatingRTCritic, RatingRTAudience: v.RatingRTAudience,
 		ImdbID: v.ImdbID, TmdbID: v.TmdbID, TvdbID: v.TvdbID,
 		OriginalLanguage: v.OriginalLanguage, Overview: v.Overview, ReleaseDate: calendarDatePtr(v.ReleaseDate), LastAirDate: calendarDatePtr(v.LastAirDate), AddedAt: instantPtr(v.AddedAt),
@@ -279,9 +261,8 @@ func catalogItemOfListing(v handlers.CollectionItemView, sel ratingsources.Selec
 		SeriesBackdropURL: v.ParentArtwork.SeriesBackdropURL, SeriesBackdropThumbhash: v.ParentArtwork.SeriesBackdropThumbhash,
 		SeasonPosterURL: v.ParentArtwork.SeasonPosterURL, SeasonPosterThumbhash: v.ParentArtwork.SeasonPosterThumbhash,
 		MangaChapterCount: v.MangaChapterCount, MangaVolumeCount: v.MangaVolumeCount,
-		OverlaySummary: catalogOverlayOf(v.OverlaySummary), Availability: catalogAvailabilityOf(v.Availability), UserState: catalogUserStateOf(v.UserState),
-		WorkID: v.WorkID, WorkTitle: v.WorkTitle, Authors: v.Authors,
-		PositionSeconds: v.PositionSeconds, DurationSeconds: v.DurationSeconds,
+		OverlaySummary: catalogOverlayOf(v.OverlaySummary), UserState: catalogUserStateOf(v.UserState),
+		WorkID: v.WorkID, WorkTitle: v.WorkTitle,
 		ProgressUpdatedAt: instantOfRFC3339(v.ProgressUpdatedAt), ItemSource: v.ItemSource,
 	}
 	if m := v.SortMetrics; m != nil {

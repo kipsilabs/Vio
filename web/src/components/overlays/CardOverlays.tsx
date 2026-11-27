@@ -5,7 +5,6 @@ import {
   OverlayIcon,
   WORDMARK_TEXT,
   applyOverlayStyle,
-  badgeFontWeight,
   getPreset,
   orderedOverlaysForPosition,
   overlayImageUrl,
@@ -274,7 +273,7 @@ function Badge({ badge, preset, scalingMode, rail }: BadgeProps) {
     // The inline size beats the preset's rem class, so it carries the
     // text size itself: browser default and in-app scale (#1796).
     fontSize: `calc(${length(preset.fontSize, POSTER_VARS.fontSize)} * var(--ui-root-text-ratio, 1))`,
-    fontWeight: badgeFontWeight(preset.fontWeight),
+    fontWeight: preset.fontWeight,
     textTransform: preset.uppercase ? "uppercase" : "none",
   };
   if (rail) {
@@ -340,13 +339,7 @@ function Badge({ badge, preset, scalingMode, rail }: BadgeProps) {
       ) : sourceChip ? (
         <span
           className="shrink-0 rounded-[0.2em] px-[0.35em] py-[0.15em] leading-none"
-          style={{
-            background: chipColor,
-            color: readableTextOn(chipColor),
-            // The chip is its own solid fill, so a text shadow the badge draws
-            // for bare artwork stays off it.
-            textShadow: "none",
-          }}
+          style={{ background: chipColor, color: readableTextOn(chipColor) }}
         >
           {badge.sourceMark}
         </span>

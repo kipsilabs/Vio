@@ -1,18 +1,4 @@
-/*
- * Labels and descriptions here are message ids read through getters, the same
- * way as in lib/adminSettingsSearch (see the top of that file): `label`,
- * `description`, `keywords` and `settings[i].label` of every section, topic,
- * item and command-palette group return text in the current interface language
- * each time they are read. A component that shows them calls `useT()` or
- * `useAppLanguage()` so it re-renders on a language change. Spreading an item
- * (`{ ...item }`) freezes its text in the language of that moment, so the
- * builders below copy with getters (`withEntries`, `topicWith`, `groupOf`)
- * instead.
- * Keywords stay English; a translated interface also searches the English
- * label and description.
- */
 import {
-  BarChart3,
   Blocks,
   Bot,
   CalendarClock,
@@ -31,6 +17,7 @@ import {
   PlayCircle,
   Puzzle,
   Radar,
+  Radio,
   Rows2,
   ScrollText,
   Send,
@@ -47,13 +34,7 @@ import type { LucideIcon } from "lucide-react";
 
 import type { PluginInstallation } from "@/api/types";
 import type { SettingsSearchGroup, SettingsSearchItem } from "@/components/settings/settingsSearch";
-import { t, type MessageKey } from "@/i18n";
-import {
-  ADMIN_SETTINGS_NAV,
-  adminSettingsHref,
-  englishSearchTerms,
-  searchEntry,
-} from "@/lib/adminSettingsSearch";
+import { ADMIN_SETTINGS_NAV, adminSettingsHref } from "@/lib/adminSettingsSearch";
 import { pluginRouteHref } from "@/lib/pluginRouteHref";
 
 export interface AdminNavItem extends SettingsSearchItem {
@@ -69,8 +50,6 @@ export interface AdminNavTopic {
   /** Stable key for the topic's remembered open state. */
   id: string;
   label: string;
-  /** The English heading, so an English search still finds the topic's pages. */
-  keywords?: readonly string[];
   icon: LucideIcon;
   items: AdminNavItem[];
 }
@@ -78,11 +57,7 @@ export interface AdminNavTopic {
 export type AdminNavEntry = AdminNavItem | AdminNavTopic;
 
 export interface AdminNavSection {
-  /** Stable key (React keys, element ids); the label is translated. */
-  id: string;
   label: string;
-  /** The English heading, so an English search still finds the section's pages. */
-  keywords?: readonly string[];
   entries: AdminNavEntry[];
 }
 
@@ -97,76 +72,46 @@ export function isAdminNavTopic(entry: AdminNavEntry): entry is AdminNavTopic {
   return "items" in entry;
 }
 
-/** An admin page before it becomes a sidebar item: its text as message ids. */
-interface NavPageDefinition {
-  labelKey: MessageKey;
-  descriptionKey: MessageKey;
-  /** English search synonyms; never shown. */
-  keywords: readonly string[];
-  /** Settings on the page, by their visible label, so search can find them. */
-  settings?: readonly MessageKey[];
-  icon: LucideIcon;
-  href: string;
-  exact?: boolean;
-}
-
 const PAGES = {
   dashboard: {
-    labelKey: "web.admin.shell.nav.page.dashboard.label",
-    descriptionKey: "web.admin.shell.nav.page.dashboard.description",
+    label: "Dashboard",
+    description: "Live sessions, content health, and server activity.",
     keywords: ["overview", "stats", "health", "scan all"],
     icon: LayoutDashboard,
     href: "/admin",
     exact: true,
   },
-  insights: {
-    labelKey: "web.admin.shell.nav.page.insights.label",
-    descriptionKey: "web.admin.shell.nav.page.insights.description",
-    keywords: [
-      "activity",
-      "live",
-      "streams",
-      "sessions",
-      "now playing",
-      "analytics",
-      "insights",
-      "playback",
-      "watch time",
-      "bandwidth",
-      "egress",
-      "devices",
-      "codecs",
-      "transcode",
-      "heatmap",
-      "leaderboard",
-    ],
-    icon: BarChart3,
-    href: "/admin/insights",
+  activity: {
+    label: "Activity",
+    description: "Live streams and current playback sessions.",
+    keywords: ["streams", "sessions", "now playing", "transcode"],
+    icon: Radio,
+    href: "/admin/activity",
   },
   logs: {
-    labelKey: "web.admin.shell.nav.page.logs.label",
-    descriptionKey: "web.admin.shell.nav.page.logs.description",
+    label: "Logs",
+    description: "Server log stream and operational output.",
     keywords: ["server logs", "debug", "tail", "events"],
     icon: ScrollText,
     href: "/admin/logs",
   },
   diagnostics: {
-    labelKey: "web.admin.shell.nav.page.diagnostics.label",
-    descriptionKey: "web.admin.shell.nav.page.diagnostics.description",
+    label: "Diagnostics",
+    description: "Uploaded client crash reports, device context, and debug bundles.",
     keywords: ["client diagnostics", "crash reports", "debug bundles", "support"],
     icon: FileWarning,
     href: "/admin/diagnostics",
   },
   libraries: {
-    labelKey: "web.admin.shell.nav.page.libraries.label",
-    descriptionKey: "web.admin.shell.nav.page.libraries.description",
+    label: "Libraries",
+    description: "Media libraries, paths, scanning, and catalog import.",
     keywords: ["library", "paths", "scan", "catalog", "seed"],
     icon: Library,
     href: "/admin/libraries",
   },
   autoscanSources: {
-    labelKey: "web.admin.shell.nav.page.autoscanSources.label",
-    descriptionKey: "web.admin.shell.nav.page.autoscanSources.description",
+    label: "Sources",
+    description: "What Autoscan watches for changes: folders, webhooks, and servers.",
     keywords: ["autoscan", "scan sources", "polling", "webhook source", "run now"],
     icon: Radar,
     href: "/admin/autoscan",
@@ -174,29 +119,36 @@ const PAGES = {
     exact: true,
   },
   autoscanActivity: {
-    labelKey: "web.admin.shell.nav.page.autoscanActivity.label",
-    descriptionKey: "web.admin.shell.nav.page.autoscanActivity.description",
+    label: "Activity",
+    description: "Changes Autoscan received and the scans they started.",
     keywords: ["autoscan", "scan queue", "scan events", "scan history"],
     icon: Radar,
     href: "/admin/autoscan/activity",
   },
+  virtualLibrary: {
+    label: "Virtual Library",
+    description: "Release desk for zero-storage items registered by plugins.",
+    keywords: ["virtual", "zero-storage", "release desk", "queue", "streaming"],
+    icon: Radio,
+    href: "/admin/virtual-library",
+  },
   collections: {
-    labelKey: "web.admin.shell.nav.page.collections.label",
-    descriptionKey: "web.admin.shell.nav.page.collections.description",
+    label: "Collections",
+    description: "Curated and smart collection management.",
     keywords: ["collection groups", "templates", "smart collections"],
     icon: LayoutPanelTop,
     href: "/admin/collections",
   },
   sections: {
-    labelKey: "web.admin.shell.nav.page.sections.label",
-    descriptionKey: "web.admin.shell.nav.page.sections.description",
+    label: "Sections",
+    description: "Rows on Home and on library pages.",
     keywords: ["home rows", "rows", "rails", "featured sections"],
     icon: Rows2,
     href: "/admin/sections",
   },
   requests: {
-    labelKey: "web.admin.shell.nav.page.requests.label",
-    descriptionKey: "web.admin.shell.nav.page.requests.description",
+    label: "Requests",
+    description: "Review, approve, and decline media requests.",
     // Servers, routing, and the request limit itself live on the Requests
     // settings page, which the command palette lists with its own keywords.
     // A group's or an account's own limit lives with the group or account.
@@ -207,8 +159,8 @@ const PAGES = {
     exact: true,
   },
   requestDiscover: {
-    labelKey: "web.admin.shell.nav.page.requestDiscover.label",
-    descriptionKey: "web.admin.shell.nav.page.requestDiscover.description",
+    label: "Discover Page",
+    description: "The rows on the Requests page's Discover tab: charts, filters, and lists.",
     keywords: [
       "discover rows",
       "request rows",
@@ -221,43 +173,43 @@ const PAGES = {
     href: "/admin/requests/discover",
   },
   scheduledTasks: {
-    labelKey: "web.admin.shell.nav.page.scheduledTasks.label",
-    descriptionKey: "web.admin.shell.nav.page.scheduledTasks.description",
+    label: "Scheduled Tasks",
+    description: "Background task schedules, runs, and job history.",
     keywords: ["tasks", "jobs", "scheduler", "sync"],
     icon: CalendarClock,
     href: "/admin/tasks",
   },
   subtitleFiles: {
-    labelKey: "web.admin.shell.nav.page.subtitleFiles.label",
-    descriptionKey: "web.admin.shell.nav.page.subtitleFiles.description",
+    label: "Subtitle Files",
+    description: "Downloaded subtitle records and subtitle admin tools.",
     keywords: ["captions", "subtitle downloads", "providers"],
     icon: Captions,
     href: "/admin/subtitles",
   },
   markers: {
-    labelKey: "web.admin.shell.nav.page.markers.label",
-    descriptionKey: "web.admin.shell.nav.page.markers.description",
+    label: "Markers",
+    description: "Intro, recap, and credits marker history.",
     keywords: ["intro markers", "credits", "recaps", "chapters"],
     icon: SkipForward,
     href: "/admin/marker-history",
   },
   recommendations: {
-    labelKey: "web.admin.shell.nav.page.recommendations.label",
-    descriptionKey: "web.admin.shell.nav.page.recommendations.description",
+    label: "Recommendations",
+    description: "Recommendation diagnostics, seed data, and ranking controls.",
     keywords: ["taste", "ranking", "recommendation seeds"],
     icon: Bot,
     href: "/admin/recommendations",
   },
   users: {
-    labelKey: "web.admin.shell.nav.page.users.label",
-    descriptionKey: "web.admin.shell.nav.page.users.description",
+    label: "Users",
+    description: "Accounts, roles, profile settings, and access.",
     keywords: ["accounts", "profiles", "roles", "permissions"],
     icon: Users,
     href: "/admin/users",
   },
   accessGroups: {
-    labelKey: "web.admin.shell.nav.page.accessGroups.label",
-    descriptionKey: "web.admin.shell.nav.page.accessGroups.description",
+    label: "Access Groups",
+    description: "Shared access defaults: libraries, downloads, streams, requests, permissions.",
     keywords: [
       "groups",
       "roles",
@@ -271,43 +223,43 @@ const PAGES = {
     href: "/admin/access-groups",
   },
   devices: {
-    labelKey: "web.admin.shell.nav.page.devices.label",
-    descriptionKey: "web.admin.shell.nav.page.devices.description",
+    label: "Devices",
+    description: "Registered devices, overrides, and per-device settings.",
     keywords: ["clients", "device overrides", "sessions"],
     icon: MonitorSmartphone,
     href: "/admin/devices",
   },
   playbackHistory: {
-    labelKey: "web.admin.shell.nav.page.playbackHistory.label",
-    descriptionKey: "web.admin.shell.nav.page.playbackHistory.description",
+    label: "Playback History",
+    description: "Historical playback events across users and profiles.",
     keywords: ["history", "watched", "progress", "plays"],
     icon: History,
     href: "/admin/history",
   },
   historyImport: {
-    labelKey: "web.admin.shell.nav.page.historyImport.label",
-    descriptionKey: "web.admin.shell.nav.page.historyImport.description",
+    label: "History Import",
+    description: "Admin history import mappings and bulk import runs.",
     keywords: ["emby", "imports", "mappings", "watch history"],
     icon: Download,
     href: "/admin/history-import",
   },
   plugins: {
-    labelKey: "web.admin.shell.nav.page.plugins.label",
-    descriptionKey: "web.admin.shell.nav.page.plugins.description",
+    label: "Plugins",
+    description: "Plugin catalog, repositories, installs, and plugin configuration.",
     keywords: ["extensions", "plugin catalog", "repositories"],
     icon: Blocks,
     href: "/admin/plugins",
   },
   policy: {
-    labelKey: "web.admin.shell.nav.page.policy.label",
-    descriptionKey: "web.admin.shell.nav.page.policy.description",
+    label: "Policy",
+    description: "OPA policy documents, vendor modules, simulations, and decision logs.",
     keywords: ["opa", "rego", "authorization", "decision log", "access policy"],
     icon: ShieldCheck,
     href: "/admin/policy",
   },
   nodes: {
-    labelKey: "web.admin.shell.nav.page.nodes.label",
-    descriptionKey: "web.admin.shell.nav.page.nodes.description",
+    label: "Nodes",
+    description: "Stream nodes, remote worker status, and where playback work runs.",
     keywords: [
       "stream nodes",
       "workers",
@@ -319,19 +271,19 @@ const PAGES = {
       "central egress",
     ],
     settings: [
-      "web.admin.shell.nav.page.nodes.setting.routingPreset",
-      "web.admin.shell.nav.page.nodes.setting.directPlayEgress",
-      "web.admin.shell.nav.page.nodes.setting.remuxExecution",
-      "web.admin.shell.nav.page.nodes.setting.remuxEgress",
-      "web.admin.shell.nav.page.nodes.setting.videoTranscodeExecution",
-      "web.admin.shell.nav.page.nodes.setting.videoTranscodeEgress",
+      { label: "Routing preset" },
+      { label: "Direct play egress" },
+      { label: "Remux execution" },
+      { label: "Remux egress" },
+      { label: "Video transcode execution" },
+      { label: "Video transcode egress" },
     ],
     icon: Server,
     href: "/admin/nodes",
   },
   downloads: {
-    labelKey: "web.admin.shell.nav.page.downloads.label",
-    descriptionKey: "web.admin.shell.nav.page.downloads.description",
+    label: "Downloads",
+    description: "Prepared download storage on the server and nodes, and device copies.",
     keywords: [
       "offline downloads",
       "prepared files",
@@ -345,8 +297,8 @@ const PAGES = {
     href: "/admin/downloads",
   },
   backups: {
-    labelKey: "web.admin.shell.nav.page.backups.label",
-    descriptionKey: "web.admin.shell.nav.page.backups.description",
+    label: "Backups",
+    description: "Nightly backups of the database and uploaded files, and how to restore them.",
     keywords: [
       "backup",
       "back up now",
@@ -362,146 +314,46 @@ const PAGES = {
     href: "/admin/backups",
   },
   apiKeys: {
-    labelKey: "web.admin.shell.nav.page.apiKeys.label",
-    descriptionKey: "web.admin.shell.nav.page.apiKeys.description",
+    label: "API Keys",
+    description: "Admin API keys and tier assignment.",
     keywords: ["tokens", "keys", "access", "scopes", "rate limit tier"],
     icon: KeyRound,
     href: "/admin/api-keys",
   },
   maintenance: {
-    labelKey: "web.admin.shell.nav.page.maintenance.label",
-    descriptionKey: "web.admin.shell.nav.page.maintenance.description",
+    label: "Maintenance",
+    description: "Operational maintenance tools.",
     keywords: ["repair", "cleanup", "system maintenance"],
     icon: Wrench,
     href: "/admin/maintenance",
   },
-} satisfies Record<string, NavPageDefinition>;
-
-/** A page as a sidebar item; `labelKey` names it differently under a topic. */
-function navPage(page: NavPageDefinition, labelKey: MessageKey = page.labelKey): AdminNavItem {
-  return {
-    get label() {
-      return t(labelKey);
-    },
-    get description() {
-      return t(page.descriptionKey);
-    },
-    get keywords() {
-      return [...page.keywords, ...englishSearchTerms(labelKey, page.descriptionKey)];
-    },
-    settings: page.settings?.map(searchEntry),
-    icon: page.icon,
-    href: page.href,
-    exact: page.exact,
-  };
-}
+} satisfies Record<string, AdminNavItem>;
 
 /**
  * A settings page as a sidebar entry. Under a topic that also holds tools the
  * page is just "Settings"; the topic already says whose. Its own name stays a
  * keyword, so searching "Logging" still finds Logs › Settings.
+ *
+ * The registry's text is read through getters, so this entry must keep them:
+ * the nav is built while its module evaluates, before the admin catalog has
+ * loaded, and reading the label here would freeze it as an empty string.
  */
-function settingsPage(id: string, labelKey?: MessageKey): AdminNavItem {
+function settingsPage(id: string, label?: string): AdminNavItem {
   const page = ADMIN_SETTINGS_NAV.find((item) => item.id === id);
   if (!page) throw new Error(`Unknown admin settings page ${id}`);
   return {
     get label() {
-      return labelKey ? t(labelKey) : page.label;
+      return label ?? page.label;
     },
     get description() {
       return page.description;
     },
     get keywords() {
-      return [
-        "settings",
-        "configuration",
-        page.label,
-        ...(labelKey ? englishSearchTerms(labelKey) : []),
-        ...(page.keywords ?? []),
-      ];
+      return ["settings", "configuration", page.label, ...(page.keywords ?? [])];
     },
     settings: page.settings,
     icon: page.icon,
     href: adminSettingsHref(id),
-  };
-}
-
-const SETTINGS: MessageKey = "web.admin.shell.nav.item.settings";
-
-function navSection(id: string, labelKey: MessageKey, entries: AdminNavEntry[]): AdminNavSection {
-  return {
-    id,
-    get label() {
-      return t(labelKey);
-    },
-    get keywords() {
-      return englishSearchTerms(labelKey);
-    },
-    entries,
-  };
-}
-
-function navTopic(
-  id: string,
-  labelKey: MessageKey,
-  icon: LucideIcon,
-  items: AdminNavItem[],
-): AdminNavTopic {
-  return {
-    id,
-    get label() {
-      return t(labelKey);
-    },
-    get keywords() {
-      return englishSearchTerms(labelKey);
-    },
-    icon,
-    items,
-  };
-}
-
-/** `section` with other entries, keeping its label live. */
-function withEntries(section: AdminNavSection, entries: AdminNavEntry[]): AdminNavSection {
-  return {
-    id: section.id,
-    get label() {
-      return section.label;
-    },
-    get keywords() {
-      return section.keywords;
-    },
-    entries,
-  };
-}
-
-/** `topic` with other items, keeping its label live. */
-function topicWith(topic: AdminNavTopic, items: AdminNavItem[]): AdminNavTopic {
-  return {
-    id: topic.id,
-    get label() {
-      return topic.label;
-    },
-    get keywords() {
-      return topic.keywords;
-    },
-    icon: topic.icon,
-    items,
-  };
-}
-
-/** A command-palette group named like `source` (a section, topic or group), label kept live. */
-function groupOf(
-  source: { readonly label: string; readonly keywords?: readonly string[] },
-  items: readonly AdminNavItem[],
-): AdminNavGroup {
-  return {
-    get label() {
-      return source.label;
-    },
-    get keywords() {
-      return source.keywords;
-    },
-    items,
   };
 }
 
@@ -511,77 +363,128 @@ function groupOf(
  * settings page is its last entry. Every admin page appears exactly once.
  */
 export const ADMIN_NAV_SECTIONS: AdminNavSection[] = [
-  navSection("monitor", "web.admin.shell.nav.section.monitor", [
-    navPage(PAGES.dashboard),
-    navPage(PAGES.insights),
-    navTopic("logs", "web.admin.shell.nav.topic.logs", ScrollText, [
-      navPage(PAGES.logs, "web.admin.shell.nav.item.serverLog"),
-      navPage(PAGES.diagnostics, "web.admin.shell.nav.item.clientDiagnostics"),
-      settingsPage("logging", SETTINGS),
-    ]),
-  ]),
-  navSection("manage", "web.admin.shell.nav.section.manage", [
-    navTopic("libraries", "web.admin.shell.nav.topic.libraries", Library, [
-      navPage(PAGES.libraries),
-      navPage(PAGES.collections),
-      navPage(PAGES.sections, "web.admin.shell.nav.item.homeSections"),
-      navPage(PAGES.subtitleFiles),
-      settingsPage("library", SETTINGS),
-    ]),
-    navTopic("autoscan", "web.admin.shell.nav.topic.autoscan", Radar, [
-      navPage(PAGES.autoscanActivity),
-      navPage(PAGES.autoscanSources),
-      settingsPage("autoscan", SETTINGS),
-    ]),
-    navTopic("requests", "web.admin.shell.nav.topic.requests", Send, [
-      navPage(PAGES.requests, "web.admin.shell.nav.item.queue"),
-      navPage(PAGES.requestDiscover),
-      settingsPage("requests", SETTINGS),
-    ]),
-    navTopic("users", "web.admin.shell.nav.topic.users", Users, [
-      navPage(PAGES.users),
-      navPage(PAGES.accessGroups),
-      navPage(PAGES.devices),
-      navPage(PAGES.historyImport),
-    ]),
-    navTopic("playback", "web.admin.shell.nav.topic.playback", PlayCircle, [
-      navPage(PAGES.playbackHistory, "web.admin.shell.nav.item.history"),
-      navPage(PAGES.markers, "web.admin.shell.nav.item.skipMarkers"),
-      navPage(PAGES.nodes),
-      settingsPage("playback", SETTINGS),
-    ]),
-    navTopic("downloads", "web.admin.shell.nav.topic.downloads", HardDriveDownload, [
-      navPage(PAGES.downloads, "web.admin.shell.nav.item.preparedFiles"),
-      settingsPage("downloads", SETTINGS),
-    ]),
-  ]),
-  navSection("configure", "web.admin.shell.nav.section.configure", [
-    navTopic("server", "web.admin.shell.nav.topic.server", Settings2, [
-      settingsPage("general"),
-      settingsPage("appearance"),
-      settingsPage("storage"),
-      settingsPage("search"),
-      settingsPage("network-access"),
-      navPage(PAGES.scheduledTasks),
-      navPage(PAGES.maintenance),
-      navPage(PAGES.backups),
-    ]),
-    navTopic("access", "web.admin.shell.nav.topic.access", Shield, [
-      settingsPage("sign-in"),
-      settingsPage("security"),
-      navPage(PAGES.apiKeys),
-      navPage(PAGES.policy),
-    ]),
-    navTopic("integrations", "web.admin.shell.nav.topic.integrations", Puzzle, [
-      navPage(PAGES.plugins),
-      settingsPage("providers"),
-      settingsPage("email"),
-      settingsPage("notifications"),
-      settingsPage("ai"),
-      navPage(PAGES.recommendations),
-      settingsPage("compatibility"),
-    ]),
-  ]),
+  {
+    label: "Monitor",
+    entries: [
+      PAGES.dashboard,
+      PAGES.activity,
+      {
+        id: "logs",
+        label: "Logs",
+        icon: ScrollText,
+        items: [
+          { ...PAGES.logs, label: "Server Log" },
+          { ...PAGES.diagnostics, label: "Client Diagnostics" },
+          settingsPage("logging", "Settings"),
+        ],
+      },
+    ],
+  },
+  {
+    label: "Manage",
+    entries: [
+      {
+        id: "libraries",
+        label: "Libraries",
+        icon: Library,
+        items: [
+          PAGES.libraries,
+          PAGES.virtualLibrary,
+          PAGES.collections,
+          { ...PAGES.sections, label: "Home Sections" },
+          PAGES.subtitleFiles,
+          settingsPage("library", "Settings"),
+          settingsPage("streaming"),
+        ],
+      },
+      {
+        id: "autoscan",
+        label: "Autoscan",
+        icon: Radar,
+        items: [
+          PAGES.autoscanActivity,
+          PAGES.autoscanSources,
+          settingsPage("autoscan", "Settings"),
+        ],
+      },
+      {
+        id: "requests",
+        label: "Requests",
+        icon: Send,
+        items: [
+          { ...PAGES.requests, label: "Queue" },
+          PAGES.requestDiscover,
+          settingsPage("requests", "Settings"),
+        ],
+      },
+      {
+        id: "users",
+        label: "Users",
+        icon: Users,
+        items: [PAGES.users, PAGES.accessGroups, PAGES.devices, PAGES.historyImport],
+      },
+      {
+        id: "playback",
+        label: "Playback",
+        icon: PlayCircle,
+        items: [
+          { ...PAGES.playbackHistory, label: "History" },
+          { ...PAGES.markers, label: "Skip Markers" },
+          PAGES.nodes,
+          settingsPage("playback", "Settings"),
+        ],
+      },
+      {
+        id: "downloads",
+        label: "Downloads",
+        icon: HardDriveDownload,
+        items: [
+          { ...PAGES.downloads, label: "Prepared Files" },
+          settingsPage("downloads", "Settings"),
+        ],
+      },
+    ],
+  },
+  {
+    label: "Configure",
+    entries: [
+      {
+        id: "server",
+        label: "Server",
+        icon: Settings2,
+        items: [
+          settingsPage("general"),
+          settingsPage("appearance"),
+          settingsPage("storage"),
+          settingsPage("search"),
+          settingsPage("network-access"),
+          PAGES.scheduledTasks,
+          PAGES.maintenance,
+          PAGES.backups,
+        ],
+      },
+      {
+        id: "access",
+        label: "Sign-in & Security",
+        icon: Shield,
+        items: [settingsPage("sign-in"), settingsPage("security"), PAGES.apiKeys, PAGES.policy],
+      },
+      {
+        id: "integrations",
+        label: "Integrations",
+        icon: Puzzle,
+        items: [
+          PAGES.plugins,
+          settingsPage("providers"),
+          settingsPage("email"),
+          settingsPage("notifications"),
+          settingsPage("ai"),
+          PAGES.recommendations,
+          settingsPage("compatibility"),
+        ],
+      },
+    ],
+  },
 ];
 
 function visibleItem(item: AdminNavItem, visibility: AdminNavVisibility): boolean {
@@ -589,16 +492,14 @@ function visibleItem(item: AdminNavItem, visibility: AdminNavVisibility): boolea
 }
 
 export function buildAdminNavSections(visibility: AdminNavVisibility = {}): AdminNavSection[] {
-  return ADMIN_NAV_SECTIONS.map((section) =>
-    withEntries(
-      section,
-      section.entries.flatMap((entry): AdminNavEntry[] => {
-        if (!isAdminNavTopic(entry)) return visibleItem(entry, visibility) ? [entry] : [];
-        const items = entry.items.filter((item) => visibleItem(item, visibility));
-        return items.length > 0 ? [topicWith(entry, items)] : [];
-      }),
-    ),
-  );
+  return ADMIN_NAV_SECTIONS.map((section) => ({
+    ...section,
+    entries: section.entries.flatMap((entry): AdminNavEntry[] => {
+      if (!isAdminNavTopic(entry)) return visibleItem(entry, visibility) ? [entry] : [];
+      const items = entry.items.filter((item) => visibleItem(item, visibility));
+      return items.length > 0 ? [{ ...entry, items }] : [];
+    }),
+  }));
 }
 
 export function buildAdminPluginNavItems(
@@ -612,15 +513,10 @@ export function buildAdminPluginNavItems(
     for (const route of installation.routes ?? []) {
       if (!route.navigable || route.navigation_kind !== "admin") continue;
 
-      // The plugin's own name for its page, or its id: plugin data, shown as is.
       const label = route.navigation_label || installation.plugin_id;
       items.push({
         label,
-        get description() {
-          return t("web.admin.shell.nav.pluginApp.description", {
-            plugin: installation.plugin_id,
-          });
-        },
+        description: `${installation.plugin_id} plugin app.`,
         keywords: [installation.plugin_id, "plugin", "plugin app"],
         icon: Puzzle,
         href: pluginRouteHref(installation.id, route.path),
@@ -637,18 +533,14 @@ export function appendAdminPluginNavSection(
   installations: readonly PluginInstallation[] | undefined,
 ): AdminNavGroup[] {
   const pluginItems = buildAdminPluginNavItems(installations);
-  const copies = sections.map((section) => groupOf(section, [...section.items]));
 
-  if (!pluginItems.length) return copies;
+  if (!pluginItems.length) {
+    return sections.map((section) => ({ ...section, items: [...section.items] }));
+  }
 
   return [
-    ...copies,
-    {
-      get label() {
-        return t("web.admin.shell.nav.group.pluginApps");
-      },
-      items: pluginItems,
-    },
+    ...sections.map((section) => ({ ...section, items: [...section.items] })),
+    { label: "Plugin Apps", items: pluginItems },
   ];
 }
 
@@ -665,9 +557,9 @@ export function buildAdminCommandNavSections(
   const groups: AdminNavGroup[] = [];
   for (const section of buildAdminNavSections(visibility)) {
     const loose = section.entries.filter((entry): entry is AdminNavItem => !isAdminNavTopic(entry));
-    if (loose.length > 0) groups.push(groupOf(section, loose));
+    if (loose.length > 0) groups.push({ label: section.label, items: loose });
     for (const entry of section.entries) {
-      if (isAdminNavTopic(entry)) groups.push(groupOf(entry, entry.items));
+      if (isAdminNavTopic(entry)) groups.push({ label: entry.label, items: entry.items });
     }
   }
 

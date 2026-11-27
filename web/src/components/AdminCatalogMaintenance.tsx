@@ -47,7 +47,7 @@ import {
   formatJobProgress,
   jobStatusLabel,
 } from "./adminCatalogMaintenanceFormatters";
-import { AdminCatalogImportSource } from "@/components/AdminCatalogImportSource";
+import { PathText } from "@/components/PathText";
 import { Download, Plus, RefreshCw, Trash2, Upload } from "lucide-react";
 import { copyTextToClipboard } from "@/lib/clipboard";
 import { formatDateTime } from "@/lib/datetime";
@@ -539,12 +539,7 @@ export default function AdminCatalogMaintenance() {
                       >
                         {jobStatusLabel(job.status, t)}
                       </Badge>
-                      <span className="text-sm font-medium">
-                        <AdminCatalogImportSource
-                          job={job}
-                          fallback={t("web.admin.catalogMaintenance.imports.seedFallback")}
-                        />
-                      </span>
+                      <span className="text-sm font-medium">{describeImportJob(t, job)}</span>
                       <span className="text-muted-foreground text-xs">
                         {t("web.admin.catalogMaintenance.jobs.requested", {
                           date: formatDateTime(job.requested_at),
@@ -763,6 +758,18 @@ function fileCount(t: Translate, count: number) {
 
 function describeExportJob(t: Translate, job: AdminJob) {
   return `${exportScopeLabel(t, job)} • ${formatDateTime(job.requested_at)}`;
+}
+
+function describeImportJob(t: Translate, job: AdminJob): ReactNode {
+  const label = (job.request_payload as { source_label?: string }).source_label;
+  // The server's label: the remote URL, a file name, or "Export job <id>", untranslated.
+  return label ? (
+    <bdi dir="ltr">
+      <PathText path={label} />
+    </bdi>
+  ) : (
+    t("web.admin.catalogMaintenance.imports.seedFallback")
+  );
 }
 
 /** Decorative separator in an import source's label; not text, so not translated. */

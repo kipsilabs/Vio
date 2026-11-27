@@ -32,7 +32,6 @@ export function ModelField({
   onCommit,
   placeholder,
   managedByEnv,
-  dirty,
 }: {
   label: string;
   description?: ReactNode;
@@ -45,8 +44,6 @@ export function ModelField({
   placeholder?: string;
   /** The variable that sets this model on the server; disables the field. */
   managedByEnv?: string;
-  /** Marks the row as holding an unsaved edit. */
-  dirty?: boolean;
 }) {
   const t = useT();
   const inputID = useId();
@@ -74,7 +71,6 @@ export function ModelField({
     <SettingFieldRow
       label={label}
       htmlFor={inputID}
-      dirty={dirty}
       description={description}
       status={status}
       managedByEnv={managedByEnv}
@@ -96,7 +92,7 @@ export function ModelField({
           autoComplete="off"
           spellCheck={false}
           disabled={managedByEnv != null}
-          className="font-mono text-[0.8125rem]"
+          className="font-mono text-[13px]"
         />
         {suggestions.length > 0 && (
           <Select

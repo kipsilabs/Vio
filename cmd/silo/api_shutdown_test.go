@@ -60,7 +60,7 @@ func (w *apiStopWait) signalAndAwaitRouteAway(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatal("readiness did not fail after a signal")
 		}
-		time.Sleep(time.Millisecond)
+		time.Sleep(time.Millisecond) //nolint:forbidigo // Polling readiness shutdown; the only signal is the atomic state.
 	}
 }
 

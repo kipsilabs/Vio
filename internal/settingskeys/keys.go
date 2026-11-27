@@ -75,6 +75,8 @@ const (
 	PlaybackSubtitleLanguage = "playback.subtitle_language"
 	// Subtitles
 	PlaybackSubtitleMode = "playback.subtitle_mode"
+	// Version order
+	PlaybackVersionSort = "playback.version_sort"
 	// Audio sync offset
 	PlayerAudioSyncMs = "player.audio_sync_ms"
 	// Audiobook rewind interval
@@ -198,6 +200,7 @@ var Remote = []string{
 	PlaybackSubtitleAppearance,
 	PlaybackSubtitleLanguage,
 	PlaybackSubtitleMode,
+	PlaybackVersionSort,
 	PlayerAudioSyncMs,
 	PlayerAudiobookSkipBackSeconds,
 	PlayerAudiobookSkipForwardSeconds,

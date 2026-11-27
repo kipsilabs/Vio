@@ -36,15 +36,30 @@ import {
   Shuffle,
   ShieldCheck,
   Tags,
-  Eye,
+  Trash2,
+  TimerReset,
   ThumbsDown,
   UsersRound,
   Hand,
   Wrench,
   Zap,
 } from "lucide-react";
+import { useQueryClient } from "@tanstack/react-query";
+import { useDeleteMediaItem } from "@/hooks/queries/items";
+import { usePreplayDiscovery } from "@/hooks/usePreplayDiscovery";
+import { useVersionListRefresh } from "@/hooks/useVersionListRefresh";
+import {
+  awaitVirtualCandidatesRefresh,
+  cancelVirtualCandidatesRefresh,
+} from "@/api/v2/mediaCandidates";
+import { catalogKeys, itemKeys } from "@/hooks/queries/keys";
+import { useRealtimeEvents } from "@/components/realtimeEventsContext";
+import { useWatchDetail } from "@/hooks/queries/items";
+import {
+  mergePlaybackInventory,
+  usePlaybackInventoryMirror,
+} from "@/player/playbackInventoryMirror";
 import { cn } from "@/lib/utils";
-import { numberText, type Translate, useT } from "@/i18n";
 import AddToCollectionDialog from "@/components/AddToCollectionDialog";
 import { Button } from "@/components/ui/button";
 import {
@@ -54,7 +69,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import type { FileVersion, PlaybackVariant } from "@/api/types";
+import type { FileVersion, PlaybackVariant, WatchDetail } from "@/api/types";
 import type { RedetectMarkersKind, RefreshItemMetadataMode } from "@/hooks/queries/items";
 import type {
   PlayerSubtitleTrackSignature,
@@ -69,10 +84,15 @@ import StarRating from "@/components/StarRating";
 import { MediaActionIcon } from "@/components/mediaActionIcons";
 import { useWatchPlaybackController } from "@/playback/watchPlaybackContext";
 import { parseWatchHref } from "@/pages/watchRouteHelpers";
-import VersionDropdown from "./VersionDropdown";
+import VersionDropdown, { VersionRefreshRow } from "./VersionDropdown";
+import type { ItemVersionSelection } from "./versionRankingUtils";
+import { sanitizeVersionLabel } from "./versionFormatUtils";
+import {
+  PROVISIONAL_INVENTORY_POLL_MS,
+  PROVISIONAL_INVENTORY_TIMEOUT_MS,
+} from "@/player/utils/inventoryProvenance";
 import AudioTracksPopover from "./AudioTracksPopover";
 import SubtitlesPopover from "./SubtitlesPopover";
-import { isRightToLeft, readingArrowKey } from "@/lib/direction";
 
 // Keep hover feedback on the compositor. Repainting these controls while the detail backdrop is
 // animating can stall the main thread on image-heavy movie and series pages.
@@ -82,6 +102,68 @@ const responsivePlayActionClass = `${responsivePrimaryActionClass} hover:bg-prim
 const staticGlassActionClass = "transition-none";
 const overflowMenuClass =
   "detail-overflow-menu border-border bg-popover text-popover-foreground fixed z-50 max-h-[calc(100vh-1rem)] w-max max-w-[calc(100vw-2rem)] min-w-0 overflow-y-auto rounded-md border p-1 shadow-md";
+
+/**
+ * Whether the selected row's inventory is still waiting for the server's answer.
+ *
+ * A row the catalog already stamped (`probed_at`) needs no read, and a watch
+ * detail whose matching version carries the stamp has been answered. Anything
+ * else — no payload yet, or a payload still serving the row's declared listing —
+ * is worth re-reading while the selection window is open.
+ */
+function selectedInventoryPending(
+  watch: WatchDetail | undefined,
+  selectedVersion: FileVersion | null | undefined,
+): boolean {
+  const fileId = selectedVersion?.file_id;
+  if (fileId == null) return false;
+  if (selectedVersion?.probed_at) return false;
+  const row = watch?.versions?.find((version) => version.file_id === fileId);
+  return !row?.probed_at;
+}
+
+/** The row's own name: its release first, then the edition, then the resolution. */
+function versionDisplayLabel(version: FileVersion | null): string {
+  if (!version) return "";
+  return (
+    sanitizeVersionLabel(version.release_name || version.edition_raw) ||
+    version.resolution ||
+    `Version ${version.file_id}`
+  );
+}
+
+/**
+ * Why Play is not starting the row the page preferred. A skipped row never
+ * disables Play: the page selects the best available row instead, so the notice
+ * names what it skipped and what it plays, keeping the version list one click
+ * away.
+ */
+function versionFallbackMessage(fallback: NonNullable<ItemVersionSelection["fallback"]>): string {
+  const selected = versionDisplayLabel(fallback.selected);
+  const skipped = versionDisplayLabel(fallback.skipped);
+  if (fallback.reason === "unlisted") {
+    return selected
+      ? `The version you last played is no longer listed. Playing ${selected}.`
+      : "The version you last played is no longer listed. Pick a version to play.";
+  }
+  const unplayable = fallback.reason === "unplayable";
+  const sameSkippedAndSelected =
+    fallback.skipped && fallback.selected && fallback.skipped.file_id === fallback.selected.file_id;
+  if (sameSkippedAndSelected) {
+    if (unplayable) {
+      return `${skipped} cannot play on this device. Pick another version.`;
+    }
+    return fallback.reason === "failed"
+      ? `${skipped} is marked failed. Playing it retries the link.`
+      : `${skipped} is not available right now. Playing it retries the link.`;
+  }
+  if (unplayable) {
+    return `${skipped} cannot play on this device. Playing ${selected} instead.`;
+  }
+  return fallback.reason === "failed"
+    ? `${skipped} is marked failed. Playing ${selected} instead.`
+    : `${skipped} is not available right now. Playing ${selected} instead.`;
+}
 
 function visibleOverflowItems(menu: HTMLElement | null): HTMLButtonElement[] {
   if (!menu) return [];
@@ -126,7 +208,7 @@ function DetailOverflowMenuItem({
       {...props}
       type="button"
       role="menuitem"
-      className={`focus:bg-accent focus:text-accent-foreground hover:bg-accent hover:text-accent-foreground [&_svg:not([class*='text-'])]:text-muted-foreground relative flex w-full cursor-pointer items-center gap-2 rounded-sm px-2 py-1.5 text-start text-sm outline-hidden select-none disabled:pointer-events-none disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4 ${className ?? ""}`}
+      className={`focus:bg-accent focus:text-accent-foreground hover:bg-accent hover:text-accent-foreground [&_svg:not([class*='text-'])]:text-muted-foreground relative flex w-full cursor-pointer items-center gap-2 rounded-sm px-2 py-1.5 text-left text-sm outline-hidden select-none disabled:pointer-events-none disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4 ${className ?? ""}`}
       onClick={() => {
         closeMenu?.();
         onAction?.();
@@ -219,8 +301,8 @@ export interface ActionBarProps {
   playLabel?: string;
   playProgress?: number;
   restartHref?: string;
-  /** Mark Unwatched in the More menu for a partly watched movie or episode. */
-  onMarkUnwatched?: () => void;
+  /** Clears the resume position without marking the item watched. */
+  onResetProgress?: () => void;
   resumePositionSeconds?: number;
   resumeDurationSeconds?: number;
   resumeResolution?: string;
@@ -263,14 +345,22 @@ export interface ActionBarProps {
   /** Enables the admin "Seek Previews" action; the server must offer seek previews. */
   canManageTrickplay?: boolean;
   versions?: FileVersion[];
+  /** The item has a virtual source, even when no version is currently playable. */
+  hasVirtualSource?: boolean;
   playbackVariants?: PlaybackVariant[];
   selectedVersion?: FileVersion | null;
-  /** The file Start Over plays: the first part of selectedVersion's presentation. */
-  restartVersion?: FileVersion | null;
   /** The viewer chose selectedVersion rather than playing the default version. */
   versionPicked?: boolean;
-  onSelectVersion?: (version: FileVersion | null) => void;
-  onSelectEdition?: (key: string) => void;
+  /**
+   * Set when the page could not play the row it preferred (a row the refresh
+   * dropped, a failed row, or a row the provider is not serving right now) and
+   * plays another row instead. Play stays enabled; the notice names the row it
+   * had to skip so the version list is one click away.
+   */
+  versionFallback?: ItemVersionSelection["fallback"];
+  onSelectVersion?: (version: FileVersion) => void;
+  /** Fired when a version picker popover opens or closes (open=true on open). */
+  onVersionPickerOpenChange?: (open: boolean) => void;
   onDownload?: () => void;
   onSearchSubtitles?: () => void;
   /** Opens the season picker to request seasons the library is missing. */
@@ -282,6 +372,9 @@ export interface ActionBarProps {
   qualityPreference?: string | null;
   audioSelectionMode?: "auto" | "explicit";
   explicitAudioTrackIndex?: number | null;
+  /** True when the play target version was explicitly chosen by the viewer;
+   * the server must not silently substitute another version. */
+  explicitFileSelection?: boolean;
   onSelectAudioTrack?: (trackIndex: number) => void;
   onResetAudioSelection?: () => void;
   prePlaySubtitleMode?: "auto" | "off" | "explicit";
@@ -295,29 +388,6 @@ export interface ActionBarProps {
   showForcedSubtitles?: boolean;
 }
 
-/**
- * Start Over can play another file than the one the pickers describe (part 1
- * of a later part's presentation). Audio indexes belong to the picked file, so
- * the server resolves the saved audio preference instead. A manual subtitle
- * pick still matches by language, source and flags, but loses the picked
- * file's track index, sidecar path and downloaded subtitle.
- */
-function withoutFileSpecificPicks<
-  T extends { audioTrackIndex?: number; prePlaySubtitleSelection: PrePlaySubtitleSelection | null },
->(input: T): T {
-  const selection = input.prePlaySubtitleSelection;
-  return {
-    ...input,
-    audioTrackIndex: undefined,
-    prePlaySubtitleSelection: selection && {
-      ...selection,
-      track_index: undefined,
-      external_subtitle_path: undefined,
-      downloaded_subtitle_id: undefined,
-    },
-  };
-}
-
 export default function ActionBar({
   compactMobile = false,
   contentId,
@@ -328,10 +398,10 @@ export default function ActionBar({
   secondaryActions,
   links,
   playHref,
-  playLabel: playLabelProp,
+  playLabel = "Play",
   playProgress,
   restartHref,
-  onMarkUnwatched,
+  onResetProgress,
   resumePositionSeconds,
   resumeDurationSeconds,
   watchedLabel,
@@ -345,7 +415,7 @@ export default function ActionBar({
   onToggleNotInterested,
   notInterested = false,
   onAllowForProfiles,
-  allowForLabel: allowForLabelProp,
+  allowForLabel = "Allow for…",
   onRefresh,
   isRefreshing = false,
   onRedetectMarkers,
@@ -360,12 +430,13 @@ export default function ActionBar({
   canEditMarkers = false,
   canManageTrickplay = false,
   versions,
+  hasVirtualSource = false,
   playbackVariants,
   selectedVersion,
-  restartVersion,
   versionPicked = false,
+  versionFallback = null,
   onSelectVersion,
-  onSelectEdition,
+  onVersionPickerOpenChange,
   onDownload,
   onSearchSubtitles,
   onRequestSeasons,
@@ -374,6 +445,7 @@ export default function ActionBar({
   onRatingChange,
   audioSelectionMode = "auto",
   explicitAudioTrackIndex = null,
+  explicitFileSelection = false,
   onSelectAudioTrack,
   onResetAudioSelection,
   prePlaySubtitleMode = "auto",
@@ -386,10 +458,6 @@ export default function ActionBar({
   subtitleMode,
   showForcedSubtitles,
 }: ActionBarProps) {
-  const t = useT();
-  const resumeLabel = t("web.detail.actions.resume");
-  const playLabel = playLabelProp ?? t("web.detail.actions.play");
-  const allowForLabel = allowForLabelProp ?? t("web.detail.actions.allowFor");
   const navigate = useNavigate();
   const location = useLocation();
   const playbackController = useWatchPlaybackController();
@@ -416,16 +484,180 @@ export default function ActionBar({
   const [markerEditorOpen, setMarkerEditorOpen] = useState(false);
   const [trickplayOpen, setTrickplayOpen] = useState(false);
   const showTrickplay = isAdmin && canManageTrickplay && !!contentId;
+  const deleteMediaItem = useDeleteMediaItem();
+  const queryClient = useQueryClient();
+  const virtualDetail =
+    hasVirtualSource ||
+    !!versions?.some((version) =>
+      /^virtual:\/\/(?:movie\/[^?]+|series\/[^?]+(?::\d+:\d+|\/\d+\/\d+))(?:\?|$)/.test(
+        version.file_path ?? "",
+      ),
+    );
+  const { discovering, failed: discoveryFailed } = usePreplayDiscovery(contentId, virtualDetail);
+  const { awaitAdminJob } = useRealtimeEvents();
+  // The item-page "Refresh List": start the async re-list job, wait for it to
+  // finish, then re-read the item and the watch detail so both the page's
+  // version list and the picker's indexer rows are replaced from the server's
+  // answer rather than a client-side merge. The refresh control stays locked
+  // for this whole flow; a second press cancels the job and unlocks it.
+  const handleRefreshVersions = useCallback(async () => {
+    if (!contentId) return;
+    await awaitVirtualCandidatesRefresh(contentId, awaitAdminJob);
+    await Promise.all([
+      queryClient.invalidateQueries({
+        queryKey: catalogKeys.itemDetail(contentId).slice(0, 4),
+      }),
+      queryClient.invalidateQueries({
+        queryKey: itemKeys.watchDetail(contentId),
+      }),
+    ]);
+  }, [awaitAdminJob, contentId, queryClient]);
+  const handleCancelRefresh = useCallback(async () => {
+    if (!contentId) return;
+    await cancelVirtualCandidatesRefresh(contentId);
+  }, [contentId]);
+  // A virtual item with no discovered version still needs the indexer search
+  // entry point; the version picker cannot carry it when there are no rows.
+  const standaloneRefresh = useVersionListRefresh(
+    virtualDetail && !selectedVersion ? handleRefreshVersions : undefined,
+    virtualDetail && !selectedVersion ? handleCancelRefresh : undefined,
+  );
+  // How long the selected row's inventory read keeps polling after a selection.
+  // It is the same documented selection window the menus use, so an unprobeable
+  // version stops asking instead of polling for as long as the page is open. The
+  // window is armed by the read itself — the first time react-query asks whether
+  // to poll — which is when the selection's read mounts.
+  const inventoryPollWindow = useRef<{ fileId: number | null; deadline: number }>({
+    fileId: null,
+    deadline: 0,
+  });
+  // The catalog version rows can omit the probed track inventory. Read the
+  // selected file's watch detail and use its current audio/subtitle lists for
+  // the pre-play menus, so the media page offers the same tracks as the player
+  // rather than the pre-probe placeholders. The zero stale time is deliberate:
+  // this read may follow the probe that populated those lists.
+  const { data: selectedWatch, refetch: refetchSelectedWatch } = useWatchDetail(
+    contentId,
+    selectedVersion?.file_id,
+    undefined,
+    {
+      enabled: !!contentId && !!selectedVersion,
+      staleTime: 0,
+      // While the server has not answered for this row, ask again on an
+      // interval: the selection probe's answer normally arrives as a
+      // `versions_updated` event, but the event only invalidates this query, so
+      // a delayed or missed frame would leave the menu on declared metadata
+      // until the viewer pressed Retry. Polling makes the wait follow the
+      // server's own answer, and the deadline hands the decision back to the
+      // menus once the documented window is spent.
+      refetchInterval: (query) => {
+        const fileId = selectedVersion?.file_id ?? null;
+        if (fileId == null || selectedVersion?.probed_at) return false;
+        if (inventoryPollWindow.current.fileId !== fileId) {
+          inventoryPollWindow.current = {
+            fileId,
+            deadline: Date.now() + PROVISIONAL_INVENTORY_TIMEOUT_MS,
+          };
+        }
+        if (!selectedInventoryPending(query.state.data, selectedVersion)) return false;
+        return Date.now() < inventoryPollWindow.current.deadline
+          ? PROVISIONAL_INVENTORY_POLL_MS
+          : false;
+      },
+    },
+  );
+  const playerInventory = usePlaybackInventoryMirror(selectedVersion?.file_id);
+  const selectedWatchVersion = useMemo(
+    () =>
+      selectedVersion
+        ? selectedWatch?.versions?.find((version) => version.file_id === selectedVersion.file_id)
+        : undefined,
+    [selectedVersion, selectedWatch],
+  );
+  const isWatchProbed = Boolean(selectedWatchVersion?.probed_at);
+  const isCatalogProbed = Boolean(selectedVersion?.probed_at);
+  const probed = isWatchProbed || isCatalogProbed;
+  const selectedVersionWithTracks = useMemo(() => {
+    if (!selectedVersion) return null;
+    if (!selectedWatchVersion) {
+      return mergePlaybackInventory(selectedVersion, playerInventory, {
+        audioProbed: isCatalogProbed,
+        subtitlesProbed: isCatalogProbed,
+      });
+    }
+    // When the watch detail read is probed, its inventory is authoritative even
+    // if empty (verified empty). When only the catalog version carries probed_at
+    // (watch read hasn't completed or is unprobed), the catalog lists are
+    // authoritative. When neither is probed, the selected row's declaration is
+    // still its own inventory: show it now, but let a later probe replace it.
+    if (isWatchProbed) {
+      return mergePlaybackInventory(
+        {
+          ...selectedVersion,
+          audio_tracks: selectedWatchVersion.audio_tracks ?? [],
+          subtitle_tracks: selectedWatchVersion.subtitle_tracks ?? [],
+        },
+        playerInventory,
+        { audioProbed: true, subtitlesProbed: true },
+      );
+    }
+    if (isCatalogProbed) {
+      return mergePlaybackInventory(
+        {
+          ...selectedVersion,
+          audio_tracks: selectedVersion.audio_tracks ?? [],
+          subtitle_tracks: selectedVersion.subtitle_tracks ?? [],
+        },
+        playerInventory,
+        { audioProbed: true, subtitlesProbed: true },
+      );
+    }
+    return mergePlaybackInventory(
+      {
+        ...selectedVersion,
+        audio_tracks:
+          (selectedWatchVersion.audio_tracks?.length ?? 0) > 0
+            ? selectedWatchVersion.audio_tracks
+            : selectedVersion.audio_tracks,
+        subtitle_tracks:
+          (selectedWatchVersion.subtitle_tracks?.length ?? 0) > 0
+            ? selectedWatchVersion.subtitle_tracks
+            : selectedVersion.subtitle_tracks,
+      },
+      playerInventory,
+    );
+  }, [isCatalogProbed, isWatchProbed, playerInventory, selectedVersion, selectedWatchVersion]);
+  // The selected row's own declared tracks are inventory too: render them
+  // immediately instead of waiting on a pre-play probe that often never lands.
+  // They are that row's listing, never a sibling's, and stay labelled as
+  // unverified until probe evidence for this exact file replaces them.
+  const audioRows = selectedVersionWithTracks?.audio_tracks ?? [];
+  const subtitleRows = selectedVersionWithTracks?.subtitle_tracks ?? [];
+  const audioRowsProbed = probed || playerInventory?.audioVerified === true;
+  const subtitleRowsProbed = probed || playerInventory?.subtitleVerified === true;
+  const audioInventoryDeclared = audioRows.length > 0 && !audioRowsProbed;
+  const subtitleInventoryDeclared = subtitleRows.length > 0 && !subtitleRowsProbed;
+  // Only a row with no declared tracks and no probe evidence waits in
+  // discovery. An empty verified list stays final, and a row with declared
+  // tracks never reads as unavailable.
+  const audioInventoryProvisional = audioRows.length === 0 && !audioRowsProbed;
+  const subtitleInventoryProvisional = subtitleRows.length === 0 && !subtitleRowsProbed;
+  // The watch detail read is the page's discovery path: the server persists
+  // probed tracks there. Retrying re-reads it for the selected file; Play stays
+  // available throughout, so a slow probe never blocks starting playback.
+  const handleRetryInventory = useCallback(() => {
+    void refetchSelectedWatch();
+  }, [refetchSelectedWatch]);
   const showMarkerEditor = canEditMarkers && !!contentId;
   const hasMultipleVersions = (playbackVariants?.length ?? 0) > 1 || (versions?.length ?? 0) > 1;
   const showPlayChoiceDialog =
-    !hasMultipleVersions && playLabel === resumeLabel && !!playHref && !!restartHref;
-  const displayedPlayLabel = showPlayChoiceDialog ? t("web.detail.actions.play") : playLabel;
+    !hasMultipleVersions && playLabel === "Resume" && !!playHref && !!restartHref;
+  const displayedPlayLabel = showPlayChoiceDialog ? "Play" : playLabel;
   const playText = compactMobile ? (
     <>
       <span className="detail-full-label">{displayedPlayLabel}</span>
       <span className="detail-short-label">
-        {displayedPlayLabel === resumeLabel ? resumeLabel : t("web.detail.actions.play")}
+        {displayedPlayLabel === "Resume" ? "Resume" : "Play"}
       </span>
     </>
   ) : (
@@ -460,6 +692,10 @@ export default function ActionBar({
     () => `${location.pathname}${location.search}`,
     [location.pathname, location.search],
   );
+  // One policy for every start path: a row the liveness check marked
+  // unavailable is re-linked rather than replaying a stale provider pin. Play,
+  // Resume and the overflow "Play from Beginning" must not disagree about it.
+  const forceRelinkForSelectedVersion = selectedVersion?.available === false ? true : undefined;
   const buildPrePlayStartInput = useCallback(
     (base: {
       contentId: string;
@@ -467,6 +703,7 @@ export default function ActionBar({
       libraryId?: number;
       restart?: boolean;
       returnHref?: string;
+      forceRelink?: boolean;
     }) => ({
       ...base,
       audioTrackIndex:
@@ -478,12 +715,14 @@ export default function ActionBar({
       prePlaySubtitleMode,
       prePlaySubtitleSelection:
         prePlaySubtitleMode === "explicit" ? explicitSubtitleSelection : null,
+      explicitFileSelection,
       versionPicked,
     }),
     [
       audioSelectionMode,
       explicitAudioTrackIndex,
       explicitSubtitleSelection,
+      explicitFileSelection,
       prePlaySubtitleMode,
       versionPicked,
     ],
@@ -496,27 +735,25 @@ export default function ActionBar({
         return;
       }
 
-      const restart = restartOverride ?? parsed.restart;
-      const file = restart ? (restartVersion ?? selectedVersion) : selectedVersion;
-      const input = buildPrePlayStartInput({
-        contentId: parsed.contentId,
-        fileId: file?.file_id ?? parsed.fileId,
-        libraryId: parsed.libraryId,
-        restart,
-        returnHref: currentHref,
-      });
       playbackController.startPlayback(
-        file && file.file_id !== selectedVersion?.file_id ? withoutFileSpecificPicks(input) : input,
+        buildPrePlayStartInput({
+          contentId: parsed.contentId,
+          fileId: selectedVersion?.file_id ?? parsed.fileId,
+          libraryId: parsed.libraryId,
+          restart: restartOverride ?? parsed.restart,
+          returnHref: currentHref,
+          forceRelink: forceRelinkForSelectedVersion,
+        }),
         "viewer",
       );
     },
     [
       buildPrePlayStartInput,
       currentHref,
+      forceRelinkForSelectedVersion,
       navigate,
       playbackController,
-      restartVersion,
-      selectedVersion,
+      selectedVersion?.file_id,
     ],
   );
   const handleResumePlayback = () => {
@@ -600,27 +837,16 @@ export default function ActionBar({
       );
     // Line the first item up with Manage: the menu's border and padding sit above it.
     const besideTop = clampTop(triggerRect.top - 5);
-    // Beside the main menu on its end side (right, or left in a right-to-left
-    // layout), else the other side.
-    const rtl = isRightToLeft(main);
-    const right = mainRect.right + gap;
-    const left = mainRect.left - gap - menuRect.width;
-    const sides = [
-      { left: right, fits: right + menuRect.width <= window.innerWidth - viewportPadding },
-      { left, fits: left >= viewportPadding },
-    ];
-    if (rtl) sides.reverse();
-    const beside = sides.find((side) => side.fits);
-    if (beside) {
-      setManagePosition({ left: beside.left, top: besideTop });
+    if (mainRect.right + gap + menuRect.width <= window.innerWidth - viewportPadding) {
+      setManagePosition({ left: mainRect.right + gap, top: besideTop });
+    } else if (mainRect.left - gap - menuRect.width >= viewportPadding) {
+      setManagePosition({ left: mainRect.left - gap - menuRect.width, top: besideTop });
     } else {
-      // No room beside it on a narrow screen: cascade over the main menu, under
-      // Manage, stepped in from its start edge.
-      const cascade = rtl ? mainRect.right - 24 - menuRect.width : mainRect.left + 24;
+      // No room beside it on a narrow screen: cascade over the main menu, under Manage.
       setManagePosition({
         left: Math.min(
           window.innerWidth - menuRect.width - viewportPadding,
-          Math.max(viewportPadding, cascade),
+          Math.max(viewportPadding, mainRect.left + 24),
         ),
         top: clampTop(triggerRect.bottom),
       });
@@ -722,14 +948,12 @@ export default function ActionBar({
     };
   }, [closeManageMenu, closeOverflowMenu, manageOpen, overflowOpen, positionOverflowMenu]);
   const handleOverflowKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
-    // The submenu opens toward the end side, so its keys follow the direction.
-    const key = readingArrowKey(event);
-    if (key === "ArrowRight" && event.target === manageTriggerRef.current) {
+    if (event.key === "ArrowRight" && event.target === manageTriggerRef.current) {
       event.preventDefault();
       openManageMenu(true);
       return;
     }
-    if (key === "ArrowLeft" && event.currentTarget === manageMenuRef.current) {
+    if (event.key === "ArrowLeft" && event.currentTarget === manageMenuRef.current) {
       event.preventDefault();
       closeManageMenu(true);
       return;
@@ -785,7 +1009,7 @@ export default function ActionBar({
     onShuffle && (
       <DetailOverflowMenuItem key="shuffle" closeMenu={closeOverflowMenu} onAction={onShuffle}>
         <Shuffle className="size-4" />
-        {t("web.detail.actions.shuffle")}
+        Shuffle
       </DetailOverflowMenuItem>
     ),
     showRestartInMenu && (
@@ -795,17 +1019,13 @@ export default function ActionBar({
         onAction={handleRestartPlayback}
       >
         <RotateCcw className="size-4" />
-        {t("web.detail.actions.playFromBeginning")}
+        Play from Beginning
       </DetailOverflowMenuItem>
     ),
-    onMarkUnwatched && (
-      <DetailOverflowMenuItem
-        key="markUnwatched"
-        closeMenu={closeOverflowMenu}
-        onAction={onMarkUnwatched}
-      >
-        <Eye className="size-4" />
-        {t("web.detail.actions.markUnwatched")}
+    onResetProgress && (
+      <DetailOverflowMenuItem key="reset" closeMenu={closeOverflowMenu} onAction={onResetProgress}>
+        <TimerReset className="size-4" />
+        Reset Progress
       </DetailOverflowMenuItem>
     ),
   ];
@@ -817,9 +1037,7 @@ export default function ActionBar({
         onAction={onToggleWatchlist}
       >
         {inWatchlist ? <Check className="size-4" /> : <Plus className="size-4" />}
-        {inWatchlist
-          ? t("web.detail.actions.removeFromWatchlist")
-          : t("web.detail.actions.addToWatchlist")}
+        {inWatchlist ? "Remove from Watchlist" : "Add to Watchlist"}
       </DetailOverflowMenuItem>
     ),
     contentId && canAddToCollection && (
@@ -829,13 +1047,13 @@ export default function ActionBar({
         onAction={() => setAddToCollectionOpen(true)}
       >
         <FolderPlus className="size-4" />
-        {t("web.detail.actions.addToCollection")}
+        Add to Collection
       </DetailOverflowMenuItem>
     ),
     onDownload && (
       <DetailOverflowMenuItem key="download" closeMenu={closeOverflowMenu} onAction={onDownload}>
         <Download className="size-4" />
-        {t("web.detail.actions.download")}
+        Download
       </DetailOverflowMenuItem>
     ),
     onRequestSeasons && (
@@ -845,7 +1063,7 @@ export default function ActionBar({
         onAction={onRequestSeasons}
       >
         <Inbox className="size-4" />
-        {t("web.detail.actions.requestSeasons")}
+        Request Seasons
       </DetailOverflowMenuItem>
     ),
     onToggleNotInterested && (
@@ -855,9 +1073,7 @@ export default function ActionBar({
         onAction={onToggleNotInterested}
       >
         <ThumbsDown className={cn("size-4", notInterested && "fill-current")} />
-        {notInterested
-          ? t("web.detail.actions.showInRecommendations")
-          : t("web.detail.actions.notInterested")}
+        {notInterested ? "Show in Recommendations" : "Not Interested"}
       </DetailOverflowMenuItem>
     ),
     onAllowForProfiles && (
@@ -879,7 +1095,7 @@ export default function ActionBar({
           onAction={watchTogether.onStartParty}
         >
           <UsersRound className="size-4" />
-          {t("web.detail.actions.startWatchParty")}
+          Start a Watch Party
         </DetailOverflowMenuItem>,
         watchTogether.liveRoom && (
           <DetailOverflowMenuItem
@@ -888,7 +1104,7 @@ export default function ActionBar({
             onAction={watchTogether.liveRoom.onSuggest}
           >
             <Hand className="size-4" />
-            {t("web.detail.actions.suggestToRoom", { code: watchTogether.liveRoom.code })}
+            Suggest to {watchTogether.liveRoom.code}
           </DetailOverflowMenuItem>
         ),
         watchTogether.liveRoom?.onPlay && (
@@ -898,7 +1114,7 @@ export default function ActionBar({
             onAction={watchTogether.liveRoom.onPlay}
           >
             <Zap className="size-4" />
-            {t("web.detail.actions.playInRoom", { code: watchTogether.liveRoom.code })}
+            Play in {watchTogether.liveRoom.code}
           </DetailOverflowMenuItem>
         ),
       ]
@@ -912,13 +1128,13 @@ export default function ActionBar({
           onAction={onEditMetadata}
         >
           <MediaActionIcon action="editMetadata" />
-          {t("web.detail.actions.editMetadata")}
+          Edit Metadata
         </DetailOverflowMenuItem>
       ),
       canCurateMetadata && onMatchItem && (
         <DetailOverflowMenuItem key="match" closeMenu={closeOverflowMenu} onAction={onMatchItem}>
           <MediaActionIcon action="matchItem" />
-          {t("web.detail.actions.matchItem")}
+          Match Item
         </DetailOverflowMenuItem>
       ),
       canCurateMetadata && onRefresh && (
@@ -929,7 +1145,7 @@ export default function ActionBar({
           onAction={() => setRefreshDialogOpen(true)}
         >
           <MediaActionIcon action="refreshMetadata" isPending={isRefreshing} />
-          {t("web.detail.actions.refreshMetadata")}
+          Refresh Metadata
         </DetailOverflowMenuItem>
       ),
     ],
@@ -941,7 +1157,7 @@ export default function ActionBar({
           onAction={() => setMarkerEditorOpen(true)}
         >
           <Tags className="size-4" />
-          {t("web.detail.actions.editMarkers")}
+          Edit Markers
         </DetailOverflowMenuItem>
       ),
       isAdmin && onRedetectMarkers && (
@@ -955,10 +1171,10 @@ export default function ActionBar({
         >
           <RefreshCw className={`size-4 ${isRedetectingMarkers ? "animate-spin" : ""}`} />
           {redetectKind === "credits"
-            ? t("web.detail.actions.redetectCredits")
+            ? "Re-detect Credits"
             : redetectKind === "intro"
-              ? t("web.detail.actions.redetectIntro")
-              : t("web.detail.actions.redetectMarkers")}
+              ? "Re-detect Intro Markers"
+              : "Re-detect Markers"}
         </DetailOverflowMenuItem>
       ),
       showTrickplay && (
@@ -968,17 +1184,27 @@ export default function ActionBar({
           onAction={() => setTrickplayOpen(true)}
         >
           <GalleryHorizontal className="size-4" />
-          {t("web.detail.actions.seekPreviews")}
+          Seek Previews
         </DetailOverflowMenuItem>
       ),
       canCurateMetadata && onSplitItem && (
         <DetailOverflowMenuItem key="split" closeMenu={closeOverflowMenu} onAction={onSplitItem}>
           <Scissors className="size-4" />
-          {t("web.detail.actions.splitVersions")}
+          Split Versions
         </DetailOverflowMenuItem>
       ),
     ],
     [
+      canCurateMetadata && onShowMediaInfo && (
+        <DetailOverflowMenuItem
+          key="media-info"
+          closeMenu={closeOverflowMenu}
+          onAction={onShowMediaInfo}
+        >
+          <Info className="size-4" />
+          Media Info
+        </DetailOverflowMenuItem>
+      ),
       isAdmin && contentId && (
         <DetailOverflowMenuItem
           key="play-history"
@@ -986,22 +1212,34 @@ export default function ActionBar({
           onAction={() => navigate(`/admin/history?media_item_id=${encodeURIComponent(contentId)}`)}
         >
           <MediaActionIcon action="viewPlayHistory" />
-          {t("web.detail.actions.viewPlayHistory")}
+          View Play History
         </DetailOverflowMenuItem>
       ),
     ],
-  ];
-  const infoItems = [
-    onShowMediaInfo && (
-      <DetailOverflowMenuItem
-        key="media-info"
-        closeMenu={closeOverflowMenu}
-        onAction={onShowMediaInfo}
-      >
-        <Info className="size-4" />
-        {t("web.detail.mediaInfo.title")}
-      </DetailOverflowMenuItem>
-    ),
+    [
+      isAdmin && contentId && (
+        <DetailOverflowMenuItem
+          key="delete-item"
+          closeMenu={closeOverflowMenu}
+          className="text-red-500 hover:bg-red-500/10 hover:text-red-400 focus:bg-red-500/10 focus:text-red-400"
+          disabled={deleteMediaItem.isPending}
+          onAction={() => {
+            if (
+              window.confirm("Delete this show/movie? Home and library will update immediately.")
+            ) {
+              deleteMediaItem.mutate(contentId, {
+                onSuccess: () => {
+                  navigate("/");
+                },
+              });
+            }
+          }}
+        >
+          <Trash2 className="size-4 text-red-500" />
+          Delete Show / Movie
+        </DetailOverflowMenuItem>
+      ),
+    ],
   ];
   const manageItems = manageGroups.flat().filter(Boolean);
   // A single management action sits at the end of the menu instead of behind Manage.
@@ -1010,7 +1248,6 @@ export default function ActionBar({
     playbackItems,
     libraryItems,
     partyItems,
-    infoItems,
     hasManagePanel
       ? [
           <DetailOverflowMenuItem
@@ -1023,8 +1260,8 @@ export default function ActionBar({
             onAction={() => openManageMenu(true)}
           >
             <Wrench className="size-4" />
-            {t("web.detail.actions.manage")}
-            <ChevronRight className="ms-auto size-4" />
+            Manage
+            <ChevronRight className="ml-auto size-4" />
           </DetailOverflowMenuItem>,
         ]
       : manageItems,
@@ -1053,7 +1290,7 @@ export default function ActionBar({
         ? Math.round((resumePositionSeconds / resumeDurationSeconds) * 100)
         : null;
   const dialogDescription = showPlayChoiceDialog
-    ? buildPlayChoiceDescription(t, formattedResumeTime, percentComplete)
+    ? buildPlayChoiceDescription(formattedResumeTime, percentComplete)
     : "";
 
   // When a version is explicitly selected (multi-version), play it directly.
@@ -1066,16 +1303,25 @@ export default function ActionBar({
           fileId: selectedVersion.file_id,
           restart,
           returnHref: currentHref,
+          forceRelink: forceRelinkForSelectedVersion,
         }),
         "viewer",
       );
     },
-    [buildPrePlayStartInput, contentId, currentHref, playbackController, selectedVersion],
+    [
+      buildPrePlayStartInput,
+      contentId,
+      currentHref,
+      forceRelinkForSelectedVersion,
+      playbackController,
+      selectedVersion,
+    ],
   );
 
   // The subtitle control is available even when the selected file has no
-  // embedded tracks because downloaded subtitles are loaded on demand.
-  const hasStreamControls = Boolean(selectedVersion);
+  // embedded tracks because downloaded subtitles are loaded on demand. It also
+  // owns the row when the item lists versions but none is selected yet.
+  const hasStreamControls = Boolean(selectedVersion) || (versions?.length ?? 0) > 0;
 
   return (
     <div className="detail-action-bar space-y-2.5" data-compact-mobile={compactMobile || undefined}>
@@ -1173,9 +1419,7 @@ export default function ActionBar({
               <>
                 <span className="detail-full-label">{watchedLabel}</span>
                 <span className="detail-short-label">
-                  {isWatched
-                    ? t("web.detail.actions.markUnwatched")
-                    : t("web.detail.actions.markWatched")}
+                  {isWatched ? "Mark Unwatched" : "Mark Watched"}
                 </span>
               </>
             ) : (
@@ -1190,14 +1434,8 @@ export default function ActionBar({
             variant="glass"
             size="icon-lg"
             onClick={onToggleFavorite}
-            title={
-              isFavorite ? t("web.detail.actions.unfavorite") : t("web.detail.actions.favorite")
-            }
-            aria-label={
-              isFavorite
-                ? t("web.detail.actions.removeFromFavorites")
-                : t("web.detail.actions.addToFavorites")
-            }
+            title={isFavorite ? "Unfavorite" : "Favorite"}
+            aria-label={isFavorite ? "Remove from favorites" : "Add to favorites"}
             className={`${staticGlassActionClass} detail-secondary-action size-11 cursor-pointer rounded-full`}
           >
             <Heart
@@ -1217,8 +1455,8 @@ export default function ActionBar({
             ref={overflowTriggerRef}
             variant="glass"
             size="icon-lg"
-            title={t("web.detail.actions.more")}
-            aria-label={t("web.detail.actions.moreActions")}
+            title="More"
+            aria-label="More actions"
             aria-haspopup="menu"
             aria-expanded={overflowOpen}
             aria-controls={overflowOpen ? overflowMenuId : undefined}
@@ -1253,20 +1491,12 @@ export default function ActionBar({
                       onAction={onToggleFavorite}
                     >
                       <Heart className="size-4" />
-                      {isFavorite
-                        ? t("web.detail.actions.removeFromFavorites")
-                        : t("web.detail.actions.addToFavorites")}
+                      {isFavorite ? "Remove from favorites" : "Add to favorites"}
                     </DetailOverflowMenuItem>
                   )}
                   {onRatingChange && (
-                    <div
-                      className="px-2 py-2"
-                      role="group"
-                      aria-label={t("web.detail.actions.yourRating")}
-                    >
-                      <span className="mb-2 block text-sm">
-                        {t("web.detail.actions.yourRating")}
-                      </span>
+                    <div className="px-2 py-2" role="group" aria-label="Your rating">
+                      <span className="mb-2 block text-sm">Your rating</span>
                       {/* ArrowUp/ArrowDown keep moving through the menu; only
                               ArrowLeft/ArrowRight change the rating here. */}
                       <StarRating
@@ -1299,7 +1529,7 @@ export default function ActionBar({
               }}
               className={overflowMenuClass}
               role="menu"
-              aria-label={t("web.detail.actions.manage")}
+              aria-label="Manage"
               onKeyDown={handleOverflowKeyDown}
             >
               <DetailOverflowGroups groups={manageGroups} />
@@ -1310,9 +1540,7 @@ export default function ActionBar({
           <Dialog open={playChoiceOpen} onOpenChange={setPlayChoiceOpen}>
             <DialogContent className="max-w-xs gap-3 p-5">
               <DialogHeader className="gap-1.5">
-                <DialogTitle className="text-base">
-                  {t("web.detail.actions.resumeDialogTitle")}
-                </DialogTitle>
+                <DialogTitle className="text-base">Resume Playback?</DialogTitle>
                 <DialogDescription className="text-xs">{dialogDescription}</DialogDescription>
               </DialogHeader>
               <div className="grid gap-2">
@@ -1321,7 +1549,7 @@ export default function ActionBar({
                   className="h-9 justify-start gap-2.5 px-3 text-sm"
                 >
                   <Play className="size-3.5 fill-current" />
-                  {t("web.detail.actions.resumeAt", { time: formattedResumeTime })}
+                  Resume at {formattedResumeTime}
                 </Button>
                 <Button
                   variant="outline"
@@ -1329,7 +1557,7 @@ export default function ActionBar({
                   className="h-9 justify-start gap-2.5 px-3 text-sm"
                 >
                   <RotateCcw className="size-3.5" />
-                  {t("web.detail.actions.playFromBeginning")}
+                  Play from Beginning
                 </Button>
               </div>
             </DialogContent>
@@ -1374,34 +1602,77 @@ export default function ActionBar({
         )}
       </div>
 
+      {versionFallback ? (
+        <p role="status" className="text-muted-foreground text-xs">
+          {versionFallbackMessage(versionFallback)}
+        </p>
+      ) : null}
+
       {/* ── Stream info controls (second row) ──────────────── */}
       {/* flex-wrap matters: without it this row's min-content width (two or
           three nowrap trigger buttons) inflates the auto-sized hero column
           past narrow viewports, clipping the whole info column. */}
-      {hasStreamControls && (
+      {(hasStreamControls ||
+        discovering ||
+        discoveryFailed ||
+        (virtualDetail && !selectedVersion)) && (
         <div className="detail-stream-actions flex min-w-0 flex-wrap items-center gap-2">
-          {versions && hasMultipleVersions && selectedVersion && onSelectVersion && (
-            <VersionDropdown
-              versions={versions}
-              playbackVariants={playbackVariants}
-              selectedVersion={selectedVersion}
-              onSelectVersion={onSelectVersion}
-              onSelectEdition={onSelectEdition}
-              versionPicked={versionPicked}
-            />
+          {discovering && (
+            <span
+              role="status"
+              className="text-muted-foreground inline-flex items-center gap-2 text-xs"
+            >
+              <Loader2 aria-hidden="true" className="size-3.5 animate-spin" />
+              Finding versions
+            </span>
           )}
-          {selectedVersion && (selectedVersion.audio_tracks?.length ?? 0) > 0 && (
+          {!discovering && discoveryFailed && (
+            <span role="status" className="text-muted-foreground text-xs">
+              Versions unavailable. Retry with Play.
+            </span>
+          )}
+          {versions &&
+            versions.length > 0 &&
+            (hasMultipleVersions || virtualDetail || versionFallback != null) &&
+            selectedVersion &&
+            onSelectVersion && (
+              <VersionDropdown
+                versions={versions}
+                playbackVariants={playbackVariants}
+                selectedVersion={selectedVersionWithTracks}
+                selectionMissing={false}
+                onSelectVersion={onSelectVersion}
+                contentId={contentId}
+                onOpenChange={onVersionPickerOpenChange}
+                onRefreshVersions={contentId ? handleRefreshVersions : undefined}
+                onCancelRefresh={contentId ? handleCancelRefresh : undefined}
+              />
+            )}
+          {virtualDetail && !selectedVersion && contentId && (
+            <div className="w-44 shrink-0">
+              <VersionRefreshRow
+                refreshing={standaloneRefresh.refreshing}
+                cancelable={standaloneRefresh.cancelable}
+                error={standaloneRefresh.error}
+                onPress={standaloneRefresh.refresh}
+              />
+            </div>
+          )}
+          {selectedVersionWithTracks && (audioRows.length > 0 || audioInventoryProvisional) && (
             <AudioTracksPopover
-              version={selectedVersion}
+              version={selectedVersionWithTracks}
               selectionMode={audioSelectionMode}
               explicitTrackIndex={explicitAudioTrackIndex}
+              inventoryProvisional={audioInventoryProvisional}
+              inventoryDeclared={audioInventoryDeclared}
+              onRetryInventory={handleRetryInventory}
               onSelectTrack={onSelectAudioTrack}
               onResetSelection={onResetAudioSelection}
             />
           )}
-          {selectedVersion && (
+          {selectedVersionWithTracks && (
             <SubtitlesPopover
-              version={selectedVersion}
+              version={selectedVersionWithTracks}
               selectionMode={prePlaySubtitleMode}
               explicitSelection={explicitSubtitleSelection}
               preferredSubtitleLanguage={preferredSubtitleLanguage}
@@ -1411,6 +1682,9 @@ export default function ActionBar({
               activeAudioTrackIndex={
                 audioSelectionMode === "explicit" ? explicitAudioTrackIndex : null
               }
+              inventoryProvisional={subtitleInventoryProvisional}
+              inventoryDeclared={subtitleInventoryDeclared}
+              onRetryInventory={handleRetryInventory}
               onSelectSubtitle={onSelectSubtitle}
               onSelectSubtitleOff={onSelectSubtitleOff}
               onResetSelection={onResetSubtitleSelection}
@@ -1430,25 +1704,19 @@ function formatPlaybackTime(totalSeconds: number): string {
   const remainingSeconds = seconds % 60;
 
   if (hours > 0) {
-    return numberText(
-      `${hours}:${String(minutes).padStart(2, "0")}:${String(remainingSeconds).padStart(2, "0")}`,
-    );
+    return `${hours}:${String(minutes).padStart(2, "0")}:${String(remainingSeconds).padStart(2, "0")}`;
   }
 
-  return numberText(`${minutes}:${String(remainingSeconds).padStart(2, "0")}`);
+  return `${minutes}:${String(remainingSeconds).padStart(2, "0")}`;
 }
 
 function buildPlayChoiceDescription(
-  t: Translate,
   formattedResumeTime: string,
   percentComplete: number | null,
 ): string {
   if (percentComplete != null && percentComplete > 0) {
-    return t("web.detail.actions.resumeDescriptionPercent", {
-      time: formattedResumeTime,
-      percent: percentComplete,
-    });
+    return `You're ${formattedResumeTime} in, about ${percentComplete}% through.`;
   }
 
-  return t("web.detail.actions.resumeDescription", { time: formattedResumeTime });
+  return `You're ${formattedResumeTime} in. Resume where you left off or start over.`;
 }

@@ -70,10 +70,10 @@ const SERVER_CONFIG: RateLimitConfig = {
   redis_available: true,
 };
 
-const REDIS_HINT = /Set up Redis in General settings/;
+const REDIS_HINT = /Set up Redis on the General page first/;
 
 async function openBackendSelect() {
-  await userEvent.click(screen.getByRole("combobox", { name: /Counter storage/i }));
+  await userEvent.click(screen.getByRole("combobox", { name: /Where counters are kept/i }));
 }
 
 const makeForm = (overrides: Record<string, unknown> = {}) => fakeSettingsForm({}, overrides);
@@ -107,10 +107,8 @@ describe("SecurityAccessSettings", () => {
     useSettingsFormMock.mockReturnValue(makeForm({ setValue }));
     const { rerender } = render(<SecurityAccessSettings />);
 
-    expect(screen.queryByText(/Any signed-in account/)).not.toBeInTheDocument();
-    await userEvent.click(
-      screen.getByRole("switch", { name: /Allow local media servers for all accounts/i }),
-    );
+    expect(screen.queryByText(/Anyone who can sign in/)).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("switch", { name: /Local servers for every account/i }));
     expect(setValue).toHaveBeenCalledWith("media_servers.allow_private_destinations", "true");
 
     useSettingsFormMock.mockReturnValue(
@@ -120,7 +118,7 @@ describe("SecurityAccessSettings", () => {
       }),
     );
     rerender(<SecurityAccessSettings />);
-    expect(screen.getByText(/Any signed-in account/)).toBeInTheDocument();
+    expect(screen.getByText(/Anyone who can sign in/)).toBeInTheDocument();
   });
 
   it("stages an edited rate-limit row on the shared save bar", async () => {
@@ -211,9 +209,7 @@ describe("SecurityAccessSettings", () => {
     render(<SecurityAccessSettings />);
 
     expect(
-      screen.getByText(
-        /Rate limiting is using in-memory counters instead of the saved Redis counter storage/i,
-      ),
+      screen.getByText(/running limiter is using in-memory counters, not the saved Redis/i),
     ).toBeInTheDocument();
   });
 
@@ -225,7 +221,7 @@ describe("SecurityAccessSettings", () => {
 
     render(<SecurityAccessSettings />);
 
-    expect(screen.getByText(/isn’t running on this server/i)).toBeInTheDocument();
+    expect(screen.getByText(/no limiter is running in this process/i)).toBeInTheDocument();
   });
   it("drops a draft when identical configuration arrives under different authority", async () => {
     rateLimitConfigMock.mockReturnValue({

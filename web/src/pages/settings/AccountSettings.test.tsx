@@ -12,12 +12,6 @@ const mocks = vi.hoisted(() => ({
 vi.mock("@/hooks/queries/account", () => ({
   useAccountPasswordCapability: () => mocks.useCapability(),
   useChangeAccountPassword: () => mocks.useChangePassword(),
-  usePasswordPolicy: () => ({
-    minimum_length: 8,
-    maximum_bytes: 72,
-    require_uppercase: false,
-    require_special: false,
-  }),
 }));
 
 // The Sign-in section has its own tests (AccountSignInSection.test.tsx).
@@ -124,22 +118,11 @@ describe("AccountSettings", () => {
       await user.click(screen.getByRole("button", { name: "Change password" }));
     };
 
-    // As the server answers a refusal: the summary, then the member's detail.
-    const refused = v2Problem(
-      422,
-      "validation_failed",
-      "The request did not pass validation; see errors.",
+    mocks.mutateAsync.mockRejectedValueOnce(
+      v2Problem(422, "validation_failed", "Current password is incorrect."),
     );
-    refused.problem.errors = [
-      {
-        location: "body.new_password",
-        code: "invalid",
-        detail: "Include at least one capital letter.",
-      },
-    ];
-    mocks.mutateAsync.mockRejectedValueOnce(refused);
     await submit();
-    expect(screen.getByRole("alert")).toHaveTextContent("Include at least one capital letter.");
+    expect(screen.getByRole("alert")).toHaveTextContent("Current password is incorrect.");
 
     mocks.mutateAsync.mockRejectedValueOnce(new TypeError("Failed to fetch"));
     await submit();

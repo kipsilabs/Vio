@@ -16,7 +16,7 @@ import {
   TOUCH_CONTROL_CLASS,
 } from "@/components/admin/libraries/DiagnosticsListParts";
 import {
-  useWideTableLayout,
+  useWideDiagnosticsTableLayout,
   usePagination,
 } from "@/components/admin/libraries/diagnosticsListState";
 import { Badge } from "@/components/ui/badge";
@@ -43,7 +43,7 @@ export function StaleIDsSection({
   onStatusChange?: (status: { count: number | undefined; isError?: boolean }) => void;
 } = {}) {
   const t = useT();
-  const showTable = useWideTableLayout();
+  const showTable = useWideDiagnosticsTableLayout();
   const [open, setOpen] = useState(false);
   const isOpen = embedded || open;
   const [search, setSearch] = useState("");
@@ -169,9 +169,7 @@ export function StaleIDsSection({
         <DiagnosticsCardList>
           {pag.rows.map((s) => (
             <DiagnosticsCard key={staleIDKey(s)}>
-              <h3 dir="auto" className="bidi-text font-medium break-words">
-                {s.title}
-              </h3>
+              <h3 className="font-medium break-words">{s.title}</h3>
               <CardFields>
                 <CardField label={t("web.admin.libraries.column.year")}>
                   <span className="tabular-nums">{numberText(s.year)}</span>

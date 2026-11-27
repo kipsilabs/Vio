@@ -4,12 +4,10 @@ import (
 	"bufio"
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
-	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -23,8 +21,8 @@ import (
 	"github.com/Silo-Server/silo-server/internal/auth"
 	"github.com/Silo-Server/silo-server/internal/clientip"
 	"github.com/Silo-Server/silo-server/internal/database/queryattr"
+	"github.com/Silo-Server/silo-server/internal/httpheader"
 	"github.com/Silo-Server/silo-server/internal/httpstream"
-	"github.com/Silo-Server/silo-server/internal/logredact"
 	"github.com/Silo-Server/silo-server/internal/telemetry"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -65,17 +63,19 @@ const (
 	// authClassAnonymous labels a gated operation that established no identity
 	// (no credential, or one the gate refused).
 	authClassAnonymous = "anonymous"
-	// labelOther replaces methods outside the standard set and unknown
-	// credential kinds. Client names fold through telemetry.ClientLabel.
-	labelOther = "other"
-	// maxClientNameLen and maxClientVersionLen clamp the X-Silo-Client and
-	// X-Silo-Client-Version values before they reach a label or a log line.
+	// labelOther replaces unknown client names and methods outside the standard set.
+	labelOther          = "other"
+	metricClientWeb     = "web"
+	metricClientApple   = "apple"
+	metricClientAndroid = "android"
+	// maxClientNameLen and maxClientVersionLen clamp the X-Vio-Client and
+	// X-Vio-Client-Version values before they reach a label or a log line.
 	maxClientNameLen    = 64
 	maxClientVersionLen = 32
 )
 
 var (
-	requestInFlight = promauto.NewGaugeVec(prometheus.GaugeOpts{Name: "silo_apiv2_in_flight", Help: "Active native API v2 operations, including response streaming."}, []string{labelOperationID})
+	requestInFlight = promauto.NewGaugeVec(prometheus.GaugeOpts{Name: "vio_apiv2_in_flight", Help: "Active native API v2 operations, including response streaming."}, []string{labelOperationID})
 	requestsTotal   = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "streamapp_apiv2_requests_total",
 		Help: "Native API v2 requests by operation, status class, problem type, credential class and client.",
@@ -117,8 +117,9 @@ type observation struct {
 	authClass   string
 	userID      *int
 	// operationError is the application error a handler returned, captured
-	// before Huma converts it to a problem envelope. The request log reports it
-	// so a 500 names its underlying cause under the same request_id.
+	// before Huma converts it to a problem envelope. It is what the request log
+	// reports, so a 500 names its underlying cause under the same request_id
+	// instead of discarding it.
 	operationError error
 	// clientName and clientVersion are the clamped X-Silo-Client identity,
 	// read once when the request arrives.
@@ -133,10 +134,40 @@ func observationFrom(ctx context.Context) *observation {
 	return o
 }
 
+// noteOperationError records the application error an operation returned. It
+// only keeps the first error, so a wrapped/handler-level capture cannot be
+// overwritten by a later conversion.
+func noteOperationError(ctx context.Context, err error) {
+	if err == nil {
+		return
+	}
+	o := observationFrom(ctx)
+	if o == nil || o.operationError != nil {
+		return
+	}
+	// A masked 5xx problem carries the failure it hides as an out-of-band
+	// cause; the request log names that instead of the generic envelope. A 4xx
+	// problem is logged by its own safe message, never its cause.
+	if p, ok := errors.AsType[*Problem](err); ok && p.cause != nil && p.Status >= http.StatusInternalServerError {
+		o.operationError = p.cause
+		return
+	}
+	o.operationError = err
+}
+
+// observedClientName is the clamped X-Silo-Client name the observe middleware
+// read for this request, the name behind the `client` metric label, or ""
+// when the request did not pass through it.
+func observedClientName(ctx context.Context) string {
+	if o := observationFrom(ctx); o != nil {
+		return o.clientName
+	}
+	return ""
+}
+
 // observe is the outermost v2 chi middleware after requestID: it records the
 // request once, whatever answered it (an operation, a gate, the 404/405
-// fallbacks, the panic recovery inside bufferResponse, or recoverRaw for a
-// panic that reached no Huma operation).
+// fallbacks, or the panic recovery inside bufferResponse).
 func observe(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -151,92 +182,31 @@ func observe(next http.Handler) http.Handler {
 		o.clientName, o.clientVersion = clientIdentity(r)
 		r = r.WithContext(context.WithValue(r.Context(), observationKey{}, o))
 		sw := &statusRecorder{ResponseWriter: w}
-		httpstream.Serve(recoverRaw(next, sw), sw, r, func(aborted bool) {
-			status := sw.status
-			if activitylog.RecordedStatus(r, status, status != 0) == activitylog.StatusClientClosedRequest {
-				// The client went away, and its server error is recorded as
-				// abandoned, as the activity log records it as 499. The error is
-				// still written: net/http also cancels the context of a client
-				// that only half-closed, and an unwritten response would reach
-				// that client as an empty 200.
-				status = 0
+		next.ServeHTTP(sw, r)
+		status := sw.status
+		if activitylog.RecordedStatus(r, status, status != 0) == activitylog.StatusClientClosedRequest {
+			// The client went away, and its server error is recorded as
+			// abandoned, as the activity log records it as 499. The error is
+			// still written: net/http also cancels the context of a client
+			// that only half-closed, and an unwritten response would reach
+			// that client as an empty 200.
+			status = 0
+		}
+		if span.IsRecording() {
+			span.SetAttributes(attribute.String("operation", o.operationID), attribute.String("error.type", o.errorCode))
+			if status != 0 {
+				span.SetAttributes(attribute.Int("http.response.status_code", status))
+			} else if sw.hijacked {
+				span.SetAttributes(attribute.String("http.response.outcome", "hijacked"))
+			} else {
+				span.SetAttributes(attribute.String("http.response.outcome", "abandoned"))
 			}
-			if span.IsRecording() {
-				span.SetAttributes(attribute.String("operation", o.operationID), attribute.String("error.type", o.errorCode))
-				if status != 0 {
-					span.SetAttributes(attribute.Int("http.response.status_code", status))
-				}
-				switch {
-				case aborted:
-					span.SetAttributes(attribute.String("http.response.outcome", "aborted"))
-					span.SetStatus(codes.Error, "aborted")
-				case status == 0 && sw.hijacked:
-					span.SetAttributes(attribute.String("http.response.outcome", "hijacked"))
-				case status == 0:
-					span.SetAttributes(attribute.String("http.response.outcome", "abandoned"))
-				case status >= 500:
-					span.SetStatus(codes.Error, "server_error")
-				}
+			if status >= 500 {
+				span.SetStatus(codes.Error, "server_error")
 			}
-			report(r, o, status, aborted, sw.hijacked, sw.bytes, time.Since(start))
-		})
+		}
+		report(r, o, status, sw.hijacked, sw.bytes, time.Since(start))
 	})
-}
-
-// recoverRaw answers a panic that bufferResponse did not catch: one from a raw
-// registration or from a v2 chi middleware. Without it the panic would unwind
-// past observe unrecorded, to the listener-wide recoverer, whose empty 500
-// differs from the internal_error problem every Huma operation answers with.
-// A response that is already committed cannot be replaced, so it is broken
-// with http.ErrAbortHandler and recorded as aborted, as a handler that aborts
-// itself is. A hijacked connection is recorded the same way, but it belongs to
-// the handler: net/http does not close it, so the handler's own cleanup must.
-// That sentinel passes through untouched.
-func recoverRaw(next http.Handler, sw *statusRecorder) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer func() {
-			rec := recover()
-			if rec == nil {
-				return
-			}
-			if rec == http.ErrAbortHandler { //nolint:errorlint // sentinel compared by identity, as net/http does
-				panic(rec)
-			}
-			logHandlerPanic(r, rec)
-			if sw.status != 0 || sw.hijacked {
-				panic(http.ErrAbortHandler)
-			}
-			// Drop the headers that describe the handler's unsent body. The
-			// rest stay: the listener's and the route's (request ID, nosniff,
-			// media CORS), so a cross-origin player can still read the problem.
-			h := w.Header()
-			for _, name := range rawRepresentationHeaders {
-				h.Del(name)
-			}
-			writeProblem(w, r, NewProblem(TypeInternalError, "An unexpected error occurred."))
-		}()
-		next.ServeHTTP(w, r)
-	})
-}
-
-// rawRepresentationHeaders describe a raw handler's own body. writeProblem
-// replaces Content-Type and Cache-Control itself.
-//
-//nolint:goconst // plain header names; the package's constants are named for other features
-var rawRepresentationHeaders = []string{
-	"Accept-Ranges", "Content-Disposition", "Content-Encoding", "Content-Language",
-	"Content-Length", "Content-Range", "Content-Security-Policy", "ETag",
-	"Last-Modified", "Location", "Trailer",
-}
-
-// logHandlerPanic logs a recovered v2 handler panic with its stack. The panic
-// value is free text that may quote a credential, so it is masked first.
-func logHandlerPanic(r *http.Request, rec any) {
-	slog.ErrorContext(r.Context(), "apiv2 handler panic",
-		"component", "apiv2",
-		"request_id", requestIDFrom(r.Context()),
-		"panic", logredact.SanitizeText(fmt.Sprint(rec)),
-		"stack", string(debug.Stack()))
 }
 
 // statusRecorder captures structured and raw response statuses and counts the
@@ -250,15 +220,11 @@ type statusRecorder struct {
 	bytes    int64
 }
 
-// WriteHeader records the first final status the writer below accepted. An
-// informational 1xx (other than 101) commits nothing, and net/http panics on an
-// invalid code before sending any header; neither may make a panic that
-// follows look like it broke a committed response.
 func (s *statusRecorder) WriteHeader(status int) {
-	s.ResponseWriter.WriteHeader(status)
-	if s.status == 0 && (status >= 200 || status == http.StatusSwitchingProtocols) {
+	if s.status == 0 {
 		s.status = status
 	}
+	s.ResponseWriter.WriteHeader(status)
 }
 
 func (s *statusRecorder) Write(p []byte) (int, error) {
@@ -313,16 +279,12 @@ func (s *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return conn, rw, err
 }
 
-func report(r *http.Request, o *observation, status int, aborted, hijacked bool, bodyBytes int64, elapsed time.Duration) {
+func report(r *http.Request, o *observation, status int, hijacked bool, bodyBytes int64, elapsed time.Duration) {
 	name, version := o.clientName, o.clientVersion
 	major := strconv.Itoa(APIMajor)
 	method := methodLabel(r.Method)
 	class := statusClass(status)
-	switch {
-	case aborted:
-		// The handler broke the response after sending its status.
-		class = "aborted"
-	case status == 0 && hijacked:
+	if status == 0 && hijacked {
 		class = "hijacked"
 	}
 	requestsTotal.WithLabelValues(major, o.operationID, method, class, o.errorCode, o.authClass, clientLabel(name)).Inc()
@@ -356,6 +318,16 @@ func report(r *http.Request, o *observation, status int, aborted, hijacked bool,
 		attrs = append(attrs, "user_id", *o.userID)
 	}
 	attrs = append(attrs, o.db.LogAttrs()...)
+	if o.operationError != nil {
+		// The underlying application error is logged under the same request_id
+		// as the response, so a 500 (or a converted 408) names its cause
+		// instead of leaving only the generic problem code.
+		attrs = append(attrs, "error", o.operationError.Error())
+	}
+	if status >= 500 {
+		slog.ErrorContext(r.Context(), "apiv2 request", attrs...)
+		return
+	}
 	slog.InfoContext(r.Context(), "apiv2 request", attrs...)
 }
 
@@ -387,8 +359,8 @@ func statusClass(status int) string {
 // to a printable bounded string. The values are opaque: trimmed, length
 // limited, control characters dropped, never parsed or validated.
 func clientIdentity(r *http.Request) (name, version string) {
-	return clampLabel(r.Header.Get("X-Silo-Client"), maxClientNameLen),
-		clampLabel(r.Header.Get("X-Silo-Client-Version"), maxClientVersionLen)
+	return clampLabel(httpheader.Get(r.Header, httpheader.Client, httpheader.LegacyClient), maxClientNameLen),
+		clampLabel(httpheader.Get(r.Header, httpheader.ClientVersion, httpheader.LegacyClientVersion), maxClientVersionLen)
 }
 
 func clampLabel(v string, limit int) string {
@@ -404,30 +376,23 @@ func clampLabel(v string, limit int) string {
 	return v
 }
 
-// clientLabel folds a self-reported client name into a metric family. Vio's
-// own clients ("vio web", "vio apple", ...) are recognized alongside Silo's in
-// internal/telemetry.ClientLabel, so an arbitrary name cannot create series.
-func clientLabel(name string) string { return telemetry.ClientLabel(name) }
-
-// noteOperationError records the application error an operation returned. It
-// only keeps the first error, so a wrapped/handler-level capture cannot be
-// overwritten by a later conversion.
-func noteOperationError(ctx context.Context, err error) {
-	if err == nil {
-		return
+// clientLabel maps only recognized first-party product names into fixed families.
+// Arbitrary self-reported names cannot create metric series or store private text
+// in Prometheus. Logs retain the existing clamped client identity for diagnosis.
+func clientLabel(name string) string {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "":
+		return labelNone
+	case "silo web", "vio web":
+		return metricClientWeb
+	case "silo apple", "silo apple tv", "silo ios", "silo tvos", "silo macos", "silo ipados",
+		"vio apple", "vio apple tv", "vio ios", "vio tvos", "vio macos", "vio ipados":
+		return metricClientApple
+	case "silo android", "silo android tv", "vio android", "vio android tv":
+		return metricClientAndroid
+	default:
+		return labelOther
 	}
-	o := observationFrom(ctx)
-	if o == nil || o.operationError != nil {
-		return
-	}
-	// A masked 5xx problem carries the failure it hides as an out-of-band
-	// cause; the request log names that instead of the generic envelope. A 4xx
-	// problem is logged by its own safe message, never its cause.
-	if p, ok := errors.AsType[*Problem](err); ok && p.cause != nil && p.Status >= http.StatusInternalServerError {
-		o.operationError = p.cause
-		return
-	}
-	o.operationError = err
 }
 
 // observeOperation is the first Huma middleware: the request matched an
@@ -478,9 +443,13 @@ func authClassFor(claims *auth.Claims) string {
 }
 
 // noteProblem records the problem type identifier for the metric and log
-// labels. The identifier is the catalog's, never client input.
+// labels. The identifier is the catalog's, never client input. When the
+// envelope was built from a masked application error (serviceProblem), the
+// cause is recorded too so the request log names the underlying failure under
+// the same request ID.
 func noteProblem(ctx context.Context, p *Problem) {
 	if o := observationFrom(ctx); o != nil && p != nil {
 		o.errorCode = strings.TrimPrefix(p.Type, ProblemTypeOrigin)
+		noteOperationError(ctx, p.cause)
 	}
 }

@@ -5,14 +5,13 @@ import { cn } from "@/lib/utils";
 import { isImeComposing } from "@/lib/imeComposition";
 
 interface TagInputProps {
-  id?: string;
   value: string[];
   onChange: (tags: string[]) => void;
   placeholder?: string;
   className?: string;
 }
 
-export function TagInput({ id, value, onChange, placeholder, className }: TagInputProps) {
+export function TagInput({ value, onChange, placeholder, className }: TagInputProps) {
   const t = useT();
   const [input, setInput] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
@@ -67,7 +66,6 @@ export function TagInput({ id, value, onChange, placeholder, className }: TagInp
         </span>
       ))}
       <input
-        id={id}
         ref={inputRef}
         type="text"
         value={input}

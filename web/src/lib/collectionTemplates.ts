@@ -102,12 +102,14 @@ export interface ApplyCollectionTemplateBundleRequest {
   library_ids: number[];
   dry_run?: boolean;
   delete_existing?: boolean;
+  virtual_playback?: boolean;
   featured?: ApplyCollectionTemplateBundleFeaturedRequest;
 }
 
 export interface ApplyCollectionTemplateBundleJobRequest {
   library_ids: number[];
   delete_existing?: boolean;
+  virtual_playback?: boolean;
   featured?: ApplyCollectionTemplateBundleFeaturedRequest;
 }
 
@@ -163,6 +165,10 @@ export interface ApplyCollectionTemplateBundleResponse {
 }
 
 export const TEMPLATE_STALE_TIME = 5 * 60_000;
+
+// Largest explicit "Max Items" value the import APIs accept. Mirrors
+// MaxExplicitItemLimit in internal/collectionutil.
+export const COLLECTION_MAX_ITEMS = 100000;
 
 export function fetchCollectionTemplates(): Promise<CollectionTemplateCatalog> {
   return v2("GET /api/v2/admin/collections/templates").then(

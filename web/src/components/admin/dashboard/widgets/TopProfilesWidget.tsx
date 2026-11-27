@@ -2,23 +2,22 @@ import { useMemo } from "react";
 import { Link } from "react-router";
 
 import { Card, CardContent } from "@/components/ui/card";
-import { useDashboardInsightsPeople } from "@/hooks/queries/admin/insights";
+import { useAdminTopActivity } from "@/hooks/queries/admin/dashboardInsights";
 import { BarList, BarListSkeleton } from "../charts";
 import type { BarListItem } from "../charts";
 import { SectionError } from "../feedback";
 import { formatWatchTime } from "../format";
-import { rangePhrase, rangeTitle } from "../range";
+import { rangeDays, rangePhrase, rangeTitle } from "../range";
 import { useWidgetRange } from "../widgetChrome";
 import { WidgetHeader } from "../WidgetHeader";
 import { WidgetRangePicker } from "../WidgetRangePicker";
 import { formatLocale } from "@/lib/appLocale";
 import { useT } from "@/i18n";
-import { widgetRangeToInsightsRange } from "@/pages/admin-insights/insightsHelpers";
 
 const ROW_LIMIT = 8;
 
 /**
- * Most active household profiles of the chosen window, by Insights plays.
+ * Most active household profiles of the chosen window.
  *
  * Rows are per profile, not per account: several profiles share one login, so
  * the label carries both when the account name adds anything.
@@ -26,10 +25,10 @@ const ROW_LIMIT = 8;
 export function TopProfilesWidget() {
   const t = useT();
   const { range } = useWidgetRange();
-  const query = useDashboardInsightsPeople(range);
+  const query = useAdminTopActivity(rangeDays(range));
   const items = useMemo<BarListItem[]>(
     () =>
-      (query.data?.top_profiles ?? []).slice(0, ROW_LIMIT).map((profile) => {
+      (query.data?.profiles ?? []).slice(0, ROW_LIMIT).map((profile) => {
         const account =
           profile.username ||
           t("web.admin.dashboard.widgets.topProfiles.userFallback", {
@@ -40,7 +39,7 @@ export function TopProfilesWidget() {
           id: `${profile.user_id}:${profile.profile_id}`,
           label: name === account ? account : `${name} · ${account}`,
           value: profile.plays,
-          secondary: formatWatchTime(profile.watch_seconds),
+          secondary: formatWatchTime(profile.total_seconds),
           to: `/admin/history?user_id=${profile.user_id}${
             profile.profile_id ? `&profile_id=${encodeURIComponent(profile.profile_id)}` : ""
           }`,
@@ -53,14 +52,8 @@ export function TopProfilesWidget() {
     <Card className="h-full">
       <WidgetHeader title={rangeTitle(t("web.admin.dashboard.widgets.topProfiles.title"), range)}>
         <Link
-          to={`/admin/insights?tab=people&range=${widgetRangeToInsightsRange(range)}`}
-          className="text-muted-foreground hover:text-primary hidden text-[0.6875rem] whitespace-nowrap transition-colors @sm/card-header:inline"
-        >
-          {t("web.admin.dashboard.widgets.openInsights")}
-        </Link>
-        <Link
           to="/admin/history"
-          className="text-muted-foreground hover:text-primary text-[0.6875rem] whitespace-nowrap transition-colors"
+          className="text-muted-foreground hover:text-primary text-[11px] whitespace-nowrap transition-colors"
         >
           {t("web.admin.dashboard.widgets.topProfiles.allHistory")}
         </Link>
@@ -69,7 +62,7 @@ export function TopProfilesWidget() {
       <CardContent className="min-h-0 flex-1 overflow-y-auto">
         {query.isLoading ? (
           <BarListSkeleton />
-        ) : query.error && !query.data ? (
+        ) : query.error ? (
           <SectionError message={t("web.admin.dashboard.widgets.topProfiles.loadFailed")} />
         ) : (
           <BarList

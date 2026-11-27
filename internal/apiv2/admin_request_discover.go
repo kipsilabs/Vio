@@ -228,7 +228,7 @@ func (reg *Registry) getAdminDiscoverLayout(ctx context.Context, _ *struct{}) (*
 	}
 	l, err := s.GetDiscoverLayout(ctx, adminRequestViewer(ctx))
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	return adminDiscoverLayoutOutput(ctx, l), nil
 }
@@ -238,7 +238,7 @@ func (reg *Registry) getAdminDiscoverLayout(ctx context.Context, _ *struct{}) (*
 func (reg *Registry) guardDiscoverLayout(ctx context.Context, s adminRequestDiscover, v mediarequests.Viewer, headers AdminRequestPreconditions) (int64, *Problem) {
 	current, err := s.GetDiscoverLayout(ctx, v)
 	if err != nil {
-		return 0, requestProblem(err)
+		return 0, requestProblem(ctx, err)
 	}
 	return adminRequestGuard(headers, discoverLayoutTag(ctx, current), current.Revision)
 }
@@ -247,7 +247,7 @@ func (reg *Registry) guardDiscoverLayout(ctx context.Context, s adminRequestDisc
 func (reg *Registry) staleDiscoverLayout(ctx context.Context, s adminRequestDiscover, v mediarequests.Viewer) error {
 	latest, err := s.GetDiscoverLayout(ctx, v)
 	if err != nil {
-		return requestProblem(err)
+		return requestProblem(ctx, err)
 	}
 	return NewProblem(TypePreconditionFailed, "The Discover layout changed; reload before saving.").WithHeader("ETag", discoverLayoutTag(ctx, latest).String())
 }
@@ -271,7 +271,7 @@ func (reg *Registry) updateAdminDiscoverLayout(ctx context.Context, in *AdminDis
 		return nil, reg.staleDiscoverLayout(ctx, s, v)
 	}
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	return adminDiscoverLayoutOutput(ctx, l), nil
 }
@@ -291,7 +291,7 @@ func (reg *Registry) resetAdminDiscoverLayout(ctx context.Context, in *AdminDisc
 		return nil, reg.staleDiscoverLayout(ctx, s, v)
 	}
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	return nil, nil
 }
@@ -303,7 +303,7 @@ func (reg *Registry) previewAdminDiscoverRow(ctx context.Context, in *AdminDisco
 	}
 	page, err := s.PreviewDiscoverRow(ctx, adminRequestViewer(ctx), in.Body.domain())
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	return &RequestMediaPageOutput{Body: requestMediaPageOf(page)}, nil
 }
@@ -315,7 +315,7 @@ func (reg *Registry) listAdminWatchProviders(ctx context.Context, in *AdminWatch
 	}
 	providers, err := s.ListWatchProviders(ctx, adminRequestViewer(ctx), mediarequests.MediaType(in.MediaType), in.Region)
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	items := make([]AdminWatchProvider, 0, len(providers))
 	for _, wp := range providers {

@@ -139,29 +139,10 @@ export function SubtitleUploadForm({
 
   const selectFile = useCallback(
     (file: File | null | undefined) => {
-      // The running upload sends the file chosen before it started, so a new
-      // choice now would name a file that never reaches the server.
-      if (!file || uploading) {
+      if (!file) {
         return;
       }
       if (!isAcceptedSubtitleFile(file)) {
-        // Drop the earlier choice so Upload cannot send a file other than the
-        // one the error names, along with its detected language and any
-        // detection still running for it. Clearing the input lets the
-        // picker fire again when the same accepted file is chosen next.
-        detectRequestRef.current++;
-        setDetectingLanguage(false);
-        setSelectedFile(null);
-        // Only a language detection found goes back to the default. The
-        // detector reports a fallback as "manual", which may be the user's own
-        // choice, so that one stays.
-        if (detectionSource && detectionSource !== "manual") {
-          setLanguage(defaultLanguage);
-        }
-        setDetectionSource(null);
-        if (fileInputRef.current) {
-          fileInputRef.current.value = "";
-        }
         reportError(t("web.subtitles.upload.unsupportedType"));
         return;
       }
@@ -169,7 +150,7 @@ export function SubtitleUploadForm({
       setError(null);
       void runLanguageDetection(file, language);
     },
-    [defaultLanguage, detectionSource, language, reportError, runLanguageDetection, t, uploading],
+    [language, reportError, runLanguageDetection, t],
   );
 
   const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -177,7 +158,6 @@ export function SubtitleUploadForm({
   };
 
   const handleBrowseClick = () => {
-    if (uploading) return;
     fileInputRef.current?.click();
   };
 
@@ -185,13 +165,13 @@ export function SubtitleUploadForm({
     event.preventDefault();
     event.stopPropagation();
     dragDepthRef.current += 1;
-    if (!uploading) setIsDragging(true);
+    setIsDragging(true);
   };
 
   const handleDragOver = (event: React.DragEvent<HTMLDivElement>) => {
     event.preventDefault();
     event.stopPropagation();
-    event.dataTransfer.dropEffect = uploading ? "none" : "copy";
+    event.dataTransfer.dropEffect = "copy";
   };
 
   const handleDragLeave = (event: React.DragEvent<HTMLDivElement>) => {
@@ -275,13 +255,11 @@ export function SubtitleUploadForm({
         accept={ACCEPTED_SUBTITLE_EXTENSIONS}
         className="sr-only"
         onChange={handleFileChange}
-        disabled={uploading}
       />
 
       <div
         role="button"
-        tabIndex={uploading ? -1 : 0}
-        aria-disabled={uploading || undefined}
+        tabIndex={0}
         aria-label={t("web.subtitles.upload.dropZoneLabel")}
         onClick={handleBrowseClick}
         onKeyDown={(event) => {
@@ -295,7 +273,7 @@ export function SubtitleUploadForm({
         onDragLeave={handleDragLeave}
         onDrop={handleDrop}
         className={cn(
-          "flex cursor-pointer flex-col items-center justify-center gap-2 rounded-lg border border-dashed px-4 py-6 text-center transition-colors aria-disabled:cursor-not-allowed aria-disabled:opacity-50",
+          "flex cursor-pointer flex-col items-center justify-center gap-2 rounded-lg border border-dashed px-4 py-6 text-center transition-colors",
           isPlayer
             ? isDragging
               ? "border-white/50 bg-white/10"

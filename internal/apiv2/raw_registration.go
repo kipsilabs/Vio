@@ -23,49 +23,17 @@ type RawOperation struct {
 	// WildcardParam names a terminal path parameter that captures nested paths.
 	// OpenAPI retains {name}; Chi receives its corresponding /* route.
 	WildcardParam string
-	// CrossOrigin sends uncredentialed wildcard CORS on every answer,
-	// authorization refusals included, so a player page on another origin (a
-	// Google Cast receiver) can read the response. Only for media a URL or
-	// header token authorizes, never a cookie.
-	CrossOrigin bool
-}
-
-// Cross-origin media headers. The exposed set matches the media proxy's, so
-// a player reads the same range and validator headers from either origin.
-const (
-	mediaCORSAllowHeaders  = "Range"
-	mediaCORSExposeHeaders = "Accept-Ranges, Content-Encoding, Content-Length, Content-Range, ETag, Last-Modified, Retry-After"
-)
-
-// mediaCrossOrigin runs outside the authorization gate, so a refusal still
-// reaches the player as a readable status instead of an opaque CORS failure.
-// Only the original-file stream route answers a preflight (playbackMediaCORS).
-// Cast receivers fetch playlists and segments with plain GETs and have not
-// been seen to send one.
-func mediaCrossOrigin(ctx huma.Context, next func(huma.Context)) {
-	ctx.SetHeader("Access-Control-Allow-Origin", "*")
-	ctx.SetHeader("Access-Control-Allow-Headers", mediaCORSAllowHeaders)
-	ctx.SetHeader("Access-Control-Expose-Headers", mediaCORSExposeHeaders)
-	// Lets a player on another origin read which protocol the connection
-	// speaks, so it does not send parallel ranges over HTTP/2 or HTTP/3.
-	ctx.SetHeader("Timing-Allow-Origin", "*")
-	next(ctx)
 }
 
 // RawImpliedStatuses lists only failures of the shared authorization gates.
 // Raw handlers declare their own protocol statuses; JSON negotiation and Huma
-// input validation do not run on byte streams. A public operation naming a
-// rate-limit bucket adds 429, as in ImpliedStatuses.
-func RawImpliedStatuses(class Class, serviceBacked, rateLimited bool) []int {
+// input validation do not run on byte streams.
+func RawImpliedStatuses(class Class, serviceBacked bool) []int {
 	if class == ClassPublic {
-		var statuses []int
-		if rateLimited {
-			statuses = append(statuses, http.StatusTooManyRequests)
-		}
 		if serviceBacked {
-			statuses = append(statuses, http.StatusServiceUnavailable)
+			return []int{http.StatusServiceUnavailable}
 		}
-		return statuses
+		return nil
 	}
 	statuses := []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusServiceUnavailable}
 	if resolvesProfile(class) {
@@ -207,7 +175,7 @@ func RegisterRaw(reg *Registry, raw RawOperation, handler http.Handler) {
 	if resolvesProfile(op.Class) {
 		op.Parameters = append(op.Parameters, profileHeaderFor(&op), profileTokenHeaderParam())
 	}
-	for _, status := range RawImpliedStatuses(op.Class, op.ServiceBacked, op.RateLimitBucket != "") {
+	for _, status := range RawImpliedStatuses(op.Class, op.ServiceBacked) {
 		key := strconv.Itoa(status)
 		if _, exists := op.Responses[key]; !exists {
 			op.Responses[key] = &huma.Response{Description: http.StatusText(status), Content: map[string]*huma.MediaType{
@@ -223,12 +191,7 @@ func RegisterRaw(reg *Registry, raw RawOperation, handler http.Handler) {
 		r, w := humachi.Unwrap(ctx)
 		handler.ServeHTTP(w, r.WithContext(ctx.Context()))
 	}
-	middlewares := []func(huma.Context, func(huma.Context)){observeIdentity, classGate(reg.deps), observeOperation}
-	if raw.CrossOrigin {
-		// Last wraps outermost.
-		middlewares = append(middlewares, mediaCrossOrigin)
-	}
-	for _, middleware := range middlewares {
+	for _, middleware := range []func(huma.Context, func(huma.Context)){observeIdentity, classGate(reg.deps), observeOperation} {
 		next := serve
 		serve = func(ctx huma.Context) { middleware(ctx, next) }
 	}

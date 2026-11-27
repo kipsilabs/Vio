@@ -10,8 +10,7 @@ import (
 	mediacatalog "github.com/Silo-Server/silo-server/internal/catalog"
 )
 
-// The ratings domain: the acting profile's ratings of catalog items. A rating
-// runs from 1 to 10, which clients show as five stars with half stars.
+// The ratings domain: the acting profile's star ratings of catalog items.
 
 // RatingListInput is the listRatings query.
 type RatingListInput struct {
@@ -27,7 +26,7 @@ type RatingItemInput struct {
 // RatingEntry is the profile's rating of one item.
 type RatingEntry struct {
 	ItemID  ID      `json:"item_id" doc:"The catalog item" example:"movie:heat-1995"`
-	Rating  int     `json:"rating" minimum:"1" maximum:"10" doc:"1 to 10; clients show it as five stars with half stars (7 is 3.5 stars)" example:"7"`
+	Rating  int     `json:"rating" doc:"Stars, 1 to 5" example:"4"`
 	RatedAt Instant `json:"rated_at" doc:"When the rating was last set" example:"2026-01-02T03:04:05.000Z"`
 }
 
@@ -36,9 +35,9 @@ type RatingEntryOutput struct {
 	Body RatingEntry
 }
 
-// RatingSet is the setRating body: the rating to record.
+// RatingSet is the setRating body: the stars to record.
 type RatingSet struct {
-	Rating int `json:"rating" minimum:"1" maximum:"10" doc:"1 to 10; clients show it as five stars with half stars (7 is 3.5 stars)" example:"7"`
+	Rating int `json:"rating" minimum:"1" maximum:"5" doc:"Stars, 1 to 5" example:"4"`
 }
 
 // RatingSetInput names the item and carries the rating to set.
@@ -104,7 +103,7 @@ func (reg *Registry) getRating(ctx context.Context, in *RatingItemInput) (*Ratin
 	if !found {
 		return nil, NewProblem(TypeNotFound, "The profile has not rated the item.")
 	}
-	return &RatingEntryOutput{Body: ratingEntry(r)}, nil
+	return &RatingEntryOutput{Body: RatingEntry{ItemID: ID(r.MediaItemID), Rating: r.Score, RatedAt: NewInstant(r.RatedAt)}}, nil
 }
 
 // setRating records the rating for an item the viewer may see, with the
@@ -176,7 +175,7 @@ func (reg *Registry) listRatings(ctx context.Context, cursors *Cursors, in *Rati
 	}
 	items := make([]RatingEntry, 0, len(ratings))
 	for _, r := range ratings {
-		items = append(items, ratingEntry(r))
+		items = append(items, RatingEntry{ItemID: ID(r.MediaItemID), Rating: r.Score, RatedAt: NewInstant(r.RatedAt)})
 	}
 	return &RatingCollectionOutput{Body: RatingCollection{Collection: Paginated(items, next)}}, nil
 }
@@ -207,8 +206,4 @@ func (reg *Registry) deleteRating(ctx context.Context, in *RatingItemInput) (*st
 		return nil, serviceProblem(err)
 	}
 	return nil, nil
-}
-
-func ratingEntry(r mediacatalog.UserRating) RatingEntry {
-	return RatingEntry{ItemID: ID(r.MediaItemID), Rating: r.Score, RatedAt: NewInstant(r.RatedAt)}
 }

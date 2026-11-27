@@ -15,8 +15,8 @@ type AdminHistoryImportMappingCreateInput struct {
 		SourceID         ID     `json:"source_id" pattern:"^[1-9][0-9]*$"`
 		ExternalUserID   string `json:"external_user_id" minLength:"1"`
 		ExternalUserName string `json:"external_user_name"`
-		SiloUserID       ID     `json:"silo_user_id" pattern:"^[1-9][0-9]*$"`
-		SiloProfileID    ID     `json:"silo_profile_id" minLength:"1"`
+		SiloUserID       ID     `json:"vio_user_id" pattern:"^[1-9][0-9]*$"`
+		SiloProfileID    ID     `json:"vio_profile_id" minLength:"1"`
 	}
 }
 type AdminHistoryImportMappingUpdateInput struct {
@@ -25,8 +25,8 @@ type AdminHistoryImportMappingUpdateInput struct {
 	IfMatch     string `header:"If-Match"`
 	IfNoneMatch string `header:"If-None-Match"`
 	Body        struct {
-		SiloUserID    *ID `json:"silo_user_id,omitempty" nullable:"false" pattern:"^[1-9][0-9]*$"`
-		SiloProfileID *ID `json:"silo_profile_id,omitempty" nullable:"false" minLength:"1"`
+		SiloUserID    *ID `json:"vio_user_id,omitempty" nullable:"false" pattern:"^[1-9][0-9]*$"`
+		SiloProfileID *ID `json:"vio_profile_id,omitempty" nullable:"false" minLength:"1"`
 	}
 }
 

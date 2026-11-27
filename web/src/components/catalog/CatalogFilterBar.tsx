@@ -1,5 +1,4 @@
 import type { PersonalizedSorts } from "@/lib/querySortOptions";
-import type { Ref } from "react";
 import { Loader2, SlidersHorizontal } from "lucide-react";
 
 import type { GuidedFormState } from "@/components/collections/CollectionGuidedRulesEditor";
@@ -28,8 +27,6 @@ interface CatalogFilterBarProps {
   onUpdate: (patch: Partial<GuidedFormState>) => void;
   activeFilterCount: number;
   onOpenFilters: () => void;
-  /** The Filters button, so the sheet can return focus to it on close. */
-  filtersButtonRef?: Ref<HTMLButtonElement>;
   showMediaScopeSelector?: boolean;
   allowPersonalizedSorts?: PersonalizedSorts;
   sortRelevanceScope?: QuerySortRelevanceScope;
@@ -57,7 +54,6 @@ export default function CatalogFilterBar({
   onUpdate,
   activeFilterCount,
   onOpenFilters,
-  filtersButtonRef,
   showMediaScopeSelector = true,
   allowPersonalizedSorts = false,
   sortRelevanceScope,
@@ -201,13 +197,7 @@ export default function CatalogFilterBar({
       )}
 
       {/* Filters button */}
-      <Button
-        ref={filtersButtonRef}
-        variant="outline"
-        size="sm"
-        onClick={onOpenFilters}
-        className="gap-2"
-      >
+      <Button variant="outline" size="sm" onClick={onOpenFilters} className="gap-2">
         <SlidersHorizontal className="h-4 w-4" />
         {t("web.catalog.filters.open")}
         {activeFilterCount > 0 && (

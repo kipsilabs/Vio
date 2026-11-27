@@ -1,5 +1,5 @@
 import { useMemo, useRef } from "react";
-import { Play } from "lucide-react";
+import { CalendarClock, Play } from "lucide-react";
 import type { EpisodeListItem } from "@/api/types";
 import CardPlayOverlay from "@/components/CardPlayOverlay";
 import { WatchedCheckIndicator } from "@/components/CardWatchedBadge";
@@ -10,6 +10,9 @@ import CardOverlays from "@/components/overlays/CardOverlays";
 import ViewTransitionLink from "@/components/ViewTransitionLink";
 import { useEpisodeSpoilerPrefs, type EpisodeSpoilerPrefs } from "@/hooks/useEpisodeSpoilerPrefs";
 import { useOverlayPrefs } from "@/hooks/useOverlayPrefs";
+import { isUpcomingEpisode, useEpisodeReleaseCapability } from "@/hooks/queries/episodeRelease";
+import { usePrefetchCatalogItemDetail } from "@/hooks/queries/catalogRead";
+import { useDwellPrefetch } from "@/hooks/useDwellPrefetch";
 import { useGridRowCap } from "@/hooks/useGridRowCap";
 import type { CardQuickActionMode } from "@/lib/cardQuickActions";
 import { buildItemHref } from "@/lib/mediaNavigation";
@@ -18,10 +21,8 @@ import { overlayDataFromEpisodeListItem, type CardOverlayPrefs } from "@/lib/ove
 import { cn } from "@/lib/utils";
 import { EpisodeGridSkeleton } from "./SectionSkeletons";
 import { useT } from "@/i18n";
-import { episodeAirDateLabel } from "@/lib/episodeCardLabels";
 import EpisodeCardCaption from "./EpisodeCardCaption";
 import { episodeLinkLibraryId, type EpisodeNavigationState } from "../itemDetailLayout";
-import WatchProgressBar from "@/components/WatchProgressBar";
 
 /**
  * How much of a season stays visible before the section scrolls, so a long one
@@ -46,8 +47,6 @@ interface SeasonEpisodeGridProps {
   episodeLinkState?: EpisodeNavigationState;
   /** The page's library scope, kept on each episode link. */
   libraryId?: number;
-  /** The series' episode labels; "air_date" leads each caption with its title, not its code. */
-  episodeLabels?: string;
 }
 
 export default function SeasonEpisodeGrid({
@@ -56,12 +55,16 @@ export default function SeasonEpisodeGrid({
   isLoading,
   episodeLinkState,
   libraryId,
-  episodeLabels,
 }: SeasonEpisodeGridProps) {
   const t = useT();
   const { prefs: overlayPrefs, quickActionMode } = useOverlayPrefs();
   const spoilerPrefs = useEpisodeSpoilerPrefs();
+  const prefetchScopedEpisode = usePrefetchCatalogItemDetail(libraryId);
+  const prefetchEpisode = usePrefetchCatalogItemDetail();
   const setGridRef = useGridRowCap<HTMLDivElement>(VISIBLE_EPISODE_ROWS, episodes.length);
+  // Capability-gated upcoming treatment shared with the list rows.
+  const { data: releaseCapability } = useEpisodeReleaseCapability();
+  const releaseSupported = releaseCapability?.available ?? false;
   const playbackById = useMemo(
     () => new Map((playbackEpisodes ?? []).map((episode) => [episode.content_id, episode])),
     [playbackEpisodes],
@@ -93,10 +96,15 @@ export default function SeasonEpisodeGrid({
           playbackEpisode={playbackById.get(episode.content_id) ?? episode}
           episodeLinkState={episodeLinkState}
           libraryId={libraryId}
-          episodeLabels={episodeLabels}
           overlayPrefs={overlayPrefs}
           quickActionMode={quickActionMode}
+          releaseSupported={releaseSupported}
           spoilerPrefs={spoilerPrefs}
+          onPrefetch={() =>
+            (episodeLinkLibraryId(episode, libraryId) === undefined
+              ? prefetchEpisode
+              : prefetchScopedEpisode)(episode.content_id)
+          }
         />
       ))}
     </div>
@@ -108,34 +116,38 @@ function SeasonEpisodeCard({
   playbackEpisode,
   episodeLinkState,
   libraryId,
-  episodeLabels,
   overlayPrefs,
   quickActionMode,
+  releaseSupported,
   spoilerPrefs,
+  onPrefetch,
 }: {
   episode: EpisodeListItem;
   playbackEpisode: EpisodeListItem;
   episodeLinkState?: EpisodeNavigationState;
   libraryId?: number;
-  episodeLabels?: string;
   overlayPrefs: CardOverlayPrefs | null;
   quickActionMode: CardQuickActionMode;
+  releaseSupported: boolean;
   spoilerPrefs: EpisodeSpoilerPrefs;
+  onPrefetch: () => void;
 }) {
   const t = useT();
   const cardRef = useRef<HTMLDivElement>(null);
+  const prefetchHandlers = useDwellPrefetch(onPrefetch);
   const hasPartialProgress =
     !episode.user_data?.played &&
     (episode.user_data?.position_seconds ?? 0) > 0 &&
     (episode.user_data?.duration_seconds ?? 0) > 0;
   const episodeTitle =
-    episode.title ||
-    episodeAirDateLabel(episodeLabels, episode.air_date) ||
-    t("web.detail.episodes.numbered", { episode: episode.episode_number });
+    episode.title || t("web.detail.episodes.numbered", { episode: episode.episode_number });
   const unwatched = isEpisodeUnwatched(episode.user_data);
   const hideImage =
     spoilerPrefs.hideImages && unwatched && isEpisodeStill(episode.still_is_episode_still);
   const hideOverview = spoilerPrefs.hideOverviews && unwatched;
+  // Same upcoming treatment as the list rows: badge + dim only, never a
+  // playback gate. Navigation and watched state stay intact.
+  const upcoming = isUpcomingEpisode(episode, releaseSupported);
   const episodeHref = buildItemHref({
     contentId: episode.content_id,
     libraryId: episodeLinkLibraryId(episode, libraryId),
@@ -144,14 +156,9 @@ function SeasonEpisodeCard({
   const playable = (playbackEpisode.files ?? []).some((file) => !file.unreadable);
 
   return (
-    <div ref={cardRef} className="group/card media-card media-card-longpress">
+    <div ref={cardRef} className="group/card media-card media-card-longpress" {...prefetchHandlers}>
       <div className="group/media relative">
-        <ViewTransitionLink
-          to={episodeHref}
-          state={episodeLinkState}
-          prefetchOn="intent"
-          className="group block"
-        >
+        <ViewTransitionLink to={episodeHref} state={episodeLinkState} className="group block">
           <div className="media-card-image relative aspect-video">
             {episode.still_url ? (
               <img
@@ -160,13 +167,30 @@ function SeasonEpisodeCard({
                 decoding="async"
                 className={cn(
                   "h-full w-full object-cover transition-transform duration-300",
+                  upcoming && "opacity-45 saturate-50",
                   hideImage ? SPOILER_IMAGE_CLASS : "group-hover:scale-[1.03]",
                 )}
                 loading="lazy"
               />
+            ) : upcoming ? (
+              <div className="flex h-full w-full items-center justify-center">
+                <CalendarClock
+                  size={32}
+                  className="text-muted-foreground/50"
+                  aria-label="Upcoming"
+                />
+              </div>
             ) : (
               <div className="flex h-full w-full items-center justify-center">
                 <Play size={32} className="text-muted-foreground/30" />
+              </div>
+            )}
+            {upcoming && episode.still_url && (
+              <div className="absolute inset-0 flex items-center justify-center bg-black/35">
+                <span className="metadata-badge gap-1">
+                  <CalendarClock className="size-3" aria-hidden="true" />
+                  Upcoming
+                </span>
               </div>
             )}
             {overlayPrefs && (
@@ -174,20 +198,28 @@ function SeasonEpisodeCard({
                 data={overlayDataFromEpisodeListItem(episode)}
                 prefs={overlayPrefs}
                 variant="wide"
-                hasProgressBar={hasPartialProgress}
               />
             )}
             {/* Hover dim behind the play button */}
             {playable && <div className="media-card-hover-dim absolute inset-0" />}
             {hasPartialProgress && (
-              <WatchProgressBar
-                percent={
-                  ((episode.user_data?.position_seconds ?? 0) /
-                    (episode.user_data?.duration_seconds ?? 1)) *
-                  100
-                }
-                animate
-              />
+              <div className="absolute inset-x-2 bottom-1.5 h-[3px] overflow-hidden rounded-full bg-black/40">
+                <div
+                  className="progress-fill h-full rounded-full"
+                  style={{
+                    width: `${Math.max(
+                      0,
+                      Math.min(
+                        100,
+                        ((episode.user_data?.position_seconds ?? 0) /
+                          (episode.user_data?.duration_seconds ?? 1)) *
+                          100,
+                      ),
+                    )}%`,
+                    background: "var(--primary)",
+                  }}
+                />
+              </div>
             )}
           </div>
         </ViewTransitionLink>
@@ -211,10 +243,9 @@ function SeasonEpisodeCard({
       <ViewTransitionLink to={episodeHref} state={episodeLinkState} className="block">
         <EpisodeCardCaption
           episode={episode}
-          episodeLabels={episodeLabels}
           hideOverview={hideOverview}
           badges={episode.user_data?.played && <WatchedCheckIndicator />}
-          notice={unreadable && <UnreadableFileBadge />}
+          notice={upcoming ? "Upcoming" : unreadable ? <UnreadableFileBadge /> : undefined}
         />
       </ViewTransitionLink>
     </div>

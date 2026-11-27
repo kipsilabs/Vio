@@ -1,20 +1,21 @@
-SILO BRAND ASSETS — NOTICE
+VIO BRAND ASSETS — NOTICE
 ==========================
 
-The files in this directory (and its subdirectories) that constitute Silo brand
-assets — including the Silo logo, wordmark, app icons, and other visual-identity
-files — are:
+The files in this directory (and its subdirectories) that constitute Vio brand
+assets — including the Vio logo, wordmark, app icons, and other visual-identity
+files — are the property of this fork. All rights reserved.
 
-    Copyright (c) 2026 Silo Media L.L.C. All rights reserved.
-
-These brand assets are TRADEMARKS of Silo Media L.L.C. They are NOT licensed
-under the GNU Affero General Public License (AGPL-3.0-or-later) that covers the
-Silo source code, nor under any other open-source license.
+These brand assets are NOT licensed under the GNU Affero General Public License
+(AGPL-3.0-or-later) that covers the Vio source code, nor under any other
+open-source license.
 
 If you redistribute or fork this software, you MUST remove or replace these
-brand assets. You may not use the Silo name or logo as the identity of a
-modified or redistributed version, and you may not publish a Silo-branded app to
-any app store without written permission from Silo Media L.L.C.
+brand assets. You may not use the Vio name or logo as the identity of a
+modified or redistributed version.
 
-See TRADEMARK.md for the full Silo Trademark & Brand Policy, including the
-permitted referential uses (e.g. "compatible with Silo").
+Vio is based on Silo (© Silo Media L.L.C., AGPL-3.0-or-later). Silo is a
+trademark of Silo Media L.L.C.; Vio is an unofficial fork, not affiliated with
+or endorsed by Silo Media.
+
+See TRADEMARK.md for the full Vio Trademark & Fork Notice, including the
+permitted referential uses (e.g. "a fork of Silo").

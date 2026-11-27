@@ -3,7 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 
 import type { SettingsSectionEntry } from "@/api/types";
-import { problemDisplayText, readableErrorText, V2ProblemError } from "@/api/v2/request";
+import { problemDisplayText, V2ProblemError } from "@/api/v2/request";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { SectionOrderList } from "@/components/sections/SectionOrderList";
 import { Button } from "@/components/ui/button";
@@ -26,15 +26,14 @@ import { fetchRecipeCatalog } from "@/lib/recipes";
 import { DetailCard } from "../ui";
 
 // A refused save names its reason in the problem's first error (a 400 from
-// recipe validation) or in its detail. A save the server didn't refuse (a
-// failed fetch, a timeout, a proxy's error page) has no reason to show.
+// recipe validation) or in its detail.
 function saveErrorMessage(t: Translate, error: unknown): string {
   let reason: string | undefined;
   if (error instanceof V2ProblemError) {
     const field = error.problem.errors?.[0];
     reason = problemDisplayText(error.problem, field ? field.detail : (error.problem.detail ?? ""));
-  } else {
-    reason = readableErrorText(error, "");
+  } else if (error instanceof Error) {
+    reason = error.message;
   }
   reason = reason?.trim();
   return reason

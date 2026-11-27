@@ -6,7 +6,7 @@ import (
 )
 
 func downloadSubscriptionMutationFixtureCases() []fixtureCase {
-	viewer := with(with(bearer(memberToken), "X-Profile-Id", "p-owner"), "X-Silo-Device-Id", "device-one")
+	viewer := with(with(bearer(memberToken), "X-Profile-Id", "p-owner"), "X-Vio-Device-Id", "device-one")
 	row := syntheticDownloadSubscription()
 	tag := downloadSubscriptionOf(row).ETag
 	row.Active = true

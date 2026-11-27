@@ -15,7 +15,7 @@ type DownloadSubscriptionSyncService interface {
 	SyncSubscriptionPage(context.Context, int, string, string, string, *catalogpkg.EpisodePagePosition, int, catalogpkg.AccessFilter, func(*downloads.Subscription) error) (downloads.SubscriptionSyncPage, error)
 }
 type DownloadSubscriptionSyncInput struct {
-	DeviceID string `header:"X-Silo-Device-Id" required:"true" minLength:"1" maxLength:"128"`
+	DeviceID string `header:"X-Vio-Device-Id" required:"true" minLength:"1" maxLength:"128"`
 	Limit    int    `query:"limit" default:"50" minimum:"1" maximum:"100"`
 	Cursor   string `query:"cursor"`
 	Body     struct {

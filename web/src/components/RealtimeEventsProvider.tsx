@@ -53,7 +53,7 @@ import {
 import { jobCancelledError, jobFailedError } from "@/lib/adminJobErrors";
 import { bumpHomeRefreshSignal } from "@/pages/homeSurfaceRefresh";
 import { createRealtimeQueryRefreshScheduler } from "@/components/realtimeQueryRefresh";
-import { adminSessionsKey, applyAdminSessionPauseEvent } from "@/api/v2/adminSessionsCache";
+import { adminSessionsKey } from "@/api/v2/adminSessionsCache";
 import {
   adminDownloadPreparationsKey,
   applyDownloadPreparationProgress,
@@ -74,10 +74,12 @@ import {
   sectionKeys,
 } from "@/hooks/queries/keys";
 import {
+  isTerminalItemDetailNotFound,
   dropInactiveWatchDetail,
   scheduleMediaSurfaceInvalidation,
   updateCatalogItemDetail,
 } from "@/hooks/queries/mediaSurfaceRefresh";
+import { scheduleVersionLivenessRefresh } from "@/hooks/queries/versionLiveness";
 import type { ReactNode } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLocation } from "react-router";
@@ -374,6 +376,18 @@ function catalogEventContentID(data: unknown) {
   }
   const value = (data as { content_id?: unknown }).content_id;
   return typeof value === "string" && value ? value : undefined;
+}
+
+/**
+ * A row was stamped failed (or a refresh rewrote the item's versions). Its
+ * liveness verdict is cached for minutes, so the version menus hold the dead
+ * row until the check runs again.
+ */
+function isVersionsUpdatedEvent(message: EventsEventMessage) {
+  if (message.event !== "catalog.item.changed") return false;
+  const data = message.data;
+  if (!data || typeof data !== "object" || !("change" in data)) return false;
+  return (data as { change?: unknown }).change === "versions_updated";
 }
 
 function handleJobSideEffects(
@@ -834,6 +848,14 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
         break;
       case "catalog":
         {
+          // The coalesced sweep below would also invalidate these checks, but
+          // only once its window closes; a stamped row has to leave an open
+          // version menu at once. A refresh announces its burst one row at a
+          // time, so the re-check is coalesced and rate-limited per row set
+          // (see scheduleVersionLivenessRefresh).
+          if (isVersionsUpdatedEvent(message)) {
+            scheduleVersionLivenessRefresh(queryClient);
+          }
           const isItemChange = CATALOG_ITEM_CHANGED_EVENTS.has(message.event);
           catalogInvalidation.schedule({
             itemId: isItemChange ? catalogEventContentID(message.data) : undefined,
@@ -858,8 +880,6 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
       case "sessions":
         if (message.event === "sessions.replaced") {
           refreshSessions();
-        } else if (message.event === "session.paused" || message.event === "session.resumed") {
-          applyAdminSessionPauseEvent(queryClient, realtimeAuthority, message.data);
         }
         break;
       case "tasks":
@@ -1036,7 +1056,8 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
     droppedSinceCatchUpRef.current = false;
     void queryClient.refetchQueries({
       type: "active",
-      predicate: (query) => !isDashboardQueryKey(query.queryKey),
+      predicate: (query) =>
+        !isDashboardQueryKey(query.queryKey) && !isTerminalItemDetailNotFound(query),
     });
     // The account record is not a query. An access change made while the
     // socket was down never sends access_changed: the reconnect's ticket

@@ -1040,3 +1040,69 @@ func (r *Repository) GetActiveVirtualRefreshByContentID(ctx context.Context, con
 		contentID,
 	))
 }
+
+// HasFinishedJobOfType reports whether a job of this kind has reached a
+// terminal state the operator did not ask to retry: completed, or canceled.
+func (r *Repository) HasFinishedJobOfType(ctx context.Context, jobType string) (bool, error) {
+	var exists bool
+	if err := r.pool.QueryRow(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM admin_jobs WHERE job_type = $1 AND status IN ($2, $3)
+		)`,
+		jobType, StatusCompleted, StatusCancelled,
+	).Scan(&exists); err != nil {
+		return false, fmt.Errorf("check finished admin job of type: %w", err)
+	}
+	return exists, nil
+}
+
+// LatestJobRequestedAt reports when a job of this kind was last requested.
+func (r *Repository) LatestJobRequestedAt(ctx context.Context, jobType string) (time.Time, bool, error) {
+	var requestedAt time.Time
+	err := r.pool.QueryRow(ctx, `
+		SELECT requested_at FROM admin_jobs
+		WHERE job_type = $1
+		ORDER BY requested_at DESC, id DESC
+		LIMIT 1`,
+		jobType,
+	).Scan(&requestedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return time.Time{}, false, nil
+	}
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("latest admin job of type: %w", err)
+	}
+	return requestedAt, true, nil
+}
+
+// RequeueLatestFailedOfType re-queues the newest failed job of this kind for a
+// retry, unless one is already queued or running.
+func (r *Repository) RequeueLatestFailedOfType(ctx context.Context, jobType string) (bool, error) {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE admin_jobs
+		SET status = $2,
+			message = 'Requeued after a partial run',
+			error_message = '',
+			started_at = NULL,
+			completed_at = NULL,
+			heartbeat_at = NULL,
+			expires_at = NULL,
+			updated_at = NOW()
+		WHERE id = (
+			SELECT id FROM admin_jobs
+			WHERE job_type = $1 AND status = $3
+			ORDER BY requested_at DESC, id DESC
+			LIMIT 1
+		)
+		  AND status = $3
+		  AND NOT EXISTS (
+			SELECT 1 FROM admin_jobs
+			WHERE job_type = $1 AND status IN ($2, $4)
+		)`,
+		jobType, StatusQueued, StatusFailed, StatusRunning,
+	)
+	if err != nil {
+		return false, fmt.Errorf("requeueing latest failed admin job of type: %w", err)
+	}
+	return tag.RowsAffected() > 0, nil
+}

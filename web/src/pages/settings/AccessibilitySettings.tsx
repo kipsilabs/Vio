@@ -152,7 +152,7 @@ function AppLanguageSetting() {
         </SelectContent>
       </Select>
       {tag !== null && matchAppLanguage(tag, PSEUDO_LOCALES_ENABLED) === null && (
-        <p className="text-muted-foreground text-[0.8125rem]">
+        <p className="text-muted-foreground text-[13px]">
           {t("web.settings.accessibility.appLanguageUnavailable")}
         </p>
       )}
@@ -364,7 +364,7 @@ export default function AccessibilitySettings() {
             </div>
           </div>
 
-          <p className="text-muted-foreground text-[0.8125rem]">
+          <p className="text-muted-foreground text-[13px]">
             {t("web.settings.accessibility.dateTimePreview", {
               short: formatDate(previewDate),
               medium: formatDate(previewDate, "medium"),

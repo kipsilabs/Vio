@@ -110,7 +110,7 @@ const playerConfig: PlayerConfig = {
   apiBaseUrl: "/api/v1",
   getAccessToken: () => "token",
   getProfileId: () => "profile-1",
-  getDeviceHeaders: () => ({ "X-Silo-Device-Id": "test-device" }),
+  getDeviceId: () => "test-device",
   getProfileToken: () => null,
 };
 
@@ -750,13 +750,6 @@ describe("useAudiobookPlayback", () => {
       vi.advanceTimersByTime(1500);
     });
     expect(audio.pause).toHaveBeenCalled();
-  });
-
-  it("setSleep reports the full duration when armed long after the player opened", () => {
-    const { result } = renderAudiobookPlayback();
-    vi.setSystemTime(Date.now() + 40_000);
-    act(() => result.current.setSleep({ kind: "duration", seconds: 300 }));
-    expect(result.current.sleep.remainingMs).toBe(300_000);
   });
 
   it("setSleep with off clears any armed timer", () => {

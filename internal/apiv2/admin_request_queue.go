@@ -102,11 +102,11 @@ func (reg *Registry) getAdminRequestCounts(ctx context.Context, _ *struct{}) (*A
 	viewer := adminRequestViewer(ctx)
 	c, err := s.CountAdminViews(ctx, viewer)
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	settings, err := reg.deps.AdminRequests.GetSettings(ctx, viewer)
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	return &AdminRequestCountsOutput{Body: AdminRequestCounts{RequestsEnabled: settings.RequestsEnabled, NeedsApproval: c.NeedsApproval, InProgress: c.InProgress, Failed: c.Failed, Done: c.Done}}, nil
 }
@@ -118,11 +118,9 @@ func (reg *Registry) listAdminRequestEvents(ctx context.Context, in *MediaReques
 	}
 	events, err := s.ListRequestEvents(ctx, adminRequestViewer(ctx), string(in.ID))
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	items := make([]AdminRequestEvent, 0, len(events))
-	// A scoped key (the monitoring scope) gets no event text: errors in it
-	// can name download servers, their addresses and routing rules.
 	withhold := scopedAPIKey(ctx)
 	for _, e := range events {
 		item := AdminRequestEvent{ID: IDFromInt(e.ID), Type: e.EventType, ActorUsername: e.ActorUsername, Message: e.Message, CreatedAt: NewInstant(e.CreatedAt)}
@@ -152,3 +150,5 @@ func adminListFilter(in *AdminMediaRequestListInput) (mediarequests.ListFilter, 
 	}
 	return filter, nil
 }
+
+var adminRequestQueueOperationIDs = []string{opGetAdminRequestCounts, opListAdminRequestEvents}

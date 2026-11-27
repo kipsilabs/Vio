@@ -1,8 +1,6 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 
-import type { FileVersion, Profile, WatchDetail } from "@/api/types";
-import { createAppIntl, setAppIntl, type Messages } from "@/i18n";
-import pseudo from "@/locales/en-XA.json";
+import type { Profile, WatchDetail } from "@/api/types";
 
 import {
   createWatchRouteRequest,
@@ -75,6 +73,19 @@ describe("buildWatchRouteRequest", () => {
     expect(buildWatchHref(makeRequest())).toBe("/watch/movie-1");
   });
 
+  it("treats an explicit pick as a different request from an Auto start", () => {
+    // Two starts for the same row are not the same request: one may be
+    // replaced by the server, the other may not.
+    const explicit = createWatchRouteRequest({
+      contentId: "movie-1",
+      fileId: 42,
+      explicitFileSelection: true,
+    });
+    const auto = createWatchRouteRequest({ contentId: "movie-1", fileId: 42 });
+
+    expect(explicit.requestKey).not.toBe(auto.requestKey);
+  });
+
   it("keeps a shuffle in the watch href and the request key", () => {
     const shuffled = makeRequest("shuffle=shuffle-1");
 
@@ -85,6 +96,108 @@ describe("buildWatchRouteRequest", () => {
 });
 
 describe("buildWatchPageProps", () => {
+  it("forwards a pick the navigation carried", () => {
+    const props = buildWatchPageProps({
+      request: createWatchRouteRequest({
+        contentId: "movie-1",
+        fileId: 42,
+        explicitFileSelection: true,
+      }),
+      item: makeWatchDetail(),
+      currentProfile: profile,
+    });
+
+    expect(props.explicitFileSelection).toBe(true);
+  });
+
+  it("leaves an Auto start substitutable", () => {
+    const props = buildWatchPageProps({
+      request: createWatchRouteRequest({ contentId: "movie-1", fileId: 42 }),
+      item: makeWatchDetail(),
+      currentProfile: profile,
+    });
+
+    expect(props.explicitFileSelection).toBe(false);
+  });
+
+  // A reload keeps the remembered row but loses the navigation that carried
+  // why the row was chosen; the store's standing is what the watch page has
+  // left to tell a pick from an Auto start.
+  it("derives the pick from the remembered row after a reload", () => {
+    const props = buildWatchPageProps({
+      request: createWatchRouteRequest({ contentId: "movie-1", fileId: 42 }),
+      item: makeWatchDetail(),
+      currentProfile: profile,
+      requestedFileId: 42,
+      requestedVersionExplicit: true,
+    });
+
+    expect(props.explicitFileSelection).toBe(true);
+  });
+
+  it("does not pin the remembered row when the viewer did not name it", () => {
+    const props = buildWatchPageProps({
+      request: createWatchRouteRequest({ contentId: "movie-1", fileId: 42 }),
+      item: makeWatchDetail(),
+      currentProfile: profile,
+      requestedFileId: 42,
+      requestedVersionExplicit: false,
+    });
+
+    expect(props.explicitFileSelection).toBe(false);
+  });
+
+  it("does not pin a remembered row this request does not play", () => {
+    const props = buildWatchPageProps({
+      request: createWatchRouteRequest({ contentId: "movie-1", fileId: 42 }),
+      item: makeWatchDetail(),
+      currentProfile: profile,
+      requestedFileId: 7,
+      requestedVersionExplicit: true,
+    });
+
+    expect(props.explicitFileSelection).toBe(false);
+  });
+
+  it("forwards the watch detail's virtual ranking to the player", () => {
+    const virtualRanking = {
+      profile_label: "4K HDR",
+      source: "profile" as const,
+      criteria: [
+        { attribute: "score", direction: "desc" as const },
+        { attribute: "resolution", direction: "desc" as const },
+      ],
+    };
+    const props = buildWatchPageProps({
+      request: makeRequest(),
+      item: makeWatchDetail({ virtual_ranking: virtualRanking }),
+      currentProfile: profile,
+    });
+
+    expect(props.virtualRanking).toEqual(virtualRanking);
+  });
+
+  it("leaves the virtual ranking absent for local content", () => {
+    const props = buildWatchPageProps({
+      request: makeRequest(),
+      item: makeWatchDetail(),
+      currentProfile: profile,
+    });
+
+    expect(props.virtualRanking).toBeUndefined();
+  });
+
+  it("keeps the empty playback variants identity stable across builds", () => {
+    const build = () =>
+      buildWatchPageProps({
+        request: makeRequest(),
+        item: makeWatchDetail(),
+        currentProfile: profile,
+      });
+
+    expect(build().playbackVariants).toBe(build().playbackVariants);
+  });
+
   it("prefers effective subtitle defaults from watch detail over raw profile values", () => {
     const props = buildWatchPageProps({
       request: makeRequest(),
@@ -224,6 +337,31 @@ describe("buildWatchPageProps", () => {
     });
   });
 
+  it("prefers the device's requested row over the server's last-played substitute", () => {
+    const props = buildWatchPageProps({
+      request: makeRequest(),
+      item: makeWatchDetail({
+        user_data: {
+          played: false,
+          is_in_progress: true,
+          position_seconds: 120,
+          duration_seconds: 3600,
+          last_file_id: 77,
+          last_resolution: "2160p",
+        },
+      }),
+      currentProfile: profile,
+      requestedFileId: 88,
+    });
+
+    expect(props).toMatchObject({
+      resumeHints: {
+        lastFileId: 88,
+        lastResolution: "2160p",
+      },
+    });
+  });
+
   it("forces a session-scoped restart when restart=1 is present", () => {
     const props = buildWatchPageProps({
       request: makeRequest("restart=1"),
@@ -341,44 +479,4 @@ describe("buildWatchPageProps", () => {
       expect(props.initialBitmapSubtitleTrackIndexByFileId).toEqual(bitmapIndexes);
     },
   );
-});
-
-describe("initial subtitle track", () => {
-  afterEach(() => setAppIntl(createAppIntl("en", {})));
-
-  it("matches a saved track signature by its stored label in any interface language", () => {
-    // A translated interface: the pseudo-locale changes every message.
-    setAppIntl(createAppIntl("en-XA", pseudo as unknown as Messages));
-    const untitled = { codec: "subrip", external: false };
-    const version = {
-      file_id: 7,
-      resolution: "1080p",
-      codec_video: "h264",
-      codec_audio: "aac",
-      hdr: false,
-      container: "mkv",
-      file_size: 1,
-      duration: 1,
-      bitrate: 1,
-      subtitle_tracks: [untitled, untitled],
-    } satisfies FileVersion;
-    const props = buildWatchPageProps({
-      request: makeRequest(),
-      item: makeWatchDetail({
-        versions: [version],
-        effective_subtitle_mode: "always",
-        effective_subtitle_language: "",
-        // Item pages and other clients store this label in English.
-        effective_subtitle_track_signature: {
-          source: "embedded",
-          language: "unknown",
-          codec: "subrip",
-          label: "Subtitle 2",
-        },
-      }),
-      currentProfile: profile,
-    });
-
-    expect(props.initialSubtitleTrackIndexByFileId).toEqual({ 7: 1 });
-  });
 });

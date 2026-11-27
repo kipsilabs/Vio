@@ -9,6 +9,7 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/access"
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
+	"github.com/Silo-Server/silo-server/internal/auth"
 	"github.com/Silo-Server/silo-server/internal/progresssync"
 )
 
@@ -156,7 +157,7 @@ func (reg *Registry) bootstrapActor(ctx context.Context, headers ProgressBootstr
 		return progresssync.Actor{}, NewProblem(TypeAuthenticationRequired, "Authentication required.")
 	}
 	captured := *claims
-	input := access.ResolveInput{UserID: userID, ProfileID: profileID, SessionID: captured.SessionID, ProfileToken: headers.ProfileToken, SkipPINVerification: captured.SkipsProfilePIN()}
+	input := access.ResolveInput{UserID: userID, ProfileID: profileID, SessionID: captured.SessionID, ProfileToken: headers.ProfileToken, SkipPINVerification: captured.TokenType == auth.TokenTypeAPIKey}
 	actor := progresssync.Actor{Input: input, Recheck: func(ctx context.Context) (access.Scope, error) {
 		if err := reg.deps.Auth.RevalidateCurrent(ctx, headers.Authorization, &captured, method, path); err != nil {
 			return access.Scope{}, err

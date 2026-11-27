@@ -1,20 +1,24 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useLocation, useNavigate } from "react-router";
-import { leafUserData, type FileVersion, type ItemDetail } from "@/api/types";
-import { buildFieldFilterHref } from "@/pages/catalogSearchParams";
-import type { PlayerSubtitleTrackSignature } from "@/player/types";
+import type { FileVersion, ItemDetail } from "@/api/types";
+import type { PlayerSubtitleTrackSignature, PrePlaySubtitleSelection } from "@/player/types";
 import { useRedetectItemMarkers, useRefreshItemMetadata } from "@/hooks/queries/items";
 import { useAdminMarkerCapabilities } from "@/hooks/queries/admin/markers";
 import { useLibraryCapabilities } from "@/hooks/queries/admin/libraries";
 import { useSimilarItems } from "@/hooks/queries/recommendations";
-import { usePrePlayAudioSelection, usePrePlaySubtitleSelection } from "./usePrePlayTrackSelection";
+import { useDeleteSubtitlePreference, useSetSubtitlePreference } from "@/hooks/queries/subtitles";
+import {
+  useVersionLiveness,
+  applyVersionAvailability,
+  useVersionPlayability,
+  applyVersionPlayability,
+} from "@/hooks/queries/versionLiveness";
+import { useVersionPlayabilityClient } from "@/hooks/queries/versionPlayabilityClient";
 import { useAuth } from "@/hooks/useAuth";
 import { useIsActingAdmin } from "@/hooks/useIsActingAdmin";
 import { useAmbientColor } from "@/hooks/useAmbientColor";
 import { useCurrentProfile } from "@/hooks/useCurrentProfile";
 import CastCarousel from "@/components/CastCarousel";
-import MovieBoxSetRow from "@/components/boxsets/MovieBoxSetRow";
-import ItemCollectionsRow from "@/components/collections/ItemCollectionsRow";
 import { buildCrewGroups } from "@/components/castCrewGroups";
 import DownloadVersionPicker from "@/components/DownloadVersionPicker";
 import EditMetadataDialog from "@/components/EditMetadataDialog";
@@ -29,17 +33,19 @@ import { useOnViewTranslation } from "@/hooks/useOnViewTranslation";
 import MetadataBadges from "./components/MetadataBadges";
 import TrailersSection from "./components/TrailersSection";
 import ExtrasSection from "./components/ExtrasSection";
+import CollectionsSection from "./components/CollectionsSection";
 import QualityBadges from "./components/QualityBadges";
 import ScoreRow from "./components/ScoreRow";
 import HeroCrewLine from "./components/HeroCrewLine";
 import MediaUserActionBar from "./components/MediaUserActionBar";
 import MediaInfoDialog from "./components/MediaInfoDialog";
 import SubtitleSearchDialog from "./components/SubtitleSearchDialog";
+import { sortByResolution } from "./components/VersionFlyout";
 import {
   selectDefaultPlaybackVariantVersion,
-  selectedDownloadVersions,
-  selectedStartVersion,
+  selectItemVersion,
 } from "./components/versionRankingUtils";
+import { readRequestedVersion, rememberRequestedFileId } from "@/playback/requestedVersion";
 import { resolveSelectedMediaSummary } from "./components/selectedMediaSummary";
 import { RecommendationGridSkeleton } from "./components/SectionSkeletons";
 import { resolveLeafPrimaryAction } from "./itemDetailLayout";
@@ -48,22 +54,27 @@ import {
   canEditMarkers as canEditMarkersForUser,
 } from "@/lib/permissions";
 import { formatRuntimeMinutes } from "@/lib/mediaFormat";
-import { useQualityPreferenceState } from "@/hooks/queries/qualityPreference";
+import { useQualityPreference } from "@/hooks/queries/qualityPreference";
 import { useDetailWatchTogether } from "@/pages/watchtogether/DetailWatchTogether";
 import { hasMachineTranslation } from "./components/machineTranslation";
-import { useT } from "@/i18n";
 
 export default function MovieContent({
   item,
-  libraryId,
   showAdvisoryAge,
+  onStaleVersion,
+  onSelectedFileIdChange,
 }: {
   item: ItemDetail & { type: "movie" };
-  /** The page's ?libraryId= scope; the match and split dialogs search in it. */
-  libraryId?: number;
   showAdvisoryAge?: boolean;
+  onStaleVersion?: (fileId: number) => void;
+  /**
+   * Reports the viewer's explicit version pick (the in-place choice or the
+   * remembered one on this device) so the page's detail read can carry it. The
+   * server-derived default is not reported: it would only duplicate the read
+   * the page already made.
+   */
+  onSelectedFileIdChange?: (fileId: number | null) => void;
 }) {
-  const t = useT();
   const { translating: overviewTranslating, onTranslate: onTranslateOverview } =
     useOnViewTranslation(item);
   const navigate = useNavigate();
@@ -79,9 +90,10 @@ export default function MovieContent({
   // The resolution cap comes from the settings contract, where the quality
   // picker writes; the profile column it falls back to is only the pre-cutover
   // choice, since that picker no longer mirrors into it.
-  const { preference: qualityPreference, settled: qualitySettled } = useQualityPreferenceState(
-    currentProfile?.quality_preference,
-  );
+  const qualityPreference = useQualityPreference(currentProfile?.quality_preference);
+  // The same capability surface a playback start sends, so the versions check
+  // can judge each row with the production planner before the viewer picks.
+  const { client: playabilityClient, ready: playabilityReady } = useVersionPlayabilityClient();
   const canCurateMetadata = canCurateMetadataForUser(user, currentProfile);
   const canEditMarkers = canEditMarkersForUser(user, currentProfile);
 
@@ -96,11 +108,8 @@ export default function MovieContent({
   const canRedetectMovieCredits =
     markerCapabilities.data?.redetect_markers === true &&
     markerCapabilities.data?.movie_credits === true;
-  const scopedItem = useMemo(
-    () => (libraryId === undefined ? item : { ...item, library_id: libraryId }),
-    [item, libraryId],
-  );
-
+  const deleteSubtitlePreference = useDeleteSubtitlePreference();
+  const setSubtitlePreference = useSetSubtitlePreference();
   const [editOpen, setEditOpen] = useState(false);
   const [matchOpen, setMatchOpen] = useState(false);
   const [splitOpen, setSplitOpen] = useState(false);
@@ -109,30 +118,122 @@ export default function MovieContent({
   const [mediaInfoOpen, setMediaInfoOpen] = useState(false);
   const crewGroups = useMemo(() => buildCrewGroups(item.crew ?? [], "Director"), [item.crew]);
   const [mediaInfoFileId, setMediaInfoFileId] = useState<number | null>(null);
+  // Tracks whether a version picker has been opened; the picker-open path
+  // widens the liveness probe from the default version to the whole list.
+  const [versionPickersOpened, setVersionPickersOpened] = useState(false);
+  const handleVersionPickerOpenChange = useCallback((open: boolean) => {
+    if (open) {
+      setVersionPickersOpened(true);
+    }
+  }, []);
 
   // Version selection state — drives the Play button and inline stream popovers.
-  const userData = leafUserData(item.user_data);
-  const [selectedEditionKey, setSelectedEditionKey] = useState<string | undefined>(undefined);
+  const sortedVersions = useMemo(() => sortByResolution(item.versions), [item.versions]);
+  const userData =
+    item.user_data && "position_seconds" in item.user_data ? item.user_data : undefined;
+  // The viewer's own pick, remembered on this device. It outlives the server's
+  // `last_file_id`, which names whichever row actually served the bytes after
+  // a substitution. Read on mount, but only once the profile has resolved: the
+  // store is profile-scoped, and a pre-resolution read would alias another
+  // profile's pick. A pick made in place is held in state below.
+  const requestedProfileId = currentProfile?.id ?? null;
+  const requestedVersion = useMemo(
+    () => (requestedProfileId ? readRequestedVersion(item.content_id, requestedProfileId) : null),
+    [item.content_id, requestedProfileId],
+  );
+  const requestedFileId = requestedVersion?.fileId ?? null;
   const defaultSelectedVersion = useMemo(
     () =>
       selectDefaultPlaybackVariantVersion(
-        item.versions,
+        sortedVersions,
         item.playback_variants,
         userData,
         qualityPreference,
-        selectedEditionKey,
+        item.effective_version_edition_key,
+        requestedFileId,
       ),
-    [qualityPreference, selectedEditionKey, item.playback_variants, item.versions, userData],
+    [
+      qualityPreference,
+      item.effective_version_edition_key,
+      item.playback_variants,
+      requestedFileId,
+      sortedVersions,
+      userData,
+    ],
   );
-  const [manualSelectedFileId, setManualSelectedFileId] = useState<number | null>(null);
-  const pickedVersion = useMemo(
+
+  // Check the default-selected version as soon as the page mounts so it can't
+  // sit as an unavailable row before any liveness result exists. Only that one
+  // version is probed until a picker opens, at which point the full chunked
+  // check takes over (results are cached for 5 minutes, so re-opening does not
+  // re-fetch).
+  const livenessVersions = useMemo(
     () =>
-      manualSelectedFileId != null
-        ? (item.versions.find((version) => version.file_id === manualSelectedFileId) ?? null)
-        : null,
-    [manualSelectedFileId, item.versions],
+      versionPickersOpened ? item.versions : defaultSelectedVersion ? [defaultSelectedVersion] : [],
+    [defaultSelectedVersion, item.versions, versionPickersOpened],
   );
-  const selectedVersion = pickedVersion ?? defaultSelectedVersion;
+  const versionLiveness = useVersionLiveness(livenessVersions, true);
+  // A cheap, provider-free pass over every row: the picker must know which
+  // rows this client can play before it offers them, and the default row must
+  // not be an unplayable one. It only adds the playability verdict; liveness
+  // above stays the authority for `available`/`failed`.
+  const versionPlayability = useVersionPlayability(
+    item.versions,
+    playabilityClient,
+    playabilityReady,
+  );
+  const versionsWithPlayability = useMemo(
+    () =>
+      applyVersionPlayability(
+        applyVersionAvailability(item.versions, versionLiveness),
+        versionPlayability,
+      ),
+    [item.versions, versionLiveness, versionPlayability],
+  );
+
+  const [manualSelectedFileId, setManualSelectedFileId] = useState<number | null>(null);
+  // The device's requested row is checked before the server's `last_file_id`:
+  // it is the viewer's pick, while the server's last file names whatever served
+  // the bytes after a substitution. Either may have left the list since.
+  const persistedSelectedFileId =
+    manualSelectedFileId ??
+    requestedFileId ??
+    (userData && "last_file_id" in userData ? (userData.last_file_id ?? null) : null);
+  // The page always resolves a playable row: a persisted row the refresh dropped,
+  // a failed default, and a currently unavailable default each fall back to the
+  // best available row with a notice instead of disabling Play for the item.
+  const explicitPickFileId =
+    manualSelectedFileId ?? (requestedVersion?.explicit === true ? requestedFileId : null);
+  const versionSelection = useMemo(
+    () =>
+      selectItemVersion(
+        versionsWithPlayability,
+        defaultSelectedVersion,
+        persistedSelectedFileId,
+        explicitPickFileId,
+      ),
+    [defaultSelectedVersion, explicitPickFileId, persistedSelectedFileId, versionsWithPlayability],
+  );
+  const selectedVersion = versionSelection.version;
+  const versionFallback = versionSelection.fallback;
+  // A row the page did not keep must not keep naming itself to the detail read;
+  // only a row the catalog still carries and the viewer asked for is a
+  // selection.
+  const explicitSelectedFileId = versionFallback
+    ? null
+    : (manualSelectedFileId ?? requestedFileId ?? null);
+  useEffect(() => {
+    onSelectedFileIdChange?.(explicitSelectedFileId);
+  }, [explicitSelectedFileId, onSelectedFileIdChange]);
+  // Play must tell the server whether this row is the viewer's or the page's.
+  // A pick made in place says so directly; a remembered one only while it is
+  // still the row the catalog gives us to play, and only if the viewer named it
+  // themselves. An Auto start's row is remembered as a hint, not a pin.
+  const explicitFileSelection =
+    versionFallback == null &&
+    (manualSelectedFileId != null ||
+      (requestedVersion?.explicit === true &&
+        requestedVersion.fileId === selectedVersion?.file_id));
   const selectedMediaSummary = useMemo(
     () => resolveSelectedMediaSummary(selectedVersion, item.playback_variants, item.runtime ?? 0),
     [item.playback_variants, item.runtime, selectedVersion],
@@ -144,56 +245,84 @@ export default function MovieContent({
     },
     [selectedVersion?.file_id],
   );
-  const audioSelection = usePrePlayAudioSelection(
-    item.content_id,
-    item.content_id,
-    selectedVersion,
+  const [audioSelectionMode, setAudioSelectionMode] = useState<"auto" | "explicit">("auto");
+  const [explicitAudioTrackIndex, setExplicitAudioTrackIndex] = useState<number | null>(null);
+  const [subtitleSelectionMode, setSubtitleSelectionMode] = useState<"auto" | "off" | "explicit">(
+    "auto",
   );
-  const clearAudioSelection = audioSelection.clear;
-  const subtitleSelection = usePrePlaySubtitleSelection(
-    item.content_id,
-    item.content_id,
-    selectedVersion?.file_id,
-  );
-  const clearSubtitleSelection = subtitleSelection.clear;
+  const [explicitSubtitleSelection, setExplicitSubtitleSelection] =
+    useState<PrePlaySubtitleSelection | null>(null);
 
   // Reset selection when navigating to a different movie (adjust state during render).
   const [prevContentId, setPrevContentId] = useState(item.content_id);
   if (prevContentId !== item.content_id) {
     setPrevContentId(item.content_id);
     setManualSelectedFileId(null);
-    setSelectedEditionKey(undefined);
-  } else if (selectedEditionKey === undefined && qualitySettled && defaultSelectedVersion) {
-    setSelectedEditionKey(defaultSelectedVersion.edition_key ?? "");
+    setAudioSelectionMode("auto");
+    setExplicitAudioTrackIndex(null);
+    setSubtitleSelectionMode("auto");
+    setExplicitSubtitleSelection(null);
   }
   const handleSelectVersion = useCallback(
-    (version: FileVersion | null) => {
-      setManualSelectedFileId(version?.file_id ?? null);
-      if (version) setSelectedEditionKey(version.edition_key ?? "");
-      // Track indexes belong to a file, so another version starts from Auto.
-      clearAudioSelection();
-      clearSubtitleSelection();
+    (version: FileVersion) => {
+      setManualSelectedFileId(version.file_id);
+      // Remember the pick across reloads: the server records the row that
+      // actually plays, which may be a substitute for this one. The standing
+      // travels with it so a later Play still pins this row after a reload.
+      rememberRequestedFileId(item.content_id, version.file_id, requestedProfileId, {
+        explicit: true,
+      });
+      setAudioSelectionMode("auto");
+      setExplicitAudioTrackIndex(null);
+      setSubtitleSelectionMode("auto");
+      setExplicitSubtitleSelection(null);
     },
-    [clearAudioSelection, clearSubtitleSelection],
+    [item.content_id, requestedProfileId],
   );
 
-  const handleSelectEdition = useCallback(
-    (key: string) => {
-      setSelectedEditionKey(key);
-      handleSelectVersion(null);
-    },
-    [handleSelectVersion],
-  );
-  const downloadVersions = useMemo(
-    () => selectedDownloadVersions(selectedVersion, item.playback_variants, qualityPreference),
-    [selectedVersion, item.playback_variants, qualityPreference],
-  );
-  const restartVersion = useMemo(
-    () => selectedStartVersion(selectedVersion, item.playback_variants, qualityPreference),
-    [selectedVersion, item.playback_variants, qualityPreference],
-  );
+  const handleSelectAudioTrack = useCallback((trackIndex: number) => {
+    setAudioSelectionMode("explicit");
+    setExplicitAudioTrackIndex(trackIndex);
+  }, []);
 
-  const primaryAction = resolveLeafPrimaryAction(item, t("web.detail.actions.play"));
+  const handleResetAudioSelection = useCallback(() => {
+    setAudioSelectionMode("auto");
+    setExplicitAudioTrackIndex(null);
+  }, []);
+
+  const handleSelectSubtitle = (selection: PrePlaySubtitleSelection) => {
+    setSubtitleSelectionMode("explicit");
+    setExplicitSubtitleSelection(selection);
+    // Persist as this movie's override so the choice sticks across visits,
+    // exactly like a manual in-player selection.
+    setSubtitlePreference.mutate({
+      prefId: item.content_id,
+      selection,
+    });
+  };
+
+  const handleSelectSubtitleOff = () => {
+    setSubtitleSelectionMode("off");
+    setExplicitSubtitleSelection(null);
+    setSubtitlePreference.mutate({
+      prefId: item.content_id,
+      selection: null,
+    });
+  };
+
+  const handleResetSubtitleSelection = () => {
+    setSubtitleSelectionMode("auto");
+    setExplicitSubtitleSelection(null);
+    // "Auto" also clears the persisted override saved by a manual in-player
+    // selection, so profile-level auto selection applies to this movie again.
+    deleteSubtitlePreference.mutate(item.content_id);
+  };
+
+  const isPlayable =
+    (item.versions?.length ?? 0) > 0 ||
+    (item.playback_variants?.length ?? 0) > 0 ||
+    Boolean(item.play_content_id);
+  const primaryAction = resolveLeafPrimaryAction(item, "Play");
   const watchTogether = useDetailWatchTogether({
     item,
     target:
@@ -208,7 +337,7 @@ export default function MovieContent({
         : null,
   });
   const restartHref =
-    primaryAction.resuming && item.versions.length > 0
+    primaryAction.label === "Resume" && isPlayable
       ? `/watch/${item.content_id}?restart=1`
       : undefined;
   const { data: similarData, isLoading: similarLoading } = useSimilarItems(item.content_id);
@@ -242,13 +371,8 @@ export default function MovieContent({
         <DetailHero
           title={title}
           topNav={<PageBack />}
-          context={t("web.detail.hero.typeMovie")}
+          context="Movie"
           studioLabel={firstStudio}
-          studioHref={
-            firstStudio
-              ? buildFieldFilterHref("studio", firstStudio, { libraryId, mediaType: "movie" })
-              : undefined
-          }
           backdropUrl={item.backdrop_url}
           backdropThumbhash={item.backdrop_thumbhash}
           posterUrl={item.poster_url}
@@ -282,7 +406,7 @@ export default function MovieContent({
               item={item}
               contentId={item.content_id}
               watchTogether={watchTogether.menu}
-              playHref={item.versions.length > 0 ? `/watch/${item.content_id}` : undefined}
+              playHref={isPlayable ? `/watch/${item.content_id}` : undefined}
               playLabel={primaryAction.label}
               playProgress={primaryAction.progress}
               restartHref={restartHref}
@@ -331,14 +455,17 @@ export default function MovieContent({
               onSplitItem={
                 canCurateMetadata && item.versions.length > 1 ? () => setSplitOpen(true) : undefined
               }
-              onShowMediaInfo={item.versions.length > 0 ? () => openMediaInfo() : undefined}
-              versions={item.versions}
+              onShowMediaInfo={
+                canCurateMetadata && item.versions.length > 0 ? () => openMediaInfo() : undefined
+              }
+              versions={versionsWithPlayability}
+              hasVirtualSource={item.has_virtual_source === true}
               playbackVariants={item.playback_variants}
               selectedVersion={selectedVersion}
-              restartVersion={restartVersion}
-              versionPicked={pickedVersion != null}
+              versionFallback={versionFallback}
               onSelectVersion={handleSelectVersion}
-              onSelectEdition={handleSelectEdition}
+              onVersionPickerOpenChange={handleVersionPickerOpenChange}
+              explicitFileSelection={explicitFileSelection}
               onDownload={
                 user?.download_allowed && item.versions.length > 0
                   ? () => setDownloadOpen(true)
@@ -348,15 +475,15 @@ export default function MovieContent({
                 item.versions.length > 0 ? () => setSubtitleSearchOpen(true) : undefined
               }
               qualityPreference={qualityPreference}
-              audioSelectionMode={audioSelection.mode}
-              explicitAudioTrackIndex={audioSelection.explicitIndex}
-              onSelectAudioTrack={audioSelection.select}
-              onResetAudioSelection={audioSelection.reset}
-              prePlaySubtitleMode={subtitleSelection.mode}
-              explicitSubtitleSelection={subtitleSelection.explicitSelection}
-              onSelectSubtitle={subtitleSelection.select}
-              onSelectSubtitleOff={subtitleSelection.selectOff}
-              onResetSubtitleSelection={subtitleSelection.reset}
+              audioSelectionMode={audioSelectionMode}
+              explicitAudioTrackIndex={explicitAudioTrackIndex}
+              onSelectAudioTrack={handleSelectAudioTrack}
+              onResetAudioSelection={handleResetAudioSelection}
+              prePlaySubtitleMode={subtitleSelectionMode}
+              explicitSubtitleSelection={explicitSubtitleSelection}
+              onSelectSubtitle={handleSelectSubtitle}
+              onSelectSubtitleOff={handleSelectSubtitleOff}
+              onResetSubtitleSelection={handleResetSubtitleSelection}
               preferredSubtitleLanguage={item.effective_subtitle_language}
               preferredSubtitleTrackSignature={preferredSubtitleTrackSignature}
               subtitleMode={item.effective_subtitle_mode as "off" | "auto" | "always" | undefined}
@@ -373,7 +500,7 @@ export default function MovieContent({
           {canCurateMetadata && (
             <MatchItemDialog
               key={item.content_id}
-              item={scopedItem}
+              item={item}
               open={matchOpen}
               onOpenChange={setMatchOpen}
               onReplaced={followReplacedItem}
@@ -382,7 +509,7 @@ export default function MovieContent({
           {canCurateMetadata && (
             <SplitItemDialog
               key={`split-${item.content_id}`}
-              item={scopedItem}
+              item={item}
               open={splitOpen}
               onOpenChange={setSplitOpen}
             />
@@ -390,9 +517,11 @@ export default function MovieContent({
           <DownloadVersionPicker
             open={downloadOpen}
             onOpenChange={setDownloadOpen}
-            versions={downloadVersions}
-            partsInOrder
+            versions={item.versions}
             title={title}
+            selectedFileId={selectedVersion?.file_id}
+            onStaleVersion={onStaleVersion}
+            createTarget={{ contentId: item.content_id }}
           />
           <SubtitleSearchDialog
             open={subtitleSearchOpen}
@@ -400,21 +529,25 @@ export default function MovieContent({
             version={selectedVersion}
             title={title}
           />
-          <MediaInfoDialog
-            open={mediaInfoOpen}
-            onOpenChange={setMediaInfoOpen}
-            versions={item.versions}
-            title={title}
-            initialFileId={mediaInfoFileId}
-          />
+          {canCurateMetadata && (
+            <MediaInfoDialog
+              open={mediaInfoOpen}
+              onOpenChange={setMediaInfoOpen}
+              versions={item.versions}
+              title={title}
+              initialFileId={mediaInfoFileId}
+            />
+          )}
           {watchTogether.sheet}
         </>
       }
     >
-      {((item.cast?.length ?? 0) > 0 || crewGroups.some((g) => g.members.length > 0)) && (
-        <DetailSection title={t("web.detail.sections.castAndCrew")}>
-          <CastCarousel cast={item.cast ?? []} crewGroups={crewGroups} limit={12} prefetchPeople />
-        </DetailSection>
+      {canCurateMetadata && (
+        <MediaLocations
+          title="Media locations"
+          versions={item.versions}
+          onShowMediaInfo={openMediaInfo}
+        />
       )}
 
       {/* Local extras play in Silo, so they lead; YouTube videos follow. */}
@@ -422,9 +555,13 @@ export default function MovieContent({
 
       {item.videos && item.videos.length > 0 && <TrailersSection videos={item.videos} />}
 
-      <MovieBoxSetRow contentId={item.content_id} libraryId={libraryId} />
+      {((item.cast?.length ?? 0) > 0 || crewGroups.some((g) => g.members.length > 0)) && (
+        <DetailSection title="Cast & Crew">
+          <CastCarousel cast={item.cast ?? []} crewGroups={crewGroups} limit={12} prefetchPeople />
+        </DetailSection>
+      )}
 
-      <ItemCollectionsRow contentId={item.content_id} libraryId={libraryId} />
+      <CollectionsSection collections={item.collections} />
 
       {/* More Like This */}
       {similarLoading ? (
@@ -432,14 +569,6 @@ export default function MovieContent({
       ) : (
         similarData?.items &&
         similarData.items.length > 0 && <RecommendationGrid items={similarData.items} />
-      )}
-
-      {canCurateMetadata && (
-        <MediaLocations
-          title={t("web.detail.sections.mediaLocations")}
-          versions={item.versions}
-          onShowMediaInfo={openMediaInfo}
-        />
       )}
     </DetailLayout>
   );

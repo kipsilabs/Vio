@@ -1682,6 +1682,29 @@
       "description": "Who can play and pause in Watch Parties you host. Changing it in a party saves it for your next one.",
       "recommended_control": "select",
       "notes": "The server reads it when the profile creates a Watch Party room and starts the room with this guest_control_policy instead of always host_only. The server also writes it at profile scope whenever the host changes a room's policy (updateWatchTogetherRoomPolicy), so the choice made in any client's party options carries to the next party on every client without each client storing or sending it. Profile scope because each household member hosts with their own choice. The enum members are the room's guest_control_policy values."
+    },
+    {
+      "key": "playback.version_sort",
+      "introduced_in": 10,
+      "persistence": "remote",
+      "allowed_scopes": [
+        "profile"
+      ],
+      "resolution_order": [
+        "profile",
+        "default"
+      ],
+      "value_schema": {
+        "type": "object",
+        "schema_ref": "version-sort.json",
+        "nullable": true
+      },
+      "default_value": null,
+      "category": "playback",
+      "label": "Version order",
+      "description": "Choose how the versions of an item are ordered for you.",
+      "recommended_control": "panel",
+      "notes": "Profile-scope viewer preference for the per-item version list. The server stores and resolves it but never evaluates it: the watch payload carries the criteria, and the version list applies them client-side over the versions it already has, so an attribute the payload does not expose cannot be honoured. The attribute set is therefore restricted to size, bitrate, resolution, audio_channels, bit_depth, hdr and score, matching the watch payload's sortable fields rather than the wider quality-profile vocabulary (source, confirmed, language). An empty list and an absent/null value are equivalent and mean \"no override\": the list keeps the ranking the selected quality profile returns. The 16-entry cap matches the quality-profile sort cap (maxSortCriteria in internal/virtuallibrary/quality). Duplicate attribute/direction pairs are allowed, as they are in a quality profile; they simply do not change the order. No migration: this is a new key with no legacy column, and it is nullable so a profile with no row inherits the profile ranking."
     }
   ]
 }

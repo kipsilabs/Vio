@@ -2,7 +2,6 @@ package apiv2
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"io"
 	"log/slog"
@@ -18,16 +17,23 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	dto "github.com/prometheus/client_model/go"
 
+	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
 	"github.com/Silo-Server/silo-server/internal/logredact"
 )
 
 // captureLogs routes slog through the production redaction handler into a
 // buffer for the duration of the test.
 func captureLogs(t *testing.T) *bytes.Buffer {
+	return captureLogsAt(t, slog.LevelInfo)
+}
+
+// captureLogsAt is captureLogs with an explicit minimum level, for tests that
+// assert a cause reached a debug line without entering the INFO log.
+func captureLogsAt(t *testing.T, level slog.Level) *bytes.Buffer {
 	t.Helper()
 	var buf bytes.Buffer
 	prev := slog.Default()
-	slog.SetDefault(slog.New(logredact.New(slog.NewJSONHandler(&buf, nil))))
+	slog.SetDefault(slog.New(logredact.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: level}))))
 	t.Cleanup(func() { slog.SetDefault(prev) })
 	return &buf
 }
@@ -40,6 +46,12 @@ func counterValue(t *testing.T, vec *prometheus.CounterVec, labels prometheus.La
 		t.Fatalf("labels %v: %v", labels, err)
 	}
 	return testutil.ToFloat64(c)
+}
+
+func TestV1PrefixSkipMatchesDelegation(t *testing.T) {
+	if apimw.APIv2Prefix != Prefix+"/" || !strings.HasPrefix(DelegationPattern, apimw.APIv2Prefix) {
+		t.Fatalf("apimw.APIv2Prefix = %q, delegation %q", apimw.APIv2Prefix, DelegationPattern)
+	}
 }
 
 func TestRequestLabelsAreStable(t *testing.T) {
@@ -129,6 +141,19 @@ func TestSecretBearingRequestIsNotLogged(t *testing.T) {
 	}
 	if !strings.Contains(out, `"error_code":"validation_failed"`) {
 		t.Errorf("error code missing: %s", out)
+	}
+}
+
+func TestClientLabelIsBounded(t *testing.T) {
+	for i := 0; i < 10000; i++ {
+		if got := clientLabel("private-client-" + string(rune(i))); got != labelOther {
+			t.Fatalf("arbitrary client created label %q", got)
+		}
+	}
+	for name, want := range map[string]string{"": "none", "Silo Web": "web", "Vio Web": "web", "Silo Apple TV": "apple", "Vio Apple TV": "apple", "Silo iOS": "apple", "Vio iOS": "apple", "Silo Android TV": "android", "Vio Android TV": "android", "Silo Android": "android", "silo web private": "other"} {
+		if got := clientLabel(name); got != want {
+			t.Fatalf("client %q => %q, want %q", name, got, want)
+		}
 	}
 }
 
@@ -254,106 +279,5 @@ func TestObservedFlushReturnsTransportError(t *testing.T) {
 	h.ServeHTTP(inner, httptest.NewRequest(http.MethodGet, "/api/v2/downloads/d1/file", nil))
 	if !errors.Is(got, errFlushFailed) {
 		t.Fatalf("flush error = %v", got)
-	}
-}
-
-// A response the handler breaks after committing it, with
-// panic(http.ErrAbortHandler), is still recorded once, and the panic carries
-// on so net/http breaks the connection. It is aborted while the client waits;
-// once the client has gone, the abort is only how the response ended.
-func TestObservedAbortIsRecordedAndRepanics(t *testing.T) {
-	for _, tc := range []struct {
-		name      string
-		ctx       func() context.Context
-		wantClass string
-	}{
-		{"client waiting", context.Background, "aborted"},
-		{"client gone", func() context.Context {
-			ctx, cancel := context.WithCancel(context.Background())
-			cancel()
-			return ctx
-		}, "2xx"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			buf := captureLogs(t)
-			labels := prometheus.Labels{labelAPIMajor: "2", labelOperationID: labelNone, labelMethod: http.MethodGet, labelStatusClass: tc.wantClass, labelErrorCode: labelNone, labelAuthClass: authClassAnonymous, labelClient: labelNone}
-			before := counterValue(t, requestsTotal, labels)
-			h := observe(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				_, _ = w.Write([]byte("partial"))
-				panic(http.ErrAbortHandler)
-			}))
-			func() {
-				defer func() {
-					if rec := recover(); rec != http.ErrAbortHandler { //nolint:errorlint // sentinel compared by identity, as net/http does
-						t.Fatalf("recovered %v, want http.ErrAbortHandler", rec)
-					}
-				}()
-				h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/api/v2/stream/s1", nil).WithContext(tc.ctx()))
-			}()
-			if got := counterValue(t, requestsTotal, labels) - before; got != 1 {
-				t.Fatalf("%s request counted %v times, want 1", tc.wantClass, got)
-			}
-			if n := strings.Count(buf.String(), `"msg":"apiv2 request"`); n != 1 || !strings.Contains(buf.String(), `"status_class":"`+tc.wantClass+`"`) || !strings.Contains(buf.String(), `"status":200`) {
-				t.Fatalf("logged %d request lines, want one %s line with status 200: %s", n, tc.wantClass, buf.String())
-			}
-		})
-	}
-}
-
-// A panic that reaches no Huma operation (a raw registration, or a v2 chi
-// middleware) is answered with the internal_error problem and recorded as that
-// 500. Once the handler has committed its response, the panic breaks the
-// connection instead and the request is recorded as aborted. A status the
-// writer refused commits nothing.
-func TestObservedRawPanicIsAnsweredAndRecorded(t *testing.T) {
-	for _, tc := range []struct {
-		name      string
-		status    int
-		write     bool
-		wantClass string
-		wantCode  string
-	}{
-		{"nothing written", 0, false, "5xx", TypeInternalError.ID},
-		{"status rejected", 1000, false, "5xx", TypeInternalError.ID},
-		{"response committed", 0, true, "aborted", labelNone},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			buf := captureLogs(t)
-			labels := prometheus.Labels{labelAPIMajor: "2", labelOperationID: labelNone, labelMethod: http.MethodGet, labelStatusClass: tc.wantClass, labelErrorCode: tc.wantCode, labelAuthClass: authClassAnonymous, labelClient: labelNone}
-			before := counterValue(t, requestsTotal, labels)
-			h := observe(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				w.Header().Set("Content-Length", "99")
-				w.Header().Set("Access-Control-Allow-Origin", "*")
-				if tc.status != 0 {
-					w.WriteHeader(tc.status)
-				}
-				if tc.write {
-					_, _ = w.Write([]byte("partial"))
-				}
-				panic("boom token=hunter2")
-			}))
-			rr := httptest.NewRecorder()
-			var rec any
-			func() {
-				defer func() { rec = recover() }()
-				h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/v2/events", nil))
-			}()
-			var wantRec any
-			if tc.write {
-				wantRec = http.ErrAbortHandler
-			}
-			if rec != wantRec {
-				t.Fatalf("recovered %v, want %v", rec, wantRec)
-			}
-			if !tc.write && (rr.Code != http.StatusInternalServerError || rr.Header().Get("Content-Type") != problemContentType || rr.Header().Get("Content-Length") != "" || rr.Header().Get("Access-Control-Allow-Origin") != "*" || !strings.Contains(rr.Body.String(), TypeInternalError.ID)) {
-				t.Fatalf("response = %d %v %s, want the internal_error problem", rr.Code, rr.Header(), rr.Body.String())
-			}
-			if got := counterValue(t, requestsTotal, labels) - before; got != 1 {
-				t.Fatalf("%s request counted %v times, want 1", tc.wantClass, got)
-			}
-			if strings.Contains(buf.String(), "hunter2") || !strings.Contains(buf.String(), `"msg":"apiv2 handler panic"`) {
-				t.Fatalf("panic log missing or unmasked: %s", buf.String())
-			}
-		})
 	}
 }

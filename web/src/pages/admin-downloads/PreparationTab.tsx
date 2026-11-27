@@ -208,7 +208,7 @@ export default function PreparationTab() {
     <div className="space-y-5">
       {total > 0 && (
         <div className="surface-panel rounded-2xl border-0 p-4">
-          <div className="text-muted-foreground mb-2 text-[0.625rem] font-semibold tracking-wider uppercase">
+          <div className="text-muted-foreground mb-2 text-[10px] font-semibold tracking-wider uppercase">
             {t(`${K}.stateHeading`)}
           </div>
           <div
@@ -232,7 +232,7 @@ export default function PreparationTab() {
                 aria-pressed={stateFilter === state}
                 onClick={() => setStateFilter(stateFilter === state ? null : state)}
                 className={cn(
-                  "flex items-center gap-1.5 text-[0.6875rem] transition-opacity",
+                  "flex items-center gap-1.5 text-[11px] transition-opacity",
                   stateFilter && stateFilter !== state && "opacity-30",
                 )}
               >
@@ -248,7 +248,7 @@ export default function PreparationTab() {
           </div>
           {workers.length > 0 && (
             <div className="border-border mt-3 border-t pt-3">
-              <div className="text-muted-foreground mb-2 text-[0.625rem] font-semibold tracking-wider uppercase">
+              <div className="text-muted-foreground mb-2 text-[10px] font-semibold tracking-wider uppercase">
                 {t(`${K}.byWorker`)}
               </div>
               <div className="flex flex-wrap gap-1.5">
@@ -259,7 +259,7 @@ export default function PreparationTab() {
                     aria-pressed={workerFilter === worker.key}
                     onClick={() => setWorkerFilter(workerFilter === worker.key ? null : worker.key)}
                     className={cn(
-                      "bg-surface border-border hover:border-primary/20 rounded-md border px-2.5 py-1 text-[0.6875rem] font-medium transition-all",
+                      "bg-surface border-border hover:border-primary/20 rounded-md border px-2.5 py-1 text-[11px] font-medium transition-all",
                       workerFilter === worker.key
                         ? "border-primary/40 bg-primary/10 text-primary"
                         : workerFilter && "opacity-30",
@@ -290,7 +290,7 @@ export default function PreparationTab() {
             aria-label={t(`${K}.filter.label`)}
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            className="h-8 ps-9 text-[0.8125rem]"
+            className="h-8 ps-9 text-[13px]"
           />
           {search && (
             <button
@@ -310,7 +310,7 @@ export default function PreparationTab() {
               setStateFilter(null);
               setWorkerFilter(null);
             }}
-            className="text-muted-foreground hover:text-foreground flex items-center gap-1 text-[0.6875rem]"
+            className="text-muted-foreground hover:text-foreground flex items-center gap-1 text-[11px]"
           >
             <X className="h-3 w-3" />
             {t(`${K}.filter.clearAll`)}
@@ -324,14 +324,14 @@ export default function PreparationTab() {
           aria-label={t(`${K}.selection.toolbarLabel`)}
           className="bg-surface/60 border-border flex flex-wrap items-center gap-2 rounded-lg border px-3 py-2"
         >
-          <span className="text-[0.75rem] font-medium tabular-nums">
+          <span className="text-[12px] font-medium tabular-nums">
             {t(`${K}.selection.count`, jobCount(selectedItems.length))}
           </span>
           <div className="ms-auto flex flex-wrap gap-1.5">
             <Button
               size="sm"
               variant="outline"
-              className="h-7 gap-1.5 px-2 text-[0.6875rem]"
+              className="h-7 gap-1.5 px-2 text-[11px]"
               disabled={actions.isPending || pausable.length === 0}
               onClick={() => actions.run("pause", pausable)}
             >
@@ -343,7 +343,7 @@ export default function PreparationTab() {
             <Button
               size="sm"
               variant="outline"
-              className="h-7 gap-1.5 px-2 text-[0.6875rem]"
+              className="h-7 gap-1.5 px-2 text-[11px]"
               disabled={actions.isPending || resumable.length === 0}
               onClick={() => actions.run("resume", resumable)}
             >
@@ -355,7 +355,7 @@ export default function PreparationTab() {
             <Button
               size="sm"
               variant="outline"
-              className="text-destructive hover:text-destructive h-7 gap-1.5 px-2 text-[0.6875rem]"
+              className="text-destructive hover:text-destructive h-7 gap-1.5 px-2 text-[11px]"
               disabled={actions.isPending}
               onClick={() => setCancelTargets(selectedItems)}
             >
@@ -365,7 +365,7 @@ export default function PreparationTab() {
             <Button
               size="sm"
               variant="ghost"
-              className="h-7 px-2 text-[0.6875rem]"
+              className="h-7 px-2 text-[11px]"
               disabled={actions.isPending}
               onClick={clearSelection}
             >
@@ -376,7 +376,7 @@ export default function PreparationTab() {
       )}
 
       {(search || activeFilters > 0) && (
-        <div className="text-muted-foreground text-[0.6875rem]">
+        <div className="text-muted-foreground text-[11px]">
           {t(`${K}.showing`, {
             total: items.length,
             shown: filtered.length,
@@ -385,7 +385,7 @@ export default function PreparationTab() {
         </div>
       )}
       {items.length < total && (
-        <div className="text-muted-foreground text-[0.6875rem]">
+        <div className="text-muted-foreground text-[11px]">
           {t(`${K}.listingFirst`, {
             total,
             shown: items.length.toLocaleString(formatLocale()),
@@ -426,7 +426,7 @@ export default function PreparationTab() {
             {COLUMNS.map((heading) => (
               <div
                 key={heading}
-                className="text-muted-foreground text-[0.625rem] font-semibold tracking-wider uppercase"
+                className="text-muted-foreground text-[10px] font-semibold tracking-wider uppercase"
               >
                 {t(heading)}
               </div>
@@ -515,11 +515,9 @@ function PreparationRow({
   const titleBlock = (
     <>
       {/* Underlines only the title when the row links to its item. */}
-      <div className="truncate text-[0.8125rem] font-medium group-hover/item:underline">
-        {title}
-      </div>
-      <div className="text-muted-foreground truncate text-[0.625rem]">{subtitle}</div>
-      <div className="text-muted-foreground truncate text-[0.625rem]">
+      <div className="truncate text-[13px] font-medium group-hover/item:underline">{title}</div>
+      <div className="text-muted-foreground truncate text-[10px]">{subtitle}</div>
+      <div className="text-muted-foreground truncate text-[10px]">
         {formatPreparationSource(prep)}
       </div>
     </>
@@ -530,7 +528,7 @@ function PreparationRow({
       onClick={toggle}
       aria-expanded={expanded}
       aria-label={t(`${K}.row.detailsLabel`, { title })}
-      className="text-muted-foreground hover:text-primary inline-flex items-center gap-0.5 text-[0.625rem] font-medium transition-colors"
+      className="text-muted-foreground hover:text-primary inline-flex items-center gap-0.5 text-[10px] font-medium transition-colors"
     >
       {t(`${K}.row.details`)}
       {expanded ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
@@ -584,7 +582,7 @@ function PreparationRow({
         </div>
         <div className="flex min-w-0 items-center gap-1.5">
           <FormatBadge format={prep.format} />
-          <span className="line-clamp-2 text-[0.6875rem] font-medium">
+          <span className="line-clamp-2 text-[11px] font-medium">
             {formatPreparationOutput(prep)}
           </span>
         </div>
@@ -604,17 +602,17 @@ function PreparationRow({
         <div className="flex items-start justify-between gap-2">
           <div className="mt-0.5 shrink-0">{checkbox}</div>
           <div className="min-w-0 flex-1">
-            <div className="truncate text-[0.8125rem] font-semibold">{title}</div>
-            <div className="text-muted-foreground truncate text-[0.6875rem]">{subtitle}</div>
+            <div className="truncate text-[13px] font-semibold">{title}</div>
+            <div className="text-muted-foreground truncate text-[11px]">{subtitle}</div>
           </div>
           <FormatBadge format={prep.format} />
         </div>
         <ProgressCell prep={prep} />
-        <div className="text-muted-foreground flex min-w-0 flex-wrap items-center gap-1.5 text-[0.625rem]">
+        <div className="text-muted-foreground flex min-w-0 flex-wrap items-center gap-1.5 text-[10px]">
           <WorkerBadge prep={prep} />
           <span className="truncate">{formatPreparationOutput(prep)}</span>
         </div>
-        <div className="text-muted-foreground flex items-center justify-between gap-2 text-[0.625rem]">
+        <div className="text-muted-foreground flex items-center justify-between gap-2 text-[10px]">
           <span className="flex overflow-hidden whitespace-pre">{requesterSummary(t, prep)}</span>
           <div className="flex shrink-0 items-center gap-1">
             {rowActions}
@@ -715,7 +713,7 @@ function FormatBadge({ format }: { format: AdminDownloadPreparation["format"] })
   const meta = activityMethodMeta(format);
   return (
     <span
-      className={`inline-flex shrink-0 rounded border px-1.5 py-0.5 text-[0.5625rem] font-semibold ${meta.badgeClass}`}
+      className={`inline-flex shrink-0 rounded border px-1.5 py-0.5 text-[9px] font-semibold ${meta.badgeClass}`}
     >
       {meta.label}
     </span>
@@ -726,10 +724,10 @@ function WorkerBadge({ prep }: { prep: AdminDownloadPreparation }) {
   const t = useT();
   const worker = preparationWorker(prep);
   if (!worker) {
-    return <span className="text-muted-foreground text-[0.6875rem]">{t(`${K}.notAssigned`)}</span>;
+    return <span className="text-muted-foreground text-[11px]">{t(`${K}.notAssigned`)}</span>;
   }
   return (
-    <span className="border-primary/20 bg-primary/10 text-primary inline-flex max-w-full items-center gap-1 rounded border px-1.5 py-0.5 text-[0.5625rem] font-semibold">
+    <span className="border-primary/20 bg-primary/10 text-primary inline-flex max-w-full items-center gap-1 rounded border px-1.5 py-0.5 text-[9px] font-semibold">
       {/* Same label treatment as the playback route badges (PlaybackRouteBadges). */}
       <span className="text-foreground/75 [html[data-high-contrast=true]_&]:text-muted-foreground font-normal">
         {worker.label}
@@ -750,7 +748,7 @@ function ProgressCell({ prep }: { prep: AdminDownloadPreparation }) {
         const elapsed = secondsSince(prep.started_at);
         return (
           <div className="space-y-0.5">
-            <div className="text-primary flex items-center gap-1 text-[0.6875rem] font-semibold">
+            <div className="text-primary flex items-center gap-1 text-[11px] font-semibold">
               <Loader className="h-3 w-3 animate-spin" aria-hidden="true" />
               {elapsed != null
                 ? t(`${K}.progress.runningElapsed`, {
@@ -759,7 +757,7 @@ function ProgressCell({ prep }: { prep: AdminDownloadPreparation }) {
                   })
                 : preparationRunningLabel(prep)}
             </div>
-            <div className="text-muted-foreground text-[0.625rem]">
+            <div className="text-muted-foreground text-[10px]">
               {prep.progress_unavailable
                 ? t(`${K}.progress.noReports`)
                 : t(`${K}.progress.waitingFirstReport`)}
@@ -775,7 +773,7 @@ function ProgressCell({ prep }: { prep: AdminDownloadPreparation }) {
         .join(" · ");
       return (
         <div className="space-y-1">
-          <div className="flex items-center justify-between gap-2 text-[0.6875rem]">
+          <div className="flex items-center justify-between gap-2 text-[11px]">
             <span className="font-semibold tabular-nums">
               {t(`${K}.progress.percent`, { percent: Math.floor(percent) })}
             </span>
@@ -799,7 +797,7 @@ function ProgressCell({ prep }: { prep: AdminDownloadPreparation }) {
     }
     case "queued":
       return (
-        <div className="text-muted-foreground flex items-center gap-1.5 text-[0.6875rem]">
+        <div className="text-muted-foreground flex items-center gap-1.5 text-[11px]">
           <Clock className="h-3 w-3" aria-hidden="true" />
           {prep.queue_position === 1
             ? t(`${K}.progress.queuedNext`)
@@ -813,11 +811,11 @@ function ProgressCell({ prep }: { prep: AdminDownloadPreparation }) {
     case "retrying":
       return (
         <div className="min-w-0 space-y-0.5">
-          <div className="text-warning flex items-center gap-1.5 text-[0.6875rem] font-semibold">
+          <div className="text-warning flex items-center gap-1.5 text-[11px] font-semibold">
             <RotateCw className="h-3 w-3" aria-hidden="true" />
             {t(`${K}.progress.waitingToRetry`)}
           </div>
-          <div className="text-muted-foreground line-clamp-2 text-[0.625rem]">
+          <div className="text-muted-foreground line-clamp-2 text-[10px]">
             {[
               t(`${K}.progress.attempt`, {
                 attempt: prep.attempts + 1,
@@ -834,11 +832,11 @@ function ProgressCell({ prep }: { prep: AdminDownloadPreparation }) {
     case "paused":
       return (
         <div className="min-w-0 space-y-0.5">
-          <div className="text-muted-foreground flex items-center gap-1.5 text-[0.6875rem] font-semibold">
+          <div className="text-muted-foreground flex items-center gap-1.5 text-[11px] font-semibold">
             <Pause className="h-3 w-3" aria-hidden="true" />
             {t(`${K}.progress.paused`)}
           </div>
-          <div className="text-muted-foreground text-[0.625rem]">
+          <div className="text-muted-foreground text-[10px]">
             {[formatAgo(prep.paused_at), t(`${K}.progress.wontStart`)].filter(Boolean).join(" · ")}
           </div>
         </div>
@@ -846,11 +844,11 @@ function ProgressCell({ prep }: { prep: AdminDownloadPreparation }) {
     case "failed":
       return (
         <div className="min-w-0 space-y-0.5">
-          <div className="text-destructive flex items-center gap-1.5 text-[0.6875rem] font-semibold">
+          <div className="text-destructive flex items-center gap-1.5 text-[11px] font-semibold">
             <AlertTriangle className="h-3 w-3" aria-hidden="true" />
             {t(`${K}.progress.failed`)}
           </div>
-          <div className="text-muted-foreground line-clamp-2 text-[0.625rem]" title={prep.error}>
+          <div className="text-muted-foreground line-clamp-2 text-[10px]" title={prep.error}>
             {[
               t(`${K}.progress.afterAttempts`, { count: prep.attempts }),
               formatAgo(prep.failed_at),
@@ -904,12 +902,10 @@ function Requesters({ prep }: { prep: AdminDownloadPreparation }) {
   const t = useT();
   const [first, ...rest] = prep.requesters;
   if (!first) {
-    return (
-      <span className="text-muted-foreground text-[0.6875rem]">{t(`${K}.requesters.none`)}</span>
-    );
+    return <span className="text-muted-foreground text-[11px]">{t(`${K}.requesters.none`)}</span>;
   }
   return (
-    <div className="min-w-0 text-[0.75rem]">
+    <div className="min-w-0 text-[12px]">
       <div className="flex min-w-0 items-center gap-1.5">
         <Link
           to={`/admin/users/${first.user_id}`}
@@ -921,13 +917,13 @@ function Requesters({ prep }: { prep: AdminDownloadPreparation }) {
         {first.profile_name && (
           <span
             dir="auto"
-            className="border-primary/30 bg-primary/15 text-primary max-w-[6rem] truncate rounded border px-1.5 py-0.5 text-[0.625rem] leading-none"
+            className="border-primary/30 bg-primary/15 text-primary max-w-[6rem] truncate rounded border px-1.5 py-0.5 text-[10px] leading-none"
           >
             {first.profile_name}
           </span>
         )}
       </div>
-      <div className="text-muted-foreground flex overflow-hidden text-[0.625rem] whitespace-pre">
+      <div className="text-muted-foreground flex overflow-hidden text-[10px] whitespace-pre">
         {requesterDevices(t, first, rest.length)}
       </div>
     </div>
@@ -961,27 +957,27 @@ function PreparationDetails({
       <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
         <div>
           <div className="flex items-center gap-2">
-            <div className="rounded-full border border-[var(--terminal-border)] bg-[var(--terminal-bg)] px-2 py-0.5 text-[0.625rem] font-semibold tracking-[0.2em] text-[var(--terminal-fg)] uppercase">
+            <div className="rounded-full border border-[var(--terminal-border)] bg-[var(--terminal-bg)] px-2 py-0.5 text-[10px] font-semibold tracking-[0.2em] text-[var(--terminal-fg)] uppercase">
               {t(`${K}.details.chip`)}
             </div>
-            <div className="text-foreground/85 text-[0.6875rem] font-medium">
+            <div className="text-foreground/85 text-[11px] font-medium">
               {showFFmpeg ? t(`${K}.details.headingWithFfmpeg`) : t(`${K}.details.heading`)}
             </div>
           </div>
-          <div className="text-muted-foreground mt-1 font-mono text-[0.625rem]">{prep.id}</div>
+          <div className="text-muted-foreground mt-1 font-mono text-[10px]">{prep.id}</div>
         </div>
         <div className="flex gap-1.5">
           <Button
             variant="outline"
             size="sm"
-            className="h-7 gap-1.5 px-2 text-[0.6875rem]"
+            className="h-7 gap-1.5 px-2 text-[11px]"
             onClick={onToggleFFmpeg}
             aria-pressed={showFFmpeg}
           >
             <Terminal className="h-3.5 w-3.5" />
             {showFFmpeg ? t(`${K}.details.hideFfmpeg`) : FFMPEG}
           </Button>
-          <Button variant="outline" size="sm" className="h-7 gap-1.5 px-2 text-[0.6875rem]" asChild>
+          <Button variant="outline" size="sm" className="h-7 gap-1.5 px-2 text-[11px]" asChild>
             <Link to={logsHref}>
               <FileText className="h-3.5 w-3.5" />
               {t(`${K}.details.viewLogs`)}
@@ -1105,10 +1101,10 @@ function PreparationDetails({
                     : requesterName(r)}
                 </span>
                 {/* Moves under the name when both don't fit, rather than squeezing it. */}
-                <span className="ms-auto min-w-0 text-end text-[0.625rem] wrap-anywhere text-[var(--terminal-muted)]">
+                <span className="ms-auto min-w-0 text-end text-[10px] wrap-anywhere text-[var(--terminal-muted)]">
                   {downloadEntryStatus(r.status).label}
                 </span>
-                <span className="basis-full truncate text-[0.625rem] text-[var(--terminal-muted)]">
+                <span className="basis-full truncate text-[10px] text-[var(--terminal-muted)]">
                   {requesterDevice(r)}
                 </span>
               </div>
@@ -1170,17 +1166,17 @@ function FFmpegConsole({
   return (
     <div className="mt-3 space-y-2">
       {isFetching && !isLoading && (
-        <div className="text-muted-foreground text-end text-[0.625rem]">
+        <div className="text-muted-foreground text-end text-[10px]">
           {t(`${K}.ffmpeg.refreshing`)}
         </div>
       )}
       <div className="overflow-hidden rounded-xl border border-[var(--terminal-border)] bg-[var(--terminal-bg)] shadow-[0_18px_60px_rgba(0,0,0,0.35)]">
         {isLoading ? (
-          <div className="px-4 py-6 font-mono text-[0.6875rem] text-[var(--terminal-muted)]">
+          <div className="px-4 py-6 font-mono text-[11px] text-[var(--terminal-muted)]">
             {t(`${K}.ffmpeg.loading`)}
           </div>
         ) : rows.length === 0 ? (
-          <div className="px-4 py-6 font-mono text-[0.6875rem] text-[var(--terminal-muted)]">
+          <div className="px-4 py-6 font-mono text-[11px] text-[var(--terminal-muted)]">
             {t(`${K}.ffmpeg.empty`)}
           </div>
         ) : (
@@ -1191,19 +1187,19 @@ function FFmpegConsole({
                 className="grid grid-cols-[120px_1fr] gap-3 border-b border-[var(--terminal-border)]/30 px-4 py-2.5 last:border-b-0"
               >
                 <div className="space-y-1">
-                  <div className="font-mono text-[0.625rem] text-[var(--terminal-muted)]">
+                  <div className="font-mono text-[10px] text-[var(--terminal-muted)]">
                     {formatTimeOnly(row.timestamp)}
                   </div>
-                  <div className="text-[0.625rem] tracking-[0.18em] text-[var(--terminal-muted)]/60 uppercase">
+                  <div className="text-[10px] tracking-[0.18em] text-[var(--terminal-muted)]/60 uppercase">
                     {row.message.includes(STDERR) ? STDERR : t(`${K}.ffmpeg.event`)}
                   </div>
                 </div>
                 <div className="min-w-0">
-                  <div className="font-mono text-[0.6875rem] leading-5 break-words text-[var(--terminal-fg)]">
+                  <div className="font-mono text-[11px] leading-5 break-words text-[var(--terminal-fg)]">
                     {ffmpegRowText(row)}
                   </div>
                   {row.node_id && (
-                    <div className="mt-1 text-[0.625rem] text-[var(--terminal-muted)]/60">
+                    <div className="mt-1 text-[10px] text-[var(--terminal-muted)]/60">
                       {row.node_id}
                     </div>
                   )}
@@ -1229,12 +1225,12 @@ function DetailCard({
   return (
     <div className="rounded-lg border border-[var(--terminal-border)]/60 bg-[var(--terminal-bg)]/60 px-3 py-2">
       <div className="mb-2 flex items-center gap-2">
-        <span className="text-[0.625rem] font-semibold tracking-[0.18em] text-[var(--terminal-muted)] uppercase">
+        <span className="text-[10px] font-semibold tracking-[0.18em] text-[var(--terminal-muted)] uppercase">
           {label}
         </span>
         {badge}
       </div>
-      <div className="grid gap-1 text-[0.6875rem]">{children}</div>
+      <div className="grid gap-1 text-[11px]">{children}</div>
     </div>
   );
 }
@@ -1250,7 +1246,7 @@ function DetailLine({
 }) {
   return (
     <div className="grid min-w-0 grid-cols-[4.25rem_1fr] gap-2">
-      <span className="text-[0.625rem] text-[var(--terminal-muted)]">{label}</span>
+      <span className="text-[10px] text-[var(--terminal-muted)]">{label}</span>
       <span
         className={cn(
           "min-w-0 font-medium break-words",

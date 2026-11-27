@@ -1,97 +1,28 @@
-import { Play } from "lucide-react";
 import type { FileVersion } from "@/api/types";
-import {
-  DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuSeparator,
-} from "@/components/ui/dropdown-menu";
-import { formatFileSize, mapAudioLabel } from "@/lib/mediaFormat";
-import { videoRangeLabel } from "@/lib/videoRange";
-import { useT } from "@/i18n";
-import { extractSourceHint, versionAudioAtmosEvidence } from "./versionFormatUtils";
-import { resolutionScore } from "./versionRankingUtils";
+import { buildQualitySummary, buildVersionDetailLine } from "./versionFormatUtils";
+import { audioScore, resolutionScore } from "./versionRankingUtils";
 
-// ---------------------------------------------------------------------------
-// Exported helper functions (also used by tests)
-// ---------------------------------------------------------------------------
+export { buildQualitySummary };
 
-export function buildQualitySummary(version: FileVersion): string {
-  const parts: string[] = [];
+/**
+ * Shared version-display helpers for the item page's catalog rows: the version
+ * picker, the media-info dialog, and the download picker. The rows themselves
+ * live in those components; this module only derives text, so every list reads
+ * the same for one version.
+ */
 
-  if (version.resolution) parts.push(version.resolution);
-  if (version.codec_video) parts.push(version.codec_video.toUpperCase());
-  const rangeLabel = videoRangeLabel(version);
-  if (rangeLabel) parts.push(rangeLabel);
-  if (version.codec_audio)
-    parts.push(mapAudioLabel(version.codec_audio, versionAudioAtmosEvidence(version)));
-  if (parts.length === 0 && version.container) {
-    parts.push(version.container.toUpperCase());
-  }
-
-  return parts.join(" · ");
-}
-
+// The item-page picker's detail line, sharing one derivation with the player
+// menu so empty details read identically across both lists.
 export function buildDetailLine(version: FileVersion): string {
-  const parts: string[] = [];
-
-  const size = formatFileSize(version.file_size);
-  if (size) parts.push(size);
-
-  const hint = version.file_name ? extractSourceHint(version.file_name) : null;
-  if (hint) parts.push(hint);
-
-  return parts.join(" · ");
+  return buildVersionDetailLine(version);
 }
 
 export function sortByResolution(versions: FileVersion[]): FileVersion[] {
   return [...versions].sort(
-    (a, b) => resolutionScore(b.resolution) - resolutionScore(a.resolution),
-  );
-}
-
-// ---------------------------------------------------------------------------
-// VersionFlyoutItems (default export)
-// ---------------------------------------------------------------------------
-
-interface VersionFlyoutItemsProps {
-  versions: FileVersion[];
-  onPlayVersion: (fileId: number) => void;
-}
-
-export default function VersionFlyoutItems({ versions, onPlayVersion }: VersionFlyoutItemsProps) {
-  const t = useT();
-  const sorted = sortByResolution(versions);
-
-  return (
-    <>
-      <DropdownMenuLabel>{t("web.detail.versions.playVersion")}</DropdownMenuLabel>
-      <DropdownMenuSeparator />
-
-      {sorted.map((version) => {
-        const qualitySummary = buildQualitySummary(version);
-        const detailLine = buildDetailLine(version);
-
-        return (
-          <DropdownMenuItem
-            key={version.file_id}
-            className="flex items-center gap-3 rounded-lg py-2.5"
-            onSelect={() => onPlayVersion(version.file_id)}
-          >
-            <span className="bg-accent/70 flex size-7 shrink-0 items-center justify-center rounded-full">
-              <Play className="text-foreground size-3.5 fill-current" />
-            </span>
-
-            <span className="min-w-0 flex-1">
-              <span className="text-foreground block truncate text-sm font-medium">
-                {qualitySummary}
-              </span>
-              {detailLine && (
-                <span className="text-muted-foreground block text-xs">{detailLine}</span>
-              )}
-            </span>
-          </DropdownMenuItem>
-        );
-      })}
-    </>
+    (a, b) =>
+      resolutionScore(b.resolution) - resolutionScore(a.resolution) ||
+      Number(b.hdr) - Number(a.hdr) ||
+      audioScore(b.codec_audio) - audioScore(a.codec_audio) ||
+      (b.file_size ?? 0) - (a.file_size ?? 0),
   );
 }

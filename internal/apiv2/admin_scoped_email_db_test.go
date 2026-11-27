@@ -97,7 +97,7 @@ func scopedRecoveryDB(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
-func TestScopedAdminKeyCannotRedirectRecoveryDB(t *testing.T) {
+func TestScopedAdminKeyCannotRedirectRecoveryDB(t *testing.T) { //nolint:funlen,gocyclo // upstream test exceeds Vio's 100-line and complexity-30 limits; refactor tracked separately
 	// A private schema keeps the Owner cases independent of existing accounts
 	// and other packages running against the same database.
 	pool := scopedRecoveryDB(t)
@@ -180,7 +180,7 @@ func TestScopedAdminKeyCannotRedirectRecoveryDB(t *testing.T) {
 			if len(message.To) != 1 || message.To[0] != originalEmail {
 				t.Errorf("reset delivered to %v, want original address %q", message.To, originalEmail)
 			}
-			token := regexp.MustCompile(`/reset-password#([A-Za-z0-9_-]+)`).FindStringSubmatch(message.TextBody)
+			token := regexp.MustCompile(`/reset-password/([A-Za-z0-9_-]+)`).FindStringSubmatch(message.TextBody)
 			if len(token) != 2 {
 				t.Fatal("recovery message has no reset link")
 			}

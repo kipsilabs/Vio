@@ -108,3 +108,14 @@ func addEnvSettingLocks(env config.EnvSettings, configured map[string]bool, valu
 		vars[setting.Key] = setting.Var
 	}
 }
+
+// Environment variable names shared by the bootstrap, the backup command and
+// the node install path. Kept here because they are read by more than one
+// command and must not drift.
+const (
+	envDatabaseURL = "DATABASE_URL"
+	envRedisURL    = "REDIS_URL"
+	envSecretKey   = "SECRET_KEY"
+	envNodeURL     = "NODE_URL"
+	envNodeName    = "NODE_NAME"
+)
